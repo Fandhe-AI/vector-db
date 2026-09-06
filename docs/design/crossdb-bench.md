@@ -135,14 +135,19 @@ sqlite-vec の `ingest_bulk`／`ingest_single_stmt` はファイルベース化�
 この用途を模した「広域取得」5 フェーズ（`id` と `body` の両方を返す。LLM へ
 渡す本文の送出コストを含める）を全 DB に追加して計測した。
 
-**前提の確認（現行実装の制約）**: SQL 表層の許可リスト
-（`crates/engine/src/sql/allowlist.rs::parse_select_shape`）は行を返す `SELECT` に
-`ORDER BY <距離>` か `USING PLAN` を必須とし、ORDER BY なしのスカラーフィルタのみの
-行取得は受理しない（`scan_where_nosort_k500` は実行して拒否を捕捉し unsupported）。
-したがって現状の「広く取る」は、Top-k の k を大きく取る（上限 `MAX_SEARCH_K` =
-10,000）形でしか表現できず、「ソートしない」経路は SQL 表層に存在しない。
-`USING MODE 'recall'` は Top-k を固定件数で返すモードであり、しきい値で件数が
-可変になる構文も現状無い（`precision` は逆に少数件へ絞る側）。
+**前提の確認（現行実装。Issue #454 で解消済み）**: 本計測の実施時点では、SQL 表層の
+許可リスト（`crates/engine/src/sql/allowlist.rs::parse_select_shape`）は行を返す
+`SELECT` に `ORDER BY <距離>` か `USING PLAN` を必須とし、ORDER BY なしの
+スカラーフィルタのみの行取得は受理しなかった（`scan_where_nosort_k500` は実行して
+拒否を捕捉し unsupported とした。下表の self 列 `n/a` はこの時点の計測結果）。
+Issue #454 で `SELECT ... [WHERE ...] LIMIT n`（`ORDER BY`／`USING PLAN` を伴わない
+広域取得。契約は `docs/design/wide-retrieval-scan.md` 参照）を SQL 表層へ追加した
+ため、`scan_where_nosort_k500` は self でも受理される（許可リストが `42601` を
+返さなくなった）。self の実測値の再取得は `make bench-crossdb` が動く環境
+（Docker・venv・fixture）を要するためオーナー作業として申し送る（下表・下記所見の
+self `n/a` は未実測のまま残置）。`USING MODE 'recall'` は Top-k を固定件数で返す
+モードであり、しきい値で件数が可変になる構文は Issue #454 でも実装していない
+（spec ID 確定待ちのため見送り。ADR 参照）。
 
 | フェーズ | self (wire) | pgvector exact | pgvector HNSW | sqlite-vec | Qdrant exact | Qdrant HNSW | LanceDB exact | LanceDB HNSW | MySQL |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -200,10 +205,13 @@ k を変えて切り分けた（`scratchpad` 上の ad-hoc 計測・50 反復・
   Qdrant 3.2〜3.3 ms（sqlite-vec は 13.6 ms と悪化）。フィルタ付きは `SELECT id` でも
   高速経路から外れ、全行の `scan_scalar_columns` を通るため、投影と同じ構造的コストが
   約 2 ms 分乗っている。
-- **ソートなしのスカラーフィルタ取得は self に経路が無い。** 他 DB は 0.24 ms
-  （sqlite-vec）〜4.9 ms（Qdrant scroll）で 500 行を返す。設計思想どおりの
-  「フィルタのみで広く返す」経路は、オーナー確認（2026-09-05）を経て
-  広域取得／従来型の 2 モード構想として Issue #454 に起票した（spec 側の定義が前提）。
+- **ソートなしのスカラーフィルタ取得**: 本計測の実施時点（オーナー確認
+  2026-09-05）では self に経路が無く、他 DB が 0.24 ms（sqlite-vec）〜4.9 ms
+  （Qdrant scroll）で 500 行を返す一方 self は unsupported だった。設計思想どおりの
+  「フィルタのみで広く返す」経路は Issue #454 として起票し、SQL 表層
+  （`Statement::Scan`。`docs/design/wide-retrieval-scan.md`）へ実装済み。self の
+  実測値の再取得はオーナー作業として申し送る（上表の self 列は本計測時点の
+  `n/a` のまま）。
 - **ベクトル検索の本体は速い。** `SELECT id` の k=10 0.7 ms・k=1000 4.2 ms は brute-force
   ながら Qdrant exact と同等で、投影・フィルタ経路のオーバーヘッドを取り除けば広域取得
   でも上位に入る見込み。
@@ -562,6 +570,8 @@ Qdrant は上記の別セッション実測のため `run_all.sh` には含ま�
   （`vector_knn`〔フィルタなし〕は上記「`vector_knn` 786µs の内訳」節で実施済み）。
 - スカラー列投影時の全行デコード（`sql/exec.rs::on_visible_row` の `scan_scalar_columns`）
   を Top-k 確定後の k 行へ遅延させる改善は Issue #453（上記「self の投影コスト切り分け」節）。
-  ORDER BY なしのフィルタのみ行取得（広域取得モード）の SQL 表層追加は Issue #454。
+  ORDER BY なしのフィルタのみ行取得（広域取得モード）の SQL 表層追加は Issue #454 で
+  実装済み（`docs/design/wide-retrieval-scan.md`）。self の実測値の再取得（`make
+  bench-crossdb`）はオーナー作業として申し送る。
 - engine GPU 経路の大バッチ頭打ち（Top-k の GPU 化・転送量削減）は別タスク。
 - 本計測は共有 VM（loadavg 約 2）での単発実測であり、専有環境での再測定は未実施。

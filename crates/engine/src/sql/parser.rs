@@ -1276,6 +1276,60 @@ pub(crate) fn bind_aggregate(
     })
 }
 
+/// 束縛済みの広域取得（ソートなしのフィルタ取得）`SELECT` 文（Issue #454）。
+/// [`crate::sql::scan::execute_scan`] が直接実行する入力形。`BoundStatement` と
+/// 異なりランキング段固有のフィールド（`ranking`・`mode`・`evaluation_order`）を
+/// 持たない（[`crate::sql::allowlist::ValidatedScan`] のドキュメント参照）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundScan {
+    pub(crate) table: String,
+    pub(crate) projection: Vec<ProjectedColumn>,
+    pub(crate) metadata_filters: Vec<MetadataFilter>,
+    pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+    /// `expr_filters` をステップ列コンパイルした実行形（Issue #353。
+    /// `BoundStatement::expr_filter_programs` と同じ 1 対 1 対応の契約）。
+    pub(crate) expr_filter_programs: Vec<crate::sql::expr_program::ExprProgram>,
+    /// `LIMIT` の検証済み値（`1..=core::MAX_SEARCH_K`。[`validate_search_limit`]）。
+    pub(crate) limit: usize,
+}
+
+/// [`crate::sql::allowlist::ValidatedScan`] を `schema`・UDF レジストリ `udfs` と
+/// 照合して [`BoundScan`] へ束縛する（Issue #454 の公開 API）。投影・`WHERE` の
+/// 意味論は検索 SELECT（[`bind_in_session`]）・集計 SELECT（[`bind_aggregate`]）と
+/// 共有する（[`bind_projection`]・[`bind_where_predicates`]）。ランキング段
+/// （`ORDER BY`・`USING PLAN`）・取得モード（`USING MODE`）は関与しない
+/// （[`crate::sql::allowlist::ValidatedScan`] が構造上持たないため）。
+pub(crate) fn bind_scan(
+    stmt: &crate::sql::allowlist::ValidatedScan,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundScan, SqlSurfaceError> {
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+
+    let projection = bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
+
+    let (metadata_filters, expr_filters, _rls_predicate_present) =
+        bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+
+    let limit = validate_search_limit(stmt.limit())?;
+
+    // Issue #353 と同じく、`expr_filters` を束縛時に 1 回だけステップ列コンパイル
+    // する（行ループでの再帰評価をなくす）。
+    let expr_filter_programs = expr_filters
+        .iter()
+        .map(crate::sql::expr_program::ExprProgram::compile)
+        .collect();
+
+    Ok(BoundScan {
+        table: stmt.table_name().to_string(),
+        projection,
+        metadata_filters,
+        expr_filters,
+        expr_filter_programs,
+        limit,
+    })
+}
+
 /// [`crate::sql::allowlist::GroupByClause`] を `schema`・束縛済み `items`（アキュムレータ
 /// 一覧）と照合して [`BoundGroupBy`] へ束縛する（TASK-167・SQL-14）。`HAVING`/
 /// `ORDER BY` の対象名は SELECT リストの集計項目の実効名（`item.name`）、

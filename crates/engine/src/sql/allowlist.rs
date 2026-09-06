@@ -579,6 +579,18 @@ pub enum Statement {
     /// 通常 SELECT・集計・`SET`・`CREATE FUNCTION` への `EXPLAIN` 前置は許可リスト外
     /// として `42601` で拒否する。
     Explain(ValidatedStatement),
+    /// `SELECT <投影> FROM <table> [WHERE ...] LIMIT n`（`ORDER BY`・`USING PLAN`
+    /// のいずれも伴わない、ソートなしのフィルタ取得。Issue #454。本 DB の
+    /// 「正解を含むデータ群を広く返す」設計思想を SQL 表層で直接表現する経路で、
+    /// ランキング段・取得モード（`recall`／`precision`）の適用対象を持たない。
+    /// `FROM` 単一テーブルのカタログ存在確認を通過済み。契約の詳細は
+    /// `docs/design/wide-retrieval-scan.md`（spec ビヘイビア ID は未確定。実装
+    /// 既定値としてこの ADR に記録し、確定後にポインタを差し替える）参照。
+    ///
+    /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的
+    /// `match` はワイルドカードアームの追加が必要（`Aggregate`・`Explain` 追加時と
+    /// 同じ運用）。
+    Scan(ValidatedScan),
 }
 
 /// 集計関数の種別（TASK-166・SQL-13）。関数名は [`is_aggregate_function_name`] で
@@ -721,6 +733,53 @@ impl ValidatedAggregate {
     /// `GROUP BY` 句（TASK-167・SQL-14）。`None` なら `GROUP BY` なしの単一行集計。
     pub fn group_by(&self) -> Option<&GroupByClause> {
         self.group_by.as_ref()
+    }
+}
+
+/// 許可形状の構造判定を通過した広域取得（ソートなしのフィルタ取得）`SELECT` 文
+/// （Issue #454）。[`ValidatedStatement`]・[`ValidatedAggregate`] と同様、本モジュール
+/// が保証するのはここまでの構造情報のみで、列名・式の意味論的妥当性は検証しない
+/// （`sql::parser::bind_scan` の責務）。ランキング段（`ORDER BY`・`USING PLAN`）・
+/// 取得モード（`USING MODE`）・評価順（`HINT ORDER`）のいずれも持たない
+/// （構文上 `LIMIT n` の直後は文末のみを許可する。§3.1「本リポの実装既定値」）。
+/// フィールドは `pub(crate)`（クレート外からの直読み・直書き不可。カプセル化の方針は
+/// [`ValidatedStatement`]・[`ValidatedAggregate`] と同じ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedScan {
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    pub(crate) table_name: String,
+    /// SELECT リストの許可形状。[`ValidatedStatement::projection`] と同一の意味論
+    /// （`*`・列名リスト・式項目）を共有する。
+    pub(crate) projection: Projection,
+    /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。既存の
+    /// [`ValidatedStatement::where_predicates`] と同一の許可形状を再利用する。
+    pub(crate) where_predicates: Vec<WherePredicate>,
+    /// `LIMIT` 句の値。可視かつ WHERE を満たす行を先頭から最大この件数だけ返す
+    /// （早期終了。順序保証はスナップショット内の物理走査順のみで、`ORDER BY`
+    /// 相当の意味的順序は持たない）。
+    pub(crate) limit: u32,
+}
+
+impl ValidatedScan {
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// SELECT リストの許可形状。
+    pub fn projection(&self) -> &Projection {
+        &self.projection
+    }
+
+    /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
+    pub fn where_predicates(&self) -> &[WherePredicate] {
+        &self.where_predicates
+    }
+
+    /// `LIMIT` 句の値（構造検証済みの生値。範囲検証は `sql::parser::validate_search_limit`
+    /// が束縛時に行う）。
+    pub fn limit(&self) -> u32 {
+        self.limit
     }
 }
 
@@ -1606,10 +1665,29 @@ struct ParsedShape {
     using_plan: Option<String>,
 }
 
+/// 構文木（[`ValidatedScan`] の元）。カタログ存在確認前の中間結果（Issue #454）。
+struct ParsedScanShape {
+    table_name: String,
+    projection: Projection,
+    where_predicates: Vec<WherePredicate>,
+    limit: u32,
+}
+
+/// [`parse_select_shape`] の戻り値。`WHERE`（省略可）の直後に現れる分岐トークン
+/// （`USING`／`ORDER`／`LIMIT`）で、ランキング段を持つ検索 SELECT（[`Search`]。
+/// 既存の [`ParsedShape`]）か、ランキング段を持たない広域取得（[`Scan`]。Issue #454
+/// の [`ParsedScanShape`]）かを振り分ける。
+enum ParsedSelect {
+    Search(ParsedShape),
+    Scan(ParsedScanShape),
+}
+
 /// 許可した `SELECT` statement 形状を先頭から再帰下降で判定する（TASK-74 由来。
 /// TASK-161 で `LIMIT` 直後の `USING MODE` 句判定を追加した。TASK-77・SQL-5 で
-/// `WHERE`（省略可）直後の `USING PLAN(...)` 分岐を追加した）。
-fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
+/// `WHERE`（省略可）直後の `USING PLAN(...)` 分岐を追加した。Issue #454 で
+/// `WHERE`（省略可）の直後に `LIMIT` が直接現れる、ランキング段を持たない広域
+/// 取得の分岐を追加した）。
+fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
 
     p.expect_keyword(Keyword::Select)?;
@@ -1644,7 +1722,7 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> 
 
         p.expect_end_of_statement()?;
 
-        return Ok(ParsedShape {
+        return Ok(ParsedSelect::Search(ParsedShape {
             table_name,
             projection,
             where_predicates,
@@ -1653,7 +1731,30 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> 
             search_mode,
             evaluation_order: EvaluationOrder::DEFAULT,
             using_plan: Some(using_plan),
-        });
+        }));
+    }
+
+    // Issue #454: `WHERE`（省略可）の直後に `ORDER`（既存の検索 SELECT 経路）でも
+    // 文脈識別子 `USING`（`USING PLAN`、上の分岐）でもなく `LIMIT` キーワードが
+    // 直接現れる形は、ランキング段（`ORDER BY`・`USING PLAN` いずれも）を持たない
+    // 広域取得（ソートなしのフィルタ取得）として受理する。`LIMIT` 直後は文末のみを
+    // 許可し（`USING MODE`・`HINT ORDER` は受理しない。§3.1「本リポの実装既定値」）、
+    // それ以外の余剰トークンは `expect_end_of_statement` が `42601` へ落とす。
+    if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
+        p.advance();
+        let limit_str = p.expect_number()?;
+        let limit: u32 = limit_str.parse().map_err(|_| {
+            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
+        })?;
+
+        p.expect_end_of_statement()?;
+
+        return Ok(ParsedSelect::Scan(ParsedScanShape {
+            table_name,
+            projection,
+            where_predicates,
+            limit,
+        }));
     }
 
     p.expect_keyword(Keyword::Order)?;
@@ -1671,7 +1772,7 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> 
 
     p.expect_end_of_statement()?;
 
-    Ok(ParsedShape {
+    Ok(ParsedSelect::Search(ParsedShape {
         table_name,
         projection,
         where_predicates,
@@ -1680,7 +1781,7 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> 
         search_mode,
         evaluation_order,
         using_plan: None,
-    })
+    }))
 }
 
 /// 構文木（[`ValidatedAggregate`] の元）。カタログ存在確認前の中間結果
@@ -1906,23 +2007,38 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
                 group_by: shape.group_by,
             }))
         }
-        Some(Token::Keyword(Keyword::Select)) => {
-            let shape = parse_select_shape(&tokens)?;
-            let exists = lookup.table_exists(&shape.table_name)?;
-            if !exists {
-                return Err(SqlSurfaceError::undefined_table(shape.table_name));
+        Some(Token::Keyword(Keyword::Select)) => match parse_select_shape(&tokens)? {
+            ParsedSelect::Search(shape) => {
+                let exists = lookup.table_exists(&shape.table_name)?;
+                if !exists {
+                    return Err(SqlSurfaceError::undefined_table(shape.table_name));
+                }
+                Ok(Statement::Select(ValidatedStatement {
+                    table_name: shape.table_name,
+                    projection: shape.projection,
+                    order_by: shape.order_by,
+                    where_predicates: shape.where_predicates,
+                    limit: shape.limit,
+                    search_mode: shape.search_mode,
+                    evaluation_order: shape.evaluation_order,
+                    using_plan: shape.using_plan,
+                }))
             }
-            Ok(Statement::Select(ValidatedStatement {
-                table_name: shape.table_name,
-                projection: shape.projection,
-                order_by: shape.order_by,
-                where_predicates: shape.where_predicates,
-                limit: shape.limit,
-                search_mode: shape.search_mode,
-                evaluation_order: shape.evaluation_order,
-                using_plan: shape.using_plan,
-            }))
-        }
+            // Issue #454: `ORDER BY`・`USING PLAN` のいずれも伴わない
+            // `SELECT ... [WHERE ...] LIMIT n`（広域取得）。
+            ParsedSelect::Scan(shape) => {
+                let exists = lookup.table_exists(&shape.table_name)?;
+                if !exists {
+                    return Err(SqlSurfaceError::undefined_table(shape.table_name));
+                }
+                Ok(Statement::Scan(ValidatedScan {
+                    table_name: shape.table_name,
+                    projection: shape.projection,
+                    where_predicates: shape.where_predicates,
+                    limit: shape.limit,
+                }))
+            }
+        },
         _ if is_set_statement => {
             let value = parse_set_search_mode(&tokens)?;
             Ok(Statement::SetSearchMode { value })
@@ -1968,7 +2084,20 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
                     "EXPLAIN is not supported for aggregate SELECT statements",
                 ));
             }
-            let shape = parse_select_shape(rest)?;
+            // Issue #454: 広域取得（`ParsedSelect::Scan`）は `USING PLAN` を
+            // 持てない形（ランキング段自体を持たない）ため、既存の
+            // `shape.using_plan.is_none()` 判定と同じ理由で一律 `42601` に
+            // 落とす（`EXPLAIN` は「`USING PLAN` を伴う検索 SELECT」の前置のみを
+            // 受理する契約。本モジュールドキュメントの `Statement::Explain`
+            // 参照）。
+            let shape = match parse_select_shape(rest)? {
+                ParsedSelect::Search(shape) => shape,
+                ParsedSelect::Scan(_) => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is only supported for SELECT ... USING PLAN(...) statements",
+                    ));
+                }
+            };
             if shape.using_plan.is_none() {
                 return Err(SqlSurfaceError::unsupported(
                     "EXPLAIN is only supported for SELECT ... USING PLAN(...) statements",
@@ -2025,6 +2154,12 @@ pub fn validate_statement(
         // ポイントでは受理しない（一律 `42601`）。
         Statement::Explain(_) => Err(SqlSurfaceError::unsupported(
             "EXPLAIN is not a search query statement (use a session-aware entry point)",
+        )),
+        // Issue #454: 広域取得は `ValidatedStatement`（検索 SELECT 専用の形）を
+        // 持たないため、`Aggregate` と同じくこのエントリポイントでは受理しない
+        // （一律 `42601`）。
+        Statement::Scan(_) => Err(SqlSurfaceError::unsupported(
+            "wide-retrieval scan is not a search query statement (use a session-aware entry point)",
         )),
     }
 }
@@ -3711,6 +3846,98 @@ mod tests {
     fn aggregate_classification_is_deterministic_across_repeated_calls() {
         let lookup = catalog_with(&["documents"]);
         let sql = "SELECT COUNT(*) FROM documents WHERE lang = 'en'";
+        let first = validate_sql(sql, &lookup).expect("first call should succeed");
+        let second = validate_sql(sql, &lookup).expect("second call should succeed");
+        assert_eq!(first, second);
+    }
+
+    // --- 広域取得（ソートなしのフィルタ取得。Issue #454） -----------------------
+
+    fn expect_scan(sql: &str, lookup: &impl TableLookup) -> ValidatedScan {
+        match validate_sql(sql, lookup).expect("expected the scan shape to be accepted") {
+            Statement::Scan(scan) => scan,
+            other => panic!("expected Statement::Scan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_bare_select_star_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan("SELECT * FROM documents LIMIT 500", &lookup);
+        assert_eq!(scan.table_name(), "documents");
+        assert_eq!(scan.limit(), 500);
+        assert!(scan.where_predicates().is_empty());
+    }
+
+    #[test]
+    fn accepts_scan_with_where_and_column_list() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "SELECT id, body FROM documents WHERE lang = 'ja' LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(scan.where_predicates().len(), 1);
+        assert!(matches!(scan.projection(), Projection::Columns(cols) if cols == &["id", "body"]));
+    }
+
+    #[test]
+    fn rejects_scan_missing_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT * FROM documents", &lookup)
+            .expect_err("SELECT without ORDER BY/USING PLAN/LIMIT must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_scan_with_using_mode_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT * FROM documents LIMIT 10 USING MODE 'precision'",
+            &lookup,
+        )
+        .expect_err("bare LIMIT scan must not accept USING MODE");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_scan_with_hint_order_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT * FROM documents LIMIT 10 HINT ORDER(DISTANCE, SCALAR, RLS)",
+            &lookup,
+        )
+        .expect_err("bare LIMIT scan must not accept HINT ORDER");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_undefined_table_for_scan_with_42p01() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT * FROM ghost LIMIT 10", &lookup)
+            .expect_err("scan against an undefined table must be rejected");
+        assert_eq!(err.wire_code(), "42P01");
+    }
+
+    #[test]
+    fn validate_statement_rejects_scan_as_search_query() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement("SELECT * FROM documents LIMIT 10", &lookup)
+            .expect_err("scan must be rejected by the SELECT-only (ORDER BY) entry point");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn explain_rejects_scan_shape() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("EXPLAIN SELECT * FROM documents LIMIT 10", &lookup)
+            .expect_err("EXPLAIN must reject a bare LIMIT scan (no USING PLAN)");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn scan_classification_is_deterministic_across_repeated_calls() {
+        let lookup = catalog_with(&["documents"]);
+        let sql = "SELECT * FROM documents WHERE lang = 'en' LIMIT 10";
         let first = validate_sql(sql, &lookup).expect("first call should succeed");
         let second = validate_sql(sql, &lookup).expect("second call should succeed");
         assert_eq!(first, second);

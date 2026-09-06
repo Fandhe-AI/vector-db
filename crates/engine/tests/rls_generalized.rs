@@ -939,6 +939,87 @@ fn using_plan_dispatch_fails_closed_without_embedder_or_planner() {
     assert!(err.client_message().contains("internal error"));
 }
 
+// ---------- Issue #454: 広域取得（ソートなしのフィルタ取得）への RLS 一般化 ----------
+//
+// `Statement::Scan` は早期終了（可視かつ WHERE を満たす行が `LIMIT` 件集まった
+// 時点で走査を打ち切る）を持つため、(a) `LIMIT` が可視総数以上ならオラクル集合と
+// 完全一致すること、(b) 小さい `LIMIT` でも返却集合がオラクル集合の部分集合かつ
+// 件数が `min(limit, |oracle|)` に一致することの両方を確認しないと、早期終了が
+// 不可視行を早期に打ち切りへ数えてしまう fail-open な実装（他テナントの存在で
+// 打ち切りタイミングが変わり件数が漏れる）を見逃す（advisor 指摘: (a) を欠くと
+// オラクル比較が vacuous になる）。
+
+#[test]
+fn scan_limit_at_or_above_visible_total_matches_oracle_set_exactly() {
+    let path = unique_db_path("rls8-scan-full");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let truths = seed_corpus(&storage);
+    let core = new_core(storage);
+
+    for t in TABLES.iter() {
+        for &tenant in TENANTS.iter() {
+            for allow_private in [false, true] {
+                let ctx = ctx_for(tenant, allow_private);
+                let allowed = allowed_set(&truths, t.name, tenant, allow_private);
+                // 可視総数以上の LIMIT（全テーブル・全テナントの行総数を安全に
+                // 上回る値。ROWS_PER_TENANT * TENANTS.len() の合計を超える）。
+                let sql = format!("SELECT id FROM {} LIMIT 10000", t.name);
+                let result = core
+                    .execute_sql(&ctx, &sql)
+                    .unwrap_or_else(|e| panic!("scan should succeed: sql={sql:?} err={e:?}"));
+                let got: HashSet<u64> = result_ids(&result).into_iter().collect();
+                assert_eq!(
+                    got, allowed,
+                    "LIMIT above visible total must return exactly the oracle set: table={} tenant={tenant} allow_private={allow_private}",
+                    t.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn scan_small_limit_returns_subset_with_exact_count_and_no_leak() {
+    let path = unique_db_path("rls8-scan-subset");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let truths = seed_corpus(&storage);
+    let core = new_core(storage);
+
+    // ROWS_PER_TENANT(6) * TENANTS.len()(4) = 24 が単一テーブルの物理行総数。
+    // allow_private=true なら最大 24、false なら最大 12 の可視総数になりうるため、
+    // どちらでも「小さい LIMIT」として機能する値を使う。
+    const SMALL_LIMIT: usize = 3;
+
+    for t in TABLES.iter() {
+        for &tenant in TENANTS.iter() {
+            for allow_private in [false, true] {
+                let ctx = ctx_for(tenant, allow_private);
+                let allowed = allowed_set(&truths, t.name, tenant, allow_private);
+                let sql = format!("SELECT id FROM {} LIMIT {SMALL_LIMIT}", t.name);
+                let result = core
+                    .execute_sql(&ctx, &sql)
+                    .unwrap_or_else(|e| panic!("scan should succeed: sql={sql:?} err={e:?}"));
+                let expected_len = SMALL_LIMIT.min(allowed.len());
+                assert_eq!(
+                    result.rows.len(),
+                    expected_len,
+                    "row count must be min(limit, |oracle|): table={} tenant={tenant} allow_private={allow_private}",
+                    t.name
+                );
+                for row in &result.rows {
+                    assert!(
+                        allowed.contains(&row.id),
+                        "disallowed row leaked under early termination: table={} tenant={tenant} allow_private={allow_private} id={}",
+                        t.name, row.id
+                    );
+                }
+            }
+        }
+    }
+}
+
 // ---------- 負の対照: 検査ヘルパ自体が違反を見逃さないことを固定する ----------
 
 #[test]

@@ -40,6 +40,10 @@
 //! - [`sparse_cache`][]: `exec` の hybrid 実行が参照する `SparseIndex`（BM25 語彙・
 //!   統計）のテーブル世代整合キャッシュ（Issue #357）。フィルタなし hybrid クエリに
 //!   限り、同一世代内の連続クエリで疎索引の再構築を償却する
+//! - [`scan`][]: ランキング段（`ORDER BY`／`USING PLAN`）を持たない広域取得
+//!   （ソートなしのフィルタ取得。`SELECT ... [WHERE ...] LIMIT n`。Issue #454）の
+//!   実行。[`aggregate`] と同じく `VectorArena` を経由しない redb 直接走査で、
+//!   `VECTOR` 列を持たないテーブルでも動作する
 //!
 //! TASK-166（対象ビヘイビア: SQL-13）: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のみを結果列
 //! とする単一テーブル SELECT（C6a）を追加した。構文は [`allowlist`]（`Statement::Aggregate`）、
@@ -100,6 +104,7 @@ pub mod lexer;
 pub mod mode;
 pub mod parser;
 pub mod plan;
+pub mod scan;
 pub(crate) mod sparse_cache;
 pub mod udf_call;
 

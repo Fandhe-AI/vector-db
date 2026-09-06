@@ -1890,6 +1890,26 @@ impl EngineCore {
                     }
                 }
             }
+            // Issue #454: 広域取得（`Scan`）はセッション UDF レジストリを参照する
+            // 式項目・式述語を持ちうるため、`Select`・`Aggregate` と同じくセッション
+            // を要する実行本体（`execute_validated_in_session`）へ委譲する。
+            stmt @ crate::sql::allowlist::Statement::Scan(_) => {
+                // `stmt` は上と同じく `validate_sql` 済みのため再パースしない
+                // （Issue #314・SQL-1・TASK-83 条件7 の踏襲）。
+                let mut session = crate::sql::mode::SessionState::default();
+                match self.execute_validated_in_session(ctx, &mut session, stmt)? {
+                    crate::sql::SqlOutcome::Query(result) => Ok(result),
+                    crate::sql::SqlOutcome::SetSearchMode(_)
+                    | crate::sql::SqlOutcome::CreateFunction { .. }
+                    | crate::sql::SqlOutcome::Explain(_)
+                    | crate::sql::SqlOutcome::Insert(_) => {
+                        Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "unexpected non-Query outcome for a statement already classified as Scan"
+                                .to_string(),
+                        })
+                    }
+                }
+            }
             // TASK-78（SQL-6）: `EXPLAIN` は検索本体を実行しない別の応答形
             // （`SqlOutcome::Explain`）を返すため、`QueryResult` のみを返す本
             // エントリポイントでは受理しない（`SET`・`CREATE FUNCTION` と同じ
@@ -2299,6 +2319,35 @@ impl EngineCore {
                     crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
                 let result =
                     crate::sql::aggregate::execute_aggregate(&read_txn, ctx, &schema, &bound)?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            // Issue #454: 広域取得（ソートなしのフィルタ取得）は `Statement::Aggregate`
+            // アームと同じく、スキーマ取得（`bind_scan` 用）・行走査
+            // （`sql::scan::execute_scan`）を単一の `read_txn`（同一スナップショット）
+            // 上で行う。`VectorArena`（既存の検索 SELECT 実行経路）は経由しない
+            // （`VECTOR` 列を持たないテーブルでも動作させるため。`sql::scan`
+            // モジュールドキュメント参照）。
+            crate::sql::allowlist::Statement::Scan(validated) => {
+                let read_txn = self.storage.db().begin_read().map_err(|e| {
+                    crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: format!(
+                            "failed to begin read transaction: {}",
+                            StorageError::from(e)
+                        ),
+                    }
+                })?;
+                let schema =
+                    crate::catalog::get_table_schema_in_txn(&read_txn, &validated.table_name)
+                        .map_err(|e| match e {
+                            CatalogError::TableNotFound(name) => {
+                                crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                            }
+                            other => crate::sql::allowlist::SqlSurfaceError::Internal {
+                                detail: format!("failed to load table schema: {other}"),
+                            },
+                        })?;
+                let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
+                let result = crate::sql::scan::execute_scan(&read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             // TASK-78（SQL-6）: `EXPLAIN SELECT ... USING PLAN(...)` は検索本体
