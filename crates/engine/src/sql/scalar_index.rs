@@ -137,6 +137,30 @@ fn check_scalar_index_budget(
     Ok(())
 }
 
+/// `values`/`offsets`/`slots`/`equality`（[`TextColumnIndex`] の 4 配列）を
+/// 重複排除前の `pair_count` 件分だけ一括で `try_reserve_exact` する際に、
+/// **実際に確保される**構造体サイズ分のバイト量（codex-review P1 対応・
+/// PR #569 未解決分。`values: Vec<String>` 等の容量は `String`/`u32`/
+/// `(String, u32)` の構造体サイズ分だけ確保され、その中身（文字列バイト列）は
+/// 別途 [`approx_string_entry_bytes`] で行走査時に予算検証・計上済みだが、
+/// 高重複 TEXT 列では重複排除後の実要素数（[`TextColumnIndex::approx_heap_bytes`]
+/// が計上する対象）が `pair_count` を大幅に下回り、この**確保容量そのもの**が
+/// 予算計上から漏れて `MAX_SCALAR_INDEX_BYTES` を実質バイパスし得た。呼び出し元は
+/// 4 配列を確保する**前**に本関数の結果を [`check_scalar_index_budget`] で検証し、
+/// 通れば `running` へ加算する契約とする）。
+fn text_column_reservation_bytes(pair_count: usize) -> usize {
+    let values_bytes = pair_count.saturating_mul(std::mem::size_of::<String>());
+    let offsets_bytes = pair_count
+        .saturating_add(1)
+        .saturating_mul(std::mem::size_of::<u32>());
+    let slots_bytes = pair_count.saturating_mul(std::mem::size_of::<u32>());
+    let equality_bytes = pair_count.saturating_mul(std::mem::size_of::<(String, u32)>());
+    values_bytes
+        .saturating_add(offsets_bytes)
+        .saturating_add(slots_bytes)
+        .saturating_add(equality_bytes)
+}
+
 /// 1 つの `TEXT` 列に対する索引（等価直引き＋前方一致範囲走査の両方を支える
 /// 共有データ構造。モジュールドキュメント「データモデル」参照）。
 ///
@@ -306,6 +330,13 @@ impl ScalarIndex {
                                                                  // （codex-review P2 対応・PR #569）。`slots` は値と無関係に
                                                                  // 行数分（`pairs.len()`）で確定するため同様に一括確保する。
                     let pair_count = pairs.len();
+                    // 上記 4 配列の確保容量（重複排除前の pair_count 件分）は
+                    // 実メモリとして確保されるため、確保前にバイト予算へ計上して
+                    // 検証する（codex-review P1 対応・PR #569 未解決分。
+                    // `text_column_reservation_bytes` 参照）。
+                    let reservation_bytes = text_column_reservation_bytes(pair_count);
+                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
+                    approx_bytes = approx_bytes.saturating_add(reservation_bytes);
                     let mut values: Vec<String> = Vec::new();
                     values
                         .try_reserve_exact(pair_count)
@@ -1073,6 +1104,39 @@ mod tests {
         // `saturating_add` によるオーバーフロー耐性（巨大な累計値でもパニックしない）。
         assert!(matches!(
             check_scalar_index_budget(usize::MAX, 1),
+            Err(ScalarIndexBuildError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn text_column_reservation_bytes_scales_with_pair_count_regardless_of_dedup() {
+        // 重複排除前の pair_count のみに依存する（実際に何種類の値が
+        // 含まれるかは無関係）。高重複列でも確保容量分の予算計上を
+        // バイパスできないことを固定する（codex-review P1 対応・PR #569
+        // 未解決分）。
+        // pair_count=0 でも offsets は 1 件（先頭の 0）分だけ確保される。
+        assert_eq!(text_column_reservation_bytes(0), std::mem::size_of::<u32>());
+        let per_entry = std::mem::size_of::<String>()
+            + std::mem::size_of::<u32>() // offsets（pair_count + 1 分だが定数項は無視）
+            + std::mem::size_of::<u32>()
+            + std::mem::size_of::<(String, u32)>();
+        let pair_count = 1_000;
+        let bytes = text_column_reservation_bytes(pair_count);
+        // offsets の +1 分だけ厳密な等式ではなく下限として確認する。
+        assert!(bytes >= pair_count.saturating_mul(per_entry));
+    }
+
+    #[test]
+    fn text_column_reservation_bytes_budget_rejects_high_duplication_column() {
+        // 1 GiB 上限に対し、重複排除後は 1 件しか実データが残らない列でも、
+        // 確保容量（pair_count 件分）だけで上限を超えるケースを検証する。
+        // 一致し得ない大きさの pair_count（例: 全行が同一値の高重複 TEXT 列）を
+        // 想定し、確保**前**の予算検証でバイパスされないことを固定する。
+        let huge_pair_count = MAX_SCALAR_INDEX_BYTES; // 明らかに 1 GiB を超える確保容量になる件数
+        let reservation_bytes = text_column_reservation_bytes(huge_pair_count);
+        assert!(reservation_bytes > MAX_SCALAR_INDEX_BYTES);
+        assert!(matches!(
+            check_scalar_index_budget(0, reservation_bytes),
             Err(ScalarIndexBuildError::TooLarge)
         ));
     }
