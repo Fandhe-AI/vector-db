@@ -1020,7 +1020,7 @@ BENCH_HNSW_PARALLEL_THREADS=1,12 <scratch>/target-after/release/deps/hnsw_parall
 | `bench-hnsw-compare` self build（N=5・rows=20,000 縮小構成） | 211.687ms | 182.233ms | 0.861x | ノイズ帯内 |
 | `bench-hnsw-compare` self search median | 32.244us | 33.841us | 1.050x | ノイズ帯内 |
 | `bench-knn-profile` S0_cold（brute_force・N=1） | 31.418ms | 31.927ms | 1.016x | ほぼ同水準（hnsw 側は run1 同士の N=1 ペアで −2.4%・実測帯内） |
-| `feature_bench` `vector_knn`（フィルタなし DISTANCE・N=3・hnsw arm のみ） | 8418us | 388us | **0.046x** | Improved 方向で一貫（共有環境の参考値） |
+| `feature_bench` `vector_knn`（フィルタなし DISTANCE・N=3・hnsw arm のみ） | 8418us | 388us | 0.046x | ノイズ帯内（固定帯は超過するが `ingest` 参照区間の実測帯 101.1% は超えず、`benchmark-judgement-policy.md` §4 の基準では有効な変化と確定できない。加えて #563〔Phase 2〕との交絡もあり Phase 3 単独の帰属もできない。3/3 run で同方向・同オーダーである点は事実として記録） |
 | Recall 3 ゲート（before/after × brute_force/hnsw・4 系列・11 指標） | — | — | — | **完全一致（非退行の確定的証拠）** |
 
 詳細な計測条件・交絡の整理・全 run 生データ・限界は
