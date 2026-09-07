@@ -281,9 +281,9 @@ fn search_range(
     // `vectors` が不足する場合は、既存の 1 行ずつの経路（[`push_row`]）へ
     // フォールバックする。選出（`TopKSelector`）はスコア・id の全順序で行うため
     // push 順には依存せず、ブロック化しても結果集合・順序は 1 行版と変わらない。
-    let mut blocks = ids.chunks_exact(4);
+    let (blocks, remainder) = ids.as_chunks::<4>();
     let mut base_row = row_offset;
-    for block_ids in &mut blocks {
+    for block_ids in blocks {
         let row_slice = |offset: usize| -> Option<&[f32]> {
             let row = base_row.saturating_add(offset);
             let start = row.saturating_mul(dim);
@@ -291,14 +291,9 @@ fn search_range(
             vectors.get(start..end)
         };
         let (r0, r1, r2, r3) = (row_slice(0), row_slice(1), row_slice(2), row_slice(3));
-        let [id0, id1, id2, id3] = *block_ids else {
-            // `chunks_exact(4)` の契約上到達しない（各チャンクは常に長さ 4）。
-            // 到達した場合も panic させず、ブロック全体を fail-closed に skip する
-            // （coding-rust.md: untrusted 入力経路で unwrap/panic を避ける方針を
-            // ここでも踏襲する）。
-            base_row = base_row.saturating_add(4);
-            continue;
-        };
+        // `as_chunks::<4>()` の型契約上 `block_ids: &[u64; 4]` は常に長さ 4 のため
+        // 分解は infallible（`chunks_exact` 時代の到達不能フォールバックは不要）。
+        let [id0, id1, id2, id3] = *block_ids;
 
         match (r0, r1, r2, r3) {
             (Some(v0), Some(v1), Some(v2), Some(v3)) => {
@@ -318,7 +313,7 @@ fn search_range(
         base_row = base_row.saturating_add(4);
     }
 
-    for (offset, &id) in blocks.remainder().iter().enumerate() {
+    for (offset, &id) in remainder.iter().enumerate() {
         let row = base_row.saturating_add(offset);
         let start = row.saturating_mul(dim);
         let end = start.saturating_add(dim);

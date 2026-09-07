@@ -59,9 +59,11 @@ fn load8(c: &[f32; 8]) -> __m256 {
 /// SLP による要素ごと挿入命令の再混入が起きない）。`_mm256_castps256_ps128`／
 /// `_mm256_extractf128_ps` で上下 128 bit（`__m128`）へ分解したあと、
 /// `_mm_permute_ps` でレーンを先頭へ回してから `_mm_cvtss_f32` で取り出す。
-/// 和の計算順は `[f32; 8]::iter().sum()`（`fold(0.0, Add::add)`）と同一の
-/// `((((((0.0 + l0) + l1) + l2) + l3) + l4) + l5) + l6) + l7` にし、
-/// [`super::lane_sum`] とビット同一になるようにする。
+/// 和の計算順は `[f32; 8]::iter().sum()`（加算の単位元 `-0.0` を初期値とする
+/// `fold(-0.0, Add::add)`）と同一の
+/// `(((((((-0.0 + l0) + l1) + l2) + l3) + l4) + l5) + l6) + l7` にし、
+/// [`super::lane_sum`] とビット同一になるようにする（符号付きゼロを含む境界値でも
+/// 一致させるため、初期値は `+0.0` ではなく `-0.0` を用いる）。
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 fn lane_sum8(v: __m256) -> f32 {
@@ -76,7 +78,7 @@ fn lane_sum8(v: __m256) -> f32 {
     let l6 = _mm_cvtss_f32(_mm_permute_ps::<0b10_10_10_10>(hi));
     let l7 = _mm_cvtss_f32(_mm_permute_ps::<0b11_11_11_11>(hi));
 
-    let mut sum = 0.0f32;
+    let mut sum = -0.0f32;
     sum += l0;
     sum += l1;
     sum += l2;
@@ -156,7 +158,8 @@ fn load16(c: &[f32; 16]) -> __m512 {
 /// `__m512` の 16 レーンをインデックス昇順に取り出して和を返す（[`lane_sum8`] の
 /// 512 bit 版）。`_mm512_castps512_ps128`／`_mm512_extractf32x4_ps` で 4 つの
 /// `__m128` へ分解してから [`lane_sum8`] と同じ `_mm_permute_ps`＋`_mm_cvtss_f32`
-/// で取り出し、`0.0` から始まる左畳み込みで和を計算する。
+/// で取り出し、加算の単位元 `-0.0` から始まる左畳み込みで和を計算する
+/// （[`lane_sum8`] と同じ理由で `+0.0` ではなく `-0.0` を初期値にする）。
 #[target_feature(enable = "avx512f")]
 #[inline]
 fn lane_sum16(v: __m512) -> f32 {
@@ -182,7 +185,7 @@ fn lane_sum16(v: __m512) -> f32 {
     let l14 = _mm_cvtss_f32(_mm_permute_ps::<0b10_10_10_10>(q3));
     let l15 = _mm_cvtss_f32(_mm_permute_ps::<0b11_11_11_11>(q3));
 
-    let mut sum = 0.0f32;
+    let mut sum = -0.0f32;
     sum += l0;
     sum += l1;
     sum += l2;

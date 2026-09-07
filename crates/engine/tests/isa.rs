@@ -346,18 +346,15 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
 
     for path in &rs_files {
         let content = std::fs::read_to_string(path).expect("read source file");
-        // Issue #510: `isa/x86_block4.rs`（`isa.rs` の cfg(x86_64) サブモジュール）も
+        // Issue #510: `isa/x86_block4.rs`（`isa.rs` の cfg(x86_64) サブモジュール）は
         // `unsafe` を持たない safe fn のみで構成する契約（ADR
-        // `docs/design/simd-intrinsics-adoption.md` 決定 1）のため、`isa.rs` 本体と
-        // 同じ「`unsafe` 不在」検査の対象からは除外しつつ、`isa/` 配下全体を
-        // `isa.rs` と同じ扱いにする（ディレクトリ名一致で判定。ファイル名のみの
-        // 一致だと `isa/mod.rs` のような将来の分割形にも追随できないため）。
-        let is_isa_module = path.file_name().and_then(|n| n.to_str()) == Some("isa.rs")
-            || path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                == Some("isa");
+        // `docs/design/simd-intrinsics-adoption.md` 決定 1）だが、それはこの検査を
+        // 弱める理由にはならない。`unsafe` を許すのは sealed トークン所持を根拠に
+        // 検証済みの `isa.rs` 本体のみとし、`isa/` 配下のサブモジュールへ `unsafe`
+        // が紛れ込んだ場合はこの検査で検出できるよう除外範囲を `isa.rs` 単体に限定
+        // する（codex-review 指摘対応。ディレクトリ一致による除外は
+        // `isa/x86_block4.rs` への `unsafe` 追加を無検査で通してしまうため撤回）。
+        let is_isa_module = path.file_name().and_then(|n| n.to_str()) == Some("isa.rs");
 
         if !is_isa_module {
             assert!(
