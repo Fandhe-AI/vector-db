@@ -27,6 +27,18 @@
 //! 論理コア数まで・`BENCH_HNSW_PARALLEL_THREADS` でカンマ区切り上書き可）
 //! ごとに構築の段別中央値・ワーカー統計・対照負荷 speedup を出す。合否閾値は
 //! 持たない情報提供専用ベンチ（spec 由来の基準ではない）。
+//!
+//! # Issue #495 追記: CSR 化（Issue #494）の前後比較実測
+//!
+//! `HnswBuildProfile.flatten`（凍結時の CSR 平坦化段。逐次縮退経路では
+//! `Duration::ZERO`）を段別出力・`serial_share` の逐次段合算へ追加し、各
+//! threads 点で 1 回だけ構築した索引を保持したまま常駐メモリ（RSS 前後差・
+//! `HnswIndex::approx_heap_bytes`・VmHWM）を計測する行を追加した。CSR 化前
+//! （commit `929c027`）とのビルド互換のため、メモリ計測は `flatten` に
+//! 依存しない `HnswIndex::build_with_threads`（`build_with_threads_observed`
+//! ではない）を使う——両コミットに存在する公開 API のみで構成し、CSR 化前
+//! バイナリでもこの計測部分だけは変更なしに動く（`docs/design/hnsw-index.md`
+//! §14.13 の before/after 実測手順参照）。
 
 #[allow(dead_code)]
 mod harness;
@@ -200,6 +212,34 @@ fn control_dot_scan(corpus: &[f32], dim: usize, threads: usize) -> f32 {
     })
 }
 
+/// この threads 点で 1 回だけ `build_with_threads` した [`HnswIndex`] を保持
+/// したまま常駐メモリ（RSS）増分・`approx_heap_bytes` を計測する（Issue #495。
+/// `hybrid_profile_bench.rs`「索引を保持したまま RSS 前後を比較する」方式を
+/// 踏襲）。`protocol::run`（warmup・計測の反復測定）の外側で 1 回のみ構築
+/// することで、時間計測（`measure_threads_profiled`）とメモリ計測を独立させ、
+/// 前者のウォームアップ回数に引きずられない単発のメモリスナップショットにする。
+/// `HnswIndex::approx_heap_bytes` は Issue #494 の CSR 化メモリ見積り
+/// （`docs/design/hnsw-index.md` §14.6）を実測で突き合わせる材料。
+fn measure_memory(corpus: &[f32], params: HnswParams, threads: usize) -> Result<String, String> {
+    let vm_rss_kb_before = read_vm_rss_kb();
+    let index = HnswIndex::build_with_threads(params, DIM as u32, corpus, 1, threads)
+        .map_err(|e| format!("threads={threads}: memory measurement build failed: {e}"))?;
+    let approx_heap_bytes = index.approx_heap_bytes();
+    let vm_rss_kb_after = read_vm_rss_kb();
+    let vm_hwm_kb = harness::proc_stats::read_vm_hwm_kb();
+    // 索引はこのメモリ差分計測の対象そのものであり、以降の段では参照しないため
+    // ここで明示的に drop する（計測意図の明確化。`hybrid_profile_bench.rs` と
+    // 同一方針）。
+    drop(index);
+    Ok(harness::hnsw_parallel_profile::render_memory_line(
+        threads,
+        approx_heap_bytes,
+        vm_rss_kb_before,
+        vm_rss_kb_after,
+        vm_hwm_kb,
+    ))
+}
+
 fn measure_control(corpus: &[f32], threads: usize) -> Result<Duration, String> {
     let config = MeasurementConfig::new(20, 20, 0xC0FFEE_u64 ^ threads as u64)
         .map_err(|e| format!("control threads={threads}: {e}"))?;
@@ -270,6 +310,14 @@ fn main() {
     for &threads in &ladder {
         print_noise_snapshot(threads);
 
+        match measure_memory(&corpus, params, threads) {
+            Ok(line) => println!("{line}"),
+            Err(e) => {
+                eprintln!("hnsw_parallel_build_bench: {e}");
+                had_error = true;
+            }
+        }
+
         // この threads 点の `parallel_speedup`（ceiling 行が対照負荷 speedup と
         // 比較するために再利用する。`measure_control` 側で測り直さない——
         // 同じ計測を 2 回走らせるとベンチ全体の所要時間が倍化するため）。
@@ -328,6 +376,15 @@ fn main() {
                 )
                 .map(|(_, med, _)| med)
                 .unwrap_or_default();
+                // Issue #495: CSR 平坦化段（`repair_reachability` 完了後の最終段。
+                // `engine::hnsw::HnswBuildProfile::flatten` ドキュメンテーション
+                // コメント参照）の中央値。逐次縮退経路（threads==1 または
+                // n<=SEQUENTIAL_PREFIX_NODES）では `Duration::ZERO` のまま。
+                let flatten = min_median_max_duration(
+                    &profiles.iter().map(|p| p.flatten).collect::<Vec<_>>(),
+                )
+                .map(|(_, med, _)| med)
+                .unwrap_or_default();
 
                 if parallel_base_threads == Some(threads) {
                     parallel_phase_base = Some(parallel_phase);
@@ -343,19 +400,21 @@ fn main() {
                     sequential_prefix,
                     freeze,
                     repair,
+                    flatten,
                     total_median,
                 )
                 .map(|s| s * 100.0)
                 .unwrap_or(f64::NAN);
 
                 println!(
-                    "hnsw_parallel_build: threads={threads} total={:.3}ms level={:.3}ms prefix={:.3}ms parallel={:.3}ms freeze={:.3}ms repair={:.3}ms serial_share={share:.2}% parallel_speedup={parallel_speedup:.3}x total_speedup={total_speedup:.3}x wall_median_with_drop={:.3}ms",
+                    "hnsw_parallel_build: threads={threads} total={:.3}ms level={:.3}ms prefix={:.3}ms parallel={:.3}ms freeze={:.3}ms repair={:.3}ms flatten={:.3}ms serial_share={share:.2}% parallel_speedup={parallel_speedup:.3}x total_speedup={total_speedup:.3}x wall_median_with_drop={:.3}ms",
                     total_median.as_secs_f64() * 1000.0,
                     level_assign.as_secs_f64() * 1000.0,
                     sequential_prefix.as_secs_f64() * 1000.0,
                     parallel_phase.as_secs_f64() * 1000.0,
                     freeze.as_secs_f64() * 1000.0,
                     repair.as_secs_f64() * 1000.0,
+                    flatten.as_secs_f64() * 1000.0,
                     wall_median.as_secs_f64() * 1000.0,
                 );
 
