@@ -355,25 +355,33 @@ fn ef_sweep_recall_table_clustered_and_uniform_corpus() {
 
     // oversampling（候補数を増やし元の f32 ベクトルで再採点）が Recall@10 の
     // ギャップを縮められるかを、`ef` 掃引とは独立に見る（codex-review 指摘
-    // 対応・PR #621）。`ef` は既定値 64 に固定し、`oversample_k`（HNSW から
-    // 取得する候補数）のみを 10（oversample なし）→20→50→100 と増やす。
+    // 対応・PR #621）。呼び出し引数の `ef` は 64 で固定するが、
+    // `HnswIndex::search` 内部は探索幅を `ef.max(k)`（本関数の `k` は
+    // `oversample_k`）へ引き上げるため、`oversample_k > 64` の測定点
+    // （`oversample_k=100`）は実効探索幅が 100 になり、`ef=64` 単独の
+    // 効果とは切り分けられない（codex-review 指摘対応・PR #621）。表には
+    // 「引数 ef」に加え実効探索幅 `ef_eff = ef.max(oversample_k)` を明示し、
+    // この点を明確にする。
     println!(
-        "oversample_rescore_table: rows={rows} dim={dim} clusters={clusters} ef=64 \
-         (candidates rescored with original f32 vectors; Issue #523・R5 codex-review 追記)"
+        "oversample_rescore_table: rows={rows} dim={dim} clusters={clusters} ef_arg=64 \
+         (candidates rescored with original f32 vectors; ef_eff = ef_arg.max(oversample_k) \
+         per HnswIndex::search internals; Issue #523・R5 codex-review 追記)"
     );
     for oversample_k in [10usize, 20, 50, 100] {
+        let ef_arg = 64usize;
+        let ef_eff = ef_arg.max(oversample_k);
         let i8_rescored = recall_at_10_oversample_rescored(
             &i8_clustered,
             &clustered,
             dim,
             rows,
-            64,
+            ef_arg,
             oversample_k,
             &clustered_queries,
         );
         println!(
             "oversample_k={oversample_k}: clustered i8_rescored={i8_rescored:.4} \
-             (brute-force f32 top-10 対照。ef=64 固定)"
+             (brute-force f32 top-10 対照。ef_arg={ef_arg} ef_eff={ef_eff})"
         );
     }
 }
