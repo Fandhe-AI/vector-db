@@ -606,7 +606,7 @@ fn measure_rerank_recall_via_hnsw(
 /// print_ann_stats` と同型の複製）。
 fn print_ann_stats(gate: &str, engine: RecallEngine, stats: &AnnStats) {
     println!(
-        "{gate}: engine={} builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={} f16_residency_fallbacks={} f16_kernel={:?} i8_residency_fallbacks={} i8_kernel={:?}",
+        "{gate}: engine={} builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={} f16_residency_fallbacks={} hybrid_resumed_rounds={} f16_kernel={:?} i8_residency_fallbacks={} i8_kernel={:?}",
         engine.token(),
         stats.builds,
         stats.build_failures,
@@ -615,6 +615,7 @@ fn print_ann_stats(gate: &str, engine: RecallEngine, stats: &AnnStats) {
         stats.hybrid_queries,
         stats.ef_cap_fallbacks,
         stats.f16_residency_fallbacks,
+        stats.hybrid_resumed_rounds,
         engine::isa::current_f16(),
         stats.i8_residency_fallbacks,
         engine::isa::current_i8(),

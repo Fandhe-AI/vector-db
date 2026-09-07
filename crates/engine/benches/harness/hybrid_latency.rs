@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use engine::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
 use engine::sparse::{DocId, SparseError, SparseIndex};
 
+use super::bench_engine::BenchEngine;
 use super::rng::DeterministicRng;
 
 /// [`generate_corpus`] が許容する文書数の安全上限（coding-rust.md「無制限確保禁止」。
@@ -214,6 +215,14 @@ pub enum HybridLatencyError {
     /// `.github/workflows/*` へ配線しない運用のため、誤って CI 経由で実行された
     /// 場合に defense-in-depth で拒否する。計画「fail-closed」節参照）。
     RefusedUnderGitHubActions,
+    /// SQL 表層（hnsw opt-in）計測モードの env 変数（`BENCH_HYBRID_LATENCY_*`）
+    /// が未知値・範囲外だった（Issue #506）。
+    InvalidEnvValue(String),
+    /// [`check_ann_non_vacuous`] が ANN opt-in 統計の非 vacuous 性を確認できな
+    /// かった（Issue #506。索引が構築されなかった・hybrid 密側再取得ループが
+    /// 索引経路を通らなかった・`hybrid_resumed_rounds` が期待どおり増えな
+    /// かった等）。
+    VacuousAnnMeasurement(String),
 }
 
 impl std::fmt::Display for HybridLatencyError {
@@ -231,6 +240,8 @@ impl std::fmt::Display for HybridLatencyError {
                  (GITHUB_ACTIONS is set); this bench is not wired into any workflow \
                  and must be run locally via `make bench-hybrid`"
             ),
+            HybridLatencyError::InvalidEnvValue(msg) => write!(f, "{msg}"),
+            HybridLatencyError::VacuousAnnMeasurement(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -367,4 +378,225 @@ pub fn render_stage_line(
         summary.reached_visible_set_count,
         summary.queries,
     )
+}
+
+// --------------------------------------------------------------------------
+// SQL 表層（hnsw opt-in）計測モード（Issue #506）。
+//
+// 上記の in-build 比較（`hybrid::hybrid_search` を `ParallelSearchProvider` で
+// 直接呼ぶ既定モード）は、Issue #505（`sql::hnsw_hybrid::HnswDenseProvider` の
+// 再開型探索）の実 seam を一切通らない。#505 の変更経路へ到達できる唯一の
+// production API は SQL 表層（`EngineCore::from_storage_with_engine` ＋
+// `ORDER BY HYBRID(...)`。Issue #412 の設計判断と同じ）であるため、実際の
+// fixture 構築（`SqlHybridBenchFixture`）は `hybrid_latency_bench.rs` 側に
+// 置く（`#[path] mod temp_db;` を本ファイルへ持ち込むと、既に独自の
+// `mod temp_db;` を crate root に宣言済みの他 bench/test バイナリ
+// （`tier_latency_bench.rs`・`knn_profile_bench.rs` 等。いずれも本モジュール
+// 〔`harness::hybrid_latency`〕を `harness/mod.rs` 経由で共有取り込みする）で
+// 同一物理ファイルの二重 `mod` になり `clippy::duplicate_mod` に抵触するため。
+// 本節に残す関数・型は `temp_db` に依存しない統計・パース・描画のみ）。
+/// `HnswIndexCacheStats`（`sql::hnsw_cache` は `pub(crate)` のため本クレート外
+/// からは型名を綴れない。フィールド値は `EngineCore::hnsw_index_cache_stats()`
+/// の戻り値から直接読める——「private 型を返す public 関数」は呼び出し可能
+/// だが型を名指しできないだけであり、Issue #412 の `tests/fixtures/
+/// recall_engine.rs::AnnStats` と同じパターン）を計測用に複製した統計サマリ。
+///
+/// `hybrid_resumed_rounds` のみ `Option<u64>`: `838c53e`（before バイナリ）の
+/// ツリーには該当フィールドが存在せず、直接アクセスするとその overlay では
+/// コンパイルが壊れる。[`extract_counter`] で `{:?}` の Debug 文字列越しに
+/// 読み取ることで、フィールド有無に関わらず両ツリーでこの型・関数を
+/// コンパイル可能にする（存在しないツリーでは常に `None`）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AnnRoundStats {
+    pub builds: u64,
+    pub build_failures: u64,
+    pub hybrid_dense_searches: u64,
+    pub hybrid_rounds_max: u64,
+    pub masked_short: u64,
+    pub fallbacks: u64,
+    pub ef_cap_fallbacks: u64,
+    pub f16_residency_fallbacks: u64,
+    pub hybrid_resumed_rounds: Option<u64>,
+}
+
+/// `debug`（`format!("{stats:?}")` の出力）から `"<name>: <digits>"` という
+/// 部分文字列を探し、`<digits>` を `u64` として読む。`derive(Debug)` の出力
+/// 形式（`Struct { field: value, ... }`）に依存する薄いパーサで、`name` の
+/// フィールドが構造体に存在しない場合・パースに失敗した場合は `None` を
+/// 返す（黙って `0` へ倒すと「フィールドが存在するが値が 0」と「フィールド
+/// 自体が無い」を区別できず、before ツリーでの非対応を誤って「0 回」と
+/// 報告してしまう。coding-rust.md「untrusted 入力の扱い」と同じ fail-closed
+/// 方針を、ここでは「他ツリーの Debug 出力」という半信頼入力に対しても適用
+/// する）。
+pub fn extract_counter(debug: &str, name: &str) -> Option<u64> {
+    let needle = format!("{name}: ");
+    let idx = debug.find(&needle)?;
+    let rest = &debug[idx + needle.len()..];
+    let digits_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits_end == 0 {
+        return None;
+    }
+    rest[..digits_end].parse::<u64>().ok()
+}
+
+/// [`SqlHybridBenchFixture::ann_stats`] を描画する（`render_stage_line` と同じ
+/// 「実測値を常に出力する」情報提供専用の方針）。`hybrid_resumed_rounds` が
+/// `None`（before ツリー・フィールド非対応）の場合は `n/a` と明示する。
+pub fn render_ann_stage_line(
+    stage: &str,
+    engine: BenchEngine,
+    median_us: u128,
+    p95_us: u128,
+    stats: AnnRoundStats,
+) -> String {
+    let resumed = stats
+        .hybrid_resumed_rounds
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    format!(
+        "hybrid_latency: stage={stage} engine={} p95_us={p95_us} median_us={median_us} \
+         builds={} build_failures={} hybrid_dense_searches={} hybrid_rounds_max={} \
+         masked_short={} fallbacks={} ef_cap_fallbacks={} f16_residency_fallbacks={} \
+         hybrid_resumed_rounds={resumed}",
+        engine.token(),
+        stats.builds,
+        stats.build_failures,
+        stats.hybrid_dense_searches,
+        stats.hybrid_rounds_max,
+        stats.masked_short,
+        stats.fallbacks,
+        stats.ef_cap_fallbacks,
+        stats.f16_residency_fallbacks,
+    )
+}
+
+/// ANN opt-in 統計の非 vacuous 検証（Issue #412 設計判断 4 と同方針。
+/// `tests/fixtures/recall_engine.rs::SqlHybridFixture::assert_ann_non_vacuous`
+/// の bench 版）。`expect_resumed` は `tie_refetch` 条件の after 側計測にのみ
+/// `true` を渡す——`no_refetch` コーパスは `hybrid_rounds_max == 1` に留まり
+/// 複数ラウンドに到達しないため `hybrid_resumed_rounds == 0` が正しい挙動で
+/// あり、ここへ `true` を渡すと構造的に失敗する（`hybrid_rounds_max == 1` は
+/// `hybrid.rs` が境界の同点グループを `TieBoundary::Resolved` と判定した
+/// 時点での探索終了を意味するのみで、初回ラウンドが可視集合全体を取り切った
+/// ことの証明ではない。`docs/design/hnsw-hybrid-iterative-scan.md`「前後
+/// 比較実測（Issue #506）」節参照）。
+pub fn check_ann_non_vacuous(
+    stats: AnnRoundStats,
+    expect_resumed: bool,
+) -> Result<(), HybridLatencyError> {
+    if stats.builds < 1 {
+        return Err(HybridLatencyError::VacuousAnnMeasurement(
+            "expected at least one HNSW build".to_string(),
+        ));
+    }
+    if stats.build_failures != 0 {
+        return Err(HybridLatencyError::VacuousAnnMeasurement(format!(
+            "HNSW build must not fail (build_failures={})",
+            stats.build_failures
+        )));
+    }
+    if stats.hybrid_dense_searches == 0 {
+        return Err(HybridLatencyError::VacuousAnnMeasurement(
+            "expected the hybrid dense refetch loop to use the HNSW index".to_string(),
+        ));
+    }
+    if expect_resumed {
+        match stats.hybrid_resumed_rounds {
+            Some(v) if v > 0 => {}
+            Some(0) => {
+                return Err(HybridLatencyError::VacuousAnnMeasurement(
+                    "hybrid_resumed_rounds is 0; the resumable refetch path did not engage"
+                        .to_string(),
+                ))
+            }
+            None => {
+                return Err(HybridLatencyError::VacuousAnnMeasurement(
+                    "hybrid_resumed_rounds counter is unavailable on this build (pre-#505 \
+                     tree); BENCH_HYBRID_LATENCY_EXPECT_RESUMED must only be set against an \
+                     after binary"
+                        .to_string(),
+                ))
+            }
+            Some(_) => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+/// SQL 表層計測モードのスケール選択（`BENCH_HYBRID_LATENCY_SCALE`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatencyScale {
+    Small,
+    Large,
+}
+
+/// `BENCH_HYBRID_LATENCY_SCALE` から測定対象スケールの一覧を解決する。
+/// 未設定・空文字列・`"all"` は両方、`"small"`／`"large"` は片方のみ。
+/// 未知値は fail-closed で拒否する（`bench_engine::parse_engine` と同方針）。
+pub fn parse_scale_selection(raw: Option<&str>) -> Result<Vec<LatencyScale>, HybridLatencyError> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("all") => Ok(vec![LatencyScale::Small, LatencyScale::Large]),
+        Some("small") => Ok(vec![LatencyScale::Small]),
+        Some("large") => Ok(vec![LatencyScale::Large]),
+        Some(other) => Err(HybridLatencyError::InvalidEnvValue(format!(
+            "BENCH_HYBRID_LATENCY_SCALE must be unset, \"all\", \"small\", or \"large\" \
+             (got {other:?})"
+        ))),
+    }
+}
+
+/// SQL 表層計測モードのコーパス選択（`BENCH_HYBRID_LATENCY_CORPUS`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatencyCorpusKind {
+    NoRefetch,
+    TieRefetch,
+}
+
+/// `BENCH_HYBRID_LATENCY_CORPUS` から測定対象コーパスの一覧を解決する。
+/// [`parse_scale_selection`] と同じ語彙構造（未設定/空/`"all"` は両方）。
+pub fn parse_corpus_selection(
+    raw: Option<&str>,
+) -> Result<Vec<LatencyCorpusKind>, HybridLatencyError> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("all") => Ok(vec![
+            LatencyCorpusKind::NoRefetch,
+            LatencyCorpusKind::TieRefetch,
+        ]),
+        Some("no_refetch") => Ok(vec![LatencyCorpusKind::NoRefetch]),
+        Some("tie_refetch") => Ok(vec![LatencyCorpusKind::TieRefetch]),
+        Some(other) => Err(HybridLatencyError::InvalidEnvValue(format!(
+            "BENCH_HYBRID_LATENCY_CORPUS must be unset, \"all\", \"no_refetch\", or \
+             \"tie_refetch\" (got {other:?})"
+        ))),
+    }
+}
+
+/// `BENCH_HYBRID_LATENCY_NUM_DOCS`／`_DIM`／`_VOCAB_SIZE`／`_QUANTIZE_LEVELS` の
+/// 共有パーサ（`bench_engine::parse_dim` と同型の bound 付き正整数パーサ）。
+/// 環境変数由来の untrusted 値をそのまま `Vec::with_capacity` 等へ渡さない
+/// （coding-rust.md「長さフィールドは上限検証してから」）。
+pub fn parse_bounded_usize(
+    raw: Option<&str>,
+    default: usize,
+    min: usize,
+    max: usize,
+    var_name: &str,
+) -> Result<usize, HybridLatencyError> {
+    let trimmed = raw.map(str::trim);
+    let value: usize = match trimmed {
+        None | Some("") => return Ok(default),
+        Some(s) => s.parse::<usize>().map_err(|_| {
+            HybridLatencyError::InvalidEnvValue(format!(
+                "{var_name} must be a positive integer (got {s:?})"
+            ))
+        })?,
+    };
+    if value < min || value > max {
+        return Err(HybridLatencyError::InvalidEnvValue(format!(
+            "{var_name} must be in {min}..={max} (got {value})"
+        )));
+    }
+    Ok(value)
 }
