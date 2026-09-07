@@ -152,7 +152,8 @@ QEMU ホスト）の run-to-run ノイズが `benchmark-judgement-policy.md` §4
 取れるため、Phase 4 の効果判定は 3.2 節を主、本節は「参照区間の実測ノイズ帯
 （reference_band）」としての参考に留める。
 
-`S0prime_count_star`（`COUNT(*)` 経路）の劇的改善（min-of-N 比 27 分の 1）は
+`S0prime_count_star`（`COUNT(*)` 経路）の劇的改善（min-of-N 比 約 37 分の 1。
+before=1.990ms・after=0.054ms）は
 Phase 4 の対象外（Issue #478 VisibleBitmapCache・Phase 2 由来）であり、本 Issue
 の評価対象ではない。
 
@@ -265,6 +266,12 @@ QEMU 行の結論は共有仮想環境の参考値に過ぎず、production の�
 ### 9.1 本 doc の再現（任意環境共通）
 
 ```sh
+# 0. <repo-root> は scripts/bench_chip_ab.sh・bench-chip-ab ターゲット・
+#    scripts/bench_dot_kernel_ab.sh 等のドライバを含む本リポジトリの
+#    チェックアウト（origin/main 相当）を指す。展開元コミット（91f6a18・
+#    6184491）にはこれらのドライバが存在しないため、<state-before>／
+#    <state-after> 側では実行できない。
+
 # 1. 2 状態を独立ディレクトリへ展開（ブランチ HEAD 参照は使わない）
 git archive 91f6a18 | tar -x -C <state-before>
 git archive 6184491 | tar -x -C <state-after>
@@ -276,17 +283,19 @@ cd <state-before> && cargo bench --bench dot_kernel_bench -p engine --no-run \
   && cargo bench --bench chip_bench -p engine --no-run
 cd <state-after>  && (同上)
 
-# 3. chip_bench 前後比較
+# 3. chip_bench 前後比較（ドライバを含む <repo-root> へ戻ってから実行する）
+cd <repo-root>
 BEFORE_DIR=<state-before> AFTER_DIR=<state-after> AB_PAIRS=5 \
   make bench-chip-ab
 scripts/bench_chip_ab.sh --summarize _/bench/chip-ab/<UTC ts>
 
-# 4. dot_kernel_bench current/block4/tail A/B（既存スクリプト。Issue #519）
+# 4. dot_kernel_bench current/block4/tail A/B（既存スクリプト。Issue #519。
+#    引き続き <repo-root> で実行する）
 BEFORE_BIN=<state-before>/target/release/deps/dot_kernel_bench-<hash> \
 AFTER_BIN=<state-after>/target/release/deps/dot_kernel_bench-<hash> \
   scripts/bench_dot_kernel_ab.sh 5
 
-# 5. 精度 3 arm（f32/f16/i8。既存スクリプト。Issue #526）
+# 5. 精度 3 arm（f32/f16/i8。既存スクリプト。Issue #526。<repo-root> で実行する）
 AB_CANDIDATE_ENGINES="hnsw_f16 hnsw_i8" AB_PAIRS=5 \
   make bench-knn-precision-resident
 ```
