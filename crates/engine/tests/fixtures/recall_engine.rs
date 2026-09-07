@@ -4,7 +4,9 @@
 //! 〔Issue #403 Accepted〕・EXPLAIN 露出〔Issue #411〕）検索エンジン切替 fixture。
 //!
 //! Issue #515 で HNSW 索引ノードの f16 常駐（`hnsw::ResidentPrecision::F16`・
-//! Issue #514）opt-in を [`RecallEngine::HnswF16`] として追加した。索引の
+//! Issue #514）opt-in を [`RecallEngine::HnswF16`] として追加した。Issue #523 で
+//! 同様に I8（SQ8）常駐（`hnsw::ResidentPrecision::I8`・Issue #521・#522）
+//! opt-in を [`RecallEngine::HnswI8`] として追加した。索引の
 //! `ValidatedHnswParams` は検証済み型（[`crate::hnsw::HnswError`] を経由済み）の
 //! ため、`SearchEngineKind::Hnsw(validated)` を fixture 内で直接構築しても
 //! `search_engine::hnsw_kind` が守る「未検証入力の唯一の入口」契約は迂回しない
@@ -53,12 +55,15 @@ pub enum RecallEngine {
     Hnsw,
     /// ANN opt-in・HNSW 索引ノード f16 常駐（Issue #515・#514）。
     HnswF16,
+    /// ANN opt-in・HNSW 索引ノード I8（SQ8）常駐（Issue #523・#521・#522）。
+    HnswI8,
 }
 
 impl RecallEngine {
     /// `RECALL_ENGINE` 環境変数から解決する。未設定・空文字列・`"brute_force"`
     /// は [`RecallEngine::BruteForce`]、`"hnsw"` は [`RecallEngine::Hnsw`]、
-    /// `"hnsw_f16"` は [`RecallEngine::HnswF16`]。それ以外は fail-closed で
+    /// `"hnsw_f16"` は [`RecallEngine::HnswF16`]、`"hnsw_i8"` は
+    /// [`RecallEngine::HnswI8`]。それ以外は fail-closed で
     /// panic する（`sql/mode.rs` の「厳密一致のみ受理」方針と同型。未知値を
     /// 黙って既定へ倒すと、typo で意図せず ANN 測定が静かにスキップされる
     /// 事故を防げないため）。
@@ -77,9 +82,10 @@ impl RecallEngine {
             None | Some("") | Some("brute_force") => Ok(Self::BruteForce),
             Some("hnsw") => Ok(Self::Hnsw),
             Some("hnsw_f16") => Ok(Self::HnswF16),
+            Some("hnsw_i8") => Ok(Self::HnswI8),
             Some(other) => Err(format!(
-                "RECALL_ENGINE must be unset, \"brute_force\", \"hnsw\", or \"hnsw_f16\" \
-                 (got {other:?})"
+                "RECALL_ENGINE must be unset, \"brute_force\", \"hnsw\", \"hnsw_f16\", or \
+                 \"hnsw_i8\" (got {other:?})"
             )),
         }
     }
@@ -91,6 +97,7 @@ impl RecallEngine {
             Self::BruteForce => "brute_force",
             Self::Hnsw => "hnsw",
             Self::HnswF16 => "hnsw_f16",
+            Self::HnswI8 => "hnsw_i8",
         }
     }
 }
@@ -125,6 +132,9 @@ pub struct AnnStats {
     /// F16 常駐要求時に範囲外成分（`|x| > 65504.0`）で F32 常駐へ自動縮退した
     /// 回数（`builds` の内数。D6・Issue #514・#515）。
     pub f16_residency_fallbacks: u64,
+    /// I8（SQ8）常駐要求時に次元ごとスケールの f32 アンダーフローで F32 常駐へ
+    /// 自動縮退した回数（`builds` の内数。D6 と同型・Issue #521・#523）。
+    pub i8_residency_fallbacks: u64,
 }
 
 /// SQL 表層（`EngineCore::execute_sql`）経由で hybrid クエリを発行するための
@@ -191,6 +201,17 @@ impl SqlHybridFixture {
                 let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
                 EngineCore::from_storage_with_engine(storage, kind)
             }
+            RecallEngine::HnswI8 => {
+                // F16 版と同型（Issue #523）: 検証済み `ValidatedHnswParams` に
+                // I8（SQ8）常駐 opt-in を適用するだけで、untrusted 入力の
+                // 唯一の検証入口（`validate()`）は迂回しない（Issue #521・#522）。
+                let validated =
+                    engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
+                        .expect("default params validate")
+                        .with_resident_precision(engine::hnsw::ResidentPrecision::I8);
+                let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
+                EngineCore::from_storage_with_engine(storage, kind)
+            }
             RecallEngine::BruteForce => {
                 EngineCore::from_storage(storage, search_engine::default_engine())
             }
@@ -236,6 +257,7 @@ impl SqlHybridFixture {
             ef_cap_fallbacks: s.ef_cap_fallbacks,
             entries: s.entries,
             f16_residency_fallbacks: s.f16_residency_fallbacks,
+            i8_residency_fallbacks: s.i8_residency_fallbacks,
         }
     }
 
@@ -261,6 +283,7 @@ impl SqlHybridFixture {
             // 要求した場合も 0 になり vacuous なので、Display 側と組み合わせる。
             let resident_suffix = match self.engine {
                 RecallEngine::HnswF16 => "resident=f16",
+                RecallEngine::HnswI8 => "resident=i8",
                 RecallEngine::Hnsw => "resident=f32",
                 RecallEngine::BruteForce => {
                     panic!("assert_ann_non_vacuous(true) is only meaningful for ANN engines")
@@ -281,6 +304,16 @@ impl SqlHybridFixture {
                     stats.f16_residency_fallbacks, 0,
                     "embeddings in this fixture's corpus must stay within the f16 finite \
                      range and must not trigger the F32 fallback (D6)"
+                );
+            }
+            // Issue #523: I8 版も同型に、この fixture のコーパス（正規化済み・
+            // dim <= 128 程度の有限ベクトル）では次元ごとスケールの
+            // アンダーフロー（D6）が構造的に発生しないことを固定する。
+            if self.engine == RecallEngine::HnswI8 {
+                assert_eq!(
+                    stats.i8_residency_fallbacks, 0,
+                    "embeddings in this fixture's corpus must be finite and must not trigger \
+                     the F32 fallback (D6 と同型。Issue #521・#523)"
                 );
             }
         } else {
@@ -320,6 +353,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_hnsw_i8() {
+        assert_eq!(
+            RecallEngine::parse(Some("hnsw_i8")),
+            Ok(RecallEngine::HnswI8)
+        );
+    }
+
+    #[test]
     fn parse_trims_surrounding_whitespace() {
         // GitHub Actions の variable 展開が末尾改行を持ち込む経路
         // （`recall_threshold_from_env` 等、他ゲートの慣行と同様）を許容する。
@@ -327,6 +368,10 @@ mod tests {
         assert_eq!(
             RecallEngine::parse(Some(" hnsw_f16\n")),
             Ok(RecallEngine::HnswF16)
+        );
+        assert_eq!(
+            RecallEngine::parse(Some(" hnsw_i8\n")),
+            Ok(RecallEngine::HnswI8)
         );
     }
 
@@ -340,6 +385,9 @@ mod tests {
             "hnsw-f16",
             "HNSW_F16",
             "f16",
+            "hnsw-i8",
+            "HNSW_I8",
+            "i8",
         ] {
             assert!(
                 RecallEngine::parse(Some(raw)).is_err(),
@@ -353,5 +401,6 @@ mod tests {
         assert_eq!(RecallEngine::BruteForce.token(), "brute_force");
         assert_eq!(RecallEngine::Hnsw.token(), "hnsw");
         assert_eq!(RecallEngine::HnswF16.token(), "hnsw_f16");
+        assert_eq!(RecallEngine::HnswI8.token(), "hnsw_i8");
     }
 }

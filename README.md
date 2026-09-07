@@ -489,7 +489,7 @@ gh secret set QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE --env recall-gate
 
 ### ANN opt-in 時の Recall ゲート実測（Issue #412）
 
-3 つの Recall 閾値ゲート（hybrid・rerank・query-planning）は `RECALL_ENGINE` 環境変数（非機密の opt-in フラグ。値そのものは閾値ではないため secrets ではなく repo variables 相当の扱い）で測定対象の検索エンジンを選べます。`brute_force` は従来どおり `engine::hybrid::hybrid_search` を in-memory 配列に対して直接呼ぶ既存経路で、実測値・固定値アサーションに一切影響しません。`hnsw` を指定すると、SQL 表層（`EngineCore::from_storage_with_engine` ＋ `ORDER BY HYBRID(...)`）経由の ANN opt-in 経路（ADR `docs/design/ann-index-adoption.md` B 案）で同一の閾値を判定します——ANN の実装 seam（`sql::hnsw_cache`／`sql::hnsw_hybrid`）は結合テストから直接は触れない `pub(crate)` のため、SQL 表層を通すのが production API 経由で ANN 経路へ到達する唯一の方法です（`crates/engine/tests/fixtures/recall_engine.rs` 参照）。`hnsw_f16`（Issue #515）を指定すると、同じ ANN opt-in 経路を HNSW 索引ノードの f16 常駐表現（`hnsw::ResidentPrecision::F16`。Issue #514・`docs/design/hnsw-f16-resident.md`）付きで測定します。`.github/workflows/recall.yml` は `strategy.matrix.recall_engine: [brute_force, hnsw, hnsw_f16]` で 3 エンジンを常に独立 job としてゲートします（`workflow_dispatch`・週次 `schedule` いずれのトリガでも同じ。以前の選択式 `workflow_dispatch` 入力は `schedule` 実行で `hnsw` が測定されない抜け穴になっていたため撤去しました。Issue #412）。
+3 つの Recall 閾値ゲート（hybrid・rerank・query-planning）は `RECALL_ENGINE` 環境変数（非機密の opt-in フラグ。値そのものは閾値ではないため secrets ではなく repo variables 相当の扱い）で測定対象の検索エンジンを選べます。`brute_force` は従来どおり `engine::hybrid::hybrid_search` を in-memory 配列に対して直接呼ぶ既存経路で、実測値・固定値アサーションに一切影響しません。`hnsw` を指定すると、SQL 表層（`EngineCore::from_storage_with_engine` ＋ `ORDER BY HYBRID(...)`）経由の ANN opt-in 経路（ADR `docs/design/ann-index-adoption.md` B 案）で同一の閾値を判定します——ANN の実装 seam（`sql::hnsw_cache`／`sql::hnsw_hybrid`）は結合テストから直接は触れない `pub(crate)` のため、SQL 表層を通すのが production API 経由で ANN 経路へ到達する唯一の方法です（`crates/engine/tests/fixtures/recall_engine.rs` 参照）。`hnsw_f16`（Issue #515）を指定すると、同じ ANN opt-in 経路を HNSW 索引ノードの f16 常駐表現（`hnsw::ResidentPrecision::F16`。Issue #514・`docs/design/hnsw-f16-resident.md`）付きで測定します。`hnsw_i8`（Issue #523）を指定すると、同じ経路を I8（SQ8）常駐表現（`hnsw::ResidentPrecision::I8`。Issue #521・#522・`docs/design/hnsw-sq8-resident.md`）付きで測定します。`.github/workflows/recall.yml` は `strategy.matrix.recall_engine: [brute_force, hnsw, hnsw_f16, hnsw_i8]` で 4 エンジンを常に独立 job としてゲートします（`workflow_dispatch`・週次 `schedule` いずれのトリガでも同じ。以前の選択式 `workflow_dispatch` 入力は `schedule` 実行で `hnsw` が測定されない抜け穴になっていたため撤去しました。Issue #412）。
 
 ```bash
 RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make recall-regression
@@ -497,11 +497,13 @@ RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make rerank-regression
 RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make query-planning-regression
 # f16 常駐 opt-in（Issue #515）を測定する場合は hnsw_f16 を指定します
 RECALL_ENGINE=hnsw_f16 RECALL_VERBOSE=1 make recall-regression
-# CI から手動実行する場合（brute_force/hnsw/hnsw_f16 の 3 matrix job が起動します）
+# I8（SQ8）常駐 opt-in（Issue #523）を測定する場合は hnsw_i8 を指定します
+RECALL_ENGINE=hnsw_i8 RECALL_VERBOSE=1 make recall-regression
+# CI から手動実行する場合（brute_force/hnsw/hnsw_f16/hnsw_i8 の 4 matrix job が起動します）
 gh workflow run recall.yml --ref main
 ```
 
-各ゲートのコーパス規模が `MIN_INDEXED_ROWS`（ANN 索引の下限行数。`sql::hnsw_cache.rs` の非公開定数）を下回る段（hybrid の小規模段のみ・400 件）は、`RECALL_ENGINE=hnsw`／`hnsw_f16` を指定しても構造的に brute-force のまま索引を構築しません（そのようにゲート側が非 vacuous 検証で固定しています）。それ以外の段（hybrid・query-planning の各小規模段は 4,000 件以上、大規模段は 20,000〜40,000 件）は実際に HNSW 索引を構築して測定します。検証設計・実測結果は `docs/design/ann-recall-gate-verification.md` を参照してください（`hnsw_f16` の実測は同 doc「Issue #515 追記」節）。
+各ゲートのコーパス規模が `MIN_INDEXED_ROWS`（ANN 索引の下限行数。`sql::hnsw_cache.rs` の非公開定数）を下回る段（hybrid の小規模段のみ・400 件）は、`RECALL_ENGINE=hnsw`／`hnsw_f16`／`hnsw_i8` を指定しても構造的に brute-force のまま索引を構築しません（そのようにゲート側が非 vacuous 検証で固定しています）。それ以外の段（hybrid・query-planning の各小規模段は 4,000 件以上、大規模段は 20,000〜40,000 件）は実際に HNSW 索引を構築して測定します。検証設計・実測結果は `docs/design/ann-recall-gate-verification.md` を参照してください（`hnsw_f16` の実測は同 doc「Issue #515 追記」節・`hnsw_i8` の実測は同 doc「Issue #523 追記」節）。
 
 ### ANN（HNSW）opt-in 手順と前後比較（Issue #413）
 
@@ -514,7 +516,7 @@ let core = engine::core::EngineCore::from_storage_with_engine(storage, kind);
 
 `crates/engine/examples/feature_bench.rs`（13 フェーズ通し計測）・`crates/engine/benches/knn_profile_bench.rs`（`make bench-knn-profile`）は、いずれも ANN opt-in・規模スケールを env 変数で切り替えられます。
 
-- `BENCH_FEATURE_ENGINE` / `BENCH_KNN_PROFILE_ENGINE`: 未設定・空・`brute_force`（既定）／`hnsw`（`HnswParams::default()` で opt-in）／`hnsw_f16`（Issue #516。索引ノード f16 常駐 opt-in・`ValidatedHnswParams::with_resident_precision(F16)`。詳細は `docs/design/hnsw-f16-resident.md`）。未知値は fail-closed で拒否
+- `BENCH_FEATURE_ENGINE` / `BENCH_KNN_PROFILE_ENGINE`: 未設定・空・`brute_force`（既定）／`hnsw`（`HnswParams::default()` で opt-in）／`hnsw_f16`（Issue #516。索引ノード f16 常駐 opt-in・`ValidatedHnswParams::with_resident_precision(F16)`。詳細は `docs/design/hnsw-f16-resident.md`）／`hnsw_i8`（Issue #523。索引ノード I8（SQ8）常駐 opt-in・`ValidatedHnswParams::with_resident_precision(I8)`。詳細は `docs/design/hnsw-sq8-resident.md`）。未知値は fail-closed で拒否
 - `BENCH_FEATURE_SCALE`（`feature_bench` のみ）: 正整数倍率。既定 1（25,000 行）。`hnsw::MAX_HNSW_NODES` を超えない範囲で bound
 - `BENCH_FEATURE_DIM` / `BENCH_KNN_PROFILE_DIM`（Issue #466）: 正整数・既定 128・上限 4,096。dim=768／1536 が Issue #365 で採否の判別変数と判明したため、横断 SQL ベンチ側にも dim を可変にする規模点を用意したもの。未知値・0・上限超過は fail-closed で拒否
 
@@ -542,15 +544,16 @@ make bench-knn-visible-ratio  # 全比率 × 全行数 × 4 arm を交互 N ペ�
 
 実測結果・判断は `docs/design/hnsw-rls-cardinality-switch.md`「可視比率 × 行数の損益分岐点実測（Issue #487）」を参照してください。
 
-`knn_profile_bench` にはさらに、f16 常駐（`hnsw_f16`）と f32 常駐（`hnsw`）の前後比較・常駐メモリ実測専用の 2 モードがあります（Issue #516。互いに排他、`BENCH_KNN_PROFILE_VISIBLE_RATIO` とも排他）。
+`knn_profile_bench` にはさらに、f16 常駐（`hnsw_f16`）／I8 常駐（`hnsw_i8`）と f32 常駐（`hnsw`）の前後比較・常駐メモリ実測専用の 2 モードがあります（Issue #516・#523。互いに排他、`BENCH_KNN_PROFILE_VISIBLE_RATIO` とも排他）。
 
 - `BENCH_KNN_PROFILE_HOT_ONLY=1`: S0-cold（毎サンプル新規 `EngineCore` 構築）を省き、索引 1 回構築＋ SQL 表層 e2e ホットパス（S0-hot 相当）と参照区間（`COUNT(*)`）のみを測ります。`BENCH_KNN_PROFILE_SCALE`（最大 40 = 1,000,000 行）まで許容するため、500k 行規模のような S0-cold が非現実的な所要時間になる規模点向けです
-- `BENCH_KNN_PROFILE_INDEX_MEMORY=1`（`BENCH_KNN_PROFILE_ENGINE=hnsw|hnsw_f16` 限定）: redb・SQL 表層（`VectorArena` の 1 GiB 上限）を経由せず、メモリ上のコーパスから `HnswIndex` を 1 回構築して常駐バイト数（`approx_heap_bytes`・VmRSS 前後差・VmHWM）を子プロセス隔離で計測します。500k×768 のように SQL 表層では構造的に到達不能な規模点でも、索引単体としては計測できます
+- `BENCH_KNN_PROFILE_INDEX_MEMORY=1`（`BENCH_KNN_PROFILE_ENGINE=hnsw|hnsw_f16|hnsw_i8` 限定）: redb・SQL 表層（`VectorArena` の 1 GiB 上限）を経由せず、メモリ上のコーパスから `HnswIndex` を 1 回構築して常駐バイト数（`approx_heap_bytes`・VmRSS 前後差・VmHWM）を子プロセス隔離で計測します。500k×768 のように SQL 表層では構造的に到達不能な規模点でも、索引単体としては計測できます
 
 ```bash
 BENCH_KNN_PROFILE_HOT_ONLY=1 BENCH_KNN_PROFILE_ENGINE=hnsw_f16 BENCH_KNN_PROFILE_SCALE=20 make bench-knn-profile  # 500,000 行・f16 常駐
 BENCH_KNN_PROFILE_INDEX_MEMORY=1 BENCH_KNN_PROFILE_ENGINE=hnsw_f16 BENCH_KNN_PROFILE_SCALE=20 BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 make bench-knn-f16-resident  # 全規模点 × f32/f16 を交互 N≥5 ペア＋索引単体メモリで一括実行（AB_PAIRS・AB_POINTS・AB_MEMORY_POINTS で上書き可）
+make bench-knn-i8-resident  # 同じスクリプトの AB_CANDIDATE_ENGINE=hnsw_i8 opt-in（Issue #523。f32/I8 常駐の前後比較）
 ```
 
 実測結果・判断は `docs/design/hnsw-f16-resident.md`「Issue #516 追記」節を参照してください。

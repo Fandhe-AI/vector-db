@@ -19,10 +19,15 @@
 #   3. 500k×768 の索引単体メモリのみ（SQL 表層は arena 1 GiB 上限で
 #      構造的に到達不能。`docs/design/hnsw-f16-resident.md` 参照）
 #
+# Issue #523 で `AB_CANDIDATE_ENGINE`（既定 `hnsw_f16`。`hnsw_i8` も受理する
+# 許可リスト opt-in）を追加し、hnsw との前後比較対象を選べるよう一般化した
+# （既定は従来どおり f16 のまま出力ディレクトリ・挙動とも不変）。
+#
 # 使い方: scripts/bench_knn_f16_resident_ab.sh [--summarize <dir>]
 #   env AB_PAIRS=<N>（既定 5。5 未満は拒否）
 #   env AB_POINTS="scale:dim scale:dim ..."（既定 "1:128 4:128 20:128 1:768 4:768"）
 #   env AB_MEMORY_POINTS="scale:dim ..."（既定 AB_POINTS ＋ "20:768"）
+#   env AB_CANDIDATE_ENGINE=<hnsw_f16|hnsw_i8>（既定 hnsw_f16。許可リスト以外は拒否）
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -62,6 +67,24 @@ if ! [[ "${AB_PAIRS}" =~ ^[0-9]+$ ]] || [ "${AB_PAIRS}" -lt 5 ]; then
   exit 1
 fi
 
+# 対象候補エンジン（Issue #523）。許可リスト以外は fail-closed で拒否する
+# （値をそのままディレクトリ名・ログファイル名へ使うため、任意文字列の混入を
+# 防ぐ意味でも許可リスト検証を先に固定する）。
+AB_CANDIDATE_ENGINE="${AB_CANDIDATE_ENGINE:-hnsw_f16}"
+case "${AB_CANDIDATE_ENGINE}" in
+  hnsw_f16|hnsw_i8) ;;
+  *)
+    echo "ERROR: AB_CANDIDATE_ENGINE must be \"hnsw_f16\" or \"hnsw_i8\", got: ${AB_CANDIDATE_ENGINE}" >&2
+    exit 1
+    ;;
+esac
+# 出力ディレクトリ名は候補ごとの短縮ラベル（既定 hnsw_f16 は従来どおり
+# "bench-knn-f16-resident" を維持し、既存 docs・Makefile 参照との互換を保つ）。
+case "${AB_CANDIDATE_ENGINE}" in
+  hnsw_f16) CANDIDATE_DIR_LABEL="f16" ;;
+  hnsw_i8) CANDIDATE_DIR_LABEL="i8" ;;
+esac
+
 # デフォルトの規模点: 25k/100k/500k × dim128、25k/100k × dim768
 # （500k×768 は SQL 表層〔hot-only〕では arena 1 GiB 上限〔MAX_ARENA_TOTAL_BYTES〕
 # により構造的に到達不能。`docs/design/hnsw-f16-resident.md` 参照）。
@@ -72,7 +95,7 @@ read -r -a AB_POINTS_ARR <<<"${AB_POINTS:-${DEFAULT_POINTS}}"
 read -r -a AB_MEMORY_POINTS_ARR <<<"${AB_MEMORY_POINTS:-${AB_POINTS_ARR[*]} 20:768}"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT_DIR="${REPO_ROOT}/target/bench-knn-f16-resident/${TS}"
+OUT_DIR="${REPO_ROOT}/target/bench-knn-${CANDIDATE_DIR_LABEL}-resident/${TS}"
 mkdir -p "${OUT_DIR}"
 
 {
@@ -86,6 +109,7 @@ mkdir -p "${OUT_DIR}"
   echo "ab_pairs=${AB_PAIRS}"
   echo "ab_points=${AB_POINTS_ARR[*]}"
   echo "ab_memory_points=${AB_MEMORY_POINTS_ARR[*]}"
+  echo "ab_candidate_engine=${AB_CANDIDATE_ENGINE}"
 } >"${OUT_DIR}/env.txt"
 
 # 以降のすべての `cargo bench` 呼び出しをリポジトリルートから実行する
@@ -130,10 +154,10 @@ for point in "${AB_POINTS_ARR[@]}"; do
     run_hot_only "${scale}" "${dim}" "brute_force" "${pair}" "_beforehnsw"
     echo "run: hot_only scale=${scale} dim=${dim} arm=hnsw pair=${pair}"
     run_hot_only "${scale}" "${dim}" "hnsw" "${pair}" ""
-    echo "run: hot_only scale=${scale} dim=${dim} arm=brute_force(before hnsw_f16) pair=${pair}"
-    run_hot_only "${scale}" "${dim}" "brute_force" "${pair}" "_beforehnswf16"
-    echo "run: hot_only scale=${scale} dim=${dim} arm=hnsw_f16 pair=${pair}"
-    run_hot_only "${scale}" "${dim}" "hnsw_f16" "${pair}" ""
+    echo "run: hot_only scale=${scale} dim=${dim} arm=brute_force(before ${AB_CANDIDATE_ENGINE}) pair=${pair}"
+    run_hot_only "${scale}" "${dim}" "brute_force" "${pair}" "_before${AB_CANDIDATE_ENGINE}"
+    echo "run: hot_only scale=${scale} dim=${dim} arm=${AB_CANDIDATE_ENGINE} pair=${pair}"
+    run_hot_only "${scale}" "${dim}" "${AB_CANDIDATE_ENGINE}" "${pair}" ""
   done
 done
 
@@ -142,7 +166,7 @@ done
 for point in "${AB_MEMORY_POINTS_ARR[@]}"; do
   scale="${point%%:*}"
   dim="${point##*:}"
-  for engine in hnsw hnsw_f16; do
+  for engine in hnsw "${AB_CANDIDATE_ENGINE}"; do
     for rep in 1 2; do
       log="${OUT_DIR}/mem_scale${scale}_dim${dim}_${engine}_rep${rep}.log"
       echo "run: memory scale=${scale} dim=${dim} engine=${engine} rep=${rep}"

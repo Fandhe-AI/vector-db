@@ -41,6 +41,12 @@ pub enum BenchEngine {
     /// メモリ実測の対象として追加した。`tests/fixtures/recall_engine.rs::
     /// RecallEngine::HnswF16` と同じ構築経路・トークン語彙を踏襲する）。
     HnswF16,
+    /// ANN opt-in・索引ノード I8（SQ8）常駐（Issue #521・#522。
+    /// `ValidatedHnswParams::new(HnswParams::default())?.with_resident_precision(I8)`
+    /// で構築する。Issue #523 が f32 常駐との前後比較・常駐メモリ実測の対象
+    /// として追加した。`tests/fixtures/recall_engine.rs::RecallEngine::HnswI8`
+    /// と同じ構築経路・トークン語彙を踏襲する）。
+    HnswI8,
 }
 
 impl BenchEngine {
@@ -51,6 +57,7 @@ impl BenchEngine {
             Self::BruteForce => "brute_force",
             Self::Hnsw => "hnsw",
             Self::HnswF16 => "hnsw_f16",
+            Self::HnswI8 => "hnsw_i8",
         }
     }
 }
@@ -91,16 +98,19 @@ pub fn read_env_var(name: &'static str) -> Result<Option<String>, BenchEngineErr
 /// `raw`（`read_env_var` が返した値。前後の空白は許容: GitHub Actions の
 /// variable 展開が末尾改行を持ち込む経路への対応。`recall_engine.rs` と同方針）
 /// から [`BenchEngine`] を解決する。未設定・空文字列・`"brute_force"` は
-/// [`BenchEngine::BruteForce`]、`"hnsw"` は [`BenchEngine::Hnsw`]。それ以外は
-/// fail-closed で拒否する（黙って既定へ倒すと、typo で ANN 測定が静かに
-/// スキップされる事故を防げない）。
+/// [`BenchEngine::BruteForce`]、`"hnsw"` は [`BenchEngine::Hnsw`]、
+/// `"hnsw_f16"` は [`BenchEngine::HnswF16`]、`"hnsw_i8"` は
+/// [`BenchEngine::HnswI8`]。それ以外は fail-closed で拒否する（黙って既定へ
+/// 倒すと、typo で ANN 測定が静かにスキップされる事故を防げない）。
 pub fn parse_engine(raw: Option<&str>) -> Result<BenchEngine, BenchEngineError> {
     match raw.map(str::trim) {
         None | Some("") | Some("brute_force") => Ok(BenchEngine::BruteForce),
         Some("hnsw") => Ok(BenchEngine::Hnsw),
         Some("hnsw_f16") => Ok(BenchEngine::HnswF16),
+        Some("hnsw_i8") => Ok(BenchEngine::HnswI8),
         Some(other) => Err(err(format!(
-            "must be unset, \"brute_force\", \"hnsw\", or \"hnsw_f16\" (got {other:?})"
+            "must be unset, \"brute_force\", \"hnsw\", \"hnsw_f16\", or \"hnsw_i8\" \
+             (got {other:?})"
         ))),
     }
 }

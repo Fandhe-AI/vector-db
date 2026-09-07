@@ -120,6 +120,14 @@ name: Recall
 # trigger を問わず常時実行する（#412 と同じ「schedule でも新エンジンが
 # 未測定のまま残らない」原則）。実測結果・非 vacuous ガードの拡張内容は
 # `docs/design/ann-recall-gate-verification.md`「Issue #515 追記」節参照。
+#
+# Issue #523: HNSW 索引ノードの I8（SQ8）常駐（`hnsw::ResidentPrecision::I8`。
+# Issue #521・#522。`docs/design/hnsw-sq8-resident.md`）opt-in の 4 系列目
+# `hnsw_i8`（`crates/engine/tests/fixtures/recall_engine.rs::RecallEngine::
+# HnswI8`）を matrix へ追加し、`brute_force`/`hnsw`/`hnsw_f16`/`hnsw_i8` の
+# 4 系列を trigger を問わず常時実行する（#412・#515 と同じ原則）。実測結果・
+# 非 vacuous ガードの拡張内容は `docs/design/ann-recall-gate-verification.md`
+# 「Issue #523 追記」節参照。
 on:
   workflow_dispatch: {}
   schedule:
@@ -140,13 +148,13 @@ jobs:
     # fail-closed な制約）。
     if: github.ref == 'refs/heads/main'
     strategy:
-      # `brute_force`/`hnsw`/`hnsw_f16` の 3 系列を独立 job として毎回すべて
-      # ゲートする（冒頭コメント参照。Issue #412 受け入れ条件 3・codex-review P1
-      # 指摘対応・Issue #515 で `hnsw_f16` を追加）。1 つが fail しても他は
-      # 評価を継続する。
+      # `brute_force`/`hnsw`/`hnsw_f16`/`hnsw_i8` の 4 系列を独立 job として
+      # 毎回すべてゲートする（冒頭コメント参照。Issue #412 受け入れ条件 3・
+      # codex-review P1 指摘対応・Issue #515 で `hnsw_f16`・Issue #523 で
+      # `hnsw_i8` を追加）。1 つが fail しても他は評価を継続する。
       fail-fast: false
       matrix:
-        recall_engine: [brute_force, hnsw, hnsw_f16]
+        recall_engine: [brute_force, hnsw, hnsw_f16, hnsw_i8]
     concurrency:
       # workflow_dispatch は任意の ref を選択して起動できるため、ref を group に
       # 含めて同一 ref の重複実行のみキャンセル対象にする（bench.yml と同一方針。
