@@ -322,9 +322,13 @@ Phase 3 親 #458／ルート #455。依存 #465（CLOSED。最新基線は
 `docs/design/hybrid-rrf-latency-breakdown.md`「最新基線（2026-09-06・
 Issue #465）」節）。実装は #505、前後比較実測は #506（本 Issue のスコープ外）。
 ステータス: **Proposed**（採否はオーナー判断。#505 のマージ根拠は本節が定める
-正しさ契約——bit 同一ゲート・Recall 非劣化——であり、性能面の採否は #506・
-専有環境実測に委ねる。共有 QEMU 環境の数値は採否根拠にしない。
-`docs/design/benchmark-judgement-policy.md` §5〜6）。
+正しさ契約——bit 同一ゲート・Recall 非劣化——であり、性能面の採否は専有環境
+実測に委ねる。#506 が共有 QEMU 環境での N=5 ペア前後比較実測を記録済み
+（下記「前後比較実測（Issue #506）」節。`masked_short` 悪化は fix `923efcf`
+で解消済みだが、レイテンシは条件依存で改善〔複数ラウンド発火時〕・悪化
+〔単発ラウンドでも生じる固定コスト〕の両方が観測されており、共有 QEMU 環境の
+数値は採否根拠にしない。`docs/design/benchmark-judgement-policy.md` §5〜6。
+専有環境実測は引き続きオーナー作業）。
 
 上記「Phase B（訪問済みビットマップを引き継ぐ再開型スキャン）の採否」節の
 **Rejected 判定を撤回するものではない**。当時は実測上の必要性が確認できず
@@ -896,3 +900,187 @@ pgvector（PostgreSQL License）の `hnsw.iterative_scan` は上流 README で
 - 性能面の採否・前後比較実測は引き続き Issue #506 の担当（本 Issue のマージ
   根拠は正しさ契約のみ——上記のとおり、性能面はむしろ既知の悪化シナリオが
   実測で確認されており、#506 でこの特性を踏まえた採否判断が必要）。
+
+## 前後比較実測（Issue #506）
+
+### 計測設計
+
+既定の `make bench-hybrid`（`crates/engine/benches/hybrid_latency_bench.rs`。
+Issue #324）は `hybrid::hybrid_search` を `ParallelSearchProvider` で直接呼ぶ
+in-build 比較であり、#505 の実 seam（`sql::hnsw_hybrid::HnswDenseProvider`）を
+一切通らない（CORE-7〔Issue #324〕・ANN opt-in Recall ゲート〔Issue #412〕と
+同型の構造的制約）。#505 の変更経路へ到達できる唯一の production API は
+SQL 表層（`EngineCore::from_storage_with_engine` ＋
+`ORDER BY HYBRID(...)`）であるため、`BENCH_HYBRID_LATENCY_ENGINE` 環境変数
+opt-in で起動する SQL 表層計測モード（`harness::hybrid_latency::
+SqlHybridBenchFixture`〔統計・パース関数〕＋ `hybrid_latency_bench.rs` 側の
+同型 fixture〔`mod temp_db;` の二重宣言〔`clippy::duplicate_mod`〕を避ける
+ため実体は bench 側に置く〕）を追加した。既定モード（env 未設定）の出力は
+本追加の前後でバイト単位不変（`make bench-hybrid` 後方互換）。
+
+before／after は 2 コミット間の別バイナリで比較する（`sql::hnsw_hybrid::
+HnswDenseProvider` に in-build 無効化トグルが無いため）。
+
+- before: `838c53e`（#505 直前）
+- after: `4ceb6b5`（#505 マージ済み。fix `923efcf` を含む）
+- `git diff --stat 838c53e 4ceb6b5 -- Cargo.lock` は空（ビルド条件統一。
+  `docs/design/benchmark-judgement-policy.md` §3）
+- overlay: `crates/engine/benches/hybrid_latency_bench.rs`・`benches/harness/
+  hybrid_latency.rs`（本 Issue のベンチ差分のみ）を before ツリーへコピーし
+  `cargo build --release -p engine --bench hybrid_latency_bench` でビルド
+  （production・`Cargo.lock` は各コミットのまま）。before ツリーには
+  `HnswIndexCacheStats::hybrid_resumed_rounds` フィールド自体が存在しないため、
+  `extract_counter`（Debug 文字列越しの薄いパーサ）でこの関数自体を両ツリーで
+  コンパイル可能にしている——before バイナリの出力は `hybrid_resumed_rounds=n/a`
+  になる
+
+### 環境記録
+
+```
+nproc=12
+cpu_model=QEMU Virtual CPU version 2.5+
+cpu_flags_subset=fma f16c avx2
+bench_dedicated_env=unset（共有 QEMU 環境。docs/design/benchmark-judgement-policy.md §5〜6 により
+                             本実測は参考値扱い・専有環境再実測はオーナー作業）
+before_commit=838c53e
+after_commit=4ceb6b5
+```
+
+`AB_PAIRS=5`（`docs/design/benchmark-judgement-policy.md` §3 の下限）。各条件
+1 プロセス = 1 条件（Issue #313 と同方針）、before → after の順で 5 ペア交互
+実行。`scripts/bench_hybrid_latency_ab.sh` が各 run 直前の `loadavg`・同時実行
+プロセス（`running_processes_excluding_self`・`top_cpu_processes`）を記録済み
+（生ログは `target/bench-hybrid-latency-ab/<ts>/`。CI では退避されないため
+本 doc の表が一次記録）。
+
+### 実測結果（median_us・min-of-5／median-of-5、ratio = after/before）
+
+| 条件 | before min／median | after min／median | ratio（min） | ratio（median） | 判定 |
+| ---- | ---- | ---- | ---- | ---- | ---- |
+| `ref_bf_large_tie5`（brute_force 参照区間） | 6612 / 6672 | 6593 / 6618 | 0.997 | 0.992 | ノイズ帯内（参照区間そのもの） |
+| `hnsw_large_uniform`（一様分布・no_refetch） | 4075 / 4104 | 4425 / 4437 | 1.086 | 1.081 | 5/5 ペア一貫して悪化・両ノイズ帯超過 |
+| `hnsw_large_tie5`（20,000 件・QUANTIZE_LEVELS=5） | 3903 / 3939 | 3866 / 3896 | 0.991 | 0.989 | ノイズ帯内 |
+| `hnsw_410shape_tie2`（Issue #410 形状。4,000 件・dim=16・vocab=64・QUANTIZE_LEVELS=2） | 1669 / 1674 | 1356 / 1357 | 0.812 | 0.811 | 5/5 ペア一貫して改善・両ノイズ帯超過 |
+
+参照区間（`ref_bf_large_tie5`）の run-to-run 幅（`(max−min)/min`。`docs/design/
+benchmark-judgement-policy.md` §4 の参照区間実測ノイズ帯）: before 1.35%
+（6701 vs 6612）・after 1.99%（6724 vs 6593）。固定 ±5% 帯・実測ノイズ帯
+（約 1.3〜2%）のいずれも大きく超える変化のみを「一貫した差」として扱う。
+
+per-run 生データ（`median_us`。実行順。5 ペア）:
+
+```
+ref_bf_large_tie5      before: 6701 6672 6697 6612 6615
+                        after:  6642 6593 6724 6618 6611
+hnsw_large_uniform      before: 4082 4075 4109 4104 4196
+                        after:  4435 4467 4540 4437 4425
+hnsw_large_tie5         before: 3958 3903 3916 3941 3939
+                        after:  3896 3896 3866 3870 3898
+hnsw_410shape_tie2      before: 1674 1679 1669 1675 1673
+                        after:  1357 1360 1356 1363 1356
+```
+
+### `masked_short` 再測定（fix `923efcf` 後。#506 の最初のタスク）
+
+全条件・全 run で `masked_short=0`（`hybrid_dense_searches` に対する比率
+0/60〜0/240）——**before（`838c53e`。既に #410〔iterative scan 型〕・fix
+`923efcf` を含む）・after（`4ceb6b5`）の双方で 0** だった。実装記録節が
+記録した「再開型経路が 12 ラウンド中 9 回 `masked_short` へ縮退する」実測
+（旧 `923efcf` 未適用の実装時点）は、fix 適用後の `838c53e`／`4ceb6b5`
+いずれでも再現しない。fix `923efcf`（候補復帰ループの走査対象を
+`discarded` 限定→`merged` 全体へ拡張）が実装記録の「候補復帰ループが自己
+昇格ノードを走査対象から取りこぼす実装バグ」を解消し、再開型経路でも旧経路
+（毎ラウンド新規探索）と同水準まで到達範囲を回復したことを実測で確認した
+（`hnsw_410shape_tie2`: before/after とも `hybrid_dense_searches=240`・
+`hybrid_rounds_max=4`・`masked_short=0`）。
+
+`hybrid_resumed_rounds`（再開型経路が実際に前ラウンドの状態を再開した回数。
+after 側のみ・`hybrid_dense_searches` 中の内数）:
+
+| 条件 | after `hybrid_resumed_rounds` | 解釈 |
+| ---- | ---- | ---- |
+| `hnsw_large_uniform` | 0 | 実測（`hybrid_rounds_max=1`）は確認済み。`hybrid.rs` は境界（`pool_depth` 番目と `pool_depth+1` 番目）の同点グループが `TieBoundary::Resolved` になった時点で探索を終了する（`exhaustive` フラグ自体は `dense_fetch_k`（400）が可視集合全体（20,000）を下回るため false）ため、`hybrid_rounds_max=1` は初回 `fetch_k`（400）で可視集合全体を取り切ったことの証明にはならない。`no_refetch`（連続値・量子化なし）は境界の 2 件が厳密に同値になる確率が実質ゼロのため 1 ラウンドで `Resolved` すると推測されるが、ラウンド内訳ログは取得しておらず未確認（構造的に 0 が正しい挙動であること自体は変わらない） |
+| `hnsw_large_tie5` | 0 | 実測（`hybrid_rounds_max=1`）は確認済み。20,000 件・QUANTIZE_LEVELS=5 でも `dense_fetch_k`（400）は可視集合全体（20,000）を大きく下回るため、上記と同じ理由で「可視集合全体を取り切った」ことにはならない。同点誘発コーパスであるにもかかわらず 1 ラウンドで境界が確定した理由（同点グループが `pool_depth` 境界をまたがなかったのか、他の要因か）は未確認のまま。同点誘発コーパスであっても本フィクスチャの規模・パラメータでは複数ラウンドへ到達しない（構造的に 0）という結論自体は不変 |
+| `hnsw_410shape_tie2` | 180（5 run とも同一値。決定的） | 同点誘発コーパス・複数ラウンド（`hybrid_rounds_max=4`）に対し再開型経路が実際に発火することを固定 |
+
+`hnsw_large_tie5` が resumed=0 になる事実は `hybrid_latency_bench.rs::
+QUANTIZE_LEVELS`（Issue #324 が定めた既定の同点誘発強度。20,000 件規模）が
+再開型経路の発火条件（複数ラウンドへの到達）を満たさないことを意味し、
+Issue #410 の同点誘発コーパス（4,000 件・vocab=64・QUANTIZE_LEVELS=2。より
+語彙が小さく密ベクトルの重複率が高い）のほうが再開型経路の性能特性を捉え
+やすいことを示す。
+
+### 判断
+
+- **`masked_short` 悪化は fix `923efcf` により解消済み**（0/12→0/12。実装
+  記録が懸念した残存する `visited` 単調性由来の到達範囲差は、少なくとも
+  本フィクスチャでは観測されなかった）
+- レイテンシは条件によって方向が割れる: 再開型経路が実際に複数ラウンド
+  発火する条件（`hnsw_410shape_tie2`）では **min-of-5 で約 19% 改善**
+  （両ノイズ帯を明確に超え 5/5 ペアで一貫）した一方、再開型経路が実質的に
+  発火しない一様分布・単発ラウンド条件（`hnsw_large_uniform`）では
+  **min-of-5 で約 8.6% 悪化**（同じく両ノイズ帯を超え 5/5 ペアで一貫）した。
+  後者は `HnswDenseProvider` が `Mutex<Option<HnswResumeState>>` の
+  ロック・状態確認を毎ラウンド（1 ラウンドのみでも）行うようになった
+  固定コストの可能性が高いが、静的解析・アセンブリでの裏付けは行っていない
+  （申し送り）
+- 20,000 件・QUANTIZE_LEVELS=5 という Issue #324 の既存パラメータでは
+  再開型経路が発火条件（複数ラウンド）に到達しないため、大規模コーパスで
+  実際に再開が効く条件（大規模かつ複数ラウンドを要する）での実測は未実施
+  のまま残る
+- 実装記録が申し送った既存最適化の欠落（`PipelinePrefetch`〔#490〕未適用・
+  `sparse_visited_max`〔#497〕不参照）は、`hnsw_410shape_tie2` の改善が
+  それでも純便益として観測されたことから、少なくとも本フィクスチャでは
+  改善効果を相殺するほどの影響は無いと推測されるが、直接計測はしていない
+  （申し送り）
+- 共有 QEMU 環境の 1 回の N=5 ペア実測であり、`docs/design/
+  benchmark-judgement-policy.md` §5〜6 により **参考値**（採否根拠にしない）。
+  専有環境（`BENCH_DEDICATED_ENV=1`）での再実測をオーナーへ申し送る
+
+### Recall 3 ゲートの同一閾値検証（Step 4）
+
+`docs/spec`（private submodule）が本環境にチェックアウトされておらず、
+`HYBRID_RECALL_MIN_*` 等の spec 由来閾値を注入できない（環境変数未設定）。
+`RECALL_ENGINE=hnsw RECALL_VERBOSE=1 cargo test --release -p engine --test
+hybrid_recall -- --ignored --nocapture` を実行したところ、閾値ゲートは
+契約どおり **明示的な no-op**（`HYBRID_RECALL_MIN_R20_SMALL not configured;
+gate not enabled` 等。fail ではない）として完了し、`RECALL_VERBOSE=1` でも
+閾値未設定時は実測値そのものを計算・出力しない（測定本体が閾値ガードの
+内側にあるため）。したがって本環境では新規の Recall 実測値は得られていない。
+
+一方 `tests/hnsw_hybrid_refetch.rs`（本 Issue で `hybrid_resumed_rounds >= 1`
+の非 vacuous アサーションを追加。下記参照）・`tests/hnsw_cache.rs` の既存
+テストは brute-force 対照 Recall@10 ≥ 0.9・可視外テナント非混入を無変更の
+まま固定しており、Issue #412／#515 が記録した「brute_force／hnsw／hnsw_f16
+の全 8 測定点で Recall 実測値が完全一致」という既存結果（`docs/design/
+ann-recall-gate-verification.md`）は、#505 が SQL 表層の Recall セマンティクス
+（`finish_indexed_search` の `matches_all`・fail-closed 縮退契約）を一切
+変更していないことから、そのまま成立すると判断する。`RECALL_ENGINE=hnsw`／
+`hnsw_f16` の実閾値評価（マージ後の `recall.yml` schedule/dispatch 実行）は
+管理者作業として申し送る。
+
+### `hybrid_resumed_rounds` の非 vacuous 固定（Step 5）
+
+上記実測で `hnsw_410shape_tie2`（SQL 表層・同点誘発コーパス）の
+`hybrid_resumed_rounds` が 5 run とも 180（安定して `>= 1`）だったため、
+`tests/hnsw_hybrid_refetch.rs::run_tie_inducing_corpus_hybrid_search_
+terminates_and_is_deterministic`（F32／F16 共有本体）へ
+`stats.hybrid_resumed_rounds >= 1` のアサーションを追加した（既存の停止性・
+決定性アサーション・fixture パラメータは無変更）。
+
+### 申し送り
+
+- 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測（採否確定に必須）
+- `hnsw_large_uniform` で観測された単発ラウンドでも生じる固定コスト
+  （推定 `Mutex<Option<HnswResumeState>>` のロック・状態確認）の静的解析・
+  実アセンブリでの裏付けと、必要なら軽量化（例: ラウンド数が既知で 1 の
+  場合は状態管理をバイパスする等）
+- 大規模コーパスで再開型経路が実際に複数ラウンド発火する条件（規模・
+  QUANTIZE_LEVELS の組み合わせ）を探索したうえでの追加実測
+- `PipelinePrefetch`（#490）適用・`sparse_visited_max`（#497）参照・
+  `HopMode::TwoHop`（#501）統合による再開型経路の追加最適化（承認なしに
+  起票しない別 Issue 候補）
+- Recall ゲート閾値による hnsw／hnsw_f16 の実 run（マージ後の管理者作業）
+- 親 Issue #503 への採否判断（`masked_short` は解消済み・レイテンシは
+  条件依存で改善/悪化が両方観測されているため、単純な Accept/Reject では
+  なく条件別の適用方針の検討を推奨する、というのが本実測からの示唆）

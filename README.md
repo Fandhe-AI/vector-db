@@ -206,6 +206,43 @@ wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契�
 設定された実行環境では起動直後に fail-closed で拒否します。実測結果・設計は
 `docs/design/hybrid-refetch-latency.md` を参照してください。
 
+**SQL 表層（hnsw opt-in）計測モード（Issue #506）**: 既定モード（env 未設定）は
+`hybrid::hybrid_search` を直接呼ぶため、Issue #505 の実 seam
+（`sql::hnsw_hybrid::HnswDenseProvider`）を通りません。`BENCH_HYBRID_LATENCY_ENGINE=
+brute_force|hnsw|hnsw_f16` を設定すると、`EngineCore::from_storage_with_engine`
+＋ `ORDER BY HYBRID(...)`（SQL 表層。ANN opt-in の唯一の到達経路）を計測する
+モードへ切り替わります（既定モードの出力は本追加の前後で不変）。
+`BENCH_HYBRID_LATENCY_SCALE=small|large|all`（既定 all）・
+`BENCH_HYBRID_LATENCY_CORPUS=no_refetch|tie_refetch|all`（既定 all）・
+`BENCH_HYBRID_LATENCY_NUM_DOCS`／`_DIM`／`_VOCAB_SIZE`／`_QUANTIZE_LEVELS`
+（既定はスケール別定数を上書き）・`BENCH_HYBRID_LATENCY_EXPECT_RESUMED=1`
+（`tie_refetch` の after 側計測にのみ指定。`hybrid_resumed_rounds` が 0 のまま
+なら非 0 終了）を指定できます。
+
+前後比較は `scripts/bench_hybrid_latency_ab.sh`（`make bench-hybrid-ab`）で
+行います。`BEFORE_BIN`／`AFTER_BIN` に退避済みバイナリの絶対パス、
+`BEFORE_COMMIT`／`AFTER_COMMIT` にビルド元コミットの hash を指定し
+（`docs/design/benchmark-judgement-policy.md` §3 が要求する追跡可能性のため
+必須）、`AB_PAIRS`（既定 5・5 未満は拒否）で交互ペア数を指定して
+`ref_bf_large_tie5`・`hnsw_large_uniform`・`hnsw_large_tie5`・
+`hnsw_410shape_tie2`（Issue #410 形状）の 4 条件を before→after の順で交互
+実行します。`--summarize <dir>` で `hybrid_latency: stage=` 行・環境行を
+条件・ペア・before/after の実行順で列挙できます（判定・平均化は行わず、
+生ログをそのまま出力）。before バイナリの再現手順（`838c53e` = Issue #505
+直前）:
+
+```bash
+git archive 838c53e | tar -x -C <scratch>/before
+# 本ベンチの差分のみを overlay（production・Cargo.lock は 838c53e のまま）
+cp crates/engine/benches/hybrid_latency_bench.rs <scratch>/before/crates/engine/benches/
+cp crates/engine/benches/harness/hybrid_latency.rs <scratch>/before/crates/engine/benches/harness/
+CARGO_TARGET_DIR=<scratch>/target-before cargo build --release \
+  --manifest-path <scratch>/before/Cargo.toml -p engine --bench hybrid_latency_bench
+```
+
+実測結果・判断は `docs/design/hnsw-hybrid-iterative-scan.md`「前後比較実測
+（Issue #506）」節を参照してください。
+
 ### hybrid_rrf 段別内訳プロファイルと転置索引化の前後比較（Issue #356・#387・#394）
 
 `make bench-hybrid-profile`（`crates/engine/benches/hybrid_profile_bench.rs`・
