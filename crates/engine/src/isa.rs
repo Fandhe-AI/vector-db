@@ -399,6 +399,364 @@ fn padded_tail_sum<const LANES: usize>(a_rem: &[f32], b_rem: &[f32]) -> f32 {
     prod.iter().sum()
 }
 
+// ---------------------------------------------------------------------
+// f16 昇格 dot（Issue #514・親 #513。ポインタ: TASK-132・TASK-156・CORE-16）。
+//
+// `hnsw.rs::NodeVectors::F16`（HNSW 索引ノードの f16 常駐表現。opt-in）が
+// 候補生成スコアを計算するための ISA 別カーネル。上記 `SimdKernel`（f32 幅
+// ディスパッチ・CORE-11/CORE-12 の決定表が使う）とは別系統の
+// トークン・ディスパッチを持つ（`docs/design/simd-intrinsics-adoption.md`
+// 決定 3: 「幅」ではなく「機能」の可否を表すため独立 enum・独立 `OnceLock` とする）。
+// 索引ヒットの最終スコアは常に `kernel::dot`（f32・既存演算順）で再計算する契約
+// （同 ADR 決定 5）のため、本カーネルの ISA 間ビット一致は要求しない
+// （同一プロセス・同一 ISA 内での決定性のみを要求する）。
+// ---------------------------------------------------------------------
+
+/// x86_64 AVX2+FMA+F16C 対応の実行時確認済みトークン（sealed）。
+///
+/// [`Avx2FmaToken`] と同じ設計（フィールド private・`pub(crate) fn try_new` のみ）
+/// だが、`f16c`（`_mm256_cvtph_ps` に必要）の対応有無も確認する別トークン。
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy)]
+pub struct F16cToken(());
+
+#[cfg(target_arch = "x86_64")]
+impl F16cToken {
+    /// crate 内からのみ呼べる（[`NeonToken::try_new`] と同じ sealed 方針）。
+    pub(crate) fn try_new() -> Option<Self> {
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("f16c")
+        {
+            Some(F16cToken(()))
+        } else {
+            None
+        }
+    }
+}
+
+/// aarch64 NEON+FP16（`fcvtl`/`fcvtn` 系変換命令）対応の実行時確認済みトークン
+/// （sealed）。
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Clone, Copy)]
+pub struct NeonFp16Token(());
+
+#[cfg(target_arch = "aarch64")]
+impl NeonFp16Token {
+    /// crate 内からのみ呼べる（[`NeonToken::try_new`] と同じ sealed 方針）。
+    pub(crate) fn try_new() -> Option<Self> {
+        if std::arch::is_aarch64_feature_detected!("neon")
+            && std::arch::is_aarch64_feature_detected!("fp16")
+        {
+            Some(NeonFp16Token(()))
+        } else {
+            None
+        }
+    }
+}
+
+/// f16 昇格 dot（`hnsw.rs::NodeVectors::F16` 専用）の実行時検出済みカーネル。
+/// [`SimdKernel`] と同じ sealed トークン方式で、対応 ISA が無い環境では
+/// `Scalar`（`f16::f16_bits_to_f32` によるソフトウェア復号）へ fail-closed で
+/// 縮退する。
+#[derive(Debug, Clone, Copy)]
+pub enum F16Kernel {
+    /// f16C／NEON+FP16 いずれも未対応（ソフトウェア復号での逐次計算）。
+    Scalar,
+    /// x86_64 AVX2+FMA+F16C。
+    #[cfg(target_arch = "x86_64")]
+    F16c(F16cToken),
+    /// aarch64 NEON+FP16。
+    #[cfg(target_arch = "aarch64")]
+    NeonFp16(NeonFp16Token),
+}
+
+/// [`F16Kernel`] が使う ISA を表す判別子（`SimdKernel::isa` と同じ「別の判断を
+/// 持たない写像」という位置付け）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectedF16Isa {
+    /// ソフトウェア復号のみ。
+    Scalar,
+    /// x86_64 AVX2+FMA+F16C。
+    F16c,
+    /// aarch64 NEON+FP16。
+    NeonFp16,
+}
+
+impl F16Kernel {
+    /// [`DetectedF16Isa`] への純写像。
+    pub fn isa(self) -> DetectedF16Isa {
+        match self {
+            F16Kernel::Scalar => DetectedF16Isa::Scalar,
+            #[cfg(target_arch = "x86_64")]
+            F16Kernel::F16c(_) => DetectedF16Isa::F16c,
+            #[cfg(target_arch = "aarch64")]
+            F16Kernel::NeonFp16(_) => DetectedF16Isa::NeonFp16,
+        }
+    }
+
+    /// `a_bits`（f16 ビット表現。`hnsw.rs::NodeVectors::F16` の索引ノード行）と
+    /// `b`（f32。クエリベクトル）の昇格 dot を計算する。長さは短い方へ切り詰める
+    /// （[`dot_scalar`] と同じ意味論）。
+    pub fn dot_f16(self, a_bits: &[u16], b: &[f32]) -> f32 {
+        match self {
+            F16Kernel::Scalar => dot_f16_scalar(a_bits, b),
+            #[cfg(target_arch = "x86_64")]
+            F16Kernel::F16c(_) => {
+                // SAFETY: この variant は `F16cToken::try_new` が `avx2`・`fma`・
+                // `f16c` の対応を実行時確認できた場合にのみ構築される sealed
+                // トークンを保持する（`Avx2FmaToken`/`Avx512Token` 分岐と同じ
+                // 構造）。値の存在が CPU 対応の証明であり、`dot_f16_f16c` の
+                // `#[target_feature]` 契約を満たす。
+                unsafe { dot_f16_f16c(a_bits, b) }
+            }
+            #[cfg(target_arch = "aarch64")]
+            F16Kernel::NeonFp16(_) => {
+                // SAFETY: この variant は `NeonFp16Token::try_new` が `neon`・
+                // `fp16` の対応を実行時確認できた場合にのみ構築される sealed
+                // トークンを保持する。値の存在が CPU 対応の証明であり、
+                // `dot_f16_neon_fp16` の `#[target_feature]` 契約を満たす。
+                unsafe { dot_f16_neon_fp16(a_bits, b) }
+            }
+        }
+    }
+}
+
+/// 優先順（F16C → NeonFp16 → Scalar）で `try_new` を試す（[`detect`] と同じ
+/// fail-closed 方針）。
+pub fn detect_f16() -> F16Kernel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(token) = F16cToken::try_new() {
+            return F16Kernel::F16c(token);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if let Some(token) = NeonFp16Token::try_new() {
+            return F16Kernel::NeonFp16(token);
+        }
+    }
+    F16Kernel::Scalar
+}
+
+/// プロセス内で 1 回だけ [`detect_f16`] を実行する（[`current`] と同じ方針。
+/// `current()` とは独立の `OnceLock` を持ち、f32 幅ディスパッチの決定表
+/// （`dispatch.rs`）へは影響しない）。
+pub fn current_f16() -> F16Kernel {
+    static CURRENT_F16: OnceLock<F16Kernel> = OnceLock::new();
+    *CURRENT_F16.get_or_init(detect_f16)
+}
+
+/// f16 昇格 dot のスカラー参照実装（`f16::f16_bits_to_f32` で復号してから
+/// 左から右への逐次和。ISA 別カーネルとの許容差内一致をテストで確認する）。
+pub fn dot_f16_scalar(a_bits: &[u16], b: &[f32]) -> f32 {
+    a_bits
+        .iter()
+        .zip(b.iter())
+        .map(|(&bits, &y)| crate::f16::f16_bits_to_f32(bits) * y)
+        .sum()
+}
+
+/// x86_64 AVX2+FMA+F16C 向け f16 昇格 dot カーネル。
+///
+/// `as_chunks::<8>()` で得た固定長配列から `_mm_set_epi16`（f16 ビット表現の
+/// `set` 構築）→ `_mm256_cvtph_ps`（f16→f32 昇格）、`_mm256_set_ps`（クエリ側）
+/// → `_mm256_fmadd_ps` の順に処理する（`docs/design/simd-intrinsics-adoption.md`
+/// 決定 1: ポインタ load/store intrinsics 不使用・`set` 構築のみ）。
+/// 呼び出しには `unsafe` が必要（[`F16Kernel::dot_f16`] の SAFETY コメント参照）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+fn dot_f16_f16c(a_bits: &[u16], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = a_bits.len().min(b.len());
+    let a_bits = &a_bits[..len];
+    let b = &b[..len];
+
+    let (a_chunks, a_rem) = a_bits.as_chunks::<8>();
+    let (b_chunks, b_rem) = b.as_chunks::<8>();
+
+    // `avx2,fma,f16c` は本 fn の `#[target_feature]` で有効化済みのため、
+    // 以下の intrinsics 呼び出しは（target_feature 1.1 の規則により）
+    // `unsafe` ブロックを要さない safe fn 呼び出しである。引数はいずれも
+    // `as_chunks::<8>()` が返す固定長配列（`&[u16; 8]`／`&[f32; 8]`）からの
+    // `set` 構築のみで、ポインタ load/store は使わない（決定 1。isa.rs の
+    // `unsafe` は [`F16Kernel::dot_f16`] のディスパッチ 2 箇所のみに限定する
+    // という設計上の帰結であり、本 fn 自体には `unsafe` ブロックを置かない）。
+    let mut acc = _mm256_setzero_ps();
+    for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
+        let va16 = _mm_set_epi16(
+            ac[7] as i16,
+            ac[6] as i16,
+            ac[5] as i16,
+            ac[4] as i16,
+            ac[3] as i16,
+            ac[2] as i16,
+            ac[1] as i16,
+            ac[0] as i16,
+        );
+        let va = _mm256_cvtph_ps(va16);
+        let vb = _mm256_set_ps(bc[7], bc[6], bc[5], bc[4], bc[3], bc[2], bc[1], bc[0]);
+        acc = _mm256_fmadd_ps(va, vb, acc);
+    }
+
+    // 水平和（決定 1・決定 9: `_mm256_extractf128_ps`／`_mm_add_ps`／
+    // `_mm_shuffle_ps`／`_mm_add_ss`／`_mm_cvtss_f32` のみを使い、store
+    // intrinsics・`transmute` は使わない）。
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_shuffle_ps(sum128, sum128, 0b01_00_11_10);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_shuffle_ps(sums, sums, 0b00_00_00_01);
+    let final_sum = _mm_add_ss(sums, shuf2);
+    let lane_sum = _mm_cvtss_f32(final_sum);
+
+    let rem_sum: f32 = a_rem
+        .iter()
+        .zip(b_rem.iter())
+        .map(|(&bits, &y)| crate::f16::f16_bits_to_f32(bits) * y)
+        .sum();
+    lane_sum + rem_sum
+}
+
+/// aarch64 NEON+FP16 向け f16 昇格 dot カーネル。
+///
+/// `vset_lane_u16` 連鎖（決定 1「第二候補」。`as_chunks::<4>()` の固定長配列から
+/// 連続レーンへ順に詰める形は 1 個の `ldr d`＋`fcvtl`（f16→f32 昇格）へ畳み込まれる
+/// ことを `--emit asm` で確認済み）で f16 側を、`vsetq_lane_f32` 連鎖で f32 側を
+/// 構築し、`vfmaq_f32` で積和する。`#[inline(never)]` は生成コード検査
+/// （`scripts/check_simd_codegen.sh`）から独立シンボルとして検出できるようにする
+/// ため（決定 2）。呼び出しには `unsafe` が必要
+/// （[`F16Kernel::dot_f16`] の SAFETY コメント参照）。
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[target_feature(enable = "neon,fp16")]
+fn dot_f16_neon_fp16(a_bits: &[u16], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let len = a_bits.len().min(b.len());
+    let a_bits = &a_bits[..len];
+    let b = &b[..len];
+
+    let (a_chunks, a_rem) = a_bits.as_chunks::<4>();
+    let (b_chunks, b_rem) = b.as_chunks::<4>();
+
+    // `neon,fp16` は本 fn の `#[target_feature]` で有効化済みのため、以下の
+    // intrinsics 呼び出しは `unsafe` ブロックを要さない safe fn 呼び出しである
+    // （x86_64 側 `dot_f16_f16c` と同じ注記）。引数はいずれも `as_chunks::<4>()`
+    // が返す固定長配列（`&[u16; 4]`／`&[f32; 4]`）からの `set`
+    // （`vset_lane_u16`／`vsetq_lane_f32`）構築のみで、ポインタ load/store
+    // （`vld1q_*` 等）は使わない（決定 1）。
+    let mut acc = vdupq_n_f32(0.0);
+    for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
+        let mut vh_u16 = vdup_n_u16(0);
+        vh_u16 = vset_lane_u16(ac[0], vh_u16, 0);
+        vh_u16 = vset_lane_u16(ac[1], vh_u16, 1);
+        vh_u16 = vset_lane_u16(ac[2], vh_u16, 2);
+        vh_u16 = vset_lane_u16(ac[3], vh_u16, 3);
+        let va = vcvt_f32_f16(vreinterpret_f16_u16(vh_u16));
+
+        let mut vb = vdupq_n_f32(0.0);
+        vb = vsetq_lane_f32(bc[0], vb, 0);
+        vb = vsetq_lane_f32(bc[1], vb, 1);
+        vb = vsetq_lane_f32(bc[2], vb, 2);
+        vb = vsetq_lane_f32(bc[3], vb, 3);
+
+        acc = vfmaq_f32(acc, va, vb);
+    }
+
+    let lane_sum = vaddvq_f32(acc);
+
+    let rem_sum: f32 = a_rem
+        .iter()
+        .zip(b_rem.iter())
+        .map(|(&bits, &y)| crate::f16::f16_bits_to_f32(bits) * y)
+        .sum();
+    lane_sum + rem_sum
+}
+
+#[cfg(test)]
+mod f16_kernel_tests {
+    use super::*;
+
+    /// [`F16Kernel::dot_f16`]（実行時検出）と [`dot_f16_scalar`]（参照実装）が
+    /// 許容差内で一致すること。dim 0 を含む複数次元・チャンク境界を跨ぐ長さを
+    /// 走査する。
+    #[test]
+    fn dispatched_dot_f16_matches_scalar_reference_within_tolerance() {
+        for dim in [0usize, 1, 3, 4, 7, 8, 9, 16, 17, 33, 128, 129] {
+            let a_f32: Vec<f32> = (0..dim).map(|i| (i as f32 % 13.0) - 6.0).collect();
+            let a_bits: Vec<u16> = a_f32
+                .iter()
+                .map(|&v| crate::f16::f32_to_f16_bits(v))
+                .collect();
+            let b: Vec<f32> = (0..dim).map(|i| (i as f32 % 7.0) * 0.5 - 1.5).collect();
+
+            let expected = dot_f16_scalar(&a_bits, &b);
+            let actual = current_f16().dot_f16(&a_bits, &b);
+            let tolerance = 1e-2 * expected.abs().max(1.0) + 1e-2;
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "dim={dim} actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    /// 同一プロセス内で `to_bits()` が決定的であること（f32 側 `dot_lanes` の
+    /// 決定性契約と同型）。
+    #[test]
+    fn dot_f16_is_deterministic_within_process() {
+        let a_f32: Vec<f32> = (0..37).map(|i| (i as f32) * 0.25 - 4.0).collect();
+        let a_bits: Vec<u16> = a_f32
+            .iter()
+            .map(|&v| crate::f16::f32_to_f16_bits(v))
+            .collect();
+        let b: Vec<f32> = (0..37).map(|i| (i as f32) * 0.1).collect();
+
+        let first = current_f16().dot_f16(&a_bits, &b);
+        for _ in 0..8 {
+            assert_eq!(
+                current_f16().dot_f16(&a_bits, &b).to_bits(),
+                first.to_bits()
+            );
+        }
+    }
+
+    /// `current_f16()` の単調性（`current()` と同じ契約）。
+    #[test]
+    fn current_f16_is_stable_within_process() {
+        let first = current_f16().isa();
+        for _ in 0..8 {
+            assert_eq!(current_f16().isa(), first);
+        }
+        assert_eq!(detect_f16().isa(), first);
+    }
+
+    /// 長さ不一致・空スライスで [`dot_f16_scalar`] と同一の意味論
+    /// （短い方への切り詰め）になること。
+    #[test]
+    fn dot_f16_length_mismatch_matches_scalar_semantics() {
+        let a_f32 = [1.0f32, 2.0, 3.0, 4.0];
+        let a_bits: Vec<u16> = a_f32
+            .iter()
+            .map(|&v| crate::f16::f32_to_f16_bits(v))
+            .collect();
+        let b = vec![5.0f32, 6.0];
+
+        assert_eq!(
+            current_f16().dot_f16(&a_bits, &b),
+            dot_f16_scalar(&a_bits, &b)
+        );
+        assert_eq!(
+            current_f16().dot_f16(&[], &a_f32),
+            dot_f16_scalar(&[], &a_f32)
+        );
+        assert_eq!(current_f16().dot_f16(&[] as &[u16], &[] as &[f32]), 0.0f32);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

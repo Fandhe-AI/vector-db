@@ -48,7 +48,7 @@ use std::time::Instant;
 use super::{
     assign_level, compute_shrink, max_degree_for, node_vector, score_of,
     select_neighbors_heuristic_free, DeterministicRng, GraphBuilder, HnswBuildProfile, HnswError,
-    HnswIndex, HnswParams, HnswWorkerStats, Node, ScoredNode, VisitedScratch,
+    HnswIndex, HnswParams, HnswWorkerStats, Node, ResidentPrecision, ScoredNode, VisitedScratch,
 };
 
 thread_local! {
@@ -539,6 +539,7 @@ fn insert_node_locked(
 ///    build` と共有）を実行する。
 pub(crate) fn build_parallel_graph(
     params: HnswParams,
+    precision: ResidentPrecision,
     dim: u32,
     vectors: &[f32],
     seed: u64,
@@ -623,7 +624,15 @@ pub(crate) fn build_parallel_graph(
         return Err(e);
     }
 
-    freeze(graph, params, dim, vectors, dim_usize, owned_vectors)
+    freeze(
+        graph,
+        params,
+        precision,
+        dim,
+        vectors,
+        dim_usize,
+        owned_vectors,
+    )
 }
 
 /// [`super::HnswIndex::build_with_threads_observed`] から呼ばれる、
@@ -647,6 +656,7 @@ pub(crate) fn build_parallel_graph(
 /// 伝播）のロジックは完全に同一。
 pub(crate) fn build_parallel_graph_observed(
     params: HnswParams,
+    precision: ResidentPrecision,
     dim: u32,
     vectors: &[f32],
     seed: u64,
@@ -775,7 +785,7 @@ pub(crate) fn build_parallel_graph_observed(
     // 修復）のいずれも可変長ビルダー表現（`GraphBuilder`）に対する in-place
     // 更新を要するため、両方が完了するまで CSR へは変換しない。
     let flatten_start = Instant::now();
-    let index = HnswIndex::freeze_from(builder, dim, owned_vectors)?;
+    let index = HnswIndex::freeze_from(builder, dim, owned_vectors, precision)?;
     let flatten = flatten_start.elapsed();
 
     let profile = HnswBuildProfile {
@@ -835,6 +845,7 @@ fn assemble_graph(graph: BuildGraph, params: HnswParams) -> Result<GraphBuilder,
 fn freeze(
     graph: BuildGraph,
     params: HnswParams,
+    precision: ResidentPrecision,
     dim: u32,
     original_vectors: &[f32],
     dim_usize: usize,
@@ -842,7 +853,7 @@ fn freeze(
 ) -> Result<HnswIndex, HnswError> {
     let mut builder = assemble_graph(graph, params)?;
     builder.repair_reachability(dim_usize, original_vectors)?;
-    HnswIndex::freeze_from(builder, dim, owned_vectors)
+    HnswIndex::freeze_from(builder, dim, owned_vectors, precision)
 }
 
 #[cfg(test)]
@@ -884,7 +895,16 @@ mod tests {
         assert!(result.is_err());
         assert!(lock.is_poisoned());
 
-        let err = freeze(graph, params, dim as u32, &vectors, dim, owned).unwrap_err();
+        let err = freeze(
+            graph,
+            params,
+            ResidentPrecision::F32,
+            dim as u32,
+            &vectors,
+            dim,
+            owned,
+        )
+        .unwrap_err();
         assert_eq!(err, HnswError::WorkerPanicked);
     }
 

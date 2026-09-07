@@ -276,8 +276,9 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
     // 現れる（実際のビルドで有効になるのは対象 arch の分岐のみだが、`cfg` 行は
     // ソース上に残ったまま走査されるため、arch に依存せず常に 3 を期待できる）。
     assert_eq!(
-        unsafe_block_count, 3,
-        "expected exactly 3 `unsafe {{` blocks in isa.rs (Neon, Avx2Fma, Avx512 dot dispatch)"
+        unsafe_block_count, 5,
+        "expected exactly 5 `unsafe {{` blocks in isa.rs (Neon, Avx2Fma, Avx512 dot dispatch \
+         + F16c, NeonFp16 dot_f16 dispatch added by Issue #514)"
     );
 }
 
@@ -312,10 +313,102 @@ fn token_types_have_no_public_constructor() {
         "isa.rs must not expose a public try_new constructor for token types"
     );
 
-    for token in ["NeonToken", "Avx2FmaToken", "Avx512Token"] {
+    for token in [
+        "NeonToken",
+        "Avx2FmaToken",
+        "Avx512Token",
+        "F16cToken",
+        "NeonFp16Token",
+    ] {
         assert!(
             source.contains(&format!("struct {token}(())")),
             "{token} must be defined as a unit-field tuple struct `{token}(())`"
         );
     }
+}
+
+// ---------- f16 昇格 dot（Issue #514・親 #513。ポインタ: TASK-132・TASK-156・CORE-16） ----------
+//
+// `isa::F16Kernel`（`hnsw.rs::NodeVectors::F16` 専用のディスパッチ）の結合テスト。
+// `SimdKernel`（f32 幅ディスパッチ）の既存テストと同じ「crate 外から到達できる
+// 公開 API だけで検証する」方針を踏襲する。
+
+/// `isa::current_f16().isa()` が、`std::arch` の feature 検出マクロから
+/// テスト側で独立に算出した期待値と一致すること。
+#[test]
+fn f16_detection_matches_std_feature_macros() {
+    let expected = expected_f16_isa_from_std_macros();
+    assert_eq!(isa::current_f16().isa(), expected);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn expected_f16_isa_from_std_macros() -> isa::DetectedF16Isa {
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c")
+    {
+        isa::DetectedF16Isa::F16c
+    } else {
+        isa::DetectedF16Isa::Scalar
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn expected_f16_isa_from_std_macros() -> isa::DetectedF16Isa {
+    if std::arch::is_aarch64_feature_detected!("neon")
+        && std::arch::is_aarch64_feature_detected!("fp16")
+    {
+        isa::DetectedF16Isa::NeonFp16
+    } else {
+        isa::DetectedF16Isa::Scalar
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn expected_f16_isa_from_std_macros() -> isa::DetectedF16Isa {
+    isa::DetectedF16Isa::Scalar
+}
+
+/// `isa::current_f16().dot_f16` が `isa::dot_f16_scalar`（参照実装）と許容差内で
+/// 一致すること。決定的シード RNG で複数次元（0・チャンク境界を跨ぐ長さを含む）を
+/// 走査する。f16 の丸め誤差を許容するため許容差は f32 側 `dispatched_dot_matches_
+/// scalar_reference_within_tolerance` より緩める。
+#[test]
+fn dispatched_dot_f16_matches_scalar_reference_within_tolerance() {
+    let dims = [0usize, 1, 3, 4, 7, 8, 15, 16, 17, 33, 128, 129];
+    let mut rng = XorShift64Star::new(0x2468_ace0_1357_9bdf);
+
+    for &dim in &dims {
+        let a_f32 = random_vec(&mut rng, dim);
+        let a_bits: Vec<u16> = a_f32
+            .iter()
+            .map(|&v| {
+                let packed = engine::batch_search::pack_f16x2(v, 0.0);
+                let bits = packed & 0xFFFF;
+                bits as u16
+            })
+            .collect();
+        let b = random_vec(&mut rng, dim);
+
+        let expected = isa::dot_f16_scalar(&a_bits, &b);
+        let actual = isa::current_f16().dot_f16(&a_bits, &b);
+
+        let magnitude: f32 = a_f32.iter().zip(b.iter()).map(|(x, y)| (x * y).abs()).sum();
+        let tolerance = 1e-2 * magnitude + 1e-2;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "dim={dim} actual={actual} expected={expected} tolerance={tolerance}"
+        );
+    }
+}
+
+/// `isa::current_f16()` の単調性（`isa::current()` と同じ契約。プロセス内で
+/// 何度呼んでも同一 ISA を返す）。
+#[test]
+fn f16_detection_is_stable_within_process() {
+    let baseline = isa::current_f16().isa();
+    for _ in 0..8 {
+        assert_eq!(isa::current_f16().isa(), baseline);
+    }
+    assert_eq!(isa::detect_f16().isa(), baseline);
 }
