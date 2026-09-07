@@ -122,7 +122,9 @@ aarch64 では `SimdKernel::dot` がエイリアス化され独立シンボル�
 `_ZN6engine3isa10x86_block4...` の形で `3isa` セグメントを含み続けるため、
 既存の「モジュール単位」抽出方式（本 doc §2「なぜ関数名ではなくモジュール単位で
 対象を絞るか」）は変更せずそのまま対象に含まれる）。aarch64 側の必須シンボルは
-不変（本 Issue の `Neon` variant は 4 × `dot` の縮退のみで新規シンボルを持たない）。
+Issue #510 時点では不変（`Neon` variant は 4 × `dot` の縮退のみで新規シンボルを
+持たなかった。NEON 版は Issue #511 で実装し必須シンボルを追加した。下記
+「Issue #511 以降の追記」参照）。
 
 **実装過程で判明した禁止命令の再混入経路（本ガードの実効性を裏付ける実例）**:
 当初 `_mm256_set_ps`（レーンロード。`load8`/`load16`）から得たレーンを
@@ -150,6 +152,42 @@ aarch64 では `SimdKernel::dot` がエイリアス化され独立シンボル�
 機械検査なしには気付けない」という本 ADR §1 の動機を実例で裏付けるものであり、
 `docs/design/dot-kernel-row-block.md`「レーン和をスカラー直接縮約にした理由」
 節にも同じ原因分析を記録する。
+
+### Issue #511 以降の追記（NEON 行ブロックカーネルの必須シンボル追加と実測知見）
+
+`isa::neon_block4::dot_block4_neon`（TASK-156・CORE-14。`search_range` の
+4 行ブロックカーネルの NEON 版。詳細は `docs/design/dot-kernel-row-block.md`
+参照）を必須シンボルへ追加した（`required_segments_for` の aarch64 分岐に
+`15dot_block4_neon` を追加。`isa.rs` の `mod neon_block4;` サブモジュール配下
+だが、マングル名は `_ZN6engine3isa11neon_block4...` の形で `3isa` セグメントを
+含み続けるため、既存の「モジュール単位」抽出方式は変更せずそのまま対象に含む）。
+`#[inline(never)]` を付与している（NEON は aarch64 の baseline のため、付けないと
+呼び出し元 `dot_block4_impl` へインライン化され独立シンボルとして現れなくなる。
+`dot_f16_neon_fp16`〔Issue #514〕と同じ理由）。
+
+**非 vacuous 検査の追加**: x86 版（Issue #510）は `[f32; 4]` 戻り値での SLP
+再パック問題があったが禁止命令の「あってはならない命令」検査のみで十分だった。
+NEON 版も事前検証（`docs/design/dot-kernel-row-block.md` §2.3）で同型の問題
+（`mov v.s[i]` 再パック）を確認し、`&mut f32` 出力引数の形で回避したが、
+「`vfmaq_f32` が実際に `fmla v.4s` へコンパイルされたか」を確認する非 vacuous
+検査（`expected_rules_for` の aarch64 分岐に `dot_block4_neon` →
+`^[[:space:]]*fmla[[:space:]]+v[0-9]+\.4s` を追加。`dot_f16_neon_fp16`
+〔Issue #514・A1〕と同じ方針）も追加した。ソフトウェア縮退（スカラー逐次和のみ）
+への静かな退行を、禁止命令検査（何も検出しない）ではなく非 vacuous 検査が
+検出できることを self-test fixture（`fx_pass_block4_neon.rs`／
+`fx_fail_block4_neon_scalarized.rs`）で確認済み。
+
+実測命令サマリ（本開発環境・`--target aarch64-unknown-linux-gnu`・rustc
+1.96.0。クロスコンパイルのため実機実行ではなく `--emit asm` の静的サマリ）:
+
+```text
+dot_block4_neon: ldr=34 fmla=4 fadd=25 fmul=12 dup=12 movi=12 cmp=17 csel=9 and=11 ...（禁止命令 0 件）
+```
+
+`fmla` が 4 件（4 行分のアキュムレータそれぞれ 1 件以上）出現し、
+`ins`／`mov v.s[i]`／`ld1 {}[n]`（禁止命令）は 0 件であることを確認した
+（`make simd-codegen-check-cross` の実測。x86 版 §「Issue #510 以降の追記」と
+同じ形式で記録）。
 
 ## 6. self-test fixture の設計
 

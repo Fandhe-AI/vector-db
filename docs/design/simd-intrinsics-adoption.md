@@ -226,7 +226,7 @@ target_feature として扱われるため `is_aarch64_feature_detected!` は
 
 | Issue | 内容 | 本 ADR の決定番号 | 必須ガード |
 | ----- | ---- | ------------------ | ---------- |
-| #509〜#512 | f32 行ブロック化 | 決定 1・決定 2・決定 5（f32 条件） | `check_simd_codegen.sh` 登録・`tests/isa.rs` 個数更新 |
+| #509〜#512 | f32 行ブロック化 | 決定 1・決定 2・決定 5（f32 条件） | `check_simd_codegen.sh` 登録・`tests/isa.rs` 個数更新。#510（AVX2+FMA・AVX-512F）・#511（NEON）実装済み（`docs/design/dot-kernel-row-block.md` 参照。決定 1 が明示許容する「新カーネル 1 種につきディスパッチ箇所 1 つの `unsafe`」の範囲で進めた。#512〔前後比較・採否〕は未実施） |
 | #513〜#516 | f16 常駐（`F16cToken`／`NeonFp16Token`） | 決定 1・決定 2・決定 3・決定 5（ANN 限定） | 同上 + 期待命令表拡張。#514 実装済み（`docs/design/hnsw-f16-resident.md` 参照。#515〔Recall ゲート〕・#516〔前後比較実測〕は未実施） |
 | #517〜#519 | 多アキュムレータ化 | 決定 5（オーナー判断条件） | 同上 + Recall ゲート再実測 |
 | #520〜#523 | SQ8・VNNI（`AvxVnniToken`／`Avx512VnniToken`） | 決定 1・決定 2・決定 3・決定 5 | 同上 |

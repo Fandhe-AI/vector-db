@@ -93,7 +93,7 @@ jobs:
           changed=false
           while IFS= read -r f; do
             case "$f" in
-              crates/engine/examples/detect_features.rs|crates/engine/src/isa.rs|crates/engine/tests/isa.rs|.github/workflows/detect-features.yml)
+              crates/engine/examples/detect_features.rs|crates/engine/src/isa.rs|crates/engine/src/isa/x86_block4.rs|crates/engine/src/isa/neon_block4.rs|crates/engine/tests/isa.rs|.github/workflows/detect-features.yml)
                 changed=true ;;
             esac
           done <<< "$files"

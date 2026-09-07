@@ -63,7 +63,11 @@
 //! （ADR `docs/design/simd-intrinsics-adoption.md` 決定 1）。これにより
 //! `unsafe` ブロックの総数は 3 → 5 になる（詳細・生成コード検査で判明した
 //! 問題と対処は `docs/design/dot-kernel-row-block.md` 参照。spec 本文は
-//! 転記しない）。
+//! 転記しない）。aarch64（NEON）版は新設サブモジュール [`neon_block4`] へ同じ方針
+//! （intrinsics カーネル本体は `unsafe` を持たない safe fn）で分離し、
+//! `dot_block4_impl` の Neon 分岐（1 箇所）から `unsafe` 呼び出しする
+//! （Issue #511・TASK-156・CORE-14）。x86_64 の 2 箇所と合わせて、行ブロック
+//! カーネルのディスパッチによる `unsafe` は計 3 箇所になる。
 
 use std::sync::OnceLock;
 
@@ -76,6 +80,15 @@ use std::sync::OnceLock;
 /// 関数を `unsafe` 呼び出しする。
 #[cfg(target_arch = "x86_64")]
 mod x86_block4;
+
+/// aarch64 行ブロック（4 行）カーネル本体（Issue #511・TASK-156・CORE-14）。
+///
+/// カーネル本体は `unsafe` を持たない safe fn として分離する（[`x86_block4`] と
+/// 同じ方針・同じ ADR `docs/design/simd-intrinsics-adoption.md` 決定 1）。`isa.rs`
+/// 側は [`SimdKernel::dot_block4_impl`] の Neon 分岐でこのモジュールの関数を
+/// `unsafe` 呼び出しする。
+#[cfg(target_arch = "aarch64")]
+mod neon_block4;
 
 /// 実行時に検出された ISA。
 ///
@@ -312,12 +325,34 @@ impl SimdKernel {
                 dot_scalar(r3, query),
             ],
             #[cfg(target_arch = "aarch64")]
-            SimdKernel::Neon(_) => [
-                self.dot_impl::<PADDED_TAIL>(r0, query),
-                self.dot_impl::<PADDED_TAIL>(r1, query),
-                self.dot_impl::<PADDED_TAIL>(r2, query),
-                self.dot_impl::<PADDED_TAIL>(r3, query),
-            ],
+            SimdKernel::Neon(_) => {
+                // 4 件の結果は `[f32; 4]` の戻り値ではなく `&mut f32` 出力引数 4 個
+                // で受け取る（`neon_block4::dot_block4_neon` の doc コメント
+                // 「`[f32; 4]` 戻り値ではなく `&mut f32` 出力引数にした理由」参照。
+                // 本関数（`#[target_feature]` を持たないプレーンな関数）側で
+                // `[s0, s1, s2, s3]` を組み立てることで、SLP による要素ごと挿入
+                // 命令への再パックを避ける。x86_64 Avx2Fma 分岐と同じ理由）。
+                let (mut s0, mut s1, mut s2, mut s3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                // SAFETY: この variant は `NeonToken::try_new` が
+                // `is_aarch64_feature_detected!("neon")` を実行時確認できた場合に
+                // のみ構築される sealed トークンを保持する（[`Self::dot_impl`] の
+                // Neon 分岐と同じ SAFETY 根拠。NEON は aarch64 の baseline feature
+                // だが、`#[target_feature]` を付けた fn の呼び出しはコンパイラの
+                // 安全性検査上 `unsafe` を常に要求する）。値の存在が CPU 対応の
+                // 証明であり、`neon_block4::dot_block4_neon` の `#[target_feature]`
+                // 契約を満たす。
+                unsafe {
+                    neon_block4::dot_block4_neon::<PADDED_TAIL>(
+                        [r0, r1, r2, r3],
+                        query,
+                        &mut s0,
+                        &mut s1,
+                        &mut s2,
+                        &mut s3,
+                    )
+                }
+                [s0, s1, s2, s3]
+            }
             #[cfg(target_arch = "x86_64")]
             SimdKernel::Avx2Fma(_) => {
                 // 4 件の結果は `[f32; 4]` の戻り値ではなく `&mut f32` 出力引数 4 個
@@ -493,10 +528,12 @@ fn dot_lanes<const LANES: usize, const PADDED_TAIL: bool>(a: &[f32], b: &[f32]) 
 ///
 /// レーン和・端数和それぞれの計算は [`lane_sum`]／[`tail_sum`] へさらに切り出して
 /// あり、x86_64 行ブロックカーネル（[`x86_block4::dot_block4_avx2_fma`]・
-/// [`x86_block4::dot_block4_avx512`]）は `[f32; LANES]` を経由しないスカラー直接
-/// 縮約（[`x86_block4::lane_sum8`]／[`lane_sum16`]。生成コード検査
-/// `scripts/check_simd_codegen.sh` が要素ごと挿入命令の再混入を防ぐ。詳細は
-/// `docs/design/dot-kernel-row-block.md` 参照）で得たレーン和と、この関数が持つ
+/// [`x86_block4::dot_block4_avx512`]）・aarch64 行ブロックカーネル
+/// （[`neon_block4::dot_block4_neon`]。Issue #511）は `[f32; LANES]` を経由しない
+/// スカラー直接縮約（[`x86_block4::lane_sum8`]／[`lane_sum16`]／
+/// [`neon_block4::lane_sum4`]。生成コード検査 `scripts/check_simd_codegen.sh` が
+/// 要素ごと挿入命令の再混入を防ぐ。詳細は `docs/design/dot-kernel-row-block.md`
+/// 参照）で得たレーン和と、この関数が持つ
 /// 端数和 [`tail_sum`] を組み合わせる。[`dot_lanes`]（1 行版）とブロック版が
 /// 同一の [`tail_sum`] を共有することで、行ブロック化してもスコアが 1 行版と
 /// ビット同一であることを構造的に保証する（`dot_lanes` 自体の挙動・演算順は
@@ -519,9 +556,9 @@ fn lane_sum<const LANES: usize>(lanes: [f32; LANES]) -> f32 {
     lanes.iter().sum()
 }
 
-/// [`dot_lanes`]・x86_64 行ブロックカーネルが共有する端数和（Issue #510）。
-/// `PADDED_TAIL` の値による分岐は [`reduce_lanes`] と同一（Issue #528 のドキュメント
-/// 参照）。
+/// [`dot_lanes`]・x86_64／aarch64 行ブロックカーネルが共有する端数和
+/// （Issue #510・#511）。`PADDED_TAIL` の値による分岐は [`reduce_lanes`] と同一
+/// （Issue #528 のドキュメント参照）。
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
 fn tail_sum<const LANES: usize, const PADDED_TAIL: bool>(a_rem: &[f32], b_rem: &[f32]) -> f32 {
