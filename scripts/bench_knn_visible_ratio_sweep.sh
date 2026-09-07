@@ -25,6 +25,16 @@
 #   - hnsw_force_ann       : 上記 ＋ BENCH_KNN_PROFILE_FULL_SCAN_RATIO=0/1（常に ANN 側）
 #   - hnsw_force_plain      : 上記 ＋ BENCH_KNN_PROFILE_FULL_SCAN_RATIO=1/1（常に plain scan 側）
 # baseline（各 candidate の直前に実行。BENCH_KNN_PROFILE_ENGINE=brute_force）
+#
+# `SWEEP_CANDIDATES=visited`（Issue #498）で candidate セットを
+# `hnsw_force_ann_dense`（上記 hnsw_force_ann ＋
+# BENCH_KNN_PROFILE_SPARSE_VISITED_MAX=0。既定＝常に dense）／
+# `hnsw_force_ann_sparse`（上記 ＋
+# BENCH_KNN_PROFILE_SPARSE_VISITED_MAX=18446744073709551615。常に sparse）の
+# 2 candidate へ切り替えられる（`SWEEP_RATIOS`／`SWEEP_SCALES` で規模点も
+# 上書き可）。`hnsw_force_ann_*` を使うのは、visited 実装の効果を可視候補数
+# だけに帰属させたいため——`full_scan_ratio` 既定〔1/10〕のまま可視率を
+# 動かすと ann_masked と plain scan の切替（Issue #487）が同時に交絡するため。
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -69,23 +79,55 @@ mkdir -p "${OUT_DIR}"
 echo "building knn_profile_bench (release, once)"
 (cd "${REPO_ROOT}" && cargo bench --bench knn_profile_bench -p engine --no-run)
 
-RATIOS=("1/2" "1/4" "1/10" "1/20" "1/50")
-SCALES=(1 4)
-# baseline（brute_force）を含まない候補一覧。各候補の直前に必ず baseline を
-# 1 回実行する（輪番: baseline→cand1→baseline→cand2→baseline→cand3）。
-CANDIDATES=(hnsw_default hnsw_force_ann hnsw_force_plain)
+DEFAULT_CANDIDATE_SET="default"
+CANDIDATE_SET="${SWEEP_CANDIDATES:-${DEFAULT_CANDIDATE_SET}}"
+
+case "${CANDIDATE_SET}" in
+  default)
+    DEFAULT_RATIOS=("1/2" "1/4" "1/10" "1/20" "1/50")
+    DEFAULT_SCALES=(1 4)
+    # baseline（brute_force）を含まない候補一覧。各候補の直前に必ず baseline を
+    # 1 回実行する（輪番: baseline→cand1→baseline→cand2→baseline→cand3）。
+    CANDIDATES=(hnsw_default hnsw_force_ann hnsw_force_plain)
+    ;;
+  visited)
+    # Issue #498: visited 集合切替閾値の効果を可視候補数だけへ帰属させる
+    # ため full_scan_ratio を常に 0/1（常に ANN 側）へ固定した 2 candidate。
+    DEFAULT_RATIOS=("1/2" "1/10")
+    DEFAULT_SCALES=(1)
+    CANDIDATES=(hnsw_force_ann_dense hnsw_force_ann_sparse)
+    ;;
+  *)
+    echo "ERROR: unknown SWEEP_CANDIDATES=${CANDIDATE_SET} (expected: default, visited)" >&2
+    exit 1
+    ;;
+esac
+
+if [ -n "${SWEEP_RATIOS:-}" ]; then
+  read -r -a RATIOS <<<"${SWEEP_RATIOS}"
+else
+  RATIOS=("${DEFAULT_RATIOS[@]}")
+fi
+if [ -n "${SWEEP_SCALES:-}" ]; then
+  read -r -a SCALES <<<"${SWEEP_SCALES}"
+else
+  SCALES=("${DEFAULT_SCALES[@]}")
+fi
 
 # arm ごとの env 設定を解決する（$1=arm 名。case 全分岐で
-# BENCH_KNN_PROFILE_FULL_SCAN_RATIO を明示設定し、親シェルからの export 値が
-# else 分岐で意図せず引き継がれる事故を防ぐ。空文字列は harness 側で
-# 「未設定」＝既定 1/10 として扱われる）。
+# BENCH_KNN_PROFILE_FULL_SCAN_RATIO／BENCH_KNN_PROFILE_SPARSE_VISITED_MAX を
+# 明示設定し、親シェルからの export 値が else 分岐で意図せず引き継がれる
+# 事故を防ぐ。空文字列は harness 側で「未設定」＝既定値として扱われる）。
 resolve_env() {
   local arm="$1"
+  SPARSE_VISITED_MAX=""
   case "${arm}" in
     baseline) ENGINE="brute_force"; FULL_SCAN_RATIO="" ;;
     hnsw_default) ENGINE="hnsw"; FULL_SCAN_RATIO="" ;;
     hnsw_force_ann) ENGINE="hnsw"; FULL_SCAN_RATIO="0/1" ;;
     hnsw_force_plain) ENGINE="hnsw"; FULL_SCAN_RATIO="1/1" ;;
+    hnsw_force_ann_dense) ENGINE="hnsw"; FULL_SCAN_RATIO="0/1"; SPARSE_VISITED_MAX="0" ;;
+    hnsw_force_ann_sparse) ENGINE="hnsw"; FULL_SCAN_RATIO="0/1"; SPARSE_VISITED_MAX="18446744073709551615" ;;
     *) echo "ERROR: unknown arm ${arm}" >&2; exit 1 ;;
   esac
 }
@@ -94,7 +136,7 @@ run_one() {
   local scale="$1" ratio="$2" arm="$3" label="$4" pair="$5"
   local ratio_slug="${ratio/\//_}"
   local log="${OUT_DIR}/scale${scale}_ratio${ratio_slug}_${label}_pair${pair}.log"
-  local ENGINE FULL_SCAN_RATIO
+  local ENGINE FULL_SCAN_RATIO SPARSE_VISITED_MAX
   resolve_env "${arm}"
 
   echo "loadavg=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo n/a)" >"${log}"
@@ -102,6 +144,7 @@ run_one() {
     BENCH_KNN_PROFILE_ENGINE="${ENGINE}" \
     BENCH_KNN_PROFILE_SCALE="${scale}" \
     BENCH_KNN_PROFILE_FULL_SCAN_RATIO="${FULL_SCAN_RATIO}" \
+    BENCH_KNN_PROFILE_SPARSE_VISITED_MAX="${SPARSE_VISITED_MAX}" \
     cargo bench --bench knn_profile_bench -p engine >>"${log}" 2>&1
 }
 

@@ -369,7 +369,7 @@ else
 endif
 
 .PHONY: bench-knn-visible-ratio
-bench-knn-visible-ratio: ## Issue #487（可視比率〔1/2・1/4・1/10・1/20・1/50〕× 行数〔25k・100k〕での hnsw_subset と plain scan の損益分岐点を交互 N≥5 ペアで計測する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。SWEEP_PAIRS=<N>〔既定 5〕でペア数を上書きできる。ログは target/bench-knn-visible-ratio/<unix-ts>/ 配下）
+bench-knn-visible-ratio: ## Issue #487（可視比率〔1/2・1/4・1/10・1/20・1/50〕× 行数〔25k・100k〕での hnsw_subset と plain scan の損益分岐点を交互 N≥5 ペアで計測する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。SWEEP_PAIRS=<N>〔既定 5〕でペア数を上書きできる。SWEEP_CANDIDATES=default|visited〔既定 default。visited は Issue #498 の sparse_visited_max 診断用 candidate〕・SWEEP_RATIOS／SWEEP_SCALES で候補セット・可視率・規模点を上書きできる。ログは target/bench-knn-visible-ratio/<unix-ts>/ 配下）
 ifdef HAS_CARGO
 	scripts/bench_knn_visible_ratio_sweep.sh
 else
@@ -534,11 +534,19 @@ else
 endif
 
 .PHONY: bench-hnsw-search
-bench-hnsw-search: ## Issue #491（受理判定後 prefetch〔Issue #490・PR #574〕の前後比較実測）の 1 規模点計測を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。before/after バイナリを交互起動する前後比較・8 点〔10k／100k・dim 128／768・マスク有無〕の判定は運用者が行う。BENCH_HNSW_SEARCH_ROWS〔既定 10000・1..=200000〕・BENCH_HNSW_SEARCH_DIM〔既定 128・1..=4096〕・BENCH_HNSW_SEARCH_MASK〔既定 none・1..=99 の可視率%〕・BENCH_HNSW_SEARCH_QUERIES〔既定 200〕・BENCH_HNSW_SEARCH_EF〔既定 64〕・BENCH_HNSW_SEARCH_K〔既定 10〕・BENCH_DEDICATED_ENV=1 で専有環境自己申告・BENCH_HNSW_SEARCH_COMMIT〔ビルド時指定。git archive 再現手順で before/after バイナリへ計測対象コミットを焼き込むため必須。詳細は docs/design/hnsw-search.md「再現方法」節参照〕を指定できる）
+bench-hnsw-search: ## Issue #491（受理判定後 prefetch〔Issue #490・PR #574〕の前後比較実測）の 1 規模点計測を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。before/after バイナリを交互起動する前後比較・8 点〔10k／100k・dim 128／768・マスク有無〕の判定は運用者が行う。BENCH_HNSW_SEARCH_ROWS〔既定 10000・1..=200000〕・BENCH_HNSW_SEARCH_DIM〔既定 128・1..=4096〕・BENCH_HNSW_SEARCH_MASK〔既定 none・1..=99 の可視率%〕・BENCH_HNSW_SEARCH_QUERIES〔既定 200〕・BENCH_HNSW_SEARCH_EF〔既定 64〕・BENCH_HNSW_SEARCH_K〔既定 10〕・BENCH_DEDICATED_ENV=1 で専有環境自己申告・BENCH_HNSW_SEARCH_COMMIT〔ビルド時指定。git archive 再現手順で before/after バイナリへ計測対象コミットを焼き込むため必須。詳細は docs/design/hnsw-search.md「再現方法」節参照〕・BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX〔Issue #498。dense=0／sparse=18446744073709551615 の 2 arm のみ。`--features bench-internals` が必須——`make bench-hnsw-search-visited` を使う〕を指定できる）
 ifdef HAS_CARGO
 	cargo bench --bench hnsw_search_bench -p engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-hnsw-search をスキップ"
+endif
+
+.PHONY: bench-hnsw-search-visited
+bench-hnsw-search-visited: ## Issue #498（visited 集合切替閾値 sparse_visited_max の可視比率別 dense/sparse 前後比較。層 1）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。`--features bench-internals` で hnsw_search_bench をビルドし、規模点〔既定 10000／100000〕× 可視率〔既定 50/25/10/5/2%〕ごとに dense/sparse を交互 N≥5 ペアで計測する。AB_PAIRS=<N>〔既定 5〕・AB_ROWS="<rows...>"・AB_MASKS="<percent...>" で上書きできる。ログは target/bench-hnsw-search-visited/<unix-ts>/ 配下。scripts/bench_hnsw_search_visited_ab.sh --summarize <dir> で一覧化できる）
+ifdef HAS_CARGO
+	scripts/bench_hnsw_search_visited_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hnsw-search-visited をスキップ"
 endif
 
 # --------------------------------------------------

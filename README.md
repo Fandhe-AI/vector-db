@@ -543,6 +543,8 @@ HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel
 
 受理判定後 prefetch（Issue #490）の前後比較実測は `make bench-hnsw-search`（`BENCH_HNSW_SEARCH_ROWS`／`BENCH_HNSW_SEARCH_DIM`／`BENCH_HNSW_SEARCH_MASK`〔RLS 事前フィルタ統合の `Subset` 形状を模す可視率〕で 1 規模点を計測し、before/after バイナリを交互起動して比較する手動専用ベンチ）で実施できます。`git archive` で取り出した作業ツリーから before/after バイナリをビルドする再現手順では、ビルド時に `BENCH_HNSW_SEARCH_COMMIT=<sha>` を指定して計測対象コミットをバイナリへ焼き込んでください（未指定時の実行時フォールバックはカレントディレクトリの HEAD を返すため、同一ディレクトリから交互起動する両バイナリに同じ値が記録されます）。CI 非配線・詳細・実測値・採否は `docs/design/hnsw-search.md`「Issue #491」節を参照してください。
 
+visited 集合切替閾値（`sparse_visited_max`。Issue #497）の可視比率別 dense/sparse 前後比較（Issue #498）は、`hnsw_search_bench.rs` へ `--features bench-internals` で `BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX`（`0`＝dense固定 または `18446744073709551615`＝sparse固定の 2 arm のみ。中間値は非 vacuous 検証を単純化できないため拒否）を追加し、`make bench-hnsw-search-visited`（`scripts/bench_hnsw_search_visited_ab.sh`。`AB_PAIRS`／`AB_ROWS`／`AB_MASKS` で規模点・可視率を上書き可）から dense/sparse を交互 N ペアで計測できます。SQL 表層経由の確認は `SWEEP_CANDIDATES=visited SWEEP_SCALES=<n> SWEEP_RATIOS="<n>/<d> ..."  make bench-knn-visible-ratio` で行えます。実測では全測定点で sparse が dense を上回る改善は観測されず、閾値既定値は `0`（既存動作。常に dense）のまま現状維持と判断しました。CI 非配線・詳細・実測値・判断根拠は `docs/design/hnsw-search.md`「Issue #498」節を参照してください。
+
 ### `precision` 評価ハーネス（TASK-163）
 
 `crates/engine/tests/precision_eval.rs` は `precision` モード（TASK-162）の
