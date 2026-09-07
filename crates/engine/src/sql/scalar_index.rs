@@ -54,6 +54,18 @@ use crate::row_codec::scan_scalar_columns;
 use crate::sql::arena_cache::SqlArenaSnapshot;
 use crate::storage::Storage;
 
+/// [`ScalarIndex::resolve_candidates`] の選択度切替閾値（Issue #474）。候補比
+/// （交差後の候補数 ÷ 索引行数）が `numerator / denominator` を超える場合、
+/// 索引経路より全走査（`O(N)`。候補列挙・交差のオーバーヘッドを持たない）が
+/// 有利と判断し [`CandidateResolution::FallbackSelectivity`] へ縮退する。
+/// 暫定既定値は 1/2（根拠は `docs/design/scalar-index-prune.md`「選択度切替の
+/// 既定値」節。索引経路のコストは概ね `O(|hits|)`、全走査は `O(N + |hits|)`
+/// のため損益分岐は `hits ≈ N` 近傍にしかなく、`sql::hnsw_cache` の ANN 先例
+/// （1/10）をそのまま採ると本ユースケースの主要フェーズが索引経路に乗らず
+/// 受入条件が vacuous になるため、より緩い閾値を採用する）。
+const DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_NUMERATOR: u64 = 1;
+const DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_DENOMINATOR: u64 = 2;
+
 /// [`ScalarIndexCache`] のエントリ数上限（`sql::arena_cache::SqlArenaCache`・
 /// `core.rs::PrefilterCache` と同じ DoS 対策方針を踏襲する）。
 const MAX_SCALAR_INDEX_CACHE_ENTRIES: usize = 32;
@@ -356,7 +368,6 @@ impl TextColumnIndex {
 pub(crate) struct ScalarIndex {
     built_ctx: PolicyContext,
     built_table_generation: u64,
-    #[cfg_attr(not(test), allow(dead_code))]
     row_count: usize,
     /// `schema.columns` と同じ長さ・順序。`TEXT` 列のみ `Some`。
     columns: Vec<Option<TextColumnIndex>>,
@@ -380,6 +391,46 @@ pub(crate) struct ScalarIndex {
 /// 提供するため、この比較関数のもとで同値ペアは存在しない（決定的ソート）。
 fn cmp_value_then_slot(a: &(String, u32), b: &(String, u32)) -> std::cmp::Ordering {
     a.0.as_bytes().cmp(b.0.as_bytes()).then(a.1.cmp(&b.1))
+}
+
+/// [`ScalarIndex::resolve_candidates`] の結果（Issue #474: `sql::exec` が
+/// 候補削減を行うか全走査へ縮退するかの唯一の分岐点）。
+pub(crate) enum CandidateResolution {
+    /// 交差済み候補スロット（昇順）を使う。空 `Vec` は「一致 0 件」（全走査と
+    /// 同じ結果になる。呼び出し元は空アリーナを構築するだけでよい）。
+    Use(Vec<u32>),
+    /// 索引対応述語のうち 1 つ以上が「列未索引」または `id_index` が `None`
+    /// （`id > 2^53` を含む世代）で判定不能だったため、索引を一切使わず
+    /// 全走査へ縮退する。
+    FallbackNoIndex,
+    /// 交差後の候補比が選択度切替閾値
+    /// （[`DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_NUMERATOR`]/
+    /// [`DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_DENOMINATOR`]）を超えた
+    /// （索引経路より全走査が有利と判断）ため縮退する。
+    FallbackSelectivity,
+}
+
+/// 2 本の昇順スライスの交差（両方に存在する要素のみ）を昇順で返す
+/// （2 本指マージ。両リストとも重複要素を持たない契約——`candidates_for`／
+/// `candidates_id_range` はいずれもスロット重複のない集合を返す）。
+/// アロケーション失敗（`try_reserve`）は `None`（呼び出し元は索引なしへ
+/// 縮退する）。
+fn intersect_sorted(a: &[u32], b: &[u32]) -> Option<Vec<u32>> {
+    let mut out: Vec<u32> = Vec::new();
+    out.try_reserve(a.len().min(b.len())).ok()?;
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    Some(out)
 }
 
 impl ScalarIndex {
@@ -607,7 +658,6 @@ impl ScalarIndex {
     /// [`MetadataFilter`] を評価し、一致スロットの**昇順** `Vec<u32>` を返す。
     /// 列が `TEXT` でない・未知の列は `None`。一致 0 件（列は索引済みだが値が
     /// 存在しない）は `Some(vec![])` を返す（`None` と区別する）。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn candidates_for(&self, filter: &MetadataFilter) -> Option<Vec<u32>> {
         let column = self.columns.get(filter.column_index())?.as_ref()?;
         let mut result = match filter.op() {
@@ -626,31 +676,110 @@ impl ScalarIndex {
     /// `id` に対する範囲述語（単純比較）向け照会。`id_index` が `None`
     /// （`id > 2^53` を含む行がある）の場合は `None`（呼び出し元が全走査へ
     /// 縮退する契機。モジュールドキュメント参照）。戻り値は昇順 `Vec<u32>`。
-    #[cfg(test)]
-    fn candidates_id_range(
+    ///
+    /// `id_index` は `id` 昇順（同一 `id` 内はスロット昇順）に整列済みのため、
+    /// 範囲の両端を [`slice::partition_point`]（二分探索）で求め、対象区間
+    /// だけを複製する（Issue #474。旧実装は全件の線形走査＋フィルタだった）。
+    /// 区間内は `id` 昇順だがスロット昇順とは限らない（異なる `id` 間で挿入
+    /// 順が保たれるだけ）ため、返す前に `sort_unstable` で候補列の共通契約
+    /// （スロット昇順）へ揃える。
+    pub(crate) fn candidates_id_range(
         &self,
         lower: std::ops::Bound<u64>,
         upper: std::ops::Bound<u64>,
     ) -> Option<Vec<u32>> {
         use std::ops::Bound;
         let idx = self.id_index.as_ref()?;
-        let in_lower = |id: u64| match lower {
-            Bound::Included(l) => id >= l,
-            Bound::Excluded(l) => id > l,
-            Bound::Unbounded => true,
+        let start = match lower {
+            Bound::Unbounded => 0,
+            Bound::Included(l) => idx.partition_point(|(id, _)| *id < l),
+            Bound::Excluded(l) => idx.partition_point(|(id, _)| *id <= l),
         };
-        let in_upper = |id: u64| match upper {
-            Bound::Included(u) => id <= u,
-            Bound::Excluded(u) => id < u,
-            Bound::Unbounded => true,
+        let end = match upper {
+            Bound::Unbounded => idx.len(),
+            Bound::Included(u) => idx.partition_point(|(id, _)| *id <= u),
+            Bound::Excluded(u) => idx.partition_point(|(id, _)| *id < u),
         };
-        let mut out: Vec<u32> = idx
-            .iter()
-            .filter(|(id, _)| in_lower(*id) && in_upper(*id))
-            .map(|(_, slot)| *slot)
-            .collect();
+        if start >= end {
+            return Some(Vec::new());
+        }
+        let mut out: Vec<u32> = Vec::new();
+        out.try_reserve_exact(end - start).ok()?;
+        out.extend(idx[start..end].iter().map(|(_, slot)| *slot));
         out.sort_unstable();
         Some(out)
+    }
+
+    /// `metadata_filters`（`TEXT` 列の等価・前方一致）と `id_preds`（`id` の
+    /// 単純比較。`sql::scalar_plan::classify_scalar_plan` が
+    /// `ScalarPlan::PlainScan` 以外へ分類した述語のみを渡す契約）から候補
+    /// スロット集合を導出する（Issue #474）。各述語の候補を個別に取得し
+    /// （`None` は「判定不能」＝列未索引または `id_index` が `None`）、複数
+    /// 述語は昇順ベクトルの交差（2 本指マージ）で結合する。交差はスロットを
+    /// 「絞る」ことしかできず「通す」ことはできないため、呼び出し元
+    /// （`sql::exec`）が候補行にも引き続き `on_visible_row`（`matches_all`＋
+    /// 式述語）を適用する契約と組み合わさって fail-closed が成立する（本
+    /// メソッド自体が正しさの唯一の防御ではない）。
+    pub(crate) fn resolve_candidates(
+        &self,
+        metadata_filters: &[MetadataFilter],
+        id_preds: &[crate::sql::scalar_plan::IdPredicate],
+    ) -> CandidateResolution {
+        let mut lists: Vec<Vec<u32>> = Vec::new();
+        for filter in metadata_filters {
+            match self.candidates_for(filter) {
+                Some(slots) => lists.push(slots),
+                None => return CandidateResolution::FallbackNoIndex,
+            }
+        }
+        for pred in id_preds {
+            let Some((lower, upper)) = crate::sql::scalar_plan::id_bounds(pred) else {
+                return CandidateResolution::FallbackNoIndex;
+            };
+            match self.candidates_id_range(lower, upper) {
+                Some(slots) => lists.push(slots),
+                None => return CandidateResolution::FallbackNoIndex,
+            }
+        }
+        if lists.is_empty() {
+            // `classify_scalar_plan` が `PlainScan` 以外を返す限り到達しない
+            // 呼び出し規約違反だが、防御的に fail-closed へ倒す。
+            return CandidateResolution::FallbackNoIndex;
+        }
+        // 最小の候補列から順に交差していく（先に候補数を絞るほど後続の交差
+        // コストが小さくなる。`IndexConjunction`（交差後の候補数）が
+        // 選択度判定の基準になる）。
+        lists.sort_by_key(|v| v.len());
+        let mut intersected = lists.remove(0);
+        for list in &lists {
+            intersected = match intersect_sorted(&intersected, list) {
+                Some(v) => v,
+                None => return CandidateResolution::FallbackNoIndex,
+            };
+            if intersected.is_empty() {
+                break;
+            }
+        }
+        let hits = intersected.len() as u64;
+        let row_count = self.row_count as u64;
+        // 選択度切替（`sql::hnsw_cache` の `full_scan_ratio` と同型の
+        // `checked_mul` による整数比較。丸め誤差を避けるため両辺を分母倍する）。
+        let exceeds = match hits.checked_mul(DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_DENOMINATOR) {
+            Some(lhs) => {
+                match row_count.checked_mul(DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_NUMERATOR) {
+                    Some(rhs) => lhs > rhs,
+                    // `row_count` は `MAX_ARENA_ROWS`（100 万行程度）で頭打ちの
+                    // ため現実的には到達しないが、桁あふれた場合は判定不能
+                    // として選択度超過側（保守的に全走査）へ倒す。
+                    None => true,
+                }
+            }
+            None => true,
+        };
+        if exceeds {
+            return CandidateResolution::FallbackSelectivity;
+        }
+        CandidateResolution::Use(intersected)
     }
 
     /// 索引全体（`TEXT` 列の辞書・CSR・`equality`・`id_index`）の概算ヒープ
@@ -683,12 +812,15 @@ impl ScalarIndex {
         self.approx_bytes
     }
 
-    #[cfg(test)]
-    fn row_count(&self) -> usize {
+    /// 索引構築時のスナップショット行数（Issue #474: `sql::exec` の索引↔
+    /// スナップショット同一性ガードが `snapshot.arena().len()` と突き合わせる）。
+    pub(crate) fn row_count(&self) -> usize {
         self.row_count
     }
 
-    fn built_table_generation(&self) -> u64 {
+    /// 索引構築時のテーブル世代（Issue #474: `sql::exec` の索引↔スナップショット
+    /// 同一性ガードが `snapshot.built_table_generation_for_index()` と突き合わせる）。
+    pub(crate) fn built_table_generation(&self) -> u64 {
         self.built_table_generation
     }
 }
@@ -704,6 +836,13 @@ pub struct ScalarIndexCacheStats {
     pub builds: u64,
     pub build_failures: u64,
     pub entries: usize,
+    /// Issue #474: `sql::exec` が索引経路（`ScalarIndex::resolve_candidates`
+    /// の `CandidateResolution::Use`）を実際に消費してクエリを実行した回数。
+    pub index_scans: u64,
+    /// Issue #474: `sql::exec` が索引対応述語を持つクエリで全走査へ縮退した
+    /// 回数（`FallbackNoIndex`／`FallbackSelectivity`／同一性ガード不一致
+    /// いずれも含む）。
+    pub plain_scan_fallbacks: u64,
 }
 
 struct ScalarIndexCacheEntry {
@@ -728,6 +867,8 @@ pub(crate) struct ScalarIndexCache {
     capacity_evictions: AtomicU64,
     builds: AtomicU64,
     build_failures: AtomicU64,
+    index_scans: AtomicU64,
+    plain_scan_fallbacks: AtomicU64,
 }
 
 impl ScalarIndexCache {
@@ -741,6 +882,8 @@ impl ScalarIndexCache {
             capacity_evictions: AtomicU64::new(0),
             builds: AtomicU64::new(0),
             build_failures: AtomicU64::new(0),
+            index_scans: AtomicU64::new(0),
+            plain_scan_fallbacks: AtomicU64::new(0),
         }
     }
 
@@ -903,6 +1046,8 @@ impl ScalarIndexCache {
             builds: self.builds.load(Ordering::Relaxed),
             build_failures: self.build_failures.load(Ordering::Relaxed),
             entries,
+            index_scans: self.index_scans.load(Ordering::Relaxed),
+            plain_scan_fallbacks: self.plain_scan_fallbacks.load(Ordering::Relaxed),
         }
     }
 
@@ -911,6 +1056,19 @@ impl ScalarIndexCache {
     /// モジュールドキュメント「fail-closed の適用範囲」参照）。
     pub(crate) fn record_build_failure(&self) {
         self.build_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #474: `sql::exec` が索引経路（`CandidateResolution::Use`）を
+    /// 実際に消費してクエリを実行したことを観測用統計へ計上する。
+    pub(crate) fn record_index_scan(&self) {
+        self.index_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #474: `sql::exec` が索引対応述語を持つクエリで全走査へ縮退した
+    /// ことを観測用統計へ計上する（`FallbackNoIndex`／`FallbackSelectivity`／
+    /// 索引↔スナップショット同一性ガード不一致のいずれも呼ぶ）。
+    pub(crate) fn record_plain_scan_fallback(&self) {
+        self.plain_scan_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
 }
 

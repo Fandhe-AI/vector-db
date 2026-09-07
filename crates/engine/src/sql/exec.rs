@@ -803,6 +803,15 @@ pub(crate) fn execute_statement_with_cache(
     let mut scalar_snapshot_for_index: Option<
         std::sync::Arc<crate::sql::arena_cache::SqlArenaSnapshot>,
     > = None;
+    // Issue #474: 索引消費の候補削減（下記「ヒットだが SCALAR 段に実質的な
+    // 処理がある」分岐）が `ScalarIndexCache::lookup` を既に呼んだ場合、その
+    // 結果（`Some(index)` を得られたか）をここへ記録する。直後の gated 構築
+    // ブロック（`already_cached` の判定）が同じクエリ中に重複して `lookup` を
+    // 呼ぶと、`lookup` 自体が副作用として `hits`/`misses` 統計を加算するため、
+    // 観測用カウンタが実際の照会回数（1 回）より多く計上されてしまう
+    // （`ScalarIndexCacheStats` はテナント存在情報を含まない機微性の低い値だが、
+    // 二重計上は観測契約を破る。`tests/scalar_index_cache.rs` が固定）。
+    let mut scalar_index_lookup_hit: Option<bool> = None;
     let arena: &VectorArena = match arena_cache {
         None => owned_arena.insert(
             VectorArena::build_filtered_with_rows_in_txn(
@@ -860,17 +869,103 @@ pub(crate) fn execute_statement_with_cache(
                         })?
                         .arena()
                 } else {
-                    // ヒットだが SCALAR 段に実質的な処理がある: 従来どおり
-                    // キャッシュ済みスナップショットへ `on_visible_row` を
-                    // クエリごとに再適用して候補集合を再構築する
+                    // ヒットだが SCALAR 段に実質的な処理がある。
+                    //
+                    // Issue #474: `bound.metadata_filters`/`expr_filters` が
+                    // 索引対応述語（`sql::scalar_plan::classify_scalar_plan`）
+                    // のみからなる場合、`ScalarIndex::resolve_candidates` が
+                    // 削減した候補スロットだけを
+                    // `build_from_cached_rls_rows_subset` へ渡し、行単位の
+                    // `scan_scalar_columns`/`matches_all`/式述語評価
+                    // （`on_visible_row`）を可視行全件ではなく候補行のみに
+                    // 適用する。非対応形状・索引未消費（列未索引・`id_index`
+                    // が `None`・選択度超過・索引↔スナップショット同一性
+                    // 不一致のいずれか）の場合は、従来どおりキャッシュ済み
+                    // スナップショットへ `on_visible_row` を全行再適用する
                     // （モジュールドキュメント「RLS → SCALAR → DISTANCE」の
-                    // 責務境界は変えない）。
+                    // 責務境界・クエリ結果はいずれの経路でも不変。索引は
+                    // 候補行を「絞る」ことしかできず「通す」ことはできない
+                    // ため、`on_visible_row` を省略しない）。
                     let expected_dim = schema
                         .vector_dim()
                         .ok_or(ArenaError::InvalidDim)
                         .map_err(|e| map_arena_error(&bound.table, e))?;
                     scalar_snapshot_for_index = Some(std::sync::Arc::clone(&snapshot));
-                    owned_arena.insert(
+
+                    let scalar_plan_kind = crate::sql::scalar_plan::classify_scalar_plan(
+                        &crate::sql::scalar_plan::ScalarShapeInput {
+                            scalar_prefilter: plan.scalar_prefilter,
+                            metadata_filters: &bound.metadata_filters,
+                            expr_filters: &bound.expr_filters,
+                        },
+                    );
+
+                    let mut index_candidate_slots: Option<Vec<u32>> = None;
+                    if scalar_plan_kind != crate::sql::scalar_plan::ScalarPlan::PlainScan {
+                        if let Some(scalar_access) = scalar_cache.as_ref() {
+                            let looked_up = scalar_access.cache.lookup(
+                                scalar_access.storage,
+                                read_txn,
+                                &bound.table,
+                                ctx,
+                            );
+                            scalar_index_lookup_hit = Some(looked_up.is_some());
+                            if let Some(index) = looked_up {
+                                // 索引↔スナップショット同一性ガード（ADR
+                                // 「実行時の同一性検査」節）: `ScalarIndexCache`
+                                // のキーは `(table, ctx)` × 世代でありこの
+                                // クエリの `snapshot` そのものの同一性ではない
+                                // ため、行数・構築世代の両方が一致する場合に
+                                // 限って候補を使う。不一致時は「絞る」経路を
+                                // 使わず安全側（全走査）へ縮退するだけで
+                                // クエリの正しさには影響しない。
+                                if index.row_count() == snapshot.arena().len()
+                                    && index.built_table_generation()
+                                        == snapshot.built_table_generation_for_index()
+                                {
+                                    let id_preds: Vec<crate::sql::scalar_plan::IdPredicate> = bound
+                                        .expr_filters
+                                        .iter()
+                                        .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
+                                        .collect();
+                                    match index.resolve_candidates(
+                                        &bound.metadata_filters,
+                                        &id_preds,
+                                    ) {
+                                        crate::sql::scalar_index::CandidateResolution::Use(
+                                            slots,
+                                        ) => {
+                                            index_candidate_slots = Some(slots);
+                                        }
+                                        crate::sql::scalar_index::CandidateResolution::FallbackNoIndex
+                                        | crate::sql::scalar_index::CandidateResolution::FallbackSelectivity => {
+                                            scalar_access.cache.record_plain_scan_fallback();
+                                        }
+                                    }
+                                } else {
+                                    scalar_access.cache.record_plain_scan_fallback();
+                                }
+                            }
+                        }
+                    }
+
+                    owned_arena.insert(if let Some(slots) = index_candidate_slots.as_ref() {
+                        let built = VectorArena::build_from_cached_rls_rows_subset(
+                            &bound.table,
+                            expected_dim,
+                            snapshot.arena(),
+                            snapshot.metadata(),
+                            slots,
+                            on_visible_row,
+                            crate::arena::MAX_ARENA_ROWS,
+                            crate::arena::MAX_ARENA_TOTAL_BYTES,
+                        )
+                        .map_err(|e| map_arena_error(&bound.table, e))?;
+                        if let Some(scalar_access) = scalar_cache.as_ref() {
+                            scalar_access.cache.record_index_scan();
+                        }
+                        built
+                    } else {
                         VectorArena::build_from_cached_rls_rows(
                             &bound.table,
                             expected_dim,
@@ -880,8 +975,8 @@ pub(crate) fn execute_statement_with_cache(
                             crate::arena::MAX_ARENA_ROWS,
                             crate::arena::MAX_ARENA_TOTAL_BYTES,
                         )
-                        .map_err(|e| map_arena_error(&bound.table, e))?,
-                    )
+                        .map_err(|e| map_arena_error(&bound.table, e))?
+                    })
                 }
             } else {
                 // ミス: 従来どおり redb を走査するが、`rls_capture` で RLS 通過行
@@ -967,21 +1062,36 @@ pub(crate) fn execute_statement_with_cache(
     };
 
     // Issue #473: スカラー列二次索引（`scalar_index::ScalarIndex`）の gated 構築。
-    // 索引対応述語（`Equality`/`Prefix`。`bound.metadata_filters`）を持つ SCALAR
-    // 事前フィルタクエリに限り、`arena_cache` 経由で得たスナップショットから
-    // 索引を構築しキャッシュへ登録する。索引の結果は一切消費しない（構築される
-    // だけで本クエリの応答には使わない。候補削減は Issue #474 の担当。
-    // モジュールドキュメント「本 Issue のスコープ」参照）。構築・登録の失敗は
-    // このクエリを失敗させない（fail-soft な派生キャッシュ。
-    // `scalar_index::ScalarIndexCache` のドキュメント参照）。
+    // Issue #474 で建てゲート条件を `bound.metadata_filters` の非空判定から
+    // `classify_scalar_plan(..) != PlainScan` へ拡張した（`id` 単純比較のみ
+    // （`metadata_filters` は空）のクエリでも索引が構築されないと、上記の
+    // 候補削減分岐が `lookup` で永久にミスし続け索引を一切消費できないため）。
+    // `arena_cache` 経由で得たスナップショットから索引を構築しキャッシュへ登録
+    // する。構築済み索引は「ヒットだが SCALAR 段に実質的な処理がある」分岐
+    // （上記）で候補削減にも消費される。構築・登録の失敗はこのクエリを失敗させ
+    // ない（fail-soft な派生キャッシュ。`scalar_index::ScalarIndexCache` の
+    // ドキュメント参照）。
     if let (Some(scalar_access), Some(snapshot_for_scalar)) =
         (scalar_cache.as_ref(), scalar_snapshot_for_index.as_ref())
     {
-        if plan.scalar_prefilter && !bound.metadata_filters.is_empty() {
-            let already_cached = scalar_access
-                .cache
-                .lookup(scalar_access.storage, read_txn, &bound.table, ctx)
-                .is_some();
+        let scalar_plan_kind_for_build = crate::sql::scalar_plan::classify_scalar_plan(
+            &crate::sql::scalar_plan::ScalarShapeInput {
+                scalar_prefilter: plan.scalar_prefilter,
+                metadata_filters: &bound.metadata_filters,
+                expr_filters: &bound.expr_filters,
+            },
+        );
+        if scalar_plan_kind_for_build != crate::sql::scalar_plan::ScalarPlan::PlainScan {
+            // Issue #474: 上記の候補削減分岐が同じクエリ中に既に `lookup` を
+            // 呼んでいれば（`scalar_index_lookup_hit`）その結果を再利用し、
+            // `lookup` の重複呼び出しによる `hits`/`misses` 統計の二重計上を
+            // 避ける（呼んでいなければ通常どおり照会する）。
+            let already_cached = scalar_index_lookup_hit.unwrap_or_else(|| {
+                scalar_access
+                    .cache
+                    .lookup(scalar_access.storage, read_txn, &bound.table, ctx)
+                    .is_some()
+            });
             if !already_cached {
                 match crate::sql::scalar_index::ScalarIndex::build(schema, snapshot_for_scalar) {
                     Ok(index) => {
