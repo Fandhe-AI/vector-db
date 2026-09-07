@@ -390,7 +390,7 @@ BENCH_KNN_PROFILE_ENGINE=hnsw make bench-knn-profile
 
 ## 14. 凍結後 CSR 化の設計（Issue #493）
 
-- **ステータス**: Proposed（設計メモ。実装は #494・前後比較実測は #495。本節
+- **ステータス**: Implemented（#494 で実装済み。前後比較実測は #495。本節
   自体は本書冒頭ステータス「Accepted（記録専用・#413）」とは独立に扱う）
 - **親**: #492（HNSW 隣接リストの CSR 化）／Phase 3 親 #458／ルート #455
 - **依存**: `docs/design/benchmark-judgement-policy.md`（#462）
@@ -667,3 +667,65 @@ approx_heap_bytes}`・`pub(crate) is_mask_fully_reachable`・
 - `docs/design/hnsw-parallel-build.md`（並列構築・決定性の範囲）
 - `docs/design/hnsw-search.md`（決定性の保証範囲）
 - `docs/design/hnsw-graph-construction.md`（データ構造・API）
+
+### 14.12 実装追記（#494）
+
+§14.2〜§14.9 の設計をそのまま実装した。最終的な型名・判断は以下のとおり
+（本節は実装後の事実の記録。§14.1〜§14.11 の設計方針自体への変更はない）。
+
+- **型名**: 可変長ビルダー表現は `hnsw.rs::GraphBuilder { params, nodes:
+  Vec<Node>, entry_point }`（`pub(crate)`）。凍結後表現は新設
+  `hnsw/csr.rs::CsrGraph`（`levels: Vec<u8>`・`node_base: Vec<u32>`（長さ
+  n+1）・`offsets: Vec<u32>`・`links: Vec<u32>`。exact-length・パディング
+  なし・順序保存）。共有インターフェースは `hnsw.rs::Adjacency` trait
+  （`level_of`／`neighbors`／`node_count`）で、両型がこれを実装する。
+- **ジェネリック化の範囲**: §14.4 の「例」提示どおり、構築時・探索時の双方
+  から呼ばれる `search_layer` のみを `Adjacency` でジェネリック化した自由
+  関数 `search_layer_in<V, P, A>` へ抽出した。`HnswIndex::search_layer`／
+  `search_layer_with`（既存シグネチャ）と `GraphBuilder::search_layer`
+  はいずれもこの自由関数へ委譲する薄いラッパー。`greedy_descend_masked`・
+  `find_alternate_entry`・`search_entry_for_mask`・
+  `accepted_reachable_count`・`is_mask_fully_reachable` は探索専用のため
+  `HnswIndex`（`self.graph: CsrGraph` 直参照）に残置し、ジェネリック化しな
+  かった（シグネチャ増加を最小に抑える判断。§14.4 の裁量の範囲内）。
+  `greedy_descend`（非マスク）・`insert_node`・`connect`・`shrink_links`・
+  `repair_reachability`・`bfs_reachable` は本体無変更のまま `GraphBuilder`
+  のメソッドへ移設した。`select_neighbors_heuristic`（`self` を一切参照
+  しない薄い委譲）は `HnswIndex` に残し、構築経路（`GraphBuilder::
+  insert_node`）は本体の純粋関数 `select_neighbors_heuristic_free` を直接
+  呼ぶ形へ変更した（`#[cfg(test)]` 限定で `HnswIndex::
+  select_neighbors_heuristic` を残置。既存テスト
+  `select_neighbors_heuristic_prunes_redundant_close_candidates` が
+  `HnswIndex` 経由で純粋関数の挙動を検証するため）。
+- **stage 順序**: `level_assign → sequential_prefix → parallel_phase →
+  freeze（assemble_graph によるGraphBuilder への構造的な組み立て）→
+  repair_reachability → flatten（HnswIndex::freeze_from による CSR 平坦
+  化）`。平坦化は常に最終段（§14.2・#449 との衝突回避方針どおり）。
+- **`HnswBuildProfile.flatten`**: 追加した。逐次縮退経路（`threads == 1`
+  または `n <= SEQUENTIAL_PREFIX_NODES`）はこの区切りが存在しないため
+  `sequential_prefix` へ全量を積み、`flatten` は `Duration::ZERO` のまま
+  （既存フィールドと同じ縮退規約）。
+- **指紋テスト**: `tests/hnsw.rs::graph_fingerprint_is_stable_across_representation_change`
+  を実装前（commit `2ca1536`。CSR 化前の `Vec<Vec<u32>>` 表現）で 1 度だけ
+  採取した FNV-1a 64bit 値（自作・依存追加なし）で固定し、CSR 化の前後で
+  `build` が返すグラフ（`entry_point`／各ノードの `level_of`／各層の
+  `neighbors` を返された順序のまま走査）がビット同一であることを機械検証
+  した（green）。既存の全 HNSW テスト（`crates/engine/src/hnsw.rs` 内・
+  `tests/hnsw*.rs`・`tests/incremental_index_hnsw.rs` 等）は無変更のまま
+  green（構造体リテラルで `HnswIndex` を直接組む 7 テストのみ、新設ヘルパ
+  `index_from_nodes`〔`GraphBuilder` → `freeze_from` を経由〕へ呼び出し形
+  を追随。アサーションは無変更）。
+- **`CsrGraph::neighbors` の `None`／`Some(&[])` 区別**: exact-length
+  オフセットだけでは「範囲内レベルだがリンク 0 件」と「レベル超過／ノード
+  範囲外」を区別できないため、`level_of` で明示的にレベル上限を検査してか
+  ら区間を引く実装にした（旧 `Vec<Vec<u32>>` 表現と同じ `None`／
+  `Some(&[])` 契約を維持。`csr.rs` 内単体テストで固定）。
+- **スコープ外（申し送り）**: links 範囲 prefetch（§14.7 の「余地」）は追加
+  しなかった（ビット同一の根拠を崩すため。#489 系・#495 へ申し送り）。
+  `parallel_build::search_layer_locked`／`greedy_descend_locked`（要素単位
+  ロック版の並列構築専用アルゴリズム。ロック粒度の都合で `Adjacency` を
+  経由しない独自実装のまま）は無変更。`benches/harness/
+  hnsw_parallel_profile.rs::serial_share` への `flatten` 加算は #495 の
+  担当（本 PR の `serial_share` は `flatten` を含まない）。
+- **`unsafe`**: 新規追加なし。`csr.rs` の添字アクセスはすべて `get()`／
+  `checked_add`／`checked_mul` のみ（coding-rust.md）。
