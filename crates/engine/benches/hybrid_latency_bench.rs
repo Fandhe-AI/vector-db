@@ -363,21 +363,26 @@ impl SqlHybridBenchFixture {
                 let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
                 EngineCore::from_storage_with_engine(storage, kind)
             }
-            BenchEngine::HnswI8 => {
-                // I8（SQ8）常駐 opt-in（Issue #521・#523。`recall_engine.rs::
-                // RecallEngine::HnswI8`・`knn_profile_bench.rs` と同一構築経路）。
-                // 本ベンチ（Issue #506）は f16／i8 常駐間の比較を対象としないが、
-                // `BenchEngine::HnswI8` を追加した以上この match は網羅する必要が
-                // あるため、既存の構築経路をそのまま再利用する。
-                let validated = ValidatedHnswParams::new(HnswParams::default())
-                    .expect("default params validate")
-                    .with_resident_precision(ResidentPrecision::I8);
-                let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
-                EngineCore::from_storage_with_engine(storage, kind)
-            }
             BenchEngine::BruteForce => {
                 EngineCore::from_storage(storage, engine::search_engine::default_engine())
             }
+            // ワイルドカードで受ける（`BenchEngine::HnswI8` 等、本ベンチ
+            // （Issue #506）の対象外として後から追加された variant を含む）。
+            // `harness::bench_engine::BenchEngine` は他ベンチ（Issue #521〜523
+            // 等）と共有する enum のため、Issue #506 の対象範囲とは無関係に
+            // variant が増えていく。個別 variant 名で網羅すると、その都度
+            // `docs/design/hnsw-hybrid-iterative-scan.md`「前後比較実測
+            // （Issue #506）」節が固定する before 側コミット（`838c53e`・
+            // `4ceb6b5`）の `harness/bench_engine.rs`（この variant を持たない）
+            // へ本ファイル 1 枚だけを overlay する README の A/B 再現手順が
+            // ビルド不能になる（未定義 variant 参照）。ワイルドカードなら
+            // 新規 variant が増えても本ファイルは両コミットで変更なしにビルド
+            // でき、実際に選ばれた場合のみ fail-closed で明示エラーにする
+            // （黙って別エンジンへ縮退しない）。
+            other => fail_closed(format!(
+                "SqlHybridBenchFixture: unsupported BenchEngine {other:?} \
+                 (Issue #506 supports brute_force/hnsw/hnsw_f16 only)"
+            )),
         };
         Self {
             core,
