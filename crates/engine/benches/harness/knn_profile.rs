@@ -336,3 +336,87 @@ pub fn assert_scan_row_counts_match(
     }
     Ok(())
 }
+
+/// Issue #516: f16 常駐の前後比較。`BENCH_KNN_PROFILE_SCALE`（既存 `hnsw_cache.rs`
+/// スイープと同じ単位。25k 行/単位）から目標行数を求める（`hot-only`／`index
+/// memory` モード共有）。オーバーフロー・0 は拒否する（呼び出し元 `unit_rows` は
+/// `TENANT_A_ROWS + TENANT_B_ROWS` 定数。0 を渡さない契約だが防御的に検証する）。
+pub fn scaled_rows(scale: u64, unit_rows: u64) -> Result<u64, KnnProfileError> {
+    if unit_rows == 0 {
+        return Err(KnnProfileError::Codec("unit_rows must be > 0".to_string()));
+    }
+    scale.checked_mul(unit_rows).ok_or_else(|| {
+        KnnProfileError::Codec(format!(
+            "scale={scale} * unit_rows={unit_rows} overflows u64"
+        ))
+    })
+}
+
+/// `EXPLAIN` 出力行（`sql::explain`）から `hnsw_params: ...,resident=<value>` の
+/// `<value>` を抜き出す（Issue #516。`knn_profile_bench.rs` の hot-only モードが
+/// `f16_residency_fallbacks == 0` だけでは vacuous になり得る要求精度そのものを
+/// 検証するために使う——`sql/explain.rs` の `hnsw_params:` 行は構築時の静的
+/// 設定値〔要求精度〕のみを持ち、実行時の自動縮退結果は含まない契約
+/// （`sql/explain.rs` ドキュメンテーションコメント参照）。行末尾・`resident=`
+/// 欠損はいずれも `None`）。
+pub fn explain_resident_value(lines: &[String]) -> Option<String> {
+    for line in lines {
+        let Some(rest) = line
+            .trim_start()
+            .strip_prefix("hnsw_params:")
+            .map(str::trim_start)
+        else {
+            continue;
+        };
+        for field in rest.split(',') {
+            if let Some(value) = field.trim().strip_prefix("resident=") {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// `BenchEngine`（`hnsw_f16`/`hnsw`）が要求する `resident=` 値のラベル
+/// （`explain_resident_value` の期待値との突き合わせに使う）。本モジュールは
+/// `super::bench_engine` を参照しない契約（モジュール冒頭コメント「`std` のみに
+/// 依存する」）のため、呼び出し元がトークン文字列で渡す。
+pub fn resident_label_for_token(engine_token: &str) -> Option<&'static str> {
+    match engine_token {
+        "hnsw" => Some("f32"),
+        "hnsw_f16" => Some("f16"),
+        _ => None,
+    }
+}
+
+/// 索引常駐メモリ計測の 1 行（Issue #516。`hnsw_parallel_profile.rs::
+/// render_memory_line` と同型——`rows`/`dim`/要求精度/実効精度を追加した
+/// 版。呼び出し元は子プロセス隔離経路〔`knn_profile_bench.rs` の
+/// `BENCH_KNN_PROFILE_INDEX_MEMORY` モード〕から使う）。8 引数は `hnsw.rs`・
+/// `sql/exec.rs` 等、既存の計測・キャッシュ系関数と同じ方針で許容する
+/// （引数を構造体へ集約するほどの再利用性がないための判断）。
+#[allow(clippy::too_many_arguments)]
+pub fn render_index_memory_line(
+    rows: u64,
+    dim: u32,
+    requested_precision: &str,
+    effective_precision: &str,
+    approx_heap_bytes: usize,
+    vm_rss_kb_before: Option<u64>,
+    vm_rss_kb_after: Option<u64>,
+    vm_hwm_kb: Option<u64>,
+) -> String {
+    let fmt_opt = |v: Option<u64>| v.map_or_else(|| "unavailable".to_string(), |v| v.to_string());
+    let rss_delta = match (vm_rss_kb_before, vm_rss_kb_after) {
+        (Some(before), Some(after)) => after.saturating_sub(before).to_string(),
+        _ => "unavailable".to_string(),
+    };
+    format!(
+        "knn_profile_bench: index_memory rows={rows} dim={dim} requested={requested_precision} \
+         effective={effective_precision} approx_heap_bytes={approx_heap_bytes} \
+         vm_rss_kb_before={} vm_rss_kb_after={} vm_rss_delta_kb={rss_delta} vm_hwm_kb={}",
+        fmt_opt(vm_rss_kb_before),
+        fmt_opt(vm_rss_kb_after),
+        fmt_opt(vm_hwm_kb),
+    )
+}
