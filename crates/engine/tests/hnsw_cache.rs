@@ -200,6 +200,7 @@ fn assert_resident_precision_reached(
     let expect_suffix = match precision {
         engine::hnsw::ResidentPrecision::F16 => "resident=f16",
         engine::hnsw::ResidentPrecision::F32 => "resident=f32",
+        engine::hnsw::ResidentPrecision::I8 => "resident=i8",
     };
     let kind_display = core
         .search_engine_kind()
@@ -215,6 +216,14 @@ fn assert_resident_precision_reached(
             0,
             "embeddings in this fixture's corpus must stay within the f16 finite range \
              and must not trigger the F32 fallback (D6)"
+        );
+    }
+    if precision == engine::hnsw::ResidentPrecision::I8 {
+        assert_eq!(
+            core.hnsw_index_cache_stats().i8_residency_fallbacks,
+            0,
+            "embeddings in this fixture's corpus must be finite and must not trigger \
+             the F32 fallback (D6 と同型。Issue #521)"
         );
     }
 }
