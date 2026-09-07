@@ -139,7 +139,10 @@ record_concurrent_processes() {
 }
 
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
-out_dir="target/bench-hnsw-phase3-ab/${ts}"
+out_dir="${OUT_DIR:-target/bench-hnsw-phase3-ab/${ts}}"
+case "$out_dir" in
+    /*|*..*) fail "OUT_DIR must be a relative path without .. segments (got $out_dir)" ;;
+esac
 mkdir -p "$out_dir"
 
 {
