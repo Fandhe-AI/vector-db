@@ -407,7 +407,7 @@ GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README
 `make bench-chip`（`crates/engine/benches/chip_bench.rs`）は、`bench-dot-kernel`・`bench-knn-profile`・`feature_bench`（`BENCH_FEATURE_DIM=128`／`768`）の 4 ワークロードを 1 ワークロード = 1 子プロセスとしてラウンドロビン交互計測し、CPU 情報・実行時検出 ISA・per-run 生データ・min/median・参照区間帯を `summary.json` へ出力します。
 
 > [!IMPORTANT]
-> `.github/workflows/*` には配線しません。`bench-tier`（TASK-116）と同じ理由（AGENTS.md「CI・ワークフローの改変（P1）」）で、Phase 4（チップ最適カーネル）の採否判定に必要な AVX-512／NEON／実キャッシュ階層は本開発環境（QEMU 仮想 CPU）では実測できず、オーナー実機（Apple M／AMD Zen 4・5／Intel）での手動実行が正式な入口です。
+> `.github/workflows/*` には配線しません。`bench-tier`（TASK-116）と同じ理由（AGENTS.md「CI・ワークフローの改変（P1）」）で、Phase 4（チップ最適カーネル）の採否判定に必要な AVX-512／NEON／実キャッシュ階層は本開発環境（QEMU 仮想 CPU）では実測できず、オーナー実機（Apple M／AMD Zen 4・5／Intel）での手動実行が正式な入口です。Apple M 実機での i8／f16／f32 経路の前後比較専用の手順・記録テンプレートは `docs/design/chip-kernel-guidelines.md` §7.7（Issue #526）を参照してください。
 
 前提: Linux／aarch64 Linux は `/proc/cpuinfo`（追加ツール不要）、macOS は Xcode Command Line Tools（`cargo`）と `sysctl`（標準搭載）のみで動作します。`contrast-bench` feature は使わないため C++17 コンパイラは不要です。
 
@@ -591,6 +591,7 @@ BENCH_KNN_PROFILE_HOT_ONLY=1 BENCH_KNN_PROFILE_ENGINE=hnsw_f16 BENCH_KNN_PROFILE
 BENCH_KNN_PROFILE_INDEX_MEMORY=1 BENCH_KNN_PROFILE_ENGINE=hnsw_f16 BENCH_KNN_PROFILE_SCALE=20 BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 make bench-knn-f16-resident  # 全規模点 × f32/f16 を交互 N≥5 ペア＋索引単体メモリで一括実行（AB_PAIRS・AB_POINTS・AB_MEMORY_POINTS で上書き可）
 make bench-knn-i8-resident  # 同じスクリプトの AB_CANDIDATE_ENGINE=hnsw_i8 opt-in（Issue #523。f32/I8 常駐の前後比較）
+make bench-knn-precision-resident  # 同じスクリプトの AB_CANDIDATE_ENGINES="hnsw_f16 hnsw_i8" opt-in（Issue #526。f32/f16/i8 の 3 精度を同一セッションで一括計測。Apple M 実機向け手順・記録テンプレートは docs/design/chip-kernel-guidelines.md §7.7 参照）
 ```
 
 実測結果・判断は `docs/design/hnsw-f16-resident.md`「Issue #516 追記」節を参照してください。

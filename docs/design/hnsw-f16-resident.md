@@ -147,7 +147,10 @@ resident_precision()`）を追記する。実行時の自動縮退結果（D6）
 - wire-server への HNSW／精度 opt-in CLI 追加は対象外。
 - NEON カーネルの実機（Apple Silicon 等）での生成コード・性能確認はクロス
   コンパイル確認までが本 Issue の範囲（`make check-cross`／
-  `make simd-codegen-check-cross` で確認済み）。
+  `make simd-codegen-check-cross` で確認済み）。Apple 実機での性能前後
+  比較の手順・記録テンプレートは Issue #526（`docs/design/
+  chip-kernel-guidelines.md` §7.7）が整備し、実 Apple 計測そのものは
+  オーナー申し送り（#530 も参照）。
 
 ## Issue #516 追記: f16 常駐（`hnsw_f16`）と f32 常駐（`hnsw`）の前後比較・常駐メモリ実測
 

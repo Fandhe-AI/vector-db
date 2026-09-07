@@ -318,6 +318,17 @@ pub fn render_diff_line(from: &str, to: &str, diff_ns_per_row: f64) -> String {
     format!("diff({from}->{to}): ns_per_row={diff_ns_per_row:.1}")
 }
 
+/// 実行時ディスパッチされた 3 経路（f32 dot／f16 昇格 dot／i8 dot）の ISA を
+/// 1 行にまとめる（Issue #526。`engine::isa::current().isa()`／`current_f16().isa()`／
+/// `current_i8().isa()` の `Debug` 表示をそのまま埋め込む）。Apple 実機での
+/// 実測が「実際に NEON 系カーネルへディスパッチされたか」を非 vacuous に
+/// 確認できるようにするための証跡行であり、`resident_precision`／`hnsw_stats`
+/// 行（`knn_profile_bench.rs::run_hot_only`）と同じく計測値そのものではない
+/// ため fail-closed 検証を経ずに出力してよい（モジュール冒頭コメント参照）。
+pub fn render_kernel_isa_line(dot: &str, f16: &str, i8: &str) -> String {
+    format!("knn_profile_bench: kernel_isa dot={dot} f16={f16} i8={i8}")
+}
+
 /// S1〜S4 の走査行数がすべて一致することを検証する（整合性検証。行数が食い違う
 /// 場合は「同じテーブル・同じスナップショットを走査できていない」ことを意味し、
 /// 段別分解の前提が崩れているため fail-closed に `Err` を返す）。

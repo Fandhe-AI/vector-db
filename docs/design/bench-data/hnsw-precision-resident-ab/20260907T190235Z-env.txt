@@ -1,0 +1,10 @@
+commit=0027cc376d39063afd1883286e84a8d3430373ac
+nproc=12
+BENCH_DEDICATED_ENV=<unset>
+cpu_model=QEMU Virtual CPU version 2.5+
+cpu_flags=fpu de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm rep_good nopl xtopology cpuid tsc_known_freq pni ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c hypervisor lahf_lm abm cpuid_fault pti bmi1 avx2 bmi2
+rustc_version=rustc 1.98.1 (48a229cea 2026-09-01)
+ab_pairs=5
+ab_points=1:128
+ab_memory_points=1:128
+ab_candidate_engines=hnsw_f16 hnsw_i8
