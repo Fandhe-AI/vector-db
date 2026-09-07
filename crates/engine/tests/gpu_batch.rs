@@ -723,6 +723,7 @@ fn gpu_backend_fractional_row_chunk_matches_cpu_oracle_when_gpu_available() {
             engine::gpu_batch::GpuSearchTestOptions {
                 budget_bytes: tiny_budget_bytes,
                 force_full_readback: true,
+                dot_shader: None,
             },
         )
         .expect("gpu batch_search should succeed once the device initialized");
@@ -815,6 +816,7 @@ fn gpu_backend_partial_topk_fractional_row_chunk_matches_cpu_oracle_when_gpu_ava
             engine::gpu_batch::GpuSearchTestOptions {
                 budget_bytes: tiny_budget_bytes,
                 force_full_readback: false,
+                dot_shader: None,
             },
         )
         .expect("gpu batch_search should succeed once the device initialized");
@@ -955,6 +957,7 @@ mod topk_readback_bit_identity {
                     GpuSearchTestOptions {
                         budget_bytes: 32 * 1024 * 1024,
                         force_full_readback: true,
+                        dot_shader: None,
                     },
                 )
                 .expect("forced full-readback gpu batch_search should succeed");
@@ -1022,6 +1025,7 @@ mod topk_readback_bit_identity {
                 GpuSearchTestOptions {
                     budget_bytes: 32 * 1024 * 1024,
                     force_full_readback: true,
+                    dot_shader: None,
                 },
             )
             .expect("forced full-readback gpu batch_search should succeed");
@@ -1082,6 +1086,7 @@ mod topk_readback_bit_identity {
                 GpuSearchTestOptions {
                     budget_bytes: 32 * 1024 * 1024,
                     force_full_readback: true,
+                    dot_shader: None,
                 },
             )
             .expect("forced full-readback gpu batch_search should succeed");
@@ -1157,6 +1162,7 @@ mod topk_readback_bit_identity {
                 GpuSearchTestOptions {
                     budget_bytes: 32 * 1024 * 1024,
                     force_full_readback: true,
+                    dot_shader: None,
                 },
             )
             .expect("forced full-readback f32 contrast batch_search should succeed");
@@ -1171,6 +1177,325 @@ mod topk_readback_bit_identity {
             id_score_bits(&default_hits[0].hits),
             id_score_bits(&forced_hits[0].hits),
             "f32 contrast default path and forced full-readback path must match bit-identically"
+        );
+    }
+}
+
+// --- Issue #539: SHADER_F16 対応アダプタでの f16 算術版シェーダ選択の実機検証 ---
+//
+// `GpuBatchBackend` の既定経路（`SHADER_F16` 対応アダプタでは
+// `select_dot_shader` が自動的に f16 算術版を選ぶ）と、`GpuSearchTestOptions::
+// dot_shader` による強制オーバーライドを組み合わせ、次を実機で確認する:
+// - 既定経路 vs 強制 unpack 版の結果が境界同点許容つき Recall で一致し
+//   （`harness::gpu_scaling::count_boundary_tolerant_mismatches`）、
+//   `f16_arith_available()` が true の環境では実際に f16 算術版へ dispatch
+//   されたこと（非 vacuous）
+// - オーバーフローガード（`select_dot_shader`）が実際に働き、大振幅
+//   フィクスチャでは自動選択が unpack 版へ縮退すること
+// - 強制 `F16Arith` が利用不能・ガード不成立の場合は黙って縮退せず `Err`
+//   を返すこと（fail-closed）
+//
+// `bench-internals` feature 限定（`GpuSearchTestOptions::dot_shader` 経由）。
+#[cfg(feature = "bench-internals")]
+#[allow(dead_code)]
+#[path = "../benches/harness/mod.rs"]
+mod gpu_f16_arith_harness;
+
+#[cfg(feature = "bench-internals")]
+mod f16_arith_dot_shader {
+    use super::*;
+    use engine::gpu_batch::{GpuDotShaderKind, GpuSearchTestOptions};
+    use gpu_f16_arith_harness::gpu_scaling::count_boundary_tolerant_mismatches;
+
+    fn id_score_pairs(hits: &[engine::kernel::SearchHit]) -> Vec<(u64, f32)> {
+        let mut v: Vec<(u64, f32)> = hits.iter().map(|h| (h.id, h.score)).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    }
+
+    /// 既定経路（`SHADER_F16` 対応時は自動的に f16 算術版）と強制 unpack 版が
+    /// 境界同点許容つきで一致し、対応アダプタでは実際に f16 算術版へ
+    /// dispatch されたこと（`f16_arith_dispatches > 0`。非 vacuous）を確認する。
+    /// `dim` はパディング境界（偶数丸め）を踏む奇数・偶数の双方、`query_count`
+    /// は `GPU_QUERY_TILE_MAX`（16）の非倍数にしてタイル境界も踏む。
+    #[test]
+    fn f16_arith_default_matches_unpack_within_boundary_tolerance() {
+        for &dim in &[33usize, 128] {
+            let fx = multi_query_fixture(3000, dim, 21, 0x539_2026);
+            let matrix = engine::batch_search::ResidentMatrix::build(
+                &fx.ids,
+                &fx.tenant_ids,
+                &fx.visibilities,
+                fx.dim,
+                &fx.vectors,
+            )
+            .expect("resident matrix build should succeed for well-formed fixture");
+
+            let backend = match GpuBatchBackend::try_new(matrix) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("gpu unavailable in this environment, skipping: {e}");
+                    return;
+                }
+            };
+
+            let c = ctx("tenant-a");
+            let batch_queries: Vec<BatchQuery<'_>> = fx
+                .queries
+                .iter()
+                .map(|v| BatchQuery {
+                    vector: v,
+                    k: 5,
+                    ctx: &c,
+                })
+                .collect();
+
+            let stats_before = backend.stats();
+            let default_hits = backend
+                .batch_search(&batch_queries)
+                .expect("default gpu batch_search should succeed once the device initialized");
+            let stats_after = backend.stats();
+
+            let forced_unpack_hits = backend
+                .batch_search_with_options_for_tests(
+                    &batch_queries,
+                    GpuSearchTestOptions {
+                        budget_bytes: 32 * 1024 * 1024,
+                        force_full_readback: false,
+                        dot_shader: Some(GpuDotShaderKind::Unpack),
+                    },
+                )
+                .expect("forced unpack gpu batch_search should succeed");
+
+            assert_eq!(default_hits.len(), fx.queries.len());
+            assert_eq!(forced_unpack_hits.len(), fx.queries.len());
+
+            if !backend.f16_arith_available() {
+                // 未対応環境（本開発環境の RTX 3060 では通常到達しない分岐）
+                // では既定経路も unpack 版のはずであり、強制 unpack 版と
+                // ビット同一になる。f16 算術版は 1 回も dispatch されない。
+                assert_eq!(
+                    stats_after.f16_arith_dispatches - stats_before.f16_arith_dispatches,
+                    0,
+                    "dim={dim}: f16 arith must not dispatch on an unsupported adapter"
+                );
+                for (default, forced) in default_hits.iter().zip(forced_unpack_hits.iter()) {
+                    assert_eq!(
+                        id_score_pairs(&default.hits)
+                            .into_iter()
+                            .map(|(id, s)| (id, s.to_bits()))
+                            .collect::<Vec<_>>(),
+                        id_score_pairs(&forced.hits)
+                            .into_iter()
+                            .map(|(id, s)| (id, s.to_bits()))
+                            .collect::<Vec<_>>(),
+                        "dim={dim}: default and forced-unpack must be bit-identical without SHADER_F16"
+                    );
+                }
+                continue;
+            }
+
+            // 対応アダプタ: 実際に f16 算術版へ dispatch されたこと（非
+            // vacuous）と、境界同点許容つきで unpack 版と結果が一致することを
+            // 確認する（数値誤差の許容は `count_boundary_tolerant_mismatches`
+            // が担い、境界より明確に上位の正解の脱落は 0 件を要求する）。
+            assert!(
+                stats_after.f16_arith_dispatches > stats_before.f16_arith_dispatches,
+                "dim={dim}: f16 arith dot shader must actually be dispatched on a SHADER_F16 adapter"
+            );
+            for (qidx, (default, forced)) in default_hits
+                .iter()
+                .zip(forced_unpack_hits.iter())
+                .enumerate()
+            {
+                let mismatches = count_boundary_tolerant_mismatches(
+                    &id_score_pairs(&forced.hits),
+                    &id_score_pairs(&default.hits),
+                );
+                assert_eq!(
+                    mismatches, 0,
+                    "dim={dim} query={qidx}: f16 arith result must match unpack result within boundary tolerance"
+                );
+            }
+        }
+    }
+
+    /// [`GpuSearchTestOptions::dot_shader`] に `Some(F16Arith)`/`Some(Unpack)`
+    /// を強制した経路がそれぞれ `force_full_readback` の有無に関わらず
+    /// ビット同一であることを確認する（`topk_readback_bit_identity` と同じ
+    /// 方針を f16 算術版の S0 にも適用。全量 readback／部分 Top-k いずれの
+    /// 経路でも [`DOT_SHADER_F16_ARITH_WGSL`]/[`DOT_SHADER_TOPK_F16_ARITH_WGSL`]
+    /// の S0 演算順が完全に一致する契約の根拠）。
+    #[test]
+    fn f16_arith_partial_topk_matches_forced_full_readback_bit_identically() {
+        let row_count = 1000;
+        let dim = 33;
+        let fx = multi_query_fixture(row_count, dim, 5, 0x539_a11c);
+        let matrix = engine::batch_search::ResidentMatrix::build(
+            &fx.ids,
+            &fx.tenant_ids,
+            &fx.visibilities,
+            fx.dim,
+            &fx.vectors,
+        )
+        .expect("resident matrix build should succeed for well-formed fixture");
+
+        let backend = match GpuBatchBackend::try_new(matrix) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("gpu unavailable in this environment, skipping: {e}");
+                return;
+            }
+        };
+        if !backend.f16_arith_available() {
+            eprintln!("SHADER_F16 unavailable in this environment, skipping");
+            return;
+        }
+
+        let c = ctx("tenant-a");
+        let batch_queries: Vec<BatchQuery<'_>> = fx
+            .queries
+            .iter()
+            .map(|v| BatchQuery {
+                vector: v,
+                k: 6,
+                ctx: &c,
+            })
+            .collect();
+
+        let partial_hits = backend
+            .batch_search_with_options_for_tests(
+                &batch_queries,
+                GpuSearchTestOptions {
+                    budget_bytes: 32 * 1024 * 1024,
+                    force_full_readback: false,
+                    dot_shader: Some(GpuDotShaderKind::F16Arith),
+                },
+            )
+            .expect("forced f16 arith (partial topk) gpu batch_search should succeed");
+        let full_hits = backend
+            .batch_search_with_options_for_tests(
+                &batch_queries,
+                GpuSearchTestOptions {
+                    budget_bytes: 32 * 1024 * 1024,
+                    force_full_readback: true,
+                    dot_shader: Some(GpuDotShaderKind::F16Arith),
+                },
+            )
+            .expect("forced f16 arith (full readback) gpu batch_search should succeed");
+
+        assert_eq!(partial_hits.len(), fx.queries.len());
+        assert_eq!(full_hits.len(), fx.queries.len());
+        for (partial, full) in partial_hits.iter().zip(full_hits.iter()) {
+            let bits = |hits: &[engine::kernel::SearchHit]| -> Vec<(u64, u32)> {
+                let mut v: Vec<(u64, u32)> =
+                    hits.iter().map(|h| (h.id, h.score.to_bits())).collect();
+                v.sort_by_key(|(id, _)| *id);
+                v
+            };
+            assert_eq!(
+                bits(&partial.hits),
+                bits(&full.hits),
+                "f16 arith partial topk and forced full-readback must be bit-identical"
+            );
+        }
+    }
+
+    /// 大振幅フィクスチャ（ブロック内部分和がオーバーフロー上限を超える）
+    /// では自動選択（`select_dot_shader`）が unpack 版へ縮退し、
+    /// `f16_arith_guard_fallbacks` が増加することを確認する。あわせて
+    /// `Some(F16Arith)` の強制指定はガード不成立のため `Err` を返すこと
+    /// （fail-closed。黙って縮退しない）も確認する。
+    #[test]
+    fn f16_arith_overflow_guard_falls_back_to_unpack() {
+        let row_count = 40;
+        let dim = 128;
+        // 全成分 100.0 の行 × 全成分 100.0 のクエリ:
+        // row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK(8) = 100*100*8 = 80000
+        // > F16_ARITH_PARTIAL_SUM_LIMIT(32768) のためガードが unpack へ倒す。
+        let fx = Fixture {
+            ids: (1..=row_count as u64).collect(),
+            tenant_ids: vec!["tenant-a".to_string(); row_count],
+            visibilities: vec![Visibility::Public; row_count],
+            dim,
+            vectors: vec![100.0f32; row_count * dim],
+        };
+        let matrix = engine::batch_search::ResidentMatrix::build(
+            &fx.ids,
+            &fx.tenant_ids,
+            &fx.visibilities,
+            fx.dim,
+            &fx.vectors,
+        )
+        .expect("resident matrix build should succeed for well-formed fixture");
+
+        let backend = match GpuBatchBackend::try_new(matrix) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("gpu unavailable in this environment, skipping: {e}");
+                return;
+            }
+        };
+        if !backend.f16_arith_available() {
+            eprintln!("SHADER_F16 unavailable in this environment, skipping");
+            return;
+        }
+
+        let c = ctx("tenant-a");
+        let query = vec![100.0f32; dim];
+        let bq = [BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &c,
+        }];
+
+        let stats_before = backend.stats();
+        let default_hits = backend
+            .batch_search(&bq)
+            .expect("default gpu batch_search should succeed once the device initialized");
+        let stats_after = backend.stats();
+        assert_eq!(
+            stats_after.f16_arith_dispatches - stats_before.f16_arith_dispatches,
+            0,
+            "overflow guard must prevent f16 arith dispatch on this large-magnitude fixture"
+        );
+        assert!(
+            stats_after.f16_arith_guard_fallbacks > stats_before.f16_arith_guard_fallbacks,
+            "overflow guard fallback counter must increase when the bound is exceeded"
+        );
+
+        let forced_unpack_hits = backend
+            .batch_search_with_options_for_tests(
+                &bq,
+                GpuSearchTestOptions {
+                    budget_bytes: 32 * 1024 * 1024,
+                    force_full_readback: false,
+                    dot_shader: Some(GpuDotShaderKind::Unpack),
+                },
+            )
+            .expect("forced unpack gpu batch_search should succeed");
+        let bits = |hits: &[engine::kernel::SearchHit]| -> Vec<(u64, u32)> {
+            let mut v: Vec<(u64, u32)> = hits.iter().map(|h| (h.id, h.score.to_bits())).collect();
+            v.sort_by_key(|(id, _)| *id);
+            v
+        };
+        assert_eq!(
+            bits(&default_hits[0].hits),
+            bits(&forced_unpack_hits[0].hits),
+            "guard-triggered default path must match forced-unpack path bit-identically"
+        );
+
+        let forced_f16_err = backend.batch_search_with_options_for_tests(
+            &bq,
+            GpuSearchTestOptions {
+                budget_bytes: 32 * 1024 * 1024,
+                force_full_readback: false,
+                dot_shader: Some(GpuDotShaderKind::F16Arith),
+            },
+        );
+        assert!(
+            forced_f16_err.is_err(),
+            "forcing f16 arith when the overflow guard rejects it must fail closed, not silently fall back"
         );
     }
 }

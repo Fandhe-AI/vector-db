@@ -84,10 +84,12 @@ FallbackBatchEngine（batch_fallback.rs・CORE-8）
   CPU 経路では予算内の要求まで `Input` エラー（＝縮退対象外）で恒久的に拒否して
   しまううえ、`MAX_BATCH_ROWS × MAX_BATCH_DIM` < `MAX_BATCH_WORK` のため 1 クエリ分の
   課金がこの上限を超えることは構造的にありえず到達不能だったため
-- WGSL は `const` 文字列で埋め込み（外部ファイル読み込みなし）。
+- WGSL は `const` 文字列で埋め込み（外部ファイル読み込みなし）。既定は
   `unpack2x16float`（コア機能。`shader-f16` 拡張不要）で
   `batch_search.rs::pack_f16x2` と同じビット解釈の f16 → f32 復元を行い、
-  積和は f32 で行う
+  積和は f32 で行う（unpack 版）。`Features::SHADER_F16` 対応アダプタでは
+  `select_dot_shader` がネイティブ f16 積和版（`enable f16;`）を自動選択する
+  （詳細は Issue #539・`docs/design/gpu-batch-f16-arith.md` 参照）
 - テナント境界・可視性判定は `policy.rs::PolicyContext::is_visible` の単一
   照合パスを CPU 側で使う（`gather_reachable_rows`）。GPU では積和のみを行い、
   テナント境界判定を GPU に持ち込まない

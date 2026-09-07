@@ -65,6 +65,29 @@ const GPU_WORKGROUP_SIZE: u32 = 256;
 /// 数値ではない。
 const GPU_QUERY_TILE_MAX: usize = 16;
 
+/// f16 算術版シェーダ（[`DOT_SHADER_F16_ARITH_WGSL`]/
+/// [`DOT_SHADER_TOPK_F16_ARITH_WGSL`]・Issue #539）が f16 レジスタ `acc2` を
+/// f32 アキュムレータへフラッシュするまでの積算回数。WGSL 側の
+/// `F16_ACC_BLOCK` 定数と一致していなければならない
+/// （`tests::dot_shader_f16_arith_wgsl_constants_match_host_constants` で
+/// 機械検証）。値はブロック内部分和が f16 の値域（65504）へ収まる余裕と
+/// 精度のトレードオフに基づく実装既定値であり、spec 由来の数値ではない。
+const GPU_F16_ACC_BLOCK: u32 = 8;
+
+/// f16 の有限最大値（IEEE 754 half-precision）。[`select_dot_shader`] が
+/// クエリ成分の f16 パック時飽和（±Inf 化）を防ぐ独立ガードとして使う。
+const F16_MAX_FINITE: f32 = 65504.0;
+
+/// [`select_dot_shader`] が f16 算術版を選ぶための「ブロック内部分和の上界」
+/// 判定に使う閾値。`row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK` が
+/// この値を超える場合、[`GPU_F16_ACC_BLOCK`] 回の f16 積算のどこかで f16 の
+/// 有限最大値（65504）へ達しうるとみなし f16 算術版を選ばない
+/// （[`DOT_SHADER_WGSL`] の unpack 版へ縮退）。65504 の約半分を選び、丸め・
+/// `fma` の誤差蓄積・実際の内積が最悪ケースの符号一致（全成分が同符号で
+/// 積算される）でなくとも安全側に倒れる余裕を持たせる。spec 由来の数値では
+/// なく実装既定値。
+const F16_ARITH_PARTIAL_SUM_LIMIT: f32 = 32768.0;
+
 /// workgroup 内部分 Top-k シェーダ（[`DOT_SHADER_TOPK_WGSL`]/
 /// [`DOT_SHADER_TOPK_F32_WGSL`]）が 1 ワークグループから出力する候補数の
 /// 上限（Issue #536・ポインタ: `docs/design/gpu-batch-topk.md` 決定 1・3）。
@@ -258,6 +281,112 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL: `SHADER_F16` 対応アダプタ向けの f16 算術版（Issue #539・親 #538。
+/// 対象ビヘイビア: CORE-6, 8, 16 ポインタ）。[`DOT_SHADER_WGSL`] と行データ
+/// （常駐 f16 2 要素/u32 パック）は完全に同一だが、`unpack2x16float` で f32 へ
+/// 復元してから積和する代わりに、`enable f16;`（WGSL 拡張。`Features::
+/// SHADER_F16` 要求時のみ有効）で `vec2<f16>` のまま `fma` を実行しネイティブ
+/// f16 演算を使う。クエリ側もホスト（[`encode_query_bytes`]）が
+/// `batch_search.rs::pack_f16x2` と同じ表現で `vec2<f16>` パックしてアップロード
+/// する（[`QueryEncoding::F16Packed`]）。
+///
+/// f16 の積算をそのまま `QUERY_TILE_MAX` 件ぶん行レジスタへ蓄積し続けると
+/// 最大値 65504 を超えて容易にオーバーフローするため、[`GPU_F16_ACC_BLOCK`]
+/// 件ごとに `f32(acc2.x) + f32(acc2.y)` で f32 アキュムレータ `acc` へ
+/// フラッシュし f16 レジスタを 0 に戻す（ブロック内部分和のみ f16 の値域に
+/// 収まればよい設計。オーバーフロー検出そのものはホスト側の
+/// [`select_dot_shader`] が dispatch 前に行い、収まらない場合はこのシェーダを
+/// 選ばず [`DOT_SHADER_WGSL`] へ縮退する）。
+///
+/// [`DOT_SHADER_TOPK_F16_ARITH_WGSL`]（`topk_dot_shader!` 経由）の S0 と
+/// 演算順を完全に一致させてあり、全量 readback／部分 Top-k いずれの経路でも
+/// 同一のスコアになる（`tests/gpu_batch.rs` のビット同一検証対象）。
+const DOT_SHADER_F16_ARITH_WGSL: &str = r#"
+enable f16;
+
+const QUERY_TILE_MAX: u32 = 16u;
+const F16_ACC_BLOCK: u32 = 8u;
+
+struct Params {
+    row_stride: u32,
+    row_count: u32,
+    query_count: u32,
+    query_stride: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> packed_rows: array<vec2<f16>>;
+@group(0) @binding(2) var<storage, read> row_ids: array<u32>;
+@group(0) @binding(3) var<storage, read> query: array<vec2<f16>>;
+@group(0) @binding(4) var<storage, read_write> scores: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.row_count) {
+        return;
+    }
+    let query_count = min(params.query_count, QUERY_TILE_MAX);
+    let row = row_ids[i];
+    let row_base = row * params.row_stride;
+    let query_pairs = params.query_stride >> 1u;
+
+    var acc: array<f32, QUERY_TILE_MAX>;
+    var acc2: array<vec2<f16>, QUERY_TILE_MAX>;
+    var qi: u32 = 0u;
+    loop {
+        if (qi >= QUERY_TILE_MAX) {
+            break;
+        }
+        acc[qi] = 0.0;
+        acc2[qi] = vec2<f16>(0h, 0h);
+        qi = qi + 1u;
+    }
+
+    var j: u32 = 0u;
+    var block: u32 = 0u;
+    loop {
+        if (j >= params.row_stride) {
+            break;
+        }
+        let row_pair = packed_rows[row_base + j];
+        var q: u32 = 0u;
+        loop {
+            if (q >= query_count) {
+                break;
+            }
+            let qv = query[q * query_pairs + j];
+            acc2[q] = fma(row_pair, qv, acc2[q]);
+            q = q + 1u;
+        }
+        j = j + 1u;
+        block = block + 1u;
+        let flush = (block >= F16_ACC_BLOCK) || (j >= params.row_stride);
+        if (flush) {
+            var qf: u32 = 0u;
+            loop {
+                if (qf >= query_count) {
+                    break;
+                }
+                acc[qf] = acc[qf] + f32(acc2[qf].x) + f32(acc2[qf].y);
+                acc2[qf] = vec2<f16>(0h, 0h);
+                qf = qf + 1u;
+            }
+            block = 0u;
+        }
+    }
+
+    var qo: u32 = 0u;
+    loop {
+        if (qo >= query_count) {
+            break;
+        }
+        scores[qo * params.row_count + i] = acc[qo];
+        qo = qo + 1u;
+    }
+}
+"#;
+
 /// workgroup 内部分 Top-k シェーダ（Issue #536）を `macro_rules!` で組み立てる。
 /// 行データの読み方（S0 内積）だけが常駐形式（f16 パック常駐 /
 /// f32 常駐対照）ごとに異なり、パラメータ構造・共通バインディング・
@@ -280,8 +409,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// subgroup shuffle 段の追加最適化は別途検討する（README/ADR・PR 本文へ
 /// 申し送り）。
 macro_rules! topk_dot_shader {
-    ($row_binding:literal, $row_read_loop:literal) => {
+    ($prelude:literal, $row_binding:literal, $query_binding:literal, $row_read_loop:literal) => {
         concat!(
+            $prelude,
             r#"
 const WORKGROUP_SIZE: u32 = 256u;
 const TOPK_OUT_MAX: u32 = 256u;
@@ -303,7 +433,9 @@ struct TopKParams {
             $row_binding,
             r#"
 @group(0) @binding(2) var<storage, read> row_ids: array<u32>;
-@group(0) @binding(3) var<storage, read> query: array<f32>;
+@group(0) @binding(3) var<storage, read> query: "#,
+            $query_binding,
+            r#";
 @group(0) @binding(4) var<storage, read_write> out_topk: array<u32>;
 
 var<workgroup> sort_key: array<u32, 256>;
@@ -432,7 +564,9 @@ fn main(
 /// 選んだ場合に使う（Issue #536）。S0 は [`DOT_SHADER_WGSL`] の演算順と
 /// 完全に同一（スコアのビット同一契約の根拠）。
 const DOT_SHADER_TOPK_WGSL: &str = topk_dot_shader!(
+    "",
     "\n@group(0) @binding(1) var<storage, read> packed_rows: array<u32>;\n",
+    "array<f32>",
     r#"
     var j: u32 = 0u;
     loop {
@@ -459,7 +593,9 @@ const DOT_SHADER_TOPK_WGSL: &str = topk_dot_shader!(
 /// [`GpuF32ContrastBackend`] にも用意する。ADR §2.1「決定事項」）。S0 は
 /// [`DOT_SHADER_F32_WGSL`] の演算順と完全に同一。
 const DOT_SHADER_TOPK_F32_WGSL: &str = topk_dot_shader!(
+    "",
     "\n@group(0) @binding(1) var<storage, read> rows: array<f32>;\n",
+    "array<f32>",
     r#"
     var j: u32 = 0u;
     loop {
@@ -476,6 +612,63 @@ const DOT_SHADER_TOPK_F32_WGSL: &str = topk_dot_shader!(
             q = q + 1u;
         }
         j = j + 1u;
+    }
+"#
+);
+
+/// workgroup 内部分 Top-k シェーダ（f16 算術版・Issue #539。
+/// [`GpuContext::f16_arith_pipelines`] が保持し、`SHADER_F16` 対応アダプタで
+/// [`select_dot_shader`] が [`GpuDotShaderKind::F16Arith`] を選んだ場合に使う）。
+/// S0 は [`DOT_SHADER_F16_ARITH_WGSL`] の演算順（f16 fma 積算・
+/// [`GPU_F16_ACC_BLOCK`] 件ごとの f32 フラッシュ）と完全に同一
+/// （全量 readback／部分 Top-k のビット同一契約の根拠）。
+const DOT_SHADER_TOPK_F16_ARITH_WGSL: &str = topk_dot_shader!(
+    "enable f16;\nconst F16_ACC_BLOCK: u32 = 8u;\n",
+    "\n@group(0) @binding(1) var<storage, read> packed_rows: array<vec2<f16>>;\n",
+    "array<vec2<f16>>",
+    r#"
+    var acc2: array<vec2<f16>, QUERY_TILE_MAX>;
+    var qi2: u32 = 0u;
+    loop {
+        if (qi2 >= QUERY_TILE_MAX) {
+            break;
+        }
+        acc2[qi2] = vec2<f16>(0h, 0h);
+        qi2 = qi2 + 1u;
+    }
+
+    let query_pairs = params.query_stride >> 1u;
+    var j: u32 = 0u;
+    var block: u32 = 0u;
+    loop {
+        if (j >= params.row_stride) {
+            break;
+        }
+        let row_pair = packed_rows[row_base + j];
+        var q: u32 = 0u;
+        loop {
+            if (q >= query_count) {
+                break;
+            }
+            let qv = query[q * query_pairs + j];
+            acc2[q] = fma(row_pair, qv, acc2[q]);
+            q = q + 1u;
+        }
+        j = j + 1u;
+        block = block + 1u;
+        let flush = (block >= F16_ACC_BLOCK) || (j >= params.row_stride);
+        if (flush) {
+            var qf: u32 = 0u;
+            loop {
+                if (qf >= query_count) {
+                    break;
+                }
+                acc[qf] = acc[qf] + f32(acc2[qf].x) + f32(acc2[qf].y);
+                acc2[qf] = vec2<f16>(0h, 0h);
+                qf = qf + 1u;
+            }
+            block = 0u;
+        }
     }
 "#
 );
@@ -592,6 +785,150 @@ fn select_readback_mode(topk_pipeline_available: bool, tile_max_k: usize) -> Gpu
         return GpuReadbackMode::FullScores;
     }
     GpuReadbackMode::PartialTopK { k_out: tile_max_k }
+}
+
+/// dispatch する S0（内積）シェーダの種別（Issue #539）。`Unpack` は既存の
+/// `unpack2x16float` 経由 f32 積和（[`DOT_SHADER_WGSL`]/[`DOT_SHADER_TOPK_WGSL`]）、
+/// `F16Arith` は `SHADER_F16` 対応アダプタでのみ選ばれるネイティブ f16 積和
+/// （[`DOT_SHADER_F16_ARITH_WGSL`]/[`DOT_SHADER_TOPK_F16_ARITH_WGSL`]）。
+/// `bench-internals` feature 限定の [`GpuSearchTestOptions::dot_shader`]
+/// フィールドで公開する必要があるため `pub` にしているが、既定ビルド・
+/// `wire-server` からは（`GpuSearchTestOptions` 自体が feature gate 済みの
+/// ため）到達不能で、テナント境界・RLS 迂回の経路は増やさない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuDotShaderKind {
+    Unpack,
+    F16Arith,
+}
+
+/// クエリバッファのホスト側エンコーディング（Issue #539）。`F16Arith` シェーダ
+/// を選んだときのみ `F16Packed`（[`batch_search::pack_f16x2`] と同一表現）を
+/// 使い、それ以外は既存の `F32`（`bytes_of_f32_slice`）のまま。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryEncoding {
+    F32,
+    F16Packed,
+}
+
+/// 常駐行列（f16 2 要素/u32 パック。[`crate::batch_search::pack_f16x2`]）の
+/// 有限成分のみの絶対値最大を走査する（Issue #539・[`select_dot_shader`] の
+/// `row_max_abs` 引数を作る）。非有限成分（f16 パック時の飽和で ±Inf 化した
+/// 値）は unpack 版でも必ず非有限スコアとして除外される値のため、
+/// オーバーフローガードの母数から除外してよい（`select_dot_shader` doc
+/// 参照）。行列が空、または全成分が非有限の場合は `0.0`（安全側 = ガードが
+/// 通りやすい方向ではなく、`query_max_abs` 側の独立チェックで overflow は
+/// 別途防がれる）を返す。
+fn max_abs_finite_from_packed(packed: &[u32]) -> f32 {
+    let mut max_abs: f32 = 0.0;
+    for &word in packed {
+        let (a, b) = crate::batch_search::unpack_f16x2(word);
+        if a.is_finite() {
+            max_abs = max_abs.max(a.abs());
+        }
+        if b.is_finite() {
+            max_abs = max_abs.max(b.abs());
+        }
+    }
+    max_abs
+}
+
+/// クエリバッチ（f32・パック前）の有限成分のみの絶対値最大を走査する
+/// （Issue #539・[`select_dot_shader`] の `query_max_abs` 引数を作る）。
+/// `f16` へパックした時点での飽和（±Inf 化）を判定する独立ガード
+/// （`query_max_abs > F16_MAX_FINITE`）の母数となるため、f32 の値そのまま
+/// （f16 丸め前）で最大値を取る（`select_dot_shader` doc 参照）。
+fn max_abs_finite_from_queries(queries: &[BatchQuery<'_>]) -> f32 {
+    let mut max_abs: f32 = 0.0;
+    for q in queries {
+        for &v in q.vector {
+            if v.is_finite() {
+                max_abs = max_abs.max(v.abs());
+            }
+        }
+    }
+    max_abs
+}
+
+/// [`GpuDotShaderKind`] を GPU デバイス非依存の純関数として決める
+/// （`select_readback_mode` と同型。単体テストの対象）。
+///
+/// f16 算術版はネイティブ半精度の積和を行うため、次のいずれかが崩れると
+/// unpack 版との等価性（受け入れ条件の核心）が壊れる:
+///
+/// - `f16_arith_available`: アダプタが `SHADER_F16` に対応し、かつ
+///   f16 算術版パイプラインの生成に成功していること
+///   （[`GpuContext::f16_arith_pipelines`] が `Some`）
+/// - `row_max_abs`/`query_max_abs` がいずれも有限であること（非有限は
+///   別途 unpack 版でも非有限スコアとして除外される値のため、ここでは
+///   「ガード計算自体が意味を持つか」だけを見る）
+/// - `query_max_abs <= F16_MAX_FINITE`（65504）: クエリ成分が f16 へ
+///   パックされた時点で ±Inf へ飽和すると、unpack 版（f32 のまま計算）
+///   では有限のスコアになる行が f16 算術版だけ除外されてしまう
+///   （`row_max_abs` の値に関わらず崩れる独立した条件のため、積の判定
+///   より先に単独でチェックする）
+/// - `row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK <=
+///   F16_ARITH_PARTIAL_SUM_LIMIT`: [`GPU_F16_ACC_BLOCK`] 回分の f16 積算が
+///   ブロックフラッシュ前に f16 の有限最大値（65504）へ達しないことの
+///   保守的な上界判定
+fn select_dot_shader(
+    f16_arith_available: bool,
+    row_max_abs: f32,
+    query_max_abs: f32,
+) -> GpuDotShaderKind {
+    if !f16_arith_available {
+        return GpuDotShaderKind::Unpack;
+    }
+    if !row_max_abs.is_finite() || !query_max_abs.is_finite() {
+        return GpuDotShaderKind::Unpack;
+    }
+    if query_max_abs > F16_MAX_FINITE {
+        return GpuDotShaderKind::Unpack;
+    }
+    let bound = row_max_abs * query_max_abs * (GPU_F16_ACC_BLOCK as f32);
+    if !bound.is_finite() || bound > F16_ARITH_PARTIAL_SUM_LIMIT {
+        return GpuDotShaderKind::Unpack;
+    }
+    GpuDotShaderKind::F16Arith
+}
+
+/// クエリバッファをホスト側で `encoding` に従いバイト列化する
+/// （[`bytes_of_f32_slice`] を `QueryEncoding::F32` の場合に委譲し、
+/// `QueryEncoding::F16Packed` は 2 要素ずつ [`crate::batch_search::pack_f16x2`]
+/// で f16 パックする。パック後のバイト数は f32 表現の半分になる）。
+///
+/// `values.len()` が奇数の場合は呼び出し元（`run_tiled_batch_search`）の
+/// `query_stride` 契約違反（f16 経路は常に偶数ストライド）を示すため、
+/// GPU に触れる前に拒否する（fail-closed。coding-rust.md「untrusted 入力の
+/// 扱い」と同じ「シェーダに触れる前に検証する」方針をホスト内部の不変条件
+/// 違反にも適用）。
+fn encode_query_bytes(
+    values: &[f32],
+    encoding: QueryEncoding,
+) -> Result<Vec<u8>, BatchBackendError> {
+    match encoding {
+        QueryEncoding::F32 => bytes_of_f32_slice(values),
+        QueryEncoding::F16Packed => {
+            if !values.len().is_multiple_of(2) {
+                return Err(BatchBackendError::TransferFailed(
+                    "f16 packed query buffer length must be even".to_string(),
+                ));
+            }
+            let mut out = Vec::new();
+            try_reserve_bytes(&mut out, (values.len() / 2).saturating_mul(4))?;
+            for pair in values.chunks_exact(2) {
+                let (a, b) = match pair {
+                    [a, b] => (*a, *b),
+                    // `chunks_exact(2)` は常に長さ 2 のスライスのみ返すため
+                    // 到達しないが、添字アクセスを避けるためパターンマッチで
+                    // 表現する（coding-rust.md）。
+                    _ => continue,
+                };
+                let packed = crate::batch_search::pack_f16x2(a, b);
+                out.extend_from_slice(&packed.to_ne_bytes());
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// [`GpuReadbackMode::PartialTopK`] 経路の 1 dispatch あたり行チャンク数を
@@ -723,6 +1060,13 @@ struct GpuBatchStats {
     /// （ADR 決定 2 の縮退が実際に発生した観測点）。
     full_readback_fallbacks: std::sync::atomic::AtomicU64,
     readback_bytes: std::sync::atomic::AtomicU64,
+    /// [`select_dot_shader`] が `GpuDotShaderKind::F16Arith` を選び実際に
+    /// f16 算術版シェーダへ dispatch した回数（Issue #539）。
+    f16_arith_dispatches: std::sync::atomic::AtomicU64,
+    /// f16 算術版パイプラインは利用可能（`f16_arith_available()` が true）
+    /// だが、[`select_dot_shader`] のオーバーフローガード不成立により
+    /// unpack 版へ縮退した回数（Issue #539。ガードが実際に働いた観測点）。
+    f16_arith_guard_fallbacks: std::sync::atomic::AtomicU64,
 }
 
 impl GpuBatchStats {
@@ -733,6 +1077,8 @@ impl GpuBatchStats {
             full_readback_dispatches: self.full_readback_dispatches.load(Relaxed),
             full_readback_fallbacks: self.full_readback_fallbacks.load(Relaxed),
             readback_bytes: self.readback_bytes.load(Relaxed),
+            f16_arith_dispatches: self.f16_arith_dispatches.load(Relaxed),
+            f16_arith_guard_fallbacks: self.f16_arith_guard_fallbacks.load(Relaxed),
         }
     }
 }
@@ -744,6 +1090,8 @@ pub struct GpuBatchStatsSnapshot {
     pub full_readback_dispatches: u64,
     pub full_readback_fallbacks: u64,
     pub readback_bytes: u64,
+    pub f16_arith_dispatches: u64,
+    pub f16_arith_guard_fallbacks: u64,
 }
 
 /// プロセス共有の GPU デバイス文脈（adapter/device/queue/pipeline）。
@@ -763,6 +1111,22 @@ struct GpuContext {
     /// 本 Issue では未参照（`#[allow(dead_code)]`）。
     #[allow(dead_code)]
     topk_unavailable_reason: Option<String>,
+    /// f16 算術版の内積／Top-k パイプライン一式（Issue #539）。`SHADER_F16`
+    /// をデバイスへ要求できた場合のみ `Some`。パイプライン生成自体の失敗も
+    /// （feature 要求の成否とは独立に）`None` へ吸収する（`topk_pipeline` と
+    /// 同じ段階的 fail-closed 縮退。呼び出し元は [`select_dot_shader`] で
+    /// 常に [`GpuDotShaderKind::Unpack`] 側へ倒れる）。
+    f16_arith_pipelines: Option<F16ArithPipelines>,
+    /// f16 算術版が利用できない理由（英語・adapter 名やテナント情報を含まない）。
+    /// 診断・将来的な `EXPLAIN` 露出のために保持するが、本 Issue では未参照。
+    #[allow(dead_code)]
+    f16_arith_unavailable_reason: Option<String>,
+    /// `request_device` に `Features::SHADER_F16` を要求したかどうか
+    /// （adapter が対応を報告した場合のみ true）。要求そのものが失敗した
+    /// 場合は `Features::empty()` へ 1 回だけ再試行するため、実際に feature
+    /// 付きデバイスが得られたかは `f16_arith_pipelines.is_some()` 側で見る。
+    #[allow(dead_code)]
+    shader_f16_requested: bool,
     bind_group_layout: wgpu::BindGroupLayout,
     max_storage_buffer_binding_size: u64,
     max_workgroups_per_dimension: u32,
@@ -838,16 +1202,47 @@ fn init_gpu_context() -> Result<GpuContext, String> {
     required_limits.max_compute_workgroup_size_x =
         adapter_limits.max_compute_workgroup_size_x.max(256);
 
-    let (device, queue) = pollster_free_block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("vector-db batch backend"),
-        required_features: wgpu::Features::empty(),
-        required_limits,
-        experimental_features: wgpu::ExperimentalFeatures::default(),
-        memory_hints: wgpu::MemoryHints::Performance,
-        trace: wgpu::Trace::Off,
-    }))
-    .map_err(|()| "device request timed out".to_string())?
-    .map_err(|e| format!("device request failed: {e}"))?;
+    // `SHADER_F16`（Issue #539）はアダプタが対応を報告した場合のみ要求する。
+    // プロセス共有 `wgpu::Device` は `OnceLock` で 1 回しか作られないため、
+    // feature 要求そのものが原因で device 生成に失敗すると GPU 経路全体が
+    // 死んでしまう。そのため feature 付き要求が失敗した場合は
+    // `Features::empty()` で 1 回だけ再試行し、GPU 経路自体は必ず既存の
+    // unpack 版シェーダで動作を続けられるようにする（ADR 決定 2 と同じ
+    // 段階的 fail-closed 縮退）。
+    let shader_f16_requested = adapter.features().contains(wgpu::Features::SHADER_F16);
+    let device_descriptor =
+        |features: wgpu::Features, limits: wgpu::Limits| wgpu::DeviceDescriptor {
+            label: Some("vector-db batch backend"),
+            required_features: features,
+            required_limits: limits,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        };
+    let (device, queue, shader_f16_enabled) = if shader_f16_requested {
+        match pollster_free_block_on(adapter.request_device(&device_descriptor(
+            wgpu::Features::SHADER_F16,
+            required_limits.clone(),
+        ))) {
+            Ok(Ok((device, queue))) => (device, queue, true),
+            _ => {
+                let (device, queue) = pollster_free_block_on(adapter.request_device(
+                    &device_descriptor(wgpu::Features::empty(), required_limits.clone()),
+                ))
+                .map_err(|()| "device request timed out".to_string())?
+                .map_err(|e| format!("device request failed: {e}"))?;
+                (device, queue, false)
+            }
+        }
+    } else {
+        let (device, queue) = pollster_free_block_on(adapter.request_device(&device_descriptor(
+            wgpu::Features::empty(),
+            required_limits.clone(),
+        )))
+        .map_err(|()| "device request timed out".to_string())?
+        .map_err(|e| format!("device request failed: {e}"))?;
+        (device, queue, false)
+    };
 
     let device_lost = std::sync::Arc::new(AtomicBool::new(false));
     let device_lost_flag = device_lost.clone();
@@ -937,18 +1332,68 @@ fn init_gpu_context() -> Result<GpuContext, String> {
             Err(msg) => (None, Some(msg)),
         };
 
+    // f16 算術版パイプライン（Issue #539）は `shader_f16_enabled`（feature
+    // 要求が実際に通った場合のみ）でのみ生成を試みる。feature 非対応の
+    // デバイスで `enable f16;` を含むシェーダをコンパイルすると naga が
+    // capability 不足として validation エラーにするため（`enable
+    // subgroups;` と同じ扱い。ADR §1.3 実測ポインタ）、そもそも試みない。
+    // 生成失敗（内積・Top-k いずれも）は `init_gpu_context` 自体を失敗させず
+    // `None` へ吸収する（`topk_pipeline` と同じ段階的 fail-closed 縮退）。
+    let (f16_arith_pipelines, f16_arith_unavailable_reason) = if shader_f16_enabled {
+        match create_topk_pipeline(
+            &device,
+            &bind_group_layout,
+            DOT_SHADER_F16_ARITH_WGSL,
+            "f16-arith-dot",
+        ) {
+            Ok(dot) => {
+                // Top-k 側の生成失敗は内積側の可用性へ影響させない（`topk_pipeline`
+                // と同方針。`select_readback_mode` が Top-k 非対応時に常に全量
+                // readback へ倒すのと同じ構造で `select_dot_shader` の判定とは独立）。
+                let topk = create_topk_pipeline(
+                    &device,
+                    &bind_group_layout,
+                    DOT_SHADER_TOPK_F16_ARITH_WGSL,
+                    "f16-arith-topk",
+                )
+                .ok();
+                (Some(F16ArithPipelines { dot, topk }), None)
+            }
+            Err(msg) => (None, Some(msg)),
+        }
+    } else {
+        (
+            None,
+            Some("adapter or device does not support SHADER_F16".to_string()),
+        )
+    };
+
     Ok(GpuContext {
         device,
         queue,
         pipeline,
         topk_pipeline,
         topk_unavailable_reason,
+        f16_arith_pipelines,
+        f16_arith_unavailable_reason,
+        shader_f16_requested,
         bind_group_layout,
         max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
         max_workgroups_per_dimension,
         device_lost,
         uncaptured_error,
     })
+}
+
+/// [`GpuContext::f16_arith_pipelines`] の内訳（Issue #539）。内積本体
+/// （`dot`）は `SHADER_F16` 対応・パイプライン生成成功の必須条件だが、
+/// workgroup 内部分 Top-k（`topk`）は既存の [`GpuContext::topk_pipeline`]
+/// と同じく生成失敗を `None` へ吸収する（Top-k 非対応時は
+/// [`select_readback_mode`] が全量 readback 側へ倒すため、f16 算術版でも
+/// `dot` さえ使えれば全量 readback 経路は動く）。
+struct F16ArithPipelines {
+    dot: wgpu::ComputePipeline,
+    topk: Option<wgpu::ComputePipeline>,
 }
 
 /// [`GpuContext::topk_pipeline`]／CORE-16 対照経路の Top-k パイプライン生成
@@ -1227,6 +1672,14 @@ pub struct GpuBatchBackend {
     /// `stats()` 経由で読む）。インスタンス単位（`GpuContext` のようなプロセス
     /// 共有ではない）で、このバックエンドが処理した dispatch のみを数える。
     stats: std::sync::Arc<GpuBatchStats>,
+    /// 常駐行列（`matrix.packed()`）が保持する有限成分のみの絶対値最大
+    /// （Issue #539・[`select_dot_shader`] 参照）。`try_new` で 1 回だけ
+    /// 走査して確定させ、以降の `batch_search` 呼び出し全件で共有する
+    /// （クエリごとに毎回行列全体を再走査しないため）。非有限成分（f16
+    /// パック時の飽和で ±Inf 化した値）は unpack 版でも必ず非有限スコアと
+    /// して除外されるため最大値計算から除外してよい（`select_dot_shader`
+    /// doc 参照）。
+    row_max_abs: f32,
 }
 
 impl GpuBatchBackend {
@@ -1305,13 +1758,26 @@ impl GpuBatchBackend {
             ));
         }
 
+        // f16 算術版の選択可否ガード（Issue #539・[`select_dot_shader`]）に
+        // 使う「常駐行列の有限成分のみの絶対値最大」を 1 回だけ走査して確定
+        // させる（`batch_search` 呼び出しのたびに行列全体を再走査しない）。
+        let row_max_abs = max_abs_finite_from_packed(matrix.packed());
+
         Ok(Self {
             matrix,
             row_buffer,
             device_lost: ctx.device_lost.clone(),
             uncaptured_error: ctx.uncaptured_error.clone(),
             stats: std::sync::Arc::new(GpuBatchStats::default()),
+            row_max_abs,
         })
+    }
+
+    /// `SHADER_F16` 対応アダプタでこのプロセスの GPU 経路が f16 算術版
+    /// シェーダを使えるかどうか（Issue #539）。テナント・行数などの情報は
+    /// 含まない、GPU 初期化結果のみに依存する情報提供専用の問い合わせ。
+    pub fn f16_arith_available(&self) -> bool {
+        matches!(global_context(), Ok(ctx) if ctx.f16_arith_pipelines.is_some())
     }
 
     /// readback 方式別の dispatch 回数・バイト数のスナップショット
@@ -1401,7 +1867,7 @@ impl GpuBatchBackend {
         queries: &[BatchQuery<'_>],
         budget_bytes: usize,
     ) -> Result<Vec<BatchHit>, BatchExecError> {
-        self.batch_search_with_budget_and_mode(queries, budget_bytes, false)
+        self.batch_search_with_budget_and_mode(queries, budget_bytes, false, None)
     }
 
     /// [`Self::batch_search_with_budget`] へ「常に全量 readback 経路を使う」
@@ -1409,11 +1875,17 @@ impl GpuBatchBackend {
     /// は Top-k パイプラインの可用性に関わらず [`GpuReadbackMode::FullScores`]
     /// を選ばせるテスト・ベンチ専用のオーバーライドで、実 GPU dispatch 経由の
     /// ビット同一検証（`batch_search_with_options_for_tests`）にのみ使う。
+    /// `forced_dot_shader`（Issue #539）は S0 シェーダ選択（[`select_dot_shader`]）
+    /// を上書きするテスト専用オーバーライド。`Some(GpuDotShaderKind::F16Arith)`
+    /// が f16 算術版を使えない環境（未対応アダプタ・オーバーフローガード不成立）
+    /// で指定された場合は黙って unpack 版へ縮退せず `Err` を返す（fail-closed。
+    /// [`GpuSearchTestOptions::dot_shader`] 経由のみ到達する）。
     fn batch_search_with_budget_and_mode(
         &self,
         queries: &[BatchQuery<'_>],
         budget_bytes: usize,
         force_full_readback: bool,
+        forced_dot_shader: Option<GpuDotShaderKind>,
     ) -> Result<Vec<BatchHit>, BatchExecError> {
         if self.device_lost.load(Ordering::SeqCst) {
             return Err(BatchExecError::Backend(BatchBackendError::DeviceLost(
@@ -1472,12 +1944,74 @@ impl GpuBatchBackend {
         let dim_half = dim.div_ceil(2);
         let query_stride = dim_half.saturating_mul(2);
 
+        // S0 シェーダ選択（Issue #539）。選択はバッチ全体（`batch_search`
+        // 呼び出し単位）で 1 回だけ行う（タイル単位にしない。§2.3 設計判断）。
+        // `f16_arith_available` は `ctx.f16_arith_pipelines` の有無そのもので
+        // 判定するため、`select_dot_shader` が `F16Arith` を返した場合
+        // `ctx.f16_arith_pipelines` は必ず `Some` のはずだが、万一の不整合
+        // でも unpack 版へ fail-closed に縮退する（panic させない）。
+        let f16_available = ctx.f16_arith_pipelines.is_some();
+        let query_max_abs = max_abs_finite_from_queries(queries);
+        let natural_shader_kind = select_dot_shader(f16_available, self.row_max_abs, query_max_abs);
+        let shader_kind = match forced_dot_shader {
+            None => natural_shader_kind,
+            Some(GpuDotShaderKind::Unpack) => GpuDotShaderKind::Unpack,
+            Some(GpuDotShaderKind::F16Arith) => {
+                // 強制指定は「f16 算術版が実際に選ばれる状況」でのみ受理する。
+                // 未対応アダプタ・オーバーフローガード不成立のいずれでも
+                // 黙って unpack 版へ縮退せず拒否する（fail-closed。テスト・
+                // ベンチ専用オーバーライドの契約。§2.5）。
+                if natural_shader_kind != GpuDotShaderKind::F16Arith {
+                    return Err(BatchExecError::Backend(
+                        BatchBackendError::KernelLaunchFailed(
+                            "f16 arith dot shader forced but unavailable or overflow guard rejected it"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                GpuDotShaderKind::F16Arith
+            }
+        };
+        let (pipeline, topk_pipeline, query_encoding) = match shader_kind {
+            GpuDotShaderKind::F16Arith => match ctx.f16_arith_pipelines.as_ref() {
+                Some(p) => (&p.dot, p.topk.as_ref(), QueryEncoding::F16Packed),
+                None => (
+                    &ctx.pipeline,
+                    ctx.topk_pipeline.as_ref(),
+                    QueryEncoding::F32,
+                ),
+            },
+            GpuDotShaderKind::Unpack => (
+                &ctx.pipeline,
+                ctx.topk_pipeline.as_ref(),
+                QueryEncoding::F32,
+            ),
+        };
+        match (shader_kind, query_encoding) {
+            (GpuDotShaderKind::F16Arith, QueryEncoding::F16Packed) => {
+                self.stats
+                    .f16_arith_dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            _ if f16_available && forced_dot_shader.is_none() => {
+                // f16 算術版パイプラインは使えたが（`f16_available`）、
+                // 自動選択（`forced_dot_shader` 非指定）でオーバーフロー
+                // ガードが unpack 版を選んだ（Issue #539 のガード観測点。
+                // テスト専用の強制 `Unpack` は数えない）。
+                self.stats
+                    .f16_arith_guard_fallbacks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {}
+        }
+
         let target = DotDispatchTarget {
-            pipeline: &ctx.pipeline,
-            topk_pipeline: ctx.topk_pipeline.as_ref(),
+            pipeline,
+            topk_pipeline,
             row_buffer: &self.row_buffer,
             bind_group_layout: self.bind_group_layout_ref(ctx),
             row_stride: dim_half as u32,
+            query_encoding,
         };
 
         run_tiled_batch_search(
@@ -1533,17 +2067,25 @@ impl GpuBatchBackend {
             queries,
             options.budget_bytes,
             options.force_full_readback,
+            options.dot_shader,
         )
     }
 }
 
 /// [`GpuBatchBackend::batch_search_with_options_for_tests`] へ渡すオプション
-/// （`bench-internals` feature 限定。Issue #536）。
+/// （`bench-internals` feature 限定。Issue #536・#539）。
 #[cfg(feature = "bench-internals")]
 #[derive(Debug, Clone, Copy)]
 pub struct GpuSearchTestOptions {
     pub budget_bytes: usize,
     pub force_full_readback: bool,
+    /// S0 シェーダ選択（[`select_dot_shader`]）の強制オーバーライド
+    /// （Issue #539）。`None` は既定の自動選択。`Some(Unpack)` は常に
+    /// unpack 版を強制する。`Some(F16Arith)` は f16 算術版が利用不能
+    /// （未対応アダプタ・パイプライン生成失敗）またはオーバーフロー
+    /// ガード不成立の場合 `Err(KernelLaunchFailed)` を返し、黙って
+    /// unpack 版へ縮退しない（fail-closed 分岐の検証用）。
+    pub dot_shader: Option<GpuDotShaderKind>,
 }
 
 impl BatchBackend for GpuBatchBackend {
@@ -2038,6 +2580,9 @@ impl GpuF32ContrastBackend {
             row_buffer: &self.row_buffer,
             bind_group_layout: &ctx.bind_group_layout,
             row_stride,
+            // CORE-16 対照経路は Issue #539（f16 算術版）の対象外。常に f32
+            // 常駐のまま比較する契約を保つため `QueryEncoding::F32` 固定。
+            query_encoding: QueryEncoding::F32,
         };
 
         run_tiled_batch_search(
@@ -2252,6 +2797,12 @@ struct DotDispatchTarget<'a> {
     /// `row_buffer` の 1 行あたりの要素数（f16: `dim.div_ceil(2)` 個の u32
     /// パック要素、f32: `dim` 個の f32 要素）。
     row_stride: u32,
+    /// クエリバッファのホスト側エンコーディング（Issue #539）。`F16Packed`
+    /// は `pipeline`/`topk_pipeline` が f16 算術版であることを前提にした
+    /// 呼び出し元契約で、`dispatch_dot_products`/`dispatch_partial_topk` は
+    /// この値に従って `queries_concat`（常に f32 論理値）を
+    /// [`encode_query_bytes`] でバイト列化する。
+    query_encoding: QueryEncoding,
 }
 
 /// 1 クエリ × `row_indices` 分の内積を GPU で計算し、readback した `f32` 列を返す。
@@ -2311,7 +2862,7 @@ fn dispatch_dot_products(
     // scope の内側へ入れる必要はそもそもない）。
     let params_bytes = params.to_ne_bytes_vec()?;
     let row_ids_bytes = bytes_of_u32_slice(row_indices)?;
-    let query_bytes = bytes_of_f32_slice(queries_concat)?;
+    let query_bytes = encode_query_bytes(queries_concat, target.query_encoding)?;
 
     // バッファ・bind group の生成もすべて error scope の内側で行う
     // （codex/Bugbot P1 指摘対応: 以前は encoder 直前で push していたため、
@@ -2600,7 +3151,7 @@ fn dispatch_partial_topk(
 
     let params_bytes = params.to_ne_bytes_vec()?;
     let row_ids_bytes = bytes_of_u32_slice(row_indices)?;
-    let query_bytes = bytes_of_f32_slice(queries_concat)?;
+    let query_bytes = encode_query_bytes(queries_concat, target.query_encoding)?;
 
     let out_count = (num_workgroups)
         .saturating_mul(query_count as u64)
@@ -2747,6 +3298,185 @@ mod tests {
             DOT_SHADER_F32_WGSL.contains(&expected),
             "f32 contrast shader must declare {expected}"
         );
+    }
+
+    // --- Issue #539: SHADER_F16 対応アダプタでの f16 算術版シェーダ選択 ---
+
+    #[test]
+    fn dot_shader_f16_arith_wgsl_declares_enable_first_and_matches_host_constants() {
+        // `enable f16;` は WGSL の仕様上、他のすべての module-scope 宣言に
+        // 先行しなければならない（naga 30.0.1 は違反を validation エラーに
+        // する）。先頭付近にあることを固定する。
+        let enable_pos = DOT_SHADER_F16_ARITH_WGSL
+            .find("enable f16;")
+            .expect("f16 arith shader must declare enable f16;");
+        let struct_pos = DOT_SHADER_F16_ARITH_WGSL
+            .find("struct Params")
+            .expect("f16 arith shader must declare struct Params");
+        assert!(
+            enable_pos < struct_pos,
+            "enable f16; must precede other module-scope declarations"
+        );
+
+        let tile_max = format!("const QUERY_TILE_MAX: u32 = {GPU_QUERY_TILE_MAX}u;");
+        assert!(
+            DOT_SHADER_F16_ARITH_WGSL.contains(&tile_max),
+            "f16 arith shader must declare {tile_max}"
+        );
+        let acc_block = format!("const F16_ACC_BLOCK: u32 = {GPU_F16_ACC_BLOCK}u;");
+        assert!(
+            DOT_SHADER_F16_ARITH_WGSL.contains(&acc_block),
+            "f16 arith shader must declare {acc_block}"
+        );
+
+        // topk 版（`topk_dot_shader!` 経由）も同一の prelude 定数を共有する
+        // ことを固定する（S0 の演算順一致契約の一部）。
+        assert!(
+            DOT_SHADER_TOPK_F16_ARITH_WGSL.contains("enable f16;"),
+            "f16 arith topk shader must declare enable f16;"
+        );
+        assert!(
+            DOT_SHADER_TOPK_F16_ARITH_WGSL.contains(&acc_block),
+            "f16 arith topk shader must declare {acc_block}"
+        );
+        let enable_pos_topk = DOT_SHADER_TOPK_F16_ARITH_WGSL
+            .find("enable f16;")
+            .expect("f16 arith topk shader must declare enable f16;");
+        let struct_pos_topk = DOT_SHADER_TOPK_F16_ARITH_WGSL
+            .find("struct TopKParams")
+            .expect("f16 arith topk shader must declare struct TopKParams");
+        assert!(
+            enable_pos_topk < struct_pos_topk,
+            "enable f16; must precede other module-scope declarations in the topk shader too"
+        );
+    }
+
+    #[test]
+    fn dot_shader_topk_unpack_and_f32_variants_do_not_declare_enable_f16() {
+        // 既存 2 呼び出し（unpack・f32 対照）はマクロの `$prelude` 引数化後も
+        // 挙動不変であることの回帰: `enable f16;` を宣言しない
+        // （feature 非対応デバイスでもコンパイル可能なままであることの固定）。
+        assert!(!DOT_SHADER_TOPK_WGSL.contains("enable f16;"));
+        assert!(!DOT_SHADER_TOPK_F32_WGSL.contains("enable f16;"));
+    }
+
+    #[test]
+    fn select_dot_shader_requires_f16_available() {
+        assert_eq!(select_dot_shader(false, 1.0, 1.0), GpuDotShaderKind::Unpack);
+    }
+
+    #[test]
+    fn select_dot_shader_rejects_non_finite_inputs() {
+        assert_eq!(
+            select_dot_shader(true, f32::INFINITY, 1.0),
+            GpuDotShaderKind::Unpack
+        );
+        assert_eq!(
+            select_dot_shader(true, 1.0, f32::NAN),
+            GpuDotShaderKind::Unpack
+        );
+    }
+
+    #[test]
+    fn select_dot_shader_rejects_query_amplitude_above_f16_max_independently_of_row_max_abs() {
+        // advisor 指摘（点 4）: `query_max_abs` が f16 の有限最大値を超える
+        // 場合、`row_max_abs` が 0（全成分 0 の行）であっても採用してはならない
+        // （0 * ±Inf は f16 でも f32 でも NaN になり一見一致するように見えるが、
+        // クエリ成分が f16 パック時に飽和する分岐そのものを閉じるための独立
+        // ガード）。
+        assert_eq!(
+            select_dot_shader(true, 0.0, F16_MAX_FINITE + 1.0),
+            GpuDotShaderKind::Unpack
+        );
+    }
+
+    #[test]
+    fn select_dot_shader_rejects_partial_sum_overflow_bound() {
+        // row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK が上限を超える。
+        let over = (F16_ARITH_PARTIAL_SUM_LIMIT / (GPU_F16_ACC_BLOCK as f32)) + 1.0;
+        assert_eq!(select_dot_shader(true, over, 1.0), GpuDotShaderKind::Unpack);
+    }
+
+    #[test]
+    fn select_dot_shader_accepts_when_all_guards_pass() {
+        let per_side = ((F16_ARITH_PARTIAL_SUM_LIMIT / (GPU_F16_ACC_BLOCK as f32)) - 1.0).sqrt();
+        assert_eq!(
+            select_dot_shader(true, per_side, per_side),
+            GpuDotShaderKind::F16Arith
+        );
+    }
+
+    #[test]
+    fn select_dot_shader_accepts_boundary_value_exactly_at_limit() {
+        // `<=` 判定であることを固定する（境界値ちょうどは受理）。
+        let exact = F16_ARITH_PARTIAL_SUM_LIMIT / (GPU_F16_ACC_BLOCK as f32);
+        assert_eq!(
+            select_dot_shader(true, exact, 1.0),
+            GpuDotShaderKind::F16Arith
+        );
+    }
+
+    #[test]
+    fn encode_query_bytes_f32_matches_bytes_of_f32_slice() {
+        let values = [1.0f32, -2.5, 0.0, 3.25];
+        assert_eq!(
+            encode_query_bytes(&values, QueryEncoding::F32).expect("f32 encode must not fail"),
+            bytes_of_f32_slice(&values).expect("bytes_of_f32_slice must not fail")
+        );
+    }
+
+    #[test]
+    fn encode_query_bytes_f16_packed_round_trips_through_pack_f16x2() {
+        let values = [1.0f32, -2.0, 0.5, 4.0];
+        let encoded = encode_query_bytes(&values, QueryEncoding::F16Packed)
+            .expect("f16 packed encode must not fail");
+        // 4 要素 → 2 個の u32（各 4 byte）= 8 byte。
+        assert_eq!(encoded.len(), 8);
+        let mut roundtrip = Vec::new();
+        for chunk in encoded.chunks_exact(4) {
+            let bytes: [u8; 4] = chunk.try_into().expect("chunk must be 4 bytes");
+            let word = u32::from_ne_bytes(bytes);
+            let (a, b) = crate::batch_search::unpack_f16x2(word);
+            roundtrip.push(a);
+            roundtrip.push(b);
+        }
+        assert_eq!(roundtrip, values);
+    }
+
+    #[test]
+    fn encode_query_bytes_f16_packed_rejects_odd_length() {
+        let values = [1.0f32, 2.0, 3.0];
+        assert!(encode_query_bytes(&values, QueryEncoding::F16Packed).is_err());
+    }
+
+    #[test]
+    fn max_abs_finite_from_packed_ignores_non_finite_components() {
+        let packed = vec![
+            crate::batch_search::pack_f16x2(3.0, -5.0),
+            crate::batch_search::pack_f16x2(f32::INFINITY, 1.0),
+        ];
+        // 3.0 と 5.0（絶対値）が有限成分の最大。Inf は除外される。
+        assert_eq!(max_abs_finite_from_packed(&packed), 5.0);
+    }
+
+    #[test]
+    fn max_abs_finite_from_queries_ignores_non_finite_components() {
+        let query_a = [1.0f32, -7.0];
+        let query_b = [f32::NAN, 2.0];
+        let c = PolicyContext::new("tenant-a").expect("valid tenant id");
+        let queries = [
+            BatchQuery {
+                vector: &query_a,
+                k: 1,
+                ctx: &c,
+            },
+            BatchQuery {
+                vector: &query_b,
+                k: 1,
+                ctx: &c,
+            },
+        ];
+        assert_eq!(max_abs_finite_from_queries(&queries), 7.0);
     }
 
     #[test]
