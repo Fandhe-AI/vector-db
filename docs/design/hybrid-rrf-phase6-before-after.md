@@ -415,14 +415,48 @@ codex-review P1 指摘対応で `benchmark-judgement-policy.md` §3〔per-run �
 （ノイズ帯内）。
 
 参考として、本セクションの他フェーズでも p95 は同様に大きく振れる
-（例: `bulk_knn_k200` の median 比は A 8,577µs→C 15,711µs で約 1.83 倍、
-`bulk_knn_k1000` は約 1.74 倍）。これらは #546・#549 が変更していない経路
-（広域取得フェーズ）でも同程度以上に生じており、本開発環境の共有 QEMU
-特性による裾のノイズであって `hybrid_rrf` 固有の退行シグナルではないと
-判断する（`docs/design/benchmark-judgement-policy.md` §5 が示すとおり、
-共有環境の絶対値・比率は本来 Accepted/Rejected の根拠にしない）。全 16
-フェーズの p95 詳細表は本書の範囲外とし、`hybrid_rrf` と参照区間のみを
-記録する。
+（PR #575 codex-review P1 指摘対応で生データを追記し `benchmark-judgement-
+policy.md` §4・§5 の判定式に照らして再評価する。旧版は生データを示さないまま
+「ノイズ」と断定していたが、下記のとおり §4 の 2 種のノイズ帯（固定 ±5%・
+参照区間の実測帯）のうち実測帯についても、これらのフェーズは超過するため
+その断定は誤りだった）。
+
+**各 pair の p95 生データ（µs、pair1..5。`scripts/crossdb_bench/run.py` の
+JSON 出力 `phases.<phase>.p95_us` から取得）**:
+
+| phase | A | C |
+| --- | --- | --- |
+| bulk_knn_k200 | [8577, 8396, 9316, 8542, 44847] | [20444, 21314, 8336, 10204, 15711] |
+| bulk_knn_k1000 | [13247, 14391, 14384, 13697, 30873] | [25058, 28597, 13181, 12475, 27986] |
+
+| 指標 | A min-of-5 | C min-of-5 | ratio(min) | A median-of-5 | C median-of-5 | ratio(median) |
+| --- | --- | --- | --- | --- | --- | --- |
+| bulk_knn_k200 p95 | 8396 | 8336 | 0.993 | 8577 | 15711 | 1.831 |
+| bulk_knn_k1000 p95 | 13247 | 12475 | 0.942 | 14384 | 25058 | 1.742 |
+
+`benchmark-judgement-policy.md` §4 の判定式に照らすと、min-of-5 の比
+（0.993・0.942）は固定 ±5% 帯・参照区間の p95 実測帯（vector_knn
+A=59.3%・C=56.9%。本節冒頭）のいずれも超えず、悪化の根拠にならない。
+一方 median-of-5 の比（1.831・1.742）は固定 ±5% 帯はもちろん、`vector_knn`
+の p95 実測帯（57〜59%）そのものも大きく上回る（`|1.831-1.0|=83.1%`・
+`|1.742-1.0|=74.2%` はいずれも `reference_band` 57〜59% を超過）。§4 は
+「両ノイズ帯を超えた差分のみ判定に効かせる」規約であり、実測帯を超えた
+差分を「参照区間より広いノイズ」と再解釈してさらに大きな幅を許容してよい
+根拠にはならない。そのため旧版の「共有 QEMU 環境のノイズであって退行
+シグナルではない」という断定は §4・§5 の判定基準と整合しておらず撤回する。
+
+この median-of-5 の乖離の原因は本書の計測だけでは特定できない
+（原因未確定）。5 pair 中 C は 3 pair（20444・21314・15711）が高く 2 pair
+（8336・10204）が低い一方、A は pair5（44847・30873）の単一外れ値を除けば
+残り 4 pair が近接しており、単純な「A のみ一過性スパイク」という本節冒頭の
+説明はこの 2 フェーズには当てはまらない。`bulk_knn_k200`／`bulk_knn_k1000`
+は #546・#549 が変更していない経路（広域取得フェーズ）であり production
+変更の対象外だが、この観測自体を「本開発環境の共有 QEMU ノイズの実測例」
+として §7 の非退行結論の裏付けに使うことはしない（原因未確定のまま
+`hybrid_rrf` 側の結論を補強する証拠にはできないため）。原因の切り分けは
+本書のスコープ外とし、必要であれば別 Issue で扱う。全 16 フェーズの p95
+詳細表は本書の範囲外とし、`hybrid_rrf`・参照区間（`vector_knn`）・本節の
+`bulk_knn_k200`／`bulk_knn_k1000` のみを記録する。
 
 ## 6. Recall 3 ゲート層 B（`RECALL_ENGINE=brute_force`／`hnsw` × A／C）
 
@@ -490,10 +524,19 @@ rerank_recall --test query_planning_recall --test sparse_determinism`。状態 C
   整合）。p95（比 1.055〜1.094）も参照区間の p95 ノイズ帯（57〜59%）を
   大きく下回り、裾の悪化を示す根拠にはならない（PR #575 codex-review P2
   指摘対応で追加確認。§5）
-- 一貫した悪化（両ノイズ帯を超える）は p50・p95 いずれでも観測されなかった
-  （§5 の A pair5 外れ値は前半 12 フェーズに偏ったスパイクであり〔後半 4
-  フェーズはむしろ最小値〕、対象区間固有の退行ではない。原因は共有環境側の
-  一過性要因という未検証の仮説にとどまる）。差し戻し候補には該当しない
+- `hybrid_rrf`（対象区間）・`vector_knn`（参照区間）に限れば、一貫した悪化
+  （両ノイズ帯を超える）は p50・p95 いずれでも観測されなかった（§5 の A
+  pair5 外れ値は前半 12 フェーズに偏ったスパイクであり〔後半 4 フェーズは
+  むしろ最小値〕、対象区間固有の退行ではない。原因は共有環境側の一過性要因
+  という未検証の仮説にとどまる）。この範囲では差し戻し候補には該当しない
+- 本結論は `hybrid_rrf`・`vector_knn` の範囲に限定する。§5 で追加確認した
+  `bulk_knn_k200`／`bulk_knn_k1000`（#546・#549 の変更対象外フェーズ）は
+  p95 median-of-5 比が固定 ±5% 帯・`vector_knn` の参照区間実測帯（57〜59%）
+  の双方を超えており（PR #575 codex-review P1 指摘対応で§5 に生データを
+  追記・再評価）、この乖離は原因未確定のまま記録するにとどめ、「共有 QEMU
+  環境のノイズだから無視してよい」という判断の根拠には使わない。ただし
+  これらは production 変更〔#546・#549〕の対象経路ではないため、
+  `hybrid_rrf` 自体の非退行結論を覆すものではない
 
 ## 8. 限界・申し送り
 
@@ -567,14 +610,22 @@ done
 # `<dir-a>/scripts/crossdb_bench/run.py`・`<dir-c>/scripts/crossdb_bench/run.py`
 # （`git archive` で書き出した各ディレクトリ配下のコピー）を明示的に呼び分ける。
 # 共通 fixture は既存の `docs25k.redb`／`docs25k.jsonl`／`queries200.jsonl`（$S 配下）を再利用する。
+# --out-dir はループ内で固定すると common.write_result() が pair ごとに
+# 同じ self_exact.json を上書きし、pair 単位の生データ（p50/p95 raw 値）が
+# 失われて §5 の min-of-5／median-of-5 の事後再集計ができなくなる（PR #575
+# codex-review P2 指摘対応）。そのため pair 番号をディレクトリへ含め、
+# pair ごとに独立した出力先へ書き分ける。
 for n in 1 2 3 4 5; do
   python3 <dir-a>/scripts/crossdb_bench/run.py --db self --config exact \
     --rows-file "$S/docs25k.redb" --queries-file "$S/queries200.jsonl" \
-    --out-dir <dir-a>/results > crossdb-A-$n.log
+    --out-dir <dir-a>/results/pair-$n > crossdb-A-$n.log
   python3 <dir-c>/scripts/crossdb_bench/run.py --db self --config exact \
     --rows-file "$S/docs25k.redb" --queries-file "$S/queries200.jsonl" \
-    --out-dir <dir-c>/results > crossdb-C-$n.log
+    --out-dir <dir-c>/results/pair-$n > crossdb-C-$n.log
 done
+# 各 self_exact.json（<dir-a>/results/pair-1..5・<dir-c>/results/pair-1..5）の
+# phases.<phase>.p50_us／p95_us を pair1..5 で集計すれば §5 の min-of-5・
+# median-of-5（p50・p95 とも）を再現できる。
 
 # Recall 3 ゲート（プレースホルダ閾値・RECALL_VERBOSE=1・RECALL_ENGINE=brute_force|hnsw）
 # 比較対象コミット（<dir-a>=91f6a18・<dir-c>=c86c683）でそれぞれ選択するため、
