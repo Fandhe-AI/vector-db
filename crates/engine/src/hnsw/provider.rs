@@ -92,6 +92,15 @@ impl HnswSearchProvider {
         self.params.full_scan_ratio()
     }
 
+    /// 構築時に要求した索引ノードの常駐精度（Issue #514）。`full_scan_ratio`
+    /// と同じ理由（`ValidatedHnswParams` の private フィールド）で本 provider
+    /// 経由でのみ読み取れる。`sql::hnsw_cache::IndexedBase::build` が索引構築
+    /// 時にこの値を [`crate::hnsw::HnswIndex::build_parallel_with_precision`]
+    /// へ渡す。
+    pub fn resident_precision(&self) -> crate::hnsw::ResidentPrecision {
+        self.params.resident_precision()
+    }
+
     /// `k` 件の Top-k を得るために `HnswIndex::search` の `ef` 引数へ渡す値を返す
     /// （`self.params.ef_search.max(k).min(MAX_EF)`）。
     ///

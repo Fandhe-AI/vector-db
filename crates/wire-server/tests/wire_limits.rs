@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use wire_server::auth::{argon2id, UserStore};
-use wire_server::limits::ConnectionLimiter;
+use wire_server::limits::{ConnectionLimiter, MAX_CONNECTIONS};
 
 /// `UserStore::load_from_file` は Argon2id パラメータが `RECOMMENDED_PARAMS` と
 /// 完全一致するレコードのみを受理するため、フィクスチャも本番既定値を使う
@@ -376,4 +376,85 @@ fn wire6_concurrent_burst_never_exceeds_max() {
         limiter.active() <= MAX,
         "active permits must never exceed max"
     );
+}
+
+/// `limiter.active()` が `expected` に達するまでポーリングする。
+///
+/// accept ループは単一スレッドで listener を順に処理するため、`connect()`
+/// が返った時点では OS の backlog に滞留していて許可枠がまだ付与されて
+/// いないことがある。固定時間（例: 接続 1 本ごとに 50ms）を毎回スリープ
+/// して待つ方式は、本数に比例して累積待ち時間が伸び、共有 CI 環境の負荷
+/// 下では `READ_TIMEOUT`／アイドル期限に対して無視できない割合を占め
+/// うる（codex-review P2・Cursor Bugbot Medium 指摘）。ここでは短い間隔で
+/// 条件を再確認するポーリングに置き換え、実際に許可枠が付与された事実
+/// そのもので受理を確認する（読み取りタイムアウトの経過待ちに依存しない）。
+fn wait_for_active_permits(limiter: &ConnectionLimiter, expected: usize, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let active = limiter.active();
+        if active >= expected {
+            assert_eq!(active, expected, "active permits must not exceed expected");
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {expected} active permits, got {active}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// production 定数 `MAX_CONNECTIONS`（64）そのもので accept ループを通し、
+/// 65 本目が `'E'`／`53300` で拒否されること（Issue #482。既存の
+/// `wire6_concurrent_burst_never_exceeds_max` はパラメータ化した小さい上限
+/// （4）でのみ検証しており、production 定数そのものでの回帰は本テストが
+/// 初めて固定する）。
+///
+/// 64 本の接続受理確認は、接続 1 本ごとに固定待ち（50ms）を課す方式では
+/// なく `wait_for_active_permits` によるポーリングで行う（codex-review
+/// P2・Cursor Bugbot Medium 指摘対応: 逐次固定待ちは累積で数秒かかり、
+/// 共有環境の遅延が重なるとアイドル期限 5 秒に対し先頭接続から閉じられ
+/// 得るため）。
+#[test]
+fn wire6_production_max_connections_rejects_the_65th_connection() {
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let (addr, limiter) = spawn_server(&users_path, MAX_CONNECTIONS, Duration::from_secs(5));
+
+    let mut held: Vec<TcpStream> = Vec::with_capacity(MAX_CONNECTIONS);
+    for _ in 0..MAX_CONNECTIONS {
+        let stream = TcpStream::connect(addr).expect("connect within capacity");
+        held.push(stream);
+    }
+    // 許可枠が実際に `MAX_CONNECTIONS` 本付与された事実そのものが受理の
+    // 証拠であり（枠を超えて許可されることはない）、各接続を個別に
+    // アイドル状態か読み取りタイムアウトで確認する必要はない。
+    wait_for_active_permits(&limiter, MAX_CONNECTIONS, Duration::from_secs(5));
+
+    let mut extra = TcpStream::connect(addr).expect("connect the 65th");
+    let mut header = [0u8; 1];
+    extra.read_exact(&mut header).expect("read message type");
+    assert_eq!(
+        header[0], b'E',
+        "expected ErrorResponse for the 65th connection"
+    );
+    let mut len_buf = [0u8; 4];
+    extra.read_exact(&mut len_buf).expect("read length");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len - 4];
+    extra.read_exact(&mut body).expect("read body");
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains(wire_server::limits::SQLSTATE_TOO_MANY_CONNECTIONS),
+        "ErrorResponse must carry SQLSTATE 53300, got: {body_str:?}"
+    );
+    let mut trailing = [0u8; 1];
+    let n = extra.read(&mut trailing).unwrap_or(0);
+    assert_eq!(n, 0, "the 65th connection must be closed after rejection");
+
+    assert!(
+        limiter.active() <= MAX_CONNECTIONS,
+        "active permits must never exceed MAX_CONNECTIONS even after a rejection"
+    );
+
+    drop(held);
 }

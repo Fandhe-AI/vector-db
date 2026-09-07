@@ -274,25 +274,76 @@ fn search_range(
     k: usize,
 ) -> TopKSelector {
     let mut selector = TopKSelector::new(k);
-    for (idx, &id) in ids.iter().enumerate() {
-        let row = row_offset.saturating_add(idx);
+
+    // Issue #510（TASK-156・CORE-14）: 4 行単位でブロックカーネル
+    // （`kernel::dot_block4`）へディスパッチし、行間でクエリのロードを 1 回に
+    // 共有する。端数（4 の倍数に満たない末尾）とブロック内で 1 行でも
+    // `vectors` が不足する場合は、既存の 1 行ずつの経路（[`push_row`]）へ
+    // フォールバックする。選出（`TopKSelector`）はスコア・id の全順序で行うため
+    // push 順には依存せず、ブロック化しても結果集合・順序は 1 行版と変わらない。
+    let (blocks, remainder) = ids.as_chunks::<4>();
+    let mut base_row = row_offset;
+    for block_ids in blocks {
+        let row_slice = |offset: usize| -> Option<&[f32]> {
+            let row = base_row.saturating_add(offset);
+            let start = row.saturating_mul(dim);
+            let end = start.saturating_add(dim);
+            vectors.get(start..end)
+        };
+        let (r0, r1, r2, r3) = (row_slice(0), row_slice(1), row_slice(2), row_slice(3));
+        // `as_chunks::<4>()` の型契約上 `block_ids: &[u64; 4]` は常に長さ 4 のため
+        // 分解は infallible（`chunks_exact` 時代の到達不能フォールバックは不要）。
+        let [id0, id1, id2, id3] = *block_ids;
+
+        match (r0, r1, r2, r3) {
+            (Some(v0), Some(v1), Some(v2), Some(v3)) => {
+                let scores = crate::kernel::dot_block4([v0, v1, v2, v3], query);
+                let ids4 = [id0, id1, id2, id3];
+                for (id, score) in ids4.into_iter().zip(scores) {
+                    push_score(&mut selector, id, score);
+                }
+            }
+            _ => {
+                push_row(&mut selector, id0, r0, query);
+                push_row(&mut selector, id1, r1, query);
+                push_row(&mut selector, id2, r2, query);
+                push_row(&mut selector, id3, r3, query);
+            }
+        }
+        base_row = base_row.saturating_add(4);
+    }
+
+    for (offset, &id) in remainder.iter().enumerate() {
+        let row = base_row.saturating_add(offset);
         let start = row.saturating_mul(dim);
         let end = start.saturating_add(dim);
-        let Some(vector) = vectors.get(start..end) else {
-            // `kernel.rs::CpuScalarProvider::search` と同じ理由（アリーナ側の不変条件
-            // 破れに対して、破損した当該行だけを候補から除外する。呼び出し全体は
-            // `Ok` のまま。厳密な fail-closed ではない点は `kernel.rs` 側のコメント参照）。
-            continue;
-        };
-        let score = crate::kernel::dot(vector, query);
-        if !score.is_finite() {
-            // 格納ベクトルの NaN/Inf 混入に対する除外
-            // （`kernel.rs::CpuScalarProvider::search` と同じ理由）。
-            continue;
-        }
-        selector.push(CandidateHit { id, score });
+        push_row(&mut selector, id, vectors.get(start..end), query);
     }
+
     selector
+}
+
+/// [`search_range`] の 1 行分の候補投入（ブロック化のフォールバック経路・端数行の
+/// 双方が共有する）。`vector` が `None`（アリーナ側の不変条件破れ）・スコアが
+/// 非有限（NaN/Inf 混入）のいずれの場合も `kernel.rs::CpuScalarProvider::search` と
+/// 同じ理由で当該行だけを候補から除外する（呼び出し全体は継続。厳密な
+/// fail-closed ではない点は `kernel.rs` 側のコメント参照）。
+fn push_row(selector: &mut TopKSelector, id: u64, vector: Option<&[f32]>, query: &[f32]) {
+    let Some(vector) = vector else {
+        return;
+    };
+    push_score(selector, id, crate::kernel::dot(vector, query));
+}
+
+/// 計算済みスコア 1 件の投入（`dot_block4` 経路・[`push_row`] の双方が共有する
+/// 非有限値除外ロジック）。
+fn push_score(selector: &mut TopKSelector, id: u64, score: f32) {
+    if !score.is_finite() {
+        // 格納ベクトルの NaN/Inf 混入に対する除外
+        // （`kernel.rs::CpuScalarProvider::search` と同じ理由）。
+        return;
+    }
+    selector.push(CandidateHit { id, score });
 }
 
 #[cfg(test)]
@@ -456,6 +507,92 @@ mod tests {
                 score: 5.0
             }]
         );
+    }
+
+    #[test]
+    fn search_range_with_non_multiple_of_4_row_count_matches_scalar_reference() {
+        // Issue #510（TASK-156・CORE-14）の 4 行ブロックカーネル化の回帰: 行数が
+        // 4 の倍数でない（2 ブロック＋端数 1）場合でも `search_range`
+        // （`ParallelSearchProvider` が使う共通経路）の選出結果が
+        // `CpuScalarProvider`（1 行版参照実装）とビット単位で一致することを確認する。
+        use crate::kernel::CpuScalarProvider;
+
+        let dim = 6usize;
+        let n = 9usize; // chunks_exact(4) で 2 ブロック + 端数 1 行。
+        let mut ids = Vec::with_capacity(n);
+        let mut vectors = Vec::with_capacity(n * dim);
+        for i in 0..n {
+            ids.push(i as u64);
+            for d in 0..dim {
+                vectors.push(((i * dim + d) % 17) as f32 * 0.1 - 0.7);
+            }
+        }
+        let query: Vec<f32> = (0..dim).map(|d| (d as f32) * 0.13 - 0.4).collect();
+
+        let make_input = || SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: dim as u32,
+            query: &query,
+            k: 5,
+        };
+
+        let simd_hits = ParallelSearchProvider
+            .search(make_input())
+            .expect("simd ok");
+        let scalar_hits = CpuScalarProvider.search(make_input()).expect("scalar ok");
+        assert_eq!(
+            simd_hits, scalar_hits,
+            "n が 4 の倍数でない場合もブロック化経路と 1 行版参照実装の選出が一致すること"
+        );
+    }
+
+    #[test]
+    fn search_range_block_with_one_missing_row_only_skips_that_row() {
+        // 4 行ブロック内で末尾 1 行だけ `vectors` が不足する場合、ブロック全体
+        // ではなく当該行のみが選出対象から除外されること（`dot_block4_impl` の
+        // `uniform_len` 判定不成立 → per-row フォールバック経路が正しく機能する
+        // ことの直接検証。Issue #510。フラット配列の構造上「途中の行だけ欠落」は
+        // 表現できない——欠落は必ず末尾行から生じる——ため、
+        // `search_range_with_nonzero_offset_skips_only_the_row_straddling_the_vectors_boundary`
+        // と同じ「末尾行が範囲外」の構図を、4 行ブロックの内部で検証する）。
+        let dim = 2usize;
+        // 3 行分（0..3）のみ完全で、ブロック内 4 行目（行 3・id=13）はまるごと
+        // 範囲外（`vectors.len() == 6` は `4 * dim == 8` に対して 2 要素不足）。
+        let vectors = [
+            1.0f32, 0.0, // row 0 (id=10)
+            2.0, 0.0, // row 1 (id=11)
+            3.0, 0.0, // row 2 (id=12)
+        ];
+        let query = [1.0f32, 0.0];
+        let ids = [10u64, 11, 12, 13];
+
+        let selector = search_range(&ids, &vectors, 0, dim, &query, 10);
+        let hits = selector.into_sorted_vec();
+
+        // row 3（id=13）だけが `vectors.get(6..8)` の範囲外で除外され、他 3 行は
+        // 通常どおり選出される。
+        assert_eq!(
+            hits,
+            vec![
+                CandidateHit { id: 12, score: 3.0 },
+                CandidateHit { id: 11, score: 2.0 },
+                CandidateHit { id: 10, score: 1.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn search_range_with_dim_zero_and_k_zero_does_not_panic() {
+        // Issue #510: 4 行ブロックカーネル化後も `dim == 0`／`k == 0` で panic せず
+        // 空集合を返すこと（`as_chunks::<8>()` 等のブロックカーネル内部が dim=0 の
+        // 空スライスを問題なく扱えることの回帰）。
+        let ids = [1u64, 2, 3, 4, 5];
+        let vectors: [f32; 0] = [];
+        let query: [f32; 0] = [];
+
+        let selector = search_range(&ids, &vectors, 0, 0, &query, 0);
+        assert!(selector.into_sorted_vec().is_empty());
     }
 
     #[test]

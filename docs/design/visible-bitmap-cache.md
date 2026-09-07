@@ -69,6 +69,9 @@ TABLE-12 検査を実施済みの走査に相乗りするだけなので、追�
 
 ## 検証
 
+対照 DB 方式による非漏えいの追加検証・前後比較実測は Issue #479・
+`docs/design/visible-bitmap-cache-verification.md` を参照。
+
 `crates/engine/tests/sql_visible_cache.rs`:
 
 1. 受け入れ条件 (a): 同一テーブル世代内の 2 回目以降は `misses` を増やさず

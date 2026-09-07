@@ -32,7 +32,7 @@
 //! 判断がなされた場合、差し替え箇所は本モジュールの 2 関数に閉じている。
 use std::hint::black_box;
 
-use super::{node_vector, VisitedSet};
+use super::{node_vector, node_vector_u16, NodeSource, VisitedSet};
 
 /// `node` のベクトル先頭 1 キャッシュラインぶんを早期に load する。
 /// hnswlib／faiss も同様に先頭ラインのみを prefetch し、以降はハードウェアの
@@ -41,6 +41,17 @@ use super::{node_vector, VisitedSet};
 /// coding-rust.md の untrusted 添字アクセス禁止に倣い `[]` は使わない）。
 pub(super) fn touch_node_vector(vectors: &[f32], dim: usize, node: u32) {
     if let Ok(v) = node_vector(vectors, dim, node) {
+        if let Some(first) = v.first() {
+            black_box(*first);
+        }
+    }
+}
+
+/// [`touch_node_vector`] の f16 常駐版（Issue #514。`NodeVectors::F16` の
+/// 索引専用）。ビット表現（`u16`）のまま先頭 1 要素を触れるだけで足り、f32 への
+/// 復号は行わない（best-effort の早期 load のため復号コストを払う必要がない）。
+pub(super) fn touch_node_vector_u16(vectors: &[u16], dim: usize, node: u32) {
+    if let Ok(v) = node_vector_u16(vectors, dim, node) {
         if let Some(first) = v.first() {
             black_box(*first);
         }
@@ -64,8 +75,17 @@ pub(super) fn touch_word<T: Copy>(slot: Option<&T>) {
 pub(super) trait PrefetchPolicy {
     /// `node` を受理判定通過後に先読みする。`visited` は範囲外 `id` を
     /// `None` で返す `VisitedSet` 経由の値を想定し、本トレイトはその結果を
-    /// そのまま `touch_word` へ渡すのみで受理判定は行わない。
-    fn prefetch_neighbor<V: VisitedSet>(&self, node: u32, visited: &V, vectors: &[f32], dim: usize);
+    /// そのまま `touch_word` へ渡すのみで受理判定は行わない。`vectors` は
+    /// [`NodeSource`] 境界で一般化（Issue #514）し、構築経路（`&[f32]`）・
+    /// 探索経路（`NodeVectors`。f32／f16 常駐いずれか）の双方から同じ
+    /// `search_layer_in` 経由で呼べるようにする。
+    fn prefetch_neighbor<V: VisitedSet, S: NodeSource + ?Sized>(
+        &self,
+        node: u32,
+        visited: &V,
+        vectors: &S,
+        dim: usize,
+    );
 }
 
 /// 唯一の production 実装（ZST）。`&P` は単相化されるためコストはゼロ。
@@ -73,14 +93,14 @@ pub(super) trait PrefetchPolicy {
 pub(super) struct PipelinePrefetch;
 
 impl PrefetchPolicy for PipelinePrefetch {
-    fn prefetch_neighbor<V: VisitedSet>(
+    fn prefetch_neighbor<V: VisitedSet, S: NodeSource + ?Sized>(
         &self,
         node: u32,
         visited: &V,
-        vectors: &[f32],
+        vectors: &S,
         dim: usize,
     ) {
         visited.prefetch_slot(node as usize);
-        touch_node_vector(vectors, dim, node);
+        vectors.touch_prefetch(dim, node);
     }
 }

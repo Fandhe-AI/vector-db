@@ -76,12 +76,16 @@
 //! `unwrap`／`expect`／`[]` を使わない。`unsafe` は使わない。環境変数・feature flag
 //! による経路上書きは設けない（CORE-12 踏襲）。
 
-use std::collections::{BinaryHeap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
 use crate::kernel::dot;
 
+/// 凍結済みグラフの CSR（Compressed Sparse Row）表現（Issue #494）。
+/// [`HnswIndex`] は構築完了後、可変長ビルダー表現（[`GraphBuilder`]）を
+/// この表現へ 1 回だけ平坦化する（[`HnswIndex::freeze_from`] 参照）。
+mod csr;
 mod parallel_build;
 /// `search_layer` の隣接ループへ挿入する受理判定後 prefetch（Issue #490）。
 /// `pub(super)` 限定で本モジュール外へは公開しない。
@@ -119,6 +123,13 @@ pub const SEQUENTIAL_PREFIX_NODES: usize = 256;
 /// [`HnswIndex::build_parallel`] が決める並列度もこの上限でクランプされる）。
 pub const MAX_BUILD_THREADS: usize = 16;
 
+/// `repair_reachability`（フェーズ 1）の反復回数の絶対上限。意図的に
+/// `member_count`／`n` に比例させない（比例させると入力規模に応じて
+/// 計算量 DoS を招く。`repair_reachability_inner` のドキュメンテーション
+/// コメント参照）。Issue #447 でベンチ・テストから参照できるようモジュール
+/// レベルへ昇格した（元は関数ローカル定数。値・用途は不変）。
+pub const PRECISE_REPAIR_CAP: usize = 64;
+
 /// [`HnswIndex::build_with_threads_observed`] が返す並列構築の段別プロファイル
 /// （Issue #406 追記: 8→12 スレッド頭打ち要因の切り分け計測）。
 ///
@@ -146,11 +157,68 @@ pub struct HnswBuildProfile {
     /// 全ノード挿入後の到達性修復パス（単一スレッド。モジュール内
     /// `repair_reachability` のドキュメンテーションコメント参照）。
     pub repair_reachability: std::time::Duration,
+    /// 可変長ビルダー表現（[`GraphBuilder`]）から CSR（[`csr::CsrGraph`]）へ
+    /// 平坦化する段（Issue #494。`freeze`・`repair_reachability` の両方が
+    /// 完了した後の最終段。`build`（逐次）の縮退経路ではこの区切りが
+    /// 存在しないため `sequential_prefix` へ全量を積み、本フィールドは
+    /// `Duration::ZERO` のままにする——[`HnswIndex::build_with_threads_observed`]
+    /// の縮退経路ドキュメンテーションコメント参照）。
+    pub flatten: std::time::Duration,
     /// `build_with_threads_observed` 呼び出し全体の壁時間（上記各段の合計
     /// より長くなり得る——検証・エラー分岐等の測定対象外区間を含むため）。
     pub total: std::time::Duration,
     /// 並列フェーズの各ワーカースレッドの観測値。縮退経路では空。
     pub workers: Vec<HnswWorkerStats>,
+    /// `repair_reachability` 内訳統計（Issue #447 追記: 修復対象ノード数・
+    /// 反復回数の観測フック。`repair_reachability` フィールド（壁時間の
+    /// みの既存フィールド）とは独立に、層ごとの到達不能ノード数・フェーズ 1
+    /// 反復回数・フェーズ 2 結線数を観測する。`threads==1`／`n<=
+    /// SEQUENTIAL_PREFIX_NODES` の縮退経路でも本フィールドのみ埋まる
+    /// （`build_with_threads_observed` のドキュメンテーションコメント参照。
+    /// 他の既存フィールドの意味・値は不変）。`.claude/rules/
+    /// spec-confidentiality.md` オーナー判断範囲・数値基準/実測値は公開可）。
+    pub repair: HnswRepairStats,
+}
+
+/// 層ごとの `repair_reachability` 統計（Issue #447）。`repair_reachability_inner`
+/// の観測版（`OBSERVE=true`）のみが埋める。非観測経路（`build`・
+/// `build_with_threads`・`parallel_build::freeze`）は本構造体を生成しない
+/// （観測コストを一切乗せない設計。下記 `repair_reachability_inner` 参照）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HnswRepairLevelStats {
+    /// 対象層番号（0 始まり）。
+    pub level: usize,
+    /// 当該層のフェーズ 1 開始時点で entry から到達不能だったノード数
+    /// （フェーズ 1 の最初の反復の BFS 結果をそのまま数え上げる。追加の
+    /// BFS は行わない）。
+    pub unreachable_before: u64,
+    /// フェーズ 1 で実際に未到達ノードを見つけて結線した反復回数
+    /// （上限 [`PRECISE_REPAIR_CAP`]）。
+    pub phase1_iterations: u64,
+    /// フェーズ 1 が [`PRECISE_REPAIR_CAP`] 回まで完走した（＝反復回数の
+    /// 絶対上限に到達した）か。
+    pub phase1_cap_hit: bool,
+    /// フェーズ 2 でチェーン結線した残存ノード数（`remaining.len()`）。
+    pub phase2_nodes: u64,
+    /// フェーズ 2 で entry の `shrink_links` により犠牲になったリンクを
+    /// 再結線した件数（0 または 1）。
+    pub phase2_entry_relinked: u64,
+    /// フェーズ 1（BFS＋厳密修復ループ）の壁時間。
+    pub phase1_wall: std::time::Duration,
+    /// フェーズ 2（チェーン結線）の壁時間。
+    pub phase2_wall: std::time::Duration,
+}
+
+/// `repair_reachability` 呼び出し全体の統計（Issue #447）。
+#[derive(Debug, Clone, Default)]
+pub struct HnswRepairStats {
+    /// 層 `0..=max_level` の順（`levels.len() == max_level + 1`。エントリ
+    /// 不在時は空のまま）。
+    pub levels: Vec<HnswRepairLevelStats>,
+    /// 観測版 `repair_reachability_inner::<true>` 本体の壁時間（各層の
+    /// フェーズ wall の総和以上・呼び出し元の外側計測
+    /// （`HnswBuildProfile::repair_reachability`）以下になる入れ子区間）。
+    pub wall: std::time::Duration,
 }
 
 /// 並列構築フェーズにおける 1 ワーカースレッドの観測値（Issue #406 追記）。
@@ -179,6 +247,13 @@ pub struct HnswWorkerStats {
     /// このワーカーが `try_promote_entry` で実際にエントリポイントを
     /// 更新した回数。
     pub entry_promotions: u64,
+    /// このワーカーが `plan_links` の層探索で退化した候補集合
+    /// （`candidates.len() <= 1`）を観測した回数（Issue #448 追記。
+    /// `parallel_build.rs::DEGENERATE_LAYER_SEARCHES` 参照）。
+    pub degenerate_layer_searches: u64,
+    /// このワーカーが `ensure_reverse_link` で実際に再結線を行った回数
+    /// （Issue #448 追記。`parallel_build.rs::REVERSE_LINK_RECONNECTS` 参照）。
+    pub reverse_link_reconnects: u64,
 }
 
 /// 整数比（`u32/u32`）。`f32` は `HnswParams` の `Copy + PartialEq + Eq` derive と
@@ -313,6 +388,38 @@ impl HnswParams {
 pub struct ValidatedHnswParams {
     params: HnswParams,
     full_scan_ratio: Ratio,
+    resident_precision: ResidentPrecision,
+}
+
+/// HNSW 索引ノードの常駐ベクトル表現（Issue #514・親 #513。ポインタ:
+/// TASK-132・TASK-156・CORE-16）。
+///
+/// `F16` は `SearchEngineKind::Hnsw` opt-in 経路限定の追加 opt-in
+/// （[`ValidatedHnswParams::with_resident_precision`]）であり、既定は `F32`
+/// （既存の全動作を不変に保つ）。`docs/design/simd-intrinsics-adoption.md`
+/// 決定 5 のとおり、索引ヒットの最終スコアは常に `kernel::dot`（f32・
+/// アリーナ再計算）を経由するため、この選択は候補生成段の常駐表現のみに影響する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResidentPrecision {
+    /// f32 常駐（既定。既存の全経路と挙動不変）。
+    #[default]
+    F32,
+    /// f16（IEEE 754 binary16）常駐。`isa::F16Kernel::dot_f16` による昇格
+    /// dot で候補生成スコアを計算する。1 成分でも f16 の有限範囲
+    /// （`|x| <= 65504.0`）を超える場合は凍結時に `F32` へ自動縮退する
+    /// （`HnswIndex::resident_precision` が実効値を返す）。
+    F16,
+}
+
+impl fmt::Display for ResidentPrecision {
+    /// `EXPLAIN` の `hnsw_params: resident=<value>`（Issue #514・R5）が使う
+    /// 閉じた語彙表記。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResidentPrecision::F32 => write!(f, "f32"),
+            ResidentPrecision::F16 => write!(f, "f16"),
+        }
+    }
 }
 
 /// [`ValidatedHnswParams`] の `full_scan_ratio` 既定値（1/10。Issue #409）。
@@ -330,7 +437,23 @@ impl ValidatedHnswParams {
         Ok(Self {
             params,
             full_scan_ratio: DEFAULT_FULL_SCAN_RATIO,
+            resident_precision: ResidentPrecision::F32,
         })
+    }
+
+    /// 索引ノードの常駐精度（[`ResidentPrecision`]）を返す（構築時に指定した
+    /// 静的設定値。凍結時の自動縮退による実効値は [`HnswIndex::resident_precision`]
+    /// を参照する）。
+    pub fn resident_precision(&self) -> ResidentPrecision {
+        self.resident_precision
+    }
+
+    /// `resident_precision` だけを差し替えたコピーを返す（Issue #514・opt-in。
+    /// 検証を要さないためシグネチャは [`Result`] を返さない
+    /// `with_full_scan_ratio` とは異なる）。
+    pub fn with_resident_precision(mut self, precision: ResidentPrecision) -> Self {
+        self.resident_precision = precision;
+        self
     }
 
     /// 検証済みの内部値を返す（`m`／`ef_construction`／`ef_search` フィールドへの
@@ -557,6 +680,60 @@ struct Node {
     links: Vec<Vec<u32>>,
 }
 
+/// [`search_layer_in`]（旧 `search_layer_with` の本体。#405・#494）が構築中
+/// （[`GraphBuilder`]）・凍結後（[`csr::CsrGraph`]）のどちらの隣接表現にも
+/// 依存せず動作できるようにする最小インターフェース（Issue #494・
+/// `docs/design/hnsw-index.md` §14.4）。両実装とも [`Node::level`] を反映した
+/// `level_of`・当該レベルの隣接スライスを返す `neighbors`（`level >
+/// level_of(node)` またはノード範囲外は `None`）・現在のノード総数を返す
+/// `node_count` を持つ。
+pub(crate) trait Adjacency {
+    /// ノード `node` が割り当てられたレベル。存在しないノードは `None`。
+    fn level_of(&self, node: u32) -> Option<usize>;
+    /// 層 `level` におけるノード `node` の隣接リスト。存在しない層・ノードは
+    /// `None`（ノードのレベルが `level` 未満の場合を含む）。
+    fn neighbors(&self, level: usize, node: u32) -> Option<&[u32]>;
+    /// 現在のノード総数。
+    fn node_count(&self) -> usize;
+}
+
+/// 構築中の可変長グラフ表現（Issue #494 で [`HnswIndex`] から分離。
+/// `docs/design/hnsw-index.md` §14.2 の「2 相構成」の前半を担う）。
+///
+/// 並列構築（[`parallel_build`]）と凍結後の [`HnswIndex::repair_reachability`]
+/// 相当の修復パスは `connect`／`shrink_links` による可変長 in-place 更新を
+/// 要するため、構築中は本表現（ノードごとに個別確保した `Vec<Vec<u32>>`）を
+/// 維持し、全ノード挿入・修復が完了した時点で 1 回だけ [`csr::CsrGraph`] へ
+/// 平坦化する（[`HnswIndex::freeze_from`] 参照。平坦化は必ず最終段——
+/// #449 系の修復並列化がこの構造へ追加の書き込みを差し込む場合も、
+/// 本表現に対して行い、平坦化後の `CsrGraph` へは書き込まない契約とする）。
+///
+/// `vectors`（row-major バッファ）は保持しない——構築中の各メソッドは
+/// 既存の呼び出し規約どおり `vectors: &[f32]` を引数で受け取る（`build` の
+/// ループが所有権を持つ借用元バッファをそのまま渡す）。
+pub(crate) struct GraphBuilder {
+    params: HnswParams,
+    nodes: Vec<Node>,
+    entry_point: Option<u32>,
+}
+
+impl Adjacency for GraphBuilder {
+    fn level_of(&self, node: u32) -> Option<usize> {
+        self.nodes.get(node as usize).map(|n| n.level)
+    }
+
+    fn neighbors(&self, level: usize, node: u32) -> Option<&[u32]> {
+        self.nodes
+            .get(node as usize)
+            .and_then(|n| n.links.get(level))
+            .map(|l| l.as_slice())
+    }
+
+    fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
 /// 構築済み HNSW グラフ。`build` 完了時に渡された `vectors` の内容を
 /// `Arc<[f32]>` として所有する（モジュール冒頭「ベクトルの所有方針」節・
 /// codex-review PR #430 P1 指摘対応）。`search` は呼び出し元からベクトルを
@@ -566,11 +743,101 @@ struct Node {
 pub struct HnswIndex {
     params: HnswParams,
     dim: u32,
-    nodes: Vec<Node>,
+    /// 凍結済みグラフ（Issue #494。[`csr::CsrGraph`]）。構築中の可変長
+    /// 表現（[`GraphBuilder`]）から [`HnswIndex::freeze_from`] が 1 回だけ
+    /// 平坦化する。
+    graph: csr::CsrGraph,
     entry_point: Option<u32>,
-    /// `build` 時点の `vectors`（row-major・`len() == nodes.len() * dim`）の
-    /// 不変スナップショット。`search` はこれを `node_vector` で参照する。
-    vectors: Arc<[f32]>,
+    /// `build` 時点の `vectors`（row-major・`len() == graph.node_count() * dim`）
+    /// の不変スナップショット（Issue #514 で [`NodeVectors`] へ一般化。
+    /// `search` はこれを [`NodeSource`] 経由で参照する）。
+    vectors: NodeVectors,
+    /// `vectors` の実効常駐精度（Issue #514）。構築時に要求した精度が
+    /// f16 の有限範囲を超える成分により `F32` へ自動縮退した場合、この値は
+    /// 要求値と異なる（[`Self::resident_precision`] が返すのは常にこの実効値）。
+    resident_precision: ResidentPrecision,
+}
+
+/// HNSW 索引ノードの常駐ベクトル本体（Issue #514）。`F32` は既存経路と
+/// ビット同一（`Arc<[f32]>` をそのまま保持）、`F16` は `f16::encode_rows` で
+/// 1 回エンコードした IEEE 754 binary16 ビット列（`Arc<[u16]>`）を保持する。
+/// いずれも row-major 連続バッファで `len() == node_count * dim`。
+#[derive(Debug, Clone)]
+pub(crate) enum NodeVectors {
+    F32(Arc<[f32]>),
+    F16(Arc<[u16]>),
+}
+
+impl NodeVectors {
+    /// 概算ヒープバイト量（[`HnswIndex::approx_heap_bytes`] が使う）。
+    fn approx_bytes(&self) -> usize {
+        match self {
+            NodeVectors::F32(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
+            NodeVectors::F16(v) => v.len().saturating_mul(std::mem::size_of::<u16>()),
+        }
+    }
+}
+
+/// 探索中の候補生成スコア計算を抽象化する境界（Issue #514）。構築経路
+/// （[`GraphBuilder`]。常に f32）は `[f32]` の実装（既存動作そのまま。
+/// `score_of`／`prefetch::touch_node_vector` へ委譲）を、索引凍結後の探索経路
+/// （[`HnswIndex`]）は [`NodeVectors`] の実装を使う。[`search_layer_in`]・
+/// [`prefetch::PrefetchPolicy`] がこの境界を通じて常駐精度に依存せず動作する。
+/// `?Sized` は `[f32]`（unsized）を実装対象に含めるため。
+pub(crate) trait NodeSource {
+    fn score(&self, dim: usize, node: u32, query: &[f32]) -> Result<f32, HnswError>;
+    fn touch_prefetch(&self, dim: usize, node: u32);
+}
+
+impl NodeSource for [f32] {
+    fn score(&self, dim: usize, node: u32, query: &[f32]) -> Result<f32, HnswError> {
+        score_of(self, dim, node, query)
+    }
+    fn touch_prefetch(&self, dim: usize, node: u32) {
+        prefetch::touch_node_vector(self, dim, node);
+    }
+}
+
+impl NodeSource for NodeVectors {
+    fn score(&self, dim: usize, node: u32, query: &[f32]) -> Result<f32, HnswError> {
+        match self {
+            NodeVectors::F32(v) => score_of(v, dim, node, query),
+            NodeVectors::F16(v) => {
+                let row = node_vector_u16(v, dim, node)?;
+                let score = crate::isa::current_f16().dot_f16(row, query);
+                if !score.is_finite() {
+                    return Err(HnswError::NonFiniteScore { node });
+                }
+                Ok(score)
+            }
+        }
+    }
+
+    fn touch_prefetch(&self, dim: usize, node: u32) {
+        match self {
+            NodeVectors::F32(v) => prefetch::touch_node_vector(v, dim, node),
+            NodeVectors::F16(v) => prefetch::touch_node_vector_u16(v, dim, node),
+        }
+    }
+}
+
+/// `vectors`（f16 ビット表現の row-major バッファ）から `node` 番目の行を
+/// 切り出す（[`node_vector`] の f16 版。untrusted 添字アクセスを避けるため
+/// `get()` のみを使う）。
+fn node_vector_u16(vectors: &[u16], dim: usize, node: u32) -> Result<&[u16], HnswError> {
+    let node_usize = node as usize;
+    let start = node_usize.checked_mul(dim).ok_or(HnswError::DimMismatch {
+        dim: dim as u32,
+        len: vectors.len(),
+    })?;
+    let end = start.checked_add(dim).ok_or(HnswError::DimMismatch {
+        dim: dim as u32,
+        len: vectors.len(),
+    })?;
+    vectors.get(start..end).ok_or(HnswError::DimMismatch {
+        dim: dim as u32,
+        len: vectors.len(),
+    })
 }
 
 /// `search_layer` が呼び出しをまたいで再利用する visited 集合（世代カウンタ
@@ -787,212 +1054,89 @@ fn max_degree_for(params: &HnswParams, level: usize) -> usize {
     }
 }
 
-impl HnswIndex {
-    /// row-major 連続バッファ（`VectorArena::vectors()` と同レイアウト。
-    /// `vectors[node * dim .. node * dim + dim]` が `node` 番目のベクトル）から
-    /// 単一スレッドで構築する。
+impl GraphBuilder {
+    /// 全ノード挿入後の決定的な後始末パス。`insert_node`／`shrink_links` の
+    /// `protect` 引数（呼び出し時点のみの保護）だけでは、後続ノードの挿入が
+    /// 同じ近傍を再度枝刈りして到達不能ノードを生む残差ケースを閉じきれない
+    /// （`docs/design/hnsw-graph-construction.md`「逆方向リンクの到達性保証」
+    /// 節参照）。各層でエントリポイントから BFS
+    /// し、到達できないノードが残っていれば、その層の到達済み集合中で最も
+    /// 近い（`dot` が最大の）ノードへ双方向リンクを追加して修復する。
     ///
-    /// 検証順序: パラメータ → 次元整合 → ノード数上限 → 非有限値。空入力
-    /// （`vectors` が空）は空索引を返す（エラーにしない。呼び出し元が未挿入の
-    /// テーブルへ構築を試みる自然なケースのため）。
-    pub fn build(
-        params: HnswParams,
-        dim: u32,
+    /// # 2 フェーズ構成（計算量の上限。codex-review #423 P1 指摘）
+    ///
+    /// 検証の過程で、`shrink_links` によるヒューリスティック再選択を修復
+    /// バッチとして複数ノードへ一括適用すると、ある未到達ノードを直すための
+    /// 枝刈りが**無関係な別の**既存ノードの唯一の到達経路を巻き込んで壊し、
+    /// 新たな到達不能ノードを生む whack-a-mole が起こり得ることが分かった。
+    /// そのためフェーズ 1 は 1 ノードずつ確定的に修復し、直後に BFS を
+    /// やり直して次の未到達ノード（新たに生まれたものを含む）を選ぶ
+    /// ワークリスト方式を取る（`shrink_links`・`protect` つきで次数上限を
+    /// 維持する厳密な修復）。この「全体 BFS ＋ 到達済み全ノードとの `dot`
+    /// 計算」を伴う反復は、旧実装では上限を `member_count` の定数倍として
+    /// おり、残差の多い入力（重複ベクトルが多い adversarial な入力等）では
+    /// 反復回数・1 反復あたりのコストの双方が入力規模に比例して膨らみ、
+    /// 少なくとも O(N^2) 相当となって `MAX_HNSW_NODES`（100 万）まで受理
+    /// する構築 API 全体を計算量 DoS にさらしていた。フェーズ 1 の反復回数は
+    /// 入力規模に依存しない小さな絶対上限 [`PRECISE_REPAIR_CAP`] に固定し、
+    /// それを超えて残る未到達ノードはフェーズ 2 が閉じる。
+    ///
+    /// フェーズ 2 は残存ノードを id 昇順の**片方向チェーン**（`entry ->
+    /// remaining[0] -> remaining[1] -> ...`）として連結するだけで残りを
+    /// 閉じる。旧実装（全残存ノードをエントリポイントへ直結）は
+    /// (1) `connect` の重複検査（`Vec::contains`）を経てエントリポイントの
+    /// 隣接リストが残存ノード数に比例して伸び続け二次関数的コストになる
+    /// （Bugbot 指摘）、(2) `shrink_links` を一切呼ばないため次数が
+    /// `max_degree` を大幅に超え得る（codex-review #423 P1 指摘）、という
+    /// 2 つの問題を持っていた。チェーン方式では各ノードが新たに得る次数は
+    /// 高々 1（チェーンの「出発点」役を一度だけ務める）なので、
+    /// `connect` 直後に `shrink_links` を掛けても 1 ノードあたり
+    /// O(`max_degree`) に収まり、全体で O(remaining.len()) を保ったまま
+    /// 次数上限も維持できる。`shrink_links` は「次数が上限を超えていれば
+    /// `protect` を強制的に残しつつヒューリスティックで上限内へ再選択し、
+    /// 超えていなければ何もしない」契約（同関数のドキュメンテーション
+    /// コメント参照）を持つため、チェーンの起点を entry の現在の次数に
+    /// 関わらず常に選べる（"余裕があるか" を事前に走査する必要がなく、
+    /// 失敗しうる分岐も生まれない）。entry への `shrink_links` 適用が
+    /// entry の既存リンクを 1 本犠牲にし得る点は、フェーズ 1 が到達済み
+    /// 任意ノードへ毎回同じ `shrink_links` を適用しているのと同じ性質の
+    /// リスクであり、新たに導入するものではない。フェーズ 1 の上限を
+    /// 入力非依存の定数に保つことで、層あたりの
+    /// 総コストは O(`PRECISE_REPAIR_CAP` * N + N) に収まり、`MAX_LEVEL` も
+    /// 定数上限（32）であるため `HnswIndex::build` 全体では入力規模に対し
+    /// ほぼ線形（N log N 契約の範囲内）に収まる。
+    /// `threads` は最近傍探索フェーズ（下記 [`repair_reachability_inner`]
+    /// (Self::repair_reachability_inner) 「Issue #449」節）の並列度上限。
+    /// 呼び出し元（`build_inner`・`parallel_build::freeze`）が
+    /// [`HnswIndex::build_with_threads`] 等から引き継いだ構築スレッド数を
+    /// そのまま渡す契約（`WorkerBudgetGuard` の追加取得は行わない——下記
+    /// [`repair_reachability_inner`](Self::repair_reachability_inner)
+    /// 「Issue #449」節の「予算引き継ぎ方針」参照）。
+    fn repair_reachability(
+        &mut self,
+        dim: usize,
         vectors: &[f32],
-        seed: u64,
-    ) -> Result<Self, HnswError> {
-        let dim_usize = dim as usize;
-        let n = validate_build_input(&params, dim, vectors)?;
-
-        // `vectors` の不変スナップショットを取り、以降 `search` はこれのみを
-        // 参照する（モジュール冒頭「ベクトルの所有方針」節・codex-review PR
-        // #430 P1 指摘対応。呼び出し元が構築後に借用元バッファを書き換えても
-        // この Arc の中身は変化しない）。
-        let owned_vectors: Arc<[f32]> = Arc::from(vectors);
-        let mut index = HnswIndex {
-            params,
-            dim,
-            nodes: Vec::with_capacity(n),
-            entry_point: None,
-            vectors: owned_vectors,
-        };
-        if n == 0 {
-            return Ok(index);
-        }
-
-        let mut rng = DeterministicRng::new(seed);
-        // 全挿入をまたいで使い回す visited スクラッチ（`VisitedScratch` 参照。
-        // 挿入ごとに新規確保しないことで search_layer の初期化コストを
-        // O(N^2) から O(N) 相当へ落とす）。
-        let mut visited = VisitedScratch::default();
-        // 挿入順はノード番号昇順に固定する（呼び出し元の入力順＝挿入順。決定性の
-        // 唯一の自由度は `seed` によるレベル割当だけにする）。
-        for node_idx in 0..n {
-            let level = assign_level(&mut rng, params.m);
-            let node_id = node_idx as u32; // n <= MAX_HNSW_NODES であることを上で検証済み
-            index.insert_node(node_id, level, dim_usize, vectors, &mut visited)?;
-        }
-
-        index.repair_reachability(dim_usize, vectors)?;
-
-        Ok(index)
-    }
-
-    /// [`build`](Self::build) と同じグラフを、要素単位ロック（ノードごとの
-    /// `RwLock`）とエントリポイント更新のみの排他で並列構築する（Issue #406・
-    /// 親 #402。pgvector `hnswbuild.c` のロック粒度設計・qdrant の逐次
-    /// プレフィックス方式を参考にした。手法名のみ参照でコード転記はしない）。
-    ///
-    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の場合は
-    /// [`build`](Self::build) と完全に同一のグラフを返す（内部実装は
-    /// `parallel_build::build_parallel_graph` に委譲せず [`build`](Self::build)
-    /// をそのまま呼ぶ）。`threads >= 2` かつ `n > `[`SEQUENTIAL_PREFIX_NODES`]
-    /// の場合、先頭 [`SEQUENTIAL_PREFIX_NODES`] 件は逐次挿入し、残りを
-    /// `AtomicUsize` によるワークスティール方式で並列挿入する——挿入順が
-    /// 非決定的になるため、構築されるグラフの**形状**は同一 `seed` でも
-    /// run-to-run で変わり得る（レベル割当は並列フェーズ開始前に `seed` から
-    /// 逐次確定するため不変。[`HnswIndex::search`] の決定性契約「同一索引・
-    /// 同一クエリで再現」自体は不変。詳細は `docs/design/hnsw-parallel-build.md`
-    /// 参照）。
-    ///
-    /// # エラー
-    ///
-    /// `threads == 0` または `threads > `[`MAX_BUILD_THREADS`] は
-    /// [`HnswError::InvalidParams`]。構築ワーカーの panic・ロック poison は
-    /// [`HnswError::WorkerPanicked`]（fail-closed。部分的に結線された索引を
-    /// `Ok` で返さない）。
-    pub fn build_with_threads(
-        params: HnswParams,
-        dim: u32,
-        vectors: &[f32],
-        seed: u64,
         threads: usize,
-    ) -> Result<Self, HnswError> {
-        if threads == 0 || threads > MAX_BUILD_THREADS {
-            return Err(HnswError::InvalidParams {
-                reason: "threads must be in 1..=MAX_BUILD_THREADS",
-            });
-        }
-        let n = validate_build_input(&params, dim, vectors)?;
-        if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
-            return Self::build(params, dim, vectors, seed);
-        }
-        parallel_build::build_parallel_graph(params, dim, vectors, seed, threads, n)
+    ) -> Result<(), HnswError> {
+        self.repair_reachability_inner::<false>(dim, vectors, threads)
+            .map(|_| ())
     }
 
-    /// [`build_with_threads`](Self::build_with_threads) と同一アルゴリズム・
-    /// 同一エラー契約を共有しつつ、段別の壁時間・ワーカー統計
-    /// （[`HnswBuildProfile`]）を合わせて返す観測版（Issue #406 追記:
-    /// 8→12 スレッド頭打ち要因の切り分け計測。`docs/design/
-    /// hnsw-parallel-build.md` 参照）。
-    ///
-    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の縮退経路
-    /// （[`build`](Self::build) をそのまま呼ぶ）に限り
-    /// [`build_with_threads`](Self::build_with_threads) と完全に同一のグラフを
-    /// 返す。`threads >= 2` かつ `n > `[`SEQUENTIAL_PREFIX_NODES`] の並列経路は
-    /// ワークスティールに依存するため、[`build_with_threads`]
-    /// (Self::build_with_threads) と同様グラフの**形状**が run-to-run で
-    /// 変わり得る（この非決定性自体は観測の有無に関わらない
-    /// `build_with_threads` 既存の契約。モジュール `parallel_build` 冒頭
-    /// 「決定性の範囲」節参照）。
-    ///
-    /// 呼び出し先（`parallel_build::build_parallel_graph_observed`）は
-    /// `build_parallel_graph` と別の実装だが、ノード挿入・凍結・修復の
-    /// アルゴリズム本体（`insert_node_locked`・`assemble_graph`・
-    /// `repair_reachability`）は完全に共有する関数をそのまま呼ぶ。ただし
-    /// 段別計測のため `BuildGraph` のノードロック取得を `try_read`/
-    /// `try_write` → block の二段化にする計装を追加しており、この計装は
-    /// 観測版（`observe=true`）のみに閉じ、非観測版
-    /// （[`build_with_threads`](Self::build_with_threads) が使う
-    /// `observe=false`）には一切波及しない（`parallel_build::BuildGraph::
-    /// observe` 参照。レビュー指摘 P1-A）。したがって
-    /// `build_with_threads_one_matches_sequential_build_exactly` 等の既存
-    /// 完全一致テストは非観測版のみを対象にするため無変更のまま green だが、
-    /// 「ロック取得順序・待ち時間まで非観測版と厳密に同一」であることは
-    /// 主張しない（グラフの構築結果・poison 判定は同一）。
-    ///
-    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の縮退経路
-    /// （[`build`](Self::build) を呼ぶ）では、計測できる段の区切りが
-    /// 存在しないため所要時間の全量を `sequential_prefix` へ積み、
-    /// `workers` は空のままにする（縮退の事実がプロファイルから分かる）。
-    ///
-    /// # エラー
-    ///
-    /// [`build_with_threads`](Self::build_with_threads) と同一（`threads` の
-    /// 範囲外は [`HnswError::InvalidParams`]、ワーカー panic・ロック poison は
-    /// [`HnswError::WorkerPanicked`]）。
-    pub fn build_with_threads_observed(
-        params: HnswParams,
-        dim: u32,
+    /// [`repair_reachability`](Self::repair_reachability) の観測版（Issue #447:
+    /// 修復対象ノード数・反復回数の観測フック）。層ごとの到達不能ノード数・
+    /// フェーズ 1 反復回数・フェーズ 2 結線数・段別壁時間を
+    /// [`HnswRepairStats`] として返す。非観測経路（`build`・
+    /// `build_with_threads`・`parallel_build::freeze`）は
+    /// [`repair_reachability`](Self::repair_reachability) を呼ぶため本メソッドの
+    /// 計装コストを一切負わない。`threads` の意味は
+    /// [`repair_reachability`](Self::repair_reachability) と同一。
+    fn repair_reachability_observed(
+        &mut self,
+        dim: usize,
         vectors: &[f32],
-        seed: u64,
         threads: usize,
-    ) -> Result<(Self, HnswBuildProfile), HnswError> {
-        let total_start = std::time::Instant::now();
-        if threads == 0 || threads > MAX_BUILD_THREADS {
-            return Err(HnswError::InvalidParams {
-                reason: "threads must be in 1..=MAX_BUILD_THREADS",
-            });
-        }
-        let n = validate_build_input(&params, dim, vectors)?;
-        if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
-            let seq_start = std::time::Instant::now();
-            let index = Self::build(params, dim, vectors, seed)?;
-            let profile = HnswBuildProfile {
-                sequential_prefix: seq_start.elapsed(),
-                total: total_start.elapsed(),
-                ..HnswBuildProfile::default()
-            };
-            return Ok((index, profile));
-        }
-        let (index, mut profile) =
-            parallel_build::build_parallel_graph_observed(params, dim, vectors, seed, threads, n)?;
-        profile.total = total_start.elapsed();
-        Ok((index, profile))
-    }
-
-    /// [`build_with_threads`](Self::build_with_threads) のスレッド数を
-    /// [`crate::parallel_search::ParallelSearchProvider`] と同じ決定方法
-    /// （`thread_count_for` による行数依存の並列度算出・プロセス全体の
-    /// `WorkerBudgetGuard` による同時実行間の調停）で自動的に決める（Issue
-    /// #406 要件 5。#407／#408 の既定結線先はこちら）。決定された並列度が
-    /// 1 以下、またはグローバル予算を確保できなかった場合は
-    /// [`build`](Self::build)（逐次・完全決定的）へ縮退する（`ParallelSearchProvider`
-    /// と同じ「並列度を落とすだけで失敗させない」縮退規則）。
-    ///
-    /// `thread_count_for` は検索側の `MIN_ROWS_PER_THREAD`（1,024）を
-    /// 1 スレッドあたりの担当行数の下限として使う（`available_parallelism`
-    /// と `row_count / MIN_ROWS_PER_THREAD` の小さい方）ため、実質的な並列化
-    /// 閾値は `MIN_ROWS_PER_THREAD * 2`（2,048。`available_parallelism >= 2`
-    /// の環境で `desired >= 2` になる最小の `n`）であり、本メソッドが別途
-    /// 課す [`SEQUENTIAL_PREFIX_NODES`]（256）より大きい。したがって
-    /// `n` が 257..2047 の範囲では [`build_with_threads`](Self::
-    /// build_with_threads) に明示的なスレッド数を渡せば並列化されるが、
-    /// 本メソッドは検索側の閾値をそのまま流用する設計判断により逐次へ
-    /// 縮退する（構築 1 ノードあたりのコストは検索 1 クエリの `dot` 計算
-    /// より大幅に重いため、この閾値が構築にとって保守的すぎる可能性は
-    /// 残るが、#407／#408 が実運用で結線する際に単一の決定方法を共有する
-    /// 利点を優先した。見直しが必要になれば構築専用の閾値を別途持たせる）。
-    pub fn build_parallel(
-        params: HnswParams,
-        dim: u32,
-        vectors: &[f32],
-        seed: u64,
-    ) -> Result<Self, HnswError> {
-        let n = validate_build_input(&params, dim, vectors)?;
-        let desired = crate::parallel_search::thread_count_for(n).min(MAX_BUILD_THREADS);
-        if desired <= 1 || n <= SEQUENTIAL_PREFIX_NODES {
-            return Self::build(params, dim, vectors, seed);
-        }
-        let guard = crate::parallel_search::WorkerBudgetGuard::acquire(desired);
-        let granted = guard.granted();
-        if granted <= 1 {
-            drop(guard);
-            return Self::build(params, dim, vectors, seed);
-        }
-        let result = Self::build_with_threads(params, dim, vectors, seed, granted);
-        drop(guard);
-        result
+    ) -> Result<HnswRepairStats, HnswError> {
+        self.repair_reachability_inner::<true>(dim, vectors, threads)
     }
 
     /// 全ノード挿入後の決定的な後始末パス。`insert_node`／`shrink_links` の
@@ -1045,58 +1189,162 @@ impl HnswIndex {
     /// 総コストは O(`PRECISE_REPAIR_CAP` * N + N) に収まり、`MAX_LEVEL` も
     /// 定数上限（32）であるため `HnswIndex::build` 全体では入力規模に対し
     /// ほぼ線形（N log N 契約の範囲内）に収まる。
-    fn repair_reachability(&mut self, dim: usize, vectors: &[f32]) -> Result<(), HnswError> {
-        /// フェーズ 1（`shrink_links` つきの厳密修復）の反復回数の絶対上限。
-        /// 意図的に `member_count`／`n` に比例させない（比例させると入力
-        /// 規模に応じて計算量 DoS を招く。上記モジュールコメント参照）。
-        const PRECISE_REPAIR_CAP: usize = 64;
+    ///
+    /// # 観測分離（`OBSERVE`。Issue #447）
+    ///
+    /// `OBSERVE` を `const` ジェネリックにすることで、`OBSERVE=false`
+    /// （[`repair_reachability`](Self::repair_reachability) 経由。`build`・
+    /// `build_with_threads`・`parallel_build::freeze` が使う非観測経路）では
+    /// 単相化によって計測分岐・`Instant::now()`・カウンタ更新のコードが
+    /// 一切残らない（PR #445 の `BuildGraph::observe` 分岐と同じ方針）。
+    /// `OBSERVE=true`（[`repair_reachability_observed`]
+    /// (Self::repair_reachability_observed) 経由）でのみ [`HnswRepairStats`]
+    /// を採取する。グラフ操作の順序・比較・タイブレークは `OBSERVE` の値に
+    /// 関わらず完全に同一（観測が挙動へ影響しない）。
+    /// 入力非依存の定数に保つことで、層あたりの
+    /// 総コストは O(`PRECISE_REPAIR_CAP` * N + N) に収まり、`MAX_LEVEL` も
+    /// 定数上限（32）であるため `HnswIndex::build` 全体では入力規模に対し
+    /// ほぼ線形（N log N 契約の範囲内）に収まる。
+    ///
+    /// # 観測分離（`OBSERVE`。Issue #447）
+    ///
+    /// `OBSERVE` を `const` ジェネリックにすることで、`OBSERVE=false`
+    /// （[`repair_reachability`](Self::repair_reachability) 経由。`build`・
+    /// `build_with_threads`・`parallel_build::freeze` が使う非観測経路）では
+    /// 単相化によって計測分岐・`Instant::now()`・カウンタ更新のコードが
+    /// 一切残らない（PR #445 の `BuildGraph::observe` 分岐と同じ方針）。
+    /// `OBSERVE=true`（[`repair_reachability_observed`]
+    /// (Self::repair_reachability_observed) 経由）でのみ [`HnswRepairStats`]
+    /// を採取する。グラフ操作の順序・比較・タイブレークは `OBSERVE` の値に
+    /// 関わらず完全に同一（観測が挙動へ影響しない）。
+    ///
+    /// # 探索の並列化（`threads`。Issue #449）
+    ///
+    /// フェーズ 1 の各反復が行う「到達済み集合内の最近傍探索」（`dot` を
+    /// 到達済みノード数だけ計算する読み取り専用の走査）を、`threads` を
+    /// 上限に [`nearest_reachable`] へ分割・並列実行させる。修復先の決定
+    /// （`connect`／`shrink_links` の可変更新）自体は本メソッドが逐次のまま
+    /// 適用するため、`&mut self` の借用規則を破らずに済む（探索＝不変借用の
+    /// 読み取り専用ヘルパ、結線＝可変借用の逐次適用、という 2 相構成）。
+    ///
+    /// 並列度は [`repair_workers_for`] が
+    /// `crate::parallel_search::thread_count_for`（検索側の並列度決定と同一
+    /// 関数）を経由して決める——`threads==1`（`build`・`build_with_threads`
+    /// の縮退経路）では常に 1 に縮退し、[`nearest_reachable`] はワーカーを
+    /// 一切起動しない逐次経路のみを通る。`WorkerBudgetGuard`
+    /// （`parallel_search.rs`）の追加取得はここでは行わない——呼び出し元
+    /// （`HnswIndex::build_parallel`／`build_parallel_with_precision`）が
+    /// 構築全体（並列挿入フェーズを含む）にわたって保持済みの予算を
+    /// `threads` としてそのまま引き継ぐ契約であり、二重に予算を計上しない
+    /// ため（`build_with_threads`〔明示スレッド数指定〕の並列挿入フェーズも
+    /// 同様に追加取得なしで `threads` 本を起動する既存契約に揃えた）。
+    ///
+    /// 探索フェーズの比較・タイブレークはモジュール冒頭「順序規約」（スコア
+    /// `total_cmp` 降順・同点は id 昇順）に従い、この規約は全順序を成す
+    /// （[`better_repair_candidate`] 参照）。全順序であることから、到達済み
+    /// 集合をどう分割し・各ワーカーの局所最良をどの順序で縮約しても、
+    /// 最終的に選ばれる修復先ノードは分割・縮約の順序に依存せず一意に
+    /// 定まる——`threads` の値によらず本メソッドが返すグラフはビット同一
+    /// になる（`docs/design/rrf-tie-break-determinism.md`「維持すべき不変
+    /// 条件」と同方針。`crates/engine/src/hnsw.rs` 内 `#[cfg(test)] mod tests`
+    /// の `repair_reachability_inner` 完全一致テストで機械検証する）。
+    ///
+    /// # 冗長な BFS の省略（Issue #449）
+    ///
+    /// フェーズ 1 の各反復は必ず BFS（[`bfs_reachable_mask`]）から始まる。
+    /// フェーズ 1 が「未到達ノードが見つからず `break`」で終わった場合、
+    /// その `break` 直前に計算した BFS 結果はグラフを一切変更していない
+    /// 状態のまま得られたものであり、フェーズ 2 が使う到達集合と完全に
+    /// 一致する（フェーズ 1・フェーズ 2 とも同じ `entry` から同じグラフに
+    /// 対して BFS するため）。よってこの場合はフェーズ 2 の BFS を再実行
+    /// せず、フェーズ 1 最終反復の結果をそのまま使い回す。逆に、フェーズ 1
+    /// が反復回数の上限まで完走した場合は最終反復で必ず結線（`connect`／
+    /// `shrink_links`）が起きているため、フェーズ 2 は BFS を再実行して
+    /// グラフの最新状態を反映する（`mutated_since_bfs` フラグで判定）。
+    /// グラフの出力自体はこの省略の前後で変わらない（省略するのは「変更が
+    /// 無いと分かっている再計算」のみ）。
+    fn repair_reachability_inner<const OBSERVE: bool>(
+        &mut self,
+        dim: usize,
+        vectors: &[f32],
+        threads: usize,
+    ) -> Result<HnswRepairStats, HnswError> {
+        let inner_start = if OBSERVE {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut stats = HnswRepairStats::default();
 
         let Some(entry) = self.entry_point else {
-            return Ok(());
+            return Ok(stats);
         };
         let Some(max_level) = self.level_of(entry) else {
-            return Ok(());
+            return Ok(stats);
         };
         for level in 0..=max_level {
+            let mut level_stats = HnswRepairLevelStats {
+                level,
+                ..HnswRepairLevelStats::default()
+            };
+            let phase1_start = if OBSERVE {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            // 当該層に属するノード id（昇順）を層ごとに 1 回だけ構築する
+            // （Issue #449: 毎反復・フェーズ 2 の `(0..len).filter(level_of
+            // >= level)` 全走査を層ごとに 1 回へ削減。集合としての内容は
+            // 従来の毎回フィルタと同一）。
+            let members: Vec<u32> = (0..self.nodes.len() as u32)
+                .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
+                .collect();
+
             // フェーズ 1: 全体 BFS ＋ 到達済み全ノードとの `dot` 計算を伴う
             // 厳密な修復を `PRECISE_REPAIR_CAP` 回までに限定する。
-            for _ in 0..PRECISE_REPAIR_CAP {
-                let reachable = self.bfs_reachable(level, entry);
-                let missing_node = (0..self.nodes.len() as u32)
-                    .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
-                    .find(|n| !reachable.contains(n));
-                let Some(node) = missing_node else {
-                    break;
-                };
+            let mut phase1_completed = 0usize;
+            // フェーズ 1 の最終反復で得た到達集合（フェーズ 2 の冗長 BFS
+            // 省略に使う。上記ドキュメンテーションコメント「冗長な BFS の
+            // 省略」参照）。
+            let mut last_mask: Option<NodeMask> = None;
+            let mut mutated_since_bfs = false;
+            for iter in 0..PRECISE_REPAIR_CAP {
+                let mask = self.bfs_reachable_mask(level, entry);
+                mutated_since_bfs = false;
 
-                let node_vec = node_vector(vectors, dim, node)?;
-                let mut best: Option<(u32, f32)> = None;
-                for &candidate in &reachable {
-                    let cand_vec = node_vector(vectors, dim, candidate)?;
-                    let score = dot(node_vec, cand_vec);
-                    if !score.is_finite() {
-                        return Err(HnswError::NonFiniteScore { node: candidate });
-                    }
-                    // スコア降順・同点は id 昇順（モジュール冒頭の順序規約）。
-                    // `reachable` は `HashSet<u32>` であり走査順はプロセス
-                    // ごとに変わり得るハッシュ状態に依存するため、同点時に
-                    // 単純な `>` 比較（最初に見つかった候補を保持）のままだと
-                    // 同一 seed・同一入力でも修復先ノードが非決定的になる
-                    // （codex-review #423 P1 指摘）。ここでスコア・id の複合
-                    // 順序で明示的にタイブレークすることで、`reachable` の
-                    // 走査順に関係なく常に同じ (score, id) の組が選ばれる。
-                    let better = match best {
-                        Some((best_node, best_score)) => match score.total_cmp(&best_score) {
-                            std::cmp::Ordering::Greater => true,
-                            std::cmp::Ordering::Equal => candidate < best_node,
-                            std::cmp::Ordering::Less => false,
-                        },
-                        None => true,
-                    };
-                    if better {
-                        best = Some((candidate, score));
+                // `members` を 1 回だけ走査し、到達済み部分列（`reachable`。
+                // 最近傍探索の候補集合）と最初の未到達ノードを同時に確定する
+                // （Issue #449: 従来の 2 回の独立した `filter` 走査を統合）。
+                let mut reachable: Vec<u32> = Vec::with_capacity(members.len());
+                let mut missing_node: Option<u32> = None;
+                let mut unreachable_count: u64 = 0;
+                for &m in &members {
+                    if mask.get(m) {
+                        reachable.push(m);
+                    } else {
+                        if missing_node.is_none() {
+                            missing_node = Some(m);
+                        }
+                        unreachable_count += 1;
                     }
                 }
+                if OBSERVE && iter == 0 {
+                    // フェーズ 1 の最初の反復で得られる BFS 結果をそのまま
+                    // 流用して到達不能ノード数を数える（追加の BFS を
+                    // 入れない。この走査自体の時間は `phase1_wall` に含める
+                    // ——`unreachable_before` のドキュメンテーションコメント
+                    // 参照）。
+                    level_stats.unreachable_before = unreachable_count;
+                }
+                last_mask = Some(mask);
+
+                let Some(node) = missing_node else { break };
+
+                // 到達済み集合内の最近傍探索（読み取り専用・Issue #449 で
+                // 並列化対象。`&mut self` を要する結線はこの下の `if let
+                // Some` 内でのみ行う）。
+                let workers = repair_workers_for(reachable.len(), threads);
+                let best = nearest_reachable(vectors, dim, node, &reachable, workers)?;
                 // `reachable` は entry 自身を含むため必ず 1 件以上存在し、`best`
                 // は常に `Some` になる（entry 自身が候補になり得る）。`None` は
                 // `reachable` が空という到達不能な状態であり、fail-closed で
@@ -1108,18 +1356,42 @@ impl HnswIndex {
                     self.connect(target, node, level);
                     self.shrink_links(target, level, dim, vectors, node)?;
                     self.shrink_links(node, level, dim, vectors, target)?;
+                    mutated_since_bfs = true;
+                }
+                phase1_completed = iter + 1;
+            }
+            if OBSERVE {
+                level_stats.phase1_iterations = phase1_completed as u64;
+                level_stats.phase1_cap_hit = phase1_completed >= PRECISE_REPAIR_CAP;
+                if let Some(start) = phase1_start {
+                    level_stats.phase1_wall = start.elapsed();
                 }
             }
 
+            let phase2_start = if OBSERVE {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             // フェーズ 2: フェーズ 1 の絶対上限までで解消しなかった残りを、
             // 上記モジュールコメントのとおり id 昇順の片方向チェーンで
-            // 確定的に閉じる。`remaining` は `0..len` の昇順フィルタなので
+            // 確定的に閉じる。`remaining` は `members`（既に昇順）由来なので
             // 既に決定的な id 昇順である。
-            let reachable = self.bfs_reachable(level, entry);
-            let remaining: Vec<u32> = (0..self.nodes.len() as u32)
-                .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
-                .filter(|n| !reachable.contains(n))
-                .collect();
+            //
+            // `mutated_since_bfs` が立っていなければ、フェーズ 1 最終反復の
+            // BFS（`last_mask`）以降グラフは変化していないため、この BFS
+            // 結果をそのまま使い回す（上記「冗長な BFS の省略」参照）。
+            // `PRECISE_REPAIR_CAP > 0` なのでループは必ず 1 回以上実行され、
+            // `last_mask` は常に `Some`。
+            let mask = if mutated_since_bfs {
+                self.bfs_reachable_mask(level, entry)
+            } else {
+                last_mask.unwrap_or_else(|| self.bfs_reachable_mask(level, entry))
+            };
+            let remaining: Vec<u32> = members.iter().copied().filter(|n| !mask.get(*n)).collect();
+            if OBSERVE {
+                level_stats.phase2_nodes = remaining.len() as u64;
+            }
             if let Some((&head, tail)) = remaining.split_first() {
                 // チェーンは entry を起点にする: `entry -> head -> tail[0]
                 // -> tail[1] -> ...`。`entry -> head` の 1 本だけが「既に
@@ -1173,24 +1445,46 @@ impl HnswIndex {
                 if let Some(evicted) = evicted {
                     self.connect(prev, evicted, level);
                     self.shrink_links(prev, level, dim, vectors, evicted)?;
+                    if OBSERVE {
+                        level_stats.phase2_entry_relinked = 1;
+                    }
                 }
             }
+            if OBSERVE {
+                if let Some(start) = phase2_start {
+                    level_stats.phase2_wall = start.elapsed();
+                }
+                stats.levels.push(level_stats);
+            }
         }
-        Ok(())
+        if OBSERVE {
+            if let Some(start) = inner_start {
+                stats.wall = start.elapsed();
+            }
+        }
+        Ok(stats)
     }
 
     /// 層 `level` 上でノード `start` からリンクを辿って到達可能なノード集合を
-    /// 返す（`repair_reachability` 専用の内部 BFS。`tests/hnsw.rs` は公開 API
-    /// `neighbors` を使い同等の BFS を独立に実装して検証する）。
-    fn bfs_reachable(&self, level: usize, start: u32) -> HashSet<u32> {
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        visited.insert(start);
+    /// ビットマップで返す（`repair_reachability` 専用の内部 BFS。`tests/hnsw.rs`
+    /// は公開 API `neighbors` を使い同等の BFS を独立に実装して検証する）。
+    ///
+    /// Issue #449: 到達集合の表現を `HashSet<u32>`（SipHash によるハッシュ
+    /// コスト・エントリごとのヒープ確保）から [`NodeMask`]（1 ノード 1 bit の
+    /// ビットマップ）＋ `Vec<u32>` キューへ置換した。BFS が辿る到達可能
+    /// ノードの**集合そのもの**は不変（訪問順・到達判定ロジックは変えて
+    /// いない）ため、呼び出し元（`repair_reachability_inner`）が導く修復結果
+    /// は表現変更の前後で完全に一致する。
+    fn bfs_reachable_mask(&self, level: usize, start: u32) -> NodeMask {
+        let mut visited = NodeMask::new(self.nodes.len());
+        let mut queue: VecDeque<u32> = VecDeque::new();
+        visited.set(start);
         queue.push_back(start);
         while let Some(node) = queue.pop_front() {
             if let Some(neighbors) = self.neighbors(level, node) {
                 for &n in neighbors {
-                    if visited.insert(n) {
+                    if !visited.get(n) {
+                        visited.set(n);
                         queue.push_back(n);
                     }
                 }
@@ -1255,7 +1549,7 @@ impl HnswIndex {
             // `max_degree_for` 側で扱う）が、新規ノード自身の選択本数は Algorithm 1
             // の記法どおり層を問わず常に `m` 本にする。
             let selected =
-                self.select_neighbors_heuristic(&candidates, self.params.m, dim, vectors)?;
+                select_neighbors_heuristic_free(&candidates, self.params.m, dim, vectors)?;
 
             for &neighbor in &selected {
                 self.connect(node_id, neighbor, l);
@@ -1316,6 +1610,496 @@ impl HnswIndex {
         Ok(current)
     }
 
+    /// `from -> to` への単方向リンクを層 `level` へ追加する（重複・自己ループは
+    /// 追加しない）。次数上限の適用は呼び出し元の [`Self::shrink_links`] が担う。
+    fn connect(&mut self, from: u32, to: u32, level: usize) {
+        if from == to {
+            return;
+        }
+        let Some(node) = self.nodes.get_mut(from as usize) else {
+            return;
+        };
+        let Some(links) = node.links.get_mut(level) else {
+            return;
+        };
+        if !links.contains(&to) {
+            links.push(to);
+        }
+    }
+
+    /// `node` の層 `level` における隣接数が次数上限を超えていれば、その隣接集合
+    /// 全体へヒューリスティック近傍選択を再適用して上限内へ縮退させる
+    /// （Algorithm 1 の「次数上限超過時の再選択」段）。
+    ///
+    /// `protect` は、この呼び出し直前に `insert_node` が `node <-> protect` へ
+    /// 張ったばかりの逆方向リンク先（新規挿入ノード自身）。ヒューリスティックが
+    /// `protect` を枝刈りしてしまうと、新規ノードへの唯一の入口だった逆方向
+    /// リンクが失われ、エントリポイントからの到達路が残らないまま孤立し得る
+    /// （挿入ノードは自身の外向きリンクは持つが、探索はエントリポイントから
+    /// 既存ノードの隣接リストを辿って到達するため入方向のリンクが要る）。
+    /// ヒューリスティック選択後に `protect` が漏れて
+    /// いれば、選択済み集合中で最もスコアが低い（＝末尾の）要素と差し替えて
+    /// 強制的に残す。
+    ///
+    /// この保証は「`protect` の挿入時点で選ばれた各近傍が `protect` への逆方向
+    /// リンクを保持する」ことのみを担保する insertion-time の不変条件であり、
+    /// 後続の別ノード挿入がこれらの近傍を再度 `shrink_links` する際に `protect`
+    /// が漏れる余地までは塞がない（グローバルな到達性の恒久保証ではない）。
+    /// 全ノード挿入後に残るその残差ケースは `HnswIndex::build` 末尾の
+    /// [`Self::repair_reachability`] が閉じる（この関数自体は呼ばない。
+    /// 呼ぶと、他の未到達ノードを直すための枝刈りが無関係な第三のノードの
+    /// 唯一の到達経路を巻き込んで壊す whack-a-mole が起こり得るため）。
+    /// 詳細は `docs/design/hnsw-graph-construction.md`
+    /// 「逆方向リンクの到達性保証」節参照。
+    fn shrink_links(
+        &mut self,
+        node: u32,
+        level: usize,
+        dim: usize,
+        vectors: &[f32],
+        protect: u32,
+    ) -> Result<(), HnswError> {
+        let limit = max_degree_for(&self.params, level);
+        let current_links: Vec<u32> = self
+            .nodes
+            .get(node as usize)
+            .and_then(|n| n.links.get(level))
+            .cloned()
+            .unwrap_or_default();
+        // 縮退の計算本体（読み取り→再選択）は `compute_shrink` という純粋関数に
+        // 切り出し済み。並列構築（`parallel_build`。Issue #406）は書き込みロック
+        // 1 回の中で「現在のリンクを読む→`compute_shrink`→書き戻す」を原子的に
+        // 行うことで同じ計算を共有する（`docs/design/hnsw-parallel-build.md`
+        // 参照）。逐次経路（本メソッド）はロック不要のため読み→計算→書き込みを
+        // そのまま `self.nodes` への 2 回のアクセスとして行う。
+        if let Some(shrunk) = compute_shrink(&current_links, node, dim, vectors, limit, protect)? {
+            if let Some(n) = self.nodes.get_mut(node as usize) {
+                if let Some(links) = n.links.get_mut(level) {
+                    *links = shrunk;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `dot(node, query)`。[`HnswIndex::score`] と同じ委譲（`GraphBuilder`
+    /// は `vectors` を保持しないため、呼び出し元から渡された `vectors` を
+    /// そのまま [`score_of`] へ渡す）。
+    fn score(
+        &self,
+        node: u32,
+        query: &[f32],
+        dim: usize,
+        vectors: &[f32],
+    ) -> Result<f32, HnswError> {
+        score_of(vectors, dim, node, query)
+    }
+
+    /// 構築経路の `search_layer`（[`HnswIndex::search_layer`] と同型。
+    /// 構築中は常にパイプライン prefetch（[`prefetch::PipelinePrefetch`]）を
+    /// 使う。[`search_layer_in`] の型パラメータ `A` を `Self` に単相化する
+    /// だけの薄い委譲。
+    #[allow(clippy::too_many_arguments)]
+    fn search_layer<V: VisitedSet>(
+        &self,
+        entry_points: Vec<u32>,
+        query: &[f32],
+        ef: usize,
+        level: usize,
+        dim: usize,
+        vectors: &[f32],
+        visited: &mut V,
+        accept: Option<&NodeMask>,
+    ) -> Result<Vec<ScoredNode>, HnswError> {
+        search_layer_in(
+            self,
+            entry_points,
+            query,
+            ef,
+            level,
+            dim,
+            vectors,
+            visited,
+            accept,
+            &prefetch::PipelinePrefetch,
+        )
+    }
+}
+
+impl HnswIndex {
+    /// row-major 連続バッファ（`VectorArena::vectors()` と同レイアウト。
+    /// `vectors[node * dim .. node * dim + dim]` が `node` 番目のベクトル）から
+    /// 単一スレッドで構築する。
+    ///
+    /// 検証順序: パラメータ → 次元整合 → ノード数上限 → 非有限値。空入力
+    /// （`vectors` が空）は空索引を返す（エラーにしない。呼び出し元が未挿入の
+    /// テーブルへ構築を試みる自然なケースのため）。
+    pub fn build(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<Self, HnswError> {
+        Self::build_inner::<false>(params, ResidentPrecision::F32, dim, vectors, seed)
+            .map(|(index, _)| index)
+    }
+
+    /// [`Self::build`] の常駐精度 opt-in 版（Issue #514・親 #513。ポインタ:
+    /// TASK-132・TASK-156・CORE-16）。`precision` に [`ResidentPrecision::F16`]
+    /// を指定すると、凍結時（[`Self::freeze_from`]）に索引ノードを f16 常駐へ
+    /// エンコードする。1 成分でも f16 の有限範囲（`|x| <= 65504.0`）を超える
+    /// 場合は `F32` へ自動縮退する（`Self::resident_precision` が実効値を返す。
+    /// D6）。グラフ構築（挿入・修復）は精度によらず常に f32 で行う
+    /// （`docs/design/hnsw-f16-resident.md` 参照。決定 7）。
+    pub fn build_with_precision(
+        params: HnswParams,
+        precision: ResidentPrecision,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<Self, HnswError> {
+        Self::build_impl(params, precision, dim, vectors, seed)
+    }
+
+    /// [`Self::build`]／[`Self::build_with_precision`] が共有する構築本体
+    /// （`OBSERVE=false` に固定した [`build_inner`](Self::build_inner) の薄い
+    /// ラッパー）。
+    fn build_impl(
+        params: HnswParams,
+        precision: ResidentPrecision,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<Self, HnswError> {
+        Self::build_inner::<false>(params, precision, dim, vectors, seed).map(|(index, _)| index)
+    }
+
+    /// [`build`](Self::build) と同一アルゴリズムを実行しつつ、
+    /// `repair_reachability` の観測統計（[`HnswRepairStats`]。Issue #447）を
+    /// あわせて返す。常駐精度は常に [`ResidentPrecision::F32`]（呼び出し元の
+    /// `build_with_threads_observed` の縮退経路が threads=1 基線を得るために
+    /// 使う唯一の呼び出し元で、精度 opt-in（Issue #514）とは無関係）。返す
+    /// グラフは [`build`](Self::build) と完全に同一（`OBSERVE` は計測有無の
+    /// みを切り替え、グラフ操作へは一切影響しない。`build_inner` の
+    /// ドキュメンテーションコメント参照）。
+    fn build_observed(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<(Self, HnswRepairStats), HnswError> {
+        Self::build_inner::<true>(params, ResidentPrecision::F32, dim, vectors, seed)
+    }
+
+    /// [`build`](Self::build)・[`build_with_precision`]
+    /// (Self::build_with_precision)・[`build_observed`](Self::build_observed)
+    /// が共有する本体（Issue #447・Issue #514）。`OBSERVE=false` では
+    /// `repair_reachability_inner::<false>` の単相化により計測分岐が消え、
+    /// `build` は Issue #447 追加前と完全に同一の命令列になる。`OBSERVE=true`
+    /// では層別の到達不能ノード数・反復回数を [`HnswRepairStats`] として
+    /// 併せて返す。`precision` は凍結時（[`Self::freeze_from`]）の索引ノード
+    /// 常駐表現にのみ影響し（Issue #514）、グラフ構築（挿入・修復）は精度に
+    /// よらず常に f32 で行う。
+    fn build_inner<const OBSERVE: bool>(
+        params: HnswParams,
+        precision: ResidentPrecision,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<(Self, HnswRepairStats), HnswError> {
+        let dim_usize = dim as usize;
+        let n = validate_build_input(&params, dim, vectors)?;
+
+        // `vectors` の不変スナップショットを取り、以降 `search` はこれのみを
+        // 参照する（モジュール冒頭「ベクトルの所有方針」節・codex-review PR
+        // #430 P1 指摘対応。呼び出し元が構築後に借用元バッファを書き換えても
+        // この Arc の中身は変化しない）。
+        let owned_vectors: Arc<[f32]> = Arc::from(vectors);
+        let mut builder = GraphBuilder {
+            params,
+            nodes: Vec::with_capacity(n),
+            entry_point: None,
+        };
+        if n == 0 {
+            let index = Self::freeze_from(builder, dim, owned_vectors, precision)?;
+            return Ok((index, HnswRepairStats::default()));
+        }
+
+        let mut rng = DeterministicRng::new(seed);
+        // 全挿入をまたいで使い回す visited スクラッチ（`VisitedScratch` 参照。
+        // 挿入ごとに新規確保しないことで search_layer の初期化コストを
+        // O(N^2) から O(N) 相当へ落とす）。
+        let mut visited = VisitedScratch::default();
+        // 挿入順はノード番号昇順に固定する（呼び出し元の入力順＝挿入順。決定性の
+        // 唯一の自由度は `seed` によるレベル割当だけにする）。
+        for node_idx in 0..n {
+            let level = assign_level(&mut rng, params.m);
+            let node_id = node_idx as u32; // n <= MAX_HNSW_NODES であることを上で検証済み
+            builder.insert_node(node_id, level, dim_usize, vectors, &mut visited)?;
+        }
+
+        // `build`／`build_with_precision`／`build_observed` はいずれも単一
+        // スレッドの逐次経路であり、修復フェーズの最近傍探索（Issue #449）も
+        // 常に `threads=1`（ワーカーを起動しない縮退経路）で実行する。
+        let repair_stats = builder.repair_reachability_inner::<OBSERVE>(dim_usize, vectors, 1)?;
+
+        let index = Self::freeze_from(builder, dim, owned_vectors, precision)?;
+        Ok((index, repair_stats))
+    }
+
+    /// [`GraphBuilder`]（構築完了・`repair_reachability` 完了後のもの）を
+    /// CSR（[`csr::CsrGraph`]）へ 1 回だけ平坦化し、[`HnswIndex`] として凍結
+    /// する（Issue #494・`docs/design/hnsw-index.md` §14.2「2 相構成」の後半。
+    /// 平坦化は常に最終段——`build`・並列構築（`parallel_build::freeze`）の
+    /// いずれもここへ到達する直前に修復パスを終えている契約）。
+    ///
+    /// `precision` が [`ResidentPrecision::F16`] の場合、`vectors`（f32）を
+    /// `f16::encode_rows` で 1 回エンコードする（Issue #514）。範囲外成分
+    /// （`|x| > 65504.0`）を検出した場合は `F32` へ自動縮退し（D6）、実効精度は
+    /// [`Self::resident_precision`] から確認できる。
+    fn freeze_from(
+        builder: GraphBuilder,
+        dim: u32,
+        vectors: Arc<[f32]>,
+        precision: ResidentPrecision,
+    ) -> Result<Self, HnswError> {
+        let GraphBuilder {
+            params,
+            nodes,
+            entry_point,
+        } = builder;
+        let graph = csr::CsrGraph::from_nodes(&nodes)?;
+        let (node_vectors, resident_precision) = match precision {
+            ResidentPrecision::F32 => (NodeVectors::F32(vectors), ResidentPrecision::F32),
+            ResidentPrecision::F16 => {
+                let mut bits = Vec::new();
+                match crate::f16::encode_rows(&vectors, &mut bits) {
+                    Ok(()) => (NodeVectors::F16(Arc::from(bits)), ResidentPrecision::F16),
+                    // 範囲外成分を含む場合は F32 常駐へ縮退する（D6。索引全体を
+                    // 拒否せず、性能崖〔非有限スコアの毎クエリ brute-force
+                    // 縮退〕を避ける fail-closed な選択）。
+                    Err(_) => (NodeVectors::F32(vectors), ResidentPrecision::F32),
+                }
+            }
+        };
+        Ok(HnswIndex {
+            params,
+            dim,
+            graph,
+            entry_point,
+            vectors: node_vectors,
+            resident_precision,
+        })
+    }
+
+    /// [`build`](Self::build) と同じグラフを、要素単位ロック（ノードごとの
+    /// `RwLock`）とエントリポイント更新のみの排他で並列構築する（Issue #406・
+    /// 親 #402。pgvector `hnswbuild.c` のロック粒度設計・qdrant の逐次
+    /// プレフィックス方式を参考にした。手法名のみ参照でコード転記はしない）。
+    ///
+    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の場合は
+    /// [`build`](Self::build) と完全に同一のグラフを返す（内部実装は
+    /// `parallel_build::build_parallel_graph` に委譲せず [`build`](Self::build)
+    /// をそのまま呼ぶ）。`threads >= 2` かつ `n > `[`SEQUENTIAL_PREFIX_NODES`]
+    /// の場合、先頭 [`SEQUENTIAL_PREFIX_NODES`] 件は逐次挿入し、残りを
+    /// `AtomicUsize` によるワークスティール方式で並列挿入する——挿入順が
+    /// 非決定的になるため、構築されるグラフの**形状**は同一 `seed` でも
+    /// run-to-run で変わり得る（レベル割当は並列フェーズ開始前に `seed` から
+    /// 逐次確定するため不変。[`HnswIndex::search`] の決定性契約「同一索引・
+    /// 同一クエリで再現」自体は不変。詳細は `docs/design/hnsw-parallel-build.md`
+    /// 参照）。
+    ///
+    /// # エラー
+    ///
+    /// `threads == 0` または `threads > `[`MAX_BUILD_THREADS`] は
+    /// [`HnswError::InvalidParams`]。構築ワーカーの panic・ロック poison は
+    /// [`HnswError::WorkerPanicked`]（fail-closed。部分的に結線された索引を
+    /// `Ok` で返さない）。
+    pub fn build_with_threads(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+        threads: usize,
+    ) -> Result<Self, HnswError> {
+        Self::build_with_threads_impl(params, ResidentPrecision::F32, dim, vectors, seed, threads)
+    }
+
+    /// [`Self::build_with_threads`]／[`Self::build_parallel`] が共有する
+    /// 常駐精度対応版の構築本体（Issue #514）。
+    fn build_with_threads_impl(
+        params: HnswParams,
+        precision: ResidentPrecision,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+        threads: usize,
+    ) -> Result<Self, HnswError> {
+        if threads == 0 || threads > MAX_BUILD_THREADS {
+            return Err(HnswError::InvalidParams {
+                reason: "threads must be in 1..=MAX_BUILD_THREADS",
+            });
+        }
+        let n = validate_build_input(&params, dim, vectors)?;
+        if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
+            return Self::build_impl(params, precision, dim, vectors, seed);
+        }
+        parallel_build::build_parallel_graph(params, precision, dim, vectors, seed, threads, n)
+    }
+
+    /// [`build_with_threads`](Self::build_with_threads) と同一アルゴリズム・
+    /// 同一エラー契約を共有しつつ、段別の壁時間・ワーカー統計
+    /// （[`HnswBuildProfile`]）を合わせて返す観測版（Issue #406 追記:
+    /// 8→12 スレッド頭打ち要因の切り分け計測。`docs/design/
+    /// hnsw-parallel-build.md` 参照）。
+    ///
+    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の縮退経路
+    /// （[`build`](Self::build) をそのまま呼ぶ）に限り
+    /// [`build_with_threads`](Self::build_with_threads) と完全に同一のグラフを
+    /// 返す。`threads >= 2` かつ `n > `[`SEQUENTIAL_PREFIX_NODES`] の並列経路は
+    /// ワークスティールに依存するため、[`build_with_threads`]
+    /// (Self::build_with_threads) と同様グラフの**形状**が run-to-run で
+    /// 変わり得る（この非決定性自体は観測の有無に関わらない
+    /// `build_with_threads` 既存の契約。モジュール `parallel_build` 冒頭
+    /// 「決定性の範囲」節参照）。
+    ///
+    /// 呼び出し先（`parallel_build::build_parallel_graph_observed`）は
+    /// `build_parallel_graph` と別の実装だが、ノード挿入・凍結・修復の
+    /// アルゴリズム本体（`insert_node_locked`・`assemble_graph`・
+    /// `repair_reachability`）は完全に共有する関数をそのまま呼ぶ。ただし
+    /// 段別計測のため `BuildGraph` のノードロック取得を `try_read`/
+    /// `try_write` → block の二段化にする計装を追加しており、この計装は
+    /// 観測版（`observe=true`）のみに閉じ、非観測版
+    /// （[`build_with_threads`](Self::build_with_threads) が使う
+    /// `observe=false`）には一切波及しない（`parallel_build::BuildGraph::
+    /// observe` 参照。レビュー指摘 P1-A）。したがって
+    /// `build_with_threads_one_matches_sequential_build_exactly` 等の既存
+    /// 完全一致テストは非観測版のみを対象にするため無変更のまま green だが、
+    /// 「ロック取得順序・待ち時間まで非観測版と厳密に同一」であることは
+    /// 主張しない（グラフの構築結果・poison 判定は同一）。
+    ///
+    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の縮退経路
+    /// （[`build`](Self::build) を呼ぶ）では、計測できる段の区切りが
+    /// 存在しないため所要時間の全量を `sequential_prefix` へ積み、
+    /// `workers` は空のままにする（縮退の事実がプロファイルから分かる）。
+    ///
+    /// # エラー
+    ///
+    /// [`build_with_threads`](Self::build_with_threads) と同一（`threads` の
+    /// 範囲外は [`HnswError::InvalidParams`]、ワーカー panic・ロック poison は
+    /// [`HnswError::WorkerPanicked`]）。
+    pub fn build_with_threads_observed(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+        threads: usize,
+    ) -> Result<(Self, HnswBuildProfile), HnswError> {
+        let total_start = std::time::Instant::now();
+        if threads == 0 || threads > MAX_BUILD_THREADS {
+            return Err(HnswError::InvalidParams {
+                reason: "threads must be in 1..=MAX_BUILD_THREADS",
+            });
+        }
+        let n = validate_build_input(&params, dim, vectors)?;
+        if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
+            let seq_start = std::time::Instant::now();
+            // 縮退経路（threads=1 基線。Issue #447）: `build_observed` は
+            // `build` と完全に同一のグラフを返しつつ `repair` 統計だけを
+            // 追加で埋める。既存フィールド（`sequential_prefix`・
+            // `repair_reachability`・`workers`）の値・意味は不変のまま
+            // （下記コメント参照）。
+            let (index, repair) = Self::build_observed(params, dim, vectors, seed)?;
+            let profile = HnswBuildProfile {
+                sequential_prefix: seq_start.elapsed(),
+                total: total_start.elapsed(),
+                repair,
+                ..HnswBuildProfile::default()
+            };
+            return Ok((index, profile));
+        }
+        let (index, mut profile) = parallel_build::build_parallel_graph_observed(
+            params,
+            ResidentPrecision::F32,
+            dim,
+            vectors,
+            seed,
+            threads,
+            n,
+        )?;
+        profile.total = total_start.elapsed();
+        Ok((index, profile))
+    }
+
+    /// [`build_with_threads`](Self::build_with_threads) のスレッド数を
+    /// [`crate::parallel_search::ParallelSearchProvider`] と同じ決定方法
+    /// （`thread_count_for` による行数依存の並列度算出・プロセス全体の
+    /// `WorkerBudgetGuard` による同時実行間の調停）で自動的に決める（Issue
+    /// #406 要件 5。#407／#408 の既定結線先はこちら）。決定された並列度が
+    /// 1 以下、またはグローバル予算を確保できなかった場合は
+    /// [`build`](Self::build)（逐次・完全決定的）へ縮退する（`ParallelSearchProvider`
+    /// と同じ「並列度を落とすだけで失敗させない」縮退規則）。
+    ///
+    /// `thread_count_for` は検索側の `MIN_ROWS_PER_THREAD`（1,024）を
+    /// 1 スレッドあたりの担当行数の下限として使う（`available_parallelism`
+    /// と `row_count / MIN_ROWS_PER_THREAD` の小さい方）ため、実質的な並列化
+    /// 閾値は `MIN_ROWS_PER_THREAD * 2`（2,048。`available_parallelism >= 2`
+    /// の環境で `desired >= 2` になる最小の `n`）であり、本メソッドが別途
+    /// 課す [`SEQUENTIAL_PREFIX_NODES`]（256）より大きい。したがって
+    /// `n` が 257..2047 の範囲では [`build_with_threads`](Self::
+    /// build_with_threads) に明示的なスレッド数を渡せば並列化されるが、
+    /// 本メソッドは検索側の閾値をそのまま流用する設計判断により逐次へ
+    /// 縮退する（構築 1 ノードあたりのコストは検索 1 クエリの `dot` 計算
+    /// より大幅に重いため、この閾値が構築にとって保守的すぎる可能性は
+    /// 残るが、#407／#408 が実運用で結線する際に単一の決定方法を共有する
+    /// 利点を優先した。見直しが必要になれば構築専用の閾値を別途持たせる）。
+    pub fn build_parallel(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<Self, HnswError> {
+        Self::build_parallel_impl(params, ResidentPrecision::F32, dim, vectors, seed)
+    }
+
+    /// [`Self::build_parallel`] の常駐精度 opt-in 版（Issue #514）。
+    /// [`Self::build_with_precision`] と同じ精度契約（f16 範囲外成分での
+    /// `F32` 自動縮退・グラフ構築は常に f32）を、並列構築経路でも維持する。
+    pub fn build_parallel_with_precision(
+        params: HnswParams,
+        precision: ResidentPrecision,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<Self, HnswError> {
+        Self::build_parallel_impl(params, precision, dim, vectors, seed)
+    }
+
+    /// [`Self::build_parallel`]／[`Self::build_parallel_with_precision`] が
+    /// 共有する構築本体。
+    fn build_parallel_impl(
+        params: HnswParams,
+        precision: ResidentPrecision,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<Self, HnswError> {
+        let n = validate_build_input(&params, dim, vectors)?;
+        let desired = crate::parallel_search::thread_count_for(n).min(MAX_BUILD_THREADS);
+        if desired <= 1 || n <= SEQUENTIAL_PREFIX_NODES {
+            return Self::build_impl(params, precision, dim, vectors, seed);
+        }
+        let guard = crate::parallel_search::WorkerBudgetGuard::acquire(desired);
+        let granted = guard.granted();
+        if granted <= 1 {
+            drop(guard);
+            return Self::build_impl(params, precision, dim, vectors, seed);
+        }
+        let result = Self::build_with_threads_impl(params, precision, dim, vectors, seed, granted);
+        drop(guard);
+        result
+    }
+
     /// [`Self::greedy_descend`] のマスク付き版（Issue #431・codex-review P0
     /// 是正）。構築経路（`insert_node`）はマスクを持たないため引き続き
     /// `greedy_descend` を直接使い、本関数は探索経路（[`Self::search_masked`]）
@@ -1340,7 +2124,7 @@ impl HnswIndex {
         query: &[f32],
         level: usize,
         dim: usize,
-        vectors: &[f32],
+        vectors: &NodeVectors,
         mask: Option<&NodeMask>,
     ) -> Result<Option<u32>, HnswError> {
         let is_ok = |node: u32| mask.map(|m| m.get(node)).unwrap_or(true);
@@ -1390,16 +2174,20 @@ impl HnswIndex {
     /// （このパス自体、entry point が非受理の場合にのみ発生する）。
     fn find_alternate_entry(&self, mask: &NodeMask) -> Option<u32> {
         let mut best: Option<(u32, usize)> = None;
-        for (idx, node) in self.nodes.iter().enumerate() {
+        for idx in 0..self.graph.node_count() {
             let Ok(id) = u32::try_from(idx) else {
                 continue;
             };
             if !mask.get(id) {
                 continue;
             }
+            // `idx < node_count()` の範囲であることは上のループ条件が保証する
+            // ため、`level_of` は必ず `Some` を返す（CSR 化前の `Vec<Node>`
+            // 直接走査と等価。`unwrap_or(0)` は範囲外到達不能の防御的処理）。
+            let level = self.level_of(id).unwrap_or(0);
             match best {
-                Some((_, best_level)) if best_level >= node.level => {}
-                _ => best = Some((id, node.level)),
+                Some((_, best_level)) if best_level >= level => {}
+                _ => best = Some((id, level)),
             }
         }
         best.map(|(id, _)| id)
@@ -1485,7 +2273,7 @@ impl HnswIndex {
         target: usize,
         visited: &mut VisitedBitmap,
     ) -> usize {
-        visited.reset(self.nodes.len());
+        visited.reset(self.graph.node_count());
         if visited.mark_visited(start as usize) != Some(false) {
             return 0;
         }
@@ -1566,7 +2354,7 @@ impl HnswIndex {
         ef: usize,
         level: usize,
         dim: usize,
-        vectors: &[f32],
+        vectors: &NodeVectors,
         visited: &mut V,
         accept: Option<&NodeMask>,
     ) -> Result<Vec<ScoredNode>, HnswError> {
@@ -1595,6 +2383,11 @@ impl HnswIndex {
     /// 受理判定・順序規約は [`Self::search_layer`] の既存契約から一切変更
     /// していない（先読みは demand load の発行位置を早めるだけで、
     /// 探索結果・比較順序には影響しない）。
+    ///
+    /// 本体は [`search_layer_in`]（Issue #494。[`Adjacency`] でジェネリック化
+    /// した自由関数。構築中の [`GraphBuilder::search_layer`] とも共有する）へ
+    /// 委譲する薄いラッパー。`self.graph`（[`csr::CsrGraph`]）を渡すだけで、
+    /// アルゴリズム本体・停止条件・受理判定は変更していない。
     #[allow(clippy::too_many_arguments)]
     pub(in crate::hnsw) fn search_layer_with<V: VisitedSet, P: prefetch::PrefetchPolicy>(
         &self,
@@ -1603,122 +2396,23 @@ impl HnswIndex {
         ef: usize,
         level: usize,
         dim: usize,
-        vectors: &[f32],
+        vectors: &NodeVectors,
         visited: &mut V,
         accept: Option<&NodeMask>,
         prefetch: &P,
     ) -> Result<Vec<ScoredNode>, HnswError> {
-        visited.reset(self.nodes.len());
-        let mut candidates: BinaryHeap<ScoredNode> = BinaryHeap::new();
-        // 結果集合は最小ヒープとして扱いたいので `Reverse` で包む。
-        let mut results: BinaryHeap<std::cmp::Reverse<ScoredNode>> = BinaryHeap::new();
-        let is_accepted = |node: u32| accept.map(|m| m.get(node)).unwrap_or(true);
-
-        for ep in entry_points {
-            match visited.mark_visited(ep as usize) {
-                Some(true) => continue,
-                Some(false) => {}
-                None => continue,
-            }
-            if !is_accepted(ep) {
-                // 非受理（stale・不可視）ノードは候補ヒープへも一切積まない
-                // （§関数ドキュメンテーションコメント参照。訪問済みマークのみ
-                // 付けてスコア計算・以降の探索を行わない）。
-                continue;
-            }
-            let score = self.score(ep, query, dim, vectors)?;
-            let scored = ScoredNode { node: ep, score };
-            candidates.push(scored);
-            results.push(std::cmp::Reverse(scored));
-        }
-
-        while let Some(top_candidate) = candidates.pop() {
-            // 候補集合の最良要素が、結果集合中の最悪要素より「厳密に」劣るなら
-            // 打ち切る（Algorithm 2 の停止条件）。ここは `ScoredNode::cmp`（id
-            // 昇順タイブレーク込みの複合順序）ではなく **スコアのみ**の比較に
-            // 限定する。複合順序で判定すると、スコアが同点で id が大きいだけの
-            // 候補まで「より遠い」と誤判定して打ち切ってしまい、その候補の
-            // 未訪問隣接ノードがより近い可能性を探索し損なう（同点候補が
-            // 生じやすい重複 embedding で顕在化。
-            // `docs/design/hnsw-graph-construction.md`「`search_layer` の
-            // 停止・受理判定: 順序規約の使い分け」節参照）。
-            // id 順の複合順序は結果集合の内容（`results.pop()` によるヒープ
-            // 内での追い出し順）・最終出力の安定ソートでのみ使い、探索を続ける
-            // か否かの判定には使わない。
-            if let Some(std::cmp::Reverse(worst)) = results.peek() {
-                let strictly_farther =
-                    top_candidate.score.total_cmp(&worst.score) == std::cmp::Ordering::Less;
-                if results.len() >= ef && strictly_farther {
-                    break;
-                }
-            }
-
-            if let Some(neighbors) = self.neighbors(level, top_candidate.node) {
-                // Issue #490: hnswlib `searchBaseLayerST` に倣うソフトウェア
-                // パイプライン先読み。隣接リストの先頭要素をループ開始前に、
-                // 以降は各反復 `j` の先頭で `j+1` 番目を先読みする（距離 1）。
-                // 受理判定後にのみ触れる P0 契約（Issue #431 是正。§関数
-                // ドキュメンテーションコメント参照）を守るため、`is_accepted`
-                // を通過したノードのみを先読み対象にする——`is_accepted` は
-                // `NodeMask::get` の純粋なビット判定で副作用を持たないため、
-                // 自身の反復時に再評価しても意味は変わらない。
-                if let Some(&first) = neighbors.first() {
-                    if is_accepted(first) {
-                        prefetch.prefetch_neighbor(first, visited, vectors, dim);
-                    }
-                }
-                for (j, &neighbor) in neighbors.iter().enumerate() {
-                    if let Some(&next) = neighbors.get(j + 1) {
-                        if is_accepted(next) {
-                            prefetch.prefetch_neighbor(next, visited, vectors, dim);
-                        }
-                    }
-                    let already = match visited.mark_visited(neighbor as usize) {
-                        Some(seen) => seen,
-                        None => continue,
-                    };
-                    if already {
-                        continue;
-                    }
-                    if !is_accepted(neighbor) {
-                        // 非受理ノードは訪問済みにするのみで候補ヒープへは
-                        // 積まない（Issue #431 是正。§関数ドキュメンテーション
-                        // コメント参照）。スコア計算（このノードのベクトルへの
-                        // アクセス）自体を行わず、この隣接ノード経由でのさらに
-                        // 先の探索も一切行わない。
-                        continue;
-                    }
-                    let neighbor_score = self.score(neighbor, query, dim, vectors)?;
-                    let scored = ScoredNode {
-                        node: neighbor,
-                        score: neighbor_score,
-                    };
-                    // 打ち切り判定と同じ理由でスコアのみの比較に限定する
-                    // （`scored` が `worst` とスコア同点なら、id 順の複合順序で
-                    // 「劣る」と判定されても受理する）。`worst_ok` を満たす
-                    // 隣接ノードは（上の `is_accepted` チェックを通過済みのため）
-                    // 候補ヒープ・結果ヒープの双方へ積む。
-                    let worst_ok = match results.peek() {
-                        Some(std::cmp::Reverse(worst)) => {
-                            results.len() < ef
-                                || scored.score.total_cmp(&worst.score) != std::cmp::Ordering::Less
-                        }
-                        None => true,
-                    };
-                    if worst_ok {
-                        candidates.push(scored);
-                        results.push(std::cmp::Reverse(scored));
-                        if results.len() > ef {
-                            results.pop();
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut out: Vec<ScoredNode> = results.into_iter().map(|r| r.0).collect();
-        out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
-        Ok(out)
+        search_layer_in(
+            &self.graph,
+            entry_points,
+            query,
+            ef,
+            level,
+            dim,
+            vectors,
+            visited,
+            accept,
+            prefetch,
+        )
     }
 
     /// 近傍選択ヒューリスティック（Algorithm 4）。既定は `extend_candidates=false`・
@@ -1728,6 +2422,12 @@ impl HnswIndex {
     /// 形（候補の隣接をさらに候補へ加える拡張）は実装しない（到達しない分岐は
     /// 検証されないままコードに残り将来のバグ源になるため。既定を有効化する
     /// 場合に別途実装する）。
+    ///
+    /// 構築経路（[`GraphBuilder::insert_node`]）は本体（[`select_neighbors_heuristic_free`]）
+    /// を直接呼ぶため、本メソッドは production 経路からは呼ばれない
+    /// （Issue #494）。テスト（`select_neighbors_heuristic_prunes_redundant_close_candidates`）
+    /// が `HnswIndex` 経由で純粋関数の挙動を検証するために残す。
+    #[cfg(test)]
     fn select_neighbors_heuristic(
         &self,
         candidates: &[ScoredNode],
@@ -1741,78 +2441,6 @@ impl HnswIndex {
         select_neighbors_heuristic_free(candidates, m, dim, vectors)
     }
 
-    /// `from -> to` への単方向リンクを層 `level` へ追加する（重複・自己ループは
-    /// 追加しない）。次数上限の適用は呼び出し元の [`Self::shrink_links`] が担う。
-    fn connect(&mut self, from: u32, to: u32, level: usize) {
-        if from == to {
-            return;
-        }
-        let Some(node) = self.nodes.get_mut(from as usize) else {
-            return;
-        };
-        let Some(links) = node.links.get_mut(level) else {
-            return;
-        };
-        if !links.contains(&to) {
-            links.push(to);
-        }
-    }
-
-    /// `node` の層 `level` における隣接数が次数上限を超えていれば、その隣接集合
-    /// 全体へヒューリスティック近傍選択を再適用して上限内へ縮退させる
-    /// （Algorithm 1 の「次数上限超過時の再選択」段）。
-    ///
-    /// `protect` は、この呼び出し直前に `insert_node` が `node <-> protect` へ
-    /// 張ったばかりの逆方向リンク先（新規挿入ノード自身）。ヒューリスティックが
-    /// `protect` を枝刈りしてしまうと、新規ノードへの唯一の入口だった逆方向
-    /// リンクが失われ、エントリポイントからの到達路が残らないまま孤立し得る
-    /// （挿入ノードは自身の外向きリンクは持つが、探索はエントリポイントから
-    /// 既存ノードの隣接リストを辿って到達するため入方向のリンクが要る）。
-    /// ヒューリスティック選択後に `protect` が漏れて
-    /// いれば、選択済み集合中で最もスコアが低い（＝末尾の）要素と差し替えて
-    /// 強制的に残す。
-    ///
-    /// この保証は「`protect` の挿入時点で選ばれた各近傍が `protect` への逆方向
-    /// リンクを保持する」ことのみを担保する insertion-time の不変条件であり、
-    /// 後続の別ノード挿入がこれらの近傍を再度 `shrink_links` する際に `protect`
-    /// が漏れる余地までは塞がない（グローバルな到達性の恒久保証ではない）。
-    /// 全ノード挿入後に残るその残差ケースは `HnswIndex::build` 末尾の
-    /// [`Self::repair_reachability`] が閉じる（この関数自体は呼ばない。
-    /// 呼ぶと、他の未到達ノードを直すための枝刈りが無関係な第三のノードの
-    /// 唯一の到達経路を巻き込んで壊す whack-a-mole が起こり得るため）。
-    /// 詳細は `docs/design/hnsw-graph-construction.md`
-    /// 「逆方向リンクの到達性保証」節参照。
-    fn shrink_links(
-        &mut self,
-        node: u32,
-        level: usize,
-        dim: usize,
-        vectors: &[f32],
-        protect: u32,
-    ) -> Result<(), HnswError> {
-        let limit = max_degree_for(&self.params, level);
-        let current_links: Vec<u32> = self
-            .nodes
-            .get(node as usize)
-            .and_then(|n| n.links.get(level))
-            .cloned()
-            .unwrap_or_default();
-        // 縮退の計算本体（読み取り→再選択）は `compute_shrink` という純粋関数に
-        // 切り出し済み。並列構築（`parallel_build`。Issue #406）は書き込みロック
-        // 1 回の中で「現在のリンクを読む→`compute_shrink`→書き戻す」を原子的に
-        // 行うことで同じ計算を共有する（`docs/design/hnsw-parallel-build.md`
-        // 参照）。逐次経路（本メソッド）はロック不要のため読み→計算→書き込みを
-        // そのまま `self.nodes` への 2 回のアクセスとして行う。
-        if let Some(shrunk) = compute_shrink(&current_links, node, dim, vectors, limit, protect)? {
-            if let Some(n) = self.nodes.get_mut(node as usize) {
-                if let Some(links) = n.links.get_mut(level) {
-                    *links = shrunk;
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// `dot(node, query)`。ノード id が範囲外／`vectors` が短すぎる場合は
     /// `NonFiniteVector` 相当ではなく、境界検証は [`node_vector`] が担う
     /// （呼び出し元は構築時に検証済みの id しか渡さない内部専用パス）。結果が
@@ -1823,10 +2451,11 @@ impl HnswIndex {
         node: u32,
         query: &[f32],
         dim: usize,
-        vectors: &[f32],
+        vectors: &NodeVectors,
     ) -> Result<f32, HnswError> {
-        // 並列構築（`parallel_build`）と共有する純粋関数へ委譲する。
-        score_of(vectors, dim, node, query)
+        // Issue #514: 常駐精度（f32／f16）に依存しない [`NodeSource::score`]
+        // へ委譲する。
+        vectors.score(dim, node, query)
     }
 
     /// 構築済みパラメータを返す。
@@ -1841,12 +2470,12 @@ impl HnswIndex {
 
     /// 構築済みノード数。
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.graph.node_count()
     }
 
     /// ノード数が 0 か。
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.graph.node_count() == 0
     }
 
     /// `build` 時点の内部スナップショット（`self.vectors`）から `node` 番目の
@@ -1855,36 +2484,84 @@ impl HnswIndex {
     /// 返す（呼び出し元がテーブル世代整合キャッシュの差分判定〔`Overlay::compute`〕
     /// で「索引済みノードが現在も存在するか」を確認する用途のため、専用の
     /// エラー型を経由させる必要がない）。
+    ///
+    /// f16 常駐（[`ResidentPrecision::F16`]・Issue #514）のときは f32 表現が
+    /// 存在しないため常に `None` を返す（D5）。f16 のビット表現は
+    /// [`Self::vector_f16`] を使う。
     pub fn vector(&self, node: u32) -> Option<&[f32]> {
-        node_vector(&self.vectors, self.dim as usize, node).ok()
+        match &self.vectors {
+            NodeVectors::F32(v) => node_vector(v, self.dim as usize, node).ok(),
+            NodeVectors::F16(_) => None,
+        }
     }
 
-    /// 索引本体（隣接リスト・複製ベクトル）の概算ヒープバイト量（Issue #408。
-    /// `sql::hnsw_cache::HnswIndexCache` の容量判定・観測用統計が使う）。
-    /// `self.vectors`（`build` 時に複製した `Arc<[f32]>`）＋各ノードの隣接
-    /// リスト（層ごとの `Vec<u32>`）の `capacity()` を合算する。
+    /// [`Self::vector`] の f16 常駐版（Issue #514）。`resident_precision() ==
+    /// ResidentPrecision::F32` のときは常に `None`（D5）。
+    pub fn vector_f16(&self, node: u32) -> Option<&[u16]> {
+        match &self.vectors {
+            NodeVectors::F32(_) => None,
+            NodeVectors::F16(v) => node_vector_u16(v, self.dim as usize, node).ok(),
+        }
+    }
+
+    /// 索引ノードの実効常駐精度（Issue #514）。`build_with_precision` 等で
+    /// 要求した精度が f16 範囲外成分により `F32` へ自動縮退した場合
+    /// （D6）、この値は要求値と異なる。
+    pub fn resident_precision(&self) -> ResidentPrecision {
+        self.resident_precision
+    }
+
+    /// 索引済みノード `node` の格納ベクトルが `candidate`（呼び出し元のクエリ
+    /// スナップショットから取り出した現在の行）と「一致するとみなせるか」を
+    /// 判定する（Issue #514・D4）。`sql::hnsw_cache::Overlay::compute` の
+    /// 差分検出（世代進行直後に再インデックスすべき行の特定）が使う。
+    ///
+    /// - `F32` 常駐: `node_vector` を `to_bits()` で厳密比較する（旧
+    ///   `sql::hnsw_cache::vectors_bit_equal`〔本 Issue で撤去・本メソッドへ
+    ///   統合〕と同じ判定）。
+    /// - `F16` 常駐: `candidate` を `f16::f32_to_f16_bits` で符号化したビット列と
+    ///   格納ビット列を比較する。f16 分解能未満の摂動は「未変更」と判定される
+    ///   （最終スコアは常に f32 アリーナから再計算されるため結果の正しさは
+    ///   保たれ、影響はグラフ近傍構造の再利用判定のみに限られる）。
+    /// - `node` が範囲外、または `candidate.len() != dim` の場合は `None`
+    ///   （呼び出し元は差分ありとして扱う）。
+    pub(crate) fn node_matches(&self, node: u32, candidate: &[f32]) -> Option<bool> {
+        let dim = self.dim as usize;
+        if candidate.len() != dim {
+            return None;
+        }
+        match &self.vectors {
+            NodeVectors::F32(v) => {
+                let stored = node_vector(v, dim, node).ok()?;
+                Some(
+                    stored
+                        .iter()
+                        .zip(candidate.iter())
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                )
+            }
+            NodeVectors::F16(v) => {
+                let stored = node_vector_u16(v, dim, node).ok()?;
+                Some(
+                    stored
+                        .iter()
+                        .zip(candidate.iter())
+                        .all(|(&a, &b)| a == crate::f16::f32_to_f16_bits(b)),
+                )
+            }
+        }
+    }
+
+    /// 索引本体（CSR 隣接表現・複製ベクトル）の概算ヒープバイト量（Issue #408。
+    /// `sql::hnsw_cache::HnswIndexCache` の容量判定・観測用統計が使う。
+    /// Issue #494 で CSR 化した後は [`csr::CsrGraph::approx_heap_bytes`] へ
+    /// 委譲する）。`self.vectors`（Issue #514: [`NodeVectors`]。常駐精度に
+    /// 応じ f32／f16 いずれかのバイト量）＋ [`csr::CsrGraph`] の 4 配列の
+    /// `capacity()` を合算する。
     pub fn approx_heap_bytes(&self) -> usize {
-        let vectors_bytes = self
-            .vectors
-            .len()
-            .saturating_mul(std::mem::size_of::<f32>());
-        let nodes_bytes: usize = self
-            .nodes
-            .iter()
-            .map(|node| {
-                let links_bytes: usize = node
-                    .links
-                    .iter()
-                    .map(|l| {
-                        l.capacity()
-                            .saturating_mul(std::mem::size_of::<u32>())
-                            .saturating_add(std::mem::size_of::<Vec<u32>>())
-                    })
-                    .fold(0usize, |acc, n| acc.saturating_add(n));
-                links_bytes.saturating_add(std::mem::size_of::<Node>())
-            })
-            .fold(0usize, |acc, n| acc.saturating_add(n));
-        vectors_bytes.saturating_add(nodes_bytes)
+        self.vectors
+            .approx_bytes()
+            .saturating_add(self.graph.approx_heap_bytes())
     }
 
     /// グラフ全体の最大層（エントリポイントのレベル）。空索引では `None`。
@@ -1899,16 +2576,13 @@ impl HnswIndex {
 
     /// ノード `node` が割り当てられたレベル。存在しないノードは `None`。
     pub fn level_of(&self, node: u32) -> Option<usize> {
-        self.nodes.get(node as usize).map(|n| n.level)
+        Adjacency::level_of(&self.graph, node)
     }
 
     /// 層 `level` におけるノード `node` の隣接リスト。存在しない層・ノードは
     /// `None`（ノードのレベルが `level` 未満の場合を含む）。
     pub fn neighbors(&self, level: usize, node: u32) -> Option<&[u32]> {
-        self.nodes
-            .get(node as usize)
-            .and_then(|n| n.links.get(level))
-            .map(|l| l.as_slice())
+        Adjacency::neighbors(&self.graph, level, node)
     }
 
     /// 層 `level` における最大次数（層 0 は `2*m`、層 1 以上は `m`）。テスト・
@@ -2038,13 +2712,13 @@ impl HnswIndex {
             });
         }
         if let Some(m) = mask {
-            if m.len() != self.nodes.len() {
+            if m.len() != self.graph.node_count() {
                 return Err(HnswError::InvalidParams {
                     reason: "mask length does not match index node count",
                 });
             }
         }
-        if k == 0 || self.nodes.is_empty() {
+        if k == 0 || self.graph.node_count() == 0 {
             return Ok(Vec::new());
         }
 
@@ -2152,6 +2826,154 @@ impl HnswIndex {
     }
 }
 
+/// [`HnswIndex::search_layer_with`]／[`GraphBuilder::search_layer`] が
+/// 共有する `search_layer`（Algorithm 2）の本体（Issue #494。凍結後の
+/// [`csr::CsrGraph`]・構築中の [`GraphBuilder`] のどちらの隣接表現からも
+/// 呼べるよう [`Adjacency`] でジェネリック化した自由関数）。層 `level` 上で
+/// `entry_points` から出発し、幅 `ef` の貪欲拡張探索を行い、`dot` 降順
+/// （同点は id 昇順）に並んだ最大 `ef` 件の候補を返す。
+///
+/// `visited` は呼び出し元（`insert_node`／`build` あるいはテスト）が全
+/// 呼び出しをまたいで所有する visited 集合（[`VisitedSet`]）。構築経路は
+/// 世代カウンタ方式の [`VisitedScratch`]、探索経路（[`HnswIndex::search`]）は
+/// ビットマップ方式の [`VisitedBitmap`] を渡す。`accept`（Issue #409）が
+/// `Some` の場合、受理しないノードは候補ヒープへも一切積まない——訪問済み
+/// マークは付けるが、スコア計算（索引ノードのベクトルへのアクセスを伴う）
+/// 自体を行わず、その隣接ノードへの探索も一切行わない（Issue #431・
+/// codex-review P0 是正。`docs/design/ann-index-adoption.md`「RLS／
+/// フィルタとの相互作用と折衷案」節の P0 安全条件）。`None` の場合は常に
+/// 受理したのと同じ振る舞いになる（`search_masked_none_matches_search` 参照）。
+#[allow(clippy::too_many_arguments)]
+fn search_layer_in<
+    V: VisitedSet,
+    P: prefetch::PrefetchPolicy,
+    A: Adjacency,
+    S: NodeSource + ?Sized,
+>(
+    graph: &A,
+    entry_points: Vec<u32>,
+    query: &[f32],
+    ef: usize,
+    level: usize,
+    dim: usize,
+    vectors: &S,
+    visited: &mut V,
+    accept: Option<&NodeMask>,
+    prefetch: &P,
+) -> Result<Vec<ScoredNode>, HnswError> {
+    visited.reset(graph.node_count());
+    let mut candidates: BinaryHeap<ScoredNode> = BinaryHeap::new();
+    // 結果集合は最小ヒープとして扱いたいので `Reverse` で包む。
+    let mut results: BinaryHeap<std::cmp::Reverse<ScoredNode>> = BinaryHeap::new();
+    let is_accepted = |node: u32| accept.map(|m| m.get(node)).unwrap_or(true);
+
+    for ep in entry_points {
+        match visited.mark_visited(ep as usize) {
+            Some(true) => continue,
+            Some(false) => {}
+            None => continue,
+        }
+        if !is_accepted(ep) {
+            // 非受理（stale・不可視）ノードは候補ヒープへも一切積まない
+            // （§関数ドキュメンテーションコメント参照。訪問済みマークのみ
+            // 付けてスコア計算・以降の探索を行わない）。
+            continue;
+        }
+        let score = vectors.score(dim, ep, query)?;
+        let scored = ScoredNode { node: ep, score };
+        candidates.push(scored);
+        results.push(std::cmp::Reverse(scored));
+    }
+
+    while let Some(top_candidate) = candidates.pop() {
+        // 候補集合の最良要素が、結果集合中の最悪要素より「厳密に」劣るなら
+        // 打ち切る（Algorithm 2 の停止条件）。ここは `ScoredNode::cmp`（id
+        // 昇順タイブレーク込みの複合順序）ではなく **スコアのみ**の比較に
+        // 限定する。複合順序で判定すると、スコアが同点で id が大きいだけの
+        // 候補まで「より遠い」と誤判定して打ち切ってしまい、その候補の
+        // 未訪問隣接ノードがより近い可能性を探索し損なう（同点候補が
+        // 生じやすい重複 embedding で顕在化。
+        // `docs/design/hnsw-graph-construction.md`「`search_layer` の
+        // 停止・受理判定: 順序規約の使い分け」節参照）。
+        // id 順の複合順序は結果集合の内容（`results.pop()` によるヒープ
+        // 内での追い出し順）・最終出力の安定ソートでのみ使い、探索を続ける
+        // か否かの判定には使わない。
+        if let Some(std::cmp::Reverse(worst)) = results.peek() {
+            let strictly_farther =
+                top_candidate.score.total_cmp(&worst.score) == std::cmp::Ordering::Less;
+            if results.len() >= ef && strictly_farther {
+                break;
+            }
+        }
+
+        if let Some(neighbors) = graph.neighbors(level, top_candidate.node) {
+            // Issue #490: hnswlib `searchBaseLayerST` に倣うソフトウェア
+            // パイプライン先読み。隣接リストの先頭要素をループ開始前に、
+            // 以降は各反復 `j` の先頭で `j+1` 番目を先読みする（距離 1）。
+            // 受理判定後にのみ触れる P0 契約（Issue #431 是正。§関数
+            // ドキュメンテーションコメント参照）を守るため、`is_accepted`
+            // を通過したノードのみを先読み対象にする——`is_accepted` は
+            // `NodeMask::get` の純粋なビット判定で副作用を持たないため、
+            // 自身の反復時に再評価しても意味は変わらない。
+            if let Some(&first) = neighbors.first() {
+                if is_accepted(first) {
+                    prefetch.prefetch_neighbor(first, visited, vectors, dim);
+                }
+            }
+            for (j, &neighbor) in neighbors.iter().enumerate() {
+                if let Some(&next) = neighbors.get(j + 1) {
+                    if is_accepted(next) {
+                        prefetch.prefetch_neighbor(next, visited, vectors, dim);
+                    }
+                }
+                let already = match visited.mark_visited(neighbor as usize) {
+                    Some(seen) => seen,
+                    None => continue,
+                };
+                if already {
+                    continue;
+                }
+                if !is_accepted(neighbor) {
+                    // 非受理ノードは訪問済みにするのみで候補ヒープへは
+                    // 積まない（Issue #431 是正。§関数ドキュメンテーション
+                    // コメント参照）。スコア計算（このノードのベクトルへの
+                    // アクセス）自体を行わず、この隣接ノード経由でのさらに
+                    // 先の探索も一切行わない。
+                    continue;
+                }
+                let neighbor_score = vectors.score(dim, neighbor, query)?;
+                let scored = ScoredNode {
+                    node: neighbor,
+                    score: neighbor_score,
+                };
+                // 打ち切り判定と同じ理由でスコアのみの比較に限定する
+                // （`scored` が `worst` とスコア同点なら、id 順の複合順序で
+                // 「劣る」と判定されても受理する）。`worst_ok` を満たす
+                // 隣接ノードは（上の `is_accepted` チェックを通過済みのため）
+                // 候補ヒープ・結果ヒープの双方へ積む。
+                let worst_ok = match results.peek() {
+                    Some(std::cmp::Reverse(worst)) => {
+                        results.len() < ef
+                            || scored.score.total_cmp(&worst.score) != std::cmp::Ordering::Less
+                    }
+                    None => true,
+                };
+                if worst_ok {
+                    candidates.push(scored);
+                    results.push(std::cmp::Reverse(scored));
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<ScoredNode> = results.into_iter().map(|r| r.0).collect();
+    out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
+    Ok(out)
+}
+
 /// row-major バッファから `node` 番目のベクトルスライスを取り出す。範囲外
 /// アクセスは `[]` を使わず `get()` で検出し、`CapacityOverflow` として拒否する
 /// （coding-rust.md: untrusted 添字アクセス禁止。本関数はモジュール内部専用だが
@@ -2164,6 +2986,151 @@ fn node_vector(vectors: &[f32], dim: usize, node: u32) -> Result<&[f32], HnswErr
     let end = start.checked_add(dim).ok_or(HnswError::CapacityOverflow)?;
     vectors.get(start..end).ok_or(HnswError::CapacityOverflow)
 }
+
+/// [`GraphBuilder::repair_reachability_inner`] のフェーズ 1 が使う最近傍探索
+/// （[`nearest_reachable`]）の並列度を決める方針関数（Issue #449。方針
+/// （何本立てるか）と機構（実際の分割走査。[`nearest_reachable`] 側）を分離し、
+/// それぞれを独立にテストできるようにする）。
+///
+/// `crate::parallel_search::thread_count_for`（検索側の並列度決定と同一関数。
+/// `MIN_ROWS_PER_THREAD` による小規模時の 1 本への縮退を含む）を到達済み集合
+/// のサイズで評価し、構築側が引き継いだ `threads` 上限でさらにクランプする。
+/// `threads==1`（`build`・`build_with_threads` の縮退経路）では常に 1 を返し、
+/// [`nearest_reachable`] は並列分岐を一切通らない。
+fn repair_workers_for(reachable_len: usize, threads: usize) -> usize {
+    crate::parallel_search::thread_count_for(reachable_len).min(threads.max(1))
+}
+
+/// `current` と `candidate`（`(id, score)`）のうち、モジュール冒頭「順序規約」
+/// （スコア `total_cmp` 降順・同点は id 昇順）に従って採用すべき方を返す。
+/// この規約は全順序を成すため、[`nearest_reachable`] が到達集合をどう分割し・
+/// 各ワーカーの局所最良をどの順序で縮約しても、最終的に選ばれる候補は分割・
+/// 縮約の順序に依存せず一意に定まる（`repair_reachability_inner` の
+/// ドキュメンテーションコメント「探索の並列化」参照）。
+fn better_repair_candidate(
+    current: Option<(u32, f32)>,
+    candidate: (u32, f32),
+) -> Option<(u32, f32)> {
+    match current {
+        None => Some(candidate),
+        Some((cur_id, cur_score)) => match candidate.1.total_cmp(&cur_score) {
+            std::cmp::Ordering::Greater => Some(candidate),
+            std::cmp::Ordering::Equal if candidate.0 < cur_id => Some(candidate),
+            _ => current,
+        },
+    }
+}
+
+/// `candidates`（`reachable` の全体または 1 ワーカー分のチャンク）を逐次走査し
+/// `query` に最も近い（`dot` 最大・同点 id 昇順）候補を返す（[`nearest_reachable`]
+/// の逐次経路・並列ワーカー本体の双方が共有する機構）。非有限スコアは
+/// `HnswError::NonFiniteScore` として拒否する（`repair_reachability_inner` の
+/// 既存契約と同一。モジュール冒頭「距離カーネル」節参照）。
+fn nearest_reachable_scan(
+    vectors: &[f32],
+    dim: usize,
+    query: &[f32],
+    candidates: &[u32],
+) -> Result<Option<(u32, f32)>, HnswError> {
+    let mut best: Option<(u32, f32)> = None;
+    for &candidate in candidates {
+        let cand_vec = node_vector(vectors, dim, candidate)?;
+        let score = dot(query, cand_vec);
+        if !score.is_finite() {
+            return Err(HnswError::NonFiniteScore { node: candidate });
+        }
+        best = better_repair_candidate(best, (candidate, score));
+    }
+    Ok(best)
+}
+
+/// 到達済み集合 `reachable`（id 昇順）から `node` に最も近い候補を返す
+/// （[`GraphBuilder::repair_reachability_inner`] フェーズ 1 が使う読み取り
+/// 専用の探索。Issue #449）。`workers<=1` または `reachable.len()<=1` では
+/// 分割せず [`nearest_reachable_scan`] を直接呼ぶ（ワーカーを一切起動しない
+/// 逐次経路。`threads==1` の `build`・`build_with_threads` 縮退経路はここへ
+/// 到達する）。`workers>=2` では `reachable` を `workers` 個の連続チャンクへ
+/// 分割し、各チャンクを別スレッド（`std::thread::scope`）で
+/// [`nearest_reachable_scan`] に掛けて局所最良を求め、
+/// [`better_repair_candidate`] の全順序で縮約する——縮約順序に依存せず結果は
+/// 一意に定まるため、`workers` の値によらずビット同一の結果を返す
+/// （呼び出し元 `repair_reachability_inner` のドキュメンテーションコメント
+/// 「探索の並列化」参照）。
+///
+/// ワーカーの panic（`join` 失敗）は `HnswError::WorkerPanicked` として
+/// 構築全体を拒否する（`parallel_build::build_parallel_graph` の
+/// `first_error`／`any_panicked` パターンと同型の fail-closed 契約。部分的に
+/// 探索したまま `Ok` を返さない）。
+fn nearest_reachable(
+    vectors: &[f32],
+    dim: usize,
+    node: u32,
+    reachable: &[u32],
+    workers: usize,
+) -> Result<Option<(u32, f32)>, HnswError> {
+    let query = node_vector(vectors, dim, node)?;
+    if workers <= 1 || reachable.len() <= 1 {
+        return nearest_reachable_scan(vectors, dim, query, reachable);
+    }
+    #[cfg(test)]
+    REPAIR_PARALLEL_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let chunk_len = reachable.len().div_ceil(workers).max(1);
+    let first_error: std::sync::Mutex<Option<HnswError>> = std::sync::Mutex::new(None);
+    let (any_panicked, locals): (bool, Vec<Option<(u32, f32)>>) = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in reachable.chunks(chunk_len) {
+            let first_error_ref = &first_error;
+            handles.push(scope.spawn(move || -> Option<(u32, f32)> {
+                match nearest_reachable_scan(vectors, dim, query, chunk) {
+                    Ok(best) => best,
+                    Err(e) => {
+                        let mut fe = first_error_ref
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        if fe.is_none() {
+                            *fe = Some(e);
+                        }
+                        None
+                    }
+                }
+            }));
+        }
+        let mut any_panicked = false;
+        let mut locals = Vec::with_capacity(handles.len());
+        for h in handles {
+            match h.join() {
+                Ok(v) => locals.push(v),
+                Err(_) => {
+                    any_panicked = true;
+                    locals.push(None);
+                }
+            }
+        }
+        (any_panicked, locals)
+    });
+    if any_panicked {
+        return Err(HnswError::WorkerPanicked);
+    }
+    if let Some(e) = first_error
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner())
+    {
+        return Err(e);
+    }
+    let mut best: Option<(u32, f32)> = None;
+    for local in locals.into_iter().flatten() {
+        best = better_repair_candidate(best, local);
+    }
+    Ok(best)
+}
+
+/// [`nearest_reachable`] が `workers>=2` の並列分岐を実際に通った回数
+/// （テスト専用の非 vacuous 検証カウンタ。Issue #449。`#[cfg(test)]` の
+/// 内外で完全に消える——production バイナリには一切残らない）。
+#[cfg(test)]
+static REPAIR_PARALLEL_LAUNCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// `build`（`HnswParams::validate` → 次元整合 → ノード数上限 → 非有限値の
 /// 検証順序。モジュール `build` ドキュメンテーションコメント参照）と
@@ -2392,6 +3359,30 @@ mod tests {
         out
     }
 
+    /// 直接組んだ `Node` 列（可変長ビルダー表現）から `HnswIndex` を構成する
+    /// テスト専用ヘルパ（Issue #494・凍結時の CSR 平坦化）。`HnswIndex` の
+    /// 内部表現が `CsrGraph`（[`csr::CsrGraph`]）へ変わったため、テストは
+    /// `build`／並列構築を経由せず直接グラフ形状を指定したい場合でも
+    /// [`GraphBuilder`] を経由してから [`HnswIndex::freeze_from`] で凍結する
+    /// 必要がある。`repair_reachability` は呼ばない（テストが指定したグラフ
+    /// 形状をそのまま保持するため。呼ぶとテストが意図的に作った未修復の
+    /// 状態が変わってしまう）。
+    fn index_from_nodes(
+        params: HnswParams,
+        dim: u32,
+        nodes: Vec<Node>,
+        entry_point: Option<u32>,
+        vectors: Arc<[f32]>,
+    ) -> HnswIndex {
+        let builder = GraphBuilder {
+            params,
+            nodes,
+            entry_point,
+        };
+        HnswIndex::freeze_from(builder, dim, vectors, ResidentPrecision::F32)
+            .expect("test fixture nodes must be valid for CSR flattening")
+    }
+
     /// Issue #490: prefetch を一切行わない `PrefetchPolicy`（テスト専用）。
     /// `PipelinePrefetch` とのビット同一性の対照として使う。production
     /// バイナリには到達しない（`#[cfg(test)]` の `mod tests` 内限定）。
@@ -2399,11 +3390,11 @@ mod tests {
     struct NoPrefetch;
 
     impl prefetch::PrefetchPolicy for NoPrefetch {
-        fn prefetch_neighbor<V: VisitedSet>(
+        fn prefetch_neighbor<V: VisitedSet, S: NodeSource + ?Sized>(
             &self,
             _node: u32,
             _visited: &V,
-            _v: &[f32],
+            _v: &S,
             _d: usize,
         ) {
         }
@@ -2418,7 +3409,13 @@ mod tests {
     }
 
     impl prefetch::PrefetchPolicy for RecordingPrefetch {
-        fn prefetch_neighbor<V: VisitedSet>(&self, node: u32, _visited: &V, _v: &[f32], _d: usize) {
+        fn prefetch_neighbor<V: VisitedSet, S: NodeSource + ?Sized>(
+            &self,
+            node: u32,
+            _visited: &V,
+            _v: &S,
+            _d: usize,
+        ) {
             self.seen.borrow_mut().push(node);
         }
     }
@@ -2596,10 +3593,10 @@ mod tests {
             m: 2,
             ..Default::default()
         };
-        let index = HnswIndex {
+        let index = index_from_nodes(
             params,
-            dim: dim as u32,
-            nodes: vec![
+            dim as u32,
+            vec![
                 Node {
                     level: 0,
                     links: vec![Vec::new()],
@@ -2613,12 +3610,12 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
+            Some(0),
             // 本テストは select_neighbors_heuristic を直接呼ぶのみで search() を
             // 経由しないため、`vectors` の内容は使われない（プレースホルダで
             // 十分）。
-            vectors: Arc::from(vectors.clone()),
-        };
+            Arc::from(vectors.clone()),
+        );
         let query = &[1.0f32, 0.0f32];
         let candidates = vec![
             ScoredNode {
@@ -2708,7 +3705,7 @@ mod tests {
                     params.ef_construction,
                     0,
                     dim,
-                    &vectors,
+                    &index.vectors,
                     &mut visited,
                     None,
                 )
@@ -2738,10 +3735,10 @@ mod tests {
         // dim=1 の `dot(v, q) = v[0] * q[0]` なので `q=[1.0]` のときスコアは
         // ノード値そのものになる。
         let vectors: Vec<f32> = vec![10.0, 10.0, 20.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 Node {
                     level: 0,
                     links: vec![vec![1]],
@@ -2755,16 +3752,25 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
+            Some(0),
             // 本テストは search_layer を直接呼ぶのみで search() を経由しない
             // ため、`vectors` フィールドの内容は使われない（プレースホルダで
             // 十分）。
-            vectors: Arc::from(vectors.clone()),
-        };
+            Arc::from(vectors.clone()),
+        );
         let query = [1.0f32];
         let mut visited = VisitedScratch::default();
         let results = index
-            .search_layer(vec![0], &query, 1, 0, dim, &vectors, &mut visited, None)
+            .search_layer(
+                vec![0],
+                &query,
+                1,
+                0,
+                dim,
+                &index.vectors,
+                &mut visited,
+                None,
+            )
             .expect("search_layer should succeed");
         assert_eq!(
             results.iter().map(|s| s.node).collect::<Vec<_>>(),
@@ -2803,10 +3809,10 @@ mod tests {
         // dim=1 の `dot(v, q) = v[0] * q[0]` なので `q=[1.0]` のときスコアは
         // ノード値そのもの。node2 が最良スコアだが node1 経由でしか到達できない。
         let vectors: Vec<f32> = vec![10.0, 15.0, 20.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 Node {
                     level: 0,
                     links: vec![vec![1]],
@@ -2820,9 +3826,9 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
-            vectors: Arc::from(vectors),
-        };
+            Some(0),
+            Arc::from(vectors),
+        );
         let query = [1.0f32];
         let mut scratch = HnswSearchScratch::default();
 
@@ -2892,10 +3898,10 @@ mod tests {
     fn search_finds_expected_top_k_on_minimal_graph() {
         let dim = 1usize;
         let vectors: Vec<f32> = vec![10.0, 10.0, 20.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 Node {
                     level: 0,
                     links: vec![vec![1]],
@@ -2909,11 +3915,11 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
+            Some(0),
             // search() は `self.vectors`（build 時の不変スナップショット）を
             // 参照するため、struct literal でも同じ内容を設定する。
-            vectors: Arc::from(vectors.clone()),
-        };
+            Arc::from(vectors.clone()),
+        );
         let query = [1.0f32];
         let mut scratch = HnswSearchScratch::default();
         let results = index.search(&query, 2, 1, &mut scratch).unwrap();
@@ -2966,7 +3972,7 @@ mod tests {
                         ef,
                         0,
                         fixture_dim,
-                        vectors,
+                        &index.vectors,
                         &mut visited_no,
                         None,
                         &NoPrefetch,
@@ -2982,7 +3988,7 @@ mod tests {
                         ef,
                         0,
                         fixture_dim,
-                        vectors,
+                        &index.vectors,
                         &mut visited_pipeline,
                         None,
                         &prefetch::PipelinePrefetch,
@@ -3052,7 +4058,7 @@ mod tests {
                 ef,
                 0,
                 dim,
-                &vectors,
+                &index.vectors,
                 &mut visited_no,
                 Some(&mask),
                 &NoPrefetch,
@@ -3066,7 +4072,7 @@ mod tests {
                 ef,
                 0,
                 dim,
-                &vectors,
+                &index.vectors,
                 &mut visited_pipeline,
                 Some(&mask),
                 &prefetch::PipelinePrefetch,
@@ -3120,7 +4126,7 @@ mod tests {
                 40,
                 0,
                 dim,
-                &vectors,
+                &index.vectors,
                 &mut visited,
                 Some(&mask),
                 &recorder,
@@ -3290,10 +4296,10 @@ mod tests {
     fn is_mask_fully_reachable_uses_the_same_alternate_entry_as_search_masked() {
         let dim = 1usize;
         let vectors: Vec<f32> = vec![0.0, 1.0, 2.0, 3.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 // node0: entry point（マスクで非受理にする）。他ノードとは
                 // 無関係な孤立ノードにしておき、誤って起点に使われた場合の
                 // 挙動が明確になるようにする。
@@ -3314,9 +4320,9 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
-            vectors: Arc::from(vectors),
-        };
+            Some(0),
+            Arc::from(vectors),
+        );
 
         let mut mask = NodeMask::new(index.len());
         mask.set(1);
@@ -3369,10 +4375,10 @@ mod tests {
         let dim = 1usize;
         // dot(v, q) = v[0] * q[0]、q=[1.0] なのでスコアは値そのもの。
         let vectors: Vec<f32> = vec![5.0, 100.0, 10.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 // node0: entry。level1 隣接は node2（スコア上位のため貪欲降下
                 // は必ずここへ移動する）。level0 隣接は node1・node2 の両方
                 // （有向: node2 側からの逆辺は無い）。
@@ -3393,9 +4399,9 @@ mod tests {
                     links: vec![Vec::new(), Vec::new()],
                 },
             ],
-            entry_point: Some(0),
-            vectors: Arc::from(vectors),
-        };
+            Some(0),
+            Arc::from(vectors),
+        );
 
         let mut mask = NodeMask::new(index.len());
         mask.set(0);
@@ -3448,10 +4454,10 @@ mod tests {
     ) {
         let dim = 1usize;
         let vectors: Vec<f32> = vec![1.0, 2.0, 3.0, 100.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 Node {
                     level: 0,
                     links: vec![vec![1]],
@@ -3470,9 +4476,9 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
-            vectors: Arc::from(vectors),
-        };
+            Some(0),
+            Arc::from(vectors),
+        );
         let query = [1.0f32];
         let mut scratch = HnswSearchScratch::default();
 
@@ -3617,5 +4623,443 @@ mod tests {
              got {shrunk:?}"
         );
         assert!(shrunk.len() <= limit, "got {shrunk:?}");
+    }
+
+    // ---------- f16 常駐（Issue #514・親 #513。ポインタ: TASK-132・TASK-156・CORE-16） ----------
+
+    /// T-H1: 同一入力で `build`（F32）と `build_with_precision(F16)` の
+    /// グラフ（`entry_point`／`level_of`／`neighbors`）が全ノード・全層で一致
+    /// すること（D7: 構築は常に f32、精度は凍結時にのみ影響する）。
+    #[test]
+    fn f16_precision_produces_identical_graph_shape_to_f32() {
+        let dim = 8usize;
+        let n = 200;
+        let vectors = gen_corpus(0x0514_af16, dim, n);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+        };
+        let f32_index = HnswIndex::build(params, dim as u32, &vectors, 42).unwrap();
+        let f16_index = HnswIndex::build_with_precision(
+            params,
+            ResidentPrecision::F16,
+            dim as u32,
+            &vectors,
+            42,
+        )
+        .unwrap();
+
+        assert_eq!(f16_index.resident_precision(), ResidentPrecision::F16);
+        assert_eq!(f32_index.entry_point(), f16_index.entry_point());
+        assert_eq!(f32_index.len(), f16_index.len());
+        for node in 0..f32_index.len() as u32 {
+            assert_eq!(
+                f32_index.level_of(node),
+                f16_index.level_of(node),
+                "node={node}"
+            );
+            let max_level = f32_index.level_of(node).unwrap_or(0);
+            for level in 0..=max_level {
+                assert_eq!(
+                    f32_index.neighbors(level, node),
+                    f16_index.neighbors(level, node),
+                    "node={node} level={level}"
+                );
+            }
+        }
+    }
+
+    /// T-H2: F16 常駐索引の `approx_heap_bytes` が F32 常駐索引より小さいこと
+    /// （R1: 常駐メモリ半減が目的）。
+    #[test]
+    fn f16_precision_uses_less_heap_than_f32() {
+        let dim = 32usize;
+        let n = 500;
+        let vectors = gen_corpus(0x1620, dim, n);
+        let params = HnswParams::default();
+        let f32_index = HnswIndex::build(params, dim as u32, &vectors, 7).unwrap();
+        let f16_index = HnswIndex::build_with_precision(
+            params,
+            ResidentPrecision::F16,
+            dim as u32,
+            &vectors,
+            7,
+        )
+        .unwrap();
+        assert!(
+            f16_index.approx_heap_bytes() < f32_index.approx_heap_bytes(),
+            "f16={} f32={}",
+            f16_index.approx_heap_bytes(),
+            f32_index.approx_heap_bytes()
+        );
+    }
+
+    /// T-H3: `node_matches`（D4）・`vector`／`vector_f16`（D5）の契約。
+    #[test]
+    fn f16_node_matches_and_accessors_follow_d4_d5_contract() {
+        let dim = 4usize;
+        let n = 50;
+        let vectors = gen_corpus(0x0d4, dim, n);
+        let f16_index = HnswIndex::build_with_precision(
+            HnswParams::default(),
+            ResidentPrecision::F16,
+            dim as u32,
+            &vectors,
+            3,
+        )
+        .unwrap();
+        assert_eq!(f16_index.resident_precision(), ResidentPrecision::F16);
+
+        // D5: F16 常駐時は `vector()` は常に None、`vector_f16()` は Some。
+        assert!(f16_index.vector(0).is_none());
+        assert!(f16_index.vector_f16(0).is_some());
+        assert_eq!(f16_index.vector_f16(u32::try_from(n).unwrap()), None);
+
+        // D4: 未変更（同一 f32 行）は一致と判定される。
+        let row: Vec<f32> = vectors[0..dim].to_vec();
+        assert_eq!(f16_index.node_matches(0, &row), Some(true));
+
+        // D4: 大きな変更は不一致と判定される（f16 の分解能を大きく超える差）。
+        let mut changed = row.clone();
+        changed[0] += 100.0;
+        assert_eq!(f16_index.node_matches(0, &changed), Some(false));
+
+        // D4: f16 分解能未満の摂動は「未変更」と判定されうる（最終スコアは
+        // 常に f32 アリーナから再計算されるため結果の正しさには影響しない）。
+        let mut tiny = row.clone();
+        tiny[0] += 1e-7;
+        assert_eq!(f16_index.node_matches(0, &tiny), Some(true));
+
+        // 範囲外ノード・次元不一致は None。
+        assert_eq!(
+            f16_index.node_matches(u32::try_from(n).unwrap(), &row),
+            None
+        );
+        assert_eq!(f16_index.node_matches(0, &row[..dim - 1]), None);
+    }
+
+    /// T-H4: f16 の有限範囲（`|x| <= 65504.0`）を超える成分を含む入力を `F16`
+    /// 指定で build すると `F32` へ自動縮退し（D6）、`search` は成功する。
+    #[test]
+    fn f16_precision_falls_back_to_f32_when_a_component_is_out_of_range() {
+        let dim = 4usize;
+        let mut vectors = gen_corpus(0x0fa11, dim, 30);
+        // 1 成分だけ f16 範囲外にする。
+        if let Some(v) = vectors.get_mut(2) {
+            *v = 100_000.0;
+        }
+        let index = HnswIndex::build_with_precision(
+            HnswParams::default(),
+            ResidentPrecision::F16,
+            dim as u32,
+            &vectors,
+            9,
+        )
+        .unwrap();
+        assert_eq!(
+            index.resident_precision(),
+            ResidentPrecision::F32,
+            "out-of-range component must trigger fallback to F32 residency"
+        );
+        // 縮退後も通常どおり探索できる（F32 常駐のため `vector()` は Some）。
+        assert!(index.vector(0).is_some());
+        let query = gen_corpus(0x0fa12, dim, 1);
+        let mut scratch = HnswSearchScratch::default();
+        let hits = index.search(&query, 5, 40, &mut scratch).unwrap();
+        assert!(!hits.is_empty());
+    }
+
+    /// T-H5: F16 常駐索引の `search` が brute-force（`kernel::dot`）対照で
+    /// 妥当な Recall@10 を達成すること（クラスタ構造ありフィクスチャ。層 A
+    /// 縮小規模）。既存の F32 版 `hnsw_search.rs` 層 A と同じ判定方式を、
+    /// f16 常駐についても固定する。
+    #[test]
+    fn f16_precision_search_achieves_reasonable_recall_against_brute_force() {
+        let dim = 16usize;
+        let n = 600;
+        // クラスタ構造ありフィクスチャ（`hnsw_search.rs` の層 A と同じ方式:
+        // 少数の中心点周辺に密集させる）。
+        let mut rng = DeterministicRng::new(0xc111);
+        let n_clusters = 6usize;
+        let centers: Vec<f32> = (0..n_clusters * dim)
+            .map(|_| {
+                let bits = rng.next_u64() >> 40;
+                ((bits as f32) / (1u32 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect();
+        let mut vectors = Vec::with_capacity(n * dim);
+        for i in 0..n {
+            let c = i % n_clusters;
+            for d in 0..dim {
+                let bits = rng.next_u64() >> 40;
+                let jitter = ((bits as f32) / (1u32 << 24) as f32) * 0.1 - 0.05;
+                vectors.push(centers[c * dim + d] + jitter);
+            }
+        }
+
+        let params = HnswParams {
+            m: 16,
+            ef_construction: 100,
+            ef_search: 64,
+        };
+        let index = HnswIndex::build_with_precision(
+            params,
+            ResidentPrecision::F16,
+            dim as u32,
+            &vectors,
+            11,
+        )
+        .unwrap();
+        assert_eq!(index.resident_precision(), ResidentPrecision::F16);
+
+        let queries = 40;
+        let k = 10usize;
+        let ef = 64usize;
+        let mut scratch = HnswSearchScratch::default();
+        let mut recall_hits = 0usize;
+        let mut recall_total = 0usize;
+        for q in 0..queries {
+            let query = gen_corpus(0x0c1a55 + q as u64, dim, 1);
+            let mut brute: Vec<ScoredNode> = (0..n as u32)
+                .map(|node| ScoredNode {
+                    node,
+                    score: dot(node_vector(&vectors, dim, node).unwrap(), &query),
+                })
+                .collect();
+            brute.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
+            let truth: std::collections::HashSet<u32> =
+                brute.iter().take(k).map(|s| s.node).collect();
+
+            let hits = index.search(&query, k, ef, &mut scratch).unwrap();
+            recall_total += truth.len();
+            recall_hits += hits
+                .iter()
+                .filter(|h| truth.contains(&(h.id as u32)))
+                .count();
+        }
+        let recall = recall_hits as f64 / recall_total as f64;
+        assert!(
+            recall >= 0.7,
+            "f16 resident recall@{k} too low: {recall} ({recall_hits}/{recall_total})"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #449: repair_reachability の到達不能ノード探索・再接続の並列化
+    // ------------------------------------------------------------------
+
+    /// `repair_workers_for` の方針（Issue #449）: 到達集合が小さい（既定
+    /// `MIN_ROWS_PER_THREAD`=1,024 未満）場合は `threads` の値によらず常に
+    /// 1 に縮退し、十分大きい場合は `threads` と実行環境の並列度の小さい方
+    /// まで増える。
+    #[test]
+    fn repair_workers_for_clamps_small_reachable_sets_and_respects_threads_cap() {
+        assert_eq!(
+            repair_workers_for(400, 12),
+            1,
+            "MIN_ROWS_PER_THREAD 未満の到達集合は 1 スレッドへ縮退するはず"
+        );
+        assert_eq!(
+            repair_workers_for(400, 1),
+            1,
+            "threads=1（縮退経路）は常に 1"
+        );
+
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let expected = crate::parallel_search::thread_count_for(100_000).min(12);
+        assert_eq!(
+            repair_workers_for(100_000, 12),
+            expected,
+            "十分大きい到達集合では available_parallelism と threads の小さい方まで増える"
+        );
+        if available >= 2 {
+            assert!(
+                repair_workers_for(100_000, 12) >= 2,
+                "この実行環境（available_parallelism={available}）では複数スレッドまで増えるはず"
+            );
+        }
+    }
+
+    /// `nearest_reachable` の並列経路（`workers>=2`）が逐次経路
+    /// （`workers==1`）とビット同一の結果を返すことを、実際に並列分岐を通した
+    /// 上で固定する（Issue #449「探索の並列化」。非 vacuous 性は
+    /// `REPAIR_PARALLEL_LAUNCHES` カウンタで検証する）。
+    #[test]
+    fn nearest_reachable_matches_across_worker_counts_and_actually_parallelizes() {
+        let dim = 8usize;
+        let n = 5_000usize;
+        let vectors = gen_corpus(0x4E45_4152_4553_5449u64, dim, n);
+        // 到達集合は 0 番ノードを除く全ノード（`node` 自身は候補に含めない
+        // 既存契約——`repair_reachability_inner` 側で `reachable` は
+        // `bfs_reachable_mask` の到達集合から作るため `node` 自身は通常含み
+        // 得るが、ここでは機構単体テストのため任意の候補列を渡す）。
+        let reachable: Vec<u32> = (1..n as u32).collect();
+        let node = 0u32;
+
+        let before = REPAIR_PARALLEL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
+        let sequential = nearest_reachable(&vectors, dim, node, &reachable, 1)
+            .expect("sequential nearest_reachable must succeed");
+        let after_sequential = REPAIR_PARALLEL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            before, after_sequential,
+            "workers=1 は並列分岐を通らないはず"
+        );
+
+        for workers in [2usize, 4, 8] {
+            let parallel = nearest_reachable(&vectors, dim, node, &reachable, workers)
+                .expect("parallel nearest_reachable must succeed");
+            assert_eq!(
+                sequential, parallel,
+                "workers={workers} の結果が逐次経路とビット一致しない"
+            );
+        }
+        let after_parallel = REPAIR_PARALLEL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after_parallel > after_sequential,
+            "workers>=2 の呼び出しで並列分岐が実際に起動しているはず（非 vacuous 性の検証）"
+        );
+    }
+
+    /// 全ノード挿入後・修復前の `GraphBuilder` を組み立てるテスト専用ヘルパ
+    /// （Issue #449。`build_inner` の挿入ループと同じ手順を、修復
+    /// （`repair_reachability_inner`）呼び出し前で止めて返す。異なる
+    /// `threads` で修復した結果を比較するテストが、修復前の同一グラフを
+    /// 複数回・決定的に再現するために使う）。
+    fn build_unrepaired(
+        params: HnswParams,
+        dim: usize,
+        vectors: &[f32],
+        seed: u64,
+    ) -> GraphBuilder {
+        let n = vectors.len() / dim;
+        let mut builder = GraphBuilder {
+            params,
+            nodes: Vec::with_capacity(n),
+            entry_point: None,
+        };
+        let mut rng = DeterministicRng::new(seed);
+        let mut visited = VisitedScratch::default();
+        for node_idx in 0..n {
+            let level = assign_level(&mut rng, params.m);
+            let node_id = node_idx as u32;
+            builder
+                .insert_node(node_id, level, dim, vectors, &mut visited)
+                .expect("insertion must succeed on this deterministic corpus");
+        }
+        builder
+    }
+
+    /// `GraphBuilder`（修復前）を id 昇順 → レベル → 各層のリンク列の順で
+    /// FNV-1a 64bit ハッシュへ投入する（`tests/hnsw.rs::
+    /// graph_fingerprint_is_stable_across_representation_change` と同じ
+    /// 方式。private フィールドへ直接アクセスできる本モジュール内テスト
+    /// 限定のヘルパ）。
+    fn fingerprint_builder(builder: &GraphBuilder) -> u64 {
+        fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
+            const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+            for &b in bytes {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+            hash
+        }
+        const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+
+        let mut hash = FNV_OFFSET_BASIS;
+        hash = fnv1a_update(hash, &(builder.nodes.len() as u64).to_le_bytes());
+        hash = fnv1a_update(
+            hash,
+            &builder
+                .entry_point
+                .map(|e| e as i64)
+                .unwrap_or(-1)
+                .to_le_bytes(),
+        );
+        for node in &builder.nodes {
+            hash = fnv1a_update(hash, &(node.level as u64).to_le_bytes());
+            for links in &node.links {
+                hash = fnv1a_update(hash, &(links.len() as u64).to_le_bytes());
+                for &nb in links {
+                    hash = fnv1a_update(hash, &nb.to_le_bytes());
+                }
+            }
+        }
+        hash
+    }
+
+    /// `clusters` 個のクラスタ中心の完全な複製で行を埋める重複ヘビーコーパス
+    /// （`tests/hnsw.rs::gen_duplicate_heavy_corpus` と同じ設計意図——完全同点
+    /// スコアを誘発しフェーズ 1／フェーズ 2 の双方を確実に発火させる。本
+    /// モジュール内テスト専用の独立実装）。
+    fn gen_duplicate_heavy_corpus_local(
+        seed: u64,
+        dim: usize,
+        rows: usize,
+        clusters: usize,
+    ) -> Vec<f32> {
+        let mut rng = DeterministicRng::new(seed);
+        let centers: Vec<Vec<f32>> = (0..clusters.max(1))
+            .map(|_| {
+                (0..dim)
+                    .map(|_| {
+                        let bits = rng.next_u64() >> 40;
+                        (bits as f32) / (1u32 << 24) as f32 * 2.0 - 1.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut out = Vec::with_capacity(rows * dim);
+        for i in 0..rows {
+            out.extend_from_slice(&centers[i % centers.len()]);
+        }
+        out
+    }
+
+    /// `repair_reachability_inner`（Issue #449 の並列化後）が `threads` の値
+    /// によらずビット同一のグラフを返すことを、重複ヘビーコーパス（フェーズ
+    /// 1・フェーズ 2 双方を確実に発火させる）で固定する end-to-end テスト。
+    /// 修復前の `GraphBuilder` は `build_unrepaired` で決定的に再構築し
+    /// （`GraphBuilder` は `Clone` を実装しないため、insertion が決定的で
+    /// あることを利用して複数回同じグラフを作り直す）、各 `threads` で
+    /// 修復した結果を [`fingerprint_builder`] で比較する。
+    #[test]
+    fn repair_reachability_inner_is_thread_count_invariant_on_duplicate_heavy_graph() {
+        let dim = 12usize;
+        let rows = 3_000usize;
+        let clusters = 6usize;
+        let seed = 0x5EED_0449u64;
+        let vectors = gen_duplicate_heavy_corpus_local(seed, dim, rows, clusters);
+        let params = HnswParams::default().with_m(6).with_ef_construction(32);
+
+        let mut fingerprints = Vec::new();
+        for &threads in &[1usize, 2, 4] {
+            let mut builder = build_unrepaired(params, dim, &vectors, seed);
+            let stats = builder
+                .repair_reachability_inner::<true>(dim, &vectors, threads)
+                .expect("repair must succeed on this deterministic corpus");
+            // 非 vacuous 性: フェーズ 1・フェーズ 2 の双方が実際に発火した
+            // ことを確認する（重複ヘビーコーパスが意図どおり同点スコアを
+            // 誘発していることの検証）。
+            assert!(
+                stats.levels.iter().any(|l| l.phase1_iterations > 0),
+                "threads={threads}: フェーズ 1 が一度も発火しなかった"
+            );
+            assert!(
+                stats.levels.iter().any(|l| l.phase2_nodes > 0),
+                "threads={threads}: フェーズ 2 が一度も発火しなかった"
+            );
+            fingerprints.push((threads, fingerprint_builder(&builder)));
+        }
+
+        let (base_threads, base_fp) = fingerprints[0];
+        for &(threads, fp) in &fingerprints[1..] {
+            assert_eq!(
+                base_fp, fp,
+                "threads={base_threads} と threads={threads} でグラフが一致しない"
+            );
+        }
     }
 }

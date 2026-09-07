@@ -53,7 +53,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::arena::{ArenaError, VectorArena};
-use crate::catalog::CatalogError;
+use crate::catalog::{table_lookup_error, CatalogError, TableSchema};
 use crate::dispatch::{self, DispatchError, DispatchInput, ExecutionPath};
 use crate::kernel::{CandidateHit, KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::{PolicyContext, PolicyError};
@@ -1064,6 +1064,12 @@ pub struct EngineCore {
     /// デコード）を同一テーブル世代内で再利用する（詳細は
     /// `sql::arena_cache::SqlArenaCache` のドキュメント参照）。
     sql_arena_cache: crate::sql::arena_cache::SqlArenaCache,
+    /// スカラー列二次索引（`sql::exec::execute_statement_with_cache` の gated
+    /// 構築。Issue #473）のテーブル世代整合キャッシュ。索引はまだ誰にも
+    /// 消費されない派生データであり（候補削減は Issue #474）、
+    /// [`Self::scalar_index_cache_stats`] のみが観測用に参照する。詳細は
+    /// `sql::scalar_index::ScalarIndexCache` のドキュメント参照。
+    scalar_index_cache: crate::sql::scalar_index::ScalarIndexCache,
     /// `sql::aggregate::execute_aggregate`（`GROUP BY` なし・`WHERE` なしの
     /// `DecodeTier::Fast` 単一行集計）専用の可視行テーブル世代整合キャッシュ
     /// （Issue #478）。ヒット時は `user_rows/{table}` を一切開かずに `COUNT(*)`
@@ -1132,6 +1138,72 @@ fn dictionary_required_columns(
                 .to_string()
         })?;
     Ok((path_idx, body_idx))
+}
+
+/// [`Self::execute_insert_sql`]・[`Self::execute_insert_sql_batch`] が
+/// `sql::allowlist::validate_insert` へ渡す [`crate::sql::allowlist::TableLookup`]
+/// 実装（Issue #485・単文 INSERT 経路の上位段改善）。
+///
+/// 従来は 1 文の INSERT につき `validate_insert` 内の `Storage::table_exists`
+/// （`get_table_schema` 呼び出し・read txn #1）と、束縛のために呼ぶ
+/// `Storage::get_table_schema`（read txn #2）の 2 回、スキーマを別々の
+/// read txn・別々のデコードで取得していた（write txn 内で行う
+/// `require_table_schema_write` の TOCTOU 再読込とは別に、読み取り専用の
+/// 事前検証段だけで 2 回）。本構造体は `table_exists` が最初に取得した
+/// スキーマを [`std::cell::RefCell`] へ保持し、直後の束縛が
+/// [`Self::take_schema`] で再取得できるようにすることで、read txn・
+/// decode を 1 回に減らす（`docs/design/ingest-stage-profile.md`
+/// 「Issue #485 追記」参照）。
+///
+/// スキーマを保持する契約は「`table_exists` に最後に渡されたテーブル名と
+/// 一致する場合のみ」に限定する（`take_schema` 側でも名前を突き合わせる。
+/// `validate_insert` は 1 文につき `table_exists` を 1 回しか呼ばないため
+/// 通常は不一致が起きないが、将来の呼び出し順変更に対する fail-closed な
+/// 防御であり、不一致時は呼び出し元が既存の `get_table_schema` 経路へ
+/// フォールバックする）。カタログ照会自体が失敗した場合のエラー写像は
+/// `catalog::table_lookup_error`（`impl TableLookup for Storage` と共有）
+/// を使い、`table_exists` 単体と文言・`wire_code` を一致させる。
+struct InsertSchemaLookup<'a> {
+    storage: &'a Storage,
+    cached: std::cell::RefCell<Option<(String, TableSchema)>>,
+}
+
+impl<'a> InsertSchemaLookup<'a> {
+    fn new(storage: &'a Storage) -> Self {
+        Self {
+            storage,
+            cached: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// `table_exists` が最後に取得したスキーマを、要求されたテーブル名と
+    /// 一致する場合にのみ返す（消費型。1 回取り出したら空になる）。
+    fn take_schema(&self, table_name: &str) -> Option<TableSchema> {
+        let mut cached = self.cached.borrow_mut();
+        match cached.take() {
+            Some((name, schema)) if name == table_name => Some(schema),
+            other => {
+                // 名前不一致・未保持のいずれも fail-closed に空へ戻す
+                // （呼び出し元は既存の `get_table_schema` 経路へフォール
+                // バックするため、ここで誤ったスキーマを返してはならない）。
+                *cached = other.filter(|(name, _)| name == table_name);
+                None
+            }
+        }
+    }
+}
+
+impl crate::sql::allowlist::TableLookup for InsertSchemaLookup<'_> {
+    fn table_exists(&self, name: &str) -> Result<bool, crate::sql::allowlist::SqlSurfaceError> {
+        match self.storage.get_table_schema(name) {
+            Ok(schema) => {
+                *self.cached.borrow_mut() = Some((name.to_string(), schema));
+                Ok(true)
+            }
+            Err(CatalogError::TableNotFound(_)) => Ok(false),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
 }
 
 impl EngineCore {
@@ -1266,6 +1338,7 @@ impl EngineCore {
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
             sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
+            scalar_index_cache: crate::sql::scalar_index::ScalarIndexCache::new(),
             visible_bitmap_cache: crate::sql::visible_cache::VisibleBitmapCache::new(),
             search_engine_kind,
             hnsw_state,
@@ -1303,6 +1376,16 @@ impl EngineCore {
     /// （`core_api.snapshot` の対象外。`prefilter_cache_stats` と同じ方針）。
     pub fn sql_arena_cache_stats(&self) -> crate::sql::arena_cache::SqlArenaCacheStats {
         self.sql_arena_cache.stats()
+    }
+
+    /// `sql::scalar_index::ScalarIndexCache` の現在の統計を返す（Issue #473。
+    /// テスト・運用観測用）。テナント ID・行 ID・スカラー値等の機微情報は含まない
+    /// （`ScalarIndexCacheStats` 参照）。`VectorCore` trait には載せない固有
+    /// メソッド（`core_api.snapshot` の対象外。`sql_arena_cache_stats` と同じ
+    /// 方針）。索引はまだ SQL 実行結果を左右しない（Issue #474 が消費する）ため、
+    /// このメソッドは observability 専用であり検索結果には影響しない。
+    pub fn scalar_index_cache_stats(&self) -> crate::sql::scalar_index::ScalarIndexCacheStats {
+        self.scalar_index_cache.stats()
     }
 
     /// `sql::visible_cache::VisibleBitmapCache` の現在の統計を返す（Issue #478。
@@ -1986,19 +2069,32 @@ impl EngineCore {
         // トークンが `SELECT` であることを要求）へ流れて `42601` で拒否される
         // （挙動は本変更の前後で不変）。検索モード句（`USING MODE` 等）は
         // `INSERT` の許可形状に存在しないため `validate_insert` 側の構文検証で
-        // 同じく拒否される。覗き見トークナイズ自体が失敗した場合は分岐せず
+        // 同じく拒否される。
+        //
+        // Issue #485: 覗き見トークナイズの結果（`tokens`）を捨てずに保持し、
+        // `INSERT` と判定した場合は `validate_insert_tokens` へそのまま渡す
+        // ことで、1 文あたり `tokenize` を 1 回に減らす（以前は本判定用と
+        // `execute_insert_sql`（`validate_insert`）内の 2 回呼んでいた）。
+        // トークナイズ自体が失敗した場合（`tokens` が `Err`）は分岐せず
         // `validate_sql` へフォールスルーし、同一入力に対して同じ構文エラーを
-        // 返す（fail-closed。二重トークナイズによる無駄はあるが untrusted 入力の
-        // 長さは wire 層で既に上限検証済みのため許容する）。
-        let is_insert_statement = crate::sql::lexer::tokenize(sql).is_ok_and(|tokens| {
-            matches!(
+        // 返す（fail-closed。この経路では `tokenize` が結局 2 回目走るが、
+        // 構文エラーとなる入力は稀であり untrusted 入力の長さは wire 層で
+        // 既に上限検証済みのため許容する）。
+        if let Ok(tokens) = crate::sql::lexer::tokenize(sql) {
+            let is_insert_statement = matches!(
                 tokens.first(),
                 Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("INSERT")
-            )
-        });
-        if is_insert_statement {
-            let outcome = self.execute_insert_sql(ctx, sql)?;
-            return Ok(crate::sql::SqlOutcome::Insert(outcome));
+            );
+            if is_insert_statement {
+                let lookup = InsertSchemaLookup::new(&self.storage);
+                let stmt = crate::sql::allowlist::validate_insert_tokens(
+                    &tokens,
+                    &lookup,
+                    self.ledger_mode,
+                )?;
+                let outcome = self.execute_insert_form(ctx, &stmt, &lookup)?;
+                return Ok(crate::sql::SqlOutcome::Insert(outcome));
+            }
         }
 
         let stmt = crate::sql::allowlist::validate_sql(sql, &self.storage)?;
@@ -2285,6 +2381,12 @@ impl EngineCore {
                             cache: &s.cache,
                             provider: s.provider,
                         }),
+                    // Issue #473: スカラー列二次索引の gated 構築（応答には未使用。
+                    // 詳細は `sql::scalar_index` のドキュメント参照）。
+                    Some(crate::sql::scalar_index::ScalarCacheAccess {
+                        storage: &self.storage,
+                        cache: &self.scalar_index_cache,
+                    }),
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -2500,6 +2602,11 @@ impl EngineCore {
                 let explain_engine = crate::sql::explain::ExplainEngine {
                     kind: self.search_engine_kind(),
                     ann_plan,
+                    // Issue #474: `pre_check_bindable` が構文段のみから確定
+                    // させた静的判定（LLM I/O・世代照合の影響を受けない。
+                    // 上記コメント「戻り値…このまま使い回してよい」と同じ
+                    // 理由）。
+                    scalar_plan: pre_check_shape.scalar_plan,
                 };
                 let result = crate::sql::explain::build_explain_result(&planned, &explain_engine);
                 Ok(crate::sql::SqlOutcome::Explain(result))
@@ -2924,24 +3031,51 @@ impl EngineCore {
         ctx: &PolicyContext,
         sql: &str,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let stmt = crate::sql::allowlist::validate_insert(sql, &self.storage, self.ledger_mode)?;
-        let schema = self
-            .storage
-            .get_table_schema(&stmt.table_name)
-            .map_err(|e| match e {
-                CatalogError::TableNotFound(name) => {
-                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
-                }
-                // `TableNotFound` 以外（`CorruptSchema` の格納済みカタログ断片・
-                // `Backend` の redb I/O 情報等）は detail へ一切展開しない固定文言に
-                // 丸める（codex-review P0 指摘・PR #189。`CatalogError::CorruptSchema`
-                // 自身の「wire クライアントへは detail を渡さない」契約と
-                // security.md P0「エラー経由で内部情報・存在情報を漏らさない」対応）。
-                _ => crate::sql::allowlist::SqlSurfaceError::Internal {
-                    detail: "failed to load table schema".to_string(),
-                },
-            })?;
-        let bound = crate::sql::parser::bind_insert_form(&stmt, &schema)?;
+        // Issue #485: `validate_insert` に `InsertSchemaLookup` を渡し、
+        // `table_exists` が取得したスキーマを `take_schema` で再利用する
+        // ことで、1 文あたり 2 回（read txn・decode とも）行っていたスキーマ
+        // 取得を 1 回へ減らす（`InsertSchemaLookup` のドキュメント参照）。
+        // 束縛・実行本体は [`Self::execute_insert_form`] へ委譲する（`core.rs::
+        // execute_sql_in_session` の INSERT 分岐と共有し二重実装を避けるため）。
+        let lookup = InsertSchemaLookup::new(&self.storage);
+        let stmt = crate::sql::allowlist::validate_insert(sql, &lookup, self.ledger_mode)?;
+        self.execute_insert_form(ctx, &stmt, &lookup)
+    }
+
+    /// [`Self::execute_insert_sql`]・[`Self::execute_sql_in_session`] の
+    /// INSERT 分岐が共有する束縛〜実行本体（Issue #485）。`validate_insert`／
+    /// `validate_insert_tokens` が返した `stmt` と、その検証時に使った
+    /// `lookup`（`table_exists` 呼び出しでスキーマをキャッシュ済み）を受け取り、
+    /// [`InsertSchemaLookup::take_schema`] でスキーマを再取得できればそれを
+    /// 使い、できなければ（名前不一致・未保持の防御的経路）`get_table_schema`
+    /// 単独呼び出しへ fail-closed にフォールバックする——いずれの経路でも
+    /// エラー写像・`wire_code` は本 Issue 導入前と完全に一致する。
+    fn execute_insert_form(
+        &self,
+        ctx: &PolicyContext,
+        stmt: &crate::sql::allowlist::ValidatedInsert,
+        lookup: &InsertSchemaLookup<'_>,
+    ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let schema = match lookup.take_schema(&stmt.table_name) {
+            Some(schema) => schema,
+            None => self
+                .storage
+                .get_table_schema(&stmt.table_name)
+                .map_err(|e| match e {
+                    CatalogError::TableNotFound(name) => {
+                        crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                    }
+                    // `TableNotFound` 以外（`CorruptSchema` の格納済みカタログ断片・
+                    // `Backend` の redb I/O 情報等）は detail へ一切展開しない固定文言に
+                    // 丸める（codex-review P0 指摘・PR #189。`CatalogError::CorruptSchema`
+                    // 自身の「wire クライアントへは detail を渡さない」契約と
+                    // security.md P0「エラー経由で内部情報・存在情報を漏らさない」対応）。
+                    _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "failed to load table schema".to_string(),
+                    },
+                })?,
+        };
+        let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
                 crate::sql::exec::execute_insert(&self.storage, ctx, &bound, self.ledger_mode)
@@ -3060,19 +3194,28 @@ impl EngineCore {
                 crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string())
             })?;
 
-            let stmt =
-                crate::sql::allowlist::validate_insert(sql, &self.storage, self.ledger_mode)?;
-            let schema = self
-                .storage
-                .get_table_schema(&stmt.table_name)
-                .map_err(|e| match e {
-                    CatalogError::TableNotFound(name) => {
-                        crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
-                    }
-                    _ => crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: "failed to load table schema".to_string(),
-                    },
-                })?;
+            // Issue #485: 単文経路（`execute_insert_sql`）と同じく
+            // `InsertSchemaLookup` で `validate_insert`（`table_exists`）と
+            // 束縛のスキーマ取得を 1 read txn・1 decode へ一本化する
+            // （1 ループ = 1 文につき新規インスタンス。他文とスキーマを
+            // 共有しない一時オブジェクトのため文をまたいだ取り違えは
+            // 起こらない）。
+            let lookup = InsertSchemaLookup::new(&self.storage);
+            let stmt = crate::sql::allowlist::validate_insert(sql, &lookup, self.ledger_mode)?;
+            let schema = match lookup.take_schema(&stmt.table_name) {
+                Some(schema) => schema,
+                None => self
+                    .storage
+                    .get_table_schema(&stmt.table_name)
+                    .map_err(|e| match e {
+                        CatalogError::TableNotFound(name) => {
+                            crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                        }
+                        _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "failed to load table schema".to_string(),
+                        },
+                    })?,
+            };
             let bound = crate::sql::parser::bind_insert_form(&stmt, &schema)?;
             match bound {
                 crate::sql::parser::BoundInsertForm::File(file_bound) => {
@@ -4587,6 +4730,7 @@ mod tests {
                 storage: &core.storage,
                 cache: &core.sql_arena_cache,
             }),
+            None,
             None,
         )
         .expect("execute_statement should succeed");
