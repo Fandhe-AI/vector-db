@@ -35,6 +35,20 @@
 # 上書き可）。`hnsw_force_ann_*` を使うのは、visited 実装の効果を可視候補数
 # だけに帰属させたいため——`full_scan_ratio` 既定〔1/10〕のまま可視率を
 # 動かすと ann_masked と plain scan の切替（Issue #487）が同時に交絡するため。
+#
+# `SWEEP_CANDIDATES=acorn`（ACORN-1〔2-hop 展開〕・Issue #501・#502）で
+# candidate セットを `hnsw_one_hop`（既定・ACORN 無効。full_scan_ratio 既定
+# 1/10）／`hnsw_acorn_1_1`（上記 ＋ BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO=
+# 1/1。ACORN opt-in・full_scan_ratio 以上のあらゆる可視比率で TwoHop）の
+# 2 candidate へ切り替えられる。`4/10`（`docs/design/hnsw-rls-cardinality-
+# switch.md` の既定値候補）を独立 candidate としないのは、既定 5 比率
+# （1/2・1/4・1/5・1/10・1/20）のもとでは各点の期待 arm が
+# `hnsw_one_hop`／`hnsw_acorn_1_1` いずれかと完全に一致し（1/2 は
+# full_scan_ratio=1/10 以上かつ 4/10 未満で 1-hop、1/4・1/5・1/10 は
+# full_scan_ratio 以上かつ 4/10 以下で 2-hop、1/20 は full_scan_ratio 未満で
+# plain scan——いずれも他方の candidate の観測値で代替できる）ため、3
+# candidate 目を追加しても新規の測定点を得られないと判断したため
+# （詳細は `docs/design/hnsw-rls-cardinality-switch.md`「Issue #502」節）。
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,6 +60,12 @@ if [ "${1:-}" = "--summarize" ]; then
   # awk のみで完結させ追加依存を持たない）。
   grep -H "stage(S0_hot_where_subset)" "${DIR}"/*.log | \
     sed -E 's#.*/([^/]+)\.log:stage\(S0_hot_where_subset\): rows=([0-9]+) median=([0-9.]+)ms.*#\1 rows=\2 median=\3ms#'
+  # ACORN-1（Issue #501・#502）の観測 arm・発火回数（`--summarize` 一覧に
+  # レイテンシと並べて転記できるよう、同じログファイル名を先頭に付与する）。
+  grep -H "arm expected=" "${DIR}"/*.log | \
+    sed -E 's#.*/([^/]+)\.log:knn_profile_bench: (arm expected=.*)#\1 \2#'
+  grep -H "acorn(delta)" "${DIR}"/*.log | \
+    sed -E 's#.*/([^/]+)\.log:knn_profile_bench: (acorn\(delta\).*)#\1 \2#'
   exit 0
 fi
 
@@ -97,8 +117,16 @@ case "${CANDIDATE_SET}" in
     DEFAULT_SCALES=(1)
     CANDIDATES=(hnsw_force_ann_dense hnsw_force_ann_sparse)
     ;;
+  acorn)
+    # Issue #501・#502: ACORN-1（2-hop 展開）opt-in の可視比率別 Recall・
+    # レイテンシ前後比較。full_scan_ratio 既定（1/10）のまま可視比率を動かす
+    # ため、1/20 は両 candidate とも plain scan（対照点）になる。
+    DEFAULT_RATIOS=("1/2" "1/4" "1/5" "1/10" "1/20")
+    DEFAULT_SCALES=(1)
+    CANDIDATES=(hnsw_one_hop hnsw_acorn_1_1)
+    ;;
   *)
-    echo "ERROR: unknown SWEEP_CANDIDATES=${CANDIDATE_SET} (expected: default, visited)" >&2
+    echo "ERROR: unknown SWEEP_CANDIDATES=${CANDIDATE_SET} (expected: default, visited, acorn)" >&2
     exit 1
     ;;
 esac
@@ -115,12 +143,15 @@ else
 fi
 
 # arm ごとの env 設定を解決する（$1=arm 名。case 全分岐で
-# BENCH_KNN_PROFILE_FULL_SCAN_RATIO／BENCH_KNN_PROFILE_SPARSE_VISITED_MAX を
-# 明示設定し、親シェルからの export 値が else 分岐で意図せず引き継がれる
-# 事故を防ぐ。空文字列は harness 側で「未設定」＝既定値として扱われる）。
+# BENCH_KNN_PROFILE_FULL_SCAN_RATIO／BENCH_KNN_PROFILE_SPARSE_VISITED_MAX／
+# BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO を明示設定し、親シェルからの
+# export 値が else 分岐で意図せず引き継がれる事故を防ぐ（Issue #502で
+# ACORN_MAX_VISIBLE_RATIO を追加した際も同方針を踏襲——全分岐で明示）。
+# 空文字列は harness 側で「未設定」＝既定値として扱われる。
 resolve_env() {
   local arm="$1"
   SPARSE_VISITED_MAX=""
+  ACORN_MAX_VISIBLE_RATIO=""
   case "${arm}" in
     baseline) ENGINE="brute_force"; FULL_SCAN_RATIO="" ;;
     hnsw_default) ENGINE="hnsw"; FULL_SCAN_RATIO="" ;;
@@ -128,6 +159,8 @@ resolve_env() {
     hnsw_force_plain) ENGINE="hnsw"; FULL_SCAN_RATIO="1/1" ;;
     hnsw_force_ann_dense) ENGINE="hnsw"; FULL_SCAN_RATIO="0/1"; SPARSE_VISITED_MAX="0" ;;
     hnsw_force_ann_sparse) ENGINE="hnsw"; FULL_SCAN_RATIO="0/1"; SPARSE_VISITED_MAX="18446744073709551615" ;;
+    hnsw_one_hop) ENGINE="hnsw"; FULL_SCAN_RATIO="" ;;
+    hnsw_acorn_1_1) ENGINE="hnsw"; FULL_SCAN_RATIO=""; ACORN_MAX_VISIBLE_RATIO="1/1" ;;
     *) echo "ERROR: unknown arm ${arm}" >&2; exit 1 ;;
   esac
 }
@@ -136,7 +169,7 @@ run_one() {
   local scale="$1" ratio="$2" arm="$3" label="$4" pair="$5"
   local ratio_slug="${ratio/\//_}"
   local log="${OUT_DIR}/scale${scale}_ratio${ratio_slug}_${label}_pair${pair}.log"
-  local ENGINE FULL_SCAN_RATIO SPARSE_VISITED_MAX
+  local ENGINE FULL_SCAN_RATIO SPARSE_VISITED_MAX ACORN_MAX_VISIBLE_RATIO
   resolve_env "${arm}"
 
   echo "loadavg=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo n/a)" >"${log}"
@@ -145,6 +178,7 @@ run_one() {
     BENCH_KNN_PROFILE_SCALE="${scale}" \
     BENCH_KNN_PROFILE_FULL_SCAN_RATIO="${FULL_SCAN_RATIO}" \
     BENCH_KNN_PROFILE_SPARSE_VISITED_MAX="${SPARSE_VISITED_MAX}" \
+    BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO="${ACORN_MAX_VISIBLE_RATIO}" \
     cargo bench --bench knn_profile_bench -p engine >>"${log}" 2>&1
 }
 

@@ -369,7 +369,7 @@ else
 endif
 
 .PHONY: bench-knn-visible-ratio
-bench-knn-visible-ratio: ## Issue #487（可視比率〔1/2・1/4・1/10・1/20・1/50〕× 行数〔25k・100k〕での hnsw_subset と plain scan の損益分岐点を交互 N≥5 ペアで計測する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。SWEEP_PAIRS=<N>〔既定 5〕でペア数を上書きできる。SWEEP_CANDIDATES=default|visited〔既定 default。visited は Issue #498 の sparse_visited_max 診断用 candidate〕・SWEEP_RATIOS／SWEEP_SCALES で候補セット・可視率・規模点を上書きできる。ログは target/bench-knn-visible-ratio/<unix-ts>/ 配下）
+bench-knn-visible-ratio: ## Issue #487（可視比率〔1/2・1/4・1/10・1/20・1/50〕× 行数〔25k・100k〕での hnsw_subset と plain scan の損益分岐点を交互 N≥5 ペアで計測する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。SWEEP_PAIRS=<N>〔既定 5〕でペア数を上書きできる。SWEEP_CANDIDATES=default|visited|acorn〔既定 default。visited は Issue #498 の sparse_visited_max 診断用 candidate、acorn は Issue #501・#502 の ACORN-1（2-hop 展開）opt-in 前後比較用 candidate〕・SWEEP_RATIOS／SWEEP_SCALES で候補セット・可視率・規模点を上書きできる。ログは target/bench-knn-visible-ratio/<unix-ts>/ 配下）
 ifdef HAS_CARGO
 	scripts/bench_knn_visible_ratio_sweep.sh
 else
@@ -567,6 +567,14 @@ ifdef HAS_CARGO
 	cargo test --release -p engine --test hnsw_search -- --ignored --nocapture
 else
 	@echo "skip: Cargo.toml 未追加のため hnsw-search-recall をスキップ"
+endif
+
+.PHONY: hnsw-acorn-recall
+hnsw-acorn-recall: ## Issue #502（ACORN-1〔2-hop 展開〕の可視比率別 Recall 回帰の層 B: 25,000 行・dim128 で可視比率 1/2・1/4・1/5・1/10 を横断し Recall@10・レジーム分類を標準出力へ記録する）を実行する（層 A は make ci 対象・crates/engine/tests/hnsw_acorn_recall.rs。層 B は #[ignore]・release 実行専用）
+ifdef HAS_CARGO
+	cargo test --release -p engine --test hnsw_acorn_recall -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため hnsw-acorn-recall をスキップ"
 endif
 
 # --------------------------------------------------
