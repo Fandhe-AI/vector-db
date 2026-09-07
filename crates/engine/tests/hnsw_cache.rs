@@ -1347,6 +1347,120 @@ fn full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants()
     );
 }
 
+/// Issue #497: `ValidatedHnswParams::with_sparse_visited_max(usize::MAX)`
+/// （マスク付き探索なら必ず [`engine::hnsw::VisitedSparse`] を選ぶ極端値）を
+/// opt-in した provider でも、既定 engine（`sparse_visited_max` 既定値 0＝常に
+/// dense）と同水準の Recall@10（≥ 0.9）を維持し、`HnswIndexCache` の統計
+/// （`sparse_visited_searches > 0`。非 vacuous）に実際の採否が反映され、
+/// tenant-b（Private）の private 行が tenant-a の結果へ混入しないことを固定
+/// する。フィルタなし DISTANCE クエリ（`FullVisible` 形状）は可視行全体を
+/// 受理する恒等マスクを使うため、`sparse_visited_max = usize::MAX` であれば
+/// 索引ノード数に関わらず sparse 側が選ばれる。
+#[test]
+fn sparse_visited_max_opt_in_matches_default_engine_and_never_leaks_across_tenants() {
+    let dir = unique_db_path("hnsw-cache-sparse-visited");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    storage.create_table(&schema(DIM)).expect("create table");
+
+    let a_vectors = gen_clustered_corpus(71, DIM as usize, BASE_ROWS, 10);
+    seed_rows(&storage, "tenant-a", 1, &a_vectors, "sparse-visited-a");
+    // tenant-b の private 行（id 空間を tenant-a と分離し、混入の有無を id 範囲
+    // だけで判定できるようにする。`run_full_scan_ratio_ann_side_matches_
+    // brute_force_and_never_leaks_across_tenants` と同型）。
+    let b_vectors = gen_clustered_corpus(72, DIM as usize, 100, 4);
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Private]).expect("valid tenant");
+    let rows_b: Vec<(u64, RowInput<'_>)> = b_vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            (
+                BASE_ROWS as u64 + 1 + i as u64,
+                RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Private,
+                    embedding: v.as_slice(),
+                    metadata: &[],
+                },
+            )
+        })
+        .collect();
+    let op_b = OperationId::parse("hnsw-cache-sparse-visited-b").expect("valid operation_id");
+    engine::tenant::insert_rows(&storage, "docs", &ctx_b, &rows_b, &op_b).expect("seed tenant-b");
+
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let kind = match kind {
+        search_engine::SearchEngineKind::Hnsw(validated) => {
+            search_engine::SearchEngineKind::Hnsw(validated.with_sparse_visited_max(usize::MAX))
+        }
+        other => panic!("hnsw_kind must return SearchEngineKind::Hnsw, got {other:?}"),
+    };
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-sparse-visited-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage
+        .create_table(&schema(DIM))
+        .expect("create ref table");
+    seed_rows(
+        &ref_storage,
+        "tenant-a",
+        1,
+        &a_vectors,
+        "sparse-visited-ref-a",
+    );
+    engine::tenant::insert_rows(&ref_storage, "docs", &ctx_b, &rows_b, &op_b)
+        .expect("seed ref tenant-b");
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    let mut total_hits = 0usize;
+    for i in 0..QUERIES {
+        let query = &a_vectors[i * (BASE_ROWS / QUERIES)];
+        let got = query_ids(&core, &ctx_a, query, K);
+        let want = query_ids(&ref_core, &ctx_a, query, K);
+        for id in &got {
+            assert!(
+                *id <= BASE_ROWS as u64,
+                "tenant-a result must not include tenant-b row id {id}"
+            );
+        }
+        let want_set: std::collections::HashSet<u64> = want.iter().copied().collect();
+        total_hits += got.iter().filter(|id| want_set.contains(id)).count();
+    }
+    let recall = total_hits as f64 / (QUERIES * K) as f64;
+    assert!(
+        recall >= 0.9,
+        "sparse_visited_max opt-in recall@{K} against default engine must be >= 0.9 (got {recall})"
+    );
+
+    let stats = core.hnsw_index_cache_stats();
+    assert!(
+        stats.hits > 0,
+        "ANN-side masked search must be exercised (non-vacuous)"
+    );
+    // `sparse_visited_searches` は縮退なしで完走した全マスク付き探索
+    // （`OverlaySuccessStat::Hits`／`SubsetSearches`／`None` のいずれでも）を
+    // 数える診断カウンタで、`hits`（`Lookup::Ready` 到達分のみ）とは母集団が
+    // 異なる（初回クエリは索引の初回構築を伴い `OverlaySuccessStat::None` に
+    // 分類されるため、`sparse_visited_searches` の方が `hits` を上回りうる。
+    // `search_with_overlay` ドキュメンテーションコメント参照）。ここでは
+    // 「マスクがあれば必ず sparse を選ぶ」という本 opt-in の契約どおり、
+    // 総クエリ数（`QUERIES`）以上（フォールバック等で `hits` に届かなかった
+    // 呼び出しがあっても、その呼び出し自体は完走していれば計上される）である
+    // ことのみを固定する。
+    assert!(
+        stats.sparse_visited_searches >= QUERIES as u64,
+        "sparse_visited_max=usize::MAX must select VisitedSparse for every completed masked \
+         search (mask is always Some and count_ones() < usize::MAX). stats={stats:?}"
+    );
+}
+
 /// Issue #515: F16 常駐でも可視カーディナリティ比が `full_scan_ratio` 以上の
 /// 場合はマスク付き ANN 探索側を選び、既定エンジン対照 Recall@10 ≥ 0.9・
 /// 可視外非混入を維持することを固定する。

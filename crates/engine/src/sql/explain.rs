@@ -140,13 +140,18 @@ pub(crate) fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngin
         // `resident=`（Issue #514）も構築時の静的設定値（要求精度）のみで、
         // 実行時の自動縮退結果（`HnswIndex::resident_precision` の実効値）は
         // 露出しない（#411 の「実行時縮退結果は非露出」契約を踏襲）。
+        // `sparse_visited_max=`（Issue #497）も同じ区分——構築時の静的閾値
+        // （opt-in・既定 0）のみを露出し、実行時にどちらの visited 実装が
+        // 選ばれたか・可視候補数・索引ノード数は非露出のまま
+        // （`docs/design/explain-search-engine-exposure.md` 参照）。
         let p = params.get();
         lines.push(format!(
-            "hnsw_params: m={},ef_construction={},ef_search={},resident={}",
+            "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={}",
             p.m,
             p.ef_construction,
             p.ef_search,
-            params.resident_precision()
+            params.resident_precision(),
+            params.sparse_visited_max()
         ));
     }
     lines.push(format!("ann_plan: {}", ann_plan_token(engine.ann_plan)));
@@ -339,7 +344,7 @@ mod tests {
         assert_eq!(cell_text(&result, 4), "engine: hnsw");
         assert_eq!(
             cell_text(&result, 5),
-            "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32"
+            "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0"
         );
         assert_eq!(cell_text(&result, 6), "ann_plan: hnsw_full_visible");
         assert_eq!(cell_text(&result, 7), "scalar_plan: plain_scan");
@@ -453,11 +458,12 @@ mod tests {
             if let Some(SearchEngineKind::Hnsw(params)) = kind {
                 let p = params.get();
                 let expected = format!(
-                    "hnsw_params: m={},ef_construction={},ef_search={},resident={}",
+                    "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={}",
                     p.m,
                     p.ef_construction,
                     p.ef_search,
-                    params.resident_precision()
+                    params.resident_precision(),
+                    params.sparse_visited_max()
                 );
                 assert!(
                     result
