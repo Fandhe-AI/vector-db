@@ -186,6 +186,13 @@ pub struct HnswIndexCacheStats {
     /// （診断用。テナント境界・可視カーディナリティ等のテナント存在情報には
     /// 繋がらない——採否のみを数える）。
     pub acorn_expansions: u64,
+    /// hybrid 密側再取得ループが破棄候補ヒープ保持の再開型探索（Issue #505・
+    /// `crate::hnsw::ResumableMaskedSearch`）で完走したラウンド数の累計
+    /// （`sql::hnsw_hybrid::HnswDenseProvider` が同一クエリ・同一バッファへの
+    /// 2 回目以降の呼び出しで [`search_prepared_resumable`] の再開経路へ入り、
+    /// 縮退なしで完走した場合のみ計上する。テナント ID・行 ID・スコア等の
+    /// テナント存在情報には繋がらない——採否のみを数える診断用カウンタ）。
+    pub hybrid_resumed_rounds: u64,
     /// 現在キャッシュが保持しているエントリ数。
     pub entries: usize,
 }
@@ -610,6 +617,7 @@ pub(crate) struct HnswIndexCache {
     sparse_visited_searches: AtomicU64,
     acorn_searches: AtomicU64,
     acorn_expansions: AtomicU64,
+    hybrid_resumed_rounds: AtomicU64,
 }
 
 /// [`HnswIndexCache::lookup`] の結果。
@@ -649,6 +657,7 @@ impl HnswIndexCache {
             sparse_visited_searches: AtomicU64::new(0),
             acorn_searches: AtomicU64::new(0),
             acorn_expansions: AtomicU64::new(0),
+            hybrid_resumed_rounds: AtomicU64::new(0),
         }
     }
 
@@ -959,6 +968,7 @@ impl HnswIndexCache {
             sparse_visited_searches: self.sparse_visited_searches.load(Ordering::Relaxed),
             acorn_searches: self.acorn_searches.load(Ordering::Relaxed),
             acorn_expansions: self.acorn_expansions.load(Ordering::Relaxed),
+            hybrid_resumed_rounds: self.hybrid_resumed_rounds.load(Ordering::Relaxed),
             entries,
         }
     }
@@ -1242,6 +1252,201 @@ pub(crate) fn search_prepared(
             provider.search(input)
         }
     }
+}
+
+/// クエリ 1 本の寿命だけ [`sql::hnsw_hybrid::HnswDenseProvider`] が保持する、
+/// hybrid 密側再取得ループの破棄候補ヒープ保持型再開状態（Issue #505）。
+/// `HnswDenseProvider` は同一 `PreparedHnswSearch`（`base`／`overlay`）を
+/// クエリ全体で固定して保持するため、本状態を構築した索引・オーバーレイと
+/// 次ラウンドで参照するそれらが食い違う心配はない（`sql::hnsw_hybrid` モジュール
+/// ドキュメンテーションコメント「fail-closed な受理条件」参照）——クエリ・
+/// `ef` 単調性の整合検査は [`crate::hnsw::HnswIndex::search_masked_resume`]
+/// 自身が担う。
+pub(crate) struct HnswResumeState {
+    search: crate::hnsw::ResumableMaskedSearch,
+}
+
+/// [`search_prepared`] の再開型版（Issue #505・親 #504。`sql::hnsw_hybrid::
+/// HnswDenseProvider` の 2 ラウンド目以降が呼ぶ）。`PreparedHnswSearch::Indexed`
+/// （`TraversalRegime::OneHop` に限る。`TwoHop`・前段ガード〔アリーナ不一致・
+/// `PlainScan`・`mask_splits_graph`・`k > MAX_EF`〕はいずれも状態化せず既存の
+/// 単発経路〔[`search_with_overlay`]／brute-force〕へ縮退し `*resume` を破棄する）
+/// に限り、`resume` が `Some` ならグラフ探索を再開し、`None`（初回、または
+/// 直前ラウンドが前段ガードで縮退した）ならラウンド 1 として開始する。
+/// 索引の生の探索結果を受け取ってからの後段（結果件数充足検査・スロット写像・
+/// delta マージ・ソート・成功統計）は [`finish_indexed_search`] を単発経路と
+/// 共有する。
+///
+/// 縮退なしで再開型探索（`resume` が `Some` だった側）が完走した場合のみ
+/// `hybrid_resumed_rounds` を加算する（診断用。テナント境界・存在情報には
+/// 繋がらない）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_prepared_resumable(
+    access: &HnswCacheAccess<'_>,
+    prepared: &PreparedHnswSearch,
+    provider: &dyn SearchProvider,
+    arena: &VectorArena,
+    slot_ids: &[u64],
+    query: &[f32],
+    k: usize,
+    resume: &mut Option<HnswResumeState>,
+) -> Result<Vec<CandidateHit>, KernelError> {
+    let (base, overlay, success_stat) = match prepared {
+        PreparedHnswSearch::Indexed {
+            base,
+            overlay,
+            success_stat,
+        } => (base, overlay, *success_stat),
+        PreparedHnswSearch::FullScan => {
+            *resume = None;
+            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            let input = SearchInput {
+                ids: slot_ids,
+                vectors: arena.vectors(),
+                dim: arena.dim(),
+                query,
+                k,
+            };
+            return provider.search(input);
+        }
+        PreparedHnswSearch::PlainScanBelowRatio => {
+            *resume = None;
+            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
+            let input = SearchInput {
+                ids: slot_ids,
+                vectors: arena.vectors(),
+                dim: arena.dim(),
+                query,
+                k,
+            };
+            return provider.search(input);
+        }
+    };
+
+    if overlay.arena_len != arena.len() {
+        *resume = None;
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        return full_scan_with_arena(provider, arena, query, k);
+    }
+    if overlay.regime == TraversalRegime::PlainScan {
+        *resume = None;
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
+        return full_scan_with_arena(provider, arena, query, k);
+    }
+    if overlay.mask_splits_graph {
+        *resume = None;
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access
+            .cache
+            .mask_splits_graph
+            .fetch_add(1, Ordering::Relaxed);
+        return full_scan_with_arena(provider, arena, query, k);
+    }
+    if k > crate::hnsw::MAX_EF {
+        *resume = None;
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access
+            .cache
+            .ef_cap_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+        return full_scan_with_arena(provider, arena, query, k);
+    }
+
+    let hop = overlay.regime.hop();
+    if hop == crate::hnsw::HopMode::TwoHop {
+        // 再開型は HopMode::OneHop 限定（`crate::hnsw::ResumableMaskedSearch`
+        // ドキュメンテーションコメント参照）。TwoHop レジームのラウンドは
+        // 状態化せず既存の単発経路（`bridge_expand` を含む完全な探索）へ倒す。
+        *resume = None;
+        return search_with_overlay(
+            access,
+            Arc::clone(base),
+            Arc::clone(overlay),
+            provider,
+            arena,
+            query,
+            k,
+            success_stat,
+        );
+    }
+
+    let ef = access.provider.effective_ef(k);
+    let mask = Some(&overlay.visible_mask);
+
+    let (index_hits, used_resume) = if let Some(mut state) = resume.take() {
+        match base
+            .index
+            .search_masked_resume(&mut state.search, query, k, ef, mask)
+        {
+            Ok(hits) => {
+                *resume = Some(state);
+                (hits, true)
+            }
+            Err(_) => {
+                // 整合検査に失敗（別クエリ・ef 減少等。呼び出し元
+                // `HnswDenseProvider` は同一クエリを固定して渡す契約のため
+                // 通常到達しないが、fail-closed に状態を捨ててラウンド 1 から
+                // やり直す）。
+                match base
+                    .index
+                    .search_masked_resumable_start(query, k, ef, mask, hop)
+                {
+                    Ok((hits, new_state)) => {
+                        *resume = Some(HnswResumeState { search: new_state });
+                        (hits, false)
+                    }
+                    Err(_) => {
+                        *resume = None;
+                        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+                        return full_scan_with_arena(provider, arena, query, k);
+                    }
+                }
+            }
+        }
+    } else {
+        match base
+            .index
+            .search_masked_resumable_start(query, k, ef, mask, hop)
+        {
+            Ok((hits, new_state)) => {
+                *resume = Some(HnswResumeState { search: new_state });
+                (hits, false)
+            }
+            Err(_) => {
+                *resume = None;
+                access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+                return full_scan_with_arena(provider, arena, query, k);
+            }
+        }
+    };
+
+    let fallbacks_before = access.cache.fallbacks.load(Ordering::Relaxed);
+    let result = finish_indexed_search(
+        access,
+        base,
+        overlay,
+        provider,
+        arena,
+        query,
+        k,
+        success_stat,
+        index_hits,
+        None,
+        hop,
+        0,
+    );
+    // 縮退なし（`finish_indexed_search` が `fallbacks` を加算せず完走した）で
+    // 再開経路（`resume` が `Some` だった側）を通ったラウンドのみ計上する
+    // （診断用カウンタ。§`HnswIndexCacheStats::hybrid_resumed_rounds`）。
+    if used_resume && access.cache.fallbacks.load(Ordering::Relaxed) == fallbacks_before {
+        access
+            .cache
+            .hybrid_resumed_rounds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 
 /// DISTANCE 段の索引済み探索＋未索引分 brute-force 併用の本体（Issue #408。
@@ -1598,7 +1803,6 @@ fn search_with_overlay(
     // `Overlay::compute`（分断検査省略判定）・`prepare_subset`（早期打ち切り）
     // と同一の判定式（[`below_full_scan_ratio`] 由来）を共有する単一情報源
     // （Issue #488 の方針をそのまま踏襲。ここでの再計算を撤去した）。
-    let visible_in_index = overlay.visible_in_index;
     if overlay.regime == TraversalRegime::PlainScan {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
         access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
@@ -1673,12 +1877,62 @@ fn search_with_overlay(
         }
     };
 
+    finish_indexed_search(
+        access,
+        &base,
+        &overlay,
+        provider,
+        arena,
+        query,
+        k,
+        success_stat,
+        index_hits,
+        visited_kind,
+        hop,
+        acorn_expansions,
+    )
+}
+
+/// [`search_with_overlay`]（単発探索）・[`search_prepared_resumable`]
+/// （Issue #505 の再開型探索。`sql::hnsw_hybrid::HnswDenseProvider`）が共有する
+/// 後段（結果件数の充足検査・スロット写像＋`(tenant_id, id)` 照合・
+/// `kernel::dot` 再計算・未索引分 delta マージ・ソート/重複排除/truncate・
+/// 成功統計）。索引の生の探索結果（`index_hits`）を受け取るところから開始する
+/// ため、呼び出し元が単発 [`crate::hnsw::HnswIndex::search_masked_with_hop`]・
+/// 再開型 [`crate::hnsw::HnswIndex::search_masked_resumable_start`]／
+/// [`Self::search_masked_resume`] のどちらを使ったかによらず同一の後段契約
+/// （エラー・統計・出力順）を保つ。
+///
+/// 本関数自体は再開状態（`ResumableMaskedSearch`）に一切触れない——本関数が
+/// 内部で plain scan／brute-force へ縮退した場合でも、それは「この 1 ラウンドの
+/// 出力を brute-force で埋め合わせた」だけであり、既にグラフ探索を終えて
+/// `resume` へ格納済みの状態（`candidates`／`discarded` 等）自体は引き続き
+/// 有効（次ラウンドも再開できる）。再開状態の破棄が必要なのは、そもそも
+/// [`crate::hnsw::HnswIndex::search_masked_resumable_start`]／
+/// `search_masked_resume` を呼ばずに済ませた前段ガード
+/// （`search_prepared_resumable` 側。アリーナ不一致・`PlainScan`・
+/// `mask_splits_graph`・`k > MAX_EF`）だけである。
+#[allow(clippy::too_many_arguments)]
+fn finish_indexed_search(
+    access: &HnswCacheAccess<'_>,
+    base: &IndexedBase,
+    overlay: &Overlay,
+    provider: &dyn SearchProvider,
+    arena: &VectorArena,
+    query: &[f32],
+    k: usize,
+    success_stat: OverlaySuccessStat,
+    index_hits: Vec<crate::kernel::CandidateHit>,
+    visited_kind: Option<crate::hnsw::VisitedKind>,
+    hop: crate::hnsw::HopMode,
+    acorn_expansions: u64,
+) -> Result<Vec<CandidateHit>, KernelError> {
     // マスク付き探索の結果件数が「可視ノード数と要求 k の小さい方」に満たない
     // 場合、ビーム幅内でグラフ探索が可視ノードを十分辿り切れなかったことを
     // 意味する（§`docs/design/hnsw-rls-cardinality-switch.md`「masked_short」節）。
     // `#410` の担当である `ef` 拡張再探索は行わず、fail-closed に plain scan へ
     // 縮退して k 件充足を保証する。
-    let expected = k.min(visible_in_index);
+    let expected = k.min(overlay.visible_in_index);
     if index_hits.len() < expected {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
         access.cache.masked_short.fetch_add(1, Ordering::Relaxed);
@@ -3277,5 +3531,134 @@ mod tests {
             "arena.len() / index.len() = 0.95 >= full_scan_ratio = 0.6 では \
              早期打ち切りを踏まず Overlay::compute 経由の Indexed を返すはず"
         );
+    }
+
+    /// Issue #505: `search_prepared_resumable` を同一クエリ・`k` 倍増で
+    /// 複数ラウンド呼ぶと 2 ラウンド目以降が破棄候補ヒープ保持型の再開型探索を
+    /// 通り、`hybrid_resumed_rounds` が非 vacuous に計上され `builds` は増えず、
+    /// 各ラウンドの返却が `len <= k`・score 降順・id 昇順・可視集合内・一意で
+    /// あることを固定する。
+    #[test]
+    fn search_prepared_resumable_reuses_graph_scan_across_rounds() {
+        let path = unique_db_path("hnsw-cache-resumable-rounds");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        for i in 0..2_000u64 {
+            let v = i as f32;
+            seed_row(
+                &storage,
+                "docs",
+                i,
+                "tenant-a",
+                &[v, v + 1.0, v + 2.0, v + 3.0],
+            );
+        }
+        let c = ctx("tenant-a");
+        let cache = HnswIndexCache::new();
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+        };
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+        let read_txn = storage.db().begin_read().unwrap();
+        let prepared = prepare_full_visible(&access, &read_txn, "docs", &c, &arena);
+        let builds_after_prepare = cache.stats().builds;
+
+        let provider = crate::kernel::CpuScalarProvider;
+        let mut resume: Option<HnswResumeState> = None;
+        let query = [0.0f32, 1.0, 2.0, 3.0];
+        for k in [10usize, 20, 40] {
+            let hits = search_prepared_resumable(
+                &access,
+                &prepared,
+                &provider,
+                &arena,
+                &slot_ids,
+                &query,
+                k,
+                &mut resume,
+            )
+            .expect("resumable search succeeds");
+            assert!(hits.len() <= k);
+            assert!(hits.windows(2).all(
+                |w| w[0].score >= w[1].score && (w[0].score > w[1].score || w[0].id < w[1].id)
+            ));
+            let mut ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+            let dedup_len = {
+                ids.sort_unstable();
+                ids.dedup();
+                ids.len()
+            };
+            assert_eq!(dedup_len, hits.len(), "hits must be unique by id");
+            for h in &hits {
+                assert!((h.id as usize) < arena.len());
+            }
+        }
+
+        let stats = cache.stats();
+        assert_eq!(stats.builds, builds_after_prepare, "prepare must run once");
+        assert!(
+            stats.hybrid_resumed_rounds >= 1,
+            "at least the 2nd/3rd rounds should reuse the previous graph scan"
+        );
+    }
+
+    /// Issue #505: `k > MAX_EF` のラウンドは再開型探索を試みず状態を破棄する
+    /// （`search_prepared` の既存 `ef_cap_fallbacks` 縮退契約と同じ挙動）。
+    #[test]
+    fn search_prepared_resumable_resets_state_when_k_exceeds_max_ef() {
+        let path = unique_db_path("hnsw-cache-resumable-ef-cap");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        for i in 0..2_000u64 {
+            let v = i as f32;
+            seed_row(
+                &storage,
+                "docs",
+                i,
+                "tenant-a",
+                &[v, v + 1.0, v + 2.0, v + 3.0],
+            );
+        }
+        let c = ctx("tenant-a");
+        let cache = HnswIndexCache::new();
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+        };
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+        let read_txn = storage.db().begin_read().unwrap();
+        let prepared = prepare_full_visible(&access, &read_txn, "docs", &c, &arena);
+
+        let provider = crate::kernel::CpuScalarProvider;
+        let mut resume: Option<HnswResumeState> = None;
+        let query = [0.0f32, 1.0, 2.0, 3.0];
+        let over_max_ef = crate::hnsw::MAX_EF + 1;
+        let hits = search_prepared_resumable(
+            &access,
+            &prepared,
+            &provider,
+            &arena,
+            &slot_ids,
+            &query,
+            over_max_ef,
+            &mut resume,
+        )
+        .expect("full scan succeeds");
+        assert_eq!(hits.len(), arena.len().min(over_max_ef));
+        assert!(
+            resume.is_none(),
+            "ef_cap_fallbacks must discard resume state"
+        );
+        assert_eq!(cache.stats().ef_cap_fallbacks, 1);
+        assert_eq!(cache.stats().hybrid_resumed_rounds, 0);
     }
 }

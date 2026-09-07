@@ -1042,6 +1042,19 @@ impl VisitedBitmap {
         *word |= mask;
         Some(already)
     }
+
+    /// `id` が設定済みかを読み取り専用で判定する（状態を変更しない）。範囲外
+    /// の `id` は `false`（未確保領域＝未訪問と同義。coding-rust.md の
+    /// untrusted 添字アクセス禁止に従い `[]` は使わない）。[`ResumableMaskedSearch`]
+    /// （Issue #505）の候補復帰判定（`expanded`／`in_candidates` の照会）専用。
+    fn is_set(&self, id: usize) -> bool {
+        let word_idx = id / 64;
+        let bit_idx = id % 64;
+        match self.words.get(word_idx) {
+            Some(word) => (*word & (1u64 << bit_idx)) != 0,
+            None => false,
+        }
+    }
 }
 
 impl VisitedSet for VisitedBitmap {
@@ -3253,6 +3266,432 @@ impl HnswIndex {
             .collect();
         Ok(out)
     }
+}
+
+/// クエリ単位で保持する再開型層 0 探索状態（Issue #505・親 #503／#458／#455。
+/// pgvector `hnswscan.c` 型の「破棄候補を保持し、次ラウンドで自己昇格＋候補
+/// 復帰して層 0 探索を再開する」方式。`docs/design/hnsw-hybrid-iterative-scan.md`
+/// 「Phase B 再検討（Issue #504）」節の契約に従う独立実装——[`search_layer_in`]
+/// 本体は不変・複製しない設計は見送り、TwoHop・[`bridge_expand`] との相互作用
+/// を切り離すため `HopMode::OneHop` 限定で層 0 探索の要点のみを再実装した
+/// （見送り理由・同値性の根拠は `docs/design/hnsw-hybrid-iterative-scan.md`
+/// 「実装記録（Issue #505）」節参照）。
+///
+/// hybrid 密側再取得ループ（`hybrid.rs::hybrid_search_boosted` の
+/// `dense_fetch_k` 倍増）は同一クエリを `ef`／`k` を大きくしながら複数ラウンド
+/// 呼び直す。素朴な実装（[`HnswIndex::search_masked_with_hop`] を毎ラウンド
+/// 呼び直す）はラウンドごとに visited をリセットし層 0 ビーム探索をゼロから
+/// やり直すため、全ラウンド合計の隣接走査が Σ_r visited_r になり得る。本状態は
+/// `candidates`（未展開候補）／`results`（現在の top-`ef_eff`）／`discarded`
+/// （非受理・`results` 追い出しで一度捨てたノード）／`expanded`（隣接走査
+/// 済み）／`in_candidates`（現在 `candidates` に積まれているか）／
+/// `visited`（発見済みか）を呼び出し元（`sql::hnsw_hybrid::HnswDenseProvider`）
+/// がクエリの寿命だけ保持することで、全ラウンド合計の隣接走査を高々索引
+/// ノード数まで押さえる。
+///
+/// # 決定性・正しさの保証範囲
+///
+/// ラウンド 1（[`HnswIndex::search_masked_resumable_start`] 単体）は
+/// [`HnswIndex::search_masked_with_hop`]（`HopMode::OneHop`）とビット同一
+/// （停止条件を「pop 直後判定」から「pop 前の peek 判定」へ移すのみで、
+/// 単発実行の `results` 出力には影響しない——停止条件が成立する場合、元の
+/// 実装も pop した候補をそのまま捨てて `break` するだけで、その候補は
+/// どのみち `results`・`candidates` へ一切反映されないため）。
+/// `candidates` が尽きた時点（exhaustive。以後のラウンドで候補復帰しても
+/// 新規発見が増えない）の結果はブルートフォース対照と厳密一致する。
+/// 非 exhaustive な途中ラウンド（`ef` 依存の `worst_ok` 判定を経る）は
+/// 再実行型と一致を保証しない（本モジュールの契約はここまで。性能上の
+/// 採否・前後比較は Issue #506 の担当）。
+#[derive(Debug)]
+pub(crate) struct ResumableMaskedSearch {
+    /// 未展開の候補（最大要素＝次に展開すべきノードが `peek` で分かる
+    /// 最大ヒープ）。
+    candidates: BinaryHeap<ScoredNode>,
+    /// 現在の top-`ef_eff`（最悪要素が `peek` で分かるよう `Reverse` で
+    /// 包んだ最小ヒープ）。
+    results: BinaryHeap<std::cmp::Reverse<ScoredNode>>,
+    /// 非受理（`worst_ok` 不成立で候補ヒープへ積まれなかった）ノード、または
+    /// `results.pop()` で top-`ef_eff` から追い出されたノード。次ラウンドの
+    /// 自己昇格・候補復帰（[`HnswIndex::search_masked_resume`]）の対象。
+    discarded: Vec<ScoredNode>,
+    /// `candidates` から pop され隣接走査を終えたノード（1 ノード高々 1 回。
+    /// 一度立てたら以後は永続的に「展開不要」を意味するため降ろす操作は
+    /// 持たない）。
+    expanded: VisitedBitmap,
+    /// 現在 `candidates` ヒープに積まれている（未展開の）ノード。候補復帰
+    /// 時の二重 push 防止にのみ使う（`expanded` が立てば以後 push 対象から
+    /// 恒久的に外れるため、本フラグを「降ろす」操作は不要）。
+    in_candidates: VisitedBitmap,
+    /// 発見済み（一度でも候補として評価された）ノード。`search_layer_in` の
+    /// `visited` と同じ役割。
+    visited: VisitedBitmap,
+    /// クエリの bit 表現（整合検査用。`f32::to_bits` 比較で別クエリの状態を
+    /// 誤って再開しないことを保証する）。
+    query_bits: Vec<u32>,
+    /// 直前ラウンドの `ef_eff`（`ef.max(k)`）。次ラウンドは `>=` を要求する
+    /// （自己昇格が既存 `results` を一切降格しないことの前提）。
+    last_ef: usize,
+    /// 状態構築時点の索引ノード数（世代整合検査用）。
+    node_count: usize,
+    /// 状態構築時点のマスク長（マスク無しは `None`）。
+    mask_len: Option<usize>,
+}
+
+impl HnswIndex {
+    /// [`ResumableMaskedSearch`] のラウンド 1: 検証・起点解決・層 0 探索を
+    /// 行い、状態を返す。`hop == HopMode::TwoHop` は状態化せず拒否する
+    /// （§ [`ResumableMaskedSearch`] ドキュメンテーションコメント参照。
+    /// 呼び出し元 `sql::hnsw_cache::search_prepared_resumable` は
+    /// `TraversalRegime::TwoHop` のラウンドでは本関数を呼ばず既存の単発経路
+    /// （[`Self::search_masked_with_hop`]）へ倒す）。
+    ///
+    /// 検証順序・起点解決（固定 entry point 非受理時の代替起点選択・上位層
+    /// 貪欲降下）は [`Self::search_masked_with_hop`] と同一ロジックを踏襲する
+    /// （既存ホットパスは変更していないため複製だが、対象は起点解決のみで
+    /// 層 0 探索本体は複製しない——両者は [`Self::resumable_offer_entry`]・
+    /// [`Self::resumable_run`] を共有する）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_masked_resumable_start(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        mask: Option<&NodeMask>,
+        hop: HopMode,
+    ) -> Result<(Vec<crate::kernel::CandidateHit>, ResumableMaskedSearch), HnswError> {
+        if hop == HopMode::TwoHop {
+            return Err(HnswError::InvalidParams {
+                reason: "resumable search does not support HopMode::TwoHop",
+            });
+        }
+        let dim_usize = self.dim as usize;
+        if query.len() != dim_usize {
+            return Err(HnswError::QueryDimMismatch {
+                expected: self.dim,
+                found: query.len(),
+            });
+        }
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(HnswError::NonFiniteQuery);
+        }
+        if ef == 0 || ef > MAX_EF {
+            return Err(HnswError::InvalidParams {
+                reason: "ef must be in 1..=MAX_EF",
+            });
+        }
+        if k > MAX_EF {
+            return Err(HnswError::InvalidParams {
+                reason: "k exceeds MAX_EF",
+            });
+        }
+        let node_count = self.graph.node_count();
+        let mask_len = match mask {
+            Some(m) => {
+                if m.len() != node_count {
+                    return Err(HnswError::InvalidParams {
+                        reason: "mask length does not match index node count",
+                    });
+                }
+                Some(m.len())
+            }
+            None => None,
+        };
+
+        let mut state = ResumableMaskedSearch {
+            candidates: BinaryHeap::new(),
+            results: BinaryHeap::new(),
+            discarded: Vec::new(),
+            expanded: VisitedBitmap::default(),
+            in_candidates: VisitedBitmap::default(),
+            visited: VisitedBitmap::default(),
+            query_bits: query.iter().map(|v| v.to_bits()).collect(),
+            last_ef: 0,
+            node_count,
+            mask_len,
+        };
+        state.expanded.reset(node_count);
+        state.in_candidates.reset(node_count);
+        state.visited.reset(node_count);
+
+        if k == 0 || node_count == 0 {
+            return Ok((Vec::new(), state));
+        }
+        let Some(entry) = self.entry_point else {
+            return Ok((Vec::new(), state));
+        };
+        let Some(top_level) = self.max_level() else {
+            return Ok((Vec::new(), state));
+        };
+
+        // 起点解決は `Self::search_masked_with_hop` と同一ロジック
+        // （§関数ドキュメンテーションコメント参照）。
+        let (mut nearest, effective_top, checked_entry) = match mask {
+            Some(m) => match self.search_entry_for_mask(m) {
+                Some(start) if start == entry => (start, top_level, start),
+                Some(alt) => {
+                    let alt_level = self.level_of(alt).unwrap_or(0);
+                    (alt, top_level.min(alt_level), alt)
+                }
+                None => return Ok((Vec::new(), state)),
+            },
+            None => (entry, top_level, entry),
+        };
+        if effective_top > 0 {
+            for l in (1..=effective_top).rev() {
+                nearest = match self.greedy_descend_masked(
+                    nearest,
+                    query,
+                    l,
+                    dim_usize,
+                    &self.vectors,
+                    mask,
+                )? {
+                    Some(n) => n,
+                    None => return Ok((Vec::new(), state)),
+                };
+            }
+        }
+
+        let level0_entry_points = if mask.is_some() && checked_entry != nearest {
+            vec![nearest, checked_entry]
+        } else {
+            vec![nearest]
+        };
+
+        let ef_eff = ef.max(k);
+        for ep in level0_entry_points {
+            self.resumable_offer_entry(&mut state, ep, query, mask, dim_usize)?;
+        }
+        self.resumable_run(&mut state, query, mask, dim_usize, ef_eff)?;
+        state.last_ef = ef_eff;
+        let out = resumable_snapshot(&state, k);
+        Ok((out, state))
+    }
+
+    /// [`ResumableMaskedSearch`] のラウンド r ≥ 2: 整合検査 → 自己昇格 →
+    /// 候補復帰 → 探索再開（`docs/design/hnsw-hybrid-iterative-scan.md`
+    /// 「再開手順」節）。整合検査（クエリ・索引ノード数・マスク長の一致、
+    /// `ef_eff` が単調非減少）に外れた場合は `Err` を返す——呼び出し元
+    /// （`sql::hnsw_cache::search_prepared_resumable`）は状態を破棄し
+    /// [`Self::search_masked_resumable_start`] からやり直す契約（fail-closed。
+    /// 「不整合な状態を黙って使い続けない」ことを優先する）。
+    pub(crate) fn search_masked_resume(
+        &self,
+        state: &mut ResumableMaskedSearch,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        mask: Option<&NodeMask>,
+    ) -> Result<Vec<crate::kernel::CandidateHit>, HnswError> {
+        let dim_usize = self.dim as usize;
+        if query.len() != dim_usize {
+            return Err(HnswError::QueryDimMismatch {
+                expected: self.dim,
+                found: query.len(),
+            });
+        }
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(HnswError::NonFiniteQuery);
+        }
+        if ef == 0 || ef > MAX_EF {
+            return Err(HnswError::InvalidParams {
+                reason: "ef must be in 1..=MAX_EF",
+            });
+        }
+        if k > MAX_EF {
+            return Err(HnswError::InvalidParams {
+                reason: "k exceeds MAX_EF",
+            });
+        }
+        let node_count = self.graph.node_count();
+        let mask_len = match mask {
+            Some(m) => {
+                if m.len() != node_count {
+                    return Err(HnswError::InvalidParams {
+                        reason: "mask length does not match index node count",
+                    });
+                }
+                Some(m.len())
+            }
+            None => None,
+        };
+        let ef_eff = ef.max(k);
+        let query_bits: Vec<u32> = query.iter().map(|v| v.to_bits()).collect();
+        if state.node_count != node_count
+            || state.mask_len != mask_len
+            || state.query_bits != query_bits
+            || ef_eff < state.last_ef
+        {
+            return Err(HnswError::InvalidParams {
+                reason: "resume state does not match this query/index generation",
+            });
+        }
+
+        // 自己昇格: results ∪ discarded を全順序（`ScoredNode::Ord`。スコア
+        // 降順・同点は id 昇順）で再ソートし、上位 ef_eff 件を results へ、
+        // 残りを discarded へ戻す。`ef_eff >= state.last_ef` のため、これは
+        // 既存 results（旧 ef_eff 以内で既に採用済みの要素）を一切降格しない
+        // 単調な操作である（設計 doc「自己昇格」節の `admitted` 縮約——
+        // `results ∪ discarded` の全順序 top-ef_eff は「discarded 全ノードを
+        // best-first に再評価し満たすものを results へ直接挿入する」操作と
+        // 同値。同値性の根拠は `docs/design/hnsw-hybrid-iterative-scan.md`
+        // 「実装記録（Issue #505）」節参照）。
+        let mut merged: Vec<ScoredNode> =
+            Vec::with_capacity(state.results.len() + state.discarded.len());
+        merged.extend(state.results.drain().map(|r| r.0));
+        merged.append(&mut state.discarded);
+        merged.sort_by(|a, b| b.cmp(a));
+        let split = merged.len().min(ef_eff);
+        state.results = merged[..split]
+            .iter()
+            .copied()
+            .map(std::cmp::Reverse)
+            .collect();
+        state.discarded = merged[split..].to_vec();
+
+        // 候補復帰: discarded のうち expanded 未設定・in_candidates 未設定の
+        // ものを candidates へ push する（設計 doc「候補復帰」節）。この push
+        // は discarded の内容自体は変えない——discarded に残った要素は最終
+        // 出力（自己昇格の対象）としては引き続き有効なままで、単に「今回も
+        // 隣接探索の起点として再考する」候補に追加で加わるだけ。
+        for node in &state.discarded {
+            let idx = node.node as usize;
+            if state.expanded.is_set(idx) || state.in_candidates.is_set(idx) {
+                continue;
+            }
+            state.candidates.push(*node);
+            state.in_candidates.mark_visited(idx);
+        }
+
+        self.resumable_run(state, query, mask, dim_usize, ef_eff)?;
+        state.last_ef = ef_eff;
+        Ok(resumable_snapshot(state, k))
+    }
+
+    /// 初期探索起点の発見・受理・ヒープ挿入（`search_layer_in` の entry_points
+    /// ループと同一ロジック——`worst_ok` 判定・`results` 容量による追い出しは
+    /// 行わない。entry point は通常 1〜2 点のみのため、この非対称は元実装
+    /// からそのまま引き継ぐビット同一契約の一部）。
+    fn resumable_offer_entry(
+        &self,
+        state: &mut ResumableMaskedSearch,
+        node: u32,
+        query: &[f32],
+        mask: Option<&NodeMask>,
+        dim: usize,
+    ) -> Result<(), HnswError> {
+        match state.visited.mark_visited(node as usize) {
+            Some(true) => return Ok(()),
+            Some(false) => {}
+            None => return Ok(()),
+        }
+        let is_accepted = mask.map(|m| m.get(node)).unwrap_or(true);
+        if !is_accepted {
+            return Ok(());
+        }
+        let score = self.vectors.score(dim, node, query)?;
+        let scored = ScoredNode { node, score };
+        state.candidates.push(scored);
+        state.in_candidates.mark_visited(node as usize);
+        state.results.push(std::cmp::Reverse(scored));
+        Ok(())
+    }
+
+    /// 層 0 ビーム探索の本体（`search_layer_in` の while ループ・`HopMode::
+    /// OneHop` 経路と同一の停止条件・受理判定・順序規約。停止条件のみ
+    /// 「pop してから判定」ではなく「peek で判定してから pop」に変えている
+    /// （§ [`ResumableMaskedSearch`] ドキュメンテーションコメント「決定性・
+    /// 正しさの保証範囲」参照）。`candidates` から pop したノードが既に
+    /// [`ResumableMaskedSearch::expanded`] 済みの場合（候補復帰による重複
+    /// push）は隣接走査せず読み捨てる。
+    fn resumable_run(
+        &self,
+        state: &mut ResumableMaskedSearch,
+        query: &[f32],
+        mask: Option<&NodeMask>,
+        dim: usize,
+        ef_eff: usize,
+    ) -> Result<(), HnswError> {
+        let is_accepted = |node: u32| mask.map(|m| m.get(node)).unwrap_or(true);
+        loop {
+            let stop = match (state.candidates.peek(), state.results.peek()) {
+                (Some(top), Some(std::cmp::Reverse(worst))) => {
+                    state.results.len() >= ef_eff
+                        && top.score.total_cmp(&worst.score) == std::cmp::Ordering::Less
+                }
+                _ => false,
+            };
+            if stop {
+                break;
+            }
+            let Some(top_candidate) = state.candidates.pop() else {
+                break;
+            };
+            if state.expanded.mark_visited(top_candidate.node as usize) == Some(true) {
+                continue;
+            }
+            let Some(neighbors) = self.graph.neighbors(0, top_candidate.node) else {
+                continue;
+            };
+            for &neighbor in neighbors {
+                let already = match state.visited.mark_visited(neighbor as usize) {
+                    Some(seen) => seen,
+                    None => continue,
+                };
+                if already {
+                    continue;
+                }
+                if !is_accepted(neighbor) {
+                    // TwoHop（ACORN-1・`bridge_expand`）は本経路では未対応
+                    // （§ [`ResumableMaskedSearch`] ドキュメンテーション
+                    // コメント参照。呼び出し元が `hop == TwoHop` を拒否する）。
+                    continue;
+                }
+                let neighbor_score = self.vectors.score(dim, neighbor, query)?;
+                let scored = ScoredNode {
+                    node: neighbor,
+                    score: neighbor_score,
+                };
+                let worst_ok = match state.results.peek() {
+                    Some(std::cmp::Reverse(worst)) => {
+                        state.results.len() < ef_eff
+                            || scored.score.total_cmp(&worst.score) != std::cmp::Ordering::Less
+                    }
+                    None => true,
+                };
+                if worst_ok {
+                    state.candidates.push(scored);
+                    state.in_candidates.mark_visited(neighbor as usize);
+                    state.results.push(std::cmp::Reverse(scored));
+                    if state.results.len() > ef_eff {
+                        if let Some(std::cmp::Reverse(evicted)) = state.results.pop() {
+                            state.discarded.push(evicted);
+                        }
+                    }
+                } else {
+                    state.discarded.push(scored);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`ResumableMaskedSearch::results`] を出力順（スコア降順・同点は id 昇順。
+/// `search_layer_in` の最終ソートと同一の比較述語——[`make sort-determinism-
+/// check`] が拾う `sort_unstable_*` ではなく安定な `sort_by` を使う）に整列し
+/// 上位 `k` 件を返す。`state.results` 自体は消費しない（呼び出し元が次ラウンド
+/// も保持し続けるため）。
+fn resumable_snapshot(state: &ResumableMaskedSearch, k: usize) -> Vec<crate::kernel::CandidateHit> {
+    let mut out: Vec<ScoredNode> = state.results.iter().map(|r| r.0).collect();
+    out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
+    out.into_iter()
+        .take(k)
+        .map(|s| crate::kernel::CandidateHit {
+            id: s.node as u64,
+            score: s.score,
+        })
+        .collect()
 }
 
 /// [`HnswIndex::search_layer_with`]／[`GraphBuilder::search_layer`] が
@@ -6338,5 +6777,336 @@ mod tests {
                 "threads={base_threads} と threads={threads} でグラフが一致しない"
             );
         }
+    }
+    // ------------------------------------------------------------------
+    // Issue #505: `HnswDenseProvider` 向け再開型探索（`ResumableMaskedSearch`）。
+    // §計画「6.1 hnsw.rs 単体」に対応する。
+    // ------------------------------------------------------------------
+
+    /// マスク受理ノードに対するブルートフォース Top-k（`dot` 降順・同点は id
+    /// 昇順）。`ResumableMaskedSearch` が exhaustive（`candidates` が尽きた
+    /// 状態）に達したときの厳密性を確認する対照実装。
+    fn brute_force_masked_top_k(
+        vectors: &[f32],
+        dim: usize,
+        query: &[f32],
+        mask: Option<&NodeMask>,
+        k: usize,
+    ) -> Vec<crate::kernel::CandidateHit> {
+        let rows = vectors.len() / dim;
+        let mut scored: Vec<ScoredNode> = (0..rows)
+            .filter(|&i| mask.map(|m| m.get(i as u32)).unwrap_or(true))
+            .map(|i| {
+                let row = &vectors[i * dim..(i + 1) * dim];
+                ScoredNode {
+                    node: i as u32,
+                    score: dot(row, query),
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
+        scored
+            .into_iter()
+            .take(k)
+            .map(|s| crate::kernel::CandidateHit {
+                id: s.node as u64,
+                score: s.score,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resumable_start_matches_search_masked_bit_identical() {
+        let dim = 8usize;
+        let vectors = gen_corpus(31, dim, 300);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+        };
+        let index = HnswIndex::build(params, dim as u32, &vectors, 5).unwrap();
+        let query = gen_corpus(3001, dim, 1);
+
+        let mut mask = NodeMask::new(300);
+        for i in 0..300u32 {
+            if i % 3 == 0 {
+                mask.set(i);
+            }
+        }
+        // ビット同一性は到達可能性（マスクの連結性）に依存しない——
+        // 両経路とも同じ起点解決・同じ層 0 ビーム探索を行うため、マスクが
+        // 分断されていてもラウンド 1 の出力は一致するはず。
+
+        for mask_opt in [None, Some(&mask)] {
+            for &ef in &[1usize, 10, 40] {
+                let mut scratch = HnswSearchScratch::default();
+                let expected = index
+                    .search_masked_with_hop(
+                        &query,
+                        10,
+                        ef,
+                        mask_opt,
+                        DEFAULT_SPARSE_VISITED_MAX,
+                        HopMode::OneHop,
+                        &mut scratch,
+                    )
+                    .unwrap();
+                let (actual, _state) = index
+                    .search_masked_resumable_start(&query, 10, ef, mask_opt, HopMode::OneHop)
+                    .unwrap();
+                assert_eq!(
+                    expected,
+                    actual,
+                    "ef={ef} mask_some={} でラウンド 1 がビット同一でない",
+                    mask_opt.is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_start_rejects_two_hop() {
+        let dim = 8usize;
+        let vectors = gen_corpus(32, dim, 50);
+        let index = HnswIndex::build(HnswParams::default(), dim as u32, &vectors, 5).unwrap();
+        let query = gen_corpus(3002, dim, 1);
+        let err = index
+            .search_masked_resumable_start(&query, 5, 10, None, HopMode::TwoHop)
+            .unwrap_err();
+        assert!(matches!(err, HnswError::InvalidParams { .. }));
+    }
+
+    #[test]
+    fn resume_reaches_exhaustive_and_matches_brute_force() {
+        let dim = 8usize;
+        let rows = 200usize;
+        let vectors = gen_corpus(33, dim, rows);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+        };
+        let index = HnswIndex::build(params, dim as u32, &vectors, 9).unwrap();
+        let query = gen_corpus(3003, dim, 1);
+
+        let mut mask = NodeMask::new(rows);
+        for i in 0..rows as u32 {
+            if i % 2 == 0 {
+                mask.set(i);
+            }
+        }
+        assert!(index.is_mask_fully_reachable(&mask));
+
+        let k = 10usize;
+        let (mut hits, mut state) = index
+            .search_masked_resumable_start(&query, k, 1, Some(&mask), HopMode::OneHop)
+            .unwrap();
+        let mut ef = 1usize;
+        // 索引ノード数を上限に ef を倍増し続け、候補が尽きるまで再開する。
+        for _ in 0..32 {
+            if ef >= rows {
+                break;
+            }
+            ef = (ef * 2).min(rows);
+            hits = index
+                .search_masked_resume(&mut state, &query, k, ef, Some(&mask))
+                .unwrap();
+        }
+
+        let expected = brute_force_masked_top_k(&vectors, dim, &query, Some(&mask), k);
+        assert_eq!(
+            hits, expected,
+            "ef を索引ノード数まで拡張した exhaustive 探索はブルートフォースと厳密一致するはず"
+        );
+    }
+
+    /// 設計 doc の星型反例（起点 1 点にのみ全葉が接続するグラフ）で「候補復帰
+    /// のみで自己昇格しない」誤実装を検出する回帰テスト（codex-review PR #589
+    /// 指摘対応。§計画「6.1」参照）。
+    #[test]
+    fn resume_star_graph_promotes_discarded_every_round() {
+        let dim = 4usize;
+        // ノード 0（起点。最高スコア）と葉ノード 1..=7（起点にのみ接続）。
+        let mut raw = vec![0f32; 8 * dim];
+        // 起点は全方向へ均等な単位ベクトルに近い値を持たせ、葉は起点との
+        // dot が単調減少するよう構成する（`score = 10 - node` の等価物と
+        // なるよう第 1 成分だけを使う単純な埋め込み）。
+        for node in 0..8usize {
+            raw[node * dim] = (10 - node) as f32;
+        }
+        let query = {
+            let mut q = vec![0f32; dim];
+            q[0] = 1.0;
+            q
+        };
+        let vectors: Arc<[f32]> = raw.clone().into();
+
+        let mut nodes = Vec::new();
+        // 起点（node 0）は葉 1..=7 全てへ双方向リンクを持つ星型。
+        let leaves: Vec<u32> = (1..8u32).collect();
+        nodes.push(Node {
+            level: 0,
+            links: vec![leaves.clone()],
+        });
+        for _ in 1..8 {
+            nodes.push(Node {
+                level: 0,
+                links: vec![vec![0u32]],
+            });
+        }
+        let index = index_from_nodes(HnswParams::default(), dim as u32, nodes, Some(0), vectors);
+
+        let k = 8usize;
+        let (mut hits, mut state) = index
+            .search_masked_resumable_start(&query, k, 2, None, HopMode::OneHop)
+            .unwrap();
+        for &ef in &[4usize, 8] {
+            hits = index
+                .search_masked_resume(&mut state, &query, k, ef, None)
+                .unwrap();
+        }
+        assert_eq!(
+            hits.len(),
+            8,
+            "自己昇格が働かないと ef=2 で discarded に落ちた葉が最終結果へ戻らない"
+        );
+        let ids: std::collections::HashSet<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(ids.len(), 8, "全ノードが重複なく揃うはず");
+    }
+
+    #[test]
+    fn resume_expands_each_node_at_most_once() {
+        let dim = 8usize;
+        let rows = 150usize;
+        // 重複ヘビーコーパス（同点誘発）で二重展開が起きないことを確認する。
+        let mut vectors = gen_corpus(34, dim, 1);
+        vectors = vectors.repeat(rows);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+        };
+        let index = HnswIndex::build(params, dim as u32, &vectors, 3).unwrap();
+        let query = gen_corpus(3004, dim, 1);
+
+        let k = 5usize;
+        let (_hits, mut state) = index
+            .search_masked_resumable_start(&query, k, 1, None, HopMode::OneHop)
+            .unwrap();
+        let mut ef = 1usize;
+        for _ in 0..8 {
+            ef = (ef * 2).min(rows);
+            let _ = index
+                .search_masked_resume(&mut state, &query, k, ef, None)
+                .unwrap();
+        }
+        assert!(
+            state.candidates.is_empty(),
+            "ef を索引ノード数まで拡張すれば candidates は尽きるはず（この式が \
+             成り立たないと下の等式は非 vacuous でなくなる）"
+        );
+        let expanded_count = (0..rows).filter(|&i| state.expanded.is_set(i)).count();
+        let in_candidates_count = (0..rows).filter(|&i| state.in_candidates.is_set(i)).count();
+        // `candidates` へ一度でも積まれたノード（`in_candidates`）は、
+        // `candidates` が尽きた時点で必ず一度は pop され `expanded` が
+        // 立っている（`resumable_run` は pop 直後に無条件で `expanded` を
+        // 立てる。§ `ResumableMaskedSearch::in_candidates` ドキュメンテーション
+        // コメント参照）。二重展開（同一ノードが 2 回 `candidates` へ積まれ
+        // 2 回展開される）が起きていれば、`expanded_count` は
+        // `in_candidates_count` を **下回る**ことは無いが、二重 push を防ぐ
+        // `in_candidates` ガードが壊れていれば別ノードの取りこぼしとして
+        // この等式が崩れる——`expanded.count_ones() <= N` という自明な
+        // トートロジーではなく、両カウンタの一致という実質的な不変条件で
+        // 固定する。
+        assert_eq!(
+            expanded_count, in_candidates_count,
+            "candidates が尽きた時点で「一度でも積まれたノード」と「展開済みノード」は一致するはず"
+        );
+    }
+
+    #[test]
+    fn resume_is_deterministic_across_independent_states() {
+        let dim = 8usize;
+        let rows = 150usize;
+        let mut base = gen_corpus(35, dim, 1);
+        base = base.repeat(rows / 3 + 1);
+        base.truncate(rows * dim);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+        };
+        let index = HnswIndex::build(params, dim as u32, &base, 4).unwrap();
+        let query = gen_corpus(3005, dim, 1);
+        let k = 6usize;
+
+        let run = || {
+            let (mut hits, mut state) = index
+                .search_masked_resumable_start(&query, k, 1, None, HopMode::OneHop)
+                .unwrap();
+            let mut ef = 1usize;
+            for _ in 0..6 {
+                ef = (ef * 2).min(rows);
+                hits = index
+                    .search_masked_resume(&mut state, &query, k, ef, None)
+                    .unwrap();
+            }
+            hits
+        };
+        let a = run();
+        let b = run();
+        assert_eq!(a, b, "同一索引・同一クエリ・同一 ef 列は決定的であるはず");
+    }
+
+    #[test]
+    fn resume_with_same_ef_extends_prefix() {
+        let dim = 8usize;
+        let rows = 200usize;
+        let vectors = gen_corpus(36, dim, rows);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+        };
+        let index = HnswIndex::build(params, dim as u32, &vectors, 6).unwrap();
+        let query = gen_corpus(3006, dim, 1);
+
+        let (small, mut state) = index
+            .search_masked_resumable_start(&query, 3, 40, None, HopMode::OneHop)
+            .unwrap();
+        let large = index
+            .search_masked_resume(&mut state, &query, 6, 40, None)
+            .unwrap();
+        assert_eq!(
+            &large[..small.len()],
+            small.as_slice(),
+            "ef 同値で k のみ増やしたラウンドは前ラウンドの前方一致拡張であるはず"
+        );
+    }
+
+    #[test]
+    fn resume_rejects_mismatch_and_restarts() {
+        let dim = 8usize;
+        let rows = 120usize;
+        let vectors = gen_corpus(37, dim, rows);
+        let index = HnswIndex::build(HnswParams::default(), dim as u32, &vectors, 8).unwrap();
+        let query_a = gen_corpus(3007, dim, 1);
+        let query_b = gen_corpus(3008, dim, 1);
+
+        let (_hits, mut state) = index
+            .search_masked_resumable_start(&query_a, 5, 10, None, HopMode::OneHop)
+            .unwrap();
+
+        // クエリ不一致。
+        let err = index
+            .search_masked_resume(&mut state, &query_b, 5, 20, None)
+            .unwrap_err();
+        assert!(matches!(err, HnswError::InvalidParams { .. }));
+
+        // ef 減少（`ef.max(k)` が単調非減少という前提を破る）。
+        let err = index
+            .search_masked_resume(&mut state, &query_a, 5, 1, None)
+            .unwrap_err();
+        assert!(matches!(err, HnswError::InvalidParams { .. }));
     }
 }
