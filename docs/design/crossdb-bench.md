@@ -348,6 +348,14 @@ GPU は単発〜小バッチの全件内積検索で明確に高速化する（1
 スループットでは現行実装は CPU-SIMD と同等にとどまり、FAISS との差が改善余地を示す。
 GPU 経路は in-process API（`engine::gpu_batch`）のみで SQL／wire からは到達できない。
 
+**（2026-09-07 追記・Issue #537）** Issue #536（workgroup 内部分 Top-k）適用後
+の再計測: `100,000×128 batch 64` の self GPU f16 min-of-5 p95 は 15,783µs
+（本節上表の Issue #532 適用前値 80,756µs から readback 方式変更〔#532 タイル
+化＋#536 部分 Top-k〕を経て改善）。FAISS GPU 対照 753µs（`559b523` 時点）との
+差はなお約 21 倍に縮小したが解消はしていない。Issue #536／#537 の詳細・
+readback バイト数の確定的削減（12.66〜12.79x）・6 規模点の前後比較は
+[`gpu-batch-topk.md`](gpu-batch-topk.md)「前後比較実測（Issue #537）」節参照。
+
 ## 計測ツール
 
 - `scripts/crossdb_bench/`: Python ハーネス（`run.py --db self|pgvector|sqlite_vec|qdrant|lancedb|mysql --config exact|hnsw`・`containers.sh`・`run_all.sh`）。
