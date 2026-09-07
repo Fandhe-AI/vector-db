@@ -275,6 +275,29 @@ fn main() {
         );
     }
 
+    // ACORN-1（2-hop 展開・Issue #501）の opt-in（Issue #502）。可視比率
+    // スイープ（`run_visible_ratio_sweep`）専用の knob——`full_scan_ratio_override`
+    // と同様、S0-cold／S0-hot（既定経路）・S1〜S5' には効かない。未設定
+    // （既定）時は `ValidatedHnswParams::acorn_max_visible_ratio() == None`
+    // のまま、本 Issue 導入前と出力・処理が完全に同一。
+    let acorn_max_visible_ratio_override =
+        match harness::bench_engine::read_env_var("BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO")
+            .and_then(|raw| harness::bench_engine::parse_acorn_max_visible_ratio(raw.as_deref()))
+        {
+            Ok(v) => v,
+            Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO: {e}")),
+        };
+    if acorn_max_visible_ratio_override.is_some()
+        && !matches!(
+            knn_engine,
+            harness::bench_engine::BenchEngine::Hnsw | harness::bench_engine::BenchEngine::HnswF16
+        )
+    {
+        fail_closed(
+            "BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO requires BENCH_KNN_PROFILE_ENGINE=hnsw or hnsw_f16",
+        );
+    }
+
     // visited 集合の切替閾値（Issue #497）。S0-cold／S0-hot の `EngineCore`
     // 構築（`build_core_for`）と可視比率スイープ（`run_visible_ratio_sweep`→
     // `build_core_for_sweep`）の双方に効く。未設定時は既定値（常に dense）の
@@ -343,6 +366,13 @@ fn main() {
              BENCH_KNN_PROFILE_VISIBLE_RATIO are mutually exclusive",
         );
     }
+    // ACORN-1 knob（Issue #502）は可視比率スイープ専用。他モードで設定すると
+    // 静かに無視される事故を防ぐため fail-closed で拒否する。
+    if acorn_max_visible_ratio_override.is_some() && visible_ratio_denominator.is_none() {
+        fail_closed(
+            "BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO requires BENCH_KNN_PROFILE_VISIBLE_RATIO",
+        );
+    }
     if index_memory {
         run_index_memory_mode(knn_engine, dim, sweep_scale);
         return;
@@ -359,6 +389,7 @@ fn main() {
             denominator,
             full_scan_ratio_override,
             sparse_visited_max_override,
+            acorn_max_visible_ratio_override,
             sweep_scale,
         );
         return;
@@ -984,15 +1015,41 @@ fn main() {
 }
 
 /// `knn_engine`（`BENCH_KNN_PROFILE_FULL_SCAN_RATIO`／
-/// `BENCH_KNN_PROFILE_SPARSE_VISITED_MAX`〔Issue #497〕override 対応）で
-/// [`EngineCore`] を構築する（[`run_visible_ratio_sweep`] 専用。既定経路の
-/// `build_core_for` は override を持たないため共有しない）。
+/// `BENCH_KNN_PROFILE_SPARSE_VISITED_MAX`〔Issue #497〕／
+/// `BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO`〔ACORN-1・Issue #501・#502〕
+/// override 対応）で [`EngineCore`] を構築する（[`run_visible_ratio_sweep`]
+/// 専用。既定経路の `build_core_for` は override を持たないため共有しない）。
 fn build_core_for_sweep(
     knn_engine: harness::bench_engine::BenchEngine,
     storage: Storage,
     full_scan_ratio_override: Option<(u32, u32)>,
     sparse_visited_max_override: Option<usize>,
+    acorn_max_visible_ratio_override: Option<(u32, u32)>,
 ) -> EngineCore {
+    // `with_acorn_max_visible_ratio` は「`acorn_max_visible_ratio >=
+    // full_scan_ratio`」を検証する（`hnsw.rs::ValidatedHnswParams::
+    // with_acorn_max_visible_ratio` docコメント参照）ため、必ず
+    // `full_scan_ratio_override` 適用後に呼ぶ（本関数の Hnsw／HnswF16 双方の
+    // arm で共有する適用順）。
+    let apply_overrides = |mut validated: ValidatedHnswParams| -> ValidatedHnswParams {
+        if let Some((numerator, denominator)) = full_scan_ratio_override {
+            validated = validated
+                .with_full_scan_ratio(Ratio {
+                    numerator,
+                    denominator,
+                })
+                .expect("BENCH_KNN_PROFILE_FULL_SCAN_RATIO already validated by harness::bench_engine::parse_full_scan_ratio");
+        }
+        if let Some((numerator, denominator)) = acorn_max_visible_ratio_override {
+            validated = validated
+                .with_acorn_max_visible_ratio(Ratio {
+                    numerator,
+                    denominator,
+                })
+                .expect("BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO must not be less than the effective full_scan_ratio (BENCH_KNN_PROFILE_FULL_SCAN_RATIO or its default)");
+        }
+        validated
+    };
     match knn_engine {
         harness::bench_engine::BenchEngine::BruteForce => {
             EngineCore::from_storage(storage, search_engine::default_engine())
@@ -1000,14 +1057,7 @@ fn build_core_for_sweep(
         harness::bench_engine::BenchEngine::Hnsw => {
             let mut validated = ValidatedHnswParams::new(HnswParams::default())
                 .expect("valid HnswParams::default()");
-            if let Some((numerator, denominator)) = full_scan_ratio_override {
-                validated = validated
-                    .with_full_scan_ratio(Ratio {
-                        numerator,
-                        denominator,
-                    })
-                    .expect("BENCH_KNN_PROFILE_FULL_SCAN_RATIO already validated by harness::bench_engine::parse_full_scan_ratio");
-            }
+            validated = apply_overrides(validated);
             if let Some(max) = sparse_visited_max_override {
                 validated = validated.with_sparse_visited_max(max);
             }
@@ -1022,14 +1072,7 @@ fn build_core_for_sweep(
             let mut validated = ValidatedHnswParams::new(HnswParams::default())
                 .expect("valid HnswParams::default()")
                 .with_resident_precision(ResidentPrecision::F16);
-            if let Some((numerator, denominator)) = full_scan_ratio_override {
-                validated = validated
-                    .with_full_scan_ratio(Ratio {
-                        numerator,
-                        denominator,
-                    })
-                    .expect("BENCH_KNN_PROFILE_FULL_SCAN_RATIO already validated by harness::bench_engine::parse_full_scan_ratio");
-            }
+            validated = apply_overrides(validated);
             EngineCore::from_storage_with_engine(storage, SearchEngineKind::Hnsw(validated))
         }
     }
@@ -1048,11 +1091,19 @@ fn observed_arm_label(
     plain_scans_delta: u64,
     mask_splits_graph_delta: u64,
     masked_short_delta: u64,
+    acorn_searches_delta: u64,
 ) -> &'static str {
     // 互いに排他な 4 カウンタ（`hnsw_cache.rs` のドキュメンテーションコメント
     // 参照）のうち、非 0 のものを優先順位付きで採用する。全 0 は
     // brute_force エンジン（Subset 系カウンタを一切持たない）を表す。
-    if subset_searches_delta > 0 {
+    // `acorn_searches`（ACORN-1・Issue #501・#502）は `subset_searches` の
+    // 部分集合（`TraversalRegime::TwoHop` レジームで縮退なしに完走した回数。
+    // `sql/hnsw_cache.rs` docコメント参照）のため、`subset_searches_delta > 0`
+    // の判定内で優先的に区別する（`subset_searches_delta` 自体はどちらの
+    // レジームでも増分するため、先に判定してしまうと 2-hop 発火を見逃す）。
+    if acorn_searches_delta > 0 {
+        "ann_masked_two_hop"
+    } else if subset_searches_delta > 0 {
         "ann_masked"
     } else if plain_scans_delta > 0 {
         "plain_scan_ratio"
@@ -1088,6 +1139,7 @@ fn run_visible_ratio_sweep(
     denominator: u32,
     full_scan_ratio_override: Option<(u32, u32)>,
     sparse_visited_max_override: Option<usize>,
+    acorn_max_visible_ratio_override: Option<(u32, u32)>,
     scale: u64,
 ) {
     const BUCKET_COLUMN: &str = "bucket";
@@ -1115,8 +1167,8 @@ fn run_visible_ratio_sweep(
     println!(
         "knn_profile_bench: visible_ratio_sweep total_rows={total_rows} dim={dim} top_k={TOP_K} \
          denominator={denominator} visible_rows={visible_rows} engine={} full_scan_ratio={}/{} \
-         sparse_visited_max={} \
-         (Issue #487・#497。S0-cold・S1〜S5' は非対象。QEMU 共有開発環境での実測は参考値——\
+         sparse_visited_max={} acorn_max_visible_ratio={} \
+         (Issue #487・#497・#502。S0-cold・S1〜S5' は非対象。QEMU 共有開発環境での実測は参考値——\
          docs/design/hnsw-rls-cardinality-switch.md 参照)",
         knn_engine.token(),
         effective_full_scan_ratio.0,
@@ -1124,6 +1176,9 @@ fn run_visible_ratio_sweep(
         sparse_visited_max_override
             .map(|v| v.to_string())
             .unwrap_or_else(|| "default".to_string()),
+        acorn_max_visible_ratio_override
+            .map(|(n, d)| format!("{n}/{d}"))
+            .unwrap_or_else(|| "none".to_string()),
     );
 
     let path = unique_db_path("issue487-knn-visible-ratio-sweep");
@@ -1199,6 +1254,7 @@ fn run_visible_ratio_sweep(
         storage,
         full_scan_ratio_override,
         sparse_visited_max_override,
+        acorn_max_visible_ratio_override,
     );
 
     // --- warm: `FullVisible` 形状の索引を 1 回構築する（`Subset` 形状は索引を
@@ -1351,12 +1407,17 @@ fn run_visible_ratio_sweep(
             .collect::<Vec<f64>>()
     );
 
-    let expected =
-        harness::bench_engine::expected_arm(visible_rows, total_rows, effective_full_scan_ratio)
-            .expect("visible_rows/total_rows/full_scan_ratio must not overflow at this scale");
+    let expected = harness::bench_engine::expected_arm_acorn(
+        visible_rows,
+        total_rows,
+        effective_full_scan_ratio,
+        acorn_max_visible_ratio_override,
+    )
+    .expect("visible_rows/total_rows/full_scan_ratio/acorn_max_visible_ratio must not overflow at this scale");
     let expected_label = match expected {
         harness::bench_engine::ExpectedArm::AnnMasked => "ann_masked",
         harness::bench_engine::ExpectedArm::PlainScanRatio => "plain_scan_ratio",
+        harness::bench_engine::ExpectedArm::AnnMaskedTwoHop => "ann_masked_two_hop",
     };
 
     if requires_hnsw_stats_check(knn_engine.token()) {
@@ -1380,6 +1441,17 @@ fn run_visible_ratio_sweep(
         let fallbacks_delta = stats_after_subset
             .fallbacks
             .saturating_sub(stats_before_subset.fallbacks);
+        // ACORN-1（2-hop 展開・Issue #501）の発火状況（Issue #502）。
+        // `acorn_searches` は `TraversalRegime::TwoHop` レジームで縮退なしに
+        // 完走した回数（`subset_searches` の部分集合）、`acorn_expansions` は
+        // `bridge_expand` が受理・2-hop 候補化した累計件数——ACORN opt-in
+        // （`acorn_max_visible_ratio_override.is_some()`）でなければ常に 0。
+        let acorn_searches_delta = stats_after_subset
+            .acorn_searches
+            .saturating_sub(stats_before_subset.acorn_searches);
+        let acorn_expansions_delta = stats_after_subset
+            .acorn_expansions
+            .saturating_sub(stats_before_subset.acorn_expansions);
         // `BENCH_KNN_PROFILE_ENGINE=hnsw|hnsw_f16` では 4 カウンタ全 0 は
         // 「このクエリが Subset 系のいずれの経路も通らなかった」ことを意味し、
         // brute_force エンジンの `n/a` とは区別すべき vacuous な計測である
@@ -1410,8 +1482,29 @@ fn run_visible_ratio_sweep(
             plain_scans_delta,
             mask_splits_graph_delta,
             masked_short_delta,
+            acorn_searches_delta,
         );
         println!("knn_profile_bench: arm expected={expected_label} observed={observed_label}");
+        println!(
+            "knn_profile_bench: acorn(delta) searches={acorn_searches_delta} expansions={acorn_expansions_delta}"
+        );
+        // 期待値が `AnnMaskedTwoHop`（ACORN opt-in・可視カーディナリティ比が
+        // `full_scan_ratio <= r <= acorn_max_visible_ratio` の範囲）なのに
+        // `acorn_searches_delta == 0` だった場合は vacuous な計測として拒否
+        // する（`sparse_visited` の同型ガード・#498 の方針を踏襲）。逆に
+        // `expected != AnnMaskedTwoHop` のときは `acorn_searches_delta > 0`
+        // を要求しない——`traversal_regime_for` 自体が `expected_arm_acorn`
+        // より広い縮退経路（`mask_splits_graph`／`masked_short`）を持つため。
+        if expected == harness::bench_engine::ExpectedArm::AnnMaskedTwoHop
+            && acorn_searches_delta == 0
+        {
+            fail_closed(format!(
+                "BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO が可視カーディナリティ比 \
+                 {visible_rows}/{total_rows} を範囲内に含むにもかかわらず acorn_searches の \
+                 delta が 0 だった（TwoHop レジームが一度も縮退なしに完走しなかった vacuous な \
+                 計測。observed={observed_label}）"
+            ));
+        }
 
         // visited 集合切替閾値の診断出力（Issue #498）。`sparse_visited_max`
         // 未設定（`sparse_visited_max_override == None`）は production の既定
@@ -1547,9 +1640,10 @@ fn run_hot_only(
     let sql = c1_statement(TABLE, COLUMN, &literal, TOP_K)
         .expect("well-formed C1 statement from validated identifiers");
 
-    // hot-only モード（Issue #516）は visited 集合切替閾値（Issue #497）の
-    // 計測対象外のため、既定値（常に dense）のまま `None` を渡す。
-    let core = build_core_for_sweep(knn_engine, storage, full_scan_ratio_override, None);
+    // hot-only モード（Issue #516）は visited 集合切替閾値（Issue #497）・
+    // ACORN-1（Issue #501・#502）いずれも計測対象外のため、既定値（常に
+    // dense／ACORN 無効）のまま `None` を渡す。
+    let core = build_core_for_sweep(knn_engine, storage, full_scan_ratio_override, None, None);
 
     // --- warm: 索引構築を含む 1 回目のクエリ（計測外）。--------------------
     let warm_start = Instant::now();
