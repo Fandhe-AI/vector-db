@@ -1,0 +1,15 @@
+Phase 5 通し前後比較（Issue #544）環境スナップショット
+=========================================================
+before_commit=b161d5b
+after_commit=a40edd7
+ab_pairs=5
+ab_points=100000:128:64,20000:128:8,20000:128:64,100000:128:1,100000:128:256,500000:128:64
+nproc=12
+cpu_model=QEMU Virtual CPU version 2.5+
+cpu_vendor=GenuineIntel
+cpu_threads_per_core=1
+cpu_cores_per_socket=12
+gpu_name=NVIDIA GeForce RTX 3060
+gpu_driver=595.71.05
+rustc_version=rustc 1.96.0 (ac68faa20 2026-05-25)
+BENCH_DEDICATED_ENV=unset（共有 QEMU 環境。専有ではない）
