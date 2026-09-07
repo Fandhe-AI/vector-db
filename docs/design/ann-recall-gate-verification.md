@@ -458,19 +458,24 @@ Recall ゲートの閾値を緩める必要はない（S8 決定規則: 全指�
 未達・原因分析の記録は不要。production コード（`crates/engine/src/`）は
 本 Issue の範囲では無変更。
 
-**oversampling（R5）との関係**: 一方で `tests/hnsw_i8_recall.rs`
-（brute-force 対照 `ef` 掃引・クラスタ構造ありコーパス・N=10,000・
-dim=128）の実測では、I8 の Recall@10 が F32 対比 `ef=64/128/256` の
-いずれでも同じ差分（約 0.095）で頭打ちになり、`ef` を増やしても
-ギャップが縮まらないことを確認した（詳細は
-`docs/design/hnsw-sq8-resident.md`「Issue #523 追記」節参照）。この
-条件では「oversampling（`ef` 引き上げ）では補えない」——ただし本節の
-Recall ゲート測定（実コーパス規模・hybrid 密側再取得ループ経由）では
-その差が実害として現れなかった。両者の違いは、hybrid 密側の再取得ループ
-（`dense_fetch_k` 倍増。#410）が候補生成ノイズを実質的に吸収している
-可能性が高いと考えられるが、本 Issue の範囲では検証済みの構造的論拠では
-なく仮説の記録にとどめる（`hnsw_i8_recall.rs` の直接 `HnswIndex::search`
-呼び出しはこの再取得ループを経由しない）。
+**oversampling（R5）との関係**: `tests/hnsw_i8_recall.rs`（brute-force
+対照・クラスタ構造ありコーパス・N=10,000・dim=128）の実測では、探索幅
+（`ef`）だけを `64/128/256` と広げても返却件数 `k=10` 固定の Recall@10
+は F32 対比の差分（約 0.095）から一切改善しない一方、`ef=64` のまま
+候補数（`oversample_k`）を 10→20 へ増やし**元の f32 ベクトルで再採点**
+すると Recall@10 は 1.0000（F32 と同水準）まで完全に回復することを
+確認した（詳細は `docs/design/hnsw-sq8-resident.md`「Issue #523 追記」節
+参照）。つまりこの条件では「探索幅（`ef`）拡大では補えない」が
+「候補数を広げ f32 で再採点する oversampling」は有効であり、両者を
+区別しない場合の「oversampling 一般が効かない」という結論は誤り
+だった（codex-review 指摘・PR #621 で是正）。本節の Recall ゲート測定
+（実コーパス規模・hybrid 密側再取得ループ経由）で専用 knob なしに
+brute_force と完全一致したのは、hybrid 密側の再取得ループ
+（`dense_fetch_k` 倍増。#410）が事実上この oversampling＋再採点と同型の
+効果（候補を広く取ってから `kernel::dot` の f32 再計算でスコアを引き
+直す）を担っているためと考えられ、上記の直接測定はその仮説と整合する
+（本 Issue の範囲では構造的論拠までは検証していない。`hnsw_i8_recall.rs`
+の直接 `HnswIndex::search` 呼び出しはこの再取得ループを経由しない）。
 
 ### 可視外非混入テスト（`tests/hnsw_cache.rs`）
 

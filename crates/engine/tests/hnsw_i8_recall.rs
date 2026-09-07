@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 
 use engine::hnsw::{HnswIndex, HnswParams, HnswSearchScratch, ResidentPrecision};
+use engine::isa;
 use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
 
 /// 決定的シードの xorshift64*（`tests/hnsw_search.rs::TestRng` の複製）。
@@ -173,6 +174,69 @@ fn recall_at_10(
     hits_total as f64 / (queries.len() as f64 * 10.0)
 }
 
+/// I8 常駐から `oversample_k`（`>= 10`）件を候補として取得し、各候補を
+/// **元の f32 ベクトル**（量子化前）で `query` との内積を再計算してから
+/// 上位 10 件を選び直した Recall@10 を brute-force 対照で計測する
+/// （codex-review 指摘対応・PR #621。`ef` 掃引〔候補幅＝探索の到達範囲〕と
+/// oversampling＋再採点〔量子化スコアで丸めた順位を f32 で引き直す〕は
+/// 別の操作であり、`recall_at_10` の固定 `k=10` 呼び出しだけでは
+/// 「探索経路が量子化ノイズで候補そのものを取りこぼしているのか」
+/// 「取得できた候補の中で量子化スコアの順位が f32 の真の順位と食い違って
+/// いるだけなのか」を区別できない。本関数は後者（順位の食い違い）を
+/// f32 再採点で解消できるかを見る）。
+fn recall_at_10_oversample_rescored(
+    index: &HnswIndex,
+    vectors: &[f32],
+    dim: usize,
+    rows: usize,
+    ef: usize,
+    oversample_k: usize,
+    queries: &[Vec<f32>],
+) -> f64 {
+    assert!(oversample_k >= 10, "oversample_k must cover top-10");
+    let ids: Vec<u64> = (0..rows as u64).collect();
+    let provider = CpuScalarProvider;
+    let mut scratch = HnswSearchScratch::default();
+    let kernel = isa::detect();
+    let mut hits_total = 0usize;
+    for query in queries {
+        let brute = provider
+            .search(SearchInput {
+                ids: &ids,
+                vectors,
+                dim: dim as u32,
+                query,
+                k: 10,
+            })
+            .expect("brute-force search must succeed");
+        let brute_ids: HashSet<u64> = brute.iter().map(|h| h.id).collect();
+
+        // I8 索引から量子化スコアで oversample_k 件を取得し、各候補を
+        // 元の f32 ベクトル（量子化前）で再採点してから上位 10 件を選び直す
+        // （最終スコアは常に f32 の `kernel::dot` で再計算する既定契約
+        // 〔`docs/design/simd-intrinsics-adoption.md` 決定 5〕をこのテスト
+        // ハーネス自身でも踏襲する）。
+        let candidates = index
+            .search(query, oversample_k, ef, &mut scratch)
+            .expect("hnsw search must succeed");
+        let mut rescored: Vec<(u64, f32)> = candidates
+            .iter()
+            .map(|hit| {
+                let row = &vectors[hit.id as usize * dim..hit.id as usize * dim + dim];
+                (hit.id, kernel.dot(row, query))
+            })
+            .collect();
+        rescored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        rescored.truncate(10);
+        let hit = rescored
+            .iter()
+            .filter(|(id, _)| brute_ids.contains(id))
+            .count();
+        hits_total += hit;
+    }
+    hits_total as f64 / (queries.len() as f64 * 10.0)
+}
+
 // --------------------------------------------------
 // 層 A（常時 `#[test]`・小規模・debug 実行で数秒以内を目標）
 // --------------------------------------------------
@@ -286,6 +350,30 @@ fn ef_sweep_recall_table_clustered_and_uniform_corpus() {
             i8_c >= f32_c - 0.15,
             "clustered corpus: I8 Recall@10(ef={ef}) = {i8_c} must be >= F32 Recall@10(ef={ef}) \
              = {f32_c} - 0.15"
+        );
+    }
+
+    // oversampling（候補数を増やし元の f32 ベクトルで再採点）が Recall@10 の
+    // ギャップを縮められるかを、`ef` 掃引とは独立に見る（codex-review 指摘
+    // 対応・PR #621）。`ef` は既定値 64 に固定し、`oversample_k`（HNSW から
+    // 取得する候補数）のみを 10（oversample なし）→20→50→100 と増やす。
+    println!(
+        "oversample_rescore_table: rows={rows} dim={dim} clusters={clusters} ef=64 \
+         (candidates rescored with original f32 vectors; Issue #523・R5 codex-review 追記)"
+    );
+    for oversample_k in [10usize, 20, 50, 100] {
+        let i8_rescored = recall_at_10_oversample_rescored(
+            &i8_clustered,
+            &clustered,
+            dim,
+            rows,
+            64,
+            oversample_k,
+            &clustered_queries,
+        );
+        println!(
+            "oversample_k={oversample_k}: clustered i8_rescored={i8_rescored:.4} \
+             (brute-force f32 top-10 対照。ef=64 固定)"
         );
     }
 }
