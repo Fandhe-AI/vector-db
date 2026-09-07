@@ -32,7 +32,7 @@
 //! 判断がなされた場合、差し替え箇所は本モジュールの 2 関数に閉じている。
 use std::hint::black_box;
 
-use super::{node_vector, node_vector_u16, NodeSource, VisitedSet};
+use super::{node_vector, node_vector_i8, node_vector_u16, NodeSource, VisitedSet};
 
 /// `node` のベクトル先頭 1 キャッシュラインぶんを早期に load する。
 /// hnswlib／faiss も同様に先頭ラインのみを prefetch し、以降はハードウェアの
@@ -52,6 +52,16 @@ pub(super) fn touch_node_vector(vectors: &[f32], dim: usize, node: u32) {
 /// 復号は行わない（best-effort の早期 load のため復号コストを払う必要がない）。
 pub(super) fn touch_node_vector_u16(vectors: &[u16], dim: usize, node: u32) {
     if let Ok(v) = node_vector_u16(vectors, dim, node) {
+        if let Some(first) = v.first() {
+            black_box(*first);
+        }
+    }
+}
+
+/// [`touch_node_vector`] の SQ8（i8）常駐版（Issue #521。`NodeVectors::I8` の
+/// 索引専用）。f16 版と同じく先頭 1 要素を触れるだけで足り、復号は行わない。
+pub(super) fn touch_node_vector_i8(vectors: &[i8], dim: usize, node: u32) {
+    if let Ok(v) = node_vector_i8(vectors, dim, node) {
         if let Some(first) = v.first() {
             black_box(*first);
         }

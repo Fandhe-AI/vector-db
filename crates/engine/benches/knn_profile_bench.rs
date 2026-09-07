@@ -1828,10 +1828,12 @@ fn measure_index_memory(
     let requested = match precision {
         ResidentPrecision::F32 => "f32",
         ResidentPrecision::F16 => "f16",
+        ResidentPrecision::I8 => "i8",
     };
     let effective = match index.resident_precision() {
         ResidentPrecision::F32 => "f32",
         ResidentPrecision::F16 => "f16",
+        ResidentPrecision::I8 => "i8",
     };
     Ok(render_index_memory_line(
         rows,

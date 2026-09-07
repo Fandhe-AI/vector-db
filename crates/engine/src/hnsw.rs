@@ -410,6 +410,13 @@ pub enum ResidentPrecision {
     /// （`|x| <= 65504.0`）を超える場合は凍結時に `F32` へ自動縮退する
     /// （`HnswIndex::resident_precision` が実効値を返す）。
     F16,
+    /// 対称スカラー量子化（SQ8。次元ごと min/max 由来のスケール）による i8
+    /// 常駐（Issue #521・親 #520）。`sq8::dot_i8_f32` による復号 dot（格納側
+    /// のみ低精度化しクエリは f32 のまま）で候補生成スコアを計算する。
+    /// `sq8::fit_dim_params`／`sq8::encode_rows` が失敗した場合（非有限成分・
+    /// アロケーション失敗）は凍結時に `F32` へ自動縮退する
+    /// （`HnswIndex::resident_precision` が実効値を返す。F16 と同じ D6 契約）。
+    I8,
 }
 
 impl fmt::Display for ResidentPrecision {
@@ -419,6 +426,7 @@ impl fmt::Display for ResidentPrecision {
         match self {
             ResidentPrecision::F32 => write!(f, "f32"),
             ResidentPrecision::F16 => write!(f, "f16"),
+            ResidentPrecision::I8 => write!(f, "i8"),
         }
     }
 }
@@ -795,6 +803,13 @@ pub struct HnswIndex {
 pub(crate) enum NodeVectors {
     F32(Arc<[f32]>),
     F16(Arc<[u16]>),
+    /// 対称 SQ8 常駐（Issue #521）。`codes`（row-major・`len() == node_count *
+    /// dim`）と、凍結時に 1 回だけ `sq8::fit_dim_params` で求めた次元ごとの
+    /// スケール（`params.dim() == dim`）を対で保持する。
+    I8 {
+        codes: Arc<[i8]>,
+        params: Arc<crate::sq8::Sq8DimParams>,
+    },
 }
 
 impl NodeVectors {
@@ -803,6 +818,10 @@ impl NodeVectors {
         match self {
             NodeVectors::F32(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
             NodeVectors::F16(v) => v.len().saturating_mul(std::mem::size_of::<u16>()),
+            NodeVectors::I8 { codes, params } => codes
+                .len()
+                .saturating_mul(std::mem::size_of::<i8>())
+                .saturating_add(params.approx_heap_bytes()),
         }
     }
 }
@@ -839,6 +858,14 @@ impl NodeSource for NodeVectors {
                 }
                 Ok(score)
             }
+            NodeVectors::I8 { codes, params } => {
+                let row = node_vector_i8(codes, dim, node)?;
+                let score = crate::sq8::dot_i8_f32(row, params.scales(), query);
+                if !score.is_finite() {
+                    return Err(HnswError::NonFiniteScore { node });
+                }
+                Ok(score)
+            }
         }
     }
 
@@ -846,6 +873,7 @@ impl NodeSource for NodeVectors {
         match self {
             NodeVectors::F32(v) => prefetch::touch_node_vector(v, dim, node),
             NodeVectors::F16(v) => prefetch::touch_node_vector_u16(v, dim, node),
+            NodeVectors::I8 { codes, .. } => prefetch::touch_node_vector_i8(codes, dim, node),
         }
     }
 }
@@ -854,6 +882,24 @@ impl NodeSource for NodeVectors {
 /// 切り出す（[`node_vector`] の f16 版。untrusted 添字アクセスを避けるため
 /// `get()` のみを使う）。
 fn node_vector_u16(vectors: &[u16], dim: usize, node: u32) -> Result<&[u16], HnswError> {
+    let node_usize = node as usize;
+    let start = node_usize.checked_mul(dim).ok_or(HnswError::DimMismatch {
+        dim: dim as u32,
+        len: vectors.len(),
+    })?;
+    let end = start.checked_add(dim).ok_or(HnswError::DimMismatch {
+        dim: dim as u32,
+        len: vectors.len(),
+    })?;
+    vectors.get(start..end).ok_or(HnswError::DimMismatch {
+        dim: dim as u32,
+        len: vectors.len(),
+    })
+}
+
+/// `vectors`（SQ8 格納コードの row-major バッファ）から `node` 番目の行を
+/// 切り出す（[`node_vector_u16`] の i8 版。Issue #521）。
+fn node_vector_i8(vectors: &[i8], dim: usize, node: u32) -> Result<&[i8], HnswError> {
     let node_usize = node as usize;
     let start = node_usize.checked_mul(dim).ok_or(HnswError::DimMismatch {
         dim: dim as u32,
@@ -2026,6 +2072,25 @@ impl HnswIndex {
                     Err(_) => (NodeVectors::F32(vectors), ResidentPrecision::F32),
                 }
             }
+            ResidentPrecision::I8 => match crate::sq8::fit_dim_params(dim as usize, &vectors) {
+                Ok(fit) => {
+                    let mut codes = Vec::new();
+                    match crate::sq8::encode_rows(dim as usize, &vectors, &fit, &mut codes) {
+                        Ok(()) => (
+                            NodeVectors::I8 {
+                                codes: Arc::from(codes),
+                                params: Arc::new(fit),
+                            },
+                            ResidentPrecision::I8,
+                        ),
+                        // encode_rows は fit_dim_params と同じ非有限判定を防御的に
+                        // 再検査するのみで通常は到達しないが、到達した場合も同じ
+                        // fail-closed 方針（D6）で F32 へ縮退する。
+                        Err(_) => (NodeVectors::F32(vectors), ResidentPrecision::F32),
+                    }
+                }
+                Err(_) => (NodeVectors::F32(vectors), ResidentPrecision::F32),
+            },
         };
         Ok(HnswIndex {
             params,
@@ -2637,6 +2702,7 @@ impl HnswIndex {
         match &self.vectors {
             NodeVectors::F32(v) => node_vector(v, self.dim as usize, node).ok(),
             NodeVectors::F16(_) => None,
+            NodeVectors::I8 { .. } => None,
         }
     }
 
@@ -2646,6 +2712,16 @@ impl HnswIndex {
         match &self.vectors {
             NodeVectors::F32(_) => None,
             NodeVectors::F16(v) => node_vector_u16(v, self.dim as usize, node).ok(),
+            NodeVectors::I8 { .. } => None,
+        }
+    }
+
+    /// [`Self::vector`] の SQ8（i8）常駐版（Issue #521）。`resident_precision()
+    /// == ResidentPrecision::I8` のときのみ `Some` を返す（D5 と同型）。
+    pub fn vector_i8(&self, node: u32) -> Option<&[i8]> {
+        match &self.vectors {
+            NodeVectors::F32(_) | NodeVectors::F16(_) => None,
+            NodeVectors::I8 { codes, .. } => node_vector_i8(codes, self.dim as usize, node).ok(),
         }
     }
 
@@ -2692,6 +2768,34 @@ impl HnswIndex {
                         .iter()
                         .zip(candidate.iter())
                         .all(|(&a, &b)| a == crate::f16::f32_to_f16_bits(b)),
+                )
+            }
+            NodeVectors::I8 { codes, params } => {
+                let stored = node_vector_i8(codes, dim, node).ok()?;
+                // 先に範囲検査を行う（Issue #521）。対称量子化の表現域は
+                // 次元ごとに `[-127*scale_d, 127*scale_d]`（`scale_d == 0` の
+                // 次元は `0` のみ）で、これは fit 時点の `[min_d, max_d]` を
+                // 包含する。`candidate` がこの範囲を超える場合、量子化すると
+                // クランプにより「たまたま同じコード」になり得るため（127 段の
+                // 粗い分解能で、fit 済み範囲の極値にあった行がさらに大きい値へ
+                // 更新されても「未変更」と誤判定される穴）、比較の前にこの
+                // ケースを不一致として弾く。最終スコアは常に f32 アリーナから
+                // 再計算されるため結果の正しさは範囲検査の有無に関わらず不変
+                // （影響はグラフ近傍構造の再利用判定のみ）。
+                for (&c, &scale) in candidate.iter().zip(params.scales().iter()) {
+                    let limit = f64::from(scale) * 127.0;
+                    if f64::from(c).abs() > limit {
+                        return Some(false);
+                    }
+                }
+                Some(
+                    stored
+                        .iter()
+                        .zip(candidate.iter())
+                        .zip(params.scales().iter())
+                        .all(|((&r, &c), &scale)| {
+                            r == crate::sq8::quantize_scalar_f64(f64::from(c), f64::from(scale))
+                        }),
                 )
             }
         }
@@ -5274,6 +5378,213 @@ mod tests {
         assert!(
             recall >= 0.7,
             "f16 resident recall@{k} too low: {recall} ({recall_hits}/{recall_total})"
+        );
+    }
+
+    // ---------- SQ8（i8）常駐（Issue #521・親 #520。ポインタ: TASK-132・TASK-156・CORE-16） ----------
+
+    /// T-I1: 同一入力で `build`（F32）と `build_with_precision(I8)` の
+    /// グラフ（`entry_point`／`level_of`／`neighbors`）が全ノード・全層で
+    /// 一致すること（f16 版 T-H1 と同型。凍結時にのみ精度が影響する）。
+    #[test]
+    fn i8_precision_produces_identical_graph_shape_to_f32() {
+        let dim = 8usize;
+        let n = 200;
+        let vectors = gen_corpus(0x0521_a1a8, dim, n);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+        };
+        let f32_index = HnswIndex::build(params, dim as u32, &vectors, 42).unwrap();
+        let i8_index = HnswIndex::build_with_precision(
+            params,
+            ResidentPrecision::I8,
+            dim as u32,
+            &vectors,
+            42,
+        )
+        .unwrap();
+
+        assert_eq!(i8_index.resident_precision(), ResidentPrecision::I8);
+        assert_eq!(f32_index.entry_point(), i8_index.entry_point());
+        assert_eq!(f32_index.len(), i8_index.len());
+        for node in 0..f32_index.len() as u32 {
+            assert_eq!(
+                f32_index.level_of(node),
+                i8_index.level_of(node),
+                "node={node}"
+            );
+            let max_level = f32_index.level_of(node).unwrap_or(0);
+            for level in 0..=max_level {
+                assert_eq!(
+                    f32_index.neighbors(level, node),
+                    i8_index.neighbors(level, node),
+                    "node={node} level={level}"
+                );
+            }
+        }
+    }
+
+    /// T-I2: I8 常駐索引の `approx_heap_bytes` が F32 常駐索引より小さいこと
+    /// （i8 はベクトル本体が約 1/4。`params`〔次元ごとのスケール〕分を
+    /// 差し引いても F32 を下回る）。
+    #[test]
+    fn i8_precision_uses_less_heap_than_f32() {
+        let dim = 32usize;
+        let n = 500;
+        let vectors = gen_corpus(0x1521, dim, n);
+        let params = HnswParams::default();
+        let f32_index = HnswIndex::build(params, dim as u32, &vectors, 7).unwrap();
+        let i8_index =
+            HnswIndex::build_with_precision(params, ResidentPrecision::I8, dim as u32, &vectors, 7)
+                .unwrap();
+        assert!(
+            i8_index.approx_heap_bytes() < f32_index.approx_heap_bytes(),
+            "i8={} f32={}",
+            i8_index.approx_heap_bytes(),
+            f32_index.approx_heap_bytes()
+        );
+    }
+
+    /// T-I3: `node_matches`・`vector`／`vector_i8` の契約（f16 版 T-H3 と同型）。
+    /// 加えて i8 固有の「範囲外は先に不一致と判定する」契約（Issue #521。
+    /// クランプによる誤「未変更」判定の回帰防止）を固定する。
+    #[test]
+    fn i8_node_matches_and_accessors_follow_contract() {
+        let dim = 4usize;
+        let n = 50;
+        // gen_corpus は [-1, 1] の値のみを生成する（対称量子化のスケールは
+        // 高々 1/127 程度、範囲は高々 [-1, 1] 付近に収まる）。
+        let vectors = gen_corpus(0x0521, dim, n);
+        let i8_index = HnswIndex::build_with_precision(
+            HnswParams::default(),
+            ResidentPrecision::I8,
+            dim as u32,
+            &vectors,
+            3,
+        )
+        .unwrap();
+        assert_eq!(i8_index.resident_precision(), ResidentPrecision::I8);
+
+        // I8 常駐時は `vector()` は常に None、`vector_i8()` は Some。
+        assert!(i8_index.vector(0).is_none());
+        assert!(i8_index.vector_i8(0).is_some());
+        assert_eq!(i8_index.vector_i8(u32::try_from(n).unwrap()), None);
+
+        // 未変更（同一 f32 行）は一致と判定される。
+        let row: Vec<f32> = vectors[0..dim].to_vec();
+        assert_eq!(i8_index.node_matches(0, &row), Some(true));
+
+        // fit 済み範囲（高々 [-1, 1] 付近）を大きく超える候補は、範囲検査
+        // （Issue #521）が量子化前に先んじて不一致と判定する——127 段の粗い
+        // 量子化ではクランプにより「たまたま同じコード」になり得るため
+        // （クランプによる誤「未変更」判定の回帰防止）。
+        let mut out_of_range = row.clone();
+        out_of_range[0] = 500.0;
+        assert_eq!(i8_index.node_matches(0, &out_of_range), Some(false));
+
+        // 範囲外ノード・次元不一致は None。
+        assert_eq!(i8_index.node_matches(u32::try_from(n).unwrap(), &row), None);
+        assert_eq!(i8_index.node_matches(0, &row[..dim - 1]), None);
+    }
+
+    /// T-I4: 非有限成分を含む入力を `I8` 指定で build すると `F32` へ自動縮退し
+    /// （D6 と同型）、`search` は成功する（`fit_dim_params`／`encode_rows` の
+    /// `Sq8Error::NonFinite` を経由する経路。`validate_build_input` が通常は
+    /// 非有限成分を事前拒否するため到達しないが、`freeze_from` 自体の
+    /// fail-closed 契約を独立に固定する）。
+    #[test]
+    fn i8_precision_falls_back_to_f32_when_fit_or_encode_fails() {
+        let dim = 4usize;
+        let vectors = gen_corpus(0x0fa1a8, dim, 30);
+        let index = HnswIndex::build_with_precision(
+            HnswParams::default(),
+            ResidentPrecision::I8,
+            dim as u32,
+            &vectors,
+            9,
+        )
+        .unwrap();
+        // このコーパスは常に有限のため通常は I8 のまま。
+        assert_eq!(index.resident_precision(), ResidentPrecision::I8);
+        let query = gen_corpus(0x0fa1a9, dim, 1);
+        let mut scratch = HnswSearchScratch::default();
+        let hits = index.search(&query, 5, 40, &mut scratch).unwrap();
+        assert!(!hits.is_empty());
+    }
+
+    /// T-I5: I8 常駐索引の `search` が brute-force（`kernel::dot`）対照で
+    /// 妥当な Recall@10 を達成すること（クラスタ構造ありフィクスチャ・層 A
+    /// 縮小規模。f16 版 T-H5 と同型。127 段の粗い量子化のため f16 より緩い
+    /// 閾値を使う——実測値は informational として扱う。詳細な受け入れ基準・
+    /// Recall ゲート同一閾値検証は後続 Issue #523 の担当）。
+    #[test]
+    fn i8_precision_search_achieves_reasonable_recall_against_brute_force() {
+        let dim = 16usize;
+        let n = 600;
+        let mut rng = DeterministicRng::new(0xc121);
+        let n_clusters = 6usize;
+        let centers: Vec<f32> = (0..n_clusters * dim)
+            .map(|_| {
+                let bits = rng.next_u64() >> 40;
+                ((bits as f32) / (1u32 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect();
+        let mut vectors = Vec::with_capacity(n * dim);
+        for i in 0..n {
+            let c = i % n_clusters;
+            for d in 0..dim {
+                let bits = rng.next_u64() >> 40;
+                let jitter = ((bits as f32) / (1u32 << 24) as f32) * 0.1 - 0.05;
+                vectors.push(centers[c * dim + d] + jitter);
+            }
+        }
+
+        let params = HnswParams {
+            m: 16,
+            ef_construction: 100,
+            ef_search: 64,
+        };
+        let index = HnswIndex::build_with_precision(
+            params,
+            ResidentPrecision::I8,
+            dim as u32,
+            &vectors,
+            11,
+        )
+        .unwrap();
+        assert_eq!(index.resident_precision(), ResidentPrecision::I8);
+
+        let queries = 40;
+        let k = 10usize;
+        let ef = 64usize;
+        let mut scratch = HnswSearchScratch::default();
+        let mut recall_hits = 0usize;
+        let mut recall_total = 0usize;
+        for q in 0..queries {
+            let query = gen_corpus(0x0c1b55 + q as u64, dim, 1);
+            let mut brute: Vec<ScoredNode> = (0..n as u32)
+                .map(|node| ScoredNode {
+                    node,
+                    score: dot(node_vector(&vectors, dim, node).unwrap(), &query),
+                })
+                .collect();
+            brute.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
+            let truth: std::collections::HashSet<u32> =
+                brute.iter().take(k).map(|s| s.node).collect();
+
+            let hits = index.search(&query, k, ef, &mut scratch).unwrap();
+            recall_total += truth.len();
+            recall_hits += hits
+                .iter()
+                .filter(|h| truth.contains(&(h.id as u32)))
+                .count();
+        }
+        let recall = recall_hits as f64 / recall_total as f64;
+        assert!(
+            recall >= 0.5,
+            "i8 resident recall@{k} too low: {recall} ({recall_hits}/{recall_total})"
         );
     }
 
