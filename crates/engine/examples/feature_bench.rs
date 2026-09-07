@@ -837,6 +837,15 @@ fn main() {
             let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
             EngineCore::from_storage_with_engine(probe_storage, kind)
         }
+        BenchEngine::HnswI8 => {
+            // I8（SQ8）常駐 opt-in（Issue #521・#523）。f16 arm と同一の構築経路。
+            let validated =
+                engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
+                    .expect("valid HnswParams::default()")
+                    .with_resident_precision(engine::hnsw::ResidentPrecision::I8);
+            let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
+            EngineCore::from_storage_with_engine(probe_storage, kind)
+        }
     };
     let index_warm_start = Instant::now();
     let index_warm_probe = probe_core.execute_sql(
@@ -870,6 +879,15 @@ fn main() {
                 engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
                     .expect("valid HnswParams::default()")
                     .with_resident_precision(engine::hnsw::ResidentPrecision::F16);
+            let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
+            EngineCore::from_storage_with_engine(storage, kind)
+        }
+        BenchEngine::HnswI8 => {
+            // 上の probe_core 構築と同一経路（Issue #521・#523）。
+            let validated =
+                engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
+                    .expect("valid HnswParams::default()")
+                    .with_resident_precision(engine::hnsw::ResidentPrecision::I8);
             let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
             EngineCore::from_storage_with_engine(storage, kind)
         }
@@ -961,7 +979,7 @@ fn main() {
     // brute_force では `hnsw_index_cache_stats()` は常に全欄 0（索引を一切
     // 構築しない構造）のため統計出力・アサートの対象外とする。
     let hnsw_stats_json = match engine_choice {
-        BenchEngine::Hnsw | BenchEngine::HnswF16 => {
+        BenchEngine::Hnsw | BenchEngine::HnswF16 | BenchEngine::HnswI8 => {
             let s = core.hnsw_index_cache_stats();
             if s.builds == 0 || s.hits == 0 {
                 fail_bench(
@@ -981,7 +999,7 @@ fn main() {
                  \"misses\":{},\"fallbacks\":{},\"plain_scans\":{},\
                  \"subset_searches\":{},\"hybrid_dense_searches\":{},\
                  \"hybrid_queries\":{},\"ef_cap_fallbacks\":{},\"entries\":{},\
-                 \"f16_residency_fallbacks\":{}",
+                 \"f16_residency_fallbacks\":{},\"i8_residency_fallbacks\":{}",
                 s.builds,
                 s.build_failures,
                 s.rebuilds,
@@ -995,6 +1013,7 @@ fn main() {
                 s.ef_cap_fallbacks,
                 s.entries,
                 s.f16_residency_fallbacks,
+                s.i8_residency_fallbacks,
             )
         }
         BenchEngine::BruteForce => String::new(),

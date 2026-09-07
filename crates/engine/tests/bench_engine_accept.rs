@@ -36,6 +36,11 @@ fn parse_engine_accepts_hnsw_f16() {
 }
 
 #[test]
+fn parse_engine_accepts_hnsw_i8() {
+    assert_eq!(parse_engine(Some("hnsw_i8")), Ok(BenchEngine::HnswI8));
+}
+
+#[test]
 fn parse_engine_rejects_unknown_values_fail_closed() {
     for raw in [
         "HNSW",

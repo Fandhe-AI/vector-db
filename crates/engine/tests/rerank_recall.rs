@@ -606,7 +606,7 @@ fn measure_rerank_recall_via_hnsw(
 /// print_ann_stats` と同型の複製）。
 fn print_ann_stats(gate: &str, engine: RecallEngine, stats: &AnnStats) {
     println!(
-        "{gate}: engine={} builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={} f16_residency_fallbacks={} f16_kernel={:?}",
+        "{gate}: engine={} builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={} f16_residency_fallbacks={} f16_kernel={:?} i8_residency_fallbacks={} i8_kernel={:?}",
         engine.token(),
         stats.builds,
         stats.build_failures,
@@ -616,6 +616,8 @@ fn print_ann_stats(gate: &str, engine: RecallEngine, stats: &AnnStats) {
         stats.ef_cap_fallbacks,
         stats.f16_residency_fallbacks,
         engine::isa::current_f16(),
+        stats.i8_residency_fallbacks,
+        engine::isa::current_i8(),
     );
 }
 
@@ -1077,7 +1079,7 @@ fn rerank_recall_large_scale_threshold_gate() {
     let engine = RecallEngine::from_env();
     let r = match engine {
         RecallEngine::BruteForce => measure_rerank_recall(&docs, &qa),
-        RecallEngine::Hnsw | RecallEngine::HnswF16 => {
+        RecallEngine::Hnsw | RecallEngine::HnswF16 | RecallEngine::HnswI8 => {
             let (r, stats) = measure_rerank_recall_via_hnsw(&docs, &qa, engine);
             print_ann_stats("rerank_recall_large_scale_threshold_gate", engine, &stats);
             r

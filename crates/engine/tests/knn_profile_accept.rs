@@ -367,6 +367,7 @@ fn explain_resident_value_handles_trailing_field_and_whitespace() {
 fn resident_label_for_token_maps_known_tokens() {
     assert_eq!(resident_label_for_token("hnsw"), Some("f32"));
     assert_eq!(resident_label_for_token("hnsw_f16"), Some("f16"));
+    assert_eq!(resident_label_for_token("hnsw_i8"), Some("i8"));
     assert_eq!(resident_label_for_token("brute_force"), None);
     assert_eq!(resident_label_for_token("bogus"), None);
 }
@@ -413,6 +414,13 @@ fn requires_hnsw_stats_check_covers_hnsw_and_hnsw_f16() {
     // (brute_force engine) という実体と異なるラベルが出力されていた）。
     assert!(requires_hnsw_stats_check("hnsw"));
     assert!(requires_hnsw_stats_check("hnsw_f16"));
+}
+
+#[test]
+fn requires_hnsw_stats_check_covers_hnsw_i8() {
+    // Issue #523: I8（SQ8）常駐でも `hnsw`／`hnsw_f16` と同型に非 vacuous 検証
+    // 対象であるべき（`hnsw_f16` と同じ codex P1 指摘の再発防止）。
+    assert!(requires_hnsw_stats_check("hnsw_i8"));
 }
 
 #[test]
