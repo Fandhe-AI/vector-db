@@ -39,6 +39,19 @@
 //! ではない）を使う——両コミットに存在する公開 API のみで構成し、CSR 化前
 //! バイナリでもこの計測部分だけは変更なしに動く（`docs/design/hnsw-index.md`
 //! §14.13 の before/after 実測手順参照）。
+//!
+//! ## レビュー対応追記: メモリ計測の子プロセス隔離
+//!
+//! 各 threads 点のメモリ計測を同一プロセス内で逐次実行すると、直前の点で
+//! 構築・解放した `HnswIndex`（数百 MB 規模）のヒープページがアロケータに
+//! 残留し、後続点の `vm_rss_delta_kb`／`vm_hwm_kb` が単発計測にならず
+//! 過小評価になり得る（codex-review P2 指摘・Cursor Bugbot 指摘・PR #590）。
+//! これを避けるため、各点のメモリ計測は `measure_memory_isolated` が
+//! 自身の実行ファイルを `MEMORY_CHILD_ENV` 付きで再実行する新規子プロセスへ
+//! 隔離する（`run_memory_child_if_requested`）。時間計測（スレッド数
+//! ラダーの構築時間・段別プロファイル）は引き続き同一プロセス内で行う
+//! （プロセス起動コストが時間計測のノイズになるのを避けるため。汚染の
+//! 影響は RSS/VmHWM 系の統計に限られる）。
 
 #[allow(dead_code)]
 mod harness;
@@ -240,6 +253,91 @@ fn measure_memory(corpus: &[f32], params: HnswParams, threads: usize) -> Result<
     ))
 }
 
+/// メモリ計測を新規プロセスで隔離するための子プロセス起動用環境変数名。
+/// スレッド数ラダーの各点を同一プロセス内で逐次計測すると、直前の点で構築・
+/// 解放した `HnswIndex`（数百 MB 規模）のヒープページがアロケータに残留し、
+/// 後続点の `vm_rss_delta_kb`／`vm_hwm_kb` を汚染する（codex-review P2 指摘・
+/// Cursor Bugbot 指摘・PR #590）。本ベンチ自身を `threads` を指定して
+/// 再実行し、子プロセス側で 1 threads 点だけの `measure_memory` を実行する
+/// ことで、各点を独立したプロセス（新規ヒープ・新規 VmHWM）で計測する。
+const MEMORY_CHILD_ENV: &str = "BENCH_HNSW_PARALLEL_MEMORY_CHILD_THREADS";
+
+/// `MEMORY_CHILD_ENV` が設定されている場合のみ実行される子プロセス経路。
+/// 指定 `threads` 1 点分のコーパス生成・`measure_memory` を行い、結果行を
+/// 標準出力へ書いて終了する（`main` の通常経路には戻らない）。親プロセス
+/// （`measure_memory_isolated`）が `rows` を明示的に環境変数で渡すため、
+/// ここでの `resolve_rows()` は親と同一の値を再現する。
+fn run_memory_child_if_requested() {
+    let Ok(raw) = std::env::var(MEMORY_CHILD_ENV) else {
+        return;
+    };
+    // GITHUB_ACTIONS 下拒否は親プロセスの起動時点で既に検査済みだが、子
+    // プロセス単体で誤って呼ばれた場合の defense-in-depth として再検査する
+    // （`hnsw_build_bench.rs` と同一方針）。
+    if running_under_github_actions() {
+        eprintln!(
+            "hnsw_parallel_build_bench: refusing to run under GITHUB_ACTIONS (manual-only bench)"
+        );
+        std::process::exit(1);
+    }
+    let threads: usize = match raw.parse() {
+        Ok(t) if (1..=MAX_BUILD_THREADS).contains(&t) => t,
+        _ => {
+            eprintln!(
+                "hnsw_parallel_build_bench: invalid {MEMORY_CHILD_ENV}={raw} (must be 1..={MAX_BUILD_THREADS})"
+            );
+            std::process::exit(1);
+        }
+    };
+    let rows = resolve_rows();
+    let params = HnswParams::default();
+    let corpus = match harness::hnsw_build::generate_corpus(0xB0BA_1234 ^ rows as u64, DIM, rows) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hnsw_parallel_build_bench: corpus generation failed (memory child): {e}");
+            std::process::exit(1);
+        }
+    };
+    match measure_memory(&corpus, params, threads) {
+        Ok(line) => {
+            println!("{line}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("hnsw_parallel_build_bench: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `threads` 点のメモリ計測を新規子プロセス（自分自身の実行ファイルの
+/// 再実行）へ隔離して実行する（Issue #495 追記。codex-review P2・Cursor
+/// Bugbot 指摘対応。上記 `MEMORY_CHILD_ENV` のドキュメンテーションコメント
+/// 参照）。子プロセスの標準出力から `render_memory_line` が出す
+/// `"hnsw_parallel_build: memory ..."` 行を抜き出して返す。
+fn measure_memory_isolated(threads: usize, rows: usize) -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("threads={threads}: current_exe unavailable: {e}"))?;
+    let output = std::process::Command::new(&exe)
+        .env(MEMORY_CHILD_ENV, threads.to_string())
+        .env("BENCH_HNSW_PARALLEL_ROWS", rows.to_string())
+        .output()
+        .map_err(|e| format!("threads={threads}: memory child process spawn failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "threads={threads}: memory child process exited with {:?}: {stderr}",
+            output.status.code()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find(|line| line.starts_with("hnsw_parallel_build: memory "))
+        .map(str::to_string)
+        .ok_or_else(|| format!("threads={threads}: memory child process produced no memory line"))
+}
+
 fn measure_control(corpus: &[f32], threads: usize) -> Result<Duration, String> {
     let config = MeasurementConfig::new(20, 20, 0xC0FFEE_u64 ^ threads as u64)
         .map_err(|e| format!("control threads={threads}: {e}"))?;
@@ -263,6 +361,11 @@ fn print_noise_snapshot(threads: usize) {
 }
 
 fn main() {
+    // メモリ計測の子プロセス経路（`MEMORY_CHILD_ENV` 設定時のみ）。設定されて
+    // いれば 1 threads 点分の計測だけを行いここで終了し、通常のラダー計測
+    // 経路（下記）には進まない。
+    run_memory_child_if_requested();
+
     if running_under_github_actions() {
         eprintln!(
             "hnsw_parallel_build_bench: refusing to run under GITHUB_ACTIONS (manual-only bench)"
@@ -310,7 +413,11 @@ fn main() {
     for &threads in &ladder {
         print_noise_snapshot(threads);
 
-        match measure_memory(&corpus, params, threads) {
+        // 各 threads 点のメモリ計測は新規子プロセスへ隔離する（Issue #495
+        // 追記。同一プロセス内で逐次計測すると直前点の `HnswIndex` 構築・
+        // 解放によるアロケータのページ再利用が後続点の RSS/VmHWM を汚染する
+        // ため。`measure_memory_isolated` ドキュメンテーションコメント参照）。
+        match measure_memory_isolated(threads, rows) {
             Ok(line) => println!("{line}"),
             Err(e) => {
                 eprintln!("hnsw_parallel_build_bench: {e}");
