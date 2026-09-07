@@ -139,7 +139,8 @@ resident_precision()`）を追記する。実行時の自動縮退結果（D6）
 - AVX-512 `_mm512_cvtph_ps` 変種は未実装（ADR トークン表に無い）。
 - `RecallEngine` fixture（`crates/engine/tests/fixtures/recall_engine.rs`）
   への `hnsw_f16` 追加・`recall.yml` matrix 拡張・Recall 3 ゲート同一閾値
-  検証は本 Issue の対象外（#515）。
+  検証は Issue #515 で実施済み（`docs/design/ann-recall-gate-verification.md`
+  「Issue #515 追記」節参照）。
 - 25k／100k／500k × dim 128／768 規模での常駐メモリ・レイテンシの前後比較
   実測は対象外（#516）。
 - 既定常駐精度を F16 へ反転するかどうかは #515／#516 の実測後のオーナー判断。

@@ -514,13 +514,17 @@ const MIN_INDEXED_ROWS: usize = 1_024;
 /// 経由）から取得する点のみが異なり、baseline／after／補助計測の集計ロジックは
 /// 同一（`RerankCandidate::fused_score` は `sql/exec.rs` の hybrid 分岐が書き込む
 /// `ResultRow::score`＝RRF 融合スコアであり、in-memory 版の `h.score` と同じ意味）。
-fn measure_rerank_recall_via_hnsw(docs: &[Doc], qa: &[QaCase]) -> (RerankRecallResult, AnnStats) {
+fn measure_rerank_recall_via_hnsw(
+    docs: &[Doc],
+    qa: &[QaCase],
+    engine: RecallEngine,
+) -> (RerankRecallResult, AnnStats) {
     let dim = docs.first().map_or(0, |d| d.vector.len());
     let rows: Vec<(u64, Vec<f32>, String)> = docs
         .iter()
         .map(|d| (d.id, d.vector.clone(), d.text.clone()))
         .collect();
-    let fixture = SqlHybridFixture::new(dim as u32, &rows, RecallEngine::Hnsw);
+    let fixture = SqlHybridFixture::new(dim as u32, &rows, engine);
     let rerank_cfg = RerankConfig::default();
     let reranker = LexicalOverlapReranker::default();
     let doc_text_by_id: BTreeMap<u64, &str> =
@@ -600,15 +604,18 @@ fn measure_rerank_recall_via_hnsw(docs: &[Doc], qa: &[QaCase]) -> (RerankRecallR
 
 /// 非 vacuous 統計を数値を含まない形式でログへ出す（`hybrid_recall.rs::
 /// print_ann_stats` と同型の複製）。
-fn print_ann_stats(gate: &str, stats: &AnnStats) {
+fn print_ann_stats(gate: &str, engine: RecallEngine, stats: &AnnStats) {
     println!(
-        "{gate}: engine=hnsw builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={}",
+        "{gate}: engine={} builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={} f16_residency_fallbacks={} f16_kernel={:?}",
+        engine.token(),
         stats.builds,
         stats.build_failures,
         stats.rebuilds,
         stats.hybrid_dense_searches,
         stats.hybrid_queries,
         stats.ef_cap_fallbacks,
+        stats.f16_residency_fallbacks,
+        engine::isa::current_f16(),
     );
 }
 
@@ -1070,9 +1077,9 @@ fn rerank_recall_large_scale_threshold_gate() {
     let engine = RecallEngine::from_env();
     let r = match engine {
         RecallEngine::BruteForce => measure_rerank_recall(&docs, &qa),
-        RecallEngine::Hnsw => {
-            let (r, stats) = measure_rerank_recall_via_hnsw(&docs, &qa);
-            print_ann_stats("rerank_recall_large_scale_threshold_gate", &stats);
+        RecallEngine::Hnsw | RecallEngine::HnswF16 => {
+            let (r, stats) = measure_rerank_recall_via_hnsw(&docs, &qa, engine);
+            print_ann_stats("rerank_recall_large_scale_threshold_gate", engine, &stats);
             r
         }
     };
