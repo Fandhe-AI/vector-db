@@ -514,9 +514,14 @@ policy §7.2 と同じ形式（`docs/design/benchmark-judgement-policy.md`）。
 
 #### 7.7.6 本環境（QEMU x86_64）スモーク結果（参考値・完走確認）
 
-`AB_POINTS="1:128" AB_PAIRS=5 make bench-knn-precision-resident`
-（縮小規模点 1 点のみ。hot-only 30 run ＋ memory 12 run）を本開発環境
-（QEMU 仮想 CPU）で実行し、全 run が exit_code 0 で完走することを確認した。
+`AB_POINTS="1:128" AB_MEMORY_POINTS="1:128" AB_PAIRS=5
+AB_CANDIDATE_ENGINES="hnsw_f16 hnsw_i8" make bench-knn-precision-resident`
+（縮小規模点 1 点のみ。500k×768 の索引単体メモリ点は本開発環境〔共有 QEMU
+VM〕での所要時間の都合で `AB_MEMORY_POINTS` を明示的に絞り本スモークの
+対象外とした——hot-only 30 run ＋ memory 6 run〔1:128 点 × 3 arm × 2 rep〕）
+を本開発環境（QEMU 仮想 CPU）で実際に実行し、全 36 run が exit_code 0 で
+完走することを確認した。per-run 生データは下記のとおり
+`docs/design/bench-data/hnsw-precision-resident-ab/` へ保存済み。
 
 **この結果は x86_64・`F16c`／`Avx2Widen` 経路の参考値であり Apple の数値
 ではない。production 変更・Apple 側の判断の採否根拠にしない**
@@ -524,13 +529,37 @@ policy §7.2 と同じ形式（`docs/design/benchmark-judgement-policy.md`）。
 
 - 環境: `cpu_model=QEMU Virtual CPU version 2.5+`・`nproc=12`・
   `rustc_version=1.98.1`
-- `kernel_isa dot=Avx2Fma f16=F16c i8=Avx2Widen`（全 run で一貫。Apple 実機
-  では `dot=Neon f16=NeonFp16 i8=NeonDotprod` となることが期待される）
+- `kernel_isa dot=Avx2Fma f16=F16c i8=Avx2Widen`（全 36 run で一貫。Apple
+  実機では `dot=Neon f16=NeonFp16 i8=NeonDotprod` となることが期待される）
 - `resident_precision`・`hnsw_stats builds>0 hits>0`・
   `f16_residency_fallbacks=0`・`i8_residency_fallbacks=0` をいずれの arm でも
   確認（7.7.5 のチェックリストが本環境で全て満たされることを確認）
 - per-run 生データ（TSV・env.txt）は
-  `docs/design/bench-data/hnsw-precision-resident-ab/` に保存
+  `docs/design/bench-data/hnsw-precision-resident-ab/20260907T190235Z-{env.txt,summary.tsv}`
+  へ保存済み（相対パス・生データのみ。絶対パス・ホスト名・ユーザー名は
+  含まない）
+
+参考値として、実測した 1:128（25,000 行・dim 128）点の hot-only レイテンシ・
+索引単体メモリを下記に記録する（7.7.4 の Apple 行の記入例も兼ねる。
+判定規約は `docs/design/benchmark-judgement-policy.md` §3〜§4）:
+
+| arm | hot min (ms) | hot median (ms) | ratio (min-of-N, vs hnsw) | ratio (median) | 固定 ±5% 帯判定 | 参照区間帯（`COUNT(*)`） |
+| --- | --- | --- | --- | --- | --- | --- |
+| hnsw（f32） | 0.427 | 0.431 | 1.0000 | 1.0000 | — | 0.00%（n=15・0.054ms で不変） |
+| hnsw_f16 | 0.422 | 0.426 | 0.9883 | 0.9884 | Neutral | 0.00%（n=15・0.054ms で不変） |
+| hnsw_i8 | 0.419 | 0.426 | 0.9813 | 0.9884 | Neutral | 0.00%（n=15・0.054ms で不変） |
+
+| arm | `approx_heap_bytes`（rep1/rep2 ビット同一） | ratio (vs hnsw) | 削減率 |
+| --- | --- | --- | --- |
+| hnsw（f32） | 17,226,056 | 1.0000 | — |
+| hnsw_f16 | 10,826,056 | 0.6285 | 37.15% |
+| hnsw_i8 | 7,726,568 | 0.4485 | 55.15% |
+
+`hnsw`／`hnsw_f16` の値は `docs/design/hnsw-f16-resident.md`「Issue #516
+追記」節の 1:128 行（`hnsw`=17,226,056・`hnsw_f16`=10,826,056）と完全一致
+しており、本スモークが同一の測定経路を再現していることの裏付けになる。
+本節の数値はいずれも x86_64 QEMU の参考値であり、Apple M 実機の数値では
+ない（上記のとおり判断根拠にしない）。
 
 #### 7.7.7 Apple 行（未計測・オーナー申し送り）
 
