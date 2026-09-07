@@ -2431,6 +2431,18 @@ impl EngineCore {
                         storage: &self.storage,
                         cache: &self.visible_bitmap_cache,
                     }),
+                    // Issue #475: 索引対応述語のみの `WHERE` 付き集計・
+                    // `GROUP BY` を `ScalarIndex` の候補削減・キー列挙経路へ
+                    // 結線する（詳細は `sql::aggregate`／`sql::group_by` の
+                    // モジュールドキュメント参照）。
+                    Some(crate::sql::arena_cache::ArenaCacheAccess {
+                        storage: &self.storage,
+                        cache: &self.sql_arena_cache,
+                    }),
+                    Some(crate::sql::scalar_index::ScalarCacheAccess {
+                        storage: &self.storage,
+                        cache: &self.scalar_index_cache,
+                    }),
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
