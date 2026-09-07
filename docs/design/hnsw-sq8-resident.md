@@ -266,14 +266,17 @@ opt-in の既定 `ef_search`（既定 64）は変更しない。専用 oversampl
 2. `docs/design/ann-recall-gate-verification.md`「Issue #523 追記」節の
    Recall ゲート実測（実コーパス規模・hybrid 密側再取得ループ経由）では
    全 8 測定点で brute_force と完全一致しており、この構造的なギャップは
-   本リポの Recall ゲートが対象とする経路（SQL 表層 hybrid・単発
-   DISTANCE）では実害として現れていない。
+   本リポの Recall ゲートが対象とする経路（3 ハーネスいずれも
+   `SqlHybridFixture` 経由の SQL 表層 hybrid 検索）では実害として現れて
+   いない。**この結論は hybrid 経路に限定される**——単発 DISTANCE
+   クエリ（`ORDER BY DISTANCE(...)`）は Recall ゲートの測定対象に含まれて
+   おらず、本節の実測はその同等性を示すものではない。
 
 両者の違い（`hnsw_i8_recall.rs` の直接 `HnswIndex::search` 呼び出し vs
 hybrid 密側再取得ループ経由）の原因分析は未実施の仮説にとどめ、既定値
 変更は行わない。既定 `ef_search` の引き上げ・専用 knob 追加の要否は
-今後 I8 常駐の適用範囲が単発 DISTANCE クエリへ広がった場合にオーナー
-判断で再検討する。
+今後 I8 常駐の適用範囲が単発 DISTANCE クエリを対象にした Recall 評価へ
+広がった場合にオーナー判断で再検討する。
 
 ### 前後比較・常駐メモリ実測（`bench-knn-i8-resident`）
 

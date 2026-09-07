@@ -766,7 +766,7 @@ fn f16_hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall() 
 }
 
 /// Issue #523: I8（SQ8）常駐でも hybrid 密側再取得ループ（`HnswDenseProvider`）
-/// が既定エンジン対照 Recall@10 ≥ 0.9・可視外非混入を維持することを固定する
+/// が既定エンジン対照 Recall@10 ≥ 0.8・可視外非混入を維持することを固定する
 /// （f16 版と同型）。
 #[test]
 fn i8_hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall() {
@@ -996,7 +996,7 @@ fn f16_rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall() {
 }
 
 /// Issue #523: I8（SQ8）常駐でも Rust API（`VectorCore::search`）が
-/// `HnswIndexCache` を経由して既定エンジン対照 Recall@10 ≥ 0.9・可視外非混入を
+/// `HnswIndexCache` を経由して既定エンジン対照 Recall@10 ≥ 0.8・可視外非混入を
 /// 維持することを固定する（f16 版と同型）。
 #[test]
 fn i8_rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall() {
@@ -1151,7 +1151,7 @@ fn f16_filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
 }
 
 /// Issue #523: I8（SQ8）常駐でも `Subset` 形状（SCALAR 事前フィルタ付き
-/// DISTANCE）が既定エンジン対照 Recall@10 ≥ 0.9・可視外非混入を維持することを
+/// DISTANCE）が既定エンジン対照 Recall@10 ≥ 0.8・可視外非混入を維持することを
 /// 固定する（f16 版と同型）。
 #[test]
 fn i8_filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
@@ -1554,7 +1554,7 @@ fn f16_full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenan
 }
 
 /// Issue #523: I8（SQ8）常駐でも可視カーディナリティ比が `full_scan_ratio`
-/// 以上の場合はマスク付き ANN 探索側を選び、既定エンジン対照 Recall@10 ≥ 0.9・
+/// 以上の場合はマスク付き ANN 探索側を選び、既定エンジン対照 Recall@10 ≥ 0.8・
 /// 可視外非混入を維持することを固定する（f16 版と同型）。
 #[test]
 fn i8_full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants() {
