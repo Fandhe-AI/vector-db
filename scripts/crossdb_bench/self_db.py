@@ -21,6 +21,7 @@ users.txt はベンチ専用の一意な作業サブディレクトリ（`<workd
 from __future__ import annotations
 
 import atexit
+import hashlib
 import os
 import shutil
 import subprocess
@@ -83,6 +84,27 @@ def _port_is_listening(host: str, port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def _binary_version_string(path: str) -> str:
+    """起動に使った `wire-server` バイナリの識別情報（絶対パス・内容ハッシュ）を
+    含むバージョン文字列を組み立てる。
+
+    `CROSSDB_SELF_BINARY`（Issue #479）で過去コミットのバイナリを起動しても
+    `git rev-parse` 等でコミットを一意に復元できるとは限らない（ワークツリーの
+    退避先ビルドや未コミット状態からのビルドもあり得る）ため、実行時に実際に
+    起動したバイナリファイルの内容から sha256 を計算して識別子とする。既定の
+    `target/release/wire-server` を使った場合も同じ関数を通すため、before/after
+    比較で常に「実際に何を起動したか」が meta.version に残る
+    （codex-review P1 指摘・PR #586）。
+    """
+    abspath = os.path.abspath(path)
+    try:
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError as e:
+        return f"wire-server (path={abspath}; sha256=unavailable: {e})"
+    return f"wire-server (path={abspath}; sha256={digest})"
 
 
 class SelfServer:
@@ -619,7 +641,7 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
             rows_visible = 0
         meta = build_meta(
             db="self",
-            version="wire-server (workspace HEAD)",
+            version=_binary_version_string(server.binary),
             connection="loopback TCP (psycopg simple query protocol)",
             config=args.config,
             rows=rows_visible,
