@@ -476,8 +476,13 @@ git archive eabff3a | tar -x -C /path/to/after
 # 各ツリーへ benches/hnsw_search_bench.rs・benches/harness/hnsw_search_latency.rs・
 # harness/mod.rs の `pub mod hnsw_search_latency;` 追記・Cargo.toml の
 # [[bench]] 追記 を適用してから:
-CARGO_TARGET_DIR=/path/to/target-before cargo bench --bench hnsw_search_bench -p engine --no-run
-CARGO_TARGET_DIR=/path/to/target-after  cargo bench --bench hnsw_search_bench -p engine --no-run
+# BENCH_HNSW_SEARCH_COMMIT をビルド時に指定し、計測対象コミットをバイナリへ
+# 焼き込む（`git archive` で取り出した作業ツリーには .git が無く、指定しない
+# 場合の実行時フォールバック（git rev-parse HEAD）はカレントディレクトリの
+# HEAD を返すため、同じ作業ディレクトリから before/after を交互起動すると
+# 両方に同一値が記録されてしまう。codex-review 指摘・Issue #491）。
+BENCH_HNSW_SEARCH_COMMIT=4d2bd23 CARGO_TARGET_DIR=/path/to/target-before cargo bench --bench hnsw_search_bench -p engine --no-run
+BENCH_HNSW_SEARCH_COMMIT=eabff3a CARGO_TARGET_DIR=/path/to/target-after  cargo bench --bench hnsw_search_bench -p engine --no-run
 # 8 規模点 × 交互 5 ペアで両バイナリを起動（BENCH_HNSW_SEARCH_ROWS／
 # BENCH_HNSW_SEARCH_DIM／BENCH_HNSW_SEARCH_MASK を指定）。各プロセスは
 # target/reference いずれも代表値（min_us／median_us）のみを出力する。

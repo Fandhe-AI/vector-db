@@ -21,6 +21,28 @@
 //! （並列構築 `build_with_threads(threads>1)` は run ごとにグラフの形状が
 //! 変わり得るため before/after を交絡させる。使わない）。
 //!
+//! # 計測対象コミットの記録（`BENCH_HNSW_SEARCH_COMMIT`）
+//!
+//! `git archive <commit> | tar -x` で取り出した作業ツリーには `.git` が
+//! 含まれないため、`current_commit()` の実行時 `git rev-parse HEAD`
+//! フォールバックはビルド元コミットではなく「起動時のカレントディレクトリの
+//! HEAD」を返す——before/after バイナリを同じ作業ディレクトリから交互起動
+//! すると両方に同一の値が記録され、結果と実装の対応を誤らせる
+//! （codex-review 指摘・Issue #491）。この対応関係を保証するため、
+//! `BENCH_HNSW_SEARCH_COMMIT=<sha>` をビルド時（`cargo bench --no-run`）に
+//! 渡すと `option_env!` でバイナリへ焼き込む方式を追加した。値を渡さず
+//! ビルドした場合のみ実行時 `git rev-parse HEAD` へフォールバックする
+//! （`.git` があるリポジトリルートから直接 `cargo bench` する通常経路向け）。
+//! 出力ヘッダの `commit_source` フィールド（`build_env`／`runtime_git`／
+//! `unknown`）でどちらの経路の値かを区別できる。
+//!
+//! なお cargo は `option_env!` が読む環境変数の変更を再ビルドの
+//! フィンガープリントとして追跡しない。本ベンチの再現手順（後述）は
+//! before/after を別々の `CARGO_TARGET_DIR` でビルドするため実務上問題に
+//! ならないが、同一 `CARGO_TARGET_DIR` を使い回して
+//! `BENCH_HNSW_SEARCH_COMMIT` だけを変えて再ビルドする場合は増分ビルドが
+//! 走らず値が古いまま（stale）になり得る点に注意する。
+//!
 //! # 参照区間（代表値のみ出力・ノイズ帯はここでは算出しない）
 //!
 //! 変更（prefetch）を含まない区間として、探索本体と同一のクエリサイクル・
@@ -50,6 +72,7 @@
 //! | `BENCH_HNSW_SEARCH_EF` | 64 | `ef_search`（`1..=MAX_EF`） |
 //! | `BENCH_HNSW_SEARCH_K` | 10 | Top-k の `k`（`1..=ef`） |
 //! | `BENCH_DEDICATED_ENV` | 未設定 | `1` で専有環境自己申告（出力ヘッダへ反映するのみ。挙動は変えない） |
+//! | `BENCH_HNSW_SEARCH_COMMIT` | 未設定 | ビルド時（`cargo bench --no-run` 実行時）に渡すと `option_env!` で計測対象コミットとしてバイナリへ焼き込む。`git archive` で取り出した作業ツリー（`.git` を含まない）から before/after 双方をビルドする再現手順ではこの指定が必須——未指定時のフォールバック（実行時 `git rev-parse HEAD`）はカレントディレクトリの HEAD を返すため、同一ディレクトリから交互起動する before/after バイナリに同じ値が記録されてしまう（codex-review 指摘・Issue #491）。出力の `commit_source` フィールド（`build_env`／`runtime_git`／`unknown`）で由来を確認できる |
 //!
 //! コーパス・クエリは 2 エンジン比較ベンチと同じ理由（内積最大化とコサイン
 //! 類似度最大化を一致させ、以後の距離契約を単純化する）で L2 正規化する
@@ -81,15 +104,39 @@ fn dedicated_env() -> bool {
         .unwrap_or(false)
 }
 
-fn current_commit() -> String {
+/// 計測対象コミットを決定する。優先順位:
+/// 1. ビルド時に `BENCH_HNSW_SEARCH_COMMIT` を渡した場合（`option_env!` で
+///    バイナリへ焼き込む。`cargo bench --no-run` 実行時に指定する）。
+///    `git archive` で取り出した作業ツリー（`.git` を含まない）から
+///    ビルドする再現手順（`docs/design/hnsw-search.md`「再現方法」節）は
+///    この経路が前提——同じ作業ディレクトリから before/after バイナリを
+///    交互起動しても、各バイナリが自分のビルド時点の値を保持する
+///    （codex-review 指摘・Issue #491。実行時 `git rev-parse` はカレント
+///    ディレクトリの HEAD を返すため、この用途には使えない）。
+/// 2. 実行時 `git rev-parse HEAD`（`.git` があるリポジトリルートから
+///    `cargo bench --bench hnsw_search_bench` を直接実行する通常経路向け
+///    のフォールバック。1 と異なり「起動時のカレントディレクトリの
+///    HEAD」であり、`before`/`after` を区別する保証はない）。
+/// 3. いずれも得られない場合は `"unknown"`。
+///
+/// 戻り値は `(commit, source)`。`source` は `render_header_line` の
+/// `commit_source` へそのまま渡し、値の信頼性（1: 明示指定・2: 実行時
+/// フォールバック・3: 不明）を出力上区別できるようにする。
+fn current_commit() -> (String, &'static str) {
+    if let Some(embedded) = option_env!("BENCH_HNSW_SEARCH_COMMIT") {
+        let trimmed = embedded.trim();
+        if !trimmed.is_empty() {
+            return (trimmed.to_string(), "build_env");
+        }
+    }
     std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+        .map(|s| (s.trim().to_string(), "runtime_git"))
+        .unwrap_or_else(|| ("unknown".to_string(), "unknown"))
 }
 
 /// クエリ本数の整数倍で protocol 下限（20）以上の最小値
@@ -119,7 +166,7 @@ fn main() {
     let ef = parse_ef(std::env::var("BENCH_HNSW_SEARCH_EF").ok().as_deref());
     let k = parse_k(std::env::var("BENCH_HNSW_SEARCH_K").ok().as_deref(), ef);
     let dedicated = dedicated_env();
-    let commit = current_commit();
+    let (commit, commit_source) = current_commit();
 
     let raw_corpus = match generate_corpus(0xC0BA_1234 ^ rows as u64, dim, rows) {
         Ok(c) => c,
@@ -173,6 +220,7 @@ fn main() {
             queries_count,
             dedicated,
             &commit,
+            commit_source,
             build_ms,
         )
     );

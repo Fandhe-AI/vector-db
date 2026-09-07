@@ -196,6 +196,7 @@ fn render_lines_contain_expected_fields() {
         200,
         false,
         "abc123",
+        "build_env",
         123.456,
     );
     assert!(header.contains("rows=10000"));
@@ -203,6 +204,7 @@ fn render_lines_contain_expected_fields() {
     assert!(header.contains("mask=50%"));
     assert!(header.contains("dedicated=false"));
     assert!(header.contains("commit=abc123"));
+    assert!(header.contains("commit_source=build_env"));
 
     let target = render_target_line(1.0, 2.0, 3.0, 400);
     assert!(target.contains("target=hnsw_search"));

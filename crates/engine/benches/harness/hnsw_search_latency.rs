@@ -290,6 +290,16 @@ pub fn reference_band(values: &[f64]) -> Result<f64, HnswSearchLatencyError> {
 }
 
 /// 実行条件のヘッダ 1 行分の出力整形。
+///
+/// `commit_source` は `commit` の由来（`build_env`／`runtime_git`／`unknown`）を
+/// 明示するタグ。before/after バイナリを同一作業ディレクトリから交互起動する
+/// 再現手順（`docs/design/hnsw-search.md`「再現方法」節）では `git archive` で
+/// 取り出した作業ツリーに `.git` が無いため、実行時 `git rev-parse HEAD` は
+/// カレントディレクトリの HEAD を返してしまい両バイナリに同じ値が記録される
+/// （codex-review 指摘・Issue #491）。`commit_source` を出力へ含めることで、
+/// 読み手が「ビルド時に明示指定された値（信頼できる）」なのか「実行時
+/// フォールバック（同一プロセスでない限り信頼できない）」なのかを区別できる
+/// ようにする。
 #[allow(clippy::too_many_arguments)]
 pub fn render_header_line(
     rows: usize,
@@ -300,11 +310,13 @@ pub fn render_header_line(
     queries: usize,
     dedicated: bool,
     commit: &str,
+    commit_source: &str,
     build_ms: f64,
 ) -> String {
     format!(
         "hnsw_search_bench: rows={rows} dim={dim} mask={} ef={ef} k={k} queries={queries} \
-         corpus=l2_normalized dedicated={dedicated} commit={commit} build_ms={build_ms:.3}",
+         corpus=l2_normalized dedicated={dedicated} commit={commit} commit_source={commit_source} \
+         build_ms={build_ms:.3}",
         mask.token()
     )
 }
