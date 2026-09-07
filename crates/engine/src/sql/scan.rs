@@ -21,8 +21,9 @@
 //! 「テナント境界（P0）」）。
 //!
 //! 契約の詳細（`LIMIT` の意味・順序保証の有無・取得モードとの無関係性）は
-//! `docs/design/wide-retrieval-scan.md`（spec ビヘイビア ID は未確定。本モジュールは
-//! 本リポの実装既定値として動作する）参照。順序は同一スナップショット内の redb
+//! `docs/design/wide-retrieval-scan.md`（spec ビヘイビア ID は SQL-15・TASK-170 として
+//! 付与済み〔vector-db-spec#12〕。確定化は TASK-170 が担う。本モジュールは本リポの
+//! 実装既定値として動作する）参照。順序は同一スナップショット内の redb
 //! 行テーブルの物理走査順（`(tenant_id, id)` 昇順）であり、`ORDER BY` 相当の意味的
 //! 順序を持たない。
 

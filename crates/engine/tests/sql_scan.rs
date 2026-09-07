@@ -1,6 +1,7 @@
 //! 広域取得（ソートなしのフィルタ取得。`SELECT ... [WHERE ...] LIMIT n`）の結合
 //! テスト（Issue #454）。ポインタ: `docs/design/wide-retrieval-scan.md`（spec
-//! ビヘイビア ID は未確定。本モジュールは本リポの実装既定値の契約を固定する）。
+//! ビヘイビア ID は SQL-15・TASK-170 として付与済み〔vector-db-spec#12〕。
+//! 確定化は TASK-170 が担う。本モジュールは本リポの実装既定値の契約を固定する）。
 //!
 //! `tests/sql_aggregate.rs` と同じ流儀（`unique_db_path`＋`CleanupGuard`、決定的
 //! 擬似乱数 xorshift64*、production の判定関数（`PolicyContext::is_visible`）を

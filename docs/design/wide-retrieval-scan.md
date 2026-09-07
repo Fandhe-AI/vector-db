@@ -1,13 +1,14 @@
 # ADR: 広域取得モード（ソートなしのフィルタ取得）を SQL 表層へ追加する（Issue #454）
 
-- ステータス: Implemented（オーナー判断〔2026-09-07〕により、spec 側ビヘイビア ID
-  の確定を待たず本リポの ADR を実装既定値として先行公開。ID は候補 SQL-15・
-  TASK-170（いずれも spec 側で確定するまで仮）。確定後にポインタ差し替え PR を
-  別途作成する――下記「spec 側への申し送り」参照）
-- 対応: Issue #454
-- 関連ポインタ: TASK-161・TASK-162・SQL-12・SEARCH-9（取得モード `recall`／
-  `precision` との関係）・RLS-8（TASK-138。全読み取り経路への RLS 一般化）・
-  TABLE-12（キー/ヘッダ tenant 整合検査）。spec 本文は転記しない
+- ステータス: Implemented（spec 側ビヘイビア ID は SQL-15・TASK-170 として付与
+  済み〔vector-db-spec#12・spec main `84eb7ef4d2e2e1d3cb35bd95e13e60bec10e88c6`・
+  2026-09-07〕。オーナー判断〔2026-09-07〕による本 ADR の先行公開経緯・ID 差し
+  替えの経緯は下記「spec 側への申し送り」参照。SQL-15 自体の確定化〔本リポ側
+  の受け入れ確認・wire 経由 3 クライアント実測〕は TASK-170 が担う）
+- 対応: Issue #454・spec 側 SQL-15・TASK-170（vector-db-spec#12）
+- 関連ポインタ: SQL-15・TASK-170・TASK-161・TASK-162・SQL-12・SEARCH-9（取得
+  モード `recall`／`precision` との関係）・RLS-8（TASK-138。全読み取り経路への
+  RLS 一般化）・TABLE-12（キー/ヘッダ tenant 整合検査）。spec 本文は転記しない
   （[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
 - 検証コード: `crates/engine/src/sql/allowlist.rs`（`Statement::Scan`・
   `ValidatedScan` 単体テスト）・`crates/engine/src/sql/scan.rs`（`execute_scan`
@@ -36,7 +37,7 @@ SEARCH-9）は Top-k 固定件数／確信度ゲートであり、「ソート�
 
 ## 設計方針
 
-### 構文・返却契約（本リポの実装既定値。spec ビヘイビア ID 確定待ち）
+### 構文・返却契約（本リポの実装既定値。spec ビヘイビア ID は SQL-15・TASK-170）
 
 ```text
 SELECT <投影（既存許可形: *, 列名列, 式項目〔UDF 含む〕）> FROM <table>
@@ -59,10 +60,9 @@ SELECT <投影（既存許可形: *, 列名列, 式項目〔UDF 含む〕）> FR
 
 ### しきい値構文・大きな k の広域取得（スコープ外の判断）
 
-「しきい値・大きな k で広く返す Top-k」のうち **しきい値構文**は spec ID 未確定の
-ため本 Issue では実装しない（構文を先に固定すると spec 確定後に互換性破壊と
-なるため）。大きな k は既存 `LIMIT`（上限 `MAX_SEARCH_K`＝10,000）で既に表現
-できる。
+「しきい値・大きな k で広く返す Top-k」のうち **しきい値構文**は SQL-15 の
+スコープ外（規範化は別途）のため本 Issue では実装しない。大きな k は既存
+`LIMIT`（上限 `MAX_SEARCH_K`＝10,000）で既に表現できる。
 
 ### 構文の位置付け: `USING MODE` の新値ではなく独立文種
 
@@ -116,22 +116,30 @@ SELECT <投影（既存許可形: *, 列名列, 式項目〔UDF 含む〕）> FR
 
 ## スコープ外
 
-- spec 側ビヘイビア ID の確定（下記「spec 側への申し送り」）・確定後のポインタ
-  差し替え。
-- しきい値による可変件数の広域取得構文（spec ID 確定後に別タスク）。
+- SQL-15 自体の確定化（本リポ側の受け入れ確認・wire 経由 3 クライアント実測。
+  TASK-170 が担う。下記「spec 側への申し送り」参照）。
+- しきい値による可変件数の広域取得構文（SQL-15 のスコープ外。別タスク）。
 - 検索 SELECT（`ORDER BY`）経路の投影固定コスト削減（Issue #453 の管轄。本
   Issue では `bulk_knn_*` の self 実測値は変わらない）。
 - 広域取得への二次索引（Issue #359 ADR）適用・`EXPLAIN` 露出。
 - `make bench-crossdb`／`make e2e-three-client` の実行環境が無い場合の再実測・
   実行はオーナー作業。
 
-## spec 側への申し送り
+## spec 側への申し送り（反映済み）
 
 spec 側でモード定義・構文・返却契約（件数上限・順序保証の有無・RLS 適用）を
-ビヘイビア ID として確定する作業は本リポからは実施不可（private spec リポ
-[vector-db-spec](https://github.com/Fandhe-AI/vector-db-spec) 側の作業）。本 ADR の
-契約は spec ID 確定までの実装既定値として運用し、確定後にポインタを差し替える。
+ビヘイビア ID として新設する作業は private spec リポ
+[vector-db-spec](https://github.com/Fandhe-AI/vector-db-spec) 側で実施され、
+SQL-15（`04-behavior/sql-surface.md`）・TASK-170（`05-tasks.md`）として main へ
+マージ済み（vector-db-spec#12・spec main
+`84eb7ef4d2e2e1d3cb35bd95e13e60bec10e88c6`・2026-09-07）。本 ADR・関連コード内
+ポインタは確定済みの ID（SQL-15・TASK-170）へ差し替え済み。SQL-15 自体の確定化
+（本リポ側の受け入れ確認・wire 経由 3 クライアント実測）は TASK-170 が担う。
 
-### オーナー判断（2026-09-07）
+### オーナー判断の経緯（2026-09-07）
 
-spec 側ビヘイビア ID の確定を待つと本 PR（#562）の統合が長期に滞留するため、オーナー判断（2026-09-07）により本 ADR の契約を spec 側 ID 確定を待たず本リポの実装既定値として先行公開し、本 PR をマージする。候補 ID（SQL-15・TASK-170）は本リポ側の仮の呼称であり、spec 側で確定するまで確定値ではない。spec 側 ID が確定次第、本 ADR・関連コード内ポインタ・コミット/PR 参照を確定 ID へ差し替える別 PR を作成する。
+spec 側ビヘイビア ID の確定を待つと本 PR（#562）の統合が長期に滞留するため、
+オーナー判断（2026-09-07）により本 ADR の契約を spec 側 ID 新設を待たず本リポの
+実装既定値として先行公開し、本 PR をマージした。その後 spec 側で SQL-15・
+TASK-170 が新設・main へマージされたため（vector-db-spec#12）、本 ADR・関連
+コード内ポインタ・コミット/PR 参照を確定済みの ID へ差し替えた。
