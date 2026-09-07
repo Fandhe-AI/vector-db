@@ -86,6 +86,9 @@ use crate::kernel::dot;
 /// [`HnswIndex`] は構築完了後、可変長ビルダー表現（[`GraphBuilder`]）を
 /// この表現へ 1 回だけ平坦化する（[`HnswIndex::freeze_from`] 参照）。
 mod csr;
+/// [`NodeVectors::I8`] 専用の per-search `NodeSource` 実装（Issue #522）。
+/// `pub(super)` 限定で本モジュール外へは公開しない（[`prefetch`] と同じ方針）。
+mod i8_query;
 mod parallel_build;
 /// `search_layer` の隣接ループへ挿入する受理判定後 prefetch（Issue #490）。
 /// `pub(super)` 限定で本モジュール外へは公開しない。
@@ -872,10 +875,16 @@ pub(crate) enum NodeVectors {
     F16(Arc<[u16]>),
     /// 対称 SQ8 常駐（Issue #521）。`codes`（row-major・`len() == node_count *
     /// dim`）と、凍結時に 1 回だけ `sq8::fit_dim_params` で求めた次元ごとの
-    /// スケール（`params.dim() == dim`）を対で保持する。
+    /// スケール（`params.dim() == dim`）を対で保持する。`row_sums`
+    /// （Issue #522。`sq8::row_sums` が凍結時に 1 回だけ求める `len() ==
+    /// node_count` の行和。VNNI 系整数カーネルの符号復元に使う——モジュール
+    /// `sq8.rs` 冒頭「整数 i8×i8 dot」節参照）は `codes`・`params` と寿命・
+    /// 対応関係が完全に一致する（同じ `freeze_from` 呼び出しで一括生成し、
+    /// いずれか 1 つでも失敗すれば 3 つとも作らず `F32` へ縮退する）。
     I8 {
         codes: Arc<[i8]>,
         params: Arc<crate::sq8::Sq8DimParams>,
+        row_sums: Arc<[i32]>,
     },
 }
 
@@ -885,10 +894,15 @@ impl NodeVectors {
         match self {
             NodeVectors::F32(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
             NodeVectors::F16(v) => v.len().saturating_mul(std::mem::size_of::<u16>()),
-            NodeVectors::I8 { codes, params } => codes
+            NodeVectors::I8 {
+                codes,
+                params,
+                row_sums,
+            } => codes
                 .len()
                 .saturating_mul(std::mem::size_of::<i8>())
-                .saturating_add(params.approx_heap_bytes()),
+                .saturating_add(params.approx_heap_bytes())
+                .saturating_add(row_sums.len().saturating_mul(std::mem::size_of::<i32>())),
         }
     }
 }
@@ -925,7 +939,7 @@ impl NodeSource for NodeVectors {
                 }
                 Ok(score)
             }
-            NodeVectors::I8 { codes, params } => {
+            NodeVectors::I8 { codes, params, .. } => {
                 let row = node_vector_i8(codes, dim, node)?;
                 let score = crate::sq8::dot_i8_f32(row, params.scales(), query);
                 if !score.is_finite() {
@@ -2174,13 +2188,22 @@ impl HnswIndex {
                 Ok(fit) => {
                     let mut codes = Vec::new();
                     match crate::sq8::encode_rows(dim as usize, &vectors, &fit, &mut codes) {
-                        Ok(()) => (
-                            NodeVectors::I8 {
-                                codes: Arc::from(codes),
-                                params: Arc::new(fit),
-                            },
-                            ResidentPrecision::I8,
-                        ),
+                        // row_sums（Issue #522）は codes・params と同じ
+                        // freeze_from 呼び出し内で 1 回だけ計算し、3 つ組の
+                        // いずれか 1 つでも失敗すれば I8 常駐そのものを諦めて
+                        // F32 へ縮退する（NodeVectors::I8 ドキュメンテーション
+                        // コメント「寿命・対応関係が完全に一致する」契約）。
+                        Ok(()) => match crate::sq8::row_sums(dim as usize, &codes) {
+                            Ok(sums) => (
+                                NodeVectors::I8 {
+                                    codes: Arc::from(codes),
+                                    params: Arc::new(fit),
+                                    row_sums: Arc::from(sums),
+                                },
+                                ResidentPrecision::I8,
+                            ),
+                            Err(_) => (NodeVectors::F32(vectors), ResidentPrecision::F32),
+                        },
                         // encode_rows は fit_dim_params と同じ非有限判定を防御的に
                         // 再検査するのみで通常は到達しないが、到達した場合も同じ
                         // fail-closed 方針（D6）で F32 へ縮退する。
@@ -2432,7 +2455,7 @@ impl HnswIndex {
         query: &[f32],
         level: usize,
         dim: usize,
-        vectors: &NodeVectors,
+        vectors: &dyn NodeSource,
         mask: Option<&NodeMask>,
     ) -> Result<Option<u32>, HnswError> {
         let is_ok = |node: u32| mask.map(|m| m.get(node)).unwrap_or(true);
@@ -2788,7 +2811,7 @@ impl HnswIndex {
         ef: usize,
         level: usize,
         dim: usize,
-        vectors: &NodeVectors,
+        vectors: &dyn NodeSource,
         visited: &mut V,
         accept: Option<&NodeMask>,
         prefetch: &P,
@@ -2847,10 +2870,12 @@ impl HnswIndex {
         node: u32,
         query: &[f32],
         dim: usize,
-        vectors: &NodeVectors,
+        vectors: &dyn NodeSource,
     ) -> Result<f32, HnswError> {
-        // Issue #514: 常駐精度（f32／f16）に依存しない [`NodeSource::score`]
-        // へ委譲する。
+        // Issue #514: 常駐精度（f32／f16／i8）に依存しない [`NodeSource::score`]
+        // へ委譲する（Issue #522 で `vectors` を [`NodeVectors`] 固定から
+        // `&dyn NodeSource` へ一般化し、`search_masked_with_hop` が
+        // `hnsw::i8_query::PreparedI8Source` を渡せるようにした）。
         vectors.score(dim, node, query)
     }
 
@@ -2956,7 +2981,7 @@ impl HnswIndex {
                         .all(|(&a, &b)| a == crate::f16::f32_to_f16_bits(b)),
                 )
             }
-            NodeVectors::I8 { codes, params } => {
+            NodeVectors::I8 { codes, params, .. } => {
                 let stored = node_vector_i8(codes, dim, node).ok()?;
                 // 先に範囲検査を行う（Issue #521）。対称量子化の表現域は
                 // 次元ごとに `[-127*scale_d, 127*scale_d]`（`scale_d == 0` の
@@ -3261,6 +3286,27 @@ impl HnswIndex {
             return Ok(Vec::new());
         }
 
+        // I8 常駐（Issue #522）の候補生成は、このクエリの二重量子化
+        // （`crate::sq8::prepare_query`）を探索本体（`greedy_descend_masked`・
+        // `search_layer_with_hop`）が使う `score` 呼び出しのたびに繰り返さない
+        // よう、この呼び出し 1 回につき 1 回だけ準備する
+        // （`hnsw::i8_query::PreparedI8Source`）。F32／F16 常駐、または
+        // `prepare_query` の失敗時（`PreparedI8Source::new` 内で `Dequant`
+        // へ縮退）はいずれも既存の `NodeVectors::score`（`&self.vectors`）を
+        // そのまま使う。
+        let prepared_i8;
+        let source: &dyn NodeSource = if let NodeVectors::I8 {
+            codes,
+            params,
+            row_sums,
+        } = &self.vectors
+        {
+            prepared_i8 = i8_query::PreparedI8Source::new(codes, row_sums, params, query);
+            &prepared_i8
+        } else {
+            &self.vectors
+        };
+
         let Some(entry) = self.entry_point else {
             return Ok(Vec::new());
         };
@@ -3302,21 +3348,15 @@ impl HnswIndex {
         };
         if effective_top > 0 {
             for l in (1..=effective_top).rev() {
-                nearest = match self.greedy_descend_masked(
-                    nearest,
-                    query,
-                    l,
-                    dim_usize,
-                    &self.vectors,
-                    mask,
-                )? {
-                    Some(n) => n,
-                    // 到達しない防御的分岐: `nearest` は代替起点選択の時点で
-                    // 受理済みであることを検証しており、`greedy_descend_masked`
-                    // は受理済みの候補へしか `current` を進めないため、以降の
-                    // 呼び出しでも常に受理済みノードを渡している。
-                    None => return Ok(Vec::new()),
-                };
+                nearest =
+                    match self.greedy_descend_masked(nearest, query, l, dim_usize, source, mask)? {
+                        Some(n) => n,
+                        // 到達しない防御的分岐: `nearest` は代替起点選択の時点で
+                        // 受理済みであることを検証しており、`greedy_descend_masked`
+                        // は受理済みの候補へしか `current` を進めないため、以降の
+                        // 呼び出しでも常に受理済みノードを渡している。
+                        None => return Ok(Vec::new()),
+                    };
             }
         }
 
@@ -3363,7 +3403,7 @@ impl HnswIndex {
                 ef_eff,
                 0,
                 dim_usize,
-                &self.vectors,
+                source,
                 &mut scratch.sparse,
                 mask,
                 &prefetch::PipelinePrefetch,
@@ -3377,7 +3417,7 @@ impl HnswIndex {
                 ef_eff,
                 0,
                 dim_usize,
-                &self.vectors,
+                source,
                 &mut scratch.visited,
                 mask,
                 &prefetch::PipelinePrefetch,
