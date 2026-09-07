@@ -65,6 +65,7 @@ pub mod hybrid_latency;
 pub mod hnsw_build;
 pub mod hnsw_compare;
 pub mod hnsw_parallel_profile;
+pub mod hnsw_search_latency;
 pub mod hybrid_profile;
 pub mod ingest_profile;
 pub mod knn_profile;
