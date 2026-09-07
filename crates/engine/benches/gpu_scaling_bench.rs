@@ -43,8 +43,8 @@ use harness::accept::p95_from_samples;
 use harness::env_report::EnvReport;
 use harness::gpu_scaling::{
     count_boundary_tolerant_mismatches, format_skip_line, format_unavailable_line, parse_batches,
-    parse_dims, parse_measured_iterations, parse_rows, parse_top_k, read_env_var, speedup_ratio,
-    GpuScalingResult,
+    parse_dims, parse_measured_iterations, parse_rows, parse_top_k, read_env_var,
+    readback_bytes_per_call, speedup_ratio, GpuScalingResult, GpuScalingStatsLine,
 };
 use harness::protocol::{run_fallible, MeasurementConfig, TrialFailure};
 use harness::rng::DeterministicRng;
@@ -494,12 +494,23 @@ fn main() {
                     fatal,
                 )
                 .map(|m| m.measurement);
+                // 読み戻し統計（Issue #537）: f16/f32 各経路の計測ウィンドウ
+                // （warmup + measured）の直前直後で `stats()` を差分取得する。
+                // `max_excluded=0` で `fatal` 分類器を渡しているため、`Ok` で
+                // 戻る限り warmup・measured とも除外は発生せず、呼び出し回数は
+                // `WARMUP_ITERATIONS + config.measured_iterations` に一致する
+                // （`FallibleMeasurement::measured_attempts` を経由せず定数から
+                // 導出できる）。
+                let f16_stats_before = gpu_f16.stats();
                 let f16_measurement =
                     run_fallible(&measure_config, 0, || gpu_f16.batch_search(&queries), fatal)
                         .map(|m| m.measurement);
+                let f16_stats_after = gpu_f16.stats();
+                let f32_stats_before = gpu_f32.stats();
                 let f32_measurement =
                     run_fallible(&measure_config, 0, || gpu_f32.batch_search(&queries), fatal)
                         .map(|m| m.measurement);
+                let f32_stats_after = gpu_f32.stats();
 
                 let (cpu_measurement, f16_measurement, f32_measurement) =
                     match (cpu_measurement, f16_measurement, f32_measurement) {
@@ -594,6 +605,67 @@ fn main() {
                     mismatch,
                 };
                 println!("{result}");
+
+                // `calls` は `run_fallible` の戻り値を経由せず定数計算する
+                // （上記コメント参照）。`saturating_sub` はカウンタが同一
+                // ウィンドウ内で単調増加する契約を前提にした防御であり、
+                // 逆転時は 0 として「差分不明」を表す（`stats()` の実装が
+                // 変わっても本ベンチが panic しないための保険）。
+                let calls =
+                    u64::from(WARMUP_ITERATIONS) + u64::from(measure_config.measured_iterations());
+                let f16_bytes_total = f16_stats_after
+                    .readback_bytes
+                    .saturating_sub(f16_stats_before.readback_bytes);
+                let f32_bytes_total = f32_stats_after
+                    .readback_bytes
+                    .saturating_sub(f32_stats_before.readback_bytes);
+                match (
+                    readback_bytes_per_call(f16_bytes_total, calls),
+                    readback_bytes_per_call(f32_bytes_total, calls),
+                ) {
+                    (Ok(f16_per_call), Ok(f32_per_call)) => {
+                        let stats_line = GpuScalingStatsLine {
+                            rows,
+                            dim,
+                            batch,
+                            k,
+                            calls,
+                            f16_readback_bytes_total: f16_bytes_total,
+                            f16_readback_bytes_per_call: f16_per_call,
+                            f16_partial_topk_dispatches: f16_stats_after
+                                .partial_topk_dispatches
+                                .saturating_sub(f16_stats_before.partial_topk_dispatches),
+                            f16_full_readback_dispatches: f16_stats_after
+                                .full_readback_dispatches
+                                .saturating_sub(f16_stats_before.full_readback_dispatches),
+                            f16_full_readback_fallbacks: f16_stats_after
+                                .full_readback_fallbacks
+                                .saturating_sub(f16_stats_before.full_readback_fallbacks),
+                            f32_readback_bytes_total: f32_bytes_total,
+                            f32_readback_bytes_per_call: f32_per_call,
+                            f32_partial_topk_dispatches: f32_stats_after
+                                .partial_topk_dispatches
+                                .saturating_sub(f32_stats_before.partial_topk_dispatches),
+                            f32_full_readback_dispatches: f32_stats_after
+                                .full_readback_dispatches
+                                .saturating_sub(f32_stats_before.full_readback_dispatches),
+                            f32_full_readback_fallbacks: f32_stats_after
+                                .full_readback_fallbacks
+                                .saturating_sub(f32_stats_before.full_readback_fallbacks),
+                        };
+                        println!("{stats_line}");
+                    }
+                    (f16_res, f32_res) => {
+                        // `calls == 0` は測定条件の誤りだが、`gpu_scaling:`
+                        // 結果行は既に出力済みのため本ベンチ自体は継続する
+                        // （fail-closed に統計行だけを欠落させる）。
+                        eprintln!(
+                            "gpu_scaling_bench: readback stats unavailable rows={rows} dim={dim} \
+                             batch={batch} k={k}: f16={f16_res:?} f32={f32_res:?}"
+                        );
+                    }
+                }
+
                 any_measured = true;
             }
         }
