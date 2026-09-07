@@ -431,3 +431,177 @@ impl fmt::Display for GpuScalingStatsLine {
         )
     }
 }
+
+// ---------------------------------------------------------------------
+// GPU i8 パック常駐経路（`engine::gpu_batch::packed_i8::GpuI8BatchBackend`。
+// Issue #542）の前後比較・Recall 影響の記録（Issue #543）。既存
+// `gpu_scaling:`/`gpu_scaling_stats:` 行は 1 文字も変更せず、i8 経路は
+// 独立した接頭辞（`gpu_scaling_i8:`/`gpu_scaling_i8_stats:`）の追加行として
+// 出力する（`scripts/bench_gpu_scaling_ab.sh` の既存 grep・before バイナリとの
+// 出力互換を壊さないため）。
+// ---------------------------------------------------------------------
+
+/// `BENCH_GPU_SCALING_I8_OVERSAMPLE`（単一値。i8 常駐バックエンドは
+/// `GpuI8Options::oversample` を構築時に固定するため 1 プロセス内でスイープ
+/// できない——`docs/design/gpu-batch-i8-packed.md`「D9」節参照）を解決する。
+/// 未設定・空文字列は `default`。範囲外・非数値は fail-closed で起動を拒否する
+/// （`max` は呼び出し元が `packed_i8::MAX_I8_OVERSAMPLE` を渡す。本モジュールは
+/// `engine::gpu_batch` の feature 状態に依存させないため定数を直接参照しない）。
+pub fn parse_i8_oversample(
+    raw: Option<&str>,
+    default: usize,
+    max: usize,
+) -> Result<usize, GpuScalingError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(default),
+        Some(s) => {
+            let value: usize = s.parse().map_err(|_| {
+                err(format!(
+                    "BENCH_GPU_SCALING_I8_OVERSAMPLE must be a positive integer (got {s:?})"
+                ))
+            })?;
+            if value == 0 || value > max {
+                return Err(err(format!(
+                    "BENCH_GPU_SCALING_I8_OVERSAMPLE must be in range 1..={max} (got {value})"
+                )));
+            }
+            Ok(value)
+        }
+    }
+}
+
+/// クエリごとの Recall@k（[`crate::harness::accept::recall_at_k`] 相当の値）の
+/// 平均を求める。空列は「1 クエリも計測できていない」計測条件の誤りを表すため
+/// 拒否する（NaN を出力へ混入させない fail-closed）。
+pub fn mean_recall_at_k(per_query: &[f64]) -> Result<f64, GpuScalingError> {
+    if per_query.is_empty() {
+        return Err(err("mean_recall_at_k: per_query must not be empty"));
+    }
+    let sum: f64 = per_query.iter().sum();
+    Ok(sum / per_query.len() as f64)
+}
+
+/// `total` を `calls` で割った、1 回の `batch_search` 呼び出しあたりの
+/// 再スコア候補件数を返す（[`readback_bytes_per_call`] と同型。`calls == 0` は
+/// 無音の 0 除算にせず拒否する）。
+pub fn rescored_candidates_per_call(total: u64, calls: u64) -> Result<u64, GpuScalingError> {
+    if calls == 0 {
+        return Err(err("rescored_candidates_per_call: calls must be > 0"));
+    }
+    Ok(total / calls)
+}
+
+/// 1 規模点分の i8 経路実測結果。既存 [`GpuScalingResult`] とは独立の型で、
+/// `gpu_scaling_i8:` 接頭辞の行を出力する。
+#[derive(Debug, Clone, Copy)]
+pub struct GpuScalingI8Result {
+    pub rows: usize,
+    pub dim: usize,
+    pub batch: usize,
+    pub k: usize,
+    pub oversample: usize,
+    pub gpu_i8_p50: Duration,
+    pub gpu_i8_p95: Duration,
+    /// 1 クエリあたりの GPU i8 経路の中央値所要時間（`gpu_i8_p50 / batch`）。
+    pub per_query_gpu_i8_p50: Duration,
+    /// CPU-SIMD（A）対照との p95 短縮率。
+    pub speedup_i8_vs_cpu_p95: f64,
+    /// GPU f16 常駐（B）対照との p95 短縮率。
+    pub speedup_i8_vs_f16_p95: f64,
+    /// A（CPU-SIMD 厳密対照）に対する i8 経路の同点許容つき不一致件数
+    /// （全クエリ分合計）。
+    pub i8_mismatch: usize,
+    /// A を正解集合としたクエリごとの Recall@k の平均
+    /// （[`mean_recall_at_k`]。量子化・候補生成のみの i8 経路がどの程度
+    /// 正解集合を再現できているかを示す確定的指標）。
+    pub i8_recall_at_k: f64,
+}
+
+impl fmt::Display for GpuScalingI8Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "gpu_scaling_i8: rows={} dim={} batch={} k={} oversample={} \
+             gpu_i8_p50={}us gpu_i8_p95={}us per_query_gpu_i8_p50={}us \
+             speedup_i8_vs_cpu_p95={:.2}x speedup_i8_vs_f16_p95={:.2}x \
+             i8_mismatch={} i8_recall_at_k={:.4}",
+            self.rows,
+            self.dim,
+            self.batch,
+            self.k,
+            self.oversample,
+            self.gpu_i8_p50.as_micros(),
+            self.gpu_i8_p95.as_micros(),
+            self.per_query_gpu_i8_p50.as_micros(),
+            self.speedup_i8_vs_cpu_p95,
+            self.speedup_i8_vs_f16_p95,
+            self.i8_mismatch,
+            self.i8_recall_at_k,
+        )
+    }
+}
+
+/// i8 バックエンドが利用不能（`try_new`／`batch_search` 失敗等）だった規模点の
+/// 情報行。既存 3 経路（`gpu_scaling:`/`gpu_scaling_stats:`）の結果は失わず、
+/// この行を追加で出力するだけに留める（呼び出し元の契約）。
+pub fn format_i8_unavailable_line(
+    rows: usize,
+    dim: usize,
+    batch: usize,
+    k: usize,
+    oversample: usize,
+    reason: &str,
+) -> String {
+    format!(
+        "gpu_scaling_i8: not measurable rows={rows} dim={dim} batch={batch} k={k} \
+         oversample={oversample} reason=\"{reason}\""
+    )
+}
+
+/// 1 規模点分の i8 経路の読み戻し・再スコア統計行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuScalingI8StatsLine {
+    pub rows: usize,
+    pub dim: usize,
+    pub batch: usize,
+    pub k: usize,
+    pub oversample: usize,
+    pub calls: u64,
+    pub readback_bytes_total: u64,
+    pub readback_bytes_per_call: u64,
+    pub rescored_candidates_total: u64,
+    pub rescored_candidates_per_call: u64,
+    /// `GpuI8Meta::backend`（`wgpu::Backend`）の `Debug` 整形。
+    pub backend: String,
+    /// `GpuI8Meta::dot4_impl`（`Dot4I8Impl`）の `Debug` 整形。wgpu 30.0.1 の
+    /// 公開 API では native/polyfill を判別できず、常に `Undetermined` になる
+    /// （`packed_i8.rs::Dot4I8Impl` ドキュメンテーションコメント参照）。
+    pub dot4_impl: String,
+    /// `GpuI8BatchBackend::try_new` の所要時間（計測区間外で 1 回測った参考値）。
+    pub build_ms: u128,
+}
+
+impl fmt::Display for GpuScalingI8StatsLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "gpu_scaling_i8_stats: rows={} dim={} batch={} k={} oversample={} calls={} \
+             readback_bytes_total={} readback_bytes_per_call={} \
+             rescored_candidates_total={} rescored_candidates_per_call={} \
+             backend={} dot4_impl={} build_ms={}",
+            self.rows,
+            self.dim,
+            self.batch,
+            self.k,
+            self.oversample,
+            self.calls,
+            self.readback_bytes_total,
+            self.readback_bytes_per_call,
+            self.rescored_candidates_total,
+            self.rescored_candidates_per_call,
+            self.backend,
+            self.dot4_impl,
+            self.build_ms,
+        )
+    }
+}
