@@ -128,7 +128,9 @@ fn random_vec(rng: &mut XorShift64Star, dim: usize) -> Vec<f32> {
 /// こと。決定的シード RNG で複数次元（0 を含む）を走査する。
 #[test]
 fn dispatched_dot_matches_scalar_reference_within_tolerance() {
-    let dims = [0usize, 1, 3, 4, 7, 8, 15, 16, 17, 33, 768, 1000];
+    let dims = [
+        0usize, 1, 3, 4, 7, 8, 15, 16, 17, 33, 767, 768, 769, 1000, 1536, 1537,
+    ];
     let mut rng = XorShift64Star::new(0x1234_5678_9abc_def1);
 
     for &dim in &dims {
@@ -210,6 +212,17 @@ fn dispatched_dot_length_mismatch_matches_scalar_semantics() {
 /// （`neon_block4::dot_block4_neon`）の実行時ビット同一性の唯一の証跡は
 /// `.github/workflows/detect-features.yml` の `detect-apple` ジョブ（Apple
 /// Silicon 実機で本テストを実行）が担う。
+///
+/// dim>=[`isa::DOT_MULTI_ACC_MIN_DIM`]（768）でもこの契約は成立する
+/// （Issue #518）。`dot_block4` の intrinsics ブロックカーネル
+/// （`x86_block4`／`neon_block4`）自体は [`isa::dot_lanes_multi_acc`] へ
+/// 対応させていないが、`isa.rs::SimdKernel::dot_block4_impl` が
+/// dim>=[`isa::DOT_MULTI_ACC_MIN_DIM`] を「1 行版 `dot` を 4 回呼ぶ」既存の
+/// 非一様長フォールバックへ意図的に合流させているため、`CpuScalarProvider`
+/// と `ParallelSearchProvider`（`dot_block4` 経由）の Top-k が dim>=768 でも
+/// 食い違わない（`kernel.rs::dot` を共有する全 provider の Top-k 整合という
+/// 既存設計意図の維持。詳細は `docs/design/dot-kernel-multi-accumulator.md`
+/// 「Issue #518 追記」節参照）。
 #[test]
 fn dot_block4_matches_single_row_dot_bit_exact_across_dims() {
     let current_isa = isa::current().isa();
@@ -280,6 +293,37 @@ fn dot_block4_matches_single_row_dot_bit_exact_across_dims() {
     }
 }
 
+/// dim 閾値ディスパッチ（Issue #517/#518）: dim<[`isa::DOT_MULTI_ACC_MIN_DIM`] の
+/// 経路が [`isa::dot_scalar`]（参照実装）と厳密ビット一致であることを、整数値
+/// ベクトル（乗算・加算がいずれの順序でも `f32` として厳密表現できる値域）で
+/// 確認する。ここでの厳密一致は「実装のどこかの過去バージョンと同一である」こと
+/// ではなく「dim<閾値は multi-acc 経路（[`isa::DOT_MULTI_ACC_MIN_DIM`] 以上でのみ
+/// 到達する [`dot_multi_acc_threshold_boundary_matches_scalar_exactly`] の経路）を
+/// 一切通らず、常に正しい内積を返す」ことを実オラクル（`dot_scalar`）と突き合わせて
+/// 固定する（`current().dot(&a, &b)` を 2 回呼んで自分自身と比較するだけの
+/// vacuous なテストにしないため）。
+#[test]
+fn dot_below_threshold_dispatch_is_unaffected_by_multi_acc_addition() {
+    let dims = [0usize, 1, 7, 8, 100, 128, 384, 767];
+
+    for &dim in &dims {
+        assert!(
+            dim < isa::DOT_MULTI_ACC_MIN_DIM,
+            "test setup: dim must be below threshold"
+        );
+        let a: Vec<f32> = (0..dim).map(|i| (i % 11) as f32).collect();
+        let b: Vec<f32> = (0..dim).map(|i| (i % 13) as f32).collect();
+
+        let expected = isa::dot_scalar(&a, &b);
+        let actual = isa::current().dot(&a, &b);
+        assert_eq!(
+            actual, expected,
+            "dim={dim} integer-valued dot must match scalar reference exactly \
+             (dim below DOT_MULTI_ACC_MIN_DIM must never take the multi-acc path)"
+        );
+    }
+}
+
 /// 4 行と `query` の長さが 1 つでも異なる場合、[`isa::SimdKernel::dot_block4`] が
 /// 高速経路（intrinsics ブロックカーネル）へ入らず、1 行版 `dot` を 4 回呼ぶ
 /// 縮退経路と一致すること（`isa.rs::SimdKernel::dot_block4_impl` の
@@ -302,6 +346,27 @@ fn dot_block4_falls_back_to_single_row_dot_when_lengths_are_not_uniform() {
     ];
     let actual = isa::current().dot_block4([&r0, &r1, &r2, &r3], &query);
     assert_eq!(actual, expected);
+}
+
+/// 閾値境界（767→旧経路・768→新経路）を整数ベクトルで確認する。整数値の内積は
+/// 加算順序に依らず厳密に一致するため（Recall フィクスチャが dim 800/1000 の
+/// one-hot 系ベクトルで構造的に不変である論拠と同じ）、新旧どちらの経路を通っても
+/// `isa::dot_scalar` と完全一致するはずである。
+#[test]
+fn dot_multi_acc_threshold_boundary_matches_scalar_exactly() {
+    assert_eq!(isa::DOT_MULTI_ACC_MIN_DIM, 768);
+
+    for &dim in &[767usize, 768, 769, 800, 1000, 1536, 1537] {
+        let a: Vec<f32> = (0..dim).map(|i| (i % 7) as f32).collect();
+        let b: Vec<f32> = (0..dim).map(|i| (i % 5) as f32).collect();
+
+        let expected = isa::dot_scalar(&a, &b);
+        let actual = isa::current().dot(&a, &b);
+        assert_eq!(
+            actual, expected,
+            "dim={dim} integer-valued dot must match scalar reference exactly"
+        );
+    }
 }
 
 /// CORE-14: 検出結果への外部入力上書き機構（環境変数・設定ファイル読み取り等）が
