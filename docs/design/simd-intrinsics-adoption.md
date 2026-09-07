@@ -22,7 +22,8 @@
   [`ann-index-adoption.md`](ann-index-adoption.md)・
   [`hnsw-generation-cache.md`](hnsw-generation-cache.md)・
   [`rrf-tie-break-determinism.md`](rrf-tie-break-determinism.md)・
-  [`core16-f16-resident-gate.md`](core16-f16-resident-gate.md)
+  [`core16-f16-resident-gate.md`](core16-f16-resident-gate.md)・
+  [`dot-kernel-branchless-tail.md`](dot-kernel-branchless-tail.md)（Issue #528）
 - 本 ADR は Phase 4（親 #459）の実装 8 系統（#509〜#530）が個別に判断を再発明
   しないよう、intrinsics 導入の共通契約を 1 箇所に確定するものであり、
   `crates/` の実装コード変更・`rust-toolchain.toml` の設定変更は含まない

@@ -153,6 +153,40 @@ fn dispatched_dot_matches_scalar_reference_within_tolerance() {
     assert_eq!(isa::current().dot(&a, &b), isa::dot_scalar(&a, &b));
 }
 
+/// [`isa::SimdKernel::dot_with_scalar_tail`]（現行のスカラー逐次和 tail）と
+/// [`isa::SimdKernel::dot_with_padded_tail`]（零埋め固定長バッファによる分岐なし
+/// tail、Issue #528）が dim 0..=129 の全長でビット同一であること。あわせて
+/// [`isa::SimdKernel::dot`]（既定経路）が `dot_with_scalar_tail` と一致すること
+/// （`DEFAULT_PADDED_TAIL == false` の配線回帰）も確認する。`isa::current().isa()`
+/// を assert メッセージへ含め、どの ISA で検証されたかを判別可能にする
+/// （実機の AVX2/AVX-512/NEON 対応有無はテスト実行環境依存のため）。
+#[test]
+fn branchless_tail_matches_scalar_tail_bit_exact_across_dims() {
+    let current_isa = isa::current().isa();
+    let mut rng = XorShift64Star::new(0x0fed_cba9_8765_4321);
+
+    for dim in 0..=129usize {
+        let a = random_vec(&mut rng, dim);
+        let b = random_vec(&mut rng, dim);
+
+        let scalar_tail = isa::current().dot_with_scalar_tail(&a, &b);
+        let padded_tail = isa::current().dot_with_padded_tail(&a, &b);
+        assert_eq!(
+            scalar_tail.to_bits(),
+            padded_tail.to_bits(),
+            "isa={current_isa:?} dim={dim} scalar_tail={scalar_tail} padded_tail={padded_tail}"
+        );
+
+        let default_dot = isa::current().dot(&a, &b);
+        assert_eq!(
+            default_dot.to_bits(),
+            scalar_tail.to_bits(),
+            "isa={current_isa:?} dim={dim}: SimdKernel::dot must still use the scalar tail \
+             (DEFAULT_PADDED_TAIL == false) as production behavior is unchanged by Issue #528"
+        );
+    }
+}
+
 /// 長さ不一致・空スライスで [`isa::dot_scalar`] と同一の意味論（短い方への切り詰め）に
 /// なること。
 #[test]
