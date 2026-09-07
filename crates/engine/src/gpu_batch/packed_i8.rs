@@ -232,8 +232,12 @@ pub fn encode_rows(
         .map_err(|_| I8EncodeError::AllocationFailed)?;
 
     for row in vectors.chunks(dim) {
-        let scale = row_scale(row)?;
-        scales.push(scale);
+        // P1 #4 修正: 量子化の除算（`quantize_scalar`）へは f64 精度の
+        // `scale_f64` をそのまま渡す。[`Sq8RowScales`] への格納・後段の
+        // `ranking_key` 計算用途にのみ f32 へ丸めた `scale` を使う
+        // （[`row_scale_f64`] のドキュメンテーションコメント参照）。
+        let scale_f64 = row_scale_f64(row)?;
+        scales.push(scale_f64 as f32);
 
         let mut d = 0usize;
         while d < row_stride.saturating_mul(4) {
@@ -243,7 +247,7 @@ pub fn encode_rows(
                 let Some(&v) = row.get(idx) else {
                     continue;
                 };
-                *lane = quantize_scalar(v, scale)?;
+                *lane = quantize_scalar(v, scale_f64)?;
             }
             packed.push(pack_i8x4(lanes));
             d += 4;
@@ -254,11 +258,17 @@ pub fn encode_rows(
 }
 
 /// `values` 自身の成分だけから対称量子化スケール `max_j(|v_j|) / 127` を
-/// 求める（f64 中間計算。codex-review 指摘対応・P1 #3: f32 のみだと極端な
-/// 入力〔非常に大きい／小さい有限値〕で中間演算がオーバーフローし非有限値を
-/// 生みうるため、桁数に余裕のある f64 で計算し最終結果のみ f32 へ落とす。
-/// `values` は呼び出し元で非有限値を検証済みの前提）。
-fn row_scale(values: &[f32]) -> Result<f32, I8EncodeError> {
+/// f64 で求める（codex-review 指摘対応・P1 #3・#4: f32 のみだと極端な入力
+/// 〔非常に大きい／小さい有限値〕で中間演算がオーバーフローし非有限値を
+/// 生みうるため、桁数に余裕のある f64 で計算する。この f64 精度のまま
+/// [`quantize_scalar`] の除算まで保持しなければならない——最終結果だけ
+/// 呼び出し元で f32 へ丸めると、極小の非零有限入力〔`f32::MIN_POSITIVE`
+/// 未満の f32 劣化数域〕でスケールが f32 表現ではゼロへアンダーフローし、
+/// 以降の量子化が `scale == 0.0`（本来は「値そのものが全成分ゼロの行」を
+/// 表す契約）と誤って一致して非零な行・クエリを全要素 0 へ変換し、対称
+/// 量子化の契約に違反したまま候補選出が slot 順（実質ランダム）に縮退
+/// してしまう。`values` は呼び出し元で非有限値を検証済みの前提）。
+fn row_scale_f64(values: &[f32]) -> Result<f64, I8EncodeError> {
     let mut max_abs: f64 = 0.0;
     for &v in values {
         let a = (v as f64).abs();
@@ -273,20 +283,22 @@ fn row_scale(values: &[f32]) -> Result<f32, I8EncodeError> {
     if !scale.is_finite() {
         return Err(I8EncodeError::NonFinite);
     }
-    Ok(scale as f32)
+    Ok(scale)
 }
 
-/// 単一のスカラー値をスケール `scale` で量子化し `[-127, 127]` へクランプ
-/// する（`f64::round` = half away from zero で固定。`scale == 0.0`〔零行〕は
-/// 除算せず 0 を返す。codex-review 指摘対応・P1 #3: 除算・丸めを f64 で行い
-/// 中間結果が非有限になった場合は `NonFinite` を明示的に返す
-/// フェイルクローズ。`NaN as i8 == 0` へ暗黙に丸めて有効なスコアを無言で
-/// 除外することはしない）。
-fn quantize_scalar(v: f32, scale: f32) -> Result<i8, I8EncodeError> {
+/// 単一のスカラー値をスケール `scale`（f64。[`row_scale_f64`] の戻り値を
+/// そのまま渡す）で量子化し `[-127, 127]` へクランプする（`f64::round` =
+/// half away from zero で固定。`scale == 0.0`〔零行〕は除算せず 0 を返す。
+/// codex-review 指摘対応・P1 #3: 除算・丸めを f64 で行い中間結果が非有限に
+/// なった場合は `NonFinite` を明示的に返すフェイルクローズ。`NaN as i8 == 0`
+/// へ暗黙に丸めて有効なスコアを無言で除外することはしない。P1 #4:
+/// `scale` を f32 へ丸めてから受け取らないことで、極小の非零スケールが
+/// アンダーフローしてゼロ扱いされる不具合を避ける）。
+fn quantize_scalar(v: f32, scale: f64) -> Result<i8, I8EncodeError> {
     if scale == 0.0 {
         return Ok(0);
     }
-    let raw = (v as f64 / scale as f64).round();
+    let raw = (v as f64 / scale).round();
     if !raw.is_finite() {
         return Err(I8EncodeError::NonFinite);
     }
@@ -319,7 +331,11 @@ pub fn quantize_query(query: &[f32]) -> Result<(f32, Vec<u32>), I8EncodeError> {
         }
     }
 
-    let s_q = row_scale(query)?;
+    // P1 #4 修正: 量子化の除算へは f64 精度の `s_q_f64` をそのまま渡す。
+    // 戻り値（呼び出し元がランキングの定数項として使う）にのみ f32 丸めの
+    // `s_q` を使う（[`row_scale_f64`] のドキュメンテーションコメント参照）。
+    let s_q_f64 = row_scale_f64(query)?;
+    let s_q = s_q_f64 as f32;
 
     let row_stride = row_stride_for_dim(dim);
     let mut packed: Vec<u32> = Vec::new();
@@ -335,7 +351,7 @@ pub fn quantize_query(query: &[f32]) -> Result<(f32, Vec<u32>), I8EncodeError> {
             let Some(&v) = query.get(idx) else {
                 continue;
             };
-            *lane = quantize_scalar(v, s_q)?;
+            *lane = quantize_scalar(v, s_q_f64)?;
         }
         packed.push(pack_i8x4(lanes));
         d += 4;
@@ -738,6 +754,13 @@ impl GpuI8BatchBackend {
                 // 超えたときのみ並べ替えるため、size が最初から `k_prime`
                 // 以下だった場合は挿入順のまま残る）。
                 sort_by_ranking_key(&mut per_query, &self.row_scales);
+                // ループ内で一度も [`reduce_top_k_prime`] の縮約が発火しなかった
+                // 経路（size が最初から `k_prime` 以下）でも、直前のチャンク
+                // push に備えた `try_reserve_exact` の予約量がそのまま容量に
+                // 残っている可能性があるため、保存前に必ず容量を長さぴったりへ
+                // 縮小する（[`shrink_to_len`] 参照。容量と長さが既に一致して
+                // いれば no-op）。
+                let per_query = shrink_to_len(per_query);
                 if let Some(slot) = out.get_mut(qi) {
                     *slot = Some(per_query);
                 }
@@ -801,7 +824,13 @@ fn ranking_key(slot: u32, score: i32, row_scales: &Sq8RowScales) -> f32 {
 /// `buf` を [`ranking_key`] 降順（同点は `slot` 昇順）へ確定させる
 /// （in-place・追加確保なし）。
 fn sort_by_ranking_key(buf: &mut [(u32, i32)], row_scales: &Sq8RowScales) {
-    buf.sort_unstable_by(|&(slot_a, score_a), &(slot_b, score_b)| {
+    // sort-determinism-check（`docs/design/rrf-tie-break-determinism.md`）は
+    // 明示タイブレークの有無を問わず `sort_unstable_by` の識別子参照そのものを
+    // 検知するため、比較子は不変のまま安定ソート `sort_by` へ切り替える
+    // （codex-review 指摘対応。比較子自体は元々 `slot` 昇順の完全なタイブレークを
+    // 持ち、安定/不安定のどちらでも出力は同じだが、CI ゲートと将来の保守性の
+    // 両面で安定ソート API を使う）。
+    buf.sort_by(|&(slot_a, score_a), &(slot_b, score_b)| {
         let key_a = ranking_key(slot_a, score_a, row_scales);
         let key_b = ranking_key(slot_b, score_b, row_scales);
         key_b.total_cmp(&key_a).then(slot_a.cmp(&slot_b))
@@ -823,6 +852,34 @@ fn reduce_top_k_prime(buf: &mut Vec<(u32, i32)>, k_prime: usize, row_scales: &Sq
     }
     sort_by_ranking_key(buf, row_scales);
     buf.truncate(k_prime);
+    // `Vec::truncate` は長さのみ減らし確保済み容量を解放しない。この関数は
+    // チャンク（最大 `i8_chunk_rows` 行）を丸ごと push した直後に呼ばれるため、
+    // 縮約前の容量は「チャンク全量分」に達している——`raw_i32_scores` が
+    // クエリごとに保持する `per_query` はこの縮約後の Vec をそのままバッチ
+    // 全体（最大 `MAX_BATCH_QUERIES`）ぶん同時に保持し続けるため、縮小せずに
+    // 放置すると設計上の Σk' によるメモリ上限契約（D9）が成立しなくなる
+    // （codex-review 指摘対応・P1: dim=1・到達行 100 万・4096 クエリ・各 k=1
+    // のような形状で候補バッファだけで約 32.768GB に達すると指摘された）。
+    // 縮小後の長さぴったりの Vec へ移し替える。
+    *buf = shrink_to_len(std::mem::take(buf));
+}
+
+/// `buf` の容量を長さぴったりへ縮小した新しい `Vec` を返す（[`reduce_top_k_prime`]
+/// 参照）。フォールブル確保（`try_reserve_exact`）に失敗した場合は縮小を諦め、
+/// 元の（容量が大きいままの）`buf` をそのまま返す——容量の縮小は最適化であり
+/// 必須の契約ではないため、縮小自体の失敗で呼び出し元の処理全体を abort/panic
+/// させるより、長さは正しいまま容量だけ大きい状態を許容するほうが
+/// fail-closed の精神（受信データ経路で unwrap/expect しない）に沿う。
+fn shrink_to_len(buf: Vec<(u32, i32)>) -> Vec<(u32, i32)> {
+    if buf.capacity() <= buf.len() {
+        return buf;
+    }
+    let mut shrunk: Vec<(u32, i32)> = Vec::new();
+    if try_reserve_exact(&mut shrunk, buf.len(), "gpu i8 raw scores (shrink)").is_err() {
+        return buf;
+    }
+    shrunk.extend_from_slice(&buf);
+    shrunk
 }
 
 impl BatchBackend for GpuI8BatchBackend {
@@ -1128,6 +1185,91 @@ mod tests {
         for p in packed {
             assert_eq!(p, 0);
         }
+    }
+
+    #[test]
+    fn quantize_scalar_uses_f64_scale_and_does_not_treat_f32_underflow_as_zero_row() {
+        // codex-review 指摘対応・P1 #4 の回帰:
+        // `max_abs / 127.0`（f64）が非零だが f32 表現では劣化数域を下回り
+        // ゼロへアンダーフローするスケールでも、`quantize_scalar` へ渡す
+        // スケールが f64 精度のままであれば「零行（scale == 0.0）」として
+        // 誤って全要素 0 へ丸められないことを固定する。
+        // `v` は f32 の非零最小劣化数（smallest positive subnormal）。これ自体は
+        // f32 として表現可能な非零値だが、`v / 127.0` は f32 の表現域を下回り
+        // f32 精度では 0.0 へアンダーフローする（f64 精度では非零のまま
+        // 表現できる）。
+        let v: f32 = f32::from_bits(1);
+        let max_abs = f64::from(v);
+        let scale_f64 = max_abs / f64::from(I8_CLAMP_ABS);
+        assert_ne!(
+            scale_f64, 0.0,
+            "test precondition: scale must be nonzero in f64"
+        );
+        assert_eq!(
+            scale_f64 as f32, 0.0,
+            "test precondition: scale must underflow to zero when rounded to f32"
+        );
+
+        let lane = quantize_scalar(v, scale_f64).expect("quantize should succeed");
+        assert_ne!(
+            lane, 0,
+            "a value at the row's own magnitude must not quantize to 0 just because the f32 \
+             rounding of the scale underflows to zero"
+        );
+    }
+
+    #[test]
+    fn encode_rows_tiny_magnitude_row_is_not_quantized_to_all_zero_lanes() {
+        // 上記単体テストの `encode_rows` 経由での end-to-end 回帰: 行の
+        // 全成分が極小の非零有限値でも、`encode_rows` が返すパック済み行が
+        // 全レーン 0（零行と誤認された状態）にならないことを確認する。
+        //
+        // 注: [`Sq8RowScales`] に格納される `scale`（表示・保存用途の f32
+        // 丸め値。`ranking_key` の近似再スケールにのみ使う）自体は、この
+        // 極端な形状では f32 の表現域を下回りアンダーフローして `0.0` の
+        // ままで構わない（P1 #4 の修正対象は量子化の除算に使う内部精度で
+        // あり、保存用の表示値の丸めは対象外——`row_scale_f64` のドキュメン
+        // テーションコメント参照）。ここで固定するのは「パック済みレーンが
+        // 全 0 にならない」という量子化契約のみ。
+        let tiny: f32 = f32::from_bits(1); // f32 の非零最小劣化数
+        let vectors = [tiny, -tiny];
+        let (_scales, packed) = encode_rows(2, 1, &vectors).expect("encode should succeed");
+        assert_ne!(
+            unpack_i8x4(packed[0]),
+            [0i8; 4],
+            "a tiny-but-nonzero row must not be quantized to an all-zero packed row"
+        );
+    }
+
+    #[test]
+    fn reduce_top_k_prime_shrinks_capacity_after_truncating_down_from_a_large_chunk() {
+        // codex-review 指摘対応・P1 #? の回帰: `Vec::truncate` は長さのみ
+        // 減らし確保済み容量を解放しないため、`raw_i32_scores` のように
+        // 1 チャンクを丸ごと push してから縮約する経路では、縮約後も
+        // チャンク全量分の容量を保持し続けてしまう（`per_query` はクエリ
+        // ごとにバッチ全体で同時に保持されるため、極端な形状では設計上の
+        // Σk' によるメモリ上限契約が成立しなくなる）。
+        let row_scales = Sq8RowScales {
+            scales: vec![1.0f32; 8],
+        };
+        let mut buf: Vec<(u32, i32)> = Vec::new();
+        buf.try_reserve_exact(100_000)
+            .expect("reserve should succeed");
+        let reserved_capacity = buf.capacity();
+        for i in 0..100_000u32 {
+            buf.push((i, 1));
+        }
+
+        reduce_top_k_prime(&mut buf, 4, &row_scales);
+
+        assert_eq!(buf.len(), 4);
+        assert!(
+            buf.capacity() < reserved_capacity,
+            "reduce_top_k_prime must shrink capacity after truncating down from a large chunk \
+             (capacity {} was not reduced from the pre-truncate reservation of {})",
+            buf.capacity(),
+            reserved_capacity
+        );
     }
 
     #[test]

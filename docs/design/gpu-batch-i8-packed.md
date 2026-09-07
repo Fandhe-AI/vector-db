@@ -34,9 +34,9 @@ build_with_gpu` の primary）へは接続しない。
 | ---- | ---- |
 | 適用境界 | `FallbackBatchEngine::build_with_gpu`（本番 primary）は無変更。i8 経路は `GpuI8BatchBackend::try_new` からのみ構築する opt-in 専用バックエンド（`GpuF32ContrastBackend` の前例と同型） |
 | 配置 | 新規子モジュール `crates/engine/src/gpu_batch/packed_i8.rs`。`gpu_batch.rs` への編集は `pub mod packed_i8;` と `GpuContext::backend: wgpu::Backend` フィールド追加の 2 点に限定 |
-| 行の量子化 | **（D3 改訂・§7-1 参照）** 行 `i` ごとに独立なスケール `s_i = max_j(|x_{i,j}|) / 127`。`xq_{i,j} = round(x_{i,j}/s_i)` を `[-127, 127]` へクランプ（`-128` は使わない）。`s_i == 0`（零行）は除算せず `xq_{i,j} = 0`。他行（他テナントの不可視行を含む）の値には一切依存しない |
+| 行の量子化 | **（D3 改訂・§7-1 参照）** 行 `i` ごとに独立なスケール `s_i = max_j(abs(x_{i,j})) / 127`。`xq_{i,j} = round(x_{i,j}/s_i)` を `[-127, 127]` へクランプ（`-128` は使わない）。`s_i == 0`（零行）は除算せず `xq_{i,j} = 0`。他行（他テナントの不可視行を含む）の値には一切依存しない |
 | パック規約 | 4 レーン/u32。レーン `j`（`j = 0..4`）を bit `8j..8j+7` に格納（下位から詰める規約。`pack_f16x2` と同じ方向）。`row_stride = dim.div_ceil(4)`。末尾パディングレーンは 0 |
-| クエリ側の量子化 | **（D5 改訂・§7-1 参照）** クエリ自身の成分だけから対称スケール `s_q = max_i(|q_i|)/127` を求めて量子化する（詳細は本節末尾の式参照）。行パラメータには一切依存しない |
+| クエリ側の量子化 | **（D5 改訂・§7-1 参照）** クエリ自身の成分だけから対称スケール `s_q = max_i(abs(q_i))/127` を求めて量子化する（詳細は本節末尾の式参照）。行パラメータには一切依存しない |
 | オーバーフロー | `MAX_BATCH_DIM(8,192) × 127 × 127 = 132,129,792 < 2^31`。単体テスト `dot_i8_packed_ref_extreme_values_stay_within_i32_bound` で固定 |
 | CPU 参照実装 | `packed_i8::dot_i8_packed_ref`（レーン展開＋i32 累積の純関数）。#522（VNNI）はこの参照実装とビット同一であることを契約とする |
 | 候補生成＋再スコア | **（§7-2 参照）** GPU は i32 整数内積を返す。ホストは行スケール `s_i` を掛けた近似内積（`i32_score × s_i`）降順（同点は slot 昇順）でチャンクごとに逐次縮約し、`k' = min(reachable_rows, k × oversample)` 件だけを保持 → `ResidentMatrix::row_f32_into`（本 Issue で `pub(crate)` 化）で f32 復号し `kernel::dot` で再スコア → 上位 `k` 件へ切り詰め → 既存 `finalize_gpu_hits` で解決 |
