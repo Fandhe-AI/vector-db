@@ -130,7 +130,7 @@ fn i8_backend_raw_scores_match_cpu_reference_when_gpu_available() {
         "i8 backend try_new must succeed once the f16 backend already confirmed gpu availability",
     );
 
-    let (params, packed_rows) = encode_rows(fx.dim, fx.ids.len(), &fx.vectors)
+    let (_row_scales, packed_rows) = encode_rows(fx.dim, fx.ids.len(), &fx.vectors)
         .expect("encode_rows should succeed for well-formed fixture");
     let row_stride = fx.dim.div_ceil(4);
 
@@ -150,7 +150,7 @@ fn i8_backend_raw_scores_match_cpu_reference_when_gpu_available() {
     // tenant-a の可視行（id 1,2,3 → slot 0,1,2）のみが現れること。
     assert_eq!(per_query.len(), 3);
 
-    let qq = quantize_query(&params, &query).expect("query quantize should succeed");
+    let (_s_q, qq) = quantize_query(&query).expect("query quantize should succeed");
     for &(slot, gpu_score) in per_query {
         let row_start = (slot as usize) * row_stride;
         let row_end = row_start + row_stride;

@@ -14,7 +14,7 @@
 //! 2026-09-07 時点で #521（対称 SQ8 量子化・次元別 min/max）は OPEN・実装
 //! 未着手（`crates/engine/src/` に `Sq8`/`sq8`/量子化のトップレベル共有
 //! モジュールが存在しない）。そのため本モジュールは対称 SQ8 エンコーダを
-//! 自前で持つ（[`encode_rows`]／[`Sq8DimParams`]）。#521 マージ後は
+//! 自前で持つ（[`encode_rows`]／[`Sq8RowScales`]）。#521 マージ後は
 //! そちらの型へ統合する（`f16.rs` の前例に倣い、共有層の所有は #521 側に
 //! 委ねる。詳細は `docs/design/gpu-batch-i8-packed.md` 参照）。
 //!
@@ -119,19 +119,31 @@ fn row_stride_for_dim(dim: usize) -> usize {
     dim.div_ceil(4)
 }
 
-/// i8 パック常駐の次元別対称量子化パラメータ（D3。#521 マージ後に共有層へ
-/// 統合予定。`docs/design/gpu-batch-i8-packed.md` 参照）。次元 `i` ごとに
-/// `center_i = (min_i + max_i) / 2`・`alpha_i = (max_i - min_i) / 254` を
-/// 持つ。`alpha_i == 0`（定数次元）は除算せず量子化値を常に 0 とする。
+/// i8 パック常駐の**行単位**対称量子化パラメータ（D3 改訂。codex-review
+/// 指摘対応・P0: 当初実装は次元別 `min`/`max`（`ResidentMatrix` 全行・全
+/// テナント横断）から `center`/`alpha` を導出しており、他テナントの不可視行
+/// の値・存在が量子化スケール経由で候補選出（ひいては検索結果）に影響し
+/// うるテナント境界侵害だった。行 `i` 単独から決まるスケール
+/// `s_i = max_j(|x_{i,j}|) / 127` へ変更し、**他行（他テナントの不可視行を
+/// 含む）の値に一切依存しない**構成にした。`s_i == 0`（零行）は除算せず
+/// 量子化値を常に 0 とする。#521 マージ後に共有層へ統合予定
+/// （`docs/design/gpu-batch-i8-packed.md`「D3」節参照。#521 自体が次元別
+/// min/max 方式を踏襲する場合は同種の境界問題を引き継ぐため、オーナーへの
+/// 申し送り事項として同ドキュメントに記録する）。
 #[derive(Debug, Clone)]
-pub struct Sq8DimParams {
-    center: Vec<f32>,
-    alpha: Vec<f32>,
+pub struct Sq8RowScales {
+    /// 行 `i` のスケール（`ResidentMatrix` のスロット順と一致）。
+    scales: Vec<f32>,
 }
 
-impl Sq8DimParams {
-    pub fn dim(&self) -> usize {
-        self.center.len()
+impl Sq8RowScales {
+    pub fn row_count(&self) -> usize {
+        self.scales.len()
+    }
+
+    /// 行 `row` のスケール（範囲外は `None`。添字アクセスはしない）。
+    pub fn scale(&self, row: usize) -> Option<f32> {
+        self.scales.get(row).copied()
     }
 }
 
@@ -179,14 +191,17 @@ fn unpack_i8x4(packed: u32) -> [i8; 4] {
     out
 }
 
-/// 次元別対称量子化（D3）。`vectors` は `row_count * dim` 要素（行優先・f32）。
-/// 戻り値は `(params, packed)` で、`packed` は `row_count * row_stride_for_dim(dim)`
-/// 要素の行優先パック済み `u32` 列。
+/// 行単位対称量子化（D3 改訂）。`vectors` は `row_count * dim` 要素
+/// （行優先・f32）。戻り値は `(scales, packed)` で、`packed` は
+/// `row_count * row_stride_for_dim(dim)` 要素の行優先パック済み `u32` 列。
+/// 行 `i` のスケール `s_i` は行 `i` 自身の成分だけから決まり、他行（他
+/// テナントの不可視行を含む）には一切依存しない（P0 修正。モジュール冒頭
+/// [`Sq8RowScales`] 参照）。
 pub fn encode_rows(
     dim: usize,
     row_count: usize,
     vectors: &[f32],
-) -> Result<(Sq8DimParams, Vec<u32>), I8EncodeError> {
+) -> Result<(Sq8RowScales, Vec<u32>), I8EncodeError> {
     if dim == 0 {
         return Err(I8EncodeError::InvalidShape);
     }
@@ -202,56 +217,24 @@ pub fn encode_rows(
         }
     }
 
-    let mut min_v: Vec<f32> = Vec::new();
-    let mut max_v: Vec<f32> = Vec::new();
-    min_v
-        .try_reserve_exact(dim)
-        .map_err(|_| I8EncodeError::AllocationFailed)?;
-    max_v
-        .try_reserve_exact(dim)
-        .map_err(|_| I8EncodeError::AllocationFailed)?;
-    min_v.resize(dim, f32::INFINITY);
-    max_v.resize(dim, f32::NEG_INFINITY);
-
-    for row in vectors.chunks(dim) {
-        for (d, &v) in row.iter().enumerate() {
-            if let (Some(mn), Some(mx)) = (min_v.get_mut(d), max_v.get_mut(d)) {
-                if v < *mn {
-                    *mn = v;
-                }
-                if v > *mx {
-                    *mx = v;
-                }
-            }
-        }
-    }
-
-    let mut center: Vec<f32> = Vec::new();
-    let mut alpha: Vec<f32> = Vec::new();
-    center
-        .try_reserve_exact(dim)
-        .map_err(|_| I8EncodeError::AllocationFailed)?;
-    alpha
-        .try_reserve_exact(dim)
-        .map_err(|_| I8EncodeError::AllocationFailed)?;
-    for d in 0..dim {
-        let mn = min_v.get(d).copied().unwrap_or(0.0);
-        let mx = max_v.get(d).copied().unwrap_or(0.0);
-        center.push((mn + mx) / 2.0);
-        alpha.push((mx - mn) / 254.0);
-    }
-    let params = Sq8DimParams { center, alpha };
-
     let row_stride = row_stride_for_dim(dim);
     let packed_len = row_count
         .checked_mul(row_stride)
         .ok_or(I8EncodeError::AllocationFailed)?;
+
+    let mut scales: Vec<f32> = Vec::new();
+    scales
+        .try_reserve_exact(row_count)
+        .map_err(|_| I8EncodeError::AllocationFailed)?;
     let mut packed: Vec<u32> = Vec::new();
     packed
         .try_reserve_exact(packed_len)
         .map_err(|_| I8EncodeError::AllocationFailed)?;
 
     for row in vectors.chunks(dim) {
+        let scale = row_scale(row)?;
+        scales.push(scale);
+
         let mut d = 0usize;
         while d < row_stride.saturating_mul(4) {
             let mut lanes = [0i8; 4];
@@ -260,49 +243,74 @@ pub fn encode_rows(
                 let Some(&v) = row.get(idx) else {
                     continue;
                 };
-                let Some(&c) = params.center.get(idx) else {
-                    continue;
-                };
-                let Some(&a) = params.alpha.get(idx) else {
-                    continue;
-                };
-                *lane = quantize_scalar(v, c, a);
+                *lane = quantize_scalar(v, scale)?;
             }
             packed.push(pack_i8x4(lanes));
             d += 4;
         }
     }
 
-    Ok((params, packed))
+    Ok((Sq8RowScales { scales }, packed))
 }
 
-/// 単一のスカラー値を次元別中心・スケールで量子化し `[-127, 127]` へ
-/// クランプする（D3。`f32::round` = half away from zero で固定。
-/// `alpha == 0`（定数次元）は除算せず 0 を返す）。
-fn quantize_scalar(v: f32, center: f32, alpha: f32) -> i8 {
-    if alpha == 0.0 {
-        return 0;
+/// `values` 自身の成分だけから対称量子化スケール `max_j(|v_j|) / 127` を
+/// 求める（f64 中間計算。codex-review 指摘対応・P1 #3: f32 のみだと極端な
+/// 入力〔非常に大きい／小さい有限値〕で中間演算がオーバーフローし非有限値を
+/// 生みうるため、桁数に余裕のある f64 で計算し最終結果のみ f32 へ落とす。
+/// `values` は呼び出し元で非有限値を検証済みの前提）。
+fn row_scale(values: &[f32]) -> Result<f32, I8EncodeError> {
+    let mut max_abs: f64 = 0.0;
+    for &v in values {
+        let a = (v as f64).abs();
+        if a > max_abs {
+            max_abs = a;
+        }
     }
-    let raw = ((v - center) / alpha).round();
-    let clamped = raw.clamp(-I8_CLAMP_ABS, I8_CLAMP_ABS);
-    clamped as i8
+    if max_abs == 0.0 {
+        return Ok(0.0);
+    }
+    let scale = max_abs / (I8_CLAMP_ABS as f64);
+    if !scale.is_finite() {
+        return Err(I8EncodeError::NonFinite);
+    }
+    Ok(scale as f32)
 }
 
-/// クエリ側の量子化（D5）。次元別スケールを畳み込んだうえで単一のグローバル
-/// スケール `s_q` へ再量子化する: `q'_i = q_i * alpha_i`、
-/// `s_q = max_i(|q'_i|) / 127`、`qq_i = round(q'_i / s_q)` を `[-127,127]`
-/// へクランプ（`s_q == 0` なら全 0）。
+/// 単一のスカラー値をスケール `scale` で量子化し `[-127, 127]` へクランプ
+/// する（`f64::round` = half away from zero で固定。`scale == 0.0`〔零行〕は
+/// 除算せず 0 を返す。codex-review 指摘対応・P1 #3: 除算・丸めを f64 で行い
+/// 中間結果が非有限になった場合は `NonFinite` を明示的に返す
+/// フェイルクローズ。`NaN as i8 == 0` へ暗黙に丸めて有効なスコアを無言で
+/// 除外することはしない）。
+fn quantize_scalar(v: f32, scale: f32) -> Result<i8, I8EncodeError> {
+    if scale == 0.0 {
+        return Ok(0);
+    }
+    let raw = (v as f64 / scale as f64).round();
+    if !raw.is_finite() {
+        return Err(I8EncodeError::NonFinite);
+    }
+    let clamp_abs = I8_CLAMP_ABS as f64;
+    let clamped = raw.clamp(-clamp_abs, clamp_abs);
+    Ok(clamped as i8)
+}
+
+/// クエリ側の量子化（D5 改訂）。クエリ自身の成分だけから対称スケール
+/// `s_q = max_i(|q_i|) / 127` を求め、`qq_i = round(q_i / s_q)` を
+/// `[-127, 127]` へクランプする（`s_q == 0` なら全 0）。行側の量子化
+/// （[`encode_rows`]）が [`Sq8RowScales`] へ再構成されたことに伴い、
+/// クエリの量子化も行パラメータに依存しない自己完結の計算になった
+/// （以前の版が計算していた「次元別 `center` との内積」定数項は、行単位
+/// スケール方式には対応する概念が無いため消滅した）。
 ///
-/// `dot(q, x) = Σ q_i·center_i + Σ q'_i·xq_i` のうち、第 1 項
-/// `Σ q_i·center_i` は行 `x` に依存しない（`center` は全行共通の次元別
-/// パラメータ）ため、バッチ内の候補順位付けには寄与しない定数である。
-/// 本関数はこの定数項を計算せず（順位付けに不要）、整数内積
-/// `Σ qq_i·xq_i` だけで候補を選べるようにする（GPU 側の計算を単純化する
-/// 設計判断。最終スコアは常に D8 の f32 再計算が担うため、この定数項の省略が
-/// 最終スコアの正しさに影響することはない）。
-pub fn quantize_query(params: &Sq8DimParams, query: &[f32]) -> Result<Vec<u32>, I8EncodeError> {
-    let dim = params.dim();
-    if dim == 0 || query.len() != dim {
+/// 戻り値の `f32` は `s_q`（クエリのスケール）。GPU から届く整数内積
+/// `Σ qq_i·xq_i` と行スケール `s_i`・`s_q` を掛け合わせると近似内積
+/// `s_i * s_q * Σ qq_i·xq_i` になるが、同一クエリ内の候補順位付けでは
+/// `s_q` は全候補で共通の正の定数のため、順位付けには `s_i` だけを掛け
+/// れば足りる（呼び出し元 [`GpuI8BatchBackend::raw_i32_scores`] 参照）。
+pub fn quantize_query(query: &[f32]) -> Result<(f32, Vec<u32>), I8EncodeError> {
+    let dim = query.len();
+    if dim == 0 {
         return Err(I8EncodeError::InvalidShape);
     }
     for &v in query {
@@ -311,25 +319,7 @@ pub fn quantize_query(params: &Sq8DimParams, query: &[f32]) -> Result<Vec<u32>, 
         }
     }
 
-    let mut folded: Vec<f32> = Vec::new();
-    folded
-        .try_reserve_exact(dim)
-        .map_err(|_| I8EncodeError::AllocationFailed)?;
-    let mut max_abs = 0.0f32;
-    for (d, &q) in query.iter().enumerate() {
-        let a = params.alpha.get(d).copied().unwrap_or(0.0);
-        let folded_v = q * a;
-        if folded_v.abs() > max_abs {
-            max_abs = folded_v.abs();
-        }
-        folded.push(folded_v);
-    }
-
-    let s_q = if max_abs == 0.0 {
-        0.0
-    } else {
-        max_abs / I8_CLAMP_ABS
-    };
+    let s_q = row_scale(query)?;
 
     let row_stride = row_stride_for_dim(dim);
     let mut packed: Vec<u32> = Vec::new();
@@ -342,20 +332,16 @@ pub fn quantize_query(params: &Sq8DimParams, query: &[f32]) -> Result<Vec<u32>, 
         let mut lanes = [0i8; 4];
         for (j, lane) in lanes.iter_mut().enumerate() {
             let idx = d + j;
-            let Some(&fv) = folded.get(idx) else {
+            let Some(&v) = query.get(idx) else {
                 continue;
             };
-            *lane = if s_q == 0.0 {
-                0
-            } else {
-                (fv / s_q).round().clamp(-I8_CLAMP_ABS, I8_CLAMP_ABS) as i8
-            };
+            *lane = quantize_scalar(v, s_q)?;
         }
         packed.push(pack_i8x4(lanes));
         d += 4;
     }
 
-    Ok(packed)
+    Ok((s_q, packed))
 }
 
 /// CPU 参照実装（D7）: [`encode_rows`]/[`quantize_query`] が生成したパック
@@ -485,7 +471,7 @@ fn i8_pipeline() -> Result<&'static wgpu::ComputePipeline, String> {
 /// primary へは接続しない（モジュール冒頭コメント参照）。
 pub struct GpuI8BatchBackend {
     matrix: ResidentMatrix,
-    params: Sq8DimParams,
+    row_scales: Sq8RowScales,
     row_buffer: wgpu::Buffer,
     row_stride: usize,
     options: GpuI8Options,
@@ -546,7 +532,7 @@ impl GpuI8BatchBackend {
             decoded.extend_from_slice(&row_buf);
         }
 
-        let (params, packed) = encode_rows(dim, row_count, &decoded)
+        let (row_scales, packed) = encode_rows(dim, row_count, &decoded)
             .map_err(|e| BatchBackendError::InitFailed(format!("i8 encode failed: {e}")))?;
         let row_stride = row_stride_for_dim(dim);
 
@@ -604,7 +590,7 @@ impl GpuI8BatchBackend {
 
         Ok(Self {
             matrix,
-            params,
+            row_scales,
             row_buffer,
             row_stride,
             options,
@@ -627,8 +613,12 @@ impl GpuI8BatchBackend {
     }
 
     /// **テスト・ベンチ専用**（`bench-internals` feature 限定）。再スコア前の
-    /// 生 i32 スコア（`(slot, score)`。GPU から readback した値そのまま）を
-    /// クエリごとに返す。可視性判定・スコア契約には関与しない（既存
+    /// 生 i32 スコア（`(slot, score)`）をクエリごとに返す。codex-review
+    /// 指摘対応（P1 #2）により、GPU から readback した値をそのまま無制限に
+    /// 保持するのではなく、[`raw_i32_scores`] 内でチャンクごとに逐次縮約した
+    /// 上位 `k' = min(reachable_rows, k * oversample)` 件だけを返す
+    /// （行数が少ない既存テストでは `reachable_rows <= k'` のため実質的に
+    /// 全件が返る）。可視性判定・最終スコア契約には関与しない（既存
     /// `batch_search_with_row_budget_for_tests` と同じ露出方針）。CPU 参照
     /// 実装（[`dot_i8_packed_ref`]）との整数一致検証に使う。
     #[cfg(feature = "bench-internals")]
@@ -681,18 +671,39 @@ impl GpuI8BatchBackend {
                 .map_err(|e| BatchExecError::Input(e.into_batch_search_error()))?;
 
             for &qi in group {
-                let vector = queries.get(qi).map(|q| q.vector).ok_or_else(|| {
+                let query = queries.get(qi).ok_or_else(|| {
                     BatchExecError::Backend(BatchBackendError::KernelLaunchFailed(
                         "i8 query index out of range".to_string(),
                     ))
                 })?;
-                let qq = quantize_query(&self.params, vector).map_err(|e| {
+                let (_s_q, qq) = quantize_query(query.vector).map_err(|e| {
                     BatchExecError::Backend(BatchBackendError::KernelLaunchFailed(format!(
                         "i8 query quantize failed: {e}"
                     )))
                 })?;
 
+                // codex-review 指摘対応（P1 #2）: 到達行を無制限に
+                // `per_query` へ溜め込むと、`dim` が小さい入力（例: dim=1）
+                // では `MAX_BATCH_WORK`（rows × queries × dim）の枠内でも
+                // `queries × reachable_rows` 要素分のメモリを要求しうる
+                // （既存の `sum(k) <= MAX_BATCH_TOTAL_K` 上限はここでは効か
+                // ない）。D8 が最終的に必要とするのは
+                // `k' = min(reachable, k * oversample)` 件だけなので、
+                // チャンクを読むたびに [`reduce_top_k_prime`] で逐次縮約し、
+                // 保持量を常に `k' + 直近チャンクの行数` 以内へ抑える
+                // （バッチ全体での保持量の上限は
+                // `Σk' <= MAX_BATCH_TOTAL_K * MAX_I8_OVERSAMPLE`
+                // = 1,000,000 * 32 = 32,000,000 要素で、`validate_batch_queries`
+                // の `sum(k)` 上限と [`GpuI8BatchBackend::try_new`] の
+                // oversample 範囲検証から導かれる）。
+                let k_prime = query
+                    .k
+                    .saturating_mul(self.options.oversample)
+                    .min(reachable.len());
+
                 let mut per_query: Vec<(u32, i32)> = Vec::new();
+                try_reserve_exact(&mut per_query, k_prime, "gpu i8 raw scores (per query)")
+                    .map_err(BatchExecError::Input)?;
                 let chunk_cap = i8_chunk_rows(ctx.max_workgroups_per_dimension);
                 for chunk in reachable.chunks(chunk_cap.max(1)) {
                     let scores = dispatch_i8_dot_products(
@@ -712,10 +723,21 @@ impl GpuI8BatchBackend {
                     self.stats
                         .readback_bytes
                         .fetch_add((scores.len() as u64).saturating_mul(4), Ordering::Relaxed);
+
+                    try_reserve_exact(&mut per_query, chunk.len(), "gpu i8 raw scores (chunk)")
+                        .map_err(BatchExecError::Input)?;
                     for (&slot, &score) in chunk.iter().zip(scores.iter()) {
                         per_query.push((slot, score));
                     }
+                    reduce_top_k_prime(&mut per_query, k_prime, &self.row_scales);
                 }
+                // 最後のチャンク追加がちょうど `k_prime` 件に収まり
+                // ループ内の縮約が発火しなかった場合に備え、返却前に必ず
+                // 1 回、行スケール込みの推定内積降順（同点は slot 昇順）へ
+                // 確定させる（[`reduce_top_k_prime`] は保持量が `k_prime` を
+                // 超えたときのみ並べ替えるため、size が最初から `k_prime`
+                // 以下だった場合は挿入順のまま残る）。
+                sort_by_ranking_key(&mut per_query, &self.row_scales);
                 if let Some(slot) = out.get_mut(qi) {
                     *slot = Some(per_query);
                 }
@@ -766,6 +788,43 @@ fn i8_chunk_rows(max_workgroups_per_dimension: u32) -> usize {
     (max_workgroups_per_dimension as usize).saturating_mul(256)
 }
 
+/// `(slot, raw i32 score)` の候補選出キー: 行 `slot` のスケール
+/// （[`Sq8RowScales`]）を掛けた近似内積（降順に並べる基準。P0 修正で
+/// 量子化スケールが行単位になったため、行をまたぐ生の i32 スコアはそのまま
+/// 比較できない——行スケールを掛けてはじめて比較可能になる。範囲外の
+/// `slot`（本来到達しないはずの防御的分岐）は最下位として扱う）。
+fn ranking_key(slot: u32, score: i32, row_scales: &Sq8RowScales) -> f32 {
+    let scale = row_scales.scale(slot as usize).unwrap_or(0.0);
+    (score as f32) * scale
+}
+
+/// `buf` を [`ranking_key`] 降順（同点は `slot` 昇順）へ確定させる
+/// （in-place・追加確保なし）。
+fn sort_by_ranking_key(buf: &mut [(u32, i32)], row_scales: &Sq8RowScales) {
+    buf.sort_unstable_by(|&(slot_a, score_a), &(slot_b, score_b)| {
+        let key_a = ranking_key(slot_a, score_a, row_scales);
+        let key_b = ranking_key(slot_b, score_b, row_scales);
+        key_b.total_cmp(&key_a).then(slot_a.cmp(&slot_b))
+    });
+}
+
+/// [`GpuI8BatchBackend::raw_i32_scores`] のチャンク処理ごとに呼ぶ逐次縮約
+/// （codex-review 指摘対応・P1 #2）。`buf` の長さが `k_prime` を超えたときに
+/// 限り [`ranking_key`] 降順（同点は `slot` 昇順）で並べ替えて上位
+/// `k_prime` 件へ切り詰める。これは標準的なストリーミング top-k の性質
+/// （`TopK(A ∪ B, k) == TopK(TopK(A, k) ∪ B, k)`）により、`buf` を超過の
+/// たびに縮約しても最終的な上位 `k_prime` 件の**集合**は「全チャンクを
+/// 一括保持してから 1 回だけ選出した場合」と一致する（超過しなかった
+/// チャンクでは何も破棄しないため、より弱く「まだ何も捨てる必要が無い」
+/// ケースになるだけで、この性質は崩れない）。
+fn reduce_top_k_prime(buf: &mut Vec<(u32, i32)>, k_prime: usize, row_scales: &Sq8RowScales) {
+    if buf.len() <= k_prime {
+        return;
+    }
+    sort_by_ranking_key(buf, row_scales);
+    buf.truncate(k_prime);
+}
+
 impl BatchBackend for GpuI8BatchBackend {
     fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
         let raw = self.raw_i32_scores(queries)?;
@@ -782,22 +841,17 @@ impl BatchBackend for GpuI8BatchBackend {
                 ))
             })?;
 
-            // D8: k' = min(reachable_rows, k * oversample) 件を i32 降順
-            // （同点は slot 昇順）で選び、その候補だけを f32 再スコアする。
-            let k_prime = query
-                .k
-                .saturating_mul(self.options.oversample)
-                .min(per_query.len());
-            let mut candidates: Vec<(u32, i32)> = per_query.clone();
-            candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            candidates.truncate(k_prime);
-
+            // D8: `per_query` は `raw_i32_scores` 側で既に
+            // `k' = min(reachable_rows, k * oversample)` 件へ縮約・
+            // ソート済み（codex-review 指摘対応・P1 #2）。ここで再度
+            // 全体を `clone` して並べ替える必要はない
+            // （未予約 `clone` は確保失敗時に abort しうるため撤去した）。
             self.stats
                 .rescored_candidates
-                .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+                .fetch_add(per_query.len() as u64, Ordering::Relaxed);
 
             let mut selector = TopKSelector::new(query.k);
-            for (slot, _int_score) in &candidates {
+            for (slot, _int_score) in per_query {
                 if self
                     .matrix
                     .row_f32_into(*slot as usize, &mut row_buf)
@@ -994,17 +1048,58 @@ mod tests {
     }
 
     #[test]
-    fn encode_rows_clamps_to_signed_range_and_handles_constant_dim() {
-        // dim=2: 次元 0 は値が変化する・次元 1 は定数（alpha == 0 になる）。
-        let vectors = [0.0f32, 5.0, 10.0, 5.0, -10.0, 5.0];
-        let (params, packed) = encode_rows(2, 3, &vectors).expect("encode should succeed");
-        assert_eq!(params.alpha.get(1).copied(), Some(0.0));
+    fn encode_rows_clamps_to_signed_range_and_handles_zero_row() {
+        // 行単位量子化（D3 改訂）: 行 0 は全 0（scale == 0 の定数行）・
+        // 行 1・2 は非零。
+        let vectors = [0.0f32, 0.0, 10.0, 5.0, -10.0, 5.0];
+        let (scales, packed) = encode_rows(2, 3, &vectors).expect("encode should succeed");
+        assert_eq!(scales.scale(0), Some(0.0));
         assert_eq!(packed.len(), 3); // row_stride_for_dim(2) == 1, 3 rows
-        for &p in &packed {
+        assert_eq!(unpack_i8x4(packed[0]), [0i8; 4]);
+        for &p in &packed[1..] {
             let lanes = unpack_i8x4(p);
             for &lane in &lanes[..2] {
                 assert!((-127..=127).contains(&(lane as i32)));
             }
+        }
+    }
+
+    #[test]
+    fn encode_rows_row_scale_is_independent_of_other_rows_cross_tenant_leak_regression() {
+        // codex-review 指摘（P0）の回帰: ある行の量子化結果（スケール・
+        // パック済みバイト列）が、同じ常駐行列に同居する他テナントの行の値
+        // には一切依存しないことを固定する。他テナント側の行を極端な外れ値
+        // へ差し替えても、対象行の出力がビット同一であることを確認する
+        // （`docs/design/gpu-batch-i8-packed.md`「D3」節参照）。
+        let dim = 3usize;
+        let tenant_a_rows = [1.0f32, -2.0, 0.5, 3.0, 0.0, -1.0];
+        let tenant_b_normal = [0.1f32, 0.2, -0.3];
+        let tenant_b_outlier = [1_000.0f32, -2_000.0, 500.0];
+
+        let mut matrix_normal = tenant_a_rows.to_vec();
+        matrix_normal.extend_from_slice(&tenant_b_normal);
+        let mut matrix_outlier = tenant_a_rows.to_vec();
+        matrix_outlier.extend_from_slice(&tenant_b_outlier);
+
+        let (scales_normal, packed_normal) =
+            encode_rows(dim, 3, &matrix_normal).expect("encode (normal) should succeed");
+        let (scales_outlier, packed_outlier) =
+            encode_rows(dim, 3, &matrix_outlier).expect("encode (outlier) should succeed");
+
+        let row_stride = row_stride_for_dim(dim);
+        for row in 0..2 {
+            assert_eq!(
+                scales_normal.scale(row),
+                scales_outlier.scale(row),
+                "tenant-a row {row} scale must not depend on tenant-b's row values"
+            );
+            let start = row * row_stride;
+            let end = start + row_stride;
+            assert_eq!(
+                packed_normal.get(start..end),
+                packed_outlier.get(start..end),
+                "tenant-a row {row} packed bytes must not depend on tenant-b's row values"
+            );
         }
     }
 
@@ -1028,11 +1123,8 @@ mod tests {
 
     #[test]
     fn quantize_query_all_zero_scale_yields_zero_packed() {
-        let params = Sq8DimParams {
-            center: vec![0.0, 0.0],
-            alpha: vec![0.0, 0.0],
-        };
-        let packed = quantize_query(&params, &[1.0, 2.0]).expect("quantize should succeed");
+        let (s_q, packed) = quantize_query(&[0.0, 0.0]).expect("quantize should succeed");
+        assert_eq!(s_q, 0.0);
         for p in packed {
             assert_eq!(p, 0);
         }
