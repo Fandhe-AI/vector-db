@@ -191,7 +191,14 @@ ANN の近似近傍が確信度ゲートのマージン判定を過大評価し�
    探索起点の成分だけでは受理ノード全体を覆えないと `Overlay::compute` 時点で
    判明済み）→ `search_masked` 自体を呼ばず plain scan へ縮退（統計
    `mask_splits_graph`）
-3. それ以外 → `HnswIndex::search_masked(query, k, ef, Some(&visible_mask), scratch)`
+3. それ以外 → `HnswIndex::search_masked_with(query, k, ef, Some(&visible_mask),
+   sparse_visited_max, scratch)`（`search_masked` は `sparse_visited_max` に
+   既定値 0 を渡す薄いラッパー）。層 0 のビーム探索が使う visited 集合
+   （`VisitedBitmap`／`VisitedSparse`）の選択はこの呼び出しの内部で
+   `mask.count_ones() < sparse_visited_max` により決まる（Issue #497。
+   探索方式そのもの——plain scan／masked ANN の切替——には影響しない診断的な
+   実装選択。詳細は `docs/design/hnsw-search.md`「visited 集合の 3 実装」
+   節参照）
 4. マスク付き探索の結果件数が `min(k, visible_in_index)` 未満（ビーム幅内で
    可視ノードを辿り切れなかった）→ 当該クエリのみ plain scan へ縮退（統計
    `masked_short`。fail-closed 縮退で k 件充足を保証する。**`ef` の段階的拡張

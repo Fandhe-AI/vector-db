@@ -10,8 +10,8 @@
 mod harness;
 
 use harness::bench_engine::{
-    expected_arm, parse_dim, parse_engine, parse_full_scan_ratio, parse_scale, parse_visible_ratio,
-    BenchEngine, ExpectedArm,
+    expected_arm, parse_dim, parse_engine, parse_full_scan_ratio, parse_scale,
+    parse_sparse_visited_max, parse_visible_ratio, BenchEngine, ExpectedArm,
 };
 
 #[test]
@@ -124,6 +124,33 @@ fn parse_full_scan_ratio_rejects_zero_denominator_and_numerator_over_denominator
     for raw in ["1/0", "2/1", "abc", "1", "1/2/3", "-1/2"] {
         assert!(
             parse_full_scan_ratio(Some(raw)).is_err(),
+            "expected {raw:?} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn parse_sparse_visited_max_defaults_to_none_when_unset() {
+    assert_eq!(parse_sparse_visited_max(None), Ok(None));
+    assert_eq!(parse_sparse_visited_max(Some("")), Ok(None));
+}
+
+#[test]
+fn parse_sparse_visited_max_accepts_non_negative_integers() {
+    assert_eq!(parse_sparse_visited_max(Some("0")), Ok(Some(0)));
+    assert_eq!(parse_sparse_visited_max(Some("100")), Ok(Some(100)));
+    assert_eq!(parse_sparse_visited_max(Some(" 42 ")), Ok(Some(42)));
+    assert_eq!(
+        parse_sparse_visited_max(Some(&usize::MAX.to_string())),
+        Ok(Some(usize::MAX))
+    );
+}
+
+#[test]
+fn parse_sparse_visited_max_rejects_non_integer_and_negative() {
+    for raw in ["abc", "-1", "1.5", "1/10", "0x10"] {
+        assert!(
+            parse_sparse_visited_max(Some(raw)).is_err(),
             "expected {raw:?} to be rejected"
         );
     }
