@@ -1,0 +1,11 @@
+CPU model: QEMU Virtual CPU version 2.5+
+Flags (lscpu, relevant subset): fma avx avx2 f16c sse4_1 sse4_2 (no avx512*)
+nproc: 12
+rustc: 1.96.0 (ac68faa20 2026-05-25)
+isa::current().isa(): Avx2Fma
+BENCH_DEDICATED_ENV: unset (shared environment)
+before commit: af1287f4f39b370d6792d970c94c119c32d237b5
+after commit:  a40edd7b924a5eb1498eb0aa8a056c75d9d7eb41 (#613, PR #613, Issue #518)
+cand384 commit: a40edd7b924a5eb1498eb0aa8a056c75d9d7eb41 + isa.rs DOT_MULTI_ACC_MIN_DIM 768->384 (local, not committed)
+loadavg samples (1min) across layer A pairs 1-5, before/after/cand384 runs: range 3.88-4.51
+loadavg samples (1min) across layer B pairs 1-5, before/after runs: range 2.17-3.44
