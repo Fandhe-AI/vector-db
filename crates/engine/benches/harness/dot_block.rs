@@ -167,7 +167,20 @@ pub fn render_block_ab_line(
 }
 
 /// 参照区間（1 行版 `dot` の既存 `label=current` 計測。変更を含まない区間）の
-/// run 内相対ノイズ帯を整形する（`policy.md` §4 の「参照区間帯」併記要件）。
-pub fn render_block_ab_reference_line(working_set_label: &str, dim: usize, band: f64) -> String {
-    format!("dot_kernel: block4_ab_ref working_set={working_set_label} dim={dim} band={band:.4}")
+/// 1 プロセス起動ぶんの代表値（`ref_median_ms`）と、同一プロセス内の反復間
+/// 相対ノイズ帯（`band`。情報提供の参考値。`policy.md` §4 が要求する
+/// run-to-run〔プロセス起動間〕幅とは別の量——後者は `ref_median_ms` を
+/// N ≥ 5 プロセス起動ぶん集めて [`relative_band`] へ渡すことで doc 側が算出
+/// する）を整形する。
+pub fn render_block_ab_reference_line(
+    working_set_label: &str,
+    dim: usize,
+    ref_median: Duration,
+    band: f64,
+) -> String {
+    format!(
+        "dot_kernel: block4_ab_ref working_set={working_set_label} dim={dim} \
+         ref_median_ms={:.3} band={band:.4}",
+        ref_median.as_secs_f64() * 1e3,
+    )
 }

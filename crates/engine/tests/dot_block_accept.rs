@@ -187,11 +187,14 @@ fn render_block_ab_line_uses_non_colliding_prefix() {
 
 #[test]
 fn render_block_ab_reference_line_uses_non_colliding_prefix() {
-    let line = render_block_ab_reference_line("arena_scale", 768, 0.0123);
+    let line =
+        render_block_ab_reference_line("arena_scale", 768, Duration::from_micros(1234), 0.0123);
     assert!(line.starts_with("dot_kernel: block4_ab_ref "));
     assert!(!line.starts_with("dot_kernel: label="));
     assert!(line.contains("working_set=arena_scale"));
     assert!(line.contains("dim=768"));
+    assert!(line.contains("ref_median_ms=1.234"));
+    assert!(line.contains("band=0.0123"));
 }
 
 // --- BLOCK_AB_DIMS ---

@@ -42,7 +42,7 @@ mod harness;
 
 use harness::ab::run_ab;
 use harness::dot_block::{
-    check_block_bit_identical, parse_block_ab_env, render_block_ab_line,
+    check_block_bit_identical, parse_block_ab_env, relative_band, render_block_ab_line,
     render_block_ab_reference_line, BlockAbMode, BLOCK_AB_DIMS,
 };
 use harness::dot_kernel::{
@@ -262,13 +262,29 @@ fn measure_block_ab_stage(working_set: WorkingSet, dim: usize) -> Result<(), Str
     );
 
     // 参照区間（1 行版 dot の反復走査。block4 A/B の対象外）を同一プロセス内で
-    // 追加計測し、run 内相対ノイズ帯を併記する（`policy.md` §4 の要件）。
-    let ref_config = MeasurementConfig::new(20, 30, 0xAEF0_0000_u64.wrapping_add(dim as u64))
+    // 追加計測する。A/B 側の 2 クロージャと同じ `repeat` 回のコーパス走査に
+    // 揃える（Cursor Bugbot 指摘。以前は `CACHE_RESIDENT_REPEAT` を反映せず
+    // cache_resident でもコーパスを 1 周しか走査しておらず、200 回反復する
+    // A/B 側とはタイマー粒度・ノイズの取り方が非対称だった）。
+    //
+    // ここで出力するのは (1) 本プロセス内の反復間ノイズ帯（`band`。情報提供の
+    // 参考値に留める）と (2) 本プロセスの参照区間代表値（`ref_median_ms`）の
+    // 2 つ。`benchmark-judgement-policy.md` §4 が要求する「変更を含まない
+    // 参照区間の run-to-run（プロセス起動間）幅」は (2) を N ≥ 5 プロセス
+    // 起動ぶん集めて `relative_band` へ渡すことで初めて算出できる——单一
+    // プロセス内の反復間ノイズ帯 (1) はこれとは異なる量であり、算出式の分母も
+    // 一致しない（前者はプロセス起動条件のばらつき、後者はキャッシュ・
+    // 周波数遷移等プロセス内のばらつきを捉える）。層 A の再現手順（本 ADR
+    // 「再現手順（層 A）」節）で 5 回の `ref_median_ms` 行を保存し、doc 側で
+    // `relative_band` により run-to-run 幅を再計算する。
+    let ref_config = MeasurementConfig::new(20, 50, 0xAEF0_0000_u64.wrapping_add(dim as u64))
         .map_err(|e| format!("block4_ab_ref dim={dim}: {e}"))?;
     let ref_measurement = run(&ref_config, || {
         let mut sum = 0f32;
-        for chunk in corpus.chunks_exact(dim) {
-            sum += block_ab_reference_wrapper(chunk, &query);
+        for _ in 0..repeat {
+            for chunk in corpus.chunks_exact(dim) {
+                sum += block_ab_reference_wrapper(chunk, &query);
+            }
         }
         sum
     })
@@ -278,14 +294,11 @@ fn measure_block_ab_stage(working_set: WorkingSet, dim: usize) -> Result<(), Str
         .iter()
         .map(|d| d.as_secs_f64())
         .collect();
-    let min = ref_secs.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = ref_secs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let band = if min > 0.0 && min.is_finite() && max.is_finite() {
-        (max - min) / min
-    } else {
-        0.0
-    };
-    println!("{}", render_block_ab_reference_line(ws_label, dim, band));
+    let band = relative_band(&ref_secs).map_err(|e| format!("block4_ab_ref dim={dim}: {e}"))?;
+    println!(
+        "{}",
+        render_block_ab_reference_line(ws_label, dim, ref_measurement.summary.median, band)
+    );
 
     Ok(())
 }

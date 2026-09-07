@@ -276,49 +276,80 @@ Issue #510・#511（`SimdKernel::dot_block4`。`docs/design/dot-kernel-row-block
 `harness::ab::run_ab` で交互実行（warmup 20・計測 50）し、計測前に全ブロック
 で `dot_block4` が 1 行版とビット同一であることを検証済み（fail-closed）。
 
-per-run 生データ（N=5・プロセス単位起動）:
+> **再計測の経緯**: 初出時の本節は、参照区間（`block4_ab_ref`）が「同一
+> プロセス内の反復間ノイズ帯」（`(max-min)/min`。分母はプロセス内の反復値）
+> のみを出力しており、`benchmark-judgement-policy.md` §4 が要求する
+> 「変更を含まない参照区間の **run-to-run（プロセス起動間）** 幅」とは
+> 異なる量だった（codex-review 指摘。プロセス内反復間ノイズは cache/CPU
+> 周波数遷移由来で、プロセス起動間ノイズ〔loadavg 変動・スケジューラ由来〕
+> とは性質が異なり、後者の代用にはできない）。また旧版の block4 A/B
+> `min-of-N ratio` 列は各 run 比率の最小〜最大レンジの外側の値を含んでおり
+> （正の時間値では `min(B)/min(A)` は各 run 比率の範囲内に収まるはずという
+> 数学的制約と矛盾）、実際には保持していなかった生の A/B 時間値からの
+> 再計算では復元できなかった（codex-review 指摘。旧版の値は誤りとして
+> 破棄する）。本節はベンチ側の参照区間計測を A/B 側と対称な `repeat` 回
+> 走査へ修正し（cache_resident でも `CACHE_RESIDENT_REPEAT`＝200 回反復を
+> 反映。Cursor Bugbot 指摘）、参照区間の 1 プロセスぶんの代表値
+> （`ref_median_ms`）を出力するよう変更（`crates/engine/benches/dot_kernel_bench.rs`・
+> `benches/harness/dot_block.rs::render_block_ab_reference_line`）したうえで
+> 全数値を実機で再計測した。以下は再計測後の値である。
 
-| working_set | dim | run1 ratio | run2 | run3 | run4 | run5 | min-of-N ratio | median ratio |
+per-run 生データ（N=5・プロセス単位起動。参照区間の対称化〔上記「再計測の経緯」〕
+を含む本 doc・ベンチ更新コミットで計測。CPU・負荷条件は本節「環境」を参照）:
+
+| working_set | dim | run1 | run2 | run3 | run4 | run5 | min-of-N | median |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| cache_resident | 128 | 0.925 | 0.920 | 0.923 | 0.925 | 0.925 | 0.932 | 0.925 |
-| cache_resident | 768 | 0.458 | 0.458 | 0.458 | 0.458 | 0.458 | 0.458 | 0.458 |
-| arena_scale | 128 | 0.988 | 0.973 | 0.986 | 0.989 | 0.983 | 0.986 | 0.991 |
-| arena_scale | 768 | 0.843 | 0.848 | 0.847 | 0.852 | 0.842 | 0.845 | 0.847 |
+| cache_resident | 128 | A=0.134 B=0.124 r=0.922 | A=0.134 B=0.123 r=0.921 | A=0.135 B=0.125 r=0.928 | A=0.136 B=0.126 r=0.923 | A=0.133 B=0.124 r=0.929 | 0.9248 | 0.9230 |
+| cache_resident | 768 | A=0.179 B=0.082 r=0.458 | A=0.180 B=0.082 r=0.458 | A=0.180 B=0.082 r=0.457 | A=0.180 B=0.082 r=0.457 | A=0.180 B=0.082 r=0.457 | 0.4581 | 0.4570 |
+| arena_scale | 128 | A=0.226 B=0.235 r=1.040 | A=0.231 B=0.241 r=1.045 | A=0.230 B=0.239 r=1.042 | A=0.230 B=0.240 r=1.045 | A=0.227 B=0.236 r=1.040 | 1.0398 | 1.0420 |
+| arena_scale | 768 | A=3.086 B=2.632 r=0.853 | A=3.084 B=2.632 r=0.853 | A=3.086 B=2.600 r=0.843 | A=3.083 B=2.561 r=0.831 | A=3.074 B=2.610 r=0.849 | 0.8331 | 0.8490 |
 
-（ratio = `block4_median / single_row_median`。min-of-N ratio は A・B それぞれの
-5 run 中央値の最小値どうしの比。詳細な生データは
-`crates/engine/benches/harness/dot_block.rs`・`benches/dot_kernel_bench.rs` の
-`measure_block_ab_stage` が同一プロセス内で `run_ab`（interleaved）により
-生成する行から再現可能）
+（A = `single_row_median_ms`・B = `block4_median_ms`・r = `ratio`（B/A）。
+min-of-N は `min(B の 5 run) / min(A の 5 run)`（`benchmark-judgement-policy.md`
+§3 の統計量定義どおり。正の時間値であれば各 run の r の範囲内に収まる）。
+median は 5 run の r の中央値。生データは `crates/engine/benches/harness/dot_block.rs`・
+`benches/dot_kernel_bench.rs` の `measure_block_ab_stage` が同一プロセス内で
+`run_ab`（interleaved）により出力する行から再現可能。実行ログは
+`docs/design`（本 doc）以外には保存していないため、再現には「再現手順（層 A）」
+節の手順を再実行すること）
 
-参照区間（`block4_ab_ref`。1 行版 `dot` の反復走査。block4 A/B の対象外）の
-run 内相対ノイズ帯 `(max-min)/min`:
+参照区間（`block4_ab_ref`。A/B 側と同一 `repeat` 回で 1 行版 `dot` を反復走査。
+block4 A/B の対象外）の 1 プロセスぶんの代表値（`ref_median_ms`）と、そこから
+算出した run-to-run 相対ノイズ帯 `reference_band = (max-min)/min`
+（`benchmark-judgement-policy.md` §4 が要求する量。分母は 5 run 中の最小値）:
 
-| working_set | dim | run1 | run2 | run3 | run4 | run5 |
-| --- | --- | --- | --- | --- | --- | --- |
-| cache_resident | 128 | 0.0738 | 0.0684 | 0.0599 | 0.0517 | 0.0561 |
-| cache_resident | 768 | 0.0486 | 0.0474 | 0.0290 | 0.0367 | 0.0539 |
-| arena_scale | 128 | 0.1454 | 0.0831 | 0.4937 | 0.1417 | 0.0454 |
-| arena_scale | 768 | 0.1226 | 0.0627 | 0.2085 | 0.1398 | 0.0634 |
+| working_set | dim | run1 | run2 | run3 | run4 | run5 | reference_band |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cache_resident | 128 | 0.140 | 0.140 | 0.142 | 0.141 | 0.140 | 0.0143 |
+| cache_resident | 768 | 0.179 | 0.178 | 0.178 | 0.178 | 0.178 | 0.0056 |
+| arena_scale | 128 | 0.230 | 0.234 | 0.234 | 0.234 | 0.230 | 0.0174 |
+| arena_scale | 768 | 3.099 | 3.101 | 3.174 | 3.070 | 3.094 | 0.0339 |
 
-参照区間の単体ノイズ帯は arena_scale で特に大きい（run3 の dim128 は
-49.4%）。ただし block4 A/B の ratio 自体は 5 run を通じて非常に狭い範囲
-（cache128: 0.920〜0.925、cache768: 一定して 0.458、arena128: 0.973〜0.989、
-arena768: 0.842〜0.852）に収まっている——A・B を同一プロセス内で interleaved
-計測しているため、参照区間（独立した別計測）よりロードアベレージ変動等の
-共通ノイズを相殺しやすいことが理由と考えられる。
+（単位は ms。参考: 各 run のプロセス内反復間ノイズ帯〔`block4_ab_ref` 行の
+`band` フィールド。§4 が要求する run-to-run 幅とは別の量であり判定には
+使わない〕は cache128 で 3〜7% 程度、arena128／arena768 は run3・run4 で
+一時的に高く出る回があったが〔プロセス内の一時的な負荷変動と考えられる〕、
+プロセス起動間で見た `ref_median_ms` 自体は上表のとおり run 間で安定して
+いる）
 
-**判定（固定 ±5% 帯・classify_change）**:
+**判定（両ノイズ帯を要件とする。`benchmark-judgement-policy.md` §4）**:
 
-- dim768（cache_resident・arena_scale とも）: `Improved`（それぞれ約
-  -54.2%・-15.3%。参照区間ノイズ帯の最悪値〔20.9%〕を差し引いても
-  arena_scale の改善幅は一貫して正の方向）
-- dim128 cache_resident: `Improved`（約 -7.5%。参照区間ノイズ帯〔5.2〜7.4%〕
-  と近接するが、5 run とも 1.0 を下回る一貫した方向）
-- dim128 arena_scale: `Neutral`〜`判定不能`（約 -1〜-3%。固定 ±5% 帯の内側で、
-  参照区間ノイズ帯（run3 で 49%）と比べても改善幅が小さく、この規模・次元
-  では効果が構造的に薄いと考えられる。Issue #365 が cache 常駐 dim100/128 で
-  複数アキュムレータ化の効果が乏しいと判断した傾向と整合）
+- dim768（cache_resident・arena_scale とも）: `Improved`（固定 ±5% 帯・実測
+  run-to-run 帯の両方を超過）。cache_resident は min-of-N 比 0.4581・median 比
+  0.4570（reference_band 0.56% を大きく上回る）。arena_scale は min-of-N 比
+  0.8331・median 比 0.8490（reference_band 3.39% を上回る）。
+- dim128 cache_resident: `Improved`（min-of-N 比 0.9248・median 比 0.9230。
+  reference_band 1.43% に対し `|ratio-1|` は約 7.5〜7.7% で両ノイズ帯を超過）。
+- dim128 arena_scale: `ノイズ帯内`（固定 ±5% 帯の範囲内。min-of-N 比
+  1.0398・median 比 1.0420 はいずれも `dot_block4` 側がわずかに遅い方向だが、
+  固定帯を超えていないため実測 reference_band〔1.74%〕を超えているか否かに
+  関わらず「両ノイズ帯を超えること」という §4 の要件を満たさず、有効な変化
+  としては扱わない。旧版はここを改善方向〔約 -1〜-3%〕と誤記していたが、
+  参照区間の算出誤り〔上記「再計測の経緯」〕を修正した再計測では符号が
+  逆——`dot_block4` がわずかに遅い方向——であることが判明した。Issue #365 が
+  cache 常駐 dim100/128 で複数アキュムレータ化の効果が乏しいと判断した傾向
+  とは整合するが、arena_scale/128 は「改善が乏しい」ではなく「ノイズ帯内で
+  判定不能（むしろ悪化方向）」と訂正する）
 
 ### 層 B: production 経路（`bench-chip` knn_profile）前後比較
 
@@ -346,11 +377,26 @@ after=0.381ms（ratio 1.524）。
 参照区間 `S1_redb_scan/median_ms`（同一プロセスが同時に計測。dot を通らない）:
 before は 0.967〜0.979ms（幅 1.2%）、after は 0.968〜1.066ms（幅 10.1%）と
 比較的安定している一方、`S5_search_parallel` は同一 before/after 内でも
-0.219ms〜3.331ms（15 倍超）の 2 峰性のばらつきを示した。これは `dot_block4`
-自体の効果ではなく、`ParallelBruteForce`（スレッドプール起動を伴う）が
-knn_profile の小規模ワークロード（`S0` 由来の少数行）で初回スレッド起動
-コストの有無により 2 峰化する production 経路固有のノイズと考えられる
-（`S1_redb_scan` のような非並列区間には現れない）。
+0.219ms〜3.331ms（15 倍超）の 2 峰性のばらつきを示した。
+
+**観測事実**と**未検証の原因仮説**を分けて記録する（codex-review 指摘。旧版は
+「`ParallelBruteForce` のスレッドプール起動コスト」を原因として断定的に記述
+していたが、`crates/engine/src/parallel_search.rs` の実装を確認したところ
+`ParallelBruteForce` はスレッドプールを保持せず、検索のたびに
+`std::thread::scope` 配下でワーカーを spawn する構成である。また `S5` は
+`harness::protocol::run` の warmup フェーズ〔20 回〕を経てから計測フェーズを
+計測するため、初回スレッド起動固有のコストが計測サンプルに現れる根拠も
+実装からは確認できない）。
+
+- 観測事実: `S5_search_parallel` は before/after いずれも同一プロセス内で
+  2 峰性（約 0.22〜0.38ms 群と約 3.0〜3.3ms 群）のばらつきを示し、dot を
+  通らない `S1_redb_scan`（安定・幅 1.2〜10.1%）には現れない。
+- 未検証の原因仮説: knn_profile の小規模ワークロード（`S0` 由来の少数行）
+  特有の何らかのスケジューリング・キャッシュ挙動が `search_range` 呼び出し
+  経路（`dot_block4` 有無を問わず）で 2 峰化を引き起こしている可能性がある
+  が、上記の実装確認により「スレッドプールの初回起動コスト」という原因は
+  裏付けられない。原因の特定は本 Issue の範囲外とし、以下の判定は原因を
+  問わず観測されたノイズ規模のみに基づく。
 
 **判定**: min-of-N ratio（1.046）は固定 ±5% 帯の境界付近で `Neutral` 寄りだが、
 median ratio（1.524）は大きく異なり、N=5・単発ラウンドでは判定不能
@@ -373,10 +419,13 @@ production 変更の「採用（Accepted）」根拠にはできない。層 A�
 
 **「参考値・現状維持（条件付き）」**——`crates/engine/src/parallel_search.rs`・
 `isa.rs`（#510・#511 で導入済みの `dot_block4` 結線）は据え置く。層 A の
-dim768 改善（cache_resident 約 -54%・arena_scale 約 -15%）・dim128
-cache_resident 改善（約 -7.5%）は本環境の証拠力の範囲で「参考値」として
-記録し、dim128 arena_scale・層 B production 経路は判定不能として最終採否を
-AVX-512／NEON 実機（Issue #530）へ申し送る。
+dim768 改善（cache_resident min-of-N 比 0.4581・arena_scale min-of-N 比
+0.8331。いずれも固定 ±5% 帯・実測 run-to-run 帯の両方を超過）・dim128
+cache_resident 改善（min-of-N 比 0.9248。両ノイズ帯を超過）は本環境の証拠力の
+範囲で「参考値」として記録する。dim128 arena_scale は固定 ±5% 帯の内側
+（min-of-N 比 1.0398）のため「ノイズ帯内」（有効な変化と扱わない）、
+層 B production 経路は判定不能として、最終採否を AVX-512／NEON 実機
+（Issue #530）へ申し送る。
 
 ### 再現手順（層 A）
 
