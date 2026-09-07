@@ -1510,7 +1510,9 @@ fn run_hot_only(
     let sql = c1_statement(TABLE, COLUMN, &literal, TOP_K)
         .expect("well-formed C1 statement from validated identifiers");
 
-    let core = build_core_for_sweep(knn_engine, storage, full_scan_ratio_override);
+    // hot-only モード（Issue #516）は visited 集合切替閾値（Issue #497）の
+    // 計測対象外のため、既定値（常に dense）のまま `None` を渡す。
+    let core = build_core_for_sweep(knn_engine, storage, full_scan_ratio_override, None);
 
     // --- warm: 索引構築を含む 1 回目のクエリ（計測外）。--------------------
     let warm_start = Instant::now();
