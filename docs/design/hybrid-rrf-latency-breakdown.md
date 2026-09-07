@@ -1329,6 +1329,8 @@ per-run 表を丸ごと置き換える必要があり、単一の P2 指摘（�
 共有環境で行われており、ここで再測定してもノイズ帯の値として信頼できない。
 今後の再測定では `scripts/bench_hybrid_profile_ab.sh --summarize` が
 `baseline_round_raw`／`baseline_summary`（`B0s(min=...,median=...)` を含む）
+に加え、各 run 直前の `loadavg_before_run`・`running_processes_excluding_self`・
+`top_cpu_processes`（同 §3 の同時実行プロセス有無の記録。本 PR で追加）
 の行をそのまま列挙するため、次回実行時はこれらの行を本ドキュメントへ転記
 すれば同種の指摘は再発しない。上記のとおり本節の判断は `B0s` の値列
 無しでも固定 ±5% 帯のみで成立するため、このギャップは判断そのものの

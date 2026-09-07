@@ -54,7 +54,7 @@ if [ "${1:-}" = "--summarize" ]; then
     dir="${2:-}"
     [ -n "$dir" ] || fail "--summarize requires a directory argument"
     [ -d "$dir" ] || fail "not a directory: $dir"
-    echo "=== baseline_round_raw / baseline_summary / reference_band lines under $dir ==="
+    echo "=== baseline_round_raw / baseline_summary / reference_band / per-run load & process lines under $dir ==="
     found=0
     # 条件→ペア番号（数値昇順）→before/after の実行順を明示的に辿る（shell
     # glob の辞書順 `*.log` 展開だと "ratio1of10" が "ratio1of1" より前に来る、
@@ -84,7 +84,7 @@ if [ "${1:-}" = "--summarize" ]; then
             for side in before after; do
                 pair_file="$dir/${cond_label}_pair${pair_num}_${side}.log"
                 [ -e "$pair_file" ] || continue
-                if grep -H -E 'baseline_round_raw|baseline_summary|baseline reference_band|^hybrid_profile: rows=' "$pair_file"; then
+                if grep -H -E 'baseline_round_raw|baseline_summary|baseline reference_band|^hybrid_profile: rows=|^# loadavg_before_run=|^# running_processes_excluding_self=|^# top_cpu_processes=' "$pair_file"; then
                     found=1
                 fi
             done
@@ -125,6 +125,25 @@ if [ "$AB_ROUNDS" -lt 5 ] || [ "$AB_ROUNDS" -gt 50 ]; then
     fail "AB_ROUNDS must be in 5..=50 (hybrid_profile_bench's own BENCH_HYBRID_PROFILE_ROUNDS bound; got $AB_ROUNDS)"
 fi
 
+# 各 run 直前の同時実行プロセスのスナップショットを `# ` 接頭辞の行として出力する。
+# `running_processes_excluding_self`: 状態 R（running）のプロセス数から自シェル・ps を
+# 除いた値。0 なら計測時点で他に CPU を使っているプロセスは無い。
+# `top_cpu_processes`: CPU 使用率上位 5 件の「pid:comm:%cpu」（自シェル・ps を除く）。
+# ps が失敗した場合は両方 unknown を出力し、記録が欠けたことを明示する。
+record_concurrent_processes() {
+    local self_pid=$$ snapshot
+    if ! snapshot="$(ps -eo pid=,stat=,pcpu=,comm= 2>/dev/null)"; then
+        echo "# running_processes_excluding_self=unknown (ps unavailable)"
+        echo "# top_cpu_processes=unknown (ps unavailable)"
+        return 0
+    fi
+    local running top
+    running="$(printf '%s\n' "$snapshot" | awk -v self="$self_pid" '$1 != self && $4 != "ps" && $2 ~ /^R/ {n++} END {print n+0}')"
+    top="$(printf '%s\n' "$snapshot" | awk -v self="$self_pid" '$1 != self && $4 != "ps" {print $1":"$4":"$3}' | sort -t: -k3 -rn | head -5 | tr '\n' ' ')"
+    echo "# running_processes_excluding_self=$running"
+    echo "# top_cpu_processes=${top:-none}"
+}
+
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
 out_dir="target/bench-hybrid-profile-ab/${ts}"
 mkdir -p "$out_dir"
@@ -158,6 +177,11 @@ for cond in $conditions; do
             {
                 echo "# loadavg_before_run=$loadavg"
                 echo "# condition=$cond_label pair=$pair side=$side rows=$rows denominator=$denom"
+                # 各 run 直前の同時実行プロセスの有無（`docs/design/benchmark-judgement-policy.md`
+                # §3「同一プロセス条件（同時実行プロセス等）」の記録要件）。自プロセス
+                # （このシェルと ps 自身）を除いた running 状態のプロセス数と、CPU 使用率
+                # 上位のプロセス名を残す。ps が使えない環境では推測せず unknown と明示する
+                record_concurrent_processes
             } > "$log"
             BENCH_HYBRID_PROFILE_ROWS="$rows" \
                 BENCH_HYBRID_PROFILE_VISIBLE_RATIO="1/${denom}" \
