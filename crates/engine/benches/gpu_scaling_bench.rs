@@ -962,6 +962,12 @@ fn main() {
                             f16_full_readback_fallbacks: f16_stats_after
                                 .full_readback_fallbacks
                                 .saturating_sub(f16_stats_before.full_readback_fallbacks),
+                            f16_arith_dispatches: f16_stats_after
+                                .f16_arith_dispatches
+                                .saturating_sub(f16_stats_before.f16_arith_dispatches),
+                            f16_arith_guard_fallbacks: f16_stats_after
+                                .f16_arith_guard_fallbacks
+                                .saturating_sub(f16_stats_before.f16_arith_guard_fallbacks),
                             f32_readback_bytes_total: f32_bytes_total,
                             f32_readback_bytes_per_call: f32_per_call,
                             f32_partial_topk_dispatches: f32_stats_after
