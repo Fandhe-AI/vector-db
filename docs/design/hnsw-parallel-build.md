@@ -216,6 +216,20 @@ run-to-run 変動の範囲として扱い、閾値判定には用いない（本
 | 2 | 158.1 ms | 1.668x |
 | 4 | 88.0 ms | 2.995x |
 
+### Issue #494 追記: 凍結後 CSR 化に伴う `flatten` 段の追加
+
+凍結時の CSR 平坦化（`docs/design/hnsw-index.md` §14・Issue #493・#494）の
+実装に伴い、`HnswBuildProfile` へ `flatten`（可変長ビルダー表現
+`GraphBuilder` から CSR `csr::CsrGraph` への平坦化。`freeze`・
+`repair_reachability` の両方が完了した後の最終段）を追加した。以下の
+「Issue #406 追記」節の段別内訳表（`level`／`prefix`／`parallel`／
+`freeze`／`repair`）は本 Issue 以前（`flatten` 段が存在しない時点）の実測
+であり、`flatten` を含まない。`flatten` を含む前後比較の再実測は #495 の
+担当（`benches/harness/hnsw_parallel_profile.rs::serial_share` への
+`flatten` 加算も含む）。逐次縮退経路（`threads == 1` または
+`n <= SEQUENTIAL_PREFIX_NODES`）はこの区切りが存在しないため `flatten` は
+`Duration::ZERO` のまま（`sequential_prefix` へ全量を積む既存規約）。
+
 ### Issue #406 追記（2026-09-05）: 8→12 スレッド頭打ちの段別内訳
 
 「受け入れ条件 (b)」で観測した 8→12 スレッドの伸び悩みについて、構築の

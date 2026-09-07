@@ -500,6 +500,8 @@ BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 
 HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳）・`make bench-hnsw-compare`（usearch との構築時間・Recall@10・探索レイテンシ比較。L2 正規化コーパス方式を維持）で実測できます。いずれも手動専用ベンチで CI 非配線です。詳細・実測値は `docs/design/hnsw-parallel-build.md` を参照してください。
 
+受理判定後 prefetch（Issue #490）の前後比較実測は `make bench-hnsw-search`（`BENCH_HNSW_SEARCH_ROWS`／`BENCH_HNSW_SEARCH_DIM`／`BENCH_HNSW_SEARCH_MASK`〔RLS 事前フィルタ統合の `Subset` 形状を模す可視率〕で 1 規模点を計測し、before/after バイナリを交互起動して比較する手動専用ベンチ）で実施できます。`git archive` で取り出した作業ツリーから before/after バイナリをビルドする再現手順では、ビルド時に `BENCH_HNSW_SEARCH_COMMIT=<sha>` を指定して計測対象コミットをバイナリへ焼き込んでください（未指定時の実行時フォールバックはカレントディレクトリの HEAD を返すため、同一ディレクトリから交互起動する両バイナリに同じ値が記録されます）。CI 非配線・詳細・実測値・採否は `docs/design/hnsw-search.md`「Issue #491」節を参照してください。
+
 ### `precision` 評価ハーネス（TASK-163）
 
 `crates/engine/tests/precision_eval.rs` は `precision` モード（TASK-162）の
