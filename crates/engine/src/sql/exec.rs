@@ -784,6 +784,19 @@ pub(crate) fn execute_statement_with_cache(
     let cache_fast_path_eligible =
         bound.metadata_filters.is_empty() && bound.expr_filters.is_empty() && !is_hybrid;
 
+    // Issue #474: SCALAR 事前フィルタの索引対応述語形状の静的判定
+    // （`sql::scalar_plan::classify_scalar_plan`）。索引の gated 構築（下記）と
+    // 候補削減（「ヒットだが SCALAR 段に実質的な処理がある」分岐）の双方が参照
+    // するため、`bound.metadata_filters`／`expr_filters` が変わらないこの
+    // クエリ内で 1 回だけ計算する（`sql::hnsw_cache::classify_ann_plan` を
+    // 一度だけ呼ぶ既存の流儀と同じ）。
+    let scalar_plan_kind =
+        crate::sql::scalar_plan::classify_scalar_plan(&crate::sql::scalar_plan::ScalarShapeInput {
+            scalar_prefilter: plan.scalar_prefilter,
+            metadata_filters: &bound.metadata_filters,
+            expr_filters: &bound.expr_filters,
+        });
+
     let rls_hook = ImplicitRlsHook::new(ctx);
     // 借用元を関数スコープ末尾まで生かすための保持先（`arena` はこのいずれかを
     // 指す `&VectorArena` になる。ミス／フォールバック経路は `owned_arena` へ、
@@ -891,14 +904,6 @@ pub(crate) fn execute_statement_with_cache(
                         .ok_or(ArenaError::InvalidDim)
                         .map_err(|e| map_arena_error(&bound.table, e))?;
                     scalar_snapshot_for_index = Some(std::sync::Arc::clone(&snapshot));
-
-                    let scalar_plan_kind = crate::sql::scalar_plan::classify_scalar_plan(
-                        &crate::sql::scalar_plan::ScalarShapeInput {
-                            scalar_prefilter: plan.scalar_prefilter,
-                            metadata_filters: &bound.metadata_filters,
-                            expr_filters: &bound.expr_filters,
-                        },
-                    );
 
                     let mut index_candidate_slots: Option<Vec<u32>> = None;
                     if scalar_plan_kind != crate::sql::scalar_plan::ScalarPlan::PlainScan {
@@ -1074,14 +1079,7 @@ pub(crate) fn execute_statement_with_cache(
     if let (Some(scalar_access), Some(snapshot_for_scalar)) =
         (scalar_cache.as_ref(), scalar_snapshot_for_index.as_ref())
     {
-        let scalar_plan_kind_for_build = crate::sql::scalar_plan::classify_scalar_plan(
-            &crate::sql::scalar_plan::ScalarShapeInput {
-                scalar_prefilter: plan.scalar_prefilter,
-                metadata_filters: &bound.metadata_filters,
-                expr_filters: &bound.expr_filters,
-            },
-        );
-        if scalar_plan_kind_for_build != crate::sql::scalar_plan::ScalarPlan::PlainScan {
+        if scalar_plan_kind != crate::sql::scalar_plan::ScalarPlan::PlainScan {
             // Issue #474: 上記の候補削減分岐が同じクエリ中に既に `lookup` を
             // 呼んでいれば（`scalar_index_lookup_hit`）その結果を再利用し、
             // `lookup` の重複呼び出しによる `hits`/`misses` 統計の二重計上を

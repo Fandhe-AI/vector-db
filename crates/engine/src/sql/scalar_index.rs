@@ -1,15 +1,18 @@
-//! `sql::exec` の SCALAR 段（`WHERE` の等価・前方一致条件）が将来（Issue #474）
-//! 全行走査（O(N)）の代わりに参照する、スカラー列二次索引の**構築とテーブル世代
-//! 整合キャッシュ**（Issue #473。対応 ADR: `docs/design/scalar-secondary-index.md`。
+//! `sql::exec` の SCALAR 段（`WHERE` の等価・前方一致・`id` 単純比較条件）が
+//! 全行走査（O(N)）の代わりに参照する、スカラー列二次索引の**構築・テーブル
+//! 世代整合キャッシュ・候補削減 API**（構築・キャッシュは Issue #473、候補削減
+//! への結線は Issue #474。対応 ADR: `docs/design/scalar-secondary-index.md`。
 //! 親 Issue #359・#472。ポインタ: `docs/spec/04-behavior/data-model.md`
 //! TABLE-12・`docs/spec/04-behavior/rls.md`）。
 //!
-//! **本 Issue のスコープ**: 索引の構築・キャッシュのみ。索引を使った候補削減・
-//! `ExecutionPlan` 統合・`EXPLAIN` 露出は Issue #474 が担う。本モジュールが
-//! 提供する照会 API（[`ScalarIndex::candidates_for`] 等）は現時点で
-//! `sql::exec::execute_statement_with_cache` から一切消費されない
-//! （構築されるだけで応答には使われない。クエリ結果は本 Issue の前後で完全に
-//! 不変）。
+//! **消費経路**: 本モジュールの照会 API（[`ScalarIndex::candidates_for`]・
+//! [`ScalarIndex::candidates_id_range`]・[`ScalarIndex::resolve_candidates`]）は
+//! `sql::exec::execute_statement_with_cache` の SCALAR 事前フィルタから、索引
+//! 対応述語（`sql::scalar_plan::classify_scalar_plan` が `PlainScan` 以外へ
+//! 分類した形状。TEXT 列の等価・前方一致・`id` の単純比較とその組合せ）を持つ
+//! クエリに限って消費される（詳細は `docs/design/scalar-index-prune.md` 参照）。
+//! 索引は候補スロットを「絞る」ことしかできず「通す」ことはできないため、
+//! 候補行にも `on_visible_row`（`matches_all`＋式述語）が引き続き適用される。
 //!
 //! **データモデル**（[`ScalarIndex`]）: 構築元は
 //! [`crate::sql::arena_cache::SqlArenaSnapshot`]（RLS 段適用済み・ctx 可視行の

@@ -374,6 +374,42 @@ mod tests {
         }
     }
 
+    /// [`tests::id_bounds_matches_eval_binary_property`] は `id ∈ 0..=20` ・
+    /// 小さな literal しか網羅しないため、`id_index` が扱う実際の上限
+    /// （[`MAX_EXACT_ID`]＝`2^53`）付近の境界を別途固定する。`2^53 + 1.0` は
+    /// f64 の刻み幅が 1 を超えるため `2^53` へ丸められてしまう（`f64::from_str`
+    /// の丸めハザード）ので、あえて `+2.0` を使い実際に異なる値になる literal を
+    /// 網羅する。`id` 側は `MAX_EXACT_ID` を上限とする（`id > 2^53` の行が
+    /// 1 件でもあれば `id_index` 自体が `None` になり `id_bounds` は呼ばれない
+    /// 契約——`sql::udf_call::id_as_finite_scalar` 参照——ため、その領域は
+    /// `eval_binary` 側の `(id as f64)` 丸めで exact 比較契約が崩れても
+    /// 本関数の正しさに影響しない）。
+    #[test]
+    fn id_bounds_matches_eval_binary_property_near_2_53_boundary() {
+        use crate::sql::udf_call::{eval_binary, ExprValue};
+        let ids: Vec<u64> = vec![MAX_EXACT_ID - 2, MAX_EXACT_ID - 1, MAX_EXACT_ID];
+        let literals = [
+            (MAX_EXACT_ID - 1) as f64,
+            MAX_EXACT_ID as f64,
+            (MAX_EXACT_ID as f64) + 2.0,
+        ];
+        for &literal in &literals {
+            for op in [BinOp::Gt, BinOp::Lt, BinOp::Ge, BinOp::Le, BinOp::Eq] {
+                let pred = IdPredicate { op, literal };
+                let bounds = id_bounds(&pred).expect("finite non-negative literal");
+                for &id in &ids {
+                    let expected = matches!(
+                        eval_binary(op, ExprValue::Scalar(id as f64), ExprValue::Scalar(literal),)
+                            .expect("comparison never errors for finite operands"),
+                        ExprValue::Bool(true)
+                    );
+                    let in_range = bound_contains(bounds, id);
+                    assert_eq!(in_range, expected, "op={op:?} literal={literal} id={id}");
+                }
+            }
+        }
+    }
+
     fn bound_contains(bounds: (std::ops::Bound<u64>, std::ops::Bound<u64>), id: u64) -> bool {
         use std::ops::Bound;
         let lower_ok = match bounds.0 {

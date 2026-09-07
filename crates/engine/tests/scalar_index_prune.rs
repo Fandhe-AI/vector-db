@@ -328,6 +328,14 @@ fn low_selectivity_predicate_falls_back_to_plain_scan_but_result_still_matches()
         "a predicate exceeding the selectivity threshold must fall back to a plain scan \
          (before={before:?}, after={after:?})"
     );
+    // 選択度超過による縮退は「候補削減を使わなかった」ことそのものを意味する
+    // ため、`index_scans` は増えていないことも合わせて固定する（`plain_scan_
+    // fallbacks` の増加だけでは「索引経路を経由したが最終的に絞れなかった」
+    // 可能性を排除できない）。
+    assert_eq!(
+        after.index_scans, before.index_scans,
+        "a selectivity fallback must not also be counted as an index scan"
+    );
     assert_eq!(result_ids(&hot), vec![2, 4, 6, 8, 10, 11]);
 }
 
