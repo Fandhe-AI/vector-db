@@ -1,0 +1,45 @@
+=== run 1 ===
+loadavg: 10.63 7.96 5.84 5/464 269458
+210 MHz, 48
+env: os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma loadavg=10.63 7.96 5.84 4/463 269463
+gpu_scaling: rows=20000 dim=128 batch=8 k=10 cpu_simd_p50=5046us cpu_simd_p95=5308us gpu_f16_p50=587us gpu_f16_p95=594us gpu_f32_p50=697us gpu_f32_p95=704us per_query_cpu_p50=630us per_query_gpu_f16_p50=73us speedup_f16_p95=8.93x mismatch=0
+gpu_scaling_shader_ab: rows=20000 dim=128 batch=8 k=10 unpack_p50=586us unpack_p95=594us f16_arith_p50=586us f16_arith_p95=593us
+gpu_scaling_stats: rows=20000 dim=128 batch=8 k=10 calls=40 f16_readback_bytes_total=2022400 f16_readback_bytes_per_call=50560 f16_partial_topk_dispatches=40 f16_full_readback_dispatches=0 f16_full_readback_fallbacks=0 f16_arith_dispatches=40 f16_arith_guard_fallbacks=0 f32_readback_bytes_total=2022400 f32_readback_bytes_per_call=50560 f32_partial_topk_dispatches=40 f32_full_readback_dispatches=0 f32_full_readback_fallbacks=0
+gpu_scaling_i8: rows=20000 dim=128 batch=8 k=10 oversample=4 gpu_i8_p50=5273us gpu_i8_p95=5437us per_query_gpu_i8_p50=659us speedup_i8_vs_cpu_p95=0.98x speedup_i8_vs_f16_p95=0.11x i8_mismatch=0 i8_recall_at_k=1.0000
+gpu_scaling_i8_stats: rows=20000 dim=128 batch=8 k=10 oversample=4 calls=40 readback_bytes_total=25600000 readback_bytes_per_call=640000 rescored_candidates_total=12800 rescored_candidates_per_call=320 backend=Vulkan dot4_impl=Undetermined build_ms=17
+=== run 2 ===
+loadavg: 10.02 7.87 5.82 4/465 269515
+1792 MHz, 50
+env: os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma loadavg=10.02 7.87 5.82 4/464 269520
+gpu_scaling: rows=20000 dim=128 batch=8 k=10 cpu_simd_p50=5042us cpu_simd_p95=5102us gpu_f16_p50=585us gpu_f16_p95=592us gpu_f32_p50=717us gpu_f32_p95=789us per_query_cpu_p50=630us per_query_gpu_f16_p50=73us speedup_f16_p95=8.61x mismatch=0
+gpu_scaling_shader_ab: rows=20000 dim=128 batch=8 k=10 unpack_p50=597us unpack_p95=612us f16_arith_p50=599us f16_arith_p95=605us
+gpu_scaling_stats: rows=20000 dim=128 batch=8 k=10 calls=40 f16_readback_bytes_total=2022400 f16_readback_bytes_per_call=50560 f16_partial_topk_dispatches=40 f16_full_readback_dispatches=0 f16_full_readback_fallbacks=0 f16_arith_dispatches=40 f16_arith_guard_fallbacks=0 f32_readback_bytes_total=2022400 f32_readback_bytes_per_call=50560 f32_partial_topk_dispatches=40 f32_full_readback_dispatches=0 f32_full_readback_fallbacks=0
+gpu_scaling_i8: rows=20000 dim=128 batch=8 k=10 oversample=4 gpu_i8_p50=5370us gpu_i8_p95=5467us per_query_gpu_i8_p50=671us speedup_i8_vs_cpu_p95=0.93x speedup_i8_vs_f16_p95=0.11x i8_mismatch=0 i8_recall_at_k=1.0000
+gpu_scaling_i8_stats: rows=20000 dim=128 batch=8 k=10 oversample=4 calls=40 readback_bytes_total=25600000 readback_bytes_per_call=640000 rescored_candidates_total=12800 rescored_candidates_per_call=320 backend=Vulkan dot4_impl=Undetermined build_ms=17
+=== run 3 ===
+loadavg: 10.02 7.87 5.82 3/465 269571
+1792 MHz, 50
+env: os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma loadavg=10.02 7.87 5.82 4/464 269576
+gpu_scaling: rows=20000 dim=128 batch=8 k=10 cpu_simd_p50=5087us cpu_simd_p95=5117us gpu_f16_p50=582us gpu_f16_p95=592us gpu_f32_p50=695us gpu_f32_p95=704us per_query_cpu_p50=635us per_query_gpu_f16_p50=72us speedup_f16_p95=8.63x mismatch=0
+gpu_scaling_shader_ab: rows=20000 dim=128 batch=8 k=10 unpack_p50=605us unpack_p95=663us f16_arith_p50=599us f16_arith_p95=636us
+gpu_scaling_stats: rows=20000 dim=128 batch=8 k=10 calls=40 f16_readback_bytes_total=2022400 f16_readback_bytes_per_call=50560 f16_partial_topk_dispatches=40 f16_full_readback_dispatches=0 f16_full_readback_fallbacks=0 f16_arith_dispatches=40 f16_arith_guard_fallbacks=0 f32_readback_bytes_total=2022400 f32_readback_bytes_per_call=50560 f32_partial_topk_dispatches=40 f32_full_readback_dispatches=0 f32_full_readback_fallbacks=0
+gpu_scaling_i8: rows=20000 dim=128 batch=8 k=10 oversample=4 gpu_i8_p50=5344us gpu_i8_p95=5630us per_query_gpu_i8_p50=668us speedup_i8_vs_cpu_p95=0.91x speedup_i8_vs_f16_p95=0.11x i8_mismatch=0 i8_recall_at_k=1.0000
+gpu_scaling_i8_stats: rows=20000 dim=128 batch=8 k=10 oversample=4 calls=40 readback_bytes_total=25600000 readback_bytes_per_call=640000 rescored_candidates_total=12800 rescored_candidates_per_call=320 backend=Vulkan dot4_impl=Undetermined build_ms=18
+=== run 4 ===
+loadavg: 10.02 7.87 5.82 4/450 269586
+1792 MHz, 51
+env: os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma loadavg=10.02 7.87 5.82 4/449 269591
+gpu_scaling: rows=20000 dim=128 batch=8 k=10 cpu_simd_p50=5090us cpu_simd_p95=5114us gpu_f16_p50=598us gpu_f16_p95=604us gpu_f32_p50=703us gpu_f32_p95=716us per_query_cpu_p50=636us per_query_gpu_f16_p50=74us speedup_f16_p95=8.45x mismatch=0
+gpu_scaling_shader_ab: rows=20000 dim=128 batch=8 k=10 unpack_p50=599us unpack_p95=698us f16_arith_p50=594us f16_arith_p95=601us
+gpu_scaling_stats: rows=20000 dim=128 batch=8 k=10 calls=40 f16_readback_bytes_total=2022400 f16_readback_bytes_per_call=50560 f16_partial_topk_dispatches=40 f16_full_readback_dispatches=0 f16_full_readback_fallbacks=0 f16_arith_dispatches=40 f16_arith_guard_fallbacks=0 f32_readback_bytes_total=2022400 f32_readback_bytes_per_call=50560 f32_partial_topk_dispatches=40 f32_full_readback_dispatches=0 f32_full_readback_fallbacks=0
+gpu_scaling_i8: rows=20000 dim=128 batch=8 k=10 oversample=4 gpu_i8_p50=5367us gpu_i8_p95=9259us per_query_gpu_i8_p50=670us speedup_i8_vs_cpu_p95=0.55x speedup_i8_vs_f16_p95=0.07x i8_mismatch=0 i8_recall_at_k=1.0000
+gpu_scaling_i8_stats: rows=20000 dim=128 batch=8 k=10 oversample=4 calls=40 readback_bytes_total=25600000 readback_bytes_per_call=640000 rescored_candidates_total=12800 rescored_candidates_per_call=320 backend=Vulkan dot4_impl=Undetermined build_ms=22
+=== run 5 ===
+loadavg: 10.02 7.87 5.82 4/450 269601
+1792 MHz, 50
+env: os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma loadavg=10.02 7.87 5.82 4/449 269606
+gpu_scaling: rows=20000 dim=128 batch=8 k=10 cpu_simd_p50=5114us cpu_simd_p95=5217us gpu_f16_p50=590us gpu_f16_p95=609us gpu_f32_p50=699us gpu_f32_p95=706us per_query_cpu_p50=639us per_query_gpu_f16_p50=73us speedup_f16_p95=8.56x mismatch=0
+gpu_scaling_shader_ab: rows=20000 dim=128 batch=8 k=10 unpack_p50=672us unpack_p95=886us f16_arith_p50=810us f16_arith_p95=873us
+gpu_scaling_stats: rows=20000 dim=128 batch=8 k=10 calls=40 f16_readback_bytes_total=2022400 f16_readback_bytes_per_call=50560 f16_partial_topk_dispatches=40 f16_full_readback_dispatches=0 f16_full_readback_fallbacks=0 f16_arith_dispatches=40 f16_arith_guard_fallbacks=0 f32_readback_bytes_total=2022400 f32_readback_bytes_per_call=50560 f32_partial_topk_dispatches=40 f32_full_readback_dispatches=0 f32_full_readback_fallbacks=0
+gpu_scaling_i8: rows=20000 dim=128 batch=8 k=10 oversample=4 gpu_i8_p50=5315us gpu_i8_p95=5384us per_query_gpu_i8_p50=664us speedup_i8_vs_cpu_p95=0.97x speedup_i8_vs_f16_p95=0.11x i8_mismatch=0 i8_recall_at_k=1.0000
+gpu_scaling_i8_stats: rows=20000 dim=128 batch=8 k=10 oversample=4 calls=40 readback_bytes_total=25600000 readback_bytes_per_call=640000 rescored_candidates_total=12800 rescored_candidates_per_call=320 backend=Vulkan dot4_impl=Undetermined build_ms=17

@@ -247,7 +247,165 @@ O(可視行数 × 次元数) の CPU 処理）。各行の絶対値最大は行�
 
 ## 7. スコープ外・申し送り
 
-- 前後比較の実測・CORE-16 ゲートへの影響記録は #540 の担当
+- 前後比較の実測・CORE-16 ゲートへの影響記録は #540（本 doc §8）で実施
 - `GpuF32ContrastBackend` 側の f16 算術化は対象外（CORE-16 の公平性は
   f32 常駐のまま維持する契約）
 - `unsafe`・依存追加なし（wgpu `=30.0.1` 既存依存の範囲内）
+
+## 8. 前後比較実測（Issue #540）
+
+private spec 由来の数値基準・実測値は
+[spec-confidentiality](../../.claude/rules/spec-confidentiality.md) のオーナー
+判断（2026-08-29）により本 doc への記載を許可されている。
+
+### 8.1 前提・非 vacuity の確保
+
+`benches/gpu_scaling_bench.rs`・`benches/batch_bench.rs`（CORE-16 ゲート・
+規模点診断）のクエリ生成はいずれも `DeterministicRng::next_vector`（任意精度
+f32）であり、`select_dot_shader` の条件 5（クエリ成分が f16 へ厳密往復
+できない場合は unpack 版へ fail-closed に縮退）により、**変更なしでは
+f16 算術版シェーダへ一度も dispatch されない**（本 doc §1 参照）。
+
+この事実そのものが本 Issue の最初の確定的な発見であり、`gpu_scaling_bench`
+opt-in `BENCH_GPU_SCALING_QUERY_F16_EXACT=1`（`harness/gpu_scaling.rs::
+round_to_f16_exact`。`engine::batch_search::pack_f16x2`/`unpack_f16x2` による
+実際の往復丸め）を追加することで初めて f16 算術版シェーダへの到達を
+確認できる。以下は本開発環境（NVIDIA GeForce RTX 3060・Vulkan・共有 QEMU
+VM・他 worktree 3 本並走）での実測。
+
+### 8.2 確定的指標（環境非依存。`gpu_scaling_stats:` 行）
+
+rows=2,000・dim=128・batch=8（warmup 20 + measured 20 = calls=40）:
+
+| 条件 | `f16_arith_dispatches` | `f16_arith_guard_fallbacks` | `mismatch` |
+| --- | --- | --- | --- |
+| `QUERY_F16_EXACT` 未設定（既定） | 0 | 40 | 0 |
+| `QUERY_F16_EXACT=1` | 40 | 0 | 0 |
+
+`f16_arith_available=true`（本環境のアダプタは `SHADER_F16` 対応）。
+opt-in なしでは常に unpack 版へ縮退し（`dispatches=0`）、opt-in ありでは
+全 dispatch が f16 算術版を通ること（`dispatches=40`・`guard_fallbacks=0`）
+を確認した——§8.1 の懸念どおり、opt-in なしの before/after 比較は
+「unpack 版 vs unpack 版」の比較にしかならない。境界同点許容つき
+`mismatch` はいずれも 0（Recall 相当の非退行）。
+
+CORE-16 ゲート本体・規模点診断（`batch_bench.rs`）のクエリ生成は
+本 Issue の対象外のまま（fixture 変更は§8.4・ゲート意味論の変更を伴うため
+申し送り）で、opt-in を持たないため常に unpack 版へ縮退する。verbose
+出力（新設）で実測:
+
+```text
+verbose(f16_resident_vs_f32_resident_p95): f16_arith_available=true \
+  f16_arith_dispatches=0 f16_arith_guard_fallbacks=40
+verbose(core16_diag): scale_index=0 rows=64 dim=256 f16_arith_available=true \
+  f16_arith_dispatches=0 f16_arith_guard_fallbacks=40
+```
+
+すなわち **CORE-16 ゲート・規模点診断は現状 fixture のままでは f16 算術版
+シェーダを一度も経由しない**（選択されるシェーダは常に unpack 版のまま
+不変。`AdaptiveShaderSelector::resolve` は呼び出しごとに f16 算術版ガード
+〔`select_dot_shader` 条件 5 等〕を評価してから縮退するため、性能への
+影響がないとは断定しない。ゲート・診断そのものの改修は
+§8.4 参照）。ゲート本体の p95（f32 常駐 vs f16 パック常駐。参考値）:
+`f32_resident_p95=1.157675ms f16_resident_p95=848.251µs`
+（`BENCH_CORE16_MIN_IMPROVEMENT_PCT=0.001` で `pass=true`。閾値そのものは
+Environment `bench-gate` secrets 管理のため本 doc には記載しない）。
+
+### 8.3 レイテンシ比較
+
+#### 8.3.1 同一クエリでのシェーダ単体比較（正式比較。Issue #540 追記・codex-review P2 指摘対応・PR #611）
+
+§8.3（旧版。8.3.2 として保存）の `QUERY_F16_EXACT` 未設定/設定による比較は、
+opt-in の有無で `dataset.queries` 自体が変わる（未設定＝任意精度 f32・
+設定＝f16 厳密往復済み）ため、「unpack 版 vs f16 算術版」という 1 要因の
+比較のはずが「クエリの違い」というもう 1 つの要因を同時に動かしていた
+（codex-review 指摘）。本節は交絡を排した比較として、同一の f16 厳密往復
+済みクエリに対し `GpuBatchBackend::batch_search_with_options_for_tests`
+（`GpuSearchTestOptions::dot_shader`。`bench-internals` feature 限定）で S0
+シェーダ選択を `Unpack`／`F16Arith` へ強制する新 opt-in
+`BENCH_GPU_SCALING_SHADER_AB=1`（`BENCH_GPU_SCALING_QUERY_F16_EXACT=1` 併用
+必須。`gpu_scaling_shader_ab:` 行）を追加し実測した。
+
+計測対象コミット: `212198d`（本節が参照する `gpu_scaling_bench.rs`・
+`harness/gpu_scaling.rs` の追加コードそのもの）。
+計測条件: rows=20,000・dim=128・batch=8・k=10・iters=20（warmup 20）。
+環境: 本開発環境（NVIDIA GeForce RTX 3060・Vulkan backend）・共有 QEMU VM
+（loadavg 約 10・他 worktree 並走）・CPU `lscpu` Model name
+`QEMU Virtual CPU version 2.5+`・`logical_cpus=12`・実行時検出 ISA `Avx2Fma`。
+単一プロセス内で unpack 版 → f16 算術版の順に交互計測（同一 `gpu_f16`
+インスタンス・同一クエリ集合。シェーダ強制のみが変動要因）を 5 run（各 run
+は新規プロセス起動）実施。per-run 生データ・`nvidia-smi` クロック/温度は
+`docs/design/bench-data/gpu-scaling-ab/20260907T-shader-ab-summary.tsv`
+（要約 TSV）・`20260907T-shader-ab-raw.log`（プロセス出力全文）参照
+（`docs/design/benchmark-judgement-policy.md` §3 の per-run 生データ保持契約）。
+
+`gpu_scaling_shader_ab:` 行が全 5 run で出力された（`measure_shader_ab` 内の
+`f16_arith_measurement` が `Err` を返さなかった）ことが、f16 算術版強制が
+全 dispatch で実際に受理されたことの証跡になる（`GpuSearchTestOptions::
+dot_shader` の fail-closed 契約——`select_dot_shader` の条件が不成立の場合は
+測定自体が `Err` で失敗し `gpu_scaling_shader_ab:` ではなく `unavailable`
+行が出力される——のため。**訂正（codex-review P2 指摘・PR #611）**: 旧版は
+この裏付けとして `f16_arith_dispatches=40`／`f16_arith_guard_fallbacks=0`
+という `gpu_scaling_stats:` 行のカウンタを引用していたが、このカウンタは
+`f16_stats_before`/`f16_stats_after`（`gpu_scaling_bench.rs`）が
+`measure_shader_ab` 呼び出し**より前**の自動選択経路（同一規模点の
+`gpu_scaling:` 計測、§8.2 と同種の呼び出し）を挟んで差分取得したもので
+あり、本節の強制 A/B（`measure_shader_ab` 内の 2 回の `batch_search_
+with_options_for_tests` 呼び出し）の dispatch 数ではない。強制 A/B 自体の
+dispatch 数を数えるカウンタは現状実装されていないため、上記の成功／
+エラー契約による証跡のみを根拠とする）。
+
+min-of-5／median（μs）:
+
+| 条件 | p50 min | p50 median | p95 min | p95 median |
+| --- | --- | --- | --- | --- |
+| unpack 版（強制） | 586 | 599 | 594 | 663 |
+| f16 算術版（強制） | 586 | 599 | 593 | 605 |
+
+p50 の min・median はいずれも完全に同水準（min 一致・median 差 0µs）。
+p95 は f16 算術版側がやや低いが、run 5（負荷変動が観測された run。
+loadavg・GPU クロックは他 run と同水準のため GPU 側以外のノイズ要因の
+可能性が高い）が両条件の p95 を押し上げている外れ値であり、本サンプル数
+（N=5）では一貫した方向のシグナルとまでは言えない。`docs/design/
+benchmark-judgement-policy.md` §5 のとおり共有 QEMU 環境の数値は参考値で
+あり、採否根拠にはしない。専有環境での再実測は運用者作業として申し送る。
+
+**結論（8.3.2 の再解釈）**: 8.3.2 の `gpu_f16_p95`（min-of-5）は p95 の
+分位点の値であり、本節と比較する場合は同じ分位点（p95 min: unpack 版
+594µs・f16 算術版 593µs）を対応させる必要がある（p50 min の 586µs／586µs
+ではない。**訂正（codex-review P2 指摘・PR #611）**: 旧版は誤って p50 min
+を挙げ「完全一致」としていた）。p95 min 同士で比べると 8.3.2 の差（unpack
+版 min 648µs vs f16 算術版 min 743µs）は本節（594µs vs 593µs・ほぼ同水準）
+まで大きく縮小するが、8.3.2 と本節は計測環境（プロセス起動タイミング・
+共有 QEMU VM の負荷状況）自体も異なるため、この差の縮小を「クエリの違い」
+（f16 厳密往復済みクエリは丸め処理で成分の分布が変わる）だけに帰属できる
+かは未確定として記録する（シェーダ単体の効果ではなかったと断定はしない）。
+
+#### 8.3.2 旧比較（`QUERY_F16_EXACT` opt-in 単独。クエリが交絡した参考値・保存のため残置）
+
+単一プロセス内 A/B、rows=20,000・dim=128・batch=8・交互 5 ペア。
+`docs/design/benchmark-judgement-policy.md` §5 のとおり、共有 QEMU VM
+（loadavg 7〜8・他 worktree 3 本並走）での数値は参考値であり採否根拠には
+しない。`gpu_f16_p95`（GPU f16 常駐経路。B 経路）の min-of-5／median：
+
+| 条件 | min | median | max |
+| --- | --- | --- | --- |
+| unpack 版（`QUERY_F16_EXACT` 未設定） | 648µs | 958µs | 1084µs |
+| f16 算術版（`QUERY_F16_EXACT=1`） | 743µs | 1005µs | 3313µs |
+
+**注意（codex-review 指摘・§8.3.1 参照）**: 上記 2 条件はシェーダの違いに
+加えてクエリ集合そのものも異なる（交絡）ため、この差をシェーダ単体の
+効果として解釈しない。§8.3.1 の交絡排除後の比較を正式な判断材料とする。
+本節は履歴として残置する。
+
+### 8.4 申し送り
+
+- CORE-16 ゲート・規模点診断 fixture（`build_scaled_gate_dataset`）を
+  f16 厳密往復可能なクエリへ変更するか否かはゲート意味論の変更＝
+  spec／オーナー判断（§7 と同じ理由で本 Issue は現状維持のまま記録に
+  留める）
+- 専有環境（`BENCH_DEDICATED_ENV=1`）・Apple GPU（Metal）での再実測は
+  運用者作業
+- `mismatch` がまれに 1 になる run を観測した（境界同点許容つき比較の
+  ノイズ。本 Issue で変更した比較ロジックはなく、`count_boundary_
+  tolerant_mismatches` 自体は無変更）。継続監視は既存 Recall 系のスコープ

@@ -60,9 +60,10 @@ use harness::env_report::EnvReport;
 use harness::gpu_scaling::{
     count_boundary_tolerant_mismatches, format_i8_unavailable_line, format_skip_line,
     format_unavailable_line, mean_recall_at_k, parse_batches, parse_dims, parse_i8_oversample,
-    parse_measured_iterations, parse_rows, parse_top_k, read_env_var, readback_bytes_per_call,
-    rescored_candidates_per_call, speedup_ratio, GpuScalingI8Result, GpuScalingI8StatsLine,
-    GpuScalingResult, GpuScalingStatsLine,
+    parse_measured_iterations, parse_query_f16_exact, parse_rows, parse_shader_ab, parse_top_k,
+    read_env_var, readback_bytes_per_call, rescored_candidates_per_call, round_to_f16_exact,
+    speedup_ratio, GpuScalingI8Result, GpuScalingI8StatsLine, GpuScalingResult,
+    GpuScalingStatsLine,
 };
 use harness::protocol::{run_fallible, MeasurementConfig, TrialFailure};
 use harness::rng::DeterministicRng;
@@ -76,6 +77,8 @@ use engine::gpu_batch::packed_i8::{
     GpuI8BatchBackend, GpuI8Options, DEFAULT_I8_OVERSAMPLE, MAX_I8_OVERSAMPLE,
 };
 use engine::gpu_batch::{GpuBatchBackend, GpuF32ContrastBackend};
+#[cfg(feature = "bench-internals")]
+use engine::gpu_batch::{GpuDotShaderKind, GpuSearchTestOptions};
 use engine::kernel::SearchHit;
 use engine::policy::PolicyContext;
 use engine::storage::Visibility;
@@ -201,6 +204,17 @@ struct ScalingConfig {
     /// `GpuI8Options::oversample` は構築時固定のためプロセス内スイープしない
     /// ——`gpu_scaling_bench.rs` モジュール冒頭コメント「経路 D」参照）。
     i8_oversample: usize,
+    /// `BENCH_GPU_SCALING_QUERY_F16_EXACT`（Issue #540。
+    /// `harness::gpu_scaling::parse_query_f16_exact` doc 参照）。
+    query_f16_exact: bool,
+    /// `BENCH_GPU_SCALING_SHADER_AB`（Issue #540 追記・codex-review P2 指摘
+    /// 対応・PR #611。`harness::gpu_scaling::parse_shader_ab` doc 参照。
+    /// `bench-internals` feature 必須・`query_f16_exact` 同時指定必須——
+    /// `load_config` が fail-closed に検証する）。`bench-internals` 非有効時は
+    /// 読み出し先（`main` の `#[cfg(feature = "bench-internals")]` 分岐）が
+    /// 存在しないため `#[allow(dead_code)]`（`mod harness;` と同方針）。
+    #[allow(dead_code)]
+    shader_ab: bool,
 }
 
 fn load_config() -> Result<ScalingConfig, String> {
@@ -211,6 +225,9 @@ fn load_config() -> Result<ScalingConfig, String> {
     let iters_raw = read_env_var("BENCH_GPU_SCALING_ITERS").map_err(|e| e.to_string())?;
     let i8_oversample_raw =
         read_env_var("BENCH_GPU_SCALING_I8_OVERSAMPLE").map_err(|e| e.to_string())?;
+    let query_f16_exact_raw =
+        read_env_var("BENCH_GPU_SCALING_QUERY_F16_EXACT").map_err(|e| e.to_string())?;
+    let shader_ab_raw = read_env_var("BENCH_GPU_SCALING_SHADER_AB").map_err(|e| e.to_string())?;
 
     let rows = parse_rows(rows_raw.as_deref(), &DEFAULT_ROWS).map_err(|e| e.to_string())?;
     let dims = parse_dims(dims_raw.as_deref(), &DEFAULT_DIMS).map_err(|e| e.to_string())?;
@@ -225,6 +242,31 @@ fn load_config() -> Result<ScalingConfig, String> {
         MAX_I8_OVERSAMPLE,
     )
     .map_err(|e| e.to_string())?;
+    let query_f16_exact =
+        parse_query_f16_exact(query_f16_exact_raw.as_deref()).map_err(|e| e.to_string())?;
+    let shader_ab = parse_shader_ab(shader_ab_raw.as_deref()).map_err(|e| e.to_string())?;
+    if shader_ab {
+        // fail-closed（Issue #540 追記）: シェーダ強制 `F16Arith` は
+        // `select_dot_shader` の条件 5（クエリが f16 厳密往復不能なら拒否）を
+        // 経由するため、`query_f16_exact` なしで `shader_ab` だけを有効化すると
+        // 必ず実行時エラーになる。起動直後に明示的に拒否する。
+        if !query_f16_exact {
+            return Err(
+                "BENCH_GPU_SCALING_SHADER_AB=1 requires BENCH_GPU_SCALING_QUERY_F16_EXACT=1 \
+                 (forcing the f16 arith shader on non-exact queries always fails the \
+                 select_dot_shader overflow guard)"
+                    .to_string(),
+            );
+        }
+        #[cfg(not(feature = "bench-internals"))]
+        {
+            return Err(
+                "BENCH_GPU_SCALING_SHADER_AB=1 requires the bench-internals feature \
+                 (cargo bench --bench gpu_scaling_bench --features bench-internals)"
+                    .to_string(),
+            );
+        }
+    }
 
     Ok(ScalingConfig {
         rows,
@@ -233,6 +275,8 @@ fn load_config() -> Result<ScalingConfig, String> {
         top_k,
         measured_iterations,
         i8_oversample,
+        query_f16_exact,
+        shader_ab,
     })
 }
 
@@ -537,6 +581,91 @@ fn measure_i8_scaling_point(
     }
 }
 
+/// 同一クエリでの S0 シェーダ単体比較（Issue #540 追記・codex-review P2
+/// 指摘対応・PR #611）。`BENCH_GPU_SCALING_SHADER_AB=1`（`bench-internals`
+/// feature 必須・`config.query_f16_exact` 併用必須）のときのみ `main` から
+/// 呼ばれる。`queries` は呼び出し元が既に [`round_to_f16_exact`] で丸め済み
+/// （`config.query_f16_exact`）であることを前提とし、この関数自体は丸めを
+/// 行わない——`GpuSearchTestOptions::dot_shader` で `Unpack`／`F16Arith` を
+/// 強制する以外、`gpu_scaling: `（既存の自動選択計測）と同一のクエリ・
+/// 同一の `gpu_f16`（`GpuBatchBackend`）インスタンスを使うことで、変動要因を
+/// シェーダ選択のみに限定する。`F16Arith` 強制は `select_dot_shader` の
+/// 条件不成立時に `Err` を返す fail-closed 契約（`GpuSearchTestOptions::
+/// dot_shader` doc 参照）のため、クエリが実際に f16 算術版シェーダへ到達した
+/// ことの証跡にもなる。
+#[cfg(feature = "bench-internals")]
+#[allow(clippy::too_many_arguments)]
+fn measure_shader_ab(
+    gpu_f16: &GpuBatchBackend,
+    queries: &[BatchQuery<'_>],
+    rows: usize,
+    dim: usize,
+    batch: usize,
+    k: usize,
+    measured_iterations: u32,
+    seed: u64,
+) -> Result<String, String> {
+    let measure_config = MeasurementConfig::new(WARMUP_ITERATIONS, measured_iterations, seed)
+        .map_err(|e| format!("shader_ab measurement config invalid: {e}"))?;
+
+    fn fatal<E>(_: &E) -> TrialFailure {
+        TrialFailure::Fatal
+    }
+
+    let unpack_options = GpuSearchTestOptions {
+        // `GpuBatchBackend::batch_search`（既定 trait 実装）と同じ既定予算
+        // （`gpu_batch.rs::GPU_SCORE_BUFFER_BUDGET_BYTES`。非 pub 定数のため
+        // `tests/gpu_batch.rs` と同じくリテラルで複製する）。
+        budget_bytes: 32 * 1024 * 1024,
+        force_full_readback: false,
+        dot_shader: Some(GpuDotShaderKind::Unpack),
+    };
+    let unpack_measurement = run_fallible(
+        &measure_config,
+        0,
+        || gpu_f16.batch_search_with_options_for_tests(queries, unpack_options),
+        fatal,
+    )
+    .map(|m| m.measurement)
+    .map_err(|e| format!("shader_ab unpack measurement failed: {e}"))?;
+
+    let f16_arith_options = GpuSearchTestOptions {
+        // `GpuBatchBackend::batch_search`（既定 trait 実装）と同じ既定予算
+        // （`gpu_batch.rs::GPU_SCORE_BUFFER_BUDGET_BYTES`。非 pub 定数のため
+        // `tests/gpu_batch.rs` と同じくリテラルで複製する）。
+        budget_bytes: 32 * 1024 * 1024,
+        force_full_readback: false,
+        dot_shader: Some(GpuDotShaderKind::F16Arith),
+    };
+    let f16_arith_measurement = run_fallible(
+        &measure_config,
+        0,
+        || gpu_f16.batch_search_with_options_for_tests(queries, f16_arith_options),
+        fatal,
+    )
+    .map(|m| m.measurement)
+    .map_err(|e| {
+        format!(
+            "shader_ab f16_arith measurement failed (forced f16 arith shader was rejected \
+             — queries may not be f16-exact; requires BENCH_GPU_SCALING_QUERY_F16_EXACT=1): {e}"
+        )
+    })?;
+
+    let unpack_p95 = p95_from_samples(&unpack_measurement.samples)
+        .map_err(|e| format!("shader_ab unpack p95 unavailable: {e}"))?;
+    let f16_arith_p95 = p95_from_samples(&f16_arith_measurement.samples)
+        .map_err(|e| format!("shader_ab f16_arith p95 unavailable: {e}"))?;
+
+    Ok(format!(
+        "gpu_scaling_shader_ab: rows={rows} dim={dim} batch={batch} k={k} \
+         unpack_p50={}us unpack_p95={}us f16_arith_p50={}us f16_arith_p95={}us",
+        unpack_measurement.summary.median.as_micros(),
+        unpack_p95.as_micros(),
+        f16_arith_measurement.summary.median.as_micros(),
+        f16_arith_p95.as_micros(),
+    ))
+}
+
 fn main() {
     let config = match load_config() {
         Ok(c) => c,
@@ -646,13 +775,25 @@ fn main() {
                     }
                 }
 
-                let dataset = match build_dataset(&mut rng, rows, dim, batch) {
+                let mut dataset = match build_dataset(&mut rng, rows, dim, batch) {
                     Ok(d) => d,
                     Err(msg) => {
                         println!("{}", format_skip_line(rows, dim, batch, k, &msg));
                         continue;
                     }
                 };
+                // Issue #540: opt-in 時のみクエリ成分を f16 厳密往復可能な値へ
+                // 丸め、`select_dot_shader` の条件 5（クエリの f16 精度損失）で
+                // 常駐行 B が unpack 版へ縮退しないようにする。常駐行そのもの
+                // （`dataset.vectors`）は既に f16 パック常駐（`ResidentMatrix`）
+                // 経由で量子化済みのため丸め不要——ここで丸めるのはクエリのみ。
+                if config.query_f16_exact {
+                    for q in &mut dataset.queries {
+                        for v in q.iter_mut() {
+                            *v = round_to_f16_exact(*v);
+                        }
+                    }
+                }
 
                 let cpu_matrix = match ResidentMatrix::build(
                     &dataset.ids,
@@ -926,6 +1067,34 @@ fn main() {
                     mismatch,
                 };
                 println!("{result}");
+
+                // Issue #540 追記（codex-review P2 指摘対応・PR #611）:
+                // 同一クエリでの S0 シェーダ単体比較（交絡排除）。
+                // `config.shader_ab` は `load_config` が
+                // `config.query_f16_exact` 併用・`bench-internals` feature を
+                // fail-closed に強制済みのため、ここでは opt-in の有無だけを
+                // 見ればよい。
+                #[cfg(feature = "bench-internals")]
+                if config.shader_ab {
+                    match measure_shader_ab(
+                        &gpu_f16,
+                        &queries,
+                        rows,
+                        dim,
+                        batch,
+                        k,
+                        config.measured_iterations,
+                        seed,
+                    ) {
+                        Ok(line) => println!("{line}"),
+                        Err(msg) => {
+                            println!(
+                                "{}",
+                                format_unavailable_line(Some((rows, dim, batch, k)), &msg)
+                            )
+                        }
+                    }
+                }
 
                 // `calls` は `run_fallible` の戻り値を経由せず定数計算する
                 // （上記コメント参照）。`saturating_sub` はカウンタが同一

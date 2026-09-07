@@ -1,0 +1,16 @@
+# Issue #540 追記（codex-review P2 指摘対応・PR #611）: 同一クエリでの S0 シェーダ
+# 単体比較（BENCH_GPU_SCALING_SHADER_AB=1・BENCH_GPU_SCALING_QUERY_F16_EXACT=1）。
+# per-run 生データ（docs/design/benchmark-judgement-policy.md §3）。
+# 計測対象コミット: 212198d
+# 計測条件: rows=20000 dim=128 batch=8 k=10 iters=20 (warmup=20)
+# 環境: NVIDIA GeForce RTX 3060 (Vulkan backend)・共有 QEMU VM（他 worktree 並走）
+# CPU: QEMU Virtual CPU version 2.5+ (lscpu Model name)・logical_cpus=12・isa=Avx2Fma
+# 単一プロセス内で unpack 版 → f16 算術版の順に交互計測（同一 gpu_f16 インスタンス・
+# 同一クエリ集合。GpuSearchTestOptions::dot_shader による強制のみが変動要因）。
+# 5 run を逐次起動（各 run は新規プロセス）。
+run	loadavg_1min	gpu_clock_mhz	gpu_temp_c	unpack_p50_us	unpack_p95_us	f16_arith_p50_us	f16_arith_p95_us	f16_arith_dispatches	f16_arith_guard_fallbacks
+1	10.63	210	48	586	594	586	593	40	0
+2	10.02	1792	50	597	612	599	605	40	0
+3	10.02	1792	50	605	663	599	636	40	0
+4	10.02	1792	51	599	698	594	601	40	0
+5	10.02	1792	50	672	886	810	873	40	0
