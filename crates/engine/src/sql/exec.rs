@@ -1602,8 +1602,9 @@ fn decode_deferred_scalars(
 /// 行を `(tenant_id, id)` の複合キーで再取得し、metadata を
 /// [`decode_deferred_scalars`] へ渡す。TABLE-12 のキー/ヘッダ tenant 整合検査
 /// （`storage::verify_row_key_tenant`）をここで行う——候補選択のアリーナ構築経路
-/// （`arena.rs`）はこの照合を行わないため、遅延投影の再取得側で defense-in-depth
-/// として追加する（受け入れ条件 2「現状どおり維持」を弱めず、むしろ強化する）。
+/// （`arena.rs`）は可視行を格納する時点で同じ検査により整合性を保証しているが、
+/// 遅延投影の再取得側でも defense-in-depth として独立に再検査する（受け入れ条件 2
+/// 「現状どおり維持」を弱めず、むしろ強化する）。
 /// 行欠落・デコード失敗・tenant 不整合はいずれも当該行を黙ってスキップせず
 /// `SqlSurfaceError::Internal`（固定文言。テナント・id を含めない）として
 /// クエリ全体を fail-closed に拒否する。

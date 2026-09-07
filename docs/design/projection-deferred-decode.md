@@ -42,9 +42,10 @@ metadata バイト列を 2 通りの経路で取得する:
 | キャッシュヒット | `SqlArenaSnapshot::metadata()[slot]`（`arena()` とスロット添字が 1 対 1） |
 | キャッシュミス／`arena_cache == None` | 候補選択と同一 `read_txn` 上で行テーブルを再度開き、`(tenant_id, id)` の複合キーで再取得 |
 
-redb 再取得経路では `storage::verify_row_key_tenant` によるキー/ヘッダ tenant
-整合検査（TABLE-12）を追加で行う（候補選択のアリーナ構築経路は現状この照合を
-行っていないため、遅延投影の再取得側で defense-in-depth として強化する）。
+候補選択のアリーナ構築経路（`arena.rs`）は可視行を格納する時点で
+`storage::verify_row_key_tenant` によりキー/ヘッダ tenant 整合（TABLE-12）を
+保証しており、redb 再取得経路（本節）では同じ検査を再度行う（defense-in-depth。
+アリーナ構築後に物理データが変化しても再取得結果の整合を独立に確認できる）。
 
 ## 契約上の注記
 
