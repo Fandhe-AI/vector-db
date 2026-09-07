@@ -2990,4 +2990,132 @@ mod tests {
             "ANN 経路（索引探索・縮退なし）が復帰していることを固定する"
         );
     }
+
+    /// [`prepare_subset`] の早期打ち切り（Issue #488）を、統合テスト
+    /// （`crates/engine/tests/hnsw_cache.rs` の
+    /// `full_scan_ratio_plain_scan_below_ratio_subset_shape_matches_brute_force_and_never_leaks_across_tenants`）
+    /// が観測する `subset_searches == 0` とは別の経路で直接固定する
+    /// （codex-review P2 指摘対応・PR #606）。
+    ///
+    /// `subset_searches == 0` は `Overlay::compute` を経由する旧来のフォール
+    /// バック（`prepare_subset` に早期打ち切りを実装せず、`Overlay::compute`
+    /// → `below_full_scan_ratio` 判定 → `search_with_overlay` 内で plain scan
+    /// を選ぶ経路）でも成立してしまい、`plain_scans > 0` と組み合わせても
+    /// 「`Overlay::compute` そのものを省略した」ことの証拠にはならない。本
+    /// テストは `prepare_subset` の戻り値（[`PreparedHnswSearch`]）を
+    /// `matches!` で直接検査し、早期打ち切り固有の分岐（`Overlay::compute`
+    /// 呼び出し前に確定する `PlainScanBelowRatio`）を実際に踏んだことを
+    /// 固定する。対称条件（比が `full_scan_ratio` 以上）では同じ関数が
+    /// `Overlay::compute` を経由する `Indexed` を返すことも併せて確認し、
+    /// 分岐が比の大小に応じて実際に切り替わっていることを示す（早期打ち切り
+    /// が常に発火する実装の誤りではないことの検査）。
+    #[test]
+    fn prepare_subset_returns_plain_scan_below_ratio_directly_without_computing_overlay() {
+        let path = unique_db_path("hnsw-cache-prepare-subset-early-cutoff");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+
+        // 索引済みベース（20 ノード）を用意する。`prepare_subset` は
+        // `Lookup::Miss` では常に `FullScan` へ縮退する契約（§`prepare_subset`
+        // ドキュメンテーションコメント「2.」）のため、`IndexedBase::build` で
+        // 直接構築してキャッシュへ登録し（`MIN_INDEXED_ROWS` は
+        // `prepare_full_visible` 側の下限であり、ここでは無関係）、
+        // `prepare_subset` からは常に `Lookup::Ready`／`NeedOverlay` として
+        // 見える状態にする。
+        const N: u64 = 20;
+        let embeddings: Vec<[f32; 4]> = (0..N).map(|i| [i as f32, 0.0, 0.0, 0.0]).collect();
+        let rows: Vec<(u64, RowInput<'_>)> = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                (
+                    i as u64,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: e.as_slice(),
+                        metadata: &[],
+                    },
+                )
+            })
+            .collect();
+        let op_id = crate::recovery::required_op_id::OperationId::parse(
+            "hnsw-cache-prepare-subset-early-cutoff",
+        )
+        .expect("valid operation_id");
+        crate::tenant::insert_rows(&storage, "docs", &c, &rows, &op_id).expect("bulk insert");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let full_arena = build_arena(&read_txn, "docs", &c);
+        assert_eq!(full_arena.len(), N as usize);
+        let built = IndexedBase::build(
+            &full_arena,
+            crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
+            c.clone(),
+            gen,
+        )
+        .expect("build base")
+        .0;
+        assert_eq!(built.index.len(), N as usize);
+        cache.record_base(&storage, "docs", built);
+
+        // `full_scan_ratio` を 60/100 に固定する。`tag` 列は無いためスカラー
+        // フィルタは `on_visible_row` の細工で模擬する（`prepare_subset` は
+        // 渡されたアリーナが WHERE 適用後の部分集合であることだけを前提に
+        // しており、実際のスカラーフィルタ経路を通す必要はない）。
+        let ratio = Ratio {
+            numerator: 60,
+            denominator: 100,
+        };
+        let params = crate::hnsw::ValidatedHnswParams::new(crate::hnsw::HnswParams::default())
+            .expect("valid hnsw params")
+            .with_full_scan_ratio(ratio)
+            .expect("valid full_scan_ratio");
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(params),
+        };
+
+        // 5/20 = 0.25 < 0.6: 早期打ち切り分岐を踏むはずの部分集合アリーナ
+        // （`Overlay::compute` を経由せず `PlainScanBelowRatio` を直接返す）。
+        let below_arena = VectorArena::build_filtered_with_rows_in_txn(
+            &read_txn,
+            "docs",
+            crate::rls::ImplicitRlsHook::new(&c).predicate(),
+            |_, id, _, _| Ok(id < 5),
+        )
+        .expect("build below-ratio subset arena");
+        assert_eq!(below_arena.len(), 5);
+        let below_prepared = prepare_subset(&access, &read_txn, "docs", &c, &below_arena);
+        assert!(
+            matches!(below_prepared, PreparedHnswSearch::PlainScanBelowRatio),
+            "arena.len() / index.len() = 0.25 < full_scan_ratio = 0.6 は \
+             Overlay::compute を経由せず PlainScanBelowRatio を直接返すはず"
+        );
+
+        // 19/20 = 0.95 >= 0.6: 対称条件（早期打ち切りを踏まない）。同じ
+        // `prepare_subset` が `Overlay::compute` を経由する `Indexed` を返す
+        // ことを確認し、分岐が比の大小に応じて実際に切り替わっていることを
+        // 示す。
+        let above_arena = VectorArena::build_filtered_with_rows_in_txn(
+            &read_txn,
+            "docs",
+            crate::rls::ImplicitRlsHook::new(&c).predicate(),
+            |_, id, _, _| Ok(id < 19),
+        )
+        .expect("build at-or-above-ratio subset arena");
+        assert_eq!(above_arena.len(), 19);
+        let above_prepared = prepare_subset(&access, &read_txn, "docs", &c, &above_arena);
+        assert!(
+            matches!(above_prepared, PreparedHnswSearch::Indexed { .. }),
+            "arena.len() / index.len() = 0.95 >= full_scan_ratio = 0.6 では \
+             早期打ち切りを踏まず Overlay::compute 経由の Indexed を返すはず"
+        );
+    }
 }
