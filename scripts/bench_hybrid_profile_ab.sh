@@ -19,9 +19,18 @@
 #   scripts/bench_hybrid_profile_ab.sh --summarize target/bench-hybrid-profile-ab/<ts>
 #
 # env:
-#   BEFORE_BIN, AFTER_BIN   計測対象バイナリの絶対パス（必須。実行可能ファイル）
-#   AB_PAIRS                条件あたりの交互ペア数（既定 5・正整数）
-#   AB_ROUNDS               各実行に渡す BENCH_HYBRID_PROFILE_ROUNDS（既定 5）
+#   BEFORE_BIN, AFTER_BIN     計測対象バイナリの絶対パス（必須。実行可能ファイル）
+#   BEFORE_COMMIT, AFTER_COMMIT
+#                             計測対象バイナリをビルドしたコミットの hash（必須。
+#                             `docs/design/benchmark-judgement-policy.md` §3 が
+#                             before/after 双方のコミット hash の記録を要求する。
+#                             バイナリのパスだけでは退避先が更新されると比較対象を
+#                             追跡できないため、呼び出し側にビルド時点の hash を
+#                             明示させる）
+#   AB_PAIRS                  条件あたりの交互ペア数（既定 5。`docs/design/
+#                             benchmark-judgement-policy.md` §3 の下限 5 ペア
+#                             未満は拒否）
+#   AB_ROUNDS                 各実行に渡す BENCH_HYBRID_PROFILE_ROUNDS（既定 5）
 #
 # 手動専用ベンチのドライバであり、`.github/workflows/*` から呼ばれることは
 # ない（`refuse_under_github_actions` と同じ方針で GITHUB_ACTIONS 下は拒否）。
@@ -36,20 +45,41 @@ if [ "${GITHUB_ACTIONS:-}" != "" ]; then
     fail "refused while running under GitHub Actions (GITHUB_ACTIONS is set); this driver is local-only, matching hybrid_profile_bench's own GITHUB_ACTIONS refusal"
 fi
 
+# 条件: N=25,000/100,000 × 可視率 1/1・1/10（Issue #547 の 4 条件）。
+# --summarize のファイル走査順を実行順（この配列の並び）と一致させるため、
+# ドライバ本体・--summarize の双方がこの変数を単一情報源として使う。
+conditions="25000:1 25000:10 100000:1 100000:10"
+
 if [ "${1:-}" = "--summarize" ]; then
     dir="${2:-}"
     [ -n "$dir" ] || fail "--summarize requires a directory argument"
     [ -d "$dir" ] || fail "not a directory: $dir"
     echo "=== baseline_round_raw / baseline_summary / reference_band lines under $dir ==="
-    # grep -h: ファイル名を出さず内容だけ。複数ファイルを横断して眺めるための
-    # 集約専用モードであり、判定（pass/fail）はここでは行わない。
-    grep -h -E 'baseline_round_raw|baseline_summary|baseline reference_band|^hybrid_profile: rows=' "$dir"/*.log 2>/dev/null \
-        || fail "no matching log lines found under $dir"
+    found=0
+    # 条件→ペア→before/after の実行順を明示的に辿る（shell glob の辞書順
+    # `*.log` 展開だと "ratio1of10" が "ratio1of1" より前に来て実行順と逆転し、
+    # before/after・ペア番号の対応を取り違えやすい。codex-review 指摘）。
+    # grep -H: ファイル名を出す。ファイル名に条件・ペア・side が埋め込まれて
+    # いるため、before/after とペア番号の対応を summary 出力だけで追える。
+    for cond in $conditions; do
+        rows="${cond%%:*}"
+        denom="${cond##*:}"
+        cond_label="rows${rows}_ratio1of${denom}"
+        for pair_file in "$dir/${cond_label}"_pair*_before.log "$dir/${cond_label}"_pair*_after.log; do
+            [ -e "$pair_file" ] || continue
+            if grep -H -E 'baseline_round_raw|baseline_summary|baseline reference_band|^hybrid_profile: rows=' "$pair_file"; then
+                found=1
+            fi
+        done
+    done
+    [ "$found" -eq 1 ] || fail "no matching log lines found under $dir"
     exit 0
 fi
 
 : "${BEFORE_BIN:?BEFORE_BIN must be set to the before binary absolute path}"
 : "${AFTER_BIN:?AFTER_BIN must be set to the after binary absolute path}"
+: "${BEFORE_COMMIT:?BEFORE_COMMIT must be set to the commit hash the before binary was built from (docs/design/benchmark-judgement-policy.md §3)}"
+: "${AFTER_COMMIT:?AFTER_COMMIT must be set to the commit hash the after binary was built from (docs/design/benchmark-judgement-policy.md §3)}"
 [ -x "$BEFORE_BIN" ] || fail "BEFORE_BIN is not an executable file: $BEFORE_BIN"
 [ -x "$AFTER_BIN" ] || fail "AFTER_BIN is not an executable file: $AFTER_BIN"
 
@@ -66,6 +96,16 @@ AB_PAIRS="${AB_PAIRS:-5}"
 AB_ROUNDS="${AB_ROUNDS:-5}"
 validate_positive_int "$AB_PAIRS" "AB_PAIRS"
 validate_positive_int "$AB_ROUNDS" "AB_ROUNDS"
+# `docs/design/benchmark-judgement-policy.md` §3: 新規計測は N >= 5 ペアを
+# 必須とする（3 ペア〔#401〕・4 ペア〔#366〕はいずれも下限未満で不可）。
+[ "$AB_PAIRS" -ge 5 ] || fail "AB_PAIRS must be >= 5 per docs/design/benchmark-judgement-policy.md §3 (got $AB_PAIRS)"
+# hybrid_profile_bench 自身（harness::scan_stage_profile::parse_rounds）が
+# BENCH_HYBRID_PROFILE_ROUNDS を 5..=50 でしか受理しないため、範囲外の値を
+# ここで早期に拒否する（Bugbot 指摘。従来は正整数チェックのみで 1〜4 でも
+# スクリプトは起動してしまい、実行時に各 run が個別に fail-closed していた）。
+if [ "$AB_ROUNDS" -lt 5 ] || [ "$AB_ROUNDS" -gt 50 ]; then
+    fail "AB_ROUNDS must be in 5..=50 (hybrid_profile_bench's own BENCH_HYBRID_PROFILE_ROUNDS bound; got $AB_ROUNDS)"
+fi
 
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
 out_dir="target/bench-hybrid-profile-ab/${ts}"
@@ -75,6 +115,8 @@ mkdir -p "$out_dir"
     echo "timestamp_utc=$ts"
     echo "before_bin=$BEFORE_BIN"
     echo "after_bin=$AFTER_BIN"
+    echo "before_commit=$BEFORE_COMMIT"
+    echo "after_commit=$AFTER_COMMIT"
     echo "ab_pairs=$AB_PAIRS"
     echo "ab_rounds=$AB_ROUNDS"
     echo "nproc=$(nproc 2>/dev/null || echo unknown)"
@@ -83,9 +125,6 @@ mkdir -p "$out_dir"
     echo "bench_dedicated_env=${BENCH_DEDICATED_ENV:-unset}"
 } > "$out_dir/env.txt"
 echo "bench_hybrid_profile_ab: environment recorded at $out_dir/env.txt"
-
-# 条件: N=25,000/100,000 × 可視率 1/1・1/10（Issue #547 の 4 条件）。
-conditions="25000:1 25000:10 100000:1 100000:10"
 
 for cond in $conditions; do
     rows="${cond%%:*}"

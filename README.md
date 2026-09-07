@@ -234,10 +234,14 @@ Issue #547 で行数・可視率を opt-in 可変化しました。
 直接検証する経路）。#546（`SparseIndex::score_by_postings` のスコア
 アキュムレータ再利用）の前後比較は `scripts/bench_hybrid_profile_ab.sh`
 （`make bench-hybrid-profile-ab`）で行います。`BEFORE_BIN`／`AFTER_BIN` に
-退避済みバイナリの絶対パスを、`AB_PAIRS`（既定 5）・`AB_ROUNDS`（既定 5）で
+退避済みバイナリの絶対パス、`BEFORE_COMMIT`／`AFTER_COMMIT` にビルド元コミット
+の hash を指定し（`docs/design/benchmark-judgement-policy.md` §3 が要求する
+前後比較の追跡可能性のため必須）、`AB_PAIRS`（既定 5・5 未満は拒否）・
+`AB_ROUNDS`（既定 5・hybrid_profile_bench 自身の受理範囲 5..=50 の外は拒否）で
 交互ペア数・ラウンド数を指定し、N=25,000／100,000 × 可視率 1/1・1/10 の
 4 条件を before→after の順で交互実行します。`--summarize <dir>` で
-`baseline_round_raw`／`baseline_summary`／`reference_band` 行を一覧表示できます。
+`baseline_round_raw`／`baseline_summary`／`reference_band` 行を条件・ペア・
+before/after の実行順に沿ってファイル名付きで一覧表示できます。
 前後比較の実測結果は `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #547」
 節を参照してください。
 

@@ -336,7 +336,7 @@ else
 endif
 
 .PHONY: bench-hybrid-profile-ab
-bench-hybrid-profile-ab: ## Issue #547: #546（スコアアキュムレータ再利用）の前後比較を N=25k/100k・可視率 1/1・1/10 の 4 条件で交互 min-of-N 計測する（BEFORE_BIN・AFTER_BIN に退避済みバイナリの絶対パスを指定。AB_PAIRS・AB_ROUNDS で交互ペア数・ラウンド数を指定可。手動実行専用・CI 非配線。scripts/bench_hybrid_profile_ab.sh 参照）
+bench-hybrid-profile-ab: ## Issue #547: #546（スコアアキュムレータ再利用）の前後比較を N=25k/100k・可視率 1/1・1/10 の 4 条件で交互 min-of-N 計測する（BEFORE_BIN・AFTER_BIN に退避済みバイナリの絶対パス、BEFORE_COMMIT・AFTER_COMMIT にビルド元コミットの hash を指定。AB_PAIRS（既定 5・5 未満は拒否）・AB_ROUNDS（既定 5・5..=50）で交互ペア数・ラウンド数を指定可。手動実行専用・CI 非配線。scripts/bench_hybrid_profile_ab.sh 参照）
 ifdef HAS_CARGO
 	scripts/bench_hybrid_profile_ab.sh
 else

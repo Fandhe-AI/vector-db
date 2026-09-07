@@ -884,9 +884,13 @@ fn main() {
     let b7_precomputed: Vec<(Vec<CandidateHit>, Vec<ScoredDoc>)> = queries
         .iter()
         .map(|q| {
+            // 可視部分集合（`visible_ids`/`visible_vectors`）を使う。B4
+            // （`hybrid_search_cached_index`）と同じ候補集合を密側へ渡さないと、
+            // B7 が可視率縮小時に B4 より広い母集団から Top-`pool_depth` を
+            // 拾ってしまい、対比対象として不整合になる（codex-review 指摘）。
             let input = SearchInput {
-                ids: &corpus.ids,
-                vectors: &corpus.vectors,
+                ids: &visible_ids,
+                vectors: &visible_vectors,
                 dim: corpus.dim,
                 query: &q.vector,
                 k: pool_depth,
@@ -950,9 +954,15 @@ fn main() {
                  sql={b1_ids:?} direct={b4_ids:?}"
             ));
         }
-        if b1_ids.len() != TOP_K {
+        // 可視件数が TOP_K 未満の設定（`BENCH_HYBRID_PROFILE_VISIBLE_RATIO` で
+        // 小規模コーパス×高い分母を指定した場合。公開されている入力範囲内）では
+        // 返る行数が可視件数で頭打ちになるのが正当であり、常に TOP_K ちょうどを
+        // 要求すると到達可能な入力で必ず fail-closed してしまう（codex-review
+        // 指摘）。期待値は `TOP_K` と可視件数の小さい方とする。
+        let expected_hits = TOP_K.min(visible.len());
+        if b1_ids.len() != expected_hits {
             fail_closed(format!(
-                "B1/B4 fidelity: expected {TOP_K} ids, got {}",
+                "B1/B4 fidelity: expected {expected_hits} ids, got {}",
                 b1_ids.len()
             ));
         }
