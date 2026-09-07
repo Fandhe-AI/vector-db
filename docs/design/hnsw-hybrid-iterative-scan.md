@@ -747,3 +747,152 @@ pgvector（PostgreSQL License）の `hnsw.iterative_scan` は上流 README で
 | untrusted 入力 | `k`／`fetch_k` の検証順序（`MAX_EF` 検証 → `effective_ef`）を変更しない。`unwrap`／`expect`／添字アクセスを production コードに持ち込まない方針を #505 の実装制約として明記する |
 | 脆弱な依存 | 依存追加なし（`Mutex` は標準ライブラリ） |
 | private spec 漏えい（P0） | 本節・関連コミット・PR は TASK-nn／ビヘイビア ID のポインタ表記のみ。Issue 本文の逐語引用を行わない |
+
+### 実装記録（Issue #505）
+
+上記契約に従い、`hnsw.rs::search_layer_in`（既存ホットパス）は複製・変更せず、
+`HopMode::OneHop` 限定の独立実装 `ResumableMaskedSearch`
+（`search_masked_resumable_start`／`search_masked_resume`）として実装した。
+`search_layer_in` へ記録方針をジェネリック注入する当初案は、`bridge_expand`
+（TwoHop・ACORN-1）との相互作用を精査する追加コストに見合わないと判断し
+見送った——再開型は TwoHop レジームのラウンドを状態化せず既存の単発経路
+（`search_masked_with_hop`）へ倒す（`sql/hnsw_cache.rs::search_prepared_resumable`
+がレジームを見て分岐する）ため、`search_layer_in` 本体には一切触れていない。
+
+- **停止条件の pop→peek 化**: 元実装は `candidates.pop()` してから停止条件を
+  判定し、停止時は pop 済みの候補をそのまま捨てる。再開型は `candidates.peek()`
+  で判定してから pop する（停止時は候補を `candidates` に残し次ラウンドで
+  続行できるようにする）。単発実行の出力（`results`）はどちらの実装でも
+  同一であることを `resumable_start_matches_search_masked_bit_identical`
+  （ラウンド 1・複数 `ef`・マスク有無）で機械検証済み。
+- **自己昇格の同値な縮約**: `results ∪ discarded` を `ScoredNode::Ord`
+  （スコア降順・同点 id 昇順の全順序）で安定ソートし上位 `ef_eff` 件を
+  `results` へ戻す操作は、「discarded 全ノードを best-first に再評価し
+  `worst_ok` を満たすものだけ `results` へ挿入する」操作と同値である
+  （`results` は定義上「常に全順序の top-`ef_eff`」に等しいため、独立した
+  `admitted` 集合を持つ必要がない）。`ef_eff` は呼び出し元の整合検査で
+  単調非減少が保証されるため、この再ソートは既存 `results` を一切降格
+  しない。
+- **候補復帰の二重 push 防止**: `expanded`／`in_candidates` はいずれも
+  「一度立てたら降ろさない」ビットマップ（`VisitedBitmap::is_set` を新設し
+  読み取り専用の照会に使う）。`expanded` が立ったノードは、`candidates` に
+  過去積まれていたかどうかによらず恒久的に候補復帰の対象から外れる——
+  「ノードは高々 1 回しか隣接走査されない」という元実装の不変条件（`visited`
+  の discovery gate 由来）を再開型でも維持する。
+- **星型グラフ回帰テスト**（`resume_star_graph_promotes_discarded_every_round`）:
+  設計節「再開手順」の反例（起点 1 点にのみ全葉が接続）を固定フィクスチャ化し、
+  `ef` を 2→4→8 と拡張しながら全 8 ノードが漏れなく最終結果へ現れることを
+  確認した（候補復帰のみで自己昇格を怠る実装ではこのテストが red になる）。
+- **`hnsw_cache.rs` 側の後段共有**: `search_with_overlay`（単発経路）の
+  「結果件数充足検査・スロット写像＋`(tenant_id, id)` 照合・`kernel::dot`
+  再計算・delta マージ・ソート/重複排除/truncate・成功統計」を
+  `finish_indexed_search` として切り出し、単発・再開型の両経路が共有する。
+  `finish_indexed_search` 自体は `ResumableMaskedSearch` に一切触れない——
+  内部で plain scan／brute-force へ縮退しても、既にグラフ探索を終えて
+  `resume` へ格納済みの状態は引き続き有効（次ラウンドも再開できる）ため。
+  再開状態の破棄が必要なのは、そもそも `search_masked_resumable_start`／
+  `search_masked_resume` を呼ばずに済ませた前段ガード
+  （`search_prepared_resumable` 側。アリーナ不一致・`PlainScan`・
+  `mask_splits_graph`・`k > MAX_EF`・`TwoHop`）だけである。
+- **`HnswDenseProvider` の状態保持**: `Mutex<Option<HnswResumeState>>`
+  （`SearchProvider::search` が `&self` シグネチャのため。`RefCell` は
+  `Send + Sync` を満たせない）。poison 時は中身を捨てて `None` から始める
+  fail-closed 設計（他ラウンドの panic による不整合な状態を使い続けない）。
+  ptr-eq 受理条件が外れたラウンド（別バッファへの委譲）は本状態に一切
+  触れない（`search_for_a_different_buffer_does_not_touch_resume_state` で
+  固定）。
+- **`hybrid_resumed_rounds` 統計**: `search_prepared_resumable` が
+  「`resume` が `Some` だった側（再開経路）を通り、かつ
+  `finish_indexed_search` が `fallbacks` を加算せず完走した」ラウンドのみ
+  計上する診断用カウンタ。テナント ID・行 ID・スコアを含まない。
+  `search_masked_resumable_start`／`hybrid_cache.rs` の単体テスト
+  （一様分布コーパス・`k` を 10→20→40 と倍増）で非 vacuous であることを
+  固定した。
+- **SQL 表層経由の非 vacuous 固定を見送った理由（実測で確認した既知の制約。
+  ※下記「原因の訂正（fix 923efcf）」で述べるとおり、この実測は候補復帰の
+  走査対象漏れバグを含んだ実装によるものであり、現在の実装ではこの数値は
+  そのまま成立しない。再測定は Issue #506 の担当のまま）**:
+  Issue #410 の同点誘発コーパス（`quantize_levels: Some(2)`。
+  `tests/hnsw_hybrid_refetch.rs`）に対して、変更前（`search_with_overlay`を
+  毎ラウンド再実行する旧経路）と本 Issue の再開型経路を同一フィクスチャで
+  比較実測したところ、**旧経路は 12 ラウンド中 `masked_short` 0 回（全ラウンド
+  索引経由で要求件数を充足）だったのに対し、再開型経路は 12 ラウンド中 9 回
+  `masked_short` へ縮退した**（`ef_search` を既定 64→400 に引き上げても
+  変わらず）。個々のラウンドを追跡すると、再開型は 1 ラウンド目（`ef_eff=400`）
+  こそ旧経路と同じ 400 件を返すが、2 ラウンド目（`ef_eff=800`）で 790 件に
+  留まり、3・4 ラウンド目（`ef_eff=1600`／`3200`）でも **790 件から一切
+  増えない**（`candidates` が完全に涸れ、`discarded` も自己昇格で
+  空になり候補復帰する対象が無くなるため）。同条件で毎ラウンド新規に
+  `search_masked_with_hop` を呼ぶ旧経路は 4 ラウンド目でも要求どおり
+  3,200 件を返す——索引・エントリポイントは同一なので、これは索引の
+  連結性の限界ではない。
+
+  当時この実測に付けていた原因説明は誤りだった（後述「原因の訂正」参照）。
+  実測時点の実装は、候補復帰ループの走査対象を `discarded` のみに限定
+  しており、直前のラウンドで `discarded` から `results` へ自己昇格した
+  ノードが候補復帰の対象から漏れ、そのノードの隣接が一切展開されない
+  まま `candidates` が涸れて探索が停止するという**実装バグ**を含んでいた
+  （`hnsw.rs` の該当箇所は fix 923efcf で修正済み。下記参照）。
+
+  ### 原因の訂正（fix 923efcf）
+
+  上記の実測後、codex-review・Cursor Bugbot が独立にこの箇所（自己昇格
+  ノードのビーム展開漏れ）を指摘し、`hnsw.rs::search_masked_resume` の
+  候補復帰ループを `discarded` 限定から `merged`（`results ∪ discarded`
+  を全順序で再ソートした対象全体）へ拡張する形で修正した（コミット
+  923efcf）。この修正により、自己昇格で `results` へ移ったノードも
+  `expanded`／`in_candidates` が未設定であれば次ラウンドの候補復帰対象に
+  含まれ、隣接探索の起点として再考されるようになった。
+
+  現在の実装（`search_masked_resume`）が停止するのは、`visited`
+  （`expanded` ビットマップ）が「一度立てたら降ろさない」という正しさ上
+  必須の不変条件そのものではなく、`candidates` が空になった時点——
+  `resumable_run` は `results.len() < ef_eff`（`peek` による停止条件判定）
+  の間はスコアに基づいて展開を続け、`results ∪ discarded` の全ノードが
+  `expanded` 済みになって初めて候補復帰の材料が尽きる。上記実測時点の
+  「9/12 が `masked_short` へ縮退する」という具体的な数値は、この
+  バグを含んだ実装によるものであり、fix 923efcf 後の実装でそのまま
+  成立するとは限らない（探索フロンティアが自己昇格ノード経由でも
+  拡張されるようになったため、涸れるまでの到達範囲は広がったはずだが、
+  それでも旧経路——毎ラウンド `ef` を最初から大きく取って新規に探索する
+  ——と比べて `visited` の単調性そのものに由来する到達範囲の差は理論上
+  残り得る）。fix 923efcf を踏まえた再測定は Issue #506 の担当のまま
+  未実施であり、下記の数値・結論はいずれも**修正前の実装によるもの**と
+  読み替える必要がある。
+
+  **SQL クエリの最終的な正しさへの影響は無い**（`finish_indexed_search`
+  の `masked_short` 縮退は既存の fail-closed 契約どおり plain scan で
+  埋め合わせるため、`tests/hnsw_hybrid_refetch.rs` の bit 決定性・
+  `hybrid_rounds_max <= 8` はいずれも無変更のまま green）。一方で、
+  この特性は「再開型探索が同点誘発コーパスで期待した高速化を実現できず、
+  むしろ索引探索の作業と brute-force 縮退の両方を行う分だけ悪化しうる」
+  ことを意味し、Issue #505 の目的（全ラウンド合計の隣接走査削減）を
+  精度良く重複の多いデータで達成できていないことを示す実測結果である。
+  `hybrid_resumed_rounds` の SQL 表層経由・同点誘発コーパスでの非 vacuous
+  固定はこの制約下では成立しないため見送り、`crates/engine/src/sql/
+  hnsw_cache.rs`・`sql/hnsw_hybrid.rs` の単体テストで一様分布コーパス
+  （重複・同点が無い）における非 vacuous 性のみを固定した（上記参照）。
+- **申し送り（Issue #506 以降。性能面の採否判断に必須の入力）**: 上記
+  「原因の訂正（fix 923efcf）」のとおり、当初「exploration starvation」
+  と説明していた現象の実体は候補復帰ループの走査対象漏れという実装
+  バグであり、fix 923efcf で修正済み。したがって Issue #410 の
+  同点誘発コーパスでの `masked_short` 悪化（9/12）を fix 後の実装で
+  再測定し、修正がどの程度改善したか（改善が不十分な場合は残存する
+  `visited` 単調性由来の到達範囲差への追加対応が必要か）を確認する
+  ことが #506 の最初のタスクになる。前後比較実測（`make bench-hybrid`）
+  は、Issue #410 の同点誘発コーパスに加えて一様分布コーパスでも必ず
+  行い、両者の結果を区別して報告すること。
+- **他ラウンドが失う既存の最適化（re-executing 経路のみが持っていた
+  もの。実装記録・申し送り）**: 再開型経路（`resumable_run`）は
+  `HopMode::OneHop` のビーム探索本体を独立実装したため、既存の
+  ソフトウェアパイプライン先読み（Issue #490・`prefetch::PipelinePrefetch`）
+  を一切行わない。また `search_masked_resumable_start`／`search_masked_resume`
+  は常に dense な `VisitedBitmap` を使い、`ValidatedHnswParams::
+  sparse_visited_max`（Issue #497 の opt-in）を一切参照しない——この
+  opt-in を有効にしているユーザーでも、hybrid 密側の 2 ラウンド目以降は
+  常に dense 実装が使われる（`HnswIndexCacheStats::sparse_visited_searches`
+  は再開型ラウンドを一切計上しない）。結果は不変（ビット同一）だが、
+  性能特性が変わりうる。両者とも #506 以降で採否を判断する。
+- 性能面の採否・前後比較実測は引き続き Issue #506 の担当（本 Issue のマージ
+  根拠は正しさ契約のみ——上記のとおり、性能面はむしろ既知の悪化シナリオが
+  実測で確認されており、#506 でこの特性を踏まえた採否判断が必要）。
