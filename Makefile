@@ -624,6 +624,19 @@ else
 endif
 
 # --------------------------------------------------
+# 接続処理モデルの同時接続数 N 別スループット手動計測
+# （Issue #482。docs/design/wire-connection-model.md）
+# --------------------------------------------------
+
+.PHONY: bench-wire-concurrency
+bench-wire-concurrency: ## Issue #482（接続処理モデルの判断記録。1 接続 1 スレッド ＋ 接続数上限）の同時接続数 N 別スループットを実測する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。WIRE_CONCURRENCY_N（必須。1〜64）で同時接続数を指定する。1 プロセス = 1 規模点（docs/design/benchmark-judgement-policy.md §5 準拠）。WIRE_CONCURRENCY_ROWS／WIRE_CONCURRENCY_DIM／WIRE_CONCURRENCY_ROUNDS で規模を上書きできる（既定 25,000 行・dim 128・200 往復）
+ifdef HAS_CARGO
+	cargo test --release -p wire-server --test wire_concurrency_throughput -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため bench-wire-concurrency をスキップ"
+endif
+
+# --------------------------------------------------
 # 評価スクリプト（scripts/eval。TASK-118）
 # --------------------------------------------------
 
