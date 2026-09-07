@@ -590,12 +590,19 @@ Issue #518 は「dim=128 の既存テストが green」までを受け入れ条�
 1 行版 `dot`（Issue #518 が直接変更した経路）の N=5 min-of-N・median（ms。
 `ratio` は after/before）:
 
-| working_set | dim | before min/median | after min/median | ratio_min | ratio_median | 参照帯（before/after band） |
+| working_set | dim | before min/median | after min/median | ratio_min | ratio_median | 対象区間の変動幅（before/after band） |
 | --- | --- | --- | --- | --- | --- | --- |
 | cache_resident | 768 | 0.186 / 0.186 | 0.121 / 0.121 | 0.6505 | 0.6505 | 0.1075 / 0.0000 |
 | cache_resident | 1536 | 0.200 / 0.207 | 0.111 / 0.112 | 0.5550 | 0.5411 | 0.0650 / 0.0180 |
 | arena_scale | 768 | 2.867 / 3.119 | 2.872 / 2.879 | 1.0017 | 0.9231 | 0.1444 / 0.0299 |
 | arena_scale | 1536 | 6.374 / 6.471 | 5.767 / 5.826 | 0.9048 | 0.9003 | 0.0595 / 0.0465 |
+
+上表の「対象区間の変動幅」は dim768／1536（本 Issue の変更対象区間）自身の
+before/after 各 5 run の run-to-run 幅であり、`benchmark-judgement-policy.md`
+§4 が判定に用いる参照帯とは別物である。判定（下記「判定（決定木）」節・
+Issue #519 決定木 1.）が実際に参照帯として使うのは、変更を含まない
+dim384 の実測帯（下表の参照区間。cache_resident before band 0.1589・
+arena_scale before band 0.0835）である。
 
 参照区間（変更を含まない dim。band は `(max-min)/min`。5 run）:
 
