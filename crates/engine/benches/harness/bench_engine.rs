@@ -285,11 +285,18 @@ pub fn parse_sparse_visited_max(raw: Option<&str>) -> Result<Option<usize>, Benc
 /// 独立に扱う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpectedArm {
-    /// `visible * den >= index_len * num`: マスク付き ANN 探索が選ばれるはず。
+    /// `visible * den >= index_len * num`: マスク付き ANN 探索（1-hop・既定）
+    /// が選ばれるはず。
     AnnMasked,
     /// `visible * den < index_len * num`: 可視カーディナリティ比が閾値未満で
     /// plain scan が選ばれるはず。
     PlainScanRatio,
+    /// `full_scan_ratio <= r <= acorn_max_visible_ratio`（Issue #501・#502）:
+    /// ACORN-1（2-hop 展開）付きマスク探索が選ばれるはず。`expected_arm` の
+    /// 判定が [`ExpectedArm::AnnMasked`] で、かつ `acorn_max_visible_ratio`
+    /// が `Some` で比がその範囲内のときのみ [`expected_arm_acorn`] が返す
+    /// （`expected_arm` 自体は本 variant を返さない・後方互換）。
+    AnnMaskedTwoHop,
 }
 
 pub fn expected_arm(
@@ -311,5 +318,78 @@ pub fn expected_arm(
         Ok(ExpectedArm::PlainScanRatio)
     } else {
         Ok(ExpectedArm::AnnMasked)
+    }
+}
+
+/// `BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO` から `crate::hnsw::
+/// ValidatedHnswParams::with_acorn_max_visible_ratio` へ渡す `(numerator,
+/// denominator)` を読む（Issue #502。`parse_full_scan_ratio` と同じ受理形状・
+/// fail-closed 方針。`None` は ACORN-1 opt-in 無効〔既定〕を表す）。
+pub fn parse_acorn_max_visible_ratio(
+    raw: Option<&str>,
+) -> Result<Option<(u32, u32)>, BenchEngineError> {
+    let trimmed = raw.map(str::trim);
+    let s = match trimmed {
+        None | Some("") => return Ok(None),
+        Some(s) => s,
+    };
+    let (num_str, den_str) = s
+        .split_once('/')
+        .ok_or_else(|| err(format!("must be \"<num>/<den>\" (got {s:?})")))?;
+    let numerator: u32 = num_str.parse().map_err(|_| {
+        err(format!(
+            "numerator must be a non-negative integer (got {num_str:?})"
+        ))
+    })?;
+    let denominator: u32 = den_str.parse().map_err(|_| {
+        err(format!(
+            "denominator must be a positive integer (got {den_str:?})"
+        ))
+    })?;
+    if denominator == 0 {
+        return Err(err("denominator must be >= 1 (got 0)"));
+    }
+    if numerator > denominator {
+        return Err(err(format!(
+            "numerator must not exceed denominator (got {numerator}/{denominator})"
+        )));
+    }
+    Ok(Some((numerator, denominator)))
+}
+
+/// [`expected_arm`] を ACORN-1（Issue #501）対応に拡張したもの（Issue #502）。
+/// 基底判定が [`ExpectedArm::AnnMasked`] のときに限り、`acorn_max_visible_ratio`
+/// が `Some` で可視カーディナリティ比がその範囲内なら
+/// [`ExpectedArm::AnnMaskedTwoHop`] へ格上げする（`sql::hnsw_cache::
+/// traversal_regime_for` の `TwoHop` 判定式と同じ比較演算子〔`<=`〕を複製する。
+/// 単一情報源はそちら側にあり、本関数は予測ラベル付け専用の複製）。
+pub fn expected_arm_acorn(
+    visible: u64,
+    index_len: u64,
+    full_scan_ratio: (u32, u32),
+    acorn_max_visible_ratio: Option<(u32, u32)>,
+) -> Result<ExpectedArm, BenchEngineError> {
+    let base = expected_arm(visible, index_len, full_scan_ratio)?;
+    if base != ExpectedArm::AnnMasked {
+        return Ok(base);
+    }
+    let Some((num, den)) = acorn_max_visible_ratio else {
+        return Ok(base);
+    };
+    if den == 0 {
+        return Err(err(
+            "acorn_max_visible_ratio denominator must be >= 1 (got 0)",
+        ));
+    }
+    let lhs = visible
+        .checked_mul(den as u64)
+        .ok_or_else(|| err("overflow computing visible * acorn_max_visible_ratio.denominator"))?;
+    let rhs = index_len
+        .checked_mul(num as u64)
+        .ok_or_else(|| err("overflow computing index_len * acorn_max_visible_ratio.numerator"))?;
+    if lhs <= rhs {
+        Ok(ExpectedArm::AnnMaskedTwoHop)
+    } else {
+        Ok(base)
     }
 }
