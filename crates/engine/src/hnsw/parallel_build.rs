@@ -1747,7 +1747,7 @@ mod tests {
         .unwrap();
         assert!(
             results.len() > 1,
-            "z は plan_links 完了時点で既に層 0 の外向きリンクを持つため、z を              起点にした探索は z 単独へ退化しないはず（実際の件数={}）",
+            "z は plan_links 完了時点で既に層 0 の外向きリンクを持つため、z を起点にした探索は z 単独へ退化しないはず（実際の件数={}）",
             results.len()
         );
         assert!(!planned.selected_per_level[0].is_empty());
