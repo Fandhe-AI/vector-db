@@ -251,7 +251,10 @@ run-to-run 変動の範囲として扱い、閾値判定には用いない（本
 ### Issue #495 追記: `flatten` 段を含む段別内訳・前後比較実測
 
 `docs/design/hnsw-index.md` §14.13 の前後比較実測（before `929c027`→after
-`cadf6c3`。N=5 ペア・共有 QEMU 環境の参考値。詳細な表・判定は同節参照）から、
+`ad484e7`〔PR #590 マージコミット。`crates/engine/src/`・`Cargo.lock` は
+`cadf6c3`〔#494 適用後〕と同一で production コードとしては #494 適用後の
+状態を表す。詳細は §14.13「比較対象・環境」参照〕。N=5 ペア・共有 QEMU
+環境の参考値。詳細な表・判定は同節参照）から、
 `flatten` 段を含む after 側（CSR 化後）の段別内訳（rows=100,000・dim=64。
 上記「Issue #406 追記」節の run 番号に続けて記録）を示す。各列は 5 run の
 median を個別に集計した値（`docs/design/hnsw-index.md` §14.13 と同一の
@@ -266,8 +269,9 @@ median を個別に集計した値（`docs/design/hnsw-index.md` §14.13 と同�
 追記」の頭打ち要因分析（`repair_reachability` が支配的）を変える規模ではない。
 before（`flatten` フィールド自体が存在しない旧アリティ）との比較は `total`・
 `repair_reachability` の実測値のみで行う（`docs/design/hnsw-index.md`
-§14.13 参照。両者ともノイズ帯内で一貫した悪化・改善は観測されなかった。
-`serial_share` は定義差のため before/after で生比較しない）。
+§14.13 参照。固定帯 ±5%・実測帯〔参照区間 `dot_scan` の run-to-run 幅〕の
+両方を判定基準とし、両者ともノイズ帯内で一貫した悪化・改善は観測されな
+かった。`serial_share` は定義差のため before/after で生比較しない）。
 
 ### Issue #495 追記: 現行ベンチ（L2 正規化コーパス）での usearch 探索レイテンシ前後比較
 
@@ -281,13 +285,14 @@ before／after（CSR 化前後）で記録する。**旧実測「自作 66〜67�
 | コミット | 自作 median | usearch median（参照。CSR 非依存） |
 | --- | --- | --- |
 | before（`929c027`） | 67.302µs | 80.917µs |
-| after（`cadf6c3`） | 71.035µs | 95.202µs |
+| after（`ad484e7`。production コードは `cadf6c3` と同一） | 71.035µs | 95.202µs |
 
 自作・usearch とも after 側が高めに出ているが、`docs/design/hnsw-index.md`
-§14.13 のノイズ帯（自作 search median: before ±80.3% / after ±246.5%）を
-踏まえると「ノイズ帯内」判定であり、CSR 化由来の系統的な探索レイテンシ
-悪化とは判断できない（usearch 側〔CSR 非依存〕も同方向に上昇しており、
-環境側の負荷変動が主要因と考えられる）。
+§14.13 の判定基準（固定帯 ±5%・実測帯〔usearch 自身の run-to-run 幅。本
+条件では ±164.7%〕の両方を超えて初めて有効な変化として扱う）を踏まえると
+「ノイズ帯内」判定であり、CSR 化由来の系統的な探索レイテンシ悪化とは
+判断できない（usearch 側〔CSR 非依存〕も同方向に上昇しており、環境側の
+負荷変動が主要因と考えられる）。
 
 ### Issue #406 追記（2026-09-05）: 8→12 スレッド頭打ちの段別内訳
 
