@@ -154,11 +154,68 @@ fn text_column_reservation_bytes(pair_count: usize) -> usize {
         .saturating_add(1)
         .saturating_mul(std::mem::size_of::<u32>());
     let slots_bytes = pair_count.saturating_mul(std::mem::size_of::<u32>());
-    let equality_bytes = pair_count.saturating_mul(std::mem::size_of::<(String, u32)>());
+    // `equality: HashMap<String, u32>` は `pair_count` 件分の
+    // `try_reserve(pair_count)` を行うが、実際に確保されるバケット数は
+    // `pair_count` そのものではなく、hashbrown の負荷率・2 のべき乗丸めを
+    // 経た `hashmap_bucket_count(pair_count)` 件（[`hashmap_reservation_bytes`]
+    // 参照。codex-review P1 対応・PR #569 未解決分）。
+    let equality_bytes = hashmap_reservation_bytes(pair_count);
     values_bytes
         .saturating_add(offsets_bytes)
         .saturating_add(slots_bytes)
         .saturating_add(equality_bytes)
+}
+
+/// `std::collections::HashMap`（hashbrown 実装）が最低 `min_capacity` 件を
+/// 保持できるよう確保する**実バケット数**の見積り（codex-review P1 対応・
+/// PR #569。hashbrown v0.15.5 の `RawTableInner::fallible_with_capacity` /
+/// `capacity_to_buckets`〔`raw/mod.rs`〕と同じ規則を踏襲する: 最大負荷率
+/// 7/8 を満たすようバケット数を切り上げたうえで 2 のべき乗へ丸める
+/// （`min_capacity < 8` は 4 または 8 に固定）。`pair_count × エントリ
+/// サイズ` という単純計算では、この丸めによる追加確保
+/// （例: 100 万件 → 実バケット数 2^21 ≈ 210 万）が計上から漏れ、
+/// [`MAX_SCALAR_INDEX_BYTES`] の予算検査を実質バイパスし得た。
+/// hashbrown の内部実装はバージョン依存で将来変わり得るため、丸め則の
+/// 変化があっても過小評価側に倒れないよう本関数は意図的に保守的
+/// （実バケット数以上）に倒す。
+fn hashmap_bucket_count(min_capacity: usize) -> usize {
+    if min_capacity == 0 {
+        return 0;
+    }
+    if min_capacity < 8 {
+        return if min_capacity < 4 { 4 } else { 8 };
+    }
+    let adjusted = match min_capacity.checked_mul(8) {
+        Some(v) => v / 7,
+        // オーバーフローする規模はそもそも `MAX_SCALAR_INDEX_BYTES` を
+        // 大幅に超えるため、`usize::MAX` を返し予算検査で確実に拒否させる
+        // （fail-closed）。
+        None => return usize::MAX,
+    };
+    adjusted.next_power_of_two()
+}
+
+/// 1 バケットあたりの hashbrown 制御バイト分を含む保守的な確保バイト量
+/// （codex-review P1 対応・PR #569）。hashbrown はバケット配列の直後に
+/// SIMD グループ幅（実行環境依存。最大でも数十バイト程度）分の制御バイト
+/// パディングを追加確保するため、その分を固定オーバーヘッドとして
+/// 加算し過小評価を避ける。
+const HASHBROWN_GROUP_PADDING_BYTES: usize = 32;
+
+/// `equality: HashMap<String, u32>` が最低 `min_capacity` 件を保持できる
+/// よう確保する概算バイト量（[`hashmap_bucket_count`] 参照）。
+fn hashmap_reservation_bytes(min_capacity: usize) -> usize {
+    let buckets = hashmap_bucket_count(min_capacity);
+    if buckets == 0 {
+        // `min_capacity == 0` はテーブル未確保（`HashMap::new()` 相当）で
+        // 実際に確保は起こらないため、固定オーバーヘッドも計上しない。
+        return 0;
+    }
+    // 1 バケットにつきエントリ本体（`(String, u32)`）+ 制御バイト 1。
+    let per_bucket = std::mem::size_of::<(String, u32)>().saturating_add(1);
+    buckets
+        .saturating_mul(per_bucket)
+        .saturating_add(HASHBROWN_GROUP_PADDING_BYTES)
 }
 
 /// 行走査中に `TEXT` 列ごとの作業領域 `acc: Vec<(String, u32)>`
@@ -272,22 +329,21 @@ impl TextColumnIndex {
             .saturating_mul(std::mem::size_of::<u32>());
         // `HashMap` のキーは `values` と同じ文字列を複製保持する（`equality`
         // が値 → 添字の直引き専用であり `values` への参照を持たないため）。
-        // 実要素分（キー文字列の確保容量＋エントリ構造体サイズ）に加え、
-        // `capacity()` が実要素数を上回る分（未使用バケット）もエントリ構造体
-        // サイズ分だけ保守的に計上する。
-        let equality_len = self.equality.len();
-        let equality_entries_bytes: usize = self
+        // 各キー文字列の確保容量（中身のバイト列）に加え、テーブル本体
+        // （エントリ配列＋制御バイト。使用・未使用バケット双方を含む）を
+        // [`hashmap_bucket_count`] で計上する。`HashMap::capacity()` は
+        // hashbrown の負荷率適用後の「保持可能要素数」であり**実バケット数
+        // ではない**ため（codex-review P1 対応・PR #569 未解決分）、これを
+        // `hashmap_bucket_count` へ逆算入力することで実バケット数を復元する
+        // （`capacity()` は `hashmap_bucket_count` と同じ丸め則で導出される
+        // ため、往復させても実バケット数と一致する）。
+        let equality_inner_bytes: usize = self
             .equality
             .keys()
-            .map(|k| {
-                k.capacity()
-                    .saturating_add(std::mem::size_of::<(String, u32)>())
-            })
+            .map(String::capacity)
             .fold(0usize, |acc, n| acc.saturating_add(n));
-        let equality_unused_slots = self.equality.capacity().saturating_sub(equality_len);
-        let equality_unused_bytes =
-            equality_unused_slots.saturating_mul(std::mem::size_of::<(String, u32)>());
-        let equality_bytes = equality_entries_bytes.saturating_add(equality_unused_bytes);
+        let equality_table_bytes = hashmap_reservation_bytes(self.equality.capacity());
+        let equality_bytes = equality_inner_bytes.saturating_add(equality_table_bytes);
         values_bytes
             .saturating_add(offsets_bytes)
             .saturating_add(slots_bytes)
@@ -1217,6 +1273,54 @@ mod tests {
             check_scalar_index_budget(0, reservation_bytes),
             Err(ScalarIndexBuildError::TooLarge)
         ));
+    }
+
+    #[test]
+    fn hashmap_bucket_count_matches_hashbrown_rounding_for_known_capacities() {
+        // hashbrown の負荷率 7/8・2 のべき乗丸めの既知の境界値を固定する
+        // （codex-review P1 対応・PR #569）。100 万件は指摘で挙げられた
+        // 具体例（1,000,000 * 8 / 7 ≈ 1,142,857 → 次のべき乗 2^21）。
+        assert_eq!(hashmap_bucket_count(0), 0);
+        assert_eq!(hashmap_bucket_count(1), 4);
+        assert_eq!(hashmap_bucket_count(4), 8);
+        assert_eq!(hashmap_bucket_count(7), 8);
+        assert_eq!(hashmap_bucket_count(8), 16);
+        assert_eq!(hashmap_bucket_count(1_000_000), 1 << 21);
+    }
+
+    #[test]
+    fn hashmap_reservation_bytes_exceeds_naive_pair_count_times_entry_size() {
+        // 修正前の単純計算（pair_count × エントリサイズ）を常に上回ることを
+        // 固定する（codex-review P1 対応・PR #569。バケット数丸め・制御バイト
+        // 分が計上されない旧実装への回帰防止）。
+        let pair_count = 1_000_000usize;
+        let naive = pair_count.saturating_mul(std::mem::size_of::<(String, u32)>());
+        let actual = hashmap_reservation_bytes(pair_count);
+        assert!(
+            actual > naive,
+            "actual={actual} naive={naive} (バケット数丸め・制御バイト分が計上されているはず)"
+        );
+    }
+
+    #[test]
+    fn text_column_reservation_bytes_rejects_one_million_rows_all_empty_string_scenario() {
+        // codex-review P1 指摘（PR #569・threadId: PRRT_kwDOUAKASM6fu0DC）の
+        // 再現ケース: 64bit 環境で 100 万行・全 TEXT 列が空文字列の場合、
+        // 文字列本体バイトはほぼ 0 で「予算上ほぼ無料」に見えるが、
+        // `equality: HashMap<String, u32>` の実バケット確保（2^21 件、
+        // 制御バイト込み）だけで 1 列あたり優に前提の百バイト単位を超える。
+        // 旧実装（pair_count × size_of::<(String, u32)>() の単純計算）では
+        // この超過分が計上されず 1 GiB 予算をバイパスし得たため、
+        // 新しい見積りが hashbrown の丸めを踏まえて十分大きいことを固定する。
+        let pair_count = 1_000_000usize;
+        let reservation_bytes = text_column_reservation_bytes(pair_count);
+        // 2^21 バケット × (エントリサイズ + 制御バイト 1) 以上であること
+        // （[`hashmap_bucket_count`] の既知境界値と対応）。
+        let expected_floor = (1usize << 21) * (std::mem::size_of::<(String, u32)>() + 1);
+        assert!(
+            reservation_bytes >= expected_floor,
+            "reservation_bytes={reservation_bytes} expected_floor={expected_floor}"
+        );
     }
 
     #[test]
