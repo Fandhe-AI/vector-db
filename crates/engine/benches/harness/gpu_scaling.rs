@@ -385,6 +385,14 @@ pub struct GpuScalingStatsLine {
     pub f16_partial_topk_dispatches: u64,
     pub f16_full_readback_dispatches: u64,
     pub f16_full_readback_fallbacks: u64,
+    /// `SHADER_F16` 対応アダプタで f16 算術版 S0 シェーダへ実際に dispatch
+    /// された回数（Issue #539・`gpu_batch::GpuBatchStatsSnapshot::
+    /// f16_arith_dispatches`）。f32 対照経路（`GpuF32ContrastBackend`）は
+    /// Issue #539 の対象外のため常に 0。
+    pub f16_arith_dispatches: u64,
+    /// f16 算術版パイプラインは使えたがオーバーフローガード不成立により
+    /// unpack 版へ縮退した回数（Issue #539・`f16_arith_guard_fallbacks`）。
+    pub f16_arith_guard_fallbacks: u64,
     pub f32_readback_bytes_total: u64,
     pub f32_readback_bytes_per_call: u64,
     pub f32_partial_topk_dispatches: u64,
@@ -399,7 +407,8 @@ impl fmt::Display for GpuScalingStatsLine {
             "gpu_scaling_stats: rows={} dim={} batch={} k={} calls={} \
              f16_readback_bytes_total={} f16_readback_bytes_per_call={} \
              f16_partial_topk_dispatches={} f16_full_readback_dispatches={} \
-             f16_full_readback_fallbacks={} f32_readback_bytes_total={} \
+             f16_full_readback_fallbacks={} f16_arith_dispatches={} \
+             f16_arith_guard_fallbacks={} f32_readback_bytes_total={} \
              f32_readback_bytes_per_call={} f32_partial_topk_dispatches={} \
              f32_full_readback_dispatches={} f32_full_readback_fallbacks={}",
             self.rows,
@@ -412,6 +421,8 @@ impl fmt::Display for GpuScalingStatsLine {
             self.f16_partial_topk_dispatches,
             self.f16_full_readback_dispatches,
             self.f16_full_readback_fallbacks,
+            self.f16_arith_dispatches,
+            self.f16_arith_guard_fallbacks,
             self.f32_readback_bytes_total,
             self.f32_readback_bytes_per_call,
             self.f32_partial_topk_dispatches,
