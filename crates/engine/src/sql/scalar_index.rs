@@ -947,6 +947,25 @@ struct ScalarIndexCacheEntry {
     last_used: u64,
 }
 
+/// [`UnbuildableEntry`] が記録する失敗の起点（PR #603 codex-review P2 指摘
+/// 対応）。`(table, ctx)` あたり最新 1 件のみを保持する既存の上書き方式は
+/// 変えず、どちらの起点で「同一世代では再試行しても無駄」と判定したかを
+/// 区別して記録するためだけに使う（[`ScalarIndexCache::is_capture_known_
+/// unbuildable`] によるゲート判定自体は起点を問わず同一世代のヒットで
+/// ブロックする——採取済みでも構築側の予算超過等で不能なら、次に採取から
+/// やり直しても同じ結果になるため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnbuildableReason {
+    /// `sql::aggregate::capture_scalar_index_snapshot` 自体が採取失敗
+    /// （容量超過・復号不能・NULL 行混在等）で `None` を返した。
+    Capture,
+    /// 採取（アリーナスナップショット構築）自体は成功した——`SqlArenaCache`
+    /// ヒットにより既に温かいスナップショットが手元にある——が、そこから
+    /// [`ScalarIndex::build`] を実行した結果が失敗した（索引固有の容量超過
+    /// 等）。
+    Build,
+}
+
 /// Issue #475 codex-review P2 対応: `sql::aggregate::capture_scalar_index_snapshot`
 /// が「この `(table, ctx)`・世代では索引の piggyback 構築が採取失敗（容量超過・
 /// 復号不能・NULL 行混在等）で確定的に不可能だった」ことを記録するエントリ。
@@ -955,11 +974,19 @@ struct ScalarIndexCacheEntry {
 /// 集計・`GROUP BY` クエリのたびに同じ全走査・全量デコードの採取を繰り返す
 /// ことを避ける（構築成功索引のキャッシュとは独立に世代が進めば自然に無効化
 /// される。テーブル単位世代のみをキーにし、行内容・存在情報は保持しない）。
+///
+/// PR #603 codex-review P2 指摘対応: `reason`（[`UnbuildableReason`]）は、
+/// アリーナ採取自体の失敗（`Capture`）と、温かいスナップショットからの
+/// [`ScalarIndex::build`] 失敗（`Build`）を記録上区別する。以前は後者を
+/// このエントリへ一切記録しておらず、`SqlArenaCache` がヒットし続ける限り
+/// 同一世代の集計・`GROUP BY` クエリごとに毎回スナップショット全体の
+/// デコード・文字列複製をやり直してから全走査へ縮退していた。
 struct UnbuildableEntry {
     table: String,
     ctx: PolicyContext,
     generation: u64,
     last_used: u64,
+    reason: UnbuildableReason,
 }
 
 #[derive(Default)]
@@ -1206,14 +1233,18 @@ impl ScalarIndexCache {
     }
 
     /// Issue #475 codex-review P2 対応: この `(table, ctx)` の現在のテーブル
-    /// 世代について、集計・`GROUP BY` の piggyback 索引構築（`sql::aggregate::
-    /// capture_scalar_index_snapshot`）が採取失敗と確定済みかを調べる。ヒット
-    /// した場合、呼び出し元は採取（`user_rows/{table}` の全走査・全量デコード）
-    /// を試みず即座に全走査フォールバックへ委ねてよい。世代が進んだ古い記録は
+    /// 世代について、集計・`GROUP BY` の索引構築（`sql::aggregate::
+    /// capture_scalar_index_snapshot` による piggyback 採取、または温かい
+    /// `SqlArenaSnapshot` からの [`ScalarIndex::build`]。PR #603 codex-review
+    /// P2 指摘対応で後者も対象に含めた）が失敗済みと確定しているかを調べる。
+    /// ヒットした場合、呼び出し元は採取・構築のいずれも試みず即座に全走査
+    /// フォールバックへ委ねてよい（起点を区別せず判定する理由は
+    /// [`UnbuildableReason`] のドキュメント参照）。世代が進んだ古い記録は
     /// 一致しないため自然にミスとして扱う（明示的な無効化は不要。世代不一致の
-    /// 記録は次の [`Self::mark_capture_unbuildable`] 呼び出しで上書きされるまで
-    /// 残るが、`table` は非機微情報でありサイズは [`MAX_SCALAR_INDEX_CACHE_ENTRIES`]
-    /// で有界のため安全性に影響しない）。
+    /// 記録は次の [`Self::mark_capture_unbuildable`]／[`Self::mark_build_
+    /// unbuildable`] 呼び出しで上書きされるまで残るが、`table` は非機微情報で
+    /// ありサイズは [`MAX_SCALAR_INDEX_CACHE_ENTRIES`] で有界のため安全性に
+    /// 影響しない）。
     pub(crate) fn is_capture_known_unbuildable(
         &self,
         read_txn: &redb::ReadTransaction,
@@ -1236,9 +1267,10 @@ impl ScalarIndexCache {
     /// Issue #475 codex-review P2 対応: `capture_scalar_index_snapshot` が
     /// 採取失敗（`None`）を返した直後に呼び出し、[`Self::is_capture_known_
     /// unbuildable`] が次回以降の同一世代呼び出しをこの採取試行自体をスキップ
-    /// させられるよう記録する。テーブル世代の読み取りに失敗した場合は記録
-    /// せず終える（fail-closed。記録できなくても呼び出し元の集計クエリ自体
-    /// は全走査へフォールバック済みで正しさに影響しない）。
+    /// させられるよう記録する（[`UnbuildableReason::Capture`]）。テーブル
+    /// 世代の読み取りに失敗した場合は記録せず終える（fail-closed。記録できな
+    /// くても呼び出し元の集計クエリ自体は全走査へフォールバック済みで正しさに
+    /// 影響しない）。
     ///
     /// PR #603 codex-review P2 指摘対応: 記録する世代は、実際に採取（全走査）
     /// を試みた**その** `read_txn` のスナップショット世代
@@ -1254,6 +1286,40 @@ impl ScalarIndexCache {
         table: &str,
         ctx: &PolicyContext,
     ) {
+        self.mark_unbuildable(read_txn, table, ctx, UnbuildableReason::Capture);
+    }
+
+    /// PR #603 codex-review P2 指摘対応: `sql::aggregate::
+    /// ensure_scalar_index_snapshot` が、`SqlArenaCache` ヒットにより既に
+    /// 温かい `SqlArenaSnapshot` を持っている状態から [`ScalarIndex::build`]
+    /// を実行し、その構築自体が失敗した直後に呼び出す
+    /// （[`UnbuildableReason::Build`]）。この記録がないと、同一世代のうちは
+    /// `SqlArenaCache` がヒットし続ける限り集計・`GROUP BY` クエリのたびに
+    /// 同じ（確定的に失敗する）構築を繰り返し試み、スナップショット全体の
+    /// デコード・文字列複製コストを毎回払ってから全走査へ縮退していた。
+    /// [`Self::mark_capture_unbuildable`] と同じ fail-closed 方針（世代を
+    /// 読めない場合は記録しないだけで、呼び出し元の集計クエリ自体は失敗
+    /// しない）を踏襲する。
+    pub(crate) fn mark_build_unbuildable(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+        ctx: &PolicyContext,
+    ) {
+        self.mark_unbuildable(read_txn, table, ctx, UnbuildableReason::Build);
+    }
+
+    /// [`Self::mark_capture_unbuildable`]／[`Self::mark_build_unbuildable`]
+    /// が共有する実処理（`(table, ctx)` あたり最新 1 件のみを保持する既存の
+    /// 上書き方式・LRU 追い出しはいずれも起点によらず共通のため、`reason` の
+    /// 違いのみをパラメータ化する）。
+    fn mark_unbuildable(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+        ctx: &PolicyContext,
+        reason: UnbuildableReason,
+    ) {
         let Ok(generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
             return;
         };
@@ -1268,6 +1334,7 @@ impl ScalarIndexCache {
         {
             entry.generation = generation;
             entry.last_used = seq;
+            entry.reason = reason;
             return;
         }
         while guard.unbuildable.len() >= MAX_SCALAR_INDEX_CACHE_ENTRIES {
@@ -1286,6 +1353,7 @@ impl ScalarIndexCache {
             ctx: ctx.clone(),
             generation,
             last_used: seq,
+            reason,
         });
     }
 }

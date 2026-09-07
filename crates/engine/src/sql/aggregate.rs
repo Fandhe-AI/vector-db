@@ -1111,6 +1111,21 @@ pub(crate) fn ensure_scalar_index_snapshot(
         // Bugbot Medium 指摘: arena はヒット・スカラー索引はミス（または
         // 同一性ガード不一致）。`user_rows` を再走査せず、ヒット済み
         // スナップショットから索引だけを構築する。
+        //
+        // codex-review P2 指摘（PR #603）: この構築が容量超過等で失敗した
+        // 場合、[`crate::sql::scalar_index::ScalarIndexCache::mark_build_
+        // unbuildable`] で記録しないと、`SqlArenaCache` がヒットし続ける限り
+        // 同一世代の集計・`GROUP BY` クエリのたびにこの（確定的に失敗する）
+        // 構築——スナップショット全体のデコード・文字列複製——を繰り返して
+        // から全走査へ縮退してしまう。まず `is_capture_known_unbuildable`
+        // （起点を問わず判定する。同メソッドのドキュメント参照）で既知の
+        // 失敗を確認し、既知なら構築自体を試みない。
+        if scalar_access
+            .cache
+            .is_capture_known_unbuildable(read_txn, table, ctx)
+        {
+            return None;
+        }
         return match crate::sql::scalar_index::ScalarIndex::build(schema, &snapshot) {
             Ok(index) => scalar_access
                 .cache
@@ -1118,14 +1133,13 @@ pub(crate) fn ensure_scalar_index_snapshot(
                 .map(|index| (snapshot, index)),
             Err(_) => {
                 // このスナップショット（＝この世代）に対して確定的に構築
-                // 不能。`capture_scalar_index_snapshot` 経路の内部
-                // `ScalarIndex::build` 失敗（同関数の `.ok()?` 参照）が
-                // `mark_capture_unbuildable` を記録するのと同じ扱いで、
-                // 世代が進むまで無駄な再試行をしないよう記録する。
+                // 不能。採取失敗（`capture_scalar_index_snapshot` が `None`
+                // を返した場合）とは区別し、`mark_build_unbuildable` で
+                // 記録する。
                 scalar_access.cache.record_build_failure();
                 scalar_access
                     .cache
-                    .mark_capture_unbuildable(read_txn, table, ctx);
+                    .mark_build_unbuildable(read_txn, table, ctx);
                 None
             }
         };
@@ -1882,5 +1896,119 @@ mod tests {
             .expect("arena キャッシュヒット時は行テーブルの再走査に頼らず索引を構築できるはず");
         assert_eq!(snapshot.arena().len(), 2);
         assert_eq!(index.row_count(), 2);
+    }
+
+    /// codex-review P2 指摘（PR #603）の回帰: `SqlArenaCache` ヒット・
+    /// `ScalarIndexCache` ミスの経路で温かいスナップショットから
+    /// `ScalarIndex::build` を実行した結果が失敗した場合、
+    /// `mark_build_unbuildable` により同一世代の以降の呼び出しは
+    /// `is_capture_known_unbuildable` に阻まれて再試行しないことを固定する。
+    ///
+    /// 検証手段: `SqlArenaCaptureBuilder` へ、TEXT 列として不正な presence
+    /// バイト（`0xFF`）を含むメタデータを直接 `push` することで、通常の redb
+    /// 行走査を経由せず `ScalarIndex::build` が確実に失敗する温かいスナップ
+    /// ショットを手動で構築する。同一 `read_txn`（＝同一世代）で
+    /// `ensure_scalar_index_snapshot` を 2 回呼び、`ScalarIndexCacheStats::
+    /// build_failures` が 1 回目でのみ増加し 2 回目では増加しないことを
+    /// 確認する（修正前は 2 回目も構築を再試行し `build_failures` がもう
+    /// 1 回増えていた）。
+    #[test]
+    fn ensure_scalar_index_snapshot_does_not_retry_build_after_known_failure_in_same_generation() {
+        let path = unique_db_path("agg-scalar-index-build-failure-memo");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("kind", ColumnType::Text, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let expected_dim = schema.vector_dim().expect("vector dim");
+
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let generation = crate::catalog::table_generation_in_txn(&read_txn, "docs")
+            .expect("read table generation");
+
+        let mut capture = crate::arena::SqlArenaCaptureBuilder::new(
+            expected_dim,
+            crate::arena::MAX_ARENA_ROWS,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+        );
+        // `SqlArenaCaptureBuilder::push` はメタデータの内容を検証しない
+        // （`ScalarIndex::build` 実行時に初めて `scan_scalar_columns` が
+        // 検証する）ため、不正な presence バイトをそのまま仕込める。
+        capture.push(
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 2.0, 3.0],
+            &[0xFF],
+            0,
+        );
+        let (arena, metadata) = capture
+            .finish("docs")
+            .expect("capture must succeed structurally");
+        let snapshot = crate::sql::arena_cache::SqlArenaSnapshot::new(
+            arena,
+            metadata,
+            ctx.clone(),
+            generation,
+        );
+
+        let arena_cache = crate::sql::arena_cache::SqlArenaCache::new();
+        let scalar_cache = crate::sql::scalar_index::ScalarIndexCache::new();
+        arena_cache.insert(&storage, "docs", &ctx, snapshot);
+
+        let arena_access = crate::sql::arena_cache::ArenaCacheAccess {
+            storage: &storage,
+            cache: &arena_cache,
+        };
+        let scalar_access = crate::sql::scalar_index::ScalarCacheAccess {
+            storage: &storage,
+            cache: &scalar_cache,
+        };
+
+        let failures_before = scalar_cache.stats().build_failures;
+        let first = ensure_scalar_index_snapshot(
+            &read_txn,
+            &ctx,
+            &schema,
+            "docs",
+            expected_dim,
+            &arena_access,
+            &scalar_access,
+        );
+        assert!(
+            first.is_none(),
+            "corrupted TEXT metadata must make ScalarIndex::build fail"
+        );
+        let failures_after_first = scalar_cache.stats().build_failures;
+        assert_eq!(
+            failures_after_first,
+            failures_before + 1,
+            "the first attempt must record exactly one build failure"
+        );
+
+        let second = ensure_scalar_index_snapshot(
+            &read_txn,
+            &ctx,
+            &schema,
+            "docs",
+            expected_dim,
+            &arena_access,
+            &scalar_access,
+        );
+        assert!(second.is_none());
+        let failures_after_second = scalar_cache.stats().build_failures;
+        assert_eq!(
+            failures_after_second, failures_after_first,
+            "a generation already known to be unbuildable must not retry the build"
+        );
     }
 }
