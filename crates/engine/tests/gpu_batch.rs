@@ -1410,15 +1410,16 @@ mod f16_arith_dot_shader {
     fn f16_arith_overflow_guard_falls_back_to_unpack() {
         let row_count = 40;
         let dim = 128;
-        // 全成分 100.0 の行 × 全成分 100.0 のクエリ:
-        // row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK(8) = 100*100*8 = 80000
+        // 全成分 200.0 の行 × 全成分 200.0 のクエリ:
+        // row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK(1・PR #591 レビュー
+        // P1 指摘対応で 8 から変更) = 200*200*1 = 40000
         // > F16_ARITH_PARTIAL_SUM_LIMIT(32768) のためガードが unpack へ倒す。
         let fx = Fixture {
             ids: (1..=row_count as u64).collect(),
             tenant_ids: vec!["tenant-a".to_string(); row_count],
             visibilities: vec![Visibility::Public; row_count],
             dim,
-            vectors: vec![100.0f32; row_count * dim],
+            vectors: vec![200.0f32; row_count * dim],
         };
         let matrix = engine::batch_search::ResidentMatrix::build(
             &fx.ids,
@@ -1442,7 +1443,7 @@ mod f16_arith_dot_shader {
         }
 
         let c = ctx("tenant-a");
-        let query = vec![100.0f32; dim];
+        let query = vec![200.0f32; dim];
         let bq = [BatchQuery {
             vector: &query,
             k: 4,
