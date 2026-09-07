@@ -230,7 +230,7 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 | `bulk_knn_k200` / `bulk_knn_k1000` | 広域取得: フィルタなし Top-200／Top-1000 を `id, body` 込みで返す（LLM へ丸ごと渡す用途。ANN 構成は候補幅を max(64, k) へ引き上げて計測し `ef_search`／`hnsw_ef`／`ef` を記録） |
 | `bulk_knn_where_k200` | 広域取得: `lang = 'ja'` フィルタ付き Top-200（`id, body`） |
 | `bulk_hybrid_k200` | 広域取得: hybrid RRF の Top-200（`id, body`。pgvector・sqlite-vec は候補プールを 200 へ拡大し `candidate_pool` を記録） |
-| `scan_where_nosort_k500` | ORDER BY なしのスカラーフィルタのみ LIMIT 500（`id, body`）。self の SQL 表層は行取得 SELECT に `ORDER BY <距離>` か `USING PLAN` を必須とするため実行して拒否を捕捉し unsupported を記録 |
+| `scan_where_nosort_k500` | ORDER BY なしのスカラーフィルタのみ LIMIT 500（`id, body`）。Issue #454 で self の SQL 表層へ広域取得（`Statement::Scan`。`docs/design/wide-retrieval-scan.md`）を追加したため受理される。実行して受理／拒否を都度確認したうえで記録する |
 
 ## 公平性についての注記
 
