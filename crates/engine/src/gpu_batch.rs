@@ -1060,8 +1060,15 @@ struct GpuBatchStats {
     /// （ADR 決定 2 の縮退が実際に発生した観測点）。
     full_readback_fallbacks: std::sync::atomic::AtomicU64,
     readback_bytes: std::sync::atomic::AtomicU64,
-    /// [`select_dot_shader`] が `GpuDotShaderKind::F16Arith` を選び実際に
-    /// f16 算術版シェーダへ dispatch した回数（Issue #539）。
+    /// [`select_dot_shader`] が `GpuDotShaderKind::F16Arith` を選んだ
+    /// `batch_search` 呼び出し回数（Issue #539）。`partial_topk_dispatches`/
+    /// `full_readback_dispatches`（`run_tiled_batch_search` 内でチャンク単位
+    /// に実 GPU dispatch が成功するたび加算）とは加算タイミングが異なり、
+    /// 本カウンタは選択直後（`run_tiled_batch_search` 呼び出し前）に 1 回
+    /// だけ加算する。そのためこの後の dispatch が失敗しても本カウンタは
+    /// 減らない（「選択された回数」であって「成功した dispatch 回数」では
+    /// ない）。非 vacuous 判定（f16 経路が実際に選ばれたか）の用途では
+    /// この違いは問題にならない。
     f16_arith_dispatches: std::sync::atomic::AtomicU64,
     /// f16 算術版パイプラインは利用可能（`f16_arith_available()` が true）
     /// だが、[`select_dot_shader`] のオーバーフローガード不成立により

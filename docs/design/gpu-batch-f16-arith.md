@@ -91,7 +91,7 @@ try_new` で 1 回だけ走査して確定させ、`query_max_abs`（クエリ�
 
 ## 5. 統計・テスト用オーバーライド
 
-- `GpuBatchStatsSnapshot` へ `f16_arith_dispatches`（実際に f16 算術版へ
+- `GpuBatchStatsSnapshot` へ `f16_arith_dispatches`（`batch_search` 呼び出しが f16 算術版へ
   dispatch した回数）・`f16_arith_guard_fallbacks`（f16 算術版パイプライン
   は利用可能だが自動選択のオーバーフローガードにより unpack 版へ縮退した
   回数）を追加。`gpu_scaling_bench.rs` の `gpu_scaling_stats:` 出力行へ
