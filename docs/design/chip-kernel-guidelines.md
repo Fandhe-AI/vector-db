@@ -45,7 +45,7 @@ rustc 1.96.0（`#[target_feature(enable="avx2,fma")]` 等の safe fn 内）で
 | i8 VNNI 内積 | 不要（safe） | `_mm256_dpbusd_avx_epi32` |
 | binary popcount | 不要（safe） | `_mm512_popcnt_epi64` |
 | マスク演算・reduce | 不要（safe） | `_mm512_maskz_mov_ps` / `_mm512_reduce_add_ps` |
-| prefetch | 不要（safe） | `_mm_prefetch::<_MM_HINT_T0>(slice.as_ptr() as *const i8)` |
+| prefetch | 不要（safe） | `_mm_prefetch::<_MM_HINT_T0>(slice.as_ptr() as *const i8)`（`#[target_feature]` fn の内側限定。通常の fn から直接呼ぶと E0133。呼び出し元が新規 `unsafe` を追加できない場合は `core::hint::black_box` による早期 load で代替する——`core::hint::prefetch_read`〔`hint_prefetch` feature〕は stable 未安定化。Issue #490 で機械検証・`hnsw/prefetch.rs` に適用） |
 | ポインタ load/store | 必要（unsafe） | `_mm256_loadu_ps` / `_mm256_storeu_ps`（E0133） |
 
 結論: ポインタを取る load/store 以外は、`#[target_feature]` fn の内側であれば
@@ -170,7 +170,7 @@ Graviton4／Grace は SVE2 でも 128 bit のため NEON と理論ピークが�
 | f16 算術 | `Features::SHADER_F16`（Vulkan／Metal／DX12／WebGPU）。WGSL `enable f16;` |
 | i8 dot | WGSL `dot4I8Packed`／`dot4U8Packed`。naga が全 backend 実装（SPIR-V／HLSL／Metal は専用命令、他は polyfill）。専用命令化は DX12 SM≥6.4／Vulkan `VK_KHR_shader_integer_dot_product` |
 | `NATIVE_PACKED_INTEGER_DOT_PRODUCT` | wgpu 30.0.1 の `FeaturesWGPU` 定数一覧で未確認。実機 `adapter.features()` で要確認 |
-| Subgroup | `Features::SUBGROUP`（Vulkan／DX12／Metal）。GPU 側 Top-k 縮約に有効 |
+| Subgroup | `Features::SUBGROUP`（Vulkan／DX12／Metal）。GPU 側 Top-k 縮約に有効。実機確認・設計は [`gpu-batch-topk.md`](gpu-batch-topk.md)（#535） |
 | bf16 | 未確認 |
 
 ## 2. Rust stable での実現可能性
@@ -259,7 +259,7 @@ Issue #365 で行内マルチアキュムレータ化は不採用済み（cache 
 | 優先 | 候補 | 内容 | 既起票 |
 | ---- | ---- | ---- | ------ |
 | 1 | マルチクエリ dispatch＋クエリの workgroup 常駐 | 現状はクエリごとに行列全体を再読み込み（行列トラフィック Q 倍） | #531 |
-| 2 | GPU 側 Top-k | 行数分の f32 全量 readback（最大 32 MiB）を k×workgroup 数へ。`SUBGROUP` で縮約 | #534 |
+| 2 | GPU 側 Top-k | 行数分の f32 全量 readback（最大 32 MiB）を k×workgroup 数へ。`SUBGROUP` で縮約。実機確認・設計は [`gpu-batch-topk.md`](gpu-batch-topk.md)（#535） | #534 |
 | 3 | `SHADER_F16` ネイティブ f16 FMA | 現状は unpack して f32 演算。[`docs/design/core16-f16-resident-gate.md`](core16-f16-resident-gate.md) の環境依存があるため A/B 必須 | #538 |
 | 4 | i8 量子化＋`dot4I8Packed` | dim=128 が 32 words。`NATIVE_PACKED_INTEGER_DOT_PRODUCT` の有無は実機確認が要る | #541 |
 | 5 | Apple UMA ゼロコピー | [`docs/design/redb-insert-reserve-zero-copy.md`](redb-insert-reserve-zero-copy.md)（Issue #400）の先例に倣い静的確認を先に | #544 |

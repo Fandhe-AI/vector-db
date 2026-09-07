@@ -31,15 +31,17 @@ use std::collections::BTreeSet;
 
 use harness::hybrid_profile::{
     boundary_tie_decision, bucket_diff, build_actually_succeeds, collect_body_strings,
-    dense_refetch_schedule, fetch_cap, generate_corpus, generate_queries, initial_fetch_k,
-    is_exhaustive, next_fetch_k, refetch_schedule_matches_observed_calls,
-    refuse_under_github_actions, render_baseline_bucket_line, render_dense_refetch_line,
-    render_memory_line, render_sparse_refetch_line, render_sparse_refetch_summary_line,
-    render_stage_line, replica_matches_real, sql_dense_statement,
+    dense_refetch_schedule, expected_visible_count, fetch_cap, generate_corpus, generate_queries,
+    initial_fetch_k, is_exhaustive, next_fetch_k, parse_rows, parse_visible_ratio_denominator,
+    refetch_schedule_matches_observed_calls, refuse_under_github_actions,
+    render_baseline_bucket_line, render_dense_refetch_line, render_memory_line,
+    render_sparse_refetch_line, render_sparse_refetch_summary_line, render_stage_line,
+    replica_matches_real, select_visible_ids, sql_dense_statement,
     sql_dense_statement_with_projection, sql_hybrid_statement,
     sql_hybrid_statement_with_projection, summarize_sparse_refetch, tokenize_only,
     tokenize_term_doc_freq, tokenize_term_freq, HybridProjection, ProfileError, ProfileSparseIndex,
     RefetchSchedule, TieDecision, MAX_CORPUS_DOCS_GUARD, MAX_FETCH_K_MIRROR, MAX_POOL_DEPTH_MIRROR,
+    MAX_VISIBLE_RATIO_DENOMINATOR,
 };
 use harness::proc_stats::{parse_kb_line, read_vm_hwm_kb, read_vm_rss_kb};
 // `sparse_refetch_schedule` は `sparse_refetch_observed`（非既定 feature
@@ -403,6 +405,31 @@ fn profile_sparse_index_replica_matches_real_search_within() {
 }
 
 #[test]
+fn profile_sparse_index_replica_matches_real_search_within_full_index_stride_visible() {
+    // Issue #547: 直接 API 段が使う「全件索引＋可視部分集合」の形（索引は
+    // corpus 全件・可視集合は `select_visible_ids` の decimation 規則）で
+    // 複製実装が実 API と数値一致することを固定する。`even_visible`
+    // （2 で割った剰余）とは別に、Issue #547 が導入した可視率 1/10 の
+    // 規則そのもので回帰を張る。
+    let corpus = generate_corpus(43, 128, 8).expect("corpus ok");
+    let real = SparseIndex::build(&corpus.sparse_docs()).expect("real index ok");
+    let replica = ProfileSparseIndex::build(&corpus.sparse_docs()).expect("replica index ok");
+    let stride_visible = select_visible_ids(corpus.ids.len(), 10);
+    assert_eq!(
+        stride_visible.len(),
+        expected_visible_count(128, 10).unwrap()
+    );
+
+    let queries = generate_queries(43, 3, 8);
+    for q in &queries {
+        for k in [1usize, 5, 13] {
+            replica_matches_real(&real, &replica, &q.text, k, &stride_visible)
+                .unwrap_or_else(|e| panic!("replica mismatch (stride visible): {e}"));
+        }
+    }
+}
+
+#[test]
 fn profile_sparse_index_rejects_duplicate_doc_id() {
     let docs: Vec<(u64, &str)> = vec![(1, "vector search"), (1, "dense sparse")];
     let err = ProfileSparseIndex::build(&docs).unwrap_err();
@@ -747,6 +774,8 @@ fn profile_error_display_is_nonempty_for_new_variants() {
             observed: 2,
         },
         ProfileError::ContractViolation("boom".to_string()),
+        ProfileError::InvalidRows("must be >= 1 (got 0)".to_string()),
+        ProfileError::InvalidVisibleRatio("must be in \"1/<N>\" form".to_string()),
     ];
     for v in variants {
         assert!(!v.to_string().is_empty());
@@ -793,4 +822,134 @@ fn render_memory_line_reports_unavailable_when_rss_unreadable() {
     assert!(line.contains("vm_rss_kb_after=unavailable"));
     assert!(line.contains("rss_delta_kb=unavailable"));
     assert!(line.contains("vm_hwm_kb=unavailable"));
+}
+
+// =============================================================================
+// Issue #547: 行数・可視率 opt-in（`BENCH_HYBRID_PROFILE_ROWS`／
+// `BENCH_HYBRID_PROFILE_VISIBLE_RATIO`）のパーサ・選択関数
+// =============================================================================
+
+#[test]
+fn parse_rows_defaults_to_25000_when_unset_or_empty() {
+    assert_eq!(parse_rows(None), Ok(25_000));
+    assert_eq!(parse_rows(Some("")), Ok(25_000));
+    assert_eq!(parse_rows(Some("  ")), Ok(25_000));
+}
+
+#[test]
+fn parse_rows_accepts_boundary_values() {
+    assert_eq!(parse_rows(Some("1")), Ok(1));
+    assert_eq!(
+        parse_rows(Some("100000")),
+        Ok(MAX_CORPUS_DOCS_GUARD),
+        "100,000 must be accepted: sparse::MAX_CORPUS_DOCS and \
+         hybrid_profile::MAX_CORPUS_DOCS_GUARD both use a strict > comparison"
+    );
+}
+
+#[test]
+fn parse_rows_rejects_zero_over_limit_and_non_numeric() {
+    assert!(matches!(
+        parse_rows(Some("0")),
+        Err(ProfileError::InvalidRows(_))
+    ));
+    assert!(matches!(
+        parse_rows(Some("100001")),
+        Err(ProfileError::InvalidRows(_))
+    ));
+    assert!(matches!(
+        parse_rows(Some("not-a-number")),
+        Err(ProfileError::InvalidRows(_))
+    ));
+    assert!(matches!(
+        parse_rows(Some("-1")),
+        Err(ProfileError::InvalidRows(_))
+    ));
+}
+
+#[test]
+fn parse_visible_ratio_denominator_defaults_to_1_when_unset_or_empty() {
+    assert_eq!(parse_visible_ratio_denominator(None), Ok(1));
+    assert_eq!(parse_visible_ratio_denominator(Some("")), Ok(1));
+}
+
+#[test]
+fn parse_visible_ratio_denominator_accepts_1_over_n_form() {
+    assert_eq!(parse_visible_ratio_denominator(Some("1/1")), Ok(1));
+    assert_eq!(parse_visible_ratio_denominator(Some("1/10")), Ok(10));
+    assert_eq!(
+        parse_visible_ratio_denominator(Some(" 1/10 ")),
+        Ok(10),
+        "leading/trailing whitespace must be tolerated (GitHub Actions variable \
+         expansion trailing-newline concern, matching recall_engine.rs's policy)"
+    );
+    assert_eq!(
+        parse_visible_ratio_denominator(Some(&format!("1/{MAX_VISIBLE_RATIO_DENOMINATOR}"))),
+        Ok(MAX_VISIBLE_RATIO_DENOMINATOR)
+    );
+}
+
+#[test]
+fn parse_visible_ratio_denominator_rejects_non_1_over_n_forms() {
+    for bad in [
+        "10", "2/10", "1/0", "1/", "/10", "1/1001", "1/abc", "abc/10",
+    ] {
+        assert!(
+            matches!(
+                parse_visible_ratio_denominator(Some(bad)),
+                Err(ProfileError::InvalidVisibleRatio(_))
+            ),
+            "expected InvalidVisibleRatio for {bad:?}"
+        );
+    }
+}
+
+#[test]
+fn select_visible_ids_is_deterministic_and_matches_expected_count() {
+    let a = select_visible_ids(1_000, 10);
+    let b = select_visible_ids(1_000, 10);
+    assert_eq!(
+        a, b,
+        "select_visible_ids must be a pure deterministic function"
+    );
+    assert_eq!(a.len(), expected_visible_count(1_000, 10).unwrap());
+    // 決定的規則: doc_id % 10 == 0 のみが可視。
+    assert!(a.contains(&0));
+    assert!(a.contains(&990));
+    assert!(!a.contains(&1));
+    assert!(!a.contains(&999));
+}
+
+#[test]
+fn select_visible_ids_denominator_1_selects_all_rows() {
+    let visible = select_visible_ids(2_000, 1);
+    assert_eq!(visible.len(), 2_000);
+    assert_eq!(
+        visible,
+        (0..2_000u64).collect::<std::collections::BTreeSet<u64>>()
+    );
+}
+
+#[test]
+fn expected_visible_count_matches_ceil_division() {
+    assert_eq!(expected_visible_count(25_000, 1).unwrap(), 25_000);
+    assert_eq!(expected_visible_count(2_000, 10).unwrap(), 200);
+    // 割り切れない組み合わせは ceil で丸める（select_visible_ids の
+    // `doc_id % denominator == 0` 規則は 0 始まりのため常に floor(n/d)+1 の
+    // 端数だが、ceil_div と同じ件数になることを固定する）。
+    assert_eq!(expected_visible_count(7, 3).unwrap(), 3); // ids 0,3,6
+}
+
+#[test]
+fn expected_visible_count_never_yields_zero_for_rows_at_least_1() {
+    // `select_visible_ids` は 0 始まり連番なので `doc_id=0` が常に可視
+    // （`0 % denominator == 0`）となり、`rows>=1`（`parse_rows` が 0 を
+    // 拒否するため呼び出し元の前提でもある）なら分母をどれだけ大きく
+    // しても可視 0 件には到達しない。`expected_visible_count` の
+    // 「0 件は Err」ガードは、この不変条件が崩れた場合の防御として
+    // 残るだけであることを固定する。
+    assert_eq!(
+        expected_visible_count(1, MAX_VISIBLE_RATIO_DENOMINATOR).unwrap(),
+        1
+    );
 }

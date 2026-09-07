@@ -10,9 +10,9 @@
 mod harness;
 
 use harness::gpu_scaling::{
-    count_boundary_tolerant_mismatches, format_skip_line, format_unavailable_line, parse_batches,
-    parse_dims, parse_measured_iterations, parse_rows, parse_top_k, speedup_ratio,
-    GpuScalingResult,
+    count_boundary_tolerant_mismatches, format_skip_line, format_unavailable_line,
+    full_readback_bytes_estimate, parse_batches, parse_dims, parse_measured_iterations, parse_rows,
+    parse_top_k, readback_bytes_per_call, speedup_ratio, GpuScalingResult, GpuScalingStatsLine,
 };
 use std::time::Duration;
 
@@ -282,4 +282,111 @@ fn result_line_contains_all_required_fields() {
     ] {
         assert!(line.contains(expected), "missing {expected:?} in {line:?}");
     }
+}
+
+// ---------------------------------------------------------------------
+// 読み戻しバイト数の前後比較（Issue #537）向け純関数
+// ---------------------------------------------------------------------
+
+#[test]
+fn readback_bytes_per_call_divides_total_by_calls() {
+    assert_eq!(readback_bytes_per_call(1_000, 10).expect("ok"), 100);
+    // 割り切れない場合は切り捨て（整数除算。呼び出し元は「1 回あたり」の
+    // 概算値として扱う契約）。
+    assert_eq!(readback_bytes_per_call(1_001, 10).expect("ok"), 100);
+}
+
+#[test]
+fn readback_bytes_per_call_rejects_zero_calls() {
+    assert!(readback_bytes_per_call(1_000, 0).is_err());
+}
+
+#[test]
+fn full_readback_bytes_estimate_matches_rows_times_batch_times_four() {
+    assert_eq!(
+        full_readback_bytes_estimate(100_000, 64).expect("ok"),
+        100_000u64 * 64 * 4
+    );
+    assert_eq!(full_readback_bytes_estimate(0, 64).expect("ok"), 0);
+    assert_eq!(full_readback_bytes_estimate(100, 0).expect("ok"), 0);
+}
+
+#[test]
+fn full_readback_bytes_estimate_rejects_overflow() {
+    // rows・batch のいずれも usize::MAX 級であれば `* 4` で確実にオーバー
+    // フローする組み合わせを与え、fail-closed に拒否されることを固定する
+    // （無音のラップアラウンドで小さい「算出値」を返さない）。
+    assert!(full_readback_bytes_estimate(usize::MAX, 2).is_err());
+}
+
+#[test]
+fn gpu_scaling_stats_line_display_contains_all_required_fields() {
+    let line = GpuScalingStatsLine {
+        rows: 100_000,
+        dim: 128,
+        batch: 64,
+        k: 10,
+        calls: 40,
+        f16_readback_bytes_total: 1_024,
+        f16_readback_bytes_per_call: 25,
+        f16_partial_topk_dispatches: 40,
+        f16_full_readback_dispatches: 0,
+        f16_full_readback_fallbacks: 0,
+        f32_readback_bytes_total: 2_048,
+        f32_readback_bytes_per_call: 51,
+        f32_partial_topk_dispatches: 40,
+        f32_full_readback_dispatches: 0,
+        f32_full_readback_fallbacks: 0,
+    };
+    let rendered = line.to_string();
+    for expected in [
+        "gpu_scaling_stats:",
+        "rows=100000",
+        "dim=128",
+        "batch=64",
+        "k=10",
+        "calls=40",
+        "f16_readback_bytes_total=1024",
+        "f16_readback_bytes_per_call=25",
+        "f16_partial_topk_dispatches=40",
+        "f16_full_readback_dispatches=0",
+        "f16_full_readback_fallbacks=0",
+        "f32_readback_bytes_total=2048",
+        "f32_readback_bytes_per_call=51",
+        "f32_partial_topk_dispatches=40",
+        "f32_full_readback_dispatches=0",
+        "f32_full_readback_fallbacks=0",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected:?} in {rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn gpu_scaling_stats_line_prefix_does_not_collide_with_result_line_grep() {
+    // `scripts/bench_gpu_scaling_ab.sh` は結果行を `^gpu_scaling: rows=` で
+    // grep する（PR #580 由来）。統計行の接頭辞 `gpu_scaling_stats: ` は
+    // この前方一致パターンにマッチしないことを固定し、既存 A/B 集計
+    // スクリプトへ統計行が結果行として誤って取り込まれないことを保証する。
+    let line = GpuScalingStatsLine {
+        rows: 1,
+        dim: 1,
+        batch: 1,
+        k: 1,
+        calls: 1,
+        f16_readback_bytes_total: 0,
+        f16_readback_bytes_per_call: 0,
+        f16_partial_topk_dispatches: 0,
+        f16_full_readback_dispatches: 0,
+        f16_full_readback_fallbacks: 0,
+        f32_readback_bytes_total: 0,
+        f32_readback_bytes_per_call: 0,
+        f32_partial_topk_dispatches: 0,
+        f32_full_readback_dispatches: 0,
+        f32_full_readback_fallbacks: 0,
+    };
+    let rendered = line.to_string();
+    assert!(!rendered.starts_with("gpu_scaling: rows="));
 }

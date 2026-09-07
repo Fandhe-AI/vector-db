@@ -1150,21 +1150,35 @@ impl TableLookup for Storage {
         match self.get_table_schema(name) {
             Ok(_) => Ok(true),
             Err(CatalogError::TableNotFound(_)) => Ok(false),
-            Err(CatalogError::Invalid(detail)) => Err(SqlSurfaceError::unsupported(format!(
-                "malformed table reference: {detail}"
-            ))),
-            Err(
-                CatalogError::Backend(_)
-                | CatalogError::CorruptSchema(_)
-                | CatalogError::TableAlreadyExists(_)
-                | CatalogError::ColumnAlreadyExists(_)
-                | CatalogError::RowNotFound(_)
-                | CatalogError::IncompatibleRowKeyFormat
-                | CatalogError::TableGenerationCounterOverflow,
-            ) => Err(SqlSurfaceError::Internal {
-                detail: "catalog lookup failed".to_string(),
-            }),
+            Err(other) => Err(table_lookup_error(other)),
         }
+    }
+}
+
+/// [`TableLookup::table_exists`]（`impl TableLookup for Storage`）と
+/// `core.rs::InsertSchemaLookup`（Issue #485・単文 INSERT 経路のスキーマ取得
+/// 一本化。1 read txn・1 decode で済ませる私的キャッシュ）が共有する
+/// `CatalogError → SqlSurfaceError` の写像本体。両者は同じ `get_table_schema`
+/// 系の呼び出しに対して同一のエラー文言・`wire_code` を返す契約を持つため、
+/// ここへ抽出することで機械的に一致させる（写像がずれると security.md
+/// P0「エラー経由で内部情報・存在情報を漏らさない」契約の検査対象が
+/// 呼び出し箇所ごとに分裂してしまう）。`TableNotFound` はこの関数の対象外
+/// （呼び出し元が `Ok(false)`／`UndefinedTable` へ個別に振り分ける）。
+pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::Invalid(detail) => {
+            SqlSurfaceError::unsupported(format!("malformed table reference: {detail}"))
+        }
+        CatalogError::TableNotFound(_)
+        | CatalogError::Backend(_)
+        | CatalogError::CorruptSchema(_)
+        | CatalogError::TableAlreadyExists(_)
+        | CatalogError::ColumnAlreadyExists(_)
+        | CatalogError::RowNotFound(_)
+        | CatalogError::IncompatibleRowKeyFormat
+        | CatalogError::TableGenerationCounterOverflow => SqlSurfaceError::Internal {
+            detail: "catalog lookup failed".to_string(),
+        },
     }
 }
 
