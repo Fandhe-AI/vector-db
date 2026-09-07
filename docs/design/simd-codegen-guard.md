@@ -53,8 +53,8 @@ feature のため `SimdKernel::dot` 本体へインライン化される。関�
 
 | target | 必須シンボル |
 | ------ | ------------ |
-| x86_64 | `dot_avx2_fma` かつ `dot_avx512` |
-| aarch64 | `SimdKernel::dot`（`dot_neon` はインライン化されるため対象外） |
+| x86_64 | `dot_avx2_fma` かつ `dot_avx512`（各シンボルは Issue #528 以降 `PADDED_TAIL` の `false`／`true` 2 monomorphization として現れる） |
+| aarch64 | `SimdKernel::dot_with_scalar_tail` かつ `SimdKernel::dot_with_padded_tail`（`dot_neon` はインライン化されるため対象外。Issue #528 で `SimdKernel::dot` から更新——`dot_impl<const PADDED_TAIL: bool>` を共有本体化したことで `dot` は LLVM の関数マージによりラベルを持たないエイリアス（`.s` 上は `.set`）として出力され、独立シンボルとして現れなくなったため） |
 
 ## 3. 禁止命令集合と根拠
 
@@ -97,6 +97,59 @@ feature のため `SimdKernel::dot` 本体へインライン化される。関�
 - aarch64
   - `SimdKernel::dot`: `ldr q`／`ldp q`・`fmla v.4s`・`dup v.4s`
   - レーン挿入命令（`ld1 {...}[n]`／`ins v`／`mov v_.[bhsd][`）は 0 件
+
+### Issue #528 以降の追記
+
+`dot_lanes` へ `const PADDED_TAIL: bool` を追加し、端数（tail）処理方式を
+現行のスカラー逐次和（`false`）／零埋め固定長バッファによる分岐なし tail
+（`true`）で切り替え可能にした（詳細は `docs/design/dot-kernel-branchless-tail.md`
+参照。既定経路の挙動は不変）。x86_64 では `dot_avx2_fma`／`dot_avx512` の
+マングル名は共通のため両 monomorphization が同一の必須シンボル検査を満たす。
+aarch64 では `SimdKernel::dot` がエイリアス化され独立シンボルとして現れなく
+なったため、必須シンボルを `SimdKernel::dot_with_scalar_tail`／
+`dot_with_padded_tail`（`dot_impl::<false>`／`dot_impl::<true>` の薄い
+ラッパー）へ更新した（`required_segments_for` の aarch64 分岐）。禁止命令は
+`padded_tail_sum`（新設。零埋めバッファへの 1 要素ずつのコピー ＋ 積 ＋
+`iter().sum()`）を含め x86_64・aarch64 いずれも 0 件のまま。
+
+### Issue #510 以降の追記（4 行ブロックカーネルの必須シンボル追加と実測知見）
+
+`isa::x86_block4::dot_block4_avx2_fma`／`dot_block4_avx512`（TASK-156・CORE-14。
+`search_range` の 4 行ブロックカーネル。詳細は `docs/design/dot-kernel-row-block.md`
+参照）を必須シンボルへ追加した（`required_segments_for` の x86_64 分岐に
+`dot_block4_avx2_fma`／`dot_block4_avx512` を追加。両関数は `isa.rs` の
+`mod x86_block4;` サブモジュール配下だが、マングル名は
+`_ZN6engine3isa10x86_block4...` の形で `3isa` セグメントを含み続けるため、
+既存の「モジュール単位」抽出方式（本 doc §2「なぜ関数名ではなくモジュール単位で
+対象を絞るか」）は変更せずそのまま対象に含まれる）。aarch64 側の必須シンボルは
+不変（本 Issue の `Neon` variant は 4 × `dot` の縮退のみで新規シンボルを持たない）。
+
+**実装過程で判明した禁止命令の再混入経路（本ガードの実効性を裏付ける実例）**:
+当初 `_mm256_set_ps`（レーンロード。`load8`/`load16`）から得たレーンを
+`[f32; LANES]` 配列へ詰めてから `iter().sum()` する構成にしたところ、本ガードが
+`vinsertps`／`vunpcklps`／`vunpckhps` を検出して fail した。実測（`.s` 直接確認）
+により、①主ループ自体（`vmovups` ×1 + `vfmadd231ps` ×4／行）は禁止命令 0 件で
+意図どおりだったが、②ループ後の「4 行分の水平和を `[f32; 4]` の戻り値として
+1 回で返す」処理を LLVM の SLP ベクトライザが見つけ、4 本の独立したスカラー
+水平和を `vinsertps`/`vunpck*` で 1 個の SIMD レジスタへ再構成してから
+1 回の `vmovups` ストアへまとめる最適化を行っていたことが原因と判明した
+（`[f32; LANES]` を経由しないスカラー直接縮約〔`lane_sum8`/`lane_sum16`〕へ
+変更しても、戻り値が `[f32; 4]` である限り同じ再パックが起きた）。
+最終的に `dot_block4_avx2_fma`/`dot_block4_avx512` の戻り値を `[f32; 4]` の
+1 回の戻り値ではなく **4 個の独立した `&mut f32` 出力引数**へ変更し、`[f32; 4]`
+の組み立てを呼び出し元（`#[target_feature]` を持たないプレーンな関数
+`isa.rs::SimdKernel::dot_block4_impl`）側で行うことで、SLP が対象を見つけられなく
+なり禁止命令が消えることを確認した。実測命令サマリ（本開発環境・rustc
+1.96.0）:
+
+- `dot_block4_avx2_fma`: 主ループ `vmovups` ×1・`vfmadd231ps` ×4／行、水平和は
+  `vshufps`・`vshufpd`・`vextractf128`・`vmovshdup`・`vaddss` 主体。禁止命令 0 件
+- `dot_block4_avx512`: 同型に加え `vextractf32x4`・`vpxord`。禁止命令 0 件
+
+この経緯は「LLVM の最適化はコードの書き方の些細な違いで挙動が変わり、
+機械検査なしには気付けない」という本 ADR §1 の動機を実例で裏付けるものであり、
+`docs/design/dot-kernel-row-block.md`「レーン和をスカラー直接縮約にした理由」
+節にも同じ原因分析を記録する。
 
 ## 6. self-test fixture の設計
 

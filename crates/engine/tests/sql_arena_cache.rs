@@ -442,3 +442,16 @@ fn scalar_free_projection_cache_hit_matches_cold_cache_fast_path() {
         "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 4",
     );
 }
+
+/// Issue #453: スカラー列（`body`）を投影する `LIMIT k`（k < 可視行数）は
+/// `defer_projection` により Top-k 確定後の遅延デコード経路へ乗る。cold
+/// （redb 再走査で `on_visible_row` を経由し `SqlArenaCache::insert` でスナップ
+/// ショットを登録）・warm（`cache_fast_path_eligible` の高速経路。`Snapshot`
+/// 由来の遅延デコード）で結果が完全一致することを固定する。
+#[test]
+fn deferred_scalar_projection_cache_hit_matches_cold_cache() {
+    assert_cold_equals_warm(
+        "sql-arena-cache-diff-deferred-scalar",
+        "SELECT id, body FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 4",
+    );
+}

@@ -229,3 +229,264 @@ Issue #405 の受け入れ条件（ef=64 で ≥0.95、ef=256 で ≥0.99）は�
 `greedy_descend`／`greedy_descend_masked`（上位層貪欲降下）・エントリ
 ポイントループへの先読みは本 Issue では未適用（#491 で効果確認後に別
 Issue で検討）。効果の前後比較・採否は #491 の担当。
+
+## Issue #491: 受理判定後 prefetch の前後比較と採否
+
+### 対象・方法
+
+- before: `4d2bd23`（`eabff3a` の親。prefetch 導入前）
+- after: `eabff3a`（`perf(engine): search_layer に受理判定後の隣接ベクトル・
+  visited prefetch を追加する (#574)`。#490 の実装）
+- `git diff 4d2bd23 eabff3a -- Cargo.lock crates/engine/Cargo.toml` は空
+  （同一 `Cargo.lock` で before/after をビルド。`docs/design/
+  benchmark-judgement-policy.md` §3 の要件）
+- 新設ベンチ 3 ファイル（`benches/hnsw_search_bench.rs`・
+  `benches/harness/hnsw_search_latency.rs`・`harness/mod.rs` の 1 行・
+  `Cargo.toml` の `[[bench]]`）だけを `git archive` した各コミットのツリー
+  へ個別に追加し、`CARGO_TARGET_DIR` を分離して `cargo bench --no-run` で
+  ビルドした 2 バイナリを、8 規模点（`{10k, 100k} 行 × {128, 768} 次元 ×
+  {マスクなし, 可視率 50%}`）それぞれについて交互 5 ペア（before→after を
+  1 ペアとして 5 回）起動した
+- 索引構築は逐次 `HnswIndex::build`（`build_with_threads` は使わない）。
+  同一シードなら before/after で完全に同一のグラフになるため、探索
+  レイテンシの差分が「同じグラフに対する prefetch の有無」だけに帰属する
+- コーパス・クエリは決定的 PRNG（`DeterministicRng`）で生成し L2 正規化
+  （`harness::hnsw_compare::l2_normalize_corpus` を再利用）。マスクは
+  `NodeMask` を可視率どおりベルヌーイ試行で決定的に生成（`Subset` 形状を
+  模す。RLS 事前フィルタ統合〔Issue #409〕の実運用条件）
+- 参照区間（変更〔prefetch〕を含まない区間）: 探索本体と同一のクエリ
+  サイクル・同一シードで回した brute-force Top-k（`engine::kernel::
+  CpuScalarProvider`。`kernel.rs` は #490 で無変更）。**ノイズ帯（実測帯）
+  は単一プロセス内では算出しない**——単一プロセス内の分布には同じクエリ
+  サイクルに含まれる各クエリ間の所要時間差が混入し、`docs/design/
+  benchmark-judgement-policy.md` §4 が求める run-to-run（プロセス実行間）
+  幅にならないため（codex-review 指摘・Issue #491）。各プロセスは
+  `min_us`／`median_us` という代表値のみを出力し（`hnsw_search_bench.rs`
+  の `render_reference_line`）、実測帯はこの代表値を交互起動した複数
+  プロセス（本 Issue では 1 規模点あたり before 5 回＋after 5 回＝10 回）
+  から集めた値列に対して `harness::hnsw_search_latency::reference_band`
+  を適用して算出する。before/after で参照区間側（brute-force 経路）は
+  変更されていないため（`kernel.rs` 無変更）、本 doc では before・after
+  10 プロセス分の代表値を 1 つの値列にプールして算出する（pooled 方式。
+  before 側単独・after 側単独に分けた帯より母数が大きく、ノイズ推定が
+  より安定するため採用）
+- min-of-N（N=5）・median を両方記録し、参照区間の実測ノイズ帯（pooled・
+  `(max − min) / min`）を判定材料として併記する
+  （`docs/design/benchmark-judgement-policy.md` §4）
+
+### 環境（policy §3）
+
+- CPU: `QEMU Virtual CPU version 2.5+`（KVM）・12 vCPU
+- 命令セットフラグ: `avx2` `fma` `f16c` あり・`avx512*` 無し（`lscpu` 全文で確認）
+- 負荷: 各 run 直前の `loadavg` は概ね 3〜9（別プロセスと共有・非専有。
+  `BENCH_DEDICATED_ENV` 未設定）
+- **判定不能な施策種別**: `docs/design/benchmark-judgement-policy.md` §6 は
+  「キャッシュ規模依存のレイアウト最適化（CSR 化・prefetch・チャンク連続
+  格納）」を本開発環境で構造的に判定不能な種別として既に列挙している
+  （関連 Issue #364・#489・#492）。本 Issue（#491）の対象（`search_layer`
+  への prefetch。Issue #490）も同一種別に該当する
+
+### 実測表（8 規模点。単位 µs。`ratio = after / before`）
+
+#### 表 1: 実測値・固定 ±5% 帯による判定クラス
+
+`判定クラス` は `docs/design/benchmark-judgement-policy.md` §2・§4 の
+`classify_change` に相当する固定相対帯（±5%）のみによる分類であり、
+この帯だけを根拠に採否を決めない（表 2 の「両帯超過」で採否根拠の
+可否を別途判定する）。
+
+| 規模点 | before min | before median | after min | after median | ratio(min) | ratio(median) | 判定クラス(min) | 判定クラス(median) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 10k × dim128・マスクなし | 31.730 | 36.737 | 31.317 | 35.472 | 0.9870 | 0.9656 | Neutral | Neutral |
+| 10k × dim128・可視率50% | 54.996 | 61.045 | 58.754 | 65.916 | 1.0683 | 1.0798 | Regressed | Regressed |
+| 10k × dim768・マスクなし | 167.345 | 207.130 | 165.395 | 195.513 | 0.9883 | 0.9439 | Neutral | Improved |
+| 10k × dim768・可視率50% | 105.274 | 120.982 | 105.527 | 122.124 | 1.0024 | 1.0094 | Neutral | Neutral |
+| 100k × dim128・マスクなし | 97.536 | 121.216 | 92.330 | 113.062 | 0.9466 | 0.9327 | Improved | Improved |
+| 100k × dim128・可視率50% | 427.997 | 449.890 | 431.991 | 457.543 | 1.0093 | 1.0170 | Neutral | Neutral |
+| 100k × dim768・マスクなし | 355.731 | 476.746 | 364.344 | 497.237 | 1.0242 | 1.0430 | Neutral | Neutral |
+| 100k × dim768・可視率50% | 563.955 | 637.557 | 554.073 | 618.216 | 0.9825 | 0.9697 | Neutral | Neutral |
+
+`before min`／`after min` は各点 5 プロセス（ペア）の `min_us` の
+min-of-5、`before median`／`after median` は各点 5 プロセスの
+`median_us` の median-of-5（下記「per-run 生値」から再計算可能）。
+
+#### 表 2: 参照区間の実測ノイズ帯・両帯超過（採否根拠として使える変化）の判定
+
+`参照帯` は pooled 方式（before 5 プロセス＋after 5 プロセス＝10 プロセス
+の代表値を 1 つの値列として `reference_band` へ渡した算出値。単位は
+`min`／`median` いずれも百分率）。`両帯超過` は
+`|ratio − 1.0| > 0.05` かつ `|ratio − 1.0| > 参照帯/100` の両方を満たす
+場合のみ `Yes`（benchmark-judgement-policy.md §4「両ノイズ帯を超えるとは」
+の定義どおり、`Improved`／`Regressed` いずれの方向にも対称に適用する。
+表 1 の「判定クラス」が `Improved`／`Regressed` でも参照帯が広く
+`両帯超過` に至らない点（例: `100k×dim128・マスクなし` は min・median
+とも `Improved` だが参照帯 20.67%／42.34% には収まらず `No`）と、固定帯
+・参照帯の双方を超えて残る点（`10k×dim128・可視率50%` のみ）とが
+併存することが、「固定帯の判定クラス」と「採否に使える変化」を区別する
+具体例）。
+
+| 規模点 | 参照帯(min) | 参照帯(median) | 両帯超過(min) | 両帯超過(median) |
+| --- | --- | --- | --- | --- |
+| 10k × dim128・マスクなし | 23.36% | 19.77% | No | No |
+| 10k × dim128・可視率50% | 2.66% | 2.67% | **Yes** | **Yes** |
+| 10k × dim768・マスクなし | 7.84% | 10.26% | No | No |
+| 10k × dim768・可視率50% | 14.55% | 26.74% | No | No |
+| 100k × dim128・マスクなし | 20.67% | 42.34% | No | No |
+| 100k × dim128・可視率50% | 3.21% | 6.76% | No | No |
+| 100k × dim768・マスクなし | 16.48% | 42.26% | No | No |
+| 100k × dim768・可視率50% | 4.00% | 12.71% | No | No |
+
+per-run 生値（`target=hnsw_search`・`reference=brute_force` それぞれの
+`min_us`／`median_us`。5 ペア分。表 1・表 2 の集計元データ）:
+
+```text
+10k_d128_none:
+  target_min:    before=[33.134, 32.822, 32.568, 33.264, 31.730] after=[32.858, 31.602, 31.647, 31.669, 31.317]
+  target_median: before=[37.193, 36.294, 36.737, 37.744, 36.417] after=[39.049, 35.631, 35.232, 35.472, 35.288]
+  ref_min:       before=[98.992, 81.499, 80.244, 81.525, 81.711] after=[82.330, 81.456, 81.612, 94.333, 81.469]
+  ref_median:    before=[101.706, 86.087, 84.916, 86.639, 86.384] after=[88.193, 85.990, 85.949, 97.010, 86.173]
+
+10k_d128_mask50:
+  target_min:    before=[55.590, 54.997, 54.996, 55.513, 56.108] after=[59.837, 58.754, 60.686, 59.293, 59.791]
+  target_median: before=[61.313, 61.141, 61.045, 60.928, 60.991] after=[65.916, 65.435, 66.052, 65.807, 65.968]
+  ref_min:       before=[81.073, 80.918, 79.970, 81.165, 81.581] after=[81.154, 81.119, 81.203, 81.417, 82.097]
+  ref_median:    before=[85.843, 85.666, 84.393, 85.935, 86.414] after=[85.854, 85.772, 85.995, 86.179, 86.648]
+
+10k_d768_none:
+  target_min:    before=[171.106, 175.597, 171.472, 167.345, 169.029] after=[165.395, 169.019, 167.451, 165.831, 168.793]
+  target_median: before=[201.883, 211.133, 207.130, 207.109, 209.195] after=[193.191, 194.602, 195.903, 195.513, 197.576]
+  ref_min:       before=[760.089, 818.352, 768.997, 809.860, 789.198] after=[773.809, 763.170, 773.620, 819.717, 786.236]
+  ref_median:    before=[787.814, 848.979, 798.762, 848.204, 825.625] after=[868.619, 791.809, 801.891, 852.516, 814.923]
+
+10k_d768_mask50:
+  target_min:    before=[105.274, 106.151, 110.749, 106.025, 116.574] after=[105.838, 116.423, 127.250, 105.527, 106.907]
+  target_median: before=[118.785, 120.982, 127.513, 120.358, 130.642] after=[120.900, 144.775, 148.302, 120.283, 122.124]
+  ref_min:       before=[811.545, 771.381, 838.155, 821.559, 762.721] after=[817.028, 873.718, 781.605, 811.556, 793.988]
+  ref_median:    before=[837.063, 815.996, 891.043, 850.213, 789.735] after=[865.041, 1000.887, 829.038, 841.311, 825.409]
+
+100k_d128_none:
+  target_min:    before=[97.536, 99.745, 99.311, 114.226, 99.281] after=[93.154, 92.709, 92.330, 92.520, 95.429]
+  target_median: before=[117.653, 121.809, 121.216, 145.008, 117.695] after=[113.238, 112.833, 110.050, 113.062, 113.532]
+  ref_min:       before=[1796.346, 2009.329, 1979.172, 2167.659, 2009.626] after=[1951.177, 1934.946, 1995.044, 2010.843, 1987.943]
+  ref_median:    before=[1880.079, 2125.078, 2034.358, 2676.177, 2074.485] after=[2320.033, 2091.521, 2058.801, 2067.197, 2051.366]
+
+100k_d128_mask50:
+  target_min:    before=[430.216, 427.997, 429.438, 429.140, 431.117] after=[439.690, 433.967, 442.308, 431.991, 435.479]
+  target_median: before=[449.890, 448.879, 448.532, 452.132, 450.387] after=[463.381, 457.543, 464.103, 453.781, 453.870]
+  ref_min:       before=[1980.843, 1976.598, 1977.827, 1987.810, 2017.942] after=[2035.405, 1983.474, 2040.087, 2011.972, 1996.406]
+  ref_median:    before=[2037.215, 2048.594, 2059.394, 2039.337, 2088.492] after=[2174.837, 2056.751, 2169.444, 2086.112, 2049.812]
+
+100k_d768_none:
+  target_min:    before=[355.731, 371.497, 573.918, 375.548, 391.831] after=[430.900, 364.344, 376.173, 393.926, 477.322]
+  target_median: before=[434.800, 455.147, 760.078, 476.746, 498.414] after=[551.651, 449.520, 455.432, 497.237, 604.914]
+  ref_min:       before=[12224.855, 13708.181, 13661.991, 13928.550, 14239.645] after=[12368.938, 12857.951, 13929.325, 14229.091, 14031.782]
+  ref_median:    before=[12457.964, 14092.931, 14285.526, 14251.558, 17722.918] after=[12783.316, 13099.831, 14253.119, 14503.378, 14494.014]
+
+100k_d768_mask50:
+  target_min:    before=[563.955, 630.958, 570.585, 570.674, 590.570] after=[556.195, 635.612, 554.073, 562.234, 556.211]
+  target_median: before=[622.606, 715.489, 637.557, 629.691, 651.865] after=[610.840, 734.747, 618.216, 624.436, 610.902]
+  ref_min:       before=[14021.071, 14495.996, 14076.967, 14000.292, 14055.228] after=[13959.821, 14397.984, 14087.647, 13946.255, 13938.387]
+  ref_median:    before=[14238.742, 15877.196, 14637.363, 14255.219, 14289.322] after=[14256.561, 15992.073, 14706.054, 14189.190, 14269.151]
+```
+
+すべての可視率50%点で `masked_short_queries=0`（`k` 未満の返却は発生せず、
+非 vacuous な計測であることを確認。`hnsw_search_bench.rs` の
+`call_index` ガードにより warmup フェーズの検索は計測に含まれない
+——Bugbot 指摘・Issue #491）。
+
+### `make hnsw-search-recall` 不変確認（Recall@10。ef=64／256）
+
+| フィクスチャ | ef | before | after |
+| --- | --- | --- | --- |
+| クラスタ構造あり | 64 | 1.0000 | 1.0000 |
+| クラスタ構造あり | 256 | 1.0000 | 1.0000 |
+| 一様乱数（informational） | 64 | 0.6410 | 0.6410 |
+| 一様乱数（informational） | 256 | 0.9535 | 0.9535 |
+
+4 値とも完全一致（`hnsw.rs::tests::search_layer_prefetch_*` が固定するビット
+同一契約と整合。prefetch が探索結果に影響しないことを実データ規模でも確認）。
+
+### 判定と採否
+
+Issue #491 が要求する 2 条件——(a) 8 点いずれもノイズ帯内なら Rejected・撤回、
+(b) QEMU 共有環境の数値は採否根拠にしない——は本環境では同時に満たせない。
+`docs/design/benchmark-judgement-policy.md` §5 は共有 QEMU 環境で
+**Accepted を不可**、**Rejected は「両ノイズ帯（固定 ±5% 帯・参照区間実測帯）
+を超える一貫した悪化＋静的解析の裏付け」がある場合のみ可**と定める。
+
+参照ノイズ帯をプロセス実行間の代表値列から算出する方式（表 2）に修正した
+結果、8 点中 1 点（`10k×dim128・可視率50%`）が min-of-N・median 双方で
+固定 ±5% 帯・参照区間実測帯の**両方**を超える悪化（`両帯超過=Yes`）として
+残った。この点は 5 ペアすべてで before の最大値 (56.108µs) より after の
+最小値 (58.754µs) が大きく、区間が重ならない一貫した悪化であり、参照帯も
+2.66〜2.67% と小さいためノイズでは説明しにくい。他の 7 点はいずれの方向にも
+両帯超過に至らない（`Improved` 方向も `100k×dim128・マスクなし` が固定帯
+のみ超過・参照帯 20.67%/42.34% には収まらず両帯超過は `No`）。
+
+- **Rejected（撤回）にはしない**: `docs/design/benchmark-judgement-policy.md`
+  §5 の撤回条件は「両ノイズ帯を超える一貫した悪化＋静的解析／実アセンブリの
+  裏付けがある場合」である。`10k×dim128・可視率50%` は両帯超過の悪化という
+  前半条件は満たすが、後半の静的解析／実アセンブリによる裏付けは本 Issue の
+  対象外（#490 のビット同一性検証止まり）で未実施のため、条件を完全には
+  満たさない
+- **Accepted と断定もしない**: 「速そうなので Accepted」と書くことは
+  policy §5 で明確に禁止されている。7 点は `Improved`／`Neutral` 方向で
+  両帯超過に至らず、prefetch 導入の一貫した改善効果を主張できる根拠にも
+  ならない
+- **`10k×dim128・可視率50%` の悪化は申し送り事項として明記する**:
+  1 点のみとはいえ両ノイズ帯を超える一貫した悪化であり、旧・誤った
+  算出方式（単一プロセス内のクエリ間差をノイズ帯として扱っていたため
+  この点の参照帯が 27.34%／120.53% と過大評価され `Neutral` に埋もれて
+  いた）では見えていなかった signal である。本 doc の「判断」を Rejected
+  へは倒さないが、この 1 点に限定した追加実測・原因調査は申し送る
+- **ステータス: 保留（production 無変更）。既にマージ済み・ビット同一性
+  検証済みのコード（#490）を、8 点中 1 点の悪化のみで撤回するのは
+  非破壊側の判断ではないと判断した。専有実機（`BENCH_DEDICATED_ENV=1`）
+  での再実測——特に `10k×dim128・可視率50%` の悪化が専有環境でも
+  再現するかの確認——をオーナーへ申し送る**
+
+### 申し送り
+
+- 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測手順: `make bench-hnsw-search`
+  に `BENCH_HNSW_SEARCH_ROWS`／`BENCH_HNSW_SEARCH_DIM`／`BENCH_HNSW_SEARCH_MASK`
+  を指定し、before/after バイナリ（`git archive <commit> | tar -x` で取り出し
+  た作業ツリーへ本 Issue の新設 3 ファイルを追加コピーし `cargo bench
+  --no-run` でビルドする）を交互 5 ペア以上で起動する。100k×768 の 1 点が
+  最も時間を要する（1 run あたり約 90〜115 秒。本開発環境の実測）
+- **`10k×dim128・可視率50%` の悪化（表 1・表 2、上記「判定と採否」）は
+  専有環境での優先再確認対象とする**: 8 点中唯一、両ノイズ帯を超える
+  一貫した悪化が観測された規模点であり、専有環境で再現すれば prefetch
+  導入（#490）の当該条件下（小規模・部分可視マスク）での撤回・条件付き
+  適用を検討する材料になる
+- `search_layer_locked`（並列構築のロック対応版）・`greedy_descend`／
+  `greedy_descend_masked`（上位層貪欲降下）・エントリポイントループへの
+  prefetch 適用検討は別 Issue（本 Issue の対象外のまま）
+- 真の prefetch 命令（`_mm_prefetch`／`_prefetch`）への差し替えは新規
+  `unsafe` 1 箇所を要するオーナー承認事項であり、本実測は「現状の
+  `black_box` 方式に効果があるかどうか」の判断材料に留まる（効果を
+  確実に測れなかったこと自体は、真の prefetch 命令への投資判断を積極的に
+  後押しする根拠にはならない）
+
+### 再現方法
+
+```bash
+git fetch origin main
+git archive 4d2bd23 | tar -x -C /path/to/before
+git archive eabff3a | tar -x -C /path/to/after
+# 各ツリーへ benches/hnsw_search_bench.rs・benches/harness/hnsw_search_latency.rs・
+# harness/mod.rs の `pub mod hnsw_search_latency;` 追記・Cargo.toml の
+# [[bench]] 追記 を適用してから:
+# BENCH_HNSW_SEARCH_COMMIT をビルド時に指定し、計測対象コミットをバイナリへ
+# 焼き込む（`git archive` で取り出した作業ツリーには .git が無く、指定しない
+# 場合の実行時フォールバック（git rev-parse HEAD）はカレントディレクトリの
+# HEAD を返すため、同じ作業ディレクトリから before/after を交互起動すると
+# 両方に同一値が記録されてしまう。codex-review 指摘・Issue #491）。
+BENCH_HNSW_SEARCH_COMMIT=4d2bd23 CARGO_TARGET_DIR=/path/to/target-before cargo bench --manifest-path /path/to/before/Cargo.toml --bench hnsw_search_bench -p engine --no-run
+BENCH_HNSW_SEARCH_COMMIT=eabff3a CARGO_TARGET_DIR=/path/to/target-after  cargo bench --manifest-path /path/to/after/Cargo.toml  --bench hnsw_search_bench -p engine --no-run
+# 8 規模点 × 交互 5 ペアで両バイナリを起動（BENCH_HNSW_SEARCH_ROWS／
+# BENCH_HNSW_SEARCH_DIM／BENCH_HNSW_SEARCH_MASK を指定）。各プロセスは
+# target/reference いずれも代表値（min_us／median_us）のみを出力する。
+# 参照区間の実測ノイズ帯（表 2）は単一プロセスの出力からは算出できず、
+# 交互起動した複数プロセス（本 doc では 1 規模点あたり計 10 プロセス分）
+# の代表値列を reference_band へ渡して別途算出する。
+```

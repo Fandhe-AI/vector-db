@@ -253,13 +253,33 @@ summarize_instructions() {
 }
 
 # 必須シンボル（target 別）の判定用セグメント。
+#
+# aarch64 側は Issue #528 で `10SimdKernel3dot`（`SimdKernel::dot`）から
+# `10SimdKernel20dot_with_scalar_tail`／`10SimdKernel20dot_with_padded_tail`
+# （`SimdKernel::dot_with_scalar_tail`／`dot_with_padded_tail`）へ置き換えた。
+# `dot_impl<const PADDED_TAIL: bool>` を共有本体化したことで、`dot` は
+# LLVM の関数マージにより独立シンボルとして現れず `dot_with_scalar_tail`
+# （`PADDED_TAIL=false`）のエイリアスになるため（計測で確認済み。`.s` 上は
+# ラベルではなく `.set` として出力され、本スクリプトのラベル抽出には現れない）、
+# 実体を持つ 2 wrapper を必須シンボルとする。x86_64 側は `dot_avx2_fma`／
+# `dot_avx512` のマングル名は `PADDED_TAIL` の値に関わらず同一関数名（トップレベル
+# の型パラメータを持たない `fn` の識別子部分）を共有し、両 monomorphization
+# （`PADDED_TAIL=false`／`true`）が同一セグメントを含むラベルとして現れるため
+# 変更不要。
 required_segments_for() {
   local arch_class="$1"
   if [ "${arch_class}" = "x86_64" ]; then
     echo "12dot_avx2_fma"
     echo "10dot_avx512"
+    # Issue #510（TASK-156・CORE-14）: 4 行ブロックカーネル
+    # `isa::x86_block4::dot_block4_avx2_fma`／`dot_block4_avx512`
+    # （いずれも `#[target_feature]` fn のため、`dot_avx2_fma`／`dot_avx512` と
+    # 同様に独立シンボルとして生成される）を必須シンボルへ追加する。
+    echo "19dot_block4_avx2_fma"
+    echo "17dot_block4_avx512"
   else
-    echo "10SimdKernel3dot"
+    echo "10SimdKernel20dot_with_scalar_tail"
+    echo "10SimdKernel20dot_with_padded_tail"
   fi
 }
 
