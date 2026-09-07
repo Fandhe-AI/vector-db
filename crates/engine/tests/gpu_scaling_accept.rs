@@ -12,9 +12,10 @@ mod harness;
 use harness::gpu_scaling::{
     count_boundary_tolerant_mismatches, format_i8_unavailable_line, format_skip_line,
     format_unavailable_line, full_readback_bytes_estimate, mean_recall_at_k, parse_batches,
-    parse_dims, parse_i8_oversample, parse_measured_iterations, parse_rows, parse_top_k,
-    readback_bytes_per_call, rescored_candidates_per_call, speedup_ratio, GpuScalingI8Result,
-    GpuScalingI8StatsLine, GpuScalingResult, GpuScalingStatsLine,
+    parse_dims, parse_i8_oversample, parse_measured_iterations, parse_query_f16_exact, parse_rows,
+    parse_shader_ab, parse_top_k, readback_bytes_per_call, rescored_candidates_per_call,
+    round_to_f16_exact, speedup_ratio, GpuScalingI8Result, GpuScalingI8StatsLine, GpuScalingResult,
+    GpuScalingStatsLine,
 };
 use std::time::Duration;
 
@@ -471,6 +472,68 @@ fn format_i8_unavailable_line_has_expected_prefix() {
         "gpu_scaling_i8: not measurable rows=20000 dim=128 batch=8 k=10 oversample=4"
     ));
     assert!(line.contains("gpu i8 backend init failed"));
+}
+
+// ---------------------------------------------------------------------
+// Issue #540: f16 厳密往復クエリ opt-in（`BENCH_GPU_SCALING_QUERY_F16_EXACT`）
+// ---------------------------------------------------------------------
+
+#[test]
+fn parse_query_f16_exact_defaults_to_false() {
+    assert_eq!(parse_query_f16_exact(None), Ok(false));
+    assert_eq!(parse_query_f16_exact(Some("")), Ok(false));
+}
+
+#[test]
+fn parse_query_f16_exact_accepts_only_literal_one() {
+    assert_eq!(parse_query_f16_exact(Some("1")), Ok(true));
+}
+
+#[test]
+fn parse_query_f16_exact_rejects_other_values_fail_closed() {
+    assert!(parse_query_f16_exact(Some("true")).is_err());
+    assert!(parse_query_f16_exact(Some("0")).is_err());
+    assert!(parse_query_f16_exact(Some("yes")).is_err());
+}
+
+// ---------------------------------------------------------------------
+// Issue #540 追記（codex-review P2 指摘対応・PR #611）: 同一クエリでの
+// シェーダ単体比較 opt-in（`BENCH_GPU_SCALING_SHADER_AB`）
+// ---------------------------------------------------------------------
+
+#[test]
+fn parse_shader_ab_defaults_to_false() {
+    assert_eq!(parse_shader_ab(None), Ok(false));
+    assert_eq!(parse_shader_ab(Some("")), Ok(false));
+}
+
+#[test]
+fn parse_shader_ab_accepts_only_literal_one() {
+    assert_eq!(parse_shader_ab(Some("1")), Ok(true));
+}
+
+#[test]
+fn parse_shader_ab_rejects_other_values_fail_closed() {
+    assert!(parse_shader_ab(Some("true")).is_err());
+    assert!(parse_shader_ab(Some("0")).is_err());
+    assert!(parse_shader_ab(Some("yes")).is_err());
+}
+
+#[test]
+fn round_to_f16_exact_is_idempotent() {
+    // 一度丸めた値は再度丸めても不変であること（f16 表現できる値の固定点）。
+    let samples = [0.0f32, 1.0, -1.0, 0.5, 123.25, -7.0, 1e-3, 1e4];
+    for &v in &samples {
+        let once = round_to_f16_exact(v);
+        let twice = round_to_f16_exact(once);
+        assert_eq!(once, twice, "not a fixed point for input {v}");
+    }
+}
+
+#[test]
+fn round_to_f16_exact_zero_stays_zero() {
+    assert_eq!(round_to_f16_exact(0.0), 0.0);
+    assert_eq!(round_to_f16_exact(-0.0), -0.0);
 }
 
 #[test]
