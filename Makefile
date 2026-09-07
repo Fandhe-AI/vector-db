@@ -574,7 +574,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: recall-regression
-recall-regression: ## TASK-104 のハイブリッド検索 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路を測定〔既定 brute_force。Issue #412〕）
+recall-regression: ## TASK-104 のハイブリッド検索 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路、RECALL_ENGINE=hnsw_f16 で f16 常駐 opt-in 経路を測定〔既定 brute_force。Issue #412・#515〕）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test hybrid_recall -- --ignored --nocapture
 else
@@ -586,7 +586,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: rerank-regression
-rerank-regression: ## TASK-108 のリランキング効果測定 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路を測定〔既定 brute_force。Issue #412〕）
+rerank-regression: ## TASK-108 のリランキング効果測定 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路、RECALL_ENGINE=hnsw_f16 で f16 常駐 opt-in 経路を測定〔既定 brute_force。Issue #412・#515〕）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test rerank_recall -- --ignored --nocapture
 else
@@ -598,7 +598,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: query-planning-regression
-query-planning-regression: ## TASK-112・TASK-113 のクエリ展開受け入れ基準（intent 改善幅・direct 維持・劣化展開時の intent 改善幅・大規模段 direct 絶対下限）Recall 閾値ゲート（層 B。--ignored 一括実行のため大規模段ゲートも対象に含む）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路を測定〔既定 brute_force。Issue #412〕）
+query-planning-regression: ## TASK-112・TASK-113 のクエリ展開受け入れ基準（intent 改善幅・direct 維持・劣化展開時の intent 改善幅・大規模段 direct 絶対下限）Recall 閾値ゲート（層 B。--ignored 一括実行のため大規模段ゲートも対象に含む）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路、RECALL_ENGINE=hnsw_f16 で f16 常駐 opt-in 経路を測定〔既定 brute_force。Issue #412・#515〕）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test query_planning_recall -- --ignored --nocapture
 else
