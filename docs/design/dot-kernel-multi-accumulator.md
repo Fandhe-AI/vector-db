@@ -324,6 +324,22 @@ dot_block.rs`・`benches/dot_kernel_bench.rs` の `measure_block_ab_stage` が
 ログは `docs/design`（本 doc）以外には保存していないため、再現には「再現手順
 （層 A）」節の手順を再実行すること）
 
+> **算出精度の注記（codex-review 指摘）**: 上表の A・B 列は
+> `render_block_ab_line`〔`crates/engine/benches/harness/dot_block.rs`〕が
+> `{:.3}` で出力する小数第 3 位丸めの表示値であり、min-of-N・median 列は
+> いずれもこの丸め後の A・B 表示値から算出した近似値である（丸め前の
+> 生 `Duration` 値は本 doc・ベンチいずれにも保存しておらず、実測を伴わない
+> 再集計はできない）。一方 r 列は同じ関数が丸め前の `ratio: f64` を
+> `{:.3}` で丸めて出力した値であり、A・B を経由せず直接算出している。
+> このため A・B 経由で丸め誤差が畳み込まれる min-of-N・median 列は、r 列
+> （丸め前の高精度値に基づく）の 5 run 最小〜最大レンジからわずかに外れ
+> うる。実際 cache_resident/768 は median 比 0.4556 が r 列レンジ
+> 〔0.457〜0.458〕の外、arena_scale/128 も median 比 1.0391 が r 列レンジ
+> 〔1.040〜1.045〕の外だが、他の 2 行（cache_resident/128・arena_scale/768）
+> は丸め誤差がレンジ内に収まっている。いずれも丸めによる小さな乖離
+> （0.0001〜0.001 台）であり、下記「判定」節の分類（`Improved`／
+> `ノイズ帯内`）には影響しない。
+
 参照区間（`block4_ab_ref`。A/B 側と同一 `repeat` 回で 1 行版 `dot` を反復走査。
 block4 A/B の対象外）の 1 プロセスぶんの代表値（`ref_median_ms`）と、そこから
 算出した run-to-run 相対ノイズ帯 `reference_band = (max-min)/min`
