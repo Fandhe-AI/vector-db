@@ -781,8 +781,12 @@ fn select_readback_mode(topk_pipeline_available: bool, tile_max_k: usize) -> Gpu
 
 /// dispatch する S0（内積）シェーダの種別（Issue #539）。`Unpack` は既存の
 /// `unpack2x16float` 経由 f32 積和（[`DOT_SHADER_WGSL`]/[`DOT_SHADER_TOPK_WGSL`]）、
-/// `F16Arith` は `SHADER_F16` 対応アダプタでのみ選ばれるネイティブ f16 積和
-/// （[`DOT_SHADER_F16_ARITH_WGSL`]/[`DOT_SHADER_TOPK_F16_ARITH_WGSL`]）。
+/// `F16Arith` は `SHADER_F16` 対応アダプタでのみ選ばれる f16 パック常駐版
+/// （[`DOT_SHADER_F16_ARITH_WGSL`]/[`DOT_SHADER_TOPK_F16_ARITH_WGSL`]。
+/// 行・クエリとも読み出した `vec2<f16>` を直後に `vec2<f32>` へ拡張して
+/// から積和するため算術自体は `Unpack` と同じく f32 で行う。常駐・転送
+/// 表現のみが f16 パックの点が異なる。クエリが f16 へ厳密往復できない
+/// 場合は [`select_dot_shader`] が `Unpack` へ fail-closed に縮退する）。
 /// `bench-internals` feature 限定の [`GpuSearchTestOptions::dot_shader`]
 /// フィールドで公開する必要があるため `pub` にしているが、既定ビルド・
 /// `wire-server` からは（`GpuSearchTestOptions` 自体が feature gate 済みの

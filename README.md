@@ -402,7 +402,7 @@ env 変数（すべて fail-closed パース。不正値は非ゼロ終了）:
 
 ### GPU バッチ検索の規模スイープ（`make bench-gpu-scaling`）
 
-`engine::gpu_batch`（f16 常駐）と CPU-SIMD バッチ経路の規模 × バッチサイズ別比較を行います。`BENCH_GPU_SCALING_ROWS`／`DIMS`／`BATCH`／`TOPK`／`ITERS` で計測条件を上書きできます。GPU 実機必須・手動実行専用ベンチで CI 非配線です。実測結果は `docs/design/crossdb-bench.md`「GPU」節を参照してください。`gpu_scaling:` 結果行に続けて出力される `gpu_scaling_stats:` 行（Issue #537）は f16／f32 各経路の読み戻し統計（`partial_topk_dispatches`・`full_readback_dispatches`・1 呼び出しあたり readback バイト数、Issue #539 追加分の `f16_arith_dispatches`・`f16_arith_guard_fallbacks`）を表示し、`scripts/bench_gpu_scaling_ab.sh` の結果行 grep（`^gpu_scaling: rows=`）とは接頭辞を分離しているため既存 A/B 集計には混入しません。`Features::SHADER_F16` 対応アダプタ（本開発環境の RTX 3060 を含む）では f16 経路が自動的にネイティブ半精度演算版シェーダを選ぶため、CORE-16 ゲートの被検側（f16 常駐）はこの新シェーダを経由します（前後比較・ゲートへの影響記録は Issue #540。詳細は `docs/design/gpu-batch-f16-arith.md` 参照）。
+`engine::gpu_batch`（f16 常駐）と CPU-SIMD バッチ経路の規模 × バッチサイズ別比較を行います。`BENCH_GPU_SCALING_ROWS`／`DIMS`／`BATCH`／`TOPK`／`ITERS` で計測条件を上書きできます。GPU 実機必須・手動実行専用ベンチで CI 非配線です。実測結果は `docs/design/crossdb-bench.md`「GPU」節を参照してください。`gpu_scaling:` 結果行に続けて出力される `gpu_scaling_stats:` 行（Issue #537）は f16／f32 各経路の読み戻し統計（`partial_topk_dispatches`・`full_readback_dispatches`・1 呼び出しあたり readback バイト数、Issue #539 追加分の `f16_arith_dispatches`・`f16_arith_guard_fallbacks`）を表示し、`scripts/bench_gpu_scaling_ab.sh` の結果行 grep（`^gpu_scaling: rows=`）とは接頭辞を分離しているため既存 A/B 集計には混入しません。`Features::SHADER_F16` 対応アダプタ（本開発環境の RTX 3060 を含む）では f16 経路が自動的に f16 パック常駐版シェーダ（読み出し直後に f32 へ拡張してから積和するため算術自体は f32。クエリが f16 へ厳密往復できない場合は unpack 版へ fail-closed に縮退）を選ぶため、CORE-16 ゲートの被検側（f16 常駐）はこの新シェーダを経由します（前後比較・ゲートへの影響記録は Issue #540。詳細は `docs/design/gpu-batch-f16-arith.md` 参照）。
 
 ### Recall 回帰ハーネスの repo secrets（TASK-104）
 
