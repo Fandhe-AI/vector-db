@@ -223,17 +223,17 @@ fn observe_group_enumeration(
     let Some(groups) = index.column_groups(group_by.column_index) else {
         return Ok(false);
     };
-    // `groups`（索引本体への借用イテレータ）の存続中に `index` への別の借用
-    // （後続の呼び出しはないが、`snapshot`／`index` を後で使う可能性に備えて
-    // 早期に所有データへ変換しておく）を避けるため、先に `Vec` へ複製する。
-    let groups: Vec<(String, Vec<u32>)> = groups
-        .map(|(value, slots)| (value.to_string(), slots.to_vec()))
-        .collect();
     let Some(null_slots) = index.slots_without_value(group_by.column_index) else {
         return Ok(false);
     };
 
-    for (value, slots) in &groups {
+    // `groups`（索引本体への借用イテレータ）はループの間ずっと `index` を借用
+    // したままにし、キー・スロットいずれも `check_new_group_budget` の容量検査
+    // を通過した分だけ所有データへ複製する（fail-closed 契約。容量超過時は
+    // 索引全体を無条件で `to_string`/`to_vec` する既存の infallible な複製を
+    // 避け、容量検査より前に確保が起きないようにする）。スロット列
+    // （`&[u32]`）は借用のまま [`observe_group_slots`] へ渡せるため複製不要。
+    for (value, slots) in groups {
         let current_group_count = string_groups.len() + usize::from(null_group.is_some());
         check_new_group_budget(current_group_count, total_key_bytes, value.len())?;
         let mut accs = new_accumulators(&bound.items)?;
@@ -246,7 +246,7 @@ fn observe_group_enumeration(
             &mut accs,
             total_text_accumulator_bytes,
         )?;
-        string_groups.insert(value.clone(), accs);
+        string_groups.insert(try_clone_str(value)?, accs);
     }
     if !null_slots.is_empty() {
         let current_group_count = string_groups.len() + usize::from(null_group.is_some());

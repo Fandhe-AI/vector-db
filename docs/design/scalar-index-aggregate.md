@@ -13,9 +13,9 @@
 劣後する `where_compound_count`（`WHERE` 付き `COUNT(*)`）・`group_by_having`
 は、`sql::aggregate::execute_aggregate_with_cache`・`sql::group_by::
 execute_grouped_aggregate` が毎クエリ `user_rows/{table}` を全行走査
-（`docs/design/scan-stage-profile.md` A1〜A5）することが主因である。Issue #473・
-#474 で SELECT 経路には `ScalarIndex` の候補削減が結線済みだが、集計・`GROUP BY`
-経路は未結線だった。
+（`docs/design/scan-stage-profile.md` A1〜A5）することが主因である。
+Issue #473・#474 で SELECT 経路には `ScalarIndex` の候補削減が結線済みだが、
+集計・`GROUP BY` 経路は未結線だった。
 
 ADR `docs/design/scalar-secondary-index.md`「Issue #464 実測の反映」節は
 `agg_count`（`WHERE` なし `COUNT(*)`）を索引の対象外とし、その改善は Issue #478
