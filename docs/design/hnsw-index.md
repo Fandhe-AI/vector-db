@@ -856,9 +856,9 @@ N=5 ペア（before→after 交互）・warmup/計測 20/20（既定）。
 
 | 区間 | before min | before median | after min | after median | ratio (min-of-N) | 固定帯(±5%) | 実測帯（参照区間） | 判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| total（threads=1） | 9773.768ms | 11718.095ms | 9764.136ms | 9891.329ms | 0.999x | 固定帯内(±5%) | 実測帯内(±89.7%) | ノイズ帯内 |
-| total（threads=12） | 2358.933ms | 2615.800ms | 2064.835ms | 2339.334ms | 0.875x | 固定帯超過(±5%) | 実測帯内(±81.9%) | ノイズ帯内 |
-| repair_reachability（threads=12） | 845.559ms | 894.953ms | 734.859ms | 853.347ms | 0.869x | 固定帯超過(±5%) | 実測帯内(±46.0%) | ノイズ帯内 |
+| total（threads=1） | 9773.768ms | 11718.095ms | 9764.136ms | 9891.329ms | 0.999x | 固定帯内(±5%) | 実測帯内(±348.8%) | ノイズ帯内 |
+| total（threads=12） | 2358.933ms | 2615.800ms | 2064.835ms | 2339.334ms | 0.875x | 固定帯超過(±5%) | 実測帯内(±922.0%) | ノイズ帯内 |
+| repair_reachability（threads=12） | 845.559ms | 894.953ms | 734.859ms | 853.347ms | 0.869x | 固定帯超過(±5%) | 実測帯内(±922.0%) | ノイズ帯内 |
 | flatten（threads=12、after のみ。before は該当フィールド無し） | n/a | n/a | 8.164ms | 8.956ms | n/a | 該当なし | 該当なし | informational |
 
 参照区間（`control=dot_scan`。HNSW コードを一切通らない対照負荷。threads=1／threads=12 それぞれ独立に算出）:
@@ -970,21 +970,32 @@ N=5 ペア。参照として同一ラウンドで `brute_force` も計測（実�
 
 ```
 git fetch origin main
+# before/after それぞれ独立の checkout（worktree）を用意する
+# （2 つの cargo build を同一 checkout に対して CARGO_TARGET_DIR だけ
+#  切り替えて実行すると before/after 双方が同一ソースをビルドしてしまう
+#  ため、checkout 自体を分離する）。
 git worktree add --detach <scratch>/before 929c027
 git worktree add --detach <scratch>/after ad484e7  # PR #590 マージコミット
 # before 側にのみ計測専用パッチ（本節冒頭の diff）を適用する
-# （patch -p1 < before_measure_patch.diff 等。ad484e7 は計測用計装を
-#  ネイティブに含むためパッチ不要）
-# CARGO_TARGET_DIR を分離して双方 release ビルド
+# （<scratch>/before で patch -p1 < before_measure_patch.diff 等。
+#  ad484e7 は計測用計装をネイティブに含むためパッチ不要）
+# CARGO_TARGET_DIR を分離しつつ、各 checkout の Cargo.toml を明示して
+# 双方 release ビルド（--manifest-path で checkout を固定する）
 CARGO_TARGET_DIR=<scratch>/target-before cargo build --release -p engine \
+  --manifest-path <scratch>/before/Cargo.toml \
   --bench hnsw_parallel_build_bench --bench hnsw_compare_bench --features contrast-bench \
   --bench knn_profile_bench
 CARGO_TARGET_DIR=<scratch>/target-after cargo build --release -p engine \
+  --manifest-path <scratch>/after/Cargo.toml \
   --bench hnsw_parallel_build_bench --bench hnsw_compare_bench --features contrast-bench \
   --bench knn_profile_bench
 # before/after を交互に N=5 ペア実行（同時並走させない）
-BENCH_HNSW_PARALLEL_THREADS=1,12 <before-bin>
-BENCH_HNSW_PARALLEL_THREADS=1,12 <after-bin>
+BENCH_HNSW_PARALLEL_THREADS=1,12 <scratch>/target-before/release/deps/hnsw_parallel_build_bench-<hash>
+BENCH_HNSW_PARALLEL_THREADS=1,12 <scratch>/target-after/release/deps/hnsw_parallel_build_bench-<hash>
 # ... 以下 bench-hnsw-compare（BENCH_HNSW_COMPARE_THREADS=12）・
 # bench-knn-profile（BENCH_KNN_PROFILE_ENGINE=hnsw／brute_force）も同様に交互実行
+# （バイナリのファイル名ハッシュ〔<hash>〕は cargo のビルド設定由来の
+#  メタデータハッシュであり、本節冒頭の binary sha256 一覧のとおり
+#  before/after で偶然一致することがある。実行対象を取り違えないよう
+#  CARGO_TARGET_DIR〔target-before／target-after〕で区別すること）
 ```
