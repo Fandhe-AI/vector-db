@@ -36,18 +36,24 @@
 #
 # i8 パック常駐経路（Issue #543・親 #541）: `I8_OVERSAMPLE` が設定されている
 # 場合のみ `BENCH_GPU_SCALING_I8_OVERSAMPLE` として両バイナリへパススルーする
-# （before バイナリは未知の env を読まないため無害。i8 経路は `e14d53f`
-# より前には存在せず、before 側の `gpu_scaling_i8:` 行は常に「出ない」ことが
+# （before バイナリは未知の env を読まないため無害。未設定時は harness 側の
+# `DEFAULT_I8_OVERSAMPLE` が使われるだけで i8 計測自体は新 after バイナリでは
+# 常に試みられる。i8 経路は `e14d53f` より前には存在せず、before 側の
+# `gpu_scaling_i8:`/`gpu_scaling_i8: not measurable` 行は常に「出ない」ことが
 # 期待値——これ自体が「i8 の before は作れない」という Issue #543 の設計判断の
 # 直接的な現れ）。summary.tsv の末尾へ `i8_oversample`/`i8_p50`/`i8_p95`/
 # `i8_recall`/`i8_mismatch`/`i8_status`/`i8_reason` 列を追加する（既存 10 列の
 # 並び・意味は不変。before 側・i8 未計測行は数値列を空欄のまま維持しつつ、
-# `i8_status`（`unsupported`＝`I8_OVERSAMPLE` 未指定で計測対象外〔before 側の
-# 既定〕／`measured`＝i8 計測成功／`failed`＝`I8_OVERSAMPLE` 指定下で i8 計測が
-# 失敗）と `i8_reason`（`failed` 時のみ `gpu_scaling_i8: not measurable ...
+# `i8_status`（`unsupported`＝ログに i8 出力が無く、かつプロセスが正常終了
+# 〔典型的には before 側で i8 経路自体が存在しない〕、または `not measurable`
+# 行でバイナリが自己申告した場合／`measured`＝i8 計測成功／`failed`＝i8 出力が
+# 無くプロセスが異常終了した場合）と `i8_reason`（`unsupported`〔`not
+# measurable` 行由来〕・`failed` 時に `gpu_scaling_i8: not measurable ...
 # reason="..."` から抽出。無ければ `unknown`）で、A/B/C（`line` 列）が
-# `measured` でも i8 だけが失敗した run を「未対応」と区別する
-# （codex-review P2・Cursor Bugbot 重複指摘・PR #605）。
+# `measured` でも i8 だけが失敗した run を「未対応」と区別する。分類は
+# `I8_OVERSAMPLE` の設定有無ではなく、ログの実出力（`gpu_scaling_i8:` 行の
+# 有無）とプロセスの終了コードのみを根拠にする（codex-review P2・Cursor
+# Bugbot 重複指摘・PR #605）。
 
 set -euo pipefail
 
@@ -182,37 +188,46 @@ run_one() {
     i8_mismatch="$(echo "${i8_line}" | sed -nE 's/.* i8_mismatch=([0-9]+) .*/\1/p')"
     i8_status="measured"
     i8_reason=""
-  elif [ -n "${I8_OVERSAMPLE:-}" ]; then
-    # `I8_OVERSAMPLE` を要求したにもかかわらず `gpu_scaling_i8: rows=`
-    # （成功行）が出なかった場合。`harness/gpu_scaling.rs::
-    # format_i8_unavailable_line` の `gpu_scaling_i8: not measurable ...
-    # reason="..."` 行があれば理由を抽出し、無ければ理由不明として記録する
-    # （production の i8 バックエンドが reason 無しで exit した異常系を
-    # 想定。`status_line` 同様 log 全文は残るため詳細はそちらで追える）。
+  else
+    # `gpu_scaling_i8: rows=`（成功行）が出なかった場合。分類は
+    # `I8_OVERSAMPLE`（未指定時は harness 側が `DEFAULT_I8_OVERSAMPLE` を
+    # 使うだけで i8 計測自体は常に試みられる。`gpu_scaling_bench.rs`
+    # 参照）の設定有無に依存させない——ドキュメント記載の実行方法
+    # （`I8_OVERSAMPLE=4` 指定）だと i8 未対応の旧 before バイナリの
+    # 全行が `failed` 誤判定になり、逆に環境変数を未設定にすると新
+    # after バイナリの実際の `not measurable` 出力が `unsupported`
+    # 誤判定になっていた（codex-review P2・Cursor Bugbot 重複指摘・
+    # PR #605）。ログの実出力のみを根拠に判定する:
+    #   1. `harness/gpu_scaling.rs::format_i8_unavailable_line` の
+    #      `gpu_scaling_i8: not measurable ... reason="..."` 行が
+    #      あれば、バイナリが i8 経路を自己申告で不可としたケース
+    #      （GPU 側の実行時条件等）として `unsupported` に分類し
+    #      reason を抽出する。
+    #   2. その行も無く、かつ計測プロセス自体が非 0 終了していた
+    #      場合は、i8 経路が出力前に異常終了した可能性が高いため
+    #      `failed` に分類する（`status_line` 同様 log 全文は残る
+    #      ため詳細はそちらで追える）。
+    #   3. いずれの行も無く、かつプロセスが正常終了していた場合は
+    #      バイナリ自体に i8 経路が存在しない（典型的には before 側）
+    #      とみなし `unsupported` に分類する。
     i8_oversample=""
     i8_p50=""
     i8_p95=""
     i8_recall=""
     i8_mismatch=""
-    i8_status="failed"
     local i8_not_measurable_line
     i8_not_measurable_line="$(grep -E '^gpu_scaling_i8: not measurable' "${log}" | tail -1 || true)"
     if [ -n "${i8_not_measurable_line}" ]; then
+      i8_status="unsupported"
       i8_reason="$(echo "${i8_not_measurable_line}" | sed -nE 's/.*reason="([^"]*)".*/\1/p')"
       [ -n "${i8_reason}" ] || i8_reason="unknown"
-    else
+    elif [ "${status}" -ne 0 ]; then
+      i8_status="failed"
       i8_reason="unknown"
+    else
+      i8_status="unsupported"
+      i8_reason=""
     fi
-  else
-    # `I8_OVERSAMPLE` 未指定（i8 経路は最初から計測対象外）。典型的には
-    # before 側バイナリ（i8 経路自体が存在しない）。
-    i8_oversample=""
-    i8_p50=""
-    i8_p95=""
-    i8_recall=""
-    i8_mismatch=""
-    i8_status="unsupported"
-    i8_reason=""
   fi
 
   if [ -n "${result_line}" ]; then
