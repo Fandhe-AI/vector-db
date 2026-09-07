@@ -144,6 +144,11 @@ pub(crate) fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngin
         // （opt-in・既定 0）のみを露出し、実行時にどちらの visited 実装が
         // 選ばれたか・可視候補数・索引ノード数は非露出のまま
         // （`docs/design/explain-search-engine-exposure.md` 参照）。
+        // `acorn_max_visible_ratio`（ACORN-1 の 2-hop 展開切替閾値。Issue #501）は
+        // `full_scan_ratio` と同じ「切替閾値」区分のため、本行では意図的に
+        // 露出しない（実行時のレジーム選択・`acorn_searches`／
+        // `acorn_expansions` も同様。§`docs/design/explain-search-engine-
+        // exposure.md`「露出しない値」節参照）。
         let p = params.get();
         lines.push(format!(
             "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={}",
