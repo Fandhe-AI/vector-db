@@ -182,6 +182,31 @@ jobs:
         run: make sort-determinism-check
 
   # --------------------------------------------------
+  # simd-codegen-check（SIMD カーネル生成コード検査。Issue #467・TASK-156 関連）
+  # --------------------------------------------------
+  # `isa.rs` の `#[target_feature]` カーネルが `as_chunks` からの要素ごと構築
+  # （将来 intrinsics 導入時の `_mm256_set_ps` 等）で単一ロード命令へ最適化される
+  # のは LLVM の最適化挙動であり言語仕様の保証ではないため、`cargo rustc --emit
+  # asm` で実際に生成されたアセンブリを scripts/check_simd_codegen.sh が走査し、
+  # 要素ごと挿入命令（`vinsertps`／`vpinsr*` 等）が残っていないかを機械検査する。
+  # core-api-check・sort-determinism-check と異なり engine の release フルビルド
+  # （wgpu 等の依存を含む）を伴うため timeout を長めに取り、独立ジョブとして
+  # rust-ci（cargo test 等）と並列実行できるようにする。詳細は
+  # docs/design/simd-codegen-guard.md 参照。第三者 action は他ジョブと同一 SHA 固定。
+  simd-codegen-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run simd-codegen-check
+        run: make simd-codegen-check
+
+  # --------------------------------------------------
   # cross-check（aarch64 クロスコンパイル確認。TASK-156・対象ビヘイビア CORE-14）
   # --------------------------------------------------
   # `isa.rs` の NEON カーネル（`#[cfg(target_arch = "aarch64")]`）が x86_64 の
@@ -195,7 +220,11 @@ jobs:
   # （PR 本文参照）。
   cross-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # aarch64 版 simd-codegen-check（engine の release フルビルドを伴う）を
+    # 追加したため、cargo check のみを前提にした従来の 15 分から引き上げる
+    # （Issue #467・F9: ローカル増分計測で aarch64 emit-asm ビルドは約 34s だが
+    # CI のクリーンビルドはこれより長くなりうる）。
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -207,3 +236,5 @@ jobs:
         run: rustup target add aarch64-unknown-linux-gnu
       - name: Run check-cross
         run: make check-cross
+      - name: Run simd-codegen-check-cross
+        run: make simd-codegen-check-cross

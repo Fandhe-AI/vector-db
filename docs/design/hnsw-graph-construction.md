@@ -44,6 +44,9 @@ impl HnswIndex {
 }
 ```
 
+凍結後 CSR 化（構築は可変長・凍結時に平坦化）の設計は
+`docs/design/hnsw-index.md` §14（Issue #493）を参照。
+
 ## ベクトルの所有方針（#405・#408 への申し送り）
 
 `HnswIndex` はベクトル本体を複製しない。呼び出し元（`arena.rs::VectorArena`

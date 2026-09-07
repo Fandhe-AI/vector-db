@@ -200,6 +200,24 @@ else
 	@echo "skip: Cargo.toml 未追加のため check-cross をスキップ"
 endif
 
+.PHONY: simd-codegen-check
+simd-codegen-check: ## SIMD カーネル（isa.rs）の生成コード検査。要素ごと挿入命令の不在を --emit asm で機械検査（Issue #467・TASK-156 関連。engine の release ビルドを伴う）
+ifdef HAS_CARGO
+	scripts/check_simd_codegen.sh --self-test
+	scripts/check_simd_codegen.sh
+else
+	@echo "skip: Cargo.toml 未追加のため simd-codegen-check をスキップ"
+endif
+
+.PHONY: simd-codegen-check-cross
+simd-codegen-check-cross: ## simd-codegen-check の aarch64 版（cross-check ジョブから実行。要 aarch64-unknown-linux-gnu target。リンク不要）
+ifdef HAS_CARGO
+	scripts/check_simd_codegen.sh --target aarch64-unknown-linux-gnu --self-test
+	scripts/check_simd_codegen.sh --target aarch64-unknown-linux-gnu
+else
+	@echo "skip: Cargo.toml 未追加のため simd-codegen-check-cross をスキップ"
+endif
+
 .PHONY: e2e-three-client
 e2e-three-client: ## TASK-73（WIRE-1）/TASK-82（SQL-5〜7,9,10）/TASK-165（SQL-12・SEARCH-9）/TASK-168（SQL-13・SQL-14）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
 ifdef HAS_CARGO
@@ -223,7 +241,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/simd_bench.rs）
@@ -376,6 +394,32 @@ else
 endif
 
 # --------------------------------------------------
+# is_aarch64_feature_detected!／is_x86_feature_detected! の実効性を出力する検出ツール
+# （Issue #468。crates/engine/examples/detect_features.rs）
+# --------------------------------------------------
+
+.PHONY: detect-features
+detect-features: ## Issue #468（macOS 上の is_aarch64_feature_detected! 実効性検証）の feature 検出結果表を出力する（時間非依存・spec 閾値なしの情報提供専用のため ci には含めない。手動実行専用。出力は docs/design/chip-kernel-guidelines.md へ転記する運用）
+ifdef HAS_CARGO
+	cargo run -p engine --release --example detect_features
+else
+	@echo "skip: Cargo.toml 未追加のため detect-features をスキップ"
+endif
+
+# --------------------------------------------------
+# wgpu アダプタの features／limits を出力する検出ツール
+# （Issue #535。crates/engine/examples/gpu_adapter_info.rs）
+# --------------------------------------------------
+
+.PHONY: gpu-adapter-info
+gpu-adapter-info: ## Issue #535（wgpu SUBGROUP 可用性設計）向けの adapter features／limits 表を出力する（時間非依存・spec 閾値なしの情報提供専用のため ci には含めない。手動実行専用。出力は docs/design/gpu-batch-topk.md へ転記する運用）
+ifdef HAS_CARGO
+	cargo run -p engine --release --example gpu_adapter_info
+else
+	@echo "skip: Cargo.toml 未追加のため gpu-adapter-info をスキップ"
+endif
+
+# --------------------------------------------------
 # 全行走査経路（agg_count／rls_isolation／vector_knn_where）の段別内訳プロファイル（Issue #464。crates/engine/benches/scan_stage_profile_bench.rs）
 # --------------------------------------------------
 
@@ -407,11 +451,24 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-ingest-profile
-bench-ingest-profile: ## Issue #396（ingest 経路の段別内訳プロファイル。所有権検査・content_hash・台帳記録・encode・redb insert・世代更新・commit の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_INGEST_PROFILE_ROWS／BENCH_INGEST_PROFILE_DIM で規模を上書き可能。BENCH_INGEST_PROFILE_INSERT_MODE=insert|reserve で I6 段の redb insert_reserve A/B 計測モードを切替可能〔Issue #400・既定 insert〕）
+bench-ingest-profile: ## Issue #396（ingest 経路の段別内訳プロファイル。所有権検査・content_hash・台帳記録・encode・redb insert・世代更新・commit の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_INGEST_PROFILE_MODE=batch|single〔既定 batch。single は Issue #484: 単文 INSERT 経路の P0/E0/S0/I1〜I8 内訳〕。batch モード: BENCH_INGEST_PROFILE_ROWS／BENCH_INGEST_PROFILE_DIM で規模を上書き可能。BENCH_INGEST_PROFILE_INSERT_MODE=insert|reserve で I6 段の redb insert_reserve A/B 計測モードを切替可能〔Issue #400・既定 insert・single モードは insert のみ対応〕。single モード: BENCH_INGEST_PROFILE_STATEMENTS（既定 25,000・2,000〜100,000）で単文数を上書き可能）
 ifdef HAS_CARGO
 	cargo bench --bench ingest_profile_bench -p engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-ingest-profile をスキップ"
+endif
+
+# --------------------------------------------------
+# 単文 INSERT の wire 往復内訳プロファイル
+# （Issue #484。crates/wire-server/benches/ingest_wire_profile_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-ingest-wire-profile
+bench-ingest-wire-profile: ## Issue #484（単文 INSERT の wire 往復内訳。`bench-ingest-profile MODE=single` が計測する engine 内部段を補い wire プロトコル層自体の寄与を切り分ける）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_INGEST_WIRE_ROWS（既定 25,000・5,000〜100,000。BENCH_INGEST_WIRE_ROUNDS で割り切れる値のみ）・BENCH_INGEST_WIRE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる
+ifdef HAS_CARGO
+	cargo bench --bench ingest_wire_profile_bench -p wire-server
+else
+	@echo "skip: Cargo.toml 未追加のため bench-ingest-wire-profile をスキップ"
 endif
 
 # --------------------------------------------------

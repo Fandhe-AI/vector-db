@@ -152,6 +152,122 @@ pub fn parse_insert_mode(raw: Option<&str>) -> Result<InsertMode, IngestProfileE
     }
 }
 
+/// ベンチのモード（Issue #484）。`Batch`（既定・Issue #396 の既存挙動）は
+/// `tenant::insert_rows`（複数行 1 write txn）の段別内訳、`Single` は crossdb
+/// ベンチ（`docs/design/crossdb-bench.md`）が実際に通る単文 wire 経路
+/// （`INSERT` 1 文 ＝ 1 write txn）の段別内訳を計測する
+/// （`ingest_profile_bench.rs` モジュール冒頭コメント「Issue #484 追記」節参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileMode {
+    Batch,
+    Single,
+}
+
+/// `BENCH_INGEST_PROFILE_MODE` を解釈する（R2・fail-closed）。未設定は既定
+/// `Batch`（後方互換）へ倒す一方、空文字・大文字小文字違い・未知値は黙って
+/// 既定へフォールバックせず拒否する（[`parse_insert_mode`] と同じ方針）。
+pub fn parse_profile_mode(raw: Option<&str>) -> Result<ProfileMode, IngestProfileError> {
+    match raw {
+        None => Ok(ProfileMode::Batch),
+        Some("batch") => Ok(ProfileMode::Batch),
+        Some("single") => Ok(ProfileMode::Single),
+        Some(other) => Err(IngestProfileError::InvalidEnv {
+            name: "BENCH_INGEST_PROFILE_MODE",
+            reason: format!("unknown mode: {other:?} (expected \"batch\" or \"single\")"),
+        }),
+    }
+}
+
+/// single モードの既定単文数（crossdb ベンチと同じ 25,000 行。
+/// `docs/design/crossdb-bench.md` 参照）。
+pub const DEFAULT_SINGLE_STATEMENTS: usize = 25_000;
+/// single モードの単文数下限（統計的に意味のある warmup／計測サンプル数を
+/// 確保するための下限。[`SINGLE_WARMUP_STATEMENTS`] の 2 倍以上を要求する）。
+pub const MIN_SINGLE_STATEMENTS: usize = 2_000;
+/// single モードの単文数上限（redb 既定 durability 下では 1 文ごとに fsync が
+/// 走るため、無制限な長時間実行を防ぐ実装上の上限。INDEX-4・`batch_limits.rs`
+/// とは独立の、本ベンチ専用の安全弁）。
+pub const MAX_SINGLE_STATEMENTS: usize = 100_000;
+/// single モードの warmup 単文数（統計から除外するが投入自体は行う。先頭
+/// ページキャッシュ・アロケータのウォームアップを計測対象から外す）。
+pub const SINGLE_WARMUP_STATEMENTS: usize = 1_000;
+
+/// 投入文数と所要時間から集計 rows/s を算出する（crossdb ベンチの
+/// `ingest_single_stmt`（rows/s）と同じ単位で並記できるようにする）。
+/// 文数 0・所要時間 0 はいずれも意味のある比率を持たないため拒否する
+/// （`ns_per_row` の `ZeroRows` と同じ契約を流用）。
+pub fn rows_per_sec(stmts: usize, elapsed: Duration) -> Result<f64, IngestProfileError> {
+    if stmts == 0 {
+        return Err(IngestProfileError::ZeroRows);
+    }
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 {
+        return Err(IngestProfileError::ZeroRows);
+    }
+    Ok(stmts as f64 / secs)
+}
+
+/// `recovery::content_hash.rs::OpTag::Insert` の独立コピー（[`content_hash_insert_batch_reimpl`]
+/// の `CONTENT_HASH_OP_TAG_INSERT_BATCH` と同じ位置づけ。型付き挿入は行形
+/// `INSERT` と同じ「新規挿入」操作としてタグを共有する。`for_typed_insert`
+/// ドキュメント参照）。
+const CONTENT_HASH_OP_TAG_INSERT: u8 = 1;
+
+/// 可変長バイト列を「4 バイト LE 長さ＋本体」で連結する（`recovery::
+/// content_hash.rs::HashInputBuilder::push_bytes` の独立コピー）。
+fn push_len_prefixed(buf: &mut Vec<u8>, field: &[u8]) -> Result<(), IngestProfileError> {
+    let len = u32::try_from(field.len())
+        .map_err(|_| IngestProfileError::Codec("content hash field too large".to_string()))?;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(field);
+    Ok(())
+}
+
+/// `recovery::content_hash.rs::for_typed_insert` の再実装（single モード I3 用。
+/// `insert_typed_row_unchecked` が実際に渡す入力と同じ形——id・visibility・
+/// VECTOR 列の埋め込み・非 VECTOR 列の（列名, 値）ペア列——を受け取るが、本
+/// モジュールは `engine::row_codec::Value` を参照しない契約（モジュール冒頭
+/// コメント）のため、Text 列のみを `Option<&str>`（`None` は
+/// `push_named_scalar_columns` と同じく素通しで除外する SQL 上の未指定/NULL
+/// 相当）として受け取る（本ベンチが対象とする `docs` スキーマの非 VECTOR 列は
+/// `body`（Text）のみで、Null／Vector 型の非 VECTOR 列は対象外）。
+///
+/// バイトレイアウト（`for_typed_insert`／`push_vector`／`push_named_scalar_columns`
+/// と同一）: ドメインタグ ＋ `OpTag::Insert`(=1) ＋ `id`(u64 LE) ＋
+/// visibility(1 バイト。`0x01`=Public／`0x02`=Private) ＋ 埋め込み
+/// （4 バイト LE 長さ ＋ f32 LE 列。長さプレフィクスは [`push_len_prefixed`] の
+/// ものではなく生の 4 バイトのみ） ＋ 非 Null 列ごとに（列名を長さ
+/// プレフィクス付きで ＋ `Value::Text` タグ(=1) ＋ 本文を長さプレフィクス付きで）。
+pub fn content_hash_typed_insert_reimpl(
+    id: u64,
+    is_public: bool,
+    embedding: &[f32],
+    columns: &[(&str, Option<&str>)],
+) -> Result<[u8; 32], IngestProfileError> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(CONTENT_HASH_DOMAIN_TAG);
+    buf.push(CONTENT_HASH_OP_TAG_INSERT);
+    buf.extend_from_slice(&id.to_le_bytes());
+    buf.push(if is_public { 0x01 } else { 0x02 }); // Visibility::{PUBLIC,PRIVATE}_BYTE
+    let dim = u32::try_from(embedding.len()).map_err(|_| {
+        IngestProfileError::Codec("embedding dim too large for content hash".to_string())
+    })?;
+    buf.extend_from_slice(&dim.to_le_bytes());
+    for f in embedding {
+        buf.extend_from_slice(&f.to_le_bytes());
+    }
+    for (name, value) in columns {
+        let Some(text) = value else {
+            // `Value::Null` の列は push_named_scalar_columns と同じく素通しで除外する。
+            continue;
+        };
+        push_len_prefixed(&mut buf, name.as_bytes())?;
+        buf.push(1u8); // Value::Text タグ
+        push_len_prefixed(&mut buf, text.as_bytes())?;
+    }
+    Ok(sha256_reimpl(&buf))
+}
+
 /// `storage.rs::encode_row` の行フォーマット v2 再実装（モジュール冒頭コメント
 /// 参照）。`storage.rs` と同じフィールド検証順序・エラー条件を踏襲する。
 pub fn encode_row_reimpl(

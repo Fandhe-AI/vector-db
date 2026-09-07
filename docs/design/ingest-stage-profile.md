@@ -449,3 +449,210 @@ before（`61fc943`）/after（`origin/main`）交互実測で記録した。前�
 棄却判断（RECOVER-5／RECOVER-6／RECOVER-8 ポインタ）・PostgreSQL `COPY` の
 バッファ二重基準と `batch_limits.rs`／行形 `insert_rows` の対比は
 `docs/design/ingest-write-path.md` を参照。
+
+## Issue #484 追記: 単文 INSERT の段別プロファイル
+
+### 目的
+
+`docs/design/crossdb-bench.md`（25,000 行・dim 128・wire 経由・psycopg）で
+`ingest_single_stmt` は self 7,774 rows/s に対し sqlite-vec 11,604 rows/s と
+劣後している（親 Issue #483）。従来の `bench-ingest-profile`（Issue #396・
+Issue #400。上記各節）は `tenant::insert_rows`（バッチ経路）の段別内訳しか持たず、
+crossdb が実際に通る **単文経路**（wire 簡易クエリ → `EngineCore::
+execute_sql_in_session` → `execute_insert_sql`〔`validate_insert` →
+`get_table_schema` → `bind_insert_form`〕→ `sql::exec::execute_insert` →
+`tenant::insert_typed_row_unchecked`〔1 文 1 write txn・
+`content_hash::for_typed_insert`・`ledger::record_in_txn`・
+`bump_table_generation_in_txn`・`commit_boundary::commit`〕→
+`CommandComplete "INSERT 0 1"`）の内訳が無かった。本節はその内訳を実測する
+（テスト・ベンチ専任タスク。TASK-92・TASK-93・TASK-101・RECOVER-1/2/5/6/10・
+INDEX-4・SQL-10 のポインタ参照）。
+
+### 計測フックの設計判断（production 無変更）
+
+計画段階では「`bench-internals` feature 限定の計測点を engine 内部へ追加する」
+案も検討したが、`#[cfg(feature = "bench-internals")]` で囲んでも
+`tenant.rs`／`sql/exec.rs` の編集自体は本リポの慣行が定める production
+（`crates/engine/src/`。CLAUDE.md ステータス行の定義）の変更に変わりなく、
+「production コード無変更・テスト専任」という本 Issue の分類と両立しない。
+したがって厳格側（`crates/engine/src/`・`crates/wire-server/src/` を一切
+変更しない）を採り、以下 2 手段のみで段別化した:
+
+- **P0/E0/S0**（公開 API のみを使う e2e 計測）
+- **I1〜I8**（生 `redb::Database` レプリカ。`insert_typed_row_unchecked` と
+  同順序の再現。Issue #396 と同型の手法）
+
+### 計測設計
+
+#### engine 側（`crates/engine/benches/ingest_profile_bench.rs` `BENCH_INGEST_PROFILE_MODE=single`）
+
+| tier | 内容 |
+| --- | --- |
+| P0 `parse_bind` | `sql::allowlist::validate_insert` → `Storage::get_table_schema` → `sql::parser::bind_insert_form`（書き込みなし） |
+| E0 `typed_row_api` | `tenant::insert_typed_row`（Rust API 経由の単文 e2e。SQL なし） |
+| S0 `sql_surface` | `EngineCore::execute_sql_in_session`（wire と同一入口） |
+| I1〜I8 | 生 redb レプリカ（`run_batch_mode` と同一の `StageId` 8 段構成を再利用。single モードでは I1 を「VECTOR 列位置探索 ＋ `validate_embedding_dim`」に読み替える。バッチ内 id 重複検出に相当する処理が単文経路には存在しないため） |
+
+対象スキーマは `docs(embedding VECTOR(dim), body TEXT)`（既存 `schema(dim)`
+関数を再利用。crossdb の `lang`/`topic` 列は本ベンチでは対象外——単文経路の
+内訳切り分けに列数は本質的でないため簡略化した。§スコープ外参照）。
+可視性は SQL 経路の固定値に合わせ `Visibility::Private` で固定する
+（`sql::exec::execute_insert` が行形 `INSERT` の可視性を常に `Private` に
+固定する契約に揃える）。P0/E0/S0/レプリカは redb の「書き込み可能ハンドル
+同時複数オープン不可」制約により、それぞれ別々の一時 DB で単独計測する
+（`run_batch_mode` の E0 とレプリカの関係と同じ）。
+
+帰属: パース・束縛 ≒ S0 − E0（P0 の直接計測値と突き合わせて妥当性確認）、
+engine 内部段 ＝ Σ(I1..I8)、残差 ＝ E0 − Σ(I1..I8)。
+
+整合性検証（fail-closed。すべて通過するまで測定値を出力しない）:
+
+1. E0 DB・レプリカ DB の `user_rows/docs` 全エントリがバイト単位で一致し、
+   件数 ＝ 投入文数と一致すること。
+2. `table_generation`: E0 は文数 + 1（`create_table` 分）、レプリカは文数。
+3. E0 の `op_ledger` エントリ（計測フェーズの先頭 200 件サンプル）を復号し、
+   [`content_hash_typed_insert_reimpl`]（`recovery::content_hash.rs::
+   for_typed_insert` の再実装。`harness/ingest_profile.rs` に新設）と一致
+   すること。
+4. S0 の各文が `SqlOutcome::Insert(rows_affected == 1)` を返すこと（計測
+   ループ内で毎文検証）。
+
+新設した env: `BENCH_INGEST_PROFILE_STATEMENTS`（既定 25,000・範囲
+2,000..=100,000。先頭 1,000 文を warmup として統計から除外しつつ投入は
+行う）。`BENCH_INGEST_PROFILE_ROWS` は single モードでは無視され、その旨を
+1 行出力する。`BENCH_INGEST_PROFILE_INSERT_MODE=reserve`（Issue #400 の
+I6 A/B。batch モード専用機能）は single モードでは fail-closed に拒否する。
+
+#### wire-server 側（新規 `crates/wire-server/benches/ingest_wire_profile_bench.rs`）
+
+同一プロセス内 in-process ループバックサーバーへ、engine 側と同じ
+`docs(embedding, body)` スキーマ・SQL 文形で単文 `INSERT` を投入し、wire
+往復そのものを切り分ける。
+
+| tier | 内容 |
+| --- | --- |
+| W0 `wire_roundtrip` | `common::send_simple_query` → `read_command_complete`（`"INSERT 0 1"` を検証） → `read_ready_for_query` |
+| S0 `sql_surface` | 同一 `Arc<EngineCore>` へ `execute_sql_in_session`（wire と同一入口。SQL 文形は W0 と同一） |
+
+各ラウンドは W0 → S0 の順で交互実行し（`docs/design/
+benchmark-judgement-policy.md` §3 の交互実行方針）、`BENCH_INGEST_WIRE_ROWS`
+を `BENCH_INGEST_WIRE_ROUNDS` で均等分割した文数を 1 ラウンドとする
+（`harness::protocol::MeasurementConfig` の下限〔warmup ≥ 20・measured ≥ 20〕
+を満たすため 1 ラウンドあたり 40 文以上を要求）。W0・S0 で id・
+`operation_id` の名前空間を分離し（W0: `10,000,000+n`・S0: `20,000,000+n`）、
+最終行数は 2 × rows になる。統計量（min-of-N・median-of-N・帯判定）は
+Issue #463 の `harness::knn_wire` の純関数をそのまま再利用する。
+
+帰属: wire ＝ W0 − S0（ラウンド中央値の min-of-R どうし）。
+
+整合性検証（fail-closed）: W0 全文が `CommandComplete("INSERT 0 1")` を
+返すこと・S0 全文が `SqlOutcome::Insert(rows_affected == 1)` を返すこと
+（いずれも計測ループ内で都度検証）、計測後に `EngineCore::
+operation_recorded`（pub・TASK-93）で W0・S0 双方の代表 `operation_id`
+（各ラウンドの最初・最後）が `LedgerLookup::Recorded` であることを確認する。
+accept ループスレッドが `Arc<EngineCore>` を保持し続けるため、生 redb の
+再オープンによる行数照合（engine 側ベンチと同型の手法）は行えない
+（`operation_recorded` 経由の照合で代替する）。
+
+新設 env: `BENCH_INGEST_WIRE_ROWS`（既定 25,000・5,000..=100,000。
+`BENCH_INGEST_WIRE_ROUNDS` で割り切れる値のみ）・`BENCH_INGEST_WIRE_ROUNDS`
+（既定 5・5..=50）・`BENCH_DEDICATED_ENV=1`（自己申告。未設定時は
+「共有環境の参考値」である旨を 1 行出力する）。
+
+### 実測結果（共有 QEMU 環境の参考値・採否根拠にしない）
+
+環境: `os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma`（QEMU Virtual CPU
+version 2.5+）・commit `ecacddc`・`loadavg` 実行時 4〜5（他セッションと共有）
+・`BENCH_DEDICATED_ENV` 未設定（1 回実測。専有環境での再実測はオーナー作業
+として引き続き未実施）。
+
+#### engine 内部（`BENCH_INGEST_PROFILE_MODE=single`・既定 25,000 文・dim 128）
+
+| tier | min | median | rows/s |
+| --- | --- | --- | --- |
+| P0 `parse_bind` | 0.007ms | 0.008ms | 96,563 |
+| E0 `typed_row_api` | 0.040ms | 0.046ms | 21,472 |
+| S0 `sql_surface` | 0.052ms | 0.058ms | 16,141 |
+
+| 段 | median | ns/文 |
+| --- | --- | --- |
+| I1 `precheck`（VECTOR 列位置探索 + `validate_embedding_dim`） | 0.000ms | 24.0 |
+| I2 `begin_write` | 0.001ms | 550.0 |
+| I3 `content_hash` | 0.002ms | 2,081.0 |
+| I4 `ledger` | 0.005ms | 5,273.0 |
+| I5 `encode` | 0.000ms | 318.0 |
+| I6 `redb_insert` | 0.002ms | 2,070.0 |
+| I7 `generation_bump` | 0.001ms | 913.0 |
+| I8 `commit` | 0.031ms | 31,283.0 |
+| Σ(I1..I8) | 0.043ms | — |
+| 残差（E0 − Σ） | 0.003ms | — |
+| S0 − E0（parse/bind/dispatch informational） | 0.012ms | （P0 直接計測: 0.008ms） |
+
+単文経路でも I8（commit。redb の fsync を含む durability コスト）が
+支配的（Σ の約 73%）であり、TASK-96/97・RECOVER-5/6 の durability 契約は
+変えない前提のもと、この段は改善余地が構造的に小さいと見込まれる。次いで
+I4（ledger）・I3（content_hash）が続くが、いずれも I8 に比べ 1 桁小さい。
+S0 − E0（SQL パース・束縛・ディスパッチのオーバーヘッド。0.012ms）は P0
+単独計測値（0.008ms）と同程度の桁であり、大きな乖離はない。
+
+#### wire 往復（`BENCH_INGEST_WIRE_ROWS=25000`・`ROUNDS=5`・dim 128）
+
+min-of-R は「ラウンド中央値どうしの最小」（`docs/design/
+benchmark-judgement-policy.md` §3・`harness::knn_wire` の定義）。
+
+| tier | min-of-R | median-of-R |
+| --- | --- | --- |
+| W0 `wire_roundtrip` | 91.036µs | 95.066µs |
+| S0 `sql_surface` | 67.562µs | 69.796µs |
+
+参照区間帯（S0 のラウンド間中央値の run-to-run 幅）＝ 7.49%。帰属
+wire(W0−S0) ＝ 23.474µs（W0 min-of-R 比 25.79%。対象区間自身の増分率
+`step_ratio_pct(S0, W0)` を固定 ±5% 帯・実測参照区間帯 7.49% のいずれか
+広い方と比較すると `above_noise_band`）。W0 の min-of-R ベース換算 rows/s
+＝ 約 10,985 rows/s（crossdb の `ingest_single_stmt`〔psycopg・別プロセス〕
+参考値 7,774 rows/s を上回る——in-process 生 TCP と別プロセス・言語間
+クライアント〔psycopg・`prepare_threshold=None`〕の計測器差によるもので、
+`docs/design/knn-wire-stage-profile.md` と同じ注記が適用される。両者は
+単位が同じでも直接比較できる値ではない）。
+
+### 考察・#485 への申し送り
+
+- engine 内部段では I8（commit・durability コスト）が支配的で、Durability
+  契約（RECOVER-5/6・TASK-96/97）を変えない前提では改善余地が小さい
+  見込み。次点は I4（ledger）・I3（content_hash）。
+- wire 区分（W0−S0）は共有環境の 1 回実測で W0 min-of-R の約 26% を占め、
+  実測参照区間帯（7.49%）・固定 ±5% 帯のいずれも上回る。crossdb の劣後
+  （sqlite-vec 比）の主要因が engine 内部（I8 等）なのか wire 層（本節の
+  W0−S0）なのかの定量的な切り分けは、専有環境での複数ラウンド再測定・
+  crossdb 実測との突き合わせを経てから #485 が判断する。
+- 上記はいずれも共有 QEMU 環境・1 回実測の参考値であり、採否判断の根拠には
+  しない（`docs/design/benchmark-judgement-policy.md` §3・§7）。
+
+### 再現手順
+
+```bash
+# engine 側（既定 25,000 文・dim 128）:
+BENCH_INGEST_PROFILE_MODE=single make bench-ingest-profile
+
+# engine 側（短縮実行で挙動確認）:
+BENCH_INGEST_PROFILE_MODE=single BENCH_INGEST_PROFILE_STATEMENTS=2000 make bench-ingest-profile
+
+# wire 側（既定 25,000 行・5 ラウンド）:
+make bench-ingest-wire-profile
+
+# 専有環境での実測（オーナー作業）:
+BENCH_DEDICATED_ENV=1 make bench-ingest-wire-profile
+```
+
+### スコープ外・申し送り
+
+- production 改善（I8 等の上位段最適化）は #485 の担当。Durability 契約
+  （RECOVER-5/6・TASK-96/97）の変更は対象外。
+- engine 内部への `bench-internals` フック追加は見送った（本節「計測フックの
+  設計判断」参照）。#485 で内部段の直接計測が必須と判明した場合に再検討。
+- crossdb（psycopg・別プロセス）実測値との残差（クライアント側コスト）は
+  本ベンチの対象外。
+- engine 側の対象スキーマは `embedding`/`body` の 2 列に簡略化しており、
+  crossdb の `lang`/`topic` 列は含まない（単文経路の内訳切り分けに列数は
+  本質的でないための設計判断）。
+- 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測はオーナー作業として申し送り。

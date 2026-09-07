@@ -109,30 +109,76 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
     }
 }
 
-/// `DataRow`（'D'）を 1 行ぶん組み立てる。`row.cells` は呼び出し元の
+/// `DataRow`（'D'）を `out` の末尾へ追記する（Issue #481。行ごとに新規
+/// `Vec<u8>` を確保していた旧 [`encode_data_row`] を、呼び出し元
+/// （`crate::response_buffer::ResponseBuffer` 経由の
+/// `crate::simple_query::respond_query_result`）が持つ 1 個のバッファへ
+/// 直接組み立てる形へ置き換えたもの。`row.cells` は呼び出し元の
 /// `QueryResult::columns` と同じ順序・同じ長さであることを engine 側が保証する
 /// （`sql::exec::execute_statement` の投影順。ポインタ: TASK-75・SQL-1〜4）。
-pub fn encode_data_row(row: &ResultRow) -> Result<Vec<u8>, EncodeError> {
-    let field_count = i16::try_from(row.cells.len()).map_err(|_| EncodeError)?;
-    let mut body = Vec::new();
-    body.extend_from_slice(&field_count.to_be_bytes());
-    for cell in &row.cells {
-        match cell_to_text(cell)? {
-            None => body.extend_from_slice(&(-1i32).to_be_bytes()),
-            Some(text) => {
-                let bytes = text.as_bytes();
-                let len = i32::try_from(bytes.len()).map_err(|_| EncodeError)?;
-                body.extend_from_slice(&len.to_be_bytes());
-                body.extend_from_slice(bytes);
+///
+/// 長さフィールド（フレーム先頭 4 バイト）は本体を書き終えるまで値が
+/// 定まらないため、まずプレースホルダを push してから最後に
+/// `out.get_mut` で backpatch する（`unwrap`/`[]` を使わない。取得できない
+/// ことは有り得ないが、regression で `out` の構造が壊れた場合に panic では
+/// なく `EncodeError` へ倒す）。
+///
+/// **失敗時は `out` を呼び出し前の長さへ必ず `truncate` してから返す**
+/// （呼び出し元が完成済みフレームだけを送出できるようにするための契約。
+/// 部分フレームを絶対に残さない）。
+pub fn encode_data_row_into(row: &ResultRow, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    let start = out.len();
+    let field_count = match i16::try_from(row.cells.len()) {
+        Ok(n) => n,
+        Err(_) => {
+            out.truncate(start);
+            return Err(EncodeError);
+        }
+    };
+
+    let mut write_body = || -> Result<(), EncodeError> {
+        out.push(b'D');
+        // 長さフィールドのプレースホルダ（後で backpatch）。
+        out.extend_from_slice(&0i32.to_be_bytes());
+        let body_start = out.len();
+        out.extend_from_slice(&field_count.to_be_bytes());
+        for cell in &row.cells {
+            match cell_to_text(cell)? {
+                None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(text) => {
+                    let bytes = text.as_bytes();
+                    let len = i32::try_from(bytes.len()).map_err(|_| EncodeError)?;
+                    out.extend_from_slice(&len.to_be_bytes());
+                    out.extend_from_slice(bytes);
+                }
             }
         }
+        let body_len = out.len().checked_sub(body_start).ok_or(EncodeError)?;
+        let total_len = frame_len(body_len)?;
+        let len_pos = body_start.checked_sub(4).ok_or(EncodeError)?;
+        let len_slice = out
+            .get_mut(len_pos..len_pos.checked_add(4).ok_or(EncodeError)?)
+            .ok_or(EncodeError)?;
+        len_slice.copy_from_slice(&total_len.to_be_bytes());
+        Ok(())
+    };
+
+    match write_body() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            out.truncate(start);
+            Err(e)
+        }
     }
-    let total_len = frame_len(body.len())?;
-    let mut msg = Vec::with_capacity(1 + body.len() + 4);
-    msg.push(b'D');
-    msg.extend_from_slice(&total_len.to_be_bytes());
-    msg.extend_from_slice(&body);
-    Ok(msg)
+}
+
+/// `DataRow`（'D'）を 1 行ぶん新規 `Vec<u8>` として組み立てる。
+/// [`encode_data_row_into`] を呼ぶ薄いラッパーで、既存呼び出し元・テストとの
+/// 互換のため残す（生成バイト列は完全に同一）。
+pub fn encode_data_row(row: &ResultRow) -> Result<Vec<u8>, EncodeError> {
+    let mut out = Vec::new();
+    encode_data_row_into(row, &mut out)?;
+    Ok(out)
 }
 
 /// `CommandComplete`（'C'）。`tag` は `SELECT n` / `INSERT 0 1` / `SET` /
@@ -147,6 +193,24 @@ pub fn encode_command_complete(tag: &str) -> Result<Vec<u8>, EncodeError> {
     msg.extend_from_slice(&total_len.to_be_bytes());
     msg.extend_from_slice(&body);
     Ok(msg)
+}
+
+/// `ReadyForQuery`（'Z'）。固定長 6 バイト（タグ 1 + 長さ 4 + トランザクション
+/// 状態 1）。`crate::handshake::write_ready_for_query` から使う唯一のレイアウト
+/// 実体（Issue #481。以前は同モジュール内にバイト列組み立てが個別に存在し、
+/// `crate::response_buffer::ResponseBuffer` へ他フレームと同じ形で積める
+/// フレームが無かった）。状態は常に `'I'`（idle・トランザクション外）で固定
+/// ―― 本実装は明示トランザクション（`BEGIN`/`COMMIT`）を持たないため。
+pub fn encode_ready_for_query() -> [u8; 6] {
+    let mut msg = [0u8; 6];
+    msg[0] = b'Z';
+    let len_bytes = 5i32.to_be_bytes();
+    msg[1] = len_bytes[0];
+    msg[2] = len_bytes[1];
+    msg[3] = len_bytes[2];
+    msg[4] = len_bytes[3];
+    msg[5] = b'I';
+    msg
 }
 
 /// `EmptyQueryResponse`（'I'）。body なし・長さ固定（4）。
@@ -331,6 +395,54 @@ mod tests {
         let cell_len = i32_at(&msg, 7) as usize;
         let text = std::str::from_utf8(slice_at(&msg, 11, cell_len)).expect("utf8");
         assert_eq!(text, u64::MAX.to_string());
+    }
+
+    // --- encode_data_row_into（Issue #481）---
+
+    #[test]
+    fn encode_data_row_into_matches_encode_data_row_byte_for_byte() {
+        let row = ResultRow {
+            id: 7,
+            score: 0.0,
+            cells: vec![Cell::Integer(7), Cell::Text("lang".to_string()), Cell::Null],
+        };
+        let standalone = encode_data_row(&row).expect("encode standalone");
+        let mut out = Vec::new();
+        encode_data_row_into(&row, &mut out).expect("encode into");
+        assert_eq!(out, standalone);
+    }
+
+    #[test]
+    fn encode_data_row_into_appends_after_existing_content() {
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Bool(true)],
+        };
+        let mut out = b"PREFIX".to_vec();
+        encode_data_row_into(&row, &mut out).expect("encode into");
+        assert!(out.starts_with(b"PREFIX"));
+        assert_eq!(byte_at(&out, 6), b'D');
+    }
+
+    #[test]
+    fn encode_data_row_into_truncates_back_to_start_on_failure() {
+        // field_count は i16 に収まる必要がある（32,768 セルは超過）。
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Null; 32_768],
+        };
+        let mut out = b"KEEP".to_vec();
+        let result = encode_data_row_into(&row, &mut out);
+        assert!(result.is_err());
+        assert_eq!(out, b"KEEP", "failed encode must not leave partial bytes");
+    }
+
+    #[test]
+    fn ready_for_query_has_fixed_layout() {
+        let msg = encode_ready_for_query();
+        assert_eq!(msg, [b'Z', 0, 0, 0, 5, b'I']);
     }
 
     #[test]

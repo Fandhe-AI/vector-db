@@ -1281,3 +1281,141 @@ list 走査・BM25 スコアリング本体（Issue #388〜#392 で既に大半�
 （本ドキュメント「Issue #546」節参照）、ウォールクロック改善が計測されない
 ことは production 変更の妥当性を損なわない。本 Issue の役割は前後比較の
 実測・記録であり、#546 の採否判断そのものは対象外（既に実装・マージ済み）。
+## Issue #549: RRF 融合段の id 写像・ソートの割り当て削減（融合結果はビット同一）
+
+対応: Issue #549（`perf(engine): RRF 融合段の id 写像・ソートの割り当て削減
+（融合結果はビット同一）`）。親 #548（Phase 6・hybrid 上位 2 段の最適化）→ #461
+→ ルート #455。前提: Issue #465（最新基線）・Issue #546（`score_by_postings`
+アキュムレータ再利用）。対象ビヘイビア: SEARCH-1・SEARCH-3。関連ポインタ:
+TASK-104・TASK-84。
+
+### 変更内容
+
+`hybrid.rs::rrf_fuse_with_limits` の融合コアを、id をキーにした
+`BTreeMap<u64, f64>`（`entry().or_insert(0.0)` による毎クエリのノード確保を
+伴う累積）から、検証済み長さの**位置索引方式**へ置換した。
+
+- `compute_contributions`（旧 `accumulate_ranked` を改称・再設計）が、密・疎
+  それぞれの寄与（`weight / (k_const + rank)`）を「id ではなく列内の位置」に
+  対して `contrib: Vec<f64>`（長さ `n_d + n_s`。dense は `[0..n_d)`、sparse は
+  `[n_d..)`）へ書き込む。密・疎の位置は重ならないため、加算ではなく単純代入で
+  足りる（各位置は必ず 1 回だけ書き込まれる）
+- `index: Vec<(u64, usize)>`（`(id, pos)` の全順序タプル）を id 昇順へ**比較
+  関数なし**の `sort_unstable()` で整列する（`(id, pos)` は要素ごとに一意の
+  ため不安定性は観測されない。id を直接添字にする表は作らない ── id は
+  呼び出し元定義の任意 `u64` であり、添字化は untrusted 入力に比例した無制限
+  確保になるため）
+- 整列済み `index` の等 id 連続区間ごとに `contrib` から寄与を合算し、
+  `merged: Vec<HybridHit>`（id 昇順）を構築する。演算順（各位置の寄与を求めて
+  から加算する順序）は旧 `BTreeMap` 版の `or_insert(0.0)` → `+= dense 寄与` →
+  `+= sparse 寄与` と完全に同一であり、スコアはビット同一になる
+- 最終スコアソート（`out.sort_by(|a, b| b.score.total_cmp(&a.score)
+  .then(a.id.cmp(&b.id)))`）は安定ソートのまま**維持**（`docs/design/
+  rrf-tie-break-determinism.md` の不変条件）。この比較器は id が一意である限り
+  同値要素を生まない全順序のため、`merged` を渡す前の走査順序（本実装では id
+  昇順）自体は出力に影響しない
+- `has_duplicate_id`（`validate_extended_pool` からも使用）を、`BTreeSet` への
+  全件挿入（要素追加が B-tree ノードの新規確保・分割を伴いうる）から、`Vec` へ収集して比較関数
+  なし `sort_unstable()` の後に隣接比較する版へ置換（bool の戻り値契約・
+  呼び出し位置は不変）
+- `apply_soft_boost` の末尾の再ソートを、`hits` が既に融合スコア降順・同点 id
+  昇順へ整列済み（production 経路の `rules` 空呼び出しでは常にこの状態）なら
+  省略するガード（`is_sorted_desc_id_asc` による判定。安定ソートの入力が既に
+  整列済みなら再ソートは恒等写像であり省略は観測不能）を追加した。判定は
+  `rules.is_empty()` ではなく実際の整列状態で行うため、未整列入力＋空 `rules`
+  という契約違反ケースの挙動（従来どおり整列される）は変えない
+
+### 等価性検証
+
+置換前の融合コア（`has_duplicate_id` ×2 → `BTreeMap` 累積 → 有限性 → `collect`
+→ `sort_by`）を `#[cfg(test)] fn rrf_fuse_reference_with_limits`（内部で
+`accumulate_ranked_reference` を使用）として逐語コピーで残置し（Issue #399
+の先例に倣う）、`hybrid.rs::tests` に以下を追加した。
+
+- `rrf_fuse_with_limits_matches_reference_bitwise`: 決定的擬似乱数
+  （xorshift64*。外部クレート不使用）で 400 試行を生成し、`TieRank::GroupEnd`/
+  `Positional`、`k_const`・重みの通常値と極端値（同点グループを潰す巨大
+  `k_const`、オーバーフローを誘発しうる巨大重み）、密・疎間の id 部分/完全
+  重複、片側空、`dense_limit != sparse_limit`（`TooManyCandidates` の一致も
+  含む）を横断し、`Ok` 側は id・スコアの `to_bits()` 全件一致、`Err` 側は
+  エラー variant 一致を検証する
+- `rrf_fuse_with_limits_matches_reference_bitwise_on_full_id_overlap`: 密・疎が
+  完全に同一の id 集合を持つ（全件が両チャネルへ寄与を加算する）退行の専用
+  固定
+- `rrf_fuse_priority_duplicate_id_over_post_fusion_non_finite_score`: 重複 id と
+  融合後 `+Inf` を同時に含む入力で `DuplicateId` が返ること（検証順序:
+  長さ → 有限性(入力) → ソート順 → 重複 → 融合後有限性）を置換後の実装でも固定
+- `apply_soft_boost_skips_resort_when_hits_already_sorted_and_rules_empty` /
+  `apply_soft_boost_still_sorts_unsorted_input_with_empty_rules`: 3.3 の省略が
+  「整列済みなら省略」であって「`rules` が空なら省略」ではないことを固定
+
+既存の `tests/hybrid_recall.rs` 層 A 固定値アサーション・`tests/
+sparse_determinism.rs`・`tests/hybrid.rs`・`tests/sql_surface.rs` 等は無変更の
+まま green（同点順位規約 `TieRank::GroupEnd`・境界同点グループ完全化（#310）・
+再取得スケジュール（#392）は不変）。
+
+### 確保回数削減の根拠（静的）
+
+`#[global_allocator]` によるアロケーションカウントは本リポの既存方針
+（`storage.rs` の判断: 並列テスト下で非決定的・依存追加回避）に従い採用しない。
+変更前後の確保箇所を列挙する。
+
+| 箇所 | 変更前 | 変更後 |
+| --- | --- | --- |
+| 融合コア | `BTreeSet`×2（重複検査）＋ `BTreeMap`（累積。挿入に応じた B-tree ノード確保・分割）＋ `collect` の `Vec`＋ソートのスクラッチ | `has_duplicate_id` の `Vec`×2 ＋ `contrib: Vec<f64>` ＋ `index: Vec<(u64,usize)>` ＋ `merged: Vec<HybridHit>` ＋ソートのスクラッチ（いずれも単一 `Vec`・事前確保サイズ既知） |
+| `validate_extended_pool`（境界同点グループ完全化の再取得ラウンドごと） | `BTreeSet`×2 | `Vec<u64>`×2（`has_duplicate_id` 経由） |
+| `apply_soft_boost`（production の空 `rules` 呼び出し） | 常に `sort_by` のスクラッチ確保 | 既整列時は確保 0 |
+
+`BTreeMap`/`BTreeSet` は 1 ノードに複数要素を格納するため確保回数は要素数と
+一致しない（要素ごとに個別ヒープ確保されるわけではない）。ただし挿入に伴う
+ノードの新規確保・分割・再配置は要素数に対して非ゼロかつ事前に見積もれない
+回数発生し、確保サイズも実行時の木の形状に依存する。これに対し置換後は
+要素数が確定した単一 `Vec` の確保に集約される（`Vec` 自体も 1 回の連続領域
+確保で済む）。
+
+### 参考値（単一バイナリ内 A/B・B7 下限近似。採否記録は #550／#547 の担当）
+
+`docs/design/benchmark-judgement-policy.md` §5 により、共有 QEMU 環境では
+perf 動機の production 変更を本 Issue の実装担当が「Accepted」と判定できない
+（#546 の先例と同じ位置づけ）。本節は参考値の記録に限る。
+
+`crates/engine/benches/hybrid_profile_bench.rs` へ B7 段
+（`fuse_lower_bound`）を追加した。密・疎それぞれの Top-`pool_depth`
+候補（密は `ParallelSearchProvider`、疎は `sparse_refetch_observed(...).0` を
+`pool_depth` 件へ切り詰めたもの）を計測外（ラウンドループの前）で事前に捕捉
+し、`hybrid::rrf_fuse` の呼び出しのみを計測する（境界同点グループ完全化の
+再取得コストを含まない「融合コアだけの処理時間」の下限近似）。
+
+`BENCH_HYBRID_PROFILE_ROUNDS=5`・開発環境（共有 QEMU 環境。専有環境
+`BENCH_DEDICATED_ENV=1` ではない）での 1 回実測（`make bench-hybrid-profile`
+相当）:
+
+```text
+B7(min=10us,median=10us)
+```
+
+B1（SQL 表層 hybrid・`SELECT id`。min 6,691us）に対する比は約 0.15%、B4-B0-B5
+残差（min 974us。B4=3,157us・B0=505us・B5=1,677us）に対しては約 1%
+（`10 / 974 ≈ 1.03%`）である。ただしこの値は**変更後実装**への下限近似
+（`pool_depth` へ切り詰めた候補を渡した `rrf_fuse` 単体の計測）に限られ、
+変更前実装（`BTreeSet`/`BTreeMap` 経由）の融合コア時間・本番の境界同点
+グループ完全化後の候補数（`pool_depth` 切り詰めなし）での融合時間のいずれも
+計測していない。したがってこの参考値だけから「融合コアは元から残差のごく
+一部」「削減の絶対効果が小さい」とは判断できない。結論は今回の入力・変更後
+実装に対する参考値に限定し、削減効果（変更前後比較）は `docs/design/
+benchmark-judgement-policy.md` の基準を満たす前後比較（同一バイナリの
+production 変更前後を交互計測）を経るまで未確定とする。前後比較・採否の確定は
+親 #548 傘下の #550（通し前後比較）・#547 の担当とする。
+
+### スコープ外・申し送り
+
+- `hybrid_search_boosted` の `visible_ids: BTreeSet<u64>` のソート済み `Vec`
+  化（B8・約 1%。`sparse.rs::score_within` の `&BTreeSet` シグネチャ・
+  `bench-internals` フック・`hybrid_profile` ハーネスへ波及するため別途）
+- 最終スコアソートの `sort_unstable_by` 化（全順序のため結果は同一だが
+  `docs/design/rrf-tie-break-determinism.md` の安定ソート不変条件に関わる
+  オーナー判断事項）
+- クエリ横断の融合スクラッチ再利用（#546 型のプール化。規模が小さく費用対
+  効果が薄いため見送り）
+- perf 採否の確定（#550 通し前後比較・#547）・専有環境
+  （`BENCH_DEDICATED_ENV=1`）再実測はオーナー／運用者作業
