@@ -199,6 +199,14 @@ fn build_core_for(
                 .with_resident_precision(ResidentPrecision::F16);
             EngineCore::from_storage_with_engine(storage, SearchEngineKind::Hnsw(validated))
         }
+        harness::bench_engine::BenchEngine::HnswI8 => {
+            // I8（SQ8）常駐 opt-in（Issue #521・#523。`recall_engine.rs::
+            // RecallEngine::HnswI8` と同一構築経路）。
+            let validated = ValidatedHnswParams::new(HnswParams::default())
+                .expect("valid HnswParams::default()")
+                .with_resident_precision(ResidentPrecision::I8);
+            EngineCore::from_storage_with_engine(storage, SearchEngineKind::Hnsw(validated))
+        }
     }
 }
 
@@ -1075,6 +1083,16 @@ fn build_core_for_sweep(
             validated = apply_overrides(validated);
             EngineCore::from_storage_with_engine(storage, SearchEngineKind::Hnsw(validated))
         }
+        harness::bench_engine::BenchEngine::HnswI8 => {
+            // f16 の arm と同型（Issue #523）: このスイープ計測は I8 常駐を
+            // 対象としないが、`BenchEngine::HnswI8` を追加した以上この match
+            // を非網羅にしないため用意する。
+            let mut validated = ValidatedHnswParams::new(HnswParams::default())
+                .expect("valid HnswParams::default()")
+                .with_resident_precision(ResidentPrecision::I8);
+            validated = apply_overrides(validated);
+            EngineCore::from_storage_with_engine(storage, SearchEngineKind::Hnsw(validated))
+        }
     }
 }
 
@@ -1708,7 +1726,7 @@ fn run_hot_only(
         let s = core.hnsw_index_cache_stats();
         println!(
             "knn_profile_bench: hnsw_stats builds={} build_failures={} hits={} misses={} \
-             fallbacks={} entries={} f16_residency_fallbacks={}",
+             fallbacks={} entries={} f16_residency_fallbacks={} i8_residency_fallbacks={}",
             s.builds,
             s.build_failures,
             s.hits,
@@ -1716,6 +1734,7 @@ fn run_hot_only(
             s.fallbacks,
             s.entries,
             s.f16_residency_fallbacks,
+            s.i8_residency_fallbacks,
         );
         if s.builds == 0 || s.hits == 0 || s.build_failures > 0 {
             fail_closed(format!(
@@ -1724,7 +1743,7 @@ fn run_hot_only(
             ));
         }
         let expected_resident = resident_label_for_token(knn_engine.token())
-            .expect("hnsw/hnsw_f16 tokens must map to a resident label");
+            .expect("hnsw/hnsw_f16/hnsw_i8 tokens must map to a resident label");
         if knn_engine == harness::bench_engine::BenchEngine::HnswF16
             && s.f16_residency_fallbacks != 0
         {
@@ -1733,6 +1752,15 @@ fn run_hot_only(
                  corpus embeddings must stay within the f16 finite range for this measurement \
                  to be meaningful)",
                 s.f16_residency_fallbacks
+            ));
+        }
+        if knn_engine == harness::bench_engine::BenchEngine::HnswI8 && s.i8_residency_fallbacks != 0
+        {
+            fail_closed(format!(
+                "hnsw_i8 requested but i8_residency_fallbacks={} (D6 auto-degrade to f32; \
+                 corpus embeddings must be finite and avoid per-dimension scale underflow for \
+                 this measurement to be meaningful)",
+                s.i8_residency_fallbacks
             ));
         }
         // `EXPLAIN` は `USING PLAN(...)` 文にのみ対応する契約
@@ -1855,10 +1883,11 @@ fn run_index_memory_child_if_requested() {
     let precision = match engine_token {
         "hnsw" => ResidentPrecision::F32,
         "hnsw_f16" => ResidentPrecision::F16,
+        "hnsw_i8" => ResidentPrecision::I8,
         other => {
             eprintln!(
                 "knn_profile_bench: invalid engine token {other:?} in \
-                 {INDEX_MEMORY_CHILD_ENV} (must be \"hnsw\" or \"hnsw_f16\")"
+                 {INDEX_MEMORY_CHILD_ENV} (must be \"hnsw\", \"hnsw_f16\", or \"hnsw_i8\")"
             );
             std::process::exit(1);
         }

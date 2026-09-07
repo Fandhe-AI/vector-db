@@ -385,6 +385,7 @@ pub fn resident_label_for_token(engine_token: &str) -> Option<&'static str> {
     match engine_token {
         "hnsw" => Some("f32"),
         "hnsw_f16" => Some("f16"),
+        "hnsw_i8" => Some("i8"),
         _ => None,
     }
 }
@@ -434,5 +435,5 @@ pub fn render_index_memory_line(
 /// のため、呼び出し元がトークン文字列で渡す。`resident_label_for_token` と
 /// 同じ設計）。
 pub fn requires_hnsw_stats_check(engine_token: &str) -> bool {
-    matches!(engine_token, "hnsw" | "hnsw_f16")
+    matches!(engine_token, "hnsw" | "hnsw_f16" | "hnsw_i8")
 }

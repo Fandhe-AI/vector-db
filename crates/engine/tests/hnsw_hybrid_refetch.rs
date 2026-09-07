@@ -170,6 +170,13 @@ fn run_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic(
          tie-inducing corpus (got hybrid_resumed_rounds={})",
         stats.hybrid_resumed_rounds
     );
+    if precision == engine::hnsw::ResidentPrecision::I8 {
+        assert_eq!(
+            stats.i8_residency_fallbacks, 0,
+            "this corpus's embeddings must be finite and must not trigger the D6 \
+             fallback（Issue #523）"
+        );
+    }
 }
 
 #[test]
@@ -185,5 +192,14 @@ fn tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic() {
 fn f16_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic() {
     run_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic(
         engine::hnsw::ResidentPrecision::F16,
+    );
+}
+
+/// Issue #523: I8（SQ8）常駐でも同点誘発コーパスでの停止性・決定性契約は
+/// 不変であることを固定する（f16 版と同型）。
+#[test]
+fn i8_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic() {
+    run_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic(
+        engine::hnsw::ResidentPrecision::I8,
     );
 }

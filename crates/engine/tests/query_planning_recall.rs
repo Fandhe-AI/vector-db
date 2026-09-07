@@ -703,7 +703,7 @@ fn measure_category_recall_via_hnsw(
 /// print_ann_stats` と同型の複製）。
 fn print_ann_stats(gate: &str, engine: RecallEngine, stats: &AnnStats) {
     println!(
-        "{gate}: engine={} builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={} f16_residency_fallbacks={} hybrid_resumed_rounds={} f16_kernel={:?}",
+        "{gate}: engine={} builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={} f16_residency_fallbacks={} hybrid_resumed_rounds={} f16_kernel={:?} i8_residency_fallbacks={} i8_kernel={:?}",
         engine.token(),
         stats.builds,
         stats.build_failures,
@@ -714,6 +714,8 @@ fn print_ann_stats(gate: &str, engine: RecallEngine, stats: &AnnStats) {
         stats.f16_residency_fallbacks,
         stats.hybrid_resumed_rounds,
         engine::isa::current_f16(),
+        stats.i8_residency_fallbacks,
+        engine::isa::current_i8(),
     );
 }
 
@@ -1207,7 +1209,7 @@ fn query_planning_recall_threshold_gate() {
             measure_category_recall(&docs, &pairs, VOCAB_SIZE, direct_baseline),
             measure_category_recall(&docs, &pairs, VOCAB_SIZE, intent_baseline),
         ),
-        RecallEngine::Hnsw | RecallEngine::HnswF16 => {
+        RecallEngine::Hnsw | RecallEngine::HnswF16 | RecallEngine::HnswI8 => {
             let (direct, direct_stats) = measure_category_recall_via_hnsw(
                 &docs,
                 &pairs,
@@ -1294,7 +1296,7 @@ fn query_planning_recall_threshold_gate() {
                     intent_baseline,
                     &NoisyLlmClient,
                 ),
-                RecallEngine::Hnsw | RecallEngine::HnswF16 => {
+                RecallEngine::Hnsw | RecallEngine::HnswF16 | RecallEngine::HnswI8 => {
                     let (r, stats) = measure_category_recall_via_hnsw(
                         &docs,
                         &pairs,
@@ -1381,7 +1383,7 @@ fn query_planning_recall_large_scale_threshold_gate() {
         RecallEngine::BruteForce => {
             measure_category_recall(&docs, &pairs, LARGE_VOCAB_SIZE, direct_baseline)
         }
-        RecallEngine::Hnsw | RecallEngine::HnswF16 => {
+        RecallEngine::Hnsw | RecallEngine::HnswF16 | RecallEngine::HnswI8 => {
             let (r, stats) = measure_category_recall_via_hnsw(
                 &docs,
                 &pairs,
