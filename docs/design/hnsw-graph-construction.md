@@ -247,4 +247,6 @@ id 昇順」を踏襲する。ソートは安定ソート（`sort_by`）のみ�
 の探索段／結線段の分離を土台に、要素単位 `RwLock`・エントリポイント更新のみ
 排他という並列構築を実装した。詳細・不変条件・実測は
 `docs/design/hnsw-parallel-build.md` 参照。`Arc<[f32]>` 化によるコピー縮退
-（`arena.rs::VectorArena` 側）は引き続き #408 の担当のまま申し送る。
+（`arena.rs::VectorArena` 側）は引き続き #408 の担当のまま申し送る。並列挿入時
+の上位層リンク保証による到達不能ノード発生の抑制は Issue #448 として実装済み
+（`docs/design/hnsw-parallel-build.md`「Issue #448 追記」節参照）。

@@ -123,11 +123,19 @@ limit: 7 > 6`）。
 `current_links.len() <= limit` のため `compute_shrink` が `None` を返し
 no-op（逐次経路との性能差は生じない）。
 
-### 上位層の到達性
+### 挿入時のリンク保証（Issue #448）
 
 並列時、エントリ更新の競合（複数ワーカーが同時に新最大層を持つノードを
-挿入）で上位層に到達不能ノードが残り得るが、既存の `repair_reachability`
-（凍結後・単一スレッド）がそのまま閉じる。追加の修復ロジックは書いていない。
+挿入）や下記 H-N の窓により上位層・層 0 に到達不能ノードが残り得るが、
+`repair_reachability`（凍結後・単一スレッド）が最終的に閉じる。Issue
+#448 で `insert_node_locked` を `plan_links`（探索・選択・自ノードの
+外向きリンク）／`publish_links`（逆方向リンク・shrink・エントリ昇格）の
+2 パスへ分離し、挿入完了直前に選択近傍の少なくとも 1 つが逆方向リンクを
+保持することを確認・必要なら再結線する保証（`ensure_reverse_link`）を
+追加した——詳しくは下記「Issue #448 追記」節参照。これにより並列由来の
+到達不能ノード発生自体を抑制し、`repair_reachability` の修復量（≒ 反復
+回数）を減らす。到達不能ノードの発生を完全にゼロにする保証ではなく、
+`repair_reachability` は引き続き必要。
 
 ## 対象ファイル
 
@@ -157,6 +165,10 @@ no-op（逐次経路との性能差は生じない）。
 | `crates/engine/benches/hnsw_parallel_build_bench.rs`（Issue #447 追記） | repair 統計行（層別到達不能ノード数・反復回数・段別壁時間の min/med/max）の出力追加 |
 | `crates/engine/tests/hnsw_parallel_profile_accept.rs`（Issue #447 追記） | 上記 harness 新関数の回帰テスト |
 | `crates/engine/tests/hnsw.rs`（Issue #447 追記） | 重複ヘビーコーパスでのフェーズ 2 非 vacuous 性・逐次経路での repair 統計の決定性を固定するテスト 2 本 |
+| `crates/engine/src/hnsw/parallel_build.rs`（Issue #448 追記） | `insert_node_locked` の `plan_links`／`publish_links` 分離、`BuildGraph::has_link`・`ensure_reverse_link`（新設）、observe 限定診断カウンタ、単体テスト 4 本＋informational テスト 1 本 |
+| `crates/engine/src/hnsw.rs`（Issue #448 追記） | `HnswWorkerStats` へ `degenerate_layer_searches`／`reverse_link_reconnects` フィールド追加 |
+| `crates/engine/tests/hnsw_parallel_profile_accept.rs`（Issue #448 追記） | ヘルパの構造体リテラルへ新フィールド追随 |
+| `crates/engine/tests/hnsw_search.rs`（Issue #448 追記） | `parallel_build_recall_at_10_matches_sequential_build_within_margin` へ threads=12 判定を追加 |
 
 ## 検証
 
@@ -484,6 +496,111 @@ repair_reachability`）が実測でも成立することを確認した。
    並列化であればフェーズ 1 の反復ループ自体（BFS が支配的）の並列化が
    候補になる、という所見の位置づけに留め、本 Issue では実装しない。
 
+### Issue #448 追記（2026-09-07）: 並列挿入時のリンク保証による到達不能ノード発生の抑制
+
+Issue #447 追記の実測（並列由来の到達不能ノード発生が層 0・層 1 に集中し、
+スレッド数の増加に伴い単調増加する）を受け、発生自体を抑制する対策を
+実装した。
+
+#### 機構（H-N: 発見可能だが下位層の隣接リストが空の窓）
+
+旧・単一パス `insert_node_locked` は層を上から下へ処理し、**各層ごとに**
+`connect(node→sel)` → `connect(sel→node)` → `shrink_links(sel,
+protect=node)` を行っていた。このため挿入中ノード Z は、ある層 l+1 の
+逆方向リンクが張られた瞬間から他ワーカーに**発見可能**になる一方、
+層 l 以下の Z 自身の隣接リストはまだ**空**である窓が生じる。この窓で
+別ワーカー X が Z へ降下し層 l で `search_layer_locked(entry_points=
+[Z])` を実行すると `neighbors_copy(l, Z)` が空のため結果が `[Z]` のみに
+退化し、X は層 l 以下の全層で Z 1 本だけに結線される。この結線は Z 自身
+の後続処理や後続挿入の枝刈りで容易に失われ、X が到達不能になる。
+
+この仮説は Issue #447 の実測（(a) 層 0 集中——層 1 で同じ窓を作るには
+「レベル ≥ 2 の挿入中ノード」が必要で約 1/m の頻度、(b) スレッド数に
+比例した増加——同時挿入中ノード数に比例、(c) 発生規模が数十件程度に
+留まる稀な競合、の 3 点と整合する）。
+
+#### 対策
+
+`crates/engine/src/hnsw/parallel_build.rs::insert_node_locked` を 2 パスへ
+分離した:
+
+- `plan_links`: 探索・選択・**自ノードの外向きリンクのみ**を層ごとに
+  張る（逆方向リンクは張らない）。完了時点で対象ノードは entry から
+  到達不能なまま。
+- `publish_links`: 層を上から下へ処理し、逆方向リンク・`neighbor` 側
+  shrink・自己 shrink（既存の防御）に加え、`ensure_reverse_link` で
+  選択近傍の少なくとも 1 つが対象ノードへの逆方向リンクを保持している
+  ことを確認し、全て失われていれば `selected[0]` へ再結線する（3.2:
+  逆方向リンク保証。`compute_shrink` の `protect` 契約により次数上限を
+  維持したまま必ず残る）。
+
+`plan_links` 完了時点で対象ノードの全層の外向きリストは既に完成して
+いるため、`publish_links` が逆方向リンクを張って対象ノードが発見可能に
+なった瞬間には、その層以下の外向きリストは既に完成済みであり H-N の窓が
+構造的に閉じる。無競合（単一スレッド・逐次プレフィックス）実行では
+旧手順と完全に同一のグラフを生成することを
+`crates/engine/src/hnsw/parallel_build.rs::tests::
+plan_then_publish_matches_sequential_insert_without_contention`・
+`build_with_threads_one_matches_sequential_build_exactly` で機械検証した。
+
+エントリ昇格競合（挿入中に発見したエントリが古いスナップショットに基づく
+ケース）の追加結線は、Issue #447 実測で層 2 以上の到達不能ノードが常に
+0 だったこと（層 2 以上でのみこの経路が問題になる）を踏まえ、本 Issue
+では実装を見送った（発生 0 のため対策の効果を実測で確認できず、追加の
+複雑性に見合わないと判断）。
+
+#### 診断カウンタと実測
+
+observe 限定（production 経路には一切影響しない）の診断カウンタ
+`degenerate_layer_searches`（`plan_links` の層探索で候補集合が
+`<=1` に退化した回数。並列フェーズのみ計上）・`reverse_link_reconnects`
+（`ensure_reverse_link` が実際に再結線した回数）を
+`HnswWorkerStats` へ追加した。
+
+導入後の単発実測（本開発環境・threads=12・rows=20,256・dim=32・
+クラスタ構造ありコーパス。`cargo test --release -p engine --lib
+hnsw::parallel_build::tests::
+observed_build_at_high_thread_count_reports_low_degenerate_layer_searches
+-- --ignored --nocapture`）:
+
+```
+degenerate_layer_searches=2 reverse_link_reconnects=0 repair_unreachable_sum=0
+```
+
+H-N の窓に起因する退化探索がほぼ消え（2 件のみ。うち残存分はエントリ
+昇格競合など本対策の対象外の経路に起因する可能性がある）、この実測点
+では `repair_reachability` の修復対象自体が 0 件（Issue #447 追記の
+同規模条件では threads=12 で層横断合計 unreachable_sum が二桁台
+発生していた）まで低下した。この 1 回の実測は導入後の絶対値のみを
+確認するものであり、Issue #447 基線（100k 点・threads=12 で
+unreachable_sum 中央値 26〜27）との**同一コーパス・同一規模での定量的な
+前後比較**は行っていない——`make bench-hnsw-parallel-build` による
+100k 点フルラダー実測を運用者作業として申し送る（受け入れ条件「並列由来
+増分が導入前比 1/10 以下」の最終判定はこの実測を待つ）。
+
+#### Recall・不変条件
+
+`tests/hnsw_search.rs::parallel_build_recall_at_10_matches_sequential_
+build_within_margin` へ threads=12 の判定を追加し（既存の threads=4 に
+加える）、ef=64／256 いずれも `par >= seq - 0.02` を満たすことを確認した。
+`tests/hnsw.rs::parallel_build_invariants`（次数上限・連結性・レベル
+不変）・`graph_fingerprint_is_stable_across_representation_change`
+（逐次グラフの固定値照合）は無変更のまま green。
+
+#### 対象ファイル
+
+| パス | 変更 |
+| --- | --- |
+| `crates/engine/src/hnsw/parallel_build.rs` | `insert_node_locked` を `plan_links`／`publish_links`（新設）の 2 パスへ分離する薄いラッパへ変更。`BuildGraph::has_link`（新設）・`ensure_reverse_link`（新設）。observe 限定 TLS カウンタ `DEGENERATE_LAYER_SEARCHES`／`REVERSE_LINK_RECONNECTS` の追加。単体テスト 4 本追加（外向きリンク完成の固定・探索非退化の固定・逆方向リンク保証の固定・パス分離の無競合等価性）、informational テスト 1 本（`#[ignore]`） |
+| `crates/engine/src/hnsw.rs` | `HnswWorkerStats` へ `degenerate_layer_searches`／`reverse_link_reconnects`（`u64`）フィールド追加。既存フィールドの意味・値は不変 |
+| `crates/engine/tests/hnsw_parallel_profile_accept.rs` | `worker()`／`worker_with_wait()` ヘルパの構造体リテラルへ新フィールド追随 |
+| `crates/engine/tests/hnsw_search.rs` | `parallel_build_recall_at_10_matches_sequential_build_within_margin` を threads=4 に加え threads=12 でも判定するよう拡張 |
+
+`GraphBuilder::insert_node`／`shrink_links`／`compute_shrink`／
+`repair_reachability_inner`（#449 の担当）・`SearchProvider` trait・
+`sql::hnsw_cache`／`sql::hnsw_hybrid`・`Cargo.toml`（依存追加なし）・
+`.github/workflows`（CI 非配線のまま）はいずれも無変更。
+
 ### 外部フレームワークとの構築比較（usearch）
 
 usearch（`=2.26.1`。承認済み optional 依存・`contrast-bench` feature、
@@ -651,10 +768,13 @@ threads=8 の self が run9 より速い等の run-to-run 差がある点に注�
   段別内訳を実測済み（上記「Issue #406 追記」節）。支配的な要因は
   `search_layer_locked` の隣接コピー自体ではなく `repair_reachability`
   （凍結後・単一スレッドの後始末）と判明した
-- `repair_reachability` の並列化、または挿入時の上位層リンク保証による
-  到達不能ノード発生自体の抑制は未実装（Issue #406 追記の所見 6。
-  発生抑制は #448、修復並列化は #449 が担当。Issue #447 で内訳観測
-  フックとベンチ実測を用意済み——上記「Issue #447 追記」節参照）
+- 挿入時の上位層リンク保証による到達不能ノード発生自体の抑制は
+  実装済み（Issue #448。上記「Issue #448 追記」節参照）。`repair_
+  reachability` 本体の並列化（フェーズ 1 の BFS が支配的要因。Issue
+  #447 追記の所見 4）は未実装のまま #449 へ申し送る——残る修復対象は
+  逐次経路と同水準の残差（層 1 の数件前後）に留まる見込み（Issue #448
+  実測点の `repair_unreachable_sum=0` を根拠とする所見であり、
+  100k 点フルラダーでの確定は #448 追記に記載のとおり運用者実測待ち）
 - ホスト側の物理コア共有（SMT・vCPU ピニング等）の有無はゲスト内から
   直接検証できない（Issue #406 追記の所見 5。対照負荷の speedup 天井
   からの間接推定に留まる）
