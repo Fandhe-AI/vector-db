@@ -204,6 +204,30 @@ pub fn parse_query_f16_exact(raw: Option<&str>) -> Result<bool, GpuScalingError>
     }
 }
 
+/// `BENCH_GPU_SCALING_SHADER_AB`（Issue #540・codex-review P2 指摘対応
+/// 〔PR #611〕）: 既存の [`parse_query_f16_exact`] opt-in は before/after で
+/// クエリ集合そのものを変える（未丸め＝unpack 版縮退／丸め済み＝f16 算術版
+/// 選択）ため、"unpack 版 vs f16 算術版" の比較が「シェーダの違い」と
+/// 「クエリの違い」の 2 要因を同時に動かす交絡を含んでいた
+/// （`docs/design/gpu-batch-f16-arith.md` §8.3 参照）。本 opt-in を有効化すると
+/// `gpu_scaling_bench.rs`（`bench-internals` feature 必須）が同一の f16 厳密
+/// 往復済みクエリに対し `GpuBatchBackend::batch_search_with_options_for_tests`
+/// （[`engine::gpu_batch::GpuSearchTestOptions::dot_shader`]）で S0 シェーダ選択を
+/// `Unpack`／`F16Arith` へ交互に強制し、クエリを固定したままシェーダ単体の
+/// 効果を計測する（`gpu_scaling_shader_ab:` 行）。[`parse_query_f16_exact`] の
+/// opt-in と同時に有効化する契約（`gpu_scaling_bench.rs` 側が fail-closed に
+/// 強制する。クエリが f16 厳密往復可能でなければ `F16Arith` 強制は
+/// `select_dot_shader` の条件 5 で必ず拒否されるため）。未設定・空文字列は無効。
+pub fn parse_shader_ab(raw: Option<&str>) -> Result<bool, GpuScalingError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(err(format!(
+            "BENCH_GPU_SCALING_SHADER_AB must be unset or \"1\" (got {other:?})"
+        ))),
+    }
+}
+
 /// クエリ成分 1 個を f16 へ厳密往復可能な値へ丸める（[`parse_query_f16_exact`]
 /// の opt-in が有効なときのみ [`gpu_scaling_bench`] から呼ばれる）。
 /// `engine::batch_search::pack_f16x2`/`unpack_f16x2`

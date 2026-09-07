@@ -13,8 +13,8 @@ use harness::gpu_scaling::{
     count_boundary_tolerant_mismatches, format_i8_unavailable_line, format_skip_line,
     format_unavailable_line, full_readback_bytes_estimate, mean_recall_at_k, parse_batches,
     parse_dims, parse_i8_oversample, parse_measured_iterations, parse_query_f16_exact, parse_rows,
-    parse_top_k, readback_bytes_per_call, rescored_candidates_per_call, round_to_f16_exact,
-    speedup_ratio, GpuScalingI8Result, GpuScalingI8StatsLine, GpuScalingResult,
+    parse_shader_ab, parse_top_k, readback_bytes_per_call, rescored_candidates_per_call,
+    round_to_f16_exact, speedup_ratio, GpuScalingI8Result, GpuScalingI8StatsLine, GpuScalingResult,
     GpuScalingStatsLine,
 };
 use std::time::Duration;
@@ -494,6 +494,29 @@ fn parse_query_f16_exact_rejects_other_values_fail_closed() {
     assert!(parse_query_f16_exact(Some("true")).is_err());
     assert!(parse_query_f16_exact(Some("0")).is_err());
     assert!(parse_query_f16_exact(Some("yes")).is_err());
+}
+
+// ---------------------------------------------------------------------
+// Issue #540 追記（codex-review P2 指摘対応・PR #611）: 同一クエリでの
+// シェーダ単体比較 opt-in（`BENCH_GPU_SCALING_SHADER_AB`）
+// ---------------------------------------------------------------------
+
+#[test]
+fn parse_shader_ab_defaults_to_false() {
+    assert_eq!(parse_shader_ab(None), Ok(false));
+    assert_eq!(parse_shader_ab(Some("")), Ok(false));
+}
+
+#[test]
+fn parse_shader_ab_accepts_only_literal_one() {
+    assert_eq!(parse_shader_ab(Some("1")), Ok(true));
+}
+
+#[test]
+fn parse_shader_ab_rejects_other_values_fail_closed() {
+    assert!(parse_shader_ab(Some("true")).is_err());
+    assert!(parse_shader_ab(Some("0")).is_err());
+    assert!(parse_shader_ab(Some("yes")).is_err());
 }
 
 #[test]
