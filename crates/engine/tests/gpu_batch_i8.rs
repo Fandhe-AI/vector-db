@@ -385,7 +385,13 @@ fn measure_i8_recall_vs_brute_force(
         .expect("i8 backend try_new must succeed once gpu availability is confirmed");
 
     let ctx = PolicyContext::new("i8-recall-tenant").expect("valid tenant id");
-    let mut query_rng = RecallTestRng::new(0xF00D_F00D_0000_0001 ^ (oversample as u64));
+    // クエリ生成シードは oversample に依存させない（固定値のみ）。
+    // `i8_backend_recall_is_monotone_non_decreasing_in_oversample_when_gpu_available`
+    // が同一コーパス・同一クエリ集合で oversample=1/4/8 の Recall を比較する
+    // 前提であり、シードを oversample から独立させないと各 oversample で
+    // 異なるクエリ集合を比較することになり単調性（非減少）契約を正しく
+    // 検証できない（codex-review 指摘・Cursor Bugbot 重複指摘）。
+    let mut query_rng = RecallTestRng::new(0xF00D_F00D_0000_0001);
     let queries: Vec<Vec<f32>> = (0..query_count)
         .map(|_| (0..dim).map(|_| query_rng.next_unit()).collect())
         .collect();
