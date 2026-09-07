@@ -86,7 +86,7 @@ impl HnswIndex {
 は本タスク（#405）の対応で撤去した——検出すべき不一致の入力クラス自体が
 存在しない。
 
-## visited 集合の 2 実装
+## visited 集合の 3 実装
 
 構築経路（`build`／`insert_node`）は世代カウンタ方式の `VisitedScratch`
 （`epoch: Vec<u64>`。#404・codex-review #423 P1 指摘で O(N^2) 初期化を回避
@@ -106,6 +106,54 @@ impl HnswIndex {
 - `VisitedBitmap::reset` は伸長のみで縮めない（呼び出し元が同一スクラッチ
   を異なる索引規模へ使い回す想定のため、再確保コストより多少の未使用
   メモリを許容する）。
+
+### `VisitedSparse`（Issue #497）
+
+`VisitedBitmap` は毎クエリ `reset` で索引ノード数 N に比例する `N/64` 語の
+全クリアを行うため、マスク付き探索（`search_masked_with`。RLS／`WHERE`
+事前フィルタで可視候補が索引に対して極小のケース）でも N 全体分のコストが
+かかる。faiss の `VisitedTable` 方式（可視カーディナリティが小さいときは
+`unordered_set` へ切り替える）を参考に、`HashSet<u32>` ベースの 3 つめの
+`VisitedSet` 実装 `VisitedSparse` を追加した。`reset` は `HashSet::clear`
+（内部確保容量は保持し確保コストを償却する）で行い、実際に訪問したノード数
+にのみ比例する。
+
+- 切替点は `HnswIndex::search_masked_with(query, k, ef, mask,
+  sparse_visited_max, scratch)`（新設）。層 0 のビーム探索直前で
+  `mask.is_some() && mask.count_ones() < sparse_visited_max` を判定し、
+  真なら `VisitedSparse`、それ以外（`mask == None` を含む）は `VisitedBitmap`
+  を使う。`mask == None` は `sparse_visited_max` の値に関わらず常に dense
+  を使い、`Self::search` とのビット同一契約（`search_masked_none_matches_
+  search`）を無条件に維持する。
+- `mask.count_ones()`（`NodeMask`）は同 Issue で `ones: usize` フィールドに
+  よる O(1) 化を行った。旧実装（`words.iter().map(...).sum()`）は語走査
+  そのもので、避けたい `VisitedBitmap::reset` と同じ O(N/64) オーダーの
+  ため、切替判定にそのまま使うと自己矛盾になる。
+- 閾値 `sparse_visited_max` は `ValidatedHnswParams` の private フィールド
+  として持つ（`full_scan_ratio`・`resident_precision` と同じ設計。既存の
+  `HnswParams` へ直接フィールド追加すると外部の構造体リテラルを破壊する
+  破壊的変更になるため）。既定値は `0`（＝常に dense。既存の全動作を不変に
+  保つ）。`with_sparse_visited_max(usize)`（infallible）で opt-in する。
+- `HnswSearchScratch` は `sparse: VisitedSparse`・`last_visited_kind:
+  Option<VisitedKind>`（`Dense`／`Sparse`。診断用）を追加で保持する。
+  `last_visited_kind()`（`pub(crate)`）は `sql::hnsw_cache` が
+  `HnswIndexCacheStats::sparse_visited_searches`（縮退なしで完走した探索の
+  うち sparse を選んだ回数）を計上するのに使う。
+- `EXPLAIN` の `hnsw_params:` 行へ `sparse_visited_max=<n>` を追記した
+  （`resident=` と同区分。構築時静的値のみを露出し、実行時にどちらの
+  visited 実装が選ばれたか・可視候補数・索引ノード数は非露出のまま。
+  `docs/design/explain-search-engine-exposure.md` 参照）。
+
+### 到達可能性についての注記（#498 への申し送り）
+
+production の SQL 表層では `search_with_overlay`（`sql::hnsw_cache`）が
+`visible/index_len >= full_scan_ratio` のときのみ `search_masked_with` を
+呼ぶため、可視候補数は常に「索引ノード数 × full_scan_ratio」以上になる
+（既定 `full_scan_ratio = 1/10` なら索引ノード数の 1/10 以上）。閾値の
+既定値確定・可視比率別の費用対効果測定は Issue #498 の担当（本 Issue は
+機構と計測用 knob——`BENCH_KNN_PROFILE_SPARSE_VISITED_MAX`（`make
+bench-knn-profile`。S0-cold/S0-hot・可視比率スイープ双方に効く）——までを
+担う）。
 
 ## 決定性の保証範囲
 

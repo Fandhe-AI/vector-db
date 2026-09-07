@@ -191,7 +191,14 @@ ANN の近似近傍が確信度ゲートのマージン判定を過大評価し�
    探索起点の成分だけでは受理ノード全体を覆えないと `Overlay::compute` 時点で
    判明済み）→ `search_masked` 自体を呼ばず plain scan へ縮退（統計
    `mask_splits_graph`）
-3. それ以外 → `HnswIndex::search_masked(query, k, ef, Some(&visible_mask), scratch)`
+3. それ以外 → `HnswIndex::search_masked_with(query, k, ef, Some(&visible_mask),
+   sparse_visited_max, scratch)`（`search_masked` は `sparse_visited_max` に
+   既定値 0 を渡す薄いラッパー）。層 0 のビーム探索が使う visited 集合
+   （`VisitedBitmap`／`VisitedSparse`）の選択はこの呼び出しの内部で
+   `mask.count_ones() < sparse_visited_max` により決まる（Issue #497。
+   探索方式そのもの——plain scan／masked ANN の切替——には影響しない診断的な
+   実装選択。詳細は `docs/design/hnsw-search.md`「visited 集合の 3 実装」
+   節参照）
 4. マスク付き探索の結果件数が `min(k, visible_in_index)` 未満（ビーム幅内で
    可視ノードを辿り切れなかった）→ 当該クエリのみ plain scan へ縮退（統計
    `masked_short`。fail-closed 縮退で k 件充足を保証する。**`ef` の段階的拡張
@@ -728,6 +735,200 @@ rs`・`tests/sql_explain.rs`・`crates/wire-server/tests/wire_explain.rs`
   `EXPLAIN` の `hnsw_params:` 出力・`search_engine.rs` の `Display` テスト・
   README・`hnsw-index.md` §3 のいずれも本 Issue では変更不要
 
+## Issue #500: ACORN-1 のテナント境界契約整理とゲート条件の設計
+
+親 Issue #499（qdrant `search_on_level_acorn` 型の低選択性フィルタ限定導入）。
+前提: #488（前節）・#487（可視比率×行数スイープの所見「`ann_masked` arm
+未到達」）。対象ビヘイビア（ポインタのみ）: CORE-9・CORE-10・TASK-132・
+RLS-1〜4・RLS-8（TASK-138）・TASK-139。本 Issue は **docs 専任**（`crates/`
+配下は無変更）。契約整理とゲート条件の設計のみを行い、実装は #501、可視比率
+スイープの実測・既定値確定は #502 の担当とする。
+
+### 目的・位置づけ
+
+Issue #487・#488 の実測で判明したとおり、現行の「1-hop マスク付き探索」は可視比率
+が下がると `HnswIndex::is_mask_fully_reachable` の分断検査に落ちて
+`mask_splits_graph` → plain scan へ縮退し、`ann_masked` arm（実際に ANN
+探索を完走する経路）へ一度も到達しない。`hnsw_subset` 経路が既定エンジン比
+37〜45% 悪化する実測（Issue #413）を解く本命候補として、親 #499 は
+ACORN-1（不適合な 1-hop ノードのリンクだけを辿り、2-hop 先の適合ノードを
+候補に加える方式）を挙げている。ACORN-1 を導入するには、現行の「非受理
+ノードを一切辿らない」契約とどう整合するかを先に整理する必要があり、それが
+本 Issue の作業である。
+
+### ACORN-1 の方式要約（手法名と採否のみ・コード非転記）
+
+qdrant `search_on_level_acorn`（`lib/segment/src/index/hnsw_index/graph_layers.rs`。
+Apache-2.0）は、層探索中に候補ノードの隣接を辿る際、隣接ノードが
+フィルタに適合しない場合でも探索を打ち切らず、そのノードのさらに先の
+隣接（2-hop 先）まで辿ってフィルタ適合ノードを候補に加える。適合しない
+1-hop ノード自体はスコア計算・結果候補にはしない（`max_selectivity` 等の
+閾値で低選択性フィルタに限定して有効化）。
+
+### 現行契約の分解: I1（ベクトル非参照）と I2（リンク非参照）
+
+origin/main 時点のコード事実（`hnsw.rs::search_layer` doc コメント・
+`search_layer_in` 本体・`is_mask_fully_reachable`／`accepted_reachable_count`。
+テスト `search_masked_does_not_traverse_through_a_rejected_bridge_node`・
+`search_layer_prefetch_never_touches_rejected_nodes`）を精査すると、
+「非受理ノードを一切参照しない」契約は実際には性質の異なる 2 つの不変条件が
+束ねられている。
+
+- **I1: ベクトル非参照（P0・不変。ACORN-1 導入後も維持する）** — 非受理
+  ノードのベクトルに対するスコア計算・prefetch（#490）を一切行わず、非受理
+  ノードのスコアを候補ヒープ・結果ヒープ・停止判定に一切関与させない。
+  PR #431（codex-review P0 是正。survey 行 169・172・292・339 参照）が
+  修正したのはまさにこの不変条件（非受理ノードのスコアが `results`
+  充足・停止判定へ影響していた）であり、faiss `IDSelector` 型（不適合
+  ノードにも距離計算＝ベクトルアクセスが発生する設計）を不採用とした
+  ADR 側の判断もこの不変条件を根拠にしている
+- **I2: リンク非参照（実装上の不変条件。本 Issue でゲート下の緩和対象）** —
+  非受理ノードの隣接リストを読まず、その先を探索しない（`search_layer_in`
+  が非受理ノードを visited マークのみ付けて打ち切る挙動・
+  `is_mask_fully_reachable` の BFS が非受理ノードを中継点にしない挙動）。
+  PR #431 の是正では I1 と同時に導入されたが、ADR（`ann-index-adoption.md`
+  「実装ガイド（B 案）」節）本文が要求しているのは「非可視ノードを探索経路
+  として通過させる設計は不採用」であり、この「非可視ノード」は RLS の
+  意味での**他テナントの不可視行**を指す。ただし `PolicyContext::is_visible`
+  （`policy.rs`）は許可された `Public` 行をテナント不一致でも可視とするため、
+  「他テナント行がそもそもグラフに存在しない」は正確ではない。per-`(table, ctx)`
+  索引（#409。索引は ctx 可視アリーナのみから構築）に含まれるのは常に
+  「構築時点で `is_visible` を通過した行」（自テナント許可行、および他テナントの
+  `Public` 許可行を含む）のみであり、**構築時点で ctx に不可視だった行の情報は
+  索引に含まれない**という前提のもとで、I2 はテナント境界そのものではなく、
+  その上に置かれた「探索経路の単純化」という実装上の選択だったと整理できる
+
+ACORN-1 は **I1 を完全に維持したまま I2 のみをゲート下で緩和する**方式で
+ある: 非受理ノードは「リンクを読むだけの中継点」として扱い、スコア計算・
+ヒープ登録・結果への混入は一切行わない。2-hop 先の**受理**ノードのみ、
+通常どおりスコア計算して候補に積む。
+
+### テナント境界・存在情報漏えいの論点表
+
+| 論点 | 整理 |
+| ---- | ---- |
+| ctx 不可視行（構築時点で不可視だった行） | 索引は `(table, ctx)` キーで ctx 可視アリーナのみから構築（#409）。索引に含まれるのは常に「構築時点で `PolicyContext::is_visible` を通過した行」（自テナント許可行、および他テナントの `Public` 許可行を含む）のみであり、構築時点で ctx に不可視だった行（許可されない可視性ラベルの行、テナント不一致の `Private` 行）は索引にそもそも含まれない。非受理ノードとして現れるのは (a) 構築後に失効した stale ノード（後述）、(b) `WHERE` で除外された ctx 可視行、の 2 種のみで、いずれも構築時点で ctx が可視性判定を通過した行に限られる |
+| stale ノードのうち「不可視化」（構築後に別テナントへ再割当された行）の subcase | 索引が保持するリンクは構築時点（ctx がまだその行を可視として持っていた時点）の旧ベクトル近傍を符号化したものであり、再割当後の新ベクトル・新テナントの情報は索引に含まれない。ctx は既にその行を検索可能だった時点の情報を再利用するだけであり、再割当後のテナントへの横断経路は生じない。再構築判定（`needs_rebuild`／`REBUILD_DELTA_RATIO`、既定 1/10。`sql/hnsw_cache.rs`）は `prepare_full_visible` 経路でのみ評価され、`WHERE` 事前フィルタ付きクエリが通る `prepare_subset` は同じ base をそのまま使い続け再構築判定を行わない。そのため `Subset` 形状のクエリのみが継続する場合は比率超過後も再構築が発生せず、stale ノードの保持期間に上限はない。ただし stale ノードが保持する情報は上記のとおり 構築時点で ctx が可視だった旧ベクトルの近傍に限られ、保持期間の長さ自体が テナント境界の破れを生じさせるものではない |
+| 内容変更ノード | 同様に旧ベクトルの近傍リンクを読むだけで、旧ベクトルは ctx が構築時点で参照可能だったものに限られる |
+| `WHERE` 除外行（`Subset` 形状） | RLS 上は ctx にとって可視行であり、テナント境界の問題ではない（既存「ADR との整合」節の整理どおり） |
+| ベクトルアクセス（I1） | 非受理ノードの `NodeSource::score`・prefetch は ACORN-1 経路でも呼ばない。非受理ノードのスコアが停止判定・ヒープへ入らないため、PR #431 是正の趣旨は完全に維持される |
+| 存在情報の副次チャネル（処理量・応答時間） | ACORN-1 導入後に処理量が依存するのは ctx 自身の索引内の stale／`WHERE` 除外ノード数のみであり、他テナントの行数には依存しない。ADR が不採用とした事後フィルタ型（不可視行がグラフ上に存在し、探索がそれを辿る構造）とは前提が異なる |
+| 結果への混入防止 | 結果ヒープには受理ノードのみが積まれる。呼び出し元の写像・`(tenant_id, id)` キー照合・`kernel::dot` 再計算・`provider_result_is_valid`・`RlsSafetyNet` の多層防御（#409 以降の既存契約）は不変のまま維持される |
+| 既存ビット同一契約 | `accept == None`（`search`・構築経路）は ACORN 非適用時とビット同一のまま。ACORN 無効時（1-hop レジーム）も現行の探索と同一 |
+| ADR 本文との関係 | 「非可視ノードを探索経路として通過させる設計は不採用」の「非可視ノード」＝構築時点で ctx にとって不可視だった行であり、per-ctx 索引にはそもそも含まれない（他テナントの `Public` 許可行は `is_visible` を通過するため対象外）。ADR 本文は無変更のまま、本節がその解釈を記録する |
+
+### 成立可否の判断: 条件付き成立
+
+上表のいずれの論点でも、他テナント行への横断経路・存在情報の副次漏えい・
+I1（ベクトル非参照）の破壊は生じないことを確認できた。したがって
+**ACORN-1 導入は条件付き成立**と判断する。条件は次の 3 点である。
+
+1. I1（ベクトル非参照）を不変条件として維持すること（非受理ノードの
+   `NodeSource::score`・prefetch 呼び出しをしない）
+2. I2（リンク非参照）の緩和はゲート（後述の可視比率レジーム）下でのみ行い、
+   ゲート外（既定）では現行の 1-hop 契約を維持すること
+3. per-`(table, ctx)` 索引の前提（索引は ctx 可視アリーナのみから構築する
+   #409 の設計）を維持すること——グローバル索引・複数テナント共有索引への
+   変更は本整理の前提を崩すため対象外
+
+### ゲート条件の設計
+
+Issue #488 が確立した「1 つの判定式を複数箇所で共有し分岐の乖離を構造的に防ぐ」
+方針（`below_full_scan_ratio` を `search_with_overlay`・`Overlay::compute`・
+`prepare_subset` の 3 箇所が共有）を、**3 区分レジーム**へ拡張する設計と
+する。
+
+- 定義: `r = visible_in_index / index_len`（RLS 事前フィルタにより正確に
+  既知。サンプリング推定は不要——survey 行 169 の既存整理と同じ）
+- レジーム分類（設計案。`below_full_scan_ratio` を
+  `traversal_regime_for(visible_in_index, index_len, params) ->
+  {PlainScan, OneHop, TwoHop}` へ拡張し、`search_with_overlay`・
+  `Overlay::compute`・`prepare_subset` の 3 箇所が同一情報源を共有する）:
+  - `r < full_scan_ratio` → `PlainScan`（現行どおり不変）
+  - `full_scan_ratio ≤ r ≤ acorn_max_visible_ratio` → `TwoHop`（ACORN-1）
+  - `r > acorn_max_visible_ratio`（または ACORN 無効）→ `OneHop`（現行の
+    マスク付き探索）
+- 適用前提（既存条件をすべて維持）: `SearchEngineKind::Hnsw` opt-in・
+  `accept.is_some()`・`precision` モード除外・`k ≤ MAX_EF`・形状は
+  `FullVisible`／`Subset`（hybrid 密側 `HnswDenseProvider` は
+  `search_prepared` 経由で自動的に同じ分類に従う想定）
+- パラメータ設計: `ValidatedHnswParams::acorn_max_visible_ratio:
+  Option<Ratio>`。`None` は無効（`TwoHop` 区間が空）。
+  `with_acorn_max_visible_ratio` で `full_scan_ratio ≤ 値 ≤ 1/1`・分母 ≥ 1
+  を fail-closed に検査する（`with_full_scan_ratio` と同型の検査規約）。
+  `full_scan_ratio` 側を後から変更して逆転した場合も拒否する
+- **既定値: #501 の実装時点では無効（`None`）で出荷する**。理由は、ACORN
+  区間の現行挙動（`mask_splits_graph` → plain scan）は厳密解であり、
+  ACORN-1 はこれを近似解へ置き換える設計であるため、Recall／レイテンシの
+  トレードオフが #502 で未計測のまま既定 ON にすると hnsw opt-in
+  利用者の結果を黙って変えてしまう。候補既定値として qdrant
+  `max_selectivity`（上流ドキュメントで確認できた範囲の値のみ帰属。約
+  0.4＝`4/10`）を記録し、確定は #502 の実測後に行う
+- 分断検査の同期（最重要の設計制約）: `is_mask_fully_reachable`／
+  `accepted_reachable_count` は**探索と同じレジームで** BFS する必要が
+  ある。`TwoHop` レジームでは非受理ノードを中継点として 1 段だけ辿る BFS
+  へ拡張しないと、#487 と同じく全点が `mask_splits_graph` に落ちて
+  ACORN が一度も発火しない。起点共有（`search_entry_for_mask`。PR #435
+  で確立した契約）は維持する。`hnsw-hybrid-iterative-scan.md`「DISTANCE
+  経路の `masked_short` 到達不能性（証明）」は 2-hop レジーム下で成立が
+  変わりうるため、#501 での再検証が必要（下記「申し送り」参照）
+- コスト注記: `Subset` 形状では `Overlay::compute` ＋ BFS がクエリ毎に
+  発生し、`TwoHop` の BFS は 1-hop 非受理ノードの隣接も走査するため
+  `O((|受理| + |1-hop 非受理|)·M0) ≤ O(N·M0)` に収まる。#488 が示した
+  とおり `hnsw_subset` 退行の実体は overlay＋BFS オーバーヘッドである
+  ため、#502 は ANN 完走率だけでなく**総レイテンシ**を計測すべきことを
+  申し送る
+- 停止性・DoS: visited マークにより各ノードの隣接リスト読み取りは 1 クエリ
+  1 回以下に抑えられるため、総走査は `O(N·M0)`（マスクなし最悪ケースと
+  同オーダー）で構造的に有界とする。この構造的保証を主とし、診断統計
+  `acorn_searches`／`acorn_expansions`（`HnswCacheStats` へ追加する設計。
+  `EXPLAIN` へは非露出）で観測可能にする。追加の明示的な予算上限を設ける
+  場合は「予算超過時は当該クエリを plain scan へ fail-closed 縮退する」と
+  定義する
+- 決定性: 非受理ノードの隣接は格納順で走査し、受理された 2-hop ノードは
+  既存の `ScoredNode` 順序規約（スコア降順・id 昇順）で候補化する。同一
+  索引・同一クエリ・同一マスクで再現的な結果になる設計とする
+- `EXPLAIN`: `hnsw_params:` は構築時静的パラメータのみを露出する既存契約
+  （#411）のため、`acorn_max_visible_ratio` も静的値のみを露出する。実行時
+  のレジーム選択・可視カーディナリティは非露出のまま維持する
+- 実質的な適用範囲: warm な `FullVisible`（`r=1`）・再構築閾値内の
+  `FullVisible` は `OneHop` のまま変わらない。ACORN-1 が効くのは主に
+  `Subset` 形状（と大量削除直後の `FullVisible`）であることを明記する
+
+### #501（実装）・#502（実測）への申し送り
+
+- #501 で必要な設計契約: `search_layer_in` へのレジーム引数（`TwoHop` かつ
+  `accept.is_some()` のときのみ非受理ノードの `graph.neighbors` を読む）・
+  `greedy_descend_masked`（上位層探索）の扱い（上位層は 1-hop のまま
+  据え置くか 2-hop 適用可否を #501 で判断・記録する）・
+  `is_mask_fully_reachable` のレジーム対応・`Overlay::compute` へのパラ
+  メータ受け渡し・`ValidatedHnswParams` 拡張・`search_engine.rs`
+  `Display` 実装の追従・診断統計の追加
+- #501 のテスト契約: `search_masked_does_not_traverse_through_a_rejected_
+  bridge_node` はレジーム依存になる（`OneHop` では現行どおり、`TwoHop`
+  では 2-hop 先の受理ノードが結果に現れるが、橋渡し役の非受理ノード自体は
+  決してスコアされないことを固定する）。
+  `search_layer_prefetch_never_touches_rejected_nodes` は「非受理ノード
+  自身は先読みしない・非受理ノード経由で到達した受理 2-hop ノードの
+  先読みは可」へ拡張する。I1 の機械検証として、`NodeSource::score` 呼び出し
+  を記録するアダプタ（既存 trait を利用）で非受理ノードへの呼び出しが 0
+  件であることを固定する。既定エンジン対照 Recall@10 ≥ 0.9・可視外
+  テナント非混入・非 vacuous（`acorn_searches > 0`）を受け入れ条件とする。
+  新規 `unsafe` なし・依存追加なしを維持する
+- #502 への申し送り: 可視比率スイープはクラスタ寄りの可視集合（連続 id・
+  同一属性値）で `ann_masked`／`TwoHop` arm を実際に発火させる設計へ
+  改める（#487 の申し送りを継承）。`docs/design/benchmark-judgement-
+  policy.md` §3〜§4（交互 min-of-N・N≥5・参照区間 per-run 生データ・
+  ノイズ帯併記）に準拠する。`RECALL_ENGINE=hnsw` の 3 ゲート同一閾値の
+  確認を含める。既定値（`None` → `4/10` 候補）の確定は #502 の実測後に
+  行う
+- `hnsw-hybrid-iterative-scan.md`「DISTANCE 経路の `masked_short`
+  到達不能性（証明）」の 2-hop レジーム下での再検証は #501 の担当とし、
+  同 doc へ追記する
+- ADR `ann-index-adoption.md` 本文の改訂要否: 本節の解釈で足りると判断し、
+  ADR 本文の改訂は不要とする。オーナーが明文化を望む場合は別 Issue とする
+  （起票はユーザー承認事項のため本 Issue では行わない）
+
 ## スコープ外・申し送り
 
 - ~~不足時の `ef` 倍増再探索（iterative scan）・hybrid 密側の ANN 化と
@@ -772,3 +973,9 @@ rs`・`tests/sql_explain.rs`・`crates/wire-server/tests/wire_explain.rs`
 - spec 側: RLS 事前フィルタとの切替契約（非可視ノードの探索経路上の扱い・
   切替条件）の TASK／ビヘイビア ID 起票は引き続き ADR「spec 側への申し送り
   候補」のとおりオーナーへ報告
+- ACORN-1（不適合 1-hop ノードのリンクのみを 2-hop 中継点として参照する
+  方式）の実装（`search_layer_in`・`is_mask_fully_reachable` のレジーム
+  対応・`ValidatedHnswParams` 拡張・統計追加）: #500 で契約整理・ゲート
+  条件設計まで実施済み（「Issue #500」節参照）。実装は #501
+- ACORN-1 有効時の可視比率スイープ実測・既定値（`acorn_max_visible_ratio`）
+  の確定: #502

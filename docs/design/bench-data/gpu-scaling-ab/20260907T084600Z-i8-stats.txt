@@ -1,0 +1,9 @@
+== 20000-128-8/1-after ==
+gpu_scaling_i8: rows=20000 dim=128 batch=8 k=10 oversample=4 gpu_i8_p50=6227us gpu_i8_p95=9292us per_query_gpu_i8_p50=778us speedup_i8_vs_cpu_p95=0.56x speedup_i8_vs_f16_p95=0.15x i8_mismatch=0 i8_recall_at_k=1.0000
+gpu_scaling_i8_stats: rows=20000 dim=128 batch=8 k=10 oversample=4 calls=40 readback_bytes_total=25600000 readback_bytes_per_call=640000 rescored_candidates_total=12800 rescored_candidates_per_call=320 backend=Vulkan dot4_impl=Undetermined build_ms=20
+== 100000-128-64/1-after ==
+gpu_scaling_i8: rows=100000 dim=128 batch=64 k=10 oversample=4 gpu_i8_p50=294229us gpu_i8_p95=309910us per_query_gpu_i8_p50=4597us speedup_i8_vs_cpu_p95=0.31x speedup_i8_vs_f16_p95=0.06x i8_mismatch=0 i8_recall_at_k=1.0000
+gpu_scaling_i8_stats: rows=100000 dim=128 batch=64 k=10 oversample=4 calls=40 readback_bytes_total=1024000000 readback_bytes_per_call=25600000 rescored_candidates_total=102400 rescored_candidates_per_call=2560 backend=Vulkan dot4_impl=Undetermined build_ms=91
+== 100000-256-64/1-after ==
+gpu_scaling_i8: rows=100000 dim=256 batch=64 k=10 oversample=4 gpu_i8_p50=349059us gpu_i8_p95=361815us per_query_gpu_i8_p50=5454us speedup_i8_vs_cpu_p95=0.39x speedup_i8_vs_f16_p95=0.07x i8_mismatch=0 i8_recall_at_k=1.0000
+gpu_scaling_i8_stats: rows=100000 dim=256 batch=64 k=10 oversample=4 calls=40 readback_bytes_total=1024000000 readback_bytes_per_call=25600000 rescored_candidates_total=102400 rescored_candidates_per_call=2560 backend=Vulkan dot4_impl=Undetermined build_ms=175

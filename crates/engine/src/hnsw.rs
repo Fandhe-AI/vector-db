@@ -76,7 +76,7 @@
 //! `unwrap`／`expect`／`[]` を使わない。`unsafe` は使わない。環境変数・feature flag
 //! による経路上書きは設けない（CORE-12 踏襲）。
 
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
@@ -389,6 +389,7 @@ pub struct ValidatedHnswParams {
     params: HnswParams,
     full_scan_ratio: Ratio,
     resident_precision: ResidentPrecision,
+    sparse_visited_max: usize,
 }
 
 /// HNSW 索引ノードの常駐ベクトル表現（Issue #514・親 #513。ポインタ:
@@ -428,17 +429,45 @@ const DEFAULT_FULL_SCAN_RATIO: Ratio = Ratio {
     denominator: 10,
 };
 
+/// [`ValidatedHnswParams`] の `sparse_visited_max` 既定値（Issue #497）。
+/// `0` は「常にビットマップ visited のみを使う」（既存の全動作を不変に保つ）
+/// ことを意味する。閾値の既定値確定・可視比率別の費用対効果測定は後続
+/// Issue #498 の担当（`docs/design/hnsw-search.md`「visited 集合の 3 実装」
+/// 節の申し送り）。
+const DEFAULT_SPARSE_VISITED_MAX: usize = 0;
+
 impl ValidatedHnswParams {
     /// `params` を [`HnswParams::validate`] で検証し、通過した場合のみ構築する。
-    /// `full_scan_ratio` は既定値（[`DEFAULT_FULL_SCAN_RATIO`]）で初期化される。
-    /// 差し替えたい場合は [`Self::with_full_scan_ratio`] を使う。
+    /// `full_scan_ratio` は既定値（[`DEFAULT_FULL_SCAN_RATIO`]）、
+    /// `sparse_visited_max` は既定値（[`DEFAULT_SPARSE_VISITED_MAX`]）で
+    /// 初期化される。差し替えたい場合は [`Self::with_full_scan_ratio`]・
+    /// [`Self::with_sparse_visited_max`] を使う。
     pub fn new(params: HnswParams) -> Result<Self, HnswError> {
         params.validate()?;
         Ok(Self {
             params,
             full_scan_ratio: DEFAULT_FULL_SCAN_RATIO,
             resident_precision: ResidentPrecision::F32,
+            sparse_visited_max: DEFAULT_SPARSE_VISITED_MAX,
         })
+    }
+
+    /// visited 集合の切替閾値を返す（Issue #497。
+    /// [`HnswIndex::search_masked_with`] がマスク付き探索で `mask.count_ones()`
+    /// がこの値未満のとき [`VisitedSparse`] を選ぶ。`0`（既定）は常に
+    /// [`VisitedBitmap`] を使うことを意味する）。
+    pub fn sparse_visited_max(&self) -> usize {
+        self.sparse_visited_max
+    }
+
+    /// `sparse_visited_max` だけを差し替えたコピーを返す（Issue #497・opt-in。
+    /// 検証を要さないためシグネチャは [`Result`] を返さない
+    /// [`Self::with_resident_precision`] と同型）。既定値のまま（`0`）だと
+    /// 既存の全動作を不変に保つ（`docs/design/benchmark-judgement-policy.md`
+    /// の趣旨に沿い、未計測の性能変更を既定にしない）。
+    pub fn with_sparse_visited_max(mut self, max: usize) -> Self {
+        self.sparse_visited_max = max;
+        self
     }
 
     /// 索引ノードの常駐精度（[`ResidentPrecision`]）を返す（構築時に指定した
@@ -962,6 +991,74 @@ impl VisitedSet for VisitedBitmap {
     }
 }
 
+/// [`HnswIndex::search_masked_with`] が使う visited 集合の疎な実装（Issue #497。
+/// faiss の `VisitedTable` 方式——可視カーディナリティが小さいときは
+/// `unordered_set` へ切り替える——を参考にした 3 つめの [`VisitedSet`] 実装）。
+/// [`VisitedBitmap`] は毎クエリ `reset` で索引ノード数 N に比例する `N/64` 語の
+/// 全クリアを行うため、マスク付き探索で可視候補が索引に対して極小のケースでも
+/// N 全体分のコストがかかる。本実装は `HashSet<u32>::clear` （容量は保持し
+/// 確保コストを償却する）で `reset` を行い、実際に訪問したノード数にのみ比例
+/// させる。切替規則・到達可能性の実測条件は `docs/design/hnsw-search.md`
+/// 「visited 集合の 3 実装」節参照。
+#[derive(Debug, Default)]
+struct VisitedSparse {
+    set: HashSet<u32>,
+    len: usize,
+}
+
+impl VisitedSparse {
+    /// `len` ノード分を扱えるようにする。既訪問マークは全て消すが、
+    /// `HashSet` の内部確保容量は保持する（クエリをまたいだ確保コストの
+    /// 償却。[`VisitedBitmap::reset`] が語配列を伸長のみで縮めないのと
+    /// 同じ方針）。
+    fn reset(&mut self, len: usize) {
+        self.set.clear();
+        self.len = len;
+    }
+
+    /// `id` を訪問済みとして記録する。範囲外の `id` は `None`（呼び出し元は
+    /// untrusted 添字アクセスをせず `continue` する。coding-rust.md）。
+    fn mark_visited(&mut self, id: usize) -> Option<bool> {
+        if id >= self.len {
+            return None;
+        }
+        let Ok(id_u32) = u32::try_from(id) else {
+            return None;
+        };
+        Some(!self.set.insert(id_u32))
+    }
+}
+
+impl VisitedSet for VisitedSparse {
+    fn reset(&mut self, len: usize) {
+        VisitedSparse::reset(self, len);
+    }
+
+    fn mark_visited(&mut self, id: usize) -> Option<bool> {
+        VisitedSparse::mark_visited(self, id)
+    }
+
+    /// `HashSet` はスロットを事前 load できないため no-op（[`VisitedBitmap`]・
+    /// [`VisitedScratch`] と異なりハッシュテーブルのバケット位置は
+    /// `mark_visited` 自体を呼ばないと分からない）。非受理ノードへ先読みしない
+    /// という P0 契約は `search_layer_in` 側の受理判定が担い、本実装には
+    /// 影響しない。
+    fn prefetch_slot(&self, _id: usize) {}
+}
+
+/// [`HnswIndex::search_masked_with`] がどちらの visited 実装を選んだかを表す
+/// （Issue #497。診断・統計専用——`sql::hnsw_cache::HnswIndexCacheStats::
+/// sparse_visited_searches` の計上に使う。テナント境界・可視カーディナリティ
+/// 等の実行時縮退情報は含まない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VisitedKind {
+    /// [`VisitedBitmap`]（既定）。
+    Dense,
+    /// [`VisitedSparse`]（`ValidatedHnswParams::sparse_visited_max` の閾値未満の
+    /// 可視候補数でのみ選ばれる）。
+    Sparse,
+}
+
 /// [`HnswIndex::search_masked`]（Issue #409。Issue #431 是正で意味を拡張）が
 /// 受け取る候補マスク。索引ノード（`build` 時に割り当てたノード番号）のうち、
 /// 探索経路（貪欲降下・ビーム探索の候補集合展開）へ使ってよいもの＝結果集合へ
@@ -977,6 +1074,14 @@ impl VisitedSet for VisitedBitmap {
 pub struct NodeMask {
     words: Vec<u64>,
     len: usize,
+    /// 設定済みビット数（Issue #497）。`set` の増分でのみ更新する O(1)
+    /// カウンタ。`set` 以外に `words` を書き換える経路が無いことを前提に
+    /// 同期を保つ（`NodeMask` に unset API は存在しない）。旧実装は
+    /// `count_ones()` 呼び出しのたびに `words` を全語走査しており、これは
+    /// 避けたいビットマップ visited の `reset` と同じ O(N/64) オーダーで、
+    /// 「可視候補数で visited 実装を切り替える」判定にそのまま使うと自己
+    /// 矛盾になる（`docs/design/hnsw-search.md`「visited 集合の切替」節）。
+    ones: usize,
 }
 
 impl NodeMask {
@@ -985,11 +1090,13 @@ impl NodeMask {
         Self {
             words: vec![0u64; len.div_ceil(64)],
             len,
+            ones: 0,
         }
     }
 
     /// `node` を受理対象に加える。範囲外は無視する（呼び出し元が索引の
     /// `len()` 以内の値のみを渡す契約。fail-closed に「何も起きない」側へ倒す）。
+    /// 既に設定済みのビットを二重に `set` しても `ones` は増えない。
     pub fn set(&mut self, node: u32) {
         let idx = node as usize;
         if idx >= self.len {
@@ -998,7 +1105,11 @@ impl NodeMask {
         let word_idx = idx / 64;
         let bit_idx = idx % 64;
         if let Some(word) = self.words.get_mut(word_idx) {
-            *word |= 1u64 << bit_idx;
+            let bit = 1u64 << bit_idx;
+            if (*word & bit) == 0 {
+                self.ones += 1;
+            }
+            *word |= bit;
         }
     }
 
@@ -1028,9 +1139,10 @@ impl NodeMask {
         self.len == 0
     }
 
-    /// 受理対象に設定されているノード数。
+    /// 受理対象に設定されているノード数（O(1)。`self.ones` を返すだけ。
+    /// Issue #497: `set` の増分でのみ維持されるため語走査は行わない）。
     pub fn count_ones(&self) -> usize {
-        self.words.iter().map(|w| w.count_ones() as usize).sum()
+        self.ones
     }
 }
 
@@ -1039,9 +1151,27 @@ impl NodeMask {
 /// 使い回す想定（モジュール冒頭「ベクトルの所有方針」節と同じ、確保コストを
 /// 呼び出し元へ償却させる方針）。`Default` から始めれば初回呼び出しで索引
 /// 規模に応じて自動的に伸長する。
+///
+/// Issue #497 で `sparse`（[`VisitedSparse`]。マスク付き探索の可視候補数が
+/// 静的閾値未満のときに選ばれる）・`last_visited_kind`（直近の
+/// [`HnswIndex::search_masked_with`] 呼び出しがどちらの visited 実装を
+/// 使ったかの診断用記録）を追加した。両フィールドとも private（`pub(crate)`
+/// アクセサ [`Self::last_visited_kind`] 経由でのみ読める）。
 #[derive(Debug, Default)]
 pub struct HnswSearchScratch {
     visited: VisitedBitmap,
+    sparse: VisitedSparse,
+    last_visited_kind: Option<VisitedKind>,
+}
+
+impl HnswSearchScratch {
+    /// 直近の [`HnswIndex::search_masked_with`] 呼び出しが選んだ visited
+    /// 実装（Issue #497）。呼び出しが早期 `return`（`k == 0`・空索引・
+    /// 受理ノードなし等）で層 0 探索まで到達しなかった場合は `None`。
+    /// `sql::hnsw_cache` の診断用統計（`sparse_visited_searches`）が使う。
+    pub(crate) fn last_visited_kind(&self) -> Option<VisitedKind> {
+        self.last_visited_kind
+    }
 }
 
 /// 層 `level` におけるノードの隣接リスト最大次数を返す（層 0 は `2*m`、
@@ -2691,6 +2821,44 @@ impl HnswIndex {
         mask: Option<&NodeMask>,
         scratch: &mut HnswSearchScratch,
     ) -> Result<Vec<crate::kernel::CandidateHit>, HnswError> {
+        self.search_masked_with(query, k, ef, mask, DEFAULT_SPARSE_VISITED_MAX, scratch)
+    }
+
+    /// [`Self::search_masked`] の visited 集合切替版（Issue #497）。マスク付き
+    /// 探索（`mask == Some(_)`）の可視候補数（`mask.count_ones()`。Issue #497で
+    /// O(1) 化済み）が `sparse_visited_max` 未満のとき、層 0 のビーム探索で
+    /// [`VisitedBitmap`] の代わりに [`VisitedSparse`]（`HashSet<u32>`）を使う。
+    /// `mask == None` のときは `sparse_visited_max` の値に関わらず常に
+    /// [`VisitedBitmap`] を使う（[`Self::search`] とのビット同一契約を無条件に
+    /// 維持する。`search_masked_none_matches_search` が固定）。
+    ///
+    /// [`Self::search_masked`] は `sparse_visited_max` に既定値
+    /// （[`DEFAULT_SPARSE_VISITED_MAX`] = 0。常に dense）を渡して本関数へ委譲する
+    /// 薄いラッパー。呼び出し元（`sql::hnsw_cache::search_with_overlay`）は
+    /// `ValidatedHnswParams::sparse_visited_max`（構築時 opt-in）をそのまま渡す。
+    ///
+    /// 選ばれた visited 実装は `scratch.last_visited_kind()`
+    /// （[`VisitedKind`]。診断用）で観測できる。層 0 探索まで到達しない早期
+    /// `return` 経路（`k == 0`・空索引・受理ノードなし等）では `None` のまま
+    /// 残す。
+    ///
+    /// # エラー
+    ///
+    /// 検証順序・戻り値の契約は [`Self::search_masked`] と同一（本関数へ委譲
+    /// するだけで検証ロジック自体は変更していない）。
+    pub fn search_masked_with(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        mask: Option<&NodeMask>,
+        sparse_visited_max: usize,
+        scratch: &mut HnswSearchScratch,
+    ) -> Result<Vec<crate::kernel::CandidateHit>, HnswError> {
+        // 早期 return 経路で前回呼び出しの記録を持ち越さない（Issue #497）。
+        // 層 0 探索へ到達した場合のみ、その直前で `Some(kind)` を上書きする。
+        scratch.last_visited_kind = None;
+
         let dim_usize = self.dim as usize;
         if query.len() != dim_usize {
             return Err(HnswError::QueryDimMismatch {
@@ -2803,16 +2971,42 @@ impl HnswIndex {
         } else {
             vec![nearest]
         };
-        let results = self.search_layer(
-            level0_entry_points,
-            query,
-            ef_eff,
-            0,
-            dim_usize,
-            &self.vectors,
-            &mut scratch.visited,
-            mask,
-        )?;
+
+        // visited 集合の切替（Issue #497）: `mask` が `Some` かつ可視候補数
+        // （`count_ones()`。O(1)）が `sparse_visited_max` 未満のときのみ
+        // `VisitedSparse` を選ぶ。`mask == None` は常に dense
+        // （§本関数ドキュメンテーションコメント参照。`search` とのビット
+        // 同一契約を無条件に維持する）。
+        let use_sparse =
+            matches!(mask.map(|m| m.count_ones()), Some(ones) if ones < sparse_visited_max);
+        scratch.last_visited_kind = Some(if use_sparse {
+            VisitedKind::Sparse
+        } else {
+            VisitedKind::Dense
+        });
+        let results = if use_sparse {
+            self.search_layer(
+                level0_entry_points,
+                query,
+                ef_eff,
+                0,
+                dim_usize,
+                &self.vectors,
+                &mut scratch.sparse,
+                mask,
+            )?
+        } else {
+            self.search_layer(
+                level0_entry_points,
+                query,
+                ef_eff,
+                0,
+                dim_usize,
+                &self.vectors,
+                &mut scratch.visited,
+                mask,
+            )?
+        };
 
         let out: Vec<crate::kernel::CandidateHit> = results
             .into_iter()
@@ -3891,6 +4085,73 @@ mod tests {
         assert_eq!(bm.mark_visited(999), None);
     }
 
+    /// [`VisitedSparse`]（Issue #497）が [`VisitedBitmap`] と同じ契約
+    /// （範囲外は `None`・二重マークは `Some(true)`・新規は `Some(false)`・
+    /// `reset` 後は容量を保持したまま全訪問済みマークが消える）を満たすことを
+    /// 固定する。
+    #[test]
+    fn visited_sparse_matches_visited_bitmap_contract() {
+        let mut vs = VisitedSparse::default();
+        vs.reset(10);
+        assert_eq!(vs.mark_visited(3), Some(false));
+        assert_eq!(vs.mark_visited(3), Some(true));
+        // 範囲外は None（VisitedBitmap と同じ fail-closed 契約）。
+        assert_eq!(vs.mark_visited(999), None);
+
+        // reset は全クリア: 別の len へ伸長したあとに縮めても、以前の
+        // マークが誤って「既訪問」判定を汚染してはならない。
+        vs.reset(200);
+        assert_eq!(vs.mark_visited(150), Some(false));
+        vs.reset(5);
+        assert_eq!(
+            vs.mark_visited(150),
+            None,
+            "reset(5) 後は 150 が範囲外になるため None（VisitedBitmap は語配列を \
+             伸長のみで縮めないため既訪問扱いになるのに対し、HashSet は clear \
+             するため『範囲外』の判定が先に効く——いずれも fail-closed で\
+             「訪問済みと誤判定して探索を打ち切らない」側に倒れる点は同じ）"
+        );
+        // clear 後も内部確保容量は保持する契約（`HashSet::clear` の挙動）。
+        // 観測可能な副作用は無いため、reset 後に通常どおり動作することのみ
+        // 固定する。
+        vs.reset(10);
+        assert_eq!(vs.mark_visited(3), Some(false));
+    }
+
+    /// [`NodeMask::count_ones`]（Issue #497 で O(1) 化）が語走査での再計算と
+    /// 一致すること・同一ビットの二重 `set` で増えないこと・範囲外 `set` は
+    /// 無視されることを固定する。
+    #[test]
+    fn node_mask_count_ones_matches_word_scan_and_is_idempotent() {
+        let mut mask = NodeMask::new(130);
+        assert_eq!(mask.count_ones(), 0);
+
+        mask.set(0);
+        mask.set(63);
+        mask.set(64);
+        mask.set(129);
+        assert_eq!(mask.count_ones(), 4);
+
+        // 同一ビットの二重 set は増えない。
+        mask.set(0);
+        mask.set(129);
+        assert_eq!(mask.count_ones(), 4);
+
+        // 範囲外 set は無視される（fail-closed）。
+        mask.set(130);
+        mask.set(u32::MAX);
+        assert_eq!(mask.count_ones(), 4);
+
+        // 語走査での再計算と一致する（回帰保険。`count_ones` の実装が
+        // `self.ones` を返さず語走査に戻っても検知できるよう、期待値は
+        // ビット位置から独立に導出する）。
+        let expected: usize = [0u32, 63, 64, 129]
+            .iter()
+            .filter(|&&node| mask.get(node))
+            .count();
+        assert_eq!(mask.count_ones(), expected);
+    }
+
     /// 手作りの最小グラフ（`search_layer_continues_through_tied_score_candidates_
     /// to_find_a_strictly_closer_node` と同じ 3 ノード構成）で、上位層の貪欲降下
     /// →層 0 のビーム探索という `search` の経路が正しく動作することを確認する。
@@ -4163,6 +4424,162 @@ mod tests {
             .search_masked(&query, 10, 40, None, &mut scratch_b)
             .unwrap();
         assert_eq!(via_search, via_masked);
+
+        // Issue #497: `mask == None` は `sparse_visited_max` の値に関わらず
+        // 常に dense（`VisitedBitmap`）を使う。`usize::MAX`（マスクさえあれば
+        // 必ず sparse を選ぶ極端値）を渡しても `search` とのビット同一契約は
+        // 変わらないことを固定する。
+        let mut scratch_c = HnswSearchScratch::default();
+        let via_masked_force_sparse_threshold = index
+            .search_masked_with(&query, 10, 40, None, usize::MAX, &mut scratch_c)
+            .unwrap();
+        assert_eq!(via_search, via_masked_force_sparse_threshold);
+        assert_eq!(
+            scratch_c.last_visited_kind(),
+            Some(VisitedKind::Dense),
+            "mask == None must always select the dense visited implementation"
+        );
+    }
+
+    /// [`HnswIndex::search_masked_with`] が visited 実装（`VisitedBitmap`／
+    /// `VisitedSparse`）のどちらを選んでも結果がビット同一であることを、
+    /// マスクの形状が異なる複数フィクスチャで機械検証する（Issue #497 の
+    /// 受け入れ条件 1）。`sparse_visited_max = usize::MAX`（マスクがあれば
+    /// 必ず sparse）と `0`（常に dense。[`DEFAULT_SPARSE_VISITED_MAX`]）を
+    /// 同一マスク・同一クエリへ渡し、結果集合・順序（`dot` 降順・同点 id
+    /// 昇順）が完全一致することを固定する。
+    #[test]
+    fn search_masked_with_force_sparse_matches_force_dense_bit_identical() {
+        let dim = 8usize;
+
+        // フィクスチャ 1: 通常コーパス・偶数ノードのみ受理（密度 50%）。
+        let normal_vectors = gen_corpus(61, dim, 200);
+        let normal_index = HnswIndex::build(
+            HnswParams {
+                m: 8,
+                ef_construction: 40,
+                ef_search: 20,
+            },
+            dim as u32,
+            &normal_vectors,
+            200,
+        )
+        .unwrap();
+        let mut normal_mask = NodeMask::new(normal_index.len());
+        for node in 0..normal_index.len() {
+            if node % 2 == 0 {
+                normal_mask.set(node as u32);
+            }
+        }
+
+        // フィクスチャ 2: 重複ヘビーコーパス（同点誘発。
+        // `search_layer_prefetch_is_bit_identical_to_no_prefetch` と同型）・
+        // 3 分の 1 のノードのみ受理。
+        let mut duplicate_heavy = gen_corpus(63, dim, 20);
+        duplicate_heavy = duplicate_heavy
+            .iter()
+            .cycle()
+            .take(200 * dim)
+            .copied()
+            .collect();
+        let duplicate_index = HnswIndex::build(
+            HnswParams {
+                m: 8,
+                ef_construction: 40,
+                ef_search: 20,
+            },
+            dim as u32,
+            &duplicate_heavy,
+            200,
+        )
+        .unwrap();
+        let mut duplicate_mask = NodeMask::new(duplicate_index.len());
+        for node in 0..duplicate_index.len() {
+            if node % 3 == 0 {
+                duplicate_mask.set(node as u32);
+            }
+        }
+
+        // フィクスチャ 3: 単一ノードのみ受理（可視候補数 1。sparse 経路の
+        // 最小ケース）。
+        let single_vectors = gen_corpus(65, dim, 150);
+        let single_index = HnswIndex::build(
+            HnswParams {
+                m: 8,
+                ef_construction: 40,
+                ef_search: 20,
+            },
+            dim as u32,
+            &single_vectors,
+            150,
+        )
+        .unwrap();
+        let mut single_mask = NodeMask::new(single_index.len());
+        single_mask.set(0);
+
+        // フィクスチャ 4: 固定 entry point を非受理にした代替起点経路
+        // （`search_masked_falls_back_to_alternate_entry_when_fixed_entry_masked_out`
+        // と同型）。
+        let entry_vectors = gen_corpus(67, dim, 300);
+        let entry_index = HnswIndex::build(
+            HnswParams {
+                m: 8,
+                ef_construction: 40,
+                ef_search: 20,
+            },
+            dim as u32,
+            &entry_vectors,
+            300,
+        )
+        .unwrap();
+        let entry = entry_index
+            .entry_point()
+            .expect("non-empty index has an entry point");
+        let mut entry_mask = NodeMask::new(entry_index.len());
+        for node in 0..entry_index.len() as u32 {
+            if node != entry {
+                entry_mask.set(node);
+            }
+        }
+
+        let cases: [(&str, &HnswIndex, &NodeMask, u64); 4] = [
+            ("normal", &normal_index, &normal_mask, 1234),
+            ("duplicate_heavy", &duplicate_index, &duplicate_mask, 5678),
+            ("single_visible", &single_index, &single_mask, 91),
+            ("entry_excluded", &entry_index, &entry_mask, 4321),
+        ];
+
+        for (name, index, mask, query_seed) in cases {
+            let query = gen_corpus(query_seed, dim, 1);
+            let mut scratch_sparse = HnswSearchScratch::default();
+            let mut scratch_dense = HnswSearchScratch::default();
+            let via_sparse = index
+                .search_masked_with(&query, 10, 40, Some(mask), usize::MAX, &mut scratch_sparse)
+                .unwrap();
+            let via_dense = index
+                .search_masked_with(&query, 10, 40, Some(mask), 0, &mut scratch_dense)
+                .unwrap();
+            assert_eq!(
+                via_sparse, via_dense,
+                "fixture={name}: sparse and dense visited implementations must return \
+                 bit-identical results"
+            );
+            // 可視候補が 1 件以上あるフィクスチャでは実際に sparse 側が選ばれた
+            // ことも確認する（閾値判定そのものの回帰も兼ねる）。
+            if mask.count_ones() > 0 {
+                assert_eq!(
+                    scratch_sparse.last_visited_kind(),
+                    Some(VisitedKind::Sparse),
+                    "fixture={name}: sparse_visited_max=usize::MAX with a non-empty mask \
+                     must select VisitedSparse"
+                );
+            }
+            assert_eq!(
+                scratch_dense.last_visited_kind(),
+                Some(VisitedKind::Dense),
+                "fixture={name}: sparse_visited_max=0 must always select VisitedBitmap"
+            );
+        }
     }
 
     #[test]
