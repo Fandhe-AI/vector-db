@@ -415,3 +415,108 @@ fn table_without_vector_column_uses_plain_scan_and_is_unaffected() {
         "a table without a VECTOR column must never use the scalar index aggregate path"
     );
 }
+
+// --- codex-review P1（PR #603）: `WHERE` なしの `GROUP BY` 列挙形は
+// TEXT MIN/MAX を含む場合に使わない ---------------------------------------
+//
+// PR #603 で追加された `is_text_accumulator_budget_error` による捕捉・
+// フォールバック（`crates/engine/tests/sql_group_by.rs::
+// text_min_max_index_path_key_order_transient_overflow_falls_back_to_plain_scan`）
+// は「索引経路の処理順序でのみ超過を検出したケース」を救うが、その逆方向
+// （全走査〔物理行順〕なら容量超過で `54000` になるはずが、索引経路の
+// グループ単位の縮小により超過を一度も観測せず誤って成功してしまうケース）
+// までは救えない。列挙形は値ごとにグループをまとめて処理するため、この
+// テストの構成（各グループが「大きい値の行」と「小さい値の行」の 2 行から
+// 成る）では、あるグループの処理が完了するたびに `MIN`/`MAX` の一時的な
+// 累計バイト数が縮小され、全走査の物理行順ピーク（先頭グループの大きい値が
+// 積み上がって超過する）を索引経路の処理順序では決して再現できない。
+// 索引が使えるかどうかで `54000` の成否が変わってはならないため
+// （AGENTS.md「公開 API・エラー契約の互換性」）、TEXT MIN/MAX を含む
+// `WHERE` なしの `GROUP BY` は列挙形を最初から使わない
+// （`sql::group_by::has_text_min_max_aggregate`）。
+
+/// 6 グループ、各グループが 3 MiB の値を持つ行（`id`=0..5）と 1 バイトの値を
+/// 持つ行（`id`=6..11）から成る具体例を固定する。全走査（物理行順）は先頭
+/// 6 行の時点で 18 MiB となり容量超過（`54000`）になるが、列挙形はグループ
+/// 単位で直ちに縮小するため超過を検出できない。索引が使えるかどうかで
+/// 成否が変わらないことを検証する。
+#[test]
+fn text_min_max_group_by_capacity_judgement_matches_full_scan() {
+    let path = unique_db_path("scalar-index-aggregate-text-minmax-capacity");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let capacity_schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("k", ColumnType::Text, true),
+            ColumnDef::new("v", ColumnType::Text, true),
+        ],
+    );
+    storage
+        .create_table(&capacity_schema)
+        .expect("create table");
+
+    let tenant_ctx = ctx("tenant-a");
+    const GROUPS: u64 = 6;
+    let large_value = "z".repeat(3 * 1024 * 1024);
+    for group in 0..GROUPS {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &tenant_ctx,
+            group,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![group as f32, 0.0]),
+                Value::Text(group.to_string()),
+                Value::Text(large_value.clone()),
+            ],
+            &op_id(&format!("seed-large-{group}")),
+        )
+        .expect("insert large row");
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &tenant_ctx,
+            group + GROUPS,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![(group + GROUPS) as f32, 0.0]),
+                Value::Text(group.to_string()),
+                Value::Text("a".to_string()),
+            ],
+            &op_id(&format!("seed-small-{group}")),
+        )
+        .expect("insert small row");
+    }
+    let core = new_core(storage);
+
+    let plain_before = core
+        .scalar_index_cache_stats()
+        .aggregate_plain_scan_fallbacks;
+    let index_before = core.scalar_index_cache_stats().aggregate_index_scans;
+
+    let sql = "SELECT k, MIN(v) AS mn FROM docs GROUP BY k";
+    let cold_err = core
+        .execute_sql(&ctx("tenant-a"), sql)
+        .expect_err("capacity judgement must fail regardless of index availability (cold)");
+    assert_eq!(cold_err.wire_code(), "54000");
+    let hot_err = core
+        .execute_sql(&ctx("tenant-a"), sql)
+        .expect_err("capacity judgement must fail regardless of index availability (hot)");
+    assert_eq!(hot_err.wire_code(), "54000");
+
+    let plain_after = core
+        .scalar_index_cache_stats()
+        .aggregate_plain_scan_fallbacks;
+    let index_after = core.scalar_index_cache_stats().aggregate_index_scans;
+    assert_eq!(
+        index_before, index_after,
+        "a TEXT MIN/MAX GROUP BY must never consume the enumeration index path"
+    );
+    assert!(
+        plain_after > plain_before,
+        "a TEXT MIN/MAX GROUP BY must always fall back to the full scan"
+    );
+}

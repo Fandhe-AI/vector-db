@@ -709,6 +709,22 @@ fn order_with_nulls_last(
     }
 }
 
+/// codex-review P1 指摘（PR #603）: `bound.items` に `MIN`/`MAX(<TEXT 列>)`
+/// 集計が 1 つでも含まれるかを判定する。列挙形（[`observe_group_enumeration`]）
+/// はこの判定が真の場合、[`execute_grouped_aggregate`] から呼ばれない
+/// （下記「列挙形を使わない理由」参照）。
+fn has_text_min_max_aggregate(items: &[crate::sql::parser::BoundAggregateItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item.func,
+            crate::sql::allowlist::AggregateFunc::Min | crate::sql::allowlist::AggregateFunc::Max
+        ) && matches!(
+            item.input,
+            crate::sql::parser::AggregateInput::TextColumn(_)
+        )
+    })
+}
+
 /// [`BoundAggregate`]（`group_by` が `Some` であることを前提。呼び出し元
 /// [`crate::sql::aggregate::execute_aggregate`] が判定済み）を実行し、複数行の
 /// [`QueryResult`] を返す（TASK-167・SQL-14）。RLS 適用順序・行走査は
@@ -798,18 +814,46 @@ pub(crate) fn execute_grouped_aggregate(
             ) {
                 Some((snapshot, index)) => {
                     if where_less {
-                        used_index_path = observe_group_enumeration(
-                            &snapshot,
-                            &index,
-                            schema,
-                            bound,
-                            &referenced,
-                            group_by,
-                            &mut string_groups,
-                            &mut null_group,
-                            &mut total_key_bytes,
-                            &mut total_text_accumulator_bytes,
-                        )?;
+                        // codex-review P1 指摘（PR #603）「列挙形を使わない
+                        // 理由」: 列挙形はグループ（値）ごとに全スロットを
+                        // まとめて処理するため、あるグループの処理が完了する
+                        // たびに `MIN`/`MAX(<TEXT 列>)` の一時的な累計バイト数
+                        // が縮小されうる。そのため「あるグループの大きい値が
+                        // 他グループの大きい値と時間的に重なって積み上がる」
+                        // 全走査の物理行順ピークを、列挙形の処理順序では
+                        // 決して再現できない場合がある（例: 6 グループ、各
+                        // グループが大きい値の行と小さい値の行から成るとき、
+                        // 全走査は最初の数グループの大きい値が積み上がった
+                        // 時点で予算超過するが、列挙形はグループ単位で直ちに
+                        // 縮小するため超過を一度も観測しない）。
+                        // `observe_group_enumeration` 内の
+                        // `is_text_accumulator_budget_error` による捕捉・
+                        // フォールバック（PR #603 で追加）は「索引経路の処理
+                        // 順序でのみ超過を検出したケース」しか救えず、この
+                        // 「全走査なら超過するが索引経路では超過を検出でき
+                        // ないケース」は救えない。索引が使えるかどうかで
+                        // `54000` の成否が変わるのは公開 API・エラー契約の
+                        // 互換性に反するため（AGENTS.md）、TEXT `MIN`/`MAX`
+                        // を含む場合は列挙形を最初から使わず全走査（物理行順）
+                        // へ委ねる。候補走査形（`observe_candidate_slots_grouped`）
+                        // は `resolve_candidates` がスロット昇順（＝物理行順）
+                        // を維持し全走査と同一順序で処理するため対象外。
+                        used_index_path = if has_text_min_max_aggregate(&bound.items) {
+                            false
+                        } else {
+                            observe_group_enumeration(
+                                &snapshot,
+                                &index,
+                                schema,
+                                bound,
+                                &referenced,
+                                group_by,
+                                &mut string_groups,
+                                &mut null_group,
+                                &mut total_key_bytes,
+                                &mut total_text_accumulator_bytes,
+                            )?
+                        };
                     } else {
                         let id_preds: Vec<crate::sql::scalar_plan::IdPredicate> = bound
                             .expr_filters
