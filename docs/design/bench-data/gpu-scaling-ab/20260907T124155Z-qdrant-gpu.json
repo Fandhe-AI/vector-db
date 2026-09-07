@@ -1,0 +1,79 @@
+{
+  "meta": {
+    "generated_at_unix": 1788786847.5402322,
+    "label": "unknown",
+    "host_port_http": 17333,
+    "host_port_grpc": 17334,
+    "seed": 20260905,
+    "n_queries": 200,
+    "qdrant_server_version": "1.19.1",
+    "qdrant_cpu_image": {
+      "image": "qdrant/qdrant:v1.19.1",
+      "version": "v1.19.1",
+      "digest": "qdrant/qdrant@sha256:12364fe851b9f17356fc88189fc06d1b521262e04659ec7345975b00c9246a10"
+    },
+    "qdrant_gpu_image": {
+      "image": "qdrant/qdrant:v1.19.1-gpu-nvidia",
+      "version": "v1.19.1",
+      "digest": "qdrant/qdrant@sha256:0da55d0f94686b3d07eb7c2c869e6c9d2f50565d1b0a0a1fd7a9767af0de38ff"
+    }
+  },
+  "results": [
+    {
+      "rows": 100000,
+      "dim": 128,
+      "upsert": {
+        "rows": 100000,
+        "seconds": 1.6749500000150874,
+        "rows_per_sec": 59703.27472408086
+      },
+      "index_build": {
+        "seconds": 5.03576358302962,
+        "final_status": "green",
+        "indexed_vectors_count": 100000
+      },
+      "search": {
+        "n": 200,
+        "p50_us": 1274.8220469802618,
+        "p95_us": 1761.1070070415735,
+        "mean_us": 1353.3064885996282
+      },
+      "gpu_log_signal": {
+        "container": "bench-qdrant-gpu",
+        "checked": true,
+        "gpu_used": true,
+        "found_gpu_device_line": true,
+        "create_gpu_device_line": true,
+        "create_gpu_device_failed_line": false
+      }
+    },
+    {
+      "rows": 500000,
+      "dim": 128,
+      "upsert": {
+        "rows": 500000,
+        "seconds": 8.648803861928172,
+        "rows_per_sec": 57811.4624845394
+      },
+      "index_build": {
+        "seconds": 27.592664479045197,
+        "final_status": "green",
+        "indexed_vectors_count": 500000
+      },
+      "search": {
+        "n": 200,
+        "p50_us": 944.6919430047274,
+        "p95_us": 1121.3719844818115,
+        "mean_us": 958.2765202503651
+      },
+      "gpu_log_signal": {
+        "container": "bench-qdrant-gpu",
+        "checked": true,
+        "gpu_used": true,
+        "found_gpu_device_line": true,
+        "create_gpu_device_line": true,
+        "create_gpu_device_failed_line": false
+      }
+    }
+  ]
+}

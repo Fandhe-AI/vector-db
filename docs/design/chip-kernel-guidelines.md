@@ -262,7 +262,7 @@ Issue #365 で行内マルチアキュムレータ化は不採用済み（cache 
 | 2 | GPU 側 Top-k | 行数分の f32 全量 readback（最大 32 MiB）を k×workgroup 数へ。`SUBGROUP` で縮約。実機確認・設計は [`gpu-batch-topk.md`](gpu-batch-topk.md)（#535） | #534 |
 | 3 | `SHADER_F16` ネイティブ f16 FMA | 現状は unpack して f32 演算。[`docs/design/core16-f16-resident-gate.md`](core16-f16-resident-gate.md) の環境依存があるため A/B 必須 | #538 |
 | 4 | i8 量子化＋`dot4I8Packed` | dim=128 が 32 words。`NATIVE_PACKED_INTEGER_DOT_PRODUCT` の有無は実機確認が要る | #541 |
-| 5 | Apple UMA ゼロコピー | [`docs/design/redb-insert-reserve-zero-copy.md`](redb-insert-reserve-zero-copy.md)（Issue #400）の先例に倣い静的確認を先に | #544 |
+| 5 | Apple UMA ゼロコピー | [`docs/design/redb-insert-reserve-zero-copy.md`](redb-insert-reserve-zero-copy.md)（Issue #400）の先例に倣い静的確認済み（wgpu 30.0.1 は staging 経由で真のゼロコピーは不成立。詳細は [`gpu-batch-phase5-before-after.md`](gpu-batch-phase5-before-after.md) §6） | #544（静的確認済み・実装見送り） |
 
 ## 5. 既 Rejected との関係
 

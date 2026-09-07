@@ -586,6 +586,42 @@ fn three_clients_run_hint_order() {
     );
 }
 
+/// Issue #454: 広域取得（`ORDER BY`／`USING PLAN` を伴わない `SELECT ... LIMIT n`）
+/// が 3 クライアントいずれからも実行でき、同一スナップショット内の物理走査順
+/// （`seed_plain_docs` は単一テナントのため id 昇順。本モジュールドキュメント・
+/// `docs/design/wide-retrieval-scan.md` の「順序保証なし」契約は複数テナントが
+/// 交錯する場合の話で、単一テナント内は id 昇順が成り立つ）で一致することを
+/// 確認する。取得モード非依存の拒否経路（`USING MODE`・`HINT ORDER`・`EXPLAIN`
+/// 前置）は層 A（`tests/wire_scan.rs`）が担う。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_run_scan_where_nosort() {
+    let (db_path, _db_guard) = seed_plain_docs();
+    let users_dir = temp_db::TempDir::new("extended-syntax-e2e-scan-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+
+    let server = spawn_wire_server(&users_path, &db_path, &[]);
+    let port = server.port;
+
+    let expected = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+    assert_all_clients_match(
+        port,
+        "bare LIMIT scan",
+        "SELECT id FROM docs LIMIT 10",
+        &expected,
+    );
+    // `LIMIT` が可視総数を超えても、可視かつ WHERE を満たす行だけを返す
+    // （早期終了しない側の契約。層 A `scan_limit_larger_than_visible_set_returns_all_visible_rows`
+    // と同じ確認を 3 クライアント越しに行う）。
+    assert_all_clients_match(
+        port,
+        "bare LIMIT scan above visible total",
+        "SELECT id FROM docs LIMIT 10000",
+        &expected,
+    );
+}
+
 /// SQL-9: 同一接続セッション内で `CREATE FUNCTION` → 結果列位置からの UDF
 /// 呼び出しが 3 クライアントいずれからも成功する。
 #[test]

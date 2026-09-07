@@ -453,8 +453,11 @@ array<f32>` を丸ごと読み戻す構造から一意に定まる。裏付け:
   根拠に見送り済み（「#537 後判断」節参照）。
 - 候補 C（radix select）は k が Top-k 出力上限（256）を超える場合向けの
   条件付き候補として記録するに留める（現状は全量 readback へ縮退）。
-- `SHADER_F16`（#538）・整数ドット積系 feature（#541）・Apple UMA
-  （#544）の実機確認は、本 doc の再現用 example（§6）の出力表を流用する。
+- `SHADER_F16`（#538）・整数ドット積系 feature（#541）の実機確認は、
+  本 doc の再現用 example（§6）の出力表を流用する。Apple UMA（#544）は
+  静的確認済み（実機なし・production 変更なし。
+  [`gpu-batch-phase5-before-after.md`](gpu-batch-phase5-before-after.md)
+  §6 参照）。
 - wgpu 更新時（naga が `enable subgroups;` を実装した場合）の WGSL
   互換性再確認を申し送る。
 
