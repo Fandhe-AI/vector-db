@@ -35,7 +35,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crate::batch_fallback::{BatchBackend, BatchBackendError, BatchExecError};
-use crate::batch_search::{try_reserve_exact, BatchHit, BatchQuery, ResidentMatrix};
+use crate::batch_search::{
+    try_reserve_exact, BatchHit, BatchQuery, BatchSearchError, ResidentMatrix,
+};
 use crate::kernel::{dot, CandidateHit, TopKSelector};
 
 use super::{
@@ -745,7 +747,8 @@ impl GpuI8BatchBackend {
                     for (&slot, &score) in chunk.iter().zip(scores.iter()) {
                         per_query.push((slot, score));
                     }
-                    reduce_top_k_prime(&mut per_query, k_prime, &self.row_scales);
+                    reduce_top_k_prime(&mut per_query, k_prime, &self.row_scales)
+                        .map_err(BatchExecError::Input)?;
                 }
                 // 最後のチャンク追加がちょうど `k_prime` 件に収まり
                 // ループ内の縮約が発火しなかった場合に備え、返却前に必ず
@@ -760,7 +763,7 @@ impl GpuI8BatchBackend {
                 // 残っている可能性があるため、保存前に必ず容量を長さぴったりへ
                 // 縮小する（[`shrink_to_len`] 参照。容量と長さが既に一致して
                 // いれば no-op）。
-                let per_query = shrink_to_len(per_query);
+                let per_query = shrink_to_len(per_query).map_err(BatchExecError::Input)?;
                 if let Some(slot) = out.get_mut(qi) {
                     *slot = Some(per_query);
                 }
@@ -823,18 +826,23 @@ fn ranking_key(slot: u32, score: i32, row_scales: &Sq8RowScales) -> f32 {
 
 /// `buf` を [`ranking_key`] 降順（同点は `slot` 昇順）へ確定させる
 /// （in-place・追加確保なし）。
+///
+/// `slice::sort_by`（安定ソート）はマージソート実装のため大きなスライスで
+/// 内部的に作業用バッファをヒープ確保する（`Vec` の `try_reserve` のような
+/// フォールブル API を経由しないため、確保失敗時は abort しうる）。到達行数
+/// によっては `per_query` が数百万要素に達しうるため、フォールブル確保
+/// 契約（coding-rust.md）を保つには内部確保のない `sort_unstable_by`
+/// （pdqsort。作業用ヒープ確保を持たない）が必須（codex-review 指摘対応・
+/// P1）。比較子は `slot` 昇順の完全なタイブレークを持つ全順序であり、
+/// 安定/不安定のどちらでも出力は同じ（sort-determinism-check
+/// （`docs/design/rrf-tie-break-determinism.md`）の許可マーカー参照）。
 fn sort_by_ranking_key(buf: &mut [(u32, i32)], row_scales: &Sq8RowScales) {
-    // sort-determinism-check（`docs/design/rrf-tie-break-determinism.md`）は
-    // 明示タイブレークの有無を問わず `sort_unstable_by` の識別子参照そのものを
-    // 検知するため、比較子は不変のまま安定ソート `sort_by` へ切り替える
-    // （codex-review 指摘対応。比較子自体は元々 `slot` 昇順の完全なタイブレークを
-    // 持ち、安定/不安定のどちらでも出力は同じだが、CI ゲートと将来の保守性の
-    // 両面で安定ソート API を使う）。
-    buf.sort_by(|&(slot_a, score_a), &(slot_b, score_b)| {
+    let cmp = |&(slot_a, score_a): &(u32, i32), &(slot_b, score_b): &(u32, i32)| {
         let key_a = ranking_key(slot_a, score_a, row_scales);
         let key_b = ranking_key(slot_b, score_b, row_scales);
         key_b.total_cmp(&key_a).then(slot_a.cmp(&slot_b))
-    });
+    };
+    buf.sort_unstable_by(cmp); // sort-determinism: allow 比較子は slot 昇順の明示的タイブレークを含む全順序（フォールブル確保契約のため sort_by からの意図的な切り替え）
 }
 
 /// [`GpuI8BatchBackend::raw_i32_scores`] のチャンク処理ごとに呼ぶ逐次縮約
@@ -846,9 +854,13 @@ fn sort_by_ranking_key(buf: &mut [(u32, i32)], row_scales: &Sq8RowScales) {
 /// 一括保持してから 1 回だけ選出した場合」と一致する（超過しなかった
 /// チャンクでは何も破棄しないため、より弱く「まだ何も捨てる必要が無い」
 /// ケースになるだけで、この性質は崩れない）。
-fn reduce_top_k_prime(buf: &mut Vec<(u32, i32)>, k_prime: usize, row_scales: &Sq8RowScales) {
+fn reduce_top_k_prime(
+    buf: &mut Vec<(u32, i32)>,
+    k_prime: usize,
+    row_scales: &Sq8RowScales,
+) -> Result<(), BatchSearchError> {
     if buf.len() <= k_prime {
-        return;
+        return Ok(());
     }
     sort_by_ranking_key(buf, row_scales);
     buf.truncate(k_prime);
@@ -860,26 +872,32 @@ fn reduce_top_k_prime(buf: &mut Vec<(u32, i32)>, k_prime: usize, row_scales: &Sq
     // 放置すると設計上の Σk' によるメモリ上限契約（D9）が成立しなくなる
     // （codex-review 指摘対応・P1: dim=1・到達行 100 万・4096 クエリ・各 k=1
     // のような形状で候補バッファだけで約 32.768GB に達すると指摘された）。
-    // 縮小後の長さぴったりの Vec へ移し替える。
-    *buf = shrink_to_len(std::mem::take(buf));
+    // 縮小後の長さぴったりの Vec へ移し替える。縮小予約自体の失敗は
+    // 「容量が大きいまま成功扱いで返す」と Σk' 上限契約が崩れるため、
+    // 単なる最適化として握り潰さず `Err` として呼び出し元へ伝播する
+    // （codex-review 指摘対応・P2）。
+    *buf = shrink_to_len(std::mem::take(buf))?;
+    Ok(())
 }
 
 /// `buf` の容量を長さぴったりへ縮小した新しい `Vec` を返す（[`reduce_top_k_prime`]
-/// 参照）。フォールブル確保（`try_reserve_exact`）に失敗した場合は縮小を諦め、
-/// 元の（容量が大きいままの）`buf` をそのまま返す——容量の縮小は最適化であり
-/// 必須の契約ではないため、縮小自体の失敗で呼び出し元の処理全体を abort/panic
-/// させるより、長さは正しいまま容量だけ大きい状態を許容するほうが
-/// fail-closed の精神（受信データ経路で unwrap/expect しない）に沿う。
-fn shrink_to_len(buf: Vec<(u32, i32)>) -> Vec<(u32, i32)> {
+/// 参照）。フォールブル確保（`try_reserve_exact`）に失敗した場合は `Err` を
+/// 返す——縮小予約の失敗を「容量が大きいままの `buf` を成功扱いで返す」形で
+/// 握り潰すと、`per_query` が容量縮小前の「チャンク全量分」を保持したまま
+/// クエリ数分バッチ全体で同時に生存し、設計上の Σk' によるメモリ上限契約
+/// （D9）がメモリ逼迫時にこそ成立しなくなる（abort を避けるつもりが、より
+/// 大きなメモリ確保状態のまま処理を継続させてしまう。codex-review 指摘
+/// 対応・P2）。呼び出し元（[`reduce_top_k_prime`]）で `Err` を伝播させ、
+/// 最終的に [`GpuI8BatchBackend::raw_i32_scores`] が
+/// `BatchExecError::Input` として fail-closed に拒否する。
+fn shrink_to_len(buf: Vec<(u32, i32)>) -> Result<Vec<(u32, i32)>, BatchSearchError> {
     if buf.capacity() <= buf.len() {
-        return buf;
+        return Ok(buf);
     }
     let mut shrunk: Vec<(u32, i32)> = Vec::new();
-    if try_reserve_exact(&mut shrunk, buf.len(), "gpu i8 raw scores (shrink)").is_err() {
-        return buf;
-    }
+    try_reserve_exact(&mut shrunk, buf.len(), "gpu i8 raw scores (shrink)")?;
     shrunk.extend_from_slice(&buf);
-    shrunk
+    Ok(shrunk)
 }
 
 impl BatchBackend for GpuI8BatchBackend {
@@ -890,7 +908,17 @@ impl BatchBackend for GpuI8BatchBackend {
         try_reserve_exact(&mut hits, queries.len(), "gpu i8 batch hits")
             .map_err(BatchExecError::Input)?;
 
+        // 行デコード用スクラッチバッファを `dim` ぶんフォールブルに事前予約する
+        // （codex-review 指摘対応・P1。`ResidentMatrix::row_f32_into` は
+        // `out.clear()` してから `dim` 回 `Vec::push` するため、未予約だと
+        // `push` の内部（amortized・infallible）確保がメモリ不足時に abort
+        // しうる——既存 CPU バッチ経路〔`batch_search.rs::row_buffer_pool`〕が
+        // フォールブル確保のみを行うのと同じ契約をここでも保つ）。`dim` は
+        // 全行で共通のため、ループの外で一度予約すれば `out.clear()` は
+        // 容量を保ったままなので以降のイテレーションでも再確保は起きない。
         let mut row_buf: Vec<f32> = Vec::new();
+        try_reserve_exact(&mut row_buf, self.matrix.dim(), "gpu i8 row buffer")
+            .map_err(BatchExecError::Input)?;
         for (qi, per_query) in raw.iter().enumerate() {
             let query = queries.get(qi).ok_or_else(|| {
                 BatchExecError::Backend(BatchBackendError::KernelLaunchFailed(
@@ -908,6 +936,18 @@ impl BatchBackend for GpuI8BatchBackend {
                 .fetch_add(per_query.len() as u64, Ordering::Relaxed);
 
             let mut selector = TopKSelector::new(query.k);
+            // `query.k` は `validate_batch_queries`（`raw_i32_scores` 呼び出し
+            // 前に `batch_search.rs` の上限検証を経由する）でバッチ全体の
+            // `sum(k)` が上限内であることを検証済みのため、`TopKSelector::push`
+            // の amortized 成長（`BinaryHeap::push`。内部確保は infallible）に
+            // 任せず、既存 CPU バッチ経路（`batch_search.rs` の
+            // `selector.try_reserve(q.k)`）と同じ契約でフォールブルに事前
+            // 予約する（codex-review 指摘対応・P1）。
+            selector.try_reserve(query.k).map_err(|e| {
+                BatchExecError::Input(BatchSearchError::AllocationFailed(format!(
+                    "failed to reserve i8 selector heap: {e}"
+                )))
+            })?;
             for (slot, _int_score) in per_query {
                 if self
                     .matrix
@@ -1260,7 +1300,7 @@ mod tests {
             buf.push((i, 1));
         }
 
-        reduce_top_k_prime(&mut buf, 4, &row_scales);
+        reduce_top_k_prime(&mut buf, 4, &row_scales).expect("reserve should succeed");
 
         assert_eq!(buf.len(), 4);
         assert!(
