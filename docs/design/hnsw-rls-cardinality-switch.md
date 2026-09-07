@@ -929,6 +929,33 @@ Issue #488 が確立した「1 つの判定式を複数箇所で共有し分岐�
   ADR 本文の改訂は不要とする。オーナーが明文化を望む場合は別 Issue とする
   （起票はユーザー承認事項のため本 Issue では行わない）
 
+## Issue #501: `search_layer` の 2-hop 展開（ACORN-1）実装記録
+
+Issue #500 の設計契約（上記「ゲート条件の設計」節）に従い、`crate::hnsw::HopMode::TwoHop`（マスク付き探索限定）を実装した。
+
+### 実装の要点
+
+- `crate::hnsw::HopMode`（`OneHop`／`TwoHop`）・`ValidatedHnswParams::acorn_max_visible_ratio`（既定 `None`）・`with_acorn_max_visible_ratio`（`den>=1`・`num<=den`・`ratio >= full_scan_ratio` を fail-closed 検査。`with_full_scan_ratio` 側の後付け逆転も同様に拒否）を追加。両アクセサは `full_scan_ratio`／`with_full_scan_ratio` と同じ公開範囲（`pub`）にした——`ValidatedHnswParams` の他のビルダーメソッドと同様、統合テストが opt-in エンジンを組み立てるための公開 API として必要なため（`EXPLAIN` への非露出という D3 の判断とは別軸）
+- 非受理ノードに出会ったときの規則を `bridge_expand`（自由関数）へ集約し、`search_layer_in`（ビーム探索の受理判定後分岐）・`HnswIndex::accepted_reachable_count`（`is_mask_fully_reachable_with` の BFS）の双方が同一実装を共有する。規則: 非受理ノード N を「1-hop 非受理として初めて訪問した」ときのみ visited を付けて `bridge_expand(N)` を呼び、N の隣接（2-hop 候補）のうち受理済みかつ未訪問のものだけを visited を付けて候補化する。2-hop 候補が非受理の場合は visited を付けない（別の 1-hop 非受理ノードから改めて中継点として使えるようにするため。ただし 3-hop 以上へは展開しない——D1 の設計どおり 1 段のみ）
+- この規則により各ノードの隣接リスト読み取りはクエリ全体で高々 1 回に構造的に有界（visited マークが「展開済み」を兼ねる）となり、総走査量は `O(N・M0)` で有界（追加の明示的訪問予算上限は設けていない。§ Issue #500 の「停止性・DoS」節どおり）
+- 上位層の貪欲降下（`greedy_descend_masked`）は 1-hop のまま据え置いた（D2。層 0 の起点選択にのみ関与し Recall への寄与が薄い一方リスクのみ増えるため）
+- `sql::hnsw_cache::TraversalRegime`（`PlainScan`／`OneHop`／`TwoHop`）・`traversal_regime_for` を新設し、`Overlay::compute`（分断検査の hop 選択）・`search_with_overlay`（plain scan 判定・hop 選択の両方）が同一情報源を共有する形へ一本化した（Issue #488 の「単一情報源」方針をそのまま踏襲・拡張）。`search_with_overlay` 内での `below_full_scan_ratio` 再計算は撤去し `overlay.regime` を直接参照する
+- `EXPLAIN` への `acorn_max_visible_ratio` の露出は D3 のとおり見送った（`full_scan_ratio` と同区分。`hnsw_params:` 行は無変更のまま据え置き）
+- 診断統計 `HnswIndexCacheStats::acorn_searches`／`acorn_expansions` を追加（`TwoHop` レジームで縮退なしに完走した回数・`bridge_expand` が候補化した 2-hop ノード数の累計。`EXPLAIN` へは非露出）
+
+### #500 の設計からの差異・確定した点
+
+- `HnswIndex::search_masked`／`search_masked_with`・`HnswIndex::search_layer`（旧・`OneHop` 専用ラッパー）は既存シグネチャのまま `HopMode::OneHop` へ委譲する薄いラッパーとして残し、`HopMode` を受け取る新規メソッド（`search_masked_with_hop`・`search_layer_with_hop`）を追加する形にした（Issue #497 のパターンに倣う。既存呼び出し元・テストの変更を最小化し、R1 のビット同一性を「既存コードパスを一切変更しない」ことで構造的に保証するため）。`is_mask_fully_reachable`（`OneHop` 専用ラッパー）・旧 `search_layer`／`search_layer_with` は production からの呼び出しが `search_masked_with_hop`／`search_layer_with_hop` へ一本化されたことで非到達になったため `#[cfg(test)]` にした（`select_neighbors_heuristic` と同じ既存の扱い）
+- `TraversalRegime::hop()` は `PlainScan` に対しても `OneHop` を返す（呼び出し元は `PlainScan` の場合その値を使わず先に plain scan 分岐へ抜ける契約のため、値自体は「使われない」）
+
+### 検証
+
+- 単体テスト（`crates/engine/src/hnsw.rs`）: 橋渡しノード経由の 2-hop 到達（`search_masked_two_hop_traverses_through_a_rejected_bridge_node`）・3-hop 非到達（`search_masked_two_hop_does_not_traverse_three_hops`）・I1 機械検証（`search_masked_two_hop_never_scores_rejected_nodes`。`NodeSource::score` 呼び出しを記録するテスト専用ラッパーで非受理ノードへの呼び出しが 0 件・受理 2-hop ノードへの呼び出しが非 vacuous であることを固定）・`accept == None` でのビット同一性（`search_masked_two_hop_matches_search_when_mask_is_none`）・決定性（`search_masked_two_hop_is_deterministic`）・停止性（`search_masked_two_hop_reads_each_node_adjacency_at_most_once`。`Adjacency::neighbors` 呼び出し回数を記録するラッパーで最大 1 回であることを機械検証）・`ValidatedHnswParams` の検証規則（`acorn_max_visible_ratio_defaults_none_and_rejects_invalid_ratios`）を追加。既存の HNSW 単体テスト（103 件）は全て無変更のまま green（R1 のビット同一性の直接証拠）
+- 統合テスト（`crates/engine/tests/hnsw_cache.rs`）: `acorn_two_hop_subset_shape_matches_default_engine_and_never_leaks_across_tenants`（`Subset` 形状・選択率 20% のフィクスチャで `OneHop`（既定）だと `mask_splits_graph` が 20/20 発火することを実測確認したうえで `acorn_max_visible_ratio = 1/1` を opt-in すると全 20 クエリが `subset_searches`〔縮退なしの ANN 完走〕へ転じ、既定エンジン対照 Recall@10 ≥ 0.9・tenant-b 非混入・`plain_scans == 0`・`acorn_searches`/`acorn_expansions` 非 vacuous を満たすことを固定）・`acorn_disabled_by_default_keeps_existing_behavior_unaffected`（同じフィクスチャで opt-in しない場合 `acorn_searches == 0` のまま `mask_splits_graph` が従来どおり発火することを固定。opt-in なしでは挙動が一切変わらないことの直接証拠）
+- `hnsw_search.rs`・`hnsw_hybrid_refetch.rs`・`incremental_index_hnsw.rs`・`sql_explain.rs`（engine）・`wire_explain.rs`（wire-server）は無変更のまま green
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`・`cargo test --workspace --all-features` を実行（結果は本 PR の Test plan 参照）
+- 新規 `unsafe` は 0（既存の禁止方針を維持）。依存追加なし（`Cargo.toml` 無変更）
+
 ## Issue #498 追記: visited 集合切替閾値の可視比率スイープ確認（層 2）
 
 Issue #497（`VisitedSparse`・`sparse_visited_max` 閾値機構）の閾値既定値

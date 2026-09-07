@@ -92,6 +92,15 @@ impl HnswSearchProvider {
         self.params.full_scan_ratio()
     }
 
+    /// ACORN-1 の 2-hop 展開（`hnsw::HopMode::TwoHop`）を有効化する可視比率の
+    /// 上限を返す（Issue #501・親 #500。`None`＝既定・無効）。`full_scan_ratio`
+    /// と同じ理由（`ValidatedHnswParams` の private フィールド）で本 provider
+    /// 経由でのみ読み取れる。`sql::hnsw_cache::traversal_regime_for` が
+    /// レジーム判定に使う。
+    pub(crate) fn acorn_max_visible_ratio(&self) -> Option<crate::hnsw::Ratio> {
+        self.params.acorn_max_visible_ratio()
+    }
+
     /// visited 集合の切替閾値を返す（Issue #497。`full_scan_ratio` と同じ理由
     /// （`ValidatedHnswParams` の private フィールド）で本 provider 経由でのみ
     /// 読み取れる）。`sql::hnsw_cache::search_with_overlay` が

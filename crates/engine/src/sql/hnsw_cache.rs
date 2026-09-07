@@ -177,6 +177,15 @@ pub struct HnswIndexCacheStats {
     /// 上回りうる。テナント境界・可視カーディナリティ・索引ノード数等のテナント
     /// 存在情報には繋がらない——採否のみを数える）。
     pub sparse_visited_searches: u64,
+    /// `TraversalRegime::TwoHop`（ACORN-1・Issue #501）レジームで縮退なしに
+    /// 完走したマスク付き探索回数。`hits`／`subset_searches` とは独立に数える
+    /// 診断用カウンタ（`ValidatedHnswParams::acorn_max_visible_ratio` が
+    /// `None`（既定）の間は常に `0`）。
+    pub acorn_searches: u64,
+    /// `bridge_expand`（Issue #501）が受理・候補化した 2-hop ノード数の累計
+    /// （診断用。テナント境界・可視カーディナリティ等のテナント存在情報には
+    /// 繋がらない——採否のみを数える）。
+    pub acorn_expansions: u64,
     /// 現在キャッシュが保持しているエントリ数。
     pub entries: usize,
 }
@@ -289,6 +298,65 @@ fn below_full_scan_ratio(visible_in_index: usize, index_len: usize, ratio: Ratio
     }
 }
 
+/// マスク付き探索が可視カーディナリティ比 `visible_in_index / index_len` に
+/// 応じてどう振る舞うかを表す 3 区分（Issue #501・親 #500。ACORN-1 の
+/// 2-hop 展開〔`crate::hnsw::HopMode::TwoHop`〕を有効化する条件を、既存の
+/// `full_scan_ratio` 切替と単一情報源で判定する）。
+///
+/// - `PlainScan`: `below_full_scan_ratio` と同じ（アリーナ全体の brute-force）。
+/// - `OneHop`: 既存契約のマスク付き ANN 探索（`acorn_max_visible_ratio` が
+///   `None`、または比が `acorn_max_visible_ratio` を超える）。
+/// - `TwoHop`: `full_scan_ratio <= r <= acorn_max_visible_ratio` の区間
+///   （`ValidatedHnswParams::acorn_max_visible_ratio` が `Some` のときのみ
+///   到達しうる。既定 `None` の間は本レジームへ到達しない＝既存動作不変）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TraversalRegime {
+    PlainScan,
+    OneHop,
+    TwoHop,
+}
+
+impl TraversalRegime {
+    /// マスク付き探索へ渡す [`crate::hnsw::HopMode`]（`PlainScan` は探索自体を
+    /// 呼ばない呼び出し元の都合上 `OneHop` を返す。呼び出し元は `PlainScan` の
+    /// 場合は本値を使わず先に plain scan へ分岐する契約）。
+    pub(crate) fn hop(self) -> crate::hnsw::HopMode {
+        match self {
+            TraversalRegime::TwoHop => crate::hnsw::HopMode::TwoHop,
+            TraversalRegime::PlainScan | TraversalRegime::OneHop => crate::hnsw::HopMode::OneHop,
+        }
+    }
+}
+
+/// [`TraversalRegime`] を可視カーディナリティ比・両閾値から判定する（Issue #501）。
+/// `full_scan_ratio` 未満は常に `PlainScan`（[`below_full_scan_ratio`] と同じ
+/// 判定式・同じ fail-closed 挙動）。`acorn_max_visible_ratio` が `Some(acorn)`
+/// のとき、比が `acorn` 以下（`visible_in_index * acorn.denominator <=
+/// index_len * acorn.numerator`）なら `TwoHop`、そうでなければ `OneHop`。
+/// オーバーフロー時は fail-closed に `OneHop`（既存契約側）へ倒す
+/// （`u32 * u32` は `u64` へ必ず収まるため、この分岐は `index_len`／
+/// `visible_in_index` が `u32` 範囲外の呼び出し元防御としてのみ働く）。
+pub(crate) fn traversal_regime_for(
+    visible_in_index: usize,
+    index_len: usize,
+    full_scan_ratio: Ratio,
+    acorn_max_visible_ratio: Option<Ratio>,
+) -> TraversalRegime {
+    if below_full_scan_ratio(visible_in_index, index_len, full_scan_ratio) {
+        return TraversalRegime::PlainScan;
+    }
+    let Some(acorn) = acorn_max_visible_ratio else {
+        return TraversalRegime::OneHop;
+    };
+    match (
+        (visible_in_index as u64).checked_mul(acorn.denominator as u64),
+        (index_len as u64).checked_mul(acorn.numerator as u64),
+    ) {
+        (Some(lhs), Some(rhs)) if lhs <= rhs => TraversalRegime::TwoHop,
+        _ => TraversalRegime::OneHop,
+    }
+}
+
 /// 世代 `generation` の `arena` に対する `base` の差分オーバーレイ。
 pub(crate) struct Overlay {
     generation: u64,
@@ -326,6 +394,11 @@ pub(crate) struct Overlay {
     /// `search_with_overlay` は `search_masked` を呼ばず直接 plain scan へ
     /// 縮退する。
     mask_splits_graph: bool,
+    /// 本世代の可視カーディナリティ比から導出した [`TraversalRegime`]
+    /// （Issue #501）。`search_with_overlay` が plain scan／マスク付き ANN 探索
+    /// （さらにその hop）を選ぶ単一情報源——`below_full_scan_ratio` の
+    /// 再計算をここへ一本化する。
+    regime: TraversalRegime,
 }
 
 impl Overlay {
@@ -347,6 +420,7 @@ impl Overlay {
         arena: &VectorArena,
         generation: u64,
         full_scan_ratio: Ratio,
+        acorn_max_visible_ratio: Option<Ratio>,
     ) -> Self {
         let dim = arena.dim() as usize;
         let mut slot_of_node = vec![STALE_SLOT; base.index.len()];
@@ -409,12 +483,18 @@ impl Overlay {
         // を選ぶため、その場合は観測されない値として BFS を省略する（Issue #488。
         // `visible_in_index == 0` はこの分岐に必ず含まれる——0 件のマスクで
         // `is_mask_fully_reachable` が自明に `true` を返す旧来の性質は維持される）。
-        let mask_splits_graph =
-            if below_full_scan_ratio(visible_in_index, base.index.len(), full_scan_ratio) {
-                false
-            } else {
-                !base.index.is_mask_fully_reachable(&visible_mask)
-            };
+        let regime = traversal_regime_for(
+            visible_in_index,
+            base.index.len(),
+            full_scan_ratio,
+            acorn_max_visible_ratio,
+        );
+        let mask_splits_graph = match regime {
+            TraversalRegime::PlainScan => false,
+            TraversalRegime::OneHop | TraversalRegime::TwoHop => !base
+                .index
+                .is_mask_fully_reachable_with(&visible_mask, regime.hop()),
+        };
         Overlay {
             generation,
             arena_len: arena.len(),
@@ -425,6 +505,7 @@ impl Overlay {
             visible_mask,
             visible_in_index,
             mask_splits_graph,
+            regime,
         }
     }
 
@@ -527,6 +608,8 @@ pub(crate) struct HnswIndexCache {
     hybrid_rounds_max: AtomicU64,
     f16_residency_fallbacks: AtomicU64,
     sparse_visited_searches: AtomicU64,
+    acorn_searches: AtomicU64,
+    acorn_expansions: AtomicU64,
 }
 
 /// [`HnswIndexCache::lookup`] の結果。
@@ -564,6 +647,8 @@ impl HnswIndexCache {
             hybrid_rounds_max: AtomicU64::new(0),
             f16_residency_fallbacks: AtomicU64::new(0),
             sparse_visited_searches: AtomicU64::new(0),
+            acorn_searches: AtomicU64::new(0),
+            acorn_expansions: AtomicU64::new(0),
         }
     }
 
@@ -872,6 +957,8 @@ impl HnswIndexCache {
             hybrid_rounds_max: self.hybrid_rounds_max.load(Ordering::Relaxed),
             f16_residency_fallbacks: self.f16_residency_fallbacks.load(Ordering::Relaxed),
             sparse_visited_searches: self.sparse_visited_searches.load(Ordering::Relaxed),
+            acorn_searches: self.acorn_searches.load(Ordering::Relaxed),
+            acorn_expansions: self.acorn_expansions.load(Ordering::Relaxed),
             entries,
         }
     }
@@ -1021,6 +1108,7 @@ pub(crate) fn prepare_full_visible(
         arena,
         current_generation,
         access.provider.full_scan_ratio(),
+        access.provider.acorn_max_visible_ratio(),
     );
     if overlay.needs_rebuild(n) {
         access.cache.builds.fetch_add(1, Ordering::Relaxed);
@@ -1050,7 +1138,22 @@ pub(crate) fn prepare_full_visible(
                 // （§`Overlay::mask_splits_graph` ドキュメンテーションコメント
                 // 参照。`repair_reachability` が層 0 の entry point 起点到達性を
                 // 保証する契約に依拠しすぎず、構築直後の索引でも実際に検証する）。
-                let identity_splits_graph = !new_base.index.is_mask_fully_reachable(&identity_mask);
+                // regime（Issue #501）は「恒等マスク」＝可視全ノードのため
+                // `visible_in_index == index_len` で `traversal_regime_for` から
+                // 導出し、分断検査は regime が要求する hop で行う（`Overlay::
+                // compute` と同じ単一情報源）。
+                let identity_regime = traversal_regime_for(
+                    new_base.index.len(),
+                    new_base.index.len(),
+                    access.provider.full_scan_ratio(),
+                    access.provider.acorn_max_visible_ratio(),
+                );
+                let identity_splits_graph = match identity_regime {
+                    TraversalRegime::PlainScan => false,
+                    TraversalRegime::OneHop | TraversalRegime::TwoHop => !new_base
+                        .index
+                        .is_mask_fully_reachable_with(&identity_mask, identity_regime.hop()),
+                };
                 let identity_overlay = Arc::new(Overlay {
                     generation: current_generation,
                     arena_len: arena.len(),
@@ -1061,6 +1164,7 @@ pub(crate) fn prepare_full_visible(
                     visible_mask: identity_mask,
                     visible_in_index: new_base.index.len(),
                     mask_splits_graph: identity_splits_graph,
+                    regime: identity_regime,
                 });
                 record_overlay_for(access, table, &new_base, Arc::clone(&identity_overlay));
                 PreparedHnswSearch::Indexed {
@@ -1248,6 +1352,7 @@ pub(crate) fn prepare_subset(
         arena,
         current_generation,
         access.provider.full_scan_ratio(),
+        access.provider.acorn_max_visible_ratio(),
     ));
     PreparedHnswSearch::Indexed {
         base,
@@ -1488,15 +1593,13 @@ fn search_with_overlay(
         return full_scan_with_arena(provider, arena, query, k);
     }
 
-    // 可視カーディナリティ切替（Issue #409・`ValidatedHnswParams::full_scan_ratio`）:
-    // `visible_in_index / index.len() < full_scan_ratio` なら plain scan
-    // （アリーナ全体の brute-force）。判定式は [`below_full_scan_ratio`] に
-    // 集約し、`Overlay::compute`（分断検査省略判定）・`prepare_subset`（早期
-    // 打ち切り）と同一の式を共有する（Issue #488）。
-    let ratio = access.provider.full_scan_ratio();
-    let index_len = base.index.len();
+    // 可視カーディナリティ切替（Issue #409・`ValidatedHnswParams::full_scan_ratio`。
+    // Issue #501 で `TraversalRegime` へ一般化）: `overlay.regime` が
+    // `Overlay::compute`（分断検査省略判定）・`prepare_subset`（早期打ち切り）
+    // と同一の判定式（[`below_full_scan_ratio`] 由来）を共有する単一情報源
+    // （Issue #488 の方針をそのまま踏襲。ここでの再計算を撤去した）。
     let visible_in_index = overlay.visible_in_index;
-    if below_full_scan_ratio(visible_in_index, index_len, ratio) {
+    if overlay.regime == TraversalRegime::PlainScan {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
         access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
         return full_scan_with_arena(provider, arena, query, k);
@@ -1536,22 +1639,31 @@ fn search_with_overlay(
 
     let ef = access.provider.effective_ef(k);
     // visited 集合の切替（Issue #497）: `access.provider.sparse_visited_max()`
-    // は構築時の静的設定値（既定 0＝常に dense）を `HnswIndex::search_masked_with`
+    // は構築時の静的設定値（既定 0＝常に dense）を `HnswIndex::search_masked_with_hop`
     // へそのまま渡す。選ばれた実装は `scratch.last_visited_kind()` から読み、
     // 縮退なしで完走した場合のみ `sparse_visited_searches` へ計上する
     // （下の `masked_short`／`arena_identity_mismatch_guard` 等の縮退判定より
     // 後段で計上するため、クロージャ内で `Option<VisitedKind>` を一緒に返す）。
-    let (index_hits, visited_kind) = SEARCH_SCRATCH.with(|scratch| {
+    // `hop`（Issue #501）は `overlay.regime`（`Overlay::compute` が
+    // 世代毎に 1 回だけ判定した単一情報源）からそのまま導出する——本関数側で
+    // 独自に可視カーディナリティ比を再判定しない。
+    let hop = overlay.regime.hop();
+    let (index_hits, visited_kind, acorn_expansions) = SEARCH_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        let result = base.index.search_masked_with(
+        let result = base.index.search_masked_with_hop(
             query,
             k,
             ef,
             Some(&overlay.visible_mask),
             access.provider.sparse_visited_max(),
+            hop,
             &mut scratch,
         );
-        (result, scratch.last_visited_kind())
+        (
+            result,
+            scratch.last_visited_kind(),
+            scratch.last_acorn_expansions(),
+        )
     });
     let index_hits = match index_hits {
         Ok(hits) => hits,
@@ -1645,6 +1757,17 @@ fn search_with_overlay(
             .cache
             .sparse_visited_searches
             .fetch_add(1, Ordering::Relaxed);
+    }
+    // `TraversalRegime::TwoHop`（ACORN-1・Issue #501）で縮退なしに完走した
+    // 場合のみ `acorn_searches`／`acorn_expansions` を計上する（`hits`／
+    // `subset_searches` と同じく独立カウンタ。既定 `acorn_max_visible_ratio ==
+    // None` の間は `hop` が常に `OneHop` のためこの分岐へ到達しない）。
+    if hop == crate::hnsw::HopMode::TwoHop {
+        access.cache.acorn_searches.fetch_add(1, Ordering::Relaxed);
+        access
+            .cache
+            .acorn_expansions
+            .fetch_add(acorn_expansions, Ordering::Relaxed);
     }
     Ok(mapped)
 }
@@ -2228,6 +2351,7 @@ mod tests {
                 numerator: 1,
                 denominator: 10,
             },
+            None,
         );
 
         // id=1 は変更なしなのでどこかのノードが失効していない（stale_nodes は id=2
@@ -2302,6 +2426,7 @@ mod tests {
             visible_mask,
             visible_in_index,
             mask_splits_graph: false,
+            regime: TraversalRegime::OneHop,
         });
 
         let access = HnswCacheAccess {
@@ -2382,6 +2507,7 @@ mod tests {
             visible_mask,
             visible_in_index,
             mask_splits_graph: false,
+            regime: TraversalRegime::OneHop,
         });
         let access = HnswCacheAccess {
             storage: &storage,
@@ -2840,6 +2966,7 @@ mod tests {
             visible_mask,
             visible_in_index,
             mask_splits_graph: false,
+            regime: TraversalRegime::OneHop,
         });
         assert!(overlay.approx_heap_bytes() > MAX_HNSW_CACHE_TOTAL_BYTES);
 
