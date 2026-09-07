@@ -273,7 +273,7 @@ dispatch／GPU 側 Top-k／SHADER_F16／`dot4I8Packed`）は #531／#534／#538�
 | #366 | 距離計算と Top-k の 2 段分離バッチ化 | [`docs/design/knn-two-stage-topk.md`](knn-two-stage-topk.md) | 専有環境での再実測（#462 規約）で run-to-run 変動を上回る差が出た場合のみ |
 | #391 | fieldnorm 256 段ロッシー量子化 | [`docs/design/hybrid-rrf-latency-breakdown.md`](hybrid-rrf-latency-breakdown.md)「Issue #391」節 | ビット一致契約自体の改訂（spec 側判断）なしには再訪しない |
 | #400 | redb `insert_reserve` ゼロコピー | [`docs/design/redb-insert-reserve-zero-copy.md`](redb-insert-reserve-zero-copy.md) | redb 側の内部実装変更が確認された場合 |
-| #410 Phase B | 再開型スキャン（DISTANCE 経路の ef 倍増ループ） | [`docs/design/hnsw-hybrid-iterative-scan.md`](hnsw-hybrid-iterative-scan.md) | `masked_short` が到達可能になる設計変更時（pgvector 型の継続方式は #503 で hybrid 密側の別経路として扱う） |
+| #410 Phase B | 再開型スキャン（DISTANCE 経路の ef 倍増ループ） | [`docs/design/hnsw-hybrid-iterative-scan.md`](hnsw-hybrid-iterative-scan.md) | `masked_short` が到達可能になる設計変更時（pgvector 型の継続方式は #503 で hybrid 密側の別経路として扱う。hybrid 密側は #504 で状態保持・決定性・停止性契約を設計済み〔`hnsw-hybrid-iterative-scan.md`「Phase B 再検討（Issue #504）」節〕。実装は #505） |
 | PR #451 → PR #452 | 対照エンジン `hnsw_rs`（`=0.3.4`）の追加 | [`docs/design/hnsw-parallel-build.md`](hnsw-parallel-build.md)「hnsw_rs を加えた 3 エンジン比較」節 | 対照は usearch で足りるとのオーナー判断（2026-09-05）。再追加はオーナー承認が前提 |
 
 ## 11. 順位から外した候補と理由／未カバーのギャップ／計測カバレッジ
