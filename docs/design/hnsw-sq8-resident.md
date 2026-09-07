@@ -115,7 +115,8 @@ VNNI／NEON dotprod 系の整数内積カーネル（#522・#524）を載せる�
 
 ## Issue #522: VNNI（512bit／256bit）と i16 widen フォールバックの i8 dot カーネル
 
-- ステータス: **Implemented**（`NeonDotprodToken` 経路は #525 の担当のまま）
+- ステータス: **Implemented**（`NeonDotprodToken` 経路は #525 で実装済み。
+  下記「Issue #525」節参照）
 - 対応: Issue #522（親 #520・前提 #521）
 - 準拠 ADR: `docs/design/simd-intrinsics-adoption.md` 決定 1〜5
 - 関連コード: `crates/engine/src/isa.rs`（`I8Kernel`／`AvxVnniToken`／
@@ -210,7 +211,8 @@ AvxVnni・Avx512Vnni ディスパッチ 3 箇所。`x86_i8.rs` 本体は `unsafe
 
 ## 既知の限界・スコープ外（後続 Issue へ申し送り）
 
-- NEON dotprod（`vdotq_s32`）版の i8 整数カーネルは #525 の担当。
+- NEON dotprod（`vdotq_s32`）版の i8 整数カーネルは #525 で実装済み
+  （下記「Issue #525」節参照）。
 - `RecallEngine` fixture（`crates/engine/tests/fixtures/recall_engine.rs`）
   への `hnsw_i8` 追加・`recall.yml` matrix 拡張・Recall 3 ゲート同一閾値
   検証・`bench-knn-profile` 等の `hnsw_i8` トークン追加は Issue #523 で
@@ -396,3 +398,83 @@ i8 は f32 比で約 55.2%（7,726,568 / 17,226,056 ≈ 0.448）の常駐メモ�
 - 専有環境での大規模点（100k／500k・dim 768）再実測、VNNI 実機での
   レイテンシ実測、per-query 縮退カウンタの追加要否はオーナー判断へ申し
   送る。
+
+## Issue #525: NEON dotprod（`vdotq_s32`）版 i8 dot カーネル
+
+- ステータス: **Implemented**
+- 対応: Issue #525（親 #520・前提 #522）
+- 準拠 ADR: `docs/design/simd-intrinsics-adoption.md` 決定 1〜5
+- 関連コード: `crates/engine/src/isa.rs`（`NeonDotprodToken`・
+  `I8Kernel::NeonDotprod`／`DetectedI8Isa::NeonDotprod`・`detect_i8`／
+  `available_i8_kernels` の aarch64 分岐）・新設
+  `crates/engine/src/isa/neon_i8.rs`（`dot_i8_neon_dotprod`。`unsafe` を
+  持たない safe fn のみで構成）
+- 関連テスト: `crates/engine/tests/isa.rs`（`unsafe` 個数 11→12・
+  `isa_source_has_no_external_override_entry_points` の走査対象へ
+  `neon_i8.rs` 追加・`dispatched_dot_i8_matches_scalar_reference_bit_exact_across_kernels`
+  の doc 更新）・`scripts/check_simd_codegen.sh`（`19dot_i8_neon_dotprod`
+  必須シンボル・`sdot v.4s` 期待命令・pass/fail fixture）
+
+### 設計・実装内容
+
+x86_64 VNNI 系（u8×s8→i32・`vpdpbusd`）と異なり、`vdotq_s32`（s8×s8→i32・
+`sdot v.4s`）は符号付き×符号付き積を直接計算できるため、クエリ側は
+`I8QueryOperands::signed` をそのまま使い、VNNI 系が要する `acc −
+128*row_sum`（`shifted` 経由の符号復元）は不要——x86_64 の `Avx2Widen`
+（i16 widen フォールバック）と同じ立場になる。1 chunk = 16 要素
+（`as_chunks::<16>()`）、端数はスカラー wrapping 和、水平和は
+`vaddvq_s32`（整数のため加算順序による差は生じない）。
+
+### レジスタ構築の実測比較
+
+`unsafe` を `isa.rs` のディスパッチ 1 箇所に限定する ADR 決定 1 の下で、
+`int8x16_t` の構築方式を 1.98.0 toolchain・
+`--target aarch64-unknown-linux-gnu -O --emit asm` で 2 候補を実測比較した:
+
+1. `vcombine_s8(vcreate_s8(lo), vcreate_s8(hi))`（16 要素を 2 個の `u64`
+   へパックしてから結合）: 呼び出しコンテキスト（`#[inline(never)]` 付き
+   外側 fn 内のループ）では `mov v_.d[1], v_.d[0]`（レーン結合命令）を
+   残し、`scripts/check_simd_codegen.sh` の禁止パターン
+   （`mov v[0-9]+\.[bhsd]\[`）に抵触することを確認した。
+2. `vsetq_lane_s8::<0..15>` の昇順連鎖: 同じ呼び出しコンテキストで単一の
+   `ldr q`（16 要素の連続メモリロード）へ完全に畳み込まれ、禁止命令 0 件・
+   `sdot v.4s` 1 件以上を実測確認した。
+
+実測に基づき候補 2（`vsetq_lane_s8` 連鎖）を採用した。候補 1 が畳み込ま
+れなかったのは、ADR の想定（別の呼び出しコンテキスト）と本カーネルの
+呼び出し形（`#[inline(never)]` 外側 fn からのループ内呼び出し）が異なる
+ためと考えられる。詳細な asm 抜粋・判断根拠は本節に記載のとおりで、
+`isa/neon_i8.rs` モジュール doc にも同内容を記録した。
+
+### 検証結果
+
+- `unsafe` 個数: 11 → 12（`I8Kernel::dot_i8` の `NeonDotprod` 分岐 1 箇所）。
+- `scripts/check_simd_codegen.sh --target aarch64-unknown-linux-gnu`
+  （実ビルド。1.98.0 toolchain）: `dot_i8_neon_dotprod` シンボルで禁止
+  命令 0 件・`sdot v.4s` 1 件を確認（exit 0）。x86_64 側の既存検査も
+  非退行（exit 0）。
+- `cargo check -p engine --all-targets --target aarch64-unknown-linux-gnu`
+  （1.98.0）: 警告なしで通過（`unused_variables`／`unused_mut` の再発なし）。
+- `cargo clippy -p engine --lib --target aarch64-unknown-linux-gnu -- -D
+  warnings`（1.98.0）: 警告なし。
+- x86_64（本開発環境）: `cargo test -p engine --test isa` 全 18 件 pass・
+  `cargo fmt --check` 差分なし。
+- 「x86 版との整数一致（同一入力で同一出力）」の受け入れ条件は、Issue の
+  想定した個別 golden 定数ハードコードテストではなく、既存テスト
+  `dispatched_dot_i8_matches_scalar_reference_bit_exact_across_kernels`
+  が使う決定的シード RNG 入力と純粋関数 [`dot_i8_scalar`] を共有する
+  ことで満たす（`dot_i8_scalar` は arch 非依存の wrapping 整数演算のため、
+  同じテストが x86_64 CI・aarch64 `detect-apple` の双方で green であれば
+  x86 版と aarch64 版が同一入力で同一出力になることの機械的な証跡に
+  なる）。判断根拠は `crates/engine/tests/isa.rs` の当該テスト doc 参照。
+
+### 検証の限界
+
+本開発環境は x86_64 のため、`NeonDotprod` 経路の実行時ビット同一性・
+性能実測の唯一の証跡は `.github/workflows/detect-features.yml` の
+`detect-apple` ジョブ（GitHub ホステッド `macos-latest`。
+`cargo run --example detect_features` の `isa::current_i8(): NeonDotprod`
+出力・`cargo test -p engine --test isa` 全件）と、PR の `cross-check`
+ジョブ（1.98.1・`make check-cross`＋`make simd-codegen-check-cross`）に
+依存する。Apple 実機・Graviton での性能前後比較は #530／#526 の担当の
+まま（未実施）。

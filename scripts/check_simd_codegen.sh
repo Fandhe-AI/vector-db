@@ -311,6 +311,11 @@ required_segments_for() {
     # 現れない）必須シンボルへ追加する。`PADDED_TAIL` の 2 monomorphization は
     # 同一セグメントを共有する。
     echo "15dot_block4_neon"
+    # Issue #525: NEON dotprod 整数 i8×i8 dot カーネル
+    # `isa::neon_i8::dot_i8_neon_dotprod`。`dotprod` は aarch64 baseline 対象外
+    # のため `#[inline(never)]` を付与しており（`dot_f16_neon_fp16`／
+    # `dot_block4_neon` と同じ理由）独立シンボルとして必ず現れる。
+    echo "19dot_i8_neon_dotprod"
   fi
 }
 
@@ -366,6 +371,12 @@ expected_rules_for() {
       "dot_block4_neon" \
       '^[[:space:]]*fmla[[:space:]]+v[0-9]+\.4s' \
       "row-block FMA (fmla v.4s) actually emitted (not scalarized)"
+    # Issue #525: `vdotq_s32` が実際に `sdot v.4s`（s8x16->i32 dot-product-
+    # accumulate）へコンパイルされた証跡を要求する非 vacuous 検査。
+    printf '%s\t%s\t%s\n' \
+      "dot_i8_neon_dotprod" \
+      '^[[:space:]]*sdot[[:space:]]+v[0-9]+\.4s' \
+      "s8x16->i32 dot-product-accumulate (sdot v.4s) actually emitted"
   fi
 }
 
@@ -1069,6 +1080,77 @@ pub mod isa_probe {
     }
 }
 RUST
+
+  # pass (Issue #525): `isa::neon_i8::dot_i8_neon_dotprod` と同型の実装
+  # （`vsetq_lane_s8` 連鎖構築＋`vdotq_s32`）。禁止 0 件かつ `sdot v.4s` が
+  # 実際に emit されることを確認する。
+  cat > "${dir}/fx_pass_i8_neon_dotprod.rs" <<'RUST'
+use std::arch::aarch64::*;
+
+pub mod isa_probe {
+    use super::*;
+
+    #[target_feature(enable = "neon")]
+    fn load16(chunk: &[i8; 16]) -> int8x16_t {
+        let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15] = *chunk;
+        let v = vdupq_n_s8(0);
+        let v = vsetq_lane_s8::<0>(c0, v);
+        let v = vsetq_lane_s8::<1>(c1, v);
+        let v = vsetq_lane_s8::<2>(c2, v);
+        let v = vsetq_lane_s8::<3>(c3, v);
+        let v = vsetq_lane_s8::<4>(c4, v);
+        let v = vsetq_lane_s8::<5>(c5, v);
+        let v = vsetq_lane_s8::<6>(c6, v);
+        let v = vsetq_lane_s8::<7>(c7, v);
+        let v = vsetq_lane_s8::<8>(c8, v);
+        let v = vsetq_lane_s8::<9>(c9, v);
+        let v = vsetq_lane_s8::<10>(c10, v);
+        let v = vsetq_lane_s8::<11>(c11, v);
+        let v = vsetq_lane_s8::<12>(c12, v);
+        let v = vsetq_lane_s8::<13>(c13, v);
+        let v = vsetq_lane_s8::<14>(c14, v);
+        vsetq_lane_s8::<15>(c15, v)
+    }
+
+    #[target_feature(enable = "neon,dotprod")]
+    #[inline(never)]
+    pub fn dot_i8_neon_dotprod(codes: &[i8], signed: &[i8]) -> i32 {
+        let len = codes.len().min(signed.len());
+        let codes = &codes[..len];
+        let signed = &signed[..len];
+        let (c_chunks, c_rem) = codes.as_chunks::<16>();
+        let (s_chunks, s_rem) = signed.as_chunks::<16>();
+        let mut acc = vdupq_n_s32(0);
+        for (cc, sc) in c_chunks.iter().zip(s_chunks.iter()) {
+            let va = load16(cc);
+            let vb = load16(sc);
+            acc = vdotq_s32(acc, va, vb);
+        }
+        let lane_sum = vaddvq_s32(acc);
+        let rem_sum: i32 = c_rem.iter().zip(s_rem.iter()).fold(0i32, |sum, (&c, &s)| {
+            sum.wrapping_add(i32::from(c).wrapping_mul(i32::from(s)))
+        });
+        lane_sum.wrapping_add(rem_sum)
+    }
+}
+RUST
+
+  # fail (Issue #525): 関数名は `dot_i8_neon_dotprod` だが実体はスカラー逐次
+  # wrapping 和（`sdot` を含まない）。
+  cat > "${dir}/fx_fail_i8_neon_dotprod_missing_instruction.rs" <<'RUST'
+pub mod isa_probe {
+    #[inline(never)]
+    pub fn dot_i8_neon_dotprod(codes: &[i8], signed: &[i8]) -> i32 {
+        let len = codes.len().min(signed.len());
+        codes[..len]
+            .iter()
+            .zip(signed[..len].iter())
+            .fold(0i32, |acc, (&c, &s)| {
+                acc.wrapping_add(i32::from(c).wrapping_mul(i32::from(s)))
+            })
+    }
+}
+RUST
 }
 
 self_test() {
@@ -1248,6 +1330,27 @@ self_test() {
         overall=1
       else
         echo "self-test ok: fail_block4_neon_scalarized correctly rejected"
+      fi
+    fi
+
+    # Issue #525: 期待命令の非 vacuous 検査（`expected_rules_for`。NEON dotprod）。
+    asm="$(compile_fixture "${scratch}/pass_i8_neon_dotprod" "${scratch}/fx_pass_i8_neon_dotprod.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" aarch64 "isa_probe" "19dot_i8_neon_dotprod" >/dev/null; then
+        echo "self-test ok: pass_i8_neon_dotprod (sdot v.4s dot-product-accumulate present)"
+      else
+        echo "self-test FAILED: expected pass_i8_neon_dotprod to pass" >&2
+        overall=1
+      fi
+    fi
+
+    asm="$(compile_fixture "${scratch}/fail_i8_neon_dotprod_missing_instruction" "${scratch}/fx_fail_i8_neon_dotprod_missing_instruction.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" aarch64 "isa_probe" "19dot_i8_neon_dotprod" >/dev/null 2>&1; then
+        echo "self-test FAILED: expected fail_i8_neon_dotprod_missing_instruction to be rejected (no sdot)" >&2
+        overall=1
+      else
+        echo "self-test ok: fail_i8_neon_dotprod_missing_instruction correctly rejected"
       fi
     fi
   fi

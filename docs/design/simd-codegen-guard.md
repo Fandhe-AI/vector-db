@@ -264,6 +264,37 @@ pass: `dot_i8_avx512_vnni`／`dot_i8_avx2_widen` と同型（`set` 構築のみ�
 fail: 関数名は `dot_i8_avx512_vnni` だが実体はスカラー逐次和（`vpdpbusd`
 非搭載）——`fx_fail_f16_missing_instruction` と同型の非 vacuous 検査対象。
 
+## 6.2. Issue #525 追記: aarch64 NEON dotprod 整数 i8×i8 dot カーネル
+
+NEON dotprod（`isa/neon_i8.rs::dot_i8_neon_dotprod`。
+`docs/design/hnsw-sq8-resident.md`「Issue #525」節参照）を本ガードへ
+登録した。
+
+**新規必須シンボル・期待命令規則**
+
+| 関数 | 必須シンボル | 期待命令規則 |
+| ---- | ------------ | ------------ |
+| `dot_i8_neon_dotprod` | `19dot_i8_neon_dotprod` | `sdot v[0-9]+\.4s`（s8x16->i32 dot-product-accumulate。1 件以上） |
+
+**self-test fixture**
+
+pass: `dot_i8_neon_dotprod` と同型（`vsetq_lane_s8::<0..15>` 昇順連鎖に
+よる `int8x16_t` 構築＋`vdotq_s32`）。禁止命令 0 件・`sdot v.4s` 1 件以上
+を確認する。
+fail: 関数名は `dot_i8_neon_dotprod` だが実体はスカラー逐次 wrapping 和
+（`sdot` 非搭載）——`fx_fail_i8_missing_instruction`（Issue #522）と同型の
+非 vacuous 検査対象。
+
+**aarch64 基線命令カウント（1.98.0 toolchain・`--emit asm` 実測。実ソース
+`isa/neon_i8.rs::dot_i8_neon_dotprod` の release ビルド）**
+
+`ldr=2 subs=2 sdot=1 addv=1 fmov=1` を含む（禁止パターン `mov v.[bhsd][`／
+`ins v`／`ld1 {}[n]` はいずれも 0 件）。レジスタ構築の採否比較（`vcombine_s8`
+＋`vcreate_s8` が `mov v.d[1], v.d[0]` を残し禁止パターンに抵触した実測、
+`vsetq_lane_s8` 連鎖が単一の `ldr q` へ畳み込まれた実測）は
+`docs/design/hnsw-sq8-resident.md`「Issue #525」節「レジスタ構築の実測
+比較」参照。
+
 ## 7. 既知の限界
 
 - 本ガードは「現行の LLVM が特定の書き方をどう最適化するか」を固定するもので

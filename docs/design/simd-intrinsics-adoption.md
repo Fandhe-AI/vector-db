@@ -230,7 +230,7 @@ target_feature として扱われるため `is_aarch64_feature_detected!` は
 | #513〜#516 | f16 常駐（`F16cToken`／`NeonFp16Token`） | 決定 1・決定 2・決定 3・決定 5（ANN 限定） | 同上 + 期待命令表拡張。#514 実装済み（`docs/design/hnsw-f16-resident.md` 参照。#515〔Recall ゲート〕・#516〔前後比較実測〕は未実施） |
 | #517〜#519 | 多アキュムレータ化 | 決定 5（オーナー判断条件） | 同上 + Recall ゲート再実測 |
 | #520〜#523 | SQ8・VNNI（`AvxVnniToken`／`Avx512VnniToken`） | 決定 1・決定 2・決定 3・決定 5 | 同上。#521（対称 SQ8 量子化・i8 常駐表現）・#522（VNNI 512bit／256bit・i16 widen フォールバックの整数 i8×i8 dot カーネル。`Avx2FmaToken` を widen 経路に再利用し新規トークンは `AvxVnniToken`／`Avx512VnniToken` の 2 種のみ）実装済み（`docs/design/hnsw-sq8-resident.md`「Issue #522」節参照。#523〔Recall ゲート同一閾値検証・前後比較〕は未実施） |
-| #524〜#526 | NEON dotprod（`NeonDotprodToken`） | 決定 3・決定 4（1.98 前提） | 同上 + aarch64 ゲート提案 |
+| #524〜#526 | NEON dotprod（`NeonDotprodToken`） | 決定 3・決定 4（1.98 前提） | #525 実装済み（`docs/design/hnsw-sq8-resident.md`「Issue #525」節参照） |
 | #527〜#529 | tail 処理統一 | 決定 2 | 同上 |
 | #530 | 前後比較 | — | [`benchmark-judgement-policy.md`](benchmark-judgement-policy.md) §3〜§5 準拠 |
 
