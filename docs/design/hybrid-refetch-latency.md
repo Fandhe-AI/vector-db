@@ -191,3 +191,9 @@ fail-closed の方針）。
 - 疎側再取得ループの再スコアリング回避（Issue #392）による本ベンチ
   （`make bench-hybrid`）の A/B 前後比較・受け入れ条件との対応は
   `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #392」節参照
+- 密側再取得ループの HNSW 結線（Issue #410）・再開型探索（Issue #505）の
+  SQL 表層（hnsw opt-in）計測モードを本ベンチへ追加し（Issue #506。
+  `BENCH_HYBRID_LATENCY_ENGINE` opt-in。既定モードの出力は不変）、
+  `sql::hnsw_hybrid::HnswDenseProvider` の前後比較・`masked_short` 再測定を
+  実施した。詳細・実測表は `docs/design/hnsw-hybrid-iterative-scan.md`
+  「前後比較実測（Issue #506）」節参照

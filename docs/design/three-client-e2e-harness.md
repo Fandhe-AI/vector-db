@@ -114,6 +114,24 @@ psql・psycopg・pg の導入自動化を確定させるには、pip/npm の実�
 判断の詳細は `simple_query.rs` モジュールコメント）。読み取り可視性の既定
 （`Public` のみ）は拡大していない。
 
+### Issue #454: 広域取得（ソートなしのフィルタ取得）の検証範囲
+
+`ORDER BY`／`USING PLAN` を伴わない `SELECT ... [WHERE ...] LIMIT n`（広域取得。
+契約の詳細は `docs/design/wide-retrieval-scan.md`）の wire 経由検証も同じ層分割に
+従う。
+
+- **層 A**（`crates/wire-server/tests/wire_scan.rs`）: 実行契約自体は engine 側
+  in-process 結合テスト（`sql_scan.rs`）が確定オラクルとして検証済みのため、
+  同じ規則（複数行の返却・`WHERE` 絞り込み・RLS 非漏えい・`USING MODE`／
+  `EXPLAIN` 前置の拒否・取得モードからの独立性）が wire フレーミング越しに
+  観測できることの確認に徹する。常時（`make ci`）実行される。
+- **層 B**（`crates/wire-server/tests/extended_syntax_e2e.rs::
+  three_clients_run_scan_where_nosort`）: 追加注入を要しないため素の
+  `wire-server` 起動で足りる。`seed_plain_docs`（単一テナント）に対する
+  代表ケース 1 本（bare `LIMIT` と、可視総数を超える `LIMIT` の 2 パターン）を
+  3 クライアントで確認する（層 A で確定済みの拒否経路・順列網羅を層 B へ
+  複製しない方針は TASK-165・TASK-168・TASK-82 と同じ）。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・

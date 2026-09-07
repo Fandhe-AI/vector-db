@@ -168,6 +168,12 @@ pub struct HnswIndexCacheStats {
     /// f16 の有限範囲（`|x| <= 65504.0`）を超える成分により `F32` へ自動縮退した
     /// 回数（Issue #514・D6。`builds` の内数）。
     pub f16_residency_fallbacks: u64,
+    /// `IndexedBase::build` が `ResidentPrecision::I8` を要求されたにもかかわらず
+    /// `sq8::fit_dim_params`／`sq8::encode_rows` の失敗（非有限成分・アロケーション
+    /// 失敗）により `F32` へ自動縮退した回数（Issue #521・D6 と同型。`builds`
+    /// の内数。`f16_residency_fallbacks` とは互いに排他——`precision` は
+    /// 1 クエリあたり単一の値のため両方が同時に加算されることはない）。
+    pub i8_residency_fallbacks: u64,
     /// マスク付き探索（`FullVisible`／`Subset` いずれの形状でも。
     /// [`crate::hnsw::HnswIndex::search_masked_with`]）が縮退なしで完走した際、
     /// 可視候補数が `ValidatedHnswParams::sparse_visited_max` 未満で
@@ -177,6 +183,22 @@ pub struct HnswIndexCacheStats {
     /// 上回りうる。テナント境界・可視カーディナリティ・索引ノード数等のテナント
     /// 存在情報には繋がらない——採否のみを数える）。
     pub sparse_visited_searches: u64,
+    /// `TraversalRegime::TwoHop`（ACORN-1・Issue #501）レジームで縮退なしに
+    /// 完走したマスク付き探索回数。`hits`／`subset_searches` とは独立に数える
+    /// 診断用カウンタ（`ValidatedHnswParams::acorn_max_visible_ratio` が
+    /// `None`（既定）の間は常に `0`）。
+    pub acorn_searches: u64,
+    /// `bridge_expand`（Issue #501）が受理・候補化した 2-hop ノード数の累計
+    /// （診断用。テナント境界・可視カーディナリティ等のテナント存在情報には
+    /// 繋がらない——採否のみを数える）。
+    pub acorn_expansions: u64,
+    /// hybrid 密側再取得ループが破棄候補ヒープ保持の再開型探索（Issue #505・
+    /// `crate::hnsw::ResumableMaskedSearch`）で完走したラウンド数の累計
+    /// （`sql::hnsw_hybrid::HnswDenseProvider` が同一クエリ・同一バッファへの
+    /// 2 回目以降の呼び出しで [`search_prepared_resumable`] の再開経路へ入り、
+    /// 縮退なしで完走した場合のみ計上する。テナント ID・行 ID・スコア等の
+    /// テナント存在情報には繋がらない——採否のみを数える診断用カウンタ）。
+    pub hybrid_resumed_rounds: u64,
     /// 現在キャッシュが保持しているエントリ数。
     pub entries: usize,
 }
@@ -198,17 +220,19 @@ impl IndexedBase {
     /// [`crate::hnsw::HnswIndex::build_parallel`] で構築する。索引ノード番号は
     /// `arena` のスロット番号と一致する（構築直後の世代においては
     /// `slot_of_node[node] == node` が常に成立する）。
-    /// `precision` は Issue #514 で追加した常駐精度 opt-in（既定 `F32`）。戻り値の
-    /// `bool` は「要求 `F16` が範囲外成分により `F32` へ自動縮退したか」
-    /// （D6。呼び出し元が `HnswIndexCacheStats::f16_residency_fallbacks` へ計上する
-    /// ために使う）。
+    /// `precision` は Issue #514（F16）・Issue #521（I8）で追加した常駐精度
+    /// opt-in（既定 `F32`）。戻り値の `bool` 2 つはそれぞれ「要求 `F16`／`I8`
+    /// が範囲外成分・非有限成分等により `F32` へ自動縮退したか」（D6。呼び出し元が
+    /// `HnswIndexCacheStats::f16_residency_fallbacks`／`i8_residency_fallbacks`
+    /// へ計上するために使う。`precision` は 1 クエリあたり単一の値のため両方が
+    /// 同時に `true` になることはない）。
     fn build(
         arena: &VectorArena,
         params: crate::hnsw::HnswParams,
         precision: crate::hnsw::ResidentPrecision,
         built_ctx: PolicyContext,
         built_table_generation: u64,
-    ) -> Result<(Self, bool), HnswError> {
+    ) -> Result<(Self, bool, bool), HnswError> {
         let index = HnswIndex::build_parallel_with_precision(
             params,
             precision,
@@ -217,6 +241,8 @@ impl IndexedBase {
             HNSW_BUILD_SEED,
         )?;
         let f16_fallback = precision == crate::hnsw::ResidentPrecision::F16
+            && index.resident_precision() == crate::hnsw::ResidentPrecision::F32;
+        let i8_fallback = precision == crate::hnsw::ResidentPrecision::I8
             && index.resident_precision() == crate::hnsw::ResidentPrecision::F32;
         let mut node_keys: Vec<RowKey> = Vec::with_capacity(arena.len());
         let mut key_to_node: HashMap<RowKey, u32> = HashMap::with_capacity(arena.len());
@@ -241,6 +267,7 @@ impl IndexedBase {
                 built_table_generation,
             },
             f16_fallback,
+            i8_fallback,
         ))
     }
 
@@ -289,6 +316,65 @@ fn below_full_scan_ratio(visible_in_index: usize, index_len: usize, ratio: Ratio
     }
 }
 
+/// マスク付き探索が可視カーディナリティ比 `visible_in_index / index_len` に
+/// 応じてどう振る舞うかを表す 3 区分（Issue #501・親 #500。ACORN-1 の
+/// 2-hop 展開〔`crate::hnsw::HopMode::TwoHop`〕を有効化する条件を、既存の
+/// `full_scan_ratio` 切替と単一情報源で判定する）。
+///
+/// - `PlainScan`: `below_full_scan_ratio` と同じ（アリーナ全体の brute-force）。
+/// - `OneHop`: 既存契約のマスク付き ANN 探索（`acorn_max_visible_ratio` が
+///   `None`、または比が `acorn_max_visible_ratio` を超える）。
+/// - `TwoHop`: `full_scan_ratio <= r <= acorn_max_visible_ratio` の区間
+///   （`ValidatedHnswParams::acorn_max_visible_ratio` が `Some` のときのみ
+///   到達しうる。既定 `None` の間は本レジームへ到達しない＝既存動作不変）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TraversalRegime {
+    PlainScan,
+    OneHop,
+    TwoHop,
+}
+
+impl TraversalRegime {
+    /// マスク付き探索へ渡す [`crate::hnsw::HopMode`]（`PlainScan` は探索自体を
+    /// 呼ばない呼び出し元の都合上 `OneHop` を返す。呼び出し元は `PlainScan` の
+    /// 場合は本値を使わず先に plain scan へ分岐する契約）。
+    pub(crate) fn hop(self) -> crate::hnsw::HopMode {
+        match self {
+            TraversalRegime::TwoHop => crate::hnsw::HopMode::TwoHop,
+            TraversalRegime::PlainScan | TraversalRegime::OneHop => crate::hnsw::HopMode::OneHop,
+        }
+    }
+}
+
+/// [`TraversalRegime`] を可視カーディナリティ比・両閾値から判定する（Issue #501）。
+/// `full_scan_ratio` 未満は常に `PlainScan`（[`below_full_scan_ratio`] と同じ
+/// 判定式・同じ fail-closed 挙動）。`acorn_max_visible_ratio` が `Some(acorn)`
+/// のとき、比が `acorn` 以下（`visible_in_index * acorn.denominator <=
+/// index_len * acorn.numerator`）なら `TwoHop`、そうでなければ `OneHop`。
+/// オーバーフロー時は fail-closed に `OneHop`（既存契約側）へ倒す
+/// （`u32 * u32` は `u64` へ必ず収まるため、この分岐は `index_len`／
+/// `visible_in_index` が `u32` 範囲外の呼び出し元防御としてのみ働く）。
+pub(crate) fn traversal_regime_for(
+    visible_in_index: usize,
+    index_len: usize,
+    full_scan_ratio: Ratio,
+    acorn_max_visible_ratio: Option<Ratio>,
+) -> TraversalRegime {
+    if below_full_scan_ratio(visible_in_index, index_len, full_scan_ratio) {
+        return TraversalRegime::PlainScan;
+    }
+    let Some(acorn) = acorn_max_visible_ratio else {
+        return TraversalRegime::OneHop;
+    };
+    match (
+        (visible_in_index as u64).checked_mul(acorn.denominator as u64),
+        (index_len as u64).checked_mul(acorn.numerator as u64),
+    ) {
+        (Some(lhs), Some(rhs)) if lhs <= rhs => TraversalRegime::TwoHop,
+        _ => TraversalRegime::OneHop,
+    }
+}
+
 /// 世代 `generation` の `arena` に対する `base` の差分オーバーレイ。
 pub(crate) struct Overlay {
     generation: u64,
@@ -326,6 +412,11 @@ pub(crate) struct Overlay {
     /// `search_with_overlay` は `search_masked` を呼ばず直接 plain scan へ
     /// 縮退する。
     mask_splits_graph: bool,
+    /// 本世代の可視カーディナリティ比から導出した [`TraversalRegime`]
+    /// （Issue #501）。`search_with_overlay` が plain scan／マスク付き ANN 探索
+    /// （さらにその hop）を選ぶ単一情報源——`below_full_scan_ratio` の
+    /// 再計算をここへ一本化する。
+    regime: TraversalRegime,
 }
 
 impl Overlay {
@@ -347,6 +438,7 @@ impl Overlay {
         arena: &VectorArena,
         generation: u64,
         full_scan_ratio: Ratio,
+        acorn_max_visible_ratio: Option<Ratio>,
     ) -> Self {
         let dim = arena.dim() as usize;
         let mut slot_of_node = vec![STALE_SLOT; base.index.len()];
@@ -409,12 +501,18 @@ impl Overlay {
         // を選ぶため、その場合は観測されない値として BFS を省略する（Issue #488。
         // `visible_in_index == 0` はこの分岐に必ず含まれる——0 件のマスクで
         // `is_mask_fully_reachable` が自明に `true` を返す旧来の性質は維持される）。
-        let mask_splits_graph =
-            if below_full_scan_ratio(visible_in_index, base.index.len(), full_scan_ratio) {
-                false
-            } else {
-                !base.index.is_mask_fully_reachable(&visible_mask)
-            };
+        let regime = traversal_regime_for(
+            visible_in_index,
+            base.index.len(),
+            full_scan_ratio,
+            acorn_max_visible_ratio,
+        );
+        let mask_splits_graph = match regime {
+            TraversalRegime::PlainScan => false,
+            TraversalRegime::OneHop | TraversalRegime::TwoHop => !base
+                .index
+                .is_mask_fully_reachable_with(&visible_mask, regime.hop()),
+        };
         Overlay {
             generation,
             arena_len: arena.len(),
@@ -425,6 +523,7 @@ impl Overlay {
             visible_mask,
             visible_in_index,
             mask_splits_graph,
+            regime,
         }
     }
 
@@ -526,7 +625,11 @@ pub(crate) struct HnswIndexCache {
     hybrid_queries: AtomicU64,
     hybrid_rounds_max: AtomicU64,
     f16_residency_fallbacks: AtomicU64,
+    i8_residency_fallbacks: AtomicU64,
     sparse_visited_searches: AtomicU64,
+    acorn_searches: AtomicU64,
+    acorn_expansions: AtomicU64,
+    hybrid_resumed_rounds: AtomicU64,
 }
 
 /// [`HnswIndexCache::lookup`] の結果。
@@ -563,7 +666,11 @@ impl HnswIndexCache {
             hybrid_queries: AtomicU64::new(0),
             hybrid_rounds_max: AtomicU64::new(0),
             f16_residency_fallbacks: AtomicU64::new(0),
+            i8_residency_fallbacks: AtomicU64::new(0),
             sparse_visited_searches: AtomicU64::new(0),
+            acorn_searches: AtomicU64::new(0),
+            acorn_expansions: AtomicU64::new(0),
+            hybrid_resumed_rounds: AtomicU64::new(0),
         }
     }
 
@@ -871,7 +978,11 @@ impl HnswIndexCache {
             hybrid_queries: self.hybrid_queries.load(Ordering::Relaxed),
             hybrid_rounds_max: self.hybrid_rounds_max.load(Ordering::Relaxed),
             f16_residency_fallbacks: self.f16_residency_fallbacks.load(Ordering::Relaxed),
+            i8_residency_fallbacks: self.i8_residency_fallbacks.load(Ordering::Relaxed),
             sparse_visited_searches: self.sparse_visited_searches.load(Ordering::Relaxed),
+            acorn_searches: self.acorn_searches.load(Ordering::Relaxed),
+            acorn_expansions: self.acorn_expansions.load(Ordering::Relaxed),
+            hybrid_resumed_rounds: self.hybrid_resumed_rounds.load(Ordering::Relaxed),
             entries,
         }
     }
@@ -981,11 +1092,17 @@ pub(crate) fn prepare_full_visible(
                 ctx.clone(),
                 current_generation,
             ) {
-                Ok((built, f16_fallback)) => {
+                Ok((built, f16_fallback, i8_fallback)) => {
                     if f16_fallback {
                         access
                             .cache
                             .f16_residency_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    if i8_fallback {
+                        access
+                            .cache
+                            .i8_residency_fallbacks
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     access.cache.record_base(access.storage, table, built)
@@ -1021,6 +1138,7 @@ pub(crate) fn prepare_full_visible(
         arena,
         current_generation,
         access.provider.full_scan_ratio(),
+        access.provider.acorn_max_visible_ratio(),
     );
     if overlay.needs_rebuild(n) {
         access.cache.builds.fetch_add(1, Ordering::Relaxed);
@@ -1031,11 +1149,17 @@ pub(crate) fn prepare_full_visible(
             ctx.clone(),
             current_generation,
         ) {
-            Ok((built, f16_fallback)) => {
+            Ok((built, f16_fallback, i8_fallback)) => {
                 if f16_fallback {
                     access
                         .cache
                         .f16_residency_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if i8_fallback {
+                    access
+                        .cache
+                        .i8_residency_fallbacks
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 access.cache.rebuilds.fetch_add(1, Ordering::Relaxed);
@@ -1050,7 +1174,22 @@ pub(crate) fn prepare_full_visible(
                 // （§`Overlay::mask_splits_graph` ドキュメンテーションコメント
                 // 参照。`repair_reachability` が層 0 の entry point 起点到達性を
                 // 保証する契約に依拠しすぎず、構築直後の索引でも実際に検証する）。
-                let identity_splits_graph = !new_base.index.is_mask_fully_reachable(&identity_mask);
+                // regime（Issue #501）は「恒等マスク」＝可視全ノードのため
+                // `visible_in_index == index_len` で `traversal_regime_for` から
+                // 導出し、分断検査は regime が要求する hop で行う（`Overlay::
+                // compute` と同じ単一情報源）。
+                let identity_regime = traversal_regime_for(
+                    new_base.index.len(),
+                    new_base.index.len(),
+                    access.provider.full_scan_ratio(),
+                    access.provider.acorn_max_visible_ratio(),
+                );
+                let identity_splits_graph = match identity_regime {
+                    TraversalRegime::PlainScan => false,
+                    TraversalRegime::OneHop | TraversalRegime::TwoHop => !new_base
+                        .index
+                        .is_mask_fully_reachable_with(&identity_mask, identity_regime.hop()),
+                };
                 let identity_overlay = Arc::new(Overlay {
                     generation: current_generation,
                     arena_len: arena.len(),
@@ -1061,6 +1200,7 @@ pub(crate) fn prepare_full_visible(
                     visible_mask: identity_mask,
                     visible_in_index: new_base.index.len(),
                     mask_splits_graph: identity_splits_graph,
+                    regime: identity_regime,
                 });
                 record_overlay_for(access, table, &new_base, Arc::clone(&identity_overlay));
                 PreparedHnswSearch::Indexed {
@@ -1138,6 +1278,209 @@ pub(crate) fn search_prepared(
             provider.search(input)
         }
     }
+}
+
+/// クエリ 1 本の寿命だけ [`sql::hnsw_hybrid::HnswDenseProvider`] が保持する、
+/// hybrid 密側再取得ループの破棄候補ヒープ保持型再開状態（Issue #505）。
+/// `HnswDenseProvider` は同一 `PreparedHnswSearch`（`base`／`overlay`）を
+/// クエリ全体で固定して保持するため、本状態を構築した索引・オーバーレイと
+/// 次ラウンドで参照するそれらが食い違う心配はない（`sql::hnsw_hybrid` モジュール
+/// ドキュメンテーションコメント「fail-closed な受理条件」参照）——クエリ・
+/// `ef` 単調性の整合検査は [`crate::hnsw::HnswIndex::search_masked_resume`]
+/// 自身が担う。
+pub(crate) struct HnswResumeState {
+    search: crate::hnsw::ResumableMaskedSearch,
+}
+
+/// [`search_prepared`] の再開型版（Issue #505・親 #504。`sql::hnsw_hybrid::
+/// HnswDenseProvider` の 2 ラウンド目以降が呼ぶ）。`PreparedHnswSearch::Indexed`
+/// （`TraversalRegime::OneHop` に限る。`TwoHop`・前段ガード〔アリーナ不一致・
+/// `PlainScan`・`mask_splits_graph`・`k > MAX_EF`〕はいずれも状態化せず既存の
+/// 単発経路〔[`search_with_overlay`]／brute-force〕へ縮退し `*resume` を破棄する）
+/// に限り、`resume` が `Some` ならグラフ探索を再開し、`None`（初回、または
+/// 直前ラウンドが前段ガードで縮退した）ならラウンド 1 として開始する。
+/// 索引の生の探索結果を受け取ってからの後段（結果件数充足検査・スロット写像・
+/// delta マージ・ソート・成功統計）は [`finish_indexed_search`] を単発経路と
+/// 共有する。
+///
+/// 縮退なしで再開型探索（`resume` が `Some` だった側）が完走した場合のみ
+/// `hybrid_resumed_rounds` を加算する（診断用。テナント境界・存在情報には
+/// 繋がらない）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_prepared_resumable(
+    access: &HnswCacheAccess<'_>,
+    prepared: &PreparedHnswSearch,
+    provider: &dyn SearchProvider,
+    arena: &VectorArena,
+    slot_ids: &[u64],
+    query: &[f32],
+    k: usize,
+    resume: &mut Option<HnswResumeState>,
+) -> Result<Vec<CandidateHit>, KernelError> {
+    let (base, overlay, success_stat) = match prepared {
+        PreparedHnswSearch::Indexed {
+            base,
+            overlay,
+            success_stat,
+        } => (base, overlay, *success_stat),
+        PreparedHnswSearch::FullScan => {
+            *resume = None;
+            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            let input = SearchInput {
+                ids: slot_ids,
+                vectors: arena.vectors(),
+                dim: arena.dim(),
+                query,
+                k,
+            };
+            return provider.search(input);
+        }
+        PreparedHnswSearch::PlainScanBelowRatio => {
+            *resume = None;
+            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
+            let input = SearchInput {
+                ids: slot_ids,
+                vectors: arena.vectors(),
+                dim: arena.dim(),
+                query,
+                k,
+            };
+            return provider.search(input);
+        }
+    };
+
+    if overlay.arena_len != arena.len() {
+        *resume = None;
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        return full_scan_with_arena(provider, arena, query, k);
+    }
+    if overlay.regime == TraversalRegime::PlainScan {
+        *resume = None;
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
+        return full_scan_with_arena(provider, arena, query, k);
+    }
+    if overlay.mask_splits_graph {
+        *resume = None;
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access
+            .cache
+            .mask_splits_graph
+            .fetch_add(1, Ordering::Relaxed);
+        return full_scan_with_arena(provider, arena, query, k);
+    }
+    if k > crate::hnsw::MAX_EF {
+        *resume = None;
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access
+            .cache
+            .ef_cap_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+        return full_scan_with_arena(provider, arena, query, k);
+    }
+
+    let hop = overlay.regime.hop();
+    if hop == crate::hnsw::HopMode::TwoHop {
+        // 再開型は HopMode::OneHop 限定（`crate::hnsw::ResumableMaskedSearch`
+        // ドキュメンテーションコメント参照）。TwoHop レジームのラウンドは
+        // 状態化せず既存の単発経路（`bridge_expand` を含む完全な探索）へ倒す。
+        *resume = None;
+        return search_with_overlay(
+            access,
+            Arc::clone(base),
+            Arc::clone(overlay),
+            provider,
+            arena,
+            query,
+            k,
+            success_stat,
+        );
+    }
+
+    let ef = access.provider.effective_ef(k);
+    let mask = Some(&overlay.visible_mask);
+
+    let (index_hits, used_resume) = if let Some(mut state) = resume.take() {
+        match base
+            .index
+            .search_masked_resume(&mut state.search, query, k, ef, mask)
+        {
+            Ok(hits) => {
+                *resume = Some(state);
+                (hits, true)
+            }
+            Err(_) => {
+                // 整合検査に失敗（別クエリ・ef 減少等。呼び出し元
+                // `HnswDenseProvider` は同一クエリを固定して渡す契約のため
+                // 通常到達しないが、fail-closed に状態を捨ててラウンド 1 から
+                // やり直す）。
+                match base
+                    .index
+                    .search_masked_resumable_start(query, k, ef, mask, hop)
+                {
+                    Ok((hits, new_state)) => {
+                        *resume = Some(HnswResumeState { search: new_state });
+                        (hits, false)
+                    }
+                    Err(_) => {
+                        *resume = None;
+                        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+                        return full_scan_with_arena(provider, arena, query, k);
+                    }
+                }
+            }
+        }
+    } else {
+        match base
+            .index
+            .search_masked_resumable_start(query, k, ef, mask, hop)
+        {
+            Ok((hits, new_state)) => {
+                *resume = Some(HnswResumeState { search: new_state });
+                (hits, false)
+            }
+            Err(_) => {
+                *resume = None;
+                access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+                return full_scan_with_arena(provider, arena, query, k);
+            }
+        }
+    };
+
+    // `fallbacks`（キャッシュ全体で共有される `AtomicU64`）の呼び出し前後
+    // 差分では、並行クエリが同時に別ラウンドで縮退した場合に本呼び出し自身が
+    // 縮退していないのに差分が非 0 になり得る（codex-review P2 指摘対応・
+    // PR #619）。`finish_indexed_search` に呼び出しローカルな `Cell<bool>` を
+    // 渡し、当該呼び出しが実際にどこかの分岐で縮退したかを直接判定する。
+    let fell_back = std::cell::Cell::new(false);
+    let result = finish_indexed_search(
+        access,
+        base,
+        overlay,
+        provider,
+        arena,
+        query,
+        k,
+        success_stat,
+        index_hits,
+        None,
+        hop,
+        0,
+        &fell_back,
+    );
+    // 縮退なし（`finish_indexed_search` が `fell_back` を立てずに完走した）で
+    // 再開経路（`resume` が `Some` だった側）を通ったラウンドのみ計上する
+    // （診断用カウンタ。§`HnswIndexCacheStats::hybrid_resumed_rounds`）。
+    // `result` がエラーの場合（codex-review P2 指摘）は「縮退なしで完走」の
+    // 契約を満たさないため、`fell_back` が立っていなくても計上しない。
+    if used_resume && !fell_back.get() && result.is_ok() {
+        access
+            .cache
+            .hybrid_resumed_rounds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 
 /// DISTANCE 段の索引済み探索＋未索引分 brute-force 併用の本体（Issue #408。
@@ -1248,6 +1591,7 @@ pub(crate) fn prepare_subset(
         arena,
         current_generation,
         access.provider.full_scan_ratio(),
+        access.provider.acorn_max_visible_ratio(),
     ));
     PreparedHnswSearch::Indexed {
         base,
@@ -1488,15 +1832,12 @@ fn search_with_overlay(
         return full_scan_with_arena(provider, arena, query, k);
     }
 
-    // 可視カーディナリティ切替（Issue #409・`ValidatedHnswParams::full_scan_ratio`）:
-    // `visible_in_index / index.len() < full_scan_ratio` なら plain scan
-    // （アリーナ全体の brute-force）。判定式は [`below_full_scan_ratio`] に
-    // 集約し、`Overlay::compute`（分断検査省略判定）・`prepare_subset`（早期
-    // 打ち切り）と同一の式を共有する（Issue #488）。
-    let ratio = access.provider.full_scan_ratio();
-    let index_len = base.index.len();
-    let visible_in_index = overlay.visible_in_index;
-    if below_full_scan_ratio(visible_in_index, index_len, ratio) {
+    // 可視カーディナリティ切替（Issue #409・`ValidatedHnswParams::full_scan_ratio`。
+    // Issue #501 で `TraversalRegime` へ一般化）: `overlay.regime` が
+    // `Overlay::compute`（分断検査省略判定）・`prepare_subset`（早期打ち切り）
+    // と同一の判定式（[`below_full_scan_ratio`] 由来）を共有する単一情報源
+    // （Issue #488 の方針をそのまま踏襲。ここでの再計算を撤去した）。
+    if overlay.regime == TraversalRegime::PlainScan {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
         access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
         return full_scan_with_arena(provider, arena, query, k);
@@ -1536,22 +1877,31 @@ fn search_with_overlay(
 
     let ef = access.provider.effective_ef(k);
     // visited 集合の切替（Issue #497）: `access.provider.sparse_visited_max()`
-    // は構築時の静的設定値（既定 0＝常に dense）を `HnswIndex::search_masked_with`
+    // は構築時の静的設定値（既定 0＝常に dense）を `HnswIndex::search_masked_with_hop`
     // へそのまま渡す。選ばれた実装は `scratch.last_visited_kind()` から読み、
     // 縮退なしで完走した場合のみ `sparse_visited_searches` へ計上する
     // （下の `masked_short`／`arena_identity_mismatch_guard` 等の縮退判定より
     // 後段で計上するため、クロージャ内で `Option<VisitedKind>` を一緒に返す）。
-    let (index_hits, visited_kind) = SEARCH_SCRATCH.with(|scratch| {
+    // `hop`（Issue #501）は `overlay.regime`（`Overlay::compute` が
+    // 世代毎に 1 回だけ判定した単一情報源）からそのまま導出する——本関数側で
+    // 独自に可視カーディナリティ比を再判定しない。
+    let hop = overlay.regime.hop();
+    let (index_hits, visited_kind, acorn_expansions) = SEARCH_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        let result = base.index.search_masked_with(
+        let result = base.index.search_masked_with_hop(
             query,
             k,
             ef,
             Some(&overlay.visible_mask),
             access.provider.sparse_visited_max(),
+            hop,
             &mut scratch,
         );
-        (result, scratch.last_visited_kind())
+        (
+            result,
+            scratch.last_visited_kind(),
+            scratch.last_acorn_expansions(),
+        )
     });
     let index_hits = match index_hits {
         Ok(hits) => hits,
@@ -1561,15 +1911,72 @@ fn search_with_overlay(
         }
     };
 
+    // 単発経路は当該呼び出し限定の縮退判定を使わない（診断用
+    // `hybrid_resumed_rounds` は再開型経路 `search_prepared_resumable` のみが
+    // 参照する）ため、ここでは使い捨ての `Cell` を渡す。
+    let fell_back = std::cell::Cell::new(false);
+    finish_indexed_search(
+        access,
+        &base,
+        &overlay,
+        provider,
+        arena,
+        query,
+        k,
+        success_stat,
+        index_hits,
+        visited_kind,
+        hop,
+        acorn_expansions,
+        &fell_back,
+    )
+}
+
+/// [`search_with_overlay`]（単発探索）・[`search_prepared_resumable`]
+/// （Issue #505 の再開型探索。`sql::hnsw_hybrid::HnswDenseProvider`）が共有する
+/// 後段（結果件数の充足検査・スロット写像＋`(tenant_id, id)` 照合・
+/// `kernel::dot` 再計算・未索引分 delta マージ・ソート/重複排除/truncate・
+/// 成功統計）。索引の生の探索結果（`index_hits`）を受け取るところから開始する
+/// ため、呼び出し元が単発 [`crate::hnsw::HnswIndex::search_masked_with_hop`]・
+/// 再開型 [`crate::hnsw::HnswIndex::search_masked_resumable_start`]／
+/// [`Self::search_masked_resume`] のどちらを使ったかによらず同一の後段契約
+/// （エラー・統計・出力順）を保つ。
+///
+/// 本関数自体は再開状態（`ResumableMaskedSearch`）に一切触れない——本関数が
+/// 内部で plain scan／brute-force へ縮退した場合でも、それは「この 1 ラウンドの
+/// 出力を brute-force で埋め合わせた」だけであり、既にグラフ探索を終えて
+/// `resume` へ格納済みの状態（`candidates`／`discarded` 等）自体は引き続き
+/// 有効（次ラウンドも再開できる）。再開状態の破棄が必要なのは、そもそも
+/// [`crate::hnsw::HnswIndex::search_masked_resumable_start`]／
+/// `search_masked_resume` を呼ばずに済ませた前段ガード
+/// （`search_prepared_resumable` 側。アリーナ不一致・`PlainScan`・
+/// `mask_splits_graph`・`k > MAX_EF`）だけである。
+#[allow(clippy::too_many_arguments)]
+fn finish_indexed_search(
+    access: &HnswCacheAccess<'_>,
+    base: &IndexedBase,
+    overlay: &Overlay,
+    provider: &dyn SearchProvider,
+    arena: &VectorArena,
+    query: &[f32],
+    k: usize,
+    success_stat: OverlaySuccessStat,
+    index_hits: Vec<crate::kernel::CandidateHit>,
+    visited_kind: Option<crate::hnsw::VisitedKind>,
+    hop: crate::hnsw::HopMode,
+    acorn_expansions: u64,
+    fell_back: &std::cell::Cell<bool>,
+) -> Result<Vec<CandidateHit>, KernelError> {
     // マスク付き探索の結果件数が「可視ノード数と要求 k の小さい方」に満たない
     // 場合、ビーム幅内でグラフ探索が可視ノードを十分辿り切れなかったことを
     // 意味する（§`docs/design/hnsw-rls-cardinality-switch.md`「masked_short」節）。
     // `#410` の担当である `ef` 拡張再探索は行わず、fail-closed に plain scan へ
     // 縮退して k 件充足を保証する。
-    let expected = k.min(visible_in_index);
+    let expected = k.min(overlay.visible_in_index);
     if index_hits.len() < expected {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
         access.cache.masked_short.fetch_add(1, Ordering::Relaxed);
+        fell_back.set(true);
         return full_scan_with_arena(provider, arena, query, k);
     }
 
@@ -1578,6 +1985,7 @@ fn search_with_overlay(
         let node = hit.id as u32;
         let Some(&slot) = overlay.slot_of_node.get(node as usize) else {
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
         if slot == STALE_SLOT {
@@ -1587,21 +1995,25 @@ fn search_with_overlay(
             // マスクとオーバーレイの不整合という想定外事態を fail-closed に
             // 全件 brute-force へ倒す（黙って握りつぶさない）。
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         }
         let slot_usize = slot as usize;
         let Some(node_key) = base.node_keys.get(node as usize) else {
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
         let arena_tenant = arena.tenant_id(slot_usize);
         let arena_id = arena.ids().get(slot_usize).copied();
         if arena_tenant != Some(node_key.0.as_str()) || arena_id != Some(node_key.1) {
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         }
         let Some(vec_at_slot) = arena.vector(slot_usize) else {
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
         let score = crate::kernel::dot(vec_at_slot, query);
@@ -1645,6 +2057,17 @@ fn search_with_overlay(
             .cache
             .sparse_visited_searches
             .fetch_add(1, Ordering::Relaxed);
+    }
+    // `TraversalRegime::TwoHop`（ACORN-1・Issue #501）で縮退なしに完走した
+    // 場合のみ `acorn_searches`／`acorn_expansions` を計上する（`hits`／
+    // `subset_searches` と同じく独立カウンタ。既定 `acorn_max_visible_ratio ==
+    // None` の間は `hop` が常に `OneHop` のためこの分岐へ到達しない）。
+    if hop == crate::hnsw::HopMode::TwoHop {
+        access.cache.acorn_searches.fetch_add(1, Ordering::Relaxed);
+        access
+            .cache
+            .acorn_expansions
+            .fetch_add(acorn_expansions, Ordering::Relaxed);
     }
     Ok(mapped)
 }
@@ -2228,6 +2651,7 @@ mod tests {
                 numerator: 1,
                 denominator: 10,
             },
+            None,
         );
 
         // id=1 は変更なしなのでどこかのノードが失効していない（stale_nodes は id=2
@@ -2302,6 +2726,7 @@ mod tests {
             visible_mask,
             visible_in_index,
             mask_splits_graph: false,
+            regime: TraversalRegime::OneHop,
         });
 
         let access = HnswCacheAccess {
@@ -2382,6 +2807,7 @@ mod tests {
             visible_mask,
             visible_in_index,
             mask_splits_graph: false,
+            regime: TraversalRegime::OneHop,
         });
         let access = HnswCacheAccess {
             storage: &storage,
@@ -2791,6 +3217,146 @@ mod tests {
         }
     }
 
+    /// Issue #521: I8（SQ8）常駐 opt-in（`ValidatedHnswParams::
+    /// with_resident_precision(I8)`）で `IndexedBase::build` が実際に索引
+    /// 探索へ到達し（非 vacuous）、`i8_residency_fallbacks == 0` であることを
+    /// 確認する。加えて各ヒットのスコアが既定エンジン（f32 brute-force）の
+    /// 同 id のスコアと `to_bits()` 一致すること（索引ヒットの最終スコアは
+    /// 常に `kernel::dot` による f32 アリーナ再計算）を固定する
+    /// （f16 版 `f16_resident_precision_hits_the_ann_path_and_matches_
+    /// default_engine_scores_exactly` と同型）。
+    #[test]
+    fn i8_resident_precision_hits_the_ann_path_and_matches_default_engine_scores_exactly() {
+        let path = unique_db_path("hnsw-cache-i8-resident");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let c = ctx("tenant-a");
+
+        let embeddings: Vec<[f32; 4]> = (0..MIN_INDEXED_ROWS)
+            .map(|i| {
+                [
+                    (i as f32) * 0.001,
+                    ((i * 7) % 997) as f32 * 0.001,
+                    ((i * 13) % 991) as f32 * 0.001,
+                    ((i * 29) % 983) as f32 * 0.001,
+                ]
+            })
+            .collect();
+        let rows: Vec<(u64, RowInput<'_>)> = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                (
+                    i as u64,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: e.as_slice(),
+                        metadata: &[],
+                    },
+                )
+            })
+            .collect();
+        let op_id = crate::recovery::required_op_id::OperationId::parse("hnsw-cache-i8-resident")
+            .expect("valid operation_id");
+        crate::tenant::insert_rows(&storage, "docs", &c, &rows, &op_id).expect("bulk insert");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        assert!(arena.len() >= MIN_INDEXED_ROWS);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+
+        let cache = HnswIndexCache::new();
+        let i8_params = crate::hnsw::ValidatedHnswParams::default()
+            .with_resident_precision(crate::hnsw::ResidentPrecision::I8);
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(i8_params),
+        };
+        let ann_provider = crate::kernel::CpuScalarProvider;
+        let default_provider = crate::kernel::CpuScalarProvider;
+        let query = [0.5, 0.25, 0.1, 0.9];
+
+        // 1 回目（Miss -> build）・2 回目（Ready）の双方が成功すること。
+        let first = search_or_fallback(
+            &access,
+            &read_txn,
+            "docs",
+            &c,
+            &arena,
+            &slot_ids,
+            &ann_provider,
+            &query,
+            10,
+        )
+        .expect("warm-up query (Miss -> build) should succeed");
+        let ann_hits = search_or_fallback(
+            &access,
+            &read_txn,
+            "docs",
+            &c,
+            &arena,
+            &slot_ids,
+            &ann_provider,
+            &query,
+            10,
+        )
+        .expect("second query (Ready) should succeed");
+        assert!(!first.is_empty());
+        assert!(!ann_hits.is_empty(), "non-vacuous: must return hits");
+
+        let stats = cache.stats();
+        assert!(
+            stats.hits >= 1,
+            "I8 resident precision must still reach the indexed ANN search path \
+             (Ready + non-degraded), got stats={stats:?}"
+        );
+        assert_eq!(
+            stats.i8_residency_fallbacks, 0,
+            "embeddings in this fixture are finite and must not trigger the F32 \
+             fallback (D6 と同型。Issue #521)"
+        );
+
+        // 索引ヒットの最終スコアは常に f32 アリーナ再計算のため、i8 常駐の
+        // 候補生成は探索順序にのみ影響し、返るスコア自体は既定エンジンと
+        // ビット一致する。k=10 baseline search を id 突き合わせに使うと、
+        // ANN が（近似探索ゆえに）その baseline の上位 10 件に含まれない
+        // id を返した場合に検証が黙ってスキップされてしまう（PR #617
+        // codex-review P2 指摘）。`slot_ids` は `0..arena.len()` の恒等
+        // 写像（id == arena 上の行インデックス）であることを利用し、
+        // 各 ANN ヒットの期待スコアを baseline の Top-k 集合に頼らず
+        // `arena.vector(id)` から `kernel::dot` で直接算出することで、
+        // 全ヒットが必ず検証される（ID 不在は arena 不変条件違反として
+        // 即座に panic）。`default_provider` を使った k=10 baseline
+        // search 自体は非 vacuous 性（結果が空でないこと）の確認にのみ残す。
+        let baseline = default_provider
+            .search(crate::kernel::SearchInput {
+                ids: &slot_ids,
+                vectors: arena.vectors(),
+                dim: arena.dim(),
+                query: &query,
+                k: 10,
+            })
+            .expect("baseline search must succeed");
+        assert!(!baseline.is_empty(), "baseline search must be non-vacuous");
+        for hit in &ann_hits {
+            let expected_vector = arena
+                .vector(hit.id as usize)
+                .unwrap_or_else(|| panic!("ann hit id={} must exist in arena", hit.id));
+            let expected = crate::kernel::dot(expected_vector, &query);
+            assert_eq!(
+                hit.score.to_bits(),
+                expected.to_bits(),
+                "id={} ann_score={} expected_score={}",
+                hit.id,
+                hit.score,
+                expected
+            );
+        }
+    }
+
     #[test]
     fn record_overlay_for_marks_uncacheable_when_oversized() {
         // Cursor Bugbot 指摘対応（PR #434「Oversized overlay skips negative
@@ -2840,6 +3406,7 @@ mod tests {
             visible_mask,
             visible_in_index,
             mask_splits_graph: false,
+            regime: TraversalRegime::OneHop,
         });
         assert!(overlay.approx_heap_bytes() > MAX_HNSW_CACHE_TOTAL_BYTES);
 
@@ -3150,5 +3717,134 @@ mod tests {
             "arena.len() / index.len() = 0.95 >= full_scan_ratio = 0.6 では \
              早期打ち切りを踏まず Overlay::compute 経由の Indexed を返すはず"
         );
+    }
+
+    /// Issue #505: `search_prepared_resumable` を同一クエリ・`k` 倍増で
+    /// 複数ラウンド呼ぶと 2 ラウンド目以降が破棄候補ヒープ保持型の再開型探索を
+    /// 通り、`hybrid_resumed_rounds` が非 vacuous に計上され `builds` は増えず、
+    /// 各ラウンドの返却が `len <= k`・score 降順・id 昇順・可視集合内・一意で
+    /// あることを固定する。
+    #[test]
+    fn search_prepared_resumable_reuses_graph_scan_across_rounds() {
+        let path = unique_db_path("hnsw-cache-resumable-rounds");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        for i in 0..2_000u64 {
+            let v = i as f32;
+            seed_row(
+                &storage,
+                "docs",
+                i,
+                "tenant-a",
+                &[v, v + 1.0, v + 2.0, v + 3.0],
+            );
+        }
+        let c = ctx("tenant-a");
+        let cache = HnswIndexCache::new();
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+        };
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+        let read_txn = storage.db().begin_read().unwrap();
+        let prepared = prepare_full_visible(&access, &read_txn, "docs", &c, &arena);
+        let builds_after_prepare = cache.stats().builds;
+
+        let provider = crate::kernel::CpuScalarProvider;
+        let mut resume: Option<HnswResumeState> = None;
+        let query = [0.0f32, 1.0, 2.0, 3.0];
+        for k in [10usize, 20, 40] {
+            let hits = search_prepared_resumable(
+                &access,
+                &prepared,
+                &provider,
+                &arena,
+                &slot_ids,
+                &query,
+                k,
+                &mut resume,
+            )
+            .expect("resumable search succeeds");
+            assert!(hits.len() <= k);
+            assert!(hits.windows(2).all(
+                |w| w[0].score >= w[1].score && (w[0].score > w[1].score || w[0].id < w[1].id)
+            ));
+            let mut ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+            let dedup_len = {
+                ids.sort_unstable();
+                ids.dedup();
+                ids.len()
+            };
+            assert_eq!(dedup_len, hits.len(), "hits must be unique by id");
+            for h in &hits {
+                assert!((h.id as usize) < arena.len());
+            }
+        }
+
+        let stats = cache.stats();
+        assert_eq!(stats.builds, builds_after_prepare, "prepare must run once");
+        assert!(
+            stats.hybrid_resumed_rounds >= 1,
+            "at least the 2nd/3rd rounds should reuse the previous graph scan"
+        );
+    }
+
+    /// Issue #505: `k > MAX_EF` のラウンドは再開型探索を試みず状態を破棄する
+    /// （`search_prepared` の既存 `ef_cap_fallbacks` 縮退契約と同じ挙動）。
+    #[test]
+    fn search_prepared_resumable_resets_state_when_k_exceeds_max_ef() {
+        let path = unique_db_path("hnsw-cache-resumable-ef-cap");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        for i in 0..2_000u64 {
+            let v = i as f32;
+            seed_row(
+                &storage,
+                "docs",
+                i,
+                "tenant-a",
+                &[v, v + 1.0, v + 2.0, v + 3.0],
+            );
+        }
+        let c = ctx("tenant-a");
+        let cache = HnswIndexCache::new();
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+        };
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+        let read_txn = storage.db().begin_read().unwrap();
+        let prepared = prepare_full_visible(&access, &read_txn, "docs", &c, &arena);
+
+        let provider = crate::kernel::CpuScalarProvider;
+        let mut resume: Option<HnswResumeState> = None;
+        let query = [0.0f32, 1.0, 2.0, 3.0];
+        let over_max_ef = crate::hnsw::MAX_EF + 1;
+        let hits = search_prepared_resumable(
+            &access,
+            &prepared,
+            &provider,
+            &arena,
+            &slot_ids,
+            &query,
+            over_max_ef,
+            &mut resume,
+        )
+        .expect("full scan succeeds");
+        assert_eq!(hits.len(), arena.len().min(over_max_ef));
+        assert!(
+            resume.is_none(),
+            "ef_cap_fallbacks must discard resume state"
+        );
+        assert_eq!(cache.stats().ef_cap_fallbacks, 1);
+        assert_eq!(cache.stats().hybrid_resumed_rounds, 0);
     }
 }

@@ -117,6 +117,28 @@ mod x86_block4;
 /// `unsafe` 呼び出しする。
 #[cfg(target_arch = "aarch64")]
 mod neon_block4;
+
+/// x86_64 整数 i8×i8 dot カーネル本体（Issue #522・親 #520・前提 #521。
+/// ポインタ: TASK-132・TASK-156・CORE-16）。
+///
+/// [`x86_block4`] と同じ方針（`unsafe` を持たない safe fn のみで構成。
+/// `docs/design/simd-intrinsics-adoption.md` 決定 1）で、AVX-512 VNNI・
+/// AVX-VNNI（256bit）・AVX2 i16 widen フォールバックの 3 カーネルを提供する。
+/// `isa.rs` 側は [`I8Kernel::dot_i8`] の 3 箇所でこのモジュールの関数を
+/// `unsafe` 呼び出しする。
+#[cfg(target_arch = "x86_64")]
+mod x86_i8;
+
+/// aarch64 NEON dotprod（`vdotq_s32`）向け整数 i8×i8 dot カーネル本体
+/// （Issue #525・親 #520・前提 #522。ポインタ: TASK-132・TASK-156・CORE-16）。
+///
+/// [`x86_i8`] と同じ方針（`unsafe` を持たない safe fn のみで構成。
+/// `docs/design/simd-intrinsics-adoption.md` 決定 1）で NEON dotprod カーネル
+/// を提供する。`isa.rs` 側は [`I8Kernel::dot_i8`] の `NeonDotprod` 分岐 1 箇所
+/// でこのモジュールの関数を `unsafe` 呼び出しする。
+#[cfg(target_arch = "aarch64")]
+mod neon_i8;
+
 /// dim 閾値ディスパッチ（Issue #517/#518）で選択する複数アキュムレータ本数。
 /// Issue #365 の実測で dim768/1536 が改善した値（ACC=4）をそのまま採用する。
 const DOT_ACCUMULATORS: usize = 4;
@@ -736,6 +758,32 @@ impl NeonFp16Token {
     }
 }
 
+/// aarch64 NEON dotprod（`neon,dotprod`。Armv8.2-A dot product 拡張。s8×s8→i32
+/// の `vdotq_s32`／`sdot v.4s` に必要）対応の実行時確認済みトークン（sealed）。
+/// [`I8Kernel::dot_i8`] の整数 i8×i8 dot 専用（Issue #525・親 #520）で、
+/// [`NeonFp16Token`] と同じ独立トークン系統（ADR 決定 3）に属する。
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Clone, Copy)]
+pub struct NeonDotprodToken(());
+
+#[cfg(target_arch = "aarch64")]
+impl NeonDotprodToken {
+    /// crate 内からのみ呼べる（[`NeonToken::try_new`] と同じ sealed 方針）。
+    /// `CORE-12` の上書き機構不存在方針どおり `is_aarch64_feature_detected!`
+    /// 以外のソース（環境変数・設定・feature flag）を一切参照しない
+    /// （`tests/isa.rs::isa_source_has_no_external_override_entry_points` が
+    /// 本モジュールも走査対象に含めて機械検証する）。
+    pub(crate) fn try_new() -> Option<Self> {
+        if std::arch::is_aarch64_feature_detected!("neon")
+            && std::arch::is_aarch64_feature_detected!("dotprod")
+        {
+            Some(NeonDotprodToken(()))
+        } else {
+            None
+        }
+    }
+}
+
 /// f16 昇格 dot（`hnsw.rs::NodeVectors::F16` 専用）の実行時検出済みカーネル。
 /// [`SimdKernel`] と同じ sealed トークン方式で、対応 ISA が無い環境では
 /// `Scalar`（`f16::f16_bits_to_f32` によるソフトウェア復号）へ fail-closed で
@@ -1013,6 +1061,418 @@ fn dot_lanes_multi_acc<const LANES: usize, const WIDE: usize, const PADDED_TAIL:
 
     let wide_sum: f32 = wide.iter().sum();
     wide_sum + reduce_lanes::<LANES, PADDED_TAIL>(narrow, a_rem, b_rem)
+}
+
+// ---------------------------------------------------------------------
+// 整数 i8×i8 dot（Issue #522・親 #520・前提 #521。ポインタ: TASK-132・
+// TASK-156・CORE-16）。
+//
+// `hnsw.rs::NodeVectors::I8`（HNSW 索引ノードの SQ8 常駐表現・Issue #521）が
+// 候補生成スコアを整数演算で計算するための ISA 別カーネル。[`F16Kernel`] と
+// 同じく [`SimdKernel`]（f32 幅ディスパッチ）とは別系統の独立トークン・
+// 独立ディスパッチを持つ（ADR 決定 3）。索引ヒットの最終スコアは常に
+// `kernel::dot`（f32・アリーナ再計算）で再計算する契約（同 ADR 決定 5）の
+// ため、本カーネルの ISA 間ビット一致は要求しない（同一プロセス・同一 ISA
+// 内での決定性のみを要求する——ただし整数演算は丸め誤差を持たないため、
+// 実際には同一入力に対し全 ISA で厳密に一致する。`tests/isa.rs` が
+// `available_i8_kernels()` の全経路でこれを機械検証する）。
+// ---------------------------------------------------------------------
+
+/// x86_64 AVX-VNNI（`avx2,avxvnni`）対応の実行時確認済みトークン（sealed）。
+/// Alder Lake 以降が持つ、AVX-512 を要さない VEX 符号化 VNNI 命令
+/// （`{vex} vpdpbusd`）に対応する。
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy)]
+pub struct AvxVnniToken(());
+
+#[cfg(target_arch = "x86_64")]
+impl AvxVnniToken {
+    /// crate 内からのみ呼べる（[`NeonToken::try_new`] と同じ sealed 方針）。
+    pub(crate) fn try_new() -> Option<Self> {
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avxvnni")
+        {
+            Some(AvxVnniToken(()))
+        } else {
+            None
+        }
+    }
+}
+
+/// x86_64 AVX-512 VNNI（`avx512f,avx512bw,avx512vnni`）対応の実行時確認済み
+/// トークン（sealed）。
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy)]
+pub struct Avx512VnniToken(());
+
+#[cfg(target_arch = "x86_64")]
+impl Avx512VnniToken {
+    /// crate 内からのみ呼べる（[`NeonToken::try_new`] と同じ sealed 方針）。
+    pub(crate) fn try_new() -> Option<Self> {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+        {
+            Some(Avx512VnniToken(()))
+        } else {
+            None
+        }
+    }
+}
+
+/// 整数 i8×i8 dot の内積が使う 2 種のオペランド（[`crate::sq8::
+/// Sq8QueryCodes`] 由来。呼び出し元〔`hnsw.rs::PreparedI8Source`〕が
+/// `crate::sq8::prepare_query` の結果からそのまま組み立てる）。契約:
+/// `signed.len() == shifted.len()`・`shifted[i] == (signed[i] as i16 + 128)
+/// as u8`（`crate::sq8::prepare_query` が満たす）。
+#[derive(Debug, Clone, Copy)]
+pub struct I8QueryOperands<'a> {
+    pub signed: &'a [i8],
+    pub shifted: &'a [u8],
+}
+
+/// 整数 i8×i8 dot（`hnsw.rs::NodeVectors::I8` 専用）の実行時検出済み
+/// カーネル。[`F16Kernel`] と同じ sealed トークン方式で、対応 ISA が無い
+/// 環境では `Scalar`（[`dot_i8_scalar`]）へ fail-closed で縮退する。
+/// 優先順は x86_64: AVX-512 VNNI → AVX-VNNI → AVX2 i16 widen → Scalar／
+/// aarch64: NeonDotprod → Scalar（[`detect_i8`]）。
+#[derive(Debug, Clone, Copy)]
+pub enum I8Kernel {
+    /// いずれの ISA 別カーネルも未対応（スカラー逐次 wrapping 和）。
+    Scalar,
+    /// x86_64 AVX2（VNNI 非対応。`vpmaddwd` による i16 widen フォールバック）。
+    #[cfg(target_arch = "x86_64")]
+    Avx2Widen(Avx2FmaToken),
+    /// x86_64 AVX-VNNI（256bit）。
+    #[cfg(target_arch = "x86_64")]
+    AvxVnni(AvxVnniToken),
+    /// x86_64 AVX-512 VNNI（512bit）。
+    #[cfg(target_arch = "x86_64")]
+    Avx512Vnni(Avx512VnniToken),
+    /// aarch64 NEON dotprod（`vdotq_s32`。Issue #525）。
+    #[cfg(target_arch = "aarch64")]
+    NeonDotprod(NeonDotprodToken),
+}
+
+/// [`I8Kernel`] が使う ISA を表す判別子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectedI8Isa {
+    /// ソフトウェア（スカラー wrapping 和）のみ。
+    Scalar,
+    /// x86_64 AVX2 i16 widen フォールバック。
+    Avx2Widen,
+    /// x86_64 AVX-VNNI（256bit）。
+    AvxVnni,
+    /// x86_64 AVX-512 VNNI（512bit）。
+    Avx512Vnni,
+    /// aarch64 NEON dotprod（`vdotq_s32`。Issue #525）。
+    NeonDotprod,
+}
+
+impl I8Kernel {
+    /// [`DetectedI8Isa`] への純写像。
+    pub fn isa(self) -> DetectedI8Isa {
+        match self {
+            I8Kernel::Scalar => DetectedI8Isa::Scalar,
+            #[cfg(target_arch = "x86_64")]
+            I8Kernel::Avx2Widen(_) => DetectedI8Isa::Avx2Widen,
+            #[cfg(target_arch = "x86_64")]
+            I8Kernel::AvxVnni(_) => DetectedI8Isa::AvxVnni,
+            #[cfg(target_arch = "x86_64")]
+            I8Kernel::Avx512Vnni(_) => DetectedI8Isa::Avx512Vnni,
+            #[cfg(target_arch = "aarch64")]
+            I8Kernel::NeonDotprod(_) => DetectedI8Isa::NeonDotprod,
+        }
+    }
+
+    /// `codes`（索引ノードの格納コード。`hnsw.rs::NodeVectors::I8` の行）・
+    /// `row_sum`（`crate::sq8::row_sums` が凍結時に 1 回計算した `Σ codes`）・
+    /// `query`（[`I8QueryOperands`]。`crate::sq8::prepare_query` の結果）から
+    /// 符号付き整数内積 `Σ codes_d * query.signed_d` を計算する。
+    ///
+    /// `codes.len()` が `query.signed.len()`／`query.shifted.len()` と食い
+    /// 違う場合（呼び出し元が `dim` 一致を事前検証済みの内部専用パスであり
+    /// 通常は到達しない防御的縮退）は `row_sum` に依存しない
+    /// [`dot_i8_scalar`] へフォールバックする（`SimdKernel::dot` と同じ
+    /// 「短い方への切り詰め」意味論そのものは `dot_i8_scalar` が担う）。
+    pub fn dot_i8(self, codes: &[i8], row_sum: i32, query: I8QueryOperands<'_>) -> i32 {
+        // aarch64 の `NeonDotprod`（s8×s8 `vdotq_s32`。Issue #525）・
+        // `Scalar` は VNNI 系と異なり `row_sum` を参照しない（`NeonDotprod` は
+        // `query.signed` をそのまま使う符号付き×符号付き積のため復元が不要。
+        // `isa/neon_i8.rs` モジュール doc 参照）。x86_64 以外のビルドでは
+        // 下記 x86_64 分岐（`row_sum.wrapping_mul(128)` の実利用）が消えるため
+        // `unused_variables` 警告（`make check-cross`）を避ける目的でこの
+        // 束縛を維持する。`i32` は `Copy` のため以降の利用を妨げない。
+        let _ = row_sum;
+        if codes.len() != query.signed.len() || codes.len() != query.shifted.len() {
+            return dot_i8_scalar(codes, query.signed);
+        }
+        match self {
+            I8Kernel::Scalar => dot_i8_scalar(codes, query.signed),
+            #[cfg(target_arch = "x86_64")]
+            I8Kernel::Avx2Widen(_) => {
+                // SAFETY: この variant は `Avx2FmaToken::try_new` が `avx2`・
+                // `fma` の対応を実行時確認できた場合にのみ構築される sealed
+                // トークンを保持する（`avx2+fma ⊇ avx2` のため i16 widen
+                // カーネル〔`#[target_feature(enable = "avx2")]`〕の契約を
+                // 満たす。新規トークンを増やさずに ADR
+                // `docs/design/simd-intrinsics-adoption.md` 決定 3 の表に
+                // ある既存トークンを再利用する判断は `docs/design/
+                // hnsw-sq8-resident.md`「Issue #522」節参照）。
+                unsafe { x86_i8::dot_i8_avx2_widen(codes, query.signed) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            I8Kernel::AvxVnni(_) => {
+                // SAFETY: この variant は `AvxVnniToken::try_new` が `avx2`・
+                // `avxvnni` の対応を実行時確認できた場合にのみ構築される
+                // sealed トークンを保持する。値の存在が CPU 対応の証明であり、
+                // `dot_i8_avx_vnni` の `#[target_feature]` 契約を満たす。
+                let acc = unsafe { x86_i8::dot_i8_avx_vnni(codes, query.shifted) };
+                acc.wrapping_sub(row_sum.wrapping_mul(128))
+            }
+            #[cfg(target_arch = "x86_64")]
+            I8Kernel::Avx512Vnni(_) => {
+                // SAFETY: この variant は `Avx512VnniToken::try_new` が
+                // `avx512f`・`avx512bw`・`avx512vnni` の対応を実行時確認
+                // できた場合にのみ構築される sealed トークンを保持する。
+                // 値の存在が CPU 対応の証明であり、`dot_i8_avx512_vnni` の
+                // `#[target_feature]` 契約を満たす。
+                let acc = unsafe { x86_i8::dot_i8_avx512_vnni(codes, query.shifted) };
+                acc.wrapping_sub(row_sum.wrapping_mul(128))
+            }
+            #[cfg(target_arch = "aarch64")]
+            I8Kernel::NeonDotprod(_) => {
+                // SAFETY: この variant は `NeonDotprodToken::try_new` が
+                // `neon`・`dotprod` の対応を実行時確認できた場合にのみ構築
+                // される sealed トークンを保持する。値の存在が CPU 対応の
+                // 証明であり、`dot_i8_neon_dotprod` の `#[target_feature]`
+                // 契約を満たす。`vdotq_s32` は符号付き×符号付き積のため
+                // `row_sum` による復元は不要（`isa/neon_i8.rs` モジュール
+                // doc 参照）。
+                unsafe { neon_i8::dot_i8_neon_dotprod(codes, query.signed) }
+            }
+        }
+    }
+}
+
+/// 優先順（x86_64: Avx512Vnni → AvxVnni → Avx2Widen → Scalar／aarch64:
+/// NeonDotprod → Scalar）で `try_new` を試す（[`detect`]・[`detect_f16`] と
+/// 同じ fail-closed 方針）。
+pub fn detect_i8() -> I8Kernel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(token) = Avx512VnniToken::try_new() {
+            return I8Kernel::Avx512Vnni(token);
+        }
+        if let Some(token) = AvxVnniToken::try_new() {
+            return I8Kernel::AvxVnni(token);
+        }
+        if let Some(token) = Avx2FmaToken::try_new() {
+            return I8Kernel::Avx2Widen(token);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if let Some(token) = NeonDotprodToken::try_new() {
+            return I8Kernel::NeonDotprod(token);
+        }
+    }
+    I8Kernel::Scalar
+}
+
+/// プロセス内で 1 回だけ [`detect_i8`] を実行する（[`current`]・
+/// [`current_f16`] と同じ方針。独立の `OnceLock` を持ち、f32 幅ディスパッチ・
+/// f16 ディスパッチのいずれへも影響しない）。
+pub fn current_i8() -> I8Kernel {
+    static CURRENT_I8: OnceLock<I8Kernel> = OnceLock::new();
+    *CURRENT_I8.get_or_init(detect_i8)
+}
+
+/// このホストで構築可能な [`I8Kernel`] の全 variant（`Scalar` を含む常に
+/// 非空の列挙）。ビット同一性テスト（`tests/isa.rs`）が「ディスパッチされた
+/// 1 経路」ではなく実際に構築できる全経路を検証するために使う列挙子であり、
+/// 上書き機構（CORE-12）ではない——各 variant はこのホストで実際に
+/// `try_new()` が `Some` を返したトークンのみから作る。
+pub fn available_i8_kernels() -> Vec<I8Kernel> {
+    // x86_64／aarch64 以外（本リポは対象外だが cross-check 対象を広げても
+    // 壊れないよう防御的に維持）は下の `#[cfg]` ブロックがいずれも完全に
+    // 消えるため `kernels` への `push` が一切発生せず、`mut` が
+    // cross-check（`make check-cross`）で `unused_mut` 警告になる。
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(unused_mut)
+    )]
+    let mut kernels = vec![I8Kernel::Scalar];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(token) = Avx2FmaToken::try_new() {
+            kernels.push(I8Kernel::Avx2Widen(token));
+        }
+        if let Some(token) = AvxVnniToken::try_new() {
+            kernels.push(I8Kernel::AvxVnni(token));
+        }
+        if let Some(token) = Avx512VnniToken::try_new() {
+            kernels.push(I8Kernel::Avx512Vnni(token));
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if let Some(token) = NeonDotprodToken::try_new() {
+            kernels.push(I8Kernel::NeonDotprod(token));
+        }
+    }
+    kernels
+}
+
+/// 整数 i8×i8 dot のスカラー参照実装。`a`・`b` の短い方へ切り詰めたうえで
+/// `i32::from` した積を wrapping 加算で逐次和する（`dot_scalar`・
+/// `dot_f16_scalar` と同じ「短い方への切り詰め」意味論。整数のため丸め誤差を
+/// 持たず、[`I8Kernel::dot_i8`] の全 ISA 別カーネルとビット同一になる）。
+///
+/// `#[inline(never)]`: コンパイラの自動ベクトル化が `i8`→`i32` の要素ごと
+/// 符号拡張を per-lane 命令（x86_64 `punpcklbw`／`punpcklwd`、aarch64
+/// `mov v.b[..]`）へ変換すること自体は正当だが、インライン化されると
+/// [`I8Kernel::dot_i8`] の `Scalar` 分岐（本来は `unsafe` intrinsics ディス
+/// パッチのみを含む薄い関数であるべき）の本体へその命令列が紛れ込み、
+/// `scripts/check_simd_codegen.sh` の禁止命令検査（手書き intrinsics
+/// カーネルの `set` 構築が gather/stride 由来で per-element insert 命令へ
+/// 縮退していないかの検査）が誤検出する（`dot_i8_scalar` 単体は関数名で
+/// 除外済み）。独立シンボルとして残すことで誤検出を避ける。
+#[inline(never)]
+pub fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
+    a.iter().zip(b.iter()).fold(0i32, |acc, (&x, &y)| {
+        acc.wrapping_add(i32::from(x).wrapping_mul(i32::from(y)))
+    })
+}
+
+#[cfg(test)]
+mod i8_kernel_tests {
+    use super::*;
+
+    /// 決定的な擬似乱数（xorshift64*。`tests/isa.rs` 等と同一アルゴリズム）。
+    struct XorShift64Star(u64);
+    impl XorShift64Star {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn next_i8(&mut self) -> i8 {
+            // クランプ済みコード（`sq8.rs` の対称量子化）と同じ範囲
+            // [-127, 127] に限定する（`i8::MIN` は本カーネルの入力として
+            // 現れない契約——`sq8::quantize_scalar_f64` の不変条件）。
+            let v = (self.next_u64() % 255) as i32 - 127;
+            v as i8
+        }
+    }
+
+    fn random_codes(seed: u64, n: usize) -> Vec<i8> {
+        let mut rng = XorShift64Star(seed.max(1));
+        (0..n).map(|_| rng.next_i8()).collect()
+    }
+
+    fn operands_for(codes_len: usize, seed: u64) -> (Vec<i8>, Vec<u8>) {
+        let signed = random_codes(seed, codes_len);
+        let shifted = signed.iter().map(|&c| (i16::from(c) + 128) as u8).collect();
+        (signed, shifted)
+    }
+
+    /// [`available_i8_kernels`]（実際に構築できる全経路）×
+    /// dim=0..=300（16／32／64 の chunk 境界の端数を網羅）で、
+    /// [`I8Kernel::dot_i8`] が [`dot_i8_scalar`]（参照実装で手計算した
+    /// `row_sum` 補正込みの値）と `i32` ビット等値になることを固定する。
+    #[test]
+    fn dispatched_dot_i8_matches_scalar_reference_bit_exact_across_kernels() {
+        let kernels = available_i8_kernels();
+        assert!(
+            kernels.iter().any(|k| matches!(k, I8Kernel::Scalar)),
+            "available_i8_kernels must always include Scalar"
+        );
+
+        for dim in 0..=300usize {
+            let codes = random_codes(0x1234_5678_9abc_def1u64 ^ dim as u64, dim);
+            let (signed, shifted) = operands_for(dim, 0x0fed_cba9_8765_4321u64 ^ dim as u64);
+            let row_sum: i32 = codes
+                .iter()
+                .fold(0i32, |acc, &c| acc.wrapping_add(i32::from(c)));
+            let expected = dot_i8_scalar(&codes, &signed);
+
+            for &kernel in &kernels {
+                let operands = I8QueryOperands {
+                    signed: &signed,
+                    shifted: &shifted,
+                };
+                let actual = kernel.dot_i8(&codes, row_sum, operands);
+                assert_eq!(
+                    actual,
+                    expected,
+                    "dim={dim} isa={:?} actual={actual} expected={expected}",
+                    kernel.isa()
+                );
+            }
+        }
+    }
+
+    /// 同一プロセス内での決定性（`current_f16_is_stable_within_process` と
+    /// 同じ契約）。
+    #[test]
+    fn dot_i8_is_deterministic_within_process() {
+        let codes = random_codes(0x99, 37);
+        let (signed, shifted) = operands_for(37, 0x77);
+        let row_sum: i32 = codes
+            .iter()
+            .fold(0i32, |acc, &c| acc.wrapping_add(i32::from(c)));
+        let operands = I8QueryOperands {
+            signed: &signed,
+            shifted: &shifted,
+        };
+        let first = current_i8().dot_i8(&codes, row_sum, operands);
+        for _ in 0..8 {
+            assert_eq!(current_i8().dot_i8(&codes, row_sum, operands), first);
+        }
+    }
+
+    /// `current_i8()` の単調性（`current_f16_is_stable_within_process` と
+    /// 同じ契約）。
+    #[test]
+    fn current_i8_is_stable_within_process() {
+        let first = current_i8().isa();
+        for _ in 0..8 {
+            assert_eq!(current_i8().isa(), first);
+        }
+        assert_eq!(detect_i8().isa(), first);
+    }
+
+    /// `codes` と `query` の長さが食い違う場合、`row_sum` に依存しない
+    /// [`dot_i8_scalar`] と同一の意味論（短い方への切り詰め）になること。
+    #[test]
+    fn dot_i8_length_mismatch_matches_scalar_semantics() {
+        let codes = vec![1i8, 2, 3, 4];
+        let signed = vec![5i8, 6];
+        let shifted: Vec<u8> = signed.iter().map(|&c| (i16::from(c) + 128) as u8).collect();
+        let operands = I8QueryOperands {
+            signed: &signed,
+            shifted: &shifted,
+        };
+        assert_eq!(
+            current_i8().dot_i8(&codes, 999, operands),
+            dot_i8_scalar(&codes, &signed)
+        );
+        assert_eq!(
+            current_i8().dot_i8(
+                &[],
+                0,
+                I8QueryOperands {
+                    signed: &[] as &[i8],
+                    shifted: &[] as &[u8],
+                },
+            ),
+            0
+        );
+    }
 }
 
 #[cfg(test)]

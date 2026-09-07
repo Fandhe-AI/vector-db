@@ -358,3 +358,171 @@ terminates_and_is_deterministic` として F16 常駐でも
   閾値ゲート最終判定: マージ後の管理者作業（#412 と同じ）
 - Apple Silicon（NEON fp16）実機での層 B 実測: 手元環境が x86_64（F16C）
   のため未実施
+
+## Issue #523 追記: I8（SQ8）常駐（`hnsw_i8`）での同一閾値検証
+
+### 背景
+
+Issue #521 で HNSW 索引ノードの対称 SQ8（i8）常駐表現
+（`hnsw::ResidentPrecision::I8`。`docs/design/hnsw-sq8-resident.md`）、
+Issue #522 でクエリ側二重量子化＋整数 i8×i8 dot カーネル
+（`isa::I8Kernel`）が入った。候補生成が f16 よりさらに粗い 8-bit 量子化を
+経由するため探索順序への影響が大きくなり得るが、最終スコアは常に
+`kernel::dot` の f32 再計算という #408 契約は不変（Issue #515 と同じ
+理由づけ）。本節は Issue #515 と同型に次の 2 点を固定する:
+
+- 3 つの Recall ゲート層 B を I8 常駐でも **同一閾値** のまま通過できること
+- `tests/hnsw_cache.rs` 系の「既定エンジン対照 Recall@10・可視外非混入」を
+  I8 常駐でも固定すること（下限は精度別に異なり、F32／F16 は 0.9、I8 は
+  `min_recall_for` により 0.8。詳細は後述の可視外非混入テスト節参照）
+
+加えて、`tests/hnsw_i8_recall.rs`（brute-force 対照 `ef` 掃引）の実測で
+i8 の候補生成が f16 より明確に大きい探索順序ノイズを持つことが判明した
+ため、その事実と「本節の Recall ゲートには実害が及ばない」という結論を
+あわせて記録する（詳細は後述）。
+
+### 測定経路（`RecallEngine::HnswI8`）
+
+`RecallEngine` へ `HnswI8`（環境変数トークン `hnsw_i8`）を追加し、
+`SqlHybridFixture::new` の `HnswI8` 分岐は F16 分岐と同型に
+`ValidatedHnswParams::new(HnswParams::default())` へ
+`with_resident_precision(ResidentPrecision::I8)` を適用するだけで構築する
+（untrusted な `HnswParams` の唯一の検証入口はここでも迂回しない）。
+
+`AnnStats` へ `i8_residency_fallbacks`（次元ごとスケールの f32
+アンダーフローで F32 常駐へ自動縮退した回数。D6 と同型・Issue #521）を
+追加し、`assert_ann_non_vacuous(true)` は `HnswI8` のとき
+`search_engine_kind()` の Display に `resident=i8` が含まれること・
+`i8_residency_fallbacks == 0` を追加で固定する。3 ハーネスの
+`match engine { .. RecallEngine::Hnsw | RecallEngine::HnswF16 |
+RecallEngine::HnswI8 => .. }` へ共有 arm を拡張し、`print_ann_stats` の
+出力へ `i8_residency_fallbacks=` と `i8_kernel=`（`engine::isa::
+current_i8()` の Debug 表現）を追記した。
+
+### 実測結果（ローカル `--release`。本開発環境: x86_64・AVX2＋FMA あり・VNNI なし〔`I8Kernel::Avx2Widen` 経路〕。閾値は private spec から環境変数へ注入し値は本 doc に転記しない。ここに記載する Recall 実測値・統計カウンタはオーナー判断〔2026-08-29〕により公開可）
+
+`RECALL_VERBOSE=1` opt-in で `brute_force`／`hnsw`／`hnsw_f16`／`hnsw_i8`
+を各ゲート 1 回ずつ実行し比較した。
+
+#### hybrid（`hybrid_recall.rs`）
+
+| 段 | 指標 | brute_force | hnsw | hnsw_f16 | hnsw_i8 | 差分 |
+| ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| 小規模（400 docs） | recall@20 | 0.9010 | 0.9010 | 0.9010 | 0.9010 | 0（4 系列とも `builds=0`。構造的に brute-force のまま） |
+| 大規模（20,000 docs） | recall@20 | 0.9145 | 0.9145 | 0.9145 | 0.9145 | 0 |
+| 大規模（20,000 docs） | recall@100 | 0.9165 | 0.9165 | 0.9165 | 0.9165 | 0 |
+
+大規模段 `hnsw_i8` の統計（1 run）: `builds=1 build_failures=0 rebuilds=0
+hybrid_dense_searches=420 hybrid_queries=100 ef_cap_fallbacks=80
+i8_residency_fallbacks=0 i8_kernel=Avx2Widen(..)`（`hnsw`（F32）・
+`hnsw_f16` と統計値も完全一致）。
+
+#### rerank（`rerank_recall.rs`。大規模段のみ）
+
+| 指標 | brute_force | hnsw | hnsw_f16 | hnsw_i8 | 差分 |
+| ---- | ---- | ---- | ---- | ---- | ---- |
+| after_recall@20 | 0.9488 | 0.9488 | 0.9488 | 0.9488 | 0 |
+| non_degraded | true | true | true | true | — |
+| improvement_ratio@20（informational） | 0.2222 | 0.2222 | 0.2222 | 0.2222 | 0 |
+
+`hnsw_i8` の統計: `builds=1 build_failures=0 rebuilds=0
+hybrid_dense_searches=492 hybrid_queries=100 ef_cap_fallbacks=106
+i8_residency_fallbacks=0 i8_kernel=Avx2Widen(..)`（他 3 系列と統計値も
+完全一致）。
+
+#### query-planning（`query_planning_recall.rs`）
+
+| 段 | 指標 | brute_force | hnsw | hnsw_f16 | hnsw_i8 | 差分 |
+| ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| 大規模（direct のみ） | direct_after_recall20 | 0.8852 | 0.8852 | 0.8852 | 0.8852 | 0 |
+| 小規模（direct） | direct_after_recall20 | 0.9321 | 0.9321 | 0.9321 | 0.9321 | 0 |
+| 小規模（intent） | intent_improvement | 0.9245 | 0.9245 | 0.9245 | 0.9245 | 0 |
+| 小規模（intent_degraded） | intent_improvement_degraded | 0.3547 | 0.3547 | 0.3547 | 0.3547 | 0 |
+
+`hnsw_i8` の統計（各段）: direct `builds=1 hybrid_dense_searches=662
+hybrid_queries=160 i8_residency_fallbacks=0`、intent `builds=1
+hybrid_dense_searches=731 hybrid_queries=160 i8_residency_fallbacks=0`、
+intent_degraded `builds=1 hybrid_dense_searches=758 hybrid_queries=160
+i8_residency_fallbacks=0`。いずれも他 3 系列と統計値が完全一致。
+
+### 判断
+
+**全 8 測定点（hybrid 小規模 1・大規模 2、rerank 大規模 1＋非劣化＋
+improvement_ratio、query-planning 大規模 1・小規模 3）で
+brute_force／hnsw／hnsw_f16／hnsw_i8 の実測 Recall 値が完全一致し、
+`hnsw_i8` の `i8_residency_fallbacks` はいずれも 0（このコーパス範囲では
+D6 縮退は発生しない）だった。** I8 常駐 opt-in は同一閾値のまま運用でき、
+Recall ゲートの閾値を緩める必要はない（S8 決定規則: 全指標で
+`hnsw_i8 >= brute_force` の公開済み基準値を満たした）。
+
+未達・原因分析の記録は不要。production コード（`crates/engine/src/`）は
+本 Issue の範囲では無変更。
+
+**oversampling（R5）との関係**: `tests/hnsw_i8_recall.rs`（brute-force
+対照・クラスタ構造ありコーパス・N=10,000・dim=128）の実測では、探索幅
+（`ef`）だけを `64/128/256` と広げても返却件数 `k=10` 固定の Recall@10
+は F32 対比の差分（約 0.095）から一切改善しない一方、`ef=64` のまま
+候補数（`oversample_k`）を 10→20 へ増やし**元の f32 ベクトルで再採点**
+すると Recall@10 は 1.0000（F32 と同水準）まで完全に回復することを
+確認した（詳細は `docs/design/hnsw-sq8-resident.md`「Issue #523 追記」節
+参照）。つまりこの条件では「探索幅（`ef`）拡大では補えない」が
+「候補数を広げ f32 で再採点する oversampling」は有効であり、両者を
+区別しない場合の「oversampling 一般が効かない」という結論は誤り
+だった（codex-review 指摘・PR #621 で是正）。本節の Recall ゲート測定
+（実コーパス規模・hybrid 密側再取得ループ経由）で専用 knob なしに
+brute_force と完全一致したのは、hybrid 密側の再取得ループ
+（`dense_fetch_k` 倍増。#410）が事実上この oversampling＋再採点と同型の
+効果（候補を広く取ってから `kernel::dot` の f32 再計算でスコアを引き
+直す）を担っているためと考えられ、上記の直接測定はその仮説と整合する
+（本 Issue の範囲では構造的論拠までは検証していない。`hnsw_i8_recall.rs`
+の直接 `HnswIndex::search` 呼び出しはこの再取得ループを経由しない）。
+
+### 可視外非混入テスト（`tests/hnsw_cache.rs`）
+
+R4（テナント境界）・hybrid 密側再取得ループ・Rust API 検索・`Subset` 形状
+（SCALAR 事前フィルタ付き DISTANCE）・`full_scan_ratio` ANN 側の 5 テストに
+`i8_*` ラッパー（`run_*(ResidentPrecision::I8)`）を追加した（f16 版と同型。
+既存テストの挙動は無変更のまま green）。I8 ラッパーは追加で
+`search_engine_kind()` の Display に `resident=i8` を含むこと・
+`i8_residency_fallbacks == 0` を固定する。
+
+さらに D6（次元ごとスケールの f32 アンダーフローによる自動縮退）が SQL
+表層経由でも fail-closed に働くことを新規テスト
+`i8_scale_underflow_dimension_falls_back_to_f32_residency_without_leaking_or_losing_recall`
+で固定した: tenant-a の全行の次元 0 を `1e-44`（f32 subnormal。
+`sq8.rs::fit_dim_params_rejects_scale_that_underflows_to_zero` と同じ値）
+へ揃え、`i8_residency_fallbacks == 1`（D6 縮退が実際に 1 回発生）・
+`resident=i8`（静的な opt-in 設定自体は取り消されない）・tenant-b
+（Private）の可視外非混入・既定エンジン対照 Recall@10 ≥ 0.8（I8 の
+`min_recall_for` 下限。`crates/engine/tests/hnsw_cache.rs`）を固定する
+（f16 版は 1 成分だけを範囲外にするのに対し、I8 は次元ごとスケールが
+全行にわたる列全体の統計のため、次元 1 本を丸ごとアンダーフローさせる
+必要がある点が f16 版と異なる）。
+
+`tests/hnsw_hybrid_refetch.rs` の同点誘発コーパス停止性・決定性テストも
+`i8_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic`
+として I8 常駐でも停止性・ビット同一の決定性契約が不変であることを固定
+した。
+
+いずれも `cargo test -p engine --test hnsw_cache --test hnsw_hybrid_refetch`
+で green。production コード（`crates/engine/src/`）は無変更・テスト専任。
+
+### `recall.yml` の 4 系列化
+
+`strategy.matrix.recall_engine` を `[brute_force, hnsw, hnsw_f16]` から
+`[brute_force, hnsw, hnsw_f16, hnsw_i8]` へ拡張した（#412・#515 と同じ
+「trigger を問わず毎回全系列をゲートする」原則）。
+
+### スコープ外・申し送り（本節限定）
+
+- 規模別の常駐メモリ・レイテンシ前後比較・`ef` 掃引の詳細表: Issue #523
+  実施節（`docs/design/hnsw-sq8-resident.md`「Issue #523 追記」節）
+- `recall.yml` 4 系列 matrix の実 `workflow_dispatch`／`schedule` 疎通・
+  閾値ゲート最終判定: マージ後の管理者作業（#412・#515 と同じ）
+- VNNI（AVX-512 VNNI／AVX-VNNI）実機・Apple Silicon（NEON dotprod）
+  での層 B 実測: 手元環境が AVX2＋FMA（`Avx2Widen` 経路）のため未実施。
+  `I8_DOT_MAX_DIM` 以下では全 ISA でビット同一という契約（#522）により
+  Recall 値自体は ISA 非依存
+- per-query スケール準備失敗（`prepare_query` 失敗）時の復号 dot 縮退を
+  数えるカウンタ: `HnswIndexCacheStats` に存在しないため未計測（構造的に
+  本節の fixture では到達不能。Issue #522 の設計）

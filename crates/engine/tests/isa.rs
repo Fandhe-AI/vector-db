@@ -201,6 +201,95 @@ fn dispatched_dot_length_mismatch_matches_scalar_semantics() {
     assert_eq!(isa::current().dot(&[] as &[f32], &[] as &[f32]), 0.0f32);
 }
 
+/// `isa::I8Kernel::dot_i8`（Issue #522・親 #520・前提 #521。VNNI（512bit／256bit）・
+/// i16 widen フォールバック・Issue #525 で追加した aarch64 NEON dotprod の
+/// 整数 i8×i8 dot カーネル）が、`isa::available_i8_kernels()`（このホストで
+/// 実際に構築できる全 variant——本開発環境（x86_64）では VNNI 非対応のため
+/// `Scalar`／`Avx2Widen` のみだが、CI の対応 runner では `AvxVnni`／
+/// `Avx512Vnni` も含まれ得る。aarch64 実機（`detect-apple` ジョブ）では
+/// `Scalar`／`NeonDotprod` を含む）のいずれでもスカラー参照実装
+/// [`isa::dot_i8_scalar`] と `i32` ビット等値になることを、dim 0..=300
+/// （chunk 16/32/64 の境界の端数を網羅）・決定的擬似乱数コードで固定する。
+/// 整数演算のため丸め誤差を持たず、ISA 間のビット一致を要求できる
+/// （`isa.rs` モジュールドキュメンテーションコメント「整数 i8×i8 dot」節参照）。
+/// `codes`／`signed`（RNG seed 固定）は arch に依存しない決定的入力であり、
+/// [`isa::dot_i8_scalar`] は arch 非依存の純粋な wrapping 整数演算のため、
+/// 本テストが x86_64 CI・aarch64 `detect-apple` の双方で green であることが
+/// そのまま「x86 版との整数一致（同一入力で同一出力）」の機械的な証跡になる
+/// （Issue #525 の受け入れ条件。ADR の想定した個別 golden 定数ハードコード
+/// テストではなく、共有シード・共有スカラー参照実装を介した間接証跡とする
+/// 判断根拠は `docs/design/hnsw-sq8-resident.md`「Issue #525」節参照）。
+#[test]
+fn dispatched_dot_i8_matches_scalar_reference_bit_exact_across_kernels() {
+    let kernels = isa::available_i8_kernels();
+    assert!(
+        kernels.iter().any(|k| matches!(k, isa::I8Kernel::Scalar)),
+        "available_i8_kernels must always include Scalar"
+    );
+
+    let mut rng = XorShift64Star::new(0x0522_1234_5678_9abc);
+    for dim in 0..=300usize {
+        let codes: Vec<i8> = (0..dim)
+            .map(|_| ((rng.next_u64() % 255) as i32 - 127) as i8)
+            .collect();
+        let signed: Vec<i8> = (0..dim)
+            .map(|_| ((rng.next_u64() % 255) as i32 - 127) as i8)
+            .collect();
+        let shifted: Vec<u8> = signed.iter().map(|&c| (i16::from(c) + 128) as u8).collect();
+        let row_sum: i32 = codes
+            .iter()
+            .fold(0i32, |acc, &c| acc.wrapping_add(i32::from(c)));
+        let expected = isa::dot_i8_scalar(&codes, &signed);
+
+        for &kernel in &kernels {
+            let operands = isa::I8QueryOperands {
+                signed: &signed,
+                shifted: &shifted,
+            };
+            let actual = kernel.dot_i8(&codes, row_sum, operands);
+            assert_eq!(
+                actual,
+                expected,
+                "dim={dim} isa={:?} actual={actual} expected={expected}",
+                kernel.isa()
+            );
+        }
+    }
+}
+
+/// `isa::I8Kernel::dot_i8` の長さ不一致・空スライスが [`isa::dot_i8_scalar`]
+/// と同一の意味論（短い方への切り詰め）になることを固定する
+/// （`dispatched_dot_length_mismatch_matches_scalar_semantics` の i8 版）。
+#[test]
+fn dispatched_dot_i8_length_mismatch_matches_scalar_semantics() {
+    let codes = vec![1i8, 2, 3, 4];
+    let signed = vec![5i8, 6];
+    let shifted: Vec<u8> = signed.iter().map(|&c| (i16::from(c) + 128) as u8).collect();
+
+    assert_eq!(
+        isa::current_i8().dot_i8(
+            &codes,
+            999,
+            isa::I8QueryOperands {
+                signed: &signed,
+                shifted: &shifted,
+            },
+        ),
+        isa::dot_i8_scalar(&codes, &signed)
+    );
+    assert_eq!(
+        isa::current_i8().dot_i8(
+            &[],
+            0,
+            isa::I8QueryOperands {
+                signed: &[] as &[i8],
+                shifted: &[] as &[u8],
+            },
+        ),
+        0
+    );
+}
+
 /// `isa::SimdKernel::dot_block4`（Issue #510・#511・TASK-156・CORE-14。行ブロック
 /// カーネル）が 1 行版 [`isa::SimdKernel::dot`] とビット同一であることを、
 /// 決定的シード RNG で dim 0..=129・768・1000・1536 を走査して検証する
@@ -374,16 +463,19 @@ fn dot_multi_acc_threshold_boundary_matches_scalar_exactly() {
 /// dispatch_source_has_no_external_override_entry_points` と同じ禁止トークン集合）。
 #[test]
 fn isa_source_has_no_external_override_entry_points() {
-    // Issue #510・#511: `isa/x86_block4.rs`（cfg(x86_64) サブモジュール）・
-    // `isa/neon_block4.rs`（cfg(aarch64) サブモジュール）も同じ禁止トークン集合で
-    // 走査する（`isa.rs` 本体からモジュール分割しても CORE-12 の「上書き機構の
-    // 不存在」検査が抜け穴にならないようにするため）。`include_str!` は `cfg` に
+    // Issue #510・#511・#525: `isa/x86_block4.rs`（cfg(x86_64) サブモジュール）・
+    // `isa/neon_block4.rs`（cfg(aarch64) サブモジュール）・`isa/neon_i8.rs`
+    // （cfg(aarch64) サブモジュール）も同じ禁止トークン集合で走査する
+    // （`isa.rs` 本体からモジュール分割しても CORE-12 の「上書き機構の不存在」
+    // 検査が抜け穴にならないようにするため）。`include_str!` は `cfg` に
     // 依らずファイルの存在のみ要求するため、x86_64 ホストのテストでも
-    // `neon_block4.rs` を走査できる。
+    // `neon_block4.rs`／`neon_i8.rs` を走査できる。
     let sources = [
         include_str!("../src/isa.rs"),
         include_str!("../src/isa/x86_block4.rs"),
         include_str!("../src/isa/neon_block4.rs"),
+        include_str!("../src/isa/x86_i8.rs"),
+        include_str!("../src/isa/neon_i8.rs"),
     ];
 
     let forbidden_tokens = [
@@ -466,14 +558,19 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
     // Issue #510（TASK-156・CORE-14）で追加した `dot_block4` の AVX2+FMA・AVX-512
     // ディスパッチ 2 箇所、Issue #514 で追加した F16c/NeonFp16 の `dot_f16`
     // ディスパッチ 2 箇所、Issue #511（TASK-156・CORE-14）で追加した `dot_block4`
-    // の Neon ディスパッチ 1 箇所の計 8 箇所の `unsafe {` が現れる（実際のビルドで
-    // 有効になるのは対象 arch の分岐のみだが、`cfg` 行はソース上に残ったまま
-    // 走査されるため、arch に依存せず常に 8 を期待できる）。
+    // の Neon ディスパッチ 1 箇所、Issue #522（TASK-156・CORE-14）で追加した
+    // `dot_i8` の Avx2Widen・AvxVnni・Avx512Vnni ディスパッチ 3 箇所、Issue #525
+    // （TASK-156・CORE-14）で追加した `dot_i8` の NeonDotprod ディスパッチ 1 箇所の
+    // 計 12 箇所の `unsafe {` が現れる（実際のビルドで有効になるのは対象 arch の
+    // 分岐のみだが、`cfg` 行はソース上に残ったまま走査されるため、arch に
+    // 依存せず常に 12 を期待できる）。
     assert_eq!(
-        unsafe_block_count, 8,
-        "expected exactly 8 `unsafe {{` blocks in isa.rs (Neon/Avx2Fma/Avx512 dot dispatch \
+        unsafe_block_count, 12,
+        "expected exactly 12 `unsafe {{` blocks in isa.rs (Neon/Avx2Fma/Avx512 dot dispatch \
          + Avx2Fma/Avx512 dot_block4 dispatch + F16c/NeonFp16 dot_f16 dispatch added by \
-         Issue #514 + Neon dot_block4 dispatch added by Issue #511)"
+         Issue #514 + Neon dot_block4 dispatch added by Issue #511 + Avx2Widen/AvxVnni/ \
+         Avx512Vnni dot_i8 dispatch added by Issue #522 + NeonDotprod dot_i8 dispatch added \
+         by Issue #525)"
     );
 }
 

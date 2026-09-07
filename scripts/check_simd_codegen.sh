@@ -164,6 +164,16 @@ extract_functions() {
 # 命令行から先頭の空白・末尾改行を除いたニーモニック（先頭トークン）を返す。
 # `.` で始まるディレクティブ行・ラベル行（末尾 `:`）は対象外（アセンブリ行は
 # 必ず先頭にタブ／空白を伴うため、トリムしてから判定する）。
+#
+# Issue #522 で発見: AVX-VNNI（`avxvnni`。AVX-512 を要さない VEX 符号化
+# VNNI 命令）は LLVM の出力で `{vex}\tvpdpbusd ...` のように先頭へ符号化
+# 方式を示す波括弧接頭辞トークンが付く（`{evex}`／`{disp32}` 等、他の
+# encoding hint も同型で現れうる）。この接頭辞を先頭トークンとして扱うと
+# `mnemonic_of` が実際のニーモニック（`vpdpbusd`）ではなく `{vex}` を返し、
+# 禁止命令検査（`scan_forbidden`）・期待命令検査（`expected_rules_for`）の
+# 双方が実際の命令を一切見ないまま素通りしてしまう（`--self-test` の fail
+# fixture が本バグを再現する。詳細は `docs/design/simd-codegen-guard.md`
+# 参照）。波括弧で囲まれたトークンは除去してからニーモニックを取る。
 mnemonic_of() {
   local line="$1"
   local trimmed
@@ -173,6 +183,9 @@ mnemonic_of() {
       return 1
       ;;
   esac
+  # 先頭の `{...}` encoding hint 接頭辞（`{vex}`／`{evex}` 等）を除去し、
+  # 続く空白も取り除いてから実際のニーモニックを取る。
+  trimmed="$(echo "${trimmed}" | sed -E 's/^\{[^}]*\}[[:space:]]*//')"
   echo "${trimmed}" | sed -E 's/[[:space:]].*$//'
 }
 
@@ -279,6 +292,12 @@ required_segments_for() {
     echo "17dot_block4_avx512"
     # Issue #514: f16 昇格 dot カーネル（`isa::dot_f16_f16c`）。
     echo "12dot_f16_f16c"
+    # Issue #522: 整数 i8×i8 dot カーネル（`isa::x86_i8::dot_i8_avx512_vnni`／
+    # `dot_i8_avx_vnni`／`dot_i8_avx2_widen`。いずれも `#[target_feature]` fn
+    # のため独立シンボルとして生成される）。
+    echo "18dot_i8_avx512_vnni"
+    echo "15dot_i8_avx_vnni"
+    echo "17dot_i8_avx2_widen"
   else
     echo "10SimdKernel20dot_with_scalar_tail"
     echo "10SimdKernel20dot_with_padded_tail"
@@ -292,6 +311,11 @@ required_segments_for() {
     # 現れない）必須シンボルへ追加する。`PADDED_TAIL` の 2 monomorphization は
     # 同一セグメントを共有する。
     echo "15dot_block4_neon"
+    # Issue #525: NEON dotprod 整数 i8×i8 dot カーネル
+    # `isa::neon_i8::dot_i8_neon_dotprod`。`dotprod` は aarch64 baseline 対象外
+    # のため `#[inline(never)]` を付与しており（`dot_f16_neon_fp16`／
+    # `dot_block4_neon` と同じ理由）独立シンボルとして必ず現れる。
+    echo "19dot_i8_neon_dotprod"
   fi
 }
 
@@ -314,6 +338,27 @@ expected_rules_for() {
       "dot_f16_f16c" \
       '^[[:space:]]*vcvtph2ps[[:space:]]+[^,]*\(' \
       "f16->f32 promotion (vcvtph2ps) with a memory operand (register-only form does not count)"
+    # Issue #522: VNNI 系カーネルが実際に `vpdpbusd`（u8×s8→i32 積和）へ
+    # コンパイルされた証跡を要求する非 vacuous 検査。`{vex}` encoding hint
+    # 接頭辞が付き得る（`mnemonic_of` の対処参照）ため、行頭に任意でその
+    # トークンが現れることを許容する正規表現にする。メモリオペランド付き
+    # （`set` 構築が畳み込まれた形。register-only 版は対象外）を要求する。
+    printf '%s\t%s\t%s\n' \
+      "dot_i8_avx512_vnni" \
+      '^[[:space:]]*(\{[^}]*\}[[:space:]]+)?vpdpbusd[[:space:]]+[^,]*\(.*%zmm' \
+      "u8x8->i32 dot-product-accumulate (vpdpbusd) on %zmm with a memory operand"
+    printf '%s\t%s\t%s\n' \
+      "dot_i8_avx_vnni" \
+      '^[[:space:]]*(\{[^}]*\}[[:space:]]+)?vpdpbusd[[:space:]]+[^,]*\(.*%ymm' \
+      "u8x8->i32 dot-product-accumulate (vpdpbusd) on %ymm with a memory operand"
+    printf '%s\t%s\t%s\n' \
+      "dot_i8_avx2_widen" \
+      '^[[:space:]]*vpmaddwd[[:space:]]' \
+      "i16x16->i32 multiply-add-pairs (vpmaddwd) actually emitted (widen fallback)"
+    printf '%s\t%s\t%s\n' \
+      "dot_i8_avx2_widen" \
+      '^[[:space:]]*vpmovsxbw[[:space:]]+[^,]*\(' \
+      "i8->i16 sign-extend widen (vpmovsxbw) with a memory operand"
   else
     printf '%s\t%s\t%s\n' \
       "dot_f16_neon_fp16" \
@@ -326,6 +371,12 @@ expected_rules_for() {
       "dot_block4_neon" \
       '^[[:space:]]*fmla[[:space:]]+v[0-9]+\.4s' \
       "row-block FMA (fmla v.4s) actually emitted (not scalarized)"
+    # Issue #525: `vdotq_s32` が実際に `sdot v.4s`（s8x16->i32 dot-product-
+    # accumulate）へコンパイルされた証跡を要求する非 vacuous 検査。
+    printf '%s\t%s\t%s\n' \
+      "dot_i8_neon_dotprod" \
+      '^[[:space:]]*sdot[[:space:]]+v[0-9]+\.4s' \
+      "s8x16->i32 dot-product-accumulate (sdot v.4s) actually emitted"
   fi
 }
 
@@ -428,14 +479,31 @@ run_scan() {
     local fn_name="${block%%$'\x02'*}"
     local fn_body="${block#*$'\x02'}"
 
-    local forbidden
-    forbidden="$(scan_forbidden "${arch_class}" "${fn_body}")" || true
-    if [ -n "${forbidden}" ]; then
-      echo "ERROR: forbidden per-element insert instruction(s) found in ${fn_name}:" >&2
-      echo "${forbidden}" | while IFS= read -r item; do echo "  - ${item}"; done >&2
-      status=1
-      continue
-    fi
+    # `dot_i8_scalar`（Issue #522）は他の `unsafe` を持たないスカラー参照実装
+    # （`dot_scalar`／`dot_f16_scalar` と同じ位置付け）だが、`i8`→`i32` の
+    # 要素ごと符号拡張はコンパイラの自動ベクトル化が per-lane 命令（x86_64:
+    # `punpcklbw`／`punpcklwd`、aarch64: `mov v.b[..]`）へ正当に変換する対象
+    # であり、本検査が本来検出したい「手書き intrinsics カーネルの `set`
+    # 構築が gather/stride 由来で per-element insert 命令へ縮退した」ケース
+    # とは別物（f32／f16 のスカラー参照実装が同じ理由で偶然この命令を出さない
+    # だけで、除外規則自体は既存の `_scalar` 系関数と同じ立ち位置）。
+    # モジュール全体を走査する本関数の構造上、これらの関数は `required_
+    # segments_for`／`expected_rules_for` の対象にも一切含まれない
+    # （スカラー参照実装であり検証対象の SIMD カーネルではないため）。
+    case "${fn_name}" in
+      *"dot_i8_scalar"*)
+        ;;
+      *)
+        local forbidden
+        forbidden="$(scan_forbidden "${arch_class}" "${fn_body}")" || true
+        if [ -n "${forbidden}" ]; then
+          echo "ERROR: forbidden per-element insert instruction(s) found in ${fn_name}:" >&2
+          echo "${forbidden}" | while IFS= read -r item; do echo "  - ${item}"; done >&2
+          status=1
+          continue
+        fi
+        ;;
+    esac
 
     local missing
     missing="$(scan_expected_missing "${arch_class}" "${fn_name}" "${fn_body}")" || true
@@ -685,6 +753,115 @@ pub mod isa_probe {
     }
 }
 RUST
+
+  # pass (Issue #522): `isa::x86_i8::dot_i8_avx512_vnni` と同型の実装。
+  # メモリオペランド付き `vpdpbusd`（%zmm）を期待する非 vacuous 検査
+  # （`expected_rules_for`）が実際に pass することを確認する。
+  cat > "${dir}/fx_pass_i8_avx512_vnni.rs" <<'RUST'
+use std::arch::x86_64::*;
+
+pub mod isa_probe {
+    use super::*;
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    pub fn dot_i8_avx512_vnni(codes: &[i8], shifted: &[u8]) -> i32 {
+        let len = codes.len().min(shifted.len());
+        let (c_chunks, _c_rem) = codes[..len].as_chunks::<64>();
+        let (s_chunks, _s_rem) = shifted[..len].as_chunks::<64>();
+        let mut acc = _mm512_setzero_si512();
+        for (cc, sc) in c_chunks.iter().zip(s_chunks.iter()) {
+            let vc = _mm512_set_epi8(
+                cc[63], cc[62], cc[61], cc[60], cc[59], cc[58], cc[57], cc[56],
+                cc[55], cc[54], cc[53], cc[52], cc[51], cc[50], cc[49], cc[48],
+                cc[47], cc[46], cc[45], cc[44], cc[43], cc[42], cc[41], cc[40],
+                cc[39], cc[38], cc[37], cc[36], cc[35], cc[34], cc[33], cc[32],
+                cc[31], cc[30], cc[29], cc[28], cc[27], cc[26], cc[25], cc[24],
+                cc[23], cc[22], cc[21], cc[20], cc[19], cc[18], cc[17], cc[16],
+                cc[15], cc[14], cc[13], cc[12], cc[11], cc[10], cc[9], cc[8],
+                cc[7], cc[6], cc[5], cc[4], cc[3], cc[2], cc[1], cc[0],
+            );
+            let vs = _mm512_set_epi8(
+                sc[63] as i8, sc[62] as i8, sc[61] as i8, sc[60] as i8,
+                sc[59] as i8, sc[58] as i8, sc[57] as i8, sc[56] as i8,
+                sc[55] as i8, sc[54] as i8, sc[53] as i8, sc[52] as i8,
+                sc[51] as i8, sc[50] as i8, sc[49] as i8, sc[48] as i8,
+                sc[47] as i8, sc[46] as i8, sc[45] as i8, sc[44] as i8,
+                sc[43] as i8, sc[42] as i8, sc[41] as i8, sc[40] as i8,
+                sc[39] as i8, sc[38] as i8, sc[37] as i8, sc[36] as i8,
+                sc[35] as i8, sc[34] as i8, sc[33] as i8, sc[32] as i8,
+                sc[31] as i8, sc[30] as i8, sc[29] as i8, sc[28] as i8,
+                sc[27] as i8, sc[26] as i8, sc[25] as i8, sc[24] as i8,
+                sc[23] as i8, sc[22] as i8, sc[21] as i8, sc[20] as i8,
+                sc[19] as i8, sc[18] as i8, sc[17] as i8, sc[16] as i8,
+                sc[15] as i8, sc[14] as i8, sc[13] as i8, sc[12] as i8,
+                sc[11] as i8, sc[10] as i8, sc[9] as i8, sc[8] as i8,
+                sc[7] as i8, sc[6] as i8, sc[5] as i8, sc[4] as i8,
+                sc[3] as i8, sc[2] as i8, sc[1] as i8, sc[0] as i8,
+            );
+            acc = _mm512_dpbusd_epi32(acc, vs, vc);
+        }
+        _mm512_reduce_add_epi32(acc)
+    }
+}
+RUST
+
+  # pass (Issue #522): `isa::x86_i8::dot_i8_avx2_widen` と同型の実装
+  # （VNNI 非対応 CPU 向け i16 widen フォールバック）。`vpmaddwd`・メモリ
+  # オペランド付き `vpmovsxbw` の両方を要求する非 vacuous 検査が pass する
+  # ことを確認する。
+  cat > "${dir}/fx_pass_i8_avx2_widen.rs" <<'RUST'
+use std::arch::x86_64::*;
+
+pub mod isa_probe {
+    use super::*;
+    #[target_feature(enable = "avx2")]
+    pub fn dot_i8_avx2_widen(codes: &[i8], signed: &[i8]) -> i32 {
+        let len = codes.len().min(signed.len());
+        let (c_chunks, _c_rem) = codes[..len].as_chunks::<16>();
+        let (q_chunks, _q_rem) = signed[..len].as_chunks::<16>();
+        let mut acc = _mm256_setzero_si256();
+        for (cc, qc) in c_chunks.iter().zip(q_chunks.iter()) {
+            let vc8 = _mm_set_epi8(
+                cc[15], cc[14], cc[13], cc[12], cc[11], cc[10], cc[9], cc[8],
+                cc[7], cc[6], cc[5], cc[4], cc[3], cc[2], cc[1], cc[0],
+            );
+            let vq8 = _mm_set_epi8(
+                qc[15], qc[14], qc[13], qc[12], qc[11], qc[10], qc[9], qc[8],
+                qc[7], qc[6], qc[5], qc[4], qc[3], qc[2], qc[1], qc[0],
+            );
+            let vc16 = _mm256_cvtepi8_epi16(vc8);
+            let vq16 = _mm256_cvtepi8_epi16(vq8);
+            let prod = _mm256_madd_epi16(vc16, vq16);
+            acc = _mm256_add_epi32(acc, prod);
+        }
+        let lo = _mm256_castsi256_si128(acc);
+        let hi = _mm256_extracti128_si256(acc, 1);
+        let sum128 = _mm_add_epi32(lo, hi);
+        let shuf = _mm_shuffle_epi32(sum128, 0b01_00_11_10);
+        let sums = _mm_add_epi32(sum128, shuf);
+        let shuf2 = _mm_shuffle_epi32(sums, 0b00_00_00_01);
+        let final_sum = _mm_add_epi32(sums, shuf2);
+        _mm_cvtsi128_si32(final_sum)
+    }
+}
+RUST
+
+  # fail (Issue #522): 関数名は `dot_i8_avx512_vnni` だが実体はスカラー逐次和
+  # （`vpdpbusd` を一切使わない）。非 vacuous 検査が「命令が存在しない縮退」を
+  # 実際に検出できることを確認する（`fx_fail_f16_missing_instruction` と同型）。
+  cat > "${dir}/fx_fail_i8_missing_instruction.rs" <<'RUST'
+pub mod isa_probe {
+    #[inline(never)]
+    pub fn dot_i8_avx512_vnni(codes: &[i8], shifted: &[u8]) -> i32 {
+        let len = codes.len().min(shifted.len());
+        codes[..len]
+            .iter()
+            .zip(shifted[..len].iter())
+            .fold(0i32, |acc, (&c, &s)| {
+                acc.wrapping_add(i32::from(s).wrapping_mul(i32::from(c)))
+            })
+    }
+}
+RUST
 }
 
 write_aarch64_fixtures() {
@@ -903,6 +1080,77 @@ pub mod isa_probe {
     }
 }
 RUST
+
+  # pass (Issue #525): `isa::neon_i8::dot_i8_neon_dotprod` と同型の実装
+  # （`vsetq_lane_s8` 連鎖構築＋`vdotq_s32`）。禁止 0 件かつ `sdot v.4s` が
+  # 実際に emit されることを確認する。
+  cat > "${dir}/fx_pass_i8_neon_dotprod.rs" <<'RUST'
+use std::arch::aarch64::*;
+
+pub mod isa_probe {
+    use super::*;
+
+    #[target_feature(enable = "neon")]
+    fn load16(chunk: &[i8; 16]) -> int8x16_t {
+        let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15] = *chunk;
+        let v = vdupq_n_s8(0);
+        let v = vsetq_lane_s8::<0>(c0, v);
+        let v = vsetq_lane_s8::<1>(c1, v);
+        let v = vsetq_lane_s8::<2>(c2, v);
+        let v = vsetq_lane_s8::<3>(c3, v);
+        let v = vsetq_lane_s8::<4>(c4, v);
+        let v = vsetq_lane_s8::<5>(c5, v);
+        let v = vsetq_lane_s8::<6>(c6, v);
+        let v = vsetq_lane_s8::<7>(c7, v);
+        let v = vsetq_lane_s8::<8>(c8, v);
+        let v = vsetq_lane_s8::<9>(c9, v);
+        let v = vsetq_lane_s8::<10>(c10, v);
+        let v = vsetq_lane_s8::<11>(c11, v);
+        let v = vsetq_lane_s8::<12>(c12, v);
+        let v = vsetq_lane_s8::<13>(c13, v);
+        let v = vsetq_lane_s8::<14>(c14, v);
+        vsetq_lane_s8::<15>(c15, v)
+    }
+
+    #[target_feature(enable = "neon,dotprod")]
+    #[inline(never)]
+    pub fn dot_i8_neon_dotprod(codes: &[i8], signed: &[i8]) -> i32 {
+        let len = codes.len().min(signed.len());
+        let codes = &codes[..len];
+        let signed = &signed[..len];
+        let (c_chunks, c_rem) = codes.as_chunks::<16>();
+        let (s_chunks, s_rem) = signed.as_chunks::<16>();
+        let mut acc = vdupq_n_s32(0);
+        for (cc, sc) in c_chunks.iter().zip(s_chunks.iter()) {
+            let va = load16(cc);
+            let vb = load16(sc);
+            acc = vdotq_s32(acc, va, vb);
+        }
+        let lane_sum = vaddvq_s32(acc);
+        let rem_sum: i32 = c_rem.iter().zip(s_rem.iter()).fold(0i32, |sum, (&c, &s)| {
+            sum.wrapping_add(i32::from(c).wrapping_mul(i32::from(s)))
+        });
+        lane_sum.wrapping_add(rem_sum)
+    }
+}
+RUST
+
+  # fail (Issue #525): 関数名は `dot_i8_neon_dotprod` だが実体はスカラー逐次
+  # wrapping 和（`sdot` を含まない）。
+  cat > "${dir}/fx_fail_i8_neon_dotprod_missing_instruction.rs" <<'RUST'
+pub mod isa_probe {
+    #[inline(never)]
+    pub fn dot_i8_neon_dotprod(codes: &[i8], signed: &[i8]) -> i32 {
+        let len = codes.len().min(signed.len());
+        codes[..len]
+            .iter()
+            .zip(signed[..len].iter())
+            .fold(0i32, |acc, (&c, &s)| {
+                acc.wrapping_add(i32::from(c).wrapping_mul(i32::from(s)))
+            })
+    }
+}
+RUST
 }
 
 self_test() {
@@ -986,6 +1234,39 @@ self_test() {
         echo "self-test ok: fail_f16_missing_instruction correctly rejected"
       fi
     fi
+
+    # Issue #522: 期待命令の非 vacuous 検査（`expected_rules_for`。VNNI 系）。
+    asm="$(compile_fixture "${scratch}/pass_i8_avx512_vnni" "${scratch}/fx_pass_i8_avx512_vnni.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" x86_64 "isa_probe" "18dot_i8_avx512_vnni" >/dev/null; then
+        echo "self-test ok: pass_i8_avx512_vnni (vpdpbusd on %zmm with memory operand present)"
+      else
+        echo "self-test FAILED: expected pass_i8_avx512_vnni to pass" >&2
+        overall=1
+      fi
+    fi
+
+    # Issue #522: i16 widen フォールバックの非 vacuous 検査
+    # （`vpmaddwd`・メモリオペランド付き `vpmovsxbw` の両方を要求）。
+    asm="$(compile_fixture "${scratch}/pass_i8_avx2_widen" "${scratch}/fx_pass_i8_avx2_widen.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" x86_64 "isa_probe" "17dot_i8_avx2_widen" >/dev/null; then
+        echo "self-test ok: pass_i8_avx2_widen (vpmaddwd + memory-operand vpmovsxbw present)"
+      else
+        echo "self-test FAILED: expected pass_i8_avx2_widen to pass" >&2
+        overall=1
+      fi
+    fi
+
+    asm="$(compile_fixture "${scratch}/fail_i8_missing_instruction" "${scratch}/fx_fail_i8_missing_instruction.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" x86_64 "isa_probe" "18dot_i8_avx512_vnni" >/dev/null 2>&1; then
+        echo "self-test FAILED: expected fail_i8_missing_instruction to be rejected (no vpdpbusd)" >&2
+        overall=1
+      else
+        echo "self-test ok: fail_i8_missing_instruction correctly rejected"
+      fi
+    fi
   else
     write_aarch64_fixtures "${scratch}"
 
@@ -1049,6 +1330,27 @@ self_test() {
         overall=1
       else
         echo "self-test ok: fail_block4_neon_scalarized correctly rejected"
+      fi
+    fi
+
+    # Issue #525: 期待命令の非 vacuous 検査（`expected_rules_for`。NEON dotprod）。
+    asm="$(compile_fixture "${scratch}/pass_i8_neon_dotprod" "${scratch}/fx_pass_i8_neon_dotprod.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" aarch64 "isa_probe" "19dot_i8_neon_dotprod" >/dev/null; then
+        echo "self-test ok: pass_i8_neon_dotprod (sdot v.4s dot-product-accumulate present)"
+      else
+        echo "self-test FAILED: expected pass_i8_neon_dotprod to pass" >&2
+        overall=1
+      fi
+    fi
+
+    asm="$(compile_fixture "${scratch}/fail_i8_neon_dotprod_missing_instruction" "${scratch}/fx_fail_i8_neon_dotprod_missing_instruction.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" aarch64 "isa_probe" "19dot_i8_neon_dotprod" >/dev/null 2>&1; then
+        echo "self-test FAILED: expected fail_i8_neon_dotprod_missing_instruction to be rejected (no sdot)" >&2
+        overall=1
+      else
+        echo "self-test ok: fail_i8_neon_dotprod_missing_instruction correctly rejected"
       fi
     fi
   fi

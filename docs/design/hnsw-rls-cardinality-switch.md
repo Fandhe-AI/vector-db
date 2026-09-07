@@ -929,6 +929,33 @@ Issue #488 が確立した「1 つの判定式を複数箇所で共有し分岐�
   ADR 本文の改訂は不要とする。オーナーが明文化を望む場合は別 Issue とする
   （起票はユーザー承認事項のため本 Issue では行わない）
 
+## Issue #501: `search_layer` の 2-hop 展開（ACORN-1）実装記録
+
+Issue #500 の設計契約（上記「ゲート条件の設計」節）に従い、`crate::hnsw::HopMode::TwoHop`（マスク付き探索限定）を実装した。
+
+### 実装の要点
+
+- `crate::hnsw::HopMode`（`OneHop`／`TwoHop`）・`ValidatedHnswParams::acorn_max_visible_ratio`（既定 `None`）・`with_acorn_max_visible_ratio`（`den>=1`・`num<=den`・`ratio >= full_scan_ratio` を fail-closed 検査。`with_full_scan_ratio` 側の後付け逆転も同様に拒否）を追加。両アクセサは `full_scan_ratio`／`with_full_scan_ratio` と同じ公開範囲（`pub`）にした——`ValidatedHnswParams` の他のビルダーメソッドと同様、統合テストが opt-in エンジンを組み立てるための公開 API として必要なため（`EXPLAIN` への非露出という D3 の判断とは別軸）
+- 非受理ノードに出会ったときの規則を `bridge_expand`（自由関数）へ集約し、`search_layer_in`（ビーム探索の受理判定後分岐）・`HnswIndex::accepted_reachable_count`（`is_mask_fully_reachable_with` の BFS）の双方が同一実装を共有する。規則: 非受理ノード N を「1-hop 非受理として初めて訪問した」ときのみ visited を付けて `bridge_expand(N)` を呼び、N の隣接（2-hop 候補）のうち受理済みかつ未訪問のものだけを visited を付けて候補化する。2-hop 候補が非受理の場合は visited を付けない（別の 1-hop 非受理ノードから改めて中継点として使えるようにするため。ただし 3-hop 以上へは展開しない——D1 の設計どおり 1 段のみ）
+- この規則により各ノードの隣接リスト読み取りはクエリ全体で高々 1 回に構造的に有界（visited マークが「展開済み」を兼ねる）となり、総走査量は `O(N・M0)` で有界（追加の明示的訪問予算上限は設けていない。§ Issue #500 の「停止性・DoS」節どおり）
+- 上位層の貪欲降下（`greedy_descend_masked`）は 1-hop のまま据え置いた（D2。層 0 の起点選択にのみ関与し Recall への寄与が薄い一方リスクのみ増えるため）
+- `sql::hnsw_cache::TraversalRegime`（`PlainScan`／`OneHop`／`TwoHop`）・`traversal_regime_for` を新設し、`Overlay::compute`（分断検査の hop 選択）・`search_with_overlay`（plain scan 判定・hop 選択の両方）が同一情報源を共有する形へ一本化した（Issue #488 の「単一情報源」方針をそのまま踏襲・拡張）。`search_with_overlay` 内での `below_full_scan_ratio` 再計算は撤去し `overlay.regime` を直接参照する
+- `EXPLAIN` への `acorn_max_visible_ratio` の露出は D3 のとおり見送った（`full_scan_ratio` と同区分。`hnsw_params:` 行は無変更のまま据え置き）
+- 診断統計 `HnswIndexCacheStats::acorn_searches`／`acorn_expansions` を追加（`TwoHop` レジームで縮退なしに完走した回数・`bridge_expand` が候補化した 2-hop ノード数の累計。`EXPLAIN` へは非露出）
+
+### #500 の設計からの差異・確定した点
+
+- `HnswIndex::search_masked`／`search_masked_with`・`HnswIndex::search_layer`（旧・`OneHop` 専用ラッパー）は既存シグネチャのまま `HopMode::OneHop` へ委譲する薄いラッパーとして残し、`HopMode` を受け取る新規メソッド（`search_masked_with_hop`・`search_layer_with_hop`）を追加する形にした（Issue #497 のパターンに倣う。既存呼び出し元・テストの変更を最小化し、R1 のビット同一性を「既存コードパスを一切変更しない」ことで構造的に保証するため）。`is_mask_fully_reachable`（`OneHop` 専用ラッパー）・旧 `search_layer`／`search_layer_with` は production からの呼び出しが `search_masked_with_hop`／`search_layer_with_hop` へ一本化されたことで非到達になったため `#[cfg(test)]` にした（`select_neighbors_heuristic` と同じ既存の扱い）
+- `TraversalRegime::hop()` は `PlainScan` に対しても `OneHop` を返す（呼び出し元は `PlainScan` の場合その値を使わず先に plain scan 分岐へ抜ける契約のため、値自体は「使われない」）
+
+### 検証
+
+- 単体テスト（`crates/engine/src/hnsw.rs`）: 橋渡しノード経由の 2-hop 到達（`search_masked_two_hop_traverses_through_a_rejected_bridge_node`）・3-hop 非到達（`search_masked_two_hop_does_not_traverse_three_hops`）・I1 機械検証（`search_masked_two_hop_never_scores_rejected_nodes`。`NodeSource::score` 呼び出しを記録するテスト専用ラッパーで非受理ノードへの呼び出しが 0 件・受理 2-hop ノードへの呼び出しが非 vacuous であることを固定）・`accept == None` でのビット同一性（`search_masked_two_hop_matches_search_when_mask_is_none`）・決定性（`search_masked_two_hop_is_deterministic`）・停止性（`search_masked_two_hop_reads_each_node_adjacency_at_most_once`。`Adjacency::neighbors` 呼び出し回数を記録するラッパーで最大 1 回であることを機械検証）・`ValidatedHnswParams` の検証規則（`acorn_max_visible_ratio_defaults_none_and_rejects_invalid_ratios`）を追加。既存の HNSW 単体テスト（103 件）は全て無変更のまま green（R1 のビット同一性の直接証拠）
+- 統合テスト（`crates/engine/tests/hnsw_cache.rs`）: `acorn_two_hop_subset_shape_matches_default_engine_and_never_leaks_across_tenants`（`Subset` 形状・選択率 20% のフィクスチャで `OneHop`（既定）だと `mask_splits_graph` が 20/20 発火することを実測確認したうえで `acorn_max_visible_ratio = 1/1` を opt-in すると全 20 クエリが `subset_searches`〔縮退なしの ANN 完走〕へ転じ、既定エンジン対照 Recall@10 ≥ 0.9・tenant-b 非混入・`plain_scans == 0`・`acorn_searches`/`acorn_expansions` 非 vacuous を満たすことを固定）・`acorn_disabled_by_default_keeps_existing_behavior_unaffected`（同じフィクスチャで opt-in しない場合 `acorn_searches == 0` のまま `mask_splits_graph` が従来どおり発火することを固定。opt-in なしでは挙動が一切変わらないことの直接証拠）
+- `hnsw_search.rs`・`hnsw_hybrid_refetch.rs`・`incremental_index_hnsw.rs`・`sql_explain.rs`（engine）・`wire_explain.rs`（wire-server）は無変更のまま green
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`・`cargo test --workspace --all-features` を実行（結果は本 PR の Test plan 参照）
+- 新規 `unsafe` は 0（既存の禁止方針を維持）。依存追加なし（`Cargo.toml` 無変更）
+
 ## Issue #498 追記: visited 集合切替閾値の可視比率スイープ確認（層 2）
 
 Issue #497（`VisitedSparse`・`sparse_visited_max` 閾値機構）の閾値既定値
@@ -943,6 +970,151 @@ ratio=1/2（可視率 50%）では `ann_masked` が発火し
 `docs/design/hnsw-search.md`「Issue #498」節参照。クラスタ寄り fixture の
 整備は引き続き #502 の担当。production コード無変更（本節の計測は
 `crates/engine/benches/`・`scripts/` のみ）。
+
+## Issue #502: ACORN-1 の可視比率別 Recall・レイテンシ前後比較と既定値
+
+Issue #501 が固定した ACORN-1（`acorn_max_visible_ratio` opt-in）を可視比率
+横断で実測し、既定値（`None` のまま据え置くか候補値へ変更するか）を判断
+するための計測・回帰テストを追加した。production コード
+（`crates/engine/src/`）は無変更・テスト／ベンチ／スクリプト／docs 専任。
+
+### 計測基盤
+
+- `crates/engine/benches/harness/bench_engine.rs`: `parse_acorn_max_visible_ratio`
+  （`BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO` 用・`parse_full_scan_ratio` と
+  同型の fail-closed パーサ）・`ExpectedArm::AnnMaskedTwoHop`・
+  `expected_arm_acorn`（`expected_arm` の基底判定が `AnnMasked` かつ
+  `acorn_max_visible_ratio` が可視比率を含むときのみ `AnnMaskedTwoHop` へ
+  格上げする。`sql::hnsw_cache::traversal_regime_for` の `TwoHop` 判定式
+  〔`<=`〕を複製する予測ラベル専用関数——既存 `expected_arm` は変更せず
+  後方互換を保つ）を追加
+- `crates/engine/benches/knn_profile_bench.rs`: 可視比率スイープ
+  （`run_visible_ratio_sweep`）専用に `BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO`
+  を追加。`build_core_for_sweep` は `full_scan_ratio_override` 適用後に
+  `with_acorn_max_visible_ratio` を適用する順序で `Hnsw`／`HnswF16` 両
+  arm に結線（`with_acorn_max_visible_ratio` は `acorn >= full_scan_ratio`
+  を検証するため、この適用順が前提）。`observed_arm_label` は
+  `acorn_searches_delta > 0` を最優先で判定し `ann_masked_two_hop` を返す
+  （`acorn_searches` は `subset_searches` の部分集合のため判定順が重要）。
+  期待値が `AnnMaskedTwoHop` なのに `acorn_searches_delta == 0` だった場合は
+  vacuous な計測として fail-closed に拒否する（`sparse_visited` の既存
+  ガード・Issue #498 の方針を踏襲）。他モード（`INDEX_MEMORY`／`HOT_ONLY`）
+  との併用・`ENGINE=brute_force` との併用は拒否。knob 未設定時は本 Issue
+  導入前と出力・処理が完全に同一
+- `scripts/bench_knn_visible_ratio_sweep.sh`: `SWEEP_CANDIDATES=acorn` で
+  `hnsw_one_hop`（既定・ACORN 無効）／`hnsw_acorn_1_1`（`acorn_max_visible_
+  ratio=1/1`。full_scan_ratio 以上のあらゆる比率で TwoHop）の 2 candidate
+  を追加。既定比率は `1/2・1/4・1/5・1/10・1/20`（scale=1）。`4/10`
+  （既定値候補）を独立 candidate としないのは、この既定比率集合では各点の
+  期待 arm が 2 candidate のいずれかと完全に一致し（1/2 は 1-hop、
+  1/4・1/5・1/10 は 2-hop、1/20 は plain scan——いずれも `full_scan_ratio`
+  境界と `4/10` 境界を同じ 5 点で挟めているため）3 candidate 目が新規の
+  測定点を生まないと判断したため。`resolve_env` の全分岐で
+  `ACORN_MAX_VISIBLE_RATIO` を明示設定（親シェル export の漏れ防止）。
+  `--summarize` に `arm expected=/observed=`・`acorn(delta)` 行の抽出を追加
+
+### フィクスチャ形状のプローブ（クラスタ寄り fixture は不要と判明）
+
+Issue #487・#498 の「均等分散マスク（`id % N`）は疎な可視集合では 1-hop の
+`mask_splits_graph` に構造的に到達不能」という知見を踏まえ、`MASK_SHAPE`
+knob（modulo／clustered 切替）の要否を計測前にプローブした。ところが本
+Issue の `knn_profile_bench` フィクスチャ（一様乱数コーパス・dim128・
+25,000 行）は、`acorn_max_visible_ratio` opt-in の有無に関わらず一貫して
+`ann_masked`（1-hop）／`ann_masked_two_hop`（ACORN opt-in・可視比率が
+`full_scan_ratio` 以上 `acorn_max_visible_ratio` 以下の範囲）へ到達し、
+`mask_splits_graph` は一度も観測されなかった（可視比率 1/2・1/4・1/5・
+1/10 のいずれでも。1/20 は `full_scan_ratio` 未満で構造的に `plain_scan_ratio`）。
+均等分散マスク自体が分断を起こしにくいのではなく、Issue #487・#498 で
+観測された分断は**その計測のクラスタなし・25,000 行という組み合わせ**に
+固有だった可能性が高い（本 Issue のフィクスチャは同じく一様乱数だが
+`id % N == 0` を `bucket` 列に事前投入する形が異なるため、単純な比較では
+断定できない）。いずれにせよ本 Issue の計測目的（ACORN opt-in の効果が
+観測できる測定点の確保）には十分だったため、`MASK_SHAPE` knob の追加は
+見送った（modulo 一本で完結）。
+
+一方、`tests/hnsw_acorn_recall.rs` の層 B（後述・クラスタ構造ありコーパス・
+25,000 行・dim128）では逆に、可視比率 1/2・1/4・1/5・1/10 のすべてで
+`mask_splits_graph` が発火し ACORN opt-in（`4/10`）でも解消しなかった。
+クラスタ構造ありコーパスでは分断が可視比率だけでなく規模（1,200 行の層 A
+では解消するが 25,000 行の層 B では解消しない）にも依存する可能性がある
+ことを示す informational な観測として記録する（後続 Issue での深掘りに
+申し送る）。
+
+### 事前登録した判定規則
+
+1. 各測定点（scale × ratio）: `ratio(min) = TwoHop_min / OneHop_min`
+   （主統計量）。`Improved` は固定 ±5% 帯**と**参照区間（`S0_hot_sql_e2e`）
+   実測帯の両方を超え、かつ `ratio < 1` の場合のみ（`docs/design/
+   benchmark-judgement-policy.md` §3〜§4）
+2. Recall: TwoHop の各測定点で既定エンジン（brute_force）対照
+   `Recall@10 ≥ 0.9`（Issue #409／#501 と同じ絶対下限）
+3. 既定値: 候補は `4/10`（qdrant `max_selectivity` 相当。上流ドキュメントで
+   確認できた範囲の値のみ帰属）。採用条件は「production 到達区間
+   （`r ≥ full_scan_ratio=1/10`）の全 TwoHop 点で Recall ≥ 0.9 かつ
+   Improved、かつ専有環境（`BENCH_DEDICATED_ENV=1`）での実測」。本開発
+   環境は共有 QEMU 環境（`docs/design/benchmark-judgement-policy.md` §5）
+   のため、レイテンシの Improved 判定を Accepted 扱いにできない——既定値は
+   `None` のまま据え置き、候補値・実測表を運用者へ申し送る
+4. 1/20 は `r < full_scan_ratio` で ACORN 有無に関わらず `PlainScan`
+   （対照点として記録するのみ）
+
+### 専用回帰テスト（`crates/engine/tests/hnsw_acorn_recall.rs`）
+
+`tests/hnsw_cache.rs::seed_acorn_fixture`（選択率固定 20%・単一固定点）を
+可視比率 1/N（N ∈ {2,4,5,10}）横断へ一般化した。
+
+- 層 A（常時実行・`make ci` 対象。1,200 行・dim16）:
+  `acorn_4_10_regime_sweep_matches_expected_hop_mode_and_recall` は
+  `acorn_max_visible_ratio=4/10` opt-in のもとで N=4,5,10（r ≤ 4/10）が
+  `acorn_searches > 0`〔TwoHop〕へ、N=2（r=1/2 > 4/10）は
+  `acorn_searches == 0`〔既存の 1-hop 判定のまま〕であることを固定し、
+  全点で既定エンジン対照 Recall@10 ≥ 0.9・`Subset` 形状の非 vacuous 性
+  （`subset_searches > 0`）・tenant-b private 行の非混入・`builds` が
+  warm-up 1 回のみであることを検証する。
+  `acorn_disabled_by_default_keeps_regime_sweep_unaffected` は
+  `acorn_max_visible_ratio` 未設定（既定 `None`）では同じ可視比率横断で
+  `acorn_searches`／`acorn_expansions` が常に 0 のまま（Issue #501 の既存
+  契約を維持）であることを固定する
+- 層 B（`#[ignore]`・`make hnsw-acorn-recall`。25,000 行・dim128）:
+  `layer_b_25k_dim128_acorn_regime_sweep_report` は同じ可視比率横断を
+  より現実的な規模で実行し Recall・カウンタを表として標準出力へ記録する
+  （上記「フィクスチャ形状のプローブ」節のとおり、この規模・コーパス
+  構成では `mask_splits_graph` へ縮退し ACORN opt-in の効果を観測でき
+  なかった——informational な記録に留め、layer A の主張を弱めない）
+
+### `RecallEngine::HnswAcorn`（Recall ゲート同一閾値検証）の見送り
+
+3 つの Recall ハーネス（`hybrid_recall.rs`・`rerank_recall.rs`・
+`query_planning_recall.rs`）のゲートコーパスは単一テナント・単一
+`PolicyContext` の `FullVisible` 形状（`WHERE`・部分 RLS を持たない）で
+構成されている。ACORN-1 は SCALAR 事前フィルタ付き DISTANCE（`Subset`
+形状。可視ノードの一部が索引外という状況）でのみ意味を持つ機構であり、
+`FullVisible` 形状では非受理ノード自体が存在しないため `bridge_expand` は
+構造的に一度も発火しない——`RecallEngine::HnswAcorn` を追加しても
+`RecallEngine::Hnsw`（Issue #412）と構造的に同一の測定になり、ACORN 固有の
+検証にはならない。#616 の申し送り「`RECALL_ENGINE=hnsw` 3 ゲートが ACORN
+opt-in 経路でも同一閾値を通過することの確認」は、`RecallEngine::Hnsw`
+自体が既に ACORN 無効（`acorn_max_visible_ratio=None`）で測定しており
+（Issue #412・#515）、ACORN opt-in を追加してもゲートの正しさに対する
+追加の保証を得られないと判断し、`RecallEngine::HnswAcorn`
+の追加・`recall.yml` の `strategy.matrix.recall_engine` への `hnsw_acorn`
+追加はいずれも見送った（`tests/hnsw_acorn_recall.rs` の `Subset` 形状
+専用フィクスチャが ACORN 固有の Recall 検証を非 vacuous に担う）。
+
+### 対象外・申し送り
+
+- `hnsw_search_bench.rs` での層 1 直接 A/B（`HopMode::OneHop` vs
+  `TwoHop` の総レイテンシ比較）: `HopMode`／`search_masked_with_hop` が
+  `pub(crate)` のため `bench-internals` feature 限定ラッパー（production
+  変更）が必要。層 2（SQL 表層経由の可視比率スイープ）で総レイテンシは
+  担保済みのため見送り
+- `acorn_max_visible_ratio` 既定値の変更（`None` → 候補値）: 上記「事前
+  登録した判定規則」3 のとおり共有 QEMU 実測では Accepted にできない。
+  専有環境での再実測と既定値変更はオーナー判断
+- クラスタ構造ありコーパス・25,000 行規模での分断の深掘り（上記
+  「フィクスチャ形状のプローブ」節の観測）: 後続 Issue へ申し送り
+- scale=4（100k 行）規模点: 計測時間の都合で `SWEEP_SCALES=4` opt-in に
+  留める（既定は scale=1）
 
 ## スコープ外・申し送り
 
@@ -992,5 +1164,7 @@ ratio=1/2（可視率 50%）では `ann_masked` が発火し
   方式）の実装（`search_layer_in`・`is_mask_fully_reachable` のレジーム
   対応・`ValidatedHnswParams` 拡張・統計追加）: #500 で契約整理・ゲート
   条件設計まで実施済み（「Issue #500」節参照）。実装は #501
-- ACORN-1 有効時の可視比率スイープ実測・既定値（`acorn_max_visible_ratio`）
-  の確定: #502
+- ~~ACORN-1 有効時の可視比率スイープ実測・既定値（`acorn_max_visible_ratio`）
+  の確定: #502~~ 実測・回帰テストを実装済み（「Issue #502」節参照）。既定値
+  は共有 QEMU 環境の制約により `None` のまま据え置き、候補値 `4/10` と
+  専有環境での再実測・確定を運用者へ申し送り

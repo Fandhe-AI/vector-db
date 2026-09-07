@@ -137,16 +137,23 @@ impl fmt::Display for SearchEngineKind {
         match self {
             SearchEngineKind::CpuScalarBruteForce => write!(f, "cpu_scalar_brute_force"),
             SearchEngineKind::ParallelBruteForce => write!(f, "parallel_brute_force"),
-            SearchEngineKind::Hnsw(params) => write!(
-                f,
-                "hnsw(m={},ef_construction={},ef_search={},full_scan_ratio={},resident={},sparse_visited_max={})",
-                params.m,
-                params.ef_construction,
-                params.ef_search,
-                params.full_scan_ratio(),
-                params.resident_precision(),
-                params.sparse_visited_max()
-            ),
+            SearchEngineKind::Hnsw(params) => {
+                let acorn = match params.acorn_max_visible_ratio() {
+                    Some(r) => r.to_string(),
+                    None => "none".to_string(),
+                };
+                write!(
+                    f,
+                    "hnsw(m={},ef_construction={},ef_search={},full_scan_ratio={},resident={},sparse_visited_max={},acorn_max_visible_ratio={})",
+                    params.m,
+                    params.ef_construction,
+                    params.ef_search,
+                    params.full_scan_ratio(),
+                    params.resident_precision(),
+                    params.sparse_visited_max(),
+                    acorn
+                )
+            }
         }
     }
 }
@@ -285,7 +292,7 @@ mod tests {
         );
         assert_eq!(
             kind.to_string(),
-            "hnsw(m=32,ef_construction=200,ef_search=128,full_scan_ratio=1/10,resident=f32,sparse_visited_max=0)"
+            "hnsw(m=32,ef_construction=200,ef_search=128,full_scan_ratio=1/10,resident=f32,sparse_visited_max=0,acorn_max_visible_ratio=none)"
         );
         assert_eq!(
             SearchEngineKind::ParallelBruteForce.to_string(),

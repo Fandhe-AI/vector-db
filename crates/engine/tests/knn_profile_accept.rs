@@ -18,8 +18,9 @@ mod harness;
 
 use harness::knn_profile::{
     assert_scan_row_counts_match, decode_header_reimpl, decode_row_reimpl, explain_resident_value,
-    ns_per_row, refuse_under_github_actions, render_index_memory_line, requires_hnsw_stats_check,
-    resident_label_for_token, scaled_rows, stage_diff_ns_per_row, KnnProfileError,
+    ns_per_row, refuse_under_github_actions, render_index_memory_line, render_kernel_isa_line,
+    requires_hnsw_stats_check, resident_label_for_token, scaled_rows, stage_diff_ns_per_row,
+    KnnProfileError,
 };
 
 use engine::storage::{RowInput, Storage, Visibility};
@@ -367,6 +368,7 @@ fn explain_resident_value_handles_trailing_field_and_whitespace() {
 fn resident_label_for_token_maps_known_tokens() {
     assert_eq!(resident_label_for_token("hnsw"), Some("f32"));
     assert_eq!(resident_label_for_token("hnsw_f16"), Some("f16"));
+    assert_eq!(resident_label_for_token("hnsw_i8"), Some("i8"));
     assert_eq!(resident_label_for_token("brute_force"), None);
     assert_eq!(resident_label_for_token("bogus"), None);
 }
@@ -402,6 +404,42 @@ fn render_index_memory_line_reports_unavailable_when_proc_stats_missing() {
     assert!(line.contains("vm_hwm_kb=unavailable"));
 }
 
+// --- render_kernel_isa_line (Issue #526) -------------------------------------
+
+#[test]
+fn render_kernel_isa_line_formats_all_three_fields_in_order() {
+    let line = render_kernel_isa_line("Avx2Fma", "F16c", "Avx2Widen");
+    assert_eq!(
+        line,
+        "knn_profile_bench: kernel_isa dot=Avx2Fma f16=F16c i8=Avx2Widen"
+    );
+}
+
+#[test]
+fn render_kernel_isa_line_reflects_apple_expected_values() {
+    // Apple 実機（aarch64）での期待値（`isa.rs::detect_f16`／`detect_i8` の
+    // 優先順）。x86_64 環境ではこの組み合わせは実際には出力されない
+    // （§7.7 の非 vacuous チェックリストが参照する期待値の固定）。
+    let line = render_kernel_isa_line("Neon", "NeonFp16", "NeonDotprod");
+    assert_eq!(
+        line,
+        "knn_profile_bench: kernel_isa dot=Neon f16=NeonFp16 i8=NeonDotprod"
+    );
+}
+
+#[test]
+fn render_kernel_isa_line_rejects_empty_field_by_not_collapsing_prefix() {
+    // 空文字列を渡しても "kernel_isa" 接頭辞・フィールド境界（スペース）は
+    // 維持され、後続フィールドと結合しない（`--summarize` の grep パターンが
+    // 前方一致で誤集計しないことの回帰）。
+    let line = render_kernel_isa_line("", "F16c", "Avx2Widen");
+    assert_eq!(
+        line,
+        "knn_profile_bench: kernel_isa dot= f16=F16c i8=Avx2Widen"
+    );
+    assert!(line.starts_with("knn_profile_bench: kernel_isa "));
+}
+
 // --- requires_hnsw_stats_check (Issue #516・codex P1 指摘対応) --------------
 
 #[test]
@@ -413,6 +451,13 @@ fn requires_hnsw_stats_check_covers_hnsw_and_hnsw_f16() {
     // (brute_force engine) という実体と異なるラベルが出力されていた）。
     assert!(requires_hnsw_stats_check("hnsw"));
     assert!(requires_hnsw_stats_check("hnsw_f16"));
+}
+
+#[test]
+fn requires_hnsw_stats_check_covers_hnsw_i8() {
+    // Issue #523: I8（SQ8）常駐でも `hnsw`／`hnsw_f16` と同型に非 vacuous 検証
+    // 対象であるべき（`hnsw_f16` と同じ codex P1 指摘の再発防止）。
+    assert!(requires_hnsw_stats_check("hnsw_i8"));
 }
 
 #[test]

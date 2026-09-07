@@ -41,6 +41,12 @@ pub enum BenchEngine {
     /// メモリ実測の対象として追加した。`tests/fixtures/recall_engine.rs::
     /// RecallEngine::HnswF16` と同じ構築経路・トークン語彙を踏襲する）。
     HnswF16,
+    /// ANN opt-in・索引ノード I8（SQ8）常駐（Issue #521・#522。
+    /// `ValidatedHnswParams::new(HnswParams::default())?.with_resident_precision(I8)`
+    /// で構築する。Issue #523 が f32 常駐との前後比較・常駐メモリ実測の対象
+    /// として追加した。`tests/fixtures/recall_engine.rs::RecallEngine::HnswI8`
+    /// と同じ構築経路・トークン語彙を踏襲する）。
+    HnswI8,
 }
 
 impl BenchEngine {
@@ -51,6 +57,7 @@ impl BenchEngine {
             Self::BruteForce => "brute_force",
             Self::Hnsw => "hnsw",
             Self::HnswF16 => "hnsw_f16",
+            Self::HnswI8 => "hnsw_i8",
         }
     }
 }
@@ -91,16 +98,19 @@ pub fn read_env_var(name: &'static str) -> Result<Option<String>, BenchEngineErr
 /// `raw`（`read_env_var` が返した値。前後の空白は許容: GitHub Actions の
 /// variable 展開が末尾改行を持ち込む経路への対応。`recall_engine.rs` と同方針）
 /// から [`BenchEngine`] を解決する。未設定・空文字列・`"brute_force"` は
-/// [`BenchEngine::BruteForce`]、`"hnsw"` は [`BenchEngine::Hnsw`]。それ以外は
-/// fail-closed で拒否する（黙って既定へ倒すと、typo で ANN 測定が静かに
-/// スキップされる事故を防げない）。
+/// [`BenchEngine::BruteForce`]、`"hnsw"` は [`BenchEngine::Hnsw`]、
+/// `"hnsw_f16"` は [`BenchEngine::HnswF16`]、`"hnsw_i8"` は
+/// [`BenchEngine::HnswI8`]。それ以外は fail-closed で拒否する（黙って既定へ
+/// 倒すと、typo で ANN 測定が静かにスキップされる事故を防げない）。
 pub fn parse_engine(raw: Option<&str>) -> Result<BenchEngine, BenchEngineError> {
     match raw.map(str::trim) {
         None | Some("") | Some("brute_force") => Ok(BenchEngine::BruteForce),
         Some("hnsw") => Ok(BenchEngine::Hnsw),
         Some("hnsw_f16") => Ok(BenchEngine::HnswF16),
+        Some("hnsw_i8") => Ok(BenchEngine::HnswI8),
         Some(other) => Err(err(format!(
-            "must be unset, \"brute_force\", \"hnsw\", or \"hnsw_f16\" (got {other:?})"
+            "must be unset, \"brute_force\", \"hnsw\", \"hnsw_f16\", or \"hnsw_i8\" \
+             (got {other:?})"
         ))),
     }
 }
@@ -285,11 +295,18 @@ pub fn parse_sparse_visited_max(raw: Option<&str>) -> Result<Option<usize>, Benc
 /// 独立に扱う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpectedArm {
-    /// `visible * den >= index_len * num`: マスク付き ANN 探索が選ばれるはず。
+    /// `visible * den >= index_len * num`: マスク付き ANN 探索（1-hop・既定）
+    /// が選ばれるはず。
     AnnMasked,
     /// `visible * den < index_len * num`: 可視カーディナリティ比が閾値未満で
     /// plain scan が選ばれるはず。
     PlainScanRatio,
+    /// `full_scan_ratio <= r <= acorn_max_visible_ratio`（Issue #501・#502）:
+    /// ACORN-1（2-hop 展開）付きマスク探索が選ばれるはず。`expected_arm` の
+    /// 判定が [`ExpectedArm::AnnMasked`] で、かつ `acorn_max_visible_ratio`
+    /// が `Some` で比がその範囲内のときのみ [`expected_arm_acorn`] が返す
+    /// （`expected_arm` 自体は本 variant を返さない・後方互換）。
+    AnnMaskedTwoHop,
 }
 
 pub fn expected_arm(
@@ -311,5 +328,78 @@ pub fn expected_arm(
         Ok(ExpectedArm::PlainScanRatio)
     } else {
         Ok(ExpectedArm::AnnMasked)
+    }
+}
+
+/// `BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO` から `crate::hnsw::
+/// ValidatedHnswParams::with_acorn_max_visible_ratio` へ渡す `(numerator,
+/// denominator)` を読む（Issue #502。`parse_full_scan_ratio` と同じ受理形状・
+/// fail-closed 方針。`None` は ACORN-1 opt-in 無効〔既定〕を表す）。
+pub fn parse_acorn_max_visible_ratio(
+    raw: Option<&str>,
+) -> Result<Option<(u32, u32)>, BenchEngineError> {
+    let trimmed = raw.map(str::trim);
+    let s = match trimmed {
+        None | Some("") => return Ok(None),
+        Some(s) => s,
+    };
+    let (num_str, den_str) = s
+        .split_once('/')
+        .ok_or_else(|| err(format!("must be \"<num>/<den>\" (got {s:?})")))?;
+    let numerator: u32 = num_str.parse().map_err(|_| {
+        err(format!(
+            "numerator must be a non-negative integer (got {num_str:?})"
+        ))
+    })?;
+    let denominator: u32 = den_str.parse().map_err(|_| {
+        err(format!(
+            "denominator must be a positive integer (got {den_str:?})"
+        ))
+    })?;
+    if denominator == 0 {
+        return Err(err("denominator must be >= 1 (got 0)"));
+    }
+    if numerator > denominator {
+        return Err(err(format!(
+            "numerator must not exceed denominator (got {numerator}/{denominator})"
+        )));
+    }
+    Ok(Some((numerator, denominator)))
+}
+
+/// [`expected_arm`] を ACORN-1（Issue #501）対応に拡張したもの（Issue #502）。
+/// 基底判定が [`ExpectedArm::AnnMasked`] のときに限り、`acorn_max_visible_ratio`
+/// が `Some` で可視カーディナリティ比がその範囲内なら
+/// [`ExpectedArm::AnnMaskedTwoHop`] へ格上げする（`sql::hnsw_cache::
+/// traversal_regime_for` の `TwoHop` 判定式と同じ比較演算子〔`<=`〕を複製する。
+/// 単一情報源はそちら側にあり、本関数は予測ラベル付け専用の複製）。
+pub fn expected_arm_acorn(
+    visible: u64,
+    index_len: u64,
+    full_scan_ratio: (u32, u32),
+    acorn_max_visible_ratio: Option<(u32, u32)>,
+) -> Result<ExpectedArm, BenchEngineError> {
+    let base = expected_arm(visible, index_len, full_scan_ratio)?;
+    if base != ExpectedArm::AnnMasked {
+        return Ok(base);
+    }
+    let Some((num, den)) = acorn_max_visible_ratio else {
+        return Ok(base);
+    };
+    if den == 0 {
+        return Err(err(
+            "acorn_max_visible_ratio denominator must be >= 1 (got 0)",
+        ));
+    }
+    let lhs = visible
+        .checked_mul(den as u64)
+        .ok_or_else(|| err("overflow computing visible * acorn_max_visible_ratio.denominator"))?;
+    let rhs = index_len
+        .checked_mul(num as u64)
+        .ok_or_else(|| err("overflow computing index_len * acorn_max_visible_ratio.numerator"))?;
+    if lhs <= rhs {
+        Ok(ExpectedArm::AnnMaskedTwoHop)
+    } else {
+        Ok(base)
     }
 }

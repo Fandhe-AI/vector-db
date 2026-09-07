@@ -482,11 +482,11 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
         stats, last = measure(bulk_hybrid, idxs)
         phases["bulk_hybrid_k200"] = {**stats, "k": 200, "rows_returned": len(last)}
 
-        # ORDER BY なしの行取得は SQL 表層の許可リスト
-        # （`crates/engine/src/sql/allowlist.rs::parse_select_shape`）が
-        # `ORDER BY <distance>` か `USING PLAN` を必須とするため受理されない。
-        # 推測で unsupported にせず、実際に 1 回実行して拒否を確認したうえで記録する
-        # （explain フェーズと同じく、拒否応答は接続を切断しない）。
+        # ORDER BY なしの行取得（広域取得。Issue #454 で SQL 表層
+        # `crates/engine/src/sql/allowlist.rs::Statement::Scan` として実装済み）は
+        # 受理される。推測で通常フェーズに固定せず、実際に 1 回実行して受理／拒否を
+        # 確認したうえで記録する（旧許可リストとの互換確認・explain フェーズと同じく
+        # 拒否応答は接続を切断しない）。
         nosort_sql = "SELECT id, body FROM docs WHERE lang = 'ja' LIMIT 500"
         try:
             _exec_rows(nosort_sql)

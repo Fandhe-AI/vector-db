@@ -219,7 +219,7 @@ else
 endif
 
 .PHONY: e2e-three-client
-e2e-three-client: ## TASK-73（WIRE-1）/TASK-82（SQL-5〜7,9,10）/TASK-165（SQL-12・SEARCH-9）/TASK-168（SQL-13・SQL-14）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
+e2e-three-client: ## TASK-73（WIRE-1）/TASK-82（SQL-5〜7,9,10）/TASK-165（SQL-12・SEARCH-9）/TASK-168（SQL-13・SQL-14）/Issue #454（広域取得）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
 ifdef HAS_CARGO
 	cargo test -p wire-server --test three_client_e2e -- --ignored
 	cargo test -p wire-server --test extended_syntax_e2e -- --ignored
@@ -308,11 +308,19 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-hybrid
-bench-hybrid: ## Issue #324（境界同点グループ再取得ループ〔Issue #320〕のレイテンシ影響計測。CORE-7・PLAN-4/6/7 関連ポインタ）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+bench-hybrid: ## Issue #324（境界同点グループ再取得ループ〔Issue #320〕のレイテンシ影響計測。CORE-7・PLAN-4/6/7 関連ポインタ）＋ Issue #506（BENCH_HYBRID_LATENCY_ENGINE 設定時は SQL 表層〔hnsw opt-in〕計測モードへ切替。既定〔未設定〕モードの出力は不変）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_HYBRID_LATENCY_ENGINE=brute_force|hnsw|hnsw_f16 で SQL 表層モードを起動（未設定時は既定の in-build 比較モード）。BENCH_HYBRID_LATENCY_SCALE=small|large|all（既定 all）・BENCH_HYBRID_LATENCY_CORPUS=no_refetch|tie_refetch|all（既定 all）・BENCH_HYBRID_LATENCY_NUM_DOCS／_DIM／_VOCAB_SIZE／_QUANTIZE_LEVELS（既定はスケール別定数）・BENCH_HYBRID_LATENCY_EXPECT_RESUMED=1（tie_refetch の after 側計測にのみ指定。hybrid_resumed_rounds が 0 なら非 0 終了）
 ifdef HAS_CARGO
 	cargo bench --bench hybrid_latency_bench -p engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-hybrid をスキップ"
+endif
+
+.PHONY: bench-hybrid-ab
+bench-hybrid-ab: ## Issue #506: 再開型探索（Issue #505・sql::hnsw_hybrid::HnswDenseProvider）の前後比較を ref_bf_large_tie5・hnsw_large_uniform・hnsw_large_tie5・hnsw_410shape_tie2 の 4 条件で交互 min-of-N 計測する（BEFORE_BIN・AFTER_BIN に退避済みバイナリの絶対パス、BEFORE_COMMIT・AFTER_COMMIT にビルド元コミットの hash を指定。AB_PAIRS（既定 5・5 未満は拒否）で交互ペア数を指定可。手動実行専用・CI 非配線。scripts/bench_hybrid_latency_ab.sh 参照）
+ifdef HAS_CARGO
+	scripts/bench_hybrid_latency_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hybrid-ab をスキップ"
 endif
 
 .PHONY: bench-parse-bind
@@ -361,7 +369,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-knn-profile
-bench-knn-profile: ## Issue #362（KNN 経路の段別内訳プロファイル。走査・デコード・arena 構築・距離計算の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_KNN_PROFILE_ENGINE=brute_force|hnsw|hnsw_f16（既定 brute_force・Issue #413・#516）で S0-cold/S0-hot の検索エンジンを ANN opt-in（Issue #403 B 案・hnsw_f16 は Issue #514 f16 常駐 opt-in）へ切り替えられる（S1〜S5' は非対象）。BENCH_KNN_PROFILE_DIM=<1-4096>（既定 128・Issue #466）でベクトル次元数を上書きできる。BENCH_KNN_PROFILE_VISIBLE_RATIO=1/<N>（Issue #487）で可視比率スイープへ切り替わる（S1〜S5' 非対象。BENCH_KNN_PROFILE_FULL_SCAN_RATIO=<num>/<den>〔engine=hnsw|hnsw_f16 限定〕・BENCH_KNN_PROFILE_SCALE=<1-40> と併用可）。BENCH_KNN_PROFILE_SPARSE_VISITED_MAX=<非負整数>〔engine=hnsw 限定・Issue #497〕で HNSW visited 集合切替閾値（`ValidatedHnswParams::with_sparse_visited_max`。既定 0＝常に dense）を上書きできる（S0-cold/S0-hot・可視比率スイープの双方に効く。#498 の計測用 knob）。BENCH_KNN_PROFILE_HOT_ONLY=1（Issue #516。VISIBLE_RATIO と排他）で S0-cold を省いた SQL 表層 e2e ホットパスのみを大規模点（scale 最大 40）向けに計測する。BENCH_KNN_PROFILE_INDEX_MEMORY=1（Issue #516。HOT_ONLY と排他・engine=hnsw|hnsw_f16 限定）で索引単体の常駐メモリ（子プロセス隔離計測）を出す
+bench-knn-profile: ## Issue #362（KNN 経路の段別内訳プロファイル。走査・デコード・arena 構築・距離計算の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_KNN_PROFILE_ENGINE=brute_force|hnsw|hnsw_f16|hnsw_i8（既定 brute_force・Issue #413・#516・#523）で S0-cold/S0-hot の検索エンジンを ANN opt-in（Issue #403 B 案・hnsw_f16 は Issue #514 f16 常駐 opt-in）へ切り替えられる（S1〜S5' は非対象）。BENCH_KNN_PROFILE_DIM=<1-4096>（既定 128・Issue #466）でベクトル次元数を上書きできる。BENCH_KNN_PROFILE_VISIBLE_RATIO=1/<N>（Issue #487）で可視比率スイープへ切り替わる（S1〜S5' 非対象。BENCH_KNN_PROFILE_FULL_SCAN_RATIO=<num>/<den>〔engine=hnsw|hnsw_f16 限定〕・BENCH_KNN_PROFILE_SCALE=<1-40> と併用可）。BENCH_KNN_PROFILE_SPARSE_VISITED_MAX=<非負整数>〔engine=hnsw 限定・Issue #497〕で HNSW visited 集合切替閾値（`ValidatedHnswParams::with_sparse_visited_max`。既定 0＝常に dense）を上書きできる（S0-cold/S0-hot・可視比率スイープの双方に効く。#498 の計測用 knob）。BENCH_KNN_PROFILE_HOT_ONLY=1（Issue #516。VISIBLE_RATIO と排他）で S0-cold を省いた SQL 表層 e2e ホットパスのみを大規模点（scale 最大 40）向けに計測する。BENCH_KNN_PROFILE_INDEX_MEMORY=1（Issue #516。HOT_ONLY と排他・engine=hnsw|hnsw_f16 限定）で索引単体の常駐メモリ（子プロセス隔離計測）を出す
 ifdef HAS_CARGO
 	cargo bench --bench knn_profile_bench -p engine
 else
@@ -369,7 +377,7 @@ else
 endif
 
 .PHONY: bench-knn-visible-ratio
-bench-knn-visible-ratio: ## Issue #487（可視比率〔1/2・1/4・1/10・1/20・1/50〕× 行数〔25k・100k〕での hnsw_subset と plain scan の損益分岐点を交互 N≥5 ペアで計測する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。SWEEP_PAIRS=<N>〔既定 5〕でペア数を上書きできる。SWEEP_CANDIDATES=default|visited〔既定 default。visited は Issue #498 の sparse_visited_max 診断用 candidate〕・SWEEP_RATIOS／SWEEP_SCALES で候補セット・可視率・規模点を上書きできる。ログは target/bench-knn-visible-ratio/<unix-ts>/ 配下）
+bench-knn-visible-ratio: ## Issue #487（可視比率〔1/2・1/4・1/10・1/20・1/50〕× 行数〔25k・100k〕での hnsw_subset と plain scan の損益分岐点を交互 N≥5 ペアで計測する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。SWEEP_PAIRS=<N>〔既定 5〕でペア数を上書きできる。SWEEP_CANDIDATES=default|visited|acorn〔既定 default。visited は Issue #498 の sparse_visited_max 診断用 candidate、acorn は Issue #501・#502 の ACORN-1（2-hop 展開）opt-in 前後比較用 candidate〕・SWEEP_RATIOS／SWEEP_SCALES で候補セット・可視率・規模点を上書きできる。ログは target/bench-knn-visible-ratio/<unix-ts>/ 配下）
 ifdef HAS_CARGO
 	scripts/bench_knn_visible_ratio_sweep.sh
 else
@@ -382,6 +390,22 @@ ifdef HAS_CARGO
 	scripts/bench_knn_f16_resident_ab.sh
 else
 	@echo "skip: Cargo.toml 未追加のため bench-knn-f16-resident をスキップ"
+endif
+
+.PHONY: bench-knn-i8-resident
+bench-knn-i8-resident: ## Issue #523（I8〔SQ8〕常駐〔hnsw_i8〕と f32 常駐〔hnsw〕の前後比較・常駐メモリを交互 N≥5 ペア＋索引単体メモリ計測で記録する。scripts/bench_knn_f16_resident_ab.sh の AB_CANDIDATE_ENGINE=hnsw_i8 opt-in で実行する〔#516 と同一スクリプト・同一 knob〕）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。AB_PAIRS=<N>〔既定 5〕・AB_POINTS="scale:dim ..."〔既定 "1:128 4:128 20:128 1:768 4:768"〕・AB_MEMORY_POINTS="scale:dim ..."〔既定 AB_POINTS + "20:768"〕で上書きできる。ログは target/bench-knn-i8-resident/<UTC ts>/ 配下。scripts/bench_knn_f16_resident_ab.sh --summarize <dir> で TSV 集約）
+ifdef HAS_CARGO
+	AB_CANDIDATE_ENGINE=hnsw_i8 scripts/bench_knn_f16_resident_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-knn-i8-resident をスキップ"
+endif
+
+.PHONY: bench-knn-precision-resident
+bench-knn-precision-resident: ## Issue #526（Apple M 実機での i8／f16／f32 経路の前後比較）。scripts/bench_knn_f16_resident_ab.sh の AB_CANDIDATE_ENGINES="hnsw_f16 hnsw_i8" opt-in（複数候補輪番）で hnsw〔f32〕・hnsw_f16・hnsw_i8 の 3 精度を同一計測セッションで一括計測する（#516・#523 と同一スクリプト・同一 knob。手順・記録テンプレートは docs/design/chip-kernel-guidelines.md §7.7 参照）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。AB_PAIRS=<N>〔既定 5〕・AB_POINTS="scale:dim ..."〔既定 "1:128 4:128 20:128 1:768 4:768"〕・AB_MEMORY_POINTS="scale:dim ..."〔既定 AB_POINTS + "20:768"〕で上書きできる。ログは target/bench-knn-precision-resident/<UTC ts>/ 配下。scripts/bench_knn_f16_resident_ab.sh --summarize <dir> で TSV 集約）
+ifdef HAS_CARGO
+	AB_CANDIDATE_ENGINES="hnsw_f16 hnsw_i8" scripts/bench_knn_f16_resident_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-knn-precision-resident をスキップ"
 endif
 
 # --------------------------------------------------
@@ -569,6 +593,22 @@ else
 	@echo "skip: Cargo.toml 未追加のため hnsw-search-recall をスキップ"
 endif
 
+.PHONY: hnsw-i8-recall
+hnsw-i8-recall: ## Issue #523（R5。I8（SQ8）常駐 opt-in の brute-force 対照 Recall@10 を F32 常駐対比で ef ∈ {64, 128, 256} 掃引し、oversampling（ef 引き上げ）で補えるかの判断材料を標準出力へ出す。crates/engine/tests/hnsw_i8_recall.rs。層 A は make ci 対象・層 B は #[ignore]・release 実行専用）
+ifdef HAS_CARGO
+	cargo test --release -p engine --test hnsw_i8_recall -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため hnsw-i8-recall をスキップ"
+endif
+
+.PHONY: hnsw-acorn-recall
+hnsw-acorn-recall: ## Issue #502（ACORN-1〔2-hop 展開〕の可視比率別 Recall 回帰の層 B: 25,000 行・dim128 で可視比率 1/2・1/4・1/5・1/10 を横断し Recall@10・レジーム分類を標準出力へ記録する）を実行する（層 A は make ci 対象・crates/engine/tests/hnsw_acorn_recall.rs。層 B は #[ignore]・release 実行専用）
+ifdef HAS_CARGO
+	cargo test --release -p engine --test hnsw_acorn_recall -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため hnsw-acorn-recall をスキップ"
+endif
+
 # --------------------------------------------------
 # 疎索引キャッシュ cold/hot 等価性の大規模段（Issue #358。crates/engine/tests/sparse_cache_recall.rs）
 # --------------------------------------------------
@@ -598,7 +638,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: recall-regression
-recall-regression: ## TASK-104 のハイブリッド検索 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路、RECALL_ENGINE=hnsw_f16 で f16 常駐 opt-in 経路を測定〔既定 brute_force。Issue #412・#515〕）
+recall-regression: ## TASK-104 のハイブリッド検索 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路、RECALL_ENGINE=hnsw_f16 で f16 常駐 opt-in 経路、RECALL_ENGINE=hnsw_i8 で I8（SQ8）常駐 opt-in 経路を測定〔既定 brute_force。Issue #412・#515・#523〕）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test hybrid_recall -- --ignored --nocapture
 else
@@ -610,7 +650,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: rerank-regression
-rerank-regression: ## TASK-108 のリランキング効果測定 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路、RECALL_ENGINE=hnsw_f16 で f16 常駐 opt-in 経路を測定〔既定 brute_force。Issue #412・#515〕）
+rerank-regression: ## TASK-108 のリランキング効果測定 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路、RECALL_ENGINE=hnsw_f16 で f16 常駐 opt-in 経路、RECALL_ENGINE=hnsw_i8 で I8（SQ8）常駐 opt-in 経路を測定〔既定 brute_force。Issue #412・#515・#523〕）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test rerank_recall -- --ignored --nocapture
 else
@@ -622,7 +662,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: query-planning-regression
-query-planning-regression: ## TASK-112・TASK-113 のクエリ展開受け入れ基準（intent 改善幅・direct 維持・劣化展開時の intent 改善幅・大規模段 direct 絶対下限）Recall 閾値ゲート（層 B。--ignored 一括実行のため大規模段ゲートも対象に含む）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路、RECALL_ENGINE=hnsw_f16 で f16 常駐 opt-in 経路を測定〔既定 brute_force。Issue #412・#515〕）
+query-planning-regression: ## TASK-112・TASK-113 のクエリ展開受け入れ基準（intent 改善幅・direct 維持・劣化展開時の intent 改善幅・大規模段 direct 絶対下限）Recall 閾値ゲート（層 B。--ignored 一括実行のため大規模段ゲートも対象に含む）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303。RECALL_ENGINE=hnsw で ANN opt-in 経路、RECALL_ENGINE=hnsw_f16 で f16 常駐 opt-in 経路、RECALL_ENGINE=hnsw_i8 で I8（SQ8）常駐 opt-in 経路を測定〔既定 brute_force。Issue #412・#515・#523〕）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test query_planning_recall -- --ignored --nocapture
 else

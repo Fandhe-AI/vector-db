@@ -241,6 +241,7 @@ pub mod row_codec;
 pub mod scoring_boost;
 pub mod search_engine;
 pub mod sparse;
+pub(crate) mod sq8;
 pub mod sql;
 pub mod storage;
 pub mod tenant;

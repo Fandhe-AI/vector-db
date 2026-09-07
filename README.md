@@ -17,6 +17,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - **接続プロトコル**: PostgreSQL wire プロトコル v3 互換の**自作実装**（`pgwire` 等の外部ライブラリへ可能な限り依存しない）。psql・psycopg・node pg が無改造で接続可能なことを PoC-8 で実測済み
 - **クエリ表層**: 標準クエリカタログ C1〜C5 を MVP とする vector 特化 SQL（C6 集計・C7 結合は拡張扱い）。LLM クエリプランニングは専用構文 `USING PLAN(...)` で SQL に露出
 - **検索モード**: `recall`（広域・既定）／`precision`（ピンポイント抽出）の切り替えを提供。切替手段・実行契約の詳細は spec のビヘイビア定義（SQL-12・SEARCH-9/10・PLAN-11・TASK-161〜165）を参照
+- **広域取得（ソートなしのフィルタ取得）**: `ORDER BY`／`USING PLAN` を伴わない `SELECT ... [WHERE ...] LIMIT n` を SQL 表層へ追加（`Statement::Scan`。Issue #454）。ランキング段・取得モードを持たず、可視かつ `WHERE` を満たす行を先頭から `LIMIT` 件返す（順序保証なし・早期終了）。契約の詳細（spec 側では SQL-15・TASK-170 として付与済み〔vector-db-spec#12〕。受け入れ確認・確定化は TASK-170 が担う。閾値等は実装既定値）は [`docs/design/wide-retrieval-scan.md`](docs/design/wide-retrieval-scan.md) を参照
 - **クレート構成**: `engine`（コアロジック: データロード・検索カーネル・認証・RLS）＋ `wire-server`（バイナリ）の workspace 構成（TASK-66 で雛形を構築済み。各機能の実装は後続タスク）
 - **永続化**: `redb` ベース（単一ライタ・スナップショット読み取り。並行書き込み検証は MS-1 の TASK-144）
 - **安全性**: RLS 相当のテナント境界・fail-closed のエラー契約（SQLSTATE 風 `wire_code`）
@@ -25,7 +26,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - **バッチ検索の GPU 経路**: 一括インデクシング専用のバッチ検索（TASK-128〜130）は `wgpu`（=30.0.1・依存追加はオーナー承認済み〔2026-08-26〕）による実 GPU バックエンドを持ち、初期化失敗・実行時エラー時は CPU-SIMD 経路へ fail-closed に縮退する（詳細: [`docs/design/gpu-batch-wgpu-enablement.md`](docs/design/gpu-batch-wgpu-enablement.md)）。単発クエリ経路は引き続き CPU-SIMD のみ。GPU 側 workgroup 内部分 Top-k（共有メモリ上の bitonic ソート網＋CPU 側 `TopKSelector` 最終マージ）は [`docs/design/gpu-batch-topk.md`](docs/design/gpu-batch-topk.md)（Issue #535 で設計・#536 で実装済み・#537 で前後比較実測済み。readback バイト数は
 12.66〜12.79x 削減を確定的カウンタで確認し、ADR ステータスは Accepted）
 - **hybrid 検索の疎索引**: BM25 疎索引（`SparseIndex`）は転置索引（posting list）＋可視ビットマップ 1 パス走査方式で、RLS 可視集合へ統計（df・N・avgdl）自体を縮約する fail-closed 設計（posting へのスコアリング走査のみがコーパス文書数への線形走査から脱却し、可視集合走査 `O(|visible_ids|)`・スコアアキュムレータ初期化 `O(N)` は残る。詳細: [`docs/design/sparse-inverted-index.md`](docs/design/sparse-inverted-index.md)）
-- **ANN 索引（opt-in）**: 既定の検索エンジンは厳密最近傍（brute-force）のまま不変。`SearchEngineKind::Hnsw`（自作 HNSW・依存追加なし）を明示的に選択したときのみ opt-in で有効化される（ADR: [`docs/design/ann-index-adoption.md`](docs/design/ann-index-adoption.md) B 案）。適用状況は `EXPLAIN` の `engine:`／`ann_plan:` 行で確認できる。前後比較・opt-in 手順の詳細は下記「ANN（HNSW）opt-in 手順と前後比較（Issue #413）」節を参照。索引ノードの f16 常駐（`ResidentPrecision::F16`。既定 f32・opt-in）と F16C／NEON fp16 デコード付き dot カーネルは [`docs/design/hnsw-f16-resident.md`](docs/design/hnsw-f16-resident.md)（Issue #514）を参照
+- **ANN 索引（opt-in）**: 既定の検索エンジンは厳密最近傍（brute-force）のまま不変。`SearchEngineKind::Hnsw`（自作 HNSW・依存追加なし）を明示的に選択したときのみ opt-in で有効化される（ADR: [`docs/design/ann-index-adoption.md`](docs/design/ann-index-adoption.md) B 案）。適用状況は `EXPLAIN` の `engine:`／`ann_plan:` 行で確認できる。前後比較・opt-in 手順の詳細は下記「ANN（HNSW）opt-in 手順と前後比較（Issue #413）」節を参照。索引ノードの f16 常駐（`ResidentPrecision::F16`。既定 f32・opt-in）と F16C／NEON fp16 デコード付き dot カーネルは [`docs/design/hnsw-f16-resident.md`](docs/design/hnsw-f16-resident.md)（Issue #514）を参照。索引ノードの対称 SQ8（i8）常駐（`ResidentPrecision::I8`。既定 f32・opt-in。次元ごと min/max 由来のスケールで凍結時に 1 回量子化し、索引ヒットの最終スコアは常に f32 アリーナ再計算のまま不変）は [`docs/design/hnsw-sq8-resident.md`](docs/design/hnsw-sq8-resident.md)（Issue #521）を参照。同索引ノードの整数 i8×i8 dot カーネル（VNNI 512bit／256bit・i16 widen フォールバック。ISA 間ビット一致）は同 doc「Issue #522」節を、aarch64 NEON dotprod（`vdotq_s32`）版は同 doc「Issue #525」節を参照
 - **他実装比較・チップ別カーネル設計指針**: 他実装のホットパス手法・採否候補・ライセンス帰属は [`docs/design/hotpath-implementation-survey.md`](docs/design/hotpath-implementation-survey.md)、チップ別設計指針と Rust stable での intrinsics 可用性は [`docs/design/chip-kernel-guidelines.md`](docs/design/chip-kernel-guidelines.md)（いずれも調査記録・採用決定は各 Phase Issue）。intrinsics 導入方針 ADR（unsafe 境界・set 構築ロード・ディスパッチ設計・toolchain 1.98・適用経路）は [`docs/design/simd-intrinsics-adoption.md`](docs/design/simd-intrinsics-adoption.md)（Issue #508・ステータス Proposed・オーナー承認待ち）。`isa.rs::dot_lanes` の零埋め固定長バッファによる分岐なし tail（AVX2／AVX-512／NEON。順序保存・既定経路は現行のスカラー tail のまま不変）は [`docs/design/dot-kernel-branchless-tail.md`](docs/design/dot-kernel-branchless-tail.md)（Issue #528。既定切替の採否は Issue #529 で dim 100／129／768 の前後比較実測により Rejected・現状維持確定。`BENCH_DOT_KERNEL_TAIL_AB=1 make bench-dot-kernel` で opt-in の tail A/B 実測を再現可能）。`search_range` の 4 行ブロック（AVX2+FMA／AVX-512F／NEON）カーネルの設計・生成コード検査で判明した SLP 再パック問題と対処は [`docs/design/dot-kernel-row-block.md`](docs/design/dot-kernel-row-block.md)（Issue #510・#511 実装済み。前後比較・採否記録は Issue #512（`BENCH_DOT_KERNEL_BLOCK_AB=1 make bench-dot-kernel`。「参考値・現状維持」。詳細は [`docs/design/dot-kernel-multi-accumulator.md`](docs/design/dot-kernel-multi-accumulator.md)「行間再利用（Issue #512）」節）実施済み。dim 閾値ディスパッチ（Issue #517・#518。既定閾値 768）の前後比較・閾値候補実測は
 `scripts/bench_dot_kernel_ab.sh`（`dot_kernel_bench` の before/after 交互 min-of-N 実行ドライバ）で Issue #519 が本環境（共有 QEMU）の参考値を実測済み（詳細:
 `docs/design/dot-kernel-multi-accumulator.md`「Issue #519 追記」節）。AVX-512／NEON 実機での前後比較・閾値の最終確定は Issue #530）
@@ -207,6 +208,43 @@ wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契�
 設定された実行環境では起動直後に fail-closed で拒否します。実測結果・設計は
 `docs/design/hybrid-refetch-latency.md` を参照してください。
 
+**SQL 表層（hnsw opt-in）計測モード（Issue #506）**: 既定モード（env 未設定）は
+`hybrid::hybrid_search` を直接呼ぶため、Issue #505 の実 seam
+（`sql::hnsw_hybrid::HnswDenseProvider`）を通りません。`BENCH_HYBRID_LATENCY_ENGINE=
+brute_force|hnsw|hnsw_f16` を設定すると、`EngineCore::from_storage_with_engine`
+＋ `ORDER BY HYBRID(...)`（SQL 表層。ANN opt-in の唯一の到達経路）を計測する
+モードへ切り替わります（既定モードの出力は本追加の前後で不変）。
+`BENCH_HYBRID_LATENCY_SCALE=small|large|all`（既定 all）・
+`BENCH_HYBRID_LATENCY_CORPUS=no_refetch|tie_refetch|all`（既定 all）・
+`BENCH_HYBRID_LATENCY_NUM_DOCS`／`_DIM`／`_VOCAB_SIZE`／`_QUANTIZE_LEVELS`
+（既定はスケール別定数を上書き）・`BENCH_HYBRID_LATENCY_EXPECT_RESUMED=1`
+（`tie_refetch` の after 側計測にのみ指定。`hybrid_resumed_rounds` が 0 のまま
+なら非 0 終了）を指定できます。
+
+前後比較は `scripts/bench_hybrid_latency_ab.sh`（`make bench-hybrid-ab`）で
+行います。`BEFORE_BIN`／`AFTER_BIN` に退避済みバイナリの絶対パス、
+`BEFORE_COMMIT`／`AFTER_COMMIT` にビルド元コミットの hash を指定し
+（`docs/design/benchmark-judgement-policy.md` §3 が要求する追跡可能性のため
+必須）、`AB_PAIRS`（既定 5・5 未満は拒否）で交互ペア数を指定して
+`ref_bf_large_tie5`・`hnsw_large_uniform`・`hnsw_large_tie5`・
+`hnsw_410shape_tie2`（Issue #410 形状）の 4 条件を before→after の順で交互
+実行します。`--summarize <dir>` で `hybrid_latency: stage=` 行・環境行を
+条件・ペア・before/after の実行順で列挙できます（判定・平均化は行わず、
+生ログをそのまま出力）。before バイナリの再現手順（`838c53e` = Issue #505
+直前）:
+
+```bash
+git archive 838c53e | tar -x -C <scratch>/before
+# 本ベンチの差分のみを overlay（production・Cargo.lock は 838c53e のまま）
+cp crates/engine/benches/hybrid_latency_bench.rs <scratch>/before/crates/engine/benches/
+cp crates/engine/benches/harness/hybrid_latency.rs <scratch>/before/crates/engine/benches/harness/
+CARGO_TARGET_DIR=<scratch>/target-before cargo build --release \
+  --manifest-path <scratch>/before/Cargo.toml -p engine --bench hybrid_latency_bench
+```
+
+実測結果・判断は `docs/design/hnsw-hybrid-iterative-scan.md`「前後比較実測
+（Issue #506）」節を参照してください。
+
 ### hybrid_rrf 段別内訳プロファイルと転置索引化の前後比較（Issue #356・#387・#394）
 
 `make bench-hybrid-profile`（`crates/engine/benches/hybrid_profile_bench.rs`・
@@ -371,7 +409,7 @@ GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README
 `make bench-chip`（`crates/engine/benches/chip_bench.rs`）は、`bench-dot-kernel`・`bench-knn-profile`・`feature_bench`（`BENCH_FEATURE_DIM=128`／`768`）の 4 ワークロードを 1 ワークロード = 1 子プロセスとしてラウンドロビン交互計測し、CPU 情報・実行時検出 ISA・per-run 生データ・min/median・参照区間帯を `summary.json` へ出力します。
 
 > [!IMPORTANT]
-> `.github/workflows/*` には配線しません。`bench-tier`（TASK-116）と同じ理由（AGENTS.md「CI・ワークフローの改変（P1）」）で、Phase 4（チップ最適カーネル）の採否判定に必要な AVX-512／NEON／実キャッシュ階層は本開発環境（QEMU 仮想 CPU）では実測できず、オーナー実機（Apple M／AMD Zen 4・5／Intel）での手動実行が正式な入口です。
+> `.github/workflows/*` には配線しません。`bench-tier`（TASK-116）と同じ理由（AGENTS.md「CI・ワークフローの改変（P1）」）で、Phase 4（チップ最適カーネル）の採否判定に必要な AVX-512／NEON／実キャッシュ階層は本開発環境（QEMU 仮想 CPU）では実測できず、オーナー実機（Apple M／AMD Zen 4・5／Intel）での手動実行が正式な入口です。Apple M 実機での i8／f16／f32 経路の前後比較専用の手順・記録テンプレートは `docs/design/chip-kernel-guidelines.md` §7.7（Issue #526）を参照してください。
 
 前提: Linux／aarch64 Linux は `/proc/cpuinfo`（追加ツール不要）、macOS は Xcode Command Line Tools（`cargo`）と `sysctl`（標準搭載）のみで動作します。`contrast-bench` feature は使わないため C++17 コンパイラは不要です。
 
@@ -407,6 +445,8 @@ env 変数（すべて fail-closed パース。不正値は非ゼロ終了）:
 `engine::gpu_batch`（f16 常駐）と CPU-SIMD バッチ経路の規模 × バッチサイズ別比較を行います。`BENCH_GPU_SCALING_ROWS`／`DIMS`／`BATCH`／`TOPK`／`ITERS` で計測条件を上書きできます。GPU 実機必須・手動実行専用ベンチで CI 非配線です。実測結果は `docs/design/crossdb-bench.md`「GPU」節を参照してください。`gpu_scaling:` 結果行に続けて出力される `gpu_scaling_stats:` 行（Issue #537）は f16／f32 各経路の読み戻し統計（`partial_topk_dispatches`・`full_readback_dispatches`・1 呼び出しあたり readback バイト数、Issue #539 追加分の `f16_arith_dispatches`・`f16_arith_guard_fallbacks`）を表示し、`scripts/bench_gpu_scaling_ab.sh` の結果行 grep（`^gpu_scaling: rows=`）とは接頭辞を分離しているため既存 A/B 集計には混入しません。`Features::SHADER_F16` 対応アダプタ（本開発環境の RTX 3060 を含む）でも、f16 経路（読み出し直後に f32 へ拡張してから積和するため算術自体は f32）が自動的に選ばれるのは選択条件（アダプタが `SHADER_F16` に対応し、かつクエリの全成分が f16 として厳密往復可能・オーバーフロー／非正規化アンダーフローも生じないこと。`select_dot_shader`／`docs/design/gpu-batch-f16-arith.md` 参照）を満たす場合に限られ、満たさない場合は unpack 版へ fail-closed に縮退します。CORE-16 ゲート（`crates/engine/benches/batch_bench.rs::build_scaled_gate_dataset`）が生成するクエリは `rng.next_vector` による任意精度の f32 値で f16 丸めを行わないため、往復可能性ガードにより実際には unpack 版へ縮退することがあり、被検側（f16 常駐）が新シェーダを経由するとは限りません。実際にどちらの経路を通ったかは `GpuBatchStats`（`f16_arith_dispatches`／`f16_arith_guard_fallbacks`。`make bench-gpu-scaling` の `gpu_scaling_stats:` 行で確認可能）で確認する必要があります。CORE-16 ゲート本体・規模点診断は `BENCH_VERBOSE=1` 指定時に `verbose(...): f16_arith_available=.. f16_arith_dispatches=.. f16_arith_guard_fallbacks=..` 行（Issue #540。合否には数えない情報提供専用）を追加出力するようになり、本開発環境の実測では常に `dispatches=0 guard_fallbacks=40`（構造的に unpack 版のまま）でした。`gpu_scaling_bench` へは opt-in `BENCH_GPU_SCALING_QUERY_F16_EXACT=1`（クエリを f16 厳密往復可能な値へ丸める。`harness/gpu_scaling.rs::round_to_f16_exact`）を追加し、`scripts/bench_gpu_scaling_ab.sh` へも `QUERY_F16_EXACT=1` としてパススルーできます（summary.tsv 末尾へ `f16_arith_dispatches`／`f16_arith_guard_fallbacks` 列を追加）。前後比較の詳細・実測値は Issue #540・`docs/design/gpu-batch-f16-arith.md`「8. 前後比較実測」節を参照してください。
 
 i8 パック常駐経路（`engine::gpu_batch::packed_i8::GpuI8BatchBackend`。Issue #542。opt-in・候補生成専用）の計測行 `gpu_scaling_i8:`／`gpu_scaling_i8_stats:`（Issue #543）が A/B/C 3 経路の後段に追加で出力されます。`gpu_scaling_i8:` は CPU-SIMD 厳密対照に対する同点許容つき不一致件数（`i8_mismatch`）・平均 Recall@k（`i8_recall_at_k`。確定的指標）・速度比（`speedup_i8_vs_cpu_p95`／`speedup_i8_vs_f16_p95`）を出力し、`gpu_scaling_i8_stats:` は読み戻し・再スコア候補数・GPU backend・`build_ms` を出力します。`GpuI8Options::oversample` は構築時固定のため 1 プロセス = 1 oversample しか計測できません（`BENCH_GPU_SCALING_I8_OVERSAMPLE`。未設定時は既定 `packed_i8::DEFAULT_I8_OVERSAMPLE`＝4）。oversample のスイープは `scripts/bench_gpu_scaling_ab.sh` を `I8_OVERSAMPLE=<値>` 付きで複数回起動して行います（設定時のみ両バイナリへパススルー。before バイナリ〔i8 経路実装前〕は未知の env を読まないため無害）。実測結果・oversample 推奨値は `docs/design/gpu-batch-i8-packed.md`「前後比較実測（Issue #543）」節を参照してください。
+
+Phase 5（#532・#536・#539・#542）の通し前後比較・FAISS GPU 対照・Qdrant GPU 構築対照の更新・Apple UMA ゼロコピー静的確認は `docs/design/gpu-batch-phase5-before-after.md`（Issue #544）を参照してください。
 
 ### Recall 回帰ハーネスの repo secrets（TASK-104）
 
@@ -488,7 +528,7 @@ gh secret set QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE --env recall-gate
 
 ### ANN opt-in 時の Recall ゲート実測（Issue #412）
 
-3 つの Recall 閾値ゲート（hybrid・rerank・query-planning）は `RECALL_ENGINE` 環境変数（非機密の opt-in フラグ。値そのものは閾値ではないため secrets ではなく repo variables 相当の扱い）で測定対象の検索エンジンを選べます。`brute_force` は従来どおり `engine::hybrid::hybrid_search` を in-memory 配列に対して直接呼ぶ既存経路で、実測値・固定値アサーションに一切影響しません。`hnsw` を指定すると、SQL 表層（`EngineCore::from_storage_with_engine` ＋ `ORDER BY HYBRID(...)`）経由の ANN opt-in 経路（ADR `docs/design/ann-index-adoption.md` B 案）で同一の閾値を判定します——ANN の実装 seam（`sql::hnsw_cache`／`sql::hnsw_hybrid`）は結合テストから直接は触れない `pub(crate)` のため、SQL 表層を通すのが production API 経由で ANN 経路へ到達する唯一の方法です（`crates/engine/tests/fixtures/recall_engine.rs` 参照）。`hnsw_f16`（Issue #515）を指定すると、同じ ANN opt-in 経路を HNSW 索引ノードの f16 常駐表現（`hnsw::ResidentPrecision::F16`。Issue #514・`docs/design/hnsw-f16-resident.md`）付きで測定します。`.github/workflows/recall.yml` は `strategy.matrix.recall_engine: [brute_force, hnsw, hnsw_f16]` で 3 エンジンを常に独立 job としてゲートします（`workflow_dispatch`・週次 `schedule` いずれのトリガでも同じ。以前の選択式 `workflow_dispatch` 入力は `schedule` 実行で `hnsw` が測定されない抜け穴になっていたため撤去しました。Issue #412）。
+3 つの Recall 閾値ゲート（hybrid・rerank・query-planning）は `RECALL_ENGINE` 環境変数（非機密の opt-in フラグ。値そのものは閾値ではないため secrets ではなく repo variables 相当の扱い）で測定対象の検索エンジンを選べます。`brute_force` は従来どおり `engine::hybrid::hybrid_search` を in-memory 配列に対して直接呼ぶ既存経路で、実測値・固定値アサーションに一切影響しません。`hnsw` を指定すると、SQL 表層（`EngineCore::from_storage_with_engine` ＋ `ORDER BY HYBRID(...)`）経由の ANN opt-in 経路（ADR `docs/design/ann-index-adoption.md` B 案）で同一の閾値を判定します——ANN の実装 seam（`sql::hnsw_cache`／`sql::hnsw_hybrid`）は結合テストから直接は触れない `pub(crate)` のため、SQL 表層を通すのが production API 経由で ANN 経路へ到達する唯一の方法です（`crates/engine/tests/fixtures/recall_engine.rs` 参照）。`hnsw_f16`（Issue #515）を指定すると、同じ ANN opt-in 経路を HNSW 索引ノードの f16 常駐表現（`hnsw::ResidentPrecision::F16`。Issue #514・`docs/design/hnsw-f16-resident.md`）付きで測定します。`hnsw_i8`（Issue #523）を指定すると、同じ経路を I8（SQ8）常駐表現（`hnsw::ResidentPrecision::I8`。Issue #521・#522・`docs/design/hnsw-sq8-resident.md`）付きで測定します。`.github/workflows/recall.yml` は `strategy.matrix.recall_engine: [brute_force, hnsw, hnsw_f16, hnsw_i8]` で 4 エンジンを常に独立 job としてゲートします（`workflow_dispatch`・週次 `schedule` いずれのトリガでも同じ。以前の選択式 `workflow_dispatch` 入力は `schedule` 実行で `hnsw` が測定されない抜け穴になっていたため撤去しました。Issue #412）。
 
 ```bash
 RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make recall-regression
@@ -496,11 +536,13 @@ RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make rerank-regression
 RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make query-planning-regression
 # f16 常駐 opt-in（Issue #515）を測定する場合は hnsw_f16 を指定します
 RECALL_ENGINE=hnsw_f16 RECALL_VERBOSE=1 make recall-regression
-# CI から手動実行する場合（brute_force/hnsw/hnsw_f16 の 3 matrix job が起動します）
+# I8（SQ8）常駐 opt-in（Issue #523）を測定する場合は hnsw_i8 を指定します
+RECALL_ENGINE=hnsw_i8 RECALL_VERBOSE=1 make recall-regression
+# CI から手動実行する場合（brute_force/hnsw/hnsw_f16/hnsw_i8 の 4 matrix job が起動します）
 gh workflow run recall.yml --ref main
 ```
 
-各ゲートのコーパス規模が `MIN_INDEXED_ROWS`（ANN 索引の下限行数。`sql::hnsw_cache.rs` の非公開定数）を下回る段（hybrid の小規模段のみ・400 件）は、`RECALL_ENGINE=hnsw`／`hnsw_f16` を指定しても構造的に brute-force のまま索引を構築しません（そのようにゲート側が非 vacuous 検証で固定しています）。それ以外の段（hybrid・query-planning の各小規模段は 4,000 件以上、大規模段は 20,000〜40,000 件）は実際に HNSW 索引を構築して測定します。検証設計・実測結果は `docs/design/ann-recall-gate-verification.md` を参照してください（`hnsw_f16` の実測は同 doc「Issue #515 追記」節）。
+各ゲートのコーパス規模が `MIN_INDEXED_ROWS`（ANN 索引の下限行数。`sql::hnsw_cache.rs` の非公開定数）を下回る段（hybrid の小規模段のみ・400 件）は、`RECALL_ENGINE=hnsw`／`hnsw_f16`／`hnsw_i8` を指定しても構造的に brute-force のまま索引を構築しません（そのようにゲート側が非 vacuous 検証で固定しています）。それ以外の段（hybrid・query-planning の各小規模段は 4,000 件以上、大規模段は 20,000〜40,000 件）は実際に HNSW 索引を構築して測定します。検証設計・実測結果は `docs/design/ann-recall-gate-verification.md` を参照してください（`hnsw_f16` の実測は同 doc「Issue #515 追記」節・`hnsw_i8` の実測は同 doc「Issue #523 追記」節）。
 
 ### ANN（HNSW）opt-in 手順と前後比較（Issue #413）
 
@@ -513,7 +555,7 @@ let core = engine::core::EngineCore::from_storage_with_engine(storage, kind);
 
 `crates/engine/examples/feature_bench.rs`（13 フェーズ通し計測）・`crates/engine/benches/knn_profile_bench.rs`（`make bench-knn-profile`）は、いずれも ANN opt-in・規模スケールを env 変数で切り替えられます。
 
-- `BENCH_FEATURE_ENGINE` / `BENCH_KNN_PROFILE_ENGINE`: 未設定・空・`brute_force`（既定）／`hnsw`（`HnswParams::default()` で opt-in）／`hnsw_f16`（Issue #516。索引ノード f16 常駐 opt-in・`ValidatedHnswParams::with_resident_precision(F16)`。詳細は `docs/design/hnsw-f16-resident.md`）。未知値は fail-closed で拒否
+- `BENCH_FEATURE_ENGINE` / `BENCH_KNN_PROFILE_ENGINE`: 未設定・空・`brute_force`（既定）／`hnsw`（`HnswParams::default()` で opt-in）／`hnsw_f16`（Issue #516。索引ノード f16 常駐 opt-in・`ValidatedHnswParams::with_resident_precision(F16)`。詳細は `docs/design/hnsw-f16-resident.md`）／`hnsw_i8`（Issue #523。索引ノード I8（SQ8）常駐 opt-in・`ValidatedHnswParams::with_resident_precision(I8)`。詳細は `docs/design/hnsw-sq8-resident.md`）。未知値は fail-closed で拒否
 - `BENCH_FEATURE_SCALE`（`feature_bench` のみ）: 正整数倍率。既定 1（25,000 行）。`hnsw::MAX_HNSW_NODES` を超えない範囲で bound
 - `BENCH_FEATURE_DIM` / `BENCH_KNN_PROFILE_DIM`（Issue #466）: 正整数・既定 128・上限 4,096。dim=768／1536 が Issue #365 で採否の判別変数と判明したため、横断 SQL ベンチ側にも dim を可変にする規模点を用意したもの。未知値・0・上限超過は fail-closed で拒否
 
@@ -541,15 +583,17 @@ make bench-knn-visible-ratio  # 全比率 × 全行数 × 4 arm を交互 N ペ�
 
 実測結果・判断は `docs/design/hnsw-rls-cardinality-switch.md`「可視比率 × 行数の損益分岐点実測（Issue #487）」を参照してください。
 
-`knn_profile_bench` にはさらに、f16 常駐（`hnsw_f16`）と f32 常駐（`hnsw`）の前後比較・常駐メモリ実測専用の 2 モードがあります（Issue #516。互いに排他、`BENCH_KNN_PROFILE_VISIBLE_RATIO` とも排他）。
+`knn_profile_bench` にはさらに、f16 常駐（`hnsw_f16`）／I8 常駐（`hnsw_i8`）と f32 常駐（`hnsw`）の前後比較・常駐メモリ実測専用の 2 モードがあります（Issue #516・#523。互いに排他、`BENCH_KNN_PROFILE_VISIBLE_RATIO` とも排他）。
 
 - `BENCH_KNN_PROFILE_HOT_ONLY=1`: S0-cold（毎サンプル新規 `EngineCore` 構築）を省き、索引 1 回構築＋ SQL 表層 e2e ホットパス（S0-hot 相当）と参照区間（`COUNT(*)`）のみを測ります。`BENCH_KNN_PROFILE_SCALE`（最大 40 = 1,000,000 行）まで許容するため、500k 行規模のような S0-cold が非現実的な所要時間になる規模点向けです
-- `BENCH_KNN_PROFILE_INDEX_MEMORY=1`（`BENCH_KNN_PROFILE_ENGINE=hnsw|hnsw_f16` 限定）: redb・SQL 表層（`VectorArena` の 1 GiB 上限）を経由せず、メモリ上のコーパスから `HnswIndex` を 1 回構築して常駐バイト数（`approx_heap_bytes`・VmRSS 前後差・VmHWM）を子プロセス隔離で計測します。500k×768 のように SQL 表層では構造的に到達不能な規模点でも、索引単体としては計測できます
+- `BENCH_KNN_PROFILE_INDEX_MEMORY=1`（`BENCH_KNN_PROFILE_ENGINE=hnsw|hnsw_f16|hnsw_i8` 限定）: redb・SQL 表層（`VectorArena` の 1 GiB 上限）を経由せず、メモリ上のコーパスから `HnswIndex` を 1 回構築して常駐バイト数（`approx_heap_bytes`・VmRSS 前後差・VmHWM）を子プロセス隔離で計測します。500k×768 のように SQL 表層では構造的に到達不能な規模点でも、索引単体としては計測できます
 
 ```bash
 BENCH_KNN_PROFILE_HOT_ONLY=1 BENCH_KNN_PROFILE_ENGINE=hnsw_f16 BENCH_KNN_PROFILE_SCALE=20 make bench-knn-profile  # 500,000 行・f16 常駐
 BENCH_KNN_PROFILE_INDEX_MEMORY=1 BENCH_KNN_PROFILE_ENGINE=hnsw_f16 BENCH_KNN_PROFILE_SCALE=20 BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 make bench-knn-f16-resident  # 全規模点 × f32/f16 を交互 N≥5 ペア＋索引単体メモリで一括実行（AB_PAIRS・AB_POINTS・AB_MEMORY_POINTS で上書き可）
+make bench-knn-i8-resident  # 同じスクリプトの AB_CANDIDATE_ENGINE=hnsw_i8 opt-in（Issue #523。f32/I8 常駐の前後比較）
+make bench-knn-precision-resident  # 同じスクリプトの AB_CANDIDATE_ENGINES="hnsw_f16 hnsw_i8" opt-in（Issue #526。f32/f16/i8 の 3 精度を同一セッションで一括計測。Apple M 実機向け手順・記録テンプレートは docs/design/chip-kernel-guidelines.md §7.7 参照）
 ```
 
 実測結果・判断は `docs/design/hnsw-f16-resident.md`「Issue #516 追記」節を参照してください。

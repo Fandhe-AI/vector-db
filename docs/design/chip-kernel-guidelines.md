@@ -262,7 +262,7 @@ Issue #365 で行内マルチアキュムレータ化は不採用済み（cache 
 | 2 | GPU 側 Top-k | 行数分の f32 全量 readback（最大 32 MiB）を k×workgroup 数へ。`SUBGROUP` で縮約。実機確認・設計は [`gpu-batch-topk.md`](gpu-batch-topk.md)（#535） | #534 |
 | 3 | `SHADER_F16` ネイティブ f16 FMA | 現状は unpack して f32 演算。[`docs/design/core16-f16-resident-gate.md`](core16-f16-resident-gate.md) の環境依存があるため A/B 必須 | #538 |
 | 4 | i8 量子化＋`dot4I8Packed` | dim=128 が 32 words。`NATIVE_PACKED_INTEGER_DOT_PRODUCT` の有無は実機確認が要る | #541 |
-| 5 | Apple UMA ゼロコピー | [`docs/design/redb-insert-reserve-zero-copy.md`](redb-insert-reserve-zero-copy.md)（Issue #400）の先例に倣い静的確認を先に | #544 |
+| 5 | Apple UMA ゼロコピー | [`docs/design/redb-insert-reserve-zero-copy.md`](redb-insert-reserve-zero-copy.md)（Issue #400）の先例に倣い静的確認済み（wgpu 30.0.1 は staging 経由で真のゼロコピーは不成立。詳細は [`gpu-batch-phase5-before-after.md`](gpu-batch-phase5-before-after.md) §6） | #544（静的確認済み・実装見送り） |
 
 ## 5. 既 Rejected との関係
 
@@ -416,6 +416,160 @@ Issue #512・`docs/design/dot-kernel-multi-accumulator.md`「行間再利用
 （環境依存のため参考値）。全 4 ワークロード × 5 ラウンドが exit_code 0 で
 完走し、`summary.json`・per-run ログが `target/bench-chip/<unix-ts>/` に
 出力されることを確認した。
+
+### 7.7 Apple M 実機での i8／f16／f32 経路の前後比較（Issue #526）
+
+#### 7.7.1 目的・#530 との境界
+
+Phase 4（#459）の Apple 向け i8 経路（#520〜#525）・f16 経路（#513〜#516）は
+いずれも実装・単体テスト・クロスコンパイル確認（`make check-cross`・
+`make simd-codegen-check-cross`）・GitHub ホステッド `macos-latest` での
+`detect-apple` ジョブ（`isa::current_f16()`／`current_i8()` が期待どおり
+`NeonFp16`／`NeonDotprod` を返すことの確認）までが実施済みで、**Apple 実機
+での性能前後比較（レイテンシ・常駐メモリ）は本 Issue（#526）・#530 の担当
+として未実施**のまま申し送られていた（`docs/design/hnsw-f16-resident.md`
+「既知の限界」節・`docs/design/hnsw-sq8-resident.md`「Issue #525」節「検証の
+限界」参照）。
+
+本節は、Apple M 実機で 3 精度（f32〔`hnsw`〕・f16〔`hnsw_f16`〕・i8
+〔`hnsw_i8`〕を同一計測セッション・同一ノイズ帯で計測できる手順・記録
+テンプレートを整備する。**「前後」の意味は commit 前後ではなく同一
+バイナリでの arm 比較**であり、f16／i8 常駐は構築時 opt-in
+（`ValidatedHnswParams::with_resident_precision`）なので before を
+`hnsw`（f32 常駐）、after を `hnsw_f16`／`hnsw_i8` として扱う（#516・#523 と
+同じ方式）。補助系列として `brute_force` を各 arm の直前に計測し、
+参照区間（run-to-run ノイズ帯の基準）は同一プロセスが同時に測る
+`COUNT(*)`（`S0prime_count_star`。`hnsw_params:` を通らないため精度・
+エンジン非依存）を用いる。
+
+本 Issue が担うのは (a) Apple 実機で 3 精度比較を 1 コマンドで再現可能に
+する計測ドライバ・非 vacuous 証跡の整備、(b) 本節の記録テンプレート・
+手順、(c) 本開発環境（QEMU x86_64）での同一ドライバの完走確認（x86 参考値）
+までであり、**Apple 実機での実測値そのものはオーナー申し送り**（下記
+7.7.7 参照）。Phase 4 通しの 3 チップ比較・`vector_knn` crossdb 再計測は
+Issue #530 の担当。
+
+#### 7.7.2 手順（オーナー向け）
+
+1. `make detect-features`（`.github/workflows/detect-features.yml`
+   `detect-apple` ジョブと同型。§8.3 の実機検出結果表へ転記）
+2. `rustup update stable`（stale な toolchain での計測を避ける）
+3. `BENCH_DEDICATED_ENV=1 make bench-knn-precision-resident`
+   （既定 5 規模点〔25k／100k／500k × dim128、25k／100k × dim768〕・
+   `AB_PAIRS` 既定 5。`hnsw`・`hnsw_f16`・`hnsw_i8` の 3 arm を同一セッション
+   で計測する。所要時間は環境依存だが本環境の縮小規模〔7.7.6〕実績から
+   フル規模点では相応の時間を要すると見込まれる）
+4. `scripts/bench_knn_f16_resident_ab.sh --summarize <target/bench-knn-precision-resident/<UTC ts>>`
+   で per-run 生データを TSV へ集約
+5. TSV・env.txt を `docs/design/bench-data/hnsw-precision-resident-ab/<ts>-{env.txt,summary.tsv}`
+   へ保存（相対パス・生データのみ。絶対パス・ホスト名・ユーザー名を含めない）
+6. 手計算（min-of-N・median・ratio・`classify_change`）で 7.7.4 の表へ転記
+7. 任意で `make bench-chip` を実行し環境ブロック・`dot_kernel` 参照区間を
+   補完（§7.1〜§7.2 の表と同じ形式）
+
+`AB_MEMORY_POINTS` 既定（`AB_POINTS` ＋ `20:768`）の 500k×768 点は
+索引単体メモリ計測で VmHWM 約 4.7 GiB に達する（`docs/design/
+hnsw-f16-resident.md`「Issue #516 追記」節参照）。Apple 実機のメモリ量に
+応じて `AB_MEMORY_POINTS` を縮小することを推奨する。
+
+#### 7.7.3 環境記録表
+
+§7.1 の列に加え、macOS 固有の記録列（`scripts/bench_knn_f16_resident_ab.sh`
+の `env.txt`。`crates/engine/benches/chip_bench.rs::collect_cpu_info` と
+同じ `sysctl` キー集合を使う best-effort 収集）を含める。
+
+| チップ名／世代 | OS（`sw_vers`） | `uname -m` | `brand_string` | perflevel0／1 physicalcpu | `FEAT_FP16`／`FEAT_DotProd`／`FEAT_BF16`／`FEAT_I8MM`／`FEAT_SME` | nproc | rustc | commit | `kernel_isa`（dot／f16／i8） |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| （未計測） | | | | | | | | | |
+
+#### 7.7.4 結果記録表
+
+行 = 規模点（`scale:dim`）× arm（`hnsw`／`hnsw_f16`／`hnsw_i8`）、列は
+policy §7.2 と同じ形式（`docs/design/benchmark-judgement-policy.md`）。
+
+| 規模点 | arm | before（`hnsw`）min | before median | after min | after median | ratio (min-of-N) | ratio (median) | 判定クラス（`classify_change(ratio, 0.05)`） | 参照区間帯（`S0prime_count_star`） |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| （未計測） | | | | | | | | | |
+
+索引単体メモリ表（`approx_heap_bytes`。macOS では `proc_stats.rs` が
+`/proc/self/status` に依存するため VmRSS／VmHWM は取得できず
+`unavailable` と出力される——`approx_heap_bytes` は決定的な集計値のため
+この欠落の影響を受けない）:
+
+| 規模点 | 要求精度 | 実効精度 | `approx_heap_bytes` | `vm_rss_kb_before` | `vm_rss_kb_after` | `vm_hwm_kb` |
+| --- | --- | --- | --- | --- | --- | --- |
+| （未計測） | | | | unavailable（macOS） | unavailable | unavailable |
+
+#### 7.7.5 非 vacuous チェックリスト
+
+各 arm の per-run ログで以下を確認してから表へ転記する
+（`knn_profile_bench.rs::run_hot_only` が計測値出力の前に fail-closed 検証
+として出力する行。いずれか欠落・不一致であれば計測をやり直す）:
+
+- `resident_precision requested=<f32|f16|i8> search_engine_kind=hnsw(...,resident=<同値>...)`
+- `hnsw_stats builds>0 hits>0 build_failures=0`
+- `f16_residency_fallbacks=0`（`hnsw_f16` arm のみ。非 0 は D6 自動縮退が
+  発生し精度計測として無意味であることを示す）
+- `i8_residency_fallbacks=0`（`hnsw_i8` arm のみ。同上）
+- `kernel_isa dot=Neon f16=NeonFp16 i8=NeonDotprod`（Issue #526。Apple 実機で
+  実際に NEON 系カーネルへディスパッチされたことの証跡。本環境〔x86_64
+  QEMU〕では `dot=Avx2Fma f16=F16c i8=Avx2Widen` が期待値——下記 7.7.6 参照）
+
+#### 7.7.6 本環境（QEMU x86_64）スモーク結果（参考値・完走確認）
+
+`AB_POINTS="1:128" AB_MEMORY_POINTS="1:128" AB_PAIRS=5
+AB_CANDIDATE_ENGINES="hnsw_f16 hnsw_i8" make bench-knn-precision-resident`
+（縮小規模点 1 点のみ。500k×768 の索引単体メモリ点は本開発環境〔共有 QEMU
+VM〕での所要時間の都合で `AB_MEMORY_POINTS` を明示的に絞り本スモークの
+対象外とした——hot-only 30 run ＋ memory 6 run〔1:128 点 × 3 arm × 2 rep〕）
+を本開発環境（QEMU 仮想 CPU）で実際に実行し、全 36 run が exit_code 0 で
+完走することを確認した。per-run 生データは下記のとおり
+`docs/design/bench-data/hnsw-precision-resident-ab/` へ保存済み。
+
+**この結果は x86_64・`F16c`／`Avx2Widen` 経路の参考値であり Apple の数値
+ではない。production 変更・Apple 側の判断の採否根拠にしない**
+（`docs/design/benchmark-judgement-policy.md` §5）。
+
+- 環境: `cpu_model=QEMU Virtual CPU version 2.5+`・`nproc=12`・
+  `rustc_version=1.98.1`
+- `kernel_isa dot=Avx2Fma f16=F16c i8=Avx2Widen`（全 36 run で一貫。Apple
+  実機では `dot=Neon f16=NeonFp16 i8=NeonDotprod` となることが期待される）
+- `resident_precision`・`hnsw_stats builds>0 hits>0`・
+  `f16_residency_fallbacks=0`・`i8_residency_fallbacks=0` をいずれの arm でも
+  確認（7.7.5 のチェックリストが本環境で全て満たされることを確認）
+- per-run 生データ（TSV・env.txt）は
+  `docs/design/bench-data/hnsw-precision-resident-ab/20260907T190235Z-{env.txt,summary.tsv}`
+  へ保存済み（相対パス・生データのみ。絶対パス・ホスト名・ユーザー名は
+  含まない）
+
+参考値として、実測した 1:128（25,000 行・dim 128）点の hot-only レイテンシ・
+索引単体メモリを下記に記録する（7.7.4 の Apple 行の記入例も兼ねる。
+判定規約は `docs/design/benchmark-judgement-policy.md` §3〜§4）:
+
+| arm | hot min (ms) | hot median (ms) | ratio (min-of-N, vs hnsw) | ratio (median) | 固定 ±5% 帯判定 | 参照区間帯（`COUNT(*)`） |
+| --- | --- | --- | --- | --- | --- | --- |
+| hnsw（f32） | 0.427 | 0.431 | 1.0000 | 1.0000 | — | 0.82%（n=10・生データの中央値 0.053751〜0.054191ms から算出） |
+| hnsw_f16 | 0.422 | 0.426 | 0.9883 | 0.9884 | Neutral | 2.03%（n=10・生データの中央値 0.053735〜0.054828ms から算出） |
+| hnsw_i8 | 0.419 | 0.426 | 0.9813 | 0.9884 | Neutral | 0.21%（n=10・生データの中央値 0.053751〜0.053864ms から算出） |
+
+| arm | `approx_heap_bytes`（rep1/rep2 ビット同一） | ratio (vs hnsw) | 削減率 |
+| --- | --- | --- | --- |
+| hnsw（f32） | 17,226,056 | 1.0000 | — |
+| hnsw_f16 | 10,826,056 | 0.6285 | 37.15% |
+| hnsw_i8 | 7,726,568 | 0.4485 | 55.15% |
+
+`hnsw`／`hnsw_f16` の値は `docs/design/hnsw-f16-resident.md`「Issue #516
+追記」節の 1:128 行（`hnsw`=17,226,056・`hnsw_f16`=10,826,056）と完全一致
+しており、本スモークが同一の測定経路を再現していることの裏付けになる。
+本節の数値はいずれも x86_64 QEMU の参考値であり、Apple M 実機の数値では
+ない（上記のとおり判断根拠にしない）。
+
+#### 7.7.7 Apple 行（未計測・オーナー申し送り）
+
+7.7.3・7.7.4 の Apple M 行は本 Issue の実装時点では未計測。7.7.2 の手順で
+オーナーが実測し追記する。既定常駐精度（f16／i8 いずれかへの反転）の
+採否判断は #515／#516／#523 と同じくオーナー判断のまま（本 Issue は判断
+材料を追加しない）。
 
 ## 8. macOS 上の `is_aarch64_feature_detected!` 実効性（Issue #468）
 
