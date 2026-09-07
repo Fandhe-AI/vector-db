@@ -1019,7 +1019,7 @@ BENCH_HNSW_PARALLEL_THREADS=1,12 <scratch>/target-after/release/deps/hnsw_parall
 | --- | --- | --- | --- | --- |
 | `bench-hnsw-compare` self build（N=5・rows=20,000 縮小構成） | 211.687ms | 182.233ms | 0.861x | ノイズ帯内 |
 | `bench-hnsw-compare` self search median | 32.244us | 33.841us | 1.050x | ノイズ帯内 |
-| `bench-knn-profile` S0_cold（brute_force・N=1） | 31.418ms | 31.927ms | 1.016x | ほぼ同水準（hnsw 側は N=1 で判定不能） |
+| `bench-knn-profile` S0_cold（brute_force・N=1） | 31.418ms | 31.927ms | 1.016x | ほぼ同水準（hnsw 側は run1 同士の N=1 ペアで −2.4%・実測帯内） |
 | `feature_bench` `vector_knn`（フィルタなし DISTANCE・N=3・hnsw arm のみ） | 8418us | 388us | **0.046x** | Improved 方向で一貫（共有環境の参考値） |
 | Recall 3 ゲート（before/after × brute_force/hnsw・4 系列・11 指標） | — | — | — | **完全一致（非退行の確定的証拠）** |
 

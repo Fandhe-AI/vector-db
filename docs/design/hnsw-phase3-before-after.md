@@ -132,22 +132,25 @@ the error is indeterminate」）により `abort` した。これは本 Issue �
 
 | stage | before（run1） | after（run1） | 備考 |
 | --- | --- | --- | --- |
-| S0_cold_sql_e2e（engine=hnsw） | 1010.953ms | （run2 で abort。run1 は取得できず） | hnsw の S0-cold は前後で直接比較不能（後述） |
-| S4_arena_build（hnsw） | 4.559ms | — | |
-| S5_search_parallel（hnsw） | 5.501ms | — | |
+| S0_cold_sql_e2e（engine=hnsw） | 1010.953ms | 986.479ms | 差 −2.4%。before の run1/run2 間実測帯（±5.9%）以内で、明確な劣化シグナルなし（後述） |
+| S4_arena_build（hnsw） | 4.559ms | 4.649ms | ほぼ同水準 |
+| S5_search_parallel（hnsw） | 5.501ms | 0.259ms | run 間ばらつきが大きく参考値（before run2 は 2.980ms） |
 | S0_cold_sql_e2e（brute_force） | 31.418ms | 31.927ms | 前後でほぼ同水準 |
 | S0_hot_sql_e2e（brute_force） | 4.037ms | 1.093ms | |
 | S0prime_count_star（brute_force） | 1.954ms | 0.054ms | `VisibleBitmapCache`〔Issue #478〕の適用差。Phase 2 の変更であり Phase 3 の効果ではない |
-| hnsw_stats（before run1/run2） | hits=40 misses=1 fallbacks=0 | （after run1 は個別値未記録・run2 は abort） | |
+| hnsw_stats（before run1/run2、after run1） | hits=40 misses=1 fallbacks=0 | hits=40 misses=1 fallbacks=0 entries=1 | 前後で一致 |
 
 before 側は run1・run2 とも `engine=hnsw` が成功しており、`S0_cold_sql_e2e`
 は 1010.953ms（run1）・1071.867ms（run2）で近い値（実測帯 ±5.9%）。after 側は
-run1（engine=hnsw）の生ログが `env`／`params` 行のみで停止しており（同一
-ディスク圧迫の影響でバッファがフラッシュされる前に別プロセスの abort が
-発生した可能性がある。生ログ参照）、`S0_cold_sql_e2e` の前後比較に足る
-after 側の hnsw 値は得られなかった。**この区間（hnsw engine の S0-cold）は
-判定不能として記録し、`brute_force` 側（本 Issue の Phase 3 施策の対象外
-経路）のみを非退行の傍証として扱う**。
+run1（engine=hnsw）が完全なデータを含み `S0_cold_sql_e2e`=986.479ms を得たが、
+run2 は §4 冒頭の fail-closed 契約による abort（`env`／`params` 行のみで停止
+した生ログ。生ログ参照）でデータが取得できなかった。run1 同士（before
+1010.953ms・after 986.479ms）で比較すると差は −2.4%（before の run1/run2 間
+実測帯 ±5.9% 以内）であり、緩やかな改善方向のシグナルはあるが N=1 ペアと
+いう条件下ではノイズと明確に区別できない。**この区間（hnsw engine の
+S0-cold）は明確な劣化シグナルなし（実測帯内）として記録し、`brute_force`
+側（本 Issue の Phase 3 施策の対象外経路）とあわせて非退行の傍証として
+扱う**。
 
 全 run 生データ（取得できた分）:
 
@@ -155,7 +158,8 @@ after 側の hnsw 値は得られなかった。**この区間（hnsw engine の
 | --- | --- | --- | --- | --- | --- |
 | 1 | before | hnsw | 1010.953 | 0.440 | 1.904 |
 | 2 | before | hnsw | 1071.867 | 0.435 | 1.887 |
-| 1 | after | hnsw | n/a（生ログが `env`／`params` 行で停止） | n/a | n/a |
+| 1 | after | hnsw | 986.479 | 0.450 | 0.057 |
+| 2 | after | hnsw | n/a（fail-closed abort。生ログが `env`／`params` 行で停止） | n/a | n/a |
 | 1 | before | brute_force | 31.418 | 4.037 | 1.954 |
 | 1 | after | brute_force | 31.927 | 1.093 | 0.054 |
 
@@ -231,8 +235,10 @@ green（§9 参照）。`hnsw_f16`（Issue #515 で追加された第 3 エン�
   も前後で有意差なし。
 - **`bench-knn-profile`**（N=1 ペア。共有環境のリソース逼迫により縮退）:
   `brute_force`（Phase 3 施策の対象外経路）は `S0_cold_sql_e2e` 31.4ms→31.9ms
-  でほぼ同水準。`hnsw` 側は after 側の run1 ログが欠損し前後比較不能——
-  判定不能として記録。
+  でほぼ同水準。`hnsw` 側は before run1（1010.953ms）と after run1
+  （986.479ms）で比較可能——差は −2.4%（before の run1/run2 間実測帯 ±5.9%
+  以内）であり、明確な劣化シグナルはない。after run2 は fail-closed 契約
+  による abort でデータ欠損（判定に使えるのは run1 同士の N=1 ペアのみ）。
 - **`feature_bench`**（N=3 ペア・hnsw arm のみ）: `vector_knn`（フィルタなし
   DISTANCE。Phase 3 施策の直接対象区間）が 8418us→388us
   （**約 21.7 倍高速化**）で固定帯・実測帯（`ingest` 参照 ±5.0%）を大幅に
@@ -262,7 +268,7 @@ green（§9 参照）。`hnsw_f16`（Issue #515 で追加された第 3 エン�
 | 対象 | 計画（policy 準拠） | 実施内容 | 理由 |
 | --- | --- | --- | --- |
 | `bench-hnsw-compare` | rows=100,000・queries=200・thread_ladder=[1,12]・N=5 | rows=20,000・queries=100・thread_ladder=[12]・N=5 | 既定規模の 1 run が 3〜5 分かかり N=5×2 状態で 30〜50 分超と判明したため縮小。N=5 ペア自体は完遂 |
-| `bench-knn-profile` | N=5 ペア × 2 engine | **N=1 ペア**（after-hnsw の run1 ログ欠損） | 他 worktree（並走する複数エージェント）の同時 `cargo build --release` により `/tmp`（tmpfs 16GiB）が逼迫し、redb の fail-closed 契約（RECOVER-8）により knn_profile_bench プロセスが `abort`（`commit call returned an error, but whether the write became durable before the error is indeterminate`）。2 回目以降の run はこの巻き添えで軒並み空ログとなった |
+| `bench-knn-profile` | N=5 ペア × 2 engine | **N=1 ペア**（after-hnsw の run2 ログ欠損） | 他 worktree（並走する複数エージェント）の同時 `cargo build --release` により `/tmp`（tmpfs 16GiB）が逼迫し、redb の fail-closed 契約（RECOVER-8）により knn_profile_bench プロセスが `abort`（`commit call returned an error, but whether the write became durable before the error is indeterminate`）。2 回目以降の run はこの巻き添えで軒並み空ログとなった |
 | `feature_bench` | N=5 ペア × 2 arm（既定／hnsw） | N=3 ペア × 1 arm（hnsw のみ） | 上記と同じ共有リソース逼迫を踏まえ、時間内に確実に完走させるため事前に縮小（degradation order §7 の「scale=4 省略 → arm 削減」を先取り適用） |
 | Recall 3 ゲート | before/after × brute_force/hnsw/hnsw_f16（5 系列。timing でないため N ペア不要） | before/after × brute_force/hnsw の **4 系列**（`hnsw_f16` は時間制約により未実施） | 4 系列で 11 指標完全一致という強い非退行証拠が得られたため、5 系列目（`hnsw_f16`）は次点として申し送り |
 
