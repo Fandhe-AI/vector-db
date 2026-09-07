@@ -87,18 +87,27 @@ use engine::storage::{Storage, Visibility};
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
 
-/// 小規模段。`tests/hybrid_recall.rs` の小規模フィクスチャ（400 件）は
+/// 小規模段（既定モード＝env 未設定の in-build 比較。[`run_in_build_mode`]）。
+/// `tests/hybrid_recall.rs` の小規模フィクスチャ（400 件）は
 /// `RrfConfig::default().pool_depth() * 2`（初回 `fetch_k` = 400）と偶然一致し、
 /// 通常コーパスでも初回呼び出しで可視集合全体を取り切ってしまい再取得ループの
 /// 有無を比較できない。本ベンチは初回 `fetch_k` を上回る規模にして
-/// 「再取得の余地がある」条件を保つ。加えて `sql::hnsw_cache::MIN_INDEXED_ROWS`
-/// （1,024。ここでは複製せず参照するのみ）を上回る件数にする必要がある——
-/// SQL 表層（hnsw opt-in）計測モード（[`run_sql_surface_mode`]）はこの閾値
-/// 未満のコーパスでは構造的に索引を構築せず全件 brute-force へ縮退するため、
-/// `check_ann_non_vacuous` の `builds >= 1` 検証が常に失敗し、既定実行
-/// （`BENCH_HYBRID_LATENCY_ENGINE=hnsw`・`BENCH_HYBRID_LATENCY_SCALE=all`）が
-/// small ステージで fail-closed 終了してしまう（Cursor Bugbot 指摘・PR #622）。
-const SMALL_NUM_DOCS: usize = 1_200;
+/// 「再取得の余地がある」条件を保つ。既定モードは `sql::hnsw_hybrid` を経由
+/// しない純粋な in-build 比較のため `sql::hnsw_cache::MIN_INDEXED_ROWS` の
+/// 制約を受けず、本追加（Issue #506・PR #622）の前後で値を変更していない
+/// （README「既定モードの出力は本追加の前後で不変」節。codex-review P2 指摘・
+/// PR #622）。
+const SMALL_NUM_DOCS: usize = 1_000;
+/// 小規模段（SQL 表層〔hnsw opt-in〕計測モード専用。[`run_sql_surface_mode`]）。
+/// `sql::hnsw_cache::MIN_INDEXED_ROWS`（1,024。ここでは複製せず参照するのみ）を
+/// 上回る件数にする必要がある——この閾値未満のコーパスでは構造的に索引を構築せず
+/// 全件 brute-force へ縮退するため、`check_ann_non_vacuous` の `builds >= 1`
+/// 検証が常に失敗し、既定実行（`BENCH_HYBRID_LATENCY_ENGINE=hnsw`・
+/// `BENCH_HYBRID_LATENCY_SCALE=all`）が small ステージで fail-closed 終了して
+/// しまう（Cursor Bugbot 指摘・PR #622）。既定モード（[`SMALL_NUM_DOCS`]）とは
+/// 独立した定数にすることで、この SQL 表層専用の要件が既定モードの文書数へ
+/// 波及しないようにする（codex-review P2 指摘・PR #622）。
+const SMALL_NUM_DOCS_SQL_SURFACE: usize = 1_200;
 /// 大規模段（`tests/hybrid_recall.rs` の大規模フィクスチャと同一件数。可視集合到達の
 /// 判定条件をそのまま流用できるようにする）。
 const LARGE_NUM_DOCS: usize = 20_000;
@@ -354,6 +363,18 @@ impl SqlHybridBenchFixture {
                 let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
                 EngineCore::from_storage_with_engine(storage, kind)
             }
+            BenchEngine::HnswI8 => {
+                // I8（SQ8）常駐 opt-in（Issue #521・#523。`recall_engine.rs::
+                // RecallEngine::HnswI8`・`knn_profile_bench.rs` と同一構築経路）。
+                // 本ベンチ（Issue #506）は f16／i8 常駐間の比較を対象としないが、
+                // `BenchEngine::HnswI8` を追加した以上この match は網羅する必要が
+                // あるため、既存の構築経路をそのまま再利用する。
+                let validated = ValidatedHnswParams::new(HnswParams::default())
+                    .expect("default params validate")
+                    .with_resident_precision(ResidentPrecision::I8);
+                let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
+                EngineCore::from_storage_with_engine(storage, kind)
+            }
             BenchEngine::BruteForce => {
                 EngineCore::from_storage(storage, engine::search_engine::default_engine())
             }
@@ -459,7 +480,7 @@ fn run_sql_surface_mode() {
 
     for scale in scales {
         let (label, default_num_docs) = match scale {
-            LatencyScale::Small => ("small", SMALL_NUM_DOCS),
+            LatencyScale::Small => ("small", SMALL_NUM_DOCS_SQL_SURFACE),
             LatencyScale::Large => ("large", LARGE_NUM_DOCS),
         };
         let num_docs = parse_bounded_usize(
