@@ -1355,3 +1355,10 @@ production 変更前後を交互計測）を経るまで未確定とする。前
   効果が薄いため見送り）
 - perf 採否の確定（#550 通し前後比較・#547）・専有環境
   （`BENCH_DEDICATED_ENV=1`）再実測はオーナー／運用者作業
+
+## Issue #550: Phase 6 通し前後比較へのポインタ
+
+Issue #546・#549 を通しで前後比較した `feature_bench`・`bench-hybrid-profile`・
+crossdb self・Recall 3 ゲートの結果は `docs/design/
+hybrid-rrf-phase6-before-after.md` に記録した（数値は同 doc 参照。本節では
+転記しない）。production コード無変更・doc 専任。
