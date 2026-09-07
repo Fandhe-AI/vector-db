@@ -464,8 +464,21 @@ FAISS 753µs で約 107 倍」から、#532 の効果でこの倍率は約 1/2.7
 部分 Top-k の担当）。
 
 **申し送り**: 現 `origin/main`（#536 部分 Top-k 込み）での再計測・readback
-バイト数比較は Issue #537、Phase 5 通し比較（FAISS GPU 対照・Qdrant GPU 構築
-含む）は Issue #544、残り 19 規模点の計測は必要になった時点で別途起票する。
+バイト数比較は Issue #537、残り 19 規模点の計測は必要になった時点で別途
+起票する。
+
+**（2026-09-07 追記・Issue #544）** Phase 5（#532・#536・#539・#542）全適用
+通し比較・FAISS GPU 対照・Qdrant GPU 構築対照の更新・UMA（Apple Metal）
+ゼロコピー静的確認を実施した。self（after・`a40edd7`）の
+`100,000×128×64` GPU f16 p95 min-of-5 は 16,355µs（`b161d5b`→`a40edd7`の
+通し比較で before 81,704µs 比 0.20 倍・約 5 倍高速化。6 点中 3 点で固定帯・
+実測帯とも超過する改善を確認、残り 3 点は共有環境ノイズにより判定不能）。
+FAISS GPU（同一セッション再計測）との差は約 21〜26 倍で、Issue #537 時点の
+局所値からほぼ横ばい（Phase 5 の f16 算術版・i8 経路は既定クエリでは
+非選択のため差の縮小に寄与しない）。Qdrant GPU 索引構築は変わらず優位性
+なし。詳細・全 6 点の表・UMA 静的確認・判定根拠は
+[`gpu-batch-phase5-before-after.md`](gpu-batch-phase5-before-after.md) 参照
+（production コード無変更・テスト専任）。
 
 ### FAISS（IndexFlatIP）CPU vs GPU
 
