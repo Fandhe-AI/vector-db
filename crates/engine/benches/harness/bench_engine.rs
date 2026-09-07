@@ -35,6 +35,12 @@ pub enum BenchEngine {
     BruteForce,
     /// ANN opt-in（`search_engine::hnsw_kind(HnswParams::default())`）。
     Hnsw,
+    /// ANN opt-in・索引ノード f16 常駐（Issue #514・`hnsw::ResidentPrecision::F16`。
+    /// `ValidatedHnswParams::new(HnswParams::default())?.with_resident_precision(F16)`
+    /// で構築する。Issue #516 が f32 常駐（[`Self::Hnsw`]）との前後比較・常駐
+    /// メモリ実測の対象として追加した。`tests/fixtures/recall_engine.rs::
+    /// RecallEngine::HnswF16` と同じ構築経路・トークン語彙を踏襲する）。
+    HnswF16,
 }
 
 impl BenchEngine {
@@ -44,6 +50,7 @@ impl BenchEngine {
         match self {
             Self::BruteForce => "brute_force",
             Self::Hnsw => "hnsw",
+            Self::HnswF16 => "hnsw_f16",
         }
     }
 }
@@ -91,8 +98,25 @@ pub fn parse_engine(raw: Option<&str>) -> Result<BenchEngine, BenchEngineError> 
     match raw.map(str::trim) {
         None | Some("") | Some("brute_force") => Ok(BenchEngine::BruteForce),
         Some("hnsw") => Ok(BenchEngine::Hnsw),
+        Some("hnsw_f16") => Ok(BenchEngine::HnswF16),
         Some(other) => Err(err(format!(
-            "must be unset, \"brute_force\", or \"hnsw\" (got {other:?})"
+            "must be unset, \"brute_force\", \"hnsw\", or \"hnsw_f16\" (got {other:?})"
+        ))),
+    }
+}
+
+/// 汎用の fail-closed 真偽値パーサ（Issue #516。`knn_profile_bench.rs` の
+/// `BENCH_KNN_PROFILE_HOT_ONLY`／`BENCH_KNN_PROFILE_INDEX_MEMORY` が使う）。
+/// 未設定・空文字列・`"0"` は `false`、`"1"` は `true`。他の値（`"true"`・
+/// `"yes"` 等）は typo が黙って既定へ倒れる事故を防ぐため拒否する
+/// （`parse_engine`・`recall_engine.rs::RecallEngine::parse` と同じ「未知値は
+/// fail-closed」方針）。
+pub fn parse_flag(raw: Option<&str>) -> Result<bool, BenchEngineError> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(err(format!(
+            "must be unset, \"0\", or \"1\" (got {other:?})"
         ))),
     }
 }
