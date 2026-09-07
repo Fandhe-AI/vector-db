@@ -113,11 +113,104 @@ VNNI／NEON dotprod 系の整数内積カーネル（#522・#524）を載せる�
 - `tests/hnsw_cache.rs::assert_resident_precision_reached`: `resident=i8`
   の表示・`i8_residency_fallbacks == 0` の網羅 match へ I8 分岐を追加。
 
+## Issue #522: VNNI（512bit／256bit）と i16 widen フォールバックの i8 dot カーネル
+
+- ステータス: **Implemented**（`NeonDotprodToken` 経路は #525 の担当のまま）
+- 対応: Issue #522（親 #520・前提 #521）
+- 準拠 ADR: `docs/design/simd-intrinsics-adoption.md` 決定 1〜5
+- 関連コード: `crates/engine/src/isa.rs`（`I8Kernel`／`AvxVnniToken`／
+  `Avx512VnniToken`。`Avx2FmaToken` を widen 経路に再利用）・
+  `crates/engine/src/isa/x86_i8.rs`（新設。3 カーネル本体）・
+  `crates/engine/src/sq8.rs`（`I8_DOT_MAX_DIM`／`row_sums`／
+  `Sq8QueryCodes`／`prepare_query`／`score_from_int_dot`）・
+  `crates/engine/src/hnsw/i8_query.rs`（新設。`PreparedI8Source`）・
+  `crates/engine/src/hnsw.rs`（`NodeVectors::I8` へ `row_sums` 追加・
+  `search_masked_with_hop` の per-search 準備クエリ結線）
+
+Issue #521 の申し送りどおり、候補生成スコアを「クエリ非量子化の復号 dot」
+（`sq8::dot_i8_f32`）から「クエリ側も量子化する二重量子化」＋整数
+`i8×i8→i32` カーネルへ切り替える。
+
+### 導出（u8 シフト＋行和補正）
+
+`vpdpbusd`（u8×s8→i32 の非飽和積和）は一方のオペランドを符号なしにする
+必要があるため、ノード側コード `code_d ∈ [-127, 127]`（`sq8.rs` 既存の
+対称量子化）は変更せず、クエリ側だけを符号なしへシフトする:
+
+1. `q'_d = scale_d * q_d`（ノードと同じ次元別スケール空間へ写像）
+2. `s_q = max_d|q'_d| / 127`（クエリ単一スケール）
+3. `qq_d = clamp(round_half_away(q'_d / s_q), -127, 127)`（符号付きコード。
+   i16 widen カーネルはこれを直接使う）
+4. `u_d = (qq_d as i16 + 128) as u8 ∈ [1, 255]`（VNNI 系カーネルが使う
+   符号なしコード）
+
+VNNI 系カーネルは `acc = Σ u_d * code_d` を計算し、`row_sum = Σ_d code_d`
+（`sq8::row_sums`。`hnsw.rs::NodeVectors::I8` が凍結時に 1 回だけ計算し
+`codes`／`params` と寿命・対応関係を一致させて保持）を使って
+`int_dot = acc − 128 * row_sum` で真の内積を復元する（`acc = Σ(qq_d+128)*
+code_d = int_dot + 128*row_sum` の代数的帰結）。i16 widen（`vpmaddwd`）・
+スカラー参照実装は `qq_d` を直接使うため補正不要。全経路とも `i32` の
+wrapping 加算で計算するため、[`I8_DOT_MAX_DIM`]（=65,536。`255*127*dim ≤
+i32::MAX` を満たす上限の逆算）以下では ISA に依らずビット同一になる
+（`isa.rs::i8_kernel_tests`・`tests/isa.rs` が dim 0..=300 の全 `available_
+i8_kernels()` で機械検証）。
+
+### fail-closed 縮退
+
+`sq8::prepare_query` が失敗（`dim > I8_DOT_MAX_DIM`・クエリ側スケール
+`s_q` の復号後最悪値が `f32` で非有限になり得る）した場合、
+`hnsw/i8_query.rs::PreparedI8Source` はそのクエリに限り既存の
+`dot_i8_f32`（復号 dot）へ縮退する——索引の再構築・空集合の誤返却を
+招かない。`PreparedI8Source::score` は準備済みクエリと異なるスライスで
+呼ばれた場合（構造上到達しない防御的経路）を `ptr::eq` で検出し
+`HnswError::InvalidParams` を返す（fail-closed）。
+
+### `NodeSource` への結線
+
+`NodeSource` trait 自体は無変更。`HnswIndex::search_masked_with_hop` が
+探索呼び出し 1 回につき 1 回だけ `PreparedI8Source::new`（`NodeVectors::I8`
+の場合のみ）を構築し、`greedy_descend_masked`／`search_layer_with_hop` の
+`vectors` 引数型を `&NodeVectors` から `&dyn NodeSource`（trait object。
+`NodeVectors`／`PreparedI8Source` いずれも自動 unsized coercion で渡せる）
+へ一般化した。`search_layer_in`（Issue #494 で既にジェネリック
+`S: NodeSource + ?Sized`）はこの変更を要しない。索引ヒットの最終スコアは
+常に `kernel::dot`（f32・アリーナ再計算）のまま不変（ADR 決定 5）。
+
+### `unsafe`・codegen ガード
+
+`isa.rs` の `unsafe { }` は 8 → 11（`I8Kernel::dot_i8` の Avx2Widen・
+AvxVnni・Avx512Vnni ディスパッチ 3 箇所。`x86_i8.rs` 本体は `unsafe` を
+持たない safe fn のみ）。`scripts/check_simd_codegen.sh` に必須シンボル・
+期待命令規則（メモリオペランド付き `vpdpbusd`〔%zmm／%ymm〕・`vpmaddwd`＋
+`vpmovsxbw`）・self-test fixture を追加した。実装中に発見した
+`mnemonic_of` のバグ（AVX-VNNI の `{vex}` encoding hint 接頭辞を先頭
+トークンと誤認し、以降の禁止命令・期待命令検査の双方が素通りしていた。
+`{vex}`／`{evex}` 等の波括弧接頭辞を除去してから判定する形へ修正）を
+本 Issue の一環で修正した——既存 f16／block4 カーネルへの影響は無い
+（`{vex}` は AVX-VNNI の VEX 符号化明示にのみ現れる）。
+
+### 判断事項（自動運転モードで安全側に確定）
+
+| 論点 | 決定 | 理由 |
+| ---- | ---- | ---- |
+| 符号なし化する側 | クエリ側（u8 シフト）＋ノード行和補正 | `codes: Arc<[i8]>`・`vector_i8`・`node_matches`・GPU `packed_i8` を無変更に保てる |
+| i16 widen 経路のトークン | 既存 `Avx2FmaToken` を再利用（新規トークンなし） | ADR 決定 3 の表にある既存トークンで `avx2+fma ⊇ avx2` の SAFETY 根拠が成立するため |
+| クエリ準備の縮退先 | `dot_i8_f32`（#521 の復号 dot）を残置して利用 | 索引再構築・空集合を招かない fail-closed |
+| `NodeSource` の拡張形 | 新規メソッド・trait 変更なし。`&dyn NodeSource` への一般化のみ | 変更範囲を `search_masked_with_hop` とその直接の呼び出し先に限定できる |
+| `dot_i8_scalar` の per-lane 命令（punpcklbw／aarch64 `mov v.b[..]`） | codegen ガードの対象外として関数名で除外（`#[inline(never)]` で `I8Kernel::dot_i8` への巻き込みも防止） | スカラー参照実装の自動ベクトル化はガードが検出したい「手書き intrinsics の `set` 構築が gather/stride 由来で退化した」ケースとは別物。`dot_scalar`／`dot_f16_scalar` が偶然この命令を出さないだけで、除外規則自体は既存の `_scalar` 系関数と同じ立ち位置 |
+
+### 検証の限界（申し送り）
+
+本開発環境の CPU は VNNI 非対応（`avx avx2 f16c fma` のみ）のため、
+`Avx512Vnni`／`AvxVnni` 2 経路は実行できず、コンパイル・codegen 検査
+（`--emit asm`）・ローカル `rustc` での命令列確認までに留まる。実機での
+実行検証（ビット同一性・チップ別性能）は CI（GitHub ホステッド runner が
+対応 CPU の場合）・#523（Recall 3 ゲート同一閾値検証）・#530（チップ別
+前後比較）へ申し送る。
+
 ## 既知の限界・スコープ外（後続 Issue へ申し送り）
 
-- 整数 i8×i8 dot カーネル（VNNI `dpbusd`／NEON dotprod）は本 Issue の対象外
-  （#522・#524）。VNNI 向けにノードコードの行和（`Σ r_d`）を保持する拡張が
-  必要になった場合は #522 が `NodeVectors::I8` へフィールドを追加する。
+- NEON dotprod（`vdotq_s32`）版の i8 整数カーネルは #525 の担当。
 - `RecallEngine` fixture（`crates/engine/tests/fixtures/recall_engine.rs`）
   への `hnsw_i8` 追加・`recall.yml` matrix 拡張・Recall 3 ゲート同一閾値
   検証・`bench-knn-profile` 等の `hnsw_i8` トークン追加は #523 の担当。
