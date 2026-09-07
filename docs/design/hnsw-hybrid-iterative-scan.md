@@ -74,6 +74,38 @@ fail-closed の最終防御）に留まり、「`ef` 拡張で結果不足を解
 「切替規則」節・`sql/hnsw_cache.rs` の `masked_short` コメントへこの結論を
 反映済み。
 
+### `TwoHop` レジーム下の再検証（Issue #501）
+
+上記の証明は前提 1・2 を `search_masked`（`HopMode::OneHop` 固定）に対して
+述べたものだが、`sql::hnsw_cache::TraversalRegime::TwoHop`（ACORN-1・
+Issue #501）が選ばれる場合は `HnswIndex::search_masked_with_hop(.., hop:
+TwoHop, ..)` を呼ぶ。前提 1・2 が `TwoHop` でも成立することを確認する:
+
+- 前提 1（検査済み起点を層 0 の初期候補集合に含める）: `search_masked_with_hop`
+  の起点選択（`search_entry_for_mask` 由来の `checked_entry`）は `hop` に
+  依存しないコード経路のため無変更で成立する。
+- 前提 2（`mask_splits_graph == false` のとき検査済み起点から受理ノード
+  全体へ到達可能）: `Overlay::compute` は `regime.hop()`（`TwoHop` なら
+  `HopMode::TwoHop`）を渡して `is_mask_fully_reachable_with` を呼ぶ
+  （`sql::hnsw_cache::traversal_regime_for` が単一情報源。Issue #501）。
+  `bridge_expand`（`hnsw.rs`）は探索（`search_layer_in`）・BFS
+  （`HnswIndex::accepted_reachable_count`）の双方から呼ばれる共有実装
+  であり、「非受理ノードに出会ったときの規則」（1-hop 非受理として初めて
+  訪問したときのみ中継点として使い、受理済み・未訪問の 2-hop ノードだけを
+  候補化する）がビット同一であることを構造上（同一関数の共有）保証する。
+  したがって `TwoHop` の BFS が「到達可能」と判定した受理ノード集合は、
+  `TwoHop` の探索が実際に辿り着ける集合と一致し、前提 2 は成立する。
+
+前提 1・2 が成立する以上、上記の不等式の導出（`results.len() >=
+min(ef_eff, visible_in_index)` から `masked_short` 非到達へ至る論理）は
+`hop` に依存しないため、`TwoHop` でも同じ結論（`masked_short` は
+`mask_splits_graph == false` の間は到達しない）が成立する。BFS と探索が
+異なる規則を実装していた場合（`bridge_expand` を共有せず個別実装した
+場合）はこの前提 2 が崩れ、`masked_short` が `TwoHop` 限定で到達可能に
+なりうる——`bridge_expand` の共有はこの証明を維持するための構造的な
+必須条件である（`docs/design/hnsw-rls-cardinality-switch.md`「Issue #501」
+節「同期」参照）。
+
 ## hybrid 密側再取得ループへの結線
 
 ### 現状整理

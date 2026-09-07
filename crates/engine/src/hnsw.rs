@@ -256,6 +256,22 @@ pub struct HnswWorkerStats {
     pub reverse_link_reconnects: u64,
 }
 
+/// マスク付き探索（[`HnswIndex::search_masked_with_hop`]）が非受理ノードの
+/// リンクをどこまで中継点として辿るかを表す（Issue #501・親 #500。ACORN-1
+/// 方式。ポインタ: CORE-9・CORE-10・TASK-132）。
+///
+/// - `OneHop`（既定）: 非受理ノードは訪問済みマークのみ付けて打ち切る
+///   （既存契約。`accept.is_none()` の場合と同じくビット同一を保つ）。
+/// - `TwoHop`: 非受理ノードを 1 段だけ中継点として使い、その隣接
+///   （2-hop 先）にいる受理ノードのみを候補化する（[`bridge_expand`]）。
+///   非受理ノードのベクトルは一切参照しない（I1 不変。§本モジュール
+///   `search_layer_in` ドキュメンテーションコメント参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HopMode {
+    OneHop,
+    TwoHop,
+}
+
 /// 整数比（`u32/u32`）。`f32` は `HnswParams` の `Copy + PartialEq + Eq` derive と
 /// 両立しない（`f32` は `Eq` を実装しない）ため、Issue #401 の `REBUILD_DELTA_RATIO`
 /// （`(u64, u64)` タプル）と同じ発想で構造体化した（Issue #409。`sql::hnsw_cache`
@@ -390,6 +406,11 @@ pub struct ValidatedHnswParams {
     full_scan_ratio: Ratio,
     resident_precision: ResidentPrecision,
     sparse_visited_max: usize,
+    /// ACORN-1 の 2-hop 展開（[`HopMode::TwoHop`]）を有効化する可視比率の
+    /// 上限（Issue #501・親 #500。既定 `None`＝無効・既存動作を不変に保つ）。
+    /// `Some(ratio)` のとき `sql::hnsw_cache::traversal_regime_for` が
+    /// `full_scan_ratio <= r <= ratio` のレジームを `TwoHop` と判定する。
+    acorn_max_visible_ratio: Option<Ratio>,
 }
 
 /// HNSW 索引ノードの常駐ベクトル表現（Issue #514・親 #513。ポインタ:
@@ -449,6 +470,7 @@ impl ValidatedHnswParams {
             full_scan_ratio: DEFAULT_FULL_SCAN_RATIO,
             resident_precision: ResidentPrecision::F32,
             sparse_visited_max: DEFAULT_SPARSE_VISITED_MAX,
+            acorn_max_visible_ratio: None,
         })
     }
 
@@ -512,9 +534,54 @@ impl ValidatedHnswParams {
                 reason: "full_scan_ratio numerator must not exceed denominator",
             });
         }
+        if let Some(acorn) = self.acorn_max_visible_ratio {
+            if ratio_lt(acorn, ratio) {
+                return Err(HnswError::InvalidParams {
+                    reason: "full_scan_ratio must not exceed acorn_max_visible_ratio",
+                });
+            }
+        }
         self.full_scan_ratio = ratio;
         Ok(self)
     }
+
+    /// ACORN-1 の 2-hop 展開を有効化する可視比率の上限を返す（Issue #501。
+    /// `None`＝既定・無効）。
+    pub fn acorn_max_visible_ratio(&self) -> Option<Ratio> {
+        self.acorn_max_visible_ratio
+    }
+
+    /// `acorn_max_visible_ratio` だけを差し替えたコピーを返す（Issue #501・
+    /// opt-in）。`ratio.denominator == 0`・`ratio.numerator > ratio.denominator`・
+    /// `ratio < full_scan_ratio`（2-hop レジームが plain scan 未満の可視比率で
+    /// 発火し得ることになり無意味かつ安全側の前提〔#500〕を崩す）はいずれも
+    /// `HnswError::InvalidParams` として拒否する（fail-closed）。
+    pub fn with_acorn_max_visible_ratio(mut self, ratio: Ratio) -> Result<Self, HnswError> {
+        if ratio.denominator == 0 {
+            return Err(HnswError::InvalidParams {
+                reason: "acorn_max_visible_ratio denominator must be >= 1",
+            });
+        }
+        if ratio.numerator > ratio.denominator {
+            return Err(HnswError::InvalidParams {
+                reason: "acorn_max_visible_ratio numerator must not exceed denominator",
+            });
+        }
+        if ratio_lt(ratio, self.full_scan_ratio) {
+            return Err(HnswError::InvalidParams {
+                reason: "acorn_max_visible_ratio must not be less than full_scan_ratio",
+            });
+        }
+        self.acorn_max_visible_ratio = Some(ratio);
+        Ok(self)
+    }
+}
+
+/// `a < b` を `u64` へワイド化した交差乗算で判定する（`u32 * u32` は `u64` へ
+/// 収まるため `checked_mul` は不要。`sql::hnsw_cache` の可視比率判定と同じ
+/// 比較方式に揃える。Issue #501）。
+fn ratio_lt(a: Ratio, b: Ratio) -> bool {
+    (a.numerator as u64) * (b.denominator as u64) < (b.numerator as u64) * (a.denominator as u64)
 }
 
 impl std::ops::Deref for ValidatedHnswParams {
@@ -1162,6 +1229,12 @@ pub struct HnswSearchScratch {
     visited: VisitedBitmap,
     sparse: VisitedSparse,
     last_visited_kind: Option<VisitedKind>,
+    /// 直近の [`HnswIndex::search_masked_with_hop`] 呼び出しが `bridge_expand`
+    /// 経由で受理・候補化した 2-hop ノード数の累計（Issue #501。診断用）。
+    /// `hop == HopMode::OneHop` の呼び出し（既定・`search_masked`/
+    /// `search_masked_with` 経由を含む）では常に `0`。早期 `return` 経路
+    /// でも `0` にリセットする（`last_visited_kind` と同じ扱い）。
+    last_acorn_expansions: u64,
 }
 
 impl HnswSearchScratch {
@@ -1171,6 +1244,13 @@ impl HnswSearchScratch {
     /// `sql::hnsw_cache` の診断用統計（`sparse_visited_searches`）が使う。
     pub(crate) fn last_visited_kind(&self) -> Option<VisitedKind> {
         self.last_visited_kind
+    }
+
+    /// 直近の [`HnswIndex::search_masked_with_hop`] 呼び出しが記録した
+    /// ACORN-1 の 2-hop 展開件数（Issue #501）。`sql::hnsw_cache` の診断用
+    /// 統計（`acorn_expansions`）が使う。
+    pub(crate) fn last_acorn_expansions(&self) -> u64 {
+        self.last_acorn_expansions
     }
 
     /// [`Self::last_visited_kind`] の診断専用の薄いラッパー（Issue #498。
@@ -1856,6 +1936,9 @@ impl GraphBuilder {
         visited: &mut V,
         accept: Option<&NodeMask>,
     ) -> Result<Vec<ScoredNode>, HnswError> {
+        // 構築経路は常に `HopMode::OneHop`（ACORN-1・Issue #501 の 2-hop 展開は
+        // マスク付き探索限定。§ `HopMode` ドキュメンテーションコメント参照）。
+        let mut acorn_expansions = 0u64;
         search_layer_in(
             self,
             entry_points,
@@ -1867,6 +1950,8 @@ impl GraphBuilder {
             visited,
             accept,
             &prefetch::PipelinePrefetch,
+            HopMode::OneHop,
+            &mut acorn_expansions,
         )
     }
 }
@@ -2390,7 +2475,23 @@ impl HnswIndex {
     /// ある。両者が同じ起点を層 0 探索へ持ち込む限り、本関数が真を返す
     /// マスクについて `search_masked` が受理ノード全件へ到達できることが
     /// 保証される。
+    // production 経路は `sql::hnsw_cache` が `is_mask_fully_reachable_with` を
+    // 直接呼ぶ（`TraversalRegime::hop()` を明示的に渡す単一情報源。Issue #501）
+    // ため、`OneHop` 専用の本ラッパーはテストからのみ参照される
+    // （`select_neighbors_heuristic` と同じ方針で `#[cfg(test)]` にする）。
+    #[cfg(test)]
     pub(crate) fn is_mask_fully_reachable(&self, mask: &NodeMask) -> bool {
+        self.is_mask_fully_reachable_with(mask, HopMode::OneHop)
+    }
+
+    /// [`Self::is_mask_fully_reachable`] の hop 指定版（Issue #501）。
+    /// `hop == HopMode::TwoHop` のとき、BFS は非受理ノードを 1 段だけ中継点
+    /// として使い（[`bridge_expand`]）、実探索（[`Self::search_masked_with_hop`]）
+    /// と同じ到達規則で分断の有無を判定する——両者が異なる規則を実装すると、
+    /// 偽の分断判定（`TwoHop` が発火しない）か偽の到達可能判定（recall バグ）
+    /// のどちらかを招く（`docs/design/hnsw-rls-cardinality-switch.md`
+    /// 「Issue #501」節「同期」参照）。
+    pub(crate) fn is_mask_fully_reachable_with(&self, mask: &NodeMask, hop: HopMode) -> bool {
         let target = mask.count_ones();
         if target == 0 {
             return true;
@@ -2403,20 +2504,24 @@ impl HnswIndex {
             return false;
         };
         let mut visited = VisitedBitmap::default();
-        self.accepted_reachable_count(start, mask, target, &mut visited) >= target
+        self.accepted_reachable_count(start, mask, target, &mut visited, hop) >= target
     }
 
-    /// [`Self::is_mask_fully_reachable`] の BFS 本体。層 0 の隣接リストのみを
+    /// [`Self::is_mask_fully_reachable_with`] の BFS 本体。層 0 の隣接リストのみを
     /// 辿る BFS（辺の走査のみ）で `start` から到達可能な受理ノード数を数え、
     /// `target` 件に達した時点で早期終了する。`visited` は呼び出し元が
     /// 所有するスクラッチ（本関数専用に確保する使い捨て。呼び出し頻度が
     /// クエリ毎ではなく世代毎のため、`HnswSearchScratch` を共有する必要はない）。
+    /// `hop == HopMode::TwoHop` のとき非受理ノードは [`bridge_expand`] で
+    /// 1 段だけ中継点として使う（§呼び出し元ドキュメンテーションコメント
+    /// 「同期」参照）。
     fn accepted_reachable_count(
         &self,
         start: u32,
         mask: &NodeMask,
         target: usize,
         visited: &mut VisitedBitmap,
+        hop: HopMode,
     ) -> usize {
         visited.reset(self.graph.node_count());
         if visited.mark_visited(start as usize) != Some(false) {
@@ -2445,7 +2550,23 @@ impl HnswIndex {
                 }
                 if !mask.get(neighbor) {
                     // 非受理ノードはここで打ち切り、この先へは辿らない
-                    // （§本関数ドキュメンテーションコメント参照）。
+                    // （§本関数ドキュメンテーションコメント参照）——
+                    // ただし `hop == TwoHop` のときのみ、この非受理ノードを
+                    // 1 段だけ中継点として使い、その先（2-hop）の受理ノード
+                    // を [`bridge_expand`] 経由でキューへ加える。BFS 到達可能
+                    // 判定という関数の性質上、`target` 到達後も
+                    // `bridge_expand` 呼び出し自体は最後まで完了させる
+                    // （`neighbors` 1 本分の追加コストのみで停止性は崩れない）。
+                    if hop == HopMode::TwoHop {
+                        let _ = bridge_expand(&self.graph, 0, neighbor, mask, visited, |two_hop| {
+                            count = count.saturating_add(1);
+                            queue.push_back(two_hop);
+                            Ok(())
+                        });
+                        if count >= target {
+                            return count;
+                        }
+                    }
                     continue;
                 }
                 count = count.saturating_add(1);
@@ -2491,6 +2612,10 @@ impl HnswIndex {
     /// 一切触れない（実テナント境界は索引構築入力・呼び出し元の
     /// `provider_result_is_valid`・`RlsSafetyNet` の多層防御が担う。
     /// `sql::hnsw_cache` モジュールドキュメント参照）。
+    // production 経路は `search_masked_with_hop` が `search_layer_with_hop` を
+    // 直接呼ぶ（Issue #501）ため、`OneHop`・`PipelinePrefetch` 固定の本ラッパー
+    // はテストからのみ参照される（`is_mask_fully_reachable` と同じ方針）。
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)] // visited・accept 追加で 9 引数。既存の precision.rs・arena.rs と同じ方針で許容する。
     pub(crate) fn search_layer<V: VisitedSet>(
         &self,
@@ -2533,6 +2658,10 @@ impl HnswIndex {
     /// した自由関数。構築中の [`GraphBuilder::search_layer`] とも共有する）へ
     /// 委譲する薄いラッパー。`self.graph`（[`csr::CsrGraph`]）を渡すだけで、
     /// アルゴリズム本体・停止条件・受理判定は変更していない。
+    // `Self::search_layer`（`#[cfg(test)]`。上のドキュメンテーションコメント
+    // 参照）とテストの直接呼び出しからのみ参照される（Issue #501。production
+    // 経路は `search_layer_with_hop` を使う）。
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::hnsw) fn search_layer_with<V: VisitedSet, P: prefetch::PrefetchPolicy>(
         &self,
@@ -2546,6 +2675,12 @@ impl HnswIndex {
         accept: Option<&NodeMask>,
         prefetch: &P,
     ) -> Result<Vec<ScoredNode>, HnswError> {
+        // 既存の全呼び出し元（`search_layer`・テスト直呼び出し）は
+        // `HopMode::OneHop`（ACORN-1 の 2-hop 展開なし＝既存契約とビット
+        // 同一）を渡す。`TwoHop` 経路専用の新規呼び出しは
+        // [`Self::search_layer_with_hop`] を使う（Issue #501。既存の
+        // 呼び出し元を変更しないことで R1 のビット同一性を構造的に保つ）。
+        let mut acorn_expansions = 0u64;
         search_layer_in(
             &self.graph,
             entry_points,
@@ -2557,6 +2692,44 @@ impl HnswIndex {
             visited,
             accept,
             prefetch,
+            HopMode::OneHop,
+            &mut acorn_expansions,
+        )
+    }
+
+    /// [`Self::search_layer_with`] の hop 指定版（Issue #501。ACORN-1 の
+    /// 2-hop 展開を有効化する唯一の呼び出し経路。[`Self::search_masked_with_hop`]
+    /// からのみ呼ばれる）。`acorn_expansions` は [`bridge_expand`] が受理・
+    /// 候補化した 2-hop ノード数の累計を書き戻す出力引数（呼び出し元が
+    /// `HnswSearchScratch::last_acorn_expansions` へ転記する）。
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::hnsw) fn search_layer_with_hop<V: VisitedSet, P: prefetch::PrefetchPolicy>(
+        &self,
+        entry_points: Vec<u32>,
+        query: &[f32],
+        ef: usize,
+        level: usize,
+        dim: usize,
+        vectors: &NodeVectors,
+        visited: &mut V,
+        accept: Option<&NodeMask>,
+        prefetch: &P,
+        hop: HopMode,
+        acorn_expansions: &mut u64,
+    ) -> Result<Vec<ScoredNode>, HnswError> {
+        search_layer_in(
+            &self.graph,
+            entry_points,
+            query,
+            ef,
+            level,
+            dim,
+            vectors,
+            visited,
+            accept,
+            prefetch,
+            hop,
+            acorn_expansions,
         )
     }
 
@@ -2870,9 +3043,48 @@ impl HnswIndex {
         sparse_visited_max: usize,
         scratch: &mut HnswSearchScratch,
     ) -> Result<Vec<crate::kernel::CandidateHit>, HnswError> {
-        // 早期 return 経路で前回呼び出しの記録を持ち越さない（Issue #497）。
-        // 層 0 探索へ到達した場合のみ、その直前で `Some(kind)` を上書きする。
+        self.search_masked_with_hop(
+            query,
+            k,
+            ef,
+            mask,
+            sparse_visited_max,
+            HopMode::OneHop,
+            scratch,
+        )
+    }
+
+    /// [`Self::search_masked_with`] の hop 指定版（Issue #501。ACORN-1 の
+    /// 2-hop 展開〔[`HopMode::TwoHop`]〕を有効化する唯一の呼び出し経路）。
+    /// `hop == HopMode::OneHop` のときは本関数・[`Self::search_masked_with`]・
+    /// [`Self::search_masked`] はビット同一の結果を返す（既存動作を不変に
+    /// 保つ。呼び出し元は `sql::hnsw_cache::search_with_overlay` が
+    /// `sql::hnsw_cache::TraversalRegime`〔可視カーディナリティ×
+    /// `ValidatedHnswParams::acorn_max_visible_ratio` から導出〕を渡す）。
+    ///
+    /// `scratch.last_acorn_expansions()` に本呼び出しが `bridge_expand`
+    /// 経由で受理・候補化した 2-hop ノード数を書き戻す（`hop == OneHop` では
+    /// 常に `0`）。
+    ///
+    /// # エラー
+    ///
+    /// 検証順序・戻り値の契約は [`Self::search_masked`] と同一（本関数へ委譲
+    /// するだけで検証ロジック自体は変更していない）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_masked_with_hop(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        mask: Option<&NodeMask>,
+        sparse_visited_max: usize,
+        hop: HopMode,
+        scratch: &mut HnswSearchScratch,
+    ) -> Result<Vec<crate::kernel::CandidateHit>, HnswError> {
+        // 早期 return 経路で前回呼び出しの記録を持ち越さない（Issue #497・#501）。
+        // 層 0 探索へ到達した場合のみ、その直前で上書きする。
         scratch.last_visited_kind = None;
+        scratch.last_acorn_expansions = 0;
 
         let dim_usize = self.dim as usize;
         if query.len() != dim_usize {
@@ -2999,8 +3211,9 @@ impl HnswIndex {
         } else {
             VisitedKind::Dense
         });
+        let mut acorn_expansions = 0u64;
         let results = if use_sparse {
-            self.search_layer(
+            self.search_layer_with_hop(
                 level0_entry_points,
                 query,
                 ef_eff,
@@ -3009,9 +3222,12 @@ impl HnswIndex {
                 &self.vectors,
                 &mut scratch.sparse,
                 mask,
+                &prefetch::PipelinePrefetch,
+                hop,
+                &mut acorn_expansions,
             )?
         } else {
-            self.search_layer(
+            self.search_layer_with_hop(
                 level0_entry_points,
                 query,
                 ef_eff,
@@ -3020,8 +3236,12 @@ impl HnswIndex {
                 &self.vectors,
                 &mut scratch.visited,
                 mask,
+                &prefetch::PipelinePrefetch,
+                hop,
+                &mut acorn_expansions,
             )?
         };
+        scratch.last_acorn_expansions = acorn_expansions;
 
         let out: Vec<crate::kernel::CandidateHit> = results
             .into_iter()
@@ -3052,6 +3272,73 @@ impl HnswIndex {
 /// codex-review P0 是正。`docs/design/ann-index-adoption.md`「RLS／
 /// フィルタとの相互作用と折衷案」節の P0 安全条件）。`None` の場合は常に
 /// 受理したのと同じ振る舞いになる（`search_masked_none_matches_search` 参照）。
+/// 非受理（不適合）1-hop ノード `bridge` の隣接リストを 1 段だけ中継点として
+/// 辿り、未訪問かつ受理の 2-hop ノードを `on_accepted` へ渡す（ACORN-1・
+/// Issue #501。呼び出し元は [`search_layer_in`]（ビーム探索）・
+/// [`HnswIndex::accepted_reachable_count`]（BFS 到達可能性検査）の 2 者で、
+/// 双方が同一実装を共有することで「非受理ノードに出会ったときの規則」を
+/// ビット同一に保つ（`docs/design/hnsw-rls-cardinality-switch.md`
+/// 「Issue #501」節「同期」参照。BFS と探索が異なる規則を実装すると、
+/// 偽の分断判定（2-hop が発火しない）か偽の到達可能判定（recall バグ）の
+/// どちらかを招く）。
+///
+/// # 停止性（R2・DoS ガード）
+///
+/// `bridge` は呼び出し元が「1-hop 非受理として初めて visited へ記録した
+/// 直後」にのみ渡す契約（`bridge` 自身は既に visited 済み）。本関数はその
+/// `bridge` の隣接リストを読むだけで、2-hop 先が非受理の場合は visited を
+/// 一切付けない（別の 1-hop 経路から改めて中継点として使えるようにする
+/// ためだが、その別経路が `bridge_expand` を呼ぶのは「その 2-hop ノード
+/// 自身が誰かの 1-hop 非受理隣接として初めて visited されたとき」のみ——
+/// つまり本関数が呼ばれる回数はクエリ全体で「1-hop 非受理として visited
+/// された回数」以下に構造的に有界であり、各ノードは高々 1 回しか
+/// `visited.mark_visited` を通過しない。したがって隣接リスト読み取りの
+/// 総量はマスクの有無によらず `O(N・M0)`（`N`＝索引ノード数・`M0`＝層 0 の
+/// 最大次数）で有界（`docs/design/hnsw-rls-cardinality-switch.md`
+/// 「Issue #501」節「停止性」参照。明示的な訪問予算上限は設けない）。
+///
+/// # I1（ベクトル非参照）不変
+///
+/// 非受理ノード（`bridge` 自身・2-hop 先が非受理の場合）のベクトルには
+/// 一切アクセスしない——`vectors.score` を呼ぶのは `on_accepted` へ渡す
+/// 受理済み 2-hop ノードのみ（呼び出し元がスコア計算を担う。本関数自体は
+/// スコア計算を行わない）。
+///
+/// 戻り値は `on_accepted` へ渡した（受理・候補化した）2-hop ノード数
+/// （統計用。`HnswSearchScratch::last_acorn_expansions`・
+/// `sql::hnsw_cache::HnswIndexCacheStats::acorn_expansions` が使う）。
+fn bridge_expand<A: Adjacency, V: VisitedSet>(
+    graph: &A,
+    level: usize,
+    bridge: u32,
+    accept: &NodeMask,
+    visited: &mut V,
+    mut on_accepted: impl FnMut(u32) -> Result<(), HnswError>,
+) -> Result<usize, HnswError> {
+    let mut expanded = 0usize;
+    let Some(neighbors) = graph.neighbors(level, bridge) else {
+        return Ok(0);
+    };
+    for &two_hop in neighbors {
+        if !accept.get(two_hop) {
+            // 非受理の 2-hop ノードは visited を付けない（§関数ドキュメン
+            // テーションコメント「停止性」参照。別の 1-hop 非受理隣接
+            // からも中継点として使えるようにするため）。3-hop（さらに先）
+            // へは辿らない——展開は 1 段のみ。
+            continue;
+        }
+        // 受理ノードは通常の 1-hop 受理隣接と同じ「visited を先に付けてから
+        // 処理する」規約（Issue #431 是正済みの既存規則）に合わせる。
+        match visited.mark_visited(two_hop as usize) {
+            Some(false) => {}
+            _ => continue,
+        }
+        on_accepted(two_hop)?;
+        expanded = expanded.saturating_add(1);
+    }
+    Ok(expanded)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn search_layer_in<
     V: VisitedSet,
@@ -3069,6 +3356,8 @@ fn search_layer_in<
     visited: &mut V,
     accept: Option<&NodeMask>,
     prefetch: &P,
+    hop: HopMode,
+    acorn_expansions: &mut u64,
 ) -> Result<Vec<ScoredNode>, HnswError> {
     visited.reset(graph.node_count());
     let mut candidates: BinaryHeap<ScoredNode> = BinaryHeap::new();
@@ -3147,7 +3436,41 @@ fn search_layer_in<
                     // 積まない（Issue #431 是正。§関数ドキュメンテーション
                     // コメント参照）。スコア計算（このノードのベクトルへの
                     // アクセス）自体を行わず、この隣接ノード経由でのさらに
-                    // 先の探索も一切行わない。
+                    // 先の探索も一切行わない——ただし `hop == TwoHop`
+                    // （Issue #501・ACORN-1）のときのみ、この非受理ノードを
+                    // 1 段だけ中継点として使い、その先（2-hop）にいる受理
+                    // ノードを [`bridge_expand`] 経由で候補化する。非受理
+                    // ノード自身のベクトルには一切アクセスしない（I1 不変。
+                    // §関数ドキュメンテーションコメント参照）。
+                    if hop == HopMode::TwoHop {
+                        if let Some(mask) = accept {
+                            let expanded =
+                                bridge_expand(graph, level, neighbor, mask, visited, |two_hop| {
+                                    let score = vectors.score(dim, two_hop, query)?;
+                                    let scored = ScoredNode {
+                                        node: two_hop,
+                                        score,
+                                    };
+                                    let worst_ok = match results.peek() {
+                                        Some(std::cmp::Reverse(worst)) => {
+                                            results.len() < ef
+                                                || scored.score.total_cmp(&worst.score)
+                                                    != std::cmp::Ordering::Less
+                                        }
+                                        None => true,
+                                    };
+                                    if worst_ok {
+                                        candidates.push(scored);
+                                        results.push(std::cmp::Reverse(scored));
+                                        if results.len() > ef {
+                                            results.pop();
+                                        }
+                                    }
+                                    Ok(())
+                                })?;
+                            *acorn_expansions = acorn_expansions.saturating_add(expanded as u64);
+                        }
+                    }
                     continue;
                 }
                 let neighbor_score = vectors.score(dim, neighbor, query)?;
@@ -3755,6 +4078,85 @@ mod tests {
         );
     }
 
+    /// `acorn_max_visible_ratio`（Issue #501）の既定値・検証規則（`den==0`・
+    /// `num>den`・`ratio < full_scan_ratio` はいずれも拒否、境界一致
+    /// `ratio == full_scan_ratio` は受理）を固定する。
+    #[test]
+    fn acorn_max_visible_ratio_defaults_none_and_rejects_invalid_ratios() {
+        let v = ValidatedHnswParams::new(HnswParams::default()).expect("valid params");
+        assert_eq!(
+            v.acorn_max_visible_ratio(),
+            None,
+            "acorn_max_visible_ratio must default to None (existing behavior unchanged)"
+        );
+
+        assert!(
+            v.with_acorn_max_visible_ratio(Ratio {
+                numerator: 0,
+                denominator: 0,
+            })
+            .is_err(),
+            "denominator == 0 must be rejected"
+        );
+        assert!(
+            v.with_acorn_max_visible_ratio(Ratio {
+                numerator: 11,
+                denominator: 10,
+            })
+            .is_err(),
+            "numerator > denominator must be rejected"
+        );
+        assert!(
+            v.with_acorn_max_visible_ratio(Ratio {
+                numerator: 1,
+                denominator: 20,
+            })
+            .is_err(),
+            "acorn ratio below the default full_scan_ratio (1/10) must be rejected"
+        );
+
+        // 境界一致（acorn == full_scan_ratio）は受理する。
+        let at_boundary = v
+            .with_acorn_max_visible_ratio(Ratio {
+                numerator: 1,
+                denominator: 10,
+            })
+            .expect("acorn == full_scan_ratio must be accepted");
+        assert_eq!(
+            at_boundary.acorn_max_visible_ratio(),
+            Some(Ratio {
+                numerator: 1,
+                denominator: 10
+            })
+        );
+
+        let widened = v
+            .with_acorn_max_visible_ratio(Ratio {
+                numerator: 1,
+                denominator: 2,
+            })
+            .expect("acorn ratio above full_scan_ratio must be accepted");
+
+        // 後付けで full_scan_ratio を acorn_max_visible_ratio より大きくする
+        // 変更は拒否する（逆転防止。Issue #501）。
+        assert!(
+            widened
+                .with_full_scan_ratio(Ratio {
+                    numerator: 6,
+                    denominator: 10,
+                })
+                .is_err(),
+            "raising full_scan_ratio above acorn_max_visible_ratio must be rejected"
+        );
+        // full_scan_ratio 側との境界一致は受理する。
+        assert!(widened
+            .with_full_scan_ratio(Ratio {
+                numerator: 1,
+                denominator: 2,
+            })
+            .is_ok());
+    }
+
     #[test]
     fn assign_level_is_deterministic_for_same_seed() {
         let m = 16;
@@ -4072,6 +4474,449 @@ mod tests {
             !index.is_mask_fully_reachable(&mask),
             "node2 is mask-accepted but unreachable from node0 without traversing \
              the rejected bridge node1, so the mask must be reported as split"
+        );
+    }
+
+    /// ACORN-1 の 2-hop 展開（Issue #501・`HopMode::TwoHop`）は、上の
+    /// `search_masked_does_not_traverse_through_a_rejected_bridge_node` と
+    /// 同じグラフ形状で node1（非受理）を橋渡し役として使い、node2 へ到達
+    /// できることを固定する。`is_mask_fully_reachable_with` も同じ規則を
+    /// 共有するため到達可能と判定する（BFS と探索の同期。§`bridge_expand`
+    /// ドキュメンテーションコメント参照）。
+    #[test]
+    fn search_masked_two_hop_traverses_through_a_rejected_bridge_node() {
+        let dim = 1usize;
+        let vectors: Vec<f32> = vec![10.0, 15.0, 20.0];
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
+                Node {
+                    level: 0,
+                    links: vec![vec![1]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![vec![2]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+            ],
+            Some(0),
+            Arc::from(vectors),
+        );
+        let query = [1.0f32];
+        let mut scratch = HnswSearchScratch::default();
+
+        let mut mask = NodeMask::new(index.len());
+        mask.set(0);
+        // node1（橋渡しノード）は非受理のまま。
+        mask.set(2);
+
+        assert!(
+            index.is_mask_fully_reachable_with(&mask, HopMode::TwoHop),
+            "TwoHop 展開により node1 を橋渡しとして node2 へ到達できるはず"
+        );
+
+        let masked = index
+            .search_masked_with_hop(
+                &query,
+                3,
+                10,
+                Some(&mask),
+                DEFAULT_SPARSE_VISITED_MAX,
+                HopMode::TwoHop,
+                &mut scratch,
+            )
+            .expect("two-hop masked search should succeed");
+        assert_eq!(
+            masked.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![2, 0],
+            "TwoHop 展開は node1（非受理）を中継点として node2 を候補化し、\
+             node2（score 20）が node0（score 10）より上位に来るはず"
+        );
+        assert_eq!(
+            scratch.last_acorn_expansions(),
+            1,
+            "node1 経由で受理・候補化した 2-hop ノードは node2 の 1 件のみ"
+        );
+
+        // `HopMode::OneHop` は既存契約のまま変わらない（ビット同一）。
+        let masked_one_hop = index
+            .search_masked_with_hop(
+                &query,
+                3,
+                10,
+                Some(&mask),
+                DEFAULT_SPARSE_VISITED_MAX,
+                HopMode::OneHop,
+                &mut scratch,
+            )
+            .expect("one-hop masked search should succeed");
+        assert_eq!(
+            masked_one_hop.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(scratch.last_acorn_expansions(), 0);
+    }
+
+    /// `TwoHop` は 1 段のみ展開する（3-hop 先へは辿らない）ことを、
+    /// `0 -> 1(非受理) -> 2(非受理) -> 3(受理)` の鎖状グラフで固定する。
+    /// node3 は node1 からは 2-hop（node2 経由）先だが、node2 自身が非受理
+    /// のため `bridge_expand` は node2 を候補化せず、node3 はどちらの
+    /// 経路（探索・BFS）からも到達不能のまま。
+    #[test]
+    fn search_masked_two_hop_does_not_traverse_three_hops() {
+        let dim = 1usize;
+        let vectors: Vec<f32> = vec![10.0, 11.0, 12.0, 20.0];
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
+                Node {
+                    level: 0,
+                    links: vec![vec![1]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![vec![2]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![vec![3]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+            ],
+            Some(0),
+            Arc::from(vectors),
+        );
+        let query = [1.0f32];
+        let mut scratch = HnswSearchScratch::default();
+
+        let mut mask = NodeMask::new(index.len());
+        mask.set(0);
+        // node1・node2 はいずれも非受理のまま。
+        mask.set(3);
+
+        assert!(
+            !index.is_mask_fully_reachable_with(&mask, HopMode::TwoHop),
+            "node3 is 3 hops away through two rejected bridges; TwoHop must not \
+             report it reachable (expansion is a single hop only)"
+        );
+
+        let masked = index
+            .search_masked_with_hop(
+                &query,
+                4,
+                10,
+                Some(&mask),
+                DEFAULT_SPARSE_VISITED_MAX,
+                HopMode::TwoHop,
+                &mut scratch,
+            )
+            .expect("two-hop masked search should succeed");
+        assert_eq!(
+            masked.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![0],
+            "node3 must not appear: bridge_expand only inspects node1's own \
+             neighbors (node2, itself rejected) and never recurses further"
+        );
+    }
+
+    /// [`crate::hnsw::NodeSource`] への `score` 呼び出しを記録するテスト専用
+    /// ラッパー（I1・P0 不変の機械検証用。Issue #501）。非受理ノードのベクトル
+    /// へは一切アクセスしないという契約を、`TwoHop` 探索中に記録された
+    /// score 呼び出し先ノード集合が受理ノードのみであることで直接検証する。
+    struct RecordingNodeSource<'a> {
+        inner: &'a NodeVectors,
+        scored: std::cell::RefCell<Vec<u32>>,
+    }
+
+    impl NodeSource for RecordingNodeSource<'_> {
+        fn score(&self, dim: usize, node: u32, query: &[f32]) -> Result<f32, HnswError> {
+            self.scored.borrow_mut().push(node);
+            self.inner.score(dim, node, query)
+        }
+        fn touch_prefetch(&self, dim: usize, node: u32) {
+            self.inner.touch_prefetch(dim, node);
+        }
+    }
+
+    /// I1（ベクトル非参照・P0・不変）の機械検証: `TwoHop` 探索中に `score` が
+    /// 呼ばれるのは受理ノードのみであり、非受理ノード（橋渡し役の node1・
+    /// node3）へは一度も呼ばれないことを固定する。非 vacuous
+    /// （受理 2-hop ノードへの呼び出しは 1 件以上ある）ことも確認する。
+    #[test]
+    fn search_masked_two_hop_never_scores_rejected_nodes() {
+        let dim = 1usize;
+        // node0(受理) -> node1(非受理,橋) -> node2(受理,2-hop)
+        //             \-> node3(非受理,橋) -> node4(非受理,2-hop 先も非受理)
+        let vectors: Vec<f32> = vec![10.0, 11.0, 20.0, 12.0, 13.0];
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
+                Node {
+                    level: 0,
+                    links: vec![vec![1, 3]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![vec![2]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+                Node {
+                    level: 0,
+                    links: vec![vec![4]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+            ],
+            Some(0),
+            Arc::from(vectors),
+        );
+        let query = [1.0f32];
+
+        let mut mask = NodeMask::new(index.len());
+        mask.set(0);
+        mask.set(2);
+
+        let source = RecordingNodeSource {
+            inner: &index.vectors,
+            scored: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut visited = VisitedBitmap::default();
+        let mut expansions = 0u64;
+        let result = search_layer_in(
+            &index.graph,
+            vec![0],
+            &query,
+            10,
+            0,
+            dim,
+            &source,
+            &mut visited,
+            Some(&mask),
+            &prefetch::PipelinePrefetch,
+            HopMode::TwoHop,
+            &mut expansions,
+        )
+        .expect("two-hop search_layer_in should succeed");
+
+        assert_eq!(
+            result.iter().map(|s| s.node).collect::<Vec<_>>(),
+            vec![2, 0],
+            "node2 (accepted 2-hop via rejected bridge node1) must be found"
+        );
+        let scored = source.scored.into_inner();
+        assert!(
+            scored.contains(&0) && scored.contains(&2),
+            "score must be called for accepted nodes (non-vacuous): {scored:?}"
+        );
+        assert!(
+            !scored.contains(&1) && !scored.contains(&3) && !scored.contains(&4),
+            "score must never be called for rejected nodes (I1 invariant): {scored:?}"
+        );
+        assert_eq!(
+            expansions, 1,
+            "only node2 is accepted among the 2-hop candidates"
+        );
+    }
+
+    /// `accept == None` のとき `HopMode::TwoHop` は `HopMode::OneHop`・
+    /// [`HnswIndex::search`] とビット同一の結果を返す（`is_accepted` が常に
+    /// `true` を返すため非受理分岐そのものへ到達しない。既存動作を不変に
+    /// 保つ契約の一部）。
+    #[test]
+    fn search_masked_two_hop_matches_search_when_mask_is_none() {
+        let dim = 4usize;
+        let vectors = gen_corpus(0xACC0_1234, dim, 64);
+        let index = HnswIndex::build(
+            HnswParams::default().with_m(8).with_ef_construction(32),
+            dim as u32,
+            &vectors,
+            7,
+        )
+        .expect("build should succeed");
+        let query = gen_corpus(0xACC0_5678, dim, 1);
+        let mut scratch = HnswSearchScratch::default();
+
+        let expected = index
+            .search(&query, 10, 32, &mut scratch)
+            .expect("search should succeed");
+        let two_hop = index
+            .search_masked_with_hop(
+                &query,
+                10,
+                32,
+                None,
+                DEFAULT_SPARSE_VISITED_MAX,
+                HopMode::TwoHop,
+                &mut scratch,
+            )
+            .expect("two-hop search_masked_with_hop(mask=None) should succeed");
+        assert_eq!(
+            two_hop
+                .iter()
+                .map(|h| (h.id, h.score.to_bits()))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|h| (h.id, h.score.to_bits()))
+                .collect::<Vec<_>>(),
+            "mask=None must be bit-identical between HopMode::TwoHop and search()"
+        );
+        assert_eq!(scratch.last_acorn_expansions(), 0);
+    }
+
+    /// `TwoHop` 探索は決定的（同一索引・同一クエリ・同一マスクで新規スクラッチ
+    /// を使っても完全一致する）ことを固定する。
+    #[test]
+    fn search_masked_two_hop_is_deterministic() {
+        let dim = 4usize;
+        let vectors = gen_corpus(0x7EE7_0001, dim, 96);
+        let index = HnswIndex::build(
+            HnswParams::default().with_m(8).with_ef_construction(32),
+            dim as u32,
+            &vectors,
+            11,
+        )
+        .expect("build should succeed");
+        let query = gen_corpus(0x7EE7_0002, dim, 1);
+
+        // 偶数 id のみ受理（隣接構造次第で非受理ノードを跨ぐ橋渡しが起こる）。
+        let mut mask = NodeMask::new(index.len());
+        for id in 0..index.len() {
+            if id % 2 == 0 {
+                mask.set(id as u32);
+            }
+        }
+
+        let mut scratch_a = HnswSearchScratch::default();
+        let run1 = index
+            .search_masked_with_hop(
+                &query,
+                10,
+                32,
+                Some(&mask),
+                DEFAULT_SPARSE_VISITED_MAX,
+                HopMode::TwoHop,
+                &mut scratch_a,
+            )
+            .expect("run1 should succeed");
+
+        let mut scratch_b = HnswSearchScratch::default();
+        let run2 = index
+            .search_masked_with_hop(
+                &query,
+                10,
+                32,
+                Some(&mask),
+                DEFAULT_SPARSE_VISITED_MAX,
+                HopMode::TwoHop,
+                &mut scratch_b,
+            )
+            .expect("run2 should succeed");
+
+        assert_eq!(
+            run1.iter()
+                .map(|h| (h.id, h.score.to_bits()))
+                .collect::<Vec<_>>(),
+            run2.iter()
+                .map(|h| (h.id, h.score.to_bits()))
+                .collect::<Vec<_>>(),
+            "TwoHop search must be deterministic across independent scratches"
+        );
+        assert_eq!(
+            scratch_a.last_acorn_expansions(),
+            scratch_b.last_acorn_expansions()
+        );
+    }
+
+    /// 停止性（R2・DoS ガード）: `bridge_expand` が呼ばれる回数（＝非受理
+    /// ノードの隣接リストを読む回数）は、クエリ全体で「1-hop 非受理として
+    /// 初めて visited されたノード数」以下に構造的に有界であることを、
+    /// [`Adjacency::neighbors`] 呼び出し回数を記録するラッパーで固定する
+    /// （§`bridge_expand` ドキュメンテーションコメント「停止性」参照）。
+    struct CountingAdjacency<'a, A: Adjacency> {
+        inner: &'a A,
+        calls: std::cell::RefCell<std::collections::HashMap<u32, u32>>,
+    }
+
+    impl<A: Adjacency> Adjacency for CountingAdjacency<'_, A> {
+        fn level_of(&self, node: u32) -> Option<usize> {
+            self.inner.level_of(node)
+        }
+        fn neighbors(&self, level: usize, node: u32) -> Option<&[u32]> {
+            *self.calls.borrow_mut().entry(node).or_insert(0) += 1;
+            self.inner.neighbors(level, node)
+        }
+        fn node_count(&self) -> usize {
+            self.inner.node_count()
+        }
+    }
+
+    #[test]
+    fn search_masked_two_hop_reads_each_node_adjacency_at_most_once() {
+        let dim = 4usize;
+        let vectors = gen_corpus(0xB0DE_0001, dim, 200);
+        let index = HnswIndex::build(
+            HnswParams::default().with_m(8).with_ef_construction(48),
+            dim as u32,
+            &vectors,
+            13,
+        )
+        .expect("build should succeed");
+        let query = gen_corpus(0xB0DE_0002, dim, 1);
+
+        // 3 個に 1 個だけ受理する疎なマスク（非受理ノードを跨ぐ橋渡しを
+        // 誘発しやすくする）。
+        let mut mask = NodeMask::new(index.len());
+        for id in 0..index.len() {
+            if id % 3 == 0 {
+                mask.set(id as u32);
+            }
+        }
+
+        let counting = CountingAdjacency {
+            inner: &index.graph,
+            calls: std::cell::RefCell::new(std::collections::HashMap::new()),
+        };
+        let mut visited = VisitedBitmap::default();
+        let mut expansions = 0u64;
+        let _ = search_layer_in(
+            &counting,
+            vec![0],
+            &query,
+            32,
+            0,
+            dim,
+            &index.vectors,
+            &mut visited,
+            Some(&mask),
+            &prefetch::PipelinePrefetch,
+            HopMode::TwoHop,
+            &mut expansions,
+        )
+        .expect("two-hop search_layer_in should succeed");
+
+        let calls = counting.calls.into_inner();
+        let max_reads = calls.values().copied().max().unwrap_or(0);
+        assert!(
+            max_reads <= 1,
+            "each node's adjacency list must be read at most once per query \
+             (bridge_expand marks the bridge node visited before expanding it), \
+             but observed {max_reads} reads for some node: {calls:?}"
         );
     }
 
