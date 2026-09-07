@@ -24,11 +24,27 @@
 //!
 //! `isa::current().isa()` が `Scalar`（SIMD 拡張なし）の環境では SIMD 経路が
 //! 測定不能なため、`simd_bench.rs` と同じ方針で非ゼロ終了する。
+//!
+//! # block4 A/B（Issue #512・opt-in）
+//!
+//! `isa.rs::SimdKernel::dot_block4`（Issue #510・#511。`docs/design/
+//! dot-kernel-row-block.md`）の前後比較・採否記録（Issue #512）向けに、
+//! `BENCH_DOT_KERNEL_BLOCK_AB=1` を設定したときのみ追加で計測する opt-in
+//! セクションを末尾に持つ（未設定・`0` の既定経路の出力・所要時間は不変）。
+//! 単一バイナリ内で A（1 行版 `dot` を全行へ適用）・B（4 行組へ
+//! `dot_block4` を適用）を [`run_ab`] で交互実行し、`harness::dot_block` の
+//! ビット同一検証（fail-closed）を経てから計測する。`docs/design/
+//! dot-kernel-multi-accumulator.md`「行間再利用（Issue #512）」節が前後比較の
+//! 記録先。
 
 #[allow(dead_code)]
 mod harness;
 
 use harness::ab::run_ab;
+use harness::dot_block::{
+    check_block_bit_identical, parse_block_ab_env, render_block_ab_line,
+    render_block_ab_reference_line, BlockAbMode, BLOCK_AB_DIMS,
+};
 use harness::dot_kernel::{
     check_matches_scalar_reference, classify_change, generate_corpus, generate_query, ns_per_dot,
     refuse_under_github_actions, render_line, rows_for, speedup_ratio, WorkingSet,
@@ -119,6 +135,161 @@ fn dot_scalar_wrapper(a: &[f32], b: &[f32]) -> f32 {
     isa::dot_scalar(a, b)
 }
 
+/// block4 A/B・A 側（1 行版 `dot` を 4 行分連続で呼ぶ。#510 以前の
+/// `search_range` 相当の形）への `#[inline(never)]` 入口。
+#[inline(never)]
+fn block_ab_single_row_wrapper(rows: [&[f32]; 4], query: &[f32]) -> [f32; 4] {
+    let k = isa::current();
+    [
+        k.dot(rows[0], query),
+        k.dot(rows[1], query),
+        k.dot(rows[2], query),
+        k.dot(rows[3], query),
+    ]
+}
+
+/// block4 A/B・B 側（`dot_block4`。#510 以降の `search_range` 経路）への
+/// `#[inline(never)]` 入口。
+#[inline(never)]
+fn block_ab_block4_wrapper(rows: [&[f32]; 4], query: &[f32]) -> [f32; 4] {
+    isa::current().dot_block4(rows, query)
+}
+
+/// 参照区間（1 行版 `dot`。`measure_stage` の `label=current` 計測と同一
+/// カーネル）への `#[inline(never)]` 入口。block4 A/B の diff とは独立に、
+/// 変更を含まない区間の run 内相対ノイズ帯を算出するために使う。
+#[inline(never)]
+fn block_ab_reference_wrapper(a: &[f32], b: &[f32]) -> f32 {
+    isa::current().dot(a, b)
+}
+
+/// block4 A/B の 1 区間（1 working_set × 1 dim）を計測する。事前に全ブロック
+/// で `dot_block4` が 1 行版 `dot` とビット同一であることを検証してから
+/// [`run_ab`] で交互実行し、A/B の中央値比（`speedup_ratio`）に加え、
+/// 参照区間（1 行版 `dot` の反復走査）の run 内相対ノイズ帯（[`relative_band`]
+/// 相当。ここでは `run_ab` のサンプル列から直接算出）を返す。
+///
+/// 契約: ビット不一致が 1 件でもあれば実測せず `Err` を返す（fail-closed。
+/// `docs/design/dot-kernel-row-block.md` §4 の契約を計測前に再確認する）。
+fn measure_block_ab_stage(working_set: WorkingSet, dim: usize) -> Result<(), String> {
+    let rows = rows_for(working_set, dim).map_err(|e| e.to_string())?;
+    // 4 行組で扱うためコーパス行数を 4 の倍数へ切り詰める（端数行は本 A/B の
+    // 対象外。production `search_range` の端数行縮退経路は既存の
+    // `dot_block4_falls_back_to_single_row_dot_when_lengths_are_not_uniform`
+    // 等が別途固定済み）。
+    let usable_rows = (rows / 4) * 4;
+    if usable_rows == 0 {
+        return Err(format!(
+            "block4_ab working_set={working_set:?} dim={dim}: rows={rows} too small for a 4-row block"
+        ));
+    }
+    let corpus =
+        generate_corpus(0xB10C_0000 ^ dim as u64, dim, usable_rows).map_err(|e| e.to_string())?;
+    let query = generate_query(0xB10C_0000 ^ dim as u64, dim);
+
+    let repeat = match working_set {
+        WorkingSet::CacheResident => CACHE_RESIDENT_REPEAT,
+        WorkingSet::ArenaScale => 1,
+    };
+
+    // fail-closed ビット同一検証（計測前・1 回のみ）。
+    for (block_idx, block) in corpus.chunks_exact(dim * 4).enumerate() {
+        let (r0, rest) = block.split_at(dim);
+        let (r1, rest) = rest.split_at(dim);
+        let (r2, r3) = rest.split_at(dim);
+        let actual = block_ab_block4_wrapper([r0, r1, r2, r3], &query);
+        let expected = block_ab_single_row_wrapper([r0, r1, r2, r3], &query);
+        for lane in 0..4 {
+            check_block_bit_identical(dim, block_idx, lane, actual[lane], expected[lane])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    let config = MeasurementConfig::new(20, 50, 0xB10C_0000 ^ dim as u64)
+        .map_err(|e| format!("block4_ab dim={dim}: {e}"))?;
+    let ab = run_ab(
+        &config,
+        || {
+            let mut sum = [0f32; 4];
+            for _ in 0..repeat {
+                for block in corpus.chunks_exact(dim * 4) {
+                    let (r0, rest) = block.split_at(dim);
+                    let (r1, rest) = rest.split_at(dim);
+                    let (r2, r3) = rest.split_at(dim);
+                    let out = block_ab_single_row_wrapper([r0, r1, r2, r3], &query);
+                    for i in 0..4 {
+                        sum[i] += out[i];
+                    }
+                }
+            }
+            sum
+        },
+        || {
+            let mut sum = [0f32; 4];
+            for _ in 0..repeat {
+                for block in corpus.chunks_exact(dim * 4) {
+                    let (r0, rest) = block.split_at(dim);
+                    let (r1, rest) = rest.split_at(dim);
+                    let (r2, r3) = rest.split_at(dim);
+                    let out = block_ab_block4_wrapper([r0, r1, r2, r3], &query);
+                    for i in 0..4 {
+                        sum[i] += out[i];
+                    }
+                }
+            }
+            sum
+        },
+    )
+    .map_err(|e| format!("block4_ab dim={dim}: {e}"))?;
+
+    let ratio = speedup_ratio(
+        ab.a.summary.median.as_secs_f64(),
+        ab.b.summary.median.as_secs_f64(),
+    );
+    let ws_label = match working_set {
+        WorkingSet::CacheResident => "cache_resident",
+        WorkingSet::ArenaScale => "arena_scale",
+    };
+    println!(
+        "{}",
+        render_block_ab_line(
+            ws_label,
+            dim,
+            ab.a.summary.median,
+            ab.b.summary.median,
+            ratio
+        )
+    );
+
+    // 参照区間（1 行版 dot の反復走査。block4 A/B の対象外）を同一プロセス内で
+    // 追加計測し、run 内相対ノイズ帯を併記する（`policy.md` §4 の要件）。
+    let ref_config = MeasurementConfig::new(20, 30, 0xAEF0_0000_u64.wrapping_add(dim as u64))
+        .map_err(|e| format!("block4_ab_ref dim={dim}: {e}"))?;
+    let ref_measurement = run(&ref_config, || {
+        let mut sum = 0f32;
+        for chunk in corpus.chunks_exact(dim) {
+            sum += block_ab_reference_wrapper(chunk, &query);
+        }
+        sum
+    })
+    .map_err(|e| format!("block4_ab_ref dim={dim}: {e}"))?;
+    let ref_secs: Vec<f64> = ref_measurement
+        .samples
+        .iter()
+        .map(|d| d.as_secs_f64())
+        .collect();
+    let min = ref_secs.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = ref_secs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let band = if min > 0.0 && min.is_finite() && max.is_finite() {
+        (max - min) / min
+    } else {
+        0.0
+    };
+    println!("{}", render_block_ab_reference_line(ws_label, dim, band));
+
+    Ok(())
+}
+
 fn main() {
     if let Err(e) = refuse_under_github_actions(running_under_github_actions()) {
         eprintln!("dot_kernel_bench: {e}");
@@ -206,6 +377,42 @@ fn main() {
         }
         Err(e) => {
             eprintln!("dot_kernel_bench: diagnostic ab failed: {e}");
+        }
+    }
+
+    // block4 A/B（Issue #512・opt-in）。`BENCH_DOT_KERNEL_BLOCK_AB` 未設定・`0`
+    // では既定経路の出力・所要時間に一切影響しない（fail-closed パース。
+    // 非 UTF-8 env は `to_str` の時点で拒否する）。
+    let block_ab_raw = std::env::var_os("BENCH_DOT_KERNEL_BLOCK_AB");
+    let block_ab_str = match &block_ab_raw {
+        None => None,
+        Some(v) => match v.to_str() {
+            Some(s) => Some(s),
+            None => {
+                eprintln!("dot_kernel_bench: BENCH_DOT_KERNEL_BLOCK_AB must be valid UTF-8");
+                std::process::exit(1);
+            }
+        },
+    };
+    let mode = match parse_block_ab_env(block_ab_str) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("dot_kernel_bench: {e}");
+            std::process::exit(1);
+        }
+    };
+    if mode == BlockAbMode::On {
+        let mut block_ab_had_error = false;
+        for &working_set in &WORKING_SETS {
+            for &dim in &BLOCK_AB_DIMS {
+                if let Err(e) = measure_block_ab_stage(working_set, dim) {
+                    eprintln!("dot_kernel_bench: {e}");
+                    block_ab_had_error = true;
+                }
+            }
+        }
+        if block_ab_had_error {
+            std::process::exit(1);
         }
     }
 }

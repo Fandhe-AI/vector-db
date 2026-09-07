@@ -251,3 +251,163 @@ for i in 1 2 3 4 5; do /path/to/baseline; /path/to/cand2; done
   律速そのものへの対処（連続格納レイアウト検討 #364・キャッシュ検討 #363 の
   領域）。
 - `.github/workflows/bench.yml` への配線（情報提供専用ベンチのため行わない）。
+
+## 行間再利用（Issue #512）: 行ブロックカーネルの前後比較と採否
+
+Issue #510・#511（`SimdKernel::dot_block4`。`docs/design/dot-kernel-row-block.md`）
+は既に既定エンジン（`ParallelBruteForce` → `parallel_search::search_range`）へ
+結線済みで、1 行版 `dot` とビット同一。本節は撤回可否の判断材料として、単一
+ビルド内 block4 A/B（層 A）と別ビルド前後比較（層 B）を実測した記録である。
+判定は `docs/design/benchmark-judgement-policy.md`（Issue #462）に従う。
+
+### 環境
+
+- CPU: `QEMU Virtual CPU version 2.5+`（KVM）・12 vCPU。フラグ `avx2` / `fma` /
+  `f16c`（`avx512*` なし）
+- 負荷: 共有・非専有。層 A 実測時 loadavg 約 3.9〜5.5、層 B 実測時 約 4〜9
+  （`BENCH_DEDICATED_ENV` 未設定）
+- rustc: `1.96.0`（`isa.rs::DetectedIsa` = `Avx2Fma`）
+
+### 層 A: `dot_kernel_bench` 単一ビルド内 block4 A/B（Issue #512 追加分）
+
+`BENCH_DOT_KERNEL_BLOCK_AB=1 make bench-dot-kernel` で dim=128／768 ×
+`WorkingSet::{CacheResident, ArenaScale}` を計測。A（1 行版 `dot` を 4 行分
+連続呼び出し。#510 以前の `search_range` 相当）・B（`dot_block4`）を
+`harness::ab::run_ab` で交互実行（warmup 20・計測 50）し、計測前に全ブロック
+で `dot_block4` が 1 行版とビット同一であることを検証済み（fail-closed）。
+
+per-run 生データ（N=5・プロセス単位起動）:
+
+| working_set | dim | run1 ratio | run2 | run3 | run4 | run5 | min-of-N ratio | median ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| cache_resident | 128 | 0.925 | 0.920 | 0.923 | 0.925 | 0.925 | 0.932 | 0.925 |
+| cache_resident | 768 | 0.458 | 0.458 | 0.458 | 0.458 | 0.458 | 0.458 | 0.458 |
+| arena_scale | 128 | 0.988 | 0.973 | 0.986 | 0.989 | 0.983 | 0.986 | 0.991 |
+| arena_scale | 768 | 0.843 | 0.848 | 0.847 | 0.852 | 0.842 | 0.845 | 0.847 |
+
+（ratio = `block4_median / single_row_median`。min-of-N ratio は A・B それぞれの
+5 run 中央値の最小値どうしの比。詳細な生データは
+`crates/engine/benches/harness/dot_block.rs`・`benches/dot_kernel_bench.rs` の
+`measure_block_ab_stage` が同一プロセス内で `run_ab`（interleaved）により
+生成する行から再現可能）
+
+参照区間（`block4_ab_ref`。1 行版 `dot` の反復走査。block4 A/B の対象外）の
+run 内相対ノイズ帯 `(max-min)/min`:
+
+| working_set | dim | run1 | run2 | run3 | run4 | run5 |
+| --- | --- | --- | --- | --- | --- | --- |
+| cache_resident | 128 | 0.0738 | 0.0684 | 0.0599 | 0.0517 | 0.0561 |
+| cache_resident | 768 | 0.0486 | 0.0474 | 0.0290 | 0.0367 | 0.0539 |
+| arena_scale | 128 | 0.1454 | 0.0831 | 0.4937 | 0.1417 | 0.0454 |
+| arena_scale | 768 | 0.1226 | 0.0627 | 0.2085 | 0.1398 | 0.0634 |
+
+参照区間の単体ノイズ帯は arena_scale で特に大きい（run3 の dim128 は
+49.4%）。ただし block4 A/B の ratio 自体は 5 run を通じて非常に狭い範囲
+（cache128: 0.920〜0.925、cache768: 一定して 0.458、arena128: 0.973〜0.989、
+arena768: 0.842〜0.852）に収まっている——A・B を同一プロセス内で interleaved
+計測しているため、参照区間（独立した別計測）よりロードアベレージ変動等の
+共通ノイズを相殺しやすいことが理由と考えられる。
+
+**判定（固定 ±5% 帯・classify_change）**:
+
+- dim768（cache_resident・arena_scale とも）: `Improved`（それぞれ約
+  -54.2%・-15.3%。参照区間ノイズ帯の最悪値〔20.9%〕を差し引いても
+  arena_scale の改善幅は一貫して正の方向）
+- dim128 cache_resident: `Improved`（約 -7.5%。参照区間ノイズ帯〔5.2〜7.4%〕
+  と近接するが、5 run とも 1.0 を下回る一貫した方向）
+- dim128 arena_scale: `Neutral`〜`判定不能`（約 -1〜-3%。固定 ±5% 帯の内側で、
+  参照区間ノイズ帯（run3 で 49%）と比べても改善幅が小さく、この規模・次元
+  では効果が構造的に薄いと考えられる。Issue #365 が cache 常駐 dim100/128 で
+  複数アキュムレータ化の効果が乏しいと判断した傾向と整合）
+
+### 層 B: production 経路（`bench-chip` knn_profile）前後比較
+
+- before: `66e641c`（#510 マージ直前）・after: `631a050`（#510 マージ後）を
+  それぞれ `git worktree add` で checkout し `cargo build --release --bench
+  chip_bench` でビルド（`isa.rs::SimdKernel::dot` 呼び出し形のみが差分）
+- `BENCH_CHIP_ROUNDS=1 BENCH_CHIP_WORKLOADS=knn_profile` で before/after を
+  5 ペア交互実行（`S5_search_parallel` が `ParallelBruteForce::search` →
+  `parallel_search::search_range` → `dot_block4`〔after〕/ 4×`dot`〔before〕を
+  通る対象区間、`S1_redb_scan` が dot を通らない参照区間）
+
+`S5_search_parallel/median_ms`（1 ペア = 1 プロセス起動あたり 1 サンプル）:
+
+| pair | before | after |
+| --- | --- | --- |
+| 1 | 3.003 | 0.229 |
+| 2 | 0.219 | 3.202 |
+| 3 | 0.250 | 3.079 |
+| 4 | 3.331 | 0.381 |
+| 5 | 0.241 | 0.345 |
+
+min-of-N: before=0.219ms・after=0.229ms（ratio 1.046）／median: before=0.250ms・
+after=0.381ms（ratio 1.524）。
+
+参照区間 `S1_redb_scan/median_ms`（同一プロセスが同時に計測。dot を通らない）:
+before は 0.967〜0.979ms（幅 1.2%）、after は 0.968〜1.066ms（幅 10.1%）と
+比較的安定している一方、`S5_search_parallel` は同一 before/after 内でも
+0.219ms〜3.331ms（15 倍超）の 2 峰性のばらつきを示した。これは `dot_block4`
+自体の効果ではなく、`ParallelBruteForce`（スレッドプール起動を伴う）が
+knn_profile の小規模ワークロード（`S0` 由来の少数行）で初回スレッド起動
+コストの有無により 2 峰化する production 経路固有のノイズと考えられる
+（`S1_redb_scan` のような非並列区間には現れない）。
+
+**判定**: min-of-N ratio（1.046）は固定 ±5% 帯の境界付近で `Neutral` 寄りだが、
+median ratio（1.524）は大きく異なり、N=5・単発ラウンドでは判定不能
+（`benchmark-judgement-policy.md` §5「共有 QEMU 本環境」は絶対値ベースの
+確定判定を認めない区分であり、本節の層 B はその制約に加えて
+`ParallelBruteForce` 起動コストの 2 峰性ノイズが層 A の µs〜ms 級改善を
+容易に覆い隠す規模であることを確認した、という位置づけに留める）。
+`simd_bench`（CORE-3/4・Recall 計算込み）・`feature_128`/`feature_768` の
+追加実行は、本ノイズ規模を踏まえると層 B の結論を変える見込みが低く、
+かつ Recall 計算を含む `simd_bench` は 1 ペアあたり数分規模を要するため、
+本 Issue の実施時間内では見送り、AVX-512／NEON 実機での層 B 再実測
+（Issue #530）へ申し送る。
+
+### 判定（決定木）
+
+`benchmark-judgement-policy.md` §5 により、共有 QEMU 本環境は perf 動機の
+production 変更の「採用（Accepted）」根拠にはできない。層 A・層 B いずれも
+一貫した `Regressed`（両ノイズ帯を超える悪化）は観測されなかったため、
+「Rejected（撤回推奨）」の条件も満たさない。よって:
+
+**「参考値・現状維持（条件付き）」**——`crates/engine/src/parallel_search.rs`・
+`isa.rs`（#510・#511 で導入済みの `dot_block4` 結線）は据え置く。層 A の
+dim768 改善（cache_resident 約 -54%・arena_scale 約 -15%）・dim128
+cache_resident 改善（約 -7.5%）は本環境の証拠力の範囲で「参考値」として
+記録し、dim128 arena_scale・層 B production 経路は判定不能として最終採否を
+AVX-512／NEON 実機（Issue #530）へ申し送る。
+
+### 再現手順（層 A）
+
+```sh
+cargo bench --bench dot_kernel_bench -p engine --no-run
+BIN="$(ls -t target/release/deps/dot_kernel_bench-* 2>/dev/null | grep -v '\.d$' | head -1)"
+for i in 1 2 3 4 5; do BENCH_DOT_KERNEL_BLOCK_AB=1 "$BIN"; done
+```
+
+### 再現手順（層 B）
+
+```sh
+git worktree add /path/to/before 66e641c
+git worktree add /path/to/after 631a050
+CARGO_TARGET_DIR=/path/to/target-before cargo build --release --bench chip_bench \
+  --manifest-path /path/to/before/crates/engine/Cargo.toml
+CARGO_TARGET_DIR=/path/to/target-after cargo build --release --bench chip_bench \
+  --manifest-path /path/to/after/crates/engine/Cargo.toml
+# 交互に BENCH_CHIP_ROUNDS=1 BENCH_CHIP_WORKLOADS=knn_profile BENCH_CHIP_OUT_DIR=... で 5 ペア実行
+```
+
+### 限界・スコープ外
+
+- AVX-512F・NEON 実機での層 A・層 B 実測（本環境は AVX2+FMA のみ実行可能。
+  正当性は `make simd-codegen-check`・`make check-cross` の生成コード検査で
+  担保。実機実測は Issue #530）
+- `simd_bench`（CORE-3/4・Recall 込み）・`bench-chip` の `feature_128`／
+  `feature_768` ワークロードでの層 B 追加実測（層 B は本節の 5 ペアで
+  ノイズ規模が層 A の効果を上回ることを確認済みのため、追加ワークロードは
+  結論を変える見込みが低いと判断し本 Issue の範囲では見送り）
+- `hnsw.rs`・`batch_search.rs`・`rls.rs` の 1 行 `dot` 呼び出しの行ブロック化
+  （`docs/design/dot-kernel-row-block.md` §6 と同一のスコープ外）
+- production 変更（`parallel_search.rs`・`isa.rs`）は無変更（本 Issue はテスト・
+  ベンチ・docs 専任。撤回条件を満たしていないため撤回作業も対象外）

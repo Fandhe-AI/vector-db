@@ -333,7 +333,10 @@ dot カーネル変更（#517 等）の参照区間は、dot を通らない `fe
 `S1_redb_scan`／`S2_header_decode`（`chip_bench` の `knn_profile` ワークロードが
 同時に計測する）を用いる。f16 常駐・行間マイクロカーネル等、施策ごとの
 「対象区間 → 参照区間」対応は #509・#513・#517・#520・#524・#527 側で個別に
-定義し、本 doc へはポインタのみを残す。
+定義し、本 doc へはポインタのみを残す（行ブロックカーネル〔#510・#511〕の
+対象区間 `S5_search_parallel` ↔ 参照区間 `S1_redb_scan` 対応と実測は
+Issue #512・`docs/design/dot-kernel-multi-accumulator.md`「行間再利用
+（Issue #512）」節参照）。
 
 ### 7.4 `summary.json` キー一覧
 

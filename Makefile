@@ -386,7 +386,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-dot-kernel
-bench-dot-kernel: ## Issue #365（isa.rs dot カーネルの複数アキュムレータ化）のマイクロベンチを実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+bench-dot-kernel: ## Issue #365（isa.rs dot カーネルの複数アキュムレータ化）のマイクロベンチを実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_DOT_KERNEL_BLOCK_AB=1 で Issue #512 の行ブロックカーネル block4 A/B〔既定 Off・fail-closed パース〕を追加計測する）
 ifdef HAS_CARGO
 	cargo bench --bench dot_kernel_bench -p engine
 else
