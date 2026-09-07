@@ -12,6 +12,10 @@ users.txt はベンチ専用の一意な作業サブディレクトリ（`<workd
 `users.txt` があっても触らない（codex-review P1）。
 
 接続先ポートは環境変数 `CROSSDB_SELF_PORT`（既定 15432）で上書きできる。
+起動する `wire-server` バイナリのパスは環境変数 `CROSSDB_SELF_BINARY`
+（既定 `target/release/wire-server`）で上書きできる。設定した場合に限り、
+存在しないパスは起動前に fail-closed で拒否する（before/after の 2 バイナリを
+交互起動する前後比較計測向け。Issue #479）。
 """
 
 from __future__ import annotations
@@ -107,6 +111,19 @@ class SelfServer:
 
     @staticmethod
     def _default_binary() -> str:
+        # Issue #479: before/after の 2 バイナリを交互起動する前後比較計測
+        # （`docs/design/visible-bitmap-cache-verification.md`）向けに、
+        # `target/release/wire-server` 以外のバイナリパスを指定できるようにする。
+        # 未設定時は従来どおりの既定パスを使う（後方互換）。指定されたパスが
+        # 存在しなければここで即座に拒否する（fail-closed。存在しないパスの
+        # まま `start()` まで進めて分かりにくいプロセス起動失敗にしない）。
+        override = os.environ.get("CROSSDB_SELF_BINARY")
+        if override:
+            if not os.path.exists(override):
+                raise FileNotFoundError(
+                    f"CROSSDB_SELF_BINARY points to a nonexistent path: {override}"
+                )
+            return override
         repo_root = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "..")
         )
