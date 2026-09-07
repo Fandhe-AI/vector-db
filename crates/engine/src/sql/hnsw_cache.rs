@@ -1448,7 +1448,12 @@ pub(crate) fn search_prepared_resumable(
         }
     };
 
-    let fallbacks_before = access.cache.fallbacks.load(Ordering::Relaxed);
+    // `fallbacks`（キャッシュ全体で共有される `AtomicU64`）の呼び出し前後
+    // 差分では、並行クエリが同時に別ラウンドで縮退した場合に本呼び出し自身が
+    // 縮退していないのに差分が非 0 になり得る（codex-review P2 指摘対応・
+    // PR #619）。`finish_indexed_search` に呼び出しローカルな `Cell<bool>` を
+    // 渡し、当該呼び出しが実際にどこかの分岐で縮退したかを直接判定する。
+    let fell_back = std::cell::Cell::new(false);
     let result = finish_indexed_search(
         access,
         base,
@@ -1462,11 +1467,12 @@ pub(crate) fn search_prepared_resumable(
         None,
         hop,
         0,
+        &fell_back,
     );
-    // 縮退なし（`finish_indexed_search` が `fallbacks` を加算せず完走した）で
+    // 縮退なし（`finish_indexed_search` が `fell_back` を立てずに完走した）で
     // 再開経路（`resume` が `Some` だった側）を通ったラウンドのみ計上する
     // （診断用カウンタ。§`HnswIndexCacheStats::hybrid_resumed_rounds`）。
-    if used_resume && access.cache.fallbacks.load(Ordering::Relaxed) == fallbacks_before {
+    if used_resume && !fell_back.get() {
         access
             .cache
             .hybrid_resumed_rounds
@@ -1903,6 +1909,10 @@ fn search_with_overlay(
         }
     };
 
+    // 単発経路は当該呼び出し限定の縮退判定を使わない（診断用
+    // `hybrid_resumed_rounds` は再開型経路 `search_prepared_resumable` のみが
+    // 参照する）ため、ここでは使い捨ての `Cell` を渡す。
+    let fell_back = std::cell::Cell::new(false);
     finish_indexed_search(
         access,
         &base,
@@ -1916,6 +1926,7 @@ fn search_with_overlay(
         visited_kind,
         hop,
         acorn_expansions,
+        &fell_back,
     )
 }
 
@@ -1952,6 +1963,7 @@ fn finish_indexed_search(
     visited_kind: Option<crate::hnsw::VisitedKind>,
     hop: crate::hnsw::HopMode,
     acorn_expansions: u64,
+    fell_back: &std::cell::Cell<bool>,
 ) -> Result<Vec<CandidateHit>, KernelError> {
     // マスク付き探索の結果件数が「可視ノード数と要求 k の小さい方」に満たない
     // 場合、ビーム幅内でグラフ探索が可視ノードを十分辿り切れなかったことを
@@ -1962,6 +1974,7 @@ fn finish_indexed_search(
     if index_hits.len() < expected {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
         access.cache.masked_short.fetch_add(1, Ordering::Relaxed);
+        fell_back.set(true);
         return full_scan_with_arena(provider, arena, query, k);
     }
 
@@ -1970,6 +1983,7 @@ fn finish_indexed_search(
         let node = hit.id as u32;
         let Some(&slot) = overlay.slot_of_node.get(node as usize) else {
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
         if slot == STALE_SLOT {
@@ -1979,21 +1993,25 @@ fn finish_indexed_search(
             // マスクとオーバーレイの不整合という想定外事態を fail-closed に
             // 全件 brute-force へ倒す（黙って握りつぶさない）。
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         }
         let slot_usize = slot as usize;
         let Some(node_key) = base.node_keys.get(node as usize) else {
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
         let arena_tenant = arena.tenant_id(slot_usize);
         let arena_id = arena.ids().get(slot_usize).copied();
         if arena_tenant != Some(node_key.0.as_str()) || arena_id != Some(node_key.1) {
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         }
         let Some(vec_at_slot) = arena.vector(slot_usize) else {
             access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
         let score = crate::kernel::dot(vec_at_slot, query);

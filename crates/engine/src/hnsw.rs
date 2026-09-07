@@ -3466,6 +3466,16 @@ pub(crate) struct ResumableMaskedSearch {
     node_count: usize,
     /// 状態構築時点のマスク長（マスク無しは `None`）。
     mask_len: Option<usize>,
+    /// テスト専用の実展開回数ログ（codex-review P2 指摘対応・PR #619）。
+    /// `expanded`（[`VisitedBitmap`]）はビットフラグのため「一度でも
+    /// 立ったか」しか分からず、同一ノードが `candidates` から複数回 pop
+    /// され複数回展開される二重展開バグを検出できない。`resumable_run` が
+    /// ノードを実際に展開する（`mark_visited` が `Some(false)` を返した）
+    /// たびに node id を push し、テストが出現回数を数えて「各ノード高々
+    /// 1 回」を実カウンタで検証する。production の探索結果・計算量には
+    /// 影響しない（cfg(test) 限定）。
+    #[cfg(test)]
+    expansion_log: Vec<u32>,
 }
 
 impl HnswIndex {
@@ -3539,6 +3549,8 @@ impl HnswIndex {
             last_ef: 0,
             node_count,
             mask_len,
+            #[cfg(test)]
+            expansion_log: Vec::new(),
         };
         state.expanded.reset(node_count);
         state.in_candidates.reset(node_count);
@@ -3680,12 +3692,18 @@ impl HnswIndex {
             .collect();
         state.discarded = merged[split..].to_vec();
 
-        // 候補復帰: discarded のうち expanded 未設定・in_candidates 未設定の
-        // ものを candidates へ push する（設計 doc「候補復帰」節）。この push
-        // は discarded の内容自体は変えない——discarded に残った要素は最終
-        // 出力（自己昇格の対象）としては引き続き有効なままで、単に「今回も
+        // 候補復帰: discarded だけでなく自己昇格で results 側へ移った
+        // ノードも含め、merged（今回の re-sort 対象全体）のうち expanded
+        // 未設定・in_candidates 未設定のものを candidates へ push する
+        // （設計 doc「候補復帰」節）。discarded 限定にすると、直前まで
+        // discarded で未展開だったノードが今回の自己昇格で results へ
+        // 昇格した場合に候補復帰の対象から漏れ、そのノードの隣接が
+        // 一切展開されないまま探索が停止しうる（codex-review・Cursor
+        // Bugbot 指摘。PR #619）。push は merged 各要素の内容自体は
+        // 変えない——results／discarded どちらに残った要素も最終出力
+        // （自己昇格の対象）としては引き続き有効なままで、単に「今回も
         // 隣接探索の起点として再考する」候補に追加で加わるだけ。
-        for node in &state.discarded {
+        for node in &merged {
             let idx = node.node as usize;
             if state.expanded.is_set(idx) || state.in_candidates.is_set(idx) {
                 continue;
@@ -3761,6 +3779,8 @@ impl HnswIndex {
             if state.expanded.mark_visited(top_candidate.node as usize) == Some(true) {
                 continue;
             }
+            #[cfg(test)]
+            state.expansion_log.push(top_candidate.node);
             let Some(neighbors) = self.graph.neighbors(0, top_candidate.node) else {
                 continue;
             };
@@ -7369,13 +7389,19 @@ mod tests {
         }
         let index = index_from_nodes(HnswParams::default(), dim as u32, nodes, Some(0), vectors);
 
-        let k = 8usize;
+        // k・ef を段階的に増やす（codex-review P2 指摘対応・PR #619）。
+        // `ef_eff = ef.max(k)` のため、最終ラウンドと同じ k=8 を初回から
+        // 使うと ef_eff が初回から常に 8 となり、discarded に落ちた葉が
+        // 一度も生じないまま test が green になり得る（自己昇格からの
+        // 復帰欠落という退行を検出できない）。k・ef の双方を小さい値から
+        // 段階的に引き上げることで、各ラウンドで新たに discarded から
+        // results へ自己昇格するノードが実際に発生する状態を作る。
         let (mut hits, mut state) = index
-            .search_masked_resumable_start(&query, k, 2, None, HopMode::OneHop)
+            .search_masked_resumable_start(&query, 2, 2, None, HopMode::OneHop)
             .unwrap();
-        for &ef in &[4usize, 8] {
+        for &(k_round, ef_round) in &[(4usize, 4usize), (6, 6), (8, 8)] {
             hits = index
-                .search_masked_resume(&mut state, &query, k, ef, None)
+                .search_masked_resume(&mut state, &query, k_round, ef_round, None)
                 .unwrap();
         }
         assert_eq!(
@@ -7424,16 +7450,30 @@ mod tests {
         // `candidates` が尽きた時点で必ず一度は pop され `expanded` が
         // 立っている（`resumable_run` は pop 直後に無条件で `expanded` を
         // 立てる。§ `ResumableMaskedSearch::in_candidates` ドキュメンテーション
-        // コメント参照）。二重展開（同一ノードが 2 回 `candidates` へ積まれ
-        // 2 回展開される）が起きていれば、`expanded_count` は
-        // `in_candidates_count` を **下回る**ことは無いが、二重 push を防ぐ
-        // `in_candidates` ガードが壊れていれば別ノードの取りこぼしとして
-        // この等式が崩れる——`expanded.count_ones() <= N` という自明な
-        // トートロジーではなく、両カウンタの一致という実質的な不変条件で
-        // 固定する。
+        // コメント参照）。
         assert_eq!(
             expanded_count, in_candidates_count,
             "candidates が尽きた時点で「一度でも積まれたノード」と「展開済みノード」は一致するはず"
+        );
+        // ビットフラグ（`expanded`）は「一度でも立ったか」しか分からず、
+        // 同一ノードが `candidates` へ 2 回 push され 2 回展開される二重
+        // 展開バグを検出できない（codex-review P2 指摘対応・PR #619）。
+        // `expansion_log`（テスト専用の実カウンタ）で「各ノードの実展開
+        // 回数」を直接検証し、「各ノード展開は高々 1 回」を実質的に固定する。
+        let mut expansion_counts: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+        for &node in &state.expansion_log {
+            *expansion_counts.entry(node).or_insert(0) += 1;
+        }
+        assert_eq!(
+            state.expansion_log.len(),
+            expanded_count,
+            "実展開ログの件数は expanded ビットが立っているノード数と一致するはず"
+        );
+        assert!(
+            expansion_counts.values().all(|&count| count == 1),
+            "各ノードの実展開回数は高々 1 回のはず（二重展開が起きていれば \
+             expansion_log に同一ノードが複数回記録される）: {expansion_counts:?}"
         );
     }
 
