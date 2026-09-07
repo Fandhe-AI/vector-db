@@ -108,7 +108,11 @@ TABLE-12 検査を実施済みの走査に相乗りするだけなので、追�
 
 ## スコープ外（申し送り）
 
-- `DimAndScalar`／`Embedding` tier・`GROUP BY` 集計への拡張
+- `DimAndScalar`／`Embedding` tier・`GROUP BY` 集計への拡張（`WHERE` 付き集計・
+  `GROUP BY` は Issue #475 の `sql::scalar_index::ScalarIndex` 候補削減・キー
+  列挙経路が別途担う。本キャッシュ〔`DecodeTier::Fast`・`WHERE` なし単一行
+  集計限定〕とは適用条件が排他で重複しない。詳細は
+  `docs/design/scalar-index-aggregate.md` 参照）
 - SELECT（DISTANCE/hybrid）経路への結線（`SqlArenaCache` が既に担う範囲との
   重複度の評価を含む）
 - `sparse.rs::VisibleBitmap` との表現共有（添字空間・責務が異なるため不採用）
