@@ -18,8 +18,8 @@ mod harness;
 
 use harness::knn_profile::{
     assert_scan_row_counts_match, decode_header_reimpl, decode_row_reimpl, explain_resident_value,
-    ns_per_row, refuse_under_github_actions, render_index_memory_line, resident_label_for_token,
-    scaled_rows, stage_diff_ns_per_row, KnnProfileError,
+    ns_per_row, refuse_under_github_actions, render_index_memory_line, requires_hnsw_stats_check,
+    resident_label_for_token, scaled_rows, stage_diff_ns_per_row, KnnProfileError,
 };
 
 use engine::storage::{RowInput, Storage, Visibility};
@@ -400,4 +400,25 @@ fn render_index_memory_line_reports_unavailable_when_proc_stats_missing() {
     assert!(line.contains("vm_rss_kb_after=unavailable"));
     assert!(line.contains("vm_rss_delta_kb=unavailable"));
     assert!(line.contains("vm_hwm_kb=unavailable"));
+}
+
+// --- requires_hnsw_stats_check (Issue #516・codex P1 指摘対応) --------------
+
+#[test]
+fn requires_hnsw_stats_check_covers_hnsw_and_hnsw_f16() {
+    // hnsw・hnsw_f16 はいずれも `sql::hnsw_cache::HnswIndexCacheStats`
+    // （精度非依存の単一型）を返す設計のため、非 vacuous 検証・Subset 系
+    // カウンタ検証・builds_delta 契約検査のいずれも両エンジンで有効である
+    // べき（codex P1 指摘: hnsw_f16 だけ検証が省略され observed=n/a
+    // (brute_force engine) という実体と異なるラベルが出力されていた）。
+    assert!(requires_hnsw_stats_check("hnsw"));
+    assert!(requires_hnsw_stats_check("hnsw_f16"));
+}
+
+#[test]
+fn requires_hnsw_stats_check_excludes_brute_force_and_unknown_tokens() {
+    assert!(!requires_hnsw_stats_check("brute_force"));
+    assert!(!requires_hnsw_stats_check(""));
+    assert!(!requires_hnsw_stats_check("HNSW"));
+    assert!(!requires_hnsw_stats_check("bogus"));
 }

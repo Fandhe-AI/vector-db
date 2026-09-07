@@ -420,3 +420,19 @@ pub fn render_index_memory_line(
         fmt_opt(vm_hwm_kb),
     )
 }
+
+/// `knn_engine`（`BenchEngine::token()` の文字列）が HNSW 索引の非 vacuous
+/// 検証（`hnsw_index_cache_stats()` の builds/hits・Subset 系カウンタ・
+/// `builds_delta` 契約検査等）の対象かどうかを判定する（Issue #516・codex P1
+/// 指摘対応）。`hnsw` と `hnsw_f16` はいずれも `sql::hnsw_cache::
+/// HnswIndexCacheStats`（精度非依存の単一型）を返す設計のため、この判定は
+/// 精度に関わらず同一の検証ロジックへ流す——`hnsw_f16` だけを見逃すと
+/// `knn_profile_bench.rs` の S0-hot 非 vacuous チェック・可視比率スイープの
+/// warm-up／`builds_delta`／Subset 系カウンタ検証がすべて省略され、
+/// `observed=n/a (brute_force engine)` という実体と異なるラベルが出力される
+/// （既存防御の弱体化。本モジュールは `super::bench_engine` を参照しない契約
+/// のため、呼び出し元がトークン文字列で渡す。`resident_label_for_token` と
+/// 同じ設計）。
+pub fn requires_hnsw_stats_check(engine_token: &str) -> bool {
+    matches!(engine_token, "hnsw" | "hnsw_f16")
+}

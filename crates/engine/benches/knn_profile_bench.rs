@@ -97,7 +97,8 @@ use harness::env_report::EnvReport;
 use harness::knn_profile::{
     assert_scan_row_counts_match, decode_header_reimpl, decode_row_reimpl, ns_per_row,
     refuse_under_github_actions, render_diff_line, render_index_memory_line, render_stage_line,
-    resident_label_for_token, scaled_rows, stage_diff_ns_per_row, KnnProfileError,
+    requires_hnsw_stats_check, resident_label_for_token, scaled_rows, stage_diff_ns_per_row,
+    KnnProfileError,
 };
 use harness::proc_stats::{read_vm_hwm_kb, read_vm_rss_kb};
 use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
@@ -613,11 +614,14 @@ fn main() {
         ));
     }
 
-    // 非 vacuous 確認（Issue #413。`feature_bench.rs` と同じ原則）。hnsw opt-in
-    // 時は S0-hot 測定後に索引が実際に構築・使用されたことを固定し、満たさなけ
-    // れば `fail_closed` する。brute_force では統計を出力しない
+    // 非 vacuous 確認（Issue #413。`feature_bench.rs` と同じ原則）。hnsw／
+    // hnsw_f16 opt-in 時は S0-hot 測定後に索引が実際に構築・使用されたことを
+    // 固定し、満たさなければ `fail_closed` する（Issue #516 codex P1 指摘対応。
+    // hnsw_f16 でも `HnswIndexCache` は `hnsw` と同一の
+    // `sql::hnsw_cache::HnswIndexCacheStats` を返す設計のため、検証ロジック
+    // 自体は精度非依存で共有できる）。brute_force では統計を出力しない
     // （`hnsw_index_cache_stats()` は常に全欄 0）。
-    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+    if requires_hnsw_stats_check(knn_engine.token()) {
         let s = core.hnsw_index_cache_stats();
         println!(
             "knn_profile_bench: hnsw_stats builds={} build_failures={} hits={} misses={} fallbacks={} entries={}",
@@ -1202,7 +1206,7 @@ fn run_visible_ratio_sweep(
     let _ = core
         .execute_sql(&policy_ctx, &filterless_sql)
         .expect("warm-up query must succeed");
-    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+    if requires_hnsw_stats_check(knn_engine.token()) {
         let warm_stats = core.hnsw_index_cache_stats();
         if warm_stats.builds == 0 {
             fail_closed(format!(
@@ -1281,7 +1285,7 @@ fn run_visible_ratio_sweep(
     // 違反時に測定値だけがログへ書かれ、失敗理由が読み取れなくなることを
     // 防ぐ。`observed_arm_label` 分類・他カウンタの出力は builds_delta が
     // 健全であることを前提にしてよいため、この検査だけを前倒しする）。
-    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+    if requires_hnsw_stats_check(knn_engine.token()) {
         let builds_delta = stats_after_subset
             .builds
             .saturating_sub(stats_before_subset.builds);
@@ -1355,7 +1359,7 @@ fn run_visible_ratio_sweep(
         harness::bench_engine::ExpectedArm::PlainScanRatio => "plain_scan_ratio",
     };
 
-    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+    if requires_hnsw_stats_check(knn_engine.token()) {
         // `HnswIndexCacheStats`（`sql::hnsw_cache`）は `pub(crate)` モジュール
         // 配下のため型名を bench 側に書けない（`observed_arm_label` 上部の
         // コメント参照）。フィールドごとの差分を個別のローカル変数に留める。
@@ -1376,20 +1380,21 @@ fn run_visible_ratio_sweep(
         let fallbacks_delta = stats_after_subset
             .fallbacks
             .saturating_sub(stats_before_subset.fallbacks);
-        // `BENCH_KNN_PROFILE_ENGINE=hnsw` では 4 カウンタ全 0 は「このクエリが
-        // Subset 系のいずれの経路も通らなかった」ことを意味し、
+        // `BENCH_KNN_PROFILE_ENGINE=hnsw|hnsw_f16` では 4 カウンタ全 0 は
+        // 「このクエリが Subset 系のいずれの経路も通らなかった」ことを意味し、
         // brute_force エンジンの `n/a` とは区別すべき vacuous な計測である
         // （Cursor Bugbot 指摘。ラベルだけ `n/a (brute_force engine)` と出力
-        // されるとスイープが誤って green のまま通過してしまう）。
+        // されるとスイープが誤って green のまま通過してしまう。Issue #516
+        // codex P1 指摘対応で hnsw_f16 にもこの検証を適用した）。
         if subset_searches_delta == 0
             && plain_scans_delta == 0
             && mask_splits_graph_delta == 0
             && masked_short_delta == 0
         {
-            fail_closed(
-                "BENCH_KNN_PROFILE_ENGINE=hnsw だが Subset 系カウンタ（subset_searches/plain_scans/mask_splits_graph/masked_short）が全て 0 だった（vacuous な計測。hnsw_cache の適用条件から外れている可能性）"
-                    .to_string(),
-            );
+            fail_closed(format!(
+                "BENCH_KNN_PROFILE_ENGINE={} だが Subset 系カウンタ（subset_searches/plain_scans/mask_splits_graph/masked_short）が全て 0 だった（vacuous な計測。hnsw_cache の適用条件から外れている可能性）",
+                knn_engine.token()
+            ));
         }
         println!(
             "knn_profile_bench: hnsw_stats(subset_delta) subset_searches={} plain_scans={} \
@@ -1573,10 +1578,7 @@ fn run_hot_only(
     }
 
     // --- 非 vacuous 検証（fail-closed。hnsw／hnsw_f16 のみ）。-------------------
-    if matches!(
-        knn_engine,
-        harness::bench_engine::BenchEngine::Hnsw | harness::bench_engine::BenchEngine::HnswF16
-    ) {
+    if requires_hnsw_stats_check(knn_engine.token()) {
         let s = core.hnsw_index_cache_stats();
         println!(
             "knn_profile_bench: hnsw_stats builds={} build_failures={} hits={} misses={} \
