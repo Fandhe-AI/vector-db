@@ -25,6 +25,8 @@
 #     scripts/bench_hnsw_phase3_ab.sh [PAIRS]
 #   PAIRS: 交互実行するペア数（既定 5・正整数のみ）。
 #   OUT_DIR: 出力先（既定 docs/design/bench-data/hnsw-phase3-ab）。
+#   BEFORE_DIR／AFTER_DIR は相対パスでも指定できる（本スクリプトが起動直後に
+#   絶対パスへ解決する。§9 参照）。
 #   MODE=hnsw-compare: BENCH_HNSW_COMPARE_ROWS／_DIM／_THREADS／_QUERIES で
 #     §3 の縮小構成（rows=20,000・queries=100・thread_ladder=[12]）を上書きする
 #     （子プロセス側の `hnsw_compare_bench` が読む環境変数。本スクリプトは
@@ -53,6 +55,17 @@ die() {
 [[ -f "${BEFORE_DIR}/Cargo.toml" ]] || die "BEFORE_DIR does not look like a source tree (no Cargo.toml): ${BEFORE_DIR}"
 [[ -f "${AFTER_DIR}/Cargo.toml" ]] || die "AFTER_DIR does not look like a source tree (no Cargo.toml): ${AFTER_DIR}"
 
+# BEFORE_DIR／AFTER_DIR を絶対パスへ解決する（codex-review P2 指摘）。
+# 相対パスのまま `CARGO_TARGET_DIR="${dir}/target-phase3-ab"` を組み立てると、
+# build_* 関数内の `cd "${dir}"` によりカレントディレクトリが変わった後に
+# cargo が相対な `CARGO_TARGET_DIR` を「cd 後の」カレントディレクトリ基準で
+# 解決してしまい、実際の成果物出力先（`<dir>/<dir>/target-phase3-ab`）と
+# 本スクリプトが後段で探索する `${dir}/target-phase3-ab` が一致せず、
+# 全 MODE でバイナリ発見に失敗する。ここで絶対パス化しておけば `cd` の
+# 影響を受けない（Cursor Bugbot Low 指摘）。
+BEFORE_DIR="$(cd "${BEFORE_DIR}" && pwd)"
+AFTER_DIR="$(cd "${AFTER_DIR}" && pwd)"
+
 case "${MODE}" in
   hnsw-compare|knn-profile|feature-bench) ;;
   *) die "MODE must be one of: hnsw-compare, knn-profile, feature-bench, got: ${MODE}" ;;
@@ -75,27 +88,36 @@ record_loadavg() {
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1: $(cat /proc/loadavg 2>/dev/null || echo unavailable)" >> "${LOADAVG_LOG}"
 }
 
+# `cargo ... --message-format=json` の標準入力から、指定した target 名に
+# 一致する compiler-artifact の実行ファイルパスを取り出す（codex-review P2
+# 指摘）。mtime 最新のバイナリを探す方式では `target-phase3-ab` に別構成
+# （feature フラグ違い等）の成果物が残っている場合に誤ったバイナリを選びうる
+# ため、今回のビルドが実際に生成した実行ファイルを cargo 自身の出力から
+# 直接特定する。同名 target のメッセージが複数出ても最後の 1 件（当該
+# ビルドの最終成果物）を採用する。
+locate_artifact() {
+  local name="$1"
+  jq -r --arg name "${name}" \
+    'select(.reason == "compiler-artifact" and .target.name == $name and .executable != null) | .executable' \
+    | tail -n1
+}
+
 build_hnsw_compare() {
   local dir="$1" target="$2"
-  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo bench -p engine --bench hnsw_compare_bench --features contrast-bench --no-run )
+  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo bench -p engine --bench hnsw_compare_bench --features contrast-bench --no-run --message-format=json ) \
+    | locate_artifact hnsw_compare_bench
 }
 
 build_knn_profile() {
   local dir="$1" target="$2"
-  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo bench -p engine --bench knn_profile_bench --no-run )
+  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo bench -p engine --bench knn_profile_bench --no-run --message-format=json ) \
+    | locate_artifact knn_profile_bench
 }
 
 build_feature_bench() {
   local dir="$1" target="$2"
-  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo build --release -p engine --example feature_bench )
-}
-
-find_bench_bin() {
-  # `cargo bench --no-run` は `deps/<name>-<hash>` 形式の実行ファイルを吐く。
-  # 複数世代の成果物が残っている場合があるため mtime 最新のものを採用する。
-  local target="$1" name="$2"
-  find "${target}/release/deps" -maxdepth 1 -type f -name "${name}-*" -executable -printf '%T@ %p\n' 2>/dev/null \
-    | sort -rn | head -n1 | cut -d' ' -f2-
+  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo build --release -p engine --example feature_bench --message-format=json ) \
+    | locate_artifact feature_bench
 }
 
 BEFORE_TARGET="${BEFORE_DIR}/target-phase3-ab"
@@ -103,10 +125,8 @@ AFTER_TARGET="${AFTER_DIR}/target-phase3-ab"
 
 case "${MODE}" in
   hnsw-compare)
-    build_hnsw_compare "${BEFORE_DIR}" "${BEFORE_TARGET}"
-    build_hnsw_compare "${AFTER_DIR}" "${AFTER_TARGET}"
-    BEFORE_BIN="$(find_bench_bin "${BEFORE_TARGET}" hnsw_compare_bench)"
-    AFTER_BIN="$(find_bench_bin "${AFTER_TARGET}" hnsw_compare_bench)"
+    BEFORE_BIN="$(build_hnsw_compare "${BEFORE_DIR}" "${BEFORE_TARGET}")"
+    AFTER_BIN="$(build_hnsw_compare "${AFTER_DIR}" "${AFTER_TARGET}")"
     [[ -x "${BEFORE_BIN}" ]] || die "could not locate before hnsw_compare_bench binary under ${BEFORE_TARGET}"
     [[ -x "${AFTER_BIN}" ]] || die "could not locate after hnsw_compare_bench binary under ${AFTER_TARGET}"
     for pair in $(seq 1 "${PAIRS}"); do
@@ -120,17 +140,20 @@ case "${MODE}" in
     done
     ;;
   knn-profile)
-    build_knn_profile "${BEFORE_DIR}" "${BEFORE_TARGET}"
-    build_knn_profile "${AFTER_DIR}" "${AFTER_TARGET}"
-    BEFORE_BIN="$(find_bench_bin "${BEFORE_TARGET}" knn_profile_bench)"
-    AFTER_BIN="$(find_bench_bin "${AFTER_TARGET}" knn_profile_bench)"
+    BEFORE_BIN="$(build_knn_profile "${BEFORE_DIR}" "${BEFORE_TARGET}")"
+    AFTER_BIN="$(build_knn_profile "${AFTER_DIR}" "${AFTER_TARGET}")"
     [[ -x "${BEFORE_BIN}" ]] || die "could not locate before knn_profile_bench binary under ${BEFORE_TARGET}"
     [[ -x "${AFTER_BIN}" ]] || die "could not locate after knn_profile_bench binary under ${AFTER_TARGET}"
     ENGINES="${PHASE3_KNN_PROFILE_ENGINES:-hnsw brute_force}"
+    # side を engine の内側にネストすると before-hnsw → before-brute_force →
+    # after-hnsw の順になり、各エンジンの before/after が隣接しない
+    # （Cursor Bugbot Medium 指摘。§9 が主張する before→after の対比・
+    # コミット済みセッション順と不一致）。engine を外側にして
+    # 「エンジンごとに before→after を隣接させる」順へ変更する。
     for pair in $(seq 1 "${PAIRS}"); do
-      for side in before after; do
-        bin="${BEFORE_BIN}"; [[ "${side}" == after ]] && bin="${AFTER_BIN}"
-        for engine in ${ENGINES}; do
+      for engine in ${ENGINES}; do
+        for side in before after; do
+          bin="${BEFORE_BIN}"; [[ "${side}" == after ]] && bin="${AFTER_BIN}"
           log="${OUT_DIR}/${TS}-knn-profile-${side}-${engine}-run${pair}.log"
           [[ -e "${log}" ]] && die "raw log already exists (refusing to overwrite): ${log}"
           record_loadavg "knn-profile/${side}/${engine}/run${pair}"
@@ -140,17 +163,16 @@ case "${MODE}" in
     done
     ;;
   feature-bench)
-    build_feature_bench "${BEFORE_DIR}" "${BEFORE_TARGET}"
-    build_feature_bench "${AFTER_DIR}" "${AFTER_TARGET}"
-    BEFORE_BIN="${BEFORE_TARGET}/release/examples/feature_bench"
-    AFTER_BIN="${AFTER_TARGET}/release/examples/feature_bench"
-    [[ -x "${BEFORE_BIN}" ]] || die "could not locate before feature_bench binary: ${BEFORE_BIN}"
-    [[ -x "${AFTER_BIN}" ]] || die "could not locate after feature_bench binary: ${AFTER_BIN}"
+    BEFORE_BIN="$(build_feature_bench "${BEFORE_DIR}" "${BEFORE_TARGET}")"
+    AFTER_BIN="$(build_feature_bench "${AFTER_DIR}" "${AFTER_TARGET}")"
+    [[ -x "${BEFORE_BIN}" ]] || die "could not locate before feature_bench binary under ${BEFORE_TARGET}"
+    [[ -x "${AFTER_BIN}" ]] || die "could not locate after feature_bench binary under ${AFTER_TARGET}"
     ENGINES="${PHASE3_FEATURE_BENCH_ENGINES:-hnsw}"
+    # knn-profile と同じ理由（Cursor Bugbot Medium 指摘）で engine を外側にする。
     for pair in $(seq 1 "${PAIRS}"); do
-      for side in before after; do
-        bin="${BEFORE_BIN}"; [[ "${side}" == after ]] && bin="${AFTER_BIN}"
-        for engine in ${ENGINES}; do
+      for engine in ${ENGINES}; do
+        for side in before after; do
+          bin="${BEFORE_BIN}"; [[ "${side}" == after ]] && bin="${AFTER_BIN}"
           log="${OUT_DIR}/${TS}-feature-bench-${side}-${engine}-run${pair}.json"
           [[ -e "${log}" ]] && die "raw log already exists (refusing to overwrite): ${log}"
           record_loadavg "feature-bench/${side}/${engine}/run${pair}"
