@@ -47,8 +47,8 @@ use std::time::Instant;
 
 use super::{
     assign_level, compute_shrink, max_degree_for, node_vector, score_of,
-    select_neighbors_heuristic_free, DeterministicRng, HnswBuildProfile, HnswError, HnswIndex,
-    HnswParams, HnswWorkerStats, Node, ScoredNode, VisitedScratch,
+    select_neighbors_heuristic_free, DeterministicRng, GraphBuilder, HnswBuildProfile, HnswError,
+    HnswIndex, HnswParams, HnswWorkerStats, Node, ScoredNode, VisitedScratch,
 };
 
 thread_local! {
@@ -763,12 +763,20 @@ pub(crate) fn build_parallel_graph_observed(
     }
 
     let freeze_start = Instant::now();
-    let mut index = assemble_graph(graph, params, dim, owned_vectors)?;
+    let mut builder = assemble_graph(graph, params)?;
     let freeze = freeze_start.elapsed();
 
     let repair_start = Instant::now();
-    index.repair_reachability(dim_usize, vectors)?;
+    builder.repair_reachability(dim_usize, vectors)?;
     let repair_reachability = repair_start.elapsed();
+
+    // 平坦化（CSR 化。Issue #494）は常に最終段——`freeze`（構造的な組み立て）
+    // ・`repair_reachability`（並列フェーズが生みうる上位層の到達不能ノードの
+    // 修復）のいずれも可変長ビルダー表現（`GraphBuilder`）に対する in-place
+    // 更新を要するため、両方が完了するまで CSR へは変換しない。
+    let flatten_start = Instant::now();
+    let index = HnswIndex::freeze_from(builder, dim, owned_vectors)?;
+    let flatten = flatten_start.elapsed();
 
     let profile = HnswBuildProfile {
         level_assign,
@@ -776,6 +784,7 @@ pub(crate) fn build_parallel_graph_observed(
         parallel_phase,
         freeze,
         repair_reachability,
+        flatten,
         // `total` は呼び出し元（`HnswIndex::build_with_threads_observed`）が
         // 検証・エラー分岐を含む呼び出し全体で計測し直して埋める。
         total: std::time::Duration::ZERO,
@@ -791,12 +800,14 @@ pub(crate) fn build_parallel_graph_observed(
 /// [`freeze`] の外部から見た挙動はこの切り出し前後で変わらない）。
 /// 各ノードの `RwLock` を `into_inner` で消費し（`Vec<Node>` への再コピー
 /// なし）。
-fn assemble_graph(
-    graph: BuildGraph,
-    params: HnswParams,
-    dim: u32,
-    owned_vectors: Arc<[f32]>,
-) -> Result<HnswIndex, HnswError> {
+///
+/// 戻り値は [`super::HnswIndex`] ではなく可変長ビルダー表現
+/// （[`super::GraphBuilder`]。Issue #494）——`repair_reachability`（並列
+/// フェーズが生みうる上位層の到達不能ノードを閉じる修復パス）が
+/// `connect`／`shrink_links` による可変長 in-place 更新を要するため、
+/// CSR（[`super::csr::CsrGraph`]）への平坦化は修復完了後の最終段
+/// （[`super::HnswIndex::freeze_from`]）まで行わない。
+fn assemble_graph(graph: BuildGraph, params: HnswParams) -> Result<GraphBuilder, HnswError> {
     let entry_point = graph
         .entry
         .into_inner()
@@ -809,19 +820,18 @@ fn assemble_graph(
         nodes.push(Node { level, links });
     }
 
-    Ok(HnswIndex {
+    Ok(GraphBuilder {
         params,
-        dim,
         nodes,
         entry_point,
-        vectors: owned_vectors,
     })
 }
 
 /// 並列フェーズ完了後の `BuildGraph` を [`super::HnswIndex`] へ凍結する
-/// ([`assemble_graph`] による構造的な組み立て)。最後に既存の逐次後始末
-/// （`repair_reachability`。並列フェーズが生みうる上位層の到達不能ノードを
-/// 閉じる。モジュール冒頭「決定性の範囲」節参照）を実行する。
+/// ([`assemble_graph`] による構造的な組み立て → 既存の逐次後始末
+/// `repair_reachability`〔並列フェーズが生みうる上位層の到達不能ノードを
+/// 閉じる。モジュール冒頭「決定性の範囲」節参照〕 → [`super::HnswIndex::
+/// freeze_from`] による CSR 平坦化〔Issue #494。常に最終段〕)。
 fn freeze(
     graph: BuildGraph,
     params: HnswParams,
@@ -830,9 +840,9 @@ fn freeze(
     dim_usize: usize,
     owned_vectors: Arc<[f32]>,
 ) -> Result<HnswIndex, HnswError> {
-    let mut index = assemble_graph(graph, params, dim, owned_vectors)?;
-    index.repair_reachability(dim_usize, original_vectors)?;
-    Ok(index)
+    let mut builder = assemble_graph(graph, params)?;
+    builder.repair_reachability(dim_usize, original_vectors)?;
+    HnswIndex::freeze_from(builder, dim, owned_vectors)
 }
 
 #[cfg(test)]
