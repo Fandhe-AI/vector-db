@@ -15,7 +15,7 @@
 //! 常に `kernel::dot`（f32・アリーナ再計算）を経由するため
 //! （`docs/design/simd-intrinsics-adoption.md` 決定 5）、この近似は候補生成段
 //! にのみ影響する。整数 i8×i8 dot カーネル（VNNI／NEON dotprod）は本 Issue の
-//! 対象外（#522・#524）。
+//! 対象外（#522・#524・#525）。
 //!
 //! `half`／`simsimd` 等の外部クレートは依存最小方針
 //! （[dependency-policy](../../../.claude/rules/dependency-policy.md)）
@@ -25,8 +25,9 @@
 //! TASK-156・CORE-16）
 //!
 //! 上記の [`dot_i8_f32`]（クエリ非量子化の復号 dot）に加え、クエリ側も
-//! 量子化してから `isa::I8Kernel::dot_i8`（VNNI／i16 widen の整数カーネル）
-//! で計算する経路を [`prepare_query`] として提供する。ノード側コード
+//! 量子化してから `isa::I8Kernel::dot_i8`（VNNI／i16 widen／NEON dotprod
+//! 〔Issue #525〕の整数カーネル）で計算する経路を [`prepare_query`] として
+//! 提供する。ノード側コード
 //! `code_d ∈ [-127, 127]`（本モジュール既存の対称量子化）はそのままに、
 //! クエリ側は「次元ごとスケールで一旦 code 空間へ写像した値
 //! （`q'_d = scale_d * q_d`）」に単一スケール `s_q = max_d|q'_d| / 127` で

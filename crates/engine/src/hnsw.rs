@@ -878,7 +878,9 @@ pub(crate) enum NodeVectors {
     /// スケール（`params.dim() == dim`）を対で保持する。`row_sums`
     /// （Issue #522。`sq8::row_sums` が凍結時に 1 回だけ求める `len() ==
     /// node_count` の行和。VNNI 系整数カーネルの符号復元に使う——モジュール
-    /// `sq8.rs` 冒頭「整数 i8×i8 dot」節参照）は `codes`・`params` と寿命・
+    /// `sq8.rs` 冒頭「整数 i8×i8 dot」節参照。NEON dotprod〔Issue #525〕・
+    /// i16 widen・Scalar は符号付き×符号付き積のため `row_sums` を参照しない）
+    /// は `codes`・`params` と寿命・
     /// 対応関係が完全に一致する（同じ `freeze_from` 呼び出しで一括生成し、
     /// いずれか 1 つでも失敗すれば 3 つとも作らず `F32` へ縮退する）。
     I8 {

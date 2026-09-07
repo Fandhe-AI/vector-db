@@ -239,6 +239,10 @@ fn main() {
     println!("arch: {}", std::env::consts::ARCH);
     println!("os: {}", std::env::consts::OS);
     println!("isa::current(): {:?}", engine::isa::current().isa());
+    // Issue #525: `detect-apple` の step summary へ `NeonDotprod` が実際に
+    // 選ばれたことの直接証跡を残す（`isa::current_i8()` は VNNI 系（x86_64）・
+    // NeonDotprod（aarch64）・Scalar の実行時ディスパッチ結果）。
+    println!("isa::current_i8(): {:?}", engine::isa::current_i8().isa());
     println!();
 
     let rows = feature_rows();

@@ -10,6 +10,10 @@
 //! （次元過大・スケール溢れ）は [`I8QueryPlan::Dequant`]（既存の
 //! `sq8::dot_i8_f32` 復号 dot）へ fail-closed に縮退し、索引の再構築や
 //! 空集合の誤返却を招かない。
+//!
+//! `Integer` 経路の実際のカーネル選択は `isa::current_i8()` の実行時検出に
+//! 委ねる（x86_64: VNNI／i16 widen、aarch64: NEON dotprod〔Issue #525〕、
+//! いずれも未対応なら Scalar）。本モジュールは ISA を意識しない。
 
 use std::sync::Arc;
 
