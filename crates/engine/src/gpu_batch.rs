@@ -65,43 +65,32 @@ const GPU_WORKGROUP_SIZE: u32 = 256;
 /// 数値ではない。
 const GPU_QUERY_TILE_MAX: usize = 16;
 
-/// f16 算術版シェーダ（[`DOT_SHADER_F16_ARITH_WGSL`]/
-/// [`DOT_SHADER_TOPK_F16_ARITH_WGSL`]・Issue #539）が f16 レジスタ `acc2` を
-/// f32 アキュムレータへフラッシュするまでの積算回数。WGSL 側の
-/// `F16_ACC_BLOCK` 定数と一致していなければならない
-/// （`tests::dot_shader_f16_arith_wgsl_constants_match_host_constants` で
-/// 機械検証）。
+/// [`select_dot_shader`] の保守的なオーバーフロー margin 計算にのみ残る
+/// 旧定数（PR #591 レビュー P1 指摘対応・2 巡目で用途が変わった）。
 ///
-/// **`1` 固定（PR #591 レビュー P1 指摘対応）**: 旧実装は `8` を採用し
-/// 「ブロック内部分和が f16 の値域（65504）へ収まればよい」という
-/// オーバーフローのみのガード設計だったが、複数項の f16 加算そのものが
-/// 桁落ちを起こしうる（例: query=[2048,0,1,0,-2048]・row=[1,0,1,0,1] は
-/// 全成分が f16 で厳密表現できオーバーフローガードも通過するが、
-/// f16 レジスタ内で `2048 + 1` を計算した時点で最近接偶数丸めにより
-/// `2048` へ丸められ、最終スコアが `0`〔真値は `1`〕になり k=1 の正解が
-/// 別行と入れ替わりうる）。ブロック幅を `1` にすると `acc2` は毎回
-/// `fma(row_pair, qv, 0)`（1 組の f16 積 1 回のみ、f16 同士の加算を
-/// 経由しない）を計算した直後に `f32(acc2.x) + f32(acc2.y)` で f32
-/// アキュムレータへ加算されるため、f16 領域での複数項の桁落ちが構造的に
-/// 発生しなくなる（残るのは行データ自体が既に f16 常駐である既存の量子化
-/// 誤差のみで、`F16Arith` 選択の有無に関わらず発生する既存の制約と同水準）。
-/// 性能への影響（フラッシュ頻度の増加）は前後比較実測の別 Issue（#540）
-/// へ申し送り、本変更は正しさ優先の修正であり実測を伴わない。
+/// 元は f16 算術版シェーダが `vec2<f16>` レジスタ `acc2` を f32
+/// アキュムレータへフラッシュするまでの積算回数で、WGSL 側にも同名の
+/// 定数が宣言されていた。しかし `1` 固定にしても「単一の積そのものが
+/// f16 の分解能へ丸められる」桁落ちは防げないと判明したため
+/// （[`DOT_SHADER_F16_ARITH_WGSL`] doc 参照）、本 PR の 2 巡目修正で
+/// シェーダ本体は積和を f32 へ拡張後に行う設計へ変更し、`acc2`／
+/// フラッシュ機構・WGSL 側の同名定数は撤去した。この Rust 側定数だけは
+/// [`F16_ARITH_PARTIAL_SUM_LIMIT`] とのオーバーフロー margin 計算式
+/// （既存テストが数値ごと固定）を変えないため値 `1` のまま残しており、
+/// 実質的には乗算しても値を変えない定数（`* 1`）に縮退している。
 const GPU_F16_ACC_BLOCK: u32 = 1;
 
 /// f16 の有限最大値（IEEE 754 half-precision）。[`select_dot_shader`] が
 /// クエリ成分の f16 パック時飽和（±Inf 化）を防ぐ独立ガードとして使う。
 const F16_MAX_FINITE: f32 = 65504.0;
 
-/// [`select_dot_shader`] が f16 算術版を選ぶための「単一 f16 積のオーバー
-/// フロー上界」判定に使う閾値（PR #591 レビュー P1 指摘対応で
-/// [`GPU_F16_ACC_BLOCK`] を `1` へ変更したため、複数項の f16 加算は発生
-/// しない。`row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK` が この値を
-/// 超える場合、`fma(row_pair, qv, 0)` の 1 回の積算で f16 の有限最大値
-/// （65504）へ達しうるとみなし f16 算術版を選ばない（[`DOT_SHADER_WGSL`]
-/// の unpack 版へ縮退）。65504 の約半分を選び、丸め誤差・実際の内積が
-/// 最悪ケースの符号一致（全成分が同符号で積算される）でなくとも安全側に
-/// 倒れる余裕を持たせる。spec 由来の数値ではなく実装既定値。
+/// [`select_dot_shader`] が f16 算術版を選ぶための保守的なオーバーフロー
+/// 上界判定に使う閾値。シェーダ本体の積和は f32 で行う（doc 参照）ため
+/// この上界を超えても実際にオーバーフローするわけではないが、既存の
+/// 安全マージンとして維持する。`row_max_abs * query_max_abs *
+/// GPU_F16_ACC_BLOCK` がこの値を超える場合は f16 算術版を選ばない
+/// （[`DOT_SHADER_WGSL`] の unpack 版へ縮退）。65504 の約半分を選び、
+/// 余裕を持たせる。spec 由来の数値ではなく実装既定値。
 const F16_ARITH_PARTIAL_SUM_LIMIT: f32 = 32768.0;
 
 /// f16（IEEE 754 half-precision）の最小正 subnormal（2^-24）。この値未満の
@@ -307,24 +296,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// WGSL: `SHADER_F16` 対応アダプタ向けの f16 算術版（Issue #539・親 #538。
 /// 対象ビヘイビア: CORE-6, 8, 16 ポインタ）。[`DOT_SHADER_WGSL`] と行データ
-/// （常駐 f16 2 要素/u32 パック）は完全に同一だが、`unpack2x16float` で f32 へ
-/// 復元してから積和する代わりに、`enable f16;`（WGSL 拡張。`Features::
-/// SHADER_F16` 要求時のみ有効）で `vec2<f16>` のまま `fma` を実行しネイティブ
-/// f16 演算を使う。クエリ側もホスト（[`encode_query_bytes`]）が
-/// `batch_search.rs::pack_f16x2` と同じ表現で `vec2<f16>` パックしてアップロード
-/// する（[`QueryEncoding::F16Packed`]）。
+/// （常駐 f16 2 要素/u32 パック）は完全に同一で、`enable f16;`（WGSL 拡張。
+/// `Features::SHADER_F16` 要求時のみ有効）を使い `vec2<f16>` のまま
+/// ストレージバッファから読む（帯域幅の削減がこのシェーダの目的）。
+/// クエリ側もホスト（[`encode_query_bytes`]）が `batch_search.rs::pack_f16x2`
+/// と同じ表現で `vec2<f16>` パックしてアップロードする
+/// （[`QueryEncoding::F16Packed`]）。
 ///
-/// f16 の積算をそのまま `QUERY_TILE_MAX` 件ぶん行レジスタへ蓄積し続けると
-/// 最大値 65504 を超えて容易にオーバーフローするため、[`GPU_F16_ACC_BLOCK`]
-/// 件ごとに `f32(acc2.x) + f32(acc2.y)` で f32 アキュムレータ `acc` へ
-/// フラッシュし f16 レジスタを 0 に戻す。`GPU_F16_ACC_BLOCK` は `1` 固定
-/// （PR #591 レビュー P1 指摘対応）で、`acc2` は毎回「1 組の f16 積を計算
-/// した直後」にフラッシュされるため、複数項を f16 のまま加算することは
-/// 無い（f16 領域での桁落ちによる正解行の脱落を防ぐ。詳細は
-/// [`GPU_F16_ACC_BLOCK`] doc 参照）。オーバーフロー検出そのものはホスト側の
-/// [`select_dot_shader`] が dispatch 前に行い、単一の f16 積が
-/// オーバーフローしうる場合はこのシェーダを選ばず [`DOT_SHADER_WGSL`] へ
-/// 縮退する。
+/// **積和そのものは f32 で行う**（PR #591 レビュー P1 指摘対応・2 巡目）。
+/// 旧実装は読み出した `vec2<f16>` のまま `fma` を実行しネイティブ半精度の
+/// 積和を使っていたが、[`GPU_F16_ACC_BLOCK`] を `1` にして複数項の f16
+/// 加算を無くしても、**単一の積そのものが f16 の分解能（仮数部 10 bit）へ
+/// 丸められる**問題は残っていた（反例: `query=[128.125,128]`・
+/// `row_a=[128.125,-128.25]`・`row_b=[0,2^-14]` は全成分が f16 で厳密表現
+/// でき既存のオーバーフロー・アンダーフローガードもすべて通過するが、
+/// `128.125 * 128.125 = 16416.015625` がその区間の分解能〔16〕で
+/// `16416` へ丸められ、`row_a` の真のスコア差〔`0.015625`〕がまるごと
+/// 消えて `row_b` に順位が入れ替わる）。この丸めは「f16 領域での複数項の
+/// 加算」ではなく「1 回の乗算の結果を f16 として保持すること」自体が原因
+/// のため、フラッシュ頻度（`GPU_F16_ACC_BLOCK`）をどう調整しても解消しない。
+/// 本シェーダは `vec2<f32>(row_pair)`/`vec2<f32>(qv)` で読み出し直後に
+/// f32 へ拡張してから乗算・加算する（[`DOT_SHADER_WGSL`] の
+/// `unpack2x16float` 版と同じ演算順）ことでこの丸めを構造的に無くす。
+/// f16→f32 の拡張は常に厳密（情報の追加消失は無い）なため、クエリの
+/// 各成分が f16 へ厳密往復可能な場合（[`select_dot_shader`] の
+/// 精度ガード）は [`DOT_SHADER_WGSL`] とビット同一になる。
+///
+/// クエリ成分自体が f16 パック時に丸められる別リスク（PR #591 レビュー
+/// P1 指摘・2 巡目のもう一方）は本シェーダの外側、[`select_dot_shader`]
+/// の精度ガードで防ぐ（クエリが f16 へ厳密往復できない場合は
+/// [`DOT_SHADER_WGSL`] へ縮退しクエリを f32 のまま送る）。
 ///
 /// [`DOT_SHADER_TOPK_F16_ARITH_WGSL`]（`topk_dot_shader!` 経由）の S0 と
 /// 演算順を完全に一致させてあり、全量 readback／部分 Top-k いずれの経路でも
@@ -333,7 +334,6 @@ const DOT_SHADER_F16_ARITH_WGSL: &str = r#"
 enable f16;
 
 const QUERY_TILE_MAX: u32 = 16u;
-const F16_ACC_BLOCK: u32 = 1u;
 
 struct Params {
     row_stride: u32,
@@ -360,48 +360,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let query_pairs = params.query_stride >> 1u;
 
     var acc: array<f32, QUERY_TILE_MAX>;
-    var acc2: array<vec2<f16>, QUERY_TILE_MAX>;
     var qi: u32 = 0u;
     loop {
         if (qi >= QUERY_TILE_MAX) {
             break;
         }
         acc[qi] = 0.0;
-        acc2[qi] = vec2<f16>(0h, 0h);
         qi = qi + 1u;
     }
 
     var j: u32 = 0u;
-    var block: u32 = 0u;
     loop {
         if (j >= params.row_stride) {
             break;
         }
-        let row_pair = packed_rows[row_base + j];
+        // 読み出し直後に f32 へ拡張してから乗算する（f16 のまま積を
+        // 計算し保持する丸めを構造的に排除する。doc 参照）。
+        let row_pair = vec2<f32>(packed_rows[row_base + j]);
         var q: u32 = 0u;
         loop {
             if (q >= query_count) {
                 break;
             }
-            let qv = query[q * query_pairs + j];
-            acc2[q] = fma(row_pair, qv, acc2[q]);
+            let qv = vec2<f32>(query[q * query_pairs + j]);
+            acc[q] = acc[q] + row_pair.x * qv.x + row_pair.y * qv.y;
             q = q + 1u;
         }
         j = j + 1u;
-        block = block + 1u;
-        let flush = (block >= F16_ACC_BLOCK) || (j >= params.row_stride);
-        if (flush) {
-            var qf: u32 = 0u;
-            loop {
-                if (qf >= query_count) {
-                    break;
-                }
-                acc[qf] = acc[qf] + f32(acc2[qf].x) + f32(acc2[qf].y);
-                acc2[qf] = vec2<f16>(0h, 0h);
-                qf = qf + 1u;
-            }
-            block = 0u;
-        }
     }
 
     var qo: u32 = 0u;
@@ -647,56 +632,35 @@ const DOT_SHADER_TOPK_F32_WGSL: &str = topk_dot_shader!(
 /// workgroup 内部分 Top-k シェーダ（f16 算術版・Issue #539。
 /// [`GpuContext::f16_arith_pipelines`] が保持し、`SHADER_F16` 対応アダプタで
 /// [`select_dot_shader`] が [`GpuDotShaderKind::F16Arith`] を選んだ場合に使う）。
-/// S0 は [`DOT_SHADER_F16_ARITH_WGSL`] の演算順（f16 fma 積算・
-/// [`GPU_F16_ACC_BLOCK`] 件ごとの f32 フラッシュ）と完全に同一
-/// （全量 readback／部分 Top-k のビット同一契約の根拠）。
+/// S0 は [`DOT_SHADER_F16_ARITH_WGSL`] の演算順（f16 で保持した行・クエリを
+/// 読み出し直後に f32 へ拡張してから乗算・加算する。PR #591 レビュー P1
+/// 指摘対応・2 巡目で f16 のまま積を計算する設計から変更。[`DOT_SHADER_F16_ARITH_WGSL`]
+/// doc 参照）と完全に同一（全量 readback／部分 Top-k のビット同一契約の根拠）。
 const DOT_SHADER_TOPK_F16_ARITH_WGSL: &str = topk_dot_shader!(
-    "enable f16;\nconst F16_ACC_BLOCK: u32 = 1u;\n",
+    "enable f16;\n",
     "\n@group(0) @binding(1) var<storage, read> packed_rows: array<vec2<f16>>;\n",
     "array<vec2<f16>>",
     r#"
-    var acc2: array<vec2<f16>, QUERY_TILE_MAX>;
-    var qi2: u32 = 0u;
-    loop {
-        if (qi2 >= QUERY_TILE_MAX) {
-            break;
-        }
-        acc2[qi2] = vec2<f16>(0h, 0h);
-        qi2 = qi2 + 1u;
-    }
-
     let query_pairs = params.query_stride >> 1u;
     var j: u32 = 0u;
-    var block: u32 = 0u;
     loop {
         if (j >= params.row_stride) {
             break;
         }
-        let row_pair = packed_rows[row_base + j];
+        // 読み出し直後に f32 へ拡張してから乗算する
+        // （[`DOT_SHADER_F16_ARITH_WGSL`] doc 参照。f16 のまま積を保持する
+        // 丸めを構造的に排除する）。
+        let row_pair = vec2<f32>(packed_rows[row_base + j]);
         var q: u32 = 0u;
         loop {
             if (q >= query_count) {
                 break;
             }
-            let qv = query[q * query_pairs + j];
-            acc2[q] = fma(row_pair, qv, acc2[q]);
+            let qv = vec2<f32>(query[q * query_pairs + j]);
+            acc[q] = acc[q] + row_pair.x * qv.x + row_pair.y * qv.y;
             q = q + 1u;
         }
         j = j + 1u;
-        block = block + 1u;
-        let flush = (block >= F16_ACC_BLOCK) || (j >= params.row_stride);
-        if (flush) {
-            var qf: u32 = 0u;
-            loop {
-                if (qf >= query_count) {
-                    break;
-                }
-                acc[qf] = acc[qf] + f32(acc2[qf].x) + f32(acc2[qf].y);
-                acc2[qf] = vec2<f16>(0h, 0h);
-                qf = qf + 1u;
-            }
-            block = 0u;
-        }
     }
 "#
 );
@@ -881,21 +845,54 @@ fn max_abs_finite_from_packed(packed: &[u32]) -> f32 {
 /// 選ばない（クエリは `Unpack` 選択時は f32 のまま送るため、この量子化は
 /// `F16Arith` を選んだ場合にのみ新たに生じる。[`max_abs_finite_from_packed`]
 /// doc 参照）。
+///
+/// `has_precision_loss`（PR #591 レビュー P1 指摘対応・2 巡目）は
+/// [`f16_round_trip_exact`] doc 参照。`has_subnormal_underflow` が示す
+/// 「ゼロへ丸められる」ケースはこの一般化された丸め検知の特殊例だが、
+/// 既存テスト・呼び出し元との互換のため独立フィールドとして残す
+/// （両方が真になりうる。`select_dot_shader` はどちらか一方でも真なら
+/// 拒否する）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct QueryAmplitudeStats {
     max_abs: f32,
     has_subnormal_underflow: bool,
+    has_precision_loss: bool,
 }
 
-/// クエリバッチ（f32・パック前）の有限成分のみの絶対値最大・アンダーフロー
-/// 有無を走査する（Issue #539・[`select_dot_shader`] の
-/// `query_max_abs`/`query_has_subnormal_underflow` 引数を作る）。`f16` へ
-/// パックした時点での飽和（±Inf 化）を判定する独立ガード
-/// （`query_max_abs > F16_MAX_FINITE`）の母数となるため、f32 の値そのまま
-/// （f16 丸め前）で走査する（`select_dot_shader` doc 参照）。呼び出し元は
-/// バッチ全体ではなく [`group_queries_by_ctx`] が返す 1 グループ分の index
-/// 列（[`max_abs_finite_from_queries_subset`]）を渡し、シェーダ選択の母数を
-/// `PolicyContext` グループ単位に分離する（PR #591 レビュー P0 指摘対応）。
+/// クエリ成分 1 個が f16 へパック・アンパックしても完全に元の値へ戻るか
+/// を判定する（PR #591 レビュー P1 指摘対応・2 巡目）。
+///
+/// [`select_dot_shader`] の既存ガード（振幅上限・非正規化アンダーフロー）
+/// はいずれも「値の大きさ」だけを見ており、その範囲内でも f16 の仮数部
+/// 10 bit では表現できない値が丸められる一般のケースを検知できない
+/// （反例: `query=[2048.5,2048]`・`row_a=[1,-1]`・`row_b=[0,2^-13]` は
+/// いずれのガードも通過するが、`2048.5` が最近接偶数丸めで `2048` へ
+/// 変わり `row_a` の真のスコア〔`0.5`〕が `0` になって `row_b`
+/// 〔`0.25`〕に順位が入れ替わる。この丸めはクエリを f16 へエンコードする
+/// 時点で発生するため、シェーダ側の算術精度をどう変えても救えない）。
+/// 本関数は実際のエンコード（[`encode_query_bytes`]）と同じ
+/// [`crate::batch_search::pack_f16x2`]/[`crate::batch_search::unpack_f16x2`]
+/// で判定するため、ガードとエンコードの丸め規則が乖離しない。非有限値は
+/// 呼び出し元（[`max_abs_finite_from_query_iter`]）が別途フィルタ済みの
+/// 前提で、常に「往復可能」として扱う。
+fn f16_round_trip_exact(v: f32) -> bool {
+    if !v.is_finite() {
+        return true;
+    }
+    let (roundtrip, _) = crate::batch_search::unpack_f16x2(crate::batch_search::pack_f16x2(v, 0.0));
+    roundtrip == v
+}
+
+/// クエリバッチ（f32・パック前）の有限成分のみの絶対値最大・アンダーフロー・
+/// 丸め有無を走査する（Issue #539・[`select_dot_shader`] の
+/// `query_max_abs`/`query_has_subnormal_underflow`/`query_has_precision_loss`
+/// 引数を作る）。`f16` へパックした時点での飽和（±Inf 化）を判定する独立
+/// ガード（`query_max_abs > F16_MAX_FINITE`）の母数となるため、f32 の値
+/// そのまま（f16 丸め前）で走査する（`select_dot_shader` doc 参照）。
+/// 呼び出し元はバッチ全体ではなく [`group_queries_by_ctx`] が返す 1
+/// グループ分の index 列（[`max_abs_finite_from_queries_subset`]）を渡し、
+/// シェーダ選択の母数を `PolicyContext` グループ単位に分離する
+/// （PR #591 レビュー P0 指摘対応）。
 fn max_abs_finite_from_queries_subset(
     queries: &[BatchQuery<'_>],
     indices: &[usize],
@@ -908,6 +905,7 @@ fn max_abs_finite_from_query_iter<'a>(
 ) -> QueryAmplitudeStats {
     let mut max_abs: f32 = 0.0;
     let mut has_subnormal_underflow = false;
+    let mut has_precision_loss = false;
     for q in queries {
         for &v in q.vector {
             if !v.is_finite() {
@@ -918,19 +916,25 @@ fn max_abs_finite_from_query_iter<'a>(
             if abs > 0.0 && abs < F16_MIN_POSITIVE_SUBNORMAL {
                 has_subnormal_underflow = true;
             }
+            if !f16_round_trip_exact(v) {
+                has_precision_loss = true;
+            }
         }
     }
     QueryAmplitudeStats {
         max_abs,
         has_subnormal_underflow,
+        has_precision_loss,
     }
 }
 
 /// [`GpuDotShaderKind`] を GPU デバイス非依存の純関数として決める
 /// （`select_readback_mode` と同型。単体テストの対象）。
 ///
-/// f16 算術版はネイティブ半精度の積和を行うため、次のいずれかが崩れると
-/// unpack 版との等価性（受け入れ条件の核心）が壊れる:
+/// f16 算術版は行・クエリを `vec2<f16>` のまま常駐・転送する（積和自体は
+/// f32 へ拡張してから行う。[`DOT_SHADER_F16_ARITH_WGSL`] doc 参照）ため、
+/// 次のいずれかが崩れると unpack 版との等価性（受け入れ条件の核心）が
+/// 壊れる:
 ///
 /// - `f16_arith_available`: アダプタが `SHADER_F16` に対応し、かつ
 ///   f16 算術版パイプラインの生成に成功していること
@@ -944,24 +948,28 @@ fn max_abs_finite_from_query_iter<'a>(
 ///   （`row_max_abs` の値に関わらず崩れる独立した条件のため、積の判定
 ///   より先に単独でチェックする）
 /// - `row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK <=
-///   F16_ARITH_PARTIAL_SUM_LIMIT`: [`GPU_F16_ACC_BLOCK`]（`1` 固定。PR #591
-///   レビュー P1 指摘対応）分の f16 積算がブロックフラッシュ前に f16 の
-///   有限最大値（65504）へ達しないことの保守的な上界判定
+///   F16_ARITH_PARTIAL_SUM_LIMIT`: 保守的なオーバーフロー上界判定
+///   （[`GPU_F16_ACC_BLOCK`] doc 参照。積和自体は f32 で行うため必須では
+///   ないが、既存の安全マージンとして維持する）
 /// - `query_has_subnormal_underflow` が偽であること（PR #591 レビュー P1
 ///   指摘対応）: 上限のみを見る上記オーバーフローガードは、有効な非ゼロ
 ///   小成分が [`F16_MIN_POSITIVE_SUBNORMAL`] 未満で f16 へ厳密にゼロ丸め
-///   されるアンダーフローを検知できない。クエリは `F16Arith` 選択時のみ
-///   f16 パックされる（`Unpack` 選択時は f32 のまま送る）ため、この
-///   アンダーフローはクエリ側にのみ新たに生じるリスクであり（常駐行列側は
-///   両シェーダ共通で既に f16 量子化済みのため対象外。
-///   [`max_abs_finite_from_packed`] doc 参照）、極端な振幅差（例: クエリの
-///   ある成分が 1e-8 程度）では、この成分の寄与が消え正解行がスコア差から
-///   脱落しうるため独立に unpack 版へ縮退する
+///   されるアンダーフローを検知できない
+/// - `query_has_precision_loss` が偽であること（PR #591 レビュー P1
+///   指摘対応・2 巡目。[`f16_round_trip_exact`] doc 参照）:
+///   振幅上限・アンダーフローの範囲内でも、f16 の仮数部 10 bit では
+///   表現できない値は丸められる。この丸めはクエリを f16 へエンコードする
+///   時点で発生し、積和を f32 で行っても取り戻せないため独立に検知する。
+///   クエリは `F16Arith` 選択時のみ f16 パックされる（`Unpack` 選択時は
+///   f32 のまま送る）ため、上記 2 つのガードと同様にクエリ側にのみ新たに
+///   生じるリスクである（常駐行列側は両シェーダ共通で既に f16 量子化済み
+///   のため対象外。[`max_abs_finite_from_packed`] doc 参照）
 fn select_dot_shader(
     f16_arith_available: bool,
     row_max_abs: f32,
     query_max_abs: f32,
     query_has_subnormal_underflow: bool,
+    query_has_precision_loss: bool,
 ) -> GpuDotShaderKind {
     if !f16_arith_available {
         return GpuDotShaderKind::Unpack;
@@ -973,6 +981,9 @@ fn select_dot_shader(
         return GpuDotShaderKind::Unpack;
     }
     if query_has_subnormal_underflow {
+        return GpuDotShaderKind::Unpack;
+    }
+    if query_has_precision_loss {
         return GpuDotShaderKind::Unpack;
     }
     let bound = row_max_abs * query_max_abs * (GPU_F16_ACC_BLOCK as f32);
@@ -2235,6 +2246,7 @@ impl<'a> AdaptiveShaderSelector<'a> {
             row_max_abs,
             query_stats.max_abs,
             query_stats.has_subnormal_underflow,
+            query_stats.has_precision_loss,
         );
         let shader_kind = match self.forced_dot_shader {
             None => natural_shader_kind,
@@ -3542,10 +3554,17 @@ mod tests {
             DOT_SHADER_F16_ARITH_WGSL.contains(&tile_max),
             "f16 arith shader must declare {tile_max}"
         );
-        let acc_block = format!("const F16_ACC_BLOCK: u32 = {GPU_F16_ACC_BLOCK}u;");
+        // `F16_ACC_BLOCK`（f16 レジスタのフラッシュ機構）は PR #591 レビュー
+        // P1 指摘対応・2 巡目で撤去済み（積和を f32 へ拡張後に行う設計へ
+        // 変更したため不要。`DOT_SHADER_F16_ARITH_WGSL` doc 参照）。両
+        // シェーダとも f16 のまま乗算しないことを固定する。
         assert!(
-            DOT_SHADER_F16_ARITH_WGSL.contains(&acc_block),
-            "f16 arith shader must declare {acc_block}"
+            !DOT_SHADER_F16_ARITH_WGSL.contains("F16_ACC_BLOCK"),
+            "f16 arith shader must not retain the removed F16_ACC_BLOCK flush mechanism"
+        );
+        assert!(
+            !DOT_SHADER_F16_ARITH_WGSL.contains("fma(row_pair, qv"),
+            "f16 arith shader must widen to f32 before multiplying (no half-precision fma)"
         );
 
         // topk 版（`topk_dot_shader!` 経由）も同一の prelude 定数を共有する
@@ -3555,8 +3574,12 @@ mod tests {
             "f16 arith topk shader must declare enable f16;"
         );
         assert!(
-            DOT_SHADER_TOPK_F16_ARITH_WGSL.contains(&acc_block),
-            "f16 arith topk shader must declare {acc_block}"
+            !DOT_SHADER_TOPK_F16_ARITH_WGSL.contains("F16_ACC_BLOCK"),
+            "f16 arith topk shader must not retain the removed F16_ACC_BLOCK flush mechanism"
+        );
+        assert!(
+            !DOT_SHADER_TOPK_F16_ARITH_WGSL.contains("fma(row_pair, qv"),
+            "f16 arith topk shader must widen to f32 before multiplying (no half-precision fma)"
         );
         let enable_pos_topk = DOT_SHADER_TOPK_F16_ARITH_WGSL
             .find("enable f16;")
@@ -3582,7 +3605,7 @@ mod tests {
     #[test]
     fn select_dot_shader_requires_f16_available() {
         assert_eq!(
-            select_dot_shader(false, 1.0, 1.0, false),
+            select_dot_shader(false, 1.0, 1.0, false, false),
             GpuDotShaderKind::Unpack
         );
     }
@@ -3590,11 +3613,11 @@ mod tests {
     #[test]
     fn select_dot_shader_rejects_non_finite_inputs() {
         assert_eq!(
-            select_dot_shader(true, f32::INFINITY, 1.0, false),
+            select_dot_shader(true, f32::INFINITY, 1.0, false, false),
             GpuDotShaderKind::Unpack
         );
         assert_eq!(
-            select_dot_shader(true, 1.0, f32::NAN, false),
+            select_dot_shader(true, 1.0, f32::NAN, false, false),
             GpuDotShaderKind::Unpack
         );
     }
@@ -3607,7 +3630,7 @@ mod tests {
         // クエリ成分が f16 パック時に飽和する分岐そのものを閉じるための独立
         // ガード）。
         assert_eq!(
-            select_dot_shader(true, 0.0, F16_MAX_FINITE + 1.0, false),
+            select_dot_shader(true, 0.0, F16_MAX_FINITE + 1.0, false, false),
             GpuDotShaderKind::Unpack
         );
     }
@@ -3617,7 +3640,7 @@ mod tests {
         // row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK が上限を超える。
         let over = (F16_ARITH_PARTIAL_SUM_LIMIT / (GPU_F16_ACC_BLOCK as f32)) + 1.0;
         assert_eq!(
-            select_dot_shader(true, over, 1.0, false),
+            select_dot_shader(true, over, 1.0, false, false),
             GpuDotShaderKind::Unpack
         );
     }
@@ -3626,7 +3649,7 @@ mod tests {
     fn select_dot_shader_accepts_when_all_guards_pass() {
         let per_side = ((F16_ARITH_PARTIAL_SUM_LIMIT / (GPU_F16_ACC_BLOCK as f32)) - 1.0).sqrt();
         assert_eq!(
-            select_dot_shader(true, per_side, per_side, false),
+            select_dot_shader(true, per_side, per_side, false, false),
             GpuDotShaderKind::F16Arith
         );
     }
@@ -3636,7 +3659,7 @@ mod tests {
         // `<=` 判定であることを固定する（境界値ちょうどは受理）。
         let exact = F16_ARITH_PARTIAL_SUM_LIMIT / (GPU_F16_ACC_BLOCK as f32);
         assert_eq!(
-            select_dot_shader(true, exact, 1.0, false),
+            select_dot_shader(true, exact, 1.0, false, false),
             GpuDotShaderKind::F16Arith
         );
     }
@@ -3649,8 +3672,108 @@ mod tests {
         // （行側は両シェーダ共通で既に f16 量子化済みのためチェック対象外。
         // `max_abs_finite_from_packed` doc 参照）。
         assert_eq!(
-            select_dot_shader(true, 1.0, 1.0, true),
+            select_dot_shader(true, 1.0, 1.0, true, false),
             GpuDotShaderKind::Unpack
+        );
+    }
+
+    #[test]
+    fn select_dot_shader_rejects_query_precision_loss_even_when_overflow_and_underflow_guards_pass()
+    {
+        // PR #591 レビュー P1 指摘対応・2 巡目: 振幅上限・非正規化アンダー
+        // フローのいずれのガードも通過する値でも、f16 の仮数部 10 bit で
+        // 表現できない値は丸められうる（`f16_round_trip_exact` doc 参照）。
+        assert_eq!(
+            select_dot_shader(true, 1.0, 1.0, false, true),
+            GpuDotShaderKind::Unpack
+        );
+    }
+
+    #[test]
+    fn f16_round_trip_exact_accepts_representable_values_and_rejects_the_review_counterexample() {
+        // `query=[128.125,128]`（PR #591 レビュー・積の丸め反例）はいずれも
+        // f16 で厳密表現できる（往復可能）。この反例は積そのものの丸め
+        // （シェーダ側の f32 拡張で解消）が原因であり、クエリ成分自体は
+        // 往復可能なことを確認しておく（`f16_round_trip_exact` が過検知
+        // しないことの固定）。
+        assert!(f16_round_trip_exact(128.125));
+        assert!(f16_round_trip_exact(128.0));
+        // `query=[2048.5,2048]`（PR #591 レビュー・クエリ量子化反例）は
+        // `2048.5` が f16 で厳密表現できず往復不可能。
+        assert!(!f16_round_trip_exact(2048.5));
+        assert!(f16_round_trip_exact(2048.0));
+        // 境界・特殊値。
+        assert!(f16_round_trip_exact(0.0));
+        assert!(f16_round_trip_exact(-0.0));
+        assert!(
+            f16_round_trip_exact(f32::NAN),
+            "非有限値は対象外として往復可能扱い"
+        );
+        assert!(f16_round_trip_exact(f32::INFINITY));
+    }
+
+    #[test]
+    fn max_abs_finite_from_queries_detects_precision_loss_on_review_counterexample() {
+        // PR #591 レビュー P1 指摘対応・2 巡目の反例そのもの
+        // （`query=[2048.5,2048]`）を固定する。
+        let query = [2048.5f32, 2048.0];
+        let c = PolicyContext::new("tenant-a").expect("valid tenant id");
+        let queries = [BatchQuery {
+            vector: &query,
+            k: 1,
+            ctx: &c,
+        }];
+        let stats = max_abs_finite_from_query_iter(queries.iter());
+        assert!(stats.has_precision_loss);
+        assert!(
+            !stats.has_subnormal_underflow,
+            "この反例は振幅・丸めの問題であり非正規化アンダーフローではない"
+        );
+    }
+
+    /// PR #591 レビュー P1 指摘（2 巡目）の反例を GPU デバイスなしで
+    /// 再現する: `select_dot_shader` の全ガードを通過する query/row の
+    /// 組でも、積そのものを f16 として保持すると（旧実装）丸めが起き
+    /// 真値と異なるスコアになる（反例: `query=[128.125,128]`・
+    /// `row_a=[128.125,-128.25]`・`row_b=[0,2^-14]`）。修正後
+    /// （積和を f32 で行う設計）は真値と一致する。
+    #[test]
+    fn f16_arith_single_product_rounding_bug_pr591_p1_round2_reproduction_and_fix() {
+        let query = [128.125f32, 128.0];
+        let row_a = [128.125f32, -128.25];
+        let row_b = [0.0f32, 2f32.powi(-14)];
+
+        let true_dot_a = dot_f32(&query, &row_a);
+        let true_dot_b = dot_f32(&query, &row_b);
+        assert!(
+            true_dot_a > true_dot_b,
+            "真値では row_a が k=1 の正解であるべき"
+        );
+
+        // 旧実装（`GPU_F16_ACC_BLOCK == 1` の f16 積算シミュレーション）は
+        // この反例で row_a のスコアを 0 へ潰し、row_b に順位が入れ替わる
+        // ことを固定する（回帰の記録。撤去済みのシェーダ設計を指すが、
+        // 積を f16 のまま保持すると必ずこうなることの証拠として残す）。
+        let old_score_a = simulate_f16_arith_dot(&row_a, &query, GPU_F16_ACC_BLOCK);
+        let old_score_b = simulate_f16_arith_dot(&row_b, &query, GPU_F16_ACC_BLOCK);
+        assert_eq!(
+            old_score_a, 0.0,
+            "128.125^2 が f16 の分解能で丸められ row_a のスコアが 0 になるはず"
+        );
+        assert!(
+            old_score_b > old_score_a,
+            "旧実装では row_b に順位が入れ替わるはず（P1 指摘・2 巡目の再現）"
+        );
+
+        // 修正後（積和を f32 で行う。DOT_SHADER_F16_ARITH_WGSL doc 参照）は
+        // 真値と一致し、row_a が正しく上位に来る。
+        let fixed_score_a = simulate_f16_arith_dot_fixed(&row_a, &query);
+        let fixed_score_b = simulate_f16_arith_dot_fixed(&row_b, &query);
+        assert_eq!(fixed_score_a, true_dot_a);
+        assert_eq!(fixed_score_b, true_dot_b);
+        assert!(
+            fixed_score_a > fixed_score_b,
+            "修正後は row_a が正しく k=1 の正解であるべき"
         );
     }
 
@@ -4055,11 +4178,58 @@ mod tests {
         acc
     }
 
+    /// テスト専用ヘルパ: 素朴な f32 内積（真値の対照。零埋めして扱う）。
+    fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+        let len = a.len().max(b.len());
+        let mut acc = 0.0f32;
+        for j in 0..len {
+            let av = a.get(j).copied().unwrap_or(0.0);
+            let bv = b.get(j).copied().unwrap_or(0.0);
+            acc += av * bv;
+        }
+        acc
+    }
+
+    /// テスト専用ヘルパ: 修正後の [`DOT_SHADER_F16_ARITH_WGSL`] の演算順
+    /// （読み出し直後に f32 へ拡張してから乗算・加算する。積を f16 として
+    /// 保持しない）を CPU 上で再現する（PR #591 レビュー P1 指摘対応・
+    /// 2 巡目の回帰テスト用）。`row`/`query` は「既に f16 表現された」
+    /// 前提の値（呼び出し元がテストで f16 表現可能な値を選ぶ）を渡す想定
+    /// で、本関数自体は追加の丸めを行わない（[`dot_f32`] と数式上は同一だが、
+    /// シェーダの読み出し順・vec2 単位の加算順を明示するため独立関数として
+    /// 残す）。
+    fn simulate_f16_arith_dot_fixed(row: &[f32], query: &[f32]) -> f32 {
+        let padded_len = row.len().max(query.len()).next_multiple_of(2);
+        let mut row_padded = row.to_vec();
+        row_padded.resize(padded_len, 0.0);
+        let mut query_padded = query.to_vec();
+        query_padded.resize(padded_len, 0.0);
+        let pairs = padded_len / 2;
+
+        let mut acc: f32 = 0.0;
+        for j in 0..pairs {
+            let (rx, ry) = (row_padded[2 * j], row_padded[2 * j + 1]);
+            let (qx, qy) = (query_padded[2 * j], query_padded[2 * j + 1]);
+            acc += rx * qx + ry * qy;
+        }
+        acc
+    }
+
     #[test]
     fn f16_arith_precision_bug_pr591_p1_is_fixed_by_acc_block_1() {
-        // PR #591 レビュー P1 指摘の反例をそのまま再現する: query の f16 で
-        // 厳密表現できる成分が row と積算される過程で、複数項を f16 の
-        // まま加算するとオーバーフローガードを通過していても桁落ちが起き、
+        // PR #591 レビュー P1 指摘（1 巡目）の反例をそのまま再現する:
+        // query の f16 で厳密表現できる成分が row と積算される過程で、
+        // 複数項を f16 のまま加算するとオーバーフローガードを通過して
+        // いても桁落ちが起き、
+        //
+        // 注記: 本テストが固定する「ブロック幅 1」は複数項の f16 加算を
+        // 無くすが、単一の積そのものを f16 として保持する丸め（PR #591
+        // レビュー P1 指摘・2 巡目。
+        // `f16_arith_single_product_rounding_bug_pr591_p1_round2_reproduction_and_fix`
+        // 参照）までは解消しない。実際の production シェーダは積和を
+        // f32 で行う設計（`DOT_SHADER_F16_ARITH_WGSL` doc 参照）へ変更
+        // 済みのため、本テストが再現する `simulate_f16_arith_dot` は
+        // 撤去済みの旧シェーダ設計の記録用シミュレーションである。
         // k=1 の正解行が入れ替わりうる（`GPU_F16_ACC_BLOCK` doc 参照）。
         let query = [2048.0f32, 0.0, 1.0, 0.0, -2048.0];
         let row = [1.0f32, 0.0, 1.0, 0.0, 1.0];
@@ -4231,6 +4401,7 @@ mod tests {
                 group_row_max_abs,
                 group_query_stats.max_abs,
                 group_query_stats.has_subnormal_underflow,
+                group_query_stats.has_precision_loss,
             );
             if group_ctx == &ctx_a {
                 assert_eq!(

@@ -70,6 +70,56 @@ CPU 上のシミュレーションとして固定）。性能への影響（フ�
 増加）は前後比較実測の別 Issue（#540）へ申し送り、本変更は正しさ優先の
 修正であり実測を伴わない。
 
+### 単一積の丸め（PR #591 レビュー P1 指摘対応・2 巡目）
+
+上記「ブロック幅 1」修正は複数項の f16 加算を無くしたが、**単一の積その
+ものを `vec2<f16>` として保持する丸め**は解消していなかった。反例:
+`query=[128.125,128]`・`row_a=[128.125,-128.25]`・`row_b=[0,2^-14]`
+（真の内積は `row_a` が `0.015625`・`row_b` が `0.0078125` で `row_a` が
+k=1 の正解）はいずれの成分も f16 で厳密表現でき、既存のオーバーフロー・
+アンダーフローガードもすべて通過するが、`128.125 * 128.125 = 16416.015625`
+がその区間の f16 分解能（`16`）で `16416` へ丸められ、`row_a` の
+`fma(row_pair, qv, 0)`（レーンごと独立）の x レーンが `16416`・y レーンが
+`128 * -128.25 = -16416`（厳密表現可能）となって合算が `0` になり、
+`row_b`（`0.0078125`）に順位が入れ替わる
+（`crates/engine/src/gpu_batch.rs`
+`tests::f16_arith_single_product_rounding_bug_pr591_p1_round2_reproduction_and_fix`
+で CPU 上のシミュレーションとして固定。この丸めはブロック幅を `1` にした
+効果とは独立で、`f16` 積を計算した直後にフラッシュしても積そのものの
+丸め誤差は残る）。
+
+さらに独立した問題として、クエリ成分自体の f16 パック時の丸めも振幅・
+アンダーフローの既存ガードでは検知できない。反例:
+`query=[2048.5,2048]`・`row_a=[1,-1]`・`row_b=[0,2^-13]`（真の内積は
+`row_a` が `0.5`・`row_b` が `0.25` で `row_a` が正解）はいずれのガードも
+通過するが、`2048.5` は f16 の分解能（この振幅で `2`）で `2048` へ丸め
+られ、`row_a` のスコアが `0` になり `row_b` に順位が入れ替わる。この
+丸めはクエリを f16 へエンコードする時点で発生するため、シェーダ側の
+算術精度をどう変えても救えない。
+
+対処は 2 つを組み合わせる:
+
+1. **積和を f32 で行う**（`DOT_SHADER_F16_ARITH_WGSL`/
+   `DOT_SHADER_TOPK_F16_ARITH_WGSL`）。読み出した `vec2<f16>`（行・クエリ
+   とも）を `vec2<f32>(...)` で読み出し直後に拡張してから乗算・加算する
+   （[`DOT_SHADER_WGSL`] の `unpack2x16float` 版と同じ演算順）。これにより
+   `GPU_F16_ACC_BLOCK`・`acc2`・フラッシュ機構は不要になり撤去した
+   （WGSL 側の `F16_ACC_BLOCK` 定数宣言も撤去。Rust 側 `GPU_F16_ACC_BLOCK`
+   は既存のオーバーフロー margin 計算式〔`select_dot_shader` の
+   `F16_ARITH_PARTIAL_SUM_LIMIT` 判定〕を変えないための乗数 `1` としてのみ
+   残る）。行・クエリを `vec2<f16>` のまま常駐・転送する設計自体（帯域幅
+   削減）は変更しない
+2. **クエリ成分の f16 往復可能性を検知する独立ガード** `f16_round_trip_exact`
+   （`crate::batch_search::pack_f16x2`/`unpack_f16x2` で実際に往復させ、
+   元の値と完全一致するかを見る）を追加し、`QueryAmplitudeStats::
+   has_precision_loss` として `select_dot_shader` の新しい拒否条件にする
+   （§3 参照）
+
+f32 へ拡張後の演算は、クエリが f16 へ厳密往復可能な場合は
+`DOT_SHADER_WGSL`（unpack 版）とビット同一になる（`row` は両シェーダ共通
+で既に f16 量子化済みのため、`unpack2x16float` と `vec2<f32>(vec2<f16>)`
+はどちらも同じ厳密な f16→f32 拡張）。
+
 ## 3. オーバーフローガードと選択規則
 
 f16 の有限最大値（65504）を超える中間値が生じると、f16 算術版だけが該当
@@ -78,7 +128,8 @@ f16 の有限最大値（65504）を超える中間値が生じると、f16 算�
 前に判定する:
 
 ```text
-select_dot_shader(f16_available, row_max_abs, query_max_abs, query_has_subnormal_underflow):
+select_dot_shader(f16_available, row_max_abs, query_max_abs,
+                   query_has_subnormal_underflow, query_has_precision_loss):
   1. f16_available が false なら Unpack
   2. row_max_abs／query_max_abs のいずれかが非有限なら Unpack
   3. query_max_abs > F16_MAX_FINITE(65504) なら Unpack
@@ -90,12 +141,17 @@ select_dot_shader(f16_available, row_max_abs, query_max_abs, query_has_subnormal
      成分が f16 パックで厳密にゼロへ丸められ正解行が脱落しうるケースを
      閉じる。クエリは F16Arith 選択時のみ f16 パックされるため、この
      アンダーフローはクエリ側にのみ新たに生じるリスク）
-  5. row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK が
+  5. query_has_precision_loss が真なら Unpack
+     （PR #591 レビュー P1 指摘対応・2 巡目で追加。振幅上限・アンダー
+     フローの範囲内でも f16 の仮数部 10 bit で表現できない値は丸め
+     られる。`f16_round_trip_exact` で実際に f16 へ往復させ元の値と
+     一致するかを見る。§2「単一積の丸め」節参照）
+  6. row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK が
      F16_ARITH_PARTIAL_SUM_LIMIT(32768) を超えるなら Unpack
-     （単一 f16 積のオーバーフロー上界判定。GPU_F16_ACC_BLOCK は `1` 固定
-     〔下記「f16 積算の桁落ち」節参照〕のため複数項の f16 加算は発生
-     しない。65504 の約半分を選び丸め誤差の余裕を持たせる）
-  6. それ以外は F16Arith
+     （保守的なオーバーフロー上界判定。積和は f32 で行う設計へ変更した
+     ため必須ではないが、既存の安全マージンとして維持する。§2「単一積の
+     丸め」節参照）
+  7. それ以外は F16Arith
 ```
 
 `row_max_abs`（行ごとの有限成分のみの絶対値最大）は `GpuBatchBackend::
