@@ -128,8 +128,19 @@ pub(crate) fn pre_check_bindable(
     parser::bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
     let (metadata_filters, expr_filters, _rls_predicate_present) =
         parser::bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+    // Issue #474: `EXPLAIN` の `scalar_plan:` 行（`sql::explain`）が要求する
+    // 静的判定。`USING PLAN` は `HINT ORDER` を受理しない（SQL-5・許可リスト層）
+    // ため `scalar_prefilter` は常に `true`（`sql::exec` の SCALAR 段は常に
+    // DISTANCE 段より先に評価される）。
+    let scalar_plan =
+        crate::sql::scalar_plan::classify_scalar_plan(&crate::sql::scalar_plan::ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &metadata_filters,
+            expr_filters: &expr_filters,
+        });
     Ok(PreCheckShape {
         filters_empty: metadata_filters.is_empty() && expr_filters.is_empty(),
+        scalar_plan,
     })
 }
 
@@ -147,6 +158,9 @@ pub(crate) fn pre_check_bindable(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreCheckShape {
     pub(crate) filters_empty: bool,
+    /// Issue #474: `sql::explain` の `scalar_plan:` 行が要求する静的判定
+    /// （[`crate::sql::scalar_plan::classify_scalar_plan`] の結果）。
+    pub(crate) scalar_plan: crate::sql::scalar_plan::ScalarPlan,
 }
 
 /// `stmt`（`using_plan()` が `Some` である前提）・展開結果 `expansion`・埋め込み
