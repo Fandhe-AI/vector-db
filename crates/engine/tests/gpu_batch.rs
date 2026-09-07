@@ -457,6 +457,21 @@ impl Xorshift32 {
         let bits = self.next_u32();
         ((bits as f64 / u32::MAX as f64) * 2.0 - 1.0) as f32
     }
+
+    /// `next_f32` が返す値を [`engine::batch_search::pack_f16x2`]/
+    /// `unpack_f16x2` で 1 度だけ f16 へ丸めた値を返す（PR #591 レビュー P2
+    /// 指摘対応）。丸め後の値は f16 の表現グリッド上に乗るため、以後同じ
+    /// pack/unpack を何度施しても不変（冪等）であり、`gpu_batch.rs::
+    /// f16_round_trip_exact` の判定を常に満たす。`f16_arith_dot_shader`
+    /// モジュールの成功経路テスト（既定選択で実際に `F16Arith` へ dispatch
+    /// されることを要求する）はクエリ成分に丸めを含めてはならないため、
+    /// [`multi_query_fixture`] の乱数クエリ生成をこちらへ差し替えて使う。
+    fn next_f32_f16_round_trippable(&mut self) -> f32 {
+        let v = self.next_f32();
+        let (rounded, _) =
+            engine::batch_search::unpack_f16x2(engine::batch_search::pack_f16x2(v, 0.0));
+        rounded
+    }
 }
 
 /// 行・クエリともに `Xorshift32` で生成した固定次元のベクトル集合
@@ -487,6 +502,47 @@ fn multi_query_fixture(
         let mut q = Vec::with_capacity(dim);
         for _ in 0..dim {
             q.push(rng.next_f32());
+        }
+        queries.push(q);
+    }
+    MultiQueryFixture {
+        ids: (1..=row_count as u64).collect(),
+        tenant_ids: vec!["tenant-a".to_string(); row_count],
+        visibilities: vec![Visibility::Public; row_count],
+        dim,
+        vectors,
+        queries,
+    }
+}
+
+/// [`multi_query_fixture`] と同じだが、クエリ成分だけを
+/// `Xorshift32::next_f32_f16_round_trippable` で生成し、f16 へ厳密往復
+/// できる値に限定する（PR #591 レビュー P2 指摘対応）。行は対象外のまま
+/// （`gpu_batch.rs::select_dot_shader` の `query_has_precision_loss` ガード
+/// はクエリのみを母数にするため。`docs/design/gpu-batch-f16-arith.md` §3
+/// 参照）。`f16_arith_dot_shader` モジュールの成功経路テスト（既定選択で
+/// `SHADER_F16` 対応アダプタでは実際に `F16Arith` へ dispatch されることを
+/// 要求する）は、丸め値を含みうる `multi_query_fixture` の乱数クエリでは
+/// `has_precision_loss` ガードに拒否されて自動選択が常に `Unpack` へ縮退し
+/// てしまうため、成功経路にはこちらを使う。丸みを伴うクエリでガードが
+/// 実際に `Unpack` へ縮退することの確認は
+/// `f16_arith_precision_loss_guard_falls_back_to_unpack` に分離する。
+fn multi_query_fixture_f16_safe(
+    row_count: usize,
+    dim: usize,
+    query_count: usize,
+    seed: u32,
+) -> MultiQueryFixture {
+    let mut rng = Xorshift32(seed | 1);
+    let mut vectors = Vec::with_capacity(row_count * dim);
+    for _ in 0..row_count * dim {
+        vectors.push(rng.next_f32());
+    }
+    let mut queries = Vec::with_capacity(query_count);
+    for _ in 0..query_count {
+        let mut q = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            q.push(rng.next_f32_f16_round_trippable());
         }
         queries.push(q);
     }
@@ -1221,7 +1277,7 @@ mod f16_arith_dot_shader {
     #[test]
     fn f16_arith_default_matches_unpack_within_boundary_tolerance() {
         for &dim in &[33usize, 128] {
-            let fx = multi_query_fixture(3000, dim, 21, 0x539_2026);
+            let fx = multi_query_fixture_f16_safe(3000, dim, 21, 0x539_2026);
             let matrix = engine::batch_search::ResidentMatrix::build(
                 &fx.ids,
                 &fx.tenant_ids,
@@ -1330,7 +1386,7 @@ mod f16_arith_dot_shader {
     fn f16_arith_partial_topk_matches_forced_full_readback_bit_identically() {
         let row_count = 1000;
         let dim = 33;
-        let fx = multi_query_fixture(row_count, dim, 5, 0x539_a11c);
+        let fx = multi_query_fixture_f16_safe(row_count, dim, 5, 0x539_a11c);
         let matrix = engine::batch_search::ResidentMatrix::build(
             &fx.ids,
             &fx.tenant_ids,
@@ -1497,6 +1553,110 @@ mod f16_arith_dot_shader {
         assert!(
             forced_f16_err.is_err(),
             "forcing f16 arith when the overflow guard rejects it must fail closed, not silently fall back"
+        );
+    }
+
+    /// クエリ成分が f16 へ厳密往復できない場合（振幅・アンダーフローの
+    /// 既存ガードの範囲内でも仮数部 10 bit で丸められるケース。
+    /// `docs/design/gpu-batch-f16-arith.md`「クエリ成分自体の f16 パック時の
+    /// 丸め」節の反例と同型）に、自動選択（`select_dot_shader`）が
+    /// `has_precision_loss` ガードにより unpack 版へ縮退することを、
+    /// オーバーフローガード（[`f16_arith_overflow_guard_falls_back_to_unpack`]）
+    /// とは独立に確認する（PR #591 レビュー P2 指摘対応: `multi_query_fixture`
+    /// の乱数クエリは丸めを含みうるため成功経路テストからは分離し、丸めを
+    /// 意図的に含む最小フィクスチャで縮退確認専用に使う）。強制
+    /// `F16Arith` はガード不成立のため `Err` を返すこと（fail-closed）も
+    /// あわせて確認する。
+    #[test]
+    fn f16_arith_precision_loss_guard_falls_back_to_unpack() {
+        let row_count = 40;
+        let dim = 8;
+        // 行は通常のランダムフィクスチャ（振幅は小さくオーバーフロー
+        // ガードには抵触しない）を使い、クエリだけを手動で丸め誘発値へ
+        // 差し替える。
+        let fx = multi_query_fixture(row_count, dim, 1, 0x539_9a51);
+        let matrix = engine::batch_search::ResidentMatrix::build(
+            &fx.ids,
+            &fx.tenant_ids,
+            &fx.visibilities,
+            fx.dim,
+            &fx.vectors,
+        )
+        .expect("resident matrix build should succeed for well-formed fixture");
+
+        let backend = match GpuBatchBackend::try_new(matrix) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("gpu unavailable in this environment, skipping: {e}");
+                return;
+            }
+        };
+        if !backend.f16_arith_available() {
+            eprintln!("SHADER_F16 unavailable in this environment, skipping");
+            return;
+        }
+
+        let c = ctx("tenant-a");
+        // 2048.5 は f16 の分解能（この振幅で 2）で 2048 へ丸められ、
+        // `f16_round_trip_exact` が偽になる（doc「クエリ成分自体の f16
+        // パック時の丸め」節の反例）。振幅は F16_MAX_FINITE・オーバー
+        // フロー上界のいずれも超えないため、他のガードは働かず
+        // `has_precision_loss` 単独の効果を確認できる。
+        let mut query = vec![0.0f32; dim];
+        query[0] = 2048.5;
+        let bq = [BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &c,
+        }];
+
+        let stats_before = backend.stats();
+        let default_hits = backend
+            .batch_search(&bq)
+            .expect("default gpu batch_search should succeed once the device initialized");
+        let stats_after = backend.stats();
+        assert_eq!(
+            stats_after.f16_arith_dispatches - stats_before.f16_arith_dispatches,
+            0,
+            "precision-loss guard must prevent f16 arith dispatch for a non-round-trippable query"
+        );
+        assert!(
+            stats_after.f16_arith_guard_fallbacks > stats_before.f16_arith_guard_fallbacks,
+            "precision-loss guard fallback counter must increase when a query component cannot round-trip through f16"
+        );
+
+        let forced_unpack_hits = backend
+            .batch_search_with_options_for_tests(
+                &bq,
+                GpuSearchTestOptions {
+                    budget_bytes: 32 * 1024 * 1024,
+                    force_full_readback: false,
+                    dot_shader: Some(GpuDotShaderKind::Unpack),
+                },
+            )
+            .expect("forced unpack gpu batch_search should succeed");
+        let bits = |hits: &[engine::kernel::SearchHit]| -> Vec<(u64, u32)> {
+            let mut v: Vec<(u64, u32)> = hits.iter().map(|h| (h.id, h.score.to_bits())).collect();
+            v.sort_by_key(|(id, _)| *id);
+            v
+        };
+        assert_eq!(
+            bits(&default_hits[0].hits),
+            bits(&forced_unpack_hits[0].hits),
+            "guard-triggered default path must match forced-unpack path bit-identically"
+        );
+
+        let forced_f16_err = backend.batch_search_with_options_for_tests(
+            &bq,
+            GpuSearchTestOptions {
+                budget_bytes: 32 * 1024 * 1024,
+                force_full_readback: false,
+                dot_shader: Some(GpuDotShaderKind::F16Arith),
+            },
+        );
+        assert!(
+            forced_f16_err.is_err(),
+            "forcing f16 arith when the precision-loss guard rejects it must fail closed, not silently fall back"
         );
     }
 }
