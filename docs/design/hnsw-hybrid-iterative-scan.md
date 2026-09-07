@@ -352,34 +352,66 @@ Issue #465）」節のとおり、既定エンジン `hybrid_rrf` の `dense(B0)
   無条件に再 push すると同一ノードが `BinaryHeap` に重複して積まれるため、
   この重複防止に用いる——下記「再開手順」参照）・`candidates`
   （未展開の受理済みノード。`BinaryHeap<ScoredNode>`）・`discarded`
-  （`worst_ok` 不受理で候補ヒープへ一度も積まれなかったノード、および
-  `results.pop()` で `results` から追い出されたノード——後者は `expanded`
-  の有無を問わない。`candidates` と同じ `ScoredNode::Ord`——スコア降順・id
-  昇順の全順序）・`admitted`（これまでに受理されたノードとスコア。
-  ラウンド r の返却は `admitted` の上位 `k_r` 件）・直前ラウンドの `ef`
+  （**「まだ自己昇格していない」未受理ノード全体の集合**——`worst_ok`
+  不受理で候補ヒープへ一度も積まれなかったノード、および `results.pop()`
+  で `results` から追い出されたノード——後者は `expanded` の有無を問わない。
+  **除去は自己昇格の成功時のみ**——`candidates` へ push された（＝
+  `in_candidates` が立った）ことは `discarded` からの除去条件にしない。
+  この 2 つの集合（`discarded`＝自己昇格の再評価対象／`candidates`＋
+  `in_candidates`＝展開キューへの在庫）は独立な軸であり、1 ノードが
+  同時に両方へ属し得る（自己昇格に失敗しつつ展開キューには積まれている、
+  という状態が正常に存在する。下記「再開手順」参照）。`candidates` と
+  同じ `ScoredNode::Ord`——スコア降順・id 昇順の全順序）・`admitted`
+  （これまでに受理されたノードとスコア。ラウンド r の返却は `admitted`
+  の上位 `k_r` 件）・直前ラウンドの `ef`
 - **再開手順**: ラウンド r（`k_r > k_{r-1}`）では、まず `discarded` の
   **全ノード**（`expanded` の有無を問わない）について `ef_r =
   effective_ef(k_r)` の下で `worst_ok` を再評価し、満たすものは
-  `results`（および `admitted`）へ**直接**挿入する（自己昇格）。これは
-  discovery 時と同じ自己昇格処理を明示的に行うものであり、`candidates`
-  への合流だけでは代替できない——`search_layer_in` の while ループは
-  `candidates.pop()` した候補**自身**を `results` へ追加しない（隣接
-  ノードのうち `worst_ok` を満たすものだけを追加する）ため、discarded
-  ノードを `candidates` へ戻して pop させるだけでは、それ自身が新たな
-  `ef_r` の下で top-ef 相当になっていても `results` へは決して戻らない
-  （例: 起点 E（score=3）から A（2）、B（1）へ接続し、A/B の隣接が E のみの
-  場合、`ef₁=k₁=2` で `worst_ok` 不受理となり `discarded` へ入った B を、
+  `results`（および `admitted`）へ**直接**挿入し、**このときに限り**
+  `discarded` から除去する（自己昇格）。これは discovery 時と同じ
+  自己昇格処理を明示的に行うものであり、`candidates` への合流だけでは
+  代替できない——`search_layer_in` の while ループは `candidates.pop()`
+  した候補**自身**を `results` へ追加しない（隣接ノードのうち
+  `worst_ok` を満たすものだけを追加する）ため、discarded ノードを
+  `candidates` へ戻して pop させるだけでは、それ自身が新たな `ef_r` の
+  下で top-ef 相当になっていても `results` へは決して戻らない（例: 起点
+  E（score=3）から A（2）、B（1）へ接続し、A/B の隣接が E のみの場合、
+  `ef₁=k₁=2` で `worst_ok` 不受理となり `discarded` へ入った B を、
   自己昇格なしに `candidates` へ戻すだけで `ef₂=k₂=3` を再開しても、B の
   隣接はすべて visited 済みで新規発見が無いため `results` は `{E, A}` の
   2 件のまま——`k₂=3` の期待件数を満たせず `masked_short` へ縮退しうる。
   自己昇格を先に行えば `worst_ok` 再評価で B が `results` へ直接復帰し
   3 件になる）。
-  **自己昇格の成否によらず**、discarded から見つかった各ノードのうち
-  `expanded` が未設定であり、かつ `in_candidates` が未設定（＝
-  `candidates` ヒープに在庫が無い）のものは `candidates` へ push し
-  `in_candidates` を立てる（この時点で `discarded` からは除去する）。
-  **自己昇格したノードもこの対象に含める**——自己昇格は「そのノードを
-  `results`／`admitted` へ復帰させる」操作であり、`search_layer_in` の
+
+  **`discarded` からの除去条件は自己昇格の成功のみであり、`candidates`
+  への push とは独立**（codex-review 指摘・PR #589）。自己昇格の成否に
+  関わらず、discarded から見つかった各ノードのうち `expanded` が未設定
+  であり、かつ `in_candidates` が未設定（＝`candidates` ヒープに在庫が
+  無い）のものは `candidates` へ push し `in_candidates` を立てるが、
+  **この push は `discarded` からの除去を伴わない**——自己昇格に**失敗**
+  したノードは `expanded`／`in_candidates` の状態と無関係に `discarded`
+  に残り続け、次ラウンド以降も `worst_ok` の再評価対象になり続ける（1
+  ノードが `discarded`（自己昇格の再評価対象）と `candidates`＋
+  `in_candidates`（展開キューの在庫）の両方に同時に属する状態が正常に
+  存在する）。旧版はこの push を「discarded からの除去」と誤って結び
+  付けており（自己昇格の成否によらず除去）、次の反例で結果件数の下限を
+  満たせないことが判明した（codex-review・PR #589 指摘）: 起点 E
+  （score=10）から葉 7 個 L1〜L7（score=9〜3。すべて E のみに接続する
+  星型グラフ）へ接続し、`ef` を `k` として 2→4→8 と拡張する。ラウンド 1
+  （`ef=2`）で E・L1 が受理され L2〜L7 は `discarded` へ入る。ラウンド 2
+  （`ef=4`）で自己昇格を再評価すると L2・L3 が新たに受理されるが、
+  L4〜L7 は依然 `worst_ok` 不受理のまま——旧版はここで L4〜L7 を
+  （push 対象であることを理由に）`discarded` から除去してしまうため、
+  ラウンド 3（`ef=8`）の開始時点で `discarded` が空になり、L4〜L7 は
+  二度と自己昇格の再評価を受けられない。`candidates` に積まれた L4〜L7
+  は葉ノードで隣接が E のみ（visited 済み）のため pop されても新規発見
+  が無く、`results` は 4 件のまま `k₃=8` を満たせず `masked_short` へ
+  不要に縮退する。修正版（除去を自己昇格成功時のみに限定）では L4〜L7
+  は `discarded` に残ったままラウンド 3 を迎え、`ef₃=8` の下での
+  `worst_ok` 再評価で全員が受理され 8 件そろう。
+
+  **自己昇格したノードもこの push 対象に含める**——自己昇格は「そのノード
+  を `results`／`admitted` へ復帰させる」操作であり、`search_layer_in` の
   while ループの構造上、「そのノード自身の隣接を展開する」操作を代替
   しない（`candidates.pop()` した候補自身は `results` へ追加されないのと
   対称に、`results`／`admitted` へ直接挿入された候補も自動では展開され
@@ -395,7 +427,8 @@ Issue #465）」節のとおり、既定エンジン `hybrid_rrf` の `dense(B0)
   自己昇格の成否と無関係に未展開ノードを候補へ戻す必要がある）。
   `expanded` 済みのノードは自己昇格のみを行い `candidates` へは戻さない
   ——隣接ノードは既に走査済み（`visited` 済み）のため再度 pop して隣接
-  走査しても新規の候補は一切生まれず、二重の展開コストにしかならない。
+  走査しても新規の候補は一切生まれず、二重の展開コストにしかならない
+  （自己昇格に失敗した場合は上記のとおり `discarded` に残り続ける）。
   続いて `search_layer_in` の while ループを**同じ停止条件・同じ受理
   判定（`worst_ok`）**のまま続行する（上位層の貪欲降下〔`ef=1`〕は
   再実行しない——層 0 の状態のみを再開する）。`candidates.pop()` 時にも
@@ -404,7 +437,10 @@ Issue #465）」節のとおり、既定エンジン `hybrid_rrf` の `dense(B0)
   込んでも二重展開にならないようにする多重の安全策であり、これにより
   **ノード 1 個あたりの実質的な隣接走査は同一クエリの全ラウンドを通じて
   高々 1 回**になり、下記「停止性契約」の「全ラウンド合計の展開数は
-  高々 N」が成立する
+  高々 N」が成立する（`discarded` からの除去を自己昇格成功時のみに
+  限定しても、`discarded` の要素数は依然として高々 N であり——除去
+  されないノードも `expanded` が立てば再度 `candidates` へ push
+  されない——下記「メモリ上限」の見積りは変わらない）
 - **停止条件は `peek` で判定し、打ち切り候補を消失させない**: 現行の
   `search_layer_in` は `candidates.pop()` で候補を取り出してから
   `results.peek()` に対する停止条件（`worst_ok` の否定）を判定するため、
@@ -430,7 +466,16 @@ Issue #465）」節のとおり、既定エンジン `hybrid_rrf` の `dense(B0)
   タイミングを条件判定の前後どちらに置いても最終的な `results` の内容は
   同一であり、下記「実装方針」節の「ラウンド 1 の bit 同一性」契約は
   保たれる。相違が生じるのは関数終了後の `candidates` ヒープの残存状態
-  のみであり、これは再開型のみが参照する
+  のみであり、これは再開型のみが参照する。**peek で停止し `candidates`
+  に残ったノードの自己昇格経路**（Cursor Bugbot 指摘・PR #589）: この
+  ノードは「上記『再開手順』の訂正——`discarded` からの除去は自己昇格
+  成功時のみ」により、`candidates`（展開キューの在庫）に残ることと
+  `discarded`（自己昇格の再評価対象）に残ることが独立に両立する。
+  したがって次ラウンド以降、このノードが `candidates` から pop されて
+  展開されるかどうかに関わらず、ラウンド先頭の自己昇格ステップが
+  `discarded` を経由して毎ラウンド `worst_ok` を再評価し続けるため、
+  `results`／`admitted` への復帰経路が `candidates` の pop タイミングに
+  依存して失われることはない
 - **メモリ上限**: visited・`expanded`・`in_candidates` はいずれも
   `⌈N/64⌉` 語（N は索引ノード数）のビットマップ、`candidates`／
   `discarded` の要素数はいずれも高々 N、`admitted` も高々 N。
@@ -563,14 +608,21 @@ Issue の見出し「再開型にしても融合結果・境界同点グルー�
   discarded, admitted, visited, expanded, in_candidates }` に対する
   `run(ef)`」へ再構成し、ラウンド開始時に `discarded` 全ノードへ
   `worst_ok` 再評価 → 満たすものは `results`／`admitted` への自己昇格を
-  行う。その成否によらず、見つかった各ノードのうち `expanded` 未設定かつ
-  `in_candidates` 未設定のものを `candidates` へ push し `in_candidates`
-  を立てたうえで `discarded` から除去する（**自己昇格したノードも対象に
-  含める**——上記「状態保持契約」参照。自己昇格を欠くと `candidates` の
-  pop 処理がノード自身を `results` へ追加しないため discarded ノードが
-  恒久的に失われ、逆に自己昇格したノードを `candidates` へ戻さないと
-  そのノード自身の隣接が展開されないまま残る——どちらか一方だけでは
-  不十分）。while ループの停止条件判定は `candidates.peek()` で行い
+  行い、**このときに限り** `discarded` から除去する。**自己昇格の成否と
+  `discarded` からの除去を混同しない**（codex-review 指摘・PR #589。旧版は
+  push 対象になったことを理由に自己昇格の成否によらず除去しており、失敗
+  ノードが以後の自己昇格再評価から永久に外れ、結果件数の下限を満たせなく
+  なる反例〔星型グラフ・上記「再開手順」節〕があった）。自己昇格の成否
+  によらず、見つかった各ノードのうち `expanded` 未設定かつ `in_candidates`
+  未設定のものを `candidates` へ push し `in_candidates` を立てる——この
+  push は `discarded` の状態を変えない（自己昇格に失敗したノードは
+  `discarded` に残ったまま `candidates` にも同時に存在し得る）
+  （**自己昇格したノードも push 対象に含める**——上記「状態保持契約」
+  参照。自己昇格を欠くと `candidates` の pop 処理がノード自身を
+  `results` へ追加しないため discarded ノードが恒久的に失われ、逆に
+  自己昇格したノードを `candidates` へ戻さないとそのノード自身の隣接が
+  展開されないまま残る——どちらか一方だけでは不十分）。while ループの
+  停止条件判定は `candidates.peek()` で行い
   （上記「状態保持契約」の「停止条件は `peek` で判定し」参照）、停止が
   成立する場合は候補を pop せず `candidates`／`in_candidates` に残したまま
   ラウンドを終える。停止が成立しない場合のみ `candidates.pop()` して
@@ -603,7 +655,11 @@ Issue の見出し「再開型にしても融合結果・境界同点グルー�
   `search_layer_in(ef₁)`）、exhaustive 終了時の厳密性（brute-force 対照と
   完全一致）、同一入力に対する再現性、`discarded` を合流しない実装との
   差分が非 vacuous であること（合流しないと結果が変わる入力が存在する
-  ことの確認）
+  ことの確認）、**`discarded` からの除去を自己昇格成功時のみに限定する
+  契約の回帰テスト**（上記「再開手順」節の星型グラフ反例に対応する
+  固定フィクスチャで `ef` を 2→4→8 と複数ラウンド拡張し、各ラウンド後の
+  `results.len()` が `min(k_r, visible)` を満たすこと・最終ラウンドで
+  `masked_short` へ誤縮退しないことを固定。codex-review 指摘・PR #589）
 - 結合（`tests/hnsw_hybrid_refetch.rs`・`tests/hnsw_cache.rs`）: 既存の
   停止性（`hybrid_rounds_max <= 8`）・複数ラウンドの実発生
   （`hybrid_rounds_max >= 2`）・3 回実行の bit 一致・既定エンジン対照
