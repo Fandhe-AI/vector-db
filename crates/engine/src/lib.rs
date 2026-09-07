@@ -73,7 +73,10 @@
 //! `gpu_batch.rs` が `wgpu`（=30.0.1。依存追加はオーナー承認済み〔2026-08-26〕。
 //! `crates/engine/Cargo.toml` コメント参照）を用いた実 GPU バックエンドを提供し、
 //! `batch_fallback.rs::FallbackBatchEngine::build_with_gpu` から primary として
-//! 差し込める（詳細は `gpu_batch.rs` モジュールドキュメント参照）。
+//! 差し込める（詳細は `gpu_batch.rs` モジュールドキュメント参照）。Issue #542
+//! では `gpu_batch::packed_i8::GpuI8BatchBackend` として i8 パック常駐・
+//! `dot4I8Packed` シェーダによる opt-in 候補生成経路（最終スコアは f32 再計算。
+//! primary へは未接続）を追加した（詳細は `gpu-batch-i8-packed.md` 参照）。
 //!
 //! TASK-161（対象ビヘイビア: SQL-12）: `sql::mode` が取得モード（`recall`／
 //! `precision`）の構文（`USING MODE` 句・`SET search_mode`）・優先順位解決
