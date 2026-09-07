@@ -59,6 +59,28 @@ pub enum DotKernelError {
     NonFiniteResult,
     /// スカラー参照実装との数値差が許容差を超えた。
     ToleranceExceeded { actual: f32, expected: f32 },
+    /// tail A/B の分岐なし（padded）実装と現行スカラー実装の `to_bits()` が
+    /// 一致しなかった（Issue #529。両方式はビット同一である契約
+    /// 〔`docs/design/dot-kernel-branchless-tail.md`〕のため、この不一致は
+    /// 実測値を出さず即座に拒否すべき破損入力・実装退行を示す）。
+    BitMismatch {
+        dim: usize,
+        row: usize,
+        scalar_bits: u32,
+        padded_bits: u32,
+    },
+    /// `BENCH_DOT_KERNEL_TAIL_AB` env の値が固定語彙（未設定・`"0"`・`"1"`）に
+    /// 一致しなかった（fail-closed。coding-rust.md「untrusted 入力」の env 版）。
+    InvalidEnv {
+        name: &'static str,
+        reason: &'static str,
+    },
+    /// 統計算出対象のサンプル列が空だった（[`min_of_samples`]／[`relative_band`]）。
+    EmptySamples,
+    /// [`relative_band`] の算出時、値列に非有限（NaN/inf）が含まれる、または
+    /// 分母（最小値）が 0 以下だった（fail-closed。ゼロ除算・NaN 判定による
+    /// 暗黙の fail-open を防ぐ）。
+    NonFiniteOrNonPositiveBand,
 }
 
 impl fmt::Display for DotKernelError {
@@ -82,11 +104,61 @@ impl fmt::Display for DotKernelError {
                 f,
                 "dot result outside tolerance: actual={actual} expected={expected}"
             ),
+            DotKernelError::BitMismatch {
+                dim,
+                row,
+                scalar_bits,
+                padded_bits,
+            } => write!(
+                f,
+                "tail A/B bit mismatch at dim={dim} row={row}: scalar_tail_bits={scalar_bits:#010x} \
+                 padded_tail_bits={padded_bits:#010x}"
+            ),
+            DotKernelError::InvalidEnv { name, reason } => {
+                write!(f, "invalid value for {name}: {reason}")
+            }
+            DotKernelError::EmptySamples => write!(f, "empty sample set"),
+            DotKernelError::NonFiniteOrNonPositiveBand => write!(
+                f,
+                "relative_band input contains a non-finite value or a non-positive minimum"
+            ),
         }
     }
 }
 
 impl std::error::Error for DotKernelError {}
+
+/// Issue #529 の tail A/B 実測対象 dim（端数長の異なる境界を選定。ステータス行・
+/// `docs/design/dot-kernel-branchless-tail.md`「#529 への申し送り」節参照）。
+/// dim=768 は AVX2（LANES=8）・AVX-512（LANES=16）いずれでも端数ゼロだが、
+/// `padded_tail_sum` は端数が空でも `LANES` 個の零埋め要素の積和を実行するため
+/// 「変更を含まない区間」ではなく定数上乗せコストの実測点として意味を持つ。
+pub const TAIL_AB_DIMS: [usize; 3] = [100, 129, 768];
+
+/// tail A/B セクション（`BENCH_DOT_KERNEL_TAIL_AB`）の有効・無効状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailAbMode {
+    /// 従来どおり `label=current` の 10 ステージ・診断 A/B のみを実行する。
+    Off,
+    /// dim 100／129／768 の tail A/B（`dot_with_scalar_tail` vs
+    /// `dot_with_padded_tail`）を追加実行する。
+    On,
+}
+
+/// `BENCH_DOT_KERNEL_TAIL_AB` env の生値を解釈する純関数。未設定は `Off`、
+/// `"0"` は `Off`、`"1"` は `On`、それ以外（空文字含む）は fail-closed に拒否する
+/// （coding-rust.md の env 版。本ベンチは opt-in のためデフォルト無効を安全側とする）。
+pub fn parse_tail_ab_env(raw: Option<&str>) -> Result<TailAbMode, DotKernelError> {
+    match raw {
+        None => Ok(TailAbMode::Off),
+        Some("0") => Ok(TailAbMode::Off),
+        Some("1") => Ok(TailAbMode::On),
+        Some(_) => Err(DotKernelError::InvalidEnv {
+            name: "BENCH_DOT_KERNEL_TAIL_AB",
+            reason: "expected unset, \"0\", or \"1\"",
+        }),
+    }
+}
 
 /// `GITHUB_ACTIONS` 下での実行を拒否する（`harness::hybrid_latency::
 /// refuse_under_github_actions` と同一パターン）。
@@ -252,4 +324,96 @@ pub fn check_matches_scalar_reference(
         return Err(DotKernelError::ToleranceExceeded { actual, expected });
     }
     Ok(())
+}
+
+/// `actual`（分岐なし tail）が `expected`（現行スカラー tail）と `to_bits()` で
+/// 完全一致するか検証する（Issue #529。両方式はビット同一である契約
+/// 〔`docs/design/dot-kernel-branchless-tail.md`〕のため許容差を設けない）。
+pub fn check_bit_identical(
+    dim: usize,
+    row: usize,
+    scalar_tail: f32,
+    padded_tail: f32,
+) -> Result<(), DotKernelError> {
+    if scalar_tail.to_bits() != padded_tail.to_bits() {
+        return Err(DotKernelError::BitMismatch {
+            dim,
+            row,
+            scalar_bits: scalar_tail.to_bits(),
+            padded_bits: padded_tail.to_bits(),
+        });
+    }
+    Ok(())
+}
+
+/// 所要時間サンプル列の最小値を取る（`stats::Summary` に `min` フィールドが
+/// 無いため、`ab::run_ab`／`protocol::run` が返す `Measurement::samples`
+/// （生サンプル列）から呼び出し側が算出する。§3 の min-of-N 統計量用）。
+pub fn min_of_samples(samples: &[Duration]) -> Result<Duration, DotKernelError> {
+    samples
+        .iter()
+        .copied()
+        .min()
+        .ok_or(DotKernelError::EmptySamples)
+}
+
+/// `values`（同一計測セッションで得た参照区間の run 値列。単位は任意で一貫していれば
+/// よい。呼び出し元は通常 ns や µs 換算後の `f64` を渡す）から相対実測帯
+/// `(max - min) / min` を算出する（`docs/design/benchmark-judgement-policy.md`
+/// §4「実測帯」の定義そのもの）。空入力・非有限値・0 以下の最小値は
+/// fail-closed に拒否する（ゼロ除算・NaN 判定による暗黙の fail-open を防ぐ）。
+pub fn relative_band(values: &[f64]) -> Result<f64, DotKernelError> {
+    if values.is_empty() {
+        return Err(DotKernelError::EmptySamples);
+    }
+    if values.iter().any(|v| !v.is_finite()) {
+        return Err(DotKernelError::NonFiniteOrNonPositiveBand);
+    }
+    // `f64` は `Ord` を実装しないため `min`/`max` の代わりに `fold` で比較する
+    // （NaN は上の `is_finite` チェックで既に排除済み）。
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if min <= 0.0 {
+        return Err(DotKernelError::NonFiniteOrNonPositiveBand);
+    }
+    Ok((max - min) / min)
+}
+
+/// tail A/B（`label` は `"scalar_tail"`／`"padded_tail"`）の 1 行分を整形する。
+/// `render_line` の `dot_kernel: label=current ...` 形式とプレフィックスを変え
+/// （`dot_kernel: tail_ab ...`）、`chip.rs::parse_dot_kernel_line`（`label=current`
+/// のみを拾う）と衝突しないようにする。
+#[allow(clippy::too_many_arguments)]
+pub fn render_tail_ab_line(
+    label: &str,
+    dim: usize,
+    rows: usize,
+    min: Duration,
+    median: Duration,
+    ratio_min: f64,
+    ratio_median: f64,
+    class: ChangeClass,
+) -> String {
+    format!(
+        "dot_kernel: tail_ab label={label} dim={dim} rows={rows} min_us={:.3} median_us={:.3} \
+         ratio_min={ratio_min:.4} ratio_median={ratio_median:.4} class={class:?}",
+        min.as_secs_f64() * 1e6,
+        median.as_secs_f64() * 1e6,
+    )
+}
+
+/// tail A/B の参照区間（production 経路 `isa::current().dot`）1 行分を整形する。
+/// `reference_band`（§4 の実測帯・相対比率）は複数 run を集計した後にのみ確定する
+/// ため、1 run 分のこの行には含めない（呼び出し元が run 間で別途集計する）。
+pub fn render_tail_ab_reference_line(
+    dim: usize,
+    rows: usize,
+    min: Duration,
+    median: Duration,
+) -> String {
+    format!(
+        "dot_kernel: tail_ab_ref dim={dim} rows={rows} min_us={:.3} median_us={:.3}",
+        min.as_secs_f64() * 1e6,
+        median.as_secs_f64() * 1e6,
+    )
 }
