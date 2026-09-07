@@ -261,11 +261,13 @@ psql の `SELECT COUNT(*)` は 45 ms → 約 3.7 ms。
 `SHADER_F16` 対応アダプタで読み出し直後に f32 へ拡張して積和する経路）の
 前後比較を実施した。クエリが f16 へ厳密往復可能な場合のみシェーダが
 切り替わる契約（`select_dot_shader`）のため、opt-in `BENCH_GPU_SCALING_
-QUERY_F16_EXACT=1` でクエリを丸めない限り本表の実測は unpack 版のままで
-不変。CORE-16 ゲート・規模点診断のクエリ生成も同じ理由で構造的に
-f16 算術版を経由しない。詳細・実測値は `gpu-batch-f16-arith.md`
-「8. 前後比較実測（Issue #540）」節・`core16-f16-resident-gate.md`
-「Issue #540 追記」節参照。
+QUERY_F16_EXACT=1` でクエリを丸めない限り本表が選択する S0 シェーダは
+unpack 版のままで不変（`AdaptiveShaderSelector::resolve` は呼び出しごとに
+f16 算術版ガードを評価してから縮退するため、性能への影響がないとは断定
+しない）。CORE-16 ゲート・規模点診断のクエリ生成も同じ理由で選択される
+シェーダが構造的に不変（f16 算術版を経由しない）。詳細・実測値は
+`gpu-batch-f16-arith.md`「8. 前後比較実測（Issue #540）」節・
+`core16-f16-resident-gate.md`「Issue #540 追記」節参照。
 
 **（2026-09-07 追記・Issue #543）** opt-in 専用の i8 パック常駐経路
 （`engine::gpu_batch::packed_i8::GpuI8BatchBackend`。Issue #542。候補生成

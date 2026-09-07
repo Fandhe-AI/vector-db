@@ -192,9 +192,12 @@ BENCH_CORE16_DIAG=1 \
 **常に unpack 版シェーダへ縮退する**（クエリが f16 へ厳密往復できないため。
 `select_dot_shader` 条件 5）。したがって:
 
-- **CORE-16 ゲート本体・規模点診断は #539 導入前後で構造的に不変**
-  （本 doc の実測・判断は #539 の影響を一切受けない。以下は #540 で
-  実測した確定的カウンタによる裏付け）
+- **CORE-16 ゲート本体・規模点診断が選択する S0 シェーダは #539 導入前後で
+  不変（常に unpack 版）**——ただし `AdaptiveShaderSelector::resolve` は
+  #539 導入後も呼び出しごとに f16 算術版の選択可否ガード（`select_dot_shader`
+  条件 5 等）を評価してから unpack 版へ縮退するため、追加の分岐評価コスト
+  自体がゼロになったとは断定しない（本追記が確認したのは選択結果の不変のみ）。
+  以下は #540 で実測した確定的カウンタによる裏付け
 - ゲート本体（`BENCH_CORE16=1`。rows=20,000・dim=256・batch=8）:
   `f16_arith_available=true f16_arith_dispatches=0 f16_arith_guard_fallbacks=40`
 - 規模点診断（`BENCH_CORE16_DIAG=1 BENCH_CORE16_DIAG_SCALE_INDEX=0`。
@@ -223,4 +226,4 @@ fixture（`build_scaled_gate_dataset`）を f16 厳密往復可能なクエリ�
 
 | 環境 | opt-in 実行 | 結果 |
 | --- | --- | --- |
-| 本開発環境（NVIDIA GeForce RTX 3060・Vulkan backend） | 実施済み（Issue #540。上記の確定的カウンタ実測） | CORE-16 ゲート・診断は #539 導入前後で構造的に不変（unpack 版のまま）。placeholder 閾値に対する pass/fail の再判定は本追記の対象外（Environment `bench-gate` secrets・管理者作業） |
+| 本開発環境（NVIDIA GeForce RTX 3060・Vulkan backend） | 実施済み（Issue #540。上記の確定的カウンタ実測） | CORE-16 ゲート・診断が選択する S0 シェーダは #539 導入前後で不変（unpack 版のまま。`AdaptiveShaderSelector::resolve` 自体は呼び出しごとに f16 算術版ガードを評価してから縮退するため、性能への影響がないとは断定しない）。placeholder 閾値に対する pass/fail の再判定は本追記の対象外（Environment `bench-gate` secrets・管理者作業） |
