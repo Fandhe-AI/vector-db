@@ -346,8 +346,8 @@ before n=6／after n=5）**
   ratio ≈ 1.02 で変化なし。これは #532 の設計（`PolicyContext` 単位にまとめた
   複数クエリの償却）が単発クエリには効かないサニティ確認であり、退行ではない
 - **batch≥64（20k・100k・500k の 3 点）はいずれも固定 ±5% 帯・参照区間実測帯の
-  両方を明確に超える改善**: ratio 0.33〜0.48（f16 GPU が CPU-SIMD の
-  2.1〜3.0 倍高速）。旧実測表（batch≥64 で 0.94〜0.99x＝ほぼ同着）から
+  両方を明確に超える改善**: ratio 0.33〜0.48（変更前 GPU f16 に対して
+  2.1〜3.0 倍高速。CPU-SIMD との比較は別掲の「speedup vs CPU-SIMD」を参照）。旧実測表（batch≥64 で 0.94〜0.99x＝ほぼ同着）から
   明確に改善方向へ転じており、#532 が狙った「常駐行列の行データ読み込みを
   タイル幅ぶんのクエリで償却する」効果が実測でも確認できた
 - **speedup vs CPU-SIMD（after, 中央値ベース）**: 20,000×128×64 で 2.97x、
@@ -360,6 +360,17 @@ before n=6／after n=5）**
 - **未計測点**: rows∈{20000,100000,500000}×dim∈{128,256}×batch∈{1,8,64,256}
   の残り 17 点（dim=256 全点・batch=256 全点・20,000×128×1・500,000×128×8 等）
   は時間予算の都合で未計測。旧実測表の対応値をそのまま代用しない
+- **per-run 生データの所在（codex-review P1 指摘・PR #580）**: 本測定時点の
+  `scripts/bench_gpu_scaling_ab.sh` は各 run のログ・`summary.tsv` を
+  `_/bench/gpu-scaling-ab/`（`.gitignore` 対象）へのみ出力し、tracked な保存先
+  へ複製する運用が無かったため、上表の集約値（min/median）を導出した各 run の
+  生データ（`cpu_p50`/`cpu_p95`/`f16_p50`/`f16_p95`/`mismatch` 等）は本測定回に
+  ついては失われており復元できない。以後の計測では `summary.tsv` を
+  `docs/design/bench-data/gpu-scaling-ab/<UTC timestamp>-summary.tsv` として
+  リポジトリへコミットし、本ドキュメントの実測表からそのパスを参照する運用に
+  改める（スクリプト側の対応する注記は `scripts/bench_gpu_scaling_ab.sh` 冒頭
+  コメント参照）。上表を新たな `summary.tsv` の裏付けで置き換える再計測は
+  別 Issue の対象とする
 
 **再現手順**:
 
