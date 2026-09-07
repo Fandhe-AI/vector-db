@@ -653,12 +653,13 @@ fn measure_category_recall_via_hnsw(
     vocab_size: usize,
     baseline_query_fn: impl Fn(usize, &PairQa) -> (String, Vec<f32>),
     client: &dyn LlmClient,
+    engine: RecallEngine,
 ) -> (CategoryRecallResult, AnnStats) {
     let rows: Vec<(u64, Vec<f32>, String)> = docs
         .iter()
         .map(|d| (d.id, d.vector.clone(), d.text.clone()))
         .collect();
-    let fixture = SqlHybridFixture::new(vocab_size as u32, &rows, RecallEngine::Hnsw);
+    let fixture = SqlHybridFixture::new(vocab_size as u32, &rows, engine);
 
     let mut total_correct = 0usize;
     let mut baseline_hits20 = 0usize;
@@ -700,15 +701,18 @@ fn measure_category_recall_via_hnsw(
 
 /// 非 vacuous 統計を数値を含まない形式でログへ出す（`hybrid_recall.rs::
 /// print_ann_stats` と同型の複製）。
-fn print_ann_stats(gate: &str, stats: &AnnStats) {
+fn print_ann_stats(gate: &str, engine: RecallEngine, stats: &AnnStats) {
     println!(
-        "{gate}: engine=hnsw builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={}",
+        "{gate}: engine={} builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={} f16_residency_fallbacks={} f16_kernel={:?}",
+        engine.token(),
         stats.builds,
         stats.build_failures,
         stats.rebuilds,
         stats.hybrid_dense_searches,
         stats.hybrid_queries,
         stats.ef_cap_fallbacks,
+        stats.f16_residency_fallbacks,
+        engine::isa::current_f16(),
     );
 }
 
@@ -1202,16 +1206,18 @@ fn query_planning_recall_threshold_gate() {
             measure_category_recall(&docs, &pairs, VOCAB_SIZE, direct_baseline),
             measure_category_recall(&docs, &pairs, VOCAB_SIZE, intent_baseline),
         ),
-        RecallEngine::Hnsw => {
+        RecallEngine::Hnsw | RecallEngine::HnswF16 => {
             let (direct, direct_stats) = measure_category_recall_via_hnsw(
                 &docs,
                 &pairs,
                 VOCAB_SIZE,
                 direct_baseline,
                 &MockLlmClient,
+                engine,
             );
             print_ann_stats(
                 "query_planning_recall_threshold_gate(direct)",
+                engine,
                 &direct_stats,
             );
             let (intent, intent_stats) = measure_category_recall_via_hnsw(
@@ -1220,9 +1226,11 @@ fn query_planning_recall_threshold_gate() {
                 VOCAB_SIZE,
                 intent_baseline,
                 &MockLlmClient,
+                engine,
             );
             print_ann_stats(
                 "query_planning_recall_threshold_gate(intent)",
+                engine,
                 &intent_stats,
             );
             (direct, intent)
@@ -1285,16 +1293,18 @@ fn query_planning_recall_threshold_gate() {
                     intent_baseline,
                     &NoisyLlmClient,
                 ),
-                RecallEngine::Hnsw => {
+                RecallEngine::Hnsw | RecallEngine::HnswF16 => {
                     let (r, stats) = measure_category_recall_via_hnsw(
                         &docs,
                         &pairs,
                         VOCAB_SIZE,
                         intent_baseline,
                         &NoisyLlmClient,
+                        engine,
                     );
                     print_ann_stats(
                         "query_planning_recall_threshold_gate(intent_degraded)",
+                        engine,
                         &stats,
                     );
                     r
@@ -1370,15 +1380,20 @@ fn query_planning_recall_large_scale_threshold_gate() {
         RecallEngine::BruteForce => {
             measure_category_recall(&docs, &pairs, LARGE_VOCAB_SIZE, direct_baseline)
         }
-        RecallEngine::Hnsw => {
+        RecallEngine::Hnsw | RecallEngine::HnswF16 => {
             let (r, stats) = measure_category_recall_via_hnsw(
                 &docs,
                 &pairs,
                 LARGE_VOCAB_SIZE,
                 direct_baseline,
                 &MockLlmClient,
+                engine,
             );
-            print_ann_stats("query_planning_recall_large_scale_threshold_gate", &stats);
+            print_ann_stats(
+                "query_planning_recall_large_scale_threshold_gate",
+                engine,
+                &stats,
+            );
             r
         }
     };
