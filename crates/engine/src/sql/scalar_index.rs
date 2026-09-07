@@ -676,6 +676,62 @@ impl ScalarIndex {
         Some(result)
     }
 
+    /// `column_index` 列（`TEXT` 列限定）の値ごとのグループを、値のバイト列
+    /// 昇順（[`Self::build`] の `TextColumnIndex.values` と同じ順序）で列挙する
+    /// （Issue #475: `sql::group_by` の `WHERE` なし `GROUP BY` 列挙形が使う）。
+    /// 列が `TEXT` でない・未知の列は `None`。各グループのスロット列は昇順。
+    /// [`Self::build`] は該当列の非 `NULL` 値を**すべて**索引化するか（成功）、
+    /// 予算超過等で索引全体の構築を諦めるか（`Err`。この場合キャッシュに
+    /// エントリ自体が存在しない）のいずれかであり、一部の値だけを欠落させたまま
+    /// 索引を返すことはないため（モジュールドキュメント「データモデル」・
+    /// [`Self::build`] 参照）、ここで列挙される値は当該列の可視行が実際に
+    /// 持つ非 `NULL` 値の**全体**である（一部スキップによる取りこぼしを呼び
+    /// 出し元が心配する必要はない）。
+    pub(crate) fn column_groups(
+        &self,
+        column_index: usize,
+    ) -> Option<impl Iterator<Item = (&str, &[u32])> + '_> {
+        let column = self.columns.get(column_index)?.as_ref()?;
+        Some((0..column.values.len()).filter_map(move |i| {
+            let value = column.values.get(i)?.as_str();
+            let value_index = u32::try_from(i).ok()?;
+            let slots = column.slots_for_value_index(value_index)?;
+            Some((value, slots))
+        }))
+    }
+
+    /// `column_index` 列（`TEXT` 列限定）が `NULL`（＝索引のどの値エントリにも
+    /// 現れない）である可視行のスロットを昇順で返す（Issue #475:
+    /// `sql::group_by` の `WHERE` なし `GROUP BY` 列挙形が NULL グループを
+    /// 補完するために使う）。列が `TEXT` でない・未知の列は `None`。
+    ///
+    /// `row_count`（索引構築時の全スロット数）長のビットマップで索引済み全値の
+    /// スロットを被覆し、被覆されなかったスロットを NULL とみなす。
+    /// [`Self::build`] のドキュメントどおり「索引化された値の集合」は当該列の
+    /// 非 `NULL` 値の全体であるため、この差分計算は正確に NULL 行と一致する
+    /// （`declarative_filter::MetadataFilter::matches` の NULL 常時不一致判定と
+    /// 同じ意味論。モジュールドキュメント参照）。
+    pub(crate) fn slots_without_value(&self, column_index: usize) -> Option<Vec<u32>> {
+        let column = self.columns.get(column_index)?.as_ref()?;
+        let mut covered: Vec<bool> = Vec::new();
+        covered.try_reserve_exact(self.row_count).ok()?;
+        covered.resize(self.row_count, false);
+        for &slot in &column.slots {
+            if let Some(flag) = covered.get_mut(slot as usize) {
+                *flag = true;
+            }
+        }
+        let mut out: Vec<u32> = Vec::new();
+        for (idx, &is_covered) in covered.iter().enumerate() {
+            if !is_covered {
+                let slot = u32::try_from(idx).ok()?;
+                out.try_reserve(1).ok()?;
+                out.push(slot);
+            }
+        }
+        Some(out)
+    }
+
     /// `id` に対する範囲述語（単純比較）向け照会。`id_index` が `None`
     /// （`id > 2^53` を含む行がある）の場合は `None`（呼び出し元が全走査へ
     /// 縮退する契機。モジュールドキュメント参照）。戻り値は昇順 `Vec<u32>`。
@@ -874,6 +930,15 @@ pub struct ScalarIndexCacheStats {
     /// 回数（`FallbackNoIndex`／`FallbackSelectivity`／同一性ガード不一致
     /// いずれも含む）。
     pub plain_scan_fallbacks: u64,
+    /// Issue #475: `sql::aggregate`／`sql::group_by` が索引経路（候補走査・
+    /// `GROUP BY` キー列挙形）を実際に消費して集計クエリを実行した回数
+    /// （`index_scans`/`plain_scan_fallbacks` と別枠。SELECT 経路の消費と
+    /// 区別する）。
+    pub aggregate_index_scans: u64,
+    /// Issue #475: 集計・`GROUP BY` クエリが索引対応述語・形状を持ちながら
+    /// 全走査へ縮退した回数（`FallbackNoIndex`／`FallbackSelectivity`／
+    /// 同一性ガード不一致／構築断念／NULL 補完不能のいずれも含む）。
+    pub aggregate_plain_scan_fallbacks: u64,
 }
 
 struct ScalarIndexCacheEntry {
@@ -900,6 +965,8 @@ pub(crate) struct ScalarIndexCache {
     build_failures: AtomicU64,
     index_scans: AtomicU64,
     plain_scan_fallbacks: AtomicU64,
+    aggregate_index_scans: AtomicU64,
+    aggregate_plain_scan_fallbacks: AtomicU64,
 }
 
 impl ScalarIndexCache {
@@ -915,6 +982,8 @@ impl ScalarIndexCache {
             build_failures: AtomicU64::new(0),
             index_scans: AtomicU64::new(0),
             plain_scan_fallbacks: AtomicU64::new(0),
+            aggregate_index_scans: AtomicU64::new(0),
+            aggregate_plain_scan_fallbacks: AtomicU64::new(0),
         }
     }
 
@@ -1079,6 +1148,10 @@ impl ScalarIndexCache {
             entries,
             index_scans: self.index_scans.load(Ordering::Relaxed),
             plain_scan_fallbacks: self.plain_scan_fallbacks.load(Ordering::Relaxed),
+            aggregate_index_scans: self.aggregate_index_scans.load(Ordering::Relaxed),
+            aggregate_plain_scan_fallbacks: self
+                .aggregate_plain_scan_fallbacks
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1100,6 +1173,20 @@ impl ScalarIndexCache {
     /// 索引↔スナップショット同一性ガード不一致のいずれも呼ぶ）。
     pub(crate) fn record_plain_scan_fallback(&self) {
         self.plain_scan_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #475: `sql::aggregate`／`sql::group_by` が索引経路（候補走査・
+    /// `GROUP BY` キー列挙形）を実際に消費して集計クエリを実行したことを
+    /// 観測用統計へ計上する。
+    pub(crate) fn record_aggregate_index_scan(&self) {
+        self.aggregate_index_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #475: 集計・`GROUP BY` クエリが索引対応述語・形状を持ちながら
+    /// 全走査へ縮退したことを観測用統計へ計上する。
+    pub(crate) fn record_aggregate_plain_scan_fallback(&self) {
+        self.aggregate_plain_scan_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1823,5 +1910,126 @@ mod tests {
             }
         }
         out
+    }
+
+    // Issue #475: `column_groups`／`slots_without_value`（`sql::group_by` の
+    // WHERE なし GROUP BY 列挙形が使う API）の単体テスト。
+
+    #[test]
+    fn column_groups_enumerates_values_in_byte_order_with_correct_slots() {
+        let path = unique_db_path("scalar-index-column-groups");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        // わざと非バイト順で挿入し、列挙がバイト列昇順であることを固定する。
+        insert(&storage, &c, 1, Some("zulu"), None, Visibility::Public);
+        insert(&storage, &c, 2, Some("alpha"), None, Visibility::Public);
+        insert(&storage, &c, 3, Some("alpha"), None, Visibility::Public);
+        insert(&storage, &c, 4, None, None, Visibility::Public);
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+
+        let kind_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "kind")
+            .expect("kind column");
+        let groups: Vec<(String, Vec<u32>)> = index
+            .column_groups(kind_col)
+            .expect("text column")
+            .map(|(v, slots)| (v.to_string(), slots.to_vec()))
+            .collect();
+        let values: Vec<&str> = groups.iter().map(|(v, _)| v.as_str()).collect();
+        assert_eq!(values, vec!["alpha", "zulu"]);
+        for (_, slots) in &groups {
+            let mut sorted = slots.clone();
+            sorted.sort_unstable();
+            assert_eq!(slots, &sorted, "slots must be ascending");
+        }
+        let alpha_slots = &groups[0].1;
+        assert_eq!(alpha_slots.len(), 2);
+
+        // id=4 (kind=NULL) はどの値グループにも現れない。
+        for (_, slots) in &groups {
+            for &slot in slots {
+                let arena_id = snapshot.arena().ids()[slot as usize];
+                assert_ne!(arena_id, 4);
+            }
+        }
+    }
+
+    #[test]
+    fn slots_without_value_returns_null_rows_only() {
+        let path = unique_db_path("scalar-index-slots-without-value");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        insert(&storage, &c, 1, Some("alpha"), None, Visibility::Public);
+        insert(&storage, &c, 2, None, None, Visibility::Public);
+        insert(&storage, &c, 3, None, None, Visibility::Public);
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let kind_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "kind")
+            .expect("kind column");
+        let null_slots = index
+            .slots_without_value(kind_col)
+            .expect("text column supports null slots");
+        let null_ids: Vec<u64> = null_slots
+            .iter()
+            .map(|&slot| snapshot.arena().ids()[slot as usize])
+            .collect();
+        let mut sorted_ids = null_ids.clone();
+        sorted_ids.sort_unstable();
+        assert_eq!(sorted_ids, vec![2, 3]);
+        // 昇順契約。
+        let mut sorted_slots = null_slots.clone();
+        sorted_slots.sort_unstable();
+        assert_eq!(null_slots, sorted_slots);
+    }
+
+    #[test]
+    fn slots_without_value_empty_when_no_nulls() {
+        let path = unique_db_path("scalar-index-slots-without-value-empty");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        insert(&storage, &c, 1, Some("alpha"), None, Visibility::Public);
+        insert(&storage, &c, 2, Some("beta"), None, Visibility::Public);
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let kind_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "kind")
+            .expect("kind column");
+        assert_eq!(
+            index.slots_without_value(kind_col).expect("text column"),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn column_groups_and_slots_without_value_none_for_vector_column() {
+        let path = unique_db_path("scalar-index-column-groups-vector");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        insert(&storage, &c, 1, Some("alpha"), None, Visibility::Public);
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let embedding_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "embedding")
+            .expect("embedding column");
+        assert!(index.column_groups(embedding_col).is_none());
+        assert!(index.slots_without_value(embedding_col).is_none());
     }
 }

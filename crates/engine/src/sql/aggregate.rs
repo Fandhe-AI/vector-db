@@ -593,13 +593,28 @@ pub(crate) fn execute_aggregate_with_cache(
     schema: &TableSchema,
     bound: &BoundAggregate,
     visible_cache: Option<crate::sql::visible_cache::VisibleCacheAccess<'_>>,
+    // Issue #475: スカラー列二次索引（`sql::scalar_index::ScalarIndex`）経由の
+    // 候補削減。索引対応述語（`TEXT` 列の等価・前方一致・`id` の単純比較）を
+    // 持つ `WHERE` 付き集計に限り、`arena_cache`（RLS 段適用済みスナップ
+    // ショット）・`scalar_cache`（索引本体）の双方が揃っている場合に消費する。
+    // `GROUP BY` ありは [`crate::sql::group_by::execute_grouped_aggregate`] へ
+    // そのまま引き継ぐ（列挙形・候補走査形の判断はそちら側の責務）。
+    arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
+    scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // TASK-167（SQL-14）: `GROUP BY` ありは複数行結果を返すため
     // `sql::group_by::execute_grouped_aggregate` へ分岐する（グループ表の有界化・
     // `HAVING`/`ORDER BY`/`LIMIT` はそちらの責務）。`GROUP BY` なしは以下の
     // TASK-166・SQL-13 の単一行経路を維持する（既存挙動は変更しない）。
     if bound.group_by.is_some() {
-        return crate::sql::group_by::execute_grouped_aggregate(read_txn, ctx, schema, bound);
+        return crate::sql::group_by::execute_grouped_aggregate(
+            read_txn,
+            ctx,
+            schema,
+            bound,
+            arena_cache,
+            scalar_cache,
+        );
     }
 
     let mut accumulators = Vec::with_capacity(bound.items.len());
@@ -638,6 +653,45 @@ pub(crate) fn execute_aggregate_with_cache(
         // キー/ヘッダ tenant 整合検査だけで完結する（受入条件 3）。
         DecodeTier::Fast
     };
+
+    // Issue #475: `WHERE` が索引対応述語のみ（`classify_scalar_plan` が
+    // `PlainScan` 以外）で構成される場合、`user_rows/{table}` の全行走査
+    // （O(N)）ではなく `ScalarIndex::resolve_candidates` が絞った候補
+    // （概ね O(|hits|)）だけを走査する。`VECTOR` 列を持たないテーブル
+    // （SQL-13）はこの索引の構築材料（`SqlArenaSnapshot`／`VectorArena`）を
+    // 持てないため対象外。`Fast` tier（`WHERE` 自体が無い）はこの gate に
+    // 到達しない（`classify_scalar_plan` は `metadata_filters`・`expr_filters`
+    // が両方空なら常に `PlainScan`）。索引が使えない・構築できない・選択度が
+    // 悪いなど、あらゆる縮退はこのブロックの外（後続の既存全走査ループ）へ
+    // フォールバックするだけでクエリの正しさに影響しない（fail-closed。
+    // モジュール「Issue #475」節参照）。
+    if let (Some(expected_dim), Some(arena_access), Some(scalar_access)) = (
+        schema.vector_dim(),
+        arena_cache.as_ref(),
+        scalar_cache.as_ref(),
+    ) {
+        let scalar_shape = crate::sql::scalar_plan::ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &bound.metadata_filters,
+            expr_filters: &bound.expr_filters,
+        };
+        if crate::sql::scalar_plan::classify_scalar_plan(&scalar_shape)
+            != crate::sql::scalar_plan::ScalarPlan::PlainScan
+        {
+            if let Some(result) = try_scalar_index_aggregate(
+                read_txn,
+                ctx,
+                schema,
+                bound,
+                &referenced,
+                expected_dim,
+                arena_access,
+                scalar_access,
+            )? {
+                return Ok(result);
+            }
+        }
+    }
 
     // Issue #478: `DecodeTier::Fast` に限り、同一テーブル世代で構築済みの可視
     // `id` 集合がキャッシュにあれば `user_rows/{table}` を一切開かずに集計する
@@ -928,6 +982,331 @@ fn finish_aggregate_result(accumulators: Vec<Accumulator>, bound: &BoundAggregat
     }
 }
 
+/// Issue #475: `GROUP BY` なし・索引対応述語のみの `WHERE` を持つ集計を、
+/// `sql::scalar_index::ScalarIndex::resolve_candidates` の候補削減経由で実行
+/// できるか試みる。`Ok(Some(_))` は索引経由で確定した応答（呼び出し元はこれを
+/// そのまま返す）、`Ok(None)` は索引が使えない・構築できない・選択度が悪い等の
+/// 理由で従来の全走査へ委ねるべきことを示す（fail-closed。索引経路の一切の
+/// 縮退はここで吸収し、呼び出し元の全走査ループは無変更のまま安全側へ倒れる）。
+/// `Err` は実装バグ相当の内部矛盾（[`accumulator_bug`] 等）のみを返す。
+#[allow(clippy::too_many_arguments)]
+fn try_scalar_index_aggregate(
+    read_txn: &redb::ReadTransaction,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundAggregate,
+    referenced: &ReferencedColumns,
+    expected_dim: u32,
+    arena_access: &crate::sql::arena_cache::ArenaCacheAccess<'_>,
+    scalar_access: &crate::sql::scalar_index::ScalarCacheAccess<'_>,
+) -> Result<Option<QueryResult>, SqlSurfaceError> {
+    use crate::sql::arena_cache::SqlArenaSnapshot;
+    use crate::sql::scalar_index::ScalarIndex;
+    use std::sync::Arc;
+
+    let cached = arena_access
+        .cache
+        .lookup(arena_access.storage, read_txn, &bound.table, ctx)
+        .zip(
+            scalar_access
+                .cache
+                .lookup(scalar_access.storage, read_txn, &bound.table, ctx),
+        )
+        .filter(|(snapshot, index)| {
+            // 索引↔スナップショット同一性ガード（`sql::exec` の SELECT 経路と
+            // 同じ検査。`ScalarIndexCache`／`SqlArenaCache` はそれぞれ独立に
+            // `(table, ctx)` × 世代でキャッシュされるため、両者が同時に
+            // ヒットしても由来スナップショットが一致する保証がない）。
+            index.row_count() == snapshot.arena().len()
+                && index.built_table_generation() == snapshot.built_table_generation_for_index()
+        });
+
+    let (snapshot, index): (Arc<SqlArenaSnapshot>, Arc<ScalarIndex>) = match cached {
+        Some(pair) => pair,
+        None => {
+            // ミス、または同一性ガード不一致。SELECT が同じ世代を先に走査して
+            // いなければ索引は永久に構築されないため（受入条件「非 vacuous」）、
+            // この集計クエリ自身の走査に相乗りして構築する（計画の piggyback
+            // 採取。Issue #475）。
+            match capture_scalar_index_snapshot(read_txn, ctx, schema, &bound.table, expected_dim) {
+                Some((snapshot, index)) => {
+                    // `index` は `insert` に渡す前の `snapshot`（挿入前）から
+                    // `ScalarIndex::build` で構築済み。`ArenaCacheAccess::insert`
+                    // は挿入対象自身が真に最新世代の場合のみキャッシュへ反映する
+                    // が、いずれの場合も呼び出し元へは常に構築済みの内容
+                    // （中身は不変。`Arc` で包むだけ）を返す契約——
+                    // `sql::arena_cache::SqlArenaCache::insert` ドキュメント
+                    // 「fail-closed 契約」参照——のため、`index` の
+                    // `built_ctx`/`built_table_generation` は
+                    // `inserted_snapshot` の値と常に一致する。再構築せずその
+                    // まま `ScalarIndexCache::insert` へ渡す。
+                    let inserted_snapshot = arena_access.cache.insert(
+                        arena_access.storage,
+                        &bound.table,
+                        ctx,
+                        snapshot,
+                    );
+                    match scalar_access.cache.insert(
+                        scalar_access.storage,
+                        &bound.table,
+                        ctx,
+                        index,
+                    ) {
+                        Some(index) => (inserted_snapshot, index),
+                        None => {
+                            scalar_access.cache.record_aggregate_plain_scan_fallback();
+                            return Ok(None);
+                        }
+                    }
+                }
+                None => {
+                    scalar_access.cache.record_aggregate_plain_scan_fallback();
+                    return Ok(None);
+                }
+            }
+        }
+    };
+
+    let id_preds: Vec<crate::sql::scalar_plan::IdPredicate> = bound
+        .expr_filters
+        .iter()
+        .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
+        .collect();
+    let slots = match index.resolve_candidates(&bound.metadata_filters, &id_preds) {
+        crate::sql::scalar_index::CandidateResolution::Use(slots) => slots,
+        crate::sql::scalar_index::CandidateResolution::FallbackNoIndex
+        | crate::sql::scalar_index::CandidateResolution::FallbackSelectivity => {
+            scalar_access.cache.record_aggregate_plain_scan_fallback();
+            return Ok(None);
+        }
+    };
+
+    let mut accumulators = Vec::with_capacity(bound.items.len());
+    for item in &bound.items {
+        accumulators.push(Accumulator::new(item.func, &item.input)?);
+    }
+    observe_candidate_slots(
+        &snapshot,
+        &slots,
+        schema,
+        bound,
+        referenced,
+        &mut accumulators,
+    )?;
+    scalar_access.cache.record_aggregate_index_scan();
+    Ok(Some(finish_aggregate_result(accumulators, bound)))
+}
+
+/// Issue #475: `WHERE` なし・索引対応述語のみの `WHERE` を持つ `GROUP BY` の
+/// 候補走査形が使う、`ScalarIndex` 由来のスナップショット・索引を用意する
+/// （キャッシュヒットならそのまま、ミスなら [`capture_scalar_index_snapshot`]
+/// で構築して両キャッシュへ登録する）。`aggregate.rs`（`GROUP BY` なし）と
+/// `sql::group_by`（`GROUP BY` あり）が共有する（crate 内公開）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ensure_scalar_index_snapshot(
+    read_txn: &redb::ReadTransaction,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    table: &str,
+    expected_dim: u32,
+    arena_access: &crate::sql::arena_cache::ArenaCacheAccess<'_>,
+    scalar_access: &crate::sql::scalar_index::ScalarCacheAccess<'_>,
+) -> Option<(
+    std::sync::Arc<crate::sql::arena_cache::SqlArenaSnapshot>,
+    std::sync::Arc<crate::sql::scalar_index::ScalarIndex>,
+)> {
+    let cached = arena_access
+        .cache
+        .lookup(arena_access.storage, read_txn, table, ctx)
+        .zip(
+            scalar_access
+                .cache
+                .lookup(scalar_access.storage, read_txn, table, ctx),
+        )
+        .filter(|(snapshot, index)| {
+            index.row_count() == snapshot.arena().len()
+                && index.built_table_generation() == snapshot.built_table_generation_for_index()
+        });
+    if let Some(pair) = cached {
+        return Some(pair);
+    }
+    let (snapshot, index) =
+        capture_scalar_index_snapshot(read_txn, ctx, schema, table, expected_dim)?;
+    // `index` は挿入前の `snapshot` から構築済み（`try_scalar_index_aggregate`
+    // と同じ理由で再構築不要。同関数のドキュメント参照）。
+    let inserted_snapshot = arena_access
+        .cache
+        .insert(arena_access.storage, table, ctx, snapshot);
+    let inserted_index = scalar_access
+        .cache
+        .insert(scalar_access.storage, table, ctx, index)?;
+    Some((inserted_snapshot, inserted_index))
+}
+
+/// Issue #475: `ScalarIndex::resolve_candidates` が絞った候補スロット
+/// （`snapshot` 上の添字）を走査し、可視行と同じ SCALAR 段・集計判定を適用する。
+/// 索引は候補を「絞る」ことしかできないため、ここで `matches_all`・式述語
+/// （残余は許されない——`classify_scalar_plan` の gate により `expr_filters` は
+/// 常に `id` 単純比較のみ）を候補行にも再適用する（`sql::exec` の SELECT 経路と
+/// 同じ多層防御。モジュールドキュメント「Issue #475」節）。
+pub(crate) fn observe_candidate_slots(
+    snapshot: &crate::sql::arena_cache::SqlArenaSnapshot,
+    slots: &[u32],
+    schema: &TableSchema,
+    bound: &BoundAggregate,
+    referenced: &ReferencedColumns,
+    accumulators: &mut [Accumulator],
+) -> Result<(), SqlSurfaceError> {
+    let arena = snapshot.arena();
+    let mut expr_scratch: Vec<StackValue> = Vec::new();
+    'candidates: for &slot in slots {
+        let slot_idx = usize::try_from(slot)
+            .map_err(|_| accumulator_bug("candidate slot does not fit in usize"))?;
+        let &id = arena
+            .ids()
+            .get(slot_idx)
+            .ok_or_else(|| accumulator_bug("candidate slot out of bounds (ids)"))?;
+        let metadata = snapshot
+            .metadata()
+            .get(slot_idx)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let scanned = row_codec::scan_scalar_columns_masked(
+            schema,
+            metadata,
+            Some(referenced.scalar_mask()),
+        )?;
+
+        if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
+            continue;
+        }
+        for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
+            let embedding: &[f32] = if udf_call::references_embedding(expr) {
+                arena
+                    .vector(slot_idx)
+                    .ok_or_else(|| accumulator_bug("candidate slot out of bounds (vector)"))?
+            } else {
+                &[]
+            };
+            match program.eval(id, embedding, &mut expr_scratch)? {
+                ExprValue::Bool(true) => {}
+                ExprValue::Bool(false) => continue 'candidates,
+                _ => {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "WHERE expression did not evaluate to a boolean",
+                    ))
+                }
+            }
+        }
+
+        let vector = RowVector {
+            dim: arena.dim(),
+            values: if referenced.needs_embedding() {
+                Some(
+                    arena
+                        .vector(slot_idx)
+                        .ok_or_else(|| accumulator_bug("candidate slot out of bounds (vector)"))?,
+                )
+            } else {
+                None
+            },
+        };
+        for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
+            accumulator.observe(&item.input, id, &vector, &scanned, &mut expr_scratch)?;
+        }
+    }
+    Ok(())
+}
+
+/// Issue #475: `ScalarIndex` 経由の候補削減・`GROUP BY` キー列挙が使う
+/// [`crate::sql::arena_cache::SqlArenaSnapshot`] を、この集計クエリ自身の走査
+/// から piggyback で構築する（`sql::exec` の SELECT 経路が構築した
+/// `SqlArenaCache` エントリに依存すると、集計クエリ単独では索引が永遠に
+/// 構築されず候補削減が非 vacuous にならないため）。
+///
+/// [`crate::arena::SqlArenaCaptureBuilder::push`] は `embedding.len() ==
+/// expected_dim` を検証しない（`GrowableArenaBuffers::push_row` が
+/// `extend_from_slice` するだけ）ため、呼び出し元がここで dim を検証してから
+/// 渡す必要がある。nullable `VECTOR` 列の `NULL` 行（`dim == 0`）を含む世代は
+/// アリーナのレイアウト不変条件（`vectors.len() == ids.len() * dim`）を守れず
+/// 索引を構築できないため、1 行でも次元不一致を検出した時点で採取全体を
+/// 断念する（soft-fail。呼び出し元は `None` を受け取り、この集計クエリ自体は
+/// 従来の全走査へフォールバックするだけで失敗しない）。
+fn capture_scalar_index_snapshot(
+    read_txn: &redb::ReadTransaction,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    table: &str,
+    expected_dim: u32,
+) -> Option<(
+    crate::sql::arena_cache::SqlArenaSnapshot,
+    crate::sql::scalar_index::ScalarIndex,
+)> {
+    let row_table_name = catalog::user_rows_table_name(table);
+    let row_table = match read_txn.open_table(catalog::user_rows_table_def(&row_table_name)) {
+        Ok(t) => t,
+        // 行テーブル未作成（1 行も書き込まれていない）は空の索引を構築する
+        // 意味がないため採取を断念する（呼び出し元は全走査へフォールバック。
+        // 空テーブルは全走査も O(1) で軽量なため実害はない）。
+        Err(_) => return None,
+    };
+
+    let mut capture = crate::arena::SqlArenaCaptureBuilder::new(
+        expected_dim,
+        crate::arena::MAX_ARENA_ROWS,
+        crate::arena::MAX_ARENA_TOTAL_BYTES,
+        crate::arena::MAX_ARENA_TOTAL_BYTES,
+    );
+    let mut embedding_scratch: Vec<f32> = Vec::new();
+    let mut capture_ok = true;
+
+    for entry in row_table.iter().ok()? {
+        let (k, v) = entry.ok()?;
+        let (key_tenant, id) = k.value();
+        let buf = v.value();
+        let (tenant_id, visibility, offset) = storage::decode_row_header(buf).ok()?;
+        if !ctx.is_visible(tenant_id, visibility) {
+            continue;
+        }
+        // TABLE-12: 物理キー側 `tenant_id` とヘッダ側 `tenant_id` の不一致は
+        // このクエリ本体（呼び出し元の全走査）が独立に検出し `XX000` を返す
+        // 契約のため、ここ（piggyback な派生キャッシュの採取）では採取だけを
+        // 諦め、クエリ応答の成否には関与しない。
+        if storage::verify_row_key_tenant(key_tenant, tenant_id).is_err() {
+            capture_ok = false;
+            continue;
+        }
+        if !capture_ok {
+            continue;
+        }
+        let (dim, metadata) =
+            match storage::decode_row_body_into(buf, offset, &mut embedding_scratch) {
+                Ok(v) => v,
+                Err(_) => {
+                    capture_ok = false;
+                    continue;
+                }
+            };
+        if dim != expected_dim {
+            // nullable VECTOR の NULL 行（dim 0）を含む世代はこの索引の対象外
+            // （型ドキュメント参照）。
+            capture_ok = false;
+            continue;
+        }
+        capture.push(id, tenant_id, visibility, &embedding_scratch, metadata, 0);
+    }
+
+    if !capture_ok {
+        return None;
+    }
+    let (arena, metadata) = capture.finish(table)?;
+    let generation = crate::catalog::table_generation_in_txn(read_txn, table).ok()?;
+    let snapshot =
+        crate::sql::arena_cache::SqlArenaSnapshot::new(arena, metadata, ctx.clone(), generation);
+    let index = crate::sql::scalar_index::ScalarIndex::build(schema, &snapshot).ok()?;
+    Some((snapshot, index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,15 +1461,17 @@ mod tests {
 
         // COUNT(embedding) は NULL 行（id=2）を数えない。
         let bound_vec = bound_single(AggregateFunc::Count, AggregateInput::VectorColumnPresence);
-        let result = execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_vec, None)
-            .expect("COUNT(embedding) should succeed even with a NULL row present");
+        let result =
+            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_vec, None, None, None)
+                .expect("COUNT(embedding) should succeed even with a NULL row present");
         assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
 
         // COUNT(*) は VECTOR 値を参照しないため、nullable 列の NULL 行があっても
         // 次元不一致（旧 XX000）を返さず両方の可視行を数える（本 PR の中心的指摘）。
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let result = execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None)
-            .expect("COUNT(*) must not fail on a nullable VECTOR column's NULL row");
+        let result =
+            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None, None, None)
+                .expect("COUNT(*) must not fail on a nullable VECTOR column's NULL row");
         assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
     }
 
@@ -1123,8 +1504,9 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let err = execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None)
-            .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        let err =
+            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None, None, None)
+                .expect_err("key/header tenant mismatch must be rejected fail-closed");
         assert_eq!(err.wire_code(), "XX000");
     }
 
@@ -1160,8 +1542,9 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let err = execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None)
-            .expect_err("COUNT(*) fast path must fail closed on a corrupted embedding section");
+        let err =
+            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None, None, None)
+                .expect_err("COUNT(*) fast path must fail closed on a corrupted embedding section");
         assert_eq!(err.wire_code(), "XX000");
     }
 
@@ -1193,7 +1576,8 @@ mod tests {
 
         let bound_vec = bound_single(AggregateFunc::Count, AggregateInput::VectorColumnPresence);
         let err =
-            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_vec, None).unwrap_err();
+            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_vec, None, None, None)
+                .unwrap_err();
         assert_eq!(err.wire_code(), "XX000");
     }
 
@@ -1244,8 +1628,16 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let err = execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None)
-            .expect_err(
+        let err = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound_star,
+            None,
+            None,
+            None,
+        )
+        .expect_err(
             "COUNT(*) must fail closed on corrupted metadata even with no scalar column referenced",
         );
         assert_eq!(err.wire_code(), "XX000");
@@ -1319,5 +1711,64 @@ mod tests {
         }
         assert_eq!(min.finish(), Cell::Float(-1.5));
         assert_eq!(max.finish(), Cell::Float(42.0));
+    }
+
+    // --- Issue #475: piggyback 索引採取の soft-fail 契約 ------------------
+
+    /// nullable な `VECTOR` 列（TABLE-5 想定）の `NULL` 行（`dim == 0`）を含む
+    /// 世代では、[`capture_scalar_index_snapshot`] が採取全体を断念して `None`
+    /// を返すこと（型ドキュメント参照）を固定する。`ScalarIndex` 経由の
+    /// 索引化を試みず、呼び出し元（`execute_aggregate_with_cache`）は従来の
+    /// 全走査へフォールバックするだけでクエリ自体は失敗しない契約を、この
+    /// レイヤ単体のオラクルとして検証する（`tests/scalar_index_aggregate.rs`
+    /// の結合テストは現行の公開 INSERT 経路が nullable `VECTOR` 列の NULL 行を
+    /// 書き込めない制約——`write_row_direct` 参照——のため代替できない）。
+    #[test]
+    fn capture_scalar_index_snapshot_soft_fails_on_nullable_vector_null_row() {
+        let path = unique_db_path("agg-scalar-index-capture-null-vector");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        // id=1: VECTOR 値あり（dim==expected_dim）、id=2: nullable 列が未設定
+        // （embedding 空 = NULL・dim==0）。
+        write_row_direct(&storage, "docs", "tenant-a", 1, &[1.0, 2.0, 3.0]);
+        write_row_direct(&storage, "docs", "tenant-a", 2, &[]);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let expected_dim = schema.vector_dim().expect("vector dim");
+
+        assert!(
+            capture_scalar_index_snapshot(&read_txn, &ctx, &schema, "docs", expected_dim).is_none(),
+            "a generation containing a nullable-VECTOR NULL row must not be captured"
+        );
+    }
+
+    /// 上記と対照的に、`NULL` 行を含まない世代では通常どおり採取・構築できる
+    /// ことを固定する（soft-fail が「常に None」の縮退ではないことの確認）。
+    #[test]
+    fn capture_scalar_index_snapshot_succeeds_without_null_rows() {
+        let path = unique_db_path("agg-scalar-index-capture-ok");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        write_row_direct(&storage, "docs", "tenant-a", 1, &[1.0, 2.0, 3.0]);
+        write_row_direct(&storage, "docs", "tenant-a", 2, &[4.0, 5.0, 6.0]);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let expected_dim = schema.vector_dim().expect("vector dim");
+
+        let (snapshot, index) =
+            capture_scalar_index_snapshot(&read_txn, &ctx, &schema, "docs", expected_dim)
+                .expect("capture should succeed when no row is NULL");
+        assert_eq!(snapshot.arena().len(), 2);
+        assert_eq!(index.row_count(), 2);
     }
 }
