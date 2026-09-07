@@ -13,8 +13,12 @@
   （行内 ILP 不採用の先行判断）・`docs/design/simd-codegen-guard.md`（生成コード
   検査ガード。「Issue #510 以降の追記」節・「Issue #511 以降の追記」節に本変更の
   実測知見を記録）
-- 後続: Issue #512（前後比較・採否判断。§5「#530 向け計測点一覧」参照）・
-  Issue #530（Apple 実機での前後比較実測）
+- 後続: Issue #512（前後比較・採否判断。層 A（`dot_kernel_bench` 単一ビルド内
+  block4 A/B）・層 B（`bench-chip` knn_profile 前後比較）を実施し「参考値・
+  現状維持（条件付き）」（本環境の証拠力では Accepted/Rejected いずれも
+  確定できず、最終採否は #530 へ申し送り）と判断。詳細は `docs/design/
+  dot-kernel-multi-accumulator.md`「行間再利用（Issue #512）」節参照。§5
+  「#530 向け計測点一覧」も参照）・Issue #530（Apple 実機での前後比較実測）
 
 ## 1. 背景・目的
 
@@ -210,14 +214,17 @@ NEON 版行ブロックカーネル（Issue #511）の実機前後比較（Issue
 | ------ | ---- | ---- |
 | `make bench-chip`（`knn_profile`／`feature_128`／`feature_768`） | `ParallelBruteForce` → `parallel_search::search_range` → `kernel::dot_block4` → `dot_block4_neon` | before = Issue #511 マージ直前（`Neon` arm は 4 × `dot`）、after = マージ後。`summary.json` の実行時検出 ISA（`neon`/`fp16`/...）でラベル付け可能。判定規約は `benchmark-judgement-policy.md`（交互実行 min-of-N・N≥5・ノイズ帯併記） |
 | `make bench-chip`（`dot_kernel`） | `isa::current().dot`（1 行版） | 変更を含まない区間＝ノイズ帯の参照区間として使う |
-| `SimdKernel::dot_block4`（`pub`） | マイクロベンチ hook | ブロック計測段の `dot_kernel_bench` 追加は Issue #512 |
+| `SimdKernel::dot_block4`（`pub`） | マイクロベンチ hook | ブロック計測段の `dot_kernel_bench` 追加は Issue #512（`BENCH_DOT_KERNEL_BLOCK_AB=1`。実装済み。x86_64／AVX2+FMA でのみ実行確認済み。NEON 側の同一手順での実測は #530 の担当） |
 | `make detect-features`／`detect-apple` ジョブ | `engine::isa::current()` = `Neon` の確認・`cargo test --test isa`（ビット同一テスト） | Apple Silicon 実機での正しさの証跡 |
 | `make simd-codegen-check-cross` | aarch64 `--emit asm` の命令サマリ（`fmla v.4s` ×4・`ldr q` ×5・禁止 0） | 生成コードの証跡（Linux aarch64 ターゲット。Apple 実機 asm は Issue #530 側で `--target aarch64-apple-darwin` 相当を任意実施） |
 
 ## 6. 限界・スコープ外
 
 - 前後比較・採否判断・`dot_kernel_bench` へのブロック計測段追加 → Issue #512
-  （`SimdKernel::dot_block4` を `pub` にしておくことが計測 hook になる）
+  実装済み（`SimdKernel::dot_block4` を `pub` にしておいたことが計測 hook に
+  なった。層 A・層 B の実測結果・判定は `docs/design/
+  dot-kernel-multi-accumulator.md`「行間再利用（Issue #512）」節参照。
+  AVX-512F・NEON 実機での同一手順の実測は Issue #530 へ申し送り）
 - `hnsw.rs`・`batch_search.rs`・`rls.rs` の 1 行 `dot` 呼び出しの行ブロック化
 - `check_simd_codegen.sh` の「期待命令（`vfmadd*` ≥ 1）」検査への一般化（x86 側。
   NEON 側は Issue #511 で追加済み）
