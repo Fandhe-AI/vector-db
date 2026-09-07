@@ -66,9 +66,17 @@ FAISS GPU（`IndexFlatIP`）・Qdrant GPU 索引構築との対照値を同一�
   常に unpack 版が選ばれる契約どおり）を確認した。i8 側も全 6 点で
   `i8_mismatch=0`・`i8_recall_at_k=1.0000`（`i8_status=measured`）を確認済み。
 - 環境: `lscpu` Model name `QEMU Virtual CPU version 2.5+`（KVM）・12 vCPU・
+  命令セットフラグ avx2/fma/f16c あり・avx512 系なし（`20260907T124155Z-env.txt`
+  の `cpu_flags_*`。計測後の事後確認だが同一ホストのため静的事実として有効）・
   GPU `NVIDIA GeForce RTX 3060`（driver 595.71.05）・`BENCH_DEDICATED_ENV`
   未設定。**専有環境ではないため Accepted/Rejected の採否根拠にしない**
-  （`benchmark-judgement-policy.md` §5）。
+  （`benchmark-judgement-policy.md` §5）。**限界**: `benchmark-judgement-policy.md`
+  §3 が求める run 別 loadavg・同時実行プロセスの有無は、生ログ
+  （`.gitignore` 対象 `_/` 配下）が本作業時点で既に失われており本 run に
+  ついては未記録（`20260907T124155Z-env.txt` に明記）。§3 表の「実測帯内・
+  判定不能」判定は `cpu_p50` 列（TSV 記録済み）のみを根拠にしており、
+  loadavg の欠落がこの判定を無効化するものではないが、外れ値の事後検証は
+  できない。
 - 各 run の生データ: `docs/design/bench-data/gpu-scaling-ab/
   20260907T124155Z-summary.tsv`（60 行＝6 点 × 5 ペア × 2 側）・
   `20260907T124155Z-env.txt`・`20260907T124155Z-stats.txt`（非 vacuity 根拠）・
@@ -129,9 +137,14 @@ self（after）の `100000:128:64` GPU f16 p95 min-of-5 = 16355µs（§3 表。
 改善している）を FAISS GPU f32 min（633µs。統計量の単位が異なる点に注意
 ——self は p95、FAISS は p50 であり、単純倍率は参考値）と比べると約 25.8 倍。
 FAISS GPU f16 median（766µs）との比較では約 21.3 倍。この対 FAISS 倍率自体は `crossdb-bench.md`「GPU 節」が Issue #537 時点（#532 タイル化・#536 部分 Top-k 適用後）で記録した「約 21 倍」（p95 vs FAISS `559b523` 時点値 753µs）から大きく変わらない水準にとどまる。ただし Issue #537 時点は既に #532・#536 適用後であり、この横ばいは Phase 5 全体の効果ではなく、**Issue #537 以降に加わった変更（#539 の f16 算術版・#542 の i8）が既定経路で非選択のため FAISS との差の縮小に寄与していない**ことを示す（#532・#536 自体の寄与は主計測点の before/after 改善に含まれている）。engine 側は Top-k を CPU で行いスコアバッファを
-読み戻す構造（GPU→CPU 転送量が `rows × batch × 4` バイト。#536 で
-partial Top-k 化済みだが k×workgroup 数×8 バイトへの縮小に留まる）が
-引き続きボトルネックと推定される。
+読み戻す構造（`gpu_batch.rs::dispatch_partial_topk` は GPU 側で
+workgroup 単位の部分 Top-k のみを計算し、CPU 側が全 workgroup 分の
+部分結果を最終マージして全体の Top-k を確定する。GPU→CPU 転送量は
+`query_count（バッチ数）× num_workgroups × k_out × 8` バイト——#536 で
+`rows × batch × 4` からこの式まで削減済みだが、batch 因子は残る。
+主計測点 `100000:128:64`〔`num_workgroups = ceil(100000/256) = 391`・
+`k_out = 10`〕では `64 × 391 × 10 × 8 = 2,001,920` バイト（約 1.9 MiB）
+が引き続きボトルネックと推定される）。
 
 FAISS 計測条件: `cpu_condition=blas_disabled`（`distance_compute_blas_threshold`
 を無効化し SIMD 直接計算に固定）・`omp_num_threads=12`・`faiss-gpu-cu12
@@ -197,9 +210,15 @@ FAISS 計測条件: `cpu_condition=blas_disabled`（`distance_compute_blas_thres
 1. host `Vec` → GPU バッファの**真のゼロコピー（memcpy ゼロ）は wgpu 30.0.1
    の API 上成立しない**（`mapped_at_creation` を使っても staging 経由の
    1 回の memcpy は必須という構造）。
-2. UMA で削減可能なのは readback の blit 1 段（#536 後は k×workgroup 数×8
-   バイトまで縮小済みで効果は限定的）とアップロードの staging 1 段
-   （構築時 1 回）。
+2. UMA で削減可能な staging／blit は 2 種に分かれる。(a) 常駐行列
+   （`row_buffer`）のアップロードは構築時 1 回のみ（`dispatch_partial_topk`
+   自体は呼ばれず、別経路の行列アップロードが該当）。(b)
+   `gpu_batch.rs::dispatch_partial_topk`・`packed_i8.rs` は検索（dispatch）
+   ごとに `params`・`row_ids`・`query` を `queue.write_buffer` でアップロード
+   しており、構築時 1 回には含まれない。readback は #536 後は
+   `query_count × num_workgroups × k_out × 8` バイト（上記）まで縮小済みで
+   効果は限定的。(b) の検索ごとの staging 削減余地は UMA 環境での効果を
+   本書では未評価。
 3. 採用する場合のゲート条件は `Backend::Metal &&
    DeviceType::IntegratedGpu` かつ `MAPPABLE_PRIMARY_BUFFERS` 対応時のみ
    （discrete GPU では fail-closed に既定経路のまま）。
@@ -236,6 +255,13 @@ FAISS 計測条件: `cpu_condition=blas_disabled`（`distance_compute_blas_thres
 
 ## 8. 限界・申し送り
 
+- `benchmark-judgement-policy.md` §3 が求める run 別 loadavg・同時実行
+  プロセスの有無は、`20260907T124155Z` run の生ログ（`.gitignore` 対象
+  `_/` 配下・未 tracked）が本作業時点で既に失われており未記録
+  （`20260907T124155Z-env.txt` に明記。CPU 命令セットフラグ〔avx2/fma/f16c
+  あり・avx512 系なし〕は同一ホストでの事後確認により追記済み）。今後の
+  `bench_gpu_scaling_ab.sh` 実行では summary.tsv へ run 別 loadavg 列を
+  必須で残すこと（`20260907T082358Z-summary.tsv` が先例）。
 - 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測・CORE-6／CORE-16 の絶対閾値
   判定はオーナー作業として引き続き未実施。
 - Apple 実機（Metal・UMA）での実測と UMA ゼロコピー経路の実装は §6 の静的
