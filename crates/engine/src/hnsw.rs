@@ -82,6 +82,10 @@ use std::sync::Arc;
 
 use crate::kernel::dot;
 
+/// 凍結済みグラフの CSR（Compressed Sparse Row）表現（Issue #494）。
+/// [`HnswIndex`] は構築完了後、可変長ビルダー表現（[`GraphBuilder`]）を
+/// この表現へ 1 回だけ平坦化する（[`HnswIndex::freeze_from`] 参照）。
+mod csr;
 mod parallel_build;
 /// `search_layer` の隣接ループへ挿入する受理判定後 prefetch（Issue #490）。
 /// `pub(super)` 限定で本モジュール外へは公開しない。
@@ -146,6 +150,13 @@ pub struct HnswBuildProfile {
     /// 全ノード挿入後の到達性修復パス（単一スレッド。モジュール内
     /// `repair_reachability` のドキュメンテーションコメント参照）。
     pub repair_reachability: std::time::Duration,
+    /// 可変長ビルダー表現（[`GraphBuilder`]）から CSR（[`csr::CsrGraph`]）へ
+    /// 平坦化する段（Issue #494。`freeze`・`repair_reachability` の両方が
+    /// 完了した後の最終段。`build`（逐次）の縮退経路ではこの区切りが
+    /// 存在しないため `sequential_prefix` へ全量を積み、本フィールドは
+    /// `Duration::ZERO` のままにする——[`HnswIndex::build_with_threads_observed`]
+    /// の縮退経路ドキュメンテーションコメント参照）。
+    pub flatten: std::time::Duration,
     /// `build_with_threads_observed` 呼び出し全体の壁時間（上記各段の合計
     /// より長くなり得る——検証・エラー分岐等の測定対象外区間を含むため）。
     pub total: std::time::Duration,
@@ -557,6 +568,60 @@ struct Node {
     links: Vec<Vec<u32>>,
 }
 
+/// [`search_layer_in`]（旧 `search_layer_with` の本体。#405・#494）が構築中
+/// （[`GraphBuilder`]）・凍結後（[`csr::CsrGraph`]）のどちらの隣接表現にも
+/// 依存せず動作できるようにする最小インターフェース（Issue #494・
+/// `docs/design/hnsw-index.md` §14.4）。両実装とも [`Node::level`] を反映した
+/// `level_of`・当該レベルの隣接スライスを返す `neighbors`（`level >
+/// level_of(node)` またはノード範囲外は `None`）・現在のノード総数を返す
+/// `node_count` を持つ。
+pub(crate) trait Adjacency {
+    /// ノード `node` が割り当てられたレベル。存在しないノードは `None`。
+    fn level_of(&self, node: u32) -> Option<usize>;
+    /// 層 `level` におけるノード `node` の隣接リスト。存在しない層・ノードは
+    /// `None`（ノードのレベルが `level` 未満の場合を含む）。
+    fn neighbors(&self, level: usize, node: u32) -> Option<&[u32]>;
+    /// 現在のノード総数。
+    fn node_count(&self) -> usize;
+}
+
+/// 構築中の可変長グラフ表現（Issue #494 で [`HnswIndex`] から分離。
+/// `docs/design/hnsw-index.md` §14.2 の「2 相構成」の前半を担う）。
+///
+/// 並列構築（[`parallel_build`]）と凍結後の [`HnswIndex::repair_reachability`]
+/// 相当の修復パスは `connect`／`shrink_links` による可変長 in-place 更新を
+/// 要するため、構築中は本表現（ノードごとに個別確保した `Vec<Vec<u32>>`）を
+/// 維持し、全ノード挿入・修復が完了した時点で 1 回だけ [`csr::CsrGraph`] へ
+/// 平坦化する（[`HnswIndex::freeze_from`] 参照。平坦化は必ず最終段——
+/// #449 系の修復並列化がこの構造へ追加の書き込みを差し込む場合も、
+/// 本表現に対して行い、平坦化後の `CsrGraph` へは書き込まない契約とする）。
+///
+/// `vectors`（row-major バッファ）は保持しない——構築中の各メソッドは
+/// 既存の呼び出し規約どおり `vectors: &[f32]` を引数で受け取る（`build` の
+/// ループが所有権を持つ借用元バッファをそのまま渡す）。
+pub(crate) struct GraphBuilder {
+    params: HnswParams,
+    nodes: Vec<Node>,
+    entry_point: Option<u32>,
+}
+
+impl Adjacency for GraphBuilder {
+    fn level_of(&self, node: u32) -> Option<usize> {
+        self.nodes.get(node as usize).map(|n| n.level)
+    }
+
+    fn neighbors(&self, level: usize, node: u32) -> Option<&[u32]> {
+        self.nodes
+            .get(node as usize)
+            .and_then(|n| n.links.get(level))
+            .map(|l| l.as_slice())
+    }
+
+    fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
 /// 構築済み HNSW グラフ。`build` 完了時に渡された `vectors` の内容を
 /// `Arc<[f32]>` として所有する（モジュール冒頭「ベクトルの所有方針」節・
 /// codex-review PR #430 P1 指摘対応）。`search` は呼び出し元からベクトルを
@@ -566,10 +631,13 @@ struct Node {
 pub struct HnswIndex {
     params: HnswParams,
     dim: u32,
-    nodes: Vec<Node>,
+    /// 凍結済みグラフ（Issue #494。[`csr::CsrGraph`]）。構築中の可変長
+    /// 表現（[`GraphBuilder`]）から [`HnswIndex::freeze_from`] が 1 回だけ
+    /// 平坦化する。
+    graph: csr::CsrGraph,
     entry_point: Option<u32>,
-    /// `build` 時点の `vectors`（row-major・`len() == nodes.len() * dim`）の
-    /// 不変スナップショット。`search` はこれを `node_vector` で参照する。
+    /// `build` 時点の `vectors`（row-major・`len() == graph.node_count() * dim`）
+    /// の不変スナップショット。`search` はこれを `node_vector` で参照する。
     vectors: Arc<[f32]>,
 }
 
@@ -787,214 +855,7 @@ fn max_degree_for(params: &HnswParams, level: usize) -> usize {
     }
 }
 
-impl HnswIndex {
-    /// row-major 連続バッファ（`VectorArena::vectors()` と同レイアウト。
-    /// `vectors[node * dim .. node * dim + dim]` が `node` 番目のベクトル）から
-    /// 単一スレッドで構築する。
-    ///
-    /// 検証順序: パラメータ → 次元整合 → ノード数上限 → 非有限値。空入力
-    /// （`vectors` が空）は空索引を返す（エラーにしない。呼び出し元が未挿入の
-    /// テーブルへ構築を試みる自然なケースのため）。
-    pub fn build(
-        params: HnswParams,
-        dim: u32,
-        vectors: &[f32],
-        seed: u64,
-    ) -> Result<Self, HnswError> {
-        let dim_usize = dim as usize;
-        let n = validate_build_input(&params, dim, vectors)?;
-
-        // `vectors` の不変スナップショットを取り、以降 `search` はこれのみを
-        // 参照する（モジュール冒頭「ベクトルの所有方針」節・codex-review PR
-        // #430 P1 指摘対応。呼び出し元が構築後に借用元バッファを書き換えても
-        // この Arc の中身は変化しない）。
-        let owned_vectors: Arc<[f32]> = Arc::from(vectors);
-        let mut index = HnswIndex {
-            params,
-            dim,
-            nodes: Vec::with_capacity(n),
-            entry_point: None,
-            vectors: owned_vectors,
-        };
-        if n == 0 {
-            return Ok(index);
-        }
-
-        let mut rng = DeterministicRng::new(seed);
-        // 全挿入をまたいで使い回す visited スクラッチ（`VisitedScratch` 参照。
-        // 挿入ごとに新規確保しないことで search_layer の初期化コストを
-        // O(N^2) から O(N) 相当へ落とす）。
-        let mut visited = VisitedScratch::default();
-        // 挿入順はノード番号昇順に固定する（呼び出し元の入力順＝挿入順。決定性の
-        // 唯一の自由度は `seed` によるレベル割当だけにする）。
-        for node_idx in 0..n {
-            let level = assign_level(&mut rng, params.m);
-            let node_id = node_idx as u32; // n <= MAX_HNSW_NODES であることを上で検証済み
-            index.insert_node(node_id, level, dim_usize, vectors, &mut visited)?;
-        }
-
-        index.repair_reachability(dim_usize, vectors)?;
-
-        Ok(index)
-    }
-
-    /// [`build`](Self::build) と同じグラフを、要素単位ロック（ノードごとの
-    /// `RwLock`）とエントリポイント更新のみの排他で並列構築する（Issue #406・
-    /// 親 #402。pgvector `hnswbuild.c` のロック粒度設計・qdrant の逐次
-    /// プレフィックス方式を参考にした。手法名のみ参照でコード転記はしない）。
-    ///
-    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の場合は
-    /// [`build`](Self::build) と完全に同一のグラフを返す（内部実装は
-    /// `parallel_build::build_parallel_graph` に委譲せず [`build`](Self::build)
-    /// をそのまま呼ぶ）。`threads >= 2` かつ `n > `[`SEQUENTIAL_PREFIX_NODES`]
-    /// の場合、先頭 [`SEQUENTIAL_PREFIX_NODES`] 件は逐次挿入し、残りを
-    /// `AtomicUsize` によるワークスティール方式で並列挿入する——挿入順が
-    /// 非決定的になるため、構築されるグラフの**形状**は同一 `seed` でも
-    /// run-to-run で変わり得る（レベル割当は並列フェーズ開始前に `seed` から
-    /// 逐次確定するため不変。[`HnswIndex::search`] の決定性契約「同一索引・
-    /// 同一クエリで再現」自体は不変。詳細は `docs/design/hnsw-parallel-build.md`
-    /// 参照）。
-    ///
-    /// # エラー
-    ///
-    /// `threads == 0` または `threads > `[`MAX_BUILD_THREADS`] は
-    /// [`HnswError::InvalidParams`]。構築ワーカーの panic・ロック poison は
-    /// [`HnswError::WorkerPanicked`]（fail-closed。部分的に結線された索引を
-    /// `Ok` で返さない）。
-    pub fn build_with_threads(
-        params: HnswParams,
-        dim: u32,
-        vectors: &[f32],
-        seed: u64,
-        threads: usize,
-    ) -> Result<Self, HnswError> {
-        if threads == 0 || threads > MAX_BUILD_THREADS {
-            return Err(HnswError::InvalidParams {
-                reason: "threads must be in 1..=MAX_BUILD_THREADS",
-            });
-        }
-        let n = validate_build_input(&params, dim, vectors)?;
-        if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
-            return Self::build(params, dim, vectors, seed);
-        }
-        parallel_build::build_parallel_graph(params, dim, vectors, seed, threads, n)
-    }
-
-    /// [`build_with_threads`](Self::build_with_threads) と同一アルゴリズム・
-    /// 同一エラー契約を共有しつつ、段別の壁時間・ワーカー統計
-    /// （[`HnswBuildProfile`]）を合わせて返す観測版（Issue #406 追記:
-    /// 8→12 スレッド頭打ち要因の切り分け計測。`docs/design/
-    /// hnsw-parallel-build.md` 参照）。
-    ///
-    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の縮退経路
-    /// （[`build`](Self::build) をそのまま呼ぶ）に限り
-    /// [`build_with_threads`](Self::build_with_threads) と完全に同一のグラフを
-    /// 返す。`threads >= 2` かつ `n > `[`SEQUENTIAL_PREFIX_NODES`] の並列経路は
-    /// ワークスティールに依存するため、[`build_with_threads`]
-    /// (Self::build_with_threads) と同様グラフの**形状**が run-to-run で
-    /// 変わり得る（この非決定性自体は観測の有無に関わらない
-    /// `build_with_threads` 既存の契約。モジュール `parallel_build` 冒頭
-    /// 「決定性の範囲」節参照）。
-    ///
-    /// 呼び出し先（`parallel_build::build_parallel_graph_observed`）は
-    /// `build_parallel_graph` と別の実装だが、ノード挿入・凍結・修復の
-    /// アルゴリズム本体（`insert_node_locked`・`assemble_graph`・
-    /// `repair_reachability`）は完全に共有する関数をそのまま呼ぶ。ただし
-    /// 段別計測のため `BuildGraph` のノードロック取得を `try_read`/
-    /// `try_write` → block の二段化にする計装を追加しており、この計装は
-    /// 観測版（`observe=true`）のみに閉じ、非観測版
-    /// （[`build_with_threads`](Self::build_with_threads) が使う
-    /// `observe=false`）には一切波及しない（`parallel_build::BuildGraph::
-    /// observe` 参照。レビュー指摘 P1-A）。したがって
-    /// `build_with_threads_one_matches_sequential_build_exactly` 等の既存
-    /// 完全一致テストは非観測版のみを対象にするため無変更のまま green だが、
-    /// 「ロック取得順序・待ち時間まで非観測版と厳密に同一」であることは
-    /// 主張しない（グラフの構築結果・poison 判定は同一）。
-    ///
-    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の縮退経路
-    /// （[`build`](Self::build) を呼ぶ）では、計測できる段の区切りが
-    /// 存在しないため所要時間の全量を `sequential_prefix` へ積み、
-    /// `workers` は空のままにする（縮退の事実がプロファイルから分かる）。
-    ///
-    /// # エラー
-    ///
-    /// [`build_with_threads`](Self::build_with_threads) と同一（`threads` の
-    /// 範囲外は [`HnswError::InvalidParams`]、ワーカー panic・ロック poison は
-    /// [`HnswError::WorkerPanicked`]）。
-    pub fn build_with_threads_observed(
-        params: HnswParams,
-        dim: u32,
-        vectors: &[f32],
-        seed: u64,
-        threads: usize,
-    ) -> Result<(Self, HnswBuildProfile), HnswError> {
-        let total_start = std::time::Instant::now();
-        if threads == 0 || threads > MAX_BUILD_THREADS {
-            return Err(HnswError::InvalidParams {
-                reason: "threads must be in 1..=MAX_BUILD_THREADS",
-            });
-        }
-        let n = validate_build_input(&params, dim, vectors)?;
-        if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
-            let seq_start = std::time::Instant::now();
-            let index = Self::build(params, dim, vectors, seed)?;
-            let profile = HnswBuildProfile {
-                sequential_prefix: seq_start.elapsed(),
-                total: total_start.elapsed(),
-                ..HnswBuildProfile::default()
-            };
-            return Ok((index, profile));
-        }
-        let (index, mut profile) =
-            parallel_build::build_parallel_graph_observed(params, dim, vectors, seed, threads, n)?;
-        profile.total = total_start.elapsed();
-        Ok((index, profile))
-    }
-
-    /// [`build_with_threads`](Self::build_with_threads) のスレッド数を
-    /// [`crate::parallel_search::ParallelSearchProvider`] と同じ決定方法
-    /// （`thread_count_for` による行数依存の並列度算出・プロセス全体の
-    /// `WorkerBudgetGuard` による同時実行間の調停）で自動的に決める（Issue
-    /// #406 要件 5。#407／#408 の既定結線先はこちら）。決定された並列度が
-    /// 1 以下、またはグローバル予算を確保できなかった場合は
-    /// [`build`](Self::build)（逐次・完全決定的）へ縮退する（`ParallelSearchProvider`
-    /// と同じ「並列度を落とすだけで失敗させない」縮退規則）。
-    ///
-    /// `thread_count_for` は検索側の `MIN_ROWS_PER_THREAD`（1,024）を
-    /// 1 スレッドあたりの担当行数の下限として使う（`available_parallelism`
-    /// と `row_count / MIN_ROWS_PER_THREAD` の小さい方）ため、実質的な並列化
-    /// 閾値は `MIN_ROWS_PER_THREAD * 2`（2,048。`available_parallelism >= 2`
-    /// の環境で `desired >= 2` になる最小の `n`）であり、本メソッドが別途
-    /// 課す [`SEQUENTIAL_PREFIX_NODES`]（256）より大きい。したがって
-    /// `n` が 257..2047 の範囲では [`build_with_threads`](Self::
-    /// build_with_threads) に明示的なスレッド数を渡せば並列化されるが、
-    /// 本メソッドは検索側の閾値をそのまま流用する設計判断により逐次へ
-    /// 縮退する（構築 1 ノードあたりのコストは検索 1 クエリの `dot` 計算
-    /// より大幅に重いため、この閾値が構築にとって保守的すぎる可能性は
-    /// 残るが、#407／#408 が実運用で結線する際に単一の決定方法を共有する
-    /// 利点を優先した。見直しが必要になれば構築専用の閾値を別途持たせる）。
-    pub fn build_parallel(
-        params: HnswParams,
-        dim: u32,
-        vectors: &[f32],
-        seed: u64,
-    ) -> Result<Self, HnswError> {
-        let n = validate_build_input(&params, dim, vectors)?;
-        let desired = crate::parallel_search::thread_count_for(n).min(MAX_BUILD_THREADS);
-        if desired <= 1 || n <= SEQUENTIAL_PREFIX_NODES {
-            return Self::build(params, dim, vectors, seed);
-        }
-        let guard = crate::parallel_search::WorkerBudgetGuard::acquire(desired);
-        let granted = guard.granted();
-        if granted <= 1 {
-            drop(guard);
-            return Self::build(params, dim, vectors, seed);
-        }
-        let result = Self::build_with_threads(params, dim, vectors, seed, granted);
-        drop(guard);
-        result
-    }
-
+impl GraphBuilder {
     /// 全ノード挿入後の決定的な後始末パス。`insert_node`／`shrink_links` の
     /// `protect` 引数（呼び出し時点のみの保護）だけでは、後続ノードの挿入が
     /// 同じ近傍を再度枝刈りして到達不能ノードを生む残差ケースを閉じきれない
@@ -1255,7 +1116,7 @@ impl HnswIndex {
             // `max_degree_for` 側で扱う）が、新規ノード自身の選択本数は Algorithm 1
             // の記法どおり層を問わず常に `m` 本にする。
             let selected =
-                self.select_neighbors_heuristic(&candidates, self.params.m, dim, vectors)?;
+                select_neighbors_heuristic_free(&candidates, self.params.m, dim, vectors)?;
 
             for &neighbor in &selected {
                 self.connect(node_id, neighbor, l);
@@ -1314,6 +1175,353 @@ impl HnswIndex {
             }
         }
         Ok(current)
+    }
+
+    /// `from -> to` への単方向リンクを層 `level` へ追加する（重複・自己ループは
+    /// 追加しない）。次数上限の適用は呼び出し元の [`Self::shrink_links`] が担う。
+    fn connect(&mut self, from: u32, to: u32, level: usize) {
+        if from == to {
+            return;
+        }
+        let Some(node) = self.nodes.get_mut(from as usize) else {
+            return;
+        };
+        let Some(links) = node.links.get_mut(level) else {
+            return;
+        };
+        if !links.contains(&to) {
+            links.push(to);
+        }
+    }
+
+    /// `node` の層 `level` における隣接数が次数上限を超えていれば、その隣接集合
+    /// 全体へヒューリスティック近傍選択を再適用して上限内へ縮退させる
+    /// （Algorithm 1 の「次数上限超過時の再選択」段）。
+    ///
+    /// `protect` は、この呼び出し直前に `insert_node` が `node <-> protect` へ
+    /// 張ったばかりの逆方向リンク先（新規挿入ノード自身）。ヒューリスティックが
+    /// `protect` を枝刈りしてしまうと、新規ノードへの唯一の入口だった逆方向
+    /// リンクが失われ、エントリポイントからの到達路が残らないまま孤立し得る
+    /// （挿入ノードは自身の外向きリンクは持つが、探索はエントリポイントから
+    /// 既存ノードの隣接リストを辿って到達するため入方向のリンクが要る）。
+    /// ヒューリスティック選択後に `protect` が漏れて
+    /// いれば、選択済み集合中で最もスコアが低い（＝末尾の）要素と差し替えて
+    /// 強制的に残す。
+    ///
+    /// この保証は「`protect` の挿入時点で選ばれた各近傍が `protect` への逆方向
+    /// リンクを保持する」ことのみを担保する insertion-time の不変条件であり、
+    /// 後続の別ノード挿入がこれらの近傍を再度 `shrink_links` する際に `protect`
+    /// が漏れる余地までは塞がない（グローバルな到達性の恒久保証ではない）。
+    /// 全ノード挿入後に残るその残差ケースは `HnswIndex::build` 末尾の
+    /// [`Self::repair_reachability`] が閉じる（この関数自体は呼ばない。
+    /// 呼ぶと、他の未到達ノードを直すための枝刈りが無関係な第三のノードの
+    /// 唯一の到達経路を巻き込んで壊す whack-a-mole が起こり得るため）。
+    /// 詳細は `docs/design/hnsw-graph-construction.md`
+    /// 「逆方向リンクの到達性保証」節参照。
+    fn shrink_links(
+        &mut self,
+        node: u32,
+        level: usize,
+        dim: usize,
+        vectors: &[f32],
+        protect: u32,
+    ) -> Result<(), HnswError> {
+        let limit = max_degree_for(&self.params, level);
+        let current_links: Vec<u32> = self
+            .nodes
+            .get(node as usize)
+            .and_then(|n| n.links.get(level))
+            .cloned()
+            .unwrap_or_default();
+        // 縮退の計算本体（読み取り→再選択）は `compute_shrink` という純粋関数に
+        // 切り出し済み。並列構築（`parallel_build`。Issue #406）は書き込みロック
+        // 1 回の中で「現在のリンクを読む→`compute_shrink`→書き戻す」を原子的に
+        // 行うことで同じ計算を共有する（`docs/design/hnsw-parallel-build.md`
+        // 参照）。逐次経路（本メソッド）はロック不要のため読み→計算→書き込みを
+        // そのまま `self.nodes` への 2 回のアクセスとして行う。
+        if let Some(shrunk) = compute_shrink(&current_links, node, dim, vectors, limit, protect)? {
+            if let Some(n) = self.nodes.get_mut(node as usize) {
+                if let Some(links) = n.links.get_mut(level) {
+                    *links = shrunk;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `dot(node, query)`。[`HnswIndex::score`] と同じ委譲（`GraphBuilder`
+    /// は `vectors` を保持しないため、呼び出し元から渡された `vectors` を
+    /// そのまま [`score_of`] へ渡す）。
+    fn score(
+        &self,
+        node: u32,
+        query: &[f32],
+        dim: usize,
+        vectors: &[f32],
+    ) -> Result<f32, HnswError> {
+        score_of(vectors, dim, node, query)
+    }
+
+    /// 構築経路の `search_layer`（[`HnswIndex::search_layer`] と同型。
+    /// 構築中は常にパイプライン prefetch（[`prefetch::PipelinePrefetch`]）を
+    /// 使う。[`search_layer_in`] の型パラメータ `A` を `Self` に単相化する
+    /// だけの薄い委譲。
+    #[allow(clippy::too_many_arguments)]
+    fn search_layer<V: VisitedSet>(
+        &self,
+        entry_points: Vec<u32>,
+        query: &[f32],
+        ef: usize,
+        level: usize,
+        dim: usize,
+        vectors: &[f32],
+        visited: &mut V,
+        accept: Option<&NodeMask>,
+    ) -> Result<Vec<ScoredNode>, HnswError> {
+        search_layer_in(
+            self,
+            entry_points,
+            query,
+            ef,
+            level,
+            dim,
+            vectors,
+            visited,
+            accept,
+            &prefetch::PipelinePrefetch,
+        )
+    }
+}
+
+impl HnswIndex {
+    /// row-major 連続バッファ（`VectorArena::vectors()` と同レイアウト。
+    /// `vectors[node * dim .. node * dim + dim]` が `node` 番目のベクトル）から
+    /// 単一スレッドで構築する。
+    ///
+    /// 検証順序: パラメータ → 次元整合 → ノード数上限 → 非有限値。空入力
+    /// （`vectors` が空）は空索引を返す（エラーにしない。呼び出し元が未挿入の
+    /// テーブルへ構築を試みる自然なケースのため）。
+    pub fn build(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<Self, HnswError> {
+        let dim_usize = dim as usize;
+        let n = validate_build_input(&params, dim, vectors)?;
+
+        // `vectors` の不変スナップショットを取り、以降 `search` はこれのみを
+        // 参照する（モジュール冒頭「ベクトルの所有方針」節・codex-review PR
+        // #430 P1 指摘対応。呼び出し元が構築後に借用元バッファを書き換えても
+        // この Arc の中身は変化しない）。
+        let owned_vectors: Arc<[f32]> = Arc::from(vectors);
+        let mut builder = GraphBuilder {
+            params,
+            nodes: Vec::with_capacity(n),
+            entry_point: None,
+        };
+        if n == 0 {
+            return Self::freeze_from(builder, dim, owned_vectors);
+        }
+
+        let mut rng = DeterministicRng::new(seed);
+        // 全挿入をまたいで使い回す visited スクラッチ（`VisitedScratch` 参照。
+        // 挿入ごとに新規確保しないことで search_layer の初期化コストを
+        // O(N^2) から O(N) 相当へ落とす）。
+        let mut visited = VisitedScratch::default();
+        // 挿入順はノード番号昇順に固定する（呼び出し元の入力順＝挿入順。決定性の
+        // 唯一の自由度は `seed` によるレベル割当だけにする）。
+        for node_idx in 0..n {
+            let level = assign_level(&mut rng, params.m);
+            let node_id = node_idx as u32; // n <= MAX_HNSW_NODES であることを上で検証済み
+            builder.insert_node(node_id, level, dim_usize, vectors, &mut visited)?;
+        }
+
+        builder.repair_reachability(dim_usize, vectors)?;
+
+        Self::freeze_from(builder, dim, owned_vectors)
+    }
+
+    /// [`GraphBuilder`]（構築完了・`repair_reachability` 完了後のもの）を
+    /// CSR（[`csr::CsrGraph`]）へ 1 回だけ平坦化し、[`HnswIndex`] として凍結
+    /// する（Issue #494・`docs/design/hnsw-index.md` §14.2「2 相構成」の後半。
+    /// 平坦化は常に最終段——`build`・並列構築（`parallel_build::freeze`）の
+    /// いずれもここへ到達する直前に修復パスを終えている契約）。
+    fn freeze_from(
+        builder: GraphBuilder,
+        dim: u32,
+        vectors: Arc<[f32]>,
+    ) -> Result<Self, HnswError> {
+        let GraphBuilder {
+            params,
+            nodes,
+            entry_point,
+        } = builder;
+        let graph = csr::CsrGraph::from_nodes(&nodes)?;
+        Ok(HnswIndex {
+            params,
+            dim,
+            graph,
+            entry_point,
+            vectors,
+        })
+    }
+
+    /// [`build`](Self::build) と同じグラフを、要素単位ロック（ノードごとの
+    /// `RwLock`）とエントリポイント更新のみの排他で並列構築する（Issue #406・
+    /// 親 #402。pgvector `hnswbuild.c` のロック粒度設計・qdrant の逐次
+    /// プレフィックス方式を参考にした。手法名のみ参照でコード転記はしない）。
+    ///
+    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の場合は
+    /// [`build`](Self::build) と完全に同一のグラフを返す（内部実装は
+    /// `parallel_build::build_parallel_graph` に委譲せず [`build`](Self::build)
+    /// をそのまま呼ぶ）。`threads >= 2` かつ `n > `[`SEQUENTIAL_PREFIX_NODES`]
+    /// の場合、先頭 [`SEQUENTIAL_PREFIX_NODES`] 件は逐次挿入し、残りを
+    /// `AtomicUsize` によるワークスティール方式で並列挿入する——挿入順が
+    /// 非決定的になるため、構築されるグラフの**形状**は同一 `seed` でも
+    /// run-to-run で変わり得る（レベル割当は並列フェーズ開始前に `seed` から
+    /// 逐次確定するため不変。[`HnswIndex::search`] の決定性契約「同一索引・
+    /// 同一クエリで再現」自体は不変。詳細は `docs/design/hnsw-parallel-build.md`
+    /// 参照）。
+    ///
+    /// # エラー
+    ///
+    /// `threads == 0` または `threads > `[`MAX_BUILD_THREADS`] は
+    /// [`HnswError::InvalidParams`]。構築ワーカーの panic・ロック poison は
+    /// [`HnswError::WorkerPanicked`]（fail-closed。部分的に結線された索引を
+    /// `Ok` で返さない）。
+    pub fn build_with_threads(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+        threads: usize,
+    ) -> Result<Self, HnswError> {
+        if threads == 0 || threads > MAX_BUILD_THREADS {
+            return Err(HnswError::InvalidParams {
+                reason: "threads must be in 1..=MAX_BUILD_THREADS",
+            });
+        }
+        let n = validate_build_input(&params, dim, vectors)?;
+        if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
+            return Self::build(params, dim, vectors, seed);
+        }
+        parallel_build::build_parallel_graph(params, dim, vectors, seed, threads, n)
+    }
+
+    /// [`build_with_threads`](Self::build_with_threads) と同一アルゴリズム・
+    /// 同一エラー契約を共有しつつ、段別の壁時間・ワーカー統計
+    /// （[`HnswBuildProfile`]）を合わせて返す観測版（Issue #406 追記:
+    /// 8→12 スレッド頭打ち要因の切り分け計測。`docs/design/
+    /// hnsw-parallel-build.md` 参照）。
+    ///
+    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の縮退経路
+    /// （[`build`](Self::build) をそのまま呼ぶ）に限り
+    /// [`build_with_threads`](Self::build_with_threads) と完全に同一のグラフを
+    /// 返す。`threads >= 2` かつ `n > `[`SEQUENTIAL_PREFIX_NODES`] の並列経路は
+    /// ワークスティールに依存するため、[`build_with_threads`]
+    /// (Self::build_with_threads) と同様グラフの**形状**が run-to-run で
+    /// 変わり得る（この非決定性自体は観測の有無に関わらない
+    /// `build_with_threads` 既存の契約。モジュール `parallel_build` 冒頭
+    /// 「決定性の範囲」節参照）。
+    ///
+    /// 呼び出し先（`parallel_build::build_parallel_graph_observed`）は
+    /// `build_parallel_graph` と別の実装だが、ノード挿入・凍結・修復の
+    /// アルゴリズム本体（`insert_node_locked`・`assemble_graph`・
+    /// `repair_reachability`）は完全に共有する関数をそのまま呼ぶ。ただし
+    /// 段別計測のため `BuildGraph` のノードロック取得を `try_read`/
+    /// `try_write` → block の二段化にする計装を追加しており、この計装は
+    /// 観測版（`observe=true`）のみに閉じ、非観測版
+    /// （[`build_with_threads`](Self::build_with_threads) が使う
+    /// `observe=false`）には一切波及しない（`parallel_build::BuildGraph::
+    /// observe` 参照。レビュー指摘 P1-A）。したがって
+    /// `build_with_threads_one_matches_sequential_build_exactly` 等の既存
+    /// 完全一致テストは非観測版のみを対象にするため無変更のまま green だが、
+    /// 「ロック取得順序・待ち時間まで非観測版と厳密に同一」であることは
+    /// 主張しない（グラフの構築結果・poison 判定は同一）。
+    ///
+    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の縮退経路
+    /// （[`build`](Self::build) を呼ぶ）では、計測できる段の区切りが
+    /// 存在しないため所要時間の全量を `sequential_prefix` へ積み、
+    /// `workers` は空のままにする（縮退の事実がプロファイルから分かる）。
+    ///
+    /// # エラー
+    ///
+    /// [`build_with_threads`](Self::build_with_threads) と同一（`threads` の
+    /// 範囲外は [`HnswError::InvalidParams`]、ワーカー panic・ロック poison は
+    /// [`HnswError::WorkerPanicked`]）。
+    pub fn build_with_threads_observed(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+        threads: usize,
+    ) -> Result<(Self, HnswBuildProfile), HnswError> {
+        let total_start = std::time::Instant::now();
+        if threads == 0 || threads > MAX_BUILD_THREADS {
+            return Err(HnswError::InvalidParams {
+                reason: "threads must be in 1..=MAX_BUILD_THREADS",
+            });
+        }
+        let n = validate_build_input(&params, dim, vectors)?;
+        if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
+            let seq_start = std::time::Instant::now();
+            let index = Self::build(params, dim, vectors, seed)?;
+            let profile = HnswBuildProfile {
+                sequential_prefix: seq_start.elapsed(),
+                total: total_start.elapsed(),
+                ..HnswBuildProfile::default()
+            };
+            return Ok((index, profile));
+        }
+        let (index, mut profile) =
+            parallel_build::build_parallel_graph_observed(params, dim, vectors, seed, threads, n)?;
+        profile.total = total_start.elapsed();
+        Ok((index, profile))
+    }
+
+    /// [`build_with_threads`](Self::build_with_threads) のスレッド数を
+    /// [`crate::parallel_search::ParallelSearchProvider`] と同じ決定方法
+    /// （`thread_count_for` による行数依存の並列度算出・プロセス全体の
+    /// `WorkerBudgetGuard` による同時実行間の調停）で自動的に決める（Issue
+    /// #406 要件 5。#407／#408 の既定結線先はこちら）。決定された並列度が
+    /// 1 以下、またはグローバル予算を確保できなかった場合は
+    /// [`build`](Self::build)（逐次・完全決定的）へ縮退する（`ParallelSearchProvider`
+    /// と同じ「並列度を落とすだけで失敗させない」縮退規則）。
+    ///
+    /// `thread_count_for` は検索側の `MIN_ROWS_PER_THREAD`（1,024）を
+    /// 1 スレッドあたりの担当行数の下限として使う（`available_parallelism`
+    /// と `row_count / MIN_ROWS_PER_THREAD` の小さい方）ため、実質的な並列化
+    /// 閾値は `MIN_ROWS_PER_THREAD * 2`（2,048。`available_parallelism >= 2`
+    /// の環境で `desired >= 2` になる最小の `n`）であり、本メソッドが別途
+    /// 課す [`SEQUENTIAL_PREFIX_NODES`]（256）より大きい。したがって
+    /// `n` が 257..2047 の範囲では [`build_with_threads`](Self::
+    /// build_with_threads) に明示的なスレッド数を渡せば並列化されるが、
+    /// 本メソッドは検索側の閾値をそのまま流用する設計判断により逐次へ
+    /// 縮退する（構築 1 ノードあたりのコストは検索 1 クエリの `dot` 計算
+    /// より大幅に重いため、この閾値が構築にとって保守的すぎる可能性は
+    /// 残るが、#407／#408 が実運用で結線する際に単一の決定方法を共有する
+    /// 利点を優先した。見直しが必要になれば構築専用の閾値を別途持たせる）。
+    pub fn build_parallel(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<Self, HnswError> {
+        let n = validate_build_input(&params, dim, vectors)?;
+        let desired = crate::parallel_search::thread_count_for(n).min(MAX_BUILD_THREADS);
+        if desired <= 1 || n <= SEQUENTIAL_PREFIX_NODES {
+            return Self::build(params, dim, vectors, seed);
+        }
+        let guard = crate::parallel_search::WorkerBudgetGuard::acquire(desired);
+        let granted = guard.granted();
+        if granted <= 1 {
+            drop(guard);
+            return Self::build(params, dim, vectors, seed);
+        }
+        let result = Self::build_with_threads(params, dim, vectors, seed, granted);
+        drop(guard);
+        result
     }
 
     /// [`Self::greedy_descend`] のマスク付き版（Issue #431・codex-review P0
@@ -1390,16 +1598,20 @@ impl HnswIndex {
     /// （このパス自体、entry point が非受理の場合にのみ発生する）。
     fn find_alternate_entry(&self, mask: &NodeMask) -> Option<u32> {
         let mut best: Option<(u32, usize)> = None;
-        for (idx, node) in self.nodes.iter().enumerate() {
+        for idx in 0..self.graph.node_count() {
             let Ok(id) = u32::try_from(idx) else {
                 continue;
             };
             if !mask.get(id) {
                 continue;
             }
+            // `idx < node_count()` の範囲であることは上のループ条件が保証する
+            // ため、`level_of` は必ず `Some` を返す（CSR 化前の `Vec<Node>`
+            // 直接走査と等価。`unwrap_or(0)` は範囲外到達不能の防御的処理）。
+            let level = self.level_of(id).unwrap_or(0);
             match best {
-                Some((_, best_level)) if best_level >= node.level => {}
-                _ => best = Some((id, node.level)),
+                Some((_, best_level)) if best_level >= level => {}
+                _ => best = Some((id, level)),
             }
         }
         best.map(|(id, _)| id)
@@ -1485,7 +1697,7 @@ impl HnswIndex {
         target: usize,
         visited: &mut VisitedBitmap,
     ) -> usize {
-        visited.reset(self.nodes.len());
+        visited.reset(self.graph.node_count());
         if visited.mark_visited(start as usize) != Some(false) {
             return 0;
         }
@@ -1595,6 +1807,11 @@ impl HnswIndex {
     /// 受理判定・順序規約は [`Self::search_layer`] の既存契約から一切変更
     /// していない（先読みは demand load の発行位置を早めるだけで、
     /// 探索結果・比較順序には影響しない）。
+    ///
+    /// 本体は [`search_layer_in`]（Issue #494。[`Adjacency`] でジェネリック化
+    /// した自由関数。構築中の [`GraphBuilder::search_layer`] とも共有する）へ
+    /// 委譲する薄いラッパー。`self.graph`（[`csr::CsrGraph`]）を渡すだけで、
+    /// アルゴリズム本体・停止条件・受理判定は変更していない。
     #[allow(clippy::too_many_arguments)]
     pub(in crate::hnsw) fn search_layer_with<V: VisitedSet, P: prefetch::PrefetchPolicy>(
         &self,
@@ -1608,117 +1825,18 @@ impl HnswIndex {
         accept: Option<&NodeMask>,
         prefetch: &P,
     ) -> Result<Vec<ScoredNode>, HnswError> {
-        visited.reset(self.nodes.len());
-        let mut candidates: BinaryHeap<ScoredNode> = BinaryHeap::new();
-        // 結果集合は最小ヒープとして扱いたいので `Reverse` で包む。
-        let mut results: BinaryHeap<std::cmp::Reverse<ScoredNode>> = BinaryHeap::new();
-        let is_accepted = |node: u32| accept.map(|m| m.get(node)).unwrap_or(true);
-
-        for ep in entry_points {
-            match visited.mark_visited(ep as usize) {
-                Some(true) => continue,
-                Some(false) => {}
-                None => continue,
-            }
-            if !is_accepted(ep) {
-                // 非受理（stale・不可視）ノードは候補ヒープへも一切積まない
-                // （§関数ドキュメンテーションコメント参照。訪問済みマークのみ
-                // 付けてスコア計算・以降の探索を行わない）。
-                continue;
-            }
-            let score = self.score(ep, query, dim, vectors)?;
-            let scored = ScoredNode { node: ep, score };
-            candidates.push(scored);
-            results.push(std::cmp::Reverse(scored));
-        }
-
-        while let Some(top_candidate) = candidates.pop() {
-            // 候補集合の最良要素が、結果集合中の最悪要素より「厳密に」劣るなら
-            // 打ち切る（Algorithm 2 の停止条件）。ここは `ScoredNode::cmp`（id
-            // 昇順タイブレーク込みの複合順序）ではなく **スコアのみ**の比較に
-            // 限定する。複合順序で判定すると、スコアが同点で id が大きいだけの
-            // 候補まで「より遠い」と誤判定して打ち切ってしまい、その候補の
-            // 未訪問隣接ノードがより近い可能性を探索し損なう（同点候補が
-            // 生じやすい重複 embedding で顕在化。
-            // `docs/design/hnsw-graph-construction.md`「`search_layer` の
-            // 停止・受理判定: 順序規約の使い分け」節参照）。
-            // id 順の複合順序は結果集合の内容（`results.pop()` によるヒープ
-            // 内での追い出し順）・最終出力の安定ソートでのみ使い、探索を続ける
-            // か否かの判定には使わない。
-            if let Some(std::cmp::Reverse(worst)) = results.peek() {
-                let strictly_farther =
-                    top_candidate.score.total_cmp(&worst.score) == std::cmp::Ordering::Less;
-                if results.len() >= ef && strictly_farther {
-                    break;
-                }
-            }
-
-            if let Some(neighbors) = self.neighbors(level, top_candidate.node) {
-                // Issue #490: hnswlib `searchBaseLayerST` に倣うソフトウェア
-                // パイプライン先読み。隣接リストの先頭要素をループ開始前に、
-                // 以降は各反復 `j` の先頭で `j+1` 番目を先読みする（距離 1）。
-                // 受理判定後にのみ触れる P0 契約（Issue #431 是正。§関数
-                // ドキュメンテーションコメント参照）を守るため、`is_accepted`
-                // を通過したノードのみを先読み対象にする——`is_accepted` は
-                // `NodeMask::get` の純粋なビット判定で副作用を持たないため、
-                // 自身の反復時に再評価しても意味は変わらない。
-                if let Some(&first) = neighbors.first() {
-                    if is_accepted(first) {
-                        prefetch.prefetch_neighbor(first, visited, vectors, dim);
-                    }
-                }
-                for (j, &neighbor) in neighbors.iter().enumerate() {
-                    if let Some(&next) = neighbors.get(j + 1) {
-                        if is_accepted(next) {
-                            prefetch.prefetch_neighbor(next, visited, vectors, dim);
-                        }
-                    }
-                    let already = match visited.mark_visited(neighbor as usize) {
-                        Some(seen) => seen,
-                        None => continue,
-                    };
-                    if already {
-                        continue;
-                    }
-                    if !is_accepted(neighbor) {
-                        // 非受理ノードは訪問済みにするのみで候補ヒープへは
-                        // 積まない（Issue #431 是正。§関数ドキュメンテーション
-                        // コメント参照）。スコア計算（このノードのベクトルへの
-                        // アクセス）自体を行わず、この隣接ノード経由でのさらに
-                        // 先の探索も一切行わない。
-                        continue;
-                    }
-                    let neighbor_score = self.score(neighbor, query, dim, vectors)?;
-                    let scored = ScoredNode {
-                        node: neighbor,
-                        score: neighbor_score,
-                    };
-                    // 打ち切り判定と同じ理由でスコアのみの比較に限定する
-                    // （`scored` が `worst` とスコア同点なら、id 順の複合順序で
-                    // 「劣る」と判定されても受理する）。`worst_ok` を満たす
-                    // 隣接ノードは（上の `is_accepted` チェックを通過済みのため）
-                    // 候補ヒープ・結果ヒープの双方へ積む。
-                    let worst_ok = match results.peek() {
-                        Some(std::cmp::Reverse(worst)) => {
-                            results.len() < ef
-                                || scored.score.total_cmp(&worst.score) != std::cmp::Ordering::Less
-                        }
-                        None => true,
-                    };
-                    if worst_ok {
-                        candidates.push(scored);
-                        results.push(std::cmp::Reverse(scored));
-                        if results.len() > ef {
-                            results.pop();
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut out: Vec<ScoredNode> = results.into_iter().map(|r| r.0).collect();
-        out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
-        Ok(out)
+        search_layer_in(
+            &self.graph,
+            entry_points,
+            query,
+            ef,
+            level,
+            dim,
+            vectors,
+            visited,
+            accept,
+            prefetch,
+        )
     }
 
     /// 近傍選択ヒューリスティック（Algorithm 4）。既定は `extend_candidates=false`・
@@ -1728,6 +1846,12 @@ impl HnswIndex {
     /// 形（候補の隣接をさらに候補へ加える拡張）は実装しない（到達しない分岐は
     /// 検証されないままコードに残り将来のバグ源になるため。既定を有効化する
     /// 場合に別途実装する）。
+    ///
+    /// 構築経路（[`GraphBuilder::insert_node`]）は本体（[`select_neighbors_heuristic_free`]）
+    /// を直接呼ぶため、本メソッドは production 経路からは呼ばれない
+    /// （Issue #494）。テスト（`select_neighbors_heuristic_prunes_redundant_close_candidates`）
+    /// が `HnswIndex` 経由で純粋関数の挙動を検証するために残す。
+    #[cfg(test)]
     fn select_neighbors_heuristic(
         &self,
         candidates: &[ScoredNode],
@@ -1739,78 +1863,6 @@ impl HnswIndex {
         // へ切り出し済み。並列構築（`parallel_build`。Issue #406）の
         // `BuildGraph` からも同じ実装を共有する。
         select_neighbors_heuristic_free(candidates, m, dim, vectors)
-    }
-
-    /// `from -> to` への単方向リンクを層 `level` へ追加する（重複・自己ループは
-    /// 追加しない）。次数上限の適用は呼び出し元の [`Self::shrink_links`] が担う。
-    fn connect(&mut self, from: u32, to: u32, level: usize) {
-        if from == to {
-            return;
-        }
-        let Some(node) = self.nodes.get_mut(from as usize) else {
-            return;
-        };
-        let Some(links) = node.links.get_mut(level) else {
-            return;
-        };
-        if !links.contains(&to) {
-            links.push(to);
-        }
-    }
-
-    /// `node` の層 `level` における隣接数が次数上限を超えていれば、その隣接集合
-    /// 全体へヒューリスティック近傍選択を再適用して上限内へ縮退させる
-    /// （Algorithm 1 の「次数上限超過時の再選択」段）。
-    ///
-    /// `protect` は、この呼び出し直前に `insert_node` が `node <-> protect` へ
-    /// 張ったばかりの逆方向リンク先（新規挿入ノード自身）。ヒューリスティックが
-    /// `protect` を枝刈りしてしまうと、新規ノードへの唯一の入口だった逆方向
-    /// リンクが失われ、エントリポイントからの到達路が残らないまま孤立し得る
-    /// （挿入ノードは自身の外向きリンクは持つが、探索はエントリポイントから
-    /// 既存ノードの隣接リストを辿って到達するため入方向のリンクが要る）。
-    /// ヒューリスティック選択後に `protect` が漏れて
-    /// いれば、選択済み集合中で最もスコアが低い（＝末尾の）要素と差し替えて
-    /// 強制的に残す。
-    ///
-    /// この保証は「`protect` の挿入時点で選ばれた各近傍が `protect` への逆方向
-    /// リンクを保持する」ことのみを担保する insertion-time の不変条件であり、
-    /// 後続の別ノード挿入がこれらの近傍を再度 `shrink_links` する際に `protect`
-    /// が漏れる余地までは塞がない（グローバルな到達性の恒久保証ではない）。
-    /// 全ノード挿入後に残るその残差ケースは `HnswIndex::build` 末尾の
-    /// [`Self::repair_reachability`] が閉じる（この関数自体は呼ばない。
-    /// 呼ぶと、他の未到達ノードを直すための枝刈りが無関係な第三のノードの
-    /// 唯一の到達経路を巻き込んで壊す whack-a-mole が起こり得るため）。
-    /// 詳細は `docs/design/hnsw-graph-construction.md`
-    /// 「逆方向リンクの到達性保証」節参照。
-    fn shrink_links(
-        &mut self,
-        node: u32,
-        level: usize,
-        dim: usize,
-        vectors: &[f32],
-        protect: u32,
-    ) -> Result<(), HnswError> {
-        let limit = max_degree_for(&self.params, level);
-        let current_links: Vec<u32> = self
-            .nodes
-            .get(node as usize)
-            .and_then(|n| n.links.get(level))
-            .cloned()
-            .unwrap_or_default();
-        // 縮退の計算本体（読み取り→再選択）は `compute_shrink` という純粋関数に
-        // 切り出し済み。並列構築（`parallel_build`。Issue #406）は書き込みロック
-        // 1 回の中で「現在のリンクを読む→`compute_shrink`→書き戻す」を原子的に
-        // 行うことで同じ計算を共有する（`docs/design/hnsw-parallel-build.md`
-        // 参照）。逐次経路（本メソッド）はロック不要のため読み→計算→書き込みを
-        // そのまま `self.nodes` への 2 回のアクセスとして行う。
-        if let Some(shrunk) = compute_shrink(&current_links, node, dim, vectors, limit, protect)? {
-            if let Some(n) = self.nodes.get_mut(node as usize) {
-                if let Some(links) = n.links.get_mut(level) {
-                    *links = shrunk;
-                }
-            }
-        }
-        Ok(())
     }
 
     /// `dot(node, query)`。ノード id が範囲外／`vectors` が短すぎる場合は
@@ -1841,12 +1893,12 @@ impl HnswIndex {
 
     /// 構築済みノード数。
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.graph.node_count()
     }
 
     /// ノード数が 0 か。
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.graph.node_count() == 0
     }
 
     /// `build` 時点の内部スナップショット（`self.vectors`）から `node` 番目の
@@ -1859,32 +1911,17 @@ impl HnswIndex {
         node_vector(&self.vectors, self.dim as usize, node).ok()
     }
 
-    /// 索引本体（隣接リスト・複製ベクトル）の概算ヒープバイト量（Issue #408。
-    /// `sql::hnsw_cache::HnswIndexCache` の容量判定・観測用統計が使う）。
-    /// `self.vectors`（`build` 時に複製した `Arc<[f32]>`）＋各ノードの隣接
-    /// リスト（層ごとの `Vec<u32>`）の `capacity()` を合算する。
+    /// 索引本体（CSR 隣接表現・複製ベクトル）の概算ヒープバイト量（Issue #408。
+    /// `sql::hnsw_cache::HnswIndexCache` の容量判定・観測用統計が使う。
+    /// Issue #494 で CSR 化した後は [`csr::CsrGraph::approx_heap_bytes`] へ
+    /// 委譲する）。`self.vectors`（`build` 時に複製した `Arc<[f32]>`）＋
+    /// [`csr::CsrGraph`] の 4 配列の `capacity()` を合算する。
     pub fn approx_heap_bytes(&self) -> usize {
         let vectors_bytes = self
             .vectors
             .len()
             .saturating_mul(std::mem::size_of::<f32>());
-        let nodes_bytes: usize = self
-            .nodes
-            .iter()
-            .map(|node| {
-                let links_bytes: usize = node
-                    .links
-                    .iter()
-                    .map(|l| {
-                        l.capacity()
-                            .saturating_mul(std::mem::size_of::<u32>())
-                            .saturating_add(std::mem::size_of::<Vec<u32>>())
-                    })
-                    .fold(0usize, |acc, n| acc.saturating_add(n));
-                links_bytes.saturating_add(std::mem::size_of::<Node>())
-            })
-            .fold(0usize, |acc, n| acc.saturating_add(n));
-        vectors_bytes.saturating_add(nodes_bytes)
+        vectors_bytes.saturating_add(self.graph.approx_heap_bytes())
     }
 
     /// グラフ全体の最大層（エントリポイントのレベル）。空索引では `None`。
@@ -1899,16 +1936,13 @@ impl HnswIndex {
 
     /// ノード `node` が割り当てられたレベル。存在しないノードは `None`。
     pub fn level_of(&self, node: u32) -> Option<usize> {
-        self.nodes.get(node as usize).map(|n| n.level)
+        Adjacency::level_of(&self.graph, node)
     }
 
     /// 層 `level` におけるノード `node` の隣接リスト。存在しない層・ノードは
     /// `None`（ノードのレベルが `level` 未満の場合を含む）。
     pub fn neighbors(&self, level: usize, node: u32) -> Option<&[u32]> {
-        self.nodes
-            .get(node as usize)
-            .and_then(|n| n.links.get(level))
-            .map(|l| l.as_slice())
+        Adjacency::neighbors(&self.graph, level, node)
     }
 
     /// 層 `level` における最大次数（層 0 は `2*m`、層 1 以上は `m`）。テスト・
@@ -2038,13 +2072,13 @@ impl HnswIndex {
             });
         }
         if let Some(m) = mask {
-            if m.len() != self.nodes.len() {
+            if m.len() != self.graph.node_count() {
                 return Err(HnswError::InvalidParams {
                     reason: "mask length does not match index node count",
                 });
             }
         }
-        if k == 0 || self.nodes.is_empty() {
+        if k == 0 || self.graph.node_count() == 0 {
             return Ok(Vec::new());
         }
 
@@ -2150,6 +2184,149 @@ impl HnswIndex {
             .collect();
         Ok(out)
     }
+}
+
+/// [`HnswIndex::search_layer_with`]／[`GraphBuilder::search_layer`] が
+/// 共有する `search_layer`（Algorithm 2）の本体（Issue #494。凍結後の
+/// [`csr::CsrGraph`]・構築中の [`GraphBuilder`] のどちらの隣接表現からも
+/// 呼べるよう [`Adjacency`] でジェネリック化した自由関数）。層 `level` 上で
+/// `entry_points` から出発し、幅 `ef` の貪欲拡張探索を行い、`dot` 降順
+/// （同点は id 昇順）に並んだ最大 `ef` 件の候補を返す。
+///
+/// `visited` は呼び出し元（`insert_node`／`build` あるいはテスト）が全
+/// 呼び出しをまたいで所有する visited 集合（[`VisitedSet`]）。構築経路は
+/// 世代カウンタ方式の [`VisitedScratch`]、探索経路（[`HnswIndex::search`]）は
+/// ビットマップ方式の [`VisitedBitmap`] を渡す。`accept`（Issue #409）が
+/// `Some` の場合、受理しないノードは候補ヒープへも一切積まない——訪問済み
+/// マークは付けるが、スコア計算（索引ノードのベクトルへのアクセスを伴う）
+/// 自体を行わず、その隣接ノードへの探索も一切行わない（Issue #431・
+/// codex-review P0 是正。`docs/design/ann-index-adoption.md`「RLS／
+/// フィルタとの相互作用と折衷案」節の P0 安全条件）。`None` の場合は常に
+/// 受理したのと同じ振る舞いになる（`search_masked_none_matches_search` 参照）。
+#[allow(clippy::too_many_arguments)]
+fn search_layer_in<V: VisitedSet, P: prefetch::PrefetchPolicy, A: Adjacency>(
+    graph: &A,
+    entry_points: Vec<u32>,
+    query: &[f32],
+    ef: usize,
+    level: usize,
+    dim: usize,
+    vectors: &[f32],
+    visited: &mut V,
+    accept: Option<&NodeMask>,
+    prefetch: &P,
+) -> Result<Vec<ScoredNode>, HnswError> {
+    visited.reset(graph.node_count());
+    let mut candidates: BinaryHeap<ScoredNode> = BinaryHeap::new();
+    // 結果集合は最小ヒープとして扱いたいので `Reverse` で包む。
+    let mut results: BinaryHeap<std::cmp::Reverse<ScoredNode>> = BinaryHeap::new();
+    let is_accepted = |node: u32| accept.map(|m| m.get(node)).unwrap_or(true);
+
+    for ep in entry_points {
+        match visited.mark_visited(ep as usize) {
+            Some(true) => continue,
+            Some(false) => {}
+            None => continue,
+        }
+        if !is_accepted(ep) {
+            // 非受理（stale・不可視）ノードは候補ヒープへも一切積まない
+            // （§関数ドキュメンテーションコメント参照。訪問済みマークのみ
+            // 付けてスコア計算・以降の探索を行わない）。
+            continue;
+        }
+        let score = score_of(vectors, dim, ep, query)?;
+        let scored = ScoredNode { node: ep, score };
+        candidates.push(scored);
+        results.push(std::cmp::Reverse(scored));
+    }
+
+    while let Some(top_candidate) = candidates.pop() {
+        // 候補集合の最良要素が、結果集合中の最悪要素より「厳密に」劣るなら
+        // 打ち切る（Algorithm 2 の停止条件）。ここは `ScoredNode::cmp`（id
+        // 昇順タイブレーク込みの複合順序）ではなく **スコアのみ**の比較に
+        // 限定する。複合順序で判定すると、スコアが同点で id が大きいだけの
+        // 候補まで「より遠い」と誤判定して打ち切ってしまい、その候補の
+        // 未訪問隣接ノードがより近い可能性を探索し損なう（同点候補が
+        // 生じやすい重複 embedding で顕在化。
+        // `docs/design/hnsw-graph-construction.md`「`search_layer` の
+        // 停止・受理判定: 順序規約の使い分け」節参照）。
+        // id 順の複合順序は結果集合の内容（`results.pop()` によるヒープ
+        // 内での追い出し順）・最終出力の安定ソートでのみ使い、探索を続ける
+        // か否かの判定には使わない。
+        if let Some(std::cmp::Reverse(worst)) = results.peek() {
+            let strictly_farther =
+                top_candidate.score.total_cmp(&worst.score) == std::cmp::Ordering::Less;
+            if results.len() >= ef && strictly_farther {
+                break;
+            }
+        }
+
+        if let Some(neighbors) = graph.neighbors(level, top_candidate.node) {
+            // Issue #490: hnswlib `searchBaseLayerST` に倣うソフトウェア
+            // パイプライン先読み。隣接リストの先頭要素をループ開始前に、
+            // 以降は各反復 `j` の先頭で `j+1` 番目を先読みする（距離 1）。
+            // 受理判定後にのみ触れる P0 契約（Issue #431 是正。§関数
+            // ドキュメンテーションコメント参照）を守るため、`is_accepted`
+            // を通過したノードのみを先読み対象にする——`is_accepted` は
+            // `NodeMask::get` の純粋なビット判定で副作用を持たないため、
+            // 自身の反復時に再評価しても意味は変わらない。
+            if let Some(&first) = neighbors.first() {
+                if is_accepted(first) {
+                    prefetch.prefetch_neighbor(first, visited, vectors, dim);
+                }
+            }
+            for (j, &neighbor) in neighbors.iter().enumerate() {
+                if let Some(&next) = neighbors.get(j + 1) {
+                    if is_accepted(next) {
+                        prefetch.prefetch_neighbor(next, visited, vectors, dim);
+                    }
+                }
+                let already = match visited.mark_visited(neighbor as usize) {
+                    Some(seen) => seen,
+                    None => continue,
+                };
+                if already {
+                    continue;
+                }
+                if !is_accepted(neighbor) {
+                    // 非受理ノードは訪問済みにするのみで候補ヒープへは
+                    // 積まない（Issue #431 是正。§関数ドキュメンテーション
+                    // コメント参照）。スコア計算（このノードのベクトルへの
+                    // アクセス）自体を行わず、この隣接ノード経由でのさらに
+                    // 先の探索も一切行わない。
+                    continue;
+                }
+                let neighbor_score = score_of(vectors, dim, neighbor, query)?;
+                let scored = ScoredNode {
+                    node: neighbor,
+                    score: neighbor_score,
+                };
+                // 打ち切り判定と同じ理由でスコアのみの比較に限定する
+                // （`scored` が `worst` とスコア同点なら、id 順の複合順序で
+                // 「劣る」と判定されても受理する）。`worst_ok` を満たす
+                // 隣接ノードは（上の `is_accepted` チェックを通過済みのため）
+                // 候補ヒープ・結果ヒープの双方へ積む。
+                let worst_ok = match results.peek() {
+                    Some(std::cmp::Reverse(worst)) => {
+                        results.len() < ef
+                            || scored.score.total_cmp(&worst.score) != std::cmp::Ordering::Less
+                    }
+                    None => true,
+                };
+                if worst_ok {
+                    candidates.push(scored);
+                    results.push(std::cmp::Reverse(scored));
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<ScoredNode> = results.into_iter().map(|r| r.0).collect();
+    out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
+    Ok(out)
 }
 
 /// row-major バッファから `node` 番目のベクトルスライスを取り出す。範囲外
@@ -2392,6 +2569,30 @@ mod tests {
         out
     }
 
+    /// 直接組んだ `Node` 列（可変長ビルダー表現）から `HnswIndex` を構成する
+    /// テスト専用ヘルパ（Issue #494・凍結時の CSR 平坦化）。`HnswIndex` の
+    /// 内部表現が `CsrGraph`（[`csr::CsrGraph`]）へ変わったため、テストは
+    /// `build`／並列構築を経由せず直接グラフ形状を指定したい場合でも
+    /// [`GraphBuilder`] を経由してから [`HnswIndex::freeze_from`] で凍結する
+    /// 必要がある。`repair_reachability` は呼ばない（テストが指定したグラフ
+    /// 形状をそのまま保持するため。呼ぶとテストが意図的に作った未修復の
+    /// 状態が変わってしまう）。
+    fn index_from_nodes(
+        params: HnswParams,
+        dim: u32,
+        nodes: Vec<Node>,
+        entry_point: Option<u32>,
+        vectors: Arc<[f32]>,
+    ) -> HnswIndex {
+        let builder = GraphBuilder {
+            params,
+            nodes,
+            entry_point,
+        };
+        HnswIndex::freeze_from(builder, dim, vectors)
+            .expect("test fixture nodes must be valid for CSR flattening")
+    }
+
     /// Issue #490: prefetch を一切行わない `PrefetchPolicy`（テスト専用）。
     /// `PipelinePrefetch` とのビット同一性の対照として使う。production
     /// バイナリには到達しない（`#[cfg(test)]` の `mod tests` 内限定）。
@@ -2596,10 +2797,10 @@ mod tests {
             m: 2,
             ..Default::default()
         };
-        let index = HnswIndex {
+        let index = index_from_nodes(
             params,
-            dim: dim as u32,
-            nodes: vec![
+            dim as u32,
+            vec![
                 Node {
                     level: 0,
                     links: vec![Vec::new()],
@@ -2613,12 +2814,12 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
+            Some(0),
             // 本テストは select_neighbors_heuristic を直接呼ぶのみで search() を
             // 経由しないため、`vectors` の内容は使われない（プレースホルダで
             // 十分）。
-            vectors: Arc::from(vectors.clone()),
-        };
+            Arc::from(vectors.clone()),
+        );
         let query = &[1.0f32, 0.0f32];
         let candidates = vec![
             ScoredNode {
@@ -2738,10 +2939,10 @@ mod tests {
         // dim=1 の `dot(v, q) = v[0] * q[0]` なので `q=[1.0]` のときスコアは
         // ノード値そのものになる。
         let vectors: Vec<f32> = vec![10.0, 10.0, 20.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 Node {
                     level: 0,
                     links: vec![vec![1]],
@@ -2755,12 +2956,12 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
+            Some(0),
             // 本テストは search_layer を直接呼ぶのみで search() を経由しない
             // ため、`vectors` フィールドの内容は使われない（プレースホルダで
             // 十分）。
-            vectors: Arc::from(vectors.clone()),
-        };
+            Arc::from(vectors.clone()),
+        );
         let query = [1.0f32];
         let mut visited = VisitedScratch::default();
         let results = index
@@ -2803,10 +3004,10 @@ mod tests {
         // dim=1 の `dot(v, q) = v[0] * q[0]` なので `q=[1.0]` のときスコアは
         // ノード値そのもの。node2 が最良スコアだが node1 経由でしか到達できない。
         let vectors: Vec<f32> = vec![10.0, 15.0, 20.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 Node {
                     level: 0,
                     links: vec![vec![1]],
@@ -2820,9 +3021,9 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
-            vectors: Arc::from(vectors),
-        };
+            Some(0),
+            Arc::from(vectors),
+        );
         let query = [1.0f32];
         let mut scratch = HnswSearchScratch::default();
 
@@ -2892,10 +3093,10 @@ mod tests {
     fn search_finds_expected_top_k_on_minimal_graph() {
         let dim = 1usize;
         let vectors: Vec<f32> = vec![10.0, 10.0, 20.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 Node {
                     level: 0,
                     links: vec![vec![1]],
@@ -2909,11 +3110,11 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
+            Some(0),
             // search() は `self.vectors`（build 時の不変スナップショット）を
             // 参照するため、struct literal でも同じ内容を設定する。
-            vectors: Arc::from(vectors.clone()),
-        };
+            Arc::from(vectors.clone()),
+        );
         let query = [1.0f32];
         let mut scratch = HnswSearchScratch::default();
         let results = index.search(&query, 2, 1, &mut scratch).unwrap();
@@ -3290,10 +3491,10 @@ mod tests {
     fn is_mask_fully_reachable_uses_the_same_alternate_entry_as_search_masked() {
         let dim = 1usize;
         let vectors: Vec<f32> = vec![0.0, 1.0, 2.0, 3.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 // node0: entry point（マスクで非受理にする）。他ノードとは
                 // 無関係な孤立ノードにしておき、誤って起点に使われた場合の
                 // 挙動が明確になるようにする。
@@ -3314,9 +3515,9 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
-            vectors: Arc::from(vectors),
-        };
+            Some(0),
+            Arc::from(vectors),
+        );
 
         let mut mask = NodeMask::new(index.len());
         mask.set(1);
@@ -3369,10 +3570,10 @@ mod tests {
         let dim = 1usize;
         // dot(v, q) = v[0] * q[0]、q=[1.0] なのでスコアは値そのもの。
         let vectors: Vec<f32> = vec![5.0, 100.0, 10.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 // node0: entry。level1 隣接は node2（スコア上位のため貪欲降下
                 // は必ずここへ移動する）。level0 隣接は node1・node2 の両方
                 // （有向: node2 側からの逆辺は無い）。
@@ -3393,9 +3594,9 @@ mod tests {
                     links: vec![Vec::new(), Vec::new()],
                 },
             ],
-            entry_point: Some(0),
-            vectors: Arc::from(vectors),
-        };
+            Some(0),
+            Arc::from(vectors),
+        );
 
         let mut mask = NodeMask::new(index.len());
         mask.set(0);
@@ -3448,10 +3649,10 @@ mod tests {
     ) {
         let dim = 1usize;
         let vectors: Vec<f32> = vec![1.0, 2.0, 3.0, 100.0];
-        let index = HnswIndex {
-            params: HnswParams::default(),
-            dim: dim as u32,
-            nodes: vec![
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
                 Node {
                     level: 0,
                     links: vec![vec![1]],
@@ -3470,9 +3671,9 @@ mod tests {
                     links: vec![Vec::new()],
                 },
             ],
-            entry_point: Some(0),
-            vectors: Arc::from(vectors),
-        };
+            Some(0),
+            Arc::from(vectors),
+        );
         let query = [1.0f32];
         let mut scratch = HnswSearchScratch::default();
 
