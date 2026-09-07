@@ -802,7 +802,37 @@ pub(crate) fn execute_grouped_aggregate(
         let candidate_walk = !where_less
             && crate::sql::scalar_plan::classify_scalar_plan(&scalar_shape)
                 != crate::sql::scalar_plan::ScalarPlan::PlainScan;
-        if where_less || candidate_walk {
+        // codex-review P1 指摘（PR #603）「列挙形を使わない理由」: 列挙形は
+        // グループ（値）ごとに全スロットをまとめて処理するため、あるグループの
+        // 処理が完了するたびに `MIN`/`MAX(<TEXT 列>)` の一時的な累計バイト数が
+        // 縮小されうる。そのため「あるグループの大きい値が他グループの大きい値と
+        // 時間的に重なって積み上がる」全走査の物理行順ピークを、列挙形の処理
+        // 順序では決して再現できない場合がある（例: 6 グループ、各グループが
+        // 大きい値の行と小さい値の行から成るとき、全走査は最初の数グループの
+        // 大きい値が積み上がった時点で予算超過するが、列挙形はグループ単位で
+        // 直ちに縮小するため超過を一度も観測しない）。
+        // `observe_group_enumeration` 内の `is_text_accumulator_budget_error`
+        // による捕捉・フォールバック（PR #603 で追加）は「索引経路の処理順序
+        // でのみ超過を検出したケース」しか救えず、この「全走査なら超過するが
+        // 索引経路では超過を検出できないケース」は救えない。索引が使えるか
+        // どうかで `54000` の成否が変わるのは公開 API・エラー契約の互換性に
+        // 反するため（AGENTS.md）、TEXT `MIN`/`MAX` を含む場合は列挙形を最初
+        // から使わず全走査（物理行順）へ委ねる。候補走査形
+        // （`observe_candidate_slots_grouped`）は `resolve_candidates` が
+        // スロット昇順（＝物理行順）を維持し全走査と同一順序で処理するため
+        // 対象外。
+        let text_min_max_blocks_enumeration =
+            where_less && has_text_min_max_aggregate(&bound.items);
+        if text_min_max_blocks_enumeration {
+            // Cursor Bugbot Medium 指摘（PR #603）: 上記の理由で列挙形を
+            // 使わないと事前に確定しているにもかかわらず
+            // `ensure_scalar_index_snapshot` を呼ぶと、cold cache では
+            // `capture_scalar_index_snapshot` が全可視行の embedding を
+            // デコードし使われない `ScalarIndex` を構築してから（無駄な
+            // コスト）結局全走査へ落ちてしまう。この分岐へ来た時点で列挙形は
+            // 確実に使わないため、索引スナップショットの用意自体を試みない。
+            scalar_access.cache.record_aggregate_plain_scan_fallback();
+        } else if where_less || candidate_walk {
             match crate::sql::aggregate::ensure_scalar_index_snapshot(
                 read_txn,
                 ctx,
@@ -814,46 +844,18 @@ pub(crate) fn execute_grouped_aggregate(
             ) {
                 Some((snapshot, index)) => {
                     if where_less {
-                        // codex-review P1 指摘（PR #603）「列挙形を使わない
-                        // 理由」: 列挙形はグループ（値）ごとに全スロットを
-                        // まとめて処理するため、あるグループの処理が完了する
-                        // たびに `MIN`/`MAX(<TEXT 列>)` の一時的な累計バイト数
-                        // が縮小されうる。そのため「あるグループの大きい値が
-                        // 他グループの大きい値と時間的に重なって積み上がる」
-                        // 全走査の物理行順ピークを、列挙形の処理順序では
-                        // 決して再現できない場合がある（例: 6 グループ、各
-                        // グループが大きい値の行と小さい値の行から成るとき、
-                        // 全走査は最初の数グループの大きい値が積み上がった
-                        // 時点で予算超過するが、列挙形はグループ単位で直ちに
-                        // 縮小するため超過を一度も観測しない）。
-                        // `observe_group_enumeration` 内の
-                        // `is_text_accumulator_budget_error` による捕捉・
-                        // フォールバック（PR #603 で追加）は「索引経路の処理
-                        // 順序でのみ超過を検出したケース」しか救えず、この
-                        // 「全走査なら超過するが索引経路では超過を検出でき
-                        // ないケース」は救えない。索引が使えるかどうかで
-                        // `54000` の成否が変わるのは公開 API・エラー契約の
-                        // 互換性に反するため（AGENTS.md）、TEXT `MIN`/`MAX`
-                        // を含む場合は列挙形を最初から使わず全走査（物理行順）
-                        // へ委ねる。候補走査形（`observe_candidate_slots_grouped`）
-                        // は `resolve_candidates` がスロット昇順（＝物理行順）
-                        // を維持し全走査と同一順序で処理するため対象外。
-                        used_index_path = if has_text_min_max_aggregate(&bound.items) {
-                            false
-                        } else {
-                            observe_group_enumeration(
-                                &snapshot,
-                                &index,
-                                schema,
-                                bound,
-                                &referenced,
-                                group_by,
-                                &mut string_groups,
-                                &mut null_group,
-                                &mut total_key_bytes,
-                                &mut total_text_accumulator_bytes,
-                            )?
-                        };
+                        used_index_path = observe_group_enumeration(
+                            &snapshot,
+                            &index,
+                            schema,
+                            bound,
+                            &referenced,
+                            group_by,
+                            &mut string_groups,
+                            &mut null_group,
+                            &mut total_key_bytes,
+                            &mut total_text_accumulator_bytes,
+                        )?;
                     } else {
                         let id_preds: Vec<crate::sql::scalar_plan::IdPredicate> = bound
                             .expr_filters

@@ -520,3 +520,68 @@ fn text_min_max_group_by_capacity_judgement_matches_full_scan() {
         "a TEXT MIN/MAX GROUP BY must always fall back to the full scan"
     );
 }
+
+/// Cursor Bugbot Medium 指摘（PR #603）の回帰: `WHERE` なしの `GROUP BY` が
+/// TEXT `MIN`/`MAX` を含み列挙形を使わないと事前に確定している場合、
+/// `ensure_scalar_index_snapshot`（＝索引スナップショットの採取・
+/// `ScalarIndex::build`）自体を一切試みないことを固定する。
+///
+/// 検証手段: `ScalarIndexCacheStats::builds` は `ScalarIndexCache::insert`
+/// （`ScalarIndex::build` 成功後に呼ばれる）でのみ増加する。cold cache（この
+/// クエリより前に索引を構築するクエリを一切流していない状態）でこのクエリを
+/// 実行し、`builds` が 0 のまま増加しないことを確認する。もし
+/// `ensure_scalar_index_snapshot` が呼ばれていれば（修正前のように）、
+/// cold cache では `capture_scalar_index_snapshot` による piggyback 採取 →
+/// `ScalarIndex::build` → `insert` が走り `builds` が増加するはずである。
+#[test]
+fn text_min_max_group_by_never_attempts_scalar_index_snapshot_on_cold_cache() {
+    let path = unique_db_path("scalar-index-aggregate-text-minmax-no-snapshot");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("k", ColumnType::Text, true),
+            ColumnDef::new("v", ColumnType::Text, true),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+
+    let tenant_ctx = ctx("tenant-a");
+    for (id, (k, v)) in [("a", "1"), ("b", "2"), ("a", "0")].into_iter().enumerate() {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &tenant_ctx,
+            id as u64,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![id as f32, 0.0]),
+                Value::Text(k.to_string()),
+                Value::Text(v.to_string()),
+            ],
+            &op_id(&format!("seed-{id}")),
+        )
+        .expect("insert row");
+    }
+    let core = new_core(storage);
+
+    let builds_before = core.scalar_index_cache_stats().builds;
+    let sql = "SELECT k, MIN(v) AS mn FROM docs GROUP BY k ORDER BY k";
+    let result = core
+        .execute_sql(&ctx("tenant-a"), sql)
+        .expect("query without capacity overrun must succeed");
+    assert_eq!(
+        group_rows(&result),
+        vec![
+            vec![Cell::Text("a".to_string()), Cell::Text("0".to_string())],
+            vec![Cell::Text("b".to_string()), Cell::Text("2".to_string())],
+        ]
+    );
+    let builds_after = core.scalar_index_cache_stats().builds;
+    assert_eq!(
+        builds_before, builds_after,
+        "a TEXT MIN/MAX GROUP BY must never attempt to build a ScalarIndex snapshot on a cold cache"
+    );
+}
