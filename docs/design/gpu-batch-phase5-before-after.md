@@ -100,10 +100,12 @@ FAISS GPU（`IndexFlatIP`）・Qdrant GPU 索引構築との対照値を同一�
 `100000:128:1` は `crossdb-bench.md`「#532 クエリタイル化の前後比較」節が
 記録した局所比較でも中立と判定されており、本書の通し比較でも一貫している。
 
-`mismatch`（GPU f16 vs CPU-SIMD の Top-k 不一致数）は `100000:128:*`・
-`500000:128:64` の 4 点で全 run 0、`20000:128:8`・`20000:128:64` の 2 点では
-before/after いずれも一貫して 1（境界同点許容差。両 side で同一発生のため
-Phase 5 起因の退行ではない）。`i8_recall_at_k` は全点全 run で 1.0000。
+`mismatch`（`count_boundary_tolerant_mismatches` が境界同点を許容した後に
+残った不一致数。GPU f16 vs CPU-SIMD・GPU f32 vs CPU-SIMD 両方の合算値）は
+`100000:128:*`・`500000:128:64` の 4 点で全 run 0、`20000:128:8`・
+`20000:128:64` の 2 点では before/after いずれも一貫して 1。before/after で
+件数が同一であるという事実のみを確認済みで、原因（f16 側か f32 側か・
+どの境界条件か）は未確認。`i8_recall_at_k` は全点全 run で 1.0000。
 
 ### 各 run の生データ
 
@@ -122,14 +124,11 @@ Phase 5 起因の退行ではない）。`i8_recall_at_k` は全点全 run で 1
 | FAISS GPU f32 | 658, 633, 685, 666, 657 | 633 | 658 |
 | FAISS GPU f16 | 761, 759, 779, 781, 766 | 759 | 766 |
 
-self（after）の `100000:128:64` GPU f16 p95 min-of-5 = 16355µs（§3 表）を
-FAISS GPU f32 min（633µs。統計量の単位が異なる点に注意——self は p95、
-FAISS は p50 であり、単純倍率は参考値）と比べると約 25.8 倍。FAISS GPU f16
-median（766µs）との比較では約 21.3 倍。`crossdb-bench.md`「GPU 節」が
-Issue #537 時点で記録した「約 21 倍」（#536 適用後・#532 タイル化込みの
-p95 vs FAISS `559b523` 時点値 753µs）から大きく変わらない水準にとどまり、
-Phase 5（#539 の f16 算術版・#542 の i8 は既定経路で非選択）は FAISS との
-差の縮小には寄与していない。engine 側は Top-k を CPU で行いスコアバッファを
+self（after）の `100000:128:64` GPU f16 p95 min-of-5 = 16355µs（§3 表。
+本書の主計測点では before 81704µs → after 16355µs と Phase 5 全体で約 5 倍
+改善している）を FAISS GPU f32 min（633µs。統計量の単位が異なる点に注意
+——self は p95、FAISS は p50 であり、単純倍率は参考値）と比べると約 25.8 倍。
+FAISS GPU f16 median（766µs）との比較では約 21.3 倍。この対 FAISS 倍率自体は `crossdb-bench.md`「GPU 節」が Issue #537 時点（#532 タイル化・#536 部分 Top-k 適用後）で記録した「約 21 倍」（p95 vs FAISS `559b523` 時点値 753µs）から大きく変わらない水準にとどまる。ただし Issue #537 時点は既に #532・#536 適用後であり、この横ばいは Phase 5 全体の効果ではなく、**Issue #537 以降に加わった変更（#539 の f16 算術版・#542 の i8）が既定経路で非選択のため FAISS との差の縮小に寄与していない**ことを示す（#532・#536 自体の寄与は主計測点の before/after 改善に含まれている）。engine 側は Top-k を CPU で行いスコアバッファを
 読み戻す構造（GPU→CPU 転送量が `rows × batch × 4` バイト。#536 で
 partial Top-k 化済みだが k×workgroup 数×8 バイトへの縮小に留まる）が
 引き続きボトルネックと推定される。
@@ -217,11 +216,17 @@ FAISS 計測条件: `cpu_condition=blas_disabled`（`distance_compute_blas_thres
 - **レイテンシ（参考値）**: 6 点中 3 点（`100000:128:64`・`100000:128:256`・
   `500000:128:64`）で固定帯・実測帯の両方を超える一貫した改善（0.18〜0.20x。
   約 5〜5.6 倍高速化）を観測。残り 3 点（`20000:128:8`・`20000:128:64`・
-  `100000:128:1`）は共有環境のノイズにより判定不能。悪化方向の一貫した
-  シグナルは一度も観測されなかった。
-- **FAISS 対照**: self（after）は FAISS GPU に対しなお約 21〜26 倍遅く、
-  Phase 5 全体を通しても差は大きく縮まっていない（Issue #537 時点の局所値
-  から横ばい）。
+  `100000:128:1`）は共有環境のノイズにより min-of-5 を主統計量とする判定では
+  確定できない。ただし `100000:128:1` は全 5 ペアで after の f16 p95 が
+  before を上回り（median 比約 1.145）、実測帯 10.76% を超える悪化方向の
+  シグナル自体は観測された——主判定（min-of-5・両ノイズ帯超過）では
+  確定的な Regressed とは判定していないが、悪化方向のシグナルが無かった
+  わけではない点に注意。
+- **FAISS 対照**: self（after）は FAISS GPU に対しなお約 21〜26 倍遅い。
+  主計測点自体は Phase 5 全体（#532・#536 込み）で before 比約 5 倍改善して
+  いるが、対 FAISS 倍率は Issue #537 時点（#532・#536 適用後）の局所値から
+  横ばいであり、#537 以降に加わった変更（#539・#542）は既定経路で非選択の
+  ため対 FAISS の差の縮小には寄与していない。
 - **Qdrant 対照**: GPU 索引構築はこの規模・この VM では CPU 構築に対し
   優位性なし（先行実測と同じ傾向を再確認）。
 - **UMA**: 静的確認のみ。production 変更なし。
@@ -245,25 +250,31 @@ FAISS 計測条件: `cpu_condition=blas_disabled`（`distance_compute_blas_thres
 
 ## 9. 再現手順
 
+Bash の変数代入ではパス名展開（glob）が行われないため、ビルド後の実行
+ファイルパスは Cargo の `--message-format=json` 出力から `jq` 等で解決した
+完全パスを使う（プレースホルダーのまま `*` を変数へ代入しても文字列として
+渡り、`bench_gpu_scaling_ab.sh` の実行可能ファイル検査で停止する）。
+
 ```bash
 git archive b161d5b | tar -x -C <before-dir>
 git archive a40edd7 | tar -x -C <after-dir>
-(cd <before-dir> && CARGO_TARGET_DIR=<before-target> cargo bench \
-  --bench gpu_scaling_bench -p engine --no-run --message-format=json)
-(cd <after-dir> && CARGO_TARGET_DIR=<after-target> cargo bench \
-  --bench gpu_scaling_bench -p engine --no-run --message-format=json)
-BEFORE_BIN=<before-target>/release/deps/gpu_scaling_bench-* \
-AFTER_BIN=<after-target>/release/deps/gpu_scaling_bench-* \
-OUT_DIR=<out-dir> \
+BEFORE_BIN=$(cd <before-dir> && CARGO_TARGET_DIR=<before-target> cargo bench \
+  --bench gpu_scaling_bench -p engine --no-run --message-format=json \
+  | jq -r 'select(.executable != null) | .executable')
+AFTER_BIN=$(cd <after-dir> && CARGO_TARGET_DIR=<after-target> cargo bench \
+  --bench gpu_scaling_bench -p engine --no-run --message-format=json \
+  | jq -r 'select(.executable != null) | .executable')
+BEFORE_BIN="$BEFORE_BIN" AFTER_BIN="$AFTER_BIN" OUT_DIR=<out-dir> \
   scripts/bench_gpu_scaling_ab.sh 5 100000:128:64 20000:128:8 20000:128:64 \
     100000:128:1 100000:128:256 500000:128:64
 ```
 
-FAISS 対照（5 回）:
+FAISS 対照（5 回。リポジトリルートで実行する前提。`docker run -v` は
+絶対パスのみ受け付けるため `$(pwd)` でバインドマウント元を解決する）:
 
 ```bash
 docker run --rm --gpus all -v <scratch>:/work \
-  -v scripts/crossdb_bench/gpu:/scripts:ro bench-faiss-gpu \
+  -v "$(pwd)/scripts/crossdb_bench/gpu:/scripts:ro" bench-faiss-gpu \
   python /scripts/faiss_batch_bench.py --rows 20000 100000 500000 --dims 128 \
     --out /work/results/faiss-run<N>.json
 ```
@@ -271,7 +282,8 @@ docker run --rm --gpus all -v <scratch>:/work \
 Qdrant GPU 対照:
 
 ```bash
-docker pull qdrant/qdrant:v1.19.1 qdrant/qdrant:v1.19.1-gpu-nvidia
+docker pull qdrant/qdrant:v1.19.1
+docker pull qdrant/qdrant:v1.19.1-gpu-nvidia
 scripts/crossdb_bench/gpu/containers_gpu.sh up qdrant_cpu
 python scripts/crossdb_bench/gpu/qdrant_gpu_build_bench.py --rows 100000 500000 \
   --out qdrant-cpu.json --label cpu --container-name bench-qdrant-cpu-gpucmp
