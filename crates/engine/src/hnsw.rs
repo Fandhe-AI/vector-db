@@ -123,6 +123,13 @@ pub const SEQUENTIAL_PREFIX_NODES: usize = 256;
 /// [`HnswIndex::build_parallel`] が決める並列度もこの上限でクランプされる）。
 pub const MAX_BUILD_THREADS: usize = 16;
 
+/// `repair_reachability`（フェーズ 1）の反復回数の絶対上限。意図的に
+/// `member_count`／`n` に比例させない（比例させると入力規模に応じて
+/// 計算量 DoS を招く。`repair_reachability_inner` のドキュメンテーション
+/// コメント参照）。Issue #447 でベンチ・テストから参照できるようモジュール
+/// レベルへ昇格した（元は関数ローカル定数。値・用途は不変）。
+pub const PRECISE_REPAIR_CAP: usize = 64;
+
 /// [`HnswIndex::build_with_threads_observed`] が返す並列構築の段別プロファイル
 /// （Issue #406 追記: 8→12 スレッド頭打ち要因の切り分け計測）。
 ///
@@ -162,6 +169,56 @@ pub struct HnswBuildProfile {
     pub total: std::time::Duration,
     /// 並列フェーズの各ワーカースレッドの観測値。縮退経路では空。
     pub workers: Vec<HnswWorkerStats>,
+    /// `repair_reachability` 内訳統計（Issue #447 追記: 修復対象ノード数・
+    /// 反復回数の観測フック。`repair_reachability` フィールド（壁時間の
+    /// みの既存フィールド）とは独立に、層ごとの到達不能ノード数・フェーズ 1
+    /// 反復回数・フェーズ 2 結線数を観測する。`threads==1`／`n<=
+    /// SEQUENTIAL_PREFIX_NODES` の縮退経路でも本フィールドのみ埋まる
+    /// （`build_with_threads_observed` のドキュメンテーションコメント参照。
+    /// 他の既存フィールドの意味・値は不変）。`.claude/rules/
+    /// spec-confidentiality.md` オーナー判断範囲・数値基準/実測値は公開可）。
+    pub repair: HnswRepairStats,
+}
+
+/// 層ごとの `repair_reachability` 統計（Issue #447）。`repair_reachability_inner`
+/// の観測版（`OBSERVE=true`）のみが埋める。非観測経路（`build`・
+/// `build_with_threads`・`parallel_build::freeze`）は本構造体を生成しない
+/// （観測コストを一切乗せない設計。下記 `repair_reachability_inner` 参照）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HnswRepairLevelStats {
+    /// 対象層番号（0 始まり）。
+    pub level: usize,
+    /// 当該層のフェーズ 1 開始時点で entry から到達不能だったノード数
+    /// （フェーズ 1 の最初の反復の BFS 結果をそのまま数え上げる。追加の
+    /// BFS は行わない）。
+    pub unreachable_before: u64,
+    /// フェーズ 1 で実際に未到達ノードを見つけて結線した反復回数
+    /// （上限 [`PRECISE_REPAIR_CAP`]）。
+    pub phase1_iterations: u64,
+    /// フェーズ 1 が [`PRECISE_REPAIR_CAP`] 回まで完走した（＝反復回数の
+    /// 絶対上限に到達した）か。
+    pub phase1_cap_hit: bool,
+    /// フェーズ 2 でチェーン結線した残存ノード数（`remaining.len()`）。
+    pub phase2_nodes: u64,
+    /// フェーズ 2 で entry の `shrink_links` により犠牲になったリンクを
+    /// 再結線した件数（0 または 1）。
+    pub phase2_entry_relinked: u64,
+    /// フェーズ 1（BFS＋厳密修復ループ）の壁時間。
+    pub phase1_wall: std::time::Duration,
+    /// フェーズ 2（チェーン結線）の壁時間。
+    pub phase2_wall: std::time::Duration,
+}
+
+/// `repair_reachability` 呼び出し全体の統計（Issue #447）。
+#[derive(Debug, Clone, Default)]
+pub struct HnswRepairStats {
+    /// 層 `0..=max_level` の順（`levels.len() == max_level + 1`。エントリ
+    /// 不在時は空のまま）。
+    pub levels: Vec<HnswRepairLevelStats>,
+    /// 観測版 `repair_reachability_inner::<true>` 本体の壁時間（各層の
+    /// フェーズ wall の総和以上・呼び出し元の外側計測
+    /// （`HnswBuildProfile::repair_reachability`）以下になる入れ子区間）。
+    pub wall: std::time::Duration,
 }
 
 /// 並列構築フェーズにおける 1 ワーカースレッドの観測値（Issue #406 追記）。
@@ -907,22 +964,131 @@ impl GraphBuilder {
     /// 定数上限（32）であるため `HnswIndex::build` 全体では入力規模に対し
     /// ほぼ線形（N log N 契約の範囲内）に収まる。
     fn repair_reachability(&mut self, dim: usize, vectors: &[f32]) -> Result<(), HnswError> {
-        /// フェーズ 1（`shrink_links` つきの厳密修復）の反復回数の絶対上限。
-        /// 意図的に `member_count`／`n` に比例させない（比例させると入力
-        /// 規模に応じて計算量 DoS を招く。上記モジュールコメント参照）。
-        const PRECISE_REPAIR_CAP: usize = 64;
+        self.repair_reachability_inner::<false>(dim, vectors)
+            .map(|_| ())
+    }
+
+    /// [`repair_reachability`](Self::repair_reachability) の観測版（Issue #447:
+    /// 修復対象ノード数・反復回数の観測フック）。層ごとの到達不能ノード数・
+    /// フェーズ 1 反復回数・フェーズ 2 結線数・段別壁時間を
+    /// [`HnswRepairStats`] として返す。非観測経路（`build`・
+    /// `build_with_threads`・`parallel_build::freeze`）は
+    /// [`repair_reachability`](Self::repair_reachability) を呼ぶため本メソッドの
+    /// 計装コストを一切負わない。
+    fn repair_reachability_observed(
+        &mut self,
+        dim: usize,
+        vectors: &[f32],
+    ) -> Result<HnswRepairStats, HnswError> {
+        self.repair_reachability_inner::<true>(dim, vectors)
+    }
+
+    /// 全ノード挿入後の決定的な後始末パス。`insert_node`／`shrink_links` の
+    /// `protect` 引数（呼び出し時点のみの保護）だけでは、後続ノードの挿入が
+    /// 同じ近傍を再度枝刈りして到達不能ノードを生む残差ケースを閉じきれない
+    /// （`docs/design/hnsw-graph-construction.md`「逆方向リンクの到達性保証」
+    /// 節参照）。各層でエントリポイントから BFS
+    /// し、到達できないノードが残っていれば、その層の到達済み集合中で最も
+    /// 近い（`dot` が最大の）ノードへ双方向リンクを追加して修復する。
+    ///
+    /// # 2 フェーズ構成（計算量の上限。codex-review #423 P1 指摘）
+    ///
+    /// 検証の過程で、`shrink_links` によるヒューリスティック再選択を修復
+    /// バッチとして複数ノードへ一括適用すると、ある未到達ノードを直すための
+    /// 枝刈りが**無関係な別の**既存ノードの唯一の到達経路を巻き込んで壊し、
+    /// 新たな到達不能ノードを生む whack-a-mole が起こり得ることが分かった。
+    /// そのためフェーズ 1 は 1 ノードずつ確定的に修復し、直後に BFS を
+    /// やり直して次の未到達ノード（新たに生まれたものを含む）を選ぶ
+    /// ワークリスト方式を取る（`shrink_links`・`protect` つきで次数上限を
+    /// 維持する厳密な修復）。この「全体 BFS ＋ 到達済み全ノードとの `dot`
+    /// 計算」を伴う反復は、旧実装では上限を `member_count` の定数倍として
+    /// おり、残差の多い入力（重複ベクトルが多い adversarial な入力等）では
+    /// 反復回数・1 反復あたりのコストの双方が入力規模に比例して膨らみ、
+    /// 少なくとも O(N^2) 相当となって `MAX_HNSW_NODES`（100 万）まで受理
+    /// する構築 API 全体を計算量 DoS にさらしていた。フェーズ 1 の反復回数は
+    /// 入力規模に依存しない小さな絶対上限 [`PRECISE_REPAIR_CAP`] に固定し、
+    /// それを超えて残る未到達ノードはフェーズ 2 が閉じる。
+    ///
+    /// フェーズ 2 は残存ノードを id 昇順の**片方向チェーン**（`entry ->
+    /// remaining[0] -> remaining[1] -> ...`）として連結するだけで残りを
+    /// 閉じる。旧実装（全残存ノードをエントリポイントへ直結）は
+    /// (1) `connect` の重複検査（`Vec::contains`）を経てエントリポイントの
+    /// 隣接リストが残存ノード数に比例して伸び続け二次関数的コストになる
+    /// （Bugbot 指摘）、(2) `shrink_links` を一切呼ばないため次数が
+    /// `max_degree` を大幅に超え得る（codex-review #423 P1 指摘）、という
+    /// 2 つの問題を持っていた。チェーン方式では各ノードが新たに得る次数は
+    /// 高々 1（チェーンの「出発点」役を一度だけ務める）なので、
+    /// `connect` 直後に `shrink_links` を掛けても 1 ノードあたり
+    /// O(`max_degree`) に収まり、全体で O(remaining.len()) を保ったまま
+    /// 次数上限も維持できる。`shrink_links` は「次数が上限を超えていれば
+    /// `protect` を強制的に残しつつヒューリスティックで上限内へ再選択し、
+    /// 超えていなければ何もしない」契約（同関数のドキュメンテーション
+    /// コメント参照）を持つため、チェーンの起点を entry の現在の次数に
+    /// 関わらず常に選べる（"余裕があるか" を事前に走査する必要がなく、
+    /// 失敗しうる分岐も生まれない）。entry への `shrink_links` 適用が
+    /// entry の既存リンクを 1 本犠牲にし得る点は、フェーズ 1 が到達済み
+    /// 任意ノードへ毎回同じ `shrink_links` を適用しているのと同じ性質の
+    /// リスクであり、新たに導入するものではない。フェーズ 1 の上限を
+    /// 入力非依存の定数に保つことで、層あたりの
+    /// 総コストは O(`PRECISE_REPAIR_CAP` * N + N) に収まり、`MAX_LEVEL` も
+    /// 定数上限（32）であるため `HnswIndex::build` 全体では入力規模に対し
+    /// ほぼ線形（N log N 契約の範囲内）に収まる。
+    ///
+    /// # 観測分離（`OBSERVE`。Issue #447）
+    ///
+    /// `OBSERVE` を `const` ジェネリックにすることで、`OBSERVE=false`
+    /// （[`repair_reachability`](Self::repair_reachability) 経由。`build`・
+    /// `build_with_threads`・`parallel_build::freeze` が使う非観測経路）では
+    /// 単相化によって計測分岐・`Instant::now()`・カウンタ更新のコードが
+    /// 一切残らない（PR #445 の `BuildGraph::observe` 分岐と同じ方針）。
+    /// `OBSERVE=true`（[`repair_reachability_observed`]
+    /// (Self::repair_reachability_observed) 経由）でのみ [`HnswRepairStats`]
+    /// を採取する。グラフ操作の順序・比較・タイブレークは `OBSERVE` の値に
+    /// 関わらず完全に同一（観測が挙動へ影響しない）。
+    fn repair_reachability_inner<const OBSERVE: bool>(
+        &mut self,
+        dim: usize,
+        vectors: &[f32],
+    ) -> Result<HnswRepairStats, HnswError> {
+        let inner_start = if OBSERVE {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut stats = HnswRepairStats::default();
 
         let Some(entry) = self.entry_point else {
-            return Ok(());
+            return Ok(stats);
         };
         let Some(max_level) = self.level_of(entry) else {
-            return Ok(());
+            return Ok(stats);
         };
         for level in 0..=max_level {
+            let mut level_stats = HnswRepairLevelStats {
+                level,
+                ..HnswRepairLevelStats::default()
+            };
+            let phase1_start = if OBSERVE {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             // フェーズ 1: 全体 BFS ＋ 到達済み全ノードとの `dot` 計算を伴う
             // 厳密な修復を `PRECISE_REPAIR_CAP` 回までに限定する。
-            for _ in 0..PRECISE_REPAIR_CAP {
+            let mut phase1_completed = 0usize;
+            for iter in 0..PRECISE_REPAIR_CAP {
                 let reachable = self.bfs_reachable(level, entry);
+                if OBSERVE && iter == 0 {
+                    // フェーズ 1 の最初の反復で得られる BFS 結果をそのまま
+                    // 流用して到達不能ノード数を数える（追加の BFS を
+                    // 入れない。この `filter().count()` 自体の時間は
+                    // `phase1_wall` に含める——`unreachable_before` の
+                    // ドキュメンテーションコメント参照）。
+                    level_stats.unreachable_before = (0..self.nodes.len() as u32)
+                        .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
+                        .filter(|n| !reachable.contains(n))
+                        .count() as u64;
+                }
                 let missing_node = (0..self.nodes.len() as u32)
                     .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
                     .find(|n| !reachable.contains(n));
@@ -970,8 +1136,21 @@ impl GraphBuilder {
                     self.shrink_links(target, level, dim, vectors, node)?;
                     self.shrink_links(node, level, dim, vectors, target)?;
                 }
+                phase1_completed = iter + 1;
+            }
+            if OBSERVE {
+                level_stats.phase1_iterations = phase1_completed as u64;
+                level_stats.phase1_cap_hit = phase1_completed >= PRECISE_REPAIR_CAP;
+                if let Some(start) = phase1_start {
+                    level_stats.phase1_wall = start.elapsed();
+                }
             }
 
+            let phase2_start = if OBSERVE {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             // フェーズ 2: フェーズ 1 の絶対上限までで解消しなかった残りを、
             // 上記モジュールコメントのとおり id 昇順の片方向チェーンで
             // 確定的に閉じる。`remaining` は `0..len` の昇順フィルタなので
@@ -981,6 +1160,9 @@ impl GraphBuilder {
                 .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
                 .filter(|n| !reachable.contains(n))
                 .collect();
+            if OBSERVE {
+                level_stats.phase2_nodes = remaining.len() as u64;
+            }
             if let Some((&head, tail)) = remaining.split_first() {
                 // チェーンは entry を起点にする: `entry -> head -> tail[0]
                 // -> tail[1] -> ...`。`entry -> head` の 1 本だけが「既に
@@ -1034,10 +1216,24 @@ impl GraphBuilder {
                 if let Some(evicted) = evicted {
                     self.connect(prev, evicted, level);
                     self.shrink_links(prev, level, dim, vectors, evicted)?;
+                    if OBSERVE {
+                        level_stats.phase2_entry_relinked = 1;
+                    }
                 }
             }
+            if OBSERVE {
+                if let Some(start) = phase2_start {
+                    level_stats.phase2_wall = start.elapsed();
+                }
+                stats.levels.push(level_stats);
+            }
         }
-        Ok(())
+        if OBSERVE {
+            if let Some(start) = inner_start {
+                stats.wall = start.elapsed();
+            }
+        }
+        Ok(stats)
     }
 
     /// 層 `level` 上でノード `start` からリンクを辿って到達可能なノード集合を
@@ -1307,6 +1503,37 @@ impl HnswIndex {
         vectors: &[f32],
         seed: u64,
     ) -> Result<Self, HnswError> {
+        Self::build_inner::<false>(params, dim, vectors, seed).map(|(index, _)| index)
+    }
+
+    /// [`build`](Self::build) と同一アルゴリズムを実行しつつ、
+    /// `repair_reachability` の観測統計（[`HnswRepairStats`]。Issue #447）を
+    /// あわせて返す。`build_with_threads_observed` の縮退経路（`threads==1`
+    /// または `n<=SEQUENTIAL_PREFIX_NODES`）が threads=1 基線を得るために使う
+    /// 唯一の呼び出し元で、返すグラフは [`build`](Self::build) と完全に同一
+    /// （`OBSERVE` は計測有無のみを切り替え、グラフ操作へは一切影響しない。
+    /// `build_inner` のドキュメンテーションコメント参照）。
+    fn build_observed(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<(Self, HnswRepairStats), HnswError> {
+        Self::build_inner::<true>(params, dim, vectors, seed)
+    }
+
+    /// [`build`](Self::build)・[`build_observed`](Self::build_observed) が
+    /// 共有する本体（Issue #447）。`OBSERVE=false` では
+    /// `repair_reachability_inner::<false>` の単相化により計測分岐が消え、
+    /// `build` は本 Issue 追加前と完全に同一の命令列になる。`OBSERVE=true`
+    /// では層別の到達不能ノード数・反復回数を [`HnswRepairStats`] として
+    /// 併せて返す。
+    fn build_inner<const OBSERVE: bool>(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<(Self, HnswRepairStats), HnswError> {
         let dim_usize = dim as usize;
         let n = validate_build_input(&params, dim, vectors)?;
 
@@ -1321,7 +1548,8 @@ impl HnswIndex {
             entry_point: None,
         };
         if n == 0 {
-            return Self::freeze_from(builder, dim, owned_vectors);
+            let index = Self::freeze_from(builder, dim, owned_vectors)?;
+            return Ok((index, HnswRepairStats::default()));
         }
 
         let mut rng = DeterministicRng::new(seed);
@@ -1337,9 +1565,10 @@ impl HnswIndex {
             builder.insert_node(node_id, level, dim_usize, vectors, &mut visited)?;
         }
 
-        builder.repair_reachability(dim_usize, vectors)?;
+        let repair_stats = builder.repair_reachability_inner::<OBSERVE>(dim_usize, vectors)?;
 
-        Self::freeze_from(builder, dim, owned_vectors)
+        let index = Self::freeze_from(builder, dim, owned_vectors)?;
+        Ok((index, repair_stats))
     }
 
     /// [`GraphBuilder`]（構築完了・`repair_reachability` 完了後のもの）を
@@ -1466,10 +1695,16 @@ impl HnswIndex {
         let n = validate_build_input(&params, dim, vectors)?;
         if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
             let seq_start = std::time::Instant::now();
-            let index = Self::build(params, dim, vectors, seed)?;
+            // 縮退経路（threads=1 基線。Issue #447）: `build_observed` は
+            // `build` と完全に同一のグラフを返しつつ `repair` 統計だけを
+            // 追加で埋める。既存フィールド（`sequential_prefix`・
+            // `repair_reachability`・`workers`）の値・意味は不変のまま
+            // （下記コメント参照）。
+            let (index, repair) = Self::build_observed(params, dim, vectors, seed)?;
             let profile = HnswBuildProfile {
                 sequential_prefix: seq_start.elapsed(),
                 total: total_start.elapsed(),
+                repair,
                 ..HnswBuildProfile::default()
             };
             return Ok((index, profile));
