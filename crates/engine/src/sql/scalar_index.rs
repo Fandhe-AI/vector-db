@@ -728,41 +728,69 @@ impl ScalarIndex {
         metadata_filters: &[MetadataFilter],
         id_preds: &[crate::sql::scalar_plan::IdPredicate],
     ) -> CandidateResolution {
-        let mut lists: Vec<Vec<u32>> = Vec::new();
-        for filter in metadata_filters {
-            match self.candidates_for(filter) {
-                Some(slots) => lists.push(slots),
-                None => return CandidateResolution::FallbackNoIndex,
-            }
-        }
-        for pred in id_preds {
-            let Some((lower, upper)) = crate::sql::scalar_plan::id_bounds(pred) else {
-                return CandidateResolution::FallbackNoIndex;
-            };
-            match self.candidates_id_range(lower, upper) {
-                Some(slots) => lists.push(slots),
-                None => return CandidateResolution::FallbackNoIndex,
-            }
-        }
-        if lists.is_empty() {
+        if metadata_filters.is_empty() && id_preds.is_empty() {
             // `classify_scalar_plan` が `PlainScan` 以外を返す限り到達しない
             // 呼び出し規約違反だが、防御的に fail-closed へ倒す。
             return CandidateResolution::FallbackNoIndex;
         }
-        // 最小の候補列から順に交差していく（先に候補数を絞るほど後続の交差
-        // コストが小さくなる。`IndexConjunction`（交差後の候補数）が
-        // 選択度判定の基準になる）。
-        lists.sort_by_key(|v| v.len());
-        let mut intersected = lists.remove(0);
-        for list in &lists {
-            intersected = match intersect_sorted(&intersected, list) {
-                Some(v) => v,
-                None => return CandidateResolution::FallbackNoIndex,
-            };
-            if intersected.is_empty() {
+        // 述語ごとの候補列を全件 `Vec<Vec<u32>>` に集めてから交差する実装は、
+        // 交差前の累計保持量に上限が無かった（codex-review P1 指摘・PR #601）。
+        // 許可リスト上限の述語数（最大 256 件・`sql::allowlist` 参照）それぞれが
+        // 索引済み行の大半に一致する入力（同一 TEXT 値の等価条件を 256 個
+        // 並べる等）では、選択度切替（縮退判定）が交差**後**にしか働かないため、
+        // 交差前に 256 本の候補列（各最大 `row_count` 件）を同時保持し
+        // `MAX_ARENA_ROWS`（約 100 万行）規模ではコピーだけで約 1 GiB を
+        // 追加確保しうる。交差は「述語を追加するほど結果が単調非増加になる」
+        // （2 本指マージの結果は常に両オペランド以下の長さ）性質を持つため、
+        // 述語ごとの候補列を生成するたびにその場で累積へ交差し、次の述語へ
+        // 進む前に前の候補列を破棄する（保持するのは累積候補列と直近生成した
+        // 1 本のみ）。これにより述語数に依存せず、保持量は個々の候補列の
+        // 最大サイズ（`row_count` に比例）で頭打ちになる。
+        //
+        // 交差前に最小の候補列から処理する最適化（Issue #474 時点の実装）は
+        // 全列の長さを事前に知る必要があり本対応と両立しないため撤去した。
+        // 累積が空集合になった時点で以降の述語を評価せず打ち切る（交差は
+        // 単調非増加のため以降の交差結果も必ず空集合）ことで、代わりに早期
+        // 打ち切りによる実用上の性能劣化を抑える。
+        let mut accumulated: Option<Vec<u32>> = None;
+        for filter in metadata_filters {
+            if accumulated.as_deref().is_some_and(<[u32]>::is_empty) {
                 break;
             }
+            let slots = match self.candidates_for(filter) {
+                Some(slots) => slots,
+                None => return CandidateResolution::FallbackNoIndex,
+            };
+            accumulated = Some(match accumulated {
+                None => slots,
+                Some(acc) => match intersect_sorted(&acc, &slots) {
+                    Some(v) => v,
+                    None => return CandidateResolution::FallbackNoIndex,
+                },
+            });
         }
+        for pred in id_preds {
+            if accumulated.as_deref().is_some_and(<[u32]>::is_empty) {
+                break;
+            }
+            let Some((lower, upper)) = crate::sql::scalar_plan::id_bounds(pred) else {
+                return CandidateResolution::FallbackNoIndex;
+            };
+            let slots = match self.candidates_id_range(lower, upper) {
+                Some(slots) => slots,
+                None => return CandidateResolution::FallbackNoIndex,
+            };
+            accumulated = Some(match accumulated {
+                None => slots,
+                Some(acc) => match intersect_sorted(&acc, &slots) {
+                    Some(v) => v,
+                    None => return CandidateResolution::FallbackNoIndex,
+                },
+            });
+        }
+        // 上の 2 ループは冒頭の空チェックにより少なくとも 1 回は候補列を
+        // 生成するため、ここで `None` のままということはない。
+        let intersected = accumulated.unwrap_or_default();
         let hits = intersected.len() as u64;
         let row_count = self.row_count as u64;
         // 選択度切替（`sql::hnsw_cache` の `full_scan_ratio` と同型の

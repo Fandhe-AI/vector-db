@@ -243,6 +243,56 @@ fn conjunction_of_metadata_and_id_predicates_cold_hot_equivalence() {
     assert_eq!(result_ids(&result), vec![6, 8, 10]);
 }
 
+/// `ScalarIndex::resolve_candidates` は述語ごとの候補列を全件集めてから交差
+/// する実装から、生成のたびにその場で累積へ交差する逐次方式へ変更した
+/// （codex-review P1 対応・PR #601。累計候補保持量に上限がなかった問題への
+/// 対応。モジュールドキュメント参照）。3 つ以上の索引対応述語（メタデータ 2 件
+/// ＋ `id` 範囲 1 件）を AND で束ねても、交差の評価順に関わらず正しい積集合に
+/// 一致することを固定する。
+#[test]
+fn conjunction_of_three_predicates_matches_all_oracle() {
+    let path = unique_db_path("scalar-index-prune-conjunction-triple");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    // kind = 'a'（偶数 id）∧ path LIKE 'even/%'（偶数 id と等価集合）∧
+    // id > 4（id 5 以上）。積集合は偶数かつ 4 より大きい id。
+    let sql = "SELECT id FROM docs WHERE kind = 'a' AND path LIKE 'even/%' AND id > 4 \
+               ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20";
+    let index_scans = assert_cold_hot_equivalent(&core, "tenant-a", sql);
+    assert!(
+        index_scans > 0,
+        "a 3-predicate conjunction must still be consumed by the index"
+    );
+    let result = run(&core, "tenant-a", sql);
+    assert_eq!(result_ids(&result), vec![6, 8, 10]);
+}
+
+/// 逐次交差の早期打ち切り（累積が空集合になった時点で残りの述語を評価しない）
+/// が結果の正しさに影響しないことを固定する。`kind = 'a'`（偶数 id）と
+/// `path LIKE 'odd/%'`（奇数 id）は互いに素なため、この時点で累積は必ず
+/// 空集合になる。
+#[test]
+fn conjunction_with_disjoint_predicates_short_circuits_to_empty_result() {
+    let path = unique_db_path("scalar-index-prune-conjunction-empty");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    let sql = "SELECT id FROM docs WHERE kind = 'a' AND path LIKE 'odd/%' AND id > 1 \
+               ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20";
+    let result = run(&core, "tenant-a", sql);
+    assert!(result_ids(&result).is_empty());
+    // cold/hot でも一致し続ける（空集合を返す索引経路自体が壊れていないこと）。
+    let index_scans = assert_cold_hot_equivalent(&core, "tenant-a", sql);
+    assert!(index_scans > 0);
+}
+
 // --- 契約 2: 索引非対応形状は索引を消費しない -------------------------------
 
 #[test]
