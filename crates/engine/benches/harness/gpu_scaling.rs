@@ -3,9 +3,12 @@
 //! 規模・バッチサイズごとに実測するための、時間非依存な純関数群。
 //!
 //! 本モジュールが提供するのは「env 変数からの計測条件パース」「出力行の整形」
-//! 「Top-k 結果の同点許容つき不一致検知」のみで、いずれも `engine`・GPU デバイス
-//! そのものには依存しない（`tests/gpu_scaling_accept.rs` から GPU 非依存で
-//! 単体検証できる。`bench_engine.rs`・`recall_engine.rs` と同じ切り分け方針）。
+//! 「Top-k 結果の同点許容つき不一致検知」に加え（Issue #540）
+//! `engine::batch_search::pack_f16x2`/`unpack_f16x2`（純粋な host 側 f16
+//! 変換関数。GPU デバイスは経由しない）を借りた [`round_to_f16_exact`] のみで、
+//! いずれも GPU デバイスそのものには依存しない（`tests/gpu_scaling_accept.rs`
+//! から GPU 非依存で単体検証できる。`bench_engine.rs`・`recall_engine.rs` と
+//! 同じ切り分け方針）。
 //! GPU バックエンドの構築・計測ループ本体は `benches/gpu_scaling_bench.rs`
 //! （手動専用・`harness = false`）が担う。
 //!
@@ -16,6 +19,8 @@
 
 use std::fmt;
 use std::time::Duration;
+
+use engine::batch_search::{pack_f16x2, unpack_f16x2};
 
 /// 計測条件パース・出力整形いずれかの失敗を表す fail-closed なエラー型。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +182,40 @@ pub fn parse_measured_iterations(raw: Option<&str>, default: u32) -> Result<u32,
             Ok(value)
         }
     }
+}
+
+/// `BENCH_GPU_SCALING_QUERY_F16_EXACT`（Issue #540。PR #591・Issue #539 の
+/// f16 算術版 S0 シェーダ〔`GpuDotShaderKind::F16Arith`〕は
+/// `select_dot_shader` の条件 5（クエリ成分が f16 へ厳密往復できない場合は
+/// 縮退）により、本ベンチの既定クエリ生成〔`DeterministicRng::next_vector`。
+/// 任意精度 f32〕をそのまま使うと常に unpack 版へ縮退し、before/after を
+/// そのまま比較しても unpack 同士の比較にしかならない。この opt-in を有効化
+/// すると [`round_to_f16_exact`] でクエリ成分を f16 厳密往復可能な値へ丸め、
+/// f16 算術版シェーダが実際に選ばれる条件を満たす。未設定・空文字列は無効
+/// （既定挙動を変えない）。`1` のみ有効値として受理し、それ以外は fail-closed
+/// で拒否する（本ベンチ固有の安全弁。他の bool 系 env と同じ厳格パース方針）。
+pub fn parse_query_f16_exact(raw: Option<&str>) -> Result<bool, GpuScalingError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(err(format!(
+            "BENCH_GPU_SCALING_QUERY_F16_EXACT must be unset or \"1\" (got {other:?})"
+        ))),
+    }
+}
+
+/// クエリ成分 1 個を f16 へ厳密往復可能な値へ丸める（[`parse_query_f16_exact`]
+/// の opt-in が有効なときのみ [`gpu_scaling_bench`] から呼ばれる）。
+/// `engine::batch_search::pack_f16x2`/`unpack_f16x2`
+/// （`crates/engine/src/f16.rs` 実装への薄いラッパ。round-to-nearest-even）で
+/// 実際に f16 へ往復させてから返すため、`gpu_batch.rs::f16_round_trip_exact`
+/// の判定基準と丸め結果が完全に一致する（`tests/gpu_batch.rs::
+/// next_f32_f16_round_trippable` と同じ手法）。`f32::NAN`/`f32::INFINITY` は
+/// クエリ生成（`DeterministicRng::next_vector`）が返さない値域のため、
+/// 呼び出し元はそれらを渡さない契約とする。
+pub fn round_to_f16_exact(v: f32) -> f32 {
+    let (rounded, _) = unpack_f16x2(pack_f16x2(v, v));
+    rounded
 }
 
 /// 1 つの (rows, dim, batch) 構成に対する実測結果（出力整形の入力）。

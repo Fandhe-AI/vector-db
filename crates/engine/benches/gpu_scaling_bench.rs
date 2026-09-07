@@ -60,9 +60,9 @@ use harness::env_report::EnvReport;
 use harness::gpu_scaling::{
     count_boundary_tolerant_mismatches, format_i8_unavailable_line, format_skip_line,
     format_unavailable_line, mean_recall_at_k, parse_batches, parse_dims, parse_i8_oversample,
-    parse_measured_iterations, parse_rows, parse_top_k, read_env_var, readback_bytes_per_call,
-    rescored_candidates_per_call, speedup_ratio, GpuScalingI8Result, GpuScalingI8StatsLine,
-    GpuScalingResult, GpuScalingStatsLine,
+    parse_measured_iterations, parse_query_f16_exact, parse_rows, parse_top_k, read_env_var,
+    readback_bytes_per_call, rescored_candidates_per_call, round_to_f16_exact, speedup_ratio,
+    GpuScalingI8Result, GpuScalingI8StatsLine, GpuScalingResult, GpuScalingStatsLine,
 };
 use harness::protocol::{run_fallible, MeasurementConfig, TrialFailure};
 use harness::rng::DeterministicRng;
@@ -201,6 +201,9 @@ struct ScalingConfig {
     /// `GpuI8Options::oversample` は構築時固定のためプロセス内スイープしない
     /// ——`gpu_scaling_bench.rs` モジュール冒頭コメント「経路 D」参照）。
     i8_oversample: usize,
+    /// `BENCH_GPU_SCALING_QUERY_F16_EXACT`（Issue #540。
+    /// `harness::gpu_scaling::parse_query_f16_exact` doc 参照）。
+    query_f16_exact: bool,
 }
 
 fn load_config() -> Result<ScalingConfig, String> {
@@ -211,6 +214,8 @@ fn load_config() -> Result<ScalingConfig, String> {
     let iters_raw = read_env_var("BENCH_GPU_SCALING_ITERS").map_err(|e| e.to_string())?;
     let i8_oversample_raw =
         read_env_var("BENCH_GPU_SCALING_I8_OVERSAMPLE").map_err(|e| e.to_string())?;
+    let query_f16_exact_raw =
+        read_env_var("BENCH_GPU_SCALING_QUERY_F16_EXACT").map_err(|e| e.to_string())?;
 
     let rows = parse_rows(rows_raw.as_deref(), &DEFAULT_ROWS).map_err(|e| e.to_string())?;
     let dims = parse_dims(dims_raw.as_deref(), &DEFAULT_DIMS).map_err(|e| e.to_string())?;
@@ -225,6 +230,8 @@ fn load_config() -> Result<ScalingConfig, String> {
         MAX_I8_OVERSAMPLE,
     )
     .map_err(|e| e.to_string())?;
+    let query_f16_exact =
+        parse_query_f16_exact(query_f16_exact_raw.as_deref()).map_err(|e| e.to_string())?;
 
     Ok(ScalingConfig {
         rows,
@@ -233,6 +240,7 @@ fn load_config() -> Result<ScalingConfig, String> {
         top_k,
         measured_iterations,
         i8_oversample,
+        query_f16_exact,
     })
 }
 
@@ -646,13 +654,25 @@ fn main() {
                     }
                 }
 
-                let dataset = match build_dataset(&mut rng, rows, dim, batch) {
+                let mut dataset = match build_dataset(&mut rng, rows, dim, batch) {
                     Ok(d) => d,
                     Err(msg) => {
                         println!("{}", format_skip_line(rows, dim, batch, k, &msg));
                         continue;
                     }
                 };
+                // Issue #540: opt-in 時のみクエリ成分を f16 厳密往復可能な値へ
+                // 丸め、`select_dot_shader` の条件 5（クエリの f16 精度損失）で
+                // 常駐行 B が unpack 版へ縮退しないようにする。常駐行そのもの
+                // （`dataset.vectors`）は既に f16 パック常駐（`ResidentMatrix`）
+                // 経由で量子化済みのため丸め不要——ここで丸めるのはクエリのみ。
+                if config.query_f16_exact {
+                    for q in &mut dataset.queries {
+                        for v in q.iter_mut() {
+                            *v = round_to_f16_exact(*v);
+                        }
+                    }
+                }
 
                 let cpu_matrix = match ResidentMatrix::build(
                     &dataset.ids,

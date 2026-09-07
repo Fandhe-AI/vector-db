@@ -183,3 +183,44 @@ BENCH_CORE16_DIAG=1 \
   Metal Shading Language へどう変換されるかを wgpu/naga のソースレベルで
   確認し、UMA 帯域モデルとの相互作用を definitively に切り分ける調査
   （実機なしでは限定的にしか進められない）。
+
+## Issue #540 追記: f16 算術版（#539）導入後のゲートへの影響
+
+`gpu_batch.rs::select_dot_shader`（#539。`docs/design/gpu-batch-f16-arith.md`
+参照）は本 doc の CORE-16 ゲート本体・規模点診断（`build_scaled_gate_dataset`）
+のクエリ生成（`DeterministicRng::next_vector`。任意精度 f32）に対しては
+**常に unpack 版シェーダへ縮退する**（クエリが f16 へ厳密往復できないため。
+`select_dot_shader` 条件 5）。したがって:
+
+- **CORE-16 ゲート本体・規模点診断は #539 導入前後で構造的に不変**
+  （本 doc の実測・判断は #539 の影響を一切受けない。以下は #540 で
+  実測した確定的カウンタによる裏付け）
+- ゲート本体（`BENCH_CORE16=1`。rows=20,000・dim=256・batch=8）:
+  `f16_arith_available=true f16_arith_dispatches=0 f16_arith_guard_fallbacks=40`
+- 規模点診断（`BENCH_CORE16_DIAG=1 BENCH_CORE16_DIAG_SCALE_INDEX=0`。
+  rows=64・dim=256）: 同上（`dispatches=0 guard_fallbacks=40`）
+
+これは `gpu_scaling_bench.rs`（`bench-gpu-scaling`。CORE-16 ゲートとは別の
+情報提供専用ベンチ）へ新設した opt-in `BENCH_GPU_SCALING_QUERY_F16_EXACT=1`
+でクエリを f16 厳密往復可能へ丸めた場合は `dispatches=40 guard_fallbacks=0`
+（全 dispatch が f16 算術版）へ切り替わることと対比すると、CORE-16 ゲート
+自体が f16 算術版を経由しない事実がクエリ生成方式に起因することを確認
+できる（fixture 側の問題であり `select_dot_shader` の判定ロジック自体は
+意図どおり動作している）。
+
+fixture（`build_scaled_gate_dataset`）を f16 厳密往復可能なクエリへ変更する
+かどうかは、CORE-16 ゲートが検証する対象（「f32 常駐 vs f16 パック常駐」の
+比較に、#539 で追加された f16 算術演算の効果を含めるべきか）という
+ゲート意味論そのものの変更であり、本 Issue（テスト・ベンチ・docs 専任）の
+スコープを超える。spec／オーナー判断が必要な事項として申し送る
+（production コード〔`crates/engine/src/`〕は本 Issue で無変更）。
+
+前後比較の詳細実測・レイテンシ参考値は
+`docs/design/gpu-batch-f16-arith.md`「8. 前後比較実測（Issue #540）」節を
+参照。
+
+### 環境別 pass/fail 表への追記
+
+| 環境 | opt-in 実行 | 結果 |
+| --- | --- | --- |
+| 本開発環境（NVIDIA GeForce RTX 3060・Vulkan backend） | 実施済み（Issue #540。上記の確定的カウンタ実測） | CORE-16 ゲート・診断は #539 導入前後で構造的に不変（unpack 版のまま）。placeholder 閾値に対する pass/fail の再判定は本追記の対象外（Environment `bench-gate` secrets・管理者作業） |

@@ -257,6 +257,16 @@ psql の `SELECT COUNT(*)` は 45 ms → 約 3.7 ms。
 下記は履歴として残す（batch≥64 で GPU f16 が CPU-SIMD と同等〜逆転していた
 参照点）。
 
+**（2026-09-07 追記・Issue #540）** f16 算術版 S0 シェーダ（Issue #539。
+`SHADER_F16` 対応アダプタで読み出し直後に f32 へ拡張して積和する経路）の
+前後比較を実施した。クエリが f16 へ厳密往復可能な場合のみシェーダが
+切り替わる契約（`select_dot_shader`）のため、opt-in `BENCH_GPU_SCALING_
+QUERY_F16_EXACT=1` でクエリを丸めない限り本表の実測は unpack 版のままで
+不変。CORE-16 ゲート・規模点診断のクエリ生成も同じ理由で構造的に
+f16 算術版を経由しない。詳細・実測値は `gpu-batch-f16-arith.md`
+「8. 前後比較実測（Issue #540）」節・`core16-f16-resident-gate.md`
+「Issue #540 追記」節参照。
+
 **（2026-09-07 追記・Issue #543）** opt-in 専用の i8 パック常駐経路
 （`engine::gpu_batch::packed_i8::GpuI8BatchBackend`。Issue #542。候補生成
 のみ・primary 未接続）の前後比較・Recall 影響を実測した。Recall@10 の

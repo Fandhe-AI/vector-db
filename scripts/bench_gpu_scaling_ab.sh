@@ -54,6 +54,14 @@
 # `I8_OVERSAMPLE` の設定有無ではなく、ログの実出力（`gpu_scaling_i8:` 行の
 # 有無）とプロセスの終了コードのみを根拠にする（codex-review P2・Cursor
 # Bugbot 重複指摘・PR #605）。
+#
+# f16 算術版 S0 シェーダの前後比較（Issue #540。親 #402・#539）:
+# `QUERY_F16_EXACT=1` を設定すると両バイナリへ `BENCH_GPU_SCALING_QUERY_F16_EXACT`
+# としてパススルーする（before バイナリが本 env を持たない場合は無害に無視される。
+# `harness/gpu_scaling.rs::parse_query_f16_exact` doc 参照。未設定時は既定挙動
+# 〔クエリ丸めなし〕のまま不変）。summary.tsv 末尾へ
+# `f16_arith_dispatches`/`f16_arith_guard_fallbacks` 列を追加する
+# （`gpu_scaling_stats:` 行から抽出。既存 18 列の並び・意味は不変）。
 
 set -euo pipefail
 
@@ -94,6 +102,14 @@ if [ -n "${I8_OVERSAMPLE:-}" ] && ! [[ "${I8_OVERSAMPLE}" =~ ^[0-9]+$ ]]; then
   die "I8_OVERSAMPLE must be a positive integer when set, got: ${I8_OVERSAMPLE}"
 fi
 
+# Issue #540: `harness/gpu_scaling.rs::parse_query_f16_exact` が受理する値
+# （未設定 or "1"）と同じ許容集合をシェル側でも fail-closed に検査してから
+# 子プロセスへ渡す（coding-rust.md「untrusted 入力の扱い」: env インジェクション
+# 防止のため許可値のみ受理する）。
+if [ -n "${QUERY_F16_EXACT:-}" ] && [ "${QUERY_F16_EXACT}" != "1" ]; then
+  die "QUERY_F16_EXACT must be unset or \"1\" when set, got: ${QUERY_F16_EXACT}"
+fi
+
 SUMMARY="${OUT_DIR}/summary.tsv"
 if [ ! -f "${SUMMARY}" ]; then
   # i8_status/i8_reason（codex-review P2・Cursor Bugbot 重複指摘・PR #605）:
@@ -104,7 +120,10 @@ if [ ! -f "${SUMMARY}" ]; then
   # （`unsupported`／`measured`／`failed`）と、`failed` 時の理由
   # （`gpu_scaling_i8: not measurable ... reason="..."` から抽出）を
   # 独立の列として追加する。
-  printf 'point\tside\tpair\tcpu_p50\tcpu_p95\tf16_p50\tf16_p95\tf32_p50\tf32_p95\tmismatch\tline\ti8_oversample\ti8_p50\ti8_p95\ti8_recall\ti8_mismatch\ti8_status\ti8_reason\n' > "${SUMMARY}"
+  # f16_arith_dispatches/f16_arith_guard_fallbacks（Issue #540。
+  # `gpu_scaling_stats:` 行〔`gpu_scaling:` 結果行とは接頭辞が異なる別行〕から
+  # 抽出。行そのものが無い run（旧 before バイナリ等）は空欄のまま。
+  printf 'point\tside\tpair\tcpu_p50\tcpu_p95\tf16_p50\tf16_p95\tf32_p50\tf32_p95\tmismatch\tline\ti8_oversample\ti8_p50\ti8_p95\ti8_recall\ti8_mismatch\ti8_status\ti8_reason\tf16_arith_dispatches\tf16_arith_guard_fallbacks\n' > "${SUMMARY}"
 fi
 
 # 1 行の `gpu_scaling: ...` 出力（正常計測行のみ）から TSV フィールドを
@@ -150,21 +169,36 @@ run_one() {
   } > "${log}"
 
   local status=0
+  # Issue #540: `I8_OVERSAMPLE` と同じ「設定時のみパススルー」方式。事前検証
+  # （`QUERY_F16_EXACT` fail-closed 検査）を経た値のみここへ渡す。
+  local -a env_args=(
+    "BENCH_GPU_SCALING_ROWS=${rows}"
+    "BENCH_GPU_SCALING_DIMS=${dim}"
+    "BENCH_GPU_SCALING_BATCH=${batch}"
+  )
   if [ -n "${I8_OVERSAMPLE:-}" ]; then
-    BENCH_GPU_SCALING_ROWS="${rows}" \
-      BENCH_GPU_SCALING_DIMS="${dim}" \
-      BENCH_GPU_SCALING_BATCH="${batch}" \
-      BENCH_GPU_SCALING_I8_OVERSAMPLE="${I8_OVERSAMPLE}" \
-      "${bin}" >> "${log}" 2>&1 || status=$?
-  else
-    BENCH_GPU_SCALING_ROWS="${rows}" \
-      BENCH_GPU_SCALING_DIMS="${dim}" \
-      BENCH_GPU_SCALING_BATCH="${batch}" \
-      "${bin}" >> "${log}" 2>&1 || status=$?
+    env_args+=("BENCH_GPU_SCALING_I8_OVERSAMPLE=${I8_OVERSAMPLE}")
   fi
+  if [ -n "${QUERY_F16_EXACT:-}" ]; then
+    env_args+=("BENCH_GPU_SCALING_QUERY_F16_EXACT=${QUERY_F16_EXACT}")
+  fi
+  env "${env_args[@]}" "${bin}" >> "${log}" 2>&1 || status=$?
 
   local result_line
   result_line="$(grep -E '^gpu_scaling: rows=' "${log}" | tail -1 || true)"
+
+  # f16 算術版 S0 シェーダの dispatch カウンタ（Issue #540）。
+  # `gpu_scaling_stats:` は既存 `gpu_scaling:`/`gpu_scaling_i8:` いずれとも
+  # 接頭辞が異なるため誤って `result_line`/`i8_line` へ混入しない。
+  local stats_line f16_arith_dispatches f16_arith_guard_fallbacks
+  stats_line="$(grep -E '^gpu_scaling_stats: rows=' "${log}" | tail -1 || true)"
+  if [ -n "${stats_line}" ]; then
+    f16_arith_dispatches="$(echo "${stats_line}" | sed -nE 's/.* f16_arith_dispatches=([0-9]+) .*/\1/p')"
+    f16_arith_guard_fallbacks="$(echo "${stats_line}" | sed -nE 's/.* f16_arith_guard_fallbacks=([0-9]+) .*/\1/p')"
+  else
+    f16_arith_dispatches=""
+    f16_arith_guard_fallbacks=""
+  fi
 
   # i8 経路（Issue #543）の結果行。`gpu_scaling_i8:` は既存 `gpu_scaling:` の
   # grep（`^gpu_scaling: rows=`）とは接頭辞が異なるため誤って上の
@@ -239,18 +273,20 @@ run_one() {
     f32_p50="$(extract_field "${result_line}" gpu_f32_p50)"
     f32_p95="$(extract_field "${result_line}" gpu_f32_p95)"
     mismatch="$(echo "${result_line}" | grep -oE 'mismatch=[0-9]+' | grep -oE '[0-9]+' || true)"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "${point}" "${side}" "${pair}" "${cpu_p50}" "${cpu_p95}" "${f16_p50}" "${f16_p95}" \
       "${f32_p50}" "${f32_p95}" "${mismatch}" "measured" \
       "${i8_oversample}" "${i8_p50}" "${i8_p95}" "${i8_recall}" "${i8_mismatch}" \
-      "${i8_status}" "${i8_reason}" >> "${SUMMARY}"
+      "${i8_status}" "${i8_reason}" \
+      "${f16_arith_dispatches}" "${f16_arith_guard_fallbacks}" >> "${SUMMARY}"
   else
     local status_line
     status_line="$(grep -E '^gpu_scaling: (skip|not measurable|gpu unavailable)' "${log}" | tail -1 || echo "exit=${status}")"
-    printf '%s\t%s\t%s\t\t\t\t\t\t\t\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t\t\t\t\t\t\t\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "${point}" "${side}" "${pair}" "${status_line//$'\t'/ }" \
       "${i8_oversample}" "${i8_p50}" "${i8_p95}" "${i8_recall}" "${i8_mismatch}" \
-      "${i8_status}" "${i8_reason}" >> "${SUMMARY}"
+      "${i8_status}" "${i8_reason}" \
+      "${f16_arith_dispatches}" "${f16_arith_guard_fallbacks}" >> "${SUMMARY}"
   fi
 }
 

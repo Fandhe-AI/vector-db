@@ -624,15 +624,16 @@ fn run_core16_gate(
     }
     let min_improvement_pct = min_improvement_pct_from_env("BENCH_CORE16_MIN_IMPROVEMENT_PCT")?;
 
-    let (p95_a, p95_b) = match measure_core16_resident_p95(dataset, ctx, GPU_GATE_DIM, LABEL) {
-        Ok(pair) => pair,
-        Err(msg) => {
-            println!(
-                "{LABEL}: not measurable in this environment ({msg}) requested=true pass=false"
-            );
-            return Ok(false);
-        }
-    };
+    let (p95_a, p95_b, f16_arith_stats) =
+        match measure_core16_resident_p95(dataset, ctx, GPU_GATE_DIM, LABEL) {
+            Ok(triple) => triple,
+            Err(msg) => {
+                println!(
+                    "{LABEL}: not measurable in this environment ({msg}) requested=true pass=false"
+                );
+                return Ok(false);
+            }
+        };
 
     let pass = check_improvement_at_least(p95_a, p95_b, min_improvement_pct)
         .map_err(|err| format!("{LABEL}: improvement check failed: {err}"))?;
@@ -642,6 +643,13 @@ fn run_core16_gate(
     );
     if verbose {
         println!("verbose({LABEL}): f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?}");
+        // Issue #540: f16 算術版（Issue #539）が本ゲートの経路で実際に選ばれて
+        // いるかの確定的な観測（レイテンシとは独立の指標。合否には数えない）。
+        println!(
+            "verbose({LABEL}): f16_arith_available={} f16_arith_dispatches={} \
+             f16_arith_guard_fallbacks={}",
+            f16_arith_stats.available, f16_arith_stats.dispatches, f16_arith_stats.guard_fallbacks
+        );
     }
     Ok(pass)
 }
@@ -656,12 +664,34 @@ fn run_core16_gate(
 /// （fail-closed。CPU 比較を GPU 実測の代替として計上しない＝アサーション弱体化を
 /// 避ける。ゲート本体〔[`run_core16_gate`]〕はこれを `pass=false` へ、診断
 /// 〔[`run_core16_scaling_diagnostic`]〕は「測定不能」表示へ変換する）。
+/// [`measure_core16_resident_p95`] が計測ウィンドウ前後で差分取得する
+/// f16 算術版 S0 シェーダ（Issue #539・PR #591）の dispatch カウンタ
+/// （Issue #540。`engine::gpu_batch::GpuBatchStatsSnapshot::
+/// f16_arith_dispatches`/`f16_arith_guard_fallbacks` の差分）。
+/// `available` は `GpuBatchBackend::f16_arith_available()`
+/// （アダプタが `SHADER_F16` に対応しパイプライン生成にも成功したか）。
+/// CORE-16 ゲート本体は spec 閾値のみで pass/fail を決めるため、本構造体は
+/// `verbose` 出力専用（合否には数えない）。
+#[derive(Debug, Clone, Copy)]
+struct Core16F16ArithStats {
+    available: bool,
+    dispatches: u64,
+    guard_fallbacks: u64,
+}
+
 fn measure_core16_resident_p95(
     dataset: &GateDataset,
     ctx: &PolicyContext,
     dim: usize,
     label: &str,
-) -> Result<(std::time::Duration, std::time::Duration), String> {
+) -> Result<
+    (
+        std::time::Duration,
+        std::time::Duration,
+        Core16F16ArithStats,
+    ),
+    String,
+> {
     let f32_backend = engine::gpu_batch::GpuF32ContrastBackend::try_new(
         &dataset.ids,
         &dataset.tenant_ids,
@@ -724,8 +754,15 @@ fn measure_core16_resident_p95(
             0
         }
     };
+    // Issue #540: f16 算術版 S0 シェーダ（Issue #539）の dispatch カウンタを
+    // 計測ウィンドウ前後で差分取得する。本ゲートのクエリ生成
+    // （`gate_batch_queries`）は f16 厳密往復を保証しないため、
+    // `select_dot_shader` の条件 5（クエリ精度損失）で通常 unpack 版へ
+    // 縮退する——その事実そのものが観測点（`verbose` 出力・合否には数えない）。
+    let f16_arith_stats_before = f16_backend.stats();
     let ab = run_ab(&config, workload_a, workload_b)
         .map_err(|err| format!("A/B measurement failed: {err}"))?;
+    let f16_arith_stats_after = f16_backend.stats();
     if error_count.load(std::sync::atomic::Ordering::SeqCst) > 0 {
         return Err("batch_search returned an error during measurement; see stderr".to_string());
     }
@@ -734,7 +771,16 @@ fn measure_core16_resident_p95(
         .map_err(|err| format!("p95 of A samples unavailable: {err}"))?;
     let p95_b = p95_from_samples(&ab.b.samples)
         .map_err(|err| format!("p95 of B samples unavailable: {err}"))?;
-    Ok((p95_a, p95_b))
+    let f16_arith_stats = Core16F16ArithStats {
+        available: f16_backend.f16_arith_available(),
+        dispatches: f16_arith_stats_after
+            .f16_arith_dispatches
+            .saturating_sub(f16_arith_stats_before.f16_arith_dispatches),
+        guard_fallbacks: f16_arith_stats_after
+            .f16_arith_guard_fallbacks
+            .saturating_sub(f16_arith_stats_before.f16_arith_guard_fallbacks),
+    };
+    Ok((p95_a, p95_b, f16_arith_stats))
 }
 
 /// 規模スイープの候補点（行数, 次元）一覧。CORE-16 ゲート本体
@@ -815,10 +861,19 @@ fn run_core16_scaling_diagnostic(
 
     let dataset = build_scaled_gate_dataset(rng, rows, dim);
     match measure_core16_resident_p95(&dataset, ctx, dim, LABEL) {
-        Ok((p95_a, p95_b)) => {
+        Ok((p95_a, p95_b, f16_arith_stats)) => {
             println!(
                 "verbose({LABEL}): scale_index={index} rows={rows} dim={dim} \
                  f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?}"
+            );
+            // Issue #540: 規模点診断でも f16 算術版のカウンタを併記する
+            // （構造的に unpack 縮退であることの規模非依存性を確認するため）。
+            println!(
+                "verbose({LABEL}): scale_index={index} rows={rows} dim={dim} \
+                 f16_arith_available={} f16_arith_dispatches={} f16_arith_guard_fallbacks={}",
+                f16_arith_stats.available,
+                f16_arith_stats.dispatches,
+                f16_arith_stats.guard_fallbacks
             );
         }
         Err(msg) => {
