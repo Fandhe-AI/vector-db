@@ -199,13 +199,17 @@ fn dispatched_dot_length_mismatch_matches_scalar_semantics() {
     assert_eq!(isa::current().dot(&[] as &[f32], &[] as &[f32]), 0.0f32);
 }
 
-/// `isa::SimdKernel::dot_block4`（Issue #510・TASK-156・CORE-14。行ブロック
+/// `isa::SimdKernel::dot_block4`（Issue #510・#511・TASK-156・CORE-14。行ブロック
 /// カーネル）が 1 行版 [`isa::SimdKernel::dot`] とビット同一であることを、
 /// 決定的シード RNG で dim 0..=129・768・1000・1536 を走査して検証する
 /// （ポインタ: `docs/design/dot-kernel-row-block.md`）。符号付きゼロ・微小値
 /// （`f32::MIN_POSITIVE` 近傍）を含む値集合もあわせて検証し、4 行それぞれで
 /// 独立した丸め誤差が生じないこと（1 行版と完全に同じ縮約経路を通ること）を
-/// 固定する。
+/// 固定する。`isa::current().isa()` が実行時検出した ISA（本開発環境では
+/// x86_64 AVX2+FMA／AVX-512、aarch64 実機では Neon）で走るため、NEON 版
+/// （`neon_block4::dot_block4_neon`）の実行時ビット同一性の唯一の証跡は
+/// `.github/workflows/detect-features.yml` の `detect-apple` ジョブ（Apple
+/// Silicon 実機で本テストを実行）が担う。
 #[test]
 fn dot_block4_matches_single_row_dot_bit_exact_across_dims() {
     let current_isa = isa::current().isa();
@@ -305,12 +309,16 @@ fn dot_block4_falls_back_to_single_row_dot_when_lengths_are_not_uniform() {
 /// dispatch_source_has_no_external_override_entry_points` と同じ禁止トークン集合）。
 #[test]
 fn isa_source_has_no_external_override_entry_points() {
-    // Issue #510: `isa/x86_block4.rs`（cfg(x86_64) サブモジュール）も同じ禁止
-    // トークン集合で走査する（`isa.rs` 本体からモジュール分割しても CORE-12
-    // の「上書き機構の不存在」検査が抜け穴にならないようにするため）。
+    // Issue #510・#511: `isa/x86_block4.rs`（cfg(x86_64) サブモジュール）・
+    // `isa/neon_block4.rs`（cfg(aarch64) サブモジュール）も同じ禁止トークン集合で
+    // 走査する（`isa.rs` 本体からモジュール分割しても CORE-12 の「上書き機構の
+    // 不存在」検査が抜け穴にならないようにするため）。`include_str!` は `cfg` に
+    // 依らずファイルの存在のみ要求するため、x86_64 ホストのテストでも
+    // `neon_block4.rs` を走査できる。
     let sources = [
         include_str!("../src/isa.rs"),
         include_str!("../src/isa/x86_block4.rs"),
+        include_str!("../src/isa/neon_block4.rs"),
     ];
 
     let forbidden_tokens = [
@@ -391,14 +399,16 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
 
     // ソーステキスト上には NEON・AVX2+FMA・AVX-512 の `dot` ディスパッチ 3 箇所に加え、
     // Issue #510（TASK-156・CORE-14）で追加した `dot_block4` の AVX2+FMA・AVX-512
-    // ディスパッチ 2 箇所の計 5 箇所の `unsafe {` が現れる（実際のビルドで有効に
-    // なるのは対象 arch の分岐のみだが、`cfg` 行はソース上に残ったまま走査される
-    // ため、arch に依存せず常に 5 を期待できる）。
+    // ディスパッチ 2 箇所、Issue #514 で追加した F16c/NeonFp16 の `dot_f16`
+    // ディスパッチ 2 箇所、Issue #511（TASK-156・CORE-14）で追加した `dot_block4`
+    // の Neon ディスパッチ 1 箇所の計 8 箇所の `unsafe {` が現れる（実際のビルドで
+    // 有効になるのは対象 arch の分岐のみだが、`cfg` 行はソース上に残ったまま
+    // 走査されるため、arch に依存せず常に 8 を期待できる）。
     assert_eq!(
-        unsafe_block_count, 7,
-        "expected exactly 7 `unsafe {{` blocks in isa.rs (Neon/Avx2Fma/Avx512 dot dispatch \
+        unsafe_block_count, 8,
+        "expected exactly 8 `unsafe {{` blocks in isa.rs (Neon/Avx2Fma/Avx512 dot dispatch \
          + Avx2Fma/Avx512 dot_block4 dispatch + F16c/NeonFp16 dot_f16 dispatch added by \
-         Issue #514)"
+         Issue #514 + Neon dot_block4 dispatch added by Issue #511)"
     );
 }
 
