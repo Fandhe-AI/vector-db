@@ -240,7 +240,8 @@ C=[777, 1089, 1099, 1039, 725] であり、
 | dense (B0) | 429 | 405 |
 
 `sparse(B5)` が約 51%（3374→1666µs）、`residual(B4−B0−B5)` が約 49%
-（1881→958µs）に減少している。`sparse(B5)` の減少は #546（スコアアキュムレータ
+（1881→958µs）減少している（いずれも削減率。減少後の比率で言えば
+sparse は約 49%・residual は約 51%に相当する）。`sparse(B5)` の減少は #546（スコアアキュムレータ
 のスクラッチプール化）、`residual` の減少は #549（RRF 融合コアの位置索引化）に
 それぞれ帰属すると考えられるが、状態 B（#546 のみ）を計測していないため
 **寄与の切り分けは確定できない**（申し送り）。`sql_surface`・`projection`・
@@ -561,15 +562,21 @@ done
 #   <dir-a>/target・<dir-c>/target 配下にそのパスでバイナリを配置してから実行する）
 
 # Recall 3 ゲート（プレースホルダ閾値・RECALL_VERBOSE=1・RECALL_ENGINE=brute_force|hnsw）
-RECALL_VERBOSE=1 RECALL_ENGINE=brute_force \
-  HYBRID_RECALL_MIN_R20_SMALL=0.001 HYBRID_RECALL_MIN_R20_LARGE=0.001 HYBRID_RECALL_MIN_R100_LARGE=0.001 \
-  cargo test --release -p engine --test hybrid_recall -- --ignored --nocapture
-RECALL_VERBOSE=1 RECALL_ENGINE=brute_force RERANK_RECALL_MIN_R20_LARGE=0.001 \
-  cargo test --release -p engine --test rerank_recall -- --ignored --nocapture
-RECALL_VERBOSE=1 RECALL_ENGINE=brute_force \
-  QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT=0.001 QUERY_PLANNING_RECALL_MIN_R20_DIRECT=0.001 \
-  QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED=0.001 QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE=0.001 \
-  cargo test --release -p engine --test query_planning_recall -- --ignored --nocapture
+# 比較対象コミット（<dir-a>=91f6a18・<dir-c>=c86c683）でそれぞれ選択するため、
+# 各ディレクトリ内で cargo コマンドを実行するループにする（cd はサブシェル内のみ有効で
+# 後続コマンドへは引き継がれないため、1 サブシェル内で完結させる）。
+for dir in <dir-a> <dir-c>; do
+  ( cd "$dir" && \
+    RECALL_VERBOSE=1 RECALL_ENGINE=brute_force \
+      HYBRID_RECALL_MIN_R20_SMALL=0.001 HYBRID_RECALL_MIN_R20_LARGE=0.001 HYBRID_RECALL_MIN_R100_LARGE=0.001 \
+      cargo test --release -p engine --test hybrid_recall -- --ignored --nocapture && \
+    RECALL_VERBOSE=1 RECALL_ENGINE=brute_force RERANK_RECALL_MIN_R20_LARGE=0.001 \
+      cargo test --release -p engine --test rerank_recall -- --ignored --nocapture && \
+    RECALL_VERBOSE=1 RECALL_ENGINE=brute_force \
+      QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT=0.001 QUERY_PLANNING_RECALL_MIN_R20_DIRECT=0.001 \
+      QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED=0.001 QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE=0.001 \
+      cargo test --release -p engine --test query_planning_recall -- --ignored --nocapture )
+done
 # RECALL_ENGINE=hnsw に差し替えて同様に実行
 ```
 
