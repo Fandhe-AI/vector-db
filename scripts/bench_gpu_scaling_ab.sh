@@ -24,6 +24,13 @@
 # 各 run の直前に /proc/loadavg・nvidia-smi のクロック/温度を同じログへ書き、
 # 計測環境のノイズ源を再現性のため残す。
 #
+# 記録の保持（codex-review P1 指摘・PR #580）: OUT_DIR の既定値は本リポの
+# `.gitignore` 対象（`_/`）配下のため、実行後 summary.tsv を残す場合は
+# `docs/design/bench-data/gpu-scaling-ab/<UTC timestamp>-summary.tsv` へ
+# 明示的にコピーし、対応する docs/design/*.md の実測表からそのパスを参照する
+# こと（benchmark-judgement-policy.md §3 の per-run 生データ保持契約）。
+# 生ログ全文（*.log）まで tracked にする必要はない。
+#
 # 実行順序（規約: 逐次実行にしない・生ログを残す・skip/unavailable を握りつぶさない）:
 #   各規模点について pair=1..PAIRS の順で before → after を実行する。
 
@@ -87,6 +94,15 @@ run_one() {
   local point_dir="${OUT_DIR}/${point//:/-}"
   mkdir -p "${point_dir}"
   local log="${point_dir}/${pair}-${side}.log"
+
+  # 既存の生ログを黙って上書きしない（docs/design/benchmark-judgement-policy.md
+  # §3 の per-run 生データ保持契約）。同じ OUT_DIR・規模点で再実行すると
+  # summary.tsv には追記される一方 log ファイルは上書きされ、過去の集計行に
+  # 対応する環境情報・出力全文が失われる不整合を防ぐため、既存ログがあれば
+  # 実行前に拒否する（codex-review P1 指摘。PR #580）。
+  if [ -e "${log}" ]; then
+    die "raw log already exists (refusing to overwrite): ${log}. Use a fresh OUT_DIR for a new run."
+  fi
 
   {
     echo "# pre-run environment snapshot"
