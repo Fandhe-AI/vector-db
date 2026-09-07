@@ -211,6 +211,59 @@ dot_block4_neon: ldr=34 fmla=4 fadd=25 fmul=12 dup=12 movi=12 cmp=17 csel=9 and=
 - 要素変換後の `set_ps`（型変換を挟む構築）は `vinsertf128`／`vshufps` へ最適化
   され、`vinsertps` を残さないため同様に不適
 
+## 6.1. Issue #522 追記: 整数 i8×i8 dot カーネル・`mnemonic_of` バグ修正
+
+VNNI（512bit／256bit）と i16 widen フォールバックの整数 dot カーネル
+（`isa/x86_i8.rs`。`docs/design/hnsw-sq8-resident.md`「Issue #522」節参照）を
+本ガードへ登録した。
+
+**発見: AVX-VNNI の `{vex}` encoding hint 接頭辞バグ**
+
+AVX-VNNI（`avx2,avxvnni`。AVX-512 を要さない VEX 符号化 VNNI 命令）は
+LLVM の `.s` 出力で `{vex}\tvpdpbusd ...` のように先頭へ符号化方式を示す
+波括弧トークンが付く（`{evex}`／`{disp32}` 等、他の encoding hint も同型で
+現れうる）。旧 `mnemonic_of` はこの接頭辞を先頭トークンとして扱い、実際の
+ニーモニック（`vpdpbusd`）ではなく `{vex}` を返していたため、禁止命令検査
+（§3）・期待命令検査（§6）の双方が対象行を一切見ないまま素通りしていた
+（本 Issue の self-test fixture 作成時に判明。既存 f16／block4 カーネルへの
+影響は無い——`{vex}` は AVX-VNNI の VEX 符号化明示にのみ現れる）。波括弧で
+囲まれたトークンを除去してからニーモニックを取る形へ修正した。
+
+**新規必須シンボル・期待命令規則**
+
+| 関数 | 必須シンボル | 期待命令規則 |
+| ---- | ------------ | ------------ |
+| `dot_i8_avx512_vnni` | `18dot_i8_avx512_vnni` | メモリオペランド付き `vpdpbusd` on `%zmm`（`{vex}`／`{evex}` 接頭辞の有無を許容する正規表現） |
+| `dot_i8_avx_vnni` | `15dot_i8_avx_vnni` | 同上・`%ymm` |
+| `dot_i8_avx2_widen` | `17dot_i8_avx2_widen` | `vpmaddwd`（1 件以上）＋メモリオペランド付き `vpmovsxbw` の両方 |
+
+**判断: byte/word 要素の逐次パック検出（`punpcklbw`／`punpcklwd` 等）は
+不採用**
+
+計画段階では「禁止命令へ byte/word unpack 系（`punpcklbw`／`vpunpcklbw`／
+`punpcklwd`／`vpunpcklwd` 等）を追加する」ことを検討したが、実装・実測の
+結果**不採用**とした。理由: `scan_forbidden`（§3）はモジュール内で検出した
+全関数の命令列を無差別に走査する構造（対象を「手書き intrinsics カーネル」
+に限定しない）のため、`i8`→`i32` の要素ごと符号拡張をコンパイラが自動
+ベクトル化で正当に punpck 系（x86_64）／`mov v.b[..]`（aarch64）へ変換する
+スカラー参照実装（`dot_i8_scalar`）まで誤って fail させた（f32／f16 の
+スカラー参照実装が偶然この命令を出さないだけで、i8 幅拡張という演算特性に
+起因する誤検出）。本ガードが検出したいのは「手書き `_mm*_set_epi8` 構築が
+gather／stride 由来で per-element insert 命令へ縮退した」ケースであり、
+これは既存の `pinsrb`／`vpinsrb` 系禁止命令が既に捕捉する。`dot_i8_scalar`
+は関数名（`*dot_i8_scalar*`）で `scan_forbidden` の対象から明示的に除外し
+（`dot_scalar`／`dot_f16_scalar` と同じ「スカラー参照実装は本ガードの対象
+外」という位置付け）、`isa.rs::dot_i8_scalar` へ `#[inline(never)]` を付与
+して `I8Kernel::dot_i8` ディスパッチ本体へインライン化されないようにした
+（インライン化されると、ディスパッチ本体自身の命令列に上記の自動ベクトル化
+結果が紛れ込み、除外規則をすり抜けて誤検出が再発するため）。
+
+**self-test fixture**
+
+pass: `dot_i8_avx512_vnni`／`dot_i8_avx2_widen` と同型（`set` 構築のみ）。
+fail: 関数名は `dot_i8_avx512_vnni` だが実体はスカラー逐次和（`vpdpbusd`
+非搭載）——`fx_fail_f16_missing_instruction` と同型の非 vacuous 検査対象。
+
 ## 7. 既知の限界
 
 - 本ガードは「現行の LLVM が特定の書き方をどう最適化するか」を固定するもので
