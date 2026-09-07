@@ -76,7 +76,7 @@
 //! `unwrap`／`expect`／`[]` を使わない。`unsafe` は使わない。環境変数・feature flag
 //! による経路上書きは設けない（CORE-12 踏襲）。
 
-use std::collections::{BinaryHeap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
@@ -1105,8 +1105,20 @@ impl GraphBuilder {
     /// 総コストは O(`PRECISE_REPAIR_CAP` * N + N) に収まり、`MAX_LEVEL` も
     /// 定数上限（32）であるため `HnswIndex::build` 全体では入力規模に対し
     /// ほぼ線形（N log N 契約の範囲内）に収まる。
-    fn repair_reachability(&mut self, dim: usize, vectors: &[f32]) -> Result<(), HnswError> {
-        self.repair_reachability_inner::<false>(dim, vectors)
+    /// `threads` は最近傍探索フェーズ（下記 [`repair_reachability_inner`]
+    /// (Self::repair_reachability_inner) 「Issue #449」節）の並列度上限。
+    /// 呼び出し元（`build_inner`・`parallel_build::freeze`）が
+    /// [`HnswIndex::build_with_threads`] 等から引き継いだ構築スレッド数を
+    /// そのまま渡す契約（`WorkerBudgetGuard` の追加取得は行わない——下記
+    /// [`repair_reachability_inner`](Self::repair_reachability_inner)
+    /// 「Issue #449」節の「予算引き継ぎ方針」参照）。
+    fn repair_reachability(
+        &mut self,
+        dim: usize,
+        vectors: &[f32],
+        threads: usize,
+    ) -> Result<(), HnswError> {
+        self.repair_reachability_inner::<false>(dim, vectors, threads)
             .map(|_| ())
     }
 
@@ -1116,13 +1128,15 @@ impl GraphBuilder {
     /// [`HnswRepairStats`] として返す。非観測経路（`build`・
     /// `build_with_threads`・`parallel_build::freeze`）は
     /// [`repair_reachability`](Self::repair_reachability) を呼ぶため本メソッドの
-    /// 計装コストを一切負わない。
+    /// 計装コストを一切負わない。`threads` の意味は
+    /// [`repair_reachability`](Self::repair_reachability) と同一。
     fn repair_reachability_observed(
         &mut self,
         dim: usize,
         vectors: &[f32],
+        threads: usize,
     ) -> Result<HnswRepairStats, HnswError> {
-        self.repair_reachability_inner::<true>(dim, vectors)
+        self.repair_reachability_inner::<true>(dim, vectors, threads)
     }
 
     /// 全ノード挿入後の決定的な後始末パス。`insert_node`／`shrink_links` の
@@ -1187,10 +1201,73 @@ impl GraphBuilder {
     /// (Self::repair_reachability_observed) 経由）でのみ [`HnswRepairStats`]
     /// を採取する。グラフ操作の順序・比較・タイブレークは `OBSERVE` の値に
     /// 関わらず完全に同一（観測が挙動へ影響しない）。
+    /// 入力非依存の定数に保つことで、層あたりの
+    /// 総コストは O(`PRECISE_REPAIR_CAP` * N + N) に収まり、`MAX_LEVEL` も
+    /// 定数上限（32）であるため `HnswIndex::build` 全体では入力規模に対し
+    /// ほぼ線形（N log N 契約の範囲内）に収まる。
+    ///
+    /// # 観測分離（`OBSERVE`。Issue #447）
+    ///
+    /// `OBSERVE` を `const` ジェネリックにすることで、`OBSERVE=false`
+    /// （[`repair_reachability`](Self::repair_reachability) 経由。`build`・
+    /// `build_with_threads`・`parallel_build::freeze` が使う非観測経路）では
+    /// 単相化によって計測分岐・`Instant::now()`・カウンタ更新のコードが
+    /// 一切残らない（PR #445 の `BuildGraph::observe` 分岐と同じ方針）。
+    /// `OBSERVE=true`（[`repair_reachability_observed`]
+    /// (Self::repair_reachability_observed) 経由）でのみ [`HnswRepairStats`]
+    /// を採取する。グラフ操作の順序・比較・タイブレークは `OBSERVE` の値に
+    /// 関わらず完全に同一（観測が挙動へ影響しない）。
+    ///
+    /// # 探索の並列化（`threads`。Issue #449）
+    ///
+    /// フェーズ 1 の各反復が行う「到達済み集合内の最近傍探索」（`dot` を
+    /// 到達済みノード数だけ計算する読み取り専用の走査）を、`threads` を
+    /// 上限に [`nearest_reachable`] へ分割・並列実行させる。修復先の決定
+    /// （`connect`／`shrink_links` の可変更新）自体は本メソッドが逐次のまま
+    /// 適用するため、`&mut self` の借用規則を破らずに済む（探索＝不変借用の
+    /// 読み取り専用ヘルパ、結線＝可変借用の逐次適用、という 2 相構成）。
+    ///
+    /// 並列度は [`repair_workers_for`] が
+    /// `crate::parallel_search::thread_count_for`（検索側の並列度決定と同一
+    /// 関数）を経由して決める——`threads==1`（`build`・`build_with_threads`
+    /// の縮退経路）では常に 1 に縮退し、[`nearest_reachable`] はワーカーを
+    /// 一切起動しない逐次経路のみを通る。`WorkerBudgetGuard`
+    /// （`parallel_search.rs`）の追加取得はここでは行わない——呼び出し元
+    /// （`HnswIndex::build_parallel`／`build_parallel_with_precision`）が
+    /// 構築全体（並列挿入フェーズを含む）にわたって保持済みの予算を
+    /// `threads` としてそのまま引き継ぐ契約であり、二重に予算を計上しない
+    /// ため（`build_with_threads`〔明示スレッド数指定〕の並列挿入フェーズも
+    /// 同様に追加取得なしで `threads` 本を起動する既存契約に揃えた）。
+    ///
+    /// 探索フェーズの比較・タイブレークはモジュール冒頭「順序規約」（スコア
+    /// `total_cmp` 降順・同点は id 昇順）に従い、この規約は全順序を成す
+    /// （[`better_repair_candidate`] 参照）。全順序であることから、到達済み
+    /// 集合をどう分割し・各ワーカーの局所最良をどの順序で縮約しても、
+    /// 最終的に選ばれる修復先ノードは分割・縮約の順序に依存せず一意に
+    /// 定まる——`threads` の値によらず本メソッドが返すグラフはビット同一
+    /// になる（`docs/design/rrf-tie-break-determinism.md`「維持すべき不変
+    /// 条件」と同方針。`crates/engine/src/hnsw.rs` 内 `#[cfg(test)] mod tests`
+    /// の `repair_reachability_inner` 完全一致テストで機械検証する）。
+    ///
+    /// # 冗長な BFS の省略（Issue #449）
+    ///
+    /// フェーズ 1 の各反復は必ず BFS（[`bfs_reachable_mask`]）から始まる。
+    /// フェーズ 1 が「未到達ノードが見つからず `break`」で終わった場合、
+    /// その `break` 直前に計算した BFS 結果はグラフを一切変更していない
+    /// 状態のまま得られたものであり、フェーズ 2 が使う到達集合と完全に
+    /// 一致する（フェーズ 1・フェーズ 2 とも同じ `entry` から同じグラフに
+    /// 対して BFS するため）。よってこの場合はフェーズ 2 の BFS を再実行
+    /// せず、フェーズ 1 最終反復の結果をそのまま使い回す。逆に、フェーズ 1
+    /// が反復回数の上限まで完走した場合は最終反復で必ず結線（`connect`／
+    /// `shrink_links`）が起きているため、フェーズ 2 は BFS を再実行して
+    /// グラフの最新状態を反映する（`mutated_since_bfs` フラグで判定）。
+    /// グラフの出力自体はこの省略の前後で変わらない（省略するのは「変更が
+    /// 無いと分かっている再計算」のみ）。
     fn repair_reachability_inner<const OBSERVE: bool>(
         &mut self,
         dim: usize,
         vectors: &[f32],
+        threads: usize,
     ) -> Result<HnswRepairStats, HnswError> {
         let inner_start = if OBSERVE {
             Some(std::time::Instant::now())
@@ -1215,57 +1292,59 @@ impl GraphBuilder {
             } else {
                 None
             };
+            // 当該層に属するノード id（昇順）を層ごとに 1 回だけ構築する
+            // （Issue #449: 毎反復・フェーズ 2 の `(0..len).filter(level_of
+            // >= level)` 全走査を層ごとに 1 回へ削減。集合としての内容は
+            // 従来の毎回フィルタと同一）。
+            let members: Vec<u32> = (0..self.nodes.len() as u32)
+                .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
+                .collect();
+
             // フェーズ 1: 全体 BFS ＋ 到達済み全ノードとの `dot` 計算を伴う
             // 厳密な修復を `PRECISE_REPAIR_CAP` 回までに限定する。
             let mut phase1_completed = 0usize;
+            // フェーズ 1 の最終反復で得た到達集合（フェーズ 2 の冗長 BFS
+            // 省略に使う。上記ドキュメンテーションコメント「冗長な BFS の
+            // 省略」参照）。
+            let mut last_mask: Option<NodeMask> = None;
+            let mut mutated_since_bfs = false;
             for iter in 0..PRECISE_REPAIR_CAP {
-                let reachable = self.bfs_reachable(level, entry);
+                let mask = self.bfs_reachable_mask(level, entry);
+                mutated_since_bfs = false;
+
+                // `members` を 1 回だけ走査し、到達済み部分列（`reachable`。
+                // 最近傍探索の候補集合）と最初の未到達ノードを同時に確定する
+                // （Issue #449: 従来の 2 回の独立した `filter` 走査を統合）。
+                let mut reachable: Vec<u32> = Vec::with_capacity(members.len());
+                let mut missing_node: Option<u32> = None;
+                let mut unreachable_count: u64 = 0;
+                for &m in &members {
+                    if mask.get(m) {
+                        reachable.push(m);
+                    } else {
+                        if missing_node.is_none() {
+                            missing_node = Some(m);
+                        }
+                        unreachable_count += 1;
+                    }
+                }
                 if OBSERVE && iter == 0 {
                     // フェーズ 1 の最初の反復で得られる BFS 結果をそのまま
                     // 流用して到達不能ノード数を数える（追加の BFS を
-                    // 入れない。この `filter().count()` 自体の時間は
-                    // `phase1_wall` に含める——`unreachable_before` の
-                    // ドキュメンテーションコメント参照）。
-                    level_stats.unreachable_before = (0..self.nodes.len() as u32)
-                        .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
-                        .filter(|n| !reachable.contains(n))
-                        .count() as u64;
+                    // 入れない。この走査自体の時間は `phase1_wall` に含める
+                    // ——`unreachable_before` のドキュメンテーションコメント
+                    // 参照）。
+                    level_stats.unreachable_before = unreachable_count;
                 }
-                let missing_node = (0..self.nodes.len() as u32)
-                    .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
-                    .find(|n| !reachable.contains(n));
-                let Some(node) = missing_node else {
-                    break;
-                };
+                last_mask = Some(mask);
 
-                let node_vec = node_vector(vectors, dim, node)?;
-                let mut best: Option<(u32, f32)> = None;
-                for &candidate in &reachable {
-                    let cand_vec = node_vector(vectors, dim, candidate)?;
-                    let score = dot(node_vec, cand_vec);
-                    if !score.is_finite() {
-                        return Err(HnswError::NonFiniteScore { node: candidate });
-                    }
-                    // スコア降順・同点は id 昇順（モジュール冒頭の順序規約）。
-                    // `reachable` は `HashSet<u32>` であり走査順はプロセス
-                    // ごとに変わり得るハッシュ状態に依存するため、同点時に
-                    // 単純な `>` 比較（最初に見つかった候補を保持）のままだと
-                    // 同一 seed・同一入力でも修復先ノードが非決定的になる
-                    // （codex-review #423 P1 指摘）。ここでスコア・id の複合
-                    // 順序で明示的にタイブレークすることで、`reachable` の
-                    // 走査順に関係なく常に同じ (score, id) の組が選ばれる。
-                    let better = match best {
-                        Some((best_node, best_score)) => match score.total_cmp(&best_score) {
-                            std::cmp::Ordering::Greater => true,
-                            std::cmp::Ordering::Equal => candidate < best_node,
-                            std::cmp::Ordering::Less => false,
-                        },
-                        None => true,
-                    };
-                    if better {
-                        best = Some((candidate, score));
-                    }
-                }
+                let Some(node) = missing_node else { break };
+
+                // 到達済み集合内の最近傍探索（読み取り専用・Issue #449 で
+                // 並列化対象。`&mut self` を要する結線はこの下の `if let
+                // Some` 内でのみ行う）。
+                let workers = repair_workers_for(reachable.len(), threads);
+                let best = nearest_reachable(vectors, dim, node, &reachable, workers)?;
                 // `reachable` は entry 自身を含むため必ず 1 件以上存在し、`best`
                 // は常に `Some` になる（entry 自身が候補になり得る）。`None` は
                 // `reachable` が空という到達不能な状態であり、fail-closed で
@@ -1277,6 +1356,7 @@ impl GraphBuilder {
                     self.connect(target, node, level);
                     self.shrink_links(target, level, dim, vectors, node)?;
                     self.shrink_links(node, level, dim, vectors, target)?;
+                    mutated_since_bfs = true;
                 }
                 phase1_completed = iter + 1;
             }
@@ -1295,13 +1375,20 @@ impl GraphBuilder {
             };
             // フェーズ 2: フェーズ 1 の絶対上限までで解消しなかった残りを、
             // 上記モジュールコメントのとおり id 昇順の片方向チェーンで
-            // 確定的に閉じる。`remaining` は `0..len` の昇順フィルタなので
+            // 確定的に閉じる。`remaining` は `members`（既に昇順）由来なので
             // 既に決定的な id 昇順である。
-            let reachable = self.bfs_reachable(level, entry);
-            let remaining: Vec<u32> = (0..self.nodes.len() as u32)
-                .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
-                .filter(|n| !reachable.contains(n))
-                .collect();
+            //
+            // `mutated_since_bfs` が立っていなければ、フェーズ 1 最終反復の
+            // BFS（`last_mask`）以降グラフは変化していないため、この BFS
+            // 結果をそのまま使い回す（上記「冗長な BFS の省略」参照）。
+            // `PRECISE_REPAIR_CAP > 0` なのでループは必ず 1 回以上実行され、
+            // `last_mask` は常に `Some`。
+            let mask = if mutated_since_bfs {
+                self.bfs_reachable_mask(level, entry)
+            } else {
+                last_mask.unwrap_or_else(|| self.bfs_reachable_mask(level, entry))
+            };
+            let remaining: Vec<u32> = members.iter().copied().filter(|n| !mask.get(*n)).collect();
             if OBSERVE {
                 level_stats.phase2_nodes = remaining.len() as u64;
             }
@@ -1379,17 +1466,25 @@ impl GraphBuilder {
     }
 
     /// 層 `level` 上でノード `start` からリンクを辿って到達可能なノード集合を
-    /// 返す（`repair_reachability` 専用の内部 BFS。`tests/hnsw.rs` は公開 API
-    /// `neighbors` を使い同等の BFS を独立に実装して検証する）。
-    fn bfs_reachable(&self, level: usize, start: u32) -> HashSet<u32> {
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        visited.insert(start);
+    /// ビットマップで返す（`repair_reachability` 専用の内部 BFS。`tests/hnsw.rs`
+    /// は公開 API `neighbors` を使い同等の BFS を独立に実装して検証する）。
+    ///
+    /// Issue #449: 到達集合の表現を `HashSet<u32>`（SipHash によるハッシュ
+    /// コスト・エントリごとのヒープ確保）から [`NodeMask`]（1 ノード 1 bit の
+    /// ビットマップ）＋ `Vec<u32>` キューへ置換した。BFS が辿る到達可能
+    /// ノードの**集合そのもの**は不変（訪問順・到達判定ロジックは変えて
+    /// いない）ため、呼び出し元（`repair_reachability_inner`）が導く修復結果
+    /// は表現変更の前後で完全に一致する。
+    fn bfs_reachable_mask(&self, level: usize, start: u32) -> NodeMask {
+        let mut visited = NodeMask::new(self.nodes.len());
+        let mut queue: VecDeque<u32> = VecDeque::new();
+        visited.set(start);
         queue.push_back(start);
         while let Some(node) = queue.pop_front() {
             if let Some(neighbors) = self.neighbors(level, node) {
                 for &n in neighbors {
-                    if visited.insert(n) {
+                    if !visited.get(n) {
+                        visited.set(n);
                         queue.push_back(n);
                     }
                 }
@@ -1743,7 +1838,10 @@ impl HnswIndex {
             builder.insert_node(node_id, level, dim_usize, vectors, &mut visited)?;
         }
 
-        let repair_stats = builder.repair_reachability_inner::<OBSERVE>(dim_usize, vectors)?;
+        // `build`／`build_with_precision`／`build_observed` はいずれも単一
+        // スレッドの逐次経路であり、修復フェーズの最近傍探索（Issue #449）も
+        // 常に `threads=1`（ワーカーを起動しない縮退経路）で実行する。
+        let repair_stats = builder.repair_reachability_inner::<OBSERVE>(dim_usize, vectors, 1)?;
 
         let index = Self::freeze_from(builder, dim, owned_vectors, precision)?;
         Ok((index, repair_stats))
@@ -2888,6 +2986,151 @@ fn node_vector(vectors: &[f32], dim: usize, node: u32) -> Result<&[f32], HnswErr
     let end = start.checked_add(dim).ok_or(HnswError::CapacityOverflow)?;
     vectors.get(start..end).ok_or(HnswError::CapacityOverflow)
 }
+
+/// [`GraphBuilder::repair_reachability_inner`] のフェーズ 1 が使う最近傍探索
+/// （[`nearest_reachable`]）の並列度を決める方針関数（Issue #449。方針
+/// （何本立てるか）と機構（実際の分割走査。[`nearest_reachable`] 側）を分離し、
+/// それぞれを独立にテストできるようにする）。
+///
+/// `crate::parallel_search::thread_count_for`（検索側の並列度決定と同一関数。
+/// `MIN_ROWS_PER_THREAD` による小規模時の 1 本への縮退を含む）を到達済み集合
+/// のサイズで評価し、構築側が引き継いだ `threads` 上限でさらにクランプする。
+/// `threads==1`（`build`・`build_with_threads` の縮退経路）では常に 1 を返し、
+/// [`nearest_reachable`] は並列分岐を一切通らない。
+fn repair_workers_for(reachable_len: usize, threads: usize) -> usize {
+    crate::parallel_search::thread_count_for(reachable_len).min(threads.max(1))
+}
+
+/// `current` と `candidate`（`(id, score)`）のうち、モジュール冒頭「順序規約」
+/// （スコア `total_cmp` 降順・同点は id 昇順）に従って採用すべき方を返す。
+/// この規約は全順序を成すため、[`nearest_reachable`] が到達集合をどう分割し・
+/// 各ワーカーの局所最良をどの順序で縮約しても、最終的に選ばれる候補は分割・
+/// 縮約の順序に依存せず一意に定まる（`repair_reachability_inner` の
+/// ドキュメンテーションコメント「探索の並列化」参照）。
+fn better_repair_candidate(
+    current: Option<(u32, f32)>,
+    candidate: (u32, f32),
+) -> Option<(u32, f32)> {
+    match current {
+        None => Some(candidate),
+        Some((cur_id, cur_score)) => match candidate.1.total_cmp(&cur_score) {
+            std::cmp::Ordering::Greater => Some(candidate),
+            std::cmp::Ordering::Equal if candidate.0 < cur_id => Some(candidate),
+            _ => current,
+        },
+    }
+}
+
+/// `candidates`（`reachable` の全体または 1 ワーカー分のチャンク）を逐次走査し
+/// `query` に最も近い（`dot` 最大・同点 id 昇順）候補を返す（[`nearest_reachable`]
+/// の逐次経路・並列ワーカー本体の双方が共有する機構）。非有限スコアは
+/// `HnswError::NonFiniteScore` として拒否する（`repair_reachability_inner` の
+/// 既存契約と同一。モジュール冒頭「距離カーネル」節参照）。
+fn nearest_reachable_scan(
+    vectors: &[f32],
+    dim: usize,
+    query: &[f32],
+    candidates: &[u32],
+) -> Result<Option<(u32, f32)>, HnswError> {
+    let mut best: Option<(u32, f32)> = None;
+    for &candidate in candidates {
+        let cand_vec = node_vector(vectors, dim, candidate)?;
+        let score = dot(query, cand_vec);
+        if !score.is_finite() {
+            return Err(HnswError::NonFiniteScore { node: candidate });
+        }
+        best = better_repair_candidate(best, (candidate, score));
+    }
+    Ok(best)
+}
+
+/// 到達済み集合 `reachable`（id 昇順）から `node` に最も近い候補を返す
+/// （[`GraphBuilder::repair_reachability_inner`] フェーズ 1 が使う読み取り
+/// 専用の探索。Issue #449）。`workers<=1` または `reachable.len()<=1` では
+/// 分割せず [`nearest_reachable_scan`] を直接呼ぶ（ワーカーを一切起動しない
+/// 逐次経路。`threads==1` の `build`・`build_with_threads` 縮退経路はここへ
+/// 到達する）。`workers>=2` では `reachable` を `workers` 個の連続チャンクへ
+/// 分割し、各チャンクを別スレッド（`std::thread::scope`）で
+/// [`nearest_reachable_scan`] に掛けて局所最良を求め、
+/// [`better_repair_candidate`] の全順序で縮約する——縮約順序に依存せず結果は
+/// 一意に定まるため、`workers` の値によらずビット同一の結果を返す
+/// （呼び出し元 `repair_reachability_inner` のドキュメンテーションコメント
+/// 「探索の並列化」参照）。
+///
+/// ワーカーの panic（`join` 失敗）は `HnswError::WorkerPanicked` として
+/// 構築全体を拒否する（`parallel_build::build_parallel_graph` の
+/// `first_error`／`any_panicked` パターンと同型の fail-closed 契約。部分的に
+/// 探索したまま `Ok` を返さない）。
+fn nearest_reachable(
+    vectors: &[f32],
+    dim: usize,
+    node: u32,
+    reachable: &[u32],
+    workers: usize,
+) -> Result<Option<(u32, f32)>, HnswError> {
+    let query = node_vector(vectors, dim, node)?;
+    if workers <= 1 || reachable.len() <= 1 {
+        return nearest_reachable_scan(vectors, dim, query, reachable);
+    }
+    #[cfg(test)]
+    REPAIR_PARALLEL_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let chunk_len = reachable.len().div_ceil(workers).max(1);
+    let first_error: std::sync::Mutex<Option<HnswError>> = std::sync::Mutex::new(None);
+    let (any_panicked, locals): (bool, Vec<Option<(u32, f32)>>) = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in reachable.chunks(chunk_len) {
+            let first_error_ref = &first_error;
+            handles.push(scope.spawn(move || -> Option<(u32, f32)> {
+                match nearest_reachable_scan(vectors, dim, query, chunk) {
+                    Ok(best) => best,
+                    Err(e) => {
+                        let mut fe = first_error_ref
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        if fe.is_none() {
+                            *fe = Some(e);
+                        }
+                        None
+                    }
+                }
+            }));
+        }
+        let mut any_panicked = false;
+        let mut locals = Vec::with_capacity(handles.len());
+        for h in handles {
+            match h.join() {
+                Ok(v) => locals.push(v),
+                Err(_) => {
+                    any_panicked = true;
+                    locals.push(None);
+                }
+            }
+        }
+        (any_panicked, locals)
+    });
+    if any_panicked {
+        return Err(HnswError::WorkerPanicked);
+    }
+    if let Some(e) = first_error
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner())
+    {
+        return Err(e);
+    }
+    let mut best: Option<(u32, f32)> = None;
+    for local in locals.into_iter().flatten() {
+        best = better_repair_candidate(best, local);
+    }
+    Ok(best)
+}
+
+/// [`nearest_reachable`] が `workers>=2` の並列分岐を実際に通った回数
+/// （テスト専用の非 vacuous 検証カウンタ。Issue #449。`#[cfg(test)]` の
+/// 内外で完全に消える——production バイナリには一切残らない）。
+#[cfg(test)]
+static REPAIR_PARALLEL_LAUNCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// `build`（`HnswParams::validate` → 次元整合 → ノード数上限 → 非有限値の
 /// 検証順序。モジュール `build` ドキュメンテーションコメント参照）と
@@ -4600,5 +4843,223 @@ mod tests {
             recall >= 0.7,
             "f16 resident recall@{k} too low: {recall} ({recall_hits}/{recall_total})"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #449: repair_reachability の到達不能ノード探索・再接続の並列化
+    // ------------------------------------------------------------------
+
+    /// `repair_workers_for` の方針（Issue #449）: 到達集合が小さい（既定
+    /// `MIN_ROWS_PER_THREAD`=1,024 未満）場合は `threads` の値によらず常に
+    /// 1 に縮退し、十分大きい場合は `threads` と実行環境の並列度の小さい方
+    /// まで増える。
+    #[test]
+    fn repair_workers_for_clamps_small_reachable_sets_and_respects_threads_cap() {
+        assert_eq!(
+            repair_workers_for(400, 12),
+            1,
+            "MIN_ROWS_PER_THREAD 未満の到達集合は 1 スレッドへ縮退するはず"
+        );
+        assert_eq!(
+            repair_workers_for(400, 1),
+            1,
+            "threads=1（縮退経路）は常に 1"
+        );
+
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let expected = crate::parallel_search::thread_count_for(100_000).min(12);
+        assert_eq!(
+            repair_workers_for(100_000, 12),
+            expected,
+            "十分大きい到達集合では available_parallelism と threads の小さい方まで増える"
+        );
+        if available >= 2 {
+            assert!(
+                repair_workers_for(100_000, 12) >= 2,
+                "この実行環境（available_parallelism={available}）では複数スレッドまで増えるはず"
+            );
+        }
+    }
+
+    /// `nearest_reachable` の並列経路（`workers>=2`）が逐次経路
+    /// （`workers==1`）とビット同一の結果を返すことを、実際に並列分岐を通した
+    /// 上で固定する（Issue #449「探索の並列化」。非 vacuous 性は
+    /// `REPAIR_PARALLEL_LAUNCHES` カウンタで検証する）。
+    #[test]
+    fn nearest_reachable_matches_across_worker_counts_and_actually_parallelizes() {
+        let dim = 8usize;
+        let n = 5_000usize;
+        let vectors = gen_corpus(0x4E45_4152_4553_5449u64, dim, n);
+        // 到達集合は 0 番ノードを除く全ノード（`node` 自身は候補に含めない
+        // 既存契約——`repair_reachability_inner` 側で `reachable` は
+        // `bfs_reachable_mask` の到達集合から作るため `node` 自身は通常含み
+        // 得るが、ここでは機構単体テストのため任意の候補列を渡す）。
+        let reachable: Vec<u32> = (1..n as u32).collect();
+        let node = 0u32;
+
+        let before = REPAIR_PARALLEL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
+        let sequential = nearest_reachable(&vectors, dim, node, &reachable, 1)
+            .expect("sequential nearest_reachable must succeed");
+        let after_sequential = REPAIR_PARALLEL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            before, after_sequential,
+            "workers=1 は並列分岐を通らないはず"
+        );
+
+        for workers in [2usize, 4, 8] {
+            let parallel = nearest_reachable(&vectors, dim, node, &reachable, workers)
+                .expect("parallel nearest_reachable must succeed");
+            assert_eq!(
+                sequential, parallel,
+                "workers={workers} の結果が逐次経路とビット一致しない"
+            );
+        }
+        let after_parallel = REPAIR_PARALLEL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after_parallel > after_sequential,
+            "workers>=2 の呼び出しで並列分岐が実際に起動しているはず（非 vacuous 性の検証）"
+        );
+    }
+
+    /// 全ノード挿入後・修復前の `GraphBuilder` を組み立てるテスト専用ヘルパ
+    /// （Issue #449。`build_inner` の挿入ループと同じ手順を、修復
+    /// （`repair_reachability_inner`）呼び出し前で止めて返す。異なる
+    /// `threads` で修復した結果を比較するテストが、修復前の同一グラフを
+    /// 複数回・決定的に再現するために使う）。
+    fn build_unrepaired(
+        params: HnswParams,
+        dim: usize,
+        vectors: &[f32],
+        seed: u64,
+    ) -> GraphBuilder {
+        let n = vectors.len() / dim;
+        let mut builder = GraphBuilder {
+            params,
+            nodes: Vec::with_capacity(n),
+            entry_point: None,
+        };
+        let mut rng = DeterministicRng::new(seed);
+        let mut visited = VisitedScratch::default();
+        for node_idx in 0..n {
+            let level = assign_level(&mut rng, params.m);
+            let node_id = node_idx as u32;
+            builder
+                .insert_node(node_id, level, dim, vectors, &mut visited)
+                .expect("insertion must succeed on this deterministic corpus");
+        }
+        builder
+    }
+
+    /// `GraphBuilder`（修復前）を id 昇順 → レベル → 各層のリンク列の順で
+    /// FNV-1a 64bit ハッシュへ投入する（`tests/hnsw.rs::
+    /// graph_fingerprint_is_stable_across_representation_change` と同じ
+    /// 方式。private フィールドへ直接アクセスできる本モジュール内テスト
+    /// 限定のヘルパ）。
+    fn fingerprint_builder(builder: &GraphBuilder) -> u64 {
+        fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
+            const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+            for &b in bytes {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+            hash
+        }
+        const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+
+        let mut hash = FNV_OFFSET_BASIS;
+        hash = fnv1a_update(hash, &(builder.nodes.len() as u64).to_le_bytes());
+        hash = fnv1a_update(
+            hash,
+            &builder
+                .entry_point
+                .map(|e| e as i64)
+                .unwrap_or(-1)
+                .to_le_bytes(),
+        );
+        for node in &builder.nodes {
+            hash = fnv1a_update(hash, &(node.level as u64).to_le_bytes());
+            for links in &node.links {
+                hash = fnv1a_update(hash, &(links.len() as u64).to_le_bytes());
+                for &nb in links {
+                    hash = fnv1a_update(hash, &nb.to_le_bytes());
+                }
+            }
+        }
+        hash
+    }
+
+    /// `clusters` 個のクラスタ中心の完全な複製で行を埋める重複ヘビーコーパス
+    /// （`tests/hnsw.rs::gen_duplicate_heavy_corpus` と同じ設計意図——完全同点
+    /// スコアを誘発しフェーズ 1／フェーズ 2 の双方を確実に発火させる。本
+    /// モジュール内テスト専用の独立実装）。
+    fn gen_duplicate_heavy_corpus_local(
+        seed: u64,
+        dim: usize,
+        rows: usize,
+        clusters: usize,
+    ) -> Vec<f32> {
+        let mut rng = DeterministicRng::new(seed);
+        let centers: Vec<Vec<f32>> = (0..clusters.max(1))
+            .map(|_| {
+                (0..dim)
+                    .map(|_| {
+                        let bits = rng.next_u64() >> 40;
+                        (bits as f32) / (1u32 << 24) as f32 * 2.0 - 1.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut out = Vec::with_capacity(rows * dim);
+        for i in 0..rows {
+            out.extend_from_slice(&centers[i % centers.len()]);
+        }
+        out
+    }
+
+    /// `repair_reachability_inner`（Issue #449 の並列化後）が `threads` の値
+    /// によらずビット同一のグラフを返すことを、重複ヘビーコーパス（フェーズ
+    /// 1・フェーズ 2 双方を確実に発火させる）で固定する end-to-end テスト。
+    /// 修復前の `GraphBuilder` は `build_unrepaired` で決定的に再構築し
+    /// （`GraphBuilder` は `Clone` を実装しないため、insertion が決定的で
+    /// あることを利用して複数回同じグラフを作り直す）、各 `threads` で
+    /// 修復した結果を [`fingerprint_builder`] で比較する。
+    #[test]
+    fn repair_reachability_inner_is_thread_count_invariant_on_duplicate_heavy_graph() {
+        let dim = 12usize;
+        let rows = 3_000usize;
+        let clusters = 6usize;
+        let seed = 0x5EED_0449u64;
+        let vectors = gen_duplicate_heavy_corpus_local(seed, dim, rows, clusters);
+        let params = HnswParams::default().with_m(6).with_ef_construction(32);
+
+        let mut fingerprints = Vec::new();
+        for &threads in &[1usize, 2, 4] {
+            let mut builder = build_unrepaired(params, dim, &vectors, seed);
+            let stats = builder
+                .repair_reachability_inner::<true>(dim, &vectors, threads)
+                .expect("repair must succeed on this deterministic corpus");
+            // 非 vacuous 性: フェーズ 1・フェーズ 2 の双方が実際に発火した
+            // ことを確認する（重複ヘビーコーパスが意図どおり同点スコアを
+            // 誘発していることの検証）。
+            assert!(
+                stats.levels.iter().any(|l| l.phase1_iterations > 0),
+                "threads={threads}: フェーズ 1 が一度も発火しなかった"
+            );
+            assert!(
+                stats.levels.iter().any(|l| l.phase2_nodes > 0),
+                "threads={threads}: フェーズ 2 が一度も発火しなかった"
+            );
+            fingerprints.push((threads, fingerprint_builder(&builder)));
+        }
+
+        let (base_threads, base_fp) = fingerprints[0];
+        for &(threads, fp) in &fingerprints[1..] {
+            assert_eq!(
+                base_fp, fp,
+                "threads={base_threads} と threads={threads} でグラフが一致しない"
+            );
+        }
     }
 }
