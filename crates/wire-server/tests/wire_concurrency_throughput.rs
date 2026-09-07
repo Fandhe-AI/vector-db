@@ -25,7 +25,7 @@ mod temp_db;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -147,24 +147,48 @@ fn new_default_engine_core(
 fn spawn_server_with_max_connections(
     users_path: &std::path::Path,
     engine_core: Arc<EngineCore>,
-) -> std::net::SocketAddr {
+) -> (std::net::SocketAddr, ConnectionLimiter) {
     let store =
         Arc::new(wire_server::auth::UserStore::load_from_file(users_path).expect("valid store"));
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let limiter = ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS);
+    let limiter_for_server = limiter.clone();
 
     std::thread::spawn(move || {
         wire_server::server::accept_loop_with_engine(
             listener,
             store,
             engine_core,
-            limiter,
+            limiter_for_server,
             wire_server::limits::READ_TIMEOUT,
         );
     });
 
-    addr
+    (addr, limiter)
+}
+
+/// 全クライアントスレッド分の接続枠が解放されるまで待つ（Cursor Bugbot
+/// 指摘対応: N 本のワーカースレッドが `stream` を drop した直後は、
+/// accept ループ側の `ConnectionPermit` 解放〔TCP close の検出〕がまだ
+/// 完了していないことがあり、その状態で新規接続を開くと accept ループが
+/// まだ `MAX_CONNECTIONS` を維持していて `53300` 拒否になるレースがある。
+/// ここでは実際に `limiter.active() == 0` を確認できるまでポーリングし、
+/// タイムアウトした場合は明示的に panic させる（本ハーネスは `#[ignore]`
+/// の手動専用でありプロセス終了で構わない）。
+fn wait_for_all_permits_released(limiter: &ConnectionLimiter, timeout: std::time::Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if limiter.active() == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for all connection permits to be released (active={})",
+            limiter.active()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// ベクトルを SQL リテラル（`'[v0,v1,...]'`）へ整形する。
@@ -243,7 +267,7 @@ fn wire_concurrency_throughput_measurement() {
         .map(|(u, t, p)| (u.as_str(), t.as_str(), p.as_str()))
         .collect();
     let users_path = write_user_store_file(&user_refs);
-    let addr = spawn_server_with_max_connections(&users_path, core);
+    let (addr, limiter) = spawn_server_with_max_connections(&users_path, core);
 
     let sql = format!(
         "SELECT id FROM docs ORDER BY embedding <=> {} LIMIT 10",
@@ -251,48 +275,65 @@ fn wire_concurrency_throughput_measurement() {
     );
 
     // 全クライアントスレッドを揃って開始させ、接続確立の裾を計測区間から
-    // 除く（`Barrier` は std のみ・依存追加なし）。
-    let barrier = Arc::new(Barrier::new(n));
+    // 除く（`Barrier` は std のみ・依存追加なし）。ウォームアップ後にも
+    // 第 2 の `Barrier` で再同期し、計測区間そのものの共通開始時刻を
+    // `Instant` で揃える（codex-review P2 指摘対応: 各スレッドの往復時間
+    // 合計の最大値では実時間にならず QPS を過大評価するため、共通区間の
+    // 実壁時計〔開始 = 全スレッドが測定ラウンドへ入った時刻の最小値、
+    // 終了 = 全スレッドが測定ラウンドを終えた時刻の最大値〕を分母にする）。
+    let start_barrier = Arc::new(Barrier::new(n));
+    let measure_barrier = Arc::new(Barrier::new(n));
     let total_queries = Arc::new(AtomicU64::new(0));
-    let per_thread_samples: Vec<Vec<u128>> = std::thread::scope(|scope| {
+    let per_thread: Vec<(Vec<u128>, Instant, Instant)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..n)
             .map(|i| {
-                let barrier = Arc::clone(&barrier);
+                let start_barrier = Arc::clone(&start_barrier);
+                let measure_barrier = Arc::clone(&measure_barrier);
                 let total_queries = Arc::clone(&total_queries);
                 let sql = sql.clone();
                 let username = users[i].0.clone();
                 scope.spawn(move || {
                     let mut stream =
                         authenticate_to_ready_for_query(addr, &username, "correct-horse");
-                    barrier.wait();
+                    start_barrier.wait();
                     for _ in 0..WARMUP_ROUNDS {
                         run_one_query(&mut stream, &sql);
                     }
+                    // ウォームアップ完了後に再同期してから計測区間の開始時刻を
+                    // 取る。バリア解放直後の命令実行はスレッド間でごく僅かな
+                    // ずれしか生まないため、各スレッドの `Instant::now()` を
+                    // そのまま共通開始時刻の候補として扱える。
+                    measure_barrier.wait();
+                    let measure_start = Instant::now();
                     let mut samples = Vec::with_capacity(rounds);
                     for _ in 0..rounds {
                         samples.push(run_one_query(&mut stream, &sql));
                         total_queries.fetch_add(1, Ordering::Relaxed);
                     }
-                    samples
+                    let measure_end = Instant::now();
+                    (samples, measure_start, measure_end)
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
+    // 共通計測区間の実時間 = 最も遅く測定を始めたスレッドの開始時刻から
+    // 最も遅く終えたスレッドの終了時刻まで。全スレッドの `total_queries` を
+    // この一つの実時間で割ることで QPS の分母を実時間に一致させる。
     let wall_start_to_end_us: u128 = {
-        // 壁時計はスレッド join 後にまとめて計測すると起動オーバーヘッドを
-        // 含んでしまうため、各スレッドの計測区間の最大値（最後に終わった
-        // スレッド基準）を代理指標として使う。正確な壁時計が必要な場合は
-        // 呼び出し元で `Instant` を別途計測すること（本ハーネスは相対比較用）。
-        per_thread_samples
-            .iter()
-            .map(|s| s.iter().sum::<u128>())
-            .max()
-            .unwrap_or(0)
+        let start = per_thread.iter().map(|(_, s, _)| *s).min();
+        let end = per_thread.iter().map(|(_, _, e)| *e).max();
+        match (start, end) {
+            (Some(s), Some(e)) => e.saturating_duration_since(s).as_micros(),
+            _ => 0,
+        }
     };
 
-    let mut all_samples: Vec<u128> = per_thread_samples.into_iter().flatten().collect();
+    let mut all_samples: Vec<u128> = per_thread
+        .into_iter()
+        .flat_map(|(samples, _, _)| samples)
+        .collect();
     all_samples.sort_unstable();
     let total = total_queries.load(Ordering::Relaxed);
     let qps = if wall_start_to_end_us > 0 {
@@ -300,6 +341,13 @@ fn wire_concurrency_throughput_measurement() {
     } else {
         0.0
     };
+
+    // 参照区間の計測に入る前に、全クライアントスレッドが占有していた接続枠が
+    // 解放済みであることを確認する（Cursor Bugbot 指摘対応。上記
+    // `wait_for_all_permits_released` 参照）。N=MAX_CONNECTIONS 実行時は
+    // ここで解放を待たずに新規接続を開くと accept ループがまだ枠を
+    // `MAX_CONNECTIONS` 占有中とみなし `53300` 拒否になり得る。
+    wait_for_all_permits_released(&limiter, Duration::from_secs(5));
 
     // 参照区間: N=1 の同一プロセス内での `SET`（クエリ処理を含まない最小往復）
     // を計測し、変更を含まない区間のノイズ帯の目安として出力する。
@@ -322,7 +370,7 @@ fn wire_concurrency_throughput_measurement() {
         "WIRE_CONCURRENCY_N={n} rows={rows} dim={dim} rounds={rounds} (warmup={WARMUP_ROUNDS})"
     );
     println!("nproc={:?}", std::thread::available_parallelism());
-    println!("total_queries={total} wall_proxy_us={wall_start_to_end_us} qps={qps:.1}");
+    println!("total_queries={total} wall_us={wall_start_to_end_us} qps={qps:.1}");
     println!(
         "per_query_us: min={} p50={} p95={} max={}",
         all_samples.first().copied().unwrap_or(0),
