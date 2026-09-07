@@ -491,6 +491,7 @@ CARGO_TARGET_DIR=/path/to/target-after cargo build --release --bench chip_bench 
   （`docs/design/dot-kernel-row-block.md` §6 と同一のスコープ外）
 - production 変更（`parallel_search.rs`・`isa.rs`）は無変更（本 Issue はテスト・
   ベンチ・docs 専任。撤回条件を満たしていないため撤回作業も対象外）
+
 ## Issue #518 追記: dim 閾値による ACC=4 経路のディスパッチ
 
 Issue #365 が不採用とした理由は「全 dim 一律の ACC=4 化」が小次元（dim100/128）
