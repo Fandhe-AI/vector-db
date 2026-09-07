@@ -656,3 +656,96 @@ BENCH_DEDICATED_ENV=1 make bench-ingest-wire-profile
   crossdb の `lang`/`topic` 列は含まない（単文経路の内訳切り分けに列数は
   本質的でないための設計判断）。
 - 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測はオーナー作業として申し送り。
+
+## Issue #485 追記: 単文 INSERT 経路の上位段改善（Durability 契約不変）
+
+### 目的
+
+Issue #484 で確認した内訳（I8〔commit〕が engine 内部段の約 73%）を踏まえ、
+Durability 契約（RECOVER-5/6・TASK-96/97・commit 自体）を変えない範囲で
+改善可能な上位段（S0−E0 のパース・スキーマ取得の重複、E0 内の不要な複製）に
+絞って対応した。
+
+### 変更内容（production コード。`crates/engine/src/`）
+
+- **A（スキーマ取得の一本化）**: `core.rs::execute_insert_sql`／
+  `execute_insert_sql_batch` が `validate_insert`（`table_exists`）と束縛用の
+  `get_table_schema` を別々の read txn・別々の decode で計 2 回呼んでいたのを、
+  `core.rs::InsertSchemaLookup`（`TableLookup` 実装。`table_exists` が取得した
+  スキーマを `RefCell` に保持し `take_schema` で再利用する）により 1 回へ
+  一本化した。`catalog.rs::table_lookup_error` を新設し `impl TableLookup for
+  Storage` と共有することでエラー写像・`wire_code` を機械的に一致させている。
+  名前不一致・未保持時（防御的経路）は既存の `get_table_schema` 単独呼び出しへ
+  fail-closed にフォールバックする。
+- **B（tokenize の 1 回化）**: `core.rs::execute_sql_in_session` が `INSERT`
+  判定用の覗き見トークナイズと、`execute_insert_sql` 内部の再トークナイズで
+  計 2 回 `lexer::tokenize` を呼んでいたのを、`sql::allowlist::validate_insert_tokens`
+  （`validate_insert` から本体を切り出したトークン列受け取り版。公開
+  `validate_insert(sql, …)` はこれへ委譲し既存 API・エラー契約は不変）を
+  導入して 1 回へ削減した。トークナイズ自体が失敗する場合のみ
+  `validate_sql` へのフォールスルー経路で 2 回目が走る（構文エラーとなる
+  入力に限られるため許容）。
+- **C（embedding の複製排除）**: `tenant.rs::insert_typed_row_unchecked` が
+  `values` から取り出した embedding を `Vec<f32>` へ複製（dim 128 で 512 B）
+  していたのを `&[f32]` の借用へ変更した。`RowInput`・
+  `content_hash::for_typed_insert` はいずれも借用で受けられるため、この
+  関数の生存期間内で借用を保持するだけで足りる。
+- **D（`ledger::record_in_txn` の 1 探索化）**: 見送り（Rejected）。
+  `redb::Table::insert` の戻り値（旧値 `AccessGuard`）を使った 1 探索化は
+  契約テスト（`op_ledger` の keep-first・`23505`/`22023` 判定）への影響検証が
+  必要な一方、A〜C で狙う上位段（S0−E0）に対する寄与が最も小さいと見積もった
+  ため、リスクに見合わないと判断し本 Issue の対象外とした。後続で着手する
+  場合は本節を起点に別 Issue へ切り出す。
+
+Durability 契約（`redb::Database::create` 既定の `Durability::Immediate`・
+`recovery::commit_boundary` の abort 契約）・fail-fast（RECOVER-8・TASK-99）・
+台帳契約（TASK-92/93/101・RECOVER-1/2/3/10）はいずれも不変。契約テスト
+（`sql_insert_session_dispatch`・`sql_operation_id`・`sql_allowlist`・
+`sql_surface`・`recovery_ledger`・`recovery_content_hash`・
+`recovery_required_op_id`・`recovery_two_path`・`commit_boundary`・
+`recover6_panic_hook`・`tenant_write_error_exhaustive`・
+`table_generation_bump_coverage`・`persistence`・`power_loss`・
+`batch_limits`・`incremental_index`・`ingest_profile_accept`、wire 側
+`wire_insert_operation_id`・`wire1_simple_query`・`wire_error_response`・
+`ingest_wire_profile_accept`）はいずれも無変更のまま green。crash-test 3 種
+（`crash-test`・`crash-test-interrupt`・`crash-test-cross-table`）・
+`make ci`（lint-docs・fmt・clippy・test・crash 3 種・core-api-check・
+sort-determinism・simd-codegen・deny）も通過を確認済み。
+
+### 前後比較実測（共有 QEMU 環境の参考値・採否根拠にしない）
+
+`benchmark-judgement-policy.md` の運用ルール 4（Issue #314 の先例）に従い、
+処理回数の削減が実装から直接導かれる構造的改善であるため、非退行の確認を
+主目的とした。本 worktree（after）単体で `BENCH_INGEST_PROFILE_MODE=single
+BENCH_INGEST_PROFILE_STATEMENTS=5000` を複数回実行し、Issue #484 で記録済み
+の before 参考値（同一環境クラス・S0=0.058ms・E0=0.046ms・P0=0.008ms）と
+比較した:
+
+| tier | Issue #484 記録値（before・参考） | 本実測（after・複数回） |
+| --- | --- | --- |
+| P0 `parse_bind` | 0.008ms | 0.008ms（3 回とも一致） |
+| E0 `typed_row_api` | 0.046ms | 0.045〜0.047ms |
+| S0 `sql_surface` | 0.058ms | 0.055〜0.058ms（1 回のみ共有環境の負荷スパイク〔loadavg 5.6〕で 0.120ms） |
+
+3 回中 2 回は before 記録値と同水準（ノイズ帯内）、1 回は共有環境の負荷
+スパイクによる外れ値だった（同時に走っていた別 worktree の `cargo test`
+プロセスと重複したため）。A〜C で削減される処理量（read txn 1 回・スキーマ
+decode 1 回・tokenize 1 回・512B の複製 1 回）は S0（58µs）の数 % 程度と
+見積もっており、この規模の差は共有環境の測定ノイズに埋もれて当然観測でき
+ない。非退行（after ≤ before の参考値の範囲）は確認できたが、明確な改善方向
+のシグナルは本環境の実測からは得られなかった——正直な記録として残す。
+専有環境（`BENCH_DEDICATED_ENV=1`）での再実測、および wire 経由・crossdb
+`ingest_single_stmt` の rows/s 実測はオーナー作業として申し送る。
+
+### スコープ外・申し送り
+
+- wire の `INSERT` 応答が `CommandComplete` + `ReadyForQuery` の 2
+  `write_all` である点（Issue #484 追記で既出）。W0−S0 は本 Issue で触れる
+  engine 側合計より大きい最大の非 durability レバーであり、`perf(wire)` の
+  別 Issue 候補として申し送る。
+- D（`ledger::record_in_txn` の 1 探索化）は上記のとおり見送り。
+- I8（durable commit）・`storage_generation`/`table_generation` 等の
+  B-tree 更新構造の見直しは対象外（Durability 契約・形式変更を伴うため
+  別途設計判断が必要）。
+- 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測・crossdb `ingest_single_stmt`
+  rows/s の実測確定はオーナー作業として申し送る。

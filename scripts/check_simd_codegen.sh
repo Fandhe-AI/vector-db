@@ -271,6 +271,12 @@ required_segments_for() {
   if [ "${arch_class}" = "x86_64" ]; then
     echo "12dot_avx2_fma"
     echo "10dot_avx512"
+    # Issue #510（TASK-156・CORE-14）: 4 行ブロックカーネル
+    # `isa::x86_block4::dot_block4_avx2_fma`／`dot_block4_avx512`
+    # （いずれも `#[target_feature]` fn のため、`dot_avx2_fma`／`dot_avx512` と
+    # 同様に独立シンボルとして生成される）を必須シンボルへ追加する。
+    echo "19dot_block4_avx2_fma"
+    echo "17dot_block4_avx512"
   else
     echo "10SimdKernel20dot_with_scalar_tail"
     echo "10SimdKernel20dot_with_padded_tail"

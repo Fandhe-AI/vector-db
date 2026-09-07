@@ -777,8 +777,12 @@ pub(crate) fn insert_typed_row_unchecked(
                     "table has no VECTOR column".to_string(),
                 ))
             })?;
-        let embedding = match values.get(vector_idx) {
-            Some(crate::row_codec::Value::Vector(v)) => v.clone(),
+        // Issue #485: `Vec<f32>` の複製（dim 128 で 512 B）を避けるため
+        // `values` を所有する呼び出し元のバッファから借用する（`RowInput`・
+        // `content_hash::for_typed_insert` はいずれも `&[f32]` で受けられる
+        // ため、この関数の生存期間内で借用を保持するだけで足りる）。
+        let embedding: &[f32] = match values.get(vector_idx) {
+            Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
             _ => {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                     "VECTOR column value missing or not a Vector".to_string(),
@@ -791,7 +795,7 @@ pub(crate) fn insert_typed_row_unchecked(
         let row = RowInput {
             tenant_id: ctx.tenant_id(),
             visibility,
-            embedding: &embedding,
+            embedding,
             metadata: &metadata,
         };
         // 型付き挿入も行形 INSERT と同じ「新規挿入」操作としてハッシュ化する
@@ -816,7 +820,7 @@ pub(crate) fn insert_typed_row_unchecked(
             .filter_map(|(idx, column)| values.get(idx).map(|value| (column.name.as_str(), value)))
             .collect();
         let content_hash =
-            content_hash::for_typed_insert(id, visibility, &embedding, &named_columns)?;
+            content_hash::for_typed_insert(id, visibility, embedding, &named_columns)?;
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),
