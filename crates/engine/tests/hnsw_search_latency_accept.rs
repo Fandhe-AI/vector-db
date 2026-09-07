@@ -13,9 +13,10 @@ mod harness;
 
 use harness::hnsw_search_latency::{
     generate_corpus, generate_mask, generate_query, parse_dim, parse_ef, parse_k, parse_mask,
-    parse_queries, parse_rows, reference_band, refuse_under_github_actions, render_header_line,
-    render_masked_short_line, render_reference_line, render_target_line, HnswSearchLatencyError,
-    MaskSpec, DEFAULT_DIM, DEFAULT_EF, DEFAULT_QUERIES, DEFAULT_ROWS,
+    parse_queries, parse_rows, parse_sparse_visited_max, reference_band,
+    refuse_under_github_actions, render_header_line, render_masked_short_line,
+    render_reference_line, render_target_line, render_visited_kind_line, ArmLabel,
+    HnswSearchLatencyError, MaskSpec, DEFAULT_DIM, DEFAULT_EF, DEFAULT_QUERIES, DEFAULT_ROWS,
 };
 
 // --- refuse_under_github_actions ---
@@ -216,4 +217,98 @@ fn render_lines_contain_expected_fields() {
 
     let masked = render_masked_short_line(3);
     assert_eq!(masked, "hnsw_search_bench: masked_short_queries=3");
+}
+
+// --- parse_sparse_visited_max（Issue #498） ---
+
+#[test]
+fn parse_sparse_visited_max_unset_is_none_regardless_of_mask() {
+    assert_eq!(
+        parse_sparse_visited_max(None, MaskSpec::None),
+        Ok(None),
+        "unset knob must not activate the A/B path even without a mask"
+    );
+    assert_eq!(
+        parse_sparse_visited_max(Some(""), MaskSpec::VisiblePercent(50)),
+        Ok(None),
+        "empty string is treated the same as unset"
+    );
+    assert_eq!(
+        parse_sparse_visited_max(Some("  "), MaskSpec::VisiblePercent(50)),
+        Ok(None),
+        "whitespace-only is trimmed to empty and treated as unset"
+    );
+}
+
+#[test]
+fn parse_sparse_visited_max_accepts_valid_values_with_mask() {
+    assert_eq!(
+        parse_sparse_visited_max(Some("0"), MaskSpec::VisiblePercent(50)),
+        Ok(Some(0))
+    );
+    assert_eq!(
+        parse_sparse_visited_max(Some("18446744073709551615"), MaskSpec::VisiblePercent(50)),
+        Ok(Some(usize::MAX))
+    );
+    assert_eq!(
+        parse_sparse_visited_max(Some(" 42 "), MaskSpec::VisiblePercent(1)),
+        Ok(Some(42)),
+        "surrounding whitespace is trimmed"
+    );
+}
+
+#[test]
+fn parse_sparse_visited_max_rejects_non_integer_fail_closed() {
+    // 他のベンチ入力（parse_rows 等）と異なり既定値へフォールバックしない
+    // （不正値を黙って 0 へ倒すと after == before の vacuous 計測になるため）。
+    assert_eq!(
+        parse_sparse_visited_max(Some("abc"), MaskSpec::VisiblePercent(50)),
+        Err(HnswSearchLatencyError::InvalidSparseVisitedMax)
+    );
+    assert_eq!(
+        parse_sparse_visited_max(Some("-1"), MaskSpec::VisiblePercent(50)),
+        Err(HnswSearchLatencyError::InvalidSparseVisitedMax),
+        "negative values are not a valid usize"
+    );
+    assert_eq!(
+        parse_sparse_visited_max(Some("3.5"), MaskSpec::VisiblePercent(50)),
+        Err(HnswSearchLatencyError::InvalidSparseVisitedMax)
+    );
+}
+
+#[test]
+fn parse_sparse_visited_max_rejects_mask_none_fail_closed() {
+    // mask=none は search_masked_with 契約上常に dense を選ぶため、knob との
+    // 併用は knob が一切効かない vacuous な計測になる。
+    let err = parse_sparse_visited_max(Some("0"), MaskSpec::None).unwrap_err();
+    assert_eq!(err, HnswSearchLatencyError::SparseVisitedMaxRequiresMask);
+    let err = parse_sparse_visited_max(Some("100"), MaskSpec::None).unwrap_err();
+    assert_eq!(err, HnswSearchLatencyError::SparseVisitedMaxRequiresMask);
+}
+
+// --- ArmLabel（Issue #498） ---
+
+#[test]
+fn arm_label_maps_to_expected_sparse_visited_max_and_token() {
+    assert_eq!(ArmLabel::Dense.sparse_visited_max(), 0);
+    assert_eq!(ArmLabel::Dense.token(), "dense");
+    assert_eq!(ArmLabel::Sparse.sparse_visited_max(), usize::MAX);
+    assert_eq!(ArmLabel::Sparse.token(), "sparse");
+}
+
+// --- render_visited_kind_line（Issue #498） ---
+
+#[test]
+fn render_visited_kind_line_contains_expected_fields() {
+    let line = render_visited_kind_line(ArmLabel::Sparse, usize::MAX, 500, 200, 0, 0);
+    assert!(line.contains("arm=sparse"));
+    assert!(line.contains(&format!("sparse_visited_max={}", usize::MAX)));
+    assert!(line.contains("visible_count=500"));
+    assert!(line.contains("observed_sparse_calls=200"));
+    assert!(line.contains("observed_dense_calls=0"));
+    assert!(line.contains("unresolved_calls=0"));
+
+    let line = render_visited_kind_line(ArmLabel::Dense, 0, 500, 0, 200, 0);
+    assert!(line.contains("arm=dense"));
+    assert!(line.contains("sparse_visited_max=0"));
 }

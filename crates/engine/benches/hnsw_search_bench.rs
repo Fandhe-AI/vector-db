@@ -82,10 +82,13 @@ mod harness;
 
 use harness::env_report::EnvReport;
 use harness::hnsw_compare::l2_normalize_corpus;
+#[cfg(feature = "bench-internals")]
+use harness::hnsw_search_latency::render_visited_kind_line;
 use harness::hnsw_search_latency::{
     generate_corpus, generate_mask, generate_query, parse_dim, parse_ef, parse_k, parse_mask,
-    parse_queries, parse_rows, refuse_under_github_actions, render_header_line,
-    render_masked_short_line, render_reference_line, render_target_line, MaskSpec,
+    parse_queries, parse_rows, parse_sparse_visited_max, refuse_under_github_actions,
+    render_header_line, render_masked_short_line, render_reference_line, render_target_line,
+    ArmLabel, MaskSpec,
 };
 use harness::protocol::{run, MeasurementConfig};
 
@@ -166,6 +169,51 @@ fn main() {
     let k = parse_k(std::env::var("BENCH_HNSW_SEARCH_K").ok().as_deref(), ef);
     let dedicated = dedicated_env();
     let (commit, commit_source) = current_commit();
+
+    // visited 集合切替閾値の単一ビルド A/B（Issue #498）。knob 未設定
+    // （`sparse_visited_max_override == None`）なら本節は一切分岐せず、
+    // 以降の探索は既存 `search_masked`（常に dense）と完全に同一のまま進む
+    // （既定経路の出力不変を保つ設計。`docs/design/
+    // benchmark-judgement-policy.md`「未計測の性能変更を既定にしない」方針）。
+    let sparse_visited_max_raw = std::env::var("BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX").ok();
+    let sparse_visited_max_override =
+        match parse_sparse_visited_max(sparse_visited_max_raw.as_deref(), mask_spec) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("hnsw_search_bench: {e}");
+                std::process::exit(1);
+            }
+        };
+    // 2 arm（dense=0／sparse=usize::MAX）のみを扱う（harness::hnsw_search_latency::
+    // ArmLabel のドキュメンテーションコメント参照）。中間値は非 vacuous 検証
+    // （全計測呼び出しが単一の期待 arm と一致するか）を単純化できないため
+    // 受理しない。
+    let arm = match sparse_visited_max_override {
+        None => None,
+        Some(0) => Some(ArmLabel::Dense),
+        Some(v) if v == usize::MAX => Some(ArmLabel::Sparse),
+        Some(_) => {
+            eprintln!(
+                "hnsw_search_bench: BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX must be exactly 0 \
+                 (dense arm) or {} (sparse arm); intermediate values cannot be verified \
+                 non-vacuously against a single expected arm (Issue #498)",
+                usize::MAX
+            );
+            std::process::exit(1);
+        }
+    };
+    // `--features bench-internals` なしのビルドへ knob を渡した場合は拒否する
+    // （`HnswSearchScratch::last_visited_kind_is_sparse` が存在せず visited
+    // 実装の選択を検証できないため、未検証のまま計測を続けさせない）。
+    if arm.is_some() && !cfg!(feature = "bench-internals") {
+        eprintln!(
+            "hnsw_search_bench: BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX requires \
+             `cargo bench --features bench-internals` (or `make bench-hnsw-search-visited`) \
+             so the selected visited implementation can be verified non-vacuously \
+             (Issue #498)"
+        );
+        std::process::exit(1);
+    }
 
     let raw_corpus = match generate_corpus(0xC0BA_1234 ^ rows as u64, dim, rows) {
         Ok(c) => c,
@@ -254,6 +302,19 @@ fn main() {
     let mut short_count = 0usize;
     let mut call_index: u64 = 0;
     let warmup_iterations = u64::from(config.warmup_iterations());
+    // 単一マスクを全呼び出し（warmup・計測とも）で使い回すため可視候補数
+    // （`visible_count`）はラン全体で一定。Issue #498 の knob（`arm`）が
+    // 設定されているときは各呼び出しの選択実装（`--features bench-internals`
+    // 限定の `last_visited_kind_is_sparse`）を warmup 分も含め全数観測し、
+    // どこかで期待 arm と食い違えば非 vacuous な計測とみなさず後段で
+    // fail-closed に拒否する（超集合で数える方が warmup／計測の境界に依存
+    // せず単純で取りこぼしがない）。
+    #[cfg(feature = "bench-internals")]
+    let mut observed_sparse_calls = 0usize;
+    #[cfg(feature = "bench-internals")]
+    let mut observed_dense_calls = 0usize;
+    #[cfg(feature = "bench-internals")]
+    let mut unresolved_calls = 0usize;
     let target = run(&config, || {
         let Some(query) = queries.get(qi % queries.len()) else {
             eprintln!(
@@ -264,7 +325,26 @@ fn main() {
         qi += 1;
         let is_measured_call = call_index >= warmup_iterations;
         call_index += 1;
-        match index.search_masked(query, k, ef, mask.as_ref(), &mut scratch) {
+        let search_result = match sparse_visited_max_override {
+            Some(sparse_visited_max) => index.search_masked_with(
+                query,
+                k,
+                ef,
+                mask.as_ref(),
+                sparse_visited_max,
+                &mut scratch,
+            ),
+            None => index.search_masked(query, k, ef, mask.as_ref(), &mut scratch),
+        };
+        #[cfg(feature = "bench-internals")]
+        if arm.is_some() {
+            match scratch.last_visited_kind_is_sparse() {
+                Some(true) => observed_sparse_calls += 1,
+                Some(false) => observed_dense_calls += 1,
+                None => unresolved_calls += 1,
+            }
+        }
+        match search_result {
             Ok(hits) => {
                 if is_measured_call && hits.len() < k {
                     short_count += 1;
@@ -309,6 +389,53 @@ fn main() {
     );
     if matches!(mask_spec, MaskSpec::VisiblePercent(_)) {
         println!("{}", render_masked_short_line(short_count));
+    }
+
+    // visited 集合切替閾値の単一ビルド A/B（Issue #498）: `arm` が
+    // 設定されているとき（`bench-internals` feature が既に前段で保証済み）、
+    // ラン全体（warmup 含む）の全呼び出しが単一の期待 arm と一致したことを
+    // 確認してから出力する。1 件でも `unresolved_calls`（早期 return。
+    // `k==0`・受理ノードなし等）や逆 arm の観測があれば、意図した visited
+    // 実装が実際には選ばれなかった可能性がある未検証計測として fail-closed
+    // で拒否する（`docs/design/hnsw-search.md`「Issue #498」節）。
+    #[cfg(feature = "bench-internals")]
+    if let Some(arm) = arm {
+        let sparse_visited_max = arm.sparse_visited_max();
+        let visible_count = mask.as_ref().map(|m| m.count_ones()).unwrap_or(0);
+        if unresolved_calls > 0 {
+            eprintln!(
+                "hnsw_search_bench: {unresolved_calls} call(s) returned no visited-kind \
+                 observation (early return; likely zero visible candidates under this mask) \
+                 — cannot verify arm={} non-vacuously (Issue #498)",
+                arm.token()
+            );
+            std::process::exit(1);
+        }
+        let (expected_calls, other_calls, other_label) = match arm {
+            ArmLabel::Dense => (observed_dense_calls, observed_sparse_calls, "sparse"),
+            ArmLabel::Sparse => (observed_sparse_calls, observed_dense_calls, "dense"),
+        };
+        if other_calls > 0 || expected_calls == 0 {
+            eprintln!(
+                "hnsw_search_bench: expected every call to select the {} visited set (arm={}) \
+                 but observed {other_calls} call(s) select {other_label} instead \
+                 ({expected_calls} matched) — vacuous or contradictory measurement (Issue #498)",
+                arm.token(),
+                arm.token(),
+            );
+            std::process::exit(1);
+        }
+        println!(
+            "{}",
+            render_visited_kind_line(
+                arm,
+                sparse_visited_max,
+                visible_count,
+                observed_sparse_calls,
+                observed_dense_calls,
+                unresolved_calls,
+            )
+        );
     }
 
     // 参照区間: 変更（prefetch）を含まない brute-force Top-k。

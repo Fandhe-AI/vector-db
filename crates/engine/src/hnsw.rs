@@ -1172,6 +1172,21 @@ impl HnswSearchScratch {
     pub(crate) fn last_visited_kind(&self) -> Option<VisitedKind> {
         self.last_visited_kind
     }
+
+    /// [`Self::last_visited_kind`] の診断専用の薄いラッパー（Issue #498。
+    /// `hybrid::sparse_refetch_observed` と同じ非既定 feature `bench-internals`
+    /// 限定パターン）。`benches/hnsw_search_bench.rs` が
+    /// `sparse_visited_max` の単一ビルド A/B で「意図した visited 実装が
+    /// 実際に選ばれたか」を計測フェーズの全呼び出しで検証するために使う。
+    /// `Some(true)` は [`VisitedKind::Sparse`]、`Some(false)` は
+    /// [`VisitedKind::Dense`]、`None` は層 0 探索まで到達しなかった呼び出し
+    /// （早期 return）を表す。`bench-internals` 未指定ビルド（`wire-server`・
+    /// 既定の `cargo build -p engine`）には結線されない。
+    #[cfg(feature = "bench-internals")]
+    pub fn last_visited_kind_is_sparse(&self) -> Option<bool> {
+        self.last_visited_kind
+            .map(|k| matches!(k, VisitedKind::Sparse))
+    }
 }
 
 /// 層 `level` におけるノードの隣接リスト最大次数を返す（層 0 は `2*m`、
