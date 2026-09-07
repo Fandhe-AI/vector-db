@@ -132,30 +132,51 @@ fn count_star_hits_cache_on_second_query_within_same_generation() {
 }
 
 /// `COUNT(id)`・`SUM(id)`・`MIN(id)`・`MAX(id)` いずれも `DecodeTier::Fast` の
-/// hot キャッシュ経路で cold と同一結果を返す。
+/// hot キャッシュ経路で cold と同一結果を返す。キャッシュキーは
+/// `(table, PolicyContext)` のみで集計式を含まないため、同一 `EngineCore` を
+/// 使い回すと最初の `COUNT(id)` 呼び出しでキャッシュが作られ、後続の
+/// `SUM`/`MIN`/`MAX` の「cold」呼び出しが実際には既存キャッシュへヒットして
+/// しまい cold/hot 比較が成立しない。集計ごとに新しい `EngineCore`（＝新しい
+/// 空のキャッシュ）を使うことで、各集計の cold 呼び出しが真に
+/// `VisibleBitmapCache` を経由しない通常走査であることを保証する
+/// （codex-review 指摘対応）。
 #[test]
 fn id_aggregates_match_between_cold_and_hot_cache() {
-    let path = unique_db_path("visible-cache-id-aggregates");
-    let _guard = CleanupGuard(path.clone());
-    let storage = Storage::open(&path).expect("open storage");
-    storage.create_table(&schema()).expect("create table");
-    let core = new_core(storage);
-    let ctx = ctx_for("tenant-a", false);
-
-    for i in 1..=5u64 {
-        insert_row(&core, &ctx, i, Visibility::Public, i);
-    }
-
     for sql in [
         "SELECT COUNT(id) FROM docs",
         "SELECT SUM(id) FROM docs",
         "SELECT MIN(id) FROM docs",
         "SELECT MAX(id) FROM docs",
     ] {
+        let path = unique_db_path("visible-cache-id-aggregates");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema()).expect("create table");
+        let core = new_core(storage);
+        let ctx = ctx_for("tenant-a", false);
+
+        for i in 1..=5u64 {
+            insert_row(&core, &ctx, i, Visibility::Public, i);
+        }
+
+        let before_stats = core.visible_bitmap_cache_stats();
         let cold = core.execute_sql(&ctx, sql).expect("cold query");
         let cold_value = single_row(&cold)[0].clone();
+        let after_cold = core.visible_bitmap_cache_stats();
+        assert_eq!(
+            after_cold.misses,
+            before_stats.misses + 1,
+            "cold query for `{sql}` must be a genuine cache miss"
+        );
+
         let hot = core.execute_sql(&ctx, sql).expect("hot query");
         let hot_value = single_row(&hot)[0].clone();
+        let after_hot = core.visible_bitmap_cache_stats();
+        assert_eq!(
+            after_hot.hits,
+            after_cold.hits + 1,
+            "hot query for `{sql}` must hit the cache populated by the cold query"
+        );
         assert_eq!(cold_value, hot_value, "cold/hot mismatch for `{sql}`");
     }
 }

@@ -111,6 +111,12 @@ pub use sparse_cache::SparseIndexCacheStats;
 pub mod using_operation_id;
 pub(crate) mod using_plan;
 
+/// `EngineCore::visible_bitmap_cache_stats`（`pub`）の戻り値型を外部から
+/// 名前解決可能にするための再エクスポート。`visible_cache` モジュール自体は
+/// 内部実装として `pub(crate)` のまま維持する（`SparseIndexCacheStats` と同方針。
+/// codex-review 指摘対応）。
+pub use visible_cache::VisibleBitmapCacheStats;
+
 /// `EngineCore::execute_sql_in_session`（TASK-161）の成功応答。`SELECT` は
 /// [`exec::QueryResult`] を、`SET search_mode` は解決前の設定値
 /// （[`mode::SearchMode`]）そのものを返す。TASK-79（SQL-9）で `CREATE FUNCTION` の

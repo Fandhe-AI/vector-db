@@ -108,6 +108,12 @@ impl VisibleSnapshot {
 pub(crate) struct VisibleSnapshotBuilder {
     visible_ids: Vec<u64>,
     overflowed: bool,
+    /// 容量上限。production 経路は常に `MAX_VISIBLE_SNAPSHOT_ROWS`
+    /// （`arena::MAX_ARENA_ROWS` と共有）だが、テストでは
+    /// `with_capacity_for_test` で小さい値を注入し、実際に上限超過させて
+    /// `finish` が `None` を返す契約を検証できるようにする（codex-review 指摘対応。
+    /// 100 万件を投入する非現実的なテストを避けつつ契約を実測する）。
+    capacity: usize,
 }
 
 impl VisibleSnapshotBuilder {
@@ -115,6 +121,20 @@ impl VisibleSnapshotBuilder {
         Self {
             visible_ids: Vec::new(),
             overflowed: false,
+            capacity: MAX_VISIBLE_SNAPSHOT_ROWS,
+        }
+    }
+
+    /// テスト専用: 容量上限を注入したビルダーを構築する。`mark_visible`／
+    /// `finish` の容量超過契約（DoS 対策のフォールバック）を、
+    /// `MAX_VISIBLE_SNAPSHOT_ROWS`（100 万件）そのものを投入せずに検証するため
+    /// のフック（codex-review 指摘対応）。
+    #[cfg(test)]
+    fn with_capacity_for_test(capacity: usize) -> Self {
+        Self {
+            visible_ids: Vec::new(),
+            overflowed: false,
+            capacity,
         }
     }
 
@@ -125,7 +145,7 @@ impl VisibleSnapshotBuilder {
         if self.overflowed {
             return;
         }
-        if self.visible_ids.len() >= MAX_VISIBLE_SNAPSHOT_ROWS {
+        if self.visible_ids.len() >= self.capacity {
             self.overflowed = true;
             return;
         }
@@ -451,18 +471,28 @@ mod tests {
     }
 
     #[test]
-    fn builder_over_capacity_yields_no_snapshot() {
+    fn builder_within_capacity_yields_snapshot() {
         let c = ctx("tenant-a");
-        let mut builder = VisibleSnapshotBuilder::new();
-        // 容量超過を模擬するため直接オーバーフローフラグを立てる代わりに
-        // 大量件数を投入するのは非現実的なので、内部状態を経由せず
-        // 上限定数を直接検証する回帰として `MAX_VISIBLE_SNAPSHOT_ROWS` 相当の
-        // 小さいビルダーを想定した契約テストに留める（実容量は
-        // `arena::MAX_ARENA_ROWS` と共有）。
+        let mut builder = VisibleSnapshotBuilder::with_capacity_for_test(10);
         for id in 0..10u64 {
             builder.mark_visible(id);
         }
         let snapshot = builder.finish(c, 0).expect("within capacity");
         assert_eq!(snapshot.visible_ids().len(), 10);
+    }
+
+    #[test]
+    fn builder_over_capacity_yields_no_snapshot() {
+        // 容量上限を注入したビルダー（`with_capacity_for_test`）で実際に
+        // 上限超過させ、`finish` が `None` を返す契約（DoS 対策・容量超過時は
+        // 非登録でフォールバックする）を実測する。production の容量
+        // （`MAX_VISIBLE_SNAPSHOT_ROWS` = `arena::MAX_ARENA_ROWS`）そのものを
+        // 投入する非現実的なテストは避ける（codex-review 指摘対応）。
+        let c = ctx("tenant-a");
+        let mut builder = VisibleSnapshotBuilder::with_capacity_for_test(10);
+        for id in 0..11u64 {
+            builder.mark_visible(id);
+        }
+        assert!(builder.finish(c, 0).is_none());
     }
 }
