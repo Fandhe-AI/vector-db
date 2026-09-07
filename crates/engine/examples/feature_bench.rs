@@ -36,6 +36,12 @@
 //! `bench_engine::parse_dim` を fail-closed に用い、`meta.dim` は既存キーの
 //! まま値のみが変わる（JSON の形は不変）。
 
+// `parse_visible_ratio`／`parse_full_scan_ratio`／`ExpectedArm`／`expected_arm`
+// （Issue #487）は `knn_profile_bench.rs` 専用のスイープ opt-in で、本ファイルは
+// 使わない。`#[path]` 取り込みは 1 ファイルを 2 バイナリで共有する構成のため、
+// 本ファイル内だけを見ると未使用になり `dead_code` lint に抵触する
+// （`bench_engine.rs` 自体を分割しない理由はモジュール冒頭コメント参照）。
+#[allow(dead_code)]
 #[path = "../benches/harness/bench_engine.rs"]
 mod bench_engine;
 use bench_engine::BenchEngine;

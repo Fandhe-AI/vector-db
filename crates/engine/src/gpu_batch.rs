@@ -45,6 +45,14 @@ use crate::kernel::SearchHit;
 use crate::kernel::{CandidateHit, TopKSelector};
 use crate::policy::PolicyContext;
 
+/// i8 パック常駐・`dot4I8Packed` シェーダによる opt-in 候補生成バックエンド
+/// （Issue #542・親 #541・Phase 5 親 #460）。本番 primary
+/// （[`GpuBatchBackend`]・`FallbackBatchEngine::build_with_gpu`）へは接続せず、
+/// `GpuI8BatchBackend::try_new` からのみ明示構築する（[`GpuF32ContrastBackend`]
+/// と同型の opt-in 専用経路。CORE-12「経路を外部から上書きする機構を作らない」
+/// と整合）。詳細設計は `docs/design/gpu-batch-i8-packed.md` 参照。
+pub mod packed_i8;
+
 /// 1 回の GPU dispatch で読み戻すスコアバッファの予算（バイト）。adapter の
 /// `max_storage_buffer_binding_size` に依らず、compute の 1 次元 dispatch が
 /// `max_compute_workgroups_per_dimension`（実測値: 65535。§0 実測記録
@@ -766,6 +774,14 @@ struct GpuContext {
     bind_group_layout: wgpu::BindGroupLayout,
     max_storage_buffer_binding_size: u64,
     max_workgroups_per_dimension: u32,
+    /// adapter が実装する wgpu backend（Vulkan/Metal/DX12 等。Issue #542）。
+    /// `packed_i8::GpuI8Meta::backend` が meta として公開する値の出所で、
+    /// 専用整数内積命令（`OpSDot`/`dot4add_i8packed`/`packed_char4`）と
+    /// polyfill のどちらが選ばれたかを判別する材料に使う想定
+    /// （`docs/design/gpu-batch-i8-packed.md` の backend 別規則表参照。
+    /// wgpu 30.0.1 の公開 API では判別結果そのものは取得できないため、
+    /// 本フィールド自体は判別を行わない）。
+    backend: wgpu::Backend,
     /// デバイスロスト検知用ラッチ。`Device::set_device_lost_callback` から
     /// 更新される（コールバックは別スレッドから呼ばれうるため `AtomicBool`）。
     device_lost: std::sync::Arc<AtomicBool>,
@@ -948,6 +964,7 @@ fn init_gpu_context() -> Result<GpuContext, String> {
         max_workgroups_per_dimension,
         device_lost,
         uncaptured_error,
+        backend: info.backend,
     })
 }
 

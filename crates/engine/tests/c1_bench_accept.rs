@@ -16,8 +16,8 @@ mod harness;
 
 use harness::env_report::EnvReport;
 use harness::sql_c1::{
-    c1_statement, render_ab_line, render_p95_line, render_recall_line, resolve_verbose,
-    vector_literal, SqlC1Error, MAX_VECTOR_LITERAL_BYTES,
+    c1_statement, c1_where_statement, render_ab_line, render_p95_line, render_recall_line,
+    resolve_verbose, vector_literal, SqlC1Error, MAX_VECTOR_LITERAL_BYTES,
 };
 
 use engine::sql::allowlist::SqlSurfaceError;
@@ -120,6 +120,52 @@ fn c1_statement_rejects_column_identifier_with_symbol() {
     let literal = vector_literal(&[1.0]).unwrap();
     assert_eq!(
         c1_statement("documents", "embed;ding", &literal, 20),
+        Err(SqlC1Error::InvalidIdentifier("column"))
+    );
+}
+
+// --- c1_where_statement（Issue #487: 可視比率スイープの WHERE 付き C1）---
+
+#[test]
+fn c1_where_statement_builds_expected_select() {
+    let literal = vector_literal(&[1.0, 0.0, 0.0]).unwrap();
+    let sql = c1_where_statement("documents", "embedding", "bucket", "b0", &literal, 10).unwrap();
+    assert_eq!(
+        sql,
+        "SELECT id FROM documents WHERE bucket = 'b0' ORDER BY embedding <=> '[1,0,0]' LIMIT 10"
+    );
+}
+
+#[test]
+fn c1_where_statement_rejects_invalid_filter_column_identifier() {
+    let literal = vector_literal(&[1.0]).unwrap();
+    assert_eq!(
+        c1_where_statement("documents", "embedding", "buc;ket", "b0", &literal, 10),
+        Err(SqlC1Error::InvalidIdentifier("filter_column"))
+    );
+}
+
+#[test]
+fn c1_where_statement_rejects_filter_token_with_sql_symbols() {
+    let literal = vector_literal(&[1.0]).unwrap();
+    for token in ["b0' OR '1'='1", "b 0", "", "b0;drop"] {
+        assert_eq!(
+            c1_where_statement("documents", "embedding", "bucket", token, &literal, 10),
+            Err(SqlC1Error::InvalidIdentifier("filter_token")),
+            "expected {token:?} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn c1_where_statement_rejects_invalid_table_and_column_identifiers() {
+    let literal = vector_literal(&[1.0]).unwrap();
+    assert_eq!(
+        c1_where_statement("1docs", "embedding", "bucket", "b0", &literal, 10),
+        Err(SqlC1Error::InvalidIdentifier("table"))
+    );
+    assert_eq!(
+        c1_where_statement("documents", "embed;ding", "bucket", "b0", &literal, 10),
         Err(SqlC1Error::InvalidIdentifier("column"))
     );
 }
