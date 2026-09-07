@@ -958,9 +958,18 @@ fn main() {
         "e2e(rls_isolation/A0b, ctx=tenant-b): median={:.3}ms",
         a0b.summary.median.as_secs_f64() * 1e3
     );
+    // A0c-cold は `rounds`（A1〜A5・W1〜W4・R_dot が使う「ラウンド」概念）の
+    // 系列ではなく、`config.measured_iterations()`（本ベンチでは 20）個の
+    // 生サンプルを直接集計している（`MeasurementConfig::new` 呼び出し・上の
+    // `for _ in 0..config.measured_iterations()` ループ参照）。他系列の
+    // 「min-of-R」（R = ラウンド数。既定 `BENCH_SCAN_PROFILE_ROUNDS`）と表記を
+    // 揃えると集計対象が異なるにもかかわらず同じ略記になり誤解を招くため
+    // （PR #586 codex-review 指摘）、ここでは実際のサンプル数を明記した
+    // 「sample minimum (N=<count>)」表記を用いる。
     println!(
-        "e2e(agg_count/A0c-cold, ctx=tenant-a, includes Storage::open): median={:.3}ms (min-of-R={:.3}ms)",
+        "e2e(agg_count/A0c-cold, ctx=tenant-a, includes Storage::open): median={:.3}ms (sample minimum, N={}: {:.3}ms)",
         a0c_summary.median.as_secs_f64() * 1e3,
+        a0c_samples.len(),
         a0c_samples
             .iter()
             .min()

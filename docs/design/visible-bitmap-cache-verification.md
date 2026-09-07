@@ -93,14 +93,29 @@ dim=128・tenant_a=23,000 Public・tenant_b=2,000 Private）。
 | ------ | -----: | ---- |
 | `agg_count`（A0a, ctx=tenant-a, ヒット経路） | 0.050ms | 同一 `EngineCore` 使い回し |
 | `rls_isolation`（A0b, ctx=tenant-b, ヒット経路） | 0.050ms | 同上 |
-| `agg_count`（A0c-cold, ctx=tenant-a, ミス経路） | 7.336ms（min-of-5=7.228ms） | 毎サンプル新規 `Storage::open`＋`EngineCore` |
+| `agg_count`（A0c-cold, ctx=tenant-a, ミス経路） | 7.336ms（sample minimum, N=20: 7.228ms） | 毎サンプル新規 `Storage::open`＋`EngineCore` |
+
+`A0c-cold` の集計単位は A1〜A5／W1〜W4／R_dot が使う「ラウンド」（`rounds`。
+上表の `BENCH_SCAN_PROFILE_ROUNDS=5`）とは異なり、
+`config.measured_iterations()`（本ベンチでは 20）個の生サンプルを直接
+集計したものである。「min-of-5」という表記は round 数（5）と混同されうる
+ため、実サンプル数を明記した「sample minimum, N=20」へ改めた
+（`crates/engine/benches/scan_stage_profile_bench.rs` の出力表記と同期。
+PR #586 codex-review 指摘）。
 
 `A0a`／`A0b` の値は `docs/design/visible-bitmap-cache.md`「前後比較実測」節の
 導入後実測（0.050ms）と同一環境・同一設定での再実測であり整合する。
 `A0c-cold` は本 Issue で新規追加した測定点で、ヒット経路（0.050ms）との比が
-約 147 倍——同キャッシュのヒット時に A1〜A5 全段（redb 全行走査・ヘッダ
-デコード・RLS 判定・dim/metadata デコード・スカラー検証）と `Storage::open`
-そのものが省略されることを裏づける。
+約 147 倍——ただしこの比には `Storage::open`／`EngineCore` 構築コスト
+（DB 起動費用。`A0c-cold` 自身の設計判断で計測区間に含めている。上記
+「e2e cold 変種 A0c」節参照）が混入しており、`VisibleBitmapCache` 単独の
+効果（ミス経路でのスナップショット構築コスト削減）を裏づける数値ではない
+点に注意（PR #586 codex-review 指摘）。この比が実際に示すのは「起動込み
+（ミス経路・`A0c-cold`）vs 同一 `EngineCore` 再利用時（ヒット経路・
+`A0a`/`A0b`）」の e2e 比であり、同キャッシュのヒット時に A1〜A5 全段
+（redb 全行走査・ヘッダデコード・RLS 判定・dim/metadata デコード・
+スカラー検証）が省略されることの傍証にはなるが、`Storage::open` 自体の
+コストと切り分けられていない。
 
 `docs/design/visible-bitmap-cache.md` の導入前実測（`agg_count`
 1.598ms・`rls_isolation` 1.625ms。導入前は毎回全行走査だが `Storage::open`
@@ -180,11 +195,16 @@ python scripts/crossdb_bench/run.py --db self --config exact \
 - 対照 DB 方式のテストにより、cold／hot／複数文脈の交互ホット状態／失効後／
   wire セッション経由のいずれでも他テナントの可視性境界を跨いだ混入がない
   ことを機械的に固定した。
-- `A0c-cold`（ミス経路）とヒット経路（`A0a`/`A0b`）の比（約 147 倍）は、
-  `docs/design/visible-bitmap-cache.md` が既に報告した「約 32 倍高速化」
-  （導入前 vs 導入後のヒット経路）を補強する新しい観測点だが、before
-  バイナリでの `A0c` 実測が取れていないため、導入前後の直接比較値としては
-  未確定のまま申し送る。
+- `A0c-cold`（ミス経路・`Storage::open` を含む起動込み e2e）とヒット経路
+  （`A0a`/`A0b`・同一 `EngineCore` 再利用時）の比（約 147 倍）は、
+  `Storage::open`／`EngineCore` 構築コストを含んだ「起動込み vs 再利用時」の
+  e2e 比であり、`VisibleBitmapCache` 単独の効果（ミス経路でのスナップショット
+  構築コスト削減）を裏づける数値ではない（PR #586 codex-review 指摘。上記
+  「実測値」節参照）。`docs/design/visible-bitmap-cache.md` が既に報告した
+  「約 32 倍高速化」（`Storage::open` を含まない、導入前 vs 導入後のヒット
+  経路のみの比較）とは測定区間が異なるため単純な補強関係としては扱わない。
+  before バイナリでの `A0c` 実測も取れていないため、導入前後の直接比較値
+  としては未確定のまま申し送る。
 - crossdb self（wire 経由）の before/after 実測は、本開発環境の共有 `/tmp`
   容量制約により実施できなかった。上記の再現手順を用いた専有環境での実測は
   オーナー／運用者作業として引き続き申し送る。
