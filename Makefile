@@ -480,7 +480,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-hnsw-parallel-build
-bench-hnsw-parallel-build: ## Issue #406（HNSW 構築の並列化の受け入れ条件 (b): 100k 点で構築時間がスレッド数に応じて短縮することの実測記録）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_HNSW_PARALLEL_ROWS／BENCH_HNSW_PARALLEL_THREADS で規模・スレッド数ラダーを上書き可）
+bench-hnsw-parallel-build: ## Issue #406（HNSW 構築の並列化の受け入れ条件 (b): 100k 点で構築時間がスレッド数に応じて短縮することの実測記録）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_HNSW_PARALLEL_ROWS／BENCH_HNSW_PARALLEL_THREADS で規模・スレッド数ラダーを上書き可。Issue #495 追記: CSR 平坦化段 `flatten=`（逐次縮退経路は 0ms・並列経路は 0 超）・各 threads 点の常駐メモリ実測行〔`approx_heap_bytes`／VmRSS 前後差／VmHWM〕を出力する）
 ifdef HAS_CARGO
 	cargo bench --bench hnsw_parallel_build_bench -p engine
 else
