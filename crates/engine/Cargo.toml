@@ -391,9 +391,10 @@ test = false
 # 実測入口。`engine::hnsw::HnswIndex::search_masked` を 1 プロセス = 1 規模点
 # （`rows` × `dim` × マスク有無）で計測し、変更を含まない参照区間
 # （`engine::kernel::CpuScalarProvider` の brute-force Top-k）とあわせて
-# ノイズ帯を出力する。8 点（10k／100k・dim 128／768・マスク有無）の前後比較・
-# 採否判定は `make bench-hnsw-search` が before/after バイナリを交互起動して
-# シェル側で行う。spec 由来の pass/fail 閾値は持たない情報提供専用ベンチのため
+# ノイズ帯を出力する。`make bench-hnsw-search` は 1 プロセス = 1 規模点の
+# 計測のみを行い、8 点（10k／100k・dim 128／768・マスク有無）の before/after
+# バイナリ交互起動・前後比較・採否判定は運用者が行う。spec 由来の
+# pass/fail 閾値は持たない情報提供専用ベンチのため
 # `.github/workflows/*` へは配線しない。harness = false / test = false は他
 # ベンチと同一方針。判定ロジック自体（時間非依存）は
 # harness/hnsw_search_latency.rs にあり tests/hnsw_search_latency_accept.rs で
