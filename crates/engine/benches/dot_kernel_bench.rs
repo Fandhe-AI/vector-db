@@ -303,6 +303,51 @@ fn measure_block_ab_stage(working_set: WorkingSet, dim: usize) -> Result<(), Str
     Ok(())
 }
 
+/// 診断 A/B（SIMD 実効倍率の情報提供・合否に数えない）本体を独立関数として
+/// 切り出したもの。`main` からはセットアップ・計測いずれの失敗も `Err` で
+/// 受け取り、診断のスキップに留めて後続処理（block4 A/B 等）を継続させる。
+fn run_diagnostic_ab() -> Result<(), String> {
+    // cache 常駐・dim768 のみで代表させる（全 dim × working_set を A/B すると
+    // `bench.yml` タイムアウト級の時間がかかる既存ベンチの教訓〔`simd_bench.rs`
+    // DIAG_AB_ROW_COUNT コメント参照〕を踏まえ、本ベンチも代表点 1 つに絞る）。
+    let diag_dim = 768usize;
+    let diag_rows = rows_for(WorkingSet::CacheResident, diag_dim).map_err(|e| e.to_string())?;
+    let diag_corpus =
+        generate_corpus(0xDEAD_BEEF, diag_dim, diag_rows).map_err(|e| e.to_string())?;
+    let diag_query = generate_query(0xDEAD_BEEF, diag_dim);
+    let diag_config = MeasurementConfig::new(20, 20, 0xDEAD_BEEF).map_err(|e| e.to_string())?;
+
+    let ab = run_ab(
+        &diag_config,
+        || {
+            let mut sum = 0f32;
+            for chunk in diag_corpus.chunks_exact(diag_dim) {
+                sum += dot_wrapper(chunk, &diag_query);
+            }
+            sum
+        },
+        || {
+            let mut sum = 0f32;
+            for chunk in diag_corpus.chunks_exact(diag_dim) {
+                sum += dot_scalar_wrapper(chunk, &diag_query);
+            }
+            sum
+        },
+    )
+    .map_err(|e| format!("diagnostic ab failed: {e}"))?;
+
+    let ratio = speedup_ratio(
+        ab.b.summary.median.as_secs_f64(),
+        ab.a.summary.median.as_secs_f64(),
+    );
+    let class = classify_change(ratio, 0.05);
+    println!(
+        "dot_kernel: diagnostic_ab dim={diag_dim} rows={diag_rows} simd_vs_scalar_ratio={ratio:.3} class={class:?}"
+    );
+
+    Ok(())
+}
+
 fn main() {
     if let Err(e) = refuse_under_github_actions(running_under_github_actions()) {
         eprintln!("dot_kernel_bench: {e}");
@@ -334,63 +379,12 @@ fn main() {
     }
 
     // 診断 A/B: SIMD 実効倍率の情報提供（合否に数えない。`simd_bench.rs::
-    // diagnostic_ab` と同型の位置付け）。cache 常駐・dim768 のみで代表させる
-    // （全 dim × working_set を A/B すると `bench.yml` タイムアウト級の時間が
-    // かかる既存ベンチの教訓〔`simd_bench.rs` DIAG_AB_ROW_COUNT コメント参照〕を
-    // 踏まえ、本ベンチも代表点 1 つに絞る）。
-    let diag_dim = 768usize;
-    let diag_rows = match rows_for(WorkingSet::CacheResident, diag_dim) {
-        Ok(rows) => rows,
-        Err(e) => {
-            eprintln!("dot_kernel_bench: diagnostic ab skipped: {e}");
-            return;
-        }
-    };
-    let diag_corpus = match generate_corpus(0xDEAD_BEEF, diag_dim, diag_rows) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("dot_kernel_bench: diagnostic ab skipped: {e}");
-            return;
-        }
-    };
-    let diag_query = generate_query(0xDEAD_BEEF, diag_dim);
-    let diag_config = match MeasurementConfig::new(20, 20, 0xDEAD_BEEF) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("dot_kernel_bench: diagnostic ab skipped: {e}");
-            return;
-        }
-    };
-    match run_ab(
-        &diag_config,
-        || {
-            let mut sum = 0f32;
-            for chunk in diag_corpus.chunks_exact(diag_dim) {
-                sum += dot_wrapper(chunk, &diag_query);
-            }
-            sum
-        },
-        || {
-            let mut sum = 0f32;
-            for chunk in diag_corpus.chunks_exact(diag_dim) {
-                sum += dot_scalar_wrapper(chunk, &diag_query);
-            }
-            sum
-        },
-    ) {
-        Ok(ab) => {
-            let ratio = speedup_ratio(
-                ab.b.summary.median.as_secs_f64(),
-                ab.a.summary.median.as_secs_f64(),
-            );
-            let class = classify_change(ratio, 0.05);
-            println!(
-                "dot_kernel: diagnostic_ab dim={diag_dim} rows={diag_rows} simd_vs_scalar_ratio={ratio:.3} class={class:?}"
-            );
-        }
-        Err(e) => {
-            eprintln!("dot_kernel_bench: diagnostic ab failed: {e}");
-        }
+    // diagnostic_ab` と同型の位置付け）。診断のセットアップ失敗・計測失敗は
+    // 診断自体をスキップするのみで、後続の block4 A/B（opt-in）実行を妨げない
+    // （Cursor Bugbot 指摘。旧実装は診断の早期 `return` が main 全体を終了させ、
+    // `BENCH_DOT_KERNEL_BLOCK_AB=1` 指定時でも block4 計測が実行されなかった）。
+    if let Err(e) = run_diagnostic_ab() {
+        eprintln!("dot_kernel_bench: diagnostic ab skipped: {e}");
     }
 
     // block4 A/B（Issue #512・opt-in）。`BENCH_DOT_KERNEL_BLOCK_AB` 未設定・`0`
