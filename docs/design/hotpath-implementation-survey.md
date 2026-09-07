@@ -253,7 +253,7 @@ Qdrant HNSW に劣後する:
 | 7 | `search_layer` への prefetch 導入 | 中。hnswlib 型ソフトウェアパイプライン。真の prefetch 命令は `#[target_feature]` fn の内側限定（通常の fn からは E0133）で発行不可なため、新規 `unsafe` ゼロの制約下では `core::hint::black_box` によるタッチ方式で実装（#490） | 小〜中 | 不要 | 不要 | #490 で実装済み。#491 で 8 規模点（10k／100k・dim 128／768・マスク有無）の前後比較を実測し、8 点中 7 点は悪化方向への一貫したシグナルは無いが、1 点（10k×dim128・可視率50%）で両ノイズ帯を超える一貫した悪化が観測され、静的解析／実アセンブリの裏付けが無いため撤回条件は完全には満たさず保留（production 無変更・専有実機再実測をオーナーへ申し送り）。詳細は [`docs/design/hnsw-search.md`](hnsw-search.md)「Issue #491」節参照 |
 | 8 | f16 常駐＋f32 再スコア（ANN opt-in 経路限定） | 中。移動バイト半減。新規 `unsafe` ゼロ。候補集合が変わるため既定 brute-force 経路には適用不可 | 中 | 不要 | 不要 | 既起票 #513 |
 | 9 | visited のサイズ閾値切替（密ビットマップ ↔ `HashSet`） | 小〜中。可視カーディナリティが索引ノード数に対し極小のとき全ノード分の確保・走査を回避 | 小 | 不要 | 不要 | #497 で機構（`VisitedSparse`・`search_masked_with`・`sparse_visited_max` opt-in）を実装済み。既定は dense のみ（既存動作不変）。閾値既定値の確定・可視比率別 before/after 実測は #498 の担当。詳細は [`docs/design/hnsw-search.md`](hnsw-search.md)「visited 集合の 3 実装」節参照 |
-| 10 | dim>=768 での多アキュムレータディスパッチ | 小〜中（dim=128 の現行ベンチでは効果ゼロ）。[`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md) の arena 表で ACC=4 が dim768/1536 のみ改善。dim=768 のベンチ点追加が前提 | 小 | 不要 | 不要 | 既検討・不採用 #365 の条件付き再訪。#518 で dim 閾値ディスパッチとして実装済み・閾値確定は #519 |
+| 10 | dim>=768 での多アキュムレータディスパッチ | 小〜中（dim=128 の現行ベンチでは効果ゼロ）。[`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md) の arena 表で ACC=4 が dim768/1536 のみ改善。dim=768 のベンチ点追加が前提 | 小 | 不要 | 不要 | 既検討・不採用 #365 の条件付き再訪。#518 で dim 閾値ディスパッチとして実装済み。#519 で本環境（共有 QEMU）の前後比較を実測済み（参考値。production `dot_block4` 経路が 8〜11% 退行する所見あり）。閾値確定・退行対処はオーナー実機〔#530〕へ申し送り |
 
 内訳切り分け・dim=768 規模点追加・生成コード検査ガード・macOS 検出検証・計測規約
 は #463／#466／#467／#468／#462 として起票済み。`hybrid_rrf` 最新基線の再計測は
@@ -269,7 +269,7 @@ dispatch／GPU 側 Top-k／SHADER_F16／`dot4I8Packed`）は #531／#534／#538�
 
 | Issue／PR | 施策 | 記録先 | 再訪条件 |
 | --------- | ---- | ------ | -------- |
-| #365 | dot カーネルの行内複数アキュムレータ（ACC=2／4） | [`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md) | dim>=768 限定ディスパッチとして #518 で実装済み（#517・#466 が前提）。閾値確定・チップ別実測は #519 |
+| #365 | dot カーネルの行内複数アキュムレータ（ACC=2／4） | [`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md) | dim>=768 限定ディスパッチとして #518 で実装済み（#517・#466 が前提）。#519 で本環境の前後比較・閾値候補実測済み（参考値。閾値 768 は据え置き）。最終確定・退行対処はオーナー実機〔#530〕 |
 | #366 | 距離計算と Top-k の 2 段分離バッチ化 | [`docs/design/knn-two-stage-topk.md`](knn-two-stage-topk.md) | 専有環境での再実測（#462 規約）で run-to-run 変動を上回る差が出た場合のみ |
 | #391 | fieldnorm 256 段ロッシー量子化 | [`docs/design/hybrid-rrf-latency-breakdown.md`](hybrid-rrf-latency-breakdown.md)「Issue #391」節 | ビット一致契約自体の改訂（spec 側判断）なしには再訪しない |
 | #400 | redb `insert_reserve` ゼロコピー | [`docs/design/redb-insert-reserve-zero-copy.md`](redb-insert-reserve-zero-copy.md) | redb 側の内部実装変更が確認された場合 |
