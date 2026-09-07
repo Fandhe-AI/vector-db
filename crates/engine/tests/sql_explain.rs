@@ -196,6 +196,7 @@ fn explain_reports_search_terms_and_hints_and_mode() {
             // `unknown_custom_provider`。
             "engine: (custom_provider)".to_string(),
             "ann_plan: unknown_custom_provider".to_string(),
+            "scalar_plan: plain_scan".to_string(),
         ]
     );
 }
@@ -230,6 +231,7 @@ fn explain_uses_none_label_for_absent_hints() {
             "mode_source: default".to_string(),
             "engine: (custom_provider)".to_string(),
             "ann_plan: unknown_custom_provider".to_string(),
+            "scalar_plan: plain_scan".to_string(),
         ]
     );
 }
@@ -255,8 +257,8 @@ fn explain_reports_mode_source_query_clause() {
         .expect("EXPLAIN should succeed");
 
     let lines = explain_result_lines(outcome);
-    assert_eq!(lines[lines.len() - 4], "mode: precision");
-    assert_eq!(lines[lines.len() - 3], "mode_source: query_clause");
+    assert_eq!(lines[lines.len() - 5], "mode: precision");
+    assert_eq!(lines[lines.len() - 4], "mode_source: query_clause");
 }
 
 #[test]
@@ -287,8 +289,8 @@ fn explain_reports_mode_source_session_variable() {
         .expect("EXPLAIN should succeed");
 
     let lines = explain_result_lines(outcome);
-    assert_eq!(lines[lines.len() - 4], "mode: precision");
-    assert_eq!(lines[lines.len() - 3], "mode_source: session_variable");
+    assert_eq!(lines[lines.len() - 5], "mode: precision");
+    assert_eq!(lines[lines.len() - 4], "mode_source: session_variable");
 }
 
 #[test]
@@ -312,8 +314,8 @@ fn explain_reports_mode_source_planner_estimate() {
         .expect("EXPLAIN should succeed");
 
     let lines = explain_result_lines(outcome);
-    assert_eq!(lines[lines.len() - 4], "mode: precision");
-    assert_eq!(lines[lines.len() - 3], "mode_source: planner_estimate");
+    assert_eq!(lines[lines.len() - 5], "mode: precision");
+    assert_eq!(lines[lines.len() - 4], "mode_source: planner_estimate");
 }
 
 #[test]
@@ -679,8 +681,9 @@ fn explain_reports_custom_provider_engine_and_unknown_custom_provider_ann_plan()
         .expect("EXPLAIN should succeed");
 
     let lines = explain_result_lines(outcome);
-    assert_eq!(lines[lines.len() - 2], "engine: (custom_provider)");
-    assert_eq!(lines[lines.len() - 1], "ann_plan: unknown_custom_provider");
+    assert_eq!(lines[lines.len() - 3], "engine: (custom_provider)");
+    assert_eq!(lines[lines.len() - 2], "ann_plan: unknown_custom_provider");
+    assert_eq!(lines[lines.len() - 1], "scalar_plan: plain_scan");
 }
 
 #[test]
@@ -703,12 +706,13 @@ fn explain_reports_hnsw_engine_params_and_full_visible_ann_plan_without_filter()
         .expect("EXPLAIN should succeed");
 
     let lines = explain_result_lines(outcome);
-    assert_eq!(lines[lines.len() - 3], "engine: hnsw");
+    assert_eq!(lines[lines.len() - 4], "engine: hnsw");
     assert_eq!(
-        lines[lines.len() - 2],
-        "hnsw_params: m=16,ef_construction=100,ef_search=64"
+        lines[lines.len() - 3],
+        "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32"
     );
-    assert_eq!(lines[lines.len() - 1], "ann_plan: hnsw_full_visible");
+    assert_eq!(lines[lines.len() - 2], "ann_plan: hnsw_full_visible");
+    assert_eq!(lines[lines.len() - 1], "scalar_plan: plain_scan");
 }
 
 #[test]
@@ -731,7 +735,8 @@ fn explain_reports_hnsw_subset_ann_plan_with_default_scalar_first_where() {
         .expect("EXPLAIN should succeed");
 
     let lines = explain_result_lines(outcome);
-    assert_eq!(lines[lines.len() - 1], "ann_plan: hnsw_subset");
+    assert_eq!(lines[lines.len() - 2], "ann_plan: hnsw_subset");
+    assert_eq!(lines[lines.len() - 1], "scalar_plan: index_equality");
 }
 
 #[test]
@@ -782,7 +787,8 @@ fn explain_reports_hnsw_full_visible_ann_plan_with_only_visible_predicate() {
         .expect("EXPLAIN should succeed");
 
     let lines = explain_result_lines(outcome);
-    assert_eq!(lines[lines.len() - 1], "ann_plan: hnsw_full_visible");
+    assert_eq!(lines[lines.len() - 2], "ann_plan: hnsw_full_visible");
+    assert_eq!(lines[lines.len() - 1], "scalar_plan: plain_scan");
 }
 
 #[test]
@@ -805,7 +811,8 @@ fn explain_reports_plain_scan_precision_ann_plan_for_precision_mode() {
         .expect("EXPLAIN should succeed");
 
     let lines = explain_result_lines(outcome);
-    assert_eq!(lines[lines.len() - 1], "ann_plan: plain_scan_precision");
+    assert_eq!(lines[lines.len() - 2], "ann_plan: plain_scan_precision");
+    assert_eq!(lines[lines.len() - 1], "scalar_plan: plain_scan");
 }
 
 #[test]
@@ -877,6 +884,14 @@ fn explain_new_rows_use_closed_vocabulary_and_default_hnsw_params() {
         "hnsw_subset",
         "unknown_custom_provider",
     ];
+    // Issue #474: `scalar_plan:` の閉じた語彙。
+    const SCALAR_PLAN_TOKENS: &[&str] = &[
+        "plain_scan",
+        "index_equality",
+        "index_prefix",
+        "index_id_range",
+        "index_conjunction",
+    ];
 
     let path = unique_db_path("sql-explain-hnsw-closed-vocab");
     let _guard = CleanupGuard(path.clone());
@@ -917,7 +932,22 @@ fn explain_new_rows_use_closed_vocabulary_and_default_hnsw_params() {
     let hnsw_params_line = lines.iter().find(|l| l.starts_with("hnsw_params: "));
     assert_eq!(
         hnsw_params_line,
-        Some(&"hnsw_params: m=16,ef_construction=100,ef_search=64".to_string()),
+        Some(&"hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32".to_string()),
         "default HnswParams must round-trip exactly through EXPLAIN"
+    );
+    let scalar_plan_line = lines
+        .iter()
+        .find(|l| l.starts_with("scalar_plan: "))
+        .expect("scalar_plan line present");
+    assert!(
+        SCALAR_PLAN_TOKENS
+            .iter()
+            .any(|t| scalar_plan_line == &format!("scalar_plan: {t}")),
+        "unexpected scalar_plan token: {scalar_plan_line}"
+    );
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("scalar_plan: plain_scan"),
+        "scalar_plan is the last EXPLAIN row (no WHERE clause in this query)"
     );
 }

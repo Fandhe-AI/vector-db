@@ -126,6 +126,21 @@ impl SqlArenaSnapshot {
         self.built_table_generation
     }
 
+    /// [`crate::sql::scalar_index::ScalarIndex::build`] が索引の世代整合キー
+    /// （`built_ctx`）をこのスナップショットから引き継ぐための crate 内公開
+    /// アクセサ（Issue #473）。`built_ctx`（本モジュール内 private）と同じ値を
+    /// 返す薄いラッパー。
+    pub(crate) fn built_ctx_for_index(&self) -> &PolicyContext {
+        &self.built_ctx
+    }
+
+    /// [`crate::sql::scalar_index::ScalarIndex::build`] が索引の世代整合キー
+    /// （`built_table_generation`）をこのスナップショットから引き継ぐための
+    /// crate 内公開アクセサ（Issue #473）。
+    pub(crate) fn built_table_generation_for_index(&self) -> u64 {
+        self.built_table_generation
+    }
+
     /// キャッシュ容量判定用の概算バイト量（`arena` 本体＋`metadata` 複製の実バイト数）。
     fn approx_heap_bytes(&self) -> usize {
         let metadata_bytes: usize = self

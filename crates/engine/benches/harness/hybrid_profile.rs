@@ -37,9 +37,14 @@
 //!
 //! Issue #355 の feature_bench 記述は tenant-a/tenant-b の 2 テナント構成だが、
 //! 本 Issue が切り分けたいのは RLS 境界ではなく hybrid_rrf 内部の段別コストで
-//! あるため、単一テナント・全行 Public に単純化する（`sql_c1_bench.rs` と同じ
-//! 単純化方針）。可視行数と投入行数が一致するため、SQL 段のコーパスと直接 API 段の
-//! コーパスの整合を `SELECT COUNT(*)` の突き合わせなしに構造的に保証できる。
+//! あるため、既定（可視率 1/1）では単一テナント・全行 Public に単純化する
+//! （`sql_c1_bench.rs` と同じ単純化方針）。この既定では可視行数と投入行数が
+//! 一致するため、SQL 段のコーパスと直接 API 段のコーパスの整合を
+//! `SELECT COUNT(*)` の突き合わせなしに構造的に保証できる。Issue #547 で
+//! `BENCH_HYBRID_PROFILE_VISIBLE_RATIO` が `1/1` 超を指定した場合は、
+//! 非可視分を同一テナント内 `Visibility::Private` として投入する経路が
+//! 追加されており、可視行数と投入行数は一致しなくなる（詳細は
+//! `hybrid_profile_bench.rs` 内のコメント参照）。
 //!
 //! # 暗号用途禁止
 //!
@@ -48,6 +53,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::env::VarError;
 use std::fmt::Write as _;
 
 // Issue #387 PR #416 codex-review P2 指摘対応（2 巡目）: `sparse_refetch_observed`
@@ -114,6 +120,13 @@ impl ProfileCorpus {
 pub enum ProfileError {
     /// [`MAX_CORPUS_DOCS_GUARD`] を超過した。
     CorpusTooLarge,
+    /// `BENCH_HYBRID_PROFILE_ROWS`（Issue #547）が非 UTF-8・非数値・範囲外だった。
+    /// 黙って既定値へ倒すと行数の指定漏れが計測結果に気付かれず混入するため、
+    /// `harness::bench_engine::read_env_var` と同じ方針で明示的に拒否する。
+    InvalidRows(String),
+    /// `BENCH_HYBRID_PROFILE_VISIBLE_RATIO`（Issue #547）が `1/<N>` 形式でない、
+    /// または `N` が許容範囲外だった。
+    InvalidVisibleRatio(String),
     /// テーブル名・列名が識別子として不正だった（SQL 文字列組み立て時）。
     InvalidIdentifier(&'static str),
     /// クエリテキストに単一引用符等の SQL リテラルを壊す文字が含まれていた
@@ -156,6 +169,12 @@ impl std::fmt::Display for ProfileError {
         match self {
             ProfileError::CorpusTooLarge => {
                 write!(f, "num_docs exceeds {MAX_CORPUS_DOCS_GUARD}")
+            }
+            ProfileError::InvalidRows(detail) => {
+                write!(f, "BENCH_HYBRID_PROFILE_ROWS is invalid: {detail}")
+            }
+            ProfileError::InvalidVisibleRatio(detail) => {
+                write!(f, "BENCH_HYBRID_PROFILE_VISIBLE_RATIO is invalid: {detail}")
             }
             ProfileError::InvalidIdentifier(field) => {
                 write!(f, "{field} is not a valid identifier")
@@ -202,6 +221,166 @@ pub fn refuse_under_github_actions(under_github_actions: bool) -> Result<(), Pro
         return Err(ProfileError::RefusedUnderGitHubActions);
     }
     Ok(())
+}
+
+// --- 行数・可視率の opt-in（Issue #547。#546〔PR #565〕のスコアアキュムレータ
+// 再利用が「索引 N ≫ 可視集合」条件で効くかを N=25k／100k・可視率 100%／10% の
+// 4 条件で計測するための注入点） ---
+//
+// 可視率には SQL 段（B1〜B3）と直接 API 段（B0/B0s/B4/B5・`score_within_once`・
+// `search_within_fetch_k=<k>`）とで意味が異なる点に注意する:
+//
+// - SQL 段: `sql/exec.rs::on_visible_row` は可視行の本文のみ `SparseIndex` へ
+//   積む（`SparseIndexCache` も ctx 可視行のみを対象にする）ため、**索引の
+//   文書数そのものが可視件数と一致する**。可視率 10% は「索引 N が行数の
+//   1/10」という条件になる。
+// - 直接 API 段: 本ベンチは全行から構築した単一の `SparseIndex` へ可視部分
+//   集合（`BTreeSet<DocId>`）を渡して `search_within` を呼ぶため、**索引 N は
+//   常に行数（100%）で、可視率だけが縮小する**。#546 が対象にする
+//   「索引 N ≫ 可視集合」の条件を直接検証できるのはこちらの経路。
+
+/// `std::env::var` を fail-closed に読む（`harness::bench_engine::read_env_var`
+/// と同型の複製。本モジュールは `super::` を跨ぐ依存を持たない方針
+/// のため、共通化はせず同じ判定をここでも独立に行う）。
+///
+/// 非 UTF-8 値の拒否をどの `ProfileError` variant として報告するかは
+/// 呼び出し元（`resolve_rows_from_env`／`resolve_visible_ratio_denominator_from_env`）
+/// が `to_invalid` で指定する。両者を単一 variant（`InvalidRows`）へ固定すると、
+/// `BENCH_HYBRID_PROFILE_VISIBLE_RATIO` の非 UTF-8 値がメッセージ本文の変数名は
+/// 正しいまま誤った variant で報告される（呼び出し元でのエラー種別判定を誤らせる）。
+fn read_env_var(
+    name: &'static str,
+    to_invalid: impl FnOnce(String) -> ProfileError,
+) -> Result<Option<String>, ProfileError> {
+    match std::env::var(name) {
+        Ok(v) => Ok(Some(v)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(to_invalid(format!("{name} value is not valid UTF-8"))),
+    }
+}
+
+/// `BENCH_HYBRID_PROFILE_ROWS`（Issue #547）を解決する。未設定・空文字列は
+/// 既定 25,000（従来の `NUM_DOCS` 定数と同値・後方互換）。それ以外は
+/// `1..=MAX_CORPUS_DOCS_GUARD` の正整数のみを受理する（`sparse::MAX_CORPUS_DOCS`
+/// も同じ 100,000 で、`>` 判定のため 100,000 ちょうどは両ガードとも通過する）。
+pub fn parse_rows(raw: Option<&str>) -> Result<usize, ProfileError> {
+    const DEFAULT_ROWS: usize = 25_000;
+    let trimmed = raw.map(str::trim);
+    let value: usize = match trimmed {
+        None | Some("") => return Ok(DEFAULT_ROWS),
+        Some(s) => s.parse::<usize>().map_err(|_| {
+            ProfileError::InvalidRows(format!("must be a positive integer (got {s:?})"))
+        })?,
+    };
+    if value == 0 {
+        return Err(ProfileError::InvalidRows(
+            "must be >= 1 (got 0)".to_string(),
+        ));
+    }
+    if value > MAX_CORPUS_DOCS_GUARD {
+        return Err(ProfileError::InvalidRows(format!(
+            "must be <= {MAX_CORPUS_DOCS_GUARD} (got {value})"
+        )));
+    }
+    Ok(value)
+}
+
+/// 環境から `BENCH_HYBRID_PROFILE_ROWS` を読み取り [`parse_rows`] へ渡す
+/// （`hybrid_profile_bench.rs` から呼ぶ薄いラッパ）。
+pub fn resolve_rows_from_env() -> Result<usize, ProfileError> {
+    parse_rows(read_env_var("BENCH_HYBRID_PROFILE_ROWS", ProfileError::InvalidRows)?.as_deref())
+}
+
+/// 可視率の分母（`1/<denominator>`）。`denominator == 1` は可視率 100%
+/// （全行可視）を表す。
+pub type VisibleRatioDenominator = u32;
+
+/// [`VisibleRatioDenominator`] の許容上限（Issue #547 計画。100 行未満の
+/// コーパスでも可視 0 件に潰れない範囲として定めた本ベンチ独自の値。
+/// spec 由来の値ではない）。
+pub const MAX_VISIBLE_RATIO_DENOMINATOR: u32 = 1_000;
+
+/// `BENCH_HYBRID_PROFILE_VISIBLE_RATIO`（Issue #547）を解決する。未設定・
+/// 空文字列は既定 `1/1`（可視率 100%・従来の全行可視と後方互換）。それ以外は
+/// 厳密に `"1/<N>"` 形式（`N` は `1..=MAX_VISIBLE_RATIO_DENOMINATOR` の
+/// 正整数）のみを受理し、`"10"`・`"2/10"`・`"1/0"` 等は fail-closed で拒否する
+/// （分子が 1 以外の比率は本 Issue の 4 条件〔100%／10%〕では不要であり、
+/// 誤って `10/100` のような別解釈を許すと分母の意味が曖昧になるため）。
+pub fn parse_visible_ratio_denominator(
+    raw: Option<&str>,
+) -> Result<VisibleRatioDenominator, ProfileError> {
+    let trimmed = raw.map(str::trim);
+    let s = match trimmed {
+        None | Some("") => return Ok(1),
+        Some(s) => s,
+    };
+    let (numerator, denominator) = s.split_once('/').ok_or_else(|| {
+        ProfileError::InvalidVisibleRatio(format!("must be in \"1/<N>\" form (got {s:?})"))
+    })?;
+    if numerator.trim() != "1" {
+        return Err(ProfileError::InvalidVisibleRatio(format!(
+            "numerator must be 1 (got {s:?})"
+        )));
+    }
+    let denominator: u32 = denominator.trim().parse::<u32>().map_err(|_| {
+        ProfileError::InvalidVisibleRatio(format!(
+            "denominator must be a positive integer (got {s:?})"
+        ))
+    })?;
+    if denominator == 0 {
+        return Err(ProfileError::InvalidVisibleRatio(
+            "denominator must be >= 1 (got 0)".to_string(),
+        ));
+    }
+    if denominator > MAX_VISIBLE_RATIO_DENOMINATOR {
+        return Err(ProfileError::InvalidVisibleRatio(format!(
+            "denominator must be <= {MAX_VISIBLE_RATIO_DENOMINATOR} (got {denominator})"
+        )));
+    }
+    Ok(denominator)
+}
+
+/// 環境から `BENCH_HYBRID_PROFILE_VISIBLE_RATIO` を読み取り
+/// [`parse_visible_ratio_denominator`] へ渡す。
+pub fn resolve_visible_ratio_denominator_from_env() -> Result<VisibleRatioDenominator, ProfileError>
+{
+    parse_visible_ratio_denominator(
+        read_env_var(
+            "BENCH_HYBRID_PROFILE_VISIBLE_RATIO",
+            ProfileError::InvalidVisibleRatio,
+        )?
+        .as_deref(),
+    )
+}
+
+/// `rows` 件の `DocId`（`0..rows` の連番。[`generate_corpus`] の割当と同一）から
+/// 可視集合を選ぶ決定的規則: `doc_id % denominator == 0`。`denominator == 1`
+/// のときは全件可視（既定・後方互換）。純関数（RNG 非依存）にすることで、
+/// 「どの行が可視か」を [`expected_visible_count`] や受け入れテストと
+/// 独立に再導出できるようにする。
+pub fn select_visible_ids(rows: usize, denominator: VisibleRatioDenominator) -> BTreeSet<DocId> {
+    let denominator = denominator.max(1) as u64;
+    (0..rows as u64)
+        .filter(|id| id % denominator == 0)
+        .collect()
+}
+
+/// `rows` 件・分母 `denominator` のとき [`select_visible_ids`] が選ぶ件数を
+/// 事前に計算する（`ceil(rows / denominator)`）。可視件数が 0 件になる
+/// 組み合わせ（`rows < denominator` のとき等）は本ベンチの計測条件として
+/// 意味を持たないため fail-closed で拒否する。
+pub fn expected_visible_count(
+    rows: usize,
+    denominator: VisibleRatioDenominator,
+) -> Result<usize, ProfileError> {
+    let denominator = denominator.max(1) as usize;
+    let count = rows.div_ceil(denominator);
+    if count == 0 {
+        return Err(ProfileError::InvalidVisibleRatio(format!(
+            "rows={rows} denominator={denominator} yields 0 visible rows"
+        )));
+    }
+    Ok(count)
 }
 
 /// 決定的シードから合成コーパスを生成する。`num_docs`・`dim` はベンチ内定数のみを
