@@ -1,0 +1,31 @@
+# env
+side	detected_isa	logical_cpus	model_name	runtime_features
+before	Avx2Fma	12	QEMU Virtual CPU version 2.5+	{"avx2": true, "avx512bf16": false, "avx512bw": false, "avx512f": false, "avx512fp16": false, "avx512vl": false, "avx512vnni": false, "avxvnni": false, "f16c": true, "fma": true}
+after	Avx2Fma	12	QEMU Virtual CPU version 2.5+	{"avx2": true, "avx512bf16": false, "avx512bw": false, "avx512f": false, "avx512fp16": false, "avx512vl": false, "avx512vnni": false, "avxvnni": false, "f16c": true, "fma": true}
+
+# comparison
+workload	metric	n_before	n_after	before_min	before_median	after_min	after_median	ratio_min	ratio_median	class_min	class_median
+dot_kernel	arena_scale/dim=100/median_ms	5	5	0.178	0.282	0.173	0.221	0.9719	0.7837	Neutral	Improved
+dot_kernel	arena_scale/dim=100/ns_per_dot	5	5	7.12	11.26	6.94	8.82	0.9747	0.7833	Neutral	Improved
+dot_kernel	arena_scale/dim=128/median_ms	5	5	0.264	0.49	0.259	0.34	0.9811	0.6939	Neutral	Improved
+dot_kernel	arena_scale/dim=128/ns_per_dot	5	5	10.56	19.61	10.35	13.6	0.9801	0.6935	Neutral	Improved
+dot_kernel	arena_scale/dim=1536/median_ms	5	5	6.384	7.136	5.588	6.617	0.8753	0.9273	Improved	Improved
+dot_kernel	arena_scale/dim=1536/ns_per_dot	5	5	255.37	285.45	223.54	264.67	0.8754	0.9272	Improved	Improved
+dot_kernel	arena_scale/dim=384/median_ms	5	5	1.531	1.911	1.613	1.757	1.0536	0.9194	Regressed	Improved
+dot_kernel	arena_scale/dim=384/ns_per_dot	5	5	61.22	76.43	64.52	70.27	1.0539	0.9194	Regressed	Improved
+dot_kernel	arena_scale/dim=768/median_ms	5	5	3.34	3.608	2.934	3.378	0.8784	0.9363	Improved	Improved
+dot_kernel	arena_scale/dim=768/ns_per_dot	5	5	133.59	144.3	117.37	135.11	0.8786	0.9363	Improved	Improved
+dot_kernel	cache_resident/dim=100/median_ms	5	5	0.177	0.18	0.177	0.185	1.0000	1.0278	Neutral	Neutral
+dot_kernel	cache_resident/dim=100/ns_per_dot	5	5	5.43	5.53	5.44	5.67	1.0018	1.0253	Neutral	Neutral
+dot_kernel	cache_resident/dim=128/median_ms	5	5	0.14	0.143	0.141	0.144	1.0071	1.0070	Neutral	Neutral
+dot_kernel	cache_resident/dim=128/ns_per_dot	5	5	5.47	5.57	5.52	5.62	1.0091	1.0090	Neutral	Neutral
+dot_kernel	cache_resident/dim=1536/median_ms	5	5	0.212	0.214	0.112	0.115	0.5283	0.5374	Improved	Improved
+dot_kernel	cache_resident/dim=1536/ns_per_dot	5	5	105.83	107.12	55.79	57.28	0.5272	0.5347	Improved	Improved
+dot_kernel	cache_resident/dim=384/median_ms	5	5	0.152	0.155	0.152	0.155	1.0000	1.0000	Neutral	Neutral
+dot_kernel	cache_resident/dim=384/ns_per_dot	5	5	18.1	18.47	18.11	18.5	1.0006	1.0016	Neutral	Neutral
+dot_kernel	cache_resident/dim=768/median_ms	5	5	0.186	0.192	0.12	0.124	0.6452	0.6458	Improved	Improved
+dot_kernel	cache_resident/dim=768/ns_per_dot	5	5	44.29	45.65	28.49	29.55	0.6433	0.6473	Improved	Improved
+dot_kernel	diagnostic_ab/simd_vs_scalar_ratio	5	5	0.176	0.178	0.112	0.115	0.6364	0.6461	Improved	Improved
+
+# skipped (present on one side only)
+side_only	workload	metric	n	min	median

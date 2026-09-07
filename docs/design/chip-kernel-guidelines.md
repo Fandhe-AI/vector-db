@@ -341,7 +341,12 @@ dot カーネル変更（#517・実装は #518。前後比較・閾値候補実�
 定義し、本 doc へはポインタのみを残す（行ブロックカーネル〔#510・#511〕の
 対象区間 `S5_search_parallel` ↔ 参照区間 `S1_redb_scan` 対応と実測は
 Issue #512・`docs/design/dot-kernel-multi-accumulator.md`「行間再利用
-（Issue #512）」節参照）。
+（Issue #512）」節参照）。Phase 4 通しの前後比較実測では、参照区間
+（`S1_redb_scan`／`S2_header_decode`）自体が本開発環境（共有 QEMU）で
+±23〜46% の run-to-run 変動を示すことを確認した——固定 ±5% 帯を大きく
+超えるノイズ床であり、対象区間の ratio 解釈にはこのノイズ床を織り込む
+必要がある。詳細は [`phase4-chip-before-after.md`](phase4-chip-before-after.md)
+§3.3 参照。
 
 ### 7.4 `summary.json` キー一覧
 
@@ -382,7 +387,11 @@ Issue #512・`docs/design/dot-kernel-multi-accumulator.md`「行間再利用
 各小節共通の注記: 本開発環境（QEMU）の値は参考値であり production 変更の
 採否根拠にしない（`docs/design/benchmark-judgement-policy.md` §5）。macOS 上の
 `is_aarch64_feature_detected!` の実効性（true/false の実機確認）は Issue #468
-（§8 参照）の担当。Phase 4 通しのチップ別前後比較・最速判定は Issue #530 の担当。
+（§8 参照）の担当。Phase 4 通しのチップ別前後比較・最速判定は Issue #530 で
+ドライバ（`scripts/bench_chip_ab.sh`・`make bench-chip-ab`）・記録テンプレート・
+本開発環境（QEMU）参考値を整備済み——詳細は
+[`phase4-chip-before-after.md`](phase4-chip-before-after.md) 参照。3 チップ実機の
+実測値そのものは引き続きオーナー申し送り（同 doc §7.3・§9.2）。
 
 ### 7.6 本環境での完走記録（参考値）
 
@@ -447,7 +456,9 @@ Phase 4（#459）の Apple 向け i8 経路（#520〜#525）・f16 経路（#513
 手順、(c) 本開発環境（QEMU x86_64）での同一ドライバの完走確認（x86 参考値）
 までであり、**Apple 実機での実測値そのものはオーナー申し送り**（下記
 7.7.7 参照）。Phase 4 通しの 3 チップ比較・`vector_knn` crossdb 再計測は
-Issue #530 の担当。
+Issue #530 で実施済み（ドライバ整備・本開発環境参考値まで。3 チップ実機
+実測はオーナー申し送りのまま）——詳細は
+[`phase4-chip-before-after.md`](phase4-chip-before-after.md) 参照。
 
 #### 7.7.2 手順（オーナー向け）
 
