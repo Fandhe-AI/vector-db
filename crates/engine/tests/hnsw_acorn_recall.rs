@@ -276,16 +276,41 @@ fn run_regime_sweep(
 
     const K: usize = 10;
     const QUERIES: usize = 20;
+    // `gen_clustered_corpus` が割り当てるクラスタ数（`seed_bucketed_fixture`
+    // の呼び出しに合わせた固定値）。可視集合内の行を「等間隔の行番号」で
+    // 選ぶと `rows / QUERIES` がクラスタ数の倍数になりやすく、全クエリが
+    // 単一クラスタへ偏る（codex-review 指摘）。可視な行をクラスタ別に
+    // 集計しラウンドロビンで選ぶことで、可視クラスタを横断した決定的な
+    // クエリ選択にする。
+    const CLUSTERS: usize = 6;
+    let mut by_cluster: Vec<Vec<usize>> = vec![Vec::new(); CLUSTERS];
+    for idx in 0..rows {
+        if (idx as u32).is_multiple_of(denominator) {
+            by_cluster[idx % CLUSTERS].push(idx);
+        }
+    }
+    let mut candidate_indices: Vec<usize> = Vec::with_capacity(QUERIES);
+    let mut cursor = [0usize; CLUSTERS];
+    'select: loop {
+        let mut progressed = false;
+        for (c, bucket) in cursor.iter_mut().zip(by_cluster.iter()) {
+            if candidate_indices.len() >= QUERIES {
+                break 'select;
+            }
+            if let Some(&idx) = bucket.get(*c) {
+                candidate_indices.push(idx);
+                *c += 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
     let mut total_hits = 0usize;
     let mut queried = 0usize;
-    for i in 0..QUERIES {
-        // `bucket='b0'` の行のみをクエリ元にする（可視集合内のクエリの方が
-        // Recall 判定として自然——不可視行をクエリ元にしても SQL 表層の
-        // 判定には影響しないが、実運用に近い形にする）。
-        let candidate_idx = i * (rows / QUERIES);
-        if !(candidate_idx as u32).is_multiple_of(denominator) {
-            continue;
-        }
+    for &candidate_idx in &candidate_indices {
         queried += 1;
         let query = &vectors[candidate_idx];
         let sql = format!(

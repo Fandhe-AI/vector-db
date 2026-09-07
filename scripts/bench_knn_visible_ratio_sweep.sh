@@ -53,6 +53,25 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# ACORN-1（Issue #501・#502）の観測行（`arm expected=`／`acorn(delta)`）は
+# 本 Issue で追加した任意項目であり、それ以前に保存されたログには一切
+# 出現しない。`grep` は一致行が無いと exit 1 を返すため、`set -euo pipefail`
+# 下ではそのまま呼ぶと既存ログの集計自体が失敗扱いになってしまう
+# （codex-review 指摘）。一致行なし（exit 1）は正常終了として扱い、
+# ファイル読み取りエラー等（exit 2 以上）は従来どおり失敗として扱う。
+summarize_optional_grep() {
+  local pattern="$1" sed_expr="$2" out status=0
+  out="$(grep -H "${pattern}" "${DIR}"/*.log 2>&1)" || status=$?
+  case "${status}" in
+    0) printf '%s\n' "${out}" | sed -E "${sed_expr}" ;;
+    1) : ;; # 一致行なし（任意項目のため許容）
+    *)
+      printf '%s\n' "${out}" >&2
+      exit "${status}"
+      ;;
+  esac
+}
+
 if [ "${1:-}" = "--summarize" ]; then
   DIR="${2:?usage: $0 --summarize <dir>}"
   # 各ログの `stage(S0_hot_where_subset): ... median=<N>ms` 行を
@@ -62,10 +81,8 @@ if [ "${1:-}" = "--summarize" ]; then
     sed -E 's#.*/([^/]+)\.log:stage\(S0_hot_where_subset\): rows=([0-9]+) median=([0-9.]+)ms.*#\1 rows=\2 median=\3ms#'
   # ACORN-1（Issue #501・#502）の観測 arm・発火回数（`--summarize` 一覧に
   # レイテンシと並べて転記できるよう、同じログファイル名を先頭に付与する）。
-  grep -H "arm expected=" "${DIR}"/*.log | \
-    sed -E 's#.*/([^/]+)\.log:knn_profile_bench: (arm expected=.*)#\1 \2#'
-  grep -H "acorn(delta)" "${DIR}"/*.log | \
-    sed -E 's#.*/([^/]+)\.log:knn_profile_bench: (acorn\(delta\).*)#\1 \2#'
+  summarize_optional_grep "arm expected=" 's#.*/([^/]+)\.log:knn_profile_bench: (arm expected=.*)#\1 \2#'
+  summarize_optional_grep "acorn(delta)" 's#.*/([^/]+)\.log:knn_profile_bench: (acorn\(delta\).*)#\1 \2#'
   exit 0
 fi
 
