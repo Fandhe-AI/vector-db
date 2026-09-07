@@ -1072,11 +1072,9 @@ fn try_scalar_index_aggregate(
                     // 採取自体が確定的に失敗（容量超過・復号不能・NULL 行混在
                     // 等）。世代が進むまでは再試行しても同じ結果になるため
                     // 記録する（codex-review P2 対応）。
-                    scalar_access.cache.mark_capture_unbuildable(
-                        scalar_access.storage,
-                        &bound.table,
-                        ctx,
-                    );
+                    scalar_access
+                        .cache
+                        .mark_capture_unbuildable(read_txn, &bound.table, ctx);
                     scalar_access.cache.record_aggregate_plain_scan_fallback();
                     return Ok(None);
                 }
@@ -1162,7 +1160,7 @@ pub(crate) fn ensure_scalar_index_snapshot(
             None => {
                 scalar_access
                     .cache
-                    .mark_capture_unbuildable(scalar_access.storage, table, ctx);
+                    .mark_capture_unbuildable(read_txn, table, ctx);
                 return None;
             }
         };

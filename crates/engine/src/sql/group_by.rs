@@ -62,6 +62,73 @@ const MAX_GROUP_KEY_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 /// （[`MAX_GROUP_KEY_TOTAL_BYTES`] と同じ予算規模を採用）。
 const MAX_TEXT_ACCUMULATOR_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
+/// PR #603 codex-review P1 指摘対応: [`accumulate_row`] が TEXT 集計容量超過を
+/// 報告する際の固定 detail 文言。索引経路（[`observe_group_enumeration`]・
+/// [`observe_candidate_slots_grouped`]）がこの文言かどうかで
+/// 「全走査へフォールバックすべき容量超過」（索引の走査順に依存する一時的な
+/// 超過）と、それ以外の `SqlSurfaceError`（走査順に依存しない即時失敗）とを
+/// 区別するために使う（[`is_text_accumulator_budget_error`] 参照）。
+const TEXT_BUDGET_EXCEEDED_DETAIL: &str =
+    "GROUP BY TEXT aggregate state exceeds the allowed total size";
+/// 同上。`checked_add` のオーバーフロー（実運用では到達しないが `usize` 境界を
+/// 明示的に扱うための防御）側の detail 文言。
+const TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL: &str =
+    "GROUP BY TEXT aggregate size accounting overflowed";
+
+/// PR #603 codex-review P1 指摘対応: `err` が [`accumulate_row`] の TEXT 集計
+/// 容量超過（[`TEXT_BUDGET_EXCEEDED_DETAIL`]／[`TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL`]）
+/// かどうかを判定する。
+///
+/// `GROUP BY` を `ScalarIndex` 経由で処理する索引経路（列挙形・候補走査形）は
+/// キー順・候補の索引内順序で行を処理するため、全走査（`user_rows/{table}` の
+/// 物理行順）と処理順序が異なる。`MIN`/`MAX(TEXT)` の縮小方向更新
+/// （[`accumulate_row`] の `before`/`after` 比較）を含む累計バイト数は
+/// 非単調（増加も減少もありうる）であり、その一時的な最大値は処理順序に
+/// 依存する。そのため、全走査なら成功するクエリが索引経路の処理順序では
+/// 一時的に予算を超過し `54000` として失敗しうる——索引選択によってクエリの
+/// 成否が変わってはならない（AGENTS.md「公開 API・エラー契約の互換性」）ため、
+/// 索引経路の呼び出し元はこの超過を検出したら索引経路の結果を破棄し、全走査
+/// （処理順序に依存しない基準実装）へフォールバックする（[`execute_grouped_aggregate`]
+/// 参照）。
+///
+/// 一方、[`check_new_group_budget`] が管理するグループ数・キーバイト数の予算は
+/// 加算のみで減算されない（単調増加）ため、その一時的な最大値は最終合計以下に
+/// 抑えられ処理順序に依存しない。したがって当該予算超過はこの判定の対象に含めず、
+/// 索引経路・全走査のいずれでも同一の即時失敗として扱ってよい。
+fn is_text_accumulator_budget_error(err: &SqlSurfaceError) -> bool {
+    matches!(
+        err,
+        SqlSurfaceError::PayloadTooLarge { detail }
+            if detail == TEXT_BUDGET_EXCEEDED_DETAIL
+                || detail == TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL
+    )
+}
+
+/// PR #603 codex-review P1 指摘対応: [`observe_candidate_slots_grouped`] 内部
+/// （候補走査形。索引の候補順に依存する処理順序を持つ）専用のエラー型。
+/// [`is_text_accumulator_budget_error`] による TEXT 集計容量超過とそれ以外の
+/// `SqlSurfaceError` を、`?` 演算子で自然に伝播させつつ区別する
+/// （[`From<SqlSurfaceError>`] で自動変換されるため、内部実装は既存どおり `?`
+/// を使うだけでよい）。
+enum GroupAccumulateError {
+    /// キー順・候補順に依存する一時的な TEXT 集計容量超過（[`observe_group_enumeration`]
+    /// の同名ドキュメント参照）。呼び出し元は索引経路の途中結果を破棄し全走査へ
+    /// フォールバックする。
+    TextBudgetExceeded,
+    /// それ以外の `SqlSurfaceError`（走査順に依存しない即時失敗）。そのまま伝播する。
+    Other(SqlSurfaceError),
+}
+
+impl From<SqlSurfaceError> for GroupAccumulateError {
+    fn from(err: SqlSurfaceError) -> Self {
+        if is_text_accumulator_budget_error(&err) {
+            GroupAccumulateError::TextBudgetExceeded
+        } else {
+            GroupAccumulateError::Other(err)
+        }
+    }
+}
+
 /// グループキー（`GROUP BY` 対象列の値）。`None` は NULL 値のグループ（`TEXT` 列の
 /// NULL は 1 つのグループへまとめる。PostgreSQL 互換）。`Ord` はバイト順、`None` は
 /// 常に末尾（既定の昇順ソート・[`crate::sql::exec::ColumnMeta`] へ渡す前の表示順を
@@ -170,13 +237,11 @@ fn accumulate_row(
             *total_text_accumulator_bytes = total_text_accumulator_bytes
                 .checked_add(delta)
                 .ok_or_else(|| {
-                    SqlSurfaceError::payload_too_large(
-                        "GROUP BY TEXT aggregate size accounting overflowed",
-                    )
+                    SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
                 })?;
             if *total_text_accumulator_bytes > MAX_TEXT_ACCUMULATOR_TOTAL_BYTES {
                 return Err(SqlSurfaceError::payload_too_large(
-                    "GROUP BY TEXT aggregate state exceeds the allowed total size",
+                    TEXT_BUDGET_EXCEEDED_DETAIL,
                 ));
             }
         } else if after < before {
@@ -204,9 +269,13 @@ fn accumulate_row(
 /// ドキュメント参照）であり、一部の値だけを取りこぼして索引を返すことはない。
 /// `Ok(false)` は列挙形が使えない（`GROUP BY` キー列が `TEXT` でない・未索引・
 /// NULL 補完不能）ことを示し、呼び出し元は全走査へフォールバックする。
-/// `MAX_GROUPS`／`MAX_GROUP_KEY_TOTAL_BYTES`／`MAX_TEXT_ACCUMULATOR_TOTAL_BYTES`
-/// の予算超過は（全走査と同じく）`Err`（`54000`）として伝播する——索引が
-/// 使えたかどうかに関わらずクエリの容量契約は変えない。
+/// `MAX_GROUPS`／`MAX_GROUP_KEY_TOTAL_BYTES` の予算超過は（全走査と同じく）
+/// `Err`（`54000`）として伝播する——索引が使えたかどうかに関わらずクエリの
+/// 容量契約は変えない。ただし `MAX_TEXT_ACCUMULATOR_TOTAL_BYTES` の超過
+/// （[`is_text_accumulator_budget_error`]）に限っては、キー順の列挙が全走査の
+/// 物理行順と異なる一時的な超過を誤検出しうるため `Err` を伝播せず、
+/// 索引経路の途中結果を破棄して `Ok(false)`（全走査へフォールバック）を返す
+/// （PR #603 codex-review P1 指摘対応）。
 #[allow(clippy::too_many_arguments)]
 fn observe_group_enumeration(
     snapshot: &crate::sql::arena_cache::SqlArenaSnapshot,
@@ -237,7 +306,7 @@ fn observe_group_enumeration(
         let current_group_count = string_groups.len() + usize::from(null_group.is_some());
         check_new_group_budget(current_group_count, total_key_bytes, value.len())?;
         let mut accs = new_accumulators(&bound.items)?;
-        observe_group_slots(
+        match observe_group_slots(
             snapshot,
             slots,
             schema,
@@ -245,14 +314,28 @@ fn observe_group_enumeration(
             referenced,
             &mut accs,
             total_text_accumulator_bytes,
-        )?;
+        ) {
+            Ok(()) => {}
+            Err(err) if is_text_accumulator_budget_error(&err) => {
+                // PR #603 codex-review P1 指摘対応: キー順の列挙による一時的な
+                // TEXT 容量超過の誤検出。ここまでに構築した索引経路の途中結果
+                // （このグループを含め）を破棄し、呼び出し元に全走査への
+                // フォールバックを促す。
+                string_groups.clear();
+                *null_group = None;
+                *total_key_bytes = 0;
+                *total_text_accumulator_bytes = 0;
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        }
         string_groups.insert(try_clone_str(value)?, accs);
     }
     if !null_slots.is_empty() {
         let current_group_count = string_groups.len() + usize::from(null_group.is_some());
         check_new_group_budget(current_group_count, total_key_bytes, 0)?;
         let mut accs = new_accumulators(&bound.items)?;
-        observe_group_slots(
+        match observe_group_slots(
             snapshot,
             &null_slots,
             schema,
@@ -260,7 +343,17 @@ fn observe_group_enumeration(
             referenced,
             &mut accs,
             total_text_accumulator_bytes,
-        )?;
+        ) {
+            Ok(()) => {}
+            Err(err) if is_text_accumulator_budget_error(&err) => {
+                string_groups.clear();
+                *null_group = None;
+                *total_key_bytes = 0;
+                *total_text_accumulator_bytes = 0;
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        }
         *null_group = Some(accs);
     }
     Ok(true)
@@ -330,6 +423,15 @@ fn observe_group_slots(
 /// できないため、`matches_all`・式述語（`classify_scalar_plan` の gate により
 /// `expr_filters` は常に `id` 単純比較のみ）を候補行にも再適用する
 /// （`aggregate.rs::observe_candidate_slots` と同じ多層防御）。
+///
+/// `Ok(true)` は候補走査形を最後まで使えたことを示す。`Ok(false)` は
+/// [`is_text_accumulator_budget_error`] が指す走査順依存の一時的な TEXT 集計
+/// 容量超過を検出したことを示し、`string_groups`／`null_group`／
+/// `total_key_bytes`／`total_text_accumulator_bytes` はすべて呼び出し前の
+/// 空状態へ戻したうえで返す——呼び出し元は全走査へフォールバックする
+/// （PR #603 codex-review P1 指摘対応。走査順に依存しないそれ以外の予算超過
+/// （`MAX_GROUPS`／`MAX_GROUP_KEY_TOTAL_BYTES`）は従来どおり `Err`（`54000`）
+/// として伝播する）。
 #[allow(clippy::too_many_arguments)]
 fn observe_candidate_slots_grouped(
     snapshot: &crate::sql::arena_cache::SqlArenaSnapshot,
@@ -342,7 +444,46 @@ fn observe_candidate_slots_grouped(
     null_group: &mut Option<Vec<Accumulator>>,
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
-) -> Result<(), SqlSurfaceError> {
+) -> Result<bool, SqlSurfaceError> {
+    match observe_candidate_slots_grouped_inner(
+        snapshot,
+        slots,
+        schema,
+        bound,
+        referenced,
+        group_by,
+        string_groups,
+        null_group,
+        total_key_bytes,
+        total_text_accumulator_bytes,
+    ) {
+        Ok(()) => Ok(true),
+        Err(GroupAccumulateError::TextBudgetExceeded) => {
+            string_groups.clear();
+            *null_group = None;
+            *total_key_bytes = 0;
+            *total_text_accumulator_bytes = 0;
+            Ok(false)
+        }
+        Err(GroupAccumulateError::Other(err)) => Err(err),
+    }
+}
+
+/// [`observe_candidate_slots_grouped`] の実処理本体。`?` は
+/// [`GroupAccumulateError::from`] により `SqlSurfaceError` から自動変換される。
+#[allow(clippy::too_many_arguments)]
+fn observe_candidate_slots_grouped_inner(
+    snapshot: &crate::sql::arena_cache::SqlArenaSnapshot,
+    slots: &[u32],
+    schema: &TableSchema,
+    bound: &BoundAggregate,
+    referenced: &ReferencedColumns,
+    group_by: &crate::sql::parser::BoundGroupBy,
+    string_groups: &mut BTreeMap<String, Vec<Accumulator>>,
+    null_group: &mut Option<Vec<Accumulator>>,
+    total_key_bytes: &mut usize,
+    total_text_accumulator_bytes: &mut usize,
+) -> Result<(), GroupAccumulateError> {
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
     'candidates: for &slot in slots {
@@ -357,11 +498,9 @@ fn observe_candidate_slots_grouped(
             .get(slot_idx)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let scanned = row_codec::scan_scalar_columns_masked(
-            schema,
-            metadata,
-            Some(referenced.scalar_mask()),
-        )?;
+        let scanned =
+            row_codec::scan_scalar_columns_masked(schema, metadata, Some(referenced.scalar_mask()))
+                .map_err(SqlSurfaceError::from)?;
 
         if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
             continue;
@@ -378,9 +517,9 @@ fn observe_candidate_slots_grouped(
                 ExprValue::Bool(true) => {}
                 ExprValue::Bool(false) => continue 'candidates,
                 _ => {
-                    return Err(SqlSurfaceError::invalid_input(
+                    return Err(GroupAccumulateError::Other(SqlSurfaceError::invalid_input(
                         "WHERE expression did not evaluate to a boolean",
-                    ))
+                    )))
                 }
             }
         }
@@ -680,7 +819,7 @@ pub(crate) fn execute_grouped_aggregate(
                         if let crate::sql::scalar_index::CandidateResolution::Use(slots) =
                             index.resolve_candidates(&bound.metadata_filters, &id_preds)
                         {
-                            observe_candidate_slots_grouped(
+                            used_index_path = observe_candidate_slots_grouped(
                                 &snapshot,
                                 &slots,
                                 schema,
@@ -692,7 +831,6 @@ pub(crate) fn execute_grouped_aggregate(
                                 &mut total_key_bytes,
                                 &mut total_text_accumulator_bytes,
                             )?;
-                            used_index_path = true;
                         }
                     }
                     if used_index_path {

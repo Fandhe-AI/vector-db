@@ -1239,13 +1239,22 @@ impl ScalarIndexCache {
     /// させられるよう記録する。テーブル世代の読み取りに失敗した場合は記録
     /// せず終える（fail-closed。記録できなくても呼び出し元の集計クエリ自体
     /// は全走査へフォールバック済みで正しさに影響しない）。
+    ///
+    /// PR #603 codex-review P2 指摘対応: 記録する世代は、実際に採取（全走査）
+    /// を試みた**その** `read_txn` のスナップショット世代
+    /// （`catalog::table_generation_in_txn`）でなければならない。以前は
+    /// `Storage::table_generation`（最新コミット世代）を使っていたため、採取中
+    /// に別トランザクションがコミットすると世代 `G` での採取失敗が `G+1` へ
+    /// 誤記録されることがあった（[`Self::is_capture_known_unbuildable`] は
+    /// `read_txn` のスナップショット世代と突き合わせるため、この不一致により
+    /// 実際には構築可能な `G+1` の採取が次の更新までスキップされてしまう）。
     pub(crate) fn mark_capture_unbuildable(
         &self,
-        storage: &Storage,
+        read_txn: &redb::ReadTransaction,
         table: &str,
         ctx: &PolicyContext,
     ) {
-        let Ok(generation) = storage.table_generation(table) else {
+        let Ok(generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
             return;
         };
         let Ok(mut guard) = self.state.write() else {
@@ -1915,9 +1924,8 @@ mod tests {
             !cache.is_capture_known_unbuildable(&read_txn, "docs", &ctx_a),
             "no record yet must not be treated as known-unbuildable"
         );
+        cache.mark_capture_unbuildable(&read_txn, "docs", &ctx_a);
         drop(read_txn);
-
-        cache.mark_capture_unbuildable(&storage, "docs", &ctx_a);
 
         let read_txn = storage.db().begin_read().expect("begin read");
         assert!(
@@ -1935,6 +1943,46 @@ mod tests {
         insert(&storage, &ctx_a, 2, Some("y"), None, Visibility::Public);
         let read_txn2 = storage.db().begin_read().expect("begin read");
         assert!(!cache.is_capture_known_unbuildable(&read_txn2, "docs", &ctx_a));
+    }
+
+    // PR #603 codex-review P2 指摘対応: `mark_capture_unbuildable` は採取に
+    // 実際に使った `read_txn`（世代 G）のスナップショット世代で記録しなけれ
+    // ばならない。採取中（`read_txn` を開いた後、`mark_capture_unbuildable`
+    // を呼ぶまでの間）に別トランザクションがコミットして世代が G+1 へ進んで
+    // も、記録は G のまま——`Storage::table_generation`（最新コミット世代）を
+    // 使っていた旧実装ではここで G+1 が誤記録され、実際には構築可能な G+1 の
+    // 採取が次の更新まで誤ってスキップされていた。
+    #[test]
+    fn capture_unbuildable_memo_records_read_txn_generation_not_latest_commit() {
+        let path = unique_db_path("scalar-index-cache-unbuildable-stale-txn");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let ctx_a = ctx("tenant-a");
+        insert(&storage, &ctx_a, 1, Some("x"), None, Visibility::Public);
+
+        let cache = ScalarIndexCache::new();
+
+        // 採取に使った read_txn（世代 G）を開いたまま保持する。
+        let read_txn_g = storage.db().begin_read().expect("begin read");
+
+        // 採取中（read_txn_g を開いた後）に別トランザクションがコミットし、
+        // テーブル世代が G+1 へ進む（並行書き込みを模す）。
+        insert(&storage, &ctx_a, 2, Some("y"), None, Visibility::Public);
+
+        // 採取失敗を、採取に実際に使った read_txn_g（世代 G）で記録する。
+        cache.mark_capture_unbuildable(&read_txn_g, "docs", &ctx_a);
+        drop(read_txn_g);
+
+        // 世代 G+1（コミット済み最新）のスナップショットでは記録が一致せず、
+        // 誤ってミスとして扱われない（＝再試行が許される）ことを確認する。
+        let read_txn_g_plus_1 = storage.db().begin_read().expect("begin read");
+        assert!(
+            !cache.is_capture_known_unbuildable(&read_txn_g_plus_1, "docs", &ctx_a),
+            "the memo must be keyed by the read_txn's own generation (G), \
+             not the latest committed generation (G+1) observed after it started"
+        );
+        drop(read_txn_g_plus_1);
     }
 
     #[test]
