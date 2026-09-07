@@ -598,7 +598,7 @@ make bench-knn-precision-resident  # 同じスクリプトの AB_CANDIDATE_ENGIN
 
 実測結果・判断は `docs/design/hnsw-f16-resident.md`「Issue #516 追記」節を参照してください。
 
-HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳・`repair_reachability` 修復統計〔Issue #447〕）・`make bench-hnsw-compare`（usearch との構築時間・Recall@10・探索レイテンシ比較。L2 正規化コーパス方式を維持）で実測できます。いずれも手動専用ベンチで CI 非配線です。詳細・実測値は `docs/design/hnsw-parallel-build.md` を参照してください。
+HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳・`repair_reachability` 修復統計〔Issue #447〕）・`make bench-hnsw-compare`（usearch との構築時間・Recall@10・探索レイテンシ比較。L2 正規化コーパス方式を維持）で実測できます。いずれも手動専用ベンチで CI 非配線です。`repair_reachability` の発生抑制（Issue #448）・逐次段の並列化（Issue #449）・100k 点フルラダーでの前後比較実測と Recall 非劣化検証（Issue #450）で `repair` 段が threads=12 で約 12.5 倍短縮したことを確認済みです。詳細・実測値は `docs/design/hnsw-parallel-build.md`・`docs/design/ann-recall-gate-verification.md` を参照してください。
 
 ANN opt-in 経路に積み上がった探索メモリ局所性・構築並列化・フィルタ付き探索の各施策（#486〜#507）を通しで前後比較した実測は `docs/design/hnsw-phase3-before-after.md` を参照してください（Issue #507。before/after を `bench-hnsw-compare`〔N=5 ペア・rows=20,000 縮小構成〕、`bench-knn-profile`〔共有環境のリソース逼迫により N=1 ペア〕、`feature_bench`〔hnsw opt-in の 1 arm のみ N=3 ペア〕、Recall 3 ゲート層 B〔決定的コーパスのためペア測定対象外〕という対象別に異なる実施条件で計測。共有 QEMU 環境の参考値・採否根拠にしない。再現手順は同 doc §9）。
 
