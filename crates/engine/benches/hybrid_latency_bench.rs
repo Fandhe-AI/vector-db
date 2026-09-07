@@ -91,8 +91,14 @@ mod temp_db;
 /// `RrfConfig::default().pool_depth() * 2`（初回 `fetch_k` = 400）と偶然一致し、
 /// 通常コーパスでも初回呼び出しで可視集合全体を取り切ってしまい再取得ループの
 /// 有無を比較できない。本ベンチは初回 `fetch_k` を上回る規模にして
-/// 「再取得の余地がある」条件を保つ。
-const SMALL_NUM_DOCS: usize = 1_000;
+/// 「再取得の余地がある」条件を保つ。加えて `sql::hnsw_cache::MIN_INDEXED_ROWS`
+/// （1,024。ここでは複製せず参照するのみ）を上回る件数にする必要がある——
+/// SQL 表層（hnsw opt-in）計測モード（[`run_sql_surface_mode`]）はこの閾値
+/// 未満のコーパスでは構造的に索引を構築せず全件 brute-force へ縮退するため、
+/// `check_ann_non_vacuous` の `builds >= 1` 検証が常に失敗し、既定実行
+/// （`BENCH_HYBRID_LATENCY_ENGINE=hnsw`・`BENCH_HYBRID_LATENCY_SCALE=all`）が
+/// small ステージで fail-closed 終了してしまう（Cursor Bugbot 指摘・PR #622）。
+const SMALL_NUM_DOCS: usize = 1_200;
 /// 大規模段（`tests/hybrid_recall.rs` の大規模フィクスチャと同一件数。可視集合到達の
 /// 判定条件をそのまま流用できるようにする）。
 const LARGE_NUM_DOCS: usize = 20_000;

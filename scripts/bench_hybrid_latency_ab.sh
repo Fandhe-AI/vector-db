@@ -29,11 +29,16 @@
 #
 # `hnsw_410shape_tie2` の after 側のみ `BENCH_HYBRID_LATENCY_EXPECT_RESUMED=1`
 # を付与する（実測で確認済み: `hnsw_large_tie5`〔既定 QUANTIZE_LEVELS=5・
-# 20,000 件〕は初回 fetch_k で可視集合全体を取り切り hybrid_rounds_max=1
-# に留まるため、複数ラウンドに到達せず hybrid_resumed_rounds は構造的に
-# 常に 0 になる。`no_refetch` も同様に構造的に 0 が正しい挙動のため付与
-# しない。before 側は `hybrid_resumed_rounds` フィールド自体が無いため
-# 付与しない）。
+# 20,000 件〕は hybrid_rounds_max=1 に留まり複数ラウンドへ到達しないため
+# hybrid_resumed_rounds は構造的に常に 0 になる。`hybrid.rs` は境界の同点
+# グループが `TieBoundary::Resolved` になった時点で探索を終了するため、
+# `hybrid_rounds_max=1` は初回 fetch_k（400）が可視集合全体（20,000）を
+# 取り切ったことの証明にはならない（`dense_fetch_k` は可視集合全体を大きく
+# 下回ったまま Resolved した——原因の詳細は未確認。`docs/design/
+# hnsw-hybrid-iterative-scan.md`「前後比較実測（Issue #506）」節参照）。
+# `no_refetch` も同様に hybrid_rounds_max=1・resumed=0 が構造的に正しい
+# 挙動のため付与しない。before 側は `hybrid_resumed_rounds` フィールド
+# 自体が無いため付与しない）。
 #
 # 使い方:
 #   BEFORE_BIN=/path/to/before/hybrid_latency_bench \
@@ -88,9 +93,13 @@ condition_env() {
 }
 
 # after 側のみ EXPECT_RESUMED=1 を付ける条件。実測で確認済み: `hnsw_large_tie5`
-# （20,000 件・dim=32・vocab=256・QUANTIZE_LEVELS=5）は密側初回 fetch_k（400）で
-# 可視集合全体を取り切り hybrid_rounds_max=1（複数ラウンドに到達しない）ため
-# hybrid_resumed_rounds は構造的に常に 0 になる——`hnsw_410shape_tie2`
+# （20,000 件・dim=32・vocab=256・QUANTIZE_LEVELS=5）は hybrid_rounds_max=1
+# に留まる（複数ラウンドに到達しない）ため hybrid_resumed_rounds は構造的に
+# 常に 0 になる。`hybrid_rounds_max=1` は境界の同点グループが
+# `TieBoundary::Resolved` になった時点での探索終了であり、密側初回
+# fetch_k（400）が可視集合全体（20,000）を取り切ったことの証明では
+# ない（原因の詳細は未確認。`docs/design/hnsw-hybrid-iterative-scan.md`
+# 参照）——`hnsw_410shape_tie2`
 # （Issue #410 fixture 形状。4,000 件・dim=16・vocab=64・QUANTIZE_LEVELS=2）
 # のみが実測で複数ラウンド（hybrid_rounds_max=4）・再開型経路の発火
 # （hybrid_resumed_rounds>0）を安定して示す。`hnsw_large_uniform` は
@@ -209,8 +218,19 @@ for cond in $conditions; do
             } > "$log"
             expect_resumed=0
             [ "$side" = "after" ] && expect_resumed="$expect_resumed_after"
+            # `-u` で親環境から継承しうる固定条件用 env（コーパス形状に直結する
+            # NUM_DOCS/DIM/VOCAB_SIZE/QUANTIZE_LEVELS）を一旦クリアしてから
+            # `$env_pairs`（条件ごとの上書き。`hnsw_410shape_tie2` のみ 4 変数を
+            # 明示指定・他 3 条件は無指定のままベンチ既定値を使う）を適用する。
+            # 親シェルでこれらを export した状態のまま実行すると、条件名が
+            # 想定する形状（例: `hnsw_large_tie5` は QUANTIZE_LEVELS=5）と実際の
+            # 計測条件（親環境の export 値）が食い違いうる（codex-review P2
+            # 指摘・PR #622）。
+            echo "env: $env_pairs BENCH_HYBRID_LATENCY_EXPECT_RESUMED=$expect_resumed" >> "$log"
             # shellcheck disable=SC2086
-            env $env_pairs BENCH_HYBRID_LATENCY_EXPECT_RESUMED="$expect_resumed" \
+            env -u BENCH_HYBRID_LATENCY_NUM_DOCS -u BENCH_HYBRID_LATENCY_DIM \
+                -u BENCH_HYBRID_LATENCY_VOCAB_SIZE -u BENCH_HYBRID_LATENCY_QUANTIZE_LEVELS \
+                $env_pairs BENCH_HYBRID_LATENCY_EXPECT_RESUMED="$expect_resumed" \
                 "$bin" >> "$log" 2>&1
             echo "bench_hybrid_latency_ab: $cond pair=$pair side=$side done -> $log"
         done

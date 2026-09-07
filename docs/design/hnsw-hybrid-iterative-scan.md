@@ -999,8 +999,8 @@ after 側のみ・`hybrid_dense_searches` 中の内数）:
 
 | 条件 | after `hybrid_resumed_rounds` | 解釈 |
 | ---- | ---- | ---- |
-| `hnsw_large_uniform` | 0 | `no_refetch` は初回ラウンドで可視集合全体を取り切り複数ラウンドに到達しないため構造的に 0（正しい挙動） |
-| `hnsw_large_tie5` | 0 | 20,000 件・QUANTIZE_LEVELS=5 では密側初回 `fetch_k`（400）で可視集合全体（`num_docs`）を上回り `hybrid_rounds_max=1` に留まる。同点誘発コーパスであっても本フィクスチャの規模・パラメータでは複数ラウンドへ到達しない（構造的に 0） |
+| `hnsw_large_uniform` | 0 | 実測（`hybrid_rounds_max=1`）は確認済み。`hybrid.rs` は境界（`pool_depth` 番目と `pool_depth+1` 番目）の同点グループが `TieBoundary::Resolved` になった時点で探索を終了する（`exhaustive` フラグ自体は `dense_fetch_k`（400）が可視集合全体（20,000）を下回るため false）ため、`hybrid_rounds_max=1` は初回 `fetch_k`（400）で可視集合全体を取り切ったことの証明にはならない。`no_refetch`（連続値・量子化なし）は境界の 2 件が厳密に同値になる確率が実質ゼロのため 1 ラウンドで `Resolved` すると推測されるが、ラウンド内訳ログは取得しておらず未確認（構造的に 0 が正しい挙動であること自体は変わらない） |
+| `hnsw_large_tie5` | 0 | 実測（`hybrid_rounds_max=1`）は確認済み。20,000 件・QUANTIZE_LEVELS=5 でも `dense_fetch_k`（400）は可視集合全体（20,000）を大きく下回るため、上記と同じ理由で「可視集合全体を取り切った」ことにはならない。同点誘発コーパスであるにもかかわらず 1 ラウンドで境界が確定した理由（同点グループが `pool_depth` 境界をまたがなかったのか、他の要因か）は未確認のまま。同点誘発コーパスであっても本フィクスチャの規模・パラメータでは複数ラウンドへ到達しない（構造的に 0）という結論自体は不変 |
 | `hnsw_410shape_tie2` | 180（5 run とも同一値。決定的） | 同点誘発コーパス・複数ラウンド（`hybrid_rounds_max=4`）に対し再開型経路が実際に発火することを固定 |
 
 `hnsw_large_tie5` が resumed=0 になる事実は `hybrid_latency_bench.rs::

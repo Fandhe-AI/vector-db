@@ -475,9 +475,13 @@ pub fn render_ann_stage_line(
 /// ANN opt-in 統計の非 vacuous 検証（Issue #412 設計判断 4 と同方針。
 /// `tests/fixtures/recall_engine.rs::SqlHybridFixture::assert_ann_non_vacuous`
 /// の bench 版）。`expect_resumed` は `tie_refetch` 条件の after 側計測にのみ
-/// `true` を渡す——`no_refetch` コーパスは初回ラウンドで可視集合全体を
-/// 取り切り複数ラウンドに到達しないため `hybrid_resumed_rounds == 0` が
-/// 正しい挙動であり、ここへ `true` を渡すと構造的に失敗する。
+/// `true` を渡す——`no_refetch` コーパスは `hybrid_rounds_max == 1` に留まり
+/// 複数ラウンドに到達しないため `hybrid_resumed_rounds == 0` が正しい挙動で
+/// あり、ここへ `true` を渡すと構造的に失敗する（`hybrid_rounds_max == 1` は
+/// `hybrid.rs` が境界の同点グループを `TieBoundary::Resolved` と判定した
+/// 時点での探索終了を意味するのみで、初回ラウンドが可視集合全体を取り切った
+/// ことの証明ではない。`docs/design/hnsw-hybrid-iterative-scan.md`「前後
+/// 比較実測（Issue #506）」節参照）。
 pub fn check_ann_non_vacuous(
     stats: AnnRoundStats,
     expect_resumed: bool,
