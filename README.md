@@ -26,7 +26,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 12.66〜12.79x 削減を確定的カウンタで確認し、ADR ステータスは Accepted）
 - **hybrid 検索の疎索引**: BM25 疎索引（`SparseIndex`）は転置索引（posting list）＋可視ビットマップ 1 パス走査方式で、RLS 可視集合へ統計（df・N・avgdl）自体を縮約する fail-closed 設計（posting へのスコアリング走査のみがコーパス文書数への線形走査から脱却し、可視集合走査 `O(|visible_ids|)`・スコアアキュムレータ初期化 `O(N)` は残る。詳細: [`docs/design/sparse-inverted-index.md`](docs/design/sparse-inverted-index.md)）
 - **ANN 索引（opt-in）**: 既定の検索エンジンは厳密最近傍（brute-force）のまま不変。`SearchEngineKind::Hnsw`（自作 HNSW・依存追加なし）を明示的に選択したときのみ opt-in で有効化される（ADR: [`docs/design/ann-index-adoption.md`](docs/design/ann-index-adoption.md) B 案）。適用状況は `EXPLAIN` の `engine:`／`ann_plan:` 行で確認できる。前後比較・opt-in 手順の詳細は下記「ANN（HNSW）opt-in 手順と前後比較（Issue #413）」節を参照。索引ノードの f16 常駐（`ResidentPrecision::F16`。既定 f32・opt-in）と F16C／NEON fp16 デコード付き dot カーネルは [`docs/design/hnsw-f16-resident.md`](docs/design/hnsw-f16-resident.md)（Issue #514）を参照
-- **他実装比較・チップ別カーネル設計指針**: 他実装のホットパス手法・採否候補・ライセンス帰属は [`docs/design/hotpath-implementation-survey.md`](docs/design/hotpath-implementation-survey.md)、チップ別設計指針と Rust stable での intrinsics 可用性は [`docs/design/chip-kernel-guidelines.md`](docs/design/chip-kernel-guidelines.md)（いずれも調査記録・採用決定は各 Phase Issue）。intrinsics 導入方針 ADR（unsafe 境界・set 構築ロード・ディスパッチ設計・toolchain 1.98・適用経路）は [`docs/design/simd-intrinsics-adoption.md`](docs/design/simd-intrinsics-adoption.md)（Issue #508・ステータス Proposed・オーナー承認待ち）。`isa.rs::dot_lanes` の零埋め固定長バッファによる分岐なし tail（AVX2／AVX-512／NEON。順序保存・既定経路は現行のスカラー tail のまま不変）は [`docs/design/dot-kernel-branchless-tail.md`](docs/design/dot-kernel-branchless-tail.md)（Issue #528。既定切替の採否は Issue #529）。`search_range` の 4 行ブロック（AVX2+FMA／AVX-512F／NEON）カーネルの設計・生成コード検査で判明した SLP 再パック問題と対処は [`docs/design/dot-kernel-row-block.md`](docs/design/dot-kernel-row-block.md)（Issue #510・#511 実装済み。前後比較は Issue #512・#530）
+- **他実装比較・チップ別カーネル設計指針**: 他実装のホットパス手法・採否候補・ライセンス帰属は [`docs/design/hotpath-implementation-survey.md`](docs/design/hotpath-implementation-survey.md)、チップ別設計指針と Rust stable での intrinsics 可用性は [`docs/design/chip-kernel-guidelines.md`](docs/design/chip-kernel-guidelines.md)（いずれも調査記録・採用決定は各 Phase Issue）。intrinsics 導入方針 ADR（unsafe 境界・set 構築ロード・ディスパッチ設計・toolchain 1.98・適用経路）は [`docs/design/simd-intrinsics-adoption.md`](docs/design/simd-intrinsics-adoption.md)（Issue #508・ステータス Proposed・オーナー承認待ち）。`isa.rs::dot_lanes` の零埋め固定長バッファによる分岐なし tail（AVX2／AVX-512／NEON。順序保存・既定経路は現行のスカラー tail のまま不変）は [`docs/design/dot-kernel-branchless-tail.md`](docs/design/dot-kernel-branchless-tail.md)（Issue #528。既定切替の採否は Issue #529 で dim 100／129／768 の前後比較実測により Rejected・現状維持確定。`BENCH_DOT_KERNEL_TAIL_AB=1 make bench-dot-kernel` で opt-in の tail A/B 実測を再現可能）。`search_range` の 4 行ブロック（AVX2+FMA／AVX-512F／NEON）カーネルの設計・生成コード検査で判明した SLP 再パック問題と対処は [`docs/design/dot-kernel-row-block.md`](docs/design/dot-kernel-row-block.md)（Issue #510・#511 実装済み。前後比較は Issue #512・#530）
 
 詳細なビヘイビア（106 件・12 領域）は spec リポの [`04-behavior/`](https://github.com/Fandhe-AI/vector-db-spec/tree/main/04-behavior) を唯一の正（SSOT）とします。
 
@@ -193,7 +193,7 @@ perf 系 ADR・Issue が個別に定めてきた計測規約（交互実行・�
 
 wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契約（成功系・fail-closed 系・RLS 不変）は `crates/wire-server/tests/wire_using_plan.rs`（`make ci` 対象）が決定的スタブで検証します。実 Ollama・実クライアント 3 種（psql／psycopg／pg）を使った PLAN-9 数値基準の実測ハーネスは本リポジトリでは未整備です（TASK-116 の `make bench-tier` と同様の運用者実行手順が必要になる見込み。整備は別タスクとして追跡してください）。
 
-**0 行時の切り分け**: `USING PLAN` が SQL エラーなしで 0 行を返す場合、まず `EXPLAIN SELECT ... USING PLAN(...)` の `mode`/`mode_source` を確認してください。`mode: precision` / `mode_source: planner_estimate` であれば確信度ゲート（SEARCH-9）による既知の空集合応答です（`USING MODE 'recall'` 等で明示上書きできます）。詳細な調査結果・再現手順は `docs/design/using-plan-precision-empty-result.md`（Issue #315）を参照してください。`EXPLAIN` は `engine`/`ann_plan`（ANN opt-in 時のみ `hnsw_params` も）行で使用エンジン・索引経路への適用有無（静的判定）も報告します（Issue #411・`docs/design/explain-search-engine-exposure.md` 参照）。
+**0 行時の切り分け**: `USING PLAN` が SQL エラーなしで 0 行を返す場合、まず `EXPLAIN SELECT ... USING PLAN(...)` の `mode`/`mode_source` を確認してください。`mode: precision` / `mode_source: planner_estimate` であれば確信度ゲート（SEARCH-9）による既知の空集合応答です（`USING MODE 'recall'` 等で明示上書きできます）。詳細な調査結果・再現手順は `docs/design/using-plan-precision-empty-result.md`（Issue #315）を参照してください。`EXPLAIN` は `engine`/`ann_plan`（ANN opt-in 時のみ `hnsw_params` も）行で使用エンジン・索引経路への適用有無（静的判定）も報告します（Issue #411・`docs/design/explain-search-engine-exposure.md` 参照）。`WHERE` の等価・前方一致・`id` 単純比較がスカラー列二次索引の候補削減へ結線されているかどうかは末尾の `scalar_plan` 行（`plain_scan`/`index_equality`/`index_prefix`/`index_id_range`/`index_conjunction`）で確認できます（Issue #474・`docs/design/scalar-index-prune.md` 参照）。
 
 ### 境界同点グループ再取得ループのレイテンシ計測（Issue #324）
 
@@ -402,7 +402,7 @@ env 変数（すべて fail-closed パース。不正値は非ゼロ終了）:
 
 ### GPU バッチ検索の規模スイープ（`make bench-gpu-scaling`）
 
-`engine::gpu_batch`（f16 常駐）と CPU-SIMD バッチ経路の規模 × バッチサイズ別比較を行います。`BENCH_GPU_SCALING_ROWS`／`DIMS`／`BATCH`／`TOPK`／`ITERS` で計測条件を上書きできます。GPU 実機必須・手動実行専用ベンチで CI 非配線です。実測結果は `docs/design/crossdb-bench.md`「GPU」節を参照してください。`gpu_scaling:` 結果行に続けて出力される `gpu_scaling_stats:` 行（Issue #537）は f16／f32 各経路の読み戻し統計（`partial_topk_dispatches`・`full_readback_dispatches`・1 呼び出しあたり readback バイト数）を表示し、`scripts/bench_gpu_scaling_ab.sh` の結果行 grep（`^gpu_scaling: rows=`）とは接頭辞を分離しているため既存 A/B 集計には混入しません。
+`engine::gpu_batch`（f16 常駐）と CPU-SIMD バッチ経路の規模 × バッチサイズ別比較を行います。`BENCH_GPU_SCALING_ROWS`／`DIMS`／`BATCH`／`TOPK`／`ITERS` で計測条件を上書きできます。GPU 実機必須・手動実行専用ベンチで CI 非配線です。実測結果は `docs/design/crossdb-bench.md`「GPU」節を参照してください。`gpu_scaling:` 結果行に続けて出力される `gpu_scaling_stats:` 行（Issue #537）は f16／f32 各経路の読み戻し統計（`partial_topk_dispatches`・`full_readback_dispatches`・1 呼び出しあたり readback バイト数、Issue #539 追加分の `f16_arith_dispatches`・`f16_arith_guard_fallbacks`）を表示し、`scripts/bench_gpu_scaling_ab.sh` の結果行 grep（`^gpu_scaling: rows=`）とは接頭辞を分離しているため既存 A/B 集計には混入しません。`Features::SHADER_F16` 対応アダプタ（本開発環境の RTX 3060 を含む）でも、f16 経路（読み出し直後に f32 へ拡張してから積和するため算術自体は f32）が自動的に選ばれるのは選択条件（アダプタが `SHADER_F16` に対応し、かつクエリの全成分が f16 として厳密往復可能・オーバーフロー／非正規化アンダーフローも生じないこと。`select_dot_shader`／`docs/design/gpu-batch-f16-arith.md` 参照）を満たす場合に限られ、満たさない場合は unpack 版へ fail-closed に縮退します。CORE-16 ゲート（`crates/engine/benches/batch_bench.rs::build_scaled_gate_dataset`）が生成するクエリは `rng.next_vector` による任意精度の f32 値で f16 丸めを行わないため、往復可能性ガードにより実際には unpack 版へ縮退することがあり、被検側（f16 常駐）が新シェーダを経由するとは限りません。実際にどちらの経路を通ったかは `GpuBatchStats`（`f16_arith_dispatches`／`f16_arith_guard_fallbacks`。`make bench-gpu-scaling` の `gpu_scaling_stats:` 行で確認可能。CORE-16 ゲート自体は本カウンタを出力しません）で確認する必要があります（前後比較・ゲートへの影響記録は Issue #540。詳細は `docs/design/gpu-batch-f16-arith.md` 参照）。
 
 ### Recall 回帰ハーネスの repo secrets（TASK-104）
 
@@ -522,6 +522,20 @@ BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 ```
 
 既定エンジン（brute-force）との前後比較・25k/100k の規模スケーリング実測・参照した外部実装（qdrant・pgvector・usearch）の既定値・損益分岐点についての所見は `docs/design/hnsw-index.md` を参照してください。
+
+`knn_profile_bench` にはさらに、可視比率 × 行数の損益分岐点スイープ（Issue #487。`hnsw_subset`〔SCALAR 事前フィルタ付き DISTANCE〕vs plain scan）専用の env があります（設定時は S1〜S5' を伴わない専用モードへ切り替わります）。
+
+- `BENCH_KNN_PROFILE_VISIBLE_RATIO`: `1/<N>`（`N` は正整数・上限 1,000）。未設定（既定）はスイープ無効
+- `BENCH_KNN_PROFILE_FULL_SCAN_RATIO`（`BENCH_KNN_PROFILE_ENGINE=hnsw` 限定）: `<num>/<den>`（`den>=1`・`num<=den`）で `ValidatedHnswParams::full_scan_ratio`（既定 1/10）を上書き
+- `BENCH_KNN_PROFILE_SCALE`: 正整数倍率。既定 1（25,000 行）。`BENCH_FEATURE_SCALE` と同じ上限方針
+
+```bash
+BENCH_KNN_PROFILE_VISIBLE_RATIO=1/4 BENCH_KNN_PROFILE_ENGINE=hnsw make bench-knn-profile
+BENCH_KNN_PROFILE_VISIBLE_RATIO=1/20 BENCH_KNN_PROFILE_ENGINE=hnsw BENCH_KNN_PROFILE_SCALE=4 make bench-knn-profile  # 100,000 行
+make bench-knn-visible-ratio  # 全比率 × 全行数 × 4 arm を交互 N ペアで実行（SWEEP_PAIRS で回数を上書き）
+```
+
+実測結果・判断は `docs/design/hnsw-rls-cardinality-switch.md`「可視比率 × 行数の損益分岐点実測（Issue #487）」を参照してください。
 
 HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳・`repair_reachability` 修復統計〔Issue #447〕）・`make bench-hnsw-compare`（usearch との構築時間・Recall@10・探索レイテンシ比較。L2 正規化コーパス方式を維持）で実測できます。いずれも手動専用ベンチで CI 非配線です。詳細・実測値は `docs/design/hnsw-parallel-build.md` を参照してください。
 
