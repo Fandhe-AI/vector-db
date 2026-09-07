@@ -109,17 +109,24 @@ if [ -n "${AB_CANDIDATE_ENGINES+x}" ]; then
     echo "ERROR: AB_CANDIDATE_ENGINES must list at least one candidate" >&2
     exit 1
   fi
-  declare -A SEEN_CANDIDATES=()
+  # 重複検出は連想配列（`declare -A`）を使わず、区切り文字付き文字列への
+  # 部分一致で行う（macOS 標準 `/bin/bash` 3.2 は連想配列未対応で
+  # `declare -A` が `invalid option` エラーとなり `set -e` で計測前に
+  # 停止するため。候補は許可リスト検証済みトークンのみで区切り文字
+  # `|` を含み得ないため、部分一致による誤検出は起きない）。
+  SEEN_CANDIDATES_STR="|"
   for cand in "${AB_CANDIDATES_ARR[@]}"; do
     if ! validate_candidate_token "${cand}"; then
       echo "ERROR: AB_CANDIDATE_ENGINES entries must be \"hnsw_f16\" or \"hnsw_i8\", got: ${cand}" >&2
       exit 1
     fi
-    if [ -n "${SEEN_CANDIDATES[${cand}]:-}" ]; then
-      echo "ERROR: AB_CANDIDATE_ENGINES contains duplicate entry: ${cand}" >&2
-      exit 1
-    fi
-    SEEN_CANDIDATES[${cand}]=1
+    case "${SEEN_CANDIDATES_STR}" in
+      *"|${cand}|"*)
+        echo "ERROR: AB_CANDIDATE_ENGINES contains duplicate entry: ${cand}" >&2
+        exit 1
+        ;;
+    esac
+    SEEN_CANDIDATES_STR="${SEEN_CANDIDATES_STR}${cand}|"
   done
 else
   AB_CANDIDATE_ENGINE="${AB_CANDIDATE_ENGINE:-hnsw_f16}"
