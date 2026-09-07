@@ -169,7 +169,7 @@ Graviton4／Grace は SVE2 でも 128 bit のため NEON と理論ピークが�
 | ---- | ---- |
 | f16 算術 | `Features::SHADER_F16`（Vulkan／Metal／DX12／WebGPU）。WGSL `enable f16;` |
 | i8 dot | WGSL `dot4I8Packed`／`dot4U8Packed`。naga が全 backend 実装（SPIR-V／HLSL／Metal は専用命令、他は polyfill）。専用命令化は DX12 SM≥6.4／Vulkan `VK_KHR_shader_integer_dot_product` |
-| `NATIVE_PACKED_INTEGER_DOT_PRODUCT` | wgpu 30.0.1 の `FeaturesWGPU` 定数一覧で未確認。実機 `adapter.features()` で要確認 |
+| `NATIVE_PACKED_INTEGER_DOT_PRODUCT` | wgpu-types 30.0.1 に該当 feature 定数が存在しないことを確認済み（#542）。専用命令／polyfill の判別は `Adapter::as_hal`（`unsafe`）経由でのみ可能で、本リポの `unsafe` 原則禁止のため未判別のまま（詳細: [`gpu-batch-i8-packed.md`](gpu-batch-i8-packed.md) §4） |
 | Subgroup | `Features::SUBGROUP`（Vulkan／DX12／Metal）。GPU 側 Top-k 縮約に有効。実機確認・設計は [`gpu-batch-topk.md`](gpu-batch-topk.md)（#535） |
 | bf16 | 未確認 |
 
