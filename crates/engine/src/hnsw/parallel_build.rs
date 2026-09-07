@@ -1815,13 +1815,23 @@ mod tests {
 
     /// パス分離（`plan_links`／`publish_links`）と旧・単一パス手順が、
     /// 無競合（単一スレッド）実行では完全に同一のグラフを生成することを
-    /// 固定する。`build_with_threads_one_matches_sequential_build_exactly`
-    /// は分離後の `insert_node_locked`（新実装）と逐次 `HnswIndex::build`
-    /// （`hnsw.rs::insert_node`。分離前と同じ「層ごとに両方向」手順を
-    /// 維持したまま）を比較しており、両者が一致し続けていることが
-    /// 本 Issue のパス分離が無競合時にグラフを変えないことの間接証拠に
-    /// なる（直接の回帰は同テストが担う。ここでは異なる seed・パラメータの
-    /// 組で追加確認する）。
+    /// 固定する。
+    ///
+    /// `build_with_threads(..., threads=1)` は `build_with_threads_impl` の
+    /// `threads == 1` 分岐で逐次 `HnswIndex::build`（分離前の単一パス実装）
+    /// へ丸ごと委譲するだけであり、`plan_links`／`publish_links`（新実装）
+    /// を一切通らない（codex-review・Cursor Bugbot 指摘。PR #596）。本テストは
+    /// それを避け、`insert_node_locked`（新実装。内部で `plan_links` →
+    /// `publish_links` を呼ぶ）を全ノードに対し単一スレッド・逐次で直接
+    /// 呼び出して `BuildGraph` を構築し（呼び出し順は `build_parallel_graph`
+    /// の逐次プレフィックス挿入ループと同じ「1 件ずつ挿入完了させてから次へ」
+    /// であり、同一スレッド内では競合が発生し得ない）、`freeze`（`assemble_graph`
+    /// → `repair_reachability` → `freeze_from`。`build_parallel_graph` と
+    /// 共有する後始末）で `HnswIndex` へ組み立てたうえで、逐次
+    /// `HnswIndex::build`（`hnsw.rs::insert_node`。分離前の「層ごとに両方向」
+    /// 手順を維持したまま）の結果と比較する。レベル割当は両経路とも
+    /// `DeterministicRng::new(seed)` → `assign_level` を同じ順序で呼ぶため
+    /// 一致する（`build_inner`・`build_parallel_graph` 参照）。
     #[test]
     fn plan_then_publish_matches_sequential_insert_without_contention() {
         let dim = 5usize;
@@ -1832,19 +1842,45 @@ mod tests {
             ef_construction: 24,
             ef_search: 16,
         };
-        let sequential = PubHnswIndex::build(params, dim as u32, &vectors, 42).unwrap();
-        let parallel =
-            PubHnswIndex::build_with_threads(params, dim as u32, &vectors, 42, 1).unwrap();
+        let seed = 42u64;
 
-        assert_eq!(sequential.entry_point(), parallel.entry_point());
-        assert_eq!(sequential.max_level(), parallel.max_level());
+        let sequential = PubHnswIndex::build(params, dim as u32, &vectors, seed).unwrap();
+
+        let mut rng = DeterministicRng::new(seed);
+        let levels: Vec<usize> = (0..rows)
+            .map(|_| assign_level(&mut rng, params.m))
+            .collect();
+        let owned: Arc<[f32]> = Arc::from(vectors.as_slice());
+        let graph = BuildGraph::new(params, dim, owned.clone(), levels, false);
+        let mut visited = VisitedScratch::default();
+        for node_idx in 0..rows {
+            let node_id = node_idx as u32;
+            if node_idx == 0 {
+                graph.try_promote_entry(node_id, graph.levels[0]).unwrap();
+                continue;
+            }
+            insert_node_locked(&graph, node_id, &mut visited).unwrap();
+        }
+        let via_new_path = freeze(
+            graph,
+            params,
+            ResidentPrecision::F32,
+            dim as u32,
+            &vectors,
+            dim,
+            owned,
+        )
+        .unwrap();
+
+        assert_eq!(sequential.entry_point(), via_new_path.entry_point());
+        assert_eq!(sequential.max_level(), via_new_path.max_level());
         for node in 0..rows as u32 {
-            assert_eq!(sequential.level_of(node), parallel.level_of(node));
+            assert_eq!(sequential.level_of(node), via_new_path.level_of(node));
             let seq_level = sequential.level_of(node).unwrap();
             for level in 0..=seq_level {
                 assert_eq!(
                     sequential.neighbors(level, node),
-                    parallel.neighbors(level, node),
+                    via_new_path.neighbors(level, node),
                     "node={node} level={level}"
                 );
             }
