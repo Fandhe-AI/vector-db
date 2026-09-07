@@ -245,7 +245,7 @@ Issue #365 で行内マルチアキュムレータ化は不採用済み（cache 
 
 | 優先 | 施策 | 対象 | 根拠 | Rust | 既起票 |
 | ---- | ---- | ---- | ---- | ---- | ------ |
-| 1 | CPU f16 常駐＋F16C／NEON FP16 デコード | 全 | GPU 側の f16x2 常駐表現を CPU 側でも読めば arena 半減。L3 溢れ点が拡大 | stable 可 | #513 |
+| 1 | CPU f16 常駐＋F16C／NEON FP16 デコード | 全 | GPU 側の f16x2 常駐表現を CPU 側でも読めば arena 半減。L3 溢れ点が拡大 | stable 可 | #513（#514 実装済み。`docs/design/hnsw-f16-resident.md` 参照） |
 | 2 | 行間マイクロカーネル（4〜8 行 × 1 クエリ） | 全 | #365 が潰したのは行内 ILP。行間の load 削減は別軸。Zen 5 の load 2×512b で特に効く | stable 可 | #509 |
 | 3 | クライアント Intel の 256 bit 経路最適化 | Alder〜Arrow Lake | AVX-512 fuse off がクライアント主流。#520 の AVX-VNNI（256 bit）側に含まれる | stable 可 | #520 |
 | 4 | AVX-512 BF16／VNNI 量子化スキャン | SPR／GNR／Zen 4／5 | ANN 候補生成限定で f32 再計算（HNSW の rescoring 契約と同型） | stable 1.89 | #520 |

@@ -120,10 +120,16 @@ pub(crate) fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngin
         // `ValidatedHnswParams::get()` は検証済み `m`／`ef_construction`／
         // `ef_search` のみを返す（構築時の静的設定値。`full_scan_ratio` や
         // 実行時の可視カーディナリティ・索引ノード数はここでは露出しない）。
+        // `resident=`（Issue #514）も構築時の静的設定値（要求精度）のみで、
+        // 実行時の自動縮退結果（`HnswIndex::resident_precision` の実効値）は
+        // 露出しない（#411 の「実行時縮退結果は非露出」契約を踏襲）。
         let p = params.get();
         lines.push(format!(
-            "hnsw_params: m={},ef_construction={},ef_search={}",
-            p.m, p.ef_construction, p.ef_search
+            "hnsw_params: m={},ef_construction={},ef_search={},resident={}",
+            p.m,
+            p.ef_construction,
+            p.ef_search,
+            params.resident_precision()
         ));
     }
     lines.push(format!("ann_plan: {}", ann_plan_token(engine.ann_plan)));
@@ -303,7 +309,7 @@ mod tests {
         assert_eq!(cell_text(&result, 4), "engine: hnsw");
         assert_eq!(
             cell_text(&result, 5),
-            "hnsw_params: m=16,ef_construction=100,ef_search=64"
+            "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32"
         );
         assert_eq!(cell_text(&result, 6), "ann_plan: hnsw_full_visible");
     }
@@ -405,8 +411,11 @@ mod tests {
             if let Some(SearchEngineKind::Hnsw(params)) = kind {
                 let p = params.get();
                 let expected = format!(
-                    "hnsw_params: m={},ef_construction={},ef_search={}",
-                    p.m, p.ef_construction, p.ef_search
+                    "hnsw_params: m={},ef_construction={},ef_search={},resident={}",
+                    p.m,
+                    p.ef_construction,
+                    p.ef_search,
+                    params.resident_precision()
                 );
                 assert!(
                     result

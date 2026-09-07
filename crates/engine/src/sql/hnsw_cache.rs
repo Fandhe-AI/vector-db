@@ -164,6 +164,10 @@ pub struct HnswIndexCacheStats {
     /// `hybrid.rs::hybrid_search_boosted` の `dense_cap`／`MAX_FETCH_K` により
     /// 高々 `⌈log2(dense_cap / (2·pool_depth))⌉ + 1` に有界。停止性の観測用）。
     pub hybrid_rounds_max: u64,
+    /// `IndexedBase::build` が `ResidentPrecision::F16` を要求されたにもかかわらず
+    /// f16 の有限範囲（`|x| <= 65504.0`）を超える成分により `F32` へ自動縮退した
+    /// 回数（Issue #514・D6。`builds` の内数）。
+    pub f16_residency_fallbacks: u64,
     /// 現在キャッシュが保持しているエントリ数。
     pub entries: usize,
 }
@@ -185,14 +189,26 @@ impl IndexedBase {
     /// [`crate::hnsw::HnswIndex::build_parallel`] で構築する。索引ノード番号は
     /// `arena` のスロット番号と一致する（構築直後の世代においては
     /// `slot_of_node[node] == node` が常に成立する）。
+    /// `precision` は Issue #514 で追加した常駐精度 opt-in（既定 `F32`）。戻り値の
+    /// `bool` は「要求 `F16` が範囲外成分により `F32` へ自動縮退したか」
+    /// （D6。呼び出し元が `HnswIndexCacheStats::f16_residency_fallbacks` へ計上する
+    /// ために使う）。
     fn build(
         arena: &VectorArena,
         params: crate::hnsw::HnswParams,
+        precision: crate::hnsw::ResidentPrecision,
         built_ctx: PolicyContext,
         built_table_generation: u64,
-    ) -> Result<Self, HnswError> {
-        let index =
-            HnswIndex::build_parallel(params, arena.dim(), arena.vectors(), HNSW_BUILD_SEED)?;
+    ) -> Result<(Self, bool), HnswError> {
+        let index = HnswIndex::build_parallel_with_precision(
+            params,
+            precision,
+            arena.dim(),
+            arena.vectors(),
+            HNSW_BUILD_SEED,
+        )?;
+        let f16_fallback = precision == crate::hnsw::ResidentPrecision::F16
+            && index.resident_precision() == crate::hnsw::ResidentPrecision::F32;
         let mut node_keys: Vec<RowKey> = Vec::with_capacity(arena.len());
         let mut key_to_node: HashMap<RowKey, u32> = HashMap::with_capacity(arena.len());
         for slot in 0..arena.len() {
@@ -207,13 +223,16 @@ impl IndexedBase {
             key_to_node.insert(key.clone(), node);
             node_keys.push(key);
         }
-        Ok(IndexedBase {
-            index: Arc::new(index),
-            node_keys,
-            key_to_node,
-            built_ctx,
-            built_table_generation,
-        })
+        Ok((
+            IndexedBase {
+                index: Arc::new(index),
+                node_keys,
+                key_to_node,
+                built_ctx,
+                built_table_generation,
+            },
+            f16_fallback,
+        ))
     }
 
     /// キャッシュ容量判定用の概算バイト量。
@@ -301,12 +320,17 @@ impl Overlay {
                 }
                 continue;
             };
-            // 同一キーの行が索引構築時点から存在する: ベクトルがビット等価か確認する
+            // 同一キーの行が索引構築時点から存在する: ベクトルが一致するか確認する
             // （`update_row` は同一 `(tenant, id)` のまま embedding を差し替えられる
-            // ため、キー一致だけでは未変更の保証にならない）。
-            let same_vector = match (base.index.vector(node), arena.vector(slot)) {
-                (Some(a), Some(b)) => vectors_bit_equal(a, b),
-                _ => false,
+            // ため、キー一致だけでは未変更の保証にならない）。`HnswIndex::
+            // node_matches`（Issue #514・D4）は常駐精度（f32／f16）に依存しない
+            // 判定を提供する——`base.index.vector(node)` は F16 常駐時に常に
+            // `None` を返すため（D5）、こちらに一本化しないと F16 常駐索引の
+            // 差分検出が全行を「未変更」と誤判定し、テーブル更新後もキャッシュが
+            // 古いまま応答し続ける silent fallback になる。
+            let same_vector = match arena.vector(slot) {
+                Some(v) => base.index.node_matches(node, v).unwrap_or(false),
+                None => false,
             };
             if same_vector {
                 if let Some(entry) = slot_of_node.get_mut(node as usize) {
@@ -384,16 +408,6 @@ impl Overlay {
     }
 }
 
-/// `a`・`b` が同一次元・全成分ビット等価か（`f32::to_bits` 比較。`NaN` の
-/// ビットパターンも含めて厳密一致を要求する。浮動小数点の値比較 `==` は `NaN` を
-/// 常に不一致にしてしまい「変更なし」を誤検出しうるため使わない）。
-fn vectors_bit_equal(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b.iter())
-            .all(|(x, y)| x.to_bits() == y.to_bits())
-}
-
 /// [`HnswIndexCache`] の 1 エントリ。
 struct HnswCacheEntry {
     table: String,
@@ -459,6 +473,7 @@ pub(crate) struct HnswIndexCache {
     hybrid_dense_searches: AtomicU64,
     hybrid_queries: AtomicU64,
     hybrid_rounds_max: AtomicU64,
+    f16_residency_fallbacks: AtomicU64,
 }
 
 /// [`HnswIndexCache::lookup`] の結果。
@@ -494,6 +509,7 @@ impl HnswIndexCache {
             hybrid_dense_searches: AtomicU64::new(0),
             hybrid_queries: AtomicU64::new(0),
             hybrid_rounds_max: AtomicU64::new(0),
+            f16_residency_fallbacks: AtomicU64::new(0),
         }
     }
 
@@ -800,6 +816,7 @@ impl HnswIndexCache {
             hybrid_dense_searches: self.hybrid_dense_searches.load(Ordering::Relaxed),
             hybrid_queries: self.hybrid_queries.load(Ordering::Relaxed),
             hybrid_rounds_max: self.hybrid_rounds_max.load(Ordering::Relaxed),
+            f16_residency_fallbacks: self.f16_residency_fallbacks.load(Ordering::Relaxed),
             entries,
         }
     }
@@ -894,10 +911,19 @@ pub(crate) fn prepare_full_visible(
             match IndexedBase::build(
                 arena,
                 access.provider.params(),
+                access.provider.resident_precision(),
                 ctx.clone(),
                 current_generation,
             ) {
-                Ok(built) => access.cache.record_base(access.storage, table, built),
+                Ok((built, f16_fallback)) => {
+                    if f16_fallback {
+                        access
+                            .cache
+                            .f16_residency_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    access.cache.record_base(access.storage, table, built)
+                }
                 Err(_) => {
                     access.cache.build_failures.fetch_add(1, Ordering::Relaxed);
                     record_build_failed(access, table, ctx, current_generation);
@@ -930,10 +956,17 @@ pub(crate) fn prepare_full_visible(
         match IndexedBase::build(
             arena,
             access.provider.params(),
+            access.provider.resident_precision(),
             ctx.clone(),
             current_generation,
         ) {
-            Ok(built) => {
+            Ok((built, f16_fallback)) => {
+                if f16_fallback {
+                    access
+                        .cache
+                        .f16_residency_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 access.cache.rebuilds.fetch_add(1, Ordering::Relaxed);
                 let new_base = access.cache.record_base(access.storage, table, built);
                 let mut identity_mask = crate::hnsw::NodeMask::new(new_base.index.len());
@@ -1842,10 +1875,12 @@ mod tests {
         let built = IndexedBase::build(
             &arena,
             crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
             c.clone(),
             stale_gen,
         )
-        .expect("build");
+        .expect("build")
+        .0;
         let returned = cache.record_base(&storage, "docs", built);
         assert_eq!(returned.built_table_generation, stale_gen);
 
@@ -1874,10 +1909,12 @@ mod tests {
         let built = IndexedBase::build(
             &arena,
             crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
             owner.clone(),
             gen,
         )
-        .expect("build");
+        .expect("build")
+        .0;
         cache.record_base(&storage, "docs", built);
 
         let read_txn2 = storage.db().begin_read().unwrap();
@@ -1905,10 +1942,12 @@ mod tests {
         let built_a = IndexedBase::build(
             &arena_a,
             crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
             c.clone(),
             gen_a,
         )
-        .expect("build a");
+        .expect("build a")
+        .0;
         cache.record_base(&storage, "docs_a", built_a);
 
         let read_txn_b = storage.db().begin_read().unwrap();
@@ -1917,10 +1956,12 @@ mod tests {
         let built_b = IndexedBase::build(
             &arena_b,
             crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
             c.clone(),
             gen_b,
         )
-        .expect("build b");
+        .expect("build b")
+        .0;
         cache.record_base(&storage, "docs_b", built_b);
 
         assert_eq!(cache.stats().entries, 2);
@@ -1945,9 +1986,15 @@ mod tests {
             let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
             built_generation = gen;
             let arena = build_arena(&read_txn, "docs", c);
-            let built =
-                IndexedBase::build(&arena, crate::hnsw::HnswParams::default(), c.clone(), gen)
-                    .expect("build");
+            let built = IndexedBase::build(
+                &arena,
+                crate::hnsw::HnswParams::default(),
+                crate::hnsw::ResidentPrecision::F32,
+                c.clone(),
+                gen,
+            )
+            .expect("build")
+            .0;
             cache.record_base(&storage, "docs", built);
         }
         assert_eq!(cache.stats().entries, 2);
@@ -1977,10 +2024,12 @@ mod tests {
         let built = IndexedBase::build(
             &arena,
             crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
             c.clone(),
             old_generation,
         )
-        .expect("build");
+        .expect("build")
+        .0;
         cache.record_base(&storage, "docs", built);
         assert_eq!(cache.stats().entries, 1);
 
@@ -2013,8 +2062,15 @@ mod tests {
         let read_txn = storage.db().begin_read().unwrap();
         let gen0 = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
         let arena0 = build_arena(&read_txn, "docs", &c);
-        let base = IndexedBase::build(&arena0, crate::hnsw::HnswParams::default(), c.clone(), gen0)
-            .expect("build");
+        let base = IndexedBase::build(
+            &arena0,
+            crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
+            c.clone(),
+            gen0,
+        )
+        .expect("build")
+        .0;
 
         // id=2 の内容を変更し、id=3 を新規追加する。
         let op_id_update =
@@ -2092,8 +2148,15 @@ mod tests {
         let read_txn = storage.db().begin_read().unwrap();
         let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
         let arena = build_arena(&read_txn, "docs", &c);
-        let base = IndexedBase::build(&arena, crate::hnsw::HnswParams::default(), c.clone(), gen)
-            .expect("build");
+        let base = IndexedBase::build(
+            &arena,
+            crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
+            c.clone(),
+            gen,
+        )
+        .expect("build")
+        .0;
         let base = Arc::new(base);
 
         let (visible_mask, visible_in_index) = identity_mask_and_visible(&base);
@@ -2158,9 +2221,15 @@ mod tests {
             let read_txn = storage.db().begin_read().unwrap();
             let gen = crate::catalog::table_generation_in_txn(&read_txn, &table).unwrap();
             let arena = build_arena(&read_txn, &table, &c);
-            let built =
-                IndexedBase::build(&arena, crate::hnsw::HnswParams::default(), c.clone(), gen)
-                    .expect("build");
+            let built = IndexedBase::build(
+                &arena,
+                crate::hnsw::HnswParams::default(),
+                crate::hnsw::ResidentPrecision::F32,
+                c.clone(),
+                gen,
+            )
+            .expect("build")
+            .0;
             let base = cache.record_base(&storage, &table, built);
             bases.push((table, base));
         }
@@ -2269,10 +2338,12 @@ mod tests {
         let base = IndexedBase::build(
             &arena4,
             crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
             c_a.clone(),
             gen4,
         )
-        .expect("build");
+        .expect("build")
+        .0;
 
         // dim・ctx とも本ベースの構築時と一致: 検証通過（fail-closed 分岐に入らない）。
         assert!(!base.arena_identity_mismatch_guard(&arena4, &c_a));
@@ -2459,6 +2530,135 @@ mod tests {
         );
     }
 
+    /// Issue #514（T-C1〜T-C2）: F16 常駐 opt-in（`ValidatedHnswParams::
+    /// with_resident_precision(F16)`）で `IndexedBase::build` が実際に索引
+    /// 探索へ到達し（`hits > 0`。非 vacuous）、`f16_residency_fallbacks == 0`
+    /// （この範囲内の埋め込み値では自動縮退が起きない）ことを確認する。加えて
+    /// 各ヒットのスコアが既定エンジン（`CpuScalarProvider`。f32 brute-force）の
+    /// 同 id のスコアと `to_bits()` 一致すること（R3・#408 契約: 索引ヒットの
+    /// 最終スコアは常に `kernel::dot` による f32 アリーナ再計算）を固定する。
+    #[test]
+    fn f16_resident_precision_hits_the_ann_path_and_matches_default_engine_scores_exactly() {
+        let path = unique_db_path("hnsw-cache-f16-resident");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let c = ctx("tenant-a");
+
+        let embeddings: Vec<[f32; 4]> = (0..MIN_INDEXED_ROWS)
+            .map(|i| {
+                [
+                    (i as f32) * 0.001,
+                    ((i * 7) % 997) as f32 * 0.001,
+                    ((i * 13) % 991) as f32 * 0.001,
+                    ((i * 29) % 983) as f32 * 0.001,
+                ]
+            })
+            .collect();
+        let rows: Vec<(u64, RowInput<'_>)> = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                (
+                    i as u64,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: e.as_slice(),
+                        metadata: &[],
+                    },
+                )
+            })
+            .collect();
+        let op_id = crate::recovery::required_op_id::OperationId::parse("hnsw-cache-f16-resident")
+            .expect("valid operation_id");
+        crate::tenant::insert_rows(&storage, "docs", &c, &rows, &op_id).expect("bulk insert");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        assert!(arena.len() >= MIN_INDEXED_ROWS);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+
+        let cache = HnswIndexCache::new();
+        let f16_params = crate::hnsw::ValidatedHnswParams::default()
+            .with_resident_precision(crate::hnsw::ResidentPrecision::F16);
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(f16_params),
+        };
+        let ann_provider = crate::kernel::CpuScalarProvider;
+        let default_provider = crate::kernel::CpuScalarProvider;
+        let query = [0.5, 0.25, 0.1, 0.9];
+
+        // 1 回目（Miss -> build）・2 回目（Ready）の双方が成功すること。
+        let first = search_or_fallback(
+            &access,
+            &read_txn,
+            "docs",
+            &c,
+            &arena,
+            &slot_ids,
+            &ann_provider,
+            &query,
+            10,
+        )
+        .expect("warm-up query (Miss -> build) should succeed");
+        let ann_hits = search_or_fallback(
+            &access,
+            &read_txn,
+            "docs",
+            &c,
+            &arena,
+            &slot_ids,
+            &ann_provider,
+            &query,
+            10,
+        )
+        .expect("second query (Ready) should succeed");
+        assert!(!first.is_empty());
+        assert!(!ann_hits.is_empty(), "non-vacuous: must return hits");
+
+        let stats = cache.stats();
+        assert!(
+            stats.hits >= 1,
+            "F16 resident precision must still reach the indexed ANN search path \
+             (Ready + non-degraded), got stats={stats:?}"
+        );
+        assert_eq!(
+            stats.f16_residency_fallbacks, 0,
+            "embeddings in this fixture are well within the f16 finite range and \
+             must not trigger the F32 fallback (D6)"
+        );
+
+        // R3: 既定エンジン（f32 brute-force）と同 id のスコアが完全一致する
+        // こと（索引ヒットの最終スコアは常に f32 アリーナ再計算のため、f16
+        // 常駐の候補生成は探索順序にのみ影響し、返るスコア自体は変えない）。
+        let baseline = default_provider
+            .search(crate::kernel::SearchInput {
+                ids: &slot_ids,
+                vectors: arena.vectors(),
+                dim: arena.dim(),
+                query: &query,
+                k: 10,
+            })
+            .expect("baseline search must succeed");
+        let baseline_by_id: HashMap<u64, f32> =
+            baseline.into_iter().map(|h| (h.id, h.score)).collect();
+        for hit in &ann_hits {
+            if let Some(&expected) = baseline_by_id.get(&hit.id) {
+                assert_eq!(
+                    hit.score.to_bits(),
+                    expected.to_bits(),
+                    "id={} ann_score={} baseline_score={}",
+                    hit.id,
+                    hit.score,
+                    expected
+                );
+            }
+        }
+    }
+
     #[test]
     fn record_overlay_for_marks_uncacheable_when_oversized() {
         // Cursor Bugbot 指摘対応（PR #434「Oversized overlay skips negative
@@ -2479,8 +2679,15 @@ mod tests {
         let read_txn = storage.db().begin_read().unwrap();
         let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
         let arena = build_arena(&read_txn, "docs", &c);
-        let built = IndexedBase::build(&arena, crate::hnsw::HnswParams::default(), c.clone(), gen)
-            .expect("build");
+        let built = IndexedBase::build(
+            &arena,
+            crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
+            c.clone(),
+            gen,
+        )
+        .expect("build")
+        .0;
         let base = cache.record_base(&storage, "docs", built);
         assert_eq!(cache.stats().entries, 1);
 
@@ -2579,10 +2786,12 @@ mod tests {
         let mismatched_base = IndexedBase::build(
             &aux_arena,
             crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
             c.clone(),
             docs_gen,
         )
-        .expect("build mismatched base");
+        .expect("build mismatched base")
+        .0;
         cache.record_base(&storage, "docs", mismatched_base);
         assert_eq!(
             cache.stats().entries,
