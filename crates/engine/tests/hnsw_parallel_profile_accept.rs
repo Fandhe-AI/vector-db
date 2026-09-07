@@ -16,7 +16,7 @@ use engine::hnsw::{HnswBuildProfile, HnswWorkerStats};
 use harness::hnsw_parallel_profile::{
     aggregate_lock_blocked_ratio, aggregate_lock_wait, lock_wait_share, measured_tail,
     median_duration, min_median_max_duration, min_median_max_u64, parallel_vs_control_ceiling,
-    pick_representative, serial_share, speedup, total_entry_promotions,
+    pick_representative, render_memory_line, serial_share, speedup, total_entry_promotions,
 };
 
 // --- median_duration ---
@@ -109,12 +109,30 @@ fn min_median_max_duration_even_count_interpolates_median() {
 
 #[test]
 fn serial_share_computes_ratio_of_sequential_stages_to_total() {
+    // `flatten=0`（CSR 平坦化なしの旧アリティ相当）では従来どおり 0.5。
     let share = serial_share(
         Duration::from_millis(1),
         Duration::from_millis(2),
         Duration::from_millis(3),
         Duration::from_millis(4),
+        Duration::ZERO,
         Duration::from_millis(20),
+    )
+    .unwrap();
+    assert!((share - 0.5).abs() < 1e-9, "share={share}");
+}
+
+#[test]
+fn serial_share_includes_flatten_in_sequential_stages() {
+    // Issue #495: `flatten`（CSR 平坦化。単一スレッド実行）を逐次段へ合算する。
+    // 1+2+3+4+5=15 / 30 = 0.5。
+    let share = serial_share(
+        Duration::from_millis(1),
+        Duration::from_millis(2),
+        Duration::from_millis(3),
+        Duration::from_millis(4),
+        Duration::from_millis(5),
+        Duration::from_millis(30),
     )
     .unwrap();
     assert!((share - 0.5).abs() < 1e-9, "share={share}");
@@ -124,6 +142,7 @@ fn serial_share_computes_ratio_of_sequential_stages_to_total() {
 fn serial_share_zero_total_is_none() {
     assert_eq!(
         serial_share(
+            Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
@@ -320,4 +339,27 @@ fn parallel_vs_control_ceiling_missing_control_speedup_rel_is_none() {
 fn parallel_vs_control_ceiling_zero_control_speedup_rel_is_nan() {
     let ceiling = parallel_vs_control_ceiling(Some(2.0), Some(0.0)).unwrap();
     assert!(ceiling.is_nan());
+}
+
+// --- render_memory_line（Issue #495） ---
+
+#[test]
+fn render_memory_line_reports_delta_when_both_present() {
+    let line = render_memory_line(12, 1024, Some(1000), Some(1500), Some(1600));
+    assert_eq!(
+        line,
+        "hnsw_parallel_build: memory threads=12 approx_heap_bytes=1024 \
+         vm_rss_kb_before=1000 vm_rss_kb_after=1500 vm_rss_delta_kb=500 vm_hwm_kb=1600"
+    );
+}
+
+#[test]
+fn render_memory_line_reports_unavailable_when_proc_unreadable() {
+    let line = render_memory_line(1, 512, None, None, None);
+    assert_eq!(
+        line,
+        "hnsw_parallel_build: memory threads=1 approx_heap_bytes=512 \
+         vm_rss_kb_before=unavailable vm_rss_kb_after=unavailable \
+         vm_rss_delta_kb=unavailable vm_hwm_kb=unavailable"
+    );
 }

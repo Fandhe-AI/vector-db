@@ -244,6 +244,12 @@ psql の `SELECT COUNT(*)` は 45 ms → 約 3.7 ms。
 | `udf_call` | 41996 | 730 | 1149 |
 | `rls_isolation` | 44960 | 3552 | 3675 |
 
+**（2026-09-06 追記・Issue #481）** 簡易クエリ応答（`RowDescription`/`DataRow`×N/
+`CommandComplete`/`ReadyForQuery`）は原則 1 回の `write_all` へ束ねる方式へ変更した
+（`crate::response_buffer::ResponseBuffer`。上限 `MAX_RESPONSE_BUFFER_BYTES` 超過時は
+フレーム境界で分割送出）。上表の 4 回 `write_all` を前提とした記述はこの変更以前の
+挙動。詳細・実測は `docs/design/wire-response-buffering.md` 参照。
+
 ## GPU（NVIDIA GeForce RTX 3060）での高速化
 
 ### `engine::gpu_batch` vs CPU-SIMD バッチ（`make bench-gpu-scaling`）
@@ -253,6 +259,12 @@ psql の `SELECT COUNT(*)` は 45 ms → 約 3.7 ms。
 `GpuF32ContrastBackend`（f32 常駐対照・Issue #234）・`batch_search.rs::BatchEngine`
 （CPU-SIMD f16 常駐・12 スレッド）を同一コーパス・同一クエリで比較する。
 `mismatch` は GPU と CPU の Top-k 結果の不一致数（全点 0）。
+
+**（2026-09-06 追記・Issue #532）** dispatch 構造を「1 dispatch = 1 クエリ」
+から「`PolicyContext` 単位にグループ化したクエリを最大 `GPU_QUERY_TILE_MAX`
+本まで 1 dispatch へタイル化」する方式へ変更した（`gpu_batch.rs::
+DOT_SHADER_WGSL`）。以下の実測表は変更前の数値のまま。変更後の前後比較・
+数値更新は依存先 Issue #533 で実施予定。
 
 | rows | dim | batch | CPU-SIMD | GPU f16 | GPU f32 | per-query CPU | per-query GPU f16 | speedup f16 (p95) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -344,6 +356,14 @@ GPU は単発〜小バッチの全件内積検索で明確に高速化する（1
 スループットでは現行実装は CPU-SIMD と同等にとどまり、FAISS との差が改善余地を示す。
 GPU 経路は in-process API（`engine::gpu_batch`）のみで SQL／wire からは到達できない。
 
+**（2026-09-07 追記・Issue #537）** Issue #536（workgroup 内部分 Top-k）適用後
+の再計測: `100,000×128 batch 64` の self GPU f16 min-of-5 p95 は 15,783µs
+（本節上表の Issue #532 適用前値 80,756µs から readback 方式変更〔#532 タイル
+化＋#536 部分 Top-k〕を経て改善）。FAISS GPU 対照 753µs（`559b523` 時点）との
+差はなお約 21 倍に縮小したが解消はしていない。Issue #536／#537 の詳細・
+readback バイト数の確定的削減（12.66〜12.79x）・6 規模点の前後比較は
+[`gpu-batch-topk.md`](gpu-batch-topk.md)「前後比較実測（Issue #537）」節参照。
+
 ## 計測ツール
 
 - `scripts/crossdb_bench/`: Python ハーネス（`run.py --db self|pgvector|sqlite_vec|qdrant|lancedb|mysql --config exact|hnsw`・`containers.sh`・`run_all.sh`）。
@@ -403,6 +423,10 @@ engine 内部の B0s〜B8 段別内訳では SQL 表層固定コスト（B1−B4
 グループ完全化を含む残差は 19% にとどまることを確認した。Phase 6（Issue #548）
 への引き継ぎ内容もあわせて同節に記録。production コード
 （`crates/engine/src/`・`crates/wire-server/src/`）は無変更。
+
+Phase 6（#546・#549）を通しで前後比較した crossdb self（wire 経由）の
+`hybrid_rrf` 前後表は `docs/design/hybrid-rrf-phase6-before-after.md`
+（Issue #550）に記録した（数値は同 doc 参照。本節では転記しない）。
 
 ## dim=768 基線（Issue #466）
 

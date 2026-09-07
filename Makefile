@@ -200,6 +200,24 @@ else
 	@echo "skip: Cargo.toml 未追加のため check-cross をスキップ"
 endif
 
+.PHONY: simd-codegen-check
+simd-codegen-check: ## SIMD カーネル（isa.rs）の生成コード検査。要素ごと挿入命令の不在を --emit asm で機械検査（Issue #467・TASK-156 関連。engine の release ビルドを伴う）
+ifdef HAS_CARGO
+	scripts/check_simd_codegen.sh --self-test
+	scripts/check_simd_codegen.sh
+else
+	@echo "skip: Cargo.toml 未追加のため simd-codegen-check をスキップ"
+endif
+
+.PHONY: simd-codegen-check-cross
+simd-codegen-check-cross: ## simd-codegen-check の aarch64 版（cross-check ジョブから実行。要 aarch64-unknown-linux-gnu target。リンク不要）
+ifdef HAS_CARGO
+	scripts/check_simd_codegen.sh --target aarch64-unknown-linux-gnu --self-test
+	scripts/check_simd_codegen.sh --target aarch64-unknown-linux-gnu
+else
+	@echo "skip: Cargo.toml 未追加のため simd-codegen-check-cross をスキップ"
+endif
+
 .PHONY: e2e-three-client
 e2e-three-client: ## TASK-73（WIRE-1）/TASK-82（SQL-5〜7,9,10）/TASK-165（SQL-12・SEARCH-9）/TASK-168（SQL-13・SQL-14）/Issue #454（広域取得）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
 ifdef HAS_CARGO
@@ -223,7 +241,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/simd_bench.rs）
@@ -310,11 +328,19 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-hybrid-profile
-bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）＋ Issue #387（search_within の段別・疎側再取得発火回数）＋ Issue #465（Issue #392 適用後の最新基線ラウンド計測）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_HYBRID_PROFILE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる（Issue #465）
+bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）＋ Issue #387（search_within の段別・疎側再取得発火回数）＋ Issue #465（Issue #392 適用後の最新基線ラウンド計測）＋ Issue #547（行数・可視率 opt-in）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_HYBRID_PROFILE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告、BENCH_HYBRID_PROFILE_ROWS=<1-100000>（既定 25000）で行数、BENCH_HYBRID_PROFILE_VISIBLE_RATIO=1/<1-1000>（既定 1/1）で可視率を指定できる（Issue #547）
 ifdef HAS_CARGO
 	cargo bench --bench hybrid_profile_bench -p engine --features bench-internals
 else
 	@echo "skip: Cargo.toml 未追加のため bench-hybrid-profile をスキップ"
+endif
+
+.PHONY: bench-hybrid-profile-ab
+bench-hybrid-profile-ab: ## Issue #547: #546（スコアアキュムレータ再利用）の前後比較を N=25k/100k・可視率 1/1・1/10 の 4 条件で交互 min-of-N 計測する（BEFORE_BIN・AFTER_BIN に退避済みバイナリの絶対パス、BEFORE_COMMIT・AFTER_COMMIT にビルド元コミットの hash を指定。AB_PAIRS（既定 5・5 未満は拒否）・AB_ROUNDS（既定 5・5..=50）で交互ペア数・ラウンド数を指定可。手動実行専用・CI 非配線。scripts/bench_hybrid_profile_ab.sh 参照）
+ifdef HAS_CARGO
+	scripts/bench_hybrid_profile_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hybrid-profile-ab をスキップ"
 endif
 
 # --------------------------------------------------
@@ -368,6 +394,32 @@ else
 endif
 
 # --------------------------------------------------
+# is_aarch64_feature_detected!／is_x86_feature_detected! の実効性を出力する検出ツール
+# （Issue #468。crates/engine/examples/detect_features.rs）
+# --------------------------------------------------
+
+.PHONY: detect-features
+detect-features: ## Issue #468（macOS 上の is_aarch64_feature_detected! 実効性検証）の feature 検出結果表を出力する（時間非依存・spec 閾値なしの情報提供専用のため ci には含めない。手動実行専用。出力は docs/design/chip-kernel-guidelines.md へ転記する運用）
+ifdef HAS_CARGO
+	cargo run -p engine --release --example detect_features
+else
+	@echo "skip: Cargo.toml 未追加のため detect-features をスキップ"
+endif
+
+# --------------------------------------------------
+# wgpu アダプタの features／limits を出力する検出ツール
+# （Issue #535。crates/engine/examples/gpu_adapter_info.rs）
+# --------------------------------------------------
+
+.PHONY: gpu-adapter-info
+gpu-adapter-info: ## Issue #535（wgpu SUBGROUP 可用性設計）向けの adapter features／limits 表を出力する（時間非依存・spec 閾値なしの情報提供専用のため ci には含めない。手動実行専用。出力は docs/design/gpu-batch-topk.md へ転記する運用）
+ifdef HAS_CARGO
+	cargo run -p engine --release --example gpu_adapter_info
+else
+	@echo "skip: Cargo.toml 未追加のため gpu-adapter-info をスキップ"
+endif
+
+# --------------------------------------------------
 # 全行走査経路（agg_count／rls_isolation／vector_knn_where）の段別内訳プロファイル（Issue #464。crates/engine/benches/scan_stage_profile_bench.rs）
 # --------------------------------------------------
 
@@ -399,11 +451,24 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-ingest-profile
-bench-ingest-profile: ## Issue #396（ingest 経路の段別内訳プロファイル。所有権検査・content_hash・台帳記録・encode・redb insert・世代更新・commit の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_INGEST_PROFILE_ROWS／BENCH_INGEST_PROFILE_DIM で規模を上書き可能。BENCH_INGEST_PROFILE_INSERT_MODE=insert|reserve で I6 段の redb insert_reserve A/B 計測モードを切替可能〔Issue #400・既定 insert〕）
+bench-ingest-profile: ## Issue #396（ingest 経路の段別内訳プロファイル。所有権検査・content_hash・台帳記録・encode・redb insert・世代更新・commit の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_INGEST_PROFILE_MODE=batch|single〔既定 batch。single は Issue #484: 単文 INSERT 経路の P0/E0/S0/I1〜I8 内訳〕。batch モード: BENCH_INGEST_PROFILE_ROWS／BENCH_INGEST_PROFILE_DIM で規模を上書き可能。BENCH_INGEST_PROFILE_INSERT_MODE=insert|reserve で I6 段の redb insert_reserve A/B 計測モードを切替可能〔Issue #400・既定 insert・single モードは insert のみ対応〕。single モード: BENCH_INGEST_PROFILE_STATEMENTS（既定 25,000・2,000〜100,000）で単文数を上書き可能）
 ifdef HAS_CARGO
 	cargo bench --bench ingest_profile_bench -p engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-ingest-profile をスキップ"
+endif
+
+# --------------------------------------------------
+# 単文 INSERT の wire 往復内訳プロファイル
+# （Issue #484。crates/wire-server/benches/ingest_wire_profile_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-ingest-wire-profile
+bench-ingest-wire-profile: ## Issue #484（単文 INSERT の wire 往復内訳。`bench-ingest-profile MODE=single` が計測する engine 内部段を補い wire プロトコル層自体の寄与を切り分ける）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_INGEST_WIRE_ROWS（既定 25,000・5,000〜100,000。BENCH_INGEST_WIRE_ROUNDS で割り切れる値のみ）・BENCH_INGEST_WIRE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる
+ifdef HAS_CARGO
+	cargo bench --bench ingest_wire_profile_bench -p wire-server
+else
+	@echo "skip: Cargo.toml 未追加のため bench-ingest-wire-profile をスキップ"
 endif
 
 # --------------------------------------------------
@@ -423,7 +488,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-hnsw-parallel-build
-bench-hnsw-parallel-build: ## Issue #406（HNSW 構築の並列化の受け入れ条件 (b): 100k 点で構築時間がスレッド数に応じて短縮することの実測記録）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_HNSW_PARALLEL_ROWS／BENCH_HNSW_PARALLEL_THREADS で規模・スレッド数ラダーを上書き可）
+bench-hnsw-parallel-build: ## Issue #406（HNSW 構築の並列化の受け入れ条件 (b): 100k 点で構築時間がスレッド数に応じて短縮することの実測記録）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_HNSW_PARALLEL_ROWS／BENCH_HNSW_PARALLEL_THREADS で規模・スレッド数ラダーを上書き可。Issue #495 追記: CSR 平坦化段 `flatten=`（逐次縮退経路は 0ms・並列経路は 0 超）・各 threads 点の常駐メモリ実測行〔`approx_heap_bytes`／VmRSS 前後差／VmHWM〕を出力する）
 ifdef HAS_CARGO
 	cargo bench --bench hnsw_parallel_build_bench -p engine
 else
@@ -458,6 +523,14 @@ ifdef HAS_CARGO
 	cargo bench --bench hnsw_compare_bench -p engine --features contrast-bench
 else
 	@echo "skip: Cargo.toml 未追加のため bench-hnsw-compare をスキップ"
+endif
+
+.PHONY: bench-hnsw-search
+bench-hnsw-search: ## Issue #491（受理判定後 prefetch〔Issue #490・PR #574〕の前後比較実測）の 1 規模点計測を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。before/after バイナリを交互起動する前後比較・8 点〔10k／100k・dim 128／768・マスク有無〕の判定は運用者が行う。BENCH_HNSW_SEARCH_ROWS〔既定 10000・1..=200000〕・BENCH_HNSW_SEARCH_DIM〔既定 128・1..=4096〕・BENCH_HNSW_SEARCH_MASK〔既定 none・1..=99 の可視率%〕・BENCH_HNSW_SEARCH_QUERIES〔既定 200〕・BENCH_HNSW_SEARCH_EF〔既定 64〕・BENCH_HNSW_SEARCH_K〔既定 10〕・BENCH_DEDICATED_ENV=1 で専有環境自己申告・BENCH_HNSW_SEARCH_COMMIT〔ビルド時指定。git archive 再現手順で before/after バイナリへ計測対象コミットを焼き込むため必須。詳細は docs/design/hnsw-search.md「再現方法」節参照〕を指定できる）
+ifdef HAS_CARGO
+	cargo bench --bench hnsw_search_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hnsw-search をスキップ"
 endif
 
 # --------------------------------------------------
@@ -556,6 +629,19 @@ ifdef HAS_CARGO
 	cargo test --release -p engine --test precision_eval -- --ignored --nocapture --exact precision_eval_policy_sweep
 else
 	@echo "skip: Cargo.toml 未追加のため precision-report をスキップ"
+endif
+
+# --------------------------------------------------
+# 接続処理モデルの同時接続数 N 別スループット手動計測
+# （Issue #482。docs/design/wire-connection-model.md）
+# --------------------------------------------------
+
+.PHONY: bench-wire-concurrency
+bench-wire-concurrency: ## Issue #482（接続処理モデルの判断記録。1 接続 1 スレッド ＋ 接続数上限）の同時接続数 N 別スループットを実測する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。WIRE_CONCURRENCY_N（必須。1〜64）で同時接続数を指定する。1 プロセス = 1 規模点（docs/design/benchmark-judgement-policy.md §5 準拠）。WIRE_CONCURRENCY_ROWS／WIRE_CONCURRENCY_DIM／WIRE_CONCURRENCY_ROUNDS で規模を上書きできる（既定 25,000 行・dim 128・200 往復）
+ifdef HAS_CARGO
+	cargo test --release -p wire-server --test wire_concurrency_throughput -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため bench-wire-concurrency をスキップ"
 endif
 
 # --------------------------------------------------

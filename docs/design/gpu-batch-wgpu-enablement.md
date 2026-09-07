@@ -100,6 +100,9 @@ FallbackBatchEngine（batch_fallback.rs・CORE-8）
 - `unsafe`・`bytemuck` は使わない。バイト列変換は `to_ne_bytes`/
   `from_ne_bytes` のみ。バッファサイズは `checked_*`/`saturating_*` で導出する
 
+workgroup 内部分 Top-k（readback 量削減。段階的 fail-closed 縮退を含む）は
+[`gpu-batch-topk.md`](gpu-batch-topk.md) を参照（Issue #536 で実装）。
+
 ### 2.3 スコープ縮小事項（当初計画からの差分）
 
 実装時間の制約により、以下は当初計画（`BatchPlan` によるテナント別グループ
@@ -111,9 +114,16 @@ dispatch・チャンク分割）から縮小した。挙動の正しさ・
   `gather_reachable_rows`（クエリ単位で `PolicyContext::is_visible` を
   1 行ずつ判定）を実装しており、共通化（`BatchPlan`/
   `push_visible_candidate`/`finalize_selection` の抽出）は行っていない
-- dispatch はクエリ単位（バッチ内の複数クエリを 1 回の dispatch にまとめる
-  最適化は行わない）。行数が `GPU_SCORE_BUFFER_BUDGET_BYTES`
-  （32 MiB）を超える場合はクエリ内で行チャンクへ分割する
+- ~~dispatch はクエリ単位（バッチ内の複数クエリを 1 回の dispatch にまとめる
+  最適化は行わない）。~~ **（2026-09-06 追記・Issue #532）** クエリを
+  `PolicyContext` 単位にグループ化したうえで最大 `GPU_QUERY_TILE_MAX`
+  （実装既定値 16）本を 1 dispatch へタイル化する方式へ変更した。各スレッド
+  （行 1 つを担当）はレジスタ配列でタイル内の全クエリ分を同時に積算するため、
+  常駐行列の行データはタイル幅ぶんのクエリで 1 回読みを償却する（`workgroup`
+  共有メモリは使わない設計上の簡略化。詳細は `docs/design/hnsw-*.md` と同様の
+  ADR 形式ではなく `gpu_batch.rs::DOT_SHADER_WGSL` のドキュメンテーション
+  コメントに記載）。行数が `GPU_SCORE_BUFFER_BUDGET_BYTES`（32 MiB）を超える
+  場合はタイル内で行チャンクへ分割する点は変わらない
 - GPU バッファ（スコア/リードバック/クエリ）の呼び出し間再利用（CORE-15 の
   プール方針を GPU ステージングへ拡張）は行っておらず、呼び出しごとに
   確保・解放する
@@ -202,7 +212,7 @@ CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検�
 | ---- | ---- |
 | A03 インジェクション | WGSL は `const` 埋め込み。外部文字列からシェーダ・パラメータを組み立てない |
 | A01 アクセス制御（テナント境界 P0） | GPU は積和のみ。可視性判定は CPU 側の `PolicyContext::is_visible` 単一照合パス。`FallbackBatchEngine::revalidate_primary_hits` が GPU 出力を独立再検証する（既存 P0 防御を維持） |
-| A04 不安全な設計 / DoS | バッファサイズは `checked_*`・定数予算（`GPU_SCORE_BUFFER_BUDGET_BYTES`）で制限。計算量は `MAX_BATCH_WORK` を dispatch 前に適用 |
+| A04 不安全な設計 / DoS | バッファサイズは `checked_*`・定数予算（`GPU_SCORE_BUFFER_BUDGET_BYTES`）で制限。計算量は `MAX_BATCH_WORK` を dispatch 前に適用。**（2026-09-06 追記・Issue #532）** クエリタイル幅は `GPU_QUERY_TILE_MAX`（シェーダ側 `const` と一致することをテストで固定）でホスト・シェーダ双方が `min` クランプする二重ガード |
 | fail-closed / panic 禁止 | `unwrap`/`expect`/添字アクセスは使わない。wgpu のエラー・デバイスロスト・ポーリング失敗はすべて `Result` で伝播する |
 | 情報漏えい | エラー/イベント文字列にテナント ID・クエリ・adapter 製品名を含めない |
 | A05 設定ミス / CORE-12 | GPU 経路を強制・無効化する環境変数・feature flag を `src/` に設けない（`InstanceDescriptor::new_without_display_handle()`） |

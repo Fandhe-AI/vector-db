@@ -2188,7 +2188,23 @@ pub fn validate_insert(
     mode: LedgerMode,
 ) -> Result<ValidatedInsert, SqlSurfaceError> {
     let tokens = lexer::tokenize(sql)?;
-    let mut p = Parser::new(&tokens);
+    validate_insert_tokens(&tokens, lookup, mode)
+}
+
+/// [`validate_insert`] の本体（Issue #485・単文 INSERT 経路の上位段改善）。
+/// トークン列を受け取ることで、呼び出し元
+/// （`core.rs::execute_sql_in_session`）が既に先頭トークン判定のために
+/// `tokenize` 済みの場合、同一 SQL 文字列の再トークナイズを避けられる
+/// （TASK-83 条件7・Issue #314 で `execute_validated_in_session` が SELECT 側に
+/// 行った「二重パース排除」の INSERT 側対応）。`validate_insert`（`sql: &str`
+/// を受け取る公開 API）は内部でトークナイズしてから本関数へ委譲するため、
+/// 挙動・エラー契約・検証順序はいずれも分割前と不変。
+pub(crate) fn validate_insert_tokens(
+    tokens: &[lexer::Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<ValidatedInsert, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
     let shape = p.parse_insert()?;
     p.expect_end_of_statement()?;
 

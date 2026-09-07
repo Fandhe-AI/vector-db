@@ -27,6 +27,7 @@ pub mod accept;
 #[path = "../../../engine/benches/harness/env_report.rs"]
 pub mod env_report;
 pub mod hybrid_wire;
+pub mod ingest_wire;
 pub mod knn_wire;
 #[path = "../../../engine/benches/harness/protocol.rs"]
 pub mod protocol;

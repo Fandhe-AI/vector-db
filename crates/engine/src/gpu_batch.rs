@@ -56,6 +56,25 @@ use crate::policy::PolicyContext;
 const GPU_SCORE_BUFFER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 const GPU_WORKGROUP_SIZE: u32 = 256;
 
+/// 1 dispatch にタイル化できる最大クエリ本数（Issue #532: 1 dispatch = 1
+/// クエリだった旧構造を、1 dispatch = 複数クエリへ変更する核となる定数）。
+/// [`DOT_SHADER_WGSL`]/[`DOT_SHADER_F32_WGSL`] のレジスタ配列
+/// `acc: array<f32, QUERY_TILE_MAX>` のサイズと一致していなければならない
+/// （`tests::dot_shader_wgsl_query_tile_max_matches_host_constant` で機械検証）。
+/// 値はレジスタ圧・タイル幅のトレードオフに基づく実装既定値であり、spec 由来の
+/// 数値ではない。
+const GPU_QUERY_TILE_MAX: usize = 16;
+
+/// workgroup 内部分 Top-k シェーダ（[`DOT_SHADER_TOPK_WGSL`]/
+/// [`DOT_SHADER_TOPK_F32_WGSL`]）が 1 ワークグループから出力する候補数の
+/// 上限（Issue #536・ポインタ: `docs/design/gpu-batch-topk.md` 決定 1・3）。
+/// ワークグループサイズ [`GPU_WORKGROUP_SIZE`]（256）と同値で、共有メモリ
+/// 上の bitonic ソート網が扱える要素数（`sort_key`/`sort_slot` の配列長）と
+/// 一致する。`k_out` はこの値でクランプされ（ホスト・シェーダ二重防御）、
+/// これを超える `k` を持つクエリを含むタイルは
+/// [`select_readback_mode`] が全量 readback へ縮退させる。
+const GPU_TOPK_OUT_MAX: u32 = 256;
+
 /// GPU の submit 完了・readback・error scope 完了を待つ上限時間
 /// （codex/Bugbot 指摘対応: `PollType::wait_indefinitely()` と終了条件のない
 /// ループは、Metal 等でコマンド完了通知が停止した場合に永久に戻らず、
@@ -74,22 +93,37 @@ const GPU_POLL_SLICE: std::time::Duration = std::time::Duration::from_millis(100
 const MAX_WORKGROUPS_PER_DIMENSION_FALLBACK: u32 = 65535;
 
 /// WGSL: 常駐行列の 1 行（f16 2 要素/u32 パック。`batch_search.rs::pack_f16x2`
-/// と同一表現）と 1 クエリベクトルの内積を計算する。`unpack2x16float` は WGSL
-/// コア機能（`shader-f16` 拡張は不要）で、`batch_search.rs::unpack_f16x2` と
-/// 同じビット解釈をとる（同モジュールのドキュメンテーションコメント参照）。
+/// と同一表現）と、1 dispatch にタイル化した最大 [`GPU_QUERY_TILE_MAX`] 本の
+/// クエリベクトルの内積を計算する（Issue #532: 1 dispatch = 1 クエリだった
+/// 旧構造を、1 dispatch = 複数クエリへ変更。CORE-6・8・16 ポインタ）。
+/// `unpack2x16float` は WGSL コア機能（`shader-f16` 拡張は不要）で、
+/// `batch_search.rs::unpack_f16x2` と同じビット解釈をとる。
 ///
-/// `params.row_stride` は「1 行あたりの `packed_rows` 要素数」（= `dim.div_ceil(2)`）
-/// を表す。[`DOT_SHADER_F32_WGSL`]（Issue #234・CORE-16 対照経路）と bind group
+/// 各スレッド（行 1 つを担当）は `packed_rows` の当該行を 1 回だけ読み、
+/// レジスタ配列 `acc`（要素数 `QUERY_TILE_MAX`。共有メモリは使わない設計上の
+/// 簡略化。§9 申し送り）へタイル内の全クエリ分を同時に積算する。これにより
+/// 常駐行列の HBM トラフィックはクエリ本数に比例せず、行 1 回読みをタイル幅
+/// 分のクエリで償却する（親 Issue #531 の目的である「行列トラフィックの
+/// Q 倍削減」の核）。
+///
+/// `params.row_stride` は「1 行あたりの `packed_rows` 要素数」（= `dim.div_ceil(2)`）、
+/// `params.query_stride` は「1 クエリあたりの `query` 配列要素数」
+/// （= `row_stride * 2`。f32 換算でパディング込み）を表す。`params.query_count`
+/// は本 dispatch が実際に処理するクエリ本数（`<= QUERY_TILE_MAX`）で、
+/// ホスト側（[`dispatch_dot_products`]）が保証し、シェーダ側でも `min` で
+/// クランプする（fail-closed。ホスト・シェーダ二重の範囲外アクセス防止）。
+/// [`DOT_SHADER_F32_WGSL`]（Issue #234・CORE-16 対照経路）と bind group
 /// layout（バインディング構成・各エントリの型）を共用するため `Params` の形は
-/// 揃えてあるが、`row_stride` の意味はシェーダごとに異なる（本シェーダでは
-/// 「u32 パック要素数」、f32 版では「f32 要素数 = dim」。[`dispatch_dot_products`]
-/// のドキュメンテーションコメント参照）。
+/// 揃えてあるが、`row_stride`/`query_stride` の意味はシェーダごとに異なる
+/// （本シェーダでは「u32 パック要素数」、f32 版では「f32 要素数 = dim」）。
 const DOT_SHADER_WGSL: &str = r#"
+const QUERY_TILE_MAX: u32 = 16u;
+
 struct Params {
     row_stride: u32,
     row_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    query_count: u32,
+    query_stride: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -104,9 +138,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.row_count) {
         return;
     }
+    let query_count = min(params.query_count, QUERY_TILE_MAX);
     let row = row_ids[i];
     let row_base = row * params.row_stride;
-    var acc: f32 = 0.0;
+
+    var acc: array<f32, QUERY_TILE_MAX>;
+    var qi: u32 = 0u;
+    loop {
+        if (qi >= QUERY_TILE_MAX) {
+            break;
+        }
+        acc[qi] = 0.0;
+        qi = qi + 1u;
+    }
+
     var j: u32 = 0u;
     loop {
         if (j >= params.row_stride) {
@@ -114,10 +159,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let packed = packed_rows[row_base + j];
         let unpacked = unpack2x16float(packed);
-        acc = acc + unpacked.x * query[j * 2u] + unpacked.y * query[j * 2u + 1u];
+        var q: u32 = 0u;
+        loop {
+            if (q >= query_count) {
+                break;
+            }
+            let qbase = q * params.query_stride + j * 2u;
+            acc[q] = acc[q] + unpacked.x * query[qbase] + unpacked.y * query[qbase + 1u];
+            q = q + 1u;
+        }
         j = j + 1u;
     }
-    scores[i] = acc;
+
+    var qo: u32 = 0u;
+    loop {
+        if (qo >= query_count) {
+            break;
+        }
+        scores[qo * params.row_count + i] = acc[qo];
+        qo = qo + 1u;
+    }
 }
 "#;
 
@@ -128,13 +189,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// 内積を計算する。バインディング構成（型・数）は [`DOT_SHADER_WGSL`] と同一の
 /// ため bind group layout を共用できる（WGSL の要素型 `array<u32>` vs
 /// `array<f32>` は wgpu のバインドグループレイアウト検証に現れない）。
-/// `params.row_stride` はここでは「1 行あたりの f32 要素数」= `dim` を表す。
+/// `params.row_stride`/`params.query_stride` はここでは「1 行・1 クエリあたりの
+/// f32 要素数」= `dim`（パディング無し）を表す。ディスパッチ構造・クエリタイル化
+/// （Issue #532）は [`DOT_SHADER_WGSL`] と同一の設計で、CORE-16 の A/B が
+/// 「f16 vs f32 常駐」の差のみを見るよう、両シェーダのタイル構造を意図的に
+/// 揃えている（行データの読み方だけが異なる）。
 const DOT_SHADER_F32_WGSL: &str = r#"
+const QUERY_TILE_MAX: u32 = 16u;
+
 struct Params {
     row_stride: u32,
     row_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    query_count: u32,
+    query_stride: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -149,28 +216,281 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.row_count) {
         return;
     }
+    let query_count = min(params.query_count, QUERY_TILE_MAX);
     let row = row_ids[i];
     let row_base = row * params.row_stride;
-    var acc: f32 = 0.0;
+
+    var acc: array<f32, QUERY_TILE_MAX>;
+    var qi: u32 = 0u;
+    loop {
+        if (qi >= QUERY_TILE_MAX) {
+            break;
+        }
+        acc[qi] = 0.0;
+        qi = qi + 1u;
+    }
+
     var j: u32 = 0u;
     loop {
         if (j >= params.row_stride) {
             break;
         }
-        acc = acc + rows[row_base + j] * query[j];
+        let v = rows[row_base + j];
+        var q: u32 = 0u;
+        loop {
+            if (q >= query_count) {
+                break;
+            }
+            acc[q] = acc[q] + v * query[q * params.query_stride + j];
+            q = q + 1u;
+        }
         j = j + 1u;
     }
-    scores[i] = acc;
+
+    var qo: u32 = 0u;
+    loop {
+        if (qo >= query_count) {
+            break;
+        }
+        scores[qo * params.row_count + i] = acc[qo];
+        qo = qo + 1u;
+    }
 }
 "#;
+
+/// workgroup 内部分 Top-k シェーダ（Issue #536）を `macro_rules!` で組み立てる。
+/// 行データの読み方（S0 内積）だけが常駐形式（f16 パック常駐 /
+/// f32 常駐対照）ごとに異なり、パラメータ構造・共通バインディング・
+/// Top-k 選出（S1・出力）はマクロ本体に 1 度だけ書かれた同一リテラルを
+/// 両方の呼び出しが共有する（`docs/design/gpu-batch-topk.md` 決定 1・3）。
+/// `concat!` はリテラルトークンしか受け付けないため（`const` 経由の断片は
+/// 渡せない）、可変部分だけを `:literal` マクロ引数として渡す構成にしている。
+///
+/// # 実装スコープの申し送り（決定 1 からの意図的な縮小）
+///
+/// ADR 決定 1 は「候補 B」（`SUBGROUP` 有効時に subgroup shuffle 段を使い、
+/// 無効時は共有メモリ＋バリアのみで同じ比較網を実行する）を採用としたが、
+/// 本実装は**共有メモリ＋バリアのみ（候補 A 相当）に統一**している。理由:
+/// naga 30.0.1 はバリアの一様性も subgroup builtin の一様性も検証しない
+/// （ADR §1.3 実測）ため、`use_subgroup` の分岐先で `li` の取り違え等が
+/// 起きてもコンパイル時・CI では検知できず、実機デバッグでしか発覚しない
+/// リスクがある。本 Issue の主目的（readback 量をクエリ本数×行数比例から
+/// 「ワークグループ数 × k_out」比例へ削減する）は共有メモリのみの構成でも
+/// 達成できるため、正しさの検証可能性を優先しこちらを採用した。
+/// subgroup shuffle 段の追加最適化は別途検討する（README/ADR・PR 本文へ
+/// 申し送り）。
+macro_rules! topk_dot_shader {
+    ($row_binding:literal, $row_read_loop:literal) => {
+        concat!(
+            r#"
+const WORKGROUP_SIZE: u32 = 256u;
+const TOPK_OUT_MAX: u32 = 256u;
+const QUERY_TILE_MAX: u32 = 16u;
+
+struct TopKParams {
+    row_stride: u32,
+    row_count: u32,
+    query_count: u32,
+    query_stride: u32,
+    k_out: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: TopKParams;
+"#,
+            $row_binding,
+            r#"
+@group(0) @binding(2) var<storage, read> row_ids: array<u32>;
+@group(0) @binding(3) var<storage, read> query: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out_topk: array<u32>;
+
+var<workgroup> sort_key: array<u32, 256>;
+var<workgroup> sort_slot: array<u32, 256>;
+
+// `f32::total_cmp`（`kernel.rs::MinHeapItem::cmp` の降順基準）と同順に
+// 単調な u32 キーへ写像する（ADR 決定 1）。符号ビットが立っていれば
+// 全ビット反転、立っていなければ符号ビットのみ立てる変換で、比較は常に
+// 符号なし整数比較で行う（`score_from_key`（ホスト側）が逆写像）。
+fn topk_score_key(score: f32) -> u32 {
+    let bits = bitcast<u32>(score);
+    if ((bits & 0x80000000u) != 0u) {
+        return ~bits;
+    }
+    return bits | 0x80000000u;
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_index) li: u32,
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    let i = gid.x;
+    let valid = i < params.row_count;
+    let query_count = min(params.query_count, QUERY_TILE_MAX);
+    let k_out = min(params.k_out, WORKGROUP_SIZE);
+    // `i >= params.row_count` でも `row_ids[i]`/`packed_rows[...]` の読み出しは
+    // WebGPU の robust buffer access 契約により未定義動作にはならない
+    // （範囲外は実装依存の値を返すのみ）。この経路の結果は `valid` が false の
+    // ため S1 で番兵へ強制されるので、読み出し値自体は使われない。
+    let row = row_ids[i];
+    let row_base = row * params.row_stride;
+
+    var acc: array<f32, QUERY_TILE_MAX>;
+    var qi: u32 = 0u;
+    loop {
+        if (qi >= QUERY_TILE_MAX) {
+            break;
+        }
+        acc[qi] = 0.0;
+        qi = qi + 1u;
+    }
+"#,
+            $row_read_loop,
+            r#"
+    var qidx: u32 = 0u;
+    loop {
+        if (qidx >= query_count) {
+            break;
+        }
+
+        let score = acc[qidx];
+        let score_bits = bitcast<u32>(score);
+        // `isNan`/`isInf` は fast-math で畳まれうるため使わず、指数ビットの
+        // パターンで非有限（Inf/NaN）を判定する（ADR §2.1）。
+        let is_finite = (score_bits & 0x7F800000u) != 0x7F800000u;
+
+        var key: u32 = 0u;
+        var slot: u32 = 0xFFFFFFFFu;
+        if (valid && is_finite) {
+            key = topk_score_key(score);
+            slot = row;
+        }
+
+        var size: u32 = 2u;
+        loop {
+            if (size > WORKGROUP_SIZE) {
+                break;
+            }
+            var stride: u32 = size >> 1u;
+            loop {
+                if (stride == 0u) {
+                    break;
+                }
+
+                sort_key[li] = key;
+                sort_slot[li] = slot;
+                workgroupBarrier();
+
+                let partner_li = li ^ stride;
+                let partner_key = sort_key[partner_li];
+                let partner_slot = sort_slot[partner_li];
+                workgroupBarrier();
+
+                let dir_up = (li & size) == 0u;
+                let is_low = (li & stride) == 0u;
+                let want_better = is_low == dir_up;
+                let self_better =
+                    (key > partner_key) || (key == partner_key && slot < partner_slot);
+
+                if (want_better) {
+                    if (!self_better) {
+                        key = partner_key;
+                        slot = partner_slot;
+                    }
+                } else {
+                    if (self_better) {
+                        key = partner_key;
+                        slot = partner_slot;
+                    }
+                }
+
+                stride = stride >> 1u;
+            }
+            size = size << 1u;
+        }
+
+        if (li < k_out) {
+            let out_base = ((qidx * num_wg.x + wg_id.x) * k_out + li) * 2u;
+            out_topk[out_base] = key;
+            out_topk[out_base + 1u] = slot;
+        }
+
+        qidx = qidx + 1u;
+    }
+}
+"#,
+        )
+    };
+}
+
+/// workgroup 内部分 Top-k シェーダ（f16 パック常駐・本番経路）。
+/// [`GpuBatchBackend`] が [`select_readback_mode`] で `PartialTopK` を
+/// 選んだ場合に使う（Issue #536）。S0 は [`DOT_SHADER_WGSL`] の演算順と
+/// 完全に同一（スコアのビット同一契約の根拠）。
+const DOT_SHADER_TOPK_WGSL: &str = topk_dot_shader!(
+    "\n@group(0) @binding(1) var<storage, read> packed_rows: array<u32>;\n",
+    r#"
+    var j: u32 = 0u;
+    loop {
+        if (j >= params.row_stride) {
+            break;
+        }
+        let packed = packed_rows[row_base + j];
+        let unpacked = unpack2x16float(packed);
+        var q: u32 = 0u;
+        loop {
+            if (q >= query_count) {
+                break;
+            }
+            let qbase = q * params.query_stride + j * 2u;
+            acc[q] = acc[q] + unpacked.x * query[qbase] + unpacked.y * query[qbase + 1u];
+            q = q + 1u;
+        }
+        j = j + 1u;
+    }
+"#
+);
+
+/// workgroup 内部分 Top-k シェーダ（f32 常駐対照・CORE-16 公平性のため
+/// [`GpuF32ContrastBackend`] にも用意する。ADR §2.1「決定事項」）。S0 は
+/// [`DOT_SHADER_F32_WGSL`] の演算順と完全に同一。
+const DOT_SHADER_TOPK_F32_WGSL: &str = topk_dot_shader!(
+    "\n@group(0) @binding(1) var<storage, read> rows: array<f32>;\n",
+    r#"
+    var j: u32 = 0u;
+    loop {
+        if (j >= params.row_stride) {
+            break;
+        }
+        let v = rows[row_base + j];
+        var q: u32 = 0u;
+        loop {
+            if (q >= query_count) {
+                break;
+            }
+            acc[q] = acc[q] + v * query[q * params.query_stride + j];
+            q = q + 1u;
+        }
+        j = j + 1u;
+    }
+"#
+);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct GpuParams {
     row_stride: u32,
     row_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    /// 本 dispatch が処理するクエリ本数（`<= GPU_QUERY_TILE_MAX`。Issue #532）。
+    /// 旧 `_pad0` を転用（bind group layout・`GpuParams` のバイト長は不変）。
+    query_count: u32,
+    /// 1 クエリあたりの `query` 配列要素数（f16 経路: `row_stride * 2`、
+    /// f32 対照経路: `row_stride` と同値の `dim`）。旧 `_pad1` を転用。
+    query_stride: u32,
 }
 
 impl GpuParams {
@@ -183,10 +503,247 @@ impl GpuParams {
         try_reserve_bytes(&mut out, 16)?;
         out.extend_from_slice(&self.row_stride.to_ne_bytes());
         out.extend_from_slice(&self.row_count.to_ne_bytes());
-        out.extend_from_slice(&self._pad0.to_ne_bytes());
-        out.extend_from_slice(&self._pad1.to_ne_bytes());
+        out.extend_from_slice(&self.query_count.to_ne_bytes());
+        out.extend_from_slice(&self.query_stride.to_ne_bytes());
         Ok(out)
     }
+}
+
+/// [`DOT_SHADER_TOPK_WGSL`]/[`DOT_SHADER_TOPK_F32_WGSL`] の `TopKParams`
+/// （32 バイト）と一致するホスト側パラメータ（Issue #536）。`GpuParams` の
+/// 4 フィールドに `k_out` を加え、32 バイト境界へパディングする。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GpuTopKParams {
+    row_stride: u32,
+    row_count: u32,
+    query_count: u32,
+    query_stride: u32,
+    /// 1 ワークグループが出力する候補数（`<= GPU_TOPK_OUT_MAX`。シェーダ側も
+    /// `min` でクランプする二重防御）。
+    k_out: u32,
+}
+
+impl GpuTopKParams {
+    /// WGSL `TopKParams` とフィールド順を一致させ、32 バイトへパディングする
+    /// （`dot_topk_shader_params_size_matches_host_constant` で機械検証）。
+    fn to_ne_bytes_vec(self) -> Result<Vec<u8>, BatchBackendError> {
+        let mut out = Vec::new();
+        try_reserve_bytes(&mut out, 32)?;
+        out.extend_from_slice(&self.row_stride.to_ne_bytes());
+        out.extend_from_slice(&self.row_count.to_ne_bytes());
+        out.extend_from_slice(&self.query_count.to_ne_bytes());
+        out.extend_from_slice(&self.query_stride.to_ne_bytes());
+        out.extend_from_slice(&self.k_out.to_ne_bytes());
+        out.extend_from_slice(&0u32.to_ne_bytes());
+        out.extend_from_slice(&0u32.to_ne_bytes());
+        out.extend_from_slice(&0u32.to_ne_bytes());
+        Ok(out)
+    }
+}
+
+/// `topk_dot_shader!` マクロが生成する WGSL 内 `topk_score_key` のホスト側
+/// 等価物。`f32::total_cmp`（`kernel.rs::MinHeapItem::cmp` の降順基準）と
+/// 同順に単調な u32 キーへ写像する（ADR 決定 1）。[`score_from_key`] の逆
+/// 写像との往復・順序保存の単体テストでのみ使う（GPU からの readback
+/// デコードは常に逆方向の `score_from_key` のみを要する）ため、production
+/// 経路からは呼ばれない。
+#[cfg_attr(not(test), allow(dead_code))]
+fn score_key(score: f32) -> u32 {
+    let bits = score.to_bits();
+    if (bits & 0x8000_0000) != 0 {
+        !bits
+    } else {
+        bits | 0x8000_0000
+    }
+}
+
+/// [`score_key`] の逆写像（往復でビット同一）。`key` の最上位ビットが
+/// 立っていれば元の符号ビットは 0（`score_key` が OR で強制した側）だった
+/// と分かるため下位 31 ビットをそのまま復元し、立っていなければ元は符号1
+/// 側だったとして全ビット反転で復元する。
+fn score_from_key(key: u32) -> f32 {
+    let bits = if (key & 0x8000_0000) != 0 {
+        key & 0x7FFF_FFFF
+    } else {
+        !key
+    };
+    f32::from_bits(bits)
+}
+
+/// [`GpuBatchBackend::batch_search`]/[`GpuF32ContrastBackend::batch_search`]
+/// が 1 dispatch の readback 方式を決める fail-closed な純関数（GPU デバイス
+/// 非依存。ADR 決定 2）。Top-k パイプラインが利用不能、またはタイル内の
+/// クエリが要求する `k` の最大値が [`GPU_TOPK_OUT_MAX`] を超える場合は
+/// 常に既存の全量 readback へ縮退し、部分結果を返さない。
+///
+/// 実装スコープの申し送り（[`DOT_SHADER_TOPK_WGSL`] doc 参照）: 本実装は
+/// 共有メモリのみの Top-k シェーダに統一しているため、ADR 決定 2 が挙げる
+/// `SUBGROUP` 可用性・subgroup サイズ範囲の判定は行わない（Top-k パイプライン
+/// 自体の生成可否のみで判定する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuReadbackMode {
+    FullScores,
+    PartialTopK { k_out: usize },
+}
+
+fn select_readback_mode(topk_pipeline_available: bool, tile_max_k: usize) -> GpuReadbackMode {
+    if !topk_pipeline_available || tile_max_k == 0 || tile_max_k > GPU_TOPK_OUT_MAX as usize {
+        return GpuReadbackMode::FullScores;
+    }
+    GpuReadbackMode::PartialTopK { k_out: tile_max_k }
+}
+
+/// [`GpuReadbackMode::PartialTopK`] 経路の 1 dispatch あたり行チャンク数を
+/// fail-closed に決める純関数（ADR 決定 3）。1 チャンクの readback バイト数
+/// `width × ceil(chunk_rows / GPU_WORKGROUP_SIZE) × k_out × 8`（`(key,slot)`
+/// 各 4 byte の u32 ペア）`+ chunk_rows × 4`（行 index バッファ）が
+/// `budget_bytes` を超えない最大の `chunk_rows` を、ワークグループ数を
+/// 1 から `max_workgroups_per_dimension` まで増やしながら求める
+/// （ワークグループ数を固定すれば出力バイト数も固定され、その中で
+/// `chunk_rows` を大きくするコストは行 index バッファの線形増分のみのため、
+/// 各ワークグループ数の上限 `chunk_rows` で予算を再評価すれば最大値に届く）。
+fn plan_partial_topk_chunk_rows(
+    width: usize,
+    k_out: usize,
+    budget_bytes: usize,
+    max_workgroups_per_dimension: u32,
+) -> usize {
+    let width_u64 = width.max(1) as u64;
+    let k_out_u64 = (k_out.clamp(1, GPU_TOPK_OUT_MAX as usize)) as u64;
+    let per_workgroup_output_bytes = width_u64.saturating_mul(k_out_u64).saturating_mul(8);
+    let budget = budget_bytes as u64;
+    let max_wg = (max_workgroups_per_dimension.max(1)) as u64;
+
+    let mut best_chunk_rows: u64 = 0;
+    let mut wg: u64 = 1;
+    while wg <= max_wg {
+        let bracket_top = wg.saturating_mul(GPU_WORKGROUP_SIZE as u64);
+        let bracket_bottom = (wg - 1).saturating_mul(GPU_WORKGROUP_SIZE as u64) + 1;
+        let fixed_cost = per_workgroup_output_bytes.saturating_mul(wg);
+        if fixed_cost >= budget {
+            break;
+        }
+        let remaining = budget.saturating_sub(fixed_cost);
+        let max_rows_by_bytes = remaining / 4;
+        let candidate = max_rows_by_bytes.min(bracket_top);
+        if candidate < bracket_bottom {
+            break;
+        }
+        best_chunk_rows = candidate;
+        wg = wg.saturating_add(1);
+    }
+
+    usize::try_from(best_chunk_rows)
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
+/// GPU から readback した部分 Top-k 候補列（`(key: u32, slot: u32)` を
+/// `num_workgroups × k_out` 件（クエリごと）並べたもの）を、対応する
+/// `chunk`（[`gather_reachable_rows`] が返す昇順スロット列）と照合しつつ
+/// クエリごとの [`TopKSelector`] へ push する（ADR 決定 3。GPU デバイス
+/// 非依存の純関数で単体テスト対象）。
+///
+/// - 件数不一致（readback 破損の疑い）は [`BatchBackendError::TransferFailed`]。
+/// - 番兵（`slot == 0xFFFFFFFF`）は skip。
+/// - 番兵以外の `slot` が `chunk` に存在しない場合は readback 破損とみなし
+///   `TransferFailed`（部分結果を返さない。fail-closed）。
+/// - 非有限スコア（キー変換の往復で `!is_finite()` になったもの）は
+///   `TopKSelector::push` 側の無視と二重に skip する。
+fn merge_partial_topk_readback(
+    readback: &[u32],
+    chunk: &[u32],
+    width: usize,
+    num_workgroups: usize,
+    k_out: usize,
+    selectors: &mut [Option<TopKSelector>],
+) -> Result<(), BatchBackendError> {
+    let expected_len = width
+        .checked_mul(num_workgroups)
+        .and_then(|v| v.checked_mul(k_out))
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| {
+            BatchBackendError::TransferFailed("partial topk readback size overflow".to_string())
+        })?;
+    if readback.len() != expected_len {
+        return Err(BatchBackendError::TransferFailed(
+            "partial topk readback length mismatch".to_string(),
+        ));
+    }
+
+    for q in 0..width {
+        let Some(selector_slot) = selectors.get_mut(q) else {
+            continue;
+        };
+        let Some(selector) = selector_slot.as_mut() else {
+            continue;
+        };
+        for wg in 0..num_workgroups {
+            for slot_idx in 0..k_out {
+                let base = ((q * num_workgroups + wg) * k_out + slot_idx) * 2;
+                let (Some(&key), Some(&slot)) = (readback.get(base), readback.get(base + 1)) else {
+                    return Err(BatchBackendError::TransferFailed(
+                        "partial topk readback index out of range".to_string(),
+                    ));
+                };
+                if slot == u32::MAX {
+                    continue;
+                }
+                if chunk.binary_search(&slot).is_err() {
+                    return Err(BatchBackendError::TransferFailed(
+                        "partial topk readback slot outside dispatched chunk".to_string(),
+                    ));
+                }
+                let score = score_from_key(key);
+                if !score.is_finite() {
+                    continue;
+                }
+                selector.push(CandidateHit {
+                    id: u64::from(slot),
+                    score,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`GpuBatchBackend`]/[`GpuF32ContrastBackend`] の readback 方式別 dispatch
+/// 回数・バイト数を数える統計（Issue #536・#537 が前後比較・非 vacuous 判定に
+/// 使う `stats()` の実体）。可視性判定・スコア計算には一切関与しない
+/// 性能観測専用のカウンタで、テナント・行数・可視カーディナリティは
+/// 保持しない。
+#[derive(Debug, Default)]
+struct GpuBatchStats {
+    partial_topk_dispatches: std::sync::atomic::AtomicU64,
+    full_readback_dispatches: std::sync::atomic::AtomicU64,
+    /// Top-k パイプラインは利用可能だが、当該タイルの `k` が
+    /// [`GPU_TOPK_OUT_MAX`] を超える等の理由で全量 readback へ縮退した回数
+    /// （ADR 決定 2 の縮退が実際に発生した観測点）。
+    full_readback_fallbacks: std::sync::atomic::AtomicU64,
+    readback_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl GpuBatchStats {
+    fn snapshot(&self) -> GpuBatchStatsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        GpuBatchStatsSnapshot {
+            partial_topk_dispatches: self.partial_topk_dispatches.load(Relaxed),
+            full_readback_dispatches: self.full_readback_dispatches.load(Relaxed),
+            full_readback_fallbacks: self.full_readback_fallbacks.load(Relaxed),
+            readback_bytes: self.readback_bytes.load(Relaxed),
+        }
+    }
+}
+
+/// [`GpuBatchStats`] の外部公開スナップショット（`stats()` の戻り値）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GpuBatchStatsSnapshot {
+    pub partial_topk_dispatches: u64,
+    pub full_readback_dispatches: u64,
+    pub full_readback_fallbacks: u64,
+    pub readback_bytes: u64,
 }
 
 /// プロセス共有の GPU デバイス文脈（adapter/device/queue/pipeline）。
@@ -196,6 +753,16 @@ struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    /// workgroup 内部分 Top-k パイプライン（f16 パック常駐・本番経路。
+    /// Issue #536）。シェーダ生成・検証に失敗した場合も `init_gpu_context`
+    /// 自体は失敗させず `None` にする（ADR 決定 2: 段階的 fail-closed 縮退。
+    /// 呼び出し元は [`select_readback_mode`] で常に全量 readback 側へ倒れる）。
+    topk_pipeline: Option<wgpu::ComputePipeline>,
+    /// [`topk_pipeline`] が `None` になった理由（英語・adapter 名やテナント
+    /// 情報を含まない）。診断・`EXPLAIN` 等の将来的な露出のために保持するが、
+    /// 本 Issue では未参照（`#[allow(dead_code)]`）。
+    #[allow(dead_code)]
+    topk_unavailable_reason: Option<String>,
     bind_group_layout: wgpu::BindGroupLayout,
     max_storage_buffer_binding_size: u64,
     max_workgroups_per_dimension: u32,
@@ -361,16 +928,84 @@ fn init_gpu_context() -> Result<GpuContext, String> {
         MAX_WORKGROUPS_PER_DIMENSION_FALLBACK
     };
 
+    // Top-k パイプラインの生成は独立した error scope で試み、失敗しても
+    // `init_gpu_context` 自体は失敗させない（ADR 決定 2: 段階的 fail-closed
+    // 縮退。本番の内積 dispatch 経路は Top-k 抜きでも従来どおり動く）。
+    let (topk_pipeline, topk_unavailable_reason) =
+        match create_topk_pipeline(&device, &bind_group_layout, DOT_SHADER_TOPK_WGSL, "f16") {
+            Ok(p) => (Some(p), None),
+            Err(msg) => (None, Some(msg)),
+        };
+
     Ok(GpuContext {
         device,
         queue,
         pipeline,
+        topk_pipeline,
+        topk_unavailable_reason,
         bind_group_layout,
         max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
         max_workgroups_per_dimension,
         device_lost,
         uncaptured_error,
     })
+}
+
+/// [`GpuContext::topk_pipeline`]／CORE-16 対照経路の Top-k パイプライン生成
+/// 共通処理（Issue #536）。既存パイプライン生成（`init_gpu_context`・
+/// `init_f32_contrast_pipeline`）と同じ手順（独立 error scope → シェーダ・
+/// パイプライン生成 → LIFO pop → 失敗を `Err(String)` へ写像）を踏むが、
+/// 失敗を上位へ伝播させるだけで `init_gpu_context` 全体を失敗させない
+/// （呼び出し元が `Option` へ吸収する）。
+fn create_topk_pipeline(
+    device: &wgpu::Device,
+    bind_group_layout: &wgpu::BindGroupLayout,
+    shader_src: &str,
+    label: &str,
+) -> Result<wgpu::ComputePipeline, String> {
+    let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("batch dot product topk"),
+        source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("batch dot product topk pipeline layout"),
+        bind_group_layouts: &[Some(bind_group_layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("batch dot product topk pipeline"),
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+
+    if block_on_with_device_poll(device, oom_scope.pop())
+        .map_err(|_| {
+            format!("device poll failed or timed out during {label} topk pipeline creation")
+        })?
+        .is_some()
+    {
+        return Err(format!(
+            "gpu out of memory during {label} topk pipeline creation"
+        ));
+    }
+    if block_on_with_device_poll(device, validation_scope.pop())
+        .map_err(|_| {
+            format!("device poll failed or timed out during {label} topk pipeline creation")
+        })?
+        .is_some()
+    {
+        return Err(format!(
+            "gpu validation error during {label} topk pipeline creation"
+        ));
+    }
+
+    Ok(pipeline)
 }
 
 /// CORE-16 対照経路（[`GpuF32ContrastBackend`]）専用の compute pipeline を
@@ -382,8 +1017,8 @@ fn init_gpu_context() -> Result<GpuContext, String> {
 /// bind group layout は本番経路と共用する（[`DOT_SHADER_F32_WGSL`] のドキュメント
 /// コメント参照。バインディング構成が同一のため wgpu のレイアウト検証上は
 /// 区別されない）。
-fn f32_contrast_pipeline() -> Result<&'static wgpu::ComputePipeline, String> {
-    static PIPELINE: OnceLock<Result<wgpu::ComputePipeline, String>> = OnceLock::new();
+fn f32_contrast_pipeline() -> Result<&'static ContrastPipelines, String> {
+    static PIPELINE: OnceLock<Result<ContrastPipelines, String>> = OnceLock::new();
     let ctx = global_context().as_ref().map_err(String::clone)?;
     let result = PIPELINE.get_or_init(|| {
         // 生成は本番 dispatch と同じプロセス単位ロックの下で行う（codex P1
@@ -396,11 +1031,20 @@ fn f32_contrast_pipeline() -> Result<&'static wgpu::ComputePipeline, String> {
     result.as_ref().map_err(String::clone)
 }
 
+/// [`f32_contrast_pipeline`] が保持する対照経路の compute pipeline 一式
+/// （Issue #536: 内積本体 `dot` に加え、CORE-16 の公平性のため workgroup 内
+/// 部分 Top-k パイプライン `topk` も同じ生成タイミングで確保する）。
+struct ContrastPipelines {
+    dot: wgpu::ComputePipeline,
+    topk: Option<wgpu::ComputePipeline>,
+}
+
 /// [`f32_contrast_pipeline`] の初期化本体。`init_gpu_context` のパイプライン
 /// 生成部と同じ手順（error scope で生成失敗を捕捉 → `Err` へ写像）を踏むが、
 /// device/queue/bind_group_layout は共有の [`GpuContext`] から借用するだけで
-/// 新規作成しない。
-fn init_f32_contrast_pipeline(ctx: &GpuContext) -> Result<wgpu::ComputePipeline, String> {
+/// 新規作成しない。Top-k パイプラインの生成失敗は本体（`dot`）の初期化を
+/// 失敗させず `None` に吸収する（[`GpuContext::topk_pipeline`] と同方針）。
+fn init_f32_contrast_pipeline(ctx: &GpuContext) -> Result<ContrastPipelines, String> {
     let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
 
@@ -445,7 +1089,18 @@ fn init_f32_contrast_pipeline(ctx: &GpuContext) -> Result<wgpu::ComputePipeline,
         return Err("gpu validation error during f32 contrast pipeline creation".to_string());
     }
 
-    Ok(pipeline)
+    let topk = create_topk_pipeline(
+        &ctx.device,
+        &ctx.bind_group_layout,
+        DOT_SHADER_TOPK_F32_WGSL,
+        "f32 contrast",
+    )
+    .ok();
+
+    Ok(ContrastPipelines {
+        dot: pipeline,
+        topk,
+    })
 }
 
 fn storage_layout_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
@@ -568,6 +1223,10 @@ pub struct GpuBatchBackend {
     /// wgpu エラーの記録）。`batch_search` 冒頭で参照し、記録があれば GPU 経路を
     /// 使わず backend エラーを返して CPU 縮退（CORE-8）へ倒す。
     uncaptured_error: std::sync::Arc<AtomicBool>,
+    /// readback 方式別の dispatch 回数・バイト数（Issue #536・#537 が
+    /// `stats()` 経由で読む）。インスタンス単位（`GpuContext` のようなプロセス
+    /// 共有ではない）で、このバックエンドが処理した dispatch のみを数える。
+    stats: std::sync::Arc<GpuBatchStats>,
 }
 
 impl GpuBatchBackend {
@@ -651,7 +1310,14 @@ impl GpuBatchBackend {
             row_buffer,
             device_lost: ctx.device_lost.clone(),
             uncaptured_error: ctx.uncaptured_error.clone(),
+            stats: std::sync::Arc::new(GpuBatchStats::default()),
         })
+    }
+
+    /// readback 方式別の dispatch 回数・バイト数のスナップショット
+    /// （Issue #536。#537 の前後比較・非 vacuous 判定が読む）。
+    pub fn stats(&self) -> GpuBatchStatsSnapshot {
+        self.stats.snapshot()
     }
 }
 
@@ -693,6 +1359,13 @@ fn try_reserve_f32(buf: &mut Vec<f32>, additional: usize) -> Result<(), BatchBac
     })
 }
 
+/// [`try_reserve_f32`] の `u32` 版（[`u32_vec_from_ne_bytes`] が使う）。
+fn try_reserve_u32(buf: &mut Vec<u32>, additional: usize) -> Result<(), BatchBackendError> {
+    buf.try_reserve_exact(additional).map_err(|_| {
+        BatchBackendError::TransferFailed("readback buffer allocation failed".to_string())
+    })
+}
+
 /// GPU の readback バッファから `f32` 列を復元する（`from_ne_bytes`。
 /// `bytemuck` 不採用）。長さが 4 の倍数でない場合は空を返す（呼び出し元が
 /// バッファサイズを 4 の倍数で確保しているため通常到達しないが、fail-closed
@@ -715,8 +1388,33 @@ fn f32_vec_from_ne_bytes(bytes: &[u8]) -> Result<Vec<f32>, BatchBackendError> {
     Ok(out)
 }
 
-impl BatchBackend for GpuBatchBackend {
-    fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
+impl GpuBatchBackend {
+    /// [`BatchBackend::batch_search`] の実体。スコアバッファ予算
+    /// （`budget_bytes`）を呼び出し元から受け取る内部共通経路にし、
+    /// 既定の公開経路（trait 実装）は常に [`GPU_SCORE_BUFFER_BUDGET_BYTES`]
+    /// を使う。テスト・ベンチ専用に小さい予算を注入して行チャンク分割を
+    /// 強制する経路（[`Self::batch_search_with_row_budget_for_tests`]）と
+    /// 実装を共有するための分離（Issue #532 codex-review P2 指摘対応:
+    /// 端数を含む複数行チャンクを実 GPU dispatch 経由で検証できるようにする）。
+    fn batch_search_with_budget(
+        &self,
+        queries: &[BatchQuery<'_>],
+        budget_bytes: usize,
+    ) -> Result<Vec<BatchHit>, BatchExecError> {
+        self.batch_search_with_budget_and_mode(queries, budget_bytes, false)
+    }
+
+    /// [`Self::batch_search_with_budget`] へ「常に全量 readback 経路を使う」
+    /// 強制フラグを加えた内部共通経路（Issue #536）。`force_full_readback`
+    /// は Top-k パイプラインの可用性に関わらず [`GpuReadbackMode::FullScores`]
+    /// を選ばせるテスト・ベンチ専用のオーバーライドで、実 GPU dispatch 経由の
+    /// ビット同一検証（`batch_search_with_options_for_tests`）にのみ使う。
+    fn batch_search_with_budget_and_mode(
+        &self,
+        queries: &[BatchQuery<'_>],
+        budget_bytes: usize,
+        force_full_readback: bool,
+    ) -> Result<Vec<BatchHit>, BatchExecError> {
         if self.device_lost.load(Ordering::SeqCst) {
             return Err(BatchExecError::Backend(BatchBackendError::DeviceLost(
                 "gpu device lost".to_string(),
@@ -774,64 +1472,345 @@ impl BatchBackend for GpuBatchBackend {
         let dim_half = dim.div_ceil(2);
         let query_stride = dim_half.saturating_mul(2);
 
-        // `Vec::with_capacity`（abort-on-OOM）ではなくフォールブル確保にする
-        // （CPU 経路 `run_batch_search` の `out` と同じ方針。Issue #178 レビュー指摘）。
-        let mut hits: Vec<BatchHit> = Vec::new();
-        try_reserve_exact(&mut hits, queries.len(), "gpu batch results")
-            .map_err(BatchExecError::Input)?;
-        for q in queries {
-            let reachable = gather_reachable_rows(&self.matrix, q.ctx)
-                .map_err(|e| BatchExecError::Input(e.into_batch_search_error()))?;
+        let target = DotDispatchTarget {
+            pipeline: &ctx.pipeline,
+            topk_pipeline: ctx.topk_pipeline.as_ref(),
+            row_buffer: &self.row_buffer,
+            bind_group_layout: self.bind_group_layout_ref(ctx),
+            row_stride: dim_half as u32,
+        };
 
-            let mut selector = TopKSelector::new(q.k);
+        run_tiled_batch_search(
+            ctx,
+            &self.matrix,
+            queries,
+            &target,
+            query_stride,
+            RunTiledBatchSearchOptions {
+                budget_bytes,
+                force_full_readback,
+                stats: &self.stats,
+            },
+        )
+    }
 
-            // 行数がバッファ予算を超える場合は複数回の dispatch に分割する
-            // （GPU_SCORE_BUFFER_BUDGET_BYTES ポインタ）。各チャンクは独立に
-            // 実行し、選出器へ逐次 push するため正しさに影響しない。
-            let chunk_rows = gpu_chunk_row_capacity(ctx);
-            let target = DotDispatchTarget {
-                pipeline: &ctx.pipeline,
-                row_buffer: &self.row_buffer,
-                bind_group_layout: self.bind_group_layout_ref(ctx),
-                row_stride: dim_half as u32,
+    /// **テスト・ベンチ専用**。[`Self::batch_search_with_budget`] へ任意の
+    /// スコアバッファ予算を注入し、`GPU_SCORE_BUFFER_BUDGET_BYTES`（既定
+    /// 32MiB）では通常のデバイス上で発生しない行チャンク分割（端数を含む
+    /// 複数行チャンク）を実 GPU dispatch 経由で強制的に発生させる
+    /// （Issue #532 codex-review P2 指摘対応。`plan_query_tile` の単体テストは
+    /// 分割境界の算出だけを検証しており、実際の dispatch・readback・
+    /// `TopKSelector` への累積までは通していなかった）。非既定 feature
+    /// `bench-internals` でのみ公開する（`hybrid.rs::sparse_refetch_observed`
+    /// と同パターン。既定ビルド・`wire-server` からは到達不能で、テナント
+    /// 境界・RLS 迂回 API は一切露出しない——`budget_bytes` は dispatch を
+    /// 何回に分けるかだけを左右する純粋な性能パラメータであり、可視性判定・
+    /// スコア計算そのものには関与しない）。
+    #[cfg(feature = "bench-internals")]
+    pub fn batch_search_with_row_budget_for_tests(
+        &self,
+        queries: &[BatchQuery<'_>],
+        budget_bytes: usize,
+    ) -> Result<Vec<BatchHit>, BatchExecError> {
+        self.batch_search_with_budget(queries, budget_bytes)
+    }
+
+    /// **テスト・ベンチ専用**（Issue #536）。[`GpuSearchTestOptions`] 経由で
+    /// 「常に全量 readback 経路を使う」強制フラグを注入し、既定経路
+    /// （workgroup 内部分 Top-k）と全量 readback 経路の結果が実 GPU dispatch
+    /// 経由でビット同一であることを結合テストから検証できるようにする
+    /// （`tests/gpu_batch.rs`）。`budget_bytes`・`force_full_readback` は
+    /// いずれも dispatch の分割方式・readback 方式だけを左右する性能
+    /// パラメータであり、可視性判定・スコア計算そのものには関与しない
+    /// （[`batch_search_with_row_budget_for_tests`] と同じ露出方針）。
+    #[cfg(feature = "bench-internals")]
+    pub fn batch_search_with_options_for_tests(
+        &self,
+        queries: &[BatchQuery<'_>],
+        options: GpuSearchTestOptions,
+    ) -> Result<Vec<BatchHit>, BatchExecError> {
+        self.batch_search_with_budget_and_mode(
+            queries,
+            options.budget_bytes,
+            options.force_full_readback,
+        )
+    }
+}
+
+/// [`GpuBatchBackend::batch_search_with_options_for_tests`] へ渡すオプション
+/// （`bench-internals` feature 限定。Issue #536）。
+#[cfg(feature = "bench-internals")]
+#[derive(Debug, Clone, Copy)]
+pub struct GpuSearchTestOptions {
+    pub budget_bytes: usize,
+    pub force_full_readback: bool,
+}
+
+impl BatchBackend for GpuBatchBackend {
+    fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
+        self.batch_search_with_budget(queries, GPU_SCORE_BUFFER_BUDGET_BYTES)
+    }
+}
+
+/// [`GpuBatchBackend::batch_search`]/[`GpuF32ContrastBackend::batch_search`]
+/// が共有する dispatch 本体（Issue #532・R1）。クエリを [`group_queries_by_ctx`]
+/// で `PolicyContext` 単位にグループ化し、グループごとに [`gather_reachable_rows`]
+/// を 1 回だけ実行したうえで、[`plan_query_tile`] が決めた幅 Q でクエリを
+/// タイル化し 1 dispatch へ束ねる。f16/f32 の差異は呼び出し元が組み立てる
+/// `target`・`query_stride` のみに閉じ込め、タイル化・グループ化のロジック
+/// 自体は両バックエンドで完全に共有する。
+///
+/// テナント境界（P0）: タイル内の全クエリが同一 `PolicyContext` であることは
+/// `group_queries_by_ctx` の構成上保証されるため、1 回の `gather_reachable_rows`
+/// 呼び出し結果をタイル内の全クエリで安全に共有できる（異なる可視性のクエリが
+/// 同じ行集合を参照する経路は作らない）。選出後の解決は既存どおり
+/// [`finalize_gpu_hits`]（`PolicyContext::is_visible` 単一照合パス）が
+/// クエリごとに独立して再検証する。
+/// [`run_tiled_batch_search`] へ渡す readback 方式関連の付随パラメータを
+/// 束ねる（clippy `too_many_arguments` を避けるため。Issue #536）。
+struct RunTiledBatchSearchOptions<'a> {
+    budget_bytes: usize,
+    /// テスト・ベンチ専用のオーバーライド（`GpuSearchTestOptions`）。常に
+    /// `GpuReadbackMode::FullScores` を選ばせる。
+    force_full_readback: bool,
+    stats: &'a GpuBatchStats,
+}
+
+fn run_tiled_batch_search(
+    ctx: &GpuContext,
+    matrix: &crate::batch_search::ResidentMatrix,
+    queries: &[BatchQuery<'_>],
+    target: &DotDispatchTarget<'_>,
+    query_stride: usize,
+    opts: RunTiledBatchSearchOptions<'_>,
+) -> Result<Vec<BatchHit>, BatchExecError> {
+    let RunTiledBatchSearchOptions {
+        budget_bytes,
+        force_full_readback,
+        stats,
+    } = opts;
+    let groups = group_queries_by_ctx(queries);
+
+    // 結果は入力順で復元する（`Vec<Option<_>>` → 全件 `Some` 検証で
+    // fail-closed に欠落を検知する。§4.2 ポインタ）。
+    let mut results: Vec<Option<BatchHit>> = Vec::new();
+    try_reserve_exact(&mut results, queries.len(), "gpu tiled batch results")
+        .map_err(BatchExecError::Input)?;
+    results.resize_with(queries.len(), || None);
+
+    for group in &groups {
+        let Some(&first_idx) = group.first() else {
+            continue;
+        };
+        let group_ctx = queries.get(first_idx).map(|q| q.ctx).ok_or_else(|| {
+            BatchExecError::Backend(BatchBackendError::KernelLaunchFailed(
+                "query group index out of range".to_string(),
+            ))
+        })?;
+        let reachable = gather_reachable_rows(matrix, group_ctx)
+            .map_err(|e| BatchExecError::Input(e.into_batch_search_error()))?;
+
+        let plan = plan_query_tile(group.len(), budget_bytes, ctx.max_workgroups_per_dimension);
+
+        for tile in group.chunks(plan.width.max(1)) {
+            let width = tile.len();
+
+            // タイル内の各クエリを `query_stride` へパディングして連結する
+            // （§4.2「行データを 1 回読みで償却」の前提: シェーダは同じ行
+            // データをタイル幅ぶんのクエリで再利用するため、クエリ側は
+            // 固定ストライドで並んでいる必要がある）。
+            let mut queries_concat: Vec<f32> = Vec::new();
+            try_reserve_f32(&mut queries_concat, width.saturating_mul(query_stride))
+                .map_err(BatchExecError::Backend)?;
+            for &qi in tile {
+                let vector = queries.get(qi).map(|q| q.vector).ok_or_else(|| {
+                    BatchExecError::Backend(BatchBackendError::KernelLaunchFailed(
+                        "query tile index out of range".to_string(),
+                    ))
+                })?;
+                let before = queries_concat.len();
+                queries_concat.extend_from_slice(vector);
+                let padded_len = before.saturating_add(query_stride);
+                queries_concat.resize(padded_len.max(queries_concat.len()), 0.0);
+            }
+
+            // クエリごとに独立した選出器（`Option` で保持し、確定後に
+            // `take` で 1 度だけ取り出す。`TopKSelector::into_sorted_vec`
+            // が `self` を消費するため）。
+            let mut selectors: Vec<Option<TopKSelector>> = Vec::new();
+            try_reserve_exact(&mut selectors, width, "gpu tile selectors")
+                .map_err(BatchExecError::Input)?;
+            for &qi in tile {
+                let k = queries.get(qi).map(|q| q.k).unwrap_or(0);
+                selectors.push(Some(TopKSelector::new(k)));
+            }
+
+            // タイル内クエリの `k` の最大値で readback 方式を決める
+            // （ADR 決定 2。`select_readback_mode` は GPU デバイス非依存の
+            // 純関数で単体テスト対象）。`force_full_readback` はテスト・
+            // ベンチ専用のオーバーライドで、Top-k パイプラインが利用可能でも
+            // 常に全量 readback を選ばせる（実 GPU dispatch 経由のビット
+            // 同一検証に使う）。
+            let tile_max_k = tile
+                .iter()
+                .filter_map(|&qi| queries.get(qi).map(|q| q.k))
+                .max()
+                .unwrap_or(0);
+            let mode = if force_full_readback {
+                GpuReadbackMode::FullScores
+            } else {
+                select_readback_mode(target.topk_pipeline.is_some(), tile_max_k)
             };
-            for chunk in reachable.chunks(chunk_rows.max(1)) {
-                let scores = dispatch_dot_products(ctx, &target, chunk, q.vector, query_stride)
-                    .map_err(BatchExecError::Backend)?;
+            if target.topk_pipeline.is_some() && mode == GpuReadbackMode::FullScores {
+                stats
+                    .full_readback_fallbacks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
 
-                if scores.len() != chunk.len() {
-                    return Err(BatchExecError::Backend(BatchBackendError::TransferFailed(
-                        "readback length mismatch".to_string(),
-                    )));
-                }
-                for (&row_idx, &score) in chunk.iter().zip(scores.iter()) {
-                    if !score.is_finite() {
-                        continue;
+            match mode {
+                GpuReadbackMode::FullScores => {
+                    for chunk in reachable.chunks(plan.chunk_rows.max(1)) {
+                        let scores = dispatch_dot_products(
+                            ctx,
+                            target,
+                            chunk,
+                            &queries_concat,
+                            width,
+                            query_stride,
+                        )
+                        .map_err(BatchExecError::Backend)?;
+
+                        let expected_len = chunk.len().saturating_mul(width);
+                        if scores.len() != expected_len {
+                            return Err(BatchExecError::Backend(
+                                BatchBackendError::TransferFailed(
+                                    "readback length mismatch".to_string(),
+                                ),
+                            ));
+                        }
+                        stats
+                            .full_readback_dispatches
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        stats.readback_bytes.fetch_add(
+                            (scores.len() as u64).saturating_mul(4),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        for (qpos, selector_slot) in selectors.iter_mut().enumerate() {
+                            let Some(selector) = selector_slot.as_mut() else {
+                                continue;
+                            };
+                            let base = qpos.saturating_mul(chunk.len());
+                            for (offset, &row_idx) in chunk.iter().enumerate() {
+                                let Some(&score) = scores.get(base + offset) else {
+                                    continue;
+                                };
+                                if !score.is_finite() {
+                                    continue;
+                                }
+                                // 候補識別子は「行 id」ではなく常駐行列のスロット
+                                // 番号（`gather_reachable_rows` が返す行 index）
+                                // を使う。`TopKSelector` の同点タイブレークは
+                                // 候補識別子の昇順であり、CPU 経路
+                                // （`batch_search.rs::run_batch_search`）はスロット
+                                // 昇順を契約としているため（`batch_fallback.rs::
+                                // revalidate_primary_hits` の順序検証 (4) が同じ
+                                // 基準で判定する）、ここで行 id を使うと同点時に
+                                // 順序契約違反となり正当な結果まで
+                                // `PrimaryResultRejected` で拒否される（PR #205/
+                                // #228 の `(tenant_id, id)` 統一に追随。Issue #178）。
+                                selector.push(CandidateHit {
+                                    id: u64::from(row_idx),
+                                    score,
+                                });
+                            }
+                        }
                     }
-                    // 候補識別子は「行 id」ではなく常駐行列のスロット番号
-                    // （`gather_reachable_rows` が返す行 index）を使う。
-                    // `TopKSelector` の同点タイブレークは候補識別子の昇順で
-                    // あり、CPU 経路（`batch_search.rs::run_batch_search`）は
-                    // スロット昇順を契約としているため（`batch_fallback.rs::
-                    // revalidate_primary_hits` の順序検証 (4) が同じ基準で
-                    // 判定する）、ここで行 id を使うと同点時に順序契約違反と
-                    // なり正当な結果まで `PrimaryResultRejected` で拒否される
-                    // （PR #205/#228 の `(tenant_id, id)` 統一に追随。Issue #178）。
-                    selector.push(CandidateHit {
-                        id: u64::from(row_idx),
-                        score,
-                    });
+                }
+                GpuReadbackMode::PartialTopK { k_out } => {
+                    let chunk_rows = plan_partial_topk_chunk_rows(
+                        width,
+                        k_out,
+                        budget_bytes,
+                        ctx.max_workgroups_per_dimension,
+                    )
+                    .max(1);
+                    for chunk in reachable.chunks(chunk_rows) {
+                        let num_workgroups =
+                            chunk.len().div_ceil(GPU_WORKGROUP_SIZE as usize).max(1);
+                        let readback = dispatch_partial_topk(
+                            ctx,
+                            target,
+                            chunk,
+                            &queries_concat,
+                            width,
+                            query_stride,
+                            k_out,
+                        )
+                        .map_err(BatchExecError::Backend)?;
+                        stats
+                            .partial_topk_dispatches
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        stats.readback_bytes.fetch_add(
+                            (readback.len() as u64).saturating_mul(4),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        merge_partial_topk_readback(
+                            &readback,
+                            chunk,
+                            width,
+                            num_workgroups,
+                            k_out,
+                            &mut selectors,
+                        )
+                        .map_err(BatchExecError::Backend)?;
+                    }
                 }
             }
 
-            hits.push(BatchHit {
-                hits: finalize_gpu_hits(&self.matrix, q.ctx, &selector.into_sorted_vec())
-                    .map_err(BatchExecError::Input)?,
-            });
+            for (qpos, &qi) in tile.iter().enumerate() {
+                let Some(selector) = selectors.get_mut(qpos).and_then(Option::take) else {
+                    return Err(BatchExecError::Backend(
+                        BatchBackendError::KernelLaunchFailed(
+                            "query tile selector missing".to_string(),
+                        ),
+                    ));
+                };
+                let q_ctx = queries.get(qi).map(|q| q.ctx).ok_or_else(|| {
+                    BatchExecError::Backend(BatchBackendError::KernelLaunchFailed(
+                        "query tile index out of range".to_string(),
+                    ))
+                })?;
+                let hit = BatchHit {
+                    hits: finalize_gpu_hits(matrix, q_ctx, &selector.into_sorted_vec())
+                        .map_err(BatchExecError::Input)?,
+                };
+                if let Some(slot) = results.get_mut(qi) {
+                    *slot = Some(hit);
+                }
+            }
         }
-
-        Ok(hits)
     }
+
+    // 入力順で全クエリ分の結果が揃っていることを検証する（fail-closed:
+    // グループ化・タイル化の実装バグで一部クエリが取りこぼされた場合、
+    // 部分結果を返さず backend エラーとして CPU 縮退〔CORE-8〕へ倒す）。
+    let mut hits: Vec<BatchHit> = Vec::new();
+    try_reserve_exact(&mut hits, results.len(), "gpu tiled batch results (final)")
+        .map_err(BatchExecError::Input)?;
+    for slot in results {
+        match slot {
+            Some(hit) => hits.push(hit),
+            None => {
+                return Err(BatchExecError::Backend(
+                    BatchBackendError::KernelLaunchFailed(
+                        "query result missing after tiled dispatch".to_string(),
+                    ),
+                ))
+            }
+        }
+    }
+
+    Ok(hits)
 }
 
 /// GPU 側で選出した候補（常駐行列のスロット番号 + スコア）を、テナント修飾済みの
@@ -899,6 +1878,8 @@ pub struct GpuF32ContrastBackend {
     device_lost: std::sync::Arc<AtomicBool>,
     /// [`GpuBatchBackend::uncaptured_error`] と同じ役割。
     uncaptured_error: std::sync::Arc<AtomicBool>,
+    /// [`GpuBatchBackend::stats`] と同じ役割。
+    stats: std::sync::Arc<GpuBatchStats>,
 }
 
 impl GpuF32ContrastBackend {
@@ -988,12 +1969,31 @@ impl GpuF32ContrastBackend {
             row_buffer,
             device_lost: ctx.device_lost.clone(),
             uncaptured_error: ctx.uncaptured_error.clone(),
+            stats: std::sync::Arc::new(GpuBatchStats::default()),
         })
+    }
+
+    /// [`GpuBatchBackend::stats`] と同じ役割（Issue #536）。
+    pub fn stats(&self) -> GpuBatchStatsSnapshot {
+        self.stats.snapshot()
     }
 }
 
-impl BatchBackend for GpuF32ContrastBackend {
-    fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
+impl GpuF32ContrastBackend {
+    /// [`GpuBatchBackend::batch_search_with_budget_and_mode`] の f32 対照
+    /// 経路版（Issue #536・PR #578 codex 指摘対応）。`batch_search`（trait
+    /// 実装。既定 budget・既定の readback 方式選択）と
+    /// [`Self::batch_search_with_options_for_tests`]（テスト・ベンチ専用に
+    /// budget・`force_full_readback` を注入する経路）の両方から呼ばれる
+    /// 内部共通経路にすることで、既定経路と強制全量 readback 経路が実 GPU
+    /// dispatch を通じて完全に同一の可視性判定・スコア計算パスを通ることを
+    /// 保証する（[`GpuBatchBackend`] と同じ方針）。
+    fn batch_search_with_budget_and_mode(
+        &self,
+        queries: &[BatchQuery<'_>],
+        budget_bytes: usize,
+        force_full_readback: bool,
+    ) -> Result<Vec<BatchHit>, BatchExecError> {
         if self.device_lost.load(Ordering::SeqCst) {
             return Err(BatchExecError::Backend(BatchBackendError::DeviceLost(
                 "gpu device lost".to_string(),
@@ -1018,7 +2018,7 @@ impl BatchBackend for GpuF32ContrastBackend {
                 )))
             }
         };
-        let pipeline = f32_contrast_pipeline()
+        let pipelines = f32_contrast_pipeline()
             .map_err(|msg| BatchExecError::Backend(BatchBackendError::InitFailed(msg)))?;
 
         let _guard = gpu_dispatch_lock()
@@ -1032,60 +2032,105 @@ impl BatchBackend for GpuF32ContrastBackend {
         let row_stride = dim as u32;
         let query_stride = dim;
 
-        let mut hits: Vec<BatchHit> = Vec::new();
-        try_reserve_exact(&mut hits, queries.len(), "gpu f32 contrast results")
-            .map_err(BatchExecError::Input)?;
-        for q in queries {
-            let reachable = gather_reachable_rows(&self.matrix, q.ctx)
-                .map_err(|e| BatchExecError::Input(e.into_batch_search_error()))?;
+        let target = DotDispatchTarget {
+            pipeline: &pipelines.dot,
+            topk_pipeline: pipelines.topk.as_ref(),
+            row_buffer: &self.row_buffer,
+            bind_group_layout: &ctx.bind_group_layout,
+            row_stride,
+        };
 
-            let mut selector = TopKSelector::new(q.k);
+        run_tiled_batch_search(
+            ctx,
+            &self.matrix,
+            queries,
+            &target,
+            query_stride,
+            RunTiledBatchSearchOptions {
+                budget_bytes,
+                force_full_readback,
+                stats: &self.stats,
+            },
+        )
+    }
 
-            let chunk_rows = gpu_chunk_row_capacity(ctx);
-            let target = DotDispatchTarget {
-                pipeline,
-                row_buffer: &self.row_buffer,
-                bind_group_layout: &ctx.bind_group_layout,
-                row_stride,
-            };
-            for chunk in reachable.chunks(chunk_rows.max(1)) {
-                let scores = dispatch_dot_products(ctx, &target, chunk, q.vector, query_stride)
-                    .map_err(BatchExecError::Backend)?;
-
-                if scores.len() != chunk.len() {
-                    return Err(BatchExecError::Backend(BatchBackendError::TransferFailed(
-                        "readback length mismatch".to_string(),
-                    )));
-                }
-                for (&row_idx, &score) in chunk.iter().zip(scores.iter()) {
-                    if !score.is_finite() {
-                        continue;
-                    }
-                    selector.push(CandidateHit {
-                        id: u64::from(row_idx),
-                        score,
-                    });
-                }
-            }
-
-            hits.push(BatchHit {
-                hits: finalize_gpu_hits(&self.matrix, q.ctx, &selector.into_sorted_vec())
-                    .map_err(BatchExecError::Input)?,
-            });
-        }
-
-        Ok(hits)
+    /// **テスト・ベンチ専用**（Issue #536・PR #578 codex 指摘対応）。
+    /// [`GpuBatchBackend::batch_search_with_options_for_tests`] の f32
+    /// 対照経路版で、「常に全量 readback 経路を使う」強制フラグを注入し、
+    /// f32 対照経路でも既定経路と強制全量 readback 経路の結果が実 GPU
+    /// dispatch 経由でビット同一であることを結合テストから検証できる
+    /// ようにする（`tests/gpu_batch.rs`）。
+    #[cfg(feature = "bench-internals")]
+    pub fn batch_search_with_options_for_tests(
+        &self,
+        queries: &[BatchQuery<'_>],
+        options: GpuSearchTestOptions,
+    ) -> Result<Vec<BatchHit>, BatchExecError> {
+        self.batch_search_with_budget_and_mode(
+            queries,
+            options.budget_bytes,
+            options.force_full_readback,
+        )
     }
 }
 
-/// 1 チャンクあたりの最大行数（スコア + 行 index バッファの合計が
-/// [`GPU_SCORE_BUFFER_BUDGET_BYTES`] に収まり、かつ dispatch のワークグループ数が
-/// adapter の上限内に収まるように決める）。
-fn gpu_chunk_row_capacity(ctx: &GpuContext) -> usize {
-    let by_budget = GPU_SCORE_BUFFER_BUDGET_BYTES / 8; // scores(f32) + row_ids(u32) = 8 bytes/row
+impl BatchBackend for GpuF32ContrastBackend {
+    fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
+        self.batch_search_with_budget_and_mode(queries, GPU_SCORE_BUFFER_BUDGET_BYTES, false)
+    }
+}
+
+/// [`GpuBatchBackend::batch_search`]/[`GpuF32ContrastBackend::batch_search`]
+/// が 1 dispatch へタイル化するクエリ本数（`width`）と、そのタイルで 1 回の
+/// dispatch に含める行チャンク行数（`chunk_rows`）の組（Issue #532・R3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueryTilePlan {
+    width: usize,
+    chunk_rows: usize,
+}
+
+/// [`QueryTilePlan`] を fail-closed に決める純関数（GPU デバイス非依存。
+/// `checked_*`/`saturating_*` のみで導出し、`group_len == 0` 以外は必ず
+/// `width >= 1`・`chunk_rows >= 1` を返す）。
+///
+/// `width` は「このグループのクエリ本数」と [`GPU_QUERY_TILE_MAX`] の小さい方。
+/// `chunk_rows` は 1 回の dispatch のスコア + 行 index バッファ合計が
+/// `budget_bytes`（[`GPU_SCORE_BUFFER_BUDGET_BYTES`] ポインタ）に収まり、かつ
+/// dispatch のワークグループ数が adapter の
+/// `max_workgroups_per_dimension` 内に収まるように決める（`width == 1` の
+/// 場合、旧 `gpu_chunk_row_capacity` と同一の値になることを単体テストで固定）。
+fn plan_query_tile(
+    group_len: usize,
+    budget_bytes: usize,
+    max_workgroups_per_dimension: u32,
+) -> QueryTilePlan {
+    let width = group_len.clamp(1, GPU_QUERY_TILE_MAX);
+    // 1 行あたりのバイト数: scores（`width` クエリ分の f32）+ row_ids（u32 1 個）。
+    let per_row_bytes = (width as u64).saturating_mul(4).saturating_add(4).max(1);
+    let by_budget = usize::try_from(budget_bytes as u64 / per_row_bytes).unwrap_or(usize::MAX);
     let by_workgroups =
-        (ctx.max_workgroups_per_dimension as usize).saturating_mul(GPU_WORKGROUP_SIZE as usize);
-    by_budget.min(by_workgroups).max(1)
+        (max_workgroups_per_dimension as usize).saturating_mul(GPU_WORKGROUP_SIZE as usize);
+    let chunk_rows = by_budget.min(by_workgroups).max(1);
+    QueryTilePlan { width, chunk_rows }
+}
+
+/// クエリ列を `PolicyContext` の等価性（CORE-2 の単一照合パスが参照する
+/// `tenant_id`／`visibilities` の組。`policy.rs::PolicyContext` は
+/// `PartialEq`/`Eq` を derive 済み）でグループ化し、入力順を保った index 列を
+/// 返す（Issue #532・R1: タイル内の全クエリが同一可視性集合を共有することを
+/// 構造的に保証し、`gather_reachable_rows` をグループ単位で 1 回だけ実行する
+/// ための下ごしらえ）。件数は [`crate::batch_search::MAX_BATCH_QUERIES`]
+/// （4,096）以下であることが呼び出し元（`validate_batch_queries`）で
+/// 保証されるため、O(グループ数 × クエリ数) の線形走査で十分。
+fn group_queries_by_ctx(queries: &[BatchQuery<'_>]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<(&PolicyContext, Vec<usize>)> = Vec::new();
+    for (idx, q) in queries.iter().enumerate() {
+        match groups.iter_mut().find(|(ctx, _)| *ctx == q.ctx) {
+            Some((_, members)) => members.push(idx),
+            None => groups.push((q.ctx, vec![idx])),
+        }
+    }
+    groups.into_iter().map(|(_, members)| members).collect()
 }
 
 /// [`GpuBatchBackend::batch_search`] の dispatch 前総量ガード本体。
@@ -1198,6 +2243,10 @@ fn gather_reachable_rows(
 /// 異なる。
 struct DotDispatchTarget<'a> {
     pipeline: &'a wgpu::ComputePipeline,
+    /// workgroup 内部分 Top-k パイプライン（Issue #536）。`None` は
+    /// [`select_readback_mode`] が常に `FullScores` を選ぶことで表現される
+    /// （ADR 決定 2 の段階的 fail-closed 縮退）。
+    topk_pipeline: Option<&'a wgpu::ComputePipeline>,
     row_buffer: &'a wgpu::Buffer,
     bind_group_layout: &'a wgpu::BindGroupLayout,
     /// `row_buffer` の 1 行あたりの要素数（f16: `dim.div_ceil(2)` 個の u32
@@ -1217,24 +2266,41 @@ fn dispatch_dot_products(
     ctx: &GpuContext,
     target: &DotDispatchTarget<'_>,
     row_indices: &[u32],
-    query: &[f32],
+    queries_concat: &[f32],
+    query_count: usize,
     query_stride: usize,
 ) -> Result<Vec<f32>, BatchBackendError> {
-    if row_indices.is_empty() {
+    if row_indices.is_empty() || query_count == 0 {
         return Ok(Vec::new());
     }
+    // ホスト側の呼び出し規約違反（シェーダの `array<f32, QUERY_TILE_MAX>` を
+    // 超えるクエリ本数）は fail-closed に拒否する。シェーダ側も `min` で
+    // クランプするが、ここで弾くことでレジスタ配列の範囲外アクセスに
+    // 依存しない二重の防御にする（Issue #532・R3）。
+    if query_count > GPU_QUERY_TILE_MAX {
+        return Err(BatchBackendError::KernelLaunchFailed(
+            "query tile width exceeds GPU_QUERY_TILE_MAX".to_string(),
+        ));
+    }
+    // `queries_concat` は呼び出し元（`run_tiled_batch_search`）が各クエリを
+    // `query_stride` へパディング済みで連結したバッファである契約
+    // （長さ不整合は呼び出し元の実装バグを示すため、GPU に触れる前に拒否する）。
+    let expected_query_len = query_count.checked_mul(query_stride).ok_or_else(|| {
+        BatchBackendError::KernelLaunchFailed("query buffer size overflow".to_string())
+    })?;
+    if queries_concat.len() != expected_query_len {
+        return Err(BatchBackendError::TransferFailed(
+            "query buffer length does not match query_count * query_stride".to_string(),
+        ));
+    }
     let row_count = row_indices.len() as u32;
-
-    let mut padded_query: Vec<f32> = Vec::new();
-    try_reserve_f32(&mut padded_query, query_stride)?;
-    padded_query.extend_from_slice(query);
-    padded_query.resize(query_stride, 0.0);
+    let query_count_u32 = query_count as u32;
 
     let params = GpuParams {
         row_stride: target.row_stride,
         row_count,
-        _pad0: 0,
-        _pad1: 0,
+        query_count: query_count_u32,
+        query_stride: query_stride as u32,
     };
 
     // ステージング用バイト列（ホスト側の確保）は error scope を push する**前**に
@@ -1245,7 +2311,7 @@ fn dispatch_dot_products(
     // scope の内側へ入れる必要はそもそもない）。
     let params_bytes = params.to_ne_bytes_vec()?;
     let row_ids_bytes = bytes_of_u32_slice(row_indices)?;
-    let query_bytes = bytes_of_f32_slice(&padded_query)?;
+    let query_bytes = bytes_of_f32_slice(queries_concat)?;
 
     // バッファ・bind group の生成もすべて error scope の内側で行う
     // （codex/Bugbot P1 指摘対応: 以前は encoder 直前で push していたため、
@@ -1277,7 +2343,11 @@ fn dispatch_dot_products(
     });
     ctx.queue.write_buffer(&query_buffer, 0, &query_bytes);
 
-    let scores_bytes = (row_indices.len() as u64).saturating_mul(4);
+    // スコアバッファは「行 × クエリタイル幅」（`scores[q * row_count + i]`
+    // レイアウト。`DOT_SHADER_WGSL`/`DOT_SHADER_F32_WGSL` doc 参照）。
+    let scores_bytes = (row_indices.len() as u64)
+        .saturating_mul(query_count as u64)
+        .saturating_mul(4);
     let scores_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("batch dot product scores"),
         size: scores_bytes,
@@ -1358,6 +2428,20 @@ fn dispatch_dot_products(
         )));
     }
 
+    let bytes = wait_and_read_buffer(ctx, &readback_buffer)?;
+    let scores = f32_vec_from_ne_bytes(&bytes)?;
+    Ok(scores)
+}
+
+/// [`dispatch_dot_products`]/[`dispatch_partial_topk`] が共有する readback
+/// 完了待ちの本体（Issue #536・R: 両関数から重複していた map_async・deadline
+/// 付きポーリング・エラー写像を 1 箇所へ集約する）。呼び出し元は
+/// `copy_buffer_to_buffer` 済みの `readback_buffer`（`MAP_READ` 用途）を渡し、
+/// マップ完了後の生バイト列を受け取る（呼び出し元が `f32`/`u32` へ解釈する）。
+fn wait_and_read_buffer(
+    ctx: &GpuContext,
+    readback_buffer: &wgpu::Buffer,
+) -> Result<Vec<u8>, BatchBackendError> {
     let slice = readback_buffer.slice(..);
     let map_result: std::sync::Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
         std::sync::Arc::new(Mutex::new(None));
@@ -1428,15 +2512,210 @@ fn dispatch_dot_products(
         }
     }
 
-    let scores = {
+    let bytes = {
         let view = slice.get_mapped_range().map_err(|e| {
             BatchBackendError::TransferFailed(format!("get_mapped_range failed: {e}"))
         })?;
-        f32_vec_from_ne_bytes(&view)?
+        // codex 指摘対応（PR #578）: `view.to_vec()` はマップ領域と同サイズの
+        // ヒープ確保に失敗すると abort し、CORE-8 の CPU 縮退（呼び出し元が
+        // `Err` を受け取って `FallbackBatchEngine` へ移る経路）へ戻れない。
+        // `try_reserve_bytes` でフォールブルに確保してから `copy_from_slice`
+        // する（[`f32_vec_from_ne_bytes`] 等と同じ fail-closed 契約）。
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(view.len()).map_err(|_| {
+            BatchBackendError::TransferFailed("readback buffer allocation failed".to_string())
+        })?;
+        buf.extend_from_slice(&view);
+        buf
     };
     readback_buffer.unmap();
+    Ok(bytes)
+}
 
-    Ok(scores)
+/// `&[u8]`（ネイティブエンディアン・4 の倍数長）を `Vec<u32>` へ変換する
+/// （[`f32_vec_from_ne_bytes`] の u32 版。[`dispatch_partial_topk`] の
+/// readback デコードに使う）。
+fn u32_vec_from_ne_bytes(bytes: &[u8]) -> Result<Vec<u32>, BatchBackendError> {
+    let (quads, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    try_reserve_u32(&mut out, quads.len())?;
+    for quad in quads {
+        out.push(u32::from_ne_bytes(*quad));
+    }
+    Ok(out)
+}
+
+/// 1 クエリタイル × `row_indices` 分の workgroup 内部分 Top-k を GPU で計算し、
+/// `(key, slot)` を `num_workgroups × k_out` 件（クエリごと）並べた `u32` 列を
+/// readback する（Issue #536）。手順・防御は [`dispatch_dot_products`] と
+/// 共通化しており（`wait_and_read_buffer` を共有）、差分は出力バッファの
+/// サイズ（スコア行列ではなく Top-k 候補列）と uniform パラメータの型
+/// （[`GpuTopKParams`]。32 バイト）のみ。
+fn dispatch_partial_topk(
+    ctx: &GpuContext,
+    target: &DotDispatchTarget<'_>,
+    row_indices: &[u32],
+    queries_concat: &[f32],
+    query_count: usize,
+    query_stride: usize,
+    k_out: usize,
+) -> Result<Vec<u32>, BatchBackendError> {
+    if row_indices.is_empty() || query_count == 0 {
+        return Ok(Vec::new());
+    }
+    if query_count > GPU_QUERY_TILE_MAX {
+        return Err(BatchBackendError::KernelLaunchFailed(
+            "query tile width exceeds GPU_QUERY_TILE_MAX".to_string(),
+        ));
+    }
+    let Some(topk_pipeline) = target.topk_pipeline else {
+        return Err(BatchBackendError::KernelLaunchFailed(
+            "partial topk dispatch requested without a topk pipeline".to_string(),
+        ));
+    };
+    let expected_query_len = query_count.checked_mul(query_stride).ok_or_else(|| {
+        BatchBackendError::KernelLaunchFailed("query buffer size overflow".to_string())
+    })?;
+    if queries_concat.len() != expected_query_len {
+        return Err(BatchBackendError::TransferFailed(
+            "query buffer length does not match query_count * query_stride".to_string(),
+        ));
+    }
+    let k_out_u32 = u32::try_from(k_out.clamp(1, GPU_TOPK_OUT_MAX as usize)).unwrap_or(1);
+    let row_count = row_indices.len() as u32;
+    let query_count_u32 = query_count as u32;
+    let num_workgroups = (row_count as u64).div_ceil(GPU_WORKGROUP_SIZE as u64);
+    let workgroups_x = u32::try_from(num_workgroups).unwrap_or(u32::MAX);
+
+    let params = GpuTopKParams {
+        row_stride: target.row_stride,
+        row_count,
+        query_count: query_count_u32,
+        query_stride: query_stride as u32,
+        k_out: k_out_u32,
+    };
+
+    let params_bytes = params.to_ne_bytes_vec()?;
+    let row_ids_bytes = bytes_of_u32_slice(row_indices)?;
+    let query_bytes = bytes_of_f32_slice(queries_concat)?;
+
+    let out_count = (num_workgroups)
+        .saturating_mul(query_count as u64)
+        .saturating_mul(k_out_u32 as u64)
+        .saturating_mul(2);
+    let out_bytes_len = out_count.saturating_mul(4);
+    if out_bytes_len == 0 {
+        return Err(BatchBackendError::KernelLaunchFailed(
+            "partial topk output buffer size is zero".to_string(),
+        ));
+    }
+
+    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+
+    let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("batch dot product topk params"),
+        size: 32,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    ctx.queue.write_buffer(&params_buffer, 0, &params_bytes);
+
+    let row_ids_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("batch dot product topk row ids"),
+        size: row_ids_bytes.len() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    ctx.queue.write_buffer(&row_ids_buffer, 0, &row_ids_bytes);
+
+    let query_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("batch dot product topk query"),
+        size: query_bytes.len() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    ctx.queue.write_buffer(&query_buffer, 0, &query_bytes);
+
+    let out_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("batch dot product topk out"),
+        size: out_bytes_len,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("batch dot product topk readback"),
+        size: out_bytes_len,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("batch dot product topk bind group"),
+        layout: target.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: target.row_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: row_ids_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: query_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: out_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("batch dot product topk encoder"),
+        });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("batch dot product topk pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(topk_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(workgroups_x, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buffer, 0, &readback_buffer, 0, out_bytes_len);
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+
+    let poll_failed =
+        || BatchBackendError::DeviceLost("device poll failed or timed out".to_string());
+    let oom_err =
+        block_on_with_device_poll(&ctx.device, oom_scope.pop()).map_err(|_| poll_failed())?;
+    let validation_err = block_on_with_device_poll(&ctx.device, validation_scope.pop())
+        .map_err(|_| poll_failed())?;
+    if let Some(e) = oom_err {
+        return Err(BatchBackendError::KernelLaunchFailed(format!(
+            "gpu out of memory: {e}"
+        )));
+    }
+    if let Some(e) = validation_err {
+        return Err(BatchBackendError::KernelLaunchFailed(format!(
+            "gpu validation error: {e}"
+        )));
+    }
+
+    let bytes = wait_and_read_buffer(ctx, &readback_buffer)?;
+    u32_vec_from_ne_bytes(&bytes)
 }
 
 #[cfg(test)]
@@ -1449,6 +2728,121 @@ mod tests {
     // GPU デバイスに依存しない純粋関数のみをここで検証する。デバイス初期化を
     // 要するテスト（初期化失敗→縮退・実 GPU 分岐）は `tests/gpu_batch.rs`
     // （結合テスト。環境条件で両分岐を検証する。TASK-128 設計方針 §3.5）に置く。
+
+    // --- Issue #532: クエリタイル化（1 dispatch で複数クエリを処理）の純関数 ---
+
+    #[test]
+    fn dot_shader_wgsl_query_tile_max_matches_host_constant() {
+        // WGSL のレジスタ配列サイズ（`array<f32, QUERY_TILE_MAX>`）が
+        // ホスト側の `GPU_QUERY_TILE_MAX`（ホストが `dispatch_dot_products`
+        // で拒否する上限）とビットで一致することを固定する。値がずれると
+        // シェーダ側が `min` でクランプした本数しか計算しないのに対し
+        // ホストは超過分を範囲外アクセスとして readback してしまう。
+        let expected = format!("const QUERY_TILE_MAX: u32 = {GPU_QUERY_TILE_MAX}u;");
+        assert!(
+            DOT_SHADER_WGSL.contains(&expected),
+            "f16 shader must declare {expected}"
+        );
+        assert!(
+            DOT_SHADER_F32_WGSL.contains(&expected),
+            "f32 contrast shader must declare {expected}"
+        );
+    }
+
+    #[test]
+    fn plan_query_tile_single_query_matches_legacy_chunk_row_capacity() {
+        // width == 1（旧「1 dispatch = 1 クエリ」相当）のとき、旧
+        // `gpu_chunk_row_capacity` と同じ `chunk_rows`（32 MiB / 8 bytes/行）
+        // になることを固定し、単一クエリ経路の挙動が退行していないことを示す。
+        let plan = plan_query_tile(1, GPU_SCORE_BUFFER_BUDGET_BYTES, 65_535);
+        assert_eq!(plan.width, 1);
+        assert_eq!(plan.chunk_rows, GPU_SCORE_BUFFER_BUDGET_BYTES / 8);
+    }
+
+    #[test]
+    fn plan_query_tile_clamps_width_to_gpu_query_tile_max() {
+        let plan = plan_query_tile(100, GPU_SCORE_BUFFER_BUDGET_BYTES, 65_535);
+        assert_eq!(plan.width, GPU_QUERY_TILE_MAX);
+        assert!(plan.chunk_rows >= 1);
+    }
+
+    #[test]
+    fn plan_query_tile_shrinks_chunk_rows_as_width_grows() {
+        // タイル幅が広いほど 1 行あたりのスコアバイト数が増えるため、
+        // 同じバイト予算では収容できる行チャンクが小さくなる。
+        let narrow = plan_query_tile(1, GPU_SCORE_BUFFER_BUDGET_BYTES, 65_535);
+        let wide = plan_query_tile(GPU_QUERY_TILE_MAX, GPU_SCORE_BUFFER_BUDGET_BYTES, 65_535);
+        assert!(wide.chunk_rows < narrow.chunk_rows);
+    }
+
+    #[test]
+    fn plan_query_tile_never_returns_zero_even_under_a_tiny_workgroup_limit() {
+        // adapter の `max_workgroups_per_dimension` が極端に小さくても
+        // `chunk_rows >= 1` を維持し、0 行チャンクで無限ループにならない
+        // ことを固定する（fail-closed だが panic はしない）。
+        let plan = plan_query_tile(GPU_QUERY_TILE_MAX, GPU_SCORE_BUFFER_BUDGET_BYTES, 1);
+        assert_eq!(plan.width, GPU_QUERY_TILE_MAX);
+        assert!(plan.chunk_rows >= 1);
+    }
+
+    fn ctx_for(tenant: &str) -> PolicyContext {
+        PolicyContext::new(tenant).expect("valid tenant id")
+    }
+
+    #[test]
+    fn group_queries_by_ctx_preserves_input_order_within_each_group() {
+        let ctx_a = ctx_for("tenant-a");
+        let ctx_b = ctx_for("tenant-b");
+        let v = vec![0.0f32; 1];
+        let queries = vec![
+            BatchQuery {
+                vector: &v,
+                k: 1,
+                ctx: &ctx_a,
+            },
+            BatchQuery {
+                vector: &v,
+                k: 1,
+                ctx: &ctx_b,
+            },
+            BatchQuery {
+                vector: &v,
+                k: 1,
+                ctx: &ctx_a,
+            },
+        ];
+        let groups = group_queries_by_ctx(&queries);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], vec![0, 2]);
+        assert_eq!(groups[1], vec![1]);
+    }
+
+    #[test]
+    fn group_queries_by_ctx_splits_differing_visibility_even_for_the_same_tenant() {
+        // `PolicyContext` の等価性は tenant_id だけでなく可視性集合も見るため、
+        // 同一テナントでも可視性が異なれば別グループになる（タイル内で
+        // `gather_reachable_rows` の行集合を共有してよいのは完全に同じ ctx の
+        // クエリだけ、という R1 の前提を固定する）。
+        let ctx_private =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Private, Visibility::Public])
+                .expect("valid ctx");
+        let ctx_public = ctx_for("tenant-a");
+        let v = vec![0.0f32; 1];
+        let queries = vec![
+            BatchQuery {
+                vector: &v,
+                k: 1,
+                ctx: &ctx_private,
+            },
+            BatchQuery {
+                vector: &v,
+                k: 1,
+                ctx: &ctx_public,
+            },
+        ];
+        let groups = group_queries_by_ctx(&queries);
+        assert_eq!(groups, vec![vec![0], vec![1]]);
+    }
 
     #[test]
     fn bytes_of_u32_slice_round_trips_via_f32_vec_from_ne_bytes_is_not_applicable() {
@@ -1592,7 +2986,13 @@ mod tests {
     #[test]
     fn probe_gpu_availability_debug_only() {
         match global_context() {
-            Ok(_) => eprintln!("GPU_PROBE: available"),
+            Ok(ctx) => {
+                eprintln!("GPU_PROBE: available");
+                match &ctx.topk_unavailable_reason {
+                    None => eprintln!("GPU_PROBE: topk pipeline available"),
+                    Some(reason) => eprintln!("GPU_PROBE: topk pipeline unavailable: {reason}"),
+                }
+            }
             Err(e) => eprintln!("GPU_PROBE: unavailable: {e}"),
         }
     }
@@ -1960,6 +3360,236 @@ mod tests {
                 (score - expected).abs() < 1e-3,
                 "id={id} expected={expected} actual={score}"
             );
+        }
+    }
+
+    // --- Issue #536: workgroup 内部分 Top-k の GPU 非依存純関数テスト ---
+
+    #[test]
+    fn dot_shader_topk_wgsl_constants_match_host_constants() {
+        // WGSL 側の定数（`WORKGROUP_SIZE`/`TOPK_OUT_MAX`/`QUERY_TILE_MAX`）が
+        // ホスト側の `GPU_WORKGROUP_SIZE`/`GPU_TOPK_OUT_MAX`/`GPU_QUERY_TILE_MAX`
+        // と一致することを固定する（両シェーダ共通）。
+        let expect_wg = format!("const WORKGROUP_SIZE: u32 = {GPU_WORKGROUP_SIZE}u;");
+        let expect_topk = format!("const TOPK_OUT_MAX: u32 = {GPU_TOPK_OUT_MAX}u;");
+        let expect_tile = format!("const QUERY_TILE_MAX: u32 = {GPU_QUERY_TILE_MAX}u;");
+        for shader in [DOT_SHADER_TOPK_WGSL, DOT_SHADER_TOPK_F32_WGSL] {
+            assert!(shader.contains(&expect_wg), "missing {expect_wg}");
+            assert!(shader.contains(&expect_topk), "missing {expect_topk}");
+            assert!(shader.contains(&expect_tile), "missing {expect_tile}");
+        }
+    }
+
+    #[test]
+    fn score_key_round_trips_and_preserves_total_cmp_order() {
+        let values: [f32; 12] = [
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MIN,
+            f32::MAX,
+            1.0,
+            -1.0,
+            1e-30,
+            -1e-30,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+        ];
+        for &v in &values {
+            assert_eq!(
+                score_from_key(score_key(v)).to_bits(),
+                v.to_bits(),
+                "round trip must be bit-identical for {v}"
+            );
+        }
+        for &a in &values {
+            for &b in &values {
+                let want = a.total_cmp(&b);
+                let got = score_key(a).cmp(&score_key(b));
+                assert_eq!(got, want, "order mismatch for a={a} b={b}");
+            }
+        }
+    }
+
+    #[test]
+    fn score_key_orders_negative_floats_correctly_unlike_signed_reinterpretation() {
+        // 単純な i32 再解釈（ビットパターンをそのまま符号付き整数とみなす）では
+        // 負の浮動小数点数同士の大小関係が逆転する（絶対値が大きいほど
+        // マグニチュードのビットパターンは大きくなるため）。`score_key` は
+        // この誤りを避けるための変換であることを固定する。
+        assert!(score_key(-1.0) > score_key(-2.0));
+        assert!(((-1.0f32).to_bits() as i32) < ((-2.0f32).to_bits() as i32));
+    }
+
+    #[test]
+    fn select_readback_mode_falls_back_without_pipeline() {
+        assert_eq!(select_readback_mode(false, 10), GpuReadbackMode::FullScores);
+    }
+
+    #[test]
+    fn select_readback_mode_falls_back_when_k_exceeds_topk_out_max() {
+        assert_eq!(
+            select_readback_mode(true, GPU_TOPK_OUT_MAX as usize + 1),
+            GpuReadbackMode::FullScores
+        );
+        assert_eq!(
+            select_readback_mode(true, GPU_TOPK_OUT_MAX as usize),
+            GpuReadbackMode::PartialTopK {
+                k_out: GPU_TOPK_OUT_MAX as usize
+            }
+        );
+    }
+
+    #[test]
+    fn select_readback_mode_falls_back_on_zero_k() {
+        assert_eq!(select_readback_mode(true, 0), GpuReadbackMode::FullScores);
+    }
+
+    #[test]
+    fn select_readback_mode_selects_partial_topk_when_available() {
+        assert_eq!(
+            select_readback_mode(true, 10),
+            GpuReadbackMode::PartialTopK { k_out: 10 }
+        );
+    }
+
+    #[test]
+    fn gpu_topk_params_to_ne_bytes_vec_is_32_bytes_in_field_order() {
+        let params = GpuTopKParams {
+            row_stride: 1,
+            row_count: 2,
+            query_count: 3,
+            query_stride: 4,
+            k_out: 5,
+        };
+        let bytes = params
+            .to_ne_bytes_vec()
+            .expect("32 byte allocation must succeed");
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(&bytes[0..4], &1u32.to_ne_bytes());
+        assert_eq!(&bytes[4..8], &2u32.to_ne_bytes());
+        assert_eq!(&bytes[8..12], &3u32.to_ne_bytes());
+        assert_eq!(&bytes[12..16], &4u32.to_ne_bytes());
+        assert_eq!(&bytes[16..20], &5u32.to_ne_bytes());
+        assert_eq!(&bytes[20..32], &[0u8; 12]);
+    }
+
+    #[test]
+    fn plan_partial_topk_chunk_rows_never_returns_zero() {
+        assert!(plan_partial_topk_chunk_rows(16, 256, GPU_SCORE_BUFFER_BUDGET_BYTES, 1) >= 1);
+        assert!(plan_partial_topk_chunk_rows(1, 1, 64, 1) >= 1);
+    }
+
+    #[test]
+    fn plan_partial_topk_chunk_rows_shrinks_as_k_out_or_width_grows() {
+        let base = plan_partial_topk_chunk_rows(1, 1, GPU_SCORE_BUFFER_BUDGET_BYTES, 65_535);
+        let wider = plan_partial_topk_chunk_rows(
+            GPU_QUERY_TILE_MAX,
+            1,
+            GPU_SCORE_BUFFER_BUDGET_BYTES,
+            65_535,
+        );
+        let deeper_k = plan_partial_topk_chunk_rows(
+            1,
+            GPU_TOPK_OUT_MAX as usize,
+            GPU_SCORE_BUFFER_BUDGET_BYTES,
+            65_535,
+        );
+        assert!(wider <= base);
+        assert!(deeper_k <= base);
+    }
+
+    #[test]
+    fn merge_partial_topk_readback_rejects_length_mismatch() {
+        let mut selectors = vec![Some(TopKSelector::new(1))];
+        let err = merge_partial_topk_readback(&[0u32; 3], &[0u32], 1, 1, 1, &mut selectors)
+            .expect_err("short readback must be rejected");
+        assert!(matches!(err, BatchBackendError::TransferFailed(_)));
+    }
+
+    #[test]
+    fn merge_partial_topk_readback_skips_sentinels() {
+        let mut selectors = vec![Some(TopKSelector::new(2))];
+        // 1 ワークグループ・k_out=2・sentinel 1 件 + 有効候補 1 件。
+        let readback = vec![0u32, u32::MAX, score_key(1.5), 7u32];
+        merge_partial_topk_readback(&readback, &[7], 1, 1, 2, &mut selectors)
+            .expect("well-formed readback must merge");
+        let hits = selectors
+            .remove(0)
+            .expect("selector must remain populated")
+            .into_sorted_vec();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 7);
+        assert!((hits[0].score - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn merge_partial_topk_readback_rejects_slot_outside_chunk() {
+        let mut selectors = vec![Some(TopKSelector::new(1))];
+        let readback = vec![score_key(1.0), 99u32];
+        let err = merge_partial_topk_readback(&readback, &[7], 1, 1, 1, &mut selectors)
+            .expect_err("slot outside the dispatched chunk must be rejected");
+        assert!(matches!(err, BatchBackendError::TransferFailed(_)));
+    }
+
+    #[test]
+    fn merge_partial_topk_readback_matches_direct_push_across_multiple_chunks() {
+        // 複数チャンク・複数ワークグループにまたがる合成 readback を push した
+        // 結果が「全候補を直接 push した TopKSelector」とビット同一であることを
+        // 固定する（ADR 決定 3 の維持契約）。
+        let candidates: Vec<(u32, f32)> = vec![(10, 3.0), (11, 1.0), (12, 5.0), (13, 5.0)];
+
+        let mut direct = TopKSelector::new(10);
+        for &(slot, score) in &candidates {
+            direct.push(CandidateHit {
+                id: u64::from(slot),
+                score,
+            });
+        }
+        let direct_sorted = direct.into_sorted_vec();
+
+        // 2 チャンク（先頭 2 件・後半 2 件）× 1 ワークグループ・k_out=4 として
+        // 合成する（各チャンクの候補数が k_out 以下なので全件そのまま出力される
+        // 想定で読み替える単純化されたテスト readback）。
+        let mut merged_selector = vec![Some(TopKSelector::new(10))];
+        let chunk_a = [10u32, 11];
+        let readback_a = vec![
+            score_key(3.0),
+            10,
+            score_key(1.0),
+            11,
+            0,
+            u32::MAX,
+            0,
+            u32::MAX,
+        ];
+        merge_partial_topk_readback(&readback_a, &chunk_a, 1, 1, 4, &mut merged_selector)
+            .expect("chunk a merge must succeed");
+
+        let chunk_b = [12u32, 13];
+        let readback_b = vec![
+            score_key(5.0),
+            12,
+            score_key(5.0),
+            13,
+            0,
+            u32::MAX,
+            0,
+            u32::MAX,
+        ];
+        merge_partial_topk_readback(&readback_b, &chunk_b, 1, 1, 4, &mut merged_selector)
+            .expect("chunk b merge must succeed");
+
+        let merged_sorted = merged_selector
+            .remove(0)
+            .expect("selector must remain populated")
+            .into_sorted_vec();
+
+        assert_eq!(merged_sorted.len(), direct_sorted.len());
+        for (a, b) in merged_sorted.iter().zip(direct_sorted.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.score.to_bits(), b.score.to_bits());
         }
     }
 }

@@ -81,6 +81,14 @@ SparseIndexCache }` を 1 引数として追加した（引数を素で 2 つ増
 `pub(crate)`。`Storage`/`SparseIndexCache` の型が crate 外へ公開されるわけではない
 ため、crate 外からこの型を構築・分解することはできない）。
 
+`SparseIndex::search`/`search_within`/`score_within` が使うスコアアキュムレータの
+再利用スクラッチプール（Issue #546）は `SparseIndexCache` 自体（本ファイル）
+ではなく `SparseIndex` 内部（`sparse.rs`）に配置した。キャッシュが保持する
+実体が `Arc<SparseIndex>` であるため、`SparseIndex` 内部に置くだけで
+「キャッシュと同寿命の再利用バッファ」という要件をキャッシュ側の変更
+（`CacheEntry` の型変更・呼び出し元シグネチャの波及）なしに満たせる。詳細は
+`docs/design/hybrid-rrf-latency-breakdown.md`「Issue #546」節参照。
+
 ### スコープ外（実装しない）
 
 - 語彙マップ（`sparse.rs` の `BTreeMap`）のハッシュ系構造化: 決定性確保のための

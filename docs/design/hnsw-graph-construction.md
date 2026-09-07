@@ -19,10 +19,15 @@
 
 ## データ構造・API
 
-`crates/engine/src/hnsw.rs::HnswIndex` は、ノードごとの層別隣接リスト
-（`links: Vec<Vec<u32>>`。長さ `level+1`）・レベル・エントリポイントのみを
-保持する。層ごとの次数上限は層 0 が `2*m`、層 1 以上が `m`（`max_degree`
-アクセサで公開）。
+`crates/engine/src/hnsw.rs::HnswIndex` は、レベル・エントリポイントに加え、
+凍結済みグラフ（`hnsw/csr.rs::CsrGraph`。ノード×レベルの隣接リストを
+CSR〔Compressed Sparse Row〕として平坦化した表現）を保持する。構築中は
+可変長ビルダー表現（`hnsw.rs::GraphBuilder`。ノードごとの層別隣接リスト
+`links: Vec<Vec<u32>>`。長さ `level+1`）を使い、全ノード挿入・修復
+（`repair_reachability`）完了後に 1 回だけ CSR へ平坦化する（凍結後 CSR 化
+の設計・実装詳細は `docs/design/hnsw-index.md` §14・Issue #493・#494）。
+層ごとの次数上限は層 0 が `2*m`、層 1 以上が `m`（`max_degree` アクセサで
+公開）。
 
 ```rust
 pub struct HnswParams { pub m: usize, pub ef_construction: usize, pub ef_search: usize }
@@ -43,6 +48,9 @@ impl HnswIndex {
     pub fn max_degree(&self, level: usize) -> usize;
 }
 ```
+
+凍結後 CSR 化（構築は可変長・凍結時に平坦化）の設計は
+`docs/design/hnsw-index.md` §14（Issue #493）を参照。
 
 ## ベクトルの所有方針（#405・#408 への申し送り）
 

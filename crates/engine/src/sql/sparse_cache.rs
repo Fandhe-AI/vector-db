@@ -45,6 +45,17 @@
 //!   stale にはなり得ない（`PrefilterCache`/`DictionaryCache` が「キャッシュから
 //!   古い可能性のあるものを取り出して使う」経路を塞ぐのに対し、本関数が禁じるのは
 //!   「キャッシュへ古い索引を常駐させる」ことのみ）。
+//!
+//! **スコアスクラッチプールとの関係（Issue #546）**: 本キャッシュが保持する
+//! `Arc<SparseIndex>` は、`SparseIndex::search`/`search_within`/`score_within`
+//! が呼び出しのたびに新規確保していたスコアアキュムレータ（`acc: Vec<f64>`）を
+//! 索引の寿命内で再利用するスクラッチプールを内包する（`sparse.rs::
+//! SparseIndex::scratch_pool` のドキュメンテーションコメント参照）。世代不一致で
+//! この `Arc` ごと失効・破棄されればスクラッチプールも一緒に破棄されるため、
+//! キャッシュの世代整合契約（上記）がスクラッチの寿命管理も兼ねる。
+//! [`SparseIndex::approx_heap_bytes`] はこのプールの決定的な上限値を含むため、
+//! `Self::insert` の容量判定（`MAX_SPARSE_CACHE_TOTAL_BYTES`）はスクラッチ分も
+//! 織り込み済みである。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
