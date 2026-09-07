@@ -825,6 +825,18 @@ fn main() {
                 .expect("valid HnswParams::default()");
             EngineCore::from_storage_with_engine(probe_storage, kind)
         }
+        BenchEngine::HnswF16 => {
+            // f16 常駐 opt-in（Issue #514・#516）。`ValidatedHnswParams::new` を
+            // 経由した検証済み値へ `with_resident_precision` を適用する構築経路は
+            // `tests/fixtures/recall_engine.rs::RecallEngine::HnswF16` と同一
+            // （untrusted な `HnswParams` の唯一の検証入口はここでも変わらない）。
+            let validated =
+                engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
+                    .expect("valid HnswParams::default()")
+                    .with_resident_precision(engine::hnsw::ResidentPrecision::F16);
+            let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
+            EngineCore::from_storage_with_engine(probe_storage, kind)
+        }
     };
     let index_warm_start = Instant::now();
     let index_warm_probe = probe_core.execute_sql(
@@ -850,6 +862,15 @@ fn main() {
         BenchEngine::Hnsw => {
             let kind = engine::search_engine::hnsw_kind(engine::hnsw::HnswParams::default())
                 .expect("valid HnswParams::default()");
+            EngineCore::from_storage_with_engine(storage, kind)
+        }
+        BenchEngine::HnswF16 => {
+            // 上の probe_core 構築と同一経路（Issue #514・#516）。
+            let validated =
+                engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
+                    .expect("valid HnswParams::default()")
+                    .with_resident_precision(engine::hnsw::ResidentPrecision::F16);
+            let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
             EngineCore::from_storage_with_engine(storage, kind)
         }
     };
@@ -940,7 +961,7 @@ fn main() {
     // brute_force では `hnsw_index_cache_stats()` は常に全欄 0（索引を一切
     // 構築しない構造）のため統計出力・アサートの対象外とする。
     let hnsw_stats_json = match engine_choice {
-        BenchEngine::Hnsw => {
+        BenchEngine::Hnsw | BenchEngine::HnswF16 => {
             let s = core.hnsw_index_cache_stats();
             if s.builds == 0 || s.hits == 0 {
                 fail_bench(
@@ -951,11 +972,16 @@ fn main() {
                     ),
                 );
             }
+            // f16 常駐 opt-in（Issue #516）では、embedding が f16 有限範囲外
+            // （D6）で自動縮退した回数もあわせて出力する。f32 常駐（`BenchEngine::
+            // Hnsw`）はこのカウンタが常に 0 のままだが、区別なく出力して doc
+            // 側の前後比較表から両エンジンの JSON を同一に扱えるようにする。
             format!(
                 "\"builds\":{},\"build_failures\":{},\"rebuilds\":{},\"hits\":{},\
                  \"misses\":{},\"fallbacks\":{},\"plain_scans\":{},\
                  \"subset_searches\":{},\"hybrid_dense_searches\":{},\
-                 \"hybrid_queries\":{},\"ef_cap_fallbacks\":{},\"entries\":{}",
+                 \"hybrid_queries\":{},\"ef_cap_fallbacks\":{},\"entries\":{},\
+                 \"f16_residency_fallbacks\":{}",
                 s.builds,
                 s.build_failures,
                 s.rebuilds,
@@ -968,6 +994,7 @@ fn main() {
                 s.hybrid_queries,
                 s.ef_cap_fallbacks,
                 s.entries,
+                s.f16_residency_fallbacks,
             )
         }
         BenchEngine::BruteForce => String::new(),

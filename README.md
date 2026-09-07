@@ -511,7 +511,7 @@ let core = engine::core::EngineCore::from_storage_with_engine(storage, kind);
 
 `crates/engine/examples/feature_bench.rs`（13 フェーズ通し計測）・`crates/engine/benches/knn_profile_bench.rs`（`make bench-knn-profile`）は、いずれも ANN opt-in・規模スケールを env 変数で切り替えられます。
 
-- `BENCH_FEATURE_ENGINE` / `BENCH_KNN_PROFILE_ENGINE`: 未設定・空・`brute_force`（既定）／`hnsw`（`HnswParams::default()` で opt-in）。未知値は fail-closed で拒否
+- `BENCH_FEATURE_ENGINE` / `BENCH_KNN_PROFILE_ENGINE`: 未設定・空・`brute_force`（既定）／`hnsw`（`HnswParams::default()` で opt-in）／`hnsw_f16`（Issue #516。索引ノード f16 常駐 opt-in・`ValidatedHnswParams::with_resident_precision(F16)`。詳細は `docs/design/hnsw-f16-resident.md`）。未知値は fail-closed で拒否
 - `BENCH_FEATURE_SCALE`（`feature_bench` のみ）: 正整数倍率。既定 1（25,000 行）。`hnsw::MAX_HNSW_NODES` を超えない範囲で bound
 - `BENCH_FEATURE_DIM` / `BENCH_KNN_PROFILE_DIM`（Issue #466）: 正整数・既定 128・上限 4,096。dim=768／1536 が Issue #365 で採否の判別変数と判明したため、横断 SQL ベンチ側にも dim を可変にする規模点を用意したもの。未知値・0・上限超過は fail-closed で拒否
 
@@ -538,6 +538,19 @@ make bench-knn-visible-ratio  # 全比率 × 全行数 × 4 arm を交互 N ペ�
 ```
 
 実測結果・判断は `docs/design/hnsw-rls-cardinality-switch.md`「可視比率 × 行数の損益分岐点実測（Issue #487）」を参照してください。
+
+`knn_profile_bench` にはさらに、f16 常駐（`hnsw_f16`）と f32 常駐（`hnsw`）の前後比較・常駐メモリ実測専用の 2 モードがあります（Issue #516。互いに排他、`BENCH_KNN_PROFILE_VISIBLE_RATIO` とも排他）。
+
+- `BENCH_KNN_PROFILE_HOT_ONLY=1`: S0-cold（毎サンプル新規 `EngineCore` 構築）を省き、索引 1 回構築＋ SQL 表層 e2e ホットパス（S0-hot 相当）と参照区間（`COUNT(*)`）のみを測ります。`BENCH_KNN_PROFILE_SCALE`（最大 40 = 1,000,000 行）まで許容するため、500k 行規模のような S0-cold が非現実的な所要時間になる規模点向けです
+- `BENCH_KNN_PROFILE_INDEX_MEMORY=1`（`BENCH_KNN_PROFILE_ENGINE=hnsw|hnsw_f16` 限定）: redb・SQL 表層（`VectorArena` の 1 GiB 上限）を経由せず、メモリ上のコーパスから `HnswIndex` を 1 回構築して常駐バイト数（`approx_heap_bytes`・VmRSS 前後差・VmHWM）を子プロセス隔離で計測します。500k×768 のように SQL 表層では構造的に到達不能な規模点でも、索引単体としては計測できます
+
+```bash
+BENCH_KNN_PROFILE_HOT_ONLY=1 BENCH_KNN_PROFILE_ENGINE=hnsw_f16 BENCH_KNN_PROFILE_SCALE=20 make bench-knn-profile  # 500,000 行・f16 常駐
+BENCH_KNN_PROFILE_INDEX_MEMORY=1 BENCH_KNN_PROFILE_ENGINE=hnsw_f16 BENCH_KNN_PROFILE_SCALE=20 BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
+make bench-knn-f16-resident  # 全規模点 × f32/f16 を交互 N≥5 ペア＋索引単体メモリで一括実行（AB_PAIRS・AB_POINTS・AB_MEMORY_POINTS で上書き可）
+```
+
+実測結果・判断は `docs/design/hnsw-f16-resident.md`「Issue #516 追記」節を参照してください。
 
 HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳・`repair_reachability` 修復統計〔Issue #447〕）・`make bench-hnsw-compare`（usearch との構築時間・Recall@10・探索レイテンシ比較。L2 正規化コーパス方式を維持）で実測できます。いずれも手動専用ベンチで CI 非配線です。詳細・実測値は `docs/design/hnsw-parallel-build.md` を参照してください。
 

@@ -17,8 +17,9 @@
 mod harness;
 
 use harness::knn_profile::{
-    assert_scan_row_counts_match, decode_header_reimpl, decode_row_reimpl, ns_per_row,
-    refuse_under_github_actions, stage_diff_ns_per_row, KnnProfileError,
+    assert_scan_row_counts_match, decode_header_reimpl, decode_row_reimpl, explain_resident_value,
+    ns_per_row, refuse_under_github_actions, render_index_memory_line, requires_hnsw_stats_check,
+    resident_label_for_token, scaled_rows, stage_diff_ns_per_row, KnnProfileError,
 };
 
 use engine::storage::{RowInput, Storage, Visibility};
@@ -315,4 +316,109 @@ fn assert_scan_row_counts_match_rejects_mismatched_counts() {
 #[test]
 fn assert_scan_row_counts_match_accepts_empty_input() {
     assert!(assert_scan_row_counts_match(&[]).is_ok());
+}
+
+// --- scaled_rows (Issue #516) ------------------------------------------------
+
+#[test]
+fn scaled_rows_multiplies_scale_by_unit_rows() {
+    assert_eq!(scaled_rows(1, 25_000).unwrap(), 25_000);
+    assert_eq!(scaled_rows(4, 25_000).unwrap(), 100_000);
+    assert_eq!(scaled_rows(20, 25_000).unwrap(), 500_000);
+}
+
+#[test]
+fn scaled_rows_rejects_zero_unit_rows_and_overflow() {
+    assert!(scaled_rows(1, 0).is_err());
+    assert!(scaled_rows(u64::MAX, 2).is_err());
+}
+
+// --- explain_resident_value (Issue #516) ------------------------------------
+
+#[test]
+fn explain_resident_value_extracts_from_hnsw_params_line() {
+    let lines = vec![
+        "mode_source: default".to_string(),
+        "engine: hnsw".to_string(),
+        "hnsw_params: m=32,ef_construction=200,ef_search=128,resident=f16".to_string(),
+        "ann_plan: hnsw_full_visible".to_string(),
+    ];
+    assert_eq!(explain_resident_value(&lines), Some("f16".to_string()));
+}
+
+#[test]
+fn explain_resident_value_returns_none_when_missing_or_no_resident_field() {
+    assert_eq!(explain_resident_value(&[]), None);
+    let lines = vec!["engine: parallel_brute_force".to_string()];
+    assert_eq!(explain_resident_value(&lines), None);
+    let lines = vec!["hnsw_params: m=32,ef_construction=200,ef_search=128".to_string()];
+    assert_eq!(explain_resident_value(&lines), None);
+}
+
+#[test]
+fn explain_resident_value_handles_trailing_field_and_whitespace() {
+    let lines = vec!["  hnsw_params: m=32, resident=f32 ".to_string()];
+    assert_eq!(explain_resident_value(&lines), Some("f32".to_string()));
+}
+
+// --- resident_label_for_token (Issue #516) ----------------------------------
+
+#[test]
+fn resident_label_for_token_maps_known_tokens() {
+    assert_eq!(resident_label_for_token("hnsw"), Some("f32"));
+    assert_eq!(resident_label_for_token("hnsw_f16"), Some("f16"));
+    assert_eq!(resident_label_for_token("brute_force"), None);
+    assert_eq!(resident_label_for_token("bogus"), None);
+}
+
+// --- render_index_memory_line (Issue #516) ----------------------------------
+
+#[test]
+fn render_index_memory_line_formats_available_values() {
+    let line = render_index_memory_line(
+        500_000,
+        768,
+        "f16",
+        "f16",
+        123_456,
+        Some(1_000),
+        Some(2_500),
+        Some(3_000),
+    );
+    assert_eq!(
+        line,
+        "knn_profile_bench: index_memory rows=500000 dim=768 requested=f16 effective=f16 \
+         approx_heap_bytes=123456 vm_rss_kb_before=1000 vm_rss_kb_after=2500 \
+         vm_rss_delta_kb=1500 vm_hwm_kb=3000"
+    );
+}
+
+#[test]
+fn render_index_memory_line_reports_unavailable_when_proc_stats_missing() {
+    let line = render_index_memory_line(25_000, 128, "f32", "f32", 42, None, None, None);
+    assert!(line.contains("vm_rss_kb_before=unavailable"));
+    assert!(line.contains("vm_rss_kb_after=unavailable"));
+    assert!(line.contains("vm_rss_delta_kb=unavailable"));
+    assert!(line.contains("vm_hwm_kb=unavailable"));
+}
+
+// --- requires_hnsw_stats_check (Issue #516・codex P1 指摘対応) --------------
+
+#[test]
+fn requires_hnsw_stats_check_covers_hnsw_and_hnsw_f16() {
+    // hnsw・hnsw_f16 はいずれも `sql::hnsw_cache::HnswIndexCacheStats`
+    // （精度非依存の単一型）を返す設計のため、非 vacuous 検証・Subset 系
+    // カウンタ検証・builds_delta 契約検査のいずれも両エンジンで有効である
+    // べき（codex P1 指摘: hnsw_f16 だけ検証が省略され observed=n/a
+    // (brute_force engine) という実体と異なるラベルが出力されていた）。
+    assert!(requires_hnsw_stats_check("hnsw"));
+    assert!(requires_hnsw_stats_check("hnsw_f16"));
+}
+
+#[test]
+fn requires_hnsw_stats_check_excludes_brute_force_and_unknown_tokens() {
+    assert!(!requires_hnsw_stats_check("brute_force"));
+    assert!(!requires_hnsw_stats_check(""));
+    assert!(!requires_hnsw_stats_check("HNSW"));
+    assert!(!requires_hnsw_stats_check("bogus"));
 }
