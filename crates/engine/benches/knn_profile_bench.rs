@@ -164,8 +164,17 @@ fn fail_closed(msg: impl std::fmt::Display) -> ! {
 
 /// S0-cold／S0-hot が使う `EngineCore` を `knn_engine`（`BENCH_KNN_PROFILE_ENGINE`。
 /// Issue #413）に応じて構築する。S1〜S5' は生 redb 走査・provider 直呼び等の
-/// エンジン非依存経路のため本関数を使わない。
-fn build_core_for(knn_engine: harness::bench_engine::BenchEngine, storage: Storage) -> EngineCore {
+/// エンジン非依存経路のため本関数を使わない。`sparse_visited_max_override`
+/// （`BENCH_KNN_PROFILE_SPARSE_VISITED_MAX`。Issue #497）は `knn_engine ==
+/// Hnsw` のときのみ意味を持ち、`None`（未設定）なら既定値（常に dense）の
+/// まま構築する——未計測の性能変更を既定にしない方針（`docs/design/
+/// benchmark-judgement-policy.md`）に沿い、この knob 自体が出力・処理を
+/// 変えるのは明示的に指定した場合に限る。
+fn build_core_for(
+    knn_engine: harness::bench_engine::BenchEngine,
+    storage: Storage,
+    sparse_visited_max_override: Option<usize>,
+) -> EngineCore {
     match knn_engine {
         harness::bench_engine::BenchEngine::BruteForce => {
             EngineCore::from_storage(storage, search_engine::default_engine())
@@ -173,6 +182,12 @@ fn build_core_for(knn_engine: harness::bench_engine::BenchEngine, storage: Stora
         harness::bench_engine::BenchEngine::Hnsw => {
             let kind = search_engine::hnsw_kind(engine::hnsw::HnswParams::default())
                 .expect("valid HnswParams::default()");
+            let kind = match (kind, sparse_visited_max_override) {
+                (SearchEngineKind::Hnsw(validated), Some(max)) => {
+                    SearchEngineKind::Hnsw(validated.with_sparse_visited_max(max))
+                }
+                (kind, _) => kind,
+            };
             EngineCore::from_storage_with_engine(storage, kind)
         }
         harness::bench_engine::BenchEngine::HnswF16 => {
@@ -258,6 +273,24 @@ fn main() {
             "BENCH_KNN_PROFILE_FULL_SCAN_RATIO requires BENCH_KNN_PROFILE_ENGINE=hnsw or hnsw_f16",
         );
     }
+
+    // visited 集合の切替閾値（Issue #497）。S0-cold／S0-hot の `EngineCore`
+    // 構築（`build_core_for`）と可視比率スイープ（`run_visible_ratio_sweep`→
+    // `build_core_for_sweep`）の双方に効く。未設定時は既定値（常に dense）の
+    // まま、本 knob 導入前と出力・処理が完全に同一。#498 の可視比率別
+    // before/after 計測が主な使用先。
+    let sparse_visited_max_override =
+        match harness::bench_engine::read_env_var("BENCH_KNN_PROFILE_SPARSE_VISITED_MAX")
+            .and_then(|raw| harness::bench_engine::parse_sparse_visited_max(raw.as_deref()))
+        {
+            Ok(v) => v,
+            Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_SPARSE_VISITED_MAX: {e}")),
+        };
+    if sparse_visited_max_override.is_some()
+        && !matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw)
+    {
+        fail_closed("BENCH_KNN_PROFILE_SPARSE_VISITED_MAX requires BENCH_KNN_PROFILE_ENGINE=hnsw");
+    }
     let visible_ratio_denominator = match harness::bench_engine::read_env_var(
         "BENCH_KNN_PROFILE_VISIBLE_RATIO",
     )
@@ -324,6 +357,7 @@ fn main() {
             dim,
             denominator,
             full_scan_ratio_override,
+            sparse_visited_max_override,
             sweep_scale,
         );
         return;
@@ -521,7 +555,7 @@ fn main() {
     // 束ねる契約のため使えず、本段のみ独自の warmup/計測ループを持つ。
     for _ in 0..config.warmup_iterations() {
         let cold_storage = Storage::open(&path).expect("reopen storage for S0-cold warmup");
-        let cold_core = build_core_for(knn_engine, cold_storage);
+        let cold_core = build_core_for(knn_engine, cold_storage, sparse_visited_max_override);
         black_box(
             cold_core
                 .execute_sql(&policy_ctx, &sql)
@@ -533,7 +567,7 @@ fn main() {
     let mut s0_cold_last_result_len: Option<usize> = None;
     for _ in 0..config.measured_iterations() {
         let cold_storage = Storage::open(&path).expect("reopen storage for S0-cold measurement");
-        let cold_core = build_core_for(knn_engine, cold_storage);
+        let cold_core = build_core_for(knn_engine, cold_storage, sparse_visited_max_override);
         let start = Instant::now();
         let result = black_box(
             cold_core
@@ -559,7 +593,7 @@ fn main() {
 
     // --- S0-hot/S0': SQL 表層 e2e（単一 `EngineCore` を使い回すホットパス）。----
     let storage = Storage::open(&path).expect("reopen storage for S0-hot/S0'");
-    let core = build_core_for(knn_engine, storage);
+    let core = build_core_for(knn_engine, storage, sparse_visited_max_override);
     let s0_hot = run(&config, || {
         core.execute_sql(&policy_ctx, &sql)
             .expect("execute_sql must succeed for well-formed synthetic KNN query")
@@ -945,13 +979,15 @@ fn main() {
     println!("knn_profile_bench: consistency checks passed (S1..S3 row counts, S0 result count, S0' COUNT(*) value, S3 vs VectorArena cross-check)");
 }
 
-/// `knn_engine`（`BENCH_KNN_PROFILE_FULL_SCAN_RATIO` override 対応）で
+/// `knn_engine`（`BENCH_KNN_PROFILE_FULL_SCAN_RATIO`／
+/// `BENCH_KNN_PROFILE_SPARSE_VISITED_MAX`〔Issue #497〕override 対応）で
 /// [`EngineCore`] を構築する（[`run_visible_ratio_sweep`] 専用。既定経路の
 /// `build_core_for` は override を持たないため共有しない）。
 fn build_core_for_sweep(
     knn_engine: harness::bench_engine::BenchEngine,
     storage: Storage,
     full_scan_ratio_override: Option<(u32, u32)>,
+    sparse_visited_max_override: Option<usize>,
 ) -> EngineCore {
     match knn_engine {
         harness::bench_engine::BenchEngine::BruteForce => {
@@ -967,6 +1003,9 @@ fn build_core_for_sweep(
                         denominator,
                     })
                     .expect("BENCH_KNN_PROFILE_FULL_SCAN_RATIO already validated by harness::bench_engine::parse_full_scan_ratio");
+            }
+            if let Some(max) = sparse_visited_max_override {
+                validated = validated.with_sparse_visited_max(max);
             }
             EngineCore::from_storage_with_engine(storage, SearchEngineKind::Hnsw(validated))
         }
@@ -1044,6 +1083,7 @@ fn run_visible_ratio_sweep(
     dim: usize,
     denominator: u32,
     full_scan_ratio_override: Option<(u32, u32)>,
+    sparse_visited_max_override: Option<usize>,
     scale: u64,
 ) {
     const BUCKET_COLUMN: &str = "bucket";
@@ -1071,11 +1111,15 @@ fn run_visible_ratio_sweep(
     println!(
         "knn_profile_bench: visible_ratio_sweep total_rows={total_rows} dim={dim} top_k={TOP_K} \
          denominator={denominator} visible_rows={visible_rows} engine={} full_scan_ratio={}/{} \
-         (Issue #487。S0-cold・S1〜S5' は非対象。QEMU 共有開発環境での実測は参考値——\
+         sparse_visited_max={} \
+         (Issue #487・#497。S0-cold・S1〜S5' は非対象。QEMU 共有開発環境での実測は参考値——\
          docs/design/hnsw-rls-cardinality-switch.md 参照)",
         knn_engine.token(),
         effective_full_scan_ratio.0,
         effective_full_scan_ratio.1,
+        sparse_visited_max_override
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "default".to_string()),
     );
 
     let path = unique_db_path("issue487-knn-visible-ratio-sweep");
@@ -1146,7 +1190,12 @@ fn run_visible_ratio_sweep(
     let where_sql = c1_where_statement(TABLE, COLUMN, BUCKET_COLUMN, "b0", &literal, TOP_K)
         .expect("well-formed WHERE statement from validated identifiers/tokens");
 
-    let core = build_core_for_sweep(knn_engine, storage, full_scan_ratio_override);
+    let core = build_core_for_sweep(
+        knn_engine,
+        storage,
+        full_scan_ratio_override,
+        sparse_visited_max_override,
+    );
 
     // --- warm: `FullVisible` 形状の索引を 1 回構築する（`Subset` 形状は索引を
     // 構築しないため。モジュール冒頭コメント参照）。--------------------------

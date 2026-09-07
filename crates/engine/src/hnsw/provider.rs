@@ -92,6 +92,14 @@ impl HnswSearchProvider {
         self.params.full_scan_ratio()
     }
 
+    /// visited 集合の切替閾値を返す（Issue #497。`full_scan_ratio` と同じ理由
+    /// （`ValidatedHnswParams` の private フィールド）で本 provider 経由でのみ
+    /// 読み取れる）。`sql::hnsw_cache::search_with_overlay` が
+    /// `HnswIndex::search_masked_with` へそのまま渡す。
+    pub fn sparse_visited_max(&self) -> usize {
+        self.params.sparse_visited_max()
+    }
+
     /// 構築時に要求した索引ノードの常駐精度（Issue #514）。`full_scan_ratio`
     /// と同じ理由（`ValidatedHnswParams` の private フィールド）で本 provider
     /// 経由でのみ読み取れる。`sql::hnsw_cache::IndexedBase::build` が索引構築

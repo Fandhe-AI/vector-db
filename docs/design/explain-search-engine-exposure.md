@@ -72,7 +72,7 @@ exec.rs`（`ORDER BY` 経路の `HINT ORDER` を受理する）からは到達�
 | 行 | 常時／条件 | 値の語彙（snake_case・英語・閉じた集合） |
 | -- | -- | -- |
 | `engine: <token>` | 常時 | `parallel_brute_force` / `cpu_scalar_brute_force` / `hnsw` / `(custom_provider)`（`search_engine_kind() == None`。`with_provider`／`from_storage` 経由） |
-| `hnsw_params: m=<m>,ef_construction=<ef_c>,ef_search=<ef_s>,resident=<f32\|f16>` | `engine: hnsw` のときのみ | 構築時の静的設定値のみ（`full_scan_ratio` は含まない）。`resident=`（Issue #514 追記）は要求精度の静的値で、実行時の自動縮退結果は含まない |
+| `hnsw_params: m=<m>,ef_construction=<ef_c>,ef_search=<ef_s>,resident=<f32\|f16>,sparse_visited_max=<n>` | `engine: hnsw` のときのみ | 構築時の静的設定値のみ（`full_scan_ratio` は含まない）。`resident=`（Issue #514 追記）は要求精度の静的値で、実行時の自動縮退結果は含まない。`sparse_visited_max=`（Issue #497 追記）は visited 集合切替閾値の静的設定値（`ValidatedHnswParams::sparse_visited_max`。既定 0）で、実行時にどちらの visited 実装が選ばれたか・可視候補数・索引ノード数は含まない |
 | `ann_plan: <token>` | 常時 | `plain_scan_engine` / `plain_scan_precision` / `hnsw_full_visible` / `hnsw_subset` / `unknown_custom_provider`（`engine: (custom_provider)` のときのみ。PR #437 追記） |
 | `scalar_plan: <token>` | 常時（Issue #474 追記） | `plain_scan` / `index_equality` / `index_prefix` / `index_id_range` / `index_conjunction`（`sql::scalar_plan::classify_scalar_plan` の静的判定。件数・閾値・実行時縮退結果は非露出。詳細は `docs/design/scalar-index-prune.md` 参照） |
 
@@ -82,8 +82,11 @@ exec.rs`（`ORDER BY` 経路の `HINT ORDER` を受理する）からは到達�
 
 **露出しない値**: `full_scan_ratio`（切替閾値）・`MIN_INDEXED_ROWS`・可視カーディ
 ナリティ・行数・索引ノード数・キャッシュ状態・実行時縮退結果・hybrid 密側再取得
-ラウンド数。これらはいずれもテナントの存在情報に繋がりうるため対象外とし、必要に
-なれば別 Issue でオーナー判断とする。
+ラウンド数・実行時に選ばれた visited 実装（`VisitedBitmap`／`VisitedSparse`。
+Issue #497）。これらはいずれもテナントの存在情報に繋がりうるため対象外とし、必要に
+なれば別 Issue でオーナー判断とする。`sparse_visited_max` 自体は `resident=`
+（Issue #514）と同じ「構築時の静的 opt-in 設定値」区分のため例外的に露出する
+（`full_scan_ratio` の露出可否は本 Issue で再開しない。据え置き）。
 
 ## 実装
 
