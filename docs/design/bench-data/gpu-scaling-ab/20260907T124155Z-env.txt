@@ -1,0 +1,34 @@
+Phase 5 通し前後比較（Issue #544）環境スナップショット
+=========================================================
+before_commit=b161d5b
+after_commit=a40edd7
+ab_pairs=5
+ab_points=100000:128:64,20000:128:8,20000:128:64,100000:128:1,100000:128:256,500000:128:64
+nproc=12
+cpu_model=QEMU Virtual CPU version 2.5+
+cpu_vendor=GenuineIntel
+cpu_threads_per_core=1
+cpu_cores_per_socket=12
+gpu_name=NVIDIA GeForce RTX 3060
+gpu_driver=595.71.05
+rustc_version=rustc 1.96.0 (ac68faa20 2026-05-25)
+BENCH_DEDICATED_ENV=unset（共有 QEMU 環境。専有ではない）
+cpu_flags_avx2=yes
+cpu_flags_fma=yes
+cpu_flags_f16c=yes
+cpu_flags_avx512=no
+cpu_flags_neon=n/a（x86_64 環境のため対象外）
+# 上記 cpu_flags_* は同一ホスト（nproc・cpu_model が本ファイル上部の値と一致
+# することを事後確認済み）での再取得値であり、計測当時のスナップショットでは
+# ない（ホストの命令セットは計測後に変化しないため静的事実として有効。
+# `lscpu` の Flags 行から抽出）。
+# per-run loadavg・同時実行プロセスの有無: 未記録。
+# `scripts/bench_gpu_scaling_ab.sh` は各 run 直前に /proc/loadavg を
+# 生ログ（<OUT_DIR>/<point>/<pair>-<before|after>.log）へ書き出す仕様だが、
+# 生ログの出力先は本リポの `.gitignore` 対象（`_/`）配下であり、
+# 20260907T124155Z 実行時点の生ログは本作業時点で既に削除済みで復元でき
+# なかった（benchmark-judgement-policy.md §3 が求める run 別 loadavg・
+# 同時実行プロセスの記録はこの run について欠落。限界として明記。
+# 今後の計測では summary.tsv へ run 別 loadavg 列を必須で追記すること
+# — 20260907T082358Z の run 〔docs/design/bench-data/gpu-scaling-ab/
+# 20260907T082358Z-summary.tsv〕は loadavg_1m/5m/15m 列を持つ先例）。
