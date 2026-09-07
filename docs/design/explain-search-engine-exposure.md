@@ -83,7 +83,10 @@ exec.rs`（`ORDER BY` 経路の `HINT ORDER` を受理する）からは到達�
 **露出しない値**: `full_scan_ratio`（切替閾値）・`MIN_INDEXED_ROWS`・可視カーディ
 ナリティ・行数・索引ノード数・キャッシュ状態・実行時縮退結果・hybrid 密側再取得
 ラウンド数・実行時に選ばれた visited 実装（`VisitedBitmap`／`VisitedSparse`。
-Issue #497）。これらはいずれもテナントの存在情報に繋がりうるため対象外とし、必要に
+Issue #497）・`acorn_max_visible_ratio`（ACORN-1 の 2-hop 展開切替閾値。Issue #501。
+`full_scan_ratio` と同じ「切替閾値」区分のため据え置き。実行時のレジーム選択
+（`PlainScan`／`OneHop`／`TwoHop`）・`acorn_searches`／`acorn_expansions` も同様に
+非露出）。これらはいずれもテナントの存在情報に繋がりうるため対象外とし、必要に
 なれば別 Issue でオーナー判断とする。`sparse_visited_max` 自体は `resident=`
 （Issue #514）と同じ「構築時の静的 opt-in 設定値」区分のため例外的に露出する
 （`full_scan_ratio` の露出可否は本 Issue で再開しない。据え置き）。

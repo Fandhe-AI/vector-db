@@ -173,6 +173,22 @@ fn hnsw_kind_with(precision: engine::hnsw::ResidentPrecision) -> search_engine::
     }
 }
 
+/// [`hnsw_kind_with`] に加え、ACORN-1 の 2-hop 展開（Issue #501。
+/// `ValidatedHnswParams::acorn_max_visible_ratio`）を opt-in する統合テスト
+/// 専用ヘルパ。
+fn hnsw_kind_with_acorn(ratio: engine::hnsw::Ratio) -> search_engine::SearchEngineKind {
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    match kind {
+        search_engine::SearchEngineKind::Hnsw(validated) => search_engine::SearchEngineKind::Hnsw(
+            validated
+                .with_acorn_max_visible_ratio(ratio)
+                .expect("valid acorn_max_visible_ratio"),
+        ),
+        other => panic!("hnsw_kind must return SearchEngineKind::Hnsw, got {other:?}"),
+    }
+}
+
 /// F16 常駐 opt-in（Issue #515）の非 vacuous 確認: 実際にエンジンへ opt-in が
 /// 到達し（`search_engine_kind()` の Display に `resident=f16`）、この
 /// コーパスでは自動縮退（D6）が発生していないこと（`f16_residency_fallbacks
@@ -1806,5 +1822,250 @@ fn precision_mode_bypasses_cache_and_matches_default_engine_gate_decision() {
     assert_eq!(
         stats_after_recall.builds, 1,
         "recall mode on the same table must still populate HnswIndexCache"
+    );
+}
+
+/// ACORN-1 の 2-hop 展開（Issue #501・親 #500）が実際に効果を持つ最小フィク
+/// スチャを構成する共通ヘルパ。`tag = 'x'` の選択率 20%（`i % 5 == 0`）は、
+/// 同じコーパス上で `acorn_max_visible_ratio == None`（既定・`HopMode::OneHop`）
+/// だと `mask_splits_graph` が 20/20 で発火する（本 Issue の実測で確認済み。
+/// `docs/design/hnsw-rls-cardinality-switch.md`「Issue #501」節参照）ほど
+/// 疎な可視集合を作る一方、`acorn_max_visible_ratio = 1/1` を指定すると
+/// 同じ 20 クエリすべてが `subset_searches`（縮退なしの ANN 完走）へ転じる。
+fn seed_acorn_fixture(
+    storage: &Storage,
+    schema: &TableSchema,
+    ctx: &PolicyContext,
+    op_tag: &str,
+) -> Vec<Vec<f32>> {
+    let vectors = gen_clustered_corpus(9, DIM as usize, BASE_ROWS, 6);
+    let op_id = OperationId::parse(&format!("hnsw-cache-acorn-{op_tag}")).expect("valid op id");
+    let metadata_x = engine::row_codec::encode_scalar_columns(
+        schema,
+        &[
+            engine::row_codec::Value::Null,
+            engine::row_codec::Value::Text("x".to_string()),
+        ],
+    )
+    .expect("encode tag=x metadata");
+    let metadata_y = engine::row_codec::encode_scalar_columns(
+        schema,
+        &[
+            engine::row_codec::Value::Null,
+            engine::row_codec::Value::Text("y".to_string()),
+        ],
+    )
+    .expect("encode tag=y metadata");
+    let rows: Vec<(u64, RowInput<'_>)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            // 20% 選択率（`i % 5 == 0`）: `full_scan_ratio`（既定 1/10）は
+            // 上回るが、OneHop では `mask_splits_graph` が発火するほど疎な
+            // 可視カーディナリティ（§本関数ドキュメンテーションコメント）。
+            let metadata = if i % 5 == 0 {
+                metadata_x.as_slice()
+            } else {
+                metadata_y.as_slice()
+            };
+            (
+                i as u64 + 1,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: v.as_slice(),
+                    metadata,
+                },
+            )
+        })
+        .collect();
+    engine::tenant::insert_rows(storage, "docs", ctx, &rows, &op_id).expect("seed rows");
+    vectors
+}
+
+const ACORN_ALWAYS: engine::hnsw::Ratio = engine::hnsw::Ratio {
+    numerator: 1,
+    denominator: 1,
+};
+
+/// ACORN-1 の 2-hop 展開（Issue #501）を SCALAR 事前フィルタ付き DISTANCE
+/// （`Subset` 形状）で有効化し、(1) このフィクスチャでは分断（`mask_splits_
+/// graph`）が発生しないこと（フィクスチャ不備を先に切り分ける）、(2)
+/// `acorn_searches`／`acorn_expansions` が非 vacuous であること、(3) 既定
+/// エンジン対照 Recall@10 が本リポの回帰基準（0.9 目安）以上であること、
+/// (4) tenant-b の private 行が結果へ混入しないこと、(5) `plain_scans == 0`
+/// （TwoHop 経路が実際に選ばれ plain scan へ縮退していない）ことを固定する。
+#[test]
+fn acorn_two_hop_subset_shape_matches_default_engine_and_never_leaks_across_tenants() {
+    let dir = unique_db_path("hnsw-cache-acorn-two-hop");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    let schema = TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+            ColumnDef::new("tag", ColumnType::Text, false),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    let vectors = seed_acorn_fixture(&storage, &schema, &ctx_a, "a");
+
+    // tenant-b の private 行（id 空間を tenant-a と分離）。
+    let b_vectors = gen_clustered_corpus(42, DIM as usize, 100, 4);
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Private]).expect("valid tenant");
+    let metadata_b = engine::row_codec::encode_scalar_columns(
+        &schema,
+        &[
+            engine::row_codec::Value::Null,
+            engine::row_codec::Value::Text("x".to_string()),
+        ],
+    )
+    .expect("encode tenant-b metadata");
+    let rows_b: Vec<(u64, RowInput<'_>)> = b_vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            (
+                BASE_ROWS as u64 + 1 + i as u64,
+                RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Private,
+                    embedding: v.as_slice(),
+                    metadata: metadata_b.as_slice(),
+                },
+            )
+        })
+        .collect();
+    let op_b = OperationId::parse("hnsw-cache-acorn-two-hop-b").expect("valid operation_id");
+    engine::tenant::insert_rows(&storage, "docs", &ctx_b, &rows_b, &op_b).expect("seed tenant-b");
+
+    let kind = hnsw_kind_with_acorn(ACORN_ALWAYS);
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-acorn-two-hop-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage.create_table(&schema).expect("create ref table");
+    let _ = seed_acorn_fixture(&ref_storage, &schema, &ctx_a, "two-hop-ref");
+    engine::tenant::insert_rows(&ref_storage, "docs", &ctx_b, &rows_b, &op_b)
+        .expect("seed ref tenant-b");
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    // フィルタなしクエリを 1 本先に投げ、`FullVisible` 経路に索引を構築させる
+    // （`Subset` 経路は `Lookup::Miss` では構築を試みない契約）。
+    let _ = query_ids(&core, &ctx_a, &vectors[0], 10);
+
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    let mut total_hits = 0usize;
+    for i in 0..QUERIES {
+        let query = &vectors[i * (BASE_ROWS / QUERIES)];
+        let sql = format!(
+            "SELECT id FROM docs WHERE tag = 'x' ORDER BY embedding <=> '{}' LIMIT {K}",
+            vec_literal(query)
+        );
+        let got = core.execute_sql(&ctx_a, &sql).expect("filtered query").rows;
+        let want = ref_core
+            .execute_sql(&ctx_a, &sql)
+            .expect("filtered query (ref)")
+            .rows;
+        for row in &got {
+            assert!(
+                row.id <= BASE_ROWS as u64,
+                "tenant-a result must not include tenant-b row id {}",
+                row.id
+            );
+        }
+        let want_ids: std::collections::HashSet<u64> = want.iter().map(|r| r.id).collect();
+        total_hits += got.iter().filter(|r| want_ids.contains(&r.id)).count();
+    }
+    let recall = total_hits as f64 / (QUERIES * K) as f64;
+
+    let stats = core.hnsw_index_cache_stats();
+    // (1) フィクスチャ不備を先に切り分ける。
+    assert_eq!(
+        stats.mask_splits_graph, 0,
+        "TwoHop must resolve the disconnection that OneHop hits on this fixture \
+         (mask_splits_graph must stay 0); if this fails the fixture no longer \
+         demonstrates ACORN-1's effect"
+    );
+    // (2) 非 vacuous。
+    assert!(
+        stats.acorn_searches > 0,
+        "acorn_searches must be non-vacuous"
+    );
+    assert!(
+        stats.acorn_expansions > 0,
+        "acorn_expansions must be non-vacuous (bridge_expand must have run)"
+    );
+    // (3) 既定エンジン対照 Recall@10 >= 0.9。
+    assert!(
+        recall >= 0.9,
+        "TwoHop subset-shape recall@{K} against the default engine must be >= 0.9 (got {recall})"
+    );
+    // (5) plain scan へ縮退していない。
+    assert_eq!(
+        stats.plain_scans, 0,
+        "TwoHop must not fall back to plain scan on this fixture"
+    );
+    assert!(
+        stats.subset_searches > 0,
+        "Subset shape must be exercised (non-vacuous)"
+    );
+}
+
+/// ACORN-1（Issue #501）が既定（`acorn_max_visible_ratio == None`）のとき、
+/// 同じ疎なマスク・同じコーパスで `HopMode::OneHop`（既存契約）のまま挙動が
+/// 変わらないことを固定する——`acorn_searches`／`acorn_expansions` は常に
+/// `0` のまま、かつこのフィクスチャでは（§`seed_acorn_fixture` ドキュメン
+/// テーションコメントのとおり）`mask_splits_graph` が発火し plain scan へ
+/// 縮退する。opt-in しない限り本 Issue の変更が既存動作へ影響しないことの
+/// 直接証拠（R1）。
+#[test]
+fn acorn_disabled_by_default_keeps_existing_behavior_unaffected() {
+    let dir = unique_db_path("hnsw-cache-acorn-disabled");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    let schema = TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+            ColumnDef::new("tag", ColumnType::Text, false),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let vectors = seed_acorn_fixture(&storage, &schema, &ctx, "disabled");
+
+    // `acorn_max_visible_ratio` を opt-in しない既定エンジン。
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let _ = query_ids(&core, &ctx, &vectors[0], 10);
+
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    for i in 0..QUERIES {
+        let query = &vectors[i * (BASE_ROWS / QUERIES)];
+        let sql = format!(
+            "SELECT id FROM docs WHERE tag = 'x' ORDER BY embedding <=> '{}' LIMIT {K}",
+            vec_literal(query)
+        );
+        let _ = core.execute_sql(&ctx, &sql).expect("filtered query");
+    }
+
+    let stats = core.hnsw_index_cache_stats();
+    assert_eq!(
+        stats.acorn_searches, 0,
+        "acorn_max_visible_ratio == None must never select HopMode::TwoHop"
+    );
+    assert_eq!(stats.acorn_expansions, 0);
+    assert_eq!(
+        stats.mask_splits_graph, QUERIES as u64,
+        "without ACORN-1 opt-in, this fixture's sparse mask must keep splitting \
+         the graph exactly as before Issue #501 (existing behavior unchanged)"
     );
 }
