@@ -601,6 +601,147 @@ build_within_margin` へ threads=12 の判定を追加し（既存の threads=4 
 `sql::hnsw_cache`／`sql::hnsw_hybrid`・`Cargo.toml`（依存追加なし）・
 `.github/workflows`（CI 非配線のまま）はいずれも無変更。
 
+### Issue #449 追記（2026-09-07）: repair_reachability の到達不能ノード探索・再接続の並列化
+
+Issue #447・#448 で明らかになった「凍結後に単一スレッドで走る
+`repair_reachability` が並列構築の頭打ち要因の一つ」を受け、修復パスの
+逐次コストを削減する。
+
+#### 現状分析（着手前の実測から導いた設計判断）
+
+Issue #447 追記の実測（run7・run8）を精査すると、`phase2_wall`（層数
+（5）× BFS 1 回）はスレッド数に依存せず一定であり、`bfs_reachable`
+（`HashSet<u32>` への挿入・`VecDeque` キュー）そのものの走査コストが
+支配的だった。一方 Issue #448 適用後は残る到達不能ノードがほぼ 0（本
+Issue の実測でも `repair_unreachable_sum=0`）まで低下しており、
+Issue 本文が指定する「最近傍探索の並列化」（下記 C）だけでは修復対象
+ノードが存在しないため効果が測れない。そこで、修復量に比例しない BFS の
+定数コスト（下記 A・B）を先に削減したうえで C を実装する 3 段構成を
+採った。A・B はいずれもグラフ出力を一切変えない（到達集合は集合として
+同一）。
+
+#### 設計
+
+- **A: BFS のビットマップ化と層メンバの事前計算**（`hnsw.rs::
+  GraphBuilder::bfs_reachable_mask`）: 到達集合の表現を `HashSet<u32>`
+  （SipHash ハッシュコスト・エントリごとのヒープ確保）から
+  [`NodeMask`]（1 ノード 1 bit のビットマップ。Issue #409 で導入済みの
+  型を流用）＋ `VecDeque<u32>` キューへ置換した。層メンバ（`(0..len)
+  .filter(level_of >= level)`）も層ごとに 1 回だけ構築し、毎反復・
+  フェーズ 2 の全走査を削減した。
+- **B: フェーズ 2 の冗長 BFS 省略**: フェーズ 1 が「未到達ノードが
+  見つからず `break`」で終わった反復の BFS 結果は、グラフを一切変更
+  していない状態のまま得られたものであり、フェーズ 2 が使う到達集合と
+  完全に一致する。`mutated_since_bfs` フラグでこれを判定し、変更が
+  無いと分かっている場合はフェーズ 2 の BFS 再実行を省略する。
+- **C: 最近傍探索の並列化**（`hnsw.rs::nearest_reachable`・
+  `repair_workers_for`）: フェーズ 1 の各反復が行う「到達済み集合内の
+  最近傍探索」（`dot` を到達済みノード数だけ計算する読み取り専用の
+  走査）を `std::thread::scope` で分割・並列実行する。方針（ワーカー数
+  の決定。`repair_workers_for` が `parallel_search::thread_count_for`
+  を経由）と機構（分割走査・縮約。`nearest_reachable`）を分離し、
+  それぞれを独立にテストできるようにした。修復先の決定（`connect`／
+  `shrink_links` の可変更新）自体は逐次のまま適用する 2 相構成
+  （探索＝不変借用の読み取り専用ヘルパ、結線＝可変借用の逐次適用）。
+
+同点タイブレーク（スコア `total_cmp` 降順・同点 id 昇順。モジュール
+冒頭「順序規約」）は全順序を成すため、到達済み集合をどう分割し・各
+ワーカーの局所最良をどの順序で縮約しても最終的に選ばれる修復先ノードは
+分割・縮約の順序に依存せず一意に定まる——`threads` の値によらず
+`repair_reachability_inner` が返すグラフはビット同一になる
+（`docs/design/rrf-tie-break-determinism.md`「維持すべき不変条件」と
+同方針）。`WorkerBudgetGuard` の追加取得は行わない——呼び出し元
+（`build_with_threads`／`build_parallel`）が構築全体（並列挿入フェーズ
+を含む）にわたって保持済みの予算を `threads` としてそのまま引き継ぐ
+契約とした（二重計上の回避。既存の並列挿入フェーズも同じ規約）。
+
+BFS 本体そのものの並列化（frontier 同期方式）は Issue 本文の指示により
+本タスクでは見送り、逐次のまま維持した（下記「実測・所見」参照）。
+
+#### 決定性の検証
+
+- `crates/engine/src/hnsw.rs` 内 `#[cfg(test)] mod tests`
+  （`nearest_reachable_matches_across_worker_counts_and_actually_
+  parallelizes`）: 5,000 件の候補集合に対し `workers=1`／`2`／`4`／`8`
+  の結果がビット同一であることを固定し、`workers>=2` で並列分岐が
+  実際に起動したこと（テスト専用カウンタ `REPAIR_PARALLEL_LAUNCHES`。
+  `#[cfg(test)]` 限定で production バイナリには残らない）を確認する
+  非 vacuous 検証をあわせて行う。
+- `repair_reachability_inner_is_thread_count_invariant_on_duplicate_
+  heavy_graph`: 重複ヘビーコーパス（3,000 行・6 クラスタ。完全同点
+  スコアを誘発しフェーズ 1・フェーズ 2 の双方を確実に発火させる）で、
+  `threads=1`／`2`／`4` それぞれで修復した `GraphBuilder` の最終状態
+  （id 昇順 → レベル → 各層リンク列の FNV-1a 64bit フィンガープリント）
+  が完全一致することを固定する。フェーズ 1・フェーズ 2 が実際に発火した
+  こと（`phase1_iterations > 0`・`phase2_nodes > 0`）もあわせて確認し、
+  非 vacuous なテストにしている。
+- `repair_workers_for_clamps_small_reachable_sets_and_respects_
+  threads_cap`: 到達集合が `MIN_ROWS_PER_THREAD`（1,024）未満では
+  `threads` の値によらず常に 1 に縮退することを固定する（小規模
+  フィクスチャでの並列テストが実際にはワーカーを起動しない「見かけ上
+  green」を避けるための重要な契約）。
+- 既存の `tests/hnsw.rs::graph_fingerprint_is_stable_across_
+  representation_change`（`build`／`threads=1` の固定値照合。値
+  `0x5597_d0e9_0e1e_9898` は本 Issue の前後で不変）・
+  `repair_stats_are_deterministic_on_sequential_path`・
+  `repair_stats_on_duplicate_heavy_corpus_report_phase2_nodes` は
+  無変更のまま green（受け入れ条件 1「build／threads==1 のグラフ不変」）。
+
+#### 実測・所見
+
+`make bench-hnsw-parallel-build`（本開発環境・rows=30,000・dim=64・一様
+乱数コーパス〔クラスタ構造なし〕・threads=1,4,8,12。時間制約により
+100k 点フルラダーではなく縮小規模での 1 回実測。導入前（このコミットの
+直前）／導入後の交互比較）:
+
+| threads | repair（導入前） | repair（導入後） |
+| --- | --- | --- |
+| 1 | 16.027ms | 2.028ms |
+| 4 | 16.813ms | 2.275ms |
+| 8 | 20.554ms | 2.284ms |
+| 12 | 17.706ms | 2.270ms |
+
+このベンチの一様乱数コーパスは Issue #448 適用後 `repair_unreachable_
+sum=0`（全 threads 点で修復対象ノードが 1 件も発生しない）であるため、
+上記の改善は全面的に A（BFS のビットマップ化）・B（冗長 BFS 省略）に
+よるものであり、C（最近傍探索の並列化）はこのベンチでは 1 度も並列分岐
+を通っていない（`phase1_iterations=0`）。約 7〜9 倍の改善が確認できた
+一方、この実測では repair 段の絶対値自体が既に数 ms 台まで縮小して
+おり、「12 スレッドで並列構築全体の頭打ちに追随する」という当初の
+受け入れ条件 2 の趣旨（並列フェーズと同程度の並列度天井への追随）は、
+そもそも一様乱数コーパスでは修復対象ノードがほぼ発生しないため
+測定不能であることが判明した——BFS が逐次のままである以上、この構造は
+残る（下記「スコープ外・申し送り」参照）。
+
+C（最近傍探索の並列化）自体の正しさ・非 vacuous 性は上記「決定性の
+検証」の重複ヘビーコーパスによる単体テストで固定している。到達不能
+ノードが実際に多数発生する条件（重複ヘビー・adversarial なコーパス）
+での並列化の速度改善は、本ベンチのランダムコーパス方式では再現できず、
+運用者による専有環境での追加実測（重複ヘビーコーパス対応の
+`BENCH_HNSW_PARALLEL_*` 拡張を含む）へ申し送る。
+
+#### 対象ファイル
+
+| パス | 変更 |
+| --- | --- |
+| `crates/engine/src/hnsw.rs` | `bfs_reachable`（`HashSet`）→ `bfs_reachable_mask`（`NodeMask`）へ置換。`repair_reachability_inner` を層メンバ事前計算・`mutated_since_bfs` によるフェーズ 2 BFS 省略・`threads` 引数追加へ書き換え。`repair_workers_for`／`nearest_reachable`／`nearest_reachable_scan`／`better_repair_candidate`（新設）。`repair_reachability`／`repair_reachability_observed` に `threads: usize` を追加。`build_inner` は常に `threads=1` を渡す。テスト専用カウンタ `REPAIR_PARALLEL_LAUNCHES`（`#[cfg(test)]` 限定）。単体テスト 4 本追加 |
+| `crates/engine/src/hnsw/parallel_build.rs` | `freeze`／`build_parallel_graph`／`build_parallel_graph_observed` へ `threads` を配線し `repair_reachability`／`repair_reachability_observed` へ引き継ぐ。既存テスト 2 本の `freeze(...)` 呼び出しへ `threads=1` を追随 |
+
+`SearchProvider` trait・`sql::hnsw_cache`／`sql::hnsw_hybrid`・
+`search_layer`／探索経路・`PRECISE_REPAIR_CAP` の値・`Cargo.toml`
+（依存追加なし）・`.github/workflows`（CI 非配線のまま）はいずれも
+無変更。
+
+#### スコープ外・申し送り
+
+- BFS 本体の並列化（frontier 同期方式・原子ビットマップ）: Issue の
+  指示により本タスクでは逐次のまま維持した。上記実測のとおり、A・B
+  適用後の残る BFS コストは既に小さいため、追加の並列化が正味の改善に
+  つながるかは要実測——後続 Issue（#450 等）の前後比較・所見で採否を
+  判断する材料として申し送る。
+- 100k 点フルラダーでの導入前後比較・重複ヘビーコーパスでの C 単独の
+  速度実測: 運用者による専有環境での追加実測へ申し送る。
+
 ### 外部フレームワークとの構築比較（usearch）
 
 usearch（`=2.26.1`。承認済み optional 依存・`contrast-bench` feature、
