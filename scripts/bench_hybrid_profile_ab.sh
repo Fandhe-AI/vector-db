@@ -139,7 +139,14 @@ record_concurrent_processes() {
     fi
     local running top
     running="$(printf '%s\n' "$snapshot" | awk -v self="$self_pid" '$1 != self && $4 != "ps" && $2 ~ /^R/ {n++} END {print n+0}')"
-    top="$(printf '%s\n' "$snapshot" | awk -v self="$self_pid" '$1 != self && $4 != "ps" {print $1":"$4":"$3}' | sort -t: -k3 -rn | head -5 | tr '\n' ' ')"
+    # %cpu を先頭列にして数値ソートし（comm に `:` を含む kworker/0:1 等があるため
+    # `:` 区切りのフィールド指定ではソートキーがずれる）、上位 5 件の切り出しは
+    # `head` ではなく全入力を読み切る awk で行う（`head` の早期終了で `sort` が
+    # SIGPIPE を受けると pipefail 下でドライバ全体が中断する）。
+    top="$(printf '%s\n' "$snapshot" \
+        | awk -v self="$self_pid" '$1 != self && $4 != "ps" {print $3, $1":"$4":"$3}' \
+        | sort -k1,1 -rn \
+        | awk 'NR <= 5 {printf "%s ", $2}')"
     echo "# running_processes_excluding_self=$running"
     echo "# top_cpu_processes=${top:-none}"
 }
