@@ -83,20 +83,29 @@ pub fn min_median_max_duration(values: &[Duration]) -> Option<(Duration, Duratio
     Some((min, median, max))
 }
 
-/// 逐次段（`level_assign + sequential_prefix + freeze + repair_reachability`。
-/// いずれもスレッド数に依らず単一スレッドで実行される）が `total` に占める
-/// 割合（Amdahl の法則でいう逐次割合）。`total` が 0 の場合は `None`。
+/// 逐次段（`level_assign + sequential_prefix + freeze + repair_reachability +
+/// flatten`。いずれもスレッド数に依らず単一スレッドで実行される）が `total`
+/// に占める割合（Amdahl の法則でいう逐次割合）。`total` が 0 の場合は `None`。
+///
+/// `flatten`（CSR 平坦化。Issue #494・`engine::hnsw::HnswBuildProfile::flatten`）
+/// は `repair_reachability` 完了後の最終段として追加された逐次段であり
+/// （`hnsw.rs::HnswBuildProfile.flatten` ドキュメンテーションコメント参照）、
+/// 他の 4 段と同じくスレッド数に依らず単一スレッドで実行されるため逐次割合
+/// へ合算する（Issue #495）。逐次縮退経路（`build` と同一グラフを返す経路）
+/// では `flatten` が `Duration::ZERO` のまま呼ばれる契約のため、呼び出し元が
+/// 更新前の値をそのまま渡しても既存の期待値は変わらない。
 pub fn serial_share(
     level_assign: Duration,
     sequential_prefix: Duration,
     freeze: Duration,
     repair_reachability: Duration,
+    flatten: Duration,
     total: Duration,
 ) -> Option<f64> {
     if total.is_zero() {
         return None;
     }
-    let serial = level_assign + sequential_prefix + freeze + repair_reachability;
+    let serial = level_assign + sequential_prefix + freeze + repair_reachability + flatten;
     Some(serial.as_secs_f64() / total.as_secs_f64())
 }
 
@@ -213,4 +222,32 @@ pub fn pick_representative(profiles: &[HnswBuildProfile]) -> Option<&HnswBuildPr
     let totals: Vec<Duration> = profiles.iter().map(|p| p.total).collect();
     let median = median_duration(&totals)?;
     profiles.iter().min_by_key(|p| p.total.abs_diff(median))
+}
+
+/// 各 threads 点で 1 回だけ構築した [`engine::hnsw::HnswIndex`] を保持したまま
+/// 計測した常駐メモリ（RSS）増分行を描画する（Issue #495）。
+/// `harness::hybrid_profile::render_memory_line` と同型の書式・同じ
+/// `Option<u64>` 契約（`/proc` を読めない環境では `"unavailable"`。診断目的の
+/// ためベンチ自体は止めない）。`approx_heap_bytes` は
+/// `engine::hnsw::HnswIndex::approx_heap_bytes` の実測値（Issue #494 の CSR 化
+/// メモリ見積り〔`docs/design/hnsw-index.md` §14.6〕を突き合わせる材料）。
+pub fn render_memory_line(
+    threads: usize,
+    approx_heap_bytes: usize,
+    vm_rss_kb_before: Option<u64>,
+    vm_rss_kb_after: Option<u64>,
+    vm_hwm_kb: Option<u64>,
+) -> String {
+    let fmt_opt = |v: Option<u64>| v.map_or_else(|| "unavailable".to_string(), |v| v.to_string());
+    let rss_delta = match (vm_rss_kb_before, vm_rss_kb_after) {
+        (Some(before), Some(after)) => after.saturating_sub(before).to_string(),
+        _ => "unavailable".to_string(),
+    };
+    format!(
+        "hnsw_parallel_build: memory threads={threads} approx_heap_bytes={approx_heap_bytes} \
+         vm_rss_kb_before={} vm_rss_kb_after={} vm_rss_delta_kb={rss_delta} vm_hwm_kb={}",
+        fmt_opt(vm_rss_kb_before),
+        fmt_opt(vm_rss_kb_after),
+        fmt_opt(vm_hwm_kb),
+    )
 }
