@@ -128,9 +128,11 @@ wire_concurrency_throughput_measurement`（`#[ignore]`・手動専用。
 25,000 行・dim 128 のコーパスに対する `SELECT id FROM docs ORDER BY embedding
 <=> '<vec>' LIMIT 10` を、同時接続数 N=1／8／64 のクライアントスレッドが
 それぞれ 100 往復（ウォームアップ 5 往復除く）ずつ発行したときの集計 QPS・
-per-query レイテンシを 3 run ずつ実測した（`cargo test --release -p wire-server
---test wire_concurrency_throughput -- --ignored --nocapture`。commit
-`895e6cd20234bfdbb5b4ac838b3c2b000998fbe4`）。
+per-query レイテンシを 3 run ずつ実測した（`WIRE_CONCURRENCY_ROUNDS=100
+cargo test --release -p wire-server --test wire_concurrency_throughput --
+--ignored --nocapture`。既定は 200 往復だが本実測は 100 往復へ明示的に
+上書きして実行した。base `895e6cd20234bfdbb5b4ac838b3c2b000998fbe4` ＋ 本
+branch のハーネス追加コミット時点）。
 
 | N | run | QPS | per-query min (us) | p50 (us) | p95 (us) | max (us) |
 | --- | --- | --- | --- | --- | --- | --- |
