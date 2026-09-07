@@ -213,6 +213,19 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     crate::isa::current().dot(a, b)
 }
 
+/// 4 行 × 1 クエリの内積（`dot` の行ブロック版。Issue #510・TASK-156・CORE-14。
+/// ポインタ: `docs/design/dot-kernel-row-block.md`）。
+///
+/// 実体は `isa.rs::SimdKernel::dot_block4` へ委譲する。契約は各要素が
+/// `dot(rows[i], query)` とビット同一であること（1 行版と同じ加算順序を
+/// 内部で共有するため）。`parallel_search.rs::search_range` が 4 行単位の
+/// ブロックカーネルとして呼ぶ本番経路であり、行間でクエリのロードを 1 回に
+/// 共有することで load 帯域を削減する（行内の演算順・アキュムレータ構造は
+/// `dot` と完全に同一に保つため、Top-k の集合・順序への影響はない）。
+pub(crate) fn dot_block4(rows: [&[f32]; 4], query: &[f32]) -> [f32; 4] {
+    crate::isa::current().dot_block4(rows, query)
+}
+
 /// ヒープ内の同点タイブレーク規約（Low 指摘対応）: スコアが同じ場合は id が小さい方を
 /// 「強い」候補として扱う（[`TopKSelector::into_sorted_vec`] の `sort_by` が返却直前に
 /// id 昇順で安定させるのと選出段の基準を揃え、ヒープ挿入順・入力順に依存しない決定的な

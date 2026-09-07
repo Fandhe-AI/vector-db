@@ -18,10 +18,13 @@
 mod harness;
 
 use harness::ingest_profile::{
-    content_hash_insert_batch_reimpl, decode_ledger_entry_v2_reimpl, encode_row_reimpl,
-    encode_row_reimpl_into_slice, last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row,
-    parse_bounded_env, parse_insert_mode, refuse_under_github_actions, residual_ns_per_row,
-    sha256_reimpl, sum_durations, IngestProfileError, InsertMode, StageId, StageSamples,
+    content_hash_insert_batch_reimpl, content_hash_typed_insert_reimpl,
+    decode_ledger_entry_v2_reimpl, encode_row_reimpl, encode_row_reimpl_into_slice,
+    last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row, parse_bounded_env, parse_insert_mode,
+    parse_profile_mode, refuse_under_github_actions, residual_ns_per_row, rows_per_sec,
+    sha256_reimpl, sum_durations, IngestProfileError, InsertMode, ProfileMode, StageId,
+    StageSamples, DEFAULT_SINGLE_STATEMENTS, MAX_SINGLE_STATEMENTS, MIN_SINGLE_STATEMENTS,
+    SINGLE_WARMUP_STATEMENTS,
 };
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -527,4 +530,209 @@ fn encode_row_reimpl_into_slice_rejects_empty_tenant_id() {
     let mut dst = vec![0u8; 16];
     let err = encode_row_reimpl_into_slice(&mut dst, "", true, &[1.0], b"m").unwrap_err();
     assert!(matches!(err, IngestProfileError::Codec(_)));
+}
+// --- Issue #484: single モード追加分の回帰 -----------------------------------
+
+#[test]
+fn parse_profile_mode_defaults_to_batch_when_unset() {
+    assert_eq!(
+        parse_profile_mode(None).expect("default"),
+        ProfileMode::Batch
+    );
+}
+
+#[test]
+fn parse_profile_mode_accepts_batch_and_single() {
+    assert_eq!(
+        parse_profile_mode(Some("batch")).expect("batch"),
+        ProfileMode::Batch
+    );
+    assert_eq!(
+        parse_profile_mode(Some("single")).expect("single"),
+        ProfileMode::Single
+    );
+}
+
+#[test]
+fn parse_profile_mode_rejects_unknown_value() {
+    let err = parse_profile_mode(Some("SINGLE")).unwrap_err();
+    assert!(matches!(err, IngestProfileError::InvalidEnv { .. }));
+    let err = parse_profile_mode(Some("")).unwrap_err();
+    assert!(matches!(err, IngestProfileError::InvalidEnv { .. }));
+}
+
+#[test]
+fn single_statement_constants_are_consistent() {
+    // 既定値は下限・上限の範囲内で、warmup の 2 倍を上回る（run_single_mode の
+    // 早期拒否ガードが既定設定自体を拒否しないことを固定する）。定数どうしの
+    // 比較のため clippy が `const { assert!(..) }` 化を要求する
+    // （`assertions_on_constants`）。
+    const {
+        assert!(DEFAULT_SINGLE_STATEMENTS >= MIN_SINGLE_STATEMENTS);
+        assert!(DEFAULT_SINGLE_STATEMENTS <= MAX_SINGLE_STATEMENTS);
+        assert!(DEFAULT_SINGLE_STATEMENTS > SINGLE_WARMUP_STATEMENTS * 2);
+        assert!(MIN_SINGLE_STATEMENTS < MAX_SINGLE_STATEMENTS);
+        // README・ingest-stage-profile.md が公開している下限
+        // MIN_SINGLE_STATEMENTS が、run_single_mode の早期拒否ガード
+        // （計測フェーズ長 SINGLE_WARMUP_STATEMENTS 件以上を要求）で
+        // 実際に受理されることを固定する（codex-review・cursor-bot 指摘:
+        // 以前は `<=` 比較のため MIN_SINGLE_STATEMENTS ちょうどが
+        // 自己矛盾的に拒否されていた）。
+        assert!(MIN_SINGLE_STATEMENTS >= SINGLE_WARMUP_STATEMENTS * 2);
+    }
+}
+
+#[test]
+fn rows_per_sec_computes_expected_value() {
+    let v = rows_per_sec(1000, Duration::from_secs(2)).expect("rows_per_sec");
+    assert!((v - 500.0).abs() < 1e-9);
+}
+
+#[test]
+fn rows_per_sec_rejects_zero_stmts_or_zero_elapsed() {
+    assert!(matches!(
+        rows_per_sec(0, Duration::from_secs(1)),
+        Err(IngestProfileError::ZeroRows)
+    ));
+    assert!(matches!(
+        rows_per_sec(10, Duration::ZERO),
+        Err(IngestProfileError::ZeroRows)
+    ));
+}
+
+/// [`content_hash_typed_insert_reimpl`] が `tenant::insert_typed_row`（Rust API
+/// 経由の型付き挿入。TASK-95）が実際に `op_ledger` へ記録した内容ハッシュと
+/// 一致することを確認する（single モード I3・E0 tier のドリフト検出。
+/// `recovery::content_hash.rs::for_typed_insert` の再実装対象）。
+#[test]
+fn content_hash_typed_insert_reimpl_matches_stored_op_ledger_hash_via_typed_row_api() {
+    let path = unique_db_path("issue484-ingest-accept-typed-hash-api");
+    let _guard = CleanupGuard(path.clone());
+
+    let schema = TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(3), false),
+            ColumnDef::new("body", ColumnType::Text, false),
+        ],
+    );
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant id");
+
+    let embedding = [1.0f32, 2.0, 3.0];
+    let body = "hello typed insert".to_string();
+    let values = vec![
+        engine::row_codec::Value::Vector(embedding.to_vec()),
+        engine::row_codec::Value::Text(body.clone()),
+    ];
+    let op_id = OperationId::parse("accept-typed-hash-1").expect("valid operation id");
+    tenant::insert_typed_row(
+        &storage,
+        "docs",
+        &ctx,
+        1,
+        Visibility::Private,
+        &values,
+        &op_id,
+    )
+    .expect("insert_typed_row");
+    drop(storage);
+
+    let db = Database::open(&path).expect("reopen db read-only");
+    let read_txn = db.begin_read().expect("begin_read");
+    let ledger_table = read_txn
+        .open_table(OP_LEDGER_TABLE)
+        .expect("open op_ledger");
+    let stored = ledger_table
+        .get(("tenant-a", "docs", "accept-typed-hash-1"))
+        .expect("get ledger entry")
+        .expect("ledger entry exists");
+    let stored_hash = decode_ledger_entry_v2_reimpl(stored.value()).expect("decode ledger entry");
+
+    let recomputed = content_hash_typed_insert_reimpl(
+        1,
+        false, // Visibility::Private
+        &embedding,
+        &[("body", Some(body.as_str()))],
+    )
+    .expect("content_hash_typed_insert_reimpl");
+    assert_eq!(recomputed, stored_hash);
+}
+
+/// 上のテストと同じ照合を、SQL 表層の行形 `INSERT`（`EngineCore::
+/// execute_sql_in_session` → `execute_insert_sql` → `tenant::
+/// insert_typed_row_unchecked`。SQL-10）経由で確認する。行形 `INSERT` と
+/// 宣言的 `INSERT` は同一の `OpTag::Insert` を共有する契約
+/// （`for_typed_insert` ドキュメント参照）のため、SQL 経由でも同じ再実装で
+/// 照合できることを固定する。
+#[test]
+fn content_hash_typed_insert_reimpl_matches_stored_op_ledger_hash_via_sql_surface() {
+    use engine::core::EngineCore;
+    use engine::search_engine;
+    use engine::sql::mode::SessionState;
+    use engine::sql::SqlOutcome;
+
+    let path = unique_db_path("issue484-ingest-accept-typed-hash-sql");
+    let _guard = CleanupGuard(path.clone());
+
+    let schema = TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(3), false),
+            ColumnDef::new("body", ColumnType::Text, false),
+        ],
+    );
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant id");
+
+    let core = EngineCore::from_storage(storage, search_engine::default_engine());
+    let mut session = SessionState::default();
+    let sql = "INSERT INTO docs (id, embedding, body) VALUES (1, '[1,2,3]', 'hello sql insert') USING OPERATION_ID 'accept-typed-hash-sql-1'";
+    let outcome = core
+        .execute_sql_in_session(&ctx, &mut session, sql)
+        .expect("execute_sql_in_session");
+    match outcome {
+        SqlOutcome::Insert(o) => assert_eq!(o.rows_affected, 1),
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    // `EngineCore::from_storage` は書き込み可能ハンドルを保持したまま値を消費する
+    // ため、read-only 再オープンの前に明示的に drop する（redb は同一プロセスから
+    // 書き込みハンドルを同時に複数開けない。`run_batch_mode` の E0 と同じ理由）。
+    drop(core);
+
+    let db = Database::open(&path).expect("reopen db read-only");
+    let read_txn = db.begin_read().expect("begin_read");
+    let ledger_table = read_txn
+        .open_table(OP_LEDGER_TABLE)
+        .expect("open op_ledger");
+    let stored = ledger_table
+        .get(("tenant-a", "docs", "accept-typed-hash-sql-1"))
+        .expect("get ledger entry")
+        .expect("ledger entry exists");
+    let stored_hash = decode_ledger_entry_v2_reimpl(stored.value()).expect("decode ledger entry");
+
+    let recomputed = content_hash_typed_insert_reimpl(
+        1,
+        false, // sql::exec::execute_insert は行形 INSERT の可視性を常に Private に固定する
+        &[1.0f32, 2.0, 3.0],
+        &[("body", Some("hello sql insert"))],
+    )
+    .expect("content_hash_typed_insert_reimpl");
+    assert_eq!(recomputed, stored_hash);
+}
+
+/// Null 列（本ベンチの対象スキーマでは通常発生しないが、契約上
+/// `push_named_scalar_columns` と同じ「素通しで除外」動作を固定する）は
+/// ハッシュ入力へ現れない——列を渡さない場合と `None` を渡した場合とで
+/// 同一ハッシュになることを確認する。
+#[test]
+fn content_hash_typed_insert_reimpl_skips_none_columns_like_null() {
+    let embedding = [0.1f32, 0.2];
+    let with_none = content_hash_typed_insert_reimpl(7, true, &embedding, &[("body", None)])
+        .expect("with none column");
+    let without_column =
+        content_hash_typed_insert_reimpl(7, true, &embedding, &[]).expect("without column");
+    assert_eq!(with_none, without_column);
 }

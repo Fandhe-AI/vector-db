@@ -1216,3 +1216,306 @@ cold/hot 等価性・決定性契約は構造的に不変）。`sparse.rs` 内 u
 `approx_heap_bytes()` の表示値は上限加算分だけ増える（実 RSS は変わらない）
 ため、#547 が `bench-hybrid-profile` のメモリ計測を記録する際にはこの点を
 注記する必要がある。
+
+## Issue #547: #546 の前後比較（実測）
+
+対応: Issue #547（`test(engine): bench-hybrid-profile での前後比較
+（N=25k／100k・可視率 100%／10%）`）。前提: Issue #546（本ドキュメント
+「Issue #546」節）。計測規約は `docs/design/benchmark-judgement-policy.md`
+（Issue #462 SSOT）に従う。
+
+### 計測方法
+
+`crates/engine/benches/harness/hybrid_profile.rs` へ
+`BENCH_HYBRID_PROFILE_ROWS`（コーパス行数）・
+`BENCH_HYBRID_PROFILE_VISIBLE_RATIO`（可視率 `1/<N>`）の fail-closed
+opt-in を追加し、`scripts/bench_hybrid_profile_ab.sh`
+（`make bench-hybrid-profile-ab`）で before（#546 適用前。
+`crates/engine/src/sparse.rs`・`crates/engine/src/sql/sparse_cache.rs` のみ
+`b161d5b^`（#565 の直前コミット）まで戻したビルド）／after（HEAD。
+本 PR の計測基盤自体を含む）の 2 バイナリを N∈{25000,100000} ×
+可視率∈{1/1,1/10} の 4 条件で before→after 交互 5 ペア（各ペア
+`BENCH_HYBRID_PROFILE_ROUNDS=5`）実行した。可視率の意味は README「hybrid_rrf
+段別内訳プロファイルと転置索引化の前後比較」節と同じ（SQL 段は索引 N
+自体が縮小、直接 API 段は索引 N は常に行数で可視集合のみ縮小）。
+
+review 指摘対応として、`scripts/bench_hybrid_profile_ab.sh` へ
+`BEFORE_COMMIT`／`AFTER_COMMIT`（ビルド元コミット hash の記録を必須化）・
+`AB_PAIRS >= 5` の実行前検証（`docs/design/benchmark-judgement-policy.md`
+§3 の下限）・`AB_ROUNDS` の `hybrid_profile_bench` 自身の受理範囲
+`5..=50` との事前整合検証を追加し、`--summarize` の出力を条件→ペア→
+before/after の実行順・ファイル名付き（`grep -H`）へ変更した。あわせて
+`hybrid_profile_bench.rs` の B7 参考値（密候補が可視部分集合を無視して
+`corpus.ids`／`corpus.vectors` の全件から Top-`pool_depth` を拾っていた
+不整合）と、B1/B4 fidelity 検証（可視件数が `TOP_K` 未満の設定で常に
+fail-closed していた不整合）を修正した。以下の実測値はこれらの修正を
+適用した版で再実行した結果であり、本節はこの再実行値のみを記録する
+（旧実測値は本コミットで置き換え）。
+
+- before ビルド元: `af885d6e59a56ecb481e646ce4418bc845e0dad7`
+  （`crates/engine/src/sparse.rs`・`crates/engine/src/sql/sparse_cache.rs`
+  のみ `91f6a1830eed7bed326a552bfc4625296a8bf371` = `b161d5b^` へ差し替え）
+- after ビルド元: `af885d6e59a56ecb481e646ce4418bc845e0dad7`
+  （production コード〔`sparse.rs`・`sql/sparse_cache.rs`〕は #546 適用後の
+  ままで不変。今回の修正はいずれもベンチハーネス・計測ドライバのみ）
+
+### 実測結果（min-of-5・median-of-5 併記、参照区間帯は同一条件内の B0s の (max−min)/min）
+
+`B4`（`hybrid_search_cached_index`。engine 内 hybrid 経路の直接 API。
+`score_by_postings`／`score_within` を経由し #546 の対象）・`B5`
+（`sparse_refetch_loop`。同じく対象）を主対象とし、`B0s`
+（`CpuScalarProvider` 単線・#546 と無関係の密側参照区間）を同一実行環境の
+ノイズ帯として併記する。値は各ペアの 5 ラウンドから取った min を 5 ペア
+ぶん集め、その min・median を示す（`docs/design/benchmark-judgement-policy.md`
+§3 の「min-of-N と median の両方を必ず併記する」に対応）。
+
+| 条件（N・可視率） | B4 before (min/median) | B4 after (min/median) | B4 diff (min基準) | B5 before (min/median) | B5 after (min/median) | B5 diff (min基準) | B0s 参照区間帯 (before/after) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 25,000・1/1 | 3030us / 3041us | 3011us / 3076us | −0.6% | 1673us / 1674us | 1676us / 1682us | +0.2% | 10.1% / 9.0% |
+| 25,000・1/10 | 392us / 399us | 394us / 407us | +0.5% | 148us / 149us | 150us / 151us | +1.4% | 1.5% / 1.5% |
+| 100,000・1/1 | 9074us / 9296us | 8924us / 9279us | −1.7% | 5784us / 5807us | 5831us / 5855us | +0.8% | 12.5% / 5.8% |
+| 100,000・1/10 | 1332us / 1346us | 1319us / 1340us | −1.0% | 690us / 697us | 682us / 684us | −1.2% | 3.2% / 1.3% |
+
+per-run 生データ（各条件・各ペア・各 side の 5 ラウンド min の値列。
+5 ペアぶん）を以下に残す（`docs/design/benchmark-judgement-policy.md` §3
+「per-run 生データの記録を必須とする」に対応。単位 us、ペア 1〜5 の順）:
+
+| 条件・side | B4 各ペア min の値列 | B5 各ペア min の値列 |
+| --- | --- | --- |
+| 25,000・1/1・before | 3030, 3039, 3116, 3120, 3041 | 1674, 1673, 1674, 1677, 1680 |
+| 25,000・1/1・after | 3011, 3205, 3092, 3076, 3066 | 1679, 1687, 1712, 1676, 1682 |
+| 25,000・1/10・before | 399, 397, 417, 421, 392 | 150, 150, 148, 149, 149 |
+| 25,000・1/10・after | 397, 407, 425, 413, 394 | 150, 153, 154, 151, 151 |
+| 100,000・1/1・before | 9979, 9296, 9074, 9532, 9075 | 6028, 5784, 5803, 5807, 5820 |
+| 100,000・1/1・after | 9279, 9070, 9739, 8924, 9666 | 5831, 5855, 5883, 5845, 5875 |
+| 100,000・1/10・before | 1332, 1375, 1404, 1338, 1346 | 694, 701, 700, 697, 690 |
+| 100,000・1/10・after | 1351, 1343, 1330, 1340, 1319 | 682, 683, 692, 689, 684 |
+
+`B1`（SQL 表層 crossdb 規範形）・`B2`（既存段と同じ投影）でも同様に
+before/after 差は概ね ±2〜3% 台で、絶対値に対する `score_by_postings` の
+寄与自体が小さいため、傾向は B4/B5 と一致する。生ログ・summary 行は
+`target/bench-hybrid-profile-ab/<ts>/*.log`（実行時生成物・本リポの
+履歴には含まない）に保存されるが、上表の min／median／per-run 値は本
+ドキュメントに恒久的に記録する。
+
+**B0s 参照区間帯（前表 `B0s 参照区間帯 (before/after)` 列）の算出元について**:
+上表の B4/B5 とは異なり、`B0s`（`CpuScalarProvider` 単線の参照区間）自体の
+各ペア min 値列は計測実行時のログ（`target/bench-hybrid-profile-ab/<ts>/
+*.log`）からこのドキュメントへ転記されなかった。生ログはベンチ実行時生成物
+であり本リポの履歴に含まれないため、本コミット時点で遡って値を復元する
+手段がない。したがって上表の `B0s` 参照区間帯（1.3%〜12.5%）はこのドキュメント
+単独では第三者が再計算できない値であり、その旨をここに明記する
+（codex-review 指摘。`docs/design/benchmark-judgement-policy.md` §4）。
+
+`docs/design/benchmark-judgement-policy.md` §4 は「実測ノイズ帯」を
+「同一計測セッションで得た参照区間の run-to-run 幅」と定義し、第三者が
+その値列を検証できることを前提にしている。上記のとおり `B0s` の値列は
+本コミット時点で第三者が検証できないため、`B0s` 参照区間帯は同 §4 が
+定める実測ノイズ帯の要件を満たさない。したがって下記「判断」節では
+`B0s` 参照区間帯を判定根拠として採用せず、§4 が要求するもう一方の
+ノイズ帯である**固定相対帯（±5%。`classify_change` 基準）のみ**を根拠に
+判定する（review 指摘対応。検証不能な実測帯に基づく判断を撤回し、保存
+済みデータ〔上表・per-run 表に恒久記録した B4/B5 の min／median／各ペア
+値列〕と固定 ±5% 帯から言える範囲へ結論を限定する）。
+
+再測定によるギャップ解消はこの PR のスコープ外とする。理由は次の通り: (1)
+B0s は B4/B5 と**同一の交互実行**から得られる値のため、B0s だけを単独で
+再測定しても既存の B4/B5 per-run 値との対応関係が崩れる。整合させるには
+4 条件 × 2 side × 5 ペアの全体（B4/B5/B0s すべて）を再実行し、上表・
+per-run 表を丸ごと置き換える必要があり、単一の P2 指摘（生データ記録
+漏れ）の範囲を超える。(2) 本リポの計測規約
+（`docs/design/benchmark-judgement-policy.md`）は専有環境（`BENCH_DEDICATED_ENV`）
+での計測を前提とするが、この修正作業自体が複数エージェント並列実行中の
+共有環境で行われており、ここで再測定してもノイズ帯の値として信頼できない。
+今後の再測定では `scripts/bench_hybrid_profile_ab.sh --summarize` が
+`baseline_round_raw`／`baseline_summary`（`B0s(min=...,median=...)` を含む）
+に加え、各 run 直前の `loadavg_before_run`・`running_processes_excluding_self`・
+`top_cpu_processes`（同 §3 の同時実行プロセス有無の記録。本 PR で追加）
+の行をそのまま列挙するため、次回実行時はこれらの行を本ドキュメントへ転記
+すれば同種の指摘は再発しない。上記のとおり本節の判断は `B0s` の値列
+無しでも固定 ±5% 帯のみで成立するため、このギャップは判断そのものの
+妥当性には影響しない。
+
+**実測環境の記録（`docs/design/benchmark-judgement-policy.md` §3）**:
+本 4 条件の計測は本開発コンテナ（`lscpu` Model name: `QEMU Virtual CPU
+version 2.5+`・`nproc`=12・命令セットフラグに `avx2`／`fma`／`f16c` あり・
+`avx512*`／`neon` 無し。`BENCH_DEDICATED_ENV` 未設定の共有環境）で実行した。
+この CPU/ISA 情報は本ドキュメント作成時点でも同一環境で確認できる恒久的
+特性として記録するが、実測実行時点ごとの `loadavg`・同時実行プロセスの
+有無は前述の生ログ（本リポ履歴に含まれない実行時生成物）にのみ記録されて
+おり本コミット時点で復元できない。§3 の環境記録要件のうち静的な CPU/ISA
+情報は本節で充足し、動的な `loadavg`・同時実行プロセス有無は充足できない
+ことをここに明記する。
+
+### 判断
+
+4 条件 × 2 段（B4・B5）のいずれも、before→after の差（−1.7%〜+1.4%）は
+`docs/design/benchmark-judgement-policy.md` §4 の固定相対帯（±5%）を
+超えない（`classify_change` 基準で `Neutral` 分類）。同 §4 は判定に
+効かせる差分を「固定相対帯・実測ノイズ帯の両方を超えていること」と
+定めており、固定相対帯を超えない時点で（`B0s` 参照区間帯の検証可否に
+よらず）採用条件（ノイズ帯を明確に超える改善）を満たさないと判定できる。
+したがって **#546 のウォールクロック効果はこの計測環境・この 4 条件では
+有意に検出できない**と判断する（Issue #366・#365 と同様の「効果なし」
+実測結果。ハーネス・ドライバの review 指摘修正後に再実測した値でも結論は
+変わらない。本判断は固定相対帯のみで成立し、算出元データを提示できない
+`B0s` 実測ノイズ帯には依拠しない）。
+
+推定される要因: `score_by_postings` が確保していた `acc: Vec<f64>`
+（コーパス全体長）は glibc の同一サイズ再利用（tcache）により繰り返し
+確保・解放してもコストが小さく、かつ本ベンチの支配的コストは posting
+list 走査・BM25 スコアリング本体（Issue #388〜#392 で既に大半を削減済み）
+や SQL 表層の固定コストであるため、確保コストの除去がマイクロベンチの
+全体レイテンシに現れにくい。
+
+`#546` はスコアの f64 ビット一致・RLS 相当のテナント境界縮約契約を維持した
+まま `approx_heap_bytes()` の容量判定を実確保量に整合させる副次効果を持つため
+（本ドキュメント「Issue #546」節参照）、ウォールクロック改善が計測されない
+ことは production 変更の妥当性を損なわない。本 Issue の役割は前後比較の
+実測・記録であり、#546 の採否判断そのものは対象外（既に実装・マージ済み）。
+
+## Issue #549: RRF 融合段の id 写像・ソートの割り当て削減（融合結果はビット同一）
+
+対応: Issue #549（`perf(engine): RRF 融合段の id 写像・ソートの割り当て削減
+（融合結果はビット同一）`）。親 #548（Phase 6・hybrid 上位 2 段の最適化）→ #461
+→ ルート #455。前提: Issue #465（最新基線）・Issue #546（`score_by_postings`
+アキュムレータ再利用）。対象ビヘイビア: SEARCH-1・SEARCH-3。関連ポインタ:
+TASK-104・TASK-84。
+
+### 変更内容
+
+`hybrid.rs::rrf_fuse_with_limits` の融合コアを、id をキーにした
+`BTreeMap<u64, f64>`（`entry().or_insert(0.0)` による毎クエリのノード確保を
+伴う累積）から、検証済み長さの**位置索引方式**へ置換した。
+
+- `compute_contributions`（旧 `accumulate_ranked` を改称・再設計）が、密・疎
+  それぞれの寄与（`weight / (k_const + rank)`）を「id ではなく列内の位置」に
+  対して `contrib: Vec<f64>`（長さ `n_d + n_s`。dense は `[0..n_d)`、sparse は
+  `[n_d..)`）へ書き込む。密・疎の位置は重ならないため、加算ではなく単純代入で
+  足りる（各位置は必ず 1 回だけ書き込まれる）
+- `index: Vec<(u64, usize)>`（`(id, pos)` の全順序タプル）を id 昇順へ**比較
+  関数なし**の `sort_unstable()` で整列する（`(id, pos)` は要素ごとに一意の
+  ため不安定性は観測されない。id を直接添字にする表は作らない ── id は
+  呼び出し元定義の任意 `u64` であり、添字化は untrusted 入力に比例した無制限
+  確保になるため）
+- 整列済み `index` の等 id 連続区間ごとに `contrib` から寄与を合算し、
+  `merged: Vec<HybridHit>`（id 昇順）を構築する。演算順（各位置の寄与を求めて
+  から加算する順序）は旧 `BTreeMap` 版の `or_insert(0.0)` → `+= dense 寄与` →
+  `+= sparse 寄与` と完全に同一であり、スコアはビット同一になる
+- 最終スコアソート（`out.sort_by(|a, b| b.score.total_cmp(&a.score)
+  .then(a.id.cmp(&b.id)))`）は安定ソートのまま**維持**（`docs/design/
+  rrf-tie-break-determinism.md` の不変条件）。この比較器は id が一意である限り
+  同値要素を生まない全順序のため、`merged` を渡す前の走査順序（本実装では id
+  昇順）自体は出力に影響しない
+- `has_duplicate_id`（`validate_extended_pool` からも使用）を、`BTreeSet` への
+  全件挿入（要素追加が B-tree ノードの新規確保・分割を伴いうる）から、`Vec` へ収集して比較関数
+  なし `sort_unstable()` の後に隣接比較する版へ置換（bool の戻り値契約・
+  呼び出し位置は不変）
+- `apply_soft_boost` の末尾の再ソートを、`hits` が既に融合スコア降順・同点 id
+  昇順へ整列済み（production 経路の `rules` 空呼び出しでは常にこの状態）なら
+  省略するガード（`is_sorted_desc_id_asc` による判定。安定ソートの入力が既に
+  整列済みなら再ソートは恒等写像であり省略は観測不能）を追加した。判定は
+  `rules.is_empty()` ではなく実際の整列状態で行うため、未整列入力＋空 `rules`
+  という契約違反ケースの挙動（従来どおり整列される）は変えない
+
+### 等価性検証
+
+置換前の融合コア（`has_duplicate_id` ×2 → `BTreeMap` 累積 → 有限性 → `collect`
+→ `sort_by`）を `#[cfg(test)] fn rrf_fuse_reference_with_limits`（内部で
+`accumulate_ranked_reference` を使用）として逐語コピーで残置し（Issue #399
+の先例に倣う）、`hybrid.rs::tests` に以下を追加した。
+
+- `rrf_fuse_with_limits_matches_reference_bitwise`: 決定的擬似乱数
+  （xorshift64*。外部クレート不使用）で 400 試行を生成し、`TieRank::GroupEnd`/
+  `Positional`、`k_const`・重みの通常値と極端値（同点グループを潰す巨大
+  `k_const`、オーバーフローを誘発しうる巨大重み）、密・疎間の id 部分/完全
+  重複、片側空、`dense_limit != sparse_limit`（`TooManyCandidates` の一致も
+  含む）を横断し、`Ok` 側は id・スコアの `to_bits()` 全件一致、`Err` 側は
+  エラー variant 一致を検証する
+- `rrf_fuse_with_limits_matches_reference_bitwise_on_full_id_overlap`: 密・疎が
+  完全に同一の id 集合を持つ（全件が両チャネルへ寄与を加算する）退行の専用
+  固定
+- `rrf_fuse_priority_duplicate_id_over_post_fusion_non_finite_score`: 重複 id と
+  融合後 `+Inf` を同時に含む入力で `DuplicateId` が返ること（検証順序:
+  長さ → 有限性(入力) → ソート順 → 重複 → 融合後有限性）を置換後の実装でも固定
+- `apply_soft_boost_skips_resort_when_hits_already_sorted_and_rules_empty` /
+  `apply_soft_boost_still_sorts_unsorted_input_with_empty_rules`: 3.3 の省略が
+  「整列済みなら省略」であって「`rules` が空なら省略」ではないことを固定
+
+既存の `tests/hybrid_recall.rs` 層 A 固定値アサーション・`tests/
+sparse_determinism.rs`・`tests/hybrid.rs`・`tests/sql_surface.rs` 等は無変更の
+まま green（同点順位規約 `TieRank::GroupEnd`・境界同点グループ完全化（#310）・
+再取得スケジュール（#392）は不変）。
+
+### 確保回数削減の根拠（静的）
+
+`#[global_allocator]` によるアロケーションカウントは本リポの既存方針
+（`storage.rs` の判断: 並列テスト下で非決定的・依存追加回避）に従い採用しない。
+変更前後の確保箇所を列挙する。
+
+| 箇所 | 変更前 | 変更後 |
+| --- | --- | --- |
+| 融合コア | `BTreeSet`×2（重複検査）＋ `BTreeMap`（累積。挿入に応じた B-tree ノード確保・分割）＋ `collect` の `Vec`＋ソートのスクラッチ | `has_duplicate_id` の `Vec`×2 ＋ `contrib: Vec<f64>` ＋ `index: Vec<(u64,usize)>` ＋ `merged: Vec<HybridHit>` ＋ソートのスクラッチ（いずれも単一 `Vec`・事前確保サイズ既知） |
+| `validate_extended_pool`（境界同点グループ完全化の再取得ラウンドごと） | `BTreeSet`×2 | `Vec<u64>`×2（`has_duplicate_id` 経由） |
+| `apply_soft_boost`（production の空 `rules` 呼び出し） | 常に `sort_by` のスクラッチ確保 | 既整列時は確保 0 |
+
+`BTreeMap`/`BTreeSet` は 1 ノードに複数要素を格納するため確保回数は要素数と
+一致しない（要素ごとに個別ヒープ確保されるわけではない）。ただし挿入に伴う
+ノードの新規確保・分割・再配置は要素数に対して非ゼロかつ事前に見積もれない
+回数発生し、確保サイズも実行時の木の形状に依存する。これに対し置換後は
+要素数が確定した単一 `Vec` の確保に集約される（`Vec` 自体も 1 回の連続領域
+確保で済む）。
+
+### 参考値（単一バイナリ内 A/B・B7 下限近似。採否記録は #550／#547 の担当）
+
+`docs/design/benchmark-judgement-policy.md` §5 により、共有 QEMU 環境では
+perf 動機の production 変更を本 Issue の実装担当が「Accepted」と判定できない
+（#546 の先例と同じ位置づけ）。本節は参考値の記録に限る。
+
+`crates/engine/benches/hybrid_profile_bench.rs` へ B7 段
+（`fuse_lower_bound`）を追加した。密・疎それぞれの Top-`pool_depth`
+候補（密は `ParallelSearchProvider`、疎は `sparse_refetch_observed(...).0` を
+`pool_depth` 件へ切り詰めたもの）を計測外（ラウンドループの前）で事前に捕捉
+し、`hybrid::rrf_fuse` の呼び出しのみを計測する（境界同点グループ完全化の
+再取得コストを含まない「融合コアだけの処理時間」の下限近似）。
+
+`BENCH_HYBRID_PROFILE_ROUNDS=5`・開発環境（共有 QEMU 環境。専有環境
+`BENCH_DEDICATED_ENV=1` ではない）での 1 回実測（`make bench-hybrid-profile`
+相当）:
+
+```text
+B7(min=10us,median=10us)
+```
+
+B1（SQL 表層 hybrid・`SELECT id`。min 6,691us）に対する比は約 0.15%、B4-B0-B5
+残差（min 974us。B4=3,157us・B0=505us・B5=1,677us）に対しては約 1%
+（`10 / 974 ≈ 1.03%`）である。ただしこの値は**変更後実装**への下限近似
+（`pool_depth` へ切り詰めた候補を渡した `rrf_fuse` 単体の計測）に限られ、
+変更前実装（`BTreeSet`/`BTreeMap` 経由）の融合コア時間・本番の境界同点
+グループ完全化後の候補数（`pool_depth` 切り詰めなし）での融合時間のいずれも
+計測していない。したがってこの参考値だけから「融合コアは元から残差のごく
+一部」「削減の絶対効果が小さい」とは判断できない。結論は今回の入力・変更後
+実装に対する参考値に限定し、削減効果（変更前後比較）は `docs/design/
+benchmark-judgement-policy.md` の基準を満たす前後比較（同一バイナリの
+production 変更前後を交互計測）を経るまで未確定とする。前後比較・採否の確定は
+親 #548 傘下の #550（通し前後比較）・#547 の担当とする。
+
+### スコープ外・申し送り
+
+- `hybrid_search_boosted` の `visible_ids: BTreeSet<u64>` のソート済み `Vec`
+  化（B8・約 1%。`sparse.rs::score_within` の `&BTreeSet` シグネチャ・
+  `bench-internals` フック・`hybrid_profile` ハーネスへ波及するため別途）
+- 最終スコアソートの `sort_unstable_by` 化（全順序のため結果は同一だが
+  `docs/design/rrf-tie-break-determinism.md` の安定ソート不変条件に関わる
+  オーナー判断事項）
+- クエリ横断の融合スクラッチ再利用（#546 型のプール化。規模が小さく費用対
+  効果が薄いため見送り）
+- perf 採否の確定（#550 通し前後比較・#547）・専有環境
+  （`BENCH_DEDICATED_ENV=1`）再実測はオーナー／運用者作業
+
+## Issue #550: Phase 6 通し前後比較へのポインタ
+
+Issue #546・#549 を通しで前後比較した `feature_bench`・`bench-hybrid-profile`・
+crossdb self・Recall 3 ゲートの結果は `docs/design/
+hybrid-rrf-phase6-before-after.md` に記録した（数値は同 doc 参照。本節では
+転記しない）。production コード無変更・doc 専任。

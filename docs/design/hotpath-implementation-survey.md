@@ -210,7 +210,7 @@ Top-k を取りこぼしうる）。したがって量子化が適用できる�
 | ---- | ---- | ---- | -------------- | ---------- |
 | BLAS(sgemm) 経路への閾値切替 | faiss `utils/distances.cpp` | クエリ数×次元の閾値で逐次／BLAS を切替 | 不採用。BLAS（OpenBLAS/MKL）の依存追加が必要で依存最小方針と衝突。ただし「規模の閾値でバッチ経路へ切り替える」設計パターン自体は `gpu_batch.rs` のバッチ判定の参考になる（依存非追加の範囲でパターンのみ） | MIT |
 | L2 の `‖x‖²+‖y‖²−2⟨x,y⟩` 分解 | faiss `exhaustive_L2sqr_blas_default_impl` | 事前計算ノルム＋sgemm 内積、丸め誤差の微小負値をクランプ | 対象外（本リポは内積のみ・cosine は正規化契約）。負値クランプという数値安定化パターンは将来 L2 系カーネル追加時の参考として記録 | MIT |
-| WarpSelect／BlockSelect（GPU 上 Top-k） | faiss `gpu/utils/{WarpSelectKernel,BlockSelectKernel,Select}.cuh` | ウォープ内シャッフルでビトニックマージ | 条件付き（移植困難）。CUDA 専用の warp shuffle に依存し `wgpu`/WGSL へ直接移植不可。WGSL `subgroup` 拡張なら原理的に可能だが `wgpu =30.0.1` 時点の対応状況と環境非依存方針（NVIDIA/AMD/Apple 混在）でハードルが高い。「GPU 上で Top-k まで完結させ全距離を CPU へ転送しない」方針自体は記録に値する | MIT |
+| WarpSelect／BlockSelect（GPU 上 Top-k） | faiss `gpu/utils/{WarpSelectKernel,BlockSelectKernel,Select}.cuh` | ウォープ内シャッフルでビトニックマージ | 条件付き（移植困難）。CUDA 専用の warp shuffle に依存し `wgpu`/WGSL へ直接移植不可。WGSL `subgroup` 拡張なら原理的に可能だが `wgpu =30.0.1` 時点の対応状況と環境非依存方針（NVIDIA/AMD/Apple 混在）でハードルが高い。「GPU 上で Top-k まで完結させ全距離を CPU へ転送しない」方針自体は記録に値する。wgpu での設計は [`gpu-batch-topk.md`](gpu-batch-topk.md)（#535） | MIT |
 | 距離計算と Top-k のタイル内融合 | faiss `utils/distances_fused/` | 実体は CPU 側 AVX-512 カーネル（GPU ではない）。小次元×Top-1 専用 | 不採用（誤読注意点として記録）。GPU タイル融合ではなく CPU 特殊ケース（小次元・Top-1 専用） | MIT |
 | `wgpu` による GPU バッチ検索 | 本リポ `gpu_batch.rs` | — | 既採用（TASK-128〜130・Issue #178。CORE-6/16 のベンチ配線・`GpuF32ContrastBackend` の f16/f32 常駐対照含む） | — |
 
@@ -250,7 +250,7 @@ Qdrant HNSW に劣後する:
 | 4 | `repair_reachability` の並列化 | 中（実測根拠あり）。HNSW 構築の 8→12 スレッド頭打ちの主因（12 スレッド時に total の 39.4% を占める単一スレッド後始末段。usearch に対し 1.24〜1.26x 遅い唯一の敗因。探索は既に usearch より速い：65.5µs vs 76.5µs） | 中 | 不要 | 不要 | 既起票 #446 ツリー（#447〜#450。並列化本体は #449） |
 | 5 | HNSW 隣接リストの CSR 化 | 中（実測根拠なし・構造推論）。`Vec<Vec<u32>>` のノード×レベル分のヒープ確保・間接参照を単一 `Vec<u32>`+offsets へ | 中 | 不要 | 不要 | 既起票 #492 |
 | 6 | BM25 アキュムレータを可視集合サイズで確保 | 小（N と可視率に依存）。`score_by_postings` の `vec![0.0; N]` を実作業量 O(可視ヒット数) に合わせる。RLS で可視集合が小さいテナントほど効く。スコアはビット一致のまま | 小 | 不要 | 不要 | #546 で実装（索引寿命内の再利用バッファ方式。実測は #547） |
-| 7 | `search_layer` への prefetch 導入 | 中。hnswlib 型ソフトウェアパイプライン。新規 `unsafe` ゼロで実装可能 | 小〜中 | 不要 | 不要 | 既起票 #489 |
+| 7 | `search_layer` への prefetch 導入 | 中。hnswlib 型ソフトウェアパイプライン。真の prefetch 命令は `#[target_feature]` fn の内側限定（通常の fn からは E0133）で発行不可なため、新規 `unsafe` ゼロの制約下では `core::hint::black_box` によるタッチ方式で実装（#490） | 小〜中 | 不要 | 不要 | #490 で実装済み。#491 で 8 規模点（10k／100k・dim 128／768・マスク有無）の前後比較を実測し、8 点中 7 点は悪化方向への一貫したシグナルは無いが、1 点（10k×dim128・可視率50%）で両ノイズ帯を超える一貫した悪化が観測され、静的解析／実アセンブリの裏付けが無いため撤回条件は完全には満たさず保留（production 無変更・専有実機再実測をオーナーへ申し送り）。詳細は [`docs/design/hnsw-search.md`](hnsw-search.md)「Issue #491」節参照 |
 | 8 | f16 常駐＋f32 再スコア（ANN opt-in 経路限定） | 中。移動バイト半減。新規 `unsafe` ゼロ。候補集合が変わるため既定 brute-force 経路には適用不可 | 中 | 不要 | 不要 | 既起票 #513 |
 | 9 | visited のサイズ閾値切替（密ビットマップ ↔ `HashSet`） | 小〜中。可視カーディナリティが索引ノード数に対し極小のとき全ノード分の確保・走査を回避 | 小 | 不要 | 不要 | 既起票 #496 |
 | 10 | dim>=768 での多アキュムレータディスパッチ | 小〜中（dim=128 の現行ベンチでは効果ゼロ）。[`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md) の arena 表で ACC=4 が dim768/1536 のみ改善。dim=768 のベンチ点追加が前提 | 小 | 不要 | 不要 | 既検討・不採用 #365 の条件付き再訪（#517） |

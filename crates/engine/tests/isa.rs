@@ -153,6 +153,40 @@ fn dispatched_dot_matches_scalar_reference_within_tolerance() {
     assert_eq!(isa::current().dot(&a, &b), isa::dot_scalar(&a, &b));
 }
 
+/// [`isa::SimdKernel::dot_with_scalar_tail`]（現行のスカラー逐次和 tail）と
+/// [`isa::SimdKernel::dot_with_padded_tail`]（零埋め固定長バッファによる分岐なし
+/// tail、Issue #528）が dim 0..=129 の全長でビット同一であること。あわせて
+/// [`isa::SimdKernel::dot`]（既定経路）が `dot_with_scalar_tail` と一致すること
+/// （`DEFAULT_PADDED_TAIL == false` の配線回帰）も確認する。`isa::current().isa()`
+/// を assert メッセージへ含め、どの ISA で検証されたかを判別可能にする
+/// （実機の AVX2/AVX-512/NEON 対応有無はテスト実行環境依存のため）。
+#[test]
+fn branchless_tail_matches_scalar_tail_bit_exact_across_dims() {
+    let current_isa = isa::current().isa();
+    let mut rng = XorShift64Star::new(0x0fed_cba9_8765_4321);
+
+    for dim in 0..=129usize {
+        let a = random_vec(&mut rng, dim);
+        let b = random_vec(&mut rng, dim);
+
+        let scalar_tail = isa::current().dot_with_scalar_tail(&a, &b);
+        let padded_tail = isa::current().dot_with_padded_tail(&a, &b);
+        assert_eq!(
+            scalar_tail.to_bits(),
+            padded_tail.to_bits(),
+            "isa={current_isa:?} dim={dim} scalar_tail={scalar_tail} padded_tail={padded_tail}"
+        );
+
+        let default_dot = isa::current().dot(&a, &b);
+        assert_eq!(
+            default_dot.to_bits(),
+            scalar_tail.to_bits(),
+            "isa={current_isa:?} dim={dim}: SimdKernel::dot must still use the scalar tail \
+             (DEFAULT_PADDED_TAIL == false) as production behavior is unchanged by Issue #528"
+        );
+    }
+}
+
 /// 長さ不一致・空スライスで [`isa::dot_scalar`] と同一の意味論（短い方への切り詰め）に
 /// なること。
 #[test]
@@ -165,12 +199,127 @@ fn dispatched_dot_length_mismatch_matches_scalar_semantics() {
     assert_eq!(isa::current().dot(&[] as &[f32], &[] as &[f32]), 0.0f32);
 }
 
+/// `isa::SimdKernel::dot_block4`（Issue #510・#511・TASK-156・CORE-14。行ブロック
+/// カーネル）が 1 行版 [`isa::SimdKernel::dot`] とビット同一であることを、
+/// 決定的シード RNG で dim 0..=129・768・1000・1536 を走査して検証する
+/// （ポインタ: `docs/design/dot-kernel-row-block.md`）。符号付きゼロ・微小値
+/// （`f32::MIN_POSITIVE` 近傍）を含む値集合もあわせて検証し、4 行それぞれで
+/// 独立した丸め誤差が生じないこと（1 行版と完全に同じ縮約経路を通ること）を
+/// 固定する。`isa::current().isa()` が実行時検出した ISA（本開発環境では
+/// x86_64 AVX2+FMA／AVX-512、aarch64 実機では Neon）で走るため、NEON 版
+/// （`neon_block4::dot_block4_neon`）の実行時ビット同一性の唯一の証跡は
+/// `.github/workflows/detect-features.yml` の `detect-apple` ジョブ（Apple
+/// Silicon 実機で本テストを実行）が担う。
+#[test]
+fn dot_block4_matches_single_row_dot_bit_exact_across_dims() {
+    let current_isa = isa::current().isa();
+    let mut rng = XorShift64Star::new(0x510a_bcde_f012_3456);
+
+    let dims: Vec<usize> = (0..=129usize).chain([768, 1000, 1536]).collect();
+
+    for &dim in &dims {
+        let query = random_vec(&mut rng, dim);
+        let r0 = random_vec(&mut rng, dim);
+        let r1 = random_vec(&mut rng, dim);
+        let r2 = random_vec(&mut rng, dim);
+        let r3 = random_vec(&mut rng, dim);
+
+        let expected = [
+            isa::current().dot(&r0, &query),
+            isa::current().dot(&r1, &query),
+            isa::current().dot(&r2, &query),
+            isa::current().dot(&r3, &query),
+        ];
+        let actual = isa::current().dot_block4([&r0, &r1, &r2, &r3], &query);
+
+        for i in 0..4 {
+            assert_eq!(
+                actual[i].to_bits(),
+                expected[i].to_bits(),
+                "isa={current_isa:?} dim={dim} i={i} actual={} expected={}",
+                actual[i],
+                expected[i]
+            );
+        }
+    }
+
+    // 符号付きゼロ・微小値（subnormal 近傍）を含むエッジ値集合。
+    let edge_values: Vec<f32> = vec![
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        f32::EPSILON,
+        -f32::EPSILON,
+        1e-30,
+        -1e-30,
+    ];
+    let query = edge_values.clone();
+    let r0 = edge_values.clone();
+    let r1: Vec<f32> = edge_values.iter().rev().copied().collect();
+    let r2 = edge_values.clone();
+    let r3: Vec<f32> = edge_values.iter().map(|v| v * 2.0).collect();
+
+    let expected = [
+        isa::current().dot(&r0, &query),
+        isa::current().dot(&r1, &query),
+        isa::current().dot(&r2, &query),
+        isa::current().dot(&r3, &query),
+    ];
+    let actual = isa::current().dot_block4([&r0, &r1, &r2, &r3], &query);
+    for i in 0..4 {
+        assert_eq!(
+            actual[i].to_bits(),
+            expected[i].to_bits(),
+            "isa={current_isa:?} edge-values i={i} actual={} expected={}",
+            actual[i],
+            expected[i]
+        );
+    }
+}
+
+/// 4 行と `query` の長さが 1 つでも異なる場合、[`isa::SimdKernel::dot_block4`] が
+/// 高速経路（intrinsics ブロックカーネル）へ入らず、1 行版 `dot` を 4 回呼ぶ
+/// 縮退経路と一致すること（`isa.rs::SimdKernel::dot_block4_impl` の
+/// `uniform_len` 判定の回帰。production では `parallel_search.rs::search_range`
+/// が常に 4 行と `query` の長さを揃えて呼ぶため、この経路は主に安全側の
+/// フォールバックとして機能する）。
+#[test]
+fn dot_block4_falls_back_to_single_row_dot_when_lengths_are_not_uniform() {
+    let query = vec![1.0f32, 2.0, 3.0, 4.0];
+    let r0 = vec![1.0f32, 0.0, 0.0, 0.0]; // query と同じ長さ
+    let r1 = vec![1.0f32, 0.0, 0.0]; // 1 要素短い
+    let r2 = vec![1.0f32, 0.0, 0.0, 0.0, 0.0]; // 1 要素長い
+    let r3: Vec<f32> = Vec::new(); // 空
+
+    let expected = [
+        isa::current().dot(&r0, &query),
+        isa::current().dot(&r1, &query),
+        isa::current().dot(&r2, &query),
+        isa::current().dot(&r3, &query),
+    ];
+    let actual = isa::current().dot_block4([&r0, &r1, &r2, &r3], &query);
+    assert_eq!(actual, expected);
+}
+
 /// CORE-14: 検出結果への外部入力上書き機構（環境変数・設定ファイル読み取り等）が
 /// ソース上に存在しないことを確認する（`tests/dispatch.rs::
 /// dispatch_source_has_no_external_override_entry_points` と同じ禁止トークン集合）。
 #[test]
 fn isa_source_has_no_external_override_entry_points() {
-    let source = include_str!("../src/isa.rs");
+    // Issue #510・#511: `isa/x86_block4.rs`（cfg(x86_64) サブモジュール）・
+    // `isa/neon_block4.rs`（cfg(aarch64) サブモジュール）も同じ禁止トークン集合で
+    // 走査する（`isa.rs` 本体からモジュール分割しても CORE-12 の「上書き機構の
+    // 不存在」検査が抜け穴にならないようにするため）。`include_str!` は `cfg` に
+    // 依らずファイルの存在のみ要求するため、x86_64 ホストのテストでも
+    // `neon_block4.rs` を走査できる。
+    let sources = [
+        include_str!("../src/isa.rs"),
+        include_str!("../src/isa/x86_block4.rs"),
+        include_str!("../src/isa/neon_block4.rs"),
+    ];
 
     let forbidden_tokens = [
         "std::env",
@@ -182,11 +331,13 @@ fn isa_source_has_no_external_override_entry_points() {
         "option_env!",
     ];
 
-    for token in forbidden_tokens {
-        assert!(
-            !source.contains(token),
-            "isa.rs must not contain external override entry point token: {token}"
-        );
+    for source in sources {
+        for token in forbidden_tokens {
+            assert!(
+                !source.contains(token),
+                "isa module must not contain external override entry point token: {token}"
+            );
+        }
     }
 }
 
@@ -203,6 +354,14 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
 
     for path in &rs_files {
         let content = std::fs::read_to_string(path).expect("read source file");
+        // Issue #510: `isa/x86_block4.rs`（`isa.rs` の cfg(x86_64) サブモジュール）は
+        // `unsafe` を持たない safe fn のみで構成する契約（ADR
+        // `docs/design/simd-intrinsics-adoption.md` 決定 1）だが、それはこの検査を
+        // 弱める理由にはならない。`unsafe` を許すのは sealed トークン所持を根拠に
+        // 検証済みの `isa.rs` 本体のみとし、`isa/` 配下のサブモジュールへ `unsafe`
+        // が紛れ込んだ場合はこの検査で検出できるよう除外範囲を `isa.rs` 単体に限定
+        // する（codex-review 指摘対応。ディレクトリ一致による除外は
+        // `isa/x86_block4.rs` への `unsafe` 追加を無検査で通してしまうため撤回）。
         let is_isa_module = path.file_name().and_then(|n| n.to_str()) == Some("isa.rs");
 
         if !is_isa_module {
@@ -238,12 +397,18 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
         }
     }
 
-    // ソーステキスト上には NEON・AVX2+FMA・AVX-512 の 3 箇所の `unsafe {` が
-    // 現れる（実際のビルドで有効になるのは対象 arch の分岐のみだが、`cfg` 行は
-    // ソース上に残ったまま走査されるため、arch に依存せず常に 3 を期待できる）。
+    // ソーステキスト上には NEON・AVX2+FMA・AVX-512 の `dot` ディスパッチ 3 箇所に加え、
+    // Issue #510（TASK-156・CORE-14）で追加した `dot_block4` の AVX2+FMA・AVX-512
+    // ディスパッチ 2 箇所、Issue #514 で追加した F16c/NeonFp16 の `dot_f16`
+    // ディスパッチ 2 箇所、Issue #511（TASK-156・CORE-14）で追加した `dot_block4`
+    // の Neon ディスパッチ 1 箇所の計 8 箇所の `unsafe {` が現れる（実際のビルドで
+    // 有効になるのは対象 arch の分岐のみだが、`cfg` 行はソース上に残ったまま
+    // 走査されるため、arch に依存せず常に 8 を期待できる）。
     assert_eq!(
-        unsafe_block_count, 3,
-        "expected exactly 3 `unsafe {{` blocks in isa.rs (Neon, Avx2Fma, Avx512 dot dispatch)"
+        unsafe_block_count, 8,
+        "expected exactly 8 `unsafe {{` blocks in isa.rs (Neon/Avx2Fma/Avx512 dot dispatch \
+         + Avx2Fma/Avx512 dot_block4 dispatch + F16c/NeonFp16 dot_f16 dispatch added by \
+         Issue #514 + Neon dot_block4 dispatch added by Issue #511)"
     );
 }
 
@@ -278,10 +443,102 @@ fn token_types_have_no_public_constructor() {
         "isa.rs must not expose a public try_new constructor for token types"
     );
 
-    for token in ["NeonToken", "Avx2FmaToken", "Avx512Token"] {
+    for token in [
+        "NeonToken",
+        "Avx2FmaToken",
+        "Avx512Token",
+        "F16cToken",
+        "NeonFp16Token",
+    ] {
         assert!(
             source.contains(&format!("struct {token}(())")),
             "{token} must be defined as a unit-field tuple struct `{token}(())`"
         );
     }
+}
+
+// ---------- f16 昇格 dot（Issue #514・親 #513。ポインタ: TASK-132・TASK-156・CORE-16） ----------
+//
+// `isa::F16Kernel`（`hnsw.rs::NodeVectors::F16` 専用のディスパッチ）の結合テスト。
+// `SimdKernel`（f32 幅ディスパッチ）の既存テストと同じ「crate 外から到達できる
+// 公開 API だけで検証する」方針を踏襲する。
+
+/// `isa::current_f16().isa()` が、`std::arch` の feature 検出マクロから
+/// テスト側で独立に算出した期待値と一致すること。
+#[test]
+fn f16_detection_matches_std_feature_macros() {
+    let expected = expected_f16_isa_from_std_macros();
+    assert_eq!(isa::current_f16().isa(), expected);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn expected_f16_isa_from_std_macros() -> isa::DetectedF16Isa {
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c")
+    {
+        isa::DetectedF16Isa::F16c
+    } else {
+        isa::DetectedF16Isa::Scalar
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn expected_f16_isa_from_std_macros() -> isa::DetectedF16Isa {
+    if std::arch::is_aarch64_feature_detected!("neon")
+        && std::arch::is_aarch64_feature_detected!("fp16")
+    {
+        isa::DetectedF16Isa::NeonFp16
+    } else {
+        isa::DetectedF16Isa::Scalar
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn expected_f16_isa_from_std_macros() -> isa::DetectedF16Isa {
+    isa::DetectedF16Isa::Scalar
+}
+
+/// `isa::current_f16().dot_f16` が `isa::dot_f16_scalar`（参照実装）と許容差内で
+/// 一致すること。決定的シード RNG で複数次元（0・チャンク境界を跨ぐ長さを含む）を
+/// 走査する。f16 の丸め誤差を許容するため許容差は f32 側 `dispatched_dot_matches_
+/// scalar_reference_within_tolerance` より緩める。
+#[test]
+fn dispatched_dot_f16_matches_scalar_reference_within_tolerance() {
+    let dims = [0usize, 1, 3, 4, 7, 8, 15, 16, 17, 33, 128, 129];
+    let mut rng = XorShift64Star::new(0x2468_ace0_1357_9bdf);
+
+    for &dim in &dims {
+        let a_f32 = random_vec(&mut rng, dim);
+        let a_bits: Vec<u16> = a_f32
+            .iter()
+            .map(|&v| {
+                let packed = engine::batch_search::pack_f16x2(v, 0.0);
+                let bits = packed & 0xFFFF;
+                bits as u16
+            })
+            .collect();
+        let b = random_vec(&mut rng, dim);
+
+        let expected = isa::dot_f16_scalar(&a_bits, &b);
+        let actual = isa::current_f16().dot_f16(&a_bits, &b);
+
+        let magnitude: f32 = a_f32.iter().zip(b.iter()).map(|(x, y)| (x * y).abs()).sum();
+        let tolerance = 1e-2 * magnitude + 1e-2;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "dim={dim} actual={actual} expected={expected} tolerance={tolerance}"
+        );
+    }
+}
+
+/// `isa::current_f16()` の単調性（`isa::current()` と同じ契約。プロセス内で
+/// 何度呼んでも同一 ISA を返す）。
+#[test]
+fn f16_detection_is_stable_within_process() {
+    let baseline = isa::current_f16().isa();
+    for _ in 0..8 {
+        assert_eq!(isa::current_f16().isa(), baseline);
+    }
+    assert_eq!(isa::detect_f16().isa(), baseline);
 }

@@ -164,12 +164,13 @@ fn write_parameter_status(stream: &mut TcpStream, name: &str, value: &str) -> Re
     write_all(stream, &msg)
 }
 
+/// `ReadyForQuery`（'Z'）を単独送出する（ハンドシェイク完了直後など、応答
+/// バッファ組み立てを経由しない経路向け）。バイトレイアウトの実体は
+/// `crate::result_encoder::encode_ready_for_query`（Issue #481）に一元化した
+/// ―― 以前は本関数がレイアウトを個別に持っており、`crate::response_buffer::
+/// ResponseBuffer` へ他フレームと同じ形で積める関数が無かった。
 fn write_ready_for_query(stream: &mut TcpStream) -> Result<()> {
-    let mut msg = Vec::with_capacity(6);
-    msg.push(b'Z');
-    msg.extend_from_slice(&5i32.to_be_bytes());
-    msg.push(b'I'); // idle（トランザクション外）
-    write_all(stream, &msg)
+    write_all(stream, &crate::result_encoder::encode_ready_for_query())
 }
 
 /// ErrorResponse（'E'）。SQLSTATE と英語メッセージのみを含む最小フィールド構成

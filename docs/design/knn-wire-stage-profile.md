@@ -226,7 +226,7 @@ e2e。`SqlArenaCache` ヒット状態）と `make bench-knn-wire-profile`（T2:
   self を同一コミットで再実行する運用者作業。
 - 応答送出が複数回の `write_all` に分かれている点（バッファリング統合）は
   本ベンチの所見として記録するのみで、production 変更は別 Issue（Phase 4 系）
-  で判断する。
+  で判断する。→ Issue #481 で実装。`docs/design/wire-response-buffering.md` 参照。
 - 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測はオーナー作業。本 doc の数値は
   共有開発環境の参考値。
 - `docs/design/hotpath-implementation-survey.md`・`docs/design/
