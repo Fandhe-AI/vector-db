@@ -418,9 +418,12 @@ current_generation` による事前・事後の失効照合とは独立した読
   ない。本節の数値は既存 arm 分類の定性的傾向の把握以上には用いない
   （下記「判断」参照）という既存の制約に加え、この baseline 系列の不整合
   自体が§3の輪番方式の遵守を確認できないことの追加根拠であり、専有環境
-  での再実測では 3 候補が単一の baseline 系列を共有していることをログ上
-  検証可能な形で残す（例: baseline の pair index を candidate 側の
-  ログファイル名・記録行に明示する）
+  での再実測では、現行スクリプト（`scripts/bench_knn_visible_ratio_sweep.sh`。
+  各 candidate の直前に個別の baseline を測り `baseline_for_<candidate>`
+  としてログへ残す輪番方式）の設計どおり、各 candidate をその直前に測定した
+  baseline と対応付け、全 candidate が同一の輪番セッション内で測定された
+  ことをログ上検証可能な形で残す（baseline のログファイル名に対応する
+  candidate 名を含める現行の命名規則・pair index の記録で満たされる）
 
 ### 実測結果
 
@@ -638,7 +641,9 @@ scan への縮退分のオーバーヘッドが乗る。上表の主統計量「
   足りない。§3 が定める「各 candidate の直前に baseline を個別に挟む」
   輪番〔本 PR で `scripts/bench_knn_visible_ratio_sweep.sh` を書き換え
   済み〕での再実行・参照区間 `S0_hot_sql_e2e` の per-run 生データ保持・
-  3 候補が単一の baseline 系列を共有していることをログ上検証可能な形で
+  現行スクリプトの輪番方式（各 candidate をその直前の baseline
+  `baseline_for_<candidate>` と対応付ける設計）どおり、全 candidate が
+  同一の輪番セッション内で測定されたことをログ上検証可能な形で
   残すことを含めて再実測する）、および `ann_masked` を発火させる可視集合
   構成の設計は運用者・後続 Issue への申し送りとする（下記「スコープ外・
   申し送り」参照）
