@@ -1,0 +1,15 @@
+    Finished `release` profile [optimized] target(s) in 0.06s
+     Running tests/hybrid_recall.rs (target/release/deps/hybrid_recall-1dced341cb75c3bf)
+
+running 2 tests
+hybrid_recall_large_scale_threshold_gate: query expansion=enabled, non-identity intent-form queries (deterministic stub LlmClient, Issue #306 / PR #308)
+hybrid_recall_small_scale_threshold_gate: engine=brute_force
+hybrid_recall_small_scale_threshold_gate: recall@20 value=0.9010 pass=true
+test hybrid_recall_small_scale_threshold_gate ... ok
+hybrid_recall_large_scale_threshold_gate: engine=brute_force
+hybrid_recall_large_scale_threshold_gate: recall@20 value=0.9145 pass=true
+hybrid_recall_large_scale_threshold_gate: recall@100 value=0.9165 pass=true
+test hybrid_recall_large_scale_threshold_gate ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 1.60s
+

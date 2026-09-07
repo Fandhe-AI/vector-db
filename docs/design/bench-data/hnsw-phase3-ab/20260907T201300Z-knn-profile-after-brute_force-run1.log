@@ -1,0 +1,19 @@
+env: os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma loadavg=20.53 14.50 9.38 16/479 3047815
+knn_profile_bench: rows=25000 dim=128 top_k=10 (tenant_a=20000 tenant_b=5000) engine=brute_force
+knn_profile_bench: SQL 表層は PrefilterCache を経由しない（core.rs は EngineCore::search 専用）が SqlArenaCache（Issue #363）は経由する。S0-cold は毎サンプル新規 EngineCore で SqlArenaCache を空の状態から測る。既定 provider は ParallelSearchProvider、対照は CpuScalarProvider。BENCH_KNN_PROFILE_ENGINE=hnsw のときは S0-cold/S0-hot の EngineCore を hnsw opt-in（Issue #403 B 案）で構築する（S1〜S5' は非対象）。
+stage(S4_arena_build): rows=25000 median=7.970ms ns_per_row=318.8
+stage(S5_search_parallel): rows=25000 median=0.260ms ns_per_row=10.4
+stage(S5_search_scalar): rows=25000 median=0.277ms ns_per_row=11.1
+stage(S5prime_distance_only): rows=25000 median=0.588ms ns_per_row=23.5
+diff(S5prime->S5_scalar): n/a (独立計測どうしの中央値比較のため測定ノイズにより 逆転・未確定として継続: stage timings are not monotonically non-decreasing: S5prime > S5_scalar)
+stage(S0_cold_sql_e2e): rows=25000 median=31.927ms ns_per_row=1277.1
+stage(S0_hot_sql_e2e): rows=25000 median=1.093ms ns_per_row=43.7
+stage(S0prime_count_star): rows=25000 median=0.054ms ns_per_row=2.2
+stage(S1_redb_scan): rows=25000 median=1.869ms ns_per_row=74.8
+stage(S2_header_decode): rows=25000 median=2.283ms ns_per_row=91.3
+diff(S1->S2): ns_per_row=16.5
+stage(S3_f32_decode): rows=25000 median=4.854ms ns_per_row=194.2
+diff(S2->S3): ns_per_row=102.9
+diff(S3->S4): ns_per_row=124.6
+residual(S0-(S4+S5)): median=23.697ms (parse/bind/result-assembly 等。read_txn 境界差を含みうる保守的な残差)
+knn_profile_bench: consistency checks passed (S1..S3 row counts, S0 result count, S0' COUNT(*) value, S3 vs VectorArena cross-check)

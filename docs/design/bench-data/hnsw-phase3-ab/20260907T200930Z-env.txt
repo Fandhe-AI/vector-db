@@ -1,0 +1,11 @@
+before_commit=4d2bd23
+after_commit=799a7d8
+before_hnsw_compare_bin_sha256=8aa911762981b0dfb95b2a1830689c14e93f01276c62e884fd825d8a9a5df1d2
+after_hnsw_compare_bin_sha256=7f7a546db13533ed9641843d620025b83f0170050e29ad73fe043c0d1b1f8b6a
+nproc=12
+cpu_model=QEMU Virtual CPU version 2.5+
+isa=Avx2Fma
+BENCH_DEDICATED_ENV=<unset>
+GITHUB_ACTIONS=<unset>
+environment=共有 QEMU 開発環境（他 worktree のジョブが並走。loadavg は各 run のログを参照）
+hnsw_compare_scale_note=時間制約により既定 rows=100000/queries=200/thread_ladder=[1,12] を rows=20000/queries=100/thread_ladder=[12] へ縮小（セッション時間制約による正直な逸脱。degradation order §7 相当）

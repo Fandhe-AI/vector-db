@@ -1,0 +1,4 @@
+env: os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma loadavg=23.85 16.54 10.40 3/456 3057275
+knn_profile_bench: rows=25000 dim=128 top_k=10 (tenant_a=20000 tenant_b=5000) engine=brute_force
+knn_profile_bench: SQL 表層は PrefilterCache を経由しない（core.rs は EngineCore::search 専用）が SqlArenaCache（Issue #363）は経由する。S0-cold は毎サンプル新規 EngineCore で SqlArenaCache を空の状態から測る。既定 provider は ParallelSearchProvider、対照は CpuScalarProvider。BENCH_KNN_PROFILE_ENGINE=hnsw のときは S0-cold/S0-hot の EngineCore を hnsw opt-in（Issue #403 B 案）で構築する（S1〜S5' は非対象）。
+fatal: the storage backend's commit call returned an error, but whether the write became durable before the error is indeterminate; aborting the process to avoid returning a possibly-incorrect success or failure response

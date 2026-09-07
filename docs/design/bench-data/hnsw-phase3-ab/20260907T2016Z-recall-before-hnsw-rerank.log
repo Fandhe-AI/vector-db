@@ -1,0 +1,14 @@
+    Finished `release` profile [optimized] target(s) in 0.21s
+     Running tests/rerank_recall.rs (target/release/deps/rerank_recall-64f7d35ebd30ad6d)
+
+running 1 test
+rerank_recall_large_scale_threshold_gate: engine=hnsw builds=1 build_failures=0 rebuilds=0 hybrid_dense_searches=492 hybrid_queries=100 ef_cap_fallbacks=106
+rerank_recall_large_scale_threshold_gate: engine=hnsw
+rerank_recall_large_scale_threshold_gate: after_recall@20 value=0.9488 pass=true
+rerank_recall_large_scale_threshold_gate: non_degraded (after_hits20 >= baseline_hits20) pass=true
+rerank_recall_large_scale_threshold_gate: improvement_ratio@20 inputs (informational, non-blocking since SEARCH-7 rev 2026-08-31) baseline_hits20=387 after_hits20=389 pool_ceiling_hits20=396
+rerank_recall_large_scale_threshold_gate: improvement_ratio@20 (informational, non-blocking since SEARCH-7 rev 2026-08-31) value=0.2222
+test rerank_recall_large_scale_threshold_gate ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 29.34s
+

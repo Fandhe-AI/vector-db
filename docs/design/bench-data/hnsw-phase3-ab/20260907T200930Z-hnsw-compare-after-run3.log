@@ -1,0 +1,12 @@
+env: os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma loadavg=12.25 7.94 6.26 17/536 3021201
+hnsw_compare: rows=20000 dim=64 queries=100 thread_ladder=[12] corpus=l2_normalized
+hnsw_compare: params engine=self m=16 ef_construction=100 ef_search=64
+hnsw_compare: params engine=usearch connectivity=16 expansion_add=100 expansion_search=64 metric=IP quantization=F32 multi=false
+hnsw_compare: engine=self threads=12 build_median=228.088ms speedup=1.000x
+hnsw_compare: engine=usearch threads=12 build_median=236.544ms speedup=1.000x
+hnsw_compare: ratio threads=12 self_over_usearch=0.964x
+hnsw_compare: recall engine=self threads=1 recall@10=0.7710
+hnsw_compare: recall engine=self threads=12 recall@10=0.7580
+hnsw_compare: recall engine=usearch threads=12 recall@10=0.7650
+hnsw_compare: search_latency engine=self median_us=75.672
+hnsw_compare: search_latency engine=usearch median_us=117.212

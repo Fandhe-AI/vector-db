@@ -1,0 +1,10 @@
+loadavg_before_run1=11.47 6.37 5.63 3/452 3014006
+loadavg_after_run1=11.91 6.80 5.79 2/451 3015026
+loadavg_before_run2=11.92 7.13 5.92 2/450 3016102
+loadavg_after_run2=11.42 7.24 5.98 2/452 3017254
+loadavg_before_run3=11.20 7.47 6.08 2/452 3018364
+loadavg_after_run3=12.25 7.94 6.26 15/535 3021199
+loadavg_before_run4=12.65 8.40 6.46 21/562 3025402
+loadavg_after_run4=17.15 10.35 7.22 5/481 3027924
+loadavg_before_run5=16.26 10.69 7.42 5/481 3029030
+loadavg_after_run5=15.85 11.12 7.67 5/480 3030166
