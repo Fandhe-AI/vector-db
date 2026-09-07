@@ -1,11 +1,12 @@
 # 零埋め固定長バッファによる分岐なし tail（AVX2／AVX-512／NEON）
 
-- ステータス: **順序保存形を実装（既定経路は現行のまま不変）**
+- ステータス: **順序保存形を実装・既定切替は Rejected（現状維持確定）**
 - 対応: Issue #528（`perf(engine): 零埋め固定長バッファによる分岐なし tail を
   AVX2／AVX-512／NEON に実装する`。親 #527・Phase 4 親 #459・ルート #455）
 - 依存: Issue #508（`docs/design/simd-intrinsics-adoption.md`。ステータス
   Proposed・オーナー承認待ち）
-- 後続: Issue #529（既定切替の採否・dim 100／129／768 の前後比較実測）
+- 対応: Issue #529（既定切替の採否・dim 100／129／768 の前後比較実測。
+  「Issue #529: dim 100／129／768 での前後比較と採否記録」節参照）
 
 ## 背景・要件
 
@@ -146,31 +147,152 @@ SIMD カーネルを呼ぶ 3 箇所の `unsafe` ブロック・SAFETY 根拠（s
 判定は #529 が担う）。既存の `crates/engine/benches/dot_kernel_bench.rs` を
 用いた前後比較・判定は #529 の担当とする。
 
-## #529 への申し送り
+## Issue #529: dim 100／129／768 での前後比較と採否記録
 
-- `DEFAULT_PADDED_TAIL`（`isa.rs`）は現状 `false`。採用判断がまとまった場合は
-  この const を `true` へ反転するだけで production 経路が切り替わる
-  （SIMD カーネル呼び出し 3 箇所の `unsafe` 構造・SAFETY 根拠は不変のため
-  追加のレビュー観点は生じない）。
-- 判定は `docs/design/benchmark-judgement-policy.md` §3〜§4（交互 N≥5・
-  per-run 生データ・min-of-N と median 併記・ノイズ帯併記）に従う。
-  `SimdKernel::dot_with_scalar_tail`／`dot_with_padded_tail` が既に production
-  実装と同一の hook として公開されているため、単一バイナリ内 A/B
-  （`dot_kernel_bench.rs` へのベンチ側 env 追加。production コードへ環境変数を
-  持ち込まない）と、2 バイナリ方式（`DEFAULT_PADDED_TAIL` を一時反転した
-  ビルドとの比較）のいずれの方式でも計測できる。
-- 端数長（`dim % LANES`）が大きいほど（`LANES` に近いほど）分岐なし化の
-  効果が出やすいと考えられるため、dim 100／129／768（親 Issue #528 の後続で
-  指定された規模点）は端数長の異なる境界を含む選定になっている。
-- 順序保存の分岐なし tail は「依存 add 鎖が `r`（端数長）本→`LANES` 本へ
-  増えるだけで短縮の余地が構造的に無い」という見立てを doc に残しておく
-  （`docs/design/dot-kernel-multi-accumulator.md`・
-  `docs/design/knn-two-stage-topk.md` と同じ、既に検討済みである旨を記録して
-  同種の再提案を防ぐ役割）。folding（折り込み）形でなければ大きな高速化は
-  期待しにくく、折り込み形はオーナー判断（ADR #508 決定 5 条件 2）が前提。
+### 計測方式
+
+`crates/engine/benches/dot_kernel_bench.rs` へ opt-in セクション
+（`BENCH_DOT_KERNEL_TAIL_AB=1`）を追加した。既定（未設定）では従来の
+`label=current` 10 ステージ・診断 A/B のみが実行され出力・所要時間とも不変。
+有効時は dim ∈ `harness::dot_kernel::TAIL_AB_DIMS`（`[100, 129, 768]`）ごとに
+
+1. `SimdKernel::dot_with_scalar_tail`（A・現行）と `dot_with_padded_tail`
+   （B・Issue #528）の全行 `to_bits()` 完全一致を検証（fail-closed。1 件でも
+   不一致なら実測値を出さず非ゼロ終了）
+2. 参照区間（`SimdKernel::dot`＝production 経路。`tail_ab_ref` 行）を単独計測
+3. `harness::ab::run_ab`（interleaved・warmup/計測とも先行経路を反復ごとに
+   入れ替え）で A/B を計測（`tail_ab` 行。各 20 warmup・50 計測）
+
+を行う。`docs/design/benchmark-judgement-policy.md` §3 に従い、同一バイナリを
+**5 回**プロセス起動し（1 プロセス実行 = 1 run）、各 run の `min_us`／
+`median_us` を per-run 生データとして保持したうえで、run 間の min-of-N・
+median・参照区間の実測帯（§4 の `(max-min)/min`）を算出した。
+
+### 環境
+
+- CPU: `QEMU Virtual CPU version 2.5+`（本開発環境・共有 QEMU 環境）
+- 命令セットフラグ: `avx2` `fma` `f16c`。`avx512*` なし
+- `nproc`: 12。各 run 直前の `loadavg`: 2.59〜2.65（他プロセスと共有・非専有）
+- `BENCH_DEDICATED_ENV`: 未設定（専有環境ではない）
+- 計測対象コミット: before＝after＝同一バイナリ（`SimdKernel::dot_with_scalar_tail`／
+  `dot_with_padded_tail` の hook 切替による単一バイナリ内 A/B。2 バイナリ方式は
+  未実施）
+
+### 実測記録（N=5 run・min-of-N と median の両方）
+
+`tail_ab_ref`（参照区間・production `dot`）の run 間 min_us 値列と実測帯:
+
+| dim | run1 | run2 | run3 | run4 | run5 | 参照区間帯（相対） |
+| --- | --- | --- | --- | --- | --- | --- |
+| 100 | 166.106 | 169.608 | 161.022 | 168.051 | 162.083 | 5.33% |
+| 129 | 208.991 | 223.038 | 204.968 | 207.843 | 204.491 | 9.07% |
+| 768 | 2856.519 | 2899.993 | 2735.253 | 2952.976 | 2671.022 | 10.56% |
+
+`tail_ab`（A=scalar_tail・B=padded_tail）の run 間 `ratio_min`
+（`padded_tail.min / scalar_tail.min`）・`ratio_median` 値列と判定クラス
+（固定 ±5% 帯）:
+
+| dim | ratio_min（5 run） | ratio_median（5 run） | 固定帯判定 | 参照区間帯超過 |
+| --- | --- | --- | --- | --- |
+| 100 | 1.2482 / 1.2286 / 1.2440 / 1.2596 / 1.2569 | 1.2618 / 1.2431 / 1.3082 / 1.2678 / 1.2887 | 全 run `Regressed` | 5 run 全てで超過（5.33% 帯に対し差分 23〜31%） |
+| 129 | 1.5601 / 1.5292 / 1.6644 / 1.6526 / 1.6637 | 1.5730 / 1.5365 / 1.5016 / 1.6573 / 1.6540 | 全 run `Regressed` | 5 run 全てで超過（9.07% 帯に対し差分 50〜66%） |
+| 768 | 1.0685 / 1.0534 / 0.9886 / 1.0067 / 1.0114 | 1.0036 / 1.0274 / 1.0150 / 0.9940 / 0.9865 | `Neutral` 主体（5 run 中 2 run が僅かに `Regressed` 境界超過、他は `Neutral`） | 5 run とも非超過（10.56% 帯内） |
+
+dim=100・129 は 5 run 全てで固定 ±5% 帯・参照区間実測帯の**両方**を明確に
+超える一貫した悪化（`docs/design/benchmark-judgement-policy.md` §4 の判定
+基準を満たす）。dim=768（端数ゼロ）は両ノイズ帯の内側にとどまり非退行
+（padded_tail は rem==0 のとき零埋めバッファ処理そのものを実行しない分岐
+構造のため、追加コストがほぼ生じない）。
+
+### 実アセンブリ確認
+
+`cargo bench --bench dot_kernel_bench -p engine --no-run` のバイナリに対し
+`nm` で `dot_avx2_fma` の 2 monomorphization（`PADDED_TAIL=false`／`true`）
+シンボルを取得し `objdump -d -M intel` で比較した。
+
+- 要素ごと挿入命令（`vinsertps`／`vpinsr*`／`vunpck{l,h}ps`）: 両シンボルとも
+  0 件（`make simd-codegen-check` の既存確認と整合）
+- 分岐命令（`j*` mnemonic）数: `PADDED_TAIL=false`（scalar tail）14 件・
+  `PADDED_TAIL=true`（padded tail）9 件。tail 長 0〜7 の 7 分岐チェーンが
+  「tail が空か否か」の 1 分岐へ縮約されている点は設計どおり
+- 一方 `PADDED_TAIL=true` 側の tail 処理は、零埋めバッファへの詰め込みを
+  `memcpy@GLIBC_2.14` の呼び出し 2 回（a 側・b 側）として実装しており、
+  `docs/design/dot-kernel-branchless-tail.md`「不採用形」節で確認済みの
+  `make simd-codegen-check`（専用の `--emit asm` 検査ビルド）が `callq` を
+  含まないと確認した結果とは異なるコード生成になっている。両者はコンパイル
+  時のプロファイル（`cargo bench` の bench プロファイル vs 検査スクリプトの
+  ビルド設定）が異なり、インライン化・ループアンローリングの閾値判断が
+  LLVM 側で変わったことが原因と考えられる（本 Issue の範囲では踏み込んだ
+  原因特定は行わない）。この `memcpy` 呼び出し（関数呼び出しオーバーヘッド・
+  ポインタエイリアシング解析の断念）が、特に tail 長が小さい dim=129
+  （`129 % 8 = 1`）で悪化幅が最大（ratio ≈ 1.5〜1.66）になる主因と分析する
+  ——固定オーバーヘッドが小さいコピー量に対して相対的に支配的になるため。
+  dim=100（`100 % 8 = 4`）は現行スカラー tail 側の逐次乗算・加算そのものが
+  相対的に重くなる分、悪化幅は小さい（ratio ≈ 1.23〜1.26）が、それでも
+  一貫して悪化する。
+
+### 分析: 端数長と悪化幅の関係（設計時の見立てとの相違）
+
+「不採用形」節・旧「#529 への申し送り」節では「端数長が `LANES` に近いほど
+分岐なし化の効果が出やすい」という見立てを記録していたが、実測はこれと
+**逆方向**の結果になった。零埋め固定長バッファ方式の実装（`padded_tail_sum`）
+がコピー方式（本ビルドでは `memcpy` 呼び出し）に依存するため、コピー対象の
+要素数が少ないほど固定オーバーヘッドの相対負担が増し、端数長が最小
+（dim=129・rem=1）のときに最も悪化幅が大きくなるという逆転が生じた。
+これは「分岐削減の利得」より「零埋めバッファへの書き込みオーバーヘッド」が
+支配的であることを示す実測であり、この見立ての誤りは今後の再提案を防ぐため
+記録として残す。
+
+### 判定
+
+`docs/design/benchmark-judgement-policy.md` §5「環境別の証拠力」の
+「production 変更の棄却（Rejected・現状維持）」行に従い、共有 QEMU 環境でも
+「両ノイズ帯を超える一貫した悪化＋静的解析／実アセンブリの裏付け」がある
+場合は棄却判断が可能である。dim=100・129 で 5 run 全てが両ノイズ帯を超える
+一貫した悪化を示し、上記の実アセンブリ確認（`memcpy` 呼び出しによる固定
+オーバーヘッド）がその原因を裏付けたため、**Rejected（現状維持確定）**と
+判断する。
+
+- `DEFAULT_PADDED_TAIL`（`isa.rs`）は `false` のまま変更しない（本 Issue は
+  `crates/engine/src/` を無変更のまま完結する）。
+- `SimdKernel::dot_with_scalar_tail`／`dot_with_padded_tail` の hook・
+  `unsafe` 個数・SAFETY 根拠はいずれも不変（Issue #528 の実装をそのまま
+  維持）。
+- 折り込み形（演算順を変える方式。ADR #508 決定 5 条件 2）は本 Issue の
+  対象外のまま。順序保存形自体が悪化方向という実測が出たため、性能改善を
+  狙うなら折り込み形以外の方式は見込み薄いという所見を追加で記録する。
+- 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測は、共有 QEMU 環境の実測でも
+  一貫した明確な悪化が確認できたため、追加のオーナー実測を必須とはしない
+  （ただし実施を妨げるものではない）。
+
+### 再現手順
+
+```sh
+for i in 1 2 3 4 5; do
+  cat /proc/loadavg
+  BENCH_DOT_KERNEL_TAIL_AB=1 make bench-dot-kernel
+done
+```
+
+各 run の `dot_kernel: tail_ab_ref ...`／`dot_kernel: tail_ab label=... ...`
+行を保存し、dim ごとに `tail_ab_ref` の `min_us` 列から実測帯
+（`(max-min)/min`）を、`tail_ab` の `ratio_min`／`ratio_median` 列から
+固定 ±5% 帯の判定クラスを算出する。
+
+### 限界
+
+- AVX-512（`dot_avx512::<PADDED_TAIL>`）・NEON（`dot_neon::<PADDED_TAIL>`）
+  実機での tail A/B 実測は未実施（本開発環境は AVX2+FMA のみ）。対応 ISA を
+  持つ環境（Issue #530 のチップ別前後比較）へ引き継ぐ。
+- N=5 run はいずれも同一開発セッション内の連続実行であり、日をまたいだ
+  再現性・別ホストでの再現性は未検証。
 
 ## スコープ外
 
-- 既定経路（`SimdKernel::dot`）の挙動変更（#529 が担当）
+- `DEFAULT_PADDED_TAIL` の `true` への切替（本 Issue の実測で Rejected と
+  判断したため、専有環境実測でも覆らない限り再提案しない）
 - 折り込み形の実装（オーナー判断待ち。上記「不採用形」参照）
-- AVX-512／NEON 実機での実行時ディスパッチ検証（別タスク）
+- AVX-512／NEON 実機での実行時ディスパッチ検証（別タスク・Issue #530）
+- `dot_kernel_bench.rs` の `memcpy` コード生成差異（`make simd-codegen-check`
+  の検査ビルドとの乖離）の原因特定（本 Issue の範囲外。悪化の裏付けとしては
+  十分なため踏み込まない）
