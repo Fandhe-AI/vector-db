@@ -21,13 +21,17 @@
 //! （並列構築 `build_with_threads(threads>1)` は run ごとにグラフの形状が
 //! 変わり得るため before/after を交絡させる。使わない）。
 //!
-//! # 参照区間（ノイズ帯算出）
+//! # 参照区間（代表値のみ出力・ノイズ帯はここでは算出しない）
 //!
-//! 変更（prefetch）を含まない区間として、同一プロセス内で同じ正規化コーパス・
-//! クエリに対する brute-force Top-k（`engine::kernel::CpuScalarProvider`）の
-//! 所要時間分布を計測し、`harness::hnsw_search_latency::reference_band` で
-//! ノイズ帯（百分率）を出力する。呼び出し元は HNSW 探索本体の比率変化と
-//! この参照区間帯を突き合わせて「実測帯を超えたか」を判定する。
+//! 変更（prefetch）を含まない区間として、探索本体と同一のクエリサイクル・
+//! 同一シードで brute-force Top-k（`engine::kernel::CpuScalarProvider`）を
+//! 計測し、`target=hnsw_search` 行と同型の代表値（`min_us`／`median_us`）を
+//! 出力する。ノイズ帯（実測帯）は単一プロセス内では算出しない——プロセス
+//! 内の分布にはクエリサイクルに含まれる各クエリ間の所要時間差が混入し、
+//! `docs/design/benchmark-judgement-policy.md` §4 が求める run-to-run
+//! （プロセス実行間）幅にならないため（codex-review 指摘・Issue #491）。
+//! 呼び出し元シェルスクリプトが交互起動した複数プロセスの代表値列を
+//! `harness::hnsw_search_latency::reference_band` へ渡してノイズ帯を算出する。
 //!
 //! # CI に配線しない・`GITHUB_ACTIONS` 下は拒否
 //!
@@ -58,7 +62,7 @@ use harness::env_report::EnvReport;
 use harness::hnsw_compare::l2_normalize_corpus;
 use harness::hnsw_search_latency::{
     generate_corpus, generate_mask, generate_query, parse_dim, parse_ef, parse_k, parse_mask,
-    parse_queries, parse_rows, reference_band, refuse_under_github_actions, render_header_line,
+    parse_queries, parse_rows, refuse_under_github_actions, render_header_line,
     render_masked_short_line, render_reference_line, render_target_line, MaskSpec,
 };
 use harness::protocol::{run, MeasurementConfig};
@@ -191,9 +195,18 @@ fn main() {
     // `None` は `HnswIndex::search` とビット同一な結果を返す契約
     // （`hnsw.rs::search_masked` ドキュメンテーションコメント参照）ため、
     // 分岐を持たずに測定できる）。
+    //
+    // `protocol::run` は warmup フェーズ（`config.warmup_iterations()` 回）と
+    // 計測フェーズを同一クロージャで実行する（呼び出し元からは区別できない）。
+    // `short_count` は「計測フェーズで k 未満しか返らなかったクエリ数」という
+    // 非 vacuous 性の確認材料であり、warmup 分まで含めると表示値が実際の
+    // 計測対象より過大になる（Cursor Bugbot 指摘・Issue #491）ため、
+    // `call_index` で呼び出し回数を数え warmup 通過後のみ計上する。
     let mut scratch = HnswSearchScratch::default();
     let mut qi = 0usize;
     let mut short_count = 0usize;
+    let mut call_index: u64 = 0;
+    let warmup_iterations = u64::from(config.warmup_iterations());
     let target = run(&config, || {
         let Some(query) = queries.get(qi % queries.len()) else {
             eprintln!(
@@ -202,9 +215,11 @@ fn main() {
             std::process::exit(1);
         };
         qi += 1;
+        let is_measured_call = call_index >= warmup_iterations;
+        call_index += 1;
         match index.search_masked(query, k, ef, mask.as_ref(), &mut scratch) {
             Ok(hits) => {
-                if hits.len() < k {
+                if is_measured_call && hits.len() < k {
                     short_count += 1;
                 }
                 hits.len()
@@ -282,32 +297,31 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let ref_min = reference
+    let ref_min_us = reference
         .samples
         .iter()
         .min()
-        .copied()
-        .unwrap_or(std::time::Duration::ZERO);
-    let ref_max = reference
-        .samples
-        .iter()
-        .max()
-        .copied()
-        .unwrap_or(std::time::Duration::ZERO);
-    let band = match reference_band(ref_min, ref_max) {
-        Ok(b) => b,
+        .map(|d| d.as_secs_f64() * 1e6)
+        .unwrap_or(0.0);
+    let ref_p95 = match harness::accept::p95_from_samples(&reference.samples) {
+        Ok(d) => d.as_secs_f64() * 1e6,
         Err(e) => {
-            eprintln!("hnsw_search_bench: reference_band computation failed: {e}");
+            eprintln!("hnsw_search_bench: reference p95 computation failed: {e}");
             std::process::exit(1);
         }
     };
+    // ノイズ帯（実測帯）はここでは算出しない。単一プロセス内の分布は
+    // クエリサイクルに含まれる各クエリ間の所要時間差を含み run-to-run
+    // （プロセス実行間）幅にならない（codex-review 指摘・Issue #491）ため、
+    // 交互起動する運用者・シェルが複数プロセス launch の代表値
+    // （`min_us`／`median_us`）を集めて `reference_band` へ渡す。
     println!(
         "{}",
         render_reference_line(
-            ref_min.as_secs_f64() * 1e6,
+            ref_min_us,
             reference.summary.median.as_secs_f64() * 1e6,
-            ref_max.as_secs_f64() * 1e6,
-            band,
+            ref_p95,
+            reference.samples.len(),
         )
     );
 }

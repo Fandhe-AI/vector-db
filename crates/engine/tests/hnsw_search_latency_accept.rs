@@ -11,8 +11,6 @@
 #[path = "../benches/harness/mod.rs"]
 mod harness;
 
-use std::time::Duration;
-
 use harness::hnsw_search_latency::{
     generate_corpus, generate_mask, generate_query, parse_dim, parse_ef, parse_k, parse_mask,
     parse_queries, parse_rows, reference_band, refuse_under_github_actions, render_header_line,
@@ -159,20 +157,30 @@ fn generate_mask_visible_ratio_is_approximately_requested_percent() {
 }
 
 // --- reference_band ---
+//
+// Issue #491 codex-review 指摘: 参照ノイズ帯は単一プロセス内の分布からではなく
+// 複数プロセス launch の代表値列（例: 交互起動した各プロセスの min_us）から
+// 算出する契約に変更した（`reference_band` のシグネチャも `&[f64]` へ変更）。
 
 #[test]
 fn reference_band_computes_expected_percentage() {
-    // benchmark-judgement-policy.md の例: 1000〜1050 µs -> 5.0%。
-    let min = Duration::from_micros(1_000);
-    let max = Duration::from_micros(1_050);
-    let band = reference_band(min, max).unwrap();
+    // benchmark-judgement-policy.md の例: 1000〜1050 µs -> 5.0%
+    // （5 プロセス launch から得た代表値列を模す）。
+    let values = [1_000.0, 1_020.0, 1_050.0, 1_010.0, 1_030.0];
+    let band = reference_band(&values).unwrap();
     assert!((band - 5.0).abs() < 1e-9);
 }
 
 #[test]
-fn reference_band_rejects_zero_min() {
-    let err = reference_band(Duration::ZERO, Duration::from_micros(10)).unwrap_err();
-    assert_eq!(err, HnswSearchLatencyError::ZeroMinDuration);
+fn reference_band_rejects_empty_slice() {
+    let err = reference_band(&[]).unwrap_err();
+    assert_eq!(err, HnswSearchLatencyError::EmptyOrNonPositiveMin);
+}
+
+#[test]
+fn reference_band_rejects_non_positive_min() {
+    let err = reference_band(&[0.0, 10.0]).unwrap_err();
+    assert_eq!(err, HnswSearchLatencyError::EmptyOrNonPositiveMin);
 }
 
 // --- render_* ---
@@ -200,9 +208,9 @@ fn render_lines_contain_expected_fields() {
     assert!(target.contains("target=hnsw_search"));
     assert!(target.contains("samples=400"));
 
-    let reference = render_reference_line(1.0, 1.02, 1.05, 5.0);
+    let reference = render_reference_line(1.0, 1.02, 1.05, 400);
     assert!(reference.contains("reference=brute_force"));
-    assert!(reference.contains("reference_band_pct=5.000"));
+    assert!(reference.contains("samples=400"));
 
     let masked = render_masked_short_line(3);
     assert_eq!(masked, "hnsw_search_bench: masked_short_queries=3");

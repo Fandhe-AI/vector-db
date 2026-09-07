@@ -18,10 +18,20 @@
 //!
 //! 変更（prefetch）を含まない区間として、同一プロセス内で同じ正規化コーパス・
 //! クエリに対する brute-force Top-k（`engine::kernel::CpuScalarProvider`）の
-//! 所要時間分布を使う。[`reference_band`] はその分布の `(max - min) / min` を
-//! 百分率で返し、呼び出し元が計測対象（HNSW 探索）の比率変化と比較して
-//! 「実測帯を超えたか」を判定する材料にする（`.claude/rules/
-//! spec-confidentiality.md`: 数値基準・実測値はオーナー判断で公開可）。
+//! 所要時間分布を計測する（探索本体〔`hnsw_search_bench.rs`〕と同一のクエリ
+//! サイクル・同一シードで回すため、以後の対象区間と同じ「作業単位」になる。
+//! 単一クエリへ固定すると常時ホットキャッシュな分布になり探索本体の実測と
+//! 比較不能な過小評価のノイズ帯になるため固定しない）。
+//!
+//! `docs/design/benchmark-judgement-policy.md` §4 が求める実測帯は
+//! **単一プロセス内では算出しない**。単一プロセス内の `(max - min) / min` には
+//! 「同じクエリサイクルに含まれる各クエリ間の所要時間差」が混入し、これは
+//! §4 が求める run-to-run（プロセス実行間）幅ではない（codex-review 指摘・
+//! Issue #491）。本モジュールが 1 プロセスにつき出力するのは代表値
+//! （`min_us`／`median_us`）のみであり、呼び出し元（交互起動する運用者・
+//! シェル）が複数プロセス launch から集めた代表値列を [`reference_band`] へ
+//! 渡してノイズ帯を算出する（`.claude/rules/spec-confidentiality.md`:
+//! 数値基準・実測値はオーナー判断で公開可）。
 //!
 //! # 暗号用途禁止
 //!
@@ -29,7 +39,6 @@
 //! ベンチ入力生成専用。
 
 use std::fmt;
-use std::time::Duration;
 
 use engine::hnsw::NodeMask;
 
@@ -79,8 +88,9 @@ pub enum HnswSearchLatencyError {
     RefusedUnderGitHubActions,
     /// `rows * dim` が [`MAX_CORPUS_ELEMENTS_GUARD`] を超過した。
     CorpusTooLarge,
-    /// [`reference_band`] に渡した `min` が 0（0 除算・NaN/inf 混入の回避）。
-    ZeroMinDuration,
+    /// [`reference_band`] に渡した値列が空、または最小値が 0 以下
+    /// （0 除算・NaN/inf 混入の回避）。
+    EmptyOrNonPositiveMin,
 }
 
 impl fmt::Display for HnswSearchLatencyError {
@@ -95,9 +105,10 @@ impl fmt::Display for HnswSearchLatencyError {
                 f,
                 "rows * dim exceeds MAX_CORPUS_ELEMENTS_GUARD ({MAX_CORPUS_ELEMENTS_GUARD})"
             ),
-            HnswSearchLatencyError::ZeroMinDuration => write!(
+            HnswSearchLatencyError::EmptyOrNonPositiveMin => write!(
                 f,
-                "reference_band refuses min == 0 (would divide by zero / emit NaN)"
+                "reference_band refuses an empty slice or a non-positive min \
+                 (would divide by zero / emit NaN)"
             ),
         }
     }
@@ -251,15 +262,31 @@ pub fn generate_mask(seed: u64, len: usize, percent: u8) -> NodeMask {
     mask
 }
 
-/// 変更を含まない参照区間（brute-force Top-k）の所要時間分布から、
-/// `(max - min) / min` を百分率で返す（ノイズ帯。`min == 0` は
-/// [`HnswSearchLatencyError::ZeroMinDuration`] として拒否する）。
-pub fn reference_band(min: Duration, max: Duration) -> Result<f64, HnswSearchLatencyError> {
-    let min_secs = min.as_secs_f64();
-    if min_secs <= 0.0 {
-        return Err(HnswSearchLatencyError::ZeroMinDuration);
+/// 複数プロセス launch から集めた参照区間（brute-force Top-k）の代表値列
+/// （呼び出し元が交互起動した各プロセスの `min_us` または `median_us` 等。
+/// `harness::scan_stage_profile::reference_band` と同じ「代表値の列から
+/// run-to-run 幅を算出する」契約）から `(max - min) / min` を百分率で返す
+/// （実測帯。`docs/design/benchmark-judgement-policy.md` §4）。
+/// 空スライス・最小値が 0 以下の場合は
+/// [`HnswSearchLatencyError::EmptyOrNonPositiveMin`] として拒否する
+/// （単一プロセス内の分布から算出すると異なるクエリ間の所要時間差が
+/// 混入し run-to-run 幅にならないため、本関数は単一プロセスの `samples`
+/// を直接受け取らない契約とする。codex-review 指摘・Issue #491）。
+pub fn reference_band(values: &[f64]) -> Result<f64, HnswSearchLatencyError> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for &v in values {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
     }
-    Ok((max.as_secs_f64() - min_secs) / min_secs * 100.0)
+    if !min.is_finite() || min <= 0.0 {
+        return Err(HnswSearchLatencyError::EmptyOrNonPositiveMin);
+    }
+    Ok((max - min) / min * 100.0)
 }
 
 /// 実行条件のヘッダ 1 行分の出力整形。
@@ -290,16 +317,16 @@ pub fn render_target_line(min_us: f64, median_us: f64, p95_us: f64, samples: usi
     )
 }
 
-/// 参照区間（brute-force）1 行分の出力整形。
-pub fn render_reference_line(
-    min_us: f64,
-    median_us: f64,
-    max_us: f64,
-    reference_band_pct: f64,
-) -> String {
+/// 参照区間（brute-force）1 行分の出力整形。`target=hnsw_search` 行と同型の
+/// フィールド（min_us／median_us／p95_us／samples）のみを出力し、ノイズ帯
+/// （`reference_band_pct`）はここでは算出しない——単一プロセス内の分布から
+/// 算出すると異なるクエリ間の所要時間差が混入するため、呼び出し元が複数
+/// プロセス launch から集めた代表値列を [`reference_band`] へ渡して別途
+/// 算出する契約（codex-review 指摘・Issue #491）。
+pub fn render_reference_line(min_us: f64, median_us: f64, p95_us: f64, samples: usize) -> String {
     format!(
         "hnsw_search_bench: reference=brute_force min_us={min_us:.3} median_us={median_us:.3} \
-         max_us={max_us:.3} reference_band_pct={reference_band_pct:.3}"
+         p95_us={p95_us:.3} samples={samples}"
     )
 }
 
