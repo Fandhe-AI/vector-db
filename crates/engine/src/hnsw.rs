@@ -2957,7 +2957,19 @@ impl HnswIndex {
                 // （影響はグラフ近傍構造の再利用判定のみ）。
                 for (&c, &scale) in candidate.iter().zip(params.scales().iter()) {
                     let limit = f64::from(scale) * 127.0;
-                    if f64::from(c).abs() > limit {
+                    // `scale` は fit_dim_params が f64 で算出したスケールを
+                    // f32 へ丸めた値（真値よりわずかに小さくなり得る）。
+                    // limit（127 倍した表現域上限）もその丸め誤差ぶん真の
+                    // 最大絶対値を下回ることがあり（例: fit 時最大絶対値が
+                    // ちょうど 1.0 のとき limit ≈ 0.9999999963）、未変更の
+                    // 極値行を誤って「範囲外＝changed」と判定し不要な
+                    // 再構築を招く（PR #617 codex-review P2・Cursor Bugbot
+                    // 指摘）。f32 の 1 ULP 相当（`f32::EPSILON`）の相対
+                    // 許容誤差を加えて吸収する。範囲検査は近傍構造の再利用
+                    // 判定のみに使われ最終スコアは常に f32 で再計算される
+                    // ため、この許容誤差の拡大が結果の正しさに影響しない。
+                    let tol = limit.abs() * f64::from(f32::EPSILON);
+                    if f64::from(c).abs() > limit + tol {
                         return Some(false);
                     }
                 }
@@ -6338,7 +6350,12 @@ mod tests {
     /// （D6 と同型）、`search` は成功する（`fit_dim_params`／`encode_rows` の
     /// `Sq8Error::NonFinite` を経由する経路。`validate_build_input` が通常は
     /// 非有限成分を事前拒否するため到達しないが、`freeze_from` 自体の
-    /// fail-closed 契約を独立に固定する）。
+    /// fail-closed 契約を独立に固定する）。このコーパス自体は常に有限な
+    /// ため実際には縮退せず I8 のまま build が成功することを確認するのみで、
+    /// 縮退分岐そのものは踏まない（縮退分岐を実際に踏む検証は直後の
+    /// `i8_precision_falls_back_to_f32_when_scale_underflows` が担う。
+    /// PR #617 codex-review P2 指摘: 本テストのみでは縮退分岐の壊れを
+    /// 検出できない）。
     #[test]
     fn i8_precision_falls_back_to_f32_when_fit_or_encode_fails() {
         let dim = 4usize;
@@ -6354,6 +6371,39 @@ mod tests {
         // このコーパスは常に有限のため通常は I8 のまま。
         assert_eq!(index.resident_precision(), ResidentPrecision::I8);
         let query = gen_corpus(0x0fa1a9, dim, 1);
+        let mut scratch = HnswSearchScratch::default();
+        let hits = index.search(&query, 5, 40, &mut scratch).unwrap();
+        assert!(!hits.is_empty());
+    }
+
+    /// T-I4b: `fit_dim_params` が `Sq8Error::ScaleOutOfRange` を実際に返す
+    /// 入力（次元 0 を非零・かつ f64→f32 丸めでスケールが 0.0 へ
+    /// アンダーフローする極小の定数値へ揃えたもの）を `I8` 指定で build
+    /// すると、`freeze_from` が実際に `F32` 常駐へ縮退し（D6 と同型）、
+    /// `search` はそのまま成功することを固定する（PR #617 codex-review P2
+    /// 指摘対応。上の T-I4 は有限コーパスのみで縮退分岐を一度も踏まないため、
+    /// 本テストで縮退分岐が壊れていないことを直接検証する）。
+    #[test]
+    fn i8_precision_falls_back_to_f32_when_scale_underflows() {
+        let dim = 4usize;
+        let mut vectors = gen_corpus(0x0fa1aa, dim, 30);
+        // f32 の最小正 subnormal（約 1.4e-45）に対し scale = max_abs / 127
+        // が下回るよう、次元 0 を全行同じ極小値へ差し替える（min_d ==
+        // max_d == 1e-44 なので max_abs == 1e-44、scale ≈ 7.9e-47 は f32
+        // へ丸めると 0.0 になる）。
+        for row in vectors.chunks_exact_mut(dim) {
+            row[0] = 1e-44;
+        }
+        let index = HnswIndex::build_with_precision(
+            HnswParams::default(),
+            ResidentPrecision::I8,
+            dim as u32,
+            &vectors,
+            11,
+        )
+        .unwrap();
+        assert_eq!(index.resident_precision(), ResidentPrecision::F32);
+        let query = gen_corpus(0x0fa1ab, dim, 1);
         let mut scratch = HnswSearchScratch::default();
         let hits = index.search(&query, 5, 40, &mut scratch).unwrap();
         assert!(!hits.is_empty());

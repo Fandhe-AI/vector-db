@@ -3047,7 +3047,16 @@ mod tests {
 
         // 索引ヒットの最終スコアは常に f32 アリーナ再計算のため、i8 常駐の
         // 候補生成は探索順序にのみ影響し、返るスコア自体は既定エンジンと
-        // ビット一致する。
+        // ビット一致する。k=10 baseline search を id 突き合わせに使うと、
+        // ANN が（近似探索ゆえに）その baseline の上位 10 件に含まれない
+        // id を返した場合に検証が黙ってスキップされてしまう（PR #617
+        // codex-review P2 指摘）。`slot_ids` は `0..arena.len()` の恒等
+        // 写像（id == arena 上の行インデックス）であることを利用し、
+        // 各 ANN ヒットの期待スコアを baseline の Top-k 集合に頼らず
+        // `arena.vector(id)` から `kernel::dot` で直接算出することで、
+        // 全ヒットが必ず検証される（ID 不在は arena 不変条件違反として
+        // 即座に panic）。`default_provider` を使った k=10 baseline
+        // search 自体は非 vacuous 性（結果が空でないこと）の確認にのみ残す。
         let baseline = default_provider
             .search(crate::kernel::SearchInput {
                 ids: &slot_ids,
@@ -3057,19 +3066,20 @@ mod tests {
                 k: 10,
             })
             .expect("baseline search must succeed");
-        let baseline_by_id: HashMap<u64, f32> =
-            baseline.into_iter().map(|h| (h.id, h.score)).collect();
+        assert!(!baseline.is_empty(), "baseline search must be non-vacuous");
         for hit in &ann_hits {
-            if let Some(&expected) = baseline_by_id.get(&hit.id) {
-                assert_eq!(
-                    hit.score.to_bits(),
-                    expected.to_bits(),
-                    "id={} ann_score={} baseline_score={}",
-                    hit.id,
-                    hit.score,
-                    expected
-                );
-            }
+            let expected_vector = arena
+                .vector(hit.id as usize)
+                .unwrap_or_else(|| panic!("ann hit id={} must exist in arena", hit.id));
+            let expected = crate::kernel::dot(expected_vector, &query);
+            assert_eq!(
+                hit.score.to_bits(),
+                expected.to_bits(),
+                "id={} ann_score={} expected_score={}",
+                hit.id,
+                hit.score,
+                expected
+            );
         }
     }
 

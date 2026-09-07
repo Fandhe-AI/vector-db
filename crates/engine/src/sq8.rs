@@ -65,6 +65,18 @@ pub(crate) enum Sq8Error {
     InvalidShape,
     /// 出力バッファの確保に失敗した（`try_reserve_exact` が `Err`）。
     AllocationFailed,
+    /// `index` 次元目のスケール（f64 で算出した `max(|min|, |max|) / CODE_MAX`
+    /// を f32 へ丸めた値）が境界を保持できなかった（PR #617 codex-review P1
+    /// 指摘）。次の 2 状態のいずれかを指す——(1) 次元の値が非零（`max_abs >
+    /// 0.0`）にもかかわらずスケールが `0.0` へアンダーフローし、
+    /// `quantize_scalar_f64` の `scale == 0.0` 早期リターンにより全コードが
+    /// 消失する、(2) f64→f32 丸めで拡大したスケールを `CODE_MAX`（127）倍
+    /// して復号すると `f32::MAX` を超え `Infinity` になり得る（`dequantize`
+    /// の呼び出し元が `NonFiniteScore` として扱う可能性がある）。いずれも
+    /// D6（`f16.rs` の範囲外縮退）と同型の fail-closed 判定として扱い、
+    /// 呼び出し元（`hnsw.rs::HnswIndex::freeze_from`）はこの次元 1 つでも
+    /// 検出すれば索引全体を `F32` 常駐へ縮退する。
+    ScaleOutOfRange { index: usize },
 }
 
 /// `value / scale` を round-half-away-from-zero で丸め、`[-127, 127]` へ
@@ -121,11 +133,27 @@ pub(crate) fn fit_dim_params(dim: usize, rows: &[f32]) -> Result<Sq8DimParams, S
         }
     }
 
-    let scales = mins
-        .iter()
-        .zip(maxs.iter())
-        .map(|(min_d, max_d)| (min_d.abs().max(max_d.abs()) / CODE_MAX) as f32)
-        .collect();
+    let mut scales = Vec::with_capacity(dim);
+    for (index, (min_d, max_d)) in mins.iter().zip(maxs.iter()).enumerate() {
+        let max_abs = min_d.abs().max(max_d.abs());
+        let scale_f64 = max_abs / CODE_MAX;
+        let scale = scale_f64 as f32;
+        // 非零成分（max_abs > 0.0）なのにスケールが 0.0 へアンダーフローする
+        // と、quantize_scalar_f64 の scale == 0.0 早期リターンで当該次元の
+        // 全コードが 0 に潰れ値が消失する（PR #617 codex-review P1 指摘）。
+        if max_abs > 0.0 && scale == 0.0 {
+            return Err(Sq8Error::ScaleOutOfRange { index });
+        }
+        // f64→f32 丸めでスケールが真値より拡大され得るため、CODE_MAX（127）倍
+        // した復号後の最大値を f64 精度で検算する。f32::MAX を超える場合、
+        // dequantize の f32 乗算（127.0f32 * scale）が Infinity へ丸まり得る
+        // （PR #617 codex-review P1 指摘）。
+        let decoded_max = f64::from(scale) * CODE_MAX;
+        if !decoded_max.is_finite() || decoded_max > f64::from(f32::MAX) {
+            return Err(Sq8Error::ScaleOutOfRange { index });
+        }
+        scales.push(scale);
+    }
     Ok(Sq8DimParams { scales })
 }
 
@@ -337,6 +365,56 @@ mod tests {
             out.iter().any(|&c| c != 0),
             "at least one code must be nonzero for a non-degenerate small-scale corpus"
         );
+    }
+
+    /// 非零値のみを含む次元でも、真のスケール（f64）が f32 の最小正
+    /// subnormal を下回るほど極小だと f64→f32 丸めで 0.0 へ潰れる（PR #617
+    /// codex-review P1 指摘: `scale == 0.0` は `quantize_scalar_f64` の
+    /// 早期リターンにより当該次元の全コードを 0 にし値を消失させる）。
+    /// `fit_dim_params` はこれを `Sq8Error::ScaleOutOfRange` として検出し
+    /// 拒否しなければならない（呼び出し元 `hnsw.rs::freeze_from` は `F32`
+    /// 常駐へ縮退する）。
+    #[test]
+    fn fit_dim_params_rejects_scale_that_underflows_to_zero() {
+        let dim = 2;
+        // 次元 0: 全行 1e-44（非零・f32 subnormal だが scale = 1e-44/127 は
+        // f32 の最小正 subnormal（約 1.4e-45）を下回り 0.0 へ丸まる）。
+        // 次元 1: 通常のスケールで対照。
+        let rows = vec![1e-44f32, 1.0, 1e-44f32, -1.0, 1e-44f32, 0.5];
+        assert_eq!(
+            fit_dim_params(dim, &rows),
+            Err(Sq8Error::ScaleOutOfRange { index: 0 })
+        );
+    }
+
+    /// f64 で算出したスケールを f32 へ丸める際に真値より拡大され得るため、
+    /// `CODE_MAX`（127）倍した復号後の最大値が `f32::MAX` を超えると
+    /// `dequantize` の f32 乗算が `Infinity` へ丸まり得る（PR #617
+    /// codex-review P1 指摘）。`fit_dim_params` はこの次元を
+    /// `Sq8Error::ScaleOutOfRange` として拒否しなければならない。
+    #[test]
+    fn fit_dim_params_rejects_scale_that_overflows_on_decode() {
+        let dim = 1;
+        // 次元の最大絶対値を f32::MAX に設定する。真のスケール
+        // f32::MAX/127（f64 精度）を f32 へ丸めると、丸め方向次第では
+        // 127 倍した復号値が f32::MAX を超え得る。
+        let rows = vec![f32::MAX, -f32::MAX];
+        let result = fit_dim_params(dim, &rows);
+        // 拡大丸めが実際に起きた場合のみ ScaleOutOfRange。丸めが真値
+        // 以下に留まった場合（縮小丸め）は安全なため成功してよい——本テストは
+        // 「成功時に復号が必ず有限であること」を固定する（環境依存の丸め
+        // 方向に左右されない不変条件の検証）。
+        match result {
+            Err(Sq8Error::ScaleOutOfRange { index: 0 }) => {}
+            Ok(params) => {
+                let decoded = dequantize(127, params.scales()[0]);
+                assert!(
+                    decoded.is_finite(),
+                    "accepted scale must decode without overflowing to Infinity"
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[test]
