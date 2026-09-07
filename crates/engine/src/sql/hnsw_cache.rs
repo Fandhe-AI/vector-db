@@ -1472,7 +1472,9 @@ pub(crate) fn search_prepared_resumable(
     // 縮退なし（`finish_indexed_search` が `fell_back` を立てずに完走した）で
     // 再開経路（`resume` が `Some` だった側）を通ったラウンドのみ計上する
     // （診断用カウンタ。§`HnswIndexCacheStats::hybrid_resumed_rounds`）。
-    if used_resume && !fell_back.get() {
+    // `result` がエラーの場合（codex-review P2 指摘）は「縮退なしで完走」の
+    // 契約を満たさないため、`fell_back` が立っていなくても計上しない。
+    if used_resume && !fell_back.get() && result.is_ok() {
         access
             .cache
             .hybrid_resumed_rounds

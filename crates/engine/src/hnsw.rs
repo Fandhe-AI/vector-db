@@ -3606,6 +3606,28 @@ impl HnswIndex {
             return Ok((Vec::new(), state));
         };
 
+        // I8 常駐（Issue #522）の候補生成は、このクエリの二重量子化
+        // （`crate::sq8::prepare_query`）を `search_masked_with_hop` と同様に
+        // 呼び出し 1 回につき 1 回だけ準備する（`hnsw::i8_query::
+        // PreparedI8Source`）。準備を怠り `self.vectors`（`NodeVectors::score`）
+        // を直接使うと、I8 索引で本経路（resumable）だけが
+        // `search_masked_with_hop` と異なる（毎回デクォンタイズする）ビームを
+        // 辿り、ラウンド 1 のビット同一契約が崩れうる（Cursor Bugbot 指摘）。
+        // F32／F16 常駐、または `prepare_query` の失敗時は既存の
+        // `NodeVectors::score`（`&self.vectors`）をそのまま使う。
+        let prepared_i8;
+        let source: &dyn NodeSource = if let NodeVectors::I8 {
+            codes,
+            params,
+            row_sums,
+        } = &self.vectors
+        {
+            prepared_i8 = i8_query::PreparedI8Source::new(codes, row_sums, params, query);
+            &prepared_i8
+        } else {
+            &self.vectors
+        };
+
         // 起点解決は `Self::search_masked_with_hop` と同一ロジック
         // （§関数ドキュメンテーションコメント参照）。
         let (mut nearest, effective_top, checked_entry) = match mask {
@@ -3621,17 +3643,11 @@ impl HnswIndex {
         };
         if effective_top > 0 {
             for l in (1..=effective_top).rev() {
-                nearest = match self.greedy_descend_masked(
-                    nearest,
-                    query,
-                    l,
-                    dim_usize,
-                    &self.vectors,
-                    mask,
-                )? {
-                    Some(n) => n,
-                    None => return Ok((Vec::new(), state)),
-                };
+                nearest =
+                    match self.greedy_descend_masked(nearest, query, l, dim_usize, source, mask)? {
+                        Some(n) => n,
+                        None => return Ok((Vec::new(), state)),
+                    };
             }
         }
 
@@ -3643,9 +3659,9 @@ impl HnswIndex {
 
         let ef_eff = ef.max(k);
         for ep in level0_entry_points {
-            self.resumable_offer_entry(&mut state, ep, query, mask, dim_usize)?;
+            self.resumable_offer_entry(&mut state, ep, query, mask, dim_usize, source)?;
         }
-        self.resumable_run(&mut state, query, mask, dim_usize, ef_eff)?;
+        self.resumable_run(&mut state, query, mask, dim_usize, ef_eff, source)?;
         state.last_ef = ef_eff;
         let out = resumable_snapshot(&state, k);
         Ok((out, state))
@@ -3752,7 +3768,24 @@ impl HnswIndex {
             state.in_candidates.mark_visited(idx);
         }
 
-        self.resumable_run(state, query, mask, dim_usize, ef_eff)?;
+        // I8 常駐（Issue #522）: `search_masked_resumable_start` と同様、
+        // この呼び出し 1 回につき 1 回だけクエリを二重量子化して隣接探索
+        // 全体で共有する（Cursor Bugbot 指摘。§`search_masked_resumable_start`
+        // ドキュメンテーションコメント参照）。
+        let prepared_i8;
+        let source: &dyn NodeSource = if let NodeVectors::I8 {
+            codes,
+            params,
+            row_sums,
+        } = &self.vectors
+        {
+            prepared_i8 = i8_query::PreparedI8Source::new(codes, row_sums, params, query);
+            &prepared_i8
+        } else {
+            &self.vectors
+        };
+
+        self.resumable_run(state, query, mask, dim_usize, ef_eff, source)?;
         state.last_ef = ef_eff;
         Ok(resumable_snapshot(state, k))
     }
@@ -3761,6 +3794,7 @@ impl HnswIndex {
     /// ループと同一ロジック——`worst_ok` 判定・`results` 容量による追い出しは
     /// 行わない。entry point は通常 1〜2 点のみのため、この非対称は元実装
     /// からそのまま引き継ぐビット同一契約の一部）。
+    #[allow(clippy::too_many_arguments)]
     fn resumable_offer_entry(
         &self,
         state: &mut ResumableMaskedSearch,
@@ -3768,6 +3802,7 @@ impl HnswIndex {
         query: &[f32],
         mask: Option<&NodeMask>,
         dim: usize,
+        vectors: &dyn NodeSource,
     ) -> Result<(), HnswError> {
         match state.visited.mark_visited(node as usize) {
             Some(true) => return Ok(()),
@@ -3778,7 +3813,7 @@ impl HnswIndex {
         if !is_accepted {
             return Ok(());
         }
-        let score = self.vectors.score(dim, node, query)?;
+        let score = vectors.score(dim, node, query)?;
         let scored = ScoredNode { node, score };
         state.candidates.push(scored);
         state.in_candidates.mark_visited(node as usize);
@@ -3793,6 +3828,7 @@ impl HnswIndex {
     /// 正しさの保証範囲」参照）。`candidates` から pop したノードが既に
     /// [`ResumableMaskedSearch::expanded`] 済みの場合（候補復帰による重複
     /// push）は隣接走査せず読み捨てる。
+    #[allow(clippy::too_many_arguments)]
     fn resumable_run(
         &self,
         state: &mut ResumableMaskedSearch,
@@ -3800,6 +3836,7 @@ impl HnswIndex {
         mask: Option<&NodeMask>,
         dim: usize,
         ef_eff: usize,
+        vectors: &dyn NodeSource,
     ) -> Result<(), HnswError> {
         let is_accepted = |node: u32| mask.map(|m| m.get(node)).unwrap_or(true);
         loop {
@@ -3838,7 +3875,7 @@ impl HnswIndex {
                     // コメント参照。呼び出し元が `hop == TwoHop` を拒否する）。
                     continue;
                 }
-                let neighbor_score = self.vectors.score(dim, neighbor, query)?;
+                let neighbor_score = vectors.score(dim, neighbor, query)?;
                 let scored = ScoredNode {
                     node: neighbor,
                     score: neighbor_score,
@@ -7331,6 +7368,94 @@ mod tests {
                     expected,
                     actual,
                     "ef={ef} mask_some={} でラウンド 1 がビット同一でない",
+                    mask_opt.is_some()
+                );
+            }
+        }
+    }
+
+    /// I8 常駐（Issue #522）で再開型経路が `search_masked_with_hop` と
+    /// 異なるビームを辿らないことを固定する（Cursor Bugbot 指摘・PR #619
+    /// レビュー）。再開型経路（`search_masked_resumable_start`／
+    /// `search_masked_resume`）がクエリの二重量子化
+    /// （`hnsw::i8_query::PreparedI8Source`）を使わず `NodeVectors::score`
+    /// の毎回デクォンタイズ経路のままだと、I8 索引でだけ両経路のスコア・
+    /// 展開順が食い違い、ラウンド 1 の出力がビット同一でなくなり得た
+    /// （ラウンド 1 のビット同一は `F32` 版と同じく契約——
+    /// `resumable_start_matches_search_masked_bit_identical` 参照。
+    /// 2 ラウンド目以降の厳密一致は本フィクスチャでの実測固定であり、
+    /// 一般契約として保証されるのは「ラウンド 1」と「exhaustive 終了時」の
+    /// みである。§`docs/design/hnsw-hybrid-iterative-scan.md`「決定性契約」節）。
+    #[test]
+    fn resumable_i8_precision_matches_search_masked_with_hop_bit_identical_across_rounds() {
+        let dim = 8usize;
+        let vectors = gen_corpus(41, dim, 300);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+        };
+        let index =
+            HnswIndex::build_with_precision(params, ResidentPrecision::I8, dim as u32, &vectors, 6)
+                .unwrap();
+        assert_eq!(index.resident_precision(), ResidentPrecision::I8);
+        let query = gen_corpus(4001, dim, 1);
+
+        let mut mask = NodeMask::new(300);
+        for i in 0..300u32 {
+            if i % 3 == 0 {
+                mask.set(i);
+            }
+        }
+
+        for mask_opt in [None, Some(&mask)] {
+            // ラウンド 1: `search_masked_resumable_start` が
+            // `search_masked_with_hop` とビット同一であること。
+            let mut scratch = HnswSearchScratch::default();
+            let expected_round1 = index
+                .search_masked_with_hop(
+                    &query,
+                    10,
+                    10,
+                    mask_opt,
+                    DEFAULT_SPARSE_VISITED_MAX,
+                    HopMode::OneHop,
+                    &mut scratch,
+                )
+                .unwrap();
+            let (actual_round1, mut state) = index
+                .search_masked_resumable_start(&query, 10, 10, mask_opt, HopMode::OneHop)
+                .unwrap();
+            assert_eq!(
+                expected_round1,
+                actual_round1,
+                "I8 常駐でラウンド 1 がビット同一でない（mask_some={}）",
+                mask_opt.is_some()
+            );
+
+            // ラウンド 2 以降（`search_masked_resume`）も、同じ ef で
+            // `search_masked_with_hop` を単発呼び出した結果とビット同一で
+            // あること（`resumable_run`／`resumable_offer_entry` の
+            // 隣接探索本体が I8 索引でも準備済みクエリを使うことの検証）。
+            for &ef in &[20usize, 40] {
+                let expected = index
+                    .search_masked_with_hop(
+                        &query,
+                        10,
+                        ef,
+                        mask_opt,
+                        DEFAULT_SPARSE_VISITED_MAX,
+                        HopMode::OneHop,
+                        &mut scratch,
+                    )
+                    .unwrap();
+                let actual = index
+                    .search_masked_resume(&mut state, &query, 10, ef, mask_opt)
+                    .unwrap();
+                assert_eq!(
+                    expected,
+                    actual,
+                    "I8 常駐で ef={ef} のラウンドがビット同一でない（mask_some={}）",
                     mask_opt.is_some()
                 );
             }
