@@ -277,10 +277,77 @@ required_segments_for() {
     # 同様に独立シンボルとして生成される）を必須シンボルへ追加する。
     echo "19dot_block4_avx2_fma"
     echo "17dot_block4_avx512"
+    # Issue #514: f16 昇格 dot カーネル（`isa::dot_f16_f16c`）。
+    echo "12dot_f16_f16c"
   else
     echo "10SimdKernel20dot_with_scalar_tail"
     echo "10SimdKernel20dot_with_padded_tail"
+    # Issue #514: f16 昇格 dot カーネル（`isa::dot_f16_neon_fp16`）。
+    # `#[inline(never)]` を付与しているため独立シンボルとして必ず現れる。
+    echo "17dot_f16_neon_fp16"
   fi
+}
+
+# 非 vacuous 検査（決定 2・Issue #514・A1）: 「期待命令が対象関数に 1 件以上
+# 出現する」ことを要求する rule 表。禁止命令検査（`scan_forbidden`）が
+# 「あってはならない命令」を検査するのに対し、本関数は「無ければならない
+# 命令」を検査する——f16 カーネルは `set` 構築が実際に intrinsics へ
+# コンパイルされたことの証跡（`vcvtph2ps`／`fcvtl`）を要求しないと、
+# ソフトウェア復号へ静かに縮退していても検査を通過してしまう
+# （`--self-test` の fail fixture 参照）。
+#
+# 出力は「関数名セグメント<TAB>期待正規表現（拡張正規表現。命令行全体に
+# 対して `grep -E` で照合）<TAB>説明」を 1 行 1 rule で返す。対象関数
+# セグメントに一致する関数が 1 つも無ければ本検査は素通り
+# （`required_segments_for` の必須シンボル検査が既にその欠落を検出する）。
+expected_rules_for() {
+  local arch_class="$1"
+  if [ "${arch_class}" = "x86_64" ]; then
+    printf '%s\t%s\t%s\n' \
+      "dot_f16_f16c" \
+      '^[[:space:]]*vcvtph2ps[[:space:]]+[^,]*\(' \
+      "f16->f32 promotion (vcvtph2ps) with a memory operand (register-only form does not count)"
+  else
+    printf '%s\t%s\t%s\n' \
+      "dot_f16_neon_fp16" \
+      '^[[:space:]]*fcvtl2?[[:space:]]+v[0-9]+\.4s' \
+      "f16->f32 promotion (fcvtl/fcvtl2 widening to 4s)"
+  fi
+}
+
+# `fn_name`（1 関数）が `expected_rules_for` の対象か判定し、対象なら
+# `fn_body`（命令行。\x03 区切り）に期待パターンが 1 件以上出現するかを検査
+# する。対象外の関数は常に成功（0）。一致なしは非ゼロ・理由を stdout へ
+# 1 行（`scan_forbidden` と同様、行番号は付けない）。
+scan_expected_missing() {
+  local arch_class="$1"
+  local fn_name="$2"
+  local fn_body="$3"
+
+  local rules
+  rules="$(expected_rules_for "${arch_class}")"
+  local rule
+  while IFS=$'\t' read -r seg pattern desc; do
+    [ -z "${seg}" ] && continue
+    case "${fn_name}" in
+      *"${seg}"*) ;;
+      *) continue ;;
+    esac
+    local IFS_OLD="${IFS}"
+    IFS=$'\x03'
+    local found=1
+    local line
+    for line in ${fn_body}; do
+      if echo "${line}" | grep -Eq "${pattern}"; then
+        found=0
+        break
+      fi
+    done
+    IFS="${IFS_OLD}"
+    if [ "${found}" -ne 0 ]; then
+      echo "${desc}"
+    fi
+  done <<< "${rules}"
 }
 
 # 生成済み `.s` を対象に、module_segment 配下の関数群を検査する共通本体。
@@ -352,6 +419,17 @@ run_scan() {
     if [ -n "${forbidden}" ]; then
       echo "ERROR: forbidden per-element insert instruction(s) found in ${fn_name}:" >&2
       echo "${forbidden}" | while IFS= read -r item; do echo "  - ${item}"; done >&2
+      status=1
+      continue
+    fi
+
+    local missing
+    missing="$(scan_expected_missing "${arch_class}" "${fn_name}" "${fn_body}")" || true
+    if [ -n "${missing}" ]; then
+      echo "${missing}" | while IFS= read -r item; do
+        [ -z "${item}" ] && continue
+        echo "ERROR: expected instruction missing in ${fn_name}: ${item}" >&2
+      done
       status=1
       continue
     fi
@@ -532,6 +610,67 @@ pub mod isa_probe {
     }
 }
 RUST
+
+  # pass (Issue #514・A1): `isa.rs::dot_f16_f16c` と同型の実装。メモリ
+  # オペランド付き `vcvtph2ps` を期待する非 vacuous 検査（`expected_rules_for`）
+  # が実際に pass することを確認する。
+  cat > "${dir}/fx_pass_f16.rs" <<'RUST'
+use std::arch::x86_64::*;
+
+pub mod isa_probe {
+    use super::*;
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub fn dot_f16_f16c(a: &[u16], b: &[f32]) -> f32 {
+        let len = a.len().min(b.len());
+        let (a_chunks, _a_rem) = a[..len].as_chunks::<8>();
+        let (b_chunks, _b_rem) = b[..len].as_chunks::<8>();
+        let mut acc = _mm256_setzero_ps();
+        for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
+            let va16 = _mm_set_epi16(
+                ac[7] as i16, ac[6] as i16, ac[5] as i16, ac[4] as i16,
+                ac[3] as i16, ac[2] as i16, ac[1] as i16, ac[0] as i16,
+            );
+            let va = _mm256_cvtph_ps(va16);
+            let vb = _mm256_set_ps(bc[7], bc[6], bc[5], bc[4], bc[3], bc[2], bc[1], bc[0]);
+            acc = _mm256_fmadd_ps(va, vb, acc);
+        }
+        let lo = _mm256_castps256_ps128(acc);
+        let hi = _mm256_extractf128_ps(acc, 1);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_shuffle_ps(sum128, sum128, 0b01_00_11_10);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_shuffle_ps(sums, sums, 0b00_00_00_01);
+        let final_sum = _mm_add_ss(sums, shuf2);
+        _mm_cvtss_f32(final_sum)
+    }
+}
+RUST
+
+  # fail (Issue #514・A1): 関数名は `dot_f16_f16c` だが実体はソフトウェア復号
+  # のみ（`vcvtph2ps` を一切使わない）。非 vacuous 検査が「命令が存在しない
+  # 縮退」を実際に検出できることを確認する（禁止命令検査は素通りしてしまう
+  # ケースへの対照）。
+  cat > "${dir}/fx_fail_f16_missing_instruction.rs" <<'RUST'
+pub mod isa_probe {
+    #[inline(never)]
+    pub fn dot_f16_f16c(a: &[u16], b: &[f32]) -> f32 {
+        let len = a.len().min(b.len());
+        let mut acc = 0f32;
+        for (&bits, &y) in a[..len].iter().zip(b[..len].iter()) {
+            let sign = ((bits & 0x8000) as u32) << 16;
+            let exp = ((bits >> 10) & 0x1F) as u32;
+            let mantissa = (bits & 0x03FF) as u32;
+            let bits32 = if exp == 0 {
+                sign
+            } else {
+                sign | (((exp as i32 - 15 + 127) as u32) << 23) | (mantissa << 13)
+            };
+            acc += f32::from_bits(bits32) * y;
+        }
+        acc
+    }
+}
+RUST
 }
 
 write_aarch64_fixtures() {
@@ -600,6 +739,64 @@ pub mod isa_probe {
     }
 }
 RUST
+
+  # pass (Issue #514・A1): `isa.rs::dot_f16_neon_fp16` と同型の実装。
+  # `fcvtl` へ畳み込まれる f16 昇格を要求する非 vacuous 検査が実際に pass
+  # することを確認する。
+  cat > "${dir}/fx_pass_f16.rs" <<'RUST'
+use std::arch::aarch64::*;
+
+pub mod isa_probe {
+    use super::*;
+    #[target_feature(enable = "neon,fp16")]
+    pub fn dot_f16_neon_fp16(a: &[u16], b: &[f32]) -> f32 {
+        let len = a.len().min(b.len());
+        let (a_chunks, _a_rem) = a[..len].as_chunks::<4>();
+        let (b_chunks, _b_rem) = b[..len].as_chunks::<4>();
+        let mut acc = vdupq_n_f32(0.0);
+        for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
+            let mut vh_u16 = vdup_n_u16(0);
+            vh_u16 = vset_lane_u16(ac[0], vh_u16, 0);
+            vh_u16 = vset_lane_u16(ac[1], vh_u16, 1);
+            vh_u16 = vset_lane_u16(ac[2], vh_u16, 2);
+            vh_u16 = vset_lane_u16(ac[3], vh_u16, 3);
+            let va = vcvt_f32_f16(vreinterpret_f16_u16(vh_u16));
+
+            let mut vb = vdupq_n_f32(0.0);
+            vb = vsetq_lane_f32(bc[0], vb, 0);
+            vb = vsetq_lane_f32(bc[1], vb, 1);
+            vb = vsetq_lane_f32(bc[2], vb, 2);
+            vb = vsetq_lane_f32(bc[3], vb, 3);
+            acc = vfmaq_f32(acc, va, vb);
+        }
+        vaddvq_f32(acc)
+    }
+}
+RUST
+
+  # fail (Issue #514・A1): 関数名は `dot_f16_neon_fp16` だが実体はソフトウェア
+  # 復号のみ（`fcvtl` を一切使わない）。
+  cat > "${dir}/fx_fail_f16_missing_instruction.rs" <<'RUST'
+pub mod isa_probe {
+    #[inline(never)]
+    pub fn dot_f16_neon_fp16(a: &[u16], b: &[f32]) -> f32 {
+        let len = a.len().min(b.len());
+        let mut acc = 0f32;
+        for (&bits, &y) in a[..len].iter().zip(b[..len].iter()) {
+            let sign = ((bits & 0x8000) as u32) << 16;
+            let exp = ((bits >> 10) & 0x1F) as u32;
+            let mantissa = (bits & 0x03FF) as u32;
+            let bits32 = if exp == 0 {
+                sign
+            } else {
+                sign | (((exp as i32 - 15 + 127) as u32) << 23) | (mantissa << 13)
+            };
+            acc += f32::from_bits(bits32) * y;
+        }
+        acc
+    }
+}
+RUST
 }
 
 self_test() {
@@ -662,6 +859,27 @@ self_test() {
         echo "self-test ok: fail_missing_symbol correctly rejected"
       fi
     fi
+
+    # Issue #514・A1: 期待命令の非 vacuous 検査（`expected_rules_for`）。
+    asm="$(compile_fixture "${scratch}/pass_f16" "${scratch}/fx_pass_f16.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" x86_64 "isa_probe" "12dot_f16_f16c" >/dev/null; then
+        echo "self-test ok: pass_f16 (vcvtph2ps memory-operand promotion present)"
+      else
+        echo "self-test FAILED: expected pass_f16 to pass" >&2
+        overall=1
+      fi
+    fi
+
+    asm="$(compile_fixture "${scratch}/fail_f16_missing_instruction" "${scratch}/fx_fail_f16_missing_instruction.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" x86_64 "isa_probe" "12dot_f16_f16c" >/dev/null 2>&1; then
+        echo "self-test FAILED: expected fail_f16_missing_instruction to be rejected (no vcvtph2ps)" >&2
+        overall=1
+      else
+        echo "self-test ok: fail_f16_missing_instruction correctly rejected"
+      fi
+    fi
   else
     write_aarch64_fixtures "${scratch}"
 
@@ -683,6 +901,27 @@ self_test() {
         overall=1
       else
         echo "self-test ok: fail_lane_stride correctly rejected"
+      fi
+    fi
+
+    # Issue #514・A1: 期待命令の非 vacuous 検査（`expected_rules_for`）。
+    asm="$(compile_fixture "${scratch}/pass_f16" "${scratch}/fx_pass_f16.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" aarch64 "isa_probe" "17dot_f16_neon_fp16" >/dev/null; then
+        echo "self-test ok: pass_f16 (fcvtl widening promotion present)"
+      else
+        echo "self-test FAILED: expected pass_f16 to pass" >&2
+        overall=1
+      fi
+    fi
+
+    asm="$(compile_fixture "${scratch}/fail_f16_missing_instruction" "${scratch}/fx_fail_f16_missing_instruction.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" aarch64 "isa_probe" "17dot_f16_neon_fp16" >/dev/null 2>&1; then
+        echo "self-test FAILED: expected fail_f16_missing_instruction to be rejected (no fcvtl)" >&2
+        overall=1
+      else
+        echo "self-test ok: fail_f16_missing_instruction correctly rejected"
       fi
     fi
   fi

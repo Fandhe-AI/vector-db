@@ -220,6 +220,7 @@ pub mod dictionary;
 pub mod dispatch;
 pub mod embedding;
 pub mod error_format;
+pub(crate) mod f16;
 pub mod gpu_batch;
 pub mod hnsw;
 pub mod hybrid;
