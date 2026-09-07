@@ -168,6 +168,12 @@ pub struct HnswIndexCacheStats {
     /// f16 の有限範囲（`|x| <= 65504.0`）を超える成分により `F32` へ自動縮退した
     /// 回数（Issue #514・D6。`builds` の内数）。
     pub f16_residency_fallbacks: u64,
+    /// `IndexedBase::build` が `ResidentPrecision::I8` を要求されたにもかかわらず
+    /// `sq8::fit_dim_params`／`sq8::encode_rows` の失敗（非有限成分・アロケーション
+    /// 失敗）により `F32` へ自動縮退した回数（Issue #521・D6 と同型。`builds`
+    /// の内数。`f16_residency_fallbacks` とは互いに排他——`precision` は
+    /// 1 クエリあたり単一の値のため両方が同時に加算されることはない）。
+    pub i8_residency_fallbacks: u64,
     /// マスク付き探索（`FullVisible`／`Subset` いずれの形状でも。
     /// [`crate::hnsw::HnswIndex::search_masked_with`]）が縮退なしで完走した際、
     /// 可視候補数が `ValidatedHnswParams::sparse_visited_max` 未満で
@@ -214,17 +220,19 @@ impl IndexedBase {
     /// [`crate::hnsw::HnswIndex::build_parallel`] で構築する。索引ノード番号は
     /// `arena` のスロット番号と一致する（構築直後の世代においては
     /// `slot_of_node[node] == node` が常に成立する）。
-    /// `precision` は Issue #514 で追加した常駐精度 opt-in（既定 `F32`）。戻り値の
-    /// `bool` は「要求 `F16` が範囲外成分により `F32` へ自動縮退したか」
-    /// （D6。呼び出し元が `HnswIndexCacheStats::f16_residency_fallbacks` へ計上する
-    /// ために使う）。
+    /// `precision` は Issue #514（F16）・Issue #521（I8）で追加した常駐精度
+    /// opt-in（既定 `F32`）。戻り値の `bool` 2 つはそれぞれ「要求 `F16`／`I8`
+    /// が範囲外成分・非有限成分等により `F32` へ自動縮退したか」（D6。呼び出し元が
+    /// `HnswIndexCacheStats::f16_residency_fallbacks`／`i8_residency_fallbacks`
+    /// へ計上するために使う。`precision` は 1 クエリあたり単一の値のため両方が
+    /// 同時に `true` になることはない）。
     fn build(
         arena: &VectorArena,
         params: crate::hnsw::HnswParams,
         precision: crate::hnsw::ResidentPrecision,
         built_ctx: PolicyContext,
         built_table_generation: u64,
-    ) -> Result<(Self, bool), HnswError> {
+    ) -> Result<(Self, bool, bool), HnswError> {
         let index = HnswIndex::build_parallel_with_precision(
             params,
             precision,
@@ -233,6 +241,8 @@ impl IndexedBase {
             HNSW_BUILD_SEED,
         )?;
         let f16_fallback = precision == crate::hnsw::ResidentPrecision::F16
+            && index.resident_precision() == crate::hnsw::ResidentPrecision::F32;
+        let i8_fallback = precision == crate::hnsw::ResidentPrecision::I8
             && index.resident_precision() == crate::hnsw::ResidentPrecision::F32;
         let mut node_keys: Vec<RowKey> = Vec::with_capacity(arena.len());
         let mut key_to_node: HashMap<RowKey, u32> = HashMap::with_capacity(arena.len());
@@ -257,6 +267,7 @@ impl IndexedBase {
                 built_table_generation,
             },
             f16_fallback,
+            i8_fallback,
         ))
     }
 
@@ -614,6 +625,7 @@ pub(crate) struct HnswIndexCache {
     hybrid_queries: AtomicU64,
     hybrid_rounds_max: AtomicU64,
     f16_residency_fallbacks: AtomicU64,
+    i8_residency_fallbacks: AtomicU64,
     sparse_visited_searches: AtomicU64,
     acorn_searches: AtomicU64,
     acorn_expansions: AtomicU64,
@@ -654,6 +666,7 @@ impl HnswIndexCache {
             hybrid_queries: AtomicU64::new(0),
             hybrid_rounds_max: AtomicU64::new(0),
             f16_residency_fallbacks: AtomicU64::new(0),
+            i8_residency_fallbacks: AtomicU64::new(0),
             sparse_visited_searches: AtomicU64::new(0),
             acorn_searches: AtomicU64::new(0),
             acorn_expansions: AtomicU64::new(0),
@@ -965,6 +978,7 @@ impl HnswIndexCache {
             hybrid_queries: self.hybrid_queries.load(Ordering::Relaxed),
             hybrid_rounds_max: self.hybrid_rounds_max.load(Ordering::Relaxed),
             f16_residency_fallbacks: self.f16_residency_fallbacks.load(Ordering::Relaxed),
+            i8_residency_fallbacks: self.i8_residency_fallbacks.load(Ordering::Relaxed),
             sparse_visited_searches: self.sparse_visited_searches.load(Ordering::Relaxed),
             acorn_searches: self.acorn_searches.load(Ordering::Relaxed),
             acorn_expansions: self.acorn_expansions.load(Ordering::Relaxed),
@@ -1078,11 +1092,17 @@ pub(crate) fn prepare_full_visible(
                 ctx.clone(),
                 current_generation,
             ) {
-                Ok((built, f16_fallback)) => {
+                Ok((built, f16_fallback, i8_fallback)) => {
                     if f16_fallback {
                         access
                             .cache
                             .f16_residency_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    if i8_fallback {
+                        access
+                            .cache
+                            .i8_residency_fallbacks
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     access.cache.record_base(access.storage, table, built)
@@ -1129,11 +1149,17 @@ pub(crate) fn prepare_full_visible(
             ctx.clone(),
             current_generation,
         ) {
-            Ok((built, f16_fallback)) => {
+            Ok((built, f16_fallback, i8_fallback)) => {
                 if f16_fallback {
                     access
                         .cache
                         .f16_residency_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if i8_fallback {
+                    access
+                        .cache
+                        .i8_residency_fallbacks
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 access.cache.rebuilds.fetch_add(1, Ordering::Relaxed);
@@ -3168,6 +3194,146 @@ mod tests {
                     expected
                 );
             }
+        }
+    }
+
+    /// Issue #521: I8（SQ8）常駐 opt-in（`ValidatedHnswParams::
+    /// with_resident_precision(I8)`）で `IndexedBase::build` が実際に索引
+    /// 探索へ到達し（非 vacuous）、`i8_residency_fallbacks == 0` であることを
+    /// 確認する。加えて各ヒットのスコアが既定エンジン（f32 brute-force）の
+    /// 同 id のスコアと `to_bits()` 一致すること（索引ヒットの最終スコアは
+    /// 常に `kernel::dot` による f32 アリーナ再計算）を固定する
+    /// （f16 版 `f16_resident_precision_hits_the_ann_path_and_matches_
+    /// default_engine_scores_exactly` と同型）。
+    #[test]
+    fn i8_resident_precision_hits_the_ann_path_and_matches_default_engine_scores_exactly() {
+        let path = unique_db_path("hnsw-cache-i8-resident");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let c = ctx("tenant-a");
+
+        let embeddings: Vec<[f32; 4]> = (0..MIN_INDEXED_ROWS)
+            .map(|i| {
+                [
+                    (i as f32) * 0.001,
+                    ((i * 7) % 997) as f32 * 0.001,
+                    ((i * 13) % 991) as f32 * 0.001,
+                    ((i * 29) % 983) as f32 * 0.001,
+                ]
+            })
+            .collect();
+        let rows: Vec<(u64, RowInput<'_>)> = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                (
+                    i as u64,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: e.as_slice(),
+                        metadata: &[],
+                    },
+                )
+            })
+            .collect();
+        let op_id = crate::recovery::required_op_id::OperationId::parse("hnsw-cache-i8-resident")
+            .expect("valid operation_id");
+        crate::tenant::insert_rows(&storage, "docs", &c, &rows, &op_id).expect("bulk insert");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        assert!(arena.len() >= MIN_INDEXED_ROWS);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+
+        let cache = HnswIndexCache::new();
+        let i8_params = crate::hnsw::ValidatedHnswParams::default()
+            .with_resident_precision(crate::hnsw::ResidentPrecision::I8);
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(i8_params),
+        };
+        let ann_provider = crate::kernel::CpuScalarProvider;
+        let default_provider = crate::kernel::CpuScalarProvider;
+        let query = [0.5, 0.25, 0.1, 0.9];
+
+        // 1 回目（Miss -> build）・2 回目（Ready）の双方が成功すること。
+        let first = search_or_fallback(
+            &access,
+            &read_txn,
+            "docs",
+            &c,
+            &arena,
+            &slot_ids,
+            &ann_provider,
+            &query,
+            10,
+        )
+        .expect("warm-up query (Miss -> build) should succeed");
+        let ann_hits = search_or_fallback(
+            &access,
+            &read_txn,
+            "docs",
+            &c,
+            &arena,
+            &slot_ids,
+            &ann_provider,
+            &query,
+            10,
+        )
+        .expect("second query (Ready) should succeed");
+        assert!(!first.is_empty());
+        assert!(!ann_hits.is_empty(), "non-vacuous: must return hits");
+
+        let stats = cache.stats();
+        assert!(
+            stats.hits >= 1,
+            "I8 resident precision must still reach the indexed ANN search path \
+             (Ready + non-degraded), got stats={stats:?}"
+        );
+        assert_eq!(
+            stats.i8_residency_fallbacks, 0,
+            "embeddings in this fixture are finite and must not trigger the F32 \
+             fallback (D6 と同型。Issue #521)"
+        );
+
+        // 索引ヒットの最終スコアは常に f32 アリーナ再計算のため、i8 常駐の
+        // 候補生成は探索順序にのみ影響し、返るスコア自体は既定エンジンと
+        // ビット一致する。k=10 baseline search を id 突き合わせに使うと、
+        // ANN が（近似探索ゆえに）その baseline の上位 10 件に含まれない
+        // id を返した場合に検証が黙ってスキップされてしまう（PR #617
+        // codex-review P2 指摘）。`slot_ids` は `0..arena.len()` の恒等
+        // 写像（id == arena 上の行インデックス）であることを利用し、
+        // 各 ANN ヒットの期待スコアを baseline の Top-k 集合に頼らず
+        // `arena.vector(id)` から `kernel::dot` で直接算出することで、
+        // 全ヒットが必ず検証される（ID 不在は arena 不変条件違反として
+        // 即座に panic）。`default_provider` を使った k=10 baseline
+        // search 自体は非 vacuous 性（結果が空でないこと）の確認にのみ残す。
+        let baseline = default_provider
+            .search(crate::kernel::SearchInput {
+                ids: &slot_ids,
+                vectors: arena.vectors(),
+                dim: arena.dim(),
+                query: &query,
+                k: 10,
+            })
+            .expect("baseline search must succeed");
+        assert!(!baseline.is_empty(), "baseline search must be non-vacuous");
+        for hit in &ann_hits {
+            let expected_vector = arena
+                .vector(hit.id as usize)
+                .unwrap_or_else(|| panic!("ann hit id={} must exist in arena", hit.id));
+            let expected = crate::kernel::dot(expected_vector, &query);
+            assert_eq!(
+                hit.score.to_bits(),
+                expected.to_bits(),
+                "id={} ann_score={} expected_score={}",
+                hit.id,
+                hit.score,
+                expected
+            );
         }
     }
 
