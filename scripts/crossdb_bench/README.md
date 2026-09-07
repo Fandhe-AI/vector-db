@@ -75,6 +75,20 @@ CROSSDB_PG_PORT=25433 scripts/crossdb_bench/containers.sh up pgvector
 CROSSDB_PG_PORT=25433 python scripts/crossdb_bench/run.py --db pgvector --config exact ...
 ```
 
+### 環境変数（self が起動するバイナリの上書き）
+
+`--db self` は既定で `target/release/wire-server`（リポジトリルート基準）を
+子プロセスとして起動する。環境変数 `CROSSDB_SELF_BINARY` を設定すると、
+別の場所にビルドしたバイナリを起動できる（別コミット・別 `CARGO_TARGET_DIR`
+の before/after バイナリを交互起動する前後比較計測向け。Issue #479）。
+未設定時は既定パスのまま（後方互換）。設定した場合に限り、指定パスが
+存在しなければ起動前に `FileNotFoundError` で拒否する（fail-closed）。
+
+```bash
+CROSSDB_SELF_BINARY=/tmp/wt-before/target-before/release/wire-server \
+  python scripts/crossdb_bench/run.py --db self --config exact ...
+```
+
 ### 環境変数（コンテナ名）
 
 `containers.sh` が起動する各コンテナの名前は既定で `bench-<db>` 固定だが、

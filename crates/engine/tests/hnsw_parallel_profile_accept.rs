@@ -12,11 +12,14 @@ mod harness;
 
 use std::time::Duration;
 
-use engine::hnsw::{HnswBuildProfile, HnswWorkerStats};
+use engine::hnsw::{HnswBuildProfile, HnswRepairLevelStats, HnswRepairStats, HnswWorkerStats};
 use harness::hnsw_parallel_profile::{
-    aggregate_lock_blocked_ratio, aggregate_lock_wait, lock_wait_share, measured_tail,
-    median_duration, min_median_max_duration, min_median_max_u64, parallel_vs_control_ceiling,
-    pick_representative, render_memory_line, serial_share, speedup, total_entry_promotions,
+    aggregate_lock_blocked_ratio, aggregate_lock_wait, format_per_level, lock_wait_share,
+    measured_tail, median_duration, min_median_max_duration, min_median_max_u64,
+    parallel_vs_control_ceiling, pick_representative, render_memory_line, repair_phase1_cap_hits,
+    repair_phase_wall_sum, repair_total_phase1_iterations, repair_total_phase2_nodes,
+    repair_total_unreachable, repair_unreachable_per_level_min_med_max, repair_wall_gap,
+    serial_share, speedup, total_entry_promotions,
 };
 
 // --- median_duration ---
@@ -362,4 +365,112 @@ fn render_memory_line_reports_unavailable_when_proc_unreadable() {
          vm_rss_kb_before=unavailable vm_rss_kb_after=unavailable \
          vm_rss_delta_kb=unavailable vm_hwm_kb=unavailable"
     );
+}
+
+// --- repair_reachability 統計の集計・整形（Issue #447） ---
+
+fn level_stats(
+    level: usize,
+    unreachable_before: u64,
+    phase1_iterations: u64,
+    phase1_cap_hit: bool,
+    phase2_nodes: u64,
+    phase1_wall_ms: u64,
+    phase2_wall_ms: u64,
+) -> HnswRepairLevelStats {
+    HnswRepairLevelStats {
+        level,
+        unreachable_before,
+        phase1_iterations,
+        phase1_cap_hit,
+        phase2_nodes,
+        phase2_entry_relinked: 0,
+        phase1_wall: Duration::from_millis(phase1_wall_ms),
+        phase2_wall: Duration::from_millis(phase2_wall_ms),
+    }
+}
+
+#[test]
+fn repair_phase_wall_sum_adds_all_levels() {
+    let stats = HnswRepairStats {
+        levels: vec![
+            level_stats(0, 1, 1, false, 0, 3, 2),
+            level_stats(1, 0, 0, false, 0, 1, 1),
+        ],
+        wall: Duration::from_millis(10),
+    };
+    assert_eq!(repair_phase_wall_sum(&stats), Duration::from_millis(7));
+}
+
+#[test]
+fn repair_wall_gap_returns_difference_when_outer_is_larger() {
+    let stats = HnswRepairStats {
+        levels: vec![],
+        wall: Duration::from_millis(4),
+    };
+    assert_eq!(
+        repair_wall_gap(&stats, Duration::from_millis(10)),
+        Some(Duration::from_millis(6))
+    );
+}
+
+#[test]
+fn repair_wall_gap_is_none_when_outer_is_smaller_than_wall() {
+    let stats = HnswRepairStats {
+        levels: vec![],
+        wall: Duration::from_millis(10),
+    };
+    assert_eq!(repair_wall_gap(&stats, Duration::from_millis(4)), None);
+}
+
+#[test]
+fn repair_total_functions_sum_across_levels() {
+    let stats = HnswRepairStats {
+        levels: vec![
+            level_stats(0, 5, 3, true, 2, 1, 1),
+            level_stats(1, 1, 1, false, 0, 1, 1),
+        ],
+        wall: Duration::ZERO,
+    };
+    assert_eq!(repair_total_unreachable(&stats), 6);
+    assert_eq!(repair_total_phase1_iterations(&stats), 4);
+    assert_eq!(repair_total_phase2_nodes(&stats), 2);
+    assert_eq!(repair_phase1_cap_hits(&stats), 1);
+}
+
+fn profile_with_repair_level(unreachable_before: u64) -> HnswBuildProfile {
+    HnswBuildProfile {
+        repair: HnswRepairStats {
+            levels: vec![level_stats(0, unreachable_before, 0, false, 0, 0, 0)],
+            wall: Duration::ZERO,
+        },
+        ..HnswBuildProfile::default()
+    }
+}
+
+#[test]
+fn repair_unreachable_per_level_min_med_max_reports_per_level_stats() {
+    let profiles = vec![
+        profile_with_repair_level(5),
+        profile_with_repair_level(1),
+        profile_with_repair_level(3),
+    ];
+    let per_level = repair_unreachable_per_level_min_med_max(&profiles);
+    assert_eq!(per_level, vec![(0, (1, 3, 5))]);
+}
+
+#[test]
+fn repair_unreachable_per_level_min_med_max_empty_profiles_is_empty() {
+    assert_eq!(repair_unreachable_per_level_min_med_max(&[]), vec![]);
+}
+
+#[test]
+fn format_per_level_renders_bracketed_list() {
+    let per_level = vec![(0, (1u64, 3u64, 5u64)), (1, (0, 0, 2))];
+    assert_eq!(format_per_level(&per_level), "[L0:1/3/5,L1:0/0/2]");
+}
+
+#[test]
+fn format_per_level_empty_is_bracket_pair() {
+    assert_eq!(format_per_level(&[]), "[]");
 }

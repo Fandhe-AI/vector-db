@@ -12,11 +12,16 @@ users.txt はベンチ専用の一意な作業サブディレクトリ（`<workd
 `users.txt` があっても触らない（codex-review P1）。
 
 接続先ポートは環境変数 `CROSSDB_SELF_PORT`（既定 15432）で上書きできる。
+起動する `wire-server` バイナリのパスは環境変数 `CROSSDB_SELF_BINARY`
+（既定 `target/release/wire-server`）で上書きできる。設定した場合に限り、
+存在しないパスは起動前に fail-closed で拒否する（before/after の 2 バイナリを
+交互起動する前後比較計測向け。Issue #479）。
 """
 
 from __future__ import annotations
 
 import atexit
+import hashlib
 import os
 import shutil
 import subprocess
@@ -81,6 +86,27 @@ def _port_is_listening(host: str, port: int) -> bool:
         return False
 
 
+def _binary_version_string(path: str) -> str:
+    """起動に使った `wire-server` バイナリの識別情報（絶対パス・内容ハッシュ）を
+    含むバージョン文字列を組み立てる。
+
+    `CROSSDB_SELF_BINARY`（Issue #479）で過去コミットのバイナリを起動しても
+    `git rev-parse` 等でコミットを一意に復元できるとは限らない（ワークツリーの
+    退避先ビルドや未コミット状態からのビルドもあり得る）ため、実行時に実際に
+    起動したバイナリファイルの内容から sha256 を計算して識別子とする。既定の
+    `target/release/wire-server` を使った場合も同じ関数を通すため、before/after
+    比較で常に「実際に何を起動したか」が meta.version に残る
+    （codex-review P1 指摘・PR #586）。
+    """
+    abspath = os.path.abspath(path)
+    try:
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError as e:
+        return f"wire-server (path={abspath}; sha256=unavailable: {e})"
+    return f"wire-server (path={abspath}; sha256={digest})"
+
+
 class SelfServer:
     """wire-server 子プロセスのライフサイクル管理（起動・users.txt 生成・停止）。
 
@@ -92,7 +118,8 @@ class SelfServer:
     def __init__(self, db_path: str, workdir: str, binary: str | None = None):
         self.db_path = db_path
         self.workdir = workdir
-        self.binary = binary or self._default_binary()
+        # 呼び出し側から渡された `binary` も同じ理由で絶対パスへ正規化する
+        self.binary = os.path.abspath(binary) if binary else self._default_binary()
         self.proc: subprocess.Popen | None = None
         # 子プロセスの stdout/stderr の書き出し先（ファイル）。パイプ（`subprocess.PIPE`）
         # を使うと、誰も読み取らない間に OS のパイプバッファが満杯になって
@@ -107,6 +134,25 @@ class SelfServer:
 
     @staticmethod
     def _default_binary() -> str:
+        # Issue #479: before/after の 2 バイナリを交互起動する前後比較計測
+        # （`docs/design/visible-bitmap-cache-verification.md`）向けに、
+        # `target/release/wire-server` 以外のバイナリパスを指定できるようにする。
+        # 未設定時は従来どおりの既定パスを使う（後方互換）。指定されたパスが
+        # 存在しなければここで即座に拒否する（fail-closed。存在しないパスの
+        # まま `start()` まで進めて分かりにくいプロセス起動失敗にしない）。
+        override = os.environ.get("CROSSDB_SELF_BINARY")
+        if override:
+            # 絶対パスへ正規化してから存在確認・起動・ハッシュ算出で同一パスを使う。
+            # `wire-server-before` のような区切りなし相対パスをそのまま渡すと、
+            # exists はカレントディレクトリを見る一方 subprocess は PATH を検索する
+            # ため、起動失敗や PATH 上の同名バイナリの誤起動（meta.version の
+            # ハッシュとも食い違う）が起こり得る（codex-review 指摘）
+            override = os.path.abspath(override)
+            if not os.path.exists(override):
+                raise FileNotFoundError(
+                    f"CROSSDB_SELF_BINARY points to a nonexistent path: {override}"
+                )
+            return override
         repo_root = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "..")
         )
@@ -275,13 +321,19 @@ def run(args, queries: list[dict]) -> dict:
     os.makedirs(workdir, exist_ok=True)
     run_dir = tempfile.mkdtemp(prefix=f"self_bench_work_{os.getpid()}_", dir=workdir)
     work_db = os.path.join(run_dir, "self_bench_work.redb")
-    shutil.copyfile(args.rows_file, work_db)
-    server = SelfServer(db_path=work_db, workdir=workdir)
+    # `SelfServer.__init__` は `CROSSDB_SELF_BINARY` の存在検証で例外を送出しうる
+    # （fail-closed）。この検証・コンストラクタ呼び出し自体を try に含めることで、
+    # 直前の fixture DB コピー（`shutil.copyfile`）が作業ディレクトリに残留しない
+    # ようにする（コンストラクタ失敗時も finally で run_dir を必ず削除する）。
+    server: SelfServer | None = None
     try:
+        shutil.copyfile(args.rows_file, work_db)
+        server = SelfServer(db_path=work_db, workdir=workdir)
         server.start()
         return _run_phases(args, queries, server)
     finally:
-        server.stop()
+        if server is not None:
+            server.stop()
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
@@ -596,7 +648,7 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
             rows_visible = 0
         meta = build_meta(
             db="self",
-            version="wire-server (workspace HEAD)",
+            version=_binary_version_string(server.binary),
             connection="loopback TCP (psycopg simple query protocol)",
             config=args.config,
             rows=rows_visible,
