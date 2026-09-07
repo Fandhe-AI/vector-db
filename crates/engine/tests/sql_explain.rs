@@ -859,6 +859,7 @@ fn explain_does_not_touch_hnsw_index_cache() {
         + after.hybrid_dense_searches
         + after.hybrid_queries
         + after.hybrid_rounds_max
+        + after.hybrid_resumed_rounds
         + after.entries as u64;
     assert_eq!(
         total, 0,

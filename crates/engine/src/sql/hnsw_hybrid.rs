@@ -11,10 +11,13 @@
 //! 一切変更せずに密側の索引経路を接続する。
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::arena::VectorArena;
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
-use crate::sql::hnsw_cache::{search_prepared, HnswCacheAccess, PreparedHnswSearch};
+use crate::sql::hnsw_cache::{
+    search_prepared_resumable, HnswCacheAccess, HnswResumeState, PreparedHnswSearch,
+};
 
 /// hybrid 密側再取得ループ専用の `SearchProvider` アダプタ。
 ///
@@ -48,6 +51,13 @@ pub(crate) struct HnswDenseProvider<'a> {
     /// このアダプタが実際に索引経路（`受理条件`を満たしたラウンド）を通した回数。
     /// クエリ終了時に [`Self::finish`] で `HnswIndexCache` の統計へ反映する。
     rounds: AtomicU64,
+    /// hybrid 密側再取得ループの破棄候補ヒープ保持型再開状態（Issue #505）。
+    /// `SearchProvider::search` が `&self` シグネチャのため `Mutex` で包む
+    /// （`RefCell` は `SearchProvider: Send + Sync`〔`hybrid.rs` が並列実行の
+    /// 対象として要求〕を満たせない）。受理条件を満たさないラウンド（`inner`
+    /// へ委譲）は本状態に一切触れない。2 ラウンド目以降のみ `Some` になる
+    /// （1 ラウンド目は `search_prepared_resumable` 内で新規状態を構築する）。
+    resume: Mutex<Option<HnswResumeState>>,
 }
 
 impl<'a> HnswDenseProvider<'a> {
@@ -68,6 +78,7 @@ impl<'a> HnswDenseProvider<'a> {
             inner,
             prepared,
             rounds: AtomicU64::new(0),
+            resume: Mutex::new(None),
         }
     }
 
@@ -101,7 +112,15 @@ impl SearchProvider for HnswDenseProvider<'_> {
         }
         self.rounds.fetch_add(1, Ordering::Relaxed);
         self.access.cache.record_hybrid_dense_search();
-        search_prepared(
+        // `Mutex` の poison（他ラウンドが panic した）は fail-closed に「再開
+        // 状態を捨てて今回はラウンド 1 として扱う」側へ倒す——不整合な状態を
+        // 使い続けない。
+        let mut guard = self.resume.lock().unwrap_or_else(|poisoned| {
+            let mut inner = poisoned.into_inner();
+            *inner = None;
+            inner
+        });
+        search_prepared_resumable(
             self.access,
             &self.prepared,
             self.inner,
@@ -109,6 +128,7 @@ impl SearchProvider for HnswDenseProvider<'_> {
             self.slot_ids,
             input.query,
             input.k,
+            &mut guard,
         )
     }
 }
@@ -330,5 +350,103 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.ef_cap_fallbacks, 1);
         assert_eq!(stats.hybrid_dense_searches, 1);
+    }
+
+    /// Issue #505: 同一バッファ・同一クエリへ `k` を倍増しながら複数ラウンド
+    /// 呼ぶと、2 ラウンド目以降が破棄候補ヒープ保持型の再開型探索
+    /// （`sql::hnsw_cache::search_prepared_resumable`）を通り、`builds` を
+    /// 増やさず `hybrid_resumed_rounds` が非 vacuous に計上されることを固定
+    /// する（§`HnswIndexCacheStats::hybrid_resumed_rounds` ドキュメンテーション
+    /// コメント参照）。
+    #[test]
+    fn search_resumes_across_rounds_for_the_same_buffer() {
+        let table = "docs";
+        let tenant = "tenant-a";
+        let (storage, _guard) = seeded_storage(table, tenant, 2_000);
+        let c = ctx(tenant);
+        let read_txn = storage.db().begin_read().expect("begin read");
+        let arena = build_arena(&read_txn, table, &c);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+        let cache = HnswIndexCache::new();
+        let hnsw_provider = HnswSearchProvider::new(ValidatedHnswParams::default());
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: hnsw_provider,
+        };
+        let read_txn = storage.db().begin_read().expect("begin read");
+        let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
+        let builds_after_prepare = cache.stats().builds;
+
+        let inner = ParallelSearchProvider;
+        let adapter = HnswDenseProvider::new(&access, &arena, &slot_ids, &inner, prepared);
+
+        for round_k in [10usize, 20, 40] {
+            let input = SearchInput {
+                ids: &slot_ids,
+                vectors: arena.vectors(),
+                dim: arena.dim(),
+                query: &[0.0, 1.0, 2.0, 3.0],
+                k: round_k,
+            };
+            let hits = adapter.search(input).expect("search succeeds via index");
+            assert!(!hits.is_empty());
+        }
+        adapter.finish();
+
+        let stats = cache.stats();
+        assert_eq!(stats.builds, builds_after_prepare, "prepare must run once");
+        assert_eq!(stats.hybrid_dense_searches, 3);
+        assert!(
+            stats.hybrid_resumed_rounds >= 1,
+            "at least the 2nd/3rd rounds should have resumed the previous graph scan"
+        );
+    }
+
+    /// 別バッファ（受理条件を満たさないラウンド）へ委譲しても再開状態には
+    /// 一切触れないことを固定する（Issue #505。§`HnswDenseProvider::resume`
+    /// ドキュメンテーションコメント参照）。
+    #[test]
+    fn search_for_a_different_buffer_does_not_touch_resume_state() {
+        let table = "docs";
+        let tenant = "tenant-a";
+        let (storage, _guard) = seeded_storage(table, tenant, 2_000);
+        let c = ctx(tenant);
+        let read_txn = storage.db().begin_read().expect("begin read");
+        let arena = build_arena(&read_txn, table, &c);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+        let cache = HnswIndexCache::new();
+        let hnsw_provider = HnswSearchProvider::new(ValidatedHnswParams::default());
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: hnsw_provider,
+        };
+        let read_txn = storage.db().begin_read().expect("begin read");
+        let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
+
+        let inner = ParallelSearchProvider;
+        let adapter = HnswDenseProvider::new(&access, &arena, &slot_ids, &inner, prepared);
+
+        let other_vectors: Vec<f32> = arena.vectors().to_vec();
+        let other_ids: Vec<u64> = slot_ids.clone();
+        for round_k in [5usize, 10] {
+            let input = SearchInput {
+                ids: &other_ids,
+                vectors: &other_vectors,
+                dim: DIM,
+                query: &[0.0, 1.0, 2.0, 3.0],
+                k: round_k,
+            };
+            adapter.search(input).expect("search succeeds via inner");
+        }
+        adapter.finish();
+
+        let stats = cache.stats();
+        assert_eq!(stats.hybrid_dense_searches, 0);
+        assert_eq!(
+            stats.hybrid_resumed_rounds, 0,
+            "delegated rounds must never build or consume resume state"
+        );
     }
 }
