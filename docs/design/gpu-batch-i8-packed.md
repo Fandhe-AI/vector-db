@@ -271,10 +271,17 @@ native/polyfill の A/B は本実測のスコープ外）。
 ### レイテンシ（参考値・共有 QEMU 環境のため採否根拠にしない）
 
 `gpu_i8_p95`（after 側。min-of-5・median）と、同一 after バイナリ内の A
-（CPU-SIMD）・B（GPU f16 常駐）の p95 を突き合わせた速度比
-（`speedup_ratio` = 分子 / i8_p95。1.0 未満は i8 の方が遅いことを表す）。
-参照区間帯は pooled `cpu_p50`（before + after 両側。`isa.rs`／
-`batch_search.rs` は本 Issue で無変更のため純粋な run-to-run ノイズの目安）。
+（CPU-SIMD）・B（GPU f16 常駐）の p95 を突き合わせたレイテンシ比
+（下表の「ratio i8/A」「ratio i8/B」列 = i8_p95 / 対照 p95〔min-of-N〕。
+1.0 超は i8 の方が遅いことを表す）。この比は `gpu_scaling_bench.rs` が
+自ら出力する `speedup_i8_vs_cpu_p95`/`speedup_i8_vs_f16_p95`
+フィールド（`harness/gpu_scaling.rs::speedup_ratio` = 対照 p95 / i8_p95。
+1.0 未満が i8 の方が遅いことを表す）とは分子・分母が逆で値も逆数の
+関係にある——本節の表はレイテンシ比（i8/対照）として独自に算出した
+ものであり、ベンチ出力の `speedup_ratio` フィールドをそのまま転記した
+ものではない。参照区間帯は pooled `cpu_p50`（before + after 両側。
+`isa.rs`／`batch_search.rs` は本 Issue で無変更のため純粋な
+run-to-run ノイズの目安）。
 
 | rows:dim:batch | i8_p95（min/median） | A（cpu）p95（min） | B（f16）p95（min） | ratio i8/A（min-of-N） | ratio i8/B（min-of-N） | 参照区間帯 |
 | --- | --- | --- | --- | --- | --- | --- |
