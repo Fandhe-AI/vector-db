@@ -166,7 +166,7 @@ Top-k を取りこぼしうる）。したがって量子化が適用できる�
 | ---- | ---- | ---- | -------------- | ---------- |
 | カーディナリティ推定 → plain scan／ANN 切替 | qdrant `full_scan_threshold` | 統計＋サンプリング推定で確定できない曖昧域を扱う | 既採用（`full_scan_ratio` 既定 1/10・Issue #409）。本リポは RLS 事前フィルタで正確な可視カーディナリティが既知のため qdrant 型のサンプリング推定は不要 | Apache-2.0 |
 | 探索時グラフ内マスク | qdrant `FilteredScorer` | 不適合ノードをスコア対象から除外 | 既採用（`NodeMask`／`search_masked`・Issue #409） | Apache-2.0 |
-| ACORN-1（2-hop 展開） | qdrant `search_on_level_acorn` | 1-hop 不適合ノードのみ 2-hop まで展開。低選択性フィルタでのみ有効化 | 条件付き採用（§9-#3b）。`hnsw_subset` 経路が既定比 37〜45% 悪化する実測（Issue #413）の改善策。前提: 「不適合な 1-hop ノードのリンクだけを辿りベクトルは読まない」設計であることの確認と、PR #431 の P0 契約との整合再検証 | Apache-2.0 |
+| ACORN-1（2-hop 展開） | qdrant `search_on_level_acorn` | 1-hop 不適合ノードのみ 2-hop まで展開。低選択性フィルタでのみ有効化 | 条件付き採用（§9-#3b）。`hnsw_subset` 経路が既定比 37〜45% 悪化する実測（Issue #413）の改善策。#500 で契約整理済み（条件付き成立。ベクトル非参照〔I1・P0〕は維持したまま、リンク非参照〔I2〕のみゲート下で緩和する設計。`docs/design/hnsw-rls-cardinality-switch.md`「Issue #500」節）→ 実装 #501・実測 #502 | Apache-2.0 |
 | 破棄候補ヒープ保持型 iterative scan | pgvector `hnswscan.c` | 破棄候補を pairing heap に保持し以後バッチ単位で再開する（ef 倍増による再実行ではない） | 条件付き採用（§9-#3c）。本リポの hybrid 密側再取得ループ（Issue #410）は `dense_fetch_k` 倍増で再実行するためラウンドごとに同じ候補を再評価しており、pgvector 型の継続方式は計算重複を避けられる | PostgreSQL License |
 | ビルド時のフィルタ専用追加サブグラフ | qdrant `hnsw/build.rs`（`payload_m`/`payload_m0`） | カーディナリティの大きい payload ブロック専用サブグラフをマージ | 不採用（当面）。本リポの索引は「ctx 可視アリーナのみから構築」という per-テナント前提であり、複数テナント/条件を跨ぐグローバル索引最適化とは前提が異なる | Apache-2.0 |
 | `IDSelector` による中間フィルタ | faiss `HNSW.cpp::search_from_candidates_fixVT` | 距離計算は先に行い `is_member` 判定は結果ヒープ追加の可否のみに使う | 不採用（P0 違反）。不適合ノードにも距離計算＝ベクトルアクセスが発生し、PR #431 の「非可視ノードのベクトルへ一切触れない」契約に反する | MIT |
@@ -245,7 +245,7 @@ Qdrant HNSW に劣後する:
 | 1 | Top-k 確定後の遅延スカラーデコード | 最大。k 非依存の約 9〜10ms 固定コストを除去。`bulk_knn_k200/k1000`・投影列を伴う全 SELECT に効く。集計経路には既に同型の `DecodeTier`（Issue #350）が実装済み | 中 | 不要 | 不要 | 既起票 #453 |
 | 2 | スカラー列二次索引 | 大。`vector_knn_where` 4.6x・`where_compound_count` 4.1x の主因である `WHERE` の O(N) 全行走査を除去 | 大 | 不要 | 不要 | 既起票 #359（Proposed）→ #471 |
 | 3a | `hnsw_subset` 退行の原因切り分けと `full_scan_ratio` 再調整 | 大。ANN opt-in 時に SCALAR 事前フィルタ付き DISTANCE が 37〜45% 悪化する既知の退行（Issue #413）。#413 は「フィルタの選択性が主要因・行数規模は副次的」と結論しており、切替閾値がずれている可能性がある。定数の再調整が最も安価な仮説で ACORN より先に検証すべき | 小 | 不要 | 不要 | 既起票 #486 |
-| 3b | ACORN-1（2-hop 展開）の導入 | 中。3a で閾値調整では解けないと判明した場合の本命 | 大 | 不要 | 不要 | 既起票 #499 |
+| 3b | ACORN-1（2-hop 展開）の導入 | 中。3a で閾値調整では解けないと判明した場合の本命 | 大 | 不要 | 不要 | 契約整理・ゲート条件設計は #500 で実施済み（条件付き成立）。実装 #501・実測 #502 |
 | 3c | hybrid 密側再取得の破棄候補ヒープ保持化（pgvector 型） | 中。3a/3b とは別経路。SCALAR 事前フィルタ付き DISTANCE 経路には再取得ループ自体が存在しない（Issue #410: `masked_short` は構造的に到達不能）ためこの施策は `hnsw_subset` 退行には効かない | 中 | 不要 | 不要 | 既起票 #503 |
 | 4 | `repair_reachability` の並列化 | 中（実測根拠あり）。HNSW 構築の 8→12 スレッド頭打ちの主因（12 スレッド時に total の 39.4% を占める単一スレッド後始末段。usearch に対し 1.24〜1.26x 遅い唯一の敗因。探索は既に usearch より速い：65.5µs vs 76.5µs） | 中 | 不要 | 不要 | 既起票 #446 ツリー（#447〜#450。並列化本体は #449） |
 | 5 | HNSW 隣接リストの CSR 化 | 中（実測根拠なし・構造推論）。`Vec<Vec<u32>>` のノード×レベル分のヒープ確保・間接参照を単一 `Vec<u32>`+offsets へ | 中 | 不要 | 不要 | 既起票 #492 |
@@ -290,7 +290,8 @@ dispatch／GPU 側 Top-k／SHADER_F16／`dot4I8Packed`）は #531／#534／#538�
 - hnswlib 型 level0 インターリーブ／qdrant 型リンク圧縮: 永続化前提のレイアウト。
   本リポの HNSW は永続化未実装のため時期尚早
 - faiss `IDSelector` 型の中間フィルタ: 不適合ノードにも距離計算が走り、PR #431
-  の P0 契約に反するため採用不可
+  の P0 契約に反するため採用不可（この契約〔ベクトル非参照〕は #500 の ACORN-1
+  契約整理でも不変条件 I1 として維持）
 - BLAS(sgemm) バッチ経路: BLAS 依存の追加が必要で依存最小方針と衝突
 
 top-10 でカバーできていないギャップ:
@@ -336,4 +337,5 @@ top-10 でカバーできていないギャップ:
 - [`docs/design/scalar-secondary-index.md`](scalar-secondary-index.md)
   （スカラー列二次索引 ADR）
 - [`docs/design/hnsw-rls-cardinality-switch.md`](hnsw-rls-cardinality-switch.md)
-  （HNSW×RLS 統合・PR #431 の P0 契約の所在）
+  （HNSW×RLS 統合・PR #431 の P0 契約の所在。ACORN-1 導入時の契約整理は
+  「Issue #500」節参照）
