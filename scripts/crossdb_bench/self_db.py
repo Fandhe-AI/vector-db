@@ -292,13 +292,19 @@ def run(args, queries: list[dict]) -> dict:
     os.makedirs(workdir, exist_ok=True)
     run_dir = tempfile.mkdtemp(prefix=f"self_bench_work_{os.getpid()}_", dir=workdir)
     work_db = os.path.join(run_dir, "self_bench_work.redb")
-    shutil.copyfile(args.rows_file, work_db)
-    server = SelfServer(db_path=work_db, workdir=workdir)
+    # `SelfServer.__init__` は `CROSSDB_SELF_BINARY` の存在検証で例外を送出しうる
+    # （fail-closed）。この検証・コンストラクタ呼び出し自体を try に含めることで、
+    # 直前の fixture DB コピー（`shutil.copyfile`）が作業ディレクトリに残留しない
+    # ようにする（コンストラクタ失敗時も finally で run_dir を必ず削除する）。
+    server: SelfServer | None = None
     try:
+        shutil.copyfile(args.rows_file, work_db)
+        server = SelfServer(db_path=work_db, workdir=workdir)
         server.start()
         return _run_phases(args, queries, server)
     finally:
-        server.stop()
+        if server is not None:
+            server.stop()
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
