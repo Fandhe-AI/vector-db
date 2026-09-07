@@ -2,9 +2,12 @@
 
 - ステータス: Issue #365 時点は**現状維持で close 可**（全 dim 一律の ACC=4 化は
   不採用）。Issue #517/#518 で条件付き再訪し、**dim 閾値（768）による ACC=4
-  経路のディスパッチとして採用**（「Issue #518 追記」節参照）
+  経路のディスパッチとして採用**（「Issue #518 追記」節参照）。Issue #519 で
+  本環境（共有 QEMU・非専有）における dim 768／1536 の前後比較・閾値候補
+  （384）の輪番実測を実施（参考値）。**閾値 768 は本 Issue では変更せず据え置き**、
+  最終確定はオーナー実機（Issue #530）へ申し送り（「Issue #519 追記」節参照）
 - 対応: Issue #365（`perf(engine): isa.rs dot カーネルの複数アキュムレータ化`）・
-  Issue #517（親）・Issue #518（実装）
+  Issue #517（親）・Issue #518（実装）・Issue #519（前後比較・閾値確定）
 - 前提: Issue #362（`docs/design/knn-stage-profile.md`「`dot_lanes` の実
   アセンブリ確認」節）で、AVX2+FMA 環境の `dot_avx2_fma` が単一 FMA 依存チェーン
   （4 段 unroll だが実質 1 系統）に律速されていることが判明済み
@@ -516,7 +519,8 @@ Issue #518（実装）はこの知見を踏まえ、**ベクトル長を実行�
   （層 A 固定値含む）を確認済み
 - AVX2+FMA 以外（AVX-512・NEON）での実測は本 Issue の範囲外（Issue #365 と
   同じ限界を引き継ぐ）。閾値そのものの確定・チップ別実測・前後比較は
-  Issue #519 の担当
+  Issue #519 で本環境（共有 QEMU・AVX2+FMA）の参考値を実測済み。AVX-512・NEON
+  実機での確定はオーナー実機（Issue #530）へ申し送り（「Issue #519 追記」節参照）
 - `PADDED_TAIL`（tail 処理方式切り替え。Issue #528）は `dot_lanes_multi_acc`
   にも貫通させ、端数（`a_rem`／`b_rem`）と `narrow` レーンの縮約は `dot_lanes`
   と同じ `reduce_lanes` を経由する（手書きの逐次和には戻さない）。これにより
@@ -537,3 +541,263 @@ Issue #518（実装）はこの知見を踏まえ、**ベクトル長を実行�
   経由の呼び出しにも自動的に波及させる（新規 intrinsics カーネルの追加なし）。
   `tests/isa.rs::dot_block4_matches_single_row_dot_bit_exact_across_dims` は
   dim 768/1000/1536 を含む元の全 dim 帯でビット同一のまま検証する
+
+## Issue #519 追記: dim 768／1536 での前後比較と閾値の確定
+
+Issue #518 は「dim=128 の既存テストが green」までを受け入れ条件とし、閾値
+768 そのものの妥当性・前後比較の実測を本 Issue（#519）へ申し送っていた。本節は
+`scripts/bench_dot_kernel_ab.sh`（新規。`dot_kernel_bench` を before/after/
+候補バイナリで交互 min-of-N 実行する薄いドライバ）を用いて実測した記録であり、
+判定は `docs/design/benchmark-judgement-policy.md`（Issue #462）に従う。
+
+### 計測方式
+
+- before＝`af1287f4f39b370d6792d970c94c119c32d237b5`（= Issue #518 直前）・
+  after＝`a40edd7b924a5eb1498eb0aa8a056c75d9d7eb41`（Issue #518・PR #613）。
+  `git diff before after -- Cargo.lock Cargo.toml crates/engine/Cargo.toml`
+  が空であることを確認済み（同一 lockfile・同一プロファイルでビルド。
+  benchmark-judgement-policy.md §3）
+- 閾値候補として `after` の `isa.rs::DOT_MULTI_ACC_MIN_DIM` を `768`→`384`
+  へ書き換えた `cand384`（使い捨てビルド。コミットしない）を追加し、
+  before → after → before → cand384 の輪番で交互実行した
+  （`docs/design/benchmark-judgement-policy.md` §3 の輪番規約）
+- **重要な観測ポイント**: 既定エンジンの production 経路
+  （`ParallelBruteForce` → `parallel_search::search_range` → `dot_block4`）
+  は、`isa.rs::dot_block4_impl` が dim>=768 を「1 行版 `dot_impl` を 4 回
+  呼ぶ縮退経路」へ合流させる構成（intrinsics 行ブロックカーネルは ACC=4 未対応の
+  ため。「Issue #518 追記」節参照）のため、`label=current`（1 行版 `dot`）の
+  改善だけを見ると production 経路の実際の変化を見誤る。本節は
+  `BENCH_DOT_KERNEL_BLOCK_AB=1` の block4 A/B（B 行＝`dot_block4`）を
+  before/after バイナリ間で比較することで、この production 経路の変化を
+  直接測定した
+- N=5 ペア（プロセス起動単位。1 run = 1 プロセス）。各 run 直前の
+  `/proc/loadavg` を記録
+
+### 環境
+
+- CPU: `QEMU Virtual CPU version 2.5+`（KVM）・12 vCPU。フラグ `avx2`／
+  `fma`／`f16c`（`avx512*` なし）。`isa.rs::DetectedIsa` = `Avx2Fma`
+- rustc: `1.96.0`
+- 負荷: 共有・非専有（`BENCH_DEDICATED_ENV` 未設定）。層 A 実測時 loadavg
+  約 3.88〜4.51、層 B 実測時 約 2.17〜3.44
+- 生データ: `docs/design/bench-data/dot-kernel-multi-acc-ab/20260907T125122Z-summary.tsv`
+  （層 A）・`docs/design/bench-data/dot-kernel-multi-acc-ab/20260907T125122Z-layerB/`
+  （層 B。`chip_bench` の `summary.json` を pair・side ごとに保存）・
+  `docs/design/bench-data/dot-kernel-multi-acc-ab/20260907T125122Z-env.txt`
+
+### 層 A: `dot_kernel_bench`（`label=current`）dim 768／1536 の前後比較
+
+1 行版 `dot`（Issue #518 が直接変更した経路）の N=5 min-of-N・median（ms。
+`ratio` は after/before）:
+
+| working_set | dim | before min/median | after min/median | ratio_min | ratio_median | 対象区間の変動幅（before/after band） |
+| --- | --- | --- | --- | --- | --- | --- |
+| cache_resident | 768 | 0.186 / 0.186 | 0.121 / 0.121 | 0.6505 | 0.6505 | 0.1075 / 0.0000 |
+| cache_resident | 1536 | 0.200 / 0.207 | 0.111 / 0.112 | 0.5550 | 0.5411 | 0.0650 / 0.0180 |
+| arena_scale | 768 | 2.867 / 3.119 | 2.872 / 2.879 | 1.0017 | 0.9231 | 0.1444 / 0.0299 |
+| arena_scale | 1536 | 6.374 / 6.471 | 5.767 / 5.826 | 0.9048 | 0.9003 | 0.0595 / 0.0465 |
+
+上表の「対象区間の変動幅」は dim768／1536（本 Issue の変更対象区間）自身の
+before/after 各 5 run の run-to-run 幅であり、`benchmark-judgement-policy.md`
+§4 が判定に用いる参照帯とは別物である。判定（下記「判定（決定木）」節・
+Issue #519 決定木 1.）が実際に参照帯として使うのは、変更を含まない
+dim384 の実測帯（下表の参照区間。cache_resident before band 0.1589・
+arena_scale before band 0.0835）である。
+
+参照区間（変更を含まない dim。band は `(max-min)/min`。5 run）:
+
+| working_set | dim | before min/median (band) | after min/median (band) | ratio_min | ratio_median |
+| --- | --- | --- | --- | --- | --- |
+| cache_resident | 100 | 0.176 / 0.176 (0.0682) | 0.180 / 0.180 (1.9889\*) | 1.0227 | 1.0227 |
+| cache_resident | 128 | 0.139 / 0.140 (0.0791) | 0.146 / 0.146 (0.0000) | 1.0504 | 1.0429 |
+| cache_resident | 384 | 0.151 / 0.152 (0.1589) | 0.152 / 0.152 (0.0000) | 1.0066 | 1.0000 |
+| arena_scale | 100 | 0.163 / 0.167 (0.2209) | 0.163 / 0.170 (0.2086) | 1.0000 | 1.0180 |
+| arena_scale | 128 | 0.224 / 0.229 (0.1786) | 0.225 / 0.228 (0.1244) | 1.0045 | 0.9956 |
+| arena_scale | 384 | 1.222 / 1.269 (0.0835) | 1.224 / 1.268 (0.0743) | 1.0016 | 0.9992 |
+
+（\* after cache_resident/dim=100 の 5 run のうち 1 run が 0.538ms の外れ値
+（共有環境のノイズと考えられる。他 4 run は 0.180ms 前後で安定）を含み band を
+大きく引き上げている。median は外れ値の影響を受けにくいため median 比 1.0227
+は他の参照区間と整合する範囲に収まっている。生データ: `20260907T125122Z-summary.tsv`
+の `side=after kind=current working_set=cache_resident dim=100` 行）
+
+参照区間（dim100/128/384・両 working_set）は固定 ±5% 帯・実測 run-to-run 帯の
+少なくとも一方には収まらない行（cache128 の 5.0%・cache384 の band 15.9% 等）
+もあるが、いずれも共有 QEMU 環境の高いノイズ帯自体が原因であり、下記「判定」
+節の分類には影響しない（参照区間はあくまでノイズの大きさを見るための対照）。
+
+### 層 A: block4 A/B（production 経路の B 行。dim 768 が対象区間・dim 128 が参照区間）
+
+`dot_block4`（`ParallelBruteForce` → `search_range` が通る経路）の
+before/after 比較。N=5 min-of-N・median（ms）:
+
+| working_set | dim | before min/median (band) | after min/median (band) | ratio_min | ratio_median |
+| --- | --- | --- | --- | --- | --- |
+| cache_resident | 128（参照） | 0.123 / 0.124 (0.0325) | 0.124 / 0.124 (0.0081) | 1.0081 | 1.0000 |
+| cache_resident | 768（対象） | 0.107 / 0.107 (0.0000) | 0.116 / 0.116 (0.0000) | 1.0841 | 1.0841 |
+| arena_scale | 128（参照） | 0.205 / 0.207 (0.0537) | 0.204 / 0.205 (0.0245) | 0.9951 | 0.9903 |
+| arena_scale | 768（対象） | 2.526 / 2.596 (0.0503) | 2.739 / 2.881 (0.0781) | 1.0843 | 1.1098 |
+
+**所見**: dim768 の block4 経路（production の `search_range` が実際に通る
+経路）は before → after で **8〜11% 悪化**している。これは「Issue #518 追記」
+節が記録した設計判断——`dot_block4_impl` が dim>=768 を intrinsics 行ブロック
+カーネルから「1 行版 `dot_impl` を 4 回呼ぶ」縮退経路へ意図的に合流させた
+ため、1 行版が multi-acc（ACC=4）へ分岐しても、intrinsics 行ブロックカーネル
+自体が持っていた行間再利用の効果（Issue #512 実測で before 比 0.46〜0.85 倍。
+「行間再利用（Issue #512）」節参照）を失う——の直接的な現れである。dim128
+（参照区間。閾値未満のため `dot_block4_impl` は不変）は両帯内（ratio 0.99〜
+1.01）で安定しており、dim768 の悪化がノイズではなく構造的な退行であることを
+支持する。
+
+### 層 A: 閾値候補 384 の輪番結果
+
+`cand384`（`DOT_MULTI_ACC_MIN_DIM` = 384）の比較は、輪番順序
+（`before → after → before → cand1 → before → cand2 …`。benchmark-judgement-policy.md
+§3）どおり **各 `candN` 直前に実行した `before`（`summary.tsv` の `pair=Nc0`
+行）**を baseline とする。時間方向に離れた「`after` 用の `pair=1〜5` の
+`before`」を使うと測定順の交絡が再導入されるため使わない（両者は
+cache_resident では偶然一致するが、arena_scale では乖離する。生データ:
+`20260907T125122Z-summary.tsv` の `side=before pair=<N>c0` 行）。
+
+| working_set | before(c0) min/median | cand384 min/median | ratio_min | ratio_median |
+| --- | --- | --- | --- | --- |
+| cache_resident | 0.151 / 0.152 | 0.122 / 0.123 | 0.8079 | 0.8092 |
+| arena_scale | 1.209 / 1.257 | 1.173 / 1.176 | 0.9702 | 0.9356 |
+
+参照区間帯は上記「層 A: `dot_kernel_bench`」節の dim384 行（cache_resident
+before band 15.89%・arena_scale before band 8.35%）を、輪番直前 baseline と
+同じ working_set・同じ dim の実測帯として流用する。
+
+判定（固定 ±5% 帯・実測帯の両方を要件とする。§4）:
+
+- cache_resident: ratio_min 0.8079（19.21% 改善）・ratio_median 0.8092
+  （19.08% 改善）はいずれも固定帯・参照帯（15.89%）の両方を超過 → `Improved`。
+- arena_scale: ratio_min 0.9702（2.98% 改善）は固定 ±5% 帯を超えず
+  → `Neutral`。ratio_median 0.9356（6.44% 改善）は固定帯は超えるが参照帯
+  （8.35%）を超えないため → `Neutral`。
+
+dim384 を multi-acc（ACC=4）経路に含めた場合、本環境の輪番実測では
+cache_resident のみ両ノイズ帯を超える改善が確認でき、arena_scale は
+両統計量ともノイズ帯内（`Neutral`）にとどまる。
+
+### 層 B: production 経路（`bench-chip` `feature_768`）前後比較
+
+before/after を `feature_768`（rows=25,000・dim=768）で N=5 ペア交互実行
+（`BENCH_CHIP_ROUNDS=1` を 1 run として 5 回起動）。`vector_knn`（dot を
+通る対象区間）・`hybrid_rrf`（密側で dot を通る）・`agg_count`／
+`rls_isolation`（dot を通らない参照区間）の p50（us）:
+
+| metric | before min/median | after min/median | ratio_min | ratio_median |
+| --- | --- | --- | --- | --- |
+| vector_knn/p50 | 2206 / 2258 | 2205 / 2279 | 0.9995 | 1.0093 |
+| hybrid_rrf/p50 | 66792 / 67644 | 66532 / 67044 | 0.9961 | 0.9911 |
+| agg_count/p50（参照） | 54 / 54 | 54 / 54 | 1.0000 | 1.0000 |
+| rls_isolation/p50（参照） | 50 / 50 | 50 / 50 | 1.0000 | 1.0000 |
+
+**所見**: SQL 表層の `feature_768` エンドツーエンド計測では `vector_knn`・
+`hybrid_rrf` いずれも before/after の差は 1%未満で両ノイズ帯内（`Neutral`）
+——層 A の block4 dim768 単体測定で見えた 8〜11% の退行は、`feature_768`
+ワークロード（rows=25,000・dim=768。arena_scale 相当）のエンドツーエンド
+レイテンシには明確な形では現れていない。1 行版 `dot` の multi-acc 化による
+改善（layer A の arena_scale dim768 median 比 0.9231）と block4 経路の退行
+（同 median 比 1.1098）が、SQL 表層の他コスト（redb スキャン・RLS 判定・
+デコード等）と混ざって希釈されている可能性がある——という解釈にとどまり、
+本 Issue の計測（1 規模点・1 ワークロード）だけでは因果を分離できない。
+
+### 判定（決定木）
+
+benchmark-judgement-policy.md §4（固定 ±5% 帯・実測 run-to-run 帯の両方を
+要件とする）に従い分類する:
+
+1. `current` dim768／1536: 4 点中 3 点（cache768・cache1536・arena1536）が
+   `Improved`（固定 ±5% 帯・参照区間の実測帯〔同一 working_set の dim384
+   before band〕の両方を超過）。arena768 は min-of-N 比 1.0017（0.17% 悪化
+   ＝実質不変）が固定帯を超えず、median 比 0.9231（7.69% 改善）も固定帯は
+   超えるが参照帯（arena_scale dim384 before band 8.35%。上記「層 A:
+   `dot_kernel_bench`」節の参照区間表）を超えないため、min-of-N・median
+   いずれも `Neutral` と判定する（両帯の比較式を統一適用。従来の記載は
+   参照帯 8.35%／17.86%／22.09% のいずれも超えない改善率を `Improved` と
+   誤分類していたため訂正する）。参照区間のノイズが大きい共有環境のため、
+   4 点中 1 点（arena768）は Issue #518 の効果が本環境の計測解像度では
+   有効な変化として確認できない、というのが正しい所見である。Issue #518
+   の 1 行版改善は cache768・cache1536・arena1536 の 3 点で本環境でも
+   参考値として確認できる。
+2. block4 dim768（production `search_range` 経路）: cache_resident・
+   arena_scale とも `Regressed`（8〜11% の悪化。参照区間 dim128 の帯
+   0.8〜5.4% を超過）。**Issue #518 が `search_range` の dim>=768 を
+   intrinsics 行ブロックカーネルから 4×1 行版縮退経路へ切り替えたことに
+   よる退行の所見**として記録する。対処候補（`x86_block4`／`neon_block4`
+   の ACC=4 化で縮約順を 1 行版 multi-acc と一致させビット同一契約を保つ、
+   または閾値の見直し）はオーナー判断・別 Issue 候補として申し送る
+   （本 Issue では `isa.rs` を変更しない）。
+3. 層 B（`feature_768` エンドツーエンド）: `vector_knn`・`hybrid_rrf`
+   いずれも `Neutral`（両ノイズ帯内）。上記 2. の退行は本規模・本ワークロード
+   のエンドツーエンドレイテンシには明確には現れていない。
+4. 閾値候補 384: 輪番直前 baseline（`pair=Nc0`）で再集計すると
+   cache_resident のみ `Improved`（固定帯・参照帯〔15.89%〕の両方を超過）。
+   arena_scale は ratio_min 0.9702（2.98% 改善。固定 ±5% 帯内）・
+   ratio_median 0.9356（6.44% 改善。固定帯は超えるが参照帯〔8.35%〕は
+   超えない）でいずれも `Neutral` と判定する（従来の記載は候補直前でなく
+   時間的に離れた `pair=1〜5` の `before` を baseline に使っており、
+   `benchmark-judgement-policy.md` §3 の輪番比較が要求する時間方向の交絡
+   排除に反していた。TSV 再集計値は上記「層 A: 閾値候補 384 の輪番結果」節
+   参照）。dim384 を multi-acc（ACC=4）経路に含めた場合の 1 行版 `dot` の
+   改善は cache_resident では両ノイズ帯を超えて確認できるが、arena_scale
+   では本環境の計測解像度では有効な変化として確認できない。ただし 2. の
+   block4 退行は `dot_block4_impl` の縮退境界にも連動するため、閾値を
+   下げると production `search_range` 経路の退行対象 dim レンジが広がる
+   可能性がある（本 Issue では検証していない）。
+5. **総合**: `DOT_MULTI_ACC_MIN_DIM` = 768 は**本 Issue で変更しない**
+   （共有 QEMU 環境の参考値のみで確定・変更しない。1 行版の改善と block4
+   経路の退行が同時に存在するため、閾値の最終判断には 2. の対処方針
+   （行ブロック側 ACC=4 化 or 閾値見直し）とセットでの検討が必要）。閾値の
+   確定はオーナー実機（Phase 4 通し比較 Issue #530）へ申し送る。
+
+### オーナー実機テンプレート（`chip-kernel-guidelines.md` §7.1/§7.2 形式）
+
+| チップ | ISA | `current` dim768 ratio | `current` dim1536 ratio | block4 dim768 ratio | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| Apple M シリーズ（NEON） | Neon | （未計測） | （未計測） | （未計測） | （未計測） |
+| AMD Zen4 以降（AVX-512） | Avx512 | （未計測） | （未計測） | （未計測） | （未計測） |
+| Intel（AVX-512） | Avx512 | （未計測） | （未計測） | （未計測） | （未計測） |
+| 本開発環境（QEMU・共有・参考値） | Avx2Fma | 0.65／0.92（cache/arena） | 0.54／0.90 | 1.08／1.11 | 参考値（本節） |
+
+### 再現手順（層 A）
+
+```sh
+git fetch origin
+git worktree add /path/to/before af1287f4f39b370d6792d970c94c119c32d237b5
+git worktree add /path/to/after  a40edd7b924a5eb1498eb0aa8a056c75d9d7eb41
+CARGO_TARGET_DIR=/path/to/target-before cargo build --release -p engine --bench dot_kernel_bench \
+  --manifest-path /path/to/before/crates/engine/Cargo.toml
+CARGO_TARGET_DIR=/path/to/target-after  cargo build --release -p engine --bench dot_kernel_bench \
+  --manifest-path /path/to/after/crates/engine/Cargo.toml
+# 実行ファイルは target-*/release/deps/dot_kernel_bench-<hash>（.d を除く最新）
+
+BEFORE_BIN=/path/to/bin/before AFTER_BIN=/path/to/bin/after \
+  scripts/bench_dot_kernel_ab.sh 5
+```
+
+閾値候補（`cand384`）は `after` の `crates/engine/src/isa.rs` の
+`pub const DOT_MULTI_ACC_MIN_DIM: usize = 768;` を `384` へ書き換えてから
+同様にビルドし、`CAND_BINS="cand384=/path/to/bin/cand384"` を追加して実行する
+（コミットしない使い捨てビルド）。
+
+生データは `docs/design/bench-data/dot-kernel-multi-acc-ab/20260907T125122Z-summary.tsv`
+（層 A）・`20260907T125122Z-layerB/`（層 B。`chip_bench` `summary.json`）参照。
+
+### 限界・申し送り
+
+- AVX-512／NEON／Apple Silicon 実機での実測・閾値の最終確定は未実施
+  （Issue #530・オーナー実機。上記テンプレート参照）
+- block4 dim1536 のバイナリ間比較は未実施（`harness/dot_block.rs::
+  BLOCK_AB_DIMS` が `[128, 768]` 固定のため。ベンチ本体を変更すると
+  before バイナリと交絡するため本 Issue では追加しなかった）
+- 層 B は `feature_768`（1 規模点・1 ワークロード）のみ実測。
+  `knn_profile` ワークロード・25k 以外の規模点・専有環境
+  （`BENCH_DEDICATED_ENV=1`）での再実測は未実施
+- block4 経路の退行（8〜11%）への対処（行ブロック側 ACC=4 化 or 閾値見直し）
+  は本 Issue のスコープ外。オーナー判断・別 Issue 候補として申し送る
+  （自動運転モードのため本 Issue では Issue 起票を行っていない）
+- 共有 QEMU 環境（本開発環境）での実測は本節のとおり参考値・採否根拠に
+  しない（`benchmark-judgement-policy.md` §5）

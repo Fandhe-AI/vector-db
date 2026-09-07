@@ -1,0 +1,441 @@
+side	pair	kind	working_set	dim	rows	value_ms	ns_per_dot	ratio	status
+before	1	current	cache_resident	100	163	0.178	5.47		ok
+before	1	current	cache_resident	128	128	0.150	5.87		ok
+before	1	current	cache_resident	384	42	0.157	18.74		ok
+before	1	current	cache_resident	768	21	0.190	45.27		ok
+before	1	current	cache_resident	1536	10	0.202	100.96		ok
+before	1	current	arena_scale	100	25000	0.199	7.95		ok
+before	1	current	arena_scale	128	25000	0.264	10.56		ok
+before	1	current	arena_scale	384	25000	1.292	51.68		ok
+before	1	current	arena_scale	768	25000	3.179	127.15		ok
+before	1	current	arena_scale	1536	25000	6.753	270.11		ok
+before	1	block_single	cache_resident	128		0.134			ok
+before	1	block4	cache_resident	128		0.123		0.924	ok
+before	1	block_single	cache_resident	768		0.179			ok
+before	1	block4	cache_resident	768		0.107		0.597	ok
+before	1	block_single	arena_scale	128		0.209			ok
+before	1	block4	arena_scale	128		0.207		0.991	ok
+before	1	block_single	arena_scale	768		3.188			ok
+before	1	block4	arena_scale	768		2.626		0.824	ok
+before	1	block_ref	cache_resident	128		0.140		0.0495	ok
+before	1	block_ref	cache_resident	768		0.180		0.0388	ok
+before	1	block_ref	arena_scale	128		0.215		0.1935	ok
+before	1	block_ref	arena_scale	768		3.194		0.1416	ok
+after	1	current	cache_resident	100	163	0.180	5.52		ok
+after	1	current	cache_resident	128	128	0.146	5.69		ok
+after	1	current	cache_resident	384	42	0.152	18.12		ok
+after	1	current	cache_resident	768	21	0.121	28.81		ok
+after	1	current	cache_resident	1536	10	0.111	55.73		ok
+after	1	current	arena_scale	100	25000	0.171	6.84		ok
+after	1	current	arena_scale	128	25000	0.228	9.10		ok
+after	1	current	arena_scale	384	25000	1.315	52.60		ok
+after	1	current	arena_scale	768	25000	2.958	118.30		ok
+after	1	current	arena_scale	1536	25000	6.035	241.39		ok
+after	1	block_single	cache_resident	128		0.133			ok
+after	1	block4	cache_resident	128		0.124		0.935	ok
+after	1	block_single	cache_resident	768		0.115			ok
+after	1	block4	cache_resident	768		0.116		1.008	ok
+after	1	block_single	arena_scale	128		0.202			ok
+after	1	block4	arena_scale	128		0.204		1.009	ok
+after	1	block_single	arena_scale	768		2.970			ok
+after	1	block4	arena_scale	768		2.953		0.994	ok
+after	1	block_ref	cache_resident	128		0.146		0.0969	ok
+after	1	block_ref	cache_resident	768		0.115		0.0634	ok
+after	1	block_ref	arena_scale	128		0.211		0.1754	ok
+after	1	block_ref	arena_scale	768		2.940		0.0643	ok
+before	1c0	current	cache_resident	100	163	0.176	5.39		ok
+before	1c0	current	cache_resident	128	128	0.140	5.46		ok
+before	1c0	current	cache_resident	384	42	0.151	18.02		ok
+before	1c0	current	cache_resident	768	21	0.186	44.31		ok
+before	1c0	current	cache_resident	1536	10	0.200	100.05		ok
+before	1c0	current	arena_scale	100	25000	0.165	6.61		ok
+before	1c0	current	arena_scale	128	25000	0.230	9.18		ok
+before	1c0	current	arena_scale	384	25000	1.315	52.59		ok
+before	1c0	current	arena_scale	768	25000	3.185	127.41		ok
+before	1c0	current	arena_scale	1536	25000	6.591	263.63		ok
+before	1c0	block_single	cache_resident	128		0.134			ok
+before	1c0	block4	cache_resident	128		0.124		0.924	ok
+before	1c0	block_single	cache_resident	768		0.198			ok
+before	1c0	block4	cache_resident	768		0.107		0.538	ok
+before	1c0	block_single	arena_scale	128		0.202			ok
+before	1c0	block4	arena_scale	128		0.203		1.003	ok
+before	1c0	block_single	arena_scale	768		3.080			ok
+before	1c0	block4	arena_scale	768		2.595		0.843	ok
+before	1c0	block_ref	cache_resident	128		0.140		0.1873	ok
+before	1c0	block_ref	cache_resident	768		0.179		0.0564	ok
+before	1c0	block_ref	arena_scale	128		0.210		0.1485	ok
+before	1c0	block_ref	arena_scale	768		3.128		0.1414	ok
+cand384	1	current	cache_resident	100	163	0.180	5.53		ok
+cand384	1	current	cache_resident	128	128	0.146	5.70		ok
+cand384	1	current	cache_resident	384	42	0.122	14.58		ok
+cand384	1	current	cache_resident	768	21	0.121	28.76		ok
+cand384	1	current	cache_resident	1536	10	0.113	56.25		ok
+cand384	1	current	arena_scale	100	25000	0.163	6.53		ok
+cand384	1	current	arena_scale	128	25000	0.225	8.99		ok
+cand384	1	current	arena_scale	384	25000	1.176	47.03		ok
+cand384	1	current	arena_scale	768	25000	2.878	115.11		ok
+cand384	1	current	arena_scale	1536	25000	5.881	235.25		ok
+cand384	1	block_single	cache_resident	128		0.133			ok
+cand384	1	block4	cache_resident	128		0.125		0.936	ok
+cand384	1	block_single	cache_resident	768		0.116			ok
+cand384	1	block4	cache_resident	768		0.116		1.007	ok
+cand384	1	block_single	arena_scale	128		0.210			ok
+cand384	1	block4	arena_scale	128		0.211		1.005	ok
+cand384	1	block_single	arena_scale	768		2.911			ok
+cand384	1	block4	arena_scale	768		2.939		1.009	ok
+cand384	1	block_ref	cache_resident	128		0.146		0.1118	ok
+cand384	1	block_ref	cache_resident	768		0.115		0.0559	ok
+cand384	1	block_ref	arena_scale	128		0.218		0.3009	ok
+cand384	1	block_ref	arena_scale	768		2.938		0.1037	ok
+before	2	current	cache_resident	100	163	0.188	5.76		ok
+before	2	current	cache_resident	128	128	0.139	5.44		ok
+before	2	current	cache_resident	384	42	0.175	20.89		ok
+before	2	current	cache_resident	768	21	0.206	49.17		ok
+before	2	current	cache_resident	1536	10	0.208	103.82		ok
+before	2	current	arena_scale	100	25000	0.167	6.67		ok
+before	2	current	arena_scale	128	25000	0.227	9.08		ok
+before	2	current	arena_scale	384	25000	1.269	50.77		ok
+before	2	current	arena_scale	768	25000	3.097	123.88		ok
+before	2	current	arena_scale	1536	25000	6.442	257.68		ok
+before	2	block_single	cache_resident	128		0.134			ok
+before	2	block4	cache_resident	128		0.124		0.924	ok
+before	2	block_single	cache_resident	768		0.179			ok
+before	2	block4	cache_resident	768		0.107		0.596	ok
+before	2	block_single	arena_scale	128		0.203			ok
+before	2	block4	arena_scale	128		0.205		1.010	ok
+before	2	block_single	arena_scale	768		3.069			ok
+before	2	block4	arena_scale	768		2.563		0.835	ok
+before	2	block_ref	cache_resident	128		0.140		0.0628	ok
+before	2	block_ref	cache_resident	768		0.198		0.0403	ok
+before	2	block_ref	arena_scale	128		0.211		0.2247	ok
+before	2	block_ref	arena_scale	768		3.110		0.0760	ok
+after	2	current	cache_resident	100	163	0.180	5.52		ok
+after	2	current	cache_resident	128	128	0.146	5.69		ok
+after	2	current	cache_resident	384	42	0.152	18.11		ok
+after	2	current	cache_resident	768	21	0.121	28.79		ok
+after	2	current	cache_resident	1536	10	0.113	56.47		ok
+after	2	current	arena_scale	100	25000	0.163	6.52		ok
+after	2	current	arena_scale	128	25000	0.225	8.98		ok
+after	2	current	arena_scale	384	25000	1.268	50.71		ok
+after	2	current	arena_scale	768	25000	2.873	114.93		ok
+after	2	current	arena_scale	1536	25000	5.826	233.03		ok
+after	2	block_single	cache_resident	128		0.133			ok
+after	2	block4	cache_resident	128		0.124		0.935	ok
+after	2	block_single	cache_resident	768		0.115			ok
+after	2	block4	cache_resident	768		0.116		1.008	ok
+after	2	block_single	arena_scale	128		0.213			ok
+after	2	block4	arena_scale	128		0.208		0.975	ok
+after	2	block_single	arena_scale	768		2.908			ok
+after	2	block4	arena_scale	768		2.918		1.003	ok
+after	2	block_ref	cache_resident	128		0.146		1.1085	ok
+after	2	block_ref	cache_resident	768		0.116		1.4350	ok
+after	2	block_ref	arena_scale	128		0.228		0.1925	ok
+after	2	block_ref	arena_scale	768		2.935		0.3058	ok
+before	2c0	current	cache_resident	100	163	0.176	5.41		ok
+before	2c0	current	cache_resident	128	128	0.139	5.44		ok
+before	2c0	current	cache_resident	384	42	0.152	18.08		ok
+before	2c0	current	cache_resident	768	21	0.186	44.29		ok
+before	2c0	current	cache_resident	1536	10	0.206	102.80		ok
+before	2c0	current	arena_scale	100	25000	0.166	6.64		ok
+before	2c0	current	arena_scale	128	25000	0.237	9.48		ok
+before	2c0	current	arena_scale	384	25000	1.226	49.04		ok
+before	2c0	current	arena_scale	768	25000	3.127	125.06		ok
+before	2c0	current	arena_scale	1536	25000	6.653	266.14		ok
+before	2c0	block_single	cache_resident	128		0.134			ok
+before	2c0	block4	cache_resident	128		0.124		0.927	ok
+before	2c0	block_single	cache_resident	768		0.179			ok
+before	2c0	block4	cache_resident	768		0.107		0.598	ok
+before	2c0	block_single	arena_scale	128		0.201			ok
+before	2c0	block4	arena_scale	128		0.203		1.010	ok
+before	2c0	block_single	arena_scale	768		3.157			ok
+before	2c0	block4	arena_scale	768		2.620		0.830	ok
+before	2c0	block_ref	cache_resident	128		0.140		0.0532	ok
+before	2c0	block_ref	cache_resident	768		0.179		0.0411	ok
+before	2c0	block_ref	arena_scale	128		0.209		0.1911	ok
+before	2c0	block_ref	arena_scale	768		3.161		0.1119	ok
+cand384	2	current	cache_resident	100	163	0.180	5.52		ok
+cand384	2	current	cache_resident	128	128	0.146	5.69		ok
+cand384	2	current	cache_resident	384	42	0.123	14.66		ok
+cand384	2	current	cache_resident	768	21	0.121	28.82		ok
+cand384	2	current	cache_resident	1536	10	0.113	56.45		ok
+cand384	2	current	arena_scale	100	25000	0.173	6.91		ok
+cand384	2	current	arena_scale	128	25000	0.228	9.12		ok
+cand384	2	current	arena_scale	384	25000	1.198	47.91		ok
+cand384	2	current	arena_scale	768	25000	2.980	119.19		ok
+cand384	2	current	arena_scale	1536	25000	5.847	233.88		ok
+cand384	2	block_single	cache_resident	128		0.133			ok
+cand384	2	block4	cache_resident	128		0.125		0.934	ok
+cand384	2	block_single	cache_resident	768		0.115			ok
+cand384	2	block4	cache_resident	768		0.116		1.007	ok
+cand384	2	block_single	arena_scale	128		0.197			ok
+cand384	2	block4	arena_scale	128		0.202		1.024	ok
+cand384	2	block_single	arena_scale	768		2.783			ok
+cand384	2	block4	arena_scale	768		2.764		0.993	ok
+cand384	2	block_ref	cache_resident	128		0.146		0.0491	ok
+cand384	2	block_ref	cache_resident	768		0.115		0.0679	ok
+cand384	2	block_ref	arena_scale	128		0.204		0.1044	ok
+cand384	2	block_ref	arena_scale	768		2.758		0.1620	ok
+before	3	current	cache_resident	100	163	0.176	5.40		ok
+before	3	current	cache_resident	128	128	0.139	5.45		ok
+before	3	current	cache_resident	384	42	0.152	18.07		ok
+before	3	current	cache_resident	768	21	0.186	44.29		ok
+before	3	current	cache_resident	1536	10	0.200	99.89		ok
+before	3	current	arena_scale	100	25000	0.174	6.96		ok
+before	3	current	arena_scale	128	25000	0.246	9.84		ok
+before	3	current	arena_scale	384	25000	1.264	50.55		ok
+before	3	current	arena_scale	768	25000	3.119	124.78		ok
+before	3	current	arena_scale	1536	25000	6.681	267.24		ok
+before	3	block_single	cache_resident	128		0.134			ok
+before	3	block4	cache_resident	128		0.124		0.925	ok
+before	3	block_single	cache_resident	768		0.179			ok
+before	3	block4	cache_resident	768		0.107		0.599	ok
+before	3	block_single	arena_scale	128		0.207			ok
+before	3	block4	arena_scale	128		0.210		1.013	ok
+before	3	block_single	arena_scale	768		3.178			ok
+before	3	block4	arena_scale	768		2.653		0.835	ok
+before	3	block_ref	cache_resident	128		0.140		0.0723	ok
+before	3	block_ref	cache_resident	768		0.179		0.0407	ok
+before	3	block_ref	arena_scale	128		0.215		0.2244	ok
+before	3	block_ref	arena_scale	768		3.186		0.2064	ok
+after	3	current	cache_resident	100	163	0.186	5.71		ok
+after	3	current	cache_resident	128	128	0.146	5.69		ok
+after	3	current	cache_resident	384	42	0.152	18.12		ok
+after	3	current	cache_resident	768	21	0.121	28.80		ok
+after	3	current	cache_resident	1536	10	0.112	56.22		ok
+after	3	current	arena_scale	100	25000	0.170	6.79		ok
+after	3	current	arena_scale	128	25000	0.242	9.68		ok
+after	3	current	arena_scale	384	25000	1.294	51.75		ok
+after	3	current	arena_scale	768	25000	2.945	117.78		ok
+after	3	current	arena_scale	1536	25000	5.779	231.18		ok
+after	3	block_single	cache_resident	128		0.133			ok
+after	3	block4	cache_resident	128		0.124		0.934	ok
+after	3	block_single	cache_resident	768		0.115			ok
+after	3	block4	cache_resident	768		0.116		1.009	ok
+after	3	block_single	arena_scale	128		0.199			ok
+after	3	block4	arena_scale	128		0.204		1.025	ok
+after	3	block_single	arena_scale	768		2.733			ok
+after	3	block4	arena_scale	768		2.739		1.002	ok
+after	3	block_ref	cache_resident	128		0.146		0.2231	ok
+after	3	block_ref	cache_resident	768		0.115		0.0805	ok
+after	3	block_ref	arena_scale	128		0.209		0.2303	ok
+after	3	block_ref	arena_scale	768		2.735		0.3408	ok
+before	3c0	current	cache_resident	100	163	0.176	5.39		ok
+before	3c0	current	cache_resident	128	128	0.140	5.46		ok
+before	3c0	current	cache_resident	384	42	0.152	18.04		ok
+before	3c0	current	cache_resident	768	21	0.186	44.33		ok
+before	3c0	current	cache_resident	1536	10	0.204	102.17		ok
+before	3c0	current	arena_scale	100	25000	0.195	7.81		ok
+before	3c0	current	arena_scale	128	25000	0.263	10.51		ok
+before	3c0	current	arena_scale	384	25000	1.315	52.60		ok
+before	3c0	current	arena_scale	768	25000	3.200	127.99		ok
+before	3c0	current	arena_scale	1536	25000	6.403	256.11		ok
+before	3c0	block_single	cache_resident	128		0.134			ok
+before	3c0	block4	cache_resident	128		0.124		0.927	ok
+before	3c0	block_single	cache_resident	768		0.179			ok
+before	3c0	block4	cache_resident	768		0.107		0.596	ok
+before	3c0	block_single	arena_scale	128		0.198			ok
+before	3c0	block4	arena_scale	128		0.203		1.026	ok
+before	3c0	block_single	arena_scale	768		2.929			ok
+before	3c0	block4	arena_scale	768		2.500		0.854	ok
+before	3c0	block_ref	cache_resident	128		0.140		0.0779	ok
+before	3c0	block_ref	cache_resident	768		0.180		0.0451	ok
+before	3c0	block_ref	arena_scale	128		0.204		0.2060	ok
+before	3c0	block_ref	arena_scale	768		2.904		0.0703	ok
+cand384	3	current	cache_resident	100	163	0.180	5.53		ok
+cand384	3	current	cache_resident	128	128	0.146	5.69		ok
+cand384	3	current	cache_resident	384	42	0.123	14.68		ok
+cand384	3	current	cache_resident	768	21	0.121	28.71		ok
+cand384	3	current	cache_resident	1536	10	0.111	55.39		ok
+cand384	3	current	arena_scale	100	25000	0.175	7.00		ok
+cand384	3	current	arena_scale	128	25000	0.249	9.95		ok
+cand384	3	current	arena_scale	384	25000	1.536	61.43		ok
+cand384	3	current	arena_scale	768	25000	2.975	119.01		ok
+cand384	3	current	arena_scale	1536	25000	5.751	230.05		ok
+cand384	3	block_single	cache_resident	128		0.132			ok
+cand384	3	block4	cache_resident	128		0.125		0.941	ok
+cand384	3	block_single	cache_resident	768		0.115			ok
+cand384	3	block4	cache_resident	768		0.116		1.007	ok
+cand384	3	block_single	arena_scale	128		0.196			ok
+cand384	3	block4	arena_scale	128		0.199		1.018	ok
+cand384	3	block_single	arena_scale	768		2.751			ok
+cand384	3	block4	arena_scale	768		2.748		0.999	ok
+cand384	3	block_ref	cache_resident	128		0.146		0.1688	ok
+cand384	3	block_ref	cache_resident	768		0.115		0.1039	ok
+cand384	3	block_ref	arena_scale	128		0.202		0.1552	ok
+cand384	3	block_ref	arena_scale	768		2.733		0.0986	ok
+before	4	current	cache_resident	100	163	0.176	5.39		ok
+before	4	current	cache_resident	128	128	0.141	5.52		ok
+before	4	current	cache_resident	384	42	0.151	18.03		ok
+before	4	current	cache_resident	768	21	0.186	44.33		ok
+before	4	current	cache_resident	1536	10	0.213	106.28		ok
+before	4	current	arena_scale	100	25000	0.163	6.53		ok
+before	4	current	arena_scale	128	25000	0.224	8.97		ok
+before	4	current	arena_scale	384	25000	1.222	48.88		ok
+before	4	current	arena_scale	768	25000	2.867	114.68		ok
+before	4	current	arena_scale	1536	25000	6.471	258.84		ok
+before	4	block_single	cache_resident	128		0.137			ok
+before	4	block4	cache_resident	128		0.127		0.925	ok
+before	4	block_single	cache_resident	768		0.179			ok
+before	4	block4	cache_resident	768		0.107		0.598	ok
+before	4	block_single	arena_scale	128		0.206			ok
+before	4	block4	arena_scale	128		0.205		0.995	ok
+before	4	block_single	arena_scale	768		3.137			ok
+before	4	block4	arena_scale	768		2.596		0.828	ok
+before	4	block_ref	cache_resident	128		0.141		0.0657	ok
+before	4	block_ref	cache_resident	768		0.179		0.0584	ok
+before	4	block_ref	arena_scale	128		0.215		0.2395	ok
+before	4	block_ref	arena_scale	768		3.072		0.1332	ok
+after	4	current	cache_resident	100	163	0.538	16.52		ok
+after	4	current	cache_resident	128	128	0.146	5.69		ok
+after	4	current	cache_resident	384	42	0.152	18.13		ok
+after	4	current	cache_resident	768	21	0.121	28.82		ok
+after	4	current	cache_resident	1536	10	0.112	55.92		ok
+after	4	current	arena_scale	100	25000	0.197	7.88		ok
+after	4	current	arena_scale	128	25000	0.228	9.12		ok
+after	4	current	arena_scale	384	25000	1.259	50.36		ok
+after	4	current	arena_scale	768	25000	2.879	115.14		ok
+after	4	current	arena_scale	1536	25000	5.871	234.84		ok
+after	4	block_single	cache_resident	128		0.133			ok
+after	4	block4	cache_resident	128		0.125		0.941	ok
+after	4	block_single	cache_resident	768		0.115			ok
+after	4	block4	cache_resident	768		0.116		1.008	ok
+after	4	block_single	arena_scale	128		0.205			ok
+after	4	block4	arena_scale	128		0.209		1.020	ok
+after	4	block_single	arena_scale	768		2.876			ok
+after	4	block4	arena_scale	768		2.881		1.002	ok
+after	4	block_ref	cache_resident	128		0.146		0.0801	ok
+after	4	block_ref	cache_resident	768		0.115		0.0697	ok
+after	4	block_ref	arena_scale	128		0.213		0.2016	ok
+after	4	block_ref	arena_scale	768		2.900		0.1127	ok
+before	4c0	current	cache_resident	100	163	0.176	5.39		ok
+before	4c0	current	cache_resident	128	128	0.140	5.45		ok
+before	4c0	current	cache_resident	384	42	0.151	17.98		ok
+before	4c0	current	cache_resident	768	21	0.186	44.30		ok
+before	4c0	current	cache_resident	1536	10	0.209	104.63		ok
+before	4c0	current	arena_scale	100	25000	0.177	7.08		ok
+before	4c0	current	arena_scale	128	25000	0.228	9.11		ok
+before	4c0	current	arena_scale	384	25000	1.209	48.34		ok
+before	4c0	current	arena_scale	768	25000	3.134	125.38		ok
+before	4c0	current	arena_scale	1536	25000	6.594	263.75		ok
+before	4c0	block_single	cache_resident	128		0.134			ok
+before	4c0	block4	cache_resident	128		0.124		0.925	ok
+before	4c0	block_single	cache_resident	768		0.179			ok
+before	4c0	block4	cache_resident	768		0.107		0.599	ok
+before	4c0	block_single	arena_scale	128		0.204			ok
+before	4c0	block4	arena_scale	128		0.205		1.007	ok
+before	4c0	block_single	arena_scale	768		3.128			ok
+before	4c0	block4	arena_scale	768		2.601		0.832	ok
+before	4c0	block_ref	cache_resident	128		0.140		0.0497	ok
+before	4c0	block_ref	cache_resident	768		0.179		0.0447	ok
+before	4c0	block_ref	arena_scale	128		0.214		0.1529	ok
+before	4c0	block_ref	arena_scale	768		3.090		0.1036	ok
+cand384	4	current	cache_resident	100	163	0.180	5.52		ok
+cand384	4	current	cache_resident	128	128	0.146	5.69		ok
+cand384	4	current	cache_resident	384	42	0.124	14.74		ok
+cand384	4	current	cache_resident	768	21	0.121	28.86		ok
+cand384	4	current	cache_resident	1536	10	0.113	56.39		ok
+cand384	4	current	arena_scale	100	25000	0.165	6.58		ok
+cand384	4	current	arena_scale	128	25000	0.230	9.19		ok
+cand384	4	current	arena_scale	384	25000	1.176	47.04		ok
+cand384	4	current	arena_scale	768	25000	2.961	118.45		ok
+cand384	4	current	arena_scale	1536	25000	5.858	234.32		ok
+cand384	4	block_single	cache_resident	128		0.133			ok
+cand384	4	block4	cache_resident	128		0.124		0.938	ok
+cand384	4	block_single	cache_resident	768		0.115			ok
+cand384	4	block4	cache_resident	768		0.116		1.007	ok
+cand384	4	block_single	arena_scale	128		0.201			ok
+cand384	4	block4	arena_scale	128		0.204		1.015	ok
+cand384	4	block_single	arena_scale	768		2.863			ok
+cand384	4	block4	arena_scale	768		2.856		0.998	ok
+cand384	4	block_ref	cache_resident	128		0.146		0.0812	ok
+cand384	4	block_ref	cache_resident	768		0.115		0.0669	ok
+cand384	4	block_ref	arena_scale	128		0.209		0.1433	ok
+cand384	4	block_ref	arena_scale	768		2.838		0.0976	ok
+before	5	current	cache_resident	100	163	0.176	5.41		ok
+before	5	current	cache_resident	128	128	0.140	5.45		ok
+before	5	current	cache_resident	384	42	0.152	18.10		ok
+before	5	current	cache_resident	768	21	0.186	44.33		ok
+before	5	current	cache_resident	1536	10	0.207	103.28		ok
+before	5	current	arena_scale	100	25000	0.163	6.51		ok
+before	5	current	arena_scale	128	25000	0.229	9.16		ok
+before	5	current	arena_scale	384	25000	1.324	52.96		ok
+before	5	current	arena_scale	768	25000	3.281	131.25		ok
+before	5	current	arena_scale	1536	25000	6.374	254.94		ok
+before	5	block_single	cache_resident	128		0.142			ok
+before	5	block4	cache_resident	128		0.125		0.874	ok
+before	5	block_single	cache_resident	768		0.179			ok
+before	5	block4	cache_resident	768		0.107		0.597	ok
+before	5	block_single	arena_scale	128		0.222			ok
+before	5	block4	arena_scale	128		0.216		0.973	ok
+before	5	block_single	arena_scale	768		3.001			ok
+before	5	block4	arena_scale	768		2.526		0.842	ok
+before	5	block_ref	cache_resident	128		0.151		1.3204	ok
+before	5	block_ref	cache_resident	768		0.184		0.7011	ok
+before	5	block_ref	arena_scale	128		0.238		0.2895	ok
+before	5	block_ref	arena_scale	768		2.960		0.1507	ok
+after	5	current	cache_resident	100	163	0.180	5.52		ok
+after	5	current	cache_resident	128	128	0.146	5.69		ok
+after	5	current	cache_resident	384	42	0.152	18.12		ok
+after	5	current	cache_resident	768	21	0.121	28.75		ok
+after	5	current	cache_resident	1536	10	0.112	56.15		ok
+after	5	current	arena_scale	100	25000	0.164	6.56		ok
+after	5	current	arena_scale	128	25000	0.253	10.12		ok
+after	5	current	arena_scale	384	25000	1.224	48.98		ok
+after	5	current	arena_scale	768	25000	2.872	114.89		ok
+after	5	current	arena_scale	1536	25000	5.767	230.69		ok
+after	5	block_single	cache_resident	128		0.132			ok
+after	5	block4	cache_resident	128		0.124		0.941	ok
+after	5	block_single	cache_resident	768		0.115			ok
+after	5	block4	cache_resident	768		0.116		1.008	ok
+after	5	block_single	arena_scale	128		0.203			ok
+after	5	block4	arena_scale	128		0.205		1.006	ok
+after	5	block_single	arena_scale	768		2.865			ok
+after	5	block4	arena_scale	768		2.865		1.000	ok
+after	5	block_ref	cache_resident	128		0.146		0.0808	ok
+after	5	block_ref	cache_resident	768		0.116		0.0533	ok
+after	5	block_ref	arena_scale	128		0.212		0.1512	ok
+after	5	block_ref	arena_scale	768		2.833		0.0808	ok
+before	5c0	current	cache_resident	100	163	0.176	5.39		ok
+before	5c0	current	cache_resident	128	128	0.140	5.45		ok
+before	5c0	current	cache_resident	384	42	0.152	18.08		ok
+before	5c0	current	cache_resident	768	21	0.186	44.31		ok
+before	5c0	current	cache_resident	1536	10	0.209	104.66		ok
+before	5c0	current	arena_scale	100	25000	0.162	6.49		ok
+before	5c0	current	arena_scale	128	25000	0.226	9.03		ok
+before	5c0	current	arena_scale	384	25000	1.257	50.29		ok
+before	5c0	current	arena_scale	768	25000	3.235	129.39		ok
+before	5c0	current	arena_scale	1536	25000	6.965	278.58		ok
+before	5c0	block_single	cache_resident	128		0.134			ok
+before	5c0	block4	cache_resident	128		0.124		0.926	ok
+before	5c0	block_single	cache_resident	768		0.179			ok
+before	5c0	block4	cache_resident	768		0.107		0.598	ok
+before	5c0	block_single	arena_scale	128		0.201			ok
+before	5c0	block4	arena_scale	128		0.200		0.992	ok
+before	5c0	block_single	arena_scale	768		3.090			ok
+before	5c0	block4	arena_scale	768		2.624		0.849	ok
+before	5c0	block_ref	cache_resident	128		0.141		0.0561	ok
+before	5c0	block_ref	cache_resident	768		0.179		0.0427	ok
+before	5c0	block_ref	arena_scale	128		0.210		0.1922	ok
+before	5c0	block_ref	arena_scale	768		3.079		0.0640	ok
+cand384	5	current	cache_resident	100	163	0.180	5.51		ok
+cand384	5	current	cache_resident	128	128	0.146	5.69		ok
+cand384	5	current	cache_resident	384	42	0.125	14.84		ok
+cand384	5	current	cache_resident	768	21	0.122	29.01		ok
+cand384	5	current	cache_resident	1536	10	0.113	56.50		ok
+cand384	5	current	arena_scale	100	25000	0.164	6.55		ok
+cand384	5	current	arena_scale	128	25000	0.227	9.09		ok
+cand384	5	current	arena_scale	384	25000	1.173	46.92		ok
+cand384	5	current	arena_scale	768	25000	2.952	118.07		ok
+cand384	5	current	arena_scale	1536	25000	5.731	229.25		ok
+cand384	5	block_single	cache_resident	128		0.141			ok
+cand384	5	block4	cache_resident	128		0.125		0.888	ok
+cand384	5	block_single	cache_resident	768		0.116			ok
+cand384	5	block4	cache_resident	768		0.117		1.009	ok
+cand384	5	block_single	arena_scale	128		0.197			ok
+cand384	5	block4	arena_scale	128		0.200		1.012	ok
+cand384	5	block_single	arena_scale	768		2.858			ok
+cand384	5	block4	arena_scale	768		2.863		1.002	ok
+cand384	5	block_ref	cache_resident	128		0.146		0.0688	ok
+cand384	5	block_ref	cache_resident	768		0.116		0.1617	ok
+cand384	5	block_ref	arena_scale	128		0.205		0.1884	ok
+cand384	5	block_ref	arena_scale	768		2.843		0.0788	ok
