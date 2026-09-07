@@ -162,6 +162,49 @@ pub fn c1_statement(
     ))
 }
 
+/// `[A-Za-z0-9_]+` に一致するかを検証する（`c1_where_statement` の `filter_token`
+/// 用。`is_valid_identifier` より緩い——先頭が数字でもよい——が、
+/// `'`・空白・SQL 記号を一切含めないため文字列リテラルへ未検証のまま連結する
+/// 経路にはならない。Issue #487 が生成する `bucket` 列の値 `b0`／`b1`… に使う）。
+fn is_valid_filter_token(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// SCALAR 事前フィルタ付き DISTANCE の規範形クエリ文字列を組み立てる: `SELECT id
+/// FROM <table> WHERE <filter_column> = '<filter_token>' ORDER BY <column> <=>
+/// '<literal>' LIMIT <k>`（Issue #487。可視比率 × 行数スイープが
+/// `sql::hnsw_cache::search_with_overlay`（`Subset` 形状）を発火させるために使う）。
+///
+/// `table`・`column`・`filter_column` は [`c1_statement`] と同じ識別子検証
+/// （`is_valid_identifier`）を経る。`filter_token` は [`is_valid_filter_token`]
+/// （`[A-Za-z0-9_]+`。単一引用符・SQL 記号を含められない）で検証してから単一
+/// 引用符内へ埋め込む——env 由来の比率整数から `format!("b{n}")` で組み立てた
+/// 値のみを渡す契約であり、untrusted な外部文字列をここへ渡す経路は無い。
+pub fn c1_where_statement(
+    table: &str,
+    column: &str,
+    filter_column: &str,
+    filter_token: &str,
+    literal: &VectorLiteral,
+    k: usize,
+) -> Result<String, SqlC1Error> {
+    if !is_valid_identifier(table) {
+        return Err(SqlC1Error::InvalidIdentifier("table"));
+    }
+    if !is_valid_identifier(column) {
+        return Err(SqlC1Error::InvalidIdentifier("column"));
+    }
+    if !is_valid_identifier(filter_column) {
+        return Err(SqlC1Error::InvalidIdentifier("filter_column"));
+    }
+    if !is_valid_filter_token(filter_token) {
+        return Err(SqlC1Error::InvalidIdentifier("filter_token"));
+    }
+    Ok(format!(
+        "SELECT id FROM {table} WHERE {filter_column} = '{filter_token}' ORDER BY {column} <=> '{literal}' LIMIT {k}"
+    ))
+}
+
 /// `BENCH_SQL_C1_VERBOSE` の opt-in 判定（TASK-83・Issue #278）。
 ///
 /// 既定（`raw` が `Some("1")` 以外）は非 verbose（`Ok(false)`）で、

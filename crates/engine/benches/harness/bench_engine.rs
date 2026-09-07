@@ -152,3 +152,120 @@ pub fn parse_dim(raw: Option<&str>, default: u32, max: u32) -> Result<u32, Bench
     }
     Ok(value)
 }
+
+/// `knn_profile_bench.rs` の可視比率 × 行数スイープ（Issue #487）が
+/// `BENCH_KNN_PROFILE_VISIBLE_RATIO` から読む可視比率の分母。`None` はスイープ
+/// モード無効（既定の非スイープ経路）を表す。分子は常に 1 に固定する
+/// （Issue #487 が測る「可視 1/N」の形状のみを対象とし、`2/5` のような任意比は
+/// 受理しない——受理形状を絞ることで env の入力空間を単純にし、
+/// `expected_arm`／`sql_c1::c1_where_statement` 側の `bucket` 列挙生成
+/// （`b0..b{N-1}`）とも 1 対 1 に対応させる）。
+pub fn parse_visible_ratio(
+    raw: Option<&str>,
+    max_denominator: u32,
+) -> Result<Option<u32>, BenchEngineError> {
+    let trimmed = raw.map(str::trim);
+    let denominator: u32 = match trimmed {
+        None | Some("") => return Ok(None),
+        Some(s) => {
+            let rest = s.strip_prefix("1/").ok_or_else(|| {
+                err(format!(
+                    "must be \"1/<N>\" with N a positive integer (got {s:?})"
+                ))
+            })?;
+            rest.parse::<u32>().map_err(|_| {
+                err(format!(
+                    "must be \"1/<N>\" with N a positive integer (got {s:?})"
+                ))
+            })?
+        }
+    };
+    if denominator == 0 {
+        return Err(err("denominator must be >= 1 (got 0)"));
+    }
+    if denominator > max_denominator {
+        return Err(err(format!(
+            "denominator must be <= {max_denominator} (got {denominator})"
+        )));
+    }
+    Ok(Some(denominator))
+}
+
+/// `BENCH_KNN_PROFILE_FULL_SCAN_RATIO` から `crate::hnsw::ValidatedHnswParams::
+/// with_full_scan_ratio` へ渡す `(numerator, denominator)` を読む（Issue #487）。
+/// `None` は既定値（`crate::hnsw::DEFAULT_FULL_SCAN_RATIO` = 1/10）を使うことを
+/// 表す。受理形状は `<num>/<den>`（`den >= 1`・`num <= den`）——本モジュールは
+/// `engine::` を import しない契約（モジュール冒頭コメント）のため、検証は
+/// `ValidatedHnswParams::with_full_scan_ratio` と同じ不変条件をタプルの範囲で
+/// 複製するに留め、実際の `Ratio` 構築・最終検証は呼び出し元（`knn_profile_bench.rs`。
+/// `engine::` を import できる）に委ねる。
+pub fn parse_full_scan_ratio(raw: Option<&str>) -> Result<Option<(u32, u32)>, BenchEngineError> {
+    let trimmed = raw.map(str::trim);
+    let s = match trimmed {
+        None | Some("") => return Ok(None),
+        Some(s) => s,
+    };
+    let (num_str, den_str) = s
+        .split_once('/')
+        .ok_or_else(|| err(format!("must be \"<num>/<den>\" (got {s:?})")))?;
+    let numerator: u32 = num_str.parse().map_err(|_| {
+        err(format!(
+            "numerator must be a non-negative integer (got {num_str:?})"
+        ))
+    })?;
+    let denominator: u32 = den_str.parse().map_err(|_| {
+        err(format!(
+            "denominator must be a positive integer (got {den_str:?})"
+        ))
+    })?;
+    if denominator == 0 {
+        return Err(err("denominator must be >= 1 (got 0)"));
+    }
+    if numerator > denominator {
+        return Err(err(format!(
+            "numerator must not exceed denominator (got {numerator}/{denominator})"
+        )));
+    }
+    Ok(Some((numerator, denominator)))
+}
+
+/// `knn_profile_bench.rs` のスイープが、`sql::hnsw_cache::search_with_overlay`
+/// の整数比較（`visible * den < index_len * num` なら plain scan）を、計測前に
+/// 「この (可視行数, 索引ノード数, full_scan_ratio) では ANN と plain scan の
+/// どちらが選ばれるはずか」を予測するラベル付け専用の複製（Issue #487）。
+///
+/// 実行時に実際に選ばれた経路は `HnswIndexCacheStats`（`subset_searches`・
+/// `plain_scans`・`mask_splits_graph`・`masked_short` 等）からのみ確定できる
+/// （マスク分断・結果不足等、比較だけでは分からない縮退経路があるため）。
+/// 本関数は doc 表の「予測 arm」列のラベル付けに使い、実測の「観測 arm」列とは
+/// 独立に扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedArm {
+    /// `visible * den >= index_len * num`: マスク付き ANN 探索が選ばれるはず。
+    AnnMasked,
+    /// `visible * den < index_len * num`: 可視カーディナリティ比が閾値未満で
+    /// plain scan が選ばれるはず。
+    PlainScanRatio,
+}
+
+pub fn expected_arm(
+    visible: u64,
+    index_len: u64,
+    full_scan_ratio: (u32, u32),
+) -> Result<ExpectedArm, BenchEngineError> {
+    let (num, den) = full_scan_ratio;
+    if den == 0 {
+        return Err(err("full_scan_ratio denominator must be >= 1 (got 0)"));
+    }
+    let lhs = visible
+        .checked_mul(den as u64)
+        .ok_or_else(|| err("overflow computing visible * full_scan_ratio.denominator"))?;
+    let rhs = index_len
+        .checked_mul(num as u64)
+        .ok_or_else(|| err("overflow computing index_len * full_scan_ratio.numerator"))?;
+    if lhs < rhs {
+        Ok(ExpectedArm::PlainScanRatio)
+    } else {
+        Ok(ExpectedArm::AnnMasked)
+    }
+}
