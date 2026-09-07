@@ -255,4 +255,253 @@ Issue 起票時の作業内容に「訪問済みビットマップの引き継�
   `full_scan_ratio`／`MAX_EF` 既定値の再調整（#413）は継続
 - `precision` モード hybrid の ANN 化（確信度ゲート契約の再設計が前提）
 - `SearchTimeFilter` 経路・Rust API `hybrid` 相当 API の結線
-- Phase B（再開型スキャン）の再検討（実測に基づく必要性の確認後）
+- ~~Phase B（再開型スキャン）の再検討（実測に基づく必要性の確認後）~~ 状態保持・
+  決定性・停止性の契約設計は完了（Issue #504。上記「Phase B 再検討
+  （Issue #504）」節参照）。実装（#505）・前後比較実測（#506）は継続
+
+## Phase B 再検討（Issue #504）: 再開型探索の状態保持と決定性・停止性契約
+
+親 Issue #503（`docs/design/hotpath-implementation-survey.md` §5・§9-#3c で
+「条件付き採用」と評価された pgvector `hnswscan.c` 型の破棄候補ヒープ保持）。
+Phase 3 親 #458／ルート #455。依存 #465（CLOSED。最新基線は
+`docs/design/hybrid-rrf-latency-breakdown.md`「最新基線（2026-09-06・
+Issue #465）」節）。実装は #505、前後比較実測は #506（本 Issue のスコープ外）。
+ステータス: **Proposed**（採否はオーナー判断。#505 のマージ根拠は本節が定める
+正しさ契約——bit 同一ゲート・Recall 非劣化——であり、性能面の採否は #506・
+専有環境実測に委ねる。共有 QEMU 環境の数値は採否根拠にしない。
+`docs/design/benchmark-judgement-policy.md` §5〜6）。
+
+上記「Phase B（訪問済みビットマップを引き継ぐ再開型スキャン）の採否」節の
+**Rejected 判定を撤回するものではない**。当時は実測上の必要性が確認できず
+見送ったのであり、本節はそれとは独立に「再開型にした場合、Issue #504 の
+見出し主張（融合結果・境界同点グループ・`fetch_k` スケジュールが不変）が
+どの範囲で成立するか」を #505 が機械検証できる粒度まで先に契約化する
+（実装 GO を意味しない）。
+
+### 現状の再実行型（コード事実の整理）
+
+呼び出し系列は次のとおり（origin/main で確認済み。関数名・定数名は本節末尾の
+すべてが対応するコードと一致することを実装前に再確認すること）:
+
+1. `sql/exec.rs` の `Ranking::Hybrid` 分岐が `prepare_full_visible`／
+   `prepare_subset`（`sql/hnsw_cache.rs`）をクエリ 1 回だけ呼び、
+   `sql::hnsw_hybrid::HnswDenseProvider::new` を構築、終了時に `finish()`
+2. `hybrid.rs::hybrid_search_boosted` の密側再取得ループが `dense_cap =
+   MAX_FETCH_K.min(input.ids.len())` を上限に、初期 `min(2·pool_depth,
+   dense_cap)` から `TieBoundary::Undetermined` の間 `dense_fetch_k` を
+   倍増しながら `provider.search` を**毎ラウンド最初から呼び直す**
+3. `HnswDenseProvider::search` は ptr-eq 受理条件（`input.vectors`／
+   `input.ids` が捕捉済みバッファと同一の場合のみ）で `search_prepared` へ
+   委譲し、`search_with_overlay`（`full_scan_ratio` 切替・
+   `mask_splits_graph` 検査・`k > MAX_EF` の `ef_cap_fallbacks`・
+   `search_masked`・`masked_short` ガード・スロット写像＋`kernel::dot`
+   再計算・delta brute-force マージ・`sort_by(score desc, id asc)`・
+   `dedup`・`truncate(k)`）を実行する
+
+`prepare_*` は #410 で既にクエリ 1 回に償却済み。ラウンド毎に再評価される
+のは `search_masked`（上位層貪欲降下・層 0 ビーム探索の全 visited ノードの
+距離計算）・写像検証・delta brute-force の部分であり、再開型の狙いは
+このラウンド間の重複探索を削減することにある。
+
+`docs/design/hybrid-rrf-latency-breakdown.md`「最新基線（2026-09-06・
+Issue #465）」節のとおり、既定エンジン `hybrid_rrf` の `dense(B0)` は
+25,000 行・dim 128 で全体の約 4.7〜4.8% にとどまる。再開型の効果は
+**hnsw opt-in かつ再取得ラウンドが実際に複数回発火するクエリ**（同点誘発
+コーパス等。`tests/hnsw_hybrid_refetch.rs` の条件）に限定され、全体レイテンシ
+への寄与は構造的に有界であることをここに明記する。
+
+### 状態保持契約
+
+- **所有者・寿命**: クエリ単位。`HnswDenseProvider` インスタンスが保持し
+  `finish()`（クエリ終了）で破棄する。**`HnswIndexCache` には置かない**——
+  同キャッシュは世代キー・複数クエリ間で共有される構造であり、再開状態は
+  特定の `prepared`（base ＋ overlay）・クエリベクトル・マスクの組に一意に
+  束縛されるため、キャッシュに混ぜるとテナント・クエリを跨いだ誤共有の
+  リスクを生む
+- **内容**（`hnsw.rs` の型で記述。#505 が新設する）: 独自の visited
+  ビットマップ（既存の thread-local `SEARCH_SCRATCH` はラウンド間で状態が
+  リセットされる前提のため使えず、専用スクラッチを新設する）・`candidates`
+  （未展開の受理済みノード。`BinaryHeap<ScoredNode>`）・`discarded`
+  （`worst_ok` 不受理で捨てたノード、および `results.pop()` で追い出された
+  ノード。`candidates` と同じ `ScoredNode::Ord`——スコア降順・id 昇順の
+  全順序）・`admitted`（これまでに受理されたノードとスコア。ラウンド r の
+  返却は `admitted` の上位 `k_r` 件）・直前ラウンドの `ef`
+- **再開手順**: ラウンド r（`k_r > k_{r-1}`）では `discarded` を
+  `candidates` へ合流し、`ef_r = effective_ef(k_r)` で `search_layer_in` の
+  while ループを**同じ停止条件・同じ受理判定（`worst_ok`）**のまま続行する。
+  上位層の貪欲降下（`ef=1`）は再実行しない——層 0 の状態のみを再開する
+- **メモリ上限**: visited は `⌈N/64⌉` 語（N は索引ノード数）、
+  `candidates`／`discarded` の要素数はいずれも高々 N、`admitted` も高々 N。
+  `k`・`ef` は構築済み `HnswIndex::search_masked` の検証（`MAX_EF` =
+  10,000 以下）を経由済みの値のみを受け取る。無制限確保はしない
+  （`coding-rust.md`「untrusted 入力の扱い」）
+- **並行性**: `SearchProvider` trait は `search(&self, ...)` を要求し
+  `Send + Sync` が前提のため、状態は `Mutex<Option<ResumeState>>`
+  （`RefCell` は `Sync` でないため不可）で保持する。lock poisoning は
+  fail-closed に「状態を捨てて `inner`（brute-force）へ委譲」する側へ倒す
+  ——poison から回復して不整合な状態を使い続けない
+- **無効化条件**（該当ラウンドは状態を破棄し既存の縮退経路へ倒す）:
+  - ptr-eq 受理条件が外れた（`input.vectors`／`input.ids` が別バッファ。
+    `search_delegates_to_inner_for_a_different_buffer` の既存契約と同型）
+  - `k_r > MAX_EF`（既存の `ef_cap_fallbacks` 経路）
+  - 解決形状が `PreparedHnswSearch::FullScan`（plain scan。索引探索を
+    経由しない）
+  - 索引探索エラー（`HnswError` 系）
+- **`FullScan`／`ef_cap_fallbacks` ラウンドの状態**: 不要（厳密
+  brute-force のため再開する探索状態自体が存在しない）。任意拡張として
+  「1 回の全件スコアリング結果を保持し以後は prefix を伸ばして提供する」
+  （疎側 #392 の `SparseScored::top` と同型で厳密かつ決定的）を候補として
+  記すが、**本 Issue では採否を決めない**（#505 のスコープ外）
+
+### 決定性契約: 「不変」の正確な等価クラス
+
+Issue の見出し「再開型にしても融合結果・境界同点グループ・`fetch_k`
+スケジュールが不変」を「現行の再実行型との bit 一致」と読むと、pgvector 型の
+破棄候補ヒープ再開では**一般には成立しない**。根拠は `search_layer_in` の
+受理判定 `worst_ok = results.len() < ef || score >= worst` が `ef` に
+依存することにある。`ef₁` で不受理になったノードは現行実装では visited
+マークのみ付けて捨てられる。`ef₂ > ef₁` の新規探索であれば同じノードが
+**受理され、さらにその隣接ノードが新たに展開される**。再開型は破棄ヒープ
+からそのノードを後で拾い直せるが、拾い直した時点での展開順序・visited
+集合の状態・`results.pop()` の追い出し対象が、`ef₂` からの新規探索と
+一致する保証はない。
+
+このため本節は次の等価クラスを契約として定める（弱体化ではなく、成立範囲を
+正確に記述するもの）:
+
+1. **provider 非依存で不変**（無条件）: `hybrid.rs` の `fetch_k` 生成規則・
+   `validate_extended_pool`・可視 id 検証（`core::provider_result_is_valid`）・
+   `resolve_boundary_tie_group`／`complete_boundary_tie_group_by`・
+   `rrf_fuse_with_limits`（`TieRank::GroupEnd`）・出力順（score desc・id
+   asc の安定ソート。`docs/design/rrf-tie-break-determinism.md`）。
+   `SearchProvider` trait のシグネチャは無変更のまま
+2. **再実行型と bit 一致するラウンド**: (a) ラウンド 1（同一クエリの
+   `search_layer_in` 1 回実行。破棄候補を捨てずに保持するだけでは
+   `results` の中身は変わらない）。(b) exhaustive 終了時（候補ヒープ ∪
+   破棄ヒープが空——マスク受理ノードの到達可能成分を全訪問した状態。
+   `mask_splits_graph == false` により到達可能集合 ＝ 受理ノード全体
+   （上記「DISTANCE 経路の `masked_short` 到達不能性」節の証明と同じ前提）
+   のため、この状態は厳密 Top-k と一致する）
+3. **一致を保証しないラウンド**: 非 exhaustive な ラウンド ≥ 2。上記の
+   `worst_ok` の `ef` 依存が根拠。結果は「ANN 候補順序に対する近似」であり、
+   これは上記「密 ANN 側の前方一致非保証」節（`ef` 拡大で prefix が
+   入れ替わりうる）と同じ位置づけの近似であって、新たに緩める契約ではない
+4. **帰結**: 同一クエリでも再開型と再実行型で**実現するラウンド数**が
+   異なりうる（各ラウンドの返却列が異なれば、そのラウンドでの
+   `TieBoundary` 判定——`Resolved`／`Undetermined`——も異なりうるため）。
+   「`fetch_k` スケジュールが不変」とは `fetch_k` の**生成規則**
+   （`dense_cap`・倍増式）が不変であることを意味し、実現ラウンド数の一致を
+   主張するものではない
+5. **同一索引・同一クエリ・同一世代での再現性**（`docs/design/
+   hnsw-search.md`「決定性の保証範囲」）は再開型でも維持する: 全ヒープが
+   `ScoredNode::Ord`（score desc・id asc）の全順序を持つこと、visited・
+   ヒープの初期化がクエリ開始時点で決定的であること、クエリ内は単一
+   スレッドで実行されること（スレッド非依存）
+6. **返却列の契約**（再開型でも不変）: 毎ラウンド、全ヒットに対して
+   スロット写像・`(tenant_id, id)` 照合・`kernel::dot` 再計算を行う
+   （差分更新はしない。O(k·dim) のコストより fail-closed な単純さを
+   優先する既存方針を維持）→ delta brute-force マージ → `sort_by`・
+   `dedup`・`truncate(k)`。`validate_extended_pool` を通過する
+7. **代替案（bit 一致を構成的に保証する案）**: 距離メモ再実行型——ノード→
+   スコアのメモをラウンド間で保持し、走査自体（展開・受理判定）は毎回
+   やり直す。展開を再開しないため性能面の主張（合計展開数 ≤ N）は成立
+   しないが、dot 積計算の重複だけは削減でき、結果は現行実装と bit 同一に
+   なる。#506 の実測で Recall 劣化や決定性上の懸念が出た場合の
+   フォールバックとして本節に記録するが、**採否はオーナー判断**とする
+
+### 停止性契約
+
+- ラウンド数上限は既存の `dense_cap`・`MAX_FETCH_K`（= 40,000）による
+  provider 非依存の有界性（`⌈log2(dense_cap / (2·pool_depth))⌉ + 1`。既定
+  `pool_depth = 200` なら小〜中規模で 8 以下）を再開型でも変更しない
+- ラウンド内の停止性: 各ヒープ pop は「停止条件成立」か「未訪問ノードの
+  展開」のいずれかであり、visited は単調増加かつ N で有界なため各
+  `run(ef)` は高々 N 回の展開で必ず停止する。**全ラウンド合計の展開数は
+  高々 N**（再実行型は各ラウンドが visited をリセットするため Σ_r
+  visited_r になり得る）——これが再開型の性能面の狙いであり、#506 で
+  実測する対象
+- `exhaustive` 推論の健全性: `hybrid.rs` は `hits.len() < dense_fetch_k`
+  から `exhaustive` を推論する。再開型でも「候補 ∪ 破棄ヒープが空のとき
+  にのみ `k` 未満を返す」（fail-closed。空でないのに `k` 未満を返しては
+  ならない）契約を維持する。既存の `masked_short` ガード
+  （`index_hits.len() < min(k, visible_in_index)` で plain scan へ縮退）も
+  残置し、`search_with_overlay` の不等式 `index_hits.len() >=
+  min(ef_eff, visible_in_index)` が再開型でも成立することを #505 で示す
+  （`mask_splits_graph == false` により受理ノード全体が到達可能であるため、
+  この不等式は既存証明の系として成立する）
+- `k_r > MAX_EF`: 既存契約どおり状態を破棄し `ef_cap_fallbacks` を計上して
+  厳密 brute-force へ縮退する（変更しない）
+
+### 実装方針（#505 向け・列挙のみ。本 Issue では実装しない）
+
+- `hnsw.rs::search_layer_in` を「状態構造体 `LayerScanState { candidates,
+  discarded, admitted, visited }` に対する `run(ef)`」へ再構成し、既存の
+  `search_layer_in`（現行の公開シグネチャ・呼び出し元）はその 1 回実行の
+  薄いラッパとして維持する。アルゴリズム本体を複製しない（#494 の
+  `Adjacency` ジェネリック・#490 の `PrefetchPolicy` をそのまま利用する）。
+  **ラウンド 1 の bit 同一性**（再開型 `run(ef₁)` と現行
+  `search_layer_in(ef₁)` の完全一致。`search_masked_none_matches_search`・
+  `tests/hnsw_search.rs`・`tests/hnsw_cache.rs` の全件無変更 green）が
+  受け入れゲートとなる
+- `discarded` の保持は既存の `search_masked`（通常呼び出し）では行わない
+  ——コスト・挙動を変えないため。再開型 API（例:
+  `HnswIndex::search_masked_resumable`）を別途 `pub(crate)` として追加し、
+  既存の `search`／`search_masked` の公開 API・エラー契約は変更しない
+- `sql/hnsw_cache.rs::search_with_overlay` の解決済み経路に「再開ハンドル
+  付き探索」を追加する（`prepare_*`／`search_prepared` が既に分離済みで
+  ある構成を活かす）。統計に `hybrid_resumed_rounds`（再開により完走した
+  ラウンド数）等の追加候補を挙げるが、テナント ID・行 ID・スコアは
+  含めない（既存の統計方針を維持）
+- `sql/hnsw_hybrid.rs::HnswDenseProvider` が `Mutex<Option<ResumeState>>`
+  を保持し、上記「状態保持契約」の無効化条件を判定する
+- 新規 `unsafe` は追加しない。新規依存も追加しない（`Mutex` は std）
+
+### #505／#506 向け検証計画（列挙のみ）
+
+- 単体（`hnsw.rs`）: ラウンド 1 の bit 同一（再開型 `run(ef₁)` vs 現行
+  `search_layer_in(ef₁)`）、exhaustive 終了時の厳密性（brute-force 対照と
+  完全一致）、同一入力に対する再現性、`discarded` を合流しない実装との
+  差分が非 vacuous であること（合流しないと結果が変わる入力が存在する
+  ことの確認）
+- 結合（`tests/hnsw_hybrid_refetch.rs`・`tests/hnsw_cache.rs`）: 既存の
+  停止性（`hybrid_rounds_max <= 8`）・複数ラウンドの実発生
+  （`hybrid_rounds_max >= 2`）・3 回実行の bit 一致・既定エンジン対照
+  Recall@10 ≥ 0.9・可視外テナント非混入・`hybrid_dense_searches > 0` を
+  **無変更のまま green** で維持する
+- 「再実行型との一致」の定義: 単一ラウンドで完了するクエリ
+  （`hybrid_rounds_max == 1` を assert）と exhaustive 完了クエリについては
+  融合結果の bit 一致を検証する。複数ラウンドかつ非 exhaustive なクエリは
+  bit 一致ではなく契約プロパティ（ソート順・一意性・`len <= k`・可視集合
+  内であること）と既存の Recall 基準で検証する
+- #506（本 Issue のスコープ外）: `make bench-hybrid`（同点誘発コーパスの
+  A/B。Issue #324 の方式）を交互 min-of-N（N ≥ 5）・ノイズ帯併記で前後
+  比較し、`RECALL_ENGINE=hnsw` の 3 Recall ゲート（hybrid・rerank・
+  query-planning）が同一閾値で通ることを確認する。共有 QEMU 環境の数値は
+  採否根拠にしない（`docs/design/benchmark-judgement-policy.md` §5〜6）
+- ガード: `make core-api-check`（`SearchProvider`／`VectorCore` の trait
+  差分ゼロ）・`make sort-determinism-check`（`sort_by` のみの使用）
+
+### 外部実装の参照（手法名・ライセンスのみ）
+
+pgvector（PostgreSQL License）の `hnsw.iterative_scan` は上流 README で
+確認できる設定として `strict_order`（結果を厳密に距離順に保つ）・
+`relaxed_order`（順序をわずかに緩めて Recall を優先する）の 2 モードを持ち、
+`hnsw.max_scan_tuples`（既定 20,000。訪問タプル数の近似上限。初回スキャンには
+影響しない）・`hnsw.scan_mem_multiplier`（既定 1。`work_mem` に対する倍数
+としてのメモリ上限）で打ち切り条件を持つ。本リポの hybrid 密側再取得
+ループは各ラウンドで `hits` を丸ごと置き換える設計であり、`strict_order`
+型（後続で見つかった近い候補のために既に確定した順序を保つ機構）に相当する
+仕組みは不要である——`hybrid.rs` はラウンドの結果をマージ元として保持する
+だけで、途中経過の順序保証を提供する契約を持たないため。
+
+### セキュリティ考慮（OWASP Top 10 観点）
+
+| 観点 | 対応 |
+| ---- | ---- |
+| アクセス制御の不備／テナント境界（P0） | 索引は `(table, ctx)` 可視アリーナのみから構築する契約は不変。再開状態はクエリ単位で同一 `prepared`（同一 base・overlay・マスク）に束縛され、ptr-eq 受理条件が外れたラウンドは状態を破棄し `inner` へ委譲する（fail-closed）。`NodeMask` による非受理ノード非通過（#409 の P0 条件）は再開時も同一の受理判定を経由する。`hybrid.rs` の可視 id 検証・`RlsSafetyNet` の多層防御は無変更 |
+| 存在情報の副次漏えい | 追加統計案（`hybrid_resumed_rounds` 等）にテナント ID・行 ID・スコアを含めない。`EXPLAIN` へラウンド数・再開有無を露出しない（#411 の既存方針を維持） |
+| 不安全な設計（DoS） | ラウンド数は `dense_cap`・`MAX_FETCH_K` で有界のまま。再開状態のサイズは索引ノード数 N で有界。合計展開数は再実行型以下（≤ N）になる設計であり増加方向の変更ではない |
+| インジェクション | SQL 文字列の組み立てを伴わない（docs 専任） |
+| untrusted 入力 | `k`／`fetch_k` の検証順序（`MAX_EF` 検証 → `effective_ef`）を変更しない。`unwrap`／`expect`／添字アクセスを production コードに持ち込まない方針を #505 の実装制約として明記する |
+| 脆弱な依存 | 依存追加なし（`Mutex` は標準ライブラリ） |
+| private spec 漏えい（P0） | 本節・関連コミット・PR は TASK-nn／ビヘイビア ID のポインタ表記のみ。Issue 本文の逐語引用を行わない |
