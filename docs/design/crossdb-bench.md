@@ -325,20 +325,30 @@ Issue #532（PR #567・merge commit `59bc7a8`）はバッチ検索 GPU 経路の
   規模点ごとに before n=5／after n=5 の計 n=10）
 - 環境: 本開発環境（QEMU Virtual CPU・12 vCPU・avx2/fma/f16c・NVIDIA GeForce
   RTX 3060・driver 595.71.05・Vulkan backend）。計測全体（5 規模点 × 5 ペア ×
-  before/after）を通した loadavg は 1.57〜8.79（他セッションの同時実行を含む
-  共有環境）で `BENCH_DEDICATED_ENV` は未設定 → **参考値・採否根拠にしない**
-  （規約 §5）。#532 は Issue #402 系 ADR の対象外の独立変更であり、本計測は
-  「効果の記録」であって production コードの採否判定ではない（#532 は
-  既にマージ済み）
+  before/after）を通した各 run 開始時点の loadavg（1 分平均。下記 tracked TSV
+  の `loadavg_1m` 列の全 50 run 分布）は 1.57〜8.79（他セッションの同時実行を
+  含む共有環境）で `BENCH_DEDICATED_ENV` は未設定 → **参考値・採否根拠に
+  しない**（規約 §5）。#532 は Issue #402 系 ADR の対象外の独立変更であり、
+  本計測は「効果の記録」であって production コードの採否判定ではない
+  （#532 は既にマージ済み）
 - rows 3 種 × dim 2 種 × batch 4 種の既定格子 24 点のうち時間予算内で計測できた
   5 点（FAISS 対照点 100,000×128×64 を優先し、batch=1/8/64 の代表点・大規模点を
   選定）を実測。残りは「未計測」（旧値のまま埋めない）
 - **per-run 生データ**: `docs/design/bench-data/gpu-scaling-ab/20260907T082358Z-summary.tsv`
   （tracked。50 行＝5 規模点 × 5 ペア × before/after）。各行に
-  `cpu_p50`/`cpu_p95`/`f16_p50`/`f16_p95`/`f32_p50`/`f32_p95`/`mismatch` を
-  保持する。生ログ全文（`loadavg`・GPU クロック/温度・`gpu_scaling_bench` 出力）は
+  `cpu_p50`/`cpu_p95`/`f16_p50`/`f16_p95`/`f32_p50`/`f32_p95`/`mismatch` に加え、
+  規約 §3「環境記録」・§7.1 チェックリストが求める各 run 時点の `loadavg`（1/5/15分
+  平均）を `loadavg_1m`/`loadavg_5m`/`loadavg_15m` 列として保持する（codex-review
+  P1 指摘・PR #580・スレッド `PRRT_kwDOUAKASM6f1tz8` で追加。当初は summary の
+  数値列のみを tracked 化しコメントで「規約が求めるのは summary の保持のみ」と
+  誤って記載していたが、規約は各 run の loadavg も要求するため訂正した）。
+  値は `_/bench/gpu-scaling-ab/<point>/<pair>-<side>.log` の
+  `# pre-run environment snapshot` 直後の `loadavg:` 行（run 開始直前に採取した
+  1 回分のスナップショット）から抽出したもの。生ログ全文（`loadavg` の 5 番目の
+  フィールド以降・GPU クロック/温度・`gpu_scaling_bench` 出力全文）は
   `_/bench/gpu-scaling-ab/`（git 管理外）にのみ存在し tracked 化しない（規約が
-  求めるのは summary の保持のみ。詳細は下記「per-run 生データの所在」節参照）
+  求めるのは summary への集約値・loadavg の保持であり、生ログ全文の保持までは
+  求めない。詳細は下記「per-run 生データの所在」節参照）
 
 **実測記録表（f16 常駐。単位 µs、N=5 ペア）**
 
@@ -386,12 +396,13 @@ Issue #532（PR #567・merge commit `59bc7a8`）はバッチ検索 GPU 経路の
   の残り 19 点（dim=256 全点・batch=256 全点・20,000×128×1・500,000×128×8 等）
   は時間予算の都合で未計測。旧実測表の対応値をそのまま代用しない
 - **per-run 生データの所在**: `docs/design/bench-data/gpu-scaling-ab/20260907T082358Z-summary.tsv`
-  （tracked。上表の集約値の一次記録）。以後の再計測でも同じ命名規則
-  （`<UTC timestamp>-summary.tsv`）で `docs/design/bench-data/gpu-scaling-ab/`
-  へコミットし、本ドキュメントの実測表からそのパスを参照する運用を継続する
-  （スクリプト側の対応する注記は `scripts/bench_gpu_scaling_ab.sh` 冒頭
-  コメント参照）。初回計測（per-run 生データ不明・集約値のみ）の記録は
-  本節から削除した（codex-review P1 指摘・PR #580 の再計測により置き換え）
+  （tracked。上表の集約値・各 run の `loadavg_1m`/`loadavg_5m`/`loadavg_15m` の
+  一次記録）。以後の再計測でも同じ命名規則（`<UTC timestamp>-summary.tsv`）で
+  `docs/design/bench-data/gpu-scaling-ab/` へコミットし、本ドキュメントの
+  実測表からそのパスを参照する運用を継続する（スクリプト側の対応する注記は
+  `scripts/bench_gpu_scaling_ab.sh` 冒頭コメント参照）。初回計測（per-run
+  生データ不明・集約値のみ）の記録は本節から削除した（codex-review P1 指摘・
+  PR #580 の再計測により置き換え）
 
 **再現手順**:
 
