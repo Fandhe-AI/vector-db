@@ -57,11 +57,24 @@
 #
 # f16 算術版 S0 シェーダの前後比較（Issue #540。親 #402・#539）:
 # `QUERY_F16_EXACT=1` を設定すると両バイナリへ `BENCH_GPU_SCALING_QUERY_F16_EXACT`
-# としてパススルーする（before バイナリが本 env を持たない場合は無害に無視される。
-# `harness/gpu_scaling.rs::parse_query_f16_exact` doc 参照。未設定時は既定挙動
-# 〔クエリ丸めなし〕のまま不変）。summary.tsv 末尾へ
-# `f16_arith_dispatches`/`f16_arith_guard_fallbacks` 列を追加する
-# （`gpu_scaling_stats:` 行から抽出。既存 18 列の並び・意味は不変）。
+# としてパススルーする。**注意（codex-review P2 指摘・PR #611）**: これは
+# プロセス起動を落とさないという意味では「無害」だが、before バイナリが
+# 本 env の解釈コード（`harness/gpu_scaling.rs::parse_query_f16_exact`）を
+# 持たない場合は単に無視されるだけで、before はクエリを丸めない・after は
+# クエリを f16 厳密往復可能な値へ丸める、という**異なるクエリ集合の比較**に
+# なってしまい、`docs/design/gpu-batch-f16-arith.md` §8.1〜8.3 が解消した
+# はずの交絡（クエリの違いとシェーダの違いが同時に変動する）が本スクリプト
+# 経由の比較では再発する。before/after 双方が `parse_query_f16_exact` を
+# 持つ場合（= 両バイナリとも Issue #540 の丸め対応を含む場合）に限り本
+# opt-in は交絡なしで使える。それ以外（本 Issue の変更前後を跨ぐ比較等）
+# では本スクリプトではなく、同一プロセス内で `Unpack`／`F16Arith` を強制
+# する `BENCH_GPU_SCALING_SHADER_AB=1`（`bench-internals` feature・単一
+# after バイナリのみで完結する in-process A/B。`gpu_scaling_bench.rs::
+# measure_shader_ab`・`docs/design/gpu-batch-f16-arith.md` §8.3.1 参照）を
+# 使うこと。summary.tsv 末尾へ `f16_arith_dispatches`/
+# `f16_arith_guard_fallbacks` 列を追加する（`gpu_scaling_stats:` 行から
+# 抽出。既存 18 列の並び・意味は不変。未設定時は既定挙動〔クエリ丸めなし〕
+# のまま不変）。
 
 set -euo pipefail
 

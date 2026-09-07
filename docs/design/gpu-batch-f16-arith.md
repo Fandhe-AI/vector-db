@@ -339,11 +339,21 @@ opt-in の有無で `dataset.queries` 自体が変わる（未設定＝任意精
 （要約 TSV）・`20260907T-shader-ab-raw.log`（プロセス出力全文）参照
 （`docs/design/benchmark-judgement-policy.md` §3 の per-run 生データ保持契約）。
 
-`f16_arith_dispatches=40`・`f16_arith_guard_fallbacks=0` を全 5 run で確認
-（f16 算術版強制が全 dispatch で実際に受理されたことの確定的カウンタによる
-裏付け。`GpuSearchTestOptions::dot_shader` の fail-closed 契約——受理されない
-場合は測定自体が `Err` で失敗する——のため、この値が出ていること自体が
-「クエリが実際に f16 算術版シェーダへ到達した」ことの証跡になる）。
+`gpu_scaling_shader_ab:` 行が全 5 run で出力された（`measure_shader_ab` 内の
+`f16_arith_measurement` が `Err` を返さなかった）ことが、f16 算術版強制が
+全 dispatch で実際に受理されたことの証跡になる（`GpuSearchTestOptions::
+dot_shader` の fail-closed 契約——`select_dot_shader` の条件が不成立の場合は
+測定自体が `Err` で失敗し `gpu_scaling_shader_ab:` ではなく `unavailable`
+行が出力される——のため。**訂正（codex-review P2 指摘・PR #611）**: 旧版は
+この裏付けとして `f16_arith_dispatches=40`／`f16_arith_guard_fallbacks=0`
+という `gpu_scaling_stats:` 行のカウンタを引用していたが、このカウンタは
+`f16_stats_before`/`f16_stats_after`（`gpu_scaling_bench.rs`）が
+`measure_shader_ab` 呼び出し**より前**の自動選択経路（同一規模点の
+`gpu_scaling:` 計測、§8.2 と同種の呼び出し）を挟んで差分取得したもので
+あり、本節の強制 A/B（`measure_shader_ab` 内の 2 回の `batch_search_
+with_options_for_tests` 呼び出し）の dispatch 数ではない。強制 A/B 自体の
+dispatch 数を数えるカウンタは現状実装されていないため、上記の成功／
+エラー契約による証跡のみを根拠とする）。
 
 min-of-5／median（μs）:
 
@@ -360,11 +370,16 @@ loadavg・GPU クロックは他 run と同水準のため GPU 側以外のノ�
 benchmark-judgement-policy.md` §5 のとおり共有 QEMU 環境の数値は参考値で
 あり、採否根拠にはしない。専有環境での再実測は運用者作業として申し送る。
 
-**結論（8.3.2 の再解釈）**: 8.3.2 で観測されていた差（unpack 版 min 648µs
-vs f16 算術版 min 743µs）は、本節の交絡排除後の比較（min 双方 586µs・
-完全一致）と整合しない。8.3.2 の差は「クエリの違い」（f16 厳密往復済み
-クエリは丸め処理で成分の分布が変わる）に起因していた可能性が高く、
-シェーダ単体の効果ではなかったと解釈する。
+**結論（8.3.2 の再解釈）**: 8.3.2 の `gpu_f16_p95`（min-of-5）は p95 の
+分位点の値であり、本節と比較する場合は同じ分位点（p95 min: unpack 版
+594µs・f16 算術版 593µs）を対応させる必要がある（p50 min の 586µs／586µs
+ではない。**訂正（codex-review P2 指摘・PR #611）**: 旧版は誤って p50 min
+を挙げ「完全一致」としていた）。p95 min 同士で比べると 8.3.2 の差（unpack
+版 min 648µs vs f16 算術版 min 743µs）は本節（594µs vs 593µs・ほぼ同水準）
+まで大きく縮小するが、8.3.2 と本節は計測環境（プロセス起動タイミング・
+共有 QEMU VM の負荷状況）自体も異なるため、この差の縮小を「クエリの違い」
+（f16 厳密往復済みクエリは丸め処理で成分の分布が変わる）だけに帰属できる
+かは未確定として記録する（シェーダ単体の効果ではなかったと断定はしない）。
 
 #### 8.3.2 旧比較（`QUERY_F16_EXACT` opt-in 単独。クエリが交絡した参考値・保存のため残置）
 
