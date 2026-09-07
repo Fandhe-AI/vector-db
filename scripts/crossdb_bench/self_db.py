@@ -118,7 +118,8 @@ class SelfServer:
     def __init__(self, db_path: str, workdir: str, binary: str | None = None):
         self.db_path = db_path
         self.workdir = workdir
-        self.binary = binary or self._default_binary()
+        # 呼び出し側から渡された `binary` も同じ理由で絶対パスへ正規化する
+        self.binary = os.path.abspath(binary) if binary else self._default_binary()
         self.proc: subprocess.Popen | None = None
         # 子プロセスの stdout/stderr の書き出し先（ファイル）。パイプ（`subprocess.PIPE`）
         # を使うと、誰も読み取らない間に OS のパイプバッファが満杯になって
@@ -141,6 +142,12 @@ class SelfServer:
         # まま `start()` まで進めて分かりにくいプロセス起動失敗にしない）。
         override = os.environ.get("CROSSDB_SELF_BINARY")
         if override:
+            # 絶対パスへ正規化してから存在確認・起動・ハッシュ算出で同一パスを使う。
+            # `wire-server-before` のような区切りなし相対パスをそのまま渡すと、
+            # exists はカレントディレクトリを見る一方 subprocess は PATH を検索する
+            # ため、起動失敗や PATH 上の同名バイナリの誤起動（meta.version の
+            # ハッシュとも食い違う）が起こり得る（codex-review 指摘）
+            override = os.path.abspath(override)
             if not os.path.exists(override):
                 raise FileNotFoundError(
                     f"CROSSDB_SELF_BINARY points to a nonexistent path: {override}"
