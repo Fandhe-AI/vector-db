@@ -269,18 +269,23 @@ pub(crate) fn execute_scan(
     let mut byte_budget: usize = 0;
     let mut rows: Vec<ResultRow> = Vec::new();
 
-    // codex-review P1 指摘対応: `cells`（`Vec<Cell>`）自体の確保量も累計予算へ
-    // 計上する。テキスト・ベクトルの実体バイトのみを計上する従来の
-    // `try_alloc_text_for_budget`／`try_clone_embedding_for_budget` は、`id` 等
-    // 実体バイトを消費しない列だけを大量に並べた投影（例:
+    // codex-review P1 指摘対応: `cells`（`Vec<Cell>`）・`rows`（`Vec<ResultRow>`）
+    // 双方の確保量を累計予算へ計上する。テキスト・ベクトルの実体バイトのみを
+    // 計上する従来の `try_alloc_text_for_budget`／`try_clone_embedding_for_budget`
+    // は、`id` 等実体バイトを消費しない列だけを大量に並べた投影（例:
     // `SELECT id, id, ..., id LIMIT 10000`）では `byte_budget` が 0 のまま
-    // `rows.len() * bound.projection.len()` 個の `Cell` を確保できてしまい、
-    // `MAX_SCAN_RESULT_BYTES` を迂回してメモリ枯渇を招く（`sql/exec.rs` の
-    // `row_struct_bytes` と同じ意図。構造体アロケーション自体を見逃さない）。
+    // `rows.len() * bound.projection.len()` 個の `Cell` と `rows.len()` 個の
+    // `ResultRow` を確保できてしまい、`MAX_SCAN_RESULT_BYTES` を迂回してメモリ
+    // 枯渇を招く（`sql/exec.rs` の `row_struct_bytes` と同じ意図。構造体
+    // アロケーション自体を見逃さない）。`ResultRow` 自体は `cells` を除いても
+    // `id`/`score`/`Vec<Cell>` のヘッダ分の固定サイズを持つため、1 行あたりの
+    // 構造体確保量として `cells` 分とまとめて計上する。
     let cell_struct_bytes = bound
         .projection
         .len()
         .saturating_mul(std::mem::size_of::<Cell>());
+    let result_row_struct_bytes = std::mem::size_of::<ResultRow>();
+    let per_row_struct_bytes = cell_struct_bytes.saturating_add(result_row_struct_bytes);
 
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
@@ -381,13 +386,21 @@ pub(crate) fn execute_scan(
                 continue;
             }
 
-            // `cells` 確保前に累計予算を検証（上記コメント参照。確保そのものを
-            // 許可する前に拒否できるよう `Vec::with_capacity` より先に判定する）。
+            // `cells`／`rows` 確保前に累計予算を検証（上記コメント参照。確保
+            // そのものを許可する前に拒否できるよう `Vec::try_reserve` 系より先に
+            // 判定する）。
             byte_budget =
-                try_accumulate_budget(byte_budget, cell_struct_bytes, MAX_SCAN_RESULT_BYTES)?;
+                try_accumulate_budget(byte_budget, per_row_struct_bytes, MAX_SCAN_RESULT_BYTES)?;
 
-            // 投影段。
-            let mut cells = Vec::with_capacity(bound.projection.len());
+            // 投影段。確保失敗時に abort せず `Err` を返せるよう `try_reserve_exact`
+            // を使う（`try_alloc_text_for_budget`／`try_clone_embedding_for_budget`
+            // と同方針）。
+            let mut cells: Vec<Cell> = Vec::new();
+            cells
+                .try_reserve_exact(bound.projection.len())
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve scan result cells: {e}"),
+                })?;
             for (col_idx, col) in bound.projection.iter().enumerate() {
                 match col {
                     ProjectedColumn::Id => cells.push(Cell::Integer(id)),
@@ -472,6 +485,12 @@ pub(crate) fn execute_scan(
                     }
                 }
             }
+            // `rows`（`Vec<ResultRow>`）の確保も `try_reserve` 系で行う
+            // （上記コメント参照。上限判定は既に `per_row_struct_bytes` の累計へ
+            // 反映済みのため、ここでは確保方式のみを abort 非経路へ切り替える）。
+            rows.try_reserve(1).map_err(|e| SqlSurfaceError::Internal {
+                detail: format!("failed to reserve scan result rows: {e}"),
+            })?;
             rows.push(ResultRow {
                 id,
                 score: 0.0,
@@ -793,5 +812,52 @@ mod tests {
         let bound = bound_star_scan(5);
         let result = execute_scan(&read_txn, &ctx, &schema, &bound).expect("scan should succeed");
         assert_eq!(result.rows.len(), 5);
+    }
+
+    #[test]
+    fn result_row_struct_bytes_alone_can_exceed_budget_even_with_a_single_projected_column() {
+        // codex-review P1 指摘の回帰テスト: `cells` の確保量だけを計上する対策では、
+        // `id` 1 列のみを投影する広域取得（`Cell` 自体は小さい）でも `ResultRow`
+        // （`id`/`score`/`Vec<Cell>` ヘッダ分）が行数分積み上がることを見逃す。
+        // `cell_struct_bytes` 単体では `MAX_SCAN_RESULT_BYTES` を超えない小さい
+        // 投影幅でも、`result_row_struct_bytes` を合算した `per_row_struct_bytes`
+        // なら十分な行数で超過が検出できることを、実際に巨大メモリを確保せず
+        // `try_accumulate_budget` の反復適用で確認する（`execute_scan` が使う式と
+        // 同一）。
+        let cell_struct_bytes = 1usize.saturating_mul(std::mem::size_of::<Cell>());
+        let result_row_struct_bytes = std::mem::size_of::<ResultRow>();
+        let per_row_struct_bytes = cell_struct_bytes.saturating_add(result_row_struct_bytes);
+        assert!(
+            per_row_struct_bytes > 0,
+            "per-row struct accounting must be positive to ever trip the cap"
+        );
+
+        let rows_to_exceed_cap = MAX_SCAN_RESULT_BYTES / per_row_struct_bytes + 1;
+        let mut budget = 0usize;
+        let mut rejected = false;
+        for _ in 0..rows_to_exceed_cap {
+            match try_accumulate_budget(budget, per_row_struct_bytes, MAX_SCAN_RESULT_BYTES) {
+                Ok(next) => budget = next,
+                Err(SqlSurfaceError::PayloadTooLarge { .. }) => {
+                    rejected = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert!(
+            rejected,
+            "accumulating per_row_struct_bytes across enough rows must eventually reject"
+        );
+
+        // `cell_struct_bytes` のみを計上する（旧実装相当の）計算では同じ行数で
+        // 上限を超えないことを確認し、`result_row_struct_bytes` の合算が実際に
+        // 検出精度を変えていることを固定する。
+        let mut cell_only_budget = 0usize;
+        for _ in 0..rows_to_exceed_cap {
+            cell_only_budget =
+                try_accumulate_budget(cell_only_budget, cell_struct_bytes, MAX_SCAN_RESULT_BYTES)
+                    .expect("cell_struct_bytes alone must not exceed the cap at this row count");
+        }
     }
 }
