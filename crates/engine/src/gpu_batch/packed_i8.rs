@@ -2,21 +2,22 @@
 //! バックエンド（Issue #542・親 #541・Phase 5 親 #460・ルート #455）。
 //!
 //! [`super::GpuBatchBackend`]（f16 2 要素/u32 パック常駐）の行データ移動量を
-//! さらに半減させる（1 byte/要素）ため、次元別対称 SQ8 量子化で行を i8 へ
-//! 落とし 4 要素/u32 でパックし、WGSL 組み込み `dot4I8Packed` で整数内積を
-//! 計算する。親 Issue #541 の制約により**候補生成専用**（opt-in・最終スコアは
-//! 必ず f32 再計算）とし、[`super::FallbackBatchEngine::build_with_gpu`] の
-//! primary へは接続しない（CORE-12「経路を外部から上書きする機構を作らない」
-//! と整合。構築は [`GpuI8BatchBackend::try_new`] からのみ）。
+//! さらに半減させる（1 byte/要素）ため、行単位対称 SQ8 量子化（各行の絶対値
+//! 最大からスケールを独立に導出する。D3 改訂）で行を i8 へ落とし 4 要素/u32
+//! でパックし、WGSL 組み込み `dot4I8Packed` で整数内積を計算する。親 Issue
+//! #541 の制約により**候補生成専用**（opt-in・最終スコアは必ず f32 再計算）
+//! とし、[`super::FallbackBatchEngine::build_with_gpu`] の primary へは接続
+//! しない（CORE-12「経路を外部から上書きする機構を作らない」と整合。構築は
+//! [`GpuI8BatchBackend::try_new`] からのみ）。
 //!
 //! # 依存 #521 の実装状況（着手前の確認事項）
 //!
-//! 2026-09-07 時点で #521（対称 SQ8 量子化・次元別 min/max）は OPEN・実装
-//! 未着手（`crates/engine/src/` に `Sq8`/`sq8`/量子化のトップレベル共有
-//! モジュールが存在しない）。そのため本モジュールは対称 SQ8 エンコーダを
-//! 自前で持つ（[`encode_rows`]／[`Sq8RowScales`]）。#521 マージ後は
-//! そちらの型へ統合する（`f16.rs` の前例に倣い、共有層の所有は #521 側に
-//! 委ねる。詳細は `docs/design/gpu-batch-i8-packed.md` 参照）。
+//! 2026-09-07 時点で #521（対称 SQ8 量子化）は OPEN・実装未着手
+//! （`crates/engine/src/` に `Sq8`/`sq8`/量子化のトップレベル共有モジュール
+//! が存在しない）。そのため本モジュールは行単位対称 SQ8 エンコーダを自前で
+//! 持つ（[`encode_rows`]／[`Sq8RowScales`]）。#521 マージ後はそちらの型へ
+//! 統合する（`f16.rs` の前例に倣い、共有層の所有は #521 側に委ねる。詳細は
+//! `docs/design/gpu-batch-i8-packed.md` 参照）。
 //!
 //! # スコア契約（D8: 候補生成のみ・最終スコアは f32 再計算）
 //!
@@ -540,7 +541,15 @@ impl GpuI8BatchBackend {
             .map_err(|_| {
                 BatchBackendError::InitFailed("i8 decode buffer allocation failed".to_string())
             })?;
+        // 行デコード用スクラッチバッファを `dim` ぶんフォールブルに事前予約する
+        // （codex-review 指摘対応・P1。`ResidentMatrix::row_f32_into` は
+        // `out.clear()` してから `dim` 回 `Vec::push` するため、未予約だと
+        // `push` の内部（amortized・infallible）確保がメモリ不足時に abort
+        // しうる——`decoded` 側の予約とは別の `Vec` であり、`batch_search` の
+        // 行デコード用スクラッチと同じ契約をここでも保つ）。
         let mut row_buf: Vec<f32> = Vec::new();
+        try_reserve_exact(&mut row_buf, dim, "i8 decode row buffer")
+            .map_err(|e| BatchBackendError::InitFailed(format!("{e}")))?;
         for idx in 0..row_count {
             if matrix.row_f32_into(idx, &mut row_buf).is_none() {
                 return Err(BatchBackendError::InitFailed(

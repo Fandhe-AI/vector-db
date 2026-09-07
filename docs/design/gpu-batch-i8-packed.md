@@ -9,7 +9,8 @@
 既存の GPU バッチ経路（`gpu_batch.rs::GpuBatchBackend`）は f16 2 要素/u32
 パック常駐（`batch_search.rs::ResidentMatrix::packed()`）を
 `unpack2x16float` で f32 へ戻して積和する（2 byte/要素）。本 Issue は、
-次元別対称 SQ8 量子化で行を i8 へ落とし 4 要素/u32 でパックし、WGSL 組み込み
+行単位対称 SQ8 量子化（各行の絶対値最大からスケールを独立に導出する。D3
+改訂）で行を i8 へ落とし 4 要素/u32 でパックし、WGSL 組み込み
 `dot4I8Packed` で整数内積を計算する経路（1 byte/要素）を追加する。
 
 親 Issue #541 の制約により、量子化・低精度常駐は **opt-in 限定・候補生成の
