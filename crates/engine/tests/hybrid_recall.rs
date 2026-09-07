@@ -857,13 +857,14 @@ fn measure_recall_via_hnsw(
     docs: &[Doc],
     qa: &[QaCase],
     source: QuerySource<'_>,
+    engine: RecallEngine,
 ) -> (RecallResult, AnnStats) {
     let dim = docs.first().map_or(0, |d| d.vector.len());
     let rows: Vec<(u64, Vec<f32>, String)> = docs
         .iter()
         .map(|d| (d.id, d.vector.clone(), d.text.clone()))
         .collect();
-    let fixture = SqlHybridFixture::new(dim as u32, &rows, RecallEngine::Hnsw);
+    let fixture = SqlHybridFixture::new(dim as u32, &rows, engine);
 
     let mut total_correct = 0usize;
     let mut hits20 = 0usize;
@@ -911,15 +912,18 @@ fn measure_recall_via_hnsw(
 
 /// 非 vacuous 統計を数値を含まない形式でログへ出す（`gate` はテスト名。
 /// spec-confidentiality の許可範囲内で、閾値・実測 Recall は含めない）。
-fn print_ann_stats(gate: &str, stats: &AnnStats) {
+fn print_ann_stats(gate: &str, engine: RecallEngine, stats: &AnnStats) {
     println!(
-        "{gate}: engine=hnsw builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={}",
+        "{gate}: engine={} builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={} f16_residency_fallbacks={} f16_kernel={:?}",
+        engine.token(),
         stats.builds,
         stats.build_failures,
         stats.rebuilds,
         stats.hybrid_dense_searches,
         stats.hybrid_queries,
         stats.ef_cap_fallbacks,
+        stats.f16_residency_fallbacks,
+        engine::isa::current_f16(),
     );
 }
 
@@ -1476,9 +1480,9 @@ fn hybrid_recall_small_scale_threshold_gate() {
     let engine = RecallEngine::from_env();
     let r = match engine {
         RecallEngine::BruteForce => measure_recall(&docs, &qa),
-        RecallEngine::Hnsw => {
-            let (r, stats) = measure_recall_via_hnsw(&docs, &qa, QuerySource::Baseline);
-            print_ann_stats("hybrid_recall_small_scale_threshold_gate", &stats);
+        RecallEngine::Hnsw | RecallEngine::HnswF16 => {
+            let (r, stats) = measure_recall_via_hnsw(&docs, &qa, QuerySource::Baseline, engine);
+            print_ann_stats("hybrid_recall_small_scale_threshold_gate", engine, &stats);
             r
         }
     };
@@ -1582,10 +1586,14 @@ fn hybrid_recall_large_scale_threshold_gate() {
         RecallEngine::BruteForce => {
             measure_recall_with(&docs, &intent_qa, QuerySource::Expanded(&planner_fixture))
         }
-        RecallEngine::Hnsw => {
-            let (r, stats) =
-                measure_recall_via_hnsw(&docs, &intent_qa, QuerySource::Expanded(&planner_fixture));
-            print_ann_stats("hybrid_recall_large_scale_threshold_gate", &stats);
+        RecallEngine::Hnsw | RecallEngine::HnswF16 => {
+            let (r, stats) = measure_recall_via_hnsw(
+                &docs,
+                &intent_qa,
+                QuerySource::Expanded(&planner_fixture),
+                engine,
+            );
+            print_ann_stats("hybrid_recall_large_scale_threshold_gate", engine, &stats);
             r
         }
     };

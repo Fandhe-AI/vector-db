@@ -214,3 +214,147 @@ resend_does_not_touch_other_tenants_same_path_rows` と同方針）を固定し�
 - `tests/rls_generalized.rs`／`tests/plan_rls_boost.rs` への HNSW variant
   追加（#409 申し送り）
 - `recall.yml` の `hnsw` matrix job（`strategy.matrix.recall_engine: [brute_force, hnsw]`。PR #438 で `workflow_dispatch.inputs.recall_engine` から変更）の実 `workflow_dispatch`／`schedule` 疎通確認（マージ後の管理者作業）
+
+## Issue #515 追記: f16 常駐（`hnsw_f16`）での同一閾値検証
+
+### 背景
+
+Issue #514 で HNSW 索引ノードの f16 常駐表現（`hnsw::ResidentPrecision::F16`。
+`ValidatedHnswParams::with_resident_precision` の opt-in・既定 F32。
+`docs/design/hnsw-f16-resident.md`）が入った。候補生成段のスコアが
+f16→f32 昇格 dot（`isa::F16Kernel`）になるため探索順序が変わり得るが、
+最終スコアは `kernel::dot` による f32 アリーナ再計算という #408 契約は不変
+（本 doc 上部の測定妥当性ガードと同じ理由づけ）。本節は次の 2 点を固定する:
+
+- 3 つの Recall ゲート層 B を f16 常駐でも **同一閾値** のまま通過できること
+  （brute_force 対照の実測。#412 と同じ方式）
+- `tests/hnsw_cache.rs` 系の「既定エンジン対照 Recall@10 ≥ 0.9・可視外
+  非混入」を f16 常駐でも固定すること
+
+### 測定経路（`RecallEngine::HnswF16`）
+
+`crates/engine/tests/fixtures/recall_engine.rs::RecallEngine` へ
+`HnswF16`（環境変数トークン `hnsw_f16`）を追加した。`SqlHybridFixture::new`
+の `HnswF16` 分岐は、`ValidatedHnswParams::new(HnswParams::default())`
+（`search_engine::hnsw_kind` が守るのと同じ「untrusted な `HnswParams` は
+ここでのみ検証する」経路）に `with_resident_precision(ResidentPrecision::
+F16)` を適用するだけで、fixture 内であっても production の「未検証入力の
+唯一の入口」契約を迂回しない。
+
+`AnnStats` へ `f16_residency_fallbacks`（`HnswIndexCacheStats` の同名
+フィールドの複製。F16 要求時に範囲外成分〔`|x| > 65504.0`〕で F32 常駐へ
+自動縮退した回数。D6・Issue #514）を追加し、`assert_ann_non_vacuous(true)`
+は engine が `Hnsw`/`HnswF16` のいずれかに応じて `search_engine_kind()` の
+Display に `resident=f32`/`resident=f16` が含まれること、F16 の場合は
+さらに `f16_residency_fallbacks == 0`（このコーパスでは縮退が起きていない
+こと）を追加で固定する——`f16_residency_fallbacks == 0` 単独では F32 を
+要求した場合も 0 になり vacuous なため、Display 側の確認と組み合わせる。
+
+3 ハーネスの `measure_*_via_hnsw` 系関数へ `engine: RecallEngine` 引数を
+追加し、`match engine { .. RecallEngine::Hnsw | RecallEngine::HnswF16 => .. }`
+の共有 arm で両エンジンを同じ経路から測定する（brute_force 側・在来の
+`Hnsw` 単独の挙動は無変更）。`print_ann_stats` の出力へ
+`f16_residency_fallbacks=` と `f16_kernel=`（`engine::isa::current_f16()`
+の Debug 表現。非機密——スコアを含まない）を追記した。
+
+### 実測結果（ローカル `--release`。本開発環境: x86_64・F16C あり・AVX-512 なし。閾値は private spec から環境変数へ注入し値は本 doc に転記しない。ここに記載する Recall 実測値・統計カウンタはオーナー判断〔2026-08-29〕により公開可）
+
+`RECALL_VERBOSE=1` opt-in で `brute_force`／`hnsw`／`hnsw_f16` を各ゲート
+1 回ずつ実行し比較した。
+
+#### hybrid（`hybrid_recall.rs`）
+
+| 段 | 指標 | brute_force | hnsw | hnsw_f16 | 差分 |
+| ---- | ---- | ---- | ---- | ---- | ---- |
+| 小規模（400 docs） | recall@20 | 0.9010 | 0.9010 | 0.9010 | 0（3 系列とも `builds=0`。構造的に brute-force のまま） |
+| 大規模（20,000 docs） | recall@20 | 0.9145 | 0.9145 | 0.9145 | 0 |
+| 大規模（20,000 docs） | recall@100 | 0.9165 | 0.9165 | 0.9165 | 0 |
+
+大規模段 `hnsw_f16` の統計（1 run）: `builds=1 build_failures=0 rebuilds=0
+hybrid_dense_searches=420 hybrid_queries=100 ef_cap_fallbacks=80
+f16_residency_fallbacks=0 f16_kernel=F16c(..)`（`hnsw`（F32）と統計値も
+完全一致）。
+
+#### rerank（`rerank_recall.rs`。大規模段のみ）
+
+| 指標 | brute_force | hnsw | hnsw_f16 | 差分 |
+| ---- | ---- | ---- | ---- | ---- |
+| after_recall@20 | 0.9488 | 0.9488 | 0.9488 | 0 |
+| non_degraded | true | true | true | — |
+| improvement_ratio@20（informational） | 0.2222 | 0.2222 | 0.2222 | 0 |
+
+`hnsw_f16` の統計: `builds=1 build_failures=0 rebuilds=0
+hybrid_dense_searches=492 hybrid_queries=100 ef_cap_fallbacks=106
+f16_residency_fallbacks=0`。
+
+#### query-planning（`query_planning_recall.rs`）
+
+| 段 | 指標 | brute_force | hnsw | hnsw_f16 | 差分 |
+| ---- | ---- | ---- | ---- | ---- | ---- |
+| 小規模（4,000 docs） | intent_improvement | 0.9245 | 0.9245 | 0.9245 | 0 |
+| 小規模（4,000 docs） | direct_after_recall20 | 0.9321 | 0.9321 | 0.9321 | 0 |
+| 小規模（4,000 docs） | intent_improvement_degraded | 0.3547 | 0.3547 | 0.3547 | 0 |
+| 大規模（40,000 docs） | direct_after_recall20 | 0.8852 | 0.8852 | 0.8852 | 0 |
+
+`hnsw_f16` 小規模段の統計: direct `builds=1 hybrid_dense_searches=662
+hybrid_queries=160 ef_cap_fallbacks=0 f16_residency_fallbacks=0`、intent
+`builds=1 hybrid_dense_searches=731 hybrid_queries=160 ef_cap_fallbacks=0
+f16_residency_fallbacks=0`、intent_degraded `builds=1
+hybrid_dense_searches=758 hybrid_queries=160 ef_cap_fallbacks=0
+f16_residency_fallbacks=0`。いずれも `hnsw`（F32）と統計値が完全一致。
+
+### 判断
+
+**全 8 測定点（hybrid 小規模 1・大規模 2、rerank 大規模 1＋非劣化＋
+improvement_ratio、query-planning 小規模 3・大規模 1）で
+brute_force／hnsw／hnsw_f16 の実測 Recall 値が完全一致し、`hnsw_f16` の
+`f16_residency_fallbacks` はいずれも 0（このコーパス範囲では D6 縮退は
+発生しない）だった。** F32/F16 いずれも同一閾値のまま運用でき、f16 常駐
+opt-in のために閾値を緩める必要はない（S8 決定規則: 全指標で
+`hnsw_f16 >= brute_force` の公開済み基準値を満たした）。
+
+未達・原因分析の記録は不要。production コード（`crates/engine/src/`）は
+本 Issue の範囲では無変更。
+
+### 可視外非混入テスト（`tests/hnsw_cache.rs`）
+
+R4（テナント境界）・hybrid 密側再取得ループ・Rust API 検索・`Subset` 形状
+（SCALAR 事前フィルタ付き DISTANCE）・`full_scan_ratio` ANN 側の 5 テストを
+`run_*(precision: ResidentPrecision)` 共有本体へ切り出し、既存名を F32
+ラッパー、`f16_*` を F16 ラッパーとして追加した（既存名のテストはビット
+同一の挙動のまま green）。F16 ラッパーは追加で `search_engine_kind()` の
+Display に `resident=f16` を含むこと・`f16_residency_fallbacks == 0` を
+固定する。
+
+さらに D6（範囲外成分による自動縮退）が SQL 表層経由でも fail-closed に
+働くことを新規テスト
+`f16_out_of_range_component_falls_back_to_f32_residency_without_leaking_or_losing_recall`
+で固定した: tenant-a のコーパスに 1 成分 `70000.0`（> 65504.0）を持つ行を
+1 件だけ混ぜ、`f16_residency_fallbacks == 1`（D6 縮退が実際に 1 回発生）・
+`resident=f16`（静的な opt-in 設定自体は取り消されない。索引ノードの実効
+表現のみが F32 へ切り替わる）・tenant-b（Private）の可視外非混入・既定
+エンジン対照 Recall@10 ≥ 0.9 を固定する。
+
+`tests/hnsw_hybrid_refetch.rs` の同点誘発コーパス停止性・決定性テストも
+`run_*(precision)` 化し、`f16_tie_inducing_corpus_hybrid_search_
+terminates_and_is_deterministic` として F16 常駐でも
+（候補生成の f16→f32 昇格 dot で探索順序が変わり得ても）停止性・ビット
+同一の決定性契約が不変であることを固定した。
+
+いずれも `cargo test -p engine --test hnsw_cache --test hnsw_hybrid_refetch`
+で green。production コード（`crates/engine/src/`）は無変更・テスト専任。
+
+### `recall.yml` の 3 系列化
+
+`strategy.matrix.recall_engine` を `[brute_force, hnsw]` から
+`[brute_force, hnsw, hnsw_f16]` へ拡張した（#412 と同じ「trigger を問わず
+毎回全系列をゲートする」原則。`workflow_dispatch.inputs` は使わない）。
+
+### スコープ外・申し送り（本節限定）
+
+- 規模別（25k／100k／500k × dim 128／768）の常駐メモリ・レイテンシ前後
+  比較・既定常駐精度を F16 へ反転するかの判断: Issue #516
+- `recall.yml` 3 系列 matrix の実 `workflow_dispatch`／`schedule` 疎通・
+  閾値ゲート最終判定: マージ後の管理者作業（#412 と同じ）
+- Apple Silicon（NEON fp16）実機での層 B 実測: 手元環境が x86_64（F16C）
+  のため未実施
