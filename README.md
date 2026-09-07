@@ -521,6 +521,20 @@ BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 
 既定エンジン（brute-force）との前後比較・25k/100k の規模スケーリング実測・参照した外部実装（qdrant・pgvector・usearch）の既定値・損益分岐点についての所見は `docs/design/hnsw-index.md` を参照してください。
 
+`knn_profile_bench` にはさらに、可視比率 × 行数の損益分岐点スイープ（Issue #487。`hnsw_subset`〔SCALAR 事前フィルタ付き DISTANCE〕vs plain scan）専用の env があります（設定時は S1〜S5' を伴わない専用モードへ切り替わります）。
+
+- `BENCH_KNN_PROFILE_VISIBLE_RATIO`: `1/<N>`（`N` は正整数・上限 1,000）。未設定（既定）はスイープ無効
+- `BENCH_KNN_PROFILE_FULL_SCAN_RATIO`（`BENCH_KNN_PROFILE_ENGINE=hnsw` 限定）: `<num>/<den>`（`den>=1`・`num<=den`）で `ValidatedHnswParams::full_scan_ratio`（既定 1/10）を上書き
+- `BENCH_KNN_PROFILE_SCALE`: 正整数倍率。既定 1（25,000 行）。`BENCH_FEATURE_SCALE` と同じ上限方針
+
+```bash
+BENCH_KNN_PROFILE_VISIBLE_RATIO=1/4 BENCH_KNN_PROFILE_ENGINE=hnsw make bench-knn-profile
+BENCH_KNN_PROFILE_VISIBLE_RATIO=1/20 BENCH_KNN_PROFILE_ENGINE=hnsw BENCH_KNN_PROFILE_SCALE=4 make bench-knn-profile  # 100,000 行
+make bench-knn-visible-ratio  # 全比率 × 全行数 × 4 arm を交互 N ペアで実行（SWEEP_PAIRS で回数を上書き）
+```
+
+実測結果・判断は `docs/design/hnsw-rls-cardinality-switch.md`「可視比率 × 行数の損益分岐点実測（Issue #487）」を参照してください。
+
 HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳・`repair_reachability` 修復統計〔Issue #447〕）・`make bench-hnsw-compare`（usearch との構築時間・Recall@10・探索レイテンシ比較。L2 正規化コーパス方式を維持）で実測できます。いずれも手動専用ベンチで CI 非配線です。詳細・実測値は `docs/design/hnsw-parallel-build.md` を参照してください。
 
 受理判定後 prefetch（Issue #490）の前後比較実測は `make bench-hnsw-search`（`BENCH_HNSW_SEARCH_ROWS`／`BENCH_HNSW_SEARCH_DIM`／`BENCH_HNSW_SEARCH_MASK`〔RLS 事前フィルタ統合の `Subset` 形状を模す可視率〕で 1 規模点を計測し、before/after バイナリを交互起動して比較する手動専用ベンチ）で実施できます。`git archive` で取り出した作業ツリーから before/after バイナリをビルドする再現手順では、ビルド時に `BENCH_HNSW_SEARCH_COMMIT=<sha>` を指定して計測対象コミットをバイナリへ焼き込んでください（未指定時の実行時フォールバックはカレントディレクトリの HEAD を返すため、同一ディレクトリから交互起動する両バイナリに同じ値が記録されます）。CI 非配線・詳細・実測値・採否は `docs/design/hnsw-search.md`「Issue #491」節を参照してください。

@@ -9,7 +9,10 @@
 #[path = "../benches/harness/mod.rs"]
 mod harness;
 
-use harness::bench_engine::{parse_dim, parse_engine, parse_scale, BenchEngine};
+use harness::bench_engine::{
+    expected_arm, parse_dim, parse_engine, parse_full_scan_ratio, parse_scale, parse_visible_ratio,
+    BenchEngine, ExpectedArm,
+};
 
 #[test]
 fn parse_engine_accepts_unset_empty_and_brute_force_as_default() {
@@ -76,4 +79,100 @@ fn parse_dim_rejects_zero_non_numeric_and_over_bound_fail_closed() {
             "expected {raw:?} to be rejected"
         );
     }
+}
+
+#[test]
+fn parse_visible_ratio_defaults_to_none_when_unset() {
+    assert_eq!(parse_visible_ratio(None, 1_000), Ok(None));
+    assert_eq!(parse_visible_ratio(Some(""), 1_000), Ok(None));
+}
+
+#[test]
+fn parse_visible_ratio_accepts_one_over_n_within_bound() {
+    assert_eq!(parse_visible_ratio(Some("1/2"), 1_000), Ok(Some(2)));
+    assert_eq!(parse_visible_ratio(Some("1/50"), 1_000), Ok(Some(50)));
+    assert_eq!(parse_visible_ratio(Some(" 1/10 "), 1_000), Ok(Some(10)));
+    assert_eq!(parse_visible_ratio(Some("1/1000"), 1_000), Ok(Some(1_000)));
+}
+
+#[test]
+fn parse_visible_ratio_rejects_non_one_numerator_zero_and_over_bound() {
+    for raw in ["2/5", "1/0", "0/1", "1/1001", "1", "1/", "1/-1", "abc"] {
+        assert!(
+            parse_visible_ratio(Some(raw), 1_000).is_err(),
+            "expected {raw:?} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn parse_full_scan_ratio_defaults_to_none_when_unset() {
+    assert_eq!(parse_full_scan_ratio(None), Ok(None));
+    assert_eq!(parse_full_scan_ratio(Some("")), Ok(None));
+}
+
+#[test]
+fn parse_full_scan_ratio_accepts_num_over_den_including_edge_ratios() {
+    assert_eq!(parse_full_scan_ratio(Some("1/10")), Ok(Some((1, 10))));
+    assert_eq!(parse_full_scan_ratio(Some("0/1")), Ok(Some((0, 1))));
+    assert_eq!(parse_full_scan_ratio(Some("1/1")), Ok(Some((1, 1))));
+    assert_eq!(parse_full_scan_ratio(Some(" 3/4 ")), Ok(Some((3, 4))));
+}
+
+#[test]
+fn parse_full_scan_ratio_rejects_zero_denominator_and_numerator_over_denominator() {
+    for raw in ["1/0", "2/1", "abc", "1", "1/2/3", "-1/2"] {
+        assert!(
+            parse_full_scan_ratio(Some(raw)).is_err(),
+            "expected {raw:?} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn expected_arm_boundary_matches_search_with_overlay_comparison() {
+    // `sql::hnsw_cache::search_with_overlay` は `visible * den < index_len * num`
+    // なら plain scan（Issue #487 実装コメント参照）。境界ちょうど（等号）は
+    // ANN 側になる。
+    assert_eq!(
+        expected_arm(10, 100, (1, 10)).unwrap(),
+        ExpectedArm::AnnMasked
+    );
+    assert_eq!(
+        expected_arm(9, 100, (1, 10)).unwrap(),
+        ExpectedArm::PlainScanRatio
+    );
+}
+
+#[test]
+fn expected_arm_zero_ratio_is_always_ann_masked() {
+    assert_eq!(
+        expected_arm(0, 100, (0, 1)).unwrap(),
+        ExpectedArm::AnnMasked
+    );
+    assert_eq!(
+        expected_arm(1, 1_000_000, (0, 1)).unwrap(),
+        ExpectedArm::AnnMasked
+    );
+}
+
+#[test]
+fn expected_arm_full_ratio_is_plain_scan_unless_fully_visible() {
+    assert_eq!(
+        expected_arm(50, 100, (1, 1)).unwrap(),
+        ExpectedArm::PlainScanRatio
+    );
+    assert_eq!(
+        expected_arm(100, 100, (1, 1)).unwrap(),
+        ExpectedArm::AnnMasked
+    );
+}
+
+#[test]
+fn expected_arm_rejects_zero_denominator_and_reports_overflow_fail_closed() {
+    assert!(expected_arm(1, 1, (1, 0)).is_err());
+    // `lhs = visible.checked_mul(den)`: den=2 かつ visible=u64::MAX でオーバーフロー。
+    assert!(expected_arm(u64::MAX, 2, (1, 2)).is_err());
+    // `rhs = index_len.checked_mul(num)`: num=2 かつ index_len=u64::MAX でオーバーフロー。
+    assert!(expected_arm(2, u64::MAX, (2, 2)).is_err());
 }
