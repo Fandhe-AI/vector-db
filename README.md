@@ -253,6 +253,23 @@ Phase 2（親 Issue #395）を通した前後比較・棄却判断（RECOVER-5�
 RECOVER-8 ポインタ）・バッチ上限の申し送りは `docs/design/ingest-write-path.md`
 （Issue #401）を参照してください。
 
+`BENCH_INGEST_PROFILE_MODE`（`batch`〔既定〕／`single`。Issue #484）で、
+上記のバッチ経路とは別に crossdb ベンチが実際に通る**単文** `INSERT` 経路
+（wire 簡易クエリ → SQL 表層 → `tenant::insert_typed_row_unchecked`〔1 文 1
+write txn〕）の段別内訳（`parse_bind`／`typed_row_api`／`sql_surface` の
+3 tier ＋ I1〜I8）を計測できます。`single` モードでは
+`BENCH_INGEST_PROFILE_STATEMENTS`（既定 25,000・2,000〜100,000）で単文数を
+上書きでき、`BENCH_INGEST_PROFILE_ROWS` は無視されます（`BENCH_INGEST_
+PROFILE_INSERT_MODE=reserve` は `batch` 専用機能のため `single` では
+fail-closed に拒否）。`make bench-ingest-wire-profile`
+（`crates/wire-server/benches/ingest_wire_profile_bench.rs`）は同じ単文
+`INSERT` 経路を wire プロトコル経由（in-process ループバック）で計測し、
+engine 側 `sql_surface` tier との差分から wire 往復自体の寄与を切り分けます
+（`BENCH_INGEST_WIRE_ROWS`〔既定 25,000・5,000〜100,000。`BENCH_INGEST_WIRE_
+ROUNDS` で割り切れる値のみ〕・`BENCH_INGEST_WIRE_ROUNDS`〔既定 5・5〜50〕・
+`BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定可能）。実測結果は
+`docs/design/ingest-stage-profile.md`「Issue #484 追記」節を参照してください。
+
 ### クロスエンコーダリランカーの実測手順（Issue #333）
 
 `make rerank-cross-encoder-eval`（`crates/engine/tests/rerank_cross_encoder_recall.rs`。
