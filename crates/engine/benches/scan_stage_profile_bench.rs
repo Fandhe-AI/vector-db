@@ -624,6 +624,17 @@ fn main() {
         Vec::with_capacity(config.measured_iterations() as usize);
     let mut w0_cold_last_ids: Option<Vec<u64>> = None;
     for _ in 0..config.measured_iterations() {
+        // 計測区間は `execute_sql` のみ（`Storage::open`／`EngineCore` 構築は
+        // 含まない）。`docs/design/scan-stage-profile.md`「W0-cold − W0-hot で
+        // `SqlArenaCache` の寄与を示す」という既存の解釈は、W0-hot（同一
+        // `EngineCore` を使い回す `execute_sql` のみの区間）との差分が
+        // `SqlArenaCache` のヒット/ミスにのみ帰属することを前提にしている。
+        // ここに `Storage::open`／`EngineCore` 構築コストを含めると DB 起動
+        // コストが混入し前提が崩れるため、この区間には含めない（PR #586
+        // codex-review・Cursor Bugbot 指摘。Issue #479 で新設した `A0c-cold`
+        // は `VisibleBitmapCache` のミス経路を測る別目的の測定点であり、
+        // `Storage::open` を含めて測る設計は `A0c-cold` 側だけの事情。
+        // W0-cold をそれに合わせて変更する必要はない）。
         let cold_storage = Storage::open(&path).expect("reopen storage for W0-cold measurement");
         let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
         let start = Instant::now();
@@ -660,6 +671,69 @@ fn main() {
         .any(|id| !expected_match_ids.contains(id))
     {
         fail_closed("W0-cold returned an id outside the lang='ja' visible set (tenant/filter leak suspected)");
+    }
+
+    // A0c（Issue #479）: 毎サンプル新規 `Storage::open` ＋ `EngineCore`
+    // （空の `VisibleBitmapCache`〔Issue #478〕）から `COUNT(*)` を測る。
+    // 後段の A0a／A0b は同一 `EngineCore` を使い回すため 2 回目以降は必ず
+    // 本キャッシュのヒット経路を測る（`sql/visible_cache.rs::execute_aggregate_with_cache`
+    // が `user_rows/{table}` を一切開かない経路）。A0c はそのミス経路（走査に
+    // 相乗りしたスナップショット構築を含む）を、before（キャッシュ非搭載）と
+    // after（本キャッシュ搭載）の交互実測で比較できるようにするための対照値
+    // （before では常に全行走査、after では構築コストを含むミス経路）。
+    // `Storage::open`／`EngineCore` 構築コストを計測区間に含めるのは A0c
+    // 自身の設計判断であり、W0-cold（`execute_sql` のみを計測。上記コメント
+    // 参照）とは意図的に異なる区間を採る（PR #586 codex-review・Cursor
+    // Bugbot 指摘。`docs/design/visible-bitmap-cache-verification.md` 参照）。
+    // W0c の生 DB ハンドルは既に drop 済みだが、W0-hot/A0a/A0b 用の
+    // `core`（同一 DB を開いたまま保持する）はまだ開いていないため、ここで
+    // `Storage::open` の二重オープン（`DatabaseAlreadyOpen`）を避けられる。
+    for _ in 0..config.warmup_iterations() {
+        let cold_storage = Storage::open(&path).expect("reopen storage for A0-cold warmup");
+        let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
+        black_box(
+            cold_core
+                .execute_sql(&ctx_a, &count_sql)
+                .expect("execute_sql must succeed for COUNT(*) query"),
+        );
+    }
+    let mut a0c_samples: Vec<Duration> = Vec::with_capacity(config.measured_iterations() as usize);
+    let mut a0c_last_value: Option<u64> = None;
+    for _ in 0..config.measured_iterations() {
+        // 計測区間は `Storage::open` を含む（本節冒頭のコメント・
+        // `docs/design/visible-bitmap-cache-verification.md` の前提と一致させる）。
+        let start = Instant::now();
+        let cold_storage = Storage::open(&path).expect("reopen storage for A0-cold measurement");
+        let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
+        let result = black_box(
+            cold_core
+                .execute_sql(&ctx_a, &count_sql)
+                .expect("execute_sql must succeed for COUNT(*) query"),
+        );
+        a0c_samples.push(start.elapsed());
+        if result.rows.len() != 1 {
+            fail_closed(format!(
+                "A0-cold COUNT(*) row count mismatch: expected 1, got {}",
+                result.rows.len()
+            ));
+        }
+        a0c_last_value = Some(match result.rows[0].cells.first() {
+            Some(Cell::Integer(v)) => *v,
+            other => fail_closed(format!(
+                "A0-cold COUNT(*) cell type mismatch: got {other:?}"
+            )),
+        });
+    }
+    if a0c_samples.is_empty() {
+        fail_closed("A0-cold measurement produced no samples");
+    }
+    let a0c_summary = stats::summarize(&a0c_samples).expect("A0-cold summarize");
+    match a0c_last_value {
+        Some(value) if value == tenant_a_rows => {}
+        Some(value) => fail_closed(format!(
+            "A0-cold COUNT(*) value mismatch: expected {tenant_a_rows}, got {value}"
+        )),
+        None => fail_closed("A0-cold measurement produced no COUNT(*) value"),
     }
 
     let storage = Storage::open(&path).expect("reopen storage for W0-hot/W0-nowhere/A0");
@@ -883,6 +957,25 @@ fn main() {
     println!(
         "e2e(rls_isolation/A0b, ctx=tenant-b): median={:.3}ms",
         a0b.summary.median.as_secs_f64() * 1e3
+    );
+    // A0c-cold は `rounds`（A1〜A5・W1〜W4・R_dot が使う「ラウンド」概念）の
+    // 系列ではなく、`config.measured_iterations()`（本ベンチでは 20）個の
+    // 生サンプルを直接集計している（`MeasurementConfig::new` 呼び出し・上の
+    // `for _ in 0..config.measured_iterations()` ループ参照）。他系列の
+    // 「min-of-R」（R = ラウンド数。既定 `BENCH_SCAN_PROFILE_ROUNDS`）と表記を
+    // 揃えると集計対象が異なるにもかかわらず同じ略記になり誤解を招くため
+    // （PR #586 codex-review 指摘）、ここでは実際のサンプル数を明記した
+    // 「sample minimum (N=<count>)」表記を用いる。
+    println!(
+        "e2e(agg_count/A0c-cold, ctx=tenant-a, includes Storage::open): median={:.3}ms (sample minimum, N={}: {:.3}ms)",
+        a0c_summary.median.as_secs_f64() * 1e3,
+        a0c_samples.len(),
+        a0c_samples
+            .iter()
+            .min()
+            .expect("A0-cold has at least one sample")
+            .as_secs_f64()
+            * 1e3
     );
 
     let visible_rows = tenant_a_rows as usize;
