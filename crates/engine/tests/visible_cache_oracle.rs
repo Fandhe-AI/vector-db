@@ -177,12 +177,16 @@ fn build_oracle_db(core: &EngineCore, viewer_tenant: &str, allow_private: bool) 
     }
 }
 
-fn open_core(label: &str) -> (EngineCore, CleanupGuard) {
+/// `CleanupGuard` を `EngineCore`（内部で `Storage` を保持）より先に返す
+/// （タプルの戻り順ではなく、呼び出し側の束縛順が `Drop` の逆順実行を決める。
+/// `temp_db.rs` の契約どおり `(guard, core)` の順で受けてもらう前提の
+/// シグネチャにしておくことで、呼び出し側の書き間違いを構造的に防ぐ）。
+fn open_core(label: &str) -> (CleanupGuard, EngineCore) {
     let path = unique_db_path(label);
     let guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
-    (new_core(storage), guard)
+    (guard, new_core(storage))
 }
 
 fn run_query(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> QueryResult {
@@ -208,7 +212,7 @@ fn cold_result(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> QueryResult
 /// （RLS-7・RLS-8。単一トランザクション内の複数文脈を跨いだ非漏えい）。
 #[test]
 fn cold_aggregate_matches_oracle_db_across_contexts() {
-    let (main_core, _main_guard) = open_core("visible-cache-oracle-cold-main");
+    let (_main_guard, main_core) = open_core("visible-cache-oracle-cold-main");
     build_main_db(&main_core);
 
     for (viewer_tenant, allow_private) in
@@ -219,11 +223,11 @@ fn cold_aggregate_matches_oracle_db_across_contexts() {
             // 実 DB 側は毎回新規 `EngineCore`（cold）で実行し、キャッシュ
             // ヒットに紛れ込んだ「本来 hot 経路で得たはずの正しい値」を cold
             // 経路の検証だと誤認しないようにする。
-            let (fresh_main_core, _fresh_guard) = open_core("visible-cache-oracle-cold-main-run");
+            let (_fresh_guard, fresh_main_core) = open_core("visible-cache-oracle-cold-main-run");
             build_main_db(&fresh_main_core);
             let actual = cold_result(&fresh_main_core, &viewer_ctx, sql);
 
-            let (oracle_core, _oracle_guard) = open_core("visible-cache-oracle-cold-oracle-run");
+            let (_oracle_guard, oracle_core) = open_core("visible-cache-oracle-cold-oracle-run");
             build_oracle_db(&oracle_core, viewer_tenant, allow_private);
             let expected = run_query(&oracle_core, &viewer_ctx, sql);
 
@@ -251,7 +255,7 @@ fn hot_aggregate_matches_oracle_db_across_contexts() {
     {
         let viewer_ctx = ctx_for_tenant(viewer_tenant, allow_private);
         for sql in AGGREGATE_QUERIES {
-            let (main_core, _main_guard) = open_core("visible-cache-oracle-hot-main");
+            let (_main_guard, main_core) = open_core("visible-cache-oracle-hot-main");
             build_main_db(&main_core);
 
             let before = main_core.visible_bitmap_cache_stats();
@@ -271,7 +275,7 @@ fn hot_aggregate_matches_oracle_db_across_contexts() {
                 "second call for `{sql}` must hit the cache populated by the first (non-vacuous guard)"
             );
 
-            let (oracle_core, _oracle_guard) = open_core("visible-cache-oracle-hot-oracle");
+            let (_oracle_guard, oracle_core) = open_core("visible-cache-oracle-hot-oracle");
             build_oracle_db(&oracle_core, viewer_tenant, allow_private);
             let expected = run_query(&oracle_core, &viewer_ctx, sql);
 
@@ -290,7 +294,7 @@ fn hot_aggregate_matches_oracle_db_across_contexts() {
 /// 対照 DB と一致し続けることを確認する（複数エントリ常駐下の非漏えい）。
 #[test]
 fn interleaved_hot_contexts_never_cross_contaminate() {
-    let (main_core, _main_guard) = open_core("visible-cache-oracle-interleaved");
+    let (_main_guard, main_core) = open_core("visible-cache-oracle-interleaved");
     build_main_db(&main_core);
 
     let ctx1 = ctx_for_tenant("tenant-a", false);
@@ -298,7 +302,7 @@ fn interleaved_hot_contexts_never_cross_contaminate() {
     let ctx3 = ctx_for_tenant("tenant-b", false);
 
     let oracle = |viewer_tenant: &str, allow_private: bool, sql: &str| -> QueryResult {
-        let (oracle_core, _guard) = open_core("visible-cache-oracle-interleaved-oracle");
+        let (_guard, oracle_core) = open_core("visible-cache-oracle-interleaved-oracle");
         build_oracle_db(&oracle_core, viewer_tenant, allow_private);
         run_query(
             &oracle_core,
@@ -364,7 +368,7 @@ fn interleaved_hot_contexts_never_cross_contaminate() {
 /// する。
 #[test]
 fn stale_eviction_after_unrelated_tenant_write_does_not_leak() {
-    let (main_core, _main_guard) = open_core("visible-cache-oracle-stale");
+    let (_main_guard, main_core) = open_core("visible-cache-oracle-stale");
     build_main_db(&main_core);
 
     let ctx2 = ctx_for_tenant("tenant-a", true);
@@ -373,7 +377,7 @@ fn stale_eviction_after_unrelated_tenant_write_does_not_leak() {
 
     // ctx3 を hot にする。
     let ctx3_before_write = run_query(&main_core, &ctx3, sql);
-    let (oracle3_before, _g) = open_core("visible-cache-oracle-stale-oracle3-before");
+    let (_g, oracle3_before) = open_core("visible-cache-oracle-stale-oracle3-before");
     build_oracle_db(&oracle3_before, "tenant-b", false);
     assert_eq!(
         ctx3_before_write.rows,
@@ -412,7 +416,7 @@ fn stale_eviction_after_unrelated_tenant_write_does_not_leak() {
 
     // ctx2（tenant-a Private 可視）は新規行を反映した対照 DB と一致する。
     let ctx2_result = run_query(&main_core, &ctx2, sql);
-    let (oracle2_after, _g2) = open_core("visible-cache-oracle-stale-oracle2-after");
+    let (_g2, oracle2_after) = open_core("visible-cache-oracle-stale-oracle2-after");
     build_oracle_db(&oracle2_after, "tenant-a", true);
     for (offset, id) in extra_ids.iter().enumerate() {
         insert_row(
@@ -443,7 +447,7 @@ fn session_entrypoint_matches_oracle_db() {
         ("tenant-a", "SELECT SUM(id) FROM docs"),
         ("tenant-b", "SELECT COUNT(*) FROM docs"),
     ] {
-        let (main_core, _main_guard) = open_core("visible-cache-oracle-session");
+        let (_main_guard, main_core) = open_core("visible-cache-oracle-session");
         build_main_db(&main_core);
         let ctx = ctx_public_only(viewer_tenant);
         let mut session = SessionState::default();
@@ -468,7 +472,7 @@ fn session_entrypoint_matches_oracle_db() {
         assert_eq!(after_hot.hits, after_cold.hits + 1);
         assert_eq!(cold_result.rows, hot_result.rows);
 
-        let (oracle_core, _guard) = open_core("visible-cache-oracle-session-oracle");
+        let (_guard, oracle_core) = open_core("visible-cache-oracle-session-oracle");
         build_oracle_db(&oracle_core, viewer_tenant, false);
         let expected = run_query(&oracle_core, &ctx, sql);
         assert_eq!(

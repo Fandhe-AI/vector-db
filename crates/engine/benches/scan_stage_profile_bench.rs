@@ -624,9 +624,12 @@ fn main() {
         Vec::with_capacity(config.measured_iterations() as usize);
     let mut w0_cold_last_ids: Option<Vec<u64>> = None;
     for _ in 0..config.measured_iterations() {
+        // 計測区間は `Storage::open` を含む（`docs/design/visible-bitmap-cache-verification.md`
+        // の「A0c は W0c と同じ流儀で Storage::open を含む」という前提と一致させる。
+        // `EngineCore::from_storage` 構築自体もこの区間に含める）。
+        let start = Instant::now();
         let cold_storage = Storage::open(&path).expect("reopen storage for W0-cold measurement");
         let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
-        let start = Instant::now();
         let result = black_box(
             cold_core
                 .execute_sql(&ctx_a, &sql_where)
@@ -685,9 +688,11 @@ fn main() {
     let mut a0c_samples: Vec<Duration> = Vec::with_capacity(config.measured_iterations() as usize);
     let mut a0c_last_value: Option<u64> = None;
     for _ in 0..config.measured_iterations() {
+        // 計測区間は `Storage::open` を含む（本節冒頭のコメント・
+        // `docs/design/visible-bitmap-cache-verification.md` の前提と一致させる）。
+        let start = Instant::now();
         let cold_storage = Storage::open(&path).expect("reopen storage for A0-cold measurement");
         let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
-        let start = Instant::now();
         let result = black_box(
             cold_core
                 .execute_sql(&ctx_a, &count_sql)
