@@ -2968,7 +2968,22 @@ impl HnswIndex {
                     // 許容誤差を加えて吸収する。範囲検査は近傍構造の再利用
                     // 判定のみに使われ最終スコアは常に f32 で再計算される
                     // ため、この許容誤差の拡大が結果の正しさに影響しない。
-                    let tol = limit.abs() * f64::from(f32::EPSILON);
+                    //
+                    // ただし相対許容誤差だけでは subnormal 域の scale
+                    // （例: 次元の最大絶対値が `f32::from_bits(190)` 程度の
+                    // 極小値で `fit_dim_params` が `scale = f32::from_bits(1)`
+                    // を返す場合）を吸収できない。subnormal 域では f32 の
+                    // 刻み幅（ULP）が値に比例せず `f32::MIN_POSITIVE` 未満の
+                    // 固定の絶対ステップになるため、`limit.abs() * EPSILON`
+                    // が実際の丸め誤差より小さくなり、未変更ベクトルが
+                    // `Some(false)`（不一致）と誤判定されうる（PR #617
+                    // codex-review P2 指摘）。scale 自体の 1 ULP 分の絶対
+                    // ステップ（`f32::next_up` との差。subnormal 域でも
+                    // ビット単位で正しく求まる）を 127 倍した絶対許容誤差を
+                    // フロアとして追加で持たせ、相対許容誤差とのより大きい方を
+                    // 採る。
+                    let scale_ulp = f64::from(scale.next_up()) - f64::from(scale);
+                    let tol = (limit.abs() * f64::from(f32::EPSILON)).max(scale_ulp * 127.0);
                     if f64::from(c).abs() > limit + tol {
                         return Some(false);
                     }
@@ -6344,6 +6359,43 @@ mod tests {
         // 範囲外ノード・次元不一致は None。
         assert_eq!(i8_index.node_matches(u32::try_from(n).unwrap(), &row), None);
         assert_eq!(i8_index.node_matches(0, &row[..dim - 1]), None);
+    }
+
+    /// T-I3b: `node_matches` の範囲検査が subnormal スケールでも未変更
+    /// ベクトルを誤って不一致と判定しないことを固定する（PR #617
+    /// codex-review P2 指摘）。ある次元の最大絶対値が `f32::from_bits(190)`
+    /// 程度の極小値（subnormal）のとき `fit_dim_params` が
+    /// `scale = f32::from_bits(1)`（f32 の最小正 subnormal）を受理しうる。
+    /// subnormal 域では f32 の刻み幅（ULP）が値に比例せず固定の絶対ステップに
+    /// なるため、相対許容誤差（`limit.abs() * f32::EPSILON`）だけでは
+    /// `scale * 127` の丸め誤差を吸収できず、fit 時点そのままの未変更行が
+    /// `Some(false)`（不一致）と誤判定されて世代更新のたびに不要な索引
+    /// 再構築を誘発しうる（Overlay::compute が全行変更扱いする経路）。
+    #[test]
+    fn i8_node_matches_absorbs_subnormal_scale_rounding_error() {
+        let dim = 4usize;
+        let n = 30;
+        let mut vectors = gen_corpus(0x0521b, dim, n);
+        // 次元 0 を全行同じ subnormal 極小値へ揃える（min_d == max_d ==
+        // f32::from_bits(190) なので max_abs もその値になり、scale は
+        // subnormal 域に丸まる）。
+        let extreme = f32::from_bits(190);
+        for row in vectors.chunks_exact_mut(dim) {
+            row[0] = extreme;
+        }
+        let i8_index = HnswIndex::build_with_precision(
+            HnswParams::default(),
+            ResidentPrecision::I8,
+            dim as u32,
+            &vectors,
+            5,
+        )
+        .unwrap();
+        assert_eq!(i8_index.resident_precision(), ResidentPrecision::I8);
+
+        // 未変更（fit にそのまま使った行）は一致と判定されなければならない。
+        let row: Vec<f32> = vectors[0..dim].to_vec();
+        assert_eq!(i8_index.node_matches(0, &row), Some(true));
     }
 
     /// T-I4: 非有限成分を含む入力を `I8` 指定で build すると `F32` へ自動縮退し
