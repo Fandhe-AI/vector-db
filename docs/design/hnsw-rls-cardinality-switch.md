@@ -929,6 +929,21 @@ Issue #488 が確立した「1 つの判定式を複数箇所で共有し分岐�
   ADR 本文の改訂は不要とする。オーナーが明文化を望む場合は別 Issue とする
   （起票はユーザー承認事項のため本 Issue では行わない）
 
+## Issue #498 追記: visited 集合切替閾値の可視比率スイープ確認（層 2）
+
+Issue #497（`VisitedSparse`・`sparse_visited_max` 閾値機構）の閾値既定値
+確定にあたり、本節の可視比率スイープ基盤（`SWEEP_CANDIDATES=visited`
+opt-in。`full_scan_ratio` を `0/1` へ固定した `hnsw_force_ann_dense`／
+`hnsw_force_ann_sparse` の 2 candidate）を再利用して確認計測を実施した。
+ratio=1/2（可視率 50%）では `ann_masked` が発火し
+`sparse_visited_searches` の delta が期待どおり観測された一方、ratio=1/10
+では上記「Issue #487: 可視比率 × 行数の損益分岐点実測」節と同じ構造的限界
+（均等分散マスクによる `mask_splits_graph` 縮退）で切替自体に到達しなかっ
+た。閾値既定値そのものの前後比較（層 1・dense/sparse の直接 A/B）・判断は
+`docs/design/hnsw-search.md`「Issue #498」節参照。クラスタ寄り fixture の
+整備は引き続き #502 の担当。production コード無変更（本節の計測は
+`crates/engine/benches/`・`scripts/` のみ）。
+
 ## スコープ外・申し送り
 
 - ~~不足時の `ef` 倍増再探索（iterative scan）・hybrid 密側の ANN 化と

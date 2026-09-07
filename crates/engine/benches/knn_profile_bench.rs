@@ -1405,15 +1405,47 @@ fn run_visible_ratio_sweep(
             masked_short_delta,
             fallbacks_delta,
         );
-        println!(
-            "knn_profile_bench: arm expected={expected_label} observed={}",
-            observed_arm_label(
-                subset_searches_delta,
-                plain_scans_delta,
-                mask_splits_graph_delta,
-                masked_short_delta,
-            )
+        let observed_label = observed_arm_label(
+            subset_searches_delta,
+            plain_scans_delta,
+            mask_splits_graph_delta,
+            masked_short_delta,
         );
+        println!("knn_profile_bench: arm expected={expected_label} observed={observed_label}");
+
+        // visited 集合切替閾値の診断出力（Issue #498）。`sparse_visited_max`
+        // 未設定（`sparse_visited_max_override == None`）は production の既定
+        // （`DEFAULT_SPARSE_VISITED_MAX = 0`。常に dense）と同じ効果を持つため
+        // `effective_sparse_visited_max` は 0 とみなす——`hnsw.rs::
+        // search_masked_with` の述語（`mask.count_ones() < sparse_visited_max`）
+        // と単一の情報源を共有し、期待値の計算をここだけで二重管理しない。
+        let sparse_visited_searches_delta = stats_after_subset
+            .sparse_visited_searches
+            .saturating_sub(stats_before_subset.sparse_visited_searches);
+        let effective_sparse_visited_max = sparse_visited_max_override.unwrap_or(0);
+        let expected_sparse = visible_rows < effective_sparse_visited_max as u64;
+        let expected_visited_label = if expected_sparse { "sparse" } else { "dense" };
+        println!(
+            "knn_profile_bench: sparse_visited(delta) searches={sparse_visited_searches_delta} \
+             expected_visited={expected_visited_label}"
+        );
+        // ann_masked（マスク付き探索が縮退なしで完走した）かつ、可視候補数が
+        // 閾値未満で sparse が選ばれるべき条件のときに限り、実際に 1 件も
+        // `VisitedSparse` を選ばなかった（delta == 0）ことを vacuous な計測
+        // として拒否する。`plain_scan_*`（既存 fixture では構造的に到達不能。
+        // `docs/design/hnsw-rls-cardinality-switch.md`「可視比率 × 行数の
+        // 損益分岐点実測（Issue #487）」節）や `dense` 期待（閾値 ≤ 可視行数。
+        // sparse が発火しないのが正しい挙動）は fail させない——「既存
+        // fixture では切替到達不能」という事実そのものを記録することが本
+        // 診断の目的の一つのため。
+        if observed_label == "ann_masked" && expected_sparse && sparse_visited_searches_delta == 0 {
+            fail_closed(
+                "BENCH_KNN_PROFILE_SPARSE_VISITED_MAX の閾値未満の可視候補数で ann_masked が \
+                 観測されたにもかかわらず sparse_visited_searches の delta が 0 だった \
+                 （VisitedSparse が一度も選ばれなかった vacuous な計測。Issue #498）"
+                    .to_string(),
+            );
+        }
     } else {
         println!(
             "knn_profile_bench: arm expected={expected_label} observed=n/a (brute_force engine)"
