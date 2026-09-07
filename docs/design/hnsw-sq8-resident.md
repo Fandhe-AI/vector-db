@@ -213,7 +213,8 @@ AvxVnni・Avx512Vnni ディスパッチ 3 箇所。`x86_i8.rs` 本体は `unsafe
 - NEON dotprod（`vdotq_s32`）版の i8 整数カーネルは #525 の担当。
 - `RecallEngine` fixture（`crates/engine/tests/fixtures/recall_engine.rs`）
   への `hnsw_i8` 追加・`recall.yml` matrix 拡張・Recall 3 ゲート同一閾値
-  検証・`bench-knn-profile` 等の `hnsw_i8` トークン追加は #523 の担当。
+  検証・`bench-knn-profile` 等の `hnsw_i8` トークン追加は Issue #523 で
+  実施済み（下記追記参照）。
 - `gpu_batch/packed_i8.rs`（GPU・行単位対称スケール）の本モジュールへの
   統合は未実施（#598 側の申し送りのまま。行単位／次元別で方式が異なるため
   統合形は #522 実装後に判断）。
@@ -221,3 +222,107 @@ AvxVnni・Avx512Vnni ディスパッチ 3 箇所。`x86_i8.rs` 本体は `unsafe
   ションコメントのみ更新済み（`explain.rs` 本体は `Display` 経由のパス
   スルーのため変更不要）。
 - wire-server への HNSW／精度 opt-in CLI 追加は対象外（f16 版 D12 と同型）。
+
+## Issue #523 追記: 前後比較・常駐メモリ・oversampling 要否
+
+Issue #515・#516 の f16 版と同型に、I8（SQ8）常駐 opt-in の Recall 3 ゲート
+同一閾値検証・可視外非混入テストを実施した（実測表・可視外非混入テストの
+詳細は `docs/design/ann-recall-gate-verification.md`「Issue #523 追記」節
+参照。**結論のみ再掲**: hybrid・rerank・query-planning の全 8 測定点で
+brute_force／hnsw／hnsw_f16／hnsw_i8 の Recall 実測値が完全一致し、D6
+自動縮退〔`i8_residency_fallbacks`〕もいずれも 0 だった。閾値を緩める
+必要はない）。
+
+### `ef` 掃引による oversampling 要否の判断材料（`tests/hnsw_i8_recall.rs`）
+
+R5「Recall 劣化があれば oversampling（候補幅 `ef`）で補えるか」を判断する
+ため、brute-force 対照 Recall@10 を F32 vs I8 × `ef ∈ {64, 128, 256}` で
+掃引する層 B テスト（`make hnsw-i8-recall`。N=10,000・dim=128・クラスタ
+構造ありコーパス 80 クラスタ）を追加し、本開発環境で 1 回実測した:
+
+| ef | クラスタあり F32 | クラスタあり I8 | 差分 | 一様乱数（informational）F32 | 一様乱数 I8 | 差分 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64 | 1.0000 | 0.9050 | 0.0950 | 0.6445 | 0.6435 | 0.0010 |
+| 128 | 1.0000 | 0.9050 | 0.0950 | 0.8155 | 0.8135 | 0.0020 |
+| 256 | 1.0000 | 0.9050 | 0.0950 | 0.9465 | 0.9410 | 0.0055 |
+
+**クラスタ構造ありコーパスでは `ef` を 64→128→256 と増やしても I8 の
+Recall@10 が F32 との差分（0.0950）から一切改善しない**——F32 側が既に
+`ef=64` で Recall@10=1.0000（理論上限）へ到達しているため、`ef` 自体の
+拡大余地がこのフィクスチャには残っていない。つまり本フィクスチャの範囲
+では「候補幅を広げれば I8 の量子化ノイズを打ち消せる」という
+oversampling 仮説は成立しない（i8 側の探索経路そのものが F32 と異なる
+順序で収束するため、より広い `ef` を与えても同じ約 9.5% の候補漏れが
+残る）。一様乱数コーパス（informational・HNSW にとって最難条件の一つ）
+では `ef` を増やすと F32・I8 とも改善するが、両者の差分自体は 0.001〜
+0.006 とごく小さいまま。
+
+決定規則（B: 劣化があれば ef 掃引で補えるかを記録）に従い、**「I8 常駐
+opt-in の既定 `ef_search`（既定 64）は変更しない。専用 oversample knob も
+追加しない」**と判断する。根拠は次の 2 点:
+
+1. 上記のとおり、クラスタ構造ありフィクスチャでは `ef` を増やしても
+   ギャップが縮まらない（`ef` 引き上げでは解決しない問題）。
+2. `docs/design/ann-recall-gate-verification.md`「Issue #523 追記」節の
+   Recall ゲート実測（実コーパス規模・hybrid 密側再取得ループ経由）では
+   全 8 測定点で brute_force と完全一致しており、この構造的なギャップは
+   本リポの Recall ゲートが対象とする経路（SQL 表層 hybrid・単発
+   DISTANCE）では実害として現れていない。
+
+両者の違い（`hnsw_i8_recall.rs` の直接 `HnswIndex::search` 呼び出し vs
+hybrid 密側再取得ループ経由）の原因分析は未実施の仮説にとどめ、既定値
+変更は行わない。既定 `ef_search` の引き上げ・専用 knob 追加の要否は
+今後 I8 常駐の適用範囲が単発 DISTANCE クエリへ広がった場合にオーナー
+判断で再検討する。
+
+### 前後比較・常駐メモリ実測（`bench-knn-i8-resident`）
+
+`scripts/bench_knn_f16_resident_ab.sh` を `AB_CANDIDATE_ENGINE`（既定
+`hnsw_f16`。`hnsw_i8` も受理）で一般化し（Issue #516 の f16 版スクリプトを
+そのまま再利用）、`make bench-knn-i8-resident` から実行できるようにした。
+
+自動運転環境の時間制約により、規模点は 25,000 行 × dim 128（`AB_POINTS=
+"1:128"`）の 1 点・交互 N=5 ペアに縮小して実測した（フル規模〔100k／500k
+行・dim 768〕はオーナー判断による専有環境再実測へ申し送り。計測規約
+`docs/design/benchmark-judgement-policy.md` の N≥5 は維持）。per-run 生
+データは `docs/design/bench-data/hnsw-i8-resident-ab/` 参照。
+
+hot-only レイテンシ（`stage(S0_hot_sql_e2e)` median. ms）:
+
+| pair | brute_force（i8 直前） | hnsw（f32） | hnsw_i8 |
+| --- | --- | --- | --- |
+| 1 | 0.661 | 0.678 | 0.428 |
+| 2 | 0.673 | 0.693 | 0.430 |
+| 3 | 0.652 | 0.628 | 0.425 |
+| 4 | 0.676 | 0.661 | 0.417 |
+| 5 | 0.669 | 0.631 | 0.416 |
+| **min-of-5** | 0.652 | 0.628 | **0.416** |
+| **median** | 0.669 | 0.661 | **0.425** |
+
+`hnsw_i8` は `hnsw`（f32）比で min-of-5 0.416/0.628=0.66x・median
+0.425/0.661=0.64x と一貫して高速（固定 ±5% 帯を明確に超える改善方向）。
+共有 QEMU 環境の参考値であり採否根拠にはしない
+（`benchmark-judgement-policy.md` §5 の証拠力区分）が、ヒット率・
+`i8_residency_fallbacks=0`（非 vacuous）は全 run で確認済み。
+
+索引単体常駐メモリ（`approx_heap_bytes`。25,000 行・dim 128・N=2）:
+
+| 精度 | approx_heap_bytes | vm_rss_delta_kb（参考） |
+| --- | --- | --- |
+| f32（hnsw） | 17,226,056 | 23,764 / 23,860 |
+| i8（hnsw_i8） | 7,726,568 | 14,488 / 14,456 |
+
+i8 は f32 比で約 55.2%（7,726,568 / 17,226,056 ≈ 0.448）の常駐メモリ
+削減——1 要素 4 バイト（f32）→ 1 バイト（i8 コード）＋ 4 バイト
+（次元ごとスケール・行合計）の理論比とおおむね整合する。
+
+### 判断（前後比較・oversampling の総括）
+
+- **共有 QEMU 環境の 1 規模点のみの参考値**ながら、hot-only レイテンシは
+  一貫して改善方向（min-of-5 で約 34% 短縮）、常駐メモリは決定的な値で
+  約 45% 削減を確認した。
+- oversampling（`ef` 引き上げ）は Recall ゲート実測では不要——I8 常駐
+  opt-in は既定 `ef_search` のまま運用可。
+- 専有環境での大規模点（100k／500k・dim 768）再実測、VNNI 実機での
+  レイテンシ実測、per-query 縮退カウンタの追加要否はオーナー判断へ申し
+  送る。
