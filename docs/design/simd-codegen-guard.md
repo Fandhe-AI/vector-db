@@ -53,8 +53,8 @@ feature のため `SimdKernel::dot` 本体へインライン化される。関�
 
 | target | 必須シンボル |
 | ------ | ------------ |
-| x86_64 | `dot_avx2_fma` かつ `dot_avx512` |
-| aarch64 | `SimdKernel::dot`（`dot_neon` はインライン化されるため対象外） |
+| x86_64 | `dot_avx2_fma` かつ `dot_avx512`（各シンボルは Issue #528 以降 `PADDED_TAIL` の `false`／`true` 2 monomorphization として現れる） |
+| aarch64 | `SimdKernel::dot_with_scalar_tail` かつ `SimdKernel::dot_with_padded_tail`（`dot_neon` はインライン化されるため対象外。Issue #528 で `SimdKernel::dot` から更新——`dot_impl<const PADDED_TAIL: bool>` を共有本体化したことで `dot` は LLVM の関数マージによりラベルを持たないエイリアス（`.s` 上は `.set`）として出力され、独立シンボルとして現れなくなったため） |
 
 ## 3. 禁止命令集合と根拠
 
@@ -97,6 +97,20 @@ feature のため `SimdKernel::dot` 本体へインライン化される。関�
 - aarch64
   - `SimdKernel::dot`: `ldr q`／`ldp q`・`fmla v.4s`・`dup v.4s`
   - レーン挿入命令（`ld1 {...}[n]`／`ins v`／`mov v_.[bhsd][`）は 0 件
+
+### Issue #528 以降の追記
+
+`dot_lanes` へ `const PADDED_TAIL: bool` を追加し、端数（tail）処理方式を
+現行のスカラー逐次和（`false`）／零埋め固定長バッファによる分岐なし tail
+（`true`）で切り替え可能にした（詳細は `docs/design/dot-kernel-branchless-tail.md`
+参照。既定経路の挙動は不変）。x86_64 では `dot_avx2_fma`／`dot_avx512` の
+マングル名は共通のため両 monomorphization が同一の必須シンボル検査を満たす。
+aarch64 では `SimdKernel::dot` がエイリアス化され独立シンボルとして現れなく
+なったため、必須シンボルを `SimdKernel::dot_with_scalar_tail`／
+`dot_with_padded_tail`（`dot_impl::<false>`／`dot_impl::<true>` の薄い
+ラッパー）へ更新した（`required_segments_for` の aarch64 分岐）。禁止命令は
+`padded_tail_sum`（新設。零埋めバッファへの 1 要素ずつのコピー ＋ 積 ＋
+`iter().sum()`）を含め x86_64・aarch64 いずれも 0 件のまま。
 
 ## 6. self-test fixture の設計
 
