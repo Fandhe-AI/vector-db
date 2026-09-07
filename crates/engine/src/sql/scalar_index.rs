@@ -364,6 +364,15 @@ pub(crate) struct ScalarIndex {
     /// `id_as_finite_scalar` を満たす場合のみ `Some`（1 件でも `id > 2^53` が
     /// あれば `None`。モジュールドキュメント参照）。
     id_index: Option<Vec<(u64, u32)>>,
+    /// [`Self::build`] 完了時に 1 回だけ計算した概算ヒープバイト量
+    /// （[`Self::compute_approx_heap_bytes`] の結果）。索引は構築後不変
+    /// （`columns`/`id_index` を変更する API を持たない）ため、この値も
+    /// 索引の寿命を通じて不変。[`ScalarIndexCache::insert`] が
+    /// 書き込みロック保持中に既存索引すべてを毎回再走査してしまう問題
+    /// （codex-review P2 対応・PR #569）を解消するため、
+    /// [`Self::approx_heap_bytes`] はこのフィールドを返すだけの O(1) アクセサ
+    /// にする。
+    approx_bytes: usize,
 }
 
 /// `TextColumnIndex` 構築時の並び替えキー: バイト列昇順、同値はスロット昇順。
@@ -567,16 +576,21 @@ impl ScalarIndex {
             id_index = Some(pairs);
         }
 
-        let built = Self {
+        let mut built = Self {
             built_ctx: snapshot.built_ctx_for_index().clone(),
             built_table_generation: snapshot.built_table_generation_for_index(),
             row_count,
             columns,
             id_index,
+            // 直後に `compute_approx_heap_bytes` の結果で確定させるまでの
+            // 仮値。この構造体は `build` の外へ `0` のまま漏れ出さない。
+            approx_bytes: 0,
         };
-        if built.approx_heap_bytes() > MAX_SCALAR_INDEX_BYTES {
+        let computed_bytes = built.compute_approx_heap_bytes();
+        if computed_bytes > MAX_SCALAR_INDEX_BYTES {
             return Err(ScalarIndexBuildError::TooLarge);
         }
+        built.approx_bytes = computed_bytes;
         Ok(built)
     }
 
@@ -640,8 +654,12 @@ impl ScalarIndex {
     }
 
     /// 索引全体（`TEXT` 列の辞書・CSR・`equality`・`id_index`）の概算ヒープ
-    /// バイト量（容量判定用）。
-    fn approx_heap_bytes(&self) -> usize {
+    /// バイト量を実走査で計算する（`O(索引サイズ)`）。[`Self::build`] 完了時に
+    /// 1 回だけ呼び、結果を `approx_bytes` フィールドへ確定させる。索引は
+    /// 構築後不変のためこの計算はここでしか行わない
+    /// （[`Self::approx_heap_bytes`] のドキュメント参照。codex-review P2
+    /// 対応・PR #569）。
+    fn compute_approx_heap_bytes(&self) -> usize {
         let columns_bytes: usize = self
             .columns
             .iter()
@@ -654,6 +672,15 @@ impl ScalarIndex {
             .map(|v| v.len().saturating_mul(std::mem::size_of::<(u64, u32)>()))
             .unwrap_or(0);
         columns_bytes.saturating_add(id_index_bytes)
+    }
+
+    /// 概算ヒープバイト量（容量判定用）を返す O(1) アクセサ。
+    /// [`Self::build`] 完了時に確定した `approx_bytes` フィールドをそのまま
+    /// 返すだけで索引を再走査しない（[`ScalarIndexCache::insert`] が書き込み
+    /// ロック保持中に呼んでも既存索引の再走査コストを引き起こさない。
+    /// codex-review P2 対応・PR #569）。
+    fn approx_heap_bytes(&self) -> usize {
+        self.approx_bytes
     }
 
     #[cfg(test)]
@@ -1521,6 +1548,41 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin read");
         assert!(cache.lookup(&storage, &read_txn, "docs", &ctx_b).is_none());
         assert_eq!(cache.stats().entries, 1);
+    }
+
+    /// codex-review P2 対応（PR #569）の固定テスト: `approx_heap_bytes()` は
+    /// [`ScalarIndex::build`] 完了時に確定した `approx_bytes` フィールドを
+    /// 返すだけの O(1) アクセサであり、実走査（`compute_approx_heap_bytes`）
+    /// と常に一致する。`insert` が書き込みロック保持中に既存索引すべてを
+    /// 再走査しなくなったことを、両者の値が同一であり続けることで間接的に
+    /// 固定する（`insert` が誤った値を積み上げていればここで乖離する）。
+    #[test]
+    fn approx_heap_bytes_matches_build_time_computed_value_and_is_not_recomputed() {
+        let path = unique_db_path("scalar-index-approx-bytes-cached");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let ctx_a = ctx("tenant-a");
+        insert(&storage, &ctx_a, 1, Some("x"), None, Visibility::Public);
+        insert(&storage, &ctx_a, 2, Some("y"), None, Visibility::Public);
+
+        let (snapshot, schema) = snapshot_from(&storage, &ctx_a);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+
+        let cached = index.approx_heap_bytes();
+        let recomputed = index.compute_approx_heap_bytes();
+        assert_eq!(
+            cached, recomputed,
+            "approx_heap_bytes() must equal a fresh full traversal"
+        );
+
+        let cache = ScalarIndexCache::new();
+        let inserted = cache
+            .insert(&storage, "docs", &ctx_a, index)
+            .expect("insert must succeed on fresh generation");
+        // insert 後もキャッシュ登録済みインスタンスの値は build 時点のまま
+        // （insert 経路が値を書き換えたり再走査結果へ差し替えたりしない）。
+        assert_eq!(inserted.approx_heap_bytes(), cached);
     }
 
     // ---------- 補助（テスト専用のフィルタ構築ヘルパ） ----------
