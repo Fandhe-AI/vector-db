@@ -88,6 +88,14 @@ const F16_MAX_FINITE: f32 = 65504.0;
 /// なく実装既定値。
 const F16_ARITH_PARTIAL_SUM_LIMIT: f32 = 32768.0;
 
+/// f16（IEEE 754 half-precision）の最小正 subnormal（2^-24）。この値未満の
+/// 絶対値を持つ非ゼロ有限成分は [`crate::batch_search::pack_f16x2`] で
+/// 厳密にゼロへ丸められ情報が失われる（PR #591 レビュー P1 指摘対応）。
+/// 既存のオーバーフローガード（上限のみ）はこの種のアンダーフローを
+/// 検知できず、有効な小さい値が f16 変換で消えて正解行がスコア差から
+/// 脱落しうるため、[`select_dot_shader`] は該当時に unpack 版へ縮退する。
+const F16_MIN_POSITIVE_SUBNORMAL: f32 = 5.960_464_5e-8;
+
 /// workgroup 内部分 Top-k シェーダ（[`DOT_SHADER_TOPK_WGSL`]/
 /// [`DOT_SHADER_TOPK_F32_WGSL`]）が 1 ワークグループから出力する候補数の
 /// 上限（Issue #536・ポインタ: `docs/design/gpu-batch-topk.md` 決定 1・3）。
@@ -818,6 +826,17 @@ enum QueryEncoding {
 /// 参照）。行列が空、または全成分が非有限の場合は `0.0`（安全側 = ガードが
 /// 通りやすい方向ではなく、`query_max_abs` 側の独立チェックで overflow は
 /// 別途防がれる）を返す。
+///
+/// 本関数は常駐行列（既に `pack_f16x2` で f16 量子化済みのバイト列）を
+/// 走査するため、「非ゼロの元の値が f16 変換でゼロへ丸められたか」を
+/// ここで検知することはできない（丸め後の値しか観測できず、丸め前が
+/// 真にゼロだった行との区別がつかない）。この量子化は `Unpack`/`F16Arith`
+/// いずれのシェーダを選んでも常駐行列の読み出し元（`self.row_buffer`）が
+/// 共通のため両経路で等しく発生する既存の制約であり、[`select_dot_shader`]
+/// の shader 選択が新たに追加するリスクではない（PR #591 レビュー P1
+/// 指摘対応の検討過程で確認。アンダーフロー検知が意味を持つのは、
+/// `F16Arith` 選択時にのみ追加で f16 量子化されるクエリ側
+/// [`max_abs_finite_from_queries`] のみ）。
 fn max_abs_finite_from_packed(packed: &[u32]) -> f32 {
     let mut max_abs: f32 = 0.0;
     for &word in packed {
@@ -832,21 +851,47 @@ fn max_abs_finite_from_packed(packed: &[u32]) -> f32 {
     max_abs
 }
 
-/// クエリバッチ（f32・パック前）の有限成分のみの絶対値最大を走査する
-/// （Issue #539・[`select_dot_shader`] の `query_max_abs` 引数を作る）。
-/// `f16` へパックした時点での飽和（±Inf 化）を判定する独立ガード
+/// [`max_abs_finite_from_queries`] の走査結果（Issue #539・#591 P1 レビュー
+/// 指摘対応）。`max_abs` は既存のオーバーフローガードの母数、
+/// `has_subnormal_underflow` は「非ゼロ有限成分のうち
+/// [`F16_MIN_POSITIVE_SUBNORMAL`] 未満で `pack_f16x2` により厳密にゼロへ
+/// 丸められる値が存在するか」を表す。後者が真の場合、オーバーフローが
+/// 起きなくても有効な小さいクエリ成分が f16 変換で消え去り、正解行が
+/// スコア差から脱落しうるため、[`select_dot_shader`] は f16 算術版を
+/// 選ばない（クエリは `Unpack` 選択時は f32 のまま送るため、この量子化は
+/// `F16Arith` を選んだ場合にのみ新たに生じる。[`max_abs_finite_from_packed`]
+/// doc 参照）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct QueryAmplitudeStats {
+    max_abs: f32,
+    has_subnormal_underflow: bool,
+}
+
+/// クエリバッチ（f32・パック前）の有限成分のみの絶対値最大・アンダーフロー
+/// 有無を走査する（Issue #539・[`select_dot_shader`] の
+/// `query_max_abs`/`query_has_subnormal_underflow` 引数を作る）。`f16` へ
+/// パックした時点での飽和（±Inf 化）を判定する独立ガード
 /// （`query_max_abs > F16_MAX_FINITE`）の母数となるため、f32 の値そのまま
-/// （f16 丸め前）で最大値を取る（`select_dot_shader` doc 参照）。
-fn max_abs_finite_from_queries(queries: &[BatchQuery<'_>]) -> f32 {
+/// （f16 丸め前）で走査する（`select_dot_shader` doc 参照）。
+fn max_abs_finite_from_queries(queries: &[BatchQuery<'_>]) -> QueryAmplitudeStats {
     let mut max_abs: f32 = 0.0;
+    let mut has_subnormal_underflow = false;
     for q in queries {
         for &v in q.vector {
-            if v.is_finite() {
-                max_abs = max_abs.max(v.abs());
+            if !v.is_finite() {
+                continue;
+            }
+            let abs = v.abs();
+            max_abs = max_abs.max(abs);
+            if abs > 0.0 && abs < F16_MIN_POSITIVE_SUBNORMAL {
+                has_subnormal_underflow = true;
             }
         }
     }
-    max_abs
+    QueryAmplitudeStats {
+        max_abs,
+        has_subnormal_underflow,
+    }
 }
 
 /// [`GpuDotShaderKind`] を GPU デバイス非依存の純関数として決める
@@ -870,10 +915,21 @@ fn max_abs_finite_from_queries(queries: &[BatchQuery<'_>]) -> f32 {
 ///   F16_ARITH_PARTIAL_SUM_LIMIT`: [`GPU_F16_ACC_BLOCK`] 回分の f16 積算が
 ///   ブロックフラッシュ前に f16 の有限最大値（65504）へ達しないことの
 ///   保守的な上界判定
+/// - `query_has_subnormal_underflow` が偽であること（PR #591 レビュー P1
+///   指摘対応）: 上限のみを見る上記オーバーフローガードは、有効な非ゼロ
+///   小成分が [`F16_MIN_POSITIVE_SUBNORMAL`] 未満で f16 へ厳密にゼロ丸め
+///   されるアンダーフローを検知できない。クエリは `F16Arith` 選択時のみ
+///   f16 パックされる（`Unpack` 選択時は f32 のまま送る）ため、この
+///   アンダーフローはクエリ側にのみ新たに生じるリスクであり（常駐行列側は
+///   両シェーダ共通で既に f16 量子化済みのため対象外。
+///   [`max_abs_finite_from_packed`] doc 参照）、極端な振幅差（例: クエリの
+///   ある成分が 1e-8 程度）では、この成分の寄与が消え正解行がスコア差から
+///   脱落しうるため独立に unpack 版へ縮退する
 fn select_dot_shader(
     f16_arith_available: bool,
     row_max_abs: f32,
     query_max_abs: f32,
+    query_has_subnormal_underflow: bool,
 ) -> GpuDotShaderKind {
     if !f16_arith_available {
         return GpuDotShaderKind::Unpack;
@@ -882,6 +938,9 @@ fn select_dot_shader(
         return GpuDotShaderKind::Unpack;
     }
     if query_max_abs > F16_MAX_FINITE {
+        return GpuDotShaderKind::Unpack;
+    }
+    if query_has_subnormal_underflow {
         return GpuDotShaderKind::Unpack;
     }
     let bound = row_max_abs * query_max_abs * (GPU_F16_ACC_BLOCK as f32);
@@ -915,14 +974,11 @@ fn encode_query_bytes(
             }
             let mut out = Vec::new();
             try_reserve_bytes(&mut out, (values.len() / 2).saturating_mul(4))?;
-            for pair in values.chunks_exact(2) {
-                let (a, b) = match pair {
-                    [a, b] => (*a, *b),
-                    // `chunks_exact(2)` は常に長さ 2 のスライスのみ返すため
-                    // 到達しないが、添字アクセスを避けるためパターンマッチで
-                    // 表現する（coding-rust.md）。
-                    _ => continue,
-                };
+            // `chunks_exact(2)` は常に長さ 2 のスライスを返す契約だが、
+            // clippy `chunks_exact_to_as_chunks` 指摘対応で `as_chunks::<2>()`
+            // （配列の固定長ぶんだけ添字アクセス無しで分配可能）へ置き換える。
+            let (chunks, _remainder) = values.as_chunks::<2>();
+            for &[a, b] in chunks {
                 let packed = crate::batch_search::pack_f16x2(a, b);
                 out.extend_from_slice(&packed.to_ne_bytes());
             }
@@ -1679,14 +1735,6 @@ pub struct GpuBatchBackend {
     /// `stats()` 経由で読む）。インスタンス単位（`GpuContext` のようなプロセス
     /// 共有ではない）で、このバックエンドが処理した dispatch のみを数える。
     stats: std::sync::Arc<GpuBatchStats>,
-    /// 常駐行列（`matrix.packed()`）が保持する有限成分のみの絶対値最大
-    /// （Issue #539・[`select_dot_shader`] 参照）。`try_new` で 1 回だけ
-    /// 走査して確定させ、以降の `batch_search` 呼び出し全件で共有する
-    /// （クエリごとに毎回行列全体を再走査しないため）。非有限成分（f16
-    /// パック時の飽和で ±Inf 化した値）は unpack 版でも必ず非有限スコアと
-    /// して除外されるため最大値計算から除外してよい（`select_dot_shader`
-    /// doc 参照）。
-    row_max_abs: f32,
 }
 
 impl GpuBatchBackend {
@@ -1766,17 +1814,18 @@ impl GpuBatchBackend {
         }
 
         // f16 算術版の選択可否ガード（Issue #539・[`select_dot_shader`]）に
-        // 使う「常駐行列の有限成分のみの絶対値最大」を 1 回だけ走査して確定
-        // させる（`batch_search` 呼び出しのたびに行列全体を再走査しない）。
-        let row_max_abs = max_abs_finite_from_packed(matrix.packed());
-
+        // 使う「常駐行列の有限成分のみの絶対値最大」は、`try_new` 時点では
+        // まだどの `PolicyContext` から呼ばれるか分からず行列全体（他テナント
+        // の不可視行を含む）でしか走査できないため、ここではキャッシュしない
+        // （PR #591 レビュー P0 指摘対応。統計はクエリの可視行のみに限定して
+        // `batch_search` 呼び出しのたびに [`max_abs_finite_from_visible_rows`]
+        // で求める）。
         Ok(Self {
             matrix,
             row_buffer,
             device_lost: ctx.device_lost.clone(),
             uncaptured_error: ctx.uncaptured_error.clone(),
             stats: std::sync::Arc::new(GpuBatchStats::default()),
-            row_max_abs,
         })
     }
 
@@ -1957,9 +2006,23 @@ impl GpuBatchBackend {
         // 判定するため、`select_dot_shader` が `F16Arith` を返した場合
         // `ctx.f16_arith_pipelines` は必ず `Some` のはずだが、万一の不整合
         // でも unpack 版へ fail-closed に縮退する（panic させない）。
+        //
+        // テナント境界（P0・PR #591 レビュー指摘対応）: `row_max_abs` は
+        // 常駐行列全体ではなく、このクエリバッチに含まれる各 `PolicyContext`
+        // が可視な行のみ（[`max_abs_finite_from_visible_rows`]）から求める。
+        // 常駐行列全体を母数にすると、他テナントの不可視行の値がシェーダ
+        // 選択（＝返却スコアの数値精度）に影響してしまい、可視行が全く同じ
+        // クエリでも他テナントのデータ有無で結果が変わりうる。
         let f16_available = ctx.f16_arith_pipelines.is_some();
-        let query_max_abs = max_abs_finite_from_queries(queries);
-        let natural_shader_kind = select_dot_shader(f16_available, self.row_max_abs, query_max_abs);
+        let query_stats = max_abs_finite_from_queries(queries);
+        let row_max_abs = max_abs_finite_from_visible_rows(&self.matrix, queries)
+            .map_err(|e| BatchExecError::Input(e.into_batch_search_error()))?;
+        let natural_shader_kind = select_dot_shader(
+            f16_available,
+            row_max_abs,
+            query_stats.max_abs,
+            query_stats.has_subnormal_underflow,
+        );
         let shader_kind = match forced_dot_shader {
             None => natural_shader_kind,
             Some(GpuDotShaderKind::Unpack) => GpuDotShaderKind::Unpack,
@@ -2786,6 +2849,41 @@ fn gather_reachable_rows(
     Ok(out)
 }
 
+/// クエリバッチに含まれる各 `PolicyContext` が可視な常駐行のみを走査して
+/// 有限成分の絶対値最大・アンダーフロー有無を求める（PR #591 レビュー P0
+/// 指摘対応）。[`GpuBatchBackend::batch_search`] の S0 シェーダ選択
+/// （[`select_dot_shader`]）はバッチ呼び出し単位で 1 回だけ行う設計
+/// （§2.3）のため、[`group_queries_by_ctx`] が返す全グループの可視行
+/// 集合の和（重複計算があってもスコアには影響しない）を母数にする。
+/// 常駐行列全体（他テナントの不可視行を含む）を母数にしないことで、
+/// 可視行が同一のクエリがシェーダ選択・返却スコアの数値精度において
+/// 他テナントのデータ有無に左右されないようにする。
+fn max_abs_finite_from_visible_rows(
+    matrix: &crate::batch_search::ResidentMatrix,
+    queries: &[BatchQuery<'_>],
+) -> Result<f32, GpuInputError> {
+    let dim_half = matrix.dim().div_ceil(2);
+    let mut max_abs: f32 = 0.0;
+    for group in group_queries_by_ctx(queries) {
+        let Some(&first_idx) = group.first() else {
+            continue;
+        };
+        let Some(ctx) = queries.get(first_idx).map(|q| q.ctx) else {
+            continue;
+        };
+        let reachable = gather_reachable_rows(matrix, ctx)?;
+        for &row_idx in &reachable {
+            let start = (row_idx as usize).saturating_mul(dim_half);
+            let end = start.saturating_add(dim_half);
+            let Some(row) = matrix.packed().get(start..end) else {
+                continue;
+            };
+            max_abs = max_abs.max(max_abs_finite_from_packed(row));
+        }
+    }
+    Ok(max_abs)
+}
+
 /// [`dispatch_dot_products`] へ渡す「呼び出し元の常駐形式ごとに固定の値」を
 /// 束ねる（clippy `too_many_arguments` を避けつつ、f16 パック常駐 /
 /// f32 常駐（Issue #234・[`GpuF32ContrastBackend`]）で異なるパイプライン・
@@ -3369,17 +3467,20 @@ mod tests {
 
     #[test]
     fn select_dot_shader_requires_f16_available() {
-        assert_eq!(select_dot_shader(false, 1.0, 1.0), GpuDotShaderKind::Unpack);
+        assert_eq!(
+            select_dot_shader(false, 1.0, 1.0, false),
+            GpuDotShaderKind::Unpack
+        );
     }
 
     #[test]
     fn select_dot_shader_rejects_non_finite_inputs() {
         assert_eq!(
-            select_dot_shader(true, f32::INFINITY, 1.0),
+            select_dot_shader(true, f32::INFINITY, 1.0, false),
             GpuDotShaderKind::Unpack
         );
         assert_eq!(
-            select_dot_shader(true, 1.0, f32::NAN),
+            select_dot_shader(true, 1.0, f32::NAN, false),
             GpuDotShaderKind::Unpack
         );
     }
@@ -3392,7 +3493,7 @@ mod tests {
         // クエリ成分が f16 パック時に飽和する分岐そのものを閉じるための独立
         // ガード）。
         assert_eq!(
-            select_dot_shader(true, 0.0, F16_MAX_FINITE + 1.0),
+            select_dot_shader(true, 0.0, F16_MAX_FINITE + 1.0, false),
             GpuDotShaderKind::Unpack
         );
     }
@@ -3401,14 +3502,17 @@ mod tests {
     fn select_dot_shader_rejects_partial_sum_overflow_bound() {
         // row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK が上限を超える。
         let over = (F16_ARITH_PARTIAL_SUM_LIMIT / (GPU_F16_ACC_BLOCK as f32)) + 1.0;
-        assert_eq!(select_dot_shader(true, over, 1.0), GpuDotShaderKind::Unpack);
+        assert_eq!(
+            select_dot_shader(true, over, 1.0, false),
+            GpuDotShaderKind::Unpack
+        );
     }
 
     #[test]
     fn select_dot_shader_accepts_when_all_guards_pass() {
         let per_side = ((F16_ARITH_PARTIAL_SUM_LIMIT / (GPU_F16_ACC_BLOCK as f32)) - 1.0).sqrt();
         assert_eq!(
-            select_dot_shader(true, per_side, per_side),
+            select_dot_shader(true, per_side, per_side, false),
             GpuDotShaderKind::F16Arith
         );
     }
@@ -3418,8 +3522,21 @@ mod tests {
         // `<=` 判定であることを固定する（境界値ちょうどは受理）。
         let exact = F16_ARITH_PARTIAL_SUM_LIMIT / (GPU_F16_ACC_BLOCK as f32);
         assert_eq!(
-            select_dot_shader(true, exact, 1.0),
+            select_dot_shader(true, exact, 1.0, false),
             GpuDotShaderKind::F16Arith
+        );
+    }
+
+    #[test]
+    fn select_dot_shader_rejects_query_subnormal_underflow_even_when_overflow_guard_passes() {
+        // PR #591 レビュー P1 指摘対応: オーバーフローガードだけを見た既存挙動
+        // では、クエリ側に f16 変換でゼロへ丸められる有効な小成分があっても
+        // f16 算術版を採用してしまい、正解行がスコア差から脱落しうる
+        // （行側は両シェーダ共通で既に f16 量子化済みのためチェック対象外。
+        // `max_abs_finite_from_packed` doc 参照）。
+        assert_eq!(
+            select_dot_shader(true, 1.0, 1.0, true),
+            GpuDotShaderKind::Unpack
         );
     }
 
@@ -3440,8 +3557,10 @@ mod tests {
         // 4 要素 → 2 個の u32（各 4 byte）= 8 byte。
         assert_eq!(encoded.len(), 8);
         let mut roundtrip = Vec::new();
-        for chunk in encoded.chunks_exact(4) {
-            let bytes: [u8; 4] = chunk.try_into().expect("chunk must be 4 bytes");
+        // clippy `chunks_exact_to_as_chunks` 指摘対応（gpu_batch.rs 本体側と
+        // 同方針）。
+        let (chunks, _remainder) = encoded.as_chunks::<4>();
+        for &bytes in chunks {
             let word = u32::from_ne_bytes(bytes);
             let (a, b) = crate::batch_search::unpack_f16x2(word);
             roundtrip.push(a);
@@ -3483,7 +3602,21 @@ mod tests {
                 ctx: &c,
             },
         ];
-        assert_eq!(max_abs_finite_from_queries(&queries), 7.0);
+        let stats = max_abs_finite_from_queries(&queries);
+        assert_eq!(stats.max_abs, 7.0);
+        assert!(!stats.has_subnormal_underflow);
+    }
+
+    #[test]
+    fn max_abs_finite_from_queries_detects_subnormal_underflow() {
+        let query = [1e-8f32, 2.0];
+        let c = PolicyContext::new("tenant-a").expect("valid tenant id");
+        let queries = [BatchQuery {
+            vector: &query,
+            k: 1,
+            ctx: &c,
+        }];
+        assert!(max_abs_finite_from_queries(&queries).has_subnormal_underflow);
     }
 
     #[test]
@@ -3763,6 +3896,40 @@ mod tests {
             .expect("reachable row gather should succeed within work budget");
         reachable_priv.sort_unstable();
         assert_eq!(reachable_priv, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn max_abs_finite_from_visible_rows_excludes_other_tenant_invisible_rows() {
+        // PR #591 レビュー P0 指摘対応: テナント "a" の可視行は 1.0 のみだが、
+        // テナント "b" の（"a" からは不可視な）Private 行に極端な大きさの
+        // 成分（65504）を仕込む。母数が常駐行列全体のままなら
+        // `max_abs` が 65504 になってしまい、テナント "a" 視点のシェーダ
+        // 選択・返却スコアの数値精度が他テナントのデータ有無に左右される。
+        let ids = vec![1u64, 2];
+        let tenant_ids = vec!["a".to_string(), "b".to_string()];
+        let visibilities = vec![Visibility::Public, Visibility::Private];
+        let matrix = crate::batch_search::ResidentMatrix::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            2,
+            &[1.0, 0.0, F16_MAX_FINITE, 0.0],
+        )
+        .expect("resident matrix build should succeed for well-formed fixture");
+
+        let ctx_a = PolicyContext::new("a").expect("policy context should build for valid tenant");
+        let query_a = [1.0f32, 0.0];
+        let queries = [BatchQuery {
+            vector: &query_a,
+            k: 1,
+            ctx: &ctx_a,
+        }];
+        let row_max_abs = max_abs_finite_from_visible_rows(&matrix, &queries)
+            .expect("visible row amplitude scan should succeed within work budget");
+        assert_eq!(
+            row_max_abs, 1.0,
+            "tenant b の不可視行（65504）が母数へ混入してはならない"
+        );
     }
 
     /// 同一 `(tenant_id, id)` 契約の検証用フィクスチャ（Issue #178 レビュー指摘対応）。
