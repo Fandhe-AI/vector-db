@@ -326,3 +326,97 @@ pub fn count_boundary_tolerant_mismatches(
         .saturating_sub(extra + duplicates);
     extra + duplicates + missing.max(dropped_above_boundary) + excess
 }
+
+// ---------------------------------------------------------------------
+// 読み戻しバイト数の前後比較（Issue #537。TASK-128〜130・CORE-6/CORE-16
+// ポインタ）。Issue #536 で `engine::gpu_batch` へ追加された workgroup 内
+// 部分 Top-k と統計カウンタ `GpuBatchStatsSnapshot`
+// （`partial_topk_dispatches`／`full_readback_dispatches`／
+// `full_readback_fallbacks`／`readback_bytes`）を、規模点ごとに 1 回だけ
+// 差分取得して出力するための時間非依存な純関数群。
+// ---------------------------------------------------------------------
+
+/// `total_bytes` を `calls` で割った、1 回の `batch_search` 呼び出しあたりの
+/// 読み戻しバイト数を返す。`calls == 0` は計測条件（`batch_search` を一度も
+/// 呼んでいない）の誤りを表すため、無音の 0 除算にせず拒否する
+/// （fail-closed。呼び出し元は「算出不能」として扱う）。
+pub fn readback_bytes_per_call(total_bytes: u64, calls: u64) -> Result<u64, GpuScalingError> {
+    if calls == 0 {
+        return Err(err("readback_bytes_per_call: calls must be > 0"));
+    }
+    Ok(total_bytes / calls)
+}
+
+/// Issue #536 適用前（`895e6cd`）の全量 readback 経路が 1 回の `batch_search`
+/// で読み戻すバイト数の算出値。旧経路は `scores: array<f32>`
+/// （`row_stride * query_count` 要素、単一テナント・全行可視のベンチ条件では
+/// `row_stride == rows`）をそのまま読み戻すため `rows * batch * 4` バイトに
+/// 一意に定まる（`crates/engine/src/gpu_batch.rs` の
+/// `f32_vec_from_ne_bytes`／WGSL `scores: array<f32>` 参照）。旧経路には
+/// [`GpuBatchStatsSnapshot`] 相当のカウンタが無いため実測ではなく算出値
+/// （`docs/design/gpu-batch-topk.md` の前後比較節で「算出値」と明記して扱う）。
+pub fn full_readback_bytes_estimate(rows: usize, batch: usize) -> Result<u64, GpuScalingError> {
+    let rows_u64 = u64::try_from(rows)
+        .map_err(|_| err("full_readback_bytes_estimate: rows does not fit in u64"))?;
+    let batch_u64 = u64::try_from(batch)
+        .map_err(|_| err("full_readback_bytes_estimate: batch does not fit in u64"))?;
+    rows_u64
+        .checked_mul(batch_u64)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| err("full_readback_bytes_estimate: rows * batch * 4 overflows u64"))
+}
+
+/// 1 規模点分の読み戻し統計行。`gpu_scaling_stats:` プレフィクスを使い、
+/// `scripts/bench_gpu_scaling_ab.sh` の結果行 grep（`^gpu_scaling: rows=`）
+/// とは意図的に異なる接頭辞にすることで、既存の A/B 集計スクリプトへ
+/// 結果行として誤って取り込まれないようにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuScalingStatsLine {
+    pub rows: usize,
+    pub dim: usize,
+    pub batch: usize,
+    pub k: usize,
+    /// 計測ウィンドウ（warmup + measured）中に `batch_search` を呼んだ回数。
+    /// `run_fallible` 呼び出し前後で同一の値（`gpu_scaling_bench.rs` が
+    /// `max_excluded=0` で呼ぶため warmup・measured とも除外は発生しない）。
+    pub calls: u64,
+    pub f16_readback_bytes_total: u64,
+    pub f16_readback_bytes_per_call: u64,
+    pub f16_partial_topk_dispatches: u64,
+    pub f16_full_readback_dispatches: u64,
+    pub f16_full_readback_fallbacks: u64,
+    pub f32_readback_bytes_total: u64,
+    pub f32_readback_bytes_per_call: u64,
+    pub f32_partial_topk_dispatches: u64,
+    pub f32_full_readback_dispatches: u64,
+    pub f32_full_readback_fallbacks: u64,
+}
+
+impl fmt::Display for GpuScalingStatsLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "gpu_scaling_stats: rows={} dim={} batch={} k={} calls={} \
+             f16_readback_bytes_total={} f16_readback_bytes_per_call={} \
+             f16_partial_topk_dispatches={} f16_full_readback_dispatches={} \
+             f16_full_readback_fallbacks={} f32_readback_bytes_total={} \
+             f32_readback_bytes_per_call={} f32_partial_topk_dispatches={} \
+             f32_full_readback_dispatches={} f32_full_readback_fallbacks={}",
+            self.rows,
+            self.dim,
+            self.batch,
+            self.k,
+            self.calls,
+            self.f16_readback_bytes_total,
+            self.f16_readback_bytes_per_call,
+            self.f16_partial_topk_dispatches,
+            self.f16_full_readback_dispatches,
+            self.f16_full_readback_fallbacks,
+            self.f32_readback_bytes_total,
+            self.f32_readback_bytes_per_call,
+            self.f32_partial_topk_dispatches,
+            self.f32_full_readback_dispatches,
+            self.f32_full_readback_fallbacks,
+        )
+    }
+}
