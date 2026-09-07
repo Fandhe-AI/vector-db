@@ -184,6 +184,11 @@ id 昇順」を踏襲する。ソートは安定ソート（`sort_by`）のみ�
   ションコメント参照）。安全側 = 全ノードの到達性を最終的に必ず保証し、
   かつ次数上限もフェーズ 1・フェーズ 2 のいずれの結線でも維持する。
 
+`repair_reachability` の到達不能ノード探索（BFS）のビットマップ化・
+冗長 BFS の省略・フェーズ 1 最近傍探索の並列化（Issue #449）は、上記の
+安全側の契約・グラフ出力を変えない設計判断の詳細を
+`docs/design/hnsw-parallel-build.md`「Issue #449 追記」節に記録している。
+
 ## 受け入れ条件 (b): N log N スケーリング確認ベンチ
 
 `crates/engine/benches/hnsw_build_bench.rs`（`make bench-hnsw-build` から
@@ -247,4 +252,6 @@ id 昇順」を踏襲する。ソートは安定ソート（`sort_by`）のみ�
 の探索段／結線段の分離を土台に、要素単位 `RwLock`・エントリポイント更新のみ
 排他という並列構築を実装した。詳細・不変条件・実測は
 `docs/design/hnsw-parallel-build.md` 参照。`Arc<[f32]>` 化によるコピー縮退
-（`arena.rs::VectorArena` 側）は引き続き #408 の担当のまま申し送る。
+（`arena.rs::VectorArena` 側）は引き続き #408 の担当のまま申し送る。並列挿入時
+の上位層リンク保証による到達不能ノード発生の抑制は Issue #448 として実装済み
+（`docs/design/hnsw-parallel-build.md`「Issue #448 追記」節参照）。

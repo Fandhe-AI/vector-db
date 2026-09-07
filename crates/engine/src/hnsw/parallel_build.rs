@@ -73,6 +73,20 @@ thread_local! {
     /// ポイントを更新した回数。`observe == true` の場合のみ加算される
     /// （用途・非観測経路への非影響は上記と同様）。
     static ENTRY_PROMOTION_COUNT: Cell<u64> = const { Cell::new(0) };
+    /// 現在のスレッドが [`plan_links`] の層探索で「退化した候補集合」
+    /// （`candidates.len() <= 1`）を観測した回数（Issue #448 追記）。並列
+    /// フェーズ（`graph.node_count() > SEQUENTIAL_PREFIX_NODES` の挿入）
+    /// でのみ加算し、逐次プレフィックス挿入は対象外とする——退化探索は
+    /// 挿入中の別ノードへ降下した際に発見可能だが下位層の隣接リストが
+    /// まだ空という並列固有の窓（H-N。モジュール冒頭「決定性の範囲」
+    /// 節・`docs/design/hnsw-parallel-build.md`「Issue #448 追記」節参照）
+    /// を直接示す証拠であり、パス分離（[`plan_links`]／[`publish_links`]）
+    /// 導入前後の比較に使う。`observe == true` の場合のみ加算される。
+    static DEGENERATE_LAYER_SEARCHES: Cell<u64> = const { Cell::new(0) };
+    /// 現在のスレッドが [`ensure_reverse_link`] で実際に再結線を行った回数
+    /// （Issue #448 追記）。選択近傍全てから同時 shrink により押し出された
+    /// 稀なケースの発火頻度を示す。`observe == true` の場合のみ加算される。
+    static REVERSE_LINK_RECONNECTS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// [`LINK_LOCK_STATS`] へ 1 回分の取得試行を記録する（`observe == true` の
@@ -120,6 +134,26 @@ fn read_worker_entry_promotions() -> u64 {
     ENTRY_PROMOTION_COUNT.with(|cell| cell.get())
 }
 
+/// [`DEGENERATE_LAYER_SEARCHES`] を 1 件加算する（Issue #448 追記）。
+fn record_degenerate_layer_search() {
+    DEGENERATE_LAYER_SEARCHES.with(|cell| cell.set(cell.get().saturating_add(1)));
+}
+
+/// [`REVERSE_LINK_RECONNECTS`] を 1 件加算する（Issue #448 追記）。
+fn record_reverse_link_reconnect() {
+    REVERSE_LINK_RECONNECTS.with(|cell| cell.set(cell.get().saturating_add(1)));
+}
+
+/// 現在のスレッドの累積診断カウンタを読む（Issue #448 追記。
+/// [`read_worker_lock_stats`] と同じ「ワーカー終了直前に一度だけ読む」前提）。
+fn read_worker_degenerate_layer_searches() -> u64 {
+    DEGENERATE_LAYER_SEARCHES.with(|cell| cell.get())
+}
+
+fn read_worker_reverse_link_reconnects() -> u64 {
+    REVERSE_LINK_RECONNECTS.with(|cell| cell.get())
+}
+
 /// [`LINK_LOCK_STATS`]／[`ENTRY_PROMOTION_COUNT`] を「現在この関数を呼んで
 /// いるスレッド」についてゼロへ戻す。[`build_parallel_graph_observed`] が
 /// 逐次プレフィックス挿入（呼び出し元スレッドで実行される。`observe=true`
@@ -137,6 +171,8 @@ fn reset_observation_tls() {
     LINK_LOCK_STATS.with(|cell| cell.set((0, 0)));
     LINK_LOCK_WAIT.with(|cell| cell.set(std::time::Duration::ZERO));
     ENTRY_PROMOTION_COUNT.with(|cell| cell.set(0));
+    DEGENERATE_LAYER_SEARCHES.with(|cell| cell.set(0));
+    REVERSE_LINK_RECONNECTS.with(|cell| cell.set(0));
 }
 
 /// 並列構築中の共有グラフ状態。ノード単位 `RwLock` で隣接リストを保護し、
@@ -260,6 +296,14 @@ impl BuildGraph {
     fn neighbors_copy(&self, level: usize, node: u32) -> Result<Vec<u32>, HnswError> {
         let guard = self.read_links(node)?;
         Ok(guard.get(level).cloned().unwrap_or_default())
+    }
+
+    /// 層 `level` における `node` の隣接リストに `to` が含まれるかを、
+    /// 複製を作らず読み取りロック内で直接判定する（Issue #448 追記。
+    /// [`ensure_reverse_link`] が挿入完了直前の逆方向リンク保証で使う）。
+    fn has_link(&self, level: usize, node: u32, to: u32) -> Result<bool, HnswError> {
+        let guard = self.read_links(node)?;
+        Ok(guard.get(level).is_some_and(|links| links.contains(&to)))
     }
 
     /// `from -> to` への単方向リンクを層 `level` へ追加する（`from` のみを
@@ -430,17 +474,32 @@ fn search_layer_locked(
     Ok(out)
 }
 
-/// 1 ノードをグラフへ挿入する（[`super::HnswIndex::insert_node`] のロック
-/// 対応版。Algorithm 1 相当）。並列フェーズで呼ばれる前提として、エントリ
-/// ポイントは常に `Some`（呼び出し元が先に逐次プレフィックスを挿入済み。
-/// [`build_parallel_graph`] 参照）であることを要求し、`None` は
-/// `WorkerPanicked` として fail-closed に扱う（この分岐へは通常到達しない
-/// 防御的経路）。
-fn insert_node_locked(
+/// [`plan_links`] の結果（層ごとの選択近傍。`selected_per_level[l]` が層
+/// `l` の選択近傍。Issue #448 追記）。
+struct PlannedLinks {
+    /// index = 層番号（`0..=level.min(top_level)`）。
+    selected_per_level: Vec<Vec<u32>>,
+    top_level: usize,
+    level: usize,
+}
+
+/// 1 ノードの挿入を「探索・選択・自ノードの外向きリンク」（パス 1）と
+/// 「逆方向リンク・shrink・エントリ昇格」（パス 2・[`publish_links`]）へ
+/// 分離した前半（Issue #448 追記。H-N 対策。モジュール冒頭・
+/// `docs/design/hnsw-parallel-build.md`「Issue #448 追記」節参照）。
+///
+/// 本関数の完了時点では `node_id` への逆方向リンクを一切張らないため、
+/// 他ワーカーの探索から `node_id` はまだ**発見不能**（entry からの到達路が
+/// 無い）。したがって他ワーカーが `node_id` を最近傍として降下してくる
+/// 窓（探索側が「発見できるが下位層の隣接リストが空」の退化した候補集合を
+/// 引く原因）が構造的に閉じる——`node_id` が発見可能になった時点
+/// （[`publish_links`] が層 `l` の逆方向リンクを張った直後）には、
+/// `node_id` の層 `l` 以下の外向きリストは既にこの関数で完成済みである。
+fn plan_links(
     graph: &BuildGraph,
     node_id: u32,
     visited: &mut VisitedScratch,
-) -> Result<(), HnswError> {
+) -> Result<PlannedLinks, HnswError> {
     let level = graph
         .levels
         .get(node_id as usize)
@@ -466,9 +525,12 @@ fn insert_node_locked(
     }
 
     // (ii) 挿入ノードのレベル以下の各層で ef_construction 幅の探索 →
-    // ヒューリスティック近傍選択 → 双方向リンク。
+    // ヒューリスティック近傍選択 → `node_id` 自身の外向きリンクのみを張る
+    // （逆方向リンク・shrink は [`publish_links`] へ委ねる）。
+    let max_l = level.min(top_level);
     let mut entry_candidates = vec![nearest];
-    for l in (0..=level.min(top_level)).rev() {
+    let mut selected_per_level: Vec<Vec<u32>> = vec![Vec::new(); max_l + 1];
+    for l in (0..=max_l).rev() {
         let candidates = search_layer_locked(
             graph,
             entry_candidates.clone(),
@@ -477,34 +539,19 @@ fn insert_node_locked(
             l,
             visited,
         )?;
+        if graph.observe
+            && candidates.len() <= 1
+            && graph.node_count() > super::SEQUENTIAL_PREFIX_NODES
+        {
+            record_degenerate_layer_search();
+        }
         let selected =
             select_neighbors_heuristic_free(&candidates, graph.params.m, dim, &graph.vectors)?;
 
         for &neighbor in &selected {
             graph.connect(node_id, neighbor, l)?;
-            graph.connect(neighbor, node_id, l)?;
-            graph.shrink_links(neighbor, l, node_id)?;
         }
-
-        // `node_id` 自身の層 `l` リストは `select_neighbors_heuristic_free` に
-        // よって `<= params.m` 本に収まるはずだが（逐次経路 `insert_node` は
-        // これを前提に自身の縮退を省略する）、並列経路ではこの前提が崩れる:
-        // `node_id` が既に上位層で結線済みで他ノードから発見可能な間に、
-        // 別のノード `other` の挿入処理が `node_id` を `other` 自身の近傍として
-        // 選ぶと、その `insert_node_locked` 内 `for &neighbor in &selected`
-        // ループが `neighbor = node_id` として `graph.connect(node_id, other,
-        // l)`（`node_id` 自身のリストへ `other` を追加する逆方向リンク）と
-        // `graph.shrink_links(node_id, l, other)` を呼ぶ。これが `node_id`
-        // 自身の挿入処理がまだ進行中の間（自身のループでさらに
-        // `graph.connect(node_id, own_neighbor, l)` を呼んでいる最中）に
-        // 割り込むと、`other` 側の `shrink_links` は `other` を保護するのみで
-        // `node_id` 自身が後から追加する分を考慮しないため、縮退なしでは
-        // `node_id` の最終的なリストが次数上限を超え得る（Issue #406 実装時に
-        // 不変条件テストで再現・発見した並列固有のレース。単一スレッド経路
-        // には存在しない）。`protect=node_id` は `compute_shrink` の
-        // `node != protect` 分岐を満たさない（`node == protect`）ため強制
-        // 保護なしの純粋な上位 `limit` 件選択として働く。
-        graph.shrink_links(node_id, l, node_id)?;
+        selected_per_level[l] = selected;
 
         entry_candidates = if candidates.is_empty() {
             vec![nearest]
@@ -513,14 +560,111 @@ fn insert_node_locked(
         };
     }
 
-    // (vi) 挿入ノードのレベルが現行最大層を超える可能性がある場合のみ
+    Ok(PlannedLinks {
+        selected_per_level,
+        top_level,
+        level,
+    })
+}
+
+/// 選択近傍の少なくとも 1 つが層 `level` で `node_id` への逆方向リンクを
+/// 保持しているか確認し、いずれも保持していない（同時 `shrink_links` に
+/// よる押し出しが全近傍で重なった極めて稀なケース）場合のみ
+/// `selected[0]` へ再結線する（Issue #448 追記）。`compute_shrink` の
+/// `protect` 契約（`hnsw.rs::compute_shrink` 参照）により、再結線後は
+/// 次数上限を維持したまま `node_id` が必ず残る。
+fn ensure_reverse_link(
+    graph: &BuildGraph,
+    node_id: u32,
+    level: usize,
+    selected: &[u32],
+) -> Result<(), HnswError> {
+    if selected.is_empty() {
+        return Ok(());
+    }
+    for &sel in selected {
+        if graph.has_link(level, sel, node_id)? {
+            return Ok(());
+        }
+    }
+    let target = selected[0];
+    graph.connect(target, node_id, level)?;
+    graph.shrink_links(target, level, node_id)?;
+    if graph.observe {
+        record_reverse_link_reconnect();
+    }
+    Ok(())
+}
+
+/// [`plan_links`] が確定した選択近傍を実際にグラフへ結線する後半（パス 2。
+/// Issue #448 追記）。層を上から下へ処理し、各層で逆方向リンク・
+/// `neighbor` 側 shrink・`node_id` 自身の防御的自己 shrink（下記コメント
+/// 参照）・逆方向リンク保証（[`ensure_reverse_link`]）を行ったうえで、
+/// 最後にエントリポイント昇格を試みる。
+fn publish_links(
+    graph: &BuildGraph,
+    node_id: u32,
+    planned: &PlannedLinks,
+) -> Result<(), HnswError> {
+    for l in (0..planned.selected_per_level.len()).rev() {
+        let selected = &planned.selected_per_level[l];
+        for &neighbor in selected {
+            graph.connect(neighbor, node_id, l)?;
+            graph.shrink_links(neighbor, l, node_id)?;
+        }
+
+        // `node_id` 自身の層 `l` リストは [`plan_links`] の
+        // `select_neighbors_heuristic_free` によって `<= params.m` 本に
+        // 収まっている（逐次経路 `insert_node` はこれを前提に自身の縮退を
+        // 省略する）。パス分離後は `node_id` への逆方向リンクが本関数の
+        // 直前のループでしか張られないため、他ノードの挿入処理が
+        // `node_id` を自身の近傍として選び「`node_id` 自身のリストへ
+        // 割り込んで追加する」窓（Issue #406 実装時に発見した並列固有の
+        // レース。旧 `insert_node_locked` のコメント参照）は構造的に
+        // 縮小するが、防御としてこの自己 shrink は維持する。
+        // `protect=node_id` は `compute_shrink` の `node != protect` 分岐を
+        // 満たさない（`node == protect`）ため強制保護なしの純粋な上位
+        // `limit` 件選択として働く。
+        graph.shrink_links(node_id, l, node_id)?;
+
+        // 逆方向リンク保証（3.2）: 直前の `shrink_links(neighbor, l,
+        // protect=node_id)` は `compute_shrink` の契約により `node_id` を
+        // 必ず残すが、それは各 `neighbor` の shrink が完了した「その時点」
+        // のみの保証であり、同一 `neighbor` を選んだ別ワーカーの後続
+        // shrink（`protect` が別ノード）が重なると押し出され得る。ここで
+        // 選択近傍のいずれかが `node_id` を保持していることを最終確認する。
+        ensure_reverse_link(graph, node_id, l, selected)?;
+    }
+
+    // 挿入ノードのレベルが現行最大層を超える可能性がある場合のみ
     // エントリポイント更新を試みる（実際に更新するかは `try_promote_entry`
     // が書き込みロック内で再読込のうえ判定する。モジュール冒頭参照）。
-    if level > top_level {
-        graph.try_promote_entry(node_id, level)?;
+    if planned.level > planned.top_level {
+        graph.try_promote_entry(node_id, planned.level)?;
     }
 
     Ok(())
+}
+
+/// 1 ノードをグラフへ挿入する（[`super::HnswIndex::insert_node`] のロック
+/// 対応版。Algorithm 1 相当）。並列フェーズで呼ばれる前提として、エントリ
+/// ポイントは常に `Some`（呼び出し元が先に逐次プレフィックスを挿入済み。
+/// [`build_parallel_graph`] 参照）であることを要求し、`None` は
+/// `WorkerPanicked` として fail-closed に扱う（この分岐へは通常到達しない
+/// 防御的経路）。
+///
+/// [`plan_links`]（探索・選択・自ノードの外向きリンク）→
+/// [`publish_links`]（逆方向リンク・shrink・エントリ昇格）の 2 パスに
+/// 分離した薄いラッパ（Issue #448 追記。無競合実行では旧・単一パス実装と
+/// 完全に同一のグラフを生成することを
+/// `plan_then_publish_matches_reference_without_contention` で固定する）。
+fn insert_node_locked(
+    graph: &BuildGraph,
+    node_id: u32,
+    visited: &mut VisitedScratch,
+) -> Result<(), HnswError> {
+    let planned = plan_links(graph, node_id, visited)?;
+    publish_links(graph, node_id, &planned)
 }
 
 /// [`super::HnswIndex::build_with_threads`] から呼ばれる並列構築の本体。
@@ -632,6 +776,7 @@ pub(crate) fn build_parallel_graph(
         vectors,
         dim_usize,
         owned_vectors,
+        threads,
     )
 }
 
@@ -740,6 +885,8 @@ pub(crate) fn build_parallel_graph_observed(
                 let (link_lock_blocked, link_lock_acquired) = read_worker_lock_stats();
                 let link_lock_wait = read_worker_lock_wait();
                 let entry_promotions = read_worker_entry_promotions();
+                let degenerate_layer_searches = read_worker_degenerate_layer_searches();
+                let reverse_link_reconnects = read_worker_reverse_link_reconnects();
                 HnswWorkerStats {
                     inserted_nodes,
                     busy,
@@ -747,6 +894,8 @@ pub(crate) fn build_parallel_graph_observed(
                     link_lock_acquired,
                     link_lock_wait,
                     entry_promotions,
+                    degenerate_layer_searches,
+                    reverse_link_reconnects,
                 }
             }));
         }
@@ -782,7 +931,12 @@ pub(crate) fn build_parallel_graph_observed(
     // `repair_start.elapsed()`（`profile.repair_reachability`。既存
     // フィールド）は従来どおり残す——受け入れ条件「Σ 段別 wall <=
     // repair.wall <= repair_reachability（誤差内）」の比較対象。
-    let repair = builder.repair_reachability_observed(dim_usize, vectors)?;
+    // Issue #449: 修復フェーズの最近傍探索の並列度上限として、呼び出し元
+    // （`HnswIndex::build_with_threads_observed`）から引き継いだ構築スレッド
+    // 数 `threads` をそのまま渡す（`WorkerBudgetGuard` の追加取得は行わず、
+    // 構築全体にわたって保持済みの予算を引き継ぐ契約。`repair_reachability_
+    // inner` のドキュメンテーションコメント「探索の並列化」参照）。
+    let repair = builder.repair_reachability_observed(dim_usize, vectors, threads)?;
     let repair_reachability = repair_start.elapsed();
 
     // 平坦化（CSR 化。Issue #494）は常に最終段——`freeze`（構造的な組み立て）
@@ -848,6 +1002,16 @@ fn assemble_graph(graph: BuildGraph, params: HnswParams) -> Result<GraphBuilder,
 /// `repair_reachability`〔並列フェーズが生みうる上位層の到達不能ノードを
 /// 閉じる。モジュール冒頭「決定性の範囲」節参照〕 → [`super::HnswIndex::
 /// freeze_from`] による CSR 平坦化〔Issue #494。常に最終段〕)。
+///
+/// `threads` は修復フェーズの最近傍探索（Issue #449）の並列度上限として
+/// そのまま引き継ぐ（呼び出し元 `build_parallel_graph` が受け取った構築
+/// スレッド数と同一値。`WorkerBudgetGuard` の追加取得は行わない——
+/// `repair_reachability_inner` のドキュメンテーションコメント「探索の
+/// 並列化」参照）。
+// Issue #449 で修復フェーズの並列度 `threads` を追加し 8 引数（閾値 7）を
+// 超えたが、`hnsw.rs`・`sql/hnsw_cache.rs` の既存関数群と同じ方針で許容する
+// （本ファイル内 `#[allow(clippy::too_many_arguments)]` 参照）。
+#[allow(clippy::too_many_arguments)]
 fn freeze(
     graph: BuildGraph,
     params: HnswParams,
@@ -856,9 +1020,10 @@ fn freeze(
     original_vectors: &[f32],
     dim_usize: usize,
     owned_vectors: Arc<[f32]>,
+    threads: usize,
 ) -> Result<HnswIndex, HnswError> {
     let mut builder = assemble_graph(graph, params)?;
-    builder.repair_reachability(dim_usize, original_vectors)?;
+    builder.repair_reachability(dim_usize, original_vectors, threads)?;
     HnswIndex::freeze_from(builder, dim, owned_vectors, precision)
 }
 
@@ -909,6 +1074,7 @@ mod tests {
             &vectors,
             dim,
             owned,
+            1,
         )
         .unwrap_err();
         assert_eq!(err, HnswError::WorkerPanicked);
@@ -1473,6 +1639,313 @@ mod tests {
             total_promotions, expected,
             "呼び出し元スレッドで汚染した entry_promotions がワーカー統計へ \
              混入した疑い"
+        );
+    }
+
+    // --------------------------------------------------
+    // Issue #448: パス分離（plan_links／publish_links）・逆方向リンク保証
+    // --------------------------------------------------
+
+    /// 逐次プレフィックス（単一スレッド）で `insert_node_locked` を使い
+    /// `prefix_end` 件挿入した `BuildGraph` を返す（テスト用ヘルパ）。
+    fn seeded_graph(
+        params: HnswParams,
+        dim: usize,
+        vectors: &[f32],
+        levels: Vec<usize>,
+        prefix_end: usize,
+    ) -> BuildGraph {
+        let owned: Arc<[f32]> = Arc::from(vectors);
+        let graph = BuildGraph::new(params, dim, owned, levels, false);
+        let mut visited = VisitedScratch::default();
+        for node_idx in 0..prefix_end {
+            let node_id = node_idx as u32;
+            if node_idx == 0 {
+                graph.try_promote_entry(node_id, graph.levels[0]).unwrap();
+                continue;
+            }
+            insert_node_locked(&graph, node_id, &mut visited).unwrap();
+        }
+        graph
+    }
+
+    /// H-N（挿入中ノードが発見可能になった時点で下位層の隣接リストが空の窓）
+    /// が構造的に閉じていることを固定する: `plan_links` 完了時点で対象
+    /// ノードの全層の外向きリストは既に完成している一方、いずれの選択近傍
+    /// からも対象ノードへの逆方向リンクはまだ存在しない（＝発見不能）。
+    /// `publish_links` 後は各層で少なくとも 1 つの選択近傍が逆方向リンクを
+    /// 保持する（逆方向リンク保証。3.2）。
+    #[test]
+    fn plan_links_completes_outbound_links_before_publish_makes_node_discoverable() {
+        let dim = 6usize;
+        let rows = 300usize;
+        let vectors = gen_corpus(0x9999_1111, dim, rows);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 32,
+        };
+        let mut rng = DeterministicRng::new(11);
+        let levels: Vec<usize> = (0..rows)
+            .map(|_| assign_level(&mut rng, params.m))
+            .collect();
+
+        let prefix_end = rows - 1;
+        let graph = seeded_graph(params, dim, &vectors, levels, prefix_end);
+
+        let z = prefix_end as u32;
+        let mut visited = VisitedScratch::default();
+        let planned = plan_links(&graph, z, &mut visited).unwrap();
+        assert!(!planned.selected_per_level.is_empty());
+
+        for (l, selected) in planned.selected_per_level.iter().enumerate() {
+            let out = graph.neighbors_copy(l, z).unwrap();
+            assert_eq!(
+                &out, selected,
+                "layer {l}: plan_links 完了時点で z の外向きリストは既に完成しているはず"
+            );
+            for &n in selected {
+                assert!(
+                    !graph.has_link(l, n, z).unwrap(),
+                    "layer {l}: publish 前の neighbor {n} は z への逆方向リンクを持ってはいけない"
+                );
+            }
+        }
+
+        publish_links(&graph, z, &planned).unwrap();
+
+        for (l, selected) in planned.selected_per_level.iter().enumerate() {
+            if selected.is_empty() {
+                continue;
+            }
+            let has_any = selected.iter().any(|&n| graph.has_link(l, n, z).unwrap());
+            assert!(
+                has_any,
+                "layer {l}: publish_links 後は少なくとも 1 つの選択近傍が z への逆方向リンクを保持するはず"
+            );
+        }
+    }
+
+    /// `plan_links` のみが完了し `publish_links` がまだ行われていないノード
+    /// を探索の起点（他ワーカーが降下中に発見したと仮定）にしても、H-N の
+    /// 旧窓のように候補集合が退化（`[起点のみ]`）しないことを固定する。
+    #[test]
+    fn search_from_planned_but_unpublished_node_does_not_degenerate() {
+        let dim = 6usize;
+        let rows = 300usize;
+        let vectors = gen_corpus(0x9999_2222, dim, rows);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 32,
+        };
+        let mut rng = DeterministicRng::new(13);
+        let levels: Vec<usize> = (0..rows)
+            .map(|_| assign_level(&mut rng, params.m))
+            .collect();
+
+        let prefix_end = rows - 1;
+        let graph = seeded_graph(params, dim, &vectors, levels, prefix_end);
+
+        let z = prefix_end as u32;
+        let mut visited = VisitedScratch::default();
+        let planned = plan_links(&graph, z, &mut visited).unwrap();
+        // z 自身のベクトルをクエリに使い、z を起点として層 0 を探索する
+        // （他ワーカーが z へ降下してきた状況の代理）。
+        let query = node_vector(&graph.vectors, dim, z).unwrap().to_vec();
+        let mut search_visited = VisitedScratch::default();
+        let results = search_layer_locked(
+            &graph,
+            vec![z],
+            &query,
+            params.ef_construction,
+            0,
+            &mut search_visited,
+        )
+        .unwrap();
+        assert!(
+            results.len() > 1,
+            "z は plan_links 完了時点で既に層 0 の外向きリンクを持つため、z を起点にした探索は z 単独へ退化しないはず（実際の件数={}）",
+            results.len()
+        );
+        assert!(!planned.selected_per_level[0].is_empty());
+    }
+
+    /// `ensure_reverse_link` の再結線分岐: 選択近傍全てから同時 shrink に
+    /// より押し出された（極めて稀な）ケースを人為的に再現し、再結線後に
+    /// 次数上限を維持したまま z が必ず戻ることを固定する（3.2）。
+    #[test]
+    fn ensure_reverse_link_reconnects_when_all_selected_links_were_dropped() {
+        let dim = 4usize;
+        let rows = 300usize;
+        let vectors = gen_corpus(0x9999_3333, dim, rows);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 32,
+        };
+        let mut rng = DeterministicRng::new(17);
+        let levels: Vec<usize> = (0..rows)
+            .map(|_| assign_level(&mut rng, params.m))
+            .collect();
+
+        let prefix_end = rows - 1;
+        let graph = seeded_graph(params, dim, &vectors, levels, prefix_end);
+
+        let z = prefix_end as u32;
+        let mut visited = VisitedScratch::default();
+        let planned = plan_links(&graph, z, &mut visited).unwrap();
+        publish_links(&graph, z, &planned).unwrap();
+
+        let l = 0usize;
+        let selected = &planned.selected_per_level[l];
+        assert!(!selected.is_empty());
+
+        // z への逆方向リンクを全ての選択近傍から人為的に取り除く（同時
+        // shrink が全近傍で重なった状況を模擬）。
+        for &n in selected {
+            let mut guard = graph.write_links(n).unwrap();
+            if let Some(links) = guard.get_mut(l) {
+                links.retain(|&x| x != z);
+            }
+        }
+        for &n in selected {
+            assert!(!graph.has_link(l, n, z).unwrap());
+        }
+
+        ensure_reverse_link(&graph, z, l, selected).unwrap();
+
+        let has_any = selected.iter().any(|&n| graph.has_link(l, n, z).unwrap());
+        assert!(
+            has_any,
+            "ensure_reverse_link 後は selected[0] が z への逆方向リンクを保持するはず"
+        );
+        // 次数上限（`max_degree_for`）を超えていないことも確認する。
+        let target = selected[0];
+        let limit = max_degree_for(&params, l);
+        let out = graph.neighbors_copy(l, target).unwrap();
+        assert!(
+            out.len() <= limit,
+            "再結線後も target={target} の層 {l} 隣接リストは次数上限 {limit} 以内のはず（実際={}）",
+            out.len()
+        );
+    }
+
+    /// パス分離（`plan_links`／`publish_links`）と旧・単一パス手順が、
+    /// 無競合（単一スレッド）実行では完全に同一のグラフを生成することを
+    /// 固定する。
+    ///
+    /// `build_with_threads(..., threads=1)` は `build_with_threads_impl` の
+    /// `threads == 1` 分岐で逐次 `HnswIndex::build`（分離前の単一パス実装）
+    /// へ丸ごと委譲するだけであり、`plan_links`／`publish_links`（新実装）
+    /// を一切通らない（codex-review・Cursor Bugbot 指摘。PR #596）。本テストは
+    /// それを避け、`insert_node_locked`（新実装。内部で `plan_links` →
+    /// `publish_links` を呼ぶ）を全ノードに対し単一スレッド・逐次で直接
+    /// 呼び出して `BuildGraph` を構築し（呼び出し順は `build_parallel_graph`
+    /// の逐次プレフィックス挿入ループと同じ「1 件ずつ挿入完了させてから次へ」
+    /// であり、同一スレッド内では競合が発生し得ない）、`freeze`（`assemble_graph`
+    /// → `repair_reachability` → `freeze_from`。`build_parallel_graph` と
+    /// 共有する後始末）で `HnswIndex` へ組み立てたうえで、逐次
+    /// `HnswIndex::build`（`hnsw.rs::insert_node`。分離前の「層ごとに両方向」
+    /// 手順を維持したまま）の結果と比較する。レベル割当は両経路とも
+    /// `DeterministicRng::new(seed)` → `assign_level` を同じ順序で呼ぶため
+    /// 一致する（`build_inner`・`build_parallel_graph` 参照）。
+    #[test]
+    fn plan_then_publish_matches_sequential_insert_without_contention() {
+        let dim = 5usize;
+        let rows = 500usize;
+        let vectors = gen_corpus(0x2468_1357, dim, rows);
+        let params = HnswParams {
+            m: 6,
+            ef_construction: 24,
+            ef_search: 16,
+        };
+        let seed = 42u64;
+
+        let sequential = PubHnswIndex::build(params, dim as u32, &vectors, seed).unwrap();
+
+        let mut rng = DeterministicRng::new(seed);
+        let levels: Vec<usize> = (0..rows)
+            .map(|_| assign_level(&mut rng, params.m))
+            .collect();
+        let owned: Arc<[f32]> = Arc::from(vectors.as_slice());
+        let graph = BuildGraph::new(params, dim, owned.clone(), levels, false);
+        let mut visited = VisitedScratch::default();
+        for node_idx in 0..rows {
+            let node_id = node_idx as u32;
+            if node_idx == 0 {
+                graph.try_promote_entry(node_id, graph.levels[0]).unwrap();
+                continue;
+            }
+            insert_node_locked(&graph, node_id, &mut visited).unwrap();
+        }
+        let via_new_path = freeze(
+            graph,
+            params,
+            ResidentPrecision::F32,
+            dim as u32,
+            &vectors,
+            dim,
+            owned,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(sequential.entry_point(), via_new_path.entry_point());
+        assert_eq!(sequential.max_level(), via_new_path.max_level());
+        for node in 0..rows as u32 {
+            assert_eq!(sequential.level_of(node), via_new_path.level_of(node));
+            let seq_level = sequential.level_of(node).unwrap();
+            for level in 0..=seq_level {
+                assert_eq!(
+                    sequential.neighbors(level, node),
+                    via_new_path.neighbors(level, node),
+                    "node={node} level={level}"
+                );
+            }
+        }
+    }
+
+    /// 導入後の並列構築（threads=12・数万点規模）で `degenerate_layer_searches`
+    /// が到達不能ノード増分と同程度以下の低水準に収まることを実測する
+    /// informational テスト（Issue #448。`#[ignore]`・手動専用。導入前との
+    /// 定量的な前後比較〔`docs/design/hnsw-parallel-build.md`「Issue #447
+    /// 追記」節の基線: threads=12 で層 0 到達不能ノード増分 ≈16〜18〕は
+    /// `make bench-hnsw-parallel-build` による運用者実測へ申し送る）。
+    #[test]
+    #[ignore]
+    fn observed_build_at_high_thread_count_reports_low_degenerate_layer_searches() {
+        let dim = 32usize;
+        let rows = super::super::SEQUENTIAL_PREFIX_NODES + 20_000;
+        let vectors = gen_clustered_corpus(0x448_0001, dim, rows, 40);
+        let params = HnswParams::default();
+        let seed = 0x448_1234_5678;
+        let threads = 12usize;
+
+        let (_, profile) =
+            PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, seed, threads)
+                .unwrap();
+
+        let total_degenerate: u64 = profile
+            .workers
+            .iter()
+            .map(|w| w.degenerate_layer_searches)
+            .sum();
+        let total_reconnects: u64 = profile
+            .workers
+            .iter()
+            .map(|w| w.reverse_link_reconnects)
+            .sum();
+        println!(
+            "hnsw_parallel_build issue448: threads={threads} rows={rows} \
+             degenerate_layer_searches={total_degenerate} reverse_link_reconnects={total_reconnects} \
+             repair_unreachable_sum={}",
+            profile
+                .repair
+                .levels
+                .iter()
+                .map(|l| l.unreachable_before)
+                .sum::<u64>()
         );
     }
 }

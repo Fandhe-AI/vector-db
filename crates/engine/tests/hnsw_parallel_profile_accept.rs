@@ -179,6 +179,8 @@ fn worker(inserted: u64, blocked: u64, acquired: u64, promotions: u64) -> HnswWo
         link_lock_acquired: acquired,
         link_lock_wait: Duration::ZERO,
         entry_promotions: promotions,
+        degenerate_layer_searches: 0,
+        reverse_link_reconnects: 0,
     }
 }
 
@@ -284,6 +286,8 @@ fn worker_with_wait(busy_ms: u64, wait_ms: u64) -> HnswWorkerStats {
         link_lock_acquired: 1,
         link_lock_wait: Duration::from_millis(wait_ms),
         entry_promotions: 0,
+        degenerate_layer_searches: 0,
+        reverse_link_reconnects: 0,
     }
 }
 

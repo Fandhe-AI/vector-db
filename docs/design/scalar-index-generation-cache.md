@@ -3,7 +3,8 @@
 - **Issue**: #473（親 Issue #472・#359。ADR: `docs/design/scalar-secondary-index.md`）
 - **対象ビヘイビア**（ポインタのみ・本文非転記）: `docs/spec/04-behavior/data-model.md`
   TABLE-12・`docs/spec/04-behavior/rls.md`
-- **ステータス**: 実装済み（構築とキャッシュのみ。索引を使った候補削減は Issue #474）
+- **ステータス**: 実装済み（構築とキャッシュ）。索引を使った候補削減への結線は
+  Issue #474 で実装済み（`docs/design/scalar-index-prune.md` 参照）
 
 ## 背景・目的
 

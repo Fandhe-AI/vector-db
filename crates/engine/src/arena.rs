@@ -934,6 +934,91 @@ impl VectorArena {
         })
     }
 
+    /// [`Self::build_from_cached_rls_rows`] の部分集合版（Issue #474）。
+    /// `sql::scalar_index::ScalarIndex::resolve_candidates` が絞った候補スロット
+    /// （`source_slots`。`source_arena`／`metadata` に対する添字）だけを昇順に
+    /// 辿り、`push_visible_row` で `on_visible_row`（`matches_all`＋式述語）を
+    /// 適用する。索引は候補行を「絞る」ことしかできず「通す」ことはできない
+    /// ため、`on_visible_row` を省略せず候補ごとに引き続き呼ぶ——出力
+    /// アリーナ（行・順序・スロット番号）は `source_slots` が全スロット
+    /// （`0..metadata.len()`）の場合、[`Self::build_from_cached_rls_rows`] と
+    /// ビット同一になる（[`crate::sql::exec`] の `on_visible_row` に渡る
+    /// `slot` 引数は入力スロットではなく出力側の連番であり、両関数とも
+    /// [`push_visible_row`] が管理する同じカウンタから払い出すため）。
+    ///
+    /// `source_slots` は**重複のない狭義昇順**でなければならない
+    /// （`ScalarIndex::candidates_for`／`candidates_id_range`／
+    /// `resolve_candidates` の交差はいずれも昇順・重複なしの `Vec<u32>` を
+    /// 返す契約。この前提が崩れた場合、行の重複計上・黙った脱落につながる
+    /// ため `InvalidInput` で fail-closed に拒否する。呼び出し規約違反への
+    /// 多層防御であり、正常系のオーバーヘッドにはならない）。範囲外スロット・
+    /// `metadata.len()` との不一致も同様に拒否する。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_from_cached_rls_rows_subset<G>(
+        table_name: &str,
+        expected_dim: u32,
+        source_arena: &VectorArena,
+        metadata: &[Vec<u8>],
+        source_slots: &[u32],
+        mut on_visible_row: G,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Self>
+    where
+        G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
+        if source_arena.len() != metadata.len() {
+            return Err(ArenaError::InvalidInput(
+                "cached RLS snapshot row/metadata count mismatch".to_string(),
+            ));
+        }
+        let dim = expected_dim as usize;
+        let mut buffers = GrowableArenaBuffers::new();
+        let mut visible_row_count: usize = 0;
+        let out_of_bounds =
+            || ArenaError::InvalidInput("cached RLS snapshot row index out of bounds".to_string());
+        let mut prev_slot: Option<u32> = None;
+        for &slot in source_slots {
+            if let Some(prev) = prev_slot {
+                if slot <= prev {
+                    return Err(ArenaError::InvalidInput(
+                        "scalar index candidate slots must be strictly ascending and unique"
+                            .to_string(),
+                    ));
+                }
+            }
+            prev_slot = Some(slot);
+            let i = usize::try_from(slot).map_err(|_| out_of_bounds())?;
+            let meta = metadata.get(i).ok_or_else(out_of_bounds)?;
+            let id = *source_arena.ids().get(i).ok_or_else(out_of_bounds)?;
+            let tenant_id = source_arena.tenant_id(i).ok_or_else(out_of_bounds)?;
+            let visibility = source_arena.visibility(i).ok_or_else(out_of_bounds)?;
+            let embedding = source_arena.vector(i).ok_or_else(out_of_bounds)?;
+            push_visible_row(
+                &mut buffers,
+                &mut visible_row_count,
+                dim,
+                expected_dim,
+                max_rows,
+                max_bytes,
+                id,
+                tenant_id,
+                visibility,
+                embedding,
+                meta,
+                &mut on_visible_row,
+            )?;
+        }
+        Ok(VectorArena {
+            table_name: table_name.to_string(),
+            dim: expected_dim,
+            vectors: buffers.vectors,
+            ids: buffers.ids,
+            tenant_ids: buffers.tenant_ids,
+            visibilities: buffers.visibilities,
+        })
+    }
+
     /// [`Self::build_filtered_with_limits`] の行フック付き版。呼び出し元が管理する
     /// `read_txn` 上で実行する実装本体（[`Self::build_filtered_with_rows_and_limits`]・
     /// `sql::exec::execute_statement_in_txn`（TASK-75・Issue #56 レビュー指摘対応）が
@@ -1270,6 +1355,117 @@ impl VectorArena {
 mod tests {
     use super::*;
     use crate::storage::RowInput;
+
+    // `build_from_cached_rls_rows_subset`（Issue #474）: 候補が全スロット
+    // （`0..metadata.len()`）のとき、`build_from_cached_rls_rows`（全走査）と
+    // ビット同一の出力アリーナを構築することを固定する（モジュール
+    // ドキュメント「出力アリーナは…ビット同一になる」の直接検証）。
+    #[test]
+    fn build_from_cached_rls_rows_subset_with_all_slots_matches_full_scan() {
+        let mut capture = SqlArenaCaptureBuilder::new(2, 100, usize::MAX, usize::MAX);
+        capture.push(1, "tenant-a", Visibility::Public, &[1.0, 0.0], b"a", 0);
+        capture.push(2, "tenant-a", Visibility::Public, &[0.0, 1.0], b"b", 0);
+        capture.push(3, "tenant-a", Visibility::Public, &[1.0, 1.0], b"c", 0);
+        let (source_arena, metadata) = capture.finish("docs").expect("within budget");
+
+        let full = VectorArena::build_from_cached_rls_rows(
+            "docs",
+            2,
+            &source_arena,
+            &metadata,
+            |_, _, _, _| Ok(true),
+            100,
+            usize::MAX,
+        )
+        .expect("full scan build");
+        let all_slots: Vec<u32> = (0..metadata.len() as u32).collect();
+        let subset = VectorArena::build_from_cached_rls_rows_subset(
+            "docs",
+            2,
+            &source_arena,
+            &metadata,
+            &all_slots,
+            |_, _, _, _| Ok(true),
+            100,
+            usize::MAX,
+        )
+        .expect("subset build with all slots");
+        assert_eq!(full.ids(), subset.ids());
+        assert_eq!(full.len(), subset.len());
+        for i in 0..full.len() {
+            assert_eq!(full.vector(i), subset.vector(i));
+            assert_eq!(full.tenant_id(i), subset.tenant_id(i));
+        }
+    }
+
+    // 部分集合（候補スロットが一部のみ）の場合、`build_from_cached_rls_rows_subset`
+    // の結果が「全走査してから候補以外の行を on_visible_row で false にした
+    // 場合」と一致することを固定する（索引が行を「絞る」ことしかできないという
+    // fail-closed 契約の直接検証）。
+    #[test]
+    fn build_from_cached_rls_rows_subset_matches_full_scan_filtered_to_candidates() {
+        let mut capture = SqlArenaCaptureBuilder::new(2, 100, usize::MAX, usize::MAX);
+        capture.push(1, "tenant-a", Visibility::Public, &[1.0, 0.0], b"a", 0);
+        capture.push(2, "tenant-a", Visibility::Public, &[0.0, 1.0], b"b", 0);
+        capture.push(3, "tenant-a", Visibility::Public, &[1.0, 1.0], b"c", 0);
+        let (source_arena, metadata) = capture.finish("docs").expect("within budget");
+
+        // 候補はスロット 0・2（id=1, id=3）のみ。
+        let candidate_slots: Vec<u32> = vec![0, 2];
+        let subset = VectorArena::build_from_cached_rls_rows_subset(
+            "docs",
+            2,
+            &source_arena,
+            &metadata,
+            &candidate_slots,
+            |_, _, _, _| Ok(true),
+            100,
+            usize::MAX,
+        )
+        .expect("subset build");
+        let candidates: std::collections::HashSet<u32> = candidate_slots.iter().copied().collect();
+        let mut seen = 0usize;
+        let full_filtered = VectorArena::build_from_cached_rls_rows(
+            "docs",
+            2,
+            &source_arena,
+            &metadata,
+            |_slot, _id, _emb, _meta| {
+                let ok = candidates.contains(&(seen as u32));
+                seen += 1;
+                Ok(ok)
+            },
+            100,
+            usize::MAX,
+        )
+        .expect("full scan filtered build");
+        assert_eq!(subset.ids(), full_filtered.ids());
+        assert_eq!(subset.ids(), &[1, 3]);
+    }
+
+    // 非昇順・重複スロットは `InvalidInput` で拒否する（呼び出し規約違反への
+    // 多層防御。モジュールドキュメント参照）。
+    #[test]
+    fn build_from_cached_rls_rows_subset_rejects_non_ascending_slots() {
+        let mut capture = SqlArenaCaptureBuilder::new(2, 100, usize::MAX, usize::MAX);
+        capture.push(1, "tenant-a", Visibility::Public, &[1.0, 0.0], b"a", 0);
+        capture.push(2, "tenant-a", Visibility::Public, &[0.0, 1.0], b"b", 0);
+        let (source_arena, metadata) = capture.finish("docs").expect("within budget");
+
+        let bad_slots: Vec<u32> = vec![1, 0];
+        let err = VectorArena::build_from_cached_rls_rows_subset(
+            "docs",
+            2,
+            &source_arena,
+            &metadata,
+            &bad_slots,
+            |_, _, _, _| Ok(true),
+            100,
+            usize::MAX,
+        )
+        .expect_err("non-ascending slots must be rejected");
+        assert!(matches!(err, ArenaError::InvalidInput(_)));
+    }
 
     // `SqlArenaCaptureBuilder`（Issue #363）: metadata バイト上限超過時は `push` を
     // 静かに無視して `failed()` を立てるだけで `finish()` が `None` を返すことを
