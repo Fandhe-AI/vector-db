@@ -81,11 +81,12 @@ use std::collections::BTreeSet;
 use harness::env_report::EnvReport;
 use harness::hybrid_latency::RefetchTrackingProvider;
 use harness::hybrid_profile::{
-    bucket_diff, collect_body_strings, dense_refetch_schedule, fetch_cap, generate_corpus,
-    generate_queries, initial_fetch_k, refetch_schedule_matches_observed_calls,
+    bucket_diff, collect_body_strings, dense_refetch_schedule, expected_visible_count, fetch_cap,
+    generate_corpus, generate_queries, initial_fetch_k, refetch_schedule_matches_observed_calls,
     refuse_under_github_actions, render_baseline_bucket_line, render_dense_refetch_line,
     render_sparse_refetch_line, render_sparse_refetch_summary_line, render_stage_line,
-    replica_matches_real, sparse_refetch_schedule, sql_dense_statement,
+    replica_matches_real, resolve_rows_from_env, resolve_visible_ratio_denominator_from_env,
+    select_visible_ids, sparse_refetch_schedule, sql_dense_statement,
     sql_dense_statement_with_projection, sql_hybrid_statement,
     sql_hybrid_statement_with_projection, summarize_sparse_refetch, tokenize_only,
     tokenize_term_doc_freq, tokenize_term_freq, HybridProjection, ProfileSparseIndex,
@@ -112,9 +113,9 @@ use engine::storage::{RowInput, Storage, Visibility};
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
-/// コーパス規模（Issue #356 本文が言及する feature_bench の行数感に合わせた、
-/// 本ベンチ独自の定数。spec 由来の値ではない）。
-const NUM_DOCS: usize = 25_000;
+/// コーパス規模の既定値（Issue #356 本文が言及する feature_bench の行数感に
+/// 合わせた、本ベンチ独自の値。spec 由来の値ではない）。Issue #547 で
+/// `BENCH_HYBRID_PROFILE_ROWS`（既定 25,000・後方互換）による opt-in 可変化。
 const DIM: usize = 128;
 const TOP_K: usize = 10;
 const NUM_QUERIES: usize = 5;
@@ -149,12 +150,57 @@ fn main() {
          pass/fail gate."
     );
 
+    // --- 行数・可視率の opt-in（Issue #547。#546〔PR #565〕のスコアアキュムレータ
+    // 再利用が「索引 N ≫ 可視集合」条件で効くかを検証するための注入点。
+    // `harness::hybrid_profile` モジュールドキュメント「可視率の意味」参照） ---
+    let num_docs = resolve_rows_from_env().unwrap_or_else(|e| fail_closed(e.to_string()));
+    let visible_ratio_denominator =
+        resolve_visible_ratio_denominator_from_env().unwrap_or_else(|e| fail_closed(e.to_string()));
+    let expected_visible = expected_visible_count(num_docs, visible_ratio_denominator)
+        .unwrap_or_else(|e| fail_closed(e.to_string()));
+
     // --- コーパス生成（密ベクトル・疎本文とも決定的） ---
-    let corpus = generate_corpus(SEED, NUM_DOCS, DIM)
+    let corpus = generate_corpus(SEED, num_docs, DIM)
         .unwrap_or_else(|e| fail_closed(format!("corpus generation failed: {e}")));
     let queries = generate_queries(SEED, NUM_QUERIES, DIM);
 
     let doc_refs = corpus.sparse_docs();
+
+    // 可視行 id 集合（SQL 段は RLS の正規経路で、直接 API 段は明示的な部分集合
+    // として、同じ規則〔`doc_id % denominator == 0`〕をどちらも使う。索引は
+    // 常に全件〔`doc_refs`／`SparseIndex::build`〕から構築し、可視率が縮小
+    // させるのは「クエリが渡す候補集合」のみである点が Issue #547 の測定条件）。
+    let visible_row_ids: BTreeSet<u64> = select_visible_ids(num_docs, visible_ratio_denominator);
+    // 直接 API 段（B0s/B0/B4/B5/B8）が `SearchInput`／`search_within` へ渡す
+    // 可視部分集合。`corpus.ids`（0 始まり連番）と同じ並び順を保つため、
+    // フィルタだけで id・vector・body が引き続き位置対応する。
+    let visible_ids: Vec<u64> = corpus
+        .ids
+        .iter()
+        .copied()
+        .filter(|id| visible_row_ids.contains(id))
+        .collect();
+    let visible_vectors: Vec<f32> = corpus
+        .ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| visible_row_ids.contains(id))
+        .flat_map(|(i, _)| corpus.vectors[i * DIM..(i + 1) * DIM].iter().copied())
+        .collect();
+    let visible_bodies: Vec<String> = corpus
+        .ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| visible_row_ids.contains(id))
+        .map(|(i, _)| corpus.bodies[i].clone())
+        .collect();
+    if visible_ids.len() != expected_visible {
+        fail_closed(format!(
+            "select_visible_ids produced {} ids, expected {expected_visible} \
+             (rows={num_docs} denominator={visible_ratio_denominator})",
+            visible_ids.len()
+        ));
+    }
 
     // --- Issue #389: SparseIndex 常駐時の常駐メモリ（RSS）増分 -----------------
     // プロセス内でこれが最初かつ唯一の `SparseIndex::build` 呼び出しになるよう、
@@ -215,8 +261,8 @@ fn main() {
 
     let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant id");
     let mut next_id: usize = 0;
-    while next_id < NUM_DOCS {
-        let batch_len = SEED_BATCH_ROWS.min(NUM_DOCS - next_id);
+    while next_id < num_docs {
+        let batch_len = SEED_BATCH_ROWS.min(num_docs - next_id);
         let mut metadata_batch: Vec<Vec<u8>> = Vec::with_capacity(batch_len);
         for i in next_id..next_id + batch_len {
             let encoded = encode_scalar_columns(
@@ -230,11 +276,22 @@ fn main() {
             .map(|i| {
                 let global = next_id + i;
                 let start = global * DIM;
+                let id = corpus.ids[global];
+                // 可視率 100%（既定・`visible_ratio_denominator == 1`）では従来
+                // どおり全行 Public。< 100% の条件は、RLS の正規経路（テナント内
+                // `Visibility::Private` 行は `PolicyContext::new` の Public-only
+                // ctx から不可視）で可視率を実現する（別テナント方式より
+                // 「可視率」の意味に忠実。Issue #547 計画参照）。
+                let visibility = if visible_row_ids.contains(&id) {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
                 (
-                    corpus.ids[global],
+                    id,
                     RowInput {
                         tenant_id: TENANT_ID,
-                        visibility: Visibility::Public,
+                        visibility,
                         embedding: &corpus.vectors[start..start + DIM],
                         metadata: &metadata_batch[i],
                     },
@@ -252,10 +309,10 @@ fn main() {
 
     let core = EngineCore::from_storage(storage, search_engine::default_engine());
 
-    // 可視件数の突き合わせ（単一テナント・全行 Public の単純化構成のため、SQL 段
-    // 〔`sql_hybrid`/`sql_dense_knn`〕の可視集合は投入行数と一致するはずである。
-    // 不一致は構成ミス〔テーブル定義・投入経路の不整合〕を示すため fail-closed に
-    // 打ち切る）。
+    // 可視件数の突き合わせ（RLS 経由の `COUNT(*)` は可視行のみを数えるため、
+    // 可視率 100% では投入行数と一致し、< 100% では `expected_visible_count`
+    // と一致するはずである。不一致は構成ミス〔テーブル定義・投入経路・
+    // 可視率規則の不整合〕を示すため fail-closed に打ち切る）。
     let count_sql = format!("SELECT COUNT(*) FROM {TABLE}");
     let count_result = core
         .execute_sql(&ctx, &count_sql)
@@ -264,13 +321,16 @@ fn main() {
         Some(engine::sql::exec::Cell::Integer(n)) => *n,
         other => fail_closed(format!("unexpected COUNT(*) result shape: {other:?}")),
     };
-    if visible_count != NUM_DOCS as u64 {
+    if visible_count != expected_visible as u64 {
         fail_closed(format!(
-            "visible row count mismatch: expected {NUM_DOCS}, got {visible_count} \
-             (SQL-stage corpus and direct-API-stage corpus must cover the same rows)"
+            "visible row count mismatch: expected {expected_visible}, got {visible_count} \
+             (rows={num_docs} denominator={visible_ratio_denominator})"
         ));
     }
-    println!("hybrid_profile: visible_count={visible_count} rows={NUM_DOCS} dim={DIM}");
+    println!(
+        "hybrid_profile: rows={num_docs} visible_ratio=1/{visible_ratio_denominator} \
+         visible_count={visible_count} dim={DIM}"
+    );
 
     let config = MeasurementConfig::new(20, 30, SEED).expect("protocol minimums satisfied");
 
@@ -294,7 +354,7 @@ fn main() {
             "sql_hybrid",
             sql_hybrid_measurement.summary.median.as_micros(),
             p95.as_micros(),
-            NUM_DOCS,
+            num_docs,
         )
     );
 
@@ -316,14 +376,17 @@ fn main() {
             "sql_dense_knn",
             sql_dense_measurement.summary.median.as_micros(),
             p95.as_micros(),
-            NUM_DOCS,
+            num_docs,
         )
     );
 
     // --- コンポーネントレベル（直接 API。SQL パース・テーブル走査を含まない） ---
 
+    // `sql/exec.rs::on_visible_row` は可視行の本文のみ蓄積するため、本複製も
+    // 可視部分集合（`visible_ids`/`visible_bodies`）だけを対象にする（Issue #547。
+    // `harness::hybrid_profile` モジュールドキュメント「可視率の意味」参照）。
     let collect_measurement = run(&config, || {
-        collect_body_strings(&corpus.ids, &corpus.bodies)
+        collect_body_strings(&visible_ids, &visible_bodies)
     })
     .unwrap_or_else(|e| fail_closed(format!("collect_body_strings measurement failed: {e}")));
     let p95 = harness::accept::p95_from_samples(&collect_measurement.samples)
@@ -334,7 +397,7 @@ fn main() {
             "collect_body_strings",
             collect_measurement.summary.median.as_micros(),
             p95.as_micros(),
-            NUM_DOCS,
+            visible_ids.len(),
         )
     );
 
@@ -351,7 +414,7 @@ fn main() {
             "sparse_build_total",
             build_measurement.summary.median.as_micros(),
             p95.as_micros(),
-            NUM_DOCS,
+            num_docs,
         )
     );
 
@@ -413,7 +476,7 @@ fn main() {
         .unwrap_or_else(|e| fail_closed(format!("SparseIndex::build (Issue #387) failed: {e}")));
     let replica = ProfileSparseIndex::build(&doc_refs)
         .unwrap_or_else(|e| fail_closed(format!("ProfileSparseIndex::build failed: {e}")));
-    let visible: BTreeSet<u64> = corpus.ids.iter().copied().collect();
+    let visible: BTreeSet<u64> = visible_row_ids.clone();
     let pool_depth = SQL_DEFAULT_HYBRID_POOL_DEPTH;
     let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth)
         .unwrap_or_else(|e| fail_closed(format!("RrfConfig::new failed: {e:?}")));
@@ -454,8 +517,8 @@ fn main() {
     for (idx, q) in queries.iter().enumerate() {
         let predicted = dense_refetch_schedule(
             &provider,
-            &corpus.ids,
-            &corpus.vectors,
+            &visible_ids,
+            &visible_vectors,
             corpus.dim,
             &q.vector,
             pool_depth,
@@ -463,8 +526,8 @@ fn main() {
         .unwrap_or_else(|e| fail_closed(format!("dense_refetch_schedule failed: {e}")));
         provider.reset();
         let input = SearchInput {
-            ids: &corpus.ids,
-            vectors: &corpus.vectors,
+            ids: &visible_ids,
+            vectors: &visible_vectors,
             dim: corpus.dim,
             query: &q.vector,
             k: TOP_K,
@@ -498,8 +561,8 @@ fn main() {
         let q = &queries[query_idx % queries.len()];
         query_idx += 1;
         let input = SearchInput {
-            ids: &corpus.ids,
-            vectors: &corpus.vectors,
+            ids: &visible_ids,
+            vectors: &visible_vectors,
             dim: corpus.dim,
             query: &q.vector,
             k: TOP_K,
@@ -519,8 +582,8 @@ fn main() {
     for q in &queries {
         provider.reset();
         let input = SearchInput {
-            ids: &corpus.ids,
-            vectors: &corpus.vectors,
+            ids: &visible_ids,
+            vectors: &visible_vectors,
             dim: corpus.dim,
             query: &q.vector,
             k: TOP_K,
@@ -530,7 +593,7 @@ fn main() {
         dense_stats.push(harness::hybrid_latency::aggregate_refetch_stats(
             provider.calls(),
             provider.max_k_seen(),
-            corpus.ids.len(),
+            visible_ids.len(),
         ));
     }
     let dense_summary = harness::hybrid_latency::summarize_refetch_stats(&dense_stats);
@@ -821,9 +884,13 @@ fn main() {
     let b7_precomputed: Vec<(Vec<CandidateHit>, Vec<ScoredDoc>)> = queries
         .iter()
         .map(|q| {
+            // 可視部分集合（`visible_ids`/`visible_vectors`）を使う。B4
+            // （`hybrid_search_cached_index`）と同じ候補集合を密側へ渡さないと、
+            // B7 が可視率縮小時に B4 より広い母集団から Top-`pool_depth` を
+            // 拾ってしまい、対比対象として不整合になる（codex-review 指摘）。
             let input = SearchInput {
-                ids: &corpus.ids,
-                vectors: &corpus.vectors,
+                ids: &visible_ids,
+                vectors: &visible_vectors,
                 dim: corpus.dim,
                 query: &q.vector,
                 k: pool_depth,
@@ -864,8 +931,8 @@ fn main() {
         let mut b1_ids: Vec<u64> = result.rows.iter().map(|row| row.id).collect();
         b1_ids.sort_unstable();
         let input = SearchInput {
-            ids: &corpus.ids,
-            vectors: &corpus.vectors,
+            ids: &visible_ids,
+            vectors: &visible_vectors,
             dim: corpus.dim,
             query: &q.vector,
             k: TOP_K,
@@ -887,9 +954,15 @@ fn main() {
                  sql={b1_ids:?} direct={b4_ids:?}"
             ));
         }
-        if b1_ids.len() != TOP_K {
+        // 可視件数が TOP_K 未満の設定（`BENCH_HYBRID_PROFILE_VISIBLE_RATIO` で
+        // 小規模コーパス×高い分母を指定した場合。公開されている入力範囲内）では
+        // 返る行数が可視件数で頭打ちになるのが正当であり、常に TOP_K ちょうどを
+        // 要求すると到達可能な入力で必ず fail-closed してしまう（codex-review
+        // 指摘）。期待値は `TOP_K` と可視件数の小さい方とする。
+        let expected_hits = TOP_K.min(visible.len());
+        if b1_ids.len() != expected_hits {
             fail_closed(format!(
-                "B1/B4 fidelity: expected {TOP_K} ids, got {}",
+                "B1/B4 fidelity: expected {expected_hits} ids, got {}",
                 b1_ids.len()
             ));
         }
@@ -904,8 +977,8 @@ fn main() {
             let q = &queries[query_idx % queries.len()];
             query_idx += 1;
             let input = SearchInput {
-                ids: &corpus.ids,
-                vectors: &corpus.vectors,
+                ids: &visible_ids,
+                vectors: &visible_vectors,
                 dim: corpus.dim,
                 query: &q.vector,
                 k: dense_fetch_k,
@@ -923,8 +996,8 @@ fn main() {
             let q = &queries[query_idx % queries.len()];
             query_idx += 1;
             let input = SearchInput {
-                ids: &corpus.ids,
-                vectors: &corpus.vectors,
+                ids: &visible_ids,
+                vectors: &visible_vectors,
                 dim: corpus.dim,
                 query: &q.vector,
                 k: dense_fetch_k,
@@ -996,8 +1069,8 @@ fn main() {
             let q = &queries[query_idx % queries.len()];
             query_idx += 1;
             let input = SearchInput {
-                ids: &corpus.ids,
-                vectors: &corpus.vectors,
+                ids: &visible_ids,
+                vectors: &visible_vectors,
                 dim: corpus.dim,
                 query: &q.vector,
                 k: TOP_K,
@@ -1040,7 +1113,7 @@ fn main() {
 
         // B8_visible_set_build: 残差内訳（可視集合 BTreeSet 構築。std 操作のみ）。
         let m = run(&config, || {
-            corpus.ids.iter().copied().collect::<BTreeSet<u64>>()
+            visible_ids.iter().copied().collect::<BTreeSet<u64>>()
         })
         .unwrap_or_else(|e| fail_closed(format!("B8 measurement failed: {e}")));
         b8_round_medians.push(m.summary.median);

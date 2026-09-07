@@ -1217,6 +1217,163 @@ cold/hot 等価性・決定性契約は構造的に不変）。`sparse.rs` 内 u
 ため、#547 が `bench-hybrid-profile` のメモリ計測を記録する際にはこの点を
 注記する必要がある。
 
+## Issue #547: #546 の前後比較（実測）
+
+対応: Issue #547（`test(engine): bench-hybrid-profile での前後比較
+（N=25k／100k・可視率 100%／10%）`）。前提: Issue #546（本ドキュメント
+「Issue #546」節）。計測規約は `docs/design/benchmark-judgement-policy.md`
+（Issue #462 SSOT）に従う。
+
+### 計測方法
+
+`crates/engine/benches/harness/hybrid_profile.rs` へ
+`BENCH_HYBRID_PROFILE_ROWS`（コーパス行数）・
+`BENCH_HYBRID_PROFILE_VISIBLE_RATIO`（可視率 `1/<N>`）の fail-closed
+opt-in を追加し、`scripts/bench_hybrid_profile_ab.sh`
+（`make bench-hybrid-profile-ab`）で before（#546 適用前。
+`crates/engine/src/sparse.rs`・`crates/engine/src/sql/sparse_cache.rs` のみ
+`b161d5b^`（#565 の直前コミット）まで戻したビルド）／after（HEAD。
+本 PR の計測基盤自体を含む）の 2 バイナリを N∈{25000,100000} ×
+可視率∈{1/1,1/10} の 4 条件で before→after 交互 5 ペア（各ペア
+`BENCH_HYBRID_PROFILE_ROUNDS=5`）実行した。可視率の意味は README「hybrid_rrf
+段別内訳プロファイルと転置索引化の前後比較」節と同じ（SQL 段は索引 N
+自体が縮小、直接 API 段は索引 N は常に行数で可視集合のみ縮小）。
+
+review 指摘対応として、`scripts/bench_hybrid_profile_ab.sh` へ
+`BEFORE_COMMIT`／`AFTER_COMMIT`（ビルド元コミット hash の記録を必須化）・
+`AB_PAIRS >= 5` の実行前検証（`docs/design/benchmark-judgement-policy.md`
+§3 の下限）・`AB_ROUNDS` の `hybrid_profile_bench` 自身の受理範囲
+`5..=50` との事前整合検証を追加し、`--summarize` の出力を条件→ペア→
+before/after の実行順・ファイル名付き（`grep -H`）へ変更した。あわせて
+`hybrid_profile_bench.rs` の B7 参考値（密候補が可視部分集合を無視して
+`corpus.ids`／`corpus.vectors` の全件から Top-`pool_depth` を拾っていた
+不整合）と、B1/B4 fidelity 検証（可視件数が `TOP_K` 未満の設定で常に
+fail-closed していた不整合）を修正した。以下の実測値はこれらの修正を
+適用した版で再実行した結果であり、本節はこの再実行値のみを記録する
+（旧実測値は本コミットで置き換え）。
+
+- before ビルド元: `af885d6e59a56ecb481e646ce4418bc845e0dad7`
+  （`crates/engine/src/sparse.rs`・`crates/engine/src/sql/sparse_cache.rs`
+  のみ `91f6a1830eed7bed326a552bfc4625296a8bf371` = `b161d5b^` へ差し替え）
+- after ビルド元: `af885d6e59a56ecb481e646ce4418bc845e0dad7`
+  （production コード〔`sparse.rs`・`sql/sparse_cache.rs`〕は #546 適用後の
+  ままで不変。今回の修正はいずれもベンチハーネス・計測ドライバのみ）
+
+### 実測結果（min-of-5・median-of-5 併記、参照区間帯は同一条件内の B0s の (max−min)/min）
+
+`B4`（`hybrid_search_cached_index`。engine 内 hybrid 経路の直接 API。
+`score_by_postings`／`score_within` を経由し #546 の対象）・`B5`
+（`sparse_refetch_loop`。同じく対象）を主対象とし、`B0s`
+（`CpuScalarProvider` 単線・#546 と無関係の密側参照区間）を同一実行環境の
+ノイズ帯として併記する。値は各ペアの 5 ラウンドから取った min を 5 ペア
+ぶん集め、その min・median を示す（`docs/design/benchmark-judgement-policy.md`
+§3 の「min-of-N と median の両方を必ず併記する」に対応）。
+
+| 条件（N・可視率） | B4 before (min/median) | B4 after (min/median) | B4 diff (min基準) | B5 before (min/median) | B5 after (min/median) | B5 diff (min基準) | B0s 参照区間帯 (before/after) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 25,000・1/1 | 3030us / 3041us | 3011us / 3076us | −0.6% | 1673us / 1674us | 1676us / 1682us | +0.2% | 10.1% / 9.0% |
+| 25,000・1/10 | 392us / 399us | 394us / 407us | +0.5% | 148us / 149us | 150us / 151us | +1.4% | 1.5% / 1.5% |
+| 100,000・1/1 | 9074us / 9296us | 8924us / 9279us | −1.7% | 5784us / 5807us | 5831us / 5855us | +0.8% | 12.5% / 5.8% |
+| 100,000・1/10 | 1332us / 1346us | 1319us / 1340us | −1.0% | 690us / 697us | 682us / 684us | −1.2% | 3.2% / 1.3% |
+
+per-run 生データ（各条件・各ペア・各 side の 5 ラウンド min の値列。
+5 ペアぶん）を以下に残す（`docs/design/benchmark-judgement-policy.md` §3
+「per-run 生データの記録を必須とする」に対応。単位 us、ペア 1〜5 の順）:
+
+| 条件・side | B4 各ペア min の値列 | B5 各ペア min の値列 |
+| --- | --- | --- |
+| 25,000・1/1・before | 3030, 3039, 3116, 3120, 3041 | 1674, 1673, 1674, 1677, 1680 |
+| 25,000・1/1・after | 3011, 3205, 3092, 3076, 3066 | 1679, 1687, 1712, 1676, 1682 |
+| 25,000・1/10・before | 399, 397, 417, 421, 392 | 150, 150, 148, 149, 149 |
+| 25,000・1/10・after | 397, 407, 425, 413, 394 | 150, 153, 154, 151, 151 |
+| 100,000・1/1・before | 9979, 9296, 9074, 9532, 9075 | 6028, 5784, 5803, 5807, 5820 |
+| 100,000・1/1・after | 9279, 9070, 9739, 8924, 9666 | 5831, 5855, 5883, 5845, 5875 |
+| 100,000・1/10・before | 1332, 1375, 1404, 1338, 1346 | 694, 701, 700, 697, 690 |
+| 100,000・1/10・after | 1351, 1343, 1330, 1340, 1319 | 682, 683, 692, 689, 684 |
+
+`B1`（SQL 表層 crossdb 規範形）・`B2`（既存段と同じ投影）でも同様に
+before/after 差は概ね ±2〜3% 台で、絶対値に対する `score_by_postings` の
+寄与自体が小さいため、傾向は B4/B5 と一致する。生ログ・summary 行は
+`target/bench-hybrid-profile-ab/<ts>/*.log`（実行時生成物・本リポの
+履歴には含まない）に保存されるが、上表の min／median／per-run 値は本
+ドキュメントに恒久的に記録する。
+
+**B0s 参照区間帯（前表 `B0s 参照区間帯 (before/after)` 列）の算出元について**:
+上表の B4/B5 とは異なり、`B0s`（`CpuScalarProvider` 単線の参照区間）自体の
+各ペア min 値列は計測実行時のログ（`target/bench-hybrid-profile-ab/<ts>/
+*.log`）からこのドキュメントへ転記されなかった。生ログはベンチ実行時生成物
+であり本リポの履歴に含まれないため、本コミット時点で遡って値を復元する
+手段がない。したがって上表の `B0s` 参照区間帯（1.3%〜12.5%）はこのドキュメント
+単独では第三者が再計算できない値であり、その旨をここに明記する
+（codex-review 指摘。`docs/design/benchmark-judgement-policy.md` §4）。
+
+`docs/design/benchmark-judgement-policy.md` §4 は「実測ノイズ帯」を
+「同一計測セッションで得た参照区間の run-to-run 幅」と定義し、第三者が
+その値列を検証できることを前提にしている。上記のとおり `B0s` の値列は
+本コミット時点で第三者が検証できないため、`B0s` 参照区間帯は同 §4 が
+定める実測ノイズ帯の要件を満たさない。したがって下記「判断」節では
+`B0s` 参照区間帯を判定根拠として採用せず、§4 が要求するもう一方の
+ノイズ帯である**固定相対帯（±5%。`classify_change` 基準）のみ**を根拠に
+判定する（review 指摘対応。検証不能な実測帯に基づく判断を撤回し、保存
+済みデータ〔上表・per-run 表に恒久記録した B4/B5 の min／median／各ペア
+値列〕と固定 ±5% 帯から言える範囲へ結論を限定する）。
+
+再測定によるギャップ解消はこの PR のスコープ外とする。理由は次の通り: (1)
+B0s は B4/B5 と**同一の交互実行**から得られる値のため、B0s だけを単独で
+再測定しても既存の B4/B5 per-run 値との対応関係が崩れる。整合させるには
+4 条件 × 2 side × 5 ペアの全体（B4/B5/B0s すべて）を再実行し、上表・
+per-run 表を丸ごと置き換える必要があり、単一の P2 指摘（生データ記録
+漏れ）の範囲を超える。(2) 本リポの計測規約
+（`docs/design/benchmark-judgement-policy.md`）は専有環境（`BENCH_DEDICATED_ENV`）
+での計測を前提とするが、この修正作業自体が複数エージェント並列実行中の
+共有環境で行われており、ここで再測定してもノイズ帯の値として信頼できない。
+今後の再測定では `scripts/bench_hybrid_profile_ab.sh --summarize` が
+`baseline_round_raw`／`baseline_summary`（`B0s(min=...,median=...)` を含む）
+に加え、各 run 直前の `loadavg_before_run`・`running_processes_excluding_self`・
+`top_cpu_processes`（同 §3 の同時実行プロセス有無の記録。本 PR で追加）
+の行をそのまま列挙するため、次回実行時はこれらの行を本ドキュメントへ転記
+すれば同種の指摘は再発しない。上記のとおり本節の判断は `B0s` の値列
+無しでも固定 ±5% 帯のみで成立するため、このギャップは判断そのものの
+妥当性には影響しない。
+
+**実測環境の記録（`docs/design/benchmark-judgement-policy.md` §3）**:
+本 4 条件の計測は本開発コンテナ（`lscpu` Model name: `QEMU Virtual CPU
+version 2.5+`・`nproc`=12・命令セットフラグに `avx2`／`fma`／`f16c` あり・
+`avx512*`／`neon` 無し。`BENCH_DEDICATED_ENV` 未設定の共有環境）で実行した。
+この CPU/ISA 情報は本ドキュメント作成時点でも同一環境で確認できる恒久的
+特性として記録するが、実測実行時点ごとの `loadavg`・同時実行プロセスの
+有無は前述の生ログ（本リポ履歴に含まれない実行時生成物）にのみ記録されて
+おり本コミット時点で復元できない。§3 の環境記録要件のうち静的な CPU/ISA
+情報は本節で充足し、動的な `loadavg`・同時実行プロセス有無は充足できない
+ことをここに明記する。
+
+### 判断
+
+4 条件 × 2 段（B4・B5）のいずれも、before→after の差（−1.7%〜+1.4%）は
+`docs/design/benchmark-judgement-policy.md` §4 の固定相対帯（±5%）を
+超えない（`classify_change` 基準で `Neutral` 分類）。同 §4 は判定に
+効かせる差分を「固定相対帯・実測ノイズ帯の両方を超えていること」と
+定めており、固定相対帯を超えない時点で（`B0s` 参照区間帯の検証可否に
+よらず）採用条件（ノイズ帯を明確に超える改善）を満たさないと判定できる。
+したがって **#546 のウォールクロック効果はこの計測環境・この 4 条件では
+有意に検出できない**と判断する（Issue #366・#365 と同様の「効果なし」
+実測結果。ハーネス・ドライバの review 指摘修正後に再実測した値でも結論は
+変わらない。本判断は固定相対帯のみで成立し、算出元データを提示できない
+`B0s` 実測ノイズ帯には依拠しない）。
+
+推定される要因: `score_by_postings` が確保していた `acc: Vec<f64>`
+（コーパス全体長）は glibc の同一サイズ再利用（tcache）により繰り返し
+確保・解放してもコストが小さく、かつ本ベンチの支配的コストは posting
+list 走査・BM25 スコアリング本体（Issue #388〜#392 で既に大半を削減済み）
+や SQL 表層の固定コストであるため、確保コストの除去がマイクロベンチの
+全体レイテンシに現れにくい。
+
+`#546` はスコアの f64 ビット一致・RLS 相当のテナント境界縮約契約を維持した
+まま `approx_heap_bytes()` の容量判定を実確保量に整合させる副次効果を持つため
+（本ドキュメント「Issue #546」節参照）、ウォールクロック改善が計測されない
+ことは production 変更の妥当性を損なわない。本 Issue の役割は前後比較の
+実測・記録であり、#546 の採否判断そのものは対象外（既に実装・マージ済み）。
+
 ## Issue #549: RRF 融合段の id 写像・ソートの割り当て削減（融合結果はビット同一）
 
 対応: Issue #549（`perf(engine): RRF 融合段の id 写像・ソートの割り当て削減

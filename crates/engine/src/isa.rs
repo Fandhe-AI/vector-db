@@ -52,8 +52,30 @@
 //! `docs/design/dot-kernel-branchless-tail.md` 参照。spec 本文は転記しない）。
 //! `unsafe` ブロックの個数（3 個）は本変更でも増減しない
 //! （`tests/isa.rs::unsafe_is_confined_to_isa_module_with_safety_comments`）。
+//!
+//! # 行ブロック（4 行）カーネル（TASK-156・CORE-14。Issue #510）
+//!
+//! [`SimdKernel::dot_block4`] は 4 行 × 1 クエリの内積を、行間でクエリの
+//! ロードを 1 回に共有しつつ 1 行版 `dot` とビット同一に計算する（呼び出し元は
+//! `parallel_search.rs::search_range`）。x86_64（AVX2+FMA・AVX-512F）の
+//! intrinsics カーネル本体は新設サブモジュール [`x86_block4`] へ分離し、
+//! `unsafe` は本モジュールのトークンディスパッチ箇所（2 箇所）のみに限定する
+//! （ADR `docs/design/simd-intrinsics-adoption.md` 決定 1）。これにより
+//! `unsafe` ブロックの総数は 3 → 5 になる（詳細・生成コード検査で判明した
+//! 問題と対処は `docs/design/dot-kernel-row-block.md` 参照。spec 本文は
+//! 転記しない）。
 
 use std::sync::OnceLock;
+
+/// x86_64 行ブロック（4 行）カーネル本体（Issue #510・TASK-156・CORE-14）。
+///
+/// カーネル本体は `unsafe` を持たない safe fn として分離する（ADR
+/// `docs/design/simd-intrinsics-adoption.md` 決定 1: `unsafe` は `isa.rs` の
+/// トークンディスパッチ箇所以外に持ち込まない）。`isa.rs` 側は
+/// [`SimdKernel::dot_block4_impl`] の 2 箇所（AVX2+FMA・AVX-512）でこのモジュールの
+/// 関数を `unsafe` 呼び出しする。
+#[cfg(target_arch = "x86_64")]
+mod x86_block4;
 
 /// 実行時に検出された ISA。
 ///
@@ -236,6 +258,115 @@ impl SimdKernel {
             }
         }
     }
+
+    /// 4 行 × 1 クエリの内積（`dot` の行ブロック版。Issue #510・TASK-156・CORE-14。
+    /// ポインタ: `docs/design/dot-kernel-row-block.md`）。
+    ///
+    /// 契約: 全入力で `dot_block4(rows, query)[i].to_bits() ==
+    /// self.dot(rows[i], query).to_bits()`（1 行版とビット同一）。行間で
+    /// クエリのロードを 1 回に共有し行側のロードを FMA のメモリオペランドへ
+    /// 畳み込む点のみが 1 行版と異なり、各行のアキュムレータ構造
+    /// （レーン FMA → レーン和 → 端数和。[`reduce_lanes`] 共有）は 1 行版と
+    /// 完全に同一に保つ。
+    ///
+    /// `parallel_search.rs::search_range` が呼ぶ本番経路（呼び出し元は 4 行分の
+    /// `dim` 長一致を `vectors.get(start..end)` により保証済み）に加え、
+    /// Issue #512（前後比較・採否）の計測 hook にもなる。
+    pub fn dot_block4(self, rows: [&[f32]; 4], query: &[f32]) -> [f32; 4] {
+        self.dot_block4_impl::<DEFAULT_PADDED_TAIL>(rows, query)
+    }
+
+    /// [`Self::dot_block4`] の本体。`PADDED_TAIL` は [`Self::dot_impl`] と同じ
+    /// 位置付け（[`Self::dot_block4`] は常に [`DEFAULT_PADDED_TAIL`] を使う）。
+    ///
+    /// 高速経路（intrinsics ブロックカーネル）は 4 行すべてと `query` の長さが
+    /// 等しい場合に限る。1 つでも異なれば `dot_impl` を 4 回呼ぶ経路へ縮退する
+    /// （`zip` による最短長への暗黙の切り詰めが 1 行ごとに独立して起こる 1 行版と
+    /// 異なる結果になるのを防ぐ。production では `search_range` が `dim` 長を
+    /// 保証するため常に高速経路を通る）。
+    fn dot_block4_impl<const PADDED_TAIL: bool>(
+        self,
+        rows: [&[f32]; 4],
+        query: &[f32],
+    ) -> [f32; 4] {
+        let [r0, r1, r2, r3] = rows;
+        let uniform_len = r0.len() == query.len()
+            && r1.len() == query.len()
+            && r2.len() == query.len()
+            && r3.len() == query.len();
+
+        if !uniform_len {
+            return [
+                self.dot_impl::<PADDED_TAIL>(r0, query),
+                self.dot_impl::<PADDED_TAIL>(r1, query),
+                self.dot_impl::<PADDED_TAIL>(r2, query),
+                self.dot_impl::<PADDED_TAIL>(r3, query),
+            ];
+        }
+
+        match self {
+            SimdKernel::Scalar => [
+                dot_scalar(r0, query),
+                dot_scalar(r1, query),
+                dot_scalar(r2, query),
+                dot_scalar(r3, query),
+            ],
+            #[cfg(target_arch = "aarch64")]
+            SimdKernel::Neon(_) => [
+                self.dot_impl::<PADDED_TAIL>(r0, query),
+                self.dot_impl::<PADDED_TAIL>(r1, query),
+                self.dot_impl::<PADDED_TAIL>(r2, query),
+                self.dot_impl::<PADDED_TAIL>(r3, query),
+            ],
+            #[cfg(target_arch = "x86_64")]
+            SimdKernel::Avx2Fma(_) => {
+                // 4 件の結果は `[f32; 4]` の戻り値ではなく `&mut f32` 出力引数 4 個
+                // で受け取る（`x86_block4::dot_block4_avx2_fma` の doc コメント
+                // 「レーン和をスカラー直接縮約にした理由」参照。本関数
+                // （`#[target_feature]` を持たないプレーンな関数）側で
+                // `[s0, s1, s2, s3]` を組み立てることで、SLP による要素ごと挿入
+                // 命令への再パックを避ける）。
+                let (mut s0, mut s1, mut s2, mut s3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                // SAFETY: `Avx2Fma` variant は `Avx2FmaToken::try_new` が
+                // `is_x86_feature_detected!("avx2")` かつ `("fma")` を実行時確認
+                // できた場合にのみ構築される sealed トークンを保持する（[`Self::dot_impl`]
+                // の Avx2Fma 分岐と同じ SAFETY 根拠）。値の存在自体が本 CPU が
+                // avx2+fma に対応していることの証明であり、
+                // `x86_block4::dot_block4_avx2_fma` の `#[target_feature]` 契約を満たす。
+                unsafe {
+                    x86_block4::dot_block4_avx2_fma::<PADDED_TAIL>(
+                        [r0, r1, r2, r3],
+                        query,
+                        &mut s0,
+                        &mut s1,
+                        &mut s2,
+                        &mut s3,
+                    )
+                }
+                [s0, s1, s2, s3]
+            }
+            #[cfg(target_arch = "x86_64")]
+            SimdKernel::Avx512(_) => {
+                let (mut s0, mut s1, mut s2, mut s3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                // SAFETY: `Avx512` variant は `Avx512Token::try_new` が
+                // `is_x86_feature_detected!("avx512f")` を実行時確認できた場合に
+                // のみ構築される sealed トークンを保持する（[`Self::dot_impl`] の
+                // Avx512 分岐と同じ SAFETY 根拠）。値の存在が CPU 対応の証明であり、
+                // `x86_block4::dot_block4_avx512` の `#[target_feature]` 契約を満たす。
+                unsafe {
+                    x86_block4::dot_block4_avx512::<PADDED_TAIL>(
+                        [r0, r1, r2, r3],
+                        query,
+                        &mut s0,
+                        &mut s1,
+                        &mut s2,
+                        &mut s3,
+                    )
+                }
+                [s0, s1, s2, s3]
+            }
+        }
+    }
 }
 
 /// [`SimdKernel::dot`] が使う既定の tail 方式（Issue #528）。
@@ -354,13 +485,51 @@ fn dot_lanes<const LANES: usize, const PADDED_TAIL: bool>(a: &[f32], b: &[f32]) 
         }
     }
 
-    let lane_sum: f32 = lanes.iter().sum();
-    let rem_sum: f32 = if PADDED_TAIL {
+    reduce_lanes::<LANES, PADDED_TAIL>(lanes, a_rem, b_rem)
+}
+
+/// [`dot_lanes`] の縮約段（レーン和 → 端数和 → 合算）を切り出した共通関数
+/// （Issue #510・TASK-156・CORE-14。ポインタ: `docs/design/dot-kernel-row-block.md`）。
+///
+/// レーン和・端数和それぞれの計算は [`lane_sum`]／[`tail_sum`] へさらに切り出して
+/// あり、x86_64 行ブロックカーネル（[`x86_block4::dot_block4_avx2_fma`]・
+/// [`x86_block4::dot_block4_avx512`]）は `[f32; LANES]` を経由しないスカラー直接
+/// 縮約（[`x86_block4::lane_sum8`]／[`lane_sum16`]。生成コード検査
+/// `scripts/check_simd_codegen.sh` が要素ごと挿入命令の再混入を防ぐ。詳細は
+/// `docs/design/dot-kernel-row-block.md` 参照）で得たレーン和と、この関数が持つ
+/// 端数和 [`tail_sum`] を組み合わせる。[`dot_lanes`]（1 行版）とブロック版が
+/// 同一の [`tail_sum`] を共有することで、行ブロック化してもスコアが 1 行版と
+/// ビット同一であることを構造的に保証する（`dot_lanes` 自体の挙動・演算順は
+/// 本変更で変えない）。
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn reduce_lanes<const LANES: usize, const PADDED_TAIL: bool>(
+    lanes: [f32; LANES],
+    a_rem: &[f32],
+    b_rem: &[f32],
+) -> f32 {
+    lane_sum(lanes) + tail_sum::<LANES, PADDED_TAIL>(a_rem, b_rem)
+}
+
+/// `[f32; LANES]` の左から右への逐次和（`Iterator::sum` の既定実装と同じ
+/// `fold(0.0, Add::add)`）。[`dot_lanes`] のレーン和はこの関数を経由する。
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn lane_sum<const LANES: usize>(lanes: [f32; LANES]) -> f32 {
+    lanes.iter().sum()
+}
+
+/// [`dot_lanes`]・x86_64 行ブロックカーネルが共有する端数和（Issue #510）。
+/// `PADDED_TAIL` の値による分岐は [`reduce_lanes`] と同一（Issue #528 のドキュメント
+/// 参照）。
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn tail_sum<const LANES: usize, const PADDED_TAIL: bool>(a_rem: &[f32], b_rem: &[f32]) -> f32 {
+    if PADDED_TAIL {
         padded_tail_sum::<LANES>(a_rem, b_rem)
     } else {
         a_rem.iter().zip(b_rem.iter()).map(|(x, y)| x * y).sum()
-    };
-    lane_sum + rem_sum
+    }
 }
 
 /// 零埋め固定長バッファによる分岐なし tail（Issue #528）。
