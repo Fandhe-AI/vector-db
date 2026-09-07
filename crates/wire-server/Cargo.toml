@@ -40,3 +40,13 @@ test = false
 name = "hybrid_wire_profile_bench"
 harness = false
 test = false
+
+[[bench]]
+# Issue #484: 単文 INSERT の wire 往復内訳（`crates/engine/benches/
+# ingest_profile_bench.rs` の BENCH_INGEST_PROFILE_MODE=single が計測する
+# engine 内部段を補い、wire プロトコル層自体の寄与を切り分ける）。
+# knn_wire_profile_bench と同方針（harness = false / test = false・
+# 手動実行専用・make ci 対象外・依存追加なし）。
+name = "ingest_wire_profile_bench"
+harness = false
+test = false

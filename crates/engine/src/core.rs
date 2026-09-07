@@ -1064,6 +1064,14 @@ pub struct EngineCore {
     /// デコード）を同一テーブル世代内で再利用する（詳細は
     /// `sql::arena_cache::SqlArenaCache` のドキュメント参照）。
     sql_arena_cache: crate::sql::arena_cache::SqlArenaCache,
+    /// `sql::aggregate::execute_aggregate`（`GROUP BY` なし・`WHERE` なしの
+    /// `DecodeTier::Fast` 単一行集計）専用の可視行テーブル世代整合キャッシュ
+    /// （Issue #478）。ヒット時は `user_rows/{table}` を一切開かずに `COUNT(*)`
+    /// 等を計算できる（詳細は `sql::visible_cache::VisibleBitmapCache` のドキュメント
+    /// 参照）。`GROUP BY` 集計（`sql::group_by`）・`WHERE` 付き集計・SELECT
+    /// （DISTANCE/hybrid）経路はこのキャッシュの対象外（スコープ外。ADR
+    /// `docs/design/visible-bitmap-cache.md` 参照）。
+    visible_bitmap_cache: crate::sql::visible_cache::VisibleBitmapCache,
     /// 構築時に明示指定された [`crate::search_engine::SearchEngineKind`]（Issue #407）。
     /// [`Self::open_with_engine`]／[`Self::from_storage_with_engine`] 経由なら
     /// `Some(kind)`、任意 provider を直接注入する [`Self::with_provider`]／
@@ -1258,6 +1266,7 @@ impl EngineCore {
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
             sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
+            visible_bitmap_cache: crate::sql::visible_cache::VisibleBitmapCache::new(),
             search_engine_kind,
             hnsw_state,
         }
@@ -1294,6 +1303,14 @@ impl EngineCore {
     /// （`core_api.snapshot` の対象外。`prefilter_cache_stats` と同じ方針）。
     pub fn sql_arena_cache_stats(&self) -> crate::sql::arena_cache::SqlArenaCacheStats {
         self.sql_arena_cache.stats()
+    }
+
+    /// `sql::visible_cache::VisibleBitmapCache` の現在の統計を返す（Issue #478。
+    /// テスト・運用観測用）。テナント ID・行 ID・可視件数等の機微情報は含まない
+    /// （`VisibleBitmapCacheStats` 参照）。`VectorCore` trait には載せない固有
+    /// メソッド（`core_api.snapshot` の対象外。`sql_arena_cache_stats` と同じ方針）。
+    pub fn visible_bitmap_cache_stats(&self) -> crate::sql::visible_cache::VisibleBitmapCacheStats {
+        self.visible_bitmap_cache.stats()
     }
 
     /// `sql::hnsw_cache::HnswIndexCache` の現在の統計を返す（Issue #408。
@@ -2297,8 +2314,22 @@ impl EngineCore {
                         })?;
                 let bound =
                     crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
-                let result =
-                    crate::sql::aggregate::execute_aggregate(&read_txn, ctx, &schema, &bound)?;
+                // Issue #478: `GROUP BY` なしの `DecodeTier::Fast` 単一行集計
+                // （`COUNT(*)` 等）はテーブル世代整合済みの可視 `id` 集合
+                // （`VisibleBitmapCache`）がヒットすれば `user_rows/{table}` を
+                // 一切開かずに計算できる。`GROUP BY`（`sql::group_by`）はこの
+                // キャッシュの対象外のまま（詳細は `sql::visible_cache` ドキュメント
+                // 参照）。
+                let result = crate::sql::aggregate::execute_aggregate_with_cache(
+                    &read_txn,
+                    ctx,
+                    &schema,
+                    &bound,
+                    Some(crate::sql::visible_cache::VisibleCacheAccess {
+                        storage: &self.storage,
+                        cache: &self.visible_bitmap_cache,
+                    }),
+                )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             // TASK-78（SQL-6）: `EXPLAIN SELECT ... USING PLAN(...)` は検索本体

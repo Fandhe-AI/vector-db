@@ -1,8 +1,10 @@
 # ADR: wgpu での部分 Top-k（bitonic／radix select）と SUBGROUP 可用性
 
-- ステータス: Proposed（実装 #536・前後比較 #537 の実測で Accepted／Rejected を
-  確定する。オーナー承認ゲートではない——`docs/spec/05-tasks.md` TASK-128〜130
-  の実装契約に沿った設計判断のうえで、実測により方式の採否を決める性質のため）
+- ステータス: **Accepted**（#536 で共有メモリのみの bitonic 部分 Top-k を実装。
+  #537 の前後比較実測で readback 量削減（#536 の主目的）の達成をカウンタで
+  確定的に確認し、レイテンシも共有 QEMU 環境の参考値ながら 6 点中 5 点で
+  一貫した改善方向（悪化は 0 点）を確認した。専有環境での絶対閾値判定は
+  オーナー作業へ申し送り。詳細は「前後比較実測（Issue #537）」節参照）
 - 対応: Issue #535（親 #534・Phase 5 親 #460・ルート #455）
 - 関連ポインタ: `docs/spec/04-behavior/core-engine.md`（CORE-6・CORE-8・
   CORE-16）・`docs/spec/05-tasks.md`（TASK-128・TASK-129・TASK-130）。
@@ -286,14 +288,171 @@ subgroup 組み込み（`subgroupMax`／`subgroupBallot`／`subgroupShuffleXor`�
 - **秘密情報**: 実測表にホスト名・パス・資格情報を含めない（GPU 名・
   ドライバ版のみを記録する）。
 
+## 実装記録（#536）
+
+決定 1〜3 を `crates/engine/src/gpu_batch.rs` に実装した。ADR からの意図的な
+差分は以下のとおり（`DOT_SHADER_TOPK_WGSL`/`DOT_SHADER_TOPK_F32_WGSL` の
+`topk_dot_shader!` マクロ doc に同内容を記載）。
+
+- **候補 B（subgroup shuffle 段）は実装しなかった。共有メモリ＋バリアのみ
+  （候補 A 相当）に統一した**。理由: naga 30.0.1 はバリアの一様性も
+  subgroup builtin の一様性も検証しない（§1.3）ため、`use_subgroup` の
+  分岐先で論理位置の取り違えが起きてもコンパイル時・CI では検知できず、
+  実機デバッグでしか発覚しないリスクを負う。本 Issue の主目的（readback
+  量を「クエリ本数 × 行数」比例から「ワークグループ数 × k_out」比例へ
+  削減する）は共有メモリのみの構成でも達成でき、正しさの検証可能性を
+  優先しこちらを採用した。`GpuContext`/`ContrastPipelines` に
+  `subgroup_supported` 等の判定フィールドは追加していない
+  （`select_readback_mode` は Top-k パイプライン可用性と `k` 上限のみで
+  判定する）。
+- **決定 2 の縮退条件を簡略化**: `SUBGROUP` 可用性・subgroup サイズ範囲の
+  判定は行わず、「Top-k パイプライン生成の成否」「タイル内クエリの `k`
+  最大値が `GPU_TOPK_OUT_MAX`（256）以下か」の 2 条件のみで
+  `GpuReadbackMode::FullScores`／`PartialTopK` を選ぶ（`select_readback_mode`）。
+  段階的 fail-closed 縮退（パイプライン未生成 → `init_gpu_context`/
+  `init_f32_contrast_pipeline` が独立 error scope で捕捉し `None` に吸収）
+  は維持している。
+- 決定 3 の定数・バッファ計画・readback 検証（`GpuTopKParams`・
+  `plan_partial_topk_chunk_rows`・`merge_partial_topk_readback`）は設計どおり
+  実装した。統計カウンタ `GpuBatchStats`/`GpuBatchStatsSnapshot`
+  （`partial_topk_dispatches`・`full_readback_dispatches`・
+  `full_readback_fallbacks`・`readback_bytes`）を新設し `stats()` で公開。
+- CORE-16 の公平性のため f32 常駐対照経路（`GpuF32ContrastBackend`）にも
+  同一の S1（Top-k 選出部。`topk_dot_shader!` マクロで S0 のみ差し替え）を
+  持つ Top-k パイプラインを用意した。
+
+本開発環境（NVIDIA GeForce RTX 3060・Vulkan backend）で Top-k パイプラインは
+問題なく生成・実行され（`probe_gpu_availability_debug_only` で確認）、実機
+結合テスト（`crates/engine/tests/gpu_batch.rs::topk_readback_bit_identity`）
+で既定の部分 Top-k 経路と `force_full_readback: true` の全量 readback 経路
+（`GpuSearchTestOptions`。`bench-internals` feature 限定）が
+`(id, score.to_bits())` 列としてビット同一であること、非有限スコア
+（65504 超の成分による f16 飽和 → `inf * 0.0` の NaN）を含む行が結果に
+混入しないこと、既定経路が `stats().partial_topk_dispatches > 0`・
+`full_readback_dispatches == 0` の非 vacuous な観測になることを確認した。
+
+## 前後比較実測（Issue #537）
+
+### 前提
+
+- before: `895e6cd`（#536 適用直前）／after: `4ece69e`（#536 適用直後・PR #578
+  merge commit）。`git diff 895e6cd 4ece69e -- crates/engine/src/gpu_batch.rs`
+  の変更は本 ADR が対象とする Top-k 経路のみで、`batch_search.rs`／`isa.rs`
+  （CPU-SIMD 参照区間）・`kernel.rs` は不変であることを確認済み。読み戻し
+  統計の取得には作業ブランチ（本 PR。`crates/engine/src/gpu_batch.rs` 無変更、
+  `benches/` のみ追加）のバイナリを使用し、`git diff 4ece69e <作業ブランチ>
+  -- crates/engine/src/gpu_batch.rs` が空であることで `4ece69e` と同一の
+  `stats()` 実装であることを担保した。
+- 環境: 本開発環境（共有 QEMU VM・NVIDIA GeForce RTX 3060・Vulkan backend・
+  CPU flags avx2/fma/f16c・avx512 系なし・12 vCPU・計測中の loadavg 約
+  3.4〜8.8）。`BENCH_DEDICATED_ENV` 未設定の共有環境であり、
+  `benchmark-judgement-policy.md` §5 により**レイテンシ数値は参考値・採否
+  根拠にしない**（専有環境での再実測をオーナーへ申し送る。readback バイト数は
+  決定的カウンタのため本環境でも確定的に判定できる——下記「readback バイト数」
+  節参照）。
+- 規模点: `20000:128:8`・`20000:128:64`・`100000:128:1`・`100000:128:64`・
+  `500000:128:64`（`crossdb-bench.md` GPU 節と同一 5 点）に加え、readback 量
+  削減が最も効く `100000:128:256` を追加した計 6 点。ペア数 N=5（交互
+  before→after。`scripts/bench_gpu_scaling_ab.sh`）。生データは
+  `docs/design/bench-data/gpu-scaling-ab/20260907T015208Z-summary.tsv`
+  （60 行＝6 点 × 5 ペア × 2 側）に保持。
+
+### readback バイト数（確定的カウンタ・環境ノイズの影響を受けない）
+
+after 側は `stats()` の `readback_bytes` を warmup+measured 全呼び出し
+（`calls`）で割った 1 呼び出しあたりの実測値。before 側には
+`GpuBatchStatsSnapshot` 相当のカウンタが無いため、全量 readback 経路が
+1 回の `batch_search` で読み戻す `rows × batch × 4` バイトの算出値
+（`harness::gpu_scaling::full_readback_bytes_estimate`。旧 `scores:
+array<f32>` を丸ごと読み戻す構造から一意に定まる。裏付け:
+`tests/gpu_batch.rs::default_path_reports_nonvacuous_partial_topk_stats`）。
+
+| rows | dim | batch | before 算出値（バイト） | after 実測値（バイト/call） | 削減比 | 非 vacuous |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20,000 | 128 | 8 | 640,000 | 50,560 | 12.66x | partial_topk=40, full_readback=0 |
+| 20,000 | 128 | 64 | 5,120,000 | 404,480 | 12.66x | partial_topk=160, full_readback=0 |
+| 100,000 | 128 | 1 | 400,000 | 31,280 | 12.79x | partial_topk=40, full_readback=0 |
+| 100,000 | 128 | 64 | 25,600,000 | 2,001,920 | 12.79x | partial_topk=160, full_readback=0 |
+| 500,000 | 128 | 64 | 128,000,000 | 10,004,480 | 12.79x | partial_topk=160, full_readback=0 |
+| 100,000 | 128 | 256 | 102,400,000 | 8,007,680 | 12.79x | partial_topk=640, full_readback=0 |
+
+全点で `full_readback_dispatches == 0`・`full_readback_fallbacks == 0`
+（全量 readback への縮退が発生していない）。削減比は `rows × 4 /
+(ceil(rows / GPU_WORKGROUP_SIZE) × k_out × 8)` に収束し（`k_out = k = 10`。
+`GPU_WORKGROUP_SIZE = 256`）、rows が 256 の倍数へ近づくほど理論上限
+12.8x（`256 × 4 / (10 × 8)`）へ収束する。**readback 量削減という #536 の
+主目的は本環境でも確定的に達成を確認できた**（生ログ:
+`docs/design/bench-data/gpu-scaling-ab/20260907T015208Z-readback-stats.txt`）。
+
+### レイテンシ（参考値・共有 QEMU 環境のため採否根拠にしない）
+
+`gpu_f16_p95` の min-of-5・median、参照区間（CPU-SIMD 経路。before/after で
+`isa.rs`／`batch_search.rs` は不変）の pooled 実測帯、固定 ±5% 帯・実測帯の
+両方を超える場合のみ有効な変化として扱う
+（`benchmark-judgement-policy.md` §4 の判定式）。
+
+| rows:dim:batch | before f16 p95 (min/median) | after f16 p95 (min/median) | ratio (min-of-N) | 固定帯判定 | 参照区間帯（cpu_p50 pooled） | 判定 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20000:128:8 | 703/772 µs | 536/542 µs | 0.762 | Improved | 9.84% | 実測帯も超過・Improved |
+| 20000:128:64 | 5180/5625 µs | 3689/3721 µs | 0.712 | Improved | 4.58% | 実測帯も超過・Improved |
+| 100000:128:1 | 1419/1463 µs | 1276/1301 µs | 0.899 | Improved | 17.57% | **実測帯内・判定不能**（loadavg 変動による外れ値混入） |
+| 100000:128:64 | 28662/31428 µs | 15783/15889 µs | 0.551 | Improved | 5.04% | 実測帯も超過・Improved |
+| 500000:128:64 | 139641/146544 µs | 77243/79006 µs | 0.553 | Improved | 13.36% | 実測帯も超過・Improved |
+| 100000:128:256 | 112099/113261 µs | 64500/76819 µs | 0.575 | Improved | 24.05% | 実測帯も超過・Improved |
+
+6 点中 5 点で固定帯・実測帯の両方を超える一貫した改善（比 0.55〜0.76x）が
+観測された。`100000:128:1` のみ参照区間の実測帯（17.57%）が対象比率との差
+（10.1%）を上回り、共有環境のノイズから独立した変化として判定できない
+（`batch=1` は 1 回あたりの絶対時間が短く相対ノイズの影響を受けやすい）。
+いずれの数値も共有 QEMU 環境の参考値であり、TASK-128〜130・CORE-6/CORE-16
+の絶対閾値判定・Accepted／Rejected 確定の根拠には用いない
+（`benchmark-judgement-policy.md` §5）。専有環境（`BENCH_DEDICATED_ENV=1`）
+での再実測をオーナーへ申し送る。
+
+### 判定
+
+- **readback 量削減（#536 の主目的）**: 確定的カウンタにより 12.66〜12.79x
+  の削減を確認——**達成**。
+- **レイテンシ**: 共有環境の参考値としては 6 点中 5 点で明確な改善方向
+  （0.55〜0.76x）。専有環境での確定判定はオーナー作業へ申し送り、悪化は
+  一度も観測されなかった。
+- 上記により、本 ADR のステータスを Implemented から **Accepted**
+  へ更新する（readback 量削減の目的達成をカウンタで確定的に確認できたため。
+  レイテンシの絶対閾値判定は専有環境再実測まで保留）。
+
+### 決定 5 の #537 後判断
+
+- **候補 A（barrier-only）を非対応 adapter の縮退先へ昇格する案**: 見送り
+  （Rejected）。既定経路が候補 A 相当（共有メモリのみ）であり、readback
+  削減・レイテンシ改善のいずれも実測で確認できたため、非対応 adapter 向けの
+  別経路を追加する動機がない。
+- **subgroup shuffle 段（決定 1「候補 B」）の追加**: 見送り（Rejected）。
+  共有メモリのみの構成で readback 削減（確定）・レイテンシ改善（参考値ながら
+  一貫した方向）の両方が確認できており、追加実装コスト（naga の
+  `enable subgroups;` 未実装という既知の制約下での builtin 一様性の手動保証）
+  に見合う効果が見込めない。
+
+### 再現手順（前後比較）
+
+1. before/after バイナリを退避: `cargo bench --bench gpu_scaling_bench -p
+   engine --no-run --message-format=json` を各コミットの worktree で実行し、
+   `executable` を抽出する。
+2. 交互実行: `BEFORE_BIN=<path> AFTER_BIN=<path> OUT_DIR=<dir>
+   scripts/bench_gpu_scaling_ab.sh 5 20000:128:8 20000:128:64 100000:128:1
+   100000:128:64 500000:128:64 100000:128:256`
+3. readback 統計行の取得: 作業ブランチのバイナリを規模点ごとに 1 プロセス
+   （`BENCH_GPU_SCALING_ROWS`/`DIMS`/`BATCH` を 1 点指定）で実行し
+   `gpu_scaling_stats:` 行を保存する。
+4. 集計: `summary.tsv` から `rows:dim:batch` × `side` でグルーピングし、
+   min-of-N・median・`ratio = after_min / before_min`・pooled `cpu_p50` の
+   `reference_band = (max-min)/min` を算出する。
+
 ## スコープ外・申し送り
 
-- Top-k シェーダ本体・経路判定純関数・統計カウンタの実装は #536 の担当。
-  前後比較・readback バイト数の実測は #537 の担当。
-- 非対応 adapter の縮退先を「全量 readback」から「barrier-only bitonic
-  （候補 A）」へ昇格する案は、#537 の実測結果を見てから再検討する。
-- 候補 C（radix select）は k が Top-k 出力上限を超える場合向けの条件付き
-  候補として記録するに留める。
+- subgroup shuffle 段の追加・非対応 adapter の縮退先昇格は #537 の実測を
+  根拠に見送り済み（「#537 後判断」節参照）。
+- 候補 C（radix select）は k が Top-k 出力上限（256）を超える場合向けの
+  条件付き候補として記録するに留める（現状は全量 readback へ縮退）。
 - `SHADER_F16`（#538）・整数ドット積系 feature（#541）・Apple UMA
   （#544）の実機確認は、本 doc の再現用 example（§6）の出力表を流用する。
 - wgpu 更新時（naga が `enable subgroups;` を実装した場合）の WGSL
