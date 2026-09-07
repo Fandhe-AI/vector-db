@@ -155,11 +155,9 @@ fn is_visible_to(spec: &RowSpec, viewer_tenant: &str, allow_private: bool) -> bo
 
 /// メイン DB へ全行を物理投入する（RLS 判定はクエリ時点で行われる）。
 fn build_main_db(core: &EngineCore) {
-    let mut seq = 0u64;
-    for spec in corpus() {
+    for (seq, spec) in corpus().into_iter().enumerate() {
         let owner_ctx = ctx_for_tenant(spec.tenant, true);
-        insert_row(core, &owner_ctx, spec.id, spec.visibility, seq);
-        seq += 1;
+        insert_row(core, &owner_ctx, spec.id, spec.visibility, seq as u64);
     }
 }
 
@@ -167,14 +165,15 @@ fn build_main_db(core: &EngineCore) {
 /// **だけ** を、同一 id・同一 visibility・同一 tenant・同一投入順で物理投入
 /// する。不可視行はこの DB に一切存在しない。
 fn build_oracle_db(core: &EngineCore, viewer_tenant: &str, allow_private: bool) {
-    let mut seq = 0u64;
-    for spec in corpus() {
+    // `seq`（`operation_id` 生成用）は一意性のみを要求し連番である必要は
+    // ないため、スキップした行の分だけ歯抜けになっても問題ない
+    // （`enumerate()` の添字をそのまま使う）。
+    for (seq, spec) in corpus().into_iter().enumerate() {
         if !is_visible_to(&spec, viewer_tenant, allow_private) {
             continue;
         }
         let owner_ctx = ctx_for_tenant(spec.tenant, true);
-        insert_row(core, &owner_ctx, spec.id, spec.visibility, seq);
-        seq += 1;
+        insert_row(core, &owner_ctx, spec.id, spec.visibility, seq as u64);
     }
 }
 
