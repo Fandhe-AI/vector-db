@@ -269,6 +269,19 @@ pub(crate) fn execute_scan(
     let mut byte_budget: usize = 0;
     let mut rows: Vec<ResultRow> = Vec::new();
 
+    // codex-review P1 指摘対応: `cells`（`Vec<Cell>`）自体の確保量も累計予算へ
+    // 計上する。テキスト・ベクトルの実体バイトのみを計上する従来の
+    // `try_alloc_text_for_budget`／`try_clone_embedding_for_budget` は、`id` 等
+    // 実体バイトを消費しない列だけを大量に並べた投影（例:
+    // `SELECT id, id, ..., id LIMIT 10000`）では `byte_budget` が 0 のまま
+    // `rows.len() * bound.projection.len()` 個の `Cell` を確保できてしまい、
+    // `MAX_SCAN_RESULT_BYTES` を迂回してメモリ枯渇を招く（`sql/exec.rs` の
+    // `row_struct_bytes` と同じ意図。構造体アロケーション自体を見逃さない）。
+    let cell_struct_bytes = bound
+        .projection
+        .len()
+        .saturating_mul(std::mem::size_of::<Cell>());
+
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
             // 早期終了: 可視かつ WHERE を満たす行が `bound.limit` 件集まった時点で
@@ -367,6 +380,11 @@ pub(crate) fn execute_scan(
             if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
+
+            // `cells` 確保前に累計予算を検証（上記コメント参照。確保そのものを
+            // 許可する前に拒否できるよう `Vec::with_capacity` より先に判定する）。
+            byte_budget =
+                try_accumulate_budget(byte_budget, cell_struct_bytes, MAX_SCAN_RESULT_BYTES)?;
 
             // 投影段。
             let mut cells = Vec::with_capacity(bound.projection.len());
@@ -723,5 +741,57 @@ mod tests {
             SqlSurfaceError::PayloadTooLarge { .. } => {}
             other => panic!("expected PayloadTooLarge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cell_struct_bytes_budget_rejects_projection_width_that_bypasses_text_and_vector_accounting()
+    {
+        // codex-review P1 指摘の回帰テスト: `id` のみを大量に並べた投影
+        // （実体バイトを持たないセル）は `try_alloc_text_for_budget`／
+        // `try_clone_embedding_for_budget` を一切通らないため、`cells`
+        // （`Vec<Cell>`）自体の確保量を累計しないと `byte_budget` が 0 のまま
+        // `MAX_SCAN_RESULT_BYTES` を迂回できてしまっていた。実際に数千万列の
+        // 投影を構築するとテスト自体が数 GB のメモリを消費するため
+        // （`ProjectedColumn` 1 要素あたり数十バイト）、`execute_scan` が使う式
+        // （`projection.len().saturating_mul(size_of::<Cell>())` →
+        // `try_accumulate_budget`）を直接検証する。
+        let huge_projection_len = MAX_SCAN_RESULT_BYTES / std::mem::size_of::<Cell>() + 1;
+        let cell_struct_bytes = huge_projection_len.saturating_mul(std::mem::size_of::<Cell>());
+        let mut budget = 0usize;
+        let err = try_accumulate_budget(budget, cell_struct_bytes, MAX_SCAN_RESULT_BYTES)
+            .expect_err("projection width exceeding the byte cap must be rejected");
+        match err {
+            SqlSurfaceError::PayloadTooLarge { .. } => {}
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+        // 予算内の投影幅は引き続き受理される（既存の `id`/`embedding` 2 列投影
+        // テストが確認する通常経路への回帰がないことの補足確認）。
+        let small_cell_struct_bytes = 2usize.saturating_mul(std::mem::size_of::<Cell>());
+        budget = 0;
+        budget = try_accumulate_budget(budget, small_cell_struct_bytes, MAX_SCAN_RESULT_BYTES)
+            .expect("small projection width must stay within budget");
+        assert_eq!(budget, small_cell_struct_bytes);
+    }
+
+    #[test]
+    fn cell_struct_bytes_accumulates_across_rows_in_execute_scan() {
+        // `execute_scan` の行ループへ実際に結線されていることの確認（累計は
+        // 行数に比例して増える契約。実行そのものは既存のバイト予算内に収まる
+        // 小規模な走査で検証し、上のユニットテストと相補的に production 経路の
+        // 配線漏れを検出する）。
+        let path = unique_db_path("scan-cell-struct-bytes-wired");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+        for id in 1..=5u64 {
+            write_row_direct(&storage, "docs", "tenant-a", id, &[1.0, 2.0, 3.0]);
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let bound = bound_star_scan(5);
+        let result = execute_scan(&read_txn, &ctx, &schema, &bound).expect("scan should succeed");
+        assert_eq!(result.rows.len(), 5);
     }
 }
