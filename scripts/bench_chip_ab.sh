@@ -73,6 +73,12 @@ fi
 DEFAULT_OUT_DIR="${REPO_ROOT}/_/bench/chip-ab/$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${OUT_DIR:-${DEFAULT_OUT_DIR}}"
 mkdir -p "${OUT_DIR}"
+# `run_one` は `cd "${state_dir}"` してから `BENCH_CHIP_OUT_DIR` を使うため、
+# 相対パスのままだと解決基準が state_dir 側にずれ summary.json が
+# before/after ディレクトリ配下へ分散して `--summarize` から見えなくなる
+# （codex-review P2・Cursor Bugbot 指摘・Issue #530）。呼び出し元 cwd 基準の
+# 絶対パスへここで正規化する。
+OUT_DIR="$(cd "${OUT_DIR}" && pwd)"
 
 CARGO_BIN="${CARGO:-cargo}"
 
@@ -92,6 +98,12 @@ run_one() {
   local status=0
   (
     cd "${state_dir}"
+    # CARGO_TARGET_DIR は明示的に state_dir 配下へ固定する。呼び出し元の
+    # シェル環境が CARGO_TARGET_DIR を（共有ビルドキャッシュ等の目的で）
+    # 設定していた場合、before/after 2 状態が同一 target ディレクトリへ
+    # ビルド成果物を書き込み合い、before 実行時に after 側の（あるいはその
+    # 逆の）バイナリを誤って再利用しうる（Cursor Bugbot 指摘・Issue #530）。
+    CARGO_TARGET_DIR="${state_dir}/target" \
     BENCH_CHIP_ROUNDS=1 \
     BENCH_CHIP_OUT_DIR="${run_out}" \
     BENCH_CHIP_WORKLOADS="${BENCH_CHIP_WORKLOADS:-}" \

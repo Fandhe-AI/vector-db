@@ -4,28 +4,28 @@ before	Avx2Fma	12	QEMU Virtual CPU version 2.5+	{"avx2": true, "avx512bf16": fal
 after	Avx2Fma	12	QEMU Virtual CPU version 2.5+	{"avx2": true, "avx512bf16": false, "avx512bw": false, "avx512f": false, "avx512fp16": false, "avx512vl": false, "avx512vnni": false, "avxvnni": false, "f16c": true, "fma": true}
 
 # comparison
-workload	metric	n_before	n_after	before_min	before_median	after_min	after_median	ratio_min	ratio_median	class_min	class_median
-dot_kernel	arena_scale/dim=100/median_ms	5	5	0.178	0.282	0.173	0.221	0.9719	0.7837	Neutral	Improved
-dot_kernel	arena_scale/dim=100/ns_per_dot	5	5	7.12	11.26	6.94	8.82	0.9747	0.7833	Neutral	Improved
-dot_kernel	arena_scale/dim=128/median_ms	5	5	0.264	0.49	0.259	0.34	0.9811	0.6939	Neutral	Improved
-dot_kernel	arena_scale/dim=128/ns_per_dot	5	5	10.56	19.61	10.35	13.6	0.9801	0.6935	Neutral	Improved
-dot_kernel	arena_scale/dim=1536/median_ms	5	5	6.384	7.136	5.588	6.617	0.8753	0.9273	Improved	Improved
-dot_kernel	arena_scale/dim=1536/ns_per_dot	5	5	255.37	285.45	223.54	264.67	0.8754	0.9272	Improved	Improved
-dot_kernel	arena_scale/dim=384/median_ms	5	5	1.531	1.911	1.613	1.757	1.0536	0.9194	Regressed	Improved
-dot_kernel	arena_scale/dim=384/ns_per_dot	5	5	61.22	76.43	64.52	70.27	1.0539	0.9194	Regressed	Improved
-dot_kernel	arena_scale/dim=768/median_ms	5	5	3.34	3.608	2.934	3.378	0.8784	0.9363	Improved	Improved
-dot_kernel	arena_scale/dim=768/ns_per_dot	5	5	133.59	144.3	117.37	135.11	0.8786	0.9363	Improved	Improved
-dot_kernel	cache_resident/dim=100/median_ms	5	5	0.177	0.18	0.177	0.185	1.0000	1.0278	Neutral	Neutral
-dot_kernel	cache_resident/dim=100/ns_per_dot	5	5	5.43	5.53	5.44	5.67	1.0018	1.0253	Neutral	Neutral
-dot_kernel	cache_resident/dim=128/median_ms	5	5	0.14	0.143	0.141	0.144	1.0071	1.0070	Neutral	Neutral
-dot_kernel	cache_resident/dim=128/ns_per_dot	5	5	5.47	5.57	5.52	5.62	1.0091	1.0090	Neutral	Neutral
-dot_kernel	cache_resident/dim=1536/median_ms	5	5	0.212	0.214	0.112	0.115	0.5283	0.5374	Improved	Improved
-dot_kernel	cache_resident/dim=1536/ns_per_dot	5	5	105.83	107.12	55.79	57.28	0.5272	0.5347	Improved	Improved
-dot_kernel	cache_resident/dim=384/median_ms	5	5	0.152	0.155	0.152	0.155	1.0000	1.0000	Neutral	Neutral
-dot_kernel	cache_resident/dim=384/ns_per_dot	5	5	18.1	18.47	18.11	18.5	1.0006	1.0016	Neutral	Neutral
-dot_kernel	cache_resident/dim=768/median_ms	5	5	0.186	0.192	0.12	0.124	0.6452	0.6458	Improved	Improved
-dot_kernel	cache_resident/dim=768/ns_per_dot	5	5	44.29	45.65	28.49	29.55	0.6433	0.6473	Improved	Improved
-dot_kernel	diagnostic_ab/simd_vs_scalar_ratio	5	5	0.176	0.178	0.112	0.115	0.6364	0.6461	Improved	Improved
+workload	metric	n_pairs	before_min	before_median	after_min	after_median	ratio_min	ratio_median	class_min	class_median	before_values	after_values
+dot_kernel	arena_scale/dim=100/median_ms	5	0.178	0.282	0.173	0.221	0.9719	0.7837	Neutral	Improved	pair1=0.181,pair2=0.178,pair3=0.397,pair4=0.355,pair5=0.282	pair1=0.176,pair2=0.173,pair3=0.221,pair4=0.343,pair5=0.229
+dot_kernel	arena_scale/dim=100/ns_per_dot	5	7.12	11.26	6.94	8.82	0.9747	0.7833	Neutral	Improved	pair1=7.23,pair2=7.12,pair3=15.89,pair4=14.22,pair5=11.26	pair1=7.05,pair2=6.94,pair3=8.82,pair4=13.72,pair5=9.17
+dot_kernel	arena_scale/dim=128/median_ms	5	0.264	0.49	0.259	0.34	0.9811	0.6939	Neutral	Improved	pair1=0.285,pair2=0.264,pair3=0.632,pair4=0.581,pair5=0.49	pair1=0.267,pair2=0.259,pair3=0.34,pair4=0.551,pair5=0.439
+dot_kernel	arena_scale/dim=128/ns_per_dot	5	10.56	19.61	10.35	13.6	0.9801	0.6935	Neutral	Improved	pair1=11.38,pair2=10.56,pair3=25.28,pair4=23.24,pair5=19.61	pair1=10.69,pair2=10.35,pair3=13.6,pair4=22.03,pair5=17.54
+dot_kernel	arena_scale/dim=1536/median_ms	5	6.384	7.136	5.588	6.617	0.8753	0.9273	Improved	Improved	pair1=7.226,pair2=6.384,pair3=7.136,pair4=6.935,pair5=9.824	pair1=6.617,pair2=6.48,pair3=6.706,pair4=5.588,pair5=8.414
+dot_kernel	arena_scale/dim=1536/ns_per_dot	5	255.37	285.45	223.54	264.67	0.8754	0.9272	Improved	Improved	pair1=289.05,pair2=255.37,pair3=285.45,pair4=277.42,pair5=392.95	pair1=264.67,pair2=259.2,pair3=268.23,pair4=223.54,pair5=336.54
+dot_kernel	arena_scale/dim=384/median_ms	5	1.531	1.911	1.613	1.757	1.0536	0.9194	Regressed	Improved	pair1=1.74,pair2=1.531,pair3=2.214,pair4=1.969,pair5=1.911	pair1=1.668,pair2=1.613,pair3=1.757,pair4=1.916,pair5=1.795
+dot_kernel	arena_scale/dim=384/ns_per_dot	5	61.22	76.43	64.52	70.27	1.0539	0.9194	Regressed	Improved	pair1=69.6,pair2=61.22,pair3=88.55,pair4=78.76,pair5=76.43	pair1=66.72,pair2=64.52,pair3=70.27,pair4=76.65,pair5=71.8
+dot_kernel	arena_scale/dim=768/median_ms	5	3.34	3.608	2.934	3.378	0.8784	0.9363	Improved	Improved	pair1=3.608,pair2=3.34,pair3=4.825,pair4=3.539,pair5=4.117	pair1=3.378,pair2=2.934,pair3=3.211,pair4=5.001,pair5=3.431
+dot_kernel	arena_scale/dim=768/ns_per_dot	5	133.59	144.3	117.37	135.11	0.8786	0.9363	Improved	Improved	pair1=144.3,pair2=133.59,pair3=192.98,pair4=141.55,pair5=164.69	pair1=135.11,pair2=117.37,pair3=128.44,pair4=200.02,pair5=137.23
+dot_kernel	cache_resident/dim=100/median_ms	5	0.177	0.18	0.177	0.185	1.0000	1.0278	Neutral	Neutral	pair1=0.18,pair2=0.177,pair3=0.181,pair4=0.18,pair5=0.18	pair1=0.177,pair2=0.18,pair3=0.194,pair4=0.185,pair5=0.561
+dot_kernel	cache_resident/dim=100/ns_per_dot	5	5.43	5.53	5.44	5.67	1.0018	1.0253	Neutral	Neutral	pair1=5.51,pair2=5.43,pair3=5.55,pair4=5.53,pair5=5.53	pair1=5.44,pair2=5.53,pair3=5.96,pair4=5.67,pair5=17.21
+dot_kernel	cache_resident/dim=128/median_ms	5	0.14	0.143	0.141	0.144	1.0071	1.0070	Neutral	Neutral	pair1=0.14,pair2=0.14,pair3=0.143,pair4=0.143,pair5=0.143	pair1=0.142,pair2=0.141,pair3=0.144,pair4=0.149,pair5=0.578
+dot_kernel	cache_resident/dim=128/ns_per_dot	5	5.47	5.57	5.52	5.62	1.0091	1.0090	Neutral	Neutral	pair1=5.47,pair2=5.48,pair3=5.58,pair4=5.57,pair5=5.57	pair1=5.53,pair2=5.52,pair3=5.62,pair4=5.84,pair5=22.56
+dot_kernel	cache_resident/dim=1536/median_ms	5	0.212	0.214	0.112	0.115	0.5283	0.5374	Improved	Improved	pair1=0.213,pair2=0.212,pair3=0.214,pair4=0.217,pair5=0.216	pair1=0.112,pair2=0.113,pair3=0.115,pair4=0.119,pair5=0.12
+dot_kernel	cache_resident/dim=1536/ns_per_dot	5	105.83	107.12	55.79	57.28	0.5272	0.5347	Improved	Improved	pair1=106.39,pair2=105.83,pair3=107.12,pair4=108.25,pair5=108.14	pair1=55.79,pair2=56.52,pair3=57.28,pair4=59.68,pair5=60.07
+dot_kernel	cache_resident/dim=384/median_ms	5	0.152	0.155	0.152	0.155	1.0000	1.0000	Neutral	Neutral	pair1=0.156,pair2=0.152,pair3=0.155,pair4=0.155,pair5=0.155	pair1=0.152,pair2=0.152,pair3=0.181,pair4=0.155,pair5=0.165
+dot_kernel	cache_resident/dim=384/ns_per_dot	5	18.1	18.47	18.11	18.5	1.0006	1.0016	Neutral	Neutral	pair1=18.55,pair2=18.1,pair3=18.47,pair4=18.48,pair5=18.47	pair1=18.11,pair2=18.13,pair3=21.51,pair4=18.5,pair5=19.69
+dot_kernel	cache_resident/dim=768/median_ms	5	0.186	0.192	0.12	0.124	0.6452	0.6458	Improved	Improved	pair1=0.186,pair2=0.186,pair3=0.192,pair4=0.192,pair5=0.195	pair1=0.12,pair2=0.121,pair3=0.124,pair4=0.126,pair5=0.126
+dot_kernel	cache_resident/dim=768/ns_per_dot	5	44.29	45.65	28.49	29.55	0.6433	0.6473	Improved	Improved	pair1=44.29,pair2=44.35,pair3=45.65,pair4=45.81,pair5=46.42	pair1=28.49,pair2=28.9,pair3=29.55,pair4=30.09,pair5=30.08
+dot_kernel	diagnostic_ab/simd_vs_scalar_ratio	5	0.176	0.178	0.112	0.115	0.6364	0.6461	Improved	Improved	pair1=0.177,pair2=0.176,pair3=0.179,pair4=0.183,pair5=0.178	pair1=0.115,pair2=0.112,pair3=0.123,pair4=0.113,pair5=0.12
 
-# skipped (present on one side only)
-side_only	workload	metric	n	min	median
+# insufficient_pairs (fewer than 5 complete before/after pairs at the same pair number; judgement withheld per benchmark-judgement-policy.md §3)
+workload	metric	n_pairs	before_values	after_values

@@ -343,8 +343,10 @@ dot カーネル変更（#517・実装は #518。前後比較・閾値候補実�
 Issue #512・`docs/design/dot-kernel-multi-accumulator.md`「行間再利用
 （Issue #512）」節参照）。Phase 4 通しの前後比較実測では、参照区間
 （`S1_redb_scan`／`S2_header_decode`）自体が本開発環境（共有 QEMU）で
-±23〜46% の run-to-run 変動を示すことを確認した——固定 ±5% 帯を大きく
-超えるノイズ床であり、対象区間の ratio 解釈にはこのノイズ床を織り込む
+実測ノイズ帯（reference_band。`benchmark-judgement-policy.md` §4。
+before+after 10 run プール）99.5%／159.9% を示すことを確認した（単純な
+before/after 比では +23.5%／+46.1%）——固定 ±5% 帯・実測ノイズ帯のいずれも
+大きく超えるノイズ床であり、対象区間の ratio 解釈にはこのノイズ床を織り込む
 必要がある。詳細は [`phase4-chip-before-after.md`](phase4-chip-before-after.md)
 §3.3 参照。
 

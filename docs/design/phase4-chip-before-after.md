@@ -129,16 +129,28 @@ dim≥768（ACC=4 ディスパッチの対象域。#517〜#519）で cache_resid
 | `S0prime_count_star/median_ms` | 参照外（Issue #478 由来） | 1.990 | 0.054 | 0.027 | Improved（Phase 4 外） |
 
 **重要な所見**: dot を一切通らない参照区間（`S1_redb_scan`／`S2_header_decode`）
-自体が min-of-5 比で +23.5%／+46.1% の「悪化」を示した。これは production の
-退行ではなく、**本開発環境（複数の並行タスクが同居する共有 QEMU ホスト）の
-run-to-run ノイズが `benchmark-judgement-policy.md` §4 の固定 ±5% 帯を大きく
-超える**ことを実測で確認したものである（`bench_chip_ab.sh` 単体を単独実行
-していても、同一ホスト上の他プロセスの影響は排除できない）。したがって
+自体の before/after 比（ratio_min）は S1 で 1.235（+23.5%）・S2 で 1.461
+（+46.1%）だったが、これは単純な before/after 差であり
+`benchmark-judgement-policy.md` §4 が定義する実測ノイズ帯（
+`reference_band = (reference_max - reference_min) / reference_min`）そのもの
+ではない。同一計測セッションの run-to-run 値列（参照区間は対象の変更が影響
+しないため before 5 run + after 5 run の計 10 run をプールして算出する。生値は
+[`20260907T201653Z-chip-ab-knn-profile-summary.tsv`](bench-data/phase4-chip-ab/20260907T201653Z-chip-ab-knn-profile-summary.tsv)
+の `before_values`／`after_values` 列参照）から実測ノイズ帯を計算すると、
+`S1_redb_scan` は reference_band ≈ 99.5%（reference_min=0.975ms・
+reference_max=1.945ms）、`S2_header_decode` は reference_band ≈ 159.9%
+（reference_min=1.136ms・reference_max=2.953ms）であり、いずれも上記
+before/after 比の絶対差（S1: 23.5pt・S2: 46.1pt）を大きく上回る。すなわち
+production の退行ではなく、**本開発環境（複数の並行タスクが同居する共有
+QEMU ホスト）の run-to-run ノイズが `benchmark-judgement-policy.md` §4 の
+固定 ±5% 帯・実測ノイズ帯の双方を大きく超える**ことを実測で確認したものであ
+る、という結論自体は変わらない（`bench_chip_ab.sh` 単体を単独実行していても、
+同一ホスト上の他プロセスの影響は排除できない）。したがって
 `S5_search_parallel` の ratio(min)=2.14 も、Phase 4（行ブロックカーネル）由来の
 効果と環境ノイズを本環境の 1 セッションでは分離できない。`dot_kernel`
 ワークロード単体（3.2 節）の方が測定対象の粒度が細かく working_set 別の内訳が
-取れるため、Phase 4 の効果判定は 3.2 節を主、本節は「参照区間のノイズ実測値」
-としての参考に留める。
+取れるため、Phase 4 の効果判定は 3.2 節を主、本節は「参照区間の実測ノイズ帯
+（reference_band）」としての参考に留める。
 
 `S0prime_count_star`（`COUNT(*)` 経路）の劇的改善（min-of-N 比 27 分の 1）は
 Phase 4 の対象外（Issue #478 VisibleBitmapCache・Phase 2 由来）であり、本 Issue
@@ -192,10 +204,16 @@ Qdrant HNSW 目標 559µs）を参照値として引用するに留める。再�
 
 ### 7.1 既定 brute-force エンジン（結果ビット同一契約）
 
-- **f32 1 行版 → f32 block4 版**が Phase 4 で production 既定を変えた唯一の
-  経路である。ただし block4 版はまだ既定切替されていない（`SimdKernel::dot`
-  の既定は 1 行版のまま。行ブロックカーネルは `search_range` 経路にのみ配線
-  済みで、既定切替の採否は個別 Issue のスコープ外）
+- **f32 1 行版の ACC=4 ディスパッチ**（dim≥`DOT_MULTI_ACC_MIN_DIM`=768。
+  #517〜#519）が Phase 4 で `SimdKernel::dot` の production 既定を変えた
+  唯一の経路である（3.2 節の 12〜47% 改善はこの経路に帰属する。block4 版
+  ではない）。block4 版（#510・#511）は `search_range` 専用の 4 行 SIMD
+  経路として `dot_block4` に配線済みだが、dim≥768 域では自身の SIMD 実装を
+  使わず 1 行版 ACC=4 経路へ内部合流する（`isa.rs::dot_block4_impl` の実装
+  コメント参照）ため、この域では両者は実質同一カーネルを指す。dim<768 域の
+  block4 独自 SIMD 効果は §4 の `block4_ab` 系列（参考値）でのみ計測して
+  おり、`SimdKernel::dot` の既定切替の採否は個別 Issue のスコープ外のまま
+  据え置き
 - 分岐なし tail（#527〜#529）は既定不採用のまま（Issue #529 の判断を継承）
 
 ### 7.2 ANN opt-in（`SearchEngineKind::Hnsw`）
@@ -211,7 +229,7 @@ Qdrant HNSW 目標 559µs）を参照値として引用するに留める。再�
 
 | チップ | ISA 検出（`engine::isa`） | `kernel_isa`（dot／f16／i8） | 最速経路（既定 brute-force） | 最速経路（ANN opt-in・候補生成） | 根拠 | 判定 |
 | --- | --- | --- | --- | --- | --- | --- |
-| **本環境（x86_64 QEMU・参考値）** | `Avx2Fma` | dot=Avx2Fma／f16=F16c／i8=Avx2Widen | dim≥768: block4 版が min-of-N で 12〜47% 高速（§3.2）。dim<384: Neutral〜方向不定 | 3 arm とも Recall 完全一致（§5）。VNNI 非搭載のため i8 の整数カーネル効果は未計測 | §3.2・§4・Issue #526 | **参考値・採否根拠にしない**（`benchmark-judgement-policy.md` §5） |
+| **本環境（x86_64 QEMU・参考値）** | `Avx2Fma` | dot=Avx2Fma／f16=F16c／i8=Avx2Widen | dim≥768: 1 行版 ACC=4 ディスパッチが min-of-N で 12〜47% 高速（§3.2。block4 版ではなく `SimdKernel::dot` の 1 行版経路。dim≥768 では block4 も同経路へ合流するため実質同一）。dim<384: Neutral〜方向不定 | 3 arm とも Recall 完全一致（§5）。VNNI 非搭載のため i8 の整数カーネル効果は未計測 | §3.2・§4・Issue #526 | **参考値・採否根拠にしない**（`benchmark-judgement-policy.md` §5） |
 | **Apple M1／M2／M3／M4** | （未計測） | （未計測。期待値: dot=Neon／f16=NeonFp16／i8=NeonDotprod。Issue #525 実装済み） | 未計測・オーナー申し送り | 未計測・オーナー申し送り | — | **未計測** |
 | **AMD Zen 4**（Ryzen 7000／EPYC Genoa） | （未計測） | （未計測。期待値: `Avx512f`／`Avx512Vnni` 検出見込み） | 未計測・オーナー申し送り | 未計測・オーナー申し送り | — | **未計測** |
 | **AMD Zen 5**（デスクトップ／EPYC Turin／Ryzen AI 300） | （未計測） | （未計測。期待値: Zen 4 同様＋拡張命令） | 未計測・オーナー申し送り | 未計測・オーナー申し送り | — | **未計測** |
@@ -231,12 +249,14 @@ QEMU 行の結論は共有仮想環境の参考値に過ぎず、production の�
   で `BENCH_CHIP_WORKLOADS=feature_128,feature_768` 指定により追加実測可能
 - crossdb `vector_knn` self A/C 再計測は未実施（§6）
 - `knn_profile` ワークロードの参照区間（`S1_redb_scan`／`S2_header_decode`）
-  自体が本環境で ±23〜46% の run-to-run 変動を示した。専有環境
-  （`BENCH_DEDICATED_ENV=1`）での再実測がなければ `S5_search_parallel` 等の
-  ratio は Phase 4 由来の効果と環境ノイズを分離できない
-- `DOT_MULTI_ACC_MIN_DIM`（768）の最終確定・block4 経路の dim=384 での
-  min-of-N 方向不定（§3.2）への対処は Issue #519 の申し送りを継承しオーナー
-  判断のまま
+  自体が本環境で実測ノイズ帯（reference_band。before+after 10 run プール。
+  `benchmark-judgement-policy.md` §4）99.5%／159.9% を示した（単純な
+  before/after 比では +23.5%／+46.1%）。専有環境（`BENCH_DEDICATED_ENV=1`）
+  での再実測がなければ `S5_search_parallel` 等の ratio は Phase 4 由来の
+  効果と環境ノイズを分離できない
+- `DOT_MULTI_ACC_MIN_DIM`（768）の最終確定・1 行版 ACC=4 ディスパッチの
+  dim=384 での min-of-N 方向不定（§3.2）への対処は Issue #519 の申し送りを
+  継承しオーナー判断のまま
 - f16／i8 既定常駐化・`DEFAULT_PADDED_TAIL` 切替は既存の個別判断（#515・
   #516・#523・#529）どおり本 Issue でも提案しない
 

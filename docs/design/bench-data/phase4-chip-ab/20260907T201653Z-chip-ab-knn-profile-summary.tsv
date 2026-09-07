@@ -4,27 +4,27 @@ before	Avx2Fma	12	QEMU Virtual CPU version 2.5+	{"avx2": true, "avx512bf16": fal
 after	Avx2Fma	12	QEMU Virtual CPU version 2.5+	{"avx2": true, "avx512bf16": false, "avx512bw": false, "avx512f": false, "avx512fp16": false, "avx512vl": false, "avx512vnni": false, "avxvnni": false, "f16c": true, "fma": true}
 
 # comparison
-workload	metric	n_before	n_after	before_min	before_median	after_min	after_median	ratio_min	ratio_median	class_min	class_median
-knn_profile	S0_cold_sql_e2e/median_ms	5	5	25.165	27.67	20.007	23.99	0.7950	0.8670	Improved	Improved
-knn_profile	S0_cold_sql_e2e/ns_per_row	5	5	1006.6	1106.8	800.3	959.6	0.7951	0.8670	Improved	Improved
-knn_profile	S0_hot_sql_e2e/median_ms	5	5	0.897	2.67	1.05	2.535	1.1706	0.9494	Regressed	Improved
-knn_profile	S0_hot_sql_e2e/ns_per_row	5	5	35.9	106.8	42	101.4	1.1699	0.9494	Regressed	Improved
-knn_profile	S0prime_count_star/median_ms	5	5	1.99	2.352	0.054	0.058	0.0271	0.0247	Improved	Improved
-knn_profile	S0prime_count_star/ns_per_row	5	5	79.6	94.1	2.2	2.3	0.0276	0.0244	Improved	Improved
-knn_profile	S1_redb_scan/median_ms	5	5	0.975	0.997	1.204	1.644	1.2349	1.6489	Regressed	Regressed
-knn_profile	S1_redb_scan/ns_per_row	5	5	39	39.9	48.2	65.7	1.2359	1.6466	Regressed	Regressed
-knn_profile	S2_header_decode/median_ms	5	5	1.136	1.304	1.66	2.395	1.4613	1.8367	Regressed	Regressed
-knn_profile	S2_header_decode/ns_per_row	5	5	45.4	52.2	66.4	95.8	1.4626	1.8352	Regressed	Regressed
-knn_profile	S3_f32_decode/median_ms	5	5	2.746	2.896	3.107	3.293	1.1315	1.1371	Regressed	Regressed
-knn_profile	S3_f32_decode/ns_per_row	5	5	109.8	115.8	124.3	131.7	1.1321	1.1373	Regressed	Regressed
-knn_profile	S4_arena_build/median_ms	5	5	4.312	4.47	4.86	5.195	1.1271	1.1622	Regressed	Regressed
-knn_profile	S4_arena_build/ns_per_row	5	5	172.5	178.8	194.4	207.8	1.1270	1.1622	Regressed	Regressed
-knn_profile	S5_search_parallel/median_ms	5	5	0.299	1.614	0.64	2.763	2.1405	1.7119	Regressed	Regressed
-knn_profile	S5_search_parallel/ns_per_row	5	5	12	64.6	25.6	110.5	2.1333	1.7105	Regressed	Regressed
-knn_profile	S5_search_scalar/median_ms	5	5	0.384	0.463	0.453	0.57	1.1797	1.2311	Regressed	Regressed
-knn_profile	S5_search_scalar/ns_per_row	5	5	15.4	18.5	18.1	22.8	1.1753	1.2324	Regressed	Regressed
-knn_profile	S5prime_distance_only/median_ms	5	5	0.372	0.443	0.451	0.56	1.2124	1.2641	Regressed	Regressed
-knn_profile	S5prime_distance_only/ns_per_row	5	5	14.9	17.7	18.1	22.4	1.2148	1.2655	Regressed	Regressed
+workload	metric	n_pairs	before_min	before_median	after_min	after_median	ratio_min	ratio_median	class_min	class_median	before_values	after_values
+knn_profile	S0_cold_sql_e2e/median_ms	5	25.165	27.67	20.007	23.99	0.7950	0.8670	Improved	Improved	pair1=25.165,pair2=34.742,pair3=27.67,pair4=33.753,pair5=26.218	pair1=37.08,pair2=23.99,pair3=32.254,pair4=20.007,pair5=21.418
+knn_profile	S0_cold_sql_e2e/ns_per_row	5	1006.6	1106.8	800.3	959.6	0.7951	0.8670	Improved	Improved	pair1=1006.6,pair2=1389.7,pair3=1106.8,pair4=1350.1,pair5=1048.7	pair1=1483.2,pair2=959.6,pair3=1290.2,pair4=800.3,pair5=856.7
+knn_profile	S0_hot_sql_e2e/median_ms	5	0.897	2.67	1.05	2.535	1.1706	0.9494	Regressed	Improved	pair1=3.63,pair2=0.897,pair3=3.461,pair4=2.67,pair5=1.056	pair1=2.095,pair2=2.535,pair3=3.072,pair4=1.05,pair5=2.832
+knn_profile	S0_hot_sql_e2e/ns_per_row	5	35.9	106.8	42	101.4	1.1699	0.9494	Regressed	Improved	pair1=145.2,pair2=35.9,pair3=138.4,pair4=106.8,pair5=42.3	pair1=83.8,pair2=101.4,pair3=122.9,pair4=42,pair5=113.3
+knn_profile	S0prime_count_star/median_ms	5	1.99	2.352	0.054	0.058	0.0271	0.0247	Improved	Improved	pair1=5.558,pair2=2.074,pair3=4.512,pair4=2.352,pair5=1.99	pair1=0.058,pair2=0.055,pair3=0.115,pair4=0.054,pair5=0.11
+knn_profile	S0prime_count_star/ns_per_row	5	79.6	94.1	2.2	2.3	0.0276	0.0244	Improved	Improved	pair1=222.3,pair2=83,pair3=180.5,pair4=94.1,pair5=79.6	pair1=2.3,pair2=2.2,pair3=4.6,pair4=2.2,pair5=4.4
+knn_profile	S1_redb_scan/median_ms	5	0.975	0.997	1.204	1.644	1.2349	1.6489	Regressed	Regressed	pair1=1.799,pair2=0.981,pair3=1.69,pair4=0.997,pair5=0.975	pair1=1.259,pair2=1.644,pair3=1.945,pair4=1.204,pair5=1.92
+knn_profile	S1_redb_scan/ns_per_row	5	39	39.9	48.2	65.7	1.2359	1.6466	Regressed	Regressed	pair1=72,pair2=39.2,pair3=67.6,pair4=39.9,pair5=39	pair1=50.4,pair2=65.7,pair3=77.8,pair4=48.2,pair5=76.8
+knn_profile	S2_header_decode/median_ms	5	1.136	1.304	1.66	2.395	1.4613	1.8367	Regressed	Regressed	pair1=1.304,pair2=1.156,pair3=1.473,pair4=1.549,pair5=1.136	pair1=1.833,pair2=2.395,pair3=2.953,pair4=1.66,pair5=2.513
+knn_profile	S2_header_decode/ns_per_row	5	45.4	52.2	66.4	95.8	1.4626	1.8352	Regressed	Regressed	pair1=52.2,pair2=46.2,pair3=58.9,pair4=61.9,pair5=45.4	pair1=73.3,pair2=95.8,pair3=118.1,pair4=66.4,pair5=100.5
+knn_profile	S3_f32_decode/median_ms	5	2.746	2.896	3.107	3.293	1.1315	1.1371	Regressed	Regressed	pair1=4.294,pair2=2.746,pair3=2.896,pair4=2.873,pair5=4.294	pair1=3.257,pair2=5.128,pair3=3.293,pair4=3.107,pair5=5.361
+knn_profile	S3_f32_decode/ns_per_row	5	109.8	115.8	124.3	131.7	1.1321	1.1373	Regressed	Regressed	pair1=171.8,pair2=109.8,pair3=115.8,pair4=114.9,pair5=171.8	pair1=130.3,pair2=205.1,pair3=131.7,pair4=124.3,pair5=214.5
+knn_profile	S4_arena_build/median_ms	5	4.312	4.47	4.86	5.195	1.1271	1.1622	Regressed	Regressed	pair1=4.7,pair2=4.312,pair3=4.695,pair4=4.47,pair5=4.375	pair1=8.339,pair2=5.195,pair3=4.974,pair4=7.794,pair5=4.86
+knn_profile	S4_arena_build/ns_per_row	5	172.5	178.8	194.4	207.8	1.1270	1.1622	Regressed	Regressed	pair1=188,pair2=172.5,pair3=187.8,pair4=178.8,pair5=175	pair1=333.5,pair2=207.8,pair3=199,pair4=311.8,pair5=194.4
+knn_profile	S5_search_parallel/median_ms	5	0.299	1.614	0.64	2.763	2.1405	1.7119	Regressed	Regressed	pair1=3.47,pair2=1.994,pair3=1.614,pair4=0.299,pair5=1.606	pair1=3.213,pair2=2.995,pair3=0.64,pair4=2.763,pair5=1.764
+knn_profile	S5_search_parallel/ns_per_row	5	12	64.6	25.6	110.5	2.1333	1.7105	Regressed	Regressed	pair1=138.8,pair2=79.8,pair3=64.6,pair4=12,pair5=64.2	pair1=128.5,pair2=119.8,pair3=25.6,pair4=110.5,pair5=70.6
+knn_profile	S5_search_scalar/median_ms	5	0.384	0.463	0.453	0.57	1.1797	1.2311	Regressed	Regressed	pair1=0.897,pair2=0.384,pair3=1.389,pair4=0.405,pair5=0.463	pair1=0.872,pair2=0.57,pair3=0.544,pair4=0.453,pair5=0.766
+knn_profile	S5_search_scalar/ns_per_row	5	15.4	18.5	18.1	22.8	1.1753	1.2324	Regressed	Regressed	pair1=35.9,pair2=15.4,pair3=55.5,pair4=16.2,pair5=18.5	pair1=34.9,pair2=22.8,pair3=21.8,pair4=18.1,pair5=30.6
+knn_profile	S5prime_distance_only/median_ms	5	0.372	0.443	0.451	0.56	1.2124	1.2641	Regressed	Regressed	pair1=0.903,pair2=0.372,pair3=0.671,pair4=0.384,pair5=0.443	pair1=0.744,pair2=0.56,pair3=0.479,pair4=0.451,pair5=0.709
+knn_profile	S5prime_distance_only/ns_per_row	5	14.9	17.7	18.1	22.4	1.2148	1.2655	Regressed	Regressed	pair1=36.1,pair2=14.9,pair3=26.8,pair4=15.3,pair5=17.7	pair1=29.8,pair2=22.4,pair3=19.1,pair4=18.1,pair5=28.4
 
-# skipped (present on one side only)
-side_only	workload	metric	n	min	median
+# insufficient_pairs (fewer than 5 complete before/after pairs at the same pair number; judgement withheld per benchmark-judgement-policy.md §3)
+workload	metric	n_pairs	before_values	after_values
