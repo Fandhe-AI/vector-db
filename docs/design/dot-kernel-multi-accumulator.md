@@ -762,6 +762,10 @@ benchmark-judgement-policy.md §4（固定 ±5% 帯・実測 run-to-run 帯の�
 | Intel（AVX-512） | Avx512 | （未計測） | （未計測） | （未計測） | （未計測） |
 | 本開発環境（QEMU・共有・参考値） | Avx2Fma | 0.65／0.92（cache/arena） | 0.54／0.90 | 1.08／1.11 | 参考値（本節） |
 
+Phase 4 通し比較（Issue #530）でも同型の本開発環境参考値を再実測しており、
+集約先は [`phase4-chip-before-after.md`](phase4-chip-before-after.md) §3.2・§4
+を参照（実機実測欄は本節と同じく未計測のまま）。
+
 ### 再現手順（層 A）
 
 ```sh

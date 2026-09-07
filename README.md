@@ -29,7 +29,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - **ANN 索引（opt-in）**: 既定の検索エンジンは厳密最近傍（brute-force）のまま不変。`SearchEngineKind::Hnsw`（自作 HNSW・依存追加なし）を明示的に選択したときのみ opt-in で有効化される（ADR: [`docs/design/ann-index-adoption.md`](docs/design/ann-index-adoption.md) B 案）。適用状況は `EXPLAIN` の `engine:`／`ann_plan:` 行で確認できる。前後比較・opt-in 手順の詳細は下記「ANN（HNSW）opt-in 手順と前後比較（Issue #413）」節を参照。索引ノードの f16 常駐（`ResidentPrecision::F16`。既定 f32・opt-in）と F16C／NEON fp16 デコード付き dot カーネルは [`docs/design/hnsw-f16-resident.md`](docs/design/hnsw-f16-resident.md)（Issue #514）を参照。索引ノードの対称 SQ8（i8）常駐（`ResidentPrecision::I8`。既定 f32・opt-in。次元ごと min/max 由来のスケールで凍結時に 1 回量子化し、索引ヒットの最終スコアは常に f32 アリーナ再計算のまま不変）は [`docs/design/hnsw-sq8-resident.md`](docs/design/hnsw-sq8-resident.md)（Issue #521）を参照。同索引ノードの整数 i8×i8 dot カーネル（VNNI 512bit／256bit・i16 widen フォールバック。ISA 間ビット一致）は同 doc「Issue #522」節を、aarch64 NEON dotprod（`vdotq_s32`）版は同 doc「Issue #525」節を参照
 - **他実装比較・チップ別カーネル設計指針**: 他実装のホットパス手法・採否候補・ライセンス帰属は [`docs/design/hotpath-implementation-survey.md`](docs/design/hotpath-implementation-survey.md)、チップ別設計指針と Rust stable での intrinsics 可用性は [`docs/design/chip-kernel-guidelines.md`](docs/design/chip-kernel-guidelines.md)（いずれも調査記録・採用決定は各 Phase Issue）。intrinsics 導入方針 ADR（unsafe 境界・set 構築ロード・ディスパッチ設計・toolchain 1.98・適用経路）は [`docs/design/simd-intrinsics-adoption.md`](docs/design/simd-intrinsics-adoption.md)（Issue #508・ステータス Proposed・オーナー承認待ち）。`isa.rs::dot_lanes` の零埋め固定長バッファによる分岐なし tail（AVX2／AVX-512／NEON。順序保存・既定経路は現行のスカラー tail のまま不変）は [`docs/design/dot-kernel-branchless-tail.md`](docs/design/dot-kernel-branchless-tail.md)（Issue #528。既定切替の採否は Issue #529 で dim 100／129／768 の前後比較実測により Rejected・現状維持確定。`BENCH_DOT_KERNEL_TAIL_AB=1 make bench-dot-kernel` で opt-in の tail A/B 実測を再現可能）。`search_range` の 4 行ブロック（AVX2+FMA／AVX-512F／NEON）カーネルの設計・生成コード検査で判明した SLP 再パック問題と対処は [`docs/design/dot-kernel-row-block.md`](docs/design/dot-kernel-row-block.md)（Issue #510・#511 実装済み。前後比較・採否記録は Issue #512（`BENCH_DOT_KERNEL_BLOCK_AB=1 make bench-dot-kernel`。「参考値・現状維持」。詳細は [`docs/design/dot-kernel-multi-accumulator.md`](docs/design/dot-kernel-multi-accumulator.md)「行間再利用（Issue #512）」節）実施済み。dim 閾値ディスパッチ（Issue #517・#518。既定閾値 768）の前後比較・閾値候補実測は
 `scripts/bench_dot_kernel_ab.sh`（`dot_kernel_bench` の before/after 交互 min-of-N 実行ドライバ）で Issue #519 が本環境（共有 QEMU）の参考値を実測済み（詳細:
-`docs/design/dot-kernel-multi-accumulator.md`「Issue #519 追記」節）。AVX-512／NEON 実機での前後比較・閾値の最終確定は Issue #530）
+`docs/design/dot-kernel-multi-accumulator.md`「Issue #519 追記」節）。Phase 4（チップ最適カーネル群 #459）通しの着手前 SHA/適用後 SHA 前後比較・チップ別最速判定は [`docs/design/phase4-chip-before-after.md`](docs/design/phase4-chip-before-after.md)（Issue #530。`scripts/bench_chip_ab.sh`・`make bench-chip-ab` で本開発環境〔共有 QEMU〕参考値を実測済み。Apple M／AMD Zen／Intel 実機での実測はオーナー申し送り）
 
 詳細なビヘイビア（106 件・12 領域）は spec リポの [`04-behavior/`](https://github.com/Fandhe-AI/vector-db-spec/tree/main/04-behavior) を唯一の正（SSOT）とします。
 
@@ -432,7 +432,19 @@ env 変数（すべて fail-closed パース。不正値は非ゼロ終了）:
 
 出力は `<BENCH_CHIP_OUT_DIR>/summary.json`（CPU モデル名・関心 ISA フラグ・キャッシュ容量・実行時検出フラグ・build 情報・ラウンドごとの per-run ログパス・メトリクスごとの `values`／`min`／`median`／`max`／`reference_band_pct`）と、各 (round, workload) ごとの `round<N>_<workload>.{stdout,stderr}.log` です。すべて `<BENCH_CHIP_OUT_DIR>` からの相対パスで記録し、絶対パス・ホスト名・ユーザー名は含みません。本開発環境（QEMU・12 vCPU）での既定 5 ラウンド完走は数分程度でした（実測は環境依存）。
 
-**before/after の交互比較手順**（`docs/design/dot-kernel-multi-accumulator.md`「再現手順」と同型）: 変更前後のコミットをそれぞれ別の worktree（`CARGO_TARGET_DIR` を分離）でビルドし、`BENCH_CHIP_ROUNDS=1 BENCH_CHIP_OUT_DIR=<...>/pairN/{before,after}` を N ≥ 5 ペア交互実行してください。各 `summary.json` の値列を `docs/design/chip-kernel-guidelines.md` §7 の結果記録テンプレートへ転記し、min-of-N・median・ratio・参照区間帯を記録します。
+**before/after の交互比較手順**（Issue #530。Phase 4 通しの前後比較で追加した専用ドライバ）: `scripts/bench_chip_ab.sh`（`make bench-chip-ab`）が上記の手作業を自動化します。
+
+```sh
+# 1. 変更前後のコミットをそれぞれ git archive で独立ディレクトリへ展開し、
+#    各ディレクトリで cargo bench --bench {dot_kernel_bench,knn_profile_bench,chip_bench} -p engine --no-run
+#    と cargo build --release -p engine --example feature_bench を事前ビルドしておく
+BEFORE_DIR=<before のディレクトリ> AFTER_DIR=<after のディレクトリ> AB_PAIRS=5 \
+  make bench-chip-ab
+# 2. TSV へ集約（env ブロック・workload×metric ごとの before/after min・median・ratio・判定クラス）
+scripts/bench_chip_ab.sh --summarize _/bench/chip-ab/<UTC ts>
+```
+
+`AB_PAIRS`（既定 5・5 未満は拒否）・`BENCH_CHIP_WORKLOADS`（対象ワークロードの絞り込み）を指定できます。出力は `<OUT_DIR>/pair<N>-{before,after}/summary.json`（`.gitignore` 対象。記録を残す場合は `docs/design/bench-data/phase4-chip-ab/<UTC ts>-*.tsv` へ明示的にコピーしてください）。`GITHUB_ACTIONS` 下・出力先の再利用は fail-closed に拒否します。集約結果は `docs/design/chip-kernel-guidelines.md` §7 のテンプレート・`docs/design/phase4-chip-before-after.md`（本開発環境の実測記録済み）へ転記します。
 
 結果の記録先・公開境界: 実測値そのものは public な docs・Issue へ記録可能です（オーナー判断 2026-08-29・[spec-confidentiality](.claude/rules/spec-confidentiality.md)）。spec 由来の閾値は本リポジトリには記載しません。結果記録テンプレート・チップ別空テンプレート・`summary.json` キー一覧は `docs/design/chip-kernel-guidelines.md` §7 を参照してください。
 

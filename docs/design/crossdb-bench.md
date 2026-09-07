@@ -779,3 +779,12 @@ Qdrant は上記の別セッション実測のため `run_all.sh` には含ま�
   bench-crossdb`）はオーナー作業として申し送る。
 - engine GPU 経路の大バッチ頭打ち（Top-k の GPU 化・転送量削減）は別タスク。
 - 本計測は共有 VM（loadavg 約 2）での単発実測であり、専有環境での再測定は未実施。
+- Phase 4 通しのチップ別前後比較（Issue #530）では、`vector_knn` self A/C
+  再計測は本 doc の既存記録（`vector_knn` 786µs・Qdrant HNSW 目標 559µs）を
+  引用するに留め、新規実測は時間予算の都合で見送った。`vector_knn` は
+  Phase 2/3/5/6 の変更（遅延デコード・二次索引・CSR・GPU 等）を多く含み
+  Phase 4（チップ最適カーネル）単独には帰属できないため、区間帰属の観点でも
+  再計測の優先度は `dot_kernel`／`knn_profile` ワークロード（`chip_bench`
+  経由）より低いと判断した。詳細は
+  [`phase4-chip-before-after.md`](phase4-chip-before-after.md) §6 参照。
+  再計測はオーナー実機での手順（同 doc §9）の一部として実施可能。

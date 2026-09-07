@@ -486,6 +486,18 @@ else
 	@echo "skip: Cargo.toml 未追加のため bench-chip をスキップ"
 endif
 
+.PHONY: bench-chip-ab
+bench-chip-ab: ## Issue #530（Phase 4 通しのチップ別前後比較。親 #459・ルート #455）。`chip_bench`（Issue #469）を before/after 2 状態ディレクトリ（`git archive` で書き出した独立ワークツリー）で交互 min-of-N 実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BEFORE_DIR・AFTER_DIR 必須〔各ディレクトリで事前に `cargo bench --bench chip_bench -p engine --no-run` 等のビルドを済ませておくこと〕。AB_PAIRS（既定 5・5 未満は拒否）で交互ペア数を指定可。BENCH_CHIP_WORKLOADS で計測対象ワークロードを絞り込み可。ログは _/bench/chip-ab/<UTC ts>/ 配下。scripts/bench_chip_ab.sh --summarize <dir> で TSV 集約）を実行する
+ifdef HAS_CARGO
+	@if [ -z "$(BEFORE_DIR)" ] || [ -z "$(AFTER_DIR)" ]; then \
+		echo "ERROR: BEFORE_DIR・AFTER_DIR を指定してください（例: make bench-chip-ab BEFORE_DIR=<path> AFTER_DIR=<path>）"; \
+		exit 1; \
+	fi
+	BEFORE_DIR="$(BEFORE_DIR)" AFTER_DIR="$(AFTER_DIR)" scripts/bench_chip_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-chip-ab をスキップ"
+endif
+
 # --------------------------------------------------
 # ingest 経路の段別内訳プロファイル（Issue #396。crates/engine/benches/ingest_profile_bench.rs）
 # --------------------------------------------------
