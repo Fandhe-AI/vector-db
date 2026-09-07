@@ -247,6 +247,13 @@ pub struct HnswWorkerStats {
     /// このワーカーが `try_promote_entry` で実際にエントリポイントを
     /// 更新した回数。
     pub entry_promotions: u64,
+    /// このワーカーが `plan_links` の層探索で退化した候補集合
+    /// （`candidates.len() <= 1`）を観測した回数（Issue #448 追記。
+    /// `parallel_build.rs::DEGENERATE_LAYER_SEARCHES` 参照）。
+    pub degenerate_layer_searches: u64,
+    /// このワーカーが `ensure_reverse_link` で実際に再結線を行った回数
+    /// （Issue #448 追記。`parallel_build.rs::REVERSE_LINK_RECONNECTS` 参照）。
+    pub reverse_link_reconnects: u64,
 }
 
 /// 整数比（`u32/u32`）。`f32` は `HnswParams` の `Copy + PartialEq + Eq` derive と
