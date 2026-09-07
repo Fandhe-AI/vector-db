@@ -50,6 +50,7 @@ pub mod bench_engine;
 pub mod chip;
 #[cfg(feature = "contrast-bench")]
 pub mod contrast;
+pub mod dot_block;
 pub mod dot_kernel;
 pub mod env_report;
 pub mod gpu_scaling;
