@@ -1539,7 +1539,7 @@ impl HnswIndex {
 
         // `vectors` の不変スナップショットを取り、以降 `search` はこれのみを
         // 参照する（モジュール冒頭「ベクトルの所有方針」節・codex-review PR
-        // #430 P1 指摘対応。呼び出し元が構築後に borrowed 元バッファを書き換えても
+        // #430 P1 指摘対応。呼び出し元が構築後に借用元バッファを書き換えても
         // この Arc の中身は変化しない）。
         let owned_vectors: Arc<[f32]> = Arc::from(vectors);
         let mut builder = GraphBuilder {
