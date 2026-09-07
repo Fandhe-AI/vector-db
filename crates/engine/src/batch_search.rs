@@ -653,7 +653,12 @@ impl ResidentMatrix {
     /// あり、本メソッドはバッチスコア計算のためだけに使う）。バッファを
     /// 呼び出し元が使い回すことで、`BatchEngine::batch_search` がクエリ数
     /// 分だけ同一行を毎回ヒープ確保し直す（codex レビュー指摘対応）のを避ける。
-    fn row_f32_into(&self, idx: usize, out: &mut Vec<f32>) -> Option<()> {
+    ///
+    /// `pub(crate)`（Issue #542）: `gpu_batch::packed_i8::GpuI8BatchBackend`
+    /// が i8 パック常駐の構築入力・候補生成後の f32 再スコア（真値は f16
+    /// 復号 f32 dot のまま。CORE-8 の縮退対称性と同じ「候補生成のみ低精度・
+    /// 最終スコアは f32」契約）の両方でこのデコードを再利用する。
+    pub(crate) fn row_f32_into(&self, idx: usize, out: &mut Vec<f32>) -> Option<()> {
         let packed_per_row = self.dim.div_ceil(2);
         let start = idx.checked_mul(packed_per_row)?;
         let end = start.checked_add(packed_per_row)?;
