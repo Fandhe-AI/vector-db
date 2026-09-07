@@ -199,12 +199,119 @@ fn dispatched_dot_length_mismatch_matches_scalar_semantics() {
     assert_eq!(isa::current().dot(&[] as &[f32], &[] as &[f32]), 0.0f32);
 }
 
+/// `isa::SimdKernel::dot_block4`（Issue #510・TASK-156・CORE-14。行ブロック
+/// カーネル）が 1 行版 [`isa::SimdKernel::dot`] とビット同一であることを、
+/// 決定的シード RNG で dim 0..=129・768・1000・1536 を走査して検証する
+/// （ポインタ: `docs/design/dot-kernel-row-block.md`）。符号付きゼロ・微小値
+/// （`f32::MIN_POSITIVE` 近傍）を含む値集合もあわせて検証し、4 行それぞれで
+/// 独立した丸め誤差が生じないこと（1 行版と完全に同じ縮約経路を通ること）を
+/// 固定する。
+#[test]
+fn dot_block4_matches_single_row_dot_bit_exact_across_dims() {
+    let current_isa = isa::current().isa();
+    let mut rng = XorShift64Star::new(0x510a_bcde_f012_3456);
+
+    let dims: Vec<usize> = (0..=129usize).chain([768, 1000, 1536]).collect();
+
+    for &dim in &dims {
+        let query = random_vec(&mut rng, dim);
+        let r0 = random_vec(&mut rng, dim);
+        let r1 = random_vec(&mut rng, dim);
+        let r2 = random_vec(&mut rng, dim);
+        let r3 = random_vec(&mut rng, dim);
+
+        let expected = [
+            isa::current().dot(&r0, &query),
+            isa::current().dot(&r1, &query),
+            isa::current().dot(&r2, &query),
+            isa::current().dot(&r3, &query),
+        ];
+        let actual = isa::current().dot_block4([&r0, &r1, &r2, &r3], &query);
+
+        for i in 0..4 {
+            assert_eq!(
+                actual[i].to_bits(),
+                expected[i].to_bits(),
+                "isa={current_isa:?} dim={dim} i={i} actual={} expected={}",
+                actual[i],
+                expected[i]
+            );
+        }
+    }
+
+    // 符号付きゼロ・微小値（subnormal 近傍）を含むエッジ値集合。
+    let edge_values: Vec<f32> = vec![
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        f32::EPSILON,
+        -f32::EPSILON,
+        1e-30,
+        -1e-30,
+    ];
+    let query = edge_values.clone();
+    let r0 = edge_values.clone();
+    let r1: Vec<f32> = edge_values.iter().rev().copied().collect();
+    let r2 = edge_values.clone();
+    let r3: Vec<f32> = edge_values.iter().map(|v| v * 2.0).collect();
+
+    let expected = [
+        isa::current().dot(&r0, &query),
+        isa::current().dot(&r1, &query),
+        isa::current().dot(&r2, &query),
+        isa::current().dot(&r3, &query),
+    ];
+    let actual = isa::current().dot_block4([&r0, &r1, &r2, &r3], &query);
+    for i in 0..4 {
+        assert_eq!(
+            actual[i].to_bits(),
+            expected[i].to_bits(),
+            "isa={current_isa:?} edge-values i={i} actual={} expected={}",
+            actual[i],
+            expected[i]
+        );
+    }
+}
+
+/// 4 行と `query` の長さが 1 つでも異なる場合、[`isa::SimdKernel::dot_block4`] が
+/// 高速経路（intrinsics ブロックカーネル）へ入らず、1 行版 `dot` を 4 回呼ぶ
+/// 縮退経路と一致すること（`isa.rs::SimdKernel::dot_block4_impl` の
+/// `uniform_len` 判定の回帰。production では `parallel_search.rs::search_range`
+/// が常に 4 行と `query` の長さを揃えて呼ぶため、この経路は主に安全側の
+/// フォールバックとして機能する）。
+#[test]
+fn dot_block4_falls_back_to_single_row_dot_when_lengths_are_not_uniform() {
+    let query = vec![1.0f32, 2.0, 3.0, 4.0];
+    let r0 = vec![1.0f32, 0.0, 0.0, 0.0]; // query と同じ長さ
+    let r1 = vec![1.0f32, 0.0, 0.0]; // 1 要素短い
+    let r2 = vec![1.0f32, 0.0, 0.0, 0.0, 0.0]; // 1 要素長い
+    let r3: Vec<f32> = Vec::new(); // 空
+
+    let expected = [
+        isa::current().dot(&r0, &query),
+        isa::current().dot(&r1, &query),
+        isa::current().dot(&r2, &query),
+        isa::current().dot(&r3, &query),
+    ];
+    let actual = isa::current().dot_block4([&r0, &r1, &r2, &r3], &query);
+    assert_eq!(actual, expected);
+}
+
 /// CORE-14: 検出結果への外部入力上書き機構（環境変数・設定ファイル読み取り等）が
 /// ソース上に存在しないことを確認する（`tests/dispatch.rs::
 /// dispatch_source_has_no_external_override_entry_points` と同じ禁止トークン集合）。
 #[test]
 fn isa_source_has_no_external_override_entry_points() {
-    let source = include_str!("../src/isa.rs");
+    // Issue #510: `isa/x86_block4.rs`（cfg(x86_64) サブモジュール）も同じ禁止
+    // トークン集合で走査する（`isa.rs` 本体からモジュール分割しても CORE-12
+    // の「上書き機構の不存在」検査が抜け穴にならないようにするため）。
+    let sources = [
+        include_str!("../src/isa.rs"),
+        include_str!("../src/isa/x86_block4.rs"),
+    ];
 
     let forbidden_tokens = [
         "std::env",
@@ -216,11 +323,13 @@ fn isa_source_has_no_external_override_entry_points() {
         "option_env!",
     ];
 
-    for token in forbidden_tokens {
-        assert!(
-            !source.contains(token),
-            "isa.rs must not contain external override entry point token: {token}"
-        );
+    for source in sources {
+        for token in forbidden_tokens {
+            assert!(
+                !source.contains(token),
+                "isa module must not contain external override entry point token: {token}"
+            );
+        }
     }
 }
 
@@ -237,6 +346,14 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
 
     for path in &rs_files {
         let content = std::fs::read_to_string(path).expect("read source file");
+        // Issue #510: `isa/x86_block4.rs`（`isa.rs` の cfg(x86_64) サブモジュール）は
+        // `unsafe` を持たない safe fn のみで構成する契約（ADR
+        // `docs/design/simd-intrinsics-adoption.md` 決定 1）だが、それはこの検査を
+        // 弱める理由にはならない。`unsafe` を許すのは sealed トークン所持を根拠に
+        // 検証済みの `isa.rs` 本体のみとし、`isa/` 配下のサブモジュールへ `unsafe`
+        // が紛れ込んだ場合はこの検査で検出できるよう除外範囲を `isa.rs` 単体に限定
+        // する（codex-review 指摘対応。ディレクトリ一致による除外は
+        // `isa/x86_block4.rs` への `unsafe` 追加を無検査で通してしまうため撤回）。
         let is_isa_module = path.file_name().and_then(|n| n.to_str()) == Some("isa.rs");
 
         if !is_isa_module {
@@ -272,13 +389,16 @@ fn unsafe_is_confined_to_isa_module_with_safety_comments() {
         }
     }
 
-    // ソーステキスト上には NEON・AVX2+FMA・AVX-512 の 3 箇所の `unsafe {` が
-    // 現れる（実際のビルドで有効になるのは対象 arch の分岐のみだが、`cfg` 行は
-    // ソース上に残ったまま走査されるため、arch に依存せず常に 3 を期待できる）。
+    // ソーステキスト上には NEON・AVX2+FMA・AVX-512 の `dot` ディスパッチ 3 箇所に加え、
+    // Issue #510（TASK-156・CORE-14）で追加した `dot_block4` の AVX2+FMA・AVX-512
+    // ディスパッチ 2 箇所の計 5 箇所の `unsafe {` が現れる（実際のビルドで有効に
+    // なるのは対象 arch の分岐のみだが、`cfg` 行はソース上に残ったまま走査される
+    // ため、arch に依存せず常に 5 を期待できる）。
     assert_eq!(
-        unsafe_block_count, 5,
-        "expected exactly 5 `unsafe {{` blocks in isa.rs (Neon, Avx2Fma, Avx512 dot dispatch \
-         + F16c, NeonFp16 dot_f16 dispatch added by Issue #514)"
+        unsafe_block_count, 7,
+        "expected exactly 7 `unsafe {{` blocks in isa.rs (Neon/Avx2Fma/Avx512 dot dispatch \
+         + Avx2Fma/Avx512 dot_block4 dispatch + F16c/NeonFp16 dot_f16 dispatch added by \
+         Issue #514)"
     );
 }
 

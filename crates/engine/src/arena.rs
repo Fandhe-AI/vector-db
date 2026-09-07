@@ -1044,9 +1044,11 @@ impl VectorArena {
 
         for entry in table.iter().map_err(StorageError::from)? {
             let (k, v) = entry.map_err(StorageError::from)?;
-            // 複合キーの第 2 要素が行 `id`（第 1 要素のテナントは行データ側のヘッダと
-            // 同一。可視性判定は従来どおり行データ由来の値で行う）。
-            let (_key_tenant, id) = k.value();
+            // 複合キーの第 2 要素が行 `id`（第 1 要素 `key_tenant` は物理キー側の
+            // テナント。可視性判定自体は従来どおり行データ側のヘッダ由来の値で
+            // 行うが、可視と判定した行は下で `key_tenant` とヘッダ側 `tenant_id` の
+            // 整合を検査する）。
+            let (key_tenant, id) = k.value();
             let buf = v.value();
 
             // まず tenant_id・visibility だけを安全に取得する（embedding・metadata の
@@ -1066,6 +1068,22 @@ impl VectorArena {
             if !predicate(tenant_id, visibility) {
                 continue;
             }
+
+            // 可視行・常に: 複合キー側の `key_tenant` とヘッダ側 `tenant_id` の
+            // 不一致（内部バグ・raw redb 書き込みによる異常）を fail-closed に拒否する
+            // （対象ビヘイビア: TABLE-12。`sql/aggregate.rs` の走査ループと同一パターン。
+            // PR #563 codex-review P0 対応: この検査を欠いたまま
+            // `sql::exec::decode_deferred_scalars_from_redb` の遅延投影再取得が
+            // `arena.tenant_id(slot)`（ヘッダ側）をキーに `(tenant, id)` で
+            // 再取得すると、物理キーとヘッダの tenant が不一致に壊れた行では
+            // 再取得後の `verify_row_key_tenant` がヘッダ側 tenant 同士の一致
+            // としてすり抜け、本来無関係な別テナントの物理行を re-fetch して
+            // しまう恐れがあった。ここで不一致行をアリーナへ一切格納しないことで、
+            // アリーナに載る全スロットは物理キー・ヘッダ双方の tenant が一致
+            // することを不変条件として保証し、後続の再取得キーが指す物理行は
+            // 常に走査時と同一であることを保証する）。
+            crate::storage::verify_row_key_tenant(key_tenant, tenant_id)
+                .map_err(ArenaError::from)?;
 
             // ここに到達するのは可視行だけ。以降は embedding を含む完全デコードを行い、
             // 次元不一致・デコードエラーは従来どおり fail-closed に伝播する
@@ -2137,6 +2155,60 @@ mod tests {
         assert!(
             matches!(err, ArenaError::Storage(_)),
             "expected ArenaError::Storage for header decode failure, got: {err:?}"
+        );
+    }
+
+    // 対象ビヘイビア: TABLE-12（PR #563 codex-review P0 対応）。物理キー側
+    // `tenant_id` とヘッダ側 `tenant_id` が意図的にずれた行（内部バグ・raw redb
+    // 書き込みによる異常を想定）は、ヘッダ側が `Public` で可視と判定されても
+    // アリーナへ格納せず fail-closed に拒否すること。この検査を欠いたまま
+    // アリーナへ格納すると、`arena.tenant_id(slot)`（ヘッダ側の値）をキーに行を
+    // 再取得する `sql::exec::decode_deferred_scalars_from_redb` の遅延投影経路が、
+    // 元の走査対象とは異なる物理行（ここでは本物の `(tenant-b, 1)`）を re-fetch
+    // してしまい、無関係な別テナントの `Private` 本文が漏えいする恐れがあった
+    // （`sql/aggregate.rs::key_tenant_header_tenant_mismatch_is_rejected_fail_closed`
+    // と同じ観点の検査を `arena.rs` の走査ループへも追加する回帰）。
+    #[test]
+    fn build_filtered_rejects_row_whose_key_tenant_and_header_tenant_mismatch() {
+        let path = unique_db_path("key-header-tenant-mismatch");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 4))
+            .expect("create_table");
+
+        {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let row_table_name = catalog::user_rows_table_name("docs");
+                let mut row_table = write_txn
+                    .open_table(catalog::user_rows_table_def(&row_table_name))
+                    .expect("open row table");
+                // 物理キーは tenant-a、ヘッダ内容は tenant-b・Public という
+                // TABLE-12 違反の異常行（raw redb 書き込みで意図的に構成）。
+                let buf = crate::storage::encode_row(&RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 2.0, 3.0, 4.0],
+                    metadata: b"m",
+                })
+                .expect("encode row");
+                row_table
+                    .insert(("tenant-a", 1u64), buf.as_slice())
+                    .expect("insert key/header tenant mismatched row");
+            }
+            write_txn.commit().expect("commit mismatched row");
+        }
+
+        // ヘッダ側 tenant（tenant-b）・`Public` により可視と判定される述語を
+        // 渡しても、key/header 不一致は fail-closed に拒否される。
+        let err = VectorArena::build_filtered(&storage, "docs", |tenant, visibility| {
+            tenant == "tenant-b" && visibility == Visibility::Public
+        })
+        .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        assert!(
+            matches!(err, ArenaError::Storage(_)),
+            "expected ArenaError::Storage for key/header tenant mismatch, got: {err:?}"
         );
     }
 

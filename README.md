@@ -26,7 +26,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 12.66〜12.79x 削減を確定的カウンタで確認し、ADR ステータスは Accepted）
 - **hybrid 検索の疎索引**: BM25 疎索引（`SparseIndex`）は転置索引（posting list）＋可視ビットマップ 1 パス走査方式で、RLS 可視集合へ統計（df・N・avgdl）自体を縮約する fail-closed 設計（posting へのスコアリング走査のみがコーパス文書数への線形走査から脱却し、可視集合走査 `O(|visible_ids|)`・スコアアキュムレータ初期化 `O(N)` は残る。詳細: [`docs/design/sparse-inverted-index.md`](docs/design/sparse-inverted-index.md)）
 - **ANN 索引（opt-in）**: 既定の検索エンジンは厳密最近傍（brute-force）のまま不変。`SearchEngineKind::Hnsw`（自作 HNSW・依存追加なし）を明示的に選択したときのみ opt-in で有効化される（ADR: [`docs/design/ann-index-adoption.md`](docs/design/ann-index-adoption.md) B 案）。適用状況は `EXPLAIN` の `engine:`／`ann_plan:` 行で確認できる。前後比較・opt-in 手順の詳細は下記「ANN（HNSW）opt-in 手順と前後比較（Issue #413）」節を参照。索引ノードの f16 常駐（`ResidentPrecision::F16`。既定 f32・opt-in）と F16C／NEON fp16 デコード付き dot カーネルは [`docs/design/hnsw-f16-resident.md`](docs/design/hnsw-f16-resident.md)（Issue #514）を参照
-- **他実装比較・チップ別カーネル設計指針**: 他実装のホットパス手法・採否候補・ライセンス帰属は [`docs/design/hotpath-implementation-survey.md`](docs/design/hotpath-implementation-survey.md)、チップ別設計指針と Rust stable での intrinsics 可用性は [`docs/design/chip-kernel-guidelines.md`](docs/design/chip-kernel-guidelines.md)（いずれも調査記録・採用決定は各 Phase Issue）。intrinsics 導入方針 ADR（unsafe 境界・set 構築ロード・ディスパッチ設計・toolchain 1.98・適用経路）は [`docs/design/simd-intrinsics-adoption.md`](docs/design/simd-intrinsics-adoption.md)（Issue #508・ステータス Proposed・オーナー承認待ち）。`isa.rs::dot_lanes` の零埋め固定長バッファによる分岐なし tail（AVX2／AVX-512／NEON。順序保存・既定経路は現行のスカラー tail のまま不変）は [`docs/design/dot-kernel-branchless-tail.md`](docs/design/dot-kernel-branchless-tail.md)（Issue #528。既定切替の採否は Issue #529）
+- **他実装比較・チップ別カーネル設計指針**: 他実装のホットパス手法・採否候補・ライセンス帰属は [`docs/design/hotpath-implementation-survey.md`](docs/design/hotpath-implementation-survey.md)、チップ別設計指針と Rust stable での intrinsics 可用性は [`docs/design/chip-kernel-guidelines.md`](docs/design/chip-kernel-guidelines.md)（いずれも調査記録・採用決定は各 Phase Issue）。intrinsics 導入方針 ADR（unsafe 境界・set 構築ロード・ディスパッチ設計・toolchain 1.98・適用経路）は [`docs/design/simd-intrinsics-adoption.md`](docs/design/simd-intrinsics-adoption.md)（Issue #508・ステータス Proposed・オーナー承認待ち）。`isa.rs::dot_lanes` の零埋め固定長バッファによる分岐なし tail（AVX2／AVX-512／NEON。順序保存・既定経路は現行のスカラー tail のまま不変）は [`docs/design/dot-kernel-branchless-tail.md`](docs/design/dot-kernel-branchless-tail.md)（Issue #528。既定切替の採否は Issue #529）。`search_range` の 4 行ブロック（AVX2+FMA／AVX-512F）カーネルの設計・生成コード検査で判明した SLP 再パック問題と対処は [`docs/design/dot-kernel-row-block.md`](docs/design/dot-kernel-row-block.md)（Issue #510。NEON 版は Issue #511・前後比較は Issue #512）
 
 詳細なビヘイビア（106 件・12 領域）は spec リポの [`04-behavior/`](https://github.com/Fandhe-AI/vector-db-spec/tree/main/04-behavior) を唯一の正（SSOT）とします。
 
@@ -222,6 +222,29 @@ bench-hybrid-wire-profile`（`crates/wire-server/benches/
 hybrid_wire_profile_bench.rs`）は同 Issue で `hybrid_rrf` の engine 内 hybrid
 経路／SQL 表層／wire の 3 区分を切り分けます。`BENCH_HYBRID_WIRE_ROUNDS`
 （既定 5・5〜50）でラウンド数を指定できます。
+
+Issue #547 で行数・可視率を opt-in 可変化しました。
+`BENCH_HYBRID_PROFILE_ROWS`（既定 25,000・`1..=100000`）でコーパス行数、
+`BENCH_HYBRID_PROFILE_VISIBLE_RATIO`（既定 `1/1`・`1/<1..=1000>` 形式のみ）で
+可視率を指定できます。可視率の意味は経路で異なります: SQL 段
+（`sql_hybrid`／`sql_dense_knn`／`collect_body_strings`）は RLS の正規経路
+（可視率に満たない行を `Visibility::Private` として投入）で索引の文書数
+そのものが縮小し、直接 API 段（`hybrid_search_cached_index`・
+`sparse_refetch_loop`・`search_within_fetch_k=<k>` 等）は常に全件から
+構築した索引へ可視部分集合だけを渡します（「索引 N ≫ 可視集合」条件を
+直接検証する経路）。#546（`SparseIndex::score_by_postings` のスコア
+アキュムレータ再利用）の前後比較は `scripts/bench_hybrid_profile_ab.sh`
+（`make bench-hybrid-profile-ab`）で行います。`BEFORE_BIN`／`AFTER_BIN` に
+退避済みバイナリの絶対パス、`BEFORE_COMMIT`／`AFTER_COMMIT` にビルド元コミット
+の hash を指定し（`docs/design/benchmark-judgement-policy.md` §3 が要求する
+前後比較の追跡可能性のため必須）、`AB_PAIRS`（既定 5・5 未満は拒否）・
+`AB_ROUNDS`（既定 5・hybrid_profile_bench 自身の受理範囲 5..=50 の外は拒否）で
+交互ペア数・ラウンド数を指定し、N=25,000／100,000 × 可視率 1/1・1/10 の
+4 条件を before→after の順で交互実行します。`--summarize <dir>` で
+`baseline_round_raw`／`baseline_summary`／`reference_band` 行を条件・ペア・
+before/after の実行順に沿ってファイル名付きで一覧表示できます。
+前後比較の実測結果は `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #547」
+節を参照してください。
 
 `cargo run --release -p engine --example feature_bench` は SQL 表層・ベクトル
 検索・RLS を含む 13 フェーズ（`ingest`・`hybrid_rrf`・`vector_knn` 等）を
@@ -498,7 +521,7 @@ BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 
 既定エンジン（brute-force）との前後比較・25k/100k の規模スケーリング実測・参照した外部実装（qdrant・pgvector・usearch）の既定値・損益分岐点についての所見は `docs/design/hnsw-index.md` を参照してください。
 
-HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳）・`make bench-hnsw-compare`（usearch との構築時間・Recall@10・探索レイテンシ比較。L2 正規化コーパス方式を維持）で実測できます。いずれも手動専用ベンチで CI 非配線です。詳細・実測値は `docs/design/hnsw-parallel-build.md` を参照してください。
+HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳・`repair_reachability` 修復統計〔Issue #447〕）・`make bench-hnsw-compare`（usearch との構築時間・Recall@10・探索レイテンシ比較。L2 正規化コーパス方式を維持）で実測できます。いずれも手動専用ベンチで CI 非配線です。詳細・実測値は `docs/design/hnsw-parallel-build.md` を参照してください。
 
 受理判定後 prefetch（Issue #490）の前後比較実測は `make bench-hnsw-search`（`BENCH_HNSW_SEARCH_ROWS`／`BENCH_HNSW_SEARCH_DIM`／`BENCH_HNSW_SEARCH_MASK`〔RLS 事前フィルタ統合の `Subset` 形状を模す可視率〕で 1 規模点を計測し、before/after バイナリを交互起動して比較する手動専用ベンチ）で実施できます。`git archive` で取り出した作業ツリーから before/after バイナリをビルドする再現手順では、ビルド時に `BENCH_HNSW_SEARCH_COMMIT=<sha>` を指定して計測対象コミットをバイナリへ焼き込んでください（未指定時の実行時フォールバックはカレントディレクトリの HEAD を返すため、同一ディレクトリから交互起動する両バイナリに同じ値が記録されます）。CI 非配線・詳細・実測値・採否は `docs/design/hnsw-search.md`「Issue #491」節を参照してください。
 

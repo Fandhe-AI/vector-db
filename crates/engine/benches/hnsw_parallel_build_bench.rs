@@ -61,9 +61,11 @@ use std::time::Duration;
 
 use harness::env_report::EnvReport;
 use harness::hnsw_parallel_profile::{
-    aggregate_lock_blocked_ratio, aggregate_lock_wait, lock_wait_share, measured_tail,
-    min_median_max_duration, min_median_max_u64, parallel_vs_control_ceiling, pick_representative,
-    serial_share, speedup, total_entry_promotions,
+    aggregate_lock_blocked_ratio, aggregate_lock_wait, format_per_level, lock_wait_share,
+    measured_tail, min_median_max_duration, min_median_max_u64, parallel_vs_control_ceiling,
+    pick_representative, repair_phase1_cap_hits, repair_total_phase1_iterations,
+    repair_total_phase2_nodes, repair_total_unreachable, repair_unreachable_per_level_min_med_max,
+    repair_wall_gap, serial_share, speedup, total_entry_promotions,
 };
 use harness::proc_stats::read_vm_rss_kb;
 use harness::protocol::{run, MeasurementConfig};
@@ -524,6 +526,87 @@ fn main() {
                     flatten.as_secs_f64() * 1000.0,
                     wall_median.as_secs_f64() * 1000.0,
                 );
+
+                // Issue #447: repair_reachability の修復対象ノード数・反復回数
+                // （測定標本 `profiles` 横断の集計。ワークスティール起因の
+                // run-to-run 変動そのものが測定対象のため、代表実行 1 件では
+                // なく標本横断の min/med/max を出す——設計「5. ベンチ出力」
+                // 節参照）。threads=1（縮退経路）でも `profile.repair` が
+                // 埋まるため同じ行を出す。
+                {
+                    let per_level = repair_unreachable_per_level_min_med_max(&profiles);
+                    let unreachable_sums: Vec<u64> = profiles
+                        .iter()
+                        .map(|p| repair_total_unreachable(&p.repair))
+                        .collect();
+                    let phase1_iters: Vec<u64> = profiles
+                        .iter()
+                        .map(|p| repair_total_phase1_iterations(&p.repair))
+                        .collect();
+                    let phase2_nodes: Vec<u64> = profiles
+                        .iter()
+                        .map(|p| repair_total_phase2_nodes(&p.repair))
+                        .collect();
+                    let cap_hits: Vec<u64> = profiles
+                        .iter()
+                        .map(|p| repair_phase1_cap_hits(&p.repair))
+                        .collect();
+                    let phase1_wall_only = min_median_max_duration(
+                        &profiles
+                            .iter()
+                            .map(|p| {
+                                p.repair
+                                    .levels
+                                    .iter()
+                                    .map(|l| l.phase1_wall)
+                                    .sum::<Duration>()
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    let phase2_wall_only = min_median_max_duration(
+                        &profiles
+                            .iter()
+                            .map(|p| {
+                                p.repair
+                                    .levels
+                                    .iter()
+                                    .map(|l| l.phase2_wall)
+                                    .sum::<Duration>()
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    let repair_stats_wall = min_median_max_duration(
+                        &profiles.iter().map(|p| p.repair.wall).collect::<Vec<_>>(),
+                    );
+                    let repair_wall_gaps: Vec<Duration> = profiles
+                        .iter()
+                        .filter_map(|p| repair_wall_gap(&p.repair, p.repair_reachability))
+                        .collect();
+
+                    let fmt_mmm = |v: Option<(u64, u64, u64)>| match v {
+                        Some((min, med, max)) => format!("{min}/{med}/{max}"),
+                        None => "n/a".to_string(),
+                    };
+                    let fmt_ms = |v: Option<(Duration, Duration, Duration)>| match v {
+                        Some((_, med, _)) => format!("{:.3}ms", med.as_secs_f64() * 1000.0),
+                        None => "n/a".to_string(),
+                    };
+
+                    println!(
+                        "hnsw_parallel_build: threads={threads} repair_unreachable[per-level min/med/max]={} repair_unreachable_sum[min/med/max]={} repair_phase1_iters[min/med/max]={} repair_phase1_cap_hits[med]={} repair_phase2_nodes[min/med/max]={} repair_phase1_wall[med]={} repair_phase2_wall[med]={} repair_stats_wall[med]={} repair_wall_gap[med]={}",
+                        format_per_level(&per_level),
+                        fmt_mmm(min_median_max_u64(&unreachable_sums)),
+                        fmt_mmm(min_median_max_u64(&phase1_iters)),
+                        min_median_max_u64(&cap_hits)
+                            .map(|(_, med, _)| med.to_string())
+                            .unwrap_or_else(|| "n/a".to_string()),
+                        fmt_mmm(min_median_max_u64(&phase2_nodes)),
+                        fmt_ms(phase1_wall_only),
+                        fmt_ms(phase2_wall_only),
+                        fmt_ms(repair_stats_wall),
+                        fmt_ms(min_median_max_duration(&repair_wall_gaps)),
+                    );
+                }
 
                 if let Some(representative) = pick_representative(&profiles) {
                     let workers = &representative.workers;

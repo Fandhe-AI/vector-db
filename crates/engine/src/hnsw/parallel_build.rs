@@ -777,7 +777,12 @@ pub(crate) fn build_parallel_graph_observed(
     let freeze = freeze_start.elapsed();
 
     let repair_start = Instant::now();
-    builder.repair_reachability(dim_usize, vectors)?;
+    // Issue #447: 観測版 `repair_reachability_observed` を呼び、層別の
+    // 到達不能ノード数・反復回数を `profile.repair` へ格納する。外側の
+    // `repair_start.elapsed()`（`profile.repair_reachability`。既存
+    // フィールド）は従来どおり残す——受け入れ条件「Σ 段別 wall <=
+    // repair.wall <= repair_reachability（誤差内）」の比較対象。
+    let repair = builder.repair_reachability_observed(dim_usize, vectors)?;
     let repair_reachability = repair_start.elapsed();
 
     // 平坦化（CSR 化。Issue #494）は常に最終段——`freeze`（構造的な組み立て）
@@ -799,6 +804,7 @@ pub(crate) fn build_parallel_graph_observed(
         // 検証・エラー分岐を含む呼び出し全体で計測し直して埋める。
         total: std::time::Duration::ZERO,
         workers,
+        repair,
     };
     Ok((index, profile))
 }
@@ -1167,6 +1173,107 @@ mod tests {
                  sequential Recall@10={seq_recall}"
             );
         }
+    }
+
+    /// `profile.repair`（Issue #447）の段別 wall が呼び出し元の外側計測
+    /// （`profile.repair_reachability`）の入れ子区間になっていること、
+    /// 層ごとのカウンタが「反復回数は上限を超えない」「フェーズ 2 が
+    /// 発火した層は必ずフェーズ 1 が上限まで走っている」等の不変条件を
+    /// 満たすことを固定する（受け入れ条件 2）。
+    #[test]
+    fn build_with_threads_observed_repair_stats_are_consistent_with_stage_wall() {
+        let dim = 16usize;
+        let rows = super::super::SEQUENTIAL_PREFIX_NODES + 1_200;
+        let clusters = 20usize;
+        let vectors = gen_clustered_corpus(0xC0FF_EE01, dim, rows, clusters);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 32,
+        };
+        let seed = 0x7788_99AA_BBCC;
+        let threads = 4usize;
+
+        let (observed, profile) =
+            PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, seed, threads)
+                .unwrap();
+
+        let phase_wall_sum: std::time::Duration = profile
+            .repair
+            .levels
+            .iter()
+            .map(|l| l.phase1_wall + l.phase2_wall)
+            .sum();
+        assert!(
+            phase_wall_sum <= profile.repair.wall,
+            "phase_wall_sum={phase_wall_sum:?} repair.wall={:?}",
+            profile.repair.wall
+        );
+        assert!(
+            profile.repair.wall <= profile.repair_reachability,
+            "repair.wall={:?} repair_reachability={:?}",
+            profile.repair.wall,
+            profile.repair_reachability
+        );
+        // タイマー往復分だけの誤差を許容する（絶対 5ms または相対 10% の
+        // 大きい方。CI 高負荷時のフレーキー化を避けるための緩い許容——
+        // 計画書「判断・リスク」節参照）。
+        let gap = profile
+            .repair_reachability
+            .saturating_sub(profile.repair.wall);
+        let tolerance = std::cmp::max(
+            std::time::Duration::from_millis(5),
+            profile.repair_reachability / 10,
+        );
+        assert!(
+            gap <= tolerance,
+            "gap={gap:?} tolerance={tolerance:?} repair_reachability={:?} repair.wall={:?}",
+            profile.repair_reachability,
+            profile.repair.wall
+        );
+
+        assert_eq!(
+            profile.repair.levels.len(),
+            observed.max_level().map(|l| l + 1).unwrap_or(0)
+        );
+        for level_stats in &profile.repair.levels {
+            assert!(level_stats.phase1_iterations as usize <= super::super::PRECISE_REPAIR_CAP);
+            if level_stats.phase2_nodes > 0 {
+                assert!(
+                    level_stats.phase1_cap_hit,
+                    "level={} phase2_nodes>0 だが phase1_cap_hit=false",
+                    level_stats.level
+                );
+            }
+            if level_stats.unreachable_before == 0 {
+                assert_eq!(level_stats.phase1_iterations, 0);
+                assert_eq!(level_stats.phase2_nodes, 0);
+            }
+        }
+    }
+
+    /// 縮退経路（threads=1 基線。Issue #447）では `profile.repair.levels` が
+    /// 非空に埋まる一方、既存フィールド（`repair_reachability`＝ゼロ・
+    /// `workers`＝空）の意味は不変であること、グラフが `build` と完全に
+    /// 一致することを確認する（設計「縮退経路の扱い」節）。
+    #[test]
+    fn build_with_threads_observed_degenerate_path_fills_repair_stats_only() {
+        let dim = 4usize;
+        let rows = 100usize; // < SEQUENTIAL_PREFIX_NODES(256)
+        let vectors = gen_corpus(0xD00D, dim, rows);
+        let params = HnswParams::default();
+        let sequential = PubHnswIndex::build(params, dim as u32, &vectors, 9).unwrap();
+        let (observed, profile) =
+            PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, 9, 4).unwrap();
+
+        assert_eq!(sequential.entry_point(), observed.entry_point());
+        for node in 0..rows as u32 {
+            assert_eq!(sequential.level_of(node), observed.level_of(node));
+        }
+        assert!(profile.workers.is_empty());
+        assert_eq!(profile.repair_reachability, std::time::Duration::ZERO);
+        assert!(!profile.repair.levels.is_empty());
+        assert!(profile.repair.wall <= profile.sequential_prefix);
     }
 
     /// `threads==0`／`threads > MAX_BUILD_THREADS`・非有限値のエラー契約が

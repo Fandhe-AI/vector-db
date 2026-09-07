@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use engine::hnsw::{HnswBuildProfile, HnswWorkerStats};
+use engine::hnsw::{HnswBuildProfile, HnswRepairStats, HnswWorkerStats};
 
 use super::stats;
 
@@ -222,6 +222,108 @@ pub fn pick_representative(profiles: &[HnswBuildProfile]) -> Option<&HnswBuildPr
     let totals: Vec<Duration> = profiles.iter().map(|p| p.total).collect();
     let median = median_duration(&totals)?;
     profiles.iter().min_by_key(|p| p.total.abs_diff(median))
+}
+
+// --------------------------------------------------
+// `repair_reachability` 統計（Issue #447: 修復対象ノード数・反復回数の
+// 観測フックとベンチへの追加）の時間非依存な集計・整形ロジック。
+// --------------------------------------------------
+
+/// [`HnswRepairStats::levels`] の `phase1_wall + phase2_wall` の総和
+/// （層をまたいだ Σ）。[`repair_wall_gap`] が呼び出し元の外側計測
+/// （`HnswBuildProfile::repair_reachability`）との入れ子区間を検証する材料。
+pub fn repair_phase_wall_sum(stats: &HnswRepairStats) -> Duration {
+    stats
+        .levels
+        .iter()
+        .map(|l| l.phase1_wall + l.phase2_wall)
+        .sum()
+}
+
+/// 呼び出し元の外側計測 `outer`（`HnswBuildProfile::repair_reachability`）と
+/// 観測版本体の壁時間 `stats.wall` の差（`outer - stats.wall`）。
+/// `outer < stats.wall` は入れ子区間の整合違反（タイマーの単調性が壊れて
+/// いる・実装のバグ）であり `None` を返す（呼び出し側が fail-closed で
+/// 「整合しない」と報告できるようにする）。
+pub fn repair_wall_gap(stats: &HnswRepairStats, outer: Duration) -> Option<Duration> {
+    outer.checked_sub(stats.wall)
+}
+
+/// 層横断の到達不能ノード数合計（`saturating_add`。層数が `u32::MAX` 級に
+/// なることはない——`MAX_LEVEL`＝32——が、他の合計系関数と同じ防御的な
+/// 演算にそろえる）。
+pub fn repair_total_unreachable(stats: &HnswRepairStats) -> u64 {
+    stats
+        .levels
+        .iter()
+        .fold(0u64, |acc, l| acc.saturating_add(l.unreachable_before))
+}
+
+/// 層横断のフェーズ 1 反復回数合計。
+pub fn repair_total_phase1_iterations(stats: &HnswRepairStats) -> u64 {
+    stats
+        .levels
+        .iter()
+        .fold(0u64, |acc, l| acc.saturating_add(l.phase1_iterations))
+}
+
+/// 層横断のフェーズ 2 結線ノード数合計。
+pub fn repair_total_phase2_nodes(stats: &HnswRepairStats) -> u64 {
+    stats
+        .levels
+        .iter()
+        .fold(0u64, |acc, l| acc.saturating_add(l.phase2_nodes))
+}
+
+/// フェーズ 1 が [`engine::hnsw::PRECISE_REPAIR_CAP`] まで到達した層数
+/// （`phase1_cap_hit == true` の層数）。
+pub fn repair_phase1_cap_hits(stats: &HnswRepairStats) -> u64 {
+    stats.levels.iter().filter(|l| l.phase1_cap_hit).count() as u64
+}
+
+/// 複数の計測標本（[`HnswBuildProfile`]）横断で、層 index ごとの
+/// 到達不能ノード数（`unreachable_before`）の (min, median, max) を返す
+/// （[`min_median_max_u64`] を層ごとに適用する）。標本間で `levels.len()` が
+/// 異なる場合は最大長に揃え、ある標本にその層 index が存在しない場合は
+/// その標本を当該層の集計対象から除外する（`levels.len()` は seed と
+/// ノード数で決まる `max_level+1` のため通常は標本間で一致するが、
+/// 万一の食い違いを「標本なし」として扱い panic・パニックしない
+/// fail-closed な扱いにする）。戻り値は層 index 昇順。
+pub fn repair_unreachable_per_level_min_med_max(
+    profiles: &[HnswBuildProfile],
+) -> Vec<(usize, (u64, u64, u64))> {
+    let max_levels = profiles
+        .iter()
+        .map(|p| p.repair.levels.len())
+        .max()
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(max_levels);
+    for level in 0..max_levels {
+        let values: Vec<u64> = profiles
+            .iter()
+            .filter_map(|p| p.repair.levels.get(level))
+            .map(|l| l.unreachable_before)
+            .collect();
+        if let Some(mmm) = min_median_max_u64(&values) {
+            out.push((level, mmm));
+        }
+    }
+    out
+}
+
+/// [`repair_unreachable_per_level_min_med_max`] の結果をベンチ出力の 1 行に
+/// 埋め込む短い形式（`[L0:min/med/max,L1:min/med/max,...]`）へ整形する。
+/// 空スライスは `"[]"`。
+pub fn format_per_level(per_level: &[(usize, (u64, u64, u64))]) -> String {
+    if per_level.is_empty() {
+        return "[]".to_string();
+    }
+    let body = per_level
+        .iter()
+        .map(|(level, (min, med, max))| format!("L{level}:{min}/{med}/{max}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
 }
 
 /// 各 threads 点で 1 回だけ構築した [`engine::hnsw::HnswIndex`] を保持したまま

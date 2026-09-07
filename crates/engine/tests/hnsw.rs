@@ -565,6 +565,87 @@ fn graph_fingerprint_is_stable_across_representation_change() {
     );
 }
 
+/// `repair_reachability` の観測統計（Issue #447）が非 vacuous であることを、
+/// フェーズ 2（片方向チェーン結線）が確実に発火する重複ヘビーコーパス
+/// （`gen_duplicate_heavy_corpus`。完全同点スコアを誘発しフェーズ 1 の
+/// `PRECISE_REPAIR_CAP` を使い切りやすい）で固定する。`tests/hnsw.rs` の
+/// 既存流儀（crate 外の公開 API のみ）に従い `build_with_threads_observed`
+/// （`threads=1` の縮退経路。`profile.repair` のみを埋める設計。
+/// `HnswIndex::build_with_threads_observed` のドキュメンテーションコメント
+/// 参照）経由で観測する。
+#[test]
+fn repair_stats_on_duplicate_heavy_corpus_report_phase2_nodes() {
+    let dim = 12usize;
+    let rows = 400usize;
+    let clusters = 5usize;
+    let vectors = gen_duplicate_heavy_corpus(0x5EED_0001, dim, rows, clusters);
+    let params = HnswParams::default()
+        .with_m(6)
+        .with_ef_construction(32)
+        .with_ef_search(16);
+
+    let (index, profile) =
+        HnswIndex::build_with_threads_observed(params, dim as u32, &vectors, 0x5EED_0001, 1)
+            .expect("build should succeed");
+
+    assert_degree_and_wellformed_invariants(&index);
+    assert_fully_connected_from_entry(&index);
+
+    let phase2_total: u64 = profile.repair.levels.iter().map(|l| l.phase2_nodes).sum();
+    let cap_hits_total: u64 = profile
+        .repair
+        .levels
+        .iter()
+        .filter(|l| l.phase1_cap_hit)
+        .count() as u64;
+    assert!(
+        phase2_total > 0,
+        "duplicate-heavy corpus should force phase 2 chain-linking to fire at least once"
+    );
+    assert!(
+        cap_hits_total > 0,
+        "duplicate-heavy corpus should exhaust PRECISE_REPAIR_CAP on at least one level"
+    );
+}
+
+/// 同一 seed・同一入力で 2 回構築した場合、`repair` 統計のカウンタ系
+/// フィールド（`wall` 系の壁時間を除く）が完全に一致することを固定する
+/// （逐次経路は完全決定的。`docs/design/hnsw-parallel-build.md` の並列経路
+/// 非決定性契約とは無関係）。
+#[test]
+fn repair_stats_are_deterministic_on_sequential_path() {
+    let dim = 12usize;
+    let rows = 400usize;
+    let clusters = 5usize;
+    let vectors = gen_duplicate_heavy_corpus(0x5EED_0002, dim, rows, clusters);
+    let params = HnswParams::default()
+        .with_m(6)
+        .with_ef_construction(32)
+        .with_ef_search(16);
+
+    let (_, profile_a) =
+        HnswIndex::build_with_threads_observed(params, dim as u32, &vectors, 0x5EED_0002, 1)
+            .expect("build should succeed");
+    let (_, profile_b) =
+        HnswIndex::build_with_threads_observed(params, dim as u32, &vectors, 0x5EED_0002, 1)
+            .expect("build should succeed");
+
+    assert_eq!(profile_a.repair.levels.len(), profile_b.repair.levels.len());
+    for (a, b) in profile_a
+        .repair
+        .levels
+        .iter()
+        .zip(profile_b.repair.levels.iter())
+    {
+        assert_eq!(a.level, b.level);
+        assert_eq!(a.unreachable_before, b.unreachable_before);
+        assert_eq!(a.phase1_iterations, b.phase1_iterations);
+        assert_eq!(a.phase1_cap_hit, b.phase1_cap_hit);
+        assert_eq!(a.phase2_nodes, b.phase2_nodes);
+        assert_eq!(a.phase2_entry_relinked, b.phase2_entry_relinked);
+    }
+}
+
 /// HNSW 構築の並列化（Issue #406）の不変条件テスト。要素単位 `RwLock`・
 /// エントリポイント更新のみ排他という設計が、逐次構築と同じ次数上限・
 /// 連結性・レベル割当を維持することを検証する（実装計画 §6.2）。
