@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use engine::hnsw::{
-    HnswError, HnswIndex, HnswParams, HnswSearchScratch, MAX_EF, SEQUENTIAL_PREFIX_NODES,
+    HnswError, HnswIndex, HnswParams, HnswSearchScratch, NodeMask, MAX_EF, SEQUENTIAL_PREFIX_NODES,
 };
 use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
 
@@ -542,4 +542,57 @@ fn search_on_parallel_built_index_is_deterministic_across_repeated_calls() {
     let mut fresh_scratch = HnswSearchScratch::default();
     let with_fresh_scratch = index.search(&query, 10, 64, &mut fresh_scratch).unwrap();
     assert_eq!(first, with_fresh_scratch);
+}
+
+/// Issue #497: 公開 API 経由でも `HnswIndex::search_masked_with` の
+/// `sparse_visited_max` opt-in（`VisitedSet` の疎な実装への切替）が結果へ
+/// 一切影響しないことを固定する（crate 外の公開 API のみで検証する `tests/*.rs`
+/// の流儀に従い、`crates/engine/src/hnsw.rs` 内 `#[cfg(test)] mod tests` の
+/// `search_masked_with_force_sparse_matches_force_dense_bit_identical` を
+/// 公開 API 側から補完する）。
+#[test]
+fn search_masked_with_sparse_visited_max_does_not_change_results() {
+    let (_, index) = small_index();
+    let dim = 8;
+    let query = gen_query(0x9999_0000, 0xBBBB_2222, dim, 8);
+
+    let mut mask = NodeMask::new(index.len());
+    for node in 0..index.len() {
+        if node % 4 == 0 {
+            mask.set(node as u32);
+        }
+    }
+
+    let mut scratch_dense = HnswSearchScratch::default();
+    let via_dense = index
+        .search_masked_with(&query, 10, 64, Some(&mask), 0, &mut scratch_dense)
+        .unwrap();
+
+    let mut scratch_sparse = HnswSearchScratch::default();
+    let via_sparse = index
+        .search_masked_with(&query, 10, 64, Some(&mask), usize::MAX, &mut scratch_sparse)
+        .unwrap();
+
+    assert_eq!(
+        via_dense, via_sparse,
+        "sparse_visited_max opt-in must not change search_masked_with results"
+    );
+
+    // `mask == None` は `sparse_visited_max` の値に関わらず `search` と
+    // ビット同一（`HnswIndex::search_masked_with` ドキュメンテーションコメント
+    // 参照）。
+    let mut scratch_plain = HnswSearchScratch::default();
+    let via_plain = index.search(&query, 10, 64, &mut scratch_plain).unwrap();
+    let mut scratch_none_mask_forced_sparse = HnswSearchScratch::default();
+    let via_none_mask_forced_sparse = index
+        .search_masked_with(
+            &query,
+            10,
+            64,
+            None,
+            usize::MAX,
+            &mut scratch_none_mask_forced_sparse,
+        )
+        .unwrap();
+    assert_eq!(via_plain, via_none_mask_forced_sparse);
 }

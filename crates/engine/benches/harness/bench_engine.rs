@@ -229,6 +229,26 @@ pub fn parse_full_scan_ratio(raw: Option<&str>) -> Result<Option<(u32, u32)>, Be
     Ok(Some((numerator, denominator)))
 }
 
+/// `BENCH_KNN_PROFILE_SPARSE_VISITED_MAX` から `crate::hnsw::ValidatedHnswParams::
+/// with_sparse_visited_max` へ渡す `usize` を読む（Issue #497。#498 の可視比率別
+/// before/after 計測が使う knob）。`None` は既定値（`DEFAULT_SPARSE_VISITED_MAX`
+/// = 0＝常に dense）を使うことを表す。受理形状は非負整数（`usize` として
+/// 妥当な範囲）——`parse_full_scan_ratio` と同じ fail-closed 方針（本モジュールは
+/// `engine::` を import しない契約のため、`usize` へのパースそのものが唯一の
+/// 検証であり `ValidatedHnswParams` 側の追加検証は無い——`with_sparse_visited_max`
+/// は infallible）。
+pub fn parse_sparse_visited_max(raw: Option<&str>) -> Result<Option<usize>, BenchEngineError> {
+    let trimmed = raw.map(str::trim);
+    let s = match trimmed {
+        None | Some("") => return Ok(None),
+        Some(s) => s,
+    };
+    let value: usize = s
+        .parse()
+        .map_err(|_| err(format!("must be a non-negative integer (got {s:?})")))?;
+    Ok(Some(value))
+}
+
 /// `knn_profile_bench.rs` のスイープが、`sql::hnsw_cache::search_with_overlay`
 /// の整数比較（`visible * den < index_len * num` なら plain scan）を、計測前に
 /// 「この (可視行数, 索引ノード数, full_scan_ratio) では ANN と plain scan の

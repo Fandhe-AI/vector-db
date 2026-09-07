@@ -709,7 +709,7 @@ fn explain_reports_hnsw_engine_params_and_full_visible_ann_plan_without_filter()
     assert_eq!(lines[lines.len() - 4], "engine: hnsw");
     assert_eq!(
         lines[lines.len() - 3],
-        "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32"
+        "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0"
     );
     assert_eq!(lines[lines.len() - 2], "ann_plan: hnsw_full_visible");
     assert_eq!(lines[lines.len() - 1], "scalar_plan: plain_scan");
@@ -932,7 +932,10 @@ fn explain_new_rows_use_closed_vocabulary_and_default_hnsw_params() {
     let hnsw_params_line = lines.iter().find(|l| l.starts_with("hnsw_params: "));
     assert_eq!(
         hnsw_params_line,
-        Some(&"hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32".to_string()),
+        Some(
+            &"hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0"
+                .to_string()
+        ),
         "default HnswParams must round-trip exactly through EXPLAIN"
     );
     let scalar_plan_line = lines

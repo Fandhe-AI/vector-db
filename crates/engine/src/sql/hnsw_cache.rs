@@ -168,6 +168,15 @@ pub struct HnswIndexCacheStats {
     /// f16 の有限範囲（`|x| <= 65504.0`）を超える成分により `F32` へ自動縮退した
     /// 回数（Issue #514・D6。`builds` の内数）。
     pub f16_residency_fallbacks: u64,
+    /// マスク付き探索（`FullVisible`／`Subset` いずれの形状でも。
+    /// [`crate::hnsw::HnswIndex::search_masked_with`]）が縮退なしで完走した際、
+    /// 可視候補数が `ValidatedHnswParams::sparse_visited_max` 未満で
+    /// [`crate::hnsw::VisitedSparse`]（`HashSet<u32>`）を選んだ回数（Issue #497。
+    /// `hits`／`subset_searches` とは独立に数える診断用カウンタで、初回構築を
+    /// 伴う呼び出し（`OverlaySuccessStat::None`）も計上に含むため両者の合計を
+    /// 上回りうる。テナント境界・可視カーディナリティ・索引ノード数等のテナント
+    /// 存在情報には繋がらない——採否のみを数える）。
+    pub sparse_visited_searches: u64,
     /// 現在キャッシュが保持しているエントリ数。
     pub entries: usize,
 }
@@ -517,6 +526,7 @@ pub(crate) struct HnswIndexCache {
     hybrid_queries: AtomicU64,
     hybrid_rounds_max: AtomicU64,
     f16_residency_fallbacks: AtomicU64,
+    sparse_visited_searches: AtomicU64,
 }
 
 /// [`HnswIndexCache::lookup`] の結果。
@@ -553,6 +563,7 @@ impl HnswIndexCache {
             hybrid_queries: AtomicU64::new(0),
             hybrid_rounds_max: AtomicU64::new(0),
             f16_residency_fallbacks: AtomicU64::new(0),
+            sparse_visited_searches: AtomicU64::new(0),
         }
     }
 
@@ -860,6 +871,7 @@ impl HnswIndexCache {
             hybrid_queries: self.hybrid_queries.load(Ordering::Relaxed),
             hybrid_rounds_max: self.hybrid_rounds_max.load(Ordering::Relaxed),
             f16_residency_fallbacks: self.f16_residency_fallbacks.load(Ordering::Relaxed),
+            sparse_visited_searches: self.sparse_visited_searches.load(Ordering::Relaxed),
             entries,
         }
     }
@@ -1523,10 +1535,23 @@ fn search_with_overlay(
     }
 
     let ef = access.provider.effective_ef(k);
-    let index_hits = SEARCH_SCRATCH.with(|scratch| {
+    // visited 集合の切替（Issue #497）: `access.provider.sparse_visited_max()`
+    // は構築時の静的設定値（既定 0＝常に dense）を `HnswIndex::search_masked_with`
+    // へそのまま渡す。選ばれた実装は `scratch.last_visited_kind()` から読み、
+    // 縮退なしで完走した場合のみ `sparse_visited_searches` へ計上する
+    // （下の `masked_short`／`arena_identity_mismatch_guard` 等の縮退判定より
+    // 後段で計上するため、クロージャ内で `Option<VisitedKind>` を一緒に返す）。
+    let (index_hits, visited_kind) = SEARCH_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        base.index
-            .search_masked(query, k, ef, Some(&overlay.visible_mask), &mut scratch)
+        let result = base.index.search_masked_with(
+            query,
+            k,
+            ef,
+            Some(&overlay.visible_mask),
+            access.provider.sparse_visited_max(),
+            &mut scratch,
+        );
+        (result, scratch.last_visited_kind())
     });
     let index_hits = match index_hits {
         Ok(hits) => hits,
@@ -1612,6 +1637,14 @@ fn search_with_overlay(
             access.cache.subset_searches.fetch_add(1, Ordering::Relaxed);
         }
         OverlaySuccessStat::None => {}
+    }
+    // 縮退なしで完走した場合のみ、実際に選ばれた visited 実装を計上する
+    // （Issue #497）。`hits`／`subset_searches` とは独立に数える診断用カウンタ。
+    if visited_kind == Some(crate::hnsw::VisitedKind::Sparse) {
+        access
+            .cache
+            .sparse_visited_searches
+            .fetch_add(1, Ordering::Relaxed);
     }
     Ok(mapped)
 }
