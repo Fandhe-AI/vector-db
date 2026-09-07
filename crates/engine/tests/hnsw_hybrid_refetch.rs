@@ -157,6 +157,19 @@ fn run_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic(
             "this corpus's embeddings must stay within the f16 finite range"
         );
     }
+    // Issue #506: fix `923efcf`（候補復帰ループの走査対象を `discarded` 限定→
+    // `merged` 全体へ拡張）後、同点誘発コーパスでも `HnswDenseProvider` の
+    // 再開型探索（`sql::hnsw_hybrid`。Issue #505）が SQL 表層経由で実際に
+    // 複数回再開することを固定する（非 vacuous）。この値が 0 のままだと、
+    // 「毎ラウンド `search_prepared` を新規実行する」経路へ静かに縮退した
+    // まま気づけない——`hybrid_rounds_max >= 2`（上記）で複数ラウンド自体は
+    // 固定済みだが、それが再開型か毎回新規実行かまでは区別できないため。
+    assert!(
+        stats.hybrid_resumed_rounds >= 1,
+        "the resumable refetch path (Issue #505) must actually engage on this \
+         tie-inducing corpus (got hybrid_resumed_rounds={})",
+        stats.hybrid_resumed_rounds
+    );
 }
 
 #[test]

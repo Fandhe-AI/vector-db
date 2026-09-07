@@ -308,11 +308,19 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-hybrid
-bench-hybrid: ## Issue #324（境界同点グループ再取得ループ〔Issue #320〕のレイテンシ影響計測。CORE-7・PLAN-4/6/7 関連ポインタ）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+bench-hybrid: ## Issue #324（境界同点グループ再取得ループ〔Issue #320〕のレイテンシ影響計測。CORE-7・PLAN-4/6/7 関連ポインタ）＋ Issue #506（BENCH_HYBRID_LATENCY_ENGINE 設定時は SQL 表層〔hnsw opt-in〕計測モードへ切替。既定〔未設定〕モードの出力は不変）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_HYBRID_LATENCY_ENGINE=brute_force|hnsw|hnsw_f16 で SQL 表層モードを起動（未設定時は既定の in-build 比較モード）。BENCH_HYBRID_LATENCY_SCALE=small|large|all（既定 all）・BENCH_HYBRID_LATENCY_CORPUS=no_refetch|tie_refetch|all（既定 all）・BENCH_HYBRID_LATENCY_NUM_DOCS／_DIM／_VOCAB_SIZE／_QUANTIZE_LEVELS（既定はスケール別定数）・BENCH_HYBRID_LATENCY_EXPECT_RESUMED=1（tie_refetch の after 側計測にのみ指定。hybrid_resumed_rounds が 0 なら非 0 終了）
 ifdef HAS_CARGO
 	cargo bench --bench hybrid_latency_bench -p engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-hybrid をスキップ"
+endif
+
+.PHONY: bench-hybrid-ab
+bench-hybrid-ab: ## Issue #506: 再開型探索（Issue #505・sql::hnsw_hybrid::HnswDenseProvider）の前後比較を ref_bf_large_tie5・hnsw_large_uniform・hnsw_large_tie5・hnsw_410shape_tie2 の 4 条件で交互 min-of-N 計測する（BEFORE_BIN・AFTER_BIN に退避済みバイナリの絶対パス、BEFORE_COMMIT・AFTER_COMMIT にビルド元コミットの hash を指定。AB_PAIRS（既定 5・5 未満は拒否）で交互ペア数を指定可。手動実行専用・CI 非配線。scripts/bench_hybrid_latency_ab.sh 参照）
+ifdef HAS_CARGO
+	scripts/bench_hybrid_latency_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hybrid-ab をスキップ"
 endif
 
 .PHONY: bench-parse-bind

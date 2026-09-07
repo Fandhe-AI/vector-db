@@ -125,6 +125,12 @@ pub struct AnnStats {
     /// F16 常駐要求時に範囲外成分（`|x| > 65504.0`）で F32 常駐へ自動縮退した
     /// 回数（`builds` の内数。D6・Issue #514・#515）。
     pub f16_residency_fallbacks: u64,
+    /// hybrid 密側再取得ループが再開型探索（`sql::hnsw_hybrid::
+    /// HnswDenseProvider`。Issue #505）で実際に前ラウンドの状態を再開した
+    /// 回数（Issue #506。Recall ゲート run で「再開型経路が実際に通った」
+    /// ことを `RECALL_VERBOSE=1` 出力から確認できるようにする診断用カウンタ。
+    /// テナント ID・行 ID・スコアは含まない）。
+    pub hybrid_resumed_rounds: u64,
 }
 
 /// SQL 表層（`EngineCore::execute_sql`）経由で hybrid クエリを発行するための
@@ -236,6 +242,7 @@ impl SqlHybridFixture {
             ef_cap_fallbacks: s.ef_cap_fallbacks,
             entries: s.entries,
             f16_residency_fallbacks: s.f16_residency_fallbacks,
+            hybrid_resumed_rounds: s.hybrid_resumed_rounds,
         }
     }
 

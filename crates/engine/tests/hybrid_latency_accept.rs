@@ -16,9 +16,12 @@
 #[path = "../benches/harness/mod.rs"]
 mod harness;
 
+use harness::bench_engine::BenchEngine;
 use harness::hybrid_latency::{
-    aggregate_refetch_stats, generate_corpus, generate_query, refuse_under_github_actions,
-    render_stage_line, summarize_refetch_stats, HybridLatencyError, RefetchStats,
+    aggregate_refetch_stats, check_ann_non_vacuous, extract_counter, generate_corpus,
+    generate_query, parse_bounded_usize, parse_corpus_selection, parse_scale_selection,
+    refuse_under_github_actions, render_ann_stage_line, render_stage_line, summarize_refetch_stats,
+    AnnRoundStats, HybridLatencyError, LatencyCorpusKind, LatencyScale, RefetchStats,
 };
 
 // --- generate_corpus: 決定性・上限検証 ---
@@ -241,4 +244,254 @@ fn render_stage_line_includes_measured_values() {
     assert!(line.contains("provider_calls_max=3"));
     assert!(line.contains("max_k_across_queries=150"));
     assert!(line.contains("reached_visible_set=0/1"));
+}
+
+// --- SQL 表層（hnsw opt-in）計測モードの契約テスト（Issue #506） ---
+
+// extract_counter: Debug 文字列越しの薄いパーサ。
+
+#[test]
+fn extract_counter_reads_matching_field() {
+    let debug = "HnswIndexCacheStats { hits: 3, hybrid_resumed_rounds: 42, entries: 1 }";
+    assert_eq!(extract_counter(debug, "hybrid_resumed_rounds"), Some(42));
+}
+
+#[test]
+fn extract_counter_reads_zero() {
+    let debug = "S { hybrid_resumed_rounds: 0 }";
+    assert_eq!(extract_counter(debug, "hybrid_resumed_rounds"), Some(0));
+}
+
+#[test]
+fn extract_counter_returns_none_when_field_absent() {
+    // `838c53e`（Issue #505 未マージのツリー）の Debug 出力を模す:
+    // `hybrid_resumed_rounds` フィールド自体が存在しない。
+    let debug = "HnswIndexCacheStats { hits: 3, entries: 1 }";
+    assert_eq!(extract_counter(debug, "hybrid_resumed_rounds"), None);
+}
+
+#[test]
+fn extract_counter_returns_none_on_malformed_value() {
+    let debug = "S { hybrid_resumed_rounds: abc }";
+    assert_eq!(extract_counter(debug, "hybrid_resumed_rounds"), None);
+}
+
+#[test]
+fn extract_counter_does_not_confuse_prefix_field_names() {
+    // `hybrid_dense_searches` は `hybrid_resumed_rounds` の探索対象ではない
+    // ため誤って拾わないことを固定する。
+    let debug = "S { hybrid_dense_searches: 7 }";
+    assert_eq!(extract_counter(debug, "hybrid_resumed_rounds"), None);
+}
+
+// --- parse_scale_selection / parse_corpus_selection ---
+
+#[test]
+fn parse_scale_selection_defaults_to_both() {
+    assert_eq!(
+        parse_scale_selection(None).expect("ok"),
+        vec![LatencyScale::Small, LatencyScale::Large]
+    );
+    assert_eq!(
+        parse_scale_selection(Some("")).expect("ok"),
+        vec![LatencyScale::Small, LatencyScale::Large]
+    );
+    assert_eq!(
+        parse_scale_selection(Some("all")).expect("ok"),
+        vec![LatencyScale::Small, LatencyScale::Large]
+    );
+}
+
+#[test]
+fn parse_scale_selection_accepts_single_values() {
+    assert_eq!(
+        parse_scale_selection(Some("small")).expect("ok"),
+        vec![LatencyScale::Small]
+    );
+    assert_eq!(
+        parse_scale_selection(Some("large")).expect("ok"),
+        vec![LatencyScale::Large]
+    );
+}
+
+#[test]
+fn parse_scale_selection_rejects_unknown_values() {
+    assert!(parse_scale_selection(Some("huge")).is_err());
+}
+
+#[test]
+fn parse_corpus_selection_defaults_to_both() {
+    assert_eq!(
+        parse_corpus_selection(None).expect("ok"),
+        vec![LatencyCorpusKind::NoRefetch, LatencyCorpusKind::TieRefetch]
+    );
+}
+
+#[test]
+fn parse_corpus_selection_accepts_single_values() {
+    assert_eq!(
+        parse_corpus_selection(Some("no_refetch")).expect("ok"),
+        vec![LatencyCorpusKind::NoRefetch]
+    );
+    assert_eq!(
+        parse_corpus_selection(Some("tie_refetch")).expect("ok"),
+        vec![LatencyCorpusKind::TieRefetch]
+    );
+}
+
+#[test]
+fn parse_corpus_selection_rejects_unknown_values() {
+    assert!(parse_corpus_selection(Some("weird")).is_err());
+}
+
+// --- parse_bounded_usize ---
+
+#[test]
+fn parse_bounded_usize_uses_default_when_unset() {
+    assert_eq!(
+        parse_bounded_usize(None, 32, 1, 4096, "DIM").expect("ok"),
+        32
+    );
+    assert_eq!(
+        parse_bounded_usize(Some(""), 32, 1, 4096, "DIM").expect("ok"),
+        32
+    );
+}
+
+#[test]
+fn parse_bounded_usize_accepts_value_in_range() {
+    assert_eq!(
+        parse_bounded_usize(Some("16"), 32, 1, 4096, "DIM").expect("ok"),
+        16
+    );
+}
+
+#[test]
+fn parse_bounded_usize_rejects_out_of_range() {
+    assert!(parse_bounded_usize(Some("0"), 32, 1, 4096, "DIM").is_err());
+    assert!(parse_bounded_usize(Some("5000"), 32, 1, 4096, "DIM").is_err());
+}
+
+#[test]
+fn parse_bounded_usize_rejects_non_numeric() {
+    assert!(parse_bounded_usize(Some("abc"), 32, 1, 4096, "DIM").is_err());
+}
+
+// --- render_ann_stage_line: 実測値・engine トークンを必ず含む ---
+
+#[test]
+fn render_ann_stage_line_includes_measured_values_and_resumed_rounds() {
+    let stats = AnnRoundStats {
+        builds: 1,
+        build_failures: 0,
+        hybrid_dense_searches: 240,
+        hybrid_rounds_max: 4,
+        masked_short: 0,
+        fallbacks: 0,
+        ef_cap_fallbacks: 0,
+        f16_residency_fallbacks: 0,
+        hybrid_resumed_rounds: Some(180),
+    };
+    let line = render_ann_stage_line(
+        "sql_large_tie_refetch",
+        BenchEngine::Hnsw,
+        1360,
+        1382,
+        stats,
+    );
+    assert!(line.contains("stage=sql_large_tie_refetch"));
+    assert!(line.contains("engine=hnsw"));
+    assert!(line.contains("p95_us=1382"));
+    assert!(line.contains("median_us=1360"));
+    assert!(line.contains("hybrid_dense_searches=240"));
+    assert!(line.contains("hybrid_rounds_max=4"));
+    assert!(line.contains("masked_short=0"));
+    assert!(line.contains("hybrid_resumed_rounds=180"));
+}
+
+#[test]
+fn render_ann_stage_line_shows_na_when_resumed_rounds_unavailable() {
+    let stats = AnnRoundStats {
+        builds: 1,
+        ..Default::default()
+    };
+    let line = render_ann_stage_line("stage", BenchEngine::Hnsw, 0, 0, stats);
+    assert!(line.contains("hybrid_resumed_rounds=n/a"));
+}
+
+// --- check_ann_non_vacuous ---
+
+#[test]
+fn check_ann_non_vacuous_rejects_zero_builds() {
+    let stats = AnnRoundStats::default();
+    let err = check_ann_non_vacuous(stats, false).unwrap_err();
+    assert!(matches!(err, HybridLatencyError::VacuousAnnMeasurement(_)));
+}
+
+#[test]
+fn check_ann_non_vacuous_rejects_build_failures() {
+    let stats = AnnRoundStats {
+        builds: 1,
+        build_failures: 1,
+        hybrid_dense_searches: 1,
+        ..Default::default()
+    };
+    assert!(check_ann_non_vacuous(stats, false).is_err());
+}
+
+#[test]
+fn check_ann_non_vacuous_rejects_zero_dense_searches() {
+    let stats = AnnRoundStats {
+        builds: 1,
+        ..Default::default()
+    };
+    assert!(check_ann_non_vacuous(stats, false).is_err());
+}
+
+#[test]
+fn check_ann_non_vacuous_passes_without_resumed_requirement() {
+    let stats = AnnRoundStats {
+        builds: 1,
+        hybrid_dense_searches: 1,
+        hybrid_resumed_rounds: Some(0),
+        ..Default::default()
+    };
+    assert!(check_ann_non_vacuous(stats, false).is_ok());
+}
+
+#[test]
+fn check_ann_non_vacuous_rejects_zero_resumed_rounds_when_expected() {
+    let stats = AnnRoundStats {
+        builds: 1,
+        hybrid_dense_searches: 1,
+        hybrid_resumed_rounds: Some(0),
+        ..Default::default()
+    };
+    assert!(check_ann_non_vacuous(stats, true).is_err());
+}
+
+#[test]
+fn check_ann_non_vacuous_rejects_missing_resumed_rounds_field_when_expected() {
+    // before ツリー（`838c53e`）を模す: フィールド自体が存在しないため
+    // `extract_counter` は常に `None` を返す。`EXPECT_RESUMED=1` を before
+    // バイナリへ渡すのは呼び出し側の誤りであり fail-closed で拒否する。
+    let stats = AnnRoundStats {
+        builds: 1,
+        hybrid_dense_searches: 1,
+        hybrid_resumed_rounds: None,
+        ..Default::default()
+    };
+    assert!(check_ann_non_vacuous(stats, true).is_err());
+}
+
+#[test]
+fn check_ann_non_vacuous_passes_when_resumed_rounds_positive_and_expected() {
+    let stats = AnnRoundStats {
+        builds: 1,
+        hybrid_dense_searches: 240,
+        hybrid_rounds_max: 4,
+        hybrid_resumed_rounds: Some(180),
+        ..Default::default()
+    };
+    assert!(check_ann_non_vacuous(stats, true).is_ok());
 }
