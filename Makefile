@@ -565,6 +565,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため bench-hnsw-compare をスキップ"
 endif
 
+.PHONY: bench-hnsw-phase3-ab
+bench-hnsw-phase3-ab: ## Issue #507: Phase 3（#458 ツリー・ルート #455。ANN／HNSW の構築並列化・探索メモリ局所性・フィルタ付き探索 #489〜#503）の通し前後比較を bench-knn-profile・bench-hnsw-compare・feature_bench の 3 ワークロードで交互 min-of-N 計測する（BEFORE_*_BIN／AFTER_*_BIN に退避済みバイナリの絶対パス、BEFORE_COMMIT／AFTER_COMMIT にビルド元コミットの hash を指定。AB_PAIRS〔既定 5・5..=50〕・AB_WORKLOADS〔既定 "knn_profile hnsw_compare feature_1"。"feature_4" は opt-in〕で交互ペア数・対象ワークロードを指定可。手動実行専用・CI 非配線。scripts/bench_hnsw_phase3_ab.sh 参照）
+ifdef HAS_CARGO
+	scripts/bench_hnsw_phase3_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hnsw-phase3-ab をスキップ"
+endif
+
 .PHONY: bench-hnsw-search
 bench-hnsw-search: ## Issue #491（受理判定後 prefetch〔Issue #490・PR #574〕の前後比較実測）の 1 規模点計測を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。before/after バイナリを交互起動する前後比較・8 点〔10k／100k・dim 128／768・マスク有無〕の判定は運用者が行う。BENCH_HNSW_SEARCH_ROWS〔既定 10000・1..=200000〕・BENCH_HNSW_SEARCH_DIM〔既定 128・1..=4096〕・BENCH_HNSW_SEARCH_MASK〔既定 none・1..=99 の可視率%〕・BENCH_HNSW_SEARCH_QUERIES〔既定 200〕・BENCH_HNSW_SEARCH_EF〔既定 64〕・BENCH_HNSW_SEARCH_K〔既定 10〕・BENCH_DEDICATED_ENV=1 で専有環境自己申告・BENCH_HNSW_SEARCH_COMMIT〔ビルド時指定。git archive 再現手順で before/after バイナリへ計測対象コミットを焼き込むため必須。詳細は docs/design/hnsw-search.md「再現方法」節参照〕・BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX〔Issue #498。dense=0／sparse=18446744073709551615 の 2 arm のみ。`--features bench-internals` が必須——`make bench-hnsw-search-visited` を使う〕を指定できる）
 ifdef HAS_CARGO
