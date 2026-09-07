@@ -372,8 +372,9 @@ Issue #522 でクエリ側二重量子化＋整数 i8×i8 dot カーネル
 理由づけ）。本節は Issue #515 と同型に次の 2 点を固定する:
 
 - 3 つの Recall ゲート層 B を I8 常駐でも **同一閾値** のまま通過できること
-- `tests/hnsw_cache.rs` 系の「既定エンジン対照 Recall@10 ≥ 0.9・可視外
-  非混入」を I8 常駐でも固定すること
+- `tests/hnsw_cache.rs` 系の「既定エンジン対照 Recall@10・可視外非混入」を
+  I8 常駐でも固定すること（下限は精度別に異なり、F32／F16 は 0.9、I8 は
+  `min_recall_for` により 0.8。詳細は後述の可視外非混入テスト節参照）
 
 加えて、`tests/hnsw_i8_recall.rs`（brute-force 対照 `ef` 掃引）の実測で
 i8 の候補生成が f16 より明確に大きい探索順序ノイズを持つことが判明した
@@ -487,7 +488,8 @@ R4（テナント境界）・hybrid 密側再取得ループ・Rust API 検索�
 `sq8.rs::fit_dim_params_rejects_scale_that_underflows_to_zero` と同じ値）
 へ揃え、`i8_residency_fallbacks == 1`（D6 縮退が実際に 1 回発生）・
 `resident=i8`（静的な opt-in 設定自体は取り消されない）・tenant-b
-（Private）の可視外非混入・既定エンジン対照 Recall@10 ≥ 0.9 を固定する
+（Private）の可視外非混入・既定エンジン対照 Recall@10 ≥ 0.8（I8 の
+`min_recall_for` 下限。`crates/engine/tests/hnsw_cache.rs`）を固定する
 （f16 版は 1 成分だけを範囲外にするのに対し、I8 は次元ごとスケールが
 全行にわたる列全体の統計のため、次元 1 本を丸ごとアンダーフローさせる
 必要がある点が f16 版と異なる）。

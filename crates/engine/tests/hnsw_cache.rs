@@ -1404,9 +1404,10 @@ fn run_full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenan
         total_hits += got.iter().filter(|id| want_set.contains(id)).count();
     }
     let recall = total_hits as f64 / (QUERIES * K) as f64;
+    let min_recall = min_recall_for(precision);
     assert!(
-        recall >= 0.9,
-        "ANN-side (ratio >= threshold) recall@{K} against default engine must be >= 0.9 (got {recall})"
+        recall >= min_recall,
+        "ANN-side (ratio >= threshold) recall@{K} against default engine must be >= {min_recall} (got {recall})"
     );
 
     let stats = core.hnsw_index_cache_stats();
