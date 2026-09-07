@@ -449,9 +449,12 @@ impl SqlArenaCaptureBuilder {
     }
 
     /// 容量超過・確保失敗により、これ以上行を蓄積できなくなったか
-    /// （[`Self::finish`] が `None` を返すことが確定した状態か）。`#[cfg(test)]`
-    /// 専用（本番経路は [`Self::finish`] の `None` 判定のみで十分なため）。
-    #[cfg(test)]
+    /// （[`Self::finish`] が `None` を返すことが確定した状態か）。`failed` に
+    /// 一度でも遷移すると [`Self::push`] は即座に no-op へ縮退するため、以降の
+    /// 呼び出しは安価だが、呼び出し元が本メソッドで早期に検知して残り行の
+    /// デコード自体を打ち切ることで、無駄なデコード・確保コストを避けられる
+    /// （`sql::aggregate::capture_scalar_index_snapshot` が使用。Issue #475
+    /// codex-review P2 対応）。
     pub(crate) fn failed(&self) -> bool {
         self.failed
     }

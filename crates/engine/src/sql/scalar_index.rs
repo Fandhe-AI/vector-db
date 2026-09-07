@@ -947,9 +947,25 @@ struct ScalarIndexCacheEntry {
     last_used: u64,
 }
 
+/// Issue #475 codex-review P2 対応: `sql::aggregate::capture_scalar_index_snapshot`
+/// が「この `(table, ctx)`・世代では索引の piggyback 構築が採取失敗（容量超過・
+/// 復号不能・NULL 行混在等）で確定的に不可能だった」ことを記録するエントリ。
+/// `ScalarIndexCacheEntry`（構築成功した索引本体）とは別枠——同一世代内は
+/// [`ScalarIndexCache::is_capture_known_unbuildable`] がこの記録をヒットさせ、
+/// 集計・`GROUP BY` クエリのたびに同じ全走査・全量デコードの採取を繰り返す
+/// ことを避ける（構築成功索引のキャッシュとは独立に世代が進めば自然に無効化
+/// される。テーブル単位世代のみをキーにし、行内容・存在情報は保持しない）。
+struct UnbuildableEntry {
+    table: String,
+    ctx: PolicyContext,
+    generation: u64,
+    last_used: u64,
+}
+
 #[derive(Default)]
 struct ScalarIndexCacheState {
     entries: Vec<ScalarIndexCacheEntry>,
+    unbuildable: Vec<UnbuildableEntry>,
 }
 
 /// `(table, ctx)` × テーブル単位世代でキャッシュする [`ScalarIndex`] キャッシュ
@@ -1187,6 +1203,81 @@ impl ScalarIndexCache {
     pub(crate) fn record_aggregate_plain_scan_fallback(&self) {
         self.aggregate_plain_scan_fallbacks
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #475 codex-review P2 対応: この `(table, ctx)` の現在のテーブル
+    /// 世代について、集計・`GROUP BY` の piggyback 索引構築（`sql::aggregate::
+    /// capture_scalar_index_snapshot`）が採取失敗と確定済みかを調べる。ヒット
+    /// した場合、呼び出し元は採取（`user_rows/{table}` の全走査・全量デコード）
+    /// を試みず即座に全走査フォールバックへ委ねてよい。世代が進んだ古い記録は
+    /// 一致しないため自然にミスとして扱う（明示的な無効化は不要。世代不一致の
+    /// 記録は次の [`Self::mark_capture_unbuildable`] 呼び出しで上書きされるまで
+    /// 残るが、`table` は非機微情報でありサイズは [`MAX_SCALAR_INDEX_CACHE_ENTRIES`]
+    /// で有界のため安全性に影響しない）。
+    pub(crate) fn is_capture_known_unbuildable(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+        ctx: &PolicyContext,
+    ) -> bool {
+        let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table)
+        else {
+            return false;
+        };
+        let Ok(guard) = self.state.read() else {
+            return false;
+        };
+        guard
+            .unbuildable
+            .iter()
+            .any(|e| e.table == table && e.ctx == *ctx && e.generation == current_generation)
+    }
+
+    /// Issue #475 codex-review P2 対応: `capture_scalar_index_snapshot` が
+    /// 採取失敗（`None`）を返した直後に呼び出し、[`Self::is_capture_known_
+    /// unbuildable`] が次回以降の同一世代呼び出しをこの採取試行自体をスキップ
+    /// させられるよう記録する。テーブル世代の読み取りに失敗した場合は記録
+    /// せず終える（fail-closed。記録できなくても呼び出し元の集計クエリ自体
+    /// は全走査へフォールバック済みで正しさに影響しない）。
+    pub(crate) fn mark_capture_unbuildable(
+        &self,
+        storage: &Storage,
+        table: &str,
+        ctx: &PolicyContext,
+    ) {
+        let Ok(generation) = storage.table_generation(table) else {
+            return;
+        };
+        let Ok(mut guard) = self.state.write() else {
+            return;
+        };
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(entry) = guard
+            .unbuildable
+            .iter_mut()
+            .find(|e| e.table == table && e.ctx == *ctx)
+        {
+            entry.generation = generation;
+            entry.last_used = seq;
+            return;
+        }
+        while guard.unbuildable.len() >= MAX_SCALAR_INDEX_CACHE_ENTRIES {
+            let Some((idx, _)) = guard
+                .unbuildable
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_used)
+            else {
+                break;
+            };
+            guard.unbuildable.remove(idx);
+        }
+        guard.unbuildable.push(UnbuildableEntry {
+            table: table.to_string(),
+            ctx: ctx.clone(),
+            generation,
+            last_used: seq,
+        });
     }
 }
 
@@ -1802,6 +1893,48 @@ mod tests {
             "stale insert must be rejected (None), not returned to caller"
         );
         assert_eq!(cache.stats().entries, 0);
+    }
+
+    // Issue #475 codex-review P2 対応（`sql::aggregate::capture_scalar_index_
+    // snapshot` の piggyback 採取失敗の記録・照会）: `mark_capture_unbuildable`
+    // で記録した世代は `is_capture_known_unbuildable` がヒットし、書き込みで
+    // 世代が進むと自動的にミスへ戻ることを固定する。
+    #[test]
+    fn capture_unbuildable_memo_hits_same_generation_and_misses_after_write() {
+        let path = unique_db_path("scalar-index-cache-unbuildable");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let ctx_a = ctx("tenant-a");
+        insert(&storage, &ctx_a, 1, Some("x"), None, Visibility::Public);
+
+        let cache = ScalarIndexCache::new();
+
+        let read_txn = storage.db().begin_read().expect("begin read");
+        assert!(
+            !cache.is_capture_known_unbuildable(&read_txn, "docs", &ctx_a),
+            "no record yet must not be treated as known-unbuildable"
+        );
+        drop(read_txn);
+
+        cache.mark_capture_unbuildable(&storage, "docs", &ctx_a);
+
+        let read_txn = storage.db().begin_read().expect("begin read");
+        assert!(
+            cache.is_capture_known_unbuildable(&read_txn, "docs", &ctx_a),
+            "same generation must hit the recorded memo"
+        );
+        // 別テナント ctx・別テーブルは記録を共有しない。
+        let ctx_b = ctx("tenant-b");
+        assert!(!cache.is_capture_known_unbuildable(&read_txn, "docs", &ctx_b));
+        assert!(!cache.is_capture_known_unbuildable(&read_txn, "other_table", &ctx_a));
+        drop(read_txn);
+
+        // 書き込みで世代が進むと記録は現世代と一致しなくなり、ミスへ戻る
+        // （採取の再試行が世代進行後に自動的に許される）。
+        insert(&storage, &ctx_a, 2, Some("y"), None, Visibility::Public);
+        let read_txn2 = storage.db().begin_read().expect("begin read");
+        assert!(!cache.is_capture_known_unbuildable(&read_txn2, "docs", &ctx_a));
     }
 
     #[test]

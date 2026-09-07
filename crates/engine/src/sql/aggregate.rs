@@ -1027,7 +1027,16 @@ fn try_scalar_index_aggregate(
             // ミス、または同一性ガード不一致。SELECT が同じ世代を先に走査して
             // いなければ索引は永久に構築されないため（受入条件「非 vacuous」）、
             // この集計クエリ自身の走査に相乗りして構築する（計画の piggyback
-            // 採取。Issue #475）。
+            // 採取。Issue #475）。ただし同一世代で過去に採取が確定的に失敗
+            // 済みなら（codex-review P2 対応）、無駄な全走査・全量デコードを
+            // 試みず即座に全走査フォールバックへ委ねる。
+            if scalar_access
+                .cache
+                .is_capture_known_unbuildable(read_txn, &bound.table, ctx)
+            {
+                scalar_access.cache.record_aggregate_plain_scan_fallback();
+                return Ok(None);
+            }
             match capture_scalar_index_snapshot(read_txn, ctx, schema, &bound.table, expected_dim) {
                 Some((snapshot, index)) => {
                     // `index` は `insert` に渡す前の `snapshot`（挿入前）から
@@ -1060,6 +1069,14 @@ fn try_scalar_index_aggregate(
                     }
                 }
                 None => {
+                    // 採取自体が確定的に失敗（容量超過・復号不能・NULL 行混在
+                    // 等）。世代が進むまでは再試行しても同じ結果になるため
+                    // 記録する（codex-review P2 対応）。
+                    scalar_access.cache.mark_capture_unbuildable(
+                        scalar_access.storage,
+                        &bound.table,
+                        ctx,
+                    );
                     scalar_access.cache.record_aggregate_plain_scan_fallback();
                     return Ok(None);
                 }
@@ -1130,8 +1147,25 @@ pub(crate) fn ensure_scalar_index_snapshot(
     if let Some(pair) = cached {
         return Some(pair);
     }
+    // 同一世代で過去に採取が確定的に失敗済みなら（codex-review P2 対応）、
+    // 無駄な全走査・全量デコードを試みず即座に `None`（全走査フォールバック）
+    // で返す。
+    if scalar_access
+        .cache
+        .is_capture_known_unbuildable(read_txn, table, ctx)
+    {
+        return None;
+    }
     let (snapshot, index) =
-        capture_scalar_index_snapshot(read_txn, ctx, schema, table, expected_dim)?;
+        match capture_scalar_index_snapshot(read_txn, ctx, schema, table, expected_dim) {
+            Some(pair) => pair,
+            None => {
+                scalar_access
+                    .cache
+                    .mark_capture_unbuildable(scalar_access.storage, table, ctx);
+                return None;
+            }
+        };
     // `index` は挿入前の `snapshot` から構築済み（`try_scalar_index_aggregate`
     // と同じ理由で再構築不要。同関数のドキュメント参照）。
     let inserted_snapshot = arena_access
@@ -1294,6 +1328,18 @@ fn capture_scalar_index_snapshot(
             continue;
         }
         capture.push(id, tenant_id, visibility, &embedding_scratch, metadata, 0);
+        // Issue #475 codex-review P2 対応: `capture` が容量超過（`MAX_ARENA_
+        // TOTAL_BYTES` 等）で `failed` へ遷移すると、以降の `push` は no-op に
+        // 縮退し `finish` は確定で `None` を返す。それにもかかわらずこの
+        // ループを最後まで回すと、残り行すべてについて意味のない
+        // `decode_row_body_into`（embedding 全量デコード）を続けてしまう
+        // （容量超過は行数・バイト量に比例するため、テーブル規模が大きいほど
+        // 無駄なデコード・確保コストも比例して増える）。`finish` を待たず
+        // ここで打ち切り、呼び出し元を全走査フォールバックへ即座に委ねる。
+        if capture.failed() {
+            capture_ok = false;
+            break;
+        }
     }
 
     if !capture_ok {
