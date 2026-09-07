@@ -526,3 +526,46 @@ R4（テナント境界）・hybrid 密側再取得ループ・Rust API 検索�
 - per-query スケール準備失敗（`prepare_query` 失敗）時の復号 dot 縮退を
   数えるカウンタ: `HnswIndexCacheStats` に存在しないため未計測（構造的に
   本節の fixture では到達不能。Issue #522 の設計）
+
+## Issue #507 追記: Phase 3（#458 ツリー）通し後の同一閾値検証
+
+Phase 3（#458 ツリー・ルート #455。#489〜#503。`docs/design/
+hnsw-phase3-before-after.md` 参照）通し適用後、before（`4d2bd23`）・after
+（`6184491`）双方の独立ビルドで `RECALL_ENGINE=brute_force|hnsw` の 3
+ハーネス（`hybrid_recall.rs`・`rerank_recall.rs`・`query_planning_recall.rs`）
+を `RECALL_VERBOSE=1`・プレースホルダ閾値（`0.001`）で実行した
+（Issue #412・#515・#523 と同型の測定経路。`docs/spec` 未チェックアウトの
+ため実閾値は不使用）。
+
+### 実測結果
+
+10 測定点すべてで before/after × brute_force/hnsw の 4 通りが完全一致:
+
+| 指標 | 値 |
+| --- | --- |
+| hybrid 小規模 recall@20 | 0.9010 |
+| hybrid 大規模 recall@20 | 0.9145 |
+| hybrid 大規模 recall@100 | 0.9165 |
+| rerank 大規模 after_recall@20 | 0.9488 |
+| rerank non_degraded | true |
+| rerank improvement_ratio@20（informational） | 0.2222 |
+| query_planning intent_improvement | 0.9245 |
+| query_planning intent_improvement_degraded | 0.3547 |
+| query_planning direct r20（小規模） | 0.9321 |
+| query_planning direct r20（大規模） | 0.8852 |
+
+非 vacuity: 全 hnsw 実行で `builds=1 build_failures=0 rebuilds=0`。
+`query_planning_recall_large_scale_threshold_gate`（after-hnsw）:
+`hybrid_dense_searches=456 hybrid_queries=100 ef_cap_fallbacks=120
+hybrid_resumed_rounds=236`——Issue #503（`HnswDenseProvider` 再開型探索）が
+before 側には存在しない `hybrid_resumed_rounds` カウンタとして非 vacuous に
+発火したことを直接確認できた（`query_planning_recall_threshold_gate` の
+direct/intent/intent_degraded 3 テストでも `hybrid_resumed_rounds=
+502/571/598`）。
+
+### 判定
+
+Phase 3 の全施策（#489〜#503）適用後も、既存の 3 Recall ゲートは
+brute_force／hnsw 双方で before と完全に同一の値を維持しており、非退行を
+確認した。詳細な計測条件・交絡・前後比較（性能側）は
+`docs/design/hnsw-phase3-before-after.md` 参照。

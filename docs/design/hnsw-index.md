@@ -357,8 +357,10 @@ S0-cold の 22.9 倍は「毎サンプル HNSW グラフをゼロから構築す
   スタブの注入を要する実測は時間制約により未実施
 - `HnswParams` の非既定値（`ef_search` 等）のスイープ
 - `contrast_bench`（usearch）への HNSW 対照経路追加
-- 凍結後 CSR 化の実装（#494）・前後比較実測（#495）——設計は本書§14
-  （Issue #493）
+- 凍結後 CSR 化の実装（#494）・前後比較実測（#495）は実施済み——設計は
+  本書§14（Issue #493）、実装・実測は§14.12・§14.13 参照
+- Phase 3（#458 ツリー・ルート #455。#489〜#503）通しの前後比較は #507
+  として実施済み。`docs/design/hnsw-phase3-before-after.md`・本書§15 参照
 
 ## 12. 再現方法
 
@@ -1003,3 +1005,21 @@ BENCH_HNSW_PARALLEL_THREADS=1,12 <scratch>/target-after/release/deps/hnsw_parall
 #  before/after で偶然一致することがある。実行対象を取り違えないよう
 #  CARGO_TARGET_DIR〔target-before／target-after〕で区別すること）
 ```
+
+## 15. Phase 3（#458 ツリー）通し前後比較（Issue #507）
+
+本書§1 の「Phase 3」（#404〜#412・#402 ツリー）とは別の、#455 ルート配下
+**#458 ツリー**（ANN／HNSW の構築並列化・探索メモリ局所性・フィルタ付き
+探索。#489〜#503）の全施策適用後の通し前後比較を実施した。
+
+- before: `4d2bd23`（#458 ツリー最初の production マージの親）
+- after: `6184491`（実装着手時点の `origin/main`。全 6 実装 PR を含む）
+- 対象: `bench-knn-profile`（S0-cold／S0-hot）・`bench-hnsw-compare`
+  （usearch 対照）・`feature_bench`・Recall 3 ゲート層 B
+  （`RECALL_ENGINE=brute_force|hnsw`）
+- 詳細な計測条件（交絡表・非 vacuity 表を含む）・実測表・判定・限界は
+  `docs/design/hnsw-phase3-before-after.md` 参照
+
+本書§7〜§10 の対象（#404〜#412）と本節の対象（#489〜#503）は独立した
+production 変更であり、本書の既定エンジン Recall・損益分岐点の結論
+（§10）は本節によって変わらない。

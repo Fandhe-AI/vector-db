@@ -1,0 +1,9 @@
+timestamp_utc=20260907T202344Z
+before_commit=4d2bd23f1f4f13f64ccbaf807e09b352ec6e31a2
+after_commit=6184491389ca02d176e3518761525193520bd6c2
+ab_pairs=5
+ab_workloads=knn_profile
+nproc=12
+cpu_model=QEMU Virtual CPU version 2.5+
+cpu_flags_subset=fma f16c avx2
+bench_dedicated_env=unset

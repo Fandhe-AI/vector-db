@@ -567,7 +567,7 @@ BENCH_FEATURE_DIM=768 cargo run --release -p engine --example feature_bench
 BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 ```
 
-既定エンジン（brute-force）との前後比較・25k/100k の規模スケーリング実測・参照した外部実装（qdrant・pgvector・usearch）の既定値・損益分岐点についての所見は `docs/design/hnsw-index.md` を参照してください。
+既定エンジン（brute-force）との前後比較・25k/100k の規模スケーリング実測・参照した外部実装（qdrant・pgvector・usearch）の既定値・損益分岐点についての所見は `docs/design/hnsw-index.md` を参照してください。Phase 3（#458 ツリー・ルート #455。ANN／HNSW の構築並列化・探索メモリ局所性・フィルタ付き探索 #489〜#503）の通し前後比較・Recall 3 ゲート同一閾値検証は `docs/design/hnsw-phase3-before-after.md`（Issue #507）を参照してください。
 
 `knn_profile_bench` にはさらに、可視比率 × 行数の損益分岐点スイープ（Issue #487。`hnsw_subset`〔SCALAR 事前フィルタ付き DISTANCE〕vs plain scan）専用の env があります（設定時は S1〜S5' を伴わない専用モードへ切り替わります）。
 
