@@ -416,7 +416,7 @@ FAISS 753µs で約 107 倍」から、#532 の効果でこの倍率は約 1/2.7
 
 **申し送り**: 現 `origin/main`（#536 部分 Top-k 込み）での再計測・readback
 バイト数比較は Issue #537、Phase 5 通し比較（FAISS GPU 対照・Qdrant GPU 構築
-含む）は Issue #544、残り 17 規模点の計測は必要になった時点で別途起票する。
+含む）は Issue #544、残り 19 規模点の計測は必要になった時点で別途起票する。
 
 ### FAISS（IndexFlatIP）CPU vs GPU
 
