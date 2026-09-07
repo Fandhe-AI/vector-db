@@ -96,9 +96,11 @@ mod harness;
 use harness::env_report::EnvReport;
 use harness::knn_profile::{
     assert_scan_row_counts_match, decode_header_reimpl, decode_row_reimpl, ns_per_row,
-    refuse_under_github_actions, render_diff_line, render_stage_line, stage_diff_ns_per_row,
+    refuse_under_github_actions, render_diff_line, render_index_memory_line, render_stage_line,
+    requires_hnsw_stats_check, resident_label_for_token, scaled_rows, stage_diff_ns_per_row,
     KnnProfileError,
 };
+use harness::proc_stats::{read_vm_hwm_kb, read_vm_rss_kb};
 use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 use harness::rng::DeterministicRng;
 use harness::sql_c1::{c1_statement, c1_where_statement, vector_literal};
@@ -109,7 +111,7 @@ use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
-use engine::hnsw::{HnswParams, Ratio, ValidatedHnswParams};
+use engine::hnsw::{HnswIndex, HnswParams, Ratio, ResidentPrecision, ValidatedHnswParams};
 use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
@@ -189,6 +191,14 @@ fn build_core_for(
             };
             EngineCore::from_storage_with_engine(storage, kind)
         }
+        harness::bench_engine::BenchEngine::HnswF16 => {
+            // f16 常駐 opt-in（Issue #514・#516。`recall_engine.rs::RecallEngine::
+            // HnswF16` と同一構築経路）。
+            let validated = ValidatedHnswParams::new(HnswParams::default())
+                .expect("valid HnswParams::default()")
+                .with_resident_precision(ResidentPrecision::F16);
+            EngineCore::from_storage_with_engine(storage, SearchEngineKind::Hnsw(validated))
+        }
     }
 }
 
@@ -210,6 +220,12 @@ fn print_stage_diff_or_unconfirmed(from: &str, to: &str, diff: Result<f64, KnnPr
 }
 
 fn main() {
+    // メモリ計測の子プロセス経路（Issue #516。`INDEX_MEMORY_CHILD_ENV` 設定時の
+    // み）。設定されていれば 1 点分の索引単体メモリ計測だけを行いここで終了し、
+    // 通常の計測経路（下記）には進まない（`hnsw_parallel_build_bench.rs::
+    // run_memory_child_if_requested` と同型）。
+    run_index_memory_child_if_requested();
+
     if let Err(e) = refuse_under_github_actions(std::env::var_os("GITHUB_ACTIONS").is_some()) {
         fail_closed(e);
     }
@@ -249,9 +265,14 @@ fn main() {
             Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_FULL_SCAN_RATIO: {e}")),
         };
     if full_scan_ratio_override.is_some()
-        && !matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw)
+        && !matches!(
+            knn_engine,
+            harness::bench_engine::BenchEngine::Hnsw | harness::bench_engine::BenchEngine::HnswF16
+        )
     {
-        fail_closed("BENCH_KNN_PROFILE_FULL_SCAN_RATIO requires BENCH_KNN_PROFILE_ENGINE=hnsw");
+        fail_closed(
+            "BENCH_KNN_PROFILE_FULL_SCAN_RATIO requires BENCH_KNN_PROFILE_ENGINE=hnsw or hnsw_f16",
+        );
     }
 
     // visited 集合の切替閾値（Issue #497）。S0-cold／S0-hot の `EngineCore`
@@ -286,6 +307,51 @@ fn main() {
         Ok(v) => v,
         Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_SCALE: {e}")),
     };
+
+    // f16 常駐の前後比較用モード（Issue #516）。既定経路（S0-cold〜residual の
+    // 段別分解。本節の対象外）とは独立の投入・warm・計測フローを持つ。
+    // `BENCH_KNN_PROFILE_INDEX_MEMORY` は索引単体の常駐バイト数計測（redb を
+    // 経由しない・子プロセス隔離）、`BENCH_KNN_PROFILE_HOT_ONLY` は
+    // 25k/100k/500k 規模点での SQL 表層 e2e レイテンシ前後比較（S0-hot のみ・
+    // 索引 1 回構築）。互いに排他、`BENCH_KNN_PROFILE_VISIBLE_RATIO`
+    // （上記スイープ）とも排他とする（計測条件が異なりすぎるため同時指定を
+    // fail-closed で拒否する。この判定は `visible_ratio_denominator` の分岐
+    // （下記）より前に置く——後ろに置くとスイープが先に `return` してしまい
+    // 排他違反を検出できない。モジュール冒頭コメントの既定経路の出力不変契約は
+    // 3 モードとも未設定〔既定〕時は分岐しないことで維持する）。
+    let index_memory: bool =
+        match harness::bench_engine::read_env_var("BENCH_KNN_PROFILE_INDEX_MEMORY")
+            .and_then(|raw| harness::bench_engine::parse_flag(raw.as_deref()))
+        {
+            Ok(v) => v,
+            Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_INDEX_MEMORY: {e}")),
+        };
+    let hot_only: bool = match harness::bench_engine::read_env_var("BENCH_KNN_PROFILE_HOT_ONLY")
+        .and_then(|raw| harness::bench_engine::parse_flag(raw.as_deref()))
+    {
+        Ok(v) => v,
+        Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_HOT_ONLY: {e}")),
+    };
+    if index_memory && hot_only {
+        fail_closed(
+            "BENCH_KNN_PROFILE_INDEX_MEMORY and BENCH_KNN_PROFILE_HOT_ONLY are mutually exclusive",
+        );
+    }
+    if (index_memory || hot_only) && visible_ratio_denominator.is_some() {
+        fail_closed(
+            "BENCH_KNN_PROFILE_INDEX_MEMORY/BENCH_KNN_PROFILE_HOT_ONLY and \
+             BENCH_KNN_PROFILE_VISIBLE_RATIO are mutually exclusive",
+        );
+    }
+    if index_memory {
+        run_index_memory_mode(knn_engine, dim, sweep_scale);
+        return;
+    }
+    if hot_only {
+        run_hot_only(knn_engine, dim, sweep_scale, full_scan_ratio_override);
+        return;
+    }
+
     if let Some(denominator) = visible_ratio_denominator {
         run_visible_ratio_sweep(
             knn_engine,
@@ -548,11 +614,14 @@ fn main() {
         ));
     }
 
-    // 非 vacuous 確認（Issue #413。`feature_bench.rs` と同じ原則）。hnsw opt-in
-    // 時は S0-hot 測定後に索引が実際に構築・使用されたことを固定し、満たさなけ
-    // れば `fail_closed` する。brute_force では統計を出力しない
+    // 非 vacuous 確認（Issue #413。`feature_bench.rs` と同じ原則）。hnsw／
+    // hnsw_f16 opt-in 時は S0-hot 測定後に索引が実際に構築・使用されたことを
+    // 固定し、満たさなければ `fail_closed` する（Issue #516 codex P1 指摘対応。
+    // hnsw_f16 でも `HnswIndexCache` は `hnsw` と同一の
+    // `sql::hnsw_cache::HnswIndexCacheStats` を返す設計のため、検証ロジック
+    // 自体は精度非依存で共有できる）。brute_force では統計を出力しない
     // （`hnsw_index_cache_stats()` は常に全欄 0）。
-    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+    if requires_hnsw_stats_check(knn_engine.token()) {
         let s = core.hnsw_index_cache_stats();
         println!(
             "knn_profile_bench: hnsw_stats builds={} build_failures={} hits={} misses={} fallbacks={} entries={}",
@@ -944,6 +1013,25 @@ fn build_core_for_sweep(
             }
             EngineCore::from_storage_with_engine(storage, SearchEngineKind::Hnsw(validated))
         }
+        harness::bench_engine::BenchEngine::HnswF16 => {
+            // Issue #487 スイープは元々 f16 常駐を対象としないが、Issue #516 で
+            // `BenchEngine::HnswF16` を追加した以上、この match を非網羅にしない
+            // ため f32 版と同じ override 適用ロジックに `with_resident_precision`
+            // を重ねるだけの対応を用意する（本 Issue のスイープ計測はこの経路を
+            // 使わない。`run_hot_only` が f16 常駐計測の本体）。
+            let mut validated = ValidatedHnswParams::new(HnswParams::default())
+                .expect("valid HnswParams::default()")
+                .with_resident_precision(ResidentPrecision::F16);
+            if let Some((numerator, denominator)) = full_scan_ratio_override {
+                validated = validated
+                    .with_full_scan_ratio(Ratio {
+                        numerator,
+                        denominator,
+                    })
+                    .expect("BENCH_KNN_PROFILE_FULL_SCAN_RATIO already validated by harness::bench_engine::parse_full_scan_ratio");
+            }
+            EngineCore::from_storage_with_engine(storage, SearchEngineKind::Hnsw(validated))
+        }
     }
 }
 
@@ -1118,7 +1206,7 @@ fn run_visible_ratio_sweep(
     let _ = core
         .execute_sql(&policy_ctx, &filterless_sql)
         .expect("warm-up query must succeed");
-    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+    if requires_hnsw_stats_check(knn_engine.token()) {
         let warm_stats = core.hnsw_index_cache_stats();
         if warm_stats.builds == 0 {
             fail_closed(format!(
@@ -1197,7 +1285,7 @@ fn run_visible_ratio_sweep(
     // 違反時に測定値だけがログへ書かれ、失敗理由が読み取れなくなることを
     // 防ぐ。`observed_arm_label` 分類・他カウンタの出力は builds_delta が
     // 健全であることを前提にしてよいため、この検査だけを前倒しする）。
-    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+    if requires_hnsw_stats_check(knn_engine.token()) {
         let builds_delta = stats_after_subset
             .builds
             .saturating_sub(stats_before_subset.builds);
@@ -1271,7 +1359,7 @@ fn run_visible_ratio_sweep(
         harness::bench_engine::ExpectedArm::PlainScanRatio => "plain_scan_ratio",
     };
 
-    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+    if requires_hnsw_stats_check(knn_engine.token()) {
         // `HnswIndexCacheStats`（`sql::hnsw_cache`）は `pub(crate)` モジュール
         // 配下のため型名を bench 側に書けない（`observed_arm_label` 上部の
         // コメント参照）。フィールドごとの差分を個別のローカル変数に留める。
@@ -1292,20 +1380,21 @@ fn run_visible_ratio_sweep(
         let fallbacks_delta = stats_after_subset
             .fallbacks
             .saturating_sub(stats_before_subset.fallbacks);
-        // `BENCH_KNN_PROFILE_ENGINE=hnsw` では 4 カウンタ全 0 は「このクエリが
-        // Subset 系のいずれの経路も通らなかった」ことを意味し、
+        // `BENCH_KNN_PROFILE_ENGINE=hnsw|hnsw_f16` では 4 カウンタ全 0 は
+        // 「このクエリが Subset 系のいずれの経路も通らなかった」ことを意味し、
         // brute_force エンジンの `n/a` とは区別すべき vacuous な計測である
         // （Cursor Bugbot 指摘。ラベルだけ `n/a (brute_force engine)` と出力
-        // されるとスイープが誤って green のまま通過してしまう）。
+        // されるとスイープが誤って green のまま通過してしまう。Issue #516
+        // codex P1 指摘対応で hnsw_f16 にもこの検証を適用した）。
         if subset_searches_delta == 0
             && plain_scans_delta == 0
             && mask_splits_graph_delta == 0
             && masked_short_delta == 0
         {
-            fail_closed(
-                "BENCH_KNN_PROFILE_ENGINE=hnsw だが Subset 系カウンタ（subset_searches/plain_scans/mask_splits_graph/masked_short）が全て 0 だった（vacuous な計測。hnsw_cache の適用条件から外れている可能性）"
-                    .to_string(),
-            );
+            fail_closed(format!(
+                "BENCH_KNN_PROFILE_ENGINE={} だが Subset 系カウンタ（subset_searches/plain_scans/mask_splits_graph/masked_short）が全て 0 だった（vacuous な計測。hnsw_cache の適用条件から外れている可能性）",
+                knn_engine.token()
+            ));
         }
         println!(
             "knn_profile_bench: hnsw_stats(subset_delta) subset_searches={} plain_scans={} \
@@ -1332,6 +1421,440 @@ fn run_visible_ratio_sweep(
     }
 
     println!("knn_profile_bench: visible_ratio_sweep consistency checks passed (WHERE result count/bucket membership, COUNT(*) value)");
+}
+
+/// f16 常駐の前後比較（Issue #516・要件 A）: `BENCH_KNN_PROFILE_HOT_ONLY=1` で
+/// 呼ばれる。既定経路（S0-cold〜residual の段別分解）とは独立した投入・warm・
+/// 計測フローを持ち、SQL 表層 e2e のホットパス（S0-hot 相当。索引 1 回構築＋
+/// キャッシュヒット）と参照区間（`COUNT(*)`）のみを測る——`BENCH_KNN_PROFILE_
+/// SCALE` を 500k 行規模（scale=20）まで許すため、既定経路が行う S0-cold（毎
+/// サンプル新規 `EngineCore` 構築。40 回以上）は本モードでは行わない
+/// （非現実的な所要時間になるため。`docs/design/hnsw-f16-resident.md`
+/// 「Issue #516 追記」節「hot-only モード」参照）。
+fn run_hot_only(
+    knn_engine: harness::bench_engine::BenchEngine,
+    dim: usize,
+    scale: u64,
+    full_scan_ratio_override: Option<(u32, u32)>,
+) {
+    let tenant_a_rows = TENANT_A_ROWS as u64 * scale;
+    let tenant_b_rows = TENANT_B_ROWS as u64 * scale;
+    let total_rows = tenant_a_rows + tenant_b_rows;
+    if total_rows == 0 {
+        fail_closed("hot-only mode requires total_rows > 0");
+    }
+
+    let effective_full_scan_ratio = full_scan_ratio_override.unwrap_or_else(|| {
+        let default = ValidatedHnswParams::default().full_scan_ratio();
+        (default.numerator, default.denominator)
+    });
+    println!(
+        "knn_profile_bench: hot_only total_rows={total_rows} dim={dim} top_k={TOP_K} \
+         engine={} full_scan_ratio={}/{} (Issue #516。S0-cold・S1〜S5' は非対象。QEMU \
+         共有開発環境での実測は参考値——docs/design/hnsw-f16-resident.md 参照)",
+        knn_engine.token(),
+        effective_full_scan_ratio.0,
+        effective_full_scan_ratio.1,
+    );
+
+    let path = unique_db_path("issue516-knn-hot-only");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage for hot-only seeding");
+    storage
+        .create_table(&TableSchema::new(
+            TABLE,
+            vec![ColumnDef::new(
+                COLUMN,
+                ColumnType::Vector(dim as u32),
+                false,
+            )],
+        ))
+        .expect("create table for hot-only seeding");
+
+    let mut rng = DeterministicRng::new(1);
+    let mut next_id: u64 = 0;
+    for (tenant_id, count) in [(TENANT_A, tenant_a_rows), (TENANT_B, tenant_b_rows)] {
+        let ctx = PolicyContext::new(tenant_id).expect("valid tenant id");
+        let mut remaining = count;
+        while remaining > 0 {
+            let batch_len = (SEED_BATCH_ROWS as u64).min(remaining);
+            let mut batch_vectors: Vec<Vec<f32>> = Vec::with_capacity(batch_len as usize);
+            for _ in 0..batch_len {
+                batch_vectors.push(rng.next_vector(dim));
+            }
+            let rows: Vec<(u64, RowInput<'_>)> = (0..batch_len as usize)
+                .map(|i| {
+                    let id = next_id + i as u64;
+                    (
+                        id,
+                        RowInput {
+                            tenant_id,
+                            visibility: Visibility::Public,
+                            embedding: &batch_vectors[i],
+                            metadata: b"",
+                        },
+                    )
+                })
+                .collect();
+            let op_id = OperationId::parse(&format!("hotonly-{tenant_id}-{next_id}"))
+                .expect("valid operation_id");
+            tenant::insert_rows(&storage, TABLE, &ctx, &rows, &op_id).expect("seed batch insert");
+            next_id += batch_len;
+            remaining -= batch_len;
+        }
+    }
+    if next_id != total_rows {
+        fail_closed(format!(
+            "hot-only seeded row count mismatch: expected {total_rows}, got {next_id}"
+        ));
+    }
+
+    let policy_ctx = PolicyContext::new(TENANT_A).expect("valid tenant id");
+    let query = rng.next_vector(dim);
+    let literal = vector_literal(&query).expect("finite query vector");
+    let sql = c1_statement(TABLE, COLUMN, &literal, TOP_K)
+        .expect("well-formed C1 statement from validated identifiers");
+
+    // hot-only モード（Issue #516）は visited 集合切替閾値（Issue #497）の
+    // 計測対象外のため、既定値（常に dense）のまま `None` を渡す。
+    let core = build_core_for_sweep(knn_engine, storage, full_scan_ratio_override, None);
+
+    // --- warm: 索引構築を含む 1 回目のクエリ（計測外）。--------------------
+    let warm_start = Instant::now();
+    let warm_result = core
+        .execute_sql(&policy_ctx, &sql)
+        .expect("warm-up query must succeed");
+    let index_warm_ms = warm_start.elapsed().as_secs_f64() * 1e3;
+    if warm_result.rows.len() != TOP_K.min(total_rows as usize) {
+        fail_closed(format!(
+            "hot-only warm-up result row count mismatch: expected {}, got {}",
+            TOP_K.min(total_rows as usize),
+            warm_result.rows.len()
+        ));
+    }
+    println!("knn_profile_bench: index_warm_ms={index_warm_ms:.3}");
+
+    let config = MeasurementConfig::new(20, 20, 1).expect("protocol minimums satisfied");
+
+    // --- S0-hot: 単一 `EngineCore` を使い回すホットパス。-----------------------
+    let s0_hot = run(&config, || {
+        core.execute_sql(&policy_ctx, &sql)
+            .expect("execute_sql must succeed for well-formed synthetic KNN query")
+    })
+    .expect("measurement must satisfy protocol minimums");
+
+    // --- 参照区間: `COUNT(*)`（run-to-run 実測ノイズ帯の基準。`docs/design/
+    // benchmark-judgement-policy.md` §4）。--------------------------------------
+    let count_sql = format!("SELECT COUNT(*) FROM {TABLE}");
+    let count_reference = run(&config, || {
+        core.execute_sql(&policy_ctx, &count_sql)
+            .expect("execute_sql must succeed for COUNT(*) query")
+    })
+    .expect("measurement must satisfy protocol minimums");
+
+    // --- 計測外での結果検証（fail-closed）。------------------------------------
+    let hot_result_len = core
+        .execute_sql(&policy_ctx, &sql)
+        .expect("execute_sql must succeed for well-formed synthetic KNN query")
+        .rows
+        .len();
+    let expected_rows = TOP_K.min(total_rows as usize);
+    if hot_result_len != expected_rows {
+        fail_closed(format!(
+            "hot-only S0-hot result row count mismatch: expected {expected_rows}, got {hot_result_len}"
+        ));
+    }
+    let count_result = core
+        .execute_sql(&policy_ctx, &count_sql)
+        .expect("execute_sql must succeed for COUNT(*) query");
+    let count_value = match count_result.rows.first().and_then(|r| r.cells.first()) {
+        Some(Cell::Integer(v)) => *v,
+        other => fail_closed(format!("COUNT(*) cell type mismatch: got {other:?}")),
+    };
+    if count_value as u64 != total_rows {
+        fail_closed(format!(
+            "COUNT(*) value mismatch: expected {total_rows}, got {count_value}"
+        ));
+    }
+
+    // --- 非 vacuous 検証（fail-closed。hnsw／hnsw_f16 のみ）。-------------------
+    if requires_hnsw_stats_check(knn_engine.token()) {
+        let s = core.hnsw_index_cache_stats();
+        println!(
+            "knn_profile_bench: hnsw_stats builds={} build_failures={} hits={} misses={} \
+             fallbacks={} entries={} f16_residency_fallbacks={}",
+            s.builds,
+            s.build_failures,
+            s.hits,
+            s.misses,
+            s.fallbacks,
+            s.entries,
+            s.f16_residency_fallbacks,
+        );
+        if s.builds == 0 || s.hits == 0 || s.build_failures > 0 {
+            fail_closed(format!(
+                "ANN non-vacuous check failed: builds={} hits={} build_failures={}",
+                s.builds, s.hits, s.build_failures
+            ));
+        }
+        let expected_resident = resident_label_for_token(knn_engine.token())
+            .expect("hnsw/hnsw_f16 tokens must map to a resident label");
+        if knn_engine == harness::bench_engine::BenchEngine::HnswF16
+            && s.f16_residency_fallbacks != 0
+        {
+            fail_closed(format!(
+                "hnsw_f16 requested but f16_residency_fallbacks={} (D6 auto-degrade to f32; \
+                 corpus embeddings must stay within the f16 finite range for this measurement \
+                 to be meaningful)",
+                s.f16_residency_fallbacks
+            ));
+        }
+        // `EXPLAIN` は `USING PLAN(...)` 文にのみ対応する契約
+        // （`sql/allowlist.rs`「EXPLAIN is only supported for SELECT ... USING
+        // PLAN(...) statements」）で、本モードが使う `c1_statement`（`ORDER BY
+        // embedding <=> '<vec>' LIMIT k`。`USING PLAN` を伴わない）には使えない。
+        // 代わりに `EngineCore::search_engine_kind()`（pub API）の `Display` 出力
+        // （`search_engine.rs`: `"hnsw(...,resident=<value>)"`）で要求精度が実際に
+        // 構築へ到達したことを確認する（`tests/fixtures/recall_engine.rs::
+        // assert_ann_non_vacuous` と同じ判定方法）。
+        let kind_display = core
+            .search_engine_kind()
+            .map(|k| k.to_string())
+            .unwrap_or_default();
+        let resident_suffix = format!("resident={expected_resident}");
+        println!(
+            "knn_profile_bench: resident_precision requested={expected_resident} \
+             search_engine_kind={kind_display}"
+        );
+        if !kind_display.contains(&resident_suffix) {
+            fail_closed(format!(
+                "search_engine_kind() display does not contain {resident_suffix:?}: got \
+                 {kind_display:?}"
+            ));
+        }
+    }
+
+    // --- 出力（全 fail-closed 検証を終えたここまでの間、測定値は一切 println!
+    // していない。既定経路 main() と同じ契約）。--------------------------------
+    println!(
+        "{}",
+        render_stage_line(
+            "S0_hot_sql_e2e",
+            total_rows as usize,
+            s0_hot.summary.median,
+            ns_per_row(s0_hot.summary.median, total_rows as usize).expect("total_rows > 0"),
+        )
+    );
+    println!(
+        "raw(S0_hot_sql_e2e): samples_ms={:?}",
+        s0_hot
+            .samples
+            .iter()
+            .map(|d| d.as_secs_f64() * 1e3)
+            .collect::<Vec<f64>>()
+    );
+    println!(
+        "{}",
+        render_stage_line(
+            "S0prime_count_star",
+            total_rows as usize,
+            count_reference.summary.median,
+            ns_per_row(count_reference.summary.median, total_rows as usize)
+                .expect("total_rows > 0"),
+        )
+    );
+    println!(
+        "raw(S0prime_count_star): samples_ms={:?}",
+        count_reference
+            .samples
+            .iter()
+            .map(|d| d.as_secs_f64() * 1e3)
+            .collect::<Vec<f64>>()
+    );
+    println!("knn_profile_bench: hot_only consistency checks passed (S0-hot result count, COUNT(*) value, resident precision)");
+}
+
+/// メモリ計測を新規子プロセスへ隔離するための起動用環境変数名（Issue #516。
+/// `hnsw_parallel_build_bench.rs::MEMORY_CHILD_ENV` と同型）。値は
+/// `"<scale>:<dim>:<engine_token>"`（例: `"20:768:hnsw_f16"`）。
+const INDEX_MEMORY_CHILD_ENV: &str = "BENCH_KNN_PROFILE_INDEX_MEMORY_CHILD";
+
+/// `INDEX_MEMORY_CHILD_ENV` が設定されている場合のみ実行される子プロセス経路
+/// （Issue #516）。1 点分（`scale`・`dim`・エンジン）のコーパス生成・
+/// `HnswIndex::build_parallel_with_precision` 呼び出しを行い、結果行を標準出力へ
+/// 書いて終了する（`main` の通常経路には戻らない）。
+fn run_index_memory_child_if_requested() {
+    let Ok(raw) = std::env::var(INDEX_MEMORY_CHILD_ENV) else {
+        return;
+    };
+    // GITHUB_ACTIONS 下拒否は親プロセス起動時点で既に検査済みだが、子プロセス
+    // 単体で誤って呼ばれた場合の defense-in-depth（`hnsw_parallel_build_bench.rs`
+    // と同一方針）。
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        eprintln!("knn_profile_bench: refusing to run under GITHUB_ACTIONS (manual-only bench)");
+        std::process::exit(1);
+    }
+    let mut parts = raw.splitn(3, ':');
+    let (scale_str, dim_str, engine_token) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(s), Some(d), Some(e)) => (s, d, e),
+        _ => {
+            eprintln!(
+                "knn_profile_bench: invalid {INDEX_MEMORY_CHILD_ENV}={raw:?} (expected \
+                 \"<scale>:<dim>:<engine_token>\")"
+            );
+            std::process::exit(1);
+        }
+    };
+    let scale: u64 = match scale_str.parse() {
+        Ok(v) if (1..=MAX_SWEEP_SCALE).contains(&v) => v,
+        _ => {
+            eprintln!(
+                "knn_profile_bench: invalid scale {scale_str:?} in {INDEX_MEMORY_CHILD_ENV} \
+                 (must be 1..={MAX_SWEEP_SCALE})"
+            );
+            std::process::exit(1);
+        }
+    };
+    let dim: usize = match dim_str.parse::<u32>() {
+        Ok(v) if (1..=harness::bench_engine::MAX_BENCH_DIM).contains(&v) => v as usize,
+        _ => {
+            eprintln!(
+                "knn_profile_bench: invalid dim {dim_str:?} in {INDEX_MEMORY_CHILD_ENV} (must be \
+                 1..={})",
+                harness::bench_engine::MAX_BENCH_DIM
+            );
+            std::process::exit(1);
+        }
+    };
+    let precision = match engine_token {
+        "hnsw" => ResidentPrecision::F32,
+        "hnsw_f16" => ResidentPrecision::F16,
+        other => {
+            eprintln!(
+                "knn_profile_bench: invalid engine token {other:?} in \
+                 {INDEX_MEMORY_CHILD_ENV} (must be \"hnsw\" or \"hnsw_f16\")"
+            );
+            std::process::exit(1);
+        }
+    };
+    let rows = match scaled_rows(scale, TOTAL_ROWS as u64) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("knn_profile_bench: {e}");
+            std::process::exit(1);
+        }
+    };
+    match measure_index_memory(rows, dim, precision) {
+        Ok(line) => {
+            println!("{line}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("knn_profile_bench: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `rows` 件・`dim` 次元・`precision` 常駐精度で `HnswIndex` を 1 回構築し、
+/// 構築前後の RSS・VmHWM・`approx_heap_bytes` を計測する（Issue #516。子プロセス
+/// 内でのみ呼ばれる想定——アロケータ残留ページによる後続点の汚染を避けるため、
+/// 呼び出し元 `run_index_memory_child_if_requested` が新規プロセスを 1 点ごとに
+/// 起動する契約。`hnsw_parallel_build_bench.rs::measure_memory` と同型だが、
+/// redb を経由せずメモリ上のコーパスから直接構築する点が異なる——SQL 表層
+/// `VectorArena`〔`MAX_ARENA_TOTAL_BYTES` 1 GiB〕を経由しないため、500k×768 の
+/// ような arena 構造的上限を超える点でも索引単体としては計測できる）。
+fn measure_index_memory(
+    rows: u64,
+    dim: usize,
+    precision: ResidentPrecision,
+) -> Result<String, String> {
+    let mut rng = DeterministicRng::new(0xF16_5EED ^ rows ^ (dim as u64));
+    let mut corpus: Vec<f32> = Vec::with_capacity(rows as usize * dim);
+    for _ in 0..rows {
+        corpus.extend(rng.next_vector(dim));
+    }
+
+    let vm_rss_kb_before = read_vm_rss_kb();
+    let index = HnswIndex::build_parallel_with_precision(
+        HnswParams::default(),
+        precision,
+        dim as u32,
+        &corpus,
+        1,
+    )
+    .map_err(|e| format!("rows={rows} dim={dim}: HnswIndex build failed: {e}"))?;
+    let vm_rss_kb_after = read_vm_rss_kb();
+    let vm_hwm_kb = read_vm_hwm_kb();
+
+    if index.len() != rows as usize {
+        return Err(format!(
+            "rows={rows} dim={dim}: built index len {} does not match corpus rows {rows}",
+            index.len()
+        ));
+    }
+    let requested = match precision {
+        ResidentPrecision::F32 => "f32",
+        ResidentPrecision::F16 => "f16",
+    };
+    let effective = match index.resident_precision() {
+        ResidentPrecision::F32 => "f32",
+        ResidentPrecision::F16 => "f16",
+    };
+    Ok(render_index_memory_line(
+        rows,
+        dim as u32,
+        requested,
+        effective,
+        index.approx_heap_bytes(),
+        vm_rss_kb_before,
+        vm_rss_kb_after,
+        vm_hwm_kb,
+    ))
+}
+
+/// 索引単体メモリ計測モード（Issue #516・要件 B。`BENCH_KNN_PROFILE_INDEX_MEMORY=1`）。
+/// `knn_engine` が `brute_force` の場合は索引を構築しないため拒否する
+/// （fail-closed。typo で「メモリ計測のつもりが何も測っていない」事故を防ぐ）。
+fn run_index_memory_mode(knn_engine: harness::bench_engine::BenchEngine, dim: usize, scale: u64) {
+    if knn_engine == harness::bench_engine::BenchEngine::BruteForce {
+        fail_closed(
+            "BENCH_KNN_PROFILE_INDEX_MEMORY requires BENCH_KNN_PROFILE_ENGINE=hnsw or hnsw_f16 \
+             (brute_force builds no index)",
+        );
+    }
+    let rows = match scaled_rows(scale, TOTAL_ROWS as u64) {
+        Ok(r) => r,
+        Err(e) => fail_closed(e),
+    };
+    println!(
+        "knn_profile_bench: index_memory_mode rows={rows} dim={dim} engine={} (Issue #516。\
+         子プロセス隔離計測。QEMU 共有開発環境での実測は参考値)",
+        knn_engine.token()
+    );
+    let exe = std::env::current_exe().unwrap_or_else(|e| {
+        fail_closed(format!("current_exe unavailable: {e}"));
+    });
+    let child_value = format!("{scale}:{dim}:{}", knn_engine.token());
+    let output = std::process::Command::new(&exe)
+        .env(INDEX_MEMORY_CHILD_ENV, &child_value)
+        .output()
+        .unwrap_or_else(|e| fail_closed(format!("memory child process spawn failed: {e}")));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        fail_closed(format!(
+            "memory child process exited with {:?}: {stderr}",
+            output.status.code()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("knn_profile_bench: index_memory "))
+        .unwrap_or_else(|| {
+            fail_closed("memory child process produced no index_memory line".to_string())
+        });
+    println!("{line}");
 }
 
 /// [`engine::isa::current().dot`] を呼ぶだけの薄いラッパー。`#[inline(never)]` に

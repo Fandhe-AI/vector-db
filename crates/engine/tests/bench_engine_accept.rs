@@ -10,7 +10,7 @@
 mod harness;
 
 use harness::bench_engine::{
-    expected_arm, parse_dim, parse_engine, parse_full_scan_ratio, parse_scale,
+    expected_arm, parse_dim, parse_engine, parse_flag, parse_full_scan_ratio, parse_scale,
     parse_sparse_visited_max, parse_visible_ratio, BenchEngine, ExpectedArm,
 };
 
@@ -30,10 +30,52 @@ fn parse_engine_accepts_hnsw() {
 }
 
 #[test]
+fn parse_engine_accepts_hnsw_f16() {
+    assert_eq!(parse_engine(Some("hnsw_f16")), Ok(BenchEngine::HnswF16));
+}
+
+#[test]
 fn parse_engine_rejects_unknown_values_fail_closed() {
-    for raw in ["HNSW", "ann", "bruteforce", "0"] {
+    for raw in [
+        "HNSW",
+        "ann",
+        "bruteforce",
+        "0",
+        "HNSW_F16",
+        "f16",
+        "hnswf16",
+    ] {
         assert!(
             parse_engine(Some(raw)).is_err(),
+            "expected {raw:?} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn bench_engine_token_round_trips_through_parse_engine() {
+    for engine in [
+        BenchEngine::BruteForce,
+        BenchEngine::Hnsw,
+        BenchEngine::HnswF16,
+    ] {
+        assert_eq!(parse_engine(Some(engine.token())), Ok(engine));
+    }
+}
+
+#[test]
+fn parse_flag_defaults_to_false_and_accepts_zero_one() {
+    assert_eq!(parse_flag(None), Ok(false));
+    assert_eq!(parse_flag(Some("")), Ok(false));
+    assert_eq!(parse_flag(Some("0")), Ok(false));
+    assert_eq!(parse_flag(Some(" 1 ")), Ok(true));
+}
+
+#[test]
+fn parse_flag_rejects_unknown_values_fail_closed() {
+    for raw in ["true", "false", "yes", "no", "2", "-1", "TRUE"] {
+        assert!(
+            parse_flag(Some(raw)).is_err(),
             "expected {raw:?} to be rejected"
         );
     }
