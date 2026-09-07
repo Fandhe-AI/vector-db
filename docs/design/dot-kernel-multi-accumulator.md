@@ -299,19 +299,30 @@ per-run 生データ（N=5・プロセス単位起動。参照区間の対称化
 
 | working_set | dim | run1 | run2 | run3 | run4 | run5 | min-of-N | median |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| cache_resident | 128 | A=0.134 B=0.124 r=0.922 | A=0.134 B=0.123 r=0.921 | A=0.135 B=0.125 r=0.928 | A=0.136 B=0.126 r=0.923 | A=0.133 B=0.124 r=0.929 | 0.9248 | 0.9230 |
-| cache_resident | 768 | A=0.179 B=0.082 r=0.458 | A=0.180 B=0.082 r=0.458 | A=0.180 B=0.082 r=0.457 | A=0.180 B=0.082 r=0.457 | A=0.180 B=0.082 r=0.457 | 0.4581 | 0.4570 |
-| arena_scale | 128 | A=0.226 B=0.235 r=1.040 | A=0.231 B=0.241 r=1.045 | A=0.230 B=0.239 r=1.042 | A=0.230 B=0.240 r=1.045 | A=0.227 B=0.236 r=1.040 | 1.0398 | 1.0420 |
-| arena_scale | 768 | A=3.086 B=2.632 r=0.853 | A=3.084 B=2.632 r=0.853 | A=3.086 B=2.600 r=0.843 | A=3.083 B=2.561 r=0.831 | A=3.074 B=2.610 r=0.849 | 0.8331 | 0.8490 |
+| cache_resident | 128 | A=0.134 B=0.124 r=0.922 | A=0.134 B=0.123 r=0.921 | A=0.135 B=0.125 r=0.928 | A=0.136 B=0.126 r=0.923 | A=0.133 B=0.124 r=0.929 | 0.9248 | 0.9254 |
+| cache_resident | 768 | A=0.179 B=0.082 r=0.458 | A=0.180 B=0.082 r=0.458 | A=0.180 B=0.082 r=0.457 | A=0.180 B=0.082 r=0.457 | A=0.180 B=0.082 r=0.457 | 0.4581 | 0.4556 |
+| arena_scale | 128 | A=0.226 B=0.235 r=1.040 | A=0.231 B=0.241 r=1.045 | A=0.230 B=0.239 r=1.042 | A=0.230 B=0.240 r=1.045 | A=0.227 B=0.236 r=1.040 | 1.0398 | 1.0391 |
+| arena_scale | 768 | A=3.086 B=2.632 r=0.853 | A=3.084 B=2.632 r=0.853 | A=3.086 B=2.600 r=0.843 | A=3.083 B=2.561 r=0.831 | A=3.074 B=2.610 r=0.849 | 0.8331 | 0.8462 |
 
 （A = `single_row_median_ms`・B = `block4_median_ms`・r = `ratio`（B/A）。
 min-of-N は `min(B の 5 run) / min(A の 5 run)`（`benchmark-judgement-policy.md`
 §3 の統計量定義どおり。正の時間値であれば各 run の r の範囲内に収まる）。
-median は 5 run の r の中央値。生データは `crates/engine/benches/harness/dot_block.rs`・
-`benches/dot_kernel_bench.rs` の `measure_block_ab_stage` が同一プロセス内で
-`run_ab`（interleaved）により出力する行から再現可能。実行ログは
-`docs/design`（本 doc）以外には保存していないため、再現には「再現手順（層 A）」
-節の手順を再実行すること）
+median は `median(B の 5 run) / median(A の 5 run)`（`benchmark-judgement-policy.md`
+§2「median-of-N: N ペアの中央値を採る統計量」・§3「統計量は min-of-N と median の
+両方を必ず併記する」の定義どおり、min-of-N と対称に各系列〔A・B〕の中央値から
+算出する。`harness/ab.rs::median_ratio`〔`summary_a.median / summary_b.median`〕
+と同一方式であり、本節「層 B」の `S5_search_parallel` の median 集計方式とも
+一致させた。旧版は各 run の比率 r の中央値〔`median(r)`。系列 A・B 双方の中央値が
+同一 run で揃うとは限らないため一般に `median(B)/median(A)` とは一致しない〕を
+誤って「median」欄に記載していた〔codex-review 指摘〕。両者の差は本節の実測値
+では小さく〔例: cache128 は 0.9230→0.9254〕、下記「判定」節の分類結果〔`Improved`
+／`ノイズ帯内`〕はいずれも変わらない。参考として各 run の比率 r の中央値
+（旧版の値）も別の統計量として残す: cache128 0.9230・cache768 0.4570・
+arena128 1.0420・arena768 0.8490。生データは `crates/engine/benches/harness/
+dot_block.rs`・`benches/dot_kernel_bench.rs` の `measure_block_ab_stage` が
+同一プロセス内で `run_ab`（interleaved）により出力する行から再現可能。実行
+ログは `docs/design`（本 doc）以外には保存していないため、再現には「再現手順
+（層 A）」節の手順を再実行すること）
 
 参照区間（`block4_ab_ref`。A/B 側と同一 `repeat` 回で 1 行版 `dot` を反復走査。
 block4 A/B の対象外）の 1 プロセスぶんの代表値（`ref_median_ms`）と、そこから
@@ -336,12 +347,12 @@ block4 A/B の対象外）の 1 プロセスぶんの代表値（`ref_median_ms`
 
 - dim768（cache_resident・arena_scale とも）: `Improved`（固定 ±5% 帯・実測
   run-to-run 帯の両方を超過）。cache_resident は min-of-N 比 0.4581・median 比
-  0.4570（reference_band 0.56% を大きく上回る）。arena_scale は min-of-N 比
-  0.8331・median 比 0.8490（reference_band 3.39% を上回る）。
-- dim128 cache_resident: `Improved`（min-of-N 比 0.9248・median 比 0.9230。
+  0.4556（reference_band 0.56% を大きく上回る）。arena_scale は min-of-N 比
+  0.8331・median 比 0.8462（reference_band 3.39% を上回る）。
+- dim128 cache_resident: `Improved`（min-of-N 比 0.9248・median 比 0.9254。
   reference_band 1.43% に対し `|ratio-1|` は約 7.5〜7.7% で両ノイズ帯を超過）。
 - dim128 arena_scale: `ノイズ帯内`（固定 ±5% 帯の範囲内。min-of-N 比
-  1.0398・median 比 1.0420 はいずれも `dot_block4` 側がわずかに遅い方向だが、
+  1.0398・median 比 1.0391 はいずれも `dot_block4` 側がわずかに遅い方向だが、
   固定帯を超えていないため実測 reference_band〔1.74%〕を超えているか否かに
   関わらず「両ノイズ帯を超えること」という §4 の要件を満たさず、有効な変化
   としては扱わない。旧版はここを改善方向〔約 -1〜-3%〕と誤記していたが、
