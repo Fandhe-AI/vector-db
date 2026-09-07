@@ -109,10 +109,16 @@ GPU 上で実行し、以下を確認した:
 - #521 マージ後のエンコーダ統合（本 Issue で置いた `packed_i8.rs` 内エンコー
   ダを #521 の共有層へ寄せる）
 - i8 用 workgroup 内部分 Top-k シェーダ（i32 キーの bitonic 網）は未実装
+  （#543 実測により readback 量が f16 比約 12.8 倍多いことが定量的に判明。
+  §8「原因分析」参照。実装自体は引き続き未着手）
 - クエリタイル化（1 dispatch = 複数クエリ。既存 f16/f32 経路の
-  `GPU_QUERY_TILE_MAX` 相当）は未実装
-- oversample 既定値の調整（#523／#543 の実測後）
-- `bench-gpu-scaling` への i8 経路追加と前後比較表（#543）
+  `GPU_QUERY_TILE_MAX` 相当）は未実装（同じく §8「原因分析」で速度低下の
+  主因の一つと分析。実装自体は引き続き未着手）
+- oversample 既定値の調整（#543 実測で推奨値〔既定 4 のまま〕を記録。
+  production コード〔`DEFAULT_I8_OVERSAMPLE`〕の変更は見送り。§8「oversample
+  の推奨値」参照）
+- `bench-gpu-scaling` への i8 経路追加と前後比較表（#543 で実施済み。
+  §8 参照）
 - wgpu 更新時に判別可能な feature が追加された場合の `Dot4I8Impl` 判定の実装
 - `FallbackBatchEngine` への i8 primary 接続は行わない（既定経路不変・#541
   契約）
@@ -251,12 +257,16 @@ oversample 増加で非減少）とも整合する。
 | 100,000 | 256 | 64 | 25,600,000 | 2,560 | Vulkan | Undetermined | 175 |
 
 readback バイト数は `dim` に依存せず（i8 dispatch が読み戻すのは i32
-スコア配列のみでベクトル次元数を含まない）、`rows × batch × 4 × 10`
-（候補生成専用のため既存 f16/f32 の部分 Top-k readback とは異なり
-`k' = k × oversample` 件の生スコアをそのまま読み戻す構造）で決まる。
-`dot4_impl` は wgpu 30.0.1 の制約により全 run で `Undetermined`
-（§4「`Dot4I8Impl` が常に `Undetermined` である理由」節参照。native/
-polyfill の A/B は本実測のスコープ外）。
+スコア配列のみでベクトル次元数を含まない）、`rows × batch × 4`（到達可能な
+**全行**の生 i32 スコアをそのまま readback し、`k' = k × oversample` 件への
+縮約は CPU 側〔`reduce_top_k_prime`〕で行う構造。`packed_i8.rs::
+dispatch_i8_dot_products`／`raw_i32_scores` 参照）で決まる。既存 f16/f32
+経路が Issue #536 で獲得した「GPU 側 workgroup 内部分 Top-k による readback
+削減」を i8 経路は持たない——同一規模点の f16 readback（`gpu_scaling_stats:`
+行。100000:128:64 で 2,001,920 bytes/call）と比べて i8 は**約 12.8 倍多い**
+（25,600,000 bytes/call）。`dot4_impl` は wgpu 30.0.1 の制約により全 run で
+`Undetermined`（§4「`Dot4I8Impl` が常に `Undetermined` である理由」節参照。
+native/polyfill の A/B は本実測のスコープ外）。
 
 ### レイテンシ（参考値・共有 QEMU 環境のため採否根拠にしない）
 
@@ -270,38 +280,49 @@ polyfill の A/B は本実測のスコープ外）。
 | --- | --- | --- | --- | --- | --- | --- |
 | 20000:128:8 | 5,486 / 6,196 µs | 5,047 µs | 535 µs | 1.087x（**遅い**） | 10.254x（**遅い**） | 11.32% |
 | 100000:128:64 | 306,634 / 310,024 µs | 82,869 µs | 15,810 µs | 3.700x（**遅い**） | 19.395x（**遅い**） | 11.62% |
-| 100000:256:64 | 336,079 / 361,815 µs | 137,090 µs | 21,899 µs | 2.452x（**遅い**） | 15.347x（**遅い**） | 121.0%（loadavg 変動による外れ値混入。実測帯内・判定不能） |
+| 100000:256:64 | 336,079 / 361,815 µs | 137,090 µs | 21,899 µs | 2.452x（**遅い**） | 15.347x（**遅い**） | 121.0%（1 run の外れ値〔loadavg スパイク〕で拡大。実測帯も超過） |
 
 3 規模点いずれも i8 経路は A（CPU-SIMD）・B（GPU f16 常駐）の**両方より
-明確に遅い**（比 1.09〜3.70x 対 A、10.3〜19.4x 対 B）。参照区間帯を大きく
-超える一貫した悪化方向であり（`100000:256:64` の参照区間帯 121% は 1 run
-の外れ値〔loadavg スパイク〕によるもので、他の 2 点・生ログの他 4 ペアは
-安定した傾向を示す）、共有環境のノイズでは説明できない一貫した傾向と判断
-する。
+明確に遅い**（比 1.09〜3.70x 対 A、10.3〜19.4x 対 B）。いずれの点も参照
+区間帯を大きく超える一貫した悪化方向であり（`100000:256:64` は帯自体が
+1 run の外れ値で 121% まで拡大しているが、`|ratio-1|` はその帯すら上回る
+1330% に達するため判定は揺るがない）、共有環境のノイズでは説明できない
+一貫した傾向と判断する。
 
 ### 原因分析
 
-i8 経路（`packed_i8.rs::DOT_SHADER_I8_WGSL`）は**「1 dispatch = 1
-クエリ」**の単純な構造のまま実装されている（同シェーダのドキュメンテー
-ションコメント「D11 の申し送り」参照）。一方で既存 f16/f32 経路は
-Issue #532（クエリタイル化。最大 `GPU_QUERY_TILE_MAX` 本を 1 dispatch へ
-束ねる）・Issue #536（workgroup 内部分 Top-k による readback 削減）を
-経て最適化済みであり、GPU dispatch・常駐行列読み込みの固定コストを複数
-クエリで償却できる。i8 経路にはこの償却機構がなく、`batch >= 8` の全規模
-点で `1 dispatch/query` の固定オーバーヘッドがバッチサイズに比例して
-積み上がることが、上記の速度比が readback バイト数の削減比（f16 比
-1/8〜1/4 相当のバイト数）から期待される改善とは逆方向に大きく外れている
-主因と考えられる（クエリタイル化・部分 Top-k は #542 doc §6 で明示的に
-「未実装」と申し送られている既知のスコープ外事項であり、本実測で初めて
-定量的な裏付けが得られた）。
+速度低下は 2 つの既知のスコープ外事項（#542 doc §6「i8 用 workgroup 内
+部分 Top-k シェーダは未実装」「クエリタイル化は未実装」）に起因すると
+分析する。
+
+1. **readback 量が f16 の約 12.8 倍**（上記「確定的指標」節）。i8 経路は
+   `raw_i32_scores`／`dispatch_i8_dot_products` が到達可能な**全行**の
+   生 i32 スコアを readback してから CPU 側で `k' = k × oversample` 件へ
+   縮約する構造で、Issue #536 が f16/f32 経路に追加した「workgroup 内
+   部分 Top-k による readback 削減」を持たない。つまり i8 経路の readback
+   構造は #536 適用**前**の f16/f32 経路（`docs/design/gpu-batch-topk.md`
+   の before 相当）と同型であり、あらためて readback 削減を実装すれば
+   同種の改善（実測 12.66〜12.79x）が見込める。
+2. **「1 dispatch = 1 クエリ」のまま**（`packed_i8.rs::DOT_SHADER_I8_WGSL`
+   ドキュメンテーションコメント「D11 の申し送り」参照）。既存 f16/f32
+   経路は Issue #532（クエリタイル化。最大 `GPU_QUERY_TILE_MAX` 本を
+   1 dispatch へ束ねる）で GPU dispatch・常駐行列読み込みの固定コストを
+   複数クエリで償却できるようになったが、i8 経路にはこの償却機構がなく、
+   `batch >= 8` の全規模点で `1 dispatch/query` の固定オーバーヘッドが
+   バッチサイズに比例して積み上がる。
+
+両要因とも本実測で初めて定量的な裏付け（readback 12.8 倍・速度比
+1.09〜19.4x）が得られた。行単位対称 SQ8 量子化そのもの（1 byte/要素の
+常駐サイズ削減）は本実測の対象外だが、readback・dispatch 構造の 2 点を
+是正しない限り、常駐サイズ削減の恩恵は速度実測には現れないと考えられる。
 
 ### oversample の推奨値
 
-構築時固定オプションのため、本実測（既定 oversample=4）に加え、開発中の
-スモークテストとして `20000:128:8`・`crates/engine/tests/
-gpu_batch_i8.rs::i8_backend_recall_is_monotone_non_decreasing_in_
-oversample_when_gpu_available`（2,000 行・dim 128 のクラスタ構造ありコー
-パス）で oversample を 1・4・8 と振った際の Recall@10 が非減少である
+構築時固定オプションのため、本実測（既定 oversample=4）に加え、`crates/
+engine/tests/gpu_batch_i8.rs::
+i8_backend_recall_is_monotone_non_decreasing_in_oversample_when_gpu_
+available`（2,000 行・dim 128 のクラスタ構造ありコーパス）で oversample を
+1・4・8 と振った際の Recall@10 が非減少である
 ことを確認済み（同テストは `make ci` 対象として本 PR に含まれる）。加えて
 2,000 行・dim 128・batch 8 の単発スモーク実測で oversample 1 → 2 → 4 → 8
 の平均 Recall@10 が 0.9875 → 1.0000 → 1.0000 → 1.0000 と単調に改善する
@@ -345,7 +366,7 @@ oversample_when_gpu_available`（2,000 行・dim 128 のクラスタ構造あり
    ピングし、min-of-N・median・`ratio = i8_p95_min / {cpu,f16}_p95_min`・
    pooled `cpu_p50` の `reference_band` を算出する。
 
-## スコープ外・申し送り（Issue #543）
+## 9. スコープ外・申し送り（Issue #543）
 
 - `500000:128:64` 等の追加規模点（i8 は 1 run あたり最大約 2.2 秒〔p50〕・
   N=5 ペアで数分規模になり、本実測の時間予算では計測時間の都合で見送った）
