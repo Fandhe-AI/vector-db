@@ -3,6 +3,14 @@
 //! ANN opt-in（Issue #412。前提: ADR `docs/design/ann-index-adoption.md` B 案
 //! 〔Issue #403 Accepted〕・EXPLAIN 露出〔Issue #411〕）検索エンジン切替 fixture。
 //!
+//! Issue #515 で HNSW 索引ノードの f16 常駐（`hnsw::ResidentPrecision::F16`・
+//! Issue #514）opt-in を [`RecallEngine::HnswF16`] として追加した。索引の
+//! `ValidatedHnswParams` は検証済み型（[`crate::hnsw::HnswError`] を経由済み）の
+//! ため、`SearchEngineKind::Hnsw(validated)` を fixture 内で直接構築しても
+//! `search_engine::hnsw_kind` が守る「未検証入力の唯一の入口」契約は迂回しない
+//! （untrusted な文字列・設定値からの構築ではなく、`ValidatedHnswParams::new` を
+//! 経由済みの値に `with_resident_precision` を適用するだけのため）。
+//!
 //! `hnsw::provider::HnswSearchProvider::search` は常に brute-force へ委譲する
 //! 契約であり、各ハーネスが直接使う `SearchProvider`（[`engine::kernel::
 //! SearchProvider`]）の差し替えだけでは ANN 経路は発火しない。ANN の実 seam
@@ -43,14 +51,17 @@ pub enum RecallEngine {
     BruteForce,
     /// ANN opt-in（SQL 表層 `EngineCore::from_storage_with_engine` 経由）。
     Hnsw,
+    /// ANN opt-in・HNSW 索引ノード f16 常駐（Issue #515・#514）。
+    HnswF16,
 }
 
 impl RecallEngine {
     /// `RECALL_ENGINE` 環境変数から解決する。未設定・空文字列・`"brute_force"`
-    /// は [`RecallEngine::BruteForce`]、`"hnsw"` は [`RecallEngine::Hnsw`]。
-    /// それ以外は fail-closed で panic する（`sql/mode.rs` の「厳密一致のみ
-    /// 受理」方針と同型。未知値を黙って既定へ倒すと、typo で意図せず ANN 測定が
-    /// 静かにスキップされる事故を防げないため）。
+    /// は [`RecallEngine::BruteForce`]、`"hnsw"` は [`RecallEngine::Hnsw`]、
+    /// `"hnsw_f16"` は [`RecallEngine::HnswF16`]。それ以外は fail-closed で
+    /// panic する（`sql/mode.rs` の「厳密一致のみ受理」方針と同型。未知値を
+    /// 黙って既定へ倒すと、typo で意図せず ANN 測定が静かにスキップされる
+    /// 事故を防げないため）。
     pub fn from_env() -> Self {
         let raw = std::env::var("RECALL_ENGINE").ok();
         match Self::parse(raw.as_deref()) {
@@ -65,8 +76,10 @@ impl RecallEngine {
         match raw.map(str::trim) {
             None | Some("") | Some("brute_force") => Ok(Self::BruteForce),
             Some("hnsw") => Ok(Self::Hnsw),
+            Some("hnsw_f16") => Ok(Self::HnswF16),
             Some(other) => Err(format!(
-                "RECALL_ENGINE must be unset, \"brute_force\", or \"hnsw\" (got {other:?})"
+                "RECALL_ENGINE must be unset, \"brute_force\", \"hnsw\", or \"hnsw_f16\" \
+                 (got {other:?})"
             )),
         }
     }
@@ -77,6 +90,7 @@ impl RecallEngine {
         match self {
             Self::BruteForce => "brute_force",
             Self::Hnsw => "hnsw",
+            Self::HnswF16 => "hnsw_f16",
         }
     }
 }
@@ -108,6 +122,9 @@ pub struct AnnStats {
     pub hybrid_rounds_max: u64,
     pub ef_cap_fallbacks: u64,
     pub entries: usize,
+    /// F16 常駐要求時に範囲外成分（`|x| > 65504.0`）で F32 常駐へ自動縮退した
+    /// 回数（`builds` の内数。D6・Issue #514・#515）。
+    pub f16_residency_fallbacks: u64,
 }
 
 /// SQL 表層（`EngineCore::execute_sql`）経由で hybrid クエリを発行するための
@@ -118,6 +135,7 @@ pub struct AnnStats {
 pub struct SqlHybridFixture {
     core: EngineCore,
     ctx: PolicyContext,
+    engine: RecallEngine,
     _guard: CleanupGuard,
 }
 
@@ -158,6 +176,21 @@ impl SqlHybridFixture {
                     .expect("valid hnsw params");
                 EngineCore::from_storage_with_engine(storage, kind)
             }
+            RecallEngine::HnswF16 => {
+                // `ValidatedHnswParams::new` を経由した検証済み値
+                // （`search_engine::hnsw_kind` が守る「untrusted な
+                // `HnswParams` はここでのみ検証する」契約と同じ経路）に
+                // F16 常駐 opt-in（`with_resident_precision`）を適用する。
+                // untrusted 入力（`HnswParams`）自体は依然 `validate()` を
+                // 経由済みのため、この構築は fixture 内であっても production の
+                // 「未検証入力の唯一の入口」契約を迂回しない（Issue #515）。
+                let validated =
+                    engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
+                        .expect("default params validate")
+                        .with_resident_precision(engine::hnsw::ResidentPrecision::F16);
+                let kind = engine::search_engine::SearchEngineKind::Hnsw(validated);
+                EngineCore::from_storage_with_engine(storage, kind)
+            }
             RecallEngine::BruteForce => {
                 EngineCore::from_storage(storage, search_engine::default_engine())
             }
@@ -165,6 +198,7 @@ impl SqlHybridFixture {
         Self {
             core,
             ctx,
+            engine,
             _guard: guard,
         }
     }
@@ -201,6 +235,7 @@ impl SqlHybridFixture {
             hybrid_rounds_max: s.hybrid_rounds_max,
             ef_cap_fallbacks: s.ef_cap_fallbacks,
             entries: s.entries,
+            f16_residency_fallbacks: s.f16_residency_fallbacks,
         }
     }
 
@@ -220,6 +255,34 @@ impl SqlHybridFixture {
                 stats.hybrid_dense_searches > 0,
                 "expected the hybrid dense refetch loop to use the HNSW index"
             );
+            // Issue #515: `resident=` の Display 出力・自動縮退カウンタの両方で
+            // 「opt-in が実際にエンジンへ到達し、かつ（F16 の場合）縮退していない」
+            // ことを固定する。`f16_residency_fallbacks == 0` 単独では F32 を
+            // 要求した場合も 0 になり vacuous なので、Display 側と組み合わせる。
+            let resident_suffix = match self.engine {
+                RecallEngine::HnswF16 => "resident=f16",
+                RecallEngine::Hnsw => "resident=f32",
+                RecallEngine::BruteForce => {
+                    panic!("assert_ann_non_vacuous(true) is only meaningful for ANN engines")
+                }
+            };
+            let kind_display = self
+                .core
+                .search_engine_kind()
+                .map(|k| k.to_string())
+                .unwrap_or_default();
+            assert!(
+                kind_display.contains(resident_suffix),
+                "expected search_engine_kind() display to contain {resident_suffix:?}, got \
+                 {kind_display:?}"
+            );
+            if self.engine == RecallEngine::HnswF16 {
+                assert_eq!(
+                    stats.f16_residency_fallbacks, 0,
+                    "embeddings in this fixture's corpus must stay within the f16 finite \
+                     range and must not trigger the F32 fallback (D6)"
+                );
+            }
         } else {
             assert_eq!(
                 stats.builds, 0,
@@ -249,15 +312,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_hnsw_f16() {
+        assert_eq!(
+            RecallEngine::parse(Some("hnsw_f16")),
+            Ok(RecallEngine::HnswF16)
+        );
+    }
+
+    #[test]
     fn parse_trims_surrounding_whitespace() {
         // GitHub Actions の variable 展開が末尾改行を持ち込む経路
         // （`recall_threshold_from_env` 等、他ゲートの慣行と同様）を許容する。
         assert_eq!(RecallEngine::parse(Some(" hnsw\n")), Ok(RecallEngine::Hnsw));
+        assert_eq!(
+            RecallEngine::parse(Some(" hnsw_f16\n")),
+            Ok(RecallEngine::HnswF16)
+        );
     }
 
     #[test]
     fn parse_rejects_unknown_values_fail_closed() {
-        for raw in ["HNSW", "ann", "bruteforce", "0"] {
+        for raw in [
+            "HNSW",
+            "ann",
+            "bruteforce",
+            "0",
+            "hnsw-f16",
+            "HNSW_F16",
+            "f16",
+        ] {
             assert!(
                 RecallEngine::parse(Some(raw)).is_err(),
                 "expected {raw:?} to be rejected"
@@ -269,5 +352,6 @@ mod tests {
     fn token_does_not_reveal_numeric_thresholds() {
         assert_eq!(RecallEngine::BruteForce.token(), "brute_force");
         assert_eq!(RecallEngine::Hnsw.token(), "hnsw");
+        assert_eq!(RecallEngine::HnswF16.token(), "hnsw_f16");
     }
 }

@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use engine::hnsw::{
-    HnswError, HnswIndex, HnswParams, HnswSearchScratch, MAX_EF, SEQUENTIAL_PREFIX_NODES,
+    HnswError, HnswIndex, HnswParams, HnswSearchScratch, NodeMask, MAX_EF, SEQUENTIAL_PREFIX_NODES,
 };
 use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
 
@@ -225,16 +225,22 @@ fn parallel_build_recall_at_10_matches_sequential_build_within_margin() {
     let queries = gen_queries(0xA5A5_1234_1111, 0x51DE_0004, dim, 20, 100);
 
     let sequential = HnswIndex::build(params, dim as u32, &vectors, seed).unwrap();
-    let parallel = HnswIndex::build_with_threads(params, dim as u32, &vectors, seed, 4).unwrap();
 
-    for ef in [64usize, 256] {
-        let seq_recall = recall_at_10(&sequential, &vectors, dim, rows, ef, &queries);
-        let par_recall = recall_at_10(&parallel, &vectors, dim, rows, ef, &queries);
-        assert!(
-            par_recall >= seq_recall - 0.02,
-            "ef={ef} parallel Recall@10={par_recall} must be within 0.02 of \
-             sequential Recall@10={seq_recall}"
-        );
+    // Issue #448: パス分離（plan_links／publish_links）・逆方向リンク保証の
+    // 導入後、高スレッド数（threads=12）でも Recall@10 が同水準であることを
+    // 追加確認する（4 に加え 12。`MAX_BUILD_THREADS`=16 のため許容範囲）。
+    for threads in [4usize, 12] {
+        let parallel =
+            HnswIndex::build_with_threads(params, dim as u32, &vectors, seed, threads).unwrap();
+        for ef in [64usize, 256] {
+            let seq_recall = recall_at_10(&sequential, &vectors, dim, rows, ef, &queries);
+            let par_recall = recall_at_10(&parallel, &vectors, dim, rows, ef, &queries);
+            assert!(
+                par_recall >= seq_recall - 0.02,
+                "threads={threads} ef={ef} parallel Recall@10={par_recall} must be \
+                 within 0.02 of sequential Recall@10={seq_recall}"
+            );
+        }
     }
 }
 
@@ -536,4 +542,57 @@ fn search_on_parallel_built_index_is_deterministic_across_repeated_calls() {
     let mut fresh_scratch = HnswSearchScratch::default();
     let with_fresh_scratch = index.search(&query, 10, 64, &mut fresh_scratch).unwrap();
     assert_eq!(first, with_fresh_scratch);
+}
+
+/// Issue #497: 公開 API 経由でも `HnswIndex::search_masked_with` の
+/// `sparse_visited_max` opt-in（`VisitedSet` の疎な実装への切替）が結果へ
+/// 一切影響しないことを固定する（crate 外の公開 API のみで検証する `tests/*.rs`
+/// の流儀に従い、`crates/engine/src/hnsw.rs` 内 `#[cfg(test)] mod tests` の
+/// `search_masked_with_force_sparse_matches_force_dense_bit_identical` を
+/// 公開 API 側から補完する）。
+#[test]
+fn search_masked_with_sparse_visited_max_does_not_change_results() {
+    let (_, index) = small_index();
+    let dim = 8;
+    let query = gen_query(0x9999_0000, 0xBBBB_2222, dim, 8);
+
+    let mut mask = NodeMask::new(index.len());
+    for node in 0..index.len() {
+        if node % 4 == 0 {
+            mask.set(node as u32);
+        }
+    }
+
+    let mut scratch_dense = HnswSearchScratch::default();
+    let via_dense = index
+        .search_masked_with(&query, 10, 64, Some(&mask), 0, &mut scratch_dense)
+        .unwrap();
+
+    let mut scratch_sparse = HnswSearchScratch::default();
+    let via_sparse = index
+        .search_masked_with(&query, 10, 64, Some(&mask), usize::MAX, &mut scratch_sparse)
+        .unwrap();
+
+    assert_eq!(
+        via_dense, via_sparse,
+        "sparse_visited_max opt-in must not change search_masked_with results"
+    );
+
+    // `mask == None` は `sparse_visited_max` の値に関わらず `search` と
+    // ビット同一（`HnswIndex::search_masked_with` ドキュメンテーションコメント
+    // 参照）。
+    let mut scratch_plain = HnswSearchScratch::default();
+    let via_plain = index.search(&query, 10, 64, &mut scratch_plain).unwrap();
+    let mut scratch_none_mask_forced_sparse = HnswSearchScratch::default();
+    let via_none_mask_forced_sparse = index
+        .search_masked_with(
+            &query,
+            10,
+            64,
+            None,
+            usize::MAX,
+            &mut scratch_none_mask_forced_sparse,
+        )
+        .unwrap();
+    assert_eq!(via_plain, via_none_mask_forced_sparse);
 }

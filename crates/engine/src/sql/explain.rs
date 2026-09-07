@@ -34,6 +34,7 @@ use crate::query_planner::PlannedQuery;
 use crate::search_engine::SearchEngineKind;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::hnsw_cache::AnnPlan;
+use crate::sql::scalar_plan::ScalarPlan;
 
 /// `EXPLAIN` 応答の列名（安定契約。一度出したら変えない）。
 const QUERY_PLAN_COLUMN: &str = "QUERY PLAN";
@@ -57,6 +58,9 @@ pub(crate) struct ExplainEngine {
     pub(crate) kind: Option<SearchEngineKind>,
     /// [`crate::sql::hnsw_cache::classify_ann_plan`] の判定結果（静的判定）。
     pub(crate) ann_plan: AnnPlan,
+    /// [`crate::sql::scalar_plan::classify_scalar_plan`] の判定結果
+    /// （静的判定。Issue #474）。
+    pub(crate) scalar_plan: ScalarPlan,
 }
 
 /// [`ExplainEngine::kind`] を `engine:` 行の値（閉じた語彙・snake_case）へ変換する。
@@ -91,12 +95,25 @@ fn ann_plan_token(plan: AnnPlan) -> &'static str {
     }
 }
 
+/// [`ScalarPlan`] を `scalar_plan:` 行の値（閉じた語彙・snake_case）へ変換する
+/// （Issue #474）。
+fn scalar_plan_token(plan: ScalarPlan) -> &'static str {
+    match plan {
+        ScalarPlan::PlainScan => "plain_scan",
+        ScalarPlan::IndexEquality => "index_equality",
+        ScalarPlan::IndexPrefix => "index_prefix",
+        ScalarPlan::IndexIdRange => "index_id_range",
+        ScalarPlan::IndexConjunction => "index_conjunction",
+    }
+}
+
 /// [`PlannedQuery`]（LLM 展開結果＋解決済み実効モード）と [`ExplainEngine`]
-/// （使用エンジン・ANN 静的判定、Issue #411）から `EXPLAIN` の [`QueryResult`]
-/// を決定的に構築する（副作用なし。同一入力には常に同一の行を返す）。
+/// （使用エンジン・ANN 静的判定〔Issue #411〕・SCALAR 索引静的判定
+/// 〔Issue #474〕）から `EXPLAIN` の [`QueryResult`] を決定的に構築する
+/// （副作用なし。同一入力には常に同一の行を返す）。
 /// 行順序: `search_terms[i]`（展開結果の件数分）→ `path_hint` → `kind_hint` →
 /// `mode` → `mode_source` → `engine` → （`engine: hnsw` のときのみ）
-/// `hnsw_params` → `ann_plan`。
+/// `hnsw_params` → `ann_plan` → `scalar_plan`。
 pub(crate) fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngine) -> QueryResult {
     let expansion = planned.expansion();
     let resolved = planned.mode();
@@ -123,16 +140,25 @@ pub(crate) fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngin
         // `resident=`（Issue #514）も構築時の静的設定値（要求精度）のみで、
         // 実行時の自動縮退結果（`HnswIndex::resident_precision` の実効値）は
         // 露出しない（#411 の「実行時縮退結果は非露出」契約を踏襲）。
+        // `sparse_visited_max=`（Issue #497）も同じ区分——構築時の静的閾値
+        // （opt-in・既定 0）のみを露出し、実行時にどちらの visited 実装が
+        // 選ばれたか・可視候補数・索引ノード数は非露出のまま
+        // （`docs/design/explain-search-engine-exposure.md` 参照）。
         let p = params.get();
         lines.push(format!(
-            "hnsw_params: m={},ef_construction={},ef_search={},resident={}",
+            "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={}",
             p.m,
             p.ef_construction,
             p.ef_search,
-            params.resident_precision()
+            params.resident_precision(),
+            params.sparse_visited_max()
         ));
     }
     lines.push(format!("ann_plan: {}", ann_plan_token(engine.ann_plan)));
+    lines.push(format!(
+        "scalar_plan: {}",
+        scalar_plan_token(engine.scalar_plan)
+    ));
 
     let rows = lines
         .into_iter()
@@ -171,6 +197,7 @@ mod tests {
         ExplainEngine {
             kind: Some(SearchEngineKind::ParallelBruteForce),
             ann_plan: AnnPlan::PlainScanEngine,
+            scalar_plan: ScalarPlan::PlainScan,
         }
     }
 
@@ -196,9 +223,10 @@ mod tests {
                 name: QUERY_PLAN_COLUMN.to_string()
             }
         );
-        // 既存 6 行（不変・後方互換）+ Issue #411 の `engine`／`ann_plan` 2 行
-        // （既定エンジンでは `hnsw_params` 行は出ない）。
-        assert_eq!(result.rows.len(), 8);
+        // 既存 6 行（不変・後方互換）+ Issue #411 の `engine`／`ann_plan` 2 行 +
+        // Issue #474 の `scalar_plan` 1 行（既定エンジンでは `hnsw_params` 行は
+        // 出ない）。
+        assert_eq!(result.rows.len(), 9);
         assert_eq!(cell_text(&result, 0), "search_terms[0]: alpha");
         assert_eq!(cell_text(&result, 1), "search_terms[1]: beta");
         assert_eq!(cell_text(&result, 2), "path_hint: src/lib.rs");
@@ -207,6 +235,7 @@ mod tests {
         assert_eq!(cell_text(&result, 5), "mode_source: query_clause");
         assert_eq!(cell_text(&result, 6), "engine: parallel_brute_force");
         assert_eq!(cell_text(&result, 7), "ann_plan: plain_scan_engine");
+        assert_eq!(cell_text(&result, 8), "scalar_plan: plain_scan");
     }
 
     #[test]
@@ -225,14 +254,15 @@ mod tests {
         let result = build_explain_result(&planned, &default_engine());
 
         // 検索語 0 件のため行は path_hint/kind_hint/mode/mode_source/engine/
-        // ann_plan の 6 行。
-        assert_eq!(result.rows.len(), 6);
+        // ann_plan/scalar_plan の 7 行。
+        assert_eq!(result.rows.len(), 7);
         assert_eq!(cell_text(&result, 0), "path_hint: (none)");
         assert_eq!(cell_text(&result, 1), "kind_hint: (none)");
         assert_eq!(cell_text(&result, 2), "mode: recall");
         assert_eq!(cell_text(&result, 3), "mode_source: default");
         assert_eq!(cell_text(&result, 4), "engine: parallel_brute_force");
         assert_eq!(cell_text(&result, 5), "ann_plan: plain_scan_engine");
+        assert_eq!(cell_text(&result, 6), "scalar_plan: plain_scan");
     }
 
     #[test]
@@ -254,8 +284,9 @@ mod tests {
             let planned =
                 PlannedQuery::new(QueryExpansion::default(), ResolvedMode::new(mode, source));
             let result = build_explain_result(&planned, &default_engine());
-            // `mode_source` は末尾から 3 番目（末尾 2 行が `engine`／`ann_plan`）。
-            let mode_source_row = result.rows.len() - 3;
+            // `mode_source` は末尾から 4 番目（末尾 3 行が
+            // `engine`／`ann_plan`／`scalar_plan`）。
+            let mode_source_row = result.rows.len() - 4;
             assert_eq!(
                 cell_text(&result, mode_source_row),
                 format!("mode_source: {expected_source}")
@@ -276,16 +307,18 @@ mod tests {
         let engine = ExplainEngine {
             kind: None,
             ann_plan: AnnPlan::UnknownCustomProvider,
+            scalar_plan: ScalarPlan::PlainScan,
         };
 
         let result = build_explain_result(&planned, &engine);
 
         let last = result.rows.len() - 1;
-        assert_eq!(cell_text(&result, last - 1), "engine: (custom_provider)");
+        assert_eq!(cell_text(&result, last), "scalar_plan: plain_scan");
         assert_eq!(
-            cell_text(&result, last),
+            cell_text(&result, last - 1),
             "ann_plan: unknown_custom_provider"
         );
+        assert_eq!(cell_text(&result, last - 2), "engine: (custom_provider)");
     }
 
     #[test]
@@ -299,19 +332,22 @@ mod tests {
         let engine = ExplainEngine {
             kind: Some(SearchEngineKind::Hnsw(hnsw_params)),
             ann_plan: AnnPlan::HnswFullVisible,
+            scalar_plan: ScalarPlan::PlainScan,
         };
 
         let result = build_explain_result(&planned, &engine);
 
-        // path_hint/kind_hint/mode/mode_source/engine/hnsw_params/ann_plan の 7 行
-        // （`hnsw_params` が挟まる分、既定エンジンより 1 行多い）。
-        assert_eq!(result.rows.len(), 7);
+        // path_hint/kind_hint/mode/mode_source/engine/hnsw_params/ann_plan/
+        // scalar_plan の 8 行（`hnsw_params` が挟まる分、既定エンジンより
+        // 1 行多い）。
+        assert_eq!(result.rows.len(), 8);
         assert_eq!(cell_text(&result, 4), "engine: hnsw");
         assert_eq!(
             cell_text(&result, 5),
-            "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32"
+            "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0"
         );
         assert_eq!(cell_text(&result, 6), "ann_plan: hnsw_full_visible");
+        assert_eq!(cell_text(&result, 7), "scalar_plan: plain_scan");
     }
 
     #[test]
@@ -330,17 +366,24 @@ mod tests {
             let engine = ExplainEngine {
                 kind: Some(SearchEngineKind::ParallelBruteForce),
                 ann_plan: plan,
+                scalar_plan: ScalarPlan::PlainScan,
             };
             let result = build_explain_result(&planned, &engine);
-            let last = result.rows.len() - 1;
-            assert_eq!(cell_text(&result, last), format!("ann_plan: {expected}"));
+            // `ann_plan` は末尾から 2 番目（末尾行は Issue #474 の
+            // `scalar_plan`）。
+            let ann_plan_row = result.rows.len() - 2;
+            assert_eq!(
+                cell_text(&result, ann_plan_row),
+                format!("ann_plan: {expected}")
+            );
         }
     }
 
     /// Issue #411 の要件 3（テナント存在情報に繋がる数値の非露出）を
-    /// 機械的に固定する: 新規 3 行（`engine`／`hnsw_params`／`ann_plan`）の値が
-    /// いずれも閉じた語彙集合の要素であり、可視カーディナリティ・行数・
-    /// 索引ノード数等のデータ由来の数値を含まないことを検証する。
+    /// 機械的に固定する: 新規行（`engine`／`hnsw_params`／`ann_plan`／
+    /// `scalar_plan`〔Issue #474〕）の値がいずれも閉じた語彙集合の要素であり、
+    /// 可視カーディナリティ・行数・索引ノード数等のデータ由来の数値を
+    /// 含まないことを検証する。
     #[test]
     fn build_explain_result_new_rows_use_closed_vocabulary_only() {
         const ENGINE_TOKENS: &[&str] = &[
@@ -391,7 +434,11 @@ mod tests {
                 QueryExpansion::default(),
                 ResolvedMode::new(SearchMode::Recall, ModeSource::Default),
             );
-            let engine = ExplainEngine { kind, ann_plan };
+            let engine = ExplainEngine {
+                kind,
+                ann_plan,
+                scalar_plan: ScalarPlan::PlainScan,
+            };
             let result = build_explain_result(&planned, &engine);
 
             let engine_line = format!("engine: {}", engine_token(kind));
@@ -411,11 +458,12 @@ mod tests {
             if let Some(SearchEngineKind::Hnsw(params)) = kind {
                 let p = params.get();
                 let expected = format!(
-                    "hnsw_params: m={},ef_construction={},ef_search={},resident={}",
+                    "hnsw_params: m={},ef_construction={},ef_search={},resident={},sparse_visited_max={}",
                     p.m,
                     p.ef_construction,
                     p.ef_search,
-                    params.resident_precision()
+                    params.resident_precision(),
+                    params.sparse_visited_max()
                 );
                 assert!(
                     result

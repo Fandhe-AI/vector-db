@@ -285,6 +285,13 @@ required_segments_for() {
     # Issue #514: f16 昇格 dot カーネル（`isa::dot_f16_neon_fp16`）。
     # `#[inline(never)]` を付与しているため独立シンボルとして必ず現れる。
     echo "17dot_f16_neon_fp16"
+    # Issue #511（TASK-156・CORE-14）: 4 行ブロックカーネル
+    # `isa::neon_block4::dot_block4_neon`。`#[inline(never)]` を付与している
+    # ため（`dot_f16_neon_fp16` と同じ理由。NEON は aarch64 baseline のため
+    # 付けないと呼び出し元 `dot_block4_impl` へインライン化され独立シンボルとして
+    # 現れない）必須シンボルへ追加する。`PADDED_TAIL` の 2 monomorphization は
+    # 同一セグメントを共有する。
+    echo "15dot_block4_neon"
   fi
 }
 
@@ -312,6 +319,13 @@ expected_rules_for() {
       "dot_f16_neon_fp16" \
       '^[[:space:]]*fcvtl2?[[:space:]]+v[0-9]+\.4s' \
       "f16->f32 promotion (fcvtl/fcvtl2 widening to 4s)"
+    # Issue #511: `vfmaq_f32` が実際に `fmla v.4s` へコンパイルされた証跡を要求する
+    # 非 vacuous 検査（x86 版 `dot_block4_*` には期待規則が無いが、本 Issue は
+    # aarch64 側のみを扱う。x86 側の一般化は Issue #510 doc の申し送りのまま）。
+    printf '%s\t%s\t%s\n' \
+      "dot_block4_neon" \
+      '^[[:space:]]*fmla[[:space:]]+v[0-9]+\.4s' \
+      "row-block FMA (fmla v.4s) actually emitted (not scalarized)"
   fi
 }
 
@@ -797,6 +811,98 @@ pub mod isa_probe {
     }
 }
 RUST
+
+  # pass (Issue #511): `isa.rs::neon_block4::dot_block4_neon` と同型の実装
+  # （`vsetq_lane_f32` 構築＋`vfmaq_f32`＋`&mut f32` 出力）。禁止 0 件かつ
+  # `fmla v.4s` が実際に emit されることを確認する。
+  cat > "${dir}/fx_pass_block4_neon.rs" <<'RUST'
+use std::arch::aarch64::*;
+
+pub mod isa_probe {
+    use super::*;
+    #[target_feature(enable = "neon")]
+    #[inline(never)]
+    pub unsafe fn dot_block4_neon(
+        rows: [&[f32]; 4],
+        query: &[f32],
+        out0: &mut f32,
+        out1: &mut f32,
+        out2: &mut f32,
+        out3: &mut f32,
+    ) {
+        let [r0, r1, r2, r3] = rows;
+        let (qc, qr) = query.as_chunks::<4>();
+        let (c0, t0) = r0.as_chunks::<4>();
+        let (c1, t1) = r1.as_chunks::<4>();
+        let (c2, t2) = r2.as_chunks::<4>();
+        let (c3, t3) = r3.as_chunks::<4>();
+
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
+        let mut a2 = vdupq_n_f32(0.0);
+        let mut a3 = vdupq_n_f32(0.0);
+
+        for ((((qk, x0), x1), x2), x3) in qc.iter().zip(c0).zip(c1).zip(c2).zip(c3) {
+            let [q0, q1, q2, q3] = *qk;
+            let vq = vdupq_n_f32(0.0);
+            let vq = vsetq_lane_f32::<0>(q0, vq);
+            let vq = vsetq_lane_f32::<1>(q1, vq);
+            let vq = vsetq_lane_f32::<2>(q2, vq);
+            let vq = vsetq_lane_f32::<3>(q3, vq);
+
+            let [x00, x01, x02, x03] = *x0;
+            let vx0 = vdupq_n_f32(0.0);
+            let vx0 = vsetq_lane_f32::<0>(x00, vx0);
+            let vx0 = vsetq_lane_f32::<1>(x01, vx0);
+            let vx0 = vsetq_lane_f32::<2>(x02, vx0);
+            let vx0 = vsetq_lane_f32::<3>(x03, vx0);
+            a0 = vfmaq_f32(a0, vx0, vq);
+
+            let _ = (x1, x2, x3);
+        }
+
+        let l0 = vgetq_lane_f32::<0>(a0);
+        let l1 = vgetq_lane_f32::<1>(a0);
+        let l2 = vgetq_lane_f32::<2>(a0);
+        let l3 = vgetq_lane_f32::<3>(a0);
+        let mut sum = -0.0f32;
+        sum += l0;
+        sum += l1;
+        sum += l2;
+        sum += l3;
+        let rem: f32 = t0.iter().zip(qr.iter()).map(|(x, y)| x * y).sum();
+        *out0 = sum + rem;
+        *out1 = *out0;
+        *out2 = *out0;
+        *out3 = *out0;
+        let _ = t1;
+        let _ = t2;
+        let _ = t3;
+    }
+}
+RUST
+
+  # fail (Issue #511): 関数名は `dot_block4_neon` だが実体はスカラー逐次和
+  # （`fmla` を含まない。ソフトウェア縮退の検出漏れを防ぐための非 vacuous 検査対象）。
+  cat > "${dir}/fx_fail_block4_neon_scalarized.rs" <<'RUST'
+pub mod isa_probe {
+    #[inline(never)]
+    pub fn dot_block4_neon(
+        rows: [&[f32]; 4],
+        query: &[f32],
+        out0: &mut f32,
+        out1: &mut f32,
+        out2: &mut f32,
+        out3: &mut f32,
+    ) {
+        let [r0, r1, r2, r3] = rows;
+        *out0 = r0.iter().zip(query.iter()).map(|(x, y)| x * y).sum();
+        *out1 = r1.iter().zip(query.iter()).map(|(x, y)| x * y).sum();
+        *out2 = r2.iter().zip(query.iter()).map(|(x, y)| x * y).sum();
+        *out3 = r3.iter().zip(query.iter()).map(|(x, y)| x * y).sum();
+    }
+}
+RUST
 }
 
 self_test() {
@@ -922,6 +1028,27 @@ self_test() {
         overall=1
       else
         echo "self-test ok: fail_f16_missing_instruction correctly rejected"
+      fi
+    fi
+
+    # Issue #511: 期待命令の非 vacuous 検査（`expected_rules_for`）。
+    asm="$(compile_fixture "${scratch}/pass_block4_neon" "${scratch}/fx_pass_block4_neon.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" aarch64 "isa_probe" "15dot_block4_neon" >/dev/null; then
+        echo "self-test ok: pass_block4_neon (fmla v.4s row-block FMA present)"
+      else
+        echo "self-test FAILED: expected pass_block4_neon to pass" >&2
+        overall=1
+      fi
+    fi
+
+    asm="$(compile_fixture "${scratch}/fail_block4_neon_scalarized" "${scratch}/fx_fail_block4_neon_scalarized.rs" "${TARGET}")" || { overall=1; asm=""; }
+    if [ -n "${asm}" ]; then
+      if run_scan "${asm}" aarch64 "isa_probe" "15dot_block4_neon" >/dev/null 2>&1; then
+        echo "self-test FAILED: expected fail_block4_neon_scalarized to be rejected (no fmla)" >&2
+        overall=1
+      else
+        echo "self-test ok: fail_block4_neon_scalarized correctly rejected"
       fi
     fi
   fi

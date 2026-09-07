@@ -86,7 +86,7 @@ impl HnswIndex {
 は本タスク（#405）の対応で撤去した——検出すべき不一致の入力クラス自体が
 存在しない。
 
-## visited 集合の 2 実装
+## visited 集合の 3 実装
 
 構築経路（`build`／`insert_node`）は世代カウンタ方式の `VisitedScratch`
 （`epoch: Vec<u64>`。#404・codex-review #423 P1 指摘で O(N^2) 初期化を回避
@@ -106,6 +106,54 @@ impl HnswIndex {
 - `VisitedBitmap::reset` は伸長のみで縮めない（呼び出し元が同一スクラッチ
   を異なる索引規模へ使い回す想定のため、再確保コストより多少の未使用
   メモリを許容する）。
+
+### `VisitedSparse`（Issue #497）
+
+`VisitedBitmap` は毎クエリ `reset` で索引ノード数 N に比例する `N/64` 語の
+全クリアを行うため、マスク付き探索（`search_masked_with`。RLS／`WHERE`
+事前フィルタで可視候補が索引に対して極小のケース）でも N 全体分のコストが
+かかる。faiss の `VisitedTable` 方式（可視カーディナリティが小さいときは
+`unordered_set` へ切り替える）を参考に、`HashSet<u32>` ベースの 3 つめの
+`VisitedSet` 実装 `VisitedSparse` を追加した。`reset` は `HashSet::clear`
+（内部確保容量は保持し確保コストを償却する）で行い、実際に訪問したノード数
+にのみ比例する。
+
+- 切替点は `HnswIndex::search_masked_with(query, k, ef, mask,
+  sparse_visited_max, scratch)`（新設）。層 0 のビーム探索直前で
+  `mask.is_some() && mask.count_ones() < sparse_visited_max` を判定し、
+  真なら `VisitedSparse`、それ以外（`mask == None` を含む）は `VisitedBitmap`
+  を使う。`mask == None` は `sparse_visited_max` の値に関わらず常に dense
+  を使い、`Self::search` とのビット同一契約（`search_masked_none_matches_
+  search`）を無条件に維持する。
+- `mask.count_ones()`（`NodeMask`）は同 Issue で `ones: usize` フィールドに
+  よる O(1) 化を行った。旧実装（`words.iter().map(...).sum()`）は語走査
+  そのもので、避けたい `VisitedBitmap::reset` と同じ O(N/64) オーダーの
+  ため、切替判定にそのまま使うと自己矛盾になる。
+- 閾値 `sparse_visited_max` は `ValidatedHnswParams` の private フィールド
+  として持つ（`full_scan_ratio`・`resident_precision` と同じ設計。既存の
+  `HnswParams` へ直接フィールド追加すると外部の構造体リテラルを破壊する
+  破壊的変更になるため）。既定値は `0`（＝常に dense。既存の全動作を不変に
+  保つ）。`with_sparse_visited_max(usize)`（infallible）で opt-in する。
+- `HnswSearchScratch` は `sparse: VisitedSparse`・`last_visited_kind:
+  Option<VisitedKind>`（`Dense`／`Sparse`。診断用）を追加で保持する。
+  `last_visited_kind()`（`pub(crate)`）は `sql::hnsw_cache` が
+  `HnswIndexCacheStats::sparse_visited_searches`（縮退なしで完走した探索の
+  うち sparse を選んだ回数）を計上するのに使う。
+- `EXPLAIN` の `hnsw_params:` 行へ `sparse_visited_max=<n>` を追記した
+  （`resident=` と同区分。構築時静的値のみを露出し、実行時にどちらの
+  visited 実装が選ばれたか・可視候補数・索引ノード数は非露出のまま。
+  `docs/design/explain-search-engine-exposure.md` 参照）。
+
+### 到達可能性についての注記（#498 への申し送り）
+
+production の SQL 表層では `search_with_overlay`（`sql::hnsw_cache`）が
+`visible/index_len >= full_scan_ratio` のときのみ `search_masked_with` を
+呼ぶため、可視候補数は常に「索引ノード数 × full_scan_ratio」以上になる
+（既定 `full_scan_ratio = 1/10` なら索引ノード数の 1/10 以上）。閾値の
+既定値確定・可視比率別の費用対効果測定は Issue #498 の担当（本 Issue は
+機構と計測用 knob——`BENCH_KNN_PROFILE_SPARSE_VISITED_MAX`（`make
+bench-knn-profile`。S0-cold/S0-hot・可視比率スイープ双方に効く）——までを
+担う）。
 
 ## 決定性の保証範囲
 
@@ -489,4 +537,344 @@ BENCH_HNSW_SEARCH_COMMIT=eabff3a CARGO_TARGET_DIR=/path/to/target-after  cargo b
 # 参照区間の実測ノイズ帯（表 2）は単一プロセスの出力からは算出できず、
 # 交互起動した複数プロセス（本 doc では 1 規模点あたり計 10 プロセス分）
 # の代表値列を reference_band へ渡して別途算出する。
+```
+
+## Issue #498: visited 集合切替閾値の可視比率スイープ前後比較と既定値
+
+親 #496・前提 #497（`VisitedSparse` 機構・`sparse_visited_max` 既定 0＝常に
+dense・計測 knob `BENCH_KNN_PROFILE_SPARSE_VISITED_MAX` までを実装済み。
+「visited 集合の 3 実装」節「到達可能性についての注記」参照）。本 Issue は
+その閾値既定値の根拠を、dense（既定）／sparse（`VisitedSparse` を強制）の
+可視比率別 dense/sparse 前後比較として実測し、`docs/design/
+benchmark-judgement-policy.md` に従って記録する。
+
+### 構造的事実（計測前に確認済み）
+
+1. `HnswIndex::search_masked_with` が `VisitedSparse` を選ぶのは
+   `mask.is_some() && mask.count_ones() < sparse_visited_max` のときのみ
+   （§「`VisitedSparse`（Issue #497）」参照）。閾値は**可視候補数の絶対値**
+   との比較であり比率ではない
+2. production（`sql::hnsw_cache::search_with_overlay`）が
+   `search_masked_with` へ到達するのは可視候補数が
+   `index_len × full_scan_ratio`（既定 1/10）以上のときに限る。したがって
+   それ未満の `sparse_visited_max` は production 経路では到達しない
+3. `VisitedBitmap::reset` は索引ノード数 N に比例（N/64 語のクリア）、
+   `VisitedSparse` は実訪問ノード数に比例する `HashSet<u32>` 挿入。
+   25k〜200k 規模では dense 優位が事前仮説
+
+### 計測設計
+
+**層 1（判定の主根拠）**: `hnsw_search_bench.rs`（Issue #491 の 1 規模点 A/B
+基盤）へ `BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX`（非負整数。未設定時は既存
+`search_masked` 経路と完全に同一のまま不変）を追加し、同一バイナリ内の 2 arm
+（`dense`=0固定／`sparse`=`usize::MAX`固定。中間値は非 vacuous 検証を単純化
+できないため受理しない）で計測する。`--features bench-internals` 限定の
+`HnswSearchScratch::last_visited_kind_is_sparse()`（`hnsw.rs`。診断専用の
+薄いラッパー）で、warmup を含む全呼び出しが単一の期待 arm と一致したことを
+確認してから出力する——1 件でも逆 arm・早期 return（`unresolved_calls`）が
+あれば非 0 終了する fail-closed 設計（本 Issue 唯一の `crates/engine/src/`
+変更はこのアクセサ 1 件のみ。挙動変更なし・既定ビルドには結線されない）。
+
+- arm: `dense`（値 0）／`sparse`（値 `usize::MAX`。マスクがあれば常に sparse）
+- 規模点（1 プロセス = 1 規模点。policy §5・Issue #313）: rows
+  {10,000・100,000} × dim 128 × 可視率 {50・25・10・5・2}% × ef 64・k 10・
+  queries 200（既定）
+- 可視候補数の絶対値（`visible_count`）を出力に含める（閾値は絶対値比較の
+  ため）。既定 `full_scan_ratio=1/10` の下で production 到達不能な
+  5%・2% 点は informational として明示する
+- 参照区間: 既存の brute-force `reference` 行（変更を含まない区間）。
+  ノイズ帯は #491 方式のとおり単一プロセス内では算出せず、交互起動した
+  複数プロセスの代表値列（dense/sparse 各 N launch）を
+  `harness::hnsw_search_latency::reference_band` へプールして算出する
+- ドライバ: `scripts/bench_hnsw_search_visited_ab.sh`（新設。
+  `bench_knn_visible_ratio_sweep.sh` と同型。`GITHUB_ACTIONS` 下拒否・
+  `AB_PAIRS`〔既定 5・5 未満拒否〕・`AB_ROWS`／`AB_MASKS`〔既定
+  `10000 100000`／`50 25 10 5 2`〕・rows→mask→pair→arm の順で dense→sparse
+  を交互起動・各 run のログを個別保存・`--summarize <dir>` で一覧化）
+
+**層 2（確認のみ）**: `knn_profile_bench.rs` の可視比率スイープ
+（Issue #487）へ `sparse_visited_searches` の delta 出力・`expected_visited`
+（production と同じ述語 `visible_rows < sparse_visited_max` から計算）を
+追加し、`observed_arm == ann_masked && expected_sparse && delta == 0` の
+ときのみ fail-closed にする（切替が発火すべき条件で発火しない vacuous な
+計測を green にしない。`plain_scan_*` や `dense` 期待は fail させない——
+既存 fixture での到達可能性そのものを記録することも目的のため）。
+`scripts/bench_knn_visible_ratio_sweep.sh` へ `SWEEP_CANDIDATES=visited`
+opt-in（`hnsw_force_ann_dense`／`hnsw_force_ann_sparse`。`full_scan_ratio`
+を `0/1`〔常に ANN 側〕へ固定し、visited 実装の効果を可視候補数だけへ
+帰属させる。可視率×行数の ANN/plain scan 切替そのものは Issue #487 が担当
+のため交絡させない）・`SWEEP_RATIOS`／`SWEEP_SCALES` 上書きを追加した。
+
+### 事前登録した判定規則（計測前に確定）
+
+- 各規模点: `ratio(min) = sparse_min / dense_min`（主統計量）・
+  `ratio(median)`（交差確認）
+- `Improved` と認めるのは `|ratio(min) − 1.0|` が固定 ±5% 帯と pooled 参照
+  区間実測帯の**両方**を超え、かつ改善方向（`ratio < 1`）の場合のみ
+- 閾値候補 = 「全 rows 規模で `Improved` となる可視候補数の最大値」。ただし
+  production 到達条件（可視候補数 ≥ `index_len × full_scan_ratio`）を
+  満たす点に限る
+- 該当点が無ければ `DEFAULT_SPARSE_VISITED_MAX = 0` のまま**暫定維持**
+  （閾値を上げる方向への「改善の根拠不足」による現状維持であり、
+  `benchmark-judgement-policy.md` §5 が Rejected 認定に要求する「両ノイズ帯
+  を超える一貫した悪化＋静的解析／実アセンブリの裏付け」を満たした確定
+  Rejected 判断ではない。この非対称——`Improved` 側は両帯超過を要求する一方
+  `Rejected` 側は改善点の不在のみで足りるとする pre-registration 上の
+  取り扱い——は policy §5 の「Rejected（現状維持）」欄の証拠要件を免除する
+  ものではないことを計測前から明記する
+- 該当点があっても共有 QEMU 環境では `benchmark-judgement-policy.md` §5 に
+  より Accepted 不可。既定値は変更せず「参考値＋専有環境再実測をオーナーへ
+  申し送り」とする
+
+### 環境（policy §3）
+
+- CPU: `QEMU Virtual CPU version 2.5+`（KVM）・12 vCPU（共有・非専有。
+  他の並列セッションと同居。`BENCH_DEDICATED_ENV` 未設定）
+- 負荷: 各 run 直前の `loadavg` は概ね 5〜8
+- commit: `4b4533a`（本 Issue の作業ブランチ基点）
+
+### 実測表（層 1）
+
+rows=10,000（N=5 交互ペア。単位 µs）:
+
+| 可視率 | 可視候補数 | dense min | dense median | sparse min | sparse median | ratio(min) | ratio(median) | production 到達可否 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 50% | 4,917 | 57.292 | 64.852 | 69.544 | 78.409 | 1.214 | 1.209 | 到達可（≥1/10） |
+| 25% | 2,475 | 33.451 | 40.924 | 45.339 | 54.101 | 1.355 | 1.322 | 到達可（≥1/10） |
+| 10% | 1,003 | 20.579 | 24.063 | 31.969 | 38.321 | 1.553 | 1.593 | 境界（≈1/10） |
+| 5% | 493 | 6.250 | 17.356 | 6.558 | 29.922 | 1.049 | 1.724 | informational（<1/10） |
+| 2% | 216 | 6.430 | 6.569 | 6.911 | 7.077 | 1.075 | 1.077 | informational（<1/10） |
+
+pooled 参照区間実測帯（brute-force 代表値・10 run/mask・全 mask 込み）:
+24.03%（min=81.042µs, max=100.514µs, n=50）。
+
+rows=100,000（N=5 交互ペア。単位 µs）は下表参照（実行中に取得した生ログを
+`target/bench-hnsw-search-visited/<ts>/` 配下に保持。§「再現方法」の
+コマンドで同一条件を再現できる）:
+
+| 可視率 | 可視候補数 | dense min | dense median | sparse min | sparse median | ratio(min) | ratio(median) | production 到達可否 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 50% | 50,286 | 409.863 | 443.743 | 437.454 | 500.584 | 1.067 | 1.128 | 到達可（≥1/10） |
+| 25% | 25,119 | 249.514 | 277.324 | 273.081 | 309.233 | 1.094 | 1.115 | 到達可（≥1/10） |
+| 10% | 10,043 | 113.361 | 142.131 | 114.052 | 152.955 | 1.006 | 1.076 | 境界（≈1/10） |
+| 5% | 4,949 | 93.771 | 99.423 | 105.507 | 113.532 | 1.125 | 1.142 | informational（<1/10） |
+| 2% | 1,928 | 66.969 | 67.483 | 67.407 | 67.958 | 1.007 | 1.007 | informational（<1/10） |
+
+pooled 参照区間実測帯（brute-force 代表値・10 run/mask・全 mask 込み）:
+59.02%（min=1877.630µs, max=2985.746µs, n=50）——100k 規模は共有環境の
+負荷変動の影響を強く受け、10k 規模（24.03%）より大幅に広い。10%・2% の
+`ratio(min)`（1.006・1.007）はこの帯の内側であり判定不能——それでも
+`ratio < 1`（改善方向）を示す点は無かった。
+
+<details>
+<summary>per-run 生データ（rows=10,000。5 ペア × 5 可視率 × 2 arm = 50 run）</summary>
+
+| mask% | arm | pair | min_us | median_us | visible_count |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 50 | dense | 1 | 57.804 | 65.153 | 4917 |
+| 50 | dense | 2 | 59.131 | 64.852 | 4917 |
+| 50 | dense | 3 | 58.324 | 64.415 | 4917 |
+| 50 | dense | 4 | 57.292 | 64.043 | 4917 |
+| 50 | dense | 5 | 57.533 | 64.858 | 4917 |
+| 50 | sparse | 1 | 70.213 | 78.409 | 4917 |
+| 50 | sparse | 2 | 70.535 | 79.594 | 4917 |
+| 50 | sparse | 3 | 69.915 | 77.782 | 4917 |
+| 50 | sparse | 4 | 69.620 | 78.963 | 4917 |
+| 50 | sparse | 5 | 69.544 | 77.063 | 4917 |
+| 25 | dense | 1 | 35.061 | 40.910 | 2475 |
+| 25 | dense | 2 | 33.663 | 41.036 | 2475 |
+| 25 | dense | 3 | 33.451 | 40.910 | 2475 |
+| 25 | dense | 4 | 34.197 | 41.862 | 2475 |
+| 25 | dense | 5 | 34.014 | 40.924 | 2475 |
+| 25 | sparse | 1 | 45.721 | 54.168 | 2475 |
+| 25 | sparse | 2 | 45.339 | 53.713 | 2475 |
+| 25 | sparse | 3 | 45.598 | 53.733 | 2475 |
+| 25 | sparse | 4 | 46.480 | 55.069 | 2475 |
+| 25 | sparse | 5 | 45.632 | 54.101 | 2475 |
+| 10 | dense | 1 | 20.759 | 24.276 | 1003 |
+| 10 | dense | 2 | 20.720 | 23.979 | 1003 |
+| 10 | dense | 3 | 20.738 | 24.447 | 1003 |
+| 10 | dense | 4 | 20.579 | 24.063 | 1003 |
+| 10 | dense | 5 | 20.781 | 23.906 | 1003 |
+| 10 | sparse | 1 | 32.239 | 38.321 | 1003 |
+| 10 | sparse | 2 | 32.919 | 39.088 | 1003 |
+| 10 | sparse | 3 | 31.969 | 38.301 | 1003 |
+| 10 | sparse | 4 | 32.177 | 38.174 | 1003 |
+| 10 | sparse | 5 | 32.182 | 38.466 | 1003 |
+| 5 | dense | 1 | 6.340 | 17.356 | 493 |
+| 5 | dense | 2 | 6.337 | 17.233 | 493 |
+| 5 | dense | 3 | 6.313 | 17.071 | 493 |
+| 5 | dense | 4 | 6.250 | 17.476 | 493 |
+| 5 | dense | 5 | 6.360 | 17.413 | 493 |
+| 5 | sparse | 1 | 6.639 | 29.999 | 493 |
+| 5 | sparse | 2 | 6.558 | 30.427 | 493 |
+| 5 | sparse | 3 | 6.558 | 29.524 | 493 |
+| 5 | sparse | 4 | 6.572 | 29.809 | 493 |
+| 5 | sparse | 5 | 6.574 | 29.922 | 493 |
+| 2 | dense | 1 | 6.478 | 6.569 | 216 |
+| 2 | dense | 2 | 6.478 | 6.577 | 216 |
+| 2 | dense | 3 | 6.457 | 6.567 | 216 |
+| 2 | dense | 4 | 6.430 | 6.572 | 216 |
+| 2 | dense | 5 | 6.480 | 6.556 | 216 |
+| 2 | sparse | 1 | 6.911 | 6.995 | 216 |
+| 2 | sparse | 2 | 6.940 | 7.077 | 216 |
+| 2 | sparse | 3 | 6.986 | 7.128 | 216 |
+| 2 | sparse | 4 | 6.961 | 7.077 | 216 |
+| 2 | sparse | 5 | 6.934 | 7.059 | 216 |
+
+</details>
+
+<details>
+<summary>per-run 生データ（rows=100,000。5 ペア × 5 可視率 × 2 arm = 50 run）</summary>
+
+| mask% | arm | pair | min_us | median_us | visible_count |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 50 | dense | 1 | 416.066 | 443.743 | 50286 |
+| 50 | dense | 2 | 414.687 | 453.925 | 50286 |
+| 50 | dense | 3 | 411.982 | 443.926 | 50286 |
+| 50 | dense | 4 | 409.863 | 429.875 | 50286 |
+| 50 | dense | 5 | 410.463 | 430.432 | 50286 |
+| 50 | sparse | 1 | 485.415 | 530.383 | 50286 |
+| 50 | sparse | 2 | 470.445 | 572.572 | 50286 |
+| 50 | sparse | 3 | 439.399 | 466.870 | 50286 |
+| 50 | sparse | 4 | 458.498 | 500.584 | 50286 |
+| 50 | sparse | 5 | 437.454 | 462.880 | 50286 |
+| 25 | dense | 1 | 253.114 | 279.577 | 25119 |
+| 25 | dense | 2 | 250.396 | 273.091 | 25119 |
+| 25 | dense | 3 | 265.111 | 290.552 | 25119 |
+| 25 | dense | 4 | 252.289 | 277.324 | 25119 |
+| 25 | dense | 5 | 249.514 | 273.792 | 25119 |
+| 25 | sparse | 1 | 273.081 | 295.019 | 25119 |
+| 25 | sparse | 2 | 317.150 | 350.753 | 25119 |
+| 25 | sparse | 3 | 273.138 | 297.350 | 25119 |
+| 25 | sparse | 4 | 276.175 | 313.874 | 25119 |
+| 25 | sparse | 5 | 286.430 | 309.233 | 25119 |
+| 10 | dense | 1 | 113.548 | 154.307 | 10043 |
+| 10 | dense | 2 | 113.361 | 137.228 | 10043 |
+| 10 | dense | 3 | 113.406 | 142.131 | 10043 |
+| 10 | dense | 4 | 114.476 | 179.007 | 10043 |
+| 10 | dense | 5 | 113.366 | 137.939 | 10043 |
+| 10 | sparse | 1 | 114.187 | 153.207 | 10043 |
+| 10 | sparse | 2 | 114.203 | 152.955 | 10043 |
+| 10 | sparse | 3 | 114.307 | 152.127 | 10043 |
+| 10 | sparse | 4 | 114.052 | 151.559 | 10043 |
+| 10 | sparse | 5 | 114.426 | 154.068 | 10043 |
+| 5 | dense | 1 | 94.100 | 99.211 | 4949 |
+| 5 | dense | 2 | 93.928 | 99.552 | 4949 |
+| 5 | dense | 3 | 94.217 | 99.423 | 4949 |
+| 5 | dense | 4 | 93.771 | 100.195 | 4949 |
+| 5 | dense | 5 | 94.170 | 98.992 | 4949 |
+| 5 | sparse | 1 | 105.507 | 112.963 | 4949 |
+| 5 | sparse | 2 | 105.600 | 113.532 | 4949 |
+| 5 | sparse | 3 | 105.981 | 114.165 | 4949 |
+| 5 | sparse | 4 | 105.518 | 112.933 | 4949 |
+| 5 | sparse | 5 | 106.380 | 114.299 | 4949 |
+| 2 | dense | 1 | 66.969 | 67.462 | 1928 |
+| 2 | dense | 2 | 67.086 | 67.483 | 1928 |
+| 2 | dense | 3 | 67.183 | 67.571 | 1928 |
+| 2 | dense | 4 | 67.118 | 67.424 | 1928 |
+| 2 | dense | 5 | 67.138 | 67.692 | 1928 |
+| 2 | sparse | 1 | 67.450 | 67.920 | 1928 |
+| 2 | sparse | 2 | 67.540 | 68.009 | 1928 |
+| 2 | sparse | 3 | 67.441 | 67.958 | 1928 |
+| 2 | sparse | 4 | 67.407 | 67.886 | 1928 |
+| 2 | sparse | 5 | 85.229 | 87.470 | 1928 |
+
+</details>
+
+### 判定
+
+rows=10k・100k 合わせて全 10 測定点で `ratio(min) > 1.0`（sparse が dense
+より遅い）であり、`Improved`（`ratio < 1`）となった点は 1 つも無かった。
+ただし「両ノイズ帯を超える悪化」として確定できる点は限られる
+（`|ratio(min) − 1.0|` と pooled 参照区間実測帯の比較。判定式は
+`benchmark-judgement-policy.md` §4）:
+
+- rows=10k（pooled 参照区間実測帯 24.03%）: 25%（差 35.5%）・10%（差
+  55.3%）は固定 ±5% 帯・実測帯の両方を超える悪化方向。50%（差 21.4%）は
+  固定帯は超えるが実測帯 24.03% には届かず**判定不能（ノイズ帯内）**。
+  5%・2%（いずれも production 到達不能な informational 参考値）も差が
+  両ノイズ帯の範囲内で判定不能——それでも改善方向を示す点は無かった
+- rows=100k（pooled 参照区間実測帯 59.02%。共有環境の負荷変動の影響が
+  10k より大きい）: `ratio(min)` は 1.006〜1.125（差 0.6〜12.5%）で、
+  10 測定点すべてが実測帯 59.02% の内側にあり**全点判定不能（ノイズ帯内）**。
+  両ノイズ帯を超える悪化と確定できる点は 100k には 1 つも無い
+
+事前登録した判定規則により、閾値候補（「全 rows 規模で `Improved` となる
+可視候補数の最大値」）は**存在しない**——10 測定点中いずれも改善方向
+（`ratio < 1`）を示さなかったため。したがって `DEFAULT_SPARSE_VISITED_MAX
+= 0`（常に dense。既存動作）は変更せず**暫定維持**する。
+
+ここで確定できるのは「悪化の証明」ではなく「改善の根拠が得られなかった
+こと」である点に注意する。両ノイズ帯を超える悪化として確定できたのは
+rows=10k の 25%・10% の 2 点のみで、100k の全点を含む残り 8 点は実測帯の
+内側（判定不能）であり、`benchmark-judgement-policy.md` §5 が「production
+変更の棄却（Rejected・現状維持）」に要求する「両ノイズ帯を超える一貫した
+悪化＋静的解析／実アセンブリの裏付け」は満たしていない。構造的事実
+（上記 1・3）どおり `VisitedBitmap::reset` の N 比例コストは今回の規模
+（10k〜100k・可視候補数 216〜50,286）で `VisitedSparse` の `HashSet` 挿入
+コストを一貫して下回る方向の実測ではあるが、これは閾値を上げる根拠が
+得られなかったことの傍証に留め、確定的な Rejected 判断の代替証拠とはしない。
+
+### 層 2（確認）実測
+
+`SWEEP_CANDIDATES=visited SWEEP_SCALES=1 SWEEP_RATIOS="1/2 1/10"` で
+N=5 実行（`hnsw_force_ann_dense`／`hnsw_force_ann_sparse`。`full_scan_ratio`
+を `0/1` へ固定）。
+
+| ratio | 観測 arm | `sparse_visited_searches` delta（dense/sparse arm） | expected_visited |
+| --- | --- | --- | --- |
+| 1/2 | `ann_masked`（`subset_searches=40`） | 0 / 40 | dense / sparse（両方 delta が期待どおり） |
+| 1/10 | `plain_scan_mask_split` | 0 / 0 | dense / sparse（切替到達不能。マスク分断で ANN 経路自体に入らない） |
+
+1/2（可視率 50%）では `ann_masked` が発火し、`sparse_visited_searches` の
+delta が期待どおり dense arm で 0・sparse arm で候補クエリ数（40）と一致
+した——production 相当の SQL 表層経由でも `VisitedSparse` が意図どおり選ば
+れることを固定できた。1/10（既定 `full_scan_ratio` と同一比率）では均等
+分散マスク fixture（Issue #487 で判明済みの構造的限界）により
+`mask_splits_graph`（分断検査による plain scan 縮退）へ落ち、visited 切替
+自体に到達しない——「既存 fixture では切替到達不能」という Issue #487 の
+既知の限界が本閾値の診断でも同様に現れることを記録する（クラスタ寄り
+fixture の整備は #502 の申し送り事項のまま。本 Issue では作らない）。
+
+### 限界・申し送り
+
+- 共有 QEMU 環境の実測のため `benchmark-judgement-policy.md` §5 により本
+  実測は「採用（Accepted）」の根拠にはできない。本 Issue の結論は
+  「暫定維持（改善の根拠不足）」であり、両ノイズ帯を超える一貫した悪化
+  ＋静的解析／実アセンブリの裏付けを要件とする policy §5 の確定的
+  「Rejected（現状維持）」認定には届いていない（上記「判定」節のとおり、
+  両帯超過を確定できたのは 10k の 25%・10% の 2 点のみで、100k を含む
+  残り 8 点は判定不能）。したがって本実測のみでは「現状維持」を
+  policy 上の確定判断として主張しない——実装（`DEFAULT_SPARSE_VISITED_MAX
+  = 0`）は「閾値を上げる方向の改善が実測で確認できなかった」ことを根拠に
+  変更しないに留め、確定的な悪化の立証や専有環境再実測の要否判断はオーナー
+  判断に委ねる（構造的事実——可視候補数に対して `VisitedBitmap::reset` の
+  N 比例コストが優位——は傍証として記録するが、これ単独で policy §5 の
+  証拠要件を代替しない）
+- 200k（`MAX_ROWS_GUARD` 上限）規模点は計測時間の都合により本 Issue では
+  未実施（10k・100k の 2 点で `ratio(min)` が一貫して 1 を上回るため、
+  傾向が 200k で反転する具体的な仮説は無い）
+- 1M 超の規模（`VisitedBitmap::reset` の N 比例コストが顕在化しやすい
+  領域）は `MAX_ROWS_GUARD`（200,000）の対象外であり本 Issue の対象外
+- クラスタ寄り可視集合 fixture の整備（Issue #487 由来の「均等分散マスク
+  では `ann_masked` に到達しにくい／`mask_splits_graph` へ落ちやすい」
+  構造的限界の解消）は Issue #502 の担当のまま
+- `full_scan_ratio` を変更した場合、`sparse_visited_max` の実効下限
+  （`index_len × full_scan_ratio`）も連動して変わる——両者の既定値は
+  独立ではなく、`full_scan_ratio` の再調整（Issue #487・#488 で申し送り済み）
+  時には本 Issue の判定規則を再適用する必要がある
+
+### 再現方法
+
+```bash
+git fetch origin main
+git checkout <commit>
+# 層 1: dense/sparse 前後比較（規模点・可視率は AB_ROWS／AB_MASKS で上書き可）
+AB_PAIRS=5 scripts/bench_hnsw_search_visited_ab.sh
+scripts/bench_hnsw_search_visited_ab.sh --summarize target/bench-hnsw-search-visited/<ts>
+
+# 層 2: SQL 表層経由の確認（Issue #487 の可視比率スイープを再利用）
+SWEEP_CANDIDATES=visited SWEEP_SCALES=1 SWEEP_RATIOS="1/2 1/10" \
+  scripts/bench_knn_visible_ratio_sweep.sh
 ```

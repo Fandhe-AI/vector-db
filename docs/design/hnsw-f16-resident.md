@@ -139,11 +139,119 @@ resident_precision()`）を追記する。実行時の自動縮退結果（D6）
 - AVX-512 `_mm512_cvtph_ps` 変種は未実装（ADR トークン表に無い）。
 - `RecallEngine` fixture（`crates/engine/tests/fixtures/recall_engine.rs`）
   への `hnsw_f16` 追加・`recall.yml` matrix 拡張・Recall 3 ゲート同一閾値
-  検証は本 Issue の対象外（#515）。
+  検証は Issue #515 で実施済み（`docs/design/ann-recall-gate-verification.md`
+  「Issue #515 追記」節参照）。
 - 25k／100k／500k × dim 128／768 規模での常駐メモリ・レイテンシの前後比較
-  実測は対象外（#516）。
+  実測は Issue #516 で実施済み（下記「Issue #516 追記」節参照）。
 - 既定常駐精度を F16 へ反転するかどうかは #515／#516 の実測後のオーナー判断。
 - wire-server への HNSW／精度 opt-in CLI 追加は対象外。
 - NEON カーネルの実機（Apple Silicon 等）での生成コード・性能確認はクロス
   コンパイル確認までが本 Issue の範囲（`make check-cross`／
   `make simd-codegen-check-cross` で確認済み）。
+
+## Issue #516 追記: f16 常駐（`hnsw_f16`）と f32 常駐（`hnsw`）の前後比較・常駐メモリ実測
+
+### 目的・測定方法
+
+`docs/design/benchmark-judgement-policy.md` §3〜§4 の計測プロトコル（交互
+N≥5 ペア・per-run 生データ必須・固定 ±5% 帯と参照区間実測帯の両方を満たした
+場合のみ有効差とする）に従い、`crates/engine/benches/knn_profile_bench.rs`
+へ 2 モードを追加した（`scripts/bench_knn_f16_resident_ab.sh`
+＝ `make bench-knn-f16-resident` から一括実行）。
+
+- **hot-only モード**（`BENCH_KNN_PROFILE_HOT_ONLY=1`）: 索引 1 回構築＋
+  SQL 表層 e2e ホットパス（`ORDER BY embedding <=> '<vec>' LIMIT k`。S0-hot
+  相当）と参照区間（`COUNT(*)`）を計測する。毎サンプル新規 `EngineCore` を
+  構築する S0-cold は、500k 行規模では非現実的な所要時間になるため対象外
+  とした（本節冒頭の目的が hnsw/hnsw_f16 間の相対比較であり、索引構築コスト
+  自体は #495・#413 の既存実測が担う）。
+- **索引単体メモリモード**（`BENCH_KNN_PROFILE_INDEX_MEMORY=1`）: redb・SQL
+  表層 `VectorArena`（`MAX_ARENA_TOTAL_BYTES` 1 GiB 上限）を経由せず、
+  メモリ上のコーパスから `HnswIndex::build_parallel_with_precision` を子
+  プロセス隔離で 1 回呼び出し、`approx_heap_bytes()`・VmRSS 前後差・VmHWM
+  を記録する。500k×768（1 点あたり embedding だけで約 1.5 GiB）は arena
+  1 GiB 上限で SQL 表層からは構造的に到達不能なため、この規模点は索引単体
+  メモリでのみ計測している。
+
+規模点は 1:128（25,000 行・dim 128）・4:128（100,000 行）・20:128
+（500,000 行）・1:768・4:768（100,000 行・dim 768）の 5 点を hot-only の
+主系列とし、索引単体メモリはこれに 20:768（500,000 行・dim 768）を加えた
+6 点で計測した。
+
+計測環境: 本開発環境（共有 QEMU 環境。CPU `QEMU Virtual CPU version 2.5+`・
+12 vCPU・命令セットフラグ `avx2`／`fma`／`f16c`。`docs/design/
+benchmark-judgement-policy.md` §5 の証拠力区分では「参考値」）。計測時点の
+コミットは `2dcade0`（本 Issue のブランチ差分は計測対象コードに含まない
+——`knn_profile_bench.rs` 自体が計測ハーネスであり、`crates/engine/src/`
+は無変更）。各 run の `loadavg` は per-run TSV
+（`docs/design/bench-data/hnsw-f16-resident-ab/20260907T095824Z-*.tsv`）に
+記録済み。
+
+### hot-only レイテンシの実測結果（min-of-N・N=5 ペア）
+
+| point (scale:dim) | rows | hnsw min (ms) | hnsw median (ms) | hnsw_f16 min (ms) | hnsw_f16 median (ms) | ratio (min-of-N) | ratio (median) | 固定 ±5% 帯判定 | 参照区間帯（`COUNT(*)`） |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1:128 | 25,000 | 0.4280 | 0.4380 | 0.4170 | 0.4240 | 0.9743 | 0.9680 | Neutral | 0.00%（n=15・0.054ms で不変） |
+| 4:128 | 100,000 | 1.6460 | 1.6530 | 1.6490 | 1.6510 | 1.0018 | 0.9988 | Neutral | 0.95%（n=15） |
+| 20:128 | 500,000 | 11.6230 | 11.8520 | 11.8730 | 11.9780 | 1.0215 | 1.0106 | Neutral | 1.99%（n=17） |
+| 1:768 | 25,000 | 0.5480 | 0.5810 | 0.5680 | 0.5760 | 1.0365 | 0.9914 | Neutral | 0.00%（n=15・0.054ms で不変） |
+| 4:768 | 100,000 | 1.7640 | 1.8000 | 1.7730 | 1.8030 | 1.0051 | 1.0017 | Neutral | 2.84%（n=15） |
+
+6 測定点すべてが固定 ±5% 帯以内（`Neutral`）であり、f16 常駐化による
+SQL 表層 e2e ホットパスの有意なレイテンシ変化（改善・悪化のいずれも）は
+確認できなかった。参照区間（`COUNT(*)`）は `hnsw_params:` を経由しない
+経路のため hnsw/hnsw_f16 で共通の値を使い、いずれの点でも実測帯は数%
+以内に収まっている。per-run 生データは
+`docs/design/bench-data/hnsw-f16-resident-ab/20260907T095824Z-hot-only.tsv`
+に記録済み。
+
+`brute_force` 系列（baseline。hnsw/hnsw_f16 各々の直前に 1 回ずつ計測する
+輪番）は、初回計測実施時（2026-09-07）のスクリプトが 2 回の `brute_force`
+呼び出しを同一ログファイル名へ書き込んでいたため（`log_noise` の `>` 上書き
+で 1 回目の値が失われる。本 PR で `_beforehnsw`／`_beforehnswf16` の
+suffix によりファイル名を分離済み）、既存ログの `brute_force` 値は「pair
+あたり 1 回（hnsw_f16 直前に測定した値）」のみが残っている。本節の判定は
+hnsw/hnsw_f16 間の比較のみを主対象とするため（`brute_force` は補助系列）、
+この欠落は判定結論に影響しない。
+
+### 索引単体メモリの実測結果
+
+`approx_heap_bytes()` は決定的な集計値（同一構成での rep1/rep2 が全 6 点
+でビット同一）であり、時間計測特有の run-to-run ノイズを持たないため
+ノイズ帯評価の対象外とする。VmRSS・VmHWM は子プロセスの measurement 経路が
+負う固定オーバーヘッド（コーパス生成の `Vec<f32>` 確保等）を含む参考値
+として per-run TSV へ記録するに留め、判定には `approx_heap_bytes()` を
+用いる。
+
+| point (scale:dim) | rows | dim | hnsw `approx_heap_bytes` | hnsw_f16 `approx_heap_bytes` | ratio (f16/f32) | 削減率 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1:128 | 25,000 | 128 | 17,226,056 | 10,826,056 | 0.6285 | 37.15% |
+| 4:128 | 100,000 | 128 | 68,903,824 | 43,303,824 | 0.6285 | 37.15% |
+| 20:128 | 500,000 | 128 | 327,741,692 | 199,741,692 | 0.6094 | 39.06% |
+| 1:768 | 25,000 | 768 | 81,226,056 | 42,826,056 | 0.5272 | 47.28% |
+| 4:768 | 100,000 | 768 | 324,903,824 | 171,303,824 | 0.5272 | 47.28% |
+| 20:768 | 500,000 | 768 | 1,607,741,692 | 839,741,692 | 0.5223 | 47.77% |
+
+6 点すべてで一貫して常駐メモリが削減されている（dim 128 で約 37〜39%・
+dim 768 で約 47〜48%）。削減率が dim に依存して変わるのは、削減対象が
+ベクトル本体（`dim` に比例。4 byte→2 byte で半減）のみで、グラフ隣接
+リスト（`m`・層数に依存し `dim` に依存しない f32/u32 固定サイズ）が f32/
+f16 いずれの常駐でも変わらないため——dim が大きいほどベクトル本体の
+相対的な割合が増え、削減率が 50% に近づく（実測方向は
+`docs/design/hnsw-f16-resident.md`「データ構造」節の設計どおり）。
+per-run 生データは
+`docs/design/bench-data/hnsw-f16-resident-ab/20260907T095824Z-index-memory.tsv`
+に記録済み。すべて `requested=effective`（f16 範囲外自動縮退〔D6〕は
+未発火）であることも同 TSV から確認できる。
+
+### 結論・申し送り
+
+- レイテンシ: 5 規模点すべてでノイズ帯内（`Neutral`）。f16 常駐化は
+  SQL 表層 e2e ホットパスに有意な影響を与えない（本開発環境の参考値）。
+- 常駐メモリ: 6 規模点すべてで一貫した削減（37〜48%）。決定的な集計値の
+  ため専有環境再実測は必須ではないが、`docs/design/benchmark-judgement-
+  policy.md` §5 のとおり本節のレイテンシ数値そのものは「参考値」の
+  位置づけを維持する。
+- 既定常駐精度を F16 へ反転するかどうかの最終判断はオーナー判断
+  （#515・本節の実測を踏まえた申し送り。メモリ削減の恩恵に対しレイテンシ
+  面での明確な劣化は観測されていない）。

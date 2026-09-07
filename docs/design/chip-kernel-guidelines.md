@@ -169,7 +169,7 @@ Graviton4／Grace は SVE2 でも 128 bit のため NEON と理論ピークが�
 | ---- | ---- |
 | f16 算術 | `Features::SHADER_F16`（Vulkan／Metal／DX12／WebGPU）。WGSL `enable f16;` |
 | i8 dot | WGSL `dot4I8Packed`／`dot4U8Packed`。naga が全 backend 実装（SPIR-V／HLSL／Metal は専用命令、他は polyfill）。専用命令化は DX12 SM≥6.4／Vulkan `VK_KHR_shader_integer_dot_product` |
-| `NATIVE_PACKED_INTEGER_DOT_PRODUCT` | wgpu 30.0.1 の `FeaturesWGPU` 定数一覧で未確認。実機 `adapter.features()` で要確認 |
+| `NATIVE_PACKED_INTEGER_DOT_PRODUCT` | wgpu-types 30.0.1 に該当 feature 定数が存在しないことを確認済み（#542）。専用命令／polyfill の判別は `Adapter::as_hal`（`unsafe`）経由でのみ可能で、本リポの `unsafe` 原則禁止のため未判別のまま（詳細: [`gpu-batch-i8-packed.md`](gpu-batch-i8-packed.md) §4） |
 | Subgroup | `Features::SUBGROUP`（Vulkan／DX12／Metal）。GPU 側 Top-k 縮約に有効。実機確認・設計は [`gpu-batch-topk.md`](gpu-batch-topk.md)（#535） |
 | bf16 | 未確認 |
 
@@ -246,7 +246,7 @@ Issue #365 で行内マルチアキュムレータ化は不採用済み（cache 
 | 優先 | 施策 | 対象 | 根拠 | Rust | 既起票 |
 | ---- | ---- | ---- | ---- | ---- | ------ |
 | 1 | CPU f16 常駐＋F16C／NEON FP16 デコード | 全 | GPU 側の f16x2 常駐表現を CPU 側でも読めば arena 半減。L3 溢れ点が拡大 | stable 可 | #513（#514 実装済み。`docs/design/hnsw-f16-resident.md` 参照） |
-| 2 | 行間マイクロカーネル（4〜8 行 × 1 クエリ） | 全 | #365 が潰したのは行内 ILP。行間の load 削減は別軸。Zen 5 の load 2×512b で特に効く | stable 可 | #509 |
+| 2 | 行間マイクロカーネル（4〜8 行 × 1 クエリ） | 全 | #365 が潰したのは行内 ILP。行間の load 削減は別軸。Zen 5 の load 2×512b で特に効く | stable 可 | #509（#510・#511 実装済み） |
 | 3 | クライアント Intel の 256 bit 経路最適化 | Alder〜Arrow Lake | AVX-512 fuse off がクライアント主流。#520 の AVX-VNNI（256 bit）側に含まれる | stable 可 | #520 |
 | 4 | AVX-512 BF16／VNNI 量子化スキャン | SPR／GNR／Zen 4／5 | ANN 候補生成限定で f32 再計算（HNSW の rescoring 契約と同型） | stable 1.89 | #520 |
 | 5 | AVX-VNNI i8 | クライアント Intel | 4 と同一 Issue（#520）の 256 bit 版 | stable 1.89 | #520 |
@@ -269,7 +269,9 @@ Issue #365 で行内マルチアキュムレータ化は不採用済み（cache 
 Issue #365（行内複数アキュムレータ）は cache 常駐 dim100/dim128 の小次元で
 悪化したことを理由に不採用としたが（dim384 は cache 常駐で改善・arena 規模で
 非劣化）、arena 規模かつ dim>=768 限定では改善が確認されている。
-本 doc §3 の優先 1〜7 はいずれも dim>=768 限定ディスパッチ（#517）や量子化
+本 doc §3 の優先 1〜7 はいずれも dim>=768 限定ディスパッチ（#517。dot カーネルの
+実装は #518 で完了・[`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md)
+「Issue #518 追記」節参照。閾値確定・チップ別実測は #519）や量子化
 opt-in 経路（#520 等）に閉じており、#365 が不採用とした「全 dim 一律の複数
 アキュムレータ化」を再提案するものではない。詳細な対応表は
 [`docs/design/hotpath-implementation-survey.md`](hotpath-implementation-survey.md)
@@ -328,12 +330,15 @@ Intel）での手動計測が必要になる。手順は README「チップ別�
 
 ### 7.3 参照区間の指定（施策別）
 
-dot カーネル変更（#517 等）の参照区間は、dot を通らない `feature_bench` フェーズ
+dot カーネル変更（#517・実装は #518。閾値確定・実測は #519）の参照区間は、dot を通らない `feature_bench` フェーズ
 （例: `agg_count`・`explain`・`where_compound`）と `knn_profile` の
 `S1_redb_scan`／`S2_header_decode`（`chip_bench` の `knn_profile` ワークロードが
 同時に計測する）を用いる。f16 常駐・行間マイクロカーネル等、施策ごとの
 「対象区間 → 参照区間」対応は #509・#513・#517・#520・#524・#527 側で個別に
-定義し、本 doc へはポインタのみを残す。
+定義し、本 doc へはポインタのみを残す（行ブロックカーネル〔#510・#511〕の
+対象区間 `S5_search_parallel` ↔ 参照区間 `S1_redb_scan` 対応と実測は
+Issue #512・`docs/design/dot-kernel-multi-accumulator.md`「行間再利用
+（Issue #512）」節参照）。
 
 ### 7.4 `summary.json` キー一覧
 

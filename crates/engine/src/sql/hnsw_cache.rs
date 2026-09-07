@@ -67,7 +67,7 @@ use redb::ReadableDatabase;
 
 use crate::arena::VectorArena;
 use crate::hnsw::provider::HnswSearchProvider;
-use crate::hnsw::{HnswError, HnswIndex, HnswSearchScratch};
+use crate::hnsw::{HnswError, HnswIndex, HnswSearchScratch, Ratio};
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
 use crate::storage::Storage;
@@ -168,6 +168,15 @@ pub struct HnswIndexCacheStats {
     /// f16 の有限範囲（`|x| <= 65504.0`）を超える成分により `F32` へ自動縮退した
     /// 回数（Issue #514・D6。`builds` の内数）。
     pub f16_residency_fallbacks: u64,
+    /// マスク付き探索（`FullVisible`／`Subset` いずれの形状でも。
+    /// [`crate::hnsw::HnswIndex::search_masked_with`]）が縮退なしで完走した際、
+    /// 可視候補数が `ValidatedHnswParams::sparse_visited_max` 未満で
+    /// [`crate::hnsw::VisitedSparse`]（`HashSet<u32>`）を選んだ回数（Issue #497。
+    /// `hits`／`subset_searches` とは独立に数える診断用カウンタで、初回構築を
+    /// 伴う呼び出し（`OverlaySuccessStat::None`）も計上に含むため両者の合計を
+    /// 上回りうる。テナント境界・可視カーディナリティ・索引ノード数等のテナント
+    /// 存在情報には繋がらない——採否のみを数える）。
+    pub sparse_visited_searches: u64,
     /// 現在キャッシュが保持しているエントリ数。
     pub entries: usize,
 }
@@ -257,6 +266,29 @@ impl IndexedBase {
     }
 }
 
+/// 可視カーディナリティ比（`visible_in_index / index_len`）が
+/// `ValidatedHnswParams::full_scan_ratio` 未満かどうかを整数比較で判定する
+/// （Issue #409）。`search_with_overlay` の可視カーディナリティ切替・
+/// `Overlay::compute` の分断検査（[`Overlay::mask_splits_graph`]）省略判定・
+/// `prepare_subset` の早期打ち切り（Issue #488）が同じ判定式を共有する
+/// ことで、3 箇所の分岐条件が将来ずれる（挙動が食い違う）ことを構造的に防ぐ。
+/// `index_len == 0` は自明に「索引を信用できない」ため常に `true`。丸め誤差を
+/// 避けるため `visible_in_index * denominator < index_len * numerator` の整数
+/// 比較で行い、`checked_mul` のオーバーフロー時は fail-closed に `true`
+/// （plain scan 側）へ倒す。
+fn below_full_scan_ratio(visible_in_index: usize, index_len: usize, ratio: Ratio) -> bool {
+    if index_len == 0 {
+        return true;
+    }
+    match (
+        (visible_in_index as u64).checked_mul(ratio.denominator as u64),
+        (index_len as u64).checked_mul(ratio.numerator as u64),
+    ) {
+        (Some(lhs), Some(rhs)) => lhs < rhs,
+        _ => true,
+    }
+}
+
 /// 世代 `generation` の `arena` に対する `base` の差分オーバーレイ。
 pub(crate) struct Overlay {
     generation: u64,
@@ -301,7 +333,21 @@ impl Overlay {
     /// 全体）を突き合わせ、索引済み・未索引・失効の 3 分類を確定する。世代あたり
     /// 1 回（`HnswIndexCache::lookup` が `Ready` を返せない間だけ）呼ばれる想定
     /// （`sql::arena_cache` の「キャッシュミス時のみ再構築」と同じ償却）。
-    fn compute(base: &IndexedBase, arena: &VectorArena, generation: u64) -> Self {
+    ///
+    /// `full_scan_ratio` は呼び出し元（`sql::exec` の DISTANCE 段）が使う
+    /// [`ValidatedHnswParams::full_scan_ratio`] をそのまま渡す。可視カーディナリ
+    /// ティ比が閾値未満と判明した場合、`search_with_overlay` は
+    /// `mask_splits_graph` を参照する前に plain scan を選ぶ契約（本関数呼び出し元
+    /// 双方で不変）のため、その場合は分断検査（[`crate::hnsw::HnswIndex::
+    /// is_mask_fully_reachable`]。BFS で |受理ノード| × 次数に比例するコスト）を
+    /// 省略できる（Issue #488。観測不能な値の計算を省くだけで `search_with_overlay`
+    /// の出力は不変）。
+    fn compute(
+        base: &IndexedBase,
+        arena: &VectorArena,
+        generation: u64,
+        full_scan_ratio: Ratio,
+    ) -> Self {
         let dim = arena.dim() as usize;
         let mut slot_of_node = vec![STALE_SLOT; base.index.len()];
         let mut delta_slots: Vec<u64> = Vec::new();
@@ -356,13 +402,19 @@ impl Overlay {
             }
         }
         let visible_in_index = base.index.len().saturating_sub(stale_nodes);
-        // 世代（マスク）が変わるたび 1 回だけの分断検査（§`mask_splits_graph`
-        // ドキュメンテーションコメント参照）。`visible_in_index == 0` なら
-        // マスクの受理ノードが 0 件で `is_mask_fully_reachable` が自明に
-        // `true`（分断なし）を返すため、`search_with_overlay` 側の可視
-        // カーディナリティ切替（`index_len == 0 || below_ratio`）が先に
-        // plain scan を選ぶ既存契約と矛盾しない。
-        let mask_splits_graph = !base.index.is_mask_fully_reachable(&visible_mask);
+        // 世代（マスク）が変わるたび高々 1 回だけの分断検査（§`mask_splits_graph`
+        // ドキュメンテーションコメント参照）。可視カーディナリティ比が
+        // `full_scan_ratio` 未満（[`below_full_scan_ratio`]）なら
+        // `search_with_overlay` は `mask_splits_graph` を参照する前に plain scan
+        // を選ぶため、その場合は観測されない値として BFS を省略する（Issue #488。
+        // `visible_in_index == 0` はこの分岐に必ず含まれる——0 件のマスクで
+        // `is_mask_fully_reachable` が自明に `true` を返す旧来の性質は維持される）。
+        let mask_splits_graph =
+            if below_full_scan_ratio(visible_in_index, base.index.len(), full_scan_ratio) {
+                false
+            } else {
+                !base.index.is_mask_fully_reachable(&visible_mask)
+            };
         Overlay {
             generation,
             arena_len: arena.len(),
@@ -474,6 +526,7 @@ pub(crate) struct HnswIndexCache {
     hybrid_queries: AtomicU64,
     hybrid_rounds_max: AtomicU64,
     f16_residency_fallbacks: AtomicU64,
+    sparse_visited_searches: AtomicU64,
 }
 
 /// [`HnswIndexCache::lookup`] の結果。
@@ -510,6 +563,7 @@ impl HnswIndexCache {
             hybrid_queries: AtomicU64::new(0),
             hybrid_rounds_max: AtomicU64::new(0),
             f16_residency_fallbacks: AtomicU64::new(0),
+            sparse_visited_searches: AtomicU64::new(0),
         }
     }
 
@@ -817,6 +871,7 @@ impl HnswIndexCache {
             hybrid_queries: self.hybrid_queries.load(Ordering::Relaxed),
             hybrid_rounds_max: self.hybrid_rounds_max.load(Ordering::Relaxed),
             f16_residency_fallbacks: self.f16_residency_fallbacks.load(Ordering::Relaxed),
+            sparse_visited_searches: self.sparse_visited_searches.load(Ordering::Relaxed),
             entries,
         }
     }
@@ -860,6 +915,17 @@ pub(crate) enum PreparedHnswSearch {
     /// を 1 加算する——各呼び出しは実際に一度ずつ brute-force 探索を行うラウンドの
     /// ため、解決時ではなく探索時に計上する）。
     FullScan,
+    /// `Subset` 形状（Issue #409）専用の早期打ち切り（Issue #488）。`arena.len()`
+    /// （可視カーディナリティ `visible_in_index` の上界）の時点で既に
+    /// `full_scan_ratio` 未満と判明しているため、`Overlay::compute`（行ごとの
+    /// `RowKey` 生成・`HashMap` 引き・dot 比較・分断検査）を丸ごと省略して
+    /// [`PreparedHnswSearch::FullScan`] と同じ全件 brute-force を選ぶ。`FullScan`
+    /// と分けて持つのは、`fallbacks` に加え `plain_scans`（可視カーディナリティ比
+    /// 未満での plain scan）も観測できるようにするため（[`search_with_overlay`]
+    /// の下限判定ヒット時と同じ統計意味）。`FullScan` と同様、統計は解決時では
+    /// なく [`search_prepared`] の探索時（hybrid 密側の複数ラウンドではラウンド
+    /// ごと）に加算する。
+    PlainScanBelowRatio,
 }
 
 /// `FullVisible` 形状（Issue #408。フィルタなし DISTANCE・hybrid 密側）の
@@ -950,7 +1016,12 @@ pub(crate) fn prepare_full_visible(
         access.cache.evict_entry_if_mismatched(table, ctx, &base);
         return PreparedHnswSearch::FullScan;
     }
-    let overlay = Overlay::compute(&base, arena, current_generation);
+    let overlay = Overlay::compute(
+        &base,
+        arena,
+        current_generation,
+        access.provider.full_scan_ratio(),
+    );
     if overlay.needs_rebuild(n) {
         access.cache.builds.fetch_add(1, Ordering::Relaxed);
         match IndexedBase::build(
@@ -1054,6 +1125,18 @@ pub(crate) fn search_prepared(
             };
             provider.search(input)
         }
+        PreparedHnswSearch::PlainScanBelowRatio => {
+            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
+            let input = SearchInput {
+                ids: slot_ids,
+                vectors: arena.vectors(),
+                dim: arena.dim(),
+                query,
+                k,
+            };
+            provider.search(input)
+        }
     }
 }
 
@@ -1121,9 +1204,6 @@ pub(crate) fn prepare_subset(
         Lookup::NeedOverlay(base) => base,
     };
 
-    let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
-        return PreparedHnswSearch::FullScan;
-    };
     if base.arena_identity_mismatch_guard(arena, ctx) {
         // `FullVisible` 経路（`prepare_full_visible`）と異なり、ここでは巻き添えを
         // 避けるためエントリを退避しない（この不整合は通常発生しない防御的
@@ -1132,13 +1212,43 @@ pub(crate) fn prepare_subset(
         return PreparedHnswSearch::FullScan;
     }
 
+    // 早期打ち切り（Issue #488）: `overlay.visible_in_index <= arena.len()`
+    // （Subset アリーナに含まれない索引済みノードは `Overlay::compute` が
+    // 構造的に `STALE_SLOT` として除外するため、写像を計算する前でも
+    // 上界として使える）。この上界がすでに `full_scan_ratio` 未満なら、
+    // 実際の重なりに関わらず `search_with_overlay` は必ず plain scan を選ぶ
+    // （[`below_full_scan_ratio`] は `visible_in_index` に対して単調。
+    // 上界が閾値未満なら実値もその関数で必ず閾値未満と判定される）ため、
+    // `Overlay::compute`（行ごとの `RowKey` 生成・`HashMap` 引き・dot 比較・
+    // 分断検査）を丸ごと省略できる。出力は `Overlay::compute` を実行した
+    // 場合と完全に同一（`search_with_overlay` が選ぶ分岐が同じ）。
+    if below_full_scan_ratio(
+        arena.len(),
+        base.index.len(),
+        access.provider.full_scan_ratio(),
+    ) {
+        // 統計（`fallbacks`／`plain_scans`）は解決時ではなく `search_prepared`
+        // の探索時に加算する（`FullScan` と同じ方針。hybrid 密側の複数ラウンドで
+        // 本関数が 1 回しか呼ばれない場合でも、ラウンドごとに正しく計上される）。
+        return PreparedHnswSearch::PlainScanBelowRatio;
+    }
+
+    let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
+        return PreparedHnswSearch::FullScan;
+    };
+
     // per-query の写像を計算する（キャッシュへは登録しない。§本関数
     // ドキュメンテーションコメント参照）。`Overlay::compute` は「渡された
     // arena のスロット番号系列に対する索引済みノードの写像」を汎用的に計算
     // するため、可視全集合ではなく WHERE 適用後の部分集合アリーナを渡しても
     // そのまま正しく動く（部分集合に含まれない索引済みノードは自然に
     // `STALE_SLOT` として除外される）。
-    let overlay = Arc::new(Overlay::compute(&base, arena, current_generation));
+    let overlay = Arc::new(Overlay::compute(
+        &base,
+        arena,
+        current_generation,
+        access.provider.full_scan_ratio(),
+    ));
     PreparedHnswSearch::Indexed {
         base,
         overlay,
@@ -1380,20 +1490,13 @@ fn search_with_overlay(
 
     // 可視カーディナリティ切替（Issue #409・`ValidatedHnswParams::full_scan_ratio`）:
     // `visible_in_index / index.len() < full_scan_ratio` なら plain scan
-    // （アリーナ全体の brute-force）。整数比較 `visible_in_index * den <
-    // index.len() * num` で丸め誤差を避け、`checked_mul` のオーバーフロー時は
-    // fail-closed に plain scan へ倒す（比較不能を「索引を信用しない」側へ）。
+    // （アリーナ全体の brute-force）。判定式は [`below_full_scan_ratio`] に
+    // 集約し、`Overlay::compute`（分断検査省略判定）・`prepare_subset`（早期
+    // 打ち切り）と同一の式を共有する（Issue #488）。
     let ratio = access.provider.full_scan_ratio();
     let index_len = base.index.len();
     let visible_in_index = overlay.visible_in_index;
-    let below_ratio = match (
-        (visible_in_index as u64).checked_mul(ratio.denominator as u64),
-        (index_len as u64).checked_mul(ratio.numerator as u64),
-    ) {
-        (Some(lhs), Some(rhs)) => lhs < rhs,
-        _ => true,
-    };
-    if index_len == 0 || below_ratio {
+    if below_full_scan_ratio(visible_in_index, index_len, ratio) {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
         access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
         return full_scan_with_arena(provider, arena, query, k);
@@ -1432,10 +1535,23 @@ fn search_with_overlay(
     }
 
     let ef = access.provider.effective_ef(k);
-    let index_hits = SEARCH_SCRATCH.with(|scratch| {
+    // visited 集合の切替（Issue #497）: `access.provider.sparse_visited_max()`
+    // は構築時の静的設定値（既定 0＝常に dense）を `HnswIndex::search_masked_with`
+    // へそのまま渡す。選ばれた実装は `scratch.last_visited_kind()` から読み、
+    // 縮退なしで完走した場合のみ `sparse_visited_searches` へ計上する
+    // （下の `masked_short`／`arena_identity_mismatch_guard` 等の縮退判定より
+    // 後段で計上するため、クロージャ内で `Option<VisitedKind>` を一緒に返す）。
+    let (index_hits, visited_kind) = SEARCH_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        base.index
-            .search_masked(query, k, ef, Some(&overlay.visible_mask), &mut scratch)
+        let result = base.index.search_masked_with(
+            query,
+            k,
+            ef,
+            Some(&overlay.visible_mask),
+            access.provider.sparse_visited_max(),
+            &mut scratch,
+        );
+        (result, scratch.last_visited_kind())
     });
     let index_hits = match index_hits {
         Ok(hits) => hits,
@@ -1521,6 +1637,14 @@ fn search_with_overlay(
             access.cache.subset_searches.fetch_add(1, Ordering::Relaxed);
         }
         OverlaySuccessStat::None => {}
+    }
+    // 縮退なしで完走した場合のみ、実際に選ばれた visited 実装を計上する
+    // （Issue #497）。`hits`／`subset_searches` とは独立に数える診断用カウンタ。
+    if visited_kind == Some(crate::hnsw::VisitedKind::Sparse) {
+        access
+            .cache
+            .sparse_visited_searches
+            .fetch_add(1, Ordering::Relaxed);
     }
     Ok(mapped)
 }
@@ -2096,7 +2220,15 @@ mod tests {
         let gen1 = crate::catalog::table_generation_in_txn(&read_txn2, "docs").unwrap();
         assert!(gen1 > gen0);
         let arena1 = build_arena(&read_txn2, "docs", &c);
-        let overlay = Overlay::compute(&base, &arena1, gen1);
+        let overlay = Overlay::compute(
+            &base,
+            &arena1,
+            gen1,
+            Ratio {
+                numerator: 1,
+                denominator: 10,
+            },
+        );
 
         // id=1 は変更なしなのでどこかのノードが失効していない（stale_nodes は id=2
         // 分の 1 件のみ）。
@@ -2889,6 +3021,134 @@ mod tests {
         assert!(
             stats_final.hits >= 1,
             "ANN 経路（索引探索・縮退なし）が復帰していることを固定する"
+        );
+    }
+
+    /// [`prepare_subset`] の早期打ち切り（Issue #488）を、統合テスト
+    /// （`crates/engine/tests/hnsw_cache.rs` の
+    /// `full_scan_ratio_plain_scan_below_ratio_subset_shape_matches_brute_force_and_never_leaks_across_tenants`）
+    /// が観測する `subset_searches == 0` とは別の経路で直接固定する
+    /// （codex-review P2 指摘対応・PR #606）。
+    ///
+    /// `subset_searches == 0` は `Overlay::compute` を経由する旧来のフォール
+    /// バック（`prepare_subset` に早期打ち切りを実装せず、`Overlay::compute`
+    /// → `below_full_scan_ratio` 判定 → `search_with_overlay` 内で plain scan
+    /// を選ぶ経路）でも成立してしまい、`plain_scans > 0` と組み合わせても
+    /// 「`Overlay::compute` そのものを省略した」ことの証拠にはならない。本
+    /// テストは `prepare_subset` の戻り値（[`PreparedHnswSearch`]）を
+    /// `matches!` で直接検査し、早期打ち切り固有の分岐（`Overlay::compute`
+    /// 呼び出し前に確定する `PlainScanBelowRatio`）を実際に踏んだことを
+    /// 固定する。対称条件（比が `full_scan_ratio` 以上）では同じ関数が
+    /// `Overlay::compute` を経由する `Indexed` を返すことも併せて確認し、
+    /// 分岐が比の大小に応じて実際に切り替わっていることを示す（早期打ち切り
+    /// が常に発火する実装の誤りではないことの検査）。
+    #[test]
+    fn prepare_subset_returns_plain_scan_below_ratio_directly_without_computing_overlay() {
+        let path = unique_db_path("hnsw-cache-prepare-subset-early-cutoff");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+
+        // 索引済みベース（20 ノード）を用意する。`prepare_subset` は
+        // `Lookup::Miss` では常に `FullScan` へ縮退する契約（§`prepare_subset`
+        // ドキュメンテーションコメント「2.」）のため、`IndexedBase::build` で
+        // 直接構築してキャッシュへ登録し（`MIN_INDEXED_ROWS` は
+        // `prepare_full_visible` 側の下限であり、ここでは無関係）、
+        // `prepare_subset` からは常に `Lookup::Ready`／`NeedOverlay` として
+        // 見える状態にする。
+        const N: u64 = 20;
+        let embeddings: Vec<[f32; 4]> = (0..N).map(|i| [i as f32, 0.0, 0.0, 0.0]).collect();
+        let rows: Vec<(u64, RowInput<'_>)> = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                (
+                    i as u64,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: e.as_slice(),
+                        metadata: &[],
+                    },
+                )
+            })
+            .collect();
+        let op_id = crate::recovery::required_op_id::OperationId::parse(
+            "hnsw-cache-prepare-subset-early-cutoff",
+        )
+        .expect("valid operation_id");
+        crate::tenant::insert_rows(&storage, "docs", &c, &rows, &op_id).expect("bulk insert");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let full_arena = build_arena(&read_txn, "docs", &c);
+        assert_eq!(full_arena.len(), N as usize);
+        let built = IndexedBase::build(
+            &full_arena,
+            crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
+            c.clone(),
+            gen,
+        )
+        .expect("build base")
+        .0;
+        assert_eq!(built.index.len(), N as usize);
+        cache.record_base(&storage, "docs", built);
+
+        // `full_scan_ratio` を 60/100 に固定する。`tag` 列は無いためスカラー
+        // フィルタは `on_visible_row` の細工で模擬する（`prepare_subset` は
+        // 渡されたアリーナが WHERE 適用後の部分集合であることだけを前提に
+        // しており、実際のスカラーフィルタ経路を通す必要はない）。
+        let ratio = Ratio {
+            numerator: 60,
+            denominator: 100,
+        };
+        let params = crate::hnsw::ValidatedHnswParams::new(crate::hnsw::HnswParams::default())
+            .expect("valid hnsw params")
+            .with_full_scan_ratio(ratio)
+            .expect("valid full_scan_ratio");
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(params),
+        };
+
+        // 5/20 = 0.25 < 0.6: 早期打ち切り分岐を踏むはずの部分集合アリーナ
+        // （`Overlay::compute` を経由せず `PlainScanBelowRatio` を直接返す）。
+        let below_arena = VectorArena::build_filtered_with_rows_in_txn(
+            &read_txn,
+            "docs",
+            crate::rls::ImplicitRlsHook::new(&c).predicate(),
+            |_, id, _, _| Ok(id < 5),
+        )
+        .expect("build below-ratio subset arena");
+        assert_eq!(below_arena.len(), 5);
+        let below_prepared = prepare_subset(&access, &read_txn, "docs", &c, &below_arena);
+        assert!(
+            matches!(below_prepared, PreparedHnswSearch::PlainScanBelowRatio),
+            "arena.len() / index.len() = 0.25 < full_scan_ratio = 0.6 は \
+             Overlay::compute を経由せず PlainScanBelowRatio を直接返すはず"
+        );
+
+        // 19/20 = 0.95 >= 0.6: 対称条件（早期打ち切りを踏まない）。同じ
+        // `prepare_subset` が `Overlay::compute` を経由する `Indexed` を返す
+        // ことを確認し、分岐が比の大小に応じて実際に切り替わっていることを
+        // 示す。
+        let above_arena = VectorArena::build_filtered_with_rows_in_txn(
+            &read_txn,
+            "docs",
+            crate::rls::ImplicitRlsHook::new(&c).predicate(),
+            |_, id, _, _| Ok(id < 19),
+        )
+        .expect("build at-or-above-ratio subset arena");
+        assert_eq!(above_arena.len(), 19);
+        let above_prepared = prepare_subset(&access, &read_txn, "docs", &c, &above_arena);
+        assert!(
+            matches!(above_prepared, PreparedHnswSearch::Indexed { .. }),
+            "arena.len() / index.len() = 0.95 >= full_scan_ratio = 0.6 では \
+             早期打ち切りを踏まず Overlay::compute 経由の Indexed を返すはず"
         );
     }
 }

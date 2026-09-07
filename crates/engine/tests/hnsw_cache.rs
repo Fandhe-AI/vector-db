@@ -21,6 +21,11 @@
 //!   完全一致すること。
 //! - Rust API（`VectorCore::search`）は本キャッシュを経由しない（`sql` 表層専用の
 //!   段階化。既存 Issue #407 の契約を維持）。
+//! - Issue #515: HNSW 索引ノードの F16 常駐（Issue #514）opt-in でも上記の
+//!   Recall・非漏えい契約が同水準で成立すること（`f16_*` テストとして R4・
+//!   hybrid・Rust API・`Subset` 形状・`full_scan_ratio` ANN 側のそれぞれに
+//!   対応する版を追加）。加えて範囲外成分による自動縮退（D6）が SQL 表層
+//!   経由でも非漏えい・Recall を維持したまま fail-closed に働くこと。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, VectorCore};
@@ -150,6 +155,52 @@ fn recall_at_k(got: &[u64], want: &[u64]) -> f64 {
     let want_set: std::collections::HashSet<u64> = want.iter().copied().collect();
     let hits = got.iter().filter(|id| want_set.contains(id)).count();
     hits as f64 / want.len() as f64
+}
+
+/// `search_engine::hnsw_kind`（既定 `HnswParams` の唯一の検証入口）が返す
+/// 検証済み `SearchEngineKind::Hnsw` へ、常駐精度 opt-in（`ResidentPrecision`。
+/// Issue #514・#515）を適用するテスト専用ヘルパ。`precision ==
+/// ResidentPrecision::F32` のときは `hnsw_kind(HnswParams::default())` と
+/// 完全に等価（`ValidatedHnswParams` の既定値が F32 のため）。
+fn hnsw_kind_with(precision: engine::hnsw::ResidentPrecision) -> search_engine::SearchEngineKind {
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    match kind {
+        search_engine::SearchEngineKind::Hnsw(validated) => {
+            search_engine::SearchEngineKind::Hnsw(validated.with_resident_precision(precision))
+        }
+        other => panic!("hnsw_kind must return SearchEngineKind::Hnsw, got {other:?}"),
+    }
+}
+
+/// F16 常駐 opt-in（Issue #515）の非 vacuous 確認: 実際にエンジンへ opt-in が
+/// 到達し（`search_engine_kind()` の Display に `resident=f16`）、この
+/// コーパスでは自動縮退（D6）が発生していないこと（`f16_residency_fallbacks
+/// == 0`）を固定する。F32 側では逆に `resident=f32` を固定する。
+fn assert_resident_precision_reached(
+    core: &EngineCore,
+    precision: engine::hnsw::ResidentPrecision,
+) {
+    let expect_suffix = match precision {
+        engine::hnsw::ResidentPrecision::F16 => "resident=f16",
+        engine::hnsw::ResidentPrecision::F32 => "resident=f32",
+    };
+    let kind_display = core
+        .search_engine_kind()
+        .map(|k| k.to_string())
+        .unwrap_or_default();
+    assert!(
+        kind_display.contains(expect_suffix),
+        "expected search_engine_kind() display to contain {expect_suffix:?}, got {kind_display:?}"
+    );
+    if precision == engine::hnsw::ResidentPrecision::F16 {
+        assert_eq!(
+            core.hnsw_index_cache_stats().f16_residency_fallbacks,
+            0,
+            "embeddings in this fixture's corpus must stay within the f16 finite range \
+             and must not trigger the F32 fallback (D6)"
+        );
+    }
 }
 
 /// R1: 構築 → 差分 brute-force → 再構築 → update/delete の段階遷移で Recall@10 が
@@ -323,8 +374,9 @@ fn seed_rows_on_core(
 
 /// R4: テナント境界。tenant-a の private 行は tenant-b の可視結果に現れず、
 /// キャッシュエントリは `(table, ctx)` ごとに独立する。
-#[test]
-fn r4_tenant_isolation_never_leaks_across_ctx() {
+/// [`r4_tenant_isolation_never_leaks_across_ctx`]／[`f16_r4_tenant_isolation_never_leaks_across_ctx`]
+/// が共有する本体（Issue #515。`precision` で常駐精度を切り替える）。
+fn run_r4_tenant_isolation_never_leaks_across_ctx(precision: engine::hnsw::ResidentPrecision) {
     let dir = unique_db_path("hnsw-cache-r4");
     let _cleanup = CleanupGuard(dir.clone());
     let storage = Storage::open(&dir).expect("open storage");
@@ -390,8 +442,7 @@ fn r4_tenant_isolation_never_leaks_across_ctx() {
     let op_b = OperationId::parse("hnsw-cache-r4-b").expect("valid operation_id");
     engine::tenant::insert_rows(&storage, "docs", &ctx_b, &rows_b, &op_b).expect("seed tenant-b");
 
-    let kind =
-        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let kind = hnsw_kind_with(precision);
     let core = EngineCore::from_storage_with_engine(storage, kind);
 
     let query = &a_vectors[0];
@@ -409,6 +460,19 @@ fn r4_tenant_isolation_never_leaks_across_ctx() {
         stats.entries >= 2,
         "tenant-a and tenant-b must occupy independent cache entries"
     );
+    assert_resident_precision_reached(&core, precision);
+}
+
+#[test]
+fn r4_tenant_isolation_never_leaks_across_ctx() {
+    run_r4_tenant_isolation_never_leaks_across_ctx(engine::hnsw::ResidentPrecision::F32);
+}
+
+/// Issue #515: F16 常駐でもテナント境界（`(table, ctx)` 完全一致キー）は
+/// 不変であることを固定する。
+#[test]
+fn f16_r4_tenant_isolation_never_leaks_across_ctx() {
+    run_r4_tenant_isolation_never_leaks_across_ctx(engine::hnsw::ResidentPrecision::F16);
 }
 
 /// フィルタ付き（`WHERE`）DISTANCE クエリは `HnswIndexCache` の `FullVisible`
@@ -511,8 +575,12 @@ fn filtered_distance_bypasses_full_visible_entries_and_matches_default_engine() 
 /// 一致するようクエリを組み立てる（`default_preset.rs::hybrid_corpus` と同じ
 /// 「密・疎ともに当たる文書を作る」設計方針。ANN の近似性を許容するため
 /// 完全一致ではなく Recall 基準で判定する）。
-#[test]
-fn hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall() {
+/// [`hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall`]／
+/// [`f16_hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall`]
+/// が共有する本体（Issue #515）。
+fn run_hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall(
+    precision: engine::hnsw::ResidentPrecision,
+) {
     const HYBRID_DIM: u32 = 16;
     const CLUSTERS: usize = 6;
     let hybrid_schema = TableSchema::new(
@@ -571,8 +639,7 @@ fn hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall() {
         &other_vectors,
         Visibility::Private,
     );
-    let kind =
-        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let kind = hnsw_kind_with(precision);
     let core = EngineCore::from_storage_with_engine(storage, kind);
 
     let ref_dir = unique_db_path("hnsw-cache-hybrid-ref");
@@ -629,6 +696,23 @@ fn hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall() {
     assert!(
         stats.hybrid_queries > 0 && stats.hybrid_rounds_max > 0,
         "hybrid per-query round accounting must be non-vacuous"
+    );
+    assert_resident_precision_reached(&core, precision);
+}
+
+#[test]
+fn hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall() {
+    run_hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall(
+        engine::hnsw::ResidentPrecision::F32,
+    );
+}
+
+/// Issue #515: F16 常駐でも hybrid 密側再取得ループ（`HnswDenseProvider`）が
+/// 既定エンジン対照 Recall@10 ≥ 0.9・可視外非混入を維持することを固定する。
+#[test]
+fn f16_hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall() {
+    run_hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall(
+        engine::hnsw::ResidentPrecision::F16,
     );
 }
 
@@ -766,8 +850,12 @@ fn hybrid_queries_use_subset_shape_and_match_default_engine_recall() {
 /// はまさにその迂回を解消することが目的のため、ANN 特有の近似性を許容する
 /// Recall 基準へ揃える必要がある。詳細は `docs/design/hnsw-rls-cardinality-switch.md`
 /// 参照）。
-#[test]
-fn rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall() {
+/// [`rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall`]／
+/// [`f16_rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall`]
+/// が共有する本体（Issue #515）。
+fn run_rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall(
+    precision: engine::hnsw::ResidentPrecision,
+) {
     let dir = unique_db_path("hnsw-cache-rust-api-hnsw");
     let _cleanup = CleanupGuard(dir.clone());
     let storage = Storage::open(&dir).expect("open storage");
@@ -783,8 +871,7 @@ fn rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall() {
         &other_vectors,
         "rust-api-other-tenant",
     );
-    let kind =
-        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let kind = hnsw_kind_with(precision);
     let core = EngineCore::from_storage_with_engine(storage, kind);
 
     let ref_dir = unique_db_path("hnsw-cache-rust-api-ref");
@@ -828,6 +915,24 @@ fn rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall() {
         stats.hits + stats.plain_scans + stats.masked_short > 0,
         "Rust API search must exercise the HnswIndexCache path (non-vacuous)"
     );
+    assert_resident_precision_reached(&core, precision);
+}
+
+#[test]
+fn rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall() {
+    run_rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall(
+        engine::hnsw::ResidentPrecision::F32,
+    );
+}
+
+/// Issue #515: F16 常駐でも Rust API（`VectorCore::search`）が `HnswIndexCache`
+/// を経由して既定エンジン対照 Recall@10 ≥ 0.9・可視外非混入を維持することを
+/// 固定する。
+#[test]
+fn f16_rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall() {
+    run_rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall(
+        engine::hnsw::ResidentPrecision::F16,
+    );
 }
 
 /// SCALAR 事前フィルタ付き DISTANCE（`Subset` 形状。Issue #409）: フィルタなし
@@ -838,8 +943,12 @@ fn rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall() {
 /// 動いたこと（`subset_searches > 0`）・`Subset` 経路がキャッシュへエントリを
 /// 追加しないこと（§`search_subset_or_fallback` ドキュメンテーションコメント
 /// 「3.」）を固定する。
-#[test]
-fn filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
+/// [`filtered_distance_uses_subset_shape_and_matches_default_engine_recall`]／
+/// [`f16_filtered_distance_uses_subset_shape_and_matches_default_engine_recall`]
+/// が共有する本体（Issue #515）。
+fn run_filtered_distance_uses_subset_shape_and_matches_default_engine_recall(
+    precision: engine::hnsw::ResidentPrecision,
+) {
     let dir = unique_db_path("hnsw-cache-subset-hnsw");
     let _cleanup = CleanupGuard(dir.clone());
     let storage = Storage::open(&dir).expect("open storage");
@@ -893,8 +1002,7 @@ fn filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
         .collect();
     engine::tenant::insert_rows(&storage, "docs", &ctx, &rows, &op_id).expect("seed rows");
 
-    let kind =
-        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let kind = hnsw_kind_with(precision);
     let core = EngineCore::from_storage_with_engine(storage, kind);
 
     let ref_dir = unique_db_path("hnsw-cache-subset-ref");
@@ -952,6 +1060,190 @@ fn filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
         stats.entries, baseline_entries,
         "Subset shape must never register a cache entry"
     );
+    assert_resident_precision_reached(&core, precision);
+}
+
+#[test]
+fn filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
+    run_filtered_distance_uses_subset_shape_and_matches_default_engine_recall(
+        engine::hnsw::ResidentPrecision::F32,
+    );
+}
+
+/// Issue #515: F16 常駐でも `Subset` 形状（SCALAR 事前フィルタ付き DISTANCE）
+/// が既定エンジン対照 Recall@10 ≥ 0.9・可視外非混入を維持することを固定する。
+#[test]
+fn f16_filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
+    run_filtered_distance_uses_subset_shape_and_matches_default_engine_recall(
+        engine::hnsw::ResidentPrecision::F16,
+    );
+}
+
+/// `Subset` 形状の早期打ち切り（Issue #488・`PreparedHnswSearch::PlainScanBelowRatio`）:
+/// `WHERE` 適用後の部分集合カーディナリティ（`arena.len()`。索引済みノード数の
+/// 上界）が `full_scan_ratio` 未満まで下がった場合に、`Overlay::compute` を
+/// 経由せず plain scan へ縮退すること・既定エンジン対照 Recall@10 が回帰基準
+/// 以上であること・`WHERE` を満たさない行が混入しないこと・実際にこの早期
+/// 打ち切り分岐を経由したこと（`stats.plain_scans > 0` かつ `Overlay::compute`
+/// を経由する `subset_searches == 0`）を固定する（対称版である `FullVisible`
+/// 形状側の `full_scan_ratio_plain_scan_side_matches_brute_force_and_never_leaks_across_tenants`
+/// に対応する `Subset` 形状側のテスト）。
+#[test]
+fn full_scan_ratio_plain_scan_below_ratio_subset_shape_matches_brute_force_and_never_leaks_across_tenants(
+) {
+    let dir = unique_db_path("hnsw-cache-ratio-subset");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    let schema = TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+            ColumnDef::new("tag", ColumnType::Text, false),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+
+    let vectors = gen_clustered_corpus(53, DIM as usize, BASE_ROWS, 6);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let op_id = OperationId::parse("hnsw-cache-ratio-subset").expect("valid operation_id");
+    let metadata_x = engine::row_codec::encode_scalar_columns(
+        &schema,
+        &[Value::Null, Value::Text("x".to_string())],
+    )
+    .expect("encode tag=x metadata");
+    let metadata_y = engine::row_codec::encode_scalar_columns(
+        &schema,
+        &[Value::Null, Value::Text("y".to_string())],
+    )
+    .expect("encode tag=y metadata");
+    let rows: Vec<(u64, RowInput<'_>)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let metadata = if i % 2 == 0 {
+                metadata_x.as_slice()
+            } else {
+                metadata_y.as_slice()
+            };
+            (
+                i as u64 + 1,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: v.as_slice(),
+                    metadata,
+                },
+            )
+        })
+        .collect();
+    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows, &op_id).expect("seed rows");
+
+    // tenant-b の行を同一テーブルへ混在させ、可視外テナントの id が結果へ
+    // 混入しないことを検証できるようにする（TABLE-12・security.md P0）。
+    // `seed_rows` ヘルパーは metadata を空にするため、`tag` 列（not null）を
+    // 持つ本テストのスキーマでは使えず、`rows` と同じ手順で個別に組み立てる。
+    let other_vectors = gen_clustered_corpus(54, DIM as usize, 100, 4);
+    let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+    let other_rows: Vec<(u64, RowInput<'_>)> = other_vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            (
+                BASE_ROWS as u64 + 1 + i as u64,
+                RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Public,
+                    embedding: v.as_slice(),
+                    metadata: metadata_x.as_slice(),
+                },
+            )
+        })
+        .collect();
+    let op_other = OperationId::parse("hnsw-cache-ratio-subset-other").expect("valid operation_id");
+    engine::tenant::insert_rows(&storage, "docs", &ctx_b, &other_rows, &op_other)
+        .expect("seed tenant-b rows");
+
+    // `full_scan_ratio` を 60/100 まで引き上げる。`tag = 'x'` の選択率は
+    // ちょうど 50% であるため、`arena.len() / index.len() ≈ 0.5` が常に
+    // 0.6 未満となり `PlainScanBelowRatio` を確実に踏む。
+    let ratio = engine::hnsw::Ratio {
+        numerator: 60,
+        denominator: 100,
+    };
+    let params = engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
+        .expect("valid hnsw params")
+        .with_full_scan_ratio(ratio)
+        .expect("valid full_scan_ratio");
+    let kind = engine::search_engine::SearchEngineKind::Hnsw(params);
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-ratio-subset-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage.create_table(&schema).expect("create ref table");
+    engine::tenant::insert_rows(&ref_storage, "docs", &ctx, &rows, &op_id).expect("seed ref rows");
+    let op_other_ref =
+        OperationId::parse("hnsw-cache-ratio-subset-other-ref").expect("valid operation_id");
+    engine::tenant::insert_rows(&ref_storage, "docs", &ctx_b, &other_rows, &op_other_ref)
+        .expect("seed ref tenant-b rows");
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    // フィルタなしクエリを 1 本先に投げ、`FullVisible` 経路に索引を構築させる
+    // （可視カーディナリティ比は構築直後 1.0 のため `full_scan_ratio`=0.6 を
+    // 上回り、この呼び出し自体は plain scan を踏まない）。
+    let _ = query_ids(&core, &ctx, &vectors[0], 10);
+    let baseline_entries = core.hnsw_index_cache_stats().entries;
+    assert_eq!(baseline_entries, 1, "unfiltered query must build one entry");
+
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    let mut total_hits = 0usize;
+    for i in 0..QUERIES {
+        let query = &vectors[i * (BASE_ROWS / QUERIES)];
+        let sql = format!(
+            "SELECT id FROM docs WHERE tag = 'x' ORDER BY embedding <=> '{}' LIMIT {K}",
+            vec_literal(query)
+        );
+        let got = core.execute_sql(&ctx, &sql).expect("filtered query").rows;
+        let want = ref_core
+            .execute_sql(&ctx, &sql)
+            .expect("filtered query (ref)")
+            .rows;
+        for row in &got {
+            assert_eq!(
+                row.id % 2,
+                1,
+                "row {} does not satisfy tag='x' (1-indexed odd rows are tag='x')",
+                row.id
+            );
+            assert!(
+                row.id <= BASE_ROWS as u64,
+                "tenant-a query must not return tenant-b row id {}",
+                row.id
+            );
+        }
+        let want_ids: std::collections::HashSet<u64> = want.iter().map(|r| r.id).collect();
+        total_hits += got.iter().filter(|r| want_ids.contains(&r.id)).count();
+    }
+    let recall = total_hits as f64 / (QUERIES * K) as f64;
+    assert!(
+        recall >= 0.9,
+        "plain-scan-side (below full_scan_ratio) Subset shape recall@{K} against the default engine must be >= 0.9 (got {recall})"
+    );
+
+    let stats = core.hnsw_index_cache_stats();
+    assert!(
+        stats.plain_scans > 0,
+        "arena.len() / index.len() < full_scan_ratio must exercise the early-cutoff plain scan path (non-vacuous)"
+    );
+    assert_eq!(
+        stats.subset_searches, 0,
+        "early cutoff must skip Overlay::compute entirely, never touching the subset_searches counter"
+    );
+    assert_eq!(
+        stats.entries, baseline_entries,
+        "Subset early cutoff must never register a cache entry"
+    );
 }
 
 /// 可視カーディナリティ比が `full_scan_ratio` 以上（既定 1/10。構築直後は
@@ -961,8 +1253,13 @@ fn filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
 /// こと（Issue #409 受入基準 2「切替閾値の前後で結果が brute-force と同水準」の
 /// ANN 側）。tenant-b の private 行が tenant-a の結果へ混入しないことも併せて
 /// 固定する。
-#[test]
-fn full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants() {
+///
+/// [`full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants`]／
+/// [`f16_full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants`]
+/// が共有する本体（Issue #515）。
+fn run_full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants(
+    precision: engine::hnsw::ResidentPrecision,
+) {
     let dir = unique_db_path("hnsw-cache-ratio-ann");
     let _cleanup = CleanupGuard(dir.clone());
     let storage = Storage::open(&dir).expect("open storage");
@@ -994,9 +1291,7 @@ fn full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants()
     engine::tenant::insert_rows(&storage, "docs", &ctx_b, &rows_b, &op_b).expect("seed tenant-b");
 
     // 既定の `full_scan_ratio`（1/10）をそのまま使う。
-    let params = engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
-        .expect("valid hnsw params");
-    let kind = engine::search_engine::SearchEngineKind::Hnsw(params);
+    let kind = hnsw_kind_with(precision);
     let core = EngineCore::from_storage_with_engine(storage, kind);
 
     let ref_dir = unique_db_path("hnsw-cache-ratio-ann-ref");
@@ -1041,6 +1336,244 @@ fn full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants()
     assert_eq!(
         stats.plain_scans, 0,
         "ratio >= full_scan_ratio must never fall back to plain scan"
+    );
+    assert_resident_precision_reached(&core, precision);
+}
+
+#[test]
+fn full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants() {
+    run_full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants(
+        engine::hnsw::ResidentPrecision::F32,
+    );
+}
+
+/// Issue #497: `ValidatedHnswParams::with_sparse_visited_max(usize::MAX)`
+/// （マスク付き探索なら必ず [`engine::hnsw::VisitedSparse`] を選ぶ極端値）を
+/// opt-in した provider でも、既定 engine（`sparse_visited_max` 既定値 0＝常に
+/// dense）と同水準の Recall@10（≥ 0.9）を維持し、`HnswIndexCache` の統計
+/// （`sparse_visited_searches > 0`。非 vacuous）に実際の採否が反映され、
+/// tenant-b（Private）の private 行が tenant-a の結果へ混入しないことを固定
+/// する。フィルタなし DISTANCE クエリ（`FullVisible` 形状）は可視行全体を
+/// 受理する恒等マスクを使うため、`sparse_visited_max = usize::MAX` であれば
+/// 索引ノード数に関わらず sparse 側が選ばれる。
+#[test]
+fn sparse_visited_max_opt_in_matches_default_engine_and_never_leaks_across_tenants() {
+    let dir = unique_db_path("hnsw-cache-sparse-visited");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    storage.create_table(&schema(DIM)).expect("create table");
+
+    let a_vectors = gen_clustered_corpus(71, DIM as usize, BASE_ROWS, 10);
+    seed_rows(&storage, "tenant-a", 1, &a_vectors, "sparse-visited-a");
+    // tenant-b の private 行（id 空間を tenant-a と分離し、混入の有無を id 範囲
+    // だけで判定できるようにする。`run_full_scan_ratio_ann_side_matches_
+    // brute_force_and_never_leaks_across_tenants` と同型）。
+    let b_vectors = gen_clustered_corpus(72, DIM as usize, 100, 4);
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Private]).expect("valid tenant");
+    let rows_b: Vec<(u64, RowInput<'_>)> = b_vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            (
+                BASE_ROWS as u64 + 1 + i as u64,
+                RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Private,
+                    embedding: v.as_slice(),
+                    metadata: &[],
+                },
+            )
+        })
+        .collect();
+    let op_b = OperationId::parse("hnsw-cache-sparse-visited-b").expect("valid operation_id");
+    engine::tenant::insert_rows(&storage, "docs", &ctx_b, &rows_b, &op_b).expect("seed tenant-b");
+
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let kind = match kind {
+        search_engine::SearchEngineKind::Hnsw(validated) => {
+            search_engine::SearchEngineKind::Hnsw(validated.with_sparse_visited_max(usize::MAX))
+        }
+        other => panic!("hnsw_kind must return SearchEngineKind::Hnsw, got {other:?}"),
+    };
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-sparse-visited-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage
+        .create_table(&schema(DIM))
+        .expect("create ref table");
+    seed_rows(
+        &ref_storage,
+        "tenant-a",
+        1,
+        &a_vectors,
+        "sparse-visited-ref-a",
+    );
+    engine::tenant::insert_rows(&ref_storage, "docs", &ctx_b, &rows_b, &op_b)
+        .expect("seed ref tenant-b");
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    let mut total_hits = 0usize;
+    for i in 0..QUERIES {
+        let query = &a_vectors[i * (BASE_ROWS / QUERIES)];
+        let got = query_ids(&core, &ctx_a, query, K);
+        let want = query_ids(&ref_core, &ctx_a, query, K);
+        for id in &got {
+            assert!(
+                *id <= BASE_ROWS as u64,
+                "tenant-a result must not include tenant-b row id {id}"
+            );
+        }
+        let want_set: std::collections::HashSet<u64> = want.iter().copied().collect();
+        total_hits += got.iter().filter(|id| want_set.contains(id)).count();
+    }
+    let recall = total_hits as f64 / (QUERIES * K) as f64;
+    assert!(
+        recall >= 0.9,
+        "sparse_visited_max opt-in recall@{K} against default engine must be >= 0.9 (got {recall})"
+    );
+
+    let stats = core.hnsw_index_cache_stats();
+    assert!(
+        stats.hits > 0,
+        "ANN-side masked search must be exercised (non-vacuous)"
+    );
+    // `sparse_visited_searches` は縮退なしで完走した全マスク付き探索
+    // （`OverlaySuccessStat::Hits`／`SubsetSearches`／`None` のいずれでも）を
+    // 数える診断カウンタで、`hits`（`Lookup::Ready` 到達分のみ）とは母集団が
+    // 異なる（初回クエリは索引の初回構築を伴い `OverlaySuccessStat::None` に
+    // 分類されるため、`sparse_visited_searches` の方が `hits` を上回りうる。
+    // `search_with_overlay` ドキュメンテーションコメント参照）。ここでは
+    // 「マスクがあれば必ず sparse を選ぶ」という本 opt-in の契約どおり、
+    // 総クエリ数（`QUERIES`）以上（フォールバック等で `hits` に届かなかった
+    // 呼び出しがあっても、その呼び出し自体は完走していれば計上される）である
+    // ことのみを固定する。
+    assert!(
+        stats.sparse_visited_searches >= QUERIES as u64,
+        "sparse_visited_max=usize::MAX must select VisitedSparse for every completed masked \
+         search (mask is always Some and count_ones() < usize::MAX). stats={stats:?}"
+    );
+}
+
+/// Issue #515: F16 常駐でも可視カーディナリティ比が `full_scan_ratio` 以上の
+/// 場合はマスク付き ANN 探索側を選び、既定エンジン対照 Recall@10 ≥ 0.9・
+/// 可視外非混入を維持することを固定する。
+#[test]
+fn f16_full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants() {
+    run_full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants(
+        engine::hnsw::ResidentPrecision::F16,
+    );
+}
+
+/// D6（F16 常駐要求時、範囲外成分（`|x| > 65504.0`）を含む場合は索引全体を
+/// F32 常駐へ自動縮退する。`hnsw.rs::HnswIndex::freeze_from` 参照）が SQL 表層
+/// 経由でも fail-closed に働くことを固定する（Issue #515。`crates/engine/src/
+/// sql/hnsw_cache.rs` の単体テスト
+/// `f16_resident_precision_hits_the_ann_path_and_matches_default_engine_scores_exactly`
+/// は範囲内成分のみを使う対照テストで、こちらは逆に縮退が実際に起きるケースを
+/// 固定する）。tenant-a に 1 成分 `70000.0`（> 65504.0）を持つ行を 1 件だけ
+/// 混ぜ、`f16_residency_fallbacks == 1`・`resident=f16`（静的設定は要求どおり
+/// F16 のまま。実効的にはノードは F32 常駐だが opt-in 自体は取り消されない）・
+/// tenant-b（Private）の可視外非混入・既定エンジン対照 Recall@10 ≥ 0.9 を
+/// 固定する。
+#[test]
+fn f16_out_of_range_component_falls_back_to_f32_residency_without_leaking_or_losing_recall() {
+    let dir = unique_db_path("hnsw-cache-f16-fallback");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    storage.create_table(&schema(DIM)).expect("create table");
+
+    let mut a_vectors = gen_clustered_corpus(51, DIM as usize, BASE_ROWS, 6);
+    // f16 の有限範囲（|x| <= 65504.0）を超える成分を 1 件だけ混ぜる
+    // （`crate::f16::F16_MAX` は `pub(crate)` のため結合テストからは参照でき
+    // ず、`hnsw.rs::freeze_from` ドキュメンテーションコメントに明記された
+    // 65504.0 をそのまま使う）。
+    a_vectors[0][0] = 70_000.0;
+    seed_rows(&storage, "tenant-a", 1, &a_vectors, "f16-fallback-a");
+    // tenant-b の private 行（不可視）。可視外混入がないことの検証対象
+    // （`Public` はテナント横断可視のため `Private` を使う。R4 と同じ方針）。
+    let b_vectors = gen_clustered_corpus(52, DIM as usize, 64, 4);
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Private]).expect("valid tenant");
+    let rows_b: Vec<(u64, RowInput<'_>)> = b_vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            (
+                BASE_ROWS as u64 + 1 + i as u64,
+                RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Private,
+                    embedding: v.as_slice(),
+                    metadata: &[],
+                },
+            )
+        })
+        .collect();
+    let op_b = OperationId::parse("hnsw-cache-f16-fallback-b").expect("valid operation_id");
+    engine::tenant::insert_rows(&storage, "docs", &ctx_b, &rows_b, &op_b).expect("seed tenant-b");
+
+    let kind = hnsw_kind_with(engine::hnsw::ResidentPrecision::F16);
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-f16-fallback-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage
+        .create_table(&schema(DIM))
+        .expect("create ref table");
+    seed_rows(&ref_storage, "tenant-a", 1, &a_vectors, "f16-fallback-ref");
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    let mut total_hits = 0usize;
+    for i in 0..QUERIES {
+        let query = &a_vectors[i * (BASE_ROWS / QUERIES)];
+        let got = query_ids(&core, &ctx, query, K);
+        // 可視外テナント（tenant-b）の id（`BASE_ROWS + 1 ..`）が一切混入しない
+        // こと（TABLE-12・security.md P0「テナント境界」）。
+        for id in &got {
+            assert!(
+                *id <= BASE_ROWS as u64,
+                "must never return a row from an invisible tenant (id={id})"
+            );
+        }
+        let want = query_ids(&ref_core, &ctx, query, K);
+        let want_set: std::collections::HashSet<u64> = want.iter().copied().collect();
+        total_hits += got.iter().filter(|id| want_set.contains(id)).count();
+    }
+    let recall = total_hits as f64 / (QUERIES * K) as f64;
+    assert!(
+        recall >= 0.9,
+        "recall@{K} against the default-engine reference must be >= 0.9 even under D6 \
+         fallback (got {recall})"
+    );
+
+    let stats = core.hnsw_index_cache_stats();
+    assert_eq!(
+        stats.f16_residency_fallbacks, 1,
+        "the out-of-range component must trigger exactly one D6 fallback"
+    );
+    // 静的設定（opt-in 自体）は要求どおり F16 のまま——D6 縮退は索引ノードの
+    // 実効表現のみを F32 へ切り替え、`ValidatedHnswParams::resident_precision`
+    // が保持する opt-in 設定そのものは取り消さない
+    // （`hnsw.rs::HnswIndex::resident_precision`・`freeze_from` 参照）。
+    let kind_display = core
+        .search_engine_kind()
+        .map(|k| k.to_string())
+        .unwrap_or_default();
+    assert!(
+        kind_display.contains("resident=f16"),
+        "static opt-in configuration must remain resident=f16 even when D6 falls back \
+         the effective node representation, got {kind_display:?}"
     );
 }
 

@@ -247,6 +247,13 @@ pub struct HnswWorkerStats {
     /// このワーカーが `try_promote_entry` で実際にエントリポイントを
     /// 更新した回数。
     pub entry_promotions: u64,
+    /// このワーカーが `plan_links` の層探索で退化した候補集合
+    /// （`candidates.len() <= 1`）を観測した回数（Issue #448 追記。
+    /// `parallel_build.rs::DEGENERATE_LAYER_SEARCHES` 参照）。
+    pub degenerate_layer_searches: u64,
+    /// このワーカーが `ensure_reverse_link` で実際に再結線を行った回数
+    /// （Issue #448 追記。`parallel_build.rs::REVERSE_LINK_RECONNECTS` 参照）。
+    pub reverse_link_reconnects: u64,
 }
 
 /// 整数比（`u32/u32`）。`f32` は `HnswParams` の `Copy + PartialEq + Eq` derive と
@@ -382,6 +389,7 @@ pub struct ValidatedHnswParams {
     params: HnswParams,
     full_scan_ratio: Ratio,
     resident_precision: ResidentPrecision,
+    sparse_visited_max: usize,
 }
 
 /// HNSW 索引ノードの常駐ベクトル表現（Issue #514・親 #513。ポインタ:
@@ -421,17 +429,45 @@ const DEFAULT_FULL_SCAN_RATIO: Ratio = Ratio {
     denominator: 10,
 };
 
+/// [`ValidatedHnswParams`] の `sparse_visited_max` 既定値（Issue #497）。
+/// `0` は「常にビットマップ visited のみを使う」（既存の全動作を不変に保つ）
+/// ことを意味する。閾値の既定値確定・可視比率別の費用対効果測定は後続
+/// Issue #498 の担当（`docs/design/hnsw-search.md`「visited 集合の 3 実装」
+/// 節の申し送り）。
+const DEFAULT_SPARSE_VISITED_MAX: usize = 0;
+
 impl ValidatedHnswParams {
     /// `params` を [`HnswParams::validate`] で検証し、通過した場合のみ構築する。
-    /// `full_scan_ratio` は既定値（[`DEFAULT_FULL_SCAN_RATIO`]）で初期化される。
-    /// 差し替えたい場合は [`Self::with_full_scan_ratio`] を使う。
+    /// `full_scan_ratio` は既定値（[`DEFAULT_FULL_SCAN_RATIO`]）、
+    /// `sparse_visited_max` は既定値（[`DEFAULT_SPARSE_VISITED_MAX`]）で
+    /// 初期化される。差し替えたい場合は [`Self::with_full_scan_ratio`]・
+    /// [`Self::with_sparse_visited_max`] を使う。
     pub fn new(params: HnswParams) -> Result<Self, HnswError> {
         params.validate()?;
         Ok(Self {
             params,
             full_scan_ratio: DEFAULT_FULL_SCAN_RATIO,
             resident_precision: ResidentPrecision::F32,
+            sparse_visited_max: DEFAULT_SPARSE_VISITED_MAX,
         })
+    }
+
+    /// visited 集合の切替閾値を返す（Issue #497。
+    /// [`HnswIndex::search_masked_with`] がマスク付き探索で `mask.count_ones()`
+    /// がこの値未満のとき [`VisitedSparse`] を選ぶ。`0`（既定）は常に
+    /// [`VisitedBitmap`] を使うことを意味する）。
+    pub fn sparse_visited_max(&self) -> usize {
+        self.sparse_visited_max
+    }
+
+    /// `sparse_visited_max` だけを差し替えたコピーを返す（Issue #497・opt-in。
+    /// 検証を要さないためシグネチャは [`Result`] を返さない
+    /// [`Self::with_resident_precision`] と同型）。既定値のまま（`0`）だと
+    /// 既存の全動作を不変に保つ（`docs/design/benchmark-judgement-policy.md`
+    /// の趣旨に沿い、未計測の性能変更を既定にしない）。
+    pub fn with_sparse_visited_max(mut self, max: usize) -> Self {
+        self.sparse_visited_max = max;
+        self
     }
 
     /// 索引ノードの常駐精度（[`ResidentPrecision`]）を返す（構築時に指定した
@@ -955,6 +991,74 @@ impl VisitedSet for VisitedBitmap {
     }
 }
 
+/// [`HnswIndex::search_masked_with`] が使う visited 集合の疎な実装（Issue #497。
+/// faiss の `VisitedTable` 方式——可視カーディナリティが小さいときは
+/// `unordered_set` へ切り替える——を参考にした 3 つめの [`VisitedSet`] 実装）。
+/// [`VisitedBitmap`] は毎クエリ `reset` で索引ノード数 N に比例する `N/64` 語の
+/// 全クリアを行うため、マスク付き探索で可視候補が索引に対して極小のケースでも
+/// N 全体分のコストがかかる。本実装は `HashSet<u32>::clear` （容量は保持し
+/// 確保コストを償却する）で `reset` を行い、実際に訪問したノード数にのみ比例
+/// させる。切替規則・到達可能性の実測条件は `docs/design/hnsw-search.md`
+/// 「visited 集合の 3 実装」節参照。
+#[derive(Debug, Default)]
+struct VisitedSparse {
+    set: HashSet<u32>,
+    len: usize,
+}
+
+impl VisitedSparse {
+    /// `len` ノード分を扱えるようにする。既訪問マークは全て消すが、
+    /// `HashSet` の内部確保容量は保持する（クエリをまたいだ確保コストの
+    /// 償却。[`VisitedBitmap::reset`] が語配列を伸長のみで縮めないのと
+    /// 同じ方針）。
+    fn reset(&mut self, len: usize) {
+        self.set.clear();
+        self.len = len;
+    }
+
+    /// `id` を訪問済みとして記録する。範囲外の `id` は `None`（呼び出し元は
+    /// untrusted 添字アクセスをせず `continue` する。coding-rust.md）。
+    fn mark_visited(&mut self, id: usize) -> Option<bool> {
+        if id >= self.len {
+            return None;
+        }
+        let Ok(id_u32) = u32::try_from(id) else {
+            return None;
+        };
+        Some(!self.set.insert(id_u32))
+    }
+}
+
+impl VisitedSet for VisitedSparse {
+    fn reset(&mut self, len: usize) {
+        VisitedSparse::reset(self, len);
+    }
+
+    fn mark_visited(&mut self, id: usize) -> Option<bool> {
+        VisitedSparse::mark_visited(self, id)
+    }
+
+    /// `HashSet` はスロットを事前 load できないため no-op（[`VisitedBitmap`]・
+    /// [`VisitedScratch`] と異なりハッシュテーブルのバケット位置は
+    /// `mark_visited` 自体を呼ばないと分からない）。非受理ノードへ先読みしない
+    /// という P0 契約は `search_layer_in` 側の受理判定が担い、本実装には
+    /// 影響しない。
+    fn prefetch_slot(&self, _id: usize) {}
+}
+
+/// [`HnswIndex::search_masked_with`] がどちらの visited 実装を選んだかを表す
+/// （Issue #497。診断・統計専用——`sql::hnsw_cache::HnswIndexCacheStats::
+/// sparse_visited_searches` の計上に使う。テナント境界・可視カーディナリティ
+/// 等の実行時縮退情報は含まない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VisitedKind {
+    /// [`VisitedBitmap`]（既定）。
+    Dense,
+    /// [`VisitedSparse`]（`ValidatedHnswParams::sparse_visited_max` の閾値未満の
+    /// 可視候補数でのみ選ばれる）。
+    Sparse,
+}
+
 /// [`HnswIndex::search_masked`]（Issue #409。Issue #431 是正で意味を拡張）が
 /// 受け取る候補マスク。索引ノード（`build` 時に割り当てたノード番号）のうち、
 /// 探索経路（貪欲降下・ビーム探索の候補集合展開）へ使ってよいもの＝結果集合へ
@@ -970,6 +1074,14 @@ impl VisitedSet for VisitedBitmap {
 pub struct NodeMask {
     words: Vec<u64>,
     len: usize,
+    /// 設定済みビット数（Issue #497）。`set` の増分でのみ更新する O(1)
+    /// カウンタ。`set` 以外に `words` を書き換える経路が無いことを前提に
+    /// 同期を保つ（`NodeMask` に unset API は存在しない）。旧実装は
+    /// `count_ones()` 呼び出しのたびに `words` を全語走査しており、これは
+    /// 避けたいビットマップ visited の `reset` と同じ O(N/64) オーダーで、
+    /// 「可視候補数で visited 実装を切り替える」判定にそのまま使うと自己
+    /// 矛盾になる（`docs/design/hnsw-search.md`「visited 集合の切替」節）。
+    ones: usize,
 }
 
 impl NodeMask {
@@ -978,11 +1090,13 @@ impl NodeMask {
         Self {
             words: vec![0u64; len.div_ceil(64)],
             len,
+            ones: 0,
         }
     }
 
     /// `node` を受理対象に加える。範囲外は無視する（呼び出し元が索引の
     /// `len()` 以内の値のみを渡す契約。fail-closed に「何も起きない」側へ倒す）。
+    /// 既に設定済みのビットを二重に `set` しても `ones` は増えない。
     pub fn set(&mut self, node: u32) {
         let idx = node as usize;
         if idx >= self.len {
@@ -991,7 +1105,11 @@ impl NodeMask {
         let word_idx = idx / 64;
         let bit_idx = idx % 64;
         if let Some(word) = self.words.get_mut(word_idx) {
-            *word |= 1u64 << bit_idx;
+            let bit = 1u64 << bit_idx;
+            if (*word & bit) == 0 {
+                self.ones += 1;
+            }
+            *word |= bit;
         }
     }
 
@@ -1021,9 +1139,10 @@ impl NodeMask {
         self.len == 0
     }
 
-    /// 受理対象に設定されているノード数。
+    /// 受理対象に設定されているノード数（O(1)。`self.ones` を返すだけ。
+    /// Issue #497: `set` の増分でのみ維持されるため語走査は行わない）。
     pub fn count_ones(&self) -> usize {
-        self.words.iter().map(|w| w.count_ones() as usize).sum()
+        self.ones
     }
 }
 
@@ -1032,9 +1151,42 @@ impl NodeMask {
 /// 使い回す想定（モジュール冒頭「ベクトルの所有方針」節と同じ、確保コストを
 /// 呼び出し元へ償却させる方針）。`Default` から始めれば初回呼び出しで索引
 /// 規模に応じて自動的に伸長する。
+///
+/// Issue #497 で `sparse`（[`VisitedSparse`]。マスク付き探索の可視候補数が
+/// 静的閾値未満のときに選ばれる）・`last_visited_kind`（直近の
+/// [`HnswIndex::search_masked_with`] 呼び出しがどちらの visited 実装を
+/// 使ったかの診断用記録）を追加した。両フィールドとも private（`pub(crate)`
+/// アクセサ [`Self::last_visited_kind`] 経由でのみ読める）。
 #[derive(Debug, Default)]
 pub struct HnswSearchScratch {
     visited: VisitedBitmap,
+    sparse: VisitedSparse,
+    last_visited_kind: Option<VisitedKind>,
+}
+
+impl HnswSearchScratch {
+    /// 直近の [`HnswIndex::search_masked_with`] 呼び出しが選んだ visited
+    /// 実装（Issue #497）。呼び出しが早期 `return`（`k == 0`・空索引・
+    /// 受理ノードなし等）で層 0 探索まで到達しなかった場合は `None`。
+    /// `sql::hnsw_cache` の診断用統計（`sparse_visited_searches`）が使う。
+    pub(crate) fn last_visited_kind(&self) -> Option<VisitedKind> {
+        self.last_visited_kind
+    }
+
+    /// [`Self::last_visited_kind`] の診断専用の薄いラッパー（Issue #498。
+    /// `hybrid::sparse_refetch_observed` と同じ非既定 feature `bench-internals`
+    /// 限定パターン）。`benches/hnsw_search_bench.rs` が
+    /// `sparse_visited_max` の単一ビルド A/B で「意図した visited 実装が
+    /// 実際に選ばれたか」を計測フェーズの全呼び出しで検証するために使う。
+    /// `Some(true)` は [`VisitedKind::Sparse`]、`Some(false)` は
+    /// [`VisitedKind::Dense`]、`None` は層 0 探索まで到達しなかった呼び出し
+    /// （早期 return）を表す。`bench-internals` 未指定ビルド（`wire-server`・
+    /// 既定の `cargo build -p engine`）には結線されない。
+    #[cfg(feature = "bench-internals")]
+    pub fn last_visited_kind_is_sparse(&self) -> Option<bool> {
+        self.last_visited_kind
+            .map(|k| matches!(k, VisitedKind::Sparse))
+    }
 }
 
 /// 層 `level` におけるノードの隣接リスト最大次数を返す（層 0 は `2*m`、
@@ -1098,8 +1250,20 @@ impl GraphBuilder {
     /// 総コストは O(`PRECISE_REPAIR_CAP` * N + N) に収まり、`MAX_LEVEL` も
     /// 定数上限（32）であるため `HnswIndex::build` 全体では入力規模に対し
     /// ほぼ線形（N log N 契約の範囲内）に収まる。
-    fn repair_reachability(&mut self, dim: usize, vectors: &[f32]) -> Result<(), HnswError> {
-        self.repair_reachability_inner::<false>(dim, vectors)
+    /// `threads` は最近傍探索フェーズ（下記 [`repair_reachability_inner`]
+    /// (Self::repair_reachability_inner) 「Issue #449」節）の並列度上限。
+    /// 呼び出し元（`build_inner`・`parallel_build::freeze`）が
+    /// [`HnswIndex::build_with_threads`] 等から引き継いだ構築スレッド数を
+    /// そのまま渡す契約（`WorkerBudgetGuard` の追加取得は行わない——下記
+    /// [`repair_reachability_inner`](Self::repair_reachability_inner)
+    /// 「Issue #449」節の「予算引き継ぎ方針」参照）。
+    fn repair_reachability(
+        &mut self,
+        dim: usize,
+        vectors: &[f32],
+        threads: usize,
+    ) -> Result<(), HnswError> {
+        self.repair_reachability_inner::<false>(dim, vectors, threads)
             .map(|_| ())
     }
 
@@ -1109,13 +1273,15 @@ impl GraphBuilder {
     /// [`HnswRepairStats`] として返す。非観測経路（`build`・
     /// `build_with_threads`・`parallel_build::freeze`）は
     /// [`repair_reachability`](Self::repair_reachability) を呼ぶため本メソッドの
-    /// 計装コストを一切負わない。
+    /// 計装コストを一切負わない。`threads` の意味は
+    /// [`repair_reachability`](Self::repair_reachability) と同一。
     fn repair_reachability_observed(
         &mut self,
         dim: usize,
         vectors: &[f32],
+        threads: usize,
     ) -> Result<HnswRepairStats, HnswError> {
-        self.repair_reachability_inner::<true>(dim, vectors)
+        self.repair_reachability_inner::<true>(dim, vectors, threads)
     }
 
     /// 全ノード挿入後の決定的な後始末パス。`insert_node`／`shrink_links` の
@@ -1180,10 +1346,73 @@ impl GraphBuilder {
     /// (Self::repair_reachability_observed) 経由）でのみ [`HnswRepairStats`]
     /// を採取する。グラフ操作の順序・比較・タイブレークは `OBSERVE` の値に
     /// 関わらず完全に同一（観測が挙動へ影響しない）。
+    /// 入力非依存の定数に保つことで、層あたりの
+    /// 総コストは O(`PRECISE_REPAIR_CAP` * N + N) に収まり、`MAX_LEVEL` も
+    /// 定数上限（32）であるため `HnswIndex::build` 全体では入力規模に対し
+    /// ほぼ線形（N log N 契約の範囲内）に収まる。
+    ///
+    /// # 観測分離（`OBSERVE`。Issue #447）
+    ///
+    /// `OBSERVE` を `const` ジェネリックにすることで、`OBSERVE=false`
+    /// （[`repair_reachability`](Self::repair_reachability) 経由。`build`・
+    /// `build_with_threads`・`parallel_build::freeze` が使う非観測経路）では
+    /// 単相化によって計測分岐・`Instant::now()`・カウンタ更新のコードが
+    /// 一切残らない（PR #445 の `BuildGraph::observe` 分岐と同じ方針）。
+    /// `OBSERVE=true`（[`repair_reachability_observed`]
+    /// (Self::repair_reachability_observed) 経由）でのみ [`HnswRepairStats`]
+    /// を採取する。グラフ操作の順序・比較・タイブレークは `OBSERVE` の値に
+    /// 関わらず完全に同一（観測が挙動へ影響しない）。
+    ///
+    /// # 探索の並列化（`threads`。Issue #449）
+    ///
+    /// フェーズ 1 の各反復が行う「到達済み集合内の最近傍探索」（`dot` を
+    /// 到達済みノード数だけ計算する読み取り専用の走査）を、`threads` を
+    /// 上限に [`nearest_reachable`] へ分割・並列実行させる。修復先の決定
+    /// （`connect`／`shrink_links` の可変更新）自体は本メソッドが逐次のまま
+    /// 適用するため、`&mut self` の借用規則を破らずに済む（探索＝不変借用の
+    /// 読み取り専用ヘルパ、結線＝可変借用の逐次適用、という 2 相構成）。
+    ///
+    /// 並列度は [`repair_workers_for`] が
+    /// `crate::parallel_search::thread_count_for`（検索側の並列度決定と同一
+    /// 関数）を経由して決める——`threads==1`（`build`・`build_with_threads`
+    /// の縮退経路）では常に 1 に縮退し、[`nearest_reachable`] はワーカーを
+    /// 一切起動しない逐次経路のみを通る。`WorkerBudgetGuard`
+    /// （`parallel_search.rs`）の追加取得はここでは行わない——呼び出し元
+    /// （`HnswIndex::build_parallel`／`build_parallel_with_precision`）が
+    /// 構築全体（並列挿入フェーズを含む）にわたって保持済みの予算を
+    /// `threads` としてそのまま引き継ぐ契約であり、二重に予算を計上しない
+    /// ため（`build_with_threads`〔明示スレッド数指定〕の並列挿入フェーズも
+    /// 同様に追加取得なしで `threads` 本を起動する既存契約に揃えた）。
+    ///
+    /// 探索フェーズの比較・タイブレークはモジュール冒頭「順序規約」（スコア
+    /// `total_cmp` 降順・同点は id 昇順）に従い、この規約は全順序を成す
+    /// （[`better_repair_candidate`] 参照）。全順序であることから、到達済み
+    /// 集合をどう分割し・各ワーカーの局所最良をどの順序で縮約しても、
+    /// 最終的に選ばれる修復先ノードは分割・縮約の順序に依存せず一意に
+    /// 定まる——`threads` の値によらず本メソッドが返すグラフはビット同一
+    /// になる（`docs/design/rrf-tie-break-determinism.md`「維持すべき不変
+    /// 条件」と同方針。`crates/engine/src/hnsw.rs` 内 `#[cfg(test)] mod tests`
+    /// の `repair_reachability_inner` 完全一致テストで機械検証する）。
+    ///
+    /// # 冗長な BFS の省略（Issue #449）
+    ///
+    /// フェーズ 1 の各反復は必ず BFS（[`bfs_reachable_mask`]）から始まる。
+    /// フェーズ 1 が「未到達ノードが見つからず `break`」で終わった場合、
+    /// その `break` 直前に計算した BFS 結果はグラフを一切変更していない
+    /// 状態のまま得られたものであり、フェーズ 2 が使う到達集合と完全に
+    /// 一致する（フェーズ 1・フェーズ 2 とも同じ `entry` から同じグラフに
+    /// 対して BFS するため）。よってこの場合はフェーズ 2 の BFS を再実行
+    /// せず、フェーズ 1 最終反復の結果をそのまま使い回す。逆に、フェーズ 1
+    /// が反復回数の上限まで完走した場合は最終反復で必ず結線（`connect`／
+    /// `shrink_links`）が起きているため、フェーズ 2 は BFS を再実行して
+    /// グラフの最新状態を反映する（`mutated_since_bfs` フラグで判定）。
+    /// グラフの出力自体はこの省略の前後で変わらない（省略するのは「変更が
+    /// 無いと分かっている再計算」のみ）。
     fn repair_reachability_inner<const OBSERVE: bool>(
         &mut self,
         dim: usize,
         vectors: &[f32],
+        threads: usize,
     ) -> Result<HnswRepairStats, HnswError> {
         let inner_start = if OBSERVE {
             Some(std::time::Instant::now())
@@ -1208,57 +1437,59 @@ impl GraphBuilder {
             } else {
                 None
             };
+            // 当該層に属するノード id（昇順）を層ごとに 1 回だけ構築する
+            // （Issue #449: 毎反復・フェーズ 2 の `(0..len).filter(level_of
+            // >= level)` 全走査を層ごとに 1 回へ削減。集合としての内容は
+            // 従来の毎回フィルタと同一）。
+            let members: Vec<u32> = (0..self.nodes.len() as u32)
+                .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
+                .collect();
+
             // フェーズ 1: 全体 BFS ＋ 到達済み全ノードとの `dot` 計算を伴う
             // 厳密な修復を `PRECISE_REPAIR_CAP` 回までに限定する。
             let mut phase1_completed = 0usize;
+            // フェーズ 1 の最終反復で得た到達集合（フェーズ 2 の冗長 BFS
+            // 省略に使う。上記ドキュメンテーションコメント「冗長な BFS の
+            // 省略」参照）。
+            let mut last_mask: Option<NodeMask> = None;
+            let mut mutated_since_bfs = false;
             for iter in 0..PRECISE_REPAIR_CAP {
-                let reachable = self.bfs_reachable(level, entry);
+                let mask = self.bfs_reachable_mask(level, entry);
+                mutated_since_bfs = false;
+
+                // `members` を 1 回だけ走査し、到達済み部分列（`reachable`。
+                // 最近傍探索の候補集合）と最初の未到達ノードを同時に確定する
+                // （Issue #449: 従来の 2 回の独立した `filter` 走査を統合）。
+                let mut reachable: Vec<u32> = Vec::with_capacity(members.len());
+                let mut missing_node: Option<u32> = None;
+                let mut unreachable_count: u64 = 0;
+                for &m in &members {
+                    if mask.get(m) {
+                        reachable.push(m);
+                    } else {
+                        if missing_node.is_none() {
+                            missing_node = Some(m);
+                        }
+                        unreachable_count += 1;
+                    }
+                }
                 if OBSERVE && iter == 0 {
                     // フェーズ 1 の最初の反復で得られる BFS 結果をそのまま
                     // 流用して到達不能ノード数を数える（追加の BFS を
-                    // 入れない。この `filter().count()` 自体の時間は
-                    // `phase1_wall` に含める——`unreachable_before` の
-                    // ドキュメンテーションコメント参照）。
-                    level_stats.unreachable_before = (0..self.nodes.len() as u32)
-                        .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
-                        .filter(|n| !reachable.contains(n))
-                        .count() as u64;
+                    // 入れない。この走査自体の時間は `phase1_wall` に含める
+                    // ——`unreachable_before` のドキュメンテーションコメント
+                    // 参照）。
+                    level_stats.unreachable_before = unreachable_count;
                 }
-                let missing_node = (0..self.nodes.len() as u32)
-                    .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
-                    .find(|n| !reachable.contains(n));
-                let Some(node) = missing_node else {
-                    break;
-                };
+                last_mask = Some(mask);
 
-                let node_vec = node_vector(vectors, dim, node)?;
-                let mut best: Option<(u32, f32)> = None;
-                for &candidate in &reachable {
-                    let cand_vec = node_vector(vectors, dim, candidate)?;
-                    let score = dot(node_vec, cand_vec);
-                    if !score.is_finite() {
-                        return Err(HnswError::NonFiniteScore { node: candidate });
-                    }
-                    // スコア降順・同点は id 昇順（モジュール冒頭の順序規約）。
-                    // `reachable` は `HashSet<u32>` であり走査順はプロセス
-                    // ごとに変わり得るハッシュ状態に依存するため、同点時に
-                    // 単純な `>` 比較（最初に見つかった候補を保持）のままだと
-                    // 同一 seed・同一入力でも修復先ノードが非決定的になる
-                    // （codex-review #423 P1 指摘）。ここでスコア・id の複合
-                    // 順序で明示的にタイブレークすることで、`reachable` の
-                    // 走査順に関係なく常に同じ (score, id) の組が選ばれる。
-                    let better = match best {
-                        Some((best_node, best_score)) => match score.total_cmp(&best_score) {
-                            std::cmp::Ordering::Greater => true,
-                            std::cmp::Ordering::Equal => candidate < best_node,
-                            std::cmp::Ordering::Less => false,
-                        },
-                        None => true,
-                    };
-                    if better {
-                        best = Some((candidate, score));
-                    }
-                }
+                let Some(node) = missing_node else { break };
+
+                // 到達済み集合内の最近傍探索（読み取り専用・Issue #449 で
+                // 並列化対象。`&mut self` を要する結線はこの下の `if let
+                // Some` 内でのみ行う）。
+                let workers = repair_workers_for(reachable.len(), threads);
+                let best = nearest_reachable(vectors, dim, node, &reachable, workers)?;
                 // `reachable` は entry 自身を含むため必ず 1 件以上存在し、`best`
                 // は常に `Some` になる（entry 自身が候補になり得る）。`None` は
                 // `reachable` が空という到達不能な状態であり、fail-closed で
@@ -1270,6 +1501,7 @@ impl GraphBuilder {
                     self.connect(target, node, level);
                     self.shrink_links(target, level, dim, vectors, node)?;
                     self.shrink_links(node, level, dim, vectors, target)?;
+                    mutated_since_bfs = true;
                 }
                 phase1_completed = iter + 1;
             }
@@ -1288,13 +1520,20 @@ impl GraphBuilder {
             };
             // フェーズ 2: フェーズ 1 の絶対上限までで解消しなかった残りを、
             // 上記モジュールコメントのとおり id 昇順の片方向チェーンで
-            // 確定的に閉じる。`remaining` は `0..len` の昇順フィルタなので
+            // 確定的に閉じる。`remaining` は `members`（既に昇順）由来なので
             // 既に決定的な id 昇順である。
-            let reachable = self.bfs_reachable(level, entry);
-            let remaining: Vec<u32> = (0..self.nodes.len() as u32)
-                .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
-                .filter(|n| !reachable.contains(n))
-                .collect();
+            //
+            // `mutated_since_bfs` が立っていなければ、フェーズ 1 最終反復の
+            // BFS（`last_mask`）以降グラフは変化していないため、この BFS
+            // 結果をそのまま使い回す（上記「冗長な BFS の省略」参照）。
+            // `PRECISE_REPAIR_CAP > 0` なのでループは必ず 1 回以上実行され、
+            // `last_mask` は常に `Some`。
+            let mask = if mutated_since_bfs {
+                self.bfs_reachable_mask(level, entry)
+            } else {
+                last_mask.unwrap_or_else(|| self.bfs_reachable_mask(level, entry))
+            };
+            let remaining: Vec<u32> = members.iter().copied().filter(|n| !mask.get(*n)).collect();
             if OBSERVE {
                 level_stats.phase2_nodes = remaining.len() as u64;
             }
@@ -1372,17 +1611,25 @@ impl GraphBuilder {
     }
 
     /// 層 `level` 上でノード `start` からリンクを辿って到達可能なノード集合を
-    /// 返す（`repair_reachability` 専用の内部 BFS。`tests/hnsw.rs` は公開 API
-    /// `neighbors` を使い同等の BFS を独立に実装して検証する）。
-    fn bfs_reachable(&self, level: usize, start: u32) -> HashSet<u32> {
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        visited.insert(start);
+    /// ビットマップで返す（`repair_reachability` 専用の内部 BFS。`tests/hnsw.rs`
+    /// は公開 API `neighbors` を使い同等の BFS を独立に実装して検証する）。
+    ///
+    /// Issue #449: 到達集合の表現を `HashSet<u32>`（SipHash によるハッシュ
+    /// コスト・エントリごとのヒープ確保）から [`NodeMask`]（1 ノード 1 bit の
+    /// ビットマップ）＋ `Vec<u32>` キューへ置換した。BFS が辿る到達可能
+    /// ノードの**集合そのもの**は不変（訪問順・到達判定ロジックは変えて
+    /// いない）ため、呼び出し元（`repair_reachability_inner`）が導く修復結果
+    /// は表現変更の前後で完全に一致する。
+    fn bfs_reachable_mask(&self, level: usize, start: u32) -> NodeMask {
+        let mut visited = NodeMask::new(self.nodes.len());
+        let mut queue: VecDeque<u32> = VecDeque::new();
+        visited.set(start);
         queue.push_back(start);
         while let Some(node) = queue.pop_front() {
             if let Some(neighbors) = self.neighbors(level, node) {
                 for &n in neighbors {
-                    if visited.insert(n) {
+                    if !visited.get(n) {
+                        visited.set(n);
                         queue.push_back(n);
                     }
                 }
@@ -1736,7 +1983,10 @@ impl HnswIndex {
             builder.insert_node(node_id, level, dim_usize, vectors, &mut visited)?;
         }
 
-        let repair_stats = builder.repair_reachability_inner::<OBSERVE>(dim_usize, vectors)?;
+        // `build`／`build_with_precision`／`build_observed` はいずれも単一
+        // スレッドの逐次経路であり、修復フェーズの最近傍探索（Issue #449）も
+        // 常に `threads=1`（ワーカーを起動しない縮退経路）で実行する。
+        let repair_stats = builder.repair_reachability_inner::<OBSERVE>(dim_usize, vectors, 1)?;
 
         let index = Self::freeze_from(builder, dim, owned_vectors, precision)?;
         Ok((index, repair_stats))
@@ -2586,6 +2836,44 @@ impl HnswIndex {
         mask: Option<&NodeMask>,
         scratch: &mut HnswSearchScratch,
     ) -> Result<Vec<crate::kernel::CandidateHit>, HnswError> {
+        self.search_masked_with(query, k, ef, mask, DEFAULT_SPARSE_VISITED_MAX, scratch)
+    }
+
+    /// [`Self::search_masked`] の visited 集合切替版（Issue #497）。マスク付き
+    /// 探索（`mask == Some(_)`）の可視候補数（`mask.count_ones()`。Issue #497で
+    /// O(1) 化済み）が `sparse_visited_max` 未満のとき、層 0 のビーム探索で
+    /// [`VisitedBitmap`] の代わりに [`VisitedSparse`]（`HashSet<u32>`）を使う。
+    /// `mask == None` のときは `sparse_visited_max` の値に関わらず常に
+    /// [`VisitedBitmap`] を使う（[`Self::search`] とのビット同一契約を無条件に
+    /// 維持する。`search_masked_none_matches_search` が固定）。
+    ///
+    /// [`Self::search_masked`] は `sparse_visited_max` に既定値
+    /// （[`DEFAULT_SPARSE_VISITED_MAX`] = 0。常に dense）を渡して本関数へ委譲する
+    /// 薄いラッパー。呼び出し元（`sql::hnsw_cache::search_with_overlay`）は
+    /// `ValidatedHnswParams::sparse_visited_max`（構築時 opt-in）をそのまま渡す。
+    ///
+    /// 選ばれた visited 実装は `scratch.last_visited_kind()`
+    /// （[`VisitedKind`]。診断用）で観測できる。層 0 探索まで到達しない早期
+    /// `return` 経路（`k == 0`・空索引・受理ノードなし等）では `None` のまま
+    /// 残す。
+    ///
+    /// # エラー
+    ///
+    /// 検証順序・戻り値の契約は [`Self::search_masked`] と同一（本関数へ委譲
+    /// するだけで検証ロジック自体は変更していない）。
+    pub fn search_masked_with(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        mask: Option<&NodeMask>,
+        sparse_visited_max: usize,
+        scratch: &mut HnswSearchScratch,
+    ) -> Result<Vec<crate::kernel::CandidateHit>, HnswError> {
+        // 早期 return 経路で前回呼び出しの記録を持ち越さない（Issue #497）。
+        // 層 0 探索へ到達した場合のみ、その直前で `Some(kind)` を上書きする。
+        scratch.last_visited_kind = None;
+
         let dim_usize = self.dim as usize;
         if query.len() != dim_usize {
             return Err(HnswError::QueryDimMismatch {
@@ -2698,16 +2986,42 @@ impl HnswIndex {
         } else {
             vec![nearest]
         };
-        let results = self.search_layer(
-            level0_entry_points,
-            query,
-            ef_eff,
-            0,
-            dim_usize,
-            &self.vectors,
-            &mut scratch.visited,
-            mask,
-        )?;
+
+        // visited 集合の切替（Issue #497）: `mask` が `Some` かつ可視候補数
+        // （`count_ones()`。O(1)）が `sparse_visited_max` 未満のときのみ
+        // `VisitedSparse` を選ぶ。`mask == None` は常に dense
+        // （§本関数ドキュメンテーションコメント参照。`search` とのビット
+        // 同一契約を無条件に維持する）。
+        let use_sparse =
+            matches!(mask.map(|m| m.count_ones()), Some(ones) if ones < sparse_visited_max);
+        scratch.last_visited_kind = Some(if use_sparse {
+            VisitedKind::Sparse
+        } else {
+            VisitedKind::Dense
+        });
+        let results = if use_sparse {
+            self.search_layer(
+                level0_entry_points,
+                query,
+                ef_eff,
+                0,
+                dim_usize,
+                &self.vectors,
+                &mut scratch.sparse,
+                mask,
+            )?
+        } else {
+            self.search_layer(
+                level0_entry_points,
+                query,
+                ef_eff,
+                0,
+                dim_usize,
+                &self.vectors,
+                &mut scratch.visited,
+                mask,
+            )?
+        };
 
         let out: Vec<crate::kernel::CandidateHit> = results
             .into_iter()
@@ -2881,6 +3195,151 @@ fn node_vector(vectors: &[f32], dim: usize, node: u32) -> Result<&[f32], HnswErr
     let end = start.checked_add(dim).ok_or(HnswError::CapacityOverflow)?;
     vectors.get(start..end).ok_or(HnswError::CapacityOverflow)
 }
+
+/// [`GraphBuilder::repair_reachability_inner`] のフェーズ 1 が使う最近傍探索
+/// （[`nearest_reachable`]）の並列度を決める方針関数（Issue #449。方針
+/// （何本立てるか）と機構（実際の分割走査。[`nearest_reachable`] 側）を分離し、
+/// それぞれを独立にテストできるようにする）。
+///
+/// `crate::parallel_search::thread_count_for`（検索側の並列度決定と同一関数。
+/// `MIN_ROWS_PER_THREAD` による小規模時の 1 本への縮退を含む）を到達済み集合
+/// のサイズで評価し、構築側が引き継いだ `threads` 上限でさらにクランプする。
+/// `threads==1`（`build`・`build_with_threads` の縮退経路）では常に 1 を返し、
+/// [`nearest_reachable`] は並列分岐を一切通らない。
+fn repair_workers_for(reachable_len: usize, threads: usize) -> usize {
+    crate::parallel_search::thread_count_for(reachable_len).min(threads.max(1))
+}
+
+/// `current` と `candidate`（`(id, score)`）のうち、モジュール冒頭「順序規約」
+/// （スコア `total_cmp` 降順・同点は id 昇順）に従って採用すべき方を返す。
+/// この規約は全順序を成すため、[`nearest_reachable`] が到達集合をどう分割し・
+/// 各ワーカーの局所最良をどの順序で縮約しても、最終的に選ばれる候補は分割・
+/// 縮約の順序に依存せず一意に定まる（`repair_reachability_inner` の
+/// ドキュメンテーションコメント「探索の並列化」参照）。
+fn better_repair_candidate(
+    current: Option<(u32, f32)>,
+    candidate: (u32, f32),
+) -> Option<(u32, f32)> {
+    match current {
+        None => Some(candidate),
+        Some((cur_id, cur_score)) => match candidate.1.total_cmp(&cur_score) {
+            std::cmp::Ordering::Greater => Some(candidate),
+            std::cmp::Ordering::Equal if candidate.0 < cur_id => Some(candidate),
+            _ => current,
+        },
+    }
+}
+
+/// `candidates`（`reachable` の全体または 1 ワーカー分のチャンク）を逐次走査し
+/// `query` に最も近い（`dot` 最大・同点 id 昇順）候補を返す（[`nearest_reachable`]
+/// の逐次経路・並列ワーカー本体の双方が共有する機構）。非有限スコアは
+/// `HnswError::NonFiniteScore` として拒否する（`repair_reachability_inner` の
+/// 既存契約と同一。モジュール冒頭「距離カーネル」節参照）。
+fn nearest_reachable_scan(
+    vectors: &[f32],
+    dim: usize,
+    query: &[f32],
+    candidates: &[u32],
+) -> Result<Option<(u32, f32)>, HnswError> {
+    let mut best: Option<(u32, f32)> = None;
+    for &candidate in candidates {
+        let cand_vec = node_vector(vectors, dim, candidate)?;
+        let score = dot(query, cand_vec);
+        if !score.is_finite() {
+            return Err(HnswError::NonFiniteScore { node: candidate });
+        }
+        best = better_repair_candidate(best, (candidate, score));
+    }
+    Ok(best)
+}
+
+/// 到達済み集合 `reachable`（id 昇順）から `node` に最も近い候補を返す
+/// （[`GraphBuilder::repair_reachability_inner`] フェーズ 1 が使う読み取り
+/// 専用の探索。Issue #449）。`workers<=1` または `reachable.len()<=1` では
+/// 分割せず [`nearest_reachable_scan`] を直接呼ぶ（ワーカーを一切起動しない
+/// 逐次経路。`threads==1` の `build`・`build_with_threads` 縮退経路はここへ
+/// 到達する）。`workers>=2` では `reachable` を `workers` 個の連続チャンクへ
+/// 分割し、各チャンクを別スレッド（`std::thread::scope`）で
+/// [`nearest_reachable_scan`] に掛けて局所最良を求め、
+/// [`better_repair_candidate`] の全順序で縮約する——縮約順序に依存せず結果は
+/// 一意に定まるため、`workers` の値によらずビット同一の結果を返す
+/// （呼び出し元 `repair_reachability_inner` のドキュメンテーションコメント
+/// 「探索の並列化」参照）。
+///
+/// ワーカーの panic（`join` 失敗）は `HnswError::WorkerPanicked` として
+/// 構築全体を拒否する（`parallel_build::build_parallel_graph` の
+/// `first_error`／`any_panicked` パターンと同型の fail-closed 契約。部分的に
+/// 探索したまま `Ok` を返さない）。
+fn nearest_reachable(
+    vectors: &[f32],
+    dim: usize,
+    node: u32,
+    reachable: &[u32],
+    workers: usize,
+) -> Result<Option<(u32, f32)>, HnswError> {
+    let query = node_vector(vectors, dim, node)?;
+    if workers <= 1 || reachable.len() <= 1 {
+        return nearest_reachable_scan(vectors, dim, query, reachable);
+    }
+    #[cfg(test)]
+    REPAIR_PARALLEL_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let chunk_len = reachable.len().div_ceil(workers).max(1);
+    let first_error: std::sync::Mutex<Option<HnswError>> = std::sync::Mutex::new(None);
+    let (any_panicked, locals): (bool, Vec<Option<(u32, f32)>>) = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in reachable.chunks(chunk_len) {
+            let first_error_ref = &first_error;
+            handles.push(scope.spawn(move || -> Option<(u32, f32)> {
+                match nearest_reachable_scan(vectors, dim, query, chunk) {
+                    Ok(best) => best,
+                    Err(e) => {
+                        let mut fe = first_error_ref
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        if fe.is_none() {
+                            *fe = Some(e);
+                        }
+                        None
+                    }
+                }
+            }));
+        }
+        let mut any_panicked = false;
+        let mut locals = Vec::with_capacity(handles.len());
+        for h in handles {
+            match h.join() {
+                Ok(v) => locals.push(v),
+                Err(_) => {
+                    any_panicked = true;
+                    locals.push(None);
+                }
+            }
+        }
+        (any_panicked, locals)
+    });
+    if any_panicked {
+        return Err(HnswError::WorkerPanicked);
+    }
+    if let Some(e) = first_error
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner())
+    {
+        return Err(e);
+    }
+    let mut best: Option<(u32, f32)> = None;
+    for local in locals.into_iter().flatten() {
+        best = better_repair_candidate(best, local);
+    }
+    Ok(best)
+}
+
+/// [`nearest_reachable`] が `workers>=2` の並列分岐を実際に通った回数
+/// （テスト専用の非 vacuous 検証カウンタ。Issue #449。`#[cfg(test)]` の
+/// 内外で完全に消える——production バイナリには一切残らない）。
+#[cfg(test)]
+static REPAIR_PARALLEL_LAUNCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// `build`（`HnswParams::validate` → 次元整合 → ノード数上限 → 非有限値の
 /// 検証順序。モジュール `build` ドキュメンテーションコメント参照）と
@@ -3641,6 +4100,73 @@ mod tests {
         assert_eq!(bm.mark_visited(999), None);
     }
 
+    /// [`VisitedSparse`]（Issue #497）が [`VisitedBitmap`] と同じ契約
+    /// （範囲外は `None`・二重マークは `Some(true)`・新規は `Some(false)`・
+    /// `reset` 後は容量を保持したまま全訪問済みマークが消える）を満たすことを
+    /// 固定する。
+    #[test]
+    fn visited_sparse_matches_visited_bitmap_contract() {
+        let mut vs = VisitedSparse::default();
+        vs.reset(10);
+        assert_eq!(vs.mark_visited(3), Some(false));
+        assert_eq!(vs.mark_visited(3), Some(true));
+        // 範囲外は None（VisitedBitmap と同じ fail-closed 契約）。
+        assert_eq!(vs.mark_visited(999), None);
+
+        // reset は全クリア: 別の len へ伸長したあとに縮めても、以前の
+        // マークが誤って「既訪問」判定を汚染してはならない。
+        vs.reset(200);
+        assert_eq!(vs.mark_visited(150), Some(false));
+        vs.reset(5);
+        assert_eq!(
+            vs.mark_visited(150),
+            None,
+            "reset(5) 後は 150 が範囲外になるため None（VisitedBitmap は語配列を \
+             伸長のみで縮めないため既訪問扱いになるのに対し、HashSet は clear \
+             するため『範囲外』の判定が先に効く——いずれも fail-closed で\
+             「訪問済みと誤判定して探索を打ち切らない」側に倒れる点は同じ）"
+        );
+        // clear 後も内部確保容量は保持する契約（`HashSet::clear` の挙動）。
+        // 観測可能な副作用は無いため、reset 後に通常どおり動作することのみ
+        // 固定する。
+        vs.reset(10);
+        assert_eq!(vs.mark_visited(3), Some(false));
+    }
+
+    /// [`NodeMask::count_ones`]（Issue #497 で O(1) 化）が語走査での再計算と
+    /// 一致すること・同一ビットの二重 `set` で増えないこと・範囲外 `set` は
+    /// 無視されることを固定する。
+    #[test]
+    fn node_mask_count_ones_matches_word_scan_and_is_idempotent() {
+        let mut mask = NodeMask::new(130);
+        assert_eq!(mask.count_ones(), 0);
+
+        mask.set(0);
+        mask.set(63);
+        mask.set(64);
+        mask.set(129);
+        assert_eq!(mask.count_ones(), 4);
+
+        // 同一ビットの二重 set は増えない。
+        mask.set(0);
+        mask.set(129);
+        assert_eq!(mask.count_ones(), 4);
+
+        // 範囲外 set は無視される（fail-closed）。
+        mask.set(130);
+        mask.set(u32::MAX);
+        assert_eq!(mask.count_ones(), 4);
+
+        // 語走査での再計算と一致する（回帰保険。`count_ones` の実装が
+        // `self.ones` を返さず語走査に戻っても検知できるよう、期待値は
+        // ビット位置から独立に導出する）。
+        let expected: usize = [0u32, 63, 64, 129]
+            .iter()
+            .filter(|&&node| mask.get(node))
+            .count();
+        assert_eq!(mask.count_ones(), expected);
+    }
+
     /// 手作りの最小グラフ（`search_layer_continues_through_tied_score_candidates_
     /// to_find_a_strictly_closer_node` と同じ 3 ノード構成）で、上位層の貪欲降下
     /// →層 0 のビーム探索という `search` の経路が正しく動作することを確認する。
@@ -3913,6 +4439,162 @@ mod tests {
             .search_masked(&query, 10, 40, None, &mut scratch_b)
             .unwrap();
         assert_eq!(via_search, via_masked);
+
+        // Issue #497: `mask == None` は `sparse_visited_max` の値に関わらず
+        // 常に dense（`VisitedBitmap`）を使う。`usize::MAX`（マスクさえあれば
+        // 必ず sparse を選ぶ極端値）を渡しても `search` とのビット同一契約は
+        // 変わらないことを固定する。
+        let mut scratch_c = HnswSearchScratch::default();
+        let via_masked_force_sparse_threshold = index
+            .search_masked_with(&query, 10, 40, None, usize::MAX, &mut scratch_c)
+            .unwrap();
+        assert_eq!(via_search, via_masked_force_sparse_threshold);
+        assert_eq!(
+            scratch_c.last_visited_kind(),
+            Some(VisitedKind::Dense),
+            "mask == None must always select the dense visited implementation"
+        );
+    }
+
+    /// [`HnswIndex::search_masked_with`] が visited 実装（`VisitedBitmap`／
+    /// `VisitedSparse`）のどちらを選んでも結果がビット同一であることを、
+    /// マスクの形状が異なる複数フィクスチャで機械検証する（Issue #497 の
+    /// 受け入れ条件 1）。`sparse_visited_max = usize::MAX`（マスクがあれば
+    /// 必ず sparse）と `0`（常に dense。[`DEFAULT_SPARSE_VISITED_MAX`]）を
+    /// 同一マスク・同一クエリへ渡し、結果集合・順序（`dot` 降順・同点 id
+    /// 昇順）が完全一致することを固定する。
+    #[test]
+    fn search_masked_with_force_sparse_matches_force_dense_bit_identical() {
+        let dim = 8usize;
+
+        // フィクスチャ 1: 通常コーパス・偶数ノードのみ受理（密度 50%）。
+        let normal_vectors = gen_corpus(61, dim, 200);
+        let normal_index = HnswIndex::build(
+            HnswParams {
+                m: 8,
+                ef_construction: 40,
+                ef_search: 20,
+            },
+            dim as u32,
+            &normal_vectors,
+            200,
+        )
+        .unwrap();
+        let mut normal_mask = NodeMask::new(normal_index.len());
+        for node in 0..normal_index.len() {
+            if node % 2 == 0 {
+                normal_mask.set(node as u32);
+            }
+        }
+
+        // フィクスチャ 2: 重複ヘビーコーパス（同点誘発。
+        // `search_layer_prefetch_is_bit_identical_to_no_prefetch` と同型）・
+        // 3 分の 1 のノードのみ受理。
+        let mut duplicate_heavy = gen_corpus(63, dim, 20);
+        duplicate_heavy = duplicate_heavy
+            .iter()
+            .cycle()
+            .take(200 * dim)
+            .copied()
+            .collect();
+        let duplicate_index = HnswIndex::build(
+            HnswParams {
+                m: 8,
+                ef_construction: 40,
+                ef_search: 20,
+            },
+            dim as u32,
+            &duplicate_heavy,
+            200,
+        )
+        .unwrap();
+        let mut duplicate_mask = NodeMask::new(duplicate_index.len());
+        for node in 0..duplicate_index.len() {
+            if node % 3 == 0 {
+                duplicate_mask.set(node as u32);
+            }
+        }
+
+        // フィクスチャ 3: 単一ノードのみ受理（可視候補数 1。sparse 経路の
+        // 最小ケース）。
+        let single_vectors = gen_corpus(65, dim, 150);
+        let single_index = HnswIndex::build(
+            HnswParams {
+                m: 8,
+                ef_construction: 40,
+                ef_search: 20,
+            },
+            dim as u32,
+            &single_vectors,
+            150,
+        )
+        .unwrap();
+        let mut single_mask = NodeMask::new(single_index.len());
+        single_mask.set(0);
+
+        // フィクスチャ 4: 固定 entry point を非受理にした代替起点経路
+        // （`search_masked_falls_back_to_alternate_entry_when_fixed_entry_masked_out`
+        // と同型）。
+        let entry_vectors = gen_corpus(67, dim, 300);
+        let entry_index = HnswIndex::build(
+            HnswParams {
+                m: 8,
+                ef_construction: 40,
+                ef_search: 20,
+            },
+            dim as u32,
+            &entry_vectors,
+            300,
+        )
+        .unwrap();
+        let entry = entry_index
+            .entry_point()
+            .expect("non-empty index has an entry point");
+        let mut entry_mask = NodeMask::new(entry_index.len());
+        for node in 0..entry_index.len() as u32 {
+            if node != entry {
+                entry_mask.set(node);
+            }
+        }
+
+        let cases: [(&str, &HnswIndex, &NodeMask, u64); 4] = [
+            ("normal", &normal_index, &normal_mask, 1234),
+            ("duplicate_heavy", &duplicate_index, &duplicate_mask, 5678),
+            ("single_visible", &single_index, &single_mask, 91),
+            ("entry_excluded", &entry_index, &entry_mask, 4321),
+        ];
+
+        for (name, index, mask, query_seed) in cases {
+            let query = gen_corpus(query_seed, dim, 1);
+            let mut scratch_sparse = HnswSearchScratch::default();
+            let mut scratch_dense = HnswSearchScratch::default();
+            let via_sparse = index
+                .search_masked_with(&query, 10, 40, Some(mask), usize::MAX, &mut scratch_sparse)
+                .unwrap();
+            let via_dense = index
+                .search_masked_with(&query, 10, 40, Some(mask), 0, &mut scratch_dense)
+                .unwrap();
+            assert_eq!(
+                via_sparse, via_dense,
+                "fixture={name}: sparse and dense visited implementations must return \
+                 bit-identical results"
+            );
+            // 可視候補が 1 件以上あるフィクスチャでは実際に sparse 側が選ばれた
+            // ことも確認する（閾値判定そのものの回帰も兼ねる）。
+            if mask.count_ones() > 0 {
+                assert_eq!(
+                    scratch_sparse.last_visited_kind(),
+                    Some(VisitedKind::Sparse),
+                    "fixture={name}: sparse_visited_max=usize::MAX with a non-empty mask \
+                     must select VisitedSparse"
+                );
+            }
+            assert_eq!(
+                scratch_dense.last_visited_kind(),
+                Some(VisitedKind::Dense),
+                "fixture={name}: sparse_visited_max=0 must always select VisitedBitmap"
+            );
+        }
     }
 
     #[test]
@@ -4593,5 +5275,223 @@ mod tests {
             recall >= 0.7,
             "f16 resident recall@{k} too low: {recall} ({recall_hits}/{recall_total})"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #449: repair_reachability の到達不能ノード探索・再接続の並列化
+    // ------------------------------------------------------------------
+
+    /// `repair_workers_for` の方針（Issue #449）: 到達集合が小さい（既定
+    /// `MIN_ROWS_PER_THREAD`=1,024 未満）場合は `threads` の値によらず常に
+    /// 1 に縮退し、十分大きい場合は `threads` と実行環境の並列度の小さい方
+    /// まで増える。
+    #[test]
+    fn repair_workers_for_clamps_small_reachable_sets_and_respects_threads_cap() {
+        assert_eq!(
+            repair_workers_for(400, 12),
+            1,
+            "MIN_ROWS_PER_THREAD 未満の到達集合は 1 スレッドへ縮退するはず"
+        );
+        assert_eq!(
+            repair_workers_for(400, 1),
+            1,
+            "threads=1（縮退経路）は常に 1"
+        );
+
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let expected = crate::parallel_search::thread_count_for(100_000).min(12);
+        assert_eq!(
+            repair_workers_for(100_000, 12),
+            expected,
+            "十分大きい到達集合では available_parallelism と threads の小さい方まで増える"
+        );
+        if available >= 2 {
+            assert!(
+                repair_workers_for(100_000, 12) >= 2,
+                "この実行環境（available_parallelism={available}）では複数スレッドまで増えるはず"
+            );
+        }
+    }
+
+    /// `nearest_reachable` の並列経路（`workers>=2`）が逐次経路
+    /// （`workers==1`）とビット同一の結果を返すことを、実際に並列分岐を通した
+    /// 上で固定する（Issue #449「探索の並列化」。非 vacuous 性は
+    /// `REPAIR_PARALLEL_LAUNCHES` カウンタで検証する）。
+    #[test]
+    fn nearest_reachable_matches_across_worker_counts_and_actually_parallelizes() {
+        let dim = 8usize;
+        let n = 5_000usize;
+        let vectors = gen_corpus(0x4E45_4152_4553_5449u64, dim, n);
+        // 到達集合は 0 番ノードを除く全ノード（`node` 自身は候補に含めない
+        // 既存契約——`repair_reachability_inner` 側で `reachable` は
+        // `bfs_reachable_mask` の到達集合から作るため `node` 自身は通常含み
+        // 得るが、ここでは機構単体テストのため任意の候補列を渡す）。
+        let reachable: Vec<u32> = (1..n as u32).collect();
+        let node = 0u32;
+
+        let before = REPAIR_PARALLEL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
+        let sequential = nearest_reachable(&vectors, dim, node, &reachable, 1)
+            .expect("sequential nearest_reachable must succeed");
+        let after_sequential = REPAIR_PARALLEL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            before, after_sequential,
+            "workers=1 は並列分岐を通らないはず"
+        );
+
+        for workers in [2usize, 4, 8] {
+            let parallel = nearest_reachable(&vectors, dim, node, &reachable, workers)
+                .expect("parallel nearest_reachable must succeed");
+            assert_eq!(
+                sequential, parallel,
+                "workers={workers} の結果が逐次経路とビット一致しない"
+            );
+        }
+        let after_parallel = REPAIR_PARALLEL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after_parallel > after_sequential,
+            "workers>=2 の呼び出しで並列分岐が実際に起動しているはず（非 vacuous 性の検証）"
+        );
+    }
+
+    /// 全ノード挿入後・修復前の `GraphBuilder` を組み立てるテスト専用ヘルパ
+    /// （Issue #449。`build_inner` の挿入ループと同じ手順を、修復
+    /// （`repair_reachability_inner`）呼び出し前で止めて返す。異なる
+    /// `threads` で修復した結果を比較するテストが、修復前の同一グラフを
+    /// 複数回・決定的に再現するために使う）。
+    fn build_unrepaired(
+        params: HnswParams,
+        dim: usize,
+        vectors: &[f32],
+        seed: u64,
+    ) -> GraphBuilder {
+        let n = vectors.len() / dim;
+        let mut builder = GraphBuilder {
+            params,
+            nodes: Vec::with_capacity(n),
+            entry_point: None,
+        };
+        let mut rng = DeterministicRng::new(seed);
+        let mut visited = VisitedScratch::default();
+        for node_idx in 0..n {
+            let level = assign_level(&mut rng, params.m);
+            let node_id = node_idx as u32;
+            builder
+                .insert_node(node_id, level, dim, vectors, &mut visited)
+                .expect("insertion must succeed on this deterministic corpus");
+        }
+        builder
+    }
+
+    /// `GraphBuilder`（修復前）を id 昇順 → レベル → 各層のリンク列の順で
+    /// FNV-1a 64bit ハッシュへ投入する（`tests/hnsw.rs::
+    /// graph_fingerprint_is_stable_across_representation_change` と同じ
+    /// 方式。private フィールドへ直接アクセスできる本モジュール内テスト
+    /// 限定のヘルパ）。
+    fn fingerprint_builder(builder: &GraphBuilder) -> u64 {
+        fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
+            const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+            for &b in bytes {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+            hash
+        }
+        const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+
+        let mut hash = FNV_OFFSET_BASIS;
+        hash = fnv1a_update(hash, &(builder.nodes.len() as u64).to_le_bytes());
+        hash = fnv1a_update(
+            hash,
+            &builder
+                .entry_point
+                .map(|e| e as i64)
+                .unwrap_or(-1)
+                .to_le_bytes(),
+        );
+        for node in &builder.nodes {
+            hash = fnv1a_update(hash, &(node.level as u64).to_le_bytes());
+            for links in &node.links {
+                hash = fnv1a_update(hash, &(links.len() as u64).to_le_bytes());
+                for &nb in links {
+                    hash = fnv1a_update(hash, &nb.to_le_bytes());
+                }
+            }
+        }
+        hash
+    }
+
+    /// `clusters` 個のクラスタ中心の完全な複製で行を埋める重複ヘビーコーパス
+    /// （`tests/hnsw.rs::gen_duplicate_heavy_corpus` と同じ設計意図——完全同点
+    /// スコアを誘発しフェーズ 1／フェーズ 2 の双方を確実に発火させる。本
+    /// モジュール内テスト専用の独立実装）。
+    fn gen_duplicate_heavy_corpus_local(
+        seed: u64,
+        dim: usize,
+        rows: usize,
+        clusters: usize,
+    ) -> Vec<f32> {
+        let mut rng = DeterministicRng::new(seed);
+        let centers: Vec<Vec<f32>> = (0..clusters.max(1))
+            .map(|_| {
+                (0..dim)
+                    .map(|_| {
+                        let bits = rng.next_u64() >> 40;
+                        (bits as f32) / (1u32 << 24) as f32 * 2.0 - 1.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut out = Vec::with_capacity(rows * dim);
+        for i in 0..rows {
+            out.extend_from_slice(&centers[i % centers.len()]);
+        }
+        out
+    }
+
+    /// `repair_reachability_inner`（Issue #449 の並列化後）が `threads` の値
+    /// によらずビット同一のグラフを返すことを、重複ヘビーコーパス（フェーズ
+    /// 1・フェーズ 2 双方を確実に発火させる）で固定する end-to-end テスト。
+    /// 修復前の `GraphBuilder` は `build_unrepaired` で決定的に再構築し
+    /// （`GraphBuilder` は `Clone` を実装しないため、insertion が決定的で
+    /// あることを利用して複数回同じグラフを作り直す）、各 `threads` で
+    /// 修復した結果を [`fingerprint_builder`] で比較する。
+    #[test]
+    fn repair_reachability_inner_is_thread_count_invariant_on_duplicate_heavy_graph() {
+        let dim = 12usize;
+        let rows = 3_000usize;
+        let clusters = 6usize;
+        let seed = 0x5EED_0449u64;
+        let vectors = gen_duplicate_heavy_corpus_local(seed, dim, rows, clusters);
+        let params = HnswParams::default().with_m(6).with_ef_construction(32);
+
+        let mut fingerprints = Vec::new();
+        for &threads in &[1usize, 2, 4] {
+            let mut builder = build_unrepaired(params, dim, &vectors, seed);
+            let stats = builder
+                .repair_reachability_inner::<true>(dim, &vectors, threads)
+                .expect("repair must succeed on this deterministic corpus");
+            // 非 vacuous 性: フェーズ 1・フェーズ 2 の双方が実際に発火した
+            // ことを確認する（重複ヘビーコーパスが意図どおり同点スコアを
+            // 誘発していることの検証）。
+            assert!(
+                stats.levels.iter().any(|l| l.phase1_iterations > 0),
+                "threads={threads}: フェーズ 1 が一度も発火しなかった"
+            );
+            assert!(
+                stats.levels.iter().any(|l| l.phase2_nodes > 0),
+                "threads={threads}: フェーズ 2 が一度も発火しなかった"
+            );
+            fingerprints.push((threads, fingerprint_builder(&builder)));
+        }
+
+        let (base_threads, base_fp) = fingerprints[0];
+        for &(threads, fp) in &fingerprints[1..] {
+            assert_eq!(
+                base_fp, fp,
+                "threads={base_threads} と threads={threads} でグラフが一致しない"
+            );
+        }
     }
 }

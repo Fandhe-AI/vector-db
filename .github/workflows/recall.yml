@@ -112,6 +112,14 @@ name: Recall
 # `schedule` いずれのトリガでも両エンジンを毎回同一閾値でゲートする（選択式の
 # `inputs.recall_engine` は撤去。手動実行時に片方のエンジンだけを検証したい
 # 場合は GitHub UI の re-run で個別の matrix job を再実行すればよい）。
+#
+# Issue #515: HNSW 索引ノードの f16 常駐（`hnsw::ResidentPrecision::F16`。
+# Issue #514。`docs/design/hnsw-f16-resident.md`）opt-in の 3 系列目
+# `hnsw_f16`（`crates/engine/tests/fixtures/recall_engine.rs::RecallEngine::
+# HnswF16`）を matrix へ追加し、`brute_force`/`hnsw`/`hnsw_f16` の 3 系列を
+# trigger を問わず常時実行する（#412 と同じ「schedule でも新エンジンが
+# 未測定のまま残らない」原則）。実測結果・非 vacuous ガードの拡張内容は
+# `docs/design/ann-recall-gate-verification.md`「Issue #515 追記」節参照。
 on:
   workflow_dispatch: {}
   schedule:
@@ -132,12 +140,13 @@ jobs:
     # fail-closed な制約）。
     if: github.ref == 'refs/heads/main'
     strategy:
-      # `brute_force`/`hnsw` の 2 系列を独立 job として毎回両方ゲートする
-      # （冒頭コメント参照。Issue #412 受け入れ条件 3・codex-review P1 指摘対応）。
-      # 一方が fail してももう一方は評価を継続する。
+      # `brute_force`/`hnsw`/`hnsw_f16` の 3 系列を独立 job として毎回すべて
+      # ゲートする（冒頭コメント参照。Issue #412 受け入れ条件 3・codex-review P1
+      # 指摘対応・Issue #515 で `hnsw_f16` を追加）。1 つが fail しても他は
+      # 評価を継続する。
       fail-fast: false
       matrix:
-        recall_engine: [brute_force, hnsw]
+        recall_engine: [brute_force, hnsw, hnsw_f16]
     concurrency:
       # workflow_dispatch は任意の ref を選択して起動できるため、ref を group に
       # 含めて同一 ref の重複実行のみキャンセル対象にする（bench.yml と同一方針。

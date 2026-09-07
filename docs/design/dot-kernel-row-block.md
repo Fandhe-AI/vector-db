@@ -1,17 +1,24 @@
-# `search_range` の行ブロック（4 行）カーネル（AVX2+FMA／AVX-512F）
+# `search_range` の行ブロック（4 行）カーネル（AVX2+FMA／AVX-512F／NEON）
 
-- ステータス: **実装済み（既定エンジンへ結線済み）**
+- ステータス: **実装済み（既定エンジンへ結線済み。AVX2+FMA／AVX-512F は
+  Issue #510、NEON は Issue #511）**
 - 対応: Issue #510（`perf(engine): search_range の行ブロック（4 行）カーネルを
-  AVX2+FMA／AVX-512F で実装する`）
+  AVX2+FMA／AVX-512F で実装する`）・Issue #511（`perf(engine): 行ブロック
+  カーネルの NEON 版（Apple M／Graviton）を実装する`）
 - 依存: ADR `docs/design/simd-intrinsics-adoption.md`（Issue #508。ステータス
-  Proposed・オーナー承認待ち。本 Issue は決定 1 が明示的に許容する「新カーネル
+  Proposed・オーナー承認待ち。Issue #510 は決定 1 が明示的に許容する「新カーネル
   1 種につきトークンディスパッチ箇所 1 つの `unsafe`」を 2 箇所（AVX2+FMA・
-  AVX-512）追加する）
+  AVX-512）、Issue #511 はさらに 1 箇所（NEON）追加する）
 - 関連ポインタ: TASK-156（CORE-14。`isa.rs` の実行時 ISA 検出）・Issue #365
   （行内 ILP 不採用の先行判断）・`docs/design/simd-codegen-guard.md`（生成コード
-  検査ガード。「Issue #510 以降の追記」節に本変更の実測知見を記録）
-- 後続: Issue #511（NEON 版行ブロックカーネル。本 Issue の `Neon` variant は
-  4 × `dot` の縮退のまま）・Issue #512（前後比較・採否判断）
+  検査ガード。「Issue #510 以降の追記」節・「Issue #511 以降の追記」節に本変更の
+  実測知見を記録）
+- 後続: Issue #512（前後比較・採否判断。層 A（`dot_kernel_bench` 単一ビルド内
+  block4 A/B）・層 B（`bench-chip` knn_profile 前後比較）を実施し「参考値・
+  現状維持（条件付き）」（本環境の証拠力では Accepted/Rejected いずれも
+  確定できず、最終採否は #530 へ申し送り）と判断。詳細は `docs/design/
+  dot-kernel-multi-accumulator.md`「行間再利用（Issue #512）」節参照。§5
+  「#530 向け計測点一覧」も参照）・Issue #530（Apple 実機での前後比較実測）
 
 ## 1. 背景・目的
 
@@ -50,13 +57,16 @@ impl SimdKernel {
   Issue #529 で既定が反転しても `dot` との同一性が自動的に維持される。
 - **ディスパッチ**（`dot_block4_impl::<PADDED_TAIL>` の `match self`）:
   - `Scalar` → 4 × `dot_scalar`
-  - `Neon(_)` → 4 × `self.dot_impl`（NEON 版カーネルは Issue #511）
+  - `Neon(_)` → `unsafe { neon_block4::dot_block4_neon(...) }`
+    （Issue #511 で実装済み。SAFETY: `NeonToken` 所持）
   - `Avx2Fma(_)` → `unsafe { x86_block4::dot_block4_avx2_fma(...) }`
-    （**新規 unsafe 1**。SAFETY: `Avx2FmaToken` 所持）
+    （SAFETY: `Avx2FmaToken` 所持）
   - `Avx512(_)` → `unsafe { x86_block4::dot_block4_avx512(...) }`
-    （**新規 unsafe 2**。SAFETY: `Avx512Token` 所持）
-- **`unsafe` 個数**: `isa.rs` 全文で 3 → 5（Neon/Avx2Fma/Avx512 の `dot`
-  ディスパッチ 3 箇所 + Avx2Fma/Avx512 の `dot_block4` ディスパッチ 2 箇所）。
+    （SAFETY: `Avx512Token` 所持）
+- **`unsafe` 個数**: `isa.rs` 全文で（Issue #510 時点）3 → 5（Neon/Avx2Fma/Avx512
+  の `dot` ディスパッチ 3 箇所 + Avx2Fma/Avx512 の `dot_block4` ディスパッチ
+  2 箇所）。Issue #514（f16 昇格 dot）で 5 → 7、Issue #511（NEON 版
+  `dot_block4` ディスパッチ）で 7 → 8。
 
 ### 2.2 intrinsics カーネル本体（`crates/engine/src/isa/x86_block4.rs`）
 
@@ -79,6 +89,38 @@ ADR 決定 1「カーネル本体は safe fn として `isa/*.rs` へ分離し�
   レーン和自体は下記の理由でブロック側が独自のスカラー直接縮約
   （`lane_sum8`／`lane_sum16`）を持つ（`lane_sum` とビット同一の左畳み込み順
   `0.0 + l0 + l1 + ...` を維持）。
+
+### 2.3 NEON 版（Issue #511）
+
+x86_64 版（`isa/x86_block4.rs`）と同型の構成で、新設サブモジュール
+`isa/neon_block4.rs`（`#[cfg(target_arch = "aarch64")]`）へ intrinsics カーネル
+本体（`unsafe` を持たない safe fn）を分離した。`isa.rs` 側は
+`dot_block4_impl` の `Neon` 分岐 1 箇所でのみ `unsafe` 呼び出しする。
+
+- **事前検証**（`rustc stable(1.96.0) --target aarch64-unknown-linux-gnu -O
+  --emit asm` での試作コンパイル。§3 の x86 版と同じ手順を aarch64 で再現）:
+  x86 版が遭遇した「`[f32; 4]` 戻り値での SLP 再パック」問題は NEON でも
+  同様に再現した——`[f32; 4]` を 1 回の戻り値で返す形は `mov v4.s[1], v5.s[0]`
+  等のレーン挿入命令（禁止命令。ADR 決定 2）を 2 件検出したのに対し、x86 版と
+  同じ **4 個の `&mut f32` 出力引数** の形では禁止命令 0 件だった。主ループは
+  `ldr q` ×5（クエリ 1 + 行 4）＋ `fmla v.4s` ×4／反復 に畳み込まれることを
+  確認した。
+- `load4`: `as_chunks::<4>()` で得た `&[f32; 4]` をパターン分解し、
+  `vsetq_lane_f32::<0..3>` を**昇順**（レーン 0→3）で適用する。x86 版が
+  `_mm256_set_ps` へ逆順で渡すのと異なり、NEON の `vsetq_lane_f32` はレーン
+  番号を明示指定するため逆順にする必要がない。ポインタ load（`vld1q_f32`）は
+  使わない。
+- `dot_block4_neon`: クエリチャンクを 1 回だけロードし、4 本のアキュムレータ
+  （`float32x4_t`）へ `vfmaq_f32`（`a + b*c` の単一丸め FMA）で積算する。
+  `#[inline(never)]` を付与する（NEON は aarch64 の baseline のため、付けないと
+  呼び出し元へインライン化され `check_simd_codegen.sh` の必須シンボル検査が
+  対象を見つけられなくなる。`dot_f16_neon_fp16`〔Issue #514〕と同じ理由）。
+- レーン和: `vaddvq_f32`（ペアワイズ水平加算）は 1 行版 `[f32; 4]::iter().sum()`
+  （左から右への逐次和）と加算順序が異なりビット不一致になり得るため**不採用**。
+  `vgetq_lane_f32::<0..3>` で 1 レーンずつ取り出し、x86 版 `lane_sum8`／
+  `lane_sum16` と同じ逐次 `+=`（初期値 `-0.0`）で縮約する
+  `lane_sum4` を新設した。
+- 端数和: `dot_lanes`・x86 版行ブロックカーネルと同一の `tail_sum` を共有する。
 
 ## 3. 生成コード検査で発覚した問題と対処（実装時の主要な設計変更点）
 
@@ -147,7 +189,13 @@ unsafe { x86_block4::dot_block4_avx2_fma::<PADDED_TAIL>(rows, query, &mut s0, &m
 長さ不一致時の縮退経路の一致も固定する。AVX-512F は本開発環境（QEMU 上の
 仮想 CPU・AVX2 のみ）では実行時検証できず、コンパイル・命令検査
 （`make simd-codegen-check`）と AVX2+FMA 版とのロジック対称性のみで担保する
-（実機検証は Issue #512／#530 の担当）。
+（実機検証は Issue #512／#530 の担当）。NEON も同じ理由で本開発環境（x86_64）
+では実行時検証できず、`make check-cross`／`make simd-codegen-check-cross`
+（aarch64 クロスコンパイル・命令検査。生成コードの証跡）が担保する。**NEON の
+実行時ビット同一性の唯一の証跡**は `.github/workflows/detect-features.yml` の
+`detect-apple` ジョブ（macos-latest・Apple Silicon 実機で
+`cargo test -p engine --test isa` を実行し、`dot_block4_matches_single_row_dot_bit_exact_across_dims`
+が NEON arm を実際に検証する）である。
 
 `crates/engine/src/parallel_search.rs` 側の回帰は
 `search_range_with_non_multiple_of_4_row_count_matches_scalar_reference`
@@ -157,13 +205,30 @@ unsafe { x86_block4::dot_block4_avx2_fma::<PADDED_TAIL>(rows, query, &mut s0, &m
 にもブロック境界（4 の倍数・非倍数）・AVX2/AVX-512 レーン境界（8・16）を横断する
 ケースを追加した。
 
-## 5. 限界・スコープ外
+## 5. Issue #530（Apple 実機前後比較）向け計測点一覧
 
-- NEON 版行ブロックカーネル → Issue #511（本 Issue の `Neon` arm は 4 × `dot`
-  の縮退のまま）
+NEON 版行ブロックカーネル（Issue #511）の実機前後比較（Issue #530）に必要な
+計測点:
+
+| 計測点 | 経路 | 備考 |
+| ------ | ---- | ---- |
+| `make bench-chip`（`knn_profile`／`feature_128`／`feature_768`） | `ParallelBruteForce` → `parallel_search::search_range` → `kernel::dot_block4` → `dot_block4_neon` | before = Issue #511 マージ直前（`Neon` arm は 4 × `dot`）、after = マージ後。`summary.json` の実行時検出 ISA（`neon`/`fp16`/...）でラベル付け可能。判定規約は `benchmark-judgement-policy.md`（交互実行 min-of-N・N≥5・ノイズ帯併記） |
+| `make bench-chip`（`dot_kernel`） | `isa::current().dot`（1 行版） | 変更を含まない区間＝ノイズ帯の参照区間として使う |
+| `SimdKernel::dot_block4`（`pub`） | マイクロベンチ hook | ブロック計測段の `dot_kernel_bench` 追加は Issue #512（`BENCH_DOT_KERNEL_BLOCK_AB=1`。実装済み。x86_64／AVX2+FMA でのみ実行確認済み。NEON 側の同一手順での実測は #530 の担当） |
+| `make detect-features`／`detect-apple` ジョブ | `engine::isa::current()` = `Neon` の確認・`cargo test --test isa`（ビット同一テスト） | Apple Silicon 実機での正しさの証跡 |
+| `make simd-codegen-check-cross` | aarch64 `--emit asm` の命令サマリ（`fmla v.4s` ×4・`ldr q` ×5・禁止 0） | 生成コードの証跡（Linux aarch64 ターゲット。Apple 実機 asm は Issue #530 側で `--target aarch64-apple-darwin` 相当を任意実施） |
+
+## 6. 限界・スコープ外
+
 - 前後比較・採否判断・`dot_kernel_bench` へのブロック計測段追加 → Issue #512
-  （`SimdKernel::dot_block4` を `pub` にしておくことが計測 hook になる）
+  実装済み（`SimdKernel::dot_block4` を `pub` にしておいたことが計測 hook に
+  なった。層 A・層 B の実測結果・判定は `docs/design/
+  dot-kernel-multi-accumulator.md`「行間再利用（Issue #512）」節参照。
+  AVX-512F・NEON 実機での同一手順の実測は Issue #530 へ申し送り）
 - `hnsw.rs`・`batch_search.rs`・`rls.rs` の 1 行 `dot` 呼び出しの行ブロック化
-- `check_simd_codegen.sh` の「期待命令（`vfmadd*` ≥ 1）」検査への一般化
+- `check_simd_codegen.sh` の「期待命令（`vfmadd*` ≥ 1）」検査への一般化（x86 側。
+  NEON 側は Issue #511 で追加済み）
 - `DEFAULT_PADDED_TAIL` の既定切替（Issue #529）
 - ADR `simd-intrinsics-adoption.md` のステータス更新（オーナー作業）
+- Apple 実機（`aarch64-apple-darwin`）での `--emit asm` 命令検査は CI 非配線
+  （`cross-check` は Linux aarch64 ターゲット）。必要なら Issue #530 で任意実施

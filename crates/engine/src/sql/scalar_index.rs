@@ -1,15 +1,18 @@
-//! `sql::exec` の SCALAR 段（`WHERE` の等価・前方一致条件）が将来（Issue #474）
-//! 全行走査（O(N)）の代わりに参照する、スカラー列二次索引の**構築とテーブル世代
-//! 整合キャッシュ**（Issue #473。対応 ADR: `docs/design/scalar-secondary-index.md`。
+//! `sql::exec` の SCALAR 段（`WHERE` の等価・前方一致・`id` 単純比較条件）が
+//! 全行走査（O(N)）の代わりに参照する、スカラー列二次索引の**構築・テーブル
+//! 世代整合キャッシュ・候補削減 API**（構築・キャッシュは Issue #473、候補削減
+//! への結線は Issue #474。対応 ADR: `docs/design/scalar-secondary-index.md`。
 //! 親 Issue #359・#472。ポインタ: `docs/spec/04-behavior/data-model.md`
 //! TABLE-12・`docs/spec/04-behavior/rls.md`）。
 //!
-//! **本 Issue のスコープ**: 索引の構築・キャッシュのみ。索引を使った候補削減・
-//! `ExecutionPlan` 統合・`EXPLAIN` 露出は Issue #474 が担う。本モジュールが
-//! 提供する照会 API（[`ScalarIndex::candidates_for`] 等）は現時点で
-//! `sql::exec::execute_statement_with_cache` から一切消費されない
-//! （構築されるだけで応答には使われない。クエリ結果は本 Issue の前後で完全に
-//! 不変）。
+//! **消費経路**: 本モジュールの照会 API（[`ScalarIndex::candidates_for`]・
+//! [`ScalarIndex::candidates_id_range`]・[`ScalarIndex::resolve_candidates`]）は
+//! `sql::exec::execute_statement_with_cache` の SCALAR 事前フィルタから、索引
+//! 対応述語（`sql::scalar_plan::classify_scalar_plan` が `PlainScan` 以外へ
+//! 分類した形状。TEXT 列の等価・前方一致・`id` の単純比較とその組合せ）を持つ
+//! クエリに限って消費される（詳細は `docs/design/scalar-index-prune.md` 参照）。
+//! 索引は候補スロットを「絞る」ことしかできず「通す」ことはできないため、
+//! 候補行にも `on_visible_row`（`matches_all`＋式述語）が引き続き適用される。
 //!
 //! **データモデル**（[`ScalarIndex`]）: 構築元は
 //! [`crate::sql::arena_cache::SqlArenaSnapshot`]（RLS 段適用済み・ctx 可視行の
@@ -53,6 +56,18 @@ use crate::policy::PolicyContext;
 use crate::row_codec::scan_scalar_columns;
 use crate::sql::arena_cache::SqlArenaSnapshot;
 use crate::storage::Storage;
+
+/// [`ScalarIndex::resolve_candidates`] の選択度切替閾値（Issue #474）。候補比
+/// （交差後の候補数 ÷ 索引行数）が `numerator / denominator` を超える場合、
+/// 索引経路より全走査（`O(N)`。候補列挙・交差のオーバーヘッドを持たない）が
+/// 有利と判断し [`CandidateResolution::FallbackSelectivity`] へ縮退する。
+/// 暫定既定値は 1/2（根拠は `docs/design/scalar-index-prune.md`「選択度切替の
+/// 既定値」節。索引経路のコストは概ね `O(|hits|)`、全走査は `O(N + |hits|)`
+/// のため損益分岐は `hits ≈ N` 近傍にしかなく、`sql::hnsw_cache` の ANN 先例
+/// （1/10）をそのまま採ると本ユースケースの主要フェーズが索引経路に乗らず
+/// 受入条件が vacuous になるため、より緩い閾値を採用する）。
+const DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_NUMERATOR: u64 = 1;
+const DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_DENOMINATOR: u64 = 2;
 
 /// [`ScalarIndexCache`] のエントリ数上限（`sql::arena_cache::SqlArenaCache`・
 /// `core.rs::PrefilterCache` と同じ DoS 対策方針を踏襲する）。
@@ -356,7 +371,6 @@ impl TextColumnIndex {
 pub(crate) struct ScalarIndex {
     built_ctx: PolicyContext,
     built_table_generation: u64,
-    #[cfg_attr(not(test), allow(dead_code))]
     row_count: usize,
     /// `schema.columns` と同じ長さ・順序。`TEXT` 列のみ `Some`。
     columns: Vec<Option<TextColumnIndex>>,
@@ -380,6 +394,46 @@ pub(crate) struct ScalarIndex {
 /// 提供するため、この比較関数のもとで同値ペアは存在しない（決定的ソート）。
 fn cmp_value_then_slot(a: &(String, u32), b: &(String, u32)) -> std::cmp::Ordering {
     a.0.as_bytes().cmp(b.0.as_bytes()).then(a.1.cmp(&b.1))
+}
+
+/// [`ScalarIndex::resolve_candidates`] の結果（Issue #474: `sql::exec` が
+/// 候補削減を行うか全走査へ縮退するかの唯一の分岐点）。
+pub(crate) enum CandidateResolution {
+    /// 交差済み候補スロット（昇順）を使う。空 `Vec` は「一致 0 件」（全走査と
+    /// 同じ結果になる。呼び出し元は空アリーナを構築するだけでよい）。
+    Use(Vec<u32>),
+    /// 索引対応述語のうち 1 つ以上が「列未索引」または `id_index` が `None`
+    /// （`id > 2^53` を含む世代）で判定不能だったため、索引を一切使わず
+    /// 全走査へ縮退する。
+    FallbackNoIndex,
+    /// 交差後の候補比が選択度切替閾値
+    /// （[`DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_NUMERATOR`]/
+    /// [`DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_DENOMINATOR`]）を超えた
+    /// （索引経路より全走査が有利と判断）ため縮退する。
+    FallbackSelectivity,
+}
+
+/// 2 本の昇順スライスの交差（両方に存在する要素のみ）を昇順で返す
+/// （2 本指マージ。両リストとも重複要素を持たない契約——`candidates_for`／
+/// `candidates_id_range` はいずれもスロット重複のない集合を返す）。
+/// アロケーション失敗（`try_reserve`）は `None`（呼び出し元は索引なしへ
+/// 縮退する）。
+fn intersect_sorted(a: &[u32], b: &[u32]) -> Option<Vec<u32>> {
+    let mut out: Vec<u32> = Vec::new();
+    out.try_reserve(a.len().min(b.len())).ok()?;
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    Some(out)
 }
 
 impl ScalarIndex {
@@ -607,7 +661,6 @@ impl ScalarIndex {
     /// [`MetadataFilter`] を評価し、一致スロットの**昇順** `Vec<u32>` を返す。
     /// 列が `TEXT` でない・未知の列は `None`。一致 0 件（列は索引済みだが値が
     /// 存在しない）は `Some(vec![])` を返す（`None` と区別する）。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn candidates_for(&self, filter: &MetadataFilter) -> Option<Vec<u32>> {
         let column = self.columns.get(filter.column_index())?.as_ref()?;
         let mut result = match filter.op() {
@@ -623,34 +676,197 @@ impl ScalarIndex {
         Some(result)
     }
 
+    /// `column_index` 列（`TEXT` 列限定）の値ごとのグループを、値のバイト列
+    /// 昇順（[`Self::build`] の `TextColumnIndex.values` と同じ順序）で列挙する
+    /// （Issue #475: `sql::group_by` の `WHERE` なし `GROUP BY` 列挙形が使う）。
+    /// 列が `TEXT` でない・未知の列は `None`。各グループのスロット列は昇順。
+    /// [`Self::build`] は該当列の非 `NULL` 値を**すべて**索引化するか（成功）、
+    /// 予算超過等で索引全体の構築を諦めるか（`Err`。この場合キャッシュに
+    /// エントリ自体が存在しない）のいずれかであり、一部の値だけを欠落させたまま
+    /// 索引を返すことはないため（モジュールドキュメント「データモデル」・
+    /// [`Self::build`] 参照）、ここで列挙される値は当該列の可視行が実際に
+    /// 持つ非 `NULL` 値の**全体**である（一部スキップによる取りこぼしを呼び
+    /// 出し元が心配する必要はない）。
+    pub(crate) fn column_groups(
+        &self,
+        column_index: usize,
+    ) -> Option<impl Iterator<Item = (&str, &[u32])> + '_> {
+        let column = self.columns.get(column_index)?.as_ref()?;
+        Some((0..column.values.len()).filter_map(move |i| {
+            let value = column.values.get(i)?.as_str();
+            let value_index = u32::try_from(i).ok()?;
+            let slots = column.slots_for_value_index(value_index)?;
+            Some((value, slots))
+        }))
+    }
+
+    /// `column_index` 列（`TEXT` 列限定）が `NULL`（＝索引のどの値エントリにも
+    /// 現れない）である可視行のスロットを昇順で返す（Issue #475:
+    /// `sql::group_by` の `WHERE` なし `GROUP BY` 列挙形が NULL グループを
+    /// 補完するために使う）。列が `TEXT` でない・未知の列は `None`。
+    ///
+    /// `row_count`（索引構築時の全スロット数）長のビットマップで索引済み全値の
+    /// スロットを被覆し、被覆されなかったスロットを NULL とみなす。
+    /// [`Self::build`] のドキュメントどおり「索引化された値の集合」は当該列の
+    /// 非 `NULL` 値の全体であるため、この差分計算は正確に NULL 行と一致する
+    /// （`declarative_filter::MetadataFilter::matches` の NULL 常時不一致判定と
+    /// 同じ意味論。モジュールドキュメント参照）。
+    pub(crate) fn slots_without_value(&self, column_index: usize) -> Option<Vec<u32>> {
+        let column = self.columns.get(column_index)?.as_ref()?;
+        let mut covered: Vec<bool> = Vec::new();
+        covered.try_reserve_exact(self.row_count).ok()?;
+        covered.resize(self.row_count, false);
+        for &slot in &column.slots {
+            if let Some(flag) = covered.get_mut(slot as usize) {
+                *flag = true;
+            }
+        }
+        let mut out: Vec<u32> = Vec::new();
+        for (idx, &is_covered) in covered.iter().enumerate() {
+            if !is_covered {
+                let slot = u32::try_from(idx).ok()?;
+                out.try_reserve(1).ok()?;
+                out.push(slot);
+            }
+        }
+        Some(out)
+    }
+
     /// `id` に対する範囲述語（単純比較）向け照会。`id_index` が `None`
     /// （`id > 2^53` を含む行がある）の場合は `None`（呼び出し元が全走査へ
     /// 縮退する契機。モジュールドキュメント参照）。戻り値は昇順 `Vec<u32>`。
-    #[cfg(test)]
-    fn candidates_id_range(
+    ///
+    /// `id_index` は `id` 昇順（同一 `id` 内はスロット昇順）に整列済みのため、
+    /// 範囲の両端を [`slice::partition_point`]（二分探索）で求め、対象区間
+    /// だけを複製する（Issue #474。旧実装は全件の線形走査＋フィルタだった）。
+    /// 区間内は `id` 昇順だがスロット昇順とは限らない（異なる `id` 間で挿入
+    /// 順が保たれるだけ）ため、返す前に `sort_unstable` で候補列の共通契約
+    /// （スロット昇順）へ揃える。
+    pub(crate) fn candidates_id_range(
         &self,
         lower: std::ops::Bound<u64>,
         upper: std::ops::Bound<u64>,
     ) -> Option<Vec<u32>> {
         use std::ops::Bound;
         let idx = self.id_index.as_ref()?;
-        let in_lower = |id: u64| match lower {
-            Bound::Included(l) => id >= l,
-            Bound::Excluded(l) => id > l,
-            Bound::Unbounded => true,
+        let start = match lower {
+            Bound::Unbounded => 0,
+            Bound::Included(l) => idx.partition_point(|(id, _)| *id < l),
+            Bound::Excluded(l) => idx.partition_point(|(id, _)| *id <= l),
         };
-        let in_upper = |id: u64| match upper {
-            Bound::Included(u) => id <= u,
-            Bound::Excluded(u) => id < u,
-            Bound::Unbounded => true,
+        let end = match upper {
+            Bound::Unbounded => idx.len(),
+            Bound::Included(u) => idx.partition_point(|(id, _)| *id <= u),
+            Bound::Excluded(u) => idx.partition_point(|(id, _)| *id < u),
         };
-        let mut out: Vec<u32> = idx
-            .iter()
-            .filter(|(id, _)| in_lower(*id) && in_upper(*id))
-            .map(|(_, slot)| *slot)
-            .collect();
+        if start >= end {
+            return Some(Vec::new());
+        }
+        let mut out: Vec<u32> = Vec::new();
+        out.try_reserve_exact(end - start).ok()?;
+        out.extend(idx[start..end].iter().map(|(_, slot)| *slot));
         out.sort_unstable();
         Some(out)
+    }
+
+    /// `metadata_filters`（`TEXT` 列の等価・前方一致）と `id_preds`（`id` の
+    /// 単純比較。`sql::scalar_plan::classify_scalar_plan` が
+    /// `ScalarPlan::PlainScan` 以外へ分類した述語のみを渡す契約）から候補
+    /// スロット集合を導出する（Issue #474）。各述語の候補を個別に取得し
+    /// （`None` は「判定不能」＝列未索引または `id_index` が `None`）、複数
+    /// 述語は昇順ベクトルの交差（2 本指マージ）で結合する。交差はスロットを
+    /// 「絞る」ことしかできず「通す」ことはできないため、呼び出し元
+    /// （`sql::exec`）が候補行にも引き続き `on_visible_row`（`matches_all`＋
+    /// 式述語）を適用する契約と組み合わさって fail-closed が成立する（本
+    /// メソッド自体が正しさの唯一の防御ではない）。
+    pub(crate) fn resolve_candidates(
+        &self,
+        metadata_filters: &[MetadataFilter],
+        id_preds: &[crate::sql::scalar_plan::IdPredicate],
+    ) -> CandidateResolution {
+        if metadata_filters.is_empty() && id_preds.is_empty() {
+            // `classify_scalar_plan` が `PlainScan` 以外を返す限り到達しない
+            // 呼び出し規約違反だが、防御的に fail-closed へ倒す。
+            return CandidateResolution::FallbackNoIndex;
+        }
+        // 述語ごとの候補列を全件 `Vec<Vec<u32>>` に集めてから交差する実装は、
+        // 交差前の累計保持量に上限が無かった（codex-review P1 指摘・PR #601）。
+        // 許可リスト上限の述語数（最大 256 件・`sql::allowlist` 参照）それぞれが
+        // 索引済み行の大半に一致する入力（同一 TEXT 値の等価条件を 256 個
+        // 並べる等）では、選択度切替（縮退判定）が交差**後**にしか働かないため、
+        // 交差前に 256 本の候補列（各最大 `row_count` 件）を同時保持し
+        // `MAX_ARENA_ROWS`（約 100 万行）規模ではコピーだけで約 1 GiB を
+        // 追加確保しうる。交差は「述語を追加するほど結果が単調非増加になる」
+        // （2 本指マージの結果は常に両オペランド以下の長さ）性質を持つため、
+        // 述語ごとの候補列を生成するたびにその場で累積へ交差し、次の述語へ
+        // 進む前に前の候補列を破棄する（保持するのは累積候補列と直近生成した
+        // 1 本のみ）。これにより述語数に依存せず、保持量は個々の候補列の
+        // 最大サイズ（`row_count` に比例）で頭打ちになる。
+        //
+        // 交差前に最小の候補列から処理する最適化（Issue #474 時点の実装）は
+        // 全列の長さを事前に知る必要があり本対応と両立しないため撤去した。
+        // 累積が空集合になった時点で以降の述語を評価せず打ち切る（交差は
+        // 単調非増加のため以降の交差結果も必ず空集合）ことで、代わりに早期
+        // 打ち切りによる実用上の性能劣化を抑える。
+        let mut accumulated: Option<Vec<u32>> = None;
+        for filter in metadata_filters {
+            if accumulated.as_deref().is_some_and(<[u32]>::is_empty) {
+                break;
+            }
+            let slots = match self.candidates_for(filter) {
+                Some(slots) => slots,
+                None => return CandidateResolution::FallbackNoIndex,
+            };
+            accumulated = Some(match accumulated {
+                None => slots,
+                Some(acc) => match intersect_sorted(&acc, &slots) {
+                    Some(v) => v,
+                    None => return CandidateResolution::FallbackNoIndex,
+                },
+            });
+        }
+        for pred in id_preds {
+            if accumulated.as_deref().is_some_and(<[u32]>::is_empty) {
+                break;
+            }
+            let Some((lower, upper)) = crate::sql::scalar_plan::id_bounds(pred) else {
+                return CandidateResolution::FallbackNoIndex;
+            };
+            let slots = match self.candidates_id_range(lower, upper) {
+                Some(slots) => slots,
+                None => return CandidateResolution::FallbackNoIndex,
+            };
+            accumulated = Some(match accumulated {
+                None => slots,
+                Some(acc) => match intersect_sorted(&acc, &slots) {
+                    Some(v) => v,
+                    None => return CandidateResolution::FallbackNoIndex,
+                },
+            });
+        }
+        // 上の 2 ループは冒頭の空チェックにより少なくとも 1 回は候補列を
+        // 生成するため、ここで `None` のままということはない。
+        let intersected = accumulated.unwrap_or_default();
+        let hits = intersected.len() as u64;
+        let row_count = self.row_count as u64;
+        // 選択度切替（`sql::hnsw_cache` の `full_scan_ratio` と同型の
+        // `checked_mul` による整数比較。丸め誤差を避けるため両辺を分母倍する）。
+        let exceeds = match hits.checked_mul(DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_DENOMINATOR) {
+            Some(lhs) => {
+                match row_count.checked_mul(DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_NUMERATOR) {
+                    Some(rhs) => lhs > rhs,
+                    // `row_count` は `MAX_ARENA_ROWS`（100 万行程度）で頭打ちの
+                    // ため現実的には到達しないが、桁あふれた場合は判定不能
+                    // として選択度超過側（保守的に全走査）へ倒す。
+                    None => true,
+                }
+            }
+            None => true,
+        };
+        if exceeds {
+            return CandidateResolution::FallbackSelectivity;
+        }
+        CandidateResolution::Use(intersected)
     }
 
     /// 索引全体（`TEXT` 列の辞書・CSR・`equality`・`id_index`）の概算ヒープ
@@ -683,12 +899,15 @@ impl ScalarIndex {
         self.approx_bytes
     }
 
-    #[cfg(test)]
-    fn row_count(&self) -> usize {
+    /// 索引構築時のスナップショット行数（Issue #474: `sql::exec` の索引↔
+    /// スナップショット同一性ガードが `snapshot.arena().len()` と突き合わせる）。
+    pub(crate) fn row_count(&self) -> usize {
         self.row_count
     }
 
-    fn built_table_generation(&self) -> u64 {
+    /// 索引構築時のテーブル世代（Issue #474: `sql::exec` の索引↔スナップショット
+    /// 同一性ガードが `snapshot.built_table_generation_for_index()` と突き合わせる）。
+    pub(crate) fn built_table_generation(&self) -> u64 {
         self.built_table_generation
     }
 }
@@ -704,6 +923,22 @@ pub struct ScalarIndexCacheStats {
     pub builds: u64,
     pub build_failures: u64,
     pub entries: usize,
+    /// Issue #474: `sql::exec` が索引経路（`ScalarIndex::resolve_candidates`
+    /// の `CandidateResolution::Use`）を実際に消費してクエリを実行した回数。
+    pub index_scans: u64,
+    /// Issue #474: `sql::exec` が索引対応述語を持つクエリで全走査へ縮退した
+    /// 回数（`FallbackNoIndex`／`FallbackSelectivity`／同一性ガード不一致
+    /// いずれも含む）。
+    pub plain_scan_fallbacks: u64,
+    /// Issue #475: `sql::aggregate`／`sql::group_by` が索引経路（候補走査・
+    /// `GROUP BY` キー列挙形）を実際に消費して集計クエリを実行した回数
+    /// （`index_scans`/`plain_scan_fallbacks` と別枠。SELECT 経路の消費と
+    /// 区別する）。
+    pub aggregate_index_scans: u64,
+    /// Issue #475: 集計・`GROUP BY` クエリが索引対応述語・形状を持ちながら
+    /// 全走査へ縮退した回数（`FallbackNoIndex`／`FallbackSelectivity`／
+    /// 同一性ガード不一致／構築断念／NULL 補完不能のいずれも含む）。
+    pub aggregate_plain_scan_fallbacks: u64,
 }
 
 struct ScalarIndexCacheEntry {
@@ -712,9 +947,52 @@ struct ScalarIndexCacheEntry {
     last_used: u64,
 }
 
+/// [`UnbuildableEntry`] が記録する失敗の起点（PR #603 codex-review P2 指摘
+/// 対応）。`(table, ctx)` あたり最新 1 件のみを保持する既存の上書き方式は
+/// 変えず、どちらの起点で「同一世代では再試行しても無駄」と判定したかを
+/// 区別して記録するためだけに使う（[`ScalarIndexCache::is_capture_known_
+/// unbuildable`] によるゲート判定自体は起点を問わず同一世代のヒットで
+/// ブロックする——採取済みでも構築側の予算超過等で不能なら、次に採取から
+/// やり直しても同じ結果になるため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnbuildableReason {
+    /// `sql::aggregate::capture_scalar_index_snapshot` 自体が採取失敗
+    /// （容量超過・復号不能・NULL 行混在等）で `None` を返した。
+    Capture,
+    /// 採取（アリーナスナップショット構築）自体は成功した——`SqlArenaCache`
+    /// ヒットにより既に温かいスナップショットが手元にある——が、そこから
+    /// [`ScalarIndex::build`] を実行した結果が失敗した（索引固有の容量超過
+    /// 等）。
+    Build,
+}
+
+/// Issue #475 codex-review P2 対応: `sql::aggregate::capture_scalar_index_snapshot`
+/// が「この `(table, ctx)`・世代では索引の piggyback 構築が採取失敗（容量超過・
+/// 復号不能・NULL 行混在等）で確定的に不可能だった」ことを記録するエントリ。
+/// `ScalarIndexCacheEntry`（構築成功した索引本体）とは別枠——同一世代内は
+/// [`ScalarIndexCache::is_capture_known_unbuildable`] がこの記録をヒットさせ、
+/// 集計・`GROUP BY` クエリのたびに同じ全走査・全量デコードの採取を繰り返す
+/// ことを避ける（構築成功索引のキャッシュとは独立に世代が進めば自然に無効化
+/// される。テーブル単位世代のみをキーにし、行内容・存在情報は保持しない）。
+///
+/// PR #603 codex-review P2 指摘対応: `reason`（[`UnbuildableReason`]）は、
+/// アリーナ採取自体の失敗（`Capture`）と、温かいスナップショットからの
+/// [`ScalarIndex::build`] 失敗（`Build`）を記録上区別する。以前は後者を
+/// このエントリへ一切記録しておらず、`SqlArenaCache` がヒットし続ける限り
+/// 同一世代の集計・`GROUP BY` クエリごとに毎回スナップショット全体の
+/// デコード・文字列複製をやり直してから全走査へ縮退していた。
+struct UnbuildableEntry {
+    table: String,
+    ctx: PolicyContext,
+    generation: u64,
+    last_used: u64,
+    reason: UnbuildableReason,
+}
+
 #[derive(Default)]
 struct ScalarIndexCacheState {
     entries: Vec<ScalarIndexCacheEntry>,
+    unbuildable: Vec<UnbuildableEntry>,
 }
 
 /// `(table, ctx)` × テーブル単位世代でキャッシュする [`ScalarIndex`] キャッシュ
@@ -728,6 +1006,10 @@ pub(crate) struct ScalarIndexCache {
     capacity_evictions: AtomicU64,
     builds: AtomicU64,
     build_failures: AtomicU64,
+    index_scans: AtomicU64,
+    plain_scan_fallbacks: AtomicU64,
+    aggregate_index_scans: AtomicU64,
+    aggregate_plain_scan_fallbacks: AtomicU64,
 }
 
 impl ScalarIndexCache {
@@ -741,6 +1023,10 @@ impl ScalarIndexCache {
             capacity_evictions: AtomicU64::new(0),
             builds: AtomicU64::new(0),
             build_failures: AtomicU64::new(0),
+            index_scans: AtomicU64::new(0),
+            plain_scan_fallbacks: AtomicU64::new(0),
+            aggregate_index_scans: AtomicU64::new(0),
+            aggregate_plain_scan_fallbacks: AtomicU64::new(0),
         }
     }
 
@@ -903,6 +1189,12 @@ impl ScalarIndexCache {
             builds: self.builds.load(Ordering::Relaxed),
             build_failures: self.build_failures.load(Ordering::Relaxed),
             entries,
+            index_scans: self.index_scans.load(Ordering::Relaxed),
+            plain_scan_fallbacks: self.plain_scan_fallbacks.load(Ordering::Relaxed),
+            aggregate_index_scans: self.aggregate_index_scans.load(Ordering::Relaxed),
+            aggregate_plain_scan_fallbacks: self
+                .aggregate_plain_scan_fallbacks
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -911,6 +1203,158 @@ impl ScalarIndexCache {
     /// モジュールドキュメント「fail-closed の適用範囲」参照）。
     pub(crate) fn record_build_failure(&self) {
         self.build_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #474: `sql::exec` が索引経路（`CandidateResolution::Use`）を
+    /// 実際に消費してクエリを実行したことを観測用統計へ計上する。
+    pub(crate) fn record_index_scan(&self) {
+        self.index_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #474: `sql::exec` が索引対応述語を持つクエリで全走査へ縮退した
+    /// ことを観測用統計へ計上する（`FallbackNoIndex`／`FallbackSelectivity`／
+    /// 索引↔スナップショット同一性ガード不一致のいずれも呼ぶ）。
+    pub(crate) fn record_plain_scan_fallback(&self) {
+        self.plain_scan_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #475: `sql::aggregate`／`sql::group_by` が索引経路（候補走査・
+    /// `GROUP BY` キー列挙形）を実際に消費して集計クエリを実行したことを
+    /// 観測用統計へ計上する。
+    pub(crate) fn record_aggregate_index_scan(&self) {
+        self.aggregate_index_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #475: 集計・`GROUP BY` クエリが索引対応述語・形状を持ちながら
+    /// 全走査へ縮退したことを観測用統計へ計上する。
+    pub(crate) fn record_aggregate_plain_scan_fallback(&self) {
+        self.aggregate_plain_scan_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #475 codex-review P2 対応: この `(table, ctx)` の現在のテーブル
+    /// 世代について、集計・`GROUP BY` の索引構築（`sql::aggregate::
+    /// capture_scalar_index_snapshot` による piggyback 採取、または温かい
+    /// `SqlArenaSnapshot` からの [`ScalarIndex::build`]。PR #603 codex-review
+    /// P2 指摘対応で後者も対象に含めた）が失敗済みと確定しているかを調べる。
+    /// ヒットした場合、呼び出し元は採取・構築のいずれも試みず即座に全走査
+    /// フォールバックへ委ねてよい（起点を区別せず判定する理由は
+    /// [`UnbuildableReason`] のドキュメント参照）。世代が進んだ古い記録は
+    /// 一致しないため自然にミスとして扱う（明示的な無効化は不要。世代不一致の
+    /// 記録は次の [`Self::mark_capture_unbuildable`]／[`Self::mark_build_
+    /// unbuildable`] 呼び出しで上書きされるまで残るが、`table` は非機微情報で
+    /// ありサイズは [`MAX_SCALAR_INDEX_CACHE_ENTRIES`] で有界のため安全性に
+    /// 影響しない）。
+    pub(crate) fn is_capture_known_unbuildable(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+        ctx: &PolicyContext,
+    ) -> bool {
+        let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table)
+        else {
+            return false;
+        };
+        let Ok(guard) = self.state.read() else {
+            return false;
+        };
+        guard
+            .unbuildable
+            .iter()
+            .any(|e| e.table == table && e.ctx == *ctx && e.generation == current_generation)
+    }
+
+    /// Issue #475 codex-review P2 対応: `capture_scalar_index_snapshot` が
+    /// 採取失敗（`None`）を返した直後に呼び出し、[`Self::is_capture_known_
+    /// unbuildable`] が次回以降の同一世代呼び出しをこの採取試行自体をスキップ
+    /// させられるよう記録する（[`UnbuildableReason::Capture`]）。テーブル
+    /// 世代の読み取りに失敗した場合は記録せず終える（fail-closed。記録できな
+    /// くても呼び出し元の集計クエリ自体は全走査へフォールバック済みで正しさに
+    /// 影響しない）。
+    ///
+    /// PR #603 codex-review P2 指摘対応: 記録する世代は、実際に採取（全走査）
+    /// を試みた**その** `read_txn` のスナップショット世代
+    /// （`catalog::table_generation_in_txn`）でなければならない。以前は
+    /// `Storage::table_generation`（最新コミット世代）を使っていたため、採取中
+    /// に別トランザクションがコミットすると世代 `G` での採取失敗が `G+1` へ
+    /// 誤記録されることがあった（[`Self::is_capture_known_unbuildable`] は
+    /// `read_txn` のスナップショット世代と突き合わせるため、この不一致により
+    /// 実際には構築可能な `G+1` の採取が次の更新までスキップされてしまう）。
+    pub(crate) fn mark_capture_unbuildable(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+        ctx: &PolicyContext,
+    ) {
+        self.mark_unbuildable(read_txn, table, ctx, UnbuildableReason::Capture);
+    }
+
+    /// PR #603 codex-review P2 指摘対応: `sql::aggregate::
+    /// ensure_scalar_index_snapshot` が、`SqlArenaCache` ヒットにより既に
+    /// 温かい `SqlArenaSnapshot` を持っている状態から [`ScalarIndex::build`]
+    /// を実行し、その構築自体が失敗した直後に呼び出す
+    /// （[`UnbuildableReason::Build`]）。この記録がないと、同一世代のうちは
+    /// `SqlArenaCache` がヒットし続ける限り集計・`GROUP BY` クエリのたびに
+    /// 同じ（確定的に失敗する）構築を繰り返し試み、スナップショット全体の
+    /// デコード・文字列複製コストを毎回払ってから全走査へ縮退していた。
+    /// [`Self::mark_capture_unbuildable`] と同じ fail-closed 方針（世代を
+    /// 読めない場合は記録しないだけで、呼び出し元の集計クエリ自体は失敗
+    /// しない）を踏襲する。
+    pub(crate) fn mark_build_unbuildable(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+        ctx: &PolicyContext,
+    ) {
+        self.mark_unbuildable(read_txn, table, ctx, UnbuildableReason::Build);
+    }
+
+    /// [`Self::mark_capture_unbuildable`]／[`Self::mark_build_unbuildable`]
+    /// が共有する実処理（`(table, ctx)` あたり最新 1 件のみを保持する既存の
+    /// 上書き方式・LRU 追い出しはいずれも起点によらず共通のため、`reason` の
+    /// 違いのみをパラメータ化する）。
+    fn mark_unbuildable(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+        ctx: &PolicyContext,
+        reason: UnbuildableReason,
+    ) {
+        let Ok(generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
+            return;
+        };
+        let Ok(mut guard) = self.state.write() else {
+            return;
+        };
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(entry) = guard
+            .unbuildable
+            .iter_mut()
+            .find(|e| e.table == table && e.ctx == *ctx)
+        {
+            entry.generation = generation;
+            entry.last_used = seq;
+            entry.reason = reason;
+            return;
+        }
+        while guard.unbuildable.len() >= MAX_SCALAR_INDEX_CACHE_ENTRIES {
+            let Some((idx, _)) = guard
+                .unbuildable
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_used)
+            else {
+                break;
+            };
+            guard.unbuildable.remove(idx);
+        }
+        guard.unbuildable.push(UnbuildableEntry {
+            table: table.to_string(),
+            ctx: ctx.clone(),
+            generation,
+            last_used: seq,
+            reason,
+        });
     }
 }
 
@@ -1528,6 +1972,87 @@ mod tests {
         assert_eq!(cache.stats().entries, 0);
     }
 
+    // Issue #475 codex-review P2 対応（`sql::aggregate::capture_scalar_index_
+    // snapshot` の piggyback 採取失敗の記録・照会）: `mark_capture_unbuildable`
+    // で記録した世代は `is_capture_known_unbuildable` がヒットし、書き込みで
+    // 世代が進むと自動的にミスへ戻ることを固定する。
+    #[test]
+    fn capture_unbuildable_memo_hits_same_generation_and_misses_after_write() {
+        let path = unique_db_path("scalar-index-cache-unbuildable");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let ctx_a = ctx("tenant-a");
+        insert(&storage, &ctx_a, 1, Some("x"), None, Visibility::Public);
+
+        let cache = ScalarIndexCache::new();
+
+        let read_txn = storage.db().begin_read().expect("begin read");
+        assert!(
+            !cache.is_capture_known_unbuildable(&read_txn, "docs", &ctx_a),
+            "no record yet must not be treated as known-unbuildable"
+        );
+        cache.mark_capture_unbuildable(&read_txn, "docs", &ctx_a);
+        drop(read_txn);
+
+        let read_txn = storage.db().begin_read().expect("begin read");
+        assert!(
+            cache.is_capture_known_unbuildable(&read_txn, "docs", &ctx_a),
+            "same generation must hit the recorded memo"
+        );
+        // 別テナント ctx・別テーブルは記録を共有しない。
+        let ctx_b = ctx("tenant-b");
+        assert!(!cache.is_capture_known_unbuildable(&read_txn, "docs", &ctx_b));
+        assert!(!cache.is_capture_known_unbuildable(&read_txn, "other_table", &ctx_a));
+        drop(read_txn);
+
+        // 書き込みで世代が進むと記録は現世代と一致しなくなり、ミスへ戻る
+        // （採取の再試行が世代進行後に自動的に許される）。
+        insert(&storage, &ctx_a, 2, Some("y"), None, Visibility::Public);
+        let read_txn2 = storage.db().begin_read().expect("begin read");
+        assert!(!cache.is_capture_known_unbuildable(&read_txn2, "docs", &ctx_a));
+    }
+
+    // PR #603 codex-review P2 指摘対応: `mark_capture_unbuildable` は採取に
+    // 実際に使った `read_txn`（世代 G）のスナップショット世代で記録しなけれ
+    // ばならない。採取中（`read_txn` を開いた後、`mark_capture_unbuildable`
+    // を呼ぶまでの間）に別トランザクションがコミットして世代が G+1 へ進んで
+    // も、記録は G のまま——`Storage::table_generation`（最新コミット世代）を
+    // 使っていた旧実装ではここで G+1 が誤記録され、実際には構築可能な G+1 の
+    // 採取が次の更新まで誤ってスキップされていた。
+    #[test]
+    fn capture_unbuildable_memo_records_read_txn_generation_not_latest_commit() {
+        let path = unique_db_path("scalar-index-cache-unbuildable-stale-txn");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let ctx_a = ctx("tenant-a");
+        insert(&storage, &ctx_a, 1, Some("x"), None, Visibility::Public);
+
+        let cache = ScalarIndexCache::new();
+
+        // 採取に使った read_txn（世代 G）を開いたまま保持する。
+        let read_txn_g = storage.db().begin_read().expect("begin read");
+
+        // 採取中（read_txn_g を開いた後）に別トランザクションがコミットし、
+        // テーブル世代が G+1 へ進む（並行書き込みを模す）。
+        insert(&storage, &ctx_a, 2, Some("y"), None, Visibility::Public);
+
+        // 採取失敗を、採取に実際に使った read_txn_g（世代 G）で記録する。
+        cache.mark_capture_unbuildable(&read_txn_g, "docs", &ctx_a);
+        drop(read_txn_g);
+
+        // 世代 G+1（コミット済み最新）のスナップショットでは記録が一致せず、
+        // 誤ってミスとして扱われない（＝再試行が許される）ことを確認する。
+        let read_txn_g_plus_1 = storage.db().begin_read().expect("begin read");
+        assert!(
+            !cache.is_capture_known_unbuildable(&read_txn_g_plus_1, "docs", &ctx_a),
+            "the memo must be keyed by the read_txn's own generation (G), \
+             not the latest committed generation (G+1) observed after it started"
+        );
+        drop(read_txn_g_plus_1);
+    }
+
     #[test]
     fn cache_key_separates_by_ctx() {
         let path = unique_db_path("scalar-index-cache-ctx");
@@ -1634,5 +2159,126 @@ mod tests {
             }
         }
         out
+    }
+
+    // Issue #475: `column_groups`／`slots_without_value`（`sql::group_by` の
+    // WHERE なし GROUP BY 列挙形が使う API）の単体テスト。
+
+    #[test]
+    fn column_groups_enumerates_values_in_byte_order_with_correct_slots() {
+        let path = unique_db_path("scalar-index-column-groups");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        // わざと非バイト順で挿入し、列挙がバイト列昇順であることを固定する。
+        insert(&storage, &c, 1, Some("zulu"), None, Visibility::Public);
+        insert(&storage, &c, 2, Some("alpha"), None, Visibility::Public);
+        insert(&storage, &c, 3, Some("alpha"), None, Visibility::Public);
+        insert(&storage, &c, 4, None, None, Visibility::Public);
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+
+        let kind_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "kind")
+            .expect("kind column");
+        let groups: Vec<(String, Vec<u32>)> = index
+            .column_groups(kind_col)
+            .expect("text column")
+            .map(|(v, slots)| (v.to_string(), slots.to_vec()))
+            .collect();
+        let values: Vec<&str> = groups.iter().map(|(v, _)| v.as_str()).collect();
+        assert_eq!(values, vec!["alpha", "zulu"]);
+        for (_, slots) in &groups {
+            let mut sorted = slots.clone();
+            sorted.sort_unstable();
+            assert_eq!(slots, &sorted, "slots must be ascending");
+        }
+        let alpha_slots = &groups[0].1;
+        assert_eq!(alpha_slots.len(), 2);
+
+        // id=4 (kind=NULL) はどの値グループにも現れない。
+        for (_, slots) in &groups {
+            for &slot in slots {
+                let arena_id = snapshot.arena().ids()[slot as usize];
+                assert_ne!(arena_id, 4);
+            }
+        }
+    }
+
+    #[test]
+    fn slots_without_value_returns_null_rows_only() {
+        let path = unique_db_path("scalar-index-slots-without-value");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        insert(&storage, &c, 1, Some("alpha"), None, Visibility::Public);
+        insert(&storage, &c, 2, None, None, Visibility::Public);
+        insert(&storage, &c, 3, None, None, Visibility::Public);
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let kind_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "kind")
+            .expect("kind column");
+        let null_slots = index
+            .slots_without_value(kind_col)
+            .expect("text column supports null slots");
+        let null_ids: Vec<u64> = null_slots
+            .iter()
+            .map(|&slot| snapshot.arena().ids()[slot as usize])
+            .collect();
+        let mut sorted_ids = null_ids.clone();
+        sorted_ids.sort_unstable();
+        assert_eq!(sorted_ids, vec![2, 3]);
+        // 昇順契約。
+        let mut sorted_slots = null_slots.clone();
+        sorted_slots.sort_unstable();
+        assert_eq!(null_slots, sorted_slots);
+    }
+
+    #[test]
+    fn slots_without_value_empty_when_no_nulls() {
+        let path = unique_db_path("scalar-index-slots-without-value-empty");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        insert(&storage, &c, 1, Some("alpha"), None, Visibility::Public);
+        insert(&storage, &c, 2, Some("beta"), None, Visibility::Public);
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let kind_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "kind")
+            .expect("kind column");
+        assert_eq!(
+            index.slots_without_value(kind_col).expect("text column"),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn column_groups_and_slots_without_value_none_for_vector_column() {
+        let path = unique_db_path("scalar-index-column-groups-vector");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        insert(&storage, &c, 1, Some("alpha"), None, Visibility::Public);
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let embedding_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "embedding")
+            .expect("embedding column");
+        assert!(index.column_groups(embedding_col).is_none());
+        assert!(index.slots_without_value(embedding_col).is_none());
     }
 }

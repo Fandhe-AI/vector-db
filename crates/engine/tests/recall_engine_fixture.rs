@@ -208,3 +208,74 @@ fn hnsw_engine_does_not_build_index_below_min_indexed_rows() {
     assert!(!got.is_empty(), "expected non-empty hybrid result");
     fixture.assert_ann_non_vacuous(false);
 }
+
+/// 非 vacuous ガード（正・F16 常駐。Issue #515）:
+/// `RecallEngine::HnswF16` でも `MIN_INDEXED_ROWS` 以上のコーパスでは実際に
+/// 索引が構築され、`resident=f16`（`search_engine_kind()` の Display）で
+/// 自動縮退（D6）が発生していないことを固定する。
+#[test]
+fn hnsw_f16_engine_builds_index_at_or_above_min_indexed_rows() {
+    const DIM: usize = 16;
+    const ROWS: usize = 1_200;
+    const CLUSTERS: usize = 6;
+
+    let rows = gen_clustered_corpus(4, DIM, ROWS, CLUSTERS);
+    let fixture = SqlHybridFixture::new(DIM as u32, &rows, RecallEngine::HnswF16);
+
+    let query_vec = rows[0].1.clone();
+    let got = fixture.hybrid_top(&query_vec, "clusterword0", 10);
+    assert!(!got.is_empty(), "expected non-empty hybrid result");
+    fixture.assert_ann_non_vacuous(true);
+}
+
+/// 非 vacuous ガード（負・F16 常駐）: `MIN_INDEXED_ROWS` 未満のコーパスは
+/// `RecallEngine::HnswF16` を指定しても索引を構築しない。
+#[test]
+fn hnsw_f16_engine_does_not_build_index_below_min_indexed_rows() {
+    const DIM: usize = 16;
+    const ROWS: usize = 400;
+    const CLUSTERS: usize = 6;
+
+    let rows = gen_clustered_corpus(5, DIM, ROWS, CLUSTERS);
+    let fixture = SqlHybridFixture::new(DIM as u32, &rows, RecallEngine::HnswF16);
+
+    let query_vec = rows[0].1.clone();
+    let got = fixture.hybrid_top(&query_vec, "clusterword0", 10);
+    assert!(!got.is_empty(), "expected non-empty hybrid result");
+    fixture.assert_ann_non_vacuous(false);
+}
+
+/// F16 常駐（候補生成が f16→f32 昇格 dot になり探索順序が変わり得る）でも
+/// F32 常駐と同一コーパス・同一クエリで Top-20 の重なりが高い（Recall
+/// tolerance 0.9 以上）ことを固定する（候補順序差の許容。完全一致は要求しない。
+/// 最終スコアは常に `kernel::dot` の f32 再計算——#408 契約——のため id 集合の
+/// 差は探索経路のみに起因する）。
+#[test]
+fn hnsw_f16_engine_top_ids_match_hnsw_within_recall_tolerance() {
+    const DIM: usize = 16;
+    const ROWS: usize = 1_200;
+    const CLUSTERS: usize = 6;
+    const K: usize = 20;
+
+    let rows = gen_clustered_corpus(6, DIM, ROWS, CLUSTERS);
+    let f32_fixture = SqlHybridFixture::new(DIM as u32, &rows, RecallEngine::Hnsw);
+    let f16_fixture = SqlHybridFixture::new(DIM as u32, &rows, RecallEngine::HnswF16);
+
+    let query_vec = rows[0].1.clone();
+    let f32_top = f32_fixture.hybrid_top(&query_vec, "clusterword0", K);
+    let f16_top = f16_fixture.hybrid_top(&query_vec, "clusterword0", K);
+    assert!(!f32_top.is_empty() && !f16_top.is_empty());
+
+    let f32_ids: std::collections::HashSet<u64> = f32_top.iter().map(|(id, _)| *id).collect();
+    let overlap = f16_top
+        .iter()
+        .filter(|(id, _)| f32_ids.contains(id))
+        .count();
+    let recall = overlap as f64 / f32_ids.len() as f64;
+    assert!(
+        recall >= 0.9,
+        "expected hnsw_f16 top-{K} to overlap hnsw (f32) top-{K} by at least 0.9, got \
+         {recall} (overlap={overlap}, f32_ids={})",
+        f32_ids.len()
+    );
+}

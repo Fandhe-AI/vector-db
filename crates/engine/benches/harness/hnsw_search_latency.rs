@@ -91,6 +91,17 @@ pub enum HnswSearchLatencyError {
     /// [`reference_band`] に渡した値列が空、または最小値が 0 以下
     /// （0 除算・NaN/inf 混入の回避）。
     EmptyOrNonPositiveMin,
+    /// `BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX`（Issue #498）が非負整数として
+    /// 解釈できなかった。未計測の性能変更を既定にしない方針（`docs/design/
+    /// benchmark-judgement-policy.md`）に沿い、未設定へフォールバックせず
+    /// fail-closed で拒否する（不正値が黙って dense〔既定 0〕へ倒れ
+    /// after == before の vacuous 計測になることを防ぐ）。
+    InvalidSparseVisitedMax,
+    /// `BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX` を `BENCH_HNSW_SEARCH_MASK=none`
+    /// （マスクなし探索）と併用した。`mask == None` は
+    /// `HnswIndex::search_masked_with` の契約上常に dense を選ぶため、
+    /// この組み合わせは knob が一切効かない vacuous な計測になる。
+    SparseVisitedMaxRequiresMask,
 }
 
 impl fmt::Display for HnswSearchLatencyError {
@@ -109,6 +120,19 @@ impl fmt::Display for HnswSearchLatencyError {
                 f,
                 "reference_band refuses an empty slice or a non-positive min \
                  (would divide by zero / emit NaN)"
+            ),
+            HnswSearchLatencyError::InvalidSparseVisitedMax => write!(
+                f,
+                "BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX must be a non-negative integer \
+                 (fail-closed: unlike other bench inputs this knob does not fall back \
+                 to a default, since falling back silently would make the measurement \
+                 vacuous — Issue #498)"
+            ),
+            HnswSearchLatencyError::SparseVisitedMaxRequiresMask => write!(
+                f,
+                "BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX requires BENCH_HNSW_SEARCH_MASK to be \
+                 set (mask=none always selects the dense visited set regardless of this \
+                 knob, making the measurement vacuous — Issue #498)"
             ),
         }
     }
@@ -346,4 +370,87 @@ pub fn render_reference_line(min_us: f64, median_us: f64, p95_us: f64, samples: 
 /// エラーにはしない）1 行分の出力整形。
 pub fn render_masked_short_line(count: usize) -> String {
     format!("hnsw_search_bench: masked_short_queries={count}")
+}
+
+/// `sparse_visited_max` の単一ビルド A/B（Issue #498）が選ぶ arm。
+/// `hnsw_search_bench.rs` は `dense`（値 0。既存の `search_masked` 既定経路と
+/// 同一）と `sparse`（値 `usize::MAX`。マスクがあれば必ず
+/// `VisitedKind::Sparse`（`engine::hnsw` 内 private 型）を選ぶ）の 2 arm
+/// のみを扱う——中間値は「可視候補数が閾値未満のときだけ sparse」という
+/// production の条件分岐を計測時に再現できず、非 vacuous 検証
+/// （`last_visited_kind_is_sparse` が常に arm と一致するか）を単純化できない
+/// ため扱わない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmLabel {
+    /// `sparse_visited_max = 0`。常に dense（`VisitedKind::Dense`）。
+    Dense,
+    /// `sparse_visited_max = usize::MAX`。マスクがあれば常に
+    /// sparse（`VisitedKind::Sparse`）。
+    Sparse,
+}
+
+impl ArmLabel {
+    /// 対応する `sparse_visited_max` の値。
+    pub fn sparse_visited_max(self) -> usize {
+        match self {
+            ArmLabel::Dense => 0,
+            ArmLabel::Sparse => usize::MAX,
+        }
+    }
+
+    /// 出力・ログ用のトークン。
+    pub fn token(self) -> &'static str {
+        match self {
+            ArmLabel::Dense => "dense",
+            ArmLabel::Sparse => "sparse",
+        }
+    }
+}
+
+/// `BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX` の生文字列を読み、
+/// `engine::hnsw::HnswIndex::search_masked_with` へ渡す `sparse_visited_max`
+/// を解決する（Issue #498）。他の時間依存ベンチ入力（`parse_rows` 等）と
+/// 異なり **fail-closed**（未設定は `Ok(None)`＝knob 無効・既存
+/// `search_masked` 経路を不変に保つが、設定されていて不正な値・
+/// `mask == MaskSpec::None` との併用は `Err`）——不正値を黙って既定 0 へ
+/// 倒すと `after == before` の vacuous な計測になり、層 1 の判定規則
+/// （`docs/design/hnsw-search.md`「Issue #498」節）を満たせなくなるため。
+///
+pub fn parse_sparse_visited_max(
+    raw: Option<&str>,
+    mask: MaskSpec,
+) -> Result<Option<usize>, HnswSearchLatencyError> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let value = raw
+        .parse::<usize>()
+        .map_err(|_| HnswSearchLatencyError::InvalidSparseVisitedMax)?;
+    if matches!(mask, MaskSpec::None) {
+        return Err(HnswSearchLatencyError::SparseVisitedMaxRequiresMask);
+    }
+    Ok(Some(value))
+}
+
+/// visited 実装の観測結果 1 行分の出力整形（Issue #498）。`arm` は
+/// `--features bench-internals` でのみ埋まる観測値（`Option<bool>` の
+/// `last_visited_kind_is_sparse`。feature 無効時は常に `None` のまま計測が
+/// 走るため、この行自体を出力しない——呼び出し元は feature 有効時のみ
+/// 呼ぶ契約）。`visible_count` は `mask.count_ones()`（可視候補数。閾値との
+/// 比較は絶対値であり比率ではないため、可視率だけでなく本フィールドを
+/// 併記する）。
+pub fn render_visited_kind_line(
+    arm: ArmLabel,
+    sparse_visited_max: usize,
+    visible_count: usize,
+    observed_sparse_calls: usize,
+    observed_dense_calls: usize,
+    unresolved_calls: usize,
+) -> String {
+    format!(
+        "hnsw_search_bench: arm={} sparse_visited_max={sparse_visited_max} \
+         visible_count={visible_count} observed_sparse_calls={observed_sparse_calls} \
+         observed_dense_calls={observed_dense_calls} unresolved_calls={unresolved_calls}",
+        arm.token(),
+    )
 }

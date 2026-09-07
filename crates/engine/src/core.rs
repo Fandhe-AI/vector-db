@@ -2451,6 +2451,18 @@ impl EngineCore {
                         storage: &self.storage,
                         cache: &self.visible_bitmap_cache,
                     }),
+                    // Issue #475: 索引対応述語のみの `WHERE` 付き集計・
+                    // `GROUP BY` を `ScalarIndex` の候補削減・キー列挙経路へ
+                    // 結線する（詳細は `sql::aggregate`／`sql::group_by` の
+                    // モジュールドキュメント参照）。
+                    Some(crate::sql::arena_cache::ArenaCacheAccess {
+                        storage: &self.storage,
+                        cache: &self.sql_arena_cache,
+                    }),
+                    Some(crate::sql::scalar_index::ScalarCacheAccess {
+                        storage: &self.storage,
+                        cache: &self.scalar_index_cache,
+                    }),
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -2651,6 +2663,11 @@ impl EngineCore {
                 let explain_engine = crate::sql::explain::ExplainEngine {
                     kind: self.search_engine_kind(),
                     ann_plan,
+                    // Issue #474: `pre_check_bindable` が構文段のみから確定
+                    // させた静的判定（LLM I/O・世代照合の影響を受けない。
+                    // 上記コメント「戻り値…このまま使い回してよい」と同じ
+                    // 理由）。
+                    scalar_plan: pre_check_shape.scalar_plan,
                 };
                 let result = crate::sql::explain::build_explain_result(&planned, &explain_engine);
                 Ok(crate::sql::SqlOutcome::Explain(result))

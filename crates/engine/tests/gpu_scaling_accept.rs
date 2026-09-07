@@ -10,9 +10,12 @@
 mod harness;
 
 use harness::gpu_scaling::{
-    count_boundary_tolerant_mismatches, format_skip_line, format_unavailable_line,
-    full_readback_bytes_estimate, parse_batches, parse_dims, parse_measured_iterations, parse_rows,
-    parse_top_k, readback_bytes_per_call, speedup_ratio, GpuScalingResult, GpuScalingStatsLine,
+    count_boundary_tolerant_mismatches, format_i8_unavailable_line, format_skip_line,
+    format_unavailable_line, full_readback_bytes_estimate, mean_recall_at_k, parse_batches,
+    parse_dims, parse_i8_oversample, parse_measured_iterations, parse_query_f16_exact, parse_rows,
+    parse_shader_ab, parse_top_k, readback_bytes_per_call, rescored_candidates_per_call,
+    round_to_f16_exact, speedup_ratio, GpuScalingI8Result, GpuScalingI8StatsLine, GpuScalingResult,
+    GpuScalingStatsLine,
 };
 use std::time::Duration;
 
@@ -332,6 +335,8 @@ fn gpu_scaling_stats_line_display_contains_all_required_fields() {
         f16_partial_topk_dispatches: 40,
         f16_full_readback_dispatches: 0,
         f16_full_readback_fallbacks: 0,
+        f16_arith_dispatches: 40,
+        f16_arith_guard_fallbacks: 0,
         f32_readback_bytes_total: 2_048,
         f32_readback_bytes_per_call: 51,
         f32_partial_topk_dispatches: 40,
@@ -351,6 +356,8 @@ fn gpu_scaling_stats_line_display_contains_all_required_fields() {
         "f16_partial_topk_dispatches=40",
         "f16_full_readback_dispatches=0",
         "f16_full_readback_fallbacks=0",
+        "f16_arith_dispatches=40",
+        "f16_arith_guard_fallbacks=0",
         "f32_readback_bytes_total=2048",
         "f32_readback_bytes_per_call=51",
         "f32_partial_topk_dispatches=40",
@@ -381,6 +388,8 @@ fn gpu_scaling_stats_line_prefix_does_not_collide_with_result_line_grep() {
         f16_partial_topk_dispatches: 0,
         f16_full_readback_dispatches: 0,
         f16_full_readback_fallbacks: 0,
+        f16_arith_dispatches: 0,
+        f16_arith_guard_fallbacks: 0,
         f32_readback_bytes_total: 0,
         f32_readback_bytes_per_call: 0,
         f32_partial_topk_dispatches: 0,
@@ -389,4 +398,163 @@ fn gpu_scaling_stats_line_prefix_does_not_collide_with_result_line_grep() {
     };
     let rendered = line.to_string();
     assert!(!rendered.starts_with("gpu_scaling: rows="));
+}
+
+// ---------------------------------------------------------------------
+// i8 経路（Issue #543）: parse_i8_oversample / GpuScalingI8Result /
+// GpuScalingI8StatsLine / mean_recall_at_k / rescored_candidates_per_call
+// ---------------------------------------------------------------------
+
+#[test]
+fn parse_i8_oversample_defaults_when_unset_or_empty() {
+    assert_eq!(parse_i8_oversample(None, 4, 32), Ok(4));
+    assert_eq!(parse_i8_oversample(Some(""), 4, 32), Ok(4));
+    assert_eq!(parse_i8_oversample(Some("  "), 4, 32), Ok(4));
+}
+
+#[test]
+fn parse_i8_oversample_accepts_boundary_values() {
+    assert_eq!(parse_i8_oversample(Some("1"), 4, 32), Ok(1));
+    assert_eq!(parse_i8_oversample(Some("32"), 4, 32), Ok(32));
+}
+
+#[test]
+fn parse_i8_oversample_rejects_zero_out_of_range_and_non_numeric_fail_closed() {
+    for raw in ["0", "33", "abc", "-1", "4.5"] {
+        assert!(
+            parse_i8_oversample(Some(raw), 4, 32).is_err(),
+            "expected {raw:?} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn mean_recall_at_k_rejects_empty_and_averages_correctly() {
+    assert!(mean_recall_at_k(&[]).is_err());
+    let mean = mean_recall_at_k(&[1.0, 0.5, 0.75]).expect("non-empty input should succeed");
+    assert!((mean - 0.75).abs() < 1e-12);
+}
+
+#[test]
+fn rescored_candidates_per_call_rejects_zero_calls_fail_closed() {
+    assert!(rescored_candidates_per_call(100, 0).is_err());
+    assert_eq!(rescored_candidates_per_call(100, 10), Ok(10));
+}
+
+#[test]
+fn gpu_scaling_i8_result_line_has_expected_prefix_and_fields() {
+    let result = GpuScalingI8Result {
+        rows: 20_000,
+        dim: 128,
+        batch: 8,
+        k: 10,
+        oversample: 4,
+        gpu_i8_p50: Duration::from_micros(100),
+        gpu_i8_p95: Duration::from_micros(150),
+        per_query_gpu_i8_p50: Duration::from_micros(12),
+        speedup_i8_vs_cpu_p95: 2.5,
+        speedup_i8_vs_f16_p95: 1.1,
+        i8_mismatch: 0,
+        i8_recall_at_k: 0.9750,
+    };
+    let rendered = result.to_string();
+    assert!(rendered.starts_with("gpu_scaling_i8: rows=20000 dim=128 batch=8 k=10 oversample=4"));
+    assert!(rendered.contains("i8_recall_at_k=0.9750"));
+    assert!(rendered.contains("i8_mismatch=0"));
+    // 既存の結果行 grep（`^gpu_scaling: rows=`）に誤マッチしないこと。
+    assert!(!rendered.starts_with("gpu_scaling: rows="));
+}
+
+#[test]
+fn format_i8_unavailable_line_has_expected_prefix() {
+    let line = format_i8_unavailable_line(20_000, 128, 8, 10, 4, "gpu i8 backend init failed");
+    assert!(line.starts_with(
+        "gpu_scaling_i8: not measurable rows=20000 dim=128 batch=8 k=10 oversample=4"
+    ));
+    assert!(line.contains("gpu i8 backend init failed"));
+}
+
+// ---------------------------------------------------------------------
+// Issue #540: f16 厳密往復クエリ opt-in（`BENCH_GPU_SCALING_QUERY_F16_EXACT`）
+// ---------------------------------------------------------------------
+
+#[test]
+fn parse_query_f16_exact_defaults_to_false() {
+    assert_eq!(parse_query_f16_exact(None), Ok(false));
+    assert_eq!(parse_query_f16_exact(Some("")), Ok(false));
+}
+
+#[test]
+fn parse_query_f16_exact_accepts_only_literal_one() {
+    assert_eq!(parse_query_f16_exact(Some("1")), Ok(true));
+}
+
+#[test]
+fn parse_query_f16_exact_rejects_other_values_fail_closed() {
+    assert!(parse_query_f16_exact(Some("true")).is_err());
+    assert!(parse_query_f16_exact(Some("0")).is_err());
+    assert!(parse_query_f16_exact(Some("yes")).is_err());
+}
+
+// ---------------------------------------------------------------------
+// Issue #540 追記（codex-review P2 指摘対応・PR #611）: 同一クエリでの
+// シェーダ単体比較 opt-in（`BENCH_GPU_SCALING_SHADER_AB`）
+// ---------------------------------------------------------------------
+
+#[test]
+fn parse_shader_ab_defaults_to_false() {
+    assert_eq!(parse_shader_ab(None), Ok(false));
+    assert_eq!(parse_shader_ab(Some("")), Ok(false));
+}
+
+#[test]
+fn parse_shader_ab_accepts_only_literal_one() {
+    assert_eq!(parse_shader_ab(Some("1")), Ok(true));
+}
+
+#[test]
+fn parse_shader_ab_rejects_other_values_fail_closed() {
+    assert!(parse_shader_ab(Some("true")).is_err());
+    assert!(parse_shader_ab(Some("0")).is_err());
+    assert!(parse_shader_ab(Some("yes")).is_err());
+}
+
+#[test]
+fn round_to_f16_exact_is_idempotent() {
+    // 一度丸めた値は再度丸めても不変であること（f16 表現できる値の固定点）。
+    let samples = [0.0f32, 1.0, -1.0, 0.5, 123.25, -7.0, 1e-3, 1e4];
+    for &v in &samples {
+        let once = round_to_f16_exact(v);
+        let twice = round_to_f16_exact(once);
+        assert_eq!(once, twice, "not a fixed point for input {v}");
+    }
+}
+
+#[test]
+fn round_to_f16_exact_zero_stays_zero() {
+    assert_eq!(round_to_f16_exact(0.0), 0.0);
+    assert_eq!(round_to_f16_exact(-0.0), -0.0);
+}
+
+#[test]
+fn gpu_scaling_i8_stats_line_prefix_does_not_collide_with_other_line_greps() {
+    let line = GpuScalingI8StatsLine {
+        rows: 1,
+        dim: 1,
+        batch: 1,
+        k: 1,
+        oversample: 4,
+        calls: 1,
+        readback_bytes_total: 0,
+        readback_bytes_per_call: 0,
+        rescored_candidates_total: 0,
+        rescored_candidates_per_call: 0,
+        backend: "Vulkan".to_string(),
+        dot4_impl: "Undetermined".to_string(),
+        build_ms: 5,
+    };
+    let rendered = line.to_string();
+    assert!(rendered.starts_with("gpu_scaling_i8_stats: rows="));
+    assert!(!rendered.starts_with("gpu_scaling: rows="));
+    assert!(!rendered.starts_with("gpu_scaling_i8: rows="));
 }

@@ -166,7 +166,7 @@ Top-k を取りこぼしうる）。したがって量子化が適用できる�
 | ---- | ---- | ---- | -------------- | ---------- |
 | カーディナリティ推定 → plain scan／ANN 切替 | qdrant `full_scan_threshold` | 統計＋サンプリング推定で確定できない曖昧域を扱う | 既採用（`full_scan_ratio` 既定 1/10・Issue #409）。本リポは RLS 事前フィルタで正確な可視カーディナリティが既知のため qdrant 型のサンプリング推定は不要 | Apache-2.0 |
 | 探索時グラフ内マスク | qdrant `FilteredScorer` | 不適合ノードをスコア対象から除外 | 既採用（`NodeMask`／`search_masked`・Issue #409） | Apache-2.0 |
-| ACORN-1（2-hop 展開） | qdrant `search_on_level_acorn` | 1-hop 不適合ノードのみ 2-hop まで展開。低選択性フィルタでのみ有効化 | 条件付き採用（§9-#3b）。`hnsw_subset` 経路が既定比 37〜45% 悪化する実測（Issue #413）の改善策。前提: 「不適合な 1-hop ノードのリンクだけを辿りベクトルは読まない」設計であることの確認と、PR #431 の P0 契約との整合再検証 | Apache-2.0 |
+| ACORN-1（2-hop 展開） | qdrant `search_on_level_acorn` | 1-hop 不適合ノードのみ 2-hop まで展開。低選択性フィルタでのみ有効化 | 条件付き採用（§9-#3b）。`hnsw_subset` 経路が既定比 37〜45% 悪化する実測（Issue #413）の改善策。#500 で契約整理済み（条件付き成立。ベクトル非参照〔I1・P0〕は維持したまま、リンク非参照〔I2〕のみゲート下で緩和する設計。`docs/design/hnsw-rls-cardinality-switch.md`「Issue #500」節）→ 実装 #501・実測 #502 | Apache-2.0 |
 | 破棄候補ヒープ保持型 iterative scan | pgvector `hnswscan.c` | 破棄候補を pairing heap に保持し以後バッチ単位で再開する（ef 倍増による再実行ではない） | 条件付き採用（§9-#3c）。本リポの hybrid 密側再取得ループ（Issue #410）は `dense_fetch_k` 倍増で再実行するためラウンドごとに同じ候補を再評価しており、pgvector 型の継続方式は計算重複を避けられる | PostgreSQL License |
 | ビルド時のフィルタ専用追加サブグラフ | qdrant `hnsw/build.rs`（`payload_m`/`payload_m0`） | カーディナリティの大きい payload ブロック専用サブグラフをマージ | 不採用（当面）。本リポの索引は「ctx 可視アリーナのみから構築」という per-テナント前提であり、複数テナント/条件を跨ぐグローバル索引最適化とは前提が異なる | Apache-2.0 |
 | `IDSelector` による中間フィルタ | faiss `HNSW.cpp::search_from_candidates_fixVT` | 距離計算は先に行い `is_member` 判定は結果ヒープ追加の可否のみに使う | 不採用（P0 違反）。不適合ノードにも距離計算＝ベクトルアクセスが発生し、PR #431 の「非可視ノードのベクトルへ一切触れない」契約に反する | MIT |
@@ -245,15 +245,15 @@ Qdrant HNSW に劣後する:
 | 1 | Top-k 確定後の遅延スカラーデコード | 最大。k 非依存の約 9〜10ms 固定コストを除去。`bulk_knn_k200/k1000`・投影列を伴う全 SELECT に効く。集計経路には既に同型の `DecodeTier`（Issue #350）が実装済み | 中 | 不要 | 不要 | 既起票 #453 |
 | 2 | スカラー列二次索引 | 大。`vector_knn_where` 4.6x・`where_compound_count` 4.1x の主因である `WHERE` の O(N) 全行走査を除去 | 大 | 不要 | 不要 | 既起票 #359（Proposed）→ #471 |
 | 3a | `hnsw_subset` 退行の原因切り分けと `full_scan_ratio` 再調整 | 大。ANN opt-in 時に SCALAR 事前フィルタ付き DISTANCE が 37〜45% 悪化する既知の退行（Issue #413）。#413 は「フィルタの選択性が主要因・行数規模は副次的」と結論しており、切替閾値がずれている可能性がある。定数の再調整が最も安価な仮説で ACORN より先に検証すべき | 小 | 不要 | 不要 | 既起票 #486 |
-| 3b | ACORN-1（2-hop 展開）の導入 | 中。3a で閾値調整では解けないと判明した場合の本命 | 大 | 不要 | 不要 | 既起票 #499 |
+| 3b | ACORN-1（2-hop 展開）の導入 | 中。3a で閾値調整では解けないと判明した場合の本命 | 大 | 不要 | 不要 | 契約整理・ゲート条件設計は #500 で実施済み（条件付き成立）。実装 #501・実測 #502 |
 | 3c | hybrid 密側再取得の破棄候補ヒープ保持化（pgvector 型） | 中。3a/3b とは別経路。SCALAR 事前フィルタ付き DISTANCE 経路には再取得ループ自体が存在しない（Issue #410: `masked_short` は構造的に到達不能）ためこの施策は `hnsw_subset` 退行には効かない | 中 | 不要 | 不要 | 既起票 #503 |
 | 4 | `repair_reachability` の並列化 | 中（実測根拠あり）。HNSW 構築の 8→12 スレッド頭打ちの主因（12 スレッド時に total の 39.4% を占める単一スレッド後始末段。usearch に対し 1.24〜1.26x 遅い唯一の敗因。探索は既に usearch より速い：65.5µs vs 76.5µs） | 中 | 不要 | 不要 | 既起票 #446 ツリー（#447〜#450。並列化本体は #449） |
 | 5 | HNSW 隣接リストの CSR 化 | 中（実測根拠なし・構造推論）。`Vec<Vec<u32>>` のノード×レベル分のヒープ確保・間接参照を単一 `Vec<u32>`+offsets へ | 中 | 不要 | 不要 | 既起票 #492 |
 | 6 | BM25 アキュムレータを可視集合サイズで確保 | 小（N と可視率に依存）。`score_by_postings` の `vec![0.0; N]` を実作業量 O(可視ヒット数) に合わせる。RLS で可視集合が小さいテナントほど効く。スコアはビット一致のまま | 小 | 不要 | 不要 | #546 で実装（索引寿命内の再利用バッファ方式。実測は #547） |
 | 7 | `search_layer` への prefetch 導入 | 中。hnswlib 型ソフトウェアパイプライン。真の prefetch 命令は `#[target_feature]` fn の内側限定（通常の fn からは E0133）で発行不可なため、新規 `unsafe` ゼロの制約下では `core::hint::black_box` によるタッチ方式で実装（#490） | 小〜中 | 不要 | 不要 | #490 で実装済み。#491 で 8 規模点（10k／100k・dim 128／768・マスク有無）の前後比較を実測し、8 点中 7 点は悪化方向への一貫したシグナルは無いが、1 点（10k×dim128・可視率50%）で両ノイズ帯を超える一貫した悪化が観測され、静的解析／実アセンブリの裏付けが無いため撤回条件は完全には満たさず保留（production 無変更・専有実機再実測をオーナーへ申し送り）。詳細は [`docs/design/hnsw-search.md`](hnsw-search.md)「Issue #491」節参照 |
 | 8 | f16 常駐＋f32 再スコア（ANN opt-in 経路限定） | 中。移動バイト半減。新規 `unsafe` ゼロ。候補集合が変わるため既定 brute-force 経路には適用不可 | 中 | 不要 | 不要 | 既起票 #513 |
-| 9 | visited のサイズ閾値切替（密ビットマップ ↔ `HashSet`） | 小〜中。可視カーディナリティが索引ノード数に対し極小のとき全ノード分の確保・走査を回避 | 小 | 不要 | 不要 | 既起票 #496 |
-| 10 | dim>=768 での多アキュムレータディスパッチ | 小〜中（dim=128 の現行ベンチでは効果ゼロ）。[`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md) の arena 表で ACC=4 が dim768/1536 のみ改善。dim=768 のベンチ点追加が前提 | 小 | 不要 | 不要 | 既検討・不採用 #365 の条件付き再訪（#517） |
+| 9 | visited のサイズ閾値切替（密ビットマップ ↔ `HashSet`） | 小〜中。可視カーディナリティが索引ノード数に対し極小のとき全ノード分の確保・走査を回避 | 小 | 不要 | 不要 | #497 で機構（`VisitedSparse`・`search_masked_with`・`sparse_visited_max` opt-in）を実装済み。#498 で可視比率別 dense/sparse 前後比較を実測（rows 10k〜100k・可視率 2〜50%）した結果、全測定点で sparse が dense を上回る速度改善は観測されず、閾値既定値は `0`（常に dense）のまま暫定維持（改善の根拠不足。`benchmark-judgement-policy.md` §5 が求める確定 Rejected の証拠要件は満たさない）。詳細は [`docs/design/hnsw-search.md`](hnsw-search.md)「Issue #498」節参照 |
+| 10 | dim>=768 での多アキュムレータディスパッチ | 小〜中（dim=128 の現行ベンチでは効果ゼロ）。[`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md) の arena 表で ACC=4 が dim768/1536 のみ改善。dim=768 のベンチ点追加が前提 | 小 | 不要 | 不要 | 既検討・不採用 #365 の条件付き再訪。#518 で dim 閾値ディスパッチとして実装済み・閾値確定は #519 |
 
 内訳切り分け・dim=768 規模点追加・生成コード検査ガード・macOS 検出検証・計測規約
 は #463／#466／#467／#468／#462 として起票済み。`hybrid_rrf` 最新基線の再計測は
@@ -269,11 +269,11 @@ dispatch／GPU 側 Top-k／SHADER_F16／`dot4I8Packed`）は #531／#534／#538�
 
 | Issue／PR | 施策 | 記録先 | 再訪条件 |
 | --------- | ---- | ------ | -------- |
-| #365 | dot カーネルの行内複数アキュムレータ（ACC=2／4） | [`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md) | dim>=768 限定ディスパッチ・dim=768 規模点追加後（#517・#466） |
+| #365 | dot カーネルの行内複数アキュムレータ（ACC=2／4） | [`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md) | dim>=768 限定ディスパッチとして #518 で実装済み（#517・#466 が前提）。閾値確定・チップ別実測は #519 |
 | #366 | 距離計算と Top-k の 2 段分離バッチ化 | [`docs/design/knn-two-stage-topk.md`](knn-two-stage-topk.md) | 専有環境での再実測（#462 規約）で run-to-run 変動を上回る差が出た場合のみ |
 | #391 | fieldnorm 256 段ロッシー量子化 | [`docs/design/hybrid-rrf-latency-breakdown.md`](hybrid-rrf-latency-breakdown.md)「Issue #391」節 | ビット一致契約自体の改訂（spec 側判断）なしには再訪しない |
 | #400 | redb `insert_reserve` ゼロコピー | [`docs/design/redb-insert-reserve-zero-copy.md`](redb-insert-reserve-zero-copy.md) | redb 側の内部実装変更が確認された場合 |
-| #410 Phase B | 再開型スキャン（DISTANCE 経路の ef 倍増ループ） | [`docs/design/hnsw-hybrid-iterative-scan.md`](hnsw-hybrid-iterative-scan.md) | `masked_short` が到達可能になる設計変更時（pgvector 型の継続方式は #503 で hybrid 密側の別経路として扱う） |
+| #410 Phase B | 再開型スキャン（DISTANCE 経路の ef 倍増ループ） | [`docs/design/hnsw-hybrid-iterative-scan.md`](hnsw-hybrid-iterative-scan.md) | `masked_short` が到達可能になる設計変更時（pgvector 型の継続方式は #503 で hybrid 密側の別経路として扱う。hybrid 密側は #504 で状態保持・決定性・停止性契約を設計済み〔`hnsw-hybrid-iterative-scan.md`「Phase B 再検討（Issue #504）」節〕。実装は #505） |
 | PR #451 → PR #452 | 対照エンジン `hnsw_rs`（`=0.3.4`）の追加 | [`docs/design/hnsw-parallel-build.md`](hnsw-parallel-build.md)「hnsw_rs を加えた 3 エンジン比較」節 | 対照は usearch で足りるとのオーナー判断（2026-09-05）。再追加はオーナー承認が前提 |
 
 ## 11. 順位から外した候補と理由／未カバーのギャップ／計測カバレッジ
@@ -290,7 +290,8 @@ dispatch／GPU 側 Top-k／SHADER_F16／`dot4I8Packed`）は #531／#534／#538�
 - hnswlib 型 level0 インターリーブ／qdrant 型リンク圧縮: 永続化前提のレイアウト。
   本リポの HNSW は永続化未実装のため時期尚早
 - faiss `IDSelector` 型の中間フィルタ: 不適合ノードにも距離計算が走り、PR #431
-  の P0 契約に反するため採用不可
+  の P0 契約に反するため採用不可（この契約〔ベクトル非参照〕は #500 の ACORN-1
+  契約整理でも不変条件 I1 として維持）
 - BLAS(sgemm) バッチ経路: BLAS 依存の追加が必要で依存最小方針と衝突
 
 top-10 でカバーできていないギャップ:
@@ -336,4 +337,5 @@ top-10 でカバーできていないギャップ:
 - [`docs/design/scalar-secondary-index.md`](scalar-secondary-index.md)
   （スカラー列二次索引 ADR）
 - [`docs/design/hnsw-rls-cardinality-switch.md`](hnsw-rls-cardinality-switch.md)
-  （HNSW×RLS 統合・PR #431 の P0 契約の所在）
+  （HNSW×RLS 統合・PR #431 の P0 契約の所在。ACORN-1 導入時の契約整理は
+  「Issue #500」節参照）

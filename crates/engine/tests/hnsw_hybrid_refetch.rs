@@ -72,8 +72,15 @@ fn seed_corpus(storage: &Storage, tenant: &str, corpus: &harness::hybrid_latency
 /// （`⌈log2(dense_cap / (2·pool_depth))⌉ + 1`。既定 `pool_depth=200` なら小規模
 /// コーパスで高々 8）以内に収まること、(b) 同一クエリを複数回実行して結果が
 /// 完全一致（決定性）することを固定する。
-#[test]
-fn tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic() {
+///
+/// [`tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic`]／
+/// [`f16_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic`]
+/// が共有する本体（Issue #515。F16 常駐でも候補生成が f16→f32 昇格 dot に
+/// 変わるだけで、停止性・ビット同一の決定性契約——本テストの核心——は
+/// 不変であることを固定する）。
+fn run_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic(
+    precision: engine::hnsw::ResidentPrecision,
+) {
     const DIM: usize = 16;
     const NUM_DOCS: usize = 4_000;
     const VOCAB: usize = 64;
@@ -90,8 +97,10 @@ fn tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic() {
         .create_table(&hybrid_schema(DIM as u32))
         .expect("create table");
     seed_corpus(&storage, "tenant-a", &corpus);
-    let kind =
-        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let validated = engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
+        .expect("valid hnsw params")
+        .with_resident_precision(precision);
+    let kind = search_engine::SearchEngineKind::Hnsw(validated);
     let core = EngineCore::from_storage_with_engine(storage, kind);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
@@ -141,5 +150,27 @@ fn tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic() {
         stats.hybrid_rounds_max <= 8,
         "hybrid dense refetch loop must terminate within a bounded number of rounds (got {})",
         stats.hybrid_rounds_max
+    );
+    if precision == engine::hnsw::ResidentPrecision::F16 {
+        assert_eq!(
+            stats.f16_residency_fallbacks, 0,
+            "this corpus's embeddings must stay within the f16 finite range"
+        );
+    }
+}
+
+#[test]
+fn tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic() {
+    run_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic(
+        engine::hnsw::ResidentPrecision::F32,
+    );
+}
+
+/// Issue #515: F16 常駐でも同点誘発コーパスでの停止性・決定性契約は不変で
+/// あることを固定する。
+#[test]
+fn f16_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic() {
+    run_tie_inducing_corpus_hybrid_search_terminates_and_is_deterministic(
+        engine::hnsw::ResidentPrecision::F16,
     );
 }

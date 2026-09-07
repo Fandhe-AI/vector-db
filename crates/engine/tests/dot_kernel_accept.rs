@@ -11,9 +11,11 @@
 mod harness;
 
 use harness::dot_kernel::{
-    check_matches_scalar_reference, classify_change, generate_corpus, generate_query, ns_per_dot,
-    refuse_under_github_actions, render_line, rows_for, speedup_ratio, ChangeClass, DotKernelError,
-    WorkingSet, ARENA_SCALE_ROWS, MAX_CORPUS_ROWS_GUARD,
+    check_bit_identical, check_matches_scalar_reference, classify_change, generate_corpus,
+    generate_query, min_of_samples, ns_per_dot, parse_tail_ab_env, refuse_under_github_actions,
+    relative_band, render_line, render_tail_ab_line, render_tail_ab_reference_line, rows_for,
+    speedup_ratio, ChangeClass, DotKernelError, TailAbMode, WorkingSet, ARENA_SCALE_ROWS,
+    MAX_CORPUS_ROWS_GUARD, MAX_DIM_GUARD, TAIL_AB_DIMS,
 };
 use std::time::Duration;
 
@@ -205,4 +207,158 @@ fn check_matches_scalar_reference_rejects_beyond_tolerance() {
 fn check_matches_scalar_reference_rejects_non_finite() {
     let err = check_matches_scalar_reference(f32::NAN, 1.0, 1.0).unwrap_err();
     assert_eq!(err, DotKernelError::NonFiniteResult);
+}
+
+// --- Issue #529: tail A/B ---
+
+#[test]
+fn tail_ab_dims_are_within_dim_guard() {
+    for &dim in &TAIL_AB_DIMS {
+        assert!(dim >= 1);
+        assert!(dim <= MAX_DIM_GUARD);
+    }
+}
+
+#[test]
+fn tail_ab_dims_match_plan_selection() {
+    // dim 選定の意味（端数長の異なる境界）: 100（中程度）・129（最小端数）・
+    // 768（端数ゼロ・定数上乗せコストの測定点）。この 3 点は
+    // `docs/design/dot-kernel-branchless-tail.md`「#529 への申し送り」節の
+    // 指定と一致していなければならない。
+    assert_eq!(TAIL_AB_DIMS, [100, 129, 768]);
+}
+
+#[test]
+fn parse_tail_ab_env_unset_is_off() {
+    assert_eq!(parse_tail_ab_env(None).unwrap(), TailAbMode::Off);
+}
+
+#[test]
+fn parse_tail_ab_env_zero_is_off() {
+    assert_eq!(parse_tail_ab_env(Some("0")).unwrap(), TailAbMode::Off);
+}
+
+#[test]
+fn parse_tail_ab_env_one_is_on() {
+    assert_eq!(parse_tail_ab_env(Some("1")).unwrap(), TailAbMode::On);
+}
+
+#[test]
+fn parse_tail_ab_env_rejects_empty_string() {
+    let err = parse_tail_ab_env(Some("")).unwrap_err();
+    assert!(matches!(err, DotKernelError::InvalidEnv { .. }));
+}
+
+#[test]
+fn parse_tail_ab_env_rejects_unrecognized_values() {
+    for bogus in ["true", "ON", "yes", "2", " 1", "1 "] {
+        let err = parse_tail_ab_env(Some(bogus)).unwrap_err();
+        assert!(
+            matches!(err, DotKernelError::InvalidEnv { .. }),
+            "expected InvalidEnv for {bogus:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn min_of_samples_returns_the_minimum() {
+    let samples = [
+        Duration::from_micros(30),
+        Duration::from_micros(10),
+        Duration::from_micros(20),
+    ];
+    assert_eq!(min_of_samples(&samples).unwrap(), Duration::from_micros(10));
+}
+
+#[test]
+fn min_of_samples_rejects_empty_input() {
+    let err = min_of_samples(&[]).unwrap_err();
+    assert_eq!(err, DotKernelError::EmptySamples);
+}
+
+#[test]
+fn relative_band_computes_example_from_policy_doc() {
+    // `docs/design/benchmark-judgement-policy.md` §4 の例（1000〜1050 →
+    // reference_band = 5.0%）と同じ値で検証する。
+    let band = relative_band(&[1000.0, 1020.0, 1050.0]).unwrap();
+    assert!((band - 0.05).abs() < 1e-9, "expected 0.05, got {band}");
+}
+
+#[test]
+fn relative_band_rejects_empty_input() {
+    let err = relative_band(&[]).unwrap_err();
+    assert_eq!(err, DotKernelError::EmptySamples);
+}
+
+#[test]
+fn relative_band_rejects_non_finite_values() {
+    let err = relative_band(&[1.0, f64::NAN, 2.0]).unwrap_err();
+    assert_eq!(err, DotKernelError::NonFiniteOrNonPositiveBand);
+
+    let err = relative_band(&[1.0, f64::INFINITY]).unwrap_err();
+    assert_eq!(err, DotKernelError::NonFiniteOrNonPositiveBand);
+}
+
+#[test]
+fn relative_band_rejects_non_positive_minimum() {
+    let err = relative_band(&[0.0, 5.0]).unwrap_err();
+    assert_eq!(err, DotKernelError::NonFiniteOrNonPositiveBand);
+
+    let err = relative_band(&[-1.0, 5.0]).unwrap_err();
+    assert_eq!(err, DotKernelError::NonFiniteOrNonPositiveBand);
+}
+
+#[test]
+fn check_bit_identical_accepts_equal_bits() {
+    assert!(check_bit_identical(768, 0, 1.5, 1.5).is_ok());
+    // 符号付きゼロは値としては等しいがビットパターンが異なるため、
+    // `to_bits()` 一致契約では区別されるべき（順序保存契約のビット同一性は
+    // 値の等価性ではなくビットパターンの一致を要求する）。
+    assert!(check_bit_identical(768, 0, 0.0, -0.0).is_err());
+}
+
+#[test]
+fn check_bit_identical_rejects_differing_bits() {
+    let err = check_bit_identical(129, 3, 1.0, 1.0000001).unwrap_err();
+    assert!(matches!(
+        err,
+        DotKernelError::BitMismatch {
+            dim: 129,
+            row: 3,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn render_tail_ab_line_uses_distinct_prefix_from_current_label() {
+    let line = render_tail_ab_line(
+        "scalar_tail",
+        129,
+        25_000,
+        Duration::from_micros(10),
+        Duration::from_micros(12),
+        1.0,
+        1.0,
+        ChangeClass::Neutral,
+    );
+    assert!(line.starts_with("dot_kernel: tail_ab "));
+    // `chip.rs::parse_dot_kernel_line` は `dot_kernel: label=current ` prefix
+    // のみを拾う。tail A/B 行がこの prefix と衝突しないことを固定する。
+    assert!(!line.contains("label=current"));
+    assert!(line.contains("label=scalar_tail"));
+    assert!(line.contains("dim=129"));
+}
+
+#[test]
+fn render_tail_ab_reference_line_uses_distinct_prefix() {
+    let line = render_tail_ab_reference_line(
+        768,
+        25_000,
+        Duration::from_micros(5),
+        Duration::from_micros(6),
+    );
+    assert!(line.starts_with("dot_kernel: tail_ab_ref "));
+    assert!(!line.contains("label=current"));
+    assert!(line.contains("dim=768"));
 }

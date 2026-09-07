@@ -774,6 +774,110 @@ fn text_min_max_accumulator_shrink_direction_is_subtracted_from_budget() {
     assert_eq!(result.rows.len(), GROUPS as usize);
 }
 
+// PR #603 codex-review P1 指摘対応: `WHERE` なしの `GROUP BY`（索引経由の
+// キー順列挙形。Issue #475）は、全走査（`user_rows/{table}` の物理行順）と
+// 処理順序が異なるため、`MIN(<TEXT 列>)` の縮小方向更新を含む TEXT 集計の
+// 一時的な累計バイト数がキー順・物理行順で異なりうる。全走査なら
+// `MAX_TEXT_ACCUMULATOR_TOTAL_BYTES`（16 MiB）以内に収まるのに、キー順の
+// 一時的な累計だけがこれを超過するよう仕組む——索引選択によってクエリの
+// 成否が変わってはならないため（AGENTS.md「公開 API・エラー契約の互換性」）、
+// 索引経路がこの超過を検出したら全走査へフォールバックし、クエリは成功
+// しなければならない。
+//
+// 物理行順（`id` 昇順）: グループ "z" に 3 MiB の大きい値→1 byte の小さい値
+// （辞書順で縮小）を先に投入し、続けてグループ "a"/"b"/"c"/"d" に単一行
+// 3.5 MiB を投入する。物理行順での一時的な最大値は
+// max(3 MiB, 1 + 3.5 MiB*4) ≈ 14.00 MiB（予算内）。
+// キー順（辞書順 "a" < "b" < "c" < "d" < "z"）では "a"〜"d" の 3.5 MiB×4
+// （14.00 MiB）を先に積んだ後、グループ "z" の縮小前の 3 MiB を加算する
+// 一時的な最大値が 14.00 MiB + 3 MiB ≈ 17.00 MiB（予算超過）になる。
+#[test]
+fn text_min_max_index_path_key_order_transient_overflow_falls_back_to_plain_scan() {
+    let path = unique_db_path("group-by-text-accumulator-index-order");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let schema = TableSchema::new(
+        "textindexorder",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(1), false),
+            ColumnDef::new("k", ColumnType::Text, false),
+            ColumnDef::new("v", ColumnType::Text, false),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let op = |n: u64| {
+        engine::recovery::required_op_id::OperationId::parse(&format!("op-{n}")).expect("valid op")
+    };
+    let insert = |id: u64, k: &str, v: String| {
+        engine::tenant::insert_typed_row(
+            &storage,
+            "textindexorder",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0f32]),
+                Value::Text(k.to_string()),
+                Value::Text(v),
+            ],
+            &op(id),
+        )
+        .expect("insert row");
+    };
+
+    const LARGE_LEN: usize = 3 * 1024 * 1024;
+    const PAYLOAD_LEN: usize = 3670016; // 3.5 MiB
+
+    // グループ "z": id=0 が辞書順で大きい 3 MiB 値、id=1 が辞書順で小さい
+    // 1 byte 値（MIN が縮小方向へ更新される）。物理行順ではこの縮小が
+    // グループ "a"〜"d" の投入より前に完了する。
+    insert(0, "z", "c".repeat(LARGE_LEN));
+    insert(1, "z", "a".to_string());
+    // グループ "a"〜"d": 各 1 行・3.5 MiB（縮小なし、単調増加）。
+    for (offset, k) in ["a", "b", "c", "d"].iter().enumerate() {
+        insert(2 + offset as u64, k, "y".repeat(PAYLOAD_LEN));
+    }
+
+    let core = new_core(storage);
+    let fallbacks_before = core
+        .scalar_index_cache_stats()
+        .aggregate_plain_scan_fallbacks;
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT k, MIN(v) FROM textindexorder GROUP BY k ORDER BY k",
+        )
+        .expect(
+            "a key-order-only transient TEXT budget overflow must fall back to a plain scan \
+             instead of failing the query (index selection must not change success/failure)",
+        );
+    let fallbacks_after = core
+        .scalar_index_cache_stats()
+        .aggregate_plain_scan_fallbacks;
+    assert!(
+        fallbacks_after > fallbacks_before,
+        "the index path must have detected the transient overflow and fallen back to a plain scan"
+    );
+
+    assert_eq!(result.rows.len(), 5, "expected 5 groups: a, b, c, d, z");
+    let mut got: BTreeMap<String, String> = BTreeMap::new();
+    for row in &result.rows {
+        let k = as_text(&row.cells[0]).expect("group key must be present");
+        let min_v = as_text(&row.cells[1]).expect("MIN(v) must be present");
+        got.insert(k, min_v);
+    }
+    assert_eq!(got.get("a").map(String::len), Some(PAYLOAD_LEN));
+    assert_eq!(got.get("b").map(String::len), Some(PAYLOAD_LEN));
+    assert_eq!(got.get("c").map(String::len), Some(PAYLOAD_LEN));
+    assert_eq!(got.get("d").map(String::len), Some(PAYLOAD_LEN));
+    assert_eq!(
+        got.get("z"),
+        Some(&"a".to_string()),
+        "MIN(v) for group z must have shrunk to the lexicographically smaller short value"
+    );
+}
+
 // `ORDER BY <GROUP BY 列> DESC` でも `NULL` グループは常に末尾（PR #230
 // codex-review P1 指摘対応: 以前は非 `NULL` 側との大小関係を含む `Ordering`
 // 全体を `.reverse()` していたため、`DESC` 指定時に `NULL` グループが先頭へ来て

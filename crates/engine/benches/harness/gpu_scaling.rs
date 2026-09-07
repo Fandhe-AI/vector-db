@@ -3,9 +3,12 @@
 //! 規模・バッチサイズごとに実測するための、時間非依存な純関数群。
 //!
 //! 本モジュールが提供するのは「env 変数からの計測条件パース」「出力行の整形」
-//! 「Top-k 結果の同点許容つき不一致検知」のみで、いずれも `engine`・GPU デバイス
-//! そのものには依存しない（`tests/gpu_scaling_accept.rs` から GPU 非依存で
-//! 単体検証できる。`bench_engine.rs`・`recall_engine.rs` と同じ切り分け方針）。
+//! 「Top-k 結果の同点許容つき不一致検知」に加え（Issue #540）
+//! `engine::batch_search::pack_f16x2`/`unpack_f16x2`（純粋な host 側 f16
+//! 変換関数。GPU デバイスは経由しない）を借りた [`round_to_f16_exact`] のみで、
+//! いずれも GPU デバイスそのものには依存しない（`tests/gpu_scaling_accept.rs`
+//! から GPU 非依存で単体検証できる。`bench_engine.rs`・`recall_engine.rs` と
+//! 同じ切り分け方針）。
 //! GPU バックエンドの構築・計測ループ本体は `benches/gpu_scaling_bench.rs`
 //! （手動専用・`harness = false`）が担う。
 //!
@@ -16,6 +19,8 @@
 
 use std::fmt;
 use std::time::Duration;
+
+use engine::batch_search::{pack_f16x2, unpack_f16x2};
 
 /// 計測条件パース・出力整形いずれかの失敗を表す fail-closed なエラー型。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +182,64 @@ pub fn parse_measured_iterations(raw: Option<&str>, default: u32) -> Result<u32,
             Ok(value)
         }
     }
+}
+
+/// `BENCH_GPU_SCALING_QUERY_F16_EXACT`（Issue #540。PR #591・Issue #539 の
+/// f16 算術版 S0 シェーダ〔`GpuDotShaderKind::F16Arith`〕は
+/// `select_dot_shader` の条件 5（クエリ成分が f16 へ厳密往復できない場合は
+/// 縮退）により、本ベンチの既定クエリ生成〔`DeterministicRng::next_vector`。
+/// 任意精度 f32〕をそのまま使うと常に unpack 版へ縮退し、before/after を
+/// そのまま比較しても unpack 同士の比較にしかならない。この opt-in を有効化
+/// すると [`round_to_f16_exact`] でクエリ成分を f16 厳密往復可能な値へ丸め、
+/// f16 算術版シェーダが実際に選ばれる条件を満たす。未設定・空文字列は無効
+/// （既定挙動を変えない）。`1` のみ有効値として受理し、それ以外は fail-closed
+/// で拒否する（本ベンチ固有の安全弁。他の bool 系 env と同じ厳格パース方針）。
+pub fn parse_query_f16_exact(raw: Option<&str>) -> Result<bool, GpuScalingError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(err(format!(
+            "BENCH_GPU_SCALING_QUERY_F16_EXACT must be unset or \"1\" (got {other:?})"
+        ))),
+    }
+}
+
+/// `BENCH_GPU_SCALING_SHADER_AB`（Issue #540・codex-review P2 指摘対応
+/// 〔PR #611〕）: 既存の [`parse_query_f16_exact`] opt-in は before/after で
+/// クエリ集合そのものを変える（未丸め＝unpack 版縮退／丸め済み＝f16 算術版
+/// 選択）ため、"unpack 版 vs f16 算術版" の比較が「シェーダの違い」と
+/// 「クエリの違い」の 2 要因を同時に動かす交絡を含んでいた
+/// （`docs/design/gpu-batch-f16-arith.md` §8.3 参照）。本 opt-in を有効化すると
+/// `gpu_scaling_bench.rs`（`bench-internals` feature 必須）が同一の f16 厳密
+/// 往復済みクエリに対し `GpuBatchBackend::batch_search_with_options_for_tests`
+/// （[`engine::gpu_batch::GpuSearchTestOptions::dot_shader`]）で S0 シェーダ選択を
+/// `Unpack`／`F16Arith` へ交互に強制し、クエリを固定したままシェーダ単体の
+/// 効果を計測する（`gpu_scaling_shader_ab:` 行）。[`parse_query_f16_exact`] の
+/// opt-in と同時に有効化する契約（`gpu_scaling_bench.rs` 側が fail-closed に
+/// 強制する。クエリが f16 厳密往復可能でなければ `F16Arith` 強制は
+/// `select_dot_shader` の条件 5 で必ず拒否されるため）。未設定・空文字列は無効。
+pub fn parse_shader_ab(raw: Option<&str>) -> Result<bool, GpuScalingError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(err(format!(
+            "BENCH_GPU_SCALING_SHADER_AB must be unset or \"1\" (got {other:?})"
+        ))),
+    }
+}
+
+/// クエリ成分 1 個を f16 へ厳密往復可能な値へ丸める（[`parse_query_f16_exact`]
+/// の opt-in が有効なときのみ [`gpu_scaling_bench`] から呼ばれる）。
+/// `engine::batch_search::pack_f16x2`/`unpack_f16x2`
+/// （`crates/engine/src/f16.rs` 実装への薄いラッパ。round-to-nearest-even）で
+/// 実際に f16 へ往復させてから返すため、`gpu_batch.rs::f16_round_trip_exact`
+/// の判定基準と丸め結果が完全に一致する（`tests/gpu_batch.rs::
+/// next_f32_f16_round_trippable` と同じ手法）。`f32::NAN`/`f32::INFINITY` は
+/// クエリ生成（`DeterministicRng::next_vector`）が返さない値域のため、
+/// 呼び出し元はそれらを渡さない契約とする。
+pub fn round_to_f16_exact(v: f32) -> f32 {
+    let (rounded, _) = unpack_f16x2(pack_f16x2(v, v));
+    rounded
 }
 
 /// 1 つの (rows, dim, batch) 構成に対する実測結果（出力整形の入力）。
@@ -385,6 +448,14 @@ pub struct GpuScalingStatsLine {
     pub f16_partial_topk_dispatches: u64,
     pub f16_full_readback_dispatches: u64,
     pub f16_full_readback_fallbacks: u64,
+    /// `SHADER_F16` 対応アダプタで f16 算術版 S0 シェーダへ実際に dispatch
+    /// された回数（Issue #539・`gpu_batch::GpuBatchStatsSnapshot::
+    /// f16_arith_dispatches`）。f32 対照経路（`GpuF32ContrastBackend`）は
+    /// Issue #539 の対象外のため常に 0。
+    pub f16_arith_dispatches: u64,
+    /// f16 算術版パイプラインは使えたがオーバーフローガード不成立により
+    /// unpack 版へ縮退した回数（Issue #539・`f16_arith_guard_fallbacks`）。
+    pub f16_arith_guard_fallbacks: u64,
     pub f32_readback_bytes_total: u64,
     pub f32_readback_bytes_per_call: u64,
     pub f32_partial_topk_dispatches: u64,
@@ -399,7 +470,8 @@ impl fmt::Display for GpuScalingStatsLine {
             "gpu_scaling_stats: rows={} dim={} batch={} k={} calls={} \
              f16_readback_bytes_total={} f16_readback_bytes_per_call={} \
              f16_partial_topk_dispatches={} f16_full_readback_dispatches={} \
-             f16_full_readback_fallbacks={} f32_readback_bytes_total={} \
+             f16_full_readback_fallbacks={} f16_arith_dispatches={} \
+             f16_arith_guard_fallbacks={} f32_readback_bytes_total={} \
              f32_readback_bytes_per_call={} f32_partial_topk_dispatches={} \
              f32_full_readback_dispatches={} f32_full_readback_fallbacks={}",
             self.rows,
@@ -412,11 +484,187 @@ impl fmt::Display for GpuScalingStatsLine {
             self.f16_partial_topk_dispatches,
             self.f16_full_readback_dispatches,
             self.f16_full_readback_fallbacks,
+            self.f16_arith_dispatches,
+            self.f16_arith_guard_fallbacks,
             self.f32_readback_bytes_total,
             self.f32_readback_bytes_per_call,
             self.f32_partial_topk_dispatches,
             self.f32_full_readback_dispatches,
             self.f32_full_readback_fallbacks,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------
+// GPU i8 パック常駐経路（`engine::gpu_batch::packed_i8::GpuI8BatchBackend`。
+// Issue #542）の前後比較・Recall 影響の記録（Issue #543）。既存
+// `gpu_scaling:`/`gpu_scaling_stats:` 行は 1 文字も変更せず、i8 経路は
+// 独立した接頭辞（`gpu_scaling_i8:`/`gpu_scaling_i8_stats:`）の追加行として
+// 出力する（`scripts/bench_gpu_scaling_ab.sh` の既存 grep・before バイナリとの
+// 出力互換を壊さないため）。
+// ---------------------------------------------------------------------
+
+/// `BENCH_GPU_SCALING_I8_OVERSAMPLE`（単一値。i8 常駐バックエンドは
+/// `GpuI8Options::oversample` を構築時に固定するため 1 プロセス内でスイープ
+/// できない——`docs/design/gpu-batch-i8-packed.md`「D9」節参照）を解決する。
+/// 未設定・空文字列は `default`。範囲外・非数値は fail-closed で起動を拒否する
+/// （`max` は呼び出し元が `packed_i8::MAX_I8_OVERSAMPLE` を渡す。本モジュールは
+/// `engine::gpu_batch` の feature 状態に依存させないため定数を直接参照しない）。
+pub fn parse_i8_oversample(
+    raw: Option<&str>,
+    default: usize,
+    max: usize,
+) -> Result<usize, GpuScalingError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(default),
+        Some(s) => {
+            let value: usize = s.parse().map_err(|_| {
+                err(format!(
+                    "BENCH_GPU_SCALING_I8_OVERSAMPLE must be a positive integer (got {s:?})"
+                ))
+            })?;
+            if value == 0 || value > max {
+                return Err(err(format!(
+                    "BENCH_GPU_SCALING_I8_OVERSAMPLE must be in range 1..={max} (got {value})"
+                )));
+            }
+            Ok(value)
+        }
+    }
+}
+
+/// クエリごとの Recall@k（[`crate::harness::accept::recall_at_k`] 相当の値）の
+/// 平均を求める。空列は「1 クエリも計測できていない」計測条件の誤りを表すため
+/// 拒否する（NaN を出力へ混入させない fail-closed）。
+pub fn mean_recall_at_k(per_query: &[f64]) -> Result<f64, GpuScalingError> {
+    if per_query.is_empty() {
+        return Err(err("mean_recall_at_k: per_query must not be empty"));
+    }
+    let sum: f64 = per_query.iter().sum();
+    Ok(sum / per_query.len() as f64)
+}
+
+/// `total` を `calls` で割った、1 回の `batch_search` 呼び出しあたりの
+/// 再スコア候補件数を返す（[`readback_bytes_per_call`] と同型。`calls == 0` は
+/// 無音の 0 除算にせず拒否する）。
+pub fn rescored_candidates_per_call(total: u64, calls: u64) -> Result<u64, GpuScalingError> {
+    if calls == 0 {
+        return Err(err("rescored_candidates_per_call: calls must be > 0"));
+    }
+    Ok(total / calls)
+}
+
+/// 1 規模点分の i8 経路実測結果。既存 [`GpuScalingResult`] とは独立の型で、
+/// `gpu_scaling_i8:` 接頭辞の行を出力する。
+#[derive(Debug, Clone, Copy)]
+pub struct GpuScalingI8Result {
+    pub rows: usize,
+    pub dim: usize,
+    pub batch: usize,
+    pub k: usize,
+    pub oversample: usize,
+    pub gpu_i8_p50: Duration,
+    pub gpu_i8_p95: Duration,
+    /// 1 クエリあたりの GPU i8 経路の中央値所要時間（`gpu_i8_p50 / batch`）。
+    pub per_query_gpu_i8_p50: Duration,
+    /// CPU-SIMD（A）対照との p95 短縮率。
+    pub speedup_i8_vs_cpu_p95: f64,
+    /// GPU f16 常駐（B）対照との p95 短縮率。
+    pub speedup_i8_vs_f16_p95: f64,
+    /// A（CPU-SIMD 厳密対照）に対する i8 経路の同点許容つき不一致件数
+    /// （全クエリ分合計）。
+    pub i8_mismatch: usize,
+    /// A を正解集合としたクエリごとの Recall@k の平均
+    /// （[`mean_recall_at_k`]。量子化・候補生成のみの i8 経路がどの程度
+    /// 正解集合を再現できているかを示す確定的指標）。
+    pub i8_recall_at_k: f64,
+}
+
+impl fmt::Display for GpuScalingI8Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "gpu_scaling_i8: rows={} dim={} batch={} k={} oversample={} \
+             gpu_i8_p50={}us gpu_i8_p95={}us per_query_gpu_i8_p50={}us \
+             speedup_i8_vs_cpu_p95={:.2}x speedup_i8_vs_f16_p95={:.2}x \
+             i8_mismatch={} i8_recall_at_k={:.4}",
+            self.rows,
+            self.dim,
+            self.batch,
+            self.k,
+            self.oversample,
+            self.gpu_i8_p50.as_micros(),
+            self.gpu_i8_p95.as_micros(),
+            self.per_query_gpu_i8_p50.as_micros(),
+            self.speedup_i8_vs_cpu_p95,
+            self.speedup_i8_vs_f16_p95,
+            self.i8_mismatch,
+            self.i8_recall_at_k,
+        )
+    }
+}
+
+/// i8 バックエンドが利用不能（`try_new`／`batch_search` 失敗等）だった規模点の
+/// 情報行。既存 3 経路（`gpu_scaling:`/`gpu_scaling_stats:`）の結果は失わず、
+/// この行を追加で出力するだけに留める（呼び出し元の契約）。
+pub fn format_i8_unavailable_line(
+    rows: usize,
+    dim: usize,
+    batch: usize,
+    k: usize,
+    oversample: usize,
+    reason: &str,
+) -> String {
+    format!(
+        "gpu_scaling_i8: not measurable rows={rows} dim={dim} batch={batch} k={k} \
+         oversample={oversample} reason=\"{reason}\""
+    )
+}
+
+/// 1 規模点分の i8 経路の読み戻し・再スコア統計行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuScalingI8StatsLine {
+    pub rows: usize,
+    pub dim: usize,
+    pub batch: usize,
+    pub k: usize,
+    pub oversample: usize,
+    pub calls: u64,
+    pub readback_bytes_total: u64,
+    pub readback_bytes_per_call: u64,
+    pub rescored_candidates_total: u64,
+    pub rescored_candidates_per_call: u64,
+    /// `GpuI8Meta::backend`（`wgpu::Backend`）の `Debug` 整形。
+    pub backend: String,
+    /// `GpuI8Meta::dot4_impl`（`Dot4I8Impl`）の `Debug` 整形。wgpu 30.0.1 の
+    /// 公開 API では native/polyfill を判別できず、常に `Undetermined` になる
+    /// （`packed_i8.rs::Dot4I8Impl` ドキュメンテーションコメント参照）。
+    pub dot4_impl: String,
+    /// `GpuI8BatchBackend::try_new` の所要時間（計測区間外で 1 回測った参考値）。
+    pub build_ms: u128,
+}
+
+impl fmt::Display for GpuScalingI8StatsLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "gpu_scaling_i8_stats: rows={} dim={} batch={} k={} oversample={} calls={} \
+             readback_bytes_total={} readback_bytes_per_call={} \
+             rescored_candidates_total={} rescored_candidates_per_call={} \
+             backend={} dot4_impl={} build_ms={}",
+            self.rows,
+            self.dim,
+            self.batch,
+            self.k,
+            self.oversample,
+            self.calls,
+            self.readback_bytes_total,
+            self.readback_bytes_per_call,
+            self.rescored_candidates_total,
+            self.rescored_candidates_per_call,
+            self.backend,
+            self.dot4_impl,
+            self.build_ms,
         )
     }
 }

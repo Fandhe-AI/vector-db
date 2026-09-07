@@ -260,11 +260,30 @@ psql の `SELECT COUNT(*)` は 45 ms → 約 3.7 ms。
 （CPU-SIMD f16 常駐・12 スレッド）を同一コーパス・同一クエリで比較する。
 `mismatch` は GPU と CPU の Top-k 結果の不一致数（全点 0）。
 
-**（2026-09-06 追記・Issue #532）** dispatch 構造を「1 dispatch = 1 クエリ」
-から「`PolicyContext` 単位にグループ化したクエリを最大 `GPU_QUERY_TILE_MAX`
-本まで 1 dispatch へタイル化」する方式へ変更した（`gpu_batch.rs::
-DOT_SHADER_WGSL`）。以下の実測表は変更前の数値のまま。変更後の前後比較・
-数値更新は依存先 Issue #533 で実施予定。
+**旧実測表（変更前・2026-09-05 以前）**。dispatch 構造が「1 dispatch = 1
+クエリ」だった時点の数値。Issue #532（PR #567）でタイル化方式へ変更したため
+下記は履歴として残す（batch≥64 で GPU f16 が CPU-SIMD と同等〜逆転していた
+参照点）。
+
+**（2026-09-07 追記・Issue #540）** f16 算術版 S0 シェーダ（Issue #539。
+`SHADER_F16` 対応アダプタで読み出し直後に f32 へ拡張して積和する経路）の
+前後比較を実施した。クエリが f16 へ厳密往復可能な場合のみシェーダが
+切り替わる契約（`select_dot_shader`）のため、opt-in `BENCH_GPU_SCALING_
+QUERY_F16_EXACT=1` でクエリを丸めない限り本表が選択する S0 シェーダは
+unpack 版のままで不変（`AdaptiveShaderSelector::resolve` は呼び出しごとに
+f16 算術版ガードを評価してから縮退するため、性能への影響がないとは断定
+しない）。CORE-16 ゲート・規模点診断のクエリ生成も同じ理由で選択される
+シェーダが構造的に不変（f16 算術版を経由しない）。詳細・実測値は
+`gpu-batch-f16-arith.md`「8. 前後比較実測（Issue #540）」節・
+`core16-f16-resident-gate.md`「Issue #540 追記」節参照。
+
+**（2026-09-07 追記・Issue #543）** opt-in 専用の i8 パック常駐経路
+（`engine::gpu_batch::packed_i8::GpuI8BatchBackend`。Issue #542。候補生成
+のみ・primary 未接続）の前後比較・Recall 影響を実測した。Recall@10 の
+劣化は観測されなかった一方、クエリタイル化未実装（1 dispatch = 1 クエリの
+まま）が原因と分析される速度低下（既存 f16 常駐経路比で最大 19.4x 遅い）
+を確認した。詳細・実測表は `gpu-batch-i8-packed.md`「前後比較実測
+（Issue #543）」節参照。
 
 | rows | dim | batch | CPU-SIMD | GPU f16 | GPU f32 | per-query CPU | per-query GPU f16 | speedup f16 (p95) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -299,6 +318,154 @@ DOT_SHADER_WGSL`）。以下の実測表は変更前の数値のまま。変更�
   クエリあたりコストが規模ごとにほぼ一定（20k で約 180 µs、500k×128 で約 6.6 ms）で
   バッチ化の効果が出ていない。
 - f16 常駐は f32 常駐より一貫して速い（500k×256 batch 8 で 76 ms vs 253 ms）。
+
+### #532 クエリタイル化の前後比較（Issue #533）
+
+Issue #532（PR #567・merge commit `59bc7a8`）はバッチ検索 GPU 経路の dispatch
+構造を「1 dispatch = 1 クエリ」から「`PolicyContext` 単位にグループ化した
+クエリを最大 `GPU_QUERY_TILE_MAX`（実装既定値 16）本まで 1 dispatch へタイル化」
+する方式へ変更した。本節は `docs/design/benchmark-judgement-policy.md` の
+計測規約（交互 N≥5 ペア・per-run 生データ必須・min-of-N＋median 併記・
+固定 ±5% と参照区間実測の 2 種ノイズ帯）に沿って計測した記録である。
+初回計測（2026-09-05 前後）は本節の per-run 生データが `.gitignore` 対象
+（`_/`）にしか出力されず復元不能だったため codex-review P1 指摘（PR #580・
+スレッド `PRRT_kwDOUAKASM6fwR6p`）を受け、`scripts/bench_gpu_scaling_ab.sh`
+冒頭コメントの運用注記（tracked 保存先への複製）に従って**再計測した**。
+本節は再計測値（`docs/design/bench-data/gpu-scaling-ab/20260907T082358Z-summary.tsv`）
+で置き換えたものであり、初回計測の集約値は削除する（per-run 生データを
+伴わない集約値は規約 §3 を満たさず再現できないため）。
+
+**前提**:
+
+- before: `b161d5b`（#567 マージの親）／after: `59bc7a8`（#567 マージコミット）。
+  `git diff --stat b161d5b 59bc7a8` の変更は `gpu_batch.rs`・
+  `tests/gpu_batch.rs`・docs・`CLAUDE.md` のみで、`Cargo.lock`・
+  `benches/gpu_scaling_bench.rs`・`benches/harness/*`・`batch_search.rs` は
+  不変（同一ハーネス・同一ビルド条件での前後比較が成立する）
+- 現 `origin/main` は使わない。Issue #536（workgroup 内部分 Top-k）が #567 の
+  後に入っており、readback 方式が交絡するため（#536 後の再計測・readback
+  バイト数比較は Issue #537 の担当）
+- 1 run = 1 プロセス = 1 (rows, dim, batch) 規模点（規約 §6「複数規模点の
+  同一プロセス内逐次比較は不可」に従う）。per-run 値は `gpu_scaling_bench` が
+  1 プロセスあたり出す 20 反復（warmup 20 別）の p50／p95
+- 参照区間 A = CPU-SIMD 経路（`gpu_batch.rs` を一切通らず #532 の変更を含まない。
+  before/after 双方の CPU-SIMD p50 を同一母集団として実測ノイズ帯を算出。
+  規模点ごとに before n=5／after n=5 の計 n=10）
+- 環境: 本開発環境（QEMU Virtual CPU・12 vCPU・avx2/fma/f16c・NVIDIA GeForce
+  RTX 3060・driver 595.71.05・Vulkan backend）。計測全体（5 規模点 × 5 ペア ×
+  before/after）を通した各 run 開始時点の loadavg（1 分平均。下記 tracked TSV
+  の `loadavg_1m` 列の全 50 run 分布）は 1.57〜8.79（他セッションの同時実行を
+  含む共有環境）で `BENCH_DEDICATED_ENV` は未設定 → **参考値・採否根拠に
+  しない**（規約 §5）。#532 は Issue #402 系 ADR の対象外の独立変更であり、
+  本計測は「効果の記録」であって production コードの採否判定ではない
+  （#532 は既にマージ済み）
+- rows 3 種 × dim 2 種 × batch 4 種の既定格子 24 点のうち時間予算内で計測できた
+  5 点（FAISS 対照点 100,000×128×64 を優先し、batch=1/8/64 の代表点・大規模点を
+  選定）を実測。残りは「未計測」（旧値のまま埋めない）
+- **per-run 生データ**: `docs/design/bench-data/gpu-scaling-ab/20260907T082358Z-summary.tsv`
+  （tracked。50 行＝5 規模点 × 5 ペア × before/after）。各行に
+  `cpu_p50`/`cpu_p95`/`f16_p50`/`f16_p95`/`f32_p50`/`f32_p95`/`mismatch` に加え、
+  規約 §3「環境記録」・§7.1 チェックリストが求める各 run 時点の `loadavg`（1/5/15分
+  平均）を `loadavg_1m`/`loadavg_5m`/`loadavg_15m` 列として保持する（codex-review
+  P1 指摘・PR #580・スレッド `PRRT_kwDOUAKASM6f1tz8` で追加。当初は summary の
+  数値列のみを tracked 化しコメントで「規約が求めるのは summary の保持のみ」と
+  誤って記載していたが、規約は各 run の loadavg も要求するため訂正した）。
+  値は `_/bench/gpu-scaling-ab/<point>/<pair>-<side>.log` の
+  `# pre-run environment snapshot` 直後の `loadavg:` 行（run 開始直前に採取した
+  1 回分のスナップショット）から抽出したもの。生ログ全文（`loadavg` の 5 番目の
+  フィールド以降・GPU クロック/温度・`gpu_scaling_bench` 出力全文）は
+  `_/bench/gpu-scaling-ab/`（git 管理外）にのみ存在し tracked 化しない（規約が
+  求めるのは summary への集約値・loadavg の保持であり、生ログ全文の保持までは
+  求めない。詳細は下記「per-run 生データの所在」節参照）
+
+**実測記録表（f16 常駐。単位 µs、N=5 ペア）**
+
+| rows | dim | batch | CPU-A 参照帯 (%) | f16_p95 before (min/med) | f16_p95 after (min/med) | ratio (min-of-N) | ratio (median) | 判定クラス | per-query after (µs) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 20,000 | 128 | 8 | 2.40 | 1461 / 1517 | 678 / 789 | 0.464 | 0.520 | Improved | 84.8 |
+| 20,000 | 128 | 64 | 3.43 | 11722 / 15082 | 5861 / 8664 | 0.500 | 0.574 | Improved | 91.6 |
+| 100,000 | 128 | 1 | 6.64 | 1385 / 1410 | 1415 / 1452 | 1.022 | 1.030 | Neutral | 1415.0 |
+| 100,000 | 128 | 64 | 2.55 | 82273 / 82778 | 30070 / 32144 | 0.365 | 0.388 | Improved | 469.8 |
+| 500,000 | 128 | 64 | 8.01 | 437659 / 444921 | 137537 / 145789 | 0.314 | 0.328 | Improved | 2149.0 |
+
+- **表の集計対象フィールド**: `f16_p95 before/after (min/med)` 列は
+  `summary.tsv` の `f16_p95`（各 run の p95 レイテンシ）を N=5 ペアの
+  母集団として min（最小値）・median（中央値）を取ったもの。`CPU-A 参照帯` は
+  同一母集団（before n=5 + after n=5 = n=10）の `cpu_p50` から
+  `(max - min) / min` で算出した実測ノイズ帯（規約 §4 の相対比率表記）。
+  `判定クラス` は固定 ±5% 帯・実測ノイズ帯（CPU-A 参照帯）の両方を
+  `ratio (min-of-N)` が超えた場合のみ `Improved`/`Regressed`、いずれかに
+  収まる場合は `Neutral` とする（規約 §4）。`per-query after (µs)` は
+  `f16_p95 after` 列の min 値を `batch` 数で除した値（例: 100,000×128×64 は
+  30070 ÷ 64 ≈ 469.8）で、p95 レイテンシ由来の値をバッチ内 1 クエリあたりに
+  換算した参考値であり、per-query 自体の実測ではない
+- **全 5 点が規約 §3 の per-run 生データ保持要件を満たす**（初回計測との違い。
+  20,000×128×8 も再計測では CPU-A 参照帯が 2.40% と安定し、初回計測で発生した
+  外れ値混入（375%）は再現しなかった）
+- **batch=1（100,000×128×1）は意図どおり中立**: ratio (min-of-N) ≈ 1.022 で
+  固定 ±5% 帯・実測ノイズ帯（6.64%）のいずれも超えない。これは #532 の設計
+  （`PolicyContext` 単位にまとめた複数クエリの償却）が単発クエリには効かない
+  サニティ確認であり、退行ではない
+- **batch≥8（20k・100k・500k の 4 点）は両ノイズ帯を超える改善方向の差分**:
+  ratio (min-of-N) 0.314〜0.500（変更前 GPU f16 に対して 2.0〜3.2 倍高速。
+  CPU-SIMD との比較は別掲の「speedup vs CPU-SIMD」を参照）。旧実測表
+  （batch≥64 で 0.94〜0.99x＝ほぼ同着）とは異なる方向の値であり、#532 が
+  狙った「常駐行列の行データ読み込みをタイル幅ぶんのクエリで償却する」効果を
+  示す（本環境は共有 QEMU 環境のため規約 §5 により production 変更の採用
+  根拠にはできないが、#532 は既にマージ済みのため本節は効果の記録目的に限る）
+- **speedup vs CPU-SIMD（after, 中央値ベース）**: 20,000×128×64 で 1.96x、
+  100,000×128×64 で 2.61x、500,000×128×64 で 2.85x（after 側 CPU-SIMD p95 の
+  中央値 ÷ f16 p95 の中央値）
+- **mismatch**: 100,000×128×64／500,000×128×64／100,000×128×1 は全 run
+  mismatch=0。20,000×128×8／20,000×128×64 は before/after とも一貫して
+  mismatch=1（#532 と無関係な既存の同点許容境界の挙動と考えられ、後続 Issue の
+  対象外）
+- **未計測点**: rows∈{20000,100000,500000}×dim∈{128,256}×batch∈{1,8,64,256}
+  の残り 19 点（dim=256 全点・batch=256 全点・20,000×128×1・500,000×128×8 等）
+  は時間予算の都合で未計測。旧実測表の対応値をそのまま代用しない
+- **per-run 生データの所在**: `docs/design/bench-data/gpu-scaling-ab/20260907T082358Z-summary.tsv`
+  （tracked。上表の集約値・各 run の `loadavg_1m`/`loadavg_5m`/`loadavg_15m` の
+  一次記録）。以後の再計測でも同じ命名規則（`<UTC timestamp>-summary.tsv`）で
+  `docs/design/bench-data/gpu-scaling-ab/` へコミットし、本ドキュメントの
+  実測表からそのパスを参照する運用を継続する（スクリプト側の対応する注記は
+  `scripts/bench_gpu_scaling_ab.sh` 冒頭コメント参照）。初回計測（per-run
+  生データ不明・集約値のみ）の記録は本節から削除した（codex-review P1 指摘・
+  PR #580 の再計測により置き換え）
+
+**再現手順**:
+
+```sh
+# before/after のバイナリを退避（それぞれ独立の CARGO_TARGET_DIR で release ビルド）
+git archive b161d5b | tar -x -C /path/to/wt-before
+git archive 59bc7a8 | tar -x -C /path/to/wt-after
+(cd /path/to/wt-before && CARGO_TARGET_DIR=/path/to/target-before \
+  cargo bench --bench gpu_scaling_bench -p engine --no-run)
+(cd /path/to/wt-after && CARGO_TARGET_DIR=/path/to/target-after \
+  cargo bench --bench gpu_scaling_bench -p engine --no-run)
+# 交互 N=5 ペア・1 プロセス 1 規模点で実行
+BEFORE_BIN=/path/to/target-before/release/deps/gpu_scaling_bench-<hash> \
+AFTER_BIN=/path/to/target-after/release/deps/gpu_scaling_bench-<hash> \
+  scripts/bench_gpu_scaling_ab.sh 5 100000:128:64 20000:128:8 20000:128:64 \
+    100000:128:1 500000:128:64
+```
+
+`scripts/bench_gpu_scaling_ab.sh` は規模点ごとに before→after を交互実行し、
+per-run 生ログ（`loadavg`・GPU クロック・`gpu_scaling_bench` の出力全文）を
+`_/bench/gpu-scaling-ab/<timestamp>/` 配下に保存する薄いシェルドライバ
+（引数は数値・パスの正規表現検証のみで `eval` 不使用。production コード
+無変更）。
+
+**FAISS GPU との差の更新**: 100,000×128×64 の self GPU f16 after 実測値
+min=30,070µs／median=32,144µs は、下表「FAISS（IndexFlatIP）CPU vs GPU」の
+同一点（GPU f32 753µs・出典コミット `559b523`）と比べると約 40〜43 倍。
+Issue #460（Phase 5 親）本文が引用していた「self GPU f16 80,756µs（旧実測表）→
+FAISS 753µs で約 107 倍」から、#532 の効果でこの倍率は約 1/2.7 に縮小した
+（それでも FAISS が大きく優位。残る差は #534〜#537 の readback 量削減・
+部分 Top-k の担当）。
+
+**申し送り**: 現 `origin/main`（#536 部分 Top-k 込み）での再計測・readback
+バイト数比較は Issue #537、Phase 5 通し比較（FAISS GPU 対照・Qdrant GPU 構築
+含む）は Issue #544、残り 19 規模点の計測は必要になった時点で別途起票する。
 
 ### FAISS（IndexFlatIP）CPU vs GPU
 

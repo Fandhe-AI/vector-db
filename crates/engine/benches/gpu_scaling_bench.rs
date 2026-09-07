@@ -35,29 +35,54 @@
 //! 出力しない）。個々の (rows, dim, batch) 点が測定量上限（`MAX_BATCH_WORK`・
 //! `MAX_BATCH_ROWS`）を超える、またはメモリ確保に失敗する場合はその点だけを
 //! `skip`/`not measurable` として飛ばし、他の点の計測は継続する。
+//!
+//! # 経路 D: GPU i8 パック常駐（Issue #543・親 #541）
+//!
+//! 上記 A/B/C の後段で、opt-in 専用の `engine::gpu_batch::packed_i8::
+//! GpuI8BatchBackend`（Issue #542。候補生成のみ・最終スコアは f32 再計算）を
+//! 追加で計測し、`gpu_scaling_i8:`/`gpu_scaling_i8_stats:` 行として出力する。
+//! 既存 A/B/C の分岐・出力順序は一切変更しない（`gpu_scaling:`/
+//! `gpu_scaling_stats:` 行は 1 文字も変えない）——i8 経路の構築・計測に失敗
+//! しても、その規模点の A/B/C の結果は失われない。
+//!
+//! i8 バックエンドは `GpuI8Options::oversample` を構築時に固定するため
+//! （`docs/design/gpu-batch-i8-packed.md`「D9」節）、プロセス内スイープは行わず
+//! `BENCH_GPU_SCALING_I8_OVERSAMPLE`（単一値・既定
+//! `packed_i8::DEFAULT_I8_OVERSAMPLE`）で 1 プロセス = 1 oversample を計測する。
+//! oversample のスイープは `scripts/bench_gpu_scaling_ab.sh` 側でプロセスを
+//! 複数回起動して行う。
 
 #[allow(dead_code)]
 mod harness;
 
-use harness::accept::p95_from_samples;
+use harness::accept::{p95_from_samples, recall_at_k};
 use harness::env_report::EnvReport;
 use harness::gpu_scaling::{
-    count_boundary_tolerant_mismatches, format_skip_line, format_unavailable_line, parse_batches,
-    parse_dims, parse_measured_iterations, parse_rows, parse_top_k, read_env_var,
-    readback_bytes_per_call, speedup_ratio, GpuScalingResult, GpuScalingStatsLine,
+    count_boundary_tolerant_mismatches, format_i8_unavailable_line, format_skip_line,
+    format_unavailable_line, mean_recall_at_k, parse_batches, parse_dims, parse_i8_oversample,
+    parse_measured_iterations, parse_query_f16_exact, parse_rows, parse_shader_ab, parse_top_k,
+    read_env_var, readback_bytes_per_call, rescored_candidates_per_call, round_to_f16_exact,
+    speedup_ratio, GpuScalingI8Result, GpuScalingI8StatsLine, GpuScalingResult,
+    GpuScalingStatsLine,
 };
 use harness::protocol::{run_fallible, MeasurementConfig, TrialFailure};
 use harness::rng::DeterministicRng;
 
-use engine::batch_fallback::BatchBackend;
+use engine::batch_fallback::{BatchBackend, BatchExecError};
 use engine::batch_search::{
-    BatchEngine, BatchQuery, ResidentMatrix, MAX_BATCH_QUERIES, MAX_BATCH_ROWS,
+    BatchEngine, BatchHit, BatchQuery, ResidentMatrix, MAX_BATCH_QUERIES, MAX_BATCH_ROWS,
     MAX_BATCH_TOTAL_BYTES, MAX_BATCH_WORK,
 };
+use engine::gpu_batch::packed_i8::{
+    GpuI8BatchBackend, GpuI8Options, DEFAULT_I8_OVERSAMPLE, MAX_I8_OVERSAMPLE,
+};
 use engine::gpu_batch::{GpuBatchBackend, GpuF32ContrastBackend};
+#[cfg(feature = "bench-internals")]
+use engine::gpu_batch::{GpuDotShaderKind, GpuSearchTestOptions};
 use engine::kernel::SearchHit;
 use engine::policy::PolicyContext;
 use engine::storage::Visibility;
+use std::time::Duration;
 
 /// 本ベンチ専用の合成データセットが使うテナント ID（実データではない。
 /// `batch_bench.rs::BENCH_TENANT` と同じ位置づけ）。
@@ -175,6 +200,21 @@ struct ScalingConfig {
     batches: Vec<usize>,
     top_k: usize,
     measured_iterations: u32,
+    /// `BENCH_GPU_SCALING_I8_OVERSAMPLE`（単一値。Issue #543。
+    /// `GpuI8Options::oversample` は構築時固定のためプロセス内スイープしない
+    /// ——`gpu_scaling_bench.rs` モジュール冒頭コメント「経路 D」参照）。
+    i8_oversample: usize,
+    /// `BENCH_GPU_SCALING_QUERY_F16_EXACT`（Issue #540。
+    /// `harness::gpu_scaling::parse_query_f16_exact` doc 参照）。
+    query_f16_exact: bool,
+    /// `BENCH_GPU_SCALING_SHADER_AB`（Issue #540 追記・codex-review P2 指摘
+    /// 対応・PR #611。`harness::gpu_scaling::parse_shader_ab` doc 参照。
+    /// `bench-internals` feature 必須・`query_f16_exact` 同時指定必須——
+    /// `load_config` が fail-closed に検証する）。`bench-internals` 非有効時は
+    /// 読み出し先（`main` の `#[cfg(feature = "bench-internals")]` 分岐）が
+    /// 存在しないため `#[allow(dead_code)]`（`mod harness;` と同方針）。
+    #[allow(dead_code)]
+    shader_ab: bool,
 }
 
 fn load_config() -> Result<ScalingConfig, String> {
@@ -183,6 +223,11 @@ fn load_config() -> Result<ScalingConfig, String> {
     let batch_raw = read_env_var("BENCH_GPU_SCALING_BATCH").map_err(|e| e.to_string())?;
     let topk_raw = read_env_var("BENCH_GPU_SCALING_TOPK").map_err(|e| e.to_string())?;
     let iters_raw = read_env_var("BENCH_GPU_SCALING_ITERS").map_err(|e| e.to_string())?;
+    let i8_oversample_raw =
+        read_env_var("BENCH_GPU_SCALING_I8_OVERSAMPLE").map_err(|e| e.to_string())?;
+    let query_f16_exact_raw =
+        read_env_var("BENCH_GPU_SCALING_QUERY_F16_EXACT").map_err(|e| e.to_string())?;
+    let shader_ab_raw = read_env_var("BENCH_GPU_SCALING_SHADER_AB").map_err(|e| e.to_string())?;
 
     let rows = parse_rows(rows_raw.as_deref(), &DEFAULT_ROWS).map_err(|e| e.to_string())?;
     let dims = parse_dims(dims_raw.as_deref(), &DEFAULT_DIMS).map_err(|e| e.to_string())?;
@@ -191,6 +236,37 @@ fn load_config() -> Result<ScalingConfig, String> {
     let measured_iterations =
         parse_measured_iterations(iters_raw.as_deref(), DEFAULT_MEASURED_ITERATIONS)
             .map_err(|e| e.to_string())?;
+    let i8_oversample = parse_i8_oversample(
+        i8_oversample_raw.as_deref(),
+        DEFAULT_I8_OVERSAMPLE,
+        MAX_I8_OVERSAMPLE,
+    )
+    .map_err(|e| e.to_string())?;
+    let query_f16_exact =
+        parse_query_f16_exact(query_f16_exact_raw.as_deref()).map_err(|e| e.to_string())?;
+    let shader_ab = parse_shader_ab(shader_ab_raw.as_deref()).map_err(|e| e.to_string())?;
+    if shader_ab {
+        // fail-closed（Issue #540 追記）: シェーダ強制 `F16Arith` は
+        // `select_dot_shader` の条件 5（クエリが f16 厳密往復不能なら拒否）を
+        // 経由するため、`query_f16_exact` なしで `shader_ab` だけを有効化すると
+        // 必ず実行時エラーになる。起動直後に明示的に拒否する。
+        if !query_f16_exact {
+            return Err(
+                "BENCH_GPU_SCALING_SHADER_AB=1 requires BENCH_GPU_SCALING_QUERY_F16_EXACT=1 \
+                 (forcing the f16 arith shader on non-exact queries always fails the \
+                 select_dot_shader overflow guard)"
+                    .to_string(),
+            );
+        }
+        #[cfg(not(feature = "bench-internals"))]
+        {
+            return Err(
+                "BENCH_GPU_SCALING_SHADER_AB=1 requires the bench-internals feature \
+                 (cargo bench --bench gpu_scaling_bench --features bench-internals)"
+                    .to_string(),
+            );
+        }
+    }
 
     Ok(ScalingConfig {
         rows,
@@ -198,6 +274,9 @@ fn load_config() -> Result<ScalingConfig, String> {
         batches,
         top_k,
         measured_iterations,
+        i8_oversample,
+        query_f16_exact,
+        shader_ab,
     })
 }
 
@@ -214,6 +293,377 @@ fn probe_gpu_available(rng: &mut DeterministicRng, dim: usize) -> Result<(), Str
     GpuBatchBackend::try_new(matrix)
         .map(|_backend| ())
         .map_err(|e| e.to_string())
+}
+
+/// 経路 D（Issue #543）の 1 規模点分の計測を行う。`cpu_hits` は A（CPU-SIMD
+/// 厳密対照。呼び出し元がこの規模点で既に計測済みの結果）で、これを正解集合と
+/// して i8 経路の同点許容つき不一致件数・Recall@k を確定的に算出する。
+/// `cpu_p95`/`f16_p95` は呼び出し元が同じ規模点で既に確定済みの A・B の p95
+/// （速度比の分子に使う。i8 経路自体の再計測はしない）。失敗はすべて
+/// `format_i8_unavailable_line` を出力してこの規模点だけを飛ばし、呼び出し元
+/// （`main`）の A/B/C の結果・継続に影響しない。
+#[allow(clippy::too_many_arguments)]
+fn measure_i8_scaling_point(
+    dataset: &ScalingDataset,
+    ctx: &PolicyContext,
+    rows: usize,
+    dim: usize,
+    batch: usize,
+    k: usize,
+    oversample: usize,
+    config: &ScalingConfig,
+    cpu_hits: &[BatchHit],
+    cpu_p95: Duration,
+    f16_p95: Duration,
+    seed: u64,
+) {
+    let i8_matrix = match ResidentMatrix::build(
+        &dataset.ids,
+        &dataset.tenant_ids,
+        &dataset.visibilities,
+        dim,
+        &dataset.vectors,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            println!(
+                "{}",
+                format_i8_unavailable_line(
+                    rows,
+                    dim,
+                    batch,
+                    k,
+                    oversample,
+                    &format!("gpu i8 resident matrix build failed: {e}")
+                )
+            );
+            return;
+        }
+    };
+
+    let build_started = std::time::Instant::now();
+    let gpu_i8 = match GpuI8BatchBackend::try_new(i8_matrix, GpuI8Options { oversample }) {
+        Ok(b) => b,
+        Err(e) => {
+            println!(
+                "{}",
+                format_i8_unavailable_line(rows, dim, batch, k, oversample, &e.to_string())
+            );
+            return;
+        }
+    };
+    let build_ms = build_started.elapsed().as_millis();
+
+    let queries = batch_queries(&dataset.queries, ctx, k);
+
+    // 正しさ・Recall（計測区間外・1 回のみ）: A（CPU-SIMD 厳密対照）を正解集合
+    // として、i8 経路の同点許容つき不一致件数と Recall@k を確定的に算出する
+    // （量子化・候補生成のみで決まる決定的指標。`docs/design/
+    // benchmark-judgement-policy.md` の「共有環境でも確定的に判定できる指標」
+    // と同じ位置づけ）。
+    let i8_hits = match gpu_i8.batch_search(&queries) {
+        Ok(h) => h,
+        Err(e) => {
+            println!(
+                "{}",
+                format_i8_unavailable_line(
+                    rows,
+                    dim,
+                    batch,
+                    k,
+                    oversample,
+                    &format!("gpu i8 batch_search failed: {e}")
+                )
+            );
+            return;
+        }
+    };
+    if cpu_hits.len() != i8_hits.len() {
+        println!(
+            "{}",
+            format_i8_unavailable_line(
+                rows,
+                dim,
+                batch,
+                k,
+                oversample,
+                "query count mismatch between cpu baseline and i8 candidate"
+            )
+        );
+        return;
+    }
+
+    let mut i8_mismatch = 0usize;
+    let mut per_query_recall: Vec<f64> = Vec::with_capacity(cpu_hits.len());
+    for i in 0..cpu_hits.len() {
+        let baseline = hit_pairs(&cpu_hits[i].hits);
+        let candidate = hit_pairs(&i8_hits[i].hits);
+        i8_mismatch += count_boundary_tolerant_mismatches(&baseline, &candidate);
+
+        let expected_ids: Vec<u64> = cpu_hits[i].hits.iter().map(|h| h.id).collect();
+        let actual_ids: Vec<u64> = i8_hits[i].hits.iter().map(|h| h.id).collect();
+        match recall_at_k(&expected_ids, &actual_ids) {
+            Ok(r) => per_query_recall.push(r),
+            Err(_) => {
+                // `expected_ids` が空（`k=0` 相当。本ベンチの `k` は常に
+                // `>= 1` のためここへは実質到達しないが、防御的に「算出不能」
+                // として計測を継続する）。
+                continue;
+            }
+        }
+    }
+    let i8_recall_at_k = match mean_recall_at_k(&per_query_recall) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "{}",
+                format_i8_unavailable_line(
+                    rows,
+                    dim,
+                    batch,
+                    k,
+                    oversample,
+                    &format!("i8 recall unavailable: {e}")
+                )
+            );
+            return;
+        }
+    };
+
+    let measure_config = match MeasurementConfig::new(
+        WARMUP_ITERATIONS,
+        config.measured_iterations,
+        seed.saturating_add(1),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("gpu_scaling_bench: i8 measurement config invalid: {e}");
+            return;
+        }
+    };
+    fn fatal(_: &BatchExecError) -> TrialFailure {
+        TrialFailure::Fatal
+    }
+
+    let stats_before = gpu_i8.stats();
+    let measurement =
+        match run_fallible(&measure_config, 0, || gpu_i8.batch_search(&queries), fatal)
+            .map(|m| m.measurement)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                println!(
+                    "{}",
+                    format_i8_unavailable_line(
+                        rows,
+                        dim,
+                        batch,
+                        k,
+                        oversample,
+                        &format!("i8 measurement failed: {e}")
+                    )
+                );
+                return;
+            }
+        };
+    let stats_after = gpu_i8.stats();
+
+    let i8_p95 = match p95_from_samples(&measurement.samples) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "{}",
+                format_i8_unavailable_line(
+                    rows,
+                    dim,
+                    batch,
+                    k,
+                    oversample,
+                    &format!("i8 p95 unavailable: {e}")
+                )
+            );
+            return;
+        }
+    };
+
+    let speedup_i8_vs_cpu_p95 = match speedup_ratio(cpu_p95, i8_p95) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "{}",
+                format_i8_unavailable_line(
+                    rows,
+                    dim,
+                    batch,
+                    k,
+                    oversample,
+                    &format!("i8 vs cpu speedup ratio unavailable: {e}")
+                )
+            );
+            return;
+        }
+    };
+    let speedup_i8_vs_f16_p95 = match speedup_ratio(f16_p95, i8_p95) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "{}",
+                format_i8_unavailable_line(
+                    rows,
+                    dim,
+                    batch,
+                    k,
+                    oversample,
+                    &format!("i8 vs f16 speedup ratio unavailable: {e}")
+                )
+            );
+            return;
+        }
+    };
+
+    let batch_u32 = u32::try_from(batch).unwrap_or(1).max(1);
+    let result = GpuScalingI8Result {
+        rows,
+        dim,
+        batch,
+        k,
+        oversample,
+        gpu_i8_p50: measurement.summary.median,
+        gpu_i8_p95: i8_p95,
+        per_query_gpu_i8_p50: measurement.summary.median / batch_u32,
+        speedup_i8_vs_cpu_p95,
+        speedup_i8_vs_f16_p95,
+        i8_mismatch,
+        i8_recall_at_k,
+    };
+    println!("{result}");
+
+    let calls = u64::from(WARMUP_ITERATIONS) + u64::from(measure_config.measured_iterations());
+    let readback_bytes_total = stats_after
+        .readback_bytes
+        .saturating_sub(stats_before.readback_bytes);
+    let rescored_candidates_total = stats_after
+        .rescored_candidates
+        .saturating_sub(stats_before.rescored_candidates);
+
+    match (
+        readback_bytes_per_call(readback_bytes_total, calls),
+        rescored_candidates_per_call(rescored_candidates_total, calls),
+    ) {
+        (Ok(bytes_per_call), Ok(rescored_per_call)) => {
+            let meta = gpu_i8.meta();
+            let stats_line = GpuScalingI8StatsLine {
+                rows,
+                dim,
+                batch,
+                k,
+                oversample,
+                calls,
+                readback_bytes_total,
+                readback_bytes_per_call: bytes_per_call,
+                rescored_candidates_total,
+                rescored_candidates_per_call: rescored_per_call,
+                backend: format!("{:?}", meta.backend),
+                dot4_impl: format!("{:?}", meta.dot4_impl),
+                build_ms,
+            };
+            println!("{stats_line}");
+        }
+        (a, b) => {
+            // `calls == 0` は測定条件の誤りだが、`gpu_scaling_i8:` 結果行は
+            // 既に出力済みのため本ベンチ自体は継続する（fail-closed に統計行
+            // だけを欠落させる。既存 `gpu_scaling_stats:` の欠落方針と同じ）。
+            eprintln!(
+                "gpu_scaling_bench: i8 readback stats unavailable rows={rows} dim={dim} \
+                 batch={batch} k={k} oversample={oversample}: readback={a:?} rescored={b:?}"
+            );
+        }
+    }
+}
+
+/// 同一クエリでの S0 シェーダ単体比較（Issue #540 追記・codex-review P2
+/// 指摘対応・PR #611）。`BENCH_GPU_SCALING_SHADER_AB=1`（`bench-internals`
+/// feature 必須・`config.query_f16_exact` 併用必須）のときのみ `main` から
+/// 呼ばれる。`queries` は呼び出し元が既に [`round_to_f16_exact`] で丸め済み
+/// （`config.query_f16_exact`）であることを前提とし、この関数自体は丸めを
+/// 行わない——`GpuSearchTestOptions::dot_shader` で `Unpack`／`F16Arith` を
+/// 強制する以外、`gpu_scaling: `（既存の自動選択計測）と同一のクエリ・
+/// 同一の `gpu_f16`（`GpuBatchBackend`）インスタンスを使うことで、変動要因を
+/// シェーダ選択のみに限定する。`F16Arith` 強制は `select_dot_shader` の
+/// 条件不成立時に `Err` を返す fail-closed 契約（`GpuSearchTestOptions::
+/// dot_shader` doc 参照）のため、クエリが実際に f16 算術版シェーダへ到達した
+/// ことの証跡にもなる。
+#[cfg(feature = "bench-internals")]
+#[allow(clippy::too_many_arguments)]
+fn measure_shader_ab(
+    gpu_f16: &GpuBatchBackend,
+    queries: &[BatchQuery<'_>],
+    rows: usize,
+    dim: usize,
+    batch: usize,
+    k: usize,
+    measured_iterations: u32,
+    seed: u64,
+) -> Result<String, String> {
+    let measure_config = MeasurementConfig::new(WARMUP_ITERATIONS, measured_iterations, seed)
+        .map_err(|e| format!("shader_ab measurement config invalid: {e}"))?;
+
+    fn fatal<E>(_: &E) -> TrialFailure {
+        TrialFailure::Fatal
+    }
+
+    let unpack_options = GpuSearchTestOptions {
+        // `GpuBatchBackend::batch_search`（既定 trait 実装）と同じ既定予算
+        // （`gpu_batch.rs::GPU_SCORE_BUFFER_BUDGET_BYTES`。非 pub 定数のため
+        // `tests/gpu_batch.rs` と同じくリテラルで複製する）。
+        budget_bytes: 32 * 1024 * 1024,
+        force_full_readback: false,
+        dot_shader: Some(GpuDotShaderKind::Unpack),
+    };
+    let unpack_measurement = run_fallible(
+        &measure_config,
+        0,
+        || gpu_f16.batch_search_with_options_for_tests(queries, unpack_options),
+        fatal,
+    )
+    .map(|m| m.measurement)
+    .map_err(|e| format!("shader_ab unpack measurement failed: {e}"))?;
+
+    let f16_arith_options = GpuSearchTestOptions {
+        // `GpuBatchBackend::batch_search`（既定 trait 実装）と同じ既定予算
+        // （`gpu_batch.rs::GPU_SCORE_BUFFER_BUDGET_BYTES`。非 pub 定数のため
+        // `tests/gpu_batch.rs` と同じくリテラルで複製する）。
+        budget_bytes: 32 * 1024 * 1024,
+        force_full_readback: false,
+        dot_shader: Some(GpuDotShaderKind::F16Arith),
+    };
+    let f16_arith_measurement = run_fallible(
+        &measure_config,
+        0,
+        || gpu_f16.batch_search_with_options_for_tests(queries, f16_arith_options),
+        fatal,
+    )
+    .map(|m| m.measurement)
+    .map_err(|e| {
+        format!(
+            "shader_ab f16_arith measurement failed (forced f16 arith shader was rejected \
+             — queries may not be f16-exact; requires BENCH_GPU_SCALING_QUERY_F16_EXACT=1): {e}"
+        )
+    })?;
+
+    let unpack_p95 = p95_from_samples(&unpack_measurement.samples)
+        .map_err(|e| format!("shader_ab unpack p95 unavailable: {e}"))?;
+    let f16_arith_p95 = p95_from_samples(&f16_arith_measurement.samples)
+        .map_err(|e| format!("shader_ab f16_arith p95 unavailable: {e}"))?;
+
+    Ok(format!(
+        "gpu_scaling_shader_ab: rows={rows} dim={dim} batch={batch} k={k} \
+         unpack_p50={}us unpack_p95={}us f16_arith_p50={}us f16_arith_p95={}us",
+        unpack_measurement.summary.median.as_micros(),
+        unpack_p95.as_micros(),
+        f16_arith_measurement.summary.median.as_micros(),
+        f16_arith_p95.as_micros(),
+    ))
 }
 
 fn main() {
@@ -325,13 +775,25 @@ fn main() {
                     }
                 }
 
-                let dataset = match build_dataset(&mut rng, rows, dim, batch) {
+                let mut dataset = match build_dataset(&mut rng, rows, dim, batch) {
                     Ok(d) => d,
                     Err(msg) => {
                         println!("{}", format_skip_line(rows, dim, batch, k, &msg));
                         continue;
                     }
                 };
+                // Issue #540: opt-in 時のみクエリ成分を f16 厳密往復可能な値へ
+                // 丸め、`select_dot_shader` の条件 5（クエリの f16 精度損失）で
+                // 常駐行 B が unpack 版へ縮退しないようにする。常駐行そのもの
+                // （`dataset.vectors`）は既に f16 パック常駐（`ResidentMatrix`）
+                // 経由で量子化済みのため丸め不要——ここで丸めるのはクエリのみ。
+                if config.query_f16_exact {
+                    for q in &mut dataset.queries {
+                        for v in q.iter_mut() {
+                            *v = round_to_f16_exact(*v);
+                        }
+                    }
+                }
 
                 let cpu_matrix = match ResidentMatrix::build(
                     &dataset.ids,
@@ -606,6 +1068,34 @@ fn main() {
                 };
                 println!("{result}");
 
+                // Issue #540 追記（codex-review P2 指摘対応・PR #611）:
+                // 同一クエリでの S0 シェーダ単体比較（交絡排除）。
+                // `config.shader_ab` は `load_config` が
+                // `config.query_f16_exact` 併用・`bench-internals` feature を
+                // fail-closed に強制済みのため、ここでは opt-in の有無だけを
+                // 見ればよい。
+                #[cfg(feature = "bench-internals")]
+                if config.shader_ab {
+                    match measure_shader_ab(
+                        &gpu_f16,
+                        &queries,
+                        rows,
+                        dim,
+                        batch,
+                        k,
+                        config.measured_iterations,
+                        seed,
+                    ) {
+                        Ok(line) => println!("{line}"),
+                        Err(msg) => {
+                            println!(
+                                "{}",
+                                format_unavailable_line(Some((rows, dim, batch, k)), &msg)
+                            )
+                        }
+                    }
+                }
+
                 // `calls` は `run_fallible` の戻り値を経由せず定数計算する
                 // （上記コメント参照）。`saturating_sub` はカウンタが同一
                 // ウィンドウ内で単調増加する契約を前提にした防御であり、
@@ -641,6 +1131,12 @@ fn main() {
                             f16_full_readback_fallbacks: f16_stats_after
                                 .full_readback_fallbacks
                                 .saturating_sub(f16_stats_before.full_readback_fallbacks),
+                            f16_arith_dispatches: f16_stats_after
+                                .f16_arith_dispatches
+                                .saturating_sub(f16_stats_before.f16_arith_dispatches),
+                            f16_arith_guard_fallbacks: f16_stats_after
+                                .f16_arith_guard_fallbacks
+                                .saturating_sub(f16_stats_before.f16_arith_guard_fallbacks),
                             f32_readback_bytes_total: f32_bytes_total,
                             f32_readback_bytes_per_call: f32_per_call,
                             f32_partial_topk_dispatches: f32_stats_after
@@ -665,6 +1161,25 @@ fn main() {
                         );
                     }
                 }
+
+                // 経路 D（Issue #543）: GPU i8 パック常駐。A/B/C の計測・出力が
+                // 終わった後段に追加する——構築・計測いずれの失敗も A/B/C の
+                // 結果を失わせない（`format_i8_unavailable_line` を出しこの
+                // 規模点の i8 計測だけを飛ばして継続する）。
+                measure_i8_scaling_point(
+                    &dataset,
+                    &ctx,
+                    rows,
+                    dim,
+                    batch,
+                    k,
+                    config.i8_oversample,
+                    &config,
+                    &cpu_hits,
+                    cpu_p95,
+                    f16_p95,
+                    seed,
+                );
 
                 any_measured = true;
             }
