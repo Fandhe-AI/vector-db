@@ -114,8 +114,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
+      # `macos-latest` イメージは `stable` という名前のツールチェーンを事前
+      # インストール済みで持つため、`rustup show`（rust-toolchain.toml の
+      # channel = "stable" を解決するだけ）は既存インストール済みの
+      # `stable` をそのまま採用し、リリース済みの最新 stable への更新を
+      # 強制しない。Issue #525 で `vdotq_s32`（`stdarch_neon_dotprod`）が
+      # 最新 stable では安定化済みと確認済みにもかかわらず、イメージに
+      # 焼き込まれた stale な `stable`（更新が反映される前の版）を使うと
+      # `error[E0658]: use of unstable library feature` として再現する
+      # （`ubuntu-latest` を使う cross-check ジョブでは毎回未インストール
+      # 状態から `rustup show` が最新 stable を新規取得するため再現しない）。
+      # `rustup update stable` で明示的にリリース済み最新へ更新してから
+      # `rustup show` でログへ記録する
       - name: Install Rust toolchain (rust-toolchain.toml)
-        run: rustup show
+        run: |
+          rustup update stable
+          rustup show
 
       # チップ世代の推測（M1／M2／…）を避け、実測でチップ・OS 版を記録する
       - name: Report chip and sysctl feature flags
