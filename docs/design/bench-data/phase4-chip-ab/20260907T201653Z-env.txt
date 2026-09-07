@@ -1,0 +1,13 @@
+commit_before=91f6a18
+commit_after=6184491
+rustc: rustc 1.98.1 (48a229cea 2026-09-01)
+host: x86_64-unknown-linux-gnu
+detected_isa: Avx2Fma
+logical_cpus: 12
+note: QEMU shared-environment reference values only; not an adoption basis (benchmark-judgement-policy.md §5)
+note2: dot-kernel-ab-summary.tsv was captured while another chip_bench(knn_profile)
+  run was concurrently active on this shared host; treat its ratios as directional
+  reference only (min-of-N already applied). chip-ab-dot-kernel-summary.tsv and
+  chip-ab-knn-profile-summary.tsv were each captured in isolation (no other
+  bench_chip_ab.sh/bench_dot_kernel_ab.sh process running), though other
+  parallel agent sessions on this shared machine cannot be ruled out.
