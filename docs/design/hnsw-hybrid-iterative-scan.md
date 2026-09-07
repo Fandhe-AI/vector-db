@@ -40,19 +40,33 @@ Issue #410 は「フィルタ付き ANN が結果不足・境界同点未確定�
 `search_layer` の受理判定は「`results.len() >= ef && strictly_farther` の
 場合のみ打ち切る」規約であり、それ以外は候補ヒープが空になるまで受理ノードを
 `results` へ積み続ける（`worst_ok = results.len() < ef` の間は常に真）。1・2
-と合わせると、`mask_splits_graph == false` のとき
+と合わせると、`mask_splits_graph == false` のとき、層 0 探索の**切り詰め前**
+の結果 `results`（`search_layer` の戻り値。`hnsw.rs::search_masked`）について
 
 ```text
-index_hits.len() >= min(ef_eff, visible_in_index) >= min(k, visible_in_index)
-                                                     = expected
+results.len() >= min(ef_eff, visible_in_index)
 ```
 
 が常に成立する（`ef_eff = effective_ef(k) = ef_search.max(k).min(MAX_EF)`
-が `k` 以上のため）。`search_with_overlay` の `masked_short` 分岐
+が `k` 以上であり、`min(x, visible_in_index)` は `x` に関して単調非減少の
+ため `min(ef_eff, visible_in_index) >= min(k, visible_in_index) = expected`
+も成立する）。`search_masked` は最後にこれを `take(k)` で切り詰めて返す
+（`hnsw.rs::search_masked` 末尾）ため、呼び出し元
+（`sql::hnsw_cache::search_with_overlay`）が受け取るのは
+`index_hits.len() = min(results.len(), k)` である。`results.len() >=
+expected` かつ `expected <= k` （`expected = min(k, visible_in_index)`）
+なので
+
+```text
+index_hits.len() = min(results.len(), k) >= min(expected, k) = expected
+```
+
+が成立する。`search_with_overlay` の `masked_short` 分岐
 （`index_hits.len() < expected`）はこの不等式と矛盾するため、
-`mask_splits_graph == false` の間は到達しない。`mask_splits_graph == true`
-のときは `search_masked` 自体を呼ばず別分岐（統計 `mask_splits_graph`）で
-plain scan するため、こちらも `masked_short` へは到達しない。
+`mask_splits_graph == false` の間は到達しない。`mask_splits_graph ==
+true` のときは `search_masked` 自体を呼ばず別分岐（統計
+`mask_splits_graph`）で plain scan するため、こちらも `masked_short` へは
+到達しない。
 
 結論: 現行実装では `masked_short` は防御的分岐（想定外の不整合に対する
 fail-closed の最終防御）に留まり、「`ef` 拡張で結果不足を解消する」という
@@ -320,18 +334,37 @@ Issue #465）」節のとおり、既定エンジン `hybrid_rrf` の `dense(B0)
   リスクを生む
 - **内容**（`hnsw.rs` の型で記述。#505 が新設する）: 独自の visited
   ビットマップ（既存の thread-local `SEARCH_SCRATCH` はラウンド間で状態が
-  リセットされる前提のため使えず、専用スクラッチを新設する）・`candidates`
+  リセットされる前提のため使えず、専用スクラッチを新設する）・`expanded`
+  ビットマップ（`candidates.pop()` で実際に展開した——隣接ノードを走査
+  した——ノードを記録する。`visited` とは別物: `visited` は隣接ノードとして
+  **発見**された時点で立つのに対し、`expanded` はそのノード自身が候補
+  ヒープから**pop されて隣接走査された**時点で立つ）・`candidates`
   （未展開の受理済みノード。`BinaryHeap<ScoredNode>`）・`discarded`
   （`worst_ok` 不受理で捨てたノード、および `results.pop()` で追い出された
   ノード。`candidates` と同じ `ScoredNode::Ord`——スコア降順・id 昇順の
   全順序）・`admitted`（これまでに受理されたノードとスコア。ラウンド r の
   返却は `admitted` の上位 `k_r` 件）・直前ラウンドの `ef`
 - **再開手順**: ラウンド r（`k_r > k_{r-1}`）では `discarded` を
-  `candidates` へ合流し、`ef_r = effective_ef(k_r)` で `search_layer_in` の
-  while ループを**同じ停止条件・同じ受理判定（`worst_ok`）**のまま続行する。
-  上位層の貪欲降下（`ef=1`）は再実行しない——層 0 の状態のみを再開する
-- **メモリ上限**: visited は `⌈N/64⌉` 語（N は索引ノード数）、
-  `candidates`／`discarded` の要素数はいずれも高々 N、`admitted` も高々 N。
+  `expanded` フラグで 2 分してから合流する——**`expanded` が未設定の
+  ノードのみ `candidates` へ合流**し、`ef_r = effective_ef(k_r)` で
+  `search_layer_in` の while ループを**同じ停止条件・同じ受理判定
+  （`worst_ok`）**のまま続行する（上位層の貪欲降下〔`ef=1`〕は再実行しない
+  ——層 0 の状態のみを再開する）。**`expanded` 済みの discarded ノードは
+  `candidates` へ戻さない**——`results.pop()` で追い出された時点で既に
+  `candidates.pop()` を経て隣接ノードを走査済み（`visited` 済みの隣接
+  ノードしか残っていない）ため、再度 pop して隣接走査しても新規の候補は
+  一切生まれず、二重の展開コストにしかならない。かわりに `ef_r` の下で
+  `worst_ok` を満たすかどうかだけを再評価し、満たせば `results`（および
+  `admitted`）へ直接差し戻す（`candidates` を経由しない O(1) の再挿入）。
+  この区別により、**ノード 1 個あたり `candidates.pop()` による展開は
+  同一クエリの全ラウンドを通じて高々 1 回**になり、下記「停止性契約」の
+  「全ラウンド合計の展開数は高々 N」が成立する。（`worst_ok` 不受理で
+  捨てられたノードは元々 `candidates`／`results` へ一度も積まれていない
+  ため `expanded` は常に未設定——`ef` が大きくなれば初めて `candidates`
+  へ合流し、その時点で初めて展開される）
+- **メモリ上限**: visited・`expanded` はいずれも `⌈N/64⌉` 語（N は索引
+  ノード数）のビットマップ、`candidates`／`discarded` の要素数はいずれも
+  高々 N、`admitted` も高々 N。
   `k`・`ef` は構築済み `HnswIndex::search_masked` の検証（`MAX_EF` =
   10,000 以下）を経由済みの値のみを受け取る。無制限確保はしない
   （`coding-rust.md`「untrusted 入力の扱い」）
@@ -419,23 +452,37 @@ Issue の見出し「再開型にしても融合結果・境界同点グルー�
   `run(ef)` は高々 N 回の展開で必ず停止する。**全ラウンド合計の展開数は
   高々 N**（再実行型は各ラウンドが visited をリセットするため Σ_r
   visited_r になり得る）——これが再開型の性能面の狙いであり、#506 で
-  実測する対象
+  実測する対象。この「全ラウンド合計 ≤ N」は上記「状態保持契約」の
+  `expanded` ビットマップによる重複排除が前提であり、それなしでは
+  成立しない: `results.pop()` で追い出されたノードのうち既に
+  `candidates.pop()` を経て展開済みのものを無条件に `candidates` へ
+  再合流させると、同一ノードが複数ラウンドで繰り返し pop・隣接走査され
+  得るため「合計展開数 ≤ N」は崩れる（`expanded` フラグにより、そのような
+  ノードは `candidates` を経由しない O(1) の `results`／`admitted` 再挿入
+  のみで扱い、展開自体は各ノードにつき高々 1 回に制限する）
 - `exhaustive` 推論の健全性: `hybrid.rs` は `hits.len() < dense_fetch_k`
   から `exhaustive` を推論する。再開型でも「候補 ∪ 破棄ヒープが空のとき
   にのみ `k` 未満を返す」（fail-closed。空でないのに `k` 未満を返しては
   ならない）契約を維持する。既存の `masked_short` ガード
   （`index_hits.len() < min(k, visible_in_index)` で plain scan へ縮退）も
-  残置し、`search_with_overlay` の不等式 `index_hits.len() >=
-  min(ef_eff, visible_in_index)` が再開型でも成立することを #505 で示す
-  （`mask_splits_graph == false` により受理ノード全体が到達可能であるため、
-  この不等式は既存証明の系として成立する）
+  残置し、切り詰め前の層 0 探索結果 `results` に対する不等式
+  `results.len() >= min(ef_eff, visible_in_index)`（上記「DISTANCE 経路の
+  `masked_short` 到達不能性」節の証明）と、それを `take(k)` で切り詰めた
+  `index_hits.len() = min(results.len(), k) >= min(k, visible_in_index)`
+  が再開型でも成立することを #505 で示す（`mask_splits_graph == false` に
+  より受理ノード全体が到達可能であるため、この不等式は既存証明の系として
+  成立する。`index_hits` 自体への下限は `ef_eff` ではなく `k` に対する
+  ものであることに注意——`ef_eff` に対する下限は切り詰め前の `results`
+  についてのみ成立する）
 - `k_r > MAX_EF`: 既存契約どおり状態を破棄し `ef_cap_fallbacks` を計上して
   厳密 brute-force へ縮退する（変更しない）
 
 ### 実装方針（#505 向け・列挙のみ。本 Issue では実装しない）
 
 - `hnsw.rs::search_layer_in` を「状態構造体 `LayerScanState { candidates,
-  discarded, admitted, visited }` に対する `run(ef)`」へ再構成し、既存の
+  discarded, admitted, visited, expanded }` に対する `run(ef)`」へ再構成し、
+  `discarded` の合流時に `expanded` 済みノードを `candidates` から除外する
+  （上記「状態保持契約」参照）。既存の
   `search_layer_in`（現行の公開シグネチャ・呼び出し元）はその 1 回実行の
   薄いラッパとして維持する。アルゴリズム本体を複製しない（#494 の
   `Adjacency` ジェネリック・#490 の `PrefetchPolicy` をそのまま利用する）。
