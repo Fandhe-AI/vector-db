@@ -355,7 +355,7 @@ A の pair5 は全フェーズが一斉に大きく跳ねている（例: `hybri
 参考値の位置づけのためこの run を除外せずそのまま記録し、min-of-5・
 median-of-5 で頑健化する）。
 
-参照区間 `vector_knn` の実測ノイズ帯: A=19.7%・C=8.6%（A は上記 pair5 の
+参照区間 `vector_knn` の実測ノイズ帯: A=19.8%・C=8.5%（A は上記 pair5 の
 外れ値を含むため、3 ペア時点の 7.1% から拡大）。wire 経由の `hybrid_rrf` は
 min 比 1.011・median 比 1.052 であり、5 ペアへの補完後も概ね 1 付近
 （ノイズ帯内〜境界）にとどまる。engine 内部（§4）で観測された
@@ -401,7 +401,7 @@ codex-review P1 指摘対応で `benchmark-judgement-policy.md` §3〔per-run �
 の JSON 出力 `phases.vector_knn.p95_us` から取得）: A=[1219, 767, 1098, 765,
 1134]・C=[1117, 1166, 743, 1104, 1056]。`reference_band_A =
 (1219 - 765) / 765 = 59.3%`、`reference_band_C = (1166 - 743) / 743 = 56.9%`
-（p50 のノイズ帯 A=19.7%・C=8.6% よりも大幅に広い。p95 は分布の裾を見る
+（p50 のノイズ帯 A=19.8%・C=8.5% よりも大幅に広い。p95 は分布の裾を見る
 統計量であり、共有 QEMU 環境ではこの規模の run-to-run 変動が生じる）。
 `hybrid_rrf` の p95 比（min 1.094・median 1.055）の乖離
 （`|1.094-1.0|=9.4%`・`|1.055-1.0|=5.5%`）はこの実測帯（57〜59%）を
@@ -439,7 +439,7 @@ codex-review P1 指摘対応で `benchmark-judgement-policy.md` §3〔per-run �
 | query-planning intent_improvement_degraded | 0.3547 | 0.3547 | 0.3547 | 0.3547 |
 | query-planning direct_after_recall20（大規模） | 0.8852 | 0.8852 | 0.8852 | 0.8852 |
 
-**全 10 指標 × 2 エンジンで A/C の差分がゼロ**。ただし Recall ハーネスは
+**全 11 指標 × 2 エンジンで A/C の差分がゼロ**。ただし Recall ハーネスは
 正解 ID の hit 数（recall@k・improvement_ratio 等の集計指標）を比較するのみで
 Top-k 内の順位入れ替え・スコアの微小なビット差はこの指標には現れない
 （PR #575 codex-review P2 指摘対応でこの限界を明記）。よってこの差分ゼロが
@@ -478,7 +478,7 @@ rerank_recall --test query_planning_recall --test sparse_determinism`。状態 C
   単位の min／median のみを出力しクエリ単位の p95 を計測しないため、本項の
   非退行判断は min-of-5・median-of-5 の範囲に限定する（§4）
 - crossdb self（wire 経由）の `hybrid_rrf` は min 比 1.011・median 比 1.052
-  （5 ペアへの補完後。§5 参照区間ノイズ帯 A=19.7%・C=8.6% と同程度〜それ未満）
+  （5 ペアへの補完後。§5 参照区間ノイズ帯 A=19.8%・C=8.5% と同程度〜それ未満）
   で、engine 内部の改善が wire レベルの p50 にはほぼ現れていない。SQL 表層・
   wire の固定コストが支配的なため（`hybrid-rrf-latency-breakdown.md` の内訳と
   整合）。p95（比 1.055〜1.094）も参照区間の p95 ノイズ帯（57〜59%）を
