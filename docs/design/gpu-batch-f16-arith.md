@@ -40,11 +40,35 @@
 出し（unpack・f32 対照）は `$prelude=""`・`$query_binding="array<f32>"` を
 渡すだけで挙動不変。
 
-f16 レジスタでの積算は `GPU_F16_ACC_BLOCK`（実装既定値 8）回ごとに
-`f32(acc2.x) + f32(acc2.y)` で f32 アキュムレータへフラッシュし、f16
-レジスタを 0 に戻す。QUERY_TILE_MAX 分のクエリすべてに渡って積算し続けると
-容易に f16 の有限最大値（65504）を超えるため、ブロック単位でのフラッシュに
-より「ブロック内部分和のみ f16 の値域に収まればよい」設計にしている。
+f16 レジスタでの積算は `GPU_F16_ACC_BLOCK`（**`1` 固定**。後述の PR #591
+レビュー P1 指摘対応）回ごとに `f32(acc2.x) + f32(acc2.y)` で f32
+アキュムレータへフラッシュし、f16 レジスタを 0 に戻す。`1` 固定のため
+`acc2` は「1 組の f16 積を fma で計算した直後」に必ずフラッシュされ、
+複数項を f16 のまま加算することは発生しない（下記「f16 積算の桁落ち
+（PR #591 レビュー P1 指摘対応）」節参照）。
+
+### f16 積算の桁落ち（PR #591 レビュー P1 指摘対応）
+
+初版実装は `GPU_F16_ACC_BLOCK = 8` を採用し「ブロック内部分和が f16 の
+有限最大値（65504）へ達しないこと」だけをオーバーフローガードで判定して
+いたが、オーバーフローしない範囲でも複数項を f16 のまま加算すると桁落ちで
+正解行が入れ替わりうることが判明した。反例:
+`query=[2048,0,1,0,-2048]`・`row=[1,0,1,0,1]`（真の内積は `1`）は
+`row_max_abs=1`・`query_max_abs=2048` で `select_dot_shader` のオーバー
+フローガード（4 番目の条件）を通過するが、f16 レジスタ内で `2048+1` を
+計算した時点で最近接偶数丸めにより `2048` へ丸められ、続く `-2048` の
+加算で最終スコアが `0` になる（真値 `1` と異なり、k=1 の正解が別行と
+入れ替わりうる）。
+
+対処として `GPU_F16_ACC_BLOCK` を `1` 固定にし、`acc2` を毎回
+「1 組の f16 積を計算した直後」にフラッシュする構成へ変更した。これにより
+複数項の f16 加算が構造的に発生しなくなり（残るのは行データ自体が既に
+f16 常駐である既存の量子化誤差のみ）、上記反例は真値 `1` と一致する
+（`crates/engine/src/gpu_batch.rs`
+`tests::f16_arith_precision_bug_pr591_p1_is_fixed_by_acc_block_1` で
+CPU 上のシミュレーションとして固定）。性能への影響（フラッシュ頻度の
+増加）は前後比較実測の別 Issue（#540）へ申し送り、本変更は正しさ優先の
+修正であり実測を伴わない。
 
 ## 3. オーバーフローガードと選択規則
 
@@ -54,29 +78,46 @@ f16 の有限最大値（65504）を超える中間値が生じると、f16 算�
 前に判定する:
 
 ```text
-select_dot_shader(f16_available, row_max_abs, query_max_abs):
+select_dot_shader(f16_available, row_max_abs, query_max_abs, query_has_subnormal_underflow):
   1. f16_available が false なら Unpack
   2. row_max_abs／query_max_abs のいずれかが非有限なら Unpack
   3. query_max_abs > F16_MAX_FINITE(65504) なら Unpack
      （row_max_abs の値に関わらず崩れる独立した条件。クエリ成分が
      f16 パック時点で ±Inf へ飽和すると、unpack 版では有限のスコアに
      なる行が f16 算術版だけ除外されてしまうケースを閉じる）
-  4. row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK が
+  4. query_has_subnormal_underflow が真なら Unpack
+     （PR #591 レビュー P1 指摘対応で追加。有効な非ゼロの小さいクエリ
+     成分が f16 パックで厳密にゼロへ丸められ正解行が脱落しうるケースを
+     閉じる。クエリは F16Arith 選択時のみ f16 パックされるため、この
+     アンダーフローはクエリ側にのみ新たに生じるリスク）
+  5. row_max_abs * query_max_abs * GPU_F16_ACC_BLOCK が
      F16_ARITH_PARTIAL_SUM_LIMIT(32768) を超えるなら Unpack
-     （ブロック内部分和が f16 の有限最大値へ達しうる保守的な上界判定。
-     65504 の約半分を選び、丸め・fma 誤差蓄積の余裕を持たせる）
-  5. それ以外は F16Arith
+     （単一 f16 積のオーバーフロー上界判定。GPU_F16_ACC_BLOCK は `1` 固定
+     〔下記「f16 積算の桁落ち」節参照〕のため複数項の f16 加算は発生
+     しない。65504 の約半分を選び丸め誤差の余裕を持たせる）
+  6. それ以外は F16Arith
 ```
 
-`row_max_abs`（常駐行列の有限成分のみの絶対値最大）は `GpuBatchBackend::
-try_new` で 1 回だけ走査して確定させ、`query_max_abs`（クエリバッチの有限
-成分のみの絶対値最大。f16 丸め前の f32 値）は `batch_search` 呼び出しごとに
-算出する。非有限成分（f16 パック時の飽和で ±Inf 化した値）は unpack 版でも
-必ず非有限スコアとして除外される値のため、最大値計算から除外してよい
-（`select_dot_shader` doc コメント参照）。
+`row_max_abs`（行ごとの有限成分のみの絶対値最大）は `GpuBatchBackend::
+try_new` で行ごとに 1 回だけ走査して確定させる（PR #591 レビュー P2 指摘
+対応。各行の値は行自身の内容のみに依存する定数のためキャッシュしてよい）。
+`batch_search` 呼び出し時は、クエリを `PolicyContext` ごとにグループ化し
+（`group_queries_by_ctx`）、**グループ単位**で当該コンテキストが可視な行
+（`gather_reachable_rows`）に対応する事前計算値だけを集約する
+（`max_abs_finite_from_precomputed_rows`）。`query_max_abs`／
+`query_has_subnormal_underflow`（クエリバッチの有限成分のみの絶対値最大・
+アンダーフロー有無。f16 丸め前の f32 値）も同じグループのクエリのみを母数
+にする（`max_abs_finite_from_queries_subset`）。非有限成分（f16 パック時の
+飽和で ±Inf 化した値）は unpack 版でも必ず非有限スコアとして除外される値の
+ため、最大値計算から除外してよい（`select_dot_shader` doc コメント参照）。
 
-選択は **`batch_search` 呼び出し単位**で 1 回だけ行う（タイル単位にしない。
-コード量と検証の単純さを優先した実装判断）。
+選択は **`PolicyContext` グループ単位**で行う（PR #591 レビュー P0 指摘
+対応で「`batch_search` 呼び出し単位で 1 回」から変更。複数 `PolicyContext`
+が混在するバッチで、あるグループの可視行・クエリの振幅が他グループの
+シェーダ選択・返却スコアの数値精度へ波及しない——他テナントから不可視な
+行の振幅変化が自テナントの検索結果から観測できてしまうテナント境界の
+弱体化を防ぐ）。タイル単位にはしない（コード量と検証の単純さを優先した
+実装判断は不変）。
 
 ## 4. ホスト側の dispatch
 
@@ -91,11 +132,14 @@ try_new` で 1 回だけ走査して確定させ、`query_max_abs`（クエリ�
 
 ## 5. 統計・テスト用オーバーライド
 
-- `GpuBatchStatsSnapshot` へ `f16_arith_dispatches`（`batch_search` 呼び出しが f16 算術版へ
-  dispatch した回数）・`f16_arith_guard_fallbacks`（f16 算術版パイプライン
-  は利用可能だが自動選択のオーバーフローガードにより unpack 版へ縮退した
-  回数）を追加。`gpu_scaling_bench.rs` の `gpu_scaling_stats:` 出力行へ
-  両カウンタを追記し、#540 の非 vacuous 判定材料にする
+- `GpuBatchStatsSnapshot` へ `f16_arith_dispatches`（`PolicyContext` グループが
+  f16 算術版へ dispatch した回数。PR #591 レビュー P0 指摘対応でシェーダ
+  選択がグループ単位になったため、1 `batch_search` 呼び出しで複数
+  `PolicyContext` を含むバッチでは複数回加算されうる）・
+  `f16_arith_guard_fallbacks`（f16 算術版パイプラインは利用可能だが自動
+  選択のオーバーフローガードにより unpack 版へ縮退したグループ数）を
+  追加。`gpu_scaling_bench.rs` の `gpu_scaling_stats:` 出力行へ両カウンタを
+  追記し、#540 の非 vacuous 判定材料にする
 - `GpuBatchBackend::f16_arith_available() -> bool`（テナント情報を含まない
   情報提供専用の問い合わせ）を追加
 - `GpuSearchTestOptions`（`bench-internals` feature 限定）に
@@ -120,6 +164,17 @@ try_new` で 1 回だけ走査して確定させ、`query_max_abs`（クエリ�
   unpack 版へ縮退し `f16_arith_guard_fallbacks` が増加すること、かつ
   強制 `F16Arith` はガード不成立のため `Err` を返すこと（黙示縮退しない）
   を確認
+
+## 6.1. 行振幅の事前計算（PR #591 レビュー P2 指摘対応）
+
+初版実装は `batch_search` 呼び出しのたびに、対象クエリバッチが可視な行を
+`gather_reachable_rows` で求めたうえで全行を f16 unpack して絶対値最大を
+再計算していた（プロセス共有の GPU dispatch ロック保持中に発生する
+O(可視行数 × 次元数) の CPU 処理）。各行の絶対値最大は行自身の内容にのみ
+依存する定数のため、`GpuBatchBackend::try_new` で全行を 1 回だけ走査して
+`row_max_abs: Vec<f32>` へキャッシュし、`batch_search` 呼び出し時は
+`PolicyContext` グループの可視行 index に対する単純な配列参照 + 最大値
+集約（`max_abs_finite_from_precomputed_rows`）だけで済ませる。
 
 ## 7. スコープ外・申し送り
 
