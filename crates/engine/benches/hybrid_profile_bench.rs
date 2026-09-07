@@ -99,13 +99,13 @@ use harness::scan_stage_profile::{
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
-use engine::hybrid::{hybrid_search, sparse_refetch_observed, RrfConfig};
-use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
+use engine::hybrid::{hybrid_search, rrf_fuse, sparse_refetch_observed, RrfConfig};
+use engine::kernel::{CandidateHit, CpuScalarProvider, SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
 use engine::row_codec::{encode_scalar_columns, Value};
 use engine::search_engine;
-use engine::sparse::SparseIndex;
+use engine::sparse::{ScoredDoc, SparseIndex};
 use engine::storage::{RowInput, Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
@@ -809,7 +809,37 @@ fn main() {
     let mut b3_round_medians = Vec::with_capacity(rounds as usize);
     let mut b4_round_medians = Vec::with_capacity(rounds as usize);
     let mut b5_round_medians = Vec::with_capacity(rounds as usize);
+    let mut b7_round_medians = Vec::with_capacity(rounds as usize);
     let mut b8_round_medians = Vec::with_capacity(rounds as usize);
+
+    // Issue #549 参考値: B7_fuse_lower_bound（`rrf_fuse` 単体の下限近似）。密・疎
+    // それぞれの Top-`pool_depth` 候補を計測外（ラウンドループの前）で事前に捕捉し、
+    // 計測区間には `hybrid::rrf_fuse` の呼び出しのみを含める。境界同点グループ完全化
+    // （Issue #310・#320）の再取得コストは含まない「融合コアだけの処理時間」の
+    // 下限近似であり、B4（`hybrid_search`。再取得込みの実効値）と対にして参照する
+    // （申し送り: 前後比較・採否は #550／#547 の担当。本ベンチは参考値の記録のみ）。
+    let b7_precomputed: Vec<(Vec<CandidateHit>, Vec<ScoredDoc>)> = queries
+        .iter()
+        .map(|q| {
+            let input = SearchInput {
+                ids: &corpus.ids,
+                vectors: &corpus.vectors,
+                dim: corpus.dim,
+                query: &q.vector,
+                k: pool_depth,
+            };
+            let dense = ParallelSearchProvider
+                .search(input)
+                .unwrap_or_else(|e| fail_closed(format!("B7 precompute dense search failed: {e}")));
+            let mut sparse = sparse_refetch_observed(&sparse_index, &q.text, &visible, &cfg)
+                .unwrap_or_else(|e| {
+                    fail_closed(format!("B7 precompute sparse_refetch_observed failed: {e}"))
+                })
+                .0;
+            sparse.truncate(pool_depth);
+            (dense, sparse)
+        })
+        .collect();
 
     // fail-closed 整合性検証: B1（SQL hybrid・SELECT id）が返す id 集合が
     // B4（直接 API・hybrid_search）と一致することを、ラウンドループの前に
@@ -996,6 +1026,18 @@ fn main() {
         .unwrap_or_else(|e| fail_closed(format!("B5 measurement failed: {e}")));
         b5_round_medians.push(m.summary.median);
 
+        // B7_fuse_lower_bound: `rrf_fuse` 単体（参考値。密・疎の取得コストは含まない
+        // 下限近似。Issue #549）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let (dense, sparse) = &b7_precomputed[query_idx % b7_precomputed.len()];
+            query_idx += 1;
+            rrf_fuse(dense, sparse, &cfg)
+                .unwrap_or_else(|e| fail_closed(format!("B7 rrf_fuse failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("B7 measurement failed: {e}")));
+        b7_round_medians.push(m.summary.median);
+
         // B8_visible_set_build: 残差内訳（可視集合 BTreeSet 構築。std 操作のみ）。
         let m = run(&config, || {
             corpus.ids.iter().copied().collect::<BTreeSet<u64>>()
@@ -1028,6 +1070,15 @@ fn main() {
             b4.as_micros(),
             b5.as_micros(),
             b8.as_micros(),
+        );
+    }
+    // B7 は Issue #549 で追加した参考値のため、上記の 8 段タプルとは別に単独ループで
+    // per-round 生データを出力する（既存タプル連結を組み替えて破壊するリスクを避ける）。
+    for (round, b7) in b7_round_medians.iter().enumerate() {
+        println!(
+            "hybrid_profile: baseline_round_raw_b7 round={} B7={}us",
+            round + 1,
+            b7.as_micros(),
         );
     }
 
@@ -1067,10 +1118,20 @@ fn main() {
         .unwrap_or_else(|e| fail_closed(format!("min_of(B5) failed: {e}")));
     let med_b5 = median_of(&b5_round_medians)
         .unwrap_or_else(|e| fail_closed(format!("median_of(B5) failed: {e}")));
+    let min_b7 = min_of(&b7_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(B7) failed: {e}")));
+    let med_b7 = median_of(&b7_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(B7) failed: {e}")));
     let min_b8 = min_of(&b8_round_medians)
         .unwrap_or_else(|e| fail_closed(format!("min_of(B8) failed: {e}")));
     let med_b8 = median_of(&b8_round_medians)
         .unwrap_or_else(|e| fail_closed(format!("median_of(B8) failed: {e}")));
+
+    println!(
+        "hybrid_profile: baseline_summary_b7 B7(min={}us,median={}us)",
+        min_b7.as_micros(),
+        med_b7.as_micros(),
+    );
 
     println!(
         "hybrid_profile: baseline_summary B0s(min={}us,median={}us) B0(min={}us,median={}us) \
@@ -1135,6 +1196,11 @@ fn main() {
     render_bucket("projection(B2-B1)", projection_diff, Some((min_b1, min_b2)));
     render_bucket("dense(B0)", Some(min_b0), None);
     render_bucket("sparse(B5)", Some(min_b5), None);
+    render_bucket(
+        "fuse_lower_bound(B7, informational, Issue #549)",
+        Some(min_b7),
+        None,
+    );
     render_bucket("residual(B4-B0-B5)", residual_diff, None);
     render_bucket(
         "residual_minus_visible_set_build(B4-B0-B5-B8)",

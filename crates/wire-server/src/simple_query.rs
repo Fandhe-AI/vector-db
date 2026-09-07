@@ -287,6 +287,24 @@ fn cached_emergency_response_bytes() -> Option<&'static Vec<u8>> {
 /// `RowDescription`/`DataRow` エンコードは両者で共通（`ColumnMeta`/`ResultRow`
 /// の汎用性による）。`EXPLAIN` の CommandComplete タグは pg 互換で行数を
 /// 付けない（`"EXPLAIN"` 固定。検索 SELECT は既存どおり `"SELECT <行数>"`）。
+///
+/// Issue #481: 以前は `RowDescription`・各 `DataRow`・`CommandComplete`・
+/// `ReadyForQuery` をそれぞれ個別の `write_all`（行数 + 3 回のシステムコール）
+/// で送出しており、`docs/design/knn-wire-stage-profile.md`「スコープ外・
+/// 申し送り」でこの点が先送りされていた。`crate::response_buffer::
+/// ResponseBuffer` へ全フレームを積み、上限
+/// （`crate::limits::MAX_RESPONSE_BUFFER_BYTES`）を超えない限り最後に一括
+/// `flush` することで、応答一式が上限以下に収まる大半のケースでは
+/// 1 回の `write_all` になる。上限超過時はフレーム境界で分割送出する
+/// （`ResponseBuffer` のドキュメント参照。「拒否」ではなくバッファ有界化の
+/// ためのフラッシュ閾値）。
+///
+/// `_response_boundary`（RECOVER-5 (3)）・`_emergency_registration`
+/// （RECOVER-6）との関係: 本関数はいずれも `execute_and_respond` が
+/// 「outcome を決定する区間」を抜けた後（`_emergency_registration` の
+/// スコープ外）に呼ばれ、`_response_boundary` の生存区間内で完結する。
+/// バッファ組み立て自体はメモリ上の操作でしかなく、commit 成功境界・
+/// 応答一意性の契約（`_response_boundary`）には影響しない。
 fn respond_query_result(
     stream: &mut TcpStream,
     result: &engine::sql::exec::QueryResult,
@@ -302,20 +320,43 @@ fn respond_query_result(
             )
         }
     };
-    write_all(stream, &row_desc)?;
+
+    // 初期確保は上限（`MAX_RESPONSE_BUFFER_BYTES`）を超えない範囲での概算
+    // ヒント（`RowDescription` 長 + 行数 × 64 バイト目安）に留める（untrusted
+    // 入力に基づく無制限確保を避ける規約に従う。実サイズが見積りを超えても
+    // `Vec` は必要に応じて再確保するだけで、上限超過時は `push_frame` が
+    // 途中で `flush` する）。
+    let hint = row_desc
+        .len()
+        .saturating_add(result.rows.len().saturating_mul(64));
+    let mut buffer = crate::response_buffer::ResponseBuffer::with_capacity_hint(
+        crate::limits::MAX_RESPONSE_BUFFER_BYTES,
+        hint,
+    );
+    buffer.push_frame(stream, &row_desc)?;
 
     for row in &result.rows {
-        let data_row = match result_encoder::encode_data_row(row) {
-            Ok(msg) => msg,
+        let start = buffer.frame_start();
+        match result_encoder::encode_data_row_into(row, buffer.as_mut_vec()) {
+            Ok(()) => {}
             Err(_) => {
+                // 失敗時は `encode_data_row_into` 自身が書きかけを巻き戻し
+                // 済みだが、念のため呼び出し側でも同じ位置まで truncate する
+                // （in-place エンコードの契約: `start` の直後から追記する前提が
+                // 崩れた場合の防御）。完成済みフレームは先に送出してから
+                // ErrorResponse へ切り替える（部分フレームを絶対に残さない）。
+                buffer.truncate_to(start);
+                buffer.flush(stream)?;
                 return respond_error_and_ready(
                     stream,
                     ErrorClass::InternalError,
                     "failed to encode data row",
-                )
+                );
             }
-        };
-        write_all(stream, &data_row)?;
+        }
+        if buffer.len() >= crate::limits::MAX_RESPONSE_BUFFER_BYTES {
+            buffer.flush(stream)?;
+        }
     }
 
     let tag = if command_tag == "EXPLAIN" {
@@ -325,13 +366,149 @@ fn respond_query_result(
     };
     match result_encoder::encode_command_complete(&tag) {
         Ok(msg) => {
-            write_all(stream, &msg)?;
-            crate::handshake::write_ready_for_query_io(stream)
+            buffer.push_frame(stream, &msg)?;
+            buffer.push_frame(stream, &result_encoder::encode_ready_for_query())?;
+            buffer.flush(stream)
         }
-        Err(_) => respond_error_and_ready(
-            stream,
-            ErrorClass::InternalError,
-            "failed to encode command complete response",
-        ),
+        Err(_) => {
+            buffer.flush(stream)?;
+            respond_error_and_ready(
+                stream,
+                ErrorClass::InternalError,
+                "failed to encode command complete response",
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::catalog::ColumnType;
+    use engine::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+    use std::net::TcpListener;
+
+    /// 実ソケットを介したループバック対（`protocol_dispatch.rs::tests::
+    /// loopback_pair` と同じパターン）。大容量応答の送信ブロックを避けるため、
+    /// 呼び出し元は必ず受信を別スレッドで並行実行すること（送信バッファの
+    /// 詰まりによるデッドロックを避ける）。
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        (server, client)
+    }
+
+    fn read_exact_owned(stream: &mut TcpStream, len: usize) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).expect("read_exact");
+        buf
+    }
+
+    /// `respond_query_result` が組み立てるバイト列は、個別エンコード
+    /// （`RowDescription` + 各 `DataRow` + `CommandComplete` + `ReadyForQuery`
+    /// をそれぞれ `Vec<u8>` として結合したもの）と完全に一致すること
+    /// （Issue #481: 送出回数を変えても内容は不変という契約の固定）。
+    #[test]
+    fn respond_query_result_matches_individually_encoded_concatenation() {
+        let columns = vec![
+            ColumnMeta::Id,
+            ColumnMeta::Scalar {
+                name: "body".to_string(),
+                ty: ColumnType::Text,
+            },
+        ];
+        let rows: Vec<ResultRow> = (0..50)
+            .map(|i| ResultRow {
+                id: i,
+                score: 0.0,
+                cells: vec![Cell::Integer(i), Cell::Text(format!("row-{i}"))],
+            })
+            .collect();
+        let result = QueryResult {
+            columns: columns.clone(),
+            rows: rows.clone(),
+        };
+
+        let mut expected = result_encoder::encode_row_description(&columns).expect("row desc");
+        for row in &rows {
+            expected.extend_from_slice(&result_encoder::encode_data_row(row).expect("data row"));
+        }
+        expected.extend_from_slice(
+            &result_encoder::encode_command_complete(&format!("SELECT {}", rows.len()))
+                .expect("command complete"),
+        );
+        expected.extend_from_slice(&result_encoder::encode_ready_for_query());
+
+        let (mut server, mut client) = loopback_pair();
+        let expected_len = expected.len();
+        let reader = std::thread::spawn(move || read_exact_owned(&mut client, expected_len));
+        respond_query_result(&mut server, &result, "SELECT").expect("respond");
+        let received = reader.join().expect("reader thread");
+
+        assert_eq!(received, expected);
+    }
+
+    /// 行の途中でエンコード不能な行（`i16` に収まらないセル数）が混在する場合、
+    /// 完成済みフレーム（`RowDescription` + 先行 `DataRow`）を送出してから
+    /// `ErrorResponse`（`XX000`）+ `ReadyForQuery` へ切り替わり、部分フレームが
+    /// 混入しないこと（Issue #481: `ResponseBuffer`/`encode_data_row_into` の
+    /// 巻き戻し契約の end-to-end 確認）。
+    #[test]
+    fn respond_query_result_flushes_completed_rows_then_errors_on_unencodable_row() {
+        let columns = vec![ColumnMeta::Id];
+        let good_row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Integer(1)],
+        };
+        // i16::MAX + 1 セルは `encode_data_row_into` を必ず失敗させる。
+        let bad_row = ResultRow {
+            id: 2,
+            score: 0.0,
+            cells: vec![Cell::Null; 32_768],
+        };
+        let result = QueryResult {
+            columns: columns.clone(),
+            rows: vec![good_row.clone(), bad_row],
+        };
+
+        let mut expected_prefix =
+            result_encoder::encode_row_description(&columns).expect("row desc");
+        expected_prefix
+            .extend_from_slice(&result_encoder::encode_data_row(&good_row).expect("data row"));
+
+        let (mut server, mut client) = loopback_pair();
+        let reader = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).expect("read_to_end");
+            buf
+        });
+        respond_query_result(&mut server, &result, "SELECT").expect("respond");
+        drop(server);
+        let received = reader.join().expect("reader thread");
+
+        assert!(
+            received.starts_with(&expected_prefix),
+            "completed RowDescription + first DataRow must be flushed before the error"
+        );
+        let tail = &received[expected_prefix.len()..];
+        assert_eq!(
+            tail.first().copied(),
+            Some(b'E'),
+            "must switch to ErrorResponse"
+        );
+        assert!(
+            tail.windows(5).any(|w| w == b"XX000"),
+            "internal encode failure must surface as XX000"
+        );
+        assert_eq!(
+            tail.last().copied(),
+            Some(b'I'),
+            "must still send ReadyForQuery after the error"
+        );
     }
 }

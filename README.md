@@ -22,7 +22,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - **安全性**: RLS 相当のテナント境界・fail-closed のエラー契約（SQLSTATE 風 `wire_code`）
 - **検索結果順序**: スコア順 Top-k・RRF 融合結果はいずれもスコア降順・同点は id 昇順で決定的（判断根拠は [`docs/design/rrf-tie-break-determinism.md`](docs/design/rrf-tie-break-determinism.md)）。ただし複数テナントを 1 バッチで扱うバッチ検索経路（`batch_search.rs`）では、同点タイブレークは常駐行列の行スロット昇順であり、行を `(tenant_id, id)` キー順（`Storage` の行キー順）で常駐行列へ渡すという事前条件のもとで `(tenant_id, id)` 昇順になる（単一テナント内では従来どおり id 昇順。CPU 経路・GPU 経路とも同一）
 - **依存最小方針**: 依存の追加・更新は必ずユーザー承認を経て行い、`=x.y.z` 完全固定で管理する
-- **バッチ検索の GPU 経路**: 一括インデクシング専用のバッチ検索（TASK-128〜130）は `wgpu`（=30.0.1・依存追加はオーナー承認済み〔2026-08-26〕）による実 GPU バックエンドを持ち、初期化失敗・実行時エラー時は CPU-SIMD 経路へ fail-closed に縮退する（詳細: [`docs/design/gpu-batch-wgpu-enablement.md`](docs/design/gpu-batch-wgpu-enablement.md)）。単発クエリ経路は引き続き CPU-SIMD のみ
+- **バッチ検索の GPU 経路**: 一括インデクシング専用のバッチ検索（TASK-128〜130）は `wgpu`（=30.0.1・依存追加はオーナー承認済み〔2026-08-26〕）による実 GPU バックエンドを持ち、初期化失敗・実行時エラー時は CPU-SIMD 経路へ fail-closed に縮退する（詳細: [`docs/design/gpu-batch-wgpu-enablement.md`](docs/design/gpu-batch-wgpu-enablement.md)）。単発クエリ経路は引き続き CPU-SIMD のみ。GPU 側 workgroup 内部分 Top-k（共有メモリ上の bitonic ソート網＋CPU 側 `TopKSelector` 最終マージ）は [`docs/design/gpu-batch-topk.md`](docs/design/gpu-batch-topk.md)（Issue #535 で設計・#536 で実装済み。前後比較は #537）
 - **hybrid 検索の疎索引**: BM25 疎索引（`SparseIndex`）は転置索引（posting list）＋可視ビットマップ 1 パス走査方式で、RLS 可視集合へ統計（df・N・avgdl）自体を縮約する fail-closed 設計（posting へのスコアリング走査のみがコーパス文書数への線形走査から脱却し、可視集合走査 `O(|visible_ids|)`・スコアアキュムレータ初期化 `O(N)` は残る。詳細: [`docs/design/sparse-inverted-index.md`](docs/design/sparse-inverted-index.md)）
 - **ANN 索引（opt-in）**: 既定の検索エンジンは厳密最近傍（brute-force）のまま不変。`SearchEngineKind::Hnsw`（自作 HNSW・依存追加なし）を明示的に選択したときのみ opt-in で有効化される（ADR: [`docs/design/ann-index-adoption.md`](docs/design/ann-index-adoption.md) B 案）。適用状況は `EXPLAIN` の `engine:`／`ann_plan:` 行で確認できる。前後比較・opt-in 手順の詳細は下記「ANN（HNSW）opt-in 手順と前後比較（Issue #413）」節を参照
 - **他実装比較・チップ別カーネル設計指針**: 他実装のホットパス手法・採否候補・ライセンス帰属は [`docs/design/hotpath-implementation-survey.md`](docs/design/hotpath-implementation-survey.md)、チップ別設計指針と Rust stable での intrinsics 可用性は [`docs/design/chip-kernel-guidelines.md`](docs/design/chip-kernel-guidelines.md)（いずれも調査記録・採用決定は各 Phase Issue）。intrinsics 導入方針 ADR（unsafe 境界・set 構築ロード・ディスパッチ設計・toolchain 1.98・適用経路）は [`docs/design/simd-intrinsics-adoption.md`](docs/design/simd-intrinsics-adoption.md)（Issue #508・ステータス Proposed・オーナー承認待ち）。`isa.rs::dot_lanes` の零埋め固定長バッファによる分岐なし tail（AVX2／AVX-512／NEON。順序保存・既定経路は現行のスカラー tail のまま不変）は [`docs/design/dot-kernel-branchless-tail.md`](docs/design/dot-kernel-branchless-tail.md)（Issue #528。既定切替の採否は Issue #529）
@@ -252,6 +252,23 @@ INSERT_MODE`（`insert`〔既定〕／`reserve`）で I6 段の redb `insert_res
 Phase 2（親 Issue #395）を通した前後比較・棄却判断（RECOVER-5／RECOVER-6／
 RECOVER-8 ポインタ）・バッチ上限の申し送りは `docs/design/ingest-write-path.md`
 （Issue #401）を参照してください。
+
+`BENCH_INGEST_PROFILE_MODE`（`batch`〔既定〕／`single`。Issue #484）で、
+上記のバッチ経路とは別に crossdb ベンチが実際に通る**単文** `INSERT` 経路
+（wire 簡易クエリ → SQL 表層 → `tenant::insert_typed_row_unchecked`〔1 文 1
+write txn〕）の段別内訳（`parse_bind`／`typed_row_api`／`sql_surface` の
+3 tier ＋ I1〜I8）を計測できます。`single` モードでは
+`BENCH_INGEST_PROFILE_STATEMENTS`（既定 25,000・2,000〜100,000）で単文数を
+上書きでき、`BENCH_INGEST_PROFILE_ROWS` は無視されます（`BENCH_INGEST_
+PROFILE_INSERT_MODE=reserve` は `batch` 専用機能のため `single` では
+fail-closed に拒否）。`make bench-ingest-wire-profile`
+（`crates/wire-server/benches/ingest_wire_profile_bench.rs`）は同じ単文
+`INSERT` 経路を wire プロトコル経由（in-process ループバック）で計測し、
+engine 側 `sql_surface` tier との差分から wire 往復自体の寄与を切り分けます
+（`BENCH_INGEST_WIRE_ROWS`〔既定 25,000・5,000〜100,000。`BENCH_INGEST_WIRE_
+ROUNDS` で割り切れる値のみ〕・`BENCH_INGEST_WIRE_ROUNDS`〔既定 5・5〜50〕・
+`BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定可能）。実測結果は
+`docs/design/ingest-stage-profile.md`「Issue #484 追記」節を参照してください。
 
 ### クロスエンコーダリランカーの実測手順（Issue #333）
 

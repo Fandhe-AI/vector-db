@@ -399,6 +399,19 @@ else
 endif
 
 # --------------------------------------------------
+# wgpu アダプタの features／limits を出力する検出ツール
+# （Issue #535。crates/engine/examples/gpu_adapter_info.rs）
+# --------------------------------------------------
+
+.PHONY: gpu-adapter-info
+gpu-adapter-info: ## Issue #535（wgpu SUBGROUP 可用性設計）向けの adapter features／limits 表を出力する（時間非依存・spec 閾値なしの情報提供専用のため ci には含めない。手動実行専用。出力は docs/design/gpu-batch-topk.md へ転記する運用）
+ifdef HAS_CARGO
+	cargo run -p engine --release --example gpu_adapter_info
+else
+	@echo "skip: Cargo.toml 未追加のため gpu-adapter-info をスキップ"
+endif
+
+# --------------------------------------------------
 # 全行走査経路（agg_count／rls_isolation／vector_knn_where）の段別内訳プロファイル（Issue #464。crates/engine/benches/scan_stage_profile_bench.rs）
 # --------------------------------------------------
 
@@ -430,11 +443,24 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-ingest-profile
-bench-ingest-profile: ## Issue #396（ingest 経路の段別内訳プロファイル。所有権検査・content_hash・台帳記録・encode・redb insert・世代更新・commit の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_INGEST_PROFILE_ROWS／BENCH_INGEST_PROFILE_DIM で規模を上書き可能。BENCH_INGEST_PROFILE_INSERT_MODE=insert|reserve で I6 段の redb insert_reserve A/B 計測モードを切替可能〔Issue #400・既定 insert〕）
+bench-ingest-profile: ## Issue #396（ingest 経路の段別内訳プロファイル。所有権検査・content_hash・台帳記録・encode・redb insert・世代更新・commit の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_INGEST_PROFILE_MODE=batch|single〔既定 batch。single は Issue #484: 単文 INSERT 経路の P0/E0/S0/I1〜I8 内訳〕。batch モード: BENCH_INGEST_PROFILE_ROWS／BENCH_INGEST_PROFILE_DIM で規模を上書き可能。BENCH_INGEST_PROFILE_INSERT_MODE=insert|reserve で I6 段の redb insert_reserve A/B 計測モードを切替可能〔Issue #400・既定 insert・single モードは insert のみ対応〕。single モード: BENCH_INGEST_PROFILE_STATEMENTS（既定 25,000・2,000〜100,000）で単文数を上書き可能）
 ifdef HAS_CARGO
 	cargo bench --bench ingest_profile_bench -p engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-ingest-profile をスキップ"
+endif
+
+# --------------------------------------------------
+# 単文 INSERT の wire 往復内訳プロファイル
+# （Issue #484。crates/wire-server/benches/ingest_wire_profile_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-ingest-wire-profile
+bench-ingest-wire-profile: ## Issue #484（単文 INSERT の wire 往復内訳。`bench-ingest-profile MODE=single` が計測する engine 内部段を補い wire プロトコル層自体の寄与を切り分ける）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_INGEST_WIRE_ROWS（既定 25,000・5,000〜100,000。BENCH_INGEST_WIRE_ROUNDS で割り切れる値のみ）・BENCH_INGEST_WIRE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる
+ifdef HAS_CARGO
+	cargo bench --bench ingest_wire_profile_bench -p wire-server
+else
+	@echo "skip: Cargo.toml 未追加のため bench-ingest-wire-profile をスキップ"
 endif
 
 # --------------------------------------------------
