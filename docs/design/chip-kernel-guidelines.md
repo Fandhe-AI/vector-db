@@ -269,7 +269,9 @@ Issue #365 で行内マルチアキュムレータ化は不採用済み（cache 
 Issue #365（行内複数アキュムレータ）は cache 常駐 dim100/dim128 の小次元で
 悪化したことを理由に不採用としたが（dim384 は cache 常駐で改善・arena 規模で
 非劣化）、arena 規模かつ dim>=768 限定では改善が確認されている。
-本 doc §3 の優先 1〜7 はいずれも dim>=768 限定ディスパッチ（#517）や量子化
+本 doc §3 の優先 1〜7 はいずれも dim>=768 限定ディスパッチ（#517。dot カーネルの
+実装は #518 で完了・[`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md)
+「Issue #518 追記」節参照。閾値確定・チップ別実測は #519）や量子化
 opt-in 経路（#520 等）に閉じており、#365 が不採用とした「全 dim 一律の複数
 アキュムレータ化」を再提案するものではない。詳細な対応表は
 [`docs/design/hotpath-implementation-survey.md`](hotpath-implementation-survey.md)
@@ -328,7 +330,7 @@ Intel）での手動計測が必要になる。手順は README「チップ別�
 
 ### 7.3 参照区間の指定（施策別）
 
-dot カーネル変更（#517 等）の参照区間は、dot を通らない `feature_bench` フェーズ
+dot カーネル変更（#517・実装は #518。閾値確定・実測は #519）の参照区間は、dot を通らない `feature_bench` フェーズ
 （例: `agg_count`・`explain`・`where_compound`）と `knn_profile` の
 `S1_redb_scan`／`S2_header_decode`（`chip_bench` の `knn_profile` ワークロードが
 同時に計測する）を用いる。f16 常駐・行間マイクロカーネル等、施策ごとの

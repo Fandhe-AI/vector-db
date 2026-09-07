@@ -28,6 +28,34 @@
 //! ソース走査で不在を検査する）。未検証の ISA 指定で `unsafe` カーネルを強制
 //! 起動させる攻撃面を、機構の不存在によって構造的に排除する。
 //!
+//! # dim 閾値ディスパッチ（Issue #365 の条件付き再訪・Issue #517/#518）
+//!
+//! [`dot_lanes`] の複数アキュムレータ化（ACC=4）は Issue #365
+//! （`docs/design/dot-kernel-multi-accumulator.md`）の実測で、cache 常駐の
+//! dim100/128 は悪化する一方 dim768/1536 は改善することが分かっている。本モジュールは
+//! その知見を踏まえ、[`DOT_MULTI_ACC_MIN_DIM`]（=768）以上の入力長でのみ
+//! [`dot_lanes_multi_acc`] へ分岐し、それ未満は既存 [`dot_lanes`] を**ビット同一の
+//! まま**通す（`dot_neon`／`dot_avx2_fma`／`dot_avx512` の各 `#[target_feature]` fn
+//! 内で分岐する。分岐そのものは新規 `unsafe` を要さない純粋な長さ判定）。
+//! dim<768 の経路・[`dot_lanes`] 本体は本変更で一切変更しない。dim>=768 は演算順が
+//! 変わるため丸め誤差が変化しうるが、`kernel::dot` を共有する全 provider
+//! （`CpuScalarProvider`・`ParallelSearchProvider`・バッチ経路・RLS 事前フィルタ）は
+//! 同一 ISA・同一 dim で同一の分岐結果・同一の演算順を共有するため、provider 間の
+//! Top-k 整合という既存設計意図は保たれる。[`SimdKernel::dot_block4`]
+//! （`ParallelSearchProvider`・`parallel_search.rs::search_range` が呼ぶ行ブロック
+//! カーネル）の intrinsics 本体は `dot_lanes_multi_acc` へ対応させていないため、
+//! [`SimdKernel::dot_block4_impl`] は dim>=[`DOT_MULTI_ACC_MIN_DIM`] を
+//! 「4 行の長さが不揃いなときの縮退経路」（1 行版 `dot_impl` を 4 回呼ぶ）へ
+//! 意図的に合流させ、`dot_block4` 経由の呼び出しにも多アキュムレータ化の効果を
+//! 波及させつつ 1 行版とのビット同一契約を維持する（新規 intrinsics カーネルは
+//! 追加しない）。tail 処理方式の切り替え
+//! （`PADDED_TAIL`。Issue #528）は [`dot_lanes_multi_acc`] にも貫通させ、
+//! [`reduce_lanes`] を経由することで dim>=768 でも [`SimdKernel::dot_with_scalar_tail`]／
+//! [`SimdKernel::dot_with_padded_tail`] の契約を dim<768 と同一の形で維持する
+//! （手書きの逐次和で tail を再実装しない）。実測に基づく閾値の確定・チップ別実測は
+//! 別 Issue（#519）の担当（`docs/design/dot-kernel-multi-accumulator.md`
+//! 「Issue #518 追記」節参照）。
+//!
 //! # 呼び出し文脈
 //!
 //! - `dispatch.rs::detect_current_isa()` は本モジュールの [`current`] へ委譲する
@@ -89,6 +117,18 @@ mod x86_block4;
 /// `unsafe` 呼び出しする。
 #[cfg(target_arch = "aarch64")]
 mod neon_block4;
+/// dim 閾値ディスパッチ（Issue #517/#518）で選択する複数アキュムレータ本数。
+/// Issue #365 の実測で dim768/1536 が改善した値（ACC=4）をそのまま採用する。
+const DOT_ACCUMULATORS: usize = 4;
+
+/// この長さ（`a.len().min(b.len())`）以上の入力で [`dot_lanes_multi_acc`] へ
+/// 分岐する閾値（Issue #517/#518）。`pub` にして `docs/design/
+/// dot-kernel-multi-accumulator.md` の前後比較・後続 Issue #519 のベンチ／テストから
+/// 参照できるようにするが、外部からの上書き機構（環境変数・設定ファイル等）は
+/// 一切持たない定数であり CORE-12 の禁止事項には抵触しない
+/// （`tests/isa.rs::isa_source_has_no_external_override_entry_points` 参照）。
+/// 閾値そのものの確定・チップ別実測は Issue #519 の担当。
+pub const DOT_MULTI_ACC_MIN_DIM: usize = 768;
 
 /// 実行時に検出された ISA。
 ///
@@ -307,8 +347,21 @@ impl SimdKernel {
             && r1.len() == query.len()
             && r2.len() == query.len()
             && r3.len() == query.len();
+        // dim>=`DOT_MULTI_ACC_MIN_DIM`（768）は 1 行版 `dot_impl`（`dot_neon`／
+        // `dot_avx2_fma`／`dot_avx512` 経由で `dot_lanes_multi_acc` へ分岐する。
+        // Issue #518 のスコープは「1 行版 `dot` のみ」で、本関数の intrinsics
+        // ブロックカーネル（`x86_block4`／`neon_block4`）は旧来どおり `dot_lanes`
+        // 相当の単一アキュムレータ構成のまま据え置く（行ブロック側の ACC=4 化は
+        // Issue #519 へ申し送り）。両者を同時に呼ぶ経路をそのままにすると
+        // `Self::dot_block4` の doc 契約「`dot_block4(rows, query)[i].to_bits()
+        // == self.dot(rows[i], query).to_bits()`」が dim>=768 で構造的に破れる
+        // （`kernel.rs::dot` を共有する `CpuScalarProvider` と
+        // `ParallelSearchProvider`〔`dot_block4` 経由〕の Top-k が同一クエリ内で
+        // 食い違いかねない）ため、dim>=768 は下記の「1 行版を 4 回呼ぶ」縮退経路
+        // （既存の非一様長フォールバックと同型）へ意図的に合流させ、契約を維持する。
+        let below_multi_acc_threshold = query.len() < DOT_MULTI_ACC_MIN_DIM;
 
-        if !uniform_len {
+        if !uniform_len || !below_multi_acc_threshold {
             return [
                 self.dot_impl::<PADDED_TAIL>(r0, query),
                 self.dot_impl::<PADDED_TAIL>(r1, query),
@@ -465,7 +518,13 @@ pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 fn dot_neon<const PADDED_TAIL: bool>(a: &[f32], b: &[f32]) -> f32 {
-    dot_lanes::<4, PADDED_TAIL>(a, b)
+    const LANES: usize = 4;
+    const WIDE: usize = LANES * DOT_ACCUMULATORS;
+    if a.len().min(b.len()) >= DOT_MULTI_ACC_MIN_DIM {
+        dot_lanes_multi_acc::<LANES, WIDE, PADDED_TAIL>(a, b)
+    } else {
+        dot_lanes::<LANES, PADDED_TAIL>(a, b)
+    }
 }
 
 /// x86_64 AVX2+FMA（256 bit・8 レーン）向け内積カーネル。
@@ -475,7 +534,13 @@ fn dot_neon<const PADDED_TAIL: bool>(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 fn dot_avx2_fma<const PADDED_TAIL: bool>(a: &[f32], b: &[f32]) -> f32 {
-    dot_lanes::<8, PADDED_TAIL>(a, b)
+    const LANES: usize = 8;
+    const WIDE: usize = LANES * DOT_ACCUMULATORS;
+    if a.len().min(b.len()) >= DOT_MULTI_ACC_MIN_DIM {
+        dot_lanes_multi_acc::<LANES, WIDE, PADDED_TAIL>(a, b)
+    } else {
+        dot_lanes::<LANES, PADDED_TAIL>(a, b)
+    }
 }
 
 /// x86_64 AVX-512（`avx512f`。512 bit・16 レーン）向け内積カーネル。
@@ -485,7 +550,13 @@ fn dot_avx2_fma<const PADDED_TAIL: bool>(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 fn dot_avx512<const PADDED_TAIL: bool>(a: &[f32], b: &[f32]) -> f32 {
-    dot_lanes::<16, PADDED_TAIL>(a, b)
+    const LANES: usize = 16;
+    const WIDE: usize = LANES * DOT_ACCUMULATORS;
+    if a.len().min(b.len()) >= DOT_MULTI_ACC_MIN_DIM {
+        dot_lanes_multi_acc::<LANES, WIDE, PADDED_TAIL>(a, b)
+    } else {
+        dot_lanes::<LANES, PADDED_TAIL>(a, b)
+    }
 }
 
 /// ISA 別カーネルの共通本体。`LANES` 個ずつのレーンアキュムレータへ `f32::mul_add`
@@ -503,6 +574,10 @@ fn dot_avx512<const PADDED_TAIL: bool>(a: &[f32], b: &[f32]) -> f32 {
 ///   左から右への逐次和（`iter().sum()`）で計算する。
 /// - `PADDED_TAIL == true`（[`SimdKernel::dot_with_padded_tail`]）: 端数を
 ///   [`padded_tail_sum`] へ委譲する（零埋め固定長バッファ経由の分岐なし tail）。
+///
+/// dim<[`DOT_MULTI_ACC_MIN_DIM`] の入力は常にこの本体を通る（Issue #518 でも本体は
+/// 一切変更していない。dim>=[`DOT_MULTI_ACC_MIN_DIM`] のときのみ呼び出し元
+/// （`dot_neon`／`dot_avx2_fma`／`dot_avx512`）が [`dot_lanes_multi_acc`] へ分岐する）。
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline]
 fn dot_lanes<const LANES: usize, const PADDED_TAIL: bool>(a: &[f32], b: &[f32]) -> f32 {
@@ -881,6 +956,63 @@ fn dot_f16_neon_fp16(a_bits: &[u16], b: &[f32]) -> f32 {
         .map(|(&bits, &y)| crate::f16::f16_bits_to_f32(bits) * y)
         .sum();
     lane_sum + rem_sum
+}
+
+/// dim 閾値ディスパッチ（Issue #517/#518）で選ばれる、複数アキュムレータ
+/// （`DOT_ACCUMULATORS` 本）版の内積本体。[`dot_lanes`] と同じ「ISA 別カーネルの
+/// 共通本体」だが、`WIDE`（`= LANES * DOT_ACCUMULATORS`）個ずつの平坦アキュムレータを
+/// 独立に回すことで FMA レイテンシを隠蔽する（`docs/design/
+/// dot-kernel-multi-accumulator.md`「設計: 2 段構造」節の採用形をそのまま実装）。
+/// `generic_const_exprs` が unstable のため `WIDE` は呼び出し側
+/// （`dot_neon`／`dot_avx2_fma`／`dot_avx512`）が計算して渡し、ここでは inline const
+/// で整合のみを固定する。
+///
+/// `#[inline(always)]` にする（`dot_lanes` の `#[inline]` とは意図的に強度を変える）
+/// 理由: `#[target_feature]` を付けた呼び出し元 fn の内側で確実にインライン化
+/// させないと、この関数が out-of-line なシンボルとしてコンパイルされ
+/// `#[target_feature]` の恩恵（AVX2+FMA・AVX-512 命令の生成）を失う。
+///
+/// 縮約は `dot_lanes` と同じ「固定順・逐次和」（`wide` の和 → `narrow` の和 →
+/// 端数和、の順で加算する。段階的な畳み込みや `as_chunks` の入れ子は使わない）。
+/// 添字アクセス（`[]` による単一要素アクセス）は使わず `zip`／イテレータのみで書く
+/// （.claude/rules/coding-rust.md）。`narrow` の縮約と端数（`a_rem`／`b_rem`）の
+/// 処理は [`dot_lanes`] と同じ [`reduce_lanes`] を経由させ、`PADDED_TAIL`
+/// （Issue #528 の tail 方式切り替え）を dim>=[`DOT_MULTI_ACC_MIN_DIM`] でも
+/// [`dot_lanes`] と同一の契約で維持する（手書きの逐次和には戻さない）。
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+fn dot_lanes_multi_acc<const LANES: usize, const WIDE: usize, const PADDED_TAIL: bool>(
+    a: &[f32],
+    b: &[f32],
+) -> f32 {
+    const { assert!(WIDE == LANES * DOT_ACCUMULATORS) };
+
+    let len = a.len().min(b.len());
+    let a = &a[..len];
+    let b = &b[..len];
+
+    let mut wide = [0f32; WIDE];
+    let (a_wide_chunks, a_wide_rem) = a.as_chunks::<WIDE>();
+    let (b_wide_chunks, b_wide_rem) = b.as_chunks::<WIDE>();
+
+    for (a_chunk, b_chunk) in a_wide_chunks.iter().zip(b_wide_chunks.iter()) {
+        for (acc, (x, y)) in wide.iter_mut().zip(a_chunk.iter().zip(b_chunk.iter())) {
+            *acc = x.mul_add(*y, *acc);
+        }
+    }
+
+    let mut narrow = [0f32; LANES];
+    let (a_narrow_chunks, a_rem) = a_wide_rem.as_chunks::<LANES>();
+    let (b_narrow_chunks, b_rem) = b_wide_rem.as_chunks::<LANES>();
+
+    for (a_chunk, b_chunk) in a_narrow_chunks.iter().zip(b_narrow_chunks.iter()) {
+        for (lane, (x, y)) in narrow.iter_mut().zip(a_chunk.iter().zip(b_chunk.iter())) {
+            *lane = x.mul_add(*y, *lane);
+        }
+    }
+
+    let wide_sum: f32 = wide.iter().sum();
+    wide_sum + reduce_lanes::<LANES, PADDED_TAIL>(narrow, a_rem, b_rem)
 }
 
 #[cfg(test)]

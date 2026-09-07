@@ -1,8 +1,10 @@
 # `isa.rs` dot カーネルの複数アキュムレータ化検討
 
-- ステータス: **現状維持で close 可**（本コミットで計測ベンチ・ADR を追加。
-  `crates/engine/src/isa.rs` の production コードは無変更）
-- 対応: Issue #365（`perf(engine): isa.rs dot カーネルの複数アキュムレータ化`）
+- ステータス: Issue #365 時点は**現状維持で close 可**（全 dim 一律の ACC=4 化は
+  不採用）。Issue #517/#518 で条件付き再訪し、**dim 閾値（768）による ACC=4
+  経路のディスパッチとして採用**（「Issue #518 追記」節参照）
+- 対応: Issue #365（`perf(engine): isa.rs dot カーネルの複数アキュムレータ化`）・
+  Issue #517（親）・Issue #518（実装）
 - 前提: Issue #362（`docs/design/knn-stage-profile.md`「`dot_lanes` の実
   アセンブリ確認」節）で、AVX2+FMA 環境の `dot_avx2_fma` が単一 FMA 依存チェーン
   （4 段 unroll だが実質 1 系統）に律速されていることが判明済み
@@ -489,3 +491,49 @@ CARGO_TARGET_DIR=/path/to/target-after cargo build --release --bench chip_bench 
   （`docs/design/dot-kernel-row-block.md` §6 と同一のスコープ外）
 - production 変更（`parallel_search.rs`・`isa.rs`）は無変更（本 Issue はテスト・
   ベンチ・docs 専任。撤回条件を満たしていないため撤回作業も対象外）
+
+## Issue #518 追記: dim 閾値による ACC=4 経路のディスパッチ
+
+Issue #365 が不採用とした理由は「全 dim 一律の ACC=4 化」が小次元（dim100/128）
+を悪化させる点にあり、dim768/1536 側は改善方向だった。Issue #517（親）・
+Issue #518（実装）はこの知見を踏まえ、**ベクトル長を実行時に見て閾値
+（`isa::DOT_MULTI_ACC_MIN_DIM` = 768）以上のときだけ** `dot_lanes_multi_acc`
+（ACC=4）へ分岐し、閾値未満は既存 `dot_lanes` を変更せずそのまま通す構成で
+条件付き採用した。
+
+- 分岐は `dot_neon`／`dot_avx2_fma`／`dot_avx512` の各 `#[target_feature]` fn
+  内で `a.len().min(b.len()) >= DOT_MULTI_ACC_MIN_DIM` により行い、新規
+  `unsafe` は追加していない（`tests/isa.rs::
+  unsafe_is_confined_to_isa_module_with_safety_comments` の個数 3 は不変）
+- dim<768 の経路は `dot_lanes` 本体を一切変更していないため、dim=128 を含む
+  既存テストはすべて無変更で green（受け入れ条件）
+- dim>=768 は演算順が変わるため丸め誤差が変化しうるが、本リポの Recall
+  フィクスチャ（`hybrid_recall.rs`・`rerank_recall.rs`・
+  `sparse_cache_recall.rs` の大規模段は dim 800、`query_planning_recall.rs`
+  は dim 1000）はいずれも 0/1 の整数値ベクトル（one-hot 系）を使っており、
+  整数値の内積は加算順序に依らず厳密に一致するため、層 A 固定値アサーション
+  は構造的に不変である。実測でも `cargo test --workspace` は全 green
+  （層 A 固定値含む）を確認済み
+- AVX2+FMA 以外（AVX-512・NEON）での実測は本 Issue の範囲外（Issue #365 と
+  同じ限界を引き継ぐ）。閾値そのものの確定・チップ別実測・前後比較は
+  Issue #519 の担当
+- `PADDED_TAIL`（tail 処理方式切り替え。Issue #528）は `dot_lanes_multi_acc`
+  にも貫通させ、端数（`a_rem`／`b_rem`）と `narrow` レーンの縮約は `dot_lanes`
+  と同じ `reduce_lanes` を経由する（手書きの逐次和には戻さない）。これにより
+  `SimdKernel::dot_with_scalar_tail`／`dot_with_padded_tail` の契約は
+  dim>=768 でも dim<768 と同一の形で維持される
+- `SimdKernel::dot_block4`（行ブロックカーネル。Issue #510・#511・
+  `docs/design/dot-kernel-row-block.md`）の intrinsics 本体
+  （`x86_block4`／`neon_block4`）自体は `dot_lanes_multi_acc` へ対応させて
+  いない（行ブロック側の ACC=4 化は本 Issue のスコープに含めない・要否は
+  Issue #519 へ申し送り）。dim>=768 でも `dot_block4(rows, query)[i] ==
+  dot(rows[i], query)` というビット同一契約（`kernel.rs::dot` を共有する
+  `CpuScalarProvider`・`ParallelSearchProvider` 間の Top-k 整合の根拠）を
+  崩さないため、`isa.rs::SimdKernel::dot_block4_impl` は dim>=768 を
+  「4 行と `query` の長さが不揃いなときの縮退経路」（1 行版 `dot_impl` を
+  4 回呼ぶ既存経路）へ意図的に合流させた。dim>=768 は非一様長ではないが、
+  同じ「intrinsics ブロックカーネルへ入らず 1 行版を 4 回呼ぶ」経路を再利用
+  することで、1 行版が `dot_lanes_multi_acc` へ分岐した効果を `dot_block4`
+  経由の呼び出しにも自動的に波及させる（新規 intrinsics カーネルの追加なし）。
+  `tests/isa.rs::dot_block4_matches_single_row_dot_bit_exact_across_dims` は
+  dim 768/1000/1536 を含む元の全 dim 帯でビット同一のまま検証する
