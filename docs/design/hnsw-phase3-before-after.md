@@ -63,7 +63,7 @@ run-to-run 幅として算出し、共変区間であることを明記する。
 | --- | --- | --- |
 | prefetch（#490） | ○ | opt-in 経路の探索で常に動く |
 | CSR 化（#494） | ○ | `freeze` で無条件に適用 |
-| #488 早期打ち切り | ○ | `full_scan_ratio` 既定 1/10 |
+| #488 早期打ち切り | △ | `full_scan_ratio` 既定 1/10 で構造的には到達可能だが、本セッションの `feature_bench` 全 run（`hnsw_stats`）は `plain_scans=0`・`subset_searches=0` であり、実測ログ上はこの分岐を一度も通っていない（既定有効＝実測で寄与確認済み、ではない。§5 参照） |
 | #448/#449 構築側 | ○ | 構築時に常に通る |
 | #505 再開型（hybrid 密側） | ○ | `HnswDenseProvider` で既定有効 |
 | #497 visited 切替 | ✕（既定 `sparse_visited_max=0`） | 常に dense。局所比較 doc（#498）参照 |
@@ -89,7 +89,7 @@ N=5 ペア（before→after 交互）。
 | 区間 | before min | before median | after min | after median | ratio (min-of-N) | 固定帯(±5%) | 実測帯（参照区間） | 判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | self build（threads=12） | 211.687ms | 221.851ms | 182.233ms | 228.088ms | 0.861x | 固定帯超過 | 実測帯内(±40.0%) | ノイズ帯内 |
-| self search median | 32.244us | 35.995us | 33.841us | 35.022us | 1.050x | 固定帯超過 | 実測帯内(±220.7%) | ノイズ帯内 |
+| self search median | 32.244us | 35.995us | 33.841us | 35.022us | 1.0495x | 固定帯内（+4.95%） | 実測帯内(±220.7%) | ノイズ帯内 |
 | usearch build（参照） | 209.123ms | 223.190ms | 212.045ms | 236.544ms | 1.014x | 該当なし | ±40.0%（自己参照） | 非対象（参照） |
 | usearch search median（参照） | 39.289us | 43.002us | 39.120us | 43.433us | 1.000x | 該当なし | ±220.7%（自己参照） | 非対象（参照） |
 
@@ -174,15 +174,20 @@ S0-cold）は明確な劣化シグナルなし（実測帯内）として記録�
 等）は before/after で完全一致しており、索引の使われ方自体は変化していない
 ことを確認済み（非 vacuous）。
 
-| フェーズ | before min (run1/2/3) | after min (run1/2/3) | before min | after min | ratio (min-of-N) | 帰属 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `vector_knn`（フィルタなし DISTANCE） | 8825/8418/9233 us | 399/388/391 us | 8418us | 388us | 0.046x（比率のみ。21.7 倍という比率自体は正しいが下記の帰属注記参照） | Phase 3／Phase 2 の寄与を分離不能（この区間は #563 投影遅延デコード〔Phase 2〕の直接対象でもあり、prefetch #490・CSR #494・#488 早期打ち切り〔Phase 3〕との交絡があるため、比率全体を Phase 3 単独の効果とは帰属できない） |
-| `where_compound` | 7390/3791/3942 us | 343/320/313 us | 3791us | 313us | 0.083x（約 12 倍高速化） | **Phase 2 の交絡**（スカラー二次索引・Issue #475 で「約 9 倍」と既報告の効果と整合。Phase 3 の寄与ではない） |
-| `point_where` | 4958/3818/4672 us | 4020/2927/2559 us | 3818us | 2559us | 0.670x | Phase 2 の交絡の可能性（判定対象外） |
-| `vector_knn_where`（`hnsw_subset` 経路） | 6839/6007/5922 us | 6087/4476/4072 us | 5922us | 4072us | 0.688x | Phase 3／Phase 2 の寄与を分離不能（#488 早期打ち切りと Phase 2 索引の双方が効きうる区間） |
-| `hybrid_rrf` | 10633/11895/11952 us | 11623/12348/11015 us | 10633us | 11015us | 1.036x | Phase 3（#505 再開型探索。固定帯（±5%）はわずかに超えるが `ingest` 実測帯（101.1%。§5 参照）内であり両ノイズ帯を超えない。`hybrid_rrf` 自体は #506 の局所比較で既に非退行確認済み） |
-| `index_warm_us` | 3724651/1546762/1160402 | 1684889/2036732/607658 | 1160402us | 607658us | 0.524x | Phase 3（CSR 化・prefetch。run 間ばらつきが大きく参考値） |
-| `ingest`（参照区間。Phase 3・Phase 2 いずれの対象でもない） | 8091/4226/4201 us | 4180/4147/4023 us | 4023us（全 6 点中の最小値） | 4023us | 0.958x | 参照。`benchmark-judgement-policy.md` §4 の規約どおり、同一セッションの参照区間の run-to-run 全幅をそのまま使う（run1 を cold-start と推測して除外しない） |
+`benchmark-judgement-policy.md` §3 は min-of-N・median-of-N の両方の併記を必須とする
+ため、以下は各フェーズの `min_us`（試行内最小値）を N=3 run 集めた系列そのものを
+min-of-N（系列の最小）・median-of-N（系列の中央値。N=3 につき中央の 1 点）の両方で
+集計する。
+
+| フェーズ | before run1/2/3（`min_us`） | after run1/2/3（`min_us`） | before min-of-N | after min-of-N | ratio（min-of-N） | before median-of-N | after median-of-N | ratio（median-of-N） | 帰属 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `vector_knn`（フィルタなし DISTANCE） | 8825/8418/9233 us | 399/388/391 us | 8418us | 388us | 0.046x（比率のみ。21.7 倍という比率自体は正しいが下記の帰属注記参照） | 8825us | 391us | 0.044x | Phase 3／Phase 2 の寄与を分離不能（この区間は #563 投影遅延デコード〔Phase 2〕の直接対象でもあり、prefetch #490・CSR #494〔Phase 3。フィルタなし＝`FullVisible` 経路のため #488 早期打ち切り〔`Subset` 経路専用〕はこの区間には関与しない〕との交絡があるため、比率全体を Phase 3 単独の効果とは帰属できない） |
+| `where_compound` | 7390/3791/3942 us | 343/320/313 us | 3791us | 313us | 0.083x（約 12 倍高速化） | 3942us | 320us | 0.081x | **Phase 2 の交絡**（スカラー二次索引・Issue #475 で「約 9 倍」と既報告の効果と整合。Phase 3 の寄与ではない） |
+| `point_where` | 4958/3818/4672 us | 4020/2927/2559 us | 3818us | 2559us | 0.670x | 4672us | 2927us | 0.627x | Phase 2 の交絡の可能性（判定対象外） |
+| `vector_knn_where`（`hnsw_subset` 経路） | 6839/6007/5922 us | 6087/4476/4072 us | 5922us | 4072us | 0.688x | 6007us | 4476us | 0.745x | Phase 3／Phase 2 の寄与を分離不能。ただし本セッションの `hnsw_stats`（全 run）は `plain_scans=0`・`subset_searches=0` であり、#488 早期打ち切り分岐が実測ログ上は一度も通っていないため、この改善を #488 の寄与と断定する根拠はない（Phase 2 索引側の寄与のみ確認できる） |
+| `hybrid_rrf` | 10633/11895/11952 us | 11623/12348/11015 us | 10633us | 11015us | 1.036x | 11895us | 11623us | 0.977x | Phase 3（#505 再開型探索。min-of-N・median-of-N とも固定帯（±5%）を超えていない（+3.59%／−2.3%）ため、`ingest` 実測帯（101.1%。§5 参照）の判定を待たずノイズ帯内。`hybrid_rrf` 自体は #506 の局所比較で既に非退行確認済み） |
+| `index_warm_us` | 3724651/1546762/1160402 | 1684889/2036732/607658 | 1160402us | 607658us | 0.524x | 1546762us | 1684889us | **1.089x** | Phase 3（CSR 化・prefetch）だが **min-of-N（0.524x・短縮）と median-of-N（1.089x・+8.9% の悪化）で傾向が逆**。N=3・run 間ばらつきが極めて大きい（before 3,724,651〜1,160,402us・after 2,036,732〜607,658us、いずれも 3 倍前後の開き）ため、min-of-N の改善方向・median-of-N の悪化方向のいずれも単独では判定根拠にできず、両論併記の参考値に留める |
+| `ingest`（参照区間。Phase 3・Phase 2 いずれの対象でもない） | 8091/4226/4201 us | 4180/4147/4023 us | 4201us | 4023us | 0.958x | 4226us | 4147us | 0.981x | 参照。`benchmark-judgement-policy.md` §4 の規約どおり、同一セッションの参照区間の run-to-run 全幅をそのまま使う（run1 を cold-start と推測して除外しない）。実測帯（101.1%）の算出には before/after 各 side の min-of-N ではなく全 6 点中の最小値（4023us。after run3 と同値）を用いる（直後の段落参照） |
 
 `ingest`（全 6 点: before 8091,4226,4201・after 4180,4147,4023）の実測帯は
 `benchmark-judgement-policy.md` §4 の規約どおり run1 を除外せず全幅で算出すると
@@ -241,10 +246,11 @@ green（§9 参照）。`hnsw_f16`（Issue #515 で追加された第 3 エン�
 
 ## 7. 判定
 
-- **`bench-hnsw-compare`**（N=5・rows=20,000 縮小構成）: self build・self search
-  median とも固定帯（±5%）は超えるが実測帯（usearch 参照。build ±40.0%・
-  search ±220.7%）を超えず、**ノイズ帯内**。Recall@10（self t=12: 0.758〜0.776）
-  も前後で有意差なし。
+- **`bench-hnsw-compare`**（N=5・rows=20,000 縮小構成）: self build は固定帯
+  （±5%）を超える（−13.9%）が実測帯（usearch build 参照 ±40.0%）内。self
+  search median は固定帯（±5%）自体を超えていない（+4.95%）ため実測帯判定を
+  待たずノイズ帯内。いずれも **ノイズ帯内**。Recall@10（self t=12:
+  0.758〜0.776）も前後で有意差なし。
 - **`bench-knn-profile`**（N=1 ペア。共有環境のリソース逼迫により縮退）:
   `brute_force`（Phase 3 施策の対象外経路）は `S0_cold_sql_e2e` 31.4ms→31.9ms
   でほぼ同水準。`hnsw` 側は before run1（1010.953ms）と after run1
@@ -318,18 +324,30 @@ mkdir -p "$S/before" "$S/after"
 git archive 4d2bd23 | tar -x -C "$S/before"
 git archive 799a7d8 | tar -x -C "$S/after"
 
-# before/after を別 CARGO_TARGET_DIR でビルド
-( cd "$S/before" && CARGO_TARGET_DIR="$S/before/target" cargo build --release -p engine --example feature_bench )
-( cd "$S/before" && CARGO_TARGET_DIR="$S/before/target" cargo bench -p engine --bench hnsw_compare_bench --features contrast-bench --no-run --message-format=json )
-( cd "$S/before" && CARGO_TARGET_DIR="$S/before/target" cargo bench -p engine --bench knn_profile_bench --no-run --message-format=json )
-# after も同様
+# 交互 N ペア（before→after を 1 ペア）での輪番実行・/proc/loadavg 記録・
+# 生ログ保存（`docs/design/bench-data/hnsw-phase3-ab/` 命名規約準拠）は
+# scripts/bench_hnsw_phase3_ab.sh（本 Issue で新設。詳細は同ファイル冒頭の
+# コメント参照）が担う。MODE ごとに 1 回ずつ呼び出す（ビルドは本スクリプトが
+# BEFORE_DIR／AFTER_DIR 配下で独立 CARGO_TARGET_DIR を使い自動的に行う）:
 
-# 交互 N=5 ペア（before→after を 1 ペア）で各ベンチを輪番実行し、
-# /proc/loadavg を各 run 直前に記録、生ログを保存する
+BEFORE_DIR="$S/before" AFTER_DIR="$S/after" MODE=hnsw-compare \
+  BENCH_HNSW_COMPARE_ROWS=20000 BENCH_HNSW_COMPARE_QUERIES=100 BENCH_HNSW_COMPARE_THREADS=12 \
+  scripts/bench_hnsw_phase3_ab.sh 5   # §3（縮小構成。§8 の正直な逸脱）
+
+BEFORE_DIR="$S/before" AFTER_DIR="$S/after" MODE=knn-profile \
+  PHASE3_KNN_PROFILE_ENGINES="hnsw brute_force" \
+  scripts/bench_hnsw_phase3_ab.sh 5   # §4（本セッションは共有環境逼迫で N=1 ペアに縮退）
+
+BEFORE_DIR="$S/before" AFTER_DIR="$S/after" MODE=feature-bench \
+  PHASE3_FEATURE_BENCH_ENGINES="hnsw" \
+  scripts/bench_hnsw_phase3_ab.sh 5   # §5（本セッションは時間制約で N=3 ペア・hnsw arm のみ）
 ```
 
-詳細な輪番手順は本 Issue の実装作業で使用したドライバスクリプトに準じる
-（`docs/design/bench-data/hnsw-phase3-ab/` の生ログから再構成可能）。
+Recall 3 ゲート層 B（§6）は timing 系ではなく決定的コーパスに基づくため輪番
+ドライバの対象外であり、`RECALL_ENGINE=brute_force|hnsw` を注入した
+`cargo test --release -p engine --test hybrid_recall -- --ignored --nocapture`
+等（`RECALL_VERBOSE=1` 併用）を before/after 双方のソースツリーで 1 回ずつ
+実行して比較する。
 
 ## 10. 参考
 
