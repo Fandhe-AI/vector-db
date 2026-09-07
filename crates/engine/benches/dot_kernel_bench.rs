@@ -24,14 +24,34 @@
 //!
 //! `isa::current().isa()` が `Scalar`（SIMD 拡張なし）の環境では SIMD 経路が
 //! 測定不能なため、`simd_bench.rs` と同じ方針で非ゼロ終了する。
+//!
+//! # tail A/B（Issue #529・opt-in）
+//!
+//! `BENCH_DOT_KERNEL_TAIL_AB=1` を設定すると、上記の既定測定に加えて
+//! dim ∈ [`harness::dot_kernel::TAIL_AB_DIMS`]（端数長の異なる境界: 100・129・768）
+//! で `SimdKernel::dot_with_scalar_tail`（現行）vs `dot_with_padded_tail`
+//! （Issue #528 の分岐なし tail）を `run_ab` で交互計測し、同一セッションで
+//! production 経路 `SimdKernel::dot`（`isa::current().dot`）を参照区間として
+//! 併せて計測する。両実装は `docs/design/dot-kernel-branchless-tail.md` の
+//! 契約によりビット同一のはずであり、`check_bit_identical` で全行検証してから
+//! 計測に入る（不一致は実測値を出さず fail-closed で拒否）。
+//!
+//! 採否判断は `docs/design/benchmark-judgement-policy.md` の交互 N≥5・
+//! per-run 生データ・min-of-N＋median 併記・固定 ±5% と参照区間実測の
+//! 2 種ノイズ帯に従う（本ベンチ 1 プロセスの実行＝1 run。N≥5 は呼び出し側が
+//! 複数回プロセスを起動して集計する）。共有 QEMU 環境（本開発環境）での実測は
+//! 同 doc §5 のとおり参考値・採否根拠にしない
+//! （`DEFAULT_PADDED_TAIL`〔`isa.rs`〕の反転はこのベンチが直接行わない）。
 
 #[allow(dead_code)]
 mod harness;
 
 use harness::ab::run_ab;
 use harness::dot_kernel::{
-    check_matches_scalar_reference, classify_change, generate_corpus, generate_query, ns_per_dot,
-    refuse_under_github_actions, render_line, rows_for, speedup_ratio, WorkingSet,
+    check_bit_identical, check_matches_scalar_reference, classify_change, generate_corpus,
+    generate_query, min_of_samples, ns_per_dot, parse_tail_ab_env, refuse_under_github_actions,
+    render_line, render_tail_ab_line, render_tail_ab_reference_line, rows_for, speedup_ratio,
+    TailAbMode, WorkingSet, TAIL_AB_DIMS,
 };
 use harness::env_report::EnvReport;
 use harness::protocol::{run, MeasurementConfig};
@@ -117,6 +137,123 @@ fn dot_wrapper(a: &[f32], b: &[f32]) -> f32 {
 #[inline(never)]
 fn dot_scalar_wrapper(a: &[f32], b: &[f32]) -> f32 {
     isa::dot_scalar(a, b)
+}
+
+/// tail A/B の A 側（現行スカラー tail）入口。`objdump` の逆アセンブル確認
+/// （`docs/design/benchmark-judgement-policy.md` 準拠の実アセンブリ確認手順）
+/// の入口も兼ねる。
+#[inline(never)]
+fn scalar_tail_wrapper(a: &[f32], b: &[f32]) -> f32 {
+    isa::current().dot_with_scalar_tail(a, b)
+}
+
+/// tail A/B の B 側（Issue #528 の分岐なし tail）入口。
+#[inline(never)]
+fn padded_tail_wrapper(a: &[f32], b: &[f32]) -> f32 {
+    isa::current().dot_with_padded_tail(a, b)
+}
+
+/// tail A/B の参照区間（production 経路）入口。`dot_wrapper` と実体は同じだが、
+/// tail A/B セクション専用の計測系列として区別するため独立した
+/// `#[inline(never)]` シンボルを持つ（`objdump` での区別のため）。
+#[inline(never)]
+fn tail_ab_reference_wrapper(a: &[f32], b: &[f32]) -> f32 {
+    isa::current().dot(a, b)
+}
+
+/// tail A/B の 1 dim 分: ビット同一性検証 → 参照区間（production `dot`）計測
+/// → `run_ab`（scalar_tail vs padded_tail）計測、の順で実行する。
+/// `min_of_samples`／`relative_band` は呼び出し元（`main`）が run 間で集計する
+/// ため、この関数は 1 run 分の `Measurement` 生サンプルをそのまま返す
+/// （per-run 生データ保持の契約。`docs/design/benchmark-judgement-policy.md` §3）。
+fn measure_tail_ab_stage(
+    dim: usize,
+) -> Result<(harness::protocol::Measurement, harness::ab::AbMeasurement), String> {
+    let rows = rows_for(WorkingSet::ArenaScale, dim).map_err(|e| e.to_string())?;
+    let corpus = generate_corpus(0x7A11_AB00 ^ dim as u64, dim, rows).map_err(|e| e.to_string())?;
+    let query = generate_query(0x7A11_AB00 ^ dim as u64, dim);
+
+    // 両実装は契約上ビット同一（`docs/design/dot-kernel-branchless-tail.md`）
+    // のため、許容差ではなく `to_bits()` 完全一致で検証する（計測ループへ入る前の
+    // fail-closed 検証。不一致は実測値を出さず拒否する）。
+    for (row_idx, chunk) in corpus.chunks_exact(dim).enumerate() {
+        let scalar = scalar_tail_wrapper(chunk, &query);
+        let padded = padded_tail_wrapper(chunk, &query);
+        check_bit_identical(dim, row_idx, scalar, padded).map_err(|e| e.to_string())?;
+    }
+
+    let ref_config = MeasurementConfig::new(20, 50, 0x7A11_AB00 ^ dim as u64)
+        .map_err(|e| format!("tail_ab_ref dim={dim}: {e}"))?;
+    let reference = run(&ref_config, || {
+        let mut sum = 0f32;
+        for chunk in corpus.chunks_exact(dim) {
+            sum += tail_ab_reference_wrapper(chunk, &query);
+        }
+        sum
+    })
+    .map_err(|e| format!("tail_ab_ref dim={dim}: {e}"))?;
+    let ref_min = min_of_samples(&reference.samples).map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        render_tail_ab_reference_line(dim, rows, ref_min, reference.summary.median)
+    );
+
+    let ab_config = MeasurementConfig::new(20, 50, 0x7A11_AB01 ^ dim as u64)
+        .map_err(|e| format!("tail_ab dim={dim}: {e}"))?;
+    let ab = run_ab(
+        &ab_config,
+        || {
+            let mut sum = 0f32;
+            for chunk in corpus.chunks_exact(dim) {
+                sum += scalar_tail_wrapper(chunk, &query);
+            }
+            sum
+        },
+        || {
+            let mut sum = 0f32;
+            for chunk in corpus.chunks_exact(dim) {
+                sum += padded_tail_wrapper(chunk, &query);
+            }
+            sum
+        },
+    )
+    .map_err(|e| format!("tail_ab dim={dim}: {e}"))?;
+
+    let a_min = min_of_samples(&ab.a.samples).map_err(|e| e.to_string())?;
+    let b_min = min_of_samples(&ab.b.samples).map_err(|e| e.to_string())?;
+    let ratio_min = speedup_ratio(a_min.as_secs_f64(), b_min.as_secs_f64());
+    let ratio_median = speedup_ratio(
+        ab.a.summary.median.as_secs_f64(),
+        ab.b.summary.median.as_secs_f64(),
+    );
+    println!(
+        "{}",
+        render_tail_ab_line(
+            "scalar_tail",
+            dim,
+            rows,
+            a_min,
+            ab.a.summary.median,
+            1.0,
+            1.0,
+            classify_change(1.0, 0.05),
+        )
+    );
+    println!(
+        "{}",
+        render_tail_ab_line(
+            "padded_tail",
+            dim,
+            rows,
+            b_min,
+            ab.b.summary.median,
+            ratio_min,
+            ratio_median,
+            classify_change(ratio_median, 0.05),
+        )
+    );
+
+    Ok((reference, ab))
 }
 
 fn main() {
@@ -206,6 +343,41 @@ fn main() {
         }
         Err(e) => {
             eprintln!("dot_kernel_bench: diagnostic ab failed: {e}");
+        }
+    }
+
+    // tail A/B（Issue #529・opt-in）: `BENCH_DOT_KERNEL_TAIL_AB` が不正値
+    // （非 UTF-8 を含む）の場合は fail-closed で非ゼロ終了する（モジュール冒頭
+    // コメント参照。`.ok()` で非 UTF-8 を無条件に「未設定」へ丸めると fail-open
+    // になるため、`var_os` の有無と `to_str` の可否を区別する）。
+    let tail_ab_env = std::env::var_os("BENCH_DOT_KERNEL_TAIL_AB");
+    let tail_ab_raw = match &tail_ab_env {
+        None => None,
+        Some(v) => match v.to_str() {
+            Some(s) => Some(s),
+            None => {
+                eprintln!("dot_kernel_bench: BENCH_DOT_KERNEL_TAIL_AB value is not valid UTF-8");
+                std::process::exit(1);
+            }
+        },
+    };
+    let tail_ab_mode = match parse_tail_ab_env(tail_ab_raw) {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("dot_kernel_bench: {e}");
+            std::process::exit(1);
+        }
+    };
+    if tail_ab_mode == TailAbMode::On {
+        let mut had_tail_ab_error = false;
+        for &dim in &TAIL_AB_DIMS {
+            if let Err(e) = measure_tail_ab_stage(dim) {
+                eprintln!("dot_kernel_bench: {e}");
+                had_tail_ab_error = true;
+            }
+        }
+        if had_tail_ab_error {
+            std::process::exit(1);
         }
     }
 }

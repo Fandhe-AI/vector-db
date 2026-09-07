@@ -348,6 +348,14 @@ defense-in-depth）。専有環境の宣言・複数回実行による中央値�
 手動で行う（`docs/design/hybrid-refetch-latency.md`・`docs/design/
 c1-p95-dedicated-env-reverification.md` と同じ運用方針）。
 
+可視比率 × 行数の損益分岐点スイープ（Issue #487。`hnsw_subset` vs plain
+scan）は `BENCH_KNN_PROFILE_VISIBLE_RATIO=1/<N>`（`BENCH_KNN_PROFILE_
+FULL_SCAN_RATIO`・`BENCH_KNN_PROFILE_SCALE` と併用可）で S1〜S5' を伴わない
+専用モードへ切り替わる。交互 N 回ペア実測は `make bench-knn-visible-ratio`
+（`scripts/bench_knn_visible_ratio_sweep.sh`。`SWEEP_PAIRS` で回数を上書き）
+から実行する。実測結果・判断は `docs/design/hnsw-rls-cardinality-switch.md`
+「可視比率 × 行数の損益分岐点実測（Issue #487）」参照。
+
 `dot_lanes` の逆アセンブル確認は次の手順で再現できる:
 
 ```sh

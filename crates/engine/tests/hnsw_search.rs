@@ -225,16 +225,22 @@ fn parallel_build_recall_at_10_matches_sequential_build_within_margin() {
     let queries = gen_queries(0xA5A5_1234_1111, 0x51DE_0004, dim, 20, 100);
 
     let sequential = HnswIndex::build(params, dim as u32, &vectors, seed).unwrap();
-    let parallel = HnswIndex::build_with_threads(params, dim as u32, &vectors, seed, 4).unwrap();
 
-    for ef in [64usize, 256] {
-        let seq_recall = recall_at_10(&sequential, &vectors, dim, rows, ef, &queries);
-        let par_recall = recall_at_10(&parallel, &vectors, dim, rows, ef, &queries);
-        assert!(
-            par_recall >= seq_recall - 0.02,
-            "ef={ef} parallel Recall@10={par_recall} must be within 0.02 of \
-             sequential Recall@10={seq_recall}"
-        );
+    // Issue #448: パス分離（plan_links／publish_links）・逆方向リンク保証の
+    // 導入後、高スレッド数（threads=12）でも Recall@10 が同水準であることを
+    // 追加確認する（4 に加え 12。`MAX_BUILD_THREADS`=16 のため許容範囲）。
+    for threads in [4usize, 12] {
+        let parallel =
+            HnswIndex::build_with_threads(params, dim as u32, &vectors, seed, threads).unwrap();
+        for ef in [64usize, 256] {
+            let seq_recall = recall_at_10(&sequential, &vectors, dim, rows, ef, &queries);
+            let par_recall = recall_at_10(&parallel, &vectors, dim, rows, ef, &queries);
+            assert!(
+                par_recall >= seq_recall - 0.02,
+                "threads={threads} ef={ef} parallel Recall@10={par_recall} must be \
+                 within 0.02 of sequential Recall@10={seq_recall}"
+            );
+        }
     }
 }
 

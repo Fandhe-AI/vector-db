@@ -486,6 +486,165 @@ fn build_rejects_node_count_beyond_max_hnsw_nodes() {
         Err(HnswError::TooManyNodes { .. })
     ));
 }
+/// Issue #494: 凍結時の CSR 平坦化・`search_layer` の CSR 参照化の前後で、
+/// `build` が返すグラフ（`entry_point`／各ノードの `level_of`／各層の
+/// `neighbors`）がビット同一であることを固定する回帰テスト。
+///
+/// 本テストは公開 API（`entry_point()`／`level_of()`／`neighbors()`）のみを
+/// 走査し、ノード id 昇順 → レベル昇順 → 各層のリンク列（返された順序の
+/// まま。並べ替えない）で FNV-1a 64bit ハッシュへ投入する。CSR 化は
+/// 隣接リストの要素順を一切変えない契約（`docs/design/hnsw-index.md` §14）
+/// のため、この値は表現変更の前後で完全に一致するはずである。
+///
+/// 期待値は本 Issue の実装前（CSR 化前・commit `2ca1536` 時点の
+/// `Vec<Vec<u32>>` 表現）で 1 度だけ採取した固定値。以降はこの値からの
+/// 逸脱を「グラフの構築結果が変わった」として検出する安全網とする。
+#[test]
+fn graph_fingerprint_is_stable_across_representation_change() {
+    /// FNV-1a 64bit（依存追加なしの自作実装。鍵・トークン等のセキュリティ
+    /// 用途には使わない非暗号ハッシュ）。
+    fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+
+    let dim = 8usize;
+    let n = 400usize;
+    let vectors = gen_corpus(0x00C0_FFEEu64, dim, n);
+    let params = HnswParams::default().with_m(8).with_ef_construction(40);
+    let index = HnswIndex::build(params, dim as u32, &vectors, 0x00C0_FFEEu64)
+        .expect("build must succeed on this deterministic corpus");
+
+    let mut hash = FNV_OFFSET_BASIS;
+    hash = fnv1a_update(hash, &(index.len() as u64).to_le_bytes());
+    hash = fnv1a_update(
+        hash,
+        &index
+            .entry_point()
+            .map(|e| e as i64)
+            .unwrap_or(-1)
+            .to_le_bytes(),
+    );
+    hash = fnv1a_update(
+        hash,
+        &index
+            .max_level()
+            .map(|l| l as i64)
+            .unwrap_or(-1)
+            .to_le_bytes(),
+    );
+
+    for node in 0..index.len() as u32 {
+        let level = index
+            .level_of(node)
+            .expect("node within len() must have a level");
+        hash = fnv1a_update(hash, &(level as u64).to_le_bytes());
+        for l in 0..=level {
+            let neighbors = index
+                .neighbors(l, node)
+                .expect("level <= level_of(node) must yield Some");
+            hash = fnv1a_update(hash, &(neighbors.len() as u64).to_le_bytes());
+            for &nb in neighbors {
+                hash = fnv1a_update(hash, &nb.to_le_bytes());
+            }
+        }
+    }
+
+    // 採取元コミット: 2ca1536（CSR 化前・`Vec<Vec<u32>>` 表現。手順は本テスト
+    // 冒頭ドキュメンテーションコメント参照）。
+    const EXPECTED_FINGERPRINT: u64 = 0x5597_d0e9_0e1e_9898;
+    assert_eq!(
+        hash, EXPECTED_FINGERPRINT,
+        "graph fingerprint changed (got {hash:#x}); re-check CSR flattening preserves link order"
+    );
+}
+
+/// `repair_reachability` の観測統計（Issue #447）が非 vacuous であることを、
+/// フェーズ 2（片方向チェーン結線）が確実に発火する重複ヘビーコーパス
+/// （`gen_duplicate_heavy_corpus`。完全同点スコアを誘発しフェーズ 1 の
+/// `PRECISE_REPAIR_CAP` を使い切りやすい）で固定する。`tests/hnsw.rs` の
+/// 既存流儀（crate 外の公開 API のみ）に従い `build_with_threads_observed`
+/// （`threads=1` の縮退経路。`profile.repair` のみを埋める設計。
+/// `HnswIndex::build_with_threads_observed` のドキュメンテーションコメント
+/// 参照）経由で観測する。
+#[test]
+fn repair_stats_on_duplicate_heavy_corpus_report_phase2_nodes() {
+    let dim = 12usize;
+    let rows = 400usize;
+    let clusters = 5usize;
+    let vectors = gen_duplicate_heavy_corpus(0x5EED_0001, dim, rows, clusters);
+    let params = HnswParams::default()
+        .with_m(6)
+        .with_ef_construction(32)
+        .with_ef_search(16);
+
+    let (index, profile) =
+        HnswIndex::build_with_threads_observed(params, dim as u32, &vectors, 0x5EED_0001, 1)
+            .expect("build should succeed");
+
+    assert_degree_and_wellformed_invariants(&index);
+    assert_fully_connected_from_entry(&index);
+
+    let phase2_total: u64 = profile.repair.levels.iter().map(|l| l.phase2_nodes).sum();
+    let cap_hits_total: u64 = profile
+        .repair
+        .levels
+        .iter()
+        .filter(|l| l.phase1_cap_hit)
+        .count() as u64;
+    assert!(
+        phase2_total > 0,
+        "duplicate-heavy corpus should force phase 2 chain-linking to fire at least once"
+    );
+    assert!(
+        cap_hits_total > 0,
+        "duplicate-heavy corpus should exhaust PRECISE_REPAIR_CAP on at least one level"
+    );
+}
+
+/// 同一 seed・同一入力で 2 回構築した場合、`repair` 統計のカウンタ系
+/// フィールド（`wall` 系の壁時間を除く）が完全に一致することを固定する
+/// （逐次経路は完全決定的。`docs/design/hnsw-parallel-build.md` の並列経路
+/// 非決定性契約とは無関係）。
+#[test]
+fn repair_stats_are_deterministic_on_sequential_path() {
+    let dim = 12usize;
+    let rows = 400usize;
+    let clusters = 5usize;
+    let vectors = gen_duplicate_heavy_corpus(0x5EED_0002, dim, rows, clusters);
+    let params = HnswParams::default()
+        .with_m(6)
+        .with_ef_construction(32)
+        .with_ef_search(16);
+
+    let (_, profile_a) =
+        HnswIndex::build_with_threads_observed(params, dim as u32, &vectors, 0x5EED_0002, 1)
+            .expect("build should succeed");
+    let (_, profile_b) =
+        HnswIndex::build_with_threads_observed(params, dim as u32, &vectors, 0x5EED_0002, 1)
+            .expect("build should succeed");
+
+    assert_eq!(profile_a.repair.levels.len(), profile_b.repair.levels.len());
+    for (a, b) in profile_a
+        .repair
+        .levels
+        .iter()
+        .zip(profile_b.repair.levels.iter())
+    {
+        assert_eq!(a.level, b.level);
+        assert_eq!(a.unreachable_before, b.unreachable_before);
+        assert_eq!(a.phase1_iterations, b.phase1_iterations);
+        assert_eq!(a.phase1_cap_hit, b.phase1_cap_hit);
+        assert_eq!(a.phase2_nodes, b.phase2_nodes);
+        assert_eq!(a.phase2_entry_relinked, b.phase2_entry_relinked);
+    }
+}
 
 /// HNSW 構築の並列化（Issue #406）の不変条件テスト。要素単位 `RwLock`・
 /// エントリポイント更新のみ排他という設計が、逐次構築と同じ次数上限・

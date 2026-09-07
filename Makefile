@@ -328,11 +328,19 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-hybrid-profile
-bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）＋ Issue #387（search_within の段別・疎側再取得発火回数）＋ Issue #465（Issue #392 適用後の最新基線ラウンド計測）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_HYBRID_PROFILE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる（Issue #465）
+bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）＋ Issue #387（search_within の段別・疎側再取得発火回数）＋ Issue #465（Issue #392 適用後の最新基線ラウンド計測）＋ Issue #547（行数・可視率 opt-in）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_HYBRID_PROFILE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告、BENCH_HYBRID_PROFILE_ROWS=<1-100000>（既定 25000）で行数、BENCH_HYBRID_PROFILE_VISIBLE_RATIO=1/<1-1000>（既定 1/1）で可視率を指定できる（Issue #547）
 ifdef HAS_CARGO
 	cargo bench --bench hybrid_profile_bench -p engine --features bench-internals
 else
 	@echo "skip: Cargo.toml 未追加のため bench-hybrid-profile をスキップ"
+endif
+
+.PHONY: bench-hybrid-profile-ab
+bench-hybrid-profile-ab: ## Issue #547: #546（スコアアキュムレータ再利用）の前後比較を N=25k/100k・可視率 1/1・1/10 の 4 条件で交互 min-of-N 計測する（BEFORE_BIN・AFTER_BIN に退避済みバイナリの絶対パス、BEFORE_COMMIT・AFTER_COMMIT にビルド元コミットの hash を指定。AB_PAIRS（既定 5・5 未満は拒否）・AB_ROUNDS（既定 5・5..=50）で交互ペア数・ラウンド数を指定可。手動実行専用・CI 非配線。scripts/bench_hybrid_profile_ab.sh 参照）
+ifdef HAS_CARGO
+	scripts/bench_hybrid_profile_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hybrid-profile-ab をスキップ"
 endif
 
 # --------------------------------------------------
@@ -353,11 +361,19 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-knn-profile
-bench-knn-profile: ## Issue #362（KNN 経路の段別内訳プロファイル。走査・デコード・arena 構築・距離計算の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_KNN_PROFILE_ENGINE=brute_force|hnsw（既定 brute_force・Issue #413）で S0-cold/S0-hot の検索エンジンを ANN opt-in（Issue #403 B 案）へ切り替えられる（S1〜S5' は非対象）。BENCH_KNN_PROFILE_DIM=<1-4096>（既定 128・Issue #466）でベクトル次元数を上書きできる
+bench-knn-profile: ## Issue #362（KNN 経路の段別内訳プロファイル。走査・デコード・arena 構築・距離計算の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_KNN_PROFILE_ENGINE=brute_force|hnsw（既定 brute_force・Issue #413）で S0-cold/S0-hot の検索エンジンを ANN opt-in（Issue #403 B 案）へ切り替えられる（S1〜S5' は非対象）。BENCH_KNN_PROFILE_DIM=<1-4096>（既定 128・Issue #466）でベクトル次元数を上書きできる。BENCH_KNN_PROFILE_VISIBLE_RATIO=1/<N>（Issue #487）で可視比率スイープへ切り替わる（S1〜S5' 非対象。BENCH_KNN_PROFILE_FULL_SCAN_RATIO=<num>/<den>〔engine=hnsw 限定〕・BENCH_KNN_PROFILE_SCALE=<1-40> と併用可）
 ifdef HAS_CARGO
 	cargo bench --bench knn_profile_bench -p engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-knn-profile をスキップ"
+endif
+
+.PHONY: bench-knn-visible-ratio
+bench-knn-visible-ratio: ## Issue #487（可視比率〔1/2・1/4・1/10・1/20・1/50〕× 行数〔25k・100k〕での hnsw_subset と plain scan の損益分岐点を交互 N≥5 ペアで計測する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。SWEEP_PAIRS=<N>〔既定 5〕でペア数を上書きできる。ログは target/bench-knn-visible-ratio/<unix-ts>/ 配下）
+ifdef HAS_CARGO
+	scripts/bench_knn_visible_ratio_sweep.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-knn-visible-ratio をスキップ"
 endif
 
 # --------------------------------------------------
@@ -378,7 +394,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-dot-kernel
-bench-dot-kernel: ## Issue #365（isa.rs dot カーネルの複数アキュムレータ化）のマイクロベンチを実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+bench-dot-kernel: ## Issue #365（isa.rs dot カーネルの複数アキュムレータ化）のマイクロベンチを実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_DOT_KERNEL_TAIL_AB=1 で Issue #529 の dim 100／129／768 分岐なし tail A/B〔fail-closed env・既定 Off〕を追加実行）
 ifdef HAS_CARGO
 	cargo bench --bench dot_kernel_bench -p engine
 else
@@ -480,7 +496,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-hnsw-parallel-build
-bench-hnsw-parallel-build: ## Issue #406（HNSW 構築の並列化の受け入れ条件 (b): 100k 点で構築時間がスレッド数に応じて短縮することの実測記録）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_HNSW_PARALLEL_ROWS／BENCH_HNSW_PARALLEL_THREADS で規模・スレッド数ラダーを上書き可）
+bench-hnsw-parallel-build: ## Issue #406（HNSW 構築の並列化の受け入れ条件 (b): 100k 点で構築時間がスレッド数に応じて短縮することの実測記録）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_HNSW_PARALLEL_ROWS／BENCH_HNSW_PARALLEL_THREADS で規模・スレッド数ラダーを上書き可。Issue #495 追記: CSR 平坦化段 `flatten=`（逐次縮退経路は 0ms・並列経路は 0 超）・各 threads 点の常駐メモリ実測行〔`approx_heap_bytes`／VmRSS 前後差／VmHWM〕を出力する）
 ifdef HAS_CARGO
 	cargo bench --bench hnsw_parallel_build_bench -p engine
 else
@@ -515,6 +531,14 @@ ifdef HAS_CARGO
 	cargo bench --bench hnsw_compare_bench -p engine --features contrast-bench
 else
 	@echo "skip: Cargo.toml 未追加のため bench-hnsw-compare をスキップ"
+endif
+
+.PHONY: bench-hnsw-search
+bench-hnsw-search: ## Issue #491（受理判定後 prefetch〔Issue #490・PR #574〕の前後比較実測）の 1 規模点計測を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。before/after バイナリを交互起動する前後比較・8 点〔10k／100k・dim 128／768・マスク有無〕の判定は運用者が行う。BENCH_HNSW_SEARCH_ROWS〔既定 10000・1..=200000〕・BENCH_HNSW_SEARCH_DIM〔既定 128・1..=4096〕・BENCH_HNSW_SEARCH_MASK〔既定 none・1..=99 の可視率%〕・BENCH_HNSW_SEARCH_QUERIES〔既定 200〕・BENCH_HNSW_SEARCH_EF〔既定 64〕・BENCH_HNSW_SEARCH_K〔既定 10〕・BENCH_DEDICATED_ENV=1 で専有環境自己申告・BENCH_HNSW_SEARCH_COMMIT〔ビルド時指定。git archive 再現手順で before/after バイナリへ計測対象コミットを焼き込むため必須。詳細は docs/design/hnsw-search.md「再現方法」節参照〕を指定できる）
+ifdef HAS_CARGO
+	cargo bench --bench hnsw_search_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hnsw-search をスキップ"
 endif
 
 # --------------------------------------------------
@@ -613,6 +637,19 @@ ifdef HAS_CARGO
 	cargo test --release -p engine --test precision_eval -- --ignored --nocapture --exact precision_eval_policy_sweep
 else
 	@echo "skip: Cargo.toml 未追加のため precision-report をスキップ"
+endif
+
+# --------------------------------------------------
+# 接続処理モデルの同時接続数 N 別スループット手動計測
+# （Issue #482。docs/design/wire-connection-model.md）
+# --------------------------------------------------
+
+.PHONY: bench-wire-concurrency
+bench-wire-concurrency: ## Issue #482（接続処理モデルの判断記録。1 接続 1 スレッド ＋ 接続数上限）の同時接続数 N 別スループットを実測する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。WIRE_CONCURRENCY_N（必須。1〜64）で同時接続数を指定する。1 プロセス = 1 規模点（docs/design/benchmark-judgement-policy.md §5 準拠）。WIRE_CONCURRENCY_ROWS／WIRE_CONCURRENCY_DIM／WIRE_CONCURRENCY_ROUNDS で規模を上書きできる（既定 25,000 行・dim 128・200 往復）
+ifdef HAS_CARGO
+	cargo test --release -p wire-server --test wire_concurrency_throughput -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため bench-wire-concurrency をスキップ"
 endif
 
 # --------------------------------------------------

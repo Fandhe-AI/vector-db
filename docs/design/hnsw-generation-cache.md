@@ -182,6 +182,17 @@ Issue #409 で `k + stale_nodes` オーバーフェッチ方式を撤去し、`O
 （候補マスク。`crate::hnsw::NodeMask`）を `HnswIndex::search_masked` へ渡す方式へ
 置き換えた。詳細は `docs/design/hnsw-rls-cardinality-switch.md` 参照。
 
+## 既知の限界（追記: Issue #514）
+
+`Overlay::compute` の差分検出（世代進行直後に索引済みノードと現行アリーナの
+差分を特定する処理）は `HnswIndex::node_matches`（Issue #514・D4）が返す
+「一致とみなせるか」の判定に依存する。索引ノードの常駐精度が f16
+（`ResidentPrecision::F16`。opt-in・既定は f32）の場合、f16 分解能未満の
+embedding 変更は「未変更」と判定されうる。最終スコアは常に f32 アリーナ
+から再計算する契約（本 doc・#408）が不変のため探索結果の正しさには影響
+しないが、影響範囲はグラフ近傍構造の再利用判定（＝再インデックス要否の
+粒度）に限られる。詳細は `docs/design/hnsw-f16-resident.md` 参照。
+
 ## スコープ外・申し送り
 
 - ~~Rust API `VectorCore::search`（`PrefilterSnapshot`・ストレージ全体世代）への
