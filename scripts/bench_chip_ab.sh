@@ -65,6 +65,17 @@ for label_dir in "BEFORE_DIR=${BEFORE_DIR}" "AFTER_DIR=${AFTER_DIR}"; do
   [[ -d "${dir}/crates/engine" ]] || die "missing crates/engine: ${dir}"
 done
 
+# `run_one` は内部で `cd "${state_dir}"` してから
+# `CARGO_TARGET_DIR="${state_dir}/target"` を組み立てる。BEFORE_DIR/AFTER_DIR
+# が相対パスのままだと、cd 後の cwd 基準で再解決され
+# `<dir>/<dir>/target`（例: `states/before/states/before/target`）という
+# 二重パスになり、事前ビルド済みの `<dir>/target` が再利用されず
+# 子ワークロードを含む不要な再ビルドが発生する（codex-review P2 指摘・
+# Issue #530）。OUT_DIR と同様、呼び出し元 cwd 基準の絶対パスへここで
+# 正規化してから run_one へ渡す。
+BEFORE_DIR="$(cd "${BEFORE_DIR}" && pwd)"
+AFTER_DIR="$(cd "${AFTER_DIR}" && pwd)"
+
 PAIRS="${AB_PAIRS:-5}"
 if ! [[ "${PAIRS}" =~ ^[0-9]+$ ]] || [ "${PAIRS}" -lt 5 ]; then
   die "AB_PAIRS must be an integer >= 5 (benchmark-judgement-policy.md \$3 N>=5), got: ${PAIRS}"
