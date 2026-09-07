@@ -400,6 +400,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため bench-knn-i8-resident をスキップ"
 endif
 
+.PHONY: bench-knn-precision-resident
+bench-knn-precision-resident: ## Issue #526（Apple M 実機での i8／f16／f32 経路の前後比較）。scripts/bench_knn_f16_resident_ab.sh の AB_CANDIDATE_ENGINES="hnsw_f16 hnsw_i8" opt-in（複数候補輪番）で hnsw〔f32〕・hnsw_f16・hnsw_i8 の 3 精度を同一計測セッションで一括計測する（#516・#523 と同一スクリプト・同一 knob。手順・記録テンプレートは docs/design/chip-kernel-guidelines.md §7.7 参照）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。AB_PAIRS=<N>〔既定 5〕・AB_POINTS="scale:dim ..."〔既定 "1:128 4:128 20:128 1:768 4:768"〕・AB_MEMORY_POINTS="scale:dim ..."〔既定 AB_POINTS + "20:768"〕で上書きできる。ログは target/bench-knn-precision-resident/<UTC ts>/ 配下。scripts/bench_knn_f16_resident_ab.sh --summarize <dir> で TSV 集約）
+ifdef HAS_CARGO
+	AB_CANDIDATE_ENGINES="hnsw_f16 hnsw_i8" scripts/bench_knn_f16_resident_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-knn-precision-resident をスキップ"
+endif
+
 # --------------------------------------------------
 # vector_knn 786us の wire／SQL 表層／距離カーネル・Top-k 内訳プロファイル
 # （Issue #463。crates/wire-server/benches/knn_wire_profile_bench.rs）

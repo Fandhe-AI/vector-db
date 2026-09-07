@@ -477,4 +477,6 @@ x86_64 VNNI 系（u8×s8→i32・`vpdpbusd`）と異なり、`vdotq_s32`（s8×s
 出力・`cargo test -p engine --test isa` 全件）と、PR の `cross-check`
 ジョブ（1.98.1・`make check-cross`＋`make simd-codegen-check-cross`）に
 依存する。Apple 実機・Graviton での性能前後比較は #530／#526 の担当の
-まま（未実施）。
+まま（未実施。手順・記録テンプレートは Issue #526 で整備済み——
+`docs/design/chip-kernel-guidelines.md` §7.7 参照。実 Apple 計測は
+オーナー申し送り）。

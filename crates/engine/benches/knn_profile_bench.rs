@@ -96,9 +96,9 @@ mod harness;
 use harness::env_report::EnvReport;
 use harness::knn_profile::{
     assert_scan_row_counts_match, decode_header_reimpl, decode_row_reimpl, ns_per_row,
-    refuse_under_github_actions, render_diff_line, render_index_memory_line, render_stage_line,
-    requires_hnsw_stats_check, resident_label_for_token, scaled_rows, stage_diff_ns_per_row,
-    KnnProfileError,
+    refuse_under_github_actions, render_diff_line, render_index_memory_line,
+    render_kernel_isa_line, render_stage_line, requires_hnsw_stats_check, resident_label_for_token,
+    scaled_rows, stage_diff_ns_per_row, KnnProfileError,
 };
 use harness::proc_stats::{read_vm_hwm_kb, read_vm_rss_kb};
 use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
@@ -112,6 +112,7 @@ use std::time::{Duration, Instant};
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::hnsw::{HnswIndex, HnswParams, Ratio, ResidentPrecision, ValidatedHnswParams};
+use engine::isa;
 use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
@@ -1599,6 +1600,19 @@ fn run_hot_only(
         effective_full_scan_ratio.0,
         effective_full_scan_ratio.1,
     );
+    // 非 vacuous 証跡（Issue #526）: ディスパッチされた 3 経路（f32／f16／i8）の
+    // ISA を実行開始時点で 1 行出力する。Apple 実機での計測が実際に NEON 系
+    // カーネル（`NeonFp16`／`NeonDotprod`）へ到達したことを、測定値そのものより
+    // 前段で確認できるようにする（本環境〔x86_64 QEMU〕では `F16c`／
+    // `Avx2Widen` が期待値）。
+    println!(
+        "{}",
+        render_kernel_isa_line(
+            &format!("{:?}", isa::current().isa()),
+            &format!("{:?}", isa::current_f16().isa()),
+            &format!("{:?}", isa::current_i8().isa()),
+        )
+    );
 
     let path = unique_db_path("issue516-knn-hot-only");
     let _guard = CleanupGuard(path.clone());
@@ -1988,6 +2002,18 @@ fn run_index_memory_mode(knn_engine: harness::bench_engine::BenchEngine, dim: us
         "knn_profile_bench: index_memory_mode rows={rows} dim={dim} engine={} (Issue #516。\
          子プロセス隔離計測。QEMU 共有開発環境での実測は参考値)",
         knn_engine.token()
+    );
+    // 非 vacuous 証跡（Issue #526）: 親プロセス側（子プロセスは索引構築のみで
+    // dot カーネルを実際にディスパッチしない）で、実行時に選ばれる 3 経路の
+    // ISA を記録する。`run_hot_only` と同じ理由（`harness::knn_profile` モジュール
+    // 冒頭コメント参照）。
+    println!(
+        "{}",
+        render_kernel_isa_line(
+            &format!("{:?}", isa::current().isa()),
+            &format!("{:?}", isa::current_f16().isa()),
+            &format!("{:?}", isa::current_i8().isa()),
+        )
     );
     let exe = std::env::current_exe().unwrap_or_else(|e| {
         fail_closed(format!("current_exe unavailable: {e}"));
