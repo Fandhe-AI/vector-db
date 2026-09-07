@@ -258,6 +258,14 @@ psql の `SELECT COUNT(*)` は 45 ms → 約 3.7 ms。
 DOT_SHADER_WGSL`）。以下の実測表は変更前の数値のまま。変更後の前後比較・
 数値更新は依存先 Issue #533 で実施予定。
 
+**（2026-09-07 追記・Issue #543）** opt-in 専用の i8 パック常駐経路
+（`engine::gpu_batch::packed_i8::GpuI8BatchBackend`。Issue #542。候補生成
+のみ・primary 未接続）の前後比較・Recall 影響を実測した。Recall@10 の
+劣化は観測されなかった一方、クエリタイル化未実装（1 dispatch = 1 クエリの
+まま）が原因と分析される速度低下（既存 f16 常駐経路比で最大 19.4x 遅い）
+を確認した。詳細・実測表は `gpu-batch-i8-packed.md`「前後比較実測
+（Issue #543）」節参照。
+
 | rows | dim | batch | CPU-SIMD | GPU f16 | GPU f32 | per-query CPU | per-query GPU f16 | speedup f16 (p95) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 20,000 | 128 | 1 | 3676 | 180 | 207 | 3676 | 180 | 20.17x |

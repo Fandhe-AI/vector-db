@@ -404,6 +404,8 @@ env 変数（すべて fail-closed パース。不正値は非ゼロ終了）:
 
 `engine::gpu_batch`（f16 常駐）と CPU-SIMD バッチ経路の規模 × バッチサイズ別比較を行います。`BENCH_GPU_SCALING_ROWS`／`DIMS`／`BATCH`／`TOPK`／`ITERS` で計測条件を上書きできます。GPU 実機必須・手動実行専用ベンチで CI 非配線です。実測結果は `docs/design/crossdb-bench.md`「GPU」節を参照してください。`gpu_scaling:` 結果行に続けて出力される `gpu_scaling_stats:` 行（Issue #537）は f16／f32 各経路の読み戻し統計（`partial_topk_dispatches`・`full_readback_dispatches`・1 呼び出しあたり readback バイト数）を表示し、`scripts/bench_gpu_scaling_ab.sh` の結果行 grep（`^gpu_scaling: rows=`）とは接頭辞を分離しているため既存 A/B 集計には混入しません。
 
+i8 パック常駐経路（`engine::gpu_batch::packed_i8::GpuI8BatchBackend`。Issue #542。opt-in・候補生成専用）の計測行 `gpu_scaling_i8:`／`gpu_scaling_i8_stats:`（Issue #543）が A/B/C 3 経路の後段に追加で出力されます。`gpu_scaling_i8:` は CPU-SIMD 厳密対照に対する同点許容つき不一致件数（`i8_mismatch`）・平均 Recall@k（`i8_recall_at_k`。確定的指標）・速度比（`speedup_i8_vs_cpu_p95`／`speedup_i8_vs_f16_p95`）を出力し、`gpu_scaling_i8_stats:` は読み戻し・再スコア候補数・GPU backend・`build_ms` を出力します。`GpuI8Options::oversample` は構築時固定のため 1 プロセス = 1 oversample しか計測できません（`BENCH_GPU_SCALING_I8_OVERSAMPLE`。未設定時は既定 `packed_i8::DEFAULT_I8_OVERSAMPLE`＝4）。oversample のスイープは `scripts/bench_gpu_scaling_ab.sh` を `I8_OVERSAMPLE=<値>` 付きで複数回起動して行います（設定時のみ両バイナリへパススルー。before バイナリ〔i8 経路実装前〕は未知の env を読まないため無害）。実測結果・oversample 推奨値は `docs/design/gpu-batch-i8-packed.md`「前後比較実測（Issue #543）」節を参照してください。
+
 ### Recall 回帰ハーネスの repo secrets（TASK-104）
 
 secret ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md`

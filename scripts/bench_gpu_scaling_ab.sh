@@ -33,6 +33,15 @@
 #
 # 実行順序（規約: 逐次実行にしない・生ログを残す・skip/unavailable を握りつぶさない）:
 #   各規模点について pair=1..PAIRS の順で before → after を実行する。
+#
+# i8 パック常駐経路（Issue #543・親 #541）: `I8_OVERSAMPLE` が設定されている
+# 場合のみ `BENCH_GPU_SCALING_I8_OVERSAMPLE` として両バイナリへパススルーする
+# （before バイナリは未知の env を読まないため無害。i8 経路は `e14d53f`
+# より前には存在せず、before 側の `gpu_scaling_i8:` 行は常に「出ない」ことが
+# 期待値——これ自体が「i8 の before は作れない」という Issue #543 の設計判断の
+# 直接的な現れ）。summary.tsv の末尾へ `i8_oversample`/`i8_p50`/`i8_p95`/
+# `i8_recall`/`i8_mismatch` 列を追加する（既存 10 列の並び・意味は不変。
+# before 側・i8 未計測行は空欄のまま）。
 
 set -euo pipefail
 
@@ -69,9 +78,13 @@ DEFAULT_OUT_DIR="${REPO_ROOT}/_/bench/gpu-scaling-ab/$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${OUT_DIR:-${DEFAULT_OUT_DIR}}"
 mkdir -p "${OUT_DIR}"
 
+if [ -n "${I8_OVERSAMPLE:-}" ] && ! [[ "${I8_OVERSAMPLE}" =~ ^[0-9]+$ ]]; then
+  die "I8_OVERSAMPLE must be a positive integer when set, got: ${I8_OVERSAMPLE}"
+fi
+
 SUMMARY="${OUT_DIR}/summary.tsv"
 if [ ! -f "${SUMMARY}" ]; then
-  printf 'point\tside\tpair\tcpu_p50\tcpu_p95\tf16_p50\tf16_p95\tf32_p50\tf32_p95\tmismatch\tline\n' > "${SUMMARY}"
+  printf 'point\tside\tpair\tcpu_p50\tcpu_p95\tf16_p50\tf16_p95\tf32_p50\tf32_p95\tmismatch\tline\ti8_oversample\ti8_p50\ti8_p95\ti8_recall\ti8_mismatch\n' > "${SUMMARY}"
 fi
 
 # 1 行の `gpu_scaling: ...` 出力（正常計測行のみ）から TSV フィールドを
@@ -117,13 +130,49 @@ run_one() {
   } > "${log}"
 
   local status=0
-  BENCH_GPU_SCALING_ROWS="${rows}" \
-    BENCH_GPU_SCALING_DIMS="${dim}" \
-    BENCH_GPU_SCALING_BATCH="${batch}" \
-    "${bin}" >> "${log}" 2>&1 || status=$?
+  if [ -n "${I8_OVERSAMPLE:-}" ]; then
+    BENCH_GPU_SCALING_ROWS="${rows}" \
+      BENCH_GPU_SCALING_DIMS="${dim}" \
+      BENCH_GPU_SCALING_BATCH="${batch}" \
+      BENCH_GPU_SCALING_I8_OVERSAMPLE="${I8_OVERSAMPLE}" \
+      "${bin}" >> "${log}" 2>&1 || status=$?
+  else
+    BENCH_GPU_SCALING_ROWS="${rows}" \
+      BENCH_GPU_SCALING_DIMS="${dim}" \
+      BENCH_GPU_SCALING_BATCH="${batch}" \
+      "${bin}" >> "${log}" 2>&1 || status=$?
+  fi
 
   local result_line
   result_line="$(grep -E '^gpu_scaling: rows=' "${log}" | tail -1 || true)"
+
+  # i8 経路（Issue #543）の結果行。`gpu_scaling_i8:` は既存 `gpu_scaling:` の
+  # grep（`^gpu_scaling: rows=`）とは接頭辞が異なるため誤って上の
+  # `result_line` へ混入しない（`harness/gpu_scaling.rs` ドキュメンテーション
+  # コメント・回帰テスト `gpu_scaling_i8_result_line_has_expected_prefix_and_fields`
+  # 参照）。
+  local i8_line
+  i8_line="$(grep -E '^gpu_scaling_i8: rows=' "${log}" | tail -1 || true)"
+  local i8_oversample i8_p50 i8_p95 i8_recall i8_mismatch
+  if [ -n "${i8_line}" ]; then
+    # 注意: `grep -oE '[0-9]+'` を素朴に重ねる二段抽出は使わない——
+    # `i8_mismatch`/`i8_recall_at_k` というキー名自体が数字 "8" を含むため、
+    # `extract_field`（既存の cpu/f16/f32 列と同じ、`key=` 直後の数値のみを
+    # sed で取り出す方式）と同型の単発 sed 抽出に統一する
+    # （`extract_field` は接尾辞 `us` 前提のため、`us` を伴わない
+    # `oversample`/`i8_mismatch`/`i8_recall_at_k` はここで個別に抽出する）。
+    i8_oversample="$(echo "${i8_line}" | sed -nE 's/.* oversample=([0-9]+) .*/\1/p')"
+    i8_p50="$(extract_field "${i8_line}" gpu_i8_p50)"
+    i8_p95="$(extract_field "${i8_line}" gpu_i8_p95)"
+    i8_recall="$(echo "${i8_line}" | sed -nE 's/.*i8_recall_at_k=([0-9.]+)$/\1/p')"
+    i8_mismatch="$(echo "${i8_line}" | sed -nE 's/.* i8_mismatch=([0-9]+) .*/\1/p')"
+  else
+    i8_oversample=""
+    i8_p50=""
+    i8_p95=""
+    i8_recall=""
+    i8_mismatch=""
+  fi
 
   if [ -n "${result_line}" ]; then
     local cpu_p50 cpu_p95 f16_p50 f16_p95 f32_p50 f32_p95 mismatch
@@ -134,14 +183,16 @@ run_one() {
     f32_p50="$(extract_field "${result_line}" gpu_f32_p50)"
     f32_p95="$(extract_field "${result_line}" gpu_f32_p95)"
     mismatch="$(echo "${result_line}" | grep -oE 'mismatch=[0-9]+' | grep -oE '[0-9]+' || true)"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "${point}" "${side}" "${pair}" "${cpu_p50}" "${cpu_p95}" "${f16_p50}" "${f16_p95}" \
-      "${f32_p50}" "${f32_p95}" "${mismatch}" "measured" >> "${SUMMARY}"
+      "${f32_p50}" "${f32_p95}" "${mismatch}" "measured" \
+      "${i8_oversample}" "${i8_p50}" "${i8_p95}" "${i8_recall}" "${i8_mismatch}" >> "${SUMMARY}"
   else
     local status_line
     status_line="$(grep -E '^gpu_scaling: (skip|not measurable|gpu unavailable)' "${log}" | tail -1 || echo "exit=${status}")"
-    printf '%s\t%s\t%s\t\t\t\t\t\t\t\t%s\n' \
-      "${point}" "${side}" "${pair}" "${status_line//$'\t'/ }" >> "${SUMMARY}"
+    printf '%s\t%s\t%s\t\t\t\t\t\t\t\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${point}" "${side}" "${pair}" "${status_line//$'\t'/ }" \
+      "${i8_oversample}" "${i8_p50}" "${i8_p95}" "${i8_recall}" "${i8_mismatch}" >> "${SUMMARY}"
   fi
 }
 

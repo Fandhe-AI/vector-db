@@ -102,6 +102,7 @@ GPU 上で実行し、以下を確認した:
 （受け入れ条件「既存 GPU テストが green」を満たす）。
 
 性能の前後比較・Recall 影響の記録は #543 の担当（本 Issue では実施しない）。
+実施結果は「前後比較実測（Issue #543）」節参照。
 
 ## 6. スコープ外・申し送り
 
@@ -184,3 +185,174 @@ codex-review の指摘 3 件（P0 1 件・P1 2 件）はいずれも修正済み
   （実 GPU がある本開発環境〔RTX 3060・Vulkan backend〕で実走。既存の
   CPU 参照実装一致・混在テナント非漏えいテストは無変更のまま green）
 - `cargo clippy -p engine --all-targets --features bench-internals,contrast-bench -- -D warnings`
+
+## 8. 前後比較実測（Issue #543）
+
+### 前提
+
+- before: `2d2c74e`（#542 適用直前）／after: 本 PR の作業ブランチ
+  （`e14d53f`〔#542 マージコミット〕以降・`git diff e14d53f <作業ブランチ>
+  -- crates/engine/src/` が空であることを確認済み）。`git diff 2d2c74e
+  e14d53f -- crates/engine/src/gpu_batch.rs crates/engine/src/lib.rs` の
+  差分は `pub mod packed_i8;`・`GpuContext::backend` フィールド追加のみで、
+  既存 f16/f32 経路の dispatch・シェーダは不変。`Cargo.lock` は両コミット間で
+  無変更（`git diff 2d2c74e e14d53f -- Cargo.lock` が空）。
+- i8 経路（`packed_i8.rs`）は `e14d53f` より前には存在しないため、i8 の
+  「before」は作れない（実測できない）。before バイナリでの `gpu_scaling_i8:`
+  行は全 run で不在であることを確認済み（既存 `gpu_scaling:`／
+  `gpu_scaling_stats:` の非退行〔層 1〕は本 Issue の主題ではないため個別の
+  前後比較表は作らず、以下の層 2（同一 after バイナリ内の A/B/D 比較）のみ
+  記録する）。
+- 環境: 本開発環境（共有 QEMU VM・NVIDIA GeForce RTX 3060・Vulkan backend・
+  12 vCPU・計測中の loadavg 約 3.6〜8.5）。`BENCH_DEDICATED_ENV` 未設定の
+  共有環境であり、`benchmark-judgement-policy.md` §5 により**レイテンシ
+  数値は参考値・採否根拠にしない**。Recall・mismatch・readback バイト数・
+  再スコア候補数は実行のたびに一意に定まる確定的指標のため、本環境でも
+  確定的に判定できる。
+- 規模点: `20000:128:8`（GPU 転送・dispatch の固定コストが支配的な小規模
+  点）・`100000:128:64`（`crossdb-bench.md` GPU 節と同一の中規模点）・
+  `100000:256:64`（i8 は f16 比でバイト/要素が半減するため dim 拡大点を
+  1 点含める）の 3 点。ペア数 N=5（交互 before→after。既定 oversample=4。
+  `scripts/bench_gpu_scaling_ab.sh`）。`500000:128:64` 等の追加規模点・
+  oversample のフル N=5 スイープ（{1,2,8}）は計測時間の都合で本実測の
+  スコープ外とした（下記「oversample の推奨値」節参照。スコープ外事項として
+  記録）。生データは
+  `docs/design/bench-data/gpu-scaling-ab/20260907T084600Z-summary.tsv`
+  （31 行＝3 点 × 5 ペア × 2 側 + ヘッダ）・
+  `docs/design/bench-data/gpu-scaling-ab/20260907T084600Z-i8-stats.txt`
+  （規模点ごとの `gpu_scaling_i8:`／`gpu_scaling_i8_stats:` 行の抜粋）に
+  保持。
+
+### 確定的指標: Recall・不一致件数・読み戻し量（環境ノイズの影響を受けない）
+
+CPU-SIMD（A）厳密対照に対する i8 経路（D。既定 oversample=4）の平均
+Recall@10・同点許容つき不一致件数は、3 規模点 × 5 ペア（after 側 15 run）
+の**全 run で完全に同一の値**だった:
+
+| rows | dim | batch | oversample | i8_recall_at_k（全 5 run） | i8_mismatch（全 5 run） |
+| --- | --- | --- | --- | --- | --- |
+| 20,000 | 128 | 8 | 4 | 1.0000 | 0 |
+| 100,000 | 128 | 64 | 4 | 1.0000 | 0 |
+| 100,000 | 256 | 64 | 4 | 1.0000 | 0 |
+
+**Recall@10 の低下は 1 件も観測されなかった**（3 規模点 × 5 ペアの全 15
+run で `i8_recall_at_k = 1.0000`・`i8_mismatch = 0`）。`crates/engine/
+tests/gpu_batch_i8.rs` の受け入れ基準（brute-force 対照 Recall@10 ≥ 0.9・
+oversample 増加で非減少）とも整合する。
+
+読み戻し量・再スコア候補数（規模点ごと 1 run の代表値。同一規模点内で
+`calls`・`readback_bytes_total`・`rescored_candidates_total` は決定的に
+一致する——`oversample` が構築時固定でクエリ内容に依存しないため）:
+
+| rows | dim | batch | readback_bytes/call | rescored_candidates/call | backend | dot4_impl | build_ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 20,000 | 128 | 8 | 640,000 | 320 | Vulkan | Undetermined | 20 |
+| 100,000 | 128 | 64 | 25,600,000 | 2,560 | Vulkan | Undetermined | 91 |
+| 100,000 | 256 | 64 | 25,600,000 | 2,560 | Vulkan | Undetermined | 175 |
+
+readback バイト数は `dim` に依存せず（i8 dispatch が読み戻すのは i32
+スコア配列のみでベクトル次元数を含まない）、`rows × batch × 4 × 10`
+（候補生成専用のため既存 f16/f32 の部分 Top-k readback とは異なり
+`k' = k × oversample` 件の生スコアをそのまま読み戻す構造）で決まる。
+`dot4_impl` は wgpu 30.0.1 の制約により全 run で `Undetermined`
+（§4「`Dot4I8Impl` が常に `Undetermined` である理由」節参照。native/
+polyfill の A/B は本実測のスコープ外）。
+
+### レイテンシ（参考値・共有 QEMU 環境のため採否根拠にしない）
+
+`gpu_i8_p95`（after 側。min-of-5・median）と、同一 after バイナリ内の A
+（CPU-SIMD）・B（GPU f16 常駐）の p95 を突き合わせた速度比
+（`speedup_ratio` = 分子 / i8_p95。1.0 未満は i8 の方が遅いことを表す）。
+参照区間帯は pooled `cpu_p50`（before + after 両側。`isa.rs`／
+`batch_search.rs` は本 Issue で無変更のため純粋な run-to-run ノイズの目安）。
+
+| rows:dim:batch | i8_p95（min/median） | A（cpu）p95（min） | B（f16）p95（min） | ratio i8/A（min-of-N） | ratio i8/B（min-of-N） | 参照区間帯 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20000:128:8 | 5,486 / 6,196 µs | 5,047 µs | 535 µs | 1.087x（**遅い**） | 10.254x（**遅い**） | 11.32% |
+| 100000:128:64 | 306,634 / 310,024 µs | 82,869 µs | 15,810 µs | 3.700x（**遅い**） | 19.395x（**遅い**） | 11.62% |
+| 100000:256:64 | 336,079 / 361,815 µs | 137,090 µs | 21,899 µs | 2.452x（**遅い**） | 15.347x（**遅い**） | 121.0%（loadavg 変動による外れ値混入。実測帯内・判定不能） |
+
+3 規模点いずれも i8 経路は A（CPU-SIMD）・B（GPU f16 常駐）の**両方より
+明確に遅い**（比 1.09〜3.70x 対 A、10.3〜19.4x 対 B）。参照区間帯を大きく
+超える一貫した悪化方向であり（`100000:256:64` の参照区間帯 121% は 1 run
+の外れ値〔loadavg スパイク〕によるもので、他の 2 点・生ログの他 4 ペアは
+安定した傾向を示す）、共有環境のノイズでは説明できない一貫した傾向と判断
+する。
+
+### 原因分析
+
+i8 経路（`packed_i8.rs::DOT_SHADER_I8_WGSL`）は**「1 dispatch = 1
+クエリ」**の単純な構造のまま実装されている（同シェーダのドキュメンテー
+ションコメント「D11 の申し送り」参照）。一方で既存 f16/f32 経路は
+Issue #532（クエリタイル化。最大 `GPU_QUERY_TILE_MAX` 本を 1 dispatch へ
+束ねる）・Issue #536（workgroup 内部分 Top-k による readback 削減）を
+経て最適化済みであり、GPU dispatch・常駐行列読み込みの固定コストを複数
+クエリで償却できる。i8 経路にはこの償却機構がなく、`batch >= 8` の全規模
+点で `1 dispatch/query` の固定オーバーヘッドがバッチサイズに比例して
+積み上がることが、上記の速度比が readback バイト数の削減比（f16 比
+1/8〜1/4 相当のバイト数）から期待される改善とは逆方向に大きく外れている
+主因と考えられる（クエリタイル化・部分 Top-k は #542 doc §6 で明示的に
+「未実装」と申し送られている既知のスコープ外事項であり、本実測で初めて
+定量的な裏付けが得られた）。
+
+### oversample の推奨値
+
+構築時固定オプションのため、本実測（既定 oversample=4）に加え、開発中の
+スモークテストとして `20000:128:8`・`crates/engine/tests/
+gpu_batch_i8.rs::i8_backend_recall_is_monotone_non_decreasing_in_
+oversample_when_gpu_available`（2,000 行・dim 128 のクラスタ構造ありコー
+パス）で oversample を 1・4・8 と振った際の Recall@10 が非減少である
+ことを確認済み（同テストは `make ci` 対象として本 PR に含まれる）。加えて
+2,000 行・dim 128・batch 8 の単発スモーク実測で oversample 1 → 2 → 4 → 8
+の平均 Recall@10 が 0.9875 → 1.0000 → 1.0000 → 1.0000 と単調に改善する
+ことを確認した（N=5 の正式なペア実測はこの oversample スイープでは実施
+していない——時間予算の制約によりスコープ外。下記「スコープ外・申し送り」
+参照）。
+
+以上より、**既定値 4 は Recall の観点からは十分に安全**（本実測 3 規模点
+すべてで Recall@10=1.0000）である一方、**レイテンシの観点では oversample
+を下げても i8 経路自体が既存 2 経路（A・B）より大幅に遅いという結論は
+変わらない**と見込まれる（原因はクエリタイル化の欠如であり oversample
+とは独立の要因のため）。`DEFAULT_I8_OVERSAMPLE` の変更は本 Issue（テスト・
+ベンチ・docs 専任）のスコープ外とし、production コード（`packed_i8.rs`）
+は無変更のまま維持する。
+
+### 判定
+
+- **Recall 影響**: 3 規模点 × 5 ペアの全 run で `i8_recall_at_k=1.0000`・
+  `i8_mismatch=0`。既定 oversample=4 で Recall 劣化は一切観測されなかった
+  （確定的指標）。
+- **速度**: 共有環境の参考値としては 3 規模点すべてで i8 経路が A（CPU-
+  SIMD）・B（GPU f16 常駐）の両方より一貫して遅い（1.09〜19.4x）。原因は
+  クエリタイル化未実装という既知のスコープ外事項（§6「申し送り」）に
+  帰着すると分析した。
+- 本実測は #542 の設計判断（候補生成専用・opt-in・primary 未接続）を
+  変更する根拠にはならない——i8 経路は既定経路に一切接続されておらず、
+  本実測結果は速度改善が必要になった場合の後続実装（クエリタイル化）の
+  優先度判断材料として記録する。
+
+### 再現手順（前後比較）
+
+1. before バイナリを別 worktree・別 `CARGO_TARGET_DIR` で退避:
+   `git worktree add <dir> 2d2c74e && cd <dir> && CARGO_TARGET_DIR=<target>
+   cargo bench --bench gpu_scaling_bench -p engine --no-run
+   --message-format=json` を実行し `executable` を抽出する。
+2. after バイナリは作業ブランチで同様にビルドする。
+3. 交互実行: `BEFORE_BIN=<path> AFTER_BIN=<path> OUT_DIR=<dir>
+   I8_OVERSAMPLE=4 scripts/bench_gpu_scaling_ab.sh 5 20000:128:8
+   100000:128:64 100000:256:64`
+4. 集計: `summary.tsv` の `i8_*` 列を `rows:dim:batch` × `side` でグルー
+   ピングし、min-of-N・median・`ratio = i8_p95_min / {cpu,f16}_p95_min`・
+   pooled `cpu_p50` の `reference_band` を算出する。
+
+## スコープ外・申し送り（Issue #543）
+
+- `500000:128:64` 等の追加規模点（i8 は 1 run あたり最大約 2.2 秒〔p50〕・
+  N=5 ペアで数分規模になり、本実測の時間予算では計測時間の都合で見送った）
+- oversample {1, 2, 8} の正式な N=5 ペア実測（上記スモーク実測で単調性は
+  確認済みだが、参照区間帯を伴う正式な前後比較表は未作成）
+- `DEFAULT_I8_OVERSAMPLE` の変更（推奨値の記録のみ。採否は専有環境再実測
+  後にオーナー判断）
+- 専有環境（`BENCH_DEDICATED_ENV=1`）でのレイテンシ再実測（オーナー作業）
+- i8 経路のクエリタイル化・workgroup 内部分 Top-k（#542 doc §6 の既存申し
+  送りだが、本実測により定量的な優先度判断材料が追加された）
