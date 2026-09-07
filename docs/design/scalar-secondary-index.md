@@ -277,6 +277,18 @@ Issue #473〜#476 はこの節の契約に従う。
   の NULL 件数フィールド追加か、`VisibleBitmapCache` 側からの補完か）は
   #475 の実装時に確定する。TABLE-12 のキー／ヘッダ tenant 整合検査は索引
   構築時に全件実施し省略しない
+
+  **#475 実装確定**: NULL 補完は `ScalarIndex::slots_without_value`（索引済み
+  全値のスロットを `row_count` 長のビットマップで被覆し、被覆されなかった
+  スロットを NULL とみなす差分計算）として実装した——`ScalarIndex::build` が
+  当該列の非 `NULL` 値を**すべて**索引化するか索引全体の構築自体を諦めるかの
+  いずれかである契約（本 ADR「データモデル」節）により、この差分は常に正確な
+  NULL 集合になる。NULL 件数フィールドの追加は不採用。`COUNT(*)` の候補件数
+  直接返却 fast path は、レビューで再検証省略が問われうる（#473/#474 の判定
+  同一性テストのみを根拠にする）リスクを避けるため**不採用**とし、他の集計と
+  同じ候補走査＋`matches_all`／式述語の再検証を経る設計へ統一した（コストは
+  候補数に比例するのみで実質的な差は小さい）。詳細・前後比較は
+  `docs/design/scalar-index-aggregate.md` 参照。
 - **`EXPLAIN`（#474）**: `sql::hnsw_cache::classify_ann_plan`（Issue #411）と同型の
   純粋関数 `classify_scalar_plan` を単一情報源にし `scalar_plan:`（例:
   `plain_scan`／`index_equality`／`index_prefix`／`index_conjunction`）を静的判定
