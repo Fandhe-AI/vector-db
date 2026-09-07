@@ -557,9 +557,24 @@ for n in 1 2 3 4 5; do
   <dir-c>/target/release/deps/hybrid_profile_bench-* --bench > C-$n.out
 done
 
-# crossdb self は scripts/crossdb_bench/run.py --db self --config exact を A→C 交互に 5 ペア実行
-# （run.py は <repo_root>/target/release/wire-server を既定で参照するため、
-#   <dir-a>/target・<dir-c>/target 配下にそのパスでバイナリを配置してから実行する）
+# crossdb self は scripts/crossdb_bench/run.py --db self --config exact を A→C 交互に 5 ペア実行。
+# self_db.py の _default_binary() は `__file__`（run.py 自身の配置先）基準で
+# `<run.py の repo_root>/target/release/wire-server` を解決する（--binary の
+# CLI オーバーライドは無い）。そのため <dir-a>・<dir-c> どちらの状態を計測するかは
+# 「どの run.py を呼び出すか」で決まり、run.py を固定してバイナリだけ配置し直しても
+# 常に「呼び出した run.py が属するディレクトリ」のバイナリが使われてしまい A/C 比較に
+# ならない（PR #575 codex-review 指摘対応）。したがって A・C それぞれの
+# `<dir-a>/scripts/crossdb_bench/run.py`・`<dir-c>/scripts/crossdb_bench/run.py`
+# （`git archive` で書き出した各ディレクトリ配下のコピー）を明示的に呼び分ける。
+# 共通 fixture は既存の `docs25k.redb`／`docs25k.jsonl`／`queries200.jsonl`（$S 配下）を再利用する。
+for n in 1 2 3 4 5; do
+  python3 <dir-a>/scripts/crossdb_bench/run.py --db self --config exact \
+    --rows-file "$S/docs25k.redb" --queries-file "$S/queries200.jsonl" \
+    --out-dir <dir-a>/results > crossdb-A-$n.log
+  python3 <dir-c>/scripts/crossdb_bench/run.py --db self --config exact \
+    --rows-file "$S/docs25k.redb" --queries-file "$S/queries200.jsonl" \
+    --out-dir <dir-c>/results > crossdb-C-$n.log
+done
 
 # Recall 3 ゲート（プレースホルダ閾値・RECALL_VERBOSE=1・RECALL_ENGINE=brute_force|hnsw）
 # 比較対象コミット（<dir-a>=91f6a18・<dir-c>=c86c683）でそれぞれ選択するため、
