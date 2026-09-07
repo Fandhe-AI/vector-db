@@ -569,3 +569,92 @@ Phase 3 の全施策（#489〜#503）適用後も、既存の 3 Recall ゲート
 brute_force／hnsw 双方で before と完全に同一の値を維持しており、非退行を
 確認した。詳細な計測条件・交絡・前後比較（性能側）は
 `docs/design/hnsw-phase3-before-after.md` 参照。
+## Issue #450 追記: repair 逐次段削減（#447〜#449）後の同一閾値検証
+
+### 背景
+
+Issue #447〜#449 で `HnswIndex::build_with_threads` の
+`repair_reachability`（凍結後・単一スレッドの後始末）を大幅に削減した
+（詳細は `docs/design/hnsw-parallel-build.md`「Issue #450 追記」節）。
+このうち #449 の保証は `repair_reachability_inner` 単体について、同一
+入力グラフに対する `threads` の値によらないビット同一性のみである
+（上記 doc「Issue #449 追記」節「決定性の検証」参照）。一方 #448 は
+`publish_links` から `ensure_reverse_link` を呼び並列構築で失われうる
+逆辺を追加する変更であり、構築グラフ全体が変更前後でビット同一である
+ことまでは保証しない。本節では #447〜#449 を含む変更全体を対象に、
+Recall ゲート層 B・可視外非混入テストが `#412`／`#515` 時点の実測値と
+変わらず通ることを実測で再確認する（グラフのビット同一性ではなく
+Recall 値の一致を根拠とする）。
+
+### 実測結果（ローカル `--release`。本開発環境: x86_64・AVX2+FMA あり・AVX-512 なし。閾値は private spec から環境変数へ注入するが、本節の実測は測定を発火させるためだけの permissive なプレースホルダ（recall 系 `(0.0,1.0]` は `0.0001`・improvement 系 `[0.0,1.0]` は `0.0`）を注入し、pass/fail 自体は判定材料としていない。実測値はオーナー判断〔2026-08-29〕により公開可）
+
+`RECALL_VERBOSE=1` opt-in で `brute_force`／`hnsw` を各ゲート 1 回ずつ
+実行し比較した（`RECALL_ENGINE` 未実装の変更は無いため `hnsw_f16`／
+`hnsw_i8` の再検証は #515／#523 の既存実測から不変のまま対象外とした）。
+
+#### hybrid（`hybrid_recall.rs`）
+
+| 段 | 指標 | brute_force | hnsw | #412／#515 実測値 | 差分 |
+| ---- | ---- | ---- | ---- | ---- | ---- |
+| 小規模（400 docs） | recall@20 | 0.9010 | 0.9010 | 0.9010 | 0 |
+| 大規模（20,000 docs） | recall@20 | 0.9145 | 0.9145 | 0.9145 | 0 |
+| 大規模（20,000 docs） | recall@100 | 0.9165 | 0.9165 | 0.9165 | 0 |
+
+大規模段 `hnsw` の統計（1 run）: `builds=1 build_failures=0 rebuilds=0
+hybrid_dense_searches=420 hybrid_queries=100 ef_cap_fallbacks=80
+f16_residency_fallbacks=0 hybrid_resumed_rounds=240`（`hybrid_resumed_
+rounds` は Issue #505/#619 で追加された再開型探索の統計。`ef_cap_
+fallbacks` と同水準で非 vacuous に発火しており停止性・非退行に問題なし）。
+
+#### rerank（`rerank_recall.rs`。大規模段のみ）
+
+| 指標 | brute_force | hnsw | #412／#515 実測値 | 差分 |
+| ---- | ---- | ---- | ---- | ---- |
+| after_recall@20 | 0.9488 | 0.9488 | 0.9488 | 0 |
+| non_degraded | true | true | true | — |
+| improvement_ratio@20（informational） | 0.2222 | 0.2222 | 0.2222 | 0 |
+
+#### query-planning（`query_planning_recall.rs`）
+
+| 段 | 指標 | brute_force | hnsw | #412／#515 実測値 | 差分 |
+| ---- | ---- | ---- | ---- | ---- | ---- |
+| 小規模（4,000 docs） | intent_improvement | 0.9245 | 0.9245 | 0.9245 | 0 |
+| 小規模（4,000 docs） | direct_after_recall20 | 0.9321 | 0.9321 | 0.9321 | 0 |
+| 小規模（4,000 docs） | intent_improvement_degraded | 0.3547 | 0.3547 | 0.3547 | 0 |
+| 大規模（40,000 docs） | direct_after_recall20 | 0.8852 | 0.8852 | 0.8852 | 0 |
+
+### 判断
+
+**全 8 測定点で brute_force／hnsw の実測 Recall 値が完全一致し、かつ
+`#412`／`#515` 時点の実測値（repair 逐次段削減前）とも完全一致した。**
+このうち `#449` 単体（`repair_reachability_inner`）は同一入力グラフに対する
+`threads` 不変性がビット同一という設計保証だが、#448 を含む変更全体
+（#447〜#449）については構築グラフそのもののビット同一性を保証しない
+（上記「背景」節参照）。本節はその変更全体を対象に、Recall 値が
+repair 逐次段削減の前後で一致することを実測で確認したものであり、
+グラフのビット同一性ではなく Recall ゲートへの影響が無いことを根拠と
+する。全指標で `hnsw >= brute_force` かつ `repair 削減後 == repair
+削減前` の S8 決定規則を満たすため、閾値を緩める必要はない。
+
+未達・原因分析の記録は不要。production コード（`crates/engine/src/`）は
+本 Issue の範囲では無変更（テスト・docs 専任）。
+
+### 可視外非混入・既存 ANN テストの無変更 green 確認
+
+`cargo test --release -p engine --test incremental_index_hnsw --test
+hnsw_cache --test hnsw_hybrid_refetch --test hnsw_parallel_profile_accept
+--test hnsw_search --test hnsw`（層 A。`hnsw_search` の `#[ignore]` 3 本
+除く）・`cargo test --release -p engine --lib hnsw::`・`make
+hnsw-search-recall`（層 B・`#[ignore]`）をいずれも実行し、全て green
+であることを確認した（`hnsw_search_recall: ef=64/256 Recall@10=1.0000`
+は `docs/design/hnsw-search.md` の既存記録と完全一致）。`tests/hnsw_
+cache.rs`・`tests/hnsw_hybrid_refetch.rs` の可視外非混入・RLS 統合テスト
+は本 Issue の変更対象（`hnsw.rs::repair_reachability_inner` 等）に触れる
+経路を含むが無変更のまま green であり、#447〜#449 が RLS 境界・可視外
+非混入契約に影響していないことを再確認した。
+
+### スコープ外・申し送り（本節限定）
+
+- `hnsw_f16`／`hnsw_i8` での再検証（Recall 経路自体は #447〜#449 の
+  変更対象外のため実施していない。必要になった場合は次回 Recall 関連
+  Issue で合わせて確認する）
