@@ -310,11 +310,19 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-hybrid-profile
-bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）＋ Issue #387（search_within の段別・疎側再取得発火回数）＋ Issue #465（Issue #392 適用後の最新基線ラウンド計測）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_HYBRID_PROFILE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる（Issue #465）
+bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）＋ Issue #387（search_within の段別・疎側再取得発火回数）＋ Issue #465（Issue #392 適用後の最新基線ラウンド計測）＋ Issue #547（行数・可視率 opt-in）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_HYBRID_PROFILE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告、BENCH_HYBRID_PROFILE_ROWS=<1-100000>（既定 25000）で行数、BENCH_HYBRID_PROFILE_VISIBLE_RATIO=1/<1-1000>（既定 1/1）で可視率を指定できる（Issue #547）
 ifdef HAS_CARGO
 	cargo bench --bench hybrid_profile_bench -p engine --features bench-internals
 else
 	@echo "skip: Cargo.toml 未追加のため bench-hybrid-profile をスキップ"
+endif
+
+.PHONY: bench-hybrid-profile-ab
+bench-hybrid-profile-ab: ## Issue #547: #546（スコアアキュムレータ再利用）の前後比較を N=25k/100k・可視率 1/1・1/10 の 4 条件で交互 min-of-N 計測する（BEFORE_BIN・AFTER_BIN に退避済みバイナリの絶対パスを指定。AB_PAIRS・AB_ROUNDS で交互ペア数・ラウンド数を指定可。手動実行専用・CI 非配線。scripts/bench_hybrid_profile_ab.sh 参照）
+ifdef HAS_CARGO
+	scripts/bench_hybrid_profile_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hybrid-profile-ab をスキップ"
 endif
 
 # --------------------------------------------------

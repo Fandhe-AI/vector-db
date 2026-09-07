@@ -222,6 +222,25 @@ hybrid_wire_profile_bench.rs`）は同 Issue で `hybrid_rrf` の engine 内 hyb
 経路／SQL 表層／wire の 3 区分を切り分けます。`BENCH_HYBRID_WIRE_ROUNDS`
 （既定 5・5〜50）でラウンド数を指定できます。
 
+Issue #547 で行数・可視率を opt-in 可変化しました。
+`BENCH_HYBRID_PROFILE_ROWS`（既定 25,000・`1..=100000`）でコーパス行数、
+`BENCH_HYBRID_PROFILE_VISIBLE_RATIO`（既定 `1/1`・`1/<1..=1000>` 形式のみ）で
+可視率を指定できます。可視率の意味は経路で異なります: SQL 段
+（`sql_hybrid`／`sql_dense_knn`／`collect_body_strings`）は RLS の正規経路
+（可視率に満たない行を `Visibility::Private` として投入）で索引の文書数
+そのものが縮小し、直接 API 段（`hybrid_search_cached_index`・
+`sparse_refetch_loop`・`search_within_fetch_k=<k>` 等）は常に全件から
+構築した索引へ可視部分集合だけを渡します（「索引 N ≫ 可視集合」条件を
+直接検証する経路）。#546（`SparseIndex::score_by_postings` のスコア
+アキュムレータ再利用）の前後比較は `scripts/bench_hybrid_profile_ab.sh`
+（`make bench-hybrid-profile-ab`）で行います。`BEFORE_BIN`／`AFTER_BIN` に
+退避済みバイナリの絶対パスを、`AB_PAIRS`（既定 5）・`AB_ROUNDS`（既定 5）で
+交互ペア数・ラウンド数を指定し、N=25,000／100,000 × 可視率 1/1・1/10 の
+4 条件を before→after の順で交互実行します。`--summarize <dir>` で
+`baseline_round_raw`／`baseline_summary`／`reference_band` 行を一覧表示できます。
+前後比較の実測結果は `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #547」
+節を参照してください。
+
 `cargo run --release -p engine --example feature_bench` は SQL 表層・ベクトル
 検索・RLS を含む 13 フェーズ（`ingest`・`hybrid_rrf`・`vector_knn` 等）を
 横断的に計測し JSON を stdout へ出力します（依存追加なし・std のみ。

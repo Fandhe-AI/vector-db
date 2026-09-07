@@ -1216,3 +1216,68 @@ cold/hot 等価性・決定性契約は構造的に不変）。`sparse.rs` 内 u
 `approx_heap_bytes()` の表示値は上限加算分だけ増える（実 RSS は変わらない）
 ため、#547 が `bench-hybrid-profile` のメモリ計測を記録する際にはこの点を
 注記する必要がある。
+
+## Issue #547: #546 の前後比較（実測）
+
+対応: Issue #547（`test(engine): bench-hybrid-profile での前後比較
+（N=25k／100k・可視率 100%／10%）`）。前提: Issue #546（本ドキュメント
+「Issue #546」節）。計測規約は `docs/design/benchmark-judgement-policy.md`
+（Issue #462 SSOT）に従う。
+
+### 計測方法
+
+`crates/engine/benches/harness/hybrid_profile.rs` へ
+`BENCH_HYBRID_PROFILE_ROWS`（コーパス行数）・
+`BENCH_HYBRID_PROFILE_VISIBLE_RATIO`（可視率 `1/<N>`）の fail-closed
+opt-in を追加し、`scripts/bench_hybrid_profile_ab.sh`
+（`make bench-hybrid-profile-ab`）で before（#546 適用前。
+`crates/engine/src/sparse.rs`・`crates/engine/src/sql/sparse_cache.rs` のみ
+`b161d5b^`（#565 の直前コミット）まで戻したビルド）／after（HEAD。
+本 PR の計測基盤自体を含む）の 2 バイナリを N∈{25000,100000} ×
+可視率∈{1/1,1/10} の 4 条件で before→after 交互 5 ペア（各ペア
+`BENCH_HYBRID_PROFILE_ROUNDS=5`）実行した。可視率の意味は README「hybrid_rrf
+段別内訳プロファイルと転置索引化の前後比較」節と同じ（SQL 段は索引 N
+自体が縮小、直接 API 段は索引 N は常に行数で可視集合のみ縮小）。
+
+### 実測結果（min-of-5、参照区間帯は同一条件内の B0s の (max−min)/min）
+
+`B4`（`hybrid_search_cached_index`。engine 内 hybrid 経路の直接 API。
+`score_by_postings`／`score_within` を経由し #546 の対象）・`B5`
+（`sparse_refetch_loop`。同じく対象）を主対象とし、`B0s`
+（`CpuScalarProvider` 単線・#546 と無関係の密側参照区間）を同一実行環境の
+ノイズ帯として併記する。
+
+| 条件（N・可視率） | B4 before→after (diff) | B5 before→after (diff) | B0s 参照区間帯 (before/after) |
+| --- | --- | --- | --- |
+| 25,000・1/1 | 5715us→6058us (+6.0%) | 3378us→3477us (+2.9%) | 16.0% / 9.6% |
+| 25,000・1/10 | 638us→624us (−2.2%) | 238us→242us (+1.7%) | 10.8% / 1.5% |
+| 100,000・1/1 | 12564us→12873us (+2.5%) | 8948us→9076us (+1.4%) | 2.6% / 8.1% |
+| 100,000・1/10 | 2164us→2190us (+1.2%) | 1108us→1127us (+1.7%) | 3.2% / 3.8% |
+
+`B1`（SQL 表層 crossdb 規範形）・`B2`（既存段と同じ投影）でも同様に
+before/after 差は概ね ±2〜3% 台で、絶対値（N=100,000・1/1 で 44〜48ms 台）に
+対する `score_by_postings` の寄与自体が小さいため、傾向は B4/B5 と一致する
+（生ログ・summary 行は `target/bench-hybrid-profile-ab/<ts>/*.log` に保存され、
+本 PR の履歴には含まない実行時生成物）。
+
+### 判断
+
+4 条件 × 2 段（B4・B5）のいずれも、before→after の差（−2.2%〜+6.0%）は
+同一条件・同一交互実行内の `B0s` 参照区間帯（1.5%〜16.0%）と同程度かそれ
+以上であり、`docs/design/benchmark-judgement-policy.md` の採用条件
+（ノイズ帯を明確に超える改善）を満たさない。したがって **#546 の
+ウォールクロック効果はこの計測環境・この 4 条件では有意に検出できない**
+と判断する（Issue #366・#365 と同様の「効果なし」実測結果）。
+
+推定される要因: `score_by_postings` が確保していた `acc: Vec<f64>`
+（コーパス全体長）は glibc の同一サイズ再利用（tcache）により繰り返し
+確保・解放してもコストが小さく、かつ本ベンチの支配的コストは posting
+list 走査・BM25 スコアリング本体（Issue #388〜#392 で既に大半を削減済み）
+や SQL 表層の固定コストであるため、確保コストの除去がマイクロベンチの
+全体レイテンシに現れにくい。
+
+`#546` はスコアの f64 ビット一致・RLS 相当のテナント境界縮約契約を維持した
+まま `approx_heap_bytes()` の容量判定を実確保量に整合させる副次効果を持つため
+（本ドキュメント「Issue #546」節参照）、ウォールクロック改善が計測されない
+ことは production 変更の妥当性を損なわない。本 Issue の役割は前後比較の
+実測・記録であり、#546 の採否判断そのものは対象外（既に実装・マージ済み）。
