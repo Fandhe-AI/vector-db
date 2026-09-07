@@ -56,20 +56,38 @@ if [ "${1:-}" = "--summarize" ]; then
     [ -d "$dir" ] || fail "not a directory: $dir"
     echo "=== baseline_round_raw / baseline_summary / reference_band lines under $dir ==="
     found=0
-    # 条件→ペア→before/after の実行順を明示的に辿る（shell glob の辞書順
-    # `*.log` 展開だと "ratio1of10" が "ratio1of1" より前に来て実行順と逆転し、
+    # 条件→ペア番号（数値昇順）→before/after の実行順を明示的に辿る（shell
+    # glob の辞書順 `*.log` 展開だと "ratio1of10" が "ratio1of1" より前に来る、
+    # また pair 番号も文字列順で "pair10" が "pair2" より前に来て実行順と逆転し、
     # before/after・ペア番号の対応を取り違えやすい。codex-review 指摘）。
+    # ペア番号はディレクトリ実体から抽出し `sort -n` で数値昇順に整列してから、
+    # 同一ペア内は before → after の順（実行順と一致）で列挙する。
     # grep -H: ファイル名を出す。ファイル名に条件・ペア・side が埋め込まれて
     # いるため、before/after とペア番号の対応を summary 出力だけで追える。
     for cond in $conditions; do
         rows="${cond%%:*}"
         denom="${cond##*:}"
         cond_label="rows${rows}_ratio1of${denom}"
-        for pair_file in "$dir/${cond_label}"_pair*_before.log "$dir/${cond_label}"_pair*_after.log; do
-            [ -e "$pair_file" ] || continue
-            if grep -H -E 'baseline_round_raw|baseline_summary|baseline reference_band|^hybrid_profile: rows=' "$pair_file"; then
-                found=1
-            fi
+        pair_numbers=""
+        for f in "$dir/${cond_label}"_pair*_before.log; do
+            [ -e "$f" ] || continue
+            base="$(basename "$f")"
+            pair_num="${base#"${cond_label}"_pair}"
+            pair_num="${pair_num%_before.log}"
+            case "$pair_num" in
+                ''|*[!0-9]*) continue ;;
+            esac
+            pair_numbers="$pair_numbers $pair_num"
+        done
+        pair_numbers="$(printf '%s\n' $pair_numbers | sort -n -u)"
+        for pair_num in $pair_numbers; do
+            for side in before after; do
+                pair_file="$dir/${cond_label}_pair${pair_num}_${side}.log"
+                [ -e "$pair_file" ] || continue
+                if grep -H -E 'baseline_round_raw|baseline_summary|baseline reference_band|^hybrid_profile: rows=' "$pair_file"; then
+                    found=1
+                fi
+            done
         done
     done
     [ "$found" -eq 1 ] || fail "no matching log lines found under $dir"
