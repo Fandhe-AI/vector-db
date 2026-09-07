@@ -101,6 +101,7 @@ pub mod mode;
 pub mod parser;
 pub mod plan;
 pub(crate) mod scalar_index;
+pub(crate) mod scalar_plan;
 pub(crate) mod sparse_cache;
 pub mod udf_call;
 pub(crate) mod visible_cache;

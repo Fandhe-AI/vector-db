@@ -776,6 +776,7 @@ pub(crate) fn build_parallel_graph(
         vectors,
         dim_usize,
         owned_vectors,
+        threads,
     )
 }
 
@@ -930,7 +931,12 @@ pub(crate) fn build_parallel_graph_observed(
     // `repair_start.elapsed()`（`profile.repair_reachability`。既存
     // フィールド）は従来どおり残す——受け入れ条件「Σ 段別 wall <=
     // repair.wall <= repair_reachability（誤差内）」の比較対象。
-    let repair = builder.repair_reachability_observed(dim_usize, vectors)?;
+    // Issue #449: 修復フェーズの最近傍探索の並列度上限として、呼び出し元
+    // （`HnswIndex::build_with_threads_observed`）から引き継いだ構築スレッド
+    // 数 `threads` をそのまま渡す（`WorkerBudgetGuard` の追加取得は行わず、
+    // 構築全体にわたって保持済みの予算を引き継ぐ契約。`repair_reachability_
+    // inner` のドキュメンテーションコメント「探索の並列化」参照）。
+    let repair = builder.repair_reachability_observed(dim_usize, vectors, threads)?;
     let repair_reachability = repair_start.elapsed();
 
     // 平坦化（CSR 化。Issue #494）は常に最終段——`freeze`（構造的な組み立て）
@@ -996,6 +1002,16 @@ fn assemble_graph(graph: BuildGraph, params: HnswParams) -> Result<GraphBuilder,
 /// `repair_reachability`〔並列フェーズが生みうる上位層の到達不能ノードを
 /// 閉じる。モジュール冒頭「決定性の範囲」節参照〕 → [`super::HnswIndex::
 /// freeze_from`] による CSR 平坦化〔Issue #494。常に最終段〕)。
+///
+/// `threads` は修復フェーズの最近傍探索（Issue #449）の並列度上限として
+/// そのまま引き継ぐ（呼び出し元 `build_parallel_graph` が受け取った構築
+/// スレッド数と同一値。`WorkerBudgetGuard` の追加取得は行わない——
+/// `repair_reachability_inner` のドキュメンテーションコメント「探索の
+/// 並列化」参照）。
+// Issue #449 で修復フェーズの並列度 `threads` を追加し 8 引数（閾値 7）を
+// 超えたが、`hnsw.rs`・`sql/hnsw_cache.rs` の既存関数群と同じ方針で許容する
+// （本ファイル内 `#[allow(clippy::too_many_arguments)]` 参照）。
+#[allow(clippy::too_many_arguments)]
 fn freeze(
     graph: BuildGraph,
     params: HnswParams,
@@ -1004,9 +1020,10 @@ fn freeze(
     original_vectors: &[f32],
     dim_usize: usize,
     owned_vectors: Arc<[f32]>,
+    threads: usize,
 ) -> Result<HnswIndex, HnswError> {
     let mut builder = assemble_graph(graph, params)?;
-    builder.repair_reachability(dim_usize, original_vectors)?;
+    builder.repair_reachability(dim_usize, original_vectors, threads)?;
     HnswIndex::freeze_from(builder, dim, owned_vectors, precision)
 }
 
@@ -1057,6 +1074,7 @@ mod tests {
             &vectors,
             dim,
             owned,
+            1,
         )
         .unwrap_err();
         assert_eq!(err, HnswError::WorkerPanicked);
@@ -1869,6 +1887,7 @@ mod tests {
             &vectors,
             dim,
             owned,
+            1,
         )
         .unwrap();
 

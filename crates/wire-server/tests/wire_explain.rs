@@ -125,6 +125,7 @@ fn explain_returns_query_plan_column_and_expected_rows() {
         // `ann_plan:` も `unknown_custom_provider`。
         "engine: (custom_provider)",
         "ann_plan: unknown_custom_provider",
+        "scalar_plan: plain_scan",
     ];
     for expected in expected_lines {
         let row = read_data_row(&mut stream);
@@ -150,13 +151,14 @@ fn explain_reports_query_clause_mode_source() {
 
     let _columns = read_row_description(&mut stream);
     let mut rows = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..9 {
         rows.push(read_data_row(&mut stream)[0].clone().expect("cell"));
     }
     assert_eq!(rows[4], "mode: precision");
     assert_eq!(rows[5], "mode_source: query_clause");
     assert_eq!(rows[6], "engine: (custom_provider)");
     assert_eq!(rows[7], "ann_plan: unknown_custom_provider");
+    assert_eq!(rows[8], "scalar_plan: plain_scan");
 
     assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
     read_ready_for_query(&mut stream);
@@ -235,7 +237,7 @@ fn explain_reports_hnsw_engine_and_full_visible_ann_plan() {
 
     let _columns = read_row_description(&mut stream);
     let mut rows = Vec::new();
-    for _ in 0..7 {
+    for _ in 0..8 {
         rows.push(read_data_row(&mut stream)[0].clone().expect("cell"));
     }
     assert_eq!(rows[4], "engine: hnsw");
@@ -244,6 +246,7 @@ fn explain_reports_hnsw_engine_and_full_visible_ann_plan() {
         "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32"
     );
     assert_eq!(rows[6], "ann_plan: hnsw_full_visible");
+    assert_eq!(rows[7], "scalar_plan: plain_scan");
 
     assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
     read_ready_for_query(&mut stream);
@@ -264,11 +267,12 @@ fn explain_reports_plain_scan_precision_ann_plan_for_hnsw_precision_mode() {
 
     let _columns = read_row_description(&mut stream);
     let mut rows = Vec::new();
-    for _ in 0..7 {
+    for _ in 0..8 {
         rows.push(read_data_row(&mut stream)[0].clone().expect("cell"));
     }
     assert_eq!(rows[4], "engine: hnsw");
     assert_eq!(rows[6], "ann_plan: plain_scan_precision");
+    assert_eq!(rows[7], "scalar_plan: plain_scan");
 
     assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
     read_ready_for_query(&mut stream);

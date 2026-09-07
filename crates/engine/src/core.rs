@@ -2602,6 +2602,11 @@ impl EngineCore {
                 let explain_engine = crate::sql::explain::ExplainEngine {
                     kind: self.search_engine_kind(),
                     ann_plan,
+                    // Issue #474: `pre_check_bindable` が構文段のみから確定
+                    // させた静的判定（LLM I/O・世代照合の影響を受けない。
+                    // 上記コメント「戻り値…このまま使い回してよい」と同じ
+                    // 理由）。
+                    scalar_plan: pre_check_shape.scalar_plan,
                 };
                 let result = crate::sql::explain::build_explain_result(&planned, &explain_engine);
                 Ok(crate::sql::SqlOutcome::Explain(result))
