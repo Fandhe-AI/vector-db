@@ -1000,85 +1000,25 @@ fn try_scalar_index_aggregate(
     arena_access: &crate::sql::arena_cache::ArenaCacheAccess<'_>,
     scalar_access: &crate::sql::scalar_index::ScalarCacheAccess<'_>,
 ) -> Result<Option<QueryResult>, SqlSurfaceError> {
-    use crate::sql::arena_cache::SqlArenaSnapshot;
-    use crate::sql::scalar_index::ScalarIndex;
-    use std::sync::Arc;
-
-    let cached = arena_access
-        .cache
-        .lookup(arena_access.storage, read_txn, &bound.table, ctx)
-        .zip(
-            scalar_access
-                .cache
-                .lookup(scalar_access.storage, read_txn, &bound.table, ctx),
-        )
-        .filter(|(snapshot, index)| {
-            // 索引↔スナップショット同一性ガード（`sql::exec` の SELECT 経路と
-            // 同じ検査。`ScalarIndexCache`／`SqlArenaCache` はそれぞれ独立に
-            // `(table, ctx)` × 世代でキャッシュされるため、両者が同時に
-            // ヒットしても由来スナップショットが一致する保証がない）。
-            index.row_count() == snapshot.arena().len()
-                && index.built_table_generation() == snapshot.built_table_generation_for_index()
-        });
-
-    let (snapshot, index): (Arc<SqlArenaSnapshot>, Arc<ScalarIndex>) = match cached {
+    // Cursor Bugbot Medium 指摘（PR #603）: キャッシュ照会・再利用ロジックを
+    // [`ensure_scalar_index_snapshot`] へ一本化した（`sql::group_by` の
+    // 候補走査形と同じヘルパを共有する）。以前はここで同種のロジックを独自に
+    // 複製しており、arena ヒット・スカラー索引ミス時に温かいスナップショットを
+    // 使わず `capture_scalar_index_snapshot` で `user_rows` を再走査していた
+    // （同関数のドキュメント「Cursor Bugbot Medium 指摘」節参照）。
+    let (snapshot, index) = match ensure_scalar_index_snapshot(
+        read_txn,
+        ctx,
+        schema,
+        &bound.table,
+        expected_dim,
+        arena_access,
+        scalar_access,
+    ) {
         Some(pair) => pair,
         None => {
-            // ミス、または同一性ガード不一致。SELECT が同じ世代を先に走査して
-            // いなければ索引は永久に構築されないため（受入条件「非 vacuous」）、
-            // この集計クエリ自身の走査に相乗りして構築する（計画の piggyback
-            // 採取。Issue #475）。ただし同一世代で過去に採取が確定的に失敗
-            // 済みなら（codex-review P2 対応）、無駄な全走査・全量デコードを
-            // 試みず即座に全走査フォールバックへ委ねる。
-            if scalar_access
-                .cache
-                .is_capture_known_unbuildable(read_txn, &bound.table, ctx)
-            {
-                scalar_access.cache.record_aggregate_plain_scan_fallback();
-                return Ok(None);
-            }
-            match capture_scalar_index_snapshot(read_txn, ctx, schema, &bound.table, expected_dim) {
-                Some((snapshot, index)) => {
-                    // `index` は `insert` に渡す前の `snapshot`（挿入前）から
-                    // `ScalarIndex::build` で構築済み。`ArenaCacheAccess::insert`
-                    // は挿入対象自身が真に最新世代の場合のみキャッシュへ反映する
-                    // が、いずれの場合も呼び出し元へは常に構築済みの内容
-                    // （中身は不変。`Arc` で包むだけ）を返す契約——
-                    // `sql::arena_cache::SqlArenaCache::insert` ドキュメント
-                    // 「fail-closed 契約」参照——のため、`index` の
-                    // `built_ctx`/`built_table_generation` は
-                    // `inserted_snapshot` の値と常に一致する。再構築せずその
-                    // まま `ScalarIndexCache::insert` へ渡す。
-                    let inserted_snapshot = arena_access.cache.insert(
-                        arena_access.storage,
-                        &bound.table,
-                        ctx,
-                        snapshot,
-                    );
-                    match scalar_access.cache.insert(
-                        scalar_access.storage,
-                        &bound.table,
-                        ctx,
-                        index,
-                    ) {
-                        Some(index) => (inserted_snapshot, index),
-                        None => {
-                            scalar_access.cache.record_aggregate_plain_scan_fallback();
-                            return Ok(None);
-                        }
-                    }
-                }
-                None => {
-                    // 採取自体が確定的に失敗（容量超過・復号不能・NULL 行混在
-                    // 等）。世代が進むまでは再試行しても同じ結果になるため
-                    // 記録する（codex-review P2 対応）。
-                    scalar_access
-                        .cache
-                        .mark_capture_unbuildable(read_txn, &bound.table, ctx);
-                    scalar_access.cache.record_aggregate_plain_scan_fallback();
-                    return Ok(None);
-                }
-            }
+            scalar_access.cache.record_aggregate_plain_scan_fallback();
+            return Ok(None);
         }
     };
 
@@ -1115,8 +1055,23 @@ fn try_scalar_index_aggregate(
 /// Issue #475: `WHERE` なし・索引対応述語のみの `WHERE` を持つ `GROUP BY` の
 /// 候補走査形が使う、`ScalarIndex` 由来のスナップショット・索引を用意する
 /// （キャッシュヒットならそのまま、ミスなら [`capture_scalar_index_snapshot`]
-/// で構築して両キャッシュへ登録する）。`aggregate.rs`（`GROUP BY` なし）と
-/// `sql::group_by`（`GROUP BY` あり）が共有する（crate 内公開）。
+/// で構築して両キャッシュへ登録する）。`aggregate.rs`（`GROUP BY` なし。
+/// [`try_scalar_index_aggregate`] から）と `sql::group_by`（`GROUP BY` あり）が
+/// 共有する（crate 内公開）。
+///
+/// Cursor Bugbot Medium 指摘（PR #603）: `SqlArenaCache` はヒットしたが
+/// `ScalarIndexCache` はミスした場合（または索引↔スナップショット同一性
+/// ガード不一致）、以前はここで `capture_scalar_index_snapshot` により
+/// `user_rows` を無条件に再走査していた。ヒット済みの温かい `SqlArenaSnapshot`
+/// が既にあるにもかかわらず全量デコードを繰り返すうえ、再走査が失敗すると
+/// （`mark_capture_unbuildable` により）同一世代の以降の呼び出しまで索引経路
+/// 自体が丸ごと使えなくなっていた。`sql::exec::execute_statement_with_cache`
+/// の SELECT 経路〔Issue #473〕が既に行っている方式と同じく、arena ヒット時は
+/// ヒット済みスナップショットから [`crate::sql::scalar_index::ScalarIndex::build`]
+/// のみを実行する。両キャッシュがともにミスした場合のみ、従来どおり
+/// [`capture_scalar_index_snapshot`] による全行再走査（`is_capture_known_
+/// unbuildable` ゲート・`mark_capture_unbuildable` 記録を含む）へフォールバック
+/// する。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure_scalar_index_snapshot(
     read_txn: &redb::ReadTransaction,
@@ -1130,24 +1085,55 @@ pub(crate) fn ensure_scalar_index_snapshot(
     std::sync::Arc<crate::sql::arena_cache::SqlArenaSnapshot>,
     std::sync::Arc<crate::sql::scalar_index::ScalarIndex>,
 )> {
-    let cached = arena_access
+    let arena_hit = arena_access
         .cache
-        .lookup(arena_access.storage, read_txn, table, ctx)
-        .zip(
-            scalar_access
-                .cache
-                .lookup(scalar_access.storage, read_txn, table, ctx),
-        )
-        .filter(|(snapshot, index)| {
-            index.row_count() == snapshot.arena().len()
-                && index.built_table_generation() == snapshot.built_table_generation_for_index()
-        });
-    if let Some(pair) = cached {
-        return Some(pair);
+        .lookup(arena_access.storage, read_txn, table, ctx);
+    let scalar_hit = scalar_access
+        .cache
+        .lookup(scalar_access.storage, read_txn, table, ctx);
+
+    if let (Some(snapshot), Some(index)) = (&arena_hit, &scalar_hit) {
+        // 索引↔スナップショット同一性ガード（`sql::exec` の SELECT 経路と
+        // 同じ検査。`ScalarIndexCache`／`SqlArenaCache` はそれぞれ独立に
+        // `(table, ctx)` × 世代でキャッシュされるため、両者が同時に
+        // ヒットしても由来スナップショットが一致する保証がない）。
+        if index.row_count() == snapshot.arena().len()
+            && index.built_table_generation() == snapshot.built_table_generation_for_index()
+        {
+            return Some((
+                std::sync::Arc::clone(snapshot),
+                std::sync::Arc::clone(index),
+            ));
+        }
     }
-    // 同一世代で過去に採取が確定的に失敗済みなら（codex-review P2 対応）、
-    // 無駄な全走査・全量デコードを試みず即座に `None`（全走査フォールバック）
-    // で返す。
+
+    if let Some(snapshot) = arena_hit {
+        // Bugbot Medium 指摘: arena はヒット・スカラー索引はミス（または
+        // 同一性ガード不一致）。`user_rows` を再走査せず、ヒット済み
+        // スナップショットから索引だけを構築する。
+        return match crate::sql::scalar_index::ScalarIndex::build(schema, &snapshot) {
+            Ok(index) => scalar_access
+                .cache
+                .insert(scalar_access.storage, table, ctx, index)
+                .map(|index| (snapshot, index)),
+            Err(_) => {
+                // このスナップショット（＝この世代）に対して確定的に構築
+                // 不能。`capture_scalar_index_snapshot` 経路の内部
+                // `ScalarIndex::build` 失敗（同関数の `.ok()?` 参照）が
+                // `mark_capture_unbuildable` を記録するのと同じ扱いで、
+                // 世代が進むまで無駄な再試行をしないよう記録する。
+                scalar_access.cache.record_build_failure();
+                scalar_access
+                    .cache
+                    .mark_capture_unbuildable(read_txn, table, ctx);
+                None
+            }
+        };
+    }
+
+    // 両キャッシュともミス: 従来どおり `capture_scalar_index_snapshot` に
+    // よる全走査 piggyback 採取（`is_capture_known_unbuildable` ゲート・
+    // `mark_capture_unbuildable` 記録を含む）へフォールバックする。
     if scalar_access
         .cache
         .is_capture_known_unbuildable(read_txn, table, ctx)
@@ -1812,6 +1798,88 @@ mod tests {
         let (snapshot, index) =
             capture_scalar_index_snapshot(&read_txn, &ctx, &schema, "docs", expected_dim)
                 .expect("capture should succeed when no row is NULL");
+        assert_eq!(snapshot.arena().len(), 2);
+        assert_eq!(index.row_count(), 2);
+    }
+
+    /// Cursor Bugbot Medium 指摘（PR #603）の回帰: `SqlArenaCache` はヒット
+    /// （温かい `SqlArenaSnapshot` が既にある）だが `ScalarIndexCache` はミスの
+    /// 場合、[`ensure_scalar_index_snapshot`] が `user_rows/{table}` の再走査
+    /// （[`capture_scalar_index_snapshot`]）に頼らず、温かいスナップショットから
+    /// 索引だけを構築できることを固定する。
+    ///
+    /// 検証手段: arena キャッシュへ手動でスナップショットを温めた**後**に、
+    /// テーブル世代カウンタ（`catalog::table_generation_in_txn` が参照する
+    /// `TABLE_GENERATION_TABLE`）を変えないまま行テーブル（`user_rows/docs`）を
+    /// 削除する。世代が変わらないため温めた arena キャッシュエントリは
+    /// 引き続きヒットし続けるが、もし実装が（修正前のように）
+    /// `capture_scalar_index_snapshot` へフォールバックすれば、行テーブル不在
+    /// （`TableDoesNotExist`）により必ず `None` になる。したがって
+    /// `Some(_)` が返ることは「温かいスナップショットを実際に再利用した」
+    /// ことの直接証拠になる。
+    #[test]
+    fn ensure_scalar_index_snapshot_reuses_warm_arena_snapshot_without_row_table_rescan() {
+        let path = unique_db_path("agg-scalar-index-reuse-warm-arena");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        write_row_direct(&storage, "docs", "tenant-a", 1, &[1.0, 2.0, 3.0]);
+        write_row_direct(&storage, "docs", "tenant-a", 2, &[4.0, 5.0, 6.0]);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let expected_dim = schema.vector_dim().expect("vector dim");
+
+        use redb::ReadableDatabase;
+        let arena_cache = crate::sql::arena_cache::SqlArenaCache::new();
+        let scalar_cache = crate::sql::scalar_index::ScalarIndexCache::new();
+        {
+            // arena キャッシュだけを温める（スカラー索引キャッシュへは意図的に
+            // 登録しない。ミス状態を維持する）。
+            let read_txn = storage.db().begin_read().expect("begin_read");
+            let (snapshot, _index) =
+                capture_scalar_index_snapshot(&read_txn, &ctx, &schema, "docs", expected_dim)
+                    .expect("initial capture should succeed");
+            arena_cache.insert(&storage, "docs", &ctx, snapshot);
+        }
+
+        // 行テーブルを、世代カウンタ（`TABLE_GENERATION_TABLE`）を変えずに
+        // 削除する（`Storage::drop_table` はカタログエントリごと削除し世代も
+        // 進めてしまうため使わない。`write_row_direct` 等の
+        // `bump_generation_and_commit` が進めるのは別カウンタ（`GENERATION_TABLE`。
+        // `storage::current_generation_in_txn` 用）であり
+        // `catalog::table_generation_in_txn` には影響しない）。
+        {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            write_txn
+                .delete_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("docs"),
+                ))
+                .expect("delete row table");
+            write_txn.commit().expect("commit row table deletion");
+        }
+
+        let arena_access = crate::sql::arena_cache::ArenaCacheAccess {
+            storage: &storage,
+            cache: &arena_cache,
+        };
+        let scalar_access = crate::sql::scalar_index::ScalarCacheAccess {
+            storage: &storage,
+            cache: &scalar_cache,
+        };
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let resolved = ensure_scalar_index_snapshot(
+            &read_txn,
+            &ctx,
+            &schema,
+            "docs",
+            expected_dim,
+            &arena_access,
+            &scalar_access,
+        );
+        let (snapshot, index) = resolved
+            .expect("arena キャッシュヒット時は行テーブルの再走査に頼らず索引を構築できるはず");
         assert_eq!(snapshot.arena().len(), 2);
         assert_eq!(index.row_count(), 2);
     }
