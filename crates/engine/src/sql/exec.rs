@@ -396,6 +396,7 @@ pub(crate) fn execute_statement_with_cache(
     sparse_cache: Option<crate::sql::sparse_cache::SparseCacheAccess<'_>>,
     arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
+    scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // TASK-162（対象ビヘイビア SEARCH-9）: `precision` の実行契約本体は
     // `crate::precision`（確信度判定・空集合 fail-closed 応答の純粋関数群）に
@@ -794,6 +795,14 @@ pub(crate) fn execute_statement_with_cache(
     let mut owned_arena: Option<VectorArena> = None;
     let mut cache_hit_snapshot: Option<std::sync::Arc<crate::sql::arena_cache::SqlArenaSnapshot>> =
         None;
+    // Issue #473: スカラー列二次索引（`scalar_index::ScalarIndex`）の gated 構築
+    // （§4.4）が使う `SqlArenaSnapshot` の保持先。索引は `arena_cache` 経由で
+    // スナップショットが手に入った経路（ヒット・ミスいずれも）でのみ構築する
+    // （`arena_cache` が `None` の場合はこのクエリでは構築しない。索引の消費
+    // 〔候補削減〕は本 Issue のスコープ外。モジュールドキュメント参照）。
+    let mut scalar_snapshot_for_index: Option<
+        std::sync::Arc<crate::sql::arena_cache::SqlArenaSnapshot>,
+    > = None;
     let arena: &VectorArena = match arena_cache {
         None => owned_arena.insert(
             VectorArena::build_filtered_with_rows_in_txn(
@@ -836,6 +845,7 @@ pub(crate) fn execute_statement_with_cache(
                     // ずっと排他借用が居座る `.insert()` の戻り値を使うと、後続の
                     // 共有借用（`scalar_source` の組み立て）と競合する（E0502）。
                     // 共有借用同士は共存できるためこの形にする。
+                    scalar_snapshot_for_index = Some(std::sync::Arc::clone(&snapshot));
                     cache_hit_snapshot = Some(snapshot);
                     cache_hit_snapshot
                         .as_ref()
@@ -859,6 +869,7 @@ pub(crate) fn execute_statement_with_cache(
                         .vector_dim()
                         .ok_or(ArenaError::InvalidDim)
                         .map_err(|e| map_arena_error(&bound.table, e))?;
+                    scalar_snapshot_for_index = Some(std::sync::Arc::clone(&snapshot));
                     owned_arena.insert(
                         VectorArena::build_from_cached_rls_rows(
                             &bound.table,
@@ -940,13 +951,54 @@ pub(crate) fn execute_statement_with_cache(
                             ctx.clone(),
                             built_table_generation,
                         );
-                        let _ = sql_cache.insert(storage, &bound.table, ctx, snapshot);
+                        // Issue #473: `sql_cache.insert` は世代整合済みか否かに
+                        // 関わらず常に構築済みスナップショットの `Arc` を返す
+                        // （`SqlArenaCache::insert` のドキュメント参照。呼び出し元
+                        // がこのクエリ自身の `read_txn` から構築した結果のため、
+                        // このクエリ限りで使う分には stale にならない）。従来
+                        // 捨てていた戻り値をスカラー索引の構築材料として保持する。
+                        let inserted = sql_cache.insert(storage, &bound.table, ctx, snapshot);
+                        scalar_snapshot_for_index = Some(inserted);
                     }
                 }
                 owned_arena.insert(built)
             }
         }
     };
+
+    // Issue #473: スカラー列二次索引（`scalar_index::ScalarIndex`）の gated 構築。
+    // 索引対応述語（`Equality`/`Prefix`。`bound.metadata_filters`）を持つ SCALAR
+    // 事前フィルタクエリに限り、`arena_cache` 経由で得たスナップショットから
+    // 索引を構築しキャッシュへ登録する。索引の結果は一切消費しない（構築される
+    // だけで本クエリの応答には使わない。候補削減は Issue #474 の担当。
+    // モジュールドキュメント「本 Issue のスコープ」参照）。構築・登録の失敗は
+    // このクエリを失敗させない（fail-soft な派生キャッシュ。
+    // `scalar_index::ScalarIndexCache` のドキュメント参照）。
+    if let (Some(scalar_access), Some(snapshot_for_scalar)) =
+        (scalar_cache.as_ref(), scalar_snapshot_for_index.as_ref())
+    {
+        if plan.scalar_prefilter && !bound.metadata_filters.is_empty() {
+            let already_cached = scalar_access
+                .cache
+                .lookup(scalar_access.storage, read_txn, &bound.table, ctx)
+                .is_some();
+            if !already_cached {
+                match crate::sql::scalar_index::ScalarIndex::build(schema, snapshot_for_scalar) {
+                    Ok(index) => {
+                        let _ = scalar_access.cache.insert(
+                            scalar_access.storage,
+                            &bound.table,
+                            ctx,
+                            index,
+                        );
+                    }
+                    Err(_) => {
+                        scalar_access.cache.record_build_failure();
+                    }
+                }
+            }
+        }
+    }
 
     // provider へ渡す id は行 `id` ではなく**アリーナのスロット番号**（0..n）にする。
     // 行 `id` の一意性スコープはテナント内（対象ビヘイビア: TABLE-12）であり、1 つの
@@ -1507,6 +1559,7 @@ pub fn execute_statement(
         schema,
         bound,
         precision_policy,
+        None,
         None,
         None,
         None,

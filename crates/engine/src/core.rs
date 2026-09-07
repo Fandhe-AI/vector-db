@@ -1064,6 +1064,12 @@ pub struct EngineCore {
     /// デコード）を同一テーブル世代内で再利用する（詳細は
     /// `sql::arena_cache::SqlArenaCache` のドキュメント参照）。
     sql_arena_cache: crate::sql::arena_cache::SqlArenaCache,
+    /// スカラー列二次索引（`sql::exec::execute_statement_with_cache` の gated
+    /// 構築。Issue #473）のテーブル世代整合キャッシュ。索引はまだ誰にも
+    /// 消費されない派生データであり（候補削減は Issue #474）、
+    /// [`Self::scalar_index_cache_stats`] のみが観測用に参照する。詳細は
+    /// `sql::scalar_index::ScalarIndexCache` のドキュメント参照。
+    scalar_index_cache: crate::sql::scalar_index::ScalarIndexCache,
     /// `sql::aggregate::execute_aggregate`（`GROUP BY` なし・`WHERE` なしの
     /// `DecodeTier::Fast` 単一行集計）専用の可視行テーブル世代整合キャッシュ
     /// （Issue #478）。ヒット時は `user_rows/{table}` を一切開かずに `COUNT(*)`
@@ -1332,6 +1338,7 @@ impl EngineCore {
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
             sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
+            scalar_index_cache: crate::sql::scalar_index::ScalarIndexCache::new(),
             visible_bitmap_cache: crate::sql::visible_cache::VisibleBitmapCache::new(),
             search_engine_kind,
             hnsw_state,
@@ -1369,6 +1376,16 @@ impl EngineCore {
     /// （`core_api.snapshot` の対象外。`prefilter_cache_stats` と同じ方針）。
     pub fn sql_arena_cache_stats(&self) -> crate::sql::arena_cache::SqlArenaCacheStats {
         self.sql_arena_cache.stats()
+    }
+
+    /// `sql::scalar_index::ScalarIndexCache` の現在の統計を返す（Issue #473。
+    /// テスト・運用観測用）。テナント ID・行 ID・スカラー値等の機微情報は含まない
+    /// （`ScalarIndexCacheStats` 参照）。`VectorCore` trait には載せない固有
+    /// メソッド（`core_api.snapshot` の対象外。`sql_arena_cache_stats` と同じ
+    /// 方針）。索引はまだ SQL 実行結果を左右しない（Issue #474 が消費する）ため、
+    /// このメソッドは observability 専用であり検索結果には影響しない。
+    pub fn scalar_index_cache_stats(&self) -> crate::sql::scalar_index::ScalarIndexCacheStats {
+        self.scalar_index_cache.stats()
     }
 
     /// `sql::visible_cache::VisibleBitmapCache` の現在の統計を返す（Issue #478。
@@ -2364,6 +2381,12 @@ impl EngineCore {
                             cache: &s.cache,
                             provider: s.provider,
                         }),
+                    // Issue #473: スカラー列二次索引の gated 構築（応答には未使用。
+                    // 詳細は `sql::scalar_index` のドキュメント参照）。
+                    Some(crate::sql::scalar_index::ScalarCacheAccess {
+                        storage: &self.storage,
+                        cache: &self.scalar_index_cache,
+                    }),
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -4702,6 +4725,7 @@ mod tests {
                 storage: &core.storage,
                 cache: &core.sql_arena_cache,
             }),
+            None,
             None,
         )
         .expect("execute_statement should succeed");
