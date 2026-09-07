@@ -1079,6 +1079,173 @@ fn f16_filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
     );
 }
 
+/// `Subset` 形状の早期打ち切り（Issue #488・`PreparedHnswSearch::PlainScanBelowRatio`）:
+/// `WHERE` 適用後の部分集合カーディナリティ（`arena.len()`。索引済みノード数の
+/// 上界）が `full_scan_ratio` 未満まで下がった場合に、`Overlay::compute` を
+/// 経由せず plain scan へ縮退すること・既定エンジン対照 Recall@10 が回帰基準
+/// 以上であること・`WHERE` を満たさない行が混入しないこと・実際にこの早期
+/// 打ち切り分岐を経由したこと（`stats.plain_scans > 0` かつ `Overlay::compute`
+/// を経由する `subset_searches == 0`）を固定する（対称版である `FullVisible`
+/// 形状側の `full_scan_ratio_plain_scan_side_matches_brute_force_and_never_leaks_across_tenants`
+/// に対応する `Subset` 形状側のテスト）。
+#[test]
+fn full_scan_ratio_plain_scan_below_ratio_subset_shape_matches_brute_force_and_never_leaks_across_tenants(
+) {
+    let dir = unique_db_path("hnsw-cache-ratio-subset");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    let schema = TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+            ColumnDef::new("tag", ColumnType::Text, false),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+
+    let vectors = gen_clustered_corpus(53, DIM as usize, BASE_ROWS, 6);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let op_id = OperationId::parse("hnsw-cache-ratio-subset").expect("valid operation_id");
+    let metadata_x = engine::row_codec::encode_scalar_columns(
+        &schema,
+        &[Value::Null, Value::Text("x".to_string())],
+    )
+    .expect("encode tag=x metadata");
+    let metadata_y = engine::row_codec::encode_scalar_columns(
+        &schema,
+        &[Value::Null, Value::Text("y".to_string())],
+    )
+    .expect("encode tag=y metadata");
+    let rows: Vec<(u64, RowInput<'_>)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let metadata = if i % 2 == 0 {
+                metadata_x.as_slice()
+            } else {
+                metadata_y.as_slice()
+            };
+            (
+                i as u64 + 1,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: v.as_slice(),
+                    metadata,
+                },
+            )
+        })
+        .collect();
+    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows, &op_id).expect("seed rows");
+
+    // tenant-b の行を同一テーブルへ混在させ、可視外テナントの id が結果へ
+    // 混入しないことを検証できるようにする（TABLE-12・security.md P0）。
+    // `seed_rows` ヘルパーは metadata を空にするため、`tag` 列（not null）を
+    // 持つ本テストのスキーマでは使えず、`rows` と同じ手順で個別に組み立てる。
+    let other_vectors = gen_clustered_corpus(54, DIM as usize, 100, 4);
+    let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+    let other_rows: Vec<(u64, RowInput<'_>)> = other_vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            (
+                BASE_ROWS as u64 + 1 + i as u64,
+                RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Public,
+                    embedding: v.as_slice(),
+                    metadata: metadata_x.as_slice(),
+                },
+            )
+        })
+        .collect();
+    let op_other = OperationId::parse("hnsw-cache-ratio-subset-other").expect("valid operation_id");
+    engine::tenant::insert_rows(&storage, "docs", &ctx_b, &other_rows, &op_other)
+        .expect("seed tenant-b rows");
+
+    // `full_scan_ratio` を 60/100 まで引き上げる。`tag = 'x'` の選択率は
+    // ちょうど 50% であるため、`arena.len() / index.len() ≈ 0.5` が常に
+    // 0.6 未満となり `PlainScanBelowRatio` を確実に踏む。
+    let ratio = engine::hnsw::Ratio {
+        numerator: 60,
+        denominator: 100,
+    };
+    let params = engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
+        .expect("valid hnsw params")
+        .with_full_scan_ratio(ratio)
+        .expect("valid full_scan_ratio");
+    let kind = engine::search_engine::SearchEngineKind::Hnsw(params);
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-ratio-subset-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage.create_table(&schema).expect("create ref table");
+    engine::tenant::insert_rows(&ref_storage, "docs", &ctx, &rows, &op_id).expect("seed ref rows");
+    let op_other_ref =
+        OperationId::parse("hnsw-cache-ratio-subset-other-ref").expect("valid operation_id");
+    engine::tenant::insert_rows(&ref_storage, "docs", &ctx_b, &other_rows, &op_other_ref)
+        .expect("seed ref tenant-b rows");
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    // フィルタなしクエリを 1 本先に投げ、`FullVisible` 経路に索引を構築させる
+    // （可視カーディナリティ比は構築直後 1.0 のため `full_scan_ratio`=0.6 を
+    // 上回り、この呼び出し自体は plain scan を踏まない）。
+    let _ = query_ids(&core, &ctx, &vectors[0], 10);
+    let baseline_entries = core.hnsw_index_cache_stats().entries;
+    assert_eq!(baseline_entries, 1, "unfiltered query must build one entry");
+
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    let mut total_hits = 0usize;
+    for i in 0..QUERIES {
+        let query = &vectors[i * (BASE_ROWS / QUERIES)];
+        let sql = format!(
+            "SELECT id FROM docs WHERE tag = 'x' ORDER BY embedding <=> '{}' LIMIT {K}",
+            vec_literal(query)
+        );
+        let got = core.execute_sql(&ctx, &sql).expect("filtered query").rows;
+        let want = ref_core
+            .execute_sql(&ctx, &sql)
+            .expect("filtered query (ref)")
+            .rows;
+        for row in &got {
+            assert_eq!(
+                row.id % 2,
+                1,
+                "row {} does not satisfy tag='x' (1-indexed odd rows are tag='x')",
+                row.id
+            );
+            assert!(
+                row.id <= BASE_ROWS as u64,
+                "tenant-a query must not return tenant-b row id {}",
+                row.id
+            );
+        }
+        let want_ids: std::collections::HashSet<u64> = want.iter().map(|r| r.id).collect();
+        total_hits += got.iter().filter(|r| want_ids.contains(&r.id)).count();
+    }
+    let recall = total_hits as f64 / (QUERIES * K) as f64;
+    assert!(
+        recall >= 0.9,
+        "plain-scan-side (below full_scan_ratio) Subset shape recall@{K} against the default engine must be >= 0.9 (got {recall})"
+    );
+
+    let stats = core.hnsw_index_cache_stats();
+    assert!(
+        stats.plain_scans > 0,
+        "arena.len() / index.len() < full_scan_ratio must exercise the early-cutoff plain scan path (non-vacuous)"
+    );
+    assert_eq!(
+        stats.subset_searches, 0,
+        "early cutoff must skip Overlay::compute entirely, never touching the subset_searches counter"
+    );
+    assert_eq!(
+        stats.entries, baseline_entries,
+        "Subset early cutoff must never register a cache entry"
+    );
+}
+
 /// 可視カーディナリティ比が `full_scan_ratio` 以上（既定 1/10。構築直後は
 /// `visible_in_index == index.len()` で比 1.0）の場合、`FullVisible` 形状は
 /// マスク付き ANN 探索（`search_masked`）側を選び、`plain_scans` を一切

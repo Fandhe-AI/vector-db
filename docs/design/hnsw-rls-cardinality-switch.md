@@ -648,6 +648,86 @@ scan への縮退分のオーバーヘッドが乗る。上表の主統計量「
   構成の設計は運用者・後続 Issue への申し送りとする（下記「スコープ外・
   申し送り」参照）
 
+## Issue #488: per-query 写像コスト削減と `full_scan_ratio` 既定値の決定手順
+
+### 前提の訂正
+
+- Issue #487 の可視比率×行数スイープ（上節）は、全 10 測定点・全 candidate で
+  `ann_masked` 観測 arm に一度も到達しなかった（均等分散マスク `id % N` は
+  `HnswIndex::is_mask_fully_reachable` を通過せず常に `mask_splits_graph` →
+  plain scan）。共有 QEMU 環境・計測プロトコル不完全という限定も含め、上節は
+  「本節の数値は `full_scan_ratio` 既定値の変更根拠にしない」と明記している。
+  したがって本 Issue では既定値を数値先決せず、`Subset` 形状の per-query
+  コスト削減を主レバーとした
+- Issue #413（`docs/design/hnsw-index.md` §7）の `meta.hnsw_stats` は
+  `subset_searches=0`（`point_where`／`vector_knn_where` 計 112 クエリすべてが
+  縮退）——25k 行では `Subset` 経路は ANN 探索を一度も完走せず、
+  `Overlay::compute`（行ごとの `String` 確保・`HashMap` 引き・`node_matches`
+  の dot）＋ `NodeMask` 構築＋分断検査 BFS を払ったうえで plain scan していた。
+  つまり Subset 経路の退行は「フォールバックで終わる経路の純粋な
+  オーバーヘッド」であり、per-query 写像コスト削減が本 Issue の主眼になる
+
+### 実装した変更（production・`sql/hnsw_cache.rs`）
+
+1. **早期打ち切り**（`prepare_subset`）: `overlay.visible_in_index <=
+   arena.len()`（`Subset` アリーナに含まれない索引済みノードは
+   `Overlay::compute` が構造的に `STALE_SLOT` として除外するため、写像を
+   計算する前でも上界として使える）という不変条件を利用し、この上界がすでに
+   `full_scan_ratio` 未満なら `Overlay::compute` を丸ごと省略して
+   `PreparedHnswSearch::PlainScanBelowRatio`（新設 variant）を返す。判定式は
+   `search_with_overlay` の可視カーディナリティ切替と共有関数
+   `below_full_scan_ratio` へ集約し、3 箇所（`search_with_overlay`・
+   `Overlay::compute`・`prepare_subset`）の分岐条件が将来ずれることを構造的に
+   防ぐ。統計（`fallbacks`／`plain_scans`）は解決時ではなく `search_prepared`
+   の探索時（hybrid 密側の複数ラウンドではラウンドごと）に加算し、`FullScan`
+   と同じ計上規約を保つ
+2. **分断検査（BFS）の遅延**（`Overlay::compute`）: `full_scan_ratio` を新規
+   引数として受け取り、`visible_in_index` 確定後にまず比率判定を行う。比率
+   未満と判明した場合は `search_with_overlay` が `mask_splits_graph` を参照
+   する前に必ず plain scan を選ぶ契約（両者不変）のため、
+   `HnswIndex::is_mask_fully_reachable`（|受理ノード|×次数に比例する BFS）を
+   呼ばずに `mask_splits_graph = false` とする。恒等マスク（`FullVisible`
+   再構築直後）の分断検査は変更していない——可視カーディナリティが常に 1/1
+   のため比率判定は必ず通過し、ANN 経路が実際に使われるケースで BFS を
+   省略しない
+
+出力は両変更前後で完全に同一（`search_with_overlay` が選ぶ分岐が変わらない
+ケースのみ計算を省略するため）。`crates/engine/tests/hnsw_cache.rs` の
+既存 10 テスト（`filtered_distance_uses_subset_shape_and_matches_default_
+engine_recall`・`full_scan_ratio_ann_side_*`・`full_scan_ratio_plain_scan_
+side_*`・`hybrid_queries_use_subset_shape_and_match_default_engine_recall`
+等。テナント境界・Recall 一致・非 vacuous 性を含む）はコード無変更のまま
+green——`Subset` 経路が実際に `subset_searches > 0` へ到達する既存フィクス
+チャ（`filtered_distance_uses_subset_shape_and_matches_default_engine_
+recall`）で本変更の分岐選択が既存と一致し続けることを確認済み。
+`crates/engine/tests/hnsw_hybrid_refetch.rs`・`tests/incremental_index_hnsw.
+rs`・`tests/sql_explain.rs`・`crates/wire-server/tests/wire_explain.rs`
+（`EXPLAIN` の `hnsw_params:`／`ann_plan:` 出力・`hnsw_index_cache_stats()`
+全 0 契約）もあわせて green を確認した。`cargo clippy --all-targets
+--all-features -- -D warnings`・`cargo fmt --check` も通過。
+
+### `full_scan_ratio` 既定値そのものの決定について
+
+`docs/design/benchmark-judgement-policy.md` が定める交互 N≥5 ペア・per-run
+生データ・ノイズ帯併記での再スイープ（cluster 形状フィクスチャの追加を含む
+ステップ 4〜6。当初計画参照）は、本セッションの計測予算・共有開発環境の
+制約により実施できなかった。本 Issue で確定的に持ち帰れる事実は次の 2 点
+のみ:
+
+- 上記の per-query 写像コスト削減（早期打ち切り・BFS 遅延）は
+  `Overlay::compute` を丸ごと省略できるケースを増やすため、`Subset` 経路が
+  ANN 探索を完走しない（Issue #413・#487 いずれの実測点でも到達している）
+  局面では構造的に非退行以上（プラスの改善方向）である——出力を変えずに
+  計算量だけを削減しているため
+- `full_scan_ratio` 既定値（1/10）自体の再調整判断は、Issue #487 で
+  記録済みのとおり `ann_masked` 観測 arm に到達するフィクスチャ（クラスタ寄り
+  の可視集合構成）が無いと数値的な根拠を持てない。本 Issue はその
+  フィクスチャ整備（cluster 形状スイープ）・`feature_bench` 4 arm 前後比較・
+  Recall ゲート同一閾値の再測定を実施しておらず、既定値は **1/10 のまま
+  変更していない**（「スコープ外・申し送り」参照）。したがって
+  `EXPLAIN` の `hnsw_params:` 出力・`search_engine.rs` の `Display` テスト・
+  README・`hnsw-index.md` §3 のいずれも本 Issue では変更不要
+
 ## スコープ外・申し送り
 
 - ~~不足時の `ef` 倍増再探索（iterative scan）・hybrid 密側の ANN 化と
