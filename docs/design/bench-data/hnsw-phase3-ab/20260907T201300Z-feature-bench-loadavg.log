@@ -1,0 +1,6 @@
+loadavg_before_hnsw_run1=14.94 15.22 10.63 16/492 3059310
+loadavg_after_hnsw_run1=14.79 15.17 10.69 7/475 3060913
+loadavg_before_hnsw_run2=14.81 15.17 10.72 16/483 3063647
+loadavg_after_hnsw_run2=14.68 15.13 10.75 4/471 3064861
+loadavg_before_hnsw_run3=15.03 15.20 10.80 9/476 3067630
+loadavg_after_hnsw_run3=14.80 15.15 10.83 4/471 3068905

@@ -1,0 +1,19 @@
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running tests/query_planning_recall.rs (target/release/deps/query_planning_recall-f908b65f625afdcd)
+
+running 2 tests
+query_planning_recall_threshold_gate: engine=brute_force
+query_planning_recall_large_scale_threshold_gate: engine=brute_force
+query_planning_recall_threshold_gate: pass_intent=true
+query_planning_recall_threshold_gate: intent_improvement value=0.9245
+query_planning_recall_threshold_gate: pass_direct=true
+query_planning_recall_threshold_gate: direct_after_recall20 value=0.9321
+query_planning_recall_threshold_gate: pass_degraded=true
+query_planning_recall_threshold_gate: intent_improvement_degraded value=0.3547
+test query_planning_recall_threshold_gate ... ok
+query_planning_recall_large_scale_threshold_gate: pass=true
+query_planning_recall_large_scale_threshold_gate: direct_after_recall20 value=0.8852
+test query_planning_recall_large_scale_threshold_gate ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 5.81s
+

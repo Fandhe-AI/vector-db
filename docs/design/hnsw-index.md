@@ -346,7 +346,8 @@ S0-cold の 22.9 倍は「毎サンプル HNSW グラフをゼロから構築す
 
 - HNSW 索引の永続化・`wire-server` CLI／テーブルカタログ属性による opt-in
   露出（ADR 申し送り事項）
-- 専有環境での再実測（本書の数値は全て非専有・共有開発環境での参考値）
+- 専有環境での再実測（本書の数値は全て非専有・共有開発環境での参考値。
+  Phase 3〔#458 ツリー〕通し比較〔§15・Issue #507〕の専有環境再実測も含む）
 - より広い規模ラダー（10k・50k・250k・500k 等）での損益分岐点の精密化
   （可視比率 × 行数〔25k・100k〕のスイープは Issue #487 で実測済み。
   `docs/design/hnsw-rls-cardinality-switch.md`「可視比率 × 行数の損益分岐点
@@ -1003,3 +1004,33 @@ BENCH_HNSW_PARALLEL_THREADS=1,12 <scratch>/target-after/release/deps/hnsw_parall
 #  before/after で偶然一致することがある。実行対象を取り違えないよう
 #  CARGO_TARGET_DIR〔target-before／target-after〕で区別すること）
 ```
+
+## 15. Phase 3（#458 ツリー）通しの前後比較（Issue #507）
+
+- **ステータス**: Recorded（参考値・採否根拠にしない）
+- 対応 Issue: #507（親 #458・ルート #455）。「Phase 3」の二義性は
+  `docs/design/hnsw-phase3-before-after.md` §0 を参照（本書§7〜§10 の Phase 3
+  は ADR の #404〜#413 を指し、本節が参照する #507 の Phase 3 は #458 ツリー
+  〔#486〜#507〕を指す。別の前後比較である）
+
+`#404`〜`#413`（ADR の Phase 3）適用後に積み上がった探索メモリ局所性・構築並列化・フィルタ付き探索の各施策（#490 prefetch・#494 CSR 化・#448/#449 repair 並列化・#488 早期打ち切り・#497 sparse visited・#501 ACORN-1・#505 再開型探索）を、before（`4d2bd23`）→ after（`799a7d8`）で通しで前後比較した。
+
+| 区間 | before | after | ratio | 判定 |
+| --- | --- | --- | --- | --- |
+| `bench-hnsw-compare` self build（N=5・rows=20,000 縮小構成） | 211.687ms | 182.233ms | 0.861x | ノイズ帯内 |
+| `bench-hnsw-compare` self search median | 32.244us | 33.841us | 1.050x | ノイズ帯内 |
+| `bench-knn-profile` S0_cold（brute_force・N=1） | 31.418ms | 31.927ms | 1.016x | ほぼ同水準（hnsw 側は run1 同士の N=1 ペアで −2.4%・実測帯内） |
+| `feature_bench` `vector_knn`（フィルタなし DISTANCE・N=3・hnsw arm のみ） | 8418us | 388us | 0.046x | ノイズ帯内（固定帯は超過するが `ingest` 参照区間の実測帯 101.1% は超えず、`benchmark-judgement-policy.md` §4 の基準では有効な変化と確定できない。加えて #563〔Phase 2〕との交絡もあり Phase 3 単独の帰属もできない。3/3 run で同方向・同オーダーである点は事実として記録） |
+| Recall 3 ゲート（before/after × brute_force/hnsw・4 系列・11 指標） | — | — | — | **完全一致（非退行の確定的証拠）** |
+
+詳細な計測条件・交絡の整理・全 run 生データ・限界は
+`docs/design/hnsw-phase3-before-after.md` を参照。生ログは
+`docs/design/bench-data/hnsw-phase3-ab/` 配下。
+
+セッション時間・共有リソース制約（他 worktree の並走ビルドによる `/tmp`
+逼迫で `bench-knn-profile` の一部 run が redb fail-closed 契約により abort）
+により、`bench-hnsw-compare` は縮小規模構成・`bench-knn-profile` は N=1・
+`feature_bench` は N=3（hnsw arm のみ）・Recall は `hnsw_f16` 系列を除く 4 系列
+という、policy（`benchmark-judgement-policy.md` §3 の N≥5 フロア）に対する
+正直な逸脱を伴う（詳細は前掲 doc §8）。専有環境での再実測はオーナー作業として
+申し送る。
