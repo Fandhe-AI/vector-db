@@ -165,9 +165,18 @@ in-module テスト `search_reuses_prepared_base_across_rounds_for_the_same_buff
 
 - 停止性は `hybrid.rs` 側の `dense_cap = MAX_FETCH_K.min(input.ids.len())`
   と `dense_fetch_k` の単調倍増（Issue #310・#320。本 Issue で無変更）が
-  provider の実装に依らず保証する。ラウンド数は高々
-  `⌈log2(dense_cap / (2 · pool_depth))⌉ + 1`（既定 `pool_depth = 200` なら
-  小〜中規模コーパスで 8 以下）。
+  provider の実装に依らず保証する。初期 `dense_fetch_k` は
+  `min(2·pool_depth, dense_cap)` であり（実装は `hybrid.rs::
+  hybrid_search_boosted` の `dense_fetch_k` 初期化を参照）、これが既に
+  `dense_cap` に達している場合（`dense_cap < 2·pool_depth`。例:
+  `dense_cap = 100`・`pool_depth = 200`）は倍増の余地がなく 1 ラウンドで
+  確定する。ラウンド数は高々
+  `⌈log2(dense_cap / min(2 · pool_depth, dense_cap))⌉ + 1`（分母を
+  `min(2·pool_depth, dense_cap)` に補正した式。既定 `pool_depth = 200` の
+  小〜中規模コーパス〔`dense_cap >= 2·pool_depth`〕では 8 以下）。
+  `dense_cap = 0`（可視候補 0 件）の場合は `dense_fetch_k = 0` のまま
+  `provider.search` を 1 回呼ぶだけ（式の分母が 0 になり定義できないため、
+  この境界は式の対象外として明示する）で、空の結果を確定させて終了する。
 - `k > MAX_EF` のラウンド（`fetch_k > 10,000`）は `ef_cap_fallbacks` 経由で
   brute-force 縮退し厳密結果になる。ラウンドごとに近似（ANN）／厳密
   （brute-force）が混在しうるが、`hybrid.rs` は各ラウンドの `hits` を
@@ -559,8 +568,12 @@ Issue の見出し「再開型にしても融合結果・境界同点グルー�
 ### 停止性契約
 
 - ラウンド数上限は既存の `dense_cap`・`MAX_FETCH_K`（= 40,000）による
-  provider 非依存の有界性（`⌈log2(dense_cap / (2·pool_depth))⌉ + 1`。既定
-  `pool_depth = 200` なら小〜中規模で 8 以下）を再開型でも変更しない
+  provider 非依存の有界性（「停止性・決定性」節のとおり
+  `⌈log2(dense_cap / min(2·pool_depth, dense_cap))⌉ + 1`。
+  `dense_cap < 2·pool_depth`（初期取得が既に `dense_cap` にクランプされる
+  小規模・強選択性フィルタの場合）は 1 ラウンドに縮退し、
+  `pool_depth = 200`・`dense_cap >= 2·pool_depth` の小〜中規模では 8 以下）
+  を再開型でも変更しない
 - ラウンド内の停止性: 各ヒープ pop は「停止条件成立」か「未訪問ノードの
   展開」のいずれかであり、visited は単調増加かつ N で有界なため各
   `run(ef)` は高々 N 回の展開で必ず停止する。**全ラウンド合計の実質的な
