@@ -248,6 +248,52 @@ run-to-run 変動の範囲として扱い、閾値判定には用いない（本
 `n <= SEQUENTIAL_PREFIX_NODES`）はこの区切りが存在しないため `flatten` は
 `Duration::ZERO` のまま（`sequential_prefix` へ全量を積む既存規約）。
 
+### Issue #495 追記: `flatten` 段を含む段別内訳・前後比較実測
+
+`docs/design/hnsw-index.md` §14.13 の前後比較実測（before `929c027`→after
+`ad484e7`〔PR #590 マージコミット。`crates/engine/src/`・`Cargo.lock` は
+`cadf6c3`〔#494 適用後〕と同一で production コードとしては #494 適用後の
+状態を表す。詳細は §14.13「比較対象・環境」参照〕。N=5 ペア・共有 QEMU
+環境の参考値。詳細な表・判定は同節参照）から、
+`flatten` 段を含む after 側（CSR 化後）の段別内訳（rows=100,000・dim=64。
+上記「Issue #406 追記」節の run 番号に続けて記録）を示す。各列は 5 run の
+median を個別に集計した値（`docs/design/hnsw-index.md` §14.13 と同一の
+ログから抽出。総和と `total` の差は測定区間外のオーバーヘッドを含む）:
+
+| threads | total median | level median | prefix median | parallel median | freeze median | repair median | flatten median | serial_share（概算） |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 9,891.3ms | 0.000ms | 9,889.3ms | 0.000ms | 0.000ms | 0.000ms | 0.000ms | 99.98% |
+| 12 | 2,339.3ms | 1.05ms | 6.0ms | 1,461.4ms | 0.61ms | 853.3ms | 8.96ms | 37.19% |
+
+`flatten` は threads=12 で median 約 9ms（total の約 0.4%）——「Issue #406
+追記」の頭打ち要因分析（`repair_reachability` が支配的）を変える規模ではない。
+before（`flatten` フィールド自体が存在しない旧アリティ）との比較は `total`・
+`repair_reachability` の実測値のみで行う（`docs/design/hnsw-index.md`
+§14.13 参照。固定帯 ±5%・実測帯〔参照区間 `dot_scan` の run-to-run 幅〕の
+両方を判定基準とし、両者ともノイズ帯内で一貫した悪化・改善は観測されな
+かった。`serial_share` は定義差のため before/after で生比較しない）。
+
+### Issue #495 追記: 現行ベンチ（L2 正規化コーパス）での usearch 探索レイテンシ前後比較
+
+`docs/design/hnsw-index.md` §14.13 の前後比較実測から、現行の
+`make bench-hnsw-compare`（自作・usearch 2 エンジン・L2 正規化コーパス。
+`run9`・`run10` と同一条件）での自作／usearch 探索レイテンシ中央値を
+before／after（CSR 化前後）で記録する。**旧実測「自作 66〜67µs／usearch
+76〜77µs」（`run7`・`run8`。非正規化コーパス時代）とは条件が異なるため
+差分計算はしない**——本節は現行条件での CSR 化前後比較のみを目的とする。
+
+| コミット | 自作 median | usearch median（参照。CSR 非依存） |
+| --- | --- | --- |
+| before（`929c027`） | 67.302µs | 80.917µs |
+| after（`ad484e7`。production コードは `cadf6c3` と同一） | 71.035µs | 95.202µs |
+
+自作・usearch とも after 側が高めに出ているが、`docs/design/hnsw-index.md`
+§14.13 の判定基準（固定帯 ±5%・実測帯〔usearch search median 自身の
+run-to-run 幅。本条件では ±103.6%〕の両方を超えて初めて有効な変化として
+扱う）を踏まえると「ノイズ帯内」判定であり、CSR 化由来の系統的な探索
+レイテンシ悪化とは判断できない（usearch 側〔CSR 非依存〕も同方向に上昇
+しており、環境側の負荷変動が主要因と考えられる）。
+
 ### Issue #406 追記（2026-09-05）: 8→12 スレッド頭打ちの段別内訳
 
 「受け入れ条件 (b)」で観測した 8→12 スレッドの伸び悩みについて、構築の

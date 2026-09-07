@@ -394,8 +394,10 @@ BENCH_KNN_PROFILE_ENGINE=hnsw make bench-knn-profile
 
 ## 14. 凍結後 CSR 化の設計（Issue #493）
 
-- **ステータス**: Implemented（#494 で実装済み。前後比較実測は #495。本節
-  自体は本書冒頭ステータス「Accepted（記録専用・#413）」とは独立に扱う）
+- **ステータス**: Implemented（#494 で実装済み。前後比較実測（#495）は
+  §14.13 のとおり N=5 交互計測を実施済み——専有環境再実測はオーナー作業と
+  して申し送り。本節自体は本書冒頭ステータス「Accepted（記録専用・#413）」
+  とは独立に扱う）
 - **親**: #492（HNSW 隣接リストの CSR 化）／Phase 3 親 #458／ルート #455
 - **依存**: `docs/design/benchmark-judgement-policy.md`（#462）
 - **関連ポインタ（spec・本文は転記しない）**: TASK-132・CORE-9・CORE-10
@@ -733,3 +735,271 @@ approx_heap_bytes}`・`pub(crate) is_mask_fully_reachable`・
   担当（本 PR の `serial_share` は `flatten` を含まない）。
 - **`unsafe`**: 新規追加なし。`csr.rs` の添字アクセスはすべて `get()`／
   `checked_add`／`checked_mul` のみ（coding-rust.md）。
+
+### 14.13 前後比較実測（Issue #495）
+
+CSR 化（#494）の探索レイテンシ・構築時間・常駐メモリへの影響を、CSR 化直前のコミットと `origin/main`（CSR 化後。厳密には後述のとおり #590 のマージコミット）で前後比較実測した。
+
+#### 比較対象・環境
+
+| 項目 | 値 |
+| --- | --- |
+| before | `929c027`（`cadf6c3` の親。`929c027..cadf6c3` の差分は #494 のみ） |
+| after（バイナリの実ビルド元） | `ad484e7`（`test(engine): CSR 化の探索レイテンシ・構築時間・常駐メモリの前後比較を記録する (#590)` のマージコミット。実測当時の `origin/main` 相当。`cadf6c3..ad484e7` は `crates/engine/src/`・`Cargo.lock` を一切変更しない〔`git diff cadf6c3 ad484e7 --stat -- crates/engine/src/ crates/wire-server/src/ Cargo.lock` は空〕ため、production コードは `cadf6c3`（#494 適用後）と同一。差分はベンチ・テスト・docs のみ（`crates/engine/benches/hnsw_parallel_build_bench.rs`・`benches/harness/hnsw_parallel_profile.rs` への `flatten`・`measure_memory_isolated` 計装の追加を含む）で、まさに本 Issue #495 が計測するために必要な計装そのものがこの差分に含まれる |
+| Cargo.lock 差分（929c027..cadf6c3・cadf6c3..ad484e7 とも） | 空（依存構成は不変） |
+| CPU | QEMU Virtual CPU version 2.5+（KVM）・12 vCPU・avx2/fma/f16c（AVX-512 なし） |
+| `nproc` | 12 |
+| 計測時 loadavg | 全 run で 1.78〜21.45（1 分値。各 run 個別の値は下記各ベンチの「全 run 生データ」表を参照。他 worktree のジョブが並走する共有環境） |
+| `BENCH_DEDICATED_ENV` / `GITHUB_ACTIONS` | 双方未設定 |
+| ビルド | `--release`・`CARGO_TARGET_DIR` を before/after で分離。バイナリ SHA-256 は下記 |
+
+**after 側の計測用差分について**: `ad484e7`（PR #590 自身）が `flatten`・`measure_memory_isolated`（各 threads 点を子プロセスへ隔離して RSS を測る方式）をネイティブに含むため、after 側はコミットをそのままビルドするだけで計測用パッチは不要だった。一方 before（`929c027`）はこの計装が存在しないため、`render_memory_line`・`measure_memory`（子プロセス隔離なしの同一プロセス内測定）のみを ad484e7 のものと同一書式・同一計算式で個別に追加する計測専用パッチを作業ツリーへ適用した（コミットしていない未追跡差分。git 管理下に無いため下記に diff 全文を保存する）。**この結果、before の `vm_rss_delta_kb`（同一プロセス内・直前の threads=1 計測の影響を受ける）と after の `vm_rss_delta_kb`（`measure_memory_isolated` による子プロセス隔離）は測定方式が異なり単純比較できない**（`approx_heap_bytes` は方式に依らず`HnswIndex::approx_heap_bytes()` の決定的な値のため影響を受けない。詳細は「常駐メモリ」節参照）。
+
+before 側へ適用した計測専用パッチ（`git diff` 全文。PR には含めない）:
+
+```diff
+diff --git a/crates/engine/benches/harness/hnsw_parallel_profile.rs b/crates/engine/benches/harness/hnsw_parallel_profile.rs
+index e47c34a..5471106 100644
+--- a/crates/engine/benches/harness/hnsw_parallel_profile.rs
++++ b/crates/engine/benches/harness/hnsw_parallel_profile.rs
+@@ -214,3 +214,26 @@ pub fn pick_representative(profiles: &[HnswBuildProfile]) -> Option<&HnswBuildPr
+     let median = median_duration(&totals)?;
+     profiles.iter().min_by_key(|p| p.total.abs_diff(median))
+ }
++
++/// Issue #495 の before/after 実測用・計測専用パッチ（PR 対象外・未コミット）。
++/// after 側 `render_memory_line` と同一書式。
++pub fn render_memory_line(
++    threads: usize,
++    approx_heap_bytes: usize,
++    vm_rss_kb_before: Option<u64>,
++    vm_rss_kb_after: Option<u64>,
++    vm_hwm_kb: Option<u64>,
++) -> String {
++    let fmt_opt = |v: Option<u64>| v.map_or_else(|| "unavailable".to_string(), |v| v.to_string());
++    let rss_delta = match (vm_rss_kb_before, vm_rss_kb_after) {
++        (Some(before), Some(after)) => after.saturating_sub(before).to_string(),
++        _ => "unavailable".to_string(),
++    };
++    format!(
++        "hnsw_parallel_build: memory threads={threads} approx_heap_bytes={approx_heap_bytes} \
++         vm_rss_kb_before={} vm_rss_kb_after={} vm_rss_delta_kb={rss_delta} vm_hwm_kb={}",
++        fmt_opt(vm_rss_kb_before),
++        fmt_opt(vm_rss_kb_after),
++        fmt_opt(vm_hwm_kb),
++    )
++}
+diff --git a/crates/engine/benches/hnsw_parallel_build_bench.rs b/crates/engine/benches/hnsw_parallel_build_bench.rs
+index 2065f56..cdc9201 100644
+--- a/crates/engine/benches/hnsw_parallel_build_bench.rs
++++ b/crates/engine/benches/hnsw_parallel_build_bench.rs
+@@ -200,6 +200,25 @@ fn control_dot_scan(corpus: &[f32], dim: usize, threads: usize) -> f32 {
+     })
+ }
+ 
++/// Issue #495 の before/after 実測用・計測専用パッチ（PR 対象外・未コミット）。
++/// after 側 `measure_memory` と同一方式。
++fn measure_memory(corpus: &[f32], params: HnswParams, threads: usize) -> Result<String, String> {
++    let vm_rss_kb_before = read_vm_rss_kb();
++    let index = HnswIndex::build_with_threads(params, DIM as u32, corpus, 1, threads)
++        .map_err(|e| format!("threads={threads}: memory measurement build failed: {e}"))?;
++    let approx_heap_bytes = index.approx_heap_bytes();
++    let vm_rss_kb_after = read_vm_rss_kb();
++    let vm_hwm_kb = harness::proc_stats::read_vm_hwm_kb();
++    drop(index);
++    Ok(harness::hnsw_parallel_profile::render_memory_line(
++        threads,
++        approx_heap_bytes,
++        vm_rss_kb_before,
++        vm_rss_kb_after,
++        vm_hwm_kb,
++    ))
++}
++
+ fn measure_control(corpus: &[f32], threads: usize) -> Result<Duration, String> {
+     let config = MeasurementConfig::new(20, 20, 0xC0FFEE_u64 ^ threads as u64)
+         .map_err(|e| format!("control threads={threads}: {e}"))?;
+@@ -270,6 +289,14 @@ fn main() {
+     for &threads in &ladder {
+         print_noise_snapshot(threads);
+ 
++        match measure_memory(&corpus, params, threads) {
++            Ok(line) => println!("{line}"),
++            Err(e) => {
++                eprintln!("hnsw_parallel_build_bench: {e}");
++                had_error = true;
++            }
++        }
++
+         // この threads 点の `parallel_speedup`（ceiling 行が対照負荷 speedup と
+         // 比較するために再利用する。`measure_control` 側で測り直さない——
+         // 同じ計測を 2 回走らせるとベンチ全体の所要時間が倍化するため）。
+```
+
+before 側は CSR 化前のため `HnswBuildProfile.flatten` フィールドを持たず、`serial_share` も旧アリティ（`flatten` を含まない）のまま——このビルド非互換のため、時間内訳（`flatten` 列・`serial_share` への合算）は after 側のみの追加として扱い、`serial_share` 自体は before/after で生比較せず、`total`・各段の実測値で比較する（`total` の差が `flatten` の正味コストを含む）。
+
+バイナリ SHA-256（cargo のファイル名ハッシュはビルド設定由来のメタデータハッシュであり、before/after で偶然一致するため内容の同一性検証には使えない。実際の生成物は下記のとおり異なる）:
+
+```
+=== binary sha256 ===
+ea11276849065f0c171a6c3c140d953c16d56c4973c0437463967d0d03a8077a  /home/fandhe/scratch495/target-before/release/deps/hnsw_parallel_build_bench-354eb84fcd8c3f05
+e48da14b86b8ce752dd475cbef8c1e1fe8615faed51b023400d54fadee747906  /home/fandhe/scratch495/target-after/release/deps/hnsw_parallel_build_bench-354eb84fcd8c3f05
+5095421c90f61b2cf9702f1fe28ba51eab8736e42729ccf77a486fb5baecc833  /home/fandhe/scratch495/target-before/release/deps/hnsw_compare_bench-90632ced6a601b42
+69b4c6df42b6b7653859750fba3aa4e7e020a5e990107d2abb69345bc2136ea5  /home/fandhe/scratch495/target-after/release/deps/hnsw_compare_bench-90632ced6a601b42
+c714950653f7de00644a7c0a6185b651afcd02b2784512a5989fb65d14a2ef78  /home/fandhe/scratch495/target-before/release/deps/knn_profile_bench-e7e4409b21f76ca8
+8af4af4c1af50adcf999b9e468ec233dd43f5a5d608e0f5514814397a764ec27  /home/fandhe/scratch495/target-after/release/deps/knn_profile_bench-0d4021cf75cba6f7
+```
+
+#### ノイズ帯の定義（`docs/design/benchmark-judgement-policy.md` §4 準拠）
+
+以下の各表は判定に **固定帯（±5%）** と **実測帯**（変更を含まない参照区間の run-to-run 幅。`reference_band = (reference_max - reference_min) / reference_min`）の**両方**を用いる。実測帯は「対象区間自身の before/after ばらつき」ではなく、**HNSW／CSR 化の影響を受けない参照区間**（`dot_scan`〔HNSW を一切通らない対照負荷〕・`usearch`〔CSR 非依存の対照エンジン〕・`brute_force`〔HNSW を経由しない参照経路〕）の値列から算出する。同一計測セッション（before→after 交互 N=5 ペアの 1 セッション）で得た参照区間の before+after 合算 10 点から算出し、両ノイズ帯をともに超えた場合のみ `Improved`／`Regressed` とし、片方のみ、またはいずれも超えない場合は「ノイズ帯内」として記録する（採否の根拠にしない）。
+
+#### bench-hnsw-parallel-build（rows=100,000・dim=64・threads=1,12）
+
+N=5 ペア（before→after 交互）・warmup/計測 20/20（既定）。
+
+| 区間 | before min | before median | after min | after median | ratio (min-of-N) | 固定帯(±5%) | 実測帯（参照区間） | 判定 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| total（threads=1） | 9773.768ms | 11718.095ms | 9764.136ms | 9891.329ms | 0.999x | 固定帯内(±5%) | 実測帯内(±348.8%) | ノイズ帯内 |
+| total（threads=12） | 2358.933ms | 2615.800ms | 2064.835ms | 2339.334ms | 0.875x | 固定帯超過(±5%) | 実測帯内(±922.0%) | ノイズ帯内 |
+| repair_reachability（threads=12） | 845.559ms | 894.953ms | 734.859ms | 853.347ms | 0.869x | 固定帯超過(±5%) | 実測帯内(±922.0%) | ノイズ帯内 |
+| flatten（threads=12、after のみ。before は該当フィールド無し） | n/a | n/a | 8.164ms | 8.956ms | n/a | 該当なし | 該当なし | informational |
+
+参照区間（`control=dot_scan`。HNSW コードを一切通らない対照負荷。threads=1／threads=12 それぞれ独立に算出）:
+
+| 参照区間 | before min | before median | after min | after median | ratio (min-of-N) | 実測帯 |
+| --- | --- | --- | --- | --- | --- | --- |
+| dot_scan（threads=1） | 54.997ms | 70.788ms | 47.408ms | 49.485ms | 0.862x | ±348.8%（合算値域 47.408〜212.747ms） |
+| dot_scan（threads=12） | 5.963ms | 21.273ms | 6.029ms | 8.987ms | 1.011x | ±922.0%（合算値域 5.963〜60.941ms） |
+
+`total（threads=1）`・`total（threads=12）` の実測帯にはそれぞれ同じ threads 点の `dot_scan` 実測帯（threads=1: ±348.8%・threads=12: ±922.0%）を用いた。`repair_reachability` は threads=12 のみで発生する逐次段のため `dot_scan（threads=12）`（±922.0%）を実測帯として用いる。両者とも実測帯が非常に広い（環境ノイズが大きい）——HNSW を一切通らない `dot_scan` でも同水準の run-to-run 変動が生じており、本節の実測が環境ノイズに支配されていることの傍証とする。`level`／`prefix`／`parallel` は「アルゴリズム無変更だが `Adjacency` 経由のモノモーフィゼーションを通る」ため対象からは除外し、`total`・`repair_reachability`・`flatten` のみを判定対象とする。
+
+常駐メモリ（`HnswIndex::approx_heap_bytes`・VmRSS 前後差）:
+
+| threads | before approx_heap_bytes（min/median） | after approx_heap_bytes（min/median） | before vm_rss_delta_kb（min/median） | after vm_rss_delta_kb（min/median） |
+| --- | --- | --- | --- | --- |
+| 1 | 47471344B / 47471344B | 43303824B / 43303824B | 50232 / 50236 | 58336 / 58396 |
+| 12 | 47443824B / 47460368B | 43303824B / 43303824B | 29364 / 29604 | 29392 / 29408 |
+
+`approx_heap_bytes` は `HnswIndex::approx_heap_bytes()` の決定的な値（測定方式〔子プロセス隔離の有無〕に依存しない）であり、before/after 双方 run 間の分散がゼロ〜ごく小さいため一次指標として扱う。`vm_rss_delta_kb` は **before（同一プロセス内で threads=1→threads=12 と連続測定。threads=12 時点は直前の threads=1 計測のアロケータ保持ページの影響を受ける）と after（`measure_memory_isolated` にによる threads 点ごとの子プロセス隔離測定）とで測定方式が異なる**ため、`vm_rss_delta_kb` の前後比較は参考値に留め、判定には用いない（threads=12 の after 側 `vm_rss_kb_before` が子プロセスにも関わらず threads=1 の after 側 `vm_rss_kb_after` 相当まで高い値を示す run があり、隔離が完全ではない可能性が残る——原因の切り分けは本 Issue のスコープ外として申し送る）。
+
+§14.6 の見積り（100k 点・dim=64・M=16: グラフ部 現行 ≈19MB → CSR ≈14.1MB。ベクトル本体 100,000×64×4B=25.6MB を加えると索引全体で 現行 ≈44.6MB → CSR ≈39.7MB・約 11% 減の見込み）との突き合わせ: threads=1 min の実測は 45.27MiB → 41.30MiB（約 8.8% 減）。見積りの約 11% 減と方向・オーダーは整合するが、実測の絶対値（約 45MiB → 約 41MiB）は見積りの索引全体（≈44.6MB → ≈39.7MB）とほぼ一致する一方、見積りはグラフ部単体の削減率（約 26%）であり `approx_heap_bytes` はベクトル本体を含む索引全体の値のため、削減率の単純比較はできない（グラフ部単体の削減量は約 4.17MB で見積りの約 5MB 減に近い）。
+
+##### parallel_build 全 run 生データ（`benchmark-judgement-policy.md` §3）
+
+| run | side | loadavg(1m/5m/15m) | total(t=1)ms | total(t=12)ms | repair(t=12)ms | flatten(t=12)ms | dot_scan(t=1)ms | dot_scan(t=12)ms | heap(t=1)B | heap(t=12)B | rss_delta(t=1)kB | rss_delta(t=12)kB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | before | 1.78/3.41/4.56 | 10658.513 | 2599.023 | 894.953 | n/a | 54.997 | 18.436 | 47471344 | 47461952 | 50248 | 29644 |
+| 2 | before | 13.59/9.68/7.35 | 11718.095 | 2358.933 | 845.559 | n/a | 55.017 | 5.963 | 47471344 | 47473280 | 50236 | 29516 |
+| 3 | before | 7.20/6.28/6.91 | 9773.768 | 2615.800 | 847.369 | n/a | 70.788 | 31.394 | 47471344 | 47448208 | 50304 | 29364 |
+| 4 | before | 9.66/5.60/5.79 | 14110.490 | 3188.911 | 1073.117 | n/a | 212.747 | 60.941 | 47471344 | 47460368 | 50232 | 29792 |
+| 5 | before | 15.68/10.10/8.63 | 18524.418 | 3755.451 | 1054.029 | n/a | 77.557 | 21.273 | 47471344 | 47443824 | 50232 | 29604 |
+| 1 | after | 14.86/8.32/6.04 | 9891.329 | 2339.334 | 853.347 | 8.956 | 49.485 | 8.987 | 43303824 | 43303824 | 58336 | 29408 |
+| 2 | after | 15.51/11.34/8.42 | 9807.070 | 2064.835 | 759.781 | 8.164 | 48.212 | 6.041 | 43303824 | 43303824 | 58336 | 29500 |
+| 3 | after | 10.66/7.20/6.78 | 9764.136 | 2125.036 | 734.859 | 8.324 | 47.408 | 6.029 | 43303824 | 43303824 | 58400 | 29392 |
+| 4 | after | 16.09/11.24/8.19 | 13273.459 | 2823.576 | 986.497 | 11.794 | 58.160 | 12.058 | 43303824 | 43303824 | 58396 | 29504 |
+| 5 | after | 14.58/14.52/12.14 | 12346.697 | 3399.517 | 1040.737 | 12.490 | 83.173 | 31.210 | 43303824 | 43303824 | 58400 | 29400 |
+
+#### bench-hnsw-compare（usearch 対照。rows=100,000・dim=64・threads=12・queries=200）
+
+N=5 ペア。自作 `HnswIndex` の構築時間・探索レイテンシの前後比較（usearch 側は CSR 化の影響を受けない対照＝実測帯の算出元）。
+
+| 区間 | before min | before median | after min | after median | ratio (min-of-N) | 固定帯(±5%) | 実測帯（参照区間） | 判定 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| self build（threads=12） | 1895.337ms | 2544.307ms | 1881.503ms | 2896.051ms | 0.993x | 固定帯内(±5%) | 実測帯内(±164.7%) | ノイズ帯内 |
+| self search median | 66.770us | 67.302us | 58.154us | 71.035us | 0.871x | 固定帯超過(±5%) | 実測帯内(±103.6%) | ノイズ帯内 |
+| usearch build（参照。CSR 非依存） | 1601.643ms | 1884.734ms | 1633.892ms | 1900.481ms | 1.020x | 該当なし | ±164.7%（自己参照） | 非対象（参照） |
+| usearch search median（参照） | 78.730us | 80.917us | 90.368us | 95.202us | 1.148x | 該当なし | ±103.6%（自己参照） | 非対象（参照） |
+
+`self build`・`self search median` の実測帯にはそれぞれ `usearch build`（±164.7%）・`usearch search median`（±103.6%）を用いた（usearch は CSR 化の影響を受けない同一プロセス内の対照エンジンであり、その run-to-run 変動幅を実測帯の算出元とする）。
+
+自作対 usearch 探索レイテンシ中央値の現行値（L2 正規化コーパス方式。旧実測「自作 66〜67µs／usearch 76〜77µs」は非正規化コーパス時代の履歴であり直接比較しない。`docs/design/hnsw-parallel-build.md`「run9・run10」節と同一条件）:
+
+- before: 67.302µs（自作。median）／80.917µs（usearch。median）
+- after: 71.035µs（自作。median）／95.202µs（usearch。median）
+
+Recall@10 threads=1（自作。同一入力・決定的構築・ビット同一グラフであることは `tests/hnsw.rs::graph_fingerprint_is_stable_across_representation_change` で機械検証済みのため、本実測では threads=12（並列構築。非決定性あり）の同水準確認に限定する）: before [0.493, 0.506, 0.4885, 0.4865, 0.4915]（threads=1 参考値 0.4905）／after [0.5185, 0.505, 0.4785, 0.4815, 0.5045]（threads=1 参考値 0.4905）——いずれも 0.478〜0.519 の範囲内で前後に系統差は見られない。
+
+##### hnsw-compare 全 run 生データ（`benchmark-judgement-policy.md` §3）
+
+| run | side | loadavg(1m/5m/15m) | self_build_ms | usearch_build_ms | self_search_us | usearch_search_us | recall_self_t1 | recall_self_t12 | recall_usearch_t12 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | before | 14.61/9.39/10.53 | 2614.732 | 2494.426 | 90.487 | 110.858 | 0.4905 | 0.4930 | 0.4675 |
+| 2 | before | 20.59/18.88/14.69 | 2544.307 | 4240.271 | 120.361 | 160.308 | 0.4905 | 0.5060 | 0.4890 |
+| 3 | before | 16.50/18.28/16.73 | 3563.279 | 1884.734 | 67.302 | 78.803 | 0.4905 | 0.4885 | 0.4950 |
+| 4 | before | 10.26/13.64/15.31 | 1902.298 | 1639.916 | 66.770 | 80.917 | 0.4905 | 0.4865 | 0.4870 |
+| 5 | before | 13.67/14.79/15.14 | 1895.337 | 1601.643 | 67.023 | 78.730 | 0.4905 | 0.4915 | 0.4850 |
+| 1 | after | 15.32/13.32/11.91 | 2910.790 | 2368.387 | 93.924 | 119.952 | 0.4905 | 0.5185 | 0.5020 |
+| 2 | after | 21.45/20.12/16.48 | 3249.388 | 3268.641 | 201.487 | 152.422 | 0.4905 | 0.5050 | 0.5010 |
+| 3 | after | 12.37/16.35/16.37 | 1881.503 | 1900.481 | 58.154 | 95.202 | 0.4905 | 0.4785 | 0.4950 |
+| 4 | after | 8.67/12.09/14.47 | 2896.051 | 1633.892 | 67.581 | 93.596 | 0.4905 | 0.4815 | 0.5010 |
+| 5 | after | 9.80/13.27/14.55 | 2699.329 | 1676.195 | 71.035 | 90.368 | 0.4905 | 0.5045 | 0.4775 |
+
+#### bench-knn-profile（`BENCH_KNN_PROFILE_ENGINE=hnsw`。25,000 行・dim=128）
+
+N=5 ペア。参照として同一ラウンドで `brute_force` も計測（実測帯の算出元）。
+
+| 区間 | before min | before median | after min | after median | ratio (min-of-N) | 固定帯(±5%) | 実測帯（参照区間） | 判定 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| S0-hot（hnsw） | 0.423ms | 0.428ms | 0.434ms | 0.448ms | 1.026x | 固定帯内(±5%) | 実測帯内(±706.0%) | ノイズ帯内 |
+| S0-cold（hnsw。flatten を含む） | 389.744ms | 395.184ms | 385.367ms | 386.559ms | 0.989x | 固定帯内(±5%) | 実測帯内(±706.0%) | ノイズ帯内 |
+| S0-hot（brute_force。参照） | 0.626ms | 0.649ms | 0.620ms | 0.666ms | 0.990x | 該当なし | ±706.0%（自己参照） | 非対象（参照） |
+
+`S0-hot（hnsw）`・`S0-cold（hnsw）` の実測帯にはいずれも `S0-hot（brute_force）`（±706.0%。HNSW を経由しない参照経路）を用いた。
+
+`hnsw_stats` の非 vacuous 性（`hits>0`・`fallbacks=0`・`build_failures=0`）:before・after ともに全 5 run で `knn_profile_bench: hnsw_stats builds=1 build_failures=0 hits=40 misses=1 fallbacks=0 entries=1`（値は前後で完全一致。before/after 各 run のログはすべて同一文字列）を確認し、`hits=40>0`・`fallbacks=0`・`build_failures=0` を満たす（非 vacuous）。
+
+##### bench-knn-profile 全 run 生データ（`benchmark-judgement-policy.md` §3）
+
+| run | side | loadavg(1m/5m/15m) | S0_hot(hnsw)ms | S0_cold(hnsw)ms | S0_hot(brute_force)ms | hnsw_stats |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | before | 12.42/13.24/14.30 | 0.428 | 394.759 | 0.649 | `knn_profile_bench: hnsw_stats builds=1 build_failures=0 hits=40 misses=1 fallbacks=0 entries=1` |
+| 2 | before | 11.63/13.04/14.19 | 0.431 | 395.184 | 0.626 | `knn_profile_bench: hnsw_stats builds=1 build_failures=0 hits=40 misses=1 fallbacks=0 entries=1` |
+| 3 | before | 9.37/12.33/13.90 | 0.426 | 430.642 | 0.640 | `knn_profile_bench: hnsw_stats builds=1 build_failures=0 hits=40 misses=1 fallbacks=0 entries=1` |
+| 4 | before | 10.37/12.23/13.81 | 0.428 | 389.744 | 1.388 | `knn_profile_bench: hnsw_stats builds=1 build_failures=0 hits=40 misses=1 fallbacks=0 entries=1` |
+| 5 | before | 9.50/11.74/13.57 | 0.423 | 808.414 | 4.997 | `knn_profile_bench: hnsw_stats builds=1 build_failures=0 hits=40 misses=1 fallbacks=0 entries=1` |
+| 1 | after | 13.45/13.43/14.34 | 0.437 | 385.367 | 0.679 | `knn_profile_bench: hnsw_stats builds=1 build_failures=0 hits=40 misses=1 fallbacks=0 entries=1` |
+| 2 | after | 11.33/12.87/14.11 | 0.448 | 385.432 | 0.636 | `knn_profile_bench: hnsw_stats builds=1 build_failures=0 hits=40 misses=1 fallbacks=0 entries=1` |
+| 3 | after | 9.65/12.24/13.85 | 0.676 | 412.503 | 0.620 | `knn_profile_bench: hnsw_stats builds=1 build_failures=0 hits=40 misses=1 fallbacks=0 entries=1` |
+| 4 | after | 9.75/11.94/13.68 | 0.434 | 386.559 | 0.666 | `knn_profile_bench: hnsw_stats builds=1 build_failures=0 hits=40 misses=1 fallbacks=0 entries=1` |
+| 5 | after | 17.30/13.46/14.07 | 0.741 | 530.369 | 0.782 | `knn_profile_bench: hnsw_stats builds=1 build_failures=0 hits=40 misses=1 fallbacks=0 entries=1` |
+
+#### 環境適格性・申し送り
+
+本実測は共有 QEMU 環境（他 worktree のジョブが並走）で取得した**参考値**であり、`docs/design/benchmark-judgement-policy.md` §5〜6 のとおり CSR 化は「キャッシュ規模依存のレイアウト最適化」として本環境では判定不能な施策種別に列挙されている。専有環境（`BENCH_DEDICATED_ENV=1`）での再実測はオーナー作業として申し送る。
+
+本実測（3 ベンチ・全区間）では、固定帯（±5%）・実測帯（変更を含まない参照区間 `dot_scan`／`usearch`／`brute_force` の run-to-run 幅。§4 参照）の両方を超える一貫した悪化・改善は観測されなかった（すべて「ノイズ帯内」判定。各参照区間の実測帯はいずれも非常に広く〔dot_scan threads=12: ±922%・usearch build: ±165%・brute_force S0-hot: ±706% 等〕、HNSW／CSR 化を一切通らない負荷でも同水準の run-to-run 変動が生じるため、本環境の実測は施策の効果を run-to-run 変動から切り分けられない——`docs/design/benchmark-judgement-policy.md` の想定どおり。`approx_heap_bytes`（測定方式に依存しない決定的な値。run 間の分散がゼロ〜ごく小さい）のみ §14.6 見積りと方向・オーダーが整合する明確な削減（約 8.8% 減。threads=1 min 比較）を示した。専有環境（`BENCH_DEDICATED_ENV=1`）でのレイテンシ・構築時間再実測はオーナー作業として引き続き申し送る（fixture・production コードの変更は本 Issue のスコープ外）。
+
+#### 再現方法
+
+```
+git fetch origin main
+# before/after それぞれ独立の checkout（worktree）を用意する
+# （2 つの cargo build を同一 checkout に対して CARGO_TARGET_DIR だけ
+#  切り替えて実行すると before/after 双方が同一ソースをビルドしてしまう
+#  ため、checkout 自体を分離する）。
+git worktree add --detach <scratch>/before 929c027
+git worktree add --detach <scratch>/after ad484e7  # PR #590 マージコミット
+# before 側にのみ計測専用パッチ（本節冒頭の diff）を適用する
+# （<scratch>/before で patch -p1 < before_measure_patch.diff 等。
+#  ad484e7 は計測用計装をネイティブに含むためパッチ不要）
+# CARGO_TARGET_DIR を分離しつつ、各 checkout の Cargo.toml を明示して
+# 双方 release ビルド（--manifest-path で checkout を固定する）
+CARGO_TARGET_DIR=<scratch>/target-before cargo build --release -p engine \
+  --manifest-path <scratch>/before/Cargo.toml \
+  --bench hnsw_parallel_build_bench --bench hnsw_compare_bench --features contrast-bench \
+  --bench knn_profile_bench
+CARGO_TARGET_DIR=<scratch>/target-after cargo build --release -p engine \
+  --manifest-path <scratch>/after/Cargo.toml \
+  --bench hnsw_parallel_build_bench --bench hnsw_compare_bench --features contrast-bench \
+  --bench knn_profile_bench
+# before/after を交互に N=5 ペア実行（同時並走させない）
+BENCH_HNSW_PARALLEL_THREADS=1,12 <scratch>/target-before/release/deps/hnsw_parallel_build_bench-<hash>
+BENCH_HNSW_PARALLEL_THREADS=1,12 <scratch>/target-after/release/deps/hnsw_parallel_build_bench-<hash>
+# ... 以下 bench-hnsw-compare（BENCH_HNSW_COMPARE_THREADS=12）・
+# bench-knn-profile（BENCH_KNN_PROFILE_ENGINE=hnsw／brute_force）も同様に交互実行
+# （バイナリのファイル名ハッシュ〔<hash>〕は cargo のビルド設定由来の
+#  メタデータハッシュであり、本節冒頭の binary sha256 一覧のとおり
+#  before/after で偶然一致することがある。実行対象を取り違えないよう
+#  CARGO_TARGET_DIR〔target-before／target-after〕で区別すること）
+```
