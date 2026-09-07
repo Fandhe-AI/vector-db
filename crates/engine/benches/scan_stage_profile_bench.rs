@@ -624,12 +624,20 @@ fn main() {
         Vec::with_capacity(config.measured_iterations() as usize);
     let mut w0_cold_last_ids: Option<Vec<u64>> = None;
     for _ in 0..config.measured_iterations() {
-        // 計測区間は `Storage::open` を含む（`docs/design/visible-bitmap-cache-verification.md`
-        // の「A0c は W0c と同じ流儀で Storage::open を含む」という前提と一致させる。
-        // `EngineCore::from_storage` 構築自体もこの区間に含める）。
-        let start = Instant::now();
+        // 計測区間は `execute_sql` のみ（`Storage::open`／`EngineCore` 構築は
+        // 含まない）。`docs/design/scan-stage-profile.md`「W0-cold − W0-hot で
+        // `SqlArenaCache` の寄与を示す」という既存の解釈は、W0-hot（同一
+        // `EngineCore` を使い回す `execute_sql` のみの区間）との差分が
+        // `SqlArenaCache` のヒット/ミスにのみ帰属することを前提にしている。
+        // ここに `Storage::open`／`EngineCore` 構築コストを含めると DB 起動
+        // コストが混入し前提が崩れるため、この区間には含めない（PR #586
+        // codex-review・Cursor Bugbot 指摘。Issue #479 で新設した `A0c-cold`
+        // は `VisibleBitmapCache` のミス経路を測る別目的の測定点であり、
+        // `Storage::open` を含めて測る設計は `A0c-cold` 側だけの事情。
+        // W0-cold をそれに合わせて変更する必要はない）。
         let cold_storage = Storage::open(&path).expect("reopen storage for W0-cold measurement");
         let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
+        let start = Instant::now();
         let result = black_box(
             cold_core
                 .execute_sql(&ctx_a, &sql_where)
@@ -665,17 +673,21 @@ fn main() {
         fail_closed("W0-cold returned an id outside the lang='ja' visible set (tenant/filter leak suspected)");
     }
 
-    // A0c（Issue #479）: W0c と同じ流儀で毎サンプル新規 `Storage::open` ＋
-    // `EngineCore`（空の `VisibleBitmapCache`〔Issue #478〕）から `COUNT(*)` を
-    // 測る。後段の A0a／A0b は同一 `EngineCore` を使い回すため 2 回目以降は
-    // 必ずキャッシュにヒットする（`sql/visible_cache.rs::execute_aggregate_with_cache`
+    // A0c（Issue #479）: 毎サンプル新規 `Storage::open` ＋ `EngineCore`
+    // （空の `VisibleBitmapCache`〔Issue #478〕）から `COUNT(*)` を測る。
+    // 後段の A0a／A0b は同一 `EngineCore` を使い回すため 2 回目以降は必ず
+    // 本キャッシュのヒット経路を測る（`sql/visible_cache.rs::execute_aggregate_with_cache`
     // が `user_rows/{table}` を一切開かない経路）。A0c はそのミス経路（走査に
     // 相乗りしたスナップショット構築を含む）を、before（キャッシュ非搭載）と
     // after（本キャッシュ搭載）の交互実測で比較できるようにするための対照値
-    // （before では常に全行走査、after では構築コストを含むミス経路）。W0c の
-    // 生 DB ハンドルは既に drop 済みだが、W0-hot/A0a/A0b 用の `core`（同一 DB を
-    // 開いたまま保持する）はまだ開いていないため、ここで `Storage::open` の
-    // 二重オープン（`DatabaseAlreadyOpen`）を避けられる。
+    // （before では常に全行走査、after では構築コストを含むミス経路）。
+    // `Storage::open`／`EngineCore` 構築コストを計測区間に含めるのは A0c
+    // 自身の設計判断であり、W0-cold（`execute_sql` のみを計測。上記コメント
+    // 参照）とは意図的に異なる区間を採る（PR #586 codex-review・Cursor
+    // Bugbot 指摘。`docs/design/visible-bitmap-cache-verification.md` 参照）。
+    // W0c の生 DB ハンドルは既に drop 済みだが、W0-hot/A0a/A0b 用の
+    // `core`（同一 DB を開いたまま保持する）はまだ開いていないため、ここで
+    // `Storage::open` の二重オープン（`DatabaseAlreadyOpen`）を避けられる。
     for _ in 0..config.warmup_iterations() {
         let cold_storage = Storage::open(&path).expect("reopen storage for A0-cold warmup");
         let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());

@@ -68,12 +68,19 @@ id_aggregates_match_between_cold_and_hot_cache` の codex-review 指摘対応と
 
 既存の `A0a`（`agg_count`・ctx=tenant-a）・`A0b`（`rls_isolation`・
 ctx=tenant-b）は同一 `EngineCore` を使い回すため、2 回目以降は必ず本
-キャッシュのヒット経路を測る。`A0c` は `W0c`（既存の cold 変種）と同じ流儀で
-毎サンプル新規 `Storage::open` + `EngineCore`（空キャッシュ）から
-`COUNT(*)` を実行することで、ミス経路（走査に相乗りしたスナップショット
-構築＋`Storage::open` を含む）の対照値を追加した。`make
-bench-scan-stage-profile` で `A0a`／`A0c-cold` を出力・整合性検証すること
-（COUNT 値が期待値と一致）を確認済み。
+キャッシュのヒット経路を測る。`A0c` は毎サンプル新規 `Storage::open` +
+`EngineCore`（空キャッシュ）から `COUNT(*)` を実行することで、ミス経路
+（走査に相乗りしたスナップショット構築＋`Storage::open` を含む）の対照値を
+追加した。`Storage::open`／`EngineCore` 構築コストを計測区間に含めるのは
+`A0c` 自身の設計判断であり、既存の `W0-cold`（`vector_knn_where` の cold
+変種。`execute_sql` のみを計測し `Storage::open` を含まない）とは意図的に
+異なる区間を採る——`docs/design/scan-stage-profile.md`「W0-cold − W0-hot で
+`SqlArenaCache` の寄与を示す」という既存の解釈は W0-hot（同一 `EngineCore`
+を使い回す `execute_sql` のみの区間）との差分に DB 起動コストを混入させない
+ことに依存しており、`W0-cold` 側を `A0c` に合わせて変更すると崩れるため
+（PR #586 codex-review・Cursor Bugbot 指摘）。`make bench-scan-stage-profile`
+で `A0a`／`A0c-cold` を出力・整合性検証すること（COUNT 値が期待値と一致）を
+確認済み。
 
 ## 実測値
 
