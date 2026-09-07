@@ -60,6 +60,11 @@ fi
 # CAND_BINS は "label=path label2=path2 ..." の空白区切り。label はシェル・
 # TSV へそのまま書き込むため許可文字集合で fail-closed に検証する
 # （coding-rust.md「untrusted 入力の扱い」: env/引数インジェクション防止）。
+# label は summary.tsv の side 列・per-pair ログファイル名（<pair>-<side>.log）
+# へそのまま使われるため、`before`／`after`（大小無視の同名重複を含む）は
+# 予約名として拒否し、CAND_BINS 内の重複も拒否する（重複・予約名を許すと
+# `run_one` のログ衝突検出（既存ログを refuse-to-overwrite）に途中で
+# 引っかかり、輪番の途中で N ペア完走できずに停止する）。
 CAND_LABELS=()
 CAND_PATHS=()
 if [ -n "${CAND_BINS:-}" ]; then
@@ -70,6 +75,17 @@ if [ -n "${CAND_BINS:-}" ]; then
     label="${entry%%=*}"
     path="${entry#*=}"
     [[ "${label}" =~ ^[A-Za-z0-9_]+$ ]] || die "CAND_BINS label must match ^[A-Za-z0-9_]+\$, got: ${label}"
+    label_lower="$(printf '%s' "${label}" | tr '[:upper:]' '[:lower:]')"
+    if [[ "${label_lower}" == "before" || "${label_lower}" == "after" ]]; then
+      die "CAND_BINS label must not reuse the reserved before/after names, got: ${label}"
+    fi
+    for existing in "${CAND_LABELS[@]:-}"; do
+      [[ -z "${existing}" ]] && continue
+      existing_lower="$(printf '%s' "${existing}" | tr '[:upper:]' '[:lower:]')"
+      if [[ "${label_lower}" == "${existing_lower}" ]]; then
+        die "CAND_BINS label must be unique, duplicate: ${label}"
+      fi
+    done
     [[ -x "${path}" ]] || die "CAND_BINS path is not an executable file: ${path}"
     CAND_LABELS+=("${label}")
     CAND_PATHS+=("${path}")

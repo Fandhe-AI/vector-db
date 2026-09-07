@@ -644,16 +644,34 @@ before/after 比較。N=5 min-of-N・median（ms）:
 
 ### 層 A: 閾値候補 384 の輪番結果
 
-`cand384`（`DOT_MULTI_ACC_MIN_DIM` = 384）の dim384 と before の比較:
+`cand384`（`DOT_MULTI_ACC_MIN_DIM` = 384）の比較は、輪番順序
+（`before → after → before → cand1 → before → cand2 …`。benchmark-judgement-policy.md
+§3）どおり **各 `candN` 直前に実行した `before`（`summary.tsv` の `pair=Nc0`
+行）**を baseline とする。時間方向に離れた「`after` 用の `pair=1〜5` の
+`before`」を使うと測定順の交絡が再導入されるため使わない（両者は
+cache_resident では偶然一致するが、arena_scale では乖離する。生データ:
+`20260907T125122Z-summary.tsv` の `side=before pair=<N>c0` 行）。
 
-| working_set | before min/median | cand384 min/median | ratio_min | ratio_median |
+| working_set | before(c0) min/median | cand384 min/median | ratio_min | ratio_median |
 | --- | --- | --- | --- | --- |
 | cache_resident | 0.151 / 0.152 | 0.122 / 0.123 | 0.8079 | 0.8092 |
-| arena_scale | 1.222 / 1.269 | 1.173 / 1.176 | 0.9599 | 0.9267 |
+| arena_scale | 1.209 / 1.257 | 1.173 / 1.176 | 0.9702 | 0.9356 |
 
-両 working_set で `Improved`（固定 ±5% 帯・上記参照区間帯のいずれも超過）。
-dim384 を multi-acc（ACC=4）経路に含めると 1 行版 `dot` は本環境で
-7〜19% 改善する。
+参照区間帯は上記「層 A: `dot_kernel_bench`」節の dim384 行（cache_resident
+before band 15.89%・arena_scale before band 8.35%）を、輪番直前 baseline と
+同じ working_set・同じ dim の実測帯として流用する。
+
+判定（固定 ±5% 帯・実測帯の両方を要件とする。§4）:
+
+- cache_resident: ratio_min 0.8079（19.21% 改善）・ratio_median 0.8092
+  （19.08% 改善）はいずれも固定帯・参照帯（15.89%）の両方を超過 → `Improved`。
+- arena_scale: ratio_min 0.9702（2.98% 改善）は固定 ±5% 帯を超えず
+  → `Neutral`。ratio_median 0.9356（6.44% 改善）は固定帯は超えるが参照帯
+  （8.35%）を超えないため → `Neutral`。
+
+dim384 を multi-acc（ACC=4）経路に含めた場合、本環境の輪番実測では
+cache_resident のみ両ノイズ帯を超える改善が確認でき、arena_scale は
+両統計量ともノイズ帯内（`Neutral`）にとどまる。
 
 ### 層 B: production 経路（`bench-chip` `feature_768`）前後比較
 
@@ -685,10 +703,18 @@ benchmark-judgement-policy.md §4（固定 ±5% 帯・実測 run-to-run 帯の�
 要件とする）に従い分類する:
 
 1. `current` dim768／1536: 4 点中 3 点（cache768・cache1536・arena1536）が
-   `Improved`（両ノイズ帯を超過）。arena768 は min-of-N 比が参照帯内
-   （`Neutral`）だが median 比は両帯を超過（`Improved`）——参照区間の
-   ノイズが大きい共有環境のため、min-of-N と median で判定が割れる場合がある
-   ことの一例。Issue #518 の 1 行版改善は本環境でも参考値として確認できる。
+   `Improved`（固定 ±5% 帯・参照区間の実測帯〔同一 working_set の dim384
+   before band〕の両方を超過）。arena768 は min-of-N 比 1.0017（0.17% 悪化
+   ＝実質不変）が固定帯を超えず、median 比 0.9231（7.69% 改善）も固定帯は
+   超えるが参照帯（arena_scale dim384 before band 8.35%。上記「層 A:
+   `dot_kernel_bench`」節の参照区間表）を超えないため、min-of-N・median
+   いずれも `Neutral` と判定する（両帯の比較式を統一適用。従来の記載は
+   参照帯 8.35%／17.86%／22.09% のいずれも超えない改善率を `Improved` と
+   誤分類していたため訂正する）。参照区間のノイズが大きい共有環境のため、
+   4 点中 1 点（arena768）は Issue #518 の効果が本環境の計測解像度では
+   有効な変化として確認できない、というのが正しい所見である。Issue #518
+   の 1 行版改善は cache768・cache1536・arena1536 の 3 点で本環境でも
+   参考値として確認できる。
 2. block4 dim768（production `search_range` 経路）: cache_resident・
    arena_scale とも `Regressed`（8〜11% の悪化。参照区間 dim128 の帯
    0.8〜5.4% を超過）。**Issue #518 が `search_range` の dim>=768 を
@@ -700,11 +726,20 @@ benchmark-judgement-policy.md §4（固定 ±5% 帯・実測 run-to-run 帯の�
 3. 層 B（`feature_768` エンドツーエンド）: `vector_knn`・`hybrid_rrf`
    いずれも `Neutral`（両ノイズ帯内）。上記 2. の退行は本規模・本ワークロード
    のエンドツーエンドレイテンシには明確には現れていない。
-4. 閾値候補 384: cache_resident・arena_scale とも `Improved`（1 行版
-   `dot` は dim384 でも multi-acc の恩恵を受ける）。ただし 2. の block4
-   退行は `dot_block4_impl` の縮退境界にも連動するため、閾値を下げると
-   production `search_range` 経路の退行対象 dim レンジが広がる可能性がある
-   （本 Issue では検証していない）。
+4. 閾値候補 384: 輪番直前 baseline（`pair=Nc0`）で再集計すると
+   cache_resident のみ `Improved`（固定帯・参照帯〔15.89%〕の両方を超過）。
+   arena_scale は ratio_min 0.9702（2.98% 改善。固定 ±5% 帯内）・
+   ratio_median 0.9356（6.44% 改善。固定帯は超えるが参照帯〔8.35%〕は
+   超えない）でいずれも `Neutral` と判定する（従来の記載は候補直前でなく
+   時間的に離れた `pair=1〜5` の `before` を baseline に使っており、
+   `benchmark-judgement-policy.md` §3 の輪番比較が要求する時間方向の交絡
+   排除に反していた。TSV 再集計値は上記「層 A: 閾値候補 384 の輪番結果」節
+   参照）。dim384 を multi-acc（ACC=4）経路に含めた場合の 1 行版 `dot` の
+   改善は cache_resident では両ノイズ帯を超えて確認できるが、arena_scale
+   では本環境の計測解像度では有効な変化として確認できない。ただし 2. の
+   block4 退行は `dot_block4_impl` の縮退境界にも連動するため、閾値を
+   下げると production `search_range` 経路の退行対象 dim レンジが広がる
+   可能性がある（本 Issue では検証していない）。
 5. **総合**: `DOT_MULTI_ACC_MIN_DIM` = 768 は**本 Issue で変更しない**
    （共有 QEMU 環境の参考値のみで確定・変更しない。1 行版の改善と block4
    経路の退行が同時に存在するため、閾値の最終判断には 2. の対処方針
