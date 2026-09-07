@@ -662,6 +662,63 @@ fn main() {
         fail_closed("W0-cold returned an id outside the lang='ja' visible set (tenant/filter leak suspected)");
     }
 
+    // A0c（Issue #479）: W0c と同じ流儀で毎サンプル新規 `Storage::open` ＋
+    // `EngineCore`（空の `VisibleBitmapCache`〔Issue #478〕）から `COUNT(*)` を
+    // 測る。後段の A0a／A0b は同一 `EngineCore` を使い回すため 2 回目以降は
+    // 必ずキャッシュにヒットする（`sql/visible_cache.rs::execute_aggregate_with_cache`
+    // が `user_rows/{table}` を一切開かない経路）。A0c はそのミス経路（走査に
+    // 相乗りしたスナップショット構築を含む）を、before（キャッシュ非搭載）と
+    // after（本キャッシュ搭載）の交互実測で比較できるようにするための対照値
+    // （before では常に全行走査、after では構築コストを含むミス経路）。W0c の
+    // 生 DB ハンドルは既に drop 済みだが、W0-hot/A0a/A0b 用の `core`（同一 DB を
+    // 開いたまま保持する）はまだ開いていないため、ここで `Storage::open` の
+    // 二重オープン（`DatabaseAlreadyOpen`）を避けられる。
+    for _ in 0..config.warmup_iterations() {
+        let cold_storage = Storage::open(&path).expect("reopen storage for A0-cold warmup");
+        let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
+        black_box(
+            cold_core
+                .execute_sql(&ctx_a, &count_sql)
+                .expect("execute_sql must succeed for COUNT(*) query"),
+        );
+    }
+    let mut a0c_samples: Vec<Duration> = Vec::with_capacity(config.measured_iterations() as usize);
+    let mut a0c_last_value: Option<u64> = None;
+    for _ in 0..config.measured_iterations() {
+        let cold_storage = Storage::open(&path).expect("reopen storage for A0-cold measurement");
+        let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
+        let start = Instant::now();
+        let result = black_box(
+            cold_core
+                .execute_sql(&ctx_a, &count_sql)
+                .expect("execute_sql must succeed for COUNT(*) query"),
+        );
+        a0c_samples.push(start.elapsed());
+        if result.rows.len() != 1 {
+            fail_closed(format!(
+                "A0-cold COUNT(*) row count mismatch: expected 1, got {}",
+                result.rows.len()
+            ));
+        }
+        a0c_last_value = Some(match result.rows[0].cells.first() {
+            Some(Cell::Integer(v)) => *v,
+            other => fail_closed(format!(
+                "A0-cold COUNT(*) cell type mismatch: got {other:?}"
+            )),
+        });
+    }
+    if a0c_samples.is_empty() {
+        fail_closed("A0-cold measurement produced no samples");
+    }
+    let a0c_summary = stats::summarize(&a0c_samples).expect("A0-cold summarize");
+    match a0c_last_value {
+        Some(value) if value == tenant_a_rows => {}
+        Some(value) => fail_closed(format!(
+            "A0-cold COUNT(*) value mismatch: expected {tenant_a_rows}, got {value}"
+        )),
+        None => fail_closed("A0-cold measurement produced no COUNT(*) value"),
+    }
+
     let storage = Storage::open(&path).expect("reopen storage for W0-hot/W0-nowhere/A0");
     let core = EngineCore::from_storage(storage, search_engine::default_engine());
 
@@ -883,6 +940,16 @@ fn main() {
     println!(
         "e2e(rls_isolation/A0b, ctx=tenant-b): median={:.3}ms",
         a0b.summary.median.as_secs_f64() * 1e3
+    );
+    println!(
+        "e2e(agg_count/A0c-cold, ctx=tenant-a, includes Storage::open): median={:.3}ms (min-of-R={:.3}ms)",
+        a0c_summary.median.as_secs_f64() * 1e3,
+        a0c_samples
+            .iter()
+            .min()
+            .expect("A0-cold has at least one sample")
+            .as_secs_f64()
+            * 1e3
     );
 
     let visible_rows = tenant_a_rows as usize;
