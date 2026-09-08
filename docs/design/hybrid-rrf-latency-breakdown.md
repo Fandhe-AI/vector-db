@@ -1725,7 +1725,7 @@ crossdb 横断ベンチ（`docs/design/crossdb-bench.md`）では `hybrid_rrf` �
 | S5 `rowcopy_replica` | `push_visible_row`（id・vector・tenant_id 文字列複製・可視性フラグ）＋投影スロット積み上げの複製 | 複製近似（下限） |
 | S6 `slotmap_replica` | `slot_ids`／`visible_id_counts`（`HashMap`）の毎クエリ O(N) 再構築の複製 | 複製近似 |
 | S7 `bodyclone_replica` | `SELECT *` 投影が行う本文列複製（既存 `projection(B2-B1)` の実体）の複製 | 複製近似 |
-| S8 `tail` | `RlsSafetyNet::apply`（Top-k のみ）＋ id 投影 | 実 API |
+| S8 `tail` | `RlsSafetyNet::apply`（Top-k のみ）＋ id 投影（`project_id_only_rows`。後述「S8 の id 投影追記」参照） | 実 API |
 
 S1〜S3・S1d・S3d は行数に依存しないパース・束縛コストを、可視全行を持つ計測用
 DB ではなく同一スキーマ・0 行の「双子 DB」で計測する。move 前に実 DB で 1 回
@@ -1744,6 +1744,22 @@ round trip から dense-topk 対照区間（S0）を引いた値であり、内�
 でのパース・束縛）を新設して `unexplained_common` の減算対象を dense 側へ
 揃え、hybrid と dense のパース・束縛差は独立区分 `parse_bind_hybrid_delta`
 として切り出す（後述）。
+
+**S8 の id 投影追記（codex-review P2 指摘・PR #668・スレッド
+`PRRT_kwDOUAKASM6gWEdt`）**: 当初実装の S8 は `RlsSafetyNet::apply` の後に
+`verified.hits().len()` を返すだけで、production `project_rows`（`sql/exec.rs`）
+が行うスロット番号→行 `id` の解決・`ResultRow`／`Cell` の構築が計測対象に
+含まれておらず、そのコストが `unexplained_common` の残差へ混入していた。
+`sql/exec.rs` に非既定 feature `bench-internals` 限定の
+`project_id_only_rows`（`project_rows` の `ProjectedColumn::Id` 分岐を単体で
+再現する関数。スカラー列投影・`Computed` 列は本ベンチの SQL が `SELECT id`
+固定のため対象外）を追加し、S8 が `RlsSafetyNet::apply` に加えてこの投影
+処理まで測定するよう変更した。`RlsSafetyNet::apply` の `label_of` 閉包も、
+定数を返すだけの簡略版から `issue660_s8_arena`（`storage` から一度だけ
+構築した実 `VectorArena`）の `tenant_id`／`visibility` を引く production 相当の
+閉包へ差し替えた。`hybrid_search` が返す hit の `id` は実際の行 `id`（アリーナの
+スロット番号ではない）であるため、計測区間の外で 1 回だけ id→スロット写像を
+作り、hits をスロット番号へ変換してから測定ラウンドへ渡している。
 
 ### 複製近似の限界
 
@@ -1813,6 +1829,8 @@ S0〜S8 のラウンドループとして実行し（既存出力行はバイト
 （行数を縮小した動作確認用の値であり、25,000 行既定の実測値ではない。段の
 相対的な内訳の傾向を確認する目的のみに使う）。
 
+S8 の id 投影追記（PR #668）後の再実行例:
+
 ```
 hybrid_profile: sql_surface_breakdown_summary stage=S0_dense_topk_ref min=28us median=28us
 hybrid_profile: sql_surface_breakdown_summary stage=S1_parse min=3us median=3us
@@ -1820,25 +1838,32 @@ hybrid_profile: sql_surface_breakdown_summary stage=S2_schema min=0us median=0us
 hybrid_profile: sql_surface_breakdown_summary stage=S3_bind min=2us median=2us
 hybrid_profile: sql_surface_breakdown_summary stage=S1d_parse_dense min=3us median=3us
 hybrid_profile: sql_surface_breakdown_summary stage=S3d_bind_dense min=2us median=2us
-hybrid_profile: sql_surface_breakdown_summary stage=S4_scan_replica min=11us median=11us
+hybrid_profile: sql_surface_breakdown_summary stage=S4_scan_replica min=10us median=10us
 hybrid_profile: sql_surface_breakdown_summary stage=S5_rowcopy_replica min=12us median=12us
 hybrid_profile: sql_surface_breakdown_summary stage=S6_slotmap_replica min=3us median=3us
 hybrid_profile: sql_surface_breakdown_summary stage=S7_bodyclone_replica min=16us median=16us
 hybrid_profile: sql_surface_breakdown_summary stage=S8_tail min=0us median=0us
-hybrid_profile: sql_surface_breakdown_bucket label=common_fixed(B3-S0) diff=21us ratio_of_b1=12.14%
-hybrid_profile: sql_surface_breakdown_bucket label=hybrid_only((B1-B4)-common_fixed) diff=44us ratio_of_b1=25.43%
-hybrid_profile: sql_surface_breakdown_bucket label=parse_bind(S1+S2+S3) diff=6us ratio_of_b1=3.47%
-hybrid_profile: sql_surface_breakdown_bucket label=parse_bind_dense(S1d+S2+S3d) diff=6us ratio_of_b1=3.47%
+hybrid_profile: sql_surface_breakdown_bucket label=common_fixed(B3-S0) diff=22us ratio_of_b1=12.57%
+hybrid_profile: sql_surface_breakdown_bucket label=hybrid_only((B1-B4)-common_fixed) diff=44us ratio_of_b1=25.14%
+hybrid_profile: sql_surface_breakdown_bucket label=parse_bind(S1+S2+S3) diff=6us ratio_of_b1=3.43%
+hybrid_profile: sql_surface_breakdown_bucket label=parse_bind_dense(S1d+S2+S3d) diff=6us ratio_of_b1=3.43%
 hybrid_profile: sql_surface_breakdown_bucket label=parse_bind_hybrid_delta(parse_bind-parse_bind_dense) diff=0us ratio_of_b1=0.00%
-hybrid_profile: sql_surface_breakdown_bucket label=scalar_stage_replica(S4+S5) diff=24us ratio_of_b1=13.87%
-hybrid_profile: sql_surface_breakdown_bucket label=unexplained_common(common_fixed-(S1d+S2+S3d+S6+S8)) diff=11us ratio_of_b1=6.36%
-hybrid_profile: sql_surface_breakdown_bucket label=unexplained_hybrid(hybrid_only-scalar_stage_replica) diff=20us ratio_of_b1=11.56%
-hybrid_profile: sql_surface_breakdown_bucket label=projection_replica(S7) diff=16us ratio_of_b1=9.25%
+hybrid_profile: sql_surface_breakdown_bucket label=scalar_stage_replica(S4+S5) diff=22us ratio_of_b1=12.57%
+hybrid_profile: sql_surface_breakdown_bucket label=unexplained_common(common_fixed-(S1d+S2+S3d+S6+S8)) diff=12us ratio_of_b1=6.86%
+hybrid_profile: sql_surface_breakdown_bucket label=unexplained_hybrid(hybrid_only-scalar_stage_replica) diff=21us ratio_of_b1=12.00%
+hybrid_profile: sql_surface_breakdown_bucket label=projection_replica(S7) diff=16us ratio_of_b1=9.14%
 hybrid_profile: cache_stats_delta name=sql_arena_hits before=0 after=250 delta=250 expected_min=250 nonvacuous=true
 hybrid_profile: cache_stats_delta name=sparse_index_hits before=0 after=250 delta=250 expected_min=250 nonvacuous=true
 hybrid_profile: cache_stats_delta name=scalar_index_hits before=0 after=0 delta=0 expected_min=0 nonvacuous=true
 hybrid_profile: cache_stats_delta name=hnsw_index_hits before=0 after=0 delta=0 expected_min=0 nonvacuous=true
 ```
+
+`rows=500` のスモーク規模では Top-`TOP_K` 件の id 投影（`Cell::Integer` 構築
+1 件のみ）自体が µs 未満のため `S8_tail` の見かけの値は追記前後で変わらない
+（`min=0us`）。追記の意図は S8 の**測定対象の正しさ**（id 投影処理を含む
+かどうか）であり、本スモーク規模でのマイクロ秒単位の変化を確認するもの
+ではない。25,000 行既定規模での前後比較は未実施（本追記は測定対象の修正が
+目的で、性能上の採否判断は伴わない）。
 
 この規模（500 行）では `scalar_stage_replica(S4+S5)`（下限、約 14%）と
 `hybrid_only`（上限、約 25%）の両方が `hybrid_only ≥ scalar_stage_replica`

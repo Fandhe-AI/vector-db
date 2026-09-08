@@ -77,6 +77,7 @@
 mod harness;
 
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 use harness::env_report::EnvReport;
 use harness::hybrid_latency::RefetchTrackingProvider;
@@ -100,6 +101,7 @@ use harness::scan_stage_profile::{
     ScanStageError,
 };
 
+use engine::arena::VectorArena;
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::hybrid::{hybrid_search, rrf_fuse, sparse_refetch_observed, RrfConfig};
@@ -312,6 +314,15 @@ fn main() {
             .expect("seed batch insert");
         next_id += batch_len;
     }
+
+    // Issue #660 レビュー指摘（PR #668 codex-review P2）対応: S8 に id 投影相当の
+    // 処理を含めるため、`storage`（この直後 `EngineCore::from_storage` へ move
+    // する）から一度だけ実 `VectorArena` を構築して退避する。production の
+    // `VectorArena::build`（TABLE-8）と同一の構築経路であり、以降 S8 計測の
+    // `engine::sql::exec::project_id_only_rows`（`bench-internals` feature 限定）
+    // へ渡す。
+    let issue660_s8_arena = VectorArena::build(&storage, TABLE)
+        .unwrap_or_else(|e| fail_closed(format!("Issue #660 S8 arena build failed: {e}")));
 
     // --- Issue #660: 双子 DB（同一スキーマ・0 行）の準備 ------------------------
     // S1(parse)/S2(schema)/S3(bind) はパース・束縛コストが行数に依存しない
@@ -1495,8 +1506,21 @@ fn main() {
         .collect();
 
     // S8 用: `hybrid_search`（B4 と同一経路）の Top-`TOP_K` hits を 1 回だけ
-    // 事前計算し、`RlsSafetyNet::apply` 単体（Top-k のみ）の末尾処理コストを
-    // 密・疎の再取得コストと混ぜずに計測する。
+    // 事前計算し、`RlsSafetyNet::apply`（Top-k のみ）＋ id 投影相当の末尾処理
+    // コストを密・疎の再取得コストと混ぜずに計測する（Issue #660 レビュー
+    // 指摘・PR #668 対応）。`hybrid_search` が返す `HybridHit::id` は実際の行
+    // `id`（`SearchInput::ids` に渡した `visible_ids` 由来）だが、production の
+    // `RlsSafetyNet::apply`／`project_rows` が受け取る hits の第 1 要素は
+    // アリーナのスロット番号（`sql/exec.rs` のモジュールドキュメント参照）
+    // であり、両者は一致しない。ここで一度だけ `issue660_s8_arena` 上の
+    // id→スロット写像を作り、hits をスロット番号へ変換してから測定ラウンドへ
+    // 渡す（変換自体は計測区間の外）。
+    let issue660_id_to_slot: HashMap<u64, u32> = issue660_s8_arena
+        .ids()
+        .iter()
+        .enumerate()
+        .map(|(slot, id)| (*id, slot as u32))
+        .collect();
     let issue660_s8_hits: Vec<(u64, f64)> = {
         let q = &queries[0];
         let input = SearchInput {
@@ -1520,7 +1544,15 @@ fn main() {
             ))
         })
         .into_iter()
-        .map(|hit| (hit.id, hit.score))
+        .map(|hit| {
+            let slot = *issue660_id_to_slot.get(&hit.id).unwrap_or_else(|| {
+                fail_closed(format!(
+                    "Issue #660 S8 precompute: hit id {} missing from arena slot map",
+                    hit.id
+                ))
+            });
+            (slot as u64, hit.score)
+        })
         .collect()
     };
 
@@ -1654,12 +1686,23 @@ fn main() {
             .unwrap_or_else(|e| fail_closed(format!("S7 measurement failed: {e}")));
         s7_round_medians.push(m.summary.median);
 
-        // S8_tail: `RlsSafetyNet::apply`（Top-k のみ）＋ id 投影の複製。
+        // S8_tail: `RlsSafetyNet::apply`（Top-k のみ）＋ id 投影の複製
+        // （Issue #660 レビュー指摘・PR #668 対応。production `project_rows` の
+        // `ProjectedColumn::Id` 経路と同一のスロット→行 id 解決・`ResultRow`／
+        // `Cell` 構築を `project_id_only_rows` で実施する）。`label_of` は
+        // `project_rows` 呼び出し前の `sql/exec.rs::execute_statement` と同じく
+        // `issue660_s8_arena` から `tenant_id`／`visibility` を引く。
         let m = run(&config, || {
             let hits = issue660_s8_hits.clone();
-            let verified =
-                RlsSafetyNet::new(&ctx).apply(hits, |_id| Some((TENANT_ID, Visibility::Public)));
-            verified.hits().len()
+            let verified = RlsSafetyNet::new(&ctx).apply(hits, |slot_id| {
+                let slot = usize::try_from(slot_id).ok()?;
+                let tenant = issue660_s8_arena.tenant_id(slot)?;
+                let visibility = issue660_s8_arena.visibility(slot)?;
+                Some((tenant, visibility))
+            });
+            let rows = engine::sql::exec::project_id_only_rows(verified, &issue660_s8_arena)
+                .unwrap_or_else(|e| fail_closed(format!("S8 projection failed: {e}")));
+            rows.len()
         })
         .unwrap_or_else(|e| fail_closed(format!("S8 measurement failed: {e}")));
         s8_round_medians.push(m.summary.median);

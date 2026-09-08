@@ -2135,6 +2135,46 @@ fn project_rows(
     Ok(rows)
 }
 
+/// **ベンチ計測専用**（非既定 feature `bench-internals`。Issue #660・PR #668
+/// codex-review 指摘対応）。[`project_rows`] のうち `ProjectedColumn::Id` のみを
+/// 対象とした投影経路——スロット番号から行 `id` への解決・[`ResultRow`]／
+/// [`Cell`] の構築——を、`RlsSafetyNet::apply` 通過後の hits に対して
+/// 単体で再現する。`crates/engine/benches/hybrid_profile_bench.rs` の S8
+/// 計測（`SELECT id ... LIMIT k` 相当のハイブリッドクエリの末尾処理）が、
+/// `RlsSafetyNet::apply`（Top-k のみ）だけでなく本来の投影コストも含められる
+/// ようにするための限定公開で、`execute_statement` からは呼ばれない
+/// （production 経路は引き続き [`project_rows`] のみを通る）。
+///
+/// スカラー列投影・`Computed` 列は対象外（本ベンチが計測する SQL は
+/// `SELECT id` 固定のため、[`project_rows`] のうち該当分岐のみを複製する）。
+#[cfg(feature = "bench-internals")]
+pub fn project_id_only_rows(
+    verified: RlsVerifiedHits,
+    arena: &VectorArena,
+) -> Result<Vec<ResultRow>, SqlSurfaceError> {
+    let hits = verified.into_hits();
+    let mut rows = Vec::with_capacity(hits.len());
+    for (slot_id, score) in hits {
+        // [`project_rows`] と同じ「hits の第 1 要素はアリーナのスロット番号」
+        // 契約（モジュールドキュメント参照）。範囲外は fail-closed に拒否する。
+        let slot = usize::try_from(slot_id).map_err(|_| SqlSurfaceError::Internal {
+            detail: "candidate slot index out of range".to_string(),
+        })?;
+        let id = *arena
+            .ids()
+            .get(slot)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "candidate arena index out of range".to_string(),
+            })?;
+        rows.push(ResultRow {
+            id,
+            score,
+            cells: vec![Cell::Integer(id)],
+        });
+    }
+    Ok(rows)
+}
+
 /// [`crate::sql::parser::BoundInsert`] を実行する（SQL-10、TASK-80）。
 /// `core.rs::EngineCore::execute_insert_sql` からのみ呼ばれる想定で、`Storage`・
 /// `PolicyContext` を束ねる（`execute_statement` と対称の役割）。クレート外へ公開する
