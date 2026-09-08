@@ -1040,16 +1040,19 @@ fn main() {
         }
     }
 
-    // Issue #660 §3.3: 以下の B0s〜B8 ラウンドループが B1（SQL hybrid・
-    // `SparseIndexCache`／`SqlArenaCache`／`ScalarIndexCache`／`HnswIndexCache`
-    // の照会経路）を rounds*50 回実行する前後で各キャッシュの統計を採取し、
-    // hot path が構造的に成立していること（非 vacuous）を fail-closed に確認する
-    // （直接計測できない `pub(crate)` キャッシュ照会の間接証跡。既存ループ本体は
-    // 無変更のまま前後にスナップショットを挟むだけ）。
-    let issue660_sql_arena_before = core.sql_arena_cache_stats();
-    let issue660_sparse_before = core.sparse_index_cache_stats();
-    let issue660_scalar_before = core.scalar_index_cache_stats();
-    let issue660_hnsw_before = core.hnsw_index_cache_stats();
+    // Issue #660 §3.3: 各ラウンドの B1（SQL hybrid・`SparseIndexCache`／
+    // `SqlArenaCache`／`ScalarIndexCache`／`HnswIndexCache` の照会経路）計測
+    // 直前・直後でのみ各キャッシュの統計を採取し、増分を B1 の実行回数
+    // （warmup + measured。B1 は 1 回の `execute_sql` ごとに各キャッシュを
+    // 高々 1 回照会する）と突き合わせる fail-closed 判定へ供する（codex-review
+    // 指摘: B1〜B3 全体を跨ぐ前後比較では B1 単独の命中を証明できないため、
+    // 採取区間を B1 の `run(...)` 呼び出しの直前・直後のみへ縮小した）。
+    let issue660_b1_iterations_per_round =
+        u64::from(config.warmup_iterations()) + u64::from(config.measured_iterations());
+    let mut issue660_sql_arena_delta_sum = 0u64;
+    let mut issue660_sparse_delta_sum = 0u64;
+    let mut issue660_scalar_delta_sum = 0u64;
+    let mut issue660_hnsw_delta_sum = 0u64;
 
     for round in 0..rounds {
         println!("hybrid_profile: baseline round {}/{rounds}", round + 1);
@@ -1093,6 +1096,12 @@ fn main() {
         b0_round_medians.push(m.summary.median);
 
         // B1_sql_hybrid_select_id: crossdb 規範形（SQL 表層 e2e の上限）。
+        // キャッシュ統計は本計測の直前・直後でのみ採取する（B1 単独の命中を
+        // 証明するため。上記コメント参照）。
+        let issue660_sql_arena_before = core.sql_arena_cache_stats();
+        let issue660_sparse_before = core.sparse_index_cache_stats();
+        let issue660_scalar_before = core.scalar_index_cache_stats();
+        let issue660_hnsw_before = core.hnsw_index_cache_stats();
         let mut query_idx = 0usize;
         let m = run(&config, || {
             let q = &queries[query_idx % queries.len()];
@@ -1112,6 +1121,22 @@ fn main() {
         })
         .unwrap_or_else(|e| fail_closed(format!("B1 measurement failed: {e}")));
         b1_round_medians.push(m.summary.median);
+        let issue660_sql_arena_after = core.sql_arena_cache_stats();
+        let issue660_sparse_after = core.sparse_index_cache_stats();
+        let issue660_scalar_after = core.scalar_index_cache_stats();
+        let issue660_hnsw_after = core.hnsw_index_cache_stats();
+        issue660_sql_arena_delta_sum += issue660_sql_arena_after
+            .hits
+            .saturating_sub(issue660_sql_arena_before.hits);
+        issue660_sparse_delta_sum += issue660_sparse_after
+            .hits
+            .saturating_sub(issue660_sparse_before.hits);
+        issue660_scalar_delta_sum += issue660_scalar_after
+            .hits
+            .saturating_sub(issue660_scalar_before.hits);
+        issue660_hnsw_delta_sum += issue660_hnsw_after
+            .hits
+            .saturating_sub(issue660_hnsw_before.hits);
 
         // B2_sql_hybrid_select_star: 既存段と同じ投影（本文複製あり）。
         let mut query_idx = 0usize;
@@ -1201,11 +1226,6 @@ fn main() {
         .unwrap_or_else(|e| fail_closed(format!("B8 measurement failed: {e}")));
         b8_round_medians.push(m.summary.median);
     }
-
-    let issue660_sql_arena_after = core.sql_arena_cache_stats();
-    let issue660_sparse_after = core.sparse_index_cache_stats();
-    let issue660_scalar_after = core.scalar_index_cache_stats();
-    let issue660_hnsw_after = core.hnsw_index_cache_stats();
 
     // --- per-round 生データ（計測規約 §3: per-run 生データ必須） ---
     for (round, (((((((b0s, b0), b1), b2), b3), b4), b5), b8)) in b0s_round_medians
@@ -1656,7 +1676,7 @@ fn main() {
     let issue660_scalar_stage_replica = issue660_min_s4 + issue660_min_s5;
     let issue660_unexplained_common = issue660_common_fixed.and_then(|c| {
         bucket_diff(
-            issue660_min_s1 + issue660_min_s2 + issue660_min_s6 + issue660_min_s8,
+            issue660_min_s1 + issue660_min_s2 + issue660_min_s3 + issue660_min_s6 + issue660_min_s8,
             c,
         )
     });
@@ -1679,7 +1699,7 @@ fn main() {
         Some(issue660_scalar_stage_replica),
     );
     issue660_render_bucket(
-        "unexplained_common(common_fixed-(S1+S2+S6+S8))",
+        "unexplained_common(common_fixed-(S1+S2+S3+S6+S8))",
         issue660_unexplained_common,
     );
     issue660_render_bucket(
@@ -1688,68 +1708,68 @@ fn main() {
     );
     issue660_render_bucket("projection_replica(S7)", Some(issue660_min_s7));
 
-    // --- キャッシュ照会の非 vacuous 検証（§3.3。arena/sparse/scalar は直接計測
-    // 不可のため hit カウンタ増分で hot path 成立を証明する。hnsw は既定エンジン
-    // では構造的に 0 回のはずであり、0 以外なら fail-closed） ---
-    let issue660_sql_arena_delta = issue660_sql_arena_after
-        .hits
-        .saturating_sub(issue660_sql_arena_before.hits);
-    let issue660_sparse_delta = issue660_sparse_after
-        .hits
-        .saturating_sub(issue660_sparse_before.hits);
-    let issue660_hnsw_delta = issue660_hnsw_after
-        .hits
-        .saturating_sub(issue660_hnsw_before.hits);
+    // --- キャッシュ照会の非 vacuous 検証（§3.3。B1 の `run(...)` 直前・直後
+    // でのみ採取した各ラウンドの増分を合算し、B1 の総実行回数（warmup+measured
+    // を rounds 回）と突き合わせる。B1 は 1 回の `execute_sql` ごとに sql_arena・
+    // sparse を高々 1 回ずつ照会するため、cache-hot 経路が成立していれば増分は
+    // 総実行回数と厳密に一致するはずで、それ未満なら B1 の一部が cache miss
+    // 経路（あるいは無関係な照会が混入）していることを意味する。hnsw は既定
+    // エンジンでは構造的に 0 回のはずであり、0 以外なら fail-closed。scalar は
+    // 本クエリ形状では照会経路自体が対象外のため informational として増分のみ
+    // 報告する） ---
+    let issue660_b1_expected_total = u64::from(rounds) * issue660_b1_iterations_per_round;
+    // `render_cache_stats_delta_line` の before/after 引数には、B1 ブラケット
+    // 区間の増分合計のみを渡す（B1 の直前直後以外〔B2 等〕での照会増分を含む
+    // 生の before/after を渡すと合計値と食い違うため。before=0・after=delta_sum
+    // と読み替える）。
     println!(
         "{}",
         render_cache_stats_delta_line(
             "sql_arena_hits",
-            issue660_sql_arena_before.hits,
-            issue660_sql_arena_after.hits,
-            1,
-            issue660_sql_arena_delta >= 1,
+            0,
+            issue660_sql_arena_delta_sum,
+            issue660_b1_expected_total,
+            issue660_sql_arena_delta_sum == issue660_b1_expected_total,
         )
     );
     println!(
         "{}",
         render_cache_stats_delta_line(
             "sparse_index_hits",
-            issue660_sparse_before.hits,
-            issue660_sparse_after.hits,
-            1,
-            issue660_sparse_delta >= 1,
+            0,
+            issue660_sparse_delta_sum,
+            issue660_b1_expected_total,
+            issue660_sparse_delta_sum == issue660_b1_expected_total,
         )
     );
     println!(
         "{}",
-        render_cache_stats_delta_line(
-            "scalar_index_hits",
-            issue660_scalar_before.hits,
-            issue660_scalar_after.hits,
-            0,
-            true,
-        )
+        render_cache_stats_delta_line("scalar_index_hits", 0, issue660_scalar_delta_sum, 0, true)
     );
     println!(
         "{}",
         render_cache_stats_delta_line(
             "hnsw_index_hits",
-            issue660_hnsw_before.hits,
-            issue660_hnsw_after.hits,
             0,
-            issue660_hnsw_delta == 0,
+            issue660_hnsw_delta_sum,
+            0,
+            issue660_hnsw_delta_sum == 0,
         )
     );
-    if issue660_sql_arena_delta == 0 || issue660_sparse_delta == 0 {
-        fail_closed(
-            "Issue #660 fail-closed: sql_arena/sparse cache hit counters did not grow during \
-             the B1 measurement rounds — the SQL surface breakdown above would not be \
-             representative of the cache-hot path",
-        );
-    }
-    if issue660_hnsw_delta != 0 {
+    if issue660_sql_arena_delta_sum != issue660_b1_expected_total
+        || issue660_sparse_delta_sum != issue660_b1_expected_total
+    {
         fail_closed(format!(
-            "Issue #660 fail-closed: hnsw_index_cache hits grew by {issue660_hnsw_delta} on \
+            "Issue #660 fail-closed: sql_arena/sparse cache hit counters (delta \
+             sql_arena={issue660_sql_arena_delta_sum} sparse={issue660_sparse_delta_sum}) did \
+             not match B1's total execution count ({issue660_b1_expected_total} = rounds * \
+             (warmup+measured)) measured directly around each round's B1 run() call — the SQL \
+             surface breakdown above would not be representative of the cache-hot path"
+        ));
+    }
+    if issue660_hnsw_delta_sum != 0 {
+        fail_closed(format!(
+            "Issue #660 fail-closed: hnsw_index_cache hits grew by {issue660_hnsw_delta_sum} on \
              the default (non-HNSW) search engine — expected structurally 0"
         ));
     }

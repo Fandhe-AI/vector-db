@@ -55,6 +55,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::env::VarError;
 use std::fmt::Write as _;
+use std::hint::black_box;
 
 // Issue #387 PR #416 codex-review P2 指摘対応（2 巡目）: `sparse_refetch_observed`
 // は非既定 feature `bench-internals` 限定公開（`hybrid.rs` 参照）のため、
@@ -711,9 +712,15 @@ pub fn rowcopy_replica(ids: &[u64], vectors: &[f32], dim: usize, tenant_id: &str
     debug_assert_eq!(out_ids.len(), ids.len());
     debug_assert_eq!(out_tenants.len(), ids.len());
     debug_assert_eq!(out_visibilities.len(), ids.len());
-    // 確保したバッファは計測対象の副作用そのもの（drop で解放される）であり、
-    // 呼び出し元へは処理件数のみ返す（`collect_body_strings` と同じ方針）。
-    let _ = (out_vectors,);
+    // 確保したバッファは計測対象の副作用そのものであり、呼び出し元へは処理件数
+    // のみ返す（`collect_body_strings` と方針は同じだが、バッファ自体を返さない
+    // ため drop 前に `black_box` を通し最適化による構築省略を防ぐ。Issue #660
+    // codex-review 指摘）。
+    black_box(&out_ids);
+    black_box(&out_vectors);
+    black_box(&out_tenants);
+    black_box(&out_visibilities);
+    black_box(&candidate_columns);
     candidate_columns.len()
 }
 
@@ -728,6 +735,10 @@ pub fn slotmap_replica(ids: &[u64]) -> usize {
         *counts.entry(id).or_insert(0) += 1;
     }
     debug_assert!(counts.len() <= ids.len());
+    // `slot_ids`／`counts` は drop 前に `black_box` を通し、最適化による構築
+    // 省略を防ぐ（Issue #660 codex-review 指摘）。
+    black_box(&slot_ids);
+    black_box(&counts);
     slot_ids.len()
 }
 
@@ -739,6 +750,9 @@ pub fn bodyclone_replica(bodies: &[String]) -> usize {
     for body in bodies {
         candidate_columns.push(vec![Value::Text(body.clone())]);
     }
+    // drop 前に `black_box` を通し、最適化による複製省略を防ぐ
+    // （Issue #660 codex-review 指摘）。
+    black_box(&candidate_columns);
     candidate_columns.len()
 }
 

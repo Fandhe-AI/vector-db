@@ -1747,7 +1747,7 @@ S4〜S7 は `on_visible_row`／`push_visible_row` の該当ロジックを手動
 | `hybrid_only` | `(B1 - B4) - common_fixed` | hybrid 限定の上乗せ（SCALAR 段の全行再構築＋疎／scalar キャッシュ照会） |
 | `parse_bind` | `S1 + S2 + S3` | パース・束縛・スキーマ取得 |
 | `scalar_stage_replica` | `S4 + S5` | 全行再構築コストの複製下限（`hybrid_only` の上限と対にして挟む） |
-| `unexplained_common` | `common_fixed - (S1+S2+S6+S8)` | arena／sparse／scalar キャッシュ照会・`begin_read`・結果組み立て等、直接計測できない `pub(crate)` 内部処理の合計（上限） |
+| `unexplained_common` | `common_fixed - (S1+S2+S3+S6+S8)` | arena／sparse／scalar キャッシュ照会・`begin_read`・結果組み立て等、直接計測できない `pub(crate)` 内部処理の合計（上限。S3〔束縛〕は実測済みのため差し引く） |
 | `unexplained_hybrid` | `hybrid_only - scalar_stage_replica` | 疎／scalar キャッシュ照会・予算検証等、複製で表せない残差（上限） |
 | `projection_replica(S7)` | `S7` そのもの | 既存 `projection(B2-B1)` の実体（本文列複製）の複製近似 |
 
@@ -1761,11 +1761,22 @@ S4〜S7 は `on_visible_row`／`push_visible_row` の該当ロジックを手動
 はいずれも `pub(crate)` のため、production コード無変更（A5）を優先し
 本ベンチから直接呼べない。代わりに `EngineCore::{sparse_index_cache_stats,
 sql_arena_cache_stats, scalar_index_cache_stats, hnsw_index_cache_stats}`
-（いずれも公開 observability API）の hit カウンタ増分で、B1 実行が実際に
-キャッシュへ命中していること（非 vacuous）を fail-closed に検証する
-（`cache_stats_delta` 行）。既定エンジン（`SearchEngineKind::Hnsw` を使わない
+（いずれも公開 observability API）の hit カウンタを、各ラウンドの B1
+`run(...)` 呼び出し **直前・直後** でのみ採取して増分をラウンド間で合算する
+（B0s〜B3・B5・B7・B8 等、B1 以外の計測が挟まる区間を含めて前後比較すると
+それらの照会増分も混入し B1 単独の命中を証明できないため。codex-review
+指摘・Issue #660 追記）。B1 は 1 回の `execute_sql` ごとに sql_arena・
+sparse をそれぞれ高々 1 回照会するため、cache-hot 経路が成立していれば
+合算増分は B1 の総実行回数（`rounds × (warmup_iterations + measured_
+iterations)`）と厳密に一致するはずであり、`cache_stats_delta` 行の
+`before`／`after` にはこの合算増分そのもの（`before=0`・`after=<合算増分>`）
+を渡し、`expected_min` には上記の総実行回数を渡して `nonvacuous` を
+「合算増分 == 総実行回数」の厳密一致で判定する（fail-closed。厳密一致に
+満たない場合は打ち切る）。既定エンジン（`SearchEngineKind::Hnsw` を使わない
 構築）では `hnsw_index_cache_stats` の hits 増分は構造的に 0 のはずであり、
-0 以外なら fail-closed で打ち切る。
+0 以外なら fail-closed で打ち切る。`scalar_index_hits` は本クエリ形状では
+照会経路自体が対象外のため、増分の値のみを informational として報告する
+（`nonvacuous` は常に `true`）。
 
 ### 計測条件・実測方法
 
@@ -1792,27 +1803,31 @@ hybrid_profile: sql_surface_breakdown_summary stage=S2_schema min=0us median=0us
 hybrid_profile: sql_surface_breakdown_summary stage=S3_bind min=2us median=2us
 hybrid_profile: sql_surface_breakdown_summary stage=S4_scan_replica min=10us median=10us
 hybrid_profile: sql_surface_breakdown_summary stage=S5_rowcopy_replica min=13us median=13us
-hybrid_profile: sql_surface_breakdown_summary stage=S6_slotmap_replica min=4us median=4us
-hybrid_profile: sql_surface_breakdown_summary stage=S7_bodyclone_replica min=16us median=16us
+hybrid_profile: sql_surface_breakdown_summary stage=S6_slotmap_replica min=3us median=3us
+hybrid_profile: sql_surface_breakdown_summary stage=S7_bodyclone_replica min=17us median=17us
 hybrid_profile: sql_surface_breakdown_summary stage=S8_tail min=0us median=0us
-hybrid_profile: sql_surface_breakdown_bucket label=common_fixed(B3-S0) diff=22us ratio_of_b1=12.64%
-hybrid_profile: sql_surface_breakdown_bucket label=hybrid_only((B1-B4)-common_fixed) diff=45us ratio_of_b1=25.86%
-hybrid_profile: sql_surface_breakdown_bucket label=parse_bind(S1+S2+S3) diff=6us ratio_of_b1=3.45%
-hybrid_profile: sql_surface_breakdown_bucket label=scalar_stage_replica(S4+S5) diff=24us ratio_of_b1=13.79%
-hybrid_profile: sql_surface_breakdown_bucket label=unexplained_common(common_fixed-(S1+S2+S6+S8)) diff=14us ratio_of_b1=8.05%
-hybrid_profile: sql_surface_breakdown_bucket label=unexplained_hybrid(hybrid_only-scalar_stage_replica) diff=20us ratio_of_b1=11.49%
-hybrid_profile: sql_surface_breakdown_bucket label=projection_replica(S7) diff=16us ratio_of_b1=9.20%
-hybrid_profile: cache_stats_delta name=sql_arena_hits before=100 after=850 delta=750 expected_min=1 nonvacuous=true
-hybrid_profile: cache_stats_delta name=sparse_index_hits before=50 after=550 delta=500 expected_min=1 nonvacuous=true
+hybrid_profile: sql_surface_breakdown_bucket label=common_fixed(B3-S0) diff=22us ratio_of_b1=12.43%
+hybrid_profile: sql_surface_breakdown_bucket label=hybrid_only((B1-B4)-common_fixed) diff=45us ratio_of_b1=25.42%
+hybrid_profile: sql_surface_breakdown_bucket label=parse_bind(S1+S2+S3) diff=6us ratio_of_b1=3.39%
+hybrid_profile: sql_surface_breakdown_bucket label=scalar_stage_replica(S4+S5) diff=24us ratio_of_b1=13.56%
+hybrid_profile: sql_surface_breakdown_bucket label=unexplained_common(common_fixed-(S1+S2+S3+S6+S8)) diff=11us ratio_of_b1=6.21%
+hybrid_profile: sql_surface_breakdown_bucket label=unexplained_hybrid(hybrid_only-scalar_stage_replica) diff=21us ratio_of_b1=11.86%
+hybrid_profile: sql_surface_breakdown_bucket label=projection_replica(S7) diff=17us ratio_of_b1=9.60%
+hybrid_profile: cache_stats_delta name=sql_arena_hits before=0 after=250 delta=250 expected_min=250 nonvacuous=true
+hybrid_profile: cache_stats_delta name=sparse_index_hits before=0 after=250 delta=250 expected_min=250 nonvacuous=true
+hybrid_profile: cache_stats_delta name=scalar_index_hits before=0 after=0 delta=0 expected_min=0 nonvacuous=true
 hybrid_profile: cache_stats_delta name=hnsw_index_hits before=0 after=0 delta=0 expected_min=0 nonvacuous=true
 ```
 
 この規模（500 行）では `scalar_stage_replica(S4+S5)`（下限、約 14%）と
-`hybrid_only`（上限、約 26%）の両方が `hybrid_only ≥ scalar_stage_replica`
+`hybrid_only`（上限、約 25%）の両方が `hybrid_only ≥ scalar_stage_replica`
 という設計上の期待どおりの順序を保っており、逆転（`n/a`）は発生していない。
-`sql_arena_hits`／`sparse_index_hits` の hit カウンタは非 vacuous（実測ラウンド
-の B1 実行がキャッシュ命中経路を通っていることを裏付ける）で、`hnsw_index_hits`
-は既定エンジンのため期待どおり 0 のまま。25,000 行既定規模での実測値・
+`cache_stats_delta` の `before`／`after` は各ラウンドの B1 `run(...)` 呼び出し
+直前・直後でのみ採取した増分の合算値（本例では warmup 20・measured 30 ×
+rounds 5 = 250）であり、`sql_arena_hits`／`sparse_index_hits` とも
+`expected_min`（B1 の総実行回数）と厳密一致（`nonvacuous=true`）することで
+B1 単独の cache-hot 経路が成立していることを裏付ける。`hnsw_index_hits` は
+既定エンジンのため期待どおり 0 のまま。25,000 行既定規模での実測値・
 専有環境実測はオーナー／運用者作業として申し送る。
 
 ### 改善候補（優先度付き起票案。実装は本 Issue の対象外・ユーザー承認後に別 Issue）
