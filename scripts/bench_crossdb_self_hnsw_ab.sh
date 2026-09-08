@@ -62,8 +62,21 @@ export CROSSDB_SELF_PORT="${CROSSDB_SELF_PORT:-15438}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/docs/design/bench-data/crossdb-self-hnsw-ab}"
 mkdir -p "${OUT_DIR}"
 
-WIRE_SERVER_BIN="${REPO_ROOT}/target/release/wire-server"
+# `self_db.py::SelfServer._default_binary` は `CROSSDB_SELF_BINARY` が
+# 継承されていればそちらを既定パスより優先して起動する。ここで固定の既定
+# パスだけを存在確認・ハッシュ算出に使うと、呼び出し元が `CROSSDB_SELF_BINARY`
+# を設定していた場合に「実際に起動するバイナリ」と「env.txt に記録される
+# バイナリ」が食い違い、既定バイナリ未ビルドなら指定済みの実行可能バイナリが
+# あっても停止してしまう（codex-review 指摘）。`_default_binary` と同じ優先順位
+# でパスを一度だけ解決し、存在確認・ハッシュ算出・`CROSSDB_SELF_BINARY` への
+# 再エクスポート（子プロセス起動）のすべてで同じ絶対パスを使う。
+WIRE_SERVER_BIN="${CROSSDB_SELF_BINARY:-${REPO_ROOT}/target/release/wire-server}"
+case "${WIRE_SERVER_BIN}" in
+  /*) : ;;
+  *) WIRE_SERVER_BIN="$(pwd)/${WIRE_SERVER_BIN}" ;;
+esac
 [ -x "${WIRE_SERVER_BIN}" ] || die "wire-server binary not found: ${WIRE_SERVER_BIN} (run: cargo build --release -p wire-server)"
+export CROSSDB_SELF_BINARY="${WIRE_SERVER_BIN}"
 PROBE_BIN="${CROSSDB_PLAN_PROBE_BINARY:-${REPO_ROOT}/target/release/examples/crossdb_plan_probe}"
 [ -x "${PROBE_BIN}" ] || die "crossdb_plan_probe binary not found: ${PROBE_BIN} (run: cargo build --release -p engine --example crossdb_plan_probe)"
 

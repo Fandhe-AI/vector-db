@@ -42,6 +42,16 @@ fi
 cd "$R"
 mkdir -p "$RESULTS_DIR" "$LOGS_DIR"
 
+# `CROSSDB_SELF_HNSW_ARGS` は self の `--config hnsw` にのみ意味を持つ opt-in
+# （`scripts/crossdb_bench/self_db.py::run` 参照）。この変数を無条件にプロセス
+# 環境へ残したまま `self exact` を実行すると、`self_db.run()` が「exact 構成で
+# --hnsw-* tuning が設定されている」として ValueError を送出し `run "$ROWS_REDB"
+# self exact` が必ず失敗する（対照結果が欠落し一括実行全体も非 0 終了する）。
+# `scripts/bench_crossdb_self_hnsw_ab.sh` と同様に値を一度取り出したうえで
+# 変数自体を unset し、self hnsw を呼ぶ直前だけ再エクスポートする。
+HNSW_ARGS_FOR_SELF_HNSW=${CROSSDB_SELF_HNSW_ARGS:-}
+unset CROSSDB_SELF_HNSW_ARGS
+
 # 失敗した DB/構成・コンテナ起動を蓄積し、後片付け後に非 0 で終了する
 # （握りつぶすと結果 JSON が欠けても make bench-crossdb が成功に見え、既存の古い
 # JSON を今回の結果と誤認しうる）。
@@ -77,7 +87,12 @@ run "$ROWS_REDB" self exact
 # `crossdb_plan_probe` example（`cargo build --release -p engine --example
 # crossdb_plan_probe`）のビルドを追加で要求する。未ビルドなら本行は失敗として
 # 記録される（`FAILED` に積まれ非 0 終了。ログは `$LOGS_DIR/self_hnsw.log`）。
+# `CROSSDB_SELF_HNSW_ARGS` は self hnsw の呼び出しにだけ渡す（上記理由）。
+if [ -n "$HNSW_ARGS_FOR_SELF_HNSW" ]; then
+  export CROSSDB_SELF_HNSW_ARGS="$HNSW_ARGS_FOR_SELF_HNSW"
+fi
 run "$ROWS_REDB" self hnsw
+unset CROSSDB_SELF_HNSW_ARGS
 run "$ROWS_JSONL" sqlite_vec exact
 run "$ROWS_JSONL" lancedb exact
 run "$ROWS_JSONL" lancedb hnsw
