@@ -337,3 +337,17 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
 | `mysql_db.py` | MySQL の全フェーズ実装 |
 | `run.py` | CLI エントリポイント（フィクスチャ読み込み → 各 db モジュール呼び出し → recall 計算 → JSON 書き出し） |
 | `containers.sh` | pgvector・Qdrant・MySQL コンテナの起動・停止（`docker rm -f` で毎回冪等に作り直す） |
+
+## 前後比較用ハーネス（Issue #633）
+
+- `hybrid_after_where.py`: `run.py` の全フェーズ実行とは別に、「WHERE クエリを
+  何本か実行してスカラー索引を暖機した後の `hybrid_rrf` レイテンシ・
+  wire-server RSS」だけを単独で計測する最小ハーネス。3 モード
+  （`hybrid`／`warm_where_then_hybrid`／`body_predicate`）は本ファイル冒頭の
+  ドキュメンテーションコメント参照。単体では使わず
+  `scripts/bench_scalar_index_crossdb_ab.sh`（前後比較ドライバ。リポジトリ
+  ルートの Makefile `bench-scalar-index-crossdb-ab` から起動）から呼ぶ想定。
+- 前後比較ドライバは `CROSSDB_SELF_PORT`（既定 15437。`CROSSDB_SELF_PORT_BASE`
+  環境変数で上書き）で `self_db.py` の既定ポート（15432）以外を使う。
+  他ジョブが同時に crossdb_bench を実行していてもポート衝突で計測が
+  止まらないようにするため。
