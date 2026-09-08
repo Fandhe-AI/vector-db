@@ -1,0 +1,8 @@
+timestamp_utc: 20260908T153029Z
+wire_server_sha256: 9c9ebad57b5f0c7967388d9ae38bf6545814dda3af5802df54ff450ff19d8fb7
+crossdb_plan_probe_sha256: d3675f830e3076a436eea6b97ad1680d2c379956f7b6e9fba1d32db5f3c76cb9
+git_rev: 8225baade30e3d821de9c1112e1c5fe1cc0458de
+ab_pairs: 5
+loadavg_before: 0.09 1.18 1.76 1/466 2534257
+fs_type_crossdb_dir: ext4
+hnsw_args: (none)
