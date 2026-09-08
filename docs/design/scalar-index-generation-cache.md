@@ -181,6 +181,129 @@ SCALAR 事前フィルタ・集計 `WHERE`・`GROUP BY` キー列挙という異
 ### スコープ外・申し送り
 
 crossdb fixture 相当での hybrid p50 の前後比較実測（Issue #632 本文の受け入れ
-条件）は次 Issue へ申し送る。閾値 `MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`
-（128）の最終値は本リポジトリの実装既定値であり、前後比較実測 Issue の結果
-次第で再検討され得る。
+条件）は次 Issue（#633）へ申し送った。閾値
+`MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`（128）の最終値は本リポジトリの実装
+既定値であり、前後比較実測 Issue の結果次第で再検討され得る。
+
+## 前後比較実測（Issue #633）
+
+### 計測条件
+
+| arm | commit | 位置づけ | wire-server バイナリ sha256（先頭 12 桁） |
+| --- | --- | --- | --- |
+| before | `773a835` | Issue #638（本節の対策）マージの親（`body` 列も無条件に索引化） | `4b950db35d5c` |
+| after | `6ff22dc` | Issue #638 マージコミット（列単位の平均値長ゲート適用後） | `ba67777ec994` |
+| ref | `ee99db3` | 退行導入（`ScalarIndex` 自体の新設・#473・`875d38d`）より前の基準 | `becfb9f9bb26` |
+
+`git diff --stat 773a835 6ff22dc -- Cargo.lock Cargo.toml scripts/crossdb_bench
+crates/wire-server` は空であり、before/after は同一ハーネス・同一依存・同一
+`wire-server` ソースで、差分は `crates/engine/src/sql/scalar_index.rs`・
+テスト・docs のみ（同一ビルド条件の根拠）。3 arm とも `git archive` で独立
+ソースツリーへ展開し、`CARGO_TARGET_DIR` を分離して個別に `cargo build
+--release -p wire-server` した。ハーネス（`scripts/crossdb_bench/*.py`・
+`scripts/bench_scalar_index_crossdb_ab.sh`）は現行ワークツリー（harness
+commit `6ff22dc8`）のものを全 arm 共通で使用し、`CROSSDB_SELF_BINARY` で
+起動するバイナリのみを差し替えた（Issue #479 の方式）。
+
+- 環境: 共有 QEMU（`QEMU Virtual CPU version 2.5+`・nproc=12・
+  `BENCH_DEDICATED_ENV` 未設定）。`docs/design/benchmark-judgement-policy.md`
+  §5 に従い**参考値・採否根拠にしない**。
+  他 worktree のジョブが並走していた可能性があるため loadavg も生データと
+  ともに記録した。
+- ペア数: 5（交互 before→after→ref の輪番。`docs/design/
+  benchmark-judgement-policy.md` §3）。
+- fixture: `docs25k.redb`／`docs25k.jsonl`／`queries200.jsonl`（25,000 行・
+  dim 128。`docs/design/crossdb-bench.md` と同一）。
+- 対象区間: crossdb self の 4 フェーズ（`hybrid_rrf`・`bulk_hybrid_k200`・
+  `vector_knn_where`・`where_compound_count`）＋参照区間（`vector_knn`・
+  `mode_recall`）は `scripts/crossdb_bench/run.py --db self --config exact`
+  経由。加えて「`WHERE` 実行後の `hybrid_rrf` 単独ループ・RSS」を
+  `scripts/crossdb_bench/hybrid_after_where.py`（Issue #632 切り分け時の
+  scratch スクリプトの tracked 版）で 3 モード（`hybrid`＝ウォームアップ
+  なし対照・`warm_where_then_hybrid`＝`WHERE lang = 'ja'` を 50 本実行して
+  `ScalarIndex` を構築させてから計測〔Issue #632 の再現条件〕・
+  `body_predicate`＝除外候補列 `body` への前方一致 `WHERE body LIKE
+  '<prefix>%'`）計測した。
+- 生データ: `docs/design/bench-data/scalar-index-crossdb-ab/`（tracked）。
+  再現: `make bench-scalar-index-crossdb-ab BEFORE_COMMIT=773a835
+  AFTER_COMMIT=6ff22dc REF_COMMIT=ee99db3 CROSSDB_DIR=<dir>
+  CROSSDB_PYTHON=<python>`。集約: `scripts/bench_scalar_index_crossdb_ab.sh
+  --summarize docs/design/bench-data/scalar-index-crossdb-ab`。
+
+### 結果（min-of-5・median 併記。単位 µs）
+
+| 区間 | before min/median | after min/median | after/before（min比） | 判定 | ref min/median | ref/before |
+| --- | --- | --- | --- | --- | --- | --- |
+| `hybrid_rrf`.p50 | 6995 / 7070 | 7036 / 7084 | 1.0057 | 帯内 | 6130 / 6278 | 0.8763（ref が速い） |
+| `bulk_hybrid_k200`.p50 | 9618 / 9652 | 9615 / 9657 | 0.9997 | 帯内 | 9649 / 9871 | 1.0033 |
+| `vector_knn_where`.p50 | 1897 / 1989 | 1959 / 2026 | 1.0328 | 帯内 | 3037 / 3141 | 1.6012（ref が遅い＝#473 以降の高速化分） |
+| `where_compound_count`.p50 | 1025 / 1046 | 1018 / 1025 | 0.9936 | 帯内 | 4344 / 4369 | 4.2405（同上） |
+| 参照: `vector_knn`.p50 | 671 / 690 | 655 / 737 | 0.9767 | 帯内 | 699 / 707 | 1.0426 |
+| 参照: `mode_recall`.p50 | 686 / 706 | 671 / 696 | 0.9780 | 帯内 | 705 / 738 | 1.0267 |
+| hybrid ループ `warm_where_then_hybrid`.p50 | 6851 / 6886 | 6806 / 6849 | 0.9935 | 帯内 | 6210 / 6241 | **0.9065（ref が約 9% 速い）** |
+| hybrid ループ `warm_where_then_hybrid`.rss_after_warm（MiB） | 63.80 / 63.92 | 63.72 / 63.86 | 0.9988 | 帯内 | 56.30 / 56.37 | **0.8825（ref が約 12% 少ない）** |
+| hybrid ループ `body_predicate`.p50 | 106.9 / 107.4 | 106.6 / 107.8 | 0.9976 | 帯内 | 1735 / 1754 | 16.24（ref が大幅に遅い＝索引自体が無い） |
+
+完全な区間別 TSV（p95・RSS 全 3 時点を含む）は上記コマンドの出力
+（`docs/design/bench-data/scalar-index-crossdb-ab/` の生データから再計算
+可能）。
+
+### 判定: `hybrid_rrf` 退行は本 fixture では解消されていない
+
+**受け入れ条件 1〜2（`hybrid_rrf` 退行の解消・ee99db3 水準への回復）は
+未達成**と判断する。before→after で `hybrid_rrf`・`warm_where_then_hybrid`
+とも ratio が 0.99〜1.01（固定 ±5% 帯内）にとどまり、ref（ee99db3）との
+比較でも before・after いずれも ref よりなお約 9〜13% 遅い・RSS も約 12〜
+13% 多いままで、before/after 間にほとんど差が無い。
+
+原因は `docs25k.jsonl` の `body` 列の実測平均バイト長（tenant-a 可視行
+23,000 件で **126.3 バイト**）が `MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`
+（**128 バイト**）を約 1.7 バイト下回ることにある。`ScalarIndex::build`
+（`crates/engine/src/sql/scalar_index.rs`）の除外判定は行単位の**累積**
+平均（`prospective_bytes > prospective_count * 128`）であり、コーパス全体
+の平均が閾値未満である以上、走査のどの時点でも累積平均が閾値を超えず
+`body` 列は除外されない——つまり **Issue #632／#638 の対策は、本 issue が
+問題を発見した crossdb fixture そのものに対しては no-op**である。
+`warm_where_then_hybrid.rss_after_warm` が before/after でほぼ同じ
+（63.80 → 63.72 MiB）であることが、除外が発火していないことの直接証跡
+になっている（除外が発火していれば Issue #632 の手動実験と同様に約 56MiB
+まで下がるはずだった）。
+
+一方で `body_predicate`（`body` への前方一致述語）は before・after とも
+高速（約 107µs。ref は 1735µs）だが、これは索引による除外の効果ではなく、
+before の時点で既に `ScalarIndex` が `body` を索引化しているため（除外が
+発火していないのだから当然）——「除外列が plain scan へ縮退する」という
+受け入れ条件 3 の効果は、本実測では**観測できていない**（`body` が索引
+対象から一度も外れていないため）。この経路の実際の縮退影響（除外時の
+p50/p95 低下幅）を確かめるには、平均バイト長が確実に 128 を超える
+（例: 200 バイト超）`body` 列を持つ fixture での再測定が必要。
+
+### 閾値 `MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`（128）の再検討要否
+
+**本実測は現行閾値 128 を支持しない。** 本 issue の発端となった crossdb
+fixture 自体が閾値のわずか下（126.3 バイト）にあり、実装が意図した「長文
+`body` 列の除外」が対象 fixture に対して発火しない。以下のいずれかの
+対応が必要と考えられる（採否はオーナー判断）:
+
+- 閾値を crossdb fixture の `body` 実測平均（126.3 バイト）を下回る値
+  （例: 96〜100 バイト）へ引き下げる。
+- 平均バイト長ではなく他の基準（総バイト量・最大値長・列のカーディナリ
+  ティ等）で除外判定する設計へ変更する。
+- 閾値はそのまま維持し、`docs25k.jsonl` 側の `body` 生成方式を見直して
+  クロス DB ベンチの母集団を意図的に長文化する。
+
+いずれも本 Issue のスコープ外（`crates/engine/src/` は本 Issue で無変更）
+とし、判断材料としてこの節を残す。
+
+### 限界・申し送り
+
+- 共有 QEMU 環境の参考値であり、専有環境での再実測はオーナー作業として
+  申し送る（`docs/design/benchmark-judgement-policy.md` §9 と同方針）。
+- `ref`（ee99db3）は `Statement::Scan`（Issue #454・#562）以前のコミットの
+  ため `scan_where_nosort_k500` フェーズは `unsupported` として記録される
+  （ハーネスの許可リスト拒否検知により fail-closed に処理済み。失敗では
+  ない）。
+- `hybrid-rrf-latency-breakdown.md` 側の対応する記述の訂正・整合は
+  Issue #637 の担当とする（本 doc では触れない）。
+- 閾値再検討（上記）は本 Issue の受け入れ条件外のため、判断のみ記録し
+  実装は行わない。実装を伴う対応はユーザー承認のうえ別 Issue で扱う。
