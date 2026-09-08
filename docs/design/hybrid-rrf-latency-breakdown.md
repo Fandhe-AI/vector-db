@@ -1688,3 +1688,220 @@ Issue #546・#549 を通しで前後比較した `feature_bench`・`bench-hybrid
 crossdb self・Recall 3 ゲートの結果は `docs/design/
 hybrid-rrf-phase6-before-after.md` に記録した（数値は同 doc 参照。本節では
 転記しない）。production コード無変更・doc 専任。
+
+## Issue #660: SQL 表層固定コスト（B1-B4）の S0〜S8 再分解
+
+親 Issue #652・ルート #649。Issue #465 の帰属表が持つ `sql_surface(B1-B4)`
+区分（B1: SQL hybrid `SELECT id`、B4: `hybrid_search` 直接呼び出し）を、より
+細かい構成要素へ再分解した。
+
+### 背景
+
+crossdb 横断ベンチ（`docs/design/crossdb-bench.md`）では `hybrid_rrf` が self
+（pgvector 比で劣後）の最大要因の一つであり、`bench-hybrid-profile`（B0s〜B8）
+の帰属表では `sql_surface(B1-B4)` が全体の 37〜40% と、疎側 `sparse(B5)` と
+ほぼ同水準の最大区分だった。しかし従来のベンチは `sql_surface` を単一区分
+としてしか持たず、内部（パース・束縛・各キャッシュ照会・SCALAR 段の行ループ・
+投影組み立て）のどこが支配的かは未確定だった。
+
+コード調査で判明した事実: `sql/exec.rs` の hybrid `Ranking::Hybrid` 分岐は
+`cache_fast_path_eligible = filters_empty && !is_hybrid`（hybrid は常に対象外）
+のため、疎索引キャッシュ（`SparseIndexCache`。Issue #357）がヒットしていても
+可視全行について `VectorArena::build_from_cached_rls_rows` の行ループ
+（`push_visible_row` の id・vector・tenant_id 文字列複製、`on_visible_row` の
+`row_codec::scan_scalar_columns` 構造検証、投影列の積み上げ）を再実行する。
+
+### 追加した段（`hybrid_profile_bench.rs`・`harness/hybrid_profile.rs`）
+
+| 段 | 内容 | 性質 |
+| --- | --- | --- |
+| S0 `dense_topk_ref` | `ParallelSearchProvider.search(k=TOP_K)`（B3 の減算対象。B0 は k=dense_fetch_k のため k を揃えた別対照が必要） | 実 API |
+| S1 `parse` | `validate_sql`（双子 DB。同一スキーマ・0 行の別 `Storage`） | 実 API |
+| S2 `schema` | `Storage::get_table_schema`（双子 DB） | 実 API |
+| S3 `bind` | `bind_in_session`（計測区間外で構築済み `ValidatedStatement` を使い、束縛のみ計る） | 実 API |
+| S1d `parse_dense` | S1 と同じ双子 DB・round-robin 規則で、文だけを dense SQL（B3 と同一文）へ差し替えたパース | 実 API |
+| S3d `bind_dense` | S3 と同じ規則で dense SQL（B3 と同一文）の束縛を計る | 実 API |
+| S4 `scan_replica` | `on_visible_row` の構造検証部（`row_codec::scan_scalar_columns` を可視全行分）の複製 | 複製近似 |
+| S5 `rowcopy_replica` | `push_visible_row`（id・vector・tenant_id 文字列複製・可視性フラグ）＋投影スロット積み上げの複製 | 複製近似（下限） |
+| S6 `slotmap_replica` | `slot_ids`／`visible_id_counts`（`HashMap`）の毎クエリ O(N) 再構築の複製 | 複製近似 |
+| S7 `bodyclone_replica` | `SELECT *` 投影が行う本文列複製（既存 `projection(B2-B1)` の実体）の複製 | 複製近似 |
+| S8 `tail` | `RlsSafetyNet::apply`（Top-k のみ）＋ id 投影（`project_id_only_rows`。後述「S8 の id 投影追記」参照） | 実 API |
+
+S1〜S3・S1d・S3d は行数に依存しないパース・束縛コストを、可視全行を持つ計測用
+DB ではなく同一スキーマ・0 行の「双子 DB」で計測する。move 前に実 DB で 1 回
+だけ束縛して得た `BoundStatement`（`PartialEq` 導出済み）と、双子 DB での束縛
+結果が構造的に一致することを fail-closed に検証してから使う。
+
+**S1d・S3d を追加した理由（codex-review 指摘・スレッド
+`PRRT_kwDOUAKASM6gV23s`・Issue #660 追記）**: `common_fixed(B3-S0)` は dense
+SQL（`sql_dense_statement_with_projection` で組み立てた B3 と同一文）の
+round trip から dense-topk 対照区間（S0）を引いた値であり、内訳は dense SQL
+自身のパース・束縛を含む。当初実装はここから引く `unexplained_common` の
+減算対象に S1・S3（hybrid SQL のパース・束縛）を流用していたため、hybrid
+固有の構文（`hybrid_rrf(...)`）・列解決コストの分だけ `unexplained_common`
+（本来は arena／sparse／scalar キャッシュ照会等の未計測 `pub(crate)` 内部
+処理の上限であるべき区分）へ混入していた。S1d・S3d（dense SQL・B3 と同一文
+でのパース・束縛）を新設して `unexplained_common` の減算対象を dense 側へ
+揃え、hybrid と dense のパース・束縛差は独立区分 `parse_bind_hybrid_delta`
+として切り出す（後述）。
+
+**S8 の id 投影追記（codex-review P2 指摘・PR #668・スレッド
+`PRRT_kwDOUAKASM6gWEdt`）**: 当初実装の S8 は `RlsSafetyNet::apply` の後に
+`verified.hits().len()` を返すだけで、production `project_rows`（`sql/exec.rs`）
+が行うスロット番号→行 `id` の解決・`ResultRow`／`Cell` の構築が計測対象に
+含まれておらず、そのコストが `unexplained_common` の残差へ混入していた。
+`sql/exec.rs` に非既定 feature `bench-internals` 限定の
+`project_id_only_rows`（`project_rows` の `ProjectedColumn::Id` 分岐を単体で
+再現する関数。スカラー列投影・`Computed` 列は本ベンチの SQL が `SELECT id`
+固定のため対象外）を追加し、S8 が `RlsSafetyNet::apply` に加えてこの投影
+処理まで測定するよう変更した。`RlsSafetyNet::apply` の `label_of` 閉包も、
+定数を返すだけの簡略版から `issue660_s8_arena`（`storage` から一度だけ
+構築した実 `VectorArena`）の `tenant_id`／`visibility` を引く production 相当の
+閉包へ差し替えた。`hybrid_search` が返す hit の `id` は実際の行 `id`（アリーナの
+スロット番号ではない）であるため、計測区間の外で 1 回だけ id→スロット写像を
+作り、hits をスロット番号へ変換してから測定ラウンドへ渡している。
+
+### 複製近似の限界
+
+S4〜S7 は `on_visible_row`／`push_visible_row` の該当ロジックを手動転記した
+近似であり、production 経路が追加で行う予算検証（`try_accumulate_budget`）・
+`debug_assert!`・`Vec` の成長パターン差（`try_reserve_exact` と `Vec::push` の
+償却確保の違い）は複製しない。そのため実測値は production コストの**下限**
+として読み、production との差は `unexplained_hybrid`（後述）として上限
+（ceiling）のみ報告する。
+
+### 差分区分（min-of-R 基準・飽和差分）
+
+| 区分 | 式 | 意味 |
+| --- | --- | --- |
+| `common_fixed` | `B3 - S0` | 全 SELECT 共通の SQL 表層固定コスト（パース・束縛・スキーマ・arena 照会・投影組み立て等。dense SQL 基準） |
+| `hybrid_only` | `(B1 - B4) - common_fixed` | hybrid 限定の上乗せ（SCALAR 段の全行再構築＋疎／scalar キャッシュ照会＋hybrid 固有のパース・束縛差） |
+| `parse_bind` | `S1 + S2 + S3` | hybrid SQL のパース・束縛・スキーマ取得（informational。`unexplained_common` の減算には使わない） |
+| `parse_bind_dense` | `S1d + S2 + S3d` | dense SQL（B3 と同一文）のパース・束縛・スキーマ取得。`unexplained_common` の減算対象 |
+| `parse_bind_hybrid_delta` | `parse_bind - parse_bind_dense` | hybrid SQL が dense SQL 比で余分に負う構文・列解決コスト（`hybrid_only` の内訳の一部として読む informational 区分。`hybrid_only` の式自体は変更しない） |
+| `scalar_stage_replica` | `S4 + S5` | 全行再構築コストの複製下限（`hybrid_only` の上限と対にして挟む） |
+| `unexplained_common` | `common_fixed - (S1d+S2+S3d+S6+S8)` | arena／sparse／scalar キャッシュ照会・`begin_read`・結果組み立て等、直接計測できない `pub(crate)` 内部処理の合計（上限。dense SQL のパース・束縛〔S1d・S3d〕は実測済みのため差し引く） |
+| `unexplained_hybrid` | `hybrid_only - scalar_stage_replica` | 疎／scalar キャッシュ照会・予算検証・hybrid 固有パース束縛差等、複製で表せない残差（上限。`parse_bind_hybrid_delta` を含む） |
+| `projection_replica(S7)` | `S7` そのもの | 既存 `projection(B2-B1)` の実体（本文列複製）の複製近似 |
+
+**解釈規則**: 行ループ（SCALAR 段の全行再構築）のコストは `hybrid_only` を
+上限、`scalar_stage_replica(S4+S5)` を下限とする区間で挟んで読む。両者の差
+`unexplained_hybrid` は sparse／scalar キャッシュ照会＋予算検証コストの上限
+（ceiling）であり、それ以上の意味付け（個別照会ごとの値）は行わない。
+
+**キャッシュ照会（arena／sparse／scalar）の直接計測不可について**:
+`SparseIndexCache::lookup`・`SqlArenaCache::lookup`・`ScalarIndexCache::lookup`
+はいずれも `pub(crate)` のため、production コード無変更（A5）を優先し
+本ベンチから直接呼べない。代わりに `EngineCore::{sparse_index_cache_stats,
+sql_arena_cache_stats, scalar_index_cache_stats, hnsw_index_cache_stats}`
+（いずれも公開 observability API）の hit カウンタを、各ラウンドの B1
+`run(...)` 呼び出し **直前・直後** でのみ採取して増分をラウンド間で合算する
+（B0s〜B3・B5・B7・B8 等、B1 以外の計測が挟まる区間を含めて前後比較すると
+それらの照会増分も混入し B1 単独の命中を証明できないため。codex-review
+指摘・Issue #660 追記）。B1 は 1 回の `execute_sql` ごとに sql_arena・
+sparse をそれぞれ高々 1 回照会するため、cache-hot 経路が成立していれば
+合算増分は B1 の総実行回数（`rounds × (warmup_iterations + measured_
+iterations)`）と厳密に一致するはずであり、`cache_stats_delta` 行の
+`before`／`after` にはこの合算増分そのもの（`before=0`・`after=<合算増分>`）
+を渡し、`expected_min` には上記の総実行回数を渡して `nonvacuous` を
+「合算増分 == 総実行回数」の厳密一致で判定する（fail-closed。厳密一致に
+満たない場合は打ち切る）。既定エンジン（`SearchEngineKind::Hnsw` を使わない
+構築）では `hnsw_index_cache_stats` の hits 増分は構造的に 0 のはずであり、
+0 以外なら fail-closed で打ち切る。`scalar_index_hits` は本クエリ形状では
+照会経路自体が対象外のため、増分の値のみを informational として報告する
+（`nonvacuous` は常に `true`）。
+
+### 計測条件・実測方法
+
+`make bench-hybrid-profile`（`BENCH_HYBRID_PROFILE_ROUNDS` で交互ラウンド数を
+指定・既定 5）。段別内訳は既存 B0s〜B8 のラウンドループの直後に独立した
+S0〜S8 のラウンドループとして実行し（既存出力行はバイト同一のまま無変更）、
+新規出力行は `sql_surface_breakdown_raw`／`_summary`／`_bucket`・
+`cache_stats_delta` 接頭辞で識別できる（`scripts/bench_hybrid_profile_ab.sh
+--summarize` の grep パターンへ追加済み）。共有 QEMU 環境（本開発環境）での
+実測はいずれも参考値であり、`docs/design/benchmark-judgement-policy.md` の
+専有環境実測（`BENCH_DEDICATED_ENV=1`）と交互 N≥5 判定はオーナー／運用者
+作業として申し送る（`bench-hybrid-profile` 全体の既存運用と同方針）。
+
+### スモークテスト実測（本開発環境・共有 QEMU・rows=500・rounds=5・参考値）
+
+`BENCH_HYBRID_PROFILE_ROWS=500 BENCH_HYBRID_PROFILE_ROUNDS=5` での 1 回実行例
+（行数を縮小した動作確認用の値であり、25,000 行既定の実測値ではない。段の
+相対的な内訳の傾向を確認する目的のみに使う）。
+
+S8 の id 投影追記（PR #668）後の再実行例:
+
+```
+hybrid_profile: sql_surface_breakdown_summary stage=S0_dense_topk_ref min=28us median=28us
+hybrid_profile: sql_surface_breakdown_summary stage=S1_parse min=3us median=3us
+hybrid_profile: sql_surface_breakdown_summary stage=S2_schema min=0us median=0us
+hybrid_profile: sql_surface_breakdown_summary stage=S3_bind min=2us median=2us
+hybrid_profile: sql_surface_breakdown_summary stage=S1d_parse_dense min=3us median=3us
+hybrid_profile: sql_surface_breakdown_summary stage=S3d_bind_dense min=2us median=2us
+hybrid_profile: sql_surface_breakdown_summary stage=S4_scan_replica min=10us median=10us
+hybrid_profile: sql_surface_breakdown_summary stage=S5_rowcopy_replica min=12us median=12us
+hybrid_profile: sql_surface_breakdown_summary stage=S6_slotmap_replica min=3us median=3us
+hybrid_profile: sql_surface_breakdown_summary stage=S7_bodyclone_replica min=16us median=16us
+hybrid_profile: sql_surface_breakdown_summary stage=S8_tail min=0us median=0us
+hybrid_profile: sql_surface_breakdown_bucket label=common_fixed(B3-S0) diff=22us ratio_of_b1=12.57%
+hybrid_profile: sql_surface_breakdown_bucket label=hybrid_only((B1-B4)-common_fixed) diff=44us ratio_of_b1=25.14%
+hybrid_profile: sql_surface_breakdown_bucket label=parse_bind(S1+S2+S3) diff=6us ratio_of_b1=3.43%
+hybrid_profile: sql_surface_breakdown_bucket label=parse_bind_dense(S1d+S2+S3d) diff=6us ratio_of_b1=3.43%
+hybrid_profile: sql_surface_breakdown_bucket label=parse_bind_hybrid_delta(parse_bind-parse_bind_dense) diff=0us ratio_of_b1=0.00%
+hybrid_profile: sql_surface_breakdown_bucket label=scalar_stage_replica(S4+S5) diff=22us ratio_of_b1=12.57%
+hybrid_profile: sql_surface_breakdown_bucket label=unexplained_common(common_fixed-(S1d+S2+S3d+S6+S8)) diff=12us ratio_of_b1=6.86%
+hybrid_profile: sql_surface_breakdown_bucket label=unexplained_hybrid(hybrid_only-scalar_stage_replica) diff=21us ratio_of_b1=12.00%
+hybrid_profile: sql_surface_breakdown_bucket label=projection_replica(S7) diff=16us ratio_of_b1=9.14%
+hybrid_profile: cache_stats_delta name=sql_arena_hits before=0 after=250 delta=250 expected_min=250 nonvacuous=true
+hybrid_profile: cache_stats_delta name=sparse_index_hits before=0 after=250 delta=250 expected_min=250 nonvacuous=true
+hybrid_profile: cache_stats_delta name=scalar_index_hits before=0 after=0 delta=0 expected_min=0 nonvacuous=true
+hybrid_profile: cache_stats_delta name=hnsw_index_hits before=0 after=0 delta=0 expected_min=0 nonvacuous=true
+```
+
+`rows=500` のスモーク規模では Top-`TOP_K` 件の id 投影（`Cell::Integer` 構築
+1 件のみ）自体が µs 未満のため `S8_tail` の見かけの値は追記前後で変わらない
+（`min=0us`）。追記の意図は S8 の**測定対象の正しさ**（id 投影処理を含む
+かどうか）であり、本スモーク規模でのマイクロ秒単位の変化を確認するもの
+ではない。25,000 行既定規模での前後比較は未実施（本追記は測定対象の修正が
+目的で、性能上の採否判断は伴わない）。
+
+この規模（500 行）では `scalar_stage_replica(S4+S5)`（下限、約 14%）と
+`hybrid_only`（上限、約 25%）の両方が `hybrid_only ≥ scalar_stage_replica`
+という設計上の期待どおりの順序を保っており、逆転（`n/a`）は発生していない。
+`parse_bind_hybrid_delta`（hybrid SQL のパース・束縛 − dense SQL〔B3 と同一
+文〕のパース・束縛）は本実測では `diff=0us` で、この規模・この 1 回実測では
+hybrid 固有の構文・列解決コストが `unexplained_common`／`unexplained_hybrid`
+の値へ有意な影響を与えていないことを示す（`parse_bind` と `parse_bind_dense`
+がともに 6us で一致）。`cache_stats_delta` の `before`／`after` は各ラウンドの
+B1 `run(...)` 呼び出し直前・直後でのみ採取した増分の合算値（本例では
+warmup 20・measured 30 × rounds 5 = 250）であり、`sql_arena_hits`／
+`sparse_index_hits` とも `expected_min`（B1 の総実行回数）と厳密一致
+（`nonvacuous=true`）することで B1 単独の cache-hot 経路が成立していることを
+裏付ける。`hnsw_index_hits` は既定エンジンのため期待どおり 0 のまま。
+25,000 行既定規模での実測値・専有環境実測はオーナー／運用者作業として
+申し送る。
+
+### 改善候補（優先度付き起票案。実装は本 Issue の対象外・ユーザー承認後に別 Issue）
+
+| 優先度 | 候補 | seam | 期待効果（仮説） | リスク・維持すべき契約 |
+| --- | --- | --- | --- | --- |
+| P1 | hybrid でも疎キャッシュヒット時（`skip_sparse_accumulation && needed_column_indices.is_empty()`）は `cache_fast_path_eligible` 相当の高速経路を通し、`build_from_cached_rls_rows` の全行再構築を省略する | `sql/exec.rs` `cache_fast_path_eligible` 判定 | `hybrid_only` 区分（本スモークテストの規模では B1 の約 26%）の大半 | 単一スナップショット契約・`RlsSafetyNet` 不変・`SqlArenaSnapshot` 借用時のスロット添字契約 |
+| P2 | hybrid の投影列（`SELECT *`・`body`）にも `defer_projection` を適用する（疎キャッシュヒット時は本文複製が不要） | `sql/exec.rs` `defer_projection` 判定・`ScalarSource::Deferred` | `projection(B2-B1)`（既存区分。`projection_replica(S7)` 実測値ぶん） | 疎キャッシュミス時は従来経路へ戻す fail-closed 分岐が必要 |
+| P3 | `slot_ids`／`visible_id_counts` の毎クエリ O(N) 確保を削減する（スナップショットに同梱、または恒等写像時の省略） | `sql/exec.rs` の slot map 構築箇所・`core::visible_id_counts` | S6 実測値ぶん | `provider_result_is_valid` の検証契約を維持する必要 |
+| P4 | パース・束縛のセッション内キャッシュ | Issue #360 で 5% ゲート評価済み | S1〜S3 実測値ぶん | 再提案ではなく Issue #360 の結論へのリンクに留め、S1〜S3 が閾値を超える場合のみ再検討を提案 |
+
+いずれも production コード（`crates/engine/src/`）を変更する前にユーザー承認
+が必要（実装は本 Issue の対象外・テスト専任）。
+
+### スコープ外・申し送り
+
+- 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測・25,000 行既定規模での確定
+  実測値の記録はオーナー／運用者作業
+- wire 側（`bench-hybrid-wire-profile` の `T2−T1p`）の内訳分解は本 Issue の
+  対象外（本 Issue の対象は engine 内 `B1−B4` 区分）
+- `bench-internals` フックによる `SqlArenaCache`／`SparseIndexCache` の直接
+  計測は production 無変更の受入基準に反するため見送り。必要なら後続 Issue
+  として起票する
+- 改善候補 P1〜P4 の実装は本 Issue では行わない
+- production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
+  無変更・テスト・ベンチ・docs 専任
