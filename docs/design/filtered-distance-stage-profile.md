@@ -69,7 +69,7 @@ SQL 表層固定コスト（4 区分目）は `e2e(index) − (I1 + I2b + I3)` �
 
 ### 計測規約（`benchmark-judgement-policy.md` への対応）
 
-- 既存 A/W 系列（ラウンド輪番）に加え、index/plain 各アーム・I1〜I3 も `harness::protocol::run`（warmup 20・計測 20）を A/W 系列と同じ `for round in 0..rounds` ループの内側で毎ラウンド呼び出し、per-round 生データ（round[N] 行）・min-of-R／median-of-R を出力する（PR #663 codex-review 指摘。初版はこのブロックがラウンドループの外側にあり 1 回しか計測されず、per-round 生データ・min-of-R が欠落していた。以下「実測結果」は修正後の計測による）。
+- 既存 A/W 系列・`R_dot`（ラウンド輪番の `for round in 0..rounds` ループ）が全ラウンド完了した後、index/plain 各アーム・I1〜I3 は別の `for round in 0..rounds` ループとして続けて実行される。A/W 系列と同一プロトコル（`harness::protocol::run`〔warmup 20・計測 20〕をラウンドごとに独立して呼び出し、ラウンド横断で min-of-R／median-of-R・per-round 生データを得る）へ揃えてはいるが、ラウンドのループ自体は A/W 系列とは別個であり、両ループが 1 つの `for` の内側で同時に輪番実行されるわけではない（PR #663 codex-review 指摘。初版はこのブロックがラウンドループの外側にあり 1 回しか計測されず、per-round 生データ・min-of-R が欠落していた。以下「実測結果」は修正後の計測による）。
 - `R_dot`（変更を含まない参照区間）の複数ラウンド中央値から実測ノイズ帯（`reference_band`）を算出し、固定 ±5% 帯と併記する。
 
 ## 実測結果（25,000 行・`1/3`・共有 QEMU 環境）
