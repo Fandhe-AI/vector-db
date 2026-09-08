@@ -1045,6 +1045,10 @@ pub struct ScalarIndexCacheStats {
     /// Issue #474: `sql::exec` が索引経路（`ScalarIndex::resolve_candidates`
     /// の `CandidateResolution::Use`）を実際に消費してクエリを実行した回数。
     pub index_scans: u64,
+    /// Issue #654: `index_scans` のうち、候補行を `VectorArena` へ複製せず
+    /// キャッシュ済みスナップショットの `VectorArena` を借用したまま
+    /// スロットマスクで直接探索できた回数（`index_scans` の部分集合）。
+    pub index_mask_scans: u64,
     /// Issue #474: `sql::exec` が索引対応述語を持つクエリで全走査へ縮退した
     /// 回数（`FallbackNoIndex`／`FallbackSelectivity`／同一性ガード不一致
     /// いずれも含む）。
@@ -1126,6 +1130,7 @@ pub(crate) struct ScalarIndexCache {
     builds: AtomicU64,
     build_failures: AtomicU64,
     index_scans: AtomicU64,
+    index_mask_scans: AtomicU64,
     plain_scan_fallbacks: AtomicU64,
     aggregate_index_scans: AtomicU64,
     aggregate_plain_scan_fallbacks: AtomicU64,
@@ -1143,6 +1148,7 @@ impl ScalarIndexCache {
             builds: AtomicU64::new(0),
             build_failures: AtomicU64::new(0),
             index_scans: AtomicU64::new(0),
+            index_mask_scans: AtomicU64::new(0),
             plain_scan_fallbacks: AtomicU64::new(0),
             aggregate_index_scans: AtomicU64::new(0),
             aggregate_plain_scan_fallbacks: AtomicU64::new(0),
@@ -1309,6 +1315,7 @@ impl ScalarIndexCache {
             build_failures: self.build_failures.load(Ordering::Relaxed),
             entries,
             index_scans: self.index_scans.load(Ordering::Relaxed),
+            index_mask_scans: self.index_mask_scans.load(Ordering::Relaxed),
             plain_scan_fallbacks: self.plain_scan_fallbacks.load(Ordering::Relaxed),
             aggregate_index_scans: self.aggregate_index_scans.load(Ordering::Relaxed),
             aggregate_plain_scan_fallbacks: self
@@ -1328,6 +1335,14 @@ impl ScalarIndexCache {
     /// 実際に消費してクエリを実行したことを観測用統計へ計上する。
     pub(crate) fn record_index_scan(&self) {
         self.index_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #654: `sql::exec` が候補削減を「絞る」だけに使い、`VectorArena`
+    /// への複製（`build_from_cached_rls_rows_subset`）を経ずキャッシュ済み
+    /// スナップショットの `VectorArena` を借用したままスロットマスクで直接
+    /// 探索できたことを観測用統計へ計上する（`index_scans` の部分集合）。
+    pub(crate) fn record_index_mask_scan(&self) {
+        self.index_mask_scans.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Issue #474: `sql::exec` が索引対応述語を持つクエリで全走査へ縮退した
