@@ -867,8 +867,13 @@ self（`ingest_single_stmt`・rows/s）を ext4 上で ee99db3（before）・HEA
 | tmpfs・after（HEAD） | 7,714 | 7,414 | — | 7,414 | — |
 
 ext4 上の before/after は差がなく（1,993〜2,080 rows/s の狭い帯に収まる）、
-`ingest_single_stmt` の低下は退行ではなく fixture の FS 条件差であると判断できる。
-tmpfs では同一バイナリ（HEAD）が 3.7〜3.8 倍のスループットを示した。
+tmpfs では同一バイナリ（HEAD）が 3.7〜3.8 倍のスループットを示した。この対照は N<5・
+参照区間のノイズ帯未算出であり `benchmark-judgement-policy.md` §3〜4 の非退行判定基準を
+満たさないため、`ingest_single_stmt` の低下を退行ではないと断定する根拠にはできない。
+初回計測（`docs/design/crossdb-bench.md` 初版時点）で FS 条件が記録されておらず、
+before 側の FS も未確認であることを踏まえ、本節の対照は「低下は fixture の FS 条件差に
+よる可能性が高い」という仮説を支持する参考値にとどめ、退行の有無そのものの判定は
+改めて 5 ペア以上・同一 FS 条件での再計測が必要と申し送る。
 
 ### 初回計測との差分所見
 
