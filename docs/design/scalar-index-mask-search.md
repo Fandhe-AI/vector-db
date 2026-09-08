@@ -148,7 +148,6 @@ Issue #474 の既存契約）。したがって `!is_hybrid` を満たす限り�
   search_subset_or_fallback` は per-query の索引・オーバーレイ解決を行う別経路
   であり、Phase 2 として別 Issue へ申し送る
 - **集計・`GROUP BY` 経路**（Issue #475 で別途結線済み）
-- **前後比較実測**（Issue #655 の担当）
 
 ## テスト設計
 
@@ -292,21 +291,28 @@ min-of-N は `vector_knn_where` で約 32%・`bulk_knn_where_k200` で約 28% �
 45.31%）が Track A（40.07%）よりさらに広く、共有環境の負荷変動（loadavg
 1.66〜2.77・並行 Issue 実行由来）により両ノイズ帯判定では `within_band`
 （regressed/improved を断定しない）に留まった。**min-of-N の改善方向自体は
-Track A の段別内訳（`I2b_candidate_mask_build` が `I2b_candidate_arena_copy`
-比で約 4.3 倍高速）と整合しており、e2e レベルでの改善の存在を否定するもので
+Track A の段別内訳（`docs/design/filtered-distance-stage-profile.md`
+〔Issue #653〕の in-binary 対照値 `I2b_candidate_arena_copy` 605.1µs vs
+`I2b_candidate_mask_build` 137.5µs——本 Issue の Track A after-only 実測
+140.0µs も同水準）と整合しており、e2e レベルでの改善の存在を否定するもので
 はない**——参照帯が広いのは計測環境のノイズによるものであり、専有環境での
 再実測を待って確定判定とすべきである。非対象フェーズ（`hybrid_rrf`・
 `bulk_hybrid_k200`・`where_compound_count`）・参照区間（`vector_knn`・
-`agg_count`・`mode_recall`）はいずれも `within_band` で非退行を確認した。
+`agg_count`・`mode_recall`）に加え、hybrid ループ 3 モード（`hybrid`・
+`warm_where_then_hybrid`・`body_predicate`。#654 の対象外区間）もいずれも
+`within_band` で非退行を確認した。
 
 ### Qdrant との差
 
 `docs/design/crossdb-bench.md` の既存実測表と対比する（本 Issue では Qdrant
-自体の再計測は行っていない）。
+自体の再計測は行っていない）。同 doc の自己申告どおり、いずれの表も
+**共有 VM（loadavg 約 2 前後）での単発実測であり専有環境での再測定は未実施**
+——本 Issue も含め、現時点で self・Qdrant を専有環境で比較した実測値は存在
+しない。
 
-- 専有環境表（同 doc「横断ベンチ実測（25,000 行・dim 128・k=10）」節）:
-  self `vector_knn_where` 2819µs（p50）に対し Qdrant exact 732µs・Qdrant HNSW
-  615µs。
+- 初回実測表（同 doc「横断ベンチ実測（25,000 行・dim 128・k=10）」節。共有
+  VM・単発実測）: self `vector_knn_where` 2819µs（p50）に対し Qdrant exact
+  732µs・Qdrant HNSW 615µs。
 - 2026-09-08 共有環境再計測（同 doc「2026-09-08 再計測」節）: self
   `vector_knn_where` 1953µs（p50）に対し Qdrant exact 657µs・Qdrant HNSW
   675µs。self `bulk_knn_where_k200` 3287µs に対し pgvector HNSW 2500µs。
