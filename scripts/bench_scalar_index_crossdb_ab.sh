@@ -18,6 +18,14 @@
 # 現行ワークツリーのものを全 arm で共通使用し、`CROSSDB_SELF_BINARY` で
 # 起動するバイナリのみ差し替える（Issue #479 の方式）。
 #
+# 3 arm（before/after/ref）比較時の輪番は `benchmark-judgement-policy.md`
+# §3「baseline/cand1/baseline/cand2/… の輪番」に従い、1 ペアあたり
+# before→after→before_ref→ref の順で実行する（`before_ref` は `before` と
+# 同一バイナリだが ref 専用の baseline として別ラベルで記録し、ref との
+# 比較が after 計測ぶん時間的に隔たった before を参照しないようにする。
+# codex-review P1 指摘・Issue #633）。REF_COMMIT を無効化した場合は
+# before→after のみの通常の 2 arm 交互実行になる。
+#
 # production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
 # 一切変更しない（本スクリプト自体・生成物はテスト・ベンチ専任）。
 #
@@ -176,12 +184,30 @@ ENV_FILE="${OUT_DIR}/${TS}-env.txt"
   echo "note=shared QEMU environment; treat as reference-only, not a pass/fail basis (docs/design/benchmark-judgement-policy.md §5)"
 } > "${ENV_FILE}"
 
-ARMS=(before after)
-[ -n "${REF_COMMIT}" ] && ARMS+=(ref)
+# 候補（before と比較する対象）の一覧と、候補ごとの直近 baseline arm 名
+# （`benchmark-judgement-policy.md` §3「baseline/cand1/baseline/cand2/…
+# の輪番」codex-review P1 指摘）。3 arm 目（ref）を比較に混ぜる際、
+# before→after→ref の順で before を 1 回しか取らないと ref との比較が
+# after 計測ぶん時間的に隔たった before を参照することになり、交互実行が
+# 前提とする時間方向の対称性が崩れる。そのため候補ごとに専用の baseline
+# 計測（before は after 用、before_ref は ref 用）を用意し、実行順は
+# 1 ペアあたり before→after→before_ref→ref（baseline/cand1/baseline/cand2）
+# とする。`before_ref` は `before` と同一バイナリ（`BEFORE_BIN`）を使う
+# 別ラベルの出力（summarize 側で ref 専用の baseline 系列として扱う）。
+CANDIDATES=(after)
+[ -n "${REF_COMMIT}" ] && CANDIDATES+=(ref)
+
+baseline_for_candidate() {
+  case "$1" in
+    after) echo "before" ;;
+    ref) echo "before_ref" ;;
+    *) die "unknown candidate: $1" ;;
+  esac
+}
 
 bin_for_arm() {
   case "$1" in
-    before) echo "${BEFORE_BIN}" ;;
+    before | before_ref) echo "${BEFORE_BIN}" ;;
     after) echo "${AFTER_BIN}" ;;
     ref) echo "${REF_BIN}" ;;
     *) die "unknown arm: $1" ;;
@@ -234,13 +260,24 @@ run_hybrid_after_where() {
       --out "${out_file}"
 }
 
+run_arm_full() {
+  local arm="$1" pair="$2"
+  echo "== pair ${pair} / arm ${arm} ==" >&2
+  run_crossdb_self "${arm}" "${pair}"
+  run_hybrid_after_where "${arm}" "${pair}" hybrid
+  run_hybrid_after_where "${arm}" "${pair}" warm_where_then_hybrid
+  run_hybrid_after_where "${arm}" "${pair}" body_predicate
+}
+
+# baseline/cand1/baseline/cand2/… の輪番（`benchmark-judgement-policy.md`
+# §3。codex-review P1 指摘）。候補ごとに専用の baseline 計測を直前に
+# 挟むことで、各候補が自身専用の baseline と時間的に隣接した対で比較
+# される（REF_COMMIT 無効時は before→after のみで実質 2 arm の交互実行）。
 for pair in $(seq 1 "${AB_PAIRS}"); do
-  for arm in "${ARMS[@]}"; do
-    echo "== pair ${pair} / arm ${arm} ==" >&2
-    run_crossdb_self "${arm}" "${pair}"
-    run_hybrid_after_where "${arm}" "${pair}" hybrid
-    run_hybrid_after_where "${arm}" "${pair}" warm_where_then_hybrid
-    run_hybrid_after_where "${arm}" "${pair}" body_predicate
+  for candidate in "${CANDIDATES[@]}"; do
+    baseline="$(baseline_for_candidate "${candidate}")"
+    run_arm_full "${baseline}" "${pair}"
+    run_arm_full "${candidate}" "${pair}"
   done
 done
 

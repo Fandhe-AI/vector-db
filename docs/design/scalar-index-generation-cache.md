@@ -210,8 +210,17 @@ commit `6ff22dc8`）のものを全 arm 共通で使用し、`CROSSDB_SELF_BINAR
   §5 に従い**参考値・採否根拠にしない**。
   他 worktree のジョブが並走していた可能性があるため loadavg も生データと
   ともに記録した。
-- ペア数: 5（交互 before→after→ref の輪番。`docs/design/
-  benchmark-judgement-policy.md` §3）。
+- ペア数: 5（交互実行。`docs/design/benchmark-judgement-policy.md` §3
+  「baseline/cand1/baseline/cand2/… の輪番」）。本節の生データ取得時点の
+  `bench_scalar_index_crossdb_ab.sh` は before→after→ref の順で before を
+  1 回しか計測しておらず、ref との比較が after 計測ぶん時間的に隔たった
+  before を参照する構成だった（codex-review P1 指摘・Issue #633）。指摘を
+  受けて同スクリプトは候補（after／ref）ごとに専用の直近 baseline 計測
+  （ref 用は `before_ref`）を挟む before→after→before_ref→ref の輪番へ
+  修正済みだが、本節の生データ自体は修正前に取得したものであり
+  再計測はしていない（`bench_scalar_index_crossdb_ab_summarize.py` は
+  この旧形式データを再集計する際 `before_ref` 不在を検出して `before`
+  へ自動フォールバックする——出力される値は本節の表と同一）。
 - fixture: `docs25k.redb`／`docs25k.jsonl`／`queries200.jsonl`（25,000 行・
   dim 128。`docs/design/crossdb-bench.md` と同一）。
 - 対象区間: crossdb self の 4 フェーズ（`hybrid_rrf`・`bulk_hybrid_k200`・
@@ -235,16 +244,18 @@ commit `6ff22dc8`）のものを全 arm 共通で使用し、`CROSSDB_SELF_BINAR
 判定は `docs/design/benchmark-judgement-policy.md` §4 の 2 種ノイズ帯
 （固定 ±5% と参照区間実測帯を**両方**超えて初めて `regressed`/`improved`。
 片方のみは「帯内」）に従う（codex-review P1 指摘・Issue #633）。
-`reference_band` は同一計測セッション内の `vector_knn.p50` の run-to-run
-幅（`(max-min)/min`。`scripts/bench_scalar_index_crossdb_ab_summarize.py::reference_band`）
-から算出した実測ノイズ帯で、after arm は **16.48%**（`min=655.15 max=763.14`）、
-ref arm は **2.94%**（`min=699.37 max=719.92`）——固定 ±5% 帯より大きく
-広い（after）／わずかに狭い（ref）ため、下表の「判定」は固定帯だけで
-機械的に出した値ではなく、この実測帯もあわせて適用したもの
+`reference_band` は候補（after／ref）ごとの baseline と candidate それぞれの
+`vector_knn.p50` run-to-run 値列を連結した幅（`(max-min)/min`。
+`scripts/bench_scalar_index_crossdb_ab_summarize.py::reference_band`）から
+算出した実測ノイズ帯で、after は **16.48%**（`min=655.15 max=763.14`。
+baseline=`before`・candidate=`after`）、ref は **8.53%**（`min=670.78
+max=727.97`。baseline=`before`〔フォールバック〕・candidate=`ref`）——
+固定 ±5% 帯より大きく広い（after）／狭い（ref）ため、下表の「判定」は
+固定帯だけで機械的に出した値ではなく、この実測帯もあわせて適用したもの
 （算出根拠は上記コマンドの stderr 出力・完全な TSV に記録。生データは
 tracked のため誰でも再計算できる）。
 
-| 区間 | before min/median | after min/median | after/before（min比） | after 判定（固定帯＋参照帯 16.48%） | ref min/median | ref/before | ref 判定（固定帯＋参照帯 2.94%） |
+| 区間 | before min/median | after min/median | after/before（min比） | after 判定（固定帯＋参照帯 16.48%） | ref min/median | ref/before | ref 判定（固定帯＋参照帯 8.53%） |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `hybrid_rrf`.p50 | 6995 / 7070 | 7036 / 7084 | 1.0057 | 帯内 | 6130 / 6278 | 0.8763 | improved（ref が速い） |
 | `bulk_hybrid_k200`.p50 | 9618 / 9652 | 9615 / 9657 | 0.9997 | 帯内 | 9649 / 9871 | 1.0033 | 帯内 |
@@ -259,7 +270,7 @@ tracked のため誰でも再計算できる）。
 本 issue の受け入れ判定に使う before→after 比較（4 対象区間・参照区間とも）
 は、固定帯・参照帯（16.48%）のいずれの基準でも「帯内」で変わらない
 （実測ノイズ帯を導入しても判定結果自体は変化しない。ref との比較のみ
-参照帯〔2.94%〕の下で新たに `regressed`/`improved` に分類される行がある
+参照帯〔8.53%〕の下で新たに `regressed`/`improved` に分類される行がある
 ——ただしこれらは元々 before/after 比較ではなく「ref との差」の解説として
 記録していた値であり、本 issue の受け入れ判定〔下記「判定」節〕には使わない）。
 
