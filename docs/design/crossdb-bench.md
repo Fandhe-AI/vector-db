@@ -3,12 +3,14 @@
 - ステータス: **実施済み**（計測ツール `scripts/crossdb_bench/`・
   `crates/engine/benches/gpu_scaling_bench.rs`。production 変更は
   `crates/wire-server/src/server.rs` の `TCP_NODELAY` 設定のみ）
-- 対応: PR #451 後続（hnsw_rs 撤去）・Issue #406 関連（HNSW 構築比較の対照）
+- 対応: PR #451 後続（hnsw_rs 撤去）・Issue #406 関連（HNSW 構築比較の対照）・
+  Issue #636（親 #629。fixture の FS 条件・Qdrant イメージ版・2026-09-08 再計測）
 - 入口: `make bench-crossdb`（README「他 DB との機能別横断ベンチ」）・
   `make bench-gpu-scaling`・`scripts/crossdb_bench/gpu/README.md`
 - 関連: `docs/design/hnsw-parallel-build.md`（自作 HNSW vs usearch）・
   `docs/design/core16-f16-resident-gate.md`（GPU f16 常駐ゲート）・
-  `docs/design/hybrid-rrf-latency-breakdown.md`（in-process の段別内訳）
+  `docs/design/hybrid-rrf-latency-breakdown.md`（in-process の段別内訳）・
+  `docs/design/benchmark-judgement-policy.md` §5（共有 QEMU 参考値の証拠力区分）
 
 ## 目的・範囲
 
@@ -28,19 +30,21 @@ spec の受け入れ基準（閾値）は本ドキュメントでは扱わない
 | --- | --- |
 | ホスト | dev-box02（Proxmox VM・QEMU 12 vCPU・31 GB。別プロジェクトのコンテナ常駐で loadavg 約 2） |
 | GPU | NVIDIA GeForce RTX 3060 12 GB（PCIe パススルー）・driver 595.71.05・CUDA 13.2・nvidia-container-toolkit 1.19.1 |
-| self | `wire-server`（release ビルド・`cef02bc` 時点。loopback TCP・簡易クエリプロトコル・psycopg 3.3.5） |
+| self | `wire-server`（release ビルド・`cef02bc` 時点。loopback TCP・簡易クエリプロトコル・psycopg 3.3.5。2026-09-08 再計測は `773a835` 相当・sha256 先頭 `4b950db35d5c`〔下記「2026-09-08 再計測」節参照〕） |
 | pgvector | `pgvector/pgvector:pg17`（PostgreSQL 17.11・pgvector 0.8.6。`<#>`。HNSW m=16 / ef_construction=100 / ef_search=64） |
 | sqlite-vec | sqlite3 3.46.1・sqlite-vec 0.1.9（in-process・ファイルベース DB・vec0 brute-force・cosine 近似〔内積指標なし〕） |
-| Qdrant | `qdrant/qdrant:latest`（gRPC・Distance.DOT・exact / HNSW） |
+| Qdrant | `qdrant/qdrant:latest`（gRPC・Distance.DOT・exact / HNSW。2026-09-08 再計測時: サーバ版 1.19.1・digest `sha256:12364fe8…`〔2026-09-03 作成〕。初回計測時のサーバ版・digest は未記録） |
 | LanceDB | lancedb 0.38.0（in-process・`metric="dot"`・exact / IVF_HNSW_FLAT m=16 ef_construction=100 ef=64） |
 | MySQL | `mysql:9`（9.7.2 Community。`VECTOR` 型は作れるが `DISTANCE()`／`VECTOR_DISTANCE` が無く〔ERROR 1305〕、`CREATE VECTOR INDEX` は構文エラー〔HeatWave 限定〕のため KNN 系は n/a） |
 | FAISS | faiss-gpu-cu12 1.14.1（Docker `bench-faiss-gpu`・python 3.12・`OMP_NUM_THREADS=12`・OpenBLAS 1 スレッド・BLAS 経路無効化） |
 | Qdrant GPU | `qdrant/qdrant:gpu-nvidia-latest`（`QDRANT__GPU__INDEXING=1`。構築のみ GPU） |
 | fixture | `seed_docs seed` 25,000 行・dim 128（tenant-a 23,000 行 public・tenant-b 2,000 行 private）・200 クエリ・k=10 |
+| fixture FS | 初回計測は FS 未記録（tmpfs 上の再現値と数値が整合。下記「2026-09-08 再計測」節参照）。2026-09-08 再計測は ext4（`/dev/sda1`）・tmpfs 対照は `/tmp` |
 | 反復 | warmup 5・50 反復（`feature_bench.rs` の既定に合わせる）・p50/p95 µs |
 
 計測対象以外のコンテナは停止した。Docker イメージの digest は `scripts/crossdb_bench/README.md`
-の手順どおり `docker inspect` で結果 JSON の meta に記録している。
+の手順どおり `docker inspect` で結果 JSON の meta に記録している。2026-09-08 再計測はこの
+前提の例外（下記「2026-09-08 再計測」節参照）。
 
 ### 公平性の注記
 
@@ -49,9 +53,18 @@ spec の受け入れ基準（閾値）は本ドキュメントでは扱わない
 - **永続化条件**: sqlite-vec は当初 `:memory:`（非永続）で他 DB（永続ストレージ）と
   投入速度の比較条件が揃っていなかったため、`--workdir` 配下のファイルベース DB へ
   変更した（codex-review P2 指摘。PRAGMA は SQLite 既定〔`journal_mode=DELETE`・
-  `synchronous=FULL` 相当〕のまま）。本ドキュメントの sqlite-vec の投入系数値
-  （`ingest_bulk`・`ingest_single_stmt`）はファイルベース化前（in-memory）の値であり、
-  ファイルベース化後の再計測は次回実行時に行う。
+  `synchronous=FULL` 相当〕のまま）。本ドキュメントの横断ベンチ表（「横断ベンチ実測」節）の
+  sqlite-vec の投入系数値（`ingest_bulk`・`ingest_single_stmt`）はファイルベース化前
+  （in-memory）の値。ファイルベース化後の値は 2026-09-08 再計測で取得済み（下記
+  「2026-09-08 再計測」節参照）。
+- **fixture の FS と fsync**: self（redb・1 文ごとに commit）・pgvector（autocommit）・
+  sqlite-vec（ファイル版）はいずれも 1 文（1 行）ごとに commit するため、`ingest_single_stmt`
+  のスループットは fixture・DB データファイルの置き場が FS の commit（fsync）コストに
+  依存しうる。2026-09-08 再計測では同一 ext4 条件で self 約 2,000 rows/s・pgvector
+  1,662 rows/s・sqlite-vec 292 rows/s と self が最速だった一方、self の fixture を
+  tmpfs（`/tmp`）へ置くと 7,414〜7,714 rows/s まで上がった（「fsync が支配的」は
+  ext4 と tmpfs の差〔約 3.7 倍〕からの推定であり、strace／perf 等での直接の裏付けは
+  未取得。詳細は下記「2026-09-08 再計測」節参照）。
 - **可視性モデル**: self の wire セッションは現行契約でどのテナントからも
   `visibility = 'public'` の行のみ可視（private は所有テナント自身からも不可視）。
   他 DB は RLS を持たないため `visibility` 列を持たせ毎クエリに
@@ -109,9 +122,14 @@ self の `ingest_bulk` は wire に COPY 相当が無く（`EngineCore::execute_
 は Rust API のみ）n/a。`ingest_single_stmt` は行形 INSERT を `USING OPERATION_ID`
 付きで 1,000 行送る（commit 粒度は全 DB とも 1 文ごと〔pgvector は autocommit、MySQL・
 sqlite-vec は 1 文ごとに commit、Qdrant は `wait=True`、LanceDB は 1 行ずつ `add`〕。7,473 rows/s。pgvector 1,601・Qdrant 1,081 rows/s より速く、in-process の sqlite-vec 11.7k rows/s には及ばない）。
+下表の `7,774 rows/s` と本文の `7,473 rows/s` はいずれも初回計測時の別 run の値
+（tmpfs 帯。fixture の置き場は未記録）で、値の混在は初回記録の誤記ではない。
+2026-09-08 の tmpfs 対照計測では 7,414〜7,714 rows/s を再現しており、初回計測も
+tmpfs 相当の FS 条件だったと推定される（下記「2026-09-08 再計測」節参照）。
 
 sqlite-vec の `ingest_bulk`／`ingest_single_stmt` はファイルベース化前
-（`:memory:`）の値（「公平性の注記」節参照）。再計測は次回実行時。
+（`:memory:`）の値（「公平性の注記」節参照）。ファイルベース化後の値は 2026-09-08
+再計測で取得済み（下記「2026-09-08 再計測」節参照）。
 
 ### 所見
 
@@ -143,9 +161,9 @@ sqlite-vec の `ingest_bulk`／`ingest_single_stmt` はファイルベース化�
 Issue #454 で `SELECT ... [WHERE ...] LIMIT n`（`ORDER BY`／`USING PLAN` を伴わない
 広域取得。契約は `docs/design/wide-retrieval-scan.md` 参照）を SQL 表層へ追加した
 ため、`scan_where_nosort_k500` は self でも受理される（許可リストが `42601` を
-返さなくなった）。self の実測値の再取得は `make bench-crossdb` が動く環境
-（Docker・venv・fixture）を要するためオーナー作業として申し送る（下表・下記所見の
-self `n/a` は未実測のまま残置）。`USING MODE 'recall'` は Top-k を固定件数で返す
+返さなくなった）。self の実測値は 2026-09-08 再計測で取得済み（463／475 µs〔500 行〕。
+下記「2026-09-08 再計測」節参照。下表・下記所見の self `n/a` は本計測時点のまま
+未更新で残置し、値は新節側にのみ記録する）。`USING MODE 'recall'` は Top-k を固定件数で返す
 モードであり、しきい値で件数が可変になる構文は Issue #454 でも実装していない
 （spec ID 確定待ちのため見送り。ADR 参照）。
 
@@ -210,8 +228,8 @@ k を変えて切り分けた（`scratchpad` 上の ad-hoc 計測・50 反復・
   （Qdrant scroll）で 500 行を返す一方 self は unsupported だった。設計思想どおりの
   「フィルタのみで広く返す」経路は Issue #454 として起票し、SQL 表層
   （`Statement::Scan`。`docs/design/wide-retrieval-scan.md`）へ実装済み。self の
-  実測値の再取得はオーナー作業として申し送る（上表の self 列は本計測時点の
-  `n/a` のまま）。
+  実測値は 2026-09-08 再計測で取得済み（463／475 µs〔500 行〕。上表の self 列は
+  本計測時点の `n/a` のまま残置し、値は下記「2026-09-08 再計測」節に記録する）。
 - **ベクトル検索の本体は速い。** `SELECT id` の k=10 0.7 ms・k=1000 4.2 ms は brute-force
   ながら Qdrant exact と同等で、投影・フィルタ経路のオーバーヘッドを取り除けば広域取得
   でも上位に入る見込み。
@@ -767,6 +785,125 @@ Qdrant は上記の別セッション実測のため `run_all.sh` には含ま�
 - 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測はオーナー作業として引き続き
   未実施（`docs/design/benchmark-judgement-policy.md` §9 と同方針）。
 
+## 2026-09-08 再計測（Issue #636。ext4 上・共有 QEMU 参考値）
+
+`make bench-crossdb` の再計測（他 DB 側切り分け Issue の一環）で fixture の FS 条件・
+Qdrant イメージ版を記録したうえで全 13 フェーズ＋広域取得 5 フェーズを再取得した。
+`docs/design/benchmark-judgement-policy.md` §5 の区分に従い、以下はいずれも**共有
+QEMU 環境の単発実測（参考値・採否根拠にしない）**である。
+
+### 計測条件
+
+- 日時: 2026-09-08T04:31〜04:33Z（`make bench-crossdb` 実行時間 75 秒）。
+- self バイナリ: `wire-server`（release ビルド。sha256 先頭 `4b950db35d5c`）。
+  main `773a835`（#627 マージ後）以降・`6ff22dc`（#638 マージ）**前**の状態
+  （本 doc の他節にある `hybrid_rrf` の退行分析はこの時点の値であることに注意。
+  `hybrid_rrf` 7,092 µs には Issue #569（ScalarIndex 構築）由来の一時的な退行
+  約 12% が含まれる。是正の是非・再測定は本 Issue のスコープ外〔#633 の担当〕）。
+- fixture 置き場: ext4（`/dev/sda1`。「公平性の注記」節「fixture の FS と fsync」参照）。
+- コンテナ名／ポート: `bench-pgvector-0908`（25433）・`bench-qdrant-0908`
+  （26333/26334）・`bench-mysql-0908`（43306）で既存の常駐コンテナと衝突しないよう
+  分離。
+- Qdrant: `qdrant/qdrant:latest` = `qdrant/qdrant@sha256:12364fe851b9f17356fc88189fc06d1b521262e04659ec7345975b00c9246a10`
+  （イメージ作成 2026-09-03T13:10Z）・サーバ版 1.19.1（結果 meta より）。
+- **逸脱**: ハーネス外の常駐コンテナ `bench-qdrant`（同 digest・アイドル・2026-09-06
+  作成）が計測中も running のまま停止されなかった（「計測環境」節の「計測対象以外の
+  コンテナは停止した」という前提の例外）。ポート・コンテナ名は計測用と分離されており
+  計測対象そのものへの直接的な混入では無いが、ホストリソース（CPU・メモリ）の共有は
+  避けられていない。
+- loadavg（各結果 JSON の meta より・1 分値）: 0.70〜2.39（構成間でばらつきあり。
+  複数 DB のコンテナ・venv を同一ホストで順に起動する構成のため）。
+- warmup 5・50 反復（既定と同じ）。
+
+### 結果表（p50 / p95 µs。既存表と同じ列順）
+
+| フェーズ | self (wire) | pgvector exact | pgvector HNSW | sqlite-vec | Qdrant exact | Qdrant HNSW | LanceDB exact | LanceDB HNSW | MySQL |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `vector_knn` | 677 / 745 | 3854 / 5934 | 3804 / 4019 | 3914 / 4325 | 596 / 774 | 750 / 995 | 8520 / 14130 | 2348 / 2982 | n/a |
+| `vector_knn_where` | 1953 / 2044 | 2072 / 2146 | 2135 / 2253 | 3933 / 4242 | 657 / 749 | 675 / 974 | 7698 / 8757 | 3417 / 4269 | n/a |
+| `where_compound_count` | 1020 / 1080 | 1547 / 1696 | 1563 / 1614 | 1955 / 2001 | 7833 / 8251 | 7385 / 8036 | 856 / 1177 | 896 / 1073 | 3105 / 3222 |
+| `agg_count` | 82 / 87 | 1669 / 1817 | 1638 / 1714 | 1585 / 1623 | 1907 / 2476 | 1385 / 1706 | 603 / 855 | 675 / 818 | 1787 / 1820 |
+| `agg_multi` | 322 / 332 | 1941 / 1996 | 2027 / 2100 | 2828 / 2934 | n/a | n/a | 7408 / 9728 | 6599 / 9102 | 2520 / 2548 |
+| `group_by_having` | 1651 / 1740 | 2927 / 3050 | 2876 / 3131 | 3704 / 3754 | n/a | n/a | 8345 / 11260 | 8318 / 11597 | 16527 / 17216 |
+| `hybrid_rrf` | 7092 / 8720 | 4825 / 5295 | 5011 / 5364 | 5581 / 6357 | n/a | n/a | 9508 / 12272 | 3765 / 4213 | n/a |
+| `mode_recall` | 712 / 786 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
+| `mode_precision` | 726 / 819 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
+| `udf_call` | 723 / 1068 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
+| `rls_isolation` | 83 / 89 | 1701 / 1839 | 1642 / 1689 | 1649 / 1697 | 1935 / 2516 | 1433 / 1820 | 608 / 726 | 780 / 878 | 1783 / 1829 |
+| `explain` | n/a | 98 / 104 | 100 / 122 | 4 / 4 | n/a | n/a | 1105 / 1605 | 464 / 561 | 167 / 183 |
+| `bulk_knn_k200` | 945 / 1022（200 行） | 4663 / 5061（200 行） | 4769 / 5142（200 行） | 7414 / 13628（200 行） | 3088 / 3391（200 行） | 3324 / 5522（200 行） | 9865 / 11554（200 行） | 3401 / 3900（200 行） | n/a |
+| `bulk_knn_k1000` | 1698 / 2335（1000 行） | 5131 / 5517（1000 行） | 5261 / 5527（1000 行） | 31636 / 47870（1000 行） | 12748 / 16357（1000 行） | 12546 / 16680（1000 行） | 12718 / 14507（1000 行） | 5310 / 6609（1000 行） | n/a |
+| `bulk_knn_where_k200` | 3287 / 3456（200 行） | 2500 / 2778（200 行） | 2477 / 2798（200 行） | 15847 / 16180（200 行） | 3068 / 3483（200 行） | 3113 / 5267（200 行） | 9078 / 10976（200 行） | 4592 / 5615（200 行） | n/a |
+| `bulk_hybrid_k200` | 9770 / 10684（200 行） | 5334 / 5863（200 行） | 5459 / 5723（200 行） | 8868 / 13839（200 行） | n/a | n/a | 10784 / 12424（200 行） | 5209 / 6088（200 行） | n/a |
+| `scan_where_nosort_k500` | 463 / 475（500 行） | 992 / 1036（500 行） | 924 / 987（500 行） | 247 / 258（500 行） | 5000 / 8632（500 行） | 4607 / 8187（500 行） | 2284 / 2629（500 行） | 2286 / 2652（500 行） | 904 / 1029（500 行） |
+
+`point_where` 行は本表に含めない（`vector_knn_where` と同一値をハーネスが複製して
+出力するため。上記「申し送り」節参照。全アダプタで `vector_knn_where` 行と完全一致
+することを結果 JSON で確認済み）。
+
+### スループット・品質表
+
+| 指標 | self (wire) | pgvector exact | pgvector HNSW | sqlite-vec | Qdrant exact | Qdrant HNSW | LanceDB exact | LanceDB HNSW | MySQL |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `ingest_bulk` | n/a | 0.47 s（53,129 rows/s） | 0.49 s（51,360 rows/s） | 0.29 s（87,640 rows/s） | 2.01 s（12,457 rows/s） | 2.07 s（12,083 rows/s） | 0.14 s（176,347 rows/s） | 0.13 s（194,940 rows/s） | 1.58 s（15,827 rows/s） |
+| `ingest_single_stmt`（ext4） | 0.49 s（2,025 rows/s） | 0.60 s（1,662 rows/s） | 1.28 s（784 rows/s） | 3.43 s（292 rows/s） | 0.93 s（1,077 rows/s） | 1.68 s（594 rows/s） | 1.47 s（678 rows/s） | 1.48 s（675 rows/s） | 1.42 s（702 rows/s） |
+| `recall_at_10` | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 0.8395 | n/a |
+| `recall_at_10_strict` | 0.9995 | 0.9865 | 0.9865 | 0.9740 | 0.7560 | 0.7470 | 0.9990 | 0.6100 | n/a |
+
+sqlite-vec の値はファイルベース化後（「公平性の注記」節参照）の初回計測値。
+Qdrant HNSW の `index_build` は 0.51 s・status green・25,000 件索引済み
+（`indexed_vectors_count` が全件に達したことを確認済み）。
+
+### `ingest_single_stmt` の FS 切り分け（小表。性能判定ではなく計測条件差の確認）
+
+self（`ingest_single_stmt`・rows/s）を ext4 上で ee99db3（before）・HEAD（after）の
+交互 3 run、tmpfs 上で HEAD の 2 run 実測した（N<5 のため
+`benchmark-judgement-policy.md` の性能判定の対象外。計測条件の差の確認が目的）。
+
+| 条件 | run 1 | run 2 | run 3 | min | median |
+| --- | --- | --- | --- | --- | --- |
+| ext4・before（ee99db3） | 2,080 | 2,014 | 2,018 | 2,014 | 2,018 |
+| ext4・after（HEAD） | 2,007 | 1,993 | 2,019 | 1,993 | 2,007 |
+| tmpfs・after（HEAD） | 7,714 | 7,414 | — | 7,414 | — |
+
+ext4 上の before/after は差がなく（1,993〜2,080 rows/s の狭い帯に収まる）、
+tmpfs では同一バイナリ（HEAD）が 3.7〜3.8 倍のスループットを示した。この対照は N<5・
+参照区間のノイズ帯未算出であり `benchmark-judgement-policy.md` §3〜4 の非退行判定基準を
+満たさないため、`ingest_single_stmt` の低下を退行ではないと断定する根拠にはできない。
+初回計測（`docs/design/crossdb-bench.md` 初版時点）で FS 条件が記録されておらず、
+before 側の FS も未確認であることを踏まえ、本節の対照は「低下は fixture の FS 条件差に
+よる可能性が高い」という仮説を支持する参考値にとどめ、退行の有無そのものの判定は
+改めて 5 ペア以上・同一 FS 条件での再計測が必要と申し送る。
+
+### 初回計測との差分所見
+
+改善（ハーネス変更・Phase 2〜6 の複数の変更を含み、単一 Issue へは帰属しない）:
+`agg_count` 3547→82 µs、`rls_isolation` 3552→83 µs、`where_compound_count`
+3903→1020 µs、`agg_multi` 3738→322 µs、`group_by_having` 3948→1651 µs、
+`bulk_knn_k200` 7993→945 µs（いずれも p50）。
+
+self が依然劣後するフェーズ:
+
+- `hybrid_rrf` 7092 µs（LanceDB HNSW 3765・pgvector 4825 µs より遅い。上記
+  Issue #569 由来の一時的な退行を含む）。
+- `bulk_hybrid_k200` 9770 µs（LanceDB HNSW 5209・pgvector 5334 µs より遅い）。
+- `vector_knn_where` 1953 µs（Qdrant 657 µs より遅い。pgvector 2072 µs とは同等）。
+- `bulk_knn_where_k200` 3287 µs（pgvector 2500 µs より遅い）。
+- `scan_where_nosort_k500` 463 µs（sqlite-vec 247 µs のみ self より速い。他 DB は
+  すべて self より遅い）。
+
+### 生データ
+
+per-run 生データ・結果表・実行ログは
+[`bench-data/crossdb-20260908/`](bench-data/crossdb-20260908/) 配下に保存した:
+
+- `results/*.json`（9 構成の結果 JSON。meta に loadavg・バージョン情報を含む）
+- `table.txt`（本節の結果表の元になった生成表）・`run.log`（Qdrant digest 行を含む）・
+  `run.sh`（fixture 置き場・コンテナ上書き環境変数の記録）
+- `ab-ext4/{before,after}-{1,2,3}-self_exact.json`（ext4 A/B の per-run 生データ）
+- `tmpfs/out-{1,2}-self_exact.json`・`run-{1,2}.log`（tmpfs 対照の per-run 生データ）
+- `env.txt`（`df -T`・Docker digest・常駐コンテナ状態・self バイナリ sha256 の記録）
+
 ## 申し送り
 
 - SQL 表層のフィルタ付き経路・集計の wire 越し 2.7〜6 ms は、in-process との差分を
@@ -775,8 +912,14 @@ Qdrant は上記の別セッション実測のため `run_all.sh` には含ま�
 - スカラー列投影時の全行デコード（`sql/exec.rs::on_visible_row` の `scan_scalar_columns`）
   を Top-k 確定後の k 行へ遅延させる改善は Issue #453（上記「self の投影コスト切り分け」節）。
   ORDER BY なしのフィルタのみ行取得（広域取得モード）の SQL 表層追加は Issue #454 で
-  実装済み（`docs/design/wide-retrieval-scan.md`）。self の実測値の再取得（`make
-  bench-crossdb`）はオーナー作業として申し送る。
+  実装済み（`docs/design/wide-retrieval-scan.md`）。self の実測値は 2026-09-08
+  再計測で取得済み（下記「2026-09-08 再計測」節参照）。
+- `point_where` フェーズはハーネスが `vector_knn_where` の統計をそのまま複製して
+  出力するため（`scripts/crossdb_bench/self_db.py`・`pgvector_db.py`・
+  `sqlite_vec_db.py`・`qdrant_db.py`・`lancedb_db.py`。MySQL は unsupported）、
+  結果表に独立フェーズとして掲載する意味が無く重複行になっている。ハーネス側の整理
+  （独立クエリ化または出力からの除外）は本 doc・Issue #636 のスコープ外として
+  申し送る。
 - engine GPU 経路の大バッチ頭打ち（Top-k の GPU 化・転送量削減）は別タスク。
 - 本計測は共有 VM（loadavg 約 2）での単発実測であり、専有環境での再測定は未実施。
 - Phase 4 通しのチップ別前後比較（Issue #530）では、`vector_knn` self A/C
