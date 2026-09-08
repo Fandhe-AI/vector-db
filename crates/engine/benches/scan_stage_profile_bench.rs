@@ -101,165 +101,209 @@ struct RoundResultA {
     visible_rows: usize,
 }
 
+/// A1（生 `redb` per-entry 走査のみ）の計測対象本体。`#[inline(never)]` により
+/// 呼び出し元（`measure_a_series` のラウンドループ）へのインライン化を止め、
+/// ループ本体のコード配置がラウンドループ側の変更（例: 前後の A0c ブロック追加）
+/// に引きずられて動くことを防ぐ（Issue #635。配置アーティファクトを完全に
+/// 無くす保証はなく、Step 2 の摂動テストで効果を確認したうえで採用している）。
+#[inline(never)]
+fn stage_a1_scan(db: &Database) -> (usize, u64) {
+    let read_txn = db.begin_read().expect("begin read txn");
+    let table = read_txn.open_table(ROW_TABLE).expect("open row table");
+    let mut rows = 0usize;
+    let mut checksum: u64 = 0;
+    for entry in table.iter().expect("iter row table") {
+        let _entry = entry.expect("iterate row entry");
+        checksum = checksum.wrapping_add(std::hint::black_box(1u64));
+        rows += 1;
+    }
+    (rows, checksum)
+}
+
+/// A2（A1 ＋ ヘッダデコード）の計測対象本体。分離理由は `stage_a1_scan` 参照。
+#[inline(never)]
+fn stage_a2_header_decode(db: &Database) -> (usize, u64) {
+    let read_txn = db.begin_read().expect("begin read txn");
+    let table = read_txn.open_table(ROW_TABLE).expect("open row table");
+    let mut rows = 0usize;
+    let mut checksum: u64 = 0;
+    for entry in table.iter().expect("iter row table") {
+        let (_k, v) = entry.expect("iterate row entry");
+        let (tenant_id, is_public, _offset) = harness::knn_profile::decode_header_reimpl(v.value())
+            .expect("header decode must succeed for well-formed synthetic rows");
+        checksum = checksum.wrapping_add(std::hint::black_box(tenant_id.len() as u64));
+        checksum = checksum.wrapping_add(std::hint::black_box(is_public as u64));
+        rows += 1;
+    }
+    (rows, checksum)
+}
+
+/// A3（A2 ＋ RLS 判定 ＋ TABLE-12 キー/ヘッダ tenant 整合検査）の計測対象本体。
+/// 不可視行は以降の追加処理を行わない（production と同じ「不可視行は
+/// dim/metadata を一切デコードしない」順序）。分離理由は `stage_a1_scan` 参照。
+#[inline(never)]
+fn stage_a3_rls_visible(db: &Database, ctx: &PolicyContext) -> (usize, usize, u64) {
+    let read_txn = db.begin_read().expect("begin read txn");
+    let table = read_txn.open_table(ROW_TABLE).expect("open row table");
+    let mut rows = 0usize;
+    let mut visible = 0usize;
+    let mut checksum: u64 = 0;
+    for entry in table.iter().expect("iter row table") {
+        let (k, v) = entry.expect("iterate row entry");
+        let (tenant_id, is_public, _offset) = harness::knn_profile::decode_header_reimpl(v.value())
+            .expect("header decode must succeed for well-formed synthetic rows");
+        let visibility = if is_public {
+            Visibility::Public
+        } else {
+            Visibility::Private
+        };
+        if is_visible(ctx, tenant_id, visibility) {
+            let (key_tenant, _id) = k.value();
+            verify_row_key_tenant_reimpl(key_tenant, tenant_id)
+                .expect("row key tenant must match header tenant for well-formed rows");
+            checksum = checksum.wrapping_add(std::hint::black_box(1u64));
+            visible += 1;
+        }
+        rows += 1;
+    }
+    (rows, visible, checksum)
+}
+
+/// A3 の可視行数のみを求める対照カウント（計測区間の外・`run()` を通さない）。
+/// `measure_a_series` が `RoundResultA::visible_rows` を求めるために使う。
+#[inline(never)]
+fn stage_a3_visible_count(db: &Database, ctx: &PolicyContext) -> usize {
+    let read_txn = db.begin_read().expect("begin read txn for visible count");
+    let table = read_txn.open_table(ROW_TABLE).expect("open row table");
+    let mut visible = 0usize;
+    for entry in table.iter().expect("iter row table") {
+        let (k, v) = entry.expect("iterate row entry");
+        let (tenant_id, is_public, _offset) =
+            harness::knn_profile::decode_header_reimpl(v.value()).expect("header decode");
+        let visibility = if is_public {
+            Visibility::Public
+        } else {
+            Visibility::Private
+        };
+        if is_visible(ctx, tenant_id, visibility) {
+            let (key_tenant, _id) = k.value();
+            verify_row_key_tenant_reimpl(key_tenant, tenant_id).expect("tenant match");
+            visible += 1;
+        }
+    }
+    visible
+}
+
+/// A4（A3 ＋ dim・metadata 借用デコード。可視行のみ）の計測対象本体。
+/// 累積段契約（A3 ⊆ A4 ⊆ A5）を保つため `verify_row_key_tenant_reimpl` は
+/// ここでも省略しない（省略すると A4−A3 の差分がデコード追加コストではなく
+/// 整合性検査コスト分だけ過小に出てしまい、後続の性能改善の帰属を誤る）。
+/// 分離理由は `stage_a1_scan` 参照。
+#[inline(never)]
+fn stage_a4_dim_meta_decode(db: &Database, ctx: &PolicyContext) -> (usize, u64) {
+    let read_txn = db.begin_read().expect("begin read txn");
+    let table = read_txn.open_table(ROW_TABLE).expect("open row table");
+    let mut rows = 0usize;
+    let mut checksum: u64 = 0;
+    for entry in table.iter().expect("iter row table") {
+        let (k, v) = entry.expect("iterate row entry");
+        let (tenant_id, is_public, _offset) =
+            harness::knn_profile::decode_header_reimpl(v.value()).expect("header decode");
+        let visibility = if is_public {
+            Visibility::Public
+        } else {
+            Visibility::Private
+        };
+        if is_visible(ctx, tenant_id, visibility) {
+            let (key_tenant, _id) = k.value();
+            verify_row_key_tenant_reimpl(key_tenant, tenant_id)
+                .expect("row key tenant must match header tenant for well-formed rows");
+            let (dim, metadata) = decode_dim_and_metadata_reimpl(v.value())
+                .expect("dim/metadata decode must succeed for well-formed synthetic rows");
+            checksum = checksum.wrapping_add(std::hint::black_box(dim as u64));
+            checksum = checksum.wrapping_add(std::hint::black_box(metadata.len() as u64));
+        }
+        rows += 1;
+    }
+    (rows, checksum)
+}
+
+/// A5（A4 ＋ `row_codec::validate_scalar_columns`。可視行のみ）の計測対象本体。
+/// A4 と同じ理由で `verify_row_key_tenant_reimpl` を省略しない。分離理由は
+/// `stage_a1_scan` 参照。
+#[inline(never)]
+fn stage_a5_scalar_validate(
+    db: &Database,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+) -> (usize, u64) {
+    let read_txn = db.begin_read().expect("begin read txn");
+    let table = read_txn.open_table(ROW_TABLE).expect("open row table");
+    let mut rows = 0usize;
+    let mut checksum: u64 = 0;
+    for entry in table.iter().expect("iter row table") {
+        let (k, v) = entry.expect("iterate row entry");
+        let (tenant_id, is_public, _offset) =
+            harness::knn_profile::decode_header_reimpl(v.value()).expect("header decode");
+        let visibility = if is_public {
+            Visibility::Public
+        } else {
+            Visibility::Private
+        };
+        if is_visible(ctx, tenant_id, visibility) {
+            let (key_tenant, _id) = k.value();
+            verify_row_key_tenant_reimpl(key_tenant, tenant_id)
+                .expect("row key tenant must match header tenant for well-formed rows");
+            let (dim, metadata) =
+                decode_dim_and_metadata_reimpl(v.value()).expect("dim/metadata decode");
+            engine::row_codec::validate_scalar_columns(schema, metadata)
+                .expect("scalar column structure must be valid for well-formed synthetic rows");
+            checksum = checksum.wrapping_add(std::hint::black_box(dim as u64));
+        }
+        rows += 1;
+    }
+    (rows, checksum)
+}
+
 fn measure_a_series(
     db: &Database,
     config: &MeasurementConfig,
     ctx: &PolicyContext,
     schema: &TableSchema,
 ) -> RoundResultA {
-    // A1: per-entry 走査のみ（ヘッダを読まない）。
-    let a1 = run(config, || {
-        let read_txn = db.begin_read().expect("begin read txn");
-        let table = read_txn.open_table(ROW_TABLE).expect("open row table");
-        let mut rows = 0usize;
-        let mut checksum: u64 = 0;
-        for entry in table.iter().expect("iter row table") {
-            let _entry = entry.expect("iterate row entry");
-            checksum = checksum.wrapping_add(std::hint::black_box(1u64));
-            rows += 1;
-        }
-        (rows, checksum)
-    })
-    .expect("measurement must satisfy protocol minimums");
+    // A1: per-entry 走査のみ（ヘッダを読まない）。計測対象本体は
+    // `stage_a1_scan`（`#[inline(never)]`。Issue #635）。
+    let a1 = run(config, || stage_a1_scan(db)).expect("measurement must satisfy protocol minimums");
 
-    // A2: A1 ＋ ヘッダデコード（tenant_id・visibility）。
-    let a2 = run(config, || {
-        let read_txn = db.begin_read().expect("begin read txn");
-        let table = read_txn.open_table(ROW_TABLE).expect("open row table");
-        let mut rows = 0usize;
-        let mut checksum: u64 = 0;
-        for entry in table.iter().expect("iter row table") {
-            let (_k, v) = entry.expect("iterate row entry");
-            let (tenant_id, is_public, _offset) =
-                harness::knn_profile::decode_header_reimpl(v.value())
-                    .expect("header decode must succeed for well-formed synthetic rows");
-            checksum = checksum.wrapping_add(std::hint::black_box(tenant_id.len() as u64));
-            checksum = checksum.wrapping_add(std::hint::black_box(is_public as u64));
-            rows += 1;
-        }
-        (rows, checksum)
-    })
-    .expect("measurement must satisfy protocol minimums");
+    // A2: A1 ＋ ヘッダデコード（tenant_id・visibility）。計測対象本体は
+    // `stage_a2_header_decode`。
+    let a2 = run(config, || stage_a2_header_decode(db))
+        .expect("measurement must satisfy protocol minimums");
 
     // A3: A2 ＋ RLS 判定（`PolicyContext::is_visible`）＋ TABLE-12 キー/ヘッダ
     // tenant 整合検査。不可視行は以降の追加処理を行わない（production と同じ
-    // 「不可視行は dim/metadata を一切デコードしない」順序）。
-    let a3 = run(config, || {
-        let read_txn = db.begin_read().expect("begin read txn");
-        let table = read_txn.open_table(ROW_TABLE).expect("open row table");
-        let mut rows = 0usize;
-        let mut visible = 0usize;
-        let mut checksum: u64 = 0;
-        for entry in table.iter().expect("iter row table") {
-            let (k, v) = entry.expect("iterate row entry");
-            let (tenant_id, is_public, _offset) =
-                harness::knn_profile::decode_header_reimpl(v.value())
-                    .expect("header decode must succeed for well-formed synthetic rows");
-            let visibility = if is_public {
-                Visibility::Public
-            } else {
-                Visibility::Private
-            };
-            if is_visible(ctx, tenant_id, visibility) {
-                let (key_tenant, _id) = k.value();
-                verify_row_key_tenant_reimpl(key_tenant, tenant_id)
-                    .expect("row key tenant must match header tenant for well-formed rows");
-                checksum = checksum.wrapping_add(std::hint::black_box(1u64));
-                visible += 1;
-            }
-            rows += 1;
-        }
-        (rows, visible, checksum)
-    })
-    .expect("measurement must satisfy protocol minimums");
-    let a3_visible = {
-        let read_txn = db.begin_read().expect("begin read txn for visible count");
-        let table = read_txn.open_table(ROW_TABLE).expect("open row table");
-        let mut visible = 0usize;
-        for entry in table.iter().expect("iter row table") {
-            let (k, v) = entry.expect("iterate row entry");
-            let (tenant_id, is_public, _offset) =
-                harness::knn_profile::decode_header_reimpl(v.value()).expect("header decode");
-            let visibility = if is_public {
-                Visibility::Public
-            } else {
-                Visibility::Private
-            };
-            if is_visible(ctx, tenant_id, visibility) {
-                let (key_tenant, _id) = k.value();
-                verify_row_key_tenant_reimpl(key_tenant, tenant_id).expect("tenant match");
-                visible += 1;
-            }
-        }
-        visible
-    };
+    // 「不可視行は dim/metadata を一切デコードしない」順序）。計測対象本体は
+    // `stage_a3_rls_visible`。
+    let a3 = run(config, || stage_a3_rls_visible(db, ctx))
+        .expect("measurement must satisfy protocol minimums");
+    // 可視行数は計測区間の外（`stage_a3_visible_count`）で別途求める。
+    let a3_visible = stage_a3_visible_count(db, ctx);
 
     // A4: A3（RLS 判定＋キー/ヘッダ tenant 整合検査）＋ dim・metadata 借用デコード
     // （可視行のみ）。累積段契約（A3 ⊆ A4 ⊆ A5）を保つため、A3 が行う
     // `verify_row_key_tenant_reimpl` はここでも省略せず実行する（省略すると
     // A4−A3 の差分がデコード追加コストではなく整合性検査コスト分だけ過小に
-    // 出てしまい、後続の性能改善の帰属を誤る）。
-    let a4 = run(config, || {
-        let read_txn = db.begin_read().expect("begin read txn");
-        let table = read_txn.open_table(ROW_TABLE).expect("open row table");
-        let mut rows = 0usize;
-        let mut checksum: u64 = 0;
-        for entry in table.iter().expect("iter row table") {
-            let (k, v) = entry.expect("iterate row entry");
-            let (tenant_id, is_public, _offset) =
-                harness::knn_profile::decode_header_reimpl(v.value()).expect("header decode");
-            let visibility = if is_public {
-                Visibility::Public
-            } else {
-                Visibility::Private
-            };
-            if is_visible(ctx, tenant_id, visibility) {
-                let (key_tenant, _id) = k.value();
-                verify_row_key_tenant_reimpl(key_tenant, tenant_id)
-                    .expect("row key tenant must match header tenant for well-formed rows");
-                let (dim, metadata) = decode_dim_and_metadata_reimpl(v.value())
-                    .expect("dim/metadata decode must succeed for well-formed synthetic rows");
-                checksum = checksum.wrapping_add(std::hint::black_box(dim as u64));
-                checksum = checksum.wrapping_add(std::hint::black_box(metadata.len() as u64));
-            }
-            rows += 1;
-        }
-        (rows, checksum)
-    })
-    .expect("measurement must satisfy protocol minimums");
+    // 出てしまい、後続の性能改善の帰属を誤る）。計測対象本体は
+    // `stage_a4_dim_meta_decode`。
+    let a4 = run(config, || stage_a4_dim_meta_decode(db, ctx))
+        .expect("measurement must satisfy protocol minimums");
 
     // A5: A4（キー/ヘッダ tenant 整合検査を含む）＋
     // `row_codec::validate_scalar_columns`（可視行のみ）。A4 と同じ理由で
-    // `verify_row_key_tenant_reimpl` を省略しない。
-    let a5 = run(config, || {
-        let read_txn = db.begin_read().expect("begin read txn");
-        let table = read_txn.open_table(ROW_TABLE).expect("open row table");
-        let mut rows = 0usize;
-        let mut checksum: u64 = 0;
-        for entry in table.iter().expect("iter row table") {
-            let (k, v) = entry.expect("iterate row entry");
-            let (tenant_id, is_public, _offset) =
-                harness::knn_profile::decode_header_reimpl(v.value()).expect("header decode");
-            let visibility = if is_public {
-                Visibility::Public
-            } else {
-                Visibility::Private
-            };
-            if is_visible(ctx, tenant_id, visibility) {
-                let (key_tenant, _id) = k.value();
-                verify_row_key_tenant_reimpl(key_tenant, tenant_id)
-                    .expect("row key tenant must match header tenant for well-formed rows");
-                let (dim, metadata) =
-                    decode_dim_and_metadata_reimpl(v.value()).expect("dim/metadata decode");
-                engine::row_codec::validate_scalar_columns(schema, metadata)
-                    .expect("scalar column structure must be valid for well-formed synthetic rows");
-                checksum = checksum.wrapping_add(std::hint::black_box(dim as u64));
-            }
-            rows += 1;
-        }
-        (rows, checksum)
-    })
-    .expect("measurement must satisfy protocol minimums");
+    // `verify_row_key_tenant_reimpl` を省略しない。計測対象本体は
+    // `stage_a5_scalar_validate`。
+    let a5 = run(config, || stage_a5_scalar_validate(db, ctx, schema))
+        .expect("measurement must satisfy protocol minimums");
 
     RoundResultA {
         a1: a1.summary.median,
