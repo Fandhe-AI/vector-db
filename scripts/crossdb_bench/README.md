@@ -132,15 +132,30 @@ python scripts/crossdb_bench/run.py --db self --config hnsw \
 | --- | --- |
 | `phases.ann_probe` | 上記 3. の `EXPLAIN` 検証結果（`engine`/`hnsw_params`/`ann_plan`/生の行） |
 | `phases.hnsw_index_warm` | 索引構築を含む初回 `vector_knn` 相当クエリの単発計時（`first_query_us`。informational） |
-| `phases.bulk_knn_k*`/`bulk_knn_where_k200`/`bulk_hybrid_k200` | `ef_search`/`ef_effective`（`ef.max(k)`。`hnsw.rs::search_masked_with` の契約からの導出値）を追加 |
+| `phases.bulk_knn_k*`/`bulk_knn_where_k200` | `ef_search`/`ef_effective`（`ef.max(k)`。`hnsw.rs::search_masked_with` の契約からの導出値） |
+| `phases.bulk_hybrid_k200` | `ef_search`/`dense_fetch_k_initial`/`dense_fetch_k_may_expand`（直後の段落参照。`ef_effective` は常に `null`） |
 | `meta.index` | `hnsw(m=16,ef_construction=100,ef_search=64,resident=f32)` または `exact (no index)` |
 | `meta.search_engine` | `hnsw` または `default` |
 | `meta.hnsw_args` | `CROSSDB_SELF_HNSW_ARGS` から渡した追加起動引数（無ければ `[]`） |
 
 候補幅は自作 HNSW の既定 `m=16/ef_construction=100/ef_search=64` を使う
 （pgvector・Qdrant・LanceDB の既定と一致）。探索側は `ef.max(k)` を内部で
-自動適用するため、`bulk_knn_k200`/`bulk_knn_k1000`（k=200/1000）は CLI 無しで
-候補幅 max(64, k) になる。
+自動適用するため、`bulk_knn_k200`/`bulk_knn_k1000`（k=200/1000）・
+`bulk_knn_where_k200` は CLI 無しで候補幅 max(64, k) になる（`k` は SQL の
+`LIMIT` そのもの）。
+
+**hybrid（`bulk_hybrid_k200`）の候補幅は上記と異なる**: `ORDER BY
+hybrid_rrf(...)` は `sql/hnsw_hybrid.rs::HnswDenseProvider` 経由で HNSW 密側
+探索へ結線されるが、渡される候補幅は SQL の `LIMIT`（200）ではなく
+`hybrid.rs::hybrid_search_boosted` が内部で管理する `dense_fetch_k` であり、
+初回は `pool_depth * 2`（既定 `pool_depth = max(limit, 200)` のため
+`dense_fetch_k_initial = 400`）から始まり、境界の同点グループが確定
+できない場合は密側再取得ループが `MAX_FETCH_K`（`10,000 * 4`）を上限に
+動的に倍増させる。この最終的な実効候補幅は `EXPLAIN`／SQL 表層からは
+静的に取得できない（per-query 解決でキャッシュにも載らない）ため、
+`self_hnsw.hybrid_ef_candidate_fields` は `ef_effective` を偽って計算せず
+常に `None` とし、代わりに下限値 `dense_fetch_k_initial` と拡張され得る
+事実を示す `dense_fetch_k_may_expand: true` を記録する。
 
 環境変数:
 

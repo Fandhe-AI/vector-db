@@ -972,7 +972,9 @@ ann_plan: hnsw_full_visible
 fixture（`docs25k.redb`・25,000 行・dim 128・ext4）を交互 5 ペア実行した
 （`docs/design/bench-data/crossdb-self-hnsw-ab/20260908T153029Z-*`。計測規約
 `docs/design/benchmark-judgement-policy.md` §5 の「共有 QEMU 環境は参考値」
-区分に該当。専有環境での再測定は未実施）:
+区分に該当。専有環境での再測定は未実施。保存済み `self_hnsw.json` の
+`bulk_hybrid_k200.ef_effective` は旧ハーネスの記録誤りであり、訂正内容は
+`docs/design/bench-data/crossdb-self-hnsw-ab/NOTE.md` 参照）:
 
 | フェーズ | exact min/median (µs) | hnsw min/median (µs) | ratio (hnsw/exact) |
 | --- | --- | --- | --- |
