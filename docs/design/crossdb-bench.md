@@ -612,9 +612,17 @@ benches/hybrid_wire_profile_bench.rs`（`make bench-hybrid-wire-profile`）で
 
 | 区分（wire 側 T1p〜T3） | 比率 |
 | --- | --- |
-| engine 内 hybrid（T1p） | 28.6% |
-| SQL 表層（T2−T1p） | 67.1%（参照区間帯超過） |
-| wire（T3−T2） | 4.3%（参照区間帯内） |
+| engine 内 hybrid（T1p） | ≈27.5% |
+| SQL 表層（T2−T1p） | ≈66.0%（参照区間帯超過） |
+| wire（T3−T2） | ≈6.4%（5/5 ペアで正値・3/5 参照区間帯超過） |
+
+> 旧値（28.6%／67.1%／4.3%）は T2（`sql_surface_hot`）を fixture 投入後の
+> main スレッド上で計測していたハーネス側のアーティファクトの影響を受けて
+> おり、sql_surface を過大に・wire を過小（参照区間帯内）に記録していた。
+> Issue #634（ハーネス是正・T2 の新規スレッド計測化）・Issue #637（本表の
+> 訂正）で是正済み。SSOT は `docs/design/hybrid-rrf-latency-breakdown.md`
+> 「訂正版帰属表（Issue #637）」節（#634 after arm・5 ペア平均。分母は
+> T3 min 平均）。
 
 engine 内部の B0s〜B8 段別内訳では SQL 表層固定コスト（B1−B4）と疎側再取得
 ループ（B5）がほぼ同水準（37〜39%）で並び最大区分であり、融合・境界同点

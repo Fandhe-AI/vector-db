@@ -1117,6 +1117,19 @@ round1・round3 の T1p が他ラウンドの約 1.5〜1.6 倍（2.4ms 台）へ
 wire(T3−T2) の band 判定はこの回に限り目安（参照帯が広く within/above の境界の
 実質的な判別力が下がる）として扱う。
 
+> **訂正（Issue #637）**: 上記の元表・解釈は fixture を投入した main スレッド
+> 上で T2（`sql_surface_hot`）を計測していたハーネス側のアーティファクト
+> （次節「Issue #634 追記」参照）の影響を受けている。`773a835` 時点（是正前）
+> では main スレッド計測で T2 が T3 を一貫して上回る逆転（約 1ms 規模）が生じ、
+> `bucket(wire)` が構造的に n/a（逆転・未確定）になっていた。元表の
+> sql_surface diff（3.646/3.663ms）自体は「訂正版帰属表（Issue #637）」の
+> ≈3.507ms と比べて約 0.14〜0.16ms 大きい程度にとどまり、wire の
+> 「ノイズ帯内」判定は採用しない。なお「Issue #634 追記」節が報告する
+> ≈0.7〜1.0ms の縮小は、#634 が別途実施した before（main スレッド計測）/
+> after（新規スレッド計測）の 5 ペア再計測どうしの比較であり、元表を
+> 過大評価と断定する根拠ではない（両者の関係は「訂正の実体」段落を参照）。
+> 訂正後の内訳は「訂正版帰属表（Issue #637）」節を参照。
+
 wire 側の SQL 表層区分（T2−T1p）が最大となるのは、T2 が `execute_sql_in_session`
 のクエリパース・束縛・可視行走査（`on_visible_row`）まで含む一方、T1p は
 `hybrid_search` のみを直接計測するため——engine 内訳（B1−B4）と同じ「SQL 表層の
@@ -1127,6 +1140,54 @@ wire 側の SQL 表層区分（T2−T1p）が最大となるのは、T2 が `exe
 > `bucket(wire)` が構造的に n/a（逆転・未確定）になりやすいハーネス側の
 > アーティファクトがあった（Issue #634）。再取得値は次節「Issue #634 追記」
 > 参照。
+
+### 訂正版帰属表（Issue #637。#634 after arm・5 ペア）
+
+計測条件は「Issue #634 追記」節と同一（after `1900069`・
+`BENCH_HYBRID_WIRE_ROUNDS=5`・交互 N=5 ペア・共有 QEMU 環境の参考値。
+`docs/design/benchmark-judgement-policy.md` §5）。「Issue #634 追記」節の
+per-run 生データ表・after arm の T1p／T2／T3 min-of-5 を 5 ペアぶん単純平均
+し、元帰属表と同じ規約（T3 min 平均を分母とする構成比）で再構成した。
+
+- T1p min 平均: (1.460+1.451+1.464+1.466+1.465)/5 ≈ 1.4612ms
+- T2 min 平均: (5.057+4.777+5.104+4.697+5.207)/5 ≈ 4.9684ms
+- T3 min 平均: (5.202+5.248+5.491+5.274+5.335)/5 ≈ 5.3100ms
+
+| 区分 | diff（5 ペア平均） | 構成比（T3 min 平均比） | band（ペア別） |
+| --- | --- | --- | --- |
+| engine_hybrid(T1p) | ≈1.461ms | ≈27.5% | n/a（基準ゼロ） |
+| sql_surface(T2−T1p) | ≈3.507ms | ≈66.0% | above_noise_band（元表 above_noise_band を維持） |
+| wire(T3−T2) | ≈0.342ms | ≈6.4% | 5/5 ペアで正値。3/5 above_noise_band・2/5 within_noise_band（内訳は「Issue #634 追記」per-run 表参照） |
+
+Issue 起票時点の切り分けで使った目安値（engine ≈1.45／SQL 表層 ≈3.3／
+wire ≈0.6ms。3 ペア暫定値）は、上記の #634 5 ペア再計測（正値の確定・分母を
+明記した平均）で置き換える。wire は目安よりやや小さい ≈0.34ms として確定
+する。
+
+順位は元表と変わらず sql_surface が 1 位（≈66%）・engine_hybrid が 2 位
+（≈27.5%）・wire が 3 位（≈6.4%）のままである。訂正の実体は「sql_surface を
+約 0.14〜0.16ms（元表 3.646/3.663ms 対 訂正版 ≈3.507ms）過大に、wire を過小
+（ノイズ帯内／n/a）に記録していた」点にある（「Issue #634 追記」節が報告する
+≈0.7〜1.0ms の縮小は、#634 自身の before/after 5 ペア再計測どうしの差分であり、
+元表との差分とは別の数値であるため混同しない）。Phase 6（次節）の候補順位
+自体は変わらない。
+
+原因（main スレッド計測固有の状態と推定されるが機構は未検証の仮説）の詳細は
+「Issue #634 追記」「原因の位置づけ」節を参照。engine 内の段別内訳（B0s〜B8。
+`bench-hybrid-profile`）は本節の wire 内訳計測（`bench-hybrid-wire-profile`）
+とは別ハーネスであり Issue #634 の影響を受けないため無変更である。
+
+> **適用範囲の注意**: 本節・「wire／SQL 表層／engine 内訳」節はいずれも
+> in-process の `bench-hybrid-wire-profile`（`WHERE` 未実行）による計測であり、
+> crossdb 経由の `hybrid_rrf` p50 実測値へそのまま外挿できない。crossdb の
+> `hybrid_rrf` p50 には `WHERE` 実行後にのみ発現する ScalarIndex
+> （Issue #473）由来の状態依存退行（約 10%）が含まれていた期間が
+> あり、Phase 1（Issue #632）で `ScalarIndex::build` のゲート是正
+> （Issue #638）を対策として実装済みだが、Issue #633 の crossdb fixture
+> 実測では退行は本 fixture 上では未解消（no-op）と判定されている。詳細は
+> 次節「Phase 6（Issue #548）への引き継ぎ」の但し書き、および
+> `docs/design/scalar-index-generation-cache.md`「判定」節・Issue #633 を
+> 参照（前後比較実測は Issue #633 の担当のため本 doc へは転記しない）。
 
 ### Issue #634 追記: T2 の新規スレッド計測と wire 内訳の再取得
 
@@ -1203,17 +1264,46 @@ before は 5/5 ペアすべてで `bucket(wire)` が「逆転・未確定（n/a�
 
 ### Phase 6（Issue #548）への引き継ぎ
 
+> Issue #548 は close 済み（#549・#550）。本節は #634／#637 による事後訂正
+> であり、以下の候補順位そのものは変わらない。
+
 - 上位候補は (1) SQL 表層固定コスト（`sql/exec.rs` の可視行走査・
   `on_visible_row`）、(2) 疎側再取得ループ（`hybrid.rs::sparse_refetch_loop`。
-  BM25 アキュムレータ再利用は Issue #545・#546 が別途対応）——engine 内訳・
-  wire 内訳の双方で SQL 表層区分が最大かそれに準じる大きさであることが一致
-  している
+  BM25 アキュムレータ再利用は Issue #545・#546 が別途対応）——wire 内訳では
+  **SQL 表層区分が最大**（「訂正版帰属表（Issue #637）」により sql_surface
+  ≈66.0%・engine_hybrid ≈27.5%・wire ≈6.4% で 3 位。旧記述「wire はノイズ帯
+  内・未確定」は撤回する）。engine 内訳（B1−B4 の sql_surface と B5 の
+  sparse）では 1 回目 sparse 38.32% > sql_surface 37.15%・2 回目 sql_surface
+  40.39% > sparse 36.64% と両区間がほぼ同水準で入れ替わっており、本訂正は
+  engine 内訳の順位を変更しない。SQL 表層固定コストは engine では
+  sparse とほぼ同水準の最大級候補、wire では単独最大の候補として扱う
 - 残差（融合＋境界同点グループ完全化。#548 タイトルが先取りする対象）は 3 位
   （19%）にとどまり、B8（可視集合構築）はノイズ帯内。#548 の対象を融合のみに
   限定せず SQL 表層固定コストも候補に含めるべきと申し送る
+- **ScalarIndex 由来の状態依存退行についての但し書き**: 本節が根拠とする
+  wire 内訳・engine 内訳はいずれも in-process の
+  `bench-hybrid-wire-profile`／`bench-hybrid-profile`（`WHERE` 未実行）に
+  よる計測であり、crossdb 経由の `hybrid_rrf` p50（`773a835` 時点 7.1ms・
+  `ee99db3` 比 +12%）には `WHERE` 実行後にのみ発現する ScalarIndex
+  （Issue #473）由来の状態依存退行（約 10%）が含まれていた。Phase 1
+  （Issue #632）で `ScalarIndex::build` の平均値長ゲート（Issue #638）を
+  対策として実装したが、Issue #633 の crossdb fixture 実測では
+  `warm_where_then_hybrid.rss_after_warm` が before/after でほぼ変化しない
+  （63.80 → 63.72 MiB。除外が発火していれば約 56MiB まで下がるはず）という
+  RSS 実測に基づき、対策は本 fixture に対して no-op であり退行は未解消と
+  判定されている（`body` 列平均長が除外閾値をわずかに下回る事実は発火しない
+  蓋然性の補助的な状況証拠に留まり、no-op 判断自体の根拠ではない。
+  `docs/design/scalar-index-generation-cache.md`「判定」節・Issue #633
+  参照）。in-process ベンチ（本 doc の測定経路）には現れないため、
+  本節の engine 内段別・wire 内訳とは独立の要因である
 - 専有環境（`BENCH_DEDICATED_ENV=1`）での `ROUNDS=10` 再実測、`rrf_fuse_with_limits`
   の下限近似（B7）実測、crossdb self の同一コミット再実行はオーナー／運用者
   作業として申し送る
+- `knn_wire_profile_bench.rs` の T2・`ingest_wire_profile_bench.rs` の S0 も
+  T2（`sql_surface_hot` 相当）を main スレッド上で計測する同種の構造を持つが、
+  本節・「Issue #634 追記」節が扱ったのは `hybrid_wire_profile_bench.rs` の
+  T2 のみで、同種アーティファクトの有無はいずれも未検証のまま（「Issue #634
+  追記」節「申し送り」から引き継ぎ）
 
 ### production コード無変更
 
@@ -1223,7 +1313,7 @@ before は 5/5 ペアすべてで `bucket(wire)` が「逆転・未確定（n/a�
 `render_baseline_bucket_line`）・`crates/engine/benches/hybrid_profile_bench.rs`
 （B0s〜B8 ラウンド計測セクション）・`crates/wire-server/benches/harness/
 hybrid_wire.rs`（新設）・`crates/wire-server/benches/hybrid_wire_profile_bench.rs`
-（新設）のみ。
+（新設）のみ。Issue #637 は docs 専任（`crates/**` 無変更）。
 
 ## Issue #546: スコアアキュムレータの再利用（実測は #547）
 

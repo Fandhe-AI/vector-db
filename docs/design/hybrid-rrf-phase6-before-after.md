@@ -367,9 +367,11 @@ min 比 1.011・median 比 1.052 であり、5 ペアへの補完後も概ね 1 
 （ノイズ帯内〜境界）にとどまる。engine 内部（§4）で観測された
 `sparse`/`residual` の削減が wire レベルの p50 にはほぼ現れていない。これは
 `docs/design/hybrid-rrf-latency-breakdown.md`「最新基線」節が示す wire 内訳
-（SQL 表層 T2−T1p が最大区分・67.1%）と整合し、engine 内 hybrid 経路
-（T1p・28.6%）の改善分が SQL 表層・wire 側の固定コストに対して相対的に小さい
-ため、と考えられる。self の `hybrid_rrf`（min 5,839〜5,903µs・median
+（SQL 表層 T2−T1p が最大区分・訂正後 ≈66%。旧 67.1% は main スレッド計測
+由来のハーネス側アーティファクトを含んでおり Issue #634／#637 で訂正済み。
+「訂正版帰属表（Issue #637）」節参照）と整合し、engine 内 hybrid 経路
+（T1p・≈27.5%。旧 28.6%も同様に訂正済み）の改善分が SQL 表層・wire 側の
+固定コストに対して相対的に小さいため、と考えられる。self の `hybrid_rrf`（min 5,839〜5,903µs・median
 5,961〜6,270µs）は `docs/design/crossdb-bench.md` 記載のスナップショット値
 （`559b523` 時点 6,178µs）と近い水準にあり、大きな環境差は無い。
 
