@@ -360,6 +360,7 @@ ITEMS=(
   "${KERNEL_FILE}|pub struct SearchHit|crates/engine/src/kernel.rs :: SearchHit"
   "${KERNEL_FILE}|pub enum KernelError|crates/engine/src/kernel.rs :: KernelError"
   "${KERNEL_FILE}|pub struct SearchInput|crates/engine/src/kernel.rs :: SearchInput"
+  "${KERNEL_FILE}|pub struct SubsetSearchInput|crates/engine/src/kernel.rs :: SubsetSearchInput"
   "${POLICY_FILE}|pub struct PolicyContext|crates/engine/src/policy.rs :: PolicyContext"
   "${POLICY_FILE}|impl PolicyContext|crates/engine/src/policy.rs :: PolicyContext (公開コンストラクタ・メソッド)"
   "${POLICY_FILE}|pub enum PolicyError|crates/engine/src/policy.rs :: PolicyError"

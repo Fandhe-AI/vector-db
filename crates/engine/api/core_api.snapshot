@@ -59,6 +59,54 @@ pub trait VectorCore: Send + Sync {
 # source: crates/engine/src/kernel.rs :: SearchProvider
 pub trait SearchProvider: Send + Sync {
     fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError>;
+    fn search_subset(
+        &self,
+        input: SubsetSearchInput<'_>,
+    ) -> Result<Vec<CandidateHit>, KernelError> {
+        let dim = input.dim as usize;
+        if input.query.len() != dim {
+            return Err(KernelError::DimMismatch {
+                expected: input.dim,
+                found: input.query.len(),
+            });
+        }
+        if input.query.iter().any(|v| !v.is_finite()) {
+            return Err(KernelError::NonFiniteQuery);
+        }
+        if input.k == 0 || input.slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let gather_len = input.slots.len().saturating_mul(dim);
+        let mut gathered: Vec<f32> = Vec::new();
+        gathered
+            .try_reserve_exact(gather_len)
+            .map_err(|_| KernelError::DimMismatch {
+                expected: input.dim,
+                found: gather_len,
+            })?;
+        let mut ids: Vec<u64> = Vec::new();
+        ids.try_reserve_exact(input.slots.len())
+            .map_err(|_| KernelError::DimMismatch {
+                expected: input.dim,
+                found: input.slots.len(),
+            })?;
+        for &slot in input.slots {
+            let start = (slot as usize).saturating_mul(dim);
+            let end = start.saturating_add(dim);
+            let Some(row) = input.vectors.get(start..end) else {
+                continue;
+            };
+            gathered.extend_from_slice(row);
+            ids.push(slot as u64);
+        }
+        self.search(SearchInput {
+            ids: &ids,
+            vectors: &gathered,
+            dim: input.dim,
+            query: input.query,
+            k: input.k,
+        })
+    }
 }
 
 # source: crates/engine/src/core.rs :: CoreError
@@ -101,6 +149,15 @@ pub enum KernelError {
 # source: crates/engine/src/kernel.rs :: SearchInput
 pub struct SearchInput<'a> {
     pub ids: &'a [u64],
+    pub vectors: &'a [f32],
+    pub dim: u32,
+    pub query: &'a [f32],
+    pub k: usize,
+}
+
+# source: crates/engine/src/kernel.rs :: SubsetSearchInput
+pub struct SubsetSearchInput<'a> {
+    pub slots: &'a [u32],
     pub vectors: &'a [f32],
     pub dim: u32,
     pub query: &'a [f32],
