@@ -62,7 +62,10 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 
 ```bash
 cargo run -p wire-server -- --users <ユーザーストアのパス> --db <redb ファイルのパス> \
-  [--bind 127.0.0.1:5432] [--search-engine default|hnsw|hnsw_f16|hnsw_i8]
+  [--bind 127.0.0.1:5432] [--search-engine default|hnsw|hnsw_f16|hnsw_i8] \
+  [--hnsw-full-scan-ratio <num>/<den>] \
+  [--hnsw-acorn-max-visible-ratio <num>/<den>] \
+  [--hnsw-sparse-visited-max <N>]
 ```
 
 `--users`・`--db` はいずれも必須です（省略時は匿名ログイン・匿名 DB を暗黙生成せず
@@ -78,11 +81,29 @@ psycopg・node pg から無改造で cleartext password 認証つき接続でき
 節参照）を索引ノード常駐精度 f32／f16／I8（SQ8）で有効化します。不正な値・
 値欠落・2 回目以降の重複指定はいずれも fail-closed で起動エラーとなり、
 既定へ黙って読み替わることはありません。選択結果は `EXPLAIN` の
-`engine:`／`hnsw_params:` 行（Issue #411）で確認できます。`m`／`ef_*`／
-`full_scan_ratio`／`sparse_visited_max`／ACORN 等の探索パラメータの CLI
-露出は対象外（既定値のまま。後続 issue）です。ANN opt-in の性能評価ベンチ
-（`RecallEngine`）が使う `brute_force` トークンは本 CLI では受理しません
-（本 CLI の語彙は `default`／`hnsw`／`hnsw_f16`／`hnsw_i8` の 4 値に限定）。
+`engine:`／`hnsw_params:` 行（Issue #411）で確認できます。ANN opt-in の性能
+評価ベンチ（`RecallEngine`）が使う `brute_force` トークンは本 CLI では受理し
+ません（本 CLI の語彙は `default`／`hnsw`／`hnsw_f16`／`hnsw_i8` の 4 値に限定）。
+
+`--hnsw-full-scan-ratio`／`--hnsw-acorn-max-visible-ratio`／
+`--hnsw-sparse-visited-max`（Issue #657）はフィルタ付き ANN の探索パラメータ
+opt-in CLI 引数です。`--search-engine` が `hnsw`／`hnsw_f16`／`hnsw_i8` の
+いずれかのときのみ指定できます（`default`／未指定との組合せ・値欠落・形状
+不正（`<num>/<den>` 以外／非負整数以外）・意味不正（分母 0・`num > den`・
+`acorn_max_visible_ratio < full_scan_ratio`）・重複指定はいずれも fail-closed
+で起動エラー）。未指定時の既定値は下表のとおりで、これまでの実装既定値の
+まま不変です（`m`／`ef_*` の CLI 露出は引き続き対象外）。
+
+| CLI フラグ | 意味 | 既定値 | 対応するベンチ env |
+| ---------- | ---- | ------ | ------------------ |
+| `--hnsw-full-scan-ratio` | 可視カーディナリティ切替の閾値比（Issue #409）。可視候補数 ÷ 索引ノード数がこの比未満なら plain scan | `1/10` | `BENCH_KNN_PROFILE_FULL_SCAN_RATIO` |
+| `--hnsw-acorn-max-visible-ratio` | ACORN-1 の 2-hop 展開を有効化する可視比率の上限（Issue #501） | none（無効） | — |
+| `--hnsw-sparse-visited-max` | visited 集合の実装切替閾値（Issue #497） | `0`（常に dense） | `BENCH_KNN_PROFILE_SPARSE_VISITED_MAX` |
+
+`full_scan_ratio`／`acorn_max_visible_ratio` はテナント存在情報に繋がるため
+`EXPLAIN` の `hnsw_params:` 行へは出しません（Issue #411 の非露出方針を維持。
+`sparse_visited_max=` は Issue #497 で既に露出済みのため現状どおり出力され
+ます）。閾値の既定値の見直し・実測は Issue #659 の担当です。
 
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 

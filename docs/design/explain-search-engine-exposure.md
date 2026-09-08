@@ -119,7 +119,12 @@ Issue #497）・`acorn_max_visible_ratio`（ACORN-1 の 2-hop 展開切替閾値
   クエリへの拡張）は SQL-6 の定義範囲に関わるため spec 側の課題として申し送り
 - 実行時縮退結果・hybrid 密側再取得ラウンド数・キャッシュ状態の可視化
   （`EXPLAIN ANALYZE` 相当）は実行を伴うため別設計
-- `full_scan_ratio` 等の閾値露出の可否はオーナー判断待ち
+- `full_scan_ratio` 等の閾値の **`EXPLAIN` への露出可否**はオーナー判断待ちの
+  まま（据え置き）。一方 **CLI での設定露出**（`--hnsw-full-scan-ratio`／
+  `--hnsw-acorn-max-visible-ratio`）は Issue #657 で実装済み——`EXPLAIN` の
+  `hnsw_params:` 行への非露出方針自体は変わらない（`docs/design/
+  hnsw-search-engine-wiring.md`「CLI 探索パラメータ opt-in（Issue #657）」節
+  参照）
 - wire-server CLI でのエンジン選択露出は Issue #656 で実装済み
   （`--search-engine`。`docs/design/hnsw-search-engine-wiring.md` 参照）。
   テーブル単位カタログ属性でのエンジン選択露出は引き続き対象外（ADR
