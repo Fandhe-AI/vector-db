@@ -26,7 +26,19 @@
 //! 保持する（1 件でも `id > 2^53` があれば `None`。fail-closed。#474 が全走査へ
 //! 縮退する契機になる）。`NULL` 値はいずれの索引にもエントリを作らない
 //! （`declarative_filter::MetadataFilter::matches` の NULL 常時不一致と同じ
-//! 判定になることが本モジュールの単体テストの不変条件）。
+//! 判定になることが本モジュールの単体テストの不変条件）。**列単位の索引対象
+//! 除外**（Issue #632）: `TEXT` 列は平均値長（非 `NULL` 値の累積バイト量 ÷
+//! 件数）が [`MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`] を超えた時点で、それ以降
+//! 一切複製・索引化されず `ColumnType::Vector` の列と同じ「未索引」
+//! （`columns[i] = None`）へ合流する。これは fail-closed（構築全体の失敗）
+//! ではなく列単位の fail-soft な縮退であり、[`ScalarIndex::candidates_for`]・
+//! [`ScalarIndex::column_groups`] は除外列に対して常に `None` を返し、
+//! 呼び出し元（`sql::exec`・`sql::aggregate`・`sql::group_by`）は既存の
+//! 「列が索引未対応」契約のまま plain scan へ縮退する（呼び出し側 3 箇所は
+//! 無変更）。長文自由記述列（例: crossdb fixture の `body`）を索引化すると
+//! 索引が肥大化しヒット後のクエリのアロケータ状態が悪化する実測
+//! （Issue #632 本文）を踏まえた対策で、短い分類値の列（例: `lang`/`topic`）は
+//! 従来どおり索引化される。
 //!
 //! **キャッシュ（[`ScalarIndexCache`]）**: キー・世代源泉・fail-closed 契約は
 //! [`crate::sql::arena_cache::SqlArenaCache`]（Issue #363）と同型
@@ -68,6 +80,22 @@ use crate::storage::Storage;
 /// 受入条件が vacuous になるため、より緩い閾値を採用する）。
 const DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_NUMERATOR: u64 = 1;
 const DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_DENOMINATOR: u64 = 2;
+
+/// [`ScalarIndex::build`] が `TEXT` 列を索引対象から除外する平均値長の閾値
+/// （バイト。本リポジトリの実装既定値・spec 非関与。Issue #632）。
+///
+/// crossdb fixture（25,000 行・`lang`/`topic`/`body`）では、長文自由記述列
+/// `body` まで無条件に索引化すると索引が約 8MiB に達し、以降の hybrid
+/// クエリのアロケータ状態が悪化して p50 が約 10% 劣化することが実測で
+/// 判明した（`body` を索引対象から外した実験ビルドで回復を確認済み。
+/// WHERE を伴わないクエリでは差がない）。本定数は列ごとの平均値長
+/// （非 `NULL` 値の累積バイト量 ÷ 件数。行数ではなく実際に索引化を試みた
+/// 非 `NULL` 値の件数を分母にすることで、NULL の多い疎な列を不当に除外
+/// しない）がこの値を超えた時点でその列を索引対象から除外する。
+/// `lang`/`topic`（短い分類値）と `body`（長文）を分離する閾値として暫定
+/// 128 を採用した。前後比較実測（crossdb fixture での hybrid p50 回復確認。
+/// 別 Issue へ申し送り）の結果次第で再検討され得る実装既定値である。
+const MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN: usize = 128;
 
 /// [`ScalarIndexCache`] のエントリ数上限（`sql::arena_cache::SqlArenaCache`・
 /// `core.rs::PrefilterCache` と同じ DoS 対策方針を踏襲する）。
@@ -460,7 +488,31 @@ impl ScalarIndex {
         per_column
             .try_reserve_exact(column_count)
             .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
-        for column in &schema.columns {
+
+        // 列単位の平均値長ゲート（Issue #632。モジュールドキュメント「列単位の
+        // 索引対象除外」参照）が使う作業領域。列ごとに (a) 初期 `acc` 確保分
+        // として `approx_bytes` へ計上済みのバイト量（除外時の返還額の基準）・
+        // (b) これまでに索引化した非 `NULL` 値の累積バイト量・(c) 同じく件数
+        // を追跡する。`column_count` は `schema.columns.len()`（untrusted な
+        // 行数ではなくスキーマ由来のため小さく、通常のアロケーションで十分だが
+        // 他の列配列との一貫性のため `try_reserve_exact` で確保する）。
+        let mut col_reservation_bytes: Vec<usize> = Vec::new();
+        col_reservation_bytes
+            .try_reserve_exact(column_count)
+            .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+        col_reservation_bytes.resize(column_count, 0);
+        let mut col_running_bytes: Vec<usize> = Vec::new();
+        col_running_bytes
+            .try_reserve_exact(column_count)
+            .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+        col_running_bytes.resize(column_count, 0);
+        let mut col_nonnull_count: Vec<usize> = Vec::new();
+        col_nonnull_count
+            .try_reserve_exact(column_count)
+            .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+        col_nonnull_count.resize(column_count, 0);
+
+        for (col_index, column) in schema.columns.iter().enumerate() {
             match column.ty {
                 ColumnType::Text => {
                     // `acc` は 1 行につき列あたり高々 1 値しか追加されないため
@@ -473,6 +525,9 @@ impl ScalarIndex {
                     let reservation_bytes = per_column_accumulator_reservation_bytes(row_count);
                     check_scalar_index_budget(approx_bytes, reservation_bytes)?;
                     approx_bytes = approx_bytes.saturating_add(reservation_bytes);
+                    if let Some(slot) = col_reservation_bytes.get_mut(col_index) {
+                        *slot = reservation_bytes;
+                    }
                     let mut acc: Vec<(String, u32)> = Vec::new();
                     acc.try_reserve_exact(row_count)
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
@@ -493,12 +548,53 @@ impl ScalarIndex {
                 scan_scalar_columns(schema, metadata).map_err(ScalarIndexBuildError::RowDecode)?;
             for (col_index, value) in scanned.into_iter().enumerate() {
                 let Some(v) = value else { continue };
+                // この列がまだ索引対象か（`TEXT` 列かつ平均値長ゲートで未除外か）
+                // を先に確認する。`Vector` 列・既に除外済みの列は静かにスキップ
+                // する（モジュールドキュメント「列単位の索引対象除外」参照）。
+                let is_indexed_column = matches!(per_column.get(col_index), Some(Some(_)));
+                if !is_indexed_column {
+                    continue;
+                }
+                let v_len = v.len();
+                let (Some(&running), Some(&nonnull)) = (
+                    col_running_bytes.get(col_index),
+                    col_nonnull_count.get(col_index),
+                ) else {
+                    // `col_running_bytes`/`col_nonnull_count` は `column_count`
+                    // ちょうどの長さで確保済みであり、`col_index` は同じ
+                    // `schema.columns` 由来のため通常到達しないが、untrusted
+                    // 入力経路の添字アクセス回避方針に従い defensive に
+                    // スキップする（この列を索引化しないだけで構築全体は
+                    // 失敗させない）。
+                    continue;
+                };
+                let prospective_count = nonnull.saturating_add(1);
+                let prospective_bytes = running.saturating_add(v_len);
+                let avg_threshold_bytes =
+                    prospective_count.saturating_mul(MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN);
+                if prospective_bytes > avg_threshold_bytes {
+                    // 平均値長が閾値を超過: この列を索引対象から除外する
+                    // （fail-closed な構築全体の失敗ではなく、列単位の
+                    // fail-soft な縮退。モジュールドキュメント参照）。
+                    // 除外時点までに計上済みのバイト量（初期 `acc` 確保分＋
+                    // これまでに複製した文字列本体分）を予算から差し戻す
+                    // （このスロット以降、当該列の値は一切複製・索引化しない
+                    // ため、確保済みメモリは `per_column[col_index] = None`
+                    // の代入で解放される）。
+                    let reservation = col_reservation_bytes.get(col_index).copied().unwrap_or(0);
+                    let refund = reservation.saturating_add(running);
+                    approx_bytes = approx_bytes.saturating_sub(refund);
+                    if let Some(slot_acc) = per_column.get_mut(col_index) {
+                        *slot_acc = None;
+                    }
+                    continue;
+                }
                 if let Some(Some(acc)) = per_column.get_mut(col_index) {
                     // タプル・`Vec` の確保容量分は上記の事前一括確保
                     // （`per_column_accumulator_reservation_bytes`）で
                     // 既に予算計上済みのため、ここでは文字列本体（ヒープ）の
                     // バイト量のみを追加計上する（二重計上を避ける）。
-                    let additional = v.len();
+                    let additional = v_len;
                     check_scalar_index_budget(approx_bytes, additional)?;
                     let owned = try_owned_string(v)?;
                     approx_bytes = approx_bytes.saturating_add(additional);
@@ -507,6 +603,12 @@ impl ScalarIndex {
                     // push されないため、この push が容量を超えて再確保
                     // （＝未計上の追加確保）を起こすことはない。
                     acc.push((owned, slot_u32));
+                    if let Some(slot) = col_running_bytes.get_mut(col_index) {
+                        *slot = prospective_bytes;
+                    }
+                    if let Some(slot) = col_nonnull_count.get_mut(col_index) {
+                        *slot = prospective_count;
+                    }
                 }
             }
         }
@@ -658,6 +760,13 @@ impl ScalarIndex {
         column.slots_for_value_index(value_index)
     }
 
+    /// `column_index` 列が実際に索引化されているか（`TEXT` 列かつ平均値長
+    /// ゲート〔Issue #632〕で除外されていないか）を返すテスト専用アクセサ。
+    #[cfg(test)]
+    fn column_is_indexed(&self, column_index: usize) -> bool {
+        matches!(self.columns.get(column_index), Some(Some(_)))
+    }
+
     /// [`MetadataFilter`] を評価し、一致スロットの**昇順** `Vec<u32>` を返す。
     /// 列が `TEXT` でない・未知の列は `None`。一致 0 件（列は索引済みだが値が
     /// 存在しない）は `Some(vec![])` を返す（`None` と区別する）。
@@ -680,13 +789,14 @@ impl ScalarIndex {
     /// 昇順（[`Self::build`] の `TextColumnIndex.values` と同じ順序）で列挙する
     /// （Issue #475: `sql::group_by` の `WHERE` なし `GROUP BY` 列挙形が使う）。
     /// 列が `TEXT` でない・未知の列は `None`。各グループのスロット列は昇順。
-    /// [`Self::build`] は該当列の非 `NULL` 値を**すべて**索引化するか（成功）、
-    /// 予算超過等で索引全体の構築を諦めるか（`Err`。この場合キャッシュに
-    /// エントリ自体が存在しない）のいずれかであり、一部の値だけを欠落させたまま
-    /// 索引を返すことはないため（モジュールドキュメント「データモデル」・
-    /// [`Self::build`] 参照）、ここで列挙される値は当該列の可視行が実際に
-    /// 持つ非 `NULL` 値の**全体**である（一部スキップによる取りこぼしを呼び
-    /// 出し元が心配する必要はない）。
+    /// [`Self::build`] は個々の `TEXT` 列について、非 `NULL` 値を**すべて**
+    /// 索引化する（`Some`）か、まったく索引化しない（`None`。予算超過等に
+    /// よる索引全体の構築失敗、または平均値長ゲート〔Issue #632・モジュール
+    /// ドキュメント「列単位の索引対象除外」参照〕による当該列の除外の
+    /// いずれか）かのいずれかであり、**ある列が `Some` として返る場合に**
+    /// 一部の値だけを欠落させたまま索引を返すことはないため、ここで列挙
+    /// される値は当該列の可視行が実際に持つ非 `NULL` 値の**全体**である
+    /// （一部スキップによる取りこぼしを呼び出し元が心配する必要はない）。
     pub(crate) fn column_groups(
         &self,
         column_index: usize,
@@ -2280,5 +2390,188 @@ mod tests {
             .expect("embedding column");
         assert!(index.column_groups(embedding_col).is_none());
         assert!(index.slots_without_value(embedding_col).is_none());
+    }
+
+    // ---------- 列単位の索引対象除外（平均値長ゲート。Issue #632） ----------
+
+    #[test]
+    fn build_keeps_indexing_text_column_with_short_values() {
+        // 短い分類値のみの列（`kind` 相当）は従来どおり索引化される回帰確認。
+        let db_path = unique_db_path("scalar-index-avg-len-short-kept");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        insert(&storage, &c, 1, Some("alpha"), None, Visibility::Public);
+        insert(&storage, &c, 2, Some("beta"), None, Visibility::Public);
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let kind_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "kind")
+            .expect("kind column");
+        assert!(
+            index.column_is_indexed(kind_col),
+            "短い値のみの列は平均値長ゲートで除外されない"
+        );
+        assert_eq!(
+            index
+                .candidates_for(&MetadataFilter_equals(&schema, "kind", "alpha"))
+                .expect("indexed column"),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn build_excludes_text_column_exceeding_avg_length_threshold() {
+        // 平均値長が閾値を大きく超える列（`body` 相当。ここでは既存スキーマの
+        // `path` 列を長文専用に使う）は索引対象から除外され、
+        // `candidates_for`／`column_groups` がいずれも `None` を返す。
+        let db_path = unique_db_path("scalar-index-avg-len-excluded");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        let long_value = "x".repeat(MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN * 4);
+        insert(
+            &storage,
+            &c,
+            1,
+            Some("alpha"),
+            Some(long_value.as_str()),
+            Visibility::Public,
+        );
+        insert(
+            &storage,
+            &c,
+            2,
+            Some("beta"),
+            Some(long_value.as_str()),
+            Visibility::Public,
+        );
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let kind_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "kind")
+            .expect("kind column");
+        let path_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "path")
+            .expect("path column");
+        assert!(
+            index.column_is_indexed(kind_col),
+            "長文列の除外が他の短い列の索引化に影響してはならない"
+        );
+        assert!(
+            !index.column_is_indexed(path_col),
+            "平均値長が閾値超過の列は索引対象から除外される"
+        );
+        assert!(index
+            .candidates_for(&MetadataFilter_equals(&schema, "path", &long_value))
+            .is_none());
+        assert!(index.column_groups(path_col).is_none());
+    }
+
+    #[test]
+    fn build_avg_length_gate_uses_nonnull_value_count_not_row_count() {
+        // 除外判定は「行数」ではなく「非 NULL 値の件数」基準であることの確認。
+        // NULL の多い疎な列に短い値のみを混在させても、平均値長は非 NULL 値の
+        // 件数を分母に計算されるため除外されない。
+        let db_path = unique_db_path("scalar-index-avg-len-sparse-nulls");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        // 大量の NULL 行（`path` 列が NULL）を挟んでも、実際に値を持つ行が
+        // いずれも短ければ列は除外されない。
+        for id in 1..=50u64 {
+            insert(&storage, &c, id, Some("alpha"), None, Visibility::Public);
+        }
+        insert(
+            &storage,
+            &c,
+            51,
+            Some("alpha"),
+            Some("short"),
+            Visibility::Public,
+        );
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let path_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "path")
+            .expect("path column");
+        assert!(
+            index.column_is_indexed(path_col),
+            "NULL の多い疎な列でも非 NULL 値が短ければ除外されない（行数基準ではない）"
+        );
+    }
+
+    #[test]
+    fn build_excluded_column_does_not_contribute_to_approx_heap_bytes() {
+        // 除外後も approx_heap_bytes() が除外列のコストを含まない小さい値に
+        // なることの確認（除外によりメモリを消費しないことの直接証跡）。
+        let excluded_db = unique_db_path("scalar-index-avg-len-bytes-excluded");
+        let _excluded_guard = CleanupGuard(excluded_db.clone());
+        let storage_excluded = Storage::open(&excluded_db).expect("open storage");
+        create_table(&storage_excluded);
+        let c = ctx("tenant-a");
+        let long_value = "x".repeat(MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN * 8);
+        for id in 1..=5u64 {
+            insert(
+                &storage_excluded,
+                &c,
+                id,
+                Some("alpha"),
+                Some(long_value.as_str()),
+                Visibility::Public,
+            );
+        }
+        let (snapshot_excluded, schema_excluded) = snapshot_from(&storage_excluded, &c);
+        let index_excluded =
+            ScalarIndex::build(&schema_excluded, &snapshot_excluded).expect("build index");
+        let path_col = schema_excluded
+            .columns
+            .iter()
+            .position(|col| col.name == "path")
+            .expect("path column");
+        assert!(!index_excluded.column_is_indexed(path_col));
+
+        // 対照: 同じ行数・同じ `kind` 値だが `path` が常に `NULL`（除外対象
+        // 列そのものを持たない）の索引と比べ、除外後の索引がおおむね同水準
+        // まで小さいことを確認する（除外列の長文コストを含んでいれば、この
+        // 対照よりずっと大きくなるはず）。
+        let baseline_db = unique_db_path("scalar-index-avg-len-bytes-baseline");
+        let _baseline_guard = CleanupGuard(baseline_db.clone());
+        let storage_baseline = Storage::open(&baseline_db).expect("open storage");
+        create_table(&storage_baseline);
+        for id in 1..=5u64 {
+            insert(
+                &storage_baseline,
+                &c,
+                id,
+                Some("alpha"),
+                None,
+                Visibility::Public,
+            );
+        }
+        let (snapshot_baseline, schema_baseline) = snapshot_from(&storage_baseline, &c);
+        let index_baseline =
+            ScalarIndex::build(&schema_baseline, &snapshot_baseline).expect("build index");
+
+        // 除外により長文コスト（`long_value.len() * 5` 相当）を含まない
+        // ため、除外後の索引は長文 1 件分未満の差に収まる。
+        assert!(
+            index_excluded.approx_heap_bytes()
+                < index_baseline.approx_heap_bytes() + long_value.len(),
+            "除外列の長文コストが approx_heap_bytes() に計上されてはならない: excluded={} baseline={}",
+            index_excluded.approx_heap_bytes(),
+            index_baseline.approx_heap_bytes()
+        );
     }
 }

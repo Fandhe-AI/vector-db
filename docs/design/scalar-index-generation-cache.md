@@ -118,3 +118,69 @@ Issue #474）。構築・登録の失敗はクエリを失敗させない（fail
 - RLS 不変の統合テストスイート・損益分岐実測・閾値確定
 - `IN`／`BETWEEN` 構文（現行許可リストに無い）
 - `core.rs::PrefilterCache` のテーブル単位世代への統一
+
+## 追記（Issue #632）
+
+### 問題
+
+crossdb fixture（25,000 行・`lang`/`topic`/`body` の 3 `TEXT` 列）では、
+`ScalarIndex::build` がスキーマ中の**全 `TEXT` 列**を無条件に索引化していた
+ため、長文自由記述列 `body` まで索引化され索引が約 8MiB に達し、以降の
+hybrid クエリのアロケータ状態が悪化して p50 が約 10% 劣化することが実測で
+判明した（`WHERE` を伴わないクエリでは差がない。`body` を索引対象から
+外した実験ビルドで回復を確認済み）。
+
+### 採用した対策
+
+`ScalarIndex::build`（`crates/engine/src/sql/scalar_index.rs`）に列単位の
+**平均値長ゲート**を追加した。`TEXT` 列ごとに、これまでに索引化した非
+`NULL` 値の累積バイト量 ÷ 件数（行数ではなく実際に索引化を試みた非 `NULL`
+値の件数を分母にする。NULL の多い疎な列を不当に除外しないため）が定数
+`MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`（暫定 128 バイト。本リポジトリの
+実装既定値・spec 非関与）を超えた時点で、その列を索引対象から除外する
+（`per_column[i] = None`。以降その列の値は一切複製・索引化しない）。
+
+除外は列単位の **fail-soft な縮退**であり、`ScalarIndex::build` 自体を
+失敗させる `ScalarIndexBuildError`（fail-closed。索引全体が構築されない）
+とは異なる。除外された列は `ColumnType::Vector` の列と同じ「未索引」
+（`columns[i] = None`）へ合流するため、`ScalarIndex::candidates_for`・
+`ScalarIndex::column_groups` は既存どおり `None` を返し、呼び出し元
+（`sql::exec::execute_statement_with_cache`〔Issue #474〕・
+`sql::aggregate::try_scalar_index_aggregate`〔Issue #475〕・
+`sql::group_by::observe_group_enumeration`〔Issue #475〕の 3 箇所）は既存の
+「列が索引未対応」契約（`FallbackNoIndex`／全走査フォールバック）のまま
+plain scan へ縮退する。**呼び出し側 3 箇所はいずれも無変更**である。
+
+### 「述語参照列限定（遅延構築）」案を採らなかった理由
+
+Issue 本文が示すもう一つの案（述語で実際に参照された列だけを索引化する
+遅延・列単位構築）は、`ScalarIndex`／`ScalarIndexCache` が `(table, ctx)` ×
+テーブル単位世代のみをキーにした**単一の索引インスタンス**を、SELECT の
+SCALAR 事前フィルタ・集計 `WHERE`・`GROUP BY` キー列挙という異なる形状の
+複数クエリで使い回す設計であるため、素直に実装すると後続の別クエリが
+異なる列を参照した時点で索引の再構築・拡張・キャッシュ無効化の追加設計が
+必要になりリスク・変更範囲が大きい。平均値長による列単位除外は「列が
+索引対象かどうか」を構築時に一度だけ・データから静的に決定できる性質を
+保てるため、既存のキャッシュ・呼び出し側を一切変更せずに済む。
+
+### 検証
+
+`sql/scalar_index.rs::tests` に、短い列は従来どおり索引化される回帰確認・
+長文列の除外確認・除外判定が行数ではなく非 `NULL` 値件数基準であることの
+確認・除外後の `approx_heap_bytes()` が除外列のコストを含まないことの確認の
+4 本を追加した。`tests/scalar_index_prune.rs` に、除外列への等価・前方一致
+述語が全走査と一致する結果を返しつつ `index_scans` を増やさず
+`plain_scan_fallbacks` を増やすこと、短い列の索引消費が除外の影響を受けない
+こと、短い列と除外列の複合述語が索引経路を一切使わないこと（`FallbackNoIndex`
+の既存契約どおり、述語 1 つでも `candidates_for` が `None` を返せば全体が
+縮退する）、除外列の値が RLS 判定をバイパスしないこと（他テナント private 行
+の非漏えい）の 5 シナリオを追加した。`tests/scalar_index_aggregate.rs` にも、
+`GROUP BY`（`WHERE` なし・列挙形）が除外列に対して `aggregate_index_scans` を
+消費せず全走査と一致することを確認するテストを 1 本追加した。
+
+### スコープ外・申し送り
+
+crossdb fixture 相当での hybrid p50 の前後比較実測（Issue #632 本文の受け入れ
+条件）は次 Issue へ申し送る。閾値 `MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`
+（128）の最終値は本リポジトリの実装既定値であり、前後比較実測 Issue の結果
+次第で再検討され得る。

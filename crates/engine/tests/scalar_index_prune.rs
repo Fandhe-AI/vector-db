@@ -21,6 +21,13 @@
 //!    いても従来どおり `22000` で拒否する（残余述語ありなので索引不使用）
 //! 5. RLS: 他テナントの private 行は索引経路でも一切露出しない
 //! 6. テーブル世代の進行後、索引は再構築され結果は一貫し続ける
+//!
+//! 加えて、列単位の索引対象除外（平均値長ゲート。Issue #632・
+//! `sql::scalar_index::MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`）が SQL 表層の
+//! 述語評価に影響しないこと（除外列への述語は `FallbackNoIndex` として
+//! plain scan へ縮退しつつ、結果自体は常に全走査と一致し続けること）を
+//! 「除外される長文列（`body`）」を持つ専用スキーマ（`schema_with_body`）で
+//! 別途検証する（下部「列単位の索引対象除外」節参照）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -479,4 +486,252 @@ fn index_rebuilds_after_generation_bump_and_results_stay_consistent() {
 
     // 再構築後の索引でも cold/hot 等価性が維持される。
     assert_cold_hot_equivalent(&core, "tenant-a", sql);
+}
+
+// --- 列単位の索引対象除外（平均値長ゲート。Issue #632） --------------------
+//
+// `sql::scalar_index::ScalarIndex::build` は平均値長が閾値（本リポジトリの
+// 実装既定値。`crates/engine/src/sql/scalar_index.rs::
+// MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN` 参照）を超える `TEXT` 列を索引対象
+// から除外する。除外は `candidates_for`/`column_groups` が `None` を返す
+// 既存の「列が索引未対応」契約へ合流するだけであり、`sql::exec` はこれを
+// `CandidateResolution::FallbackNoIndex` として plain scan へ縮退させる
+// （SELECT を先に流さなくても集計・GROUP BY 経路〔Issue #475〕から piggyback
+// で索引が構築される契約と同型で、除外判定自体は構築時に確定する）。
+
+/// `embedding`／`kind`（短い分類値）／`body`（除外対象になる長文自由記述）を
+/// 持つ専用スキーマ。既存 `schema()`／`insert_row` は非破壊のまま、本節専用に
+/// 新設する（他の契約テストへの影響を避けるため）。
+fn schema_with_body() -> TableSchema {
+    TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("kind", ColumnType::Text, false),
+            ColumnDef::new("body", ColumnType::Text, false),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_row_with_body(
+    storage: &Storage,
+    tenant_ctx: &PolicyContext,
+    id: u64,
+    embedding: [f32; 2],
+    kind: &str,
+    body: &str,
+    visibility: Visibility,
+) {
+    engine::tenant::insert_typed_row(
+        storage,
+        TABLE,
+        tenant_ctx,
+        id,
+        visibility,
+        &[
+            Value::Vector(embedding.to_vec()),
+            Value::Text(kind.to_string()),
+            Value::Text(body.to_string()),
+        ],
+        &op_id(&format!("seed-body-{id}")),
+    )
+    .expect("insert row");
+}
+
+/// 平均値長ゲート（Issue #632）で必ず除外される長さの `body` 値。閾値の
+/// 具体値（本リポジトリの実装既定値）に依存しない安全マージンを取り、
+/// `id` ごとに一意な接頭辞（`body-{id}-`）を持たせて前方一致述語の
+/// テストでも `id` を一意に選別できるようにする。
+fn long_body_value(id: u64) -> String {
+    format!("body-{id}-{}", "x".repeat(1000))
+}
+
+/// 10 行（`id` 1..=10）: 偶数 `id` は `kind = 'a'`、奇数 `id` は `kind = 'b'`。
+/// `body` は常に [`long_body_value`]（除外対象の長文）。距離は `id` に単調な
+/// ベクトルにし、`ORDER BY ... LIMIT 20`（全件超）で常に全一致行を取得できる
+/// ようにする（`seed_ten_rows` と対になる、`body` 列を持つ版）。
+fn seed_ten_rows_with_long_body(storage: &Storage, tenant: &str) {
+    let tenant_ctx = ctx(tenant);
+    for id in 1..=10u64 {
+        let kind = if id % 2 == 0 { "a" } else { "b" };
+        insert_row_with_body(
+            storage,
+            &tenant_ctx,
+            id,
+            [id as f32, 0.0],
+            kind,
+            &long_body_value(id),
+            Visibility::Public,
+        );
+    }
+}
+
+// --- シナリオ a: 除外列への等価述語 -----------------------------------------
+
+#[test]
+fn excluded_long_text_column_equality_predicate_matches_full_scan_and_skips_index() {
+    let path = unique_db_path("scalar-index-prune-excluded-equality");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_body())
+        .expect("create table");
+    seed_ten_rows_with_long_body(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    let target = long_body_value(3);
+    let sql = format!(
+        "SELECT id FROM docs WHERE body = '{target}' ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20"
+    );
+    let before = core.scalar_index_cache_stats();
+    let cold = run(&core, "tenant-a", &sql);
+    let hot = run(&core, "tenant-a", &sql);
+    assert_eq!(
+        result_ids(&cold),
+        result_ids(&hot),
+        "cold/hot results must match exactly even when the predicate column is excluded"
+    );
+    assert_eq!(result_ids(&hot), vec![3]);
+    let after = core.scalar_index_cache_stats();
+    assert!(
+        after.plain_scan_fallbacks > before.plain_scan_fallbacks,
+        "an equality predicate on an excluded (too-long) column must fall back to a plain scan"
+    );
+    assert_eq!(
+        after.index_scans, before.index_scans,
+        "an excluded column must never be counted as an index scan"
+    );
+}
+
+// --- シナリオ b: 除外列への前方一致述語 -------------------------------------
+
+#[test]
+fn excluded_long_text_column_prefix_predicate_matches_full_scan_and_skips_index() {
+    let path = unique_db_path("scalar-index-prune-excluded-prefix");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_body())
+        .expect("create table");
+    seed_ten_rows_with_long_body(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    // `body-1-` は `id=1` の値にのみ前方一致する（`id=10` は `body-10-` で
+    // 4 文字目が異なる）。
+    let sql = "SELECT id FROM docs WHERE body LIKE 'body-1-%' \
+               ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20";
+    let before = core.scalar_index_cache_stats();
+    let cold = run(&core, "tenant-a", sql);
+    let hot = run(&core, "tenant-a", sql);
+    assert_eq!(result_ids(&cold), result_ids(&hot));
+    assert_eq!(result_ids(&hot), vec![1]);
+    let after = core.scalar_index_cache_stats();
+    assert!(
+        after.plain_scan_fallbacks > before.plain_scan_fallbacks,
+        "a prefix predicate on an excluded (too-long) column must fall back to a plain scan"
+    );
+    assert_eq!(
+        after.index_scans, before.index_scans,
+        "an excluded column must never be counted as an index scan"
+    );
+}
+
+// --- シナリオ c: 短い列は除外の影響を受けず索引を消費し続ける ---------------
+
+#[test]
+fn short_text_column_still_uses_index_alongside_excluded_long_column() {
+    let path = unique_db_path("scalar-index-prune-excluded-short-unaffected");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_body())
+        .expect("create table");
+    seed_ten_rows_with_long_body(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    // `body` 列（除外対象）を含まない `kind` 単独述語は、`body` 列の除外の
+    // 有無に関わらず従来どおり索引を消費する（回帰確認）。
+    let sql = "SELECT id FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20";
+    let index_scans = assert_cold_hot_equivalent(&core, "tenant-a", sql);
+    assert!(
+        index_scans > 0,
+        "excluding one column must not prevent another indexed column from being used"
+    );
+    let result = run(&core, "tenant-a", sql);
+    assert_eq!(result_ids(&result), vec![2, 4, 6, 8, 10]);
+}
+
+// --- シナリオ d: 短い列＋除外列の複合述語は索引経路を一切使わない -----------
+
+#[test]
+fn compound_predicate_with_excluded_column_skips_index_entirely() {
+    let path = unique_db_path("scalar-index-prune-excluded-compound");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_body())
+        .expect("create table");
+    seed_ten_rows_with_long_body(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    // `kind` は索引対応述語だが、`body` の等価述語で `candidates_for` が
+    // `None` を返すため `resolve_candidates` は述語 1 つでも `None` に
+    // 遭遇した時点で全体を `FallbackNoIndex` にする既存実装（モジュール
+    // ドキュメント「消費経路」参照）。索引経路を一切使わず、結果は全走査と
+    // 一致する。
+    let target = long_body_value(4);
+    let sql = format!(
+        "SELECT id FROM docs WHERE kind = 'a' AND body = '{target}' \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20"
+    );
+    let before = core.scalar_index_cache_stats();
+    let cold = run(&core, "tenant-a", &sql);
+    let hot = run(&core, "tenant-a", &sql);
+    assert_eq!(result_ids(&cold), result_ids(&hot));
+    assert_eq!(result_ids(&hot), vec![4]);
+    let after = core.scalar_index_cache_stats();
+    assert!(
+        after.plain_scan_fallbacks > before.plain_scan_fallbacks,
+        "a compound predicate referencing an excluded column must fall back to a plain scan"
+    );
+    assert_eq!(
+        after.index_scans, before.index_scans,
+        "a compound predicate referencing an excluded column must never use the index"
+    );
+}
+
+// --- シナリオ e: RLS ---------------------------------------------------------
+
+#[test]
+fn excluded_column_predicate_never_leaks_other_tenant_private_rows() {
+    let path = unique_db_path("scalar-index-prune-excluded-rls");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_body())
+        .expect("create table");
+    seed_ten_rows_with_long_body(&storage, "tenant-a");
+    // 別テナントの private 行。`body` は tenant-a の `id=3` 行と全く同じ値
+    // （除外列の値が RLS 判定をバイパスしないことを固定する）。
+    insert_row_with_body(
+        &storage,
+        &ctx("tenant-b"),
+        999,
+        [3.0, 0.0],
+        "a",
+        &long_body_value(3),
+        Visibility::Private,
+    );
+    let core = new_core(storage);
+
+    let target = long_body_value(3);
+    let sql = format!(
+        "SELECT id FROM docs WHERE body = '{target}' ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20"
+    );
+    let cold = run(&core, "tenant-a", &sql);
+    let hot = run(&core, "tenant-a", &sql);
+    assert!(!result_ids(&cold).contains(&999));
+    assert!(!result_ids(&hot).contains(&999));
+    assert_eq!(result_ids(&hot), vec![3]);
 }
