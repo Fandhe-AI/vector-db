@@ -578,6 +578,7 @@ after min/median 6285.0/6317.2µs（比 1.0136）・before_ref min/median
 - 共有 QEMU 環境の参考値であり、専有環境での再実測はオーナー作業として
   申し送る（`docs/design/benchmark-judgement-policy.md` §9 と同方針。
   親 #630 の確定 close 判断もこの再実測を条件とする）。
+  → 2026-09-08 に実施済み（次節参照）。
 - 参照帯（16.18%／8.64%）が本節の主要な改善幅（3.8%〜9.8%）より広く、
   「両ノイズ帯超え」を要求する厳密な判定では `regressed`/`improved` の
   確定に至らない指標がある。after/ref 比の収束（1.00〜1.04）を補助的な
@@ -593,3 +594,42 @@ after min/median 6285.0/6317.2µs（比 1.0136）・before_ref min/median
   済み）を踏まえると現時点では不要と判断する。今後 crossdb fixture の
   `body` 生成方式が変わり平均長が再び 64 バイト未満になった場合は
   再検討が必要になりうる。
+
+## 専有環境での再実測（2026-09-08・Issue #645 申し送り対応）
+
+Issue #645 節で「共有 QEMU 環境の参考値であり、専有環境での再実測はオーナー作業として申し送る」とされた項目の実施記録。
+
+### 計測条件
+
+- 環境: 本開発環境（QEMU x86_64・12 論理 CPU・Avx2Fma）を**専有状態**（他ジョブ・他コンテナ計測なし。実行直前〔ビルド前・別時点〕の loadavg は 0.07。計測中の 1 分平均は生ログ `20260908T122254Z-loadavg.log` で 1.17〜3.33〔平均 2.00・3 分の 2 が 1.2〜2.5 帯〕であり、これは計測プロセス群〔wire-server・Python ハーネス・並列 provider スレッド〕自身の負荷で、外部ジョブは無い）で `BENCH_DEDICATED_ENV=1` を付与して実行。Issue #645 節（共有状態・loadavg に他 worktree のジョブ混入）との差は環境条件のみ。
+- コマンド: `BENCH_DEDICATED_ENV=1 BEFORE_COMMIT=cbe80cf AFTER_COMMIT=2f1cd80 REF_COMMIT=ee99db3 AB_PAIRS=5 CROSSDB_DIR=<docs25k> CROSSDB_PYTHON=<venv python> scripts/bench_scalar_index_crossdb_ab.sh`（Issue #645 節と同一の 3 arm・交互 5 ペア・HYBRID_ITERS 200・WARM_WHERE 50）
+- セッション ts: `20260908T122254Z`。生データは `docs/design/bench-data/scalar-index-crossdb-ab/20260908T122254Z-*`（本コミットで追跡）。集約: `scripts/bench_scalar_index_crossdb_ab.sh --summarize docs/design/bench-data/scalar-index-crossdb-ab 20260908T122254Z`
+- 参照区間実測帯（`vector_knn.p50` の run-to-run 幅）: before+after プール **5.11%**（Issue #645 節の共有環境では 16.18%）、before_ref+ref プール **11.32%**（同 8.64%）。固定帯は ±5%。
+
+### 結果（min-of-5 / median。単位 µs、RSS は MiB）
+
+| 区間 | before min/median | after min/median | after/before（min 比） | after 判定 | before_ref min/median | ref min/median | ref/before_ref（min 比） | ref 判定 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `hybrid_rrf`.p50 | 6870.29 / 7016.64 | 6495.41 / 6576.86 | 0.9454 | **improved**（固定 ±5% 帯・参照帯 5.11% の両方を超える） | 6859.17 / 7019.85 | 6313.43 / 6376.44 | 0.9204 | within_band（参照帯 11.32% 内） |
+| `bulk_hybrid_k200`.p50 | 9588.69 / 9682.43 | 9134.21 / 9310.86 | 0.9526 | within_band（改善幅 4.74%。固定 ±5% 帯・参照帯 5.11% の両方の内側） | 9493.33 / 9572.71 | 9629.63 / 9704.21 | 1.0144 | within_band |
+| `vector_knn_where`.p50 | 1940.75 / 1972.94 | 1965.30 / 1980.82 | 1.0126 | within_band | 1911.86 / 1940.41 | 2975.47 / 3032.20 | 1.5563 | regressed（ref が遅い＝#473 以降の高速化分） |
+| `where_compound_count`.p50 | 1030.13 / 1033.73 | 1033.00 / 1033.79 | 1.0028 | within_band | 1025.89 / 1031.53 | 4280.36 / 4355.02 | 4.1723 | regressed（同上） |
+| 参照: `vector_knn`.p50 | 671.69 / 679.89 | 695.85 / 700.66 | 1.0360 | within_band | 666.81 / 684.23 | 682.84 / 709.97 | 1.0240 | within_band |
+| hybrid ループ `warm_where_then_hybrid`.p50 | 6822.78 / 6885.27 | 6149.47 / 6174.10 | 0.9013 | **improved**（約 9.9% 改善・両帯超え） | 6836.53 / 6871.82 | 6122.10 / 6196.49 | 0.8955 | within_band（参照帯 11.32% 内） |
+| hybrid ループ `warm_where_then_hybrid`.rss_after_warm | 63.71 / 63.75 | 55.50 / 55.66 | 0.8711 | improved | 63.71 / 63.82 | 56.30 / 56.32 | 0.8837 | improved |
+| hybrid ループ `body_predicate`.p50 | 105.54 / 106.77 | 1773.67 / 1780.22 | 16.8058 | regressed（両帯超え。除外列への前方一致述語の plain scan 縮退） | 104.98 / 108.20 | 1725.34 / 1765.19 | 16.4343 | regressed（同水準） |
+| hybrid ループ `body_predicate`.rss_after_warm | 59.00 / 59.11 | 51.05 / 51.12 | 0.8654 | improved | 58.84 / 58.95 | 47.85 / 47.90 | 0.8132 | improved |
+
+after/ref（min 比・参考）: `hybrid_rrf`.p50 6495.41/6313.43 = 1.0288、`warm_where_then_hybrid`.p50 6149.47/6122.10 = 1.0045、`rss_after_warm` 55.50/56.30 = 0.9858、`body_predicate`.p50 1773.67/1725.34 = 1.0280。
+
+### 判定
+
+1. **参照区間帯の大幅縮小**: 参照区間帯が共有環境の 16.18% から 5.11% へ縮小し、固定 ±5% 帯と実測帯の「両方を超える」判定基準（`docs/design/benchmark-judgement-policy.md` §4）が適用可能になった。`hybrid_rrf`.p50（0.9454）・`warm_where_then_hybrid`.p50（0.9013）はいずれも両帯を超える **improved** として確定した。Issue #645 節では「帯内・方向としては改善」に留まっていた条件が専有環境で成立した。
+
+2. **基準水準への回復**: after/ref は `hybrid_rrf` 1.0288・`warm_where_then_hybrid` 1.0045 で ±5% 帯内 → ee99db3 水準への回復を確認。RSS も同様に after/ref 0.9858 で ref と同水準に収束。
+
+3. **除外発火の非 vacuous 証跡**: RSS 63.71→55.50 MiB（約 12.9% 減）・`body_predicate` 約 16.8 倍（ref 16.4 倍と同水準）は除外が確実に機能していることを直接示す。Issue #645 節と同じ結論を再現。
+
+4. **専有環境実測による確証**: `docs/design/benchmark-judgement-policy.md` §4 の判定基準における証拠力区分は「専有環境実測」に該当し、Issue #645 節で「専有環境再実測を条件に close 可」とした条件が充足された。
+
+5. **残る制約**: 除外列（長文 TEXT）への前方一致述語を高速化する手段（別方式の索引）は本 Issue ツリーのスコープ外のまま。
