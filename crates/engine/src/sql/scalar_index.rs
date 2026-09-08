@@ -92,10 +92,19 @@ const DEFAULT_SCALAR_INDEX_FULL_SCAN_RATIO_DENOMINATOR: u64 = 2;
 /// （非 `NULL` 値の累積バイト量 ÷ 件数。行数ではなく実際に索引化を試みた
 /// 非 `NULL` 値の件数を分母にすることで、NULL の多い疎な列を不当に除外
 /// しない）がこの値を超えた時点でその列を索引対象から除外する。
-/// `lang`/`topic`（短い分類値）と `body`（長文）を分離する閾値として暫定
-/// 128 を採用した。前後比較実測（crossdb fixture での hybrid p50 回復確認。
-/// 別 Issue へ申し送り）の結果次第で再検討され得る実装既定値である。
-const MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN: usize = 128;
+///
+/// `lang`/`topic`（短い分類値）と `body`（長文）を分離する閾値として #632
+/// では暫定 128 を採用したが、#633 の crossdb 前後比較実測で `body` 列の
+/// 全体平均が 126.3 バイトと判明し、128 では実質的にゲートが発火せず
+/// （RSS 実測が不変）対策が no-op になっていたことが確定した。これを受け
+/// オーナー判断（2026-09-08）で **64** へ引き下げる。判定基準（平均値長。
+/// 行単位の累積平均であり、値の並び順によっては先頭の数行時点で既に
+/// 累積平均が閾値を超えて以降の全値が除外され得る）自体は変更しない。
+/// 64 であれば `lang`（数バイト）/`topic`（十数バイト）は引き続き索引
+/// 対象に残り、crossdb `body` 相当（100 バイト超）は確実に除外される。
+/// crossdb fixture での RSS 低下・`hybrid_rrf` p50 回復の前後比較実測は
+/// 本変更（Issue #644）の対象外・後続 Issue の担当である。
+const MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN: usize = 64;
 
 /// [`ScalarIndexCache`] のエントリ数上限（`sql::arena_cache::SqlArenaCache`・
 /// `core.rs::PrefilterCache` と同じ DoS 対策方針を踏襲する）。
@@ -2572,6 +2581,172 @@ mod tests {
             "除外列の長文コストが approx_heap_bytes() に計上されてはならない: excluded={} baseline={}",
             index_excluded.approx_heap_bytes(),
             index_baseline.approx_heap_bytes()
+        );
+    }
+
+    // ---------- 閾値見直し（128 → 64。Issue #644）の crossdb 相当固定値 ----------
+
+    #[test]
+    fn build_excludes_text_column_with_crossdb_like_avg_length_126() {
+        // Issue #633 の crossdb 前後比較実測で確定した `body` 列の全体平均
+        // （126.3 バイト）相当を固定値（126 バイト・全行同長）で再現する。
+        // 旧閾値 128 では発火しなかったが、64 への引き下げにより最初の値の
+        // 時点で累積平均が閾値を超え、以降ずっと除外され続けることを確認する
+        // （行単位の累積平均判定のため、この fixture 相当では #633 が指摘した
+        // 「累積平均 vs 全体平均」の論点自体が問題にならない）。
+        let db_path = unique_db_path("scalar-index-avg-len-crossdb-like-126");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        for id in 1..=5u64 {
+            let prefix = format!("doc-{id}-");
+            let padded_len = 126usize
+                .checked_sub(prefix.len())
+                .expect("prefix shorter than 126 bytes");
+            let value = format!("{prefix}{}", "x".repeat(padded_len));
+            assert_eq!(value.len(), 126, "fixture 値は正確に 126 バイトで固定する");
+            insert(
+                &storage,
+                &c,
+                id,
+                Some("alpha"),
+                Some(value.as_str()),
+                Visibility::Public,
+            );
+        }
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let kind_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "kind")
+            .expect("kind column");
+        let path_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "path")
+            .expect("path column");
+        assert!(
+            !index.column_is_indexed(path_col),
+            "crossdb fixture 相当（平均 126 バイト）は閾値 64 で除外される"
+        );
+        assert!(index.column_groups(path_col).is_none());
+        assert!(index
+            .candidates_for(&MetadataFilter_equals(&schema, "path", "doc-1-xxx"))
+            .is_none());
+        assert!(
+            index.column_is_indexed(kind_col),
+            "長文列の除外が他の短い列の索引化に影響してはならない"
+        );
+    }
+
+    #[test]
+    fn build_keeps_indexing_text_column_with_avg_length_32() {
+        // `lang`/`topic` 相当の短い分類値列（32 バイト・全行同長）は閾値 64
+        // を下回るため、64 への引き下げ後も索引対象に残ることを固定する。
+        let db_path = unique_db_path("scalar-index-avg-len-short-32");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        let mut last_value = String::new();
+        for id in 1..=5u64 {
+            let prefix = format!("p-{id:02}-");
+            let padded_len = 32usize
+                .checked_sub(prefix.len())
+                .expect("prefix shorter than 32 bytes");
+            let value = format!("{prefix}{}", "y".repeat(padded_len));
+            assert_eq!(value.len(), 32, "fixture 値は正確に 32 バイトで固定する");
+            insert(
+                &storage,
+                &c,
+                id,
+                Some("alpha"),
+                Some(value.as_str()),
+                Visibility::Public,
+            );
+            last_value = value;
+        }
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let path_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "path")
+            .expect("path column");
+        assert!(
+            index.column_is_indexed(path_col),
+            "平均値長 32 バイトの列は閾値 64 で索引対象に残る"
+        );
+        assert_eq!(
+            index
+                .candidates_for(&MetadataFilter_equals(&schema, "path", &last_value))
+                .expect("indexed column"),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn build_avg_length_gate_keeps_column_at_exact_threshold() {
+        // 平均値長がちょうど閾値バイトの列は、厳密な `>` 比較（境界値含まず）
+        // により索引対象に残ることを固定する（将来の閾値再変更に耐える境界
+        // テスト。定数相対で書くことで 64 以外の値へ変わっても意味を保つ）。
+        let db_path = unique_db_path("scalar-index-avg-len-exact-threshold");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        let value = "z".repeat(MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN);
+        insert(
+            &storage,
+            &c,
+            1,
+            Some("alpha"),
+            Some(value.as_str()),
+            Visibility::Public,
+        );
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let path_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "path")
+            .expect("path column");
+        assert!(
+            index.column_is_indexed(path_col),
+            "平均値長がちょうど閾値の列は除外されない（厳密な `>` 比較）"
+        );
+    }
+
+    #[test]
+    fn build_avg_length_gate_excludes_column_one_byte_over_threshold() {
+        // 平均値長が閾値を 1 バイトでも超えると除外されることを固定する
+        // （境界テスト。定数相対で書く）。
+        let db_path = unique_db_path("scalar-index-avg-len-over-threshold-by-one");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_table(&storage);
+        let c = ctx("tenant-a");
+        let value = "z".repeat(MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN + 1);
+        insert(
+            &storage,
+            &c,
+            1,
+            Some("alpha"),
+            Some(value.as_str()),
+            Visibility::Public,
+        );
+        let (snapshot, schema) = snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let path_col = schema
+            .columns
+            .iter()
+            .position(|col| col.name == "path")
+            .expect("path column");
+        assert!(
+            !index.column_is_indexed(path_col),
+            "平均値長が閾値を 1 バイトでも超える列は除外される"
         );
     }
 }
