@@ -61,13 +61,28 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 ### wire-server の起動（TASK-73）
 
 ```bash
-cargo run -p wire-server -- --users <ユーザーストアのパス> --db <redb ファイルのパス> [--bind 127.0.0.1:5432]
+cargo run -p wire-server -- --users <ユーザーストアのパス> --db <redb ファイルのパス> \
+  [--bind 127.0.0.1:5432] [--search-engine default|hnsw|hnsw_f16|hnsw_i8]
 ```
 
 `--users`・`--db` はいずれも必須です（省略時は匿名ログイン・匿名 DB を暗黙生成せず
 fail-closed で起動を拒否します）。`--bind` 省略時は `127.0.0.1:5432`。psql・
 psycopg・node pg から無改造で cleartext password 認証つき接続できます
 （詳細: `docs/design/three-client-e2e-harness.md`）。
+
+`--search-engine`（Issue #656）は検索エンジン選択の opt-in CLI 引数です。
+`--planner-endpoint`／`--planner-model`／`--embedder-hashing-dim`
+（TASK-117）と同型の「プロセス起動時にのみ明示指定する注入点」で、未指定
+（または `default`）は現行どおり brute-force のまま不変です。`hnsw`／
+`hnsw_f16`／`hnsw_i8` を指定すると ANN（HNSW。下記「ANN（HNSW）opt-in 手順」
+節参照）を索引ノード常駐精度 f32／f16／I8（SQ8）で有効化します。不正な値・
+値欠落・2 回目以降の重複指定はいずれも fail-closed で起動エラーとなり、
+既定へ黙って読み替わることはありません。選択結果は `EXPLAIN` の
+`engine:`／`hnsw_params:` 行（Issue #411）で確認できます。`m`／`ef_*`／
+`full_scan_ratio`／`sparse_visited_max`／ACORN 等の探索パラメータの CLI
+露出は対象外（既定値のまま。後続 issue）です。ANN opt-in の性能評価ベンチ
+（`RecallEngine`）が使う `brute_force` トークンは本 CLI では受理しません
+（本 CLI の語彙は `default`／`hnsw`／`hnsw_f16`／`hnsw_i8` の 4 値に限定）。
 
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 
@@ -558,7 +573,9 @@ gh workflow run recall.yml --ref main
 
 ### ANN（HNSW）opt-in 手順と前後比較（Issue #413）
 
-ANN opt-in は現状 Rust API のみです（`wire-server` の CLI フラグ・テーブルカタログ属性による opt-in 露出は未実装）。
+ANN opt-in は Rust API に加え、`wire-server --search-engine`（Issue #656。上記
+「wire-server の起動」節参照）でも有効化できます。テーブルカタログ属性による
+opt-in 露出は引き続き未実装です。
 
 ```rust
 let kind = engine::search_engine::hnsw_kind(engine::hnsw::HnswParams::default())?;
