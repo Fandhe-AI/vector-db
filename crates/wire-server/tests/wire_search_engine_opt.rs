@@ -18,15 +18,25 @@
 //!   3 テナントの可視結果一致・HNSW opt-in 3 種は非 vacuous な索引構築
 //!   （`hnsw_index_cache_stats()`）まで固定する）
 //!
+//! Issue #657（フィルタ付き ANN の探索パラメータ opt-in 露出）分:
+//!
+//! - R4 拡張: `--hnsw-*` 探索パラメータ opt-in（`full_scan_ratio`／
+//!   `acorn_max_visible_ratio`／`sparse_visited_max`）を指定しても
+//!   `EXPLAIN` の `hnsw_params:` 行は `sparse_visited_max=` のみ反映し
+//!   `full_scan_ratio`／`acorn_max_visible_ratio` の値・キー名は一切出力へ
+//!   現れないこと（Issue #411 のテナント存在情報非露出方針の維持を機械的に
+//!   固定する）
+//! - R5 拡張: `--hnsw-*` チューニング指定時も RLS 境界・非 vacuous な索引構築
+//!   が不変であること
+//!
 //! `EXPLAIN` は `USING PLAN` 形のみ受理する契約（`sql::allowlist`）のため、
 //! 決定的スタブ `LlmClient` を注入する（`wire_explain.rs` と同じ構成）。
 //! バイナリ子プロセス経由の CLI 引数パース・起動可否は
-//! `tests/wire_search_engine_cli.rs` が担う（本ファイルは production の
-//! `search_engine_opt::parse`／`to_engine_kind` を直接呼ばず、`main.rs` の
-//! `resolve_search_engine` と同じ組み立て手順を fixture 内で再現する。
-//! `crates/engine/tests/fixtures/recall_engine.rs` と同型の判断——
-//! `ValidatedHnswParams::new` を経由済みの値に `with_resident_precision` を
-//! 適用するだけなので、untrusted 入力の唯一の検証入口を迂回しない）。
+//! `tests/wire_search_engine_cli.rs` が担う。本ファイルは production の
+//! `search_engine_opt::parse`／`to_engine_kind_with`（`main.rs::
+//! resolve_search_engine` と同じ経路）を直接呼び、untrusted 入力の唯一の
+//! 検証入口（`ValidatedHnswParams::new`・`with_full_scan_ratio`・
+//! `with_acorn_max_visible_ratio`）を迂回しない。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -38,13 +48,13 @@ use std::sync::Arc;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
-use engine::hnsw::{HnswParams, ResidentPrecision, ValidatedHnswParams};
 use engine::policy::PolicyContext;
 use engine::query_planner::{LlmClient, PlanError};
 use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::Value;
 use engine::search_engine::{self, SearchEngineKind};
 use engine::storage::{Storage, Visibility};
+use wire_server::search_engine_opt::{self, HnswTuning};
 
 use common::*;
 
@@ -64,20 +74,16 @@ const EXPANSION_RESPONSE_NO_HINTS: &str =
     r#"{"search_terms": [], "path_hint": null, "kind_hint": null}"#;
 
 /// 4 トークンそれぞれに対応する `SearchEngineKind`（`None` は既定＝
-/// `EngineCore::from_storage` 経由）。`main.rs::resolve_search_engine` の
-/// 分岐（`search_engine_opt::parse` → `to_engine_kind`）と同じ組み立て手順。
-fn kind_for_token(token: &str) -> Option<SearchEngineKind> {
-    let precision = match token {
-        "default" => return None,
-        "hnsw" => ResidentPrecision::F32,
-        "hnsw_f16" => ResidentPrecision::F16,
-        "hnsw_i8" => ResidentPrecision::I8,
-        other => panic!("unexpected token in test fixture: {other:?}"),
-    };
-    let validated = ValidatedHnswParams::new(HnswParams::default())
-        .expect("default params validate")
-        .with_resident_precision(precision);
-    Some(SearchEngineKind::Hnsw(validated))
+/// `EngineCore::from_storage` 経由）。production の `search_engine_opt::parse`
+/// → `SearchEngineChoice::to_engine_kind_with` をそのまま呼ぶ（`main.rs::
+/// resolve_search_engine` と同じ経路。untrusted 入力の唯一の検証入口を
+/// 迂回しない）。`tuning` が既定（`HnswTuning::default()`）のときは
+/// Issue #656 時点の `kind_for_token` とビット同一（R2）。
+fn kind_for_token_with(token: &str, tuning: HnswTuning) -> Option<SearchEngineKind> {
+    let choice = search_engine_opt::parse(token).expect("known token in test fixture");
+    choice
+        .to_engine_kind_with(tuning)
+        .unwrap_or_else(|e| panic!("token={token}: valid tuning must resolve, got error: {e}"))
 }
 
 fn resident_suffix_for(token: &str) -> &'static str {
@@ -94,8 +100,18 @@ fn resident_suffix_for(token: &str) -> &'static str {
 
 /// `docs(embedding VECTOR(2), path TEXT, body TEXT)` を持つ `EngineCore` を
 /// `token` に応じたエンジンで構築する（`wire_explain.rs::
-/// new_hnsw_core_with_docs_table` と同型）。
+/// new_hnsw_core_with_docs_table` と同型）。`tuning` が既定（全 `None`）の
+/// ときは [`new_core_with_docs_table`] とビット同一。
 fn new_core_with_docs_table(token: &str) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    new_core_with_docs_table_and_tuning(token, HnswTuning::default())
+}
+
+/// [`new_core_with_docs_table`] へ `--hnsw-*` 探索パラメータ opt-in
+/// （Issue #657）の `tuning` を加えたもの。
+fn new_core_with_docs_table_and_tuning(
+    token: &str,
+    tuning: HnswTuning,
+) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("wire-search-engine-opt-docs");
     let guard = temp_db::CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -135,7 +151,7 @@ fn new_core_with_docs_table(token: &str) -> (Arc<EngineCore>, temp_db::CleanupGu
     // `main.rs::run_server` が `--search-engine default`／未指定で
     // `EngineCore::open` を呼んだときと同じ `engine: parallel_brute_force`
     // 表示になるようにする。
-    let kind = kind_for_token(token).unwrap_or_else(search_engine::default_kind);
+    let kind = kind_for_token_with(token, tuning).unwrap_or_else(search_engine::default_kind);
     let core = EngineCore::from_storage_with_engine(storage, kind).with_query_planner(Box::new(
         StubLlmClient {
             response: EXPANSION_RESPONSE_NO_HINTS,
@@ -208,6 +224,71 @@ fn explain_reports_hnsw_engine_with_resident_precision_per_token() {
     }
 }
 
+/// R4 拡張（Issue #657）: `--hnsw-*` 探索パラメータ opt-in を指定しても
+/// `hnsw_params:` 行は `sparse_visited_max=` のみ反映し、
+/// `full_scan_ratio`／`acorn_max_visible_ratio` の値・キー名は出力全体の
+/// どこにも現れないこと（テナント存在情報に繋がる値の `EXPLAIN` 非露出
+/// 方針〔Issue #411〕の維持を機械的に固定する）。
+#[test]
+fn explain_hnsw_params_reflects_sparse_visited_max_only_not_ratios() {
+    for token in ["hnsw", "hnsw_f16", "hnsw_i8"] {
+        let tuning = HnswTuning {
+            full_scan_ratio: Some(engine::hnsw::Ratio {
+                numerator: 1,
+                denominator: 2,
+            }),
+            acorn_max_visible_ratio: Some(engine::hnsw::Ratio {
+                numerator: 1,
+                denominator: 1,
+            }),
+            sparse_visited_max: Some(8),
+        };
+        let (core, _guard) = new_core_with_docs_table_and_tuning(token, tuning);
+        let mut stream = spawn_with_alice(core);
+
+        send_simple_query(
+            &mut stream,
+            "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+        );
+
+        let _columns = read_row_description(&mut stream);
+        let mut rows = Vec::new();
+        for _ in 0..8 {
+            rows.push(read_data_row(&mut stream)[0].clone().expect("cell"));
+        }
+        let expected_resident = match token {
+            "hnsw" => "f32",
+            "hnsw_f16" => "f16",
+            "hnsw_i8" => "i8",
+            other => panic!("unexpected token: {other:?}"),
+        };
+        assert_eq!(
+            rows[5],
+            format!(
+                "hnsw_params: m=16,ef_construction=100,ef_search=64,resident={expected_resident},sparse_visited_max=8"
+            ),
+            "token={token}"
+        );
+
+        let full_output = rows.join("\n");
+        assert!(
+            !full_output.contains("full_scan_ratio"),
+            "token={token}: full_scan_ratio must not leak into EXPLAIN output, got: {full_output}"
+        );
+        assert!(
+            !full_output.contains("acorn"),
+            "token={token}: acorn_max_visible_ratio must not leak into EXPLAIN output, got: {full_output}"
+        );
+        assert!(
+            !full_output.contains("1/2") && !full_output.contains("1/1"),
+            "token={token}: ratio values must not leak into EXPLAIN output, got: {full_output}"
+        );
+
+        assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+        read_ready_for_query(&mut stream);
+    }
+}
+
 /// R5: 3 テナント × `Public`（コーパス）+ 各テナント固有の `Private` 行を
 /// 投入し、フィルタなし `DISTANCE` クエリが選択エンジンによらず
 /// (a) `Private` 行を一切返さない、(b) 3 テナントの可視結果が一致する、
@@ -221,6 +302,49 @@ fn explain_reports_hnsw_engine_with_resident_precision_per_token() {
 /// 構造的に brute-force へ縮退しない条件を満たす。
 #[test]
 fn rls_boundary_and_ann_non_vacuous_hold_across_all_search_engine_tokens() {
+    for token in ["default", "hnsw", "hnsw_f16", "hnsw_i8"] {
+        run_rls_boundary_check(token, HnswTuning::default());
+    }
+}
+
+/// R5 拡張（Issue #657）: `--hnsw-*` 探索パラメータ opt-in を指定しても
+/// RLS 境界（(a) `Private` 非漏えい・(b) 3 テナント可視結果一致）・非 vacuous
+/// な索引構築 (c) が不変であること。ACORN／sparse visited の発火有無自体は
+/// 本 Issue の対象外（D7）とし、指定してもクエリの正しさ・決定性が崩れない
+/// ことのみを固定する。
+#[test]
+fn rls_boundary_holds_with_hnsw_tuning_opt_in() {
+    let tuning = HnswTuning {
+        full_scan_ratio: Some(engine::hnsw::Ratio {
+            numerator: 1,
+            denominator: 4,
+        }),
+        acorn_max_visible_ratio: Some(engine::hnsw::Ratio {
+            numerator: 1,
+            denominator: 1,
+        }),
+        sparse_visited_max: Some(8),
+    };
+    for token in ["hnsw", "hnsw_f16", "hnsw_i8"] {
+        run_rls_boundary_check(token, tuning);
+    }
+}
+
+/// [`rls_boundary_and_ann_non_vacuous_hold_across_all_search_engine_tokens`]・
+/// [`rls_boundary_holds_with_hnsw_tuning_opt_in`] が共有する本体。
+///
+/// 3 テナント × `Public`（コーパス）+ 各テナント固有の `Private` 行を投入し、
+/// フィルタなし `DISTANCE` クエリが選択エンジン・チューニングによらず
+/// (a) `Private` 行を一切返さない、(b) 3 テナントの可視結果が一致する、
+/// (c) HNSW opt-in 3 種は索引が実際に構築される（非 vacuous。build 失敗 0・
+/// 自動縮退カウンタ 0）ことを固定する。
+///
+/// 行数は `sql::hnsw_cache` の非公開下限 `MIN_INDEXED_ROWS`（Issue #408。
+/// `docs/design/hnsw-generation-cache.md` 参照。ここでは数値を転記せず、本
+/// テストの投入行数がその下限を優に超える桁であることのみをコメントする）を
+/// 上回るよう `Public` 1,200 行（400 行 × 3 テナント）を投入し、索引が
+/// 構造的に brute-force へ縮退しない条件を満たす。
+fn run_rls_boundary_check(token: &str, tuning: HnswTuning) {
     const ROWS_PER_TENANT: u64 = 400;
     const TENANTS: [&str; 3] = ["tenant-alice", "tenant-bob", "tenant-carol"];
     const USERS: [(&str, &str, &str); 3] = [
@@ -229,7 +353,7 @@ fn rls_boundary_and_ann_non_vacuous_hold_across_all_search_engine_tokens() {
         ("carol", "tenant-carol", "pw-carol"),
     ];
 
-    for token in ["default", "hnsw", "hnsw_f16", "hnsw_i8"] {
+    {
         let path = temp_db::unique_db_path("wire-search-engine-opt-rls");
         let _guard = temp_db::CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
@@ -285,7 +409,7 @@ fn rls_boundary_and_ann_non_vacuous_hold_across_all_search_engine_tokens() {
             next_id += 1;
         }
 
-        let core = match kind_for_token(token) {
+        let core = match kind_for_token_with(token, tuning) {
             None => EngineCore::from_storage(storage, search_engine::default_engine()),
             Some(kind) => EngineCore::from_storage_with_engine(storage, kind),
         };

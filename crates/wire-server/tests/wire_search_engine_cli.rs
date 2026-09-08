@@ -20,6 +20,19 @@
 //! - R3: 不正値・値欠落・重複指定は非 0 終了・stderr に `--search-engine` を
 //!   含む説明が出ること
 //!
+//! に加え、Issue #657（フィルタ付き ANN の探索パラメータ opt-in 露出）分の
+//!
+//! - R6: `--hnsw-full-scan-ratio`／`--hnsw-acorn-max-visible-ratio`／
+//!   `--hnsw-sparse-visited-max` を正常値で指定した 3 エンジントークンいずれも
+//!   `listening on` に到達すること
+//! - R7: 値欠落・形状不正・意味不正・重複指定・D1（`--search-engine`
+//!   未指定／`default` との組合せ）はいずれも非 0 終了・該当フラグ名を含む
+//!   stderr が出ること
+//! - R8: `--search-engine hnsw` 単独と、既定値を明示した
+//!   `--hnsw-full-scan-ratio 1/10 --hnsw-sparse-visited-max 0` を加えた
+//!   プロセスとで、同一 C1 クエリの受信バイト列が完全一致すること
+//!   （未指定＝既定値の裏付け）
+//!
 //! を固定する。
 
 #[path = "common/mod.rs"]
@@ -413,5 +426,302 @@ fn unset_and_default_token_produce_identical_wire_bytes() {
     assert_eq!(
         outputs[0], outputs[1],
         "unset --search-engine and --search-engine default must produce identical wire bytes"
+    );
+}
+
+/// R6: `--hnsw-*` 3 フラグを正常値で指定した各エンジントークンで起動が拒否
+/// されず `listening on` に到達すること。
+#[test]
+fn hnsw_tuning_flags_with_valid_values_start_listening() {
+    for token in ["hnsw", "hnsw_f16", "hnsw_i8"] {
+        let fixture = TempFixtureDir::new(&format!("r6-{token}"));
+        let users_path = fixture.users_path_str();
+        write_empty_user_store(&users_path);
+        let db_path = fixture.db_path_str();
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+            .args([
+                "--users",
+                &users_path,
+                "--db",
+                &db_path,
+                "--bind",
+                "127.0.0.1:0",
+                "--search-engine",
+                token,
+                "--hnsw-full-scan-ratio",
+                "1/4",
+                "--hnsw-acorn-max-visible-ratio",
+                "1/2",
+                "--hnsw-sparse-visited-max",
+                "8",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wire-server");
+
+        let listening = wait_for_listening(&mut child);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            listening,
+            "token={token}: expected to reach listening state with hnsw tuning flags"
+        );
+    }
+}
+
+/// R7: 値欠落・形状不正・意味不正・重複指定・D1（`--search-engine` 未指定／
+/// `default` との組合せ）はいずれも非 0 終了・該当フラグ名を含む stderr。
+#[test]
+fn hnsw_tuning_flag_rejection_matrix() {
+    let fixture = TempFixtureDir::new("r7");
+    let users_path = fixture.users_path_str();
+    write_empty_user_store(&users_path);
+    let db_path = fixture.db_path_str();
+
+    // (追加引数, stderr に含まれるべきフラグ名)
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        // 値欠落（末尾単体）。
+        (
+            vec!["--search-engine", "hnsw", "--hnsw-full-scan-ratio"],
+            "--hnsw-full-scan-ratio",
+        ),
+        (
+            vec!["--search-engine", "hnsw", "--hnsw-acorn-max-visible-ratio"],
+            "--hnsw-acorn-max-visible-ratio",
+        ),
+        (
+            vec!["--search-engine", "hnsw", "--hnsw-sparse-visited-max"],
+            "--hnsw-sparse-visited-max",
+        ),
+        // 次トークンが別フラグ名の場合、既存 `--search-engine` と同じ
+        // 「次トークンを無条件で値とみなす」仕様により、そのフラグ名文字列が
+        // そのまま値として飲み込まれる（ここでは末尾に他の引数を残さない
+        // ことで、消費後に余る `8` が「unknown argument」として先に検出
+        // されてしまう混同を避ける）。結果として `parse_ratio` が
+        // `--hnsw-sparse-visited-max` という文字列を `<num>/<den>` として
+        // 拒否し、`--hnsw-full-scan-ratio` のフラグ名を含むエラーになる。
+        (
+            vec![
+                "--search-engine",
+                "hnsw",
+                "--hnsw-full-scan-ratio",
+                "--hnsw-sparse-visited-max",
+            ],
+            "--hnsw-full-scan-ratio",
+        ),
+        // 形状不正。
+        (
+            vec!["--search-engine", "hnsw", "--hnsw-full-scan-ratio", "1"],
+            "--hnsw-full-scan-ratio",
+        ),
+        (
+            vec!["--search-engine", "hnsw", "--hnsw-full-scan-ratio", "1/"],
+            "--hnsw-full-scan-ratio",
+        ),
+        (
+            vec!["--search-engine", "hnsw", "--hnsw-full-scan-ratio", "0.5"],
+            "--hnsw-full-scan-ratio",
+        ),
+        (
+            vec!["--search-engine", "hnsw", "--hnsw-full-scan-ratio", " 1/2"],
+            "--hnsw-full-scan-ratio",
+        ),
+        (
+            vec![
+                "--search-engine",
+                "hnsw",
+                "--hnsw-sparse-visited-max",
+                "abc",
+            ],
+            "--hnsw-sparse-visited-max",
+        ),
+        (
+            vec!["--search-engine", "hnsw", "--hnsw-sparse-visited-max", "-1"],
+            "--hnsw-sparse-visited-max",
+        ),
+        // 意味不正。
+        (
+            vec!["--search-engine", "hnsw", "--hnsw-full-scan-ratio", "1/0"],
+            "--hnsw-full-scan-ratio",
+        ),
+        (
+            vec!["--search-engine", "hnsw", "--hnsw-full-scan-ratio", "3/2"],
+            "--hnsw-full-scan-ratio",
+        ),
+        (
+            vec![
+                "--search-engine",
+                "hnsw",
+                "--hnsw-acorn-max-visible-ratio",
+                "1/20",
+            ],
+            "--hnsw-acorn-max-visible-ratio",
+        ),
+        (
+            vec![
+                "--search-engine",
+                "hnsw",
+                "--hnsw-full-scan-ratio",
+                "1/2",
+                "--hnsw-acorn-max-visible-ratio",
+                "1/4",
+            ],
+            "--hnsw-acorn-max-visible-ratio",
+        ),
+        // 重複指定。
+        (
+            vec![
+                "--search-engine",
+                "hnsw",
+                "--hnsw-full-scan-ratio",
+                "1/4",
+                "--hnsw-full-scan-ratio",
+                "1/2",
+            ],
+            "--hnsw-full-scan-ratio",
+        ),
+        (
+            vec![
+                "--search-engine",
+                "hnsw",
+                "--hnsw-sparse-visited-max",
+                "1",
+                "--hnsw-sparse-visited-max",
+                "2",
+            ],
+            "--hnsw-sparse-visited-max",
+        ),
+        // D1: `--search-engine default` との組合せ。
+        (
+            vec![
+                "--search-engine",
+                "default",
+                "--hnsw-sparse-visited-max",
+                "8",
+            ],
+            "--search-engine",
+        ),
+        // D1: `--search-engine` 未指定との組合せ。
+        (vec!["--hnsw-full-scan-ratio", "1/4"], "--search-engine"),
+    ];
+
+    for (extra_args, expected_flag) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+            .args([
+                "--users",
+                &users_path,
+                "--db",
+                &db_path,
+                "--bind",
+                "127.0.0.1:0",
+            ])
+            .args(&extra_args)
+            .output()
+            .expect("spawn wire-server");
+
+        assert!(
+            !output.status.success(),
+            "args={extra_args:?}: expected non-zero exit"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected_flag),
+            "args={extra_args:?}: expected stderr to mention {expected_flag}, got: {stderr}"
+        );
+    }
+}
+
+/// R8: `--search-engine hnsw` 単独と、既定値を明示した
+/// `--hnsw-full-scan-ratio 1/10 --hnsw-sparse-visited-max 0` を加えたプロセス
+/// とで、同一 C1 クエリの受信バイト列が完全一致すること（未指定＝既定値の
+/// 裏付け。`acorn_max_visible_ratio` は「既定＝none」を表す明示値が無いため
+/// 対象外とし、単体テストの `PartialEq`（`search_engine_opt::tests::
+/// empty_tuning_matches_to_engine_kind_for_all_hnsw_tokens`）で担保する）。
+#[test]
+fn hnsw_token_alone_and_with_explicit_default_tuning_produce_identical_wire_bytes() {
+    let mut outputs: Vec<Vec<u8>> = Vec::new();
+
+    for extra_args in [
+        vec!["--search-engine", "hnsw"],
+        vec![
+            "--search-engine",
+            "hnsw",
+            "--hnsw-full-scan-ratio",
+            "1/10",
+            "--hnsw-sparse-visited-max",
+            "0",
+        ],
+    ] {
+        let fixture = TempFixtureDir::new("r8");
+        let users_path = fixture.users_path_str();
+        write_user_store_with_alice(&users_path);
+        let db_path = fixture.db_path_str();
+        seed_single_row_db(&db_path);
+
+        let mut args = vec![
+            "--users".to_string(),
+            users_path,
+            "--db".to_string(),
+            db_path,
+            "--bind".to_string(),
+            "127.0.0.1:0".to_string(),
+        ];
+        args.extend(extra_args.iter().map(|s| s.to_string()));
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wire-server");
+
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).unwrap_or(0);
+                if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut addr: Option<std::net::SocketAddr> = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(line) => {
+                    if let Some(idx) = line.find("listening on ") {
+                        let addr_str = line[idx + "listening on ".len()..].trim();
+                        addr = addr_str.parse().ok();
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let addr =
+            addr.unwrap_or_else(|| panic!("did not observe listening address, args={args:?}"));
+
+        let bytes = run_c1_query_and_collect_bytes(addr);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        outputs.push(bytes);
+    }
+
+    assert_eq!(
+        outputs[0], outputs[1],
+        "hnsw alone and hnsw with explicit default tuning must produce identical wire bytes"
     );
 }
