@@ -37,7 +37,12 @@
 #       <OUT_DIR>/<ts>-loadavg.log
 #       <OUT_DIR>/<ts>-env.txt
 #
-# --summarize <dir> で TSV 集約（区間別 min-of-N・median・ratio・reference_band）。
+# --summarize <dir> [session_ts] で TSV 集約（区間別 min-of-N・median・ratio・
+# reference_band）。<dir> に複数回の実行（別 ts）の生データが混在する場合は
+# session_ts（`<ts>-crossdb-*`／`<ts>-hybrid-*` の接頭辞）を明示指定する
+# 必要がある（Issue #633 codex-review P2 指摘。別セッションの生データが
+# 混ざると before/after の min-of-N が比較不能になるため、summarize 側が
+# fail-closed に拒否する）。
 
 set -euo pipefail
 
@@ -49,7 +54,10 @@ die() {
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ "${1:-}" = "--summarize" ]; then
-  DIR="${2:?usage: $0 --summarize <dir>}"
+  DIR="${2:?usage: $0 --summarize <dir> [session_ts]}"
+  if [ -n "${3:-}" ]; then
+    exec python3 "${REPO_ROOT}/scripts/bench_scalar_index_crossdb_ab_summarize.py" "${DIR}" "${3}"
+  fi
   exec python3 "${REPO_ROOT}/scripts/bench_scalar_index_crossdb_ab_summarize.py" "${DIR}"
 fi
 

@@ -232,20 +232,40 @@ commit `6ff22dc8`）のものを全 arm 共通で使用し、`CROSSDB_SELF_BINAR
 
 ### 結果（min-of-5・median 併記。単位 µs）
 
-| 区間 | before min/median | after min/median | after/before（min比） | 判定 | ref min/median | ref/before |
-| --- | --- | --- | --- | --- | --- | --- |
-| `hybrid_rrf`.p50 | 6995 / 7070 | 7036 / 7084 | 1.0057 | 帯内 | 6130 / 6278 | 0.8763（ref が速い） |
-| `bulk_hybrid_k200`.p50 | 9618 / 9652 | 9615 / 9657 | 0.9997 | 帯内 | 9649 / 9871 | 1.0033 |
-| `vector_knn_where`.p50 | 1897 / 1989 | 1959 / 2026 | 1.0328 | 帯内 | 3037 / 3141 | 1.6012（ref が遅い＝#473 以降の高速化分） |
-| `where_compound_count`.p50 | 1025 / 1046 | 1018 / 1025 | 0.9936 | 帯内 | 4344 / 4369 | 4.2405（同上） |
-| 参照: `vector_knn`.p50 | 671 / 690 | 655 / 737 | 0.9767 | 帯内 | 699 / 707 | 1.0426 |
-| 参照: `mode_recall`.p50 | 686 / 706 | 671 / 696 | 0.9780 | 帯内 | 705 / 738 | 1.0267 |
-| hybrid ループ `warm_where_then_hybrid`.p50 | 6851 / 6886 | 6806 / 6849 | 0.9935 | 帯内 | 6210 / 6241 | **0.9065（ref が約 9% 速い）** |
-| hybrid ループ `warm_where_then_hybrid`.rss_after_warm（MiB） | 63.80 / 63.92 | 63.72 / 63.86 | 0.9988 | 帯内 | 56.30 / 56.37 | **0.8825（ref が約 12% 少ない）** |
-| hybrid ループ `body_predicate`.p50 | 106.9 / 107.4 | 106.6 / 107.8 | 0.9976 | 帯内 | 1735 / 1754 | 16.24（ref が大幅に遅い＝索引自体が無い） |
+判定は `docs/design/benchmark-judgement-policy.md` §4 の 2 種ノイズ帯
+（固定 ±5% と参照区間実測帯を**両方**超えて初めて `regressed`/`improved`。
+片方のみは「帯内」）に従う（codex-review P1 指摘・Issue #633）。
+`reference_band` は同一計測セッション内の `vector_knn.p50` の run-to-run
+幅（`(max-min)/min`。`scripts/bench_scalar_index_crossdb_ab_summarize.py::reference_band`）
+から算出した実測ノイズ帯で、after arm は **16.48%**（`min=655.15 max=763.14`）、
+ref arm は **2.94%**（`min=699.37 max=719.92`）——固定 ±5% 帯より大きく
+広い（after）／わずかに狭い（ref）ため、下表の「判定」は固定帯だけで
+機械的に出した値ではなく、この実測帯もあわせて適用したもの
+（算出根拠は上記コマンドの stderr 出力・完全な TSV に記録。生データは
+tracked のため誰でも再計算できる）。
 
-完全な区間別 TSV（p95・RSS 全 3 時点を含む）は上記コマンドの出力
-（`docs/design/bench-data/scalar-index-crossdb-ab/` の生データから再計算
+| 区間 | before min/median | after min/median | after/before（min比） | after 判定（固定帯＋参照帯 16.48%） | ref min/median | ref/before | ref 判定（固定帯＋参照帯 2.94%） |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `hybrid_rrf`.p50 | 6995 / 7070 | 7036 / 7084 | 1.0057 | 帯内 | 6130 / 6278 | 0.8763 | improved（ref が速い） |
+| `bulk_hybrid_k200`.p50 | 9618 / 9652 | 9615 / 9657 | 0.9997 | 帯内 | 9649 / 9871 | 1.0033 | 帯内 |
+| `vector_knn_where`.p50 | 1897 / 1989 | 1959 / 2026 | 1.0328 | 帯内 | 3037 / 3141 | 1.6012 | regressed（ref が遅い＝#473 以降の高速化分） |
+| `where_compound_count`.p50 | 1025 / 1046 | 1018 / 1025 | 0.9936 | 帯内 | 4344 / 4369 | 4.2405 | regressed（同上） |
+| 参照: `vector_knn`.p50 | 671 / 690 | 655 / 737 | 0.9767 | 帯内 | 699 / 707 | 1.0426 | 帯内 |
+| 参照: `mode_recall`.p50 | 686 / 706 | 671 / 696 | 0.9780 | 帯内 | 705 / 738 | 1.0267 | 帯内 |
+| hybrid ループ `warm_where_then_hybrid`.p50 | 6851 / 6886 | 6806 / 6849 | 0.9935 | 帯内 | 6210 / 6241 | 0.9065 | improved（ref が約 9% 速い） |
+| hybrid ループ `warm_where_then_hybrid`.rss_after_warm（MiB） | 63.80 / 63.92 | 63.72 / 63.86 | 0.9988 | 帯内 | 56.30 / 56.37 | 0.8825 | improved（ref が約 12% 少ない） |
+| hybrid ループ `body_predicate`.p50 | 106.9 / 107.4 | 106.6 / 107.8 | 0.9976 | 帯内 | 1735 / 1754 | 16.24 | regressed（ref が大幅に遅い＝索引自体が無い） |
+
+本 issue の受け入れ判定に使う before→after 比較（4 対象区間・参照区間とも）
+は、固定帯・参照帯（16.48%）のいずれの基準でも「帯内」で変わらない
+（実測ノイズ帯を導入しても判定結果自体は変化しない。ref との比較のみ
+参照帯〔2.94%〕の下で新たに `regressed`/`improved` に分類される行がある
+——ただしこれらは元々 before/after 比較ではなく「ref との差」の解説として
+記録していた値であり、本 issue の受け入れ判定〔下記「判定」節〕には使わない）。
+
+完全な区間別 TSV（p95・RSS 全 3 時点・`*_ref_band`／`*_class` 列を含む）は
+上記コマンドの出力（`docs/design/bench-data/scalar-index-crossdb-ab/` の
+生データから再計算
 可能）。
 
 ### 判定: `hybrid_rrf` 退行は本 fixture では解消されていない
@@ -256,18 +276,27 @@ commit `6ff22dc8`）のものを全 arm 共通で使用し、`CROSSDB_SELF_BINAR
 比較でも before・after いずれも ref よりなお約 9〜13% 遅い・RSS も約 12〜
 13% 多いままで、before/after 間にほとんど差が無い。
 
-原因は `docs25k.jsonl` の `body` 列の実測平均バイト長（tenant-a 可視行
-23,000 件で **126.3 バイト**）が `MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`
-（**128 バイト**）を約 1.7 バイト下回ることにある。`ScalarIndex::build`
-（`crates/engine/src/sql/scalar_index.rs`）の除外判定は行単位の**累積**
-平均（`prospective_bytes > prospective_count * 128`）であり、コーパス全体
-の平均が閾値未満である以上、走査のどの時点でも累積平均が閾値を超えず
-`body` 列は除外されない——つまり **Issue #632／#638 の対策は、本 issue が
-問題を発見した crossdb fixture そのものに対しては no-op**である。
-`warm_where_then_hybrid.rss_after_warm` が before/after でほぼ同じ
-（63.80 → 63.72 MiB）であることが、除外が発火していないことの直接証跡
-になっている（除外が発火していれば Issue #632 の手動実験と同様に約 56MiB
-まで下がるはずだった）。
+`ScalarIndex::build`（`crates/engine/src/sql/scalar_index.rs`）の除外
+判定は行単位の**累積**平均（`prospective_bytes > prospective_count *
+128`）であり、これは全体平均とは別の量である——コーパス全体の平均が
+閾値未満でも、走査順の途中区間だけが閾値を超えていれば累積平均は一時的に
+閾値を超えて除外が発火しうる（例: 200 バイト行→0 バイト行の順なら全体
+平均は 100 だが 1 行目の時点で既に閾値超過）。そのため `docs25k.jsonl` の
+`body` 列の実測**全体**平均バイト長（tenant-a 可視行 23,000 件で
+**126.3 バイト**。`MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`＝**128 バイト**を
+約 1.7 バイト下回る）だけでは「除外が一度も発火しない」ことの根拠には
+ならない（codex-review P2 指摘・Issue #633）。
+
+除外が発火していないことの実際の根拠は、`warm_where_then_hybrid.
+rss_after_warm` が before/after でほぼ同じ（63.80 → 63.72 MiB）である
+という直接の実測証跡である（除外が発火していれば Issue #632 の手動実験
+と同様に約 56MiB まで下がるはずだった）——**Issue #632／#638 の対策は、
+本 issue が問題を発見した crossdb fixture そのものに対しては no-op**
+であるとこの RSS 実測から判断する。全体平均が閾値のわずか下にあるという
+事実は、除外が発火しない**蓋然性が高い**ことの補助的な状況証拠に留め、
+本節の no-op 判断そのものは RSS 実測のみを根拠とする（走査順における
+累積平均の実際の推移・索引構築後の列別除外状態を直接ダンプする手段は
+本 issue のスコープ〔`crates/engine/src/` 無変更〕では用意していない）。
 
 一方で `body_predicate`（`body` への前方一致述語）は before・after とも
 高速（約 107µs。ref は 1735µs）だが、これは索引による除外の効果ではなく、
