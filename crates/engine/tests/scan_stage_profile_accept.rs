@@ -17,16 +17,23 @@
 mod harness;
 
 use harness::scan_stage_profile::{
-    assert_scan_row_counts_match, build_lang_filter, classify_against_bands,
-    decode_dim_and_metadata_reimpl, matches_lang_filter, median_of, min_of, parse_rounds,
-    parse_scale, reference_band, refuse_under_github_actions, scan_scalar_columns,
-    stage_diff_ns_per_row, step_ratio_pct, verify_row_key_tenant_reimpl, BandClass, ScanStageError,
-    DEFAULT_ROUNDS, MAX_ROUNDS, MAX_SCALE, MIN_ROUNDS,
+    assert_scan_row_counts_match, bucket_share_pct, build_lang_filter, classify_against_bands,
+    decode_dim_and_metadata_reimpl, expected_visible_hits, lang_for_id, matches_lang_filter,
+    median_of, min_of, parse_rounds, parse_scale, parse_selectivity, reference_band,
+    refuse_under_github_actions, scan_scalar_columns, stage_diff_ns_per_row, step_ratio_pct,
+    verify_row_key_tenant_reimpl, where_clause_for_arm, BandClass, ProfileArm, ScanStageError,
+    DEFAULT_ROUNDS, DEFAULT_SELECTIVITY_DENOMINATOR, MAX_ROUNDS, MAX_SCALE,
+    MAX_SELECTIVITY_DENOMINATOR, MIN_ROUNDS, MIN_SELECTIVITY_DENOMINATOR, TARGET_LANG,
 };
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::core::EngineCore;
+use engine::kernel::CpuScalarProvider;
+use engine::policy::PolicyContext;
+use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::{encode_scalar_columns, Value};
 use engine::storage::{RowInput, Storage, Visibility};
+use engine::tenant;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -387,4 +394,337 @@ fn decode_dim_and_metadata_reimpl_rejects_truncated_buffer() {
     let truncated = &full[..full.len().saturating_sub(2)];
     let err = decode_dim_and_metadata_reimpl(truncated).unwrap_err();
     assert!(matches!(err, ScanStageError::Codec(_)));
+}
+
+// --- 選択率 opt-in（Issue #653） ---------------------------------------------
+
+#[test]
+fn parse_selectivity_defaults_when_unset() {
+    assert_eq!(
+        parse_selectivity(None).unwrap(),
+        DEFAULT_SELECTIVITY_DENOMINATOR
+    );
+    assert_eq!(
+        parse_selectivity(Some("")).unwrap(),
+        DEFAULT_SELECTIVITY_DENOMINATOR
+    );
+    assert_eq!(
+        parse_selectivity(Some("  ")).unwrap(),
+        DEFAULT_SELECTIVITY_DENOMINATOR
+    );
+}
+
+#[test]
+fn parse_selectivity_accepts_within_bounds() {
+    assert_eq!(parse_selectivity(Some("1/3")).unwrap(), 3);
+    assert_eq!(
+        parse_selectivity(Some(&format!("1/{MIN_SELECTIVITY_DENOMINATOR}"))).unwrap(),
+        MIN_SELECTIVITY_DENOMINATOR
+    );
+    assert_eq!(
+        parse_selectivity(Some(&format!("1/{MAX_SELECTIVITY_DENOMINATOR}"))).unwrap(),
+        MAX_SELECTIVITY_DENOMINATOR
+    );
+}
+
+#[test]
+fn parse_selectivity_rejects_below_minimum() {
+    assert!(matches!(
+        parse_selectivity(Some("1/1")),
+        Err(ScanStageError::InvalidSelectivity(_))
+    ));
+    assert!(matches!(
+        parse_selectivity(Some("1/0")),
+        Err(ScanStageError::InvalidSelectivity(_))
+    ));
+}
+
+#[test]
+fn parse_selectivity_rejects_above_maximum() {
+    assert!(matches!(
+        parse_selectivity(Some("1/101")),
+        Err(ScanStageError::InvalidSelectivity(_))
+    ));
+}
+
+#[test]
+fn parse_selectivity_rejects_malformed_shapes() {
+    for raw in ["3", "2/3", "1/", "/3", "1/abc", "1/3/4", "1 / 3"] {
+        assert!(
+            matches!(
+                parse_selectivity(Some(raw)),
+                Err(ScanStageError::InvalidSelectivity(_))
+            ),
+            "expected {raw:?} to be rejected"
+        );
+    }
+}
+
+// --- lang_for_id -------------------------------------------------------------
+
+#[test]
+fn lang_for_id_default_denominator_matches_legacy_langs_rotation() {
+    // 導入前の `LANGS[(id as usize) % LANGS.len()]`
+    // （`LANGS = ["ja","en","fr","de","es"]`）とビット同一であることを固定する。
+    const LEGACY_LANGS: &[&str] = &["ja", "en", "fr", "de", "es"];
+    for id in 0..1000u64 {
+        let expected = LEGACY_LANGS[(id as usize) % LEGACY_LANGS.len()];
+        assert_eq!(
+            lang_for_id(id, DEFAULT_SELECTIVITY_DENOMINATOR),
+            expected,
+            "id={id}"
+        );
+    }
+}
+
+#[test]
+fn lang_for_id_selects_target_lang_at_the_configured_rate() {
+    // denominator=3: id % 3 == 0 のみ "ja"、それ以外は非 "ja"。
+    let mut ja_count = 0usize;
+    for id in 0..3000u64 {
+        if lang_for_id(id, 3) == TARGET_LANG {
+            ja_count += 1;
+            assert_eq!(id % 3, 0);
+        } else {
+            assert_ne!(id % 3, 0);
+        }
+    }
+    assert_eq!(ja_count, 1000);
+}
+
+#[test]
+fn lang_for_id_never_panics_across_the_full_denominator_range() {
+    for denominator in MIN_SELECTIVITY_DENOMINATOR..=MAX_SELECTIVITY_DENOMINATOR {
+        for id in 0..(denominator as u64 * 2) {
+            let _ = lang_for_id(id, denominator);
+        }
+    }
+}
+
+// --- expected_visible_hits ----------------------------------------------------
+
+#[test]
+fn expected_visible_hits_counts_matching_ids_only() {
+    let ids: Vec<u64> = (0..9).collect();
+    // denominator=3 → id % 3 == 0 のみ一致（0,3,6）。
+    assert_eq!(expected_visible_hits(&ids, 3), 3);
+}
+
+#[test]
+fn expected_visible_hits_empty_input_is_zero() {
+    assert_eq!(expected_visible_hits(&[], 5), 0);
+}
+
+// --- ProfileArm・where_clause_for_arm ------------------------------------------
+
+#[test]
+fn where_clause_for_arm_index_is_a_bare_equality() {
+    assert_eq!(
+        where_clause_for_arm(ProfileArm::Index, "lang", "ja"),
+        "WHERE lang = 'ja'"
+    );
+}
+
+#[test]
+fn where_clause_for_arm_plain_appends_a_residual_vector_predicate() {
+    // `AND 1 = 1` は束縛時の定数畳み込み（Issue #353）で消去され
+    // `classify_scalar_plan` を `PlainScan` へ強制できないため、`VectorRef` を
+    // 参照する残余述語（`id_predicate_from_expr` が `None` を返す形状）を使う。
+    assert_eq!(
+        where_clause_for_arm(ProfileArm::Plain, "lang", "ja"),
+        "WHERE lang = 'ja' AND vec_norm(embedding) > 0"
+    );
+}
+
+#[test]
+fn profile_arm_display_matches_stats_line_labels() {
+    assert_eq!(ProfileArm::Index.to_string(), "index");
+    assert_eq!(ProfileArm::Plain.to_string(), "plain");
+}
+
+// --- bucket_share_pct ----------------------------------------------------------
+
+#[test]
+fn bucket_share_pct_computes_percentage_of_total() {
+    let part = Duration::from_micros(250);
+    let total = Duration::from_micros(1000);
+    assert!((bucket_share_pct(part, total).unwrap() - 25.0).abs() < 1e-9);
+}
+
+#[test]
+fn bucket_share_pct_rejects_zero_total() {
+    assert!(matches!(
+        bucket_share_pct(Duration::from_micros(1), Duration::ZERO),
+        Err(ScanStageError::DegenerateRatio(_))
+    ));
+}
+
+// --- アーム契約テスト（Issue #653） -------------------------------------------
+//
+// `ScalarIndex` 候補削減（Issue #474）を実際に経由する production 経路
+// （`EngineCore::execute_sql` → `sql::exec::execute_statement_with_cache`）
+// 上で、[`ProfileArm::Index`]／[`ProfileArm::Plain`] が
+// `scalar_index_cache_stats()` に対して意図した契約（索引アームは
+// `index_scans` のみ増分、plain アームはいずれのカウンタも不変）を満たし、
+// かつ両アームが同一の Top-k id 集合を返すことを固定する
+// （`tests/scalar_index_prune.rs::assert_cold_hot_equivalent` と同じ流儀）。
+
+fn arm_test_schema() -> TableSchema {
+    TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(4), false),
+            ColumnDef::new("lang", ColumnType::Text, false),
+        ],
+    )
+}
+
+#[test]
+fn profile_arm_contract_matches_scalar_index_cache_stats() {
+    let path = unique_db_path("scan-stage-profile-accept-arm-contract");
+    let _guard = CleanupGuard(path.clone());
+    let schema = arm_test_schema();
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema).expect("create table");
+
+    let ctx = PolicyContext::with_visibilities("tenant-a", [Visibility::Public])
+        .expect("valid tenant id");
+    // denominator=3 相当（selectivity ≒ 33%）: id % 3 == 0 のみ "ja"。
+    // 索引の選択度閾値（既定 1/2）を超えないよう、十分な行数（30 行・10 一致）
+    // を投入する。
+    let rows: Vec<(u64, Vec<f32>, &str)> = (0..30u64)
+        .map(|id| {
+            let lang = lang_for_id(id, 3);
+            // `+ 1.0` でゼロベクトル（`id=0`）を避ける。ゼロノルムのベクトルは
+            // `<=>` の距離計算・`vec_norm(embedding) > 0` 述語のいずれでも
+            // 特別扱いになりうり、本テストの意図（index/plain 両アームの id
+            // 集合一致）とは無関係な差異を生むため。
+            (id, vec![id as f32 + 1.0, 0.0, 0.0, 0.0], lang)
+        })
+        .collect();
+    for (id, embedding, lang) in &rows {
+        let metadata = encode_scalar_columns(
+            &schema,
+            &[
+                Value::Vector(embedding.clone()),
+                Value::Text(lang.to_string()),
+            ],
+        )
+        .expect("encode_scalar_columns");
+        let op_id = OperationId::parse(&format!("seed-{id}")).expect("valid operation_id");
+        tenant::insert_rows(
+            &storage,
+            "docs",
+            &ctx,
+            &[(
+                *id,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding,
+                    metadata: &metadata,
+                },
+            )],
+            &op_id,
+        )
+        .expect("seed row");
+    }
+    let expected_match_ids: Vec<u64> = rows
+        .iter()
+        .filter(|(id, _, _)| lang_for_id(*id, 3) == TARGET_LANG)
+        .map(|(id, _, _)| *id)
+        .collect();
+    assert_eq!(
+        expected_visible_hits(&(0..30).collect::<Vec<_>>(), 3),
+        expected_match_ids.len()
+    );
+
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+
+    let sql_index = format!(
+        // `LIMIT` を一致件数（10）以上に取り、Top-k がタイブレーク順序に依存
+        // せず一致行集合の全体（部分集合ではなく）になるようにする（クエリ
+        // ベクトルが原点のため候補間の距離が同点になり得る）。
+        "SELECT id FROM docs {} ORDER BY embedding <=> '[0.0,0.0,0.0,0.0]' LIMIT 20",
+        where_clause_for_arm(ProfileArm::Index, "lang", TARGET_LANG)
+    );
+    let sql_plain = format!(
+        // `LIMIT` を一致件数（10）以上に取り、Top-k がタイブレーク順序に依存
+        // せず一致行集合の全体（部分集合ではなく）になるようにする（クエリ
+        // ベクトルが原点のため候補間の距離が同点になり得る）。
+        "SELECT id FROM docs {} ORDER BY embedding <=> '[0.0,0.0,0.0,0.0]' LIMIT 20",
+        where_clause_for_arm(ProfileArm::Plain, "lang", TARGET_LANG)
+    );
+
+    let result_ids = |result: &engine::sql::exec::QueryResult| -> Vec<u64> {
+        result
+            .rows
+            .iter()
+            .map(|row| match row.cells.first() {
+                Some(engine::sql::exec::Cell::Integer(v)) => *v,
+                other => panic!("unexpected id cell: {other:?}"),
+            })
+            .collect()
+    };
+
+    // 索引アーム: cold（索引を構築）→ hot（索引を消費）の順で 2 回実行し、
+    // `index_scans` のみが増分することを固定する。
+    let before_index = core.scalar_index_cache_stats();
+    let cold_index = core
+        .execute_sql(&ctx, &sql_index)
+        .expect("execute_sql (index arm, cold)");
+    let hot_index = core
+        .execute_sql(&ctx, &sql_index)
+        .expect("execute_sql (index arm, hot)");
+    let after_index = core.scalar_index_cache_stats();
+    let mut cold_index_ids = result_ids(&cold_index);
+    cold_index_ids.sort_unstable();
+    let mut hot_index_ids = result_ids(&hot_index);
+    hot_index_ids.sort_unstable();
+    assert_eq!(cold_index_ids, hot_index_ids);
+    for id in &hot_index_ids {
+        assert!(
+            expected_match_ids.contains(id),
+            "id {id} leaked outside lang='ja'"
+        );
+    }
+    // 非リーク検証（上のループ）だけでは、`hot_index_ids` が空集合や
+    // `expected_match_ids` の真部分集合でも通過してしまう（Cursor Bugbot
+    // 指摘・PR #663）。`index_scans` の増分・id 集合の cold/hot 一致は
+    // 「索引経路を通ったこと」の確認にとどまり「lang='ja' の期待行が
+    // 実際に全件返っていること」の確認にはならないため、独立に導出した
+    // `expected_match_ids`（10 行）との完全一致を固定して vacuous pass を防ぐ。
+    // `expected_match_ids` は `rows` を `id` 昇順に走査して構築しているため
+    // 既に昇順であり、`sort_unstable` 済みの `hot_index_ids` と直接比較できる。
+    assert_eq!(
+        hot_index_ids, expected_match_ids,
+        "index arm hot result must return exactly the lang='ja' visible set, not a subset (vacuous-pass guard)"
+    );
+    assert!(
+        after_index.index_scans > before_index.index_scans,
+        "index arm must consume ScalarIndex candidate resolution at least once"
+    );
+    assert_eq!(
+        after_index.plain_scan_fallbacks, before_index.plain_scan_fallbacks,
+        "index arm must never fall back to plain scan"
+    );
+
+    // plain アーム: `PlainScan` 分類のため index_scans／plain_scan_fallbacks の
+    // いずれも不変のまま、索引アームと同一の id 集合を返す。
+    let before_plain = core.scalar_index_cache_stats();
+    let plain_result = core
+        .execute_sql(&ctx, &sql_plain)
+        .expect("execute_sql (plain arm)");
+    let after_plain = core.scalar_index_cache_stats();
+    let mut plain_ids = result_ids(&plain_result);
+    plain_ids.sort_unstable();
+    assert_eq!(plain_ids, hot_index_ids);
+    assert_eq!(
+        after_plain.index_scans, before_plain.index_scans,
+        "plain arm must never consume ScalarIndex candidate resolution"
+    );
+    assert_eq!(
+        after_plain.plain_scan_fallbacks, before_plain.plain_scan_fallbacks,
+        "a pure PlainScan-classified query never enters the fallback-recording branch"
+    );
 }
