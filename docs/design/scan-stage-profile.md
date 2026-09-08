@@ -59,7 +59,7 @@ A1〜A5 の計測対象本体（`run()` へ渡すクロージャの中身）は 
 
 ## 測定設計
 
-- **コーパス**: crossdb モデル（tenant-a 23,000×scale 行 Public・tenant-b 2,000×scale 行 Private・dim 128・`lang` 列 5 値輪番〔`ja` ≒ 20%〕）。`feature_bench.rs` とは列構成が異なる（`topic`／`body` を持たない簡略版）ことを明記する。`BENCH_SCAN_PROFILE_SCALE`（既定 1＝25,000 行、4＝100,000 行。`bench_engine::parse_scale` で fail-closed）で規模を切替え、1 プロセス = 1 規模点とする（`docs/design/benchmark-judgement-policy.md` §5・Issue #313 の教訓）。
+- **コーパス**: crossdb モデル（tenant-a 23,000×scale 行 Public・tenant-b 2,000×scale 行 Private・dim 128・`lang` 列 5 値輪番〔`ja` ≒ 20%〕）。`feature_bench.rs` とは列構成が異なる（`topic`／`body` を持たない簡略版）ことを明記する。「crossdb モデル」は行数比率（tenant-a/tenant-b）のみを実 crossdb fixture（`scripts/crossdb_bench/`）に合わせたもので、`lang` 選択率自体は本ベンチ独自（5 値輪番）である。実 crossdb fixture は `lang` が `en`／`ja` の 2 値のみで `ja` は可視行の約 33%（7,621/23,000。`docs/design/crossdb-bench.md`「公平性の注記」参照。Issue #661）と異なる点に注意する。`BENCH_SCAN_PROFILE_SCALE`（既定 1＝25,000 行、4＝100,000 行。`bench_engine::parse_scale` で fail-closed）で規模を切替え、1 プロセス = 1 規模点とする（`docs/design/benchmark-judgement-policy.md` §5・Issue #313 の教訓）。
 - **ラウンド輪番**: `BENCH_SCAN_PROFILE_ROUNDS`（既定 5・5〜50・fail-closed パース）。各ラウンドで A1〜A5・W1〜W4・R_dot を輪番で 1 回ずつ計測し（各段内部は `harness::protocol::run` の warmup 20 回・計測 20 回で中央値を得る）、ラウンド横断で min-of-R と median-of-R を併記する。per-round 生値も出力する。
 - **再実装によるドリフト対策**: `pub(crate)` の `decode_row_header`／`decode_row_dim_and_metadata_borrowed`／`verify_row_key_tenant` はベンチから直接呼べないため、`benches/harness/scan_stage_profile.rs::decode_dim_and_metadata_reimpl`（f32 変換を行わず dim・metadata の構造検証のみ）を追加した。`tests/scan_stage_profile_accept.rs` が `Storage::put`/`Storage::scan()`（pub API・正本）との突き合わせでドリフトを検出する（`knn_profile_bench.rs::decode_row_reimpl` と同方式）。
 - **CI 配線**: しない。spec 由来の閾値を持たない情報提供専用のため `.github/workflows/*` へは配線せず、`GITHUB_ACTIONS` 環境下では起動直後に fail-closed で拒否する。`make bench-scan-stage-profile` から手動実行する。
@@ -224,3 +224,4 @@ e2e: `W0-cold`=86.993ms・`W0-hot`=4.972ms・`W0-nowhere`=3.041ms。raw diff（`
 - `feature_bench` の 13 フェーズ自体への段別計測点の埋め込みは行わない（`feature_bench` は 13 フェーズ横断の e2e 基線として不変に保つ）。
 - `where_compound_count`・`group_by_having` の段別分解は本 Issue 対象外（#471 側で必要なら別途）。
 - Issue #635: `#[inline(never)]` 分離の摂動テストは本開発環境（共有 QEMU）での 1 回の N=5 ペア実測に基づく。専有環境での再検証・より長期的な配置感度の安定性確認はオーナー作業として申し送り。W 系列の絶対値変化（本節初版比）は Issue #635 のスコープ外だが、実測値の記録として本 doc の「実測結果」節へ反映済み。
+- Issue #653: 選択率 opt-in（`BENCH_SCAN_PROFILE_SELECTIVITY`）・現行索引経路（Issue #474）の index/plain 2 アーム計測・索引経路の I1〜I3 内訳は本 doc ではなく `docs/design/filtered-distance-stage-profile.md` へ分離して記録した（本 doc の W 系列は索引導入前・選択率 20% 固定のまま不変）。
