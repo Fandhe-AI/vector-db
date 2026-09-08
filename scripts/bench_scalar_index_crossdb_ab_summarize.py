@@ -36,6 +36,24 @@ run を arm ごとに無条件に全件集約していたため、baseline 6 回
 hybrid（モードごと）いずれも、候補ごとの baseline/candidate 2 arm 間の
 run 番号（pair）の共通集合だけを集計対象とし、共通集合が `MIN_PAIRS`
 未満なら拒否する（fail-closed）。
+
+全出力指標への MIN_PAIRS 検証の一般化（Issue #633 codex-review P2 指摘・
+3 巡目）: 上記の対応済みペア限定を導入した後も、`MIN_PAIRS` の実際の
+検証は `REFERENCE_BAND_PHASE`（`vector_knn.p50`）1 指標（crossdb self）
+と hybrid 各モードの `p50` のみを代表として行っていた。`emit_row` は
+これとは独立に `CROSSDB_PHASES`（`hybrid_rrf` 等）の `p50`/`p95`・hybrid
+各モードの `p95`／`rss_*` それぞれについて `common_pairs_for` で対応
+済みペアを再計算するため、代表指標だけ N ≥ `MIN_PAIRS` を満たしていても
+他の指標が状態依存の欠損（一部 run で該当フェーズの JSON が生成され
+ない等）により 1〜数ペアしか対応しないまま min-of-N・median・
+`regressed`/`improved` 判定へ進みうる（`benchmark-judgement-policy.md`
+§3 の N ≥ 5 ペア契約を満たさない）。そのため本スクリプトは、実際に
+出力する行仕様（`ROW_SPECS`。`emit_row` へ渡す `(collected, key, subkey)`
+の全組）を先に列挙し、候補ごとにそれぞれの組で対応済みペア数を検証する
+（データがどちらの arm にも存在しない組は判定対象から除外し、片方にでも
+存在する組は `MIN_PAIRS` 未満なら拒否する）。この一般検証が
+`REFERENCE_BAND_PHASE`／hybrid `p50` 個別検証を包含するため、個別の
+特別扱いは撤去した。
 """
 
 from __future__ import annotations
@@ -188,16 +206,6 @@ def arm_pairs(collected: dict, arm: str, key: str, subkey: str) -> set[int]:
     """`collected`（`collect_crossdb`/`collect_hybrid` の出力）から
     `arm`/`key`（phase または mode）/`subkey`（p50 等）に存在する run 番号集合を返す。"""
     return set(collected.get(arm, {}).get(key, {}).get(subkey, {}).keys())
-
-
-def common_pairs_for(collected: dict, baseline: str, candidate: str, key: str, subkey: str = "p50") -> set[int]:
-    """候補専用 baseline と candidate、両方に存在する run 番号（pair）の積集合。
-
-    `benchmark-judgement-policy.md` §3 の交互実行は同一ペア番号を baseline/
-    candidate で対にする前提のため、いずれか一方にしか存在しない run 番号は
-    対応しない余剰 run として除外する（codex-review P2 指摘・2 巡目）。
-    """
-    return arm_pairs(collected, baseline, key, subkey) & arm_pairs(collected, candidate, key, subkey)
 
 
 def filtered_values(collected: dict, arm: str, key: str, subkey: str, allowed_pairs: set[int]) -> list[float]:
@@ -356,64 +364,73 @@ def main() -> int:
     eff_crossdb_baseline = effective_baseline_map(crossdb)
     eff_hybrid_baseline = effective_baseline_map(hybrid)
 
-    # 候補ごとに専用 baseline との対応済み run ペア（積集合）を求める
-    # （codex-review P1 指摘: 候補ごとに専用 baseline。P2 指摘・2 巡目:
-    # 対応しない余剰 run は集計対象から除外する）。crossdb self は
-    # 「全 phase に共通の pair 集合」ではなく phase ごとに個別で良いが、
-    # 実運用では 1 run が全 phase を含むため、代表として
-    # `REFERENCE_BAND_PHASE` の pair 集合を候補の対応判定に用いる
-    # （crossdb・hybrid 各モードは `emit_row` 呼び出し時に該当 key で
-    # 再度 `common_pairs_for` を計算するため、phase ごとの部分欠損にも
-    # 対応する）。
-    crossdb_common: dict[str, set[int]] = {}
-    for candidate in candidates:
-        baseline = eff_crossdb_baseline[candidate]
-        crossdb_common[candidate] = common_pairs_for(crossdb, baseline, candidate, REFERENCE_BAND_PHASE)
-
-    hybrid_common: dict[str, dict[str, set[int]]] = {}
+    # `emit_row` が実際に出力する行仕様（`(section, name, unit, collected,
+    # key, subkey)`）を先に列挙する。この一覧を「MIN_PAIRS 検証」「行の
+    # 算出」の両方が共有することで、代表指標だけの検証では見逃す個別指標
+    # の部分欠損（codex-review P2 指摘・3 巡目）を防ぐ。
+    row_specs: list[tuple[str, str, str, dict, str, str]] = []
+    for phase in CROSSDB_PHASES + CROSSDB_REFERENCE_PHASES:
+        section = "reference" if phase in CROSSDB_REFERENCE_PHASES else "crossdb"
+        row_specs.append((section, f"{phase}.p50", "us", crossdb, phase, "p50"))
+        row_specs.append((section, f"{phase}.p95", "us", crossdb, phase, "p95"))
     for mode in HYBRID_MODES:
-        hybrid_common[mode] = {}
-        for candidate in candidates:
-            baseline = eff_hybrid_baseline[candidate]
-            hybrid_common[mode][candidate] = common_pairs_for(hybrid, baseline, candidate, mode, "p50")
+        row_specs.append(("hybrid_loop", f"{mode}.p50", "us", hybrid, mode, "p50"))
+        row_specs.append(("hybrid_loop", f"{mode}.p95", "us", hybrid, mode, "p95"))
+        for rss_key in ("rss_start", "rss_after_warm", "rss_end"):
+            row_specs.append(("hybrid_loop_rss", f"{mode}.{rss_key}", "MiB", hybrid, mode, rss_key))
 
-    # N ≥ 5 ペア・候補ごとの baseline/candidate 対応を検証する（codex-review
-    # P2 指摘）。不完全なデータのまま判定へ進まず拒否する（fail-closed）。
+    # 候補ごとの専用 baseline は集約元（crossdb/hybrid）で異なるため、
+    # 行仕様の `collected` が指すデータセットに応じて対応する実効
+    # baseline マップを選ぶ。
+    def eff_baseline_for(collected: dict) -> dict[str, str]:
+        return eff_crossdb_baseline if collected is crossdb else eff_hybrid_baseline
+
+    # 候補・行仕様ごとの対応済み run ペア（積集合）を求める（codex-review
+    # P1 指摘: 候補ごとに専用 baseline。P2 指摘・2 巡目: 対応しない余剰
+    # run は除外。P2 指摘・3 巡目: 代表指標だけでなく実際に出力する
+    # 全指標で求める）。`allowed_pairs_by_spec[(name, key, subkey)][candidate]`
+    # の形で `emit_row` 呼び出し時に再利用する。
+    allowed_pairs_by_spec: dict[tuple[str, str, str], dict[str, set[int]]] = {}
     pair_errors: list[str] = []
-    for candidate in candidates:
-        if candidate not in crossdb:
-            continue
-        matched = crossdb_common[candidate]
-        if len(matched) < MIN_PAIRS:
-            baseline = eff_crossdb_baseline[candidate]
-            pair_errors.append(
-                f"crossdb {baseline}/{candidate}: matched run pairs={len(matched)} (< {MIN_PAIRS} required); "
-                f"{baseline} runs={sorted(arm_pairs(crossdb, baseline, REFERENCE_BAND_PHASE, 'p50'))} "
-                f"{candidate} runs={sorted(arm_pairs(crossdb, candidate, REFERENCE_BAND_PHASE, 'p50'))}"
-            )
-    for mode in HYBRID_MODES:
+    for _section, name, _unit, collected, key, subkey in row_specs:
+        eff_baseline = eff_baseline_for(collected)
+        spec_key = (name, key, subkey)
+        allowed_pairs_by_spec[spec_key] = {}
         for candidate in candidates:
-            if candidate not in hybrid or mode not in hybrid.get(candidate, {}):
+            baseline = eff_baseline[candidate]
+            baseline_pairs = arm_pairs(collected, baseline, key, subkey)
+            candidate_pairs = arm_pairs(collected, candidate, key, subkey)
+            allowed_pairs_by_spec[spec_key][candidate] = baseline_pairs & candidate_pairs
+            # どちらの arm にもこの指標のデータが無い場合（この候補・
+            # セクションが対象外、または該当フェーズ自体が未計測）は
+            # 判定対象から除外する。既存の「candidate not in crossdb/hybrid」
+            # スキップと同じ趣旨。
+            if not baseline_pairs and not candidate_pairs:
                 continue
-            matched = hybrid_common[mode][candidate]
+            matched = allowed_pairs_by_spec[spec_key][candidate]
             if len(matched) < MIN_PAIRS:
-                baseline = eff_hybrid_baseline[candidate]
+                dataset = "crossdb" if collected is crossdb else "hybrid"
                 pair_errors.append(
-                    f"hybrid[{mode}] {baseline}/{candidate}: matched run pairs={len(matched)} "
+                    f"{dataset}[{name}] {baseline}/{candidate}: matched run pairs={len(matched)} "
                     f"(< {MIN_PAIRS} required); "
-                    f"{baseline} runs={sorted(arm_pairs(hybrid, baseline, mode, 'p50'))} "
-                    f"{candidate} runs={sorted(arm_pairs(hybrid, candidate, mode, 'p50'))}"
+                    f"{baseline} runs={sorted(baseline_pairs)} {candidate} runs={sorted(candidate_pairs)}"
                 )
     if pair_errors:
         print(
             "ERROR: insufficient or mismatched run pairs "
             f"(N >= {MIN_PAIRS} matched pairs required per "
-            "docs/design/benchmark-judgement-policy.md §3 — codex-review P2 指摘):",
+            "docs/design/benchmark-judgement-policy.md §3 — codex-review P2 指摘・3 巡目: "
+            "実際に出力する全指標で検証):",
             file=sys.stderr,
         )
         for err in pair_errors:
             print(f"  - {err}", file=sys.stderr)
         return 2
+
+    # `reference_band` の算出（下記）は `REFERENCE_BAND_PHASE` 専用に
+    # 対応済みペアを使う。上記の一般検証で `vector_knn.p50` も検証済み
+    # のため、ここでの取得は再利用のみでよい。
+    crossdb_common: dict[str, set[int]] = allowed_pairs_by_spec[(f"{REFERENCE_BAND_PHASE}.p50", REFERENCE_BAND_PHASE, "p50")]
 
     # 実測ノイズ帯（reference_band）: 候補専用 baseline と candidate の
     # `REFERENCE_BAND_PHASE`（`vector_knn.p50`）run-to-run 値列を、対応済み
@@ -446,68 +463,27 @@ def main() -> int:
         else:
             print(f"# reference_band[{baseline}+{candidate}] {REFERENCE_BAND_PHASE}.p50: no data", file=sys.stderr)
 
+    # 行の算出は `row_specs`（前段の MIN_PAIRS 検証と共有する行仕様一覧）
+    # を走査し、各指標で検証済みの対応済みペア（`allowed_pairs_by_spec`）
+    # をそのまま使う（codex-review P2 指摘・3 巡目: 検証と算出が異なる
+    # ペア集合を使わないよう一元化）。
     rows: list[dict] = []
-    for phase in CROSSDB_PHASES + CROSSDB_REFERENCE_PHASES:
-        section = "reference" if phase in CROSSDB_REFERENCE_PHASES else "crossdb"
-        allowed_by_candidate = {
-            c: common_pairs_for(crossdb, eff_crossdb_baseline[c], c, phase, "p50") for c in candidates
-        }
+    for section, name, unit, collected, key, subkey in row_specs:
+        eff_baseline = eff_baseline_for(collected)
+        allowed_by_candidate = allowed_pairs_by_spec[(name, key, subkey)]
         emit_row(
             rows,
             section,
-            f"{phase}.p50",
-            "us",
-            crossdb,
-            phase,
-            "p50",
+            name,
+            unit,
+            collected,
+            key,
+            subkey,
             candidates,
-            eff_crossdb_baseline,
+            eff_baseline,
             allowed_by_candidate,
             ref_bands,
         )
-        allowed_by_candidate_p95 = {
-            c: common_pairs_for(crossdb, eff_crossdb_baseline[c], c, phase, "p95") for c in candidates
-        }
-        emit_row(
-            rows,
-            section,
-            f"{phase}.p95",
-            "us",
-            crossdb,
-            phase,
-            "p95",
-            candidates,
-            eff_crossdb_baseline,
-            allowed_by_candidate_p95,
-            ref_bands,
-        )
-
-    for mode in HYBRID_MODES:
-        allowed_p50 = {c: common_pairs_for(hybrid, eff_hybrid_baseline[c], c, mode, "p50") for c in candidates}
-        emit_row(
-            rows, "hybrid_loop", f"{mode}.p50", "us", hybrid, mode, "p50", candidates, eff_hybrid_baseline, allowed_p50, ref_bands
-        )
-        allowed_p95 = {c: common_pairs_for(hybrid, eff_hybrid_baseline[c], c, mode, "p95") for c in candidates}
-        emit_row(
-            rows, "hybrid_loop", f"{mode}.p95", "us", hybrid, mode, "p95", candidates, eff_hybrid_baseline, allowed_p95, ref_bands
-        )
-        for rss_key in ("rss_start", "rss_after_warm", "rss_end"):
-            allowed_rss = {
-                c: common_pairs_for(hybrid, eff_hybrid_baseline[c], c, mode, rss_key) for c in candidates
-            }
-            emit_row(
-                rows,
-                "hybrid_loop_rss",
-                f"{mode}.{rss_key}",
-                "MiB",
-                hybrid,
-                mode,
-                rss_key,
-                candidates,
-                eff_hybrid_baseline,
-                allowed_rss,
-                ref_bands,
-            )
 
     header = ["section", "name", "unit"]
     for candidate in candidates:
