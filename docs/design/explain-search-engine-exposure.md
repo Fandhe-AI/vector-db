@@ -120,7 +120,9 @@ Issue #497）・`acorn_max_visible_ratio`（ACORN-1 の 2-hop 展開切替閾値
 - 実行時縮退結果・hybrid 密側再取得ラウンド数・キャッシュ状態の可視化
   （`EXPLAIN ANALYZE` 相当）は実行を伴うため別設計
 - `full_scan_ratio` 等の閾値露出の可否はオーナー判断待ち
-- wire-server CLI・テーブル単位カタログ属性でのエンジン選択露出（ADR
+- wire-server CLI でのエンジン選択露出は Issue #656 で実装済み
+  （`--search-engine`。`docs/design/hnsw-search-engine-wiring.md` 参照）。
+  テーブル単位カタログ属性でのエンジン選択露出は引き続き対象外（ADR
   「判断確定後のスコープ外」節）
 - `SearchEngineError` の `ErrorClass`／`wire_code` 正式登録（spec 側ビヘイビア ID
   確定後）

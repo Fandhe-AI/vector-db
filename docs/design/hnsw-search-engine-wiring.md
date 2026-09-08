@@ -60,7 +60,13 @@ Hnsw 検証を理由に失敗しない（`open_with_engine` は `Storage::open` 
 Issue #411（実装済み）の `EXPLAIN` 露出は専用の網羅 `match`（`sql/explain.rs::
 engine_token`／`ann_plan_token`）で閉じた語彙へ変換するのみで、untrusted
 文字列からの逆変換（`FromStr`）を必要としなかったため、依然として未追加
-のまま（`docs/design/explain-search-engine-exposure.md` 参照）。
+のまま（`docs/design/explain-search-engine-exposure.md` 参照）。Issue #656 で
+`wire-server` CLI（`--search-engine`）という呼び出し元がついに実現したが、
+untrusted な CLI 文字列を判定する語彙は 4 値（`default`／`hnsw`／
+`hnsw_f16`／`hnsw_i8`）に閉じており、`HnswParams` の数値パラメータ
+（`m`／`ef_*` 等）を文字列から復元する必要が無いため、その判定は
+`crates/wire-server/src/search_engine_opt.rs` 側に置き、`engine::
+search_engine` へは引き続き `FromStr` を追加しない（本節の判断は維持）。
 
 ### `SearchEngineError`
 
