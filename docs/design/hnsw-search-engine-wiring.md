@@ -67,6 +67,34 @@ untrusted な CLI 文字列を判定する語彙は 4 値（`default`／`hnsw`�
 （`m`／`ef_*` 等）を文字列から復元する必要が無いため、その判定は
 `crates/wire-server/src/search_engine_opt.rs` 側に置き、`engine::
 search_engine` へは引き続き `FromStr` を追加しない（本節の判断は維持）。
+Issue #657 で `full_scan_ratio`／`acorn_max_visible_ratio`（比）・
+`sparse_visited_max`（整数）の 3 パラメータを CLI opt-in 露出した際も同じ
+判断を踏襲し、`<num>/<den>`・非負整数の untrusted 文字列パースは
+`search_engine_opt.rs::parse_ratio`／`parse_sparse_visited_max` に閉じたまま
+`engine::hnsw::Ratio`／`ValidatedHnswParams` 側へは `FromStr` を追加しない
+（意味検証は既存の `with_full_scan_ratio`／`with_acorn_max_visible_ratio`
+へ一本化し、二重実装しない）。
+
+#### CLI 探索パラメータ opt-in（Issue #657）
+
+`--hnsw-full-scan-ratio`／`--hnsw-acorn-max-visible-ratio`／
+`--hnsw-sparse-visited-max` を `wire-server` CLI へ追加し、
+`ValidatedHnswParams::with_full_scan_ratio`／`with_acorn_max_visible_ratio`／
+`with_sparse_visited_max`（いずれも既存 API・#409／#501／#497）へ結線した。
+判断:
+
+- 未指定は既定値（`full_scan_ratio`=1/10・`acorn_max_visible_ratio`=none・
+  `sparse_visited_max`=0）のまま不変（R2）。
+- `--search-engine` が `default`／未指定のまま `--hnsw-*` を指定する構成は
+  fail-closed で拒否する（黙って無視すると「チューニングが効いている」と
+  誤認したまま brute-force が走る事故になるため）。
+- 適用順序は `full_scan_ratio` → `acorn_max_visible_ratio` →
+  `sparse_visited_max` に固定（相互検証はどちらの順でも安全だが、エラー
+  文言を決定的にするため）。
+- `full_scan_ratio`／`acorn_max_visible_ratio` はテナント存在情報に繋がる
+  ため `EXPLAIN` の `hnsw_params:` 行へは出さない（Issue #411 の方針を維持。
+  `sparse_visited_max=` は Issue #497 で既に露出済み）。
+- 既定値の見直し・実測は Issue #659 の担当。
 
 ### `SearchEngineError`
 

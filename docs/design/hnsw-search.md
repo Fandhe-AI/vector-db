@@ -142,7 +142,10 @@ impl HnswIndex {
 - `EXPLAIN` の `hnsw_params:` 行へ `sparse_visited_max=<n>` を追記した
   （`resident=` と同区分。構築時静的値のみを露出し、実行時にどちらの
   visited 実装が選ばれたか・可視候補数・索引ノード数は非露出のまま。
-  `docs/design/explain-search-engine-exposure.md` 参照）。
+  `docs/design/explain-search-engine-exposure.md` 参照）。`sparse_visited_max`
+  は Issue #657 で `wire-server` CLI（`--hnsw-sparse-visited-max`）から設定
+  可能になった（詳細は `docs/design/hnsw-search-engine-wiring.md`「CLI 探索
+  パラメータ opt-in（Issue #657）」節参照）。
 
 ### 到達可能性についての注記（#498 への申し送り）
 

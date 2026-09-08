@@ -956,6 +956,12 @@ Issue #500 の設計契約（上記「ゲート条件の設計」節）に従い
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`・`cargo test --workspace --all-features` を実行（結果は本 PR の Test plan 参照）
 - 新規 `unsafe` は 0（既存の禁止方針を維持）。依存追加なし（`Cargo.toml` 無変更）
 
+`acorn_max_visible_ratio`（本節）・`full_scan_ratio`（Issue #409）は Issue #657
+で `wire-server` CLI（`--hnsw-acorn-max-visible-ratio`／
+`--hnsw-full-scan-ratio`）から設定可能になった（`EXPLAIN` 非露出方針は不変。
+詳細は `docs/design/hnsw-search-engine-wiring.md`「CLI 探索パラメータ opt-in
+（Issue #657）」節参照）。
+
 ## Issue #498 追記: visited 集合切替閾値の可視比率スイープ確認（層 2）
 
 Issue #497（`VisitedSparse`・`sparse_visited_max` 閾値機構）の閾値既定値
