@@ -75,8 +75,11 @@ classify_ann_plan`〔Issue #411〕と同型の設計）。
 `sql::hnsw_cache` の `full_scan_ratio` と同型）を満たす場合、索引経路より全走査
 が有利と判断し `FallbackSelectivity` へ縮退する。**暫定既定値は 1/2**
 （`sql::hnsw_cache` の ANN 先例〔1/10〕をそのまま採ると、想定フェーズ
-`vector_knn_where`〔`lang = 'ja'` が可視行の約 20%〕が索引経路に乗らず受入条件が
-vacuous になるため、根拠を「索引経路のコストは概ね `O(|hits|)`、全走査は
+`vector_knn_where`〔`lang = 'ja'` が可視行に占める割合は `feature_bench` コーパス
+〔5 値輪番〕では約 20%、crossdb fixture（`scripts/crossdb_bench/`）では約 33%
+（7,621/23,000。`docs/design/crossdb-bench.md`「公平性の注記」参照。Issue #661）〕
+が索引経路に乗らず受入条件が vacuous になるため（いずれの割合でも暫定既定 1/2
+は下回り非 vacuous）、根拠を「索引経路のコストは概ね `O(|hits|)`、全走査は
 `O(N + |hits|)` であり損益分岐は `hits ≈ N` 近傍にしかない」という構造から緩めに
 設定した）。数値の確定は Issue #476。
 

@@ -180,7 +180,7 @@ HNSW グラフ構築）中央値 **613.8ms**——約 12.7 倍。`meta.vm_rss_kb
 | フェーズ | 形状 | 期待される `ann_plan`（hnsw エンジン時） |
 | --- | --- | --- |
 | `vector_knn`・`mode_recall` | フィルタなし DISTANCE | `hnsw_full_visible` |
-| `point_where`・`vector_knn_where` | SCALAR 事前フィルタ付き DISTANCE | `hnsw_subset`（可視候補比率が `full_scan_ratio` 未満なら `plain_scan_engine`。本条件〔`lang='ja'`＝約 1/5〕は未満にならない） |
+| `point_where`・`vector_knn_where` | SCALAR 事前フィルタ付き DISTANCE | `hnsw_subset`（可視候補比率が `full_scan_ratio` 未満なら `plain_scan_engine`。本条件〔`lang='ja'`＝約 1/5。`feature_bench` コーパス限定の割合で、crossdb fixture（`scripts/crossdb_bench/`）では約 1/3。`docs/design/crossdb-bench.md`「公平性の注記」参照〕は未満にならない） |
 | `hybrid_rrf` | Hybrid | `HnswDenseProvider` 経由（`ann_plan` の対象外。密側再取得ループの `hybrid_dense_searches` で確認） |
 | `mode_precision` | precision 確信度ゲート | `plain_scan_precision`（構造的に brute-force 固定） |
 
