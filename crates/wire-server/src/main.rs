@@ -6,9 +6,23 @@
 //!
 //! CLI: `wire-server --users <path> --db <path> [--bind <addr:port>]
 //! [--planner-endpoint <host:port> --planner-model <name>]
-//! [--embedder-hashing-dim <N>]`
+//! [--embedder-hashing-dim <N>]
+//! [--search-engine default|hnsw|hnsw_f16|hnsw_i8]`
 //! （既定 bind: `127.0.0.1:5432`）。`--db` は必須（省略時は fail-closed で
 //! 非 0 終了。匿名・揮発 DB の暗黙生成はしない。TASK-73・WIRE-1）。
+//!
+//! `--search-engine`（Issue #656）: `--planner-endpoint` 等（TASK-117）と同型の
+//! opt-in 注入点。未指定または `default` は現行どおり `EngineCore::open`
+//! （既定＝ブルートフォース）をそのまま呼び、`hnsw`／`hnsw_f16`／`hnsw_i8` は
+//! `EngineCore::open_with_engine`（Issue #402〜#413・#513・#520 系の HNSW opt-in
+//! 経路。索引ノード常駐精度は f32／f16／I8）へ分岐する。値の解決は
+//! `search_engine_opt::parse`／`to_engine_kind` に一本化し（untrusted な CLI
+//! 文字列から `engine::search_engine::SearchEngineKind` へ到達する唯一の入口）、
+//! 不正な値・値欠落・2 回目以降の重複指定はいずれも fail-closed で起動エラー
+//! （既定へ黙って読み替えない）。探索パラメータ（`m`／`ef_*`／
+//! `full_scan_ratio`／`sparse_visited_max`／ACORN）の CLI 露出は対象外
+//! （Issue #656 のスコープ外事項。既定値のまま）。選択結果は `EXPLAIN` の
+//! `engine:`／`hnsw_params:` 行（Issue #411）で確認できる。
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
 //! ログ・引数に残さない）。
@@ -85,6 +99,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut planner_endpoint: Option<String> = None;
     let mut planner_model: Option<String> = None;
     let mut embedder_hashing_dim: Option<String> = None;
+    let mut search_engine_raw: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -137,6 +152,25 @@ fn run_server(args: &[String]) -> ExitCode {
                 embedder_hashing_dim = Some(v.clone());
                 i += 2;
             }
+            "--search-engine" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: --search-engine requires one of {:?}",
+                        wire_server::search_engine_opt::TOKENS
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #656 D6: 起動後に変更できない構成値のため、typo・
+                // スクリプトの二重指定で意図しないエンジンが黙って選ばれる
+                // 事故を防ぐ目的で 2 回目以降の指定を fail-closed に拒否する
+                // （他フラグの last-wins とは意図的に方針を変える）。
+                if search_engine_raw.is_some() {
+                    eprintln!("wire-server: --search-engine specified more than once");
+                    return ExitCode::FAILURE;
+                }
+                search_engine_raw = Some(v.clone());
+                i += 2;
+            }
             other => {
                 eprintln!("wire-server: unknown argument: {other}");
                 return ExitCode::FAILURE;
@@ -178,6 +212,19 @@ fn run_server(args: &[String]) -> ExitCode {
         },
     };
 
+    // Issue #656: 未指定は `resolve_search_engine(None)` が `Ok(None)` を返し、
+    // 既存の `EngineCore::open` 経路（下記）をそのまま通す。不正な語彙・
+    // `ValidatedHnswParams` 検証失敗はいずれもここで起動エラーとして確定させる
+    // （fail-closed。bind・ユーザーストア読込より前に決着させることで、受理
+    // 不能な構成のまま listen へ進む経路を作らない）。
+    let search_engine_kind = match resolve_search_engine(search_engine_raw.as_deref()) {
+        Ok(kind) => kind,
+        Err(e) => {
+            eprintln!("wire-server: invalid --search-engine: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let Some(users_path) = users_path else {
         eprintln!("wire-server: --users <path> is required (fail-closed: no anonymous login)");
         return ExitCode::FAILURE;
@@ -213,12 +260,27 @@ fn run_server(args: &[String]) -> ExitCode {
     // engine（永続化 + SQL 表層）を起動する。ユーザーストア読込に続けて bind 前に
     // 開くことで、DB を開けない状態のまま listen してしまう経路を避ける
     // （fail-closed。TASK-73・WIRE-1）。
-    let mut core = match engine::core::EngineCore::open(&db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("wire-server: failed to open database at {db_path:?}: {e}");
-            return ExitCode::FAILURE;
-        }
+    //
+    // Issue #656: `search_engine_kind` が `None`（未指定／`default`）の場合は
+    // `EngineCore::open` を従来どおりそのまま呼ぶ（`open_with_engine
+    // (default_kind())` へは委譲しない。エラー型・メッセージまで既存経路と
+    // ビット同一に保つ設計判断。`search_engine_opt.rs` モジュールドキュメント
+    // 参照）。`Some(kind)` の場合のみ opt-in 経路 `open_with_engine` を使う。
+    let mut core = match search_engine_kind {
+        None => match engine::core::EngineCore::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("wire-server: failed to open database at {db_path:?}: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Some(kind) => match engine::core::EngineCore::open_with_engine(&db_path, kind) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("wire-server: failed to open database at {db_path:?}: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
     };
     // TASK-117（PLAN-9）: opt-in 注入。未指定（既定）では `query_planner`/
     // `embedder` とも未設定のままとなり、`USING PLAN` は従来どおり
@@ -317,6 +379,25 @@ fn build_hashing_embedder(raw_dim: &str) -> Result<Box<dyn engine::embedding::Em
         .map_err(|_| format!("invalid dimension {raw_dim:?}"))?;
     let embedder = engine::embedding::HashingEmbedder::new(dim).map_err(|e| format!("{e:?}"))?;
     Ok(Box::new(embedder))
+}
+
+/// `--search-engine` の値（未指定は `None`）から `EngineCore::open_with_engine`
+/// へ渡す `SearchEngineKind` を解決する（Issue #656）。純関数として切り出し、
+/// `std::env::args()` を直接読まずに単体テストできるようにする（`--planner-*`
+/// 系の `build_query_planner`／`build_hashing_embedder` と同じ流儀）。
+///
+/// `raw` が `None`（`--search-engine` 未指定）の場合は `Ok(None)` を返し、
+/// `run_server` は既存の `EngineCore::open` 経路をそのまま通す。値が
+/// [`wire_server::search_engine_opt::TOKENS`] のいずれとも厳密一致しない場合は
+/// `Err` で fail-closed（既定へ黙って読み替えない）。
+fn resolve_search_engine(
+    raw: Option<&str>,
+) -> Result<Option<engine::search_engine::SearchEngineKind>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let choice = wire_server::search_engine_opt::parse(raw)?;
+    choice.to_engine_kind()
 }
 
 /// `hash-password` サブコマンド: stdin からパスワードを 1 行読み、新規 salt を
@@ -451,5 +532,44 @@ mod tests {
         // engine 側の実装既定であり本テストでは転記せず、`u32::MAX` という
         // どの上限設定でも確実に超過する値で契約を確認する。
         expect_err(build_hashing_embedder(&u32::MAX.to_string()));
+    }
+
+    // Issue #656: `--search-engine` の解決結果パーステスト。wire 経由の実行
+    // 契約（`EXPLAIN` 一致・RLS 非漏えい）は
+    // `tests/wire_search_engine_opt.rs`（in-process）・
+    // `tests/wire_search_engine_cli.rs`（子プロセス）が担う。
+
+    #[test]
+    fn resolve_search_engine_none_is_default_engine_core_open_path() {
+        // R2: 未指定は `EngineCore::open` をそのまま通す契約の入口
+        // （`run_server` 側の分岐は `None` を既存経路として扱う）。
+        assert_eq!(resolve_search_engine(None), Ok(None));
+    }
+
+    #[test]
+    fn resolve_search_engine_default_token_is_also_none() {
+        assert_eq!(resolve_search_engine(Some("default")), Ok(None));
+    }
+
+    #[test]
+    fn resolve_search_engine_accepts_hnsw_variants() {
+        for tok in ["hnsw", "hnsw_f16", "hnsw_i8"] {
+            let kind = resolve_search_engine(Some(tok))
+                .unwrap_or_else(|e| panic!("expected {tok:?} to resolve, got error: {e}"));
+            assert!(kind.is_some(), "expected Some(kind) for {tok:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_search_engine_rejects_unknown_value_fail_closed() {
+        // R3: 不正な値は既定へ読み替えず起動エラーにする。
+        let err = expect_err(resolve_search_engine(Some("bogus")));
+        assert!(err.contains("--search-engine"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_search_engine_rejects_case_variant() {
+        // 厳密一致のみ受理（`search_engine_opt::parse` の契約）。
+        expect_err(resolve_search_engine(Some("HNSW")));
     }
 }
