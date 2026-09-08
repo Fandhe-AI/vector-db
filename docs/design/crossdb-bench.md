@@ -4,7 +4,8 @@
   `crates/engine/benches/gpu_scaling_bench.rs`。production 変更は
   `crates/wire-server/src/server.rs` の `TCP_NODELAY` 設定のみ）
 - 対応: PR #451 後続（hnsw_rs 撤去）・Issue #406 関連（HNSW 構築比較の対照）・
-  Issue #636（親 #629。fixture の FS 条件・Qdrant イメージ版・2026-09-08 再計測）
+  Issue #636（親 #629。fixture の FS 条件・Qdrant イメージ版・2026-09-08 再計測）・
+  Issue #661（比較条件の未記録な非対称・fixture 選択率の記録。production・ハーネス無変更）
 - 入口: `make bench-crossdb`（README「他 DB との機能別横断ベンチ」）・
   `make bench-gpu-scaling`・`scripts/crossdb_bench/gpu/README.md`
 - 関連: `docs/design/hnsw-parallel-build.md`（自作 HNSW vs usearch）・
@@ -38,7 +39,7 @@ spec の受け入れ基準（閾値）は本ドキュメントでは扱わない
 | MySQL | `mysql:9`（9.7.2 Community。`VECTOR` 型は作れるが `DISTANCE()`／`VECTOR_DISTANCE` が無く〔ERROR 1305〕、`CREATE VECTOR INDEX` は構文エラー〔HeatWave 限定〕のため KNN 系は n/a） |
 | FAISS | faiss-gpu-cu12 1.14.1（Docker `bench-faiss-gpu`・python 3.12・`OMP_NUM_THREADS=12`・OpenBLAS 1 スレッド・BLAS 経路無効化） |
 | Qdrant GPU | `qdrant/qdrant:gpu-nvidia-latest`（`QDRANT__GPU__INDEXING=1`。構築のみ GPU） |
-| fixture | `seed_docs seed` 25,000 行・dim 128（tenant-a 23,000 行 public・tenant-b 2,000 行 private）・200 クエリ・k=10 |
+| fixture | `seed_docs seed` 25,000 行・dim 128（tenant-a 23,000 行 public・tenant-b 2,000 行 private）・200 クエリ・k=10。`lang` 列は `en`／`ja` の 2 値（`seed_docs.rs` の `rng.next().is_multiple_of(3)` により `ja` が概ね 1/3）で、`docs25k.jsonl` の実測は `ja` 合計 8,309/25,000（33.2%）・可視行（public）中 7,621/23,000（33.1%）・`where_compound_count`（public ∧ id>100 ∧ ja）7,599 行（Issue #661。下記「公平性の注記」参照。`feature_bench.rs`／`scan_stage_profile_bench.rs` の `lang` 5 値輪番コーパス〔`ja` ≒ 20%〕とは別物） |
 | fixture FS | 初回計測は FS 未記録（tmpfs 上の再現値と数値が整合。下記「2026-09-08 再計測」節参照）。2026-09-08 再計測は ext4（`/dev/sda1`）・tmpfs 対照は `/tmp` |
 | 反復 | warmup 5・50 反復（`feature_bench.rs` の既定に合わせる）・p50/p95 µs |
 
@@ -88,6 +89,56 @@ spec の受け入れ基準（閾値）は本ドキュメントでは扱わない
   分母を `min(k, 可視件数)` とする（`tie_boundary` からの充当を残り枠で頭打ち
   にし、`strict_above` の欠落を `tie_boundary` の過剰一致で埋め合わせない。
   codex-review 指摘対応）。厳密一致版は `recall_at_10_strict` として併記する。
+- **hybrid の疎スコアリング方式・融合条件が揃っていない**（Issue #661。`hybrid_rrf`・
+  `bulk_hybrid_k200` に共通）: RRF 定数（`1 / (60 + rank)`）自体は self・pgvector・
+  sqlite-vec の 3 構成で一致し、LanceDB も既定 reranker
+  `lancedb.rerankers.RRFReranker`（インストール済み 0.38.0 で
+  `inspect.signature(RRFReranker.__init__)` を確認すると `K: int = 60`）を
+  明示指定せず使っているため定数自体は揃っている。揃っていないのは以下:
+  - 疎スコアの方式そのもの: self は自作 BM25 転置索引（`sparse.rs`。小文字化＋CJK
+    ユニグラム／バイグラム＋ストップワード除去）、sqlite-vec は FTS5
+    `bm25(docs_fts)`（既定トークナイザ）、pgvector は BM25 ではなく
+    `ts_rank(body_tsv, plainto_tsquery('english', …))`（TF-IDF 系・`english`
+    stemming 辞書）、LanceDB はネイティブ hybrid の内部実装に依存。
+  - 候補プール深さ: self は `k_eff.max(DEFAULT_HYBRID_POOL_DEPTH)`
+    （`sql/exec.rs` の `DEFAULT_HYBRID_POOL_DEPTH = 200`）で `hybrid_rrf`・
+    `bulk_hybrid_k200` とも 200。pgvector・sqlite-vec は `hybrid_rrf` が
+    密／疎とも LIMIT 50（`pgvector_db.py`・`sqlite_vec_db.py`）で
+    `bulk_hybrid_k200` のみ 200 に揃えている（コメントで意図的な使い分けと明記）。
+    LanceDB の候補プール深さはライブラリ内部で非露出。
+  - self 固有の同点タイブレーク規約（`TieRank::GroupEnd`・境界同点グループ完全化。
+    Issue #310）は他 DB に対応物が無い。
+  - 上記いずれも「どちらが正しいスコアリングか」を判定する目的の計測ではなく、
+    各 DB の素の hybrid 実装を比較しているため、`hybrid_rrf`／`bulk_hybrid_k200`
+    の速度・品質差には方式差そのものの寄与が混入している。
+- **距離指標が揃っていない**（Issue #661）: sqlite-vec（vec0）は内積に対応せず
+  cosine 近似で計測している（「計測環境」表に既記載）。したがって sqlite-vec の
+  KNN 系レイテンシ・`recall_at_10`／`recall_at_10_strict` は他 DB（すべて内積／
+  `dot`）と同一の距離指標での比較ではない。
+- **可視性モデルの実コストが非対称**（上記「可視性モデル」箇条書きの帰結。
+  Issue #661）: self は wire セッションのポリシー（RLS 相当）で
+  `visible()` UDF・TABLE-12 検査を全読み取り経路で実際に払うのに対し、他 DB は
+  `visibility` 列＋btree 索引への `WHERE visibility = 'public'` 述語（
+  `common.py::public_only_where` 相当）を模倣しているだけで、ポリシー強制の
+  実コストは払っていない。
+- **pgvector の HNSW 索引が使われていない可能性**（Issue #661）: `explain`
+  フェーズ（`WHERE visibility='public' ORDER BY <#> LIMIT 10` と同形のクエリ）の
+  `sample_output` は `pgvector_exact.json`・`pgvector_hnsw.json`（いずれも
+  `docs/design/bench-data/crossdb-20260908/results/`）で完全同一の実行計画
+  （`Bitmap Index Scan on docs_visibility_idx` → `Bitmap Heap Scan`
+  → `Sort` → `Limit`。推定 `rows=125`）であり、HNSW 構成でも索引スキャンが
+  選ばれていないことを直接確認できる（このクエリ形についてのみの直接証拠。
+  `vector_knn_where`／`bulk_knn_where_k200` は同型の推定にとどまる）。整合する
+  観測として、両構成の p50 がほぼ同値（2026-09-08 実測: `vector_knn`
+  3854/3804 µs・`vector_knn_where` 2072/2135 µs・`bulk_knn_where_k200`
+  2500/2477 µs）・`recall_at_10_strict` が 0.9865 で完全一致している。
+  `pgvector_db.py` に `ANALYZE`／`VACUUM` の呼び出しが無く（`COPY` 直後の
+  統計未更新）、`visibility='public'`（実際は 23,000/25,000 行）の推定行数が
+  既定選択率由来の 125 行になっていることが一因の仮説（上流 pgvector の
+  「フィルタ付きでは planner 判断で索引が使われないことがある」という趣旨の
+  記述と同型の事象。手法名・事実のみの帰属で本文は転記しない）。下記「所見」
+  節「ANN の効果」の pgvector 行はこの読み替えが必要（規模による効果の無さ
+  ではなく索引不使用の可能性）。
 
 ## 横断ベンチ実測（25,000 行・dim 128・k=10）
 
@@ -144,7 +195,10 @@ sqlite-vec の `ingest_bulk`／`ingest_single_stmt` はファイルベース化�
 - **投入**: 一括投入は LanceDB（125k〜151k rows/s）＞ sqlite-vec ＞ pgvector ＞ MySQL ＞ Qdrant。
 - **ANN の効果**: 25,000 行では pgvector HNSW と exact の差はほぼ無く（3.6 ms 前後）、
   LanceDB HNSW は 9.3→2.4 ms と速くなる代わりに Recall@10 0.836 へ低下した。Qdrant HNSW
-  （構築完了確認後）は 729→559 µs で Recall@10 1.0 を維持した。
+  （構築完了確認後）は 729→559 µs で Recall@10 1.0 を維持した。**pgvector の
+  「差はほぼ無い」は規模（25,000 行）による効果の乏しさではなく、HNSW 索引が
+  そもそも使われていない可能性が高いと判明した**（上記「公平性の注記」
+  「pgvector の HNSW 索引が使われていない可能性」参照。Issue #661）。
 
 ## 広域取得（LLM へ丸ごと渡す用途）の実測
 
@@ -944,3 +998,14 @@ per-run 生データ・結果表・実行ログは
   その対策（列単位の平均値長ゲート・Issue #632）の crossdb 前後比較実測は
   [`scalar-index-generation-cache.md`「前後比較実測（Issue #633）」節](scalar-index-generation-cache.md)
   参照。
+- Issue #661 で記録した比較条件の非対称のうち、以下はハーネス側の変更を伴うため
+  本 doc・本 Issue のスコープ外としてオーナー承認後に別 Issue へ切り出す:
+  - `pgvector_db.py` への `ANALYZE`（`COPY` 完了・索引構築後）追加と、
+    `explain` に限られていた `EXPLAIN` 記録の `vector_knn_where`／
+    `bulk_knn_where_k200` 相当への拡張（HNSW 索引使用の直接確認のため）。
+  - LanceDB hybrid への `.rerank(RRFReranker(K=60))` 明示指定、および
+    pgvector・sqlite-vec の `hybrid_rrf` 候補プール（LIMIT 50）を
+    `bulk_hybrid_k200` と同じ 200 へ統一するかどうかの是非。
+  - `hnsw-index.md`「Issue #413」節の `point_where` 記述（`lang×topic` 複合条件と
+    注記）と `feature_bench.rs` の実クエリ（`lang` 単独条件）の食い違いに
+    見える所見の確認。
