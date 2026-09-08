@@ -1022,6 +1022,92 @@ impl VectorArena {
         })
     }
 
+    /// [`Self::build_from_cached_rls_rows_subset`] の**複製しない**版（Issue #654）。
+    ///
+    /// 新規 `VectorArena` を構築せず、`source_arena`（キャッシュ済みスナップショットの
+    /// `VectorArena`。呼び出し元が借用したまま保持し続ける）に対して
+    /// [`Self::build_from_cached_rls_rows_subset`] と全く同じ検証・`on_visible_row`
+    /// 適用を行ったうえで、通過した行の**元スロット番号**（`source_arena`／
+    /// `metadata` に対する添字）だけを狭義昇順の `Vec<u32>` として返す。
+    ///
+    /// `on_visible_row` の第 1 引数（出力側の連番）は
+    /// [`Self::build_from_cached_rls_rows_subset`] と同一の意味・同一の値になる
+    /// （両関数とも [`push_visible_row`] が管理する同じカウンタから払い出すため。
+    /// `sql::exec` の `candidate_columns`（出力側連番で添字づけられる）契約は
+    /// そのまま満たされる）。索引は候補行を「絞る」ことしかできず「通す」ことは
+    /// できないため、`on_visible_row` を省略せず候補ごとに引き続き呼ぶ。
+    ///
+    /// 返す `Vec<u32>` は「`source_arena`／`metadata` の添字のうち、`on_visible_row`
+    /// を通過したものだけを昇順に残した部分列」であり、`source_slots` が全スロット
+    /// （`0..metadata.len()`）の場合は「可視かつ `on_visible_row` を通過した行の
+    /// スロット番号を昇順に列挙したもの」になる。呼び出し元（`sql::exec`）はこの
+    /// 戻り値を [`crate::kernel::SubsetSearchInput::slots`] へそのまま渡し、
+    /// `source_arena.vectors()`／`source_arena.ids()`／`source_arena.tenant_id()` を
+    /// 直接借用したまま探索する（新規アリーナへの embedding・id・tenant_id
+    /// （`String` 複製）が発生しない）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn filter_cached_rls_rows_subset<G>(
+        expected_dim: u32,
+        source_arena: &VectorArena,
+        metadata: &[Vec<u8>],
+        source_slots: &[u32],
+        mut on_visible_row: G,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<u32>>
+    where
+        G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
+        if source_arena.len() != metadata.len() {
+            return Err(ArenaError::InvalidInput(
+                "cached RLS snapshot row/metadata count mismatch".to_string(),
+            ));
+        }
+        let out_of_bounds =
+            || ArenaError::InvalidInput("cached RLS snapshot row index out of bounds".to_string());
+        let mut kept: Vec<u32> = Vec::new();
+        let mut visible_row_count: usize = 0;
+        let mut prev_slot: Option<u32> = None;
+        for &slot in source_slots {
+            if let Some(prev) = prev_slot {
+                if slot <= prev {
+                    return Err(ArenaError::InvalidInput(
+                        "scalar index candidate slots must be strictly ascending and unique"
+                            .to_string(),
+                    ));
+                }
+            }
+            prev_slot = Some(slot);
+            let i = usize::try_from(slot).map_err(|_| out_of_bounds())?;
+            let meta = metadata.get(i).ok_or_else(out_of_bounds)?;
+            let id = *source_arena.ids().get(i).ok_or_else(out_of_bounds)?;
+            let embedding = source_arena.vector(i).ok_or_else(out_of_bounds)?;
+            if !on_visible_row(visible_row_count, id, embedding, meta)? {
+                continue;
+            }
+            // `push_visible_row` が行う容量検証（アロケーション前の上限チェック）を、
+            // 実際のバッファ確保は伴わない本関数でも同じ契約で踏襲する
+            // （新規アリーナを作らないため `GrowableArenaBuffers::ensure_capacity` は
+            // 呼ばないが、「可視行数が `max_rows`／`max_bytes` を超えたら拒否する」
+            // という security.md「不安全な設計｜無制限リソース確保（DoS）」対応の
+            // 契約自体は維持する。`kept: Vec<u32>` 自体の確保量も間接的にこれで
+            // 有界になる）。
+            visible_row_count = visible_row_count
+                .checked_add(1)
+                .ok_or(ArenaError::CapacityExceeded)?;
+            check_capacity(visible_row_count, expected_dim, max_rows, max_bytes)?;
+            if kept.len() == kept.capacity() {
+                kept.try_reserve(1).map_err(|e| {
+                    ArenaError::AllocationFailed(format!(
+                        "failed to reserve mask-filtered candidate slots: {e}"
+                    ))
+                })?;
+            }
+            kept.push(slot);
+        }
+        Ok(kept)
+    }
+
     /// [`Self::build_filtered_with_limits`] の行フック付き版。呼び出し元が管理する
     /// `read_txn` 上で実行する実装本体（[`Self::build_filtered_with_rows_and_limits`]・
     /// `sql::exec::execute_statement_in_txn`（TASK-75・Issue #56 レビュー指摘対応）が
@@ -1467,6 +1553,116 @@ mod tests {
             usize::MAX,
         )
         .expect_err("non-ascending slots must be rejected");
+        assert!(matches!(err, ArenaError::InvalidInput(_)));
+    }
+
+    // Issue #654: `filter_cached_rls_rows_subset` が返す「保持スロット」を
+    // `source_arena` から手で拾い直した embedding/id/tenant_id が、複製版
+    // `build_from_cached_rls_rows_subset` の出力アリーナとビット同一になること
+    // （「行を複製しても複製しなくても結果は同じ」という要件 2 の直接検証）。
+    #[test]
+    fn filter_cached_rls_rows_subset_kept_slots_match_build_from_cached_rls_rows_subset() {
+        let mut capture = SqlArenaCaptureBuilder::new(2, 100, usize::MAX, usize::MAX);
+        capture.push(1, "tenant-a", Visibility::Public, &[1.0, 0.0], b"a", 0);
+        capture.push(2, "tenant-a", Visibility::Public, &[0.0, 1.0], b"b", 0);
+        capture.push(3, "tenant-a", Visibility::Public, &[1.0, 1.0], b"c", 0);
+        capture.push(4, "tenant-a", Visibility::Public, &[2.0, 2.0], b"d", 0);
+        let (source_arena, metadata) = capture.finish("docs").expect("within budget");
+
+        // 候補はスロット 0・1・3（id=1, id=2, id=4）。
+        let candidate_slots: Vec<u32> = vec![0, 1, 3];
+        let built = VectorArena::build_from_cached_rls_rows_subset(
+            "docs",
+            2,
+            &source_arena,
+            &metadata,
+            &candidate_slots,
+            |_, _, _, _| Ok(true),
+            100,
+            usize::MAX,
+        )
+        .expect("subset build");
+        let kept = VectorArena::filter_cached_rls_rows_subset(
+            2,
+            &source_arena,
+            &metadata,
+            &candidate_slots,
+            |_, _, _, _| Ok(true),
+            100,
+            usize::MAX,
+        )
+        .expect("filter subset");
+
+        assert_eq!(kept, candidate_slots);
+        assert_eq!(built.len(), kept.len());
+        for (i, &slot) in kept.iter().enumerate() {
+            assert_eq!(
+                built.vector(i),
+                source_arena.vector(slot as usize),
+                "vector at output slot {i} (source slot {slot})"
+            );
+            assert_eq!(built.ids().get(i), source_arena.ids().get(slot as usize));
+            assert_eq!(built.tenant_id(i), source_arena.tenant_id(slot as usize));
+        }
+    }
+
+    // `on_visible_row` が一部の候補を `false` で落とす場合、`filter_cached_rls_rows_subset`
+    // が返す `Vec<u32>` は「通過した候補だけの部分列」になり、`on_visible_row` へ渡る
+    // 第 1 引数（出力側連番）は複製版と同一の値になること（`push_visible_row` と
+    // 同じカウンタ規約を独立実装せず踏襲していることの検証）。
+    #[test]
+    fn filter_cached_rls_rows_subset_second_arg_is_output_side_ordinal_and_skips_rejected_rows() {
+        let mut capture = SqlArenaCaptureBuilder::new(2, 100, usize::MAX, usize::MAX);
+        capture.push(10, "tenant-a", Visibility::Public, &[1.0, 0.0], b"a", 0);
+        capture.push(20, "tenant-a", Visibility::Public, &[0.0, 1.0], b"b", 0);
+        capture.push(30, "tenant-a", Visibility::Public, &[1.0, 1.0], b"c", 0);
+        let (source_arena, metadata) = capture.finish("docs").expect("within budget");
+
+        let candidate_slots: Vec<u32> = vec![0, 1, 2];
+        let mut observed_ordinals = Vec::new();
+        let kept = VectorArena::filter_cached_rls_rows_subset(
+            2,
+            &source_arena,
+            &metadata,
+            &candidate_slots,
+            |ordinal, id, _emb, _meta| {
+                observed_ordinals.push(ordinal);
+                // id=20（スロット 1）だけを落とす。
+                Ok(id != 20)
+            },
+            100,
+            usize::MAX,
+        )
+        .expect("filter subset");
+
+        // `on_visible_row` は各候補につき必ず 1 回呼ばれる（拒否された行も含む）。
+        // 引数の値は「呼び出し時点での可視カウンタ」であり、通過した行（id=10,
+        // id=30）だけがカウンタを進める: id=10 → 0（→1 へ進む）、id=20（拒否）→
+        // 1（進まない）、id=30 → 1（→2 へ進む）。
+        assert_eq!(observed_ordinals, vec![0, 1, 1]);
+        assert_eq!(kept, vec![0, 2]);
+    }
+
+    // 非昇順・重複スロットは `filter_cached_rls_rows_subset` でも `InvalidInput` で
+    // 拒否する（複製版と同じ呼び出し規約）。
+    #[test]
+    fn filter_cached_rls_rows_subset_rejects_non_ascending_slots() {
+        let mut capture = SqlArenaCaptureBuilder::new(2, 100, usize::MAX, usize::MAX);
+        capture.push(1, "tenant-a", Visibility::Public, &[1.0, 0.0], b"a", 0);
+        capture.push(2, "tenant-a", Visibility::Public, &[0.0, 1.0], b"b", 0);
+        let (source_arena, metadata) = capture.finish("docs").expect("within budget");
+
+        let bad_slots: Vec<u32> = vec![0, 0];
+        let err = VectorArena::filter_cached_rls_rows_subset(
+            2,
+            &source_arena,
+            &metadata,
+            &bad_slots,
+            |_, _, _, _| Ok(true),
+            100,
+            usize::MAX,
+        )
+        .expect_err("duplicate slots must be rejected");
         assert!(matches!(err, ArenaError::InvalidInput(_)));
     }
 

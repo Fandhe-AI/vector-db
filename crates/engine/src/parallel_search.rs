@@ -32,7 +32,9 @@
 //! という別名の定数で同値を持つ）。本モジュール自身の並列検索の挙動・
 //! エラー契約は変わらない。
 
-use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider, TopKSelector};
+use crate::kernel::{
+    CandidateHit, KernelError, SearchInput, SearchProvider, SubsetSearchInput, TopKSelector,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// クエリ 1 件あたりのスレッド数上限（CORE-3 の並列度の趣旨に対応）。
@@ -110,36 +112,7 @@ impl SearchProvider for ParallelSearchProvider {
         }
 
         let row_count = input.ids.len();
-        let desired_threads = thread_count_for(row_count);
-
-        // `desired_threads <= 1` の場合は追加ワーカーを 1 つも生成しないため、
-        // グローバル予算（`GLOBAL_WORKER_BUDGET`）を消費せず単一スレッド経路をそのまま使う。
-        // `desired_threads > 1` の場合のみ、これから生成する追加ワーカー数分の予算確保を
-        // 試みる。確保できた数（`effective_threads`）が同時実行クエリの多さにより
-        // `desired_threads` を下回ることがあるが、その場合はパーティション数を単に
-        // 減らすだけで、行を選出対象から除外することは一切ない（DoS 対策の縮退は
-        // 「並列度を落とす」形でのみ行い、fail-open にはしない）。
-        let _budget_guard;
-        let effective_threads = if desired_threads <= 1 {
-            _budget_guard = None;
-            1usize
-        } else {
-            let guard = WorkerBudgetGuard::acquire(desired_threads);
-            let granted = guard.granted();
-            if granted <= 1 {
-                // 確保できた枠が 1 以下だと下の `effective_threads <= 1` 分岐へ落ち、
-                // 実際には並列ワーカーを 1 つも起動しない。その場合にガードだけを
-                // 生存させ続けるとグローバル予算のスロットを検索終了まで無駄に
-                // 占有し、他の同時実行クエリを不必要に飢餓状態にする
-                // （Cursor Bugbot 指摘対応）。ここで即座に解放する。
-                drop(guard);
-                _budget_guard = None;
-                1usize
-            } else {
-                _budget_guard = Some(guard);
-                granted
-            }
-        };
+        let (effective_threads, _budget_guard) = acquire_execution_threads(row_count);
 
         let partials: Vec<TopKSelector> =
             if effective_threads <= 1 {
@@ -199,6 +172,161 @@ impl SearchProvider for ParallelSearchProvider {
         }
         Ok(merged.into_sorted_vec())
     }
+
+    /// 行列全体（`input.vectors`）を複製せず借用したまま、`input.slots` が指す行
+    /// だけを候補にして並列 Top-k を選出する（Issue #654）。並列度の決定・
+    /// ワーカー予算調停・部分結果マージは [`SearchProvider::search`] と共通の
+    /// 骨格（[`acquire_execution_threads`]）を共有し、範囲分割の代わりに
+    /// `slots` をワーカー数分に均等分割して割り当てる（各ワーカーは自分の担当
+    /// 範囲の `slots` サブスライスに対して [`search_range_by_slots`] を呼ぶ）。
+    fn search_subset(
+        &self,
+        input: SubsetSearchInput<'_>,
+    ) -> Result<Vec<CandidateHit>, KernelError> {
+        let dim = input.dim as usize;
+        if input.query.len() != dim {
+            return Err(KernelError::DimMismatch {
+                expected: input.dim,
+                found: input.query.len(),
+            });
+        }
+        if input.query.iter().any(|v| !v.is_finite()) {
+            return Err(KernelError::NonFiniteQuery);
+        }
+        if input.k == 0 || input.slots.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let slot_count = input.slots.len();
+        let (effective_threads, _budget_guard) = acquire_execution_threads(slot_count);
+
+        let partials: Vec<TopKSelector> =
+            if effective_threads <= 1 {
+                vec![search_range_by_slots(
+                    input.slots,
+                    input.vectors,
+                    dim,
+                    input.query,
+                    input.k,
+                )]
+            } else {
+                // `search` の並列経路（行範囲の均等分割）と同型だが、分割対象が
+                // 「絶対行インデックス範囲」ではなく「`slots` 配列そのもの」である
+                // 点のみが異なる（`vectors` はどのワーカーへも切り出さず丸ごと渡す）。
+                let slots_per_thread = slot_count.div_ceil(effective_threads);
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(effective_threads);
+                    let mut start = 0usize;
+                    while start < slot_count {
+                        let end = start.saturating_add(slots_per_thread).min(slot_count);
+                        let slots_slice = input.slots.get(start..end).unwrap_or(&[]);
+                        let vectors = input.vectors;
+                        let query = input.query;
+                        let k = input.k;
+                        handles.push(scope.spawn(move || {
+                            search_range_by_slots(slots_slice, vectors, dim, query, k)
+                        }));
+                        start = end;
+                    }
+                    join_all_or_panicked(handles)
+                })?
+            };
+
+        let mut merged = TopKSelector::new(input.k);
+        for partial in partials {
+            for hit in partial.into_sorted_vec() {
+                merged.push(hit);
+            }
+        }
+        Ok(merged.into_sorted_vec())
+    }
+}
+
+/// [`ParallelSearchProvider::search`]・[`ParallelSearchProvider::search_subset`]
+/// が共有する並列度決定・ワーカー予算確保の骨格。`row_count`（`search` は行数、
+/// `search_subset` は候補スロット数）に対して実際に使う並列度
+/// （`effective_threads`）と、そのスレッド数ぶんのグローバル予算
+/// （[`GLOBAL_WORKER_BUDGET`]）を確保した `WorkerBudgetGuard`（並列化しない場合は
+/// `None`）を返す。ガードは戻り値の生存期間中（呼び出し元の検索が終わるまで）
+/// 予算を保持し続け、`Drop` で自動的に解放される。
+fn acquire_execution_threads(row_count: usize) -> (usize, Option<WorkerBudgetGuard>) {
+    let desired_threads = thread_count_for(row_count);
+    // `desired_threads <= 1` の場合は追加ワーカーを 1 つも生成しないため、
+    // グローバル予算を消費せず単一スレッド経路をそのまま使う。`desired_threads > 1`
+    // の場合のみ、これから生成する追加ワーカー数分の予算確保を試みる。確保できた
+    // 数（`effective_threads`）が同時実行クエリの多さにより `desired_threads` を
+    // 下回ることがあるが、その場合はパーティション数を単に減らすだけで、行を
+    // 選出対象から除外することは一切ない（DoS 対策の縮退は「並列度を落とす」形
+    // でのみ行い、fail-open にはしない）。
+    if desired_threads <= 1 {
+        return (1usize, None);
+    }
+    let guard = WorkerBudgetGuard::acquire(desired_threads);
+    let granted = guard.granted();
+    if granted <= 1 {
+        // 確保できた枠が 1 以下だと実際には並列ワーカーを 1 つも起動しない。
+        // その場合にガードだけを生存させ続けるとグローバル予算のスロットを
+        // 検索終了まで無駄に占有し、他の同時実行クエリを不必要に飢餓状態に
+        // する（Cursor Bugbot 指摘対応）。ここで即座に解放する。
+        drop(guard);
+        (1usize, None)
+    } else {
+        (granted, Some(guard))
+    }
+}
+
+/// `slots`（`vectors` への行インデックス。担当範囲だけに絞り込み済み。狭義昇順・
+/// 重複なしは呼び出し元契約）に対して総当たり Top-k を選出する
+/// （[`ParallelSearchProvider::search_subset`] の単一スレッド経路・並列ワーカーの
+/// 両方から呼ばれる共通処理。[`search_range`] の「担当範囲」が絶対行インデックス
+/// レンジではなく `slots` 配列である版）。返る [`CandidateHit::id`] は
+/// `slot as u64`（[`SubsetSearchInput`] のドキュメント参照）。
+fn search_range_by_slots(
+    slots: &[u32],
+    vectors: &[f32],
+    dim: usize,
+    query: &[f32],
+    k: usize,
+) -> TopKSelector {
+    let mut selector = TopKSelector::new(k);
+
+    // Issue #510 の 4 行ブロックカーネル化と同じ理由で、4 スロット単位で
+    // `dot_block4` へディスパッチする（端数・ブロック内の行欠損は 1 行ずつの
+    // [`push_row`] へフォールバック）。
+    let (blocks, remainder) = slots.as_chunks::<4>();
+    for block in blocks {
+        let row_slice = |slot: u32| -> Option<&[f32]> {
+            let start = (slot as usize).saturating_mul(dim);
+            let end = start.saturating_add(dim);
+            vectors.get(start..end)
+        };
+        let [s0, s1, s2, s3] = *block;
+        let (r0, r1, r2, r3) = (row_slice(s0), row_slice(s1), row_slice(s2), row_slice(s3));
+
+        match (r0, r1, r2, r3) {
+            (Some(v0), Some(v1), Some(v2), Some(v3)) => {
+                let scores = crate::kernel::dot_block4([v0, v1, v2, v3], query);
+                let ids4 = [s0 as u64, s1 as u64, s2 as u64, s3 as u64];
+                for (id, score) in ids4.into_iter().zip(scores) {
+                    push_score(&mut selector, id, score);
+                }
+            }
+            _ => {
+                push_row(&mut selector, s0 as u64, r0, query);
+                push_row(&mut selector, s1 as u64, r1, query);
+                push_row(&mut selector, s2 as u64, r2, query);
+                push_row(&mut selector, s3 as u64, r3, query);
+            }
+        }
+    }
+
+    for &slot in remainder {
+        let start = (slot as usize).saturating_mul(dim);
+        let end = start.saturating_add(dim);
+        push_row(&mut selector, slot as u64, vectors.get(start..end), query);
+    }
+
+    selector
 }
 
 /// `std::thread::scope` 配下で spawn した全ハンドルを必ず `join()` してから結果をまとめる。
@@ -721,5 +849,183 @@ mod tests {
         // `Err` 変種であることの確認だけで本テストの目的（fail-closed マッピングと
         // 再 panic なし）には十分。
         assert!(matches!(result, Err(KernelError::WorkerPanicked)));
+    }
+
+    // Issue #654: `search_subset` の単一スレッド経路が、`slots` の行を gather して
+    // `CpuScalarProvider::search` を呼んだ場合とビット同一の結果になること。
+    #[test]
+    fn search_subset_single_thread_matches_gathered_scalar_reference() {
+        use crate::kernel::CpuScalarProvider;
+
+        let dim = 6usize;
+        let rows = 20usize; // MIN_ROWS_PER_THREAD 未満・単一スレッド経路を強制。
+        let mut vectors = Vec::with_capacity(rows * dim);
+        for i in 0..rows {
+            for d in 0..dim {
+                vectors.push(((i * dim + d) % 17) as f32 * 0.1 - 0.7);
+            }
+        }
+        let query: Vec<f32> = (0..dim).map(|d| (d as f32) * 0.13 - 0.4).collect();
+        let slots: Vec<u32> = vec![1, 3, 4, 7, 9, 12, 15, 19];
+
+        let subset_hits = ParallelSearchProvider
+            .search_subset(SubsetSearchInput {
+                slots: &slots,
+                vectors: &vectors,
+                dim: dim as u32,
+                query: &query,
+                k: 4,
+            })
+            .expect("search_subset ok");
+
+        let mut gathered = Vec::new();
+        let mut ids = Vec::new();
+        for &slot in &slots {
+            let start = slot as usize * dim;
+            gathered.extend_from_slice(&vectors[start..start + dim]);
+            ids.push(slot as u64);
+        }
+        let reference_hits = CpuScalarProvider
+            .search(SearchInput {
+                ids: &ids,
+                vectors: &gathered,
+                dim: dim as u32,
+                query: &query,
+                k: 4,
+            })
+            .expect("scalar ok");
+
+        assert_eq!(subset_hits, reference_hits);
+    }
+
+    // Issue #654: `search_subset` の並列経路（候補数が `MIN_ROWS_PER_THREAD` を
+    // 超える規模）が、gather 済み `CpuScalarProvider::search` とビット同一の結果に
+    // なること。同点誘発（同一ベクトルを多数含む）フィクスチャでタイブレークの
+    // 一致も検証する。偶数スロットのみへ絞り込んだ後の候補数（`rows` の約半分）
+    // が `thread_count_for` で複数スレッドへ分割される規模（`MIN_ROWS_PER_THREAD` の
+    // 2 倍以上）を確実に超えるよう、絞り込み前の `rows` を候補数ベースで決める
+    // （codex-review 指摘対応・PR #664: 絞り込み後 1539 件では
+    // `thread_count_for(1539) == 1` となり並列経路の分割・部分結果マージが
+    // 未検証だった）。
+    #[test]
+    fn search_subset_parallel_path_matches_gathered_scalar_reference_with_ties() {
+        use crate::kernel::CpuScalarProvider;
+
+        let dim = 8usize;
+        // 偶数スロットへの絞り込みで候補数がおよそ半分になるため、候補数が
+        // `MIN_ROWS_PER_THREAD * 2` を上回るよう `rows` を余裕を持って確保する。
+        let rows = MIN_ROWS_PER_THREAD * 6 + 5;
+        let mut vectors = Vec::with_capacity(rows * dim);
+        for i in 0..rows {
+            for d in 0..dim {
+                // 同点を誘発するため、行を 16 件ごとに繰り返すパターンにする。
+                let phase = (i % 16) * dim + d;
+                vectors.push(((phase % 11) as f32) * 0.1 - 0.5);
+            }
+        }
+        let query: Vec<f32> = (0..dim).map(|d| ((d % 5) as f32) * 0.2 - 0.4).collect();
+        // 候補スロットは全行の約半分（偶数番のみ）を昇順・重複なしで選ぶ。
+        let slots: Vec<u32> = (0..rows as u32).filter(|s| s % 2 == 0).collect();
+
+        // 実行環境が複数コアを持つ場合に限り、この規模で実際に並列経路（複数
+        // ワーカーへのスロット分割＋部分結果マージ）へ入ることを非 vacuous に
+        // 確認する（codex-review 指摘対応・PR #664）。`available_parallelism` が
+        // 1（コンテナ制約等）を返す環境では `thread_count_for` が単一スレッドへ
+        // 縮退するのは仕様どおりであり、CI 環境のコア数に依存してテスト自体が
+        // 不安定化しないよう条件付きにする。
+        if std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            >= 2
+        {
+            assert!(
+                thread_count_for(slots.len()) >= 2,
+                "この規模（候補数 {}）では並列経路を通るはず",
+                slots.len()
+            );
+        }
+
+        let subset_hits = ParallelSearchProvider
+            .search_subset(SubsetSearchInput {
+                slots: &slots,
+                vectors: &vectors,
+                dim: dim as u32,
+                query: &query,
+                k: 15,
+            })
+            .expect("search_subset ok");
+
+        let mut gathered = Vec::new();
+        let mut ids = Vec::new();
+        for &slot in &slots {
+            let start = slot as usize * dim;
+            gathered.extend_from_slice(&vectors[start..start + dim]);
+            ids.push(slot as u64);
+        }
+        let reference_hits = CpuScalarProvider
+            .search(SearchInput {
+                ids: &ids,
+                vectors: &gathered,
+                dim: dim as u32,
+                query: &query,
+                k: 15,
+            })
+            .expect("scalar ok");
+
+        assert_eq!(subset_hits, reference_hits);
+        assert_eq!(subset_hits.len(), 15);
+    }
+
+    #[test]
+    fn search_subset_object_safe_and_k_zero_or_empty_returns_empty() {
+        let boxed: Box<dyn SearchProvider> = Box::new(ParallelSearchProvider);
+        let vectors = [1.0f32, 0.0];
+        let query = [1.0f32, 0.0];
+        let empty: [u32; 0] = [];
+        assert!(boxed
+            .search_subset(SubsetSearchInput {
+                slots: &[0],
+                vectors: &vectors,
+                dim: 2,
+                query: &query,
+                k: 0,
+            })
+            .expect("k=0 ok")
+            .is_empty());
+        assert!(boxed
+            .search_subset(SubsetSearchInput {
+                slots: &empty,
+                vectors: &vectors,
+                dim: 2,
+                query: &query,
+                k: 1,
+            })
+            .expect("empty slots ok")
+            .is_empty());
+    }
+
+    #[test]
+    fn search_range_by_slots_with_non_multiple_of_4_and_missing_row_skips_only_that_row() {
+        // Issue #654: `search_range_by_slots` の 4 スロットブロック化 + フォールバック
+        // が `search_range`（絶対行版）と同じ「欠損 1 行だけ除外」規約を守ること。
+        let dim = 2usize;
+        let vectors = [
+            1.0f32, 0.0, // slot 0
+            2.0, 0.0, // slot 1
+            3.0, 0.0, // slot 2
+        ]; // slot 3 は範囲外（vectors.len()==6 は 4*dim==8 に対して不足）。
+        let query = [1.0f32, 0.0];
+        let slots = [0u32, 1, 2, 3];
+
+        let selector = search_range_by_slots(&slots, &vectors, dim, &query, 10);
+        let hits = selector.into_sorted_vec();
+        assert_eq!(
+            hits,
+            vec![
+                CandidateHit { id: 2, score: 3.0 },
+                CandidateHit { id: 1, score: 2.0 },
+                CandidateHit { id: 0, score: 1.0 },
+            ]
+        );
     }
 }

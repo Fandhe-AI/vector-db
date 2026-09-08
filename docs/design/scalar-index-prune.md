@@ -164,3 +164,12 @@ build_from_cached_rls_rows_subset_with_all_slots_matches_full_scan`）。非昇�
 
 現行索引経路（本 doc）を選択率 33%（crossdb fixture 相当）で段別に内訳計測した
 結果は `docs/design/filtered-distance-stage-profile.md`（Issue #653）を参照。
+
+## 後続 Issue #654
+
+候補削減が実際に消費された `VectorArena` の構築（`build_from_cached_rls_rows_subset`）
+は候補行を新規アリーナへ複製していたため、Issue #654 で候補スロットを直接
+マスクとして探索する経路（`arena.rs::filter_cached_rls_rows_subset`・
+`kernel.rs::SearchProvider::search_subset`）を追加し、hybrid・HNSW `Subset`
+形状を除く DISTANCE 経路で複製を回避した。詳細は
+`docs/design/scalar-index-mask-search.md` 参照。
