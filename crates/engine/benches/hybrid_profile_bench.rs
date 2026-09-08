@@ -1450,6 +1450,40 @@ fn main() {
         })
         .collect();
 
+    // S1d/S3d 用（Issue #660 レビュー指摘対応）: `common_fixed(B3-S0)` は
+    // dense SQL（B3 と同一文）の round trip から dense-topk 対照区間を引いた
+    // 値であり、そこから引く parse・bind も dense 側で揃える必要がある。
+    // 双子 DB 方式・round-robin 規則は S1/S3（hybrid）と同一で、文だけを
+    // `sql_dense_statement_with_projection`（B3 と同じ構築関数・投影）に
+    // 差し替える。S2（`get_table_schema`）は SQL 文の形状に依存しないため
+    // dense 専用の複製は行わず、hybrid 側と同一の測定値を双方で共有する。
+    let issue660_dense_sql_texts: Vec<String> = queries
+        .iter()
+        .map(|q| {
+            sql_dense_statement_with_projection(
+                TABLE,
+                VECTOR_COLUMN,
+                &q.vector,
+                TOP_K,
+                HybridProjection::Id,
+            )
+            .unwrap_or_else(|e| fail_closed(format!("Issue #660 S1d statement build failed: {e}")))
+        })
+        .collect();
+    let issue660_dense_validated: Vec<_> = issue660_dense_sql_texts
+        .iter()
+        .map(|sql| {
+            match validate_sql(sql, &issue660_twin_storage).unwrap_or_else(|e| {
+                fail_closed(format!("Issue #660 S3d precompute validate_sql failed: {e}"))
+            }) {
+                SqlStatement::Select(validated) => validated,
+                other => fail_closed(format!(
+                    "Issue #660 S3d precompute statement is not a SELECT (unexpected variant): {other:?}"
+                )),
+            }
+        })
+        .collect();
+
     // S4/S5 用: 可視全行の事前エンコード済み metadata（`encode_scalar_columns` は
     // 一時 DB への投入時と同じ関数。redb からの読み出し自体は含まない）。
     let issue660_encoded_visible: Vec<Vec<u8>> = visible_bodies
@@ -1494,6 +1528,11 @@ fn main() {
     let mut s1_round_medians = Vec::with_capacity(rounds as usize);
     let mut s2_round_medians = Vec::with_capacity(rounds as usize);
     let mut s3_round_medians = Vec::with_capacity(rounds as usize);
+    // S1d/S3d（Issue #660 レビュー指摘対応）: dense SQL（B3 と同一文）の
+    // parse・bind。`common_fixed(B3-S0)` の減算対象を hybrid ではなく dense
+    // 側の parse・bind へ揃えるために測定する。
+    let mut s1d_round_medians = Vec::with_capacity(rounds as usize);
+    let mut s3d_round_medians = Vec::with_capacity(rounds as usize);
     let mut s4_round_medians = Vec::with_capacity(rounds as usize);
     let mut s5_round_medians = Vec::with_capacity(rounds as usize);
     let mut s6_round_medians = Vec::with_capacity(rounds as usize);
@@ -1563,6 +1602,35 @@ fn main() {
         .unwrap_or_else(|e| fail_closed(format!("S3 measurement failed: {e}")));
         s3_round_medians.push(m.summary.median);
 
+        // S1d_parse_dense: S1 と同じ双子 DB 方式・round-robin 規則で、文だけを
+        // dense SQL（B3 と同一文）へ差し替えたパース計測（Issue #660）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let sql = &issue660_dense_sql_texts[query_idx % issue660_dense_sql_texts.len()];
+            query_idx += 1;
+            validate_sql(sql, &issue660_twin_storage)
+                .unwrap_or_else(|e| fail_closed(format!("S1d validate_sql failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("S1d measurement failed: {e}")));
+        s1d_round_medians.push(m.summary.median);
+
+        // S3d_bind_dense: S3 と同じ規則で dense SQL の束縛を計測する
+        // （`ValidatedStatement` は計測区間外で構築済み。Issue #660）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let validated = &issue660_dense_validated[query_idx % issue660_dense_validated.len()];
+            query_idx += 1;
+            bind_in_session(
+                validated,
+                &schema,
+                issue660_session.search_mode(),
+                issue660_session.udfs(),
+            )
+            .unwrap_or_else(|e| fail_closed(format!("S3d bind_in_session failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("S3d measurement failed: {e}")));
+        s3d_round_medians.push(m.summary.median);
+
         // S4_scan_replica: `on_visible_row` の構造検証部の複製。
         let m = run(&config, || scan_replica(&schema, &issue660_encoded_visible))
             .unwrap_or_else(|e| fail_closed(format!("S4 measurement failed: {e}")));
@@ -1599,11 +1667,13 @@ fn main() {
 
     // --- per-round 生データ ---
     for round in 0..rounds as usize {
-        let values: [(&str, u128); 9] = [
+        let values: [(&str, u128); 11] = [
             ("S0", s0_round_medians[round].as_micros()),
             ("S1", s1_round_medians[round].as_micros()),
             ("S2", s2_round_medians[round].as_micros()),
             ("S3", s3_round_medians[round].as_micros()),
+            ("S1d", s1d_round_medians[round].as_micros()),
+            ("S3d", s3d_round_medians[round].as_micros()),
             ("S4", s4_round_medians[round].as_micros()),
             ("S5", s5_round_medians[round].as_micros()),
             ("S6", s6_round_medians[round].as_micros()),
@@ -1629,6 +1699,14 @@ fn main() {
         .unwrap_or_else(|e| fail_closed(format!("min_of(S3) failed: {e}")));
     let issue660_med_s3 = median_of(&s3_round_medians)
         .unwrap_or_else(|e| fail_closed(format!("median_of(S3) failed: {e}")));
+    let issue660_min_s1d = min_of(&s1d_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(S1d) failed: {e}")));
+    let issue660_med_s1d = median_of(&s1d_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(S1d) failed: {e}")));
+    let issue660_min_s3d = min_of(&s3d_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(S3d) failed: {e}")));
+    let issue660_med_s3d = median_of(&s3d_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(S3d) failed: {e}")));
     let issue660_min_s4 = min_of(&s4_round_medians)
         .unwrap_or_else(|e| fail_closed(format!("min_of(S4) failed: {e}")));
     let issue660_med_s4 = median_of(&s4_round_medians)
@@ -1655,6 +1733,8 @@ fn main() {
         ("S1_parse", issue660_min_s1, issue660_med_s1),
         ("S2_schema", issue660_min_s2, issue660_med_s2),
         ("S3_bind", issue660_min_s3, issue660_med_s3),
+        ("S1d_parse_dense", issue660_min_s1d, issue660_med_s1d),
+        ("S3d_bind_dense", issue660_min_s3d, issue660_med_s3d),
         ("S4_scan_replica", issue660_min_s4, issue660_med_s4),
         ("S5_rowcopy_replica", issue660_min_s5, issue660_med_s5),
         ("S6_slotmap_replica", issue660_min_s6, issue660_med_s6),
@@ -1668,15 +1748,27 @@ fn main() {
     }
 
     // --- §3.2 差分区分（min-of-R 基準。飽和差分・逆転は n/a） -------------------
+    // 指摘（Issue #660 レビュー・PRRT_kwDOUAKASM6gV23s）: `common_fixed` は
+    // B3（dense SQL）と S0（dense-topk 対照）の差であり dense 側の値である。
+    // ここから引く parse・bind は同じく dense 側（S1d+S2+S3d）で揃える必要が
+    // あり、hybrid 側（S1+S2+S3）を引くと hybrid 固有の構文・列解決コストの
+    // 分だけ `unexplained_common` に混入してしまう。
     let issue660_common_fixed = bucket_diff(issue660_min_s0, min_b3); // B3 - S0
     let issue660_hybrid_only =
         bucket_diff(min_b4, min_b1) // B1 - B4
             .and_then(|d| issue660_common_fixed.and_then(|c| bucket_diff(c, d)));
-    let issue660_parse_bind_sum = issue660_min_s1 + issue660_min_s2 + issue660_min_s3; // 逆転しない加算のみ
+    let issue660_parse_bind_sum = issue660_min_s1 + issue660_min_s2 + issue660_min_s3; // hybrid SQL・逆転しない加算のみ
+    let issue660_parse_bind_dense_sum = issue660_min_s1d + issue660_min_s2 + issue660_min_s3d; // dense SQL（B3 と同一文）
+    let issue660_parse_bind_hybrid_delta =
+        bucket_diff(issue660_parse_bind_dense_sum, issue660_parse_bind_sum); // hybrid - dense
     let issue660_scalar_stage_replica = issue660_min_s4 + issue660_min_s5;
     let issue660_unexplained_common = issue660_common_fixed.and_then(|c| {
         bucket_diff(
-            issue660_min_s1 + issue660_min_s2 + issue660_min_s3 + issue660_min_s6 + issue660_min_s8,
+            issue660_min_s1d
+                + issue660_min_s2
+                + issue660_min_s3d
+                + issue660_min_s6
+                + issue660_min_s8,
             c,
         )
     });
@@ -1695,11 +1787,22 @@ fn main() {
     issue660_render_bucket("hybrid_only((B1-B4)-common_fixed)", issue660_hybrid_only);
     issue660_render_bucket("parse_bind(S1+S2+S3)", Some(issue660_parse_bind_sum));
     issue660_render_bucket(
+        "parse_bind_dense(S1d+S2+S3d)",
+        Some(issue660_parse_bind_dense_sum),
+    );
+    // hybrid_only の内訳の一部として読む情報用の区分（hybrid_only の計算式自体は
+    // 変更しない）。hybrid SQL が dense SQL（B3）比でどれだけ余分に
+    // parse・bind コストを負うかを切り出す。
+    issue660_render_bucket(
+        "parse_bind_hybrid_delta(parse_bind-parse_bind_dense)",
+        issue660_parse_bind_hybrid_delta,
+    );
+    issue660_render_bucket(
         "scalar_stage_replica(S4+S5)",
         Some(issue660_scalar_stage_replica),
     );
     issue660_render_bucket(
-        "unexplained_common(common_fixed-(S1+S2+S3+S6+S8))",
+        "unexplained_common(common_fixed-(S1d+S2+S3d+S6+S8))",
         issue660_unexplained_common,
     );
     issue660_render_bucket(
