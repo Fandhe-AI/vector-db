@@ -86,16 +86,20 @@ fn result_ids(result: &QueryResult) -> Vec<u64> {
     ids
 }
 
-/// `(id, projected columns as Debug string)` の集合。列投影の一致まで固定する
-/// （`ScalarSource::EagerSubset` の写像が正しいことの直接検証）。
-fn result_rows_with_cells(result: &QueryResult) -> Vec<(u64, String)> {
-    let mut rows: Vec<(u64, String)> = result
+/// `(id, score のビットパターン, 投影列の Debug 文字列)` を **`result.rows` の
+/// 順序を保ったまま** 並べたもの（codex-review 指摘対応・PR #664）。
+///
+/// 以前は id 昇順へ並べ替えたうえ `score` を捨てていたため、cold（redb 走査 →
+/// 複製経路）／hot（マスク経路）でスコアの丸め誤差やタイブレーク時の順位が
+/// 食い違っていても検出できなかった。`ORDER BY embedding <=> ...` の Top-k は
+/// 順序そのものが検証対象（マスク経路が複製経路と同じ規約で選出しているか）
+/// であるため、ここでは並べ替えず、スコアは `f64::to_bits()` でビット一致まで見る。
+fn result_rows_with_cells(result: &QueryResult) -> Vec<(u64, u64, String)> {
+    result
         .rows
         .iter()
-        .map(|r| (r.id, format!("{:?}", r.cells)))
-        .collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    rows
+        .map(|r| (r.id, r.score.to_bits(), format!("{:?}", r.cells)))
+        .collect()
 }
 
 /// 10 行（`id` 1..=10）: 偶数 `id` は `kind = 'a'`・`path` に `"even/"` 接頭辞、
@@ -358,6 +362,35 @@ fn tie_inducing_corpus_cold_hot_matches_for_mask_path() {
     let sql =
         "SELECT id, kind FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 20";
     assert_cold_hot_rows_and_cells_match(&core, "tenant-a", sql);
+}
+
+// 同点誘発コーパス（`kind='a'` の 10 行すべてが embedding `[1.0,0.0]` で同一距離
+// ＝完全同点）で `LIMIT` を候補数（10）未満に絞り、同点タイブレーク境界での
+// 選出（`id` 昇順で先頭 `LIMIT` 件を選ぶ規約）がマスク経路でも複製経路と
+// 完全一致することを検証する（codex-review 指摘対応・PR #664: `LIMIT 20`
+// （全候補以上）だけでは境界での選出そのものは未検証だった）。
+#[test]
+fn tie_inducing_corpus_cold_hot_matches_with_limit_below_candidate_count() {
+    let path = unique_db_path("scalar-index-mask-tie-limit-boundary");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_tie_inducing_rows(&storage, "tenant-a");
+    let core = EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider));
+
+    // kind='a' の候補は 10 行（id=2,4,...,20）で全件同点。LIMIT 4 で
+    // 先頭 4 件（id=2,4,6,8）のみを取得する。
+    let sql =
+        "SELECT id, kind FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 4";
+    assert_cold_hot_rows_and_cells_match(&core, "tenant-a", sql);
+
+    let hot = run(&core, "tenant-a", sql);
+    assert_eq!(hot.rows.len(), 4);
+    assert_eq!(
+        result_ids(&hot),
+        vec![2, 4, 6, 8],
+        "完全同点時は id 昇順で先頭 LIMIT 件が選ばれるはず"
+    );
 }
 
 // --- 統計: hybrid・HINT ORDER（残余述語）はマスク経路を消費しない ------------

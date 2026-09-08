@@ -901,13 +901,20 @@ mod tests {
     // Issue #654: `search_subset` の並列経路（候補数が `MIN_ROWS_PER_THREAD` を
     // 超える規模）が、gather 済み `CpuScalarProvider::search` とビット同一の結果に
     // なること。同点誘発（同一ベクトルを多数含む）フィクスチャでタイブレークの
-    // 一致も検証する。
+    // 一致も検証する。偶数スロットのみへ絞り込んだ後の候補数（`rows` の約半分）
+    // が `thread_count_for` で複数スレッドへ分割される規模（`MIN_ROWS_PER_THREAD` の
+    // 2 倍以上）を確実に超えるよう、絞り込み前の `rows` を候補数ベースで決める
+    // （codex-review 指摘対応・PR #664: 絞り込み後 1539 件では
+    // `thread_count_for(1539) == 1` となり並列経路の分割・部分結果マージが
+    // 未検証だった）。
     #[test]
     fn search_subset_parallel_path_matches_gathered_scalar_reference_with_ties() {
         use crate::kernel::CpuScalarProvider;
 
         let dim = 8usize;
-        let rows = MIN_ROWS_PER_THREAD * 3 + 5;
+        // 偶数スロットへの絞り込みで候補数がおよそ半分になるため、候補数が
+        // `MIN_ROWS_PER_THREAD * 2` を上回るよう `rows` を余裕を持って確保する。
+        let rows = MIN_ROWS_PER_THREAD * 6 + 5;
         let mut vectors = Vec::with_capacity(rows * dim);
         for i in 0..rows {
             for d in 0..dim {
@@ -919,6 +926,24 @@ mod tests {
         let query: Vec<f32> = (0..dim).map(|d| ((d % 5) as f32) * 0.2 - 0.4).collect();
         // 候補スロットは全行の約半分（偶数番のみ）を昇順・重複なしで選ぶ。
         let slots: Vec<u32> = (0..rows as u32).filter(|s| s % 2 == 0).collect();
+
+        // 実行環境が複数コアを持つ場合に限り、この規模で実際に並列経路（複数
+        // ワーカーへのスロット分割＋部分結果マージ）へ入ることを非 vacuous に
+        // 確認する（codex-review 指摘対応・PR #664）。`available_parallelism` が
+        // 1（コンテナ制約等）を返す環境では `thread_count_for` が単一スレッドへ
+        // 縮退するのは仕様どおりであり、CI 環境のコア数に依存してテスト自体が
+        // 不安定化しないよう条件付きにする。
+        if std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            >= 2
+        {
+            assert!(
+                thread_count_for(slots.len()) >= 2,
+                "この規模（候補数 {}）では並列経路を通るはず",
+                slots.len()
+            );
+        }
 
         let subset_hits = ParallelSearchProvider
             .search_subset(SubsetSearchInput {
