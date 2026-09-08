@@ -78,6 +78,8 @@ pub enum ScanStageError {
     InvalidRounds(String),
     /// `BENCH_SCAN_PROFILE_SCALE` の値が不正だった。
     InvalidScale(String),
+    /// `BENCH_SCAN_PROFILE_SELECTIVITY` の値が不正だった（Issue #653）。
+    InvalidSelectivity(String),
     /// ベンチ内デコード再実装が行バイト列を解釈できなかった（破損・レイアウト
     /// ドリフトのいずれか）。
     Codec(String),
@@ -101,6 +103,9 @@ impl fmt::Display for ScanStageError {
             }
             ScanStageError::InvalidScale(reason) => {
                 write!(f, "invalid BENCH_SCAN_PROFILE_SCALE: {reason}")
+            }
+            ScanStageError::InvalidSelectivity(reason) => {
+                write!(f, "invalid BENCH_SCAN_PROFILE_SELECTIVITY: {reason}")
             }
             ScanStageError::Codec(msg) => write!(f, "row decode failed: {msg}"),
             ScanStageError::ConsistencyViolation(msg) => {
@@ -451,4 +456,168 @@ pub fn render_bucket_line(
     band: BandClass,
 ) -> String {
     format!("bucket({label}): ns_per_row={diff_ns_per_row:.1} ratio={ratio_pct:.2}% band={band}")
+}
+
+// --- 選択率 opt-in（Issue #653） ---------------------------------------------
+//
+// `BENCH_SCAN_PROFILE_SELECTIVITY=1/<N>` で `lang = 'ja'` の割当比率を変える。
+// crossdb fixture（`lang='ja'` 8,309/25,000 ≒ 33%）に合わせて計測する場合は
+// `1/3` を指定する。既定 `1/5` は既存 fixture（`LANGS[(id) % 5]`）とビット同一の
+// 割当規則になる（`lang_for_id` のコメント参照）。
+
+/// 選択率分母の下限（1 未満は「常に ja」になり索引の意味が失われるため禁止）。
+pub const MIN_SELECTIVITY_DENOMINATOR: u32 = 2;
+/// 選択率分母の上限（実装上の目安。過度に細かい選択率は本ベンチの目的
+/// （索引経路の内訳把握）に対して意味を持たないため上限を設ける）。
+pub const MAX_SELECTIVITY_DENOMINATOR: u32 = 100;
+/// 既定分母。crossdb fixture 導入前の既存 `LANGS` 5 値輪番（`ja` ≒ 20%）と
+/// ビット同一になる値。
+pub const DEFAULT_SELECTIVITY_DENOMINATOR: u32 = 5;
+
+/// `lang_for_id` が `\"ja\"` 以外に割り当てる候補（既存 `LANGS` の非 `ja` 4 値と
+/// 同一の並び・同一の値集合）。
+pub const OTHER_LANGS: &[&str] = &["en", "fr", "de", "es"];
+
+/// `lang_for_id` が選択対象として扱う言語値（`sql WHERE lang = '<TARGET_LANG>'`
+/// で参照する値そのもの）。
+pub const TARGET_LANG: &str = "ja";
+
+/// `BENCH_SCAN_PROFILE_SELECTIVITY` を fail-closed にパースする。受理形状は
+/// `\"1/<N>\"`（`N` は [`MIN_SELECTIVITY_DENOMINATOR`]..=[`MAX_SELECTIVITY_DENOMINATOR`]
+/// の整数）。未設定・空文字は [`DEFAULT_SELECTIVITY_DENOMINATOR`]。
+pub fn parse_selectivity(raw: Option<&str>) -> Result<u32, ScanStageError> {
+    let raw = match raw {
+        None => return Ok(DEFAULT_SELECTIVITY_DENOMINATOR),
+        Some(raw) => raw,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_SELECTIVITY_DENOMINATOR);
+    }
+    let Some(("1", denominator_raw)) = trimmed.split_once('/') else {
+        return Err(ScanStageError::InvalidSelectivity(format!(
+            "{raw:?} does not match the required `1/<N>` shape"
+        )));
+    };
+    let denominator: u32 = denominator_raw.parse().map_err(|_| {
+        ScanStageError::InvalidSelectivity(format!(
+            "{raw:?}: denominator {denominator_raw:?} is not a valid u32"
+        ))
+    })?;
+    if denominator < MIN_SELECTIVITY_DENOMINATOR {
+        return Err(ScanStageError::InvalidSelectivity(format!(
+            "{raw:?}: denominator {denominator} is below the minimum {MIN_SELECTIVITY_DENOMINATOR}"
+        )));
+    }
+    if denominator > MAX_SELECTIVITY_DENOMINATOR {
+        return Err(ScanStageError::InvalidSelectivity(format!(
+            "{raw:?}: denominator {denominator} exceeds the maximum {MAX_SELECTIVITY_DENOMINATOR}"
+        )));
+    }
+    Ok(denominator)
+}
+
+/// id → `lang` 値の割当規則（シード時・期待値導出の双方が使う単一情報源）。
+/// `id % denominator == 0` は常に [`TARGET_LANG`]（`\"ja\"`）、それ以外は
+/// [`OTHER_LANGS`] を `((id % denominator) - 1) % OTHER_LANGS.len()` で輪番する。
+///
+/// `denominator == 5` のとき、既存 fixture の `LANGS[(id as usize) % LANGS.len()]`
+/// （`LANGS = [\"ja\",\"en\",\"fr\",\"de\",\"es\"]`）とビット同一になる
+/// （`id % 5 == 0` → ja、`1..=4` → en/fr/de/es の順）。
+///
+/// `denominator` は [`parse_selectivity`] が [`MIN_SELECTIVITY_DENOMINATOR`] 以上
+/// であることを検証済みの前提で呼び出す（0 除算はここでは防御しない設計。
+/// 呼び出し元が必ず `parse_selectivity` の戻り値を渡す契約）。
+pub fn lang_for_id(id: u64, denominator: u32) -> &'static str {
+    let denominator = denominator as u64;
+    let rem = id % denominator;
+    if rem == 0 {
+        TARGET_LANG
+    } else {
+        let idx = ((rem - 1) % OTHER_LANGS.len() as u64) as usize;
+        OTHER_LANGS[idx]
+    }
+}
+
+/// 可視 id 列のうち [`TARGET_LANG`] に一致する件数（[`lang_for_id`] による
+/// 独立導出。計測対象コード〔`scan_scalar_columns`／`matches_all`〕を経由しない
+/// 整合性検証用の期待値）。
+pub fn expected_visible_hits(visible_ids: &[u64], denominator: u32) -> usize {
+    visible_ids
+        .iter()
+        .filter(|id| lang_for_id(**id, denominator) == TARGET_LANG)
+        .count()
+}
+
+/// SCALAR 事前フィルタ付き DISTANCE の実行経路を切り替える 2 アーム
+/// （`sql/scalar_plan.rs::classify_scalar_plan` の分岐に対応）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileArm {
+    /// 現行の索引経路（`WHERE <col> = '<value>'`）。`ScalarIndex::resolve_candidates`
+    /// による候補削減が発火する（選択度が閾値以下の場合）。
+    Index,
+    /// `AND vec_norm(embedding) > 0` の（実運用上）恒真な残余述語を付け加え、
+    /// `classify_scalar_plan` を `PlainScan` へ縮退させる（Issue #474 以前相当の
+    /// 形状。索引を構築済みでも消費しない全可視行走査経路）。`AND 1 = 1` は
+    /// 定数畳み込み（Issue #353・`sql/expr_program.rs`）により束縛時点で消去され
+    /// `PlainScan` を強制できないため使わない。`vec_norm(embedding)` は
+    /// `VectorRef` を参照する残余述語であり `id_predicate_from_expr` が
+    /// `None` を返す（`tests/scalar_index_prune.rs::
+    /// residual_builtin_expr_never_consumes_index` と同じ形状）。
+    Plain,
+}
+
+impl fmt::Display for ProfileArm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProfileArm::Index => write!(f, "index"),
+            ProfileArm::Plain => write!(f, "plain"),
+        }
+    }
+}
+
+/// アームごとの `WHERE` 節を組み立てる（ベンチ・accept テストの双方が同じ
+/// 文字列を使うための単一情報源）。`column`・`value` は定数文字列（決定的 RNG・
+/// 固定スキーマ由来）のみを渡す契約で、未検証の外部入力を SQL 文字列へ連結
+/// しない。
+pub fn where_clause_for_arm(arm: ProfileArm, column: &str, value: &str) -> String {
+    match arm {
+        ProfileArm::Index => format!("WHERE {column} = '{value}'"),
+        ProfileArm::Plain => {
+            format!("WHERE {column} = '{value}' AND vec_norm(embedding) > 0")
+        }
+    }
+}
+
+/// 区分（bucket）の e2e 全体に対する占有率（%）。`total` が 0 の場合は
+/// [`ScanStageError::DegenerateRatio`]。
+pub fn bucket_share_pct(part: Duration, total: Duration) -> Result<f64, ScanStageError> {
+    if total.is_zero() {
+        return Err(ScanStageError::DegenerateRatio(
+            "bucket_share_pct: total duration is zero",
+        ));
+    }
+    Ok(part.as_secs_f64() / total.as_secs_f64() * 100.0)
+}
+
+/// 索引経路の区分（bucket）1 行の描画（`us` はマイクロ秒。[`render_bucket_line`]
+/// が ns/row 表記なのに対し、本関数は絶対時間 ＋ e2e 比 % を示す）。
+pub fn render_bucket_share_line(label: &str, us: f64, pct: f64) -> String {
+    format!("bucket_share({label}): us={us:.1} pct_of_e2e={pct:.2}%")
+}
+
+/// `scalar_index_cache_stats()` の増分を 1 行へ整形する（非 vacuous 確認用。
+/// テナント ID・行 ID は一切含まない集計カウンタのみを扱う）。
+#[allow(clippy::too_many_arguments)]
+pub fn render_arm_stats_line(
+    arm: ProfileArm,
+    k: usize,
+    index_scans_delta: u64,
+    plain_scan_fallbacks_delta: u64,
+    builds_delta: u64,
+    arena_cache_hits_delta: u64,
+) -> String {
+    format!(
+        "scalar_index({arm},k={k}): index_scans=+{index_scans_delta} plain_scan_fallbacks=+{plain_scan_fallbacks_delta} builds=+{builds_delta} arena_cache_hits=+{arena_cache_hits_delta}"
+    )
 }

@@ -161,3 +161,6 @@ build_from_cached_rls_rows_subset_with_all_slots_matches_full_scan`）。非昇�
 `make bench-scan-stage-profile`（W0-hot・R_dot 参照区間）・`feature_bench` の
 `vector_knn_where`／`point_where`（参照区間: 変更を含まない `vector_knn`／
 `rls_isolation`）・`scripts/crossdb_bench` 実測はオーナー作業として申し送る。
+
+現行索引経路（本 doc）を選択率 33%（crossdb fixture 相当）で段別に内訳計測した
+結果は `docs/design/filtered-distance-stage-profile.md`（Issue #653）を参照。
