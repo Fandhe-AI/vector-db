@@ -39,12 +39,17 @@
 //! | --- | --- |
 //! | I1 `index_candidate_resolve` | 値→候補スロット辞書からの `\"ja\"` lookup ＋ 複製（`ScalarIndex::candidates_for` 相当の pub API 再実装） |
 //! | I2a `candidate_predicate` | I1 の候補のみへ `scan_scalar_columns` ＋ `lang = 'ja'` 判定（`build_from_cached_rls_rows_subset` の再適用契約に対応） |
-//! | I2b `candidate_arena_copy` | I2a ＋ 一致行 embedding の連続複製（#654 の削減対象） |
-//! | I3 `provider_search` | 一致行のみへ `SearchProvider::search`（距離計算＋Top-k） |
+//! | I2b `candidate_mask_build` | I2a と同じ述語適用で「一致した元スロット番号」のマスク（`Vec<u32>`）だけを構築する（`filter_cached_rls_rows_subset` 相当。#654 適用後の index アームは複製を経由しないため embedding／id／tenant_id／visibility のいずれも複製しない） |
+//! | I3 `provider_search` | I2b のマスクを複製せず借用したままの `arena.vectors()` へ渡す `SearchProvider::search_subset`（距離計算＋Top-k。#654 相当） |
 //!
 //! SQL 表層固定コストは `e2e(index) − (I1 + I2b + I3)` の残差として算出する
-//! （逆転時は測定ノイズとして `n/a` 表示）。詳細・実測結果は
-//! `docs/design/filtered-distance-stage-profile.md` を参照。
+//! （逆転時は測定ノイズとして `n/a` 表示）。I2b・I3 は #654 適用後の index
+//! アームが実際に通る `filter_cached_rls_rows_subset` → `search_subset`
+//! （複製なし・借用のみ）の処理を再実装したものであり、#654 以前相当の
+//! 複製経路（`build_from_cached_rls_rows_subset`）は測定しない（codex-review
+//! P1 指摘・PR #663。旧版は e2e(index) が実際には経由しない複製コストを
+//! I2b/I3 へ混入させており、残差の算出契約と実装経路が不整合だった）。
+//! 詳細・実測結果は `docs/design/filtered-distance-stage-profile.md` を参照。
 //!
 //! # 出力ポリシー
 //!
@@ -894,6 +899,11 @@ fn main() {
     let mut index_arena_hits_delta = 0u64;
     let mut plain_scans_delta = 0u64;
     let mut plain_fallbacks_delta = 0u64;
+    // `index_mask_scans`（`sql/exec.rs` の `filter_cached_rls_rows_subset` →
+    // `search_subset` 経路。#654）の増分を非 vacuous に確認する（codex-review
+    // P1 指摘・PR #663。I2b/I3 が再実装するのはこの経路であり、e2e(index) が
+    // 実際にここを通っていることを本カウンタで裏取りする）。
+    let mut index_mask_scans_delta = 0u64;
 
     for round in 0..rounds {
         // --- 索引アーム（Issue #653）: `scalar_index_cache_stats()` の増分で
@@ -949,6 +959,9 @@ fn main() {
         let round_index_arena_hits_delta = index_arena_after
             .hits
             .saturating_sub(index_arena_before.hits);
+        let round_index_mask_scans_delta = index_stats_after
+            .index_mask_scans
+            .saturating_sub(index_stats_before.index_mask_scans);
         // 索引アームは `index_scans` が実際に増え（非 vacuous）、`plain_scan_fallbacks`
         // は増えない（=常に候補削減経路を消費する）ことを毎ラウンド fail-closed に確認する。
         if round_index_scans_delta == 0 {
@@ -961,11 +974,23 @@ fn main() {
                 "round {round}: index arm unexpectedly fell back to plain scan (plain_scan_fallbacks delta={round_index_plain_fallbacks_delta})"
             ));
         }
+        // `index_mask_scans` は「候補削減が発火し、かつ複製を経ずマスクだけを
+        // 構築した」（#654）ことの直接証跡。本ベンチの `Ranking::Distance`・
+        // 非 hybrid・HNSW opt-in 無し構成では、候補削減が発火した
+        // （`round_index_scans_delta > 0`）ラウンドは必ずこの分岐へ入るため、
+        // 増分 0 は I2b/I3 が再実装している実装経路（#654 相当）を e2e(index)
+        // が実際には通っていないことを意味する（codex-review P1 指摘・PR #663）。
+        if round_index_mask_scans_delta == 0 {
+            fail_closed(format!(
+                "round {round}: index arm did not take the #654 mask path (index_mask_scans delta=0; I2b/I3 reimplement filter_cached_rls_rows_subset -> search_subset, but e2e(index) did not exercise it this round)"
+            ));
+        }
         if round == 0 {
             index_scans_delta = round_index_scans_delta;
             index_plain_fallbacks_delta = round_index_plain_fallbacks_delta;
             index_builds_delta = round_index_builds_delta;
             index_arena_hits_delta = round_index_arena_hits_delta;
+            index_mask_scans_delta = round_index_mask_scans_delta;
         }
 
         // --- plain アーム（Issue #653）: `AND vec_norm(embedding) > 0` により `PlainScan` へ縮退させ、
@@ -1086,69 +1111,53 @@ fn main() {
         .expect("measurement must satisfy protocol minimums");
         i2a_rounds.push(i2a.summary.median);
 
-        // I2b: `VectorArena::build_from_cached_rls_rows_subset`（`pub(crate)`
-        // のためベンチから直接呼べない）相当の再実装。生 embedding 複製だけを
-        // 測るのではなく、production と同様に (1) amortized 成長
-        // （`GrowableArenaBuffers::ensure_capacity` の「capacity を倍々に増やし、
-        // 目標行数に達したら止める」方針を模した段階的 `reserve_exact`）と
-        // (2) 一致行ごとの id／tenant_id／visibility の複製も embedding 複製と
-        // 合わせて行う（P1 指摘・PR #663。旧実装は一括 `Vec::with_capacity(exact)`
-        // ＋ embedding のみの複製で、SQL 表層固定コストへの残差帰属・#654 の
-        // 削減上限という測定契約が production の処理量と乖離していた）。
+        // I2b: `VectorArena::filter_cached_rls_rows_subset`（`pub(crate)` のため
+        // ベンチから直接呼べない）相当の再実装（codex-review P1 指摘・PR #663）。
+        // 現行 HEAD は #654 適用済みで、index アームの温まった経路
+        // （`sql/exec.rs::execute_statement_with_cache` の `!is_hybrid &&
+        // !hnsw_subset_eligible` 分岐）は `VectorArena::build_from_cached_rls_rows_subset`
+        // による embedding／id／tenant_id／visibility の複製ではなく、
+        // `filter_cached_rls_rows_subset` によるキャッシュ済みスナップショットの
+        // `VectorArena` 借用のまま候補述語を再適用し「一致した元スロット番号」の
+        // マスク（`Vec<u32>`。狭義昇順）だけを構築する経路を通る（本ベンチの
+        // `Ranking::Distance`・非 hybrid・HNSW opt-in 無し構成では常にこの分岐。
+        // §モジュールドキュメント「SCALAR 事前フィルタ付き DISTANCE の索引経路
+        // 内訳」参照）。P1 修正前の実装は旧経路（#654 以前相当）の複製コストを
+        // 計測しており、e2e(index) が実際には経由しない処理量を I2b/I3 へ
+        // 混入させ、残差（SQL 表層固定コスト）の算出契約と実装経路が不整合
+        // だった。以降は複製を一切行わず、マスク（`Vec<u32>`）構築のみを測る。
         let i2b = run(&config, || {
-            let mut buf_vectors: Vec<f32> = Vec::new();
-            let mut buf_ids: Vec<u64> = Vec::new();
-            let mut buf_tenant_ids: Vec<String> = Vec::new();
-            let mut buf_visibilities: Vec<Visibility> = Vec::new();
-            let mut row_capacity: usize = 0;
-            let mut visible_row_count: usize = 0;
+            let mut kept: Vec<u32> = Vec::new();
             for &idx in &i1_candidates {
                 let scanned = scan_scalar_columns(&schema, &captured_metadata[idx])
                     .expect("scan_scalar_columns");
-                if !matches_lang_filter(&filters, &scanned) {
-                    continue;
+                if matches_lang_filter(&filters, &scanned) {
+                    kept.push(idx as u32);
                 }
-                visible_row_count += 1;
-                if visible_row_count > row_capacity {
-                    let doubled = row_capacity.checked_mul(2).unwrap_or(visible_row_count);
-                    let candidate = doubled.max(visible_row_count);
-                    let additional = candidate - row_capacity;
-                    buf_vectors.reserve_exact(additional * dim);
-                    buf_ids.reserve_exact(additional);
-                    buf_tenant_ids.reserve_exact(additional);
-                    buf_visibilities.reserve_exact(additional);
-                    row_capacity = candidate;
-                }
-                let vector = arena.vector(idx).expect("arena vector for captured index");
-                buf_vectors.extend_from_slice(vector);
-                buf_ids.push(captured_ids[idx]);
-                buf_tenant_ids.push(
-                    arena
-                        .tenant_id(idx)
-                        .expect("arena tenant_id for captured index")
-                        .to_string(),
-                );
-                buf_visibilities.push(
-                    arena
-                        .visibility(idx)
-                        .expect("arena visibility for captured index"),
-                );
             }
-            (buf_vectors, buf_ids, buf_tenant_ids, buf_visibilities)
+            kept
         })
         .expect("measurement must satisfy protocol minimums");
         i2b_rounds.push(i2b.summary.median);
 
-        let mut i_matched_ids: Vec<u64> = Vec::with_capacity(i1_candidates.len());
-        let mut i_matched_vectors: Vec<f32> = Vec::with_capacity(i1_candidates.len() * dim);
-        for &idx in &i1_candidates {
-            let scanned =
-                scan_scalar_columns(&schema, &captured_metadata[idx]).expect("scan_scalar_columns");
-            if matches_lang_filter(&filters, &scanned) {
-                i_matched_ids.push(captured_ids[idx]);
-                i_matched_vectors.extend_from_slice(arena.vector(idx).expect("arena vector"));
-            }
-        }
+        // I3: `filter_cached_rls_rows_subset` が返すマスクを、複製せず借用したまま
+        // の `arena.vectors()` へそのまま渡す `SearchProvider::search_subset`
+        // （Issue #654）相当の再実装。`i_matched_slots` は I2b と同じ述語適用で
+        // 独立に導出し（I2b のクロージャ内部値をタイミング計測外へ持ち出さない
+        // ため）、id 側は検証（`expected_match_ids` との突合）専用に別途復元する。
+        let i_matched_slots: Vec<u32> = i1_candidates
+            .iter()
+            .filter(|&&idx| {
+                let scanned = scan_scalar_columns(&schema, &captured_metadata[idx])
+                    .expect("scan_scalar_columns");
+                matches_lang_filter(&filters, &scanned)
+            })
+            .map(|&idx| idx as u32)
+            .collect();
+        let i_matched_ids: Vec<u64> = i_matched_slots
+            .iter()
+            .map(|&slot| captured_ids[slot as usize])
+            .collect();
         if i_matched_ids != expected_match_ids {
             fail_closed(format!(
                 "round {round}: I2a/I2b matched id set diverged from independently derived expected_match_ids (index path regression suspected)"
@@ -1156,9 +1165,9 @@ fn main() {
         }
         let i3 = run(&config, || {
             parallel_provider
-                .search(SearchInput {
-                    ids: &i_matched_ids,
-                    vectors: &i_matched_vectors,
+                .search_subset(engine::kernel::SubsetSearchInput {
+                    slots: &i_matched_slots,
+                    vectors: arena.vectors(),
                     dim: dim as u32,
                     query: &query,
                     k: TOP_K,
@@ -1490,6 +1499,10 @@ fn main() {
             index_arena_hits_delta,
         )
     );
+    // `index_mask_scans` 増分（#654 の複製なしマスク経路。codex-review P1
+    // 指摘・PR #663）。I2b/I3 が再実装している実装経路を e2e(index) が
+    // 実際に消費していることの非 vacuous な裏取り。
+    println!("index_mask_scans_delta={index_mask_scans_delta}");
     println!(
         "{}",
         render_arm_stats_line(
@@ -1557,7 +1570,7 @@ fn main() {
     for (label, dur, min_dur) in [
         ("I1_index_candidate_resolve", i1_med, i1_min),
         ("I2a_candidate_predicate", i2a_med, i2a_min),
-        ("I2b_candidate_arena_copy", i2b_med, i2b_min),
+        ("I2b_candidate_mask_build", i2b_med, i2b_min),
         ("I3_provider_search", i3_med, i3_min),
     ] {
         let us = dur.as_secs_f64() * 1e6;
@@ -1572,9 +1585,11 @@ fn main() {
             ),
         }
     }
-    // SQL 表層固定コスト（残差）= e2e(index) − (I1 + I2b + I3)。I2b は I2a を
-    // 包含する累積値のため、I2a を別途加算すると I1 分の候補述語コストを
-    // 二重計上する（W 系列の `report_diff` と同じ理由で加算対象は累積値のみ）。
+    // SQL 表層固定コスト（残差）= e2e(index) − (I1 + I2b + I3)。I2b（マスク
+    // 構築。#654 相当）は I2a（述語判定のみ）と同じ候補集合を独立に再走査する
+    // ため I2a を含む累積値ではない（I2a はマスク非構築の対照値として別出しの
+    // まま維持し、加算対象には含めない。codex-review P1 指摘・PR #663で
+    // I2b/I3 を #654 適用後の実装経路〔複製なし〕へ揃えたことに伴う整理）。
     let index_path_sum = i1_med
         .checked_add(i2b_med)
         .and_then(|d| d.checked_add(i3_med));

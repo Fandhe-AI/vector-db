@@ -112,12 +112,24 @@ bucket_share(sql_surface_fixed_cost_residual): us=332.1 pct_of_e2e=30.54%
 
 （`I2b` は `I2a` を包含する累積値なので、`I2b` 単独の複製コスト——embedding／id／tenant_id／visibility の 4 バッファ複製＋amortized 成長——は `I2b − I2a` ≈ 464.0µs ≈ e2e 比 42.7 ポイント分。）
 
+**訂正（PR #663 codex-review P1 指摘・2 回目）**: 上記 I 系列（`I2b_candidate_arena_copy`／`I3_provider_search`）は、現行 HEAD に取り込まれた #654 適用**前**相当の実装経路（`VectorArena::build_from_cached_rls_rows_subset` による embedding／id／tenant_id／visibility の複製＋複製後 `SearchProvider::search`）を再実装したものだった。一方 e2e(index) の温まった経路（`scalar_index_cache_stats().index_mask_scans` の増分で非 vacuous に確認済み）は #654 適用後の実装（`VectorArena::filter_cached_rls_rows_subset` によるキャッシュ済みスナップショットの `VectorArena` 借用のまま候補述語を再適用しマスク〔`Vec<u32>`〕だけを構築し、`SearchProvider::search_subset` へそのまま渡す。複製なし）を通る。したがって旧版の I2b/I3 は e2e(index) が実際には経由しない複製コストを計測しており、`e2e(index) − (I1 + I2b + I3)` の残差（SQL 表層固定コスト）はこの経由しないコストを二重に差し引く不整合な算出になっていた（本 PR 内の初回修正時点でも見落としが残っていた）。I2b/I3 を `filter_cached_rls_rows_subset` → `search_subset`（複製なし）相当へ揃えて再実測した値は以下のとおり（本環境・N=5 ラウンド。選択率 33%・候補 7,667 行）:
+
+```
+bucket_share(I1_index_candidate_resolve): us=2.2 pct_of_e2e=0.44% (min-of-R=1.9us)
+bucket_share(I2a_candidate_predicate): us=134.6 pct_of_e2e=26.85% (min-of-R=133.7us)
+bucket_share(I2b_candidate_mask_build): us=137.0 pct_of_e2e=27.33% (min-of-R=135.7us)
+bucket_share(I3_provider_search): us=153.6 pct_of_e2e=30.63% (min-of-R=151.7us)
+bucket_share(sql_surface_fixed_cost_residual): us=208.5 pct_of_e2e=41.59%
+```
+
+`I2b`（マスク構築のみ・複製なし）は I2a とほぼ同水準（27.33% 対 26.85%）まで縮小し、#654 が候補行の複製コストをほぼ解消していることが確認できる。残差（SQL 表層固定コスト）は 41.59% へ上振れし、I 系列合計（58.41%）を下回る規模のまま。以下の「所見」節は上記の旧版実測（`I2b_candidate_arena_copy` 相当・#654 適用前の対照値）に基づく記述であり、`I2b` の解釈（削減余地の上限）は変わらないが、`sql_surface_fixed_cost_residual` の絶対値・比率は上記の再実測値（41.59%）を正とする。
+
 ## 所見
 
 - I1（候補スロット lookup ＋ 複製 ＋ 整列）は e2e の 0.18% と無視できる大きさで、`ScalarIndex` の辞書 lookup 自体はボトルネックではない。
-- I2b（候補行の embedding／id／tenant_id／visibility 複製。production 相当の amortized 成長を含む。#654 の削減対象）は I2a 込みで e2e の 55.65%、複製そのもの（I2b−I2a）は約 42.7 ポイント——本測定条件（選択率 33%・候補 7,667 行）での **#654 の削減余地の上限**として記録する（初版は embedding のみの一括確保を計測しており過小評価だった。production 相当の複製内容へ揃えたことで比率が 41.31%→55.65% へ上振れした）。
-- SQL 表層固定コスト（残差。I1+I2b+I3 に含まれない部分）は 30.54% で、I 系列の合計（69.46%）を下回る規模。crossdb で先行して特定済みの「投影・スキャン周りの k 非依存固定コスト」（Issue #453・#454）と整合する規模感である。
-- 本測定は共有 QEMU 環境の 1 回実測（N=5 ラウンド。`R_dot` 実測ノイズ帯 10.17%）。同じビルドでの繰り返し実測では実行時の他プロセス負荷次第でノイズ帯が数百 % に及ぶ run も観測されており、median ベースの比率は run ごとにばらつきうる一方、I 系列内の相対的な大小関係（I2b が最大区分）は複数 run で一貫して観測された。絶対値・比率とも参考値の位置づけとし、専有環境再実測で確定させる。
+- I2b（候補行の embedding／id／tenant_id／visibility 複製。production 相当の amortized 成長を含む。#654 の削減対象）は I2a 込みで e2e の 55.65%、複製そのもの（I2b−I2a）は約 42.7 ポイント——本測定条件（選択率 33%・候補 7,667 行）での **#654 の削減余地の上限**として記録する（初版は embedding のみの一括確保を計測しており過小評価だった。production 相当の複製内容へ揃えたことで比率が 41.31%→55.65% へ上振れした）。この値は #654 適用前相当の対照実測であり、上記訂正のとおり e2e(index) が実際に経由する経路の実測値ではない。
+- SQL 表層固定コスト（残差。I1+I2b+I3 に含まれない部分）は上記訂正後の再実測で 41.59%（旧版の 30.54% は #654 適用前相当の I2b/I3 を差し引いた値であり不整合。上記訂正参照）。crossdb で先行して特定済みの「投影・スキャン周りの k 非依存固定コスト」（Issue #453・#454）と整合する規模感である。
+- 本測定は共有 QEMU 環境の 1 回実測（N=5 ラウンド。`R_dot` 実測ノイズ帯 10.17%）。同じビルドでの繰り返し実測では実行時の他プロセス負荷次第でノイズ帯が数百 % に及ぶ run も観測されており、median ベースの比率は run ごとにばらつきうる一方、I 系列内の相対的な大小関係は複数 run で一貫して観測された。絶対値・比率とも参考値の位置づけとし、専有環境再実測で確定させる。
 
 ## crossdb との差異（申し送り）
 
