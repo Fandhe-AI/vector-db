@@ -16,8 +16,8 @@
 //! | 段 | 内容 | 対応する区分 |
 //! | --- | --- | --- |
 //! | T1p `hybrid_direct_cached_index` | 事前構築 `SparseIndex` を使った公開 `hybrid_search`（engine 内 hybrid 経路の実効値） | engine 内 hybrid |
-//! | T2 `sql_surface_hot` | `EngineCore::execute_sql_in_session`（wire と同じ入口。crossdb 規範形 `SELECT id … hybrid_rrf … LIMIT 10`） | SQL 表層 |
-//! | T3 `wire_roundtrip` | in-process ループバックサーバーへの簡易クエリ 1 往復 | wire e2e |
+//! | T2 `sql_surface_hot` | `EngineCore::execute_sql_in_session`（wire と同じ入口。crossdb 規範形 `SELECT id … hybrid_rrf … LIMIT 10`。**ラウンドごとに新規 spawn したスレッド上で計測する**。下記「測定スレッドの揃え方」参照） | SQL 表層 |
+//! | T3 `wire_roundtrip` | in-process ループバックサーバーへの簡易クエリ 1 往復（サーバの接続スレッド上で実行） | wire e2e |
 //!
 //! 3 区分への帰属（min-of-R を用いる）: engine 内 hybrid = T1p、
 //! SQL 表層 = T2 − T1p、wire = T3 − T2。
@@ -26,6 +26,20 @@
 //! `wire-server` バイナリへ psycopg（Python・簡易クエリ）で接続するのに対し、
 //! 本ベンチは in-process ループバックのため、プロセス間・言語間のオーバー
 //! ヘッドは対象外（`docs/design/knn-wire-stage-profile.md` と同じ限界）。
+//!
+//! # 測定スレッドの揃え方（Issue #634）
+//!
+//! T2 は fixture を投入した main スレッド上ではなく、T3 のサーバ接続スレッド
+//! と同じく `std::thread::scope` でラウンドごとに新規 spawn したスレッド上で
+//! 計測する。main スレッド計測では T2 が T3 を一貫して上回る逆転が生じ
+//! `bucket(wire)` が「逆転・未確定（n/a）」になっていた（ハーネス側の計測
+//! アーティファクト）。逆転の機構は未確定（推定: fixture 投入後の main
+//! スレッド固有状態）であり、本ベンチは観測事実のみを根拠に測定スレッドを
+//! 揃える。全ラウンド共通の常駐ワーカースレッド＋チャネル方式は複雑さに
+//! 見合わないため不採用とした（T3 の接続スレッドが全ラウンドで同一という
+//! 非対称は残るが、`run` の warmup 20 反復がスレッド固有のウォーム状態を
+//! 吸収する）。詳細・再計測値は
+//! `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #634 追記」節参照。
 //!
 //! # fail-closed 検証
 //!
@@ -345,25 +359,58 @@ fn main() {
         t1p_medians.push(t1p.summary.median);
 
         // T2: SQL 表層（wire と同じ入口。crossdb 規範形 SELECT id）。
-        let mut t2_cursor = round_start;
-        let mut t2_ids_all: Vec<Vec<u64>> = Vec::with_capacity(iterations_per_stage);
-        let mut hot_session = SessionState::default();
-        let t2 = run(&config, || {
-            let idx = t2_cursor % QUERY_POOL;
-            t2_cursor += 1;
-            let sql = &sqls[idx];
-            let outcome = core
-                .execute_sql_in_session(&ctx, &mut hot_session, sql)
-                .expect("sql_surface_hot query must succeed for well-formed synthetic input");
-            match outcome {
-                SqlOutcome::Query(result) => {
-                    t2_ids_all.push(sorted_ids(result.rows.iter().map(|r| r.id).collect()));
-                    black_box(result)
+        //
+        // fixture を投入した main スレッドではなく、T3 のサーバ接続スレッドと
+        // 同じく `std::thread::scope` でラウンドごとに新規 spawn したスレッド
+        // 上で計測する（Issue #634）。main スレッド計測では T2 が T3 を
+        // 一貫して上回る逆転が生じ `bucket(wire)` が n/a になっていた
+        // （原因の機構は未確定〔推定: fixture 投入後の main スレッド固有状態〕
+        // であり、本ベンチは観測事実のみを根拠に測定スレッドを揃える。全
+        // ラウンド共通の常駐ワーカースレッド＋チャネル方式は複雑さに見合わ
+        // ないため不採用）。`core`（`Arc<EngineCore>`）・`ctx`・`sqls` は
+        // 借用のみで `Send + Sync`。`hot_session`・`t2_cursor`・
+        // `t2_ids_all` はスレッド内で生成し戻り値で持ち帰る。
+        let (t2, t2_ids_all): (harness::protocol::Measurement, Vec<Vec<u64>>) =
+            std::thread::scope(|scope| {
+                let handle = std::thread::Builder::new()
+                    .name("sql_surface_hot".to_string())
+                    .spawn_scoped(scope, || {
+                        let mut t2_cursor = round_start;
+                        let mut t2_ids_all: Vec<Vec<u64>> =
+                            Vec::with_capacity(iterations_per_stage);
+                        let mut hot_session = SessionState::default();
+                        let t2 = run(&config, || {
+                            let idx = t2_cursor % QUERY_POOL;
+                            t2_cursor += 1;
+                            let sql = &sqls[idx];
+                            let outcome = core
+                                .execute_sql_in_session(&ctx, &mut hot_session, sql)
+                                .expect(
+                                    "sql_surface_hot query must succeed for well-formed synthetic \
+                                     input",
+                                );
+                            match outcome {
+                                SqlOutcome::Query(result) => {
+                                    t2_ids_all.push(sorted_ids(
+                                        result.rows.iter().map(|r| r.id).collect(),
+                                    ));
+                                    black_box(result)
+                                }
+                                other => fail_closed(format!(
+                                    "unexpected sql_surface_hot outcome: {other:?}"
+                                )),
+                            }
+                        })
+                        .expect("measurement must satisfy protocol minimums");
+                        (t2, t2_ids_all)
+                    });
+                match handle {
+                    Ok(h) => h
+                        .join()
+                        .unwrap_or_else(|_| fail_closed("sql_surface_hot thread panicked")),
+                    Err(e) => fail_closed(format!("spawn sql_surface_hot thread: {e}")),
                 }
-                other => fail_closed(format!("unexpected sql_surface_hot outcome: {other:?}")),
-            }
-        })
-        .expect("measurement must satisfy protocol minimums");
+            });
         round_lines.push(render_tier_round_line(
             "sql_surface_hot",
             round,

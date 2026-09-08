@@ -1122,6 +1122,85 @@ wire 側の SQL 表層区分（T2−T1p）が最大となるのは、T2 が `exe
 `hybrid_search` のみを直接計測するため——engine 内訳（B1−B4）と同じ「SQL 表層の
 固定コスト」を指すが、測定対象範囲が異なるため比率は単純合算できない。
 
+> **注記**: 本表の T2（`sql_surface_hot`）は fixture を投入した main スレッド
+> 上での計測値。main スレッド計測では T2 が T3 を一貫して上回る逆転が生じ
+> `bucket(wire)` が構造的に n/a（逆転・未確定）になりやすいハーネス側の
+> アーティファクトがあった（Issue #634）。再取得値は次節「Issue #634 追記」
+> 参照。
+
+### Issue #634 追記: T2 の新規スレッド計測と wire 内訳の再取得
+
+#### 経緯
+
+`hybrid_wire_profile_bench.rs` の T2（`sql_surface_hot`）は fixture を投入した
+main スレッド上で計測しており、T3（`wire_roundtrip`。サーバの接続スレッド上で
+実行）より一貫して遅い逆転（Issue 起票時の観測値: T2 5.7〜5.8ms 対 T3
+5.3〜5.4ms）が生じていた。`bucket(sql_surface)` は約 1ms 過大、
+`bucket(wire)` は「逆転・未確定（n/a）」のままだった。原因の機構は未確定
+（推定: fixture 投入後の main スレッド固有状態）だが、T2 を
+`std::thread::scope` の新規スレッドで計測すると逆転が解消することを観測事実
+として確認したため、本 Issue でハーネス側を是正した（`crates/wire-server/
+benches/hybrid_wire_profile_bench.rs`。production コード無変更）。
+
+#### 計測条件
+
+- before: `773a835`（`origin/main`）／after: `1900069`（Issue #634 実装コミット）
+- 環境: `QEMU Virtual CPU version 2.5+`・12 vCPU・`isa=Avx2Fma`・
+  `loadavg` 約 1.2〜3.2（`BENCH_DEDICATED_ENV` 未設定・共有環境の参考値）
+- `BENCH_HYBRID_WIRE_ROUNDS=5`・交互 N=5 ペア（before → after を 1 ペア）
+
+#### per-run 生データ（min-of-5／median-of-5。単位 ms）
+
+| pair | arm | loadavg(1min) | T1p min/median | T2 min/median | T3 min/median | reference_band(T1p) | bucket(wire) |
+| ---: | --- | ---: | --- | --- | --- | ---: | --- |
+| 1 | before | 3.24 | 1.445/1.466 | 5.672/5.730 | 5.314/5.380 | 1.99% | n/a（逆転） |
+| 1 | after | 2.82 | 1.460/1.479 | 5.057/5.218 | 5.202/5.256 | 4.20% | diff=145µs ratio=2.79% (within_noise_band) |
+| 2 | before | 2.46 | 1.482/1.501 | 5.737/5.754 | 5.221/5.258 | 1.82% | n/a（逆転） |
+| 2 | after | 2.15 | 1.451/1.483 | 4.777/5.268 | 5.248/5.334 | 3.50% | diff=471µs ratio=8.97% (above_noise_band) |
+| 3 | before | 1.98 | 1.487/1.541 | 5.636/5.714 | 5.369/5.375 | 6.81% | n/a（逆転） |
+| 3 | after | 1.75 | 1.464/1.499 | 5.104/5.271 | 5.491/5.591 | 3.74% | diff=387µs ratio=7.05% (above_noise_band) |
+| 4 | before | 1.55 | 1.484/1.500 | 5.667/6.026 | 5.257/5.310 | 1.33% | n/a（逆転） |
+| 4 | after | 1.51 | 1.466/1.473 | 4.697/4.745 | 5.274/5.481 | 0.79% | diff=577µs ratio=10.94% (above_noise_band) |
+| 5 | before | 1.35 | 1.488/1.513 | 5.693/5.724 | 5.365/5.418 | 2.20% | n/a（逆転） |
+| 5 | after | 1.22 | 1.465/1.484 | 5.207/5.256 | 5.335/5.367 | 2.16% | diff=128µs ratio=2.40% (within_noise_band) |
+
+before は 5/5 ペアすべてで `bucket(wire)` が「逆転・未確定（n/a）」——Issue
+起票時の観測（main スレッド計測で構造的に逆転する）を本環境で再現した。after
+は 5/5 ペアすべてで `bucket(wire)` が正の値（128〜577µs・2.40〜10.94%）として
+算出され、受け入れ条件 2（`bucket(wire)` が正の値として算出される）を満たす。
+
+#### 帰属表（across 5 pairs の平均。参考値）
+
+| 区分 | before diff(平均) | after diff(平均) | 判定 |
+| --- | --- | --- | --- |
+| engine_hybrid(T1p) | 約 1.48ms | 約 1.47ms | 目安 engine≈1.45ms に整合 |
+| sql_surface(T2−T1p) | 約 4.20ms | 約 3.51ms | 目安 SQL 表層≈3.3ms に近い水準まで縮小 |
+| wire(T3−T2) | n/a（5/5 逆転） | 約 341µs | 目安 wire≈0.6ms より小さいが、5/5 で正値化 |
+
+目安（engine ≈1.45／SQL 表層 ≈3.3／wire ≈0.6ms）と完全には一致しないが、
+チューニングは行わず実測値をそのまま記録する。sql_surface が before→after で
+縮小するのは、T2 を新規スレッドで計測することで main スレッド固有の逆転要因
+（未確定）が除かれ、T2 自体の実測値が下がったため（T1p・T3 はほぼ不変）。
+
+#### 原因の位置づけ
+
+観測事実（main スレッド計測での逆転・新規スレッド計測での解消・wire 不変）の
+みを根拠とし、機構（fixture 投入後の main スレッド固有状態）は未検証の仮説
+として区別する。
+
+#### 申し送り
+
+- 旧値（sql_surface 67〜68%／67.1%）を引用する `docs/design/crossdb-bench.md`
+  L598・`docs/design/hybrid-rrf-phase6-before-after.md` L370 と、本節の既存
+  表・「Phase 6（Issue #548）への引き継ぎ」の文言の訂正は Issue #637 の担当
+  （本 Issue では既存表・帰属表・Phase 6 引き継ぎ本文自体は書き換えない）
+- `knn_wire_profile_bench.rs` の T2・`ingest_wire_profile_bench.rs` の S0 も
+  同じ main スレッド計測パターンであり、同種アーティファクトの有無は未検証
+- 逆転の機構（main スレッド固有状態の推定）の検証・専有環境（
+  `BENCH_DEDICATED_ENV=1`・`ROUNDS=10`）再実測はオーナー作業
+- 本ベンチ向け交互実行ドライバスクリプト（`scripts/bench_*_ab.sh` 相当）の
+  新設は本 Issue のスコープ外
+
 ### Phase 6（Issue #548）への引き継ぎ
 
 - 上位候補は (1) SQL 表層固定コスト（`sql/exec.rs` の可視行走査・
