@@ -1,0 +1,60 @@
+    Finished `bench` profile [optimized] target(s) in 0.04s
+     Running benches/scan_stage_profile_bench.rs (target/release/deps/scan_stage_profile_bench-53a25b3a00c6c991)
+env: os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma loadavg=4.10 3.03 2.53 4/466 2211519
+scan_stage_profile_bench: rows=25000 dim=128 rounds=5 scale=1 selectivity=1/3 (tenant_a=23000 public, tenant_b=2000 private)
+--- per-round raw medians (ms) ---
+round[0]: A1=1.011 A2=1.147 A3=1.329 A4=1.440 A5=1.454 W1=0.321 W2=0.403 W3=0.505 W4=0.135 R_dot=0.214
+round[1]: A1=0.983 A2=1.036 A3=1.216 A4=1.391 A5=1.455 W1=0.324 W2=0.401 W3=0.501 W4=0.141 R_dot=0.222
+round[2]: A1=0.981 A2=1.037 A3=1.213 A4=1.380 A5=1.450 W1=0.320 W2=0.400 W3=0.503 W4=0.142 R_dot=0.228
+round[3]: A1=1.010 A2=1.146 A3=1.328 A4=1.464 A5=1.515 W1=0.323 W2=0.407 W3=0.559 W4=0.161 R_dot=0.235
+round[4]: A1=1.005 A2=1.033 A3=1.231 A4=1.396 A5=1.478 W1=0.328 W2=0.407 W3=0.507 W4=0.141 R_dot=0.231
+--- A series (median-of-R / min-of-R, ns/row over total physical rows) ---
+stage(A1_redb_scan): rows=25000 median=1.005ms ns_per_row=40.2 (min-of-R=0.981ms)
+stage(A2_header_decode): rows=25000 median=1.037ms ns_per_row=41.5 (min-of-R=1.033ms)
+diff(A1->A2): ns_per_row=1.3
+bucket(A1->A2): ns_per_row=1.3 ratio=3.16% band=within_noise_band
+stage(A3_rls_visible): rows=25000 median=1.231ms ns_per_row=49.2 (min-of-R=1.213ms)
+diff(A2->A3): ns_per_row=7.7
+bucket(A2->A3): ns_per_row=7.7 ratio=18.68% band=above_noise_band
+stage(A4_dim_meta_decode): rows=25000 median=1.396ms ns_per_row=55.8 (min-of-R=1.380ms)
+diff(A3->A4): ns_per_row=6.6
+bucket(A3->A4): ns_per_row=6.6 ratio=13.43% band=above_noise_band
+stage(A5_scalar_validate): rows=25000 median=1.455ms ns_per_row=58.2 (min-of-R=1.450ms)
+diff(A4->A5): ns_per_row=2.4
+bucket(A4->A5): ns_per_row=2.4 ratio=4.25% band=within_noise_band
+e2e(agg_count/A0a, ctx=tenant-a): median=0.050ms
+e2e(rls_isolation/A0b, ctx=tenant-b): median=0.050ms
+e2e(agg_count/A0c-cold, ctx=tenant-a, includes Storage::open): median=6.896ms (sample minimum, N=20: 6.783ms)
+--- W series (median-of-R / min-of-R, ns/row over visible (tenant-a Public) rows) ---
+stage(W1_scalar_scan): rows=23000 median=0.323ms ns_per_row=14.0 (min-of-R=0.320ms)
+stage(W2_predicate): rows=23000 median=0.403ms ns_per_row=17.5 (min-of-R=0.400ms)
+diff(W1->W2): ns_per_row=3.5
+bucket(W1->W2): ns_per_row=3.5 ratio=24.73% band=above_noise_band
+stage(W3_arena_copy): rows=23000 median=0.505ms ns_per_row=22.0 (min-of-R=0.501ms)
+diff(W2->W3): ns_per_row=4.5
+bucket(W2->W3): ns_per_row=4.5 ratio=25.40% band=above_noise_band
+W4_provider_search: matched_rows=7667 median=0.141ms (min-of-R=0.135ms)
+R_dot_kernel_distance_only (reference band): median=0.228ms min-of-R=0.214ms reference_band=10.17%
+e2e(vector_knn_where/W0-cold): median=15.670ms
+e2e(vector_knn_where/W0-hot): median=1.087ms (min-of-R=1.045ms)
+e2e(vector_knn/W0-nowhere, cache fast path): median=0.600ms
+diff(W0-nowhere->W0-hot, raw diff; conflates WHERE overhead with reduced dense candidate set size, see docs): 0.487ms
+selectivity=1/3 expected_visible_hits=7667 (33.33%)
+scalar_index(index,k=10): index_scans=+39 plain_scan_fallbacks=+0 builds=+1 arena_cache_hits=+39
+scalar_index(plain,k=10): index_scans=+0 plain_scan_fallbacks=+0 builds=+0 arena_cache_hits=+0
+e2e(index,k=10): median=1.087ms (min-of-R=1.045ms)
+e2e(plain,k=10): median=2.085ms (min-of-R=2.052ms)
+arm_ratio(index->plain,k=10): ratio=91.73% (conflates ScalarIndex candidate reduction with plain-arm-only vec_norm cost; not an isolated index-effect measurement, see comment above)
+--- index/plain/I-series per-round raw medians (ms) ---
+round[0]: index=1.094 plain=2.057 I1=0.002 I2a=0.141 I2b=0.591 I3=0.151
+round[1]: index=1.045 plain=2.052 I1=0.002 I2a=0.141 I2b=0.605 I3=0.133
+round[2]: index=1.050 plain=2.103 I1=0.002 I2a=0.141 I2b=0.604 I3=0.138
+round[3]: index=1.087 plain=2.085 I1=0.002 I2a=0.140 I2b=0.639 I3=0.225
+round[4]: index=1.093 plain=2.174 I1=0.002 I2a=0.146 I2b=0.620 I3=0.148
+--- index path buckets (I series; us and % of e2e index arm; median-of-R) ---
+bucket_share(I1_index_candidate_resolve): us=1.9 pct_of_e2e=0.18% (min-of-R=1.9us)
+bucket_share(I2a_candidate_predicate): us=141.1 pct_of_e2e=12.98% (min-of-R=140.4us)
+bucket_share(I2b_candidate_arena_copy): us=605.1 pct_of_e2e=55.65% (min-of-R=591.3us)
+bucket_share(I3_provider_search): us=148.3 pct_of_e2e=13.63% (min-of-R=133.2us)
+bucket_share(sql_surface_fixed_cost_residual): us=332.1 pct_of_e2e=30.54%
+scan_stage_profile_bench: consistency checks passed (A3 visible row count == tenant_a_rows for both ctx_a/ctx_b every round, W2 match count == expected, W0-cold/W0-hot result ids within lang='ja' visible set, COUNT(*) == tenant_a_rows for both contexts, index arm and plain arm returned identical id sets, ScalarIndex candidate resolution confirmed non-vacuous via scalar_index_cache_stats() deltas)

@@ -165,6 +165,9 @@ build_from_cached_rls_rows_subset_with_all_slots_matches_full_scan`）。非昇�
 `vector_knn_where`／`point_where`（参照区間: 変更を含まない `vector_knn`／
 `rls_isolation`）・`scripts/crossdb_bench` 実測はオーナー作業として申し送る。
 
+現行索引経路（本 doc）を選択率 33%（crossdb fixture 相当）で段別に内訳計測した
+結果は `docs/design/filtered-distance-stage-profile.md`（Issue #653）を参照。
+
 ## 後続 Issue #654
 
 候補削減が実際に消費された `VectorArena` の構築（`build_from_cached_rls_rows_subset`）

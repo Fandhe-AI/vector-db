@@ -224,3 +224,4 @@ e2e: `W0-cold`=86.993ms・`W0-hot`=4.972ms・`W0-nowhere`=3.041ms。raw diff（`
 - `feature_bench` の 13 フェーズ自体への段別計測点の埋め込みは行わない（`feature_bench` は 13 フェーズ横断の e2e 基線として不変に保つ）。
 - `where_compound_count`・`group_by_having` の段別分解は本 Issue 対象外（#471 側で必要なら別途）。
 - Issue #635: `#[inline(never)]` 分離の摂動テストは本開発環境（共有 QEMU）での 1 回の N=5 ペア実測に基づく。専有環境での再検証・より長期的な配置感度の安定性確認はオーナー作業として申し送り。W 系列の絶対値変化（本節初版比）は Issue #635 のスコープ外だが、実測値の記録として本 doc の「実測結果」節へ反映済み。
+- Issue #653: 選択率 opt-in（`BENCH_SCAN_PROFILE_SELECTIVITY`）・現行索引経路（Issue #474）の index/plain 2 アーム計測・索引経路の I1〜I3 内訳は本 doc ではなく `docs/design/filtered-distance-stage-profile.md` へ分離して記録した（本 doc の W 系列は索引導入前・選択率 20% 固定のまま不変）。
