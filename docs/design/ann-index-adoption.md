@@ -308,7 +308,9 @@ RLS 事前フィルタとの切替（4 列目）については、「事後フ�
 ## 判断確定後のスコープ外（申し送り）
 
 - HNSW 索引の永続化（「実装ガイド」の対応表「永続化」行参照）
-- テーブル単位カタログ属性による opt-in・`wire-server` CLI オプション露出
+- `wire-server` CLI オプション露出は Issue #656 で実装済み
+  （`--search-engine`。詳細は `docs/design/hnsw-search-engine-wiring.md`
+  参照）。テーブル単位カタログ属性による opt-in は引き続き対象外
 - pure Rust ANN クレート（`hnsw_rs`・`instant-distance` 等）の個別評価は Issue #406 追記で実測・撤去済み（2026-09-05。詳細は `docs/design/hnsw-parallel-build.md` 参照）。production 採用可否の評価は依然未実施
 - README「実装方針（要点）」の opt-in 手順・公開境界拡張（#413 が担当。実施済み。README「ANN（HNSW）opt-in 手順と前後比較（Issue #413）」節参照）
 - CLAUDE.md の `- ステータス:` 行が 2 本重複し内容が一部乖離している件の
