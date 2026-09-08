@@ -7,7 +7,10 @@
 //! CLI: `wire-server --users <path> --db <path> [--bind <addr:port>]
 //! [--planner-endpoint <host:port> --planner-model <name>]
 //! [--embedder-hashing-dim <N>]
-//! [--search-engine default|hnsw|hnsw_f16|hnsw_i8]`
+//! [--search-engine default|hnsw|hnsw_f16|hnsw_i8]
+//! [--hnsw-full-scan-ratio <num>/<den>]
+//! [--hnsw-acorn-max-visible-ratio <num>/<den>]
+//! [--hnsw-sparse-visited-max <N>]`
 //! （既定 bind: `127.0.0.1:5432`）。`--db` は必須（省略時は fail-closed で
 //! 非 0 終了。匿名・揮発 DB の暗黙生成はしない。TASK-73・WIRE-1）。
 //!
@@ -16,13 +19,27 @@
 //! （既定＝ブルートフォース）をそのまま呼び、`hnsw`／`hnsw_f16`／`hnsw_i8` は
 //! `EngineCore::open_with_engine`（Issue #402〜#413・#513・#520 系の HNSW opt-in
 //! 経路。索引ノード常駐精度は f32／f16／I8）へ分岐する。値の解決は
-//! `search_engine_opt::parse`／`to_engine_kind` に一本化し（untrusted な CLI
-//! 文字列から `engine::search_engine::SearchEngineKind` へ到達する唯一の入口）、
-//! 不正な値・値欠落・2 回目以降の重複指定はいずれも fail-closed で起動エラー
-//! （既定へ黙って読み替えない）。探索パラメータ（`m`／`ef_*`／
-//! `full_scan_ratio`／`sparse_visited_max`／ACORN）の CLI 露出は対象外
-//! （Issue #656 のスコープ外事項。既定値のまま）。選択結果は `EXPLAIN` の
+//! `search_engine_opt::parse`／`to_engine_kind_with` に一本化し（untrusted な
+//! CLI 文字列から `engine::search_engine::SearchEngineKind` へ到達する唯一の
+//! 入口）、不正な値・値欠落・2 回目以降の重複指定はいずれも fail-closed で
+//! 起動エラー（既定へ黙って読み替えない）。選択結果は `EXPLAIN` の
 //! `engine:`／`hnsw_params:` 行（Issue #411）で確認できる。
+//!
+//! `--hnsw-full-scan-ratio`／`--hnsw-acorn-max-visible-ratio`／
+//! `--hnsw-sparse-visited-max`（Issue #657。親 Issue #656「対象外」節で
+//! 持ち越された探索パラメータの opt-in 露出）: `--search-engine` が `hnsw`／
+//! `hnsw_f16`／`hnsw_i8` のいずれかのときのみ指定できる（`default`／未指定と
+//! 同時指定・値欠落・形状不正（`<num>/<den>` 以外・非負整数以外）・意味不正
+//! （分母 0・`num > den`・`acorn_max_visible_ratio < full_scan_ratio`）・
+//! 重複指定はいずれも fail-closed で起動エラー。パースは
+//! `search_engine_opt::parse_ratio`／`parse_sparse_visited_max`、意味検証は
+//! `ValidatedHnswParams::with_full_scan_ratio`／`with_acorn_max_visible_ratio`
+//! に一本化する）。既定値（`full_scan_ratio`=1/10・`acorn_max_visible_ratio`=
+//! none・`sparse_visited_max`=0）は未指定時のまま不変（R2）。`m`／`ef_*` の CLI
+//! 露出は引き続き対象外。`full_scan_ratio`／`acorn_max_visible_ratio` は
+//! テナント存在情報に繋がるため `EXPLAIN` の `hnsw_params:` 行へは出さない
+//! （Issue #411 の方針を維持。`sparse_visited_max=` は Issue #497 で既に
+//! 露出済み）。
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
 //! ログ・引数に残さない）。
@@ -100,6 +117,9 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut planner_model: Option<String> = None;
     let mut embedder_hashing_dim: Option<String> = None;
     let mut search_engine_raw: Option<String> = None;
+    let mut full_scan_ratio_raw: Option<String> = None;
+    let mut acorn_max_visible_ratio_raw: Option<String> = None;
+    let mut sparse_visited_max_raw: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -171,6 +191,63 @@ fn run_server(args: &[String]) -> ExitCode {
                 search_engine_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::search_engine_opt::FULL_SCAN_RATIO_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires a <num>/<den> argument",
+                        wire_server::search_engine_opt::FULL_SCAN_RATIO_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #657 D2: `--search-engine` の重複指定拒否（D6 注釈参照）
+                // と同じ理由で、起動後に変更できない構成値の 2 回目以降の
+                // 指定を fail-closed に拒否する（last-wins にしない）。
+                if full_scan_ratio_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::search_engine_opt::FULL_SCAN_RATIO_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                full_scan_ratio_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::search_engine_opt::ACORN_MAX_VISIBLE_RATIO_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires a <num>/<den> argument",
+                        wire_server::search_engine_opt::ACORN_MAX_VISIBLE_RATIO_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if acorn_max_visible_ratio_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::search_engine_opt::ACORN_MAX_VISIBLE_RATIO_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                acorn_max_visible_ratio_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::search_engine_opt::SPARSE_VISITED_MAX_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::search_engine_opt::SPARSE_VISITED_MAX_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if sparse_visited_max_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::search_engine_opt::SPARSE_VISITED_MAX_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                sparse_visited_max_raw = Some(v.clone());
+                i += 2;
+            }
             other => {
                 eprintln!("wire-server: unknown argument: {other}");
                 return ExitCode::FAILURE;
@@ -217,13 +294,19 @@ fn run_server(args: &[String]) -> ExitCode {
     // `ValidatedHnswParams` 検証失敗はいずれもここで起動エラーとして確定させる
     // （fail-closed。bind・ユーザーストア読込より前に決着させることで、受理
     // 不能な構成のまま listen へ進む経路を作らない）。
-    let search_engine_kind = match resolve_search_engine(search_engine_raw.as_deref()) {
-        Ok(kind) => kind,
-        Err(e) => {
-            eprintln!("wire-server: invalid --search-engine: {e}");
-            return ExitCode::FAILURE;
-        }
+    let hnsw_tuning_raw = RawHnswTuning {
+        full_scan_ratio: full_scan_ratio_raw.as_deref(),
+        acorn_max_visible_ratio: acorn_max_visible_ratio_raw.as_deref(),
+        sparse_visited_max: sparse_visited_max_raw.as_deref(),
     };
+    let search_engine_kind =
+        match resolve_search_engine(search_engine_raw.as_deref(), &hnsw_tuning_raw) {
+            Ok(kind) => kind,
+            Err(e) => {
+                eprintln!("wire-server: invalid search engine configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     let Some(users_path) = users_path else {
         eprintln!("wire-server: --users <path> is required (fail-closed: no anonymous login)");
@@ -381,23 +464,74 @@ fn build_hashing_embedder(raw_dim: &str) -> Result<Box<dyn engine::embedding::Em
     Ok(Box::new(embedder))
 }
 
-/// `--search-engine` の値（未指定は `None`）から `EngineCore::open_with_engine`
-/// へ渡す `SearchEngineKind` を解決する（Issue #656）。純関数として切り出し、
+/// `--hnsw-full-scan-ratio`／`--hnsw-acorn-max-visible-ratio`／
+/// `--hnsw-sparse-visited-max` の 3 フラグの未パース値（Issue #657）。
+/// `resolve_search_engine` へ渡す前段の入れ物で、`std::env::args()` を直接
+/// 読まずに単体テストできるようにする（`RawHnswTuning` を経由することで
+/// 値をパースする責務を `resolve_search_engine` 側へ寄せ、`run_server` の
+/// 引数走査ループには形状検証を持たせない）。
+struct RawHnswTuning<'a> {
+    full_scan_ratio: Option<&'a str>,
+    acorn_max_visible_ratio: Option<&'a str>,
+    sparse_visited_max: Option<&'a str>,
+}
+
+/// `--search-engine` の値（未指定は `None`）と `--hnsw-*` 探索パラメータの
+/// 未パース値（Issue #657）から `EngineCore::open_with_engine` へ渡す
+/// `SearchEngineKind` を解決する（Issue #656・#657）。純関数として切り出し、
 /// `std::env::args()` を直接読まずに単体テストできるようにする（`--planner-*`
 /// 系の `build_query_planner`／`build_hashing_embedder` と同じ流儀）。
 ///
-/// `raw` が `None`（`--search-engine` 未指定）の場合は `Ok(None)` を返し、
-/// `run_server` は既存の `EngineCore::open` 経路をそのまま通す。値が
-/// [`wire_server::search_engine_opt::TOKENS`] のいずれとも厳密一致しない場合は
-/// `Err` で fail-closed（既定へ黙って読み替えない）。
+/// `raw` が `None`（`--search-engine` 未指定）かつ `tuning_raw` が全 `None`
+/// の場合は `Ok(None)` を返し、`run_server` は既存の `EngineCore::open` 経路を
+/// そのまま通す。`raw` が [`wire_server::search_engine_opt::TOKENS`] のいずれ
+/// とも厳密一致しない場合・`tuning_raw` の各値が形状不正（`<num>/<den>`
+/// 以外・非負整数以外）の場合・`raw` が `None`／`default` なのに `tuning_raw`
+/// が非空の場合・意味検証（`ValidatedHnswParams::with_full_scan_ratio`／
+/// `with_acorn_max_visible_ratio`）が失敗する場合はいずれも `Err` で
+/// fail-closed（既定へ黙って読み替えない）。
 fn resolve_search_engine(
     raw: Option<&str>,
+    tuning_raw: &RawHnswTuning<'_>,
 ) -> Result<Option<engine::search_engine::SearchEngineKind>, String> {
-    let Some(raw) = raw else {
-        return Ok(None);
+    let choice = match raw {
+        None => wire_server::search_engine_opt::SearchEngineChoice::Default,
+        Some(raw) => wire_server::search_engine_opt::parse(raw)?,
     };
-    let choice = wire_server::search_engine_opt::parse(raw)?;
-    choice.to_engine_kind()
+
+    let mut tuning = wire_server::search_engine_opt::HnswTuning::default();
+    if let Some(raw) = tuning_raw.full_scan_ratio {
+        tuning.full_scan_ratio = Some(wire_server::search_engine_opt::parse_ratio(raw).map_err(
+            |e| {
+                format!(
+                    "{}: {e}",
+                    wire_server::search_engine_opt::FULL_SCAN_RATIO_FLAG
+                )
+            },
+        )?);
+    }
+    if let Some(raw) = tuning_raw.acorn_max_visible_ratio {
+        tuning.acorn_max_visible_ratio = Some(
+            wire_server::search_engine_opt::parse_ratio(raw).map_err(|e| {
+                format!(
+                    "{}: {e}",
+                    wire_server::search_engine_opt::ACORN_MAX_VISIBLE_RATIO_FLAG
+                )
+            })?,
+        );
+    }
+    if let Some(raw) = tuning_raw.sparse_visited_max {
+        tuning.sparse_visited_max = Some(
+            wire_server::search_engine_opt::parse_sparse_visited_max(raw).map_err(|e| {
+                format!(
+                    "{}: {e}",
+                    wire_server::search_engine_opt::SPARSE_VISITED_MAX_FLAG
+                )
+            })?,
+        );
+    }
+
+    choice.to_engine_kind_with(tuning)
 }
 
 /// `hash-password` サブコマンド: stdin からパスワードを 1 行読み、新規 salt を
@@ -534,27 +668,36 @@ mod tests {
         expect_err(build_hashing_embedder(&u32::MAX.to_string()));
     }
 
-    // Issue #656: `--search-engine` の解決結果パーステスト。wire 経由の実行
-    // 契約（`EXPLAIN` 一致・RLS 非漏えい）は
+    // Issue #656・#657: `--search-engine`／`--hnsw-*` の解決結果パーステスト。
+    // wire 経由の実行契約（`EXPLAIN` 一致・RLS 非漏えい）は
     // `tests/wire_search_engine_opt.rs`（in-process）・
     // `tests/wire_search_engine_cli.rs`（子プロセス）が担う。
+
+    const EMPTY_TUNING: RawHnswTuning<'static> = RawHnswTuning {
+        full_scan_ratio: None,
+        acorn_max_visible_ratio: None,
+        sparse_visited_max: None,
+    };
 
     #[test]
     fn resolve_search_engine_none_is_default_engine_core_open_path() {
         // R2: 未指定は `EngineCore::open` をそのまま通す契約の入口
         // （`run_server` 側の分岐は `None` を既存経路として扱う）。
-        assert_eq!(resolve_search_engine(None), Ok(None));
+        assert_eq!(resolve_search_engine(None, &EMPTY_TUNING), Ok(None));
     }
 
     #[test]
     fn resolve_search_engine_default_token_is_also_none() {
-        assert_eq!(resolve_search_engine(Some("default")), Ok(None));
+        assert_eq!(
+            resolve_search_engine(Some("default"), &EMPTY_TUNING),
+            Ok(None)
+        );
     }
 
     #[test]
     fn resolve_search_engine_accepts_hnsw_variants() {
         for tok in ["hnsw", "hnsw_f16", "hnsw_i8"] {
-            let kind = resolve_search_engine(Some(tok))
+            let kind = resolve_search_engine(Some(tok), &EMPTY_TUNING)
                 .unwrap_or_else(|e| panic!("expected {tok:?} to resolve, got error: {e}"));
             assert!(kind.is_some(), "expected Some(kind) for {tok:?}");
         }
@@ -563,13 +706,106 @@ mod tests {
     #[test]
     fn resolve_search_engine_rejects_unknown_value_fail_closed() {
         // R3: 不正な値は既定へ読み替えず起動エラーにする。
-        let err = expect_err(resolve_search_engine(Some("bogus")));
+        let err = expect_err(resolve_search_engine(Some("bogus"), &EMPTY_TUNING));
         assert!(err.contains("--search-engine"), "unexpected error: {err}");
     }
 
     #[test]
     fn resolve_search_engine_rejects_case_variant() {
         // 厳密一致のみ受理（`search_engine_opt::parse` の契約）。
-        expect_err(resolve_search_engine(Some("HNSW")));
+        expect_err(resolve_search_engine(Some("HNSW"), &EMPTY_TUNING));
+    }
+
+    // Issue #657: `--hnsw-*` 探索パラメータ opt-in の `resolve_search_engine`
+    // 結線テスト。フラグ単位のパース・意味検証自体は
+    // `search_engine_opt::tests` が担うため、ここでは「未パース raw 文字列 →
+    // `SearchEngineKind`」の配線と D1（`Default` との組合せ拒否）を確認する。
+
+    #[test]
+    fn resolve_search_engine_accepts_hnsw_with_valid_tuning() {
+        let tuning = RawHnswTuning {
+            full_scan_ratio: Some("1/4"),
+            acorn_max_visible_ratio: Some("1/2"),
+            sparse_visited_max: Some("8"),
+        };
+        let kind = resolve_search_engine(Some("hnsw"), &tuning)
+            .expect("valid tuning must resolve")
+            .expect("Some for hnsw");
+        let engine::search_engine::SearchEngineKind::Hnsw(params) = kind else {
+            panic!("expected Hnsw kind");
+        };
+        assert_eq!(
+            params.full_scan_ratio(),
+            engine::hnsw::Ratio {
+                numerator: 1,
+                denominator: 4
+            }
+        );
+        assert_eq!(
+            params.acorn_max_visible_ratio(),
+            Some(engine::hnsw::Ratio {
+                numerator: 1,
+                denominator: 2
+            })
+        );
+        assert_eq!(params.sparse_visited_max(), 8);
+    }
+
+    #[test]
+    fn resolve_search_engine_rejects_tuning_without_opt_in_engine() {
+        // D1: `--search-engine` 未指定のまま `--hnsw-*` を指定する構成は
+        // fail-closed で拒否する（黙って無視しない）。
+        let tuning = RawHnswTuning {
+            full_scan_ratio: Some("1/4"),
+            acorn_max_visible_ratio: None,
+            sparse_visited_max: None,
+        };
+        let err = expect_err(resolve_search_engine(None, &tuning));
+        assert!(err.contains("--search-engine"), "unexpected error: {err}");
+
+        let err = expect_err(resolve_search_engine(Some("default"), &tuning));
+        assert!(err.contains("--search-engine"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_search_engine_rejects_malformed_ratio_with_flag_name() {
+        let tuning = RawHnswTuning {
+            full_scan_ratio: Some("not-a-ratio"),
+            acorn_max_visible_ratio: None,
+            sparse_visited_max: None,
+        };
+        let err = expect_err(resolve_search_engine(Some("hnsw"), &tuning));
+        assert!(
+            err.contains(wire_server::search_engine_opt::FULL_SCAN_RATIO_FLAG),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_search_engine_rejects_semantically_invalid_ratio_with_flag_name() {
+        let tuning = RawHnswTuning {
+            full_scan_ratio: Some("1/0"),
+            acorn_max_visible_ratio: None,
+            sparse_visited_max: None,
+        };
+        let err = expect_err(resolve_search_engine(Some("hnsw"), &tuning));
+        assert!(
+            err.contains(wire_server::search_engine_opt::FULL_SCAN_RATIO_FLAG),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_search_engine_rejects_malformed_sparse_visited_max_with_flag_name() {
+        let tuning = RawHnswTuning {
+            full_scan_ratio: None,
+            acorn_max_visible_ratio: None,
+            sparse_visited_max: Some("not-a-number"),
+        };
+        let err = expect_err(resolve_search_engine(Some("hnsw_i8"), &tuning));
+        assert!(
+            err.contains(wire_server::search_engine_opt::SPARSE_VISITED_MAX_FLAG),
+            "unexpected error: {err}"
+        );
     }
 }
