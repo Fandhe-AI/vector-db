@@ -440,6 +440,15 @@ GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README
 
 `make bench-scan-stage-profile`（`crates/engine/benches/scan_stage_profile_bench.rs`）は、`docs/design/crossdb-bench.md` で self が最劣後する `agg_count`／`rls_isolation`／`vector_knn_where` の redb 全行走査・ヘッダデコード・RLS 判定（`PolicyContext::is_visible`＋TABLE-12 キー/ヘッダ整合検査）・dim/metadata デコード・`WHERE` 述語評価・arena 複製の段別内訳を切り分けます。`BENCH_SCAN_PROFILE_ROUNDS`（既定 5・5〜50）でラウンド数、`BENCH_SCAN_PROFILE_SCALE`（既定 1＝25,000 行・4＝100,000 行。1 プロセス = 1 規模点）で規模、`BENCH_SCAN_PROFILE_SELECTIVITY`（既定 `1/5`。`1/<N>`・`N` は 2〜100）で `lang = 'ja'` の選択率、`BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定できます。spec 由来の閾値なし・情報提供専用・手動実行・CI 非配線（`GITHUB_ACTIONS` 環境下では起動直後に拒否します）。判定ロジック自体（rounds/scale/selectivity パース・段間差分・ノイズ帯判定・整合性検証）は `crates/engine/tests/scan_stage_profile_accept.rs` で `make ci` から回帰検証します。実測結果・計測設計・後続 Issue（#477・#471）への帰属分析の詳細は `docs/design/scan-stage-profile.md` を参照してください。`BENCH_SCAN_PROFILE_SELECTIVITY=1/3`（crossdb fixture 相当の選択率 33%）指定時の現行索引経路（Issue #474）内訳・非 vacuous 確認・実測結果は `docs/design/filtered-distance-stage-profile.md`（Issue #653）を参照してください。
 
+### 候補 id マスク経路の前後比較（Issue #655）
+
+Issue #654（PR #664）は SCALAR 事前フィルタ付き DISTANCE の候補行探索を「新規 `VectorArena` へ複製してから探索する」経路から「候補 id マスクを `SearchProvider::search_subset` へ直接渡す（複製なし）」経路へ置き換えました。この前後比較は 2 トラックで行います。
+
+- **段別プロファイル（Track A）**: `make bench-filtered-distance-ab BEFORE_DIR=<path> AFTER_DIR=<path> BEFORE_COMMIT=8225baa AFTER_COMMIT=db9bd94`（`git archive <commit> | tar -x -C <dir>` で用意した独立ソースツリーを指定。after 側は選択率 opt-in・I 系列・`index_mask_scans_delta` を持つ #663 merge `db9bd94` を指定する。`2488128`（#654 適用直後）は #663 未適用のため after-only 段〔I1〜I3・`index_mask_scans_delta`〕が構造的に出力できない）。`scan_stage_profile_bench`（Issue #464・#653）を before（#654 未適用）/after（適用後）2 コミットで交互 N≥5 ペア実行し、`e2e(vector_knn_where/W0-hot|W0-cold)` の改善幅と参照区間（`e2e(vector_knn/W0-nowhere)`・`R_dot_kernel_distance_only`・`agg_count`・`rls_isolation`）の非退行を確認します。`AB_AFTER_ONLY_SELECTIVITY=1/3`（既定）で crossdb fixture 相当の選択率 33% での after 側単独計測（I1〜I3 内訳・`index_mask_scans_delta`）も併せて行います（before バイナリは選択率 opt-in・I2b/I3 出力を持たないため 1/3 でのペア比較は構造的に不能）。ログは `docs/design/bench-data/filtered-distance-mask-ab/` 配下、`scripts/bench_filtered_distance_ab.sh --summarize <dir> [session_ts]` で TSV 集約します。
+- **crossdb（Track B）**: `make bench-scalar-index-crossdb-ab BEFORE_COMMIT=8225baa AFTER_COMMIT=2488128 REF_COMMIT="" CROSSDB_DIR=<dir> CROSSDB_PYTHON=<python>`（`vector_knn_where`・`bulk_knn_where_k200` を含む crossdb self 5 フェーズと参照区間 `vector_knn`・`agg_count`・`mode_recall` を計測。手順・env は既存の「他 DB との機能別横断ベンチ」節を参照）。
+
+実測結果・Qdrant との差の縮小幅は `docs/design/scalar-index-mask-search.md`「前後比較実測（Issue #655）」節を参照してください。
+
 ### チップ別カーネルの実測手順（Issue #469）
 
 `make bench-chip`（`crates/engine/benches/chip_bench.rs`）は、`bench-dot-kernel`・`bench-knn-profile`・`feature_bench`（`BENCH_FEATURE_DIM=128`／`768`）の 4 ワークロードを 1 ワークロード = 1 子プロセスとしてラウンドロビン交互計測し、CPU 情報・実行時検出 ISA・per-run 生データ・min/median・参照区間帯を `summary.json` へ出力します。

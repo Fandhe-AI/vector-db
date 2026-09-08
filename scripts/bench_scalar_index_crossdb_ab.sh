@@ -23,6 +23,9 @@
 #     BEFORE_COMMIT=773a835 AFTER_COMMIT=6ff22dc REF_COMMIT=ee99db3
 #   - Issue #645（閾値 128→64 見直し後の効果確認）:
 #     BEFORE_COMMIT=cbe80cf AFTER_COMMIT=2f1cd80 REF_COMMIT=ee99db3
+#   - Issue #655（候補 id マスク経路〔Issue #654〕の前後比較。REF_COMMIT は
+#     時間短縮のため空文字で無効化した）:
+#     BEFORE_COMMIT=8225baa AFTER_COMMIT=2488128 REF_COMMIT=""
 #
 # 3 arm（before/after/ref）比較時の輪番は `benchmark-judgement-policy.md`
 # §3「baseline/cand1/baseline/cand2/… の輪番」に従い、1 ペアあたり

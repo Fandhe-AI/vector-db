@@ -1126,3 +1126,10 @@ informational 参考値。受け入れ判定はクラスタ構造ありフィク
   - `hnsw-index.md`「Issue #413」節の `point_where` 記述（`lang×topic` 複合条件と
     注記）と `feature_bench.rs` の実クエリ（`lang` 単独条件）の食い違いに
     見える所見の確認。
+
+## Issue #655: 候補 id マスク経路（#654）の前後比較
+
+`vector_knn_where`／`bulk_knn_where_k200`（本 doc が self 最劣後として記録する
+フェーズ）の #654 適用前後比較（段別プロファイル・crossdb self 双方）は
+[`scalar-index-mask-search.md`「前後比較実測（Issue #655）」節](scalar-index-mask-search.md)
+を参照（本 doc の表は再転記しない）。

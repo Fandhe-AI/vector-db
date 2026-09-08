@@ -64,13 +64,24 @@ import re
 import statistics
 import sys
 
-# crossdb self フェーズ側で前後比較の対象にする区間（Issue #633 本文の 4 フェーズ）。
-CROSSDB_PHASES = ["hybrid_rrf", "bulk_hybrid_k200", "vector_knn_where", "where_compound_count"]
+# crossdb self フェーズ側で前後比較の対象にする区間（Issue #633 本文の 4 フェーズに
+# `bulk_knn_where_k200` を追加。Issue #655: #654（候補 id マスク経路）が
+# `sql/exec.rs::execute_statement_with_cache` の SCALAR 事前フィルタ付き
+# DISTANCE 経路全般へ効くため、単発クエリ（`vector_knn_where`）だけでなく
+# バルク側（`bulk_knn_where_k200`）でも改善幅を確認する）。
+CROSSDB_PHASES = [
+    "hybrid_rrf",
+    "bulk_hybrid_k200",
+    "vector_knn_where",
+    "bulk_knn_where_k200",
+    "where_compound_count",
+]
 # 参照区間（WHERE 前に実行される・状態非依存であるはずの区間）。同一計測
 # セッション内でのこの区間の run-to-run 幅を「実測ノイズ帯」として、固定
 # ±5% 帯とあわせた 2 種判定に使う（`docs/design/benchmark-judgement-policy.md`
-# §4）。
-CROSSDB_REFERENCE_PHASES = ["vector_knn", "mode_recall"]
+# §4）。Issue #655: `agg_count`（#654 の対象外区間。VisibleBitmapCache 経由・
+# WHERE を経由しない）を非対象フェーズの非退行確認として追加する。
+CROSSDB_REFERENCE_PHASES = ["vector_knn", "mode_recall", "agg_count"]
 # 実測ノイズ帯（reference_band）の算出に使う代表区間。Issue #633
 # codex-review P1 指摘の実例（`vector_knn.p50` が run 間で約 16.48%
 # 変動）に合わせ、`vector_knn.p50` を候補ごとの実測ノイズ帯として使う
