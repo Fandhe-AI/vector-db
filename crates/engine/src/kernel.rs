@@ -136,6 +136,36 @@ pub struct SearchInput<'a> {
     pub k: usize,
 }
 
+/// [`SearchProvider::search_subset`] の入力ビュー（Issue #654）。
+///
+/// `SqlArenaCache`（Issue #363）がヒットしたクエリで `sql::scalar_index::ScalarIndex`
+/// （Issue #473・#474）が候補行を絞り込んだ場合、従来は候補行を新規 `VectorArena` へ
+/// 複製（`arena.rs::build_from_cached_rls_rows_subset`）してから [`SearchProvider::search`]
+/// へ渡していた。本型は複製せずキャッシュ済みスナップショットの行列全体
+/// （[`Self::vectors`]）を借用したまま、[`Self::slots`] が指す行だけを候補にして
+/// 探索するための入力を表す。
+///
+/// [`SearchInput`] を再利用せず専用型にしているのは、`SearchInput::ids.len() * dim ==
+/// SearchInput::vectors.len()` という既存契約を崩さないため。本型は `ids` を持たず、
+/// 返る [`CandidateHit::id`] は常に `slots[i] as u64`（呼び出し元がスロット番号として
+/// 解釈する。`sql::exec` の「provider へ渡す id はアリーナのスロット番号」という
+/// 既存契約と同型）に固定される。
+pub struct SubsetSearchInput<'a> {
+    /// `vectors` の行番号（`0..rows`）。呼び出し元契約として狭義昇順・重複なし
+    /// （`sql::scalar_index::ScalarIndex::resolve_candidates` の戻り値と同じ形状）。
+    /// provider 側はこの契約を検証しない代わりに、範囲外の行番号は
+    /// [`CpuScalarProvider::search_subset`]・既定実装のいずれも黙って skip する
+    /// （`SearchInput` の `ids`/`vectors` 不整合行と同じ縮退規約。呼び出し規約違反への
+    /// 多層防御であり、正常系のオーバーヘッドにはならない）。
+    pub slots: &'a [u32],
+    /// `rows * dim` 要素のフラット行列（可視行のみを含む。[`SearchInput::vectors`] と
+    /// 同じレイアウト）。
+    pub vectors: &'a [f32],
+    pub dim: u32,
+    pub query: &'a [f32],
+    pub k: usize,
+}
+
 /// コアが依存する検索バックエンドの窓口（CORE-13）。object-safe（ジェネリクスなし・
 /// `&self` メソッドのみ）を維持し、`Box<dyn SearchProvider>` として `core.rs` に
 /// 保持されることを前提とする。
@@ -143,6 +173,73 @@ pub trait SearchProvider: Send + Sync {
     /// `input` に含まれる行（呼び出し元があらかじめ可視行だけへ絞り込み済み）から
     /// 総当たり Top-k 検索を行う。
     fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError>;
+
+    /// `input.vectors`（行列全体）を複製せず借用したまま、`input.slots` が指す行
+    /// だけを候補にした総当たり Top-k 検索を行う（Issue #654）。
+    ///
+    /// 既定実装は `slots` の行を一時バッファへ gather してから [`Self::search`] へ
+    /// 委譲する（従来の「候補行を複製してから `search`」経路と同じ計算・同じ Top-k
+    /// 選出規約になる）。この既定実装があるため、本メソッド追加は既存のカスタム
+    /// `SearchProvider` 実装を無変更のままコンパイル・同一結果に保つ（trait への
+    /// メソッド追加という公開 API 変更の破壊的影響を打ち消す）。`vectors` の複製を
+    /// 避ける最適化そのものは [`CpuScalarProvider::search_subset`]・
+    /// `parallel_search.rs::ParallelSearchProvider::search_subset`（Issue #654）が
+    /// オーバーライドで提供する。
+    fn search_subset(
+        &self,
+        input: SubsetSearchInput<'_>,
+    ) -> Result<Vec<CandidateHit>, KernelError> {
+        let dim = input.dim as usize;
+        if input.query.len() != dim {
+            return Err(KernelError::DimMismatch {
+                expected: input.dim,
+                found: input.query.len(),
+            });
+        }
+        if input.query.iter().any(|v| !v.is_finite()) {
+            return Err(KernelError::NonFiniteQuery);
+        }
+        if input.k == 0 || input.slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        // untrusted 経路由来ではない（`slots.len()` は呼び出し元〔`sql::exec`〕が
+        // 候補削減で決める値だが、`MAX_ARENA_ROWS` で上限が掛かっている）が、
+        // 無制限確保を避けるため `try_reserve_exact` で明示的に処理する
+        // （.claude/rules/coding-rust.md「untrusted 入力の扱い」と同じ流儀を
+        // ここでも踏襲する）。
+        let gather_len = input.slots.len().saturating_mul(dim);
+        let mut gathered: Vec<f32> = Vec::new();
+        gathered
+            .try_reserve_exact(gather_len)
+            .map_err(|_| KernelError::DimMismatch {
+                expected: input.dim,
+                found: gather_len,
+            })?;
+        let mut ids: Vec<u64> = Vec::new();
+        ids.try_reserve_exact(input.slots.len())
+            .map_err(|_| KernelError::DimMismatch {
+                expected: input.dim,
+                found: input.slots.len(),
+            })?;
+        for &slot in input.slots {
+            let start = (slot as usize).saturating_mul(dim);
+            let end = start.saturating_add(dim);
+            let Some(row) = input.vectors.get(start..end) else {
+                // `SearchInput` の行単位 skip 規約（`CpuScalarProvider::search`
+                // ドキュメント参照）と同じ理由で、範囲外の行だけを候補から外す。
+                continue;
+            };
+            gathered.extend_from_slice(row);
+            ids.push(slot as u64);
+        }
+        self.search(SearchInput {
+            ids: &ids,
+            vectors: &gathered,
+            dim: input.dim,
+            query: input.query,
+            k: input.k,
+        })
+    }
 }
 
 /// 既定の CPU-only 参照実装。内積スコアでの総当たり Top-k（`O(n log k)`、`BinaryHeap`
@@ -194,6 +291,47 @@ impl SearchProvider for CpuScalarProvider {
                 continue;
             }
             selector.push(CandidateHit { id, score });
+        }
+        Ok(selector.into_sorted_vec())
+    }
+
+    /// 行列全体（`input.vectors`）を複製せず、`input.slots` が指す行だけを直接
+    /// 参照して総当たり Top-k を選出する（Issue #654）。[`SearchProvider::search`]
+    /// と同じ検証順・同じ除外規約（範囲外行・非有限スコアの skip）を踏襲するため、
+    /// 候補行を事前に複製してから `search` を呼んだ場合とビット同一の結果になる。
+    fn search_subset(
+        &self,
+        input: SubsetSearchInput<'_>,
+    ) -> Result<Vec<CandidateHit>, KernelError> {
+        let dim = input.dim as usize;
+        if input.query.len() != dim {
+            return Err(KernelError::DimMismatch {
+                expected: input.dim,
+                found: input.query.len(),
+            });
+        }
+        if input.query.iter().any(|v| !v.is_finite()) {
+            return Err(KernelError::NonFiniteQuery);
+        }
+        if input.k == 0 || input.slots.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut selector = TopKSelector::new(input.k);
+        for &slot in input.slots {
+            let start = (slot as usize).saturating_mul(dim);
+            let end = start.saturating_add(dim);
+            let Some(vector) = input.vectors.get(start..end) else {
+                continue;
+            };
+            let score = dot(vector, input.query);
+            if !score.is_finite() {
+                continue;
+            }
+            selector.push(CandidateHit {
+                id: slot as u64,
+                score,
+            });
         }
         Ok(selector.into_sorted_vec())
     }
@@ -494,5 +632,182 @@ mod tests {
     #[test]
     fn provider_is_object_safe() {
         let _boxed: Box<dyn SearchProvider> = Box::new(CpuScalarProvider);
+        // `search_subset` も trait メソッドとして同じ `dyn` 経由で呼べること
+        // （Issue #654: object-safety を壊していないことの直接検証）。
+        let ids = [10u64];
+        let vectors = [1.0f32, 0.0];
+        let query = [1.0f32, 0.0];
+        let boxed: Box<dyn SearchProvider> = Box::new(CpuScalarProvider);
+        let hits = boxed
+            .search_subset(SubsetSearchInput {
+                slots: &[0],
+                vectors: &vectors,
+                dim: 2,
+                query: &query,
+                k: 1,
+            })
+            .expect("search_subset ok");
+        let _ = ids;
+        assert_eq!(hits, vec![CandidateHit { id: 0, score: 1.0 }]);
+    }
+
+    // `CpuScalarProvider::search_subset` の直接参照版（オーバーライド）は、
+    // `slots` の行を事前に複製してから `search` を呼んだ場合とビット同一の
+    // 結果になること（Issue #654 要件 2）。
+    #[test]
+    fn search_subset_matches_gathered_search_reference() {
+        let dim = 4usize;
+        let rows = 9usize;
+        let mut vectors = Vec::with_capacity(rows * dim);
+        for i in 0..rows {
+            for d in 0..dim {
+                vectors.push(((i * dim + d) % 13) as f32 * 0.1 - 0.5);
+            }
+        }
+        let query = [0.3f32, -0.1, 0.2, 0.05];
+        // 昇順・重複なし・末尾に範囲外スロットを 1 件混ぜて skip 規約も検証する。
+        let slots: Vec<u32> = vec![0, 2, 3, 5, 8, 100];
+
+        let subset_hits = CpuScalarProvider
+            .search_subset(SubsetSearchInput {
+                slots: &slots,
+                vectors: &vectors,
+                dim: dim as u32,
+                query: &query,
+                k: 4,
+            })
+            .expect("search_subset ok");
+
+        // 参照実装: `slots` の行を手で gather してから通常の `search` を呼ぶ
+        // （範囲外スロット 100 は自然に vectors.get で弾かれる）。
+        let mut gathered = Vec::new();
+        let mut ids = Vec::new();
+        for &slot in &slots {
+            let start = (slot as usize) * dim;
+            if let Some(row) = vectors.get(start..start + dim) {
+                gathered.extend_from_slice(row);
+                ids.push(slot as u64);
+            }
+        }
+        let reference_hits = CpuScalarProvider
+            .search(SearchInput {
+                ids: &ids,
+                vectors: &gathered,
+                dim: dim as u32,
+                query: &query,
+                k: 4,
+            })
+            .expect("search ok");
+
+        assert_eq!(subset_hits, reference_hits);
+        assert!(!subset_hits.is_empty());
+    }
+
+    // 既定実装（gather 経由）のみを使うカスタム provider（`search` だけを
+    // 実装し `search_subset` はオーバーライドしない）でも、
+    // `CpuScalarProvider::search_subset`（直接参照オーバーライド）とビット同一の
+    // 結果になること（Issue #654 要件: 既存カスタム provider 互換）。
+    #[derive(Debug, Default, Clone, Copy)]
+    struct DefaultOnlyProvider;
+    impl SearchProvider for DefaultOnlyProvider {
+        fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
+            CpuScalarProvider.search(input)
+        }
+    }
+
+    #[test]
+    fn default_search_subset_matches_overridden_implementation() {
+        let dim = 3usize;
+        let rows = 6usize;
+        let mut vectors = Vec::with_capacity(rows * dim);
+        for i in 0..rows {
+            for d in 0..dim {
+                vectors.push(((i * dim + d) % 7) as f32 * 0.2 - 0.6);
+            }
+        }
+        let query = [0.1f32, 0.2, -0.3];
+        let slots: Vec<u32> = vec![1, 2, 4, 5];
+
+        let via_default = DefaultOnlyProvider
+            .search_subset(SubsetSearchInput {
+                slots: &slots,
+                vectors: &vectors,
+                dim: dim as u32,
+                query: &query,
+                k: 3,
+            })
+            .expect("default search_subset ok");
+        let via_override = CpuScalarProvider
+            .search_subset(SubsetSearchInput {
+                slots: &slots,
+                vectors: &vectors,
+                dim: dim as u32,
+                query: &query,
+                k: 3,
+            })
+            .expect("overridden search_subset ok");
+
+        assert_eq!(via_default, via_override);
+    }
+
+    #[test]
+    fn search_subset_k_zero_or_empty_slots_returns_empty() {
+        let vectors = [1.0f32, 0.0];
+        let query = [1.0f32, 0.0];
+        let empty_slots: [u32; 0] = [];
+        let hits = CpuScalarProvider
+            .search_subset(SubsetSearchInput {
+                slots: &[0],
+                vectors: &vectors,
+                dim: 2,
+                query: &query,
+                k: 0,
+            })
+            .expect("k=0 ok");
+        assert!(hits.is_empty());
+        let hits = CpuScalarProvider
+            .search_subset(SubsetSearchInput {
+                slots: &empty_slots,
+                vectors: &vectors,
+                dim: 2,
+                query: &query,
+                k: 1,
+            })
+            .expect("empty slots ok");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_subset_rejects_dim_mismatch_and_non_finite_query() {
+        let vectors = [1.0f32, 0.0];
+        let bad_dim_query = [1.0f32, 0.0, 0.0];
+        let err = CpuScalarProvider
+            .search_subset(SubsetSearchInput {
+                slots: &[0],
+                vectors: &vectors,
+                dim: 2,
+                query: &bad_dim_query,
+                k: 1,
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            KernelError::DimMismatch {
+                expected: 2,
+                found: 3
+            }
+        );
+
+        let nan_query = [f32::NAN, 0.0];
+        let err = CpuScalarProvider
+            .search_subset(SubsetSearchInput {
+                slots: &[0],
+                vectors: &vectors,
+                dim: 2,
+                query: &nan_query,
+                k: 1,
+            })
+            .unwrap_err();
+        assert_eq!(err, KernelError::NonFiniteQuery);
     }
 }
