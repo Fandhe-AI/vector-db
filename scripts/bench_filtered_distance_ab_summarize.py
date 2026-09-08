@@ -254,14 +254,19 @@ def main() -> int:
 
     print(f"# session_ts={session_ts}", file=sys.stderr)
 
-    ref_band_values: list[float] = []
-    for side in ("before", "after"):
-        vals = list(sel1of5[side].get("vector_knn.W0-nowhere", {}).values())
-        ref_band_values.extend(vals)
-    ref_dot_values: list[float] = []
-    for side in ("before", "after"):
-        vals = list(sel1of5[side].get("R_dot_kernel_distance_only", {}).values())
-        ref_dot_values.extend(vals)
+    # 参照帯も対応済みペア限定で算出する（min/median/ratio と同じ集約契約。
+    # 対応相手のない余剰 run の外れ値が参照帯を膨らませて regressed を
+    # within_band へ誤判定するのを防ぐ。PR #669 codex-review 指摘）。
+    def matched_values(name: str) -> list[float]:
+        runs = matched_pairs_by_name.get(name, set())
+        out: list[float] = []
+        for side in ("before", "after"):
+            per_run = sel1of5[side].get(name, {})
+            out.extend(v for r, v in per_run.items() if r in runs)
+        return out
+
+    ref_band_values = matched_values("vector_knn.W0-nowhere")
+    ref_dot_values = matched_values("R_dot_kernel_distance_only")
     rb_nowhere = reference_band(ref_band_values)
     rb_dot = reference_band(ref_dot_values)
     # 判定には保守的に大きい方の参照帯を使う（`docs/design/
