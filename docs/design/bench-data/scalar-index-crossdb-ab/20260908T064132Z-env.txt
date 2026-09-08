@@ -1,0 +1,17 @@
+timestamp_utc=20260908T064132Z
+harness_commit=6ff22dc827bf221061e331d4cb112ddc6d829954
+before_commit=773a835
+before_binary_sha256=4b950db35d5c084ac6069061ced04e264032fbaff8078e1bd3c526aa0f7546f3
+after_commit=6ff22dc
+after_binary_sha256=ba67777ec99408809803b4e08af152f1703c7abe84972c4490b0df859dd2a256
+ref_commit=ee99db3
+ref_binary_sha256=becfb9f9bb26ddaba81fd7b337c44f2a63103eeb9ad44246de7a21c1f978d2bb
+ab_pairs=5
+hybrid_iters=200
+warm_where=50
+self_port=15437
+nproc=12
+cpu_model=QEMU Virtual CPU version 2.5+
+bench_dedicated_env=
+github_actions=
+note=shared QEMU environment; treat as reference-only, not a pass/fail basis (docs/design/benchmark-judgement-policy.md §5)

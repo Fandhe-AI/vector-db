@@ -498,6 +498,18 @@ else
 	@echo "skip: Cargo.toml 未追加のため bench-chip-ab をスキップ"
 endif
 
+.PHONY: bench-scalar-index-crossdb-ab
+bench-scalar-index-crossdb-ab: ## Issue #633（ScalarIndex 索引対象限定〔Issue #632〕の前後比較。crossdb self 4 フェーズ〔hybrid_rrf・bulk_hybrid_k200・vector_knn_where・where_compound_count〕と WHERE 実行後 hybrid_rrf 単独ループ・wire-server RSS）を before/after（既定で ref も）3 コミットの独立ソースツリー（`git archive` 展開）で交互 N≥5 ペア実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BEFORE_COMMIT・AFTER_COMMIT・CROSSDB_DIR〔docs25k.redb／docs25k.jsonl／queries200.jsonl を含むディレクトリ〕・CROSSDB_PYTHON〔psycopg 入り python3〕必須。REF_COMMIT（既定 ee99db3・空文字で無効）・AB_PAIRS（既定 5・5 未満は拒否）・HYBRID_ITERS（既定 200）・WARM_WHERE（既定 50）・CROSSDB_SELF_PORT_BASE（既定 15437）で上書きできる。ログは docs/design/bench-data/scalar-index-crossdb-ab/ 配下。scripts/bench_scalar_index_crossdb_ab.sh --summarize <dir> で TSV 集約）を実行する
+ifdef HAS_CARGO
+	@if [ -z "$(BEFORE_COMMIT)" ] || [ -z "$(AFTER_COMMIT)" ] || [ -z "$(CROSSDB_DIR)" ] || [ -z "$(CROSSDB_PYTHON)" ]; then \
+		echo "ERROR: BEFORE_COMMIT・AFTER_COMMIT・CROSSDB_DIR・CROSSDB_PYTHON を指定してください（例: make bench-scalar-index-crossdb-ab BEFORE_COMMIT=773a835 AFTER_COMMIT=6ff22dc CROSSDB_DIR=<dir> CROSSDB_PYTHON=<python>）"; \
+		exit 1; \
+	fi
+	BEFORE_COMMIT="$(BEFORE_COMMIT)" AFTER_COMMIT="$(AFTER_COMMIT)" CROSSDB_DIR="$(CROSSDB_DIR)" CROSSDB_PYTHON="$(CROSSDB_PYTHON)" scripts/bench_scalar_index_crossdb_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-scalar-index-crossdb-ab をスキップ"
+endif
+
 # --------------------------------------------------
 # ingest 経路の段別内訳プロファイル（Issue #396。crates/engine/benches/ingest_profile_bench.rs）
 # --------------------------------------------------
