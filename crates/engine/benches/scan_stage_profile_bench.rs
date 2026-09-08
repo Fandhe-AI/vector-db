@@ -840,154 +840,29 @@ fn main() {
     let storage = Storage::open(&path).expect("reopen storage for W0-hot/W0-nowhere/A0");
     let core = EngineCore::from_storage(storage, search_engine::default_engine());
 
-    // --- 索引アーム（Issue #653）: `scalar_index_cache_stats()` の増分で
-    // `ScalarIndex::resolve_candidates`（Issue #474）による候補削減が実際に
-    // 発火していることを非 vacuous に確認する。
-    let index_stats_before = core.scalar_index_cache_stats();
-    let index_arena_before = core.sql_arena_cache_stats();
-    let w0_hot = run(&config, || {
-        core.execute_sql(&ctx_a, &sql_where)
-            .expect("execute_sql must succeed for well-formed synthetic WHERE query")
-    })
-    .expect("measurement must satisfy protocol minimums");
-    let index_stats_after = core.scalar_index_cache_stats();
-    let index_arena_after = core.sql_arena_cache_stats();
-    let w0_hot_result = core
-        .execute_sql(&ctx_a, &sql_where)
-        .expect("execute_sql must succeed for well-formed synthetic WHERE query");
-    if w0_hot_result.rows.len() != TOP_K {
-        fail_closed(format!(
-            "W0-hot result row count mismatch: expected {TOP_K}, got {}",
-            w0_hot_result.rows.len()
-        ));
-    }
-    // cold 側と同じ「返却 id が lang='ja' の可視集合に含まれる」検証を hot 側にも
-    // 課す。cache ヒット経路（`SqlArenaCache`／`sql/hnsw_cache.rs` 等）はここでしか
-    // 通過せず、キャッシュヒット時にフィルタが未適用のまま別の行が返っても件数
-    // だけの確認では検出できない（P2 指摘）。
-    let w0_hot_ids: Vec<u64> = w0_hot_result
-        .rows
-        .iter()
-        .map(|row| match row.cells.first() {
-            Some(Cell::Integer(v)) => *v,
-            other => fail_closed(format!("W0-hot id cell type mismatch: got {other:?}")),
-        })
-        .collect();
-    if w0_hot_ids.iter().any(|id| !expected_match_ids.contains(id)) {
-        fail_closed(
-            "W0-hot returned an id outside the lang='ja' visible set (tenant/filter leak suspected, possibly via a stale cache hit)",
-        );
-    }
-    let index_scans_delta = index_stats_after
-        .index_scans
-        .saturating_sub(index_stats_before.index_scans);
-    let index_plain_fallbacks_delta = index_stats_after
-        .plain_scan_fallbacks
-        .saturating_sub(index_stats_before.plain_scan_fallbacks);
-    let index_builds_delta = index_stats_after
-        .builds
-        .saturating_sub(index_stats_before.builds);
-    let index_arena_hits_delta = index_arena_after
-        .hits
-        .saturating_sub(index_arena_before.hits);
-    // 索引アームは `index_scans` が実際に増え（非 vacuous）、`plain_scan_fallbacks`
-    // は増えない（=常に候補削減経路を消費する）ことを fail-closed に確認する。
-    if index_scans_delta == 0 {
-        fail_closed(format!(
-            "index arm did not consume ScalarIndex candidate resolution (index_scans delta=0; selectivity=1/{selectivity_denominator} may exceed the resolve_candidates threshold and fall back to plain scan)"
-        ));
-    }
-    if index_plain_fallbacks_delta != 0 {
-        fail_closed(format!(
-            "index arm unexpectedly fell back to plain scan (plain_scan_fallbacks delta={index_plain_fallbacks_delta})"
-        ));
-    }
-
-    // --- plain アーム（Issue #653）: `AND vec_norm(embedding) > 0` により `PlainScan` へ縮退させ、
-    // 索引経路を一切消費しないことを確認する（`index_scans`／`plain_scan_fallbacks`
-    // がいずれも不変のまま、直前の索引アーム側の正の増分と対照させることで
-    // 非 vacuous に検証する。理由は下記アサーション直前のコメント参照）。
-    let plain_stats_before = core.scalar_index_cache_stats();
-    let w0_plain = run(&config, || {
-        core.execute_sql(&ctx_a, &sql_where_plain)
-            .expect("execute_sql must succeed for well-formed synthetic WHERE query (plain arm)")
-    })
-    .expect("measurement must satisfy protocol minimums");
-    let plain_stats_after = core.scalar_index_cache_stats();
-    let w0_plain_result = core
-        .execute_sql(&ctx_a, &sql_where_plain)
-        .expect("execute_sql must succeed for well-formed synthetic WHERE query (plain arm)");
-    let w0_plain_ids: Vec<u64> = w0_plain_result
-        .rows
-        .iter()
-        .map(|row| match row.cells.first() {
-            Some(Cell::Integer(v)) => *v,
-            other => fail_closed(format!("W0-plain id cell type mismatch: got {other:?}")),
-        })
-        .collect();
-    if w0_plain_ids
-        .iter()
-        .any(|id| !expected_match_ids.contains(id))
-    {
-        fail_closed(
-            "W0-plain returned an id outside the lang='ja' visible set (tenant/filter leak suspected)",
-        );
-    }
-    // 両アームは論理的に同一の `WHERE` 述語（`lang = 'ja'` かどうか）を持つため、
-    // 索引経路・plain scan 経路のいずれで実行しても同一の Top-k id 集合を返す
-    // ことを固定する（索引経路が誤って別の行を返す退行を検出する）。
-    let mut w0_hot_ids_sorted = w0_hot_ids.clone();
-    w0_hot_ids_sorted.sort_unstable();
-    let mut w0_plain_ids_sorted = w0_plain_ids.clone();
-    w0_plain_ids_sorted.sort_unstable();
-    if w0_hot_ids_sorted != w0_plain_ids_sorted {
-        fail_closed(
-            "index arm and plain arm returned different id sets for the logically identical WHERE predicate",
-        );
-    }
-    let plain_scans_delta = plain_stats_after
-        .index_scans
-        .saturating_sub(plain_stats_before.index_scans);
-    let plain_fallbacks_delta = plain_stats_after
-        .plain_scan_fallbacks
-        .saturating_sub(plain_stats_before.plain_scan_fallbacks);
-    // `classify_scalar_plan` が `PlainScan` を返す形状（`sql/exec.rs`
-    // 参照）は「索引対応述語のみだが lookup/resolve に失敗した」
-    // （`FallbackNoIndex`／`FallbackSelectivity`。`plain_scan_fallbacks` を
-    // 記録する）とは異なり、索引を消費する分岐そのものへ一切入らないため
-    // `index_scans`／`plain_scan_fallbacks` のいずれも増えない。これは
-    // production の実際の挙動（`sql/exec.rs` の `if scalar_plan_kind !=
-    // ScalarPlan::PlainScan` ゲート）であり、本ベンチの計測手法上の欠落では
-    // ない——直前の索引アーム側の非 vacuous 確認（`index_scans_delta > 0`）が
-    // 同じ計測経路で正の増分を捉えていることの対照として、plain アームが
-    // 両カウンタとも不変であることを積極的に固定する。
-    if plain_scans_delta != 0 {
-        fail_closed(format!(
-            "plain arm unexpectedly consumed ScalarIndex candidate resolution (index_scans delta={plain_scans_delta})"
-        ));
-    }
-    if plain_fallbacks_delta != 0 {
-        fail_closed(format!(
-            "plain arm unexpectedly recorded a FallbackNoIndex/FallbackSelectivity plain scan fallback (plain_scan_fallbacks delta={plain_fallbacks_delta}; expected 0 for a pure PlainScan-classified query, which never enters the index-consuming branch)"
-        ));
-    }
-
-    // --- I 系列（索引経路の内訳。Issue #653）: `ScalarIndex`（pub(crate)）の
-    // 候補削減を pub API（`scan_scalar_columns`／`declarative_filter::matches_all`／
-    // `ParallelSearchProvider::search`）で再実装し、I1〜I3 を計測する。
+    // --- 索引アーム／plain アーム／I 系列（Issue #653）: ラウンド輪番。--------------
+    // A/W 系列と同じプロトコル（ラウンドごとに独立した `run()` 呼び出しを行い、
+    // ラウンド横断で min-of-R／median-of-R・per-round 生データを得る）へ揃える
+    // （codex-review P1 指摘・PR #663。旧実装はここを一度だけ計測しており、
+    // per-round 生データ・min-of-R が得られず `benchmark-judgement-policy.md`
+    // §3 の交互 N≥5 ペア・生データ必須の規約に反していた）。
     let lang_col_index = schema
         .columns
         .iter()
         .position(|c| c.name == "lang")
         .expect("lang column exists in schema");
-    // 計測外で値→候補スロット辞書を構築する（`ScalarIndex::build` 相当の pub API
-    // 再実装。I1 では lookup ＋ 複製のみを計測する）。
-    let mut lang_candidates: std::collections::HashMap<&str, Vec<usize>> =
+    let dim = arena.dim() as usize;
+
+    // 値→候補スロット辞書（`ScalarIndex::build` 相当の pub API 再実装）は
+    // `captured_metadata`／`arena` がラウンド間で不変のため、ループ外で 1 回だけ
+    // 構築する（I1 の計測対象はここからの lookup ＋ 複製＋整列のみ）。
+    let mut lang_candidates: std::collections::HashMap<&str, Vec<u32>> =
         std::collections::HashMap::new();
     for (idx, metadata) in captured_metadata.iter().enumerate() {
         let scanned = scan_scalar_columns(&schema, metadata).expect("scan_scalar_columns");
         if let Some(Some(value)) = scanned.get(lang_col_index) {
-            lang_candidates.entry(value).or_default().push(idx);
+            let slot = u32::try_from(idx).expect("captured row index fits in u32");
+            lang_candidates.entry(value).or_default().push(slot);
         }
     }
     let expected_candidate_count = lang_candidates
@@ -1002,73 +877,310 @@ fn main() {
         ));
     }
 
-    let i1 = run(&config, || {
-        lang_candidates
+    let mut index_rounds: Vec<Duration> = Vec::with_capacity(rounds as usize);
+    let mut plain_rounds: Vec<Duration> = Vec::with_capacity(rounds as usize);
+    let mut i1_rounds: Vec<Duration> = Vec::with_capacity(rounds as usize);
+    let mut i2a_rounds: Vec<Duration> = Vec::with_capacity(rounds as usize);
+    let mut i2b_rounds: Vec<Duration> = Vec::with_capacity(rounds as usize);
+    let mut i3_rounds: Vec<Duration> = Vec::with_capacity(rounds as usize);
+    // 索引アーム・plain アームの `scalar_index_cache_stats()` 増分は非 vacuous
+    // 性の確認を毎ラウンド fail-closed に行った上で、最終出力にはラウンド 0 の
+    // 値を代表値として使う（カウンタはラウンドをまたいで単調増加するため、
+    // 後続ラウンドの delta も同じ符号・非ゼロ性を持つ。実測値そのものは
+    // ラウンドごとに変わりうるが、非 vacuous 性の結論には影響しない）。
+    let mut index_scans_delta = 0u64;
+    let mut index_plain_fallbacks_delta = 0u64;
+    let mut index_builds_delta = 0u64;
+    let mut index_arena_hits_delta = 0u64;
+    let mut plain_scans_delta = 0u64;
+    let mut plain_fallbacks_delta = 0u64;
+
+    for round in 0..rounds {
+        // --- 索引アーム（Issue #653）: `scalar_index_cache_stats()` の増分で
+        // `ScalarIndex::resolve_candidates`（Issue #474）による候補削減が実際に
+        // 発火していることを非 vacuous に確認する。
+        let index_stats_before = core.scalar_index_cache_stats();
+        let index_arena_before = core.sql_arena_cache_stats();
+        let w0_hot = run(&config, || {
+            core.execute_sql(&ctx_a, &sql_where)
+                .expect("execute_sql must succeed for well-formed synthetic WHERE query")
+        })
+        .expect("measurement must satisfy protocol minimums");
+        let index_stats_after = core.scalar_index_cache_stats();
+        let index_arena_after = core.sql_arena_cache_stats();
+        index_rounds.push(w0_hot.summary.median);
+        let w0_hot_result = core
+            .execute_sql(&ctx_a, &sql_where)
+            .expect("execute_sql must succeed for well-formed synthetic WHERE query");
+        if w0_hot_result.rows.len() != TOP_K {
+            fail_closed(format!(
+                "round {round}: W0-hot result row count mismatch: expected {TOP_K}, got {}",
+                w0_hot_result.rows.len()
+            ));
+        }
+        // cold 側と同じ「返却 id が lang='ja' の可視集合に含まれる」検証を hot 側にも
+        // 課す。cache ヒット経路（`SqlArenaCache`／`sql/hnsw_cache.rs` 等）はここでしか
+        // 通過せず、キャッシュヒット時にフィルタが未適用のまま別の行が返っても件数
+        // だけの確認では検出できない（P2 指摘）。
+        let w0_hot_ids: Vec<u64> = w0_hot_result
+            .rows
+            .iter()
+            .map(|row| match row.cells.first() {
+                Some(Cell::Integer(v)) => *v,
+                other => fail_closed(format!(
+                    "round {round}: W0-hot id cell type mismatch: got {other:?}"
+                )),
+            })
+            .collect();
+        if w0_hot_ids.iter().any(|id| !expected_match_ids.contains(id)) {
+            fail_closed(format!(
+                "round {round}: W0-hot returned an id outside the lang='ja' visible set (tenant/filter leak suspected, possibly via a stale cache hit)"
+            ));
+        }
+        let round_index_scans_delta = index_stats_after
+            .index_scans
+            .saturating_sub(index_stats_before.index_scans);
+        let round_index_plain_fallbacks_delta = index_stats_after
+            .plain_scan_fallbacks
+            .saturating_sub(index_stats_before.plain_scan_fallbacks);
+        let round_index_builds_delta = index_stats_after
+            .builds
+            .saturating_sub(index_stats_before.builds);
+        let round_index_arena_hits_delta = index_arena_after
+            .hits
+            .saturating_sub(index_arena_before.hits);
+        // 索引アームは `index_scans` が実際に増え（非 vacuous）、`plain_scan_fallbacks`
+        // は増えない（=常に候補削減経路を消費する）ことを毎ラウンド fail-closed に確認する。
+        if round_index_scans_delta == 0 {
+            fail_closed(format!(
+                "round {round}: index arm did not consume ScalarIndex candidate resolution (index_scans delta=0; selectivity=1/{selectivity_denominator} may exceed the resolve_candidates threshold and fall back to plain scan)"
+            ));
+        }
+        if round_index_plain_fallbacks_delta != 0 {
+            fail_closed(format!(
+                "round {round}: index arm unexpectedly fell back to plain scan (plain_scan_fallbacks delta={round_index_plain_fallbacks_delta})"
+            ));
+        }
+        if round == 0 {
+            index_scans_delta = round_index_scans_delta;
+            index_plain_fallbacks_delta = round_index_plain_fallbacks_delta;
+            index_builds_delta = round_index_builds_delta;
+            index_arena_hits_delta = round_index_arena_hits_delta;
+        }
+
+        // --- plain アーム（Issue #653）: `AND vec_norm(embedding) > 0` により `PlainScan` へ縮退させ、
+        // 索引経路を一切消費しないことを確認する（`index_scans`／`plain_scan_fallbacks`
+        // がいずれも不変のまま、直前の索引アーム側の正の増分と対照させることで
+        // 非 vacuous に検証する。理由は下記アサーション直前のコメント参照）。
+        let plain_stats_before = core.scalar_index_cache_stats();
+        let w0_plain = run(&config, || {
+            core.execute_sql(&ctx_a, &sql_where_plain).expect(
+                "execute_sql must succeed for well-formed synthetic WHERE query (plain arm)",
+            )
+        })
+        .expect("measurement must satisfy protocol minimums");
+        let plain_stats_after = core.scalar_index_cache_stats();
+        plain_rounds.push(w0_plain.summary.median);
+        let w0_plain_result = core
+            .execute_sql(&ctx_a, &sql_where_plain)
+            .expect("execute_sql must succeed for well-formed synthetic WHERE query (plain arm)");
+        let w0_plain_ids: Vec<u64> = w0_plain_result
+            .rows
+            .iter()
+            .map(|row| match row.cells.first() {
+                Some(Cell::Integer(v)) => *v,
+                other => fail_closed(format!(
+                    "round {round}: W0-plain id cell type mismatch: got {other:?}"
+                )),
+            })
+            .collect();
+        if w0_plain_ids
+            .iter()
+            .any(|id| !expected_match_ids.contains(id))
+        {
+            fail_closed(format!(
+                "round {round}: W0-plain returned an id outside the lang='ja' visible set (tenant/filter leak suspected)"
+            ));
+        }
+        // 両アームは論理的に同一の `WHERE` 述語（`lang = 'ja'` かどうか）を持つため、
+        // 索引経路・plain scan 経路のいずれで実行しても同一の Top-k id 集合を返す
+        // ことを毎ラウンド固定する（索引経路が誤って別の行を返す退行を検出する）。
+        let mut w0_hot_ids_sorted = w0_hot_ids.clone();
+        w0_hot_ids_sorted.sort_unstable();
+        let mut w0_plain_ids_sorted = w0_plain_ids.clone();
+        w0_plain_ids_sorted.sort_unstable();
+        if w0_hot_ids_sorted != w0_plain_ids_sorted {
+            fail_closed(format!(
+                "round {round}: index arm and plain arm returned different id sets for the logically identical WHERE predicate"
+            ));
+        }
+        let round_plain_scans_delta = plain_stats_after
+            .index_scans
+            .saturating_sub(plain_stats_before.index_scans);
+        let round_plain_fallbacks_delta = plain_stats_after
+            .plain_scan_fallbacks
+            .saturating_sub(plain_stats_before.plain_scan_fallbacks);
+        // `classify_scalar_plan` が `PlainScan` を返す形状（`sql/exec.rs`
+        // 参照）は「索引対応述語のみだが lookup/resolve に失敗した」
+        // （`FallbackNoIndex`／`FallbackSelectivity`。`plain_scan_fallbacks` を
+        // 記録する）とは異なり、索引を消費する分岐そのものへ一切入らないため
+        // `index_scans`／`plain_scan_fallbacks` のいずれも増えない。これは
+        // production の実際の挙動（`sql/exec.rs` の `if scalar_plan_kind !=
+        // ScalarPlan::PlainScan` ゲート）であり、本ベンチの計測手法上の欠落では
+        // ない——直前の索引アーム側の非 vacuous 確認（`index_scans_delta > 0`）が
+        // 同じ計測経路で正の増分を捉えていることの対照として、plain アームが
+        // 両カウンタとも不変であることを毎ラウンド積極的に固定する。
+        if round_plain_scans_delta != 0 {
+            fail_closed(format!(
+                "round {round}: plain arm unexpectedly consumed ScalarIndex candidate resolution (index_scans delta={round_plain_scans_delta})"
+            ));
+        }
+        if round_plain_fallbacks_delta != 0 {
+            fail_closed(format!(
+                "round {round}: plain arm unexpectedly recorded a FallbackNoIndex/FallbackSelectivity plain scan fallback (plain_scan_fallbacks delta={round_plain_fallbacks_delta}; expected 0 for a pure PlainScan-classified query, which never enters the index-consuming branch)"
+            ));
+        }
+        if round == 0 {
+            plain_scans_delta = round_plain_scans_delta;
+            plain_fallbacks_delta = round_plain_fallbacks_delta;
+        }
+
+        // --- I 系列（索引経路の内訳。Issue #653）: `ScalarIndex`（pub(crate)）の
+        // 候補削減を pub API（`scan_scalar_columns`／`declarative_filter::matches_all`／
+        // `ParallelSearchProvider::search`）で再実装し、I1〜I3 を計測する。
+        let i1 = run(&config, || {
+            // `ScalarIndex::candidates_for` は lookup ＋ 複製ののち
+            // `sort_unstable` でスロット昇順契約を満たす（`sql/scalar_index.rs`
+            // 参照）。本ベンチの辞書は挿入順が既に昇順のため通常は no-op ソート
+            // だが、production と同じ型（`Vec<u32>`）・同じコードパス（lookup →
+            // 複製 → 整列）を踏むことを優先する（P2 指摘。旧実装は `Vec<usize>`
+            // かつ整列を欠いていた）。
+            let mut v: Vec<u32> = lang_candidates
+                .get(TARGET_LANG)
+                .cloned()
+                .unwrap_or_default();
+            v.sort_unstable();
+            v
+        })
+        .expect("measurement must satisfy protocol minimums");
+        i1_rounds.push(i1.summary.median);
+        let i1_candidates: Vec<usize> = lang_candidates
             .get(TARGET_LANG)
             .cloned()
             .unwrap_or_default()
-    })
-    .expect("measurement must satisfy protocol minimums");
-    let i1_candidates = lang_candidates
-        .get(TARGET_LANG)
-        .cloned()
-        .unwrap_or_default();
+            .iter()
+            .map(|&slot| slot as usize)
+            .collect();
 
-    let i2a = run(&config, || {
-        let mut matched = 0u64;
-        for &idx in &i1_candidates {
-            let scanned =
-                scan_scalar_columns(&schema, &captured_metadata[idx]).expect("scan_scalar_columns");
-            if matches_lang_filter(&filters, &scanned) {
-                matched = matched.wrapping_add(std::hint::black_box(1u64));
+        let i2a = run(&config, || {
+            let mut matched = 0u64;
+            for &idx in &i1_candidates {
+                let scanned = scan_scalar_columns(&schema, &captured_metadata[idx])
+                    .expect("scan_scalar_columns");
+                if matches_lang_filter(&filters, &scanned) {
+                    matched = matched.wrapping_add(std::hint::black_box(1u64));
+                }
             }
-        }
-        matched
-    })
-    .expect("measurement must satisfy protocol minimums");
+            matched
+        })
+        .expect("measurement must satisfy protocol minimums");
+        i2a_rounds.push(i2a.summary.median);
 
-    let dim = arena.dim() as usize;
-    let i2b = run(&config, || {
-        let mut copied: Vec<f32> = Vec::with_capacity(i1_candidates.len() * dim);
-        for &idx in &i1_candidates {
-            let scanned =
-                scan_scalar_columns(&schema, &captured_metadata[idx]).expect("scan_scalar_columns");
-            if matches_lang_filter(&filters, &scanned) {
+        // I2b: `VectorArena::build_from_cached_rls_rows_subset`（`pub(crate)`
+        // のためベンチから直接呼べない）相当の再実装。生 embedding 複製だけを
+        // 測るのではなく、production と同様に (1) amortized 成長
+        // （`GrowableArenaBuffers::ensure_capacity` の「capacity を倍々に増やし、
+        // 目標行数に達したら止める」方針を模した段階的 `reserve_exact`）と
+        // (2) 一致行ごとの id／tenant_id／visibility の複製も embedding 複製と
+        // 合わせて行う（P1 指摘・PR #663。旧実装は一括 `Vec::with_capacity(exact)`
+        // ＋ embedding のみの複製で、SQL 表層固定コストへの残差帰属・#654 の
+        // 削減上限という測定契約が production の処理量と乖離していた）。
+        let i2b = run(&config, || {
+            let mut buf_vectors: Vec<f32> = Vec::new();
+            let mut buf_ids: Vec<u64> = Vec::new();
+            let mut buf_tenant_ids: Vec<String> = Vec::new();
+            let mut buf_visibilities: Vec<Visibility> = Vec::new();
+            let mut row_capacity: usize = 0;
+            let mut visible_row_count: usize = 0;
+            for &idx in &i1_candidates {
+                let scanned = scan_scalar_columns(&schema, &captured_metadata[idx])
+                    .expect("scan_scalar_columns");
+                if !matches_lang_filter(&filters, &scanned) {
+                    continue;
+                }
+                visible_row_count += 1;
+                if visible_row_count > row_capacity {
+                    let doubled = row_capacity.checked_mul(2).unwrap_or(visible_row_count);
+                    let candidate = doubled.max(visible_row_count);
+                    let additional = candidate - row_capacity;
+                    buf_vectors.reserve_exact(additional * dim);
+                    buf_ids.reserve_exact(additional);
+                    buf_tenant_ids.reserve_exact(additional);
+                    buf_visibilities.reserve_exact(additional);
+                    row_capacity = candidate;
+                }
                 let vector = arena.vector(idx).expect("arena vector for captured index");
-                copied.extend_from_slice(vector);
+                buf_vectors.extend_from_slice(vector);
+                buf_ids.push(captured_ids[idx]);
+                buf_tenant_ids.push(
+                    arena
+                        .tenant_id(idx)
+                        .expect("arena tenant_id for captured index")
+                        .to_string(),
+                );
+                buf_visibilities.push(
+                    arena
+                        .visibility(idx)
+                        .expect("arena visibility for captured index"),
+                );
+            }
+            (buf_vectors, buf_ids, buf_tenant_ids, buf_visibilities)
+        })
+        .expect("measurement must satisfy protocol minimums");
+        i2b_rounds.push(i2b.summary.median);
+
+        let mut i_matched_ids: Vec<u64> = Vec::with_capacity(i1_candidates.len());
+        let mut i_matched_vectors: Vec<f32> = Vec::with_capacity(i1_candidates.len() * dim);
+        for &idx in &i1_candidates {
+            let scanned =
+                scan_scalar_columns(&schema, &captured_metadata[idx]).expect("scan_scalar_columns");
+            if matches_lang_filter(&filters, &scanned) {
+                i_matched_ids.push(captured_ids[idx]);
+                i_matched_vectors.extend_from_slice(arena.vector(idx).expect("arena vector"));
             }
         }
-        copied
-    })
-    .expect("measurement must satisfy protocol minimums");
-
-    let mut i_matched_ids: Vec<u64> = Vec::with_capacity(i1_candidates.len());
-    let mut i_matched_vectors: Vec<f32> = Vec::with_capacity(i1_candidates.len() * dim);
-    for &idx in &i1_candidates {
-        let scanned =
-            scan_scalar_columns(&schema, &captured_metadata[idx]).expect("scan_scalar_columns");
-        if matches_lang_filter(&filters, &scanned) {
-            i_matched_ids.push(captured_ids[idx]);
-            i_matched_vectors.extend_from_slice(arena.vector(idx).expect("arena vector"));
+        if i_matched_ids != expected_match_ids {
+            fail_closed(format!(
+                "round {round}: I2a/I2b matched id set diverged from independently derived expected_match_ids (index path regression suspected)"
+            ));
         }
+        let i3 = run(&config, || {
+            parallel_provider
+                .search(SearchInput {
+                    ids: &i_matched_ids,
+                    vectors: &i_matched_vectors,
+                    dim: dim as u32,
+                    query: &query,
+                    k: TOP_K,
+                })
+                .expect("search must succeed for well-formed synthetic input")
+        })
+        .expect("measurement must satisfy protocol minimums");
+        i3_rounds.push(i3.summary.median);
     }
-    if i_matched_ids != expected_match_ids {
-        fail_closed(
-            "I2a/I2b matched id set diverged from independently derived expected_match_ids (index path regression suspected)",
-        );
-    }
-    let i3 = run(&config, || {
-        parallel_provider
-            .search(SearchInput {
-                ids: &i_matched_ids,
-                vectors: &i_matched_vectors,
-                dim: dim as u32,
-                query: &query,
-                k: TOP_K,
-            })
-            .expect("search must succeed for well-formed synthetic input")
-    })
-    .expect("measurement must satisfy protocol minimums");
+
+    let index_min = min_of(&index_rounds).expect("rounds >= 1");
+    let index_med = median_of(&index_rounds).expect("rounds >= 1");
+    let plain_min = min_of(&plain_rounds).expect("rounds >= 1");
+    let plain_med = median_of(&plain_rounds).expect("rounds >= 1");
+    let i1_min = min_of(&i1_rounds).expect("rounds >= 1");
+    let i1_med = median_of(&i1_rounds).expect("rounds >= 1");
+    let i2a_min = min_of(&i2a_rounds).expect("rounds >= 1");
+    let i2a_med = median_of(&i2a_rounds).expect("rounds >= 1");
+    let i2b_min = min_of(&i2b_rounds).expect("rounds >= 1");
+    let i2b_med = median_of(&i2b_rounds).expect("rounds >= 1");
+    let i3_min = min_of(&i3_rounds).expect("rounds >= 1");
+    let i3_med = median_of(&i3_rounds).expect("rounds >= 1");
 
     let w0_nowhere = run(&config, || {
         core.execute_sql(&ctx_a, &sql_nowhere)
@@ -1330,8 +1442,9 @@ fn main() {
         w0_cold_summary.median.as_secs_f64() * 1e3
     );
     println!(
-        "e2e(vector_knn_where/W0-hot): median={:.3}ms",
-        w0_hot.summary.median.as_secs_f64() * 1e3
+        "e2e(vector_knn_where/W0-hot): median={:.3}ms (min-of-R={:.3}ms)",
+        index_med.as_secs_f64() * 1e3,
+        index_min.as_secs_f64() * 1e3
     );
     println!(
         "e2e(vector_knn/W0-nowhere, cache fast path): median={:.3}ms",
@@ -1349,7 +1462,7 @@ fn main() {
     // （全可視行対象の参照区間）側で行う。P2 指摘・詳細は
     // `docs/design/scan-stage-profile.md`「W0-hot と W0-nowhere の候補集合差」
     // 節を参照）。
-    let where_overhead_diff = w0_hot.summary.median.checked_sub(w0_nowhere.summary.median);
+    let where_overhead_diff = index_med.checked_sub(w0_nowhere.summary.median);
     match where_overhead_diff {
         Some(d) => println!(
             "diff(W0-nowhere->W0-hot, raw diff; conflates WHERE overhead with reduced dense candidate set size, see docs): {:.3}ms",
@@ -1389,56 +1502,82 @@ fn main() {
         )
     );
     println!(
-        "e2e(index,k={TOP_K}): median={:.3}ms",
-        w0_hot.summary.median.as_secs_f64() * 1e3
+        "e2e(index,k={TOP_K}): median={:.3}ms (min-of-R={:.3}ms)",
+        index_med.as_secs_f64() * 1e3,
+        index_min.as_secs_f64() * 1e3
     );
     println!(
-        "e2e(plain,k={TOP_K}): median={:.3}ms",
-        w0_plain.summary.median.as_secs_f64() * 1e3
+        "e2e(plain,k={TOP_K}): median={:.3}ms (min-of-R={:.3}ms)",
+        plain_med.as_secs_f64() * 1e3,
+        plain_min.as_secs_f64() * 1e3
     );
-    match stage_diff_ns_per_row(
-        w0_hot.summary.median,
-        w0_plain.summary.median,
-        visible_rows,
-        "index",
-        "plain",
-    ) {
+    // 注意（P1 指摘・PR #663）: `plain` アームの `AND vec_norm(embedding) > 0` は
+    // `sql/expr_program.rs`（Issue #353）の定数畳み込み対象ではない——
+    // `embedding` は行ごとに異なる値を持つ列参照のため、`vec_norm` の評価は
+    // 「行に依存しないスカラー算術・比較部分式」という定数畳み込みの適用条件を
+    // 満たさず、`matches_all` 評価のたびに候補行数 × dim 相当の実ベクトル演算
+    // （L2 ノルム計算）が発生する（`docs/design/filtered-distance-stage-profile.md`
+    // の旧記述「定数畳み込み済みステップ 1 個/行」は誤りだった）。したがって
+    // 以下の `arm_ratio` は「`ScalarIndex` 候補削減の効果」と「plain アームのみに
+    // 追加された `vec_norm` 実計算コスト」の 2 効果を混同した値であり、
+    // `ScalarIndex` 単体の寄与を切り出した数値としては使えない（`plain` アーム
+    // 側に一方的な上乗せがあるぶん、この比率は索引効果を過大に見せる方向へ
+    // 偏る）。索引経路の内訳自体（I 系列）は plain アームを経由しないため
+    // この混同の影響を受けない。
+    match stage_diff_ns_per_row(index_med, plain_med, visible_rows, "index", "plain") {
         Ok(_) => {
-            let ratio_pct =
-                step_ratio_pct(w0_hot.summary.median, w0_plain.summary.median).unwrap_or(0.0);
-            println!("arm_ratio(index->plain,k={TOP_K}): ratio={ratio_pct:.2}%");
+            let ratio_pct = step_ratio_pct(index_med, plain_med).unwrap_or(0.0);
+            println!(
+                "arm_ratio(index->plain,k={TOP_K}): ratio={ratio_pct:.2}% (conflates ScalarIndex candidate reduction with plain-arm-only vec_norm cost; not an isolated index-effect measurement, see comment above)"
+            );
         }
         Err(_) => {
-            let ratio_pct =
-                step_ratio_pct(w0_plain.summary.median, w0_hot.summary.median).unwrap_or(0.0);
+            let ratio_pct = step_ratio_pct(plain_med, index_med).unwrap_or(0.0);
             println!(
-                "arm_ratio(plain->index,k={TOP_K}): ratio={ratio_pct:.2}% (index arm is faster; plain arm is the Issue #474-以前-shaped baseline)"
+                "arm_ratio(plain->index,k={TOP_K}): ratio={ratio_pct:.2}% (index arm is slower than the plain arm this round; plain arm is the Issue #474-以前-shaped baseline. conflates the same two effects noted above)"
             );
         }
     }
 
-    println!("--- index path buckets (I series; us and % of e2e index arm) ---");
-    let e2e_index_total = w0_hot.summary.median;
-    for (label, dur) in [
-        ("I1_index_candidate_resolve", i1.summary.median),
-        ("I2a_candidate_predicate", i2a.summary.median),
-        ("I2b_candidate_arena_copy", i2b.summary.median),
-        ("I3_provider_search", i3.summary.median),
+    println!("--- index/plain/I-series per-round raw medians (ms) ---");
+    for round in 0..index_rounds.len() {
+        println!(
+            "round[{round}]: index={:.3} plain={:.3} I1={:.3} I2a={:.3} I2b={:.3} I3={:.3}",
+            index_rounds[round].as_secs_f64() * 1e3,
+            plain_rounds[round].as_secs_f64() * 1e3,
+            i1_rounds[round].as_secs_f64() * 1e3,
+            i2a_rounds[round].as_secs_f64() * 1e3,
+            i2b_rounds[round].as_secs_f64() * 1e3,
+            i3_rounds[round].as_secs_f64() * 1e3,
+        );
+    }
+
+    println!("--- index path buckets (I series; us and % of e2e index arm; median-of-R) ---");
+    let e2e_index_total = index_med;
+    for (label, dur, min_dur) in [
+        ("I1_index_candidate_resolve", i1_med, i1_min),
+        ("I2a_candidate_predicate", i2a_med, i2a_min),
+        ("I2b_candidate_arena_copy", i2b_med, i2b_min),
+        ("I3_provider_search", i3_med, i3_min),
     ] {
         let us = dur.as_secs_f64() * 1e6;
+        let min_us = min_dur.as_secs_f64() * 1e6;
         match bucket_share_pct(dur, e2e_index_total) {
-            Ok(pct) => println!("{}", render_bucket_share_line(label, us, pct)),
-            Err(e) => println!("bucket_share({label}): us={us:.1} pct_of_e2e=n/a ({e})"),
+            Ok(pct) => println!(
+                "{} (min-of-R={min_us:.1}us)",
+                render_bucket_share_line(label, us, pct)
+            ),
+            Err(e) => println!(
+                "bucket_share({label}): us={us:.1} pct_of_e2e=n/a ({e}) (min-of-R={min_us:.1}us)"
+            ),
         }
     }
     // SQL 表層固定コスト（残差）= e2e(index) − (I1 + I2b + I3)。I2b は I2a を
     // 包含する累積値のため、I2a を別途加算すると I1 分の候補述語コストを
     // 二重計上する（W 系列の `report_diff` と同じ理由で加算対象は累積値のみ）。
-    let index_path_sum = i1
-        .summary
-        .median
-        .checked_add(i2b.summary.median)
-        .and_then(|d| d.checked_add(i3.summary.median));
+    let index_path_sum = i1_med
+        .checked_add(i2b_med)
+        .and_then(|d| d.checked_add(i3_med));
     match index_path_sum.and_then(|sum| e2e_index_total.checked_sub(sum)) {
         Some(residual) => {
             let us = residual.as_secs_f64() * 1e6;

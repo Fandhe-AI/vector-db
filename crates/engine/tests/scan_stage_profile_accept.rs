@@ -688,6 +688,18 @@ fn profile_arm_contract_matches_scalar_index_cache_stats() {
             "id {id} leaked outside lang='ja'"
         );
     }
+    // 非リーク検証（上のループ）だけでは、`hot_index_ids` が空集合や
+    // `expected_match_ids` の真部分集合でも通過してしまう（Cursor Bugbot
+    // 指摘・PR #663）。`index_scans` の増分・id 集合の cold/hot 一致は
+    // 「索引経路を通ったこと」の確認にとどまり「lang='ja' の期待行が
+    // 実際に全件返っていること」の確認にはならないため、独立に導出した
+    // `expected_match_ids`（10 行）との完全一致を固定して vacuous pass を防ぐ。
+    // `expected_match_ids` は `rows` を `id` 昇順に走査して構築しているため
+    // 既に昇順であり、`sort_unstable` 済みの `hot_index_ids` と直接比較できる。
+    assert_eq!(
+        hot_index_ids, expected_match_ids,
+        "index arm hot result must return exactly the lang='ja' visible set, not a subset (vacuous-pass guard)"
+    );
     assert!(
         after_index.index_scans > before_index.index_scans,
         "index arm must consume ScalarIndex candidate resolution at least once"

@@ -41,7 +41,9 @@
 
 `AND 1 = 1` は束縛時の定数畳み込み（Issue #353・`sql/expr_program.rs`）により消去され `PlainScan` を強制できなかった（実装中に実測で判明。`tests/scalar_index_prune.rs::residual_builtin_expr_never_consumes_index` と同じ「`vec_norm(embedding) > 0` という `VectorRef` 参照の恒真述語」形状を採用した）。
 
-`plain` アームは「Issue #474 以前の実バイナリ」とビット同一ではなく、定数畳み込み済みステップ 1 個/行を余分に含む「Issue #474 以前の形状」であることに注意する（#474 以前の実バイナリとの交互 A/B は、旧ハーネスが選択率 opt-in を持たず同条件比較にならないため実施しなかった）。
+`plain` アームは「Issue #474 以前の実バイナリ」とビット同一ではなく、`vec_norm(embedding) > 0` という残余述語を余分に含む「Issue #474 以前の形状」であることに注意する（#474 以前の実バイナリとの交互 A/B は、旧ハーネスが選択率 opt-in を持たず同条件比較にならないため実施しなかった）。
+
+**訂正（PR #663 codex-review 指摘）**: 当初この一文を「定数畳み込み済みステップ 1 個/行を余分に含む」としていたが誤りだった。`sql/expr_program.rs`（Issue #353）の定数畳み込みは「行に依存しないスカラー算術・比較部分式」のみを対象とし、`vec_norm(embedding)` は行ごとに異なる `embedding` 列を参照するため畳み込み対象にならない——`plain` アームは `matches_all` 評価のたびに候補行数 × dim 相当の実ベクトル演算（L2 ノルム計算）を追加で行う。したがって下記「e2e（index／plain アーム）」の `arm_ratio` は、`ScalarIndex` 候補削減の効果と、`plain` アームにのみ追加されたこの実計算コストの 2 効果を混同した値であり、`ScalarIndex` 単体の寄与を切り出した指標としては使えない（`plain` 側に一方的な追加コストがあるぶん、比率は索引効果を過大に見せる方向へ偏る）。索引経路の内訳自体（I 系列）は `plain` アームを経由しないため、この混同の影響を受けない——**#654 の削減余地の議論は I 系列の数値のみを根拠とする**。
 
 ### 索引経路の内訳（I 系列。pub API 再実装）
 
@@ -49,10 +51,12 @@
 
 | 段 | 内容 |
 | --- | --- |
-| I1 `index_candidate_resolve` | 計測外で構築した値→候補スロット辞書（`HashMap<&str, Vec<usize>>`）からの `"ja"` lookup ＋ 複製（`ScalarIndex::candidates_for` 相当） |
+| I1 `index_candidate_resolve` | 計測外で構築した値→候補スロット辞書（`HashMap<&str, Vec<u32>>`）からの `"ja"` lookup ＋ 複製 ＋ `sort_unstable`（`ScalarIndex::candidates_for` 相当。型・整列まで揃える） |
 | I2a `candidate_predicate` | I1 の候補のみへ `scan_scalar_columns` ＋ `lang = 'ja'` 判定（`build_from_cached_rls_rows_subset` の再適用契約に対応） |
-| I2b `candidate_arena_copy` | I2a ＋ 一致行 embedding の連続 `Vec<f32>` 複製（**#654 の削減対象**。分母は候補行数） |
+| I2b `candidate_arena_copy` | I2a ＋ 一致行の embedding／id／tenant_id／visibility の複製（**#654 の削減対象**。分母は候補行数） |
 | I3 `provider_search` | 一致行のみへ `ParallelSearchProvider::search`（距離計算＋Top-k） |
+
+I2b は当初 embedding の一括 `Vec::with_capacity(exact)` 複製のみを計測していたが、production の `VectorArena::build_from_cached_rls_rows_subset`（`pub(crate)` のためベンチから直接呼べない）は (1) `GrowableArenaBuffers::ensure_capacity` による amortized 成長（capacity を倍々に増やし目標行数で止める段階的確保）と (2) 一致行ごとの id／tenant_id／visibility の複製も embedding 複製と合わせて行う。PR #663 の codex-review 指摘（測定契約が production の処理量と乖離）を受け、I2b の再実装をこの 2 点を含む形へ改めた（下記「実測結果」の数値は改訂後のもの）。
 
 SQL 表層固定コスト（4 区分目）は `e2e(index) − (I1 + I2b + I3)` の残差として `checked_sub` で算出する（I2b は I2a を包含する累積値のため、別途加算すると I1 分の候補述語コストを二重計上する。W 系列の `report_diff` と同じ理由。逆転時は測定ノイズとして `n/a` 表示）。
 
@@ -65,17 +69,16 @@ SQL 表層固定コスト（4 区分目）は `e2e(index) − (I1 + I2b + I3)` �
 
 ### 計測規約（`benchmark-judgement-policy.md` への対応）
 
-- 既存 A/W 系列（ラウンド輪番）に加え、index/plain 各アーム・I1〜I3 を `harness::protocol::run`（warmup 20・計測 20）で計測し、per-round 生データ（round[N] 行）・min-of-R／median-of-R を出力する。
+- 既存 A/W 系列（ラウンド輪番）に加え、index/plain 各アーム・I1〜I3 も `harness::protocol::run`（warmup 20・計測 20）を A/W 系列と同じ `for round in 0..rounds` ループの内側で毎ラウンド呼び出し、per-round 生データ（round[N] 行）・min-of-R／median-of-R を出力する（PR #663 codex-review 指摘。初版はこのブロックがラウンドループの外側にあり 1 回しか計測されず、per-round 生データ・min-of-R が欠落していた。以下「実測結果」は修正後の計測による）。
 - `R_dot`（変更を含まない参照区間）の複数ラウンド中央値から実測ノイズ帯（`reference_band`）を算出し、固定 ±5% 帯と併記する。
 
 ## 実測結果（25,000 行・`1/3`・共有 QEMU 環境）
 
-- commit: `b3ae8912228aa3c76f605d61b9ee16ad4763b8ce`
-- 環境: `os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma`（`lscpu` model name: `QEMU Virtual CPU version 2.5+`）・`loadavg=2.15 2.26 1.40`
+- 環境: `os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma`（`lscpu` model name: `QEMU Virtual CPU version 2.5+`）・`loadavg=4.10 3.03 2.53`
 - コマンド: `BENCH_SCAN_PROFILE_SELECTIVITY=1/3 BENCH_SCAN_PROFILE_ROUNDS=5 make bench-scan-stage-profile`
-- 生ログ: `docs/design/bench-data/filtered-distance-stage-profile/1788877278-25k-1of3.log`
+- 生ログ: `docs/design/bench-data/filtered-distance-stage-profile/1788878855-25k-1of3-postfix.log`（PR #663 review 指摘の修正——per-round ラウンド輪番化・I1 の型と整列・I2b の amortized 成長＋id/tenant_id/visibility 複製——を適用したビルドでの再実測）
 
-**共有 QEMU 環境の参考値のため、両ノイズ帯（固定 ±5%・`R_dot` 実測帯 21.14%）を超える判定には使わない。専有環境（`BENCH_DEDICATED_ENV=1`）での再実測はオーナー作業として申し送る。**
+**共有 QEMU 環境の参考値のため、両ノイズ帯（固定 ±5%・`R_dot` 実測帯 10.17%）を超える判定には使わない。専有環境（`BENCH_DEDICATED_ENV=1`）での再実測はオーナー作業として申し送る。**
 
 ### 非 vacuous 確認
 
@@ -85,36 +88,36 @@ scalar_index(index,k=10): index_scans=+39 plain_scan_fallbacks=+0 builds=+1 aren
 scalar_index(plain,k=10): index_scans=+0 plain_scan_fallbacks=+0 builds=+0 arena_cache_hits=+0
 ```
 
-索引アームは `index_scans` が計測イテレーション数（40 回中 39 回。1 回は cold で索引を構築する側に計上）ぶん増分し `plain_scan_fallbacks` は 0 のまま、plain アームは両カウンタとも 0（`PlainScan` 分類のため索引を消費する分岐へ入らない）——「索引経路が実際に発火している」ことを非 vacuous に確認できた。
+索引アームは `index_scans` が計測イテレーション数（40 回中 39 回。1 回は cold で索引を構築する側に計上）ぶん増分し `plain_scan_fallbacks` は 0 のまま、plain アームは両カウンタとも 0（`PlainScan` 分類のため索引を消費する分岐へ入らない）——「索引経路が実際に発火している」ことを非 vacuous に確認できた（本表示はラウンド 0 の delta を代表値とする。他ラウンドも fail-closed に同じ非 vacuous 性を検証している）。
 
 ### e2e（index／plain アーム）
 
 ```
-e2e(index,k=10): median=6.301ms
-e2e(plain,k=10): median=22.311ms
-arm_ratio(index->plain,k=10): ratio=254.10%
+e2e(index,k=10): median=1.087ms (min-of-R=1.045ms)
+e2e(plain,k=10): median=2.085ms (min-of-R=2.052ms)
+arm_ratio(index->plain,k=10): ratio=91.73% (conflates ScalarIndex candidate reduction with plain-arm-only vec_norm cost; not an isolated index-effect measurement, see comment above)
 ```
 
-同一選択率（33%）・同一クエリで、Issue #474 の候補削減（索引アーム）は Issue #474 以前相当の全可視行走査（plain アーム）比で約 3.5 分の 1（median 6.3ms 対 22.3ms）に短縮している。
+**訂正（PR #663 codex-review 指摘）**: 当初この節は `arm_ratio` を「Issue #474 の候補削減（索引アーム）の効果」として読み、「plain アーム比で約 3.5 分の 1 に短縮」と結論づけていたが、この結論は撤回する。上記「2 アーム（index／plain）の同一バイナリ内計測」節の訂正のとおり、`plain` アームは `ScalarIndex` 候補削減が無いことに加え `vec_norm(embedding) > 0` の実ベクトル演算コストも一方的に負っており、`arm_ratio` はこの 2 効果を混同した値である。したがって「索引アームが plain アーム比で何倍速いか」という比率そのものは `ScalarIndex` 単体の寄与としては読めない。`ScalarIndex` 候補削減自体の内訳・削減余地は次節の I 系列（`plain` アームを経由しない）を根拠とする。
 
-### 索引経路の内訳（I 系列。us・% of e2e index arm）
+### 索引経路の内訳（I 系列。us・% of e2e index arm。median-of-R。括弧内は min-of-R）
 
 ```
-bucket_share(I1_index_candidate_resolve): us=1.1 pct_of_e2e=0.02%
-bucket_share(I2a_candidate_predicate): us=1133.8 pct_of_e2e=17.99%
-bucket_share(I2b_candidate_arena_copy): us=2602.6 pct_of_e2e=41.31%
-bucket_share(I3_provider_search): us=1164.0 pct_of_e2e=18.47%
-bucket_share(sql_surface_fixed_cost_residual): us=2533.1 pct_of_e2e=40.20%
+bucket_share(I1_index_candidate_resolve): us=1.9 pct_of_e2e=0.18% (min-of-R=1.9us)
+bucket_share(I2a_candidate_predicate): us=141.1 pct_of_e2e=12.98% (min-of-R=140.4us)
+bucket_share(I2b_candidate_arena_copy): us=605.1 pct_of_e2e=55.65% (min-of-R=591.3us)
+bucket_share(I3_provider_search): us=148.3 pct_of_e2e=13.63% (min-of-R=133.2us)
+bucket_share(sql_surface_fixed_cost_residual): us=332.1 pct_of_e2e=30.54%
 ```
 
-（`I2b` は `I2a` を包含する累積値なので、`I2b` 単独の複製コストは `I2b − I2a` ≈ 1,468.8µs ≈ e2e 比 23.3 ポイント分。）
+（`I2b` は `I2a` を包含する累積値なので、`I2b` 単独の複製コスト——embedding／id／tenant_id／visibility の 4 バッファ複製＋amortized 成長——は `I2b − I2a` ≈ 464.0µs ≈ e2e 比 42.7 ポイント分。）
 
 ## 所見
 
-- I1（候補スロット lookup ＋ 複製）は e2e の 0.02% と無視できる大きさで、`ScalarIndex` の辞書 lookup 自体はボトルネックではない。
-- I2b（候補行の arena 複製。#654 の削減対象）は I2a 込みで e2e の 41.31%、複製そのもの（I2b−I2a）は約 23.3 ポイント——本測定条件（選択率 33%・候補 7,667 行）での **#654 の削減余地の上限**として記録する。
-- SQL 表層固定コスト（残差。I1+I2b+I3 に含まれない部分）は 40.20% で、I 系列の合計（59.80%）とほぼ拮抗する規模。crossdb で先行して特定済みの「投影・スキャン周りの k 非依存固定コスト」（Issue #453・#454）と整合する規模感であり、#654 単独では e2e 全体の半分弱までしか改善できない可能性を示唆する。
-- 本測定は共有 QEMU 環境の 1 回実測（N=5 ラウンド）であり、round[2]/round[3] で他プロセス負荷由来と見られる外れ値（W1=5.634ms・A2=25.070ms 等）が混入し `R_dot` 実測ノイズ帯が 21.14% まで広がった。絶対値・比率とも参考値の位置づけとし、専有環境再実測で確定させる。
+- I1（候補スロット lookup ＋ 複製 ＋ 整列）は e2e の 0.18% と無視できる大きさで、`ScalarIndex` の辞書 lookup 自体はボトルネックではない。
+- I2b（候補行の embedding／id／tenant_id／visibility 複製。production 相当の amortized 成長を含む。#654 の削減対象）は I2a 込みで e2e の 55.65%、複製そのもの（I2b−I2a）は約 42.7 ポイント——本測定条件（選択率 33%・候補 7,667 行）での **#654 の削減余地の上限**として記録する（初版は embedding のみの一括確保を計測しており過小評価だった。production 相当の複製内容へ揃えたことで比率が 41.31%→55.65% へ上振れした）。
+- SQL 表層固定コスト（残差。I1+I2b+I3 に含まれない部分）は 30.54% で、I 系列の合計（69.46%）を下回る規模。crossdb で先行して特定済みの「投影・スキャン周りの k 非依存固定コスト」（Issue #453・#454）と整合する規模感である。
+- 本測定は共有 QEMU 環境の 1 回実測（N=5 ラウンド。`R_dot` 実測ノイズ帯 10.17%）。同じビルドでの繰り返し実測では実行時の他プロセス負荷次第でノイズ帯が数百 % に及ぶ run も観測されており、median ベースの比率は run ごとにばらつきうる一方、I 系列内の相対的な大小関係（I2b が最大区分）は複数 run で一貫して観測された。絶対値・比率とも参考値の位置づけとし、専有環境再実測で確定させる。
 
 ## crossdb との差異（申し送り）
 
