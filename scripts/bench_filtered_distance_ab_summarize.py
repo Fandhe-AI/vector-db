@@ -17,9 +17,18 @@ before（#654 未適用）バイナリは `(min-of-R=...)` 接尾辞を持たな
 接尾辞の有無いずれも受理する。before バイナリは選択率 opt-in
 （`BENCH_SCAN_PROFILE_SELECTIVITY`）を持たないため、ペア run
 （`sel1of5`）は before/after 共通の既定選択率（1/5）でのみ存在する
-——1/3（`sel1of3`）は after-only 段としてのみ記録され、この
-summarizer では before との比較を行わず min/median のみを出力する
+——after-only 段（既定 `sel1of3`。`bench_filtered_distance_ab.sh` の
+`AB_AFTER_ONLY_SELECTIVITY` の分母をそのままファイル名へ反映するため
+分母は可変）は after-only 段としてのみ記録され、この summarizer では
+before との比較を行わず min/median のみを出力する
 （`bench_filtered_distance_ab.sh` のコメント「1/3 ペア比較の構造的不能」参照）。
+
+before/after 各指標の集計は、run 番号（pair）が両側に揃っている run
+だけを対象にする（`scripts/bench_scalar_index_crossdb_ab_summarize.py`
+の対応済みペア限定と同型。PR #669 codex-review 指摘）。対応しない
+余剰 run が min-of-N・median を歪めるのを防ぐため、指標ごとに
+before/after の共通 pair 集合を求め、その集合が `MIN_PAIRS` 未満なら
+拒否する。
 """
 
 from __future__ import annotations
@@ -67,8 +76,13 @@ AFTER_ONLY_METRICS = [
     ("after_only", "I3_provider_search", r"bucket_share\(I3_provider_search\): us=([\d.]+)"),
 ]
 
+# denom は `bench_filtered_distance_ab.sh` の AB_AFTER_ONLY_SELECTIVITY
+# の分母をそのまま埋め込むため可変（2〜100。PR #669 codex-review 指摘。
+# 旧来の `5|3` 固定では既定 1/3 以外の分母を指定したログを拾えなかった）。
+# paired 系列は常に分母 5 固定（同スクリプトのハードコード）で書き出される
+# ため、denom=="5" は paired・それ以外は after-only 段として扱う。
 RUN_RE = re.compile(
-    r"^(?P<ts>\d{8}T\d{6}Z)-scan-profile-(?P<side>before|after)-sel1of(?P<denom>5|3)-run(?P<pair>\d+)\.log$"
+    r"^(?P<ts>\d{8}T\d{6}Z)-scan-profile-(?P<side>before|after)-sel1of(?P<denom>\d{1,3})-run(?P<pair>\d+)\.log$"
 )
 
 
@@ -88,11 +102,14 @@ def extract(text: str, pattern: str) -> float | None:
     return float(m.group(1))
 
 
-def collect(dir_path: str, session_ts: str) -> tuple[dict, dict]:
-    """(sel1of5 系列, sel1of3 after-only 系列) を
-    side/denom → metric_name → {pair: value} へ集約する。"""
+def collect(dir_path: str, session_ts: str) -> tuple[dict, dict, str | None]:
+    """(sel1of5 系列, after-only 系列, after-only 段の分母文字列) を
+    side/denom → metric_name → {pair: value} へ集約する。after-only 段の
+    分母は実際に見つかったログ名から拾う（`AB_AFTER_ONLY_SELECTIVITY` の
+    分母をそのまま反映。PR #669 codex-review 指摘）。"""
     sel1of5: dict = {"before": {}, "after": {}}
-    sel1of3_after: dict = {}
+    after_only: dict = {}
+    after_only_denom: str | None = None
     for entry in sorted(os.listdir(dir_path)):
         m = RUN_RE.match(entry)
         if not m or m.group("ts") != session_ts:
@@ -117,7 +134,16 @@ def collect(dir_path: str, session_ts: str) -> tuple[dict, dict]:
                     bucket.setdefault(name, {})[pair] = v
         else:
             if side != "after":
-                print(f"ERROR: unexpected before-side sel1of3 run: {entry}", file=sys.stderr)
+                print(f"ERROR: unexpected before-side after-only run: {entry}", file=sys.stderr)
+                sys.exit(2)
+            if after_only_denom is None:
+                after_only_denom = denom
+            elif after_only_denom != denom:
+                print(
+                    f"ERROR: mixed after-only selectivity denominators in session "
+                    f"{session_ts}: {after_only_denom} vs {denom} ({entry})",
+                    file=sys.stderr,
+                )
                 sys.exit(2)
             if "index_mask_scans_delta" not in text:
                 print(
@@ -136,8 +162,8 @@ def collect(dir_path: str, session_ts: str) -> tuple[dict, dict]:
             for _section, name, pattern in AFTER_ONLY_METRICS:
                 v = extract(text, pattern)
                 if v is not None:
-                    sel1of3_after.setdefault(name, {})[pair] = v
-    return sel1of5, sel1of3_after
+                    after_only.setdefault(name, {})[pair] = v
+    return sel1of5, after_only, after_only_denom
 
 
 def min_median(values: list[float]) -> tuple[float, float]:
@@ -194,18 +220,37 @@ def main() -> int:
             return 2
         session_ts = sessions[0]
 
-    sel1of5, sel1of3_after = collect(dir_path, session_ts)
+    sel1of5, after_only, after_only_denom = collect(dir_path, session_ts)
 
-    for side in ("before", "after"):
-        for _section, name, _pattern in ALL_METRICS:
-            pairs = sel1of5[side].get(name, {})
-            if len(pairs) < MIN_PAIRS:
-                print(
-                    f"ERROR: sel1of5[{side}][{name}]: only {len(pairs)} runs found "
-                    f"(< {MIN_PAIRS} required, per docs/design/benchmark-judgement-policy.md §3)",
-                    file=sys.stderr,
-                )
-                return 2
+    # 指標ごとに before/after 共通の run 番号（pair）だけを集計対象にする
+    # （`scripts/bench_scalar_index_crossdb_ab_summarize.py` の対応済み
+    # ペア限定と同型。PR #669 codex-review 指摘）。対応しない余剰 run が
+    # min-of-N・median を歪めるのを防ぐため、共通集合が MIN_PAIRS 未満
+    # なら拒否する。
+    matched_pairs_by_name: dict[str, set[int]] = {}
+    pair_errors: list[str] = []
+    for _section, name, _pattern in ALL_METRICS:
+        before_pairs = set(sel1of5["before"].get(name, {}).keys())
+        after_pairs = set(sel1of5["after"].get(name, {}).keys())
+        if not before_pairs and not after_pairs:
+            continue
+        matched = before_pairs & after_pairs
+        matched_pairs_by_name[name] = matched
+        if len(matched) < MIN_PAIRS:
+            pair_errors.append(
+                f"sel1of5[{name}]: matched run pairs={len(matched)} (< {MIN_PAIRS} required); "
+                f"before runs={sorted(before_pairs)} after runs={sorted(after_pairs)}"
+            )
+    if pair_errors:
+        print(
+            "ERROR: insufficient or mismatched run pairs "
+            f"(N >= {MIN_PAIRS} matched pairs required per "
+            "docs/design/benchmark-judgement-policy.md §3):",
+            file=sys.stderr,
+        )
+        for e in pair_errors:
+            print(f"  - {e}", file=sys.stderr)
+        return 2
 
     print(f"# session_ts={session_ts}", file=sys.stderr)
 
@@ -245,10 +290,13 @@ def main() -> int:
     ]
     print("\t".join(header))
     for section, name, _pattern in ALL_METRICS:
-        before_vals = list(sel1of5["before"].get(name, {}).values())
-        after_vals = list(sel1of5["after"].get(name, {}).values())
-        if not before_vals or not after_vals:
+        matched = matched_pairs_by_name.get(name)
+        if not matched:
             continue
+        before_by_pair = sel1of5["before"].get(name, {})
+        after_by_pair = sel1of5["after"].get(name, {})
+        before_vals = [before_by_pair[p] for p in matched]
+        after_vals = [after_by_pair[p] for p in matched]
         b_min, b_median = min_median(before_vals)
         a_min, a_median = min_median(after_vals)
         ratio = a_min / b_min if b_min else float("nan")
@@ -267,11 +315,18 @@ def main() -> int:
         ]
         print("\t".join(row))
 
-    # after-only（1/3）段: min/median のみ（before 対照なし）。
-    if sel1of3_after:
-        print("# after-only (selectivity=1/3) section: min/median only, no before comparison", file=sys.stderr)
+    # after-only（既定 1/3・実際の分母は after_only_denom）段:
+    # min/median のみ（before 対照なし）。分母はログ名から拾った実際の
+    # 値をそのまま表示する（PR #669 codex-review 指摘。既定 1/3 以外の
+    # 分母を指定しても常に "1/3" と表示されていた不整合を解消）。
+    if after_only:
+        denom_label = f"1/{after_only_denom}" if after_only_denom is not None else "unknown"
+        print(
+            f"# after-only (selectivity={denom_label}) section: min/median only, no before comparison",
+            file=sys.stderr,
+        )
         for _section, name, _pattern in AFTER_ONLY_METRICS:
-            pairs = sel1of3_after.get(name, {})
+            pairs = after_only.get(name, {})
             if not pairs:
                 continue
             vals = list(pairs.values())

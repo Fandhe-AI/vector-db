@@ -44,12 +44,14 @@
 #   AB_PAIRS（既定 5・5 未満は拒否）: 既定選択率（1/5）でのペア数。
 #   AB_ROUNDS（既定 5。`BENCH_SCAN_PROFILE_ROUNDS` として子プロセスへ渡す）。
 #   AB_AFTER_ONLY_SELECTIVITY（既定 1/3。空文字で after-only 段を無効化。
-#     `1/<2-100>` 形式のみ受理）。
+#     `1/<2-100>` 形式のみ受理。分母はログ名・loadavg ラベルへそのまま
+#     反映される。分母 5 は paired 系列〔常に固定 sel1of5〕と衝突するため拒否）。
 #   OUT_DIR（既定 docs/design/bench-data/filtered-distance-mask-ab）。
 #   BENCH_DEDICATED_ENV は子プロセスへそのまま継承する（専有環境自己申告）。
 #
 # 出力: <OUT_DIR>/<ts>-scan-profile-<before|after>-sel1of5-run<N>.log
-#       <OUT_DIR>/<ts>-scan-profile-after-sel1of3-run<N>.log（after-only 段）
+#       <OUT_DIR>/<ts>-scan-profile-after-sel1of<denom>-run<N>.log（after-only 段。
+#       <denom> は AB_AFTER_ONLY_SELECTIVITY の分母。既定 3）
 #       <OUT_DIR>/<ts>-scan-profile-loadavg.log（各 run 直前の /proc/loadavg）
 #       <OUT_DIR>/<ts>-scan-profile-env.txt
 #
@@ -109,8 +111,21 @@ if ! [[ "${AB_ROUNDS}" =~ ^[0-9]+$ ]] || [ "${AB_ROUNDS}" -lt 5 ] || [ "${AB_ROU
 fi
 
 AB_AFTER_ONLY_SELECTIVITY="${AB_AFTER_ONLY_SELECTIVITY-1/3}"
-if [ -n "${AB_AFTER_ONLY_SELECTIVITY}" ] && ! [[ "${AB_AFTER_ONLY_SELECTIVITY}" =~ ^1/([2-9]|[1-9][0-9])$ ]]; then
+if [ -n "${AB_AFTER_ONLY_SELECTIVITY}" ] && ! [[ "${AB_AFTER_ONLY_SELECTIVITY}" =~ ^1/([2-9]|[1-9][0-9]|100)$ ]]; then
   die "AB_AFTER_ONLY_SELECTIVITY must be of the form 1/<2-100> or empty, got: ${AB_AFTER_ONLY_SELECTIVITY}"
+fi
+# 分母のみを抽出し、ログ名・loadavg ラベルへ反映する（PR #669 codex-review
+# 指摘。既定 1/3 のときは既存互換の "sel1of3" のまま）。paired 系列は常に
+# 分母 5 固定（下記ループのリテラル "sel1of5"）のため、after-only 側が
+# 同じ分母 5 を指すと同一セッション内でファイル名が衝突し得る——衝突自体は
+# 既存の「既存ログを上書きしない」ガードで検知されるが、原因が分かりにくい
+# ため事前に明示エラーで止める。
+AFTER_ONLY_DENOM=""
+if [ -n "${AB_AFTER_ONLY_SELECTIVITY}" ]; then
+  AFTER_ONLY_DENOM="${AB_AFTER_ONLY_SELECTIVITY#1/}"
+  if [ "${AFTER_ONLY_DENOM}" = "5" ]; then
+    die "AB_AFTER_ONLY_SELECTIVITY=1/5 collides with the hardcoded sel1of5 pair series filenames; choose a different denominator"
+  fi
 fi
 
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/docs/design/bench-data/filtered-distance-mask-ab}"
@@ -167,24 +182,31 @@ ENV_FILE="${OUT_DIR}/${TS}-scan-profile-env.txt"
 } > "${ENV_FILE}"
 
 # --- ペア計測（既定選択率 1/5。before/after 共通・selectivity opt-in を渡さない）。
+# 親シェルの環境に BENCH_SCAN_PROFILE_SELECTIVITY が残っていても after
+# バイナリへ継承されないよう `env -u` で明示的に取り除く（PR #669
+# codex-review 指摘。取り除かないと before の 1/5 固定輪番と after の
+# 継承済み選択率が同じ sel1of5 系列名の下で混在し得る）。
 for pair in $(seq 1 "${AB_PAIRS}"); do
   for side in before after; do
     bin="${BEFORE_BIN}"; [[ "${side}" == after ]] && bin="${AFTER_BIN}"
     log="${OUT_DIR}/${TS}-scan-profile-${side}-sel1of5-run${pair}.log"
     [[ -e "${log}" ]] && die "raw log already exists (refusing to overwrite): ${log}"
     record_loadavg "scan-profile/${side}/sel1of5/run${pair}"
-    BENCH_SCAN_PROFILE_ROUNDS="${AB_ROUNDS}" "${bin}" --bench > "${log}" 2>&1
+    env -u BENCH_SCAN_PROFILE_SELECTIVITY BENCH_SCAN_PROFILE_ROUNDS="${AB_ROUNDS}" "${bin}" --bench > "${log}" 2>&1
   done
 done
 
-# --- after-only 段（crossdb fixture 相当の選択率 33%。I 系列・
+# --- after-only 段（既定は crossdb fixture 相当の選択率 33%。I 系列・
 # index_mask_scans_delta を含む #654 適用後専用の内訳を、#653 の
-# in-binary 対照値と併記する位置づけで記録する）。
+# in-binary 対照値と併記する位置づけで記録する）。ログ名・loadavg ラベルは
+# 実際に使う選択率の分母（AFTER_ONLY_DENOM）を反映する（PR #669
+# codex-review 指摘。AB_AFTER_ONLY_SELECTIVITY を既定の 1/3 以外へ
+# 変更しても常に "sel1of3" と記録されていた不整合を解消）。
 if [ -n "${AB_AFTER_ONLY_SELECTIVITY}" ]; then
   for pair in $(seq 1 "${AB_PAIRS}"); do
-    log="${OUT_DIR}/${TS}-scan-profile-after-sel1of3-run${pair}.log"
+    log="${OUT_DIR}/${TS}-scan-profile-after-sel1of${AFTER_ONLY_DENOM}-run${pair}.log"
     [[ -e "${log}" ]] && die "raw log already exists (refusing to overwrite): ${log}"
-    record_loadavg "scan-profile/after/sel1of3/run${pair}"
+    record_loadavg "scan-profile/after/sel1of${AFTER_ONLY_DENOM}/run${pair}"
     BENCH_SCAN_PROFILE_ROUNDS="${AB_ROUNDS}" BENCH_SCAN_PROFILE_SELECTIVITY="${AB_AFTER_ONLY_SELECTIVITY}" \
       "${AFTER_BIN}" --bench > "${log}" 2>&1
   done
