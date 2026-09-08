@@ -30,14 +30,16 @@ mod harness;
 use std::collections::BTreeSet;
 
 use harness::hybrid_profile::{
-    boundary_tie_decision, bucket_diff, build_actually_succeeds, collect_body_strings,
-    dense_refetch_schedule, expected_visible_count, fetch_cap, generate_corpus, generate_queries,
-    initial_fetch_k, is_exhaustive, next_fetch_k, parse_rows, parse_visible_ratio_denominator,
-    refetch_schedule_matches_observed_calls, refuse_under_github_actions,
-    render_baseline_bucket_line, render_dense_refetch_line, render_memory_line,
-    render_sparse_refetch_line, render_sparse_refetch_summary_line, render_stage_line,
-    replica_matches_real, select_visible_ids, sql_dense_statement,
-    sql_dense_statement_with_projection, sql_hybrid_statement,
+    bodyclone_replica, boundary_tie_decision, bucket_diff, build_actually_succeeds,
+    collect_body_strings, dense_refetch_schedule, expected_visible_count, fetch_cap,
+    generate_corpus, generate_queries, initial_fetch_k, is_exhaustive, next_fetch_k, parse_rows,
+    parse_visible_ratio_denominator, refetch_schedule_matches_observed_calls,
+    refuse_under_github_actions, render_baseline_bucket_line, render_cache_stats_delta_line,
+    render_dense_refetch_line, render_memory_line, render_sparse_refetch_line,
+    render_sparse_refetch_summary_line, render_sql_surface_bucket_line,
+    render_sql_surface_round_raw_line, render_sql_surface_summary_line, render_stage_line,
+    replica_matches_real, rowcopy_replica, scan_replica, select_visible_ids, slotmap_replica,
+    sql_dense_statement, sql_dense_statement_with_projection, sql_hybrid_statement,
     sql_hybrid_statement_with_projection, summarize_sparse_refetch, tokenize_only,
     tokenize_term_doc_freq, tokenize_term_freq, HybridProjection, ProfileError, ProfileSparseIndex,
     RefetchSchedule, TieDecision, MAX_CORPUS_DOCS_GUARD, MAX_FETCH_K_MIRROR, MAX_POOL_DEPTH_MIRROR,
@@ -51,9 +53,11 @@ use harness::hybrid_profile::sparse_refetch_schedule;
 
 use harness::hybrid_latency::RefetchTrackingProvider;
 
+use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::hybrid::{hybrid_search, RrfConfig};
 use engine::kernel::SearchInput;
 use engine::parallel_search::ParallelSearchProvider;
+use engine::row_codec::{encode_scalar_columns, Value};
 use engine::sparse::SparseIndex;
 
 // --- generate_corpus: 決定性・形状 ---
@@ -952,4 +956,167 @@ fn expected_visible_count_never_yields_zero_for_rows_at_least_1() {
         expected_visible_count(1, MAX_VISIBLE_RATIO_DENOMINATOR).unwrap(),
         1
     );
+}
+
+// =============================================================================
+// Issue #660: SQL 表層固定コスト内訳（S0〜S8）ヘルパの回帰テスト
+// =============================================================================
+
+fn issue660_schema() -> TableSchema {
+    TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(4), false),
+            ColumnDef::new("body", ColumnType::Text, false),
+        ],
+    )
+}
+
+#[test]
+fn scan_replica_processes_every_encoded_row_and_matches_visible_count() {
+    let schema = issue660_schema();
+    let bodies = ["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+    let encoded: Vec<Vec<u8>> = bodies
+        .iter()
+        .map(|b| {
+            encode_scalar_columns(&schema, &[Value::Null, Value::Text(b.clone())])
+                .expect("encode fixture row")
+        })
+        .collect();
+    assert_eq!(scan_replica(&schema, &encoded), bodies.len());
+}
+
+#[test]
+#[should_panic(expected = "malformed row")]
+fn scan_replica_fails_closed_on_malformed_row() {
+    let schema = issue660_schema();
+    let bogus = vec![vec![0xffu8; 4]];
+    let _ = scan_replica(&schema, &bogus);
+}
+
+#[test]
+fn rowcopy_replica_processes_every_row() {
+    let ids: Vec<u64> = vec![0, 1, 2, 3];
+    let dim = 4usize;
+    let vectors: Vec<f32> = (0..ids.len() * dim).map(|i| i as f32).collect();
+    assert_eq!(rowcopy_replica(&ids, &vectors, dim, "tenant-a"), ids.len());
+}
+
+#[test]
+fn rowcopy_replica_handles_empty_input() {
+    assert_eq!(rowcopy_replica(&[], &[], 4, "tenant-a"), 0);
+}
+
+#[test]
+fn slotmap_replica_returns_slot_count_matching_ids_len() {
+    let ids: Vec<u64> = vec![10, 20, 30, 10]; // 重複あり（同一 id が複数スロットに現れうる契約）
+    assert_eq!(slotmap_replica(&ids), ids.len());
+}
+
+#[test]
+fn bodyclone_replica_processes_every_body() {
+    let bodies = vec!["one".to_string(), "two".to_string()];
+    assert_eq!(bodyclone_replica(&bodies), bodies.len());
+}
+
+#[test]
+fn bodyclone_replica_handles_empty_input() {
+    let bodies: Vec<String> = Vec::new();
+    assert_eq!(bodyclone_replica(&bodies), 0);
+}
+
+#[test]
+fn render_sql_surface_round_raw_line_formats_all_stages() {
+    let line = render_sql_surface_round_raw_line(1, &[("S0", 100), ("S1", 20), ("S2", 5)]);
+    assert_eq!(
+        line,
+        "hybrid_profile: sql_surface_breakdown_raw round=1 S0=100us S1=20us S2=5us"
+    );
+}
+
+#[test]
+fn render_sql_surface_round_raw_line_handles_empty_values() {
+    let line = render_sql_surface_round_raw_line(2, &[]);
+    assert_eq!(line, "hybrid_profile: sql_surface_breakdown_raw round=2");
+}
+
+#[test]
+fn render_sql_surface_summary_line_formats_min_median() {
+    let line = render_sql_surface_summary_line("S4_scan_replica", 10, 15);
+    assert_eq!(
+        line,
+        "hybrid_profile: sql_surface_breakdown_summary stage=S4_scan_replica min=10us median=15us"
+    );
+}
+
+#[test]
+fn render_sql_surface_bucket_line_formats_present_diff() {
+    let line = render_sql_surface_bucket_line("hybrid_only", Some(3100), Some(34.76));
+    assert_eq!(
+        line,
+        "hybrid_profile: sql_surface_breakdown_bucket label=hybrid_only diff=3100us ratio_of_b1=34.76%"
+    );
+}
+
+#[test]
+fn render_sql_surface_bucket_line_formats_inverted_diff() {
+    let line = render_sql_surface_bucket_line("unexplained_common", None, None);
+    assert_eq!(
+        line,
+        "hybrid_profile: sql_surface_breakdown_bucket label=unexplained_common diff=n/a(inverted) ratio_of_b1=n/a"
+    );
+}
+
+#[test]
+fn render_cache_stats_delta_line_reports_nonvacuous_hit_growth() {
+    let line = render_cache_stats_delta_line("sql_arena_hits", 5, 55, 50, true);
+    assert_eq!(
+        line,
+        "hybrid_profile: cache_stats_delta name=sql_arena_hits before=5 after=55 delta=50 expected_min=50 nonvacuous=true"
+    );
+}
+
+#[test]
+fn render_cache_stats_delta_line_reports_vacuous_when_delta_below_expected() {
+    let line = render_cache_stats_delta_line("hnsw_hits", 0, 0, 0, false);
+    assert_eq!(
+        line,
+        "hybrid_profile: cache_stats_delta name=hnsw_hits before=0 after=0 delta=0 expected_min=0 nonvacuous=false"
+    );
+}
+
+#[test]
+fn render_cache_stats_delta_line_delta_saturates_when_counter_decreases() {
+    // カウンタは単調増加が既定契約だが、レンダラ自体は `saturating_sub` で
+    // 逆転時にパニックしない（呼び出し元の非 vacuous 判定と表示を分離する）。
+    let line = render_cache_stats_delta_line("stale_evictions", 10, 3, 0, false);
+    assert_eq!(
+        line,
+        "hybrid_profile: cache_stats_delta name=stale_evictions before=10 after=3 delta=0 expected_min=0 nonvacuous=false"
+    );
+}
+
+#[test]
+fn scan_rowcopy_slotmap_bodyclone_replicas_are_deterministic_across_repeated_calls() {
+    let schema = issue660_schema();
+    let bodies = vec!["x".to_string(), "y".to_string()];
+    let encoded: Vec<Vec<u8>> = bodies
+        .iter()
+        .map(|b| {
+            encode_scalar_columns(&schema, &[Value::Null, Value::Text(b.clone())])
+                .expect("encode fixture row")
+        })
+        .collect();
+    let ids: Vec<u64> = vec![0, 1];
+    let vectors: Vec<f32> = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+    assert_eq!(
+        scan_replica(&schema, &encoded),
+        scan_replica(&schema, &encoded)
+    );
+    assert_eq!(
+        rowcopy_replica(&ids, &vectors, 4, "t"),
+        rowcopy_replica(&ids, &vectors, 4, "t")
+    );
+    assert_eq!(slotmap_replica(&ids), slotmap_replica(&ids));
+    assert_eq!(bodyclone_replica(&bodies), bodyclone_replica(&bodies));
 }

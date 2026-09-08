@@ -84,7 +84,7 @@ if [ "${1:-}" = "--summarize" ]; then
             for side in before after; do
                 pair_file="$dir/${cond_label}_pair${pair_num}_${side}.log"
                 [ -e "$pair_file" ] || continue
-                if grep -H -E 'baseline_round_raw|baseline_summary|baseline reference_band|^hybrid_profile: rows=|^# loadavg_before_run=|^# running_processes_excluding_self=|^# top_cpu_processes=' "$pair_file"; then
+                if grep -H -E 'baseline_round_raw|baseline_summary|baseline reference_band|sql_surface_breakdown_raw|sql_surface_breakdown_summary|sql_surface_breakdown_bucket|cache_stats_delta|^hybrid_profile: rows=|^# loadavg_before_run=|^# running_processes_excluding_self=|^# top_cpu_processes=' "$pair_file"; then
                     found=1
                 fi
             done

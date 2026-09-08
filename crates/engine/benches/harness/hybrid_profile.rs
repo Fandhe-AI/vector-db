@@ -62,9 +62,11 @@ use std::fmt::Write as _;
 // `RrfConfig`（同関数内でのみ使う）の import もそこに限定する。モジュール本体は
 // 既定 feature でもコンパイルする（`mod.rs` の `pub mod hybrid_profile;` コメント
 // 参照）。
+use engine::catalog::TableSchema;
 #[cfg(feature = "bench-internals")]
 use engine::hybrid::{sparse_refetch_observed, RrfConfig};
 use engine::kernel::{SearchInput, SearchProvider};
+use engine::row_codec::{scan_scalar_columns, Value};
 use engine::sparse::{tokenize, DocId, ScoredDoc, SparseIndex};
 
 use super::hybrid_latency::RefetchSummary;
@@ -647,6 +649,150 @@ pub fn render_baseline_bucket_line(
         None => "n/a".to_string(),
     };
     format!("baseline_bucket label={label} diff={diff_field} ratio_of_b1={ratio_field} band={band}")
+}
+
+// =============================================================================
+// Issue #660: SQL 表層固定コスト（B1-B4）の再分解（S0〜S8）
+// =============================================================================
+//
+// 親 Issue #652・ルート #649。`sql/exec.rs` の hybrid `Ranking::Hybrid` 分岐は
+// `cache_fast_path_eligible = filters_empty && !is_hybrid`（hybrid は常に対象外）
+// のため、疎索引キャッシュ（`SparseIndexCache`）がヒットしていても可視全行に
+// ついて `VectorArena::build_from_cached_rls_rows` の行ループ
+// （`push_visible_row`＋`on_visible_row` の構造検証）を再実行する。以下は
+// その行ループの構成要素を複製した「時間非依存」関数群であり、
+// `hybrid_profile_bench.rs` が計測タイマーで包んで S4〜S7 として実測する。
+//
+// # 複製近似の限界（下限であって上限ではない）
+//
+// これらの複製は `sql/exec.rs::on_visible_row`／`VectorArena::push_visible_row`
+// の該当ロジックを手動転記した近似であり、production 経路が追加で行う
+// `try_accumulate_budget` の予算検証・`debug_assert!`・`try_reserve_exact` の
+// 成長パターン差（`Vec::push` の償却確保と挙動が異なりうる）は複製しない。
+// そのため実測値は production 経路のコストの**下限**として読み、production
+// との差は `unexplained_hybrid`（`hybrid_only - (S4+S5)`）として上限（ceiling）
+// のみ報告する（`hybrid_profile_bench.rs` の帰属表参照）。
+
+/// S4 複製: `on_visible_row` の構造検証部（`row_codec::scan_scalar_columns` を
+/// 可視行ぶん繰り返す）。処理した行数を返す（呼び出し元の非 vacuous 検証・
+/// `visible_count` との突き合わせに使う）。事前エンコード済み `encoded_rows`
+/// （`row_codec::encode_scalar_columns` の出力）を受け取り、redb からの読み出し
+/// 自体は含まない（`hybrid_profile_bench.rs` が一時 DB 投入時と同じ
+/// エンコード関数で事前に用意する）。
+pub fn scan_replica(schema: &TableSchema, encoded_rows: &[Vec<u8>]) -> usize {
+    let mut count = 0usize;
+    for buf in encoded_rows {
+        // untrusted 入力ではなく本ベンチが自ら組み立てた fixture のため、
+        // 構造不整合は fixture 側のバグを意味する（fail-closed に落とす）。
+        scan_scalar_columns(schema, buf)
+            .expect("scan_replica: malformed row (bench fixture invariant violated)");
+        count += 1;
+    }
+    count
+}
+
+/// S5 複製: `VectorArena::push_visible_row`（id・vector・tenant_id 文字列複製・
+/// 可視性フラグの積み上げ）＋ `on_visible_row` 末尾の `candidate_columns:
+/// Vec<Vec<Value>>` への空 `Vec` push（`SELECT id` 相当。列取得なしの投影）を
+/// 複製する。処理した行数を返す。
+pub fn rowcopy_replica(ids: &[u64], vectors: &[f32], dim: usize, tenant_id: &str) -> usize {
+    let mut out_ids: Vec<u64> = Vec::with_capacity(ids.len());
+    let mut out_vectors: Vec<f32> = Vec::with_capacity(ids.len() * dim);
+    let mut out_tenants: Vec<String> = Vec::with_capacity(ids.len());
+    let mut out_visibilities: Vec<bool> = Vec::with_capacity(ids.len());
+    let mut candidate_columns: Vec<Vec<Value>> = Vec::with_capacity(ids.len());
+    for (i, &id) in ids.iter().enumerate() {
+        out_ids.push(id);
+        out_vectors.extend_from_slice(&vectors[i * dim..(i + 1) * dim]);
+        out_tenants.push(tenant_id.to_string());
+        out_visibilities.push(true);
+        candidate_columns.push(Vec::new());
+    }
+    debug_assert_eq!(out_ids.len(), ids.len());
+    debug_assert_eq!(out_tenants.len(), ids.len());
+    debug_assert_eq!(out_visibilities.len(), ids.len());
+    // 確保したバッファは計測対象の副作用そのもの（drop で解放される）であり、
+    // 呼び出し元へは処理件数のみ返す（`collect_body_strings` と同じ方針）。
+    let _ = (out_vectors,);
+    candidate_columns.len()
+}
+
+/// S6 複製: `slot_ids: Vec<u64>`（0..N 連番）と `core::visible_id_counts`
+/// （`HashMap<u64, usize>`）の毎クエリ O(N) 再構築を複製する。返り値は
+/// `slot_ids` の長さ（`ids.len()` と一致するはずの非 vacuous 検証用）。
+pub fn slotmap_replica(ids: &[u64]) -> usize {
+    let slot_ids: Vec<u64> = (0..ids.len() as u64).collect();
+    let mut counts: std::collections::HashMap<u64, usize> =
+        std::collections::HashMap::with_capacity(ids.len());
+    for &id in ids {
+        *counts.entry(id).or_insert(0) += 1;
+    }
+    debug_assert!(counts.len() <= ids.len());
+    slot_ids.len()
+}
+
+/// S7 複製: `SELECT *` 投影が `on_visible_row` で行う本文列の複製
+/// （`candidate_columns` へ `Value::Text(body.clone())` を積む）。
+/// `projection(B2-B1)` と対にして読む（Issue #465 の既存区分の内訳）。
+pub fn bodyclone_replica(bodies: &[String]) -> usize {
+    let mut candidate_columns: Vec<Vec<Value>> = Vec::with_capacity(bodies.len());
+    for body in bodies {
+        candidate_columns.push(vec![Value::Text(body.clone())]);
+    }
+    candidate_columns.len()
+}
+
+/// S0〜S8 の 1 ラウンド分 raw 出力（`hybrid_profile_bench.rs` の round loop
+/// から呼ぶ）。`values` は `(段名, マイクロ秒)` の順序付きスライス。
+pub fn render_sql_surface_round_raw_line(round: usize, values: &[(&str, u128)]) -> String {
+    let mut out = format!("hybrid_profile: sql_surface_breakdown_raw round={round}");
+    for (name, us) in values {
+        let _ = write!(out, " {name}={us}us");
+    }
+    out
+}
+
+/// S0〜S8 各段の min/median サマリ行。
+pub fn render_sql_surface_summary_line(name: &str, min_us: u128, median_us: u128) -> String {
+    format!(
+        "hybrid_profile: sql_surface_breakdown_summary stage={name} min={min_us}us median={median_us}us"
+    )
+}
+
+/// S1〜S8 から算出する差分区分（§3.2）の 1 行。[`render_baseline_bucket_line`]
+/// と同一の出力語彙（`diff`/`ratio_of_b1`/`band`）を再利用しつつ、接頭辞のみ
+/// 新設の `sql_surface_breakdown_bucket` にして既存 `baseline_bucket` 行との
+/// grep 互換を保つ。
+pub fn render_sql_surface_bucket_line(
+    label: &str,
+    diff_us: Option<u128>,
+    ratio_pct: Option<f64>,
+) -> String {
+    let diff_field = match diff_us {
+        Some(us) => format!("{us}us"),
+        None => "n/a(inverted)".to_string(),
+    };
+    let ratio_field = match ratio_pct {
+        Some(pct) => format!("{pct:.2}%"),
+        None => "n/a".to_string(),
+    };
+    format!("hybrid_profile: sql_surface_breakdown_bucket label={label} diff={diff_field} ratio_of_b1={ratio_field}")
+}
+
+/// world 系キャッシュ統計の増分 1 件（Issue #660 §3.3: hot path の非 vacuous
+/// 証明）。`nonvacuous` は呼び出し元が閾値（例: `delta >= expected_min`）を
+/// 判定した結果をそのまま渡す。
+pub fn render_cache_stats_delta_line(
+    name: &str,
+    before: u64,
+    after: u64,
+    expected_min: u64,
+    nonvacuous: bool,
+) -> String {
+    let delta = after.saturating_sub(before);
+    format!(
+        "hybrid_profile: cache_stats_delta name={name} before={before} after={after} delta={delta} expected_min={expected_min} nonvacuous={nonvacuous}"
+    )
 }
 
 // --- SparseIndex::build 内部 3 段の複製（`sparse.rs::with_params` の近似） -------

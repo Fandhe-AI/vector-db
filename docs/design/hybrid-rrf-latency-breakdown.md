@@ -1688,3 +1688,154 @@ Issue #546・#549 を通しで前後比較した `feature_bench`・`bench-hybrid
 crossdb self・Recall 3 ゲートの結果は `docs/design/
 hybrid-rrf-phase6-before-after.md` に記録した（数値は同 doc 参照。本節では
 転記しない）。production コード無変更・doc 専任。
+
+## Issue #660: SQL 表層固定コスト（B1-B4）の S0〜S8 再分解
+
+親 Issue #652・ルート #649。Issue #465 の帰属表が持つ `sql_surface(B1-B4)`
+区分（B1: SQL hybrid `SELECT id`、B4: `hybrid_search` 直接呼び出し）を、より
+細かい構成要素へ再分解した。
+
+### 背景
+
+crossdb 横断ベンチ（`docs/design/crossdb-bench.md`）では `hybrid_rrf` が self
+（pgvector 比で劣後）の最大要因の一つであり、`bench-hybrid-profile`（B0s〜B8）
+の帰属表では `sql_surface(B1-B4)` が全体の 37〜40% と、疎側 `sparse(B5)` と
+ほぼ同水準の最大区分だった。しかし従来のベンチは `sql_surface` を単一区分
+としてしか持たず、内部（パース・束縛・各キャッシュ照会・SCALAR 段の行ループ・
+投影組み立て）のどこが支配的かは未確定だった。
+
+コード調査で判明した事実: `sql/exec.rs` の hybrid `Ranking::Hybrid` 分岐は
+`cache_fast_path_eligible = filters_empty && !is_hybrid`（hybrid は常に対象外）
+のため、疎索引キャッシュ（`SparseIndexCache`。Issue #357）がヒットしていても
+可視全行について `VectorArena::build_from_cached_rls_rows` の行ループ
+（`push_visible_row` の id・vector・tenant_id 文字列複製、`on_visible_row` の
+`row_codec::scan_scalar_columns` 構造検証、投影列の積み上げ）を再実行する。
+
+### 追加した段（`hybrid_profile_bench.rs`・`harness/hybrid_profile.rs`）
+
+| 段 | 内容 | 性質 |
+| --- | --- | --- |
+| S0 `dense_topk_ref` | `ParallelSearchProvider.search(k=TOP_K)`（B3 の減算対象。B0 は k=dense_fetch_k のため k を揃えた別対照が必要） | 実 API |
+| S1 `parse` | `validate_sql`（双子 DB。同一スキーマ・0 行の別 `Storage`） | 実 API |
+| S2 `schema` | `Storage::get_table_schema`（双子 DB） | 実 API |
+| S3 `bind` | `bind_in_session`（計測区間外で構築済み `ValidatedStatement` を使い、束縛のみ計る） | 実 API |
+| S4 `scan_replica` | `on_visible_row` の構造検証部（`row_codec::scan_scalar_columns` を可視全行分）の複製 | 複製近似 |
+| S5 `rowcopy_replica` | `push_visible_row`（id・vector・tenant_id 文字列複製・可視性フラグ）＋投影スロット積み上げの複製 | 複製近似（下限） |
+| S6 `slotmap_replica` | `slot_ids`／`visible_id_counts`（`HashMap`）の毎クエリ O(N) 再構築の複製 | 複製近似 |
+| S7 `bodyclone_replica` | `SELECT *` 投影が行う本文列複製（既存 `projection(B2-B1)` の実体）の複製 | 複製近似 |
+| S8 `tail` | `RlsSafetyNet::apply`（Top-k のみ）＋ id 投影 | 実 API |
+
+S1〜S3 は行数に依存しないパース・束縛コストを、可視全行を持つ計測用 DB では
+なく同一スキーマ・0 行の「双子 DB」で計測する。move 前に実 DB で 1 回だけ
+束縛して得た `BoundStatement`（`PartialEq` 導出済み）と、双子 DB での束縛
+結果が構造的に一致することを fail-closed に検証してから使う。
+
+### 複製近似の限界
+
+S4〜S7 は `on_visible_row`／`push_visible_row` の該当ロジックを手動転記した
+近似であり、production 経路が追加で行う予算検証（`try_accumulate_budget`）・
+`debug_assert!`・`Vec` の成長パターン差（`try_reserve_exact` と `Vec::push` の
+償却確保の違い）は複製しない。そのため実測値は production コストの**下限**
+として読み、production との差は `unexplained_hybrid`（後述）として上限
+（ceiling）のみ報告する。
+
+### 差分区分（min-of-R 基準・飽和差分）
+
+| 区分 | 式 | 意味 |
+| --- | --- | --- |
+| `common_fixed` | `B3 - S0` | 全 SELECT 共通の SQL 表層固定コスト（パース・束縛・スキーマ・arena 照会・投影組み立て等） |
+| `hybrid_only` | `(B1 - B4) - common_fixed` | hybrid 限定の上乗せ（SCALAR 段の全行再構築＋疎／scalar キャッシュ照会） |
+| `parse_bind` | `S1 + S2 + S3` | パース・束縛・スキーマ取得 |
+| `scalar_stage_replica` | `S4 + S5` | 全行再構築コストの複製下限（`hybrid_only` の上限と対にして挟む） |
+| `unexplained_common` | `common_fixed - (S1+S2+S6+S8)` | arena／sparse／scalar キャッシュ照会・`begin_read`・結果組み立て等、直接計測できない `pub(crate)` 内部処理の合計（上限） |
+| `unexplained_hybrid` | `hybrid_only - scalar_stage_replica` | 疎／scalar キャッシュ照会・予算検証等、複製で表せない残差（上限） |
+| `projection_replica(S7)` | `S7` そのもの | 既存 `projection(B2-B1)` の実体（本文列複製）の複製近似 |
+
+**解釈規則**: 行ループ（SCALAR 段の全行再構築）のコストは `hybrid_only` を
+上限、`scalar_stage_replica(S4+S5)` を下限とする区間で挟んで読む。両者の差
+`unexplained_hybrid` は sparse／scalar キャッシュ照会＋予算検証コストの上限
+（ceiling）であり、それ以上の意味付け（個別照会ごとの値）は行わない。
+
+**キャッシュ照会（arena／sparse／scalar）の直接計測不可について**:
+`SparseIndexCache::lookup`・`SqlArenaCache::lookup`・`ScalarIndexCache::lookup`
+はいずれも `pub(crate)` のため、production コード無変更（A5）を優先し
+本ベンチから直接呼べない。代わりに `EngineCore::{sparse_index_cache_stats,
+sql_arena_cache_stats, scalar_index_cache_stats, hnsw_index_cache_stats}`
+（いずれも公開 observability API）の hit カウンタ増分で、B1 実行が実際に
+キャッシュへ命中していること（非 vacuous）を fail-closed に検証する
+（`cache_stats_delta` 行）。既定エンジン（`SearchEngineKind::Hnsw` を使わない
+構築）では `hnsw_index_cache_stats` の hits 増分は構造的に 0 のはずであり、
+0 以外なら fail-closed で打ち切る。
+
+### 計測条件・実測方法
+
+`make bench-hybrid-profile`（`BENCH_HYBRID_PROFILE_ROUNDS` で交互ラウンド数を
+指定・既定 5）。段別内訳は既存 B0s〜B8 のラウンドループの直後に独立した
+S0〜S8 のラウンドループとして実行し（既存出力行はバイト同一のまま無変更）、
+新規出力行は `sql_surface_breakdown_raw`／`_summary`／`_bucket`・
+`cache_stats_delta` 接頭辞で識別できる（`scripts/bench_hybrid_profile_ab.sh
+--summarize` の grep パターンへ追加済み）。共有 QEMU 環境（本開発環境）での
+実測はいずれも参考値であり、`docs/design/benchmark-judgement-policy.md` の
+専有環境実測（`BENCH_DEDICATED_ENV=1`）と交互 N≥5 判定はオーナー／運用者
+作業として申し送る（`bench-hybrid-profile` 全体の既存運用と同方針）。
+
+### スモークテスト実測（本開発環境・共有 QEMU・rows=500・rounds=5・参考値）
+
+`BENCH_HYBRID_PROFILE_ROWS=500 BENCH_HYBRID_PROFILE_ROUNDS=5` での 1 回実行例
+（行数を縮小した動作確認用の値であり、25,000 行既定の実測値ではない。段の
+相対的な内訳の傾向を確認する目的のみに使う）。
+
+```
+hybrid_profile: sql_surface_breakdown_summary stage=S0_dense_topk_ref min=28us median=28us
+hybrid_profile: sql_surface_breakdown_summary stage=S1_parse min=3us median=3us
+hybrid_profile: sql_surface_breakdown_summary stage=S2_schema min=0us median=0us
+hybrid_profile: sql_surface_breakdown_summary stage=S3_bind min=2us median=2us
+hybrid_profile: sql_surface_breakdown_summary stage=S4_scan_replica min=10us median=10us
+hybrid_profile: sql_surface_breakdown_summary stage=S5_rowcopy_replica min=13us median=13us
+hybrid_profile: sql_surface_breakdown_summary stage=S6_slotmap_replica min=4us median=4us
+hybrid_profile: sql_surface_breakdown_summary stage=S7_bodyclone_replica min=16us median=16us
+hybrid_profile: sql_surface_breakdown_summary stage=S8_tail min=0us median=0us
+hybrid_profile: sql_surface_breakdown_bucket label=common_fixed(B3-S0) diff=22us ratio_of_b1=12.64%
+hybrid_profile: sql_surface_breakdown_bucket label=hybrid_only((B1-B4)-common_fixed) diff=45us ratio_of_b1=25.86%
+hybrid_profile: sql_surface_breakdown_bucket label=parse_bind(S1+S2+S3) diff=6us ratio_of_b1=3.45%
+hybrid_profile: sql_surface_breakdown_bucket label=scalar_stage_replica(S4+S5) diff=24us ratio_of_b1=13.79%
+hybrid_profile: sql_surface_breakdown_bucket label=unexplained_common(common_fixed-(S1+S2+S6+S8)) diff=14us ratio_of_b1=8.05%
+hybrid_profile: sql_surface_breakdown_bucket label=unexplained_hybrid(hybrid_only-scalar_stage_replica) diff=20us ratio_of_b1=11.49%
+hybrid_profile: sql_surface_breakdown_bucket label=projection_replica(S7) diff=16us ratio_of_b1=9.20%
+hybrid_profile: cache_stats_delta name=sql_arena_hits before=100 after=850 delta=750 expected_min=1 nonvacuous=true
+hybrid_profile: cache_stats_delta name=sparse_index_hits before=50 after=550 delta=500 expected_min=1 nonvacuous=true
+hybrid_profile: cache_stats_delta name=hnsw_index_hits before=0 after=0 delta=0 expected_min=0 nonvacuous=true
+```
+
+この規模（500 行）では `scalar_stage_replica(S4+S5)`（下限、約 14%）と
+`hybrid_only`（上限、約 26%）の両方が `hybrid_only ≥ scalar_stage_replica`
+という設計上の期待どおりの順序を保っており、逆転（`n/a`）は発生していない。
+`sql_arena_hits`／`sparse_index_hits` の hit カウンタは非 vacuous（実測ラウンド
+の B1 実行がキャッシュ命中経路を通っていることを裏付ける）で、`hnsw_index_hits`
+は既定エンジンのため期待どおり 0 のまま。25,000 行既定規模での実測値・
+専有環境実測はオーナー／運用者作業として申し送る。
+
+### 改善候補（優先度付き起票案。実装は本 Issue の対象外・ユーザー承認後に別 Issue）
+
+| 優先度 | 候補 | seam | 期待効果（仮説） | リスク・維持すべき契約 |
+| --- | --- | --- | --- | --- |
+| P1 | hybrid でも疎キャッシュヒット時（`skip_sparse_accumulation && needed_column_indices.is_empty()`）は `cache_fast_path_eligible` 相当の高速経路を通し、`build_from_cached_rls_rows` の全行再構築を省略する | `sql/exec.rs` `cache_fast_path_eligible` 判定 | `hybrid_only` 区分（本スモークテストの規模では B1 の約 26%）の大半 | 単一スナップショット契約・`RlsSafetyNet` 不変・`SqlArenaSnapshot` 借用時のスロット添字契約 |
+| P2 | hybrid の投影列（`SELECT *`・`body`）にも `defer_projection` を適用する（疎キャッシュヒット時は本文複製が不要） | `sql/exec.rs` `defer_projection` 判定・`ScalarSource::Deferred` | `projection(B2-B1)`（既存区分。`projection_replica(S7)` 実測値ぶん） | 疎キャッシュミス時は従来経路へ戻す fail-closed 分岐が必要 |
+| P3 | `slot_ids`／`visible_id_counts` の毎クエリ O(N) 確保を削減する（スナップショットに同梱、または恒等写像時の省略） | `sql/exec.rs` の slot map 構築箇所・`core::visible_id_counts` | S6 実測値ぶん | `provider_result_is_valid` の検証契約を維持する必要 |
+| P4 | パース・束縛のセッション内キャッシュ | Issue #360 で 5% ゲート評価済み | S1〜S3 実測値ぶん | 再提案ではなく Issue #360 の結論へのリンクに留め、S1〜S3 が閾値を超える場合のみ再検討を提案 |
+
+いずれも production コード（`crates/engine/src/`）を変更する前にユーザー承認
+が必要（実装は本 Issue の対象外・テスト専任）。
+
+### スコープ外・申し送り
+
+- 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測・25,000 行既定規模での確定
+  実測値の記録はオーナー／運用者作業
+- wire 側（`bench-hybrid-wire-profile` の `T2−T1p`）の内訳分解は本 Issue の
+  対象外（本 Issue の対象は engine 内 `B1−B4` 区分）
+- `bench-internals` フックによる `SqlArenaCache`／`SparseIndexCache` の直接
+  計測は production 無変更の受入基準に反するため見送り。必要なら後続 Issue
+  として起票する
+- 改善候補 P1〜P4 の実装は本 Issue では行わない
+- production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
+  無変更・テスト・ベンチ・docs 専任

@@ -81,13 +81,15 @@ use std::collections::BTreeSet;
 use harness::env_report::EnvReport;
 use harness::hybrid_latency::RefetchTrackingProvider;
 use harness::hybrid_profile::{
-    bucket_diff, collect_body_strings, dense_refetch_schedule, expected_visible_count, fetch_cap,
-    generate_corpus, generate_queries, initial_fetch_k, refetch_schedule_matches_observed_calls,
-    refuse_under_github_actions, render_baseline_bucket_line, render_dense_refetch_line,
-    render_sparse_refetch_line, render_sparse_refetch_summary_line, render_stage_line,
+    bodyclone_replica, bucket_diff, collect_body_strings, dense_refetch_schedule,
+    expected_visible_count, fetch_cap, generate_corpus, generate_queries, initial_fetch_k,
+    refetch_schedule_matches_observed_calls, refuse_under_github_actions,
+    render_baseline_bucket_line, render_cache_stats_delta_line, render_dense_refetch_line,
+    render_sparse_refetch_line, render_sparse_refetch_summary_line, render_sql_surface_bucket_line,
+    render_sql_surface_round_raw_line, render_sql_surface_summary_line, render_stage_line,
     replica_matches_real, resolve_rows_from_env, resolve_visible_ratio_denominator_from_env,
-    select_visible_ids, sparse_refetch_schedule, sql_dense_statement,
-    sql_dense_statement_with_projection, sql_hybrid_statement,
+    rowcopy_replica, scan_replica, select_visible_ids, slotmap_replica, sparse_refetch_schedule,
+    sql_dense_statement, sql_dense_statement_with_projection, sql_hybrid_statement,
     sql_hybrid_statement_with_projection, summarize_sparse_refetch, tokenize_only,
     tokenize_term_doc_freq, tokenize_term_freq, HybridProjection, ProfileSparseIndex,
     SQL_DEFAULT_HYBRID_POOL_DEPTH,
@@ -104,9 +106,13 @@ use engine::hybrid::{hybrid_search, rrf_fuse, sparse_refetch_observed, RrfConfig
 use engine::kernel::{CandidateHit, CpuScalarProvider, SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
+use engine::rls::RlsSafetyNet;
 use engine::row_codec::{encode_scalar_columns, Value};
 use engine::search_engine;
 use engine::sparse::{ScoredDoc, SparseIndex};
+use engine::sql::allowlist::{validate_sql, Statement as SqlStatement};
+use engine::sql::mode::SessionState;
+use engine::sql::parser::bind_in_session;
 use engine::storage::{RowInput, Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
@@ -305,6 +311,72 @@ fn main() {
         engine::tenant::insert_rows(&storage, TABLE, &ctx, &rows, &op_id)
             .expect("seed batch insert");
         next_id += batch_len;
+    }
+
+    // --- Issue #660: 双子 DB（同一スキーマ・0 行）の準備 ------------------------
+    // S1(parse)/S2(schema)/S3(bind) はパース・束縛コストが行数に依存しない
+    // （`validate_sql` はテーブル存在確認のみ、`bind_in_session` は列解決のみで
+    // 行データを見ない）ことを利用し、可視全行を持つ `storage`（この直後
+    // `EngineCore::from_storage` へ move する）とは別の、同一スキーマ・0 行の
+    // 「双子 DB」で計測する。move 前に実 DB で 1 回だけ束縛して `BoundStatement`
+    // を退避し、双子 DB での束縛結果と構造的に一致することを fail-closed に
+    // 確認する（§3.3: 忠実性検証。`BoundStatement` は `PartialEq` を導出済み）。
+    let issue660_fidelity_query = &queries[0];
+    let issue660_fidelity_sql = sql_hybrid_statement_with_projection(
+        TABLE,
+        VECTOR_COLUMN,
+        TEXT_COLUMN,
+        &issue660_fidelity_query.vector,
+        &issue660_fidelity_query.text,
+        TOP_K,
+        HybridProjection::Id,
+    )
+    .unwrap_or_else(|e| fail_closed(format!("Issue #660 fidelity statement build failed: {e}")));
+    let issue660_session = SessionState::default();
+    let issue660_real_validated = match validate_sql(&issue660_fidelity_sql, &storage)
+        .unwrap_or_else(|e| fail_closed(format!("Issue #660 real DB validate_sql failed: {e}")))
+    {
+        SqlStatement::Select(validated) => validated,
+        other => fail_closed(format!(
+            "Issue #660 fidelity statement is not a SELECT (unexpected variant): {other:?}"
+        )),
+    };
+    let issue660_real_bound = bind_in_session(
+        &issue660_real_validated,
+        &schema,
+        issue660_session.search_mode(),
+        issue660_session.udfs(),
+    )
+    .unwrap_or_else(|e| fail_closed(format!("Issue #660 real DB bind_in_session failed: {e}")));
+
+    let issue660_twin_path = unique_db_path("issue660-hybrid-profile-twin");
+    let _issue660_twin_guard = CleanupGuard(issue660_twin_path.clone());
+    let issue660_twin_storage =
+        Storage::open(&issue660_twin_path).expect("open twin storage for Issue #660");
+    issue660_twin_storage
+        .create_table(&schema)
+        .expect("create twin table for Issue #660");
+    let issue660_twin_validated = match validate_sql(&issue660_fidelity_sql, &issue660_twin_storage)
+        .unwrap_or_else(|e| fail_closed(format!("Issue #660 twin DB validate_sql failed: {e}")))
+    {
+        SqlStatement::Select(validated) => validated,
+        other => fail_closed(format!(
+            "Issue #660 twin fidelity statement is not a SELECT (unexpected variant): {other:?}"
+        )),
+    };
+    let issue660_twin_bound = bind_in_session(
+        &issue660_twin_validated,
+        &schema,
+        issue660_session.search_mode(),
+        issue660_session.udfs(),
+    )
+    .unwrap_or_else(|e| fail_closed(format!("Issue #660 twin DB bind_in_session failed: {e}")));
+    if issue660_real_bound != issue660_twin_bound {
+        fail_closed(
+            "Issue #660 fidelity check failed: twin DB BoundStatement does not match real DB \
+             (schema drift between measurement DB and twin DB) — S1/S2/S3 would not be \
+             representative of the real bind path",
+        );
     }
 
     let core = EngineCore::from_storage(storage, search_engine::default_engine());
@@ -968,6 +1040,17 @@ fn main() {
         }
     }
 
+    // Issue #660 §3.3: 以下の B0s〜B8 ラウンドループが B1（SQL hybrid・
+    // `SparseIndexCache`／`SqlArenaCache`／`ScalarIndexCache`／`HnswIndexCache`
+    // の照会経路）を rounds*50 回実行する前後で各キャッシュの統計を採取し、
+    // hot path が構造的に成立していること（非 vacuous）を fail-closed に確認する
+    // （直接計測できない `pub(crate)` キャッシュ照会の間接証跡。既存ループ本体は
+    // 無変更のまま前後にスナップショットを挟むだけ）。
+    let issue660_sql_arena_before = core.sql_arena_cache_stats();
+    let issue660_sparse_before = core.sparse_index_cache_stats();
+    let issue660_scalar_before = core.scalar_index_cache_stats();
+    let issue660_hnsw_before = core.hnsw_index_cache_stats();
+
     for round in 0..rounds {
         println!("hybrid_profile: baseline round {}/{rounds}", round + 1);
 
@@ -1118,6 +1201,11 @@ fn main() {
         .unwrap_or_else(|e| fail_closed(format!("B8 measurement failed: {e}")));
         b8_round_medians.push(m.summary.median);
     }
+
+    let issue660_sql_arena_after = core.sql_arena_cache_stats();
+    let issue660_sparse_after = core.sparse_index_cache_stats();
+    let issue660_scalar_after = core.scalar_index_cache_stats();
+    let issue660_hnsw_after = core.hnsw_index_cache_stats();
 
     // --- per-round 生データ（計測規約 §3: per-run 生データ必須） ---
     for (round, (((((((b0s, b0), b1), b2), b3), b4), b5), b8)) in b0s_round_medians
@@ -1291,6 +1379,385 @@ fn main() {
         "hybrid_profile: baseline round measurement (Issue #465) done — see \
          docs/design/hybrid-rrf-latency-breakdown.md \"最新基線\" section for the transcribed \
          attribution table and top-2-stage identification handed to Issue #548"
+    );
+
+    // =========================================================================
+    // Issue #660: SQL 表層固定コスト（B1-B4）の S0〜S8 再分解
+    // =========================================================================
+    //
+    // 親 Issue #652・ルート #649。上記 B1（`sql_hybrid_select_id`）は hybrid
+    // 経路が `cache_fast_path_eligible` の対象外（`sql/exec.rs`）であるため、
+    // 疎索引キャッシュ（`SparseIndexCache`）がヒットしていても可視全行の行ループ
+    // （`VectorArena::build_from_cached_rls_rows`）を再実行する。以下は
+    // その内訳をパース・束縛・行ループ構成要素（複製近似）・末尾処理へ分解する。
+
+    println!(
+        "hybrid_profile: sql_surface_breakdown (Issue #660) starting — rounds={rounds} \
+         (see docs/design/hybrid-rrf-latency-breakdown.md \"Issue #660\" section for the \
+         attribution table transcribed from this run's output)"
+    );
+
+    // S1/S3 用のクエリ round-robin は B1 と同じ `query_idx % queries.len()` 規則。
+    let issue660_sql_texts: Vec<String> = queries
+        .iter()
+        .map(|q| {
+            sql_hybrid_statement_with_projection(
+                TABLE,
+                VECTOR_COLUMN,
+                TEXT_COLUMN,
+                &q.vector,
+                &q.text,
+                TOP_K,
+                HybridProjection::Id,
+            )
+            .unwrap_or_else(|e| fail_closed(format!("Issue #660 S1 statement build failed: {e}")))
+        })
+        .collect();
+    // S3(bind) 計測区間からパース自体のコストを除くため、`ValidatedStatement` は
+    // 計測区間外で 1 回だけ構築して保持する（双子 DB に対して行う。パースは
+    // テーブル存在確認のみで行数に依存しないため実 DB と等価）。
+    let issue660_validated: Vec<_> = issue660_sql_texts
+        .iter()
+        .map(|sql| {
+            match validate_sql(sql, &issue660_twin_storage).unwrap_or_else(|e| {
+                fail_closed(format!("Issue #660 S3 precompute validate_sql failed: {e}"))
+            }) {
+                SqlStatement::Select(validated) => validated,
+                other => fail_closed(format!(
+                    "Issue #660 S3 precompute statement is not a SELECT (unexpected variant): {other:?}"
+                )),
+            }
+        })
+        .collect();
+
+    // S4/S5 用: 可視全行の事前エンコード済み metadata（`encode_scalar_columns` は
+    // 一時 DB への投入時と同じ関数。redb からの読み出し自体は含まない）。
+    let issue660_encoded_visible: Vec<Vec<u8>> = visible_bodies
+        .iter()
+        .map(|body| {
+            encode_scalar_columns(&schema, &[Value::Null, Value::Text(body.clone())])
+                .unwrap_or_else(|e| fail_closed(format!("Issue #660 S4 pre-encode failed: {e}")))
+        })
+        .collect();
+
+    // S8 用: `hybrid_search`（B4 と同一経路）の Top-`TOP_K` hits を 1 回だけ
+    // 事前計算し、`RlsSafetyNet::apply` 単体（Top-k のみ）の末尾処理コストを
+    // 密・疎の再取得コストと混ぜずに計測する。
+    let issue660_s8_hits: Vec<(u64, f64)> = {
+        let q = &queries[0];
+        let input = SearchInput {
+            ids: &visible_ids,
+            vectors: &visible_vectors,
+            dim: corpus.dim,
+            query: &q.vector,
+            k: TOP_K,
+        };
+        hybrid_search(
+            &ParallelSearchProvider,
+            input,
+            &sparse_index,
+            &q.text,
+            TOP_K,
+            &cfg,
+        )
+        .unwrap_or_else(|e| {
+            fail_closed(format!(
+                "Issue #660 S8 precompute hybrid_search failed: {e}"
+            ))
+        })
+        .into_iter()
+        .map(|hit| (hit.id, hit.score))
+        .collect()
+    };
+
+    let mut s0_round_medians = Vec::with_capacity(rounds as usize);
+    let mut s1_round_medians = Vec::with_capacity(rounds as usize);
+    let mut s2_round_medians = Vec::with_capacity(rounds as usize);
+    let mut s3_round_medians = Vec::with_capacity(rounds as usize);
+    let mut s4_round_medians = Vec::with_capacity(rounds as usize);
+    let mut s5_round_medians = Vec::with_capacity(rounds as usize);
+    let mut s6_round_medians = Vec::with_capacity(rounds as usize);
+    let mut s7_round_medians = Vec::with_capacity(rounds as usize);
+    let mut s8_round_medians = Vec::with_capacity(rounds as usize);
+
+    for round in 0..rounds {
+        println!(
+            "hybrid_profile: sql_surface_breakdown round {}/{rounds} (Issue #660)",
+            round + 1
+        );
+
+        // S0_dense_topk_ref: B3（fast path 対照）の減算対象。B0 は k=dense_fetch_k
+        // だが B3 は LIMIT TOP_K のため、k を揃えた対照区間を別途持つ。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let q = &queries[query_idx % queries.len()];
+            query_idx += 1;
+            let input = SearchInput {
+                ids: &visible_ids,
+                vectors: &visible_vectors,
+                dim: corpus.dim,
+                query: &q.vector,
+                k: TOP_K,
+            };
+            ParallelSearchProvider
+                .search(input)
+                .unwrap_or_else(|e| fail_closed(format!("S0 dense_topk_ref failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("S0 measurement failed: {e}")));
+        s0_round_medians.push(m.summary.median);
+
+        // S1_parse: 字句解析＋許可リスト構文解析＋テーブル存在確認（双子 DB）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let sql = &issue660_sql_texts[query_idx % issue660_sql_texts.len()];
+            query_idx += 1;
+            validate_sql(sql, &issue660_twin_storage)
+                .unwrap_or_else(|e| fail_closed(format!("S1 validate_sql failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("S1 measurement failed: {e}")));
+        s1_round_medians.push(m.summary.median);
+
+        // S2_schema: テーブル定義読み出し（`core::read_txn_with_schema` の
+        // `pub(crate)` 非公開分を `Storage::get_table_schema` で近似）。
+        let m = run(&config, || {
+            issue660_twin_storage
+                .get_table_schema(TABLE)
+                .unwrap_or_else(|e| fail_closed(format!("S2 get_table_schema failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("S2 measurement failed: {e}")));
+        s2_round_medians.push(m.summary.median);
+
+        // S3_bind: 列解決・投影構築（`ValidatedStatement` は計測区間外で構築済み）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let validated = &issue660_validated[query_idx % issue660_validated.len()];
+            query_idx += 1;
+            bind_in_session(
+                validated,
+                &schema,
+                issue660_session.search_mode(),
+                issue660_session.udfs(),
+            )
+            .unwrap_or_else(|e| fail_closed(format!("S3 bind_in_session failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("S3 measurement failed: {e}")));
+        s3_round_medians.push(m.summary.median);
+
+        // S4_scan_replica: `on_visible_row` の構造検証部の複製。
+        let m = run(&config, || scan_replica(&schema, &issue660_encoded_visible))
+            .unwrap_or_else(|e| fail_closed(format!("S4 measurement failed: {e}")));
+        s4_round_medians.push(m.summary.median);
+
+        // S5_rowcopy_replica: `push_visible_row`＋`on_visible_row` 末尾の複製。
+        let m = run(&config, || {
+            rowcopy_replica(&visible_ids, &visible_vectors, DIM, TENANT_ID)
+        })
+        .unwrap_or_else(|e| fail_closed(format!("S5 measurement failed: {e}")));
+        s5_round_medians.push(m.summary.median);
+
+        // S6_slotmap_replica: `slot_ids`／`visible_id_counts` 再構築の複製。
+        let m = run(&config, || slotmap_replica(&visible_ids))
+            .unwrap_or_else(|e| fail_closed(format!("S6 measurement failed: {e}")));
+        s6_round_medians.push(m.summary.median);
+
+        // S7_bodyclone_replica: `SELECT *` 投影が行う本文列複製の複製
+        // （既存 `projection(B2-B1)` の実体と対にして読む）。
+        let m = run(&config, || bodyclone_replica(&visible_bodies))
+            .unwrap_or_else(|e| fail_closed(format!("S7 measurement failed: {e}")));
+        s7_round_medians.push(m.summary.median);
+
+        // S8_tail: `RlsSafetyNet::apply`（Top-k のみ）＋ id 投影の複製。
+        let m = run(&config, || {
+            let hits = issue660_s8_hits.clone();
+            let verified =
+                RlsSafetyNet::new(&ctx).apply(hits, |_id| Some((TENANT_ID, Visibility::Public)));
+            verified.hits().len()
+        })
+        .unwrap_or_else(|e| fail_closed(format!("S8 measurement failed: {e}")));
+        s8_round_medians.push(m.summary.median);
+    }
+
+    // --- per-round 生データ ---
+    for round in 0..rounds as usize {
+        let values: [(&str, u128); 9] = [
+            ("S0", s0_round_medians[round].as_micros()),
+            ("S1", s1_round_medians[round].as_micros()),
+            ("S2", s2_round_medians[round].as_micros()),
+            ("S3", s3_round_medians[round].as_micros()),
+            ("S4", s4_round_medians[round].as_micros()),
+            ("S5", s5_round_medians[round].as_micros()),
+            ("S6", s6_round_medians[round].as_micros()),
+            ("S7", s7_round_medians[round].as_micros()),
+            ("S8", s8_round_medians[round].as_micros()),
+        ];
+        println!("{}", render_sql_surface_round_raw_line(round + 1, &values));
+    }
+
+    let issue660_min_s0 = min_of(&s0_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(S0) failed: {e}")));
+    let issue660_med_s0 = median_of(&s0_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(S0) failed: {e}")));
+    let issue660_min_s1 = min_of(&s1_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(S1) failed: {e}")));
+    let issue660_med_s1 = median_of(&s1_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(S1) failed: {e}")));
+    let issue660_min_s2 = min_of(&s2_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(S2) failed: {e}")));
+    let issue660_med_s2 = median_of(&s2_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(S2) failed: {e}")));
+    let issue660_min_s3 = min_of(&s3_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(S3) failed: {e}")));
+    let issue660_med_s3 = median_of(&s3_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(S3) failed: {e}")));
+    let issue660_min_s4 = min_of(&s4_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(S4) failed: {e}")));
+    let issue660_med_s4 = median_of(&s4_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(S4) failed: {e}")));
+    let issue660_min_s5 = min_of(&s5_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(S5) failed: {e}")));
+    let issue660_med_s5 = median_of(&s5_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(S5) failed: {e}")));
+    let issue660_min_s6 = min_of(&s6_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(S6) failed: {e}")));
+    let issue660_med_s6 = median_of(&s6_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(S6) failed: {e}")));
+    let issue660_min_s7 = min_of(&s7_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(S7) failed: {e}")));
+    let issue660_med_s7 = median_of(&s7_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(S7) failed: {e}")));
+    let issue660_min_s8 = min_of(&s8_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(S8) failed: {e}")));
+    let issue660_med_s8 = median_of(&s8_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(S8) failed: {e}")));
+
+    for (name, min_d, med_d) in [
+        ("S0_dense_topk_ref", issue660_min_s0, issue660_med_s0),
+        ("S1_parse", issue660_min_s1, issue660_med_s1),
+        ("S2_schema", issue660_min_s2, issue660_med_s2),
+        ("S3_bind", issue660_min_s3, issue660_med_s3),
+        ("S4_scan_replica", issue660_min_s4, issue660_med_s4),
+        ("S5_rowcopy_replica", issue660_min_s5, issue660_med_s5),
+        ("S6_slotmap_replica", issue660_min_s6, issue660_med_s6),
+        ("S7_bodyclone_replica", issue660_min_s7, issue660_med_s7),
+        ("S8_tail", issue660_min_s8, issue660_med_s8),
+    ] {
+        println!(
+            "{}",
+            render_sql_surface_summary_line(name, min_d.as_micros(), med_d.as_micros())
+        );
+    }
+
+    // --- §3.2 差分区分（min-of-R 基準。飽和差分・逆転は n/a） -------------------
+    let issue660_common_fixed = bucket_diff(issue660_min_s0, min_b3); // B3 - S0
+    let issue660_hybrid_only =
+        bucket_diff(min_b4, min_b1) // B1 - B4
+            .and_then(|d| issue660_common_fixed.and_then(|c| bucket_diff(c, d)));
+    let issue660_parse_bind_sum = issue660_min_s1 + issue660_min_s2 + issue660_min_s3; // 逆転しない加算のみ
+    let issue660_scalar_stage_replica = issue660_min_s4 + issue660_min_s5;
+    let issue660_unexplained_common = issue660_common_fixed.and_then(|c| {
+        bucket_diff(
+            issue660_min_s1 + issue660_min_s2 + issue660_min_s6 + issue660_min_s8,
+            c,
+        )
+    });
+    let issue660_unexplained_hybrid =
+        issue660_hybrid_only.and_then(|h| bucket_diff(issue660_scalar_stage_replica, h));
+
+    let issue660_render_bucket = |label: &str, diff: Option<std::time::Duration>| {
+        let diff_us = diff.map(|d| d.as_micros());
+        let ratio_pct = diff_us.map(|us| (us as f64 / b1_us) * 100.0);
+        println!(
+            "{}",
+            render_sql_surface_bucket_line(label, diff_us, ratio_pct)
+        );
+    };
+    issue660_render_bucket("common_fixed(B3-S0)", issue660_common_fixed);
+    issue660_render_bucket("hybrid_only((B1-B4)-common_fixed)", issue660_hybrid_only);
+    issue660_render_bucket("parse_bind(S1+S2+S3)", Some(issue660_parse_bind_sum));
+    issue660_render_bucket(
+        "scalar_stage_replica(S4+S5)",
+        Some(issue660_scalar_stage_replica),
+    );
+    issue660_render_bucket(
+        "unexplained_common(common_fixed-(S1+S2+S6+S8))",
+        issue660_unexplained_common,
+    );
+    issue660_render_bucket(
+        "unexplained_hybrid(hybrid_only-scalar_stage_replica)",
+        issue660_unexplained_hybrid,
+    );
+    issue660_render_bucket("projection_replica(S7)", Some(issue660_min_s7));
+
+    // --- キャッシュ照会の非 vacuous 検証（§3.3。arena/sparse/scalar は直接計測
+    // 不可のため hit カウンタ増分で hot path 成立を証明する。hnsw は既定エンジン
+    // では構造的に 0 回のはずであり、0 以外なら fail-closed） ---
+    let issue660_sql_arena_delta = issue660_sql_arena_after
+        .hits
+        .saturating_sub(issue660_sql_arena_before.hits);
+    let issue660_sparse_delta = issue660_sparse_after
+        .hits
+        .saturating_sub(issue660_sparse_before.hits);
+    let issue660_hnsw_delta = issue660_hnsw_after
+        .hits
+        .saturating_sub(issue660_hnsw_before.hits);
+    println!(
+        "{}",
+        render_cache_stats_delta_line(
+            "sql_arena_hits",
+            issue660_sql_arena_before.hits,
+            issue660_sql_arena_after.hits,
+            1,
+            issue660_sql_arena_delta >= 1,
+        )
+    );
+    println!(
+        "{}",
+        render_cache_stats_delta_line(
+            "sparse_index_hits",
+            issue660_sparse_before.hits,
+            issue660_sparse_after.hits,
+            1,
+            issue660_sparse_delta >= 1,
+        )
+    );
+    println!(
+        "{}",
+        render_cache_stats_delta_line(
+            "scalar_index_hits",
+            issue660_scalar_before.hits,
+            issue660_scalar_after.hits,
+            0,
+            true,
+        )
+    );
+    println!(
+        "{}",
+        render_cache_stats_delta_line(
+            "hnsw_index_hits",
+            issue660_hnsw_before.hits,
+            issue660_hnsw_after.hits,
+            0,
+            issue660_hnsw_delta == 0,
+        )
+    );
+    if issue660_sql_arena_delta == 0 || issue660_sparse_delta == 0 {
+        fail_closed(
+            "Issue #660 fail-closed: sql_arena/sparse cache hit counters did not grow during \
+             the B1 measurement rounds — the SQL surface breakdown above would not be \
+             representative of the cache-hot path",
+        );
+    }
+    if issue660_hnsw_delta != 0 {
+        fail_closed(format!(
+            "Issue #660 fail-closed: hnsw_index_cache hits grew by {issue660_hnsw_delta} on \
+             the default (non-HNSW) search engine — expected structurally 0"
+        ));
+    }
+
+    println!(
+        "hybrid_profile: sql_surface_breakdown (Issue #660) done — see \
+         docs/design/hybrid-rrf-latency-breakdown.md \"Issue #660\" section for the \
+         attribution table transcribed from this run's output"
     );
 
     println!(
