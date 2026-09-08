@@ -939,3 +939,8 @@ per-run 生データ・結果表・実行ログは
   経由）より低いと判断した。詳細は
   [`phase4-chip-before-after.md`](phase4-chip-before-after.md) §6 参照。
   再計測はオーナー実機での手順（同 doc §9）の一部として実施可能。
+- `hybrid_rrf`（self）の状態依存退行（`WHERE` 実行後にのみ発現する p50 約 10%
+  劣化。`ScalarIndex::build`〔Issue #473〕の長文 `body` 列索引化が原因）と
+  その対策（列単位の平均値長ゲート・Issue #632）の crossdb 前後比較実測は
+  [`scalar-index-generation-cache.md`「前後比較実測（Issue #633）」節](scalar-index-generation-cache.md)
+  参照。
