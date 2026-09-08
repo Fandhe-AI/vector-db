@@ -625,11 +625,26 @@ def _run_phases(
             )
 
         stats, last = measure(bulk_hybrid, idxs)
+        # `hybrid_rrf` 経路は密側再取得ループ（`hybrid.rs::hybrid_search_boosted`）が
+        # 候補幅を動的に倍増し得るため、`_ef_fields`（`ann_plan: hnsw_full_visible`／
+        # `hnsw_subset` の DISTANCE 直結経路専用）をそのまま流用しない
+        # （codex-review P2 指摘・Issue #658）。exact 構成は従来どおり全フィールド
+        # `None`、hnsw 構成は初回候補幅の下限値と拡張可能性を記録する。
+        hybrid_ef_fields = (
+            self_hnsw.hybrid_ef_candidate_fields(200)
+            if is_hnsw
+            else {
+                "ef_search": None,
+                "ef_effective": None,
+                "dense_fetch_k_initial": None,
+                "dense_fetch_k_may_expand": None,
+            }
+        )
         phases["bulk_hybrid_k200"] = {
             **stats,
             "k": 200,
             "rows_returned": len(last),
-            **_ef_fields(200),
+            **hybrid_ef_fields,
         }
 
         # ORDER BY なしの行取得（広域取得。Issue #454 で SQL 表層

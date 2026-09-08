@@ -96,6 +96,19 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 HNSW_ARM_ARGS="${CROSSDB_SELF_HNSW_ARGS:-}"
 unset CROSSDB_SELF_HNSW_ARGS
 
+# 同時実行プロセスの有無（自プロセス・ps 自体を除く実行中プロセス数の簡易
+# スナップショット。`benchmark-judgement-policy.md` §3 が必須とする記録項目。
+# `bench_hybrid_latency_ab.sh::record_concurrent_processes` と同型の判定）。
+concurrent_processes_snapshot() {
+  local self_pid=$$ snapshot
+  if ! snapshot="$(ps -eo pid=,stat=,comm= 2>/dev/null)"; then
+    echo "unknown (ps unavailable)"
+    return 0
+  fi
+  printf '%s\n' "${snapshot}" \
+    | awk -v self="${self_pid}" '$1 != self && $3 != "ps" && $2 ~ /^R/ {n++} END {print n+0}'
+}
+
 {
   echo "timestamp_utc: ${TS}"
   echo "wire_server_sha256: $(sha256sum "${WIRE_SERVER_BIN}" | awk '{print $1}')"
@@ -105,6 +118,14 @@ unset CROSSDB_SELF_HNSW_ARGS
   echo "loadavg_before: $(cat /proc/loadavg 2>/dev/null || echo unavailable)"
   echo "fs_type_crossdb_dir: $(df --output=fstype "${CROSSDB_DIR}" 2>/dev/null | tail -n1 || echo unavailable)"
   echo "hnsw_args: ${HNSW_ARM_ARGS:-(none)}"
+  # `benchmark-judgement-policy.md` §3 必須項目（CPU Model name・ISA flags・
+  # 同時実行プロセスの有無・`BENCH_DEDICATED_ENV` の設定有無。codex-review P2
+  # 指摘・Issue #658）。
+  echo "cpu_model: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || echo unavailable)"
+  echo "cpu_flags_subset: $(grep -m1 flags /proc/cpuinfo 2>/dev/null | grep -oE '\b(avx2|avx512f|fma|f16c|neon)\b' | tr '\n' ' ' || echo unavailable)"
+  echo "nproc: $(nproc 2>/dev/null || echo unavailable)"
+  echo "concurrent_running_processes_excluding_self: $(concurrent_processes_snapshot)"
+  echo "bench_dedicated_env: ${BENCH_DEDICATED_ENV:-<unset>}"
 } >"${OUT_DIR}/${TS}-env.txt"
 
 echo "writing per-run results under ${OUT_DIR}/${TS}-pair<N>-<arm>/"

@@ -164,8 +164,44 @@ def parse_hnsw_args_env(raw: str | None) -> list[str]:
 def ef_effective(k: int, ef_search: int = DEFAULT_EF_SEARCH) -> int:
     """探索側の `ef.max(k)`（`hnsw.rs::search_masked_with` の実装契約）を返す。
     候補幅規約（max(64, k)）を記録するためだけに使う（wire 経由の実測値ではなく
-    契約からの導出値）。"""
+    契約からの導出値）。
+
+    `hybrid_rrf` 経由のクエリ（`ORDER BY hybrid_rrf(...)`）には適用できない
+    （`k` に最終 `LIMIT` をそのまま渡すと実際に HNSW 探索へ渡される候補幅と
+    一致しない。`hybrid_ef_candidate_fields` を使うこと）。
+    """
     return max(ef_search, k)
+
+
+# hybrid_rrf 経路の密側候補幅（Issue #658 codex-review P2 対応）。
+# `sql/exec.rs::DEFAULT_HYBRID_POOL_DEPTH`（200）由来の `pool_depth =
+# max(limit, 200)` と、`hybrid.rs::hybrid_search_boosted` の初回 `dense_fetch_k
+# = pool_depth * 2` を踏まえた「HNSW 探索へ渡される初回候補幅」の下限値。
+# `hybrid.rs::MAX_POOL_DEPTH`（10,000）* 4 が絶対上限（`MAX_FETCH_K`）。
+_HYBRID_DEFAULT_POOL_DEPTH = 200
+_HYBRID_MAX_FETCH_K = 10_000 * 4
+
+
+def hybrid_ef_candidate_fields(limit: int, ef_search: int = DEFAULT_EF_SEARCH) -> dict:
+    """`hybrid_rrf` クエリの候補幅記録用フィールドを返す。
+
+    `ef_effective`（HNSW 探索が実際に使う候補幅）は境界の同点グループが
+    確定できない場合に `hybrid.rs::hybrid_search_boosted` の再取得ループが
+    `dense_fetch_k` を倍増（上限 `MAX_FETCH_K`）させながら動的に決めるため、
+    `EXPLAIN`／SQL 表層からは静的に取得できない（`sql::hnsw_hybrid` は
+    per-query 解決でキャッシュにも載らない）。実効値を偽って記録しないよう
+    `ef_effective` は常に `None` とし、代わりに `dense_fetch_k_initial`
+    （初回取得幅。実際の探索幅の下限値）と `dense_fetch_k_may_expand`
+    （拡張され得る事実。他 DB との候補幅比較で「これで確定」と誤読しない
+    ための注記）を記録する。"""
+    pool_depth = max(limit, _HYBRID_DEFAULT_POOL_DEPTH)
+    dense_fetch_k_initial = min(pool_depth * 2, _HYBRID_MAX_FETCH_K)
+    return {
+        "ef_search": ef_search,
+        "ef_effective": None,
+        "dense_fetch_k_initial": dense_fetch_k_initial,
+        "dense_fetch_k_may_expand": True,
+    }
 
 
 def probe_binary_path() -> str:
