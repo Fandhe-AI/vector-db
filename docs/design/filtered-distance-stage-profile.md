@@ -22,7 +22,7 @@
 `sql/exec.rs::execute_statement_with_cache` は `SqlArenaCache` ヒット時、`sql::scalar_plan::classify_scalar_plan`（`bound.metadata_filters`・`bound.expr_filters` の静的形状判定）の結果に応じて分岐する:
 
 - `PlainScan`（メタデータフィルタ・式フィルタが空、または式フィルタに `id` 単純比較以外の残余述語を含む）: `ScalarIndex` を一切参照せず、キャッシュ済みスナップショットの全可視行へ `on_visible_row`（`scan_scalar_columns` → `matches_all` → 一致行のみ embedding 複製）を適用する。
-- それ以外（`IndexEquality`／`IndexPrefix`／`IndexIdRange`／`IndexConjunction`）: `ScalarIndexCache::lookup` → 索引↔スナップショット同一性ガード → `ScalarIndex::resolve_candidates` の順で候補スロットを絞り込み、`Use(slots)` なら候補行のみへ `on_visible_row` を適用する（`build_from_cached_rls_rows_subset`）。選択度が閾値（既定 1/2）を超える、または索引未構築・同一性不一致の場合は `FallbackNoIndex`／`FallbackSelectivity` として全可視行走査へ縮退する。
+- それ以外（`IndexEquality`／`IndexPrefix`／`IndexIdRange`／`IndexConjunction`）: `ScalarIndexCache::lookup` → 索引↔スナップショット同一性ガード → `ScalarIndex::resolve_candidates` の順で候補スロットを絞り込み、`Use(slots)` なら候補行のみへ `on_visible_row` を適用する。この経路は Ranking::Distance で hybrid・HNSW `Subset` 経路（`hnsw_subset_eligible`）のいずれでもない場合、`VectorArena::filter_cached_rls_rows_subset` によりキャッシュ済みスナップショットの `VectorArena` を借用のまま候補述語を再適用し、一致行の複製を経ずマスク（`Vec<u32>`）だけを構築して `SearchProvider::search_subset` へ渡す（Issue #654。§「索引経路の内訳」参照）。hybrid・HNSW `Subset` 経路は従来どおり `build_from_cached_rls_rows_subset` による複製経路を使う。選択度が閾値（既定 1/2）を超える、または索引未構築・同一性不一致の場合は `FallbackNoIndex`／`FallbackSelectivity` として全可視行走査へ縮退する。
 
 いずれの分岐も `sql::scalar_index::ScalarIndexCache`（`EngineCore::scalar_index_cache_stats()` 経由で観測可能。`index_scans`／`plain_scan_fallbacks`／`builds` を持つ。テナント ID・行 ID を含まない集計カウンタ）に統計を記録する。ただし **`PlainScan` 分類のクエリはこの分岐へ一切入らないため、`index_scans`／`plain_scan_fallbacks` のいずれも増分しない**——`FallbackNoIndex`／`FallbackSelectivity`（索引対応述語を持つが lookup/resolve に失敗）とは区別される契約であることに注意（後述「plain アームの非 vacuous 確認」参照）。
 
@@ -36,7 +36,7 @@
 
 | アーム | `WHERE` 節 | 経路 |
 | --- | --- | --- |
-| `index`（現行経路） | `WHERE lang = '<value>'` | `ScalarPlan::IndexEquality` → `resolve_candidates` → `build_from_cached_rls_rows_subset` |
+| `index`（現行経路） | `WHERE lang = '<value>'` | `ScalarPlan::IndexEquality` → `resolve_candidates` → `filter_cached_rls_rows_subset`（マスク構築・複製なし。Issue #654） → `search_subset` |
 | `plain`（Issue #474 以前相当の形状） | `WHERE lang = '<value>' AND vec_norm(embedding) > 0` | 残余述語（`VectorRef` を参照するため `id_predicate_from_expr` が `None`）により `PlainScan` → `build_from_cached_rls_rows`（全可視行 `on_visible_row`） |
 
 `AND 1 = 1` は束縛時の定数畳み込み（Issue #353・`sql/expr_program.rs`）により消去され `PlainScan` を強制できなかった（実装中に実測で判明。`tests/scalar_index_prune.rs::residual_builtin_expr_never_consumes_index` と同じ「`vec_norm(embedding) > 0` という `VectorRef` 参照の恒真述語」形状を採用した）。
@@ -52,11 +52,11 @@
 | 段 | 内容 |
 | --- | --- |
 | I1 `index_candidate_resolve` | 計測外で構築した値→候補スロット辞書（`HashMap<&str, Vec<u32>>`）からの `"ja"` lookup ＋ 複製 ＋ `sort_unstable`（`ScalarIndex::candidates_for` 相当。型・整列まで揃える） |
-| I2a `candidate_predicate` | I1 の候補のみへ `scan_scalar_columns` ＋ `lang = 'ja'` 判定（`build_from_cached_rls_rows_subset` の再適用契約に対応） |
-| I2b `candidate_arena_copy` | I2a ＋ 一致行の embedding／id／tenant_id／visibility の複製（**#654 の削減対象**。分母は候補行数） |
-| I3 `provider_search` | 一致行のみへ `ParallelSearchProvider::search`（距離計算＋Top-k） |
+| I2a `candidate_predicate` | I1 の候補のみへ `scan_scalar_columns` ＋ `lang = 'ja'` 判定（`filter_cached_rls_rows_subset`／`build_from_cached_rls_rows_subset` いずれの再適用契約にも対応） |
+| I2b | 現行経路（#654 適用後・`filter_cached_rls_rows_subset` 相当）は I2a ＋ 一致行のマスク（元スロット番号）構築のみ（`candidate_mask_build`。複製なし）。#654 適用前相当の対照値（`candidate_arena_copy`）は I2a ＋ 一致行の embedding／id／tenant_id／visibility の複製（分母は候補行数。#654 が解消した削減対象） |
+| I3 `provider_search` | 一致行のみへ `ParallelSearchProvider::search`（複製経路）／`search_subset`（マスク経路。現行経路）（距離計算＋Top-k） |
 
-I2b は当初 embedding の一括 `Vec::with_capacity(exact)` 複製のみを計測していたが、production の `VectorArena::build_from_cached_rls_rows_subset`（`pub(crate)` のためベンチから直接呼べない）は (1) `GrowableArenaBuffers::ensure_capacity` による amortized 成長（capacity を倍々に増やし目標行数で止める段階的確保）と (2) 一致行ごとの id／tenant_id／visibility の複製も embedding 複製と合わせて行う。PR #663 の codex-review 指摘（測定契約が production の処理量と乖離）を受け、I2b の再実装をこの 2 点を含む形へ改めた（下記「実測結果」の数値は改訂後のもの）。
+I2b（`candidate_arena_copy` 対照値）は当初 embedding の一括 `Vec::with_capacity(exact)` 複製のみを計測していたが、`VectorArena::build_from_cached_rls_rows_subset`（`pub(crate)` のためベンチから直接呼べない）は (1) `GrowableArenaBuffers::ensure_capacity` による amortized 成長（capacity を倍々に増やし目標行数で止める段階的確保）と (2) 一致行ごとの id／tenant_id／visibility の複製も embedding 複製と合わせて行う。PR #663 の codex-review 指摘（測定契約が production の処理量と乖離）を受け、I2b の再実装をこの 2 点を含む形へ改めた（下記「実測結果」の数値は改訂後のもの。さらに現行 HEAD が実際に経由する `filter_cached_rls_rows_subset`（複製なし）相当の `candidate_mask_build` 再実装を追加した経緯は下記「訂正（PR #663 codex-review P1 指摘・2 回目）」節参照）。
 
 SQL 表層固定コスト（4 区分目）は `e2e(index) − (I1 + I2b + I3)` の残差として `checked_sub` で算出する（I2b は I2a を包含する累積値のため、別途加算すると I1 分の候補述語コストを二重計上する。W 系列の `report_diff` と同じ理由。逆転時は測定ノイズとして `n/a` 表示）。
 
@@ -79,7 +79,7 @@ SQL 表層固定コスト（4 区分目）は `e2e(index) − (I1 + I2b + I3)` �
 - 生ログ: `docs/design/bench-data/filtered-distance-stage-profile/1788878855-25k-1of3-postfix.log`（PR #663 review 指摘の修正——per-round ラウンド輪番化・I1 の型と整列・I2b の amortized 成長＋id/tenant_id/visibility 複製——を適用したビルドでの再実測。#654 適用**前**相当の `I2b_candidate_arena_copy`／`I3_provider_search` の対照値。下記「訂正（PR #663 codex-review P1 指摘・2 回目）」節参照）
 - 生ログ（訂正後・#654 適用後の実装経路）: `docs/design/bench-data/filtered-distance-stage-profile/1788882690-25k-1of3-postfix2.log`（HEAD `892696b`。I2b/I3 を `filter_cached_rls_rows_subset` → `search_subset`〔複製なし〕相当へ揃えた再実装後の per-round 生データ・`index_mask_scans_delta=39`〔#654 のマスク経路が非 vacuous に発火したことの直接確認〕を含む。下記「訂正（PR #663 codex-review P1 指摘・2 回目）」節の数値の根拠）
 
-**共有 QEMU 環境の参考値のため、両ノイズ帯（固定 ±5%・`R_dot` 実測帯 10.17%）を超える判定には使わない。専有環境（`BENCH_DEDICATED_ENV=1`）での再実測はオーナー作業として申し送る。**
+**共有 QEMU 環境の参考値のため、両ノイズ帯を超える判定には使わない。`R_dot` 実測帯は生ログごとに異なる（`1788878855-...-postfix.log`＝10.17%、訂正後の `1788882690-...-postfix2.log`＝22.00%）。専有環境（`BENCH_DEDICATED_ENV=1`）での再実測はオーナー作業として申し送る。**
 
 ### 非 vacuous 確認
 
@@ -130,7 +130,7 @@ bucket_share(sql_surface_fixed_cost_residual): us=216.2 pct_of_e2e=42.47%
 - I1（候補スロット lookup ＋ 複製 ＋ 整列）は e2e の 0.18% と無視できる大きさで、`ScalarIndex` の辞書 lookup 自体はボトルネックではない。
 - I2b（候補行の embedding／id／tenant_id／visibility 複製。production 相当の amortized 成長を含む。#654 の削減対象）は I2a 込みで e2e の 55.65%、複製そのもの（I2b−I2a）は約 42.7 ポイント——本測定条件（選択率 33%・候補 7,667 行）での **#654 の削減余地の上限**として記録する（初版は embedding のみの一括確保を計測しており過小評価だった。production 相当の複製内容へ揃えたことで比率が 41.31%→55.65% へ上振れした）。この値は #654 適用前相当の対照実測であり、上記訂正のとおり e2e(index) が実際に経由する経路の実測値ではない。
 - SQL 表層固定コスト（残差。I1+I2b+I3 に含まれない部分）は上記訂正後の再実測で 42.47%（旧版の 30.54% は #654 適用前相当の I2b/I3 を差し引いた値であり不整合。上記訂正参照）。crossdb で先行して特定済みの「投影・スキャン周りの k 非依存固定コスト」（Issue #453・#454）と整合する規模感である。
-- 本測定は共有 QEMU 環境の 1 回実測（N=5 ラウンド。`R_dot` 実測ノイズ帯 10.17%）。同じビルドでの繰り返し実測では実行時の他プロセス負荷次第でノイズ帯が数百 % に及ぶ run も観測されており、median ベースの比率は run ごとにばらつきうる一方、I 系列内の相対的な大小関係は複数 run で一貫して観測された。絶対値・比率とも参考値の位置づけとし、専有環境再実測で確定させる。
+- 本測定は共有 QEMU 環境の 1 回実測（N=5 ラウンド）。`sql_surface_fixed_cost_residual`＝42.47% の根拠である訂正後の再実測（`1788882690-...-postfix2.log`）の `R_dot` 実測ノイズ帯は 22.00%（旧版の I2b/I3 対照値の根拠である `1788878855-...-postfix.log` は 10.17%）。同じビルドでの繰り返し実測では実行時の他プロセス負荷次第でノイズ帯が数百 % に及ぶ run も観測されており、median ベースの比率は run ごとにばらつきうる一方、I 系列内の相対的な大小関係は複数 run で一貫して観測された。絶対値・比率とも参考値の位置づけとし、専有環境再実測で確定させる。
 
 ## crossdb との差異（申し送り）
 
@@ -142,5 +142,5 @@ bucket_share(sql_surface_fixed_cost_residual): us=216.2 pct_of_e2e=42.47%
 - 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測はオーナー作業。本環境の値は参考値。
 - `LIMIT 200` の crossdb 相当（`bulk_knn_where_k200`）の投影コスト（`id`+`body`）は本 Issue では計測しない。
 - 100,000 行（`BENCH_SCAN_PROFILE_SCALE=4`）× `1/3` は未実施（1 プロセス = 1 規模点の方針上、時間許容時に追加実測）。
-- #654（候補 id マスク経路で arena 複製回避）の実装後は本ベンチの `index` アームがそのまま after 側の計測点になる（#655 で before/after 交互実行）。
+- #654（候補 id マスク経路で arena 複製回避）は現行 HEAD に取り込み済み（本ベンチの `index` アーム・I2b/I3 の訂正後実測がそのまま after 側の計測点）。#654 適用前との before/after 交互実行は #655 の担当。
 - production コード（`crates/engine/src/`）は無変更。
