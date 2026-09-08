@@ -1287,10 +1287,14 @@ before は 5/5 ペアすべてで `bucket(wire)` が「逆転・未確定（n/a�
   `ee99db3` 比 +12%）には `WHERE` 実行後にのみ発現する ScalarIndex
   （Issue #473）由来の状態依存退行（約 10%）が含まれていた。Phase 1
   （Issue #632）で `ScalarIndex::build` の平均値長ゲート（Issue #638）を
-  対策として実装したが、Issue #633 の crossdb fixture 実測では本 fixture の
-  `body` 列平均長が除外閾値をわずかに下回るため退行は未解消（no-op）と
-  判定されている（`docs/design/scalar-index-generation-cache.md`「判定」節・
-  Issue #633 参照）。in-process ベンチ（本 doc の測定経路）には現れないため、
+  対策として実装したが、Issue #633 の crossdb fixture 実測では
+  `warm_where_then_hybrid.rss_after_warm` が before/after でほぼ変化しない
+  （63.80 → 63.72 MiB。除外が発火していれば約 56MiB まで下がるはず）という
+  RSS 実測に基づき、対策は本 fixture に対して no-op であり退行は未解消と
+  判定されている（`body` 列平均長が除外閾値をわずかに下回る事実は発火しない
+  蓋然性の補助的な状況証拠に留まり、no-op 判断自体の根拠ではない。
+  `docs/design/scalar-index-generation-cache.md`「判定」節・Issue #633
+  参照）。in-process ベンチ（本 doc の測定経路）には現れないため、
   本節の engine 内段別・wire 内訳とは独立の要因である
 - 専有環境（`BENCH_DEDICATED_ENV=1`）での `ROUNDS=10` 再実測、`rrf_fuse_with_limits`
   の下限近似（B7）実測、crossdb self の同一コミット再実行はオーナー／運用者
