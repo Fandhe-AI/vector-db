@@ -499,7 +499,7 @@ else
 endif
 
 .PHONY: bench-scalar-index-crossdb-ab
-bench-scalar-index-crossdb-ab: ## Issue #633（ScalarIndex 索引対象限定〔Issue #632〕の前後比較。Issue #645 でも同一手順で使用〔閾値見直し #644 の効果確認〕）。crossdb self 4 フェーズ〔hybrid_rrf・bulk_hybrid_k200・vector_knn_where・where_compound_count〕と WHERE 実行後 hybrid_rrf 単独ループ・wire-server RSS を before/after（既定で ref も）3 コミットの独立ソースツリー（`git archive` 展開）で交互 N≥5 ペア実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BEFORE_COMMIT・AFTER_COMMIT・CROSSDB_DIR〔docs25k.redb／docs25k.jsonl／queries200.jsonl を含むディレクトリ〕・CROSSDB_PYTHON〔psycopg 入り python3〕必須。REF_COMMIT（既定 ee99db3・空文字で無効）・AB_PAIRS（既定 5・5 未満は拒否）・HYBRID_ITERS（既定 200）・WARM_WHERE（既定 50）・CROSSDB_SELF_PORT_BASE（既定 15437）で上書きできる。ログは docs/design/bench-data/scalar-index-crossdb-ab/ 配下。scripts/bench_scalar_index_crossdb_ab.sh --summarize <dir> で TSV 集約）を実行する
+bench-scalar-index-crossdb-ab: ## Issue #633（ScalarIndex 索引対象限定〔Issue #632〕の前後比較。Issue #645 でも同一手順で使用〔閾値見直し #644 の効果確認〕。Issue #655（候補 id マスク経路 #654 の crossdb 前後比較）でも同一手順で使用）。crossdb self 5 フェーズ〔hybrid_rrf・bulk_hybrid_k200・vector_knn_where・bulk_knn_where_k200・where_compound_count〕と WHERE 実行後 hybrid_rrf 単独ループ・wire-server RSS を before/after（既定で ref も）3 コミットの独立ソースツリー（`git archive` 展開）で交互 N≥5 ペア実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BEFORE_COMMIT・AFTER_COMMIT・CROSSDB_DIR〔docs25k.redb／docs25k.jsonl／queries200.jsonl を含むディレクトリ〕・CROSSDB_PYTHON〔psycopg 入り python3〕必須。REF_COMMIT（既定 ee99db3・空文字で無効）・AB_PAIRS（既定 5・5 未満は拒否）・HYBRID_ITERS（既定 200）・WARM_WHERE（既定 50）・CROSSDB_SELF_PORT_BASE（既定 15437）で上書きできる。ログは docs/design/bench-data/scalar-index-crossdb-ab/ 配下。scripts/bench_scalar_index_crossdb_ab.sh --summarize <dir> で TSV 集約）を実行する
 ifdef HAS_CARGO
 	@if [ -z "$(BEFORE_COMMIT)" ] || [ -z "$(AFTER_COMMIT)" ] || [ -z "$(CROSSDB_DIR)" ] || [ -z "$(CROSSDB_PYTHON)" ]; then \
 		echo "ERROR: BEFORE_COMMIT・AFTER_COMMIT・CROSSDB_DIR・CROSSDB_PYTHON を指定してください（例: make bench-scalar-index-crossdb-ab BEFORE_COMMIT=773a835 AFTER_COMMIT=6ff22dc CROSSDB_DIR=<dir> CROSSDB_PYTHON=<python>）"; \
@@ -508,6 +508,18 @@ ifdef HAS_CARGO
 	BEFORE_COMMIT="$(BEFORE_COMMIT)" AFTER_COMMIT="$(AFTER_COMMIT)" CROSSDB_DIR="$(CROSSDB_DIR)" CROSSDB_PYTHON="$(CROSSDB_PYTHON)" scripts/bench_scalar_index_crossdb_ab.sh
 else
 	@echo "skip: Cargo.toml 未追加のため bench-scalar-index-crossdb-ab をスキップ"
+endif
+
+.PHONY: bench-filtered-distance-ab
+bench-filtered-distance-ab: ## Issue #655（候補 id マスク経路〔Issue #654〕前後比較。親 #650・ルート #649）。SCALAR 事前フィルタ付き DISTANCE の段別プロファイル（`scan_stage_profile_bench`。Issue #653）を before（#654 未適用）/after（#654 適用後）2 コミットの独立ソースツリー（`git archive` 展開）で交互 N≥5 ペア実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BEFORE_DIR・AFTER_DIR・BEFORE_COMMIT・AFTER_COMMIT 必須。AB_PAIRS（既定 5・5 未満は拒否）・AB_ROUNDS（既定 5）・AB_AFTER_ONLY_SELECTIVITY（既定 1/3・空文字で after-only 段を無効化）・OUT_DIR で上書きできる。ログは docs/design/bench-data/filtered-distance-mask-ab/ 配下。scripts/bench_filtered_distance_ab.sh --summarize <dir> で TSV 集約。crossdb 側の前後比較は bench-scalar-index-crossdb-ab を使う）を実行する
+ifdef HAS_CARGO
+	@if [ -z "$(BEFORE_DIR)" ] || [ -z "$(AFTER_DIR)" ] || [ -z "$(BEFORE_COMMIT)" ] || [ -z "$(AFTER_COMMIT)" ]; then \
+		echo "ERROR: BEFORE_DIR・AFTER_DIR・BEFORE_COMMIT・AFTER_COMMIT を指定してください（例: make bench-filtered-distance-ab BEFORE_DIR=<path> AFTER_DIR=<path> BEFORE_COMMIT=8225baa AFTER_COMMIT=2488128）"; \
+		exit 1; \
+	fi
+	BEFORE_DIR="$(BEFORE_DIR)" AFTER_DIR="$(AFTER_DIR)" BEFORE_COMMIT="$(BEFORE_COMMIT)" AFTER_COMMIT="$(AFTER_COMMIT)" scripts/bench_filtered_distance_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-filtered-distance-ab をスキップ"
 endif
 
 # --------------------------------------------------

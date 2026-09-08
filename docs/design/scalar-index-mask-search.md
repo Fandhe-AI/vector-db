@@ -3,7 +3,7 @@
 - **Issue**: #654（親 Issue #650。ルート #649。前提 Issue #474）
 - **対象ビヘイビア**（ポインタのみ・本文非転記）: `docs/spec/04-behavior/data-model.md`
   TABLE-12・`docs/spec/04-behavior/rls.md`・CORE-3, CORE-4, CORE-13
-- **ステータス**: 実装済み
+- **ステータス**: 実装済み・前後比較実測済み（Issue #655）
 
 ## 背景・目的
 
@@ -195,3 +195,147 @@ scripts/check_core_api.sh --update && bash scripts/check_core_api.sh
 は既存クエリ形状でも自動的に発火するが、投影が `id` のみのクエリでは
 `EagerSubset` の値読み出しパスまでは検証しないため、`tests/scalar_index_mask_search.rs`
 を独立に追加した）。
+
+## 前後比較実測（Issue #655）
+
+Issue #654（PR #664・merge `2488128`）が導入した候補 id マスク経路（複製
+排除）について、`docs/design/benchmark-judgement-policy.md` の計測規約
+（交互 N≥5 ペア・per-run 生データ必須・min-of-N＋median 併記・固定 ±5% 帯と
+参照区間実測帯の 2 種ノイズ帯）に従い、段別プロファイル（Track A）・crossdb
+横断ベンチ（Track B）の 2 系統で前後比較を行った。
+
+### 計測条件
+
+| arm | commit | 位置づけ |
+| --- | --- | --- |
+| before | `8225baa` | #654 適用直前（PR #665 merge） |
+| after | `2488128` | #654 適用直後（PR #664 merge） |
+
+ビルド入力同一性: `git diff --stat 8225baa 2488128 -- Cargo.lock Cargo.toml
+crates/wire-server scripts/crossdb_bench` は空（Track B の wire-server バイナリは
+engine 以外の入力が同一）。段別プロファイル（Track A）は #663（選択率 opt-in・
+merge `db9bd94`）の追加が必要なため作業ブランチ HEAD（`db9bd94`）を after 側の
+ビルド元に使ったが、`git diff --stat 2488128 db9bd94 -- crates/engine/src
+crates/wire-server/src Cargo.lock Cargo.toml` は空（production コードは #654 適用後
+のまま無変更）であることを確認したうえで実施した。
+
+環境: 12 vCPU（`QEMU Virtual CPU version 2.5+`）の共有 QEMU 開発環境。他の
+Issue エージェントが並行実行中のため、`BENCH_DEDICATED_ENV=1` は自己申告した
+ものの実測 loadavg（Track A: 2.52〜3.97・Track B: 1.66〜2.77）は真の専有環境
+（loadavg ≈ 0）ではない。**専有条件は満たされていない・参考値**として扱い、
+`docs/design/benchmark-judgement-policy.md` §5 の共有環境区分に従いオーナーの
+専有環境再実測を申し送る。`bench-qdrant` コンテナは停止せず稼働のまま
+（Issue #636 と同様の逸脱として記録）。
+
+### Track A: 段別プロファイル（`scan_stage_profile_bench`・選択率 1/5＝既定 20%）
+
+`scripts/bench_filtered_distance_ab.sh`（新規）で before/after 各 5 ペア・
+5 ラウンド輪番実行。生データ:
+`docs/design/bench-data/filtered-distance-mask-ab/20260908T164350Z-scan-profile-*`
+（before バイナリ sha256 `09af9b2f…`・after バイナリ sha256 `154d9bec…`）。
+
+| 区間 | before min / median | after min / median | ratio(min) | 参照帯 | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| `e2e(vector_knn_where/W0-hot)` | 0.6490 / 0.6840 ms | 0.3360 / 0.3410 ms | 0.5177 | 40.07% | **improved** |
+| `e2e(vector_knn_where/W0-cold)` | 14.5570 / 14.6340 ms | 14.3960 / 14.5530 ms | 0.9889 | 40.07% | within_band |
+| `e2e(vector_knn/W0-nowhere)`（参照） | 0.5950 / 0.6060 ms | 0.5940 / 0.6070 ms | 0.9983 | 40.07% | within_band |
+| `R_dot_kernel_distance_only`（参照） | 0.1850 / 0.1890 ms | 0.1730 / 0.1790 ms | 0.9351 | 40.07% | within_band |
+| `e2e(agg_count/A0a)`（参照） | 0.0500 / 0.0500 ms | 0.0500 / 0.0500 ms | 1.0000 | 40.07% | within_band |
+| `e2e(rls_isolation/A0b)`（参照） | 0.0500 / 0.0500 ms | 0.0500 / 0.0500 ms | 1.0000 | 40.07% | within_band |
+
+`W0-hot`（ホットパス。#654 が変更する経路そのもの）は min-of-N 比 0.5177
+（約 48% 高速化）と、参照帯（40.07%。`vector_knn/W0-nowhere`・`R_dot` の広い方）
+を超えて `improved` と判定できた。参照 4 区間はいずれも `within_band` で
+非退行を確認した（`W0-cold`＝毎回 `Storage::open` を含む経路は #654 の対象外
+のため不変）。
+
+after-only（`BENCH_SCAN_PROFILE_SELECTIVITY=1/3`＝crossdb fixture 相当の選択率
+33%。before バイナリは選択率 opt-in を持たないため before 対照なし）:
+
+| 区間 | after min / median |
+| --- | --- |
+| `e2e(index,k=10)` | 0.5010 / 0.5100 ms |
+| `e2e(plain,k=10)` | 1.9880 / 1.9950 ms |
+| `I1_index_candidate_resolve` | 1.9 / 1.9 µs |
+| `I2a_candidate_predicate` | 137.1 / 138.1 µs |
+| `I2b_candidate_mask_build` | 140.0 / 141.4 µs |
+| `I3_provider_search` | 145.3 / 152.8 µs |
+
+`I2b_candidate_mask_build`（140.0µs）は `docs/design/filtered-distance-stage-profile.md`
+が記録した in-binary 対照値（`I2b_candidate_arena_copy` 605.1µs vs
+`I2b_candidate_mask_build` 137.5µs）と同水準であり、独立した計測セッションでも
+一貫した値であることを確認した。`index_mask_scans_delta>0`・
+`consistency checks passed` は全 run で非 vacuous に確認済み。
+
+### Track B: crossdb 横断ベンチ（self・`vector_knn_where`／`bulk_knn_where_k200`）
+
+`scripts/bench_scalar_index_crossdb_ab.sh`（`REF_COMMIT=""` で ref arm を無効化
+し所要時間を短縮）で before/after 各 5 ペア輪番実行。生データ:
+`docs/design/bench-data/filtered-distance-mask-ab/20260908T164059Z-crossdb-*`・
+`*-hybrid-*`（before バイナリ sha256 `9c9ebad5…`・after バイナリ sha256
+`45c28ec9…`）。
+
+| フェーズ（p50） | before min | after min | ratio(min) | 参照帯 | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| `vector_knn_where` | 1895.85 µs | 1282.85 µs | 0.6767 | 45.31% | within_band |
+| `bulk_knn_where_k200` | 3018.54 µs | 2178.09 µs | 0.7216 | 45.31% | within_band |
+| `hybrid_rrf`（対象外） | 6415.32 µs | 6472.49 µs | 1.0089 | 45.31% | within_band |
+| `bulk_hybrid_k200`（対象外） | 9103.81 µs | 9107.97 µs | 1.0005 | 45.31% | within_band |
+| `where_compound_count`（対象外） | 1012.41 µs | 1037.80 µs | 1.0251 | 45.31% | within_band |
+| `vector_knn`（参照） | 660.03 µs | 666.70 µs | 1.0101 | 45.31% | within_band |
+| `agg_count`（参照） | 82.08 µs | 82.14 µs | 1.0007 | 45.31% | within_band |
+| `mode_recall`（参照） | 670.80 µs | 676.09 µs | 1.0079 | 45.31% | within_band |
+
+min-of-N は `vector_knn_where` で約 32%・`bulk_knn_where_k200` で約 28% の
+高速化を示し、Track A（段別プロファイル。W0-hot 約 48% 改善）と方向が一致する。
+ただし本計測セッションの参照区間実測ノイズ帯（`vector_knn.p50` run-to-run 幅
+45.31%）が Track A（40.07%）よりさらに広く、共有環境の負荷変動（loadavg
+1.66〜2.77・並行 Issue 実行由来）により両ノイズ帯判定では `within_band`
+（regressed/improved を断定しない）に留まった。**min-of-N の改善方向自体は
+Track A の段別内訳（`I2b_candidate_mask_build` が `I2b_candidate_arena_copy`
+比で約 4.3 倍高速）と整合しており、e2e レベルでの改善の存在を否定するもので
+はない**——参照帯が広いのは計測環境のノイズによるものであり、専有環境での
+再実測を待って確定判定とすべきである。非対象フェーズ（`hybrid_rrf`・
+`bulk_hybrid_k200`・`where_compound_count`）・参照区間（`vector_knn`・
+`agg_count`・`mode_recall`）はいずれも `within_band` で非退行を確認した。
+
+### Qdrant との差
+
+`docs/design/crossdb-bench.md` の既存実測表と対比する（本 Issue では Qdrant
+自体の再計測は行っていない）。
+
+- 専有環境表（同 doc「横断ベンチ実測（25,000 行・dim 128・k=10）」節）:
+  self `vector_knn_where` 2819µs（p50）に対し Qdrant exact 732µs・Qdrant HNSW
+  615µs。
+- 2026-09-08 共有環境再計測（同 doc「2026-09-08 再計測」節）: self
+  `vector_knn_where` 1953µs（p50）に対し Qdrant exact 657µs・Qdrant HNSW
+  675µs。self `bulk_knn_where_k200` 3287µs に対し pgvector HNSW 2500µs。
+
+本 Issue の Track B（本セッション・共有環境）実測では self `vector_knn_where`
+の min-of-N が 1282.85µs まで下がった（before 1895.85µs 比 0.68 倍）。同一
+セッション内で Qdrant を計測していないため直接比較はできないが、上記
+2026-09-08 の Qdrant exact 657µs と比べると差は縮小方向（before 相当の
+1895〜1953µs 比では約 2.9 倍だった差が、今回の after min-of-N 1282.85µs では
+約 2.0 倍まで縮小）にあると見られる。ただし本計測は参照帯が広く（上記）
+確定的な判定ではないため、Qdrant を含めた同一セッションでの専有環境再計測
+（README「他 DB との機能別横断ベンチ」節の手順）をオーナーへ申し送る。
+
+### 限界・申し送り
+
+- **1/3 ペア比較は構造的に不能**: before（#654 適用前）バイナリは選択率
+  opt-in（Issue #653・#663 で追加）・`I2b`/`I3`/`index_mask_scans_delta` の
+  いずれも持たないため、crossdb fixture 相当の選択率 33% での before/after
+  ペア比較はできない。HEAD の `scan_stage_profile_bench` を before の
+  engine（`ScalarIndex::resolve_candidates` を複製経路のまま持つ #654 適用前
+  コード）へ差し替えて再コンパイルする方法も、HEAD 側ハーネスが
+  `search_subset`（#654 で新設された API）を参照するためコンパイル不能であり
+  採らなかった。
+- **100,000 行規模点は未実施**（時間予算の都合。任意項目として plan に記載）。
+- **Qdrant の同一セッション再計測は未実施**（README 手順に沿った別途 Docker
+  起動が必要なため本 Issue の対象外とした）。
+- **専有環境再実測**: 本計測はいずれも共有 QEMU 環境（他 Issue エージェント
+  並行実行中）での実測であり、参照帯（40〜45%）が示す通りノイズが大きい。
+  min-of-N は一貫して改善方向を示すが、両ノイズ帯判定での確定的な
+  `improved` 判定にはオーナーの専有環境再実測が必要。
+- **hybrid・HNSW `Subset` 形状**（#654 の対象外区間。「対象外」節参照）は
+  本 Issue でも計測していない。

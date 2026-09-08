@@ -1,0 +1,40 @@
+env: os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma loadavg=3.97 1.63 0.71 1/443 2901855
+scan_stage_profile_bench: rows=25000 dim=128 rounds=5 scale=1 (tenant_a=23000 public, tenant_b=2000 private)
+--- per-round raw medians (ms) ---
+round[0]: A1=1.219 A2=1.402 A3=1.582 A4=1.748 A5=1.779 W1=0.324 W2=0.432 W3=0.507 W4=0.098 R_dot=0.195
+round[1]: A1=1.244 A2=1.401 A3=1.610 A4=1.722 A5=1.780 W1=0.323 W2=0.424 W3=0.502 W4=0.117 R_dot=0.179
+round[2]: A1=1.218 A2=1.396 A3=1.556 A4=1.712 A5=1.787 W1=0.326 W2=0.423 W3=0.499 W4=0.096 R_dot=0.179
+round[3]: A1=1.216 A2=1.446 A3=1.554 A4=1.712 A5=1.801 W1=0.323 W2=0.422 W3=0.498 W4=0.099 R_dot=0.185
+round[4]: A1=1.216 A2=1.396 A3=1.553 A4=1.802 A5=1.796 W1=0.325 W2=0.425 W3=0.501 W4=0.097 R_dot=0.216
+--- A series (median-of-R / min-of-R, ns/row over total physical rows) ---
+stage(A1_redb_scan): rows=25000 median=1.218ms ns_per_row=48.7 (min-of-R=1.216ms)
+stage(A2_header_decode): rows=25000 median=1.401ms ns_per_row=56.0 (min-of-R=1.396ms)
+diff(A1->A2): ns_per_row=7.3
+bucket(A1->A2): ns_per_row=7.3 ratio=14.97% band=within_noise_band
+stage(A3_rls_visible): rows=25000 median=1.556ms ns_per_row=62.2 (min-of-R=1.553ms)
+diff(A2->A3): ns_per_row=6.2
+bucket(A2->A3): ns_per_row=6.2 ratio=11.07% band=within_noise_band
+stage(A4_dim_meta_decode): rows=25000 median=1.722ms ns_per_row=68.9 (min-of-R=1.712ms)
+diff(A3->A4): ns_per_row=6.6
+bucket(A3->A4): ns_per_row=6.6 ratio=10.68% band=within_noise_band
+stage(A5_scalar_validate): rows=25000 median=1.787ms ns_per_row=71.5 (min-of-R=1.779ms)
+diff(A4->A5): ns_per_row=2.6
+bucket(A4->A5): ns_per_row=2.6 ratio=3.78% band=within_noise_band
+e2e(agg_count/A0a, ctx=tenant-a): median=0.050ms
+e2e(rls_isolation/A0b, ctx=tenant-b): median=0.050ms
+e2e(agg_count/A0c-cold, ctx=tenant-a, includes Storage::open): median=6.491ms (sample minimum, N=20: 6.339ms)
+--- W series (median-of-R / min-of-R, ns/row over visible (tenant-a Public) rows) ---
+stage(W1_scalar_scan): rows=23000 median=0.324ms ns_per_row=14.1 (min-of-R=0.323ms)
+stage(W2_predicate): rows=23000 median=0.424ms ns_per_row=18.5 (min-of-R=0.422ms)
+diff(W1->W2): ns_per_row=4.4
+bucket(W1->W2): ns_per_row=4.4 ratio=31.01% band=above_noise_band
+stage(W3_arena_copy): rows=23000 median=0.501ms ns_per_row=21.8 (min-of-R=0.498ms)
+diff(W2->W3): ns_per_row=3.3
+bucket(W2->W3): ns_per_row=3.3 ratio=18.10% band=within_noise_band
+W4_provider_search: matched_rows=4600 median=0.098ms (min-of-R=0.096ms)
+R_dot_kernel_distance_only (reference band): median=0.185ms min-of-R=0.179ms reference_band=21.03%
+e2e(vector_knn_where/W0-cold): median=14.791ms
+e2e(vector_knn_where/W0-hot): median=0.684ms
+e2e(vector_knn/W0-nowhere, cache fast path): median=0.618ms
+diff(W0-nowhere->W0-hot, raw diff; conflates WHERE overhead with reduced dense candidate set size, see docs): 0.067ms
+scan_stage_profile_bench: consistency checks passed (A3 visible row count == tenant_a_rows for both ctx_a/ctx_b every round, W2 match count == expected, W0-cold/W0-hot result ids within lang='ja' visible set, COUNT(*) == tenant_a_rows for both contexts)

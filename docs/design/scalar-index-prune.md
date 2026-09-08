@@ -175,4 +175,8 @@ build_from_cached_rls_rows_subset_with_all_slots_matches_full_scan`）。非昇�
 マスクとして探索する経路（`arena.rs::filter_cached_rls_rows_subset`・
 `kernel.rs::SearchProvider::search_subset`）を追加し、hybrid・HNSW `Subset`
 形状を除く DISTANCE 経路で複製を回避した。詳細は
-`docs/design/scalar-index-mask-search.md` 参照。
+`docs/design/scalar-index-mask-search.md` 参照。#654 の前後比較実測（本 doc
+§7.2「専有環境再実測はオーナーへ申し送り」の対象範囲）は Issue #655 で
+段別プロファイル・crossdb 双方を実施済み（`vector_knn_where` の e2e min-of-N
+比で段別 0.5177・crossdb 0.6767。同ドキュメント「前後比較実測（Issue #655）」
+節参照。共有環境の参考値のため専有環境再実測は引き続きオーナーへ申し送り）。
