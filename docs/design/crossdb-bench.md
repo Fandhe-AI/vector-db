@@ -912,6 +912,121 @@ per-run 生データ・結果表・実行ログは
 - `tmpfs/out-{1,2}-self_exact.json`・`run-{1,2}.log`（tmpfs 対照の per-run 生データ）
 - `env.txt`（`df -T`・Docker digest・常駐コンテナ状態・self バイナリ sha256 の記録）
 
+## self の `self_hnsw` 構成（Issue #658）
+
+- 対応: Issue #658（親 #659 ツリー）。前提: `--search-engine`（Issue #656・PR #662）・
+  `--hnsw-*` 探索パラメータ opt-in（Issue #657・PR #665）
+- 目的: self（wire-server 経由）を既定エンジン（`--config exact`）だけでなく
+  `--search-engine hnsw` opt-in（`--config hnsw`）でも計測できるようにし、
+  (1) ANN 経路の選択を非 vacuous に確認、(2) 他 DB の HNSW 構成
+  （m=16/ef_construction=100/ef_search=64）と候補幅規約（`ef.max(k)`）を揃えて
+  記録、(3) 既定エンジン対照の Recall@10 と劣化有無を明示する
+
+### 構成
+
+`scripts/crossdb_bench/run.py --db self --config hnsw` は起動前に
+`crossdb_plan_probe` example（`crates/engine/examples/crossdb_plan_probe.rs`。
+`path`/`body` 列を持つ専用テーブル `plan_probe` を作業コピー redb へ投入）と
+固定応答の loopback planner スタブ（`scripts/crossdb_bench/self_hnsw.py::PlannerStub`。
+実 Ollama 不要）を用意し、`wire-server` を
+`--search-engine hnsw --planner-endpoint <stub> --planner-model crossdb-stub`
+で起動する（README「self の `--config hnsw`」節参照）。`crossdb` fixture の
+`docs` テーブルには `path` 列が無く `EXPLAIN`（`dictionary_required_columns` が
+`path`/`body` 必須列を要求）を直接使えないため、この専用テーブルで代替する。
+
+自作 HNSW の既定パラメータ（`hnsw.rs::ValidatedHnswParams`）は
+`m=16/ef_construction=100/ef_search=64` で、pgvector・Qdrant・LanceDB の既定と
+一致する。探索側は `ef.max(k)`（`hnsw.rs::search_masked_with`）を内部で自動
+適用するため、`bulk_knn_k200`/`bulk_knn_k1000`（k=200/1000）は CLI 無しで
+候補幅 max(64, k) になる（`self_hnsw.py::ef_effective`）。
+
+### 非 vacuous 確認（`ann_probe`）と限界
+
+`EXPLAIN SELECT id FROM plan_probe USING PLAN('probe') LIMIT 10` の実測出力
+（`ann_probe` フェーズ。5 ペア全 run で完全一致）:
+
+```
+engine: hnsw
+hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0
+ann_plan: hnsw_full_visible
+```
+
+`EXPLAIN` は検索本体を実行しない静的判定（`sql/explain.rs`）であり、実行時
+縮退（索引構築失敗→brute-force、`mask_splits_graph`→plain scan）はこの確認
+だけでは検出できない。実行時カウンタ（`hnsw_index_cache_stats()`）による
+確認は Rust API のみで wire 非露出であり、Issue #659（選択率 33% での
+`ann_masked` 到達実測・既定値判断）へ申し送る。
+
+### `hnsw_index_warm`（索引構築の実行証跡）
+
+`sql::hnsw_cache` は同一世代内で索引を再利用する同期構築のため、初回クエリの
+所要時間が構築コストの実行証跡になる。5 ペア全 run で 256.3〜262.2 ms
+（`first_query_us`）——定常状態の `vector_knn` p50（0.4〜0.7 ms。下記表）と
+比べて 3 桁近く大きく、25,000 行（うち可視 23,000 行）の索引構築が初回クエリで
+実際に走ったことを示す非 vacuous な証跡になっている。
+
+### 前後比較実測（exact vs hnsw。共有 QEMU 参考値）
+
+`make bench-crossdb-self-hnsw-ab`（`scripts/bench_crossdb_self_hnsw_ab.sh`）で
+同一バイナリ（`wire-server` sha256 先頭 `9c9ebad57b5f`・`8225baa` 時点）・同一
+fixture（`docs25k.redb`・25,000 行・dim 128・ext4）を交互 5 ペア実行した
+（`docs/design/bench-data/crossdb-self-hnsw-ab/20260908T153029Z-*`。計測規約
+`docs/design/benchmark-judgement-policy.md` §5 の「共有 QEMU 環境は参考値」
+区分に該当。専有環境での再測定は未実施）:
+
+| フェーズ | exact min/median (µs) | hnsw min/median (µs) | ratio (hnsw/exact) |
+| --- | --- | --- | --- |
+| `vector_knn`（フィルタなし） | 657.4 / 701.0 | 434.2 / 436.5 | 0.66 / 0.62 |
+| `vector_knn_where`（`lang='ja'` フィルタ付き） | 1891.2 / 1922.3 | 4140.3 / 4198.9 | 2.19 / 2.18 |
+| `hybrid_rrf` | 6121.4 / 6448.0 | 5834.2 / 6050.5 | 0.95 / 0.94 |
+| `bulk_knn_k200` | 879.9 / 903.7 | 617.6 / 626.3 | 0.70 / 0.69 |
+| `bulk_knn_k1000` | 1627.0 / 1686.0 | 1366.7 / 1371.7 | 0.84 / 0.81 |
+| `bulk_knn_where_k200`（フィルタ付き） | 3128.3 / 3152.7 | 5646.8 / 5720.4 | 1.81 / 1.81 |
+| `bulk_hybrid_k200`（hybrid 密側が ANN 化） | 9043.6 / 9159.8 | 8691.7 / 8824.3 | 0.96 / 0.96 |
+
+所見（既存の Issue #413・#487 の実測傾向と整合）:
+
+- フィルタなし DISTANCE・hybrid（密側が ANN 化。Issue #410）は hnsw が高速
+  （0.62〜0.96 倍）。
+- SCALAR 事前フィルタ付き DISTANCE（`hnsw_subset` 経路。`vector_knn_where`・
+  `bulk_knn_where_k200`）は hnsw が約 1.8〜2.2 倍遅い。`lang = 'ja'`
+  フィルタは可視 23,000 行のうち約 1/3（`en`/`ja` 交互投入）を通すため、
+  `full_scan_ratio`（既定 1/10）を超えて `mask_splits_graph` に伴う plain
+  scan 縮退（Issue #487 と同型の理由）が有力な要因と推測されるが、
+  `hnsw_index_cache_stats()` によるカウンタ確認は Issue #659 の担当のため
+  本 Issue では確定していない。
+
+### Recall@10（既定エンジン対照）
+
+同じ 5 ペアで `recall_at_10`（同点許容。`ground truth` は内積 brute-force）を
+記録した:
+
+| config | recall_at_10（同点許容） | recall_at_10_strict |
+| --- | --- | --- |
+| exact | 1.0000（5/5 run で不変） | 0.9995 |
+| hnsw | 0.8700〜0.8735（5/5 run で安定） | 0.8665〜0.8710 |
+
+hnsw の Recall@10 は exact 比で約 13 ポイント低い（5/5 run で安定した実測値）。
+本 Issue では `docs25k.jsonl`（`seed_docs.rs` がトピック別テンプレート文を
+`HashingEmbedder` で埋め込んだ合成コーパス）の埋め込み分布そのものは分析して
+いないが、この結果は方向として Issue #405 の既存所見（一様乱数のみの・
+クラスタ構造を持たない合成コーパスは ef=64 で Recall@10 が明確に低下する。
+informational 参考値。受け入れ判定はクラスタ構造ありフィクスチャの範囲に
+限定される契約）と整合する。ただし `docs25k.jsonl` の分布が Issue #405 の
+一様乱数フィクスチャとどの程度近いか、Recall 低下の因果自体は本 Issue
+では未確定のまま申し送る。`ef_search` 引き上げでの改善余地の検証も本 Issue
+の対象外。
+
+### 申し送り（Issue #658）
+
+- `hnsw_f16`/`hnsw_i8` トークン（`--search-engine` が受理する他の ANN 構成）は
+  出力ファイル名 `self_hnsw.json` の衝突を避けるため対象外（別構成を追加する
+  場合は出力名の設計が必要）。
+- 実行時カウンタ（`hnsw_index_cache_stats()`）による縮退有無の確定・選択率
+  33% での `ann_masked` 到達実測・既定値判断は Issue #659 の担当。
+- wire-server 側の観測性追加（stderr へのエンジン表示等）は production 変更の
+  ため本 Issue では行わない。
+
 ## 申し送り
 
 - SQL 表層のフィルタ付き経路・集計の wire 越し 2.7〜6 ms は、in-process との差分を

@@ -16,6 +16,20 @@ users.txt はベンチ専用の一意な作業サブディレクトリ（`<workd
 （既定 `target/release/wire-server`）で上書きできる。設定した場合に限り、
 存在しないパスは起動前に fail-closed で拒否する（before/after の 2 バイナリを
 交互起動する前後比較計測向け。Issue #479）。
+
+`--config`: `exact`（既定エンジン・brute-force）と `hnsw`（`--search-engine hnsw`
+opt-in。Issue #656・#657・#658）の 2 構成を選べる。`hnsw` 構成は非 vacuous な
+ANN 選択を確認するため、起動前に `crossdb_plan_probe` example（`path`/`body`
+列を持つ probe 用テーブルを作業コピー redb へ投入する。`self_hnsw.probe_binary_path`）
+を実行し、起動後に固定応答の loopback planner スタブ（`self_hnsw.PlannerStub`）
+経由で `EXPLAIN SELECT ... USING PLAN(...)` を 1 回実行して `engine: hnsw` を
+確認する（`self_hnsw.verify_explain_rows`。不一致は fail-closed に例外で全体を
+失敗させる）。`EXPLAIN` は検索本体を実行しない静的判定のため、実行時縮退
+（構築失敗→brute-force、`mask_splits_graph`→plain scan）はこの確認だけでは
+検出できない（README・`docs/design/crossdb-bench.md` 参照。実行時カウンタでの
+確認は Issue #659 の担当）。`CROSSDB_SELF_HNSW_ARGS` 環境変数で `--hnsw-*`
+探索パラメータ opt-in を追加起動引数として渡せる（`self_hnsw.parse_hnsw_args_env`。
+`--hnsw-` 接頭辞の許可リスト検証つき）。
 """
 
 from __future__ import annotations
@@ -30,6 +44,7 @@ import time
 
 import psycopg
 
+import self_hnsw
 from common import (
     DIM,
     TENANT_OTHER,
@@ -115,11 +130,20 @@ class SelfServer:
     既存ファイル（特に `users.txt`）には一切触れない。
     """
 
-    def __init__(self, db_path: str, workdir: str, binary: str | None = None):
+    def __init__(
+        self,
+        db_path: str,
+        workdir: str,
+        binary: str | None = None,
+        extra_args: list[str] | None = None,
+    ):
         self.db_path = db_path
         self.workdir = workdir
         # 呼び出し側から渡された `binary` も同じ理由で絶対パスへ正規化する
         self.binary = os.path.abspath(binary) if binary else self._default_binary()
+        # `--search-engine hnsw` 等の追加起動引数（Issue #658）。既定は空リストの
+        # ため exact 構成の起動コマンドはビット同一のまま不変。
+        self.extra_args: list[str] = list(extra_args) if extra_args else []
         self.proc: subprocess.Popen | None = None
         # 子プロセスの stdout/stderr の書き出し先（ファイル）。パイプ（`subprocess.PIPE`）
         # を使うと、誰も読み取らない間に OS のパイプバッファが満杯になって
@@ -198,7 +222,8 @@ class SelfServer:
                 self.db_path,
                 "--bind",
                 f"{BIND_HOST}:{BIND_PORT}",
-            ],
+            ]
+            + self.extra_args,
             stdout=self._log_file,
             stderr=subprocess.STDOUT,
         )
@@ -294,21 +319,45 @@ def _exec_ids(conn: psycopg.Connection, sql: str) -> list:
     return [r[0] for r in rows]
 
 
+# `CROSSDB_SELF_HNSW_ARGS` は `--config hnsw` 起動時のみ意味を持つ探索パラメータ
+# opt-in（Issue #657・#659 向けの最小対応。`self_hnsw.parse_hnsw_args_env`）。
+_HNSW_ARGS_ENV = "CROSSDB_SELF_HNSW_ARGS"
+# `--config exact` でも `EXPLAIN` の非 hnsw エンジン確認を行いたいときの opt-in
+# （既定 off。`self_hnsw` モジュールドキュメント参照）。
+_ANN_PROBE_ENV = "CROSSDB_SELF_ANN_PROBE"
+
+
 def run(args, queries: list[dict]) -> dict:
     """self（wire-server）の全フェーズを実行する。
 
     `args.rows_file` は self の場合 redb ファイルパスを指す（他 DB モジュールの
     `run(args, docs, queries)` とは引数の意味が異なる。docs jsonl は不要
     ——wire-server は既存 redb をそのまま開くため再投入しない）。
+
+    `args.config`: `exact`（既定エンジン）は起動引数・フェーズ・結果キーを
+    従来どおりビット同一に保つ。`hnsw`（`--search-engine hnsw` opt-in。
+    Issue #656・#657・#658）は probe テーブル投入・loopback planner スタブ
+    起動・`EXPLAIN` による非 vacuous 確認（`ann_probe`）・`hnsw_index_warm`
+    単発計時を追加する（モジュール docstring 参照）。
     """
-    # self は既定エンジン（brute-force）のみを wire 経由で計測できる（ANN opt-in は
-    # wire から選択できない）。hnsw 構成を受理して exact と同じ経路の結果を
-    # self_hnsw.json として保存すると比較結果を誤認させるため拒否する。
-    if args.config != "exact":
+    if args.config not in ("exact", "hnsw"):
+        raise ValueError(f"self supports --config exact or hnsw (got {args.config!r})")
+
+    hnsw_args_raw = os.environ.get(_HNSW_ARGS_ENV)
+    if args.config == "exact" and hnsw_args_raw:
+        # `exact` 構成の起動引数をビット同一に保つ契約（探索パラメータは hnsw
+        # opt-in にのみ意味を持つ）を破らないよう、混入を fail-closed に拒否する。
         raise ValueError(
-            f"self supports only --config exact (got {args.config!r}); "
-            "ANN opt-in is not selectable over the wire protocol"
+            f"{_HNSW_ARGS_ENV} is set but --config is exact; "
+            "--hnsw-* tuning only applies to --config hnsw"
         )
+    hnsw_args = self_hnsw.parse_hnsw_args_env(hnsw_args_raw) if args.config == "hnsw" else []
+
+    # `hnsw` 構成は常に非 vacuous 確認（`ann_probe`）を行う。`exact` 構成でも
+    # 明示 opt-in（`CROSSDB_SELF_ANN_PROBE=1`）で対照値（`engine:
+    # parallel_brute_force`）を確認できる（既定 off。2.2 節参照）。
+    run_ann_probe = args.config == "hnsw" or os.environ.get(_ANN_PROBE_ENV) == "1"
+
     workdir = args.workdir
     # 計測は redb を書き換える（ingest_single_stmt が行と operation_id 台帳を追加する）
     # ため、渡された fixture を直接開かず作業コピーに対して実行する。コピーしないと
@@ -321,30 +370,104 @@ def run(args, queries: list[dict]) -> dict:
     os.makedirs(workdir, exist_ok=True)
     run_dir = tempfile.mkdtemp(prefix=f"self_bench_work_{os.getpid()}_", dir=workdir)
     work_db = os.path.join(run_dir, "self_bench_work.redb")
-    # `SelfServer.__init__` は `CROSSDB_SELF_BINARY` の存在検証で例外を送出しうる
-    # （fail-closed）。この検証・コンストラクタ呼び出し自体を try に含めることで、
-    # 直前の fixture DB コピー（`shutil.copyfile`）が作業ディレクトリに残留しない
-    # ようにする（コンストラクタ失敗時も finally で run_dir を必ず削除する）。
+
+    # `ingest_single_stmt` フェーズ（`_run_phases`）と同じ導出（クエリ fixture の
+    # embedding 長）。probe テーブルの `VECTOR(dim)` 列型・起動前の probe 投入で
+    # 先に必要になるため、ここでも同じ式で導出する（`_run_phases` 内の値と一致）。
+    rng_dim = len(queries[0]["embedding"]) if queries else DIM
+
+    # `SelfServer.__init__`／`self_hnsw.probe_binary_path` は存在検証で例外を送出
+    # しうる（fail-closed）。この検証・コンストラクタ呼び出し自体を try に含める
+    # ことで、直前の fixture DB コピー（`shutil.copyfile`）が作業ディレクトリに
+    # 残留しないようにする（失敗時も finally で run_dir を必ず削除する）。
     server: SelfServer | None = None
+    planner_stub: self_hnsw.PlannerStub | None = None
     try:
         shutil.copyfile(args.rows_file, work_db)
-        server = SelfServer(db_path=work_db, workdir=workdir)
+
+        extra_args: list[str] = []
+        if run_ann_probe:
+            # `EXPLAIN` の前段 `dictionary_required_columns` が要求する非 nullable
+            # TEXT の `path`/`body` 列を `docs` テーブルは持たない（crossdb fixture
+            # 由来）ため、`crossdb_plan_probe` example で専用テーブルを作業コピー
+            # （元 fixture ではない）へ投入してから planner スタブ・wire-server を
+            # 起動する。
+            probe_binary = self_hnsw.probe_binary_path()
+            subprocess.run([probe_binary, work_db, str(rng_dim)], check=True)
+            planner_stub = self_hnsw.PlannerStub()
+            planner_stub.start()
+            extra_args += [
+                "--planner-endpoint",
+                planner_stub.endpoint,
+                "--planner-model",
+                "crossdb-stub",
+            ]
+        if args.config == "hnsw":
+            extra_args += ["--search-engine", self_hnsw.SEARCH_ENGINE_TOKEN]
+            extra_args += hnsw_args
+
+        server = SelfServer(db_path=work_db, workdir=workdir, extra_args=extra_args)
         server.start()
-        return _run_phases(args, queries, server)
+        return _run_phases(
+            args,
+            queries,
+            server,
+            run_ann_probe=run_ann_probe,
+            hnsw_args=hnsw_args,
+        )
     finally:
         if server is not None:
             server.stop()
+        if planner_stub is not None:
+            planner_stub.stop()
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
-def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
-    """起動済み wire-server に対して全フェーズを実行する（`run` から呼ばれる）。"""
+def _run_phases(
+    args,
+    queries: list[dict],
+    server: SelfServer,
+    run_ann_probe: bool = False,
+    hnsw_args: list[str] | None = None,
+) -> dict:
+    """起動済み wire-server に対して全フェーズを実行する（`run` から呼ばれる）。
+
+    `run_ann_probe`（`run()` が `args.config == "hnsw"` または
+    `CROSSDB_SELF_ANN_PROBE=1` のときに立てる）が真のときのみ `ann_probe`／
+    `hnsw_index_warm` フェーズを追加する。`args.config == "hnsw"` のときのみ
+    bulk 系フェーズへ `ef_search`/`ef_effective` を付与する。
+    """
+    hnsw_args = hnsw_args or []
+    is_hnsw = args.config == "hnsw"
     try:
         conn_a = server.connect(USER_A)
         phases: dict = {}
 
         query_vecs = [vec_literal(q["embedding"]) for q in queries]
         query_texts = [sql_escape_literal(q.get("text", "")) for q in queries]
+
+        # --- ann_probe（Issue #658）: `EXPLAIN` で選択エンジンを非 vacuous に確認する ---
+        # 静的判定（`sql/explain.rs` は検索本体を実行しない）であり、実行時縮退
+        # （構築失敗→brute-force、`mask_splits_graph`→plain scan）はここでは
+        # 検出できない（`docs/design/crossdb-bench.md` 参照。実行時カウンタでの
+        # 確認は Issue #659 の担当）。probe テーブルは `crossdb_plan_probe`
+        # example が `run()` で事前投入済み。
+        if run_ann_probe:
+            with conn_a.cursor() as cur:
+                cur.execute("EXPLAIN SELECT id FROM plan_probe USING PLAN('probe') LIMIT 10")
+                explain_rows = [r[0] for r in cur.fetchall()]
+            verified = self_hnsw.verify_explain_rows(explain_rows, expect_hnsw=is_hnsw)
+            phases["ann_probe"] = verified
+
+        # --- hnsw_index_warm（Issue #658）: 索引構築を含む初回クエリの単発計時 ---
+        # `sql::hnsw_cache` は同一世代内で索引を再利用する同期構築のため、初回
+        # クエリの所要時間が構築コストの実行証跡になる（informational。exact
+        # 構成にはこのフェーズを持たせない）。
+        if is_hnsw and query_vecs:
+            t0 = time.perf_counter()
+            _exec_ids(conn_a, f"SELECT id FROM docs ORDER BY embedding <=> '{query_vecs[0]}' LIMIT 10")
+            t1 = time.perf_counter()
+            phases["hnsw_index_warm"] = {"first_query_us": (t1 - t0) * 1_000_000.0}
 
         # --- vector_knn ---
         def knn(qv):
@@ -451,6 +574,18 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
                 cur.execute(sql)
                 return cur.fetchall()
 
+        def _ef_fields(k: int) -> dict:
+            # HNSW 候補幅規約 max(64, k)（`hnsw.rs::search_masked_with`。README・
+            # `docs/design/crossdb-bench.md` 記録用）。exact 構成は索引を持たない
+            # ため `None` のまま記録する（pgvector 等の `ef_search` フィールドと
+            # 同じ書式に揃える）。
+            if not is_hnsw:
+                return {"ef_search": None, "ef_effective": None}
+            return {
+                "ef_search": self_hnsw.DEFAULT_EF_SEARCH,
+                "ef_effective": self_hnsw.ef_effective(k),
+            }
+
         def bulk_knn(k: int):
             def _run(qv):
                 return _exec_rows(
@@ -461,7 +596,12 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
 
         for k in (200, 1000):
             stats, last = measure(bulk_knn(k), query_vecs)
-            phases[f"bulk_knn_k{k}"] = {**stats, "k": k, "rows_returned": len(last)}
+            phases[f"bulk_knn_k{k}"] = {
+                **stats,
+                "k": k,
+                "rows_returned": len(last),
+                **_ef_fields(k),
+            }
 
         def bulk_knn_where(qv):
             return _exec_rows(
@@ -470,7 +610,12 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
             )
 
         stats, last = measure(bulk_knn_where, query_vecs)
-        phases["bulk_knn_where_k200"] = {**stats, "k": 200, "rows_returned": len(last)}
+        phases["bulk_knn_where_k200"] = {
+            **stats,
+            "k": 200,
+            "rows_returned": len(last),
+            **_ef_fields(200),
+        }
 
         def bulk_hybrid(i):
             qv, qt = query_vecs[i], query_texts[i]
@@ -480,7 +625,12 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
             )
 
         stats, last = measure(bulk_hybrid, idxs)
-        phases["bulk_hybrid_k200"] = {**stats, "k": 200, "rows_returned": len(last)}
+        phases["bulk_hybrid_k200"] = {
+            **stats,
+            "k": 200,
+            "rows_returned": len(last),
+            **_ef_fields(200),
+        }
 
         # ORDER BY なしの行取得（広域取得。Issue #454 で SQL 表層
         # `crates/engine/src/sql/allowlist.rs::Statement::Scan` として実装済み）は
@@ -653,6 +803,17 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
             config=args.config,
             rows=rows_visible,
             dim=rng_dim,
+            extra={
+                "index": (
+                    f"hnsw(m=16,ef_construction=100,ef_search={self_hnsw.DEFAULT_EF_SEARCH},"
+                    "resident=f32)"
+                    if is_hnsw
+                    else "exact (no index)"
+                ),
+                "search_engine": self_hnsw.SEARCH_ENGINE_TOKEN if is_hnsw else "default",
+                "hnsw_args": hnsw_args,
+                "planner": "loopback stub (fixed expansion)" if run_ann_probe else None,
+            },
         )
         return {"meta": meta, "phases": phases}
     finally:

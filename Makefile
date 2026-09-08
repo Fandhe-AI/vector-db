@@ -510,6 +510,18 @@ else
 	@echo "skip: Cargo.toml 未追加のため bench-scalar-index-crossdb-ab をスキップ"
 endif
 
+.PHONY: bench-crossdb-self-hnsw-ab
+bench-crossdb-self-hnsw-ab: ## Issue #658（crossdb self の exact/hnsw 構成を同一バイナリで交互 N≥5 ペア実行し前後比較する）。事前に `cargo build --release -p wire-server` と `cargo build --release -p engine --example crossdb_plan_probe` が必要（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。CROSSDB_DIR〔docs25k.redb／queries200.jsonl を含むディレクトリ〕・CROSSDB_PYTHON〔psycopg 入り python3〕必須。AB_PAIRS（既定 5・5 未満は拒否）・CROSSDB_SELF_PORT（既定 15438）・CROSSDB_SELF_HNSW_ARGS（hnsw arm にのみ適用される `--hnsw-*` opt-in）で上書きできる。ログは docs/design/bench-data/crossdb-self-hnsw-ab/ 配下。scripts/bench_crossdb_self_hnsw_ab.sh --summarize <dir> で TSV 集約）を実行する
+ifdef HAS_CARGO
+	@if [ -z "$(CROSSDB_DIR)" ] || [ -z "$(CROSSDB_PYTHON)" ]; then \
+		echo "ERROR: CROSSDB_DIR・CROSSDB_PYTHON を指定してください（例: make bench-crossdb-self-hnsw-ab CROSSDB_DIR=<dir> CROSSDB_PYTHON=<python>）"; \
+		exit 1; \
+	fi
+	CROSSDB_DIR="$(CROSSDB_DIR)" CROSSDB_PYTHON="$(CROSSDB_PYTHON)" scripts/bench_crossdb_self_hnsw_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-crossdb-self-hnsw-ab をスキップ"
+endif
+
 # --------------------------------------------------
 # ingest 経路の段別内訳プロファイル（Issue #396。crates/engine/benches/ingest_profile_bench.rs）
 # --------------------------------------------------
@@ -572,7 +584,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-crossdb
-bench-crossdb: ## self（wire-server 経由）と pgvector / sqlite-vec / Qdrant / LanceDB / MySQL を機能別に比較する（Docker・Python venv・`cargo build --release -p wire-server`・seed_docs 生成 fixture が必要。CROSSDB_DIR〔fixture ディレクトリ〕と CROSSDB_PYTHON〔venv の python〕を必須指定。任意 CROSSDB_DIM（十進数字のみ・例 768。Issue #466）で dim 別 fixture 名（docs25k-d<dim>.*／queries200-d<dim>.jsonl）・results/logs サブディレクトリへ切替。時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+bench-crossdb: ## self（wire-server 経由）と pgvector / sqlite-vec / Qdrant / LanceDB / MySQL を機能別に比較する（Docker・Python venv・`cargo build --release -p wire-server`・seed_docs 生成 fixture が必要。CROSSDB_DIR〔fixture ディレクトリ〕と CROSSDB_PYTHON〔venv の python〕を必須指定。任意 CROSSDB_DIM（十進数字のみ・例 768。Issue #466）で dim 別 fixture 名（docs25k-d<dim>.*／queries200-d<dim>.jsonl）・results/logs サブディレクトリへ切替。self は exact 構成に加え hnsw 構成（`--config hnsw`。Issue #658）も自動で回す。事前に `cargo build --release -p engine --example crossdb_plan_probe` が必要——未ビルドだと self/hnsw 行のみ FAILED として記録され本ターゲット全体が非 0 終了する。時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
 	@test -n "$(CROSSDB_DIR)" || { echo "CROSSDB_DIR を指定してください（fixture ディレクトリ）"; exit 1; }
 	@test -n "$(CROSSDB_PYTHON)" || { echo "CROSSDB_PYTHON を指定してください（venv の python）"; exit 1; }
 	CROSSDB_DIR="$(CROSSDB_DIR)" CROSSDB_PYTHON="$(CROSSDB_PYTHON)" bash scripts/crossdb_bench/run_all.sh

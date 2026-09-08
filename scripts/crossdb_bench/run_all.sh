@@ -73,6 +73,11 @@ up() {
 for c in pgvector qdrant mysql; do bash "$B/containers.sh" down "$c" >/dev/null 2>&1 || true; done
 
 run "$ROWS_REDB" self exact
+# self の hnsw 構成（`--search-engine hnsw` opt-in。Issue #656〜#658）は
+# `crossdb_plan_probe` example（`cargo build --release -p engine --example
+# crossdb_plan_probe`）のビルドを追加で要求する。未ビルドなら本行は失敗として
+# 記録される（`FAILED` に積まれ非 0 終了。ログは `$LOGS_DIR/self_hnsw.log`）。
+run "$ROWS_REDB" self hnsw
 run "$ROWS_JSONL" sqlite_vec exact
 run "$ROWS_JSONL" lancedb exact
 run "$ROWS_JSONL" lancedb hnsw

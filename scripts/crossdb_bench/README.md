@@ -89,6 +89,80 @@ CROSSDB_SELF_BINARY=/tmp/wt-before/target-before/release/wire-server \
   python scripts/crossdb_bench/run.py --db self --config exact ...
 ```
 
+### self の `--config hnsw`（ANN opt-in。Issue #656〜#658）
+
+`--search-engine`（Issue #656）・`--hnsw-*` 探索パラメータ opt-in（Issue #657）が
+wire-server の CLI へ入ったことで、self（wire-server 経由）でも `--config hnsw`
+（`--search-engine hnsw`）を計測できる。**事前に `crossdb_plan_probe` example の
+ビルドが必要**（`cargo build --release -p engine --example crossdb_plan_probe`）。
+`--search-engine` を持たない旧バイナリを `CROSSDB_SELF_BINARY` で指定すると
+未知引数として起動失敗するが、これは意図した fail-closed の挙動である
+（exact 構成の結果を ANN 経路と誤認させないため、緩めない）。
+
+```bash
+cargo build --release -p wire-server
+cargo build --release -p engine --example crossdb_plan_probe
+
+python scripts/crossdb_bench/run.py --db self --config hnsw \
+  --rows-file "$S/docs25k.redb" --queries-file "$S/queries200.jsonl"
+```
+
+`--config hnsw` は起動前に次の追加処理を行う（`self_hnsw.py`。`--config exact`
+の起動引数・フェーズ・結果キーはビット同一のまま不変）:
+
+1. `crossdb_plan_probe <作業コピー redb> <dim>` を実行し、`EXPLAIN` の前段
+   `dictionary_required_columns` が要求する非 nullable TEXT の `path`/`body`
+   列を持つ専用テーブル `plan_probe` を投入する（`docs` テーブルには `path`
+   列が無いため使えない）。
+2. loopback（`127.0.0.1`）のエフェメラルポートで固定応答の planner スタブ
+   （`self_hnsw.PlannerStub`。実 Ollama 不要）を起動し、
+   `--planner-endpoint`/`--planner-model` として wire-server へ渡す。
+3. `EXPLAIN SELECT id FROM plan_probe USING PLAN('probe') LIMIT 10` を 1 回
+   実行し、`engine: hnsw` を確認する（結果は `ann_probe` フェーズへ記録。
+   不一致・欠落は例外で計測全体を失敗させる fail-closed）。
+
+`EXPLAIN` は検索本体を実行しない静的判定（`sql/explain.rs`）のため、実行時
+縮退（索引構築失敗→brute-force、`mask_splits_graph`→plain scan）はこの確認
+だけでは検出できない。実行時カウンタ（`hnsw_index_cache_stats()`）による
+確認は Rust API のみで wire 非露出であり、Issue #659 の担当として申し送る。
+
+追加フェーズ・meta:
+
+| キー | 内容 |
+| --- | --- |
+| `phases.ann_probe` | 上記 3. の `EXPLAIN` 検証結果（`engine`/`hnsw_params`/`ann_plan`/生の行） |
+| `phases.hnsw_index_warm` | 索引構築を含む初回 `vector_knn` 相当クエリの単発計時（`first_query_us`。informational） |
+| `phases.bulk_knn_k*`/`bulk_knn_where_k200`/`bulk_hybrid_k200` | `ef_search`/`ef_effective`（`ef.max(k)`。`hnsw.rs::search_masked_with` の契約からの導出値）を追加 |
+| `meta.index` | `hnsw(m=16,ef_construction=100,ef_search=64,resident=f32)` または `exact (no index)` |
+| `meta.search_engine` | `hnsw` または `default` |
+| `meta.hnsw_args` | `CROSSDB_SELF_HNSW_ARGS` から渡した追加起動引数（無ければ `[]`） |
+
+候補幅は自作 HNSW の既定 `m=16/ef_construction=100/ef_search=64` を使う
+（pgvector・Qdrant・LanceDB の既定と一致）。探索側は `ef.max(k)` を内部で
+自動適用するため、`bulk_knn_k200`/`bulk_knn_k1000`（k=200/1000）は CLI 無しで
+候補幅 max(64, k) になる。
+
+環境変数:
+
+| 環境変数 | 既定 | 内容 |
+| -------- | ---- | ---- |
+| `CROSSDB_PLAN_PROBE_BINARY` | `target/release/examples/crossdb_plan_probe` | probe example バイナリのパス上書き（絶対パス正規化・存在検査は fail-closed） |
+| `CROSSDB_SELF_HNSW_ARGS` | 未設定（空） | `--config hnsw` の起動引数へ追加する `--hnsw-*` 探索パラメータ opt-in（例: `--hnsw-full-scan-ratio 1/2`）。`shlex.split` 後、フラグ名が `--hnsw-` 接頭辞であること・各フラグの直後に値トークンが 1 個続くことを検証し、不適合は `ValueError` で拒否する（許可リスト方式）。`--config exact` で設定されていた場合も拒否する |
+| `CROSSDB_SELF_ANN_PROBE` | 未設定（`0`） | `1` を指定すると `--config exact` でも `ann_probe`（`engine: parallel_brute_force` を期待）を実行する（既定 off。対照値の記録用） |
+
+`hnsw_f16`/`hnsw_i8` トークン（`--search-engine` が受理する他の ANN 構成）は
+出力ファイル名 `self_hnsw.json` の衝突を避けるため本ハーネスの対象外
+（別構成を追加する場合は出力名の設計が必要。Issue #658 計画の申し送り）。
+
+前後比較（exact vs hnsw）は `scripts/bench_crossdb_self_hnsw_ab.sh`
+（`make bench-crossdb-self-hnsw-ab`）を使う:
+
+```bash
+CROSSDB_DIR="$S" CROSSDB_PYTHON=/path/to/venv/bin/python \
+  scripts/bench_crossdb_self_hnsw_ab.sh
+scripts/bench_crossdb_self_hnsw_ab.sh --summarize docs/design/bench-data/crossdb-self-hnsw-ab
+```
+
 ### 環境変数（コンテナ名）
 
 `containers.sh` が起動する各コンテナの名前は既定で `bench-<db>` 固定だが、
@@ -231,6 +305,8 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 | `bulk_knn_where_k200` | 広域取得: `lang = 'ja'` フィルタ付き Top-200（`id, body`） |
 | `bulk_hybrid_k200` | 広域取得: hybrid RRF の Top-200（`id, body`。pgvector・sqlite-vec は候補プールを 200 へ拡大し `candidate_pool` を記録） |
 | `scan_where_nosort_k500` | ORDER BY なしのスカラーフィルタのみ LIMIT 500（`id, body`）。Issue #454 で self の SQL 表層へ広域取得（`Statement::Scan`。`docs/design/wide-retrieval-scan.md`）を追加したため受理される。実行して受理／拒否を都度確認したうえで記録する |
+| `ann_probe` | self の `--config hnsw`（または `CROSSDB_SELF_ANN_PROBE=1`）でのみ記録。`EXPLAIN` による選択エンジンの非 vacuous 確認（上記「self の `--config hnsw`」参照。静的判定であり実行時縮退は検出できない） |
+| `hnsw_index_warm` | self の `--config hnsw` でのみ記録。索引構築を含む初回クエリの単発計時（informational） |
 
 ## 公平性についての注記
 
