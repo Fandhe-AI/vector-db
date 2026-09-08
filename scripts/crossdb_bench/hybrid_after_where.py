@@ -159,6 +159,11 @@ def main() -> int:
         server.start()
         conn = server.connect(self_db.USER_A)
 
+        # 暖機・計測ループの開始前に取得する（起動直後の loadavg）。
+        # ループ終了後に取得すると計測自体の負荷が混入し、`loadavg_start`
+        # という変数名と観測時点が一致しなくなる（codex-review P2 指摘）。
+        loadavg_start = read_loadavg()
+
         rss: dict = {}
         rss["start"] = _rss_snapshot(server.proc.pid)
 
@@ -209,7 +214,7 @@ def main() -> int:
             "warm_where": args.warm_where if args.mode != "hybrid" else 0,
             "body_prefix": body_prefix,
             "binary": self_db._binary_version_string(server.binary),
-            "loadavg_start": read_loadavg(),
+            "loadavg_start": loadavg_start,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
         payload = {
