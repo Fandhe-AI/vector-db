@@ -825,6 +825,17 @@ pub(crate) fn execute_statement_with_cache(
     // （`ScalarIndexCacheStats` はテナント存在情報を含まない機微性の低い値だが、
     // 二重計上は観測契約を破る。`tests/scalar_index_cache.rs` が固定）。
     let mut scalar_index_lookup_hit: Option<bool> = None;
+    // Issue #654: 候補削減が「絞る」だけに使われ、`VectorArena` への複製
+    // （`build_from_cached_rls_rows_subset`）を経ずキャッシュ済みスナップショットの
+    // `VectorArena` を借用したままスロットマスクで直接探索できた場合、通過した
+    // 元スロット番号（`arena`＝`snapshot.arena()` に対する添字。狭義昇順）を
+    // ここへ記録する。`Some` の場合、下の `slot_ids` 生成・DISTANCE 段は
+    // `provider.search`（複製前提）ではなく `provider.search_subset`（マスク）を
+    // 使う。対象は `Ranking::Distance`（`!is_hybrid`）かつ非 HNSW `Subset` 形状
+    // （`hnsw_subset_eligible` が偽。HNSW Subset 経路は Phase 2 まで複製経路の
+    // まま。モジュールドキュメント冒頭・`docs/design/scalar-index-mask-search.md`
+    // 参照）に限る。
+    let mut mask_kept_slots: Option<Vec<u32>> = None;
     let arena: &VectorArena = match arena_cache {
         None => owned_arena.insert(
             VectorArena::build_filtered_with_rows_in_txn(
@@ -954,34 +965,76 @@ pub(crate) fn execute_statement_with_cache(
                         }
                     }
 
-                    owned_arena.insert(if let Some(slots) = index_candidate_slots.as_ref() {
-                        let built = VectorArena::build_from_cached_rls_rows_subset(
+                    // Issue #654: 候補削減が発火し（`index_candidate_slots` が
+                    // `Some`）、かつこのクエリが `Ranking::Distance` で HNSW
+                    // `Subset` 経路（`hnsw_subset_eligible`）を使わない場合、
+                    // `VectorArena` への複製を経ずキャッシュ済みスナップショットの
+                    // `VectorArena` をそのまま借用し、`filter_cached_rls_rows_subset`
+                    // が返す元スロット番号だけを DISTANCE 段の候補マスクとして使う
+                    // （§モジュールドキュメント「Issue #654」参照）。hybrid の
+                    // `Subset` 形状（疎コーパスの `DocId` がスロット番号に依存する
+                    // ため）・HNSW `Subset` 経路（`hnsw_subset_eligible`）は対象外で
+                    // 従来どおり複製経路を使う。
+                    if let Some(slots) = index_candidate_slots.as_ref() {
+                        if !is_hybrid && !hnsw_subset_eligible {
+                            let kept = VectorArena::filter_cached_rls_rows_subset(
+                                expected_dim,
+                                snapshot.arena(),
+                                snapshot.metadata(),
+                                slots,
+                                on_visible_row,
+                                crate::arena::MAX_ARENA_ROWS,
+                                crate::arena::MAX_ARENA_TOTAL_BYTES,
+                            )
+                            .map_err(|e| map_arena_error(&bound.table, e))?;
+                            if let Some(scalar_access) = scalar_cache.as_ref() {
+                                scalar_access.cache.record_index_scan();
+                                scalar_access.cache.record_index_mask_scan();
+                            }
+                            mask_kept_slots = Some(kept);
+                            cache_hit_snapshot = Some(snapshot);
+                            cache_hit_snapshot
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    map_arena_error(
+                                        &bound.table,
+                                        ArenaError::AllocationFailed(
+                                            "cache hit snapshot missing immediately after assignment"
+                                                .to_string(),
+                                        ),
+                                    )
+                                })?
+                                .arena()
+                        } else {
+                            let built = VectorArena::build_from_cached_rls_rows_subset(
+                                &bound.table,
+                                expected_dim,
+                                snapshot.arena(),
+                                snapshot.metadata(),
+                                slots,
+                                on_visible_row,
+                                crate::arena::MAX_ARENA_ROWS,
+                                crate::arena::MAX_ARENA_TOTAL_BYTES,
+                            )
+                            .map_err(|e| map_arena_error(&bound.table, e))?;
+                            if let Some(scalar_access) = scalar_cache.as_ref() {
+                                scalar_access.cache.record_index_scan();
+                            }
+                            owned_arena.insert(built)
+                        }
+                    } else {
+                        let built = VectorArena::build_from_cached_rls_rows(
                             &bound.table,
                             expected_dim,
                             snapshot.arena(),
                             snapshot.metadata(),
-                            slots,
                             on_visible_row,
                             crate::arena::MAX_ARENA_ROWS,
                             crate::arena::MAX_ARENA_TOTAL_BYTES,
                         )
                         .map_err(|e| map_arena_error(&bound.table, e))?;
-                        if let Some(scalar_access) = scalar_cache.as_ref() {
-                            scalar_access.cache.record_index_scan();
-                        }
-                        built
-                    } else {
-                        VectorArena::build_from_cached_rls_rows(
-                            &bound.table,
-                            expected_dim,
-                            snapshot.arena(),
-                            snapshot.metadata(),
-                            on_visible_row,
-                            crate::arena::MAX_ARENA_ROWS,
-                            crate::arena::MAX_ARENA_TOTAL_BYTES,
-                        )
-                        .map_err(|e| map_arena_error(&bound.table, e))?
-                    })
+                        owned_arena.insert(built)
+                    }
                 }
             } else {
                 // ミス: 従来どおり redb を走査するが、`rls_capture` で RLS 通過行
@@ -1116,17 +1169,36 @@ pub(crate) fn execute_statement_with_cache(
     // 可視集合内で一意かつ `(tenant_id, id)` の行と 1 対 1 に対応するため、これらの
     // 契約が構造的に回復する。クライアントへ返す `ResultRow.id` は投影段で
     // `arena.ids()[slot]`（本来の行 id）へ戻す。
+    // Issue #654: `mask_kept_slots` が `Some` の場合、`arena` はキャッシュ済み
+    // スナップショットの `VectorArena` を丸ごと借用したまま（複製していない）で
+    // あり、候補は `mask_kept_slots` が指す元スロット番号だけに絞る。`None` の
+    // 場合は従来どおり `arena` の全スロット（`0..arena.ids().len()`）を候補にする
+    // （`arena` 自体が候補選択済みの縮約アリーナであるため）。
     let mut slot_ids: Vec<u64> = Vec::new();
-    slot_ids
-        .try_reserve_exact(arena.ids().len())
-        .map_err(|e| SqlSurfaceError::Internal {
-            detail: format!("failed to reserve candidate slot ids: {e}"),
-        })?;
-    for slot in 0..arena.ids().len() {
-        let slot_id = u64::try_from(slot).map_err(|_| SqlSurfaceError::Internal {
-            detail: "candidate slot index does not fit in u64".to_string(),
-        })?;
-        slot_ids.push(slot_id);
+    match mask_kept_slots.as_ref() {
+        Some(kept) => {
+            slot_ids
+                .try_reserve_exact(kept.len())
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve candidate slot ids: {e}"),
+                })?;
+            for &slot in kept {
+                slot_ids.push(slot as u64);
+            }
+        }
+        None => {
+            slot_ids.try_reserve_exact(arena.ids().len()).map_err(|e| {
+                SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve candidate slot ids: {e}"),
+                }
+            })?;
+            for slot in 0..arena.ids().len() {
+                let slot_id = u64::try_from(slot).map_err(|_| SqlSurfaceError::Internal {
+                    detail: "candidate slot index does not fit in u64".to_string(),
+                })?;
+                slot_ids.push(slot_id);
+            }
+        }
     }
     // スロット番号は重複しないため、多重集合の各件数は必ず 1 になる
     // （`core::provider_result_is_valid` の (3)(4) 検証はそのまま使える）。
@@ -1237,6 +1309,23 @@ pub(crate) fn execute_statement_with_cache(
                             provider.search(input).map_err(map_kernel_error)?
                         }
                     }
+                } else if let Some(kept) = mask_kept_slots.as_ref() {
+                    // Issue #654: `arena` はキャッシュ済みスナップショットの
+                    // `VectorArena` を丸ごと借用したまま（複製していない）。`slot_ids`
+                    // （＝`kept`）は `arena.vectors()` に対する行番号そのものであり、
+                    // 位置ベースの `SearchInput`（`ids[idx]` ではなく配列中の位置
+                    // `idx` で `vectors` の行を決める契約。`kernel.rs::CpuScalarProvider`
+                    // 参照）へそのまま渡すと誤った行を候補にしてしまう。行番号を
+                    // 明示的な候補マスクとして扱う `search_subset` を使う。
+                    provider
+                        .search_subset(crate::kernel::SubsetSearchInput {
+                            slots: kept,
+                            vectors: arena.vectors(),
+                            dim: arena.dim(),
+                            query,
+                            k: k_eff,
+                        })
+                        .map_err(map_kernel_error)?
                 } else {
                     let input = SearchInput {
                         ids: &slot_ids,
@@ -1610,6 +1699,14 @@ pub(crate) fn execute_statement_with_cache(
                 row_table_name: crate::catalog::user_rows_table_name(&bound.table),
             }),
         }
+    } else if let Some(kept) = mask_kept_slots.as_ref() {
+        // Issue #654: `arena` は複製されていない借用アリーナのため、`hits` の
+        // スロット番号（元スロット）と `candidate_columns` の添字（出力側連番）が
+        // 一致しない。`project_rows` 側で `kept` を通じて写像する。
+        ScalarSource::EagerSubset {
+            columns: &candidate_columns,
+            kept_slots: kept,
+        }
     } else {
         ScalarSource::Eager(&candidate_columns)
     };
@@ -1674,16 +1771,33 @@ pub fn execute_statement(
     )
 }
 
-/// 投影段（TASK-136・RLS-5）が参照するスカラー列の取得元（Issue #453）。
+/// 投影段（TASK-136・RLS-5）が参照するスカラー列の取得元（Issue #453・#654）。
 ///
 /// `Eager` は従来どおり `on_visible_row` が全可視行分あらかじめ複製しておいた
 /// [`Value`] を参照するだけ（`WHERE`・式述語・hybrid のいずれかが絡むクエリ）。
+/// `columns` は「出力側の連番」（`push_visible_row`／`filter_cached_rls_rows_subset`
+/// が管理するカウンタ）で添字づけられており、`arena` が候補選択済みの縮約
+/// アリーナ（＝スロット番号が出力側連番とそのまま一致する）である場合にのみ、
+/// [`project_rows`] の `slot`（`hits` の第 1 要素＝アリーナのスロット番号）を
+/// 直接 `columns.get(slot)` の添字として使える。
+///
+/// `EagerSubset` は Issue #654 のマスク経路専用: `arena` がキャッシュ済み
+/// スナップショットの `VectorArena` を複製せず借用したままのため、`slot`
+/// （＝スナップショットの元スロット番号）と `columns` の添字（出力側連番）が
+/// 一致しない。`kept_slots`（`filter_cached_rls_rows_subset` の戻り値。狭義昇順）
+/// に対する `slot` の位置（`binary_search`）を出力側連番として使い、
+/// `columns.get(その位置)` を引く。
+///
 /// `Deferred` は SCALAR 段の走査・複製そのものを省略しており、`project_rows` の
 /// 行ループが `RlsSafetyNet::apply` 通過後の Top-k 行に限って必要列だけを都度
 /// デコードする（`defer_projection` のドキュメント参照。`sql::exec` モジュール
 /// 冒頭）。
 enum ScalarSource<'a> {
     Eager(&'a [Vec<Value>]),
+    EagerSubset {
+        columns: &'a [Vec<Value>],
+        kept_slots: &'a [u32],
+    },
     Deferred(DeferredScalars<'a>),
 }
 
@@ -1847,7 +1961,9 @@ fn project_rows(
                 })
             }
         },
-        ScalarSource::Eager(_) | ScalarSource::Deferred(DeferredScalars::Snapshot(_)) => None,
+        ScalarSource::Eager(_)
+        | ScalarSource::EagerSubset { .. }
+        | ScalarSource::Deferred(DeferredScalars::Snapshot(_)) => None,
     };
     let mut deferred_budget: usize = 0;
     let hits = verified.into_hits();
@@ -1897,6 +2013,31 @@ fn project_rows(
         let decoded: RowScalars<'_> = match &scalar_source {
             ScalarSource::Eager(candidate_columns) => {
                 RowScalars::Borrowed(candidate_columns.get(slot).ok_or_else(|| {
+                    SqlSurfaceError::Internal {
+                        detail: "search hit is missing from candidate scalar columns".to_string(),
+                    }
+                })?)
+            }
+            ScalarSource::EagerSubset {
+                columns,
+                kept_slots,
+            } => {
+                // Issue #654: `slot`（アリーナのスロット番号＝元スロット）を
+                // `kept_slots`（狭義昇順。`filter_cached_rls_rows_subset` の戻り値）
+                // 上の位置（＝出力側連番）へ写像してから `columns` を引く。
+                // `kept_slots` に無いスロットは呼び出し規約違反・データ不整合として
+                // fail-closed に拒否する（黙って別行の列を返さない）。
+                let slot_u32 = u32::try_from(slot).map_err(|_| SqlSurfaceError::Internal {
+                    detail: "candidate arena index does not fit in u32".to_string(),
+                })?;
+                let ordinal =
+                    kept_slots
+                        .binary_search(&slot_u32)
+                        .map_err(|_| SqlSurfaceError::Internal {
+                            detail: "search hit slot is missing from mask candidate slots"
+                                .to_string(),
+                        })?;
+                RowScalars::Borrowed(columns.get(ordinal).ok_or_else(|| {
                     SqlSurfaceError::Internal {
                         detail: "search hit is missing from candidate scalar columns".to_string(),
                     }
