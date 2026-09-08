@@ -241,7 +241,9 @@ commit `6ff22dc8`）のものを全 arm 共通で使用し、`CROSSDB_SELF_BINAR
   再現: `make bench-scalar-index-crossdb-ab BEFORE_COMMIT=773a835
   AFTER_COMMIT=6ff22dc REF_COMMIT=ee99db3 CROSSDB_DIR=<dir>
   CROSSDB_PYTHON=<python>`。集約: `scripts/bench_scalar_index_crossdb_ab.sh
-  --summarize docs/design/bench-data/scalar-index-crossdb-ab`。
+  --summarize docs/design/bench-data/scalar-index-crossdb-ab 20260908T064132Z`
+  （本 doc に別セッションの生データ〔Issue #645〕が同一ディレクトリへ
+  追加された後は `session_ts` 明示指定が必須になったため付記した）。
 
 ### 結果（min-of-5・median 併記。単位 µs）
 
@@ -374,7 +376,9 @@ fixture 側の `body` 生成方式見直し）は採らなかった。
   前後比較実測は本 Issue のスコープ外であり、後続 Issue（実測手段は
   `make bench-scalar-index-crossdb-ab`）の担当とする。64 でも不十分と
   判明した場合の基準再検討（総バイト量・最大値長・カーディナリティ等）も
-  同様に別 Issue の担当とする。
+  同様に別 Issue の担当とする（実測結果は「前後比較実測（Issue #645）」節
+  参照。除外発火の非 vacuous 証跡は確認できたため基準再検討は現時点で
+  不要と判断）。
 
 ### 限界・申し送り
 
@@ -388,3 +392,190 @@ fixture 側の `body` 生成方式見直し）は採らなかった。
   Issue #637 の担当とする（本 doc では触れない）。
 - 閾値再検討（上記）は本 Issue の受け入れ条件外のため、判断のみ記録し
   実装は行わない。実装を伴う対応はユーザー承認のうえ別 Issue で扱う。
+
+## 前後比較実測（Issue #645）
+
+Issue #644（`MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN` 128→64）適用後の
+crossdb fixture 上での効果を事後確認する。
+
+### 計測条件
+
+| arm | commit | 位置づけ | wire-server バイナリ sha256（先頭 12 桁） |
+| --- | --- | --- | --- |
+| before | `cbe80cf` | Issue #646（本節の対策）マージの親（閾値 128） | `ba67777ec994` |
+| after | `2f1cd80` | Issue #646 マージコミット（閾値 64 適用後） | `8e3085ecd225` |
+| ref | `ee99db3` | 退行導入（`ScalarIndex` 自体の新設・#473・`875d38d`）より前の基準 | `becfb9f9bb26` |
+
+`git diff --stat cbe80cf 2f1cd80 -- Cargo.lock Cargo.toml scripts/crossdb_bench
+crates/wire-server scripts/bench_scalar_index_crossdb_ab*` は空であり、
+before/after 間の差分は `CLAUDE.md`・`crates/engine/src/sql/scalar_index.rs`・
+`docs/design/scalar-index-generation-cache.md` のみ（同一ビルド条件の根拠。
+`before` の wire-server バイナリ sha256 が Issue #633 節の `after`〔`6ff22dc`〕と
+一致するのは、その間の全コミットが wire-server バイナリへ影響しない
+テスト・docs 変更のみだったため）。ハーネス（harness commit `2f1cd80`）は
+Issue #633 と同一の `scripts/bench_scalar_index_crossdb_ab.sh`・
+`scripts/crossdb_bench/*.py` を使用し、3 arm を `git archive` で独立ソース
+ツリーへ展開・`CARGO_TARGET_DIR` を分離して個別に `cargo build --release
+-p wire-server` した。輪番は before→after→before_ref→ref（Issue #633
+codex-review P1 指摘対応後の方式。候補〔after／ref〕ごとに専用の直近
+baseline を挟む）。
+
+- 環境: 共有 QEMU（`QEMU Virtual CPU version 2.5+`・nproc=12・
+  `BENCH_DEDICATED_ENV` 未設定）。`docs/design/benchmark-judgement-policy.md`
+  §5 に従い**参考値・採否根拠にしない**。計測開始時の loadavg は 5.44
+  （他ジョブ並走の可能性）と Issue #633 節よりやや高めだったため、
+  この点も踏まえて below のノイズ帯実測を優先する。
+- ペア数: 5（交互実行）。
+- fixture: `docs25k.redb`／`docs25k.jsonl`／`queries200.jsonl`（25,000 行・
+  dim 128。Issue #633 と同一）。
+- 対象区間: Issue #633 と同一（crossdb self 4 フェーズ・参照区間 2 本・
+  hybrid ループ 3 モード・RSS 3 時点）。
+- 生データ: `docs/design/bench-data/scalar-index-crossdb-ab/`
+  （`20260908T102007Z-*`。tracked）。再現: `make
+  bench-scalar-index-crossdb-ab BEFORE_COMMIT=cbe80cf AFTER_COMMIT=2f1cd80
+  REF_COMMIT=ee99db3 CROSSDB_DIR=<dir> CROSSDB_PYTHON=<python>`。集約:
+  `scripts/bench_scalar_index_crossdb_ab.sh --summarize
+  docs/design/bench-data/scalar-index-crossdb-ab 20260908T102007Z`
+  （本 doc に Issue #633 のセッションと混在するため `session_ts` 明示が
+  必須）。
+
+### 結果（min-of-5・median 併記。単位 µs、RSS は MiB）
+
+判定は Issue #633 節と同じ 2 種ノイズ帯（固定 ±5% と参照区間実測帯を
+**両方**超えて初めて `regressed`/`improved`）に従う。実測ノイズ帯
+（`vector_knn.p50` run-to-run 幅）は after が **16.18%**（before+after
+プール）、ref が **8.64%**（before_ref+ref プール）——固定 ±5% 帯より
+いずれも広い。
+
+| 区間 | before min/median | after min/median | after/before（min比） | after 判定 | ref min/median | ref/before_ref | ref 判定 | after/ref（min比・参考） |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `hybrid_rrf`.p50 | 6869 / 7043 | 6608 / 6731 | 0.9620 | 帯内（固定帯超えず） | 6335 / 6347 | 0.9129 | improved | 1.0431 |
+| `bulk_hybrid_k200`.p50 | 9517 / 9654 | 9210 / 9279 | 0.9678 | 帯内 | 9752 / 9808 | 1.0297 | 帯内 | 0.9444 |
+| `vector_knn_where`.p50 | 1919 / 1959 | 1976 / 2002 | 1.0294 | 帯内 | 2989 / 3069 | 1.5709 | regressed（ref が遅い＝#473 以降の高速化分） | 0.6611 |
+| `where_compound_count`.p50 | 1011 / 1024 | 1027 / 1030 | 1.0161 | 帯内 | 4331 / 4373 | 4.2089 | regressed（同上） | 0.2371 |
+| 参照: `vector_knn`.p50 | 671 / 679 | 673 / 691 | 1.0028 | 帯内 | 695 / 725 | 1.0218 | 帯内 | — |
+| 参照: `mode_recall`.p50 | 676 / 708 | 696 / 703 | 1.0298 | 帯内 | 691 / 715 | 1.0289 | 帯内 | — |
+| hybrid ループ `warm_where_then_hybrid`.p50 | 6850 / 6884 | 6177 / 6267 | **0.9017**（約 9.8% 改善） | 帯内（参照帯 16.18% を超えず） | 6172 / 6216 | 0.9074 | improved | **1.0008**（ref とほぼ同水準） |
+| hybrid ループ `warm_where_then_hybrid`.rss_after_warm | 63.73 / 63.91 | **55.58 / 55.67**（約 12.8% 減） | 0.8720 | 帯内（固定帯超えるが判定は参照帯優先で帯内） | 56.32 / 56.35 | 0.8834 | improved | 1.0129 |
+| hybrid ループ `body_predicate`.p50 | 107.3 / 108.2 | **1765.9 / 1774.3**（約 16.5 倍増） | **16.4536** | **regressed**（両帯超え） | 1747.1 / 1754.4 | 16.4493 | regressed（同水準） | 1.0108（ref とほぼ同一） |
+| hybrid ループ `body_predicate`.rss_after_warm | 58.91 / 59.00 | 51.04 / 51.19 | 0.8663 | 帯内 | 47.79 / 47.88 | 0.8090 | improved | 1.0680 |
+
+完全な区間別 TSV（p95・RSS 全 3 時点・`*_ref_band`／`*_class` 列を含む）は
+上記コマンドの出力（生データから再計算可能）。
+
+### 除外発火の非 vacuous 証跡（受け入れ条件 b）
+
+**`MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN` の 128→64 引き下げにより、
+crossdb fixture の `body` 列で除外が確実に発火するようになったことを
+2 系統の直接証跡で確認した**（Issue #633 節が要求していた「本 fixture で
+除外が発火することの直接実測」が揃った）:
+
+1. **`warm_where_then_hybrid.rss_after_warm`**: before 63.73 MiB
+   （閾値 128・除外未発火。Issue #633 節の記録と一致）→ after **55.58 MiB**
+   （閾値 64・除外発火）。ref（`ee99db3`＝`ScalarIndex` 自体が存在しない
+   基準）は 56.32 MiB で after とほぼ同水準（比 1.0129）——`body` を
+   索引化しない状態（ref）と、索引化はするが `body` だけ除外する状態
+   （after）が同じ RSS 水準に収束しており、#632 手動実験が想定した
+   「約 56 MiB」という見込み値とも整合する。
+2. **`body_predicate.p50`（除外列 `body` への前方一致述語）**: before
+   107.3µs（`body` が索引対象＝索引経由の高速応答）→ after **1765.9µs**
+   （約 16.5 倍に悪化）。ref は 1747.1µs で after とほぼ同一（比 1.0108）
+   ——除外された `body` への前方一致述語が `classify_scalar_plan`／
+   `resolve_candidates`（Issue #632・#474）の契約どおり plain scan へ
+   縮退し、`ScalarIndex` 自体が存在しない ref と同水準の応答時間になった
+   ことを直接示す。
+
+両証跡とも Issue #633 節が「観測できていない」としていた効果（除外発火に
+よる RSS 低下・plain scan 縮退）を、この 2 回目の実測で確認できたことに
+なる。
+
+### plain scan 縮退の影響（受け入れ条件 c）
+
+上記 2. のとおり、`body` への前方一致述語（`body_predicate` モード）は
+索引除外後に **約 16.5 倍**遅くなる（107.3µs → 1765.9µs、min-of-5・
+固定 ±5% 帯・参照帯 16.18% のいずれも超える `regressed` 判定）。これは
+「除外列を含む述語は索引を使わず plain scan へ縮退する」という
+Issue #632・#474 で確定済みの契約どおりの構造的な結果であり、`ScalarIndex`
+自体が存在しない ref（1747.1µs）とほぼ同一の応答時間（比 1.0108）に
+収束していることから、実装上の異常ではなく契約が意図どおり働いている
+証跡と判断する。
+
+一方で `body` 以外の列（`lang`・`topic` 等の短い分類値列。閾値 64 を
+下回るため引き続き索引対象）を対象にした等価・前方一致述語には本節の
+悪化は及ばない——`vector_knn_where`・`where_compound_count`（いずれも
+`lang`／`topic` 相当の短い列への述語と推測される既存 crossdb フェーズ）は
+before→after で `regressed` 判定に至っていない（帯内）。
+
+`body` への前方一致検索の性能を維持したい場合は索引対象へ戻す（閾値を
+上げる）以外に手段が無く、これは長文列の索引構築コスト（RSS・
+`hybrid_rrf` 退行）とのトレードオフである。**採否（`body` 列への前方一致
+検索を優先するか、`hybrid_rrf` の RSS・レイテンシを優先するか）は
+オーナー判断とし、本 Issue では判断のみ記録し閾値の再変更は行わない。**
+
+### 判定
+
+**受け入れ条件 (a)（`hybrid_rrf` p50 が固定・参照帯を超えて改善し
+ref 比 ±5% 帯内へ収束）は部分的達成**:
+
+- `hybrid_rrf`.p50: before→after で 3.80% 改善（0.9620）——固定 ±5% 帯
+  以内にとどまり Issue #633 節の判定基準では「帯内」（両帯超えを要求する
+  厳密な `regressed`/`improved` 判定には至らない）。ただし after/ref 比は
+  **1.0431**（ref より 4.3% 遅いのみ）まで縮まっており、Issue #633 節の
+  「before・after いずれも ref よりなお約 9〜13% 遅い」という状態からは
+  明確に改善している。
+- `warm_where_then_hybrid`.p50（`WHERE` 実行後に `ScalarIndex` を構築
+  させてから計測する Issue #632 の再現条件）: before→after で **9.83%
+  改善**（0.9017）——固定 ±5% 帯は超えるが参照帯 16.18% には届かず
+  「帯内」判定にとどまる。一方 after/ref 比は **1.0008**——ほぼ完全に
+  ref 水準へ収束している。
+- 両指標とも「両ノイズ帯を超える」という Issue #633 節の厳密な判定基準
+  では `regressed`/`improved` の確定判定に至らないが、これは主に参照帯
+  自体が広い（16.18%／8.64%）ことによるものであり、after/ref 比が
+  1.00〜1.04 まで収束したという事実（Issue #633 節時点は before/after が
+  ほぼ無風だった）は方向として明確な改善を示す。
+
+**受け入れ条件 (b)（RSS 低下による除外発火確認）は達成**——上記「除外
+発火の非 vacuous 証跡」節のとおり、`rss_after_warm` の低下（63.73→55.58
+MiB）と `body_predicate.p50` の plain scan 相当への悪化（107.3→1765.9µs）
+の 2 系統で確認済み。
+
+**受け入れ条件 (c)（plain scan 縮退の実測値記録）は達成**——上記「plain
+scan 縮退の影響」節のとおり記録済み。
+
+**親 #630 の close 可否**: 「WHERE 実行後の hybrid_rrf 約 10% 退行」の
+是正という親課題の目的に対し、`warm_where_then_hybrid`.p50（Issue #632 の
+再現条件そのもの）が before→after で約 9.8% 改善し after/ref 比 1.0008
+（ref とほぼ同水準）まで収束したことは、目的達成の直接証跡と判断する。
+`hybrid_rrf`（`WHERE` を経由しない単発 hybrid クエリ）側の改善幅が
+相対的に小さいのは、除外閾値の変更が効くのは「`WHERE` 述語評価時に
+`ScalarIndex` が長文 `body` 列まで索引化してしまう」経路（`warm_where_
+then_hybrid`）に限られ、`WHERE` を経由しない `hybrid_rrf` 自体は元々
+`ScalarIndex` の構築コストを踏まない設計（フィルタなし hybrid クエリは
+`sql/sparse_cache.rs` 等の別キャッシュ経路）であるためと考えられる——
+両指標の挙動差自体が「除外閾値の効果は `ScalarIndex` 構築を伴う経路に
+限定される」という設計の妥当性を裏付ける。共有 QEMU 環境の参考値である
+ことを踏まえると、**専有環境での再実測により両ノイズ帯を明確に超える
+確証が得られることを条件に、親 #630 は close 可能**と判断する（本
+Issue 単独では「方向は確認済みだが共有環境のノイズ帯の広さにより
+統計的な確定判定には至らない」という限定付きの達成に留める）。
+
+### 限界・申し送り（Issue #645）
+
+- 共有 QEMU 環境の参考値であり、専有環境での再実測はオーナー作業として
+  申し送る（`docs/design/benchmark-judgement-policy.md` §9 と同方針。
+  親 #630 の確定 close 判断もこの再実測を条件とする）。
+- 参照帯（16.18%／8.64%）が本節の主要な改善幅（3.8%〜9.8%）より広く、
+  「両ノイズ帯超え」を要求する厳密な判定では `regressed`/`improved` の
+  確定に至らない指標がある。after/ref 比の収束（1.00〜1.04）を補助的な
+  傍証として判定に用いた（詳細は上記「判定」節）。
+- `body` 列への前方一致検索が plain scan へ縮退することによる約 16.5 倍の
+  レイテンシ悪化は契約どおりの構造的結果であり、本 Issue のスコープでは
+  対応しない（採否はオーナー判断。上記「plain scan 縮退の影響」節）。
+- `ref`（ee99db3）は Issue #633 節と同じ理由で `scan_where_nosort_k500`
+  フェーズが `unsupported` として記録される（fail-closed 処理済み。
+  失敗ではない）。
+- 閾値 64 でも不十分と判明した場合の基準再検討（総バイト量・最大値長・
+  カーディナリティ等）は、本節の実測（除外発火の非 vacuous 証跡を確認
+  済み）を踏まえると現時点では不要と判断する。今後 crossdb fixture の
+  `body` 生成方式が変わり平均長が再び 64 バイト未満になった場合は
+  再検討が必要になりうる。

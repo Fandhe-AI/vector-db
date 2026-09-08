@@ -4,11 +4,11 @@
 #
 # Issue #632（PR #638・merge commit `6ff22dc`）が `ScalarIndex::build`
 # （`crates/engine/src/sql/scalar_index.rs`）へ追加した列単位の平均値長
-# ゲート（`MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN` = 128。長文 `body` 列を
-# 索引対象から除外する）について、before（`773a835`＝#638 マージの親）・
-# after（`6ff22dc`＝#638 マージコミット）・ref（既定 `ee99db3`＝退行導入前の
-# 基準）の 3 コミットを `git archive` で独立ソースツリーへ展開・
-# `cargo build --release -p wire-server` で個別ビルドし、
+# ゲート（`MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`。#632 当初導入時は 128・
+# #644 で crossdb fixture 実測〔126.3 バイト〕を確実に上回る 64 へ
+# 引き下げ済み。長文 `body` 列を索引対象から除外する）について、
+# before・after・ref の 3 コミットを `git archive` で独立ソースツリーへ
+# 展開・`cargo build --release -p wire-server` で個別ビルドし、
 # `scripts/crossdb_bench/run.py --db self --config exact`（crossdb self
 # 全フェーズ）と `scripts/crossdb_bench/hybrid_after_where.py`
 # （WHERE 実行後の hybrid_rrf 単独ループ・RSS）を輪番実行する
@@ -17,6 +17,12 @@
 # 共有環境は参考値」に従う）。ハーネス（`scripts/crossdb_bench/*.py`）は
 # 現行ワークツリーのものを全 arm で共通使用し、`CROSSDB_SELF_BINARY` で
 # 起動するバイナリのみ差し替える（Issue #479 の方式）。
+#
+# 呼び出し例:
+#   - Issue #633（閾値 128 導入時の no-op 確認）:
+#     BEFORE_COMMIT=773a835 AFTER_COMMIT=6ff22dc REF_COMMIT=ee99db3
+#   - Issue #645（閾値 128→64 見直し後の効果確認）:
+#     BEFORE_COMMIT=cbe80cf AFTER_COMMIT=2f1cd80 REF_COMMIT=ee99db3
 #
 # 3 arm（before/after/ref）比較時の輪番は `benchmark-judgement-policy.md`
 # §3「baseline/cand1/baseline/cand2/… の輪番」に従い、1 ペアあたり
