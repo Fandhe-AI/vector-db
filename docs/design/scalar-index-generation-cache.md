@@ -601,7 +601,7 @@ Issue #645 節で「共有 QEMU 環境の参考値であり、専有環境での
 
 ### 計測条件
 
-- 環境: 本開発環境（QEMU x86_64・12 論理 CPU・Avx2Fma）を**専有状態**（他ジョブ・他コンテナ計測なし、開始時 loadavg 0.07、計測中 loadavg 1.0〜1.2 = 計測プロセスのみ）で `BENCH_DEDICATED_ENV=1` を付与して実行。Issue #645 節（共有状態・loadavg に他 worktree のジョブ混入）との差は環境条件のみ。
+- 環境: 本開発環境（QEMU x86_64・12 論理 CPU・Avx2Fma）を**専有状態**（他ジョブ・他コンテナ計測なし。実行直前〔ビルド前・別時点〕の loadavg は 0.07。計測中の 1 分平均は生ログ `20260908T122254Z-loadavg.log` で 1.17〜3.33〔平均 2.00・3 分の 2 が 1.2〜2.5 帯〕であり、これは計測プロセス群〔wire-server・Python ハーネス・並列 provider スレッド〕自身の負荷で、外部ジョブは無い）で `BENCH_DEDICATED_ENV=1` を付与して実行。Issue #645 節（共有状態・loadavg に他 worktree のジョブ混入）との差は環境条件のみ。
 - コマンド: `BENCH_DEDICATED_ENV=1 BEFORE_COMMIT=cbe80cf AFTER_COMMIT=2f1cd80 REF_COMMIT=ee99db3 AB_PAIRS=5 CROSSDB_DIR=<docs25k> CROSSDB_PYTHON=<venv python> scripts/bench_scalar_index_crossdb_ab.sh`（Issue #645 節と同一の 3 arm・交互 5 ペア・HYBRID_ITERS 200・WARM_WHERE 50）
 - セッション ts: `20260908T122254Z`。生データは `docs/design/bench-data/scalar-index-crossdb-ab/20260908T122254Z-*`（本コミットで追跡）。集約: `scripts/bench_scalar_index_crossdb_ab.sh --summarize docs/design/bench-data/scalar-index-crossdb-ab 20260908T122254Z`
 - 参照区間実測帯（`vector_knn.p50` の run-to-run 幅）: before+after プール **5.11%**（Issue #645 節の共有環境では 16.18%）、before_ref+ref プール **11.32%**（同 8.64%）。固定帯は ±5%。
@@ -611,7 +611,7 @@ Issue #645 節で「共有 QEMU 環境の参考値であり、専有環境での
 | 区間 | before min/median | after min/median | after/before（min 比） | after 判定 | before_ref min/median | ref min/median | ref/before_ref（min 比） | ref 判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `hybrid_rrf`.p50 | 6870.29 / 7016.64 | 6495.41 / 6576.86 | 0.9454 | **improved**（固定 ±5% 帯・参照帯 5.11% の両方を超える） | 6859.17 / 7019.85 | 6313.43 / 6376.44 | 0.9204 | within_band（参照帯 11.32% 内） |
-| `bulk_hybrid_k200`.p50 | 9588.69 / 9682.43 | 9134.21 / 9310.86 | 0.9526 | within_band（固定帯は超えるが参照帯 5.11% 内） | 9493.33 / 9572.71 | 9629.63 / 9704.21 | 1.0144 | within_band |
+| `bulk_hybrid_k200`.p50 | 9588.69 / 9682.43 | 9134.21 / 9310.86 | 0.9526 | within_band（改善幅 4.74%。固定 ±5% 帯・参照帯 5.11% の両方の内側） | 9493.33 / 9572.71 | 9629.63 / 9704.21 | 1.0144 | within_band |
 | `vector_knn_where`.p50 | 1940.75 / 1972.94 | 1965.30 / 1980.82 | 1.0126 | within_band | 1911.86 / 1940.41 | 2975.47 / 3032.20 | 1.5563 | regressed（ref が遅い＝#473 以降の高速化分） |
 | `where_compound_count`.p50 | 1030.13 / 1033.73 | 1033.00 / 1033.79 | 1.0028 | within_band | 1025.89 / 1031.53 | 4280.36 / 4355.02 | 4.1723 | regressed（同上） |
 | 参照: `vector_knn`.p50 | 671.69 / 679.89 | 695.85 / 700.66 | 1.0360 | within_band | 666.81 / 684.23 | 682.84 / 709.97 | 1.0240 | within_band |
