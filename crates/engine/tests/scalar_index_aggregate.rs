@@ -585,3 +585,58 @@ fn text_min_max_group_by_never_attempts_scalar_index_snapshot_on_cold_cache() {
         "a TEXT MIN/MAX GROUP BY must never attempt to build a ScalarIndex snapshot on a cold cache"
     );
 }
+
+// --- 平均値長ゲート（Issue #632）: 除外列の GROUP BY 列挙形は全走査へ縮退する ---
+//
+// `ScalarIndex::column_groups`（GROUP BY 列挙形が使う API。Issue #475）は
+// 平均値長ゲートで除外された列に対して常に `None` を返す。これは
+// `observe_group_enumeration` の既存「列が索引未対応」分岐（`Ok(false)`。
+// 全走査フォールバック）へ合流するだけであり、`sql::group_by` 自体は無変更の
+// まま結果が全走査と一致し続けることを固定する。
+
+#[test]
+fn group_by_enumeration_falls_back_to_full_scan_when_column_excluded_by_avg_length_gate() {
+    let path = unique_db_path("scalar-index-aggregate-group-by-excluded");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let tenant_ctx = ctx("tenant-a");
+    // `lang` へ平均値長ゲート（Issue #632）で必ず除外される長さの値を入れる
+    // （閾値の具体値には依存しない安全マージンを取る）。各行が異なる値を
+    // 持つため、GROUP BY 結果は「6 グループ・各 1 件」というシンプルな
+    // オラクルで検証できる。
+    let long_value = |id: u64| format!("lang-{id}-{}", "x".repeat(1000));
+    for id in 1..=6u64 {
+        let kind = if id % 2 == 0 { "a" } else { "b" };
+        insert_row(
+            &storage,
+            &tenant_ctx,
+            id,
+            Some(kind),
+            Some(&long_value(id)),
+            Visibility::Public,
+        );
+    }
+    let core = new_core(storage);
+
+    let before = core.scalar_index_cache_stats().aggregate_index_scans;
+    let sql = "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY lang";
+    let cold = run(&core, "tenant-a", sql);
+    let hot = run(&core, "tenant-a", sql);
+    assert_eq!(
+        group_rows(&cold),
+        group_rows(&hot),
+        "cold/hot results must match even when the GROUP BY column is excluded"
+    );
+    let after = core.scalar_index_cache_stats().aggregate_index_scans;
+    assert_eq!(
+        after, before,
+        "an excluded column's GROUP BY must never consume the enumeration index path"
+    );
+
+    let rows = group_rows(&hot);
+    assert_eq!(rows.len(), 6, "each row has a distinct lang value");
+    for row in &rows {
+        assert_eq!(row.get(1), Some(&Cell::Integer(1)));
+    }
+}
