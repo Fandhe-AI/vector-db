@@ -191,6 +191,39 @@ Proposed の範囲での暫定判断とする。
 - 世代進行時の一括失効: テーブル世代が進行したら該当 `(table, ctx)` 配下の
   全述語キーを一括で無効化する（個別述語ごとの再照合は行わない）
 
+### 4.4 `IndexedBase` 個体識別によるキー失効（世代一致だけでは不十分な理由）
+
+§4.1 の実測構成要素（テーブル世代・述語正規化キー）だけでは、**同一世代内での
+索引再構築**を区別できない。`IndexedBase::build` は世代が変わらない場面でも
+再度呼ばれうる（並列構築はワークスティール方式であり同一データ・同一 seed でも
+挿入順序が確定しないためグラフ形状が実行ごとに異なり得る〔`hnsw-parallel-build.md`
+参照〕・`HnswIndexCache` の LRU eviction 後の再構築等）。B-2 のキーがテーブル
+世代のみに依存する場合、旧い `IndexedBase` インスタンスに対して計算した
+`mask_splits_graph`／`visible_mask`（あるいは B-1 が導出する `node_of_slot`）を、
+世代が同一というだけで新しい（形状の異なりうる）`IndexedBase` インスタンスへ
+誤って適用し、本来必要な `full_scan_with_arena` への縮退を省略して Recall を
+損なう経路になりうる。
+
+既存コード（`hnsw_cache.rs::record_overlay_for`）は同種の問題を
+`Arc::ptr_eq(b, base)` によるインスタンス識別で解決している（`FullVisible`
+overlay を書き込む際、対象 `HnswCacheEntry.base` が呼び出し元の保持する
+`Arc<IndexedBase>` と同一インスタンスかを世代とは独立に照合し、不一致なら
+書き込みを行わない）。B-2（および B-1 の `node_of_slot` 導出元である
+`FullVisible` overlay 参照）は同型の識別を用いる:
+
+- B-2 のキャッシュエントリは、計算対象となった `Arc<IndexedBase>` への参照
+  （`Weak<IndexedBase>` または強参照のいずれかは実装検討事項とする）を保持し、
+  再利用時に現在解決された `base` と `Arc::ptr_eq` で再照合する。世代が一致して
+  いてもインスタンス不一致なら fail-closed（キャッシュ非使用・per-query 再計算）
+  へ倒す
+- B-1 の `node_of_slot` 導出は `FullVisible` overlay の `base` が、`Subset`
+  クエリが今まさに使っている `base` と `Arc::ptr_eq` で同一であることを前提と
+  する（世代一致のみでは §3.1 (i) の前提「同一のスナップショット arena」を
+  保証しない）
+
+この識別条件は §9 の fail-closed 契約・§10 の実装タスク（B-1 検証・B-2 独立
+キャッシュ層）に明示的に含める。
+
 ## 5. `FullVisible` 側 `HnswCacheEntry` に同居させない根拠（非登録理由の再評価）
 
 `docs/design/hnsw-rls-cardinality-switch.md` が挙げた「`Subset` 形状の
@@ -284,7 +317,9 @@ Issue #659 の申し送りである `RowKey` インターン化は、B-1 が成�
   既存キャッシュ同様テナント間干渉の経路になりうるため、B-2 が
   干渉面を広げないこと（既存の `MAX_*` 予算と同等以下）を実装条件とする
 - **fail-closed**: 世代不一致・ロック毒化・キー衝突（K2 採用時）・
-  同一性ガード不一致はすべて「キャッシュ非使用（per-query 計算または
+  同一性ガード不一致（§4.4。`IndexedBase` インスタンスの `Arc::ptr_eq`
+  不一致——世代が一致していても同一世代内の再構築で異なるインスタンスに
+  なっている場合を含む）はすべて「キャッシュ非使用（per-query 計算または
   plain scan への縮退）」側へ倒す。fail-open な分岐を設計上持たない
 - **情報漏えい**: `EXPLAIN` へヒット率・可視カーディナリティ等の
   実行時値を露出しない契約（Issue #411）を維持する。統計カウンタは
@@ -301,9 +336,15 @@ Issue #659 の申し送りである `RowKey` インターン化は、B-1 が成�
 
 1. **B-1 検証**: `prepare_subset` が `FullVisible` overlay を再利用できる
    条件（§3.1 (i)(ii)）を in-module テストで固定し、`node_of_slot` の
-   導出方法（`slot_of_node` の反転）を実装する
+   導出方法（`slot_of_node` の反転）を実装する。§4.4 の `Arc::ptr_eq`
+   同一性照合（`FullVisible` overlay の `base` と `Subset` クエリの `base`
+   が同一インスタンスであること）をこの検証に含める
 2. **B-2 独立キャッシュ層**: キー正規化（K1 方式）・容量上限・LRU evict・
-   統計カウンタ・世代再照合の fail-closed 契約を実装する
+   統計カウンタ・世代再照合の fail-closed 契約を実装する。§4.4 の
+   `IndexedBase` インスタンス識別（`Arc::ptr_eq`。既存 `record_overlay_for`
+   と同型）をキャッシュエントリの失効条件に含め、世代一致のみで
+   同一世代内の再構築（並列構築の形状差異・LRU eviction 後の再構築等）を
+   見逃さないことを in-module テストで固定する
 3. **`EXPLAIN` 非露出方針の確認**: `ann_plan: hnsw_subset` の出力契約が
    不変であること、実行時のキャッシュヒット率・可視カーディナリティが
    露出しないことを回帰テストで固定する
