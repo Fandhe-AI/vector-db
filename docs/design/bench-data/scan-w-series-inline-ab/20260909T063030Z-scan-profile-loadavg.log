@@ -1,0 +1,10 @@
+2026-09-09T06:31:12Z scan-profile/before/sel1of5/run1: 4.37 2.28 1.25 1/447 3957178
+2026-09-09T06:31:15Z scan-profile/after/sel1of5/run1: 4.10 2.26 1.24 1/447 3961064
+2026-09-09T06:31:18Z scan-profile/before/sel1of5/run2: 4.10 2.26 1.24 1/447 3964948
+2026-09-09T06:31:21Z scan-profile/after/sel1of5/run2: 3.85 2.24 1.24 2/447 3968834
+2026-09-09T06:31:24Z scan-profile/before/sel1of5/run3: 3.85 2.24 1.24 1/447 3972720
+2026-09-09T06:31:27Z scan-profile/after/sel1of5/run3: 3.62 2.22 1.24 1/448 3976605
+2026-09-09T06:31:30Z scan-profile/before/sel1of5/run4: 3.41 2.20 1.24 1/448 3980491
+2026-09-09T06:31:33Z scan-profile/after/sel1of5/run4: 3.41 2.20 1.24 1/448 3984375
+2026-09-09T06:31:36Z scan-profile/before/sel1of5/run5: 3.22 2.18 1.24 1/448 3988261
+2026-09-09T06:31:39Z scan-profile/after/sel1of5/run5: 3.22 2.18 1.24 1/448 3992147
