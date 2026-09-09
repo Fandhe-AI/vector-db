@@ -650,11 +650,21 @@ else
 endif
 
 .PHONY: hnsw-acorn-recall
-hnsw-acorn-recall: ## Issue #502（ACORN-1〔2-hop 展開〕の可視比率別 Recall 回帰の層 B: 25,000 行・dim128 で可視比率 1/2・1/4・1/5・1/10 を横断し Recall@10・レジーム分類を標準出力へ記録する）を実行する（層 A は make ci 対象・crates/engine/tests/hnsw_acorn_recall.rs。層 B は #[ignore]・release 実行専用）
+hnsw-acorn-recall: ## Issue #502（ACORN-1〔2-hop 展開〕の可視比率別 Recall 回帰の層 B: 25,000 行・dim128 で可視比率 1/2・1/4・1/5・1/10 を横断し Recall@10・レジーム分類を標準出力へ記録する）を実行する（層 A は make ci 対象・crates/engine/tests/hnsw_acorn_recall.rs。層 B は #[ignore]・release 実行専用。同ファイルの Issue #679 決定的フィクスチャ層 B レポートも一緒に走る。単独実行は make hnsw-acorn-twohop-runs 参照）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test hnsw_acorn_recall -- --ignored --nocapture
 else
 	@echo "skip: Cargo.toml 未追加のため hnsw-acorn-recall をスキップ"
+endif
+
+RUNS ?= 5
+
+.PHONY: hnsw-acorn-twohop-runs
+hnsw-acorn-twohop-runs: ## Issue #679（ACORN TwoHop へ確実に到達する決定的フィクスチャ〔クラスタ丸ごと可視マスク〕で 25,000 行・dim128 の hop モード別 Recall・acorn_expansions を RUNS 回連続測定し標準出力へ記録する。既定 RUNS=5。crates/engine/tests/hnsw_acorn_recall.rs::layer_b_25k_dim128_cluster_mask_hop_mode_report。層 A は make ci 対象・層 B は #[ignore]・release 実行専用）
+ifdef HAS_CARGO
+	HNSW_ACORN_RECALL_RUNS=$(RUNS) cargo test --release -p engine --test hnsw_acorn_recall -- --ignored --nocapture --exact layer_b_25k_dim128_cluster_mask_hop_mode_report
+else
+	@echo "skip: Cargo.toml 未追加のため hnsw-acorn-twohop-runs をスキップ"
 endif
 
 .PHONY: hnsw-crossdb-selectivity
