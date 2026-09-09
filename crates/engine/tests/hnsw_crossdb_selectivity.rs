@@ -583,11 +583,13 @@ mod layer_b {
         let ja_visible_count = ja_rows.len();
 
         for arm in arms() {
-            // `_guard`（`CleanupGuard`）は `core` と寿命を共にする必要がある
-            // （`Storage` が開いている間にファイルを消してよい前提を作らない
-            // ため。`_guard` を match アーム内で束縛すると `core` より先に
-            // drop され、以降のクエリ実行中にファイルが削除されうる）。
-            let (name, core, _guard) = match &arm {
+            // `_guard`（`CleanupGuard`）は `core`（`Storage` を保持）より
+            // 先に宣言し、drop はブロック終端で宣言の逆順に起きるため
+            // `core` を先に drop してから `_guard` がファイルを削除する
+            // 順序にする（`temp_db.rs` の「ガードを Storage より先に宣言
+            // する」契約。宣言順を `core, _guard` にすると `_guard` が先に
+            // drop され、`Storage` が開いたままファイル削除を試みる）。
+            let (name, _guard, core) = match &arm {
                 Arm::BruteForce => {
                     // brute-force 自身は arm 表に含めない（ref_core が既に対照）。
                     continue;
@@ -602,7 +604,7 @@ mod layer_b {
                     storage.create_table(&schema()).ok();
                     let kind = hnsw_kind_with(*full_scan_ratio, *acorn_max_visible_ratio);
                     let core = EngineCore::from_storage_with_engine(storage, kind);
-                    (*name, core, guard)
+                    (*name, guard, core)
                 }
             };
 
