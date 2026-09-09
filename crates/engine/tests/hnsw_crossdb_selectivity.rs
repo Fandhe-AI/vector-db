@@ -14,8 +14,9 @@
 //!   `mask_splits_graph` / plain scan のどれを通るかをカウンタで確定する。
 //! - A2: ACORN-1 opt-in（`acorn_max_visible_ratio`）の有無で到達可否が
 //!   変わるかを比較する。
-//! - A4: 既定エンジン（brute-force）対照の Recall@10 が劣化しないことを
-//!   確認する。
+//! - A4: 既定エンジン（brute-force）対照の Recall@k（k=10・200。層 B は
+//!   両方を計測し、k に応じた実質 Recall@k を記録する）が劣化しないこと
+//!   を確認する。
 //!
 //! 判定規則（実測前に事前登録。`docs/design/hnsw-rls-cardinality-switch.md`
 //! 「Issue #659」節と同一）:
@@ -23,7 +24,7 @@
 //!   と同一の優先順位（acorn > subset > plain_scan_ratio > mask_splits_graph
 //!   > masked_short > none）。全カウンタ 0 は vacuous として fail。
 //! - `ann_masked` / `ann_masked_two_hop` に到達した arm は、同 arm の
-//!   フィルタなし Recall@10 に対し `filtered >= unfiltered - 0.02` である
+//!   フィルタなし Recall@k に対し `filtered >= unfiltered - 0.02` である
 //!   こと（フィルタ付き ANN がフィルタなし ANN より悪化しないことの検証）。
 //! - 縮退（plain scan）した arm は既定エンジンと厳密一致（Recall 1.0）で
 //!   あること。
@@ -652,8 +653,10 @@ mod layer_b {
                 let label = arm_label_delta!(baseline, after);
                 let recall_filtered = hits_filtered as f64 / total as f64;
 
-                // フィルタなし Recall@10 は判定規則（filtered >= unfiltered
-                // - 0.02）の比較対象としてのみ使う。カウンタ差分には数えない
+                // フィルタなし Recall@k（この呼び出しの LIMIT=k。CSV の recall_*
+                // 列は arm,k と併記するため k=10/200 いずれも実質 Recall@k として
+                // 読める）は判定規則（filtered >= unfiltered - 0.02）の比較対象
+                // としてのみ使う。カウンタ差分には数えない
                 // （上記コメント参照）ため `after` 取得の後に独立して回す。
                 let mut hits_unfiltered = 0usize;
                 for (_lang, vec) in &queries {
@@ -694,18 +697,41 @@ mod layer_b {
                     recall_unfiltered,
                 );
 
-                // 事前登録した判定規則: `force_plain` は必ず既定エンジンと厳密一致。
-                if name == "force_plain" {
-                    assert_eq!(
-                        recall_filtered, 1.0,
-                        "force_plain (full_scan_ratio=1/1) must match the default engine exactly"
-                    );
-                }
                 // 非 vacuous: いずれかの Subset 系カウンタが動いていること。
                 assert_ne!(
                     label, "n/a (brute_force engine or vacuous)",
                     "arm={name} k={k} must not be vacuous"
                 );
+                // 事前登録した判定規則（`docs/design/hnsw-rls-cardinality-switch.md`
+                // 「Issue #659」節・本ファイル冒頭コメント参照）は arm 名ではなく
+                // 到達分類（`label`）に応じて適用する。`force_plain` に限定すると
+                // 他の 4 arm が実行時に到達方式を変えても（例えばフィクスチャ・
+                // パラメータの変更で `ann_masked` へ到達するようになっても）
+                // 判定規則が働かないまま vacuous に近い pass になり得るため
+                // （PR #671 codex-review 指摘）。
+                match label {
+                    "ann_masked" | "ann_masked_two_hop" => {
+                        // フィルタ付き ANN がフィルタなし ANN より悪化しないこと。
+                        assert!(
+                            recall_filtered >= recall_unfiltered - 0.02,
+                            "arm={name} k={k} label={label}: filtered ANN recall must not \
+                             regress vs unfiltered ANN recall by more than 0.02 \
+                             (filtered={recall_filtered}, unfiltered={recall_unfiltered})"
+                        );
+                    }
+                    "plain_scan_ratio" | "plain_scan_mask_split" | "plain_scan_masked_short" => {
+                        // plain scan 縮退は既定エンジン（brute-force）と厳密一致すること。
+                        assert_eq!(
+                            recall_filtered, 1.0,
+                            "arm={name} k={k} label={label}: plain scan fallback must match \
+                             the default engine exactly (recall_filtered={recall_filtered})"
+                        );
+                    }
+                    other => panic!(
+                        "arm={name} k={k}: unexpected label {other:?} \
+                         (not covered by the pre-registered judgement rules)"
+                    ),
+                }
             }
         }
     }
