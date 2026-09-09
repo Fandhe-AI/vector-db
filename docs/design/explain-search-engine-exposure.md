@@ -86,7 +86,11 @@ exec.rs`（`ORDER BY` 経路の `HINT ORDER` を受理する）からは到達�
 Issue #497）・`acorn_max_visible_ratio`（ACORN-1 の 2-hop 展開切替閾値。Issue #501。
 `full_scan_ratio` と同じ「切替閾値」区分のため据え置き。実行時のレジーム選択
 （`PlainScan`／`OneHop`／`TwoHop`）・`acorn_searches`／`acorn_expansions` も同様に
-非露出）。これらはいずれもテナントの存在情報に繋がりうるため対象外とし、必要に
+非露出）・`acorn_max_expansion_ratio`（TwoHop 展開過多時の plain scan 縮退ガード
+の上限比。Issue #681。`full_scan_ratio`／`acorn_max_visible_ratio` と同じ
+「切替閾値」区分のため据え置き）・`acorn_guard_fallbacks`（同ガードの実行時縮退
+結果。Issue #681。他の実行時縮退結果と同じ理由で非露出）。これらはいずれも
+テナントの存在情報に繋がりうるため対象外とし、必要に
 なれば別 Issue でオーナー判断とする。`sparse_visited_max` 自体は `resident=`
 （Issue #514）と同じ「構築時の静的 opt-in 設定値」区分のため例外的に露出する
 （`full_scan_ratio` の露出可否は本 Issue で再開しない。据え置き）。
