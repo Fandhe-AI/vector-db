@@ -122,7 +122,7 @@ concurrent_processes_snapshot() {
   # 同時実行プロセスの有無・`BENCH_DEDICATED_ENV` の設定有無。codex-review P2
   # 指摘・Issue #658）。
   echo "cpu_model: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || echo unavailable)"
-  echo "cpu_flags_subset: $(grep -m1 flags /proc/cpuinfo 2>/dev/null | grep -oE '\b(avx2|avx512f|fma|f16c|neon)\b' | tr '\n' ' ' || echo unavailable)"
+  echo "cpu_flags_subset: $(grep -m1 flags /proc/cpuinfo 2>/dev/null | grep -oE '\b(avx2|avx512f|fma|f16c|neon)\b' | tr '\n' ' ' | sed 's/ *$//' || echo unavailable)"
   echo "nproc: $(nproc 2>/dev/null || echo unavailable)"
   echo "concurrent_running_processes_excluding_self: $(concurrent_processes_snapshot)"
   echo "bench_dedicated_env: ${BENCH_DEDICATED_ENV:-<unset>}"

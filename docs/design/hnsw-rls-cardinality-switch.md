@@ -1340,6 +1340,140 @@ Issue #654（スカラー列二次索引の候補削減。`sql/exec.rs` の SCAL
 オーナー実測へ申し送る（`docs/design/benchmark-judgement-policy.md` 準拠）。
 production コード（`crates/engine/src/`）変更あり・テスト・docs あわせて実施。
 
+## Issue #677: Subset 縮退時委譲（#676）の前後比較
+
+Issue #676（PR #686・merge `418ce95`）が導入した「`Subset` 形状の plain scan
+縮退時に候補 id マスク経路（複製なし）へ委譲する」変更について、
+`docs/design/benchmark-judgement-policy.md` の計測規約に従い前後比較を行った。
+
+### 事前登録した判定規則
+
+- crossdb self exact/hnsw A/B（同一バイナリ。measurement 1）は
+  `scripts/bench_crossdb_self_hnsw_ab.sh`（Issue #658 で導入済み・本 Issue では
+  無変更のまま再利用）で `vector_knn_where`／`bulk_knn_where_k200` の
+  `ratio_min`（hnsw/exact）を測り、Issue #659 の既存基線（`a1e7b0e`・別
+  セッション・3.22x／2.59x）と比較する。**同一バイナリの exact/hnsw 比較
+  であり、#659 との対比は別セッション比較（交互 N ペアの対象外）の参考対比**
+  であることを明記する
+- scan_stage_profile の HNSW 診断（measurement 3。本 Issue で新設）は、
+  `sql::hnsw_cache::HnswIndexCacheStats` のうち Issue #676 より前から存在する
+  フィールド（`hits`／`subset_searches`／`plain_scans`／`mask_splits_graph`／
+  `masked_short`）の増分のみで到達経路を分類する（`harness::scan_stage_profile::
+  classify_hnsw_subset_regime`）。#676 が新設した `subset_mask_scans`／
+  `subset_arena_copies` は本節の計測コードから直接参照しない——同じベンチ
+  ソースを `git archive` で書き出した #676 適用前の独立ソースツリーへ overlay
+  してもコンパイルできる状態を保つための意図的な制約
+- 環境は 12 vCPU（`QEMU Virtual CPU version 2.5+`）の共有 QEMU 開発環境。
+  他の Issue エージェントが並行実行中の可能性があり、実測値は
+  `docs/design/benchmark-judgement-policy.md` §5 の共有環境区分に従い
+  **参考値**として扱う
+
+### Track 1: crossdb self exact/hnsw A/B（同一バイナリ・HEAD `bcf1471`）
+
+`cargo build --release -p wire-server`／`--example crossdb_plan_probe`
+（HEAD `bcf1471`。`418ce95^1` からの唯一の差分は #687〔`HopMode::TwoHop`
+限定〕のため本 Issue の対象〔#676・DISTANCE `Subset` 形状の既定 `full_scan_ratio`
+経路〕には影響しない）でビルドし、`make bench-crossdb-self-hnsw-ab
+CROSSDB_DIR=... CROSSDB_PYTHON=... AB_PAIRS=5`（既定 `full_scan_ratio`）と
+`CROSSDB_SELF_HNSW_ARGS="--hnsw-full-scan-ratio 2/5"`（Issue #659 が同じ値を
+候補として検討済み）の 2 セッションを実行した。生データ:
+`docs/design/bench-data/crossdb-self-hnsw-ab/20260909T090822Z-*`（既定）・
+`20260909T091144Z-*`（`2/5`）。
+
+| セッション | フェーズ | exact min / median (µs) | hnsw min / median (µs) | ratio(min) | ratio(median) |
+| --- | --- | --- | --- | --- | --- |
+| 既定 `full_scan_ratio` | `vector_knn_where` | 1267.2 / 1280.5 | 3317.7 / 3341.3 | 2.6182 | 2.6093 |
+| 既定 `full_scan_ratio` | `bulk_knn_where_k200` | 2224.4 / 2240.7 | 4598.5 / 4670.9 | 2.0673 | 2.0845 |
+| `2/5` | `vector_knn_where` | 1212.4 / 1263.9 | 1256.1 / 1288.0 | 1.0361 | 1.0191 |
+| `2/5` | `bulk_knn_where_k200` | 2131.4 / 2197.9 | 2149.1 / 2199.4 | 1.0083 | 1.0007 |
+
+参照区間（両セッションとも）:
+
+| フェーズ | ratio(min) | 備考 |
+| --- | --- | --- |
+| `vector_knn`（対象外・参照） | 0.6244／0.6369 | hnsw は元々 exact より高速（フィルタなし DISTANCE） |
+| `hybrid_rrf`（対象外） | 0.9195／0.8986 | 変化なし（`Subset` 形状を通らない） |
+| `bulk_hybrid_k200`（対象外） | 0.9409／0.9741 | 同上 |
+
+Issue #659 の既存基線（`a1e7b0e`・別セッション。**参考対比**）と比べ、既定
+`full_scan_ratio` でも `vector_knn_where` は 3.22x→2.62x、`bulk_knn_where_k200`
+は 2.59x→2.07x まで劣後幅が縮小した。`2/5` opt-in（Issue #659 が推奨候補と
+した値）では両フェーズともほぼ等速（1.01〜1.04x）まで縮小し、`docs/design/
+hnsw-rls-cardinality-switch.md`「Issue #659」節が記録した「`full_scan_ratio=2/5`
+候補は劣後幅の縮小が一貫」という所見と整合する。ただし本計測は交互 N=5 ペア・
+共有環境の単発セッションであり、専有環境での再実測は未実施（下記「限界・
+申し送り」参照）。
+
+### Track 2: scan_stage_profile の HNSW 診断（measurement 3。単一バイナリ・HEAD `bcf1471`）
+
+`crates/engine/benches/scan_stage_profile_bench.rs` に `BENCH_SCAN_PROFILE_ENGINE`
+（`brute_force`〔既定。未設定時は本節のコードパスを一切通らず出力・処理は
+Issue #677 導入前とビット同一〕／`hnsw`／`hnsw_f16`／`hnsw_i8`）・
+`BENCH_SCAN_PROFILE_FULL_SCAN_RATIO`（`hnsw` 系エンジン限定の opt-in
+override）を追加し、既存の `vector_knn_where` WHERE+DISTANCE クエリを HNSW
+opt-in でも計測できるようにした。同一プロセス内で既存の `index` アーム
+（brute_force・`ScalarIndex` 候補削減＋マスク経路。Issue #654）と新設の
+`hnsw` アームを両方測る（`BENCH_SCAN_PROFILE_ROUNDS=5`・25,000 行・選択率
+1/5＝20%）。
+
+| `full_scan_ratio` | 観測 regime | `e2e(index)` min/median | `e2e(hnsw-hot)` min/median | ratio(hnsw/index, min) |
+| --- | --- | --- | --- | --- |
+| 既定（1/10） | `plain_scan_mask_split`（`mask_splits_graph_delta=40`） | 0.316 / 0.329 ms | 1.431 / 1.559 ms | 4.528（hnsw が約 4.5 倍遅い） |
+| `2/5` | `plain_scan_ratio`（`plain_scans_delta=40`） | 0.336 / 0.345 ms | 0.314 / 0.331 ms | 0.935（ほぼ等速・hnsw がやや速い） |
+
+本フィクスチャ（`lang='ja'` 均等分散選択率 20%）は既定 `full_scan_ratio` では
+`mask_splits_graph`（connectivity 検査による分断検知）レジームへ到達し、この
+レジームでは `hnsw` アームが `index` アームの約 4.5 倍遅いままだった——#676 は
+「複製を避ける」最適化であり、`Overlay::compute_over_slots`・BFS 連結性検査
+自体のコストは削減対象ではないため、複製を伴わない brute_force 側の
+`ScalarIndex` マスク経路と比べるとまだ大きな差が残る。一方、`full_scan_ratio`
+を選択率（20%）超の `2/5` へ引き上げると `sql::hnsw_cache::
+resolve_subset_slot_plan` の `below_full_scan_ratio` 判定（`Overlay::
+compute_over_slots` 呼び出しより**前**に位置する早期 return）が発火し
+`plain_scans`（比率判定）レジームへ切り替わる。この経路は `Overlay::
+compute_over_slots` 自体（BFS 連結性検査を含む）を一度も呼ばずに縮退する
+（「Overlay の一部のみ実行し BFS 連結性検査だけを省略する」という以前の
+記述は誤りだった。codex-review 指摘・PR #688。実際は Overlay 計算そのものを
+丸ごと省略する）ため hnsw アームは index アームとほぼ等速になった。
+これは Track 1 の crossdb 実測（`2/5` opt-in で劣後幅がほぼ解消）と同じ方向の
+所見であり、**#676 の効果は「plain scan 縮退の理由」（比率判定 vs 分断検知）
+に強く依存する**ことを示している。生データ:
+`docs/design/bench-data/scan-stage-hnsw-diag/scan_default_brute.log`（既定
+brute_force・参照値）・`scan_hnsw_default.log`（既定 `full_scan_ratio`）・
+`scan_hnsw_ratio25.log`（`2/5`。再現は `make bench-scan-stage-profile
+BENCH_SCAN_PROFILE_ENGINE=hnsw BENCH_SCAN_PROFILE_FULL_SCAN_RATIO=2/5` 等で
+可能）。
+
+`BENCH_SCAN_PROFILE_ENGINE` 未設定（既定 `brute_force`）時の出力は本 Issue
+導入前と完全に不変であることをコードレビューで確認済み（新設コードは
+`if scan_engine != BenchEngine::BruteForce { .. }` のガード内のみに追加し、
+既存の A/W/index/plain/I 系列の処理・出力箇所は一切変更していない）。
+
+### 限界・申し送り（オーナー・後続 Issue への引き継ぎ）
+
+- **#676 適用前バイナリとの `git archive` 独立ツリー交互 N=5 ペア**
+  （計画時に検討した `bench_filtered_distance_ab.sh` 拡張・crossdb 側の
+  before/after 2 コミット比較）は実施していない。Track 1・Track 2 はいずれも
+  「同一バイナリ内の brute_force 対 hnsw」または「同一セッション内の
+  `full_scan_ratio` 違い」の対比にとどまり、#676 の production diff
+  そのもの（`e2f8169` vs `418ce95`）を挟んだ交互 A/B ではない。#676 の
+  効果は Track 2 の regime 分類（`mask_splits_graph`／`plain_scans` の
+  いずれでも `subset_mask_scans` 側〔複製なし〕を通ることが `crates/engine/
+  tests/hnsw_subset_mask_scan.rs`〔#676 自身の回帰テスト〕で機械的に固定
+  済みであることに基づく間接的な確認にとどまる
+- 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測はオーナー作業
+- Recall 3 ゲート（hybrid・rerank・query-planning）は `ORDER BY HYBRID(...)`
+  経由で `Subset` 形状の DISTANCE を通らず構造的に不変（`sql/hnsw_hybrid.rs`
+  は #676 の対象外のまま）。本 Issue では実測での再確認は行っていない
+  （Issue #506 と同じ判断——docs/spec submodule 未チェックアウトのため
+  閾値注入自体ができない環境であることに加え、#676 が変更する分岐
+  〔`sql/exec.rs` の DISTANCE 段〕自体を通らない経路であるため）
+- `full_scan_ratio` 既定値（1/10）の見直し（Issue #659 オーナー判断待ち）は
+  本 Issue の対象外のまま
+- `mask_splits_graph` レジームでの hnsw アームの残存コスト（`Overlay::
+  compute_over_slots`＋BFS 連結性検査自体）の削減は #676 のスコープ外
+  （複製回避のみが対象）であり、別 Issue の対象
+
 ## Issue #679: ACORN TwoHop へ確実に到達する決定的フィクスチャ
 
 親 #502。「Issue #502」節・上記「クラスタ構造ありコーパス・25,000 行規模

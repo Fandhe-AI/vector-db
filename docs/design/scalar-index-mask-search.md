@@ -181,6 +181,8 @@ fail-closed に拒否する）。
 
 詳細・実装記録は `docs/design/hnsw-rls-cardinality-switch.md`「Issue #676」節
 参照。テストは `crates/engine/tests/hnsw_subset_mask_scan.rs`（新規）。
+前後比較実測は Issue #677（`docs/design/hnsw-rls-cardinality-switch.md`
+「Issue #677」節）が担当済み。
 
 ## テスト設計
 

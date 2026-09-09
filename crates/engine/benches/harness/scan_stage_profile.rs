@@ -621,3 +621,51 @@ pub fn render_arm_stats_line(
         "scalar_index({arm},k={k}): index_scans=+{index_scans_delta} plain_scan_fallbacks=+{plain_scan_fallbacks_delta} builds=+{builds_delta} arena_cache_hits=+{arena_cache_hits_delta}"
     )
 }
+
+/// `sql::hnsw_cache::HnswIndexCacheStats` の増分から、HNSW opt-in 時の
+/// SCALAR 事前フィルタ付き DISTANCE（`Subset` 形状）がどの経路を通ったかを
+/// 分類する（Issue #677。`knn_profile_bench.rs::observed_arm_label` と同じ
+/// 判定方針の縮小版——本関数は Issue #676 より前から存在するフィールドの
+/// 増分のみを受け取るため、`git archive` で書き出した #676 適用前の独立
+/// ソースツリーへ本ファイルを overlay してもコンパイル・実行できる）。
+///
+/// `subset_searches_delta > 0` は ANN 探索が縮退なしで完走したことを表す
+/// （`hits_delta` は `FullVisible` 形状専用のため、`Subset` 形状の ANN 完走は
+/// ここでのみ捕捉できる）。`plain_scans_delta`／`mask_splits_graph_delta`／
+/// `masked_short_delta` はいずれも「plain scan へ縮退した」内訳（互いに排他）
+/// だが、Issue #676 が候補 id マスク経路（複製なし）へ委譲する対象という
+/// 意味では **同列ではない**（codex-review・Cursor Bugbot 指摘・PR #688）:
+/// `plain_scans`／`mask_splits_graph` は `sql::hnsw_cache::
+/// resolve_subset_slot_plan` が ANN を試みる**前**（`kept` から subset
+/// アリーナを複製する前）に `SubsetSlotPlan::MaskScan` を返す縮退であり、
+/// #676 の複製回避がそのまま効く。対して `masked_short` は
+/// `sql::hnsw_cache::finish_indexed_search` が ANN 探索を実際に実行した
+/// **後**——`sql/exec.rs` の `SubsetSlotPlan::Ann` 分岐で既に
+/// `build_from_cached_rls_rows_subset` により subset アリーナを複製した
+/// **後**——に結果不足で `full_scan_with_arena` へ縮退する経路であり、
+/// この regime では #676 導入前と同じく複製が発生している（複製なし委譲の
+/// 証拠としては扱えない）。
+pub fn classify_hnsw_subset_regime(
+    hits_delta: u64,
+    subset_searches_delta: u64,
+    plain_scans_delta: u64,
+    mask_splits_graph_delta: u64,
+    masked_short_delta: u64,
+) -> &'static str {
+    if subset_searches_delta > 0 {
+        "ann_masked"
+    } else if plain_scans_delta > 0 {
+        "plain_scan_ratio"
+    } else if mask_splits_graph_delta > 0 {
+        "plain_scan_mask_split"
+    } else if masked_short_delta > 0 {
+        "plain_scan_masked_short"
+    } else if hits_delta > 0 {
+        // `Subset` 形状のクエリでは通常到達しない（`hits` は `FullVisible`
+        // 形状専用）が、呼び出し元の非 vacuous 検査が上記 4 カウンタと
+        // `hits_delta` の少なくとも 1 つの非ゼロを要求するため網羅させる。
+        "full_visible_hit (unexpected for a Subset-shaped query)"
+    } else {
+        "n/a (all counters delta=0)"
+    }
+}

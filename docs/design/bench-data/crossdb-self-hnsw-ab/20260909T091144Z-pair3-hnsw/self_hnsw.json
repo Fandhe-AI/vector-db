@@ -1,0 +1,262 @@
+{
+  "meta": {
+    "db": "self",
+    "version": "wire-server (path=/home/fandhe/fandhe/app/vector-db/.claude/worktrees/wf_d048e8d7-d3f-63/target/release/wire-server; sha256=230a3c529c61)",
+    "connection": "loopback TCP (psycopg simple query protocol)",
+    "config": "hnsw",
+    "rows": 23000,
+    "dim": 128,
+    "timestamp": "2026-09-09T09:12:05+0000",
+    "nproc": 12,
+    "loadavg": [
+      1.37353515625,
+      0.6923828125,
+      0.44482421875
+    ],
+    "python": "3.14.4",
+    "host": "Linux-7.0.0-30-generic-x86_64-with-glibc2.43",
+    "warmup": 5,
+    "iters": 50,
+    "index": "hnsw(m=16,ef_construction=100,ef_search=64,resident=f32)",
+    "search_engine": "hnsw",
+    "hnsw_args": [
+      "--hnsw-full-scan-ratio",
+      "2/5"
+    ],
+    "planner": "loopback stub (fixed expansion)"
+  },
+  "phases": {
+    "ann_probe": {
+      "engine": "hnsw",
+      "hnsw_params": "m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0",
+      "ann_plan": "hnsw_full_visible",
+      "rows": [
+        "search_terms[0]: probe",
+        "path_hint: (none)",
+        "kind_hint: (none)",
+        "mode: recall",
+        "mode_source: default",
+        "engine: hnsw",
+        "hnsw_params: m=16,ef_construction=100,ef_search=64,resident=f32,sparse_visited_max=0",
+        "ann_plan: hnsw_full_visible",
+        "scalar_plan: plain_scan"
+      ]
+    },
+    "hnsw_index_warm": {
+      "first_query_us": 258887.9510294646
+    },
+    "vector_knn": {
+      "n": 50,
+      "min_us": 426.6479518264532,
+      "p50_us": 458.51082541048527,
+      "p95_us": 663.2520817220211,
+      "p99_us": 1094.6549009531736,
+      "mean_us": 487.819560803473,
+      "max_us": 1094.6549009531736
+    },
+    "vector_knn_where": {
+      "n": 50,
+      "min_us": 1208.8220100849867,
+      "p50_us": 1317.0181773602962,
+      "p95_us": 1910.2131482213736,
+      "p99_us": 2093.4559870511293,
+      "mean_us": 1394.7933819144964,
+      "max_us": 2093.4559870511293
+    },
+    "point_where": {
+      "note": "vector_knn_where と同一クエリ形のため統合（task 指示準拠）",
+      "n": 50,
+      "min_us": 1208.8220100849867,
+      "p50_us": 1317.0181773602962,
+      "p95_us": 1910.2131482213736,
+      "p99_us": 2093.4559870511293,
+      "mean_us": 1394.7933819144964,
+      "max_us": 2093.4559870511293
+    },
+    "where_compound_count": {
+      "n": 50,
+      "min_us": 1020.3849524259567,
+      "p50_us": 1038.96320797503,
+      "p95_us": 1128.6179069429636,
+      "p99_us": 1230.2601244300604,
+      "mean_us": 1054.9538861960173,
+      "max_us": 1230.2601244300604,
+      "result": "7599"
+    },
+    "agg_count": {
+      "n": 50,
+      "min_us": 82.82391354441643,
+      "p50_us": 84.16920900344849,
+      "p95_us": 92.38999336957932,
+      "p99_us": 95.74298746883869,
+      "mean_us": 85.17165668308735,
+      "max_us": 95.74298746883869,
+      "result": "23000"
+    },
+    "agg_multi": {
+      "n": 50,
+      "min_us": 296.74102552235126,
+      "p50_us": 314.4440706819296,
+      "p95_us": 334.0460825711489,
+      "p99_us": 444.1370256245136,
+      "mean_us": 318.4027783572674,
+      "max_us": 444.1370256245136,
+      "result": [
+        "23000",
+        "283511500",
+        "12326.58695652174",
+        "1",
+        "25000"
+      ]
+    },
+    "group_by_having": {
+      "n": 50,
+      "min_us": 1563.1020069122314,
+      "p50_us": 1646.016025915742,
+      "p95_us": 1726.621063426137,
+      "p99_us": 1744.4239929318428,
+      "mean_us": 1646.3563777506351,
+      "max_us": 1744.4239929318428,
+      "result": [
+        [
+          "en",
+          "15379"
+        ],
+        [
+          "ja",
+          "7621"
+        ]
+      ]
+    },
+    "hybrid_rrf": {
+      "n": 50,
+      "min_us": 5627.630976960063,
+      "p50_us": 6352.994125336409,
+      "p95_us": 7587.11202070117,
+      "p99_us": 10967.809008434415,
+      "mean_us": 6528.2421093434095,
+      "max_us": 10967.809008434415
+    },
+    "mode_recall": {
+      "n": 50,
+      "min_us": 429.1220102459192,
+      "p50_us": 450.87491162121296,
+      "p95_us": 632.1188993752003,
+      "p99_us": 1231.600996106863,
+      "mean_us": 488.05342987179756,
+      "max_us": 1231.600996106863
+    },
+    "mode_precision": {
+      "n": 50,
+      "min_us": 630.2818655967712,
+      "p50_us": 728.4590974450111,
+      "p95_us": 1034.6861090511084,
+      "p99_us": 1214.3130879849195,
+      "mean_us": 784.9231641739607,
+      "max_us": 1214.3130879849195
+    },
+    "bulk_knn_k200": {
+      "n": 50,
+      "min_us": 565.4408596456051,
+      "p50_us": 645.1690569519997,
+      "p95_us": 1095.8369821310043,
+      "p99_us": 1409.8919928073883,
+      "mean_us": 700.7494475692511,
+      "max_us": 1409.8919928073883,
+      "k": 200,
+      "rows_returned": 200,
+      "ef_search": 64,
+      "ef_effective": 200
+    },
+    "bulk_knn_k1000": {
+      "n": 50,
+      "min_us": 1200.0319547951221,
+      "p50_us": 1428.362913429737,
+      "p95_us": 1984.728965908289,
+      "p99_us": 3846.7010017484426,
+      "mean_us": 1535.6114925816655,
+      "max_us": 3846.7010017484426,
+      "k": 1000,
+      "rows_returned": 1000,
+      "ef_search": 64,
+      "ef_effective": 1000
+    },
+    "bulk_knn_where_k200": {
+      "n": 50,
+      "min_us": 2109.5378324389458,
+      "p50_us": 2217.6620550453663,
+      "p95_us": 2336.437115445733,
+      "p99_us": 2371.9859309494495,
+      "mean_us": 2230.0510201603174,
+      "max_us": 2371.9859309494495,
+      "k": 200,
+      "rows_returned": 200,
+      "ef_search": 64,
+      "ef_effective": 200
+    },
+    "bulk_hybrid_k200": {
+      "n": 50,
+      "min_us": 8315.300103276968,
+      "p50_us": 9172.962047159672,
+      "p95_us": 10492.447996512055,
+      "p99_us": 13844.020897522569,
+      "mean_us": 9347.880771383643,
+      "max_us": 13844.020897522569,
+      "k": 200,
+      "rows_returned": 200,
+      "ef_search": 64,
+      "ef_effective": null,
+      "dense_fetch_k_initial": 400,
+      "dense_fetch_k_may_expand": true
+    },
+    "scan_where_nosort_k500": {
+      "n": 50,
+      "min_us": 441.8350290507078,
+      "p50_us": 456.9380544126034,
+      "p95_us": 479.9719899892807,
+      "p99_us": 494.97606232762337,
+      "mean_us": 459.101595915854,
+      "max_us": 494.97606232762337,
+      "k": 500,
+      "rows_returned": 500
+    },
+    "rls_isolation": {
+      "n": 50,
+      "min_us": 82.11587555706501,
+      "p50_us": 82.90191181004047,
+      "p95_us": 90.32990783452988,
+      "p99_us": 96.99119254946709,
+      "mean_us": 83.82930886000395,
+      "max_us": 96.99119254946709,
+      "tenant_b_count": "23000"
+    },
+    "udf_call": {
+      "n": 50,
+      "min_us": 426.8351476639509,
+      "p50_us": 438.1299950182438,
+      "p95_us": 559.1621156781912,
+      "p99_us": 677.1788466721773,
+      "mean_us": 449.5974164456129,
+      "max_us": 677.1788466721773
+    },
+    "explain": {
+      "unsupported": true,
+      "reason": "EXPLAIN は `USING PLAN(...)` 文にのみ対応（許可リスト拒否を実機確認）: SyntaxError('unsupported SQL syntax: EXPLAIN is only supported for SELECT ... USING PLAN(...) statements')"
+    },
+    "ingest_bulk": {
+      "unsupported": true,
+      "reason": "wire プロトコルに COPY 相当が無く、SQL 表層は単文 INSERT のみ受理する（`EngineCore::execute_insert_sql_batch` は Rust API であり wire 未露出）"
+    },
+    "ingest_single_stmt": {
+      "rows": 1000,
+      "seconds": 0.5070777530781925,
+      "rows_per_sec": 1972.0841506643615,
+      "commit_granularity": "per_statement"
+    },
+    "recall_at_10": {
+      "recall_at_10": 0.87,
+      "recall_at_10_strict": 0.8665,
+      "queries": 200
+    }
+  }
+}

@@ -143,4 +143,5 @@ bucket_share(sql_surface_fixed_cost_residual): us=216.2 pct_of_e2e=42.47%
 - `LIMIT 200` の crossdb 相当（`bulk_knn_where_k200`）の投影コスト（`id`+`body`）は本 Issue では計測しない。
 - 100,000 行（`BENCH_SCAN_PROFILE_SCALE=4`）× `1/3` は未実施（1 プロセス = 1 規模点の方針上、時間許容時に追加実測）。
 - #654（候補 id マスク経路で arena 複製回避）は現行 HEAD に取り込み済み（本ベンチの `index` アーム・I2b/I3 の訂正後実測がそのまま after 側の計測点）。#654 適用前との before/after 交互実行は Issue #655 で実施済み（`docs/design/scalar-index-mask-search.md`「前後比較実測（Issue #655）」節参照。`I2b_candidate_mask_build`〔140.0µs〕は本 doc の実測値と同水準であることを独立セッションで確認）。
+- HNSW opt-in 時の `Subset` 形状（本 doc とは別経路。`sql::hnsw_cache`）の plain scan 縮退時委譲（Issue #676）の前後比較は Issue #677（`docs/design/hnsw-rls-cardinality-switch.md`「Issue #677」節）が担当した。本 doc の `index`／`plain` アーム（`ScalarIndex`。Issue #654・#474）とは独立した経路のため対象外のまま。
 - production コード（`crates/engine/src/`）は無変更。

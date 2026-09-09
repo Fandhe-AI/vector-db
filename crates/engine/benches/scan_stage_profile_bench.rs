@@ -81,12 +81,13 @@ use std::time::{Duration, Instant};
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::declarative_filter::MetadataFilter;
+use engine::hnsw::{HnswParams, Ratio, ValidatedHnswParams};
 use engine::kernel::{SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::{encode_scalar_columns, Value};
-use engine::search_engine;
+use engine::search_engine::{self, SearchEngineKind};
 use engine::sql::exec::Cell;
 use engine::storage::{RowInput, Storage, Visibility};
 use engine::{arena::VectorArena, tenant};
@@ -418,6 +419,35 @@ fn main() {
         Ok(d) => d,
         Err(e) => fail_closed(format!("BENCH_SCAN_PROFILE_SELECTIVITY: {e}")),
     };
+    // HNSW opt-in（Issue #677）: 既定 `BruteForce`（未設定）のときは本節以下の
+    // 新規コードパスを一切通らず、出力・処理は #677 導入前とビット同一のまま
+    // 不変（`bench_engine::parse_engine`／`parse_full_scan_ratio` は
+    // `knn_profile_bench.rs` と同じ fail-closed 語彙・判定方針を共有する）。
+    let scan_engine_raw = match bench_engine::read_env_var("BENCH_SCAN_PROFILE_ENGINE") {
+        Ok(v) => v,
+        Err(e) => fail_closed(format!("BENCH_SCAN_PROFILE_ENGINE: {e}")),
+    };
+    let scan_engine = match bench_engine::parse_engine(scan_engine_raw.as_deref()) {
+        Ok(e) => e,
+        Err(e) => fail_closed(format!("BENCH_SCAN_PROFILE_ENGINE: {e}")),
+    };
+    let scan_full_scan_ratio_raw =
+        match bench_engine::read_env_var("BENCH_SCAN_PROFILE_FULL_SCAN_RATIO") {
+            Ok(v) => v,
+            Err(e) => fail_closed(format!("BENCH_SCAN_PROFILE_FULL_SCAN_RATIO: {e}")),
+        };
+    let scan_full_scan_ratio_override =
+        match bench_engine::parse_full_scan_ratio(scan_full_scan_ratio_raw.as_deref()) {
+            Ok(r) => r,
+            Err(e) => fail_closed(format!("BENCH_SCAN_PROFILE_FULL_SCAN_RATIO: {e}")),
+        };
+    if scan_full_scan_ratio_override.is_some()
+        && scan_engine == harness::bench_engine::BenchEngine::BruteForce
+    {
+        fail_closed(
+            "BENCH_SCAN_PROFILE_FULL_SCAN_RATIO requires BENCH_SCAN_PROFILE_ENGINE=hnsw|hnsw_f16|hnsw_i8 (got brute_force)",
+        );
+    }
 
     let tenant_a_rows = TENANT_A_ROWS_BASE * scale;
     let tenant_b_rows = TENANT_B_ROWS_BASE * scale;
@@ -430,6 +460,22 @@ fn main() {
     println!(
         "scan_stage_profile_bench: rows={total_physical_rows} dim={DIM} rounds={rounds} scale={scale} selectivity=1/{selectivity_denominator} (tenant_a={tenant_a_rows} public, tenant_b={tenant_b_rows} private)"
     );
+    // Issue #677 追記行（既存の summarizer 正規表現は上記行のみを見るため
+    // 後方互換）。`BENCH_SCAN_PROFILE_ENGINE` 未設定（既定 `brute_force`）時は
+    // この行自体を出力しないことで、既定出力（本関数の println 列全体）を
+    // #677 導入前とビット同一のまま維持する（codex-review P2 指摘・PR #688:
+    // 無条件 println! だと `scan_default_brute.log` のように既定実行でも
+    // 新規行が増え、「既定出力はビット同一」という互換性説明と矛盾していた）。
+    if scan_engine != harness::bench_engine::BenchEngine::BruteForce {
+        println!(
+            "scan_stage_profile_bench: engine={} full_scan_ratio={}",
+            scan_engine.token(),
+            match scan_full_scan_ratio_override {
+                Some((n, d)) => format!("{n}/{d}"),
+                None => "default".to_string(),
+            }
+        );
+    }
 
     let schema = schema();
     let path = unique_db_path("issue464-scan-stage-profile");
@@ -1627,6 +1673,191 @@ fn main() {
         None => println!(
             "bucket_share(sql_surface_fixed_cost_residual): n/a (I1+I2b+I3 の合計が e2e(index) を超過。測定ノイズにより逆転・未確定)"
         ),
+    }
+
+    // --- HNSW opt-in（Issue #677。親 Issue #676 の Subset 縮退時委譲の観測）。
+    // `scan_engine == BruteForce`（既定・未設定）のときは本節を一切実行せず、
+    // ここまでの出力・検証は #677 導入前とビット同一のまま不変。
+    //
+    // `HnswIndexCacheStats`（`sql::hnsw_cache`。`pub(crate)` モジュール配下の
+    // ため型名は書けない）のうち本節が参照するのは `hits`／`builds`／
+    // `subset_searches`／`plain_scans`／`mask_splits_graph`／`masked_short`
+    // （いずれも Issue #676 より前から存在するフィールド）のみに限定し、
+    // #676 が新設した `subset_mask_scans`／`subset_arena_copies` は直接
+    // 参照しない——本ファイルを #676 適用前の独立ソースツリー（`git archive`
+    // 展開）へ overlay してもコンパイルできる状態を保つための意図的な制約
+    // （`docs/design/hnsw-rls-cardinality-switch.md`「Issue #677」節参照）。
+    // 採否そのものの直接観測（`subset_mask_scans`／`subset_arena_copies`）は
+    // #676 適用後（HEAD）限定の別セッションで行う。
+    if scan_engine != harness::bench_engine::BenchEngine::BruteForce {
+        // 直前まで使っていた既定エンジンの `core`（brute_force・`Storage::open`
+        // 保持）を明示的に破棄してから同じ redb ファイルを再オープンする
+        // （`W0-cold`／`A0-cold` 系列が同型の理由で `Storage::open` を都度
+        // 再オープンしているのと同じ制約。redb は 1 プロセス内で同一ファイルの
+        // 二重オープンを許さない）。
+        drop(core);
+        let hnsw_storage =
+            Storage::open(&path).expect("reopen storage for HNSW opt-in (Issue #677)");
+        let hnsw_kind = {
+            let mut validated = ValidatedHnswParams::new(HnswParams::default())
+                .expect("valid HnswParams::default()");
+            if let Some((numerator, denominator)) = scan_full_scan_ratio_override {
+                validated = validated
+                    .with_full_scan_ratio(Ratio { numerator, denominator })
+                    .expect("BENCH_SCAN_PROFILE_FULL_SCAN_RATIO already validated by harness::bench_engine::parse_full_scan_ratio");
+            }
+            match scan_engine {
+                harness::bench_engine::BenchEngine::Hnsw => SearchEngineKind::Hnsw(validated),
+                harness::bench_engine::BenchEngine::HnswF16 => SearchEngineKind::Hnsw(
+                    validated.with_resident_precision(engine::hnsw::ResidentPrecision::F16),
+                ),
+                harness::bench_engine::BenchEngine::HnswI8 => SearchEngineKind::Hnsw(
+                    validated.with_resident_precision(engine::hnsw::ResidentPrecision::I8),
+                ),
+                harness::bench_engine::BenchEngine::BruteForce => {
+                    unreachable!("guarded by the outer `scan_engine != BruteForce` check above")
+                }
+            }
+        };
+        let hnsw_core = EngineCore::from_storage_with_engine(hnsw_storage, hnsw_kind);
+
+        // warm: `Subset` 形状は自身では索引を構築せず既存索引の base を再利用
+        // するのみのため（`sql/hnsw_cache.rs::prepare_subset` 冒頭コメント。
+        // `knn_profile_bench.rs::run_visible_ratio_sweep` と同じ理由）、
+        // フィルタなしクエリを 1 回発行して `FullVisible` 形状の索引を先に
+        // 構築してから WHERE クエリを計測する。
+        let warm_stats_before = hnsw_core.hnsw_index_cache_stats();
+        hnsw_core
+            .execute_sql(&ctx_a, &sql_nowhere)
+            .expect("execute_sql must succeed for HNSW warm-up KNN query");
+        let warm_stats_after = hnsw_core.hnsw_index_cache_stats();
+        if warm_stats_after.builds <= warm_stats_before.builds {
+            fail_closed(
+                "HNSW warm-up did not build an index (builds delta<=0; Subset 経路が index base を再利用できず vacuous な計測になる)",
+            );
+        }
+
+        let mut hnsw_rounds: Vec<Duration> = Vec::with_capacity(rounds as usize);
+        let mut hnsw_hits_delta = 0u64;
+        let mut hnsw_subset_searches_delta = 0u64;
+        let mut hnsw_plain_scans_delta = 0u64;
+        let mut hnsw_mask_splits_graph_delta = 0u64;
+        let mut hnsw_masked_short_delta = 0u64;
+        for round in 0..rounds {
+            let stats_before = hnsw_core.hnsw_index_cache_stats();
+            let hnsw_hot = run(&config, || {
+                hnsw_core.execute_sql(&ctx_a, &sql_where).expect(
+                    "execute_sql must succeed for well-formed synthetic WHERE query (hnsw arm)",
+                )
+            })
+            .expect("measurement must satisfy protocol minimums");
+            let stats_after = hnsw_core.hnsw_index_cache_stats();
+            hnsw_rounds.push(hnsw_hot.summary.median);
+
+            let hnsw_result = hnsw_core.execute_sql(&ctx_a, &sql_where).expect(
+                "execute_sql must succeed for well-formed synthetic WHERE query (hnsw arm)",
+            );
+            let hnsw_ids: Vec<u64> = hnsw_result
+                .rows
+                .iter()
+                .map(|row| match row.cells.first() {
+                    Some(Cell::Integer(v)) => *v,
+                    other => fail_closed(format!(
+                        "round {round}: hnsw arm id cell type mismatch: got {other:?}"
+                    )),
+                })
+                .collect();
+            if hnsw_ids.iter().any(|id| !expected_match_ids.contains(id)) {
+                fail_closed(format!(
+                    "round {round}: hnsw arm returned an id outside the lang='ja' visible set (tenant/filter leak suspected)"
+                ));
+            }
+
+            let round_hits_delta = stats_after.hits.saturating_sub(stats_before.hits);
+            let round_subset_searches_delta = stats_after
+                .subset_searches
+                .saturating_sub(stats_before.subset_searches);
+            let round_plain_scans_delta = stats_after
+                .plain_scans
+                .saturating_sub(stats_before.plain_scans);
+            let round_mask_splits_graph_delta = stats_after
+                .mask_splits_graph
+                .saturating_sub(stats_before.mask_splits_graph);
+            let round_masked_short_delta = stats_after
+                .masked_short
+                .saturating_sub(stats_before.masked_short);
+            // いずれか 1 経路が非 vacuous に発火していることを毎ラウンド確認する
+            // （`hits` は `FullVisible` 形状の warm-up 由来では増えない
+            // ——`Subset` 形状専用に `subset_searches` を持つため、`Subset`
+            // 形状が ANN 完走した場合は `subset_searches` が増える）。
+            if round_hits_delta == 0
+                && round_subset_searches_delta == 0
+                && round_plain_scans_delta == 0
+                && round_mask_splits_graph_delta == 0
+                && round_masked_short_delta == 0
+            {
+                fail_closed(format!(
+                    "round {round}: hnsw arm did not exercise any observable Subset regime (all counters delta=0; vacuous measurement)"
+                ));
+            }
+            if round == 0 {
+                hnsw_hits_delta = round_hits_delta;
+                hnsw_subset_searches_delta = round_subset_searches_delta;
+                hnsw_plain_scans_delta = round_plain_scans_delta;
+                hnsw_mask_splits_graph_delta = round_mask_splits_graph_delta;
+                hnsw_masked_short_delta = round_masked_short_delta;
+            }
+        }
+
+        let hnsw_min = min_of(&hnsw_rounds).expect("rounds >= 1");
+        let hnsw_med = median_of(&hnsw_rounds).expect("rounds >= 1");
+        println!("--- hnsw arm per-round raw medians (ms) ---");
+        for (round, dur) in hnsw_rounds.iter().enumerate() {
+            println!("round[{round}]: hnsw={:.3}", dur.as_secs_f64() * 1e3);
+        }
+        println!(
+            "e2e(vector_knn_where/hnsw-hot,k={TOP_K}): median={:.3}ms (min-of-R={:.3}ms)",
+            hnsw_med.as_secs_f64() * 1e3,
+            hnsw_min.as_secs_f64() * 1e3
+        );
+        println!(
+            "hnsw_regime={} hits_delta={hnsw_hits_delta} subset_searches_delta={hnsw_subset_searches_delta} plain_scans_delta={hnsw_plain_scans_delta} mask_splits_graph_delta={hnsw_mask_splits_graph_delta} masked_short_delta={hnsw_masked_short_delta}",
+            harness::scan_stage_profile::classify_hnsw_subset_regime(
+                hnsw_hits_delta,
+                hnsw_subset_searches_delta,
+                hnsw_plain_scans_delta,
+                hnsw_mask_splits_graph_delta,
+                hnsw_masked_short_delta,
+            )
+        );
+        match stage_diff_ns_per_row(
+            index_med,
+            hnsw_med,
+            expected_match_ids.len(),
+            "index",
+            "hnsw",
+        ) {
+            Ok(_) => {
+                // stage_diff_ns_per_row(index_med, hnsw_med, ...) が Ok ⇒
+                // hnsw_med >= index_med（hnsw アームが同等以上に遅い）。
+                // ラベル「index->hnsw」と揃うよう from=index_med/to=hnsw_med で
+                // 比率を計算する（codex-review・Cursor Bugbot 指摘: 引数順が
+                // ラベルと逆で符号・表示が反転していた）。
+                let ratio_pct = step_ratio_pct(index_med, hnsw_med).unwrap_or(0.0);
+                println!(
+                    "arm_ratio(index->hnsw,k={TOP_K}): ratio={ratio_pct:.2}% (brute_force ScalarIndex-mask arm〔Issue #654〕vs hnsw arm〔Issue #676〕on the same WHERE+DISTANCE query; hnsw arm is slower or equal this round)"
+                );
+            }
+            Err(_) => {
+                // Err ⇒ hnsw_med < index_med（hnsw アームがこのラウンドは速い）。
+                // ラベル「hnsw->index」と揃うよう from=hnsw_med/to=index_med で
+                // 比率を計算する。
+                let ratio_pct = step_ratio_pct(hnsw_med, index_med).unwrap_or(0.0);
+                println!(
+                    "arm_ratio(hnsw->index,k={TOP_K}): ratio={ratio_pct:.2}% (hnsw arm is faster than the brute_force ScalarIndex-mask arm this round)"
+                );
+            }
+        }
     }
 
     println!("scan_stage_profile_bench: consistency checks passed (A3 visible row count == tenant_a_rows for both ctx_a/ctx_b every round, W2 match count == expected, W0-cold/W0-hot result ids within lang='ja' visible set, COUNT(*) == tenant_a_rows for both contexts, index arm and plain arm returned identical id sets, ScalarIndex candidate resolution confirmed non-vacuous via scalar_index_cache_stats() deltas)");
