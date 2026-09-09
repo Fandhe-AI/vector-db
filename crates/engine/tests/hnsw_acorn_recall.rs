@@ -566,6 +566,10 @@ struct ArmPoint {
     subset_searches: u64,
     acorn_searches: u64,
     acorn_expansions: u64,
+    /// greedy_descend_masked のブリッジ降下（Issue #680）が受理・比較した
+    /// 2-hop ノード数の累計。層 0 の bridge_expand が数える acorn_expansions
+    /// とは別カウンタ。
+    acorn_descent_bridges: u64,
     plain_scans: u64,
     mask_splits_graph: u64,
 }
@@ -693,6 +697,7 @@ fn run_cluster_mask_arm(
         subset_searches: stats.subset_searches,
         acorn_searches: stats.acorn_searches,
         acorn_expansions: stats.acorn_expansions,
+        acorn_descent_bridges: stats.acorn_descent_bridges,
         plain_scans: stats.plain_scans,
         mask_splits_graph: stats.mask_splits_graph,
     }
@@ -963,7 +968,7 @@ fn layer_b_25k_dim128_cluster_mask_hop_mode_report() {
     println!(
         "hnsw_acorn_recall: layer B cluster-mask hop-mode report (rows={ROWS} dim={DIM} runs={runs})"
     );
-    println!("run shape ratio arm recall@10 queries subset_searches acorn_searches acorn_expansions acorn_expansions/query plain_scans mask_splits_graph");
+    println!("run shape ratio arm recall@10 queries subset_searches acorn_searches acorn_expansions acorn_expansions/query acorn_descent_bridges plain_scans mask_splits_graph");
 
     let points: [(MaskShape, &str); 3] = [
         (MaskShape::Whole { clusters: 1 }, "1/6"),
@@ -988,7 +993,7 @@ fn layer_b_25k_dim128_cluster_mask_hop_mode_report() {
                 );
                 let p = run_cluster_mask_arm(DIM, ROWS, shape, arm, &op_tag);
                 println!(
-                    "{run} {} {ratio_label} {} {:.4} {} {} {} {} {:.2} {} {}",
+                    "{run} {} {ratio_label} {} {:.4} {} {} {} {} {:.2} {} {} {}",
                     p.shape_label,
                     p.arm_label,
                     p.recall_at_10,
@@ -997,11 +1002,22 @@ fn layer_b_25k_dim128_cluster_mask_hop_mode_report() {
                     p.acorn_searches,
                     p.acorn_expansions,
                     p.acorn_expansions_per_query(),
+                    p.acorn_descent_bridges,
                     p.plain_scans,
                     p.mask_splits_graph
                 );
                 if matches!(arm, HopArm::TwoHop) && p.acorn_searches > 0 {
                     twohop_reached += 1;
+                    // Issue #680: TwoHop 到達時は Recall@10 が既定エンジン
+                    // 対照で 0.9 以上であることを固定する（改善前の実測値
+                    // 0.9750 と非劣化、`docs/design/hnsw-rls-cardinality-switch.md`
+                    // 「Issue #680」節参照）。
+                    assert!(
+                        p.recall_at_10 >= 0.9,
+                        "TwoHop recall@10 must be >= 0.9 when reached (shape={} got {})",
+                        p.shape_label,
+                        p.recall_at_10
+                    );
                 }
             }
         }

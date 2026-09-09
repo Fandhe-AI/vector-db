@@ -192,6 +192,12 @@ pub struct HnswIndexCacheStats {
     /// （診断用。テナント境界・可視カーディナリティ等のテナント存在情報には
     /// 繋がらない——採否のみを数える）。
     pub acorn_expansions: u64,
+    /// [`crate::hnsw::HnswIndex::greedy_descend_masked`] の TwoHop 限定
+    /// ブリッジ降下（Issue #680）が受理・比較した 2-hop ノード数の累計
+    /// （診断用。`acorn_expansions`（層 0 の `bridge_expand` が数える値）とは
+    /// 別カウンタ。`acorn_searches` と同じく縮退なしに完走した TwoHop 探索
+    /// のみを計上する）。
+    pub acorn_descent_bridges: u64,
     /// hybrid 密側再取得ループが破棄候補ヒープ保持の再開型探索（Issue #505・
     /// `crate::hnsw::ResumableMaskedSearch`）で完走したラウンド数の累計
     /// （`sql::hnsw_hybrid::HnswDenseProvider` が同一クエリ・同一バッファへの
@@ -679,6 +685,7 @@ pub(crate) struct HnswIndexCache {
     sparse_visited_searches: AtomicU64,
     acorn_searches: AtomicU64,
     acorn_expansions: AtomicU64,
+    acorn_descent_bridges: AtomicU64,
     hybrid_resumed_rounds: AtomicU64,
     subset_mask_scans: AtomicU64,
     subset_arena_copies: AtomicU64,
@@ -722,6 +729,7 @@ impl HnswIndexCache {
             sparse_visited_searches: AtomicU64::new(0),
             acorn_searches: AtomicU64::new(0),
             acorn_expansions: AtomicU64::new(0),
+            acorn_descent_bridges: AtomicU64::new(0),
             hybrid_resumed_rounds: AtomicU64::new(0),
             subset_mask_scans: AtomicU64::new(0),
             subset_arena_copies: AtomicU64::new(0),
@@ -1050,6 +1058,7 @@ impl HnswIndexCache {
             sparse_visited_searches: self.sparse_visited_searches.load(Ordering::Relaxed),
             acorn_searches: self.acorn_searches.load(Ordering::Relaxed),
             acorn_expansions: self.acorn_expansions.load(Ordering::Relaxed),
+            acorn_descent_bridges: self.acorn_descent_bridges.load(Ordering::Relaxed),
             hybrid_resumed_rounds: self.hybrid_resumed_rounds.load(Ordering::Relaxed),
             subset_mask_scans: self.subset_mask_scans.load(Ordering::Relaxed),
             subset_arena_copies: self.subset_arena_copies.load(Ordering::Relaxed),
@@ -1536,6 +1545,7 @@ pub(crate) fn search_prepared_resumable(
         index_hits,
         None,
         hop,
+        0,
         0,
         &fell_back,
     );
@@ -2089,23 +2099,25 @@ fn search_with_overlay(
     // 世代毎に 1 回だけ判定した単一情報源）からそのまま導出する——本関数側で
     // 独自に可視カーディナリティ比を再判定しない。
     let hop = overlay.regime.hop();
-    let (index_hits, visited_kind, acorn_expansions) = SEARCH_SCRATCH.with(|scratch| {
-        let mut scratch = scratch.borrow_mut();
-        let result = base.index.search_masked_with_hop(
-            query,
-            k,
-            ef,
-            Some(&overlay.visible_mask),
-            access.provider.sparse_visited_max(),
-            hop,
-            &mut scratch,
-        );
-        (
-            result,
-            scratch.last_visited_kind(),
-            scratch.last_acorn_expansions(),
-        )
-    });
+    let (index_hits, visited_kind, acorn_expansions, acorn_descent_bridges) =
+        SEARCH_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let result = base.index.search_masked_with_hop(
+                query,
+                k,
+                ef,
+                Some(&overlay.visible_mask),
+                access.provider.sparse_visited_max(),
+                hop,
+                &mut scratch,
+            );
+            (
+                result,
+                scratch.last_visited_kind(),
+                scratch.last_acorn_expansions(),
+                scratch.last_acorn_descent_bridges(),
+            )
+        });
     let index_hits = match index_hits {
         Ok(hits) => hits,
         Err(_) => {
@@ -2131,6 +2143,7 @@ fn search_with_overlay(
         visited_kind,
         hop,
         acorn_expansions,
+        acorn_descent_bridges,
         &fell_back,
     )
 }
@@ -2168,6 +2181,7 @@ fn finish_indexed_search(
     visited_kind: Option<crate::hnsw::VisitedKind>,
     hop: crate::hnsw::HopMode,
     acorn_expansions: u64,
+    acorn_descent_bridges: u64,
     fell_back: &std::cell::Cell<bool>,
 ) -> Result<Vec<CandidateHit>, KernelError> {
     // マスク付き探索の結果件数が「可視ノード数と要求 k の小さい方」に満たない
@@ -2271,6 +2285,10 @@ fn finish_indexed_search(
             .cache
             .acorn_expansions
             .fetch_add(acorn_expansions, Ordering::Relaxed);
+        access
+            .cache
+            .acorn_descent_bridges
+            .fetch_add(acorn_descent_bridges, Ordering::Relaxed);
     }
     Ok(mapped)
 }

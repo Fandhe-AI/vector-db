@@ -107,6 +107,16 @@ pub const MAX_M: usize = 128;
 /// untrusted な呼び出し元がここを起点に無制限の候補集合を要求できないようにする）。
 pub const MAX_EF: usize = 10_000;
 
+/// [`two_hop_effective_ef`] が `ef.max(k)` へ掛け合わせる倍率の上限（Issue
+/// #680）。TwoHop（ACORN-1）が到達する既定レジームでは
+/// `1/10 <= full_scan_ratio <= acorn_max_visible_ratio <= 4/10` 相当の
+/// 可視比率（`node_count.div_ceil(visible)` がおおむね `3..=10`）を想定するが、
+/// `--hnsw-full-scan-ratio`（Issue #657）で下限が外れる呼び出しでも `ef_eff`
+/// が無制限に膨らまないよう固定上限で二重に抑える（`MAX_EF` によるクランプと
+/// 独立の安全弁。DoS 防止）。値の根拠は
+/// `docs/design/hnsw-rls-cardinality-switch.md`「Issue #680」節参照。
+pub(crate) const ACORN_EF_SCALE_MAX: usize = 8;
+
 /// 構築可能なノード数の上限（`arena::MAX_ARENA_ROWS` と同値。ノード id を `u32` で
 /// 表現できることの裏付けでもある）。
 pub const MAX_HNSW_NODES: usize = 1_000_000;
@@ -1310,6 +1320,13 @@ pub struct HnswSearchScratch {
     /// `search_masked_with` 経由を含む）では常に `0`。早期 `return` 経路
     /// でも `0` にリセットする（`last_visited_kind` と同じ扱い）。
     last_acorn_expansions: u64,
+    /// 直近の [`HnswIndex::search_masked_with_hop`] 呼び出しが
+    /// [`HnswIndex::greedy_descend_masked`] のブリッジ降下（Issue #680）経由で
+    /// 受理・比較した 2-hop ノード数の累計。`hop == HopMode::OneHop` の呼び
+    /// 出し（`search_masked_resumable_start` 経由を含む）では常に `0`。
+    /// `last_acorn_expansions`（層 0 の `bridge_expand` が数える値）とは
+    /// 別カウンタ（Issue #681 の閾値判定が前者の意味に依存するため）。
+    last_acorn_descent_bridges: u64,
 }
 
 impl HnswSearchScratch {
@@ -1326,6 +1343,11 @@ impl HnswSearchScratch {
     /// 統計（`acorn_expansions`）が使う。
     pub(crate) fn last_acorn_expansions(&self) -> u64 {
         self.last_acorn_expansions
+    }
+
+    /// 直近呼び出しのブリッジ降下 2-hop ノード数（Issue #680。診断用）。
+    pub(crate) fn last_acorn_descent_bridges(&self) -> u64 {
+        self.last_acorn_descent_bridges
     }
 
     /// [`Self::last_visited_kind`] の診断専用の薄いラッパー（Issue #498。
@@ -2451,6 +2473,34 @@ impl HnswIndex {
     /// 計算列（呼び出し順序込み）を辿るため、[`Self::search_masked`] が
     /// `mask: None` で呼んだときに [`Self::search`] とビット同一の結果を返す
     /// 契約（`crate::hnsw::tests::search_masked_none_matches_search`）を崩さない。
+    ///
+    /// `hop == HopMode::TwoHop` かつ `mask` が `Some` のときに限り、非受理の
+    /// 隣接ノードを 1 段だけ橋渡しの中継点として使い、その先（2-hop 先）の
+    /// 受理ノードもこの層の降下候補に含める（Issue #680）。低可視比率
+    /// （マスクが疎）の TwoHop 経路では上位層のノード数が層 0 の約 `1/M`
+    /// しかなく、受理隣接がほぼ無いまま降下が早期停止し層 0 の探索起点が
+    /// entry point 付近に固定されてしまう問題（Issue #674 Phase 2 の実測・
+    /// `docs/design/hnsw-rls-cardinality-switch.md`「Issue #680」節）への
+    /// 対処。橋渡しノード自身・非受理の 2-hop ノードは一切スコア計算しない
+    /// （I1 不変。§`bridge_expand` と同じ「不適合ノードのリンクのみを中継点
+    /// として使う」規約）。`hop == HopMode::OneHop` または `mask == None` の
+    /// ときはこの分岐に入らず、既存ループとバイト単位で同一の計算列を辿る
+    /// （`search_masked_two_hop_matches_search_when_mask_is_none`・
+    /// `search_masked_none_matches_search` のビット同一契約を維持）。
+    ///
+    /// `descent_bridges` には、この呼び出し全体（複数層の降下ループを含まず、
+    /// 1 回の `greedy_descend_masked` 呼び出し分）で受理・比較した 2-hop
+    /// ノードの延べ数を加算する（診断用。層 0 の `bridge_expand` が数える
+    /// `acorn_expansions` とは別カウンタとして扱う——Issue #681 が
+    /// `acorn_expansions` の意味〔層 0 受理件数〕を閾値判定に使う前提を崩さない
+    /// ため）。
+    ///
+    /// 停止性: 降下ループは `current_best` の厳密な改善でのみ継続するため、
+    /// 橋渡し降下を加えても有限性は変わらない（同じ橋渡しノードを別反復で
+    /// 再走査しうるが、visited を持たない従来の降下ループ自体がそうであり、
+    /// 反復回数はグラフの次数上限で有界）。1 反復あたりの追加コストは高々
+    /// `M_level` 本の非受理隣接 × `M_level` 本の 2-hop 隣接。
+    #[allow(clippy::too_many_arguments)]
     fn greedy_descend_masked(
         &self,
         start: u32,
@@ -2459,11 +2509,14 @@ impl HnswIndex {
         dim: usize,
         vectors: &dyn NodeSource,
         mask: Option<&NodeMask>,
+        hop: HopMode,
+        descent_bridges: &mut u64,
     ) -> Result<Option<u32>, HnswError> {
         let is_ok = |node: u32| mask.map(|m| m.get(node)).unwrap_or(true);
         if !is_ok(start) {
             return Ok(None);
         }
+        let bridge_enabled = hop == HopMode::TwoHop && mask.is_some();
         let mut current = start;
         let mut current_best = ScoredNode {
             node: current,
@@ -2474,6 +2527,25 @@ impl HnswIndex {
             if let Some(neighbors) = self.neighbors(level, current) {
                 for &cand in neighbors {
                     if !is_ok(cand) {
+                        if bridge_enabled {
+                            if let Some(bridged) = self.neighbors(level, cand) {
+                                for &two_hop in bridged {
+                                    if !is_ok(two_hop) {
+                                        continue;
+                                    }
+                                    *descent_bridges = descent_bridges.saturating_add(1);
+                                    let two_hop_scored = ScoredNode {
+                                        node: two_hop,
+                                        score: self.score(two_hop, query, dim, vectors)?,
+                                    };
+                                    if two_hop_scored > current_best {
+                                        current = two_hop;
+                                        current_best = two_hop_scored;
+                                        improved = true;
+                                    }
+                                }
+                            }
+                        }
                         continue;
                     }
                     let cand_scored = ScoredNode {
@@ -3256,6 +3328,7 @@ impl HnswIndex {
         // 層 0 探索へ到達した場合のみ、その直前で上書きする。
         scratch.last_visited_kind = None;
         scratch.last_acorn_expansions = 0;
+        scratch.last_acorn_descent_bridges = 0;
 
         let dim_usize = self.dim as usize;
         if query.len() != dim_usize {
@@ -3348,17 +3421,26 @@ impl HnswIndex {
             },
             None => (entry, top_level, entry),
         };
+        let mut descent_bridges = 0u64;
         if effective_top > 0 {
             for l in (1..=effective_top).rev() {
-                nearest =
-                    match self.greedy_descend_masked(nearest, query, l, dim_usize, source, mask)? {
-                        Some(n) => n,
-                        // 到達しない防御的分岐: `nearest` は代替起点選択の時点で
-                        // 受理済みであることを検証しており、`greedy_descend_masked`
-                        // は受理済みの候補へしか `current` を進めないため、以降の
-                        // 呼び出しでも常に受理済みノードを渡している。
-                        None => return Ok(Vec::new()),
-                    };
+                nearest = match self.greedy_descend_masked(
+                    nearest,
+                    query,
+                    l,
+                    dim_usize,
+                    source,
+                    mask,
+                    hop,
+                    &mut descent_bridges,
+                )? {
+                    Some(n) => n,
+                    // 到達しない防御的分岐: `nearest` は代替起点選択の時点で
+                    // 受理済みであることを検証しており、`greedy_descend_masked`
+                    // は受理済みの候補へしか `current` を進めないため、以降の
+                    // 呼び出しでも常に受理済みノードを渡している。
+                    None => return Ok(Vec::new()),
+                };
             }
         }
 
@@ -3370,8 +3452,24 @@ impl HnswIndex {
         // k > ef のとき結果集合が k 件に満たない事故を防ぐため、実効 ef を
         // `ef.max(k)` へ引き上げる（hnswlib 等の一般的慣行。詳細は
         // `docs/design/hnsw-search.md` 参照）。ef・k は共に上で MAX_EF 以下と
-        // 検証済みのため `ef_eff` も MAX_EF 以下。
-        let ef_eff = ef.max(k);
+        // 検証済みのため `ef.max(k)` も MAX_EF 以下。
+        //
+        // `hop == HopMode::TwoHop` かつ `mask` が `Some` のときのみ、可視比率
+        // に応じて実効 ef をさらに底上げする（Issue #680。§`two_hop_effective_ef`
+        // ドキュメンテーションコメント参照）。橋渡し展開で 1 クエリあたり
+        // 多数の遠方候補が流入し、既定の `ef` だと `results` ヒープが遠方候補で
+        // 埋まって早期打ち切りを誘発する事象への対処。OneHop・`mask == None`
+        // では従来どおり `ef.max(k)` のまま（式自体を分岐で切り替え、既存の
+        // 計算は一切変えない）。
+        let ef_eff = if hop == HopMode::TwoHop {
+            if let Some(m) = mask {
+                two_hop_effective_ef(ef, k, self.graph.node_count(), m.count_ones())
+            } else {
+                ef.max(k)
+            }
+        } else {
+            ef.max(k)
+        };
 
         // 層 0 探索の初期候補には降下後ノード（`nearest`）に加え、`mask` が
         // `Some` かつ両者が異なる場合は検査済み起点（`checked_entry`）も
@@ -3428,6 +3526,7 @@ impl HnswIndex {
             )?
         };
         scratch.last_acorn_expansions = acorn_expansions;
+        scratch.last_acorn_descent_bridges = descent_bridges;
 
         let out: Vec<crate::kernel::CandidateHit> = results
             .into_iter()
@@ -3643,13 +3742,25 @@ impl HnswIndex {
             },
             None => (entry, top_level, entry),
         };
+        // 本関数は冒頭で `hop == HopMode::TwoHop` を拒否済みのため、ここで
+        // `greedy_descend_masked` へ渡す hop は常に `HopMode::OneHop`
+        // （橋渡し降下は起動しない・ビット同一契約は不変。Issue #680）。
+        let mut descent_bridges = 0u64;
         if effective_top > 0 {
             for l in (1..=effective_top).rev() {
-                nearest =
-                    match self.greedy_descend_masked(nearest, query, l, dim_usize, source, mask)? {
-                        Some(n) => n,
-                        None => return Ok((Vec::new(), state)),
-                    };
+                nearest = match self.greedy_descend_masked(
+                    nearest,
+                    query,
+                    l,
+                    dim_usize,
+                    source,
+                    mask,
+                    HopMode::OneHop,
+                    &mut descent_bridges,
+                )? {
+                    Some(n) => n,
+                    None => return Ok((Vec::new(), state)),
+                };
             }
         }
 
@@ -3922,6 +4033,46 @@ fn resumable_snapshot(state: &ResumableMaskedSearch, k: usize) -> Vec<crate::ker
             score: s.score,
         })
         .collect()
+}
+
+/// TwoHop（ACORN-1）経路限定の実効 `ef` 底上げ（Issue #680）。
+///
+/// 低可視比率（マスクが疎）の TwoHop 経路では、[`bridge_expand`] の橋渡し
+/// 展開で 1 クエリあたり多数の遠方候補（非受理ノードの 2-hop 先）が幅 `ef`
+/// のビームへ流入し、`results` ヒープが遠方候補で埋まって早期打ち切りを
+/// 誘発する（Issue #674 Phase 2 の実測）。可視比率が低いほど（＝橋渡しで
+/// 混入する遠方候補の割合が高いほど）`ef` を大きく底上げすることで、真に
+/// 近い受理ノードがヒープから押し出される事故を緩和する。
+///
+/// - `base = ef.max(k)`（既存の `ef_eff` 計算と同じ。呼び出し元は `hop`・
+///   `mask` に応じてこの関数を呼ぶか `ef.max(k)` をそのまま使うかを切り替える
+///   ——本関数自体は TwoHop 判定を持たない純粋関数）。
+/// - `visible == 0` は呼び出し元で到達不能（`is_mask_fully_reachable_with`
+///   が false）となり `search_masked_with_hop` 自体が空集合を返す経路のため
+///   実質到達しないが、ゼロ除算を避け `base` をそのまま返す（防御的）。
+/// - `scale = node_count.div_ceil(visible)`（可視比率の逆数の切り上げ）を
+///   `1..=ACORN_EF_SCALE_MAX` へクランプする——`--hnsw-full-scan-ratio`
+///   （Issue #657）で可視比率の下限が既定域から外れた呼び出しでも `ef_eff`
+///   が無制限に膨らまないための安全弁。
+/// - 最終結果は `MAX_EF` でもクランプする（呼び出し元の `ef`・`k` は既に
+///   `MAX_EF` 以下と検証済みだが、乗算後の値がそれを超えないことをここでも
+///   保証する。二重の安全弁）。
+/// - `saturating_mul`／`div_ceil` を使い、untrusted な `node_count`・
+///   `visible`（wire 経由の SCALAR フィルタ選択率に依存）に対しても整数
+///   オーバーフローを未定義動作にしない（`coding-rust.md`「untrusted 入力の
+///   扱い」）。
+pub(crate) fn two_hop_effective_ef(
+    ef: usize,
+    k: usize,
+    node_count: usize,
+    visible: usize,
+) -> usize {
+    let base = ef.max(k);
+    if visible == 0 {
+        return base;
+    }
+    let scale = node_count.div_ceil(visible).clamp(1, ACORN_EF_SCALE_MAX);
+    base.saturating_mul(scale).min(MAX_EF)
 }
 
 /// [`HnswIndex::search_layer_with`]／[`GraphBuilder::search_layer`] が
@@ -5400,6 +5551,188 @@ mod tests {
             expansions, 1,
             "only node2 is accepted among the 2-hop candidates"
         );
+    }
+
+    /// Issue #680: 上位層の貪欲降下（[`HnswIndex::greedy_descend_masked`]）が
+    /// `hop == HopMode::TwoHop` のときのみ、非受理隣接（橋渡しノード）越しに
+    /// 2-hop 先の受理ノードへ移動できることを固定する。`OneHop` はこれまで
+    /// どおり非受理隣接を無視して起点に留まる（ビット同一契約）。
+    ///
+    /// グラフ形状: node0（level1・受理・起点）--level1--> node1（level1・
+    /// **非受理**・橋渡し）--level1--> node2（level1・受理・遠方だがスコアが
+    /// 高い）。`greedy_descend_masked` はレベル 1 の降下 1 回分のみを検査する
+    /// （呼び出し元 `search_masked_with_hop`／`search_masked_resumable_start`
+    /// が層ごとに繰り返し呼ぶ設計そのものは無変更）。
+    #[test]
+    fn greedy_descend_masked_two_hop_bridges_to_a_better_candidate_via_a_rejected_neighbor() {
+        let dim = 1usize;
+        // dim=1 の `dot(v, q) = v[0] * q[0]`・`q=[1.0]` なのでスコアは値そのもの。
+        // node1（橋渡し）の値は非受理のため一切参照されない前提でわざと
+        // 「スコアだけ見れば最良」の値を入れ、I1（非受理ノードのベクトル非
+        // 参照）を壊していれば誤って選ばれてしまう構図にする。
+        let vectors: Vec<f32> = vec![5.0, 999.0, 50.0];
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
+                Node {
+                    level: 1,
+                    links: vec![Vec::new(), vec![1]],
+                },
+                Node {
+                    level: 1,
+                    links: vec![Vec::new(), vec![2]],
+                },
+                Node {
+                    level: 1,
+                    links: vec![Vec::new(), Vec::new()],
+                },
+            ],
+            Some(0),
+            Arc::from(vectors),
+        );
+        let query = [1.0f32];
+
+        let mut mask = NodeMask::new(index.len());
+        mask.set(0);
+        mask.set(2);
+        // node1（橋渡し）は非受理のまま。
+
+        let source: &dyn NodeSource = &index.vectors;
+
+        let mut bridges_one_hop = 0u64;
+        let result_one_hop = index
+            .greedy_descend_masked(
+                0,
+                &query,
+                1,
+                dim,
+                source,
+                Some(&mask),
+                HopMode::OneHop,
+                &mut bridges_one_hop,
+            )
+            .expect("one-hop descend should succeed");
+        assert_eq!(
+            result_one_hop,
+            Some(0),
+            "OneHop must stay at node0: node1 is rejected and must not be used as a bridge"
+        );
+        assert_eq!(
+            bridges_one_hop, 0,
+            "OneHop must never count descent bridges"
+        );
+
+        let mut bridges_two_hop = 0u64;
+        let result_two_hop = index
+            .greedy_descend_masked(
+                0,
+                &query,
+                1,
+                dim,
+                source,
+                Some(&mask),
+                HopMode::TwoHop,
+                &mut bridges_two_hop,
+            )
+            .expect("two-hop descend should succeed");
+        assert_eq!(
+            result_two_hop,
+            Some(2),
+            "TwoHop must bridge through the rejected node1 to reach node2              (score 50 > node0's score 5)"
+        );
+        assert_eq!(
+            bridges_two_hop, 1,
+            "exactly one 2-hop node (node2) was accepted and scored via bridging"
+        );
+    }
+
+    /// I1（ベクトル非参照・P0・不変）の機械検証（降下版）: `greedy_descend_masked`
+    /// の `TwoHop` ブリッジ降下が `score` を呼ぶのは受理ノード（起点・2-hop
+    /// 先の受理ノード）のみであり、橋渡し役の非受理ノードへは一度も呼ばれない
+    /// ことを固定する。非 vacuous（受理 2-hop ノードへの呼び出しは 1 件以上）
+    /// も確認する。
+    #[test]
+    fn greedy_descend_masked_two_hop_never_scores_the_bridge_node() {
+        let dim = 1usize;
+        let vectors: Vec<f32> = vec![5.0, 999.0, 50.0];
+        let index = index_from_nodes(
+            HnswParams::default(),
+            dim as u32,
+            vec![
+                Node {
+                    level: 1,
+                    links: vec![Vec::new(), vec![1]],
+                },
+                Node {
+                    level: 1,
+                    links: vec![Vec::new(), vec![2]],
+                },
+                Node {
+                    level: 1,
+                    links: vec![Vec::new(), Vec::new()],
+                },
+            ],
+            Some(0),
+            Arc::from(vectors),
+        );
+        let query = [1.0f32];
+
+        let mut mask = NodeMask::new(index.len());
+        mask.set(0);
+        mask.set(2);
+
+        let source = RecordingNodeSource {
+            inner: &index.vectors,
+            scored: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut bridges = 0u64;
+        let result = index
+            .greedy_descend_masked(
+                0,
+                &query,
+                1,
+                dim,
+                &source,
+                Some(&mask),
+                HopMode::TwoHop,
+                &mut bridges,
+            )
+            .expect("two-hop descend should succeed");
+        assert_eq!(result, Some(2));
+        let scored = source.scored.into_inner();
+        assert!(
+            scored.contains(&0) && scored.contains(&2),
+            "score must be called for accepted nodes (non-vacuous): {scored:?}"
+        );
+        assert!(
+            !scored.contains(&1),
+            "score must never be called for the rejected bridge node1 (I1 invariant): {scored:?}"
+        );
+    }
+
+    /// `two_hop_effective_ef`（Issue #680）: 純粋関数の境界値・クランプ規則を
+    /// 固定する。
+    #[test]
+    fn two_hop_effective_ef_clamps_scale_and_upper_bound() {
+        // 基本形: `visible` が `node_count` の 1/4 なら scale=4。
+        assert_eq!(two_hop_effective_ef(64, 10, 1000, 250), 64 * 4);
+        // `ef < k` は `ef.max(k)` を先に適用してから倍率をかける。
+        assert_eq!(two_hop_effective_ef(4, 64, 1000, 250), 64 * 4);
+        // `visible == 0`（呼び出し元の到達可能性検査で通常到達しないが、
+        // 防御的にゼロ除算を避け `base` をそのまま返す）。
+        assert_eq!(two_hop_effective_ef(64, 10, 1000, 0), 64);
+        // scale は `ACORN_EF_SCALE_MAX` でクランプされる（可視比率が既定域
+        // より極端に低い場合の安全弁）。
+        let scaled = two_hop_effective_ef(64, 10, 1_000_000, 1);
+        assert_eq!(scaled, 64 * ACORN_EF_SCALE_MAX);
+        // 最終結果は `MAX_EF` でもクランプされる（二重の安全弁）。
+        let capped = two_hop_effective_ef(MAX_EF, 10, 1_000_000, 1);
+        assert_eq!(capped, MAX_EF);
+        // オーバーフロー耐性: 巨大な `node_count`／小さい `visible` でも
+        // panic せず `saturating_mul`／`div_ceil` で有限値に収まる。
+        let huge = two_hop_effective_ef(MAX_EF, MAX_EF, usize::MAX, 1);
+        assert_eq!(huge, MAX_EF);
     }
 
     /// `accept == None` のとき `HopMode::TwoHop` は `HopMode::OneHop`・

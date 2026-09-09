@@ -1458,6 +1458,112 @@ private 行には可視ラベル `'v'` を付与し（`seed_private_tenant_b` �
 - `full_scan_ratio`／`acorn_max_visible_ratio` の既定値変更: 引き続き
   オーナー判断（「Issue #502」節・「Issue #659」節と同じ申し送り）
 
+## Issue #680: ACORN TwoHop 経路の Recall 改善（上位層降下のマスク対応・ef 底上げ）
+
+### 背景
+
+Issue #674 Phase 2 の実測（均等分散マスク・25,000 行・並列構築）で
+TwoHop 経路の Recall@10 が 0.35 まで低下する run が観測された一方、
+Issue #679 が固定した決定的フィクスチャ（`Whole{clusters=1}`・可視比率
+1/6）では TwoHop 到達時の Recall@10 が既に 0.9750（`OneHop` と同値）で
+受け入れ基準（≥ 0.9）を満たしていた——このフィクスチャ単体では「未達 →
+改善」の証明にならない（vacuous pass の危険）。本 Issue は原因候補として
+Issue #501 の設計判断 D2（「上位層降下は層 0 起点選択にしか関与せず
+Recall への寄与が薄い」という前提）が低可視比率域では未検証だった点、
+および TwoHop 経路の `ef` が OneHop と同じ据え置きのままだった点を挙げる。
+
+### 変更内容
+
+1. **上位層降下のマスク対応ブリッジ**（`hnsw.rs::greedy_descend_masked`）:
+   `hop == HopMode::TwoHop` かつ `mask` が `Some` のときに限り、非受理の
+   隣接ノードを 1 段だけ橋渡しの中継点として使い、その先（2-hop 先）の
+   受理ノードもこの層の降下候補に含める。橋渡しノード自身・非受理の
+   2-hop ノードは一切スコア計算しない（I1 不変）。`hop == HopMode::OneHop`
+   または `mask == None` のときは既存ループとバイト単位で同一の計算列を
+   辿る（`search_masked_none_matches_search`・
+   `search_masked_two_hop_matches_search_when_mask_is_none` のビット同一
+   契約は無変更のまま green）。
+2. **TwoHop 限定の実効 `ef` 底上げ**（`hnsw.rs::two_hop_effective_ef`）:
+   可視比率の逆数（`node_count.div_ceil(visible)`）に応じて `ef.max(k)` を
+   最大 `ACORN_EF_SCALE_MAX`（実装既定値 8）倍まで底上げする純粋関数。
+   `MAX_EF` でも二重にクランプする（`--hnsw-full-scan-ratio` 等の CLI
+   opt-in で可視比率の下限が既定域から外れても `ef_eff` が無制限に膨らま
+   ない安全弁）。`hop == HopMode::TwoHop` かつ `mask` が `Some` のときのみ
+   適用し、OneHop・`mask == None` は従来どおり `ef.max(k)` のまま。
+3. **診断統計**: `HnswSearchScratch::last_acorn_descent_bridges`・
+   `sql::hnsw_cache::HnswIndexCacheStats::acorn_descent_bridges` を追加
+   （層 0 の `bridge_expand` が数える `acorn_expansions` とは独立の
+   カウンタ。Issue #681 が `acorn_expansions` の意味〔層 0 受理件数〕を
+   閾値判定に使う前提を崩さないため）。`EXPLAIN` へは非露出（`full_scan_
+   ratio` と同区分）。
+
+`sql::hnsw_cache`（`finish_indexed_search`）・`search_masked_resumable_start`
+（`HopMode::TwoHop` を引き続き拒否・降下呼び出しには `HopMode::OneHop` を
+明示）・`SearchProvider` trait・`NodeSource` trait はいずれも無変更。
+追加依存なし・`unsafe` 追加なし。
+
+### 検証
+
+- **ビット同一（OneHop／マスクなし）**: `search_masked_none_matches_search`・
+  `search_masked_two_hop_matches_search_when_mask_is_none`・
+  `resumable_start_matches_search_masked_bit_identical`・
+  `search_masked_two_hop_reads_each_node_adjacency_at_most_once` を含む
+  既存 92（`--lib`）／95（`--all-features`）本の `hnsw::` 単体テストが
+  無変更のまま green（コード自体は変更前後でこれらの経路を素通りしない
+  設計のため、これらのテストが green であること自体が OneHop 側の非退行
+  を機械的に保証する）。
+- **単体テスト（新規・手組みグラフ）**:
+  `greedy_descend_masked_two_hop_bridges_to_a_better_candidate_via_a_
+  rejected_neighbor`（上位層で OneHop は起点に留まり TwoHop は橋渡し
+  ノード越しにより良い候補へ移動することを固定）・
+  `greedy_descend_masked_two_hop_never_scores_the_bridge_node`（I1: 橋渡し
+  ノード自身への `score` 呼び出しが 0 件・受理 2-hop ノードへは 1 件以上の
+  非 vacuous な検証）・`two_hop_effective_ef_clamps_scale_and_upper_bound`
+  （境界値・`ACORN_EF_SCALE_MAX`／`MAX_EF` クランプ・`saturating_mul`に
+  よるオーバーフロー非発生を固定）を追加。
+- **統合テスト**（`crates/engine/tests/hnsw_acorn_recall.rs`。層 B・
+  `#[ignore]`・`make hnsw-acorn-twohop-runs` 相当）: `Whole{clusters=1}`
+  TwoHop 到達時に Recall@10 ≥ 0.9 を assert する形へ変更し、
+  `acorn_descent_bridges` を報告列へ追加。本開発環境（共有 QEMU・release
+  ビルド・25,000 行・dim128）での実測（3 run 連続）:
+
+  | run | shape | arm | recall@10 | acorn_expansions | acorn_expansions/query | acorn_descent_bridges |
+  | --- | ----- | --- | --------- | ----------------- | ----------------------- | ---------------------- |
+  | 0〜2 | `whole{clusters=1}` | one_hop | 0.9750（不変） | 0 | 0.00 | 0 |
+  | 0〜2 | `whole{clusters=1}` | two_hop（改善前・#679 記録値） | 0.9750 | 61 | 3.05 | — |
+  | 0〜2 | `whole{clusters=1}` | two_hop（改善後） | **1.0000** | 268 | 13.40 | **262** |
+
+  TwoHop の Recall@10 が改善前の 0.9750 から **1.0000** へ向上し、
+  `acorn_descent_bridges`（262・3 run とも同値）が非 vacuous であることを
+  確認した——`ef` 底上げにより層 0 の `bridge_expand` 展開件数
+  （`acorn_expansions`）も 61→268 へ増え、より広いビームで探索したことが
+  Recall 向上に寄与したと考えられる。`Whole{2}`／`Striped` 形状は
+  引き続き `mask_splits_graph`（plain scan 縮退）のため TwoHop 未到達
+  （Issue #679 の記録どおり不変）。3 run とも数値が完全一致しており、
+  同一構築（`op_tag` に `run` を含めるため run 毎に別 DB を構築するが、
+  シードが決定的なため）由来のばらつきなしと判断する。
+- **決定性・停止性**: 降下ループは `current_best` の厳密な改善でのみ
+  継続する既存の停止条件を変えていない（橋渡し降下は 1 反復あたり高々
+  `M_level × M_level` 回のスコア計算を追加するのみ）。`two_hop_effective_ef`
+  は `saturating_mul`／`div_ceil`・二重クランプによりオーバーフロー・
+  無制限膨張のいずれも起こさない（単体テストで固定）。
+- **レイテンシへの影響**: `ef` 底上げは TwoHop 経路のレイテンシを増加
+  させるトレードオフを伴う（層 0 探索が広いビームを辿るため）。本 Issue の
+  スコープでは Recall 改善を優先し、専有環境でのレイテンシ前後比較・
+  `ACORN_EF_SCALE_MAX` 既定値（8）の妥当性の最終確認はオーナー実測へ
+  申し送る（「Issue #502」節・「Issue #659」節と同じ申し送り方針）。
+
+### 対象外・申し送り
+
+- 展開過多時の fail-closed 縮退ガード: Issue #681（`acorn_expansions` の
+  意味を層 0 限定のまま据え置いたのはこのため）
+- `ACORN_EF_SCALE_MAX`（実装既定値 8）の専有環境での前後比較実測・
+  最終確定: オーナー作業
+- 層 0 初期候補の拡充（計画の変更 C・段階 2）: 変更 A＋B のみで受け入れ
+  基準（Recall ≥ 0.9・非劣化）を満たしたため未実施
+- `Whole{2}` が並列構築で分断する原因の深掘り: Issue #679 からの申し送り
+  のまま不変
+
 ## スコープ外・申し送り
 
 - ~~不足時の `ef` 倍増再探索（iterative scan）・hybrid 密側の ANN 化と
