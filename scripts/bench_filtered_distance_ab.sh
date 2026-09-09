@@ -32,6 +32,11 @@
 # 変更しない。呼び出し元は人間の運用者（本ベンチは spec 閾値を持たない
 # 情報提供専用のため CI 非配線・手動実行専用）。
 #
+# Issue #682（W 系列 `#[inline(never)]` 抽出前後比較）にも同じ骨格を流用する。
+# `AB_AFTER_ONLY_SELECTIVITY=""`・`OUT_DIR=docs/design/bench-data/scan-w-series-inline-ab`
+# を指定すれば after-only 段（選択率 33% 相当）を省略し W1/W2/diff(W1->W2) の
+# ペア比較のみを行える（ロジック自体は本スクリプト無変更のまま流用）。
+#
 # 使い方:
 #   BEFORE_DIR=<path> AFTER_DIR=<path> \
 #   BEFORE_COMMIT=<sha> AFTER_COMMIT=<sha> \

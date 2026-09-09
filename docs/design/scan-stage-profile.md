@@ -1,7 +1,7 @@
 # ADR: `agg_count`／`rls_isolation`／`vector_knn_where` の段別プロファイル
 
 - ステータス: Accepted
-- 対応 Issue: #464（親 #456・ルート #455）。A 系列バイナリ配置アーティファクトの是正・基線再取得は Issue #635（親 #631・ルート #629）
+- 対応 Issue: #464（親 #456・ルート #455）。A 系列バイナリ配置アーティファクトの是正・基線再取得は Issue #635（親 #631・ルート #629）。W 系列の同種是正（`#[inline(never)]` 独立関数抽出・W2 +17% の配置起因確定）は Issue #682（親 #675・ルート #672）
 - 関連ポインタ: TASK-83（SQL 表層性能受け入れ基準）・TASK-158（性能計測プロトコル基盤）・SQL-13（集計関数）・Issue #350（集計経路のデコードスキップ）・Issue #478（`VisibleBitmapCache`。A0a/A0b の e2e 値が本 doc 初版から大きく変わった要因）・`docs/design/crossdb-bench.md`・`docs/design/knn-stage-profile.md`（Issue #362 の先行事例）・`docs/design/knn-wire-stage-profile.md`（Issue #463 の先行事例）・`docs/design/benchmark-judgement-policy.md`（計測規約）・`docs/design/visible-bitmap-cache.md`
 
 ## 背景
@@ -54,6 +54,8 @@ A1〜A5 の計測対象本体（`run()` へ渡すクロージャの中身）は 
 | W2 `predicate` | W1 ＋ `lang = 'ja'` 判定（`declarative_filter::matches_all`） |
 | W3 `arena_copy` | W2 一致行の embedding を連続 `Vec<f32>` へ複製 |
 | W4 `provider_search` | 一致行のみへ `ParallelSearchProvider::search`（k=10） |
+
+W1・W2 の計測対象本体は `scan_stage_profile_bench.rs` 内のトップレベル関数（`stage_w1_scalar_scan`／`stage_w2_predicate`）へ `#[inline(never)]` 付きで分離している（Issue #682。A 系列と同じ設計・分離理由は上記「A1〜A5 の計測対象本体は…」を参照。W3／W4 は本 Issue の対象外のまま `run()` へ渡す無名クロージャの形で残置している）。
 
 `W0c`（e2e cold・`SqlArenaCache` を毎サンプル空の状態から測る）・`W0h`（e2e hot）・`W0n`（`WHERE` なしの同形 KNN。cache fast path）を e2e として測定する。`R_dot`（全可視行への逐次内積総和。Top-k なし）を参照区間（変更を含まない区間）として用い、複数ラウンド中央値の `(max-min)/min` をノイズ帯判定の実測帯とする（`docs/design/benchmark-judgement-policy.md` §4）。`W0h` と `W0n` は dense 探索の候補集合サイズが異なる（`W0n` は可視行全体、`W0h` は事前フィルタ後の一致行のみ）ため、`W0h − W0n` を「SQL 表層内の `WHERE` 上乗せ」として単純に報告することはできない（詳細は下記「W0-hot と W0-nowhere の候補集合差」節）。候補集合を揃えた `WHERE` 上乗せの内訳は W1〜W3（一致行のみを対象とする一貫した集合）で測る。
 
@@ -109,11 +111,99 @@ min-of-N: A=1.165ms・B=1.162ms（比 0.997・-0.3%）。median-of-N: A=1.203ms�
 - `#[inline(never)]` 分離後も A1 の絶対値は 38.9 ns/row 付近へは戻らない（後述「実測結果」の 49.9 ns/row 前後が現行ハーネスでの正しい基線）。これは A0c（#478 実装のための対照計測）自体が撤去されたわけではなく、あくまで分離後のバイナリでは A0c ブロックのコードサイズ差に対して A1 の計測値が摂動テストの範囲では有意に変化しなかった、という意味であることに注意（分離前の同条件対照は取得していないため、構造変更が配置感度を下げたこと自体を断定するものではない。過去の 38.9 ns/row との差は「退行」ではなく「異なるバイナリでの測定値」）。
 - 以降のこの doc の実測値は、この構造変更を適用した現行ハーネス（`crates/engine/benches/scan_stage_profile_bench.rs`）での再取得値へ全面的に置き換える。
 
+## W 系列バイナリ配置アーティファクト（Issue #682）
+
+2026-09-09 の再計測（Issue #672 のトラッキング）で、`scan_stage_profile_bench` の
+`W2`（`predicate`）が 17.4 → 20.3〜20.5 ns/row（約 +17%・4 run 一貫）へ悪化して
+見える所見が得られた一方、`W1`（`scalar_scan`）は不変だった。しかし `W2` が呼ぶ
+`row_codec::scan_scalar_columns`・`declarative_filter::matches_all` は
+`773a835..997cf00` 区間でバイト単位無変更（`git diff 773a835 997cf00 --
+crates/engine/src/row_codec.rs crates/engine/src/declarative_filter.rs` が空）
+であり、同区間で変更された production 5 ファイル
+（`arena.rs`／`kernel.rs`／`parallel_search.rs`／`sql/exec.rs`／
+`sql/scalar_index.rs`）は `W2` の呼び出しグラフに含まれない。一方でベンチ本体
+（`scan_stage_profile_bench.rs`）は同区間で +914 行、harness（`benches/harness/
+scan_stage_profile.rs`）は +169 行増量しており、`W1`／`W2` は A 系列
+（Issue #635）と異なり `#[inline(never)]` 分離されておらず `main()` 内クロージャ
+として `run()` へ渡されていたため、A 系列と同型の**バイナリ配置アーティファクト**
+が最有力仮説だった。
+
+### 抽出前後の A/B（本 Issue の対応。AC1）
+
+上記「段の定義 › W 系列」のとおり `W1`／`W2` の計測対象本体を `stage_w1_scalar_scan`／
+`stage_w2_predicate`（`#[inline(never)]`）へ抽出したうえで、抽出前（`997cf00`。
+本 doc の実測結果節も同一基線）／抽出後（本 Issue の変更適用後）の 2 本の
+`scan_stage_profile_bench` バイナリを、独立ソースツリー・独立
+`CARGO_TARGET_DIR`（`scripts/bench_filtered_distance_ab.sh` と同型の骨格）で
+`BENCH_SCAN_PROFILE_SCALE=1`・`BENCH_SCAN_PROFILE_ROUNDS=5` として交互 N=5 ペア
+実測した（`docs/design/benchmark-judgement-policy.md` §3〜§4 準拠。生データ・
+`env.txt`／`loadavg.log` は `docs/design/bench-data/scan-w-series-inline-ab/`）。
+
+| 指標 | before min-of-N | before median-of-N | after min-of-N | after median-of-N | ratio(after/before, min) | 参照帯 | 判定 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| W1_scalar_scan ns/row | 13.6 | 13.7 | 13.5 | 13.6 | 0.9926 | 49.33% | within_band |
+| W2_predicate ns/row | 20.0 | 20.1 | 18.5 | 18.6 | 0.9250 | 49.33% | within_band |
+| W1→W2 diff ns/row | 6.3 | 6.4 | 4.8 | 5.0 | 0.7619 | 49.33% | within_band |
+| e2e(vector_knn_where/W0-hot) ms | 0.3310 | 0.3410 | 0.3260 | 0.3410 | 0.9849 | 49.33% | within_band |
+| e2e(vector_knn_where/W0-cold) ms | 14.2040 | 14.4760 | 14.2410 | 14.3120 | 1.0026 | 49.33% | within_band |
+| R_dot_kernel_distance_only（参照区間） ms | 0.1760 | 0.1770 | 0.1770 | 0.1790 | 1.0057 | 49.33% | within_band |
+| vector_knn.W0-nowhere（参照区間） ms | 0.6100 | 0.6330 | 0.5960 | 0.6260 | 0.9770 | 49.33% | within_band |
+
+環境: 共有 QEMU（CPU model `QEMU Virtual CPU version 2.5+`・`nproc`=12・
+`BENCH_DEDICATED_ENV` 未設定）。参照区間実測帯（`vector_knn.W0-nowhere`・
+`R_dot` の before+after 10 run プールでの `(max-min)/min`）が 49.33% と非常に
+広く（`benchmark-judgement-policy.md` §4 の判定基準では両ノイズ帯を超える
+確定的な `improved` 判定には至らない環境ノイズ床）、`W2` の after min-of-N
+（18.5 ns/row）は `before` の 20.0 ns/row からは下がったものの、Issue #672 が
+指摘した悪化前の基線（17.4 ns/row）へ明確に戻ったとは言えない——上記判定表
+（本 Issue 計画）の「抽出は中立。+17% は『`main()` へのインライン化』では説明
+できない」区分に該当するため、下記の `objdump`／`nm` による配置比較を実施した。
+
+この A/B だけでは「production が無罪」を直接証明できない点は Issue #635 と同じ
+限界を持つ（`773a835` 時点のベンチファイルを HEAD 相当の engine API へそのまま
+コンパイルできるかは未確認のため、旧ベンチ＋現行 production という第 3 アームは
+本 Issue では実施していない）。
+
+### `matches_all`／`scan_scalar_columns` の配置比較（AC2。`773a835` vs `997cf00`）
+
+`773a835`（W2 +17% 観測前）・`997cf00`（観測後）2 本の `scan_stage_profile_bench`
+バイナリ（いずれも本 Issue の抽出を含まない、素の各コミット時点のベンチファイル）
+を同じ独立ソースツリー方式でビルドし、`nm -C -S`・`objdump -d --no-show-raw-insn -C`
+でシンボルの有無・サイズ・配置アライメントを比較した。
+
+| シンボル | 773a835 サイズ | 997cf00 サイズ | 773a835 addr mod 32 | 997cf00 addr mod 32 |
+| --- | --- | --- | --- | --- |
+| `engine::declarative_filter::matches_all` | 0xb8 | 0xb8（同一） | 16 | 0（32byte 整列） |
+| `engine::row_codec::scan_scalar_columns` | 0x9 | 0x9（同一） | 16 | 0（32byte 整列） |
+| `engine::row_codec::scan_scalar_columns_masked` | 0x73d | 0x73d（同一） | 0（32byte 整列） | 16 |
+| `scan_stage_profile_bench::harness::…::scan_scalar_columns`（ラッパー） | 0x16e | 0x16e（同一） | 0（32byte 整列） | 16 |
+
+いずれの関数もサイズは 2 コミット間で完全一致（`row_codec.rs`／
+`declarative_filter.rs` がバイト単位無変更であることと整合し、関数本体自体に
+コード変更が無いことを裏付ける）。一方でリンク後のアドレスのアライメント
+（mod 32）は関数ごとに 773a835/997cf00 で入れ替わっており、コード自体を一切
+変えていなくても周辺コード（`main()` の増量）の影響でリンカが選ぶ配置が動く
+ことを確認した。また `nm -C` で `matches_lang_filter`（W2 述語判定の呼び出し
+元・harness 側の小関数）のシンボルは 773a835・997cf00 いずれにも存在せず
+（`#[inline(never)]` 抽出前は常にインライン化され、`main()` の巨大な関数本体へ
+埋め込まれていたことを示す）——これは本 Issue の抽出（`stage_w2_predicate`）が
+対処する対象そのものであり、抽出前の `W2` 計測区間が `main()` 全体の配置に
+連動していたという仮説と整合する。
+
+**結論（観測事実に留め、因果を断定しない。Issue #635 と同じ慎重さ）**: `matches_all`
+等の呼び出される関数自体はビット単位で無変更のままアライメントだけが動いており、
+配置アーティファクト仮説を否定する材料は無い。ただし本 Issue の抽出後もなお
+`W2` が旧基線（17.4 ns/row）へ明確に回帰しなかった A/B 結果（上表）と合わせると、
+「`#[inline(never)]` 抽出だけで配置感度を完全に無くせる」とまでは言えず（A 系列
+の Issue #635「結論」節と同じ限界）、共有 QEMU 環境のノイズ床（参照帯 49.33%）が
+測定を支配的に覆っている可能性が高いと判断する。専有環境での再実測をオーナーへ
+申し送る。
+
 ## 実測結果
 
-計測環境: 共有 QEMU 環境（`docs/design/benchmark-judgement-policy.md` §5 の区分に従い**参考値**。専有環境での再実測は運用者作業）。`lscpu` Model name: `QEMU Virtual CPU version 2.5+`・`nproc`=12・`isa=Avx2Fma`・計測時 `loadavg` ≈ 2.0〜2.3（scale=1・scale=4 とも 1 プロセス = 1 規模点で逐次実行。並列実行中の他 Issue のビルドジョブが同時に高負荷を出す時間帯があったため、A/B 摂動テスト実測時（`loadavg` ≈ 6〜9）とは別のタイミングで低負荷を確認して実施）・`BENCH_DEDICATED_ENV` 未設定。ラウンド数: 既定 5。実測日: 2026-09-08（Issue #635）。
+計測環境: 共有 QEMU 環境（`docs/design/benchmark-judgement-policy.md` §5 の区分に従い**参考値**。専有環境での再実測は運用者作業）。`lscpu` Model name: `QEMU Virtual CPU version 2.5+`・`nproc`=12・`isa=Avx2Fma`・計測時 `loadavg` ≈ 2.0〜4.1（scale=1・scale=4 とも 1 プロセス = 1 規模点で逐次実行）・`BENCH_DEDICATED_ENV` 未設定。ラウンド数: 既定 5。実測日: 2026-09-08（Issue #635 基線）・2026-09-09（W 系列を Issue #682 の抽出後バイナリで再取得）。
 
-**再測定の経緯**: 本節の実測値は 2 段階の再測定を経ている。(1) 初回実測は codex-review／Cursor Bugbot 指摘（PR #555・P1）により、`A4`／`A5` が `A3` と同じキー/ヘッダ tenant 整合検査（`verify_row_key_tenant_reimpl`）を省いており累積段契約（A3 ⊆ A4 ⊆ A5）が成立していなかったことが判明したため、`A4`／`A5` へ同検査を追加したうえで再測定した。(2) その後 PR #586 適用後は A1 が上記「#586 後の A 系列バイナリ配置アーティファクト」節のとおりバイナリ配置アーティファクトの影響を受けていたため、`#[inline(never)]` 分離（Issue #635）を適用したうえで再測定した。下記は Issue #635 適用後の実測値（A0a／A0b の e2e 値は #478 `VisibleBitmapCache` 実装後の高速経路値へも同時に置き換わっている）。
+**再測定の経緯**: 本節の実測値は 3 段階の再測定を経ている。(1) 初回実測は codex-review／Cursor Bugbot 指摘（PR #555・P1）により、`A4`／`A5` が `A3` と同じキー/ヘッダ tenant 整合検査（`verify_row_key_tenant_reimpl`）を省いており累積段契約（A3 ⊆ A4 ⊆ A5）が成立していなかったことが判明したため、`A4`／`A5` へ同検査を追加したうえで再測定した。(2) その後 PR #586 適用後は A1 が上記「#586 後の A 系列バイナリ配置アーティファクト」節のとおりバイナリ配置アーティファクトの影響を受けていたため、`#[inline(never)]` 分離（Issue #635）を適用したうえで再測定した。(3) Issue #682 で `W1`／`W2` を同じく `#[inline(never)]` 抽出したため、W 系列列（および同一ラウンドで輪番実行される A 系列列）を再取得した（A 系列の計測対象コード自体は Issue #682 で無変更・値の変化は run-to-run 差の範囲内）。下記は Issue #682 適用後の実測値（A0a／A0b の e2e 値は #478 `VisibleBitmapCache` 実装後の高速経路値へも同時に置き換わっている）。
 
 ### 25,000 行（`BENCH_SCAN_PROFILE_SCALE=1`。tenant-a 23,000・tenant-b 2,000）
 
@@ -121,33 +211,42 @@ per-round 生値（ms）:
 
 | round | A1 | A2 | A3 | A4 | A5 | W1 | W2 | W3 | W4 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | 1.226 | 1.406 | 1.552 | 1.715 | 1.788 | 0.311 | 0.402 | 0.483 | 0.097 |
-| 1 | 1.248 | 1.397 | 1.591 | 1.725 | 1.788 | 0.313 | 0.404 | 0.472 | 0.108 |
-| 2 | 1.246 | 1.390 | 1.550 | 1.715 | 1.800 | 0.319 | 0.405 | 0.470 | 0.096 |
-| 3 | 1.248 | 1.396 | 1.551 | 1.717 | 1.788 | 0.319 | 0.404 | 0.469 | 0.093 |
-| 4 | 1.249 | 1.413 | 1.556 | 1.714 | 1.784 | 0.315 | 0.405 | 0.471 | 0.097 |
+| 0 | 0.986 | 1.085 | 1.235 | 1.353 | 1.440 | 0.321 | 0.405 | 0.485 | 0.119 |
+| 1 | 0.956 | 1.069 | 1.236 | 1.356 | 1.426 | 0.322 | 0.407 | 0.477 | 0.118 |
+| 2 | 0.961 | 1.071 | 1.253 | 1.369 | 1.404 | 0.315 | 0.407 | 0.486 | 0.109 |
+| 3 | 0.957 | 1.080 | 1.228 | 1.367 | 1.432 | 0.316 | 0.408 | 0.479 | 0.122 |
+| 4 | 0.962 | 1.092 | 1.247 | 1.375 | 1.430 | 0.320 | 0.409 | 0.483 | 0.124 |
+
+（Issue #682 の `#[inline(never)]` 抽出後に本表全体を再取得した。`A1`〜`A5` 列自体は
+`#[inline(never)]` 抽出の対象外だが、同一ラウンドで A 系列・W 系列を輪番実行する
+ため、W 系列再測定に合わせて A 系列列も同一 run のペア値へ更新している——値は
+Issue #635 の基線と同水準〔共有 QEMU 環境の run-to-run 差の範囲内〕。）
 
 median-of-R（ms・min-of-R）・ns/row・段差分:
 
 | 段 | median | min-of-R | ns/row | 差分元 | diff ns/row | ratio | 帯判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| A1 redb_scan | 1.248 | 1.226 | 49.9 | — | — | — | — |
-| A2 header_decode | 1.397 | 1.390 | 55.9 | A1→A2 | 6.0 | 11.93% | within |
-| A3 rls_visible | 1.552 | 1.550 | 62.1 | A2→A3 | 6.2 | 11.13% | within |
-| A4 dim_meta_decode | 1.715 | 1.714 | 68.6 | A3→A4 | 6.5 | 10.52% | within |
-| A5 scalar_validate | 1.788 | 1.784 | 71.5 | A4→A5 | 2.9 | 4.22% | within |
+| A1 redb_scan | 0.961 | 0.956 | 38.4 | — | — | — | — |
+| A2 header_decode | 1.080 | 1.069 | 43.2 | A1→A2 | 4.8 | 12.41% | within |
+| A3 rls_visible | 1.236 | 1.228 | 49.4 | A2→A3 | 6.2 | 14.46% | within |
+| A4 dim_meta_decode | 1.367 | 1.353 | 54.7 | A3→A4 | 5.2 | 10.56% | within |
+| A5 scalar_validate | 1.430 | 1.404 | 57.2 | A4→A5 | 2.5 | 4.61% | within |
 
-e2e: `A0a`（agg_count）median=0.050ms・`A0b`（rls_isolation）median=0.050ms（両者一致。#478 `VisibleBitmapCache` のヒット高速経路値——`docs/design/visible-bitmap-cache.md` 参照）。`A0c-cold`（毎サンプル新規 `Storage::open` を含む cold `COUNT(*)`。`VisibleBitmapCache` のミス経路対照値）median=6.561ms（sample minimum, N=20: 6.385ms）。
+e2e: `A0a`（agg_count）median=0.050ms・`A0b`（rls_isolation）median=0.050ms（両者一致。#478 `VisibleBitmapCache` のヒット高速経路値——`docs/design/visible-bitmap-cache.md` 参照）。`A0c-cold`（毎サンプル新規 `Storage::open` を含む cold `COUNT(*)`。`VisibleBitmapCache` のミス経路対照値）median=6.413ms（sample minimum, N=20: 6.279ms）。（Issue #682 の W 系列再測定に伴い、A 系列列も同一 run のペア値へ更新——run-to-run 差の範囲内であり Issue #635 の帰結を変更するものではない。）
 
 | 段 | median | min-of-R | ns/row（分母=可視 23,000 行） | 差分元 | diff ns/row | ratio | 帯判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| W1 scalar_scan | 0.315 | 0.311 | 13.7 | — | — | — | — |
-| W2 predicate | 0.404 | 0.402 | 17.6 | W1→W2 | 3.9 | 28.35% | above |
-| W3 arena_copy | 0.471 | 0.469 | 20.5 | W2→W3 | 2.9 | 16.52% | within |
-| W4 provider_search（一致 4,600 行） | 0.097 | 0.093 | — | — | — | — | — |
-| R_dot（参照区間） | 0.188 | 0.188 | — | — | — | reference_band=20.82% | — |
+| W1 scalar_scan | 0.320 | 0.315 | 13.9 | — | — | — | — |
+| W2 predicate | 0.407 | 0.405 | 17.7 | W1→W2 | 3.8 | 27.35% | above |
+| W3 arena_copy | 0.483 | 0.477 | 21.0 | W2→W3 | 3.3 | 18.71% | above |
+| W4 provider_search（一致 4,600 行） | 0.119 | 0.109 | — | — | — | — | — |
+| R_dot（参照区間） | 0.195 | 0.174 | — | — | — | reference_band=14.55% | — |
 
-e2e: `W0-cold`=14.540ms・`W0-hot`=0.660ms・`W0-nowhere`=0.599ms。raw diff（`W0-hot − W0-nowhere`）= 0.061ms（下記「W0-hot と W0-nowhere の候補集合差」節の注意を参照——このままでは「SQL 表層内の `WHERE` 上乗せ」として単純には解釈できない）。
+e2e: `W0-cold`=14.150ms・`W0-hot`=0.350ms（min-of-R=0.347ms）・`W0-nowhere`=0.604ms。raw diff（`W0-hot − W0-nowhere`）は前節の理由により「`WHERE` 上乗せ」として単純には解釈できない（下記「W0-hot と W0-nowhere の候補集合差」節参照）。
+
+（Issue #682 の `#[inline(never)]` 抽出後に本表を再取得した。抽出前〔`997cf00`〕
+との交互 A/B 比較は上記「W 系列バイナリ配置アーティファクト（Issue #682）」節を
+参照——本表の絶対値単独では帯判定が変化しても、それを抽出の効果と断定しない。）
 
 ### 100,000 行（`BENCH_SCAN_PROFILE_SCALE=4`。tenant-a 92,000・tenant-b 8,000）
 
@@ -155,33 +254,37 @@ per-round 生値（ms）:
 
 | round | A1 | A2 | A3 | A4 | A5 | W1 | W2 | W3 | W4 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | 4.791 | 6.179 | 7.501 | 7.450 | 7.903 | 1.257 | 1.835 | 3.099 | 0.219 |
-| 1 | 4.764 | 6.219 | 6.812 | 7.514 | 7.831 | 1.250 | 1.837 | 3.144 | 0.203 |
-| 2 | 4.844 | 6.191 | 6.857 | 7.482 | 7.861 | 1.258 | 1.797 | 3.121 | 0.221 |
-| 3 | 4.778 | 6.175 | 6.954 | 7.488 | 7.754 | 1.255 | 1.801 | 3.126 | 0.249 |
-| 4 | 4.763 | 6.307 | 6.814 | 7.514 | 7.836 | 1.253 | 1.795 | 3.082 | 0.330 |
+| 0 | 3.985 | 4.991 | 5.668 | 6.300 | 6.555 | 1.276 | 1.818 | 3.322 | 0.369 |
+| 1 | 3.992 | 5.054 | 5.590 | 6.246 | 6.363 | 1.264 | 1.812 | 3.219 | 0.290 |
+| 2 | 3.992 | 4.972 | 5.595 | 6.210 | 6.372 | 1.270 | 1.811 | 3.184 | 0.289 |
+| 3 | 3.978 | 5.002 | 5.643 | 6.261 | 6.429 | 1.276 | 1.817 | 3.201 | 0.249 |
+| 4 | 3.986 | 4.943 | 5.613 | 6.204 | 6.384 | 1.264 | 1.817 | 3.219 | 0.358 |
+
+（Issue #682 の `#[inline(never)]` 抽出後に本表全体を再取得した。25,000 行節の注記と同じ位置づけ——A 系列列も同一 run のペア値へ更新している。）
 
 median-of-R（ms・min-of-R）・ns/row・段差分:
 
 | 段 | median | min-of-R | ns/row | 差分元 | diff ns/row | ratio | 帯判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| A1 redb_scan | 4.778 | 4.763 | 47.8 | — | — | — | — |
-| A2 header_decode | 6.191 | 6.175 | 61.9 | A1→A2 | 14.1 | 29.58% | above |
-| A3 rls_visible | 6.857 | 6.812 | 68.6 | A2→A3 | 6.7 | 10.77% | above |
-| A4 dim_meta_decode | 7.488 | 7.450 | 74.9 | A3→A4 | 6.3 | 9.19% | above |
-| A5 scalar_validate | 7.836 | 7.754 | 78.4 | A4→A5 | 3.5 | 4.66% | within |
+| A1 redb_scan | 3.986 | 3.978 | 39.9 | — | — | — | — |
+| A2 header_decode | 4.991 | 4.943 | 49.9 | A1→A2 | 10.0 | 25.21% | above |
+| A3 rls_visible | 5.613 | 5.590 | 56.1 | A2→A3 | 6.2 | 12.46% | above |
+| A4 dim_meta_decode | 6.246 | 6.204 | 62.5 | A3→A4 | 6.3 | 11.28% | above |
+| A5 scalar_validate | 6.384 | 6.363 | 63.8 | A4→A5 | 1.4 | 2.21% | within |
 
-e2e: `A0a`（agg_count）median=0.195ms・`A0b`（rls_isolation）median=0.195ms（両者一致。#478 `VisibleBitmapCache` のヒット高速経路値）。`A0c-cold`median=29.147ms（sample minimum, N=20: 28.834ms）。
+e2e: `A0a`（agg_count）median=0.195ms・`A0b`（rls_isolation）median=0.195ms（両者一致。#478 `VisibleBitmapCache` のヒット高速経路値）。`A0c-cold`median=28.597ms（sample minimum, N=20: 28.425ms）。（Issue #682 の W 系列再測定に伴い、A 系列列も同一 run のペア値へ更新——run-to-run 差の範囲内であり Issue #635 の帰結を変更するものではない。）
 
 | 段 | median | min-of-R | ns/row（分母=可視 92,000 行） | 差分元 | diff ns/row | ratio | 帯判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| W1 scalar_scan | 1.255 | 1.250 | 13.6 | — | — | — | — |
-| W2 predicate | 1.801 | 1.795 | 19.6 | W1→W2 | 5.9 | 43.50% | above |
-| W3 arena_copy | 3.121 | 3.082 | 33.9 | W2→W3 | 14.3 | 73.31% | above |
-| W4 provider_search（一致 18,400 行） | 0.221 | 0.203 | — | — | — | — | — |
-| R_dot（参照区間） | 1.445 | 1.430 | — | — | — | reference_band=3.12% | — |
+| W1 scalar_scan | 1.270 | 1.264 | 13.8 | — | — | — | — |
+| W2 predicate | 1.817 | 1.811 | 19.8 | W1→W2 | 6.0 | 43.12% | above |
+| W3 arena_copy | 3.219 | 3.184 | 35.0 | W2→W3 | 15.2 | 77.12% | above |
+| W4 provider_search（一致 18,400 行） | 0.290 | 0.249 | — | — | — | — | — |
+| R_dot（参照区間） | 1.439 | 1.408 | — | — | — | reference_band=5.61% | — |
 
-e2e: `W0-cold`=86.993ms・`W0-hot`=4.972ms・`W0-nowhere`=3.041ms。raw diff（`W0-hot − W0-nowhere`）= 1.931ms（下記「W0-hot と W0-nowhere の候補集合差」節の注意を参照）。
+e2e: `W0-cold`=85.285ms・`W0-hot`=1.349ms（min-of-R=1.324ms）・`W0-nowhere`=3.146ms。raw diff（`W0-hot − W0-nowhere`）は前節の理由により「`WHERE` 上乗せ」として単純には解釈できない（下記「W0-hot と W0-nowhere の候補集合差」節参照）。
+
+（Issue #682 の `#[inline(never)]` 抽出後に本表を再取得した。上記 25,000 行節の注記と同じ位置づけ。）
 
 ### W0-hot と W0-nowhere の候補集合差（P2 指摘・codex-review）
 
@@ -190,13 +293,13 @@ e2e: `W0-cold`=86.993ms・`W0-hot`=4.972ms・`W0-nowhere`=3.041ms。raw diff（`
 1. **SQL 表層内の `WHERE` 上乗せ**（`scan_scalar_columns` による全可視行スキャン・述語判定・一致行の embedding 複製。W1〜W3 に相当）
 2. **dense 探索（距離計算・Top-k 選出）の候補集合サイズが小さくなることによる処理量の減少**（`W4`〔一致行のみ〕対 `R_dot`／`W0-nowhere` 内部の全可視行探索の差。候補が少ないほど計算量は減る側に働く）
 
-上記 2 つは符号が逆（1 は上乗せ・2 は削減）のため、raw diff を単純に「`WHERE` 上乗せ」として報告し、その値を `W3`（`W1`・`W2` を累積で含む値。`W1+W2+W3` のような加算は `W1` 分の `scalar_scan` コストを二重計上するため行わない）と比較して残差をパース・束縛・キャッシュ照会等へ帰属することはできない（候補集合が揃っていない）。候補集合を揃えた比較は W 系列（`W1`〜`W4`、いずれも一致行のみを対象とする一貫した集合）・`R_dot`（全可視行を対象とする参照区間）側で行っており、これらの段別内訳が主たる分析対象である。raw diff（25k: 0.061ms・100k: 1.931ms）は「候補集合差を含む e2e 全体の差」という参考値としてのみ扱う。
+上記 2 つは符号が逆（1 は上乗せ・2 は削減）のため、raw diff を単純に「`WHERE` 上乗せ」として報告し、その値を `W3`（`W1`・`W2` を累積で含む値。`W1+W2+W3` のような加算は `W1` 分の `scalar_scan` コストを二重計上するため行わない）と比較して残差をパース・束縛・キャッシュ照会等へ帰属することはできない（候補集合が揃っていない）。候補集合を揃えた比較は W 系列（`W1`〜`W4`、いずれも一致行のみを対象とする一貫した集合）・`R_dot`（全可視行を対象とする参照区間）側で行っており、これらの段別内訳が主たる分析対象である。raw diff は「候補集合差を含む e2e 全体の差」という参考値としてのみ扱う——Issue #682 再測定時点（`W0-hot`=0.350ms/1.349ms・`W0-nowhere`=0.604ms/3.146ms、25k/100k）では `W0-hot` が `W0-nowhere` を下回り符号が逆転しており（ベンチ本体も `diff(W0-nowhere->W0-hot): n/a` として測定ノイズによる逆転・未確定と明示する）、本節初版時点の raw diff（25k: 0.061ms・100k: 1.931ms）とは符号自体が異なる。これは intervening な性能改善作業（`SqlArenaCache`・`ScalarIndex` 等）が `W0-hot` 側をより大きく改善した結果であり、Issue #682（W 系列の `#[inline(never)]` 抽出）自体の効果として解釈しない。
 
 ### 実測からの所見
 
-- A 系列: `A1`（走査のみ）が総コスト（`A5` ns/row 比）の 6〜7 割を占める（25k: 49.9/71.5 ≈ 69.8%・100k: 47.8/78.4 ≈ 61.0%）。`A2`（ヘッダデコード）・`A3`（RLS 判定）が次点で、`A4`（dim/metadata デコード。A3 と同じキー/ヘッダ tenant 整合検査を含む）・`A5`（スカラー構造検証）の追加コストは A1〜A3 の合計より小さい。`A2〜A4` の帯判定は規模で明確に異なる——25k は参照区間 `R_dot` のノイズ帯が 20.82% と広く `A1→A2`（11.93%）〜`A4→A5`（4.22%）まで全段が `within_noise_band` になる一方、100k は `R_dot` のノイズ帯が 3.12% と狭いため `A1→A2`（29.58%）〜`A3→A4`（9.19%）が `above_noise_band` へ転じ、`A4→A5`（4.66%）のみ固定 ±5% 帯の内側にとどまり `within` と判定される（帯判定は「固定 ±5% 帯・参照区間実測帯のいずれか一方を超えなければ within」という OR 判定であり、100k 側の参照区間ノイズ帯が 25k より大幅に狭いことが `above` へ転じる段を増やす一因であることは掲載表の帯判定列のとおりだが、これだけに帰属することはできない。`A2`〜`A4` の diff ns/row 自体も規模で変化しており、特に `A1→A2` は 25k の 6.0 ns/row・11.93% から 100k は 14.1 ns/row・29.58% へ増分自体が約 2.35 倍に拡大している一方、`A2→A3`（25k: 6.2・100k: 6.7 ns/row）・`A3→A4`（25k: 6.5・100k: 6.3 ns/row）はほぼ横ばいであり、帯判定の変化は段ごとに「参照区間ノイズ帯の縮小」と「増分自体の拡大」の寄与度が異なる。`A1→A2` の増分拡大の原因切り分け〔ヘッダデコード自体のコストが規模依存で伸びるのか、キャッシュ・メモリ局所性等の二次要因かの特定〕は本 Issue のスコープ外として申し送る。掲載表の帯判定列を参照）。`agg_count`／`rls_isolation` の e2e（A0a/A0b）は #478 `VisibleBitmapCache` のヒット高速経路を通るようになり、25k（0.050ms/0.050ms）・100k（0.195ms/0.195ms）いずれも完全一致——同一走査であるという設計時の仮説（§背景）は、キャッシュ導入後もそのまま成立する。cold 側の対照値 `A0c-cold`（毎サンプル新規 `Storage::open`＋キャッシュミス経由の全行走査を含む）は 25k で 6.561ms・100k で 29.147ms（sample minimum 込み。前節「#586 後の…アーティファクト」参照）——キャッシュ非ヒット時のコストは e2e 全行走査の水準に戻ることを示す。
-- W 系列: `W3`（arena_copy）が規模とともに支配的になる（25k 点で W2 比 +16.52%、100k 点で W2 比 +73.31%）。一致行数（`lang='ja'` ≈ 20%）に比例して複製コストが伸びるため、規模が大きいほど `W3` の相対寄与が増す。`W0-hot` と `W0-nowhere` は候補集合が異なるため両者の raw diff を「`WHERE` 上乗せ」として単純に解釈することはできない（詳細は前節「W0-hot と W0-nowhere の候補集合差」）。
-- `W0-cold`（`SqlArenaCache` を毎回空の状態から測る）は `W0-hot` の約 17〜22 倍（25k: 14.540ms/0.660ms・100k: 86.993ms/4.972ms）——`SqlArenaCache`（Issue #363）のヒット有無がクエリ毎の redb 再デコードコストを大きく左右することを示す（`vector_knn_where` の crossdb 実測がどちらの状態に近いかは、crossdb ハーネスの接続再利用方針に依存するため本 Issue の対象外）。W0-cold／W0-hot の絶対値は本 doc 初版時点（#477・#471 の前段・#357／#363／#478 等の各種キャッシュ導入前）から変化しているが、Issue #635 の対象は A 系列のバイナリ配置アーティファクト是正・基線再取得であり、W 系列絶対値の変化は intervening な性能改善作業（`CLAUDE.md` の Issue #357・#363・#478 等）の帰結として記録するのみに留める。
+- A 系列: `A1`（走査のみ）が総コスト（`A5` ns/row 比）の 6〜7 割を占める（25k: 38.4/57.2 ≈ 67.1%・100k: 39.9/63.8 ≈ 62.5%）。`A2`（ヘッダデコード）・`A3`（RLS 判定）が次点で、`A4`（dim/metadata デコード。A3 と同じキー/ヘッダ tenant 整合検査を含む）・`A5`（スカラー構造検証）の追加コストは A1〜A3 の合計より小さい。`A2〜A4` の帯判定は規模で明確に異なる——25k は参照区間 `R_dot` のノイズ帯が 14.55% と広く `A1→A2`（12.41%）〜`A4→A5`（4.61%）まで全段が `within_noise_band` になる一方、100k は `R_dot` のノイズ帯が 5.61% と狭いため `A1→A2`（25.21%）〜`A3→A4`（11.28%）が `above_noise_band` へ転じ、`A4→A5`（2.21%）のみ固定 ±5% 帯の内側にとどまり `within` と判定される（帯判定は「固定 ±5% 帯・参照区間実測帯のいずれか一方を超えなければ within」という OR 判定であり、100k 側の参照区間ノイズ帯が 25k より大幅に狭いことが `above` へ転じる段を増やす一因であることは掲載表の帯判定列のとおりだが、これだけに帰属することはできない。`A1→A2` の増分拡大の原因切り分け〔ヘッダデコード自体のコストが規模依存で伸びるのか、キャッシュ・メモリ局所性等の二次要因かの特定〕は本 Issue のスコープ外として申し送る。掲載表の帯判定列を参照）。`agg_count`／`rls_isolation` の e2e（A0a/A0b）は #478 `VisibleBitmapCache` のヒット高速経路を通るようになり、25k（0.050ms/0.050ms）・100k（0.195ms/0.195ms）いずれも完全一致——同一走査であるという設計時の仮説（§背景）は、キャッシュ導入後もそのまま成立する。cold 側の対照値 `A0c-cold`（毎サンプル新規 `Storage::open`＋キャッシュミス経由の全行走査を含む）は 25k で 6.413ms・100k で 28.597ms（sample minimum 込み。前節「#586 後の…アーティファクト」参照）——キャッシュ非ヒット時のコストは e2e 全行走査の水準に戻ることを示す（A 系列の絶対値は上記「再測定の経緯」(3) のとおり Issue #682 の W 系列再測定に伴う同一 run のペア値であり、Issue #635 基線からの run-to-run 差の範囲内）。
+- W 系列: `W3`（arena_copy）が規模とともに支配的になる（25k 点で W2 比 +18.71%、100k 点で W2 比 +77.12%）。一致行数（`lang='ja'` ≈ 20%）に比例して複製コストが伸びるため、規模が大きいほど `W3` の相対寄与が増す。`W0-hot` と `W0-nowhere` は候補集合が異なるため両者の raw diff を「`WHERE` 上乗せ」として単純に解釈することはできない（詳細は前節「W0-hot と W0-nowhere の候補集合差」）。`W1`／`W2` は Issue #682 で `#[inline(never)]` 抽出後の値（詳細・抽出前後の A/B は上記「W 系列バイナリ配置アーティファクト（Issue #682）」節参照）。
+- `W0-cold`（`SqlArenaCache` を毎回空の状態から測る）は `W0-hot` の約 40〜65 倍（25k: 14.150ms/0.350ms・100k: 85.285ms/1.349ms）——`SqlArenaCache`（Issue #363）のヒット有無がクエリ毎の redb 再デコードコストを大きく左右することを示す（`vector_knn_where` の crossdb 実測がどちらの状態に近いかは、crossdb ハーネスの接続再利用方針に依存するため本 Issue の対象外）。W0-cold／W0-hot の絶対値は本 doc 初版時点（#477・#471 の前段・#357／#363／#478 等の各種キャッシュ導入前）から変化しているが、Issue #635／#682 の対象は A・W 系列のバイナリ配置アーティファクト是正・基線再取得であり、W 系列絶対値の変化は intervening な性能改善作業（`CLAUDE.md` の Issue #357・#363・#478 等）の帰結として記録するのみに留める。
 
 ## #477（可視ビットマップ世代整合キャッシュ）・#471（スカラー列二次索引）への帰属
 
@@ -225,3 +328,4 @@ e2e: `W0-cold`=86.993ms・`W0-hot`=4.972ms・`W0-nowhere`=3.041ms。raw diff（`
 - `where_compound_count`・`group_by_having` の段別分解は本 Issue 対象外（#471 側で必要なら別途）。
 - Issue #635: `#[inline(never)]` 分離の摂動テストは本開発環境（共有 QEMU）での 1 回の N=5 ペア実測に基づく。専有環境での再検証・より長期的な配置感度の安定性確認はオーナー作業として申し送り。W 系列の絶対値変化（本節初版比）は Issue #635 のスコープ外だが、実測値の記録として本 doc の「実測結果」節へ反映済み。
 - Issue #653: 選択率 opt-in（`BENCH_SCAN_PROFILE_SELECTIVITY`）・現行索引経路（Issue #474）の index/plain 2 アーム計測・索引経路の I1〜I3 内訳は本 doc ではなく `docs/design/filtered-distance-stage-profile.md` へ分離して記録した（本 doc の W 系列は索引導入前・選択率 20% 固定のまま不変）。
+- Issue #682: `W1`／`W2` のみを `#[inline(never)]` 抽出し、`W3`（arena_copy）・`W4`（provider_search）・`R_dot`・A/B 検証で用いた `b_visible` 対照計測は無名クロージャのまま残置している（受け入れ条件が W1/W2 の配置起因確定に限定されていたため）。抽出前後 A/B・`773a835`/`997cf00` 間の `objdump`／`nm` 比較はいずれも共有 QEMU 環境（参照帯 49.33%）での 1 回の N=5 ペア実測に基づく参考値であり、専有環境での再実測・第 3 アーム（旧ベンチ＋現行 production）の実施可否確認はオーナー作業として申し送る。

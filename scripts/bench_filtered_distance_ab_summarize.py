@@ -45,6 +45,21 @@ TARGET_METRICS = [
     ("target", "vector_knn_where.W0-hot", r"e2e\(vector_knn_where/W0-hot\): median=([\d.]+)ms"),
     ("target", "vector_knn_where.W0-cold", r"e2e\(vector_knn_where/W0-cold\): median=([\d.]+)ms"),
 ]
+# W 系列（Issue #682）: W1/W2 の計測対象本体を `#[inline(never)]` 独立関数へ
+# 抽出した前後で ns_per_row・W1→W2 差分の変化を確認する対象区間。
+W_SERIES_METRICS = [
+    (
+        "target",
+        "W1_scalar_scan.ns_per_row",
+        r"stage\(W1_scalar_scan\): rows=\d+ median=[\d.]+ms ns_per_row=([\d.]+)",
+    ),
+    (
+        "target",
+        "W2_predicate.ns_per_row",
+        r"stage\(W2_predicate\): rows=\d+ median=[\d.]+ms ns_per_row=([\d.]+)",
+    ),
+    ("target", "W1->W2.diff_ns_per_row", r"diff\(W1->W2\): ns_per_row=([\d.]+)"),
+]
 # 参照区間: 変更を含まない cache fast path・距離カーネル単体。
 REFERENCE_METRICS = [
     (
@@ -60,7 +75,7 @@ REFERENCE_METRICS = [
     ("reference", "agg_count.A0a", r"e2e\(agg_count/A0a, ctx=tenant-a\): median=([\d.]+)ms"),
     ("reference", "rls_isolation.A0b", r"e2e\(rls_isolation/A0b, ctx=tenant-b\): median=([\d.]+)ms"),
 ]
-ALL_METRICS = TARGET_METRICS + REFERENCE_METRICS
+ALL_METRICS = TARGET_METRICS + W_SERIES_METRICS + REFERENCE_METRICS
 
 # after-only（1/3）段でのみ非 vacuous 性・I 系列を確認する行。
 AFTER_ONLY_METRICS = [
