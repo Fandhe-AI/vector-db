@@ -1118,7 +1118,9 @@ opt-in 経路でも同一閾値を通過することの確認」は、`RecallEng
   登録した判定規則」3 のとおり共有 QEMU 実測では Accepted にできない。
   専有環境での再実測と既定値変更はオーナー判断
 - クラスタ構造ありコーパス・25,000 行規模での分断の深掘り（上記
-  「フィクスチャ形状のプローブ」節の観測）: 後続 Issue へ申し送り
+  「フィクスチャ形状のプローブ」節の観測）: 後続 Issue へ申し送り。
+  クラスタ丸ごと可視マスクで TwoHop へ確実に到達するフィクスチャの構築・
+  hop モード別 Recall・`acorn_expansions` の記録は「Issue #679」節参照
 - scale=4（100k 行）規模点: 計測時間の都合で `SWEEP_SCALES=4` opt-in に
   留める（既定は scale=1）
 
@@ -1291,6 +1293,124 @@ BFS 連結性検査を経由せず即座に plain scan する」設計（Issue #
   bench-crossdb-self-hnsw-ab CROSSDB_SELF_HNSW_ARGS="--hnsw-full-scan-ratio
   2/5"`）で検証してよいか。
 
+## Issue #679: ACORN TwoHop へ確実に到達する決定的フィクスチャ
+
+親 #502。「Issue #502」節・上記「クラスタ構造ありコーパス・25,000 行規模
+での分断の深掘り」（#502 節「対象外・申し送り」）が示すとおり、
+`tests/hnsw_acorn_recall.rs::run_regime_sweep`（均等分散マスク
+`id % denominator == 0`）は 25,000 行規模で `mask_splits_graph` が
+run 依存に発火する——3 run 中 1 run のみ TwoHop（`acorn_searches > 0`・
+`acorn_expansions=22184`・Recall@10 0.35）へ到達し、残り 2 run は
+plain scan へ縮退した。原因は SQL 表層の索引構築
+（`sql::hnsw_cache::IndexedBase::build` → `HnswIndex::build_parallel_
+with_precision`）が並列構築であり、`hnsw/parallel_build.rs`「決定性の
+範囲」が明記するとおりグラフ**形状**自体が run 間で非決定的なこと
+（1,200 行程度の小規模では `parallel_search.rs::MIN_ROWS_PER_THREAD=1,024`
+により常に逐次構築へ縮退しビット安定だが、25,000 行は並列構築される）。
+均等分散マスクは連結性がその形状の細部に依存するため run 依存の到達に
+なる。親 #674 の後続 #680（Recall 改善）・#681（展開過多時の
+fail-closed 縮退）が「決定的に TwoHop へ到達する fixture」を前提にする
+ため、本 Issue で到達保証と現状値の記録を先に固める。
+
+### フィクスチャ設計
+
+`crates/engine/tests/hnsw_acorn_recall.rs::MaskShape`（行番号
+`i`・クラスタ番号 `c = i % MASK_CLUSTERS`・クラスタ内序数
+`j = i / MASK_CLUSTERS`。`gen_clustered_corpus` と同じ剰余演算）:
+
+| 名称 | 可視条件 | 可視比率 | 位置づけ |
+| --- | --- | --- | --- |
+| `Whole{clusters:1}` | `c < 1` | 1/6 | **主 variant**（受け入れ条件の対象） |
+| `Whole{clusters:2}` | `c < 2` | 1/3 | 実測により informational へ降格（後述） |
+| `Whole{clusters:3}` | `c < 3` | 1/2 | 対照点（層 A のみ・ACORN が格上げしないことの確認） |
+| `Striped{clusters:2,stride:2}` | `c < 2 ∧ j % 2 == 0` | 1/6 | 副次 variant・informational（連結が橋渡し依存） |
+
+3 arm（`HopArm`）: `PlainScan`（`full_scan_ratio=1/1`）・`OneHop`（既定・
+ACORN 無効）・`TwoHop`（`acorn_max_visible_ratio=4/10` opt-in）。tenant-b
+private 行には可視ラベル `'v'` を付与し（`seed_private_tenant_b` の
+`bucket_label` 引数化）、可視条件へ構造的にマッチさせたうえでテナント
+境界自体が弾くことを確認する（付けないと非混入 assert が vacuous に
+なる）。クエリ選択は可視行を行番号昇順に並べ等間隔に最大 20 本を決定的に
+選ぶ（`select_visible_queries`。`Whole` 形状は可視行が単一クラスタに
+閉じるため、既存 `run_regime_sweep` のクラスタ横断ラウンドロビンでは
+退化する）。
+
+層 A（常時実行・1,200 行・dim16）は逐次構築でありグラフ形状が環境非依存
+でビット安定なため、`mask_splits_graph == 0`（分断縮退が一度も起きない）
+を契約として固定できる——25,000 行規模（並列構築・run 依存）の層 B とは
+保証強度が異なる。
+
+### 実測表（`make hnsw-acorn-twohop-runs RUNS=5`。共有 QEMU 開発環境）
+
+25,000 行・dim128・run=0〜4 で完全に同一の結果が得られた（決定的では
+ないが本環境では 5/5 とも同一値。他環境での分散は未確認）:
+
+| shape | ratio | arm | Recall@10 | subset_searches | acorn_searches | acorn_expansions | acorn_expansions/query | plain_scans | mask_splits_graph |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `whole{clusters=1}` | 1/6 | plain_scan | 1.0000 | 0 | 0 | 0 | 0.00 | 20 | 0 |
+| `whole{clusters=1}` | 1/6 | one_hop | 0.9750 | 20 | 0 | 0 | 0.00 | 0 | 0 |
+| `whole{clusters=1}` | 1/6 | two_hop | 0.9750 | 20 | 20 | 61 | 3.05 | 0 | 0 |
+| `whole{clusters=2}` | 1/3 | plain_scan | 1.0000 | 0 | 0 | 0 | 0.00 | 20 | 0 |
+| `whole{clusters=2}` | 1/3 | one_hop | 1.0000 | 0 | 0 | 0 | 0.00 | 0 | 20 |
+| `whole{clusters=2}` | 1/3 | two_hop | 1.0000 | 0 | 0 | 0 | 0.00 | 0 | 20 |
+| `striped{clusters=2,stride=2}` | 1/6 | plain_scan | 1.0000 | 0 | 0 | 0 | 0.00 | 20 | 0 |
+| `striped{clusters=2,stride=2}` | 1/6 | one_hop | 1.0000 | 0 | 0 | 0 | 0.00 | 0 | 20 |
+| `striped{clusters=2,stride=2}` | 1/6 | two_hop | 1.0000 | 0 | 0 | 0 | 0.00 | 0 | 20 |
+
+`twohop_reached`: `whole{clusters=1}`=5/5・`whole{clusters=2}`=0/5・
+`striped{clusters=2,stride=2}`=0/5。層 A（1,200 行・dim16。逐次構築）は
+`Whole{1}`・`Whole{2}` いずれも `acorn_searches > 0`・`mask_splits_graph
+== 0` を確認済み（`cluster_whole_mask_reaches_two_hop_deterministically`）。
+
+### 判断
+
+- **受け入れ条件 1（5 run 連続到達）は `Whole{1}`（可視比率 1/6）で
+  成立**。25,000 行・並列構築でも 5/5 run で `acorn_searches > 0`
+  （TwoHop 完走）を確認した
+- **予想外の観測**: `Whole{2}`（可視比率 1/3。`Whole{1}` より可視行が
+  多い）は逆に 5/5 run とも `mask_splits_graph` へ縮退し、ACORN opt-in
+  でも解消しなかった。「可視比率が大きいほど連結しやすい」という直感に
+  反する結果であり、層 A（1,200 行・逐次構築）では同じ `Whole{2}` が
+  問題なく TwoHop へ到達する（`mask_splits_graph == 0`）ことから、
+  分断は可視比率単独ではなく並列構築時のグラフ形状（クラスタ境界の
+  橋渡し配置）との相互作用に起因すると考えられる。原因の深掘りは
+  スコープ外（後続 Issue 申し送り）とし、本 Issue では計画のフォール
+  バック方針（主 variant が未達なら他候補で受け入れ条件を満たす）に
+  従い、主 variant を `Whole{1}` 単独へ確定した
+- `Whole{2}`・`Striped{2,2}` は informational（診断出力のみ・受け入れ
+  条件の判定対象外）として実測表に残す。`Striped{2,2}` は当初「橋渡し
+  経由でのみ連結する副次 variant」として #680／#681 の再現候補に想定
+  していたが、本環境では TwoHop 以前に `mask_splits_graph` へ縮退して
+  おり、可視比率が小さい形状でも分断が起きる条件があることを示す
+- **TwoHop 到達時の現状 Recall**（`Whole{1}` two_hop）: Recall@10=0.9750
+  （既定エンジン=brute-force 対照。受け入れ基準 0.9 を上回るが、
+  `one_hop` と同値であり ACORN opt-in による Recall 改善は本 fixture・
+  本 arm では観測されなかった。`acorn_expansions/query`=3.05 で
+  ACORN の 2-hop 展開自体は非 vacuous に発火している）
+- **#680／#681 が使うべき variant**: `Whole{1}` は TwoHop 到達が安定
+  している一方、Recall 改善効果は小さく展開回数も少ない
+  （3.05/query）ため、#680（Recall 改善）・#681（展開過多時の
+  fail-closed 縮退）の検証には橋渡し候補が多く展開が希釈されやすい
+  形状が必要な可能性がある。本 Issue の実測時点では `Striped` は
+  TwoHop 到達自体に失敗しており#680／#681 の再現候補としてそのままは
+  使えない——両 Issue は `Whole{1}` を出発点にしつつ、必要なら追加の
+  variant 設計（橋渡し候補数を増やす方向）を検討することを申し送る
+- 補助手段（`taskset` による逐次構築での再現確認）は本セッションの
+  sandbox 制約（`taskset` と `cargo test` の併用がブロックされた）に
+  より未実施。層 A（1,200 行）が既に逐次構築での契約固定を担っている
+  ため、25,000 行での逐次構築再現は運用者への申し送りとする
+
+### 対象外・申し送り
+
+- Recall 改善（#680）・展開過多時の fail-closed 縮退（#681）: 本 Issue は
+  現状値の固定に専念し、改善は後続 Issue の担当
+- `Whole{2}` が並列構築で分断する原因の深掘り: 上記「判断」参照。原因
+  分析は後続 Issue へ申し送り
+- `Whole{3}`（可視比率 1/2）の 25,000 行規模での実測: 時間節約のため
+  層 A（1,200 行）のみで確認済み（`acorn_searches == 0` を固定）
+- `full_scan_ratio`／`acorn_max_visible_ratio` の既定値変更: 引き続き
+  オーナー判断（「Issue #502」節・「Issue #659」節と同じ申し送り）
+
 ## スコープ外・申し送り
 
 - ~~不足時の `ef` 倍増再探索（iterative scan）・hybrid 密側の ANN 化と
@@ -1351,3 +1471,8 @@ BFS 連結性検査を経由せず即座に plain scan する」設計（Issue #
   分断を解消しないこと・`full_scan_ratio=2/5` 候補は wire A/B 参考値で
   改善方向が一貫することを確認。既定値は共有 QEMU 環境の制約により据え置き、
   専有環境実測を後続 Issue へ申し送り
+- ~~ACORN TwoHop へ確実に到達する決定的フィクスチャで hop 別 Recall と
+  `acorn_expansions` を記録: #679~~ 実測を実施済み（「Issue #679」節
+  参照）。クラスタ丸ごと可視マスク（`Whole{clusters:1}`・可視比率 1/6）で
+  25,000 行・並列構築でも 5/5 run で TwoHop 到達を確認。改善（#680）・
+  展開過多時の fail-closed 縮退（#681）は後続 Issue へ申し送り
