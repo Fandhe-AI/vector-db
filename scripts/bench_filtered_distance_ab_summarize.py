@@ -40,25 +40,34 @@ import sys
 
 MIN_PAIRS = 5
 
+# 各 METRICS タプルは (section, name, pattern, unit) の 4 要素。
+# unit は抽出したキャプチャ値の単位をそのまま表す（TSV の unit 列・
+# 出力フォーマットの決定に使う。Issue #682 追記・codex-review P2 指摘:
+# 従来は ALL_METRICS ループの出力側で unit="ms" を固定していたため、
+# ns/row 単位で抽出する W 系列が誤って "ms" と表示されていた）。
+
 # 対象区間: vector_knn_where の W0-hot/W0-cold。
 TARGET_METRICS = [
-    ("target", "vector_knn_where.W0-hot", r"e2e\(vector_knn_where/W0-hot\): median=([\d.]+)ms"),
-    ("target", "vector_knn_where.W0-cold", r"e2e\(vector_knn_where/W0-cold\): median=([\d.]+)ms"),
+    ("target", "vector_knn_where.W0-hot", r"e2e\(vector_knn_where/W0-hot\): median=([\d.]+)ms", "ms"),
+    ("target", "vector_knn_where.W0-cold", r"e2e\(vector_knn_where/W0-cold\): median=([\d.]+)ms", "ms"),
 ]
 # W 系列（Issue #682）: W1/W2 の計測対象本体を `#[inline(never)]` 独立関数へ
 # 抽出した前後で ns_per_row・W1→W2 差分の変化を確認する対象区間。
+# キャプチャ値はいずれも ns/row 単位（"ms" ではない）。
 W_SERIES_METRICS = [
     (
         "target",
         "W1_scalar_scan.ns_per_row",
         r"stage\(W1_scalar_scan\): rows=\d+ median=[\d.]+ms ns_per_row=([\d.]+)",
+        "ns/row",
     ),
     (
         "target",
         "W2_predicate.ns_per_row",
         r"stage\(W2_predicate\): rows=\d+ median=[\d.]+ms ns_per_row=([\d.]+)",
+        "ns/row",
     ),
-    ("target", "W1->W2.diff_ns_per_row", r"diff\(W1->W2\): ns_per_row=([\d.]+)"),
+    ("target", "W1->W2.diff_ns_per_row", r"diff\(W1->W2\): ns_per_row=([\d.]+)", "ns/row"),
 ]
 # 参照区間: 変更を含まない cache fast path・距離カーネル単体。
 REFERENCE_METRICS = [
@@ -66,14 +75,16 @@ REFERENCE_METRICS = [
         "reference",
         "vector_knn.W0-nowhere",
         r"e2e\(vector_knn/W0-nowhere, cache fast path\): median=([\d.]+)ms",
+        "ms",
     ),
     (
         "reference",
         "R_dot_kernel_distance_only",
         r"R_dot_kernel_distance_only \(reference band\): median=([\d.]+)ms",
+        "ms",
     ),
-    ("reference", "agg_count.A0a", r"e2e\(agg_count/A0a, ctx=tenant-a\): median=([\d.]+)ms"),
-    ("reference", "rls_isolation.A0b", r"e2e\(rls_isolation/A0b, ctx=tenant-b\): median=([\d.]+)ms"),
+    ("reference", "agg_count.A0a", r"e2e\(agg_count/A0a, ctx=tenant-a\): median=([\d.]+)ms", "ms"),
+    ("reference", "rls_isolation.A0b", r"e2e\(rls_isolation/A0b, ctx=tenant-b\): median=([\d.]+)ms", "ms"),
 ]
 ALL_METRICS = TARGET_METRICS + W_SERIES_METRICS + REFERENCE_METRICS
 
@@ -143,7 +154,7 @@ def collect(dir_path: str, session_ts: str) -> tuple[dict, dict, str | None]:
             sys.exit(2)
         if denom == "5":
             bucket = sel1of5[side]
-            for _section, name, pattern in ALL_METRICS:
+            for _section, name, pattern, _unit in ALL_METRICS:
                 v = extract(text, pattern)
                 if v is not None:
                     bucket.setdefault(name, {})[pair] = v
@@ -244,7 +255,7 @@ def main() -> int:
     # なら拒否する。
     matched_pairs_by_name: dict[str, set[int]] = {}
     pair_errors: list[str] = []
-    for _section, name, _pattern in ALL_METRICS:
+    for _section, name, _pattern, _unit in ALL_METRICS:
         before_pairs = set(sel1of5["before"].get(name, {}).keys())
         after_pairs = set(sel1of5["after"].get(name, {}).keys())
         if not before_pairs and not after_pairs:
@@ -309,7 +320,7 @@ def main() -> int:
         "class",
     ]
     print("\t".join(header))
-    for section, name, _pattern in ALL_METRICS:
+    for section, name, _pattern, unit in ALL_METRICS:
         matched = matched_pairs_by_name.get(name)
         if not matched:
             continue
@@ -324,7 +335,7 @@ def main() -> int:
         row = [
             section,
             name,
-            "ms",
+            unit,
             f"{b_min:.4f}",
             f"{b_median:.4f}",
             f"{a_min:.4f}",
