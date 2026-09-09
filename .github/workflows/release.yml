@@ -178,7 +178,8 @@ jobs:
             elif [ "${HTTP_STATUS}" -ge 200 ] 2>/dev/null && [ "${HTTP_STATUS}" -lt 300 ] 2>/dev/null; then
               # sparse index は 1 行 1 バージョンの JSON。vers フィールドを jq で完全一致比較する
               # （grep の正規表現扱いだと `.` が任意文字に一致し別バージョンを誤検出する）。
-              if jq -e --arg v "${RELEASE_VERSION}" -s 'map(.vers) | index($v) != null' "${INDEX_BODY_FILE}" >/dev/null; then
+              if jq -e --arg v "${RELEASE_VERSION}" -s 'map(.vers) | index($v) != null' \
+                   "${INDEX_BODY_FILE}" >/dev/null; then
                 echo "::error::version already published: ${CRATE} ${RELEASE_VERSION} already exists on crates.io."
                 exit 1
               fi
