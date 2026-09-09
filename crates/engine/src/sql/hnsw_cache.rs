@@ -199,6 +199,20 @@ pub struct HnswIndexCacheStats {
     /// 縮退なしで完走した場合のみ計上する。テナント ID・行 ID・スコア等の
     /// テナント存在情報には繋がらない——採否のみを数える診断用カウンタ）。
     pub hybrid_resumed_rounds: u64,
+    /// `Subset` 形状（Issue #409）が plain scan（`FullScan`／`PlainScanBelowRatio`／
+    /// `mask_splits_graph`／`ef_cap_fallbacks` のいずれか）へ縮退した際、
+    /// `VectorArena` を複製せずキャッシュ済みスナップショットを借用したまま
+    /// 候補 id マスク経路（`SearchProvider::search_subset`。Issue #654）へ委譲
+    /// できた回数（Issue #676）。`fallbacks`／`plain_scans`／`mask_splits_graph`／
+    /// `ef_cap_fallbacks` のいずれとも独立に数える（複製有無の観点のみを表す
+    /// カウンタで、縮退理由の分類は既存フィールドが担う）。
+    pub subset_mask_scans: u64,
+    /// `Subset` 形状が ANN 探索へ進んだ結果、`VectorArena::
+    /// build_from_cached_rls_rows_subset` による複製が発生した回数（Issue #676。
+    /// `subset_mask_scans` と排他——1 クエリで縮退／ANN のどちらか一方のみ
+    /// 到達する）。`subset_mask_scans > 0 && subset_arena_copies == 0` は
+    /// 「複製なしマスク経路が機能している」ことの非 vacuous な証跡になる。
+    pub subset_arena_copies: u64,
     /// 現在キャッシュが保持しているエントリ数。
     pub entries: usize,
 }
@@ -440,20 +454,56 @@ impl Overlay {
         full_scan_ratio: Ratio,
         acorn_max_visible_ratio: Option<Ratio>,
     ) -> Self {
+        Self::compute_over_slots(
+            base,
+            arena,
+            0..arena.len(),
+            generation,
+            full_scan_ratio,
+            acorn_max_visible_ratio,
+        )
+    }
+
+    /// [`Self::compute`] の一般化版（Issue #676）。`slots` は `arena` に対する
+    /// スロット番号の順序列（`compute` は `0..arena.len()` を渡すだけのラッパー
+    /// で、本関数の出力とビット単位で同一になる）。
+    ///
+    /// `sql::exec` の候補 id マスク経路（Issue #654）が `VectorArena::
+    /// filter_cached_rls_rows_subset` で削減した候補列（`kept: &[u32]`。昇順・
+    /// 重複なし）をここへ渡すと、「`kept` が指す行だけを複製した subset アリーナ
+    /// に対して `compute` を呼んだ場合」と全フィールド同一の `Overlay` を、
+    /// `VectorArena` を複製せずに得られる。ただし出力の座標系は `slots` の
+    /// **列挙順（ordinal: `0..slots.len()`）** であり、`slot_of_node`／
+    /// `delta_slots` の値は `arena` に対する実スロット番号ではない——`kept` を
+    /// 実際に複製した「仮想アリーナ」における番号を表す（呼び出し元は
+    /// `kept.get(ordinal)` で元スロット番号へ写像し戻す契約。§モジュール
+    /// ドキュメント「Issue #676」節参照）。
+    ///
+    /// `full_scan_ratio` の意味・分断検査の省略条件は [`Self::compute`] と同じ
+    /// （Issue #488 参照）。
+    fn compute_over_slots(
+        base: &IndexedBase,
+        arena: &VectorArena,
+        slots: impl ExactSizeIterator<Item = usize>,
+        generation: u64,
+        full_scan_ratio: Ratio,
+        acorn_max_visible_ratio: Option<Ratio>,
+    ) -> Self {
         let dim = arena.dim() as usize;
         let mut slot_of_node = vec![STALE_SLOT; base.index.len()];
         let mut delta_slots: Vec<u64> = Vec::new();
         let mut delta_vectors: Vec<f32> = Vec::new();
-        for slot in 0..arena.len() {
-            let tenant = arena.tenant_id(slot).unwrap_or("");
-            let Some(&id) = arena.ids().get(slot) else {
+        let arena_len = slots.len();
+        for (ordinal, actual_slot) in slots.enumerate() {
+            let tenant = arena.tenant_id(actual_slot).unwrap_or("");
+            let Some(&id) = arena.ids().get(actual_slot) else {
                 continue;
             };
             let key: RowKey = (tenant.to_string(), id);
             let Some(&node) = base.key_to_node.get(&key) else {
                 // 新規行（索引構築時点では存在しなかった）。
-                if let Some(v) = arena.vector(slot) {
-                    delta_slots.push(slot as u64);
+                if let Some(v) = arena.vector(actual_slot) {
+                    delta_slots.push(ordinal as u64);
                     delta_vectors.extend_from_slice(v);
                 }
                 continue;
@@ -466,18 +516,18 @@ impl Overlay {
             // `None` を返すため（D5）、こちらに一本化しないと F16 常駐索引の
             // 差分検出が全行を「未変更」と誤判定し、テーブル更新後もキャッシュが
             // 古いまま応答し続ける silent fallback になる。
-            let same_vector = match arena.vector(slot) {
+            let same_vector = match arena.vector(actual_slot) {
                 Some(v) => base.index.node_matches(node, v).unwrap_or(false),
                 None => false,
             };
             if same_vector {
                 if let Some(entry) = slot_of_node.get_mut(node as usize) {
-                    *entry = slot as u32;
+                    *entry = ordinal as u32;
                 }
-            } else if let Some(v) = arena.vector(slot) {
+            } else if let Some(v) = arena.vector(actual_slot) {
                 // 内容変更: 索引側ノードは失効させたまま（slot_of_node は STALE_SLOT
                 // のまま）、現在の内容を未索引分として扱う。
-                delta_slots.push(slot as u64);
+                delta_slots.push(ordinal as u64);
                 delta_vectors.extend_from_slice(v);
             }
         }
@@ -515,7 +565,7 @@ impl Overlay {
         };
         Overlay {
             generation,
-            arena_len: arena.len(),
+            arena_len,
             slot_of_node,
             stale_nodes,
             delta_slots,
@@ -630,6 +680,8 @@ pub(crate) struct HnswIndexCache {
     acorn_searches: AtomicU64,
     acorn_expansions: AtomicU64,
     hybrid_resumed_rounds: AtomicU64,
+    subset_mask_scans: AtomicU64,
+    subset_arena_copies: AtomicU64,
 }
 
 /// [`HnswIndexCache::lookup`] の結果。
@@ -671,7 +723,23 @@ impl HnswIndexCache {
             acorn_searches: AtomicU64::new(0),
             acorn_expansions: AtomicU64::new(0),
             hybrid_resumed_rounds: AtomicU64::new(0),
+            subset_mask_scans: AtomicU64::new(0),
+            subset_arena_copies: AtomicU64::new(0),
         }
+    }
+
+    /// `Subset` 形状の plain scan 縮退が候補 id マスク経路（複製なし）で完了した
+    /// ことを記録する（Issue #676。`sql::exec` の DISTANCE 段が `SubsetSlotPlan::
+    /// MaskScan` を選んだ全分岐で呼ぶ）。
+    pub(crate) fn record_subset_mask_scan(&self) {
+        self.subset_mask_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `Subset` 形状が ANN 探索へ進み `VectorArena` の複製が発生したことを記録
+    /// する（Issue #676。`sql::exec` の DISTANCE 段が `SubsetSlotPlan::Ann` を
+    /// 選び `build_from_cached_rls_rows_subset` を呼んだ直後に呼ぶ）。
+    pub(crate) fn record_subset_arena_copy(&self) {
+        self.subset_arena_copies.fetch_add(1, Ordering::Relaxed);
     }
 
     /// hybrid 密側再取得ループの 1 ラウンドとして本キャッシュへ探索を委ねた
@@ -983,6 +1051,8 @@ impl HnswIndexCache {
             acorn_searches: self.acorn_searches.load(Ordering::Relaxed),
             acorn_expansions: self.acorn_expansions.load(Ordering::Relaxed),
             hybrid_resumed_rounds: self.hybrid_resumed_rounds.load(Ordering::Relaxed),
+            subset_mask_scans: self.subset_mask_scans.load(Ordering::Relaxed),
+            subset_arena_copies: self.subset_arena_copies.load(Ordering::Relaxed),
             entries,
         }
     }
@@ -1618,6 +1688,139 @@ pub(crate) fn search_subset_or_fallback(
 ) -> Result<Vec<CandidateHit>, KernelError> {
     let prepared = prepare_subset(access, read_txn, table, ctx, arena);
     search_prepared(access, &prepared, provider, arena, slot_ids, query, k)
+}
+
+/// [`prepare_subset_from_slots`] の結果（Issue #676）。`Subset` 形状の候補が
+/// スカラー列二次索引の候補削減（Issue #654・`sql::exec` の SCALAR 段。
+/// `filter_cached_rls_rows_subset` が返した候補スロット列 `kept: &[u32]`）
+/// から plain scan へ縮退する場合、`VectorArena` の複製（`build_from_cached_rls_rows_subset`）
+/// を経ずキャッシュ済みスナップショットを借用したまま `SearchProvider::
+/// search_subset` へ委譲できることを表す。
+pub(crate) enum SubsetSlotPlan {
+    /// plain scan 縮退（統計は本関数内で計上済み）。呼び出し元は
+    /// `provider.search_subset(kept, snapshot_arena.vectors(), ..)` を使う
+    /// （`VectorArena` を複製しない）。
+    MaskScan,
+    /// ANN 探索へ進む。呼び出し元が `kept` から subset アリーナを複製し
+    /// `search_prepared` を呼ぶ（`success_stat` は常に `SubsetSearches`）。
+    Ann(PreparedHnswSearch),
+}
+
+/// `Subset` 形状（Issue #409）の候補削減後スロット列（`kept: &[u32]`。Issue #654・
+/// `sql::exec` の SCALAR 段が `VectorArena::filter_cached_rls_rows_subset` で
+/// 削減した候補。狭義昇順・重複なし）に対し、`VectorArena` を複製する**前**に
+/// plain scan／ANN の判定を確定する（Issue #676）。
+///
+/// [`prepare_subset`] との違いは、可視カーディナリティ判定の入力が「複製済み
+/// subset アリーナの `arena.len()`」ではなく「`kept.len()`（複製前に判明する
+/// 正確な候補件数）」である点と、`Overlay::compute` の代わりに
+/// [`Overlay::compute_over_slots`] で `snapshot_arena` を複製せず走査する点のみ。
+/// 判定順・統計計上は [`prepare_subset`]／[`search_prepared`]／
+/// [`search_with_overlay`] の前段ガードと同じ順・同じ意味を保つ（単発 DISTANCE
+/// クエリのため解決時点で計上する。呼び出し元は本関数の呼び出しを 1 クエリ
+/// あたり 1 回に限る契約——`search_prepared` のように複数ラウンド呼ばれる
+/// hybrid 密側では使わない。hybrid `Subset` 形状は対象外のまま）:
+///
+/// 1. `lookup` が `Miss`／`BuildFailedThisGeneration` → `fallbacks` → `MaskScan`
+/// 2. `arena_identity_mismatch_guard` 不一致 → `fallbacks` → `MaskScan`
+/// 3. `below_full_scan_ratio(kept.len(), base.index.len(), ..)` →
+///    `fallbacks`＋`plain_scans` → `MaskScan`（`Overlay` 未計算。[`prepare_subset`]
+///    の早期打ち切り〔Issue #488〕と同じ節約）
+/// 4. `table_generation_in_txn` 失敗 → `fallbacks` → `MaskScan`
+/// 5. `overlay.regime == PlainScan` → `fallbacks`＋`plain_scans` → `MaskScan`
+/// 6. `overlay.mask_splits_graph` → `fallbacks`＋`mask_splits_graph` → `MaskScan`
+/// 7. `k > MAX_EF` → `fallbacks`＋`ef_cap_fallbacks` → `MaskScan`
+/// 8. それ以外 → `Ann(Indexed)`（`subset_searches` は呼び出し元が探索完走後に
+///    加算する。既存 `OverlaySuccessStat::SubsetSearches` の契約のまま）
+///
+/// `MaskScan` を返す全分岐で [`HnswIndexCache::record_subset_mask_scan`] を、
+/// `Ann` を返す場合は呼び出し元が複製直後に
+/// [`HnswIndexCache::record_subset_arena_copy`] を呼ぶ契約（本関数内では
+/// 複製を行わないため呼ばない）。
+pub(crate) fn prepare_subset_from_slots(
+    access: &HnswCacheAccess<'_>,
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    ctx: &PolicyContext,
+    snapshot_arena: &VectorArena,
+    kept: &[u32],
+    k: usize,
+) -> SubsetSlotPlan {
+    let mask_scan = |access: &HnswCacheAccess<'_>| {
+        access.cache.record_subset_mask_scan();
+        SubsetSlotPlan::MaskScan
+    };
+
+    let base = match access.cache.lookup(access.storage, read_txn, table, ctx) {
+        Lookup::BuildFailedThisGeneration | Lookup::Miss => {
+            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            return mask_scan(access);
+        }
+        Lookup::Ready(base, _full_arena_overlay) => base,
+        Lookup::NeedOverlay(base) => base,
+    };
+
+    if base.arena_identity_mismatch_guard(snapshot_arena, ctx) {
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        return mask_scan(access);
+    }
+
+    // 早期打ち切り（Issue #488 と同じ節約。§本関数ドキュメンテーションコメント
+    // 3.）: 複製前に判明する `kept.len()` を可視カーディナリティの正確な値
+    // として使う（`filter_cached_rls_rows_subset` が返す `kept` は WHERE 通過後
+    // の候補そのものであり、`prepare_subset` の「複製済み subset アリーナの
+    // `arena.len()`」と異なり上界ではなく正確な値）。
+    if below_full_scan_ratio(
+        kept.len(),
+        base.index.len(),
+        access.provider.full_scan_ratio(),
+    ) {
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
+        return mask_scan(access);
+    }
+
+    let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        return mask_scan(access);
+    };
+
+    let overlay = Overlay::compute_over_slots(
+        &base,
+        snapshot_arena,
+        kept.iter().map(|&s| s as usize),
+        current_generation,
+        access.provider.full_scan_ratio(),
+        access.provider.acorn_max_visible_ratio(),
+    );
+
+    if overlay.regime == TraversalRegime::PlainScan {
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
+        return mask_scan(access);
+    }
+    if overlay.mask_splits_graph {
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access
+            .cache
+            .mask_splits_graph
+            .fetch_add(1, Ordering::Relaxed);
+        return mask_scan(access);
+    }
+    if k > crate::hnsw::MAX_EF {
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access
+            .cache
+            .ef_cap_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+        return mask_scan(access);
+    }
+
+    SubsetSlotPlan::Ann(PreparedHnswSearch::Indexed {
+        base,
+        overlay: Arc::new(overlay),
+        success_stat: OverlaySuccessStat::SubsetSearches,
+    })
 }
 
 impl IndexedBase {
@@ -2663,6 +2866,179 @@ mod tests {
         // このミニチュアフィクスチャでは再構築閾値を超える（`needs_rebuild` の
         // 挙動自体は `search_or_fallback` の rebuild 分岐で結合テストする）。
         assert!(overlay.needs_rebuild(arena1.len()));
+    }
+
+    /// `arena` 内で `id` を持つ行のスロット番号を線形探索する（テスト専用。
+    /// `arena.ids()` は `VectorArena::build_*` が確定した順序を保つため、
+    /// `kept` 候補列を組み立てる際に元スロット番号を求めるのに使う）。
+    fn slot_for_id(arena: &VectorArena, id: u64) -> u32 {
+        arena
+            .ids()
+            .iter()
+            .position(|&x| x == id)
+            .map(|i| i as u32)
+            .expect("id must exist in arena")
+    }
+
+    /// 2 つの `Overlay` が全フィールドにわたって一致することを検証する（Issue
+    /// #676。`Overlay` は `PartialEq`/`Debug` を導出していないため、テスト
+    /// 専用に手動でフィールド単位の比較を行う）。
+    fn assert_overlays_equal(a: &Overlay, b: &Overlay) {
+        assert_eq!(a.generation, b.generation, "generation");
+        assert_eq!(a.arena_len, b.arena_len, "arena_len");
+        assert_eq!(a.slot_of_node, b.slot_of_node, "slot_of_node");
+        assert_eq!(a.stale_nodes, b.stale_nodes, "stale_nodes");
+        assert_eq!(a.delta_slots, b.delta_slots, "delta_slots");
+        assert_eq!(a.delta_vectors, b.delta_vectors, "delta_vectors");
+        assert_eq!(a.visible_in_index, b.visible_in_index, "visible_in_index");
+        assert_eq!(
+            a.mask_splits_graph, b.mask_splits_graph,
+            "mask_splits_graph"
+        );
+        assert_eq!(a.regime, b.regime, "regime");
+        // `NodeMask` は `PartialEq` を持たないため、可視ノード番号の集合として比較する。
+        let mask_bits = |m: &crate::hnsw::NodeMask| -> Vec<u32> {
+            (0..m.len() as u32).filter(|&n| m.get(n)).collect()
+        };
+        assert_eq!(
+            mask_bits(&a.visible_mask),
+            mask_bits(&b.visible_mask),
+            "visible_mask"
+        );
+    }
+
+    #[test]
+    fn compute_over_slots_full_range_matches_compute() {
+        // Issue #676: `compute` は `compute_over_slots(.., 0..arena.len(), ..)` の
+        // ラッパーになったため、両者は定義上ビット同一になるはずだが、リグレッション
+        // 検出のため独立に呼び出して比較する。
+        let path = unique_db_path("hnsw-cache-overlay-full-range");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let c = ctx("tenant-a");
+        seed_row(&storage, "docs", 1, "tenant-a", &[1.0, 0.0, 0.0, 0.0]);
+        seed_row(&storage, "docs", 2, "tenant-a", &[0.0, 1.0, 0.0, 0.0]);
+        seed_row(&storage, "docs", 3, "tenant-a", &[0.0, 0.0, 1.0, 0.0]);
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let base = IndexedBase::build(
+            &arena,
+            crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
+            c.clone(),
+            gen,
+        )
+        .expect("build")
+        .0;
+        let ratio = Ratio {
+            numerator: 1,
+            denominator: 10,
+        };
+
+        let via_compute = Overlay::compute(&base, &arena, gen, ratio, None);
+        let via_slots =
+            Overlay::compute_over_slots(&base, &arena, 0..arena.len(), gen, ratio, None);
+        assert_overlays_equal(&via_compute, &via_slots);
+    }
+
+    #[test]
+    fn compute_over_slots_subset_matches_compute_on_copied_subset_arena() {
+        // Issue #676: `compute_over_slots(snapshot, kept)`（複製なし）が
+        // `compute(build_from_cached_rls_rows_subset(kept))`（複製あり・従来の
+        // HNSW `Subset` 経路）と全フィールド同一の `Overlay` を返すことを固定する。
+        // 内容変更行（id=2）・新規行（id=5）・kept から除外される未変更行（id=3。
+        // WHERE で除外されただけで削除ではない）を含むフィクスチャで検証する。
+        let path = unique_db_path("hnsw-cache-overlay-subset-equiv");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let c = ctx("tenant-a");
+        seed_row(&storage, "docs", 1, "tenant-a", &[1.0, 0.0, 0.0, 0.0]);
+        seed_row(&storage, "docs", 2, "tenant-a", &[0.0, 1.0, 0.0, 0.0]);
+        seed_row(&storage, "docs", 3, "tenant-a", &[0.0, 0.0, 1.0, 0.0]);
+        seed_row(&storage, "docs", 4, "tenant-a", &[0.0, 0.0, 0.0, 1.0]);
+
+        let read_txn0 = storage.db().begin_read().unwrap();
+        let gen0 = crate::catalog::table_generation_in_txn(&read_txn0, "docs").unwrap();
+        let arena0 = build_arena(&read_txn0, "docs", &c);
+        let base = IndexedBase::build(
+            &arena0,
+            crate::hnsw::HnswParams::default(),
+            crate::hnsw::ResidentPrecision::F32,
+            c.clone(),
+            gen0,
+        )
+        .expect("build")
+        .0;
+
+        let op_id_update =
+            crate::recovery::required_op_id::OperationId::parse("hnsw-cache-overlay-subset-update")
+                .unwrap();
+        crate::tenant::update_row(
+            &storage,
+            "docs",
+            &c,
+            2,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[0.0, 1.0, 1.0, 0.0],
+                metadata: &[],
+            },
+            &op_id_update,
+        )
+        .expect("update row");
+        seed_row(&storage, "docs", 5, "tenant-a", &[1.0, 0.0, 0.0, 1.0]);
+
+        let read_txn1 = storage.db().begin_read().unwrap();
+        let gen1 = crate::catalog::table_generation_in_txn(&read_txn1, "docs").unwrap();
+        let arena1 = build_arena(&read_txn1, "docs", &c);
+
+        // kept: id=3 を除いた昇順・重複なしの候補スロット（WHERE が id=3 を
+        // 除外したことを模す）。
+        let mut kept: Vec<u32> = [1u64, 2, 4, 5]
+            .iter()
+            .map(|&id| slot_for_id(&arena1, id))
+            .collect();
+        kept.sort_unstable();
+
+        let ratio = Ratio {
+            numerator: 1,
+            denominator: 10,
+        };
+        let via_mask = Overlay::compute_over_slots(
+            &base,
+            &arena1,
+            kept.iter().map(|&s| s as usize),
+            gen1,
+            ratio,
+            None,
+        );
+
+        // 対照: `kept` を実際に複製した subset アリーナに対し従来どおり `compute`
+        // を呼ぶ（Issue #654 以前の HNSW `Subset` 経路と同型）。
+        let metadata: Vec<Vec<u8>> = vec![Vec::new(); arena1.len()];
+        let subset_arena = VectorArena::build_from_cached_rls_rows_subset(
+            "docs",
+            arena1.dim(),
+            &arena1,
+            &metadata,
+            &kept,
+            |_, _, _, _| Ok(true),
+            crate::arena::MAX_ARENA_ROWS,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+        )
+        .expect("build subset arena");
+        let via_copy = Overlay::compute(&base, &subset_arena, gen1, ratio, None);
+
+        assert_overlays_equal(&via_mask, &via_copy);
+        // 非 vacuous であることの確認（id=2 の内容変更・id=5 の新規で delta が
+        // 発生し、kept.len()（4）が全体の視認集合と異なることを確かめる）。
+        assert_eq!(via_mask.delta_slots.len(), 2);
+        assert_eq!(via_mask.arena_len, 4);
     }
 
     #[test]

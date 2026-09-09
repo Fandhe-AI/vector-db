@@ -49,7 +49,7 @@
 //! （詳細・段階化の理由は `docs/design/hnsw-generation-cache.md` 参照）。
 
 use crate::hnsw::{HnswParams, ValidatedHnswParams, MAX_EF};
-use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
+use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider, SubsetSearchInput};
 use crate::parallel_search::ParallelSearchProvider;
 
 /// [`crate::search_engine::SearchEngineKind::Hnsw`] が構築する provider。
@@ -150,6 +150,24 @@ impl SearchProvider for HnswSearchProvider {
     /// 非有限クエリ・`k == 0`）は委譲先とビット単位で同一になる。
     fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
         self.fallback.search(input)
+    }
+
+    /// Issue #676: `sql::hnsw_cache` の `Subset` 形状（SCALAR 事前フィルタ付き
+    /// DISTANCE）が plain scan へ縮退した際、複製済みアリーナではなくキャッシュ
+    /// 済みスナップショットの `VectorArena` を借用したまま候補スロットだけを
+    /// 探索する「候補 id マスク経路」（Issue #654）へ載せるためのオーバーライド。
+    /// `SearchProvider::search_subset` の既定実装（`slots` を一時バッファへ
+    /// gather してから `Self::search` を呼ぶ）へ委譲すると gather 自体が複製に
+    /// なり Issue #676 の効果（`VectorArena` 複製の回避）が得られないため、
+    /// `self.fallback`（[`ParallelSearchProvider`]）の複製なしオーバーライドへ
+    /// そのまま委譲する。`fallback` へ委譲する `search` と対称であり、ビット
+    /// 一致契約（`hnsw/provider.rs` モジュールドキュメント「本タスク時点の契約」
+    /// 節）も同様に保たれる。
+    fn search_subset(
+        &self,
+        input: SubsetSearchInput<'_>,
+    ) -> Result<Vec<CandidateHit>, KernelError> {
+        self.fallback.search_subset(input)
     }
 }
 
@@ -285,6 +303,74 @@ mod tests {
             let got = hnsw_provider.search(input_a).unwrap();
             let want = reference.search(input_b).unwrap();
             assert_eq!(got, want, "k={k}");
+        }
+    }
+
+    #[test]
+    fn search_subset_matches_fallback_and_gathered_reference_bit_for_bit() {
+        // Issue #676: `HnswSearchProvider::search_subset` の委譲先
+        // （`ParallelSearchProvider::search_subset`）とビット一致すること、
+        // かつ「候補行を一時バッファへ複製してから `search`」した参照結果
+        // （`SearchProvider::search_subset` の既定実装が行う gather）とも
+        // 一致すること（同点誘発を含む重複ヘビーコーパス）を固定する。
+        use crate::kernel::SubsetSearchInput;
+
+        let dim = 5usize;
+        let n = 64usize;
+        // 同点を誘発するため一部の行を意図的に複製する。
+        let base = deterministic_corpus(n / 2, dim, 4242);
+        let mut vectors = base.clone();
+        vectors.extend_from_slice(&base);
+        let query = deterministic_corpus(1, dim, 99);
+        // 昇順・重複なし・範囲外スロットを含む候補（既定実装の skip 規約検証）。
+        let slots: Vec<u32> = (0..n as u32)
+            .step_by(3)
+            .chain(std::iter::once(n as u32 + 5))
+            .collect();
+
+        let provider = HnswSearchProvider::new(ValidatedHnswParams::default());
+        let fallback = ParallelSearchProvider;
+
+        for k in [1usize, 5, 20, n] {
+            let input = SubsetSearchInput {
+                slots: &slots,
+                vectors: &vectors,
+                dim: dim as u32,
+                query: &query,
+                k,
+            };
+            let got = provider.search_subset(input).unwrap();
+
+            let input_fallback = SubsetSearchInput {
+                slots: &slots,
+                vectors: &vectors,
+                dim: dim as u32,
+                query: &query,
+                k,
+            };
+            let want_fallback = fallback.search_subset(input_fallback).unwrap();
+            assert_eq!(got, want_fallback, "k={k} (vs fallback)");
+
+            // gather 参照: 候補行を一時バッファへ複製してから通常の `search` を呼ぶ。
+            let mut gathered: Vec<f32> = Vec::new();
+            let mut gathered_ids: Vec<u64> = Vec::new();
+            for &slot in &slots {
+                let start = slot as usize * dim;
+                let end = start + dim;
+                if end <= vectors.len() {
+                    gathered.extend_from_slice(&vectors[start..end]);
+                    gathered_ids.push(slot as u64);
+                }
+            }
+            let input_gathered = SearchInput {
+                ids: &gathered_ids,
+                vectors: &gathered,
+                dim: dim as u32,
+                query: &query,
+                k,
+            };
+            let want_gathered = fallback.search(input_gathered).unwrap();
+            assert_eq!(got, want_gathered, "k={k} (vs gathered reference)");
         }
     }
 

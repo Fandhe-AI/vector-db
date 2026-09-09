@@ -831,10 +831,14 @@ pub(crate) fn execute_statement_with_cache(
     // 元スロット番号（`arena`＝`snapshot.arena()` に対する添字。狭義昇順）を
     // ここへ記録する。`Some` の場合、下の `slot_ids` 生成・DISTANCE 段は
     // `provider.search`（複製前提）ではなく `provider.search_subset`（マスク）を
-    // 使う。対象は `Ranking::Distance`（`!is_hybrid`）かつ非 HNSW `Subset` 形状
-    // （`hnsw_subset_eligible` が偽。HNSW Subset 経路は Phase 2 まで複製経路の
-    // まま。モジュールドキュメント冒頭・`docs/design/scalar-index-mask-search.md`
-    // 参照）に限る。
+    // 使う。対象は `Ranking::Distance`（`!is_hybrid`）——HNSW `Subset` 形状
+    // （`hnsw_subset_eligible`）も含む（Issue #676。DISTANCE 段が
+    // `sql::hnsw_cache::prepare_subset_from_slots` で plain scan 縮退と判明した
+    // 場合のみ本フィールドをそのまま使い、ANN 探索へ進む場合はそこで初めて
+    // `build_from_cached_rls_rows_subset` を呼び複製する。hybrid `Subset` 形状
+    // （`hnsw_hybrid_subset_eligible`）は対象外のまま従来どおり複製経路。
+    // モジュールドキュメント冒頭・`docs/design/scalar-index-mask-search.md`・
+    // `docs/design/hnsw-rls-cardinality-switch.md` 参照）。
     let mut mask_kept_slots: Option<Vec<u32>> = None;
     let arena: &VectorArena = match arena_cache {
         None => owned_arena.insert(
@@ -965,18 +969,21 @@ pub(crate) fn execute_statement_with_cache(
                         }
                     }
 
-                    // Issue #654: 候補削減が発火し（`index_candidate_slots` が
-                    // `Some`）、かつこのクエリが `Ranking::Distance` で HNSW
-                    // `Subset` 経路（`hnsw_subset_eligible`）を使わない場合、
+                    // Issue #654・#676: 候補削減が発火し（`index_candidate_slots`
+                    // が `Some`）、かつこのクエリが `Ranking::Distance` の場合、
                     // `VectorArena` への複製を経ずキャッシュ済みスナップショットの
                     // `VectorArena` をそのまま借用し、`filter_cached_rls_rows_subset`
                     // が返す元スロット番号だけを DISTANCE 段の候補マスクとして使う
-                    // （§モジュールドキュメント「Issue #654」参照）。hybrid の
-                    // `Subset` 形状（疎コーパスの `DocId` がスロット番号に依存する
-                    // ため）・HNSW `Subset` 経路（`hnsw_subset_eligible`）は対象外で
-                    // 従来どおり複製経路を使う。
+                    // （§モジュールドキュメント「Issue #654」参照）。HNSW `Subset`
+                    // 経路（`hnsw_subset_eligible`）も Issue #676 でここへ合流した
+                    // ——DISTANCE 段が `sql::hnsw_cache::prepare_subset_from_slots`
+                    // で plain scan 縮退と判定した場合はこのマスクをそのまま使い、
+                    // ANN 探索へ進む場合はそこで初めて複製する（下の DISTANCE 段
+                    // 参照）。hybrid の `Subset` 形状（疎コーパスの `DocId` が
+                    // スロット番号に依存するため）のみ対象外で従来どおり複製経路
+                    // を使う。
                     if let Some(slots) = index_candidate_slots.as_ref() {
-                        if !is_hybrid && !hnsw_subset_eligible {
+                        if !is_hybrid {
                             let kept = VectorArena::filter_cached_rls_rows_subset(
                                 expected_dim,
                                 snapshot.arena(),
@@ -1285,29 +1292,127 @@ pub(crate) fn execute_statement_with_cache(
                         }
                     }
                 } else if hnsw_subset_eligible {
-                    match hnsw_cache.as_ref() {
-                        Some(access) => crate::sql::hnsw_cache::search_subset_or_fallback(
-                            access,
-                            read_txn,
-                            &bound.table,
-                            ctx,
-                            arena,
-                            &slot_ids,
-                            provider,
-                            query,
-                            k_eff,
-                        )
-                        .map_err(map_kernel_error)?,
-                        None => {
-                            let input = SearchInput {
-                                ids: &slot_ids,
-                                vectors: arena.vectors(),
-                                dim: arena.dim(),
-                                query,
-                                k: k_eff,
-                            };
-                            provider.search(input).map_err(map_kernel_error)?
+                    // Issue #676: SCALAR 段の候補削減（Issue #654）が `VectorArena`
+                    // を複製せず借用したまま候補スロットだけを絞り込めていた場合
+                    // （`mask_kept_slots`／`cache_hit_snapshot` が揃っている場合）、
+                    // まず `sql::hnsw_cache::prepare_subset_from_slots` で
+                    // 複製する**前**に plain scan／ANN を判定する。plain scan なら
+                    // 複製せず候補 id マスク経路（`search_subset`）へ委譲し、ANN へ
+                    // 進む場合のみこの時点で初めて `build_from_cached_rls_rows_subset`
+                    // を呼んで複製する（従来どおりの経路）。索引が候補削減を発火
+                    // できなかった場合（`mask_kept_slots` が `None`）は、従来どおり
+                    // `search_subset_or_fallback`（`arena` は行フィルタ済みの複製
+                    // アリーナ）を使う。
+                    match (
+                        hnsw_cache.as_ref(),
+                        mask_kept_slots.as_ref(),
+                        cache_hit_snapshot.as_ref(),
+                    ) {
+                        (Some(access), Some(kept), Some(snapshot)) => {
+                            match crate::sql::hnsw_cache::prepare_subset_from_slots(
+                                access,
+                                read_txn,
+                                &bound.table,
+                                ctx,
+                                snapshot.arena(),
+                                kept,
+                                k_eff,
+                            ) {
+                                crate::sql::hnsw_cache::SubsetSlotPlan::MaskScan => provider
+                                    .search_subset(crate::kernel::SubsetSearchInput {
+                                        slots: kept,
+                                        vectors: snapshot.arena().vectors(),
+                                        dim: snapshot.arena().dim(),
+                                        query,
+                                        k: k_eff,
+                                    })
+                                    .map_err(map_kernel_error)?,
+                                crate::sql::hnsw_cache::SubsetSlotPlan::Ann(prepared) => {
+                                    // ANN 探索へ進む場合のみ、ここで初めて `kept` から
+                                    // subset アリーナを複製する（従来の HNSW `Subset`
+                                    // 経路と同じ複製。`sql/exec.rs` モジュールドキュメント
+                                    // 「Issue #654」節・`docs/design/
+                                    // scalar-index-mask-search.md`「Issue #676」節参照）。
+                                    let built = VectorArena::build_from_cached_rls_rows_subset(
+                                        &bound.table,
+                                        snapshot.arena().dim(),
+                                        snapshot.arena(),
+                                        snapshot.metadata(),
+                                        kept,
+                                        |_, _, _, _| Ok(true),
+                                        crate::arena::MAX_ARENA_ROWS,
+                                        crate::arena::MAX_ARENA_TOTAL_BYTES,
+                                    )
+                                    .map_err(|e| map_arena_error(&bound.table, e))?;
+                                    access.cache.record_subset_arena_copy();
+                                    let subset_slot_ids: Vec<u64> =
+                                        (0..built.ids().len() as u64).collect();
+                                    let raw_ann = crate::sql::hnsw_cache::search_prepared(
+                                        access,
+                                        &prepared,
+                                        provider,
+                                        &built,
+                                        &subset_slot_ids,
+                                        query,
+                                        k_eff,
+                                    )
+                                    .map_err(map_kernel_error)?;
+                                    // `search_prepared` が返す `id` は subset アリーナ
+                                    // 内の連番（ordinal）——`Overlay::compute_over_slots`
+                                    // が `kept` の列挙順で座標系を作った（§`Overlay::
+                                    // compute_over_slots` ドキュメンテーションコメント
+                                    // 参照）ため、`kept.get(ordinal)` で元スロット番号
+                                    // （`snapshot.arena()` に対する添字）へ写像し戻す。
+                                    // 範囲外は索引・マージロジックの不整合を意味するため
+                                    // 黙って落とさず fail-closed に拒否する。
+                                    let mut mapped = Vec::with_capacity(raw_ann.len());
+                                    for hit in raw_ann {
+                                        let ordinal = usize::try_from(hit.id).map_err(|_| {
+                                            SqlSurfaceError::Internal {
+                                                detail: "hnsw subset ordinal does not fit in usize"
+                                                    .to_string(),
+                                            }
+                                        })?;
+                                        let orig_slot = kept.get(ordinal).copied().ok_or(
+                                            SqlSurfaceError::Internal {
+                                                detail:
+                                                    "hnsw subset ordinal out of range of candidate slots"
+                                                        .to_string(),
+                                            },
+                                        )?;
+                                        mapped.push(crate::kernel::CandidateHit {
+                                            id: orig_slot as u64,
+                                            score: hit.score,
+                                        });
+                                    }
+                                    mapped
+                                }
+                            }
                         }
+                        _ => match hnsw_cache.as_ref() {
+                            Some(access) => crate::sql::hnsw_cache::search_subset_or_fallback(
+                                access,
+                                read_txn,
+                                &bound.table,
+                                ctx,
+                                arena,
+                                &slot_ids,
+                                provider,
+                                query,
+                                k_eff,
+                            )
+                            .map_err(map_kernel_error)?,
+                            None => {
+                                let input = SearchInput {
+                                    ids: &slot_ids,
+                                    vectors: arena.vectors(),
+                                    dim: arena.dim(),
+                                    query,
+                                    k: k_eff,
+                                };
+                                provider.search(input).map_err(map_kernel_error)?
+                            }
+                        },
                     }
                 } else if let Some(kept) = mask_kept_slots.as_ref() {
                     // Issue #654: `arena` はキャッシュ済みスナップショットの
