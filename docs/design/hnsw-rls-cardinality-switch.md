@@ -1293,6 +1293,53 @@ BFS 連結性検査を経由せず即座に plain scan する」設計（Issue #
   bench-crossdb-self-hnsw-ab CROSSDB_SELF_HNSW_ARGS="--hnsw-full-scan-ratio
   2/5"`）で検証してよいか。
 
+## Issue #676: `Subset` 形状の plain scan 縮退時に候補 id マスク経路へ委譲する
+
+`Subset` 形状（本節「per-query 写像」）は plain scan へ縮退する場合でも
+従来 `build_from_cached_rls_rows_subset` で `VectorArena` を複製してから
+`search_with_overlay` を呼んでいた（複製自体が縮退時の主要コストになり得る）。
+Issue #654（スカラー列二次索引の候補削減。`sql/exec.rs` の SCALAR 段）で
+非 HNSW 経路に導入した「複製せず候補 id マスクで直接探索する」経路
+（`SearchProvider::search_subset`）を、HNSW `Subset` 形状の **plain scan 縮退
+時に限り** 合流させた。
+
+- 判定は複製の**前**に行う: `sql::hnsw_cache::prepare_subset_from_slots` が
+  `kept: &[u32]`（Issue #654 の候補削減結果。狭義昇順）と `kept.len()`
+  （複製前に判明する正確な可視カーディナリティ）だけを使い、
+  `below_full_scan_ratio`／[`Overlay::compute_over_slots`]（`Overlay::compute`
+  の一般化版。任意の順序付きスロット列に対して「その列を実際に複製した subset
+  アリーナに compute した場合」と全フィールド同一の `Overlay` を、複製せず
+  ordinal 座標系で返す）で `SubsetSlotPlan::MaskScan`／`Ann(PreparedHnswSearch)`
+  を確定する
+- `MaskScan`（`PlainScanBelowRatio`・regime `PlainScan`・`mask_splits_graph`・
+  `Lookup::Miss`／`BuildFailedThisGeneration`・同一性ガード不一致・
+  `k > MAX_EF` のいずれか）なら `provider.search_subset` で複製せず探索する。
+  `Ann` なら `sql/exec.rs` がその時点で初めて `build_from_cached_rls_rows_subset`
+  を呼び複製し、`search_prepared` へ渡す（複製・写像・スコア再計算の契約は
+  Issue #676 以前と不変）
+- ANN 経路が返す `id` は subset アリーナの連番（ordinal）——`kept.get(ordinal)`
+  で元スロット番号へ写像し戻す（範囲外は `SqlSurfaceError::Internal` で
+  fail-closed）
+- テナント境界: マスクは RLS 可視・WHERE 通過済みスロットの絞り込みであり、
+  索引自体は引き続き ctx 可視アリーナのみから構築される契約（本 doc「事後
+  フィルタ不採用」判断）を変えない。`arena_identity_mismatch_guard`（dim・ctx
+  一致検査）はマスク経路・複製経路の双方で同じ `base` に対して行う
+
+新設カウンタ `HnswIndexCacheStats::subset_mask_scans`（複製なしマスク経路を
+選んだ回数）・`subset_arena_copies`（ANN 進行時に複製した回数。互いに排他）
+で採否を観測できる。`EXPLAIN`（Issue #411）の `ann_plan: hnsw_subset` 露出・
+検索本体を実行しない契約は不変。`index_candidate_slots == None`（索引未消費・
+`FallbackSelectivity`・キャッシュミス）の HNSW `Subset` は従来どおり
+`search_subset_or_fallback`（複製経路）のまま——本 Issue は「索引が候補を
+削減できた」場合のみを対象とする。hybrid `Subset` 形状（`prepare_subset`・
+`sql::hnsw_hybrid::HnswDenseProvider`）は対象外のまま。
+
+詳細・実装記録は `docs/design/scalar-index-mask-search.md`「Issue #676」節、
+テストは `crates/engine/tests/hnsw_subset_mask_scan.rs`（新規）参照。前後
+比較実測は共有 QEMU 環境のため本 Issue のスコープ外とし、後続 Issue／
+オーナー実測へ申し送る（`docs/design/benchmark-judgement-policy.md` 準拠）。
+production コード（`crates/engine/src/`）変更あり・テスト・docs あわせて実施。
+
 ## Issue #679: ACORN TwoHop へ確実に到達する決定的フィクスチャ
 
 親 #502。「Issue #502」節・上記「クラスタ構造ありコーパス・25,000 行規模
