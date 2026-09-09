@@ -2528,8 +2528,8 @@ impl HnswIndex {
                 for &cand in neighbors {
                     if !is_ok(cand) {
                         if bridge_enabled {
-                            if let Some(bridged) = self.neighbors(level, cand).map(|n| n.to_vec()) {
-                                for two_hop in bridged {
+                            if let Some(bridged) = self.neighbors(level, cand) {
+                                for &two_hop in bridged {
                                     if !is_ok(two_hop) {
                                         continue;
                                     }
