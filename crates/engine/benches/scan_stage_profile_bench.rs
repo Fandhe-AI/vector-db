@@ -80,6 +80,7 @@ use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
+use engine::declarative_filter::MetadataFilter;
 use engine::kernel::{SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
@@ -301,6 +302,41 @@ fn stage_a5_scalar_validate(
         rows += 1;
     }
     (rows, checksum)
+}
+
+/// W1（可視行 metadata への `scan_scalar_columns`）の計測対象本体。
+/// W 系列は `773a835..997cf00` 区間でベンチ `main()` が大幅増量したにも
+/// かかわらず `scan_scalar_columns`／`declarative_filter::matches_all`
+/// 自体はバイト単位無変更のまま W2 が +17% 悪化して見えた
+/// （バイナリ配置アーティファクト疑い）ため、A 系列（`stage_a1_scan` 参照）と
+/// 同型の `#[inline(never)]` 独立関数へ抽出した（Issue #682）。
+#[inline(never)]
+fn stage_w1_scalar_scan(schema: &TableSchema, captured_metadata: &[Vec<u8>]) -> u64 {
+    let mut checksum = 0u64;
+    for metadata in captured_metadata {
+        let scanned = scan_scalar_columns(schema, metadata).expect("scan_scalar_columns");
+        checksum = checksum.wrapping_add(std::hint::black_box(scanned.len() as u64));
+    }
+    checksum
+}
+
+/// W2（W1 ＋ `lang = 'ja'` 判定〔`matches_lang_filter`〕）の計測対象本体。
+/// 戻り値は一致件数（ラウンドごとの整合性検証にも同じ値を再利用する）。
+/// 分離理由は `stage_w1_scalar_scan` 参照。
+#[inline(never)]
+fn stage_w2_predicate(
+    schema: &TableSchema,
+    captured_metadata: &[Vec<u8>],
+    filters: &[MetadataFilter],
+) -> u64 {
+    let mut matched = 0u64;
+    for metadata in captured_metadata {
+        let scanned = scan_scalar_columns(schema, metadata).expect("scan_scalar_columns");
+        if matches_lang_filter(filters, &scanned) {
+            matched = matched.wrapping_add(std::hint::black_box(1u64));
+        }
+    }
+    matched
 }
 
 fn measure_a_series(
@@ -582,41 +618,23 @@ fn main() {
             ));
         }
 
-        // W1: 可視行 metadata へ `scan_scalar_columns`。
+        // W1: 可視行 metadata へ `scan_scalar_columns`（`#[inline(never)]`。Issue #682）。
         let w1 = run(&config, || {
-            let mut checksum = 0u64;
-            for metadata in &captured_metadata {
-                let scanned = scan_scalar_columns(&schema, metadata).expect("scan_scalar_columns");
-                checksum = checksum.wrapping_add(std::hint::black_box(scanned.len() as u64));
-            }
-            checksum
+            stage_w1_scalar_scan(&schema, &captured_metadata)
         })
         .expect("measurement must satisfy protocol minimums");
         w1_rounds.push(w1.summary.median);
 
-        // W2: W1 ＋ `lang = 'ja'` 判定。
+        // W2: W1 ＋ `lang = 'ja'` 判定（`#[inline(never)]`。Issue #682）。
         let w2 = run(&config, || {
-            let mut matched = 0u64;
-            for metadata in &captured_metadata {
-                let scanned = scan_scalar_columns(&schema, metadata).expect("scan_scalar_columns");
-                if matches_lang_filter(&filters, &scanned) {
-                    matched = matched.wrapping_add(std::hint::black_box(1u64));
-                }
-            }
-            matched
+            stage_w2_predicate(&schema, &captured_metadata, &filters)
         })
         .expect("measurement must satisfy protocol minimums");
         w2_rounds.push(w2.summary.median);
-        let w2_match_count = {
-            let mut matched = 0usize;
-            for metadata in &captured_metadata {
-                let scanned = scan_scalar_columns(&schema, metadata).expect("scan_scalar_columns");
-                if matches_lang_filter(&filters, &scanned) {
-                    matched += 1;
-                }
-            }
-            matched
-        };
+        // 整合性検証は計測対象本体（`stage_w2_predicate`）の戻り値をそのまま
+        // 再利用する（同一ロジックの重複走査を排除。検証の弱体化ではない——
+        // `expected_match_ids` 側は `lang_for_id` 由来の独立導出のまま不変）。
+        let w2_match_count = stage_w2_predicate(&schema, &captured_metadata, &filters) as usize;
         if w2_match_count != expected_match_ids.len() {
             fail_closed(format!(
                 "round {round}: W2 lang='ja' match count mismatch: expected {}, got {w2_match_count}",

@@ -1446,7 +1446,8 @@ private 行には可視ラベル `'v'` を付与し（`seed_private_tenant_b` �
   呼ぶため、フィルタ選択率が非常に低いクエリが多発する場合はテナント文字列の
   複製コストが積み上がりうる。性能のみに関わる最適化であり本 Issue の
   正当性・安全性には影響しないため、実測してから要否を判断する後続課題として
-  申し送る
+  申し送る（`Subset` 経路との関係は `docs/design/hnsw-subset-overlay-cache.md`
+  〔Issue #678〕で整理）
 - `tests/rls_generalized.rs`／`tests/plan_rls_boost.rs` への HNSW エンジン
   variant 追加（TASK-138・TASK-139 の ANN 経路検証）。`tests/hnsw_cache.rs`
   の `r4_tenant_isolation_never_leaks_across_ctx`・新規 Rust API／`Subset`
