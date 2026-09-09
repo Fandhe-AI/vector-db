@@ -1689,14 +1689,132 @@ Recall への寄与が薄い」という前提）が低可視比率域では未�
 
 ### 対象外・申し送り
 
-- 展開過多時の fail-closed 縮退ガード: Issue #681（`acorn_expansions` の
-  意味を層 0 限定のまま据え置いたのはこのため）
+- ~~展開過多時の fail-closed 縮退ガード: Issue #681~~ 実装済み（「Issue #681」
+  節参照。`acorn_expansions` の意味を層 0 限定のまま据え置いたのはこのため）
 - `ACORN_EF_SCALE_MAX`（実装既定値 8）の専有環境での前後比較実測・
   最終確定: オーナー作業
 - 層 0 初期候補の拡充（計画の変更 C・段階 2）: 変更 A＋B のみで受け入れ
   基準（Recall ≥ 0.9・非劣化）を満たしたため未実施
 - `Whole{2}` が並列構築で分断する原因の深掘り: Issue #679 からの申し送り
   のまま不変
+
+## Issue #681: ACORN 橋渡し展開過多時の plain scan への fail-closed 縮退ガード
+
+### 背景
+
+Issue #674 Phase 2 が観測した Recall@10 0.35 の run（#680 の実装により
+Issue #679 の決定的フィクスチャでは 1.0000 まで改善済み）が示すとおり、
+TwoHop（ACORN-1）の橋渡し展開（`hnsw.rs::bridge_expand`）が過多になると
+非受理ノード越しに多数の遠方候補がビームへ流入し得る。#680 は `ef` 底上げ
+でこの現象を緩和したが、展開件数そのものへの上限や事後の安全弁は存在しな
+かった——`--hnsw-acorn-max-visible-ratio`（Issue #657）を opt-in した運用者
+が、展開過多な状況に無自覚のまま低 Recall な結果を受け取り得るという課題
+が残っていた。本 Issue はこれに対する fail-closed な事後ガードを追加する。
+
+### 判定式と結線点
+
+- **純粋関数** `hnsw.rs::acorn_expansions_exceed(expansions: u64, visible:
+  usize, ratio: Ratio) -> bool`: `expansions * ratio.denominator >
+  visible * ratio.numerator` を `u64::checked_mul` によるワイド化交差乗算
+  で判定する（`below_full_scan_ratio` と同じ比較方式）。`checked_mul` が
+  失敗した場合・`visible == 0`（防御的）はいずれも縮退側（`true`）へ
+  fail-closed に倒す。層 0 `bridge_expand` の停止性契約（各 2-hop ノードは
+  高々 1 回しか visited を通らない）により `expansions <= visible` が
+  構造的に成立するため、`ratio = 1/1` は常に発火不能——これを利用して
+  「発火する（`0/1`）」「発火しない（`1/1`）」の 2 arm を決定的に作れる。
+- **opt-in パラメータ** `ValidatedHnswParams::acorn_max_expansion_ratio`
+  （`with_acorn_max_expansion_ratio` 経由。既定 `None`＝無効）。
+  `acorn_max_visible_ratio` とは意図的に独立フィールドとした——順序制約
+  （`ratio >= full_scan_ratio` 等）を課すと `--hnsw-*` CLI の適用順序
+  （Issue #657）へ新たな制約を持ち込むため、「`hop == TwoHop` のときにしか
+  参照されず、到達しないレジームでは単に観測されない」という設計に統一
+  した（`sparse_visited_max` と同型の独立度）。
+- **結線点** `sql::hnsw_cache::search_with_overlay`: `base.index.
+  search_masked_with_hop(..)` が `Ok(hits)` を返した直後・
+  `finish_indexed_search` 呼び出し前の 1 箇所のみに挿入する。この 1 箇所で
+  DISTANCE `FullVisible`・DISTANCE `Subset`（`search_prepared` 経由）・
+  hybrid 密側 TwoHop（`search_prepared_resumable` が `HopMode::TwoHop` を
+  `search_with_overlay` へ委譲する既存経路）の 3 呼び出し元すべてを覆う。
+  発火時は `full_scan_with_arena`（既存の plain scan 縮退経路。ctx 可視
+  アリーナはそのまま・テナント境界は一切緩めない）へ縮退する。
+- **統計** `sql::hnsw_cache::HnswIndexCacheStats::acorn_guard_fallbacks`
+  （`fallbacks` の内数。`masked_short`／`mask_splits_graph`／
+  `ef_cap_fallbacks` はいずれも本判定より前の分岐で確定するため互いに
+  排他。TwoHop 完走前に捨てるため `acorn_searches`／`acorn_expansions`／
+  `acorn_descent_bridges`〔縮退なしに完走した場合のみ計上する既存契約〕
+  とも排他）。
+
+既定 `acorn_max_expansion_ratio == None` の間はこの `if let` を素通りする
+だけで、以降のコード経路（`finish_indexed_search` の呼び出し・統計）は
+ビット同一のまま変わらない。
+
+### `Overlay::compute` 側の事前推定（検討結果: 見送り）
+
+`HnswIndex::is_mask_fully_reachable_with(mask, TwoHop)` の BFS
+（`accepted_reachable_count`）は既に `bridge_expand` の受理件数を内部
+カウンタへ足しているが、その戻り値自体は現状捨てている。これを世代ごとに
+記録すれば「マスク全体で橋渡し越しにしか到達できないノード数」という
+クエリ非依存の上限は得られる。しかし per-query の実際の展開件数は探索の
+起点・ビーム幅に依存するため、この上限が閾値未満であっても「事後ガードが
+発火しないことの証明」（検査省略の最適化）にしかならず、上限超過をもって
+探索前に縮退すると過剰縮退（本来 Recall を維持できたはずのクエリまで
+plain scan へ落とす）になりかねない。Recall の fail-closed 化が目的の本
+Issue では事後判定のみで十分と判断し、事前推定は将来の最適化候補として
+`is_mask_fully_reachable_with` の戻り値拡張を自然な hook に位置づけたまま
+見送った（`Overlay` へのフィールド追加を避ける判断とも整合する）。
+
+### `EXPLAIN` 露出判断
+
+`acorn_max_expansion_ratio` は `full_scan_ratio`／`acorn_max_visible_ratio`
+と同じ「切替閾値」区分に分類し非露出とした。`acorn_guard_fallbacks` も
+実行時縮退結果であり非露出（`EXPLAIN` は検索本体を実行しない契約を維持）。
+`docs/design/explain-search-engine-exposure.md`「露出しない値」節へ追記
+済み。
+
+### 検証
+
+- **単体テスト**（`hnsw.rs`）: `with_acorn_max_expansion_ratio` の検証規則
+  （`denominator == 0`／`numerator > denominator` を拒否、`numerator == 0`・
+  `acorn_max_visible_ratio` 未設定との組合せは受理）・
+  `acorn_expansions_exceed` の境界値（`0/1` は展開 1 件で発火、`1/1` は
+  構造的に発火不能、`visible == 0` は防御的に発火、`checked_mul` 失敗時は
+  fail-closed に発火）を固定。
+- **結合テスト**（`crates/engine/tests/hnsw_acorn_recall.rs`。Issue #679 の
+  決定的フィクスチャ `Whole{clusters=1}`・1,200 行・dim16 を再利用）:
+  - `acorn_expansion_guard_fires_and_matches_plain_scan`（AC1）:
+    `acorn_max_expansion_ratio = 0/1` で少なくとも 1 クエリが発火
+    （非 vacuous）し、`fired_queries + acorn_searches == queries`（発火／
+    TwoHop 完走の二分割が全クエリを尽くし `masked_short`／
+    `mask_splits_graph`／`plain_scans` へ逸れていないことも確認）、発火
+    クエリの結果 id 集合が既定エンジン（brute-force。plain scan と結果
+    集合として同値になるはずの対照）と完全一致することを固定した。
+  - `acorn_expansion_guard_never_fires_at_1_1_and_is_bit_identical`
+    （AC2）: `1/1`（構造的に発火不能）とガードなし TwoHop で全クエリの
+    結果 id 列がビット同一・`acorn_guard_fallbacks == 0`・両アームとも
+    `acorn_searches > 0`（非 vacuous）・`acorn_expansions` が一致すること
+    を固定した。
+  - `acorn_expansion_guard_is_inert_without_two_hop`（AC2）:
+    `HopArm::OneHop`（ACORN 自体が無効）へガードを設定しても
+    `acorn_guard_fallbacks == 0`・`acorn_searches == 0` のまま、ガードなし
+    OneHop と全クエリの結果 id 列がビット同一であることを固定した
+    （独立フィールド設計の直接検証）。
+  - 既存の ACORN 関連結合テスト（`hnsw_cache.rs`・`hnsw_subset_mask_scan.
+    rs`・`hnsw_hybrid_refetch.rs`・`incremental_index_hnsw.rs`・
+    `sql_explain.rs`）・`hnsw::` 単体テスト（96 本）はいずれも無変更のまま
+    green（既定 `None` によるビット同一の直接証拠）。
+
+### 対象外・申し送り
+
+- wire-server CLI フラグ（`--hnsw-acorn-max-expansion-ratio`。Issue #657
+  の `search_engine_opt.rs` パターンへの追加）
+- ベンチ knob（`BENCH_KNN_PROFILE_ACORN_MAX_EXPANSION_RATIO` 等）
+- 閾値既定値の実測による確定（既定は `None` のまま。専有環境実測は
+  オーナー申し送り）
+- `Subset` 形状で事後縮退時にも複製を避ける（Issue #676 の延長）
+- 層 B レポート（`make hnsw-acorn-twohop-runs`）へのガード arm 追加・
+  hybrid 密側 TwoHop 専用の停止性・決定性テスト（`tests/
+  hnsw_hybrid_refetch.rs`）: 層 A の結合テストで AC1／AC2 を直接証拠付きで
+  固定できたため本 Issue のスコープでは見送り、後続 Issue へ申し送り
 
 ## スコープ外・申し送り
 
@@ -1762,4 +1880,5 @@ Recall への寄与が薄い」という前提）が低可視比率域では未�
   `acorn_expansions` を記録: #679~~ 実測を実施済み（「Issue #679」節
   参照）。クラスタ丸ごと可視マスク（`Whole{clusters:1}`・可視比率 1/6）で
   25,000 行・並列構築でも 5/5 run で TwoHop 到達を確認。改善（#680）・
-  展開過多時の fail-closed 縮退（#681）は後続 Issue へ申し送り
+  展開過多時の fail-closed 縮退（#681）は後続 Issue で対応済み（「Issue
+  #680」節・「Issue #681」節参照）

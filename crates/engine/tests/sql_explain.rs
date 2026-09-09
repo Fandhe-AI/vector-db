@@ -860,6 +860,7 @@ fn explain_does_not_touch_hnsw_index_cache() {
         + after.hybrid_queries
         + after.hybrid_rounds_max
         + after.hybrid_resumed_rounds
+        + after.acorn_guard_fallbacks
         + after.entries as u64;
     assert_eq!(
         total, 0,

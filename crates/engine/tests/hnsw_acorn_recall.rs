@@ -527,6 +527,30 @@ fn hnsw_kind_for_arm(arm: HopArm) -> search_engine::SearchEngineKind {
     }
 }
 
+/// `hnsw_kind_for_arm` の結果へ TwoHop 展開過多ガード（Issue #681・親 #674。
+/// `ValidatedHnswParams::acorn_max_expansion_ratio`）を追加適用する。
+/// `acorn_max_visible_ratio` とは独立フィールドのため `HopArm::OneHop`
+/// （ACORN 自体が無効）へ適用しても構築は成功する——その場合 `hop` が常に
+/// `OneHop` のためガード自体が一切観測されない（Issue #681 の「Overlay 側で
+/// 独立に受理する」設計の直接検証。`acorn_expansion_guard_is_inert_without_
+/// two_hop` 参照）。
+fn hnsw_kind_for_arm_with_guard(
+    arm: HopArm,
+    guard_ratio: Option<Ratio>,
+) -> search_engine::SearchEngineKind {
+    let kind = hnsw_kind_for_arm(arm);
+    match (kind, guard_ratio) {
+        (search_engine::SearchEngineKind::Hnsw(validated), Some(ratio)) => {
+            search_engine::SearchEngineKind::Hnsw(
+                validated
+                    .with_acorn_max_expansion_ratio(ratio)
+                    .expect("valid acorn_max_expansion_ratio"),
+            )
+        }
+        (kind, _) => kind,
+    }
+}
+
 /// 可視行（`shape.is_visible(i)` を満たす行番号）を昇順に集め、その中から
 /// 等間隔に最大 `max_queries` 本を決定的に選ぶ（`run_regime_sweep` の
 /// クラスタ別ラウンドロビンと異なり、`Whole` 形状では可視行が単一クラスタ
@@ -932,6 +956,346 @@ fn cluster_whole_mask_acorn_disabled_by_default() {
         p.shape_label
     );
     assert_eq!(p.acorn_expansions, 0);
+}
+
+/// 層 A（常時実行）: TwoHop 展開過多ガード（Issue #681・親 #674）が
+/// `acorn_max_expansion_ratio = 0/1`（展開が 1 件でもあれば発火）opt-in で
+/// 実際に発火し、発火クエリの結果が既定エンジン（brute-force。plain scan が
+/// 内部的に使うのと同じ全件探索）と完全一致することを固定する（AC1）。
+/// クエリ単位で「発火」（`acorn_guard_fallbacks` の増分）と「TwoHop 完走」
+/// （`acorn_searches` の増分）の二分割が全クエリを尽くすこと（他の縮退経路
+/// 〔`masked_short`／`mask_splits_graph`／`plain_scans`〕へ逸れていないこと）
+/// もあわせて確認する。
+#[test]
+fn acorn_expansion_guard_fires_and_matches_plain_scan() {
+    const DIM: usize = 16;
+    const ROWS: usize = 1_200;
+    const K: usize = 10;
+    let shape = MaskShape::Whole { clusters: 1 };
+    let op_tag = "layer-a-681-guard-fires";
+
+    let dir = unique_db_path(&format!("hnsw-acorn-guard-{op_tag}"));
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    let sch = schema(DIM as u32);
+    storage.create_table(&sch).expect("create table");
+    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    let vectors = seed_cluster_mask_fixture(&storage, &sch, &ctx_a, op_tag, DIM, ROWS, shape);
+    let (_b_vectors, _ctx_b) =
+        seed_private_tenant_b(&storage, &sch, DIM, ROWS as u64 + 1, 100, op_tag, "v");
+
+    // 参照（brute-force。ガード発火時の plain scan と結果集合として同値に
+    // なるはずの対照。同一シード〔`gen_clustered_corpus` seed=9 固定〕から
+    // 独立に再構築するため `vectors` の内容は本体と一致する）。
+    let ref_dir = unique_db_path(&format!("hnsw-acorn-guard-{op_tag}-ref"));
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage.create_table(&sch).expect("create ref table");
+    let _ = seed_cluster_mask_fixture(
+        &ref_storage,
+        &sch,
+        &ctx_a,
+        &format!("{op_tag}-ref"),
+        DIM,
+        ROWS,
+        shape,
+    );
+    let (_b_vectors_ref, _ctx_b_ref) = seed_private_tenant_b(
+        &ref_storage,
+        &sch,
+        DIM,
+        ROWS as u64 + 1,
+        100,
+        &format!("{op_tag}-ref"),
+        "v",
+    );
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    let kind = hnsw_kind_for_arm_with_guard(
+        HopArm::TwoHop,
+        Some(Ratio {
+            numerator: 0,
+            denominator: 1,
+        }),
+    );
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+    // フィルタなしクエリを 1 本先に投げ `FullVisible` 索引を warm する
+    // （`Subset` 形状は `Lookup::Miss` では構築しない契約。`run_cluster_mask_arm`
+    // と同じ理由）。
+    let _ = query_ids(&core, &ctx_a, &vectors[0], K);
+
+    let candidate_indices = select_visible_queries(ROWS, shape, 20);
+    let mut fired_queries = 0usize;
+    let mut completed_queries = 0usize;
+    let mut fired_recall_hits = 0usize;
+    let mut fired_recall_total = 0usize;
+    for &idx in &candidate_indices {
+        let before = core.hnsw_index_cache_stats();
+        let query = &vectors[idx];
+        let sql = format!(
+            "SELECT id FROM docs WHERE bucket = 'v' ORDER BY embedding <=> '{}' LIMIT {K}",
+            vec_literal(query)
+        );
+        let got = core.execute_sql(&ctx_a, &sql).expect("guarded query").rows;
+        let after = core.hnsw_index_cache_stats();
+
+        let fired = after.acorn_guard_fallbacks > before.acorn_guard_fallbacks;
+        let completed = after.acorn_searches > before.acorn_searches;
+        assert!(
+            fired ^ completed,
+            "each TwoHop query must either fire the guard or complete TwoHop, never both/neither (idx={idx})"
+        );
+        assert_eq!(
+            after.masked_short, before.masked_short,
+            "masked_short must not fire (idx={idx})"
+        );
+        assert_eq!(
+            after.mask_splits_graph, before.mask_splits_graph,
+            "mask_splits_graph must not fire (idx={idx})"
+        );
+        assert_eq!(
+            after.plain_scans, before.plain_scans,
+            "plain_scans (full_scan_ratio 由来の縮退) must not fire (idx={idx})"
+        );
+
+        for row in &got {
+            assert!(
+                row.id <= ROWS as u64,
+                "tenant-a result must not include tenant-b row id {} (idx={idx})",
+                row.id
+            );
+        }
+
+        if fired {
+            fired_queries += 1;
+            let want = ref_core.execute_sql(&ctx_a, &sql).expect("ref query").rows;
+            let got_ids: std::collections::HashSet<u64> = got.iter().map(|r| r.id).collect();
+            let want_ids: std::collections::HashSet<u64> = want.iter().map(|r| r.id).collect();
+            assert_eq!(
+                got_ids, want_ids,
+                "guard-fired result must equal brute-force (plain scan equivalence) at idx={idx}"
+            );
+            fired_recall_hits += got_ids.intersection(&want_ids).count();
+            fired_recall_total += want_ids.len();
+        } else {
+            completed_queries += 1;
+        }
+    }
+
+    assert!(
+        fired_queries > 0,
+        "guard must fire for at least one query with ratio=0/1 (non-vacuous)"
+    );
+    assert_eq!(
+        fired_queries + completed_queries,
+        candidate_indices.len(),
+        "fired + completed TwoHop must account for every query"
+    );
+    assert_eq!(
+        fired_recall_hits, fired_recall_total,
+        "fired-query subset Recall@10 must be exactly 1.0 (plain scan equivalence)"
+    );
+}
+
+/// 層 A（常時実行）: `acorn_max_expansion_ratio = 1/1` は `bridge_expand` の
+/// 停止性契約（`expansions <= visible` が構造的に成立。
+/// `crate::hnsw::acorn_expansions_exceed` ドキュメンテーションコメント参照）
+/// により構造的に発火不能であることを、ガードなし TwoHop と全クエリの結果
+/// 行 id 列が完全一致することで固定する（AC2）。`acorn_guard_fallbacks == 0`・
+/// 両アームとも `acorn_searches > 0`（非 vacuous）・`acorn_expansions` が
+/// 一致することもあわせて確認する。
+#[test]
+fn acorn_expansion_guard_never_fires_at_1_1_and_is_bit_identical() {
+    const DIM: usize = 16;
+    const ROWS: usize = 1_200;
+    const K: usize = 10;
+    let shape = MaskShape::Whole { clusters: 1 };
+
+    let baseline_dir = unique_db_path("hnsw-acorn-guard-1-1-baseline");
+    let _baseline_cleanup = CleanupGuard(baseline_dir.clone());
+    let baseline_storage = Storage::open(&baseline_dir).expect("open baseline storage");
+    let sch = schema(DIM as u32);
+    baseline_storage
+        .create_table(&sch)
+        .expect("create baseline table");
+    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    let vectors = seed_cluster_mask_fixture(
+        &baseline_storage,
+        &sch,
+        &ctx_a,
+        "guard-1-1-baseline",
+        DIM,
+        ROWS,
+        shape,
+    );
+    let baseline_kind = hnsw_kind_for_arm_with_guard(HopArm::TwoHop, None);
+    let baseline_core = EngineCore::from_storage_with_engine(baseline_storage, baseline_kind);
+    let _ = query_ids(&baseline_core, &ctx_a, &vectors[0], K);
+
+    let guarded_dir = unique_db_path("hnsw-acorn-guard-1-1-guarded");
+    let _guarded_cleanup = CleanupGuard(guarded_dir.clone());
+    let guarded_storage = Storage::open(&guarded_dir).expect("open guarded storage");
+    guarded_storage
+        .create_table(&sch)
+        .expect("create guarded table");
+    // `gen_clustered_corpus` は seed 固定（op_tag 非依存）のため、独立に
+    // 再構築しても `vectors` と同一のコーパスになる。
+    let _ = seed_cluster_mask_fixture(
+        &guarded_storage,
+        &sch,
+        &ctx_a,
+        "guard-1-1-guarded",
+        DIM,
+        ROWS,
+        shape,
+    );
+    let guarded_kind = hnsw_kind_for_arm_with_guard(
+        HopArm::TwoHop,
+        Some(Ratio {
+            numerator: 1,
+            denominator: 1,
+        }),
+    );
+    let guarded_core = EngineCore::from_storage_with_engine(guarded_storage, guarded_kind);
+    let _ = query_ids(&guarded_core, &ctx_a, &vectors[0], K);
+
+    let candidate_indices = select_visible_queries(ROWS, shape, 20);
+    for &idx in &candidate_indices {
+        let query = &vectors[idx];
+        let sql = format!(
+            "SELECT id FROM docs WHERE bucket = 'v' ORDER BY embedding <=> '{}' LIMIT {K}",
+            vec_literal(query)
+        );
+        let baseline_ids: Vec<u64> = baseline_core
+            .execute_sql(&ctx_a, &sql)
+            .expect("baseline query")
+            .rows
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        let guarded_ids: Vec<u64> = guarded_core
+            .execute_sql(&ctx_a, &sql)
+            .expect("guarded query")
+            .rows
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            baseline_ids, guarded_ids,
+            "acorn_max_expansion_ratio=1/1 must be bit-identical to no guard at idx={idx}"
+        );
+    }
+
+    let baseline_stats = baseline_core.hnsw_index_cache_stats();
+    let guarded_stats = guarded_core.hnsw_index_cache_stats();
+    assert_eq!(
+        guarded_stats.acorn_guard_fallbacks, 0,
+        "acorn_max_expansion_ratio=1/1 must never fire (structurally unfireable)"
+    );
+    assert!(
+        guarded_stats.acorn_searches > 0,
+        "guarded arm must reach TwoHop and complete (non-vacuous)"
+    );
+    assert!(
+        baseline_stats.acorn_searches > 0,
+        "baseline arm must reach TwoHop and complete (non-vacuous)"
+    );
+    assert_eq!(
+        baseline_stats.acorn_expansions, guarded_stats.acorn_expansions,
+        "acorn_expansions must match between guarded (never fires) and baseline arms"
+    );
+}
+
+/// 層 A（常時実行）: TwoHop 展開過多ガード（Issue #681）は `hop ==
+/// HopMode::TwoHop` のときのみ参照される独立フィールドであるため、
+/// `HopArm::OneHop`（ACORN 自体が無効）へ `acorn_max_expansion_ratio = 0/1`
+/// を設定しても一切観測されない（inert）ことを、ガードなし OneHop と全クエリ
+/// の結果行 id 列が完全一致することで固定する（AC2）。
+#[test]
+fn acorn_expansion_guard_is_inert_without_two_hop() {
+    const DIM: usize = 16;
+    const ROWS: usize = 1_200;
+    const K: usize = 10;
+    let shape = MaskShape::Whole { clusters: 1 };
+
+    let baseline_dir = unique_db_path("hnsw-acorn-guard-onehop-baseline");
+    let _baseline_cleanup = CleanupGuard(baseline_dir.clone());
+    let baseline_storage = Storage::open(&baseline_dir).expect("open baseline storage");
+    let sch = schema(DIM as u32);
+    baseline_storage
+        .create_table(&sch)
+        .expect("create baseline table");
+    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    let vectors = seed_cluster_mask_fixture(
+        &baseline_storage,
+        &sch,
+        &ctx_a,
+        "guard-onehop-baseline",
+        DIM,
+        ROWS,
+        shape,
+    );
+    let baseline_kind = hnsw_kind_for_arm_with_guard(HopArm::OneHop, None);
+    let baseline_core = EngineCore::from_storage_with_engine(baseline_storage, baseline_kind);
+    let _ = query_ids(&baseline_core, &ctx_a, &vectors[0], K);
+
+    let guarded_dir = unique_db_path("hnsw-acorn-guard-onehop-guarded");
+    let _guarded_cleanup = CleanupGuard(guarded_dir.clone());
+    let guarded_storage = Storage::open(&guarded_dir).expect("open guarded storage");
+    guarded_storage
+        .create_table(&sch)
+        .expect("create guarded table");
+    let _ = seed_cluster_mask_fixture(
+        &guarded_storage,
+        &sch,
+        &ctx_a,
+        "guard-onehop-guarded",
+        DIM,
+        ROWS,
+        shape,
+    );
+    let guarded_kind = hnsw_kind_for_arm_with_guard(
+        HopArm::OneHop,
+        Some(Ratio {
+            numerator: 0,
+            denominator: 1,
+        }),
+    );
+    let guarded_core = EngineCore::from_storage_with_engine(guarded_storage, guarded_kind);
+    let _ = query_ids(&guarded_core, &ctx_a, &vectors[0], K);
+
+    let candidate_indices = select_visible_queries(ROWS, shape, 20);
+    for &idx in &candidate_indices {
+        let query = &vectors[idx];
+        let sql = format!(
+            "SELECT id FROM docs WHERE bucket = 'v' ORDER BY embedding <=> '{}' LIMIT {K}",
+            vec_literal(query)
+        );
+        let baseline_ids: Vec<u64> = baseline_core
+            .execute_sql(&ctx_a, &sql)
+            .expect("baseline query")
+            .rows
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        let guarded_ids: Vec<u64> = guarded_core
+            .execute_sql(&ctx_a, &sql)
+            .expect("guarded query")
+            .rows
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            baseline_ids, guarded_ids,
+            "guard on OneHop regime must be inert (no TwoHop) at idx={idx}"
+        );
+    }
+
+    let guarded_stats = guarded_core.hnsw_index_cache_stats();
+    assert_eq!(guarded_stats.acorn_guard_fallbacks, 0);
+    assert_eq!(guarded_stats.acorn_searches, 0);
+    let baseline_stats = baseline_core.hnsw_index_cache_stats();
+    assert_eq!(baseline_stats.acorn_searches, 0);
 }
 
 /// 層 B（`#[ignore]`・`make hnsw-acorn-twohop-runs`）: 25,000 行・dim128 の

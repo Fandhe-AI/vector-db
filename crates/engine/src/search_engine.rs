@@ -142,16 +142,21 @@ impl fmt::Display for SearchEngineKind {
                     Some(r) => r.to_string(),
                     None => "none".to_string(),
                 };
+                let acorn_expansion = match params.acorn_max_expansion_ratio() {
+                    Some(r) => r.to_string(),
+                    None => "none".to_string(),
+                };
                 write!(
                     f,
-                    "hnsw(m={},ef_construction={},ef_search={},full_scan_ratio={},resident={},sparse_visited_max={},acorn_max_visible_ratio={})",
+                    "hnsw(m={},ef_construction={},ef_search={},full_scan_ratio={},resident={},sparse_visited_max={},acorn_max_visible_ratio={},acorn_max_expansion_ratio={})",
                     params.m,
                     params.ef_construction,
                     params.ef_search,
                     params.full_scan_ratio(),
                     params.resident_precision(),
                     params.sparse_visited_max(),
-                    acorn
+                    acorn,
+                    acorn_expansion
                 )
             }
         }
@@ -292,7 +297,7 @@ mod tests {
         );
         assert_eq!(
             kind.to_string(),
-            "hnsw(m=32,ef_construction=200,ef_search=128,full_scan_ratio=1/10,resident=f32,sparse_visited_max=0,acorn_max_visible_ratio=none)"
+            "hnsw(m=32,ef_construction=200,ef_search=128,full_scan_ratio=1/10,resident=f32,sparse_visited_max=0,acorn_max_visible_ratio=none,acorn_max_expansion_ratio=none)"
         );
         assert_eq!(
             SearchEngineKind::ParallelBruteForce.to_string(),
