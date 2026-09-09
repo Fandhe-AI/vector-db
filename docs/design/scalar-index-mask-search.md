@@ -105,8 +105,8 @@ pub(crate) fn filter_cached_rls_rows_subset<G>(
   `build_from_cached_rls_rows_subset` の複製経路へ縮退する）
 - `!is_hybrid`（`Ranking::Distance` のみ。hybrid の疎コーパス `DocId` は
   スロット番号に依存するため対象外）
-- `!hnsw_subset_eligible`（HNSW opt-in 時の `Subset` 形状は Phase 2 へ申し送り。
-  下記「対象外」参照）
+- `hnsw_subset_eligible` の場合も含む（Issue #676。ただし縮退時のみマスク経路
+  を使い、ANN 探索へ進む場合はその時点で複製する。下記「Issue #676」節参照）
 
 マスク経路が発火すると:
 
@@ -144,10 +144,43 @@ Issue #474 の既存契約）。したがって `!is_hybrid` を満たす限り�
 - **hybrid（`Ranking::Hybrid`）の Subset 形状**: 疎コーパスの `DocId` がスロット
   番号に依存し `hybrid::hybrid_search` の `SearchInput` 契約を変えないと載せ
   られないため、従来の複製経路（`build_from_cached_rls_rows_subset`）を維持する
-- **HNSW（`hnsw_subset_eligible`）の Subset 形状**: `sql::hnsw_cache::
-  search_subset_or_fallback` は per-query の索引・オーバーレイ解決を行う別経路
-  であり、Phase 2 として別 Issue へ申し送る
 - **集計・`GROUP BY` 経路**（Issue #475 で別途結線済み）
+
+## Issue #676: HNSW `Subset` 形状の plain scan 縮退時にも本経路を使う
+
+Phase 2 として申し送っていた HNSW opt-in 時の `Subset` 形状（SCALAR 事前
+フィルタ付き DISTANCE。`hnsw_subset_eligible`）についても、**候補削減後
+（`filter_cached_rls_rows_subset` が返す `kept: Vec<u32>`）に plain scan へ
+縮退すると判明した場合に限り**、本経路（`VectorArena` を複製せず候補 id
+マスクで直接探索）へ委譲するよう拡張した。ANN 探索へ進む場合は従来どおり
+`build_from_cached_rls_rows_subset` で複製する——「複製してから plain scan
+するか判定する」のではなく「plain scan と判明してから複製の要否を決める」
+順序へ入れ替えたのが本 Issue の核心。
+
+判定は `sql::hnsw_cache::prepare_subset_from_slots`（新設）が `kept.len()`
+（複製前に判明する正確な可視カーディナリティ）と
+[`Overlay::compute_over_slots`](../../crates/engine/src/sql/hnsw_cache.rs)
+（`Overlay::compute` の一般化版。`0..arena.len()` の代わりに任意の順序付き
+スロット列を受け取り、`kept` を実際に複製した subset アリーナに対して
+`compute` を呼んだ場合と全フィールド同一の `Overlay` を、複製せず ordinal
+座標系で返す）で行う。`sql/exec.rs` の DISTANCE 段は判定結果
+（`sql::hnsw_cache::SubsetSlotPlan::MaskScan`／`Ann(PreparedHnswSearch)`）に
+応じて `provider.search_subset`（複製なし）または `build_from_cached_rls_rows_subset`
+＋`search_prepared`（複製あり。ANN 探索）のいずれかへ分岐する。ANN 経路が
+返す `id` は subset アリーナの連番（ordinal）であるため、`kept.get(ordinal)`
+で元スロット番号へ写像し戻す（範囲外は `SqlSurfaceError::Internal` で
+fail-closed に拒否する）。
+
+新設カウンタ `HnswIndexCacheStats::subset_mask_scans`（複製なしマスク経路を
+選んだ回数）・`subset_arena_copies`（ANN 進行時に複製した回数。両者は
+互いに排他）で採否を観測できる。`index_candidate_slots == None`（索引未消費・
+`FallbackSelectivity`・キャッシュミス）の場合は従来どおり
+`search_subset_or_fallback`（複製経路）を使う。`EXPLAIN`（Issue #411）の
+`ann_plan: hnsw_subset` 露出契約・実行時縮退非露出の方針は不変（検索本体を
+実行しない）。
+
+詳細・実装記録は `docs/design/hnsw-rls-cardinality-switch.md`「Issue #676」節
+参照。テストは `crates/engine/tests/hnsw_subset_mask_scan.rs`（新規）。
 
 ## テスト設計
 
