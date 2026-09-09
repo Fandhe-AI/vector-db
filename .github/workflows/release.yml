@@ -191,10 +191,12 @@ jobs:
                   exit 1
                   ;;
                 1)
-                  echo "crate '${CRATE}' has published versions, but '${RELEASE_VERSION}' is not among them; continuing."
+                  echo "crate '${CRATE}' has published versions," \
+                    "but '${RELEASE_VERSION}' is not among them; continuing."
                   ;;
                 *)
-                  echo "::error::could not parse crates.io sparse index for ${CRATE} (${URL}, jq exit=${JQ_EXIT})."
+                  echo "::error::could not parse crates.io sparse index for ${CRATE}" \
+                    "(${URL}, jq exit=${JQ_EXIT})."
                   exit 1
                   ;;
               esac
