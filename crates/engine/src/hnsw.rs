@@ -424,6 +424,14 @@ pub struct ValidatedHnswParams {
     /// `Some(ratio)` のとき `sql::hnsw_cache::traversal_regime_for` が
     /// `full_scan_ratio <= r <= ratio` のレジームを `TwoHop` と判定する。
     acorn_max_visible_ratio: Option<Ratio>,
+    /// TwoHop（ACORN-1）探索 1 回の橋渡し展開件数が可視ノード数に対して
+    /// この比を超えたら plain scan へ fail-closed に縮退する上限比
+    /// （Issue #681・親 #674。既定 `None`＝ガード無効・既存動作を不変に保つ）。
+    /// `sql::hnsw_cache::search_with_overlay` が TwoHop 完走直後の事後判定
+    /// （[`acorn_expansions_exceed`]）に使う。`acorn_max_visible_ratio` が
+    /// `None` のままでも受理する独立フィールド（`hop == TwoHop` レジームへ
+    /// 到達しない設定では単に観測されない）。
+    acorn_max_expansion_ratio: Option<Ratio>,
 }
 
 /// HNSW 索引ノードの常駐ベクトル表現（Issue #514・親 #513。ポインタ:
@@ -492,6 +500,7 @@ impl ValidatedHnswParams {
             resident_precision: ResidentPrecision::F32,
             sparse_visited_max: DEFAULT_SPARSE_VISITED_MAX,
             acorn_max_visible_ratio: None,
+            acorn_max_expansion_ratio: None,
         })
     }
 
@@ -594,6 +603,31 @@ impl ValidatedHnswParams {
             });
         }
         self.acorn_max_visible_ratio = Some(ratio);
+        Ok(self)
+    }
+
+    /// TwoHop 展開過多ガード（Issue #681）の上限比を返す（`None`＝既定・無効）。
+    pub fn acorn_max_expansion_ratio(&self) -> Option<Ratio> {
+        self.acorn_max_expansion_ratio
+    }
+
+    /// `acorn_max_expansion_ratio` だけを差し替えたコピーを返す（Issue #681・
+    /// opt-in）。`ratio.denominator == 0`・`ratio.numerator > ratio.denominator`
+    /// は `HnswError::InvalidParams` として拒否する（fail-closed。他フィールドとの
+    /// 順序制約は課さない——`acorn_max_visible_ratio` が `None` のままでも受理する。
+    /// `numerator == 0` は受理する（「展開が 1 件でもあれば縮退」の意味）。
+    pub fn with_acorn_max_expansion_ratio(mut self, ratio: Ratio) -> Result<Self, HnswError> {
+        if ratio.denominator == 0 {
+            return Err(HnswError::InvalidParams {
+                reason: "acorn_max_expansion_ratio denominator must be >= 1",
+            });
+        }
+        if ratio.numerator > ratio.denominator {
+            return Err(HnswError::InvalidParams {
+                reason: "acorn_max_expansion_ratio numerator must not exceed denominator",
+            });
+        }
+        self.acorn_max_expansion_ratio = Some(ratio);
         Ok(self)
     }
 }
@@ -4075,6 +4109,42 @@ pub(crate) fn two_hop_effective_ef(
     base.saturating_mul(scale).min(MAX_EF)
 }
 
+/// TwoHop（ACORN-1）探索 1 回の橋渡し展開件数 `expansions`（層 0
+/// [`bridge_expand`] の受理件数）が可視ノード数 `visible` に対する上限比
+/// `ratio` を超えたかを判定する純粋関数（Issue #681・親 #674）。
+///
+/// `sql::hnsw_cache::search_with_overlay` が TwoHop 完走直後（事後）に
+/// `true` を返された場合、その ANN 結果を捨てて plain scan（既存の縮退経路。
+/// `full_scan_with_arena`）へ fail-closed に切り替える——探索コストは
+/// 既に払っているが、展開過多による Recall 低下（Issue #674 Phase 2 の
+/// 実測）より結果の正しさを優先する。
+///
+/// - `expansions * ratio.denominator > visible * ratio.numerator`
+///   （`below_full_scan_ratio` と同じ整数交差乗算の比較方式に揃える）。
+/// - `u64::checked_mul` を使い、untrusted な `expansions`／`visible`
+///   （wire 経由の SCALAR フィルタ選択率・クエリ内容に依存し得る）に対して
+///   整数オーバーフローを未定義動作にしない。オーバーフロー時は縮退側
+///   （`true`）へ fail-closed に倒す（`coding-rust.md`「untrusted 入力の扱い」）。
+/// - `visible == 0` は呼び出し元（`Overlay::compute` の分断検査）で通常
+///   到達不能だが、防御的に `expansions > 0` なら縮退側（`true`）へ倒す
+///   （ゼロ除算を避けつつ fail-closed の方向を保つ）。
+/// - 層 0 の `bridge_expand` は各 2-hop ノードを高々 1 回しか
+///   `visited.mark_visited` を通さない（`bridge_expand` ドキュメンテーション
+///   コメント「停止性」節）ため `expansions <= visible` が構造的に成立する。
+///   したがって `ratio = 1/1` は構造的に発火不能（常に `false`）。
+pub(crate) fn acorn_expansions_exceed(expansions: u64, visible: usize, ratio: Ratio) -> bool {
+    if visible == 0 {
+        return expansions > 0;
+    }
+    let lhs = expansions.checked_mul(ratio.denominator as u64);
+    let rhs = (visible as u64).checked_mul(ratio.numerator as u64);
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => lhs > rhs,
+        // オーバーフロー時は fail-closed に縮退側へ倒す。
+        _ => true,
+    }
+}
+
 /// [`HnswIndex::search_layer_with`]／[`GraphBuilder::search_layer`] が
 /// 共有する `search_layer`（Algorithm 2）の本体（Issue #494。凍結後の
 /// [`csr::CsrGraph`]・構築中の [`GraphBuilder`] のどちらの隣接表現からも
@@ -4975,6 +5045,127 @@ mod tests {
                 denominator: 2,
             })
             .is_ok());
+    }
+
+    /// `acorn_max_expansion_ratio`（Issue #681・親 #674）の既定値・検証規則を
+    /// 固定する。`acorn_max_visible_ratio` と異なり `full_scan_ratio` との
+    /// 順序制約は課さない（独立フィールド。§`ValidatedHnswParams` ドキュメント
+    /// コメント参照）。
+    #[test]
+    fn acorn_max_expansion_ratio_defaults_none_and_rejects_invalid_ratios() {
+        let v = ValidatedHnswParams::new(HnswParams::default()).expect("valid params");
+        assert_eq!(
+            v.acorn_max_expansion_ratio(),
+            None,
+            "acorn_max_expansion_ratio must default to None (existing behavior unchanged)"
+        );
+
+        assert!(
+            v.with_acorn_max_expansion_ratio(Ratio {
+                numerator: 0,
+                denominator: 0,
+            })
+            .is_err(),
+            "denominator == 0 must be rejected"
+        );
+        assert!(
+            v.with_acorn_max_expansion_ratio(Ratio {
+                numerator: 2,
+                denominator: 1,
+            })
+            .is_err(),
+            "numerator > denominator must be rejected"
+        );
+
+        // `numerator == 0` は受理する（「展開が 1 件でもあれば縮退」の意味）。
+        let zero_ratio = v
+            .with_acorn_max_expansion_ratio(Ratio {
+                numerator: 0,
+                denominator: 1,
+            })
+            .expect("numerator == 0 must be accepted");
+        assert_eq!(
+            zero_ratio.acorn_max_expansion_ratio(),
+            Some(Ratio {
+                numerator: 0,
+                denominator: 1
+            })
+        );
+
+        // `1/1` も受理する（構造的に発火不能な上限だが、値としては妥当）。
+        assert!(v
+            .with_acorn_max_expansion_ratio(Ratio {
+                numerator: 1,
+                denominator: 1,
+            })
+            .is_ok());
+
+        // `acorn_max_visible_ratio` が未設定（`None`）のままでも受理する
+        // （独立フィールド。`hop == TwoHop` レジームへ到達しない設定では
+        // 単に観測されないだけで、拒否理由にはならない）。
+        assert_eq!(v.acorn_max_visible_ratio(), None);
+        assert!(v
+            .with_acorn_max_expansion_ratio(Ratio {
+                numerator: 1,
+                denominator: 2,
+            })
+            .is_ok());
+    }
+
+    /// [`acorn_expansions_exceed`]（Issue #681）の境界値・fail-closed 方向を
+    /// 固定する。`ratio = 1/1` は `bridge_expand` の停止性契約
+    /// （各 2-hop ノードは高々 1 回しか visited を通らない＝`expansions <=
+    /// visible` が構造的に成立）により常に発火不能であることも確認する。
+    #[test]
+    fn acorn_expansions_exceed_boundary_and_overflow_behavior() {
+        let ratio_0_1 = Ratio {
+            numerator: 0,
+            denominator: 1,
+        };
+        let ratio_1_1 = Ratio {
+            numerator: 1,
+            denominator: 1,
+        };
+        let ratio_1_100 = Ratio {
+            numerator: 1,
+            denominator: 100,
+        };
+
+        // `0/1`: 展開が 1 件でもあれば発火。
+        assert!(!acorn_expansions_exceed(0, 100, ratio_0_1));
+        assert!(acorn_expansions_exceed(1, 100, ratio_0_1));
+
+        // `1/1`: `expansions <= visible` が構造的に成立するため常に発火不能。
+        assert!(!acorn_expansions_exceed(0, 100, ratio_1_1));
+        assert!(!acorn_expansions_exceed(100, 100, ratio_1_1));
+
+        // `1/100`: 境界（等しい）は非発火、超過は発火。
+        assert!(!acorn_expansions_exceed(10, 1000, ratio_1_100));
+        assert!(acorn_expansions_exceed(11, 1000, ratio_1_100));
+
+        // `visible == 0` は防御的に `expansions > 0` で発火（呼び出し元の
+        // 分断検査で通常到達しないが、ゼロ除算を避けつつ fail-closed を保つ）。
+        assert!(!acorn_expansions_exceed(0, 0, ratio_1_1));
+        assert!(acorn_expansions_exceed(1, 0, ratio_1_1));
+
+        // オーバーフロー（`checked_mul` 失敗）は fail-closed に縮退側（`true`）
+        // へ倒す。分母 2 との乗算で `u64::MAX` を超えさせる。
+        assert!(acorn_expansions_exceed(
+            u64::MAX,
+            1,
+            Ratio {
+                numerator: 1,
+                denominator: 2,
+            }
+        ));
+        assert!(acorn_expansions_exceed(
+            1,
+            usize::MAX,
+            Ratio {
+                numerator: 2,
+                denominator: 1,
+            }
+        ));
     }
 
     #[test]

@@ -198,6 +198,17 @@ pub struct HnswIndexCacheStats {
     /// 別カウンタ。`acorn_searches` と同じく縮退なしに完走した TwoHop 探索
     /// のみを計上する）。
     pub acorn_descent_bridges: u64,
+    /// TwoHop（ACORN-1）探索が完走した直後、橋渡し展開件数
+    /// （`bridge_expand` の受理件数）が可視ノード数に対する
+    /// `ValidatedHnswParams::acorn_max_expansion_ratio` を超えたため ANN 結果を
+    /// 捨てて plain scan へ縮退した回数（Issue #681・親 #674。`fallbacks` の
+    /// 内数。`masked_short`／`mask_splits_graph`／`ef_cap_fallbacks` とは互いに
+    /// 排他——いずれも本判定より前の分岐で確定するため。TwoHop 完走前に捨てる
+    /// ため `acorn_searches`／`acorn_expansions`／`acorn_descent_bridges` とも
+    /// 排他〔これらは縮退なしに完走した場合のみ計上する既存契約〕。既定
+    /// `acorn_max_expansion_ratio == None` の間は常に `0`。テナント境界・可視
+    /// カーディナリティ等のテナント存在情報には繋がらない——採否のみを数える）。
+    pub acorn_guard_fallbacks: u64,
     /// hybrid 密側再取得ループが破棄候補ヒープ保持の再開型探索（Issue #505・
     /// `crate::hnsw::ResumableMaskedSearch`）で完走したラウンド数の累計
     /// （`sql::hnsw_hybrid::HnswDenseProvider` が同一クエリ・同一バッファへの
@@ -686,6 +697,7 @@ pub(crate) struct HnswIndexCache {
     acorn_searches: AtomicU64,
     acorn_expansions: AtomicU64,
     acorn_descent_bridges: AtomicU64,
+    acorn_guard_fallbacks: AtomicU64,
     hybrid_resumed_rounds: AtomicU64,
     subset_mask_scans: AtomicU64,
     subset_arena_copies: AtomicU64,
@@ -730,6 +742,7 @@ impl HnswIndexCache {
             acorn_searches: AtomicU64::new(0),
             acorn_expansions: AtomicU64::new(0),
             acorn_descent_bridges: AtomicU64::new(0),
+            acorn_guard_fallbacks: AtomicU64::new(0),
             hybrid_resumed_rounds: AtomicU64::new(0),
             subset_mask_scans: AtomicU64::new(0),
             subset_arena_copies: AtomicU64::new(0),
@@ -1059,6 +1072,7 @@ impl HnswIndexCache {
             acorn_searches: self.acorn_searches.load(Ordering::Relaxed),
             acorn_expansions: self.acorn_expansions.load(Ordering::Relaxed),
             acorn_descent_bridges: self.acorn_descent_bridges.load(Ordering::Relaxed),
+            acorn_guard_fallbacks: self.acorn_guard_fallbacks.load(Ordering::Relaxed),
             hybrid_resumed_rounds: self.hybrid_resumed_rounds.load(Ordering::Relaxed),
             subset_mask_scans: self.subset_mask_scans.load(Ordering::Relaxed),
             subset_arena_copies: self.subset_arena_copies.load(Ordering::Relaxed),
@@ -1464,6 +1478,8 @@ pub(crate) fn search_prepared_resumable(
         // 再開型は HopMode::OneHop 限定（`crate::hnsw::ResumableMaskedSearch`
         // ドキュメンテーションコメント参照）。TwoHop レジームのラウンドは
         // 状態化せず既存の単発経路（`bridge_expand` を含む完全な探索）へ倒す。
+        // 展開過多ガード（Issue #681）も `search_with_overlay` 側でそのまま
+        // 適用される。
         *resume = None;
         return search_with_overlay(
             access,
@@ -2125,6 +2141,33 @@ fn search_with_overlay(
             return full_scan_with_arena(provider, arena, query, k);
         }
     };
+
+    // TwoHop（ACORN-1）展開過多ガード（Issue #681・親 #674）: 橋渡し展開
+    // （層 0 `bridge_expand` の受理件数。`acorn_expansions`）が可視ノード数
+    // に対する `ValidatedHnswParams::acorn_max_expansion_ratio` を超えた場合、
+    // 探索コストは既に払っているが ANN 結果を捨てて plain scan（既存の縮退
+    // 経路。テナント境界は `full_scan_with_arena` が使う ctx 可視アリーナの
+    // ままで一切緩めない）へ fail-closed に切り替える——展開過多による Recall
+    // 低下（Issue #674 Phase 2 の実測）より結果の正しさを優先する。既定
+    // `acorn_max_expansion_ratio == None` の間はこの分岐へ一切入らず、
+    // 以降のコード経路（`finish_indexed_search` の呼び出し・統計）はビット
+    // 同一のまま変わらない。
+    if hop == crate::hnsw::HopMode::TwoHop {
+        if let Some(ratio) = access.provider.acorn_max_expansion_ratio() {
+            if crate::hnsw::acorn_expansions_exceed(
+                acorn_expansions,
+                overlay.visible_in_index,
+                ratio,
+            ) {
+                access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+                access
+                    .cache
+                    .acorn_guard_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                return full_scan_with_arena(provider, arena, query, k);
+            }
+        }
+    }
 
     // 単発経路は当該呼び出し限定の縮退判定を使わない（診断用
     // `hybrid_resumed_rounds` は再開型経路 `search_prepared_resumable` のみが

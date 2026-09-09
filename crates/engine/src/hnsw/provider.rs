@@ -101,6 +101,14 @@ impl HnswSearchProvider {
         self.params.acorn_max_visible_ratio()
     }
 
+    /// TwoHop 展開過多ガード（Issue #681・親 #674）の上限比を返す。
+    /// `full_scan_ratio` と同じ理由（`ValidatedHnswParams` の private
+    /// フィールド）で本 provider 経由でのみ読み取れる。`None`＝既定・無効。
+    /// `sql::hnsw_cache::search_with_overlay` が TwoHop 完走直後の事後判定に使う。
+    pub(crate) fn acorn_max_expansion_ratio(&self) -> Option<crate::hnsw::Ratio> {
+        self.params.acorn_max_expansion_ratio()
+    }
+
     /// visited 集合の切替閾値を返す（Issue #497。`full_scan_ratio` と同じ理由
     /// （`ValidatedHnswParams` の private フィールド）で本 provider 経由でのみ
     /// 読み取れる）。`sql::hnsw_cache::search_with_overlay` が
