@@ -104,19 +104,19 @@ locate_artifact() {
 
 build_hnsw_compare() {
   local dir="$1" target="$2"
-  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo bench -p fandhe-vector-db-engine --bench hnsw_compare_bench --features contrast-bench --no-run --message-format=json ) \
+  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo bench --manifest-path crates/engine/Cargo.toml --bench hnsw_compare_bench --features contrast-bench --no-run --message-format=json ) \
     | locate_artifact hnsw_compare_bench
 }
 
 build_knn_profile() {
   local dir="$1" target="$2"
-  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo bench -p fandhe-vector-db-engine --bench knn_profile_bench --no-run --message-format=json ) \
+  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo bench --manifest-path crates/engine/Cargo.toml --bench knn_profile_bench --no-run --message-format=json ) \
     | locate_artifact knn_profile_bench
 }
 
 build_feature_bench() {
   local dir="$1" target="$2"
-  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo build --release -p fandhe-vector-db-engine --example feature_bench --message-format=json ) \
+  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo build --release --manifest-path crates/engine/Cargo.toml --example feature_bench --message-format=json ) \
     | locate_artifact feature_bench
 }
 

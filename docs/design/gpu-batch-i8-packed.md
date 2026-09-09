@@ -192,12 +192,12 @@ codex-review の指摘 3 件（P0 1 件・P1 2 件）はいずれも修正済み
 
 ### 検証
 
-- `cargo test -p fandhe-vector-db-engine --features bench-internals,contrast-bench --lib gpu_batch::packed_i8`
+- `cargo test -p engine --features bench-internals,contrast-bench --lib gpu_batch::packed_i8`
   （CPU オンリーの単体テスト。§7-1 の回帰テストを含む）
-- `cargo test -p fandhe-vector-db-engine --features bench-internals,contrast-bench --test gpu_batch_i8`
+- `cargo test -p engine --features bench-internals,contrast-bench --test gpu_batch_i8`
   （実 GPU がある本開発環境〔RTX 3060・Vulkan backend〕で実走。既存の
   CPU 参照実装一致・混在テナント非漏えいテストは無変更のまま green）
-- `cargo clippy -p fandhe-vector-db-engine --all-targets --features bench-internals,contrast-bench -- -D warnings`
+- `cargo clippy -p engine --all-targets --features bench-internals,contrast-bench -- -D warnings`
 
 ## 8. 前後比較実測（Issue #543）
 
@@ -386,7 +386,7 @@ available`（2,000 行・dim 128 のクラスタ構造ありコーパス）で o
 
 1. before バイナリを別 worktree・別 `CARGO_TARGET_DIR` で退避:
    `git worktree add <dir> 2d2c74e && cd <dir> && CARGO_TARGET_DIR=<target>
-   cargo bench --bench gpu_scaling_bench -p fandhe-vector-db-engine --no-run
+   cargo bench --bench gpu_scaling_bench -p engine --no-run
    --message-format=json` を実行し `executable` を抽出する。
 2. after バイナリは作業ブランチで同様にビルドする。
 3. 交互実行: `BEFORE_BIN=<path> AFTER_BIN=<path> OUT_DIR=<dir>

@@ -153,10 +153,10 @@ after 側の測定を生成したバイナリはリポジトリ履歴から復�
   破損行のブロック境界一致・`CpuScalarProvider`／`ParallelSearchProvider` 間
   bit 単位一致・整数ベクトル独立参照実装との一致）を先に green にしてから
   計測すること
-- ビルド: before/after とも `cargo build --release -p fandhe-vector-db-engine`
+- ビルド: before/after とも `cargo build --release -p engine`
   （before/after で `Cargo.toml`・依存は変更しないため同一プロファイル）
 - 計測対象: `make bench-knn-profile`（S5 系フェーズ）と
-  `cargo run --release -p fandhe-vector-db-engine --example feature_bench`（`vector_knn`
+  `cargo run --release -p engine --example feature_bench`（`vector_knn`
   フェーズ）の両方を実行する
 - 交互実行: before 1 回 → after 1 回を 1 ペアとし、最低 4 ペア（8 回）以上を
   ペア単位で交互に実行する。逐次実行（before を N 回連続 → after を N 回
@@ -171,5 +171,5 @@ after 側の測定を生成したバイナリはリポジトリ履歴から復�
 
 ```sh
 make bench-knn-profile   # S5 系フェーズの実測（時間依存・手動実行専用）
-cargo run --release -p fandhe-vector-db-engine --example feature_bench  # vector_knn フェーズ
+cargo run --release -p engine --example feature_bench  # vector_knn フェーズ
 ```

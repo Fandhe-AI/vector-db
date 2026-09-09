@@ -604,7 +604,7 @@ observe 限定（production 経路には一切影響しない）の診断カウ�
 `HnswWorkerStats` へ追加した。
 
 導入後の単発実測（本開発環境・threads=12・rows=20,256・dim=32・
-クラスタ構造ありコーパス。`cargo test --release -p fandhe-vector-db-engine --lib
+クラスタ構造ありコーパス。`cargo test --release -p engine --lib
 hnsw::parallel_build::tests::
 observed_build_at_high_thread_count_reports_low_degenerate_layer_searches
 -- --ignored --nocapture`）:

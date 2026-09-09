@@ -345,7 +345,7 @@ BEFORE_DIR="$S/before" AFTER_DIR="$S/after" MODE=feature-bench \
 
 Recall 3 ゲート層 B（§6）は timing 系ではなく決定的コーパスに基づくため輪番
 ドライバの対象外であり、`RECALL_ENGINE=brute_force|hnsw` を注入した
-`cargo test --release -p fandhe-vector-db-engine --test hybrid_recall -- --ignored --nocapture`
+`cargo test --release -p engine --test hybrid_recall -- --ignored --nocapture`
 等（`RECALL_VERBOSE=1` 併用）を before/after 双方のソースツリーで 1 回ずつ
 実行して比較する。
 

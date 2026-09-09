@@ -72,7 +72,7 @@ enum マッチの分岐分散が発生していた。本 Issue は PostgreSQL �
 
 ## 検証
 
-- `cargo test -p fandhe-vector-db-engine`: `sql_udf_call`／`sql_surface`／`sql_aggregate`／
+- `cargo test -p engine`: `sql_udf_call`／`sql_surface`／`sql_aggregate`／
   `sql_group_by`／`sql_evaluation_order`／`wasm_udf_contract`／
   `tenant_isolation`／`tenant_breach` を含む既存テストは無修正で green
   （評価結果・エラー契約が不変であることの確認）
@@ -104,7 +104,7 @@ enum マッチの分岐分散が発生していた。本 Issue は PostgreSQL �
 実行方法:
 
 ```sh
-cargo test -p fandhe-vector-db-engine --release --lib \
+cargo test -p engine --release --lib \
   sql::expr_program::tests::bench_recursive_eval_vs_compiled_program \
   -- --ignored --nocapture
 ```

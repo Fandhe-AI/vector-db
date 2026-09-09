@@ -275,7 +275,7 @@ git archive 838c53e | tar -x -C <scratch>/before
 cp crates/engine/benches/hybrid_latency_bench.rs <scratch>/before/crates/engine/benches/
 cp crates/engine/benches/harness/hybrid_latency.rs <scratch>/before/crates/engine/benches/harness/
 CARGO_TARGET_DIR=<scratch>/target-before cargo build --release \
-  --manifest-path <scratch>/before/Cargo.toml -p fandhe-vector-db-engine --bench hybrid_latency_bench
+  --manifest-path <scratch>/before/crates/engine/Cargo.toml --bench hybrid_latency_bench
 ```
 
 実測結果・判断は `docs/design/hnsw-hybrid-iterative-scan.md`「前後比較実測
@@ -483,8 +483,8 @@ env 変数（すべて fail-closed パース。不正値は非ゼロ終了）:
 
 ```sh
 # 1. 変更前後のコミットをそれぞれ git archive で独立ディレクトリへ展開し、
-#    各ディレクトリで cargo bench --bench {dot_kernel_bench,knn_profile_bench,chip_bench} -p fandhe-vector-db-engine --no-run
-#    と cargo build --release -p fandhe-vector-db-engine --example feature_bench を事前ビルドしておく
+#    各ディレクトリで cargo bench --bench {dot_kernel_bench,knn_profile_bench,chip_bench} --manifest-path crates/engine/Cargo.toml --no-run
+#    と cargo build --release --manifest-path crates/engine/Cargo.toml --example feature_bench を事前ビルドしておく
 BEFORE_DIR=<before のディレクトリ> AFTER_DIR=<after のディレクトリ> AB_PAIRS=5 \
   make bench-chip-ab
 # 2. TSV へ集約（env ブロック・workload×metric ごとの before/after min・median・ratio・判定クラス）

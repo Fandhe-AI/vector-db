@@ -58,10 +58,10 @@ README「ティア別レイテンシ受け入れ基準の実測手順」を参�
    実行）を行い、「測定不能」の明示ログ出力とともに正常終了（exit 0）することを確認した。
 2. **fail-closed の動作確認**: opt-in しつつ接続・閾値 env 未設定で実行し、明示エラー
    とともに非ゼロ終了（exit 1）することを確認した。
-3. **ビルド確認**: `cargo bench --bench tier_latency_bench -p fandhe-vector-db-engine --no-run` が
+3. **ビルド確認**: `cargo bench --bench tier_latency_bench -p engine --no-run` が
    警告なしで成功することを確認した（`cargo clippy --workspace --all-targets
    --all-features -- -D warnings` にも本ベンチ・テストを含めて通過済み）。
-4. **判定ロジック・routing の回帰確認**: `cargo test -p fandhe-vector-db-engine --test
+4. **判定ロジック・routing の回帰確認**: `cargo test -p engine --test
    tier_latency_accept` を実行し、`harness::tier` の判定ロジックがすべて pass する
    ことを確認した。
 

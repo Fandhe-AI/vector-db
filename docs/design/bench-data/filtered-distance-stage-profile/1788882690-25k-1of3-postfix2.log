@@ -1,4 +1,4 @@
-cargo bench --bench scan_stage_profile_bench -p fandhe-vector-db-engine
+cargo bench --bench scan_stage_profile_bench -p engine
     Finished `bench` profile [optimized] target(s) in 0.04s
      Running benches/scan_stage_profile_bench.rs (target/release/deps/scan_stage_profile_bench-53a25b3a00c6c991)
 env: os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma loadavg=5.71 2.73 1.75 1/449 2732561

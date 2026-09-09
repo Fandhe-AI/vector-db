@@ -453,11 +453,11 @@ x86_64 VNNI 系（u8×s8→i32・`vpdpbusd`）と異なり、`vdotq_s32`（s8×s
   （実ビルド。1.98.0 toolchain）: `dot_i8_neon_dotprod` シンボルで禁止
   命令 0 件・`sdot v.4s` 1 件を確認（exit 0）。x86_64 側の既存検査も
   非退行（exit 0）。
-- `cargo check -p fandhe-vector-db-engine --all-targets --target aarch64-unknown-linux-gnu`
+- `cargo check -p engine --all-targets --target aarch64-unknown-linux-gnu`
   （1.98.0）: 警告なしで通過（`unused_variables`／`unused_mut` の再発なし）。
-- `cargo clippy -p fandhe-vector-db-engine --lib --target aarch64-unknown-linux-gnu -- -D
+- `cargo clippy -p engine --lib --target aarch64-unknown-linux-gnu -- -D
   warnings`（1.98.0）: 警告なし。
-- x86_64（本開発環境）: `cargo test -p fandhe-vector-db-engine --test isa` 全 18 件 pass・
+- x86_64（本開発環境）: `cargo test -p engine --test isa` 全 18 件 pass・
   `cargo fmt --check` 差分なし。
 - 「x86 版との整数一致（同一入力で同一出力）」の受け入れ条件は、Issue の
   想定した個別 golden 定数ハードコードテストではなく、既存テスト
@@ -474,7 +474,7 @@ x86_64 VNNI 系（u8×s8→i32・`vpdpbusd`）と異なり、`vdotq_s32`（s8×s
 性能実測の唯一の証跡は `.github/workflows/detect-features.yml` の
 `detect-apple` ジョブ（GitHub ホステッド `macos-latest`。
 `cargo run --example detect_features` の `isa::current_i8(): NeonDotprod`
-出力・`cargo test -p fandhe-vector-db-engine --test isa` 全件）と、PR の `cross-check`
+出力・`cargo test -p engine --test isa` 全件）と、PR の `cross-check`
 ジョブ（1.98.1・`make check-cross`＋`make simd-codegen-check-cross`）に
 依存する。Apple 実機・Graviton での性能前後比較は #530／#526 の担当の
 まま（未実施。手順・記録テンプレートは Issue #526 で整備済み——

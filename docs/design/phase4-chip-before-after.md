@@ -81,10 +81,10 @@ Phase 5: #567/#578/#591/#598 GPU／Phase 6: #565/#572／wire: #573／#562 広域
 ### 3.1 手順（本環境で実施）
 
 1. `git archive 91f6a18` / `git archive 6184491` を独立ディレクトリへ展開
-2. 各状態で `cargo bench --bench dot_kernel_bench -p fandhe-vector-db-engine --no-run` →
-   `cargo bench --bench knn_profile_bench -p fandhe-vector-db-engine --no-run` →
-   `cargo build --release -p fandhe-vector-db-engine --example feature_bench` →
-   `cargo bench --bench chip_bench -p fandhe-vector-db-engine --no-run`（計測窓にビルド時間を
+2. 各状態で `cargo bench --bench dot_kernel_bench -p engine --no-run` →
+   `cargo bench --bench knn_profile_bench -p engine --no-run` →
+   `cargo build --release -p engine --example feature_bench` →
+   `cargo bench --bench chip_bench -p engine --no-run`（計測窓にビルド時間を
    混入させない事前ビルド）
 3. `scripts/bench_chip_ab.sh`（新規。本 Issue で追加）を
    `BEFORE_DIR`／`AFTER_DIR`／`AB_PAIRS=5`／`BENCH_CHIP_WORKLOADS=<対象>` で実行
@@ -277,10 +277,10 @@ git archive 91f6a18 | tar -x -C <state-before>
 git archive 6184491 | tar -x -C <state-after>
 
 # 2. 事前ビルド（計測窓にビルド時間を混入させない）
-cd <state-before> && cargo bench --bench dot_kernel_bench -p fandhe-vector-db-engine --no-run \
-  && cargo bench --bench knn_profile_bench -p fandhe-vector-db-engine --no-run \
-  && cargo build --release -p fandhe-vector-db-engine --example feature_bench --example seed_docs \
-  && cargo bench --bench chip_bench -p fandhe-vector-db-engine --no-run
+cd <state-before> && cargo bench --bench dot_kernel_bench -p engine --no-run \
+  && cargo bench --bench knn_profile_bench -p engine --no-run \
+  && cargo build --release -p engine --example feature_bench --example seed_docs \
+  && cargo bench --bench chip_bench -p engine --no-run
 cd <state-after>  && (同上)
 
 # 3. chip_bench 前後比較（ドライバを含む <repo-root> へ戻ってから実行する）

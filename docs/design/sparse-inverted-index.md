@@ -170,7 +170,7 @@ Apache-2.0 表記で参照している既存の先例と表記を揃えた）
 
 - **before**: `8bfaaa4`（origin/main。#387〔Issue #416〕まで込み・#388 直前と
   production コード同一）を `git worktree add --detach` でチェックアウトし、
-  別 `CARGO_TARGET_DIR` で `cargo build --release -p fandhe-vector-db-engine --example
+  別 `CARGO_TARGET_DIR` で `cargo build --release -p engine --example
   feature_bench` を実行
 - **after**: 本ブランチ（`origin/main` `6cdf2e7`〔#428 まで。Phase 1 の
   production 変更 #388〜#392 = PR #422/#424/#425/#426/#427 を含む〕+
@@ -332,8 +332,8 @@ warmup 20・計測 30。`GITHUB_ACTIONS` 下は fail-closed 拒否のため未�
 
 ```sh
 # feature_bench（release ビルド。before は該当コミットの worktree + 別 CARGO_TARGET_DIR）
-cargo build --release -p fandhe-vector-db-engine --example feature_bench
-cargo run --release -p fandhe-vector-db-engine --example feature_bench
+cargo build --release -p engine --example feature_bench
+cargo run --release -p engine --example feature_bench
 
 # bench-hybrid-profile（手動専用。GITHUB_ACTIONS 下は fail-closed 拒否）
 make bench-hybrid-profile

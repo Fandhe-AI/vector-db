@@ -128,7 +128,7 @@ green）・`scripts/check_sort_determinism.sh` を確認済み。`make core-api-
 ## 前後比較
 
 before = `origin/main`（`c7f478a`）、after = 本 Issue の HEAD。同一
-`cargo build --release -p fandhe-vector-db-engine --example feature_bench`（別 `CARGO_TARGET_DIR`）
+`cargo build --release -p engine --example feature_bench`（別 `CARGO_TARGET_DIR`）
 を交互に N=5 ペア実行し、各 run の p50 を記録した（本開発環境は共有環境のため
 **参考値**。採用根拠は構造的非退行——縮退先が既存の全走査経路そのもの・hot 経路
 は候補数 O(|hits|)——と cold/hot・RLS オラクルの等価性テストに置く）。

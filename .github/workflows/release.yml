@@ -57,10 +57,11 @@ permissions:
   contents: read
 
 concurrency:
-  # 同一クレートへの公開処理が並行して二重実行されないよう直列化する。
+  # 公開処理が並行して二重実行されないようワークフロー全体で直列化する（`all` と
+  # 単体公開は対象クレートが重なるため、クレート別グループでは排他にならない）。
   # 公開処理の途中キャンセルは crates.io 側の中途半端な状態を招き得るため
   # cancel-in-progress は行わない。
-  group: release-${{ inputs.crate }}
+  group: release
   cancel-in-progress: false
 
 jobs:

@@ -927,7 +927,7 @@ HnswDenseProvider` に in-build 無効化トグルが無いため）。
   `docs/design/benchmark-judgement-policy.md` §3）
 - overlay: `crates/engine/benches/hybrid_latency_bench.rs`・`benches/harness/
   hybrid_latency.rs`（本 Issue のベンチ差分のみ）を before ツリーへコピーし
-  `cargo build --release -p fandhe-vector-db-engine --bench hybrid_latency_bench` でビルド
+  `cargo build --release -p engine --bench hybrid_latency_bench` でビルド
   （production・`Cargo.lock` は各コミットのまま）。before ツリーには
   `HnswIndexCacheStats::hybrid_resumed_rounds` フィールド自体が存在しないため、
   `extract_counter`（Debug 文字列越しの薄いパーサ）でこの関数自体を両ツリーで
@@ -1041,7 +1041,7 @@ Issue #410 の同点誘発コーパス（4,000 件・vocab=64・QUANTIZE_LEVELS=
 
 `docs/spec`（private submodule）が本環境にチェックアウトされておらず、
 `HYBRID_RECALL_MIN_*` 等の spec 由来閾値を注入できない（環境変数未設定）。
-`RECALL_ENGINE=hnsw RECALL_VERBOSE=1 cargo test --release -p fandhe-vector-db-engine --test
+`RECALL_ENGINE=hnsw RECALL_VERBOSE=1 cargo test --release -p engine --test
 hybrid_recall -- --ignored --nocapture` を実行したところ、閾値ゲートは
 契約どおり **明示的な no-op**（`HYBRID_RECALL_MIN_R20_SMALL not configured;
 gate not enabled` 等。fail ではない）として完了し、`RECALL_VERBOSE=1` でも

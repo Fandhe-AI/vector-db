@@ -132,7 +132,7 @@ dim=128）を 3 回実行した中央値:
 
 ### feature_bench `ingest` フェーズとの整合（A1）
 
-同一開発環境で `cargo run --release -p fandhe-vector-db-engine --example feature_bench` を実行し、
+同一開発環境で `cargo run --release -p engine --example feature_bench` を実行し、
 `ingest` フェーズ（25 バッチ・1,000 行/バッチ・dim128・テナント A/B 混在）の
 実測値と本ベンチの E0（40 バッチ・1,000 行/バッチ・dim128・単一テナント）を比較する:
 
@@ -184,7 +184,7 @@ BENCH_INGEST_PROFILE_ROWS=200 BENCH_INGEST_PROFILE_DIM=64 make bench-ingest-prof
 # CI 経路での拒否を確認する場合:
 GITHUB_ACTIONS=true make bench-ingest-profile
 # feature_bench との比較用:
-cargo run --release -p fandhe-vector-db-engine --example feature_bench
+cargo run --release -p engine --example feature_bench
 ```
 
 ## スコープ外
@@ -310,10 +310,10 @@ Issue #397 で encode 実行回数を 1 行 1 回へ揃えた後も、`insert_ro
   `crates/engine/tests/persistence.rs::
   persist2_put_batch_discards_whole_transaction_on_mid_batch_encode_failure`
   で確認済み。
-- `cargo test -p fandhe-vector-db-engine --lib`（1,215 件）・関連結合テスト（`recovery_content_
+- `cargo test -p engine --lib`（1,215 件）・関連結合テスト（`recovery_content_
   hash`・`ingest_profile_accept`・`incremental_index`・`incremental_recall`・
   `batch_limits`・`persistence`・`power_loss`・`index_failure_injection`・
-  `sql_surface`）・`cargo clippy -p fandhe-vector-db-engine --all-targets -- -D warnings`・
+  `sql_surface`）・`cargo clippy -p engine --all-targets -- -D warnings`・
   `make check-cross`（aarch64）はいずれも green。
 
 ### 前後比較実測
@@ -385,7 +385,7 @@ Issue #397 で encode 実行回数を 1 行 1 回へ揃えた後も、`insert_ro
 自動では反映されない構造（本ファイル冒頭の「測定設計」節参照）のため、本 Issue
 では `content_hash.rs` 内の手動専用テスト
 （`recovery::content_hash::tests::sha256_streaming_vs_reference_manual_timing`。
-`#[ignore]`・CI 非配線。`cargo test --release -p fandhe-vector-db-engine --lib
+`#[ignore]`・CI 非配線。`cargo test --release -p engine --lib
 recovery::content_hash::tests::sha256_streaming_vs_reference_manual_timing --
 --ignored --nocapture` で実行）で計測した。
 

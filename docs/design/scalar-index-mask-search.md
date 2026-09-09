@@ -218,8 +218,8 @@ gather 済み `CpuScalarProvider::search` 対照一致（同点誘発コーパ�
 ## 検証コマンド
 
 ```bash
-cargo test -p fandhe-vector-db-engine --lib kernel:: parallel_search:: arena::
-cargo test -p fandhe-vector-db-engine --test scalar_index_mask_search --test scalar_index_prune \
+cargo test -p engine --lib kernel:: parallel_search:: arena::
+cargo test -p engine --test scalar_index_mask_search --test scalar_index_prune \
   --test scalar_index_cache --test hnsw_cache --test hnsw_hybrid_refetch \
   --test sql_explain --test sql_precision_mode
 scripts/check_core_api.sh --update && bash scripts/check_core_api.sh

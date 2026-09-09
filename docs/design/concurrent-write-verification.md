@@ -34,7 +34,7 @@ join 後に `scan_page` のページングで全行を読み切り、欠損・�
 ### 実測ハーネス（手動実行専用）
 
 `crates/engine/examples/concurrent_write_bench.rs`（`cargo test` の対象外。
-`cargo run -p fandhe-vector-db-engine --release --example concurrent_write_bench` で実行）。
+`cargo run -p engine --release --example concurrent_write_bench` で実行）。
 スレッド数 {1, 2, 4, 8} × 書き込み方式 {`put` 単発, `put_batch`（20 件/バッチ）}
 の全 8 設定で、1 設定あたり 800 行を書き込み、操作（`put` 1 回 or `put_batch` 1 回）
 ごとの所要時間の p50/p95/max と全体スループット（rows/sec）を計測する。

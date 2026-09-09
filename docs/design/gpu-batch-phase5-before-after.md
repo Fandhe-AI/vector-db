@@ -32,7 +32,7 @@ FAISS GPU（`IndexFlatIP`）・Qdrant GPU 索引構築との対照値を同一�
 | after | `a40edd7` | 作業ブランチ作成時点の `origin/main`（Phase 5 全 4 変更を含む） |
 
 - 両状態は `git archive <hash>` で個別ディレクトリへ展開し、独立した
-  `CARGO_TARGET_DIR` で `cargo bench --bench gpu_scaling_bench -p fandhe-vector-db-engine
+  `CARGO_TARGET_DIR` で `cargo bench --bench gpu_scaling_bench -p engine
   --no-run --message-format=json` によりビルドした（release プロファイル・
   同一 `rustc 1.96.0`）。
 - **ビルド条件の同一性**: `git diff --stat b161d5b a40edd7 -- Cargo.lock
@@ -285,10 +285,10 @@ Bash の変数代入ではパス名展開（glob）が行われないため、�
 git archive b161d5b | tar -x -C <before-dir>
 git archive a40edd7 | tar -x -C <after-dir>
 BEFORE_BIN=$(cd <before-dir> && CARGO_TARGET_DIR=<before-target> cargo bench \
-  --bench gpu_scaling_bench -p fandhe-vector-db-engine --no-run --message-format=json \
+  --bench gpu_scaling_bench -p engine --no-run --message-format=json \
   | jq -r 'select(.executable != null) | .executable')
 AFTER_BIN=$(cd <after-dir> && CARGO_TARGET_DIR=<after-target> cargo bench \
-  --bench gpu_scaling_bench -p fandhe-vector-db-engine --no-run --message-format=json \
+  --bench gpu_scaling_bench -p engine --no-run --message-format=json \
   | jq -r 'select(.executable != null) | .executable')
 BEFORE_BIN="$BEFORE_BIN" AFTER_BIN="$AFTER_BIN" OUT_DIR=<out-dir> \
   scripts/bench_gpu_scaling_ab.sh 5 100000:128:64 20000:128:8 20000:128:64 \

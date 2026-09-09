@@ -76,14 +76,14 @@ GroupEnd` の挙動（タイ組の境界カット・完全化）がキャッシ�
 
 | 対象 | 結果 |
 | ---- | ---- |
-| `cargo test -p fandhe-vector-db-engine --test hybrid_recall` | ok（10 passed・層 A 固定値〔小規模・大規模〕不変） |
-| `cargo test -p fandhe-vector-db-engine --test rerank_recall` | ok（13 passed） |
-| `cargo test -p fandhe-vector-db-engine --test query_planning_recall` | ok（10 passed） |
-| `cargo test -p fandhe-vector-db-engine --test precision_eval` | ok（11 passed） |
-| `cargo test -p fandhe-vector-db-engine --test incremental_recall` | ok |
-| `cargo test -p fandhe-vector-db-engine --test sparse_cache` | ok（5 passed。#357 既存受け入れ基準） |
-| `cargo test -p fandhe-vector-db-engine --test sql_surface` | ok（12 passed） |
-| `cargo test -p fandhe-vector-db-engine --test hybrid` | ok（9 passed） |
+| `cargo test -p engine --test hybrid_recall` | ok（10 passed・層 A 固定値〔小規模・大規模〕不変） |
+| `cargo test -p engine --test rerank_recall` | ok（13 passed） |
+| `cargo test -p engine --test query_planning_recall` | ok（10 passed） |
+| `cargo test -p engine --test precision_eval` | ok（11 passed） |
+| `cargo test -p engine --test incremental_recall` | ok |
+| `cargo test -p engine --test sparse_cache` | ok（5 passed。#357 既存受け入れ基準） |
+| `cargo test -p engine --test sql_surface` | ok（12 passed） |
+| `cargo test -p engine --test hybrid` | ok（9 passed） |
 | `make sort-determinism-check` | ok |
 
 ## 実行結果（新規 SQL 表層専用検証）
@@ -104,7 +104,7 @@ examples/` へ追跡化した。
 
 - **before**: `git worktree add` で #377 直前の main（コミット `4d913bb`）を
   チェックアウトし、同じ `feature_bench.rs` を複製して
-  `cargo run --release -p fandhe-vector-db-engine --example feature_bench` を 1 回実行
+  `cargo run --release -p engine --example feature_bench` を 1 回実行
 - **after**: 作業ブランチ（#377 込み）で同じコマンドを 1 回実行
 
 いずれも非専有環境（本開発コンテナ）での 1 回実測であり、参考値として扱う
@@ -157,7 +157,7 @@ p50 で約 2.5 倍、p95 で約 1.65 倍のレイテンシ改善を確認した�
 
 ## 3 クライアント wire 経由検証（要件 4）
 
-- 層 A（`cargo test -p fandhe-vector-db-wire-server`）: green（全 crate 実行。109 + 各結合テスト
+- 層 A（`cargo test -p wire-server`）: green（全 crate 実行。109 + 各結合テスト
   ファイル含め failure 0）
 - 層 B（`#[ignore]` の 3 クライアント e2e）: `three_clients_run_c1_through_c4_and_
   reject_wrong_password`（`crates/wire-server/tests/three_client_e2e.rs`。
@@ -191,17 +191,17 @@ p50 で約 2.5 倍、p95 で約 1.65 倍のレイテンシ改善を確認した�
 
 ```sh
 # SQL 表層専用の cold/hot 等価性検証（小規模・同点誘発コーパス）
-cargo test -p fandhe-vector-db-engine --test sparse_cache_recall
+cargo test -p engine --test sparse_cache_recall
 
 # 大規模段（数万件規模。既定では実行しない）
 make sparse-cache-recall-large
 
 # 既存 Recall ゲート（cache 非経由。構造的不変の再確認）
-cargo test -p fandhe-vector-db-engine --test hybrid_recall --test rerank_recall \
+cargo test -p engine --test hybrid_recall --test rerank_recall \
   --test query_planning_recall --test precision_eval --test incremental_recall
 
 # 前後比較（feature_bench。release ビルド）
-cargo run --release -p fandhe-vector-db-engine --example feature_bench
+cargo run --release -p engine --example feature_bench
 ```
 
 ## 追記（Issue #393）

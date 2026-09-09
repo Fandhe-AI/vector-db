@@ -463,7 +463,7 @@ A=59.3%・C=56.9%。本節冒頭）のいずれも超えず、悪化の根拠に
 ## 6. Recall 3 ゲート層 B（`RECALL_ENGINE=brute_force`／`hnsw` × A／C）
 
 `(0.0,1.0]` 内のプレースホルダ閾値（`0.001`）＋`RECALL_VERBOSE=1` を注入し、
-`cargo test --release -p fandhe-vector-db-engine --test <name> -- --ignored --nocapture` を
+`cargo test --release -p engine --test <name> -- --ignored --nocapture` を
 状態 × エンジンの 4 通りで実行した（決定的ハーネスのため 1 回で十分。
 プレースホルダは spec 閾値ではなく pass/fail は記録しない）。
 
@@ -492,7 +492,7 @@ Top-k 内の順位入れ替え・スコアの微小なビット差はこの指�
 直接比較）が根拠であり、本書の Recall 一致はそれを補強する状況証拠
 （集計指標の非退行）にとどめる。12 run すべて `test result: ok`（`0 failed`）。
 
-層 A（`cargo test --release -p fandhe-vector-db-engine --test hybrid_recall --test
+層 A（`cargo test --release -p engine --test hybrid_recall --test
 rerank_recall --test query_planning_recall --test sparse_determinism`。状態 C）
 は全件 green（23 テスト・0 failed）。
 
@@ -584,10 +584,10 @@ git archive 91f6a18 | tar -x -C <dir-a>
 git archive c86c683 | tar -x -C <dir-c>
 
 # 状態 A（before）をビルド
-( cd <dir-a> && CARGO_TARGET_DIR=<dir-a>/target cargo build --release -p fandhe-vector-db-engine --example feature_bench --bench hybrid_profile_bench --features bench-internals -p fandhe-vector-db-wire-server --bin wire-server )
+( cd <dir-a> && CARGO_TARGET_DIR=<dir-a>/target cargo build --release -p engine --example feature_bench --bench hybrid_profile_bench --features bench-internals -p wire-server --bin wire-server )
 
 # 状態 C（after）をビルド
-( cd <dir-c> && CARGO_TARGET_DIR=<dir-c>/target cargo build --release -p fandhe-vector-db-engine --example feature_bench --bench hybrid_profile_bench --features bench-internals -p fandhe-vector-db-wire-server --bin wire-server )
+( cd <dir-c> && CARGO_TARGET_DIR=<dir-c>/target cargo build --release -p engine --example feature_bench --bench hybrid_profile_bench --features bench-internals -p wire-server --bin wire-server )
 
 # feature_bench 交互 5 ペア（p50 min-of-5・median-of-5 を集計）
 for n in 1 2 3 4 5; do
@@ -637,13 +637,13 @@ for dir in <dir-a> <dir-c>; do
   ( cd "$dir" && \
     RECALL_VERBOSE=1 RECALL_ENGINE=brute_force \
       HYBRID_RECALL_MIN_R20_SMALL=0.001 HYBRID_RECALL_MIN_R20_LARGE=0.001 HYBRID_RECALL_MIN_R100_LARGE=0.001 \
-      cargo test --release -p fandhe-vector-db-engine --test hybrid_recall -- --ignored --nocapture && \
+      cargo test --release -p engine --test hybrid_recall -- --ignored --nocapture && \
     RECALL_VERBOSE=1 RECALL_ENGINE=brute_force RERANK_RECALL_MIN_R20_LARGE=0.001 \
-      cargo test --release -p fandhe-vector-db-engine --test rerank_recall -- --ignored --nocapture && \
+      cargo test --release -p engine --test rerank_recall -- --ignored --nocapture && \
     RECALL_VERBOSE=1 RECALL_ENGINE=brute_force \
       QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT=0.001 QUERY_PLANNING_RECALL_MIN_R20_DIRECT=0.001 \
       QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED=0.001 QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE=0.001 \
-      cargo test --release -p fandhe-vector-db-engine --test query_planning_recall -- --ignored --nocapture )
+      cargo test --release -p engine --test query_planning_recall -- --ignored --nocapture )
 done
 # RECALL_ENGINE=hnsw に差し替えて同様に実行
 ```

@@ -101,7 +101,7 @@ pgvector の既定値（64）とは異なる。
 - **before** = commit `0803a8c`（PR #429。Phase 3 の最初の production 変更
   〔#423〕直前。`feature_bench.rs` は Issue #358 でこの時点までに追跡化
   済み）。`git worktree add --detach <dir> 0803a8c` ＋ 別 `CARGO_TARGET_DIR`
-  で `cargo build --release -p fandhe-vector-db-engine --example feature_bench`。
+  で `cargo build --release -p engine --example feature_bench`。
 - **after/既定** = 本ブランチ（`origin/main` `40cc024` ＋ 本 Issue の変更）を
   `BENCH_FEATURE_ENGINE` 未設定（既定 brute-force）で実行。
 - **after/hnsw** = 同ブランチを `BENCH_FEATURE_ENGINE=hnsw` で実行。
@@ -366,10 +366,10 @@ S0-cold の 22.9 倍は「毎サンプル HNSW グラフをゼロから構築す
 ```bash
 # before バイナリ
 git worktree add --detach /tmp/ann413-before 0803a8c
-CARGO_TARGET_DIR=/tmp/ann413-target-before cargo build --release -p fandhe-vector-db-engine --example feature_bench
+CARGO_TARGET_DIR=/tmp/ann413-target-before cargo build --release -p engine --example feature_bench
 
 # after バイナリ（本ブランチ）
-cargo build --release -p fandhe-vector-db-engine --example feature_bench
+cargo build --release -p engine --example feature_bench
 
 # scale=1（既定）
 ./target/release/examples/feature_bench                         # 既定エンジン
@@ -986,11 +986,11 @@ git worktree add --detach <scratch>/after ad484e7  # PR #590 マージコミッ�
 #  ad484e7 は計測用計装をネイティブに含むためパッチ不要）
 # CARGO_TARGET_DIR を分離しつつ、各 checkout の Cargo.toml を明示して
 # 双方 release ビルド（--manifest-path で checkout を固定する）
-CARGO_TARGET_DIR=<scratch>/target-before cargo build --release -p fandhe-vector-db-engine \
+CARGO_TARGET_DIR=<scratch>/target-before cargo build --release -p engine \
   --manifest-path <scratch>/before/Cargo.toml \
   --bench hnsw_parallel_build_bench --bench hnsw_compare_bench --features contrast-bench \
   --bench knn_profile_bench
-CARGO_TARGET_DIR=<scratch>/target-after cargo build --release -p fandhe-vector-db-engine \
+CARGO_TARGET_DIR=<scratch>/target-after cargo build --release -p engine \
   --manifest-path <scratch>/after/Cargo.toml \
   --bench hnsw_parallel_build_bench --bench hnsw_compare_bench --features contrast-bench \
   --bench knn_profile_bench

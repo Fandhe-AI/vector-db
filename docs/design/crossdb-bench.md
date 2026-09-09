@@ -511,9 +511,9 @@ Issue #532（PR #567・merge commit `59bc7a8`）はバッチ検索 GPU 経路の
 git archive b161d5b | tar -x -C /path/to/wt-before
 git archive 59bc7a8 | tar -x -C /path/to/wt-after
 (cd /path/to/wt-before && CARGO_TARGET_DIR=/path/to/target-before \
-  cargo bench --bench gpu_scaling_bench -p fandhe-vector-db-engine --no-run)
+  cargo bench --bench gpu_scaling_bench -p engine --no-run)
 (cd /path/to/wt-after && CARGO_TARGET_DIR=/path/to/target-after \
-  cargo bench --bench gpu_scaling_bench -p fandhe-vector-db-engine --no-run)
+  cargo bench --bench gpu_scaling_bench -p engine --no-run)
 # 交互 N=5 ペア・1 プロセス 1 規模点で実行
 BEFORE_BIN=/path/to/target-before/release/deps/gpu_scaling_bench-<hash> \
 AFTER_BIN=/path/to/target-after/release/deps/gpu_scaling_bench-<hash> \
@@ -791,12 +791,12 @@ ns/row 1683.1 と、dim=128 実測（`docs/design/hnsw-index.md` 参照）に比
 ### 再現手順
 
 ```bash
-cargo build --release -p fandhe-vector-db-engine --example seed_docs -p fandhe-vector-db-wire-server
+cargo build --release -p engine --example seed_docs -p wire-server
 
 S=<CROSSDB_DIR>
-cargo run --release -p fandhe-vector-db-engine --example seed_docs -- seed "$S/docs25k-d768.redb" 25000 768
-cargo run --release -p fandhe-vector-db-engine --example seed_docs -- export "$S/docs25k-d768.redb" "$S/docs25k-d768.jsonl"
-cargo run --release -p fandhe-vector-db-engine --example seed_docs -- queries 768 200 "$S/queries200-d768.jsonl"
+cargo run --release -p engine --example seed_docs -- seed "$S/docs25k-d768.redb" 25000 768
+cargo run --release -p engine --example seed_docs -- export "$S/docs25k-d768.redb" "$S/docs25k-d768.jsonl"
+cargo run --release -p engine --example seed_docs -- queries 768 200 "$S/queries200-d768.jsonl"
 
 python scripts/crossdb_bench/run.py --db self --config exact \
   --rows-file "$S/docs25k-d768.redb" --queries-file "$S/queries200-d768.jsonl" \
@@ -825,7 +825,7 @@ python scripts/crossdb_bench/run.py --db qdrant --config hnsw   --rows-file "$S/
 scripts/crossdb_bench/containers.sh down qdrant
 unset CROSSDB_QDRANT_CONTAINER CROSSDB_QDRANT_HTTP_PORT CROSSDB_QDRANT_GRPC_PORT
 
-BENCH_FEATURE_DIM=768 cargo run --release -p fandhe-vector-db-engine --example feature_bench
+BENCH_FEATURE_DIM=768 cargo run --release -p engine --example feature_bench
 BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 ```
 
