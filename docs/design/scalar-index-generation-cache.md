@@ -204,7 +204,7 @@ crates/wire-server` は空であり、before/after は同一ハーネス・同�
 `wire-server` ソースで、差分は `crates/engine/src/sql/scalar_index.rs`・
 テスト・docs のみ（同一ビルド条件の根拠）。3 arm とも `git archive` で独立
 ソースツリーへ展開し、`CARGO_TARGET_DIR` を分離して個別に `cargo build
---release -p wire-server` した。ハーネス（`scripts/crossdb_bench/*.py`・
+--release -p fandhe-vector-db-wire-server` した。ハーネス（`scripts/crossdb_bench/*.py`・
 `scripts/bench_scalar_index_crossdb_ab.sh`）は現行ワークツリー（harness
 commit `6ff22dc8`）のものを全 arm 共通で使用し、`CROSSDB_SELF_BINARY` で
 起動するバイナリのみを差し替えた（Issue #479 の方式）。
@@ -416,7 +416,7 @@ before/after 間の差分は `CLAUDE.md`・`crates/engine/src/sql/scalar_index.r
 Issue #633 と同一の `scripts/bench_scalar_index_crossdb_ab.sh`・
 `scripts/crossdb_bench/*.py` を使用し、3 arm を `git archive` で独立ソース
 ツリーへ展開・`CARGO_TARGET_DIR` を分離して個別に `cargo build --release
--p wire-server` した。輪番は before→after→before_ref→ref（Issue #633
+-p fandhe-vector-db-wire-server` した。輪番は before→after→before_ref→ref（Issue #633
 codex-review P1 指摘対応後の方式。候補〔after／ref〕ごとに専用の直近
 baseline を挟む）。
 

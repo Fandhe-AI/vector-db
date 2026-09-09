@@ -66,7 +66,7 @@ green）。
 （`89085aa`）+ 本 Issue のブランチで以下すべて green（固定値は無変更）。
 
 ```text
-cargo test -p engine --test hybrid_recall --test rerank_recall \
+cargo test -p fandhe-vector-db-engine --test hybrid_recall --test rerank_recall \
   --test query_planning_recall --test precision_eval --test incremental_recall
 ```
 
@@ -119,7 +119,7 @@ RECALL_VERBOSE=1 QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT=0.001 \
 ### 4. 大規模段 cold/hot 等価性（`make sparse-cache-recall-large`）
 
 既存の `#[ignore]` 大規模段テスト（20,000 件規模）を after 側（本ブランチ）で
-再実行し green を確認した（`cargo test -p engine --release --test sparse_cache_recall
+再実行し green を確認した（`cargo test -p fandhe-vector-db-engine --release --test sparse_cache_recall
 -- --ignored`。所要 約 7.8 秒）。
 
 ## 受け入れ条件の充足状況

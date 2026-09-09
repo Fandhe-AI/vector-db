@@ -186,7 +186,7 @@ make bench-hybrid-profile
 関数（`harness::hybrid_profile::sparse_refetch_schedule`）とその import・依存
 テスト 2 件（`sparse_refetch_schedule_*`）のみ同 feature の背後に置く。コーパス
 生成・SQL 文組み立て・tokenize 複製・`refuse_under_github_actions` 等、大半の
-時間非依存テストは feature 無指定の通常の `cargo test -p engine` でも実行され
+時間非依存テストは feature 無指定の通常の `cargo test -p fandhe-vector-db-engine` でも実行され
 （42 件）、`bench-internals` を含む `--all-features` では上記 2 件を加えた 44 件が
 検証される（Issue #387 PR #416 codex-review P2 指摘対応・2 巡目。1 巡目の対応では
 ファイル全体を `#![cfg(feature = "bench-internals")]` で覆っており、依存しない
@@ -573,7 +573,7 @@ SparseIndexCache`（Issue #357）経由の構築機会も無い〕に加えて�
 3. 単体テスト（`postings_reconstruct_tf_and_df_matching_doc_entry_for_
    all_docs` 等）で posting list から復元した tf／df が `DocEntry` 経由の
    値と全件一致することを固定した
-4. 既存テスト（`cargo test -p engine --all-features`）は green・依存追加
+4. 既存テスト（`cargo test -p fandhe-vector-db-engine --all-features`）は green・依存追加
    なし
 5. メモリ増分を `bench-hybrid-profile` の RSS で記録した（上表。解釈欄の
    限界も含めて記録）

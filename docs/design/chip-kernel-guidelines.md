@@ -653,7 +653,7 @@ macOS 26.5.2 に限定される（bare-metal・旧 macOS へは一般化しな�
   'hw.optional.AdvSIMD'`（§8.2 参照）。`hw.optional.arm.FEAT_FP16`／
   `FEAT_FHM`／`FEAT_DotProd` = `1`、`FEAT_BF16`／`FEAT_I8MM`／`FEAT_SME`／
   `FEAT_SME2` = `0`
-- `cargo test -p engine --test isa`: `test result: ok. 8 passed; 0 failed;
+- `cargo test -p fandhe-vector-db-engine --test isa`: `test result: ok. 8 passed; 0 failed;
   0 ignored; 0 measured; 0 filtered out`
 
 **オーナー実機（M4 等）**:
@@ -663,7 +663,7 @@ macOS 26.5.2 に限定される（bare-metal・旧 macOS へは一般化しな�
 
 ### 8.4 手順
 
-1. `make detect-features`（`cargo run -p engine --release --example
+1. `make detect-features`（`cargo run -p fandhe-vector-db-engine --release --example
    detect_features`）を実行する
 2. macOS では追加で `sysctl -n hw.optional.arm.FEAT_SME` 等（example の
    sysctl 名一覧を参照）で相互検証できる

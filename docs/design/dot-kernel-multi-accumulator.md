@@ -82,7 +82,7 @@ arena 規模（25,000 行 × dim768）では改善が約 8% にとどまり、DR
 `tests/dot_kernel_accept.rs`（`make ci` 対象）で回帰検証する。
 
 採否は 2 コミット間の worktree A/B で判断した: (1) ベンチ・ハーネスのみを先に
-コミットし `cargo bench --bench dot_kernel_bench -p engine --no-run` のバイナリ
+コミットし `cargo bench --bench dot_kernel_bench -p fandhe-vector-db-engine --no-run` のバイナリ
 を `baseline` として保存、(2) `isa.rs` を `DOT_ACCUMULATORS = 2` へ変更して
 再ビルドしたバイナリを `cand2` として保存、(3) `DOT_ACCUMULATORS = 4` へ変更
 した `cand4` を追加保存、(4) `baseline`/`cand2`/`baseline`/`cand4` を交互に
@@ -158,7 +158,7 @@ arena 規模（25,000 行 × dim768）では改善が約 8% にとどまり、DR
 1. `isa.rs` の `dot_avx2_fma` を一時的に「設計」節の 2 段構造（`WIDE = LANES *
    DOT_ACCUMULATORS` の平坦アキュムレータ配列）へ書き換える（`DOT_ACCUMULATORS`
    は検証対象の値。baseline 確認時は無変更のまま）。
-2. `cargo bench --bench dot_kernel_bench -p engine --no-run` でビルドし、
+2. `cargo bench --bench dot_kernel_bench -p fandhe-vector-db-engine --no-run` でビルドし、
    `target/release/deps/dot_kernel_bench-<hash>` を確認用に退避する。
 3. `nm <バイナリ> | grep dot_avx2_fma` でマングル済みシンボル名
    （`_ZN6engine3isa12dot_avx2_fma...`）を取得する。
@@ -225,7 +225,7 @@ Issue #365 は本 ADR の実測表・判断根拠をもって**現状維持で c
 
 ```sh
 # ベンチ・ハーネスをビルド（isa.rs は無変更のまま）
-cargo bench --bench dot_kernel_bench -p engine --no-run
+cargo bench --bench dot_kernel_bench -p fandhe-vector-db-engine --no-run
 # ビルド成果物を退避（target/release/deps/ には同一接頭辞の実行可能ファイルに
 # 加え rustc が生成する .d dep-info ファイル（例: dot_kernel_bench-<hash>.d）が
 # 同居し、glob だけでは実行可能ファイルとの区別がつかない。mtime 降順（ls -t）
@@ -235,7 +235,7 @@ cargo bench --bench dot_kernel_bench -p engine --no-run
 cp "$(ls -t target/release/deps/dot_kernel_bench-* 2>/dev/null | grep -v '\.d$' | head -1)" /path/to/baseline
 
 # isa.rs の DOT_ACCUMULATORS を変更（例: 2）して再ビルド
-cargo bench --bench dot_kernel_bench -p engine --no-run
+cargo bench --bench dot_kernel_bench -p fandhe-vector-db-engine --no-run
 cp "$(ls -t target/release/deps/dot_kernel_bench-* 2>/dev/null | grep -v '\.d$' | head -1)" /path/to/cand2
 
 # 交互実行して比較（例: 5 回）
@@ -464,7 +464,7 @@ cache_resident 改善（min-of-N 比 0.9248。両ノイズ帯を超過）は本�
 ### 再現手順（層 A）
 
 ```sh
-cargo bench --bench dot_kernel_bench -p engine --no-run
+cargo bench --bench dot_kernel_bench -p fandhe-vector-db-engine --no-run
 BIN="$(ls -t target/release/deps/dot_kernel_bench-* 2>/dev/null | grep -v '\.d$' | head -1)"
 for i in 1 2 3 4 5; do BENCH_DOT_KERNEL_BLOCK_AB=1 "$BIN"; done
 ```
@@ -772,9 +772,9 @@ Phase 4 通し比較（Issue #530）でも同型の本開発環境参考値を�
 git fetch origin
 git worktree add /path/to/before af1287f4f39b370d6792d970c94c119c32d237b5
 git worktree add /path/to/after  a40edd7b924a5eb1498eb0aa8a056c75d9d7eb41
-CARGO_TARGET_DIR=/path/to/target-before cargo build --release -p engine --bench dot_kernel_bench \
+CARGO_TARGET_DIR=/path/to/target-before cargo build --release -p fandhe-vector-db-engine --bench dot_kernel_bench \
   --manifest-path /path/to/before/crates/engine/Cargo.toml
-CARGO_TARGET_DIR=/path/to/target-after  cargo build --release -p engine --bench dot_kernel_bench \
+CARGO_TARGET_DIR=/path/to/target-after  cargo build --release -p fandhe-vector-db-engine --bench dot_kernel_bench \
   --manifest-path /path/to/after/crates/engine/Cargo.toml
 # 実行ファイルは target-*/release/deps/dot_kernel_bench-<hash>（.d を除く最新）
 

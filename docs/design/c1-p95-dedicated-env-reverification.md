@@ -44,7 +44,7 @@ end-to-end 再測定は TASK-165 の管轄とする。
 
 | 項目 | 内容 |
 | ---- | ---- |
-| 測定入口 | `crates/engine/benches/sql_c1_bench.rs`（`cargo bench --bench sql_c1_bench -p engine` / `make bench-c1`） |
+| 測定入口 | `crates/engine/benches/sql_c1_bench.rs`（`cargo bench --bench sql_c1_bench -p fandhe-vector-db-engine` / `make bench-c1`） |
 | 測定対象 | `EngineCore::execute_sql(ctx, "SELECT id FROM documents ORDER BY embedding <=> '[...]' LIMIT 20")`（SQL-1 の規範形。`harness::sql_c1` が構造検証つきで組み立てる） |
 | データ | 100,000 行 × 768 次元・k=20（本ベンチが選んだ計測構成。既存 `simd_bench.rs` の行数・次元に揃えて比較可能にしたもので、spec の計測条件の転記ではない。決定的シード RNG で生成し、`tenant::insert_rows` で 10,000 行単位のチャンク投入） |
 | プロトコル | `harness::protocol::run`（warmup 20・計測 50・決定的シード）→ `harness::accept::p95_from_samples` / `check_p95_within_limit`。Recall@20 は `CpuScalarProvider`（厳密最近傍の独立オラクル）との Top-20 一致率を 20 クエリの worst-query で判定 |

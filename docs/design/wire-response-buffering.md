@@ -112,7 +112,7 @@ write_ready_for_query` にのみ存在し、`ResponseBuffer` へ他フレーム�
 wire_bulk_select_latency_measurement`（`#[ignore]`・手動専用）で、
 `bulk_knn_k1000` 相当（`id, body`・本文約 200B・k=1,000・全件同一近傍方向の
 25,000 行規模を模した 1,000 行コーパス）の wire 往復レイテンシを before/after
-3 ペア実測した（`cargo test --release -p wire-server --test
+3 ペア実測した（`cargo test --release -p fandhe-vector-db-wire-server --test
 wire_bulk_response -- --ignored --nocapture wire_bulk_select_latency_measurement`。
 各ペア 20 往復・中央値採用。before は本 PR の `crates/wire-server/src/` 変更のみ
 `git stash` で除去した状態＝依存 Issue #463 時点の `origin/main`

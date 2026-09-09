@@ -412,17 +412,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
-name = "engine"
-version = "0.1.0"
-dependencies = [
- "ort",
- "redb",
- "tokenizers",
- "usearch",
- "wgpu",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -433,6 +422,24 @@ name = "esaxx-rs"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
+
+[[package]]
+name = "fandhe-vector-db-engine"
+version = "0.1.0"
+dependencies = [
+ "ort",
+ "redb",
+ "tokenizers",
+ "usearch",
+ "wgpu",
+]
+
+[[package]]
+name = "fandhe-vector-db-wire-server"
+version = "0.1.0"
+dependencies = [
+ "fandhe-vector-db-engine",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -1819,13 +1826,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "wire-server"
-version = "0.1.0"
-dependencies = [
- "engine",
 ]
 
 [[package]]

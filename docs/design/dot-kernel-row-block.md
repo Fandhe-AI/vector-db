@@ -194,7 +194,7 @@ unsafe { x86_block4::dot_block4_avx2_fma::<PADDED_TAIL>(rows, query, &mut s0, &m
 （aarch64 クロスコンパイル・命令検査。生成コードの証跡）が担保する。**NEON の
 実行時ビット同一性の唯一の証跡**は `.github/workflows/detect-features.yml` の
 `detect-apple` ジョブ（macos-latest・Apple Silicon 実機で
-`cargo test -p engine --test isa` を実行し、`dot_block4_matches_single_row_dot_bit_exact_across_dims`
+`cargo test -p fandhe-vector-db-engine --test isa` を実行し、`dot_block4_matches_single_row_dot_bit_exact_across_dims`
 が NEON arm を実際に検証する）である。
 
 `crates/engine/src/parallel_search.rs` 側の回帰は

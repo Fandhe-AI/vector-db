@@ -13,7 +13,10 @@ members = ["crates/engine", "crates/wire-server"]
 # `edition = "..."` 形式をこのファイルから読むため、この位置・形式を維持すること。
 edition = "2021"
 license = "MIT OR Apache-2.0"
-publish = false
+repository = "https://github.com/Fandhe-AI/vector-db"
+# crates.io 公開は `.github/workflows/release.yml`（workflow_dispatch・environment
+# `crates-io-release` の承認ゲート）からのみ行う。
+publish = true
 
 # CI（`cargo test --workspace --all-features`。`.github/workflows/ci.yml` の rust-ci →
 # Fandhe-AI/actions rust-base-ci reusable workflow）の実行時間対策。

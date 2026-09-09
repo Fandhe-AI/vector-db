@@ -242,7 +242,7 @@ dim=100・129 は 5 run 全て・集計 ratio のいずれで見ても固定 ±5
 ### 実アセンブリ確認
 
 コミット `51eab9ea8044`（`isa.rs` は Issue #528・`2ca1536` 以降無変更）で
-`cargo bench --bench dot_kernel_bench -p engine --no-run` のバイナリに対し
+`cargo bench --bench dot_kernel_bench -p fandhe-vector-db-engine --no-run` のバイナリに対し
 `nm` で `dot_avx2_fma` の 2 monomorphization（`PADDED_TAIL=false`／`true`）
 シンボルを取得し `objdump -d -M intel` で比較した。
 

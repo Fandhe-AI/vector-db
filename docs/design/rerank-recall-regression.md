@@ -265,7 +265,7 @@ SEARCH-7 の相対基準（`improvement_ratio` の下限。オーナー承認済
 **依存追加を中断した経緯**: `ort = "=2.0.0-rc.13"` + `tokenizers = "=0.23.1"`
 （`optional = true` + `cross-encoder` feature。実装計画どおり `default-features =
 false` + `load-dynamic` 構成）を `crates/engine/Cargo.toml` へ追加し、
-`cargo tree -p engine --features cross-encoder -e features` で依存解決・
+`cargo tree -p fandhe-vector-db-engine --features cross-encoder -e features` で依存解決・
 `load-dynamic` 以外の feature が有効化されていないこと・`cargo tree -p
 wire-server` に両クレートが出現しないことを確認したが、`make deny` の
 advisories チェックが `tokenizers` の推移的依存 `paste`（unmaintained advisory

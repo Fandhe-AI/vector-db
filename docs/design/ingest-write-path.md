@@ -74,7 +74,7 @@ Linux・x86_64・12 論理コア・AVX2FMA。`docs/design/ingest-stage-profile.m
 ### 3.1 `feature_bench` `ingest` フェーズ
 
 25 バッチ・1,000 行/バッチ・dim128・テナント A/B 混在（`cargo run --release
--p engine --example feature_bench`）を交互 3 ペア実行した中央値:
+-p fandhe-vector-db-engine --example feature_bench`）を交互 3 ペア実行した中央値:
 
 | 指標 | before (median) | after (median) | 比 (after/before) |
 | --- | --- | --- | --- |
@@ -228,13 +228,13 @@ Issue #398 で導入した 1 バッチ 1 arena 確保（`encoded_row_len` の `c
 # before（Issue #396 時点）
 git worktree add /path/to/wt-before 61fc943 --detach
 cd /path/to/wt-before
-cargo run --release -p engine --example feature_bench
+cargo run --release -p fandhe-vector-db-engine --example feature_bench
 make bench-ingest-profile
 
 # after（本 doc 掲載値の計測対象。2.1 節の badd9d9 で固定）
 git worktree add /path/to/wt-after badd9d9 --detach
 cd /path/to/wt-after
-cargo run --release -p engine --example feature_bench
+cargo run --release -p fandhe-vector-db-engine --example feature_bench
 make bench-ingest-profile
 ```
 

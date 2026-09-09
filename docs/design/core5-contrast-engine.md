@@ -70,7 +70,7 @@ required-features = ["contrast-bench"]
 
 とし、`contrast_bench.rs`（新設）にのみ `required-features` を付けた。`src/` 配下は
 本 feature で一切 `cfg` 分岐せず、`wire-server` バイナリは usearch をリンクしない
-（`cargo tree -p wire-server` に出現しないことを確認済み）。以前 `test-support`
+（`cargo tree -p fandhe-vector-db-wire-server` に出現しないことを確認済み）。以前 `test-support`
 feature を廃止した経緯（`crates/engine/Cargo.toml` コメント参照）はテナント境界
 迂回 API の露出が理由だったが、本 feature は bench 専用の依存有効化のみで安全境界に
 触れない。

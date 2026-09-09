@@ -151,19 +151,19 @@ git worktree add /path/to/wt-before 2ca1536
 cp crates/engine/benches/scan_stage_profile_bench.rs \
    /path/to/wt-before/crates/engine/benches/scan_stage_profile_bench.rs
 ( cd /path/to/wt-before && \
-  CARGO_TARGET_DIR=/path/to/target-before cargo build --release -p wire-server )
-cargo build --release -p wire-server   # after（本ブランチ）
+  CARGO_TARGET_DIR=/path/to/target-before cargo build --release -p fandhe-vector-db-wire-server )
+cargo build --release -p fandhe-vector-db-wire-server   # after（本ブランチ）
 
 # 25,000 行・dim=128 の fixture を用意する（after 側ビルドを流用）
-cargo run --release -p engine --example seed_docs -- \
+cargo run --release -p fandhe-vector-db-engine --example seed_docs -- \
   seed /path/to/docs25k.redb 25000 128
-cargo run --release -p engine --example seed_docs -- \
+cargo run --release -p fandhe-vector-db-engine --example seed_docs -- \
   queries 128 200 /path/to/queries200.jsonl
 # run.py --db self の --expect-dim 検証は --rows-file と同じディレクトリ・
 # 同じ basename の docs jsonl（docs25k.redb → docs25k.jsonl）を自動探索する
 # （run.py の自動探索規約。Issue #466）。これを export しておかないと
 # --expect-dim 128 が dim 未検証のまま拒否され計測開始前に停止する。
-cargo run --release -p engine --example seed_docs -- \
+cargo run --release -p fandhe-vector-db-engine --example seed_docs -- \
   export /path/to/docs25k.redb /path/to/docs25k.jsonl
 
 # before/after を交互に N=5 ペア実行する（例。実際は自動化スクリプトで N 回ループする）

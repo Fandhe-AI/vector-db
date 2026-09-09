@@ -128,7 +128,7 @@ fail-closed）・`encode_row_reimpl_into_slice`（`encode_row_reimpl` と同一�
 計測環境: 本開発環境（`nproc`=12。他プロセスと計測環境を共有）。
 `make bench-ingest-profile` 相当（`BENCH_INGEST_PROFILE_INSERT_MODE=insert`
 ／`=reserve` を交互に実行。既定 rows=1,000・dim=128）。`cargo build --release
--p engine --bench ingest_profile_bench` でビルドした単一バイナリを両モードで
+-p fandhe-vector-db-engine --bench ingest_profile_bench` でビルドした単一バイナリを両モードで
 起動する単一ビルド内 A/B（Issue #324・#366 と同型）。
 
 ### I6（redb insert）段（dim=128・rows=1,000。交互 5 ペア）
@@ -219,13 +219,13 @@ min-of-N でも改善方向であること。加えて契約変更を伴わず `
 ## 再現手順
 
 ```sh
-cargo build --release -p engine --bench ingest_profile_bench
+cargo build --release -p fandhe-vector-db-engine --bench ingest_profile_bench
 BENCH_INGEST_PROFILE_INSERT_MODE=insert  ./target/release/deps/ingest_profile_bench-<hash>
 BENCH_INGEST_PROFILE_INSERT_MODE=reserve ./target/release/deps/ingest_profile_bench-<hash>
 ```
 
 （`<hash>` はビルドごとに変わるハッシュ付きファイル名。`cargo bench --bench
-ingest_profile_bench -p engine`〔`make bench-ingest-profile`〕でも同様に env
+ingest_profile_bench -p fandhe-vector-db-engine`〔`make bench-ingest-profile`〕でも同様に env
 を渡せる。規模点は `BENCH_INGEST_PROFILE_ROWS`／`BENCH_INGEST_PROFILE_DIM` を
 併用。交互実行・min-of-N の必要性は `docs/design/knn-two-stage-topk.md`
 「再現手順」節と同じ理由による。）

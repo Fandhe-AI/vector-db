@@ -30,7 +30,7 @@ CI 段階（PR 作成前）で検出できるようにする。
 `scripts/check_simd_codegen.sh`（`check_sort_determinism.sh`・`check_core_api.sh`
 と同型の、`cargo test` を経由しない軽量シェルスクリプト）が以下を行う。
 
-1. `cargo rustc -p engine --release --lib -- --emit asm` で release ビルドの
+1. `cargo rustc -p fandhe-vector-db-engine --release --lib -- --emit asm` で release ビルドの
    アセンブリ（`target/.../deps/engine-<hash>.s`）を生成する（追加の `-C` フラグは
    付けない。実際の release ビルドとの忠実性を優先）
 2. 生成された `.s` から、マングル名に `isa` モジュールのセグメント（`3isa`）を

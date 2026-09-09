@@ -84,7 +84,7 @@ for c in pgvector qdrant mysql; do bash "$B/containers.sh" down "$c" >/dev/null 
 
 run "$ROWS_REDB" self exact
 # self の hnsw 構成（`--search-engine hnsw` opt-in。Issue #656〜#658）は
-# `crossdb_plan_probe` example（`cargo build --release -p engine --example
+# `crossdb_plan_probe` example（`cargo build --release -p fandhe-vector-db-engine --example
 # crossdb_plan_probe`）のビルドを追加で要求する。未ビルドなら本行は失敗として
 # 記録される（`FAILED` に積まれ非 0 終了。ログは `$LOGS_DIR/self_hnsw.log`）。
 # `CROSSDB_SELF_HNSW_ARGS` は self hnsw の呼び出しにだけ渡す（上記理由）。

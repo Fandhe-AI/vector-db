@@ -50,7 +50,7 @@ embedding 長・値・metadata の完全一致（混線 0 件）を検証した�
   `dim_validation_is_fail_closed` / `mixed_dim_rows_roundtrip_intact` /
   `alter_table_does_not_disturb_other_dims`
 - `crates/engine/examples/multi_dim_bench.rs`（手動実行専用の実測ハーネス。
-  `cargo run -p engine --release --example multi_dim_bench` で実行、`cargo test`
+  `cargo run -p fandhe-vector-db-engine --release --example multi_dim_bench` で実行、`cargo test`
   対象外）: (a) 単一次元 768 のみのベースライン DB と (b) 384/768/1536 混在 DB
   （各テーブル 800 行、20 件/バッチ。mixed 側は 3 テーブルをバッチ単位で巡回
   ［round-robin］しながら `put_batch` する。テーブルごとに全バッチを書き終えて

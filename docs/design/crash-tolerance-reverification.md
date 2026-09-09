@@ -95,9 +95,9 @@ B-tree のため、そうした書き込みは新規割当ページ（既存の�
 
 各シナリオの合否とアサーション根拠はテスト実装（`crates/engine/tests/power_loss.rs`・
 `crates/engine/src/storage.rs` 内 `mod power_loss`）を SSOT とする。CI 実行分
-（`cargo test -p engine`）は全シナリオ・否定コントロールとも合格しており、`#[ignore]`
+（`cargo test -p fandhe-vector-db-engine`）は全シナリオ・否定コントロールとも合格しており、`#[ignore]`
 の拡張反復（`power_loss_scenario3_partial_writeback_extended_search`）もローカルで
-合格を確認済みである。`cargo test -p engine`（`--ignored` を含まない）は engine クレート
+合格を確認済みである。`cargo test -p fandhe-vector-db-engine`（`--ignored` を含まない）は engine クレート
 全体で数秒程度、本ハーネス単体（`--test power_loss`）では 0.2〜0.3 秒程度で完了し、CI
 時間への影響は軽微である。
 

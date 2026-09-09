@@ -50,7 +50,7 @@
 | OS | Linux 7.0.0-29-generic（Ubuntu ベース） |
 | GPU | NVIDIA GeForce RTX 3060（driver 595.71.05。本 ADR の実測では未使用） |
 | RAM | 32 GiB |
-| ビルド | `cargo run --release`（`-p engine --example high_dim_bench`） |
+| ビルド | `cargo run --release`（`-p fandhe-vector-db-engine --example high_dim_bench`） |
 
 **注意（測定条件の限界）**: 本ホストは仮想化 CPU（QEMU）であり、`multi-dim-table-coexistence.md`
 の実測環境（Apple M4 Max ベアメタル）とは異なる。絶対値の比較はせず、本 ADR 内の

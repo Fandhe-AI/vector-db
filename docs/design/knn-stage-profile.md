@@ -254,7 +254,7 @@ codex-review 指摘・PR #378）。
 
 ## `dot_lanes` の実アセンブリ確認（受け入れ条件 3）
 
-`cargo bench --bench knn_profile_bench -p engine --no-run` でビルドしたバイナリ
+`cargo bench --bench knn_profile_bench -p fandhe-vector-db-engine --no-run` でビルドしたバイナリ
 （production コード無変更。`knn_profile_bench.rs::dot_wrapper` は
 `engine::isa::current().dot(a, b)` を呼ぶだけの `#[inline(never)]` ラッパー）を
 `objdump -d -M intel` で逆アセンブルした。開発環境の検出 ISA は `Avx2Fma`
@@ -359,7 +359,7 @@ FULL_SCAN_RATIO`・`BENCH_KNN_PROFILE_SCALE` と併用可）で S1〜S5' を伴�
 `dot_lanes` の逆アセンブル確認は次の手順で再現できる:
 
 ```sh
-cargo bench --bench knn_profile_bench -p engine --no-run
+cargo bench --bench knn_profile_bench -p fandhe-vector-db-engine --no-run
 nm target/release/deps/knn_profile_bench-*  | grep dot_avx2_fma
 objdump -d -M intel --start-address=<addr> --stop-address=<addr+len> \
   target/release/deps/knn_profile_bench-*

@@ -1370,7 +1370,7 @@ Issue #676（PR #686・merge `418ce95`）が導入した「`Subset` 形状の pl
 
 ### Track 1: crossdb self exact/hnsw A/B（同一バイナリ・HEAD `bcf1471`）
 
-`cargo build --release -p wire-server`／`--example crossdb_plan_probe`
+`cargo build --release -p fandhe-vector-db-wire-server`／`--example crossdb_plan_probe`
 （HEAD `bcf1471`。`418ce95^1` からの唯一の差分は #687〔`HopMode::TwoHop`
 限定〕のため本 Issue の対象〔#676・DISTANCE `Subset` 形状の既定 `full_scan_ratio`
 経路〕には影響しない）でビルドし、`make bench-crossdb-self-hnsw-ab

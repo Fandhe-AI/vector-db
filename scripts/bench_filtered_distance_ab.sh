@@ -154,7 +154,7 @@ locate_artifact() {
 
 build_scan_stage_profile() {
   local dir="$1" target="$2"
-  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo bench -p engine --bench scan_stage_profile_bench --no-run --message-format=json ) \
+  ( cd "${dir}" && CARGO_TARGET_DIR="${target}" cargo bench -p fandhe-vector-db-engine --bench scan_stage_profile_bench --no-run --message-format=json ) \
     | locate_artifact scan_stage_profile_bench
 }
 
