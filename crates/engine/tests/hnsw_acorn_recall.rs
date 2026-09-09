@@ -14,6 +14,13 @@
 //! 前後比較〔`make bench-knn-visible-ratio SWEEP_CANDIDATES=acorn`〕とは
 //! 別の関心事）。
 //!
+//! Issue #679（親 #502）: 上記の均等分散マスク（`id % N == 0`）は 25,000 行
+//! 規模（並列 HNSW 構築）で TwoHop 到達が run 依存になることが判明したため、
+//! `MaskShape`（クラスタ丸ごと可視・「縞」の 2 族）・`HopArm`・
+//! `run_cluster_mask_arm` 以降を追加し、確実に到達する決定的フィクスチャで
+//! hop モード別 Recall・`acorn_expansions` を記録する（改善は #680・
+//! 展開過多時の fail-closed 縮退は #681 の担当）。
+//!
 //! production コード〔`crates/engine/src/`〕は無変更・テスト専任。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -172,7 +179,13 @@ fn hnsw_kind_with_acorn(ratio: Option<Ratio>) -> search_engine::SearchEngineKind
     }
 }
 
-/// テナント境界確認用の private 行（tenant-b）を投入する。
+/// テナント境界確認用の private 行（tenant-b）を投入する。`bucket_label` は
+/// フィクスチャの可視ラベル体系（`run_regime_sweep` は `"b0"`・
+/// `run_cluster_mask_arm` は `"v"`）に合わせて呼び出し側が指定する——ラベルを
+/// 固定すると、可視ラベルと異なる文字列を tenant-b 行へ付けてしまい
+/// 「WHERE 可視 = tenant-b 行が構造的に一致しない」非 vacuous な非混入検査に
+/// なってしまう（tenant-b 行は常にクエリの可視条件へマッチさせたうえで、
+/// テナント境界自体で弾かれることを確認する必要がある）。
 fn seed_private_tenant_b(
     storage: &Storage,
     schema: &TableSchema,
@@ -180,12 +193,16 @@ fn seed_private_tenant_b(
     id_offset: u64,
     rows: usize,
     op_tag: &str,
+    bucket_label: &str,
 ) -> (Vec<Vec<f32>>, PolicyContext) {
     let vectors = gen_clustered_corpus(42, dim, rows, 4);
     let ctx_b =
         PolicyContext::with_visibilities("tenant-b", [Visibility::Private]).expect("valid tenant");
-    let metadata_b = encode_scalar_columns(schema, &[Value::Null, Value::Text("b0".to_string())])
-        .expect("encode tenant-b metadata");
+    let metadata_b = encode_scalar_columns(
+        schema,
+        &[Value::Null, Value::Text(bucket_label.to_string())],
+    )
+    .expect("encode tenant-b metadata");
     let rows_b: Vec<(u64, RowInput<'_>)> = vectors
         .iter()
         .enumerate()
@@ -239,7 +256,7 @@ fn run_regime_sweep(
     let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
     let vectors = seed_bucketed_fixture(&storage, &sch, &ctx_a, op_tag, dim, rows, denominator);
     let (_b_vectors, _ctx_b) =
-        seed_private_tenant_b(&storage, &sch, dim, rows as u64 + 1, 100, op_tag);
+        seed_private_tenant_b(&storage, &sch, dim, rows as u64 + 1, 100, op_tag, "b0");
 
     let ref_dir = unique_db_path(&format!("hnsw-acorn-recall-{op_tag}-ref"));
     let _ref_cleanup = CleanupGuard(ref_dir.clone());
@@ -261,6 +278,7 @@ fn run_regime_sweep(
         rows as u64 + 1,
         100,
         &format!("{op_tag}-ref"),
+        "b0",
     );
     let _ = b_vectors_ref;
     let _ = ctx_b_ref;
@@ -359,6 +377,326 @@ const ACORN_4_10: Ratio = Ratio {
     numerator: 4,
     denominator: 10,
 };
+
+// ---------- Issue #679: TwoHop へ確実に到達する決定的フィクスチャ ----------
+//
+// 背景: 上の `run_regime_sweep`（均等分散マスク `id % denominator == 0`）は
+// 25,000 行規模（並列 HNSW 構築）で `mask_splits_graph` の発火が run 依存
+// （観測 3 run 中 1 run のみ TwoHop へ到達）——`hnsw/parallel_build.rs`
+// 「決定性の範囲」が示すとおり並列構築はグラフ形状自体が run 間で
+// 非決定的であり、疎で散在したマスクは連結性がその形状の細部に依存する。
+// 本節はクラスタ丸ごと可視という粗いマスクで到達を安定させ、hop モード別の
+// Recall・`acorn_expansions` を記録する（改善そのものは #680・展開過多時の
+// fail-closed 縮退は #681 が担当。本 Issue は現状値の固定に専念する）。
+
+/// 可視マスクの族。行番号 `i`（0 始まり）・クラスタ番号
+/// `c = i % MASK_CLUSTERS`・クラスタ内序数 `j = i / MASK_CLUSTERS` から
+/// 可視性を決定的に導出する（`gen_clustered_corpus` の割り当て方式
+/// `center = centers[i % clusters]` と同じ剰余演算を使うことで、
+/// 「クラスタ単位で丸ごと可視／不可視」を表現する）。
+#[derive(Clone, Copy)]
+enum MaskShape {
+    /// 先頭 `clusters` 個のクラスタを丸ごと可視にする（主 variant）。
+    /// クラスタ境界の橋渡し本数が少なく、連結性が構築側の run 間差に
+    /// 左右されにくいと期待される形状。
+    Whole { clusters: usize },
+    /// `clusters` 個のクラスタのうち、各クラスタ内で `stride` おきの行のみを
+    /// 可視にする「縞」形状（副次 variant）。可視行が同一クラスタ内に散在
+    /// するため、TwoHop での連結が橋渡し数に強く依存する——#680／#681 が
+    /// 挙げる劣化条件（橋渡し候補の希釈）の再現候補として informational に
+    /// 記録するのみで、受け入れ条件の判定には使わない。
+    Striped { clusters: usize, stride: usize },
+}
+
+/// `gen_clustered_corpus` へ渡すクラスタ数（`MaskShape` の剰余演算と
+/// 揃える必要がある固定値。既存 `run_regime_sweep` の `CLUSTERS` と同値）。
+const MASK_CLUSTERS: usize = 6;
+
+impl MaskShape {
+    fn is_visible(&self, i: usize) -> bool {
+        let c = i % MASK_CLUSTERS;
+        match *self {
+            MaskShape::Whole { clusters } => c < clusters,
+            MaskShape::Striped { clusters, stride } => {
+                c < clusters && (i / MASK_CLUSTERS).is_multiple_of(stride)
+            }
+        }
+    }
+
+    /// 標準出力・doc 記録用のラベル（`docs/design/hnsw-rls-cardinality-switch.md`
+    /// 「Issue #679」節の実測表と対応させる）。
+    fn label(&self) -> String {
+        match *self {
+            MaskShape::Whole { clusters } => format!("whole{{clusters={clusters}}}"),
+            MaskShape::Striped { clusters, stride } => {
+                format!("striped{{clusters={clusters},stride={stride}}}")
+            }
+        }
+    }
+}
+
+/// `MaskShape::is_visible` に従って `bucket` 列へ `'v'`（可視）／`'h'`
+/// （不可視）を割り当てるクラスタ構造コーパスを投入する（`seed_bucketed_fixture`
+/// の一般化。`denominator` 分の 1 の等間隔マスクではなく `MaskShape` の
+/// クラスタ単位マスクを使う点のみが異なる）。
+fn seed_cluster_mask_fixture(
+    storage: &Storage,
+    schema: &TableSchema,
+    ctx: &PolicyContext,
+    op_tag: &str,
+    dim: usize,
+    rows: usize,
+    shape: MaskShape,
+) -> Vec<Vec<f32>> {
+    let vectors = gen_clustered_corpus(9, dim, rows, MASK_CLUSTERS);
+    let op_id = OperationId::parse(&format!("hnsw-acorn-recall-{op_tag}")).expect("valid op id");
+    let metadata: Vec<Vec<u8>> = (0..rows)
+        .map(|i| {
+            let bucket = if shape.is_visible(i) { "v" } else { "h" };
+            encode_scalar_columns(schema, &[Value::Null, Value::Text(bucket.to_string())])
+                .expect("encode bucket metadata")
+        })
+        .collect();
+    let rows_input: Vec<(u64, RowInput<'_>)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            (
+                i as u64 + 1,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: v.as_slice(),
+                    metadata: metadata[i].as_slice(),
+                },
+            )
+        })
+        .collect();
+    engine::tenant::insert_rows(storage, "docs", ctx, &rows_input, &op_id).expect("seed rows");
+    vectors
+}
+
+/// hop モード別の 3 arm。`OneHop` は既定パラメータのまま（ACORN opt-in 無効）、
+/// `PlainScan` は `full_scan_ratio=1/1` で可視カーディナリティ比に関わらず
+/// 常に plain scan を選ばせる対照点、`TwoHop` は `acorn_max_visible_ratio=4/10`
+/// opt-in で ACORN-1 を有効化する（`full_scan_ratio` は既定 1/10 のまま）。
+#[derive(Clone, Copy)]
+enum HopArm {
+    PlainScan,
+    OneHop,
+    TwoHop,
+}
+
+impl HopArm {
+    fn label(&self) -> &'static str {
+        match self {
+            HopArm::PlainScan => "plain_scan",
+            HopArm::OneHop => "one_hop",
+            HopArm::TwoHop => "two_hop",
+        }
+    }
+}
+
+const RATIO_1_1: Ratio = Ratio {
+    numerator: 1,
+    denominator: 1,
+};
+
+/// `arm` に応じたパラメータ上書きを既定 `HnswParams` へ適用する
+/// （`hnsw_kind_with_acorn` と同型だが、`full_scan_ratio` 上書きも扱う点が
+/// 異なる。`PlainScan` と `TwoHop` は互いに独立したフィールドを上書きする
+/// ため同時適用しない——`with_acorn_max_visible_ratio` は
+/// `ratio >= full_scan_ratio` を要求するため、`full_scan_ratio=1/1` の
+/// arm で acorn を設定すると必ず `HnswError::InvalidParams` になる）。
+fn hnsw_kind_for_arm(arm: HopArm) -> search_engine::SearchEngineKind {
+    let kind = search_engine::hnsw_kind(HnswParams::default()).expect("valid hnsw params");
+    match kind {
+        search_engine::SearchEngineKind::Hnsw(validated) => {
+            let validated = match arm {
+                HopArm::PlainScan => validated
+                    .with_full_scan_ratio(RATIO_1_1)
+                    .expect("valid full_scan_ratio"),
+                HopArm::OneHop => validated,
+                HopArm::TwoHop => validated
+                    .with_acorn_max_visible_ratio(ACORN_4_10)
+                    .expect("valid acorn_max_visible_ratio"),
+            };
+            search_engine::SearchEngineKind::Hnsw(validated)
+        }
+        other => other,
+    }
+}
+
+/// 可視行（`shape.is_visible(i)` を満たす行番号）を昇順に集め、その中から
+/// 等間隔に最大 `max_queries` 本を決定的に選ぶ（`run_regime_sweep` の
+/// クラスタ別ラウンドロビンと異なり、`Whole` 形状では可視行が単一クラスタ
+/// 内に閉じるため「クラスタ横断」ではなく「可視集合内の等間隔抽出」が
+/// 適切——単一クラスタ可視時にラウンドロビンを使うと退化して先頭 1 件しか
+/// 選べない）。可視行が 0 件の場合はフィクスチャ不備として panic する。
+fn select_visible_queries(rows: usize, shape: MaskShape, max_queries: usize) -> Vec<usize> {
+    let visible: Vec<usize> = (0..rows).filter(|&i| shape.is_visible(i)).collect();
+    assert!(
+        !visible.is_empty(),
+        "fixture must have at least one visible row (shape={})",
+        shape.label()
+    );
+    if visible.len() <= max_queries {
+        return visible;
+    }
+    let step = visible.len() as f64 / max_queries as f64;
+    let mut selected: Vec<usize> = (0..max_queries)
+        .map(|k| {
+            let idx = ((k as f64 * step) as usize).min(visible.len() - 1);
+            visible[idx]
+        })
+        .collect();
+    // 等間隔の丸め込みで隣接候補が同一行番号へ縮退する可能性（`visible.len()`
+    // が `max_queries` にごく近い場合）に備え、昇順であることを利用した
+    // 連続重複除去で安全側に倒す（同一クエリの重複計上を防ぐ）。
+    selected.dedup();
+    selected
+}
+
+/// 1 arm（可視マスク `shape` × hop モード `arm`）の測定結果。
+struct ArmPoint {
+    shape_label: String,
+    arm_label: &'static str,
+    recall_at_10: f64,
+    queries: usize,
+    subset_searches: u64,
+    acorn_searches: u64,
+    acorn_expansions: u64,
+    plain_scans: u64,
+    mask_splits_graph: u64,
+}
+
+impl ArmPoint {
+    fn acorn_expansions_per_query(&self) -> f64 {
+        if self.queries == 0 {
+            0.0
+        } else {
+            self.acorn_expansions as f64 / self.queries as f64
+        }
+    }
+}
+
+/// `shape`（可視マスク）× `arm`（hop モード）の 1 点を測定する共通本体
+/// （`run_regime_sweep` と同じ構造——対象・brute-force 対照の 2 本の DB を
+/// 構築し、tenant-b private 行の非混入・`Subset` 形状が warm-up 後に
+/// 再構築されないことを assert する）。tenant-b 行には可視ラベル `'v'` を
+/// 付け、可視条件 `WHERE bucket = 'v'` に構造的にマッチさせたうえで
+/// テナント境界自体が弾くことを確認する（付けないと非混入 assert が
+/// vacuous になる）。
+fn run_cluster_mask_arm(
+    dim: usize,
+    rows: usize,
+    shape: MaskShape,
+    arm: HopArm,
+    op_tag: &str,
+) -> ArmPoint {
+    let dir = unique_db_path(&format!("hnsw-acorn-recall-{op_tag}"));
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    let sch = schema(dim as u32);
+    storage.create_table(&sch).expect("create table");
+    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    let vectors = seed_cluster_mask_fixture(&storage, &sch, &ctx_a, op_tag, dim, rows, shape);
+    let (_b_vectors, _ctx_b) =
+        seed_private_tenant_b(&storage, &sch, dim, rows as u64 + 1, 100, op_tag, "v");
+
+    let ref_dir = unique_db_path(&format!("hnsw-acorn-recall-{op_tag}-ref"));
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage.create_table(&sch).expect("create ref table");
+    let _ = seed_cluster_mask_fixture(
+        &ref_storage,
+        &sch,
+        &ctx_a,
+        &format!("{op_tag}-ref"),
+        dim,
+        rows,
+        shape,
+    );
+    let (b_vectors_ref, ctx_b_ref) = seed_private_tenant_b(
+        &ref_storage,
+        &sch,
+        dim,
+        rows as u64 + 1,
+        100,
+        &format!("{op_tag}-ref"),
+        "v",
+    );
+    let _ = b_vectors_ref;
+    let _ = ctx_b_ref;
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    let kind = hnsw_kind_for_arm(arm);
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    // フィルタなしクエリを 1 本先に投げ `FullVisible` 索引を warm する
+    // （`Subset` 形状は `Lookup::Miss` では構築しない契約。`run_regime_sweep`
+    // と同じ理由）。
+    let _ = query_ids(&core, &ctx_a, &vectors[0], 10);
+    let builds_after_warm = core.hnsw_index_cache_stats().builds;
+
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    let candidate_indices = select_visible_queries(rows, shape, QUERIES);
+
+    let mut total_hits = 0usize;
+    let mut queried = 0usize;
+    for &candidate_idx in &candidate_indices {
+        queried += 1;
+        let query = &vectors[candidate_idx];
+        let sql = format!(
+            "SELECT id FROM docs WHERE bucket = 'v' ORDER BY embedding <=> '{}' LIMIT {K}",
+            vec_literal(query)
+        );
+        let got = core.execute_sql(&ctx_a, &sql).expect("filtered query").rows;
+        let want = ref_core
+            .execute_sql(&ctx_a, &sql)
+            .expect("filtered query (ref)")
+            .rows;
+        for row in &got {
+            assert!(
+                row.id <= rows as u64,
+                "tenant-a result must not include tenant-b row id {} (shape={} arm={})",
+                row.id,
+                shape.label(),
+                arm.label()
+            );
+        }
+        let want_ids: std::collections::HashSet<u64> = want.iter().map(|r| r.id).collect();
+        total_hits += got.iter().filter(|r| want_ids.contains(&r.id)).count();
+    }
+    assert!(
+        queried > 0,
+        "no query originated from bucket='v' (shape={}); fixture must yield at least one visible row",
+        shape.label()
+    );
+    let recall = total_hits as f64 / (queried * K) as f64;
+
+    let stats = core.hnsw_index_cache_stats();
+    assert_eq!(
+        stats.builds,
+        builds_after_warm,
+        "Subset shape must not rebuild the index per query (shape={} arm={})",
+        shape.label(),
+        arm.label()
+    );
+
+    ArmPoint {
+        shape_label: shape.label(),
+        arm_label: arm.label(),
+        recall_at_10: recall,
+        queries: queried,
+        subset_searches: stats.subset_searches,
+        acorn_searches: stats.acorn_searches,
+        acorn_expansions: stats.acorn_expansions,
+        plain_scans: stats.plain_scans,
+        mask_splits_graph: stats.mask_splits_graph,
+    }
+}
 
 /// 層 A（常時実行）: 縮小フィクスチャ（1,200 行・dim16）で可視比率
 /// 1/2・1/4・1/5・1/10 を横断し、`acorn_max_visible_ratio = 4/10` opt-in の
@@ -477,5 +815,217 @@ fn layer_b_25k_dim128_acorn_regime_sweep_report() {
             p.plain_scans,
             p.mask_splits_graph
         );
+    }
+}
+
+/// 層 A（常時実行）: 1,200 行・dim16 のクラスタ丸ごと可視マスク（Issue #679）
+/// で TwoHop 到達を固定する。1,200 行の索引構築は常に逐次（
+/// `hnsw/parallel_search.rs::MIN_ROWS_PER_THREAD=1,024` により
+/// `thread_count_for(1,200) == 1`）なのでグラフ形状は環境非依存でビット
+/// 安定であり、`mask_splits_graph == 0`（分断縮退が一度も起きない）を
+/// 契約として固定できる（25,000 行規模〔並列構築・run 依存〕の層 B とは
+/// 異なる保証強度）。`Whole{1}`（可視比率 1/6）・`Whole{2}`（1/3）は
+/// TraversalRegime::TwoHop（`full_scan_ratio=1/10 <= r <= acorn=4/10`）へ、
+/// `Whole{3}`（1/2）は ACORN が格上げしないこと（`acorn_searches == 0`）を
+/// 確認する。
+#[test]
+fn cluster_whole_mask_reaches_two_hop_deterministically() {
+    const DIM: usize = 16;
+    const ROWS: usize = 1_200;
+
+    for clusters in [1usize, 2] {
+        let shape = MaskShape::Whole { clusters };
+        let p = run_cluster_mask_arm(
+            DIM,
+            ROWS,
+            shape,
+            HopArm::TwoHop,
+            &format!("layer-a-679-whole-{clusters}-twohop"),
+        );
+        assert!(
+            p.subset_searches > 0,
+            "Subset shape must be exercised (non-vacuous) at shape={}",
+            p.shape_label
+        );
+        assert!(
+            p.acorn_searches > 0,
+            "expected TwoHop (acorn_searches > 0) at shape={} (1,200 rows is always built sequentially, so \
+             connectivity is deterministic), got acorn_searches=0 (mask_splits_graph={})",
+            p.shape_label,
+            p.mask_splits_graph
+        );
+        assert_eq!(
+            p.mask_splits_graph, 0,
+            "sequential build (1,200 rows) must never split the mask at shape={}",
+            p.shape_label
+        );
+        assert!(
+            p.acorn_expansions > 0,
+            "acorn_expansions must be non-vacuous at shape={}",
+            p.shape_label
+        );
+    }
+
+    // `Whole{3}`（可視比率 1/2）は `full_scan_ratio(1/10) <= r <= acorn(4/10)`
+    // を満たさず OneHop のまま——ACORN opt-in が無条件に格上げしないことの
+    // 対照点。
+    let p3 = run_cluster_mask_arm(
+        DIM,
+        ROWS,
+        MaskShape::Whole { clusters: 3 },
+        HopArm::TwoHop,
+        "layer-a-679-whole-3-twohop",
+    );
+    assert_eq!(
+        p3.acorn_searches, 0,
+        "expected 1-hop (acorn_searches == 0) at shape={} (r=1/2 > 4/10)",
+        p3.shape_label
+    );
+
+    // `PlainScan` arm（`full_scan_ratio=1/1`）は可視比率に関わらず常に
+    // plain scan（アリーナ全体の brute-force）を選ぶため、既定エンジン
+    // 対照との Recall@10 は構造的に 1.0 になる。
+    let p_plain = run_cluster_mask_arm(
+        DIM,
+        ROWS,
+        MaskShape::Whole { clusters: 1 },
+        HopArm::PlainScan,
+        "layer-a-679-whole-1-plainscan",
+    );
+    assert!(
+        p_plain.plain_scans > 0,
+        "PlainScan arm must be exercised (non-vacuous) at shape={}",
+        p_plain.shape_label
+    );
+    assert_eq!(p_plain.acorn_searches, 0);
+    assert_eq!(
+        p_plain.recall_at_10, 1.0,
+        "PlainScan arm must match brute-force exactly (structural, not just >= 0.9) at shape={}",
+        p_plain.shape_label
+    );
+}
+
+/// 層 A（常時実行）: `acorn_max_visible_ratio` 未設定（`HopArm::OneHop`）では
+/// クラスタ丸ごと可視マスクでも `acorn_searches` が常に 0 のまま
+/// （Issue #501 の既存契約を維持）であることを固定する（Issue #679 の
+/// フィクスチャでも opt-in しない限り既存動作へ影響しないことの直接証拠）。
+#[test]
+fn cluster_whole_mask_acorn_disabled_by_default() {
+    const DIM: usize = 16;
+    const ROWS: usize = 1_200;
+
+    let p = run_cluster_mask_arm(
+        DIM,
+        ROWS,
+        MaskShape::Whole { clusters: 1 },
+        HopArm::OneHop,
+        "layer-a-679-whole-1-onehop-disabled",
+    );
+    assert_eq!(
+        p.acorn_searches, 0,
+        "acorn_max_visible_ratio == None must never select HopMode::TwoHop (shape={})",
+        p.shape_label
+    );
+    assert_eq!(p.acorn_expansions, 0);
+}
+
+/// 層 B（`#[ignore]`・`make hnsw-acorn-twohop-runs`）: 25,000 行・dim128 の
+/// クラスタ丸ごと可視マスク（Issue #679）で、並列 HNSW 構築（run 依存の
+/// グラフ形状）のもとでも TwoHop 到達（`acorn_searches > 0`）が
+/// `HNSW_ACORN_RECALL_RUNS`（既定 1・fail-closed パース）回連続で再現する
+/// ことを記録する。主 variant（`Whole{1}`）は全 run で到達することを
+/// assert し（受け入れ条件 1）、`Whole{2}`・副次 variant（`Striped{2,2}`）は
+/// informational（診断出力のみ・assert なし——実測で `Whole{2}` は逆に
+/// `mask_splits_graph` へ 5/5 run とも縮退することが判明したため、計画の
+/// フォールバック方針に従い主 variant を `Whole{1}` 単独へ絞った。詳細は
+/// `docs/design/hnsw-rls-cardinality-switch.md`「Issue #679」節参照）とする。
+/// `Whole{3}`（対照点）は時間節約のため層 A のみで確認済み。実測値は同節へ
+/// 転記することを想定する（オーナー判断〔2026-08-29〕により公開可）。
+#[test]
+#[ignore]
+fn layer_b_25k_dim128_cluster_mask_hop_mode_report() {
+    const DIM: usize = 128;
+    const ROWS: usize = 25_000;
+    const MAX_RUNS: u32 = 20;
+
+    let runs: u32 = match std::env::var("HNSW_ACORN_RECALL_RUNS") {
+        Ok(s) => s
+            .parse::<u32>()
+            .ok()
+            .filter(|&n| (1..=MAX_RUNS).contains(&n))
+            .unwrap_or_else(|| {
+                panic!("HNSW_ACORN_RECALL_RUNS must be an integer in 1..={MAX_RUNS}, got {s:?}")
+            }),
+        Err(std::env::VarError::NotPresent) => 1,
+        Err(e) => panic!("HNSW_ACORN_RECALL_RUNS must be valid UTF-8: {e}"),
+    };
+
+    println!(
+        "hnsw_acorn_recall: layer B cluster-mask hop-mode report (rows={ROWS} dim={DIM} runs={runs})"
+    );
+    println!("run shape ratio arm recall@10 queries subset_searches acorn_searches acorn_expansions acorn_expansions/query plain_scans mask_splits_graph");
+
+    let points: [(MaskShape, &str); 3] = [
+        (MaskShape::Whole { clusters: 1 }, "1/6"),
+        (MaskShape::Whole { clusters: 2 }, "1/3"),
+        (
+            MaskShape::Striped {
+                clusters: 2,
+                stride: 2,
+            },
+            "1/6(striped)",
+        ),
+    ];
+
+    for (shape, ratio_label) in points {
+        let mut twohop_reached = 0u32;
+        for run in 0..runs {
+            for arm in [HopArm::PlainScan, HopArm::OneHop, HopArm::TwoHop] {
+                let op_tag = format!(
+                    "layer-b-679-{}-run{run}-{}",
+                    shape.label().replace(['{', '}', ',', '=', ':'], "_"),
+                    arm.label()
+                );
+                let p = run_cluster_mask_arm(DIM, ROWS, shape, arm, &op_tag);
+                println!(
+                    "{run} {} {ratio_label} {} {:.4} {} {} {} {} {:.2} {} {}",
+                    p.shape_label,
+                    p.arm_label,
+                    p.recall_at_10,
+                    p.queries,
+                    p.subset_searches,
+                    p.acorn_searches,
+                    p.acorn_expansions,
+                    p.acorn_expansions_per_query(),
+                    p.plain_scans,
+                    p.mask_splits_graph
+                );
+                if matches!(arm, HopArm::TwoHop) && p.acorn_searches > 0 {
+                    twohop_reached += 1;
+                }
+            }
+        }
+        println!(
+            "twohop_reached={twohop_reached}/{runs} shape={}",
+            shape.label()
+        );
+        // 受け入れ条件 1（Issue #679）: 主 variant（`Whole{1}`）は全 run で
+        // TwoHop へ到達する。実測では `Whole{2}`（可視比率 1/3）は逆に
+        // `mask_splits_graph` へ 5/5 run とも縮退することが判明した——
+        // 可視比率が大きいほど連結しやすいという直感に反する結果であり、
+        // 並列構築のグラフ形状（クラスタ境界の橋渡し配置）に依存する
+        // fixture 固有の挙動と考えられる（詳細は
+        // `docs/design/hnsw-rls-cardinality-switch.md`「Issue #679」節）。
+        // そのため `Whole{2}` は `Striped` と同じく informational（診断出力
+        // のみ）へ位置づけを変更し、主 variant を `Whole{1}` 単独に絞る
+        // （計画の「主 variant が未達なら他候補へ格上げ」フォールバックを
+        // 適用し、5/5 到達を安定して示す形状のみを受け入れ条件の対象にした）。
+        if matches!(shape, MaskShape::Whole { clusters: 1 }) {
+            assert_eq!(
+                twohop_reached, runs,
+                "expected TwoHop to be reached on every run for shape={} (got {twohop_reached}/{runs})",
+                shape.label()
+            );
+        }
     }
 }
