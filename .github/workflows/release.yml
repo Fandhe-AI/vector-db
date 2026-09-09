@@ -1,0 +1,266 @@
+name: release
+
+# crates.io 公開ワークフロー（fandhe-frontend / fandhe-backend の release.yml と同型）。
+# workflow_dispatch 起点で、公開対象クレート・バージョン・モードを明示入力し、
+# 「verify（ガード群 + `cargo publish --dry-run`。トークン不要）」→
+# 「publish（`mode: publish` のときのみ。GitHub Environment `crates-io-release` の
+# 承認ゲートを通す）」の 2 ジョブで実行する。既定モードは dry-run-only（安全側）。
+#
+# 公開対象は workspace の 2 クレート（`crates/engine` = fandhe-vector-db-engine、
+# `crates/wire-server` = fandhe-vector-db-wire-server）。crate 入力を choice 型に
+# 固定することで、任意文字列のシェル注入・存在しないパッケージ指定を構造的に排除する
+# （fail-closed）。`all` は `cargo publish --workspace` による依存順の一括公開
+# （engine → wire-server。cargo が sparse index 反映待ちを含めて順序解決する）。
+#
+# タグ push 起点は採用しない。workflow_dispatch の明示入力（crate/version/mode）に
+# よるバージョン整合ガード（semver 形式・Cargo.toml 一致・crates.io 既公開チェック）の
+# 方が、タグ文字列パースより誤公開に対して fail-closed なため。
+#
+# 前提（オーナー作業。本ワークフローは存在確認のみ行い作成はしない）:
+# - GitHub Environment `crates-io-release` に required reviewers を設定する（初回 run で
+#   環境が自動作成された場合は保護ルールが空のため、必ず手動で追加する）
+# - 同 Environment の secret `CARGO_REGISTRY_TOKEN`（crates.io API トークン。両クレートの
+#   publish-new / publish-update スコープ）を設定する。トークンは publish ステップの env
+#   にのみ注入し、他ステップ・verify ジョブへは渡さない
+# - private submodule（docs/spec）は公開処理に不要なため取得しない
+#
+# 各ステップは crates.io（https://index.crates.io ・ https://static.crates.io）への
+# 到達性を前提とする。runner が到達不可の場合はステップが失敗するが、これは環境
+# エラーであり本ワークフローの設計不備ではない。
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: "公開対象クレート（all は --workspace による依存順の一括公開）"
+        type: choice
+        required: true
+        default: fandhe-vector-db-engine
+        options:
+          - fandhe-vector-db-engine
+          - fandhe-vector-db-wire-server
+          - all
+      version:
+        description: "公開しようとするバージョン（例: 0.1.0）。対象クレートの Cargo.toml の version と完全一致する必要がある"
+        type: string
+        required: true
+      mode:
+        description: "dry-run-only: 検証のみ（既定・安全側）。publish: 実際に cargo publish を実行する"
+        type: choice
+        required: true
+        default: dry-run-only
+        options:
+          - dry-run-only
+          - publish
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一クレートへの公開処理が並行して二重実行されないよう直列化する。
+  # 公開処理の途中キャンセルは crates.io 側の中途半端な状態を招き得るため
+  # cancel-in-progress は行わない。
+  group: release-${{ inputs.crate }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: "verify: guards + cargo publish --dry-run (${{ inputs.crate }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # workflow_dispatch 入力を ${{ }} で run 本文へ直接展開しない（式インジェクション
+      # 対策）。すべての run ステップはこの env 経由で入力を受け取りシェル変数として扱う。
+      RELEASE_CRATE: ${{ inputs.crate }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_MODE: ${{ inputs.mode }}
+    steps:
+      - name: Checkout
+        # ci.yml / bench.yml と同一コミットに固定。docs/spec submodule は取得しない。
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        # bench.yml / detect-features.yml と同じく rust-toolchain.toml を単一真実源として
+        # rustup show で同期する。
+        run: rustup show
+
+      - name: "guard: 入力バージョン形式の検証"
+        # semver（プレリリース・ビルドメタデータ許容）に一致しない入力は後続ステップへ
+        # 渡さず即座に停止する。
+        run: |
+          set -euo pipefail
+          SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          if ! echo "${RELEASE_VERSION}" | grep -Eq "${SEMVER_RE}"; then
+            echo "::error::invalid version format: '${RELEASE_VERSION}' (expected semver, e.g. 0.1.0)"
+            exit 1
+          fi
+
+      - name: "guard: 公開対象クレートの解決"
+        # choice 入力 `all` を workspace の公開対象パッケージ一覧へ展開する。
+        # `publish = false` のパッケージは対象に含めない（現状は 2 クレートとも公開対象）。
+        # 後続ステップは RELEASE_PACKAGES（空白区切り）を対象として扱う。
+        run: |
+          set -euo pipefail
+          if [ "${RELEASE_CRATE}" = "all" ]; then
+            PACKAGES="$(cargo metadata --format-version 1 --no-deps --locked \
+              | jq -r '.packages[]
+                       | select(.publish == null or (.publish | length) > 0)
+                       | .name' \
+              | sort | tr '\n' ' ')"
+          else
+            PACKAGES="${RELEASE_CRATE} "
+          fi
+          if [ -z "${PACKAGES// /}" ]; then
+            echo "::error::no publishable package resolved for crate input '${RELEASE_CRATE}'."
+            exit 1
+          fi
+          echo "release packages: ${PACKAGES}"
+          echo "RELEASE_PACKAGES=${PACKAGES}" >> "${GITHUB_ENV}"
+
+      - name: "guard: Cargo.toml バージョン一致の検証"
+        # cargo pkgid の出力（例: path+file:///.../crates/engine#fandhe-vector-db-engine@0.1.0）
+        # からバージョンを抽出し、入力 version と完全一致しなければ公開を止める。
+        # `all` のときは全対象パッケージが同一バージョンであることを要求する。
+        run: |
+          set -euo pipefail
+          for PKG in ${RELEASE_PACKAGES}; do
+            PKGID="$(cargo pkgid -p "${PKG}" --locked)"
+            CARGO_VERSION="${PKGID##*#}"
+            CARGO_VERSION="${CARGO_VERSION##*@}"
+            if [ "${CARGO_VERSION}" != "${RELEASE_VERSION}" ]; then
+              echo "::error::version mismatch: ${PKG} Cargo.toml has '${CARGO_VERSION}'" \
+                "but input version is '${RELEASE_VERSION}'."
+              exit 1
+            fi
+            echo "${PKG}: Cargo.toml version ${CARGO_VERSION} matches input."
+          done
+
+      - name: "guard: crates.io 既公開バージョンの検証"
+        # sparse index を直接取得し、入力バージョンが既に公開済みでないか確認する。
+        # 誤って同一バージョンを再実行しても crates.io へ到達する前に止まる
+        # （publish 自体は非冪等なため、CI 側で冪等性を保証する）。
+        run: |
+          set -euo pipefail
+          if ! command -v curl >/dev/null 2>&1; then
+            echo "::error::environment error: curl is not available on this runner."
+            exit 1
+          fi
+          INDEX_BODY_FILE="$(mktemp "${RUNNER_TEMP:-/tmp}/release-index-body.XXXXXX.json")"
+          trap 'rm -f "${INDEX_BODY_FILE}"' EXIT
+          for CRATE in ${RELEASE_PACKAGES}; do
+            LEN=${#CRATE}
+            # crates.io sparse index のシャーディング規約: 1〜2 文字名は '<len>/<name>'、
+            # 3 文字名は '3/<先頭1文字>/<name>'、4 文字以上は '<先頭2文字>/<次2文字>/<name>'。
+            if [ "${LEN}" -le 2 ]; then
+              INDEX_PATH="${LEN}/${CRATE}"
+            elif [ "${LEN}" -eq 3 ]; then
+              INDEX_PATH="3/${CRATE:0:1}/${CRATE}"
+            else
+              INDEX_PATH="${CRATE:0:2}/${CRATE:2:2}/${CRATE}"
+            fi
+            URL="https://index.crates.io/${INDEX_PATH}"
+            # -f を付けない: 404 を curl の非 0 終了ではなく HTTP status として受け取る。
+            # 実ネットワーク障害は curl 自体の非 0 終了で検出する。
+            set +e
+            HTTP_STATUS="$(curl -sS -o "${INDEX_BODY_FILE}" -w '%{http_code}' "${URL}")"
+            CURL_EXIT=$?
+            set -e
+            if [ "${CURL_EXIT}" -ne 0 ]; then
+              echo "::error::failed to reach crates.io sparse index (${URL}, curl exit=${CURL_EXIT})."
+              exit 1
+            fi
+            if [ "${HTTP_STATUS}" = "404" ]; then
+              echo "crate '${CRATE}' is not yet published on crates.io; continuing."
+            elif [ "${HTTP_STATUS}" -ge 200 ] 2>/dev/null && [ "${HTTP_STATUS}" -lt 300 ] 2>/dev/null; then
+              if grep -q "\"vers\":\"${RELEASE_VERSION}\"" "${INDEX_BODY_FILE}"; then
+                echo "::error::version already published: ${CRATE} ${RELEASE_VERSION} already exists on crates.io."
+                exit 1
+              fi
+              echo "crate '${CRATE}' has published versions, but '${RELEASE_VERSION}' is not among them; continuing."
+            else
+              echo "::error::unexpected HTTP status from crates.io sparse index (${URL}, status=${HTTP_STATUS})."
+              exit 1
+            fi
+          done
+
+      - name: "verify: cargo package --list"
+        # 公開に含まれるファイル一覧を Step Summary に記録し、監査ログとして残す
+        # （private spec 由来ファイルの混入がないことの可視化を兼ねる）。
+        run: |
+          set -euo pipefail
+          for PKG in ${RELEASE_PACKAGES}; do
+            {
+              echo "## cargo package --list: ${PKG} ${RELEASE_VERSION}"
+              echo '```'
+              cargo package --list -p "${PKG}" --locked
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+          done
+
+      - name: "verify: cargo publish --dry-run"
+        # トークン不要。パッケージ検証ビルドまでを実施し、実公開前にビルド可能性・
+        # パッケージング可能性を確認する。`all` は --workspace で依存順に検証する
+        # （wire-server 単体は engine の公開版が crates.io に無い間は依存解決で失敗する。
+        # 初回公開は `all` を使う）。
+        run: |
+          set -euo pipefail
+          if [ "${RELEASE_CRATE}" = "all" ]; then
+            cargo publish --dry-run --workspace --locked
+          else
+            cargo publish --dry-run -p "${RELEASE_CRATE}" --locked
+          fi
+
+  publish:
+    name: "publish: cargo publish (${{ inputs.crate }})（要 環境承認）"
+    needs: verify
+    # publish モードのみ実行。dry-run-only（既定・安全側）では本ジョブ自体がスキップされ、
+    # environment の保護ルールにも到達しない。
+    if: ${{ inputs.mode == 'publish' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # GitHub Environment による承認ゲート。保護ルールが通るまで publish は実行されない。
+    environment: crates-io-release
+    env:
+      RELEASE_CRATE: ${{ inputs.crate }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_MODE: ${{ inputs.mode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # verify ジョブが検証したのと同一コミットへピン留めする（TOCTOU 防止）。
+          # environment 承認待ちの間に対象ブランチが進んでも、verify が確認した tree と
+          # 異なる内容が publish されることはない。
+          ref: ${{ github.sha }}
+          submodules: false
+          persist-credentials: false
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      - name: "guard: CARGO_REGISTRY_TOKEN の存在確認"
+        # トークン値は一切出力しない（存在有無のみ判定）。
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::environment error: secret CARGO_REGISTRY_TOKEN is not set on environment crates-io-release."
+            exit 1
+          fi
+
+      - name: "publish: cargo publish"
+        # トークンはこのステップの env にのみ限定して注入し、ジョブ全体（他ステップ）へは
+        # 広げない。`all` は --workspace で engine → wire-server の依存順に公開する。
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${RELEASE_CRATE}" = "all" ]; then
+            cargo publish --workspace --locked
+          else
+            cargo publish -p "${RELEASE_CRATE}" --locked
+          fi
