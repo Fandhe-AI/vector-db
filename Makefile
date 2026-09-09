@@ -657,6 +657,18 @@ else
 	@echo "skip: Cargo.toml 未追加のため hnsw-acorn-recall をスキップ"
 endif
 
+.PHONY: hnsw-crossdb-selectivity
+hnsw-crossdb-selectivity: ## Issue #659（選択率 33%〔crossdb fixture の lang='ja'〕での ann_masked／mask_splits_graph／plain scan 到達分類・ACORN-1 比較・既定エンジン対照 Recall を arm 表として標準出力へ記録する）を実行する（層 A は make ci 対象・crates/engine/tests/hnsw_crossdb_selectivity.rs。層 B は #[ignore]・release 実行専用。CROSSDB_DIR〔docs25k.redb・queries200.jsonl を含むディレクトリ〕必須）
+ifdef HAS_CARGO
+	@if [ -z "$(CROSSDB_DIR)" ]; then \
+		echo "ERROR: CROSSDB_DIR を指定してください（例: make hnsw-crossdb-selectivity CROSSDB_DIR=<dir>）"; \
+		exit 1; \
+	fi
+	CROSSDB_DIR="$(CROSSDB_DIR)" cargo test --release -p engine --test hnsw_crossdb_selectivity -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため hnsw-crossdb-selectivity をスキップ"
+endif
+
 # --------------------------------------------------
 # 疎索引キャッシュ cold/hot 等価性の大規模段（Issue #358。crates/engine/tests/sparse_cache_recall.rs）
 # --------------------------------------------------

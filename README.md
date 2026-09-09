@@ -432,6 +432,8 @@ CROSSDB_DIM=768 make bench-crossdb
 
 GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README.md` を参照してください。spec 由来の閾値なし、情報提供専用・手動実行・CI 非配線です。計測結果・所見は `docs/design/crossdb-bench.md` を参照してください（dim=768 基線は同ドキュメント参照）。後続 Issue が self との前後比較を行う際の受け入れ条件テンプレート（統計量・ノイズ帯・記入例）は `docs/design/benchmark-judgement-policy.md` を参照してください。
 
+`make hnsw-crossdb-selectivity CROSSDB_DIR=<dir>`（`crates/engine/tests/hnsw_crossdb_selectivity.rs`。層 A は `make ci` 対象、層 B は `#[ignore]`・release 専用）は crossdb fixture（`docs25k.redb`・`lang='ja'` 選択率 33.1%）を対象に、HNSW opt-in の `full_scan_ratio`／`acorn_max_visible_ratio` 別 arm での `ann_masked`／`mask_splits_graph`／plain scan 到達分類と既定エンジン対照 Recall@10 を記録します（Issue #659。実測結果は `docs/design/hnsw-rls-cardinality-switch.md`「Issue #659」節参照）。
+
 ### `vector_knn` の wire／SQL／カーネル内訳プロファイル（Issue #463）
 
 `make bench-knn-wire-profile`（`crates/wire-server/benches/knn_wire_profile_bench.rs`）は、`docs/design/crossdb-bench.md` の `vector_knn` 786µs を wire／SQL 表層／距離カーネル・Top-k の 4 区分へ切り分けます。`BENCH_KNN_WIRE_ROUNDS`（既定 5・5〜50）でラウンド数、`BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定できます。spec 由来の閾値なし・情報提供専用・手動実行・CI 非配線（`GITHUB_ACTIONS` 環境下では起動直後に拒否します）。判定ロジック自体（rounds パース・帰属計算・ノイズ帯判定）は `crates/wire-server/tests/knn_wire_profile_accept.rs` で `make ci` から回帰検証します。実測結果・計測設計の詳細は `docs/design/knn-wire-stage-profile.md` を参照してください。
