@@ -464,7 +464,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-scan-stage-profile
-bench-scan-stage-profile: ## Issue #464（docs/design/crossdb-bench.md で self が最劣後する agg_count／rls_isolation／vector_knn_where の redb 全行走査・ヘッダデコード・RLS 判定・dim/metadata デコード・WHERE 述語評価の段別内訳を切り分ける）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_SCAN_PROFILE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_SCAN_PROFILE_SCALE=<1-4>（既定 1＝25,000 行・4＝100,000 行）で規模、BENCH_SCAN_PROFILE_SELECTIVITY=1/<2-100>（既定 1/5・crossdb fixture 相当の 1/3 で選択率 33%。Issue #653・docs/design/filtered-distance-stage-profile.md）で lang='ja' 選択率、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる（1 プロセス = 1 規模点）
+bench-scan-stage-profile: ## Issue #464（docs/design/crossdb-bench.md で self が最劣後する agg_count／rls_isolation／vector_knn_where の redb 全行走査・ヘッダデコード・RLS 判定・dim/metadata デコード・WHERE 述語評価の段別内訳を切り分ける）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_SCAN_PROFILE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_SCAN_PROFILE_SCALE=<1-4>（既定 1＝25,000 行・4＝100,000 行）で規模、BENCH_SCAN_PROFILE_SELECTIVITY=1/<2-100>（既定 1/5・crossdb fixture 相当の 1/3 で選択率 33%。Issue #653・docs/design/filtered-distance-stage-profile.md）で lang='ja' 選択率、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる（1 プロセス = 1 規模点）。BENCH_SCAN_PROFILE_ENGINE=brute_force|hnsw|hnsw_f16|hnsw_i8（既定 brute_force・未設定時は出力・処理が導入前とビット同一のまま不変）・BENCH_SCAN_PROFILE_FULL_SCAN_RATIO=<n>/<d>（hnsw 系エンジン限定の opt-in override）で HNSW opt-in 時の Subset 縮退時委譲（Issue #676）の到達経路・レイテンシを追加計測できる（Issue #677。docs/design/hnsw-rls-cardinality-switch.md「Issue #677」節参照）
 ifdef HAS_CARGO
 	cargo bench --bench scan_stage_profile_bench -p engine
 else

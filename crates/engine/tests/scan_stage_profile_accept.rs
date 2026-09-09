@@ -18,12 +18,13 @@ mod harness;
 
 use harness::scan_stage_profile::{
     assert_scan_row_counts_match, bucket_share_pct, build_lang_filter, classify_against_bands,
-    decode_dim_and_metadata_reimpl, expected_visible_hits, lang_for_id, matches_lang_filter,
-    median_of, min_of, parse_rounds, parse_scale, parse_selectivity, reference_band,
-    refuse_under_github_actions, scan_scalar_columns, stage_diff_ns_per_row, step_ratio_pct,
-    verify_row_key_tenant_reimpl, where_clause_for_arm, BandClass, ProfileArm, ScanStageError,
-    DEFAULT_ROUNDS, DEFAULT_SELECTIVITY_DENOMINATOR, MAX_ROUNDS, MAX_SCALE,
-    MAX_SELECTIVITY_DENOMINATOR, MIN_ROUNDS, MIN_SELECTIVITY_DENOMINATOR, TARGET_LANG,
+    classify_hnsw_subset_regime, decode_dim_and_metadata_reimpl, expected_visible_hits,
+    lang_for_id, matches_lang_filter, median_of, min_of, parse_rounds, parse_scale,
+    parse_selectivity, reference_band, refuse_under_github_actions, scan_scalar_columns,
+    stage_diff_ns_per_row, step_ratio_pct, verify_row_key_tenant_reimpl, where_clause_for_arm,
+    BandClass, ProfileArm, ScanStageError, DEFAULT_ROUNDS, DEFAULT_SELECTIVITY_DENOMINATOR,
+    MAX_ROUNDS, MAX_SCALE, MAX_SELECTIVITY_DENOMINATOR, MIN_ROUNDS, MIN_SELECTIVITY_DENOMINATOR,
+    TARGET_LANG,
 };
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -726,5 +727,60 @@ fn profile_arm_contract_matches_scalar_index_cache_stats() {
     assert_eq!(
         after_plain.plain_scan_fallbacks, before_plain.plain_scan_fallbacks,
         "a pure PlainScan-classified query never enters the fallback-recording branch"
+    );
+}
+
+// --- classify_hnsw_subset_regime（Issue #677） ------------------------------
+
+#[test]
+fn classify_hnsw_subset_regime_ann_masked_has_priority() {
+    // `subset_searches_delta > 0`（ANN 完走）はどのフィールドが同時に非ゼロ
+    // でも最優先で `ann_masked` と分類する。
+    assert_eq!(classify_hnsw_subset_regime(0, 1, 0, 0, 0), "ann_masked");
+    assert_eq!(classify_hnsw_subset_regime(1, 1, 1, 1, 1), "ann_masked");
+}
+
+#[test]
+fn classify_hnsw_subset_regime_plain_scan_ratio() {
+    assert_eq!(
+        classify_hnsw_subset_regime(0, 0, 1, 0, 0),
+        "plain_scan_ratio"
+    );
+}
+
+#[test]
+fn classify_hnsw_subset_regime_mask_split() {
+    // Issue #676 が候補 id マスク経路（複製なし）へ委譲する対象の一つ
+    // （connectivity 検査による分断検知）。
+    assert_eq!(
+        classify_hnsw_subset_regime(0, 0, 0, 1, 0),
+        "plain_scan_mask_split"
+    );
+}
+
+#[test]
+fn classify_hnsw_subset_regime_masked_short() {
+    assert_eq!(
+        classify_hnsw_subset_regime(0, 0, 0, 0, 1),
+        "plain_scan_masked_short"
+    );
+}
+
+#[test]
+fn classify_hnsw_subset_regime_full_visible_hit_fallback() {
+    // `Subset` 形状のクエリでは通常到達しないが、`hits_delta` のみが非ゼロの
+    // 場合でも panic せず判別可能なラベルを返す（呼び出し元の非 vacuous
+    // 検査が 5 カウンタ中いずれか 1 つの非ゼロを要求するため）。
+    assert_eq!(
+        classify_hnsw_subset_regime(1, 0, 0, 0, 0),
+        "full_visible_hit (unexpected for a Subset-shaped query)"
+    );
+}
+
+#[test]
+fn classify_hnsw_subset_regime_all_zero_is_not_ann_masked() {
+    assert_eq!(
+        classify_hnsw_subset_regime(0, 0, 0, 0, 0),
+        "n/a (all counters delta=0)"
     );
 }

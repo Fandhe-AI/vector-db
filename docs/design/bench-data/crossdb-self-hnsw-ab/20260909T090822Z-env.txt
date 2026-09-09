@@ -1,0 +1,13 @@
+timestamp_utc: 20260909T090822Z
+wire_server_sha256: 230a3c529c6106fb93319301aa7802ec38e4486c512ff7c0b2f853be8d1cb230
+crossdb_plan_probe_sha256: 459ceb88b9b541c574d227e0c09c30f9534a446e3e527f557d16ee72901f3073
+git_rev: bcf1471eaadcf00e1d0acdbc361a8e7eb4659b8e
+ab_pairs: 5
+loadavg_before: 0.94 0.51 0.35 1/434 19080
+fs_type_crossdb_dir: ext4
+hnsw_args: (none)
+cpu_model: QEMU Virtual CPU version 2.5+
+cpu_flags_subset: fma f16c avx2 
+nproc: 12
+concurrent_running_processes_excluding_self: 0
+bench_dedicated_env: <unset>

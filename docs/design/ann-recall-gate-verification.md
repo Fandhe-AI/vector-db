@@ -616,3 +616,23 @@ cache.rs`・`tests/hnsw_hybrid_refetch.rs` の可視外非混入・RLS 統合テ
 - `hnsw_f16`／`hnsw_i8` での再検証（Recall 経路自体は #447〜#449 の
   変更対象外のため実施していない。必要になった場合は次回 Recall 関連
   Issue で合わせて確認する）
+
+## Issue #677 追記
+
+Issue #676（`sql::hnsw_cache::prepare_subset_from_slots`。DISTANCE 段の
+`Subset` 形状 plain scan 縮退時委譲）は 3 つの Recall ハーネス（`hybrid_
+recall.rs`・`rerank_recall.rs`・`query_planning_recall.rs`）が使う `ORDER BY
+HYBRID(...)` 経路（`sql::hnsw_hybrid::HnswDenseProvider`）を通らない
+（`sql/exec.rs` の DISTANCE 段のみを変更対象とし、hybrid 密側は対象外のまま
+——本 doc「Issue #676」相当節・`docs/design/hnsw-rls-cardinality-switch.md`
+「Issue #676」節参照）。したがって #412・#515・#523 が記録した
+brute_force／hnsw／hnsw_f16／hnsw_i8 の実測値（全 8〜12 測定点で完全一致）
+は #676 適用前後で構造的に不変であり、Issue #506 と同じ理由（変更対象の
+分岐自体を通らない経路であること）により本 Issue では実測での再確認を
+行っていない。docs/spec submodule 未チェックアウトのため閾値注入自体も
+できない環境だった（プレースホルダ閾値での実行にとどめる #450／#506 の
+運用も、本経路が構造的に不変である以上は追加の情報を持たないと判断した）。
+
+専有環境での再確認が必要と判断された場合は `make recall-regression
+RECALL_ENGINE=hnsw RECALL_VERBOSE=1`（プレースホルダ閾値）等をオーナー・
+後続 Issue へ申し送る。
