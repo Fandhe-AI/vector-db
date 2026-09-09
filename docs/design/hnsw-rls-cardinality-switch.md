@@ -1427,9 +1427,14 @@ opt-in でも計測できるようにした。同一プロセス内で既存の 
 「複製を避ける」最適化であり、`Overlay::compute_over_slots`・BFS 連結性検査
 自体のコストは削減対象ではないため、複製を伴わない brute_force 側の
 `ScalarIndex` マスク経路と比べるとまだ大きな差が残る。一方、`full_scan_ratio`
-を選択率（20%）超の `2/5` へ引き上げると `plain_scans`（比率判定）レジームへ
-切り替わり、この経路は Overlay の一部（`Overlay::compute_over_slots`）のみで
-BFS 連結性検査を経由しないため hnsw アームは index アームとほぼ等速になった。
+を選択率（20%）超の `2/5` へ引き上げると `sql::hnsw_cache::
+resolve_subset_slot_plan` の `below_full_scan_ratio` 判定（`Overlay::
+compute_over_slots` 呼び出しより**前**に位置する早期 return）が発火し
+`plain_scans`（比率判定）レジームへ切り替わる。この経路は `Overlay::
+compute_over_slots` 自体（BFS 連結性検査を含む）を一度も呼ばずに縮退する
+（「Overlay の一部のみ実行し BFS 連結性検査だけを省略する」という以前の
+記述は誤りだった。codex-review 指摘・PR #688。実際は Overlay 計算そのものを
+丸ごと省略する）ため hnsw アームは index アームとほぼ等速になった。
 これは Track 1 の crossdb 実測（`2/5` opt-in で劣後幅がほぼ解消）と同じ方向の
 所見であり、**#676 の効果は「plain scan 縮退の理由」（比率判定 vs 分断検知）
 に強く依存する**ことを示している。生データ:

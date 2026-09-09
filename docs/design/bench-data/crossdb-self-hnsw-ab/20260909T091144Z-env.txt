@@ -7,7 +7,7 @@ loadavg_before: 0.29 0.45 0.36 1/442 87549
 fs_type_crossdb_dir: ext4
 hnsw_args: --hnsw-full-scan-ratio 2/5
 cpu_model: QEMU Virtual CPU version 2.5+
-cpu_flags_subset: fma f16c avx2 
+cpu_flags_subset: fma f16c avx2
 nproc: 12
 concurrent_running_processes_excluding_self: 0
 bench_dedicated_env: <unset>

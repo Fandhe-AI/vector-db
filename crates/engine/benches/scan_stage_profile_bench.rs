@@ -461,15 +461,21 @@ fn main() {
         "scan_stage_profile_bench: rows={total_physical_rows} dim={DIM} rounds={rounds} scale={scale} selectivity=1/{selectivity_denominator} (tenant_a={tenant_a_rows} public, tenant_b={tenant_b_rows} private)"
     );
     // Issue #677 追記行（既存の summarizer 正規表現は上記行のみを見るため
-    // 後方互換）。`scan_engine` 既定（未設定）は `brute_force` トークンのまま。
-    println!(
-        "scan_stage_profile_bench: engine={} full_scan_ratio={}",
-        scan_engine.token(),
-        match scan_full_scan_ratio_override {
-            Some((n, d)) => format!("{n}/{d}"),
-            None => "default".to_string(),
-        }
-    );
+    // 後方互換）。`BENCH_SCAN_PROFILE_ENGINE` 未設定（既定 `brute_force`）時は
+    // この行自体を出力しないことで、既定出力（本関数の println 列全体）を
+    // #677 導入前とビット同一のまま維持する（codex-review P2 指摘・PR #688:
+    // 無条件 println! だと `scan_default_brute.log` のように既定実行でも
+    // 新規行が増え、「既定出力はビット同一」という互換性説明と矛盾していた）。
+    if scan_engine != harness::bench_engine::BenchEngine::BruteForce {
+        println!(
+            "scan_stage_profile_bench: engine={} full_scan_ratio={}",
+            scan_engine.token(),
+            match scan_full_scan_ratio_override {
+                Some((n, d)) => format!("{n}/{d}"),
+                None => "default".to_string(),
+            }
+        );
+    }
 
     let schema = schema();
     let path = unique_db_path("issue464-scan-stage-profile");
@@ -1832,15 +1838,23 @@ fn main() {
             "hnsw",
         ) {
             Ok(_) => {
-                let ratio_pct = step_ratio_pct(hnsw_med, index_med).unwrap_or(0.0);
+                // stage_diff_ns_per_row(index_med, hnsw_med, ...) が Ok ⇒
+                // hnsw_med >= index_med（hnsw アームが同等以上に遅い）。
+                // ラベル「index->hnsw」と揃うよう from=index_med/to=hnsw_med で
+                // 比率を計算する（codex-review・Cursor Bugbot 指摘: 引数順が
+                // ラベルと逆で符号・表示が反転していた）。
+                let ratio_pct = step_ratio_pct(index_med, hnsw_med).unwrap_or(0.0);
                 println!(
-                    "arm_ratio(index->hnsw,k={TOP_K}): ratio={ratio_pct:.2}% (brute_force ScalarIndex-mask arm〔Issue #654〕vs hnsw arm〔Issue #676〕on the same WHERE+DISTANCE query)"
+                    "arm_ratio(index->hnsw,k={TOP_K}): ratio={ratio_pct:.2}% (brute_force ScalarIndex-mask arm〔Issue #654〕vs hnsw arm〔Issue #676〕on the same WHERE+DISTANCE query; hnsw arm is slower or equal this round)"
                 );
             }
             Err(_) => {
-                let ratio_pct = step_ratio_pct(index_med, hnsw_med).unwrap_or(0.0);
+                // Err ⇒ hnsw_med < index_med（hnsw アームがこのラウンドは速い）。
+                // ラベル「hnsw->index」と揃うよう from=hnsw_med/to=index_med で
+                // 比率を計算する。
+                let ratio_pct = step_ratio_pct(hnsw_med, index_med).unwrap_or(0.0);
                 println!(
-                    "arm_ratio(hnsw->index,k={TOP_K}): ratio={ratio_pct:.2}% (hnsw arm is slower than the brute_force ScalarIndex-mask arm this round)"
+                    "arm_ratio(hnsw->index,k={TOP_K}): ratio={ratio_pct:.2}% (hnsw arm is faster than the brute_force ScalarIndex-mask arm this round)"
                 );
             }
         }

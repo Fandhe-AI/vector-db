@@ -632,8 +632,19 @@ pub fn render_arm_stats_line(
 /// `subset_searches_delta > 0` は ANN 探索が縮退なしで完走したことを表す
 /// （`hits_delta` は `FullVisible` 形状専用のため、`Subset` 形状の ANN 完走は
 /// ここでのみ捕捉できる）。`plain_scans_delta`／`mask_splits_graph_delta`／
-/// `masked_short_delta` はいずれも plain scan 縮退の内訳（互いに排他）で、
-/// Issue #676 が候補 id マスク経路（複製なし）へ委譲する対象そのもの。
+/// `masked_short_delta` はいずれも「plain scan へ縮退した」内訳（互いに排他）
+/// だが、Issue #676 が候補 id マスク経路（複製なし）へ委譲する対象という
+/// 意味では **同列ではない**（codex-review・Cursor Bugbot 指摘・PR #688）:
+/// `plain_scans`／`mask_splits_graph` は `sql::hnsw_cache::
+/// resolve_subset_slot_plan` が ANN を試みる**前**（`kept` から subset
+/// アリーナを複製する前）に `SubsetSlotPlan::MaskScan` を返す縮退であり、
+/// #676 の複製回避がそのまま効く。対して `masked_short` は
+/// `sql::hnsw_cache::finish_indexed_search` が ANN 探索を実際に実行した
+/// **後**——`sql/exec.rs` の `SubsetSlotPlan::Ann` 分岐で既に
+/// `build_from_cached_rls_rows_subset` により subset アリーナを複製した
+/// **後**——に結果不足で `full_scan_with_arena` へ縮退する経路であり、
+/// この regime では #676 導入前と同じく複製が発生している（複製なし委譲の
+/// 証拠としては扱えない）。
 pub fn classify_hnsw_subset_regime(
     hits_delta: u64,
     subset_searches_delta: u64,
