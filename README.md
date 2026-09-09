@@ -432,7 +432,7 @@ CROSSDB_DIM=768 make bench-crossdb
 
 GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README.md` を参照してください。spec 由来の閾値なし、情報提供専用・手動実行・CI 非配線です。計測結果・所見は `docs/design/crossdb-bench.md` を参照してください（dim=768 基線は同ドキュメント参照）。後続 Issue が self との前後比較を行う際の受け入れ条件テンプレート（統計量・ノイズ帯・記入例）は `docs/design/benchmark-judgement-policy.md` を参照してください。
 
-`make hnsw-crossdb-selectivity CROSSDB_DIR=<dir>`（`crates/engine/tests/hnsw_crossdb_selectivity.rs`。層 A は `make ci` 対象、層 B は `#[ignore]`・release 専用）は crossdb fixture（`docs25k.redb`・`lang='ja'` 選択率 33.1%）を対象に、HNSW opt-in の `full_scan_ratio`／`acorn_max_visible_ratio` 別 arm での `ann_masked`／`mask_splits_graph`／plain scan 到達分類と既定エンジン対照 Recall@10 を記録します（Issue #659。実測結果は `docs/design/hnsw-rls-cardinality-switch.md`「Issue #659」節参照）。
+`make hnsw-crossdb-selectivity CROSSDB_DIR=<dir>`（`crates/engine/tests/hnsw_crossdb_selectivity.rs`。層 A は `make ci` 対象、層 B は `#[ignore]`・release 専用）は crossdb fixture（`docs25k.redb`・`lang='ja'` 選択率 33.1%）を対象に、HNSW opt-in の `full_scan_ratio`／`acorn_max_visible_ratio` 別 arm・k（10・200）での `ann_masked`／`mask_splits_graph`／plain scan 到達分類と既定エンジン対照 Recall@k（LIMIT=k に対応する実質 Recall@k。k=10 と k=200 の双方を記録）を記録します（Issue #659。実測結果は `docs/design/hnsw-rls-cardinality-switch.md`「Issue #659」節参照）。
 
 ### `vector_knn` の wire／SQL／カーネル内訳プロファイル（Issue #463）
 

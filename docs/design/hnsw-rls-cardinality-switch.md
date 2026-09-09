@@ -1140,8 +1140,10 @@ Issue #487 の可視比率スイープ（均等分散 `id % N` マスク・一�
   と同一の優先順位（acorn > subset > plain_scan_ratio > mask_splits_graph
   > masked_short > none）。全カウンタ 0 は vacuous として fail。
 - `ann_masked` / `ann_masked_two_hop` に到達した arm は、同 arm のフィルタ
-  なし Recall@10 に対し `filtered >= unfiltered - 0.02` であること
-  （フィルタ付き ANN がフィルタなし ANN より悪化しないことの検証）。
+  なし Recall@k（k=10・200 それぞれ）に対し `filtered >= unfiltered - 0.02`
+  であること（フィルタ付き ANN がフィルタなし ANN より悪化しないことの
+  検証）。判定はテスト実装（`crates/engine/tests/hnsw_crossdb_selectivity.rs`）
+  側で arm 名でなく到達分類（`label`）に応じて適用する。
 - 縮退（plain scan）した arm は既定エンジンと厳密一致（Recall 1.0）で
   あること。
 - 既定値（`full_scan_ratio`／`acorn_max_visible_ratio`）の変更提案は、
@@ -1162,7 +1164,9 @@ CROSSDB_DIR=<dir>`・release 専用）。crossdb fixture の実体
 閾値で `PlainScanBelowRatio` 早期打ち切りを狙う対照〕・`force_plain`＝
 `full_scan_ratio=1/1`〔常に plain scan の対照〕）× 2 k（10・200）で
 `hnsw_index_cache_stats()` の増分から到達方式を分類し、`lang='ja'`
-フィルタ付き／なし DISTANCE の既定エンジン対照 Recall@10 を記録する。
+フィルタ付き／なし DISTANCE の既定エンジン対照 Recall@k（LIMIT=k の
+結果全体を正解集合と照合するため、k=10 では Recall@10・k=200 では
+Recall@200 に相当する）を記録する。
 カウンタの before/after 窓は**フィルタ付き 200 クエリのみ**に限定する
 （フィルタなしクエリは `FullVisible` 経路〔可視比率 1.0〕で別途
 `traversal_regime_for` を通り `acorn_searches` 等を独立に加算しうるため、
