@@ -25,7 +25,7 @@ redb = "=4.2.0"
 # 下記 `contrast-bench` feature 限定とし、`wire-server` バイナリはリンクしない
 # （`cargo tree -p wire-server` に出現しないことを CI 外の手元確認で担保）。
 # .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
-usearch = { version = "=2.26.1", optional = true }
+usearch = { version = "=2.26.2", optional = true }
 
 # TASK-128〜130（Issue #178）: GPU バッチ経路（`gpu_batch.rs`）用の依存。
 # .claude/rules/dependency-policy.md の承認事項をここに記録する
@@ -73,7 +73,7 @@ ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, fea
     "load-dynamic",
     "api-17",
 ] }
-tokenizers = { version = "=0.23.1", optional = true, default-features = false, features = [
+tokenizers = { version = "=0.23.2", optional = true, default-features = false, features = [
     "onig",
 ] }
 
