@@ -1122,6 +1122,175 @@ opt-in 経路でも同一閾値を通過することの確認」は、`RecallEng
 - scale=4（100k 行）規模点: 計測時間の都合で `SWEEP_SCALES=4` opt-in に
   留める（既定は scale=1）
 
+## Issue #659: 選択率 33%（crossdb fixture）での `ann_masked` 到達実測と既定値判断
+
+### 背景
+
+Issue #487 の可視比率スイープ（均等分散 `id % N` マスク・一様乱数ベクトル）
+は 1/2〜1/10 の全点で `mask_splits_graph`（連結性検査による plain scan 縮退）
+に落ち `ann_masked` を一度も観測できなかった。Issue #658（PR）は
+`lang='ja'`（crossdb fixture・可視 23,000 行中 7,621 行 ≒ 33.1%）が
+`full_scan_ratio`（既定 1/10）を超えるため `mask_splits_graph` 縮退が
+有力な要因と**推測**したが、`hnsw_index_cache_stats()` が wire 非露出の
+ため確認できないまま本 Issue へ申し送られた。本節はその確認結果を記録する。
+
+### 事前登録した判定規則（実測前に本節へ記載）
+
+- arm 分類は `crates/engine/benches/knn_profile_bench.rs::observed_arm_label`
+  と同一の優先順位（acorn > subset > plain_scan_ratio > mask_splits_graph
+  > masked_short > none）。全カウンタ 0 は vacuous として fail。
+- `ann_masked` / `ann_masked_two_hop` に到達した arm は、同 arm のフィルタ
+  なし Recall@k（k=10・200 それぞれ）に対し `filtered >= unfiltered - 0.02`
+  であること（フィルタ付き ANN がフィルタなし ANN より悪化しないことの
+  検証）。判定はテスト実装（`crates/engine/tests/hnsw_crossdb_selectivity.rs`）
+  側で arm 名でなく到達分類（`label`）に応じて適用する。
+- 縮退（plain scan）した arm は既定エンジンと厳密一致（Recall 1.0）で
+  あること。
+- 既定値（`full_scan_ratio`／`acorn_max_visible_ratio`）の変更提案は、
+  (i) 決定的成果（arm 到達・Recall）で優位が示され、かつ (ii) 専有環境
+  （`BENCH_DEDICATED_ENV=1`）でレイテンシの Improved が両ノイズ帯を
+  超えた場合のみ Accepted にする。本環境（共有 QEMU）では (ii) を満たせ
+  ないため、実測後も既定値は据え置く。
+
+### 計測基盤
+
+`crates/engine/tests/hnsw_crossdb_selectivity.rs`（層 A は `make ci`
+対象・fixture 不要。層 B は `#[ignore]`・`make hnsw-crossdb-selectivity
+CROSSDB_DIR=<dir>`・release 専用）。crossdb fixture の実体
+（`docs25k.redb`・`queries200.jsonl`。`seed_docs seed <db> 25000 128`
+形式）を対象に、5 arm（`default`＝既定 `full_scan_ratio=1/10`・
+`acorn_4_10`＝`acorn_max_visible_ratio=4/10`・`acorn_1_1`＝同 `1/1`・
+`full_scan_2_5`＝`full_scan_ratio=2/5`〔fixture 選択率 33.1% より高い
+閾値で `PlainScanBelowRatio` 早期打ち切りを狙う対照〕・`force_plain`＝
+`full_scan_ratio=1/1`〔常に plain scan の対照〕）× 2 k（10・200）で
+`hnsw_index_cache_stats()` の増分から到達方式を分類し、`lang='ja'`
+フィルタ付き／なし DISTANCE の既定エンジン対照 Recall@k（LIMIT=k の
+結果全体を正解集合と照合するため、k=10 では Recall@10・k=200 では
+Recall@200 に相当する）を記録する。
+カウンタの before/after 窓は**フィルタ付き 200 クエリのみ**に限定する
+（フィルタなしクエリは `FullVisible` 経路〔可視比率 1.0〕で別途
+`traversal_regime_for` を通り `acorn_searches` 等を独立に加算しうるため、
+同一窓に混ぜるとフィルタ付き経路の到達方式判定が汚染される。実装時に
+一度この汚染を作り込み〔`acorn_1_1` が誤って `ann_masked_two_hop` と
+分類された〕、レビューで検出して分離した。詳細はテストのコメント参照）。
+
+### arm 表（実測。フィルタ付き専用窓へ分離後に再現確認）
+
+共有 QEMU 環境・fixture: `docs/design/bench-data/crossdb-selectivity-659/arm-report-20260909T013000Z.log`。
+
+| arm | k | ja_visible/index | subset | acorn | plain_ratio | mask_split | 分類 | recall filtered | recall unfiltered |
+| --- | - | ----------------- | ------ | ----- | ------------ | ---------- | ---- | ---------------- | ------------------- |
+| default | 10 | 7621/23000 | 0 | 0 | 0 | 200 | `plain_scan_mask_split` | 1.0000 | 0.8670 |
+| default | 200 | 7621/23000 | 0 | 0 | 0 | 200 | `plain_scan_mask_split` | 1.0000 | 0.8515〜0.8516 |
+| acorn_4_10 | 10 | 7621/23000 | 0 | 0 | 0 | 200 | `plain_scan_mask_split` | 1.0000 | 0.8670 |
+| acorn_4_10 | 200 | 7621/23000 | 0 | 0 | 0 | 200 | `plain_scan_mask_split` | 1.0000 | 0.8515 |
+| acorn_1_1 | 10 | 7621/23000 | 0 | 0 | 0 | 200 | `plain_scan_mask_split` | 1.0000 | 0.8670 |
+| acorn_1_1 | 200 | 7621/23000 | 0 | 0 | 0 | 200 | `plain_scan_mask_split` | 1.0000 | 0.8515 |
+| full_scan_2_5 | 10 | 7621/23000 | 0 | 0 | 200 | 0 | `plain_scan_ratio` | 1.0000 | 0.8665〜0.8670 |
+| full_scan_2_5 | 200 | 7621/23000 | 0 | 0 | 200 | 0 | `plain_scan_ratio` | 1.0000 | 0.8515 |
+| force_plain | 10 | 7621/23000 | 0 | 0 | 200 | 0 | `plain_scan_ratio` | 1.0000 | 0.8665〜0.8670 |
+| force_plain | 200 | 7621/23000 | 0 | 0 | 200 | 0 | `plain_scan_ratio` | 1.0000 | 0.8515〜0.8516 |
+
+判定規則に照らした結果:
+
+- **A1**（`default` の到達方式）: `ann_masked` ではなく
+  `mask_splits_graph` に 200 クエリ全件（k=10・200 いずれも）が到達する
+  ことを確認した。Issue #658 の推測（`mask_splits_graph` 縮退が有力な
+  要因）を**カウンタで確定**した——`subset_searches` は常に 0、
+  `mask_splits_graph` が常に 200（非 vacuous）。
+- **A2**（ACORN-1 opt-in の効果）: `acorn_4_10`・`acorn_1_1` いずれも
+  `default` と**同じ** `mask_splits_graph` 縮退のまま（`subset_searches`・
+  `acorn_searches` は常に 0）。両閾値とも regime 判定式
+  （`visible_in_index * denom <= index_len * numerator`。`sql/
+  hnsw_cache.rs::traversal_regime_for`）上は `TraversalRegime::TwoHop`
+  に解決されるはずだが（`0.3313 <= 0.4` と `0.3313 <= 1.0` はいずれも
+  真）、2-hop 中継を試みても連結性検査
+  `is_mask_fully_reachable_with(mask, HopMode::TwoHop)` が依然として
+  失敗し、plain scan へ縮退する。**この fixture・このグラフでは
+  ACORN-1（`acorn_max_visible_ratio`。閾値を 4/10 まで・1/1〔常に
+  TwoHop〕まで引き上げても）が `mask_splits_graph` を一切解消しない**
+  ことを確認した（Issue #502 の「クラスタ構造ありコーパス・25,000 行
+  規模では ACORN 4/10 でも分断が解消しない」という既存所見と整合する
+  結果）。
+- **A4**（Recall 非劣化）: `ann_masked`／`ann_masked_two_hop` に到達した
+  arm は 0 件だった（上記 A2 のとおり全 hnsw arm が plain scan・
+  `plain_scan_mask_split` または `plain_scan_ratio` へ縮退）ため、
+  「filtered >= unfiltered - 0.02」の判定規則は本実測では一度も
+  行使されなかった。全 arm の filtered recall は既定エンジンと厳密
+  一致（1.0000）——ただしこれは ANN 探索の精度検証ではなく、plain scan
+  縮退が既定エンジン（brute-force）と等価な経路を通ることの自明な
+  帰結である点に注意（trivial pass。ANN 経路の Recall 非劣化検証には
+  ならない）。
+
+### wire A/B（A3）
+
+`make bench-crossdb-self-hnsw-ab` 相当・self（wire 経由）exact/hnsw 交互 N=5 ペア。HEAD `a1e7b0e`。生データ: `docs/design/bench-data/crossdb-selectivity-659/`。
+
+S1（`default`。`CROSSDB_SELF_HNSW_ARGS` 未指定）:
+
+| phase | exact min/median (µs) | hnsw min/median (µs) | ratio min/median |
+| --- | --- | --- | --- |
+| vector_knn | 669.4 / 674.7 | 425.7 / 437.8 | 0.636 / 0.649 |
+| vector_knn_where | 1270.0 / 1295.9 | 4083.7 / 4248.2 | **3.215 / 3.278** |
+| hybrid_rrf | 6579.1 / 6690.9 | 5860.6 / 6180.0 | 0.891 / 0.924 |
+| bulk_knn_k200 | 852.5 / 911.6 | 602.4 / 620.4 | 0.707 / 0.681 |
+| bulk_knn_k1000 | 1648.0 / 1651.4 | 1364.8 / 1376.5 | 0.828 / 0.834 |
+| bulk_knn_where_k200 | 2189.2 / 2209.3 | 5673.7 / 5719.9 | **2.592 / 2.589** |
+| bulk_hybrid_k200 | 9123.7 / 9288.4 | 8377.7 / 8831.3 | 0.918 / 0.951 |
+
+S3（`full_scan_2_5`。`--hnsw-full-scan-ratio 2/5`〔fixture 選択率
+33.1% を上回る閾値で `PlainScanBelowRatio` 早期打ち切りを狙う〕）:
+
+| phase | exact min/median (µs) | hnsw min/median (µs) | ratio min/median |
+| --- | --- | --- | --- |
+| vector_knn | 652.3 / 701.5 | 432.4 / 449.8 | 0.663 / 0.641 |
+| vector_knn_where | 1265.5 / 1292.4 | 1991.8 / 2027.8 | **1.574 / 1.569** |
+| hybrid_rrf | 6478.3 / 6554.3 | 5878.4 / 5987.8 | 0.907 / 0.914 |
+| bulk_knn_k200 | 845.3 / 896.6 | 602.2 / 615.4 | 0.712 / 0.686 |
+| bulk_knn_k1000 | 1614.5 / 1697.3 | 1380.3 / 1388.6 | 0.855 / 0.818 |
+| bulk_knn_where_k200 | 2176.7 / 2251.3 | 3228.7 / 3264.8 | **1.483 / 1.450** |
+| bulk_hybrid_k200 | 9094.1 / 9272.0 | 8644.3 / 8749.8 | 0.951 / 0.944 |
+
+所見: `full_scan_ratio` を fixture 選択率（33.1%）より高い `2/5`
+（40%）へ引き上げると、`vector_knn_where`（3.22x→1.57x）・
+`bulk_knn_where_k200`（2.59x→1.48x）とも hnsw 側の劣後幅が明確に縮小
+する——arm 表で確認した「`PlainScanBelowRatio` は `Overlay::compute`・
+BFS 連結性検査を経由せず即座に plain scan する」設計（Issue #488）が
+`mask_splits_graph` 経路（`Overlay::compute` を経由してから BFS で
+失敗する、より高コストな plain scan 縮退）よりレイテンシ面で有利という
+仮説を支持する参考値。ただし依然として exact 側（1.0x）には及ばず、
+共有 QEMU 環境のため両ノイズ帯を超える確定判定はできない（S2＝
+`acorn_4_10` の wire 実測は、in-process ハーネスで `default`／`acorn_1_1`
+と同一の `mask_splits_graph` 縮退が確認できたため予測結果が自明であり、
+時間予算の優先順位（S1 > S2 > S3。計画§3.3）に従い本 Issue では省略
+した）。HEAD には Issue #664（非 HNSW の Subset 形状のみ id マスク経路化）
+が含まれるため、Issue #658 時点の比率（2.19x／1.81x）とは前提条件が異なり
+単純比較できない（exact 側だけ #664 で速くなった非対称が残っている
+ため、hnsw 側の絶対値は #658 とほぼ同水準でも比率は悪化して見える）。
+
+### 判断
+
+- **既定値（`full_scan_ratio=1/10`・`acorn_max_visible_ratio=None`）は
+  据え置く**。共有 QEMU 環境では専有環境実測（判定規則の条件 (ii)）を
+  満たせないため Accepted にできない。
+- 候補値の一次評価（決定的成果のみ。判定規則の条件 (i)）:
+  - `full_scan_ratio` を `2/5`（fixture 選択率 33.1% 超）へ引き上げる
+    候補は、Recall 非劣化（force_plain と同じ `plain_scan_ratio`
+    縮退・既定エンジン厳密一致）を満たしたうえで、wire A/B（参考値）
+    でも改善方向が一貫した。専有環境で条件 (ii) を満たせば Accepted に
+    できる候補として最有力。
+  - `acorn_max_visible_ratio`（`4/10`・`1/1` いずれも）は、regime 判定式
+    上は TwoHop に解決されるにもかかわらず本 fixture の `mask_splits_graph`
+    を一切解消しなかった（上記 A2）。決定的優位性が無いため、この
+    fixture を根拠には推奨できない——`full_scan_ratio` 引き上げの方が
+    本 fixture には効果があるという逆の結論になった（Issue #502 が
+    候補として残した `4/10` は本 fixture では採用理由にならない）。
+- **オーナーへの質問**: `full_scan_ratio` の既定値を `1/10` から `2/5`
+  相当（本 fixture の選択率 33% 前後をカバーする水準）へ引き上げる
+  方向性を専有環境実測（`BENCH_DEDICATED_ENV=1`・`make
+  bench-crossdb-self-hnsw-ab CROSSDB_SELF_HNSW_ARGS="--hnsw-full-scan-ratio
+  2/5"`）で検証してよいか。
+
 ## スコープ外・申し送り
 
 - ~~不足時の `ef` 倍増再探索（iterative scan）・hybrid 密側の ANN 化と
@@ -1174,3 +1343,10 @@ opt-in 経路でも同一閾値を通過することの確認」は、`RecallEng
   の確定: #502~~ 実測・回帰テストを実装済み（「Issue #502」節参照）。既定値
   は共有 QEMU 環境の制約により `None` のまま据え置き、候補値 `4/10` と
   専有環境での再実測・確定を運用者へ申し送り
+- ~~crossdb fixture（選択率 33%）での `ann_masked` 到達実測・既定値判断:
+  #659~~ 実測を実施済み（「Issue #659」節参照）。`default` は
+  `mask_splits_graph` へ到達すること（Issue #658 の推測を確定）・
+  ACORN-1（`acorn_max_visible_ratio=4/10`／`1/1` いずれも）は本 fixture の
+  分断を解消しないこと・`full_scan_ratio=2/5` 候補は wire A/B 参考値で
+  改善方向が一貫することを確認。既定値は共有 QEMU 環境の制約により据え置き、
+  専有環境実測を後続 Issue へ申し送り

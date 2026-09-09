@@ -1009,7 +1009,10 @@ ann_plan: hnsw_full_visible
 縮退（索引構築失敗→brute-force、`mask_splits_graph`→plain scan）はこの確認
 だけでは検出できない。実行時カウンタ（`hnsw_index_cache_stats()`）による
 確認は Rust API のみで wire 非露出であり、Issue #659（選択率 33% での
-`ann_masked` 到達実測・既定値判断）へ申し送る。
+`ann_masked` 到達実測・既定値判断）へ申し送る。**確定結果**: `default`
+は `mask_splits_graph`（連結性検査による plain scan 縮退）へ到達すること
+を in-process ハーネスのカウンタで確認済み（`docs/design/
+hnsw-rls-cardinality-switch.md`「Issue #659」節参照）。
 
 ### `hnsw_index_warm`（索引構築の実行証跡）
 
@@ -1050,7 +1053,13 @@ fixture（`docs25k.redb`・25,000 行・dim 128・ext4）を交互 5 ペア実�
   `full_scan_ratio`（既定 1/10）を超えて `mask_splits_graph` に伴う plain
   scan 縮退（Issue #487 と同型の理由）が有力な要因と推測されるが、
   `hnsw_index_cache_stats()` によるカウンタ確認は Issue #659 の担当のため
-  本 Issue では確定していない。
+  本 Issue では確定していない。**確定結果**: Issue #659 が
+  `mask_splits_graph` 縮退であることをカウンタで確認し、`full_scan_ratio`
+  を fixture 選択率より高い値（`2/5`）へ引き上げると劣後幅が縮小する
+  （3.22x→1.57x・2.59x→1.48x。参考値）ことも確認した（`docs/design/
+  hnsw-rls-cardinality-switch.md`「Issue #659」節参照。HEAD には Issue
+  #664 が含まれるため本節の比率〔2.19x／1.81x〕とは前提条件が異なり
+  単純比較できない点に注意）。
 
 ### Recall@10（既定エンジン対照）
 
@@ -1080,6 +1089,8 @@ informational 参考値。受け入れ判定はクラスタ構造ありフィク
   場合は出力名の設計が必要）。
 - 実行時カウンタ（`hnsw_index_cache_stats()`）による縮退有無の確定・選択率
   33% での `ann_masked` 到達実測・既定値判断は Issue #659 の担当。
+  実測・既定値判断（据え置き）は `docs/design/hnsw-rls-cardinality-switch.md`
+  「Issue #659」節参照。
 - wire-server 側の観測性追加（stderr へのエンジン表示等）は production 変更の
   ため本 Issue では行わない。
 

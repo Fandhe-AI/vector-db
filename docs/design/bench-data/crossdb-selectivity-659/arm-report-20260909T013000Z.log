@@ -1,0 +1,15 @@
+arm,k,ja_visible_count,subset,acorn,plain_ratio,mask_split,masked_short,fallbacks,builds,entries,label,recall_filtered,recall_unfiltered
+default,10,7621,0,0,0,200,0,200,1,1,plain_scan_mask_split,1.0000,0.8670
+default,200,7621,0,0,0,200,0,200,1,1,plain_scan_mask_split,1.0000,0.8516
+acorn_4_10,10,7621,0,0,0,200,0,200,1,1,plain_scan_mask_split,1.0000,0.8670
+acorn_4_10,200,7621,0,0,0,200,0,200,1,1,plain_scan_mask_split,1.0000,0.8515
+acorn_1_1,10,7621,0,0,0,200,0,200,1,1,plain_scan_mask_split,1.0000,0.8670
+acorn_1_1,200,7621,0,0,0,200,0,200,1,1,plain_scan_mask_split,1.0000,0.8515
+full_scan_2_5,10,7621,0,0,200,0,0,200,1,1,plain_scan_ratio,1.0000,0.8670
+full_scan_2_5,200,7621,0,0,200,0,0,200,1,1,plain_scan_ratio,1.0000,0.8515
+force_plain,10,7621,0,0,200,0,0,200,1,1,plain_scan_ratio,1.0000,0.8665
+force_plain,200,7621,0,0,200,0,0,200,1,1,plain_scan_ratio,1.0000,0.8515
+test layer_b::layer_b_crossdb_docs25k_lang_ja_arm_report ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 13.66s
+
