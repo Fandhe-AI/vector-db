@@ -25,7 +25,10 @@
   （Issue #409・#659。`Subset` per-query 写像の非登録理由・`RowKey` インターン化
   の申し送り）・`docs/design/scalar-index-mask-search.md`（Issue #654・#676 の
   候補 id マスク経路）・`docs/design/scalar-index-generation-cache.md`
-  （Issue #473。述語キー付き世代整合キャッシュの先例）・
+  （Issue #473。`ScalarIndexCache` は `(table, ctx)` × テーブル世代でキャッシュ
+  し述語はキーに含まない――`MetadataFilter`／`id_bounds` の述語表現・
+  正規化ロジックの先例として参照する。述語キー付きキャッシュ自体の先例
+  ではない）・
   `docs/design/benchmark-judgement-policy.md`（Issue #462。前後比較実測の
   計測規約）・`docs/design/ann-index-adoption.md`（Issue #367・#403。HNSW
   採否 ADR 本体・「事後フィルタ不採用」の判断）
@@ -150,11 +153,15 @@ B-1 が成立しない場合でも B-2 単独で BFS コストは償却できる
 
 | 方式 | 内容 | 長所 | 短所 |
 | --- | --- | --- | --- |
-| K1 | B-2 の対象を `classify_scalar_plan != PlainScan`（索引対応形状）に限定し、`PlainScan` 形状（索引非対応述語を含む）は従来どおり per-query 計算のまま | キー設計が `ScalarIndex` の既存正規化と共有でき単純・well-defined 性が保証される | 索引非対応述語（`Builtin`／`WasmCall` 等）を伴うクエリはキャッシュされない |
+| K1 | B-2 の対象を `classify_scalar_plan != PlainScan`（索引対応形状）に限定し、`PlainScan` 形状（索引非対応述語を含む）は従来どおり per-query 計算のまま | `ScalarIndex` が候補削減で既に扱う述語表現（`metadata_filters`／`id_bounds`。`ScalarIndexCache` 自体は述語をキーに含まないため、共有できるのはこの述語表現とその正規化ロジックのみ）を土台にでき、well-defined 性が保証される――ただし述語列を並び替え・直列化してキャッシュキー化する処理自体は B-2 で新規に設計する必要がある | 索引非対応述語（`Builtin`／`WasmCall` 等）を伴うクエリはキャッシュされない・キー化の実装コストは `ScalarIndex` に既存キャッシュキーがある前提より大きい |
 | K2 | 候補スロット集合そのもののフィンガープリント（O(\|候補\|) のハッシュ）をキーにする | 述語の形状を問わず適用できる | フィンガープリントの衝突可能性（fail-closed に「別候補」として扱う定義が必要）・O(\|候補\|) の計算コストが (a) の一部を再導入する（B-1 が成立すれば (a) 自体が軽量になるため許容範囲かは要実測）・候補集合が 1 クエリごとに変わりやすい場合（`id` 範囲述語の可変下限等）ヒット率が構造的に低い |
 
-**推奨: K1。** 理由は (1) `ScalarIndex`（Issue #473）の正規化キーと実装を共有
-でき新規のキー設計コストを最小化できる、(2) K2 のフィンガープリント計算
+**推奨: K1。** 理由は (1) `ScalarIndex`（Issue #473）が持つ述語表現
+（`metadata_filters`／`id_bounds`）を土台にでき、K2 のような候補集合
+フィンガープリント方式よりキー設計コストを抑えられる（ただし
+`ScalarIndexCache` 自体に述語キー付きキャッシュの実装は無く、述語列を
+正規化してキャッシュキー化する処理は B-2 で新規に設計する必要がある）、
+(2) K2 のフィンガープリント計算
 コストは B-1 が成立しない場合 (a) を代替する程度の重さになり得え、B-2 単独の
 狙い（BFS コストの償却）に対して割に合わない可能性が高い、(3) 索引非対応述語
 （`Builtin`／`WasmCall`）は crossdb fixture の主要経路（`lang='ja'` 等価述語）
@@ -216,9 +223,9 @@ B-1（写像導出）は `FullVisible` overlay を**読むだけ**で書き込�
 | --- | --- | --- | --- |
 | A（#676） | 縮退時の id マスク経路委譲（arena 複製の除去） | `Subset` 経路全般の arena 複製コスト | Overlay 構築・BFS の per-query コスト |
 | B（本 ADR） | B-1 写像導出／B-2 BFS 判定キャッシュ | 可視比率 ≥ `full_scan_ratio` で `mask_splits_graph` 判定または ANN 実行に至るクエリ | 可視比率 < `full_scan_ratio`（`PlainScanBelowRatio` で既に早期打ち切り済み） |
-| C（#659 申し送り） | `full_scan_ratio` 既定値の引き上げ（2/5 候補） | 選択率 ≤ 40% 程度のクエリを `PlainScanBelowRatio` で即座に縮退させる | それ以上の可視比率、または ANN 実行そのものを狙いたい場合 |
+| C（#659 申し送り） | `full_scan_ratio` 既定値の引き上げ（2/5 候補） | 選択率が 40% 未満のクエリを `PlainScanBelowRatio` で即座に縮退させる（`below_full_scan_ratio` は厳密な `<` 比較のため、ちょうど 40% は含まない） | それ以上の可視比率、または ANN 実行そのものを狙いたい場合 |
 
-`full_scan_ratio` を仮に 2/5 へ引き上げると、選択率 ≤ 40% のクエリは
+`full_scan_ratio` を仮に 2/5 へ引き上げると、選択率が 40% 未満のクエリは
 `Overlay::compute` 自体に到達しなくなり、案 B は何も追加の効果を持たない
 （B の対象範囲が縮小する）。
 
