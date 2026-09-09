@@ -11,7 +11,7 @@
 #
 # 呼び出し元は人間の運用者（`make bench-chip-ab`）。呼び出し先は
 # `BEFORE_DIR`/`AFTER_DIR`（それぞれ workspace ルート相当のディレクトリ。
-# `crates/engine` を含み `cargo bench --bench chip_bench -p engine` が
+# `crates/engine` を含み `cargo bench --bench chip_bench --manifest-path crates/engine/Cargo.toml` が
 # 起動できる状態を前提とする）配下の `chip_bench` バイナリを `cargo bench`
 # 経由で呼ぶ。production コード（`crates/engine/src/`）・`chip_bench.rs`・
 # `harness/chip.rs` は一切変更しない（変更すると before/after で計測器が
@@ -118,7 +118,7 @@ run_one() {
     BENCH_CHIP_ROUNDS=1 \
     BENCH_CHIP_OUT_DIR="${run_out}" \
     BENCH_CHIP_WORKLOADS="${BENCH_CHIP_WORKLOADS:-}" \
-    "${CARGO_BIN}" bench --bench chip_bench -p engine
+    "${CARGO_BIN}" bench --bench chip_bench --manifest-path crates/engine/Cargo.toml
   ) > "${run_out}/driver.log" 2>&1 || status=$?
 
   if [ "${status}" -ne 0 ]; then

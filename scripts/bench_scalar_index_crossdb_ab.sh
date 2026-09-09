@@ -8,7 +8,7 @@
 # #644 で crossdb fixture 実測〔126.3 バイト〕を確実に上回る 64 へ
 # 引き下げ済み。長文 `body` 列を索引対象から除外する）について、
 # before・after・ref の 3 コミットを `git archive` で独立ソースツリーへ
-# 展開・`cargo build --release -p wire-server` で個別ビルドし、
+# 展開・`cargo build --release --manifest-path crates/wire-server/Cargo.toml` で個別ビルドし、
 # `scripts/crossdb_bench/run.py --db self --config exact`（crossdb self
 # 全フェーズ）と `scripts/crossdb_bench/hybrid_after_where.py`
 # （WHERE 実行後の hybrid_rrf 単独ループ・RSS）を輪番実行する
@@ -153,7 +153,7 @@ prepare_arm() {
   mkdir -p "${wt}"
   git -C "${REPO_ROOT}" archive "${commit}" | tar -x -C "${wt}"
   local bin
-  bin="$(cd "${wt}" && CARGO_TARGET_DIR="${target}" cargo build --release -p wire-server --message-format=json | locate_artifact)"
+  bin="$(cd "${wt}" && CARGO_TARGET_DIR="${target}" cargo build --release --manifest-path crates/wire-server/Cargo.toml --message-format=json | locate_artifact)"
   [[ -x "${bin}" ]] || die "could not locate wire-server binary for commit ${commit} under ${target}"
   echo "${bin}"
 }

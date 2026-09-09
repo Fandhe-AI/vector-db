@@ -32,7 +32,8 @@ vector-db/
 │   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-interrupt + crash-test-cross-table + core-api-check + sort-determinism-check + cross-check（aarch64 クロスコンパイル確認）の CI
 │   ├── bench.yml                  # TASK-127 性能・Recall 受け入れ基準（CORE-5 は Issue #176 で usearch 接続済み・既定ゲート）+ TASK-130 バッチ高速化受け入れ基準（CORE-6/16 は GPU 搭載環境向けの Issue #178 opt-in）の回帰ベンチ（workflow_dispatch + 週次 schedule）+ TASK-83 SQL 表層 C1 p95 専有環境再測定（Conditional Go 条件7・workflow_dispatch 限定）
 │   ├── recall.yml                 # TASK-104 ハイブリッド検索 Recall 回帰の層 B 閾値ゲート（workflow_dispatch + 週次 schedule。environment recall-gate + strict モードで閾値未評価runの誤green化を防止。pull_request 非対応＝spec 閾値の非公開ログ漏えい防止。PR ゲートは層 A が担う）
-│   └── codex-review.yml           # PR 自動レビュー wrapper
+│   ├── codex-review.yml           # PR 自動レビュー wrapper
+│   └── release.yml                # crates.io 公開（workflow_dispatch・environment crates-io-release 承認ゲート・既定 dry-run-only）
 ├── .claude/
 │   ├── agents/                    # カテゴリ別 subagent 定義
 │   ├── rules/                     # 運用ルール
