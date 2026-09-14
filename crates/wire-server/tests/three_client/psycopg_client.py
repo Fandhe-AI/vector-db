@@ -30,7 +30,11 @@ codex-review 指摘・PR #210）。
 全列を出力する。`crates/wire-server/tests/three_client_e2e.rs` の
 `run_psql`／`run_pg` と同じ区切り規約）。失敗時はエラーを stderr へ出力し、
 終了コード 1（silent skip はしない）。SQLSTATE を伴う失敗（拒否経路の検証。
-TASK-165）は `[SQLSTATE=<code>]` を stderr メッセージに含める。
+TASK-165）は `[SQLSTATE=<code>]` を stderr メッセージに含める。commit 成功
+境界を跨いだ panic 時の緊急応答（TASK-97・TASK-153・ERR-5・Issue #706）が
+持つ `detail` フィールド（`state=may_be_committed`）は psycopg の
+`e.diag.message_detail` として読めるため、値がある場合は
+`[DETAIL=<detail>]` を続けて stderr メッセージに含める。
 """
 
 import json
@@ -98,6 +102,9 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001 — ハーネスへ理由を伝える最終防波堤
         sqlstate = getattr(e, "sqlstate", None)
         suffix = f" [SQLSTATE={sqlstate}]" if sqlstate else ""
+        diag = getattr(e, "diag", None)
+        detail = getattr(diag, "message_detail", None) if diag is not None else None
+        suffix += f" [DETAIL={detail}]" if detail else ""
         print(f"psycopg_client: query failed{suffix}: {e}", file=sys.stderr)
         return 1
 

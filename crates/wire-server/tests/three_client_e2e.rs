@@ -40,6 +40,19 @@
 //! 評価順序・台帳スコープ・複数次元共存・`42P01` は engine 側
 //! `crates/engine/tests/arbitrary_table.rs`（TASK-81・SQL-11 確定化の根拠）が
 //! 既に機械検証済みのため、本ファイルでは重複網羅しない。
+//!
+//! TASK-97・TASK-153・ERR-5（Issue #706）: commit 成功境界を跨いだ panic 時の
+//! 緊急応答（`S`=`ERROR`・`C`=`XX000`・`D`=`state=may_be_committed`）の
+//! バイト列契約そのものは層 A（`tests/wire_emergency_response.rs`）が固定し、
+//! テスト専用注入フラグ `--fault-inject post-commit-panic`（feature
+//! `fault-injection`・Issue #705）の CLI 受理・発火・abort は層 A
+//! （`tests/wire_fault_injection_cli.rs`）が検証済み。本ファイルはその先
+//! ——無改造の実クライアント 3 種が、自身のドライバ API から実際に `detail`
+//! 値へ到達できるか（psql の `DETAIL:` 行、psycopg の
+//! `e.diag.message_detail`、node `pg` の `err.detail`）——を検証する
+//! （`three_clients_receive_emergency_response_detail_after_post_commit_panic`）。
+//! `--fault-inject` は 1 プロセスにつき 1 回しか発火しない take-once 契約
+//! （Issue #705）のため、クライアントごとに独立したサーバー・DB を起動する。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -54,6 +67,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::core::EngineCore;
+use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::row_codec::Value;
 use engine::storage::{Storage, Visibility};
@@ -69,9 +84,17 @@ fn resolve_tool(env_var: &str, default_name: &str) -> String {
 /// `wire-server` バイナリを子プロセスとして起動し、stderr の `listening on
 /// 127.0.0.1:<port>` 行から実際に bind されたポートを取得する。
 /// 呼び出し元が `Drop` 相当で必ず kill する（[`ServerGuard`]）。
+///
+/// `startup_lines` は listen 行到達までに観測した stderr の全行（トリム済み）
+/// を保持する（Issue #706。`--fault-inject`〔Issue #705〕を渡して起動する
+/// 場合の `fault injection armed` 行の観測に使う。`ServerGuard` の生存中に
+/// 子プロセスが自発的に終了することがある（Issue #706 の commit 後 panic
+/// 注入。`Drop` の `kill`／`wait` は既終了プロセスに対しても安全に no-op と
+/// なる）ため、`wait_for_exit` で明示的に終了を待ち受けられるようにする。
 struct ServerGuard {
     child: Child,
     port: u16,
+    startup_lines: Vec<String>,
 }
 
 impl Drop for ServerGuard {
@@ -81,16 +104,43 @@ impl Drop for ServerGuard {
     }
 }
 
-fn spawn_wire_server(users_path: &Path, db_path: &Path) -> ServerGuard {
+impl ServerGuard {
+    /// 子プロセスの終了（緊急応答送出後の `fail_fast` による abort を含む。
+    /// TASK-97・RECOVER-6・TASK-99・RECOVER-8）を `timeout` まで待ち受ける
+    /// （`crates/wire-server/tests/wire_fault_injection_cli.rs::wait_for_exit`
+    /// と同型）。超過した場合は kill してから panic する。
+    fn wait_for_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                return status;
+            }
+            if start.elapsed() > timeout {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("subprocess did not terminate within {timeout:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// `extra_args`（`extended_syntax_e2e.rs::spawn_wire_server` と同型）で
+/// `--fault-inject post-commit-panic`（Issue #705・#706）等の追加 CLI を
+/// まとめて渡せるようにする。
+fn spawn_wire_server(users_path: &Path, db_path: &Path, extra_args: &[String]) -> ServerGuard {
+    let mut args: Vec<String> = vec![
+        "--users".into(),
+        users_path.to_str().expect("utf-8 path").into(),
+        "--db".into(),
+        db_path.to_str().expect("utf-8 path").into(),
+        "--bind".into(),
+        "127.0.0.1:0".into(),
+    ];
+    args.extend_from_slice(extra_args);
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
-        .args([
-            "--users",
-            users_path.to_str().expect("utf-8 path"),
-            "--db",
-            db_path.to_str().expect("utf-8 path"),
-            "--bind",
-            "127.0.0.1:0",
-        ])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -112,6 +162,7 @@ fn spawn_wire_server(users_path: &Path, db_path: &Path) -> ServerGuard {
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut port: Option<u16> = None;
+    let mut startup_lines: Vec<String> = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -119,12 +170,15 @@ fn spawn_wire_server(users_path: &Path, db_path: &Path) -> ServerGuard {
         }
         match rx.recv_timeout(remaining) {
             Ok(line) => {
-                if let Some(addr_str) = line.trim().strip_prefix("wire-server: listening on ") {
+                let trimmed = line.trim().to_string();
+                if let Some(addr_str) = trimmed.strip_prefix("wire-server: listening on ") {
                     if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
                         port = Some(addr.port());
+                        startup_lines.push(trimmed);
                         break;
                     }
                 }
+                startup_lines.push(trimmed);
             }
             Err(_) => break,
         }
@@ -133,10 +187,19 @@ fn spawn_wire_server(users_path: &Path, db_path: &Path) -> ServerGuard {
     let Some(port) = port else {
         let _ = child.kill();
         let _ = child.wait();
-        panic!("wire-server did not report a listening port within the deadline");
+        panic!(
+            "wire-server did not report a listening port within the deadline \
+             (run via `make e2e-three-client` which builds with `--features \
+             fault-injection` when `--fault-inject` is passed); lines so far: \
+             {startup_lines:?}"
+        );
     };
 
-    ServerGuard { child, port }
+    ServerGuard {
+        child,
+        port,
+        startup_lines,
+    }
 }
 
 /// 3 テナント（alice/bob/carol）に Public 行 1 件ずつを投入した `docs`
@@ -709,7 +772,7 @@ fn three_clients_run_c1_through_c4_and_reject_wrong_password() {
     let users_path = users_dir.path().join("users.txt");
     write_users_file(&users_path);
 
-    let server = spawn_wire_server(&users_path, &db_path);
+    let server = spawn_wire_server(&users_path, &db_path, &[]);
     let port = server.port;
 
     // 独立オラクル（TASK-73／WIRE-1。各定数のドキュメンテーションコメント
@@ -772,7 +835,7 @@ fn three_clients_verify_search_mode_switch_and_precision_contract() {
     let users_path = users_dir.path().join("users.txt");
     write_users_file(&users_path);
 
-    let server = spawn_wire_server(&users_path, &db_path);
+    let server = spawn_wire_server(&users_path, &db_path, &[]);
     let port = server.port;
 
     const PRECISION_CLAUSE_SQL: &str =
@@ -849,7 +912,7 @@ fn three_clients_verify_aggregate_queries_and_rls_invariance() {
     let users_path = users_dir.path().join("users.txt");
     write_users_file(&users_path);
 
-    let server = spawn_wire_server(&users_path, &db_path);
+    let server = spawn_wire_server(&users_path, &db_path, &[]);
     let port = server.port;
 
     // 独立オラクル（可視行は id=1/2/3 の Public 3 行のみ。Private 行
@@ -935,7 +998,7 @@ fn three_clients_run_c1_and_insert_on_arbitrary_table() {
     let users_path = users_dir.path().join("users.txt");
     write_users_file(&users_path);
 
-    let server = spawn_wire_server(&users_path, &db_path);
+    let server = spawn_wire_server(&users_path, &db_path, &[]);
     let port = server.port;
 
     // 独立オラクル（Public 3 行のみ。tenant-a の Private 行 id=11 は wire
@@ -1011,4 +1074,238 @@ fn three_clients_run_c1_and_insert_on_arbitrary_table() {
 
     drop(server);
     let _ = std::io::stdout().flush();
+}
+// -----------------------------------------------------------------------
+// Issue #706: 緊急応答（TASK-97・TASK-153・ERR-5）の 3 クライアント detail
+// 到達検証。
+// -----------------------------------------------------------------------
+
+/// psql（無改造）で `sql` を送り、commit 後 panic の緊急応答（TASK-97・
+/// TASK-153・ERR-5）を検証する。psql は `ErrorResponse` 受信直後の接続断を
+/// 「connection to server was lost」として終了コード 2 で報告するため
+/// （通常の拒否経路の終了コード 1 とは異なる）、`run_psql_session_expect_sqlstate`
+/// と同じ `!success()` のみで判定する。`-v VERBOSITY=verbose` で `DETAIL:`
+/// 行を出力させ、`LC_ALL=C` で libpq の gettext 翻訳によるラベル文言差を
+/// 避ける（`DETAIL:` 自体は翻訳されうるが、`state=may_be_committed` の
+/// 生値は翻訳対象外）。観測した stderr 全文を返す（実行記録用）。
+fn run_psql_expect_emergency(port: u16, user: &str, password: &str, sql: &str) -> String {
+    let psql = resolve_tool("PSQL_BIN", "psql");
+    let output = Command::new(&psql)
+        .env("PGPASSWORD", password)
+        .env("LC_ALL", "C")
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-U",
+            user,
+            "-d",
+            "irrelevant-db-name",
+            "-X",
+            "-w",
+            "-q",
+            "-At",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-v",
+            "VERBOSITY=verbose",
+            "-c",
+            sql,
+        ])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {psql}: {e}"));
+    assert!(
+        !output.status.success(),
+        "psql must exit non-zero after the emergency response / connection loss"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("XX000"),
+        "expected SQLSTATE XX000 in psql stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("state=may_be_committed"),
+        "expected ERR-5 detail 'state=may_be_committed' in psql stderr, got: {stderr}"
+    );
+    stderr
+}
+
+/// psycopg（無改造）で `sql` を送り、commit 後 panic の緊急応答を検証する
+/// （`psycopg_client.py` が `e.diag.message_detail` を `[DETAIL=...]` として
+/// stderr へ出力する。Issue #706 で追加）。
+fn run_psycopg_expect_emergency(port: u16, user: &str, password: &str, sql: &str) -> String {
+    let output = spawn_psycopg_client(port, user, password, &[], sql);
+    assert!(
+        !output.status.success(),
+        "psycopg_client.py must exit non-zero for the emergency response"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("[SQLSTATE=XX000]"),
+        "expected [SQLSTATE=XX000] in psycopg_client.py stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("[DETAIL=state=may_be_committed]"),
+        "expected ERR-5 [DETAIL=state=may_be_committed] in psycopg_client.py stderr, got: {stderr}"
+    );
+    stderr
+}
+
+/// node `pg`（無改造）で `sql` を送り、commit 後 panic の緊急応答を検証する
+/// （`pg_client.js` が `err.detail` を `[DETAIL=...]` として stderr へ出力する。
+/// Issue #706 で追加）。
+fn run_pg_expect_emergency(port: u16, user: &str, password: &str, sql: &str) -> String {
+    let output = spawn_pg_client(port, user, password, &[], sql);
+    assert!(
+        !output.status.success(),
+        "pg_client.js must exit non-zero for the emergency response"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("[SQLSTATE=XX000]"),
+        "expected [SQLSTATE=XX000] in pg_client.js stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("[DETAIL=state=may_be_committed]"),
+        "expected ERR-5 [DETAIL=state=may_be_committed] in pg_client.js stderr, got: {stderr}"
+    );
+    stderr
+}
+
+/// commit 成功境界を跨いだ panic（TASK-97・RECOVER-6）の緊急応答が、無改造の
+/// psql／psycopg／node `pg` それぞれのドライバ API から観測できる `detail`
+/// フィールド（ERR-5・`state=may_be_committed`）として実際に到達することを
+/// 検証する（Issue #706）。`--fault-inject post-commit-panic`（Issue #705）は
+/// 1 プロセスにつき 1 回のみ発火する take-once 契約のため、クライアントごとに
+/// 独立したサーバー・DB・テナントを用意する。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg, and a `--features fault-injection` \
+            build; run via `make e2e-three-client`"]
+fn three_clients_receive_emergency_response_detail_after_post_commit_panic() {
+    struct Case {
+        client: &'static str,
+        user: &'static str,
+        password: &'static str,
+        tenant: &'static str,
+        id: u64,
+    }
+
+    let cases = [
+        Case {
+            client: "psql",
+            user: "alice",
+            password: "pw-alice",
+            tenant: "tenant-a",
+            id: 901,
+        },
+        Case {
+            client: "psycopg",
+            user: "bob",
+            password: "pw-bob",
+            tenant: "tenant-b",
+            id: 902,
+        },
+        Case {
+            client: "pg",
+            user: "carol",
+            password: "pw-carol",
+            tenant: "tenant-c",
+            id: 903,
+        },
+    ];
+
+    for case in cases {
+        let (db_path, _db_guard) = seed_three_tenant_db();
+        let users_dir = temp_db::TempDir::new("three-client-e2e-emergency-users");
+        let users_path = users_dir.path().join("users.txt");
+        write_users_file(&users_path);
+
+        let mut server = spawn_wire_server(
+            &users_path,
+            &db_path,
+            &["--fault-inject".into(), "post-commit-panic".into()],
+        );
+        // 「fault injection armed」が listen 到達前に観測されること（非
+        // vacuous な arm 確認。`wire_fault_injection_cli.rs::
+        // armed_post_commit_panic_sends_emergency_response_then_aborts` と
+        // 同じ検査方針）。feature 無効ビルドで実行された場合は `--fault-inject`
+        // が未知引数として拒否され listen 行に到達できないため、この時点で
+        // `spawn_wire_server` 側の panic として明示的に失敗する。
+        assert!(
+            server
+                .startup_lines
+                .iter()
+                .any(|l| l.contains("fault injection armed")),
+            "client={}: expected 'fault injection armed' before listen; lines={:?}",
+            case.client,
+            server.startup_lines,
+        );
+
+        let insert_sql = format!(
+            "INSERT INTO docs (id, embedding, lang, body) VALUES \
+             ({}, '[0.5,0.5]', 'en', 'emergency e2e') \
+             USING OPERATION_ID 'emergency-e2e-{}'",
+            case.id, case.client
+        );
+
+        let stderr = match case.client {
+            "psql" => run_psql_expect_emergency(server.port, case.user, case.password, &insert_sql),
+            "psycopg" => {
+                run_psycopg_expect_emergency(server.port, case.user, case.password, &insert_sql)
+            }
+            "pg" => run_pg_expect_emergency(server.port, case.user, case.password, &insert_sql),
+            other => panic!("unknown client label: {other}"),
+        };
+        eprintln!("[e2e-record] {}: {stderr}", case.client);
+
+        let status = server.wait_for_exit(Duration::from_secs(30));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert!(
+                !status.success(),
+                "client={}: server must not exit successfully; status={status:?}",
+                case.client
+            );
+            assert_eq!(
+                status.signal(),
+                Some(6),
+                "client={}: server must be terminated by SIGABRT \
+                 (std::process::abort); status={status:?}",
+                case.client
+            );
+        }
+
+        // commit 自体は成功しているため、再オープン後も投入行が可視のまま
+        // であること（`state=may_be_committed` が実際に committed だった
+        // ことの確認。他テナントの Public 行 3 件と合わせて 4 件になる）。
+        drop(server);
+        let storage = Storage::open(&db_path).expect("reopen storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let read_ctx = PolicyContext::with_visibilities(
+            case.tenant,
+            [Visibility::Public, Visibility::Private],
+        )
+        .expect("valid tenant");
+        let result = core
+            .execute_sql(
+                &read_ctx,
+                "SELECT id FROM docs ORDER BY embedding <=> '[0.5,0.5]' LIMIT 10",
+            )
+            .expect("select should succeed after the emergency-abort path");
+        assert_eq!(
+            result.rows.len(),
+            4,
+            "client={}: expected 3 seeded Public rows + 1 committed Private row",
+            case.client
+        );
+        assert!(
+            result.rows.iter().any(|row| row.id == case.id),
+            "client={}: expected the committed row (id={}) to remain visible; rows={:?}",
+            case.client,
+            case.id,
+            result.rows,
+        );
+    }
 }
