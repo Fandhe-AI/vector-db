@@ -132,6 +132,69 @@ psql・psycopg・pg の導入自動化を確定させるには、pip/npm の実�
   3 クライアントで確認する（層 A で確定済みの拒否経路・順列網羅を層 B へ
   複製しない方針は TASK-165・TASK-168・TASK-82 と同じ）。
 
+### Issue #705: テスト専用 commit 後 panic 注入フラグ（`fault-injection` feature）
+
+**目的**: commit 成功境界を跨いだ panic → 緊急応答の同期送出 → abort
+（TASK-97・RECOVER-6。応答本体は `D`=`state=may_be_committed`。ERR-5）は、
+これまで engine のプロセス内テストと wire-server 層 A
+（`tests/wire_emergency_response.rs`。テストバイナリ自身が登録・commit・
+panic を再現する）でしか観測できず、`wire-server` バイナリを外部クライアント
+から commit 後 panic させる手段が無かった。#702（3 クライアント e2e で `D`
+到達を確認する）の前提として、テスト専用・feature gate 付きの注入フラグを
+バイナリへ追加した。
+
+**feature gate と CLI 契約**: `crates/wire-server/Cargo.toml` の
+`fault-injection` feature（default に含めない・依存追加なし）を有効化した
+ビルドでのみ `--fault-inject post-commit-panic` を受理する。既定ビルドでは
+このフラグ自体が存在せず `main.rs` の `other =>` 分岐で未知引数として拒否
+される。値欠落・不正値（閉じた語彙 `post-commit-panic` の厳密一致のみ受理）・
+2 回目以降の重複指定はいずれも fail-closed で起動エラー（`--search-engine`
+等・Issue #656 と同じ判断枠組み）。
+
+**注入点の位置と理由**: 実際の panic 注入は
+`crate::simple_query::execute_and_respond` の「登録ブロック」
+（`_emergency_registration` が生存する区間。同関数のコメント参照）の**内側**、
+`engine.execute_sql_in_session` の呼び出し直後に置く
+（`crate::fault_injection::maybe_panic_after_commit`）。この区間の外
+（ブロック終端後の `match outcome { .. }` 側）で panic しても、登録は既に
+drop 済みで緊急応答は送られず接続断（RECOVER-5 の abort バックストップ）に
+なるだけのため、注入点をここより後ろへ移動してはならない。登録ブロックの
+境界自体は変更していない。
+
+**arm-once と発火条件**: `main.rs::run_server` が bind 成功後・`listening on`
+出力前に `fault_injection::arm` を高々 1 回呼ぶ（テストが両行の出力順に
+依存できるようにするため）。発火は `Ok(SqlOutcome::Insert(_))`（commit 成功
+を意味する）のときだけ arm を消費する（`compare_exchange` による take-once）。
+`Err(_)` や他の読み取り専用 variant（`SELECT`・`EXPLAIN` 等）では arm は
+一切触らず据え置くため、失敗した INSERT・SELECT を挟んでも後続の成功
+INSERT で確実に発火する。
+
+**安全性の判断**: default features に含めないため既定ビルド・crates.io
+公開の既定構成にはシンボルもフラグも存在しない。feature を有効化しても
+露出するのは「CLI を握る者が自プロセスを 1 回だけ commit 後 panic で終了
+させる」能力のみで、テナント境界・RLS・認証・fail-closed 経路を迂回する
+API は一切露出しない（engine の `bench-internals` feature と同じ判断
+枠組み）。発火経路自体は production の RECOVER-6 経路そのもので、追加する
+のはトリガーだけ。`make lint`／`make test` は `--all-features` のため CI
+でも常にコンパイル・実行され、feature コードの腐敗を防ぐ。
+
+**検証層**: 単体テスト（`crates/wire-server/src/fault_injection.rs`）は
+`is_committed_insert`／take-once の判定純関数のみを検証する（実発火は
+`ResponseBoundaryGuard` の `Drop` と `fail_fast::install` により必ず
+SIGABRT に至るためプロセス内テスト不可）。結合テスト
+（`crates/wire-server/tests/wire_fault_injection_cli.rs`）は
+`CARGO_BIN_EXE_wire-server` の実子プロセスとして起動し、CLI 引数の拒否・
+未 arm 時の通常応答・実際の発火（緊急応答の `S`/`C`/`M`/`D` フィールド・
+abort・再オープン後の可視性）・arm 維持（SELECT・拒否された INSERT を
+挟んでも消費されない）を検証する。e2e 層（#702・`three_client_e2e.rs`）は
+本フラグを使って 3 クライアント経由の `D` 到達を確認する担当。
+
+**既知の制約**: `make test`／CI は `--all-features` のため
+`cfg(not(feature = "fault-injection"))` の既定ビルド拒否テスト
+（`default_build_rejects_fault_inject_flag_as_unknown_argument`）は CI では
+実行されない。`cargo test -p fandhe-vector-db-wire-server`（feature 無し）
+を別途ローカルで実行することが唯一の検査手段。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・
@@ -140,6 +203,9 @@ psql・psycopg・pg の導入自動化を確定させるには、pip/npm の実�
 - `wire-server --db <path>` が必須化された（省略時は fail-closed で
   起動拒否。匿名・揮発 DB の暗黙生成はしない）。
 - `Makefile` に `e2e-three-client`（opt-in・`ci` には含めない）を追加した。
+- `crates/wire-server/Cargo.toml` に `fault-injection` feature（default 外）
+  を追加し、`e2e-three-client` の `three_client_e2e` 行はこの feature 付きで
+  ビルドするよう変更した（Issue #705）。
 
 ## スコープ外
 

@@ -10,9 +10,20 @@
 //! [--search-engine default|hnsw|hnsw_f16|hnsw_i8]
 //! [--hnsw-full-scan-ratio <num>/<den>]
 //! [--hnsw-acorn-max-visible-ratio <num>/<den>]
-//! [--hnsw-sparse-visited-max <N>]`
+//! [--hnsw-sparse-visited-max <N>]
+//! [--fault-inject post-commit-panic]`
 //! （既定 bind: `127.0.0.1:5432`）。`--db` は必須（省略時は fail-closed で
 //! 非 0 終了。匿名・揮発 DB の暗黙生成はしない。TASK-73・WIRE-1）。
+//!
+//! `--fault-inject post-commit-panic`（Issue #705。feature `fault-injection`
+//! 有効ビルド限定・**テスト専用**）: `INSERT` の commit 成功直後に自プロセスを
+//! 1 回だけ panic させ、TASK-97・RECOVER-6 の緊急応答
+//! （`C`=`XX000`・`D`=`state=may_be_committed`。ERR-5）と後続の abort を外部
+//! クライアントから観測できるようにする。既定ビルド（feature 無効）では
+//! このフラグ自体が存在せず `unknown argument: --fault-inject` で非 0 終了する
+//! （fail-closed）。値欠落・不正値・重複指定も同様に起動エラー。詳細は
+//! `wire_server::fault_injection` モジュールドキュメント・
+//! `docs/design/three-client-e2e-harness.md`「Issue #705」節参照。
 //!
 //! `--search-engine`（Issue #656）: `--planner-endpoint` 等（TASK-117）と同型の
 //! opt-in 注入点。未指定または `default` は現行どおり `EngineCore::open`
@@ -120,6 +131,11 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut full_scan_ratio_raw: Option<String> = None;
     let mut acorn_max_visible_ratio_raw: Option<String> = None;
     let mut sparse_visited_max_raw: Option<String> = None;
+    // Issue #705（テスト専用・feature `fault-injection` 限定）。feature 無効
+    // ビルドではこの変数自体が存在せず、`--fault-inject` は下記 `other =>`
+    // 分岐で未知引数として拒否される。
+    #[cfg(feature = "fault-injection")]
+    let mut fault_inject_raw: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -248,6 +264,31 @@ fn run_server(args: &[String]) -> ExitCode {
                 sparse_visited_max_raw = Some(v.clone());
                 i += 2;
             }
+            // Issue #705（テスト専用・feature `fault-injection` 限定）。feature
+            // 無効ビルドではこのアームごとコンパイルされず、`--fault-inject`
+            // は下の `other =>` で未知引数として拒否される（fail-closed）。
+            #[cfg(feature = "fault-injection")]
+            wire_server::fault_injection::FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires one of [{:?}]",
+                        wire_server::fault_injection::FLAG,
+                        wire_server::fault_injection::POST_COMMIT_PANIC_TOKEN
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // 他の起動後変更不能な構成値（`--search-engine` 等）と同じ理由で
+                // last-wins にせず 2 回目以降の指定を fail-closed に拒否する。
+                if fault_inject_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::fault_injection::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                fault_inject_raw = Some(v.clone());
+                i += 2;
+            }
             other => {
                 eprintln!("wire-server: unknown argument: {other}");
                 return ExitCode::FAILURE;
@@ -307,6 +348,25 @@ fn run_server(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+
+    // Issue #705（テスト専用・feature `fault-injection` 限定）: `--search-engine`
+    // と同じく bind・ユーザーストア読込より前に確定させる（fail-closed。
+    // 不正な構成のまま listen へ進む経路を作らない）。`arm` 自体は listen
+    // 直前（`guarded.bind()` 成功後）まで遅延する。
+    #[cfg(feature = "fault-injection")]
+    let fault_kind = match fault_inject_raw.as_deref() {
+        None => None,
+        Some(raw) => match wire_server::fault_injection::parse(raw) {
+            Ok(kind) => Some(kind),
+            Err(e) => {
+                eprintln!(
+                    "wire-server: invalid {}: {e}",
+                    wire_server::fault_injection::FLAG
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
 
     let Some(users_path) = users_path else {
         eprintln!("wire-server: --users <path> is required (fail-closed: no anonymous login)");
@@ -391,6 +451,16 @@ fn run_server(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Issue #705（テスト専用・feature `fault-injection` 限定）: bind 成功後・
+    // `listening on` 出力より前に arm する（テストが両行の出力順に依存できる
+    // ようにするため）。プロセス起動あたり高々 1 回だけ呼ばれる。
+    #[cfg(feature = "fault-injection")]
+    if let Some(kind) = fault_kind {
+        wire_server::fault_injection::arm(kind);
+        eprintln!("wire-server: fault injection armed: post-commit-panic (test only)");
+    }
+
     // 実際に bind されたアドレスを出す（`--bind 127.0.0.1:0` の ephemeral port
     // 割り当て結果を E2E テストハーネスがこの行から取得する前提。TASK-73）。
     match listener.local_addr() {
