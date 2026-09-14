@@ -33,6 +33,13 @@
 //! 失敗させ、silent skip はしない（`.claude/rules/coding-rust.md`・実行規約
 //! 「テストの skip・ignore・アサーション弱体化で CI を通さない」の精神を、
 //! 明示的に選択実行するこの導線でも維持する）。
+//!
+//! TASK-187（SQL-11）: `docs` 以外の任意テーブル（`kb_articles`）でも C1 相当の
+//! SELECT・`INSERT ... USING OPERATION_ID` が `docs` と同じ契約（成否・
+//! `wire_code`・RLS 暗黙適用）で通ることを 3 クライアント経由で確認する。
+//! 評価順序・台帳スコープ・複数次元共存・`42P01` は engine 側
+//! `crates/engine/tests/arbitrary_table.rs`（TASK-81・SQL-11 確定化の根拠）が
+//! 既に機械検証済みのため、本ファイルでは重複網羅しない。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -178,6 +185,74 @@ fn seed_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
     (path, guard)
 }
 
+/// `docs` とは別名の任意テーブル（`kb_articles`）に `seed_three_tenant_db` と
+/// 同じ Public 3 行を投入したうえで、tenant-a の Private 行（id=11,
+/// lang="xx"）も追加した一時 DB を用意する（TASK-187・SQL-11）。`docs` と
+/// 別名のテーブルでも wire 経由の C1 相当・RLS 暗黙適用が同一契約で成立する
+/// ことを、Private 行の非漏洩という非自明な形で検証するための seed
+/// （engine 側 `crates/engine/tests/arbitrary_table.rs` の対照検証と同じ
+/// `kb_articles` という命名を踏襲する）。
+fn seed_arbitrary_table_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("three-client-e2e-kb-articles");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "kb_articles",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let public_rows: [(&str, u64, [f32; 2], &str, &str); 3] = [
+        ("tenant-a", 1, [1.0, 0.0], "ja", "vector database intro"),
+        ("tenant-b", 2, [0.0, 1.0], "en", "query planning notes"),
+        ("tenant-c", 3, [-1.0, 0.0], "ja", "unrelated topic"),
+    ];
+    for (tenant, id, dir, lang, body) in public_rows {
+        let ctx = PolicyContext::new(tenant).expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "kb_articles",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(dir.to_vec()),
+                Value::Text(lang.to_string()),
+                Value::Text(body.to_string()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
+        )
+        .expect("insert public row");
+    }
+    // TASK-101（RECOVER-10）: 上の public_rows ループで tenant-a が既に
+    // "test-op" を使用しているため、別内容の再利用は OperationIdContentMismatch
+    // になる。Private 行専用の別 operation_id を使う。
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    engine::tenant::insert_typed_row(
+        &storage,
+        "kb_articles",
+        &ctx,
+        11,
+        Visibility::Private,
+        &[
+            Value::Vector(vec![1.0, 0.0]),
+            Value::Text("xx".to_string()),
+            Value::Text("private body".to_string()),
+        ],
+        &engine::recovery::required_op_id::OperationId::parse("test-op-private-kb")
+            .expect("valid operation_id"),
+    )
+    .expect("insert private row");
+    (path, guard)
+}
+
 /// `seed_three_tenant_db` と同じ Public 3 行（`embedding`/`lang`/`body`）に加え、
 /// tenant-a の Private 行（id=11, lang="xx"）・tenant-b の Private 行
 /// （id=12, lang="ja"）を投入した一時 DB を用意する（TASK-168・SQL-13/14）。
@@ -279,6 +354,13 @@ const C3_SQL: &str =
 /// C4（TASK-73／WIRE-1。`crates/engine/tests/sql_surface.rs`
 /// `sql4_hybrid_degrades_to_dense_only_when_no_visible_body_text` と同じ契約）。
 const C4_SQL: &str = "SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'zzz-term-absent-from-any-seed-body') LIMIT 3";
+
+/// TASK-187（SQL-11）: `docs` 以外の任意テーブル（`kb_articles`）での C1 相当。
+/// `LIMIT` を `docs` 版（3）より大きい 5 にし、Public 行（3 件）しか無い
+/// コーパスで万一 RLS が破綻し Private 行（id=11）が漏れても `LIMIT` で
+/// 隠れず必ず観測できる形にする（非 vacuous な RLS チェック）。
+const C1_SQL_ARBITRARY_TABLE: &str =
+    "SELECT id FROM kb_articles ORDER BY embedding <=> '[1.0,0.0]' LIMIT 5";
 
 /// psql（無改造）で任意の SQL を実行し、返却された各行を `|` 区切りで結合した
 /// 文字列の集合として返す（単一列なら値そのもの）。`-F '|'` で区切り文字を
@@ -827,6 +909,104 @@ fn three_clients_verify_aggregate_queries_and_rls_invariance() {
         run_psql_session_expect_sqlstate(port, user, pw, &[], REJECT_MIXED_SHAPE_SQL, "42601");
         run_psycopg_session_expect_sqlstate(port, user, pw, &[], REJECT_MIXED_SHAPE_SQL, "42601");
         run_pg_session_expect_sqlstate(port, user, pw, &[], REJECT_MIXED_SHAPE_SQL, "42601");
+    }
+
+    drop(server);
+    let _ = std::io::stdout().flush();
+}
+
+/// TASK-187（SQL-11）: `docs` とは別名の任意テーブル（`kb_articles`）でも、
+/// wire 経由・3 クライアントで C1 相当 SELECT と `INSERT ... USING
+/// OPERATION_ID` が `docs` と同じ契約（成否・RLS 暗黙適用）で通ることを
+/// 確認する。評価順序・台帳スコープ・複数次元共存・`42P01` は engine 側
+/// `crates/engine/tests/arbitrary_table.rs`（TASK-81）が既に機械検証済みの
+/// ため、本テストは wire 経由の C1 相当 SELECT・`INSERT` の成否契約確認に
+/// 限定する。TASK-82／`docs/design/three-client-e2e-harness.md` の既定契約
+/// （wire 認証経路の `PolicyContext` は Public のみ・書いた本人も同一 wire
+/// セッションでは読み戻せない非対称）はここでも維持されるため、`INSERT`
+/// 後に C1 を再実行して可視性を確認することはしない（`docs` の
+/// `three_clients_run_insert_with_operation_id` 相当と同じく「成功したこと」
+/// のみを確認する）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_run_c1_and_insert_on_arbitrary_table() {
+    let (db_path, _db_guard) = seed_arbitrary_table_three_tenant_db();
+    let users_dir = temp_db::TempDir::new("three-client-e2e-arbitrary-table-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+
+    let server = spawn_wire_server(&users_path, &db_path);
+    let port = server.port;
+
+    // 独立オラクル（Public 3 行のみ。tenant-a の Private 行 id=11 は wire
+    // 認証経路では不可視のため、現れれば RLS 暗黙適用の破綻として検出される）。
+    let expected_c1 = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+
+    let insert_sql = |id: u64, op: &str| -> String {
+        format!(
+            "INSERT INTO kb_articles (id, embedding, lang, body) VALUES \
+             ({id}, '[0.5,0.5]', 'en', 'inserted via three-client e2e') \
+             USING OPERATION_ID '{op}'"
+        )
+    };
+
+    // tenant ごとに id・operation_id のブロックを分け、台帳（TASK-93・
+    // RECOVER-2）の内容照合ハッシュ（TASK-101・RECOVER-10）が誤って
+    // 別テナント・別クライアントの再送と衝突判定しないようにする。
+    for (i, (user, pw)) in [
+        ("alice", "pw-alice"),
+        ("bob", "pw-bob"),
+        ("carol", "pw-carol"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // C1 相当 SELECT。
+        assert_eq!(
+            run_psql(port, user, pw, C1_SQL_ARBITRARY_TABLE),
+            expected_c1,
+            "psql: unexpected C1 result on kb_articles for user {user}"
+        );
+        assert_eq!(
+            run_psycopg(port, user, pw, C1_SQL_ARBITRARY_TABLE),
+            expected_c1,
+            "psycopg: unexpected C1 result on kb_articles for user {user}"
+        );
+        assert_eq!(
+            run_pg(port, user, pw, C1_SQL_ARBITRARY_TABLE),
+            expected_c1,
+            "pg: unexpected C1 result on kb_articles for user {user}"
+        );
+
+        // INSERT ... USING OPERATION_ID（3 クライアントとも成功のみ確認）。
+        let base_id: u64 = 200 + (i as u64) * 10;
+        run_psql_session(
+            port,
+            user,
+            pw,
+            &[],
+            &insert_sql(base_id, &format!("arbitrary-table-e2e-insert-psql-{user}")),
+        );
+        run_psycopg_session(
+            port,
+            user,
+            pw,
+            &[],
+            &insert_sql(
+                base_id + 1,
+                &format!("arbitrary-table-e2e-insert-psycopg-{user}"),
+            ),
+        );
+        run_pg_session(
+            port,
+            user,
+            pw,
+            &[],
+            &insert_sql(
+                base_id + 2,
+                &format!("arbitrary-table-e2e-insert-pg-{user}"),
+            ),
+        );
     }
 
     drop(server);
