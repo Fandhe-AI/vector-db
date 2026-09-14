@@ -19,7 +19,12 @@
 // `run_psycopg` と同じ区切り規約）。
 // 失敗時はエラーを stderr へ出力し終了コード 1（silent skip はしない）。SQLSTATE
 // を伴う失敗（拒否経路の検証。TASK-165）は `[SQLSTATE=<code>]` を stderr
-// メッセージに含める。
+// メッセージに含める。commit 成功境界を跨いだ panic 時の緊急応答（TASK-97・
+// TASK-153・ERR-5・Issue #706）が持つ detail フィールド（state=may_be_committed）
+// は node pg の err.detail として読めるため、値がある場合は [DETAIL=<detail>]
+// を続けて stderr メッセージに含める。接続断由来の後追い error イベント
+// （ErrorResponse 受信後の切断）で無リスナーの uncaught 例外にならないよう
+// client.on("error", ...) を登録する。
 
 const host = process.env.WIRE_HOST;
 const port = process.env.WIRE_PORT;
@@ -66,6 +71,14 @@ const client = new pg.Client({
   connectionTimeoutMillis: 5000,
 });
 
+// ErrorResponse 受信直後の接続断（緊急応答経路。Issue #706）で pg が
+// 後追いの "error" イベントを emit することがあり、リスナー未登録だと
+// プロセス全体が uncaught 例外で異常終了してしまう。stderr へログだけ
+// 残し、終了コード・メッセージの決定は下の .catch() に一本化する。
+client.on("error", (e) => {
+  process.stderr.write(`pg_client: connection error: ${e}\n`);
+});
+
 client
   .connect()
   .then(async () => {
@@ -82,7 +95,8 @@ client
   })
   .then(() => process.exit(0))
   .catch((err) => {
-    const suffix = err && err.code ? ` [SQLSTATE=${err.code}]` : "";
+    let suffix = err && err.code ? ` [SQLSTATE=${err.code}]` : "";
+    suffix += err && typeof err.detail === "string" ? ` [DETAIL=${err.detail}]` : "";
     process.stderr.write(`pg_client: query failed${suffix}: ${err}\n`);
     process.exit(1);
   });

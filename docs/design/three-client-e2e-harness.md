@@ -139,7 +139,7 @@ psql・psycopg・pg の導入自動化を確定させるには、pip/npm の実�
 これまで engine のプロセス内テストと wire-server 層 A
 （`tests/wire_emergency_response.rs`。テストバイナリ自身が登録・commit・
 panic を再現する）でしか観測できず、`wire-server` バイナリを外部クライアント
-から commit 後 panic させる手段が無かった。#702（3 クライアント e2e で `D`
+から commit 後 panic させる手段が無かった。#706（3 クライアント e2e で `D`
 到達を確認する）の前提として、テスト専用・feature gate 付きの注入フラグを
 バイナリへ追加した。
 
@@ -186,7 +186,7 @@ SIGABRT に至るためプロセス内テスト不可）。結合テスト
 `CARGO_BIN_EXE_wire-server` の実子プロセスとして起動し、CLI 引数の拒否・
 未 arm 時の通常応答・実際の発火（緊急応答の `S`/`C`/`M`/`D` フィールド・
 abort・再オープン後の可視性）・arm 維持（SELECT・拒否された INSERT を
-挟んでも消費されない）を検証する。e2e 層（#702・`three_client_e2e.rs`）は
+挟んでも消費されない）を検証する。e2e 層（#706・`three_client_e2e.rs`）は
 本フラグを使って 3 クライアント経由の `D` 到達を確認する担当。
 
 **既知の制約**: `make test`／CI は `--all-features` のため
@@ -194,6 +194,61 @@ abort・再オープン後の可視性）・arm 維持（SELECT・拒否され�
 （`default_build_rejects_fault_inject_flag_as_unknown_argument`）は CI では
 実行されない。`cargo test -p fandhe-vector-db-wire-server`（feature 無し）
 を別途ローカルで実行することが唯一の検査手段。
+
+### Issue #706: 3 クライアントでの緊急応答 detail 到達検証
+
+**目的**: ERR-5（`docs/spec/04-behavior/error-format.md`）の期待欄が定める
+「無改造クライアントから `detail` へ到達できる」ことを、Issue #705 の注入
+フラグを使って実クライアント経由で機械検証する。Issue #701 で `D` フィールド
+自体のバイト列契約は層 A で固定済みだったが、psql・psycopg・node `pg` それぞれ
+の**ドライバ API から**その値が実際に読めるかは未検証のまま残っていた。
+
+**到達フィールド（実測で確認）**:
+
+| クライアント | 到達フィールド | stderr 出力例 |
+| --- | --- | --- |
+| psql | `DETAIL:` 行（`-v VERBOSITY=verbose` 必須） | `DETAIL:  state=may_be_committed` |
+| psycopg | `e.diag.message_detail` | `[DETAIL=state=may_be_committed]` |
+| node `pg` | `err.detail` | `[DETAIL=state=may_be_committed]` |
+
+**1 クライアント 1 サーバーの理由**: `--fault-inject post-commit-panic`
+（Issue #705）は 1 プロセスにつき高々 1 回しか発火しない take-once 契約
+（同プロセスへ 2 回目の成功 INSERT を送っても発火しない）。3 クライアントを
+同一サーバーへ順に接続すると 2 クライアント目以降が発火を観測できないため、
+`three_clients_receive_emergency_response_detail_after_post_commit_panic`
+はクライアント（psql→alice、psycopg→bob、pg→carol）ごとに独立した
+`ServerGuard`・一時 DB・テナントを用意する。
+
+**psql の終了コードと `LC_ALL`**: psql は `ErrorResponse` 受信直後の接続断を
+「connection to server was lost」として終了コード 2 で報告する（通常の拒否
+経路——`ReadyForQuery` まで到達してからのエラー——の終了コード 1 とは異なる）
+ため、検証は `!status.success()` のみで行う（`run_psql_session_expect_sqlstate`
+と同じ判定方針）。`DETAIL:` ラベル自体は libpq の gettext 翻訳対象になり
+得るため `LC_ALL=C` を渡すが、`state=may_be_committed` という生値そのものは
+翻訳対象ではないためこのガードで十分。
+
+**psycopg の接続断吸収挙動**: psycopg 3.x の内部ジェネレータは
+`ErrorResponse` を受け取った直後の接続断由来の例外を、既に受け取った
+FATAL エラー結果の陰に隠して送出する。結果として `cur.execute()` は素直に
+`XX000` の `InternalError`（`e.diag.message_detail` 込み）を送出し、
+呼び出し側で接続断由来の二重例外を個別にハンドルする必要はない。
+
+**node `pg` の追加防御**: `client.query()` が reject した後に接続断由来の
+後追い `error` イベントを `pg.Client` が emit することがあり、リスナー未登録
+だと Node プロセス全体が uncaught 例外で異常終了する。`client.on("error",
+...)` を登録し stderr へログするだけに留め、成否判定は既存の `.catch()` に
+一本化した（`Issue #706` で追加。`WIRE_SQL_PRELUDE` を使わない通常の拒否
+経路テストの挙動・出力形式は変えていない）。
+
+**`pg` の一時導入**: 本リポは `pg` を `package.json` として常設していないため
+（Node 依存の管理方針は本 ADR のスコープ外）、実行確認はリポ外のスクラッチ
+ディレクトリへ `npm install pg@8.23.0` した上で `NODE_PATH` 環境変数経由で
+`pg_client.js` に解決させた（PR #708 と同じ一時導入方法）。
+
+**実行記録**: `make e2e-three-client`（`three_client_e2e` 5 件・
+`extended_syntax_e2e` 6 件、計 11 件）で本テストを含め全件成功することを
+確認した。個別実行時の観測 `[e2e-record]` 出力（実行環境固有の文言・
+接続情報は含まない）は PR 本文の Test plan に転記した。
 
 ## 影響
 
@@ -206,6 +261,11 @@ abort・再オープン後の可視性）・arm 維持（SELECT・拒否され�
 - `crates/wire-server/Cargo.toml` に `fault-injection` feature（default 外）
   を追加し、`e2e-three-client` の `three_client_e2e` 行はこの feature 付きで
   ビルドするよう変更した（Issue #705）。
+- `three_client_e2e.rs::spawn_wire_server` が `extra_args: &[String]` を
+  受け取れるよう拡張され（`extended_syntax_e2e.rs` と同型）、`ServerGuard`
+  が起動時 stderr の全行と `wait_for_exit` を保持するようになった。
+  `tests/three_client/{psycopg_client.py,pg_client.js}` は失敗時に
+  `[DETAIL=<detail>]` を stderr へ追記する（いずれも Issue #706）。
 
 ## スコープ外
 
