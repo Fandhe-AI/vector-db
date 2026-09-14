@@ -232,8 +232,10 @@ pub(crate) fn should_abort(armed: bool, panicking: bool) -> bool {
 
 /// このスレッドが現在「commit 成功後・応答未確定」の区間にあるかを読み取り専用で
 /// 照会する（TASK-97、対象ビヘイビア: RECOVER-6）。[`panic_hook`](crate::recovery::
-/// panic_hook) が panic フック内から呼び、緊急応答（`may_be_committed` を運ぶ
-/// ErrorResponse）を送出してよい状況かどうかの判定材料の一つに使う。
+/// panic_hook) が panic フック内から呼び、緊急応答（wire-server 側が ERR-5 に
+/// 従い `D`（detail）フィールドへ `state=may_be_committed` を載せた
+/// ErrorResponse。ポインタ: TASK-153・ERR-5）を送出してよい状況かどうかの
+/// 判定材料の一つに使う。
 ///
 /// [`COMMIT_PENDING_RESPONSE`] をクリアしない・書き換えない（既存の
 /// [`ResponseBoundaryGuard`] の世代管理・abort 判定ロジックには一切影響しない）。
