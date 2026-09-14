@@ -26,11 +26,12 @@
 //! 本モジュールに閉じる）。
 //!
 //! `D`（detail）フィールド（`RECOVER-5` (3)・commit 後 panic 時の `state=
-//! may_be_committed` 相当の情報）は、その wire 形式が spec 側でまだ確定していない
-//! ため本モジュールでは導入しない（codex-review P1 指摘対応・PR #258。公開契約の
-//! 拡張は公開済み設計文書または管理者承認を経てから行う）。`crate::simple_query`
-//! の緊急応答チャネルも本 [`encode`]（3 フィールドのみ）を使い、通常応答と同一の
-//! 契約を維持する。
+//! may_be_committed` 相当の情報）の wire 形式は ERR-5（2026-09-14 確定・
+//! `vector-db-spec#15`。ポインタ: TASK-153）により確定し、[`encode_with_detail`]
+//! で追加できるようになった。通常応答（[`encode`]）は従来どおり `S`/`C`/`M` の
+//! 3 フィールドのみで `D` を付けない契約を維持する（`crate::simple_query` の
+//! 緊急応答チャネルへの `encode_with_detail` 配線は本モジュールの担当外。
+//! 依存先 Issue へ申し送り）。
 //!
 //! フレーム長は [`crate::result_encoder::frame_len`]（`checked` 方式）を再利用し、
 //! `as i32` によるオーバーフローを起こさない（`.claude/rules/coding-rust.md`
@@ -41,7 +42,7 @@
 
 use engine::error_format::ErrorClass;
 
-use crate::result_encoder::{frame_len, push_s_c_m_fields, EncodeError};
+use crate::result_encoder::{frame_len, push_d_field, push_s_c_m_fields, EncodeError};
 
 /// `message` に NUL バイトが含まれないか検証する（fail-closed）。フィールドは
 /// NUL 終端のため、混入するとフレーム構造そのものが壊れる（後続フィールドの
@@ -93,6 +94,33 @@ pub fn encode(class: ErrorClass, message: &str) -> Result<Vec<u8>, EncodeError> 
     reject_embedded_nul(message)?;
     let mut body = Vec::new();
     push_s_c_m_fields(&mut body, severity_for(class), class.wire_code(), message);
+    body.push(0); // フィールド終端
+    wrap_frame(body)
+}
+
+/// `D`（detail）フィールド付きエラー応答（ERR-5・TASK-153 ポインタ）。
+/// `S`/`C`/`M` は [`encode`] と同一契約（[`severity_for`]・`class.wire_code()`）
+/// に `D`=`detail` を追記する。想定呼び出し元は commit 後 panic の緊急応答
+/// 経路（`RECOVER-5` (3)。`state=may_be_committed` 固定文字列の搬送）だが、
+/// 本関数自体は任意の `detail: &str` を受け取る汎用 API であるため、呼び出し元は
+/// 内部エラー詳細・他テナントのデータや存在情報を `detail` へ流し込まないこと
+/// （`.claude/rules/security.md` P0。`encode` の message と同じ注意）。
+///
+/// `message`・`detail` いずれも NUL バイト混入は fail-closed に拒否する
+/// （フィールド区切りの NUL 終端を破壊するため）。改行は許容する——PostgreSQL の
+/// `DETAIL` は複数行を許容するのが通常の意味論であり、本 wire 実装のフィールド
+/// 終端は NUL のみに依存するため改行があってもフレーム構造は壊れない
+/// （`message` と同じ制約に揃える）。
+pub fn encode_with_detail(
+    class: ErrorClass,
+    message: &str,
+    detail: &str,
+) -> Result<Vec<u8>, EncodeError> {
+    reject_embedded_nul(message)?;
+    reject_embedded_nul(detail)?;
+    let mut body = Vec::new();
+    push_s_c_m_fields(&mut body, severity_for(class), class.wire_code(), message);
+    push_d_field(&mut body, detail);
     body.push(0); // フィールド終端
     wrap_frame(body)
 }
@@ -180,8 +208,8 @@ mod tests {
         assert!(result.is_err(), "embedded NUL must be rejected fail-closed");
     }
 
-    /// `D`（detail）フィールドは spec 側で wire 形式が未確定のため、[`encode`]
-    /// はどの分類でも追加しない（codex-review P1 指摘対応・PR #258）。
+    /// 通常応答（[`encode`]）は ERR-5 確定後も `D` フィールドを追加しない契約を
+    /// 維持する（`D` を追加したい呼び出し元は [`encode_with_detail`] を使う）。
     #[test]
     fn encode_never_includes_a_detail_field() {
         for class in ErrorClass::ALL {
@@ -215,5 +243,88 @@ mod tests {
             };
             assert_eq!(severity_for(class), expected, "class={class:?}");
         }
+    }
+
+    /// ERR-5: `encode_with_detail` が `ErrorClass::ALL` 全件で `S`/`C`/`M`/`D`
+    /// の 4 フィールドをちょうど 1 個ずつ含み、`D` の値が渡した `detail` と一致
+    /// し、`D` なしの [`encode`] とはバイト列が異なる（先頭の `S`/`C`/`M` 部分は
+    /// 共通）ことを検証する。
+    #[test]
+    fn encode_with_detail_includes_single_d_field_and_preserves_normal_encode() {
+        for class in ErrorClass::ALL {
+            let with_detail =
+                encode_with_detail(class, "msg", "state=may_be_committed").expect("encode");
+            let without_detail = encode(class, "msg").expect("encode");
+
+            let body = body_of(&with_detail);
+            assert_eq!(
+                find_field(body, b'S').as_deref(),
+                Some(severity_for(class)),
+                "class={class:?}"
+            );
+            assert_eq!(
+                find_field(body, b'C').as_deref(),
+                Some(class.wire_code()),
+                "class={class:?}"
+            );
+            assert_eq!(
+                find_field(body, b'M').as_deref(),
+                Some("msg"),
+                "class={class:?}"
+            );
+            assert_eq!(
+                find_field(body, b'D').as_deref(),
+                Some("state=may_be_committed"),
+                "class={class:?}"
+            );
+            assert_eq!(body.last().copied(), Some(0), "field terminator");
+
+            assert_ne!(
+                with_detail, without_detail,
+                "class={class:?}: detail 付きと通常応答はバイト列が異なるはず"
+            );
+        }
+    }
+
+    /// `message`・`detail` いずれに NUL が混入していても fail-closed に拒否する
+    /// （フィールド区切りの NUL 終端破壊を防ぐ）。
+    #[test]
+    fn encode_with_detail_rejects_message_or_detail_with_embedded_nul() {
+        let bad_message = encode_with_detail(ErrorClass::InternalError, "bad\0message", "detail");
+        assert!(
+            bad_message.is_err(),
+            "embedded NUL in message must be rejected fail-closed"
+        );
+
+        let bad_detail = encode_with_detail(ErrorClass::InternalError, "message", "bad\0detail");
+        assert!(
+            bad_detail.is_err(),
+            "embedded NUL in detail must be rejected fail-closed"
+        );
+    }
+
+    /// PostgreSQL の `DETAIL` は複数行を許容するのが通常の意味論であり、本 wire
+    /// 実装のフィールド終端は NUL のみに依存するため、改行を含む `detail` でも
+    /// 1 フィールドとして正常にエンコードされ値がそのまま（改行含む）復元できる。
+    #[test]
+    fn encode_with_detail_allows_newline_in_detail() {
+        let detail_with_newline = "state=may_be_committed\nline2";
+        let msg = encode_with_detail(ErrorClass::InternalError, "message", detail_with_newline)
+            .expect("encode");
+        let body = body_of(&msg);
+        assert_eq!(find_field(body, b'D').as_deref(), Some(detail_with_newline));
+    }
+
+    /// 受け入れ条件「通常応答のバイト列が変更前と同一」を機械的に固定する。
+    /// golden bytes は `D` フィールド追加前の実装から `encode(ErrorClass::
+    /// InternalError, "internal error")` を実際に呼び出して採取した固定値。
+    #[test]
+    fn encode_normal_response_byte_sequence_is_unchanged_by_detail_addition() {
+        let msg = encode(ErrorClass::InternalError, "internal error").expect("encode");
+        let golden: Vec<u8> = vec![
+            69, 0, 0, 0, 35, 83, 69, 82, 82, 79, 82, 0, 67, 88, 88, 48, 48, 48, 0, 77, 105, 110,
+            116, 101, 114, 110, 97, 108, 32, 101, 114, 114, 111, 114, 0, 0,
+        ];
+        assert_eq!(msg, golden);
     }
 }
