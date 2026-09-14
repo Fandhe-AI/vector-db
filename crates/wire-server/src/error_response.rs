@@ -29,9 +29,10 @@
 //! may_be_committed` 相当の情報）の wire 形式は ERR-5（2026-09-14 確定・
 //! `vector-db-spec#15`。ポインタ: TASK-153）により確定し、[`encode_with_detail`]
 //! で追加できるようになった。通常応答（[`encode`]）は従来どおり `S`/`C`/`M` の
-//! 3 フィールドのみで `D` を付けない契約を維持する（`crate::simple_query` の
-//! 緊急応答チャネルへの `encode_with_detail` 配線は本モジュールの担当外。
-//! 依存先 Issue へ申し送り）。
+//! 3 フィールドのみで `D` を付けない契約を維持する。`crate::simple_query::
+//! build_emergency_response_bytes`（緊急応答チャネル）は本モジュールの
+//! [`MAY_BE_COMMITTED_DETAIL`] 定数と [`encode_with_detail`] を使って配線済み
+//! （TASK-97・RECOVER-6・ERR-5）。
 //!
 //! フレーム長は [`crate::result_encoder::frame_len`]（`checked` 方式）を再利用し、
 //! `as i32` によるオーバーフローを起こさない（`.claude/rules/coding-rust.md`
@@ -97,6 +98,14 @@ pub fn encode(class: ErrorClass, message: &str) -> Result<Vec<u8>, EncodeError> 
     body.push(0); // フィールド終端
     wrap_frame(body)
 }
+
+/// 緊急応答（`RECOVER-5` (3)。commit 後 panic 時に「commit は成功している
+/// かもしれない」ことを伝える固定文字列）の `D`（detail）値（ERR-5・TASK-153
+/// ポインタ）。値の内容は他テナントのデータ・存在情報を一切含まない固定文言
+/// であり、`crate::simple_query::build_emergency_response_bytes` が唯一の
+/// 呼び出し元として [`encode_with_detail`] へ渡す（定数を 1 箇所に集約し、
+/// 呼び出し元・テストでの生リテラル重複を避ける）。
+pub const MAY_BE_COMMITTED_DETAIL: &str = "state=may_be_committed";
 
 /// `D`（detail）フィールド付きエラー応答（ERR-5・TASK-153 ポインタ）。
 /// `S`/`C`/`M` は [`encode`] と同一契約（[`severity_for`]・`class.wire_code()`）
@@ -253,7 +262,7 @@ mod tests {
     fn encode_with_detail_includes_single_d_field_and_preserves_normal_encode() {
         for class in ErrorClass::ALL {
             let with_detail =
-                encode_with_detail(class, "msg", "state=may_be_committed").expect("encode");
+                encode_with_detail(class, "msg", MAY_BE_COMMITTED_DETAIL).expect("encode");
             let without_detail = encode(class, "msg").expect("encode");
 
             let body = body_of(&with_detail);
@@ -274,7 +283,7 @@ mod tests {
             );
             assert_eq!(
                 find_field(body, b'D').as_deref(),
-                Some("state=may_be_committed"),
+                Some(MAY_BE_COMMITTED_DETAIL),
                 "class={class:?}"
             );
             assert_eq!(body.last().copied(), Some(0), "field terminator");

@@ -128,7 +128,8 @@ pub(crate) fn execute_and_respond(
     // 起きたら常に送られることを意味しない。詳細は
     // [`build_emergency_response_bytes`] のドキュメント参照。
     //
-    // 応答バイト列の内容は `WireError::internal()` の固定文言のみに依存し
+    // 応答バイト列の内容は `WireError::internal()` の固定文言と
+    // `crate::error_response::MAY_BE_COMMITTED_DETAIL`（ERR-5）のみに依存し
     // クエリごとに変化しないため、初回呼び出し時に一度だけ構築してキャッシュ
     // する（[`cached_emergency_response_bytes`] 参照。毎クエリの
     // `WireError::internal()` 構築・エンコード・アロケーションを避ける
@@ -217,13 +218,14 @@ pub(crate) fn execute_and_respond(
 /// 緊急応答（TASK-97・RECOVER-6、対象ビヘイビア ERR-1）の事前エンコード済み
 /// バイト列を組み立てる。
 ///
-/// `crate::error_response::encode`（TASK-153・ERR-1）で通常応答と同じ `S`/`C`/`M`
-/// の 3 フィールドのみの ErrorResponse を組み立てる。クライアントは commit
-/// 成功後の panic を「サイレントな接続断」ではなく同期的な ErrorResponse として
-/// 観測できる（RECOVER-6 が防ぐ範囲）。「commit は成功しているかもしれない」という
-/// 状態情報を運ぶ `D`（detail）フィールドは、wire 形式が spec 側で未確定のため
-/// 追加しない（codex-review P1 指摘対応・PR #258。`crate::error_response`
-/// モジュールドキュメント参照）。
+/// `crate::error_response::encode_with_detail`（TASK-153・ERR-1・ERR-5）で
+/// 通常応答と同じ `S`/`C`/`M` に加え `D`（detail）＝
+/// `crate::error_response::MAY_BE_COMMITTED_DETAIL` を組み立てる。クライアントは
+/// commit 成功後の panic を「サイレントな接続断」ではなく同期的な ErrorResponse
+/// として観測でき（RECOVER-6 が防ぐ範囲）、`D` フィールドにより「commit は
+/// 成功しているかもしれない」という状態情報も併せて受け取れる（ERR-5・
+/// 2026-09-14 確定・`vector-db-spec#15`。`crate::error_response` モジュール
+/// ドキュメント参照）。
 ///
 /// `internal_error` は呼び出し元が構築済みの `WireError::internal()` を渡す契約
 /// （通常経路の内部エラー応答と同じ固定文言・`wire_code` を使い、文言を二重に
@@ -261,7 +263,11 @@ pub(crate) fn execute_and_respond(
 fn build_emergency_response_bytes(
     internal_error: &engine::error_format::WireError,
 ) -> Result<Vec<u8>, result_encoder::EncodeError> {
-    crate::error_response::encode(internal_error.class(), internal_error.message())
+    crate::error_response::encode_with_detail(
+        internal_error.class(),
+        internal_error.message(),
+        crate::error_response::MAY_BE_COMMITTED_DETAIL,
+    )
 }
 
 /// [`build_emergency_response_bytes`] の結果をプロセス生存期間でキャッシュする
@@ -280,6 +286,19 @@ fn cached_emergency_response_bytes() -> Option<&'static Vec<u8>> {
             build_emergency_response_bytes(&internal_error).ok()
         })
         .as_ref()
+}
+
+/// [`cached_emergency_response_bytes`] の薄い公開ラッパー（TASK-97・ERR-5）。
+///
+/// wire-server が実際に組み立てる緊急応答バイト列（`D`=`state=may_be_committed`
+/// 込み）を crate 外から取得するための唯一の公開経路。呼び出し文脈は
+/// `crates/wire-server/tests/wire_emergency_response.rs`（層 A 結合テスト）
+/// ―― engine 側の `engine::recovery::panic_hook::EmergencyResponseRegistration::
+/// register` へ登録するバイト列として、`execute_and_respond` の実運用経路と
+/// 同一のエンコード結果を渡すために使う。本関数自体は登録・送出のいずれにも
+/// 関与しない（`build_emergency_response_bytes` のドキュメント参照）。
+pub fn emergency_response_bytes() -> Option<&'static [u8]> {
+    cached_emergency_response_bytes().map(Vec::as_slice)
 }
 
 /// 検索 SELECT（`command_tag` = `"SELECT"`）・`EXPLAIN`（`command_tag` =
@@ -510,5 +529,69 @@ mod tests {
             Some(b'I'),
             "must still send ReadyForQuery after the error"
         );
+    }
+
+    /// ERR-5: [`emergency_response_bytes`] が返すバイト列（`crates/wire-server/
+    /// tests/wire_emergency_response.rs` が層 A で送受信するのと同じキャッシュ
+    /// 済み実体）を直接パースし、`S`=`ERROR`・`C`=`XX000`・`M`=`internal error`・
+    /// `D` がちょうど 1 個で [`crate::error_response::MAY_BE_COMMITTED_DETAIL`]
+    /// と一致することを固定する（サブプロセステストが環境要因で flaky になった
+    /// 場合にも残る最小の固定点）。
+    #[test]
+    fn emergency_response_bytes_carries_may_be_committed_detail() {
+        let bytes = emergency_response_bytes().expect("emergency response bytes must encode");
+        assert_eq!(bytes.first().copied(), Some(b'E'), "type byte");
+
+        let declared_len = i32::from_be_bytes(
+            bytes
+                .get(1..5)
+                .expect("length field")
+                .try_into()
+                .expect("4 bytes"),
+        ) as usize;
+        assert_eq!(
+            declared_len,
+            bytes.len() - 1,
+            "length field excludes only the leading 'E' type byte"
+        );
+
+        let body = bytes.get(5..).expect("body");
+
+        // フィールド（タグ 1 バイト＋NUL 終端文字列）を機械的に抽出するテスト
+        // 専用ヘルパー。受信データ経路ではないため `unwrap`/`expect` は許容する
+        // （`.claude/rules/coding-rust.md` の添字アクセス禁止は untrusted 受信
+        // 入力経路が対象。`error_response.rs::tests::find_field` と同型）。
+        fn find_field(body: &[u8], tag: u8) -> Option<String> {
+            let mut idx = 0;
+            while idx < body.len() {
+                let this_tag = *body.get(idx)?;
+                if this_tag == 0 {
+                    return None;
+                }
+                let value_start = idx + 1;
+                let nul_offset = body.get(value_start..)?.iter().position(|&b| b == 0)?;
+                let value_end = value_start + nul_offset;
+                if this_tag == tag {
+                    let field_bytes = body.get(value_start..value_end)?;
+                    return std::str::from_utf8(field_bytes).ok().map(str::to_string);
+                }
+                idx = value_end + 1;
+            }
+            None
+        }
+
+        assert_eq!(find_field(body, b'S').as_deref(), Some("ERROR"));
+        assert_eq!(find_field(body, b'C').as_deref(), Some("XX000"));
+        assert_eq!(find_field(body, b'M').as_deref(), Some("internal error"));
+        assert_eq!(
+            find_field(body, b'D').as_deref(),
+            Some(crate::error_response::MAY_BE_COMMITTED_DETAIL)
+        );
+        assert_eq!(
+            body.iter().filter(|&&b| b == b'D').count(),
+            1,
+            "D field must appear exactly once"
+        );
+        assert_eq!(body.last().copied(), Some(0), "field terminator");
     }
 }

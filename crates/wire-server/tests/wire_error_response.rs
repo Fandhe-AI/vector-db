@@ -36,8 +36,11 @@ use common::*;
 
 /// `ErrorResponse`（'E'）を読み、`(severity, sqlstate, message)` フィールドを
 /// 機械的に抽出する。`D`（detail）フィールドが含まれないことも合わせて確認する
-/// （`crate::error_response::encode` は wire 形式が spec 側で未確定の `D` を
-/// 一切追加しない契約。`crate::error_response` モジュールドキュメント参照）。
+/// （通常応答（`crate::error_response::encode`）は `D` を付けない契約。
+/// ERR-5・TASK-153・`crate::error_response` モジュールドキュメント参照。
+/// 本ファイルで検証する各エラー分類〔28P01・42601・0A000・08P01・53300・
+/// 42P01〕はいずれも通常応答経路であり緊急応答（`RECOVER-6`。層 A 検証は
+/// `wire_emergency_response.rs`）とは別経路である）。
 fn read_error_response_fields(stream: &mut TcpStream) -> (String, String, String) {
     let mut header = [0u8; 1];
     stream.read_exact(&mut header).expect("read type");
