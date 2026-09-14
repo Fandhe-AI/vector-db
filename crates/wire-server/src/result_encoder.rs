@@ -485,8 +485,10 @@ mod tests {
         assert!(body.windows(6).any(|w| w == b"ERROR\0"));
         assert!(body.windows(6).any(|w| w == b"XX000\0"));
         assert!(body.windows(15).any(|w| w == b"internal error\0"));
-        // `D`（detail）フィールドは含まない（ERR-1 のワイヤ形式が spec 側で
-        // 未確定のため。上記 NOTE 参照）。
+        // 通常応答（`encode_error_response`／`crate::error_response::encode`）は
+        // `D` を付けない契約（ERR-5。緊急応答チャネルのみ `crate::error_response::
+        // encode_with_detail` 経由で `D` を付与する。`crate::error_response`
+        // モジュールドキュメント参照）。
         assert!(!body.contains(&b'D'));
         assert_eq!(
             body.last().copied(),
