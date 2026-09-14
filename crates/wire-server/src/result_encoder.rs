@@ -250,6 +250,20 @@ pub(crate) fn push_s_c_m_fields(body: &mut Vec<u8>, severity: &str, sqlstate: &s
     body.push(0);
 }
 
+/// `ErrorResponse`（'E'）の `D`（detail）フィールドを 1 個 `body` へ追記する
+/// （タグ 1 バイト＋値＋NUL 終端。[`push_s_c_m_fields`] と同じ「フィールド
+/// 終端・フレーム化は呼び出し元が担う」方針）。
+///
+/// 呼び出し元は `crate::error_response::encode_with_detail` のみ（ERR-5・
+/// TASK-153 ポインタ。`RECOVER-5` (3) の commit 後 panic 緊急応答で
+/// `state=may_be_committed` を搬送する用途）。`crate` 内限定公開とし、
+/// wire-server 外へは公開しない。
+pub(crate) fn push_d_field(body: &mut Vec<u8>, detail: &str) {
+    body.push(b'D');
+    body.extend_from_slice(detail.as_bytes());
+    body.push(0);
+}
+
 /// `ErrorResponse`（'E'）を `S`/`C`/`M` の 3 フィールドのみ、severity `ERROR`
 /// 固定で組み立てる（`sqlstate`/`message`。他テナント・存在情報は含めない）。
 ///
