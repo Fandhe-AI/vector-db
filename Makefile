@@ -219,9 +219,11 @@ else
 endif
 
 .PHONY: e2e-three-client
-e2e-three-client: ## TASK-73（WIRE-1）/TASK-82（SQL-5〜7,9,10）/TASK-165（SQL-12・SEARCH-9）/TASK-168（SQL-13・SQL-14）/TASK-187（SQL-11）/Issue #454（広域取得）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
+e2e-three-client: ## TASK-73（WIRE-1）/TASK-82（SQL-5〜7,9,10）/TASK-165（SQL-12・SEARCH-9）/TASK-168（SQL-13・SQL-14）/TASK-187（SQL-11）/Issue #454（広域取得）/Issue #705（TASK-153・ERR-5。commit 後 panic 注入フラグ）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
 ifdef HAS_CARGO
-	cargo test -p fandhe-vector-db-wire-server --test three_client_e2e -- --ignored
+	# Issue #705: `three_client_e2e` は `fault-injection` feature 付きでビルドし、
+	# #702 の commit 後 panic ケースが `--fault-inject` を使えるようにする。
+	cargo test -p fandhe-vector-db-wire-server --features fault-injection --test three_client_e2e -- --ignored
 	cargo test -p fandhe-vector-db-wire-server --test extended_syntax_e2e -- --ignored
 else
 	@echo "skip: Cargo.toml 未追加のため e2e-three-client をスキップ"

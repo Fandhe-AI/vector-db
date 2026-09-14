@@ -155,7 +155,18 @@ pub(crate) fn execute_and_respond(
                     ),
                 )
             });
-        engine.execute_sql_in_session(ctx, session, sql)
+        let outcome = engine.execute_sql_in_session(ctx, session, sql);
+        // Issue #705（テスト専用・feature `fault-injection` 限定）: 直前行の
+        // `outcome` を「登録ブロック」の終端（`_emergency_registration` が
+        // drop される直前）でだけ検査し、commit 後 panic を注入できる唯一の
+        // 位置に置く。このブロックを抜けて `match outcome { .. }` 側へ進むと
+        // `_emergency_registration` は既に drop 済みで緊急応答は送られなく
+        // なる（上記コメント「outcome を決定する区間」参照）ため、注入点を
+        // ここより後ろへ移動してはならない。feature 無効時はこの呼び出し
+        // ごとコンパイルされず、既定ビルドの挙動・コード生成は完全に不変。
+        #[cfg(feature = "fault-injection")]
+        crate::fault_injection::maybe_panic_after_commit(&outcome);
+        outcome
     };
 
     match outcome {

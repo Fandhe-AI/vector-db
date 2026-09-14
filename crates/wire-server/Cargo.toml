@@ -29,6 +29,17 @@ path = "src/main.rs"
 # パッケージ名（crates.io 公開名）と `engine::` のソース内参照名を分離する。
 engine = { package = "fandhe-vector-db-engine", path = "../engine", version = "=0.1.0" }
 
+[features]
+# Issue #705: テスト専用の commit 後 panic 注入（`--fault-inject
+# post-commit-panic`）を有効化する feature gate。default に含めない・依存追加
+# なし。engine の `bench-internals` feature と同じ判断枠組み（テナント境界・
+# RLS・認証・fail-closed 経路を迂回する API は一切露出しない。露出するのは
+# 「CLI を握る者が自プロセスを 1 回だけ commit 後 panic で終了させる」能力の
+# みで、発火経路自体は production の RECOVER-6 経路そのもの。詳細は
+# `docs/design/three-client-e2e-harness.md`「Issue #705」節）。`make lint`／
+# `make test` は `--all-features` のため CI でも常にコンパイル・実行される。
+fault-injection = []
+
 [[bench]]
 # Issue #463: `vector_knn` 786µs（docs/design/crossdb-bench.md）の wire／SQL 表層／
 # 距離カーネル・Top-k 内訳を切り分ける実測入口。harness = false / test = false は

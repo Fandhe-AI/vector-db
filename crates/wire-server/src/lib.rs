@@ -29,6 +29,10 @@
 //! - [`search_engine_opt`]: `--search-engine` opt-in CLI 引数の閉じた語彙
 //!   パーサ（Issue #656。`engine::search_engine::SearchEngineKind` へ
 //!   untrusted な CLI 文字列から到達する唯一の入口）
+//! - `fault_injection`（feature `fault-injection` 限定・テスト専用。
+//!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
+//!   語彙パーサと、`simple_query::execute_and_respond` の登録ブロック内から
+//!   呼ばれる commit 後 panic 注入。default features には含まれない
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）、
 //! TASK-68（対象ビヘイビア WIRE-4, WIRE-10）、TASK-69（対象ビヘイビア WIRE-5, WIRE-6）、
@@ -39,6 +43,8 @@
 pub mod auth;
 pub mod bind_guard;
 pub mod error_response;
+#[cfg(feature = "fault-injection")]
+pub mod fault_injection;
 pub mod framing;
 pub mod handshake;
 pub mod limits;
