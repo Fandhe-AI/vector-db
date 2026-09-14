@@ -99,6 +99,14 @@ pub fn encode(class: ErrorClass, message: &str) -> Result<Vec<u8>, EncodeError> 
     wrap_frame(body)
 }
 
+/// 緊急応答（`RECOVER-5` (3)。commit 後 panic 時に「commit は成功している
+/// かもしれない」ことを伝える固定文字列）の `D`（detail）値（ERR-5・TASK-153
+/// ポインタ）。値の内容は他テナントのデータ・存在情報を一切含まない固定文言
+/// であり、`crate::simple_query::build_emergency_response_bytes` が唯一の
+/// 呼び出し元として [`encode_with_detail`] へ渡す（定数を 1 箇所に集約し、
+/// 呼び出し元・テストでの生リテラル重複を避ける）。
+pub const MAY_BE_COMMITTED_DETAIL: &str = "state=may_be_committed";
+
 /// `D`（detail）フィールド付きエラー応答（ERR-5・TASK-153 ポインタ）。
 /// `S`/`C`/`M` は [`encode`] と同一契約（[`severity_for`]・`class.wire_code()`）
 /// に `D`=`detail` を追記する。想定呼び出し元は commit 後 panic の緊急応答
@@ -112,14 +120,6 @@ pub fn encode(class: ErrorClass, message: &str) -> Result<Vec<u8>, EncodeError> 
 /// `DETAIL` は複数行を許容するのが通常の意味論であり、本 wire 実装のフィールド
 /// 終端は NUL のみに依存するため改行があってもフレーム構造は壊れない
 /// （`message` と同じ制約に揃える）。
-/// 緊急応答（`RECOVER-5` (3)。commit 後 panic 時に「commit は成功している
-/// かもしれない」ことを伝える固定文字列）の `D`（detail）値（ERR-5・TASK-153
-/// ポインタ）。値の内容は他テナントのデータ・存在情報を一切含まない固定文言
-/// であり、`crate::simple_query::build_emergency_response_bytes` が唯一の
-/// 呼び出し元として [`encode_with_detail`] へ渡す（定数を 1 箇所に集約し、
-/// 呼び出し元・テストでの生リテラル重複を避ける）。
-pub const MAY_BE_COMMITTED_DETAIL: &str = "state=may_be_committed";
-
 pub fn encode_with_detail(
     class: ErrorClass,
     message: &str,
