@@ -1,0 +1,142 @@
+//! `ErrorClass` → HTTP ステータスの決定的射影（Issue #744。対象ビヘイビア ERR-4。
+//! ポインタ: `docs/spec/05-tasks.md` TASK-180・`docs/spec/04-behavior/error-format.md`
+//! ERR-4）。
+//!
+//! NoSQL 表層は SQL 表層とエラー契約（`wire_code`）を完全共有し、新規 `wire_code` を
+//! 追加しない方針のもと、分類済みの [`ErrorClass`] を受け取って対応する HTTP ステータス
+//! を返すだけの純関数を提供する。分類そのもの（どの失敗をどの `ErrorClass` に分類するか）
+//! の決定にはここでは関与しない——上位層（要求パーサ・認証・SQL 表層の委譲結果）が
+//! 既に `ErrorClass` を確定させたあとの写像のみを担う。
+//!
+//! 呼び出し元は後続 Issue（#745 の JSON エラー本文エンコーダ・#746 の応答エンコーダの
+//! ステータス行）を想定する。
+
+use engine::error_format::ErrorClass;
+
+/// `ErrorClass` から HTTP ステータスコードへの決定的射影。
+///
+/// 「1 つの `wire_code`（＝ `ErrorClass`）→ 常に 1 つのステータス」の方向にのみ 1:1 で、
+/// 逆方向（ステータス → `wire_code`）は 1:1 ではない（例えば 400 は複数分類が共有する）。
+///
+/// 外部状態・時刻・乱数を参照しない `const fn` の網羅 `match`。[`ErrorClass`] へ
+/// variant が追加されるとこの `match` はコンパイルエラーになる（`#[non_exhaustive]`
+/// を付けない設計方針。`docs/design/error-enum-non-exhaustive-policy.md`）。
+/// `_` アームを置かないことは `#[deny(clippy::wildcard_enum_match_arm)]` によって
+/// `make lint`（`-D warnings`）でも機械的に強制する。
+#[deny(clippy::wildcard_enum_match_arm)]
+pub const fn http_status(class: ErrorClass) -> u16 {
+    match class {
+        ErrorClass::AuthRequired | ErrorClass::AuthInvalid => 401,
+        ErrorClass::ForbiddenTenantMismatch => 403,
+        ErrorClass::TableNotFound | ErrorClass::RowNotFound => 404,
+        ErrorClass::UniqueViolation => 409,
+        ErrorClass::PayloadTooLarge => 413,
+        ErrorClass::InternalError => 500,
+        ErrorClass::FeatureNotSupported => 501,
+        ErrorClass::ConnectionLimitExceeded => 503,
+        ErrorClass::ProtocolViolation
+        | ErrorClass::UnsupportedSqlSyntax
+        | ErrorClass::InvalidInput
+        | ErrorClass::NumericOutOfRange
+        | ErrorClass::OperationIdContentMismatch
+        | ErrorClass::MissingOperationId => 400,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
+    /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
+    const EXPECTED: [(ErrorClass, u16); 16] = [
+        (ErrorClass::InvalidInput, 400),
+        (ErrorClass::AuthInvalid, 401),
+        (ErrorClass::AuthRequired, 401),
+        (ErrorClass::ForbiddenTenantMismatch, 403),
+        (ErrorClass::TableNotFound, 404),
+        (ErrorClass::RowNotFound, 404),
+        (ErrorClass::UniqueViolation, 409),
+        (ErrorClass::MissingOperationId, 400),
+        (ErrorClass::PayloadTooLarge, 413),
+        (ErrorClass::ConnectionLimitExceeded, 503),
+        (ErrorClass::FeatureNotSupported, 501),
+        (ErrorClass::UnsupportedSqlSyntax, 400),
+        (ErrorClass::ProtocolViolation, 400),
+        (ErrorClass::InternalError, 500),
+        (ErrorClass::NumericOutOfRange, 400),
+        (ErrorClass::OperationIdContentMismatch, 400),
+    ];
+
+    #[test]
+    fn expected_table_length_matches_all_classes() {
+        // (a) 表の長さが `ErrorClass::ALL` と一致すること。
+        assert_eq!(EXPECTED.len(), ErrorClass::ALL.len());
+    }
+
+    #[test]
+    fn expected_table_covers_every_class_exactly_once() {
+        // (b) `ALL` の各 variant が期待表にちょうど 1 回現れること。
+        for class in ErrorClass::ALL {
+            let occurrences = EXPECTED.iter().filter(|(c, _)| *c == class).count();
+            assert_eq!(
+                occurrences, 1,
+                "class {:?} は期待表にちょうど 1 回現れるべき",
+                class
+            );
+        }
+    }
+
+    #[test]
+    fn http_status_matches_expected_table() {
+        // (c) 各行で実装の返値が期待値と一致すること。
+        for (class, expected) in EXPECTED {
+            assert_eq!(
+                http_status(class),
+                expected,
+                "class {:?} の射影が期待値と不一致",
+                class
+            );
+        }
+    }
+
+    #[test]
+    fn projection_is_deterministic_across_wire_code_round_trip() {
+        // 「1 つの wire_code → 常に 1 つのステータス」の固定。`wire_code()` で
+        // 一度シリアライズしてから `from_wire_code` で復元しても射影が変わらないこと、
+        // かつ同一入力の 2 回呼び出しが一致することを確認する。
+        for class in ErrorClass::ALL {
+            let round_tripped = ErrorClass::from_wire_code(class.wire_code())
+                .expect("ALL の各 class の wire_code は必ず逆引きできる");
+            assert_eq!(http_status(class), http_status(round_tripped));
+            assert_eq!(http_status(class), http_status(class));
+        }
+    }
+
+    #[test]
+    fn all_projections_are_client_error_or_server_error_range() {
+        // エラー分類が 2xx/3xx へ誤って射影されないことの範囲健全性チェック。
+        for class in ErrorClass::ALL {
+            let status = http_status(class);
+            assert!(
+                (400..=599).contains(&status),
+                "class {:?} のステータス {} が 400..=599 の範囲外",
+                class,
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn auth_required_projects_to_401_even_without_connected_send_path() {
+        // `AuthRequired` は送出経路未接続（`has_connected_send_path() == false`）だが、
+        // 射影テーブル上は他の認証系分類と同じ 401 として確定している
+        // （#753/#754 の Bearer 欠落経路が消費する契約の先取り固定）。
+        assert!(!ErrorClass::AuthRequired.has_connected_send_path());
+        assert_eq!(http_status(ErrorClass::AuthRequired), 401);
+    }
+
+    /// `const fn` であることの固定。#745/#746 が定数文脈から利用する形態を先取りして
+    /// コンパイル時に検証する。
+    const _: u16 = http_status(ErrorClass::InternalError);
+}
