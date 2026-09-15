@@ -117,6 +117,8 @@ define_error_classes! {
     FeatureNotSupported => ("0A000", "FEATURE_NOT_SUPPORTED"),
     /// 受理範囲外の SQL 構文（構文解析失敗・AST 許可リスト外。`42601`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::UnsupportedSyntax`] の写像。
+    /// [`crate::json::JsonError`]（重複キー・非 RFC 8259 数値等。Issue #732・
+    /// TASK-172・NOSQL-8 ポインタ）もこの分類へ写像する。
     UnsupportedSqlSyntax => ("42601", "UNSUPPORTED_SQL_SYNTAX"),
     /// プロトコル違反（`08P01`）。wire-server の `framing::SQLSTATE_PROTOCOL_VIOLATION`
     /// に対応する分類（engine 側に発生経路はなく、写像の集約のみ）。

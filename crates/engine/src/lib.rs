@@ -229,6 +229,7 @@ pub mod hnsw;
 pub mod hybrid;
 pub mod incremental;
 pub mod isa;
+pub mod json;
 pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
