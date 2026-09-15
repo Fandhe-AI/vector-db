@@ -206,8 +206,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
 /// [`BoundScan`] を実行する（Issue #454・TASK-186・NOSQL-3 の公開 API）。
 /// `core.rs::EngineCore::execute_sql_in_session` の `Statement::Scan` アームから
 /// 呼ばれるほか、[`BoundScan`] が公開型へ昇格したため engine クレート外から
-/// SQL テキストを経由せず直接呼び出すこともできる（TASK-186 が要求する、NoSQL
-/// 表層向けの第 2 の実行器を作らず既存の束縛済み実行計画を再利用する方式）。
+/// SQL テキストを経由せず直接呼び出すこともできる（TASK-186・NOSQL-3）。
 pub fn execute_scan(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,

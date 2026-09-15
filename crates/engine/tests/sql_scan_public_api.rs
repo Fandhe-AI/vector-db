@@ -147,7 +147,7 @@ fn bound_scan_new_constructs_directly_without_sql_text() {
 
     // SQL テキストの構文解析・`validate_sql` を一切経由せず、`BoundScan::new`
     // （本 Issue で追加した直接構築用 constructor）だけで束縛済み実行計画を
-    // 組み立てる（TASK-186・NOSQL-3 が要求する「SQL テキスト非経由」経路）。
+    // 組み立てる（TASK-186・NOSQL-3。SQL テキスト非経由の構築経路）。
     let projection = vec![
         ProjectedColumn::Id,
         ProjectedColumn::Column {
