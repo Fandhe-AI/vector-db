@@ -33,7 +33,12 @@
 //! - [`using_plan`][]: `USING PLAN('<query>')` 文末句（`ORDER BY` の代替。SQL-5）の
 //!   LLM クエリ展開結果 → 既存 C4 ハイブリッド実行形への束縛（TASK-77）
 //! - [`aggregate`][]: 集計関数のみを結果列とする `GROUP BY` なし単一行 SELECT の
-//!   実行（TASK-166・SQL-13）。`GROUP BY` ありの複数行実行は [`group_by`] へ委譲する
+//!   実行（TASK-166・SQL-13）。`GROUP BY` ありの複数行実行は [`group_by`] へ委譲する。
+//!   `bind_aggregate`／`execute_aggregate`／`BoundAggregate` は TASK-186（NOSQL-4・
+//!   NOSQL-5）で公開 API へ昇格しており engine クレート外からも呼べる（`bind_aggregate`
+//!   への到達は現状 SQL テキスト経由の [`allowlist::validate_sql`] のみで、
+//!   `BoundScan::new` 相当の SQL テキスト非経由の直接構築 `BoundAggregate::new`
+//!   は対象外のまま）
 //! - [`group_by`][]: `GROUP BY <TEXT 列>` 集計の複数行実行（TASK-167・SQL-14）。
 //!   グループ表の有界化（`MAX_GROUPS`・`MAX_GROUP_KEY_TOTAL_BYTES`）・`HAVING`・
 //!   `ORDER BY`・`LIMIT` を担う
