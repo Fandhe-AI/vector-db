@@ -165,12 +165,11 @@ fn rls9_wire_insert_response_bytes_are_identical_for_foreign_held_id_and_absent_
     );
 }
 
-/// 対象ビヘイビア: TABLE-12。同一テナント（tenant-a）内での重複 `id` への
-/// `INSERT` は `23505` で拒否され、応答本文に他テナント名・行 `id` を含む
-/// 識別子が漏えいしないこと。他テナント（tenant-b・tenant-c）を事前に seed
-/// した状態でも同じ結果になることを wire 越しに固定する（存在情報秘匿の
-/// 回帰検証。`row_id_tenant_scope.rs::rls9_insert_response_is_identical_...`
-/// と同型のアサーション）。
+/// 対象ビヘイビア: TABLE-12。他テナント（tenant-b・tenant-c）を事前に seed
+/// した状態でも、同一テナント（tenant-a）内での重複 `id` への `INSERT` は
+/// `23505` で拒否され、応答本文に他テナント名・行 `id` を含む識別子が
+/// 漏えいしないこと。存在情報秘匿の回帰検証（`row_id_tenant_scope.rs::
+/// rls9_insert_response_is_identical_...` と同型のアサーション）。
 #[test]
 fn table12_wire_insert_duplicate_within_own_tenant_is_rejected_with_23505_without_leaking_row_identifiers(
 ) {
