@@ -75,15 +75,19 @@ fail-closed で起動を拒否します）。`--bind` 省略時は `127.0.0.1:54
 psycopg・node pg から無改造で cleartext password 認証つき接続できます
 （詳細: `docs/design/three-client-e2e-harness.md`）。
 
-`--surface`（Issue #734・TASK-171／HTTP-1）はクエリインターフェースを SQL
-表層（現行の PostgreSQL wire プロトコル）／NoSQL 表層（HTTP/1.1 最小
-サブセット。TASK-172 以降）の 2 択で排他選択する opt-in CLI 引数です。未指定
-（または `sql`）は現行どおり SQL wire のまま不変です。`sql`／`nosql` 以外の
-値・値欠落・2 回目以降の重複指定はいずれも fail-closed で起動エラーとなり、
-既定へ黙って読み替わることはありません。`nosql` はパーサとしては受理され
-ますが、NoSQL リスナー本体の配線は別 Issue（#735）の担当のため、それまでは
-起動を明示メッセージ付きで停止します（選ばれていない SQL wire を黙って
-listen する fail-open を避けるための暫定挙動）。
+`--surface`（Issue #734・#735・TASK-171／HTTP-1・HTTP-9）はクエリ
+インターフェースを SQL 表層（現行の PostgreSQL wire プロトコル）／NoSQL
+表層（HTTP/1.1 最小サブセット。TASK-172 以降）の 2 択で排他選択する opt-in
+CLI 引数です。未指定（または `sql`）は現行どおり SQL wire のまま不変です。
+`sql`／`nosql` 以外の値・値欠落・2 回目以降の重複指定はいずれも fail-closed
+で起動エラーとなり、既定へ黙って読み替わることはありません。両表層とも
+bind アドレスの通信路保護要件検証（TLS 未構成時は loopback 限定。WIRE-7）を
+共有した後にリスナーだけが分岐するため、`nosql` 選択時も非ループバック
+bind は同じ理由で起動拒否されます。`nosql` を選択すると、選ばれた表層
+（SQL wire）のリスナーは一切 bind されず、代わりに HTTP/1.1 のリスナーが
+1 本だけ bind されます。本 Issue（#735）時点の HTTP リスナーは要求を一切
+読まずに接続を受理直後にクローズする stub です（読み取りタイムアウト・
+接続数リミッター・接続ハンドラ本体・応答生成は後続 Issue の担当）。
 
 `--search-engine`（Issue #656）は検索エンジン選択の opt-in CLI 引数です。
 `--planner-endpoint`／`--planner-model`／`--embedder-hashing-dim`

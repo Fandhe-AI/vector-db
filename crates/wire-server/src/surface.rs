@@ -11,12 +11,13 @@
 //! fail-closed で拒否し、既定へ黙って読み替えない（`main.rs::run_server` の
 //! 引数ループが `search_engine_opt` と同じ作法で処理する）。
 //!
-//! `nosql` を選択した場合の NoSQL リスナー本体の配線は Issue #735 の担当
-//! （本モジュールはパースの受理・拒否契約のみを持つ）。`nosql` 選択時に
-//! 従来どおり SQL wire リスナーを bind するフォールバック（fail-open）は
-//! HTTP-1 の排他方針に反するため行わない（`main.rs::run_server` 側が
-//! リスナー配線の前段で暫定的に fail-closed 停止する。同モジュールの
-//! 呼び出し箇所コメント参照）。
+//! `nosql` を選択した場合、`main.rs::run_server` は本モジュールの解決結果に
+//! 応じて [`crate::server::accept_loop_with_engine`]（`Sql`）／
+//! [`crate::http::listener::accept_loop_stub`]（`Nosql`）のいずれか 1 本だけを
+//! 呼ぶ（HTTP-1 の排他方針・Issue #735）。両表層とも bind 自体は
+//! `main.rs::run_server` が単一の `GuardedBindAddrs::resolve`／`bind` 呼び出し
+//! を共有した後に分岐するため、`nosql` 選択時にも WIRE-7 の bind ガード
+//! （TLS 未構成時は loopback 限定）が同じ経路で適用される（HTTP-9）。
 
 /// `--surface` の CLI フラグ名。
 pub const FLAG: &str = "--surface";
@@ -31,7 +32,8 @@ pub enum Surface {
     /// 既定（未指定時）。PostgreSQL wire プロトコル互換の SQL 表層。
     #[default]
     Sql,
-    /// NoSQL 表層（HTTP/1.1 最小サブセット）。リスナー本体は Issue #735。
+    /// NoSQL 表層（HTTP/1.1 最小サブセット）。`http::listener::accept_loop_stub`
+    /// が受け皿（Issue #735。本 Issue 時点は accept 直後にクローズする stub）。
     Nosql,
 }
 
