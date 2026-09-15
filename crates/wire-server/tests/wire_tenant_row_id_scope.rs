@@ -15,6 +15,12 @@
 //! （既存の `sql/exec.rs::TenantWriteError::IdConflict → SqlSurfaceError::
 //! IdConflict`（`23505`）写像・固定文言をそのまま `ErrorResponse` へ載せる
 //! wire 層の既存経路を確認するのみ）。
+//!
+//! ファイル末尾（Issue #738）には、応答バイト列の同一性に加えて残る観測
+//! チャネルである**レイテンシ分布**が (b) 他テナント保持 id・(c) 未存在 id
+//! の間で統計的に区別できないことを検証する層 A（時間非依存の判定ロジック
+//! 単体テスト・`make ci` 対象）・層 B（`#[ignore]` 実測。`make
+//! wire-tenant-latency`）を追加している。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -223,4 +229,552 @@ fn table12_wire_insert_duplicate_within_own_tenant_is_rejected_with_23505_withou
     let tag = read_command_complete(&mut stream);
     assert_eq!(tag, "INSERT 0 1");
     read_ready_for_query(&mut stream);
+}
+// ============================================================================
+// Issue #738（test(wire)）: (b) 他テナント保持 id・(c) 未存在 id への自テナント
+// 名義 `INSERT` の wire 応答**レイテンシ分布**が統計的に区別できないことの
+// 機械検証。Issue #737（上記 `rls9_wire_insert_response_bytes_are_identical_
+// for_foreign_held_id_and_absent_id`）は応答バイト列の同一性を固定したが、
+// 残る観測チャネルはレイテンシであり、TASK-95・TABLE-12・RLS-9 の確定化には
+// 「(b) と (c) のレイテンシ分布が統計的に区別できない」ことの追加確認が要る。
+//
+// 判定は `benchmark-judgement-policy.md`（public・本リポ側の実装既定値）の
+// 「固定相対帯」と「実測参照帯（A/A 分割）」の 2 種のノイズ帯を両方超えて
+// 初めて `Distinguishable`（fail）とする方式を、タイミング副チャネルの
+// 不在検証（同経路であることの確認）へ適用したもの。判定ロジック（`judge`
+// 以下）は実測タイマーを一切使わない時間非依存の純関数として層 A
+// （`cargo test`・`make ci` 対象）で固定し、計測本体（`#[ignore]`・
+// `make wire-tenant-latency`）は層 B として分離する（`tier_latency_accept.rs`
+// と同じ層分離方針）。
+// ============================================================================
+
+/// `TENANT_LATENCY_ROUNDS` 未指定時の 1 腕あたり計測ラウンド数。
+const DEFAULT_ROUNDS: usize = 200;
+/// `resolve_rounds` が受理する最小値（200 未満は統計的に信頼できないとして
+/// fail-closed で拒否する。本 Issue の実装既定値）。
+const MIN_ROUNDS: usize = 200;
+/// `TENANT_LATENCY_WARMUP` 未指定時のウォームアップ往復回数（統計から除外）。
+const DEFAULT_WARMUP: usize = 20;
+
+/// 固定相対帯（`benchmark-judgement-policy.md` §4 が Issue #401 から継承する
+/// 非退行閾値と同じ値を、同一性検証の許容差として転用する。本リポの実装
+/// 既定値）。
+const FIXED_BAND_MEDIAN: f64 = 0.05;
+const FIXED_BAND_P95: f64 = 0.10;
+
+/// 実測参照帯（A/A 分割）の上限値。これを超える場合は環境ノイズが判定に
+/// 使えないほど大きいとみなし `Inconclusive` とする（vacuous pass 防止。
+/// 固定帯の 5 倍を「参照帯として無意味」とみなす本リポの実装既定値）。
+const AA_BAND_MEDIAN_CAP: f64 = 0.25;
+const AA_BAND_P95_CAP: f64 = 0.50;
+
+/// `TENANT_LATENCY_ROUNDS` を検証しつつ解決する（時間非依存の純関数。
+/// `env::var` の結果を直接受け取るのではなく `Option<&str>` を引数化する
+/// ことで層 A から実行時タイマー・env に依存せず単体テストできる。
+/// `tier_latency_bench.rs::parse_max_p95_ms` 系と同じ fail-closed 方針）。
+fn resolve_rounds(raw: Option<&str>) -> Result<usize, String> {
+    match raw {
+        None => Ok(DEFAULT_ROUNDS),
+        Some(s) => {
+            let trimmed = s.trim();
+            let n: usize = trimmed.parse().map_err(|_| {
+                format!("TENANT_LATENCY_ROUNDS must be a positive integer, got {s:?}")
+            })?;
+            if n < MIN_ROUNDS {
+                return Err(format!(
+                    "TENANT_LATENCY_ROUNDS must be >= {MIN_ROUNDS} (statistically unreliable below this), got {n}"
+                ));
+            }
+            Ok(n)
+        }
+    }
+}
+
+/// `TENANT_LATENCY_WARMUP` を検証しつつ解決する（`resolve_rounds` と同じ
+/// 方針。ウォームアップは統計対象外のため下限は課さない）。
+fn resolve_warmup(raw: Option<&str>) -> Result<usize, String> {
+    match raw {
+        None => Ok(DEFAULT_WARMUP),
+        Some(s) => {
+            let trimmed = s.trim();
+            trimmed.parse().map_err(|_| {
+                format!("TENANT_LATENCY_WARMUP must be a non-negative integer, got {s:?}")
+            })
+        }
+    }
+}
+
+/// `wire_concurrency_throughput.rs::percentile` と同式（`idx =
+/// round((n-1)*p)`）で再実装し、統計量の算出方法を本リポ内で整合させる。
+/// `sorted` は昇順ソート済みであることを呼び出し元が保証する。
+fn percentile(sorted: &[u128], p: f64) -> u128 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// 計測順（取得順）の偶奇で 2 分割する（A/A 分割の分割方法。同一経路・
+/// 同一 run の同一腕を 2 分割することで「ノイズだけでも動きうる幅」の
+/// 実測値を得る）。
+fn split_even_odd(samples: &[u128]) -> (Vec<u128>, Vec<u128>) {
+    let mut even = Vec::with_capacity(samples.len().div_ceil(2));
+    let mut odd = Vec::with_capacity(samples.len() / 2);
+    for (i, &s) in samples.iter().enumerate() {
+        if i % 2 == 0 {
+            even.push(s);
+        } else {
+            odd.push(s);
+        }
+    }
+    (even, odd)
+}
+
+/// `a` と `b` の対称相対差（`|a/b - 1|`）。`b == 0` は往復レイテンシとして
+/// 現実的に到達しないが、fail-closed に「区別可能」側へ倒す（`a == 0` も
+/// 同時に成立する場合のみ差なしとみなす）。
+fn relative_diff(a: u128, b: u128) -> f64 {
+    if b == 0 {
+        return if a == 0 { 0.0 } else { f64::INFINITY };
+    }
+    ((a as f64) / (b as f64) - 1.0).abs()
+}
+
+/// 1 腕のサンプル列を計測順の偶奇で 2 分割し、median・p95 それぞれの
+/// 相対差（A/A 帯）を返す。
+fn aa_band(samples: &[u128]) -> (f64, f64) {
+    let (mut even, mut odd) = split_even_odd(samples);
+    even.sort_unstable();
+    odd.sort_unstable();
+    let median_diff = relative_diff(percentile(&even, 0.50), percentile(&odd, 0.50));
+    let p95_diff = relative_diff(percentile(&even, 0.95), percentile(&odd, 0.95));
+    (median_diff, p95_diff)
+}
+
+/// レイテンシ分布同一性の判定結果（計画 §3.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// 両ノイズ帯を超えて区別できる差が観測された（fail。タイミング副
+    /// チャネルによる存在情報漏えいの疑い）。
+    Distinguishable,
+    /// A/A 帯（環境ノイズ）そのものが大きすぎて判定に使えない
+    /// （fail。vacuous pass を防ぐための明示的な判定不能）。
+    Inconclusive,
+    /// 両ノイズ帯を超える差は観測されなかった（pass）。
+    Indistinguishable,
+}
+
+/// 固定相対帯・A/A 帯上限のペア（median・p95）。テストから閾値を差し替え
+/// られるよう構造体化する。
+#[derive(Debug, Clone, Copy)]
+struct Bands {
+    fixed_median: f64,
+    fixed_p95: f64,
+    aa_median_cap: f64,
+    aa_p95_cap: f64,
+}
+
+impl Default for Bands {
+    fn default() -> Self {
+        Self {
+            fixed_median: FIXED_BAND_MEDIAN,
+            fixed_p95: FIXED_BAND_P95,
+            aa_median_cap: AA_BAND_MEDIAN_CAP,
+            aa_p95_cap: AA_BAND_P95_CAP,
+        }
+    }
+}
+
+/// (b)（他テナント保持 id）・(c)（未存在 id）2 腕のサンプル列からレイテンシ
+/// 分布の同一性を判定する（時間非依存の純関数。実測タイマー・env を一切
+/// 参照しない。`tier_latency_bench.rs::judge` と同じ「計測本体から分離した
+/// 判定ロジック」の方針）。`b`・`c` は各腕の生サンプル列（計測順のまま。
+/// 内部でソート・A/A 分割の双方に使う）。
+fn judge(b: &[u128], c: &[u128], bands: &Bands) -> Verdict {
+    let (aa_median_b, aa_p95_b) = aa_band(b);
+    let (aa_median_c, aa_p95_c) = aa_band(c);
+    let aa_median = aa_median_b.max(aa_median_c);
+    let aa_p95 = aa_p95_b.max(aa_p95_c);
+
+    // A/A 帯そのものが上限を超える場合は環境ノイズが判定に使えないほど
+    // 大きいとみなし、固定帯との比較より先に `Inconclusive` で打ち切る
+    // （両者が同時に成立しても「区別できた」と誤認しない vacuous pass 防止）。
+    if aa_median > bands.aa_median_cap || aa_p95 > bands.aa_p95_cap {
+        return Verdict::Inconclusive;
+    }
+
+    let mut b_sorted = b.to_vec();
+    let mut c_sorted = c.to_vec();
+    b_sorted.sort_unstable();
+    c_sorted.sort_unstable();
+
+    let delta_median = relative_diff(percentile(&b_sorted, 0.50), percentile(&c_sorted, 0.50));
+    let delta_p95 = relative_diff(percentile(&b_sorted, 0.95), percentile(&c_sorted, 0.95));
+
+    if delta_median > bands.fixed_median.max(aa_median) || delta_p95 > bands.fixed_p95.max(aa_p95) {
+        return Verdict::Distinguishable;
+    }
+
+    Verdict::Indistinguishable
+}
+
+/// 次のメッセージを型バイトのみ検査し（`CommandComplete` 以外は panic）、
+/// 送信から `ReadyForQuery` 受信完了までの往復時間（マイクロ秒）を返す
+/// （`wire_concurrency_throughput.rs::run_one_query` と同じ計測範囲）。
+fn measure_insert_round_trip(stream: &mut TcpStream, sql: &str) -> u128 {
+    let start = std::time::Instant::now();
+    send_simple_query(stream, sql);
+    let bytes = read_raw_message(stream);
+    assert_eq!(
+        bytes.first(),
+        Some(&b'C'),
+        "expected CommandComplete during latency measurement, got: {bytes:?}"
+    );
+    read_ready_for_query(stream);
+    start.elapsed().as_micros()
+}
+
+/// tenant-b へ `ids` の各行を wire を経由せず `EngineCore::insert_row` で
+/// seed する（(b) 腕用。`seed_foreign_tenants` と同じ「wire 非経由の直接
+/// API 呼び出し」の流儀。tenant-c への seed は不要——(c) 腕はどのテナントも
+/// 保持しない id が前提のため）。
+fn seed_foreign_ids(core: &EngineCore, ids: &[u64]) {
+    let b = PolicyContext::new(TENANT_B).expect("valid tenant");
+    for &id in ids {
+        let op_id = format!("lat-seed-b-{id:07}");
+        core.insert_row(
+            &b,
+            TABLE,
+            id,
+            &RowInput {
+                tenant_id: TENANT_B,
+                visibility: Visibility::Public,
+                embedding: &[0.0, 1.0, 0.0],
+                metadata: b"seed-lat-b",
+            },
+            Some(&OperationId::parse(&op_id).expect("valid operation_id")),
+        )
+        .expect("seed tenant-b row for latency measurement");
+    }
+}
+
+/// ABBA 交互実行のための腕識別子（`benchmark-judgement-policy.md` §3 の
+/// 交互実行規約。テーブル成長・redb commit コストの時間ドリフト・ペア内の
+/// 先行/後続バイアスを両腕へ均等に配る）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    ForeignHeld,
+    Absent,
+}
+
+/// `count` 件ずつを `b,c,c,b` の順で循環させる ABBA スケジュールを組み立てる
+/// （時間非依存の純関数。両腕とも `count` 件に達したら終了）。
+fn abba_schedule(count: usize) -> Vec<Arm> {
+    let block = [Arm::ForeignHeld, Arm::Absent, Arm::Absent, Arm::ForeignHeld];
+    let mut schedule = Vec::with_capacity(count * 2);
+    let mut b_remaining = count;
+    let mut c_remaining = count;
+    let mut i = 0usize;
+    while b_remaining > 0 || c_remaining > 0 {
+        match block[i % block.len()] {
+            Arm::ForeignHeld if b_remaining > 0 => {
+                schedule.push(Arm::ForeignHeld);
+                b_remaining -= 1;
+            }
+            Arm::Absent if c_remaining > 0 => {
+                schedule.push(Arm::Absent);
+                c_remaining -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    schedule
+}
+
+/// `count` 件ぶんの ABBA 交互実行を 1 フェーズ実行し、各腕の生サンプル列
+/// （計測順のまま）を返す。`b_id_base`／`c_id_base` は id の衝突を避ける
+/// ための各腕・各フェーズ専用のオフセット（呼び出し元がフェーズ間で重複
+/// しない値を渡す）。
+fn run_latency_phase(
+    stream: &mut TcpStream,
+    b_id_base: u64,
+    c_id_base: u64,
+    count: usize,
+) -> (Vec<u128>, Vec<u128>) {
+    let schedule = abba_schedule(count);
+    let mut b_samples = Vec::with_capacity(count);
+    let mut c_samples = Vec::with_capacity(count);
+    let mut b_i = 0u64;
+    let mut c_i = 0u64;
+    for arm in schedule {
+        match arm {
+            Arm::ForeignHeld => {
+                let id = b_id_base + b_i;
+                let op_id = format!("lat-b-{id:07}");
+                b_samples.push(measure_insert_round_trip(stream, &insert_sql(id, &op_id)));
+                b_i += 1;
+            }
+            Arm::Absent => {
+                let id = c_id_base + c_i;
+                let op_id = format!("lat-c-{id:07}");
+                c_samples.push(measure_insert_round_trip(stream, &insert_sql(id, &op_id)));
+                c_i += 1;
+            }
+        }
+    }
+    (b_samples, c_samples)
+}
+
+/// (b) 他テナント（tenant-b）保持 id・(c) 未存在 id への自テナント名義
+/// `INSERT` の wire レイテンシ分布が統計的に区別できないことを検証する
+/// 手動専用の計測テスト（Issue #738・TASK-95・TABLE-12・RLS-9）。
+///
+/// `TENANT_LATENCY_ROUNDS`（既定 200・200 未満は拒否）・
+/// `TENANT_LATENCY_WARMUP`（既定 20）で規模を上書きできる。1 プロセス =
+/// 1 計測（`benchmark-judgement-policy.md` §5 準拠）。spec 閾値を持たない
+/// 情報提供専用の性能検証と同じく CI 非配線（`GITHUB_ACTIONS` 下は
+/// fail-closed で拒否する。`knn_wire_profile_accept.rs` 系と同じ方針）。
+#[test]
+#[ignore]
+fn rls9_wire_insert_latency_distribution_is_indistinguishable_for_foreign_held_id_and_absent_id() {
+    assert!(
+        std::env::var("GITHUB_ACTIONS").is_err(),
+        "this manual latency benchmark must not run under GITHUB_ACTIONS (shared/noisy CI environment invalidates the noise bands)"
+    );
+
+    let rounds = resolve_rounds(std::env::var("TENANT_LATENCY_ROUNDS").ok().as_deref())
+        .expect("TENANT_LATENCY_ROUNDS must be valid");
+    let warmup = resolve_warmup(std::env::var("TENANT_LATENCY_WARMUP").ok().as_deref())
+        .expect("TENANT_LATENCY_WARMUP must be valid");
+
+    // フェーズ間で id が衝突しないよう、腕・フェーズごとに十分離れた
+    // オフセットを割り当てる（warmup・rounds とも現実的な範囲であれば
+    // 衝突しない安全マージン）。
+    const B_WARMUP_BASE: u64 = 1_000_000;
+    const B_MEASURED_BASE: u64 = 2_000_000;
+    const C_WARMUP_BASE: u64 = 3_000_000;
+    const C_MEASURED_BASE: u64 = 4_000_000;
+
+    let (core, _guard) = new_core_with_docs_table();
+    let b_warmup_ids: Vec<u64> = (0..warmup as u64).map(|i| B_WARMUP_BASE + i).collect();
+    let b_measured_ids: Vec<u64> = (0..rounds as u64).map(|i| B_MEASURED_BASE + i).collect();
+    seed_foreign_ids(&core, &b_warmup_ids);
+    seed_foreign_ids(&core, &b_measured_ids);
+
+    let mut stream = spawn_with_alice(core);
+
+    // ウォームアップ（統計から除外。接続直後の cold path を計測区間から
+    // 除く）。
+    let _ = run_latency_phase(&mut stream, B_WARMUP_BASE, C_WARMUP_BASE, warmup);
+
+    let (b_samples, c_samples) =
+        run_latency_phase(&mut stream, B_MEASURED_BASE, C_MEASURED_BASE, rounds);
+
+    let mut b_sorted = b_samples.clone();
+    let mut c_sorted = c_samples.clone();
+    b_sorted.sort_unstable();
+    c_sorted.sort_unstable();
+
+    let bands = Bands::default();
+    let verdict = judge(&b_samples, &c_samples, &bands);
+
+    let (aa_median_b, aa_p95_b) = aa_band(&b_samples);
+    let (aa_median_c, aa_p95_c) = aa_band(&c_samples);
+
+    println!("=== rls9_wire_insert_latency_distribution ===");
+    println!("rounds={rounds} warmup={warmup}");
+    println!("nproc={:?}", std::thread::available_parallelism());
+    println!(
+        "foreign_held(b)_us: min={} median={} p95={} max={}",
+        b_sorted.first().copied().unwrap_or(0),
+        percentile(&b_sorted, 0.50),
+        percentile(&b_sorted, 0.95),
+        b_sorted.last().copied().unwrap_or(0)
+    );
+    println!(
+        "absent(c)_us: min={} median={} p95={} max={}",
+        c_sorted.first().copied().unwrap_or(0),
+        percentile(&c_sorted, 0.50),
+        percentile(&c_sorted, 0.95),
+        c_sorted.last().copied().unwrap_or(0)
+    );
+    println!(
+        "delta_median={:.4} delta_p95={:.4}",
+        relative_diff(percentile(&b_sorted, 0.50), percentile(&c_sorted, 0.50)),
+        relative_diff(percentile(&b_sorted, 0.95), percentile(&c_sorted, 0.95))
+    );
+    println!(
+        "aa_median=max({aa_median_b:.4},{aa_median_c:.4}) aa_p95=max({aa_p95_b:.4},{aa_p95_c:.4})"
+    );
+    println!("verdict={verdict:?}");
+    println!(
+        "note: shared/CI environment values are reference-only per docs/design/benchmark-judgement-policy.md"
+    );
+
+    match verdict {
+        Verdict::Indistinguishable => {}
+        Verdict::Distinguishable => panic!(
+            "wire INSERT round-trip latency is statistically distinguishable between a \
+             foreign-tenant-held id and an absent id (potential timing side channel); see \
+             the printed summary above for delta/AA band values"
+        ),
+        Verdict::Inconclusive => panic!(
+            "environment noise (A/A band) exceeds the upper bound; the measurement cannot \
+             confirm indistinguishability in this run — re-run with less concurrent load or \
+             a higher TENANT_LATENCY_ROUNDS"
+        ),
+    }
+}
+
+// --- 層A相当: 時間非依存の判定ロジック単体テスト（`benchmark-judgement-
+//     policy.md` §5「1 プロセス = 1 計測」の裏で使う `judge` 自体は実測
+//     タイマーに依存しないため `make ci` 対象の通常テストとして固定する） ---
+
+#[cfg(test)]
+mod tenant_latency_judge_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_rounds_defaults_to_200_when_unset() {
+        assert_eq!(resolve_rounds(None).unwrap(), 200);
+    }
+
+    #[test]
+    fn resolve_rounds_accepts_the_minimum_and_rejects_below_it() {
+        assert_eq!(resolve_rounds(Some("200")).unwrap(), 200);
+        assert!(resolve_rounds(Some("199")).is_err());
+    }
+
+    #[test]
+    fn resolve_rounds_rejects_non_integer_and_empty() {
+        assert!(resolve_rounds(Some("")).is_err());
+        assert!(resolve_rounds(Some("abc")).is_err());
+        assert!(resolve_rounds(Some("200.5")).is_err());
+        assert!(resolve_rounds(Some("-1")).is_err());
+    }
+
+    #[test]
+    fn resolve_warmup_defaults_to_20_when_unset() {
+        assert_eq!(resolve_warmup(None).unwrap(), 20);
+    }
+
+    #[test]
+    fn resolve_warmup_accepts_zero_and_rejects_non_integer() {
+        assert_eq!(resolve_warmup(Some("0")).unwrap(), 0);
+        assert!(resolve_warmup(Some("abc")).is_err());
+        assert!(resolve_warmup(Some("-1")).is_err());
+    }
+
+    #[test]
+    fn percentile_matches_wire_concurrency_throughput_formula() {
+        let sorted = vec![10u128, 20, 30, 40, 50];
+        // idx = round((5-1)*0.5) = 2 -> sorted[2] = 30
+        assert_eq!(percentile(&sorted, 0.50), 30);
+        // idx = round((5-1)*0.95) = round(3.8) = 4 -> sorted[4] = 50
+        assert_eq!(percentile(&sorted, 0.95), 50);
+        assert_eq!(percentile(&[], 0.50), 0);
+    }
+
+    #[test]
+    fn split_even_odd_splits_by_acquisition_order_parity() {
+        let (even, odd) = split_even_odd(&[1u128, 2, 3, 4, 5]);
+        assert_eq!(even, vec![1, 3, 5]);
+        assert_eq!(odd, vec![2, 4]);
+    }
+
+    #[test]
+    fn abba_schedule_cycles_foreign_held_absent_absent_foreign_held() {
+        let schedule = abba_schedule(2);
+        assert_eq!(
+            schedule,
+            vec![Arm::ForeignHeld, Arm::Absent, Arm::Absent, Arm::ForeignHeld]
+        );
+        // 各腕ちょうど count 件ずつ。
+        assert_eq!(
+            schedule.iter().filter(|a| **a == Arm::ForeignHeld).count(),
+            2
+        );
+        assert_eq!(schedule.iter().filter(|a| **a == Arm::Absent).count(), 2);
+    }
+
+    #[test]
+    fn abba_schedule_handles_uneven_tail_when_one_arm_is_exhausted() {
+        // count=1: 最初の 2 スロットで両腕とも埋まり、以降の block 要素は
+        // 「既に埋まった腕」を指すためスキップされ、schedule 長は 2 のまま。
+        let schedule = abba_schedule(1);
+        assert_eq!(schedule, vec![Arm::ForeignHeld, Arm::Absent]);
+    }
+
+    fn identical_samples(n: usize, value: u128) -> Vec<u128> {
+        vec![value; n]
+    }
+
+    /// ケース 1: 同一分布 → `Indistinguishable`。
+    #[test]
+    fn judge_reports_indistinguishable_for_identical_distributions() {
+        let b = identical_samples(200, 1000);
+        let c = identical_samples(200, 1000);
+        assert_eq!(judge(&b, &c, &Bands::default()), Verdict::Indistinguishable);
+    }
+
+    /// ケース 2: 両帯を超える差（例: (b) を 1.3 倍）→ `Distinguishable`。
+    #[test]
+    fn judge_reports_distinguishable_when_one_arm_is_scaled_up_beyond_both_bands() {
+        let b = identical_samples(200, 1300);
+        let c = identical_samples(200, 1000);
+        assert_eq!(judge(&b, &c, &Bands::default()), Verdict::Distinguishable);
+    }
+
+    /// ケース 3: 固定帯を超えるが A/A 帯内 → `Indistinguishable`（ノイズ帯内。
+    /// A/A 帯自体を固定帯より広くとることで「固定帯超過だが環境ノイズの
+    /// 範囲内」の状況を作る）。
+    #[test]
+    fn judge_reports_indistinguishable_when_delta_exceeds_fixed_band_but_within_aa_band() {
+        // b: 偶数番目 920・奇数番目 1080（A/A 帯 ≈0.148 が固定帯 0.05 を
+        // 上回るように広げる。b 全体の中央値は 1080 となり c の 1000 との
+        // 差 0.08 は固定帯 0.05 を超えるが A/A 帯 0.148 には収まる）。
+        let b: Vec<u128> = (0..200)
+            .map(|i| if i % 2 == 0 { 920 } else { 1080 })
+            .collect();
+        let c = identical_samples(200, 1000);
+        // delta_median = |median(b)/median(c) - 1| は固定帯 0.05 を超えるが、
+        // b の A/A 帯（偶奇差）がそれを上回るよう仕組んであるため
+        // `max(fixed, aa)` の比較で吸収される。
+        let verdict = judge(&b, &c, &Bands::default());
+        assert_eq!(verdict, Verdict::Indistinguishable);
+    }
+
+    /// ケース 4: A/A 帯が上限超過 → `Inconclusive`。
+    #[test]
+    fn judge_reports_inconclusive_when_aa_band_exceeds_the_upper_cap() {
+        // 偶奇差が極端（100 と 10000）で A/A 帯の上限（0.25／0.50）を
+        // 大きく超える腕を作る。
+        let b: Vec<u128> = (0..200)
+            .map(|i| if i % 2 == 0 { 100 } else { 10_000 })
+            .collect();
+        let c = identical_samples(200, 1000);
+        assert_eq!(judge(&b, &c, &Bands::default()), Verdict::Inconclusive);
+    }
+
+    /// `Inconclusive` は `Distinguishable` より優先される（両方の条件を
+    /// 同時に満たしうる入力でも、環境ノイズが判定不能な大きさである以上、
+    /// 「区別できた」とは主張しない）。
+    #[test]
+    fn judge_prioritizes_inconclusive_over_distinguishable() {
+        let b: Vec<u128> = (0..200)
+            .map(|i| if i % 2 == 0 { 100 } else { 10_000 })
+            .collect();
+        let c = identical_samples(200, 1000);
+        // b の中央値は (100+10000)/2 付近で c の 1000 と大きく異なりうるが、
+        // それでも Inconclusive が優先される。
+        assert_eq!(judge(&b, &c, &Bands::default()), Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn relative_diff_handles_zero_denominator() {
+        assert_eq!(relative_diff(0, 0), 0.0);
+        assert_eq!(relative_diff(1, 0), f64::INFINITY);
+    }
 }
