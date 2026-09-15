@@ -2369,8 +2369,16 @@ fn full_scan_with_arena(
 /// ではなくクエリ形状とエンジン設定から決まるこの**静的判定**をそのまま報告する
 /// （実行時 fail-closed 縮退・hybrid 再取得ラウンド数は対象外。
 /// `docs/design/explain-search-engine-exposure.md` 参照）。
+///
+/// TASK-186・NOSQL-10 の前提として Issue #730 で公開 API へ昇格した
+/// （`sql::explain::build_explain_result` を engine クレート外から実際に呼ぶには
+/// 入力である本 enum も構築できる必要があるため。`#[non_exhaustive]` を付け
+/// クレート外からの網羅 `match` を禁止する〔`SearchEngineKind` と同じ拡張点
+/// 保護。クレート内の網羅 `match`（`sql::explain::ann_plan_token` 等）は
+/// `#[non_exhaustive]` の影響を受けない〕）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AnnPlan {
+#[non_exhaustive]
+pub enum AnnPlan {
     /// エンジンが `SearchEngineKind::Hnsw` でない（`hnsw_cache` が `None`）ため
     /// 常に全件 brute-force。`SearchEngineKind` が既知（`CpuScalarBruteForce`／
     /// `ParallelBruteForce`）の場合のみこの分類を返す。
@@ -2395,12 +2403,15 @@ pub(crate) enum AnnPlan {
 }
 
 /// [`classify_ann_plan`] の入力（`sql::exec::execute_statement_with_cache` と
-/// `sql::explain` 双方が同じ形へ組み立てる）。
+/// `sql::explain` 双方が同じ形へ組み立てる）。TASK-186・NOSQL-10 の前提として
+/// Issue #730 で公開 API へ昇格した（フィールドはすべて `bool` でテナント存在
+/// 情報を持たないため、`#[non_exhaustive]` は付けずクレート外が構造体リテラルで
+/// 直接組み立てられるようにする）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AnnShapeInput {
+pub struct AnnShapeInput {
     /// `hnsw_cache.is_some()`（`EngineCore::hnsw_state` の有無。
     /// `SearchEngineKind::Hnsw` opt-in 構築時のみ `true`）。
-    pub(crate) hnsw_enabled: bool,
+    pub hnsw_enabled: bool,
     /// `EngineCore::search_engine_kind().is_none()`（`with_provider`／
     /// `from_storage` 経由でカスタム provider を直接注入した構築経路。
     /// Issue #411 追記・codex-review P1 指摘・PR #437）。`hnsw_enabled == false`
@@ -2410,26 +2421,29 @@ pub(crate) struct AnnShapeInput {
     /// の 4 boolean（`hnsw_full_visible_eligible` 等）はこの分岐に依存しない
     /// （`UnknownCustomProvider` も `PlainScanEngine` も等しく `HnswFullVisible`／
     /// `HnswSubset` ではないため）ため、`sql::exec` は常に `false` を渡してよい。
-    pub(crate) engine_kind_unknown: bool,
+    pub engine_kind_unknown: bool,
     /// `Ranking::Hybrid` かどうか。分類本体（[`classify_ann_plan`]）は
     /// `is_hybrid` を参照しない（`FullVisible`／`Subset` の形状判定自体は
     /// `Ranking` の種別に依存しないため。上記コメント「Issue #410」参照）。
     /// `sql::exec` 側の 4 boolean 導出・判別テストが 1 つの構造体から
     /// 4 通りすべてを再現できるように、この構造体に残す。
-    pub(crate) is_hybrid: bool,
+    pub is_hybrid: bool,
     /// `bound.mode`（`USING PLAN` 経由の推定を含む）が `precision` か。
-    pub(crate) is_precision: bool,
+    pub is_precision: bool,
     /// `bound.metadata_filters` と `bound.expr_filters` がともに空か。
-    pub(crate) filters_empty: bool,
+    pub filters_empty: bool,
     /// `ExecutionPlan::from_evaluation_order(..).scalar_prefilter`
     /// （SCALAR 段が DISTANCE 段より先に評価されるか）。
-    pub(crate) scalar_prefilter: bool,
+    pub scalar_prefilter: bool,
 }
 
 /// [`AnnShapeInput`] から [`AnnPlan`] を決定する（純粋関数・副作用なし）。
 /// `sql::exec` の現行 4 式と同値であることは
 /// [`tests::classify_ann_plan_matches_exec_eligibility_truth_table`] で固定する。
-pub(crate) fn classify_ann_plan(input: AnnShapeInput) -> AnnPlan {
+/// TASK-186・NOSQL-10 の前提として Issue #730 で公開 API へ昇格した
+/// （`sql::explain::build_explain_result` が `EXPLAIN` と同じ `ann_plan:` 値を
+/// 返すための単一情報源を、engine クレート外からも共有できるようにするため）。
+pub fn classify_ann_plan(input: AnnShapeInput) -> AnnPlan {
     if !input.hnsw_enabled {
         return if input.engine_kind_unknown {
             AnnPlan::UnknownCustomProvider

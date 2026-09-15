@@ -26,7 +26,14 @@
 //! - [`plan`][]: `HINT ORDER(...)` の評価順序規則（RLS は暗黙事前フィルタ＋
 //!   [`crate::rls::RlsSafetyNet`]（TASK-136）による最終安全網の二重適用を維持し、
 //!   `HINT` で外せない。TASK-76・SQL-7・RLS-5）
-//! - [`exec`][]: 実行計画（既定 RLS→SCALAR→DISTANCE、`HINT ORDER` 指定時は [`plan`] に従う）
+//! - [`exec`][]: 実行計画（既定 RLS→SCALAR→DISTANCE、`HINT ORDER` 指定時は [`plan`] に従う）。
+//!   [`exec::execute_insert`] は TASK-186（NOSQL-6）の前提として Issue #730 で公開 API へ
+//!   昇格しており、engine クレート外からも呼べる（ファイル形 [`exec::execute_file_insert`]
+//!   は対象外のまま `pub(crate)`）
+//! - [`explain`][]: `EXPLAIN` 応答の構築（TASK-78・SQL-6）。`build_explain_result`・
+//!   `ExplainEngine`・[`AnnPlan`]・[`ScalarPlan`]・[`classify_ann_plan`]・
+//!   [`classify_scalar_plan`] は TASK-186（NOSQL-10）の前提として Issue #730 で
+//!   公開 API へ昇格しており、engine クレート外からも呼べる
 //! - [`mode`][]: 取得モード（`recall`／`precision`）の優先順位解決・セッション状態
 //!   （TASK-161・SQL-12）
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
@@ -102,7 +109,7 @@ pub mod aggregate;
 pub mod allowlist;
 pub(crate) mod arena_cache;
 pub mod exec;
-pub(crate) mod explain;
+pub mod explain;
 pub(crate) mod expr_program;
 pub mod group_by;
 pub(crate) mod hnsw_cache;
@@ -123,6 +130,14 @@ pub(crate) mod visible_cache;
 /// 内部実装として `pub(crate)` のまま維持する（codex-review 指摘対応）。
 pub use scalar_index::ScalarIndexCacheStats;
 pub use sparse_cache::SparseIndexCacheStats;
+
+/// [`explain::build_explain_result`]（TASK-186・NOSQL-10 の前提。Issue #730）が
+/// 要求する入力型・分類関数を外部から名前解決可能にするための再エクスポート。
+/// `hnsw_cache`（Issue #408・#409・#410 の索引キャッシュ実装本体）・
+/// `scalar_plan` モジュール自体は内部実装として `pub(crate)` のまま維持する
+/// （`ScalarIndexCacheStats`／`SparseIndexCacheStats` と同方針）。
+pub use hnsw_cache::{classify_ann_plan, AnnPlan, AnnShapeInput};
+pub use scalar_plan::{classify_scalar_plan, ScalarPlan, ScalarShapeInput};
 pub mod using_operation_id;
 pub(crate) mod using_plan;
 
