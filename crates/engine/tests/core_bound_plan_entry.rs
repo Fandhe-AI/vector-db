@@ -168,6 +168,39 @@ fn scan_entry_rejects_undefined_table_before_invoking_binder() {
     assert!(matches!(err, SqlSurfaceError::UndefinedTable { .. }));
 }
 
+/// PR #788 レビュー指摘（Issue #728）: `table` に識別子として形式不正な文字列
+/// （`catalog::validate_identifier` が `CatalogError::Invalid` を返す入力。
+/// ここでは英数字のみだが上限〔63 バイト〕超過の 64 バイト文字列を使う。
+/// SQL テキスト経由〔`validate_sql` → `TableLookup::table_exists` →
+/// `catalog::table_lookup_error`〕はこれを `wire_code` `42601`
+/// （`UnsupportedSyntax`）へ分類するため、本エントリでも `Internal`（`XX000`）
+/// ではなく同じ分類に丸め込まれることを固定する（`read_txn_with_schema` が
+/// 単一の写像本体 `catalog::table_lookup_error` を共有する契約）。
+#[test]
+fn scan_entry_classifies_malformed_table_name_same_as_sql_path() {
+    let path = unique_db_path("bound-plan-scan-malformed-table");
+    let _guard = CleanupGuard(path.clone());
+    let core = open_engine_core(&path);
+    let ctx_a = ctx_for("tenant-a");
+    let session = SessionState::default();
+    let malformed_table = "a".repeat(64);
+
+    let binder_called = std::sync::atomic::AtomicBool::new(false);
+    let err = core
+        .execute_bound_scan_in_session(&ctx_a, &session, &malformed_table, |_schema, _udfs| {
+            binder_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            unreachable!("binder must not be invoked for a malformed table name");
+        })
+        .expect_err("malformed table name should be rejected before the binder runs");
+
+    assert!(!binder_called.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        matches!(err, SqlSurfaceError::UnsupportedSyntax { .. }),
+        "expected UnsupportedSyntax (42601), got {err:?}"
+    );
+    assert_eq!(err.wire_code(), "42601");
+}
+
 #[test]
 fn scan_entry_propagates_binder_error_unchanged() {
     let path = unique_db_path("bound-plan-scan-binder-error");
@@ -255,6 +288,34 @@ fn aggregate_entry_matches_sql_path_and_shares_visible_bitmap_cache() {
         stats.hits >= 1,
         "expected at least one VisibleBitmapCache hit, got {stats:?}"
     );
+}
+
+/// `scan_entry_classifies_malformed_table_name_same_as_sql_path` と同じ判断
+/// （PR #788 レビュー指摘・Issue #728）を `execute_bound_aggregate_in_session`
+/// 側にも固定する。
+#[test]
+fn aggregate_entry_classifies_malformed_table_name_same_as_sql_path() {
+    let path = unique_db_path("bound-plan-aggregate-malformed-table");
+    let _guard = CleanupGuard(path.clone());
+    let core = open_engine_core(&path);
+    let ctx_a = ctx_for("tenant-a");
+    let session = SessionState::default();
+    let malformed_table = "a".repeat(64);
+
+    let binder_called = std::sync::atomic::AtomicBool::new(false);
+    let err = core
+        .execute_bound_aggregate_in_session(&ctx_a, &session, &malformed_table, |_schema, _udfs| {
+            binder_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            unreachable!("binder must not be invoked for a malformed table name");
+        })
+        .expect_err("malformed table name should be rejected before the binder runs");
+
+    assert!(!binder_called.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        matches!(err, SqlSurfaceError::UnsupportedSyntax { .. }),
+        "expected UnsupportedSyntax (42601), got {err:?}"
+    );
+    assert_eq!(err.wire_code(), "42601");
 }
 
 #[test]

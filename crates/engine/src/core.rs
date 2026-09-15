@@ -2060,9 +2060,17 @@ impl EngineCore {
                 CatalogError::TableNotFound(name) => {
                     crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
                 }
-                other => crate::sql::allowlist::SqlSurfaceError::Internal {
-                    detail: format!("failed to load table schema: {other}"),
-                },
+                // `CatalogError::Invalid`（識別子形式不正）は `catalog::table_lookup_error`
+                // （`impl TableLookup for Storage` と共有する単一の写像本体）へ委譲し、
+                // SQL 表層（`validate_sql` の `TableLookup::table_exists` 経由）と同じ
+                // `42601`（unsupported syntax）へ分類する。ここで独自に `Internal`
+                // （`XX000`）へ丸め込むと、[`Self::execute_bound_scan_in_session`]・
+                // [`Self::execute_bound_aggregate_in_session`] のドキュメンテーション
+                // コメントが謳う「SQL 経路と同一のエラー分類・露出範囲」契約が、
+                // 不正なテーブル名に対してだけ破られてしまう（Issue #728 PR #788
+                // レビュー指摘）。`Invalid` 以外（`Backend`／`CorruptSchema` 等の内部
+                // 破損系）は `table_lookup_error` 内で引き続き `Internal` に丸め込まれる。
+                other => crate::catalog::table_lookup_error(other),
             },
         )?;
         Ok((read_txn, schema))
