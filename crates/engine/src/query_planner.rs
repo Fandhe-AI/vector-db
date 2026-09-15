@@ -14,10 +14,11 @@
 //!
 //! 依存は追加しない（dependency-policy.md）。HTTP クライアントは
 //! `std::net::TcpStream` 上に POST・`Content-Length`／chunked 応答対応の最小限の
-//! HTTP/1.1 クライアントを自作し（本リポが pg wire v3 を自作している方針と整合。
-//! 汎用 HTTP クライアント化はしない）、JSON はリクエスト組み立て用の文字列エスケープと
-//! 応答パース用の最小 JSON パーサを本モジュール内に閉じて自作する（`dictionary.rs` が
-//! 正規表現を手書きパーサで代替した前例に倣う）。
+//! HTTP/1.1 クライアントを自作する（本リポが pg wire v3 を自作している方針と整合。
+//! 汎用 HTTP クライアント化はしない）。JSON はリクエスト組み立て用の文字列エスケープを
+//! 本モジュール内に閉じて自作する一方、応答パース用の最小 JSON パーサは共有モジュール
+//! [`crate::json`] を利用する（Issue #731 で移設。TASK-172・NOSQL-8 の将来コンシューマ
+//! と共有するため）。
 //!
 //! `crate::sql::mode::SearchMode` への依存（TASK-164・PLAN-11）: `QueryExpansion::mode_hint`
 //! の型として使う新しい結合。モジュール外部（LLM プロセス・SQL 表層）への結線は
@@ -51,7 +52,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use std::collections::BTreeMap;
+use crate::json::{self, JsonError, JsonValue};
 
 /// [`LlmClient::complete`] の失敗理由。メッセージは英語
 /// （japanese-style.md: プログラム出力文字列は英語）。プロンプト本文・応答本文は
@@ -401,332 +402,6 @@ pub struct EmbeddedQuery {
     pub embedding: Vec<f32>,
 }
 
-// ---------------------------------------------------------------------------
-// 最小 JSON 値・パーサ（依存追加なし。応答パース専用）
-// ---------------------------------------------------------------------------
-
-/// 最小 JSON パーサが受理するネスト深さの上限（スタック消費・DoS 対策）。
-const MAX_JSON_DEPTH: usize = 16;
-/// JSON 文字列リテラル 1 つあたりの最大文字数（トランスポート層の DoS 対策専用の
-/// 緩い上限）。本パーサは Ollama `/api/generate` 応答本体（`response` フィールドに
-/// LLM の生成テキスト全体を、`context` 配列にトークン列を含みうる）と、そこから
-/// 抽出した展開結果 JSON の両方に使い回す。展開結果側の意味的な上限
-/// （検索語件数・各語長・ヒント長）は [`MAX_SEARCH_TERMS`]・[`MAX_TERM_LEN`]・
-/// [`MAX_HINT_LEN`] として [`parse_expansion`] が独立に検証するため、本パーサ自身の
-/// 上限はメモリ確保量を [`MAX_RESPONSE_BYTES`] 相当に頭打ちさせるためだけの粗い
-/// バックストップでよい（狭すぎると実際の Ollama 応答を transport 層で拒否して
-/// しまう。1 文字 1 バイト以上を消費するため、応答本文の総バイト数上限
-/// [`MAX_RESPONSE_BYTES`] を超える文字数にはそもそも到達しない）。
-const MAX_JSON_STRING_CHARS: usize = MAX_RESPONSE_BYTES;
-/// JSON 配列・オブジェクトが保持できる要素数の上限（同上の理由でトランスポート層の
-/// 粗い上限。`context` 配列はプロンプト＋応答のトークン数に比例し数千要素になりうる）。
-const MAX_JSON_CONTAINER_ITEMS: usize = 65_536;
-
-#[derive(Debug, Clone, PartialEq)]
-enum JsonValue {
-    Null,
-    Bool(bool),
-    Number(f64),
-    String(String),
-    Array(Vec<JsonValue>),
-    Object(BTreeMap<String, JsonValue>),
-}
-
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsonParser<'a> {
-    fn new(s: &'a str) -> Self {
-        Self {
-            bytes: s.as_bytes(),
-            pos: 0,
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn bump(&mut self) -> Option<u8> {
-        let b = self.peek();
-        if b.is_some() {
-            self.pos += 1;
-        }
-        b
-    }
-
-    fn skip_ws(&mut self) {
-        while let Some(b) = self.peek() {
-            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn expect_byte(&mut self, expected: u8) -> Result<(), PlanError> {
-        match self.bump() {
-            Some(b) if b == expected => Ok(()),
-            _ => Err(PlanError::InvalidResponse),
-        }
-    }
-
-    fn parse_value(&mut self, depth: usize) -> Result<JsonValue, PlanError> {
-        if depth > MAX_JSON_DEPTH {
-            return Err(PlanError::InvalidResponse);
-        }
-        self.skip_ws();
-        match self.peek() {
-            Some(b'{') => self.parse_object(depth),
-            Some(b'[') => self.parse_array(depth),
-            Some(b'"') => self.parse_string().map(JsonValue::String),
-            Some(b't') | Some(b'f') => self.parse_bool(),
-            Some(b'n') => self.parse_null(),
-            Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
-            _ => Err(PlanError::InvalidResponse),
-        }
-    }
-
-    fn parse_object(&mut self, depth: usize) -> Result<JsonValue, PlanError> {
-        self.expect_byte(b'{')?;
-        let mut map = BTreeMap::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(JsonValue::Object(map));
-        }
-        loop {
-            self.skip_ws();
-            if map.len() >= MAX_JSON_CONTAINER_ITEMS {
-                return Err(PlanError::InvalidResponse);
-            }
-            let key = self.parse_string()?;
-            self.skip_ws();
-            self.expect_byte(b':')?;
-            let value = self.parse_value(depth + 1)?;
-            map.insert(key, value);
-            self.skip_ws();
-            match self.bump() {
-                Some(b',') => continue,
-                Some(b'}') => break,
-                _ => return Err(PlanError::InvalidResponse),
-            }
-        }
-        Ok(JsonValue::Object(map))
-    }
-
-    fn parse_array(&mut self, depth: usize) -> Result<JsonValue, PlanError> {
-        self.expect_byte(b'[')?;
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(JsonValue::Array(items));
-        }
-        loop {
-            if items.len() >= MAX_JSON_CONTAINER_ITEMS {
-                return Err(PlanError::InvalidResponse);
-            }
-            let value = self.parse_value(depth + 1)?;
-            items.push(value);
-            self.skip_ws();
-            match self.bump() {
-                Some(b',') => continue,
-                Some(b']') => break,
-                _ => return Err(PlanError::InvalidResponse),
-            }
-        }
-        Ok(JsonValue::Array(items))
-    }
-
-    fn parse_string(&mut self) -> Result<String, PlanError> {
-        self.expect_byte(b'"')?;
-        let mut out = String::new();
-        loop {
-            let b = self.bump().ok_or(PlanError::InvalidResponse)?;
-            match b {
-                b'"' => break,
-                b'\\' => {
-                    let esc = self.bump().ok_or(PlanError::InvalidResponse)?;
-                    match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{8}'),
-                        b'f' => out.push('\u{c}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let cp = self.parse_hex4()?;
-                            if (0xd800..=0xdbff).contains(&cp) {
-                                // 高位サロゲート: 直後に `\uXXXX` 形式の低位サロゲート
-                                // が続く場合のみ、正規のサロゲートペアとして 1 個の
-                                // 補助平面コードポイントへ復号する（絵文字等）。
-                                if self.bump() != Some(b'\\') || self.bump() != Some(b'u') {
-                                    return Err(PlanError::InvalidResponse);
-                                }
-                                let low = self.parse_hex4()?;
-                                if !(0xdc00..=0xdfff).contains(&low) {
-                                    // 低位サロゲートが続かない = 孤立した高位サロゲート。
-                                    // 破損文字列を U+FFFD へ丸めて正常応答として返すと
-                                    // fail-closed 方針に反するため拒否する
-                                    // （codex-review PR #252 P2 指摘）。
-                                    return Err(PlanError::InvalidResponse);
-                                }
-                                let scalar = 0x10000u32
-                                    + (u32::from(cp) - 0xd800) * 0x400
-                                    + (u32::from(low) - 0xdc00);
-                                out.push(char::from_u32(scalar).ok_or(PlanError::InvalidResponse)?);
-                            } else if (0xdc00..=0xdfff).contains(&cp) {
-                                // ペアの相方を伴わない孤立した低位サロゲートも不正な
-                                // JSON 文字列表現であり、fail-closed に拒否する。
-                                return Err(PlanError::InvalidResponse);
-                            } else {
-                                out.push(
-                                    char::from_u32(u32::from(cp))
-                                        .ok_or(PlanError::InvalidResponse)?,
-                                );
-                            }
-                        }
-                        _ => return Err(PlanError::InvalidResponse),
-                    }
-                }
-                // 生の制御文字は JSON 仕様上不正（要エスケープ）。fail-closed に拒否する。
-                0x00..=0x1f => return Err(PlanError::InvalidResponse),
-                _ => {
-                    // マルチバイト UTF-8 継続バイトも含め、そのままバイト列として
-                    // 再構成する（`str::from_utf8` 相当の妥当性は元の `&str` 入力が
-                    // 既に保証しているため、1 バイトずつ ASCII 相当のみを個別処理し
-                    // それ以外はバイト列を後段でまとめて UTF-8 復元する）。
-                    let start = self.pos - 1;
-                    let mut end = self.pos;
-                    while let Some(next) = self.peek() {
-                        if next == b'"' || next == b'\\' || next < 0x20 {
-                            break;
-                        }
-                        end += 1;
-                        self.pos += 1;
-                    }
-                    // untrusted 入力経路のため添字アクセスではなく `get()` で明示的に
-                    // 検証する（coding-rust.md）。`start`・`end` は上の走査で
-                    // 常に `self.bytes` の範囲内に収まるが、範囲外を返す実装変更に
-                    // 対しても fail-closed に振る舞う。
-                    let Some(slice) = self.bytes.get(start..end) else {
-                        return Err(PlanError::InvalidResponse);
-                    };
-                    let Ok(s) = std::str::from_utf8(slice) else {
-                        return Err(PlanError::InvalidResponse);
-                    };
-                    out.push_str(s);
-                }
-            }
-            if out.chars().count() > MAX_JSON_STRING_CHARS {
-                return Err(PlanError::InvalidResponse);
-            }
-        }
-        Ok(out)
-    }
-
-    fn parse_hex4(&mut self) -> Result<u16, PlanError> {
-        let mut value: u16 = 0;
-        for _ in 0..4 {
-            let b = self.bump().ok_or(PlanError::InvalidResponse)?;
-            let digit = match b {
-                b'0'..=b'9' => b - b'0',
-                b'a'..=b'f' => b - b'a' + 10,
-                b'A'..=b'F' => b - b'A' + 10,
-                _ => return Err(PlanError::InvalidResponse),
-            };
-            value = value
-                .checked_mul(16)
-                .and_then(|v| v.checked_add(u16::from(digit)))
-                .ok_or(PlanError::InvalidResponse)?;
-        }
-        Ok(value)
-    }
-
-    fn parse_bool(&mut self) -> Result<JsonValue, PlanError> {
-        // untrusted 入力経路のため添字アクセスではなく `get()` で明示的に検証する
-        // （coding-rust.md）。範囲外なら `unwrap_or(&[])` で空スライスとして扱い、
-        // `starts_with` が自然に `false` を返す（fail-closed）。
-        let rest = self.bytes.get(self.pos..).unwrap_or(&[]);
-        if rest.starts_with(b"true") {
-            self.pos += 4;
-            Ok(JsonValue::Bool(true))
-        } else if rest.starts_with(b"false") {
-            self.pos += 5;
-            Ok(JsonValue::Bool(false))
-        } else {
-            Err(PlanError::InvalidResponse)
-        }
-    }
-
-    fn parse_null(&mut self) -> Result<JsonValue, PlanError> {
-        let rest = self.bytes.get(self.pos..).unwrap_or(&[]);
-        if rest.starts_with(b"null") {
-            self.pos += 4;
-            Ok(JsonValue::Null)
-        } else {
-            Err(PlanError::InvalidResponse)
-        }
-    }
-
-    fn parse_number(&mut self) -> Result<JsonValue, PlanError> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        let mut saw_digit = false;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-            saw_digit = true;
-        }
-        if self.peek() == Some(b'.') {
-            self.pos += 1;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
-                self.pos += 1;
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        if !saw_digit || self.pos - start > 64 {
-            return Err(PlanError::InvalidResponse);
-        }
-        let Some(slice) = self.bytes.get(start..self.pos) else {
-            return Err(PlanError::InvalidResponse);
-        };
-        let Ok(text) = std::str::from_utf8(slice) else {
-            return Err(PlanError::InvalidResponse);
-        };
-        text.parse::<f64>()
-            .map(JsonValue::Number)
-            .map_err(|_| PlanError::InvalidResponse)
-    }
-}
-
-/// `s` 全体を単一の JSON 値としてパースする（末尾に余分な非空白文字があれば拒否する。
-/// 上限は [`MAX_JSON_DEPTH`]・[`MAX_JSON_STRING_CHARS`]・[`MAX_JSON_CONTAINER_ITEMS`]）。
-fn parse_json(s: &str) -> Result<JsonValue, PlanError> {
-    let mut parser = JsonParser::new(s);
-    let value = parser.parse_value(0)?;
-    parser.skip_ws();
-    if parser.pos != parser.bytes.len() {
-        return Err(PlanError::InvalidResponse);
-    }
-    Ok(value)
-}
-
 /// `s` の中から最初のバランスの取れた JSON オブジェクト（`{`〜対応する `}`）を抽出する。
 /// LLM 応答にコードフェンス（```` ```json ... ``` ````）や前後の説明文が混じっていても、
 /// 最初に現れる完結した `{...}` を拾える（文字列リテラル内の `{`/`}` は無視する）。
@@ -798,7 +473,7 @@ pub const MAX_HINT_LEN: usize = 256;
 /// fail-safe の解決契約は spec のビヘイビア定義〔PLAN-11〕を参照。
 pub fn parse_expansion(response: &str) -> Result<QueryExpansion, PlanError> {
     let json_text = extract_first_json_object(response).ok_or(PlanError::InvalidResponse)?;
-    let value = parse_json(json_text)?;
+    let value = json::parse_json(json_text)?;
     let JsonValue::Object(map) = value else {
         return Err(PlanError::InvalidResponse);
     };
@@ -886,6 +561,24 @@ pub const DEFAULT_OLLAMA_PORT: u16 = 11434;
 
 /// 1 回の応答本文として受理する最大バイト数（無制限確保を避ける安全弁）。
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+// `crate::json::MAX_JSON_STRING_CHARS`（応答パース用の共有 JSON パーサが持つ文字列長
+// 上限）は本モジュールの `MAX_RESPONSE_BYTES` と同じ実用上のサイズ感を意図した独立
+// 定数（Issue #731 で共有モジュールへ移設した際、コンシューマ非依存性のため相互参照を
+// 持たせない設計にした）。数値のズレが将来気づかれないよう、コンパイル時に一致を
+// 検証する。
+const _: () = assert!(crate::json::MAX_JSON_STRING_CHARS == MAX_RESPONSE_BYTES);
+
+/// [`json::parse_json`] の失敗（[`JsonError`]）を、本モジュールの応答検証失敗
+/// （[`PlanError::InvalidResponse`]）へ写像する。共有 JSON パーサは単一の不透明な
+/// 失敗理由のみを返す fail-closed 設計であり、本モジュール側もそれを緩めず常に
+/// `InvalidResponse` として扱う（`parse_expansion`・`extract_response_field` から
+/// `?` 演算子経由で利用）。
+impl From<JsonError> for PlanError {
+    fn from(_: JsonError) -> Self {
+        PlanError::InvalidResponse
+    }
+}
+
 /// HTTP 応答ヘッダ部（ステータス行＋ヘッダ）として受理する最大バイト数。
 const MAX_HTTP_HEADER_BYTES: usize = 8 * 1024;
 /// `Transfer-Encoding: chunked` デコード中にストリームから読み取る総バイト数
@@ -999,8 +692,8 @@ impl LlmClient for OllamaClient {
 }
 
 /// `out` の末尾へ JSON 文字列リテラル（引用符込み）として `s` をエスケープ出力する
-/// （リクエスト組み立て専用の最小エスケーパ。応答パースの [`JsonParser`] とは非対称の
-/// 単純な片方向処理で十分）。
+/// （リクエスト組み立て専用の最小エスケーパ。応答パース用の共有パーサ
+/// （[`crate::json::parse_json`]）とは非対称の単純な片方向処理で十分）。
 fn json_write_escaped_string(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
@@ -1543,7 +1236,7 @@ fn dechunk_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> Result<Vec<u8>, Pla
 /// Ollama `/api/generate`（`stream: false`）の JSON 応答本文から `response`
 /// フィールド（生成テキスト）を取り出す。
 fn extract_response_field(json_text: &str) -> Result<String, PlanError> {
-    let value = parse_json(json_text)?;
+    let value = json::parse_json(json_text)?;
     let JsonValue::Object(map) = value else {
         return Err(PlanError::InvalidResponse);
     };
@@ -1876,6 +1569,21 @@ mod tests {
         );
     }
 
+    // 回帰テスト（Issue #731）: `extract_first_json_object` はバランスの取れた
+    // `{...}` を抽出できる（＝この段は通過する）が、内部の JSON 構文自体が不正
+    // （配列の末尾カンマ）な入力。`json::parse_json` の `JsonError` が
+    // `From<JsonError> for PlanError` 経由で `PlanError::InvalidResponse` へ正しく
+    // 写像されることを固定する（共有モジュール移設後もこの経路が空振りにならない
+    // ことの確認）。
+    #[test]
+    fn parse_expansion_rejects_malformed_json_syntax() {
+        let response = r#"{"search_terms": ["a",], "path_hint": null, "kind_hint": null}"#;
+        assert_eq!(
+            parse_expansion(response).unwrap_err(),
+            PlanError::InvalidResponse
+        );
+    }
+
     #[test]
     fn parse_expansion_rejects_overlong_hint() {
         let long_hint = "x".repeat(MAX_HINT_LEN + 1);
@@ -1884,69 +1592,6 @@ mod tests {
         );
         assert_eq!(
             parse_expansion(&response).unwrap_err(),
-            PlanError::InvalidResponse
-        );
-    }
-
-    // --- 最小 JSON パーサ自体の回帰 ---
-
-    #[test]
-    fn parse_json_rejects_excess_nesting_depth() {
-        let mut s = String::new();
-        for _ in 0..(MAX_JSON_DEPTH + 4) {
-            s.push('[');
-        }
-        for _ in 0..(MAX_JSON_DEPTH + 4) {
-            s.push(']');
-        }
-        assert_eq!(parse_json(&s).unwrap_err(), PlanError::InvalidResponse);
-    }
-
-    #[test]
-    fn parse_json_rejects_trailing_garbage() {
-        assert_eq!(
-            parse_json("{}garbage").unwrap_err(),
-            PlanError::InvalidResponse
-        );
-    }
-
-    #[test]
-    fn parse_json_handles_escaped_unicode() {
-        let value = parse_json("\"\\u0041\\u0042\"").unwrap();
-        assert_eq!(value, JsonValue::String("AB".to_string()));
-    }
-
-    // 回帰テスト（codex-review PR #252 P2 指摘対応）: 正規のサロゲートペアは
-    // 補助平面のコードポイント 1 個へ復号され、孤立サロゲート（相方を伴わない
-    // 高位・低位サロゲート）は破損文字列を U+FFFD へ丸めて返さず fail-closed に
-    // 拒否する。
-    #[test]
-    fn parse_json_decodes_surrogate_pair_to_supplementary_plane_char() {
-        // U+1F600 (😀) の UTF-16 サロゲートペア表現。
-        let value = parse_json("\"\\ud83d\\ude00\"").unwrap();
-        assert_eq!(value, JsonValue::String("\u{1f600}".to_string()));
-    }
-
-    #[test]
-    fn parse_json_rejects_isolated_high_surrogate() {
-        assert_eq!(
-            parse_json("\"\\ud800\"").unwrap_err(),
-            PlanError::InvalidResponse
-        );
-    }
-
-    #[test]
-    fn parse_json_rejects_isolated_low_surrogate() {
-        assert_eq!(
-            parse_json("\"\\udc00\"").unwrap_err(),
-            PlanError::InvalidResponse
-        );
-    }
-
-    #[test]
-    fn parse_json_rejects_high_surrogate_not_followed_by_low_surrogate() {
-        assert_eq!(
-            parse_json("\"\\ud800\\u0041\"").unwrap_err(),
             PlanError::InvalidResponse
         );
     }
@@ -2171,8 +1816,8 @@ mod tests {
     // 回帰テスト（advisor 指摘対応）: 実際の Ollama `/api/generate` 非ストリーミング
     // 応答は `response`（LLM 生成テキスト全体。プロンプト接頭辞を大きく取るほど
     // 数千〜数万文字になりうる）に加え `context`（プロンプト＋応答のトークン列。
-    // 数千要素の整数配列）を含む。トランスポート層の JSON パーサ上限
-    // （`MAX_JSON_STRING_CHARS`/`MAX_JSON_CONTAINER_ITEMS`）が展開結果向けの狭い
+    // 数千要素の整数配列）を含む。共有 JSON パーサ（`crate::json`）のトランスポート層
+    // 上限（`MAX_JSON_STRING_CHARS`/`MAX_JSON_CONTAINER_ITEMS`）が展開結果向けの狭い
     // 上限のままだと、この現実的な応答形状を `InvalidResponse` として毎回拒否して
     // しまう（スタブが小さな応答しか返さない他のテストでは検知できなかった）。
     #[test]
