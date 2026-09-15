@@ -6,15 +6,21 @@
 //! プロトコル（HTTP-1〜13）であり、pg wire v3 互換実装（[`crate::framing`] 等）と
 //! 並ぶ、もう一方の表層の接続処理層に位置づく。
 //!
+//! エラー契約は SQL 表層（`wire_code` ＝ [`engine::error_format::ErrorClass`]）と
+//! 完全共有し、新規 `wire_code` は追加しない。本モジュール配下は `ErrorClass` を
+//! HTTP 上の表現（ステータス・応答本文等）へ写像する各要素、および要求側の
+//! パース処理を集約する。
+//!
 //! モジュール構成（現時点）:
 //! - [`request`]: 要求行（メソッド・ターゲット・バージョン）の解析（Issue #740・
 //!   TASK-173・HTTP-2, HTTP-11）
+//! - [`status`]: `ErrorClass` → HTTP ステータスの決定的射影（Issue #744・ERR-4）
+//! - [`error_body`]: `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - ヘッダパーサ（Issue #741。[`request::parse_request_line`] が返す
 //!   `consumed` オフセットから読み始める）
 //! - `Content-Type`／本文長上限の検証（Issue #742）
-//! - `ErrorClass` → HTTP ステータス／JSON エラー本文への写像（Issue #744, #745）
 //! - 応答エンコーダ（Issue #746）
 //! - 接続ハンドラ（ストリームからの有界読み取り・EOF 時の無応答クローズ判断。
 //!   Issue #747）
@@ -23,4 +29,6 @@
 //! PoC-15/TASK-182 は private 資産のためポインタ参照のみで、コード・所見は
 //! 転記しない）。
 
+pub mod error_body;
 pub mod request;
+pub mod status;
