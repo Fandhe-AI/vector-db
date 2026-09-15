@@ -2280,11 +2280,29 @@ pub fn project_id_only_rows(
     Ok(rows)
 }
 
-/// [`crate::sql::parser::BoundInsert`] を実行する（SQL-10、TASK-80）。
-/// `core.rs::EngineCore::execute_insert_sql` からのみ呼ばれる想定で、`Storage`・
-/// `PolicyContext` を束ねる（`execute_statement` と対称の役割）。クレート外へ公開する
-/// 契約は持たず、可視性は `pub(crate)` に留める（TASK-93・codex-review P1 指摘・PR #226:
-/// `ledger_mode` 引数の追加をソース互換性の破壊的変更として扱う必要をなくすため）。
+/// [`crate::sql::parser::BoundInsert`] を実行する（SQL-10、TASK-80。TASK-186・
+/// NOSQL-6 の前提として Issue #730 で公開 API へ昇格。`BoundScan`／`BoundAggregate`
+/// と同じ「同作法」で `execute_scan`／`execute_aggregate` に続く）。`core.rs::
+/// EngineCore::execute_insert_sql` からもクレート外からも呼べる（`execute_statement`
+/// と対称の役割）。
+///
+/// **公開してよい根拠**（ファイル形 [`execute_file_insert`] が `pub(crate)` に
+/// 閉じられている〔codex-review P1 指摘・PR #221〕のとの対比）: `operation_id`
+/// 必須化ガード（TASK-92・RECOVER-1）は本関数の**内部**で
+/// `ledger_mode.resolve(bound.operation_id.as_ref())` として適用される
+/// （呼び出し元の `sql::allowlist::validate_insert` に依存しない。下記
+/// ドキュメント参照）。`execute_file_insert` はこのガードを関数外
+/// （`sql::allowlist::validate_insert`）に依存する設計のため `pub(crate)` の
+/// まま維持する（`BoundFileInsert` を直接構築してガードを迂回できてしまうため。
+/// 対象外）。可視性は常に `Visibility::Private` に固定し、テナントは
+/// `ctx.tenant_id()` からのみ導出される（`BoundInsert` にテナント・可視性
+/// フィールドは存在しない）。重複検出は呼び出し元テナントの名前空間内に閉じる
+/// （TABLE-12・RLS-9。存在オラクルにならない）。`ledger_mode` に
+/// [`crate::recovery::required_op_id::LedgerMode::CompareOnlyWithoutLedger`]
+/// を渡す構成は本 Issue で新規に開いたバイパスではない
+/// （`core.rs::EngineCore::with_ledger_mode` で既にクレート外から選択可能）。
+/// `batch_limits.rs`（INDEX-4）のバッチ上限は本関数（単行 API）では適用しない
+/// （上限判定は呼び出し元の責務）。
 ///
 /// 行の書き込みはガードなし実体 [`crate::tenant::insert_typed_row_unchecked`]（`pub(crate)`）
 /// へ委譲する（TASK-95・TABLE-12・RLS-9。`operation_id` 必須化ガードは本関数の
@@ -2328,7 +2346,7 @@ pub fn project_id_only_rows(
 /// ため、ここで改めて `MissingOperationId` を返す経路は実質到達しない
 /// （`LedgerMode::CompareOnlyWithoutLedger` でのみ `None` になり得るが、その場合
 /// `resolve` は `LedgerWrite::Disabled` を返し、台帳へは触れない）。
-pub(crate) fn execute_insert(
+pub fn execute_insert(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
     bound: &crate::sql::parser::BoundInsert,
@@ -2414,7 +2432,9 @@ pub(crate) fn execute_insert(
 /// `core::EngineCore::execute_insert_sql` が `sql::allowlist::validate_insert` 経由で
 /// 適用済みであり、本関数自体はガードを持たない。クレート外へ公開すると
 /// `BoundFileInsert` を直接構築してガードを迂回できるため `pub(crate)` に閉じる
-/// （codex-review P1 指摘・PR #221。security.md P0）。
+/// （codex-review P1 指摘・PR #221。security.md P0）。行形 `INSERT`
+/// （[`execute_insert`]）はガードを関数内部で自己完結して適用するため
+/// Issue #730 で公開 API へ昇格した対比がある（本関数は対象外のまま）。
 pub(crate) fn execute_file_insert(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
