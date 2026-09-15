@@ -158,6 +158,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため test をスキップ"
 endif
 
+.PHONY: test-default-build
+test-default-build: ## 既定ビルド（feature fault-injection 無効）専用の回帰テストを実行する（Issue #710・#715。make test は --all-features のため対象外のテストをピンポイント実行）
+ifdef HAS_CARGO
+	cargo test -p fandhe-vector-db-wire-server --test wire_fault_injection_cli
+else
+	@echo "skip: Cargo.toml 未追加のため test-default-build をスキップ"
+endif
+
 .PHONY: crash-test
 crash-test: ## クラッシュ耐性回帰テスト（TASK-142・PERSIST-1。scripts/crash_test.sh を実行）
 ifdef HAS_CARGO
@@ -243,7 +251,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/simd_bench.rs）
