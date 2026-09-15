@@ -29,6 +29,9 @@
 //! - [`search_engine_opt`]: `--search-engine` opt-in CLI 引数の閉じた語彙
 //!   パーサ（Issue #656。`engine::search_engine::SearchEngineKind` へ
 //!   untrusted な CLI 文字列から到達する唯一の入口）
+//! - [`surface`]: `--surface` opt-in CLI 引数の閉じた語彙パーサ（Issue #734・
+//!   TASK-171／HTTP-1。SQL／NoSQL の 2 表層排他選択へ untrusted な CLI
+//!   文字列から到達する唯一の入口。NoSQL リスナー本体の配線は Issue #735）
 //! - `fault_injection`（feature `fault-injection` 限定・テスト専用。
 //!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
 //!   語彙パーサと、`simple_query::execute_and_respond` の登録ブロック内から
@@ -54,3 +57,4 @@ pub mod result_encoder;
 pub mod search_engine_opt;
 pub mod server;
 pub mod simple_query;
+pub mod surface;
