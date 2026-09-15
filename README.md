@@ -63,7 +63,8 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 
 ```bash
 cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアのパス> --db <redb ファイルのパス> \
-  [--bind 127.0.0.1:5432] [--search-engine default|hnsw|hnsw_f16|hnsw_i8] \
+  [--bind 127.0.0.1:5432] [--surface sql|nosql] \
+  [--search-engine default|hnsw|hnsw_f16|hnsw_i8] \
   [--hnsw-full-scan-ratio <num>/<den>] \
   [--hnsw-acorn-max-visible-ratio <num>/<den>] \
   [--hnsw-sparse-visited-max <N>]
@@ -73,6 +74,16 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
 fail-closed で起動を拒否します）。`--bind` 省略時は `127.0.0.1:5432`。psql・
 psycopg・node pg から無改造で cleartext password 認証つき接続できます
 （詳細: `docs/design/three-client-e2e-harness.md`）。
+
+`--surface`（Issue #734・TASK-171／HTTP-1）はクエリインターフェースを SQL
+表層（現行の PostgreSQL wire プロトコル）／NoSQL 表層（HTTP/1.1 最小
+サブセット。TASK-172 以降）の 2 択で排他選択する opt-in CLI 引数です。未指定
+（または `sql`）は現行どおり SQL wire のまま不変です。`sql`／`nosql` 以外の
+値・値欠落・2 回目以降の重複指定はいずれも fail-closed で起動エラーとなり、
+既定へ黙って読み替わることはありません。`nosql` はパーサとしては受理され
+ますが、NoSQL リスナー本体の配線は別 Issue（#735）の担当のため、それまでは
+起動を明示メッセージ付きで停止します（選ばれていない SQL wire を黙って
+listen する fail-open を避けるための暫定挙動）。
 
 `--search-engine`（Issue #656）は検索エンジン選択の opt-in CLI 引数です。
 `--planner-endpoint`／`--planner-model`／`--embedder-hashing-dim`
