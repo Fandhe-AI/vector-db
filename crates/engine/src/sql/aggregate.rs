@@ -1,7 +1,10 @@
 //! 集計 SELECT（`GROUP BY` なし・単一行結果、TASK-166・SQL-13）の実行本体。
 //! `GROUP BY` ありの複数行実行は [`crate::sql::group_by::execute_grouped_aggregate`]
-//! （TASK-167・SQL-14）が担い、[`execute_aggregate`] は `BoundAggregate::group_by`
-//! の有無で振り分けるだけの薄い分岐を持つ。
+//! （TASK-167・SQL-14）が担い、[`execute_aggregate_with_cache`] は
+//! `BoundAggregate::group_by` の有無で振り分けるだけの薄い分岐を持つ。
+//! [`execute_aggregate`] は engine クレート外向けの公開ラッパー（TASK-186・
+//! NOSQL-4・NOSQL-5）で `execute_aggregate_with_cache` へキャッシュ `None` で
+//! 委譲するのみ。
 //!
 //! 責務境界: [`crate::sql::parser::bind_aggregate`] が返す
 //! [`crate::sql::parser::BoundAggregate`] を受け取り、対象テーブルの行テーブル
@@ -569,13 +572,33 @@ pub(crate) fn storage_internal(e: impl Into<StorageError>) -> SqlSurfaceError {
     }
 }
 
+/// [`BoundAggregate`] を実行する（TASK-186・NOSQL-4・NOSQL-5 の公開 API）。従来の
+/// 5 引数シグネチャ（`execute_aggregate_with_cache`）を維持する薄いラッパー
+/// （Issue #357・#363 レビュー指摘対応を踏襲した [`crate::sql::exec::execute_statement`]
+/// と同じ設計判断: `visible_cache`・`arena_cache`・`scalar_cache` の各型が属する
+/// `sql::visible_cache`／`sql::arena_cache`／`sql::scalar_index` モジュールが
+/// いずれも `pub(crate)` のため crate 外から構築不能で、本関数はすべてに `None`
+/// を渡しキャッシュ最適化を経由しない新規走査のみの経路として動作する）。crate
+/// 内部のキャッシュ経路（`core.rs::EngineCore::execute_sql_in_session` の
+/// `Statement::Aggregate` アーム）は引き続き [`execute_aggregate_with_cache`] を
+/// 直接呼ぶ。
+pub fn execute_aggregate(
+    read_txn: &redb::ReadTransaction,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundAggregate,
+) -> Result<QueryResult, SqlSurfaceError> {
+    execute_aggregate_with_cache(read_txn, ctx, schema, bound, None, None, None)
+}
+
 /// [`crate::sql::parser::BoundAggregate`] を実行し、単一行の [`QueryResult`] を返す
 /// （TASK-166・SQL-13）。`read_txn` は呼び出し元（`core.rs::EngineCore::execute_sql_in_session`）
 /// が `schema` 取得と同一のトランザクションから渡す（既存の検索 SELECT 実行経路
 /// `sql::exec::execute_statement` と同じ「単一スナップショット」契約。Issue #56
 /// レビュー指摘対応の踏襲）。
-/// `Statement::Aggregate` の唯一の生産用エントリポイント（`core.rs`）は
-/// [`execute_aggregate_with_cache`] を使う（キャッシュを渡さない場合は `None`）。
+/// `Statement::Aggregate` の唯一の生産用エントリポイント（`core.rs`）は本関数を
+/// 直接使う（キャッシュを渡さない場合は `None`）。engine クレート外からは
+/// [`execute_aggregate`]（本モジュールの公開ラッパー）を使う。
 /// Issue #478: `GROUP BY` なし・`WHERE` なしの
 /// `DecodeTier::Fast`（`COUNT(*)`・`COUNT(id)`・`SUM`/`AVG`/`MIN`/`MAX(id)`）に
 /// 限り、`visible_cache`（`crate::sql::visible_cache::VisibleBitmapCache`）が

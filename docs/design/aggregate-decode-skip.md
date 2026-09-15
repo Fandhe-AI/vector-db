@@ -141,6 +141,11 @@ tenant プレフィクスの range scan 化等の更なる最適化はスコー�
 - 既存の結合テスト（`crates/engine/tests/sql_aggregate.rs`・`sql_group_by.rs`）は
   無変更のまま green（`WHERE`・`vec_norm` を含む式・`GROUP BY` 等の end-to-end oracle
   一致を維持）
+- `crates/engine/tests/sql_aggregate_public_api.rs`（TASK-186・NOSQL-4・NOSQL-5。
+  Issue #727）: `bind_aggregate`／`execute_aggregate`／`BoundAggregate` が engine
+  クレート外から到達可能であることの固定に加え、`GROUP BY` の有無での振り分け
+  （Issue #475 の列挙形フォールバック経路）・索引対応述語ありの `WHERE`・空集合契約
+  （`COUNT=0`・`SUM=NULL`）が公開ラッパー越しでも同一であることを確認
 
 ## 性能実測について（申し送り）
 

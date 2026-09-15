@@ -1023,13 +1023,32 @@ pub(crate) enum AggregateInput {
 }
 
 /// 束縛済みの集計項目 1 つ（TASK-166・SQL-13）。
+///
+/// フィールドは `pub(crate)` のまま公開しない（`BoundScan`・`BoundStatement` と
+/// 同じ作法）。クレート外からは [`Self::func`]／[`Self::name`] アクセサー経由で
+/// 読み取る。`input`（[`AggregateInput`]）は `ScalarExpr` variant が
+/// `pub(crate) mod` の [`crate::sql::expr_program::ExprProgram`] を保持するため
+/// 公開せず、アクセサーも設けない（TASK-186・NOSQL-4・NOSQL-5）。
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct BoundAggregateItem {
+#[non_exhaustive]
+pub struct BoundAggregateItem {
     pub(crate) func: crate::sql::allowlist::AggregateFunc,
     pub(crate) input: AggregateInput,
     /// `AS <alias>` の指定値、省略時は関数名小文字
     /// （[`crate::sql::allowlist::AggregateFunc::default_alias`]）。
     pub(crate) name: String,
+}
+
+impl BoundAggregateItem {
+    /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`）。
+    pub fn func(&self) -> crate::sql::allowlist::AggregateFunc {
+        self.func
+    }
+
+    /// 出力列名（`AS <alias>` の指定値、省略時は関数名小文字）。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// SELECT リストの出力列 1 つ（TASK-167・SQL-14）。`GROUP BY` なしの単一行集計
@@ -1083,8 +1102,19 @@ pub(crate) struct BoundGroupBy {
 /// `mode`・`evaluation_order`）を持たない（集計結果の順位付け・取得モードは
 /// `sql::group_by`（`GROUP BY` ありの場合のみ）が別途扱うため。
 /// [`crate::sql::allowlist::ValidatedAggregate`] のドキュメント参照）。
+///
+/// フィールドは `pub(crate)` のまま公開しない（`BoundScan`・`BoundStatement` と
+/// 同じ作法）。クレート外からはアクセサーメソッド経由で読み取る。`projection`
+/// （[`ProjectionColumn`]）・`group_by`（[`BoundGroupBy`]）は非公開のまま維持し
+/// （`GroupKey`/`Aggregate` の内部添字・`BoundHaving`/`BoundOrderBy` を経由しない
+/// 独立したアクセサーが必要になるため）、代わりに [`Self::has_group_by`] のみを
+/// 公開する。SQL テキストを経由しない直接構築（`BoundScan::new` 相当の
+/// `BoundAggregate::new`）は本 Issue の対象外（`AggregateInput`／`ExprProgram`／
+/// `ProjectionColumn`／`BoundGroupBy` の公開設計が必要なため。TASK-186・
+/// NOSQL-4・NOSQL-5）。
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct BoundAggregate {
+#[non_exhaustive]
+pub struct BoundAggregate {
     pub(crate) table: String,
     /// 集計項目（アキュムレータを持つ項目のみ。`GroupKey` 項目は含まない）。
     pub(crate) items: Vec<BoundAggregateItem>,
@@ -1098,6 +1128,40 @@ pub(crate) struct BoundAggregate {
     pub(crate) projection: Vec<ProjectionColumn>,
     /// `GROUP BY` 句（TASK-167・SQL-14）。`None` なら TASK-166・SQL-13 の単一行集計。
     pub(crate) group_by: Option<BoundGroupBy>,
+}
+
+impl BoundAggregate {
+    /// 束縛対象のテーブル名。
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// 集計項目一覧（アキュムレータを持つ項目のみ。`GROUP BY` 列は含まない）。
+    pub fn items(&self) -> &[BoundAggregateItem] {
+        &self.items
+    }
+
+    /// SCALAR 段で適用するメタデータフィルタ一覧（等価・前方一致、TASK-147・EXT-3）。
+    pub fn metadata_filters(&self) -> &[MetadataFilter] {
+        &self.metadata_filters
+    }
+
+    /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済み。
+    pub fn expr_filters(&self) -> &[crate::sql::udf_call::BoundExpr] {
+        &self.expr_filters
+    }
+
+    /// `WHERE` 句に RLS 相当の述語（テナント境界を表す条件）が含まれるか。
+    pub fn rls_predicate_present(&self) -> bool {
+        self.rls_predicate_present
+    }
+
+    /// `GROUP BY` 句を持つか（`true` なら
+    /// [`crate::sql::group_by::execute_grouped_aggregate`]（TASK-167・SQL-14）へ、
+    /// `false` なら単一行集計（TASK-166・SQL-13）へ振り分けられる）。
+    pub fn has_group_by(&self) -> bool {
+        self.group_by.is_some()
+    }
 }
 
 /// 集計項目 1 つの引数（[`crate::sql::allowlist::AggregateArg`]）を `schema` と
@@ -1183,12 +1247,15 @@ fn resolve_aggregate_input(
 
 /// [`crate::sql::allowlist::ValidatedAggregate`] を `schema`・UDF レジストリ `udfs`
 /// と照合して [`BoundAggregate`] へ束縛する（TASK-166・SQL-13 の公開 API。
-/// TASK-167・SQL-14 で `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT` の束縛を追加）。
+/// TASK-167・SQL-14 で `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT` の束縛を追加。
+/// TASK-186・NOSQL-4・NOSQL-5 で engine クレート外へ公開 API として昇格）。
 /// `WHERE` 句の意味論は [`bind_where_predicates`] を検索 SELECT
 /// （[`bind_in_session`]）と共有する。式ノード予算（[`crate::sql::udf_call::MAX_EXPR_NODES`]）
 /// は集計項目＋`WHERE` の全式項目で 1 文につき共有する（`bind_in_session` と同じ
-/// 歯止め）。
-pub(crate) fn bind_aggregate(
+/// 歯止め）。`stmt`（[`crate::sql::allowlist::ValidatedAggregate`]）に `pub`
+/// constructor が無いため、クレート外からの到達は現状
+/// [`crate::sql::allowlist::validate_sql`]（SQL テキスト経由）のみ。
+pub fn bind_aggregate(
     stmt: &crate::sql::allowlist::ValidatedAggregate,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
