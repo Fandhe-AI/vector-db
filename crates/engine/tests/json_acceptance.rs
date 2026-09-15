@@ -321,9 +321,12 @@ fn duplicate_keys() {
         r#"[{"a":1},{"a":2,"a":3}]"#,
     );
     assert_rejected("duplicate empty key", r#"{"":1,"":2}"#);
-    // `a` エスケープが復号後 `"a"` と等しいことを利用し、比較が復号後の
+    // `\u0061` エスケープが復号後 `"a"` と等しいことを利用し、比較が復号後の
     // キー文字列で行われている（生のリテラル一致ではない）ことを固定する。
-    assert_rejected("duplicate key literal vs escaped a", r#"{"a":1,"a":2}"#);
+    assert_rejected(
+        "duplicate key literal vs escaped a",
+        r#"{"a":1,"\u0061":2}"#,
+    );
 
     // NFC/NFD で異なるバイト列を持つキーは正規化されず別キーとして受理される
     // （バイト列相違＝別キー。復号後のキーで比較していることの証拠でもある）。
