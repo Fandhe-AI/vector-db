@@ -184,15 +184,23 @@ pub fn find_crlf_within(input: &[u8], max_len: usize) -> Result<Option<usize>, F
             .ok_or(FrameError::Malformed("crlf scan index out of range"))?;
         match byte {
             b'\r' => {
-                if i + 1 >= limit {
+                // 周辺コード（下の checked_add・呼び出し元の checked_sub 等）
+                // との様式統一のため checked_add(1) を使う。i < limit ≤
+                // input.len() ≤ isize::MAX なのでオーバーフローは実質発生
+                // しないが、万一の不変条件破れも panic ではなく Malformed で
+                // fail-closed に倒す。
+                let next = i
+                    .checked_add(1)
+                    .ok_or(FrameError::Malformed("crlf scan index overflow"))?;
+                if next >= limit {
                     // \r が窓の末尾にある。直後のバイトが未着（本当に途中）か、
                     // 上限に達していて読み進められないかのいずれかであり、
                     // ここでは判別できない。呼び出し元の Incomplete / 上限超過
                     // 判定に委ねるため「見つからなかった」として返す。
                     return Ok(None);
                 }
-                return match input.get(i + 1) {
-                    Some(b'\n') => Ok(Some(i + 1)),
+                return match input.get(next) {
+                    Some(b'\n') => Ok(Some(next)),
                     _ => Err(FrameError::Malformed("bare CR in request line")),
                 };
             }
@@ -338,6 +346,20 @@ mod tests {
         let input = vec![b'a'; MAX_REQUEST_LINE_LEN];
         let err = parse_request_line(&input).unwrap_err();
         assert_protocol_violation(&err);
+    }
+
+    #[test]
+    fn incomplete_when_trailing_cr_is_at_window_end_under_limit() {
+        // 上限未満の入力が `\r` で途切れている（`\n` がまだ届いていない）
+        // ケース。find_crlf_within の「\r が窓の末尾にある」分岐（上限超過
+        // 側は rejects_request_line_over_limit_with_crlf が経由）を、
+        // 上限未満側から通す。
+        let input = b"POST /x HTTP/1.1\r";
+        assert!(input.len() < MAX_REQUEST_LINE_LEN);
+        assert_eq!(
+            parse_request_line(input).expect("should not error while incomplete"),
+            RequestLineParse::Incomplete
+        );
     }
 
     #[test]
