@@ -8,15 +8,15 @@
 //! `crates/wire-server/src/fault_injection.rs` 側が担う。本ファイルは wire
 //! フレーミング・実プロセス越しの観測に専念する）。
 //!
-//! **既知のカバレッジ制約**: 既定ビルド（feature 無効）で `--fault-inject`
+//! **カバレッジ経路**: 既定ビルド（feature 無効）で `--fault-inject`
 //! が未知引数として拒否されることを固定する
 //! [`default_build_rejects_fault_inject_flag_as_unknown_argument`] は
-//! `cfg(not(feature = "fault-injection"))` の下でのみコンパイルされる。
-//! `make test`／CI は `--all-features` で実行するため、このテストは
-//! **CI では実行されない**。ローカルで
-//! `cargo test -p fandhe-vector-db-wire-server`（feature 無し）を別途実行
-//! することが唯一の検査手段（`docs/design/three-client-e2e-harness.md`
-//! 「Issue #705」節参照）。
+//! `cfg(not(feature = "fault-injection"))` の下でのみコンパイルされ、
+//! `--all-features` で走る `make test`／`rust-ci` の対象には入らない。
+//! この既定ビルド側の拒否契約は `make test-default-build`（`make ci` に
+//! 含む）・`.github/workflows/ci.yml` の独立ジョブ `test-default-build`
+//! が常時実行して検査する（Issue #705・#715・#716。
+//! `docs/design/three-client-e2e-harness.md`「Issue #705」節参照）。
 
 #[cfg(not(feature = "fault-injection"))]
 use std::process::Command;
