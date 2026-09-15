@@ -28,8 +28,14 @@ use crate::sql::udf_call::{BinOp, BoundExpr};
 
 /// [`classify_scalar_plan`] の分類結果。閉じた語彙（`sql::explain` の
 /// `scalar_plan:` 行の値と 1 対 1）。
+///
+/// TASK-186・NOSQL-10 の前提として Issue #730 で公開 API へ昇格した
+/// （`sql::hnsw_cache::AnnPlan` と同じ理由。`#[non_exhaustive]` により
+/// クレート外からの網羅 `match` を禁止する。クレート内の網羅 `match`
+/// （`sql::explain::scalar_plan_token` 等）は影響を受けない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScalarPlan {
+#[non_exhaustive]
+pub enum ScalarPlan {
     /// 索引を使わず全可視行を走査する（既定）。
     PlainScan,
     /// 索引対応述語がちょうど 1 件で、`TEXT` 列の等価条件。
@@ -43,16 +49,21 @@ pub(crate) enum ScalarPlan {
 }
 
 /// [`classify_scalar_plan`] の入力。`sql::exec`・`sql::using_plan::
-/// pre_check_bindable` の双方が同じ形へ組み立てる。
-pub(crate) struct ScalarShapeInput<'a> {
+/// pre_check_bindable` の双方が同じ形へ組み立てる。TASK-186・NOSQL-10 の前提
+/// として Issue #730 で公開 API へ昇格した（`metadata_filters`／
+/// `expr_filters` はいずれも既に `pub` な型〔`MetadataFilter`・`BoundExpr`〕の
+/// スライスで、`BoundStatement` のアクセサー経由で外部から得られるため、
+/// クレート外が構造体リテラルで直接組み立てられるようにする。
+/// `#[non_exhaustive]` は付けない）。
+pub struct ScalarShapeInput<'a> {
     /// `ExecutionPlan::from_evaluation_order(..).scalar_prefilter`
     /// （SCALAR 段が DISTANCE 段より先に評価されるか）。`false`（`HINT ORDER`
     /// による DISTANCE 先行・SCALAR 事後フィルタ）では索引を使わない
     /// （`sql::exec` の事後フィルタ経路は索引化の対象外。モジュール
     /// ドキュメント参照）。
-    pub(crate) scalar_prefilter: bool,
-    pub(crate) metadata_filters: &'a [MetadataFilter],
-    pub(crate) expr_filters: &'a [BoundExpr],
+    pub scalar_prefilter: bool,
+    pub metadata_filters: &'a [MetadataFilter],
+    pub expr_filters: &'a [BoundExpr],
 }
 
 /// `id <op> <数値リテラル>` へ正規化した式述語（左右いずれの位置で束縛されて
@@ -108,8 +119,9 @@ pub(crate) fn id_predicate_from_expr(expr: &BoundExpr) -> Option<IdPredicate> {
 
 /// [`ScalarShapeInput`] から [`ScalarPlan`] を決定する（純粋関数・副作用なし）。
 /// `sql::exec`（索引消費の可否判定）と `sql::explain`（`scalar_plan:` 行）が
-/// この関数だけを単一情報源として使う（モジュールドキュメント参照）。
-pub(crate) fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
+/// この関数だけを単一情報源として使う（モジュールドキュメント参照）。TASK-186・
+/// NOSQL-10 の前提として Issue #730 で公開 API へ昇格した。
+pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
     if !input.scalar_prefilter {
         return ScalarPlan::PlainScan;
     }

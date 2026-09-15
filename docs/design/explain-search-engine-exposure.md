@@ -103,7 +103,8 @@ Issue #497）・`acorn_max_visible_ratio`（ACORN-1 の 2-hop 展開切替閾値
   置換（ディスパッチ構造・適用条件そのものは無変更）
 - `crates/engine/src/sql/using_plan.rs`: `pre_check_bindable` の戻り値を
   `PreCheckShape { filters_empty }` へ拡張
-- `crates/engine/src/sql/explain.rs`: `ExplainEngine { kind, ann_plan }`・
+- `crates/engine/src/sql/explain.rs`: `ExplainEngine { kind, ann_plan,
+  scalar_plan }`（Issue #474 で `scalar_plan` フィールドを追加済み）・
   `build_explain_result(planned, engine)`（`engine_token`／`ann_plan_token` の
   網羅 `match`。新規行の閉じた語彙・非データ依存を機械的に固定するテストを含む）
 - `crates/engine/src/core.rs`: `Statement::Explain` アームで `ExplainEngine` を
@@ -150,6 +151,50 @@ brute-force かを判別できない。従来はこの場合も `hnsw_enabled ==
 は `engine_kind_unknown` を参照しない（常に `false` を渡す）ため実行時の適用
 条件は無変更。
 
+## 追記（Issue #730・NOSQL-10 の前提）
+
+`sql::exec::execute_insert` と並び、本 doc が扱う `sql::explain::
+build_explain_result` を `BoundScan`（Issue #726）・`BoundAggregate`
+（Issue #727）と同じ「同作法」で公開 API へ昇格した（`bind_scan`／
+`bind_aggregate` と異なり `build_explain_result` はもともと副作用のない純粋
+整形関数だったため、フィールドの非公開維持・アクセサー追加という形はそのまま
+踏襲しつつ、入力である `ExplainEngine`・`AnnPlan`・`ScalarPlan`・
+`classify_ann_plan`・`classify_scalar_plan` も併せて公開しないと呼べない点が
+`bind_scan`／`bind_aggregate` との違い）:
+
+- `sql.rs`: `mod explain` を `pub(crate)` → `pub` へ。`hnsw_cache::{AnnPlan,
+  AnnShapeInput, classify_ann_plan}`・`scalar_plan::{ScalarPlan,
+  ScalarShapeInput, classify_scalar_plan}` を `pub use` で再エクスポート
+  （`hnsw_cache`／`scalar_plan` モジュール自体は内部実装として `pub(crate)`
+  のまま維持）
+- `sql/explain.rs`: `ExplainEngine` を `#[non_exhaustive] pub struct` 化し
+  `Self::new`（構築）・`kind()`／`ann_plan()`／`scalar_plan()`（読み取り）を
+  追加。フィールド自体は `pub(crate)` のまま。`build_explain_result` を
+  `pub fn` 化
+- `sql/hnsw_cache.rs`: `AnnPlan` を `#[non_exhaustive] pub enum` 化。
+  `AnnShapeInput` は全フィールド `bool`（テナント存在情報を持たない）のため
+  `#[non_exhaustive]` は付けず `pub struct`（フィールドも `pub`）にして
+  クレート外から構造体リテラルで組み立てられるようにした。
+  `classify_ann_plan` を `pub fn` 化
+- `sql/scalar_plan.rs`: `ScalarPlan` を `#[non_exhaustive] pub enum` 化。
+  `ScalarShapeInput<'a>` は既に `pub` な型（`MetadataFilter`・`BoundExpr`）の
+  スライスのみを持つため `pub struct`（フィールドも `pub`）。
+  `classify_scalar_plan` を `pub fn` 化
+- `crates/engine/tests/sql_insert_explain_public_api.rs`（新設）:
+  `EngineCore::plan_query_with_mode` → `classify_ann_plan`／
+  `classify_scalar_plan` → `ExplainEngine::new` → `build_explain_result` を
+  engine クレート外から組み立てた結果が、SQL `EXPLAIN`（`execute_sql_in_
+  session` の `Statement::Explain` アーム）が実際に返す行と**行単位で完全
+  一致**することを固定（#765 の受け入れ条件の先取り）
+
+`PlannedQuery::new`（`pub(crate)` のまま）は対象外——外部は
+`EngineCore::plan_query_with_mode`（既存 `pub`）で `PlannedQuery` を取得する。
+`using_plan::pre_check_bindable`／`PreCheckShape` も対象外のまま（`sql::exec`
+の `EXPLAIN` アームは引き続き内部でこれを使う。外部は `AnnShapeInput`／
+`ScalarShapeInput` を自前で組み立てればよく、単一情報源（分類関数）は共有
+される）。
+
 ## ポインタ
 
-SQL-6・TASK-78・CORE-9・CORE-10・CORE-12・TASK-132・SEARCH-9・PLAN-11
+SQL-6・TASK-78・CORE-9・CORE-10・CORE-12・TASK-132・SEARCH-9・PLAN-11・
+TASK-186（NOSQL-6・NOSQL-10）
