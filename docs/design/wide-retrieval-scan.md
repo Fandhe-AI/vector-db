@@ -18,7 +18,8 @@
   `scan_small_limit_returns_subset_with_exact_count_and_no_leak`）・
   `crates/wire-server/tests/wire_scan.rs`（層 A）・
   `crates/wire-server/tests/extended_syntax_e2e.rs::three_clients_run_scan_where_nosort`
-  （層 B）
+  （層 B）・`crates/engine/tests/sql_scan_public_api.rs`（TASK-186・NOSQL-3。
+  `bind_scan`／`execute_scan`／`BoundScan` の公開 API 昇格の結合テスト。Issue #726）
 
 ## 背景
 

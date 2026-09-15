@@ -7,8 +7,9 @@
 //! を受け取り、対象テーブルの行テーブル（`user_rows/{table}`）を可視かつ `WHERE` を
 //! 満たす行が `LIMIT` 件集まった時点で走査を打ち切る早期終了付きで走査し、単一の
 //! [`crate::sql::exec::QueryResult`] を組み立てる。`core.rs::EngineCore::
-//! execute_sql_in_session` の `Statement::Scan` アームから呼ばれる（[`crate::sql`]
-//! モジュールドキュメント参照）。
+//! execute_sql_in_session` の `Statement::Scan` アームから呼ばれるほか、`bind_scan`・
+//! `execute_scan`・`BoundScan` は TASK-186（NOSQL-3）で公開 API へ昇格しており、
+//! engine クレート外からも直接呼べる（[`crate::sql`] モジュールドキュメント参照）。
 //!
 //! [`crate::sql::aggregate::execute_aggregate`] と同じ理由で
 //! [`crate::arena::VectorArena`]（既存の検索 SELECT 実行経路）は使わない: アリーナは
@@ -202,9 +203,11 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
     (tier, scalar_mask)
 }
 
-/// [`BoundScan`] を実行する（Issue #454 の公開 API。`core.rs::EngineCore::
-/// execute_sql_in_session` の `Statement::Scan` アームからのみ呼ばれる想定）。
-pub(crate) fn execute_scan(
+/// [`BoundScan`] を実行する（Issue #454・TASK-186・NOSQL-3 の公開 API）。
+/// `core.rs::EngineCore::execute_sql_in_session` の `Statement::Scan` アームから
+/// 呼ばれるほか、[`BoundScan`] が公開型へ昇格したため engine クレート外から
+/// SQL テキストを経由せず直接呼び出すこともできる（TASK-186・NOSQL-3）。
+pub fn execute_scan(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
     schema: &TableSchema,

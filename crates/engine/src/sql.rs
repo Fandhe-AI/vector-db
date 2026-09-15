@@ -43,7 +43,9 @@
 //! - [`scan`][]: ランキング段（`ORDER BY`／`USING PLAN`）を持たない広域取得
 //!   （ソートなしのフィルタ取得。`SELECT ... [WHERE ...] LIMIT n`。Issue #454）の
 //!   実行。[`aggregate`] と同じく `VectorArena` を経由しない redb 直接走査で、
-//!   `VECTOR` 列を持たないテーブルでも動作する
+//!   `VECTOR` 列を持たないテーブルでも動作する。`bind_scan`／`execute_scan`／
+//!   `BoundScan` は TASK-186（NOSQL-3）で公開 API へ昇格しており、SQL テキストを
+//!   経由しない直接束縛の入口として engine クレート外からも呼べる
 //!
 //! TASK-166（対象ビヘイビア: SQL-13）: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のみを結果列
 //! とする単一テーブル SELECT（C6a）を追加した。構文は [`allowlist`]（`Statement::Aggregate`）、

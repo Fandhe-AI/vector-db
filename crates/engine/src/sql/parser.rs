@@ -1280,26 +1280,103 @@ pub(crate) fn bind_aggregate(
 /// [`crate::sql::scan::execute_scan`] が直接実行する入力形。`BoundStatement` と
 /// 異なりランキング段固有のフィールド（`ranking`・`mode`・`evaluation_order`）を
 /// 持たない（[`crate::sql::allowlist::ValidatedScan`] のドキュメント参照）。
+///
+/// フィールドは `pub(crate)` のまま公開しない（`BoundStatement` と同じ作法。
+/// PR #188 レビュー指摘対応の方針を踏襲）。クレート外からはアクセサーメソッド
+/// 経由で読み取り、[`Self::new`] 経由で構築する（TASK-186・NOSQL-3。SQL テキストを
+/// 経由しない直接束縛の入口）。
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct BoundScan {
+#[non_exhaustive]
+pub struct BoundScan {
     pub(crate) table: String,
     pub(crate) projection: Vec<ProjectedColumn>,
     pub(crate) metadata_filters: Vec<MetadataFilter>,
     pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
     /// `expr_filters` をステップ列コンパイルした実行形（Issue #353。
     /// `BoundStatement::expr_filter_programs` と同じ 1 対 1 対応の契約）。
+    /// `sql::expr_program` が `pub(crate) mod` のためクレート外に型を出せず、
+    /// アクセサーは設けない（`BoundStatement::expr_filter_programs` と同じ判断）。
     pub(crate) expr_filter_programs: Vec<crate::sql::expr_program::ExprProgram>,
     /// `LIMIT` の検証済み値（`1..=core::MAX_SEARCH_K`。[`validate_search_limit`]）。
     pub(crate) limit: usize,
 }
 
+impl BoundScan {
+    /// クレート外から `BoundScan` を直接構築する constructor（TASK-186・NOSQL-3。
+    /// SQL テキストの構文解析・[`crate::sql::allowlist::validate_sql`] を経由せずに
+    /// 束縛済み実行計画を組み立てる入口）。`expr_filters` のステップ列コンパイル
+    /// （[`compile_expr_filter_programs`]）は内部で行う。
+    ///
+    /// **`limit` はここでは検証しない**（[`validate_search_limit`] は
+    /// `pub(crate)` のまま・SQL テキスト経由の [`bind_scan`] のみが検証を強制する。
+    /// `BoundStatement::new` と同じ設計判断）。ただし [`crate::sql::scan::execute_scan`]
+    /// は `bound.limit` の値によらず結果セットの累計バイト予算
+    /// （`MAX_SCAN_RESULT_BYTES`）で走査を打ち切るため、未検証の巨大な `limit` を
+    /// 渡しても無制限なメモリ確保には至らない（fail-closed。OWASP「不安全な設計」
+    /// 観点）。
+    pub fn new(
+        table: String,
+        projection: Vec<ProjectedColumn>,
+        metadata_filters: Vec<MetadataFilter>,
+        expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+        limit: usize,
+    ) -> Self {
+        let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
+        Self {
+            table,
+            projection,
+            metadata_filters,
+            expr_filters,
+            expr_filter_programs,
+            limit,
+        }
+    }
+
+    /// 束縛対象のテーブル名。
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// 投影対象の列一覧（`Row::id` 疑似列を含みうる）。
+    pub fn projection(&self) -> &[ProjectedColumn] {
+        &self.projection
+    }
+
+    /// SCALAR 段で適用するメタデータフィルタ一覧（等価・前方一致、TASK-147・EXT-3）。
+    pub fn metadata_filters(&self) -> &[MetadataFilter] {
+        &self.metadata_filters
+    }
+
+    /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済み。
+    pub fn expr_filters(&self) -> &[crate::sql::udf_call::BoundExpr] {
+        &self.expr_filters
+    }
+
+    /// `LIMIT` 句の値。
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+/// `expr_filters` を束縛時に 1 回だけステップ列コンパイルする（Issue #353）。
+/// [`bind_scan`]・[`BoundScan::new`] の双方が共有する（行ループでの再帰評価を
+/// なくす契約は SQL テキスト経由・直接構築経由のいずれでも同一）。
+fn compile_expr_filter_programs(
+    expr_filters: &[crate::sql::udf_call::BoundExpr],
+) -> Vec<crate::sql::expr_program::ExprProgram> {
+    expr_filters
+        .iter()
+        .map(crate::sql::expr_program::ExprProgram::compile)
+        .collect()
+}
+
 /// [`crate::sql::allowlist::ValidatedScan`] を `schema`・UDF レジストリ `udfs` と
-/// 照合して [`BoundScan`] へ束縛する（Issue #454 の公開 API）。投影・`WHERE` の
-/// 意味論は検索 SELECT（[`bind_in_session`]）・集計 SELECT（[`bind_aggregate`]）と
-/// 共有する（[`bind_projection`]・[`bind_where_predicates`]）。ランキング段
-/// （`ORDER BY`・`USING PLAN`）・取得モード（`USING MODE`）は関与しない
+/// 照合して [`BoundScan`] へ束縛する（Issue #454・TASK-186・NOSQL-3 の公開 API）。
+/// 投影・`WHERE` の意味論は検索 SELECT（[`bind_in_session`]）・集計 SELECT
+/// （[`bind_aggregate`]）と共有する（[`bind_projection`]・[`bind_where_predicates`]）。
+/// ランキング段（`ORDER BY`・`USING PLAN`）・取得モード（`USING MODE`）は関与しない
 /// （[`crate::sql::allowlist::ValidatedScan`] が構造上持たないため）。
-pub(crate) fn bind_scan(
+pub fn bind_scan(
     stmt: &crate::sql::allowlist::ValidatedScan,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
@@ -1315,10 +1392,7 @@ pub(crate) fn bind_scan(
 
     // Issue #353 と同じく、`expr_filters` を束縛時に 1 回だけステップ列コンパイル
     // する（行ループでの再帰評価をなくす）。
-    let expr_filter_programs = expr_filters
-        .iter()
-        .map(crate::sql::expr_program::ExprProgram::compile)
-        .collect();
+    let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
 
     Ok(BoundScan {
         table: stmt.table_name().to_string(),
