@@ -71,6 +71,33 @@ jobs:
       cache-key-prefix: vector-db
 
   # --------------------------------------------------
+  # test-default-build（既定ビルド専用の回帰テスト。Issue #710・#715）
+  # --------------------------------------------------
+  # rust-ci（reusable workflow）の test ジョブは `cargo test --workspace
+  # --all-features` で実行するため feature fault-injection が常に有効になり、
+  # 既定ビルド（feature 無効）時の挙動を検証する
+  # default_build_rejects_fault_inject_flag_as_unknown_argument
+  # （wire_fault_injection_cli）が実行対象に入らない。Makefile の
+  # test-default-build ターゲット（--all-features を付けない単体実行）を直接
+  # 呼び出す独立ジョブとして接続する（Bugbot 指摘・PR #718）。rust-ci
+  # （reusable workflow）とは異なり生の steps を持つ独立ジョブとして定義するため、
+  # 第三者 action（actions/checkout）は SHA 固定で参照する
+  # （AGENTS.md「CI・ワークフローの改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions のみ）。
+  # branch protection の必須チェックへ追加する運用は rust-ci と同様ユーザー作業（PR 本文参照）。
+  test-default-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run test-default-build
+        run: make test-default-build
+
+  # --------------------------------------------------
   # crash-test（クラッシュ耐性回帰テスト。TASK-142・対象ビヘイビア PERSIST-1）
   # --------------------------------------------------
   # プロセス外からの SIGKILL → 再起動 → 内容検証を行う回帰テスト（scripts/crash_test.sh）。
