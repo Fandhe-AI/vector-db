@@ -22,6 +22,10 @@ use std::collections::BTreeMap;
 use crate::error_format::{ClassifiedError, ErrorClass};
 
 /// [`parse_json`] が受理するネスト深さの上限（スタック消費・DoS 対策）。
+/// コンテナ（配列・オブジェクト）のネスト数の上限であり、`JsonParser::parse_object`・
+/// `JsonParser::parse_array`（いずれも非公開）の入口で `depth >= MAX_JSON_DEPTH` を
+/// 検査することで、空コンテナ（`[]`・`{}`）を最内に置いた場合でも 1 段多く受理して
+/// しまう off-by-one（Issue #733 の境界テストで検出）が生じない形に統一している。
 pub const MAX_JSON_DEPTH: usize = 16;
 /// JSON 文字列リテラル 1 つあたりの最大文字数（トランスポート層の DoS 対策専用の
 /// 緩い上限）。呼び出し元が意味的な上限（件数・長さ等）を独立に検証する前提の、
@@ -132,6 +136,12 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_object(&mut self, depth: usize) -> Result<JsonValue, JsonError> {
+        // コンテナ入口でも深さ上限を検査する（空オブジェクトを最内に置いた入力が
+        // `parse_value` の値ベース判定だけでは 1 段多く受理されてしまう off-by-one
+        // を防ぐ。`parse_value` 側の `depth > MAX_JSON_DEPTH` は多層防御として残置）。
+        if depth >= MAX_JSON_DEPTH {
+            return Err(JsonError);
+        }
         self.expect_byte(b'{')?;
         let mut map = BTreeMap::new();
         self.skip_ws();
@@ -168,6 +178,10 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_array(&mut self, depth: usize) -> Result<JsonValue, JsonError> {
+        // `parse_object` と同じ理由でコンテナ入口でも深さ上限を検査する。
+        if depth >= MAX_JSON_DEPTH {
+            return Err(JsonError);
+        }
         self.expect_byte(b'[')?;
         let mut items = Vec::new();
         self.skip_ws();
