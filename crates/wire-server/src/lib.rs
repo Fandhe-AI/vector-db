@@ -14,7 +14,9 @@
 //!   `http::status` は `ErrorClass` → HTTP ステータスの決定的射影（Issue #744・ERR-4）。
 //!   `http::error_body` は `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）。
 //!   `http::listener` は `--surface nosql` の accept ループ stub（Issue #735・
-//!   HTTP-9）。後続のヘッダ・本文検証・応答エンコーダ・接続ハンドラ本体は
+//!   HTTP-9）。`http::session` はセッション認証のトークン生成・base64url 表現
+//!   （TASK-174・HTTP-4・Issue #750。ストア・エンドポイントは後続 Issue の担当）。
+//!   後続のヘッダ・本文検証・応答エンコーダ・接続ハンドラ本体は
 //!   #741〜#747 が `http` 配下へ追加していく
 //! - [`bind_guard`]: bind アドレスの通信路保護要件検証（TLS 未構成時は loopback 限定。
 //!   TASK-70・WIRE-7）。`main.rs::run_server` の唯一の bind 経路

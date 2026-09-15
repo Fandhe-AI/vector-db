@@ -8,8 +8,8 @@
 //!
 //! エラー契約は SQL 表層（`wire_code` ＝ [`engine::error_format::ErrorClass`]）と
 //! 完全共有し、新規 `wire_code` は追加しない。本モジュール配下は `ErrorClass` を
-//! HTTP 上の表現（ステータス・応答本文等）へ写像する各要素、および要求側の
-//! パース処理を集約する。
+//! HTTP 上の表現（ステータス・応答本文等）へ写像する各要素、要求側の
+//! パース処理、およびセッション認証の構成要素を集約する。
 //!
 //! モジュール構成（現時点）:
 //! - [`request`]: 要求行（メソッド・ターゲット・バージョン）の解析（Issue #740・
@@ -20,6 +20,10 @@
 //!   を即クローズ。Issue #735・TASK-171／HTTP-1・HTTP-9）。`main.rs::run_server`
 //!   が SQL wire の [`crate::server::accept_loop_with_engine`] と排他選択で
 //!   呼ぶ唯一の呼び出し元
+//! - [`session`]: HTTP セッション認証の構成要素（トークン生成・エンコード等。
+//!   Issue #750・TASK-174・HTTP-4）。ストア・エンドポイント・Bearer 検証は
+//!   本モジュールの対象外（後続 Issue の担当。[`session`] のモジュール doc
+//!   を参照）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - ヘッダパーサ（Issue #741。[`request::parse_request_line`] が返す
@@ -36,4 +40,5 @@
 pub mod error_body;
 pub mod listener;
 pub mod request;
+pub mod session;
 pub mod status;
