@@ -7,8 +7,10 @@
 //! HTTP 上の表現（ステータス・応答本文等）へ写像する各要素を集約する。
 //!
 //! - [`status`]: `ErrorClass` → HTTP ステータスの決定的射影（Issue #744・ERR-4）
+//! - [`error_body`]: `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）
 //!
-//! 後続 Issue（JSON エラー本文エンコーダ・要求行/ヘッダ解析・応答エンコーダ等）が
+//! 後続 Issue（要求行/ヘッダ解析・応答エンコーダ等）が
 //! 本モジュール配下へ `pub mod` を追加していく。
 
+pub mod error_body;
 pub mod status;
