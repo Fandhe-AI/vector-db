@@ -146,6 +146,11 @@ tenant プレフィクスの range scan 化等の更なる最適化はスコー�
   クレート外から到達可能であることの固定に加え、`GROUP BY` の有無での振り分け
   （Issue #475 の列挙形フォールバック経路）・索引対応述語ありの `WHERE`・空集合契約
   （`COUNT=0`・`SUM=NULL`）が公開ラッパー越しでも同一であることを確認
+- `crates/engine/tests/core_bound_plan_entry.rs`（TASK-186・NOSQL-4・NOSQL-5。
+  Issue #728）: 単一 `Storage` 構成で SQL テキスト非経由に束縛済み集計計画を
+  実行するセッション対応エントリ `EngineCore::execute_bound_aggregate_in_session`
+  が、SQL テキスト経由と同じ `VisibleBitmapCache`（本 Issue のキャッシュ）を
+  共有することを固定。詳細は `docs/design/bound-plan-session-entry.md` 参照
 
 ## 性能実測について（申し送り）
 

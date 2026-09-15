@@ -2414,56 +2414,16 @@ impl EngineCore {
             // 行走査（`sql::aggregate::execute_aggregate`）を、既存の検索 SELECT
             // （`Statement::Select` アーム）と同じく単一の `read_txn`（同一
             // スナップショット）上で行う（Issue #56 レビュー指摘対応の踏襲。上記
-            // `Statement::Select` アームのドキュメント参照）。
+            // `Statement::Select` アームのドキュメント参照）。トランザクション・
+            // スキーマ取得は [`Self::read_txn_with_schema`] を、実行本体は
+            // [`Self::run_aggregate_plan`] を共有する（TASK-186・NOSQL-4・NOSQL-5:
+            // [`Self::execute_bound_aggregate_in_session`] が同じ実行本体を束縛済み
+            // 計画向けに再利用する）。
             crate::sql::allowlist::Statement::Aggregate(validated) => {
-                let read_txn = self.storage.db().begin_read().map_err(|e| {
-                    crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: format!(
-                            "failed to begin read transaction: {}",
-                            StorageError::from(e)
-                        ),
-                    }
-                })?;
-                let schema =
-                    crate::catalog::get_table_schema_in_txn(&read_txn, &validated.table_name)
-                        .map_err(|e| match e {
-                            CatalogError::TableNotFound(name) => {
-                                crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
-                            }
-                            other => crate::sql::allowlist::SqlSurfaceError::Internal {
-                                detail: format!("failed to load table schema: {other}"),
-                            },
-                        })?;
+                let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
                 let bound =
                     crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
-                // Issue #478: `GROUP BY` なしの `DecodeTier::Fast` 単一行集計
-                // （`COUNT(*)` 等）はテーブル世代整合済みの可視 `id` 集合
-                // （`VisibleBitmapCache`）がヒットすれば `user_rows/{table}` を
-                // 一切開かずに計算できる。`GROUP BY`（`sql::group_by`）はこの
-                // キャッシュの対象外のまま（詳細は `sql::visible_cache` ドキュメント
-                // 参照）。
-                let result = crate::sql::aggregate::execute_aggregate_with_cache(
-                    &read_txn,
-                    ctx,
-                    &schema,
-                    &bound,
-                    Some(crate::sql::visible_cache::VisibleCacheAccess {
-                        storage: &self.storage,
-                        cache: &self.visible_bitmap_cache,
-                    }),
-                    // Issue #475: 索引対応述語のみの `WHERE` 付き集計・
-                    // `GROUP BY` を `ScalarIndex` の候補削減・キー列挙経路へ
-                    // 結線する（詳細は `sql::aggregate`／`sql::group_by` の
-                    // モジュールドキュメント参照）。
-                    Some(crate::sql::arena_cache::ArenaCacheAccess {
-                        storage: &self.storage,
-                        cache: &self.sql_arena_cache,
-                    }),
-                    Some(crate::sql::scalar_index::ScalarCacheAccess {
-                        storage: &self.storage,
-                        cache: &self.scalar_index_cache,
-                    }),
-                )?;
+                let result = self.run_aggregate_plan(&read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             // Issue #454: 広域取得（ソートなしのフィルタ取得）は `Statement::Aggregate`
@@ -2471,28 +2431,14 @@ impl EngineCore {
             // （`sql::scan::execute_scan`）を単一の `read_txn`（同一スナップショット）
             // 上で行う。`VectorArena`（既存の検索 SELECT 実行経路）は経由しない
             // （`VECTOR` 列を持たないテーブルでも動作させるため。`sql::scan`
-            // モジュールドキュメント参照）。
+            // モジュールドキュメント参照）。トランザクション・スキーマ取得は
+            // [`Self::read_txn_with_schema`] を、実行本体は [`Self::run_scan_plan`]
+            // を共有する（TASK-186・NOSQL-3: [`Self::execute_bound_scan_in_session`]
+            // が同じ実行本体を束縛済み計画向けに再利用する）。
             crate::sql::allowlist::Statement::Scan(validated) => {
-                let read_txn = self.storage.db().begin_read().map_err(|e| {
-                    crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: format!(
-                            "failed to begin read transaction: {}",
-                            StorageError::from(e)
-                        ),
-                    }
-                })?;
-                let schema =
-                    crate::catalog::get_table_schema_in_txn(&read_txn, &validated.table_name)
-                        .map_err(|e| match e {
-                            CatalogError::TableNotFound(name) => {
-                                crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
-                            }
-                            other => crate::sql::allowlist::SqlSurfaceError::Internal {
-                                detail: format!("failed to load table schema: {other}"),
-                            },
-                        })?;
+                let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
                 let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
-                let result = crate::sql::scan::execute_scan(&read_txn, ctx, &schema, &bound)?;
+                let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             // TASK-78（SQL-6）: `EXPLAIN SELECT ... USING PLAN(...)` は検索本体
@@ -2673,6 +2619,139 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::Explain(result))
             }
         }
+    }
+
+    /// [`Self::execute_validated_in_session`] の `Statement::Scan` アーム・
+    /// [`Self::execute_bound_scan_in_session`] が共有する実行本体（TASK-186・
+    /// NOSQL-3）。`read_txn`・`schema` は呼び出し元が同一スナップショットから
+    /// 取得済みのものをそのまま渡す（`sql::scan::execute_scan` への単純な委譲。
+    /// `VectorArena` を経由しない redb 直接走査であることは `sql::scan`
+    /// モジュールドキュメント参照）。
+    fn run_scan_plan(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        ctx: &PolicyContext,
+        schema: &crate::catalog::TableSchema,
+        bound: &crate::sql::parser::BoundScan,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::scan::execute_scan(read_txn, ctx, schema, bound)
+    }
+
+    /// [`Self::execute_validated_in_session`] の `Statement::Aggregate` アーム・
+    /// [`Self::execute_bound_aggregate_in_session`] が共有する実行本体
+    /// （TASK-186・NOSQL-4・NOSQL-5）。`read_txn`・`schema` は呼び出し元が同一
+    /// スナップショットから取得済みのものをそのまま渡す。SQL 経路専用の
+    /// キャッシュ（`VisibleBitmapCache`〔Issue #478〕・`SqlArenaCache`
+    /// 〔Issue #363〕・`ScalarIndexCache`〔Issue #473〕）を配線した
+    /// `execute_aggregate_with_cache` を経由することで、束縛済み計画エントリ
+    /// （[`Self::execute_bound_aggregate_in_session`]）も SQL テキスト経由と
+    /// 同一のキャッシュ最適化を受ける（`sql::aggregate::execute_aggregate`
+    /// 〔公開ラッパー・キャッシュ非経由〕とは意図的に差別化する）。
+    fn run_aggregate_plan(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        ctx: &PolicyContext,
+        schema: &crate::catalog::TableSchema,
+        bound: &crate::sql::parser::BoundAggregate,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::aggregate::execute_aggregate_with_cache(
+            read_txn,
+            ctx,
+            schema,
+            bound,
+            Some(crate::sql::visible_cache::VisibleCacheAccess {
+                storage: &self.storage,
+                cache: &self.visible_bitmap_cache,
+            }),
+            Some(crate::sql::arena_cache::ArenaCacheAccess {
+                storage: &self.storage,
+                cache: &self.sql_arena_cache,
+            }),
+            Some(crate::sql::scalar_index::ScalarCacheAccess {
+                storage: &self.storage,
+                cache: &self.scalar_index_cache,
+            }),
+        )
+    }
+
+    /// 束縛済み広域取得計画（[`crate::sql::parser::BoundScan`]）を単一
+    /// スナップショット上で実行する（TASK-186・NOSQL-3。Issue #728）。SQL
+    /// テキストを経由せず束縛済み計画を直接実行したい呼び出し元（`wire-server`
+    /// の NoSQL 表層。TASK-175／TASK-177 のポインタ）向けのセッション対応
+    /// エントリで、単一の `Storage` を `EngineCore` が所有したまま
+    /// [`Self::execute_sql_in_session`] の `Statement::Scan` アームと同一の
+    /// トランザクション・スキーマ・実行本体（[`Self::run_scan_plan`]）を共有する
+    /// （`&redb::ReadTransaction` を要求する [`crate::sql::scan::execute_scan`] へ
+    /// クレート外から直接到達する手段が無いための第 2 の実行器を作らない設計。
+    /// `docs/design/bound-plan-session-entry.md` 参照）。
+    ///
+    /// 処理順は (1) `table` のスキーマを取得（`bind` はまだ呼ばない）、
+    /// (2) `bind(&schema, session.udfs())` で束縛済み計画を得る、(3) 得られた
+    /// 計画の対象テーブルが `table` と一致するか検証する、(4) 実行——の順。
+    /// `bind` の戻り値が `Err` の場合はそのまま伝播する（engine 側で分類を
+    /// 変えない）。テーブル不存在は [`Self::read_txn_with_schema`] と同じ
+    /// `UndefinedTable` へ丸め込む（SQL 経路と同一のエラー分類・露出範囲）。
+    ///
+    /// `bind` は `read_txn` が開いている間に呼ばれる（RLS 実装のための単一
+    /// スナップショット契約〔Issue #56〕を守るため、スキーマ取得と束縛の間に
+    /// 別トランザクションを挟めない設計）。したがって呼び出し元の `bind`
+    /// closure は純粋・軽量に保つこと（I/O・LLM 呼び出し等の重い処理を
+    /// closure 内で行わない）。
+    pub fn execute_bound_scan_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+        )
+            -> Result<crate::sql::parser::BoundScan, crate::sql::allowlist::SqlSurfaceError>,
+    {
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let bound = bind(&schema, session.udfs())?;
+        if bound.table() != table {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "bound scan plan targets a different table than requested",
+            ));
+        }
+        self.run_scan_plan(&read_txn, ctx, &schema, &bound)
+    }
+
+    /// 束縛済み集計計画（[`crate::sql::parser::BoundAggregate`]。`GROUP BY`
+    /// の有無を問わない）を単一スナップショット上で実行する（TASK-186・
+    /// NOSQL-4・NOSQL-5。Issue #728）。契約・設計判断は
+    /// [`Self::execute_bound_scan_in_session`] と同一（`docs/design/
+    /// bound-plan-session-entry.md` 参照）。実行本体は [`Self::run_aggregate_plan`]
+    /// を共有するため、SQL テキスト経由と同じキャッシュ最適化
+    /// （`VisibleBitmapCache`／`SqlArenaCache`／`ScalarIndexCache`）を受ける。
+    pub fn execute_bound_aggregate_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+        ) -> Result<
+            crate::sql::parser::BoundAggregate,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let bound = bind(&schema, session.udfs())?;
+        if bound.table() != table {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "bound aggregate plan targets a different table than requested",
+            ));
+        }
+        self.run_aggregate_plan(&read_txn, ctx, &schema, &bound)
     }
 
     /// `USING PLAN('<query>')`（TASK-77・SQL-5）経路のうち、スキーマに依存しない
