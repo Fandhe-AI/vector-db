@@ -11,8 +11,15 @@
 //! （`query_planner.rs::parse_expansion` が検索語件数・長さの意味的上限を独立に
 //! 検証する例を参照）。エラーは常に単一の不透明な [`JsonError`] のみを返し、
 //! 失敗理由（バイト位置等）を外部に漏らさない（fail-closed。security.md 準拠）。
+//!
+//! Issue #732（TASK-172・NOSQL-8 ポインタ）で、オブジェクトの重複キー拒否・数値
+//! リテラルの RFC 8259 準拠の厳格化を行った（先頭ゼロ・小数部/指数部の数字欠落等
+//! を拒否）。[`JsonError`] は [`crate::error_format::ClassifiedError`] を実装し、
+//! `wire_code()` で `42601`（`UnsupportedSqlSyntax`）を返す。
 
 use std::collections::BTreeMap;
+
+use crate::error_format::{ClassifiedError, ErrorClass};
 
 /// [`parse_json`] が受理するネスト深さの上限（スタック消費・DoS 対策）。
 pub const MAX_JSON_DEPTH: usize = 16;
@@ -30,6 +37,28 @@ pub const MAX_JSON_CONTAINER_ITEMS: usize = 65_536;
 /// （`query_planner.rs` の `impl From<JsonError> for PlanError` を参照）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JsonError;
+
+impl JsonError {
+    /// SQLSTATE 風 `wire_code`（coding-rust.md「エラー型は SQLSTATE 風 wire_code の
+    /// 設計に従う」）。[`ClassifiedError`] へ委譲する（実装型ごとに再定義しない。
+    /// `tenant.rs::TenantWriteError::wire_code` と同じパターン）。
+    pub fn wire_code(&self) -> &'static str {
+        ClassifiedError::wire_code(self)
+    }
+}
+
+/// [`parse_json`] の失敗はすべて「受理範囲外の構文」（`42601`）として写像する。
+/// 重複キー・非 RFC 8259 数値・深さ/件数/長さ上限超過のいずれも同じ分類とし、
+/// 内部詳細（バイト位置等）はクライアントへ運ばない（security.md P0）。
+impl ClassifiedError for JsonError {
+    fn error_class(&self) -> ErrorClass {
+        ErrorClass::UnsupportedSqlSyntax
+    }
+
+    fn client_message(&self) -> String {
+        "invalid JSON".to_string()
+    }
+}
 
 /// [`parse_json`] が返す JSON 値。オブジェクトは `BTreeMap` で保持するため、
 /// キーの反復順序はキー文字列の昇順で決定的になる（呼び出し元が結果を再現可能に
@@ -119,7 +148,15 @@ impl<'a> JsonParser<'a> {
             self.skip_ws();
             self.expect_byte(b':')?;
             let value = self.parse_value(depth + 1)?;
-            map.insert(key, value);
+            // RFC 8259 は重複キーの扱いをパーサ依存とするが、後勝ちで無警告に
+            // 上書きすると呼び出し元（NoSQL 表層等）が別実装と解釈を違えうる
+            // （confusion attack の温床）。fail-closed に拒否する（Issue #732）。
+            match map.entry(key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(value);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => return Err(JsonError),
+            }
             self.skip_ws();
             match self.bump() {
                 Some(b',') => continue,
@@ -284,20 +321,39 @@ impl<'a> JsonParser<'a> {
         }
     }
 
+    /// RFC 8259 `number = [ "-" ] int [ frac ] [ exp ]` に沿って明示的に検証する。
+    /// `int = "0" / ( digit1-9 *DIGIT )` を `match` の分岐そのもので表現している
+    /// ため、先頭ゼロの直後に数字が続く入力（`"01"` 等）は `Some(b'0')` 分岐が
+    /// 1 桁しか消費しない構造上、後続の桁が未消費のまま残り
+    /// `parse_json`（末尾ゴミ検査）または呼び出し元の走査で自然に拒否される
+    /// （本関数内では桁数を数えない）。`frac`・`exp` はそれぞれ「区切り文字の後に
+    /// 数字が 1 つも無い」場合（`"1."`・`"1e"`・`"1e+"` 等）を明示的に拒否する。
+    /// `+` 符号始まり・`.` 始まり・`NaN`／`Infinity` は呼び出し元 `parse_value` の
+    /// 分岐条件（`Some(b'-') | Some(b'0'..=b'9')` のときのみ本関数へ到達）により
+    /// 構造的に到達しないため、ここでは扱わない（Issue #732）。
     fn parse_number(&mut self) -> Result<JsonValue, JsonError> {
         let start = self.pos;
         if self.peek() == Some(b'-') {
             self.pos += 1;
         }
-        let mut saw_digit = false;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-            saw_digit = true;
+        match self.peek() {
+            Some(b'0') => self.pos += 1,
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err(JsonError),
         }
         if self.peek() == Some(b'.') {
             self.pos += 1;
+            let frac_start = self.pos;
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.pos += 1;
+            }
+            if self.pos == frac_start {
+                return Err(JsonError);
             }
         }
         if matches!(self.peek(), Some(b'e') | Some(b'E')) {
@@ -305,11 +361,15 @@ impl<'a> JsonParser<'a> {
             if matches!(self.peek(), Some(b'+') | Some(b'-')) {
                 self.pos += 1;
             }
+            let exp_start = self.pos;
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.pos += 1;
             }
+            if self.pos == exp_start {
+                return Err(JsonError);
+            }
         }
-        if !saw_digit || self.pos - start > 64 {
+        if self.pos - start > 64 {
             return Err(JsonError);
         }
         let Some(slice) = self.bytes.get(start..self.pos) else {
@@ -387,5 +447,87 @@ mod tests {
     #[test]
     fn parse_json_rejects_high_surrogate_not_followed_by_low_surrogate() {
         assert_eq!(parse_json("\"\\ud800\\u0041\"").unwrap_err(), JsonError);
+    }
+
+    // 重複キー拒否（Issue #732・TASK-172・NOSQL-8）: 後勝ちで無警告に上書きせず
+    // fail-closed に拒否する。トップレベル・ネスト先いずれも対象。
+    #[test]
+    fn parse_json_rejects_duplicate_key_at_top_level() {
+        let err = parse_json(r#"{"a":1,"a":2}"#).unwrap_err();
+        assert_eq!(err, JsonError);
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn parse_json_rejects_duplicate_key_in_nested_object() {
+        assert_eq!(parse_json(r#"{"a":{"b":1,"b":2}}"#).unwrap_err(), JsonError);
+    }
+
+    #[test]
+    fn parse_json_accepts_non_duplicate_keys() {
+        let value = parse_json(r#"{"a":1,"b":2}"#).unwrap();
+        match value {
+            JsonValue::Object(map) => {
+                assert_eq!(map.get("a"), Some(&JsonValue::Number(1.0)));
+                assert_eq!(map.get("b"), Some(&JsonValue::Number(2.0)));
+            }
+            _ => panic!("expected object"),
+        }
+    }
+
+    // 数値構文の RFC 8259 厳格化（Issue #732）: 先頭ゼロ・小数部/指数部の数字欠落
+    // 等の非準拠表記を拒否する。`+`／`.` 始まり・`NaN`／`Infinity` は
+    // `parse_value` の分岐条件により既に構造的に拒否されるため、ここでは
+    // その回帰防止のみ確認する。
+    #[test]
+    fn parse_json_rejects_non_rfc8259_numbers() {
+        let rejected = [
+            "01",
+            "-01",
+            "00",
+            "+1",
+            ".5",
+            "1.",
+            "1.e5",
+            "1e",
+            "1e+",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        ];
+        for input in rejected {
+            assert_eq!(
+                parse_json(input).unwrap_err(),
+                JsonError,
+                "expected rejection for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_json_accepts_rfc8259_numbers() {
+        let accepted: &[(&str, f64)] = &[
+            ("0", 0.0),
+            ("-0", -0.0),
+            ("0.5", 0.5),
+            ("-0.5", -0.5),
+            ("123", 123.0),
+            ("-123", -123.0),
+            ("1.5e10", 1.5e10),
+            ("1.5E-10", 1.5e-10),
+            ("0e0", 0.0),
+            ("100", 100.0),
+        ];
+        for (input, expected) in accepted {
+            let value =
+                parse_json(input).unwrap_or_else(|_| panic!("expected accept for {input:?}"));
+            assert_eq!(value, JsonValue::Number(*expected), "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_json_number_rejection_reports_unsupported_sql_syntax_wire_code() {
+        let err = parse_json("01").unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 }
