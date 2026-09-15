@@ -38,6 +38,9 @@ engine = { package = "fandhe-vector-db-engine", path = "../engine", version = "=
 # みで、発火経路自体は production の RECOVER-6 経路そのもの。詳細は
 # `docs/design/three-client-e2e-harness.md`「Issue #705」節）。`make lint`／
 # `make test` は `--all-features` のため CI でも常にコンパイル・実行される。
+# feature 無効（既定ビルド）側の `--fault-inject` 拒否契約は `make
+# test-default-build`（`make ci` に含む）・`ci.yml` の `test-default-build`
+# ジョブが検査する（Issue #715・#716）。
 fault-injection = []
 
 [[bench]]

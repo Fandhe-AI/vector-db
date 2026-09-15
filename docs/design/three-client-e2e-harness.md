@@ -176,7 +176,10 @@ INSERT で確実に発火する。
 API は一切露出しない（engine の `bench-internals` feature と同じ判断
 枠組み）。発火経路自体は production の RECOVER-6 経路そのもので、追加する
 のはトリガーだけ。`make lint`／`make test` は `--all-features` のため CI
-でも常にコンパイル・実行され、feature コードの腐敗を防ぐ。
+でも常にコンパイル・実行され、feature コードの腐敗を防ぐ。既定ビルド
+（feature 無効）側の `--fault-inject` 拒否契約は `make test-default-build`
+（`make ci` に含む）・`.github/workflows/ci.yml` の `test-default-build`
+ジョブが担う（Issue #715・#716）。
 
 **検証層**: 単体テスト（`crates/wire-server/src/fault_injection.rs`）は
 `is_committed_insert`／take-once の判定純関数のみを検証する（実発火は
@@ -189,11 +192,12 @@ abort・再オープン後の可視性）・arm 維持（SELECT・拒否され�
 挟んでも消費されない）を検証する。e2e 層（#706・`three_client_e2e.rs`）は
 本フラグを使って 3 クライアント経由の `D` 到達を確認する担当。
 
-**既知の制約**: `make test`／CI は `--all-features` のため
-`cfg(not(feature = "fault-injection"))` の既定ビルド拒否テスト
-（`default_build_rejects_fault_inject_flag_as_unknown_argument`）は CI では
-実行されない。`cargo test -p fandhe-vector-db-wire-server`（feature 無し）
-を別途ローカルで実行することが唯一の検査手段。
+**既定ビルド側の検査経路**: `make test`／`rust-ci` は `--all-features` の
+ため `cfg(not(feature = "fault-injection"))` の既定ビルド拒否テスト
+（`default_build_rejects_fault_inject_flag_as_unknown_argument`）はこの経路
+には入らない。この既定ビルド側の拒否契約は `make test-default-build`
+（`make ci` に含む）・`.github/workflows/ci.yml` の独立ジョブ
+`test-default-build` が常時実行して検査する（Issue #715・#716・PR #718）。
 
 ### Issue #706: 3 クライアントでの緊急応答 detail 到達検証
 
@@ -258,6 +262,9 @@ FATAL エラー結果の陰に隠して送出する。結果として `cur.execu
 - `wire-server --db <path>` が必須化された（省略時は fail-closed で
   起動拒否。匿名・揮発 DB の暗黙生成はしない）。
 - `Makefile` に `e2e-three-client`（opt-in・`ci` には含めない）を追加した。
+- `Makefile` に `test-default-build`（`ci` に含む）・
+  `.github/workflows/ci.yml` に同名の独立ジョブを追加し、既定ビルド拒否
+  テストを常時検査する経路を整備した（Issue #715・#716・PR #718）。
 - `crates/wire-server/Cargo.toml` に `fault-injection` feature（default 外）
   を追加し、`e2e-three-client` の `three_client_e2e` 行はこの feature 付きで
   ビルドするよう変更した（Issue #705）。
