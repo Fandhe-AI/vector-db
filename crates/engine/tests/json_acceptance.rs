@@ -321,6 +321,13 @@ fn duplicate_keys() {
         r#"[{"a":1},{"a":2,"a":3}]"#,
     );
     assert_rejected("duplicate empty key", r#"{"":1,"":2}"#);
+    // `\u0061` 単独のキーが復号後 `"a"` として受理されることを先に固定し、
+    // 直後の重複拒否がエスケープそのものの拒否ではなく復号後キー比較による
+    // ものだと切り分けられるようにする。
+    match assert_accepted("escaped key alone decodes to a", r#"{"\u0061":1}"#) {
+        JsonValue::Object(map) => assert!(map.contains_key("a"), "復号後キーは \"a\""),
+        other => panic!("expected object, got {other:?}"),
+    }
     // `\u0061` エスケープが復号後 `"a"` と等しいことを利用し、比較が復号後の
     // キー文字列で行われている（生のリテラル一致ではない）ことを固定する。
     assert_rejected(
