@@ -29,6 +29,10 @@
 //! - [`search_engine_opt`]: `--search-engine` opt-in CLI 引数の閉じた語彙
 //!   パーサ（Issue #656。`engine::search_engine::SearchEngineKind` へ
 //!   untrusted な CLI 文字列から到達する唯一の入口）
+//! - [`http`]: NoSQL 表層（`--surface nosql`）が使う自作 HTTP/1.1 最小
+//!   サブセットの転送路。現時点では要求行パーサ（Issue #740・TASK-173）の
+//!   み実装済み（`AGENTS.md` P1「Web API はスコープ外」とは別物である旨は
+//!   モジュール doc 参照）
 //! - `fault_injection`（feature `fault-injection` 限定・テスト専用。
 //!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
 //!   語彙パーサと、`simple_query::execute_and_respond` の登録ブロック内から
@@ -47,6 +51,7 @@ pub mod error_response;
 pub mod fault_injection;
 pub mod framing;
 pub mod handshake;
+pub mod http;
 pub mod limits;
 pub mod protocol_dispatch;
 pub(crate) mod response_buffer;
