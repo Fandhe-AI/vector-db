@@ -115,6 +115,12 @@ SELECT <投影（既存許可形: *, 列名列, 式項目〔UDF 含む〕）> FR
 - `crates/wire-server/`: 追加の変更なし（`EngineCore::execute_sql_in_session` を
   経由する既存の簡易クエリ経路がそのまま `Statement::Scan` を受理する）。
 
+`bind_scan`／`execute_scan`／`BoundScan` を engine クレート外へ `pub` 昇格し
+（TASK-186・NOSQL-3。Issue #726）、単一 `Storage` 構成で SQL テキスト非経由に
+束縛済み scan 計画を実行するセッション対応エントリ
+`EngineCore::execute_bound_scan_in_session` を追加した（Issue #728。詳細は
+`docs/design/bound-plan-session-entry.md` 参照）。
+
 ## スコープ外
 
 - SQL-15 自体の確定化（本リポ側の受け入れ確認・wire 経由 3 クライアント実測。
