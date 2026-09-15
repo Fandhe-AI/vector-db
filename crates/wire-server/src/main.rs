@@ -5,6 +5,7 @@
 //! 簡易クエリプロトコルを `engine::core::EngineCore` へ接続した）。
 //!
 //! CLI: `wire-server --users <path> --db <path> [--bind <addr:port>]
+//! [--surface sql|nosql]
 //! [--planner-endpoint <host:port> --planner-model <name>]
 //! [--embedder-hashing-dim <N>]
 //! [--search-engine default|hnsw|hnsw_f16|hnsw_i8]
@@ -15,6 +16,16 @@
 //! （既定 bind: `127.0.0.1:5432`）。`--db` は必須（省略時は fail-closed で
 //! 非 0 終了。匿名・揮発 DB の暗黙生成はしない。TASK-73・WIRE-1）。
 //!
+//! `--surface`（Issue #734・TASK-171／HTTP-1）: クエリインターフェースを
+//! SQL 表層（現行の PostgreSQL wire プロトコル）／NoSQL 表層（HTTP/1.1 最小
+//! サブセット。TASK-172 以降）の 2 択で排他選択する opt-in 注入点。未指定は
+//! `sql`（既定・現行経路のままビット同一）。値の解決は `surface::parse` に
+//! 一本化し、不正な値・値欠落・2 回目以降の重複指定はいずれも fail-closed で
+//! 起動エラー（既定へ黙って読み替えない）。`nosql` はパーサとしては受理する
+//! が、NoSQL リスナー本体の配線は Issue #735 の担当のため、それまでは
+//! bind 直前で明示メッセージ付きに非 0 終了する（選ばれていない SQL wire を
+//! 黙って listen する fail-open を避けるための暫定停止。#735 でリスナー分岐へ
+//! 置き換わる）。
 //! `--fault-inject post-commit-panic`（Issue #705。feature `fault-injection`
 //! 有効ビルド限定・**テスト専用**）: `INSERT` の commit 成功直後に自プロセスを
 //! 1 回だけ panic させ、TASK-97・RECOVER-6 の緊急応答
@@ -124,6 +135,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut users_path: Option<PathBuf> = None;
     let mut db_path: Option<PathBuf> = None;
     let mut bind_addr = DEFAULT_BIND.to_string();
+    let mut surface_raw: Option<String> = None;
     let mut planner_endpoint: Option<String> = None;
     let mut planner_model: Option<String> = None;
     let mut embedder_hashing_dim: Option<String> = None;
@@ -186,6 +198,28 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 };
                 embedder_hashing_dim = Some(v.clone());
+                i += 2;
+            }
+            wire_server::surface::FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires one of {:?}",
+                        wire_server::surface::FLAG,
+                        wire_server::surface::TOKENS
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #734: 起動後に変更できない構成値のため、
+                // `--search-engine`（D6）と同じ理由で 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if surface_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::surface::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                surface_raw = Some(v.clone());
                 i += 2;
             }
             "--search-engine" => {
@@ -368,6 +402,17 @@ fn run_server(args: &[String]) -> ExitCode {
         },
     };
 
+    // Issue #734: `--search-engine` と同じく bind・ユーザーストア読込より前に
+    // 決着させる（fail-closed。受理不能な構成のまま listen へ進む経路を
+    // 作らない）。
+    let surface = match resolve_surface(surface_raw.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wire-server: invalid {}: {e}", wire_server::surface::FLAG);
+            return ExitCode::FAILURE;
+        }
+    };
+
     let Some(users_path) = users_path else {
         eprintln!("wire-server: --users <path> is required (fail-closed: no anonymous login)");
         return ExitCode::FAILURE;
@@ -378,6 +423,18 @@ fn run_server(args: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+
+    // Issue #734: `nosql` 選択時は SQL wire リスナーを一切 bind しない
+    // （HTTP-1 の排他方針。選ばれていない表層を公開する fail-open を防ぐ）。
+    // NoSQL リスナー本体の配線は Issue #735 の担当のため、それまでは
+    // fail-closed に起動を停止する（#735 がこのブロックをリスナー分岐へ
+    // 置き換える）。
+    if surface == wire_server::surface::Surface::Nosql {
+        eprintln!(
+            "wire-server: --surface nosql: the NoSQL surface listener is not wired yet (Issue #735); refusing to start the SQL listener instead (fail-closed)"
+        );
+        return ExitCode::FAILURE;
+    }
 
     // TLS（TASK-72・WIRE-9）は未実装のため常に `Cleartext` を渡す。bind の
     // loopback 検証をユーザーストア読込より前に行うことで、ユーザーストアの
@@ -602,6 +659,19 @@ fn resolve_search_engine(
     }
 
     choice.to_engine_kind_with(tuning)
+}
+
+/// `--surface` の値（未指定は `None`）から [`wire_server::surface::Surface`]
+/// を解決する（Issue #734）。純関数として切り出し、`std::env::args()` を
+/// 直接読まずに単体テストできるようにする（`resolve_search_engine` と同じ
+/// 流儀）。`raw` が `None` は既定 `Surface::Sql`、[`wire_server::surface::
+/// TOKENS`] のいずれとも厳密一致しない場合は `Err`（fail-closed。既定へ
+/// 黙って読み替えない）。
+fn resolve_surface(raw: Option<&str>) -> Result<wire_server::surface::Surface, String> {
+    match raw {
+        None => Ok(wire_server::surface::Surface::Sql),
+        Some(raw) => wire_server::surface::parse(raw),
+    }
 }
 
 /// `hash-password` サブコマンド: stdin からパスワードを 1 行読み、新規 salt を
@@ -877,5 +947,44 @@ mod tests {
             err.contains(wire_server::search_engine_opt::SPARSE_VISITED_MAX_FLAG),
             "unexpected error: {err}"
         );
+    }
+
+    // Issue #734: `--surface` の解決結果パーステスト。wire 経由の実行契約
+    // （受理・拒否の外形挙動）は `tests/wire_surface_cli.rs`（子プロセス）が
+    // 担う。
+
+    #[test]
+    fn resolve_surface_none_is_sql() {
+        assert_eq!(
+            resolve_surface(None),
+            Ok(wire_server::surface::Surface::Sql)
+        );
+    }
+
+    #[test]
+    fn resolve_surface_accepts_both_tokens() {
+        assert_eq!(
+            resolve_surface(Some("sql")),
+            Ok(wire_server::surface::Surface::Sql)
+        );
+        assert_eq!(
+            resolve_surface(Some("nosql")),
+            Ok(wire_server::surface::Surface::Nosql)
+        );
+    }
+
+    #[test]
+    fn resolve_surface_rejects_unknown_value_fail_closed() {
+        let err = expect_err(resolve_surface(Some("bogus")));
+        assert!(
+            err.contains(wire_server::surface::FLAG),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_surface_rejects_case_variant() {
+        // 厳密一致のみ受理（`surface::parse` の契約）。
+        expect_err(resolve_surface(Some("SQL")));
     }
 }
