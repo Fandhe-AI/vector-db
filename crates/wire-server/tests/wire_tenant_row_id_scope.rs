@@ -167,9 +167,15 @@ fn rls9_wire_insert_response_bytes_are_identical_for_foreign_held_id_and_absent_
 
 /// 対象ビヘイビア: TABLE-12。他テナント（tenant-b・tenant-c）を事前に seed
 /// した状態でも、同一テナント（tenant-a）内での重複 `id` への `INSERT` は
-/// `23505` で拒否され、応答本文に他テナント名・行 `id` を含む識別子が
-/// 漏えいしないこと。存在情報秘匿の回帰検証（`row_id_tenant_scope.rs::
-/// rls9_insert_response_is_identical_...` と同型のアサーション）。
+/// `23505` で拒否され、応答本文に他テナント名・行 `id`（重複対象自身の
+/// `id`＝42 を含む）を含む識別子が漏えいしないこと。存在情報秘匿の回帰検証
+/// （`row_id_tenant_scope.rs::rls9_insert_response_is_identical_...` と同型
+/// のアサーション）。重複対象の id は `100`/`200`（他テナント seed 行の id）
+/// と数字列として衝突しない `42` を使う（`row_id_tenant_scope.rs` の
+/// `dup_with_foreign`/`dup_without_foreign` テストと同じ値。codex-review
+/// 指摘: 従来は `id=1` を使っており、他テナント id（100/200）の非漏えいしか
+/// 検査できず「重複対象自身の id が現れない」という本テストの目的を満たして
+/// いなかった）。
 #[test]
 fn table12_wire_insert_duplicate_within_own_tenant_is_rejected_with_23505_without_leaking_row_identifiers(
 ) {
@@ -177,14 +183,14 @@ fn table12_wire_insert_duplicate_within_own_tenant_is_rejected_with_23505_withou
     seed_foreign_tenants(&core);
     let mut stream = spawn_with_alice(core);
 
-    send_simple_query(&mut stream, &insert_sql(1, "wire-op-dup-first"));
+    send_simple_query(&mut stream, &insert_sql(42, "wire-op-dup-first"));
     let tag = read_command_complete(&mut stream);
     assert_eq!(tag, "INSERT 0 1");
     read_ready_for_query(&mut stream);
 
     // 同一 id・別 operation_id（台帳照合と行キー衝突を混同しないための注意点は
     // `wire_insert_operation_id.rs`・`row_id_tenant_scope.rs` と同じ）。
-    send_simple_query(&mut stream, &insert_sql(1, "wire-op-dup-second"));
+    send_simple_query(&mut stream, &insert_sql(42, "wire-op-dup-second"));
     let bytes = read_raw_message(&mut stream);
     assert_eq!(
         bytes.first(),
@@ -205,6 +211,10 @@ fn table12_wire_insert_duplicate_within_own_tenant_is_rejected_with_23505_withou
     assert!(
         !body_str.contains("100") && !body_str.contains("200"),
         "error response must not leak another tenant's row id: {body_str:?}"
+    );
+    assert!(
+        !body_str.contains("42"),
+        "error response must not leak the duplicate row's own id: {body_str:?}"
     );
     read_ready_for_query(&mut stream);
 
