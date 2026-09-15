@@ -2305,10 +2305,15 @@ pub fn project_id_only_rows(
 /// （上限判定は呼び出し元の責務）。
 ///
 /// 行の書き込みはガードなし実体 [`crate::tenant::insert_typed_row_unchecked`]（`pub(crate)`）
-/// へ委譲する（TASK-95・TABLE-12・RLS-9。`operation_id` 必須化ガードは本関数の
-/// 呼び出し前に `sql::allowlist::validate_insert` が適用済みのため、ガード付き公開版
-/// `crate::tenant::insert_typed_row` は経由しない。TASK-92・RECOVER-1・
-/// codex-review P1 指摘・PR #217）。`catalog.rs` の生の挿入 API は `pub(crate)` かつ
+/// へ委譲する（TASK-95・TABLE-12・RLS-9）。ガード（`operation_id` 必須化）は
+/// `crate::tenant::insert_typed_row` のような呼び出し先ではなく本関数自身が
+/// `ledger_mode.resolve(..)` で適用する（下記ドキュメント参照。TASK-92・
+/// RECOVER-1・codex-review P1 指摘・PR #217）ため、ガード付き公開版
+/// `crate::tenant::insert_typed_row` は経由しない。SQL 表層経由（`core.rs`）
+/// では `sql::allowlist::validate_insert` の事前検査が同じ判定を本関数の
+/// 呼び出し前に重ねて行うため、本関数内の判定は SQL 表層にとっては冗長な
+/// 多層防御になるが、engine クレート外の呼び出し元（Issue #730）にとっては
+/// これが**唯一**のガードである。`catalog.rs` の生の挿入 API は `pub(crate)` かつ
 /// テナント名前空間の指定を呼び出し元任せにするため、SQL 表層からは使わない
 /// （ガードを迂回できる書き込み入口を増やさない。security.md P0）。テナントは
 /// `ctx.tenant_id()` からサーバー側で導出され（クライアントが列リストへテナント
@@ -2334,18 +2339,22 @@ pub fn project_id_only_rows(
 /// 内容不一致検出（同一 `operation_id`・異なる内容）は TASK-101、対象ビヘイビア:
 /// RECOVER-10 の管轄で未提供。
 ///
-/// `ledger_mode` は `core.rs::EngineCore` が保持する構成をそのまま受け取り、
+/// `ledger_mode` は呼び出し元が保持する構成をそのまま受け取り、
 /// `ledger_mode.resolve(bound.operation_id.as_ref())` で
 /// [`crate::recovery::ledger::LedgerWrite`] へ変換したうえで
 /// [`crate::tenant::insert_typed_row_unchecked`] へ渡す（TASK-93、対象ビヘイビア:
 /// RECOVER-2。台帳への追記が行書き込みと同一 write トランザクションで行われる点は
-/// `tenant.rs` モジュールドキュメント参照）。`bound.operation_id` の必須化
-/// （TASK-92・RECOVER-1）は呼び出し元 `sql::allowlist::validate_insert` が
-/// `LedgerMode::require` 経由で本関数の呼び出し前に適用済みのため、
-/// `LedgerMode::Ledgered`（既定）では常に `Some`。`resolve` はその判定を再利用する
-/// ため、ここで改めて `MissingOperationId` を返す経路は実質到達しない
-/// （`LedgerMode::CompareOnlyWithoutLedger` でのみ `None` になり得るが、その場合
-/// `resolve` は `LedgerWrite::Disabled` を返し、台帳へは触れない）。
+/// `tenant.rs` モジュールドキュメント参照）。この `resolve` 呼び出しが
+/// `bound.operation_id` の必須化（TASK-92・RECOVER-1）そのものであり、
+/// `LedgerMode::Ledgered`（既定）で `None` を渡すと `resolve` が `Err` を返し
+/// [`SqlSurfaceError::MissingOperationId`]（`23502`）へ写像される——SQL 表層
+/// 経由（`core.rs`）では `sql::allowlist::validate_insert` の事前検査が同じ
+/// 判定を本関数の呼び出し前に既に行っているため通常は到達しないが、
+/// engine クレート外の呼び出し元（Issue #730）にとってはこの経路が
+/// **唯一到達可能な** fail-closed ガードである（`execute_insert_rejects_
+/// missing_operation_id_under_ledgered` で固定）。
+/// `LedgerMode::CompareOnlyWithoutLedger` では `None` でも `resolve` は
+/// `LedgerWrite::Disabled` を返して成功し、台帳へは触れない。
 pub fn execute_insert(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
