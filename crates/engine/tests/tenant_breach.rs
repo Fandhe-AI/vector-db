@@ -1,13 +1,21 @@
 //! `engine::tenant`（TASK-95・対象ビヘイビア: RECOVER-4）の機械検証。
 //!
-//! テナント境界を越える読み取り・書き込み（INSERT/UPDATE/DELETE）の試行が
-//! 全件拒否され、対象データが試行前後で不変であることを検証する。
+//! テナント境界を越える読み取り 10 回・書き込み（INSERT/UPDATE/DELETE 各 10 回。計
+//! 40 試行）の遮断が `wire_code`（`42501`／`P0002`）で明示的に固定され、対象データが
+//! 試行前後で不変（構造同値に加え、行数＋内容ハッシュの一致でも二重に検証）である
+//! ことを検証する。
 //!
 //! `tests/tenant_isolation.rs`（TASK-89）・`tests/rls_security.rs`（TASK-133）の
 //! シード手法（決定的 xorshift64*・`unique_db_path` + `CleanupGuard`）を踏襲し、
 //! テスト側だけが持つグラウンドトゥルースを独立オラクルとして使う
 //! （`PolicyContext::is_visible`/`is_owner` の実装バグからも独立させるため、本体の
 //! 判定 API はオラクル側で再利用しない）。
+//!
+//! 本ファイルが担わない範囲: TABLE-12・RLS-9（同一 id 名前空間化・応答同一性）の
+//! 検証は `tests/row_id_tenant_scope.rs` が担う。wire プロトコル経由の応答同一性・
+//! レイテンシ分布比較は兄弟 Issue（#737・#738）の担当。SQL 表層に `UPDATE`/`DELETE`
+//! 構文が存在しないため、SQL 経由の越境 UPDATE/DELETE は構造的に対象外
+//! （攻撃面は Rust API `RowInput::tenant_id` ≠ ctx に限られる）。
 
 use std::collections::BTreeMap;
 
@@ -92,6 +100,71 @@ fn victim_ctx() -> PolicyContext {
 type RowSnapshotValue = (bool, Vec<f32>, Vec<u8>);
 /// スナップショット全体: キーは物理キーと同形の `(tenant_id, id)`（TABLE-12）。
 type TableSnapshot = BTreeMap<(String, u64), RowSnapshotValue>;
+
+// ---------- RECOVER-4 の試行数タリー ----------
+//
+// 対象ビヘイビア: RECOVER-4「越境読み取り 10 回・書き込み 30 回（INSERT/UPDATE/DELETE
+// 各 10 回）の遮断」。読み取り側は `PrefilterIndex`/`SearchTimeFilter` 5 回ずつの
+// フェーズ 1（`recover4_read_breach_attempts_never_return_foreign_private_rows` の
+// `attempts` カウンタ）で固定する。書き込み側は 3 種別 ×10 回を合算した総数を固定する
+// （個別の種別内訳は各テストの試行ループが担保する）。
+const READ_ATTEMPTS: u32 = 10;
+const WRITE_ATTEMPTS_PER_KIND: usize = 10;
+const WRITE_ATTEMPTS: usize = WRITE_ATTEMPTS_PER_KIND * 3;
+#[allow(dead_code)] // 受入基準の「読み取り 10 回・書き込み 30 回」計 40 回を文書化する定数。
+const TOTAL_ATTEMPTS: usize = READ_ATTEMPTS as usize + WRITE_ATTEMPTS;
+
+/// テスト専任の差分検出用ハッシュ（FNV-1a 64bit。`tests/hnsw.rs` の
+/// `graph_fingerprint_is_stable_across_representation_change` と同一定数）。
+/// `engine::recovery::content_hash`（自作 SHA-256）は `pub(crate)` で結合テストから
+/// 到達不能なため、本ファイル専用の非暗号用途ハッシュとして別途実装する
+/// （セキュリティ用途ではなく、スナップショット比較の取りこぼしを防ぐための
+/// 補助的な差分検出のみに使う）。
+const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+fn fnv1a_update(hash: u64, bytes: &[u8]) -> u64 {
+    let mut h = hash;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// `TableSnapshot`（`BTreeMap` により `(tenant_id, id)` 昇順で決定的に反復される）を
+/// 長さ前置つきの正規化バイト列へ畳み込み、行数と合わせたフィンガープリントを返す。
+/// 境界の曖昧さ（可変長フィールドの連結による衝突）を長さ前置で排除する。
+fn snapshot_fingerprint(snapshot: &TableSnapshot) -> (usize, u64) {
+    let mut hash = FNV_OFFSET_BASIS;
+    hash = fnv1a_update(hash, &(snapshot.len() as u64).to_le_bytes());
+    for ((tenant_id, id), (is_public, embedding, metadata)) in snapshot {
+        let tenant_bytes = tenant_id.as_bytes();
+        hash = fnv1a_update(hash, &(tenant_bytes.len() as u64).to_le_bytes());
+        hash = fnv1a_update(hash, tenant_bytes);
+        hash = fnv1a_update(hash, &id.to_le_bytes());
+        hash = fnv1a_update(hash, &[u8::from(*is_public)]);
+        hash = fnv1a_update(hash, &(embedding.len() as u64).to_le_bytes());
+        for v in embedding {
+            hash = fnv1a_update(hash, &v.to_bits().to_le_bytes());
+        }
+        hash = fnv1a_update(hash, &(metadata.len() as u64).to_le_bytes());
+        hash = fnv1a_update(hash, metadata);
+    }
+    (snapshot.len(), hash)
+}
+
+/// RECOVER-4「対象データが試行前後で不変」を、構造同値（`BTreeMap ==`）に加えて
+/// 行数＋内容ハッシュの一致でも固定する（`BTreeMap ==` だけでは読み落としうる
+/// フィールド単位の取りこぼしを、独立した畳み込み方式のハッシュで多重に検出する）。
+fn assert_snapshot_unchanged(before: &TableSnapshot, after: &TableSnapshot, what: &str) {
+    assert_eq!(before, after, "{what}: table contents must be unchanged");
+    assert_eq!(
+        snapshot_fingerprint(before),
+        snapshot_fingerprint(after),
+        "{what}: (row_count, content_hash) must be unchanged"
+    );
+}
 
 fn snapshot_table(storage: &Storage) -> TableSnapshot {
     let mut out = BTreeMap::new();
@@ -251,6 +324,10 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
                 .expect("valid operation_id"),
         );
         assert!(matches!(r, Err(TenantWriteError::Forbidden)));
+        // RECOVER-4・ERR-2: 越境 INSERT はテナント不一致（クライアント自身の入力に
+        // 起因し存在情報を含まない）として一律 `42501` へ写像される（`Forbidden` の
+        // variant 固定に加え、応答契約そのものである `wire_code` も明示的に固定する）。
+        assert_eq!(r.as_ref().unwrap_err().wire_code(), "42501");
         results.push(r);
     }
 
@@ -291,6 +368,9 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
                     .expect("valid operation_id"),
             );
             assert!(matches!(r, Err(TenantWriteError::NotFound)));
+            // RECOVER-4・RLS-9: 存在／非所有を区別しない一律 `P0002` への写像
+            // （受入基準の「不可視扱い」に相当。存在情報を漏らさない fail-closed 判定）。
+            assert_eq!(r.as_ref().unwrap_err().wire_code(), "P0002");
             results.push(r);
         } else {
             let own_id = attacker_own_ids[(i as usize) % attacker_own_ids.len()];
@@ -311,6 +391,7 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
                     .expect("valid operation_id"),
             );
             assert!(matches!(r, Err(TenantWriteError::Forbidden)));
+            assert_eq!(r.as_ref().unwrap_err().wire_code(), "42501");
             results.push(r);
         }
     }
@@ -336,12 +417,23 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
                 .expect("valid operation_id"),
         );
         assert!(matches!(r, Err(TenantWriteError::NotFound)));
+        assert_eq!(r.as_ref().unwrap_err().wire_code(), "P0002");
         results.push(r);
     }
 
-    // 全 30 件が Err であること（成功件数 0）。
-    assert_eq!(results.len(), 30);
-    assert!(results.iter().all(|r| r.is_err()));
+    // 全 30 件（INSERT/UPDATE/DELETE 各 10 回）が Err であること（成功件数 0）。
+    assert_eq!(results.len(), WRITE_ATTEMPTS);
+    let rejected = results.iter().filter(|r| r.is_err()).count();
+    assert_eq!(rejected, WRITE_ATTEMPTS);
+    let succeeded = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(succeeded, 0);
+    // 拒否はすべて RECOVER-4 が定める 2 分類（`42501`／`P0002`）のいずれかに落ちる。
+    let rejected_by_wire_code = results
+        .iter()
+        .filter_map(|r| r.as_ref().err())
+        .filter(|e| matches!(e.wire_code(), "42501" | "P0002"))
+        .count();
+    assert_eq!(rejected_by_wire_code, WRITE_ATTEMPTS);
 
     // エラーの Display/Debug 文字列に被害側テナント名・対象 id が含まれないこと
     // （security.md P0「存在情報を漏らさない」の回帰検証）。
@@ -365,12 +457,10 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
         }
     }
 
-    // 試行後、テーブル全体が試行前と完全一致すること（差分 0 件）。
+    // 試行後、テーブル全体が試行前と完全一致すること（差分 0 件・行数＋内容ハッシュも
+    // 不変）。
     let after = snapshot_table(&storage);
-    assert_eq!(
-        before, after,
-        "table contents must be unchanged after all rejected attempts"
-    );
+    assert_snapshot_unchanged(&before, &after, "in-process view after 30 breach attempts");
 
     // 永続イメージの不変性も確認する（RECOVER-4: 「対象データが試行前後で不変」は
     // プロセス内ビューだけでなくディスク上の状態を指す。ハンドルを閉じて再オープンし、
@@ -378,9 +468,10 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
     drop(storage);
     let reopened = Storage::open(&path).expect("reopen storage after breach attempts");
     let after_reopen = snapshot_table(&reopened);
-    assert_eq!(
-        before, after_reopen,
-        "persisted table contents must be unchanged after reopening the database"
+    assert_snapshot_unchanged(
+        &before,
+        &after_reopen,
+        "persisted image after reopening the database",
     );
 }
 
@@ -484,7 +575,16 @@ fn recover4_read_breach_attempts_never_return_foreign_private_rows() {
         }
         assert!(visible.iter().all(|r| allowed_ids.contains(&r.id)));
     }
-    assert_eq!(attempts, 10, "phase 1 must account for exactly 10 attempts");
+    assert_eq!(
+        attempts, READ_ATTEMPTS,
+        "phase 1 must account for exactly {READ_ATTEMPTS} attempts"
+    );
+
+    // RECOVER-4「対象データが試行前後で不変」: フェーズ 1（読み取りのみ）の試行後、
+    // テーブル全体が不変であることを確認する（読み取り経路は書き込みトランザクション
+    // を一切開始しないため、書き込み側テストと異なり `&Storage` 借用中のまま検証できる）。
+    let after_phase1 = snapshot_table(&storage);
+    assert_snapshot_unchanged(&before, &after_phase1, "after phase 1 read attempts");
 
     // フェーズ 2: `EngineCore`（`Storage` の所有権を取る経路）。`get_row`・`search`・
     // `execute_sql` を巡回し、フェーズ 1 と別の 10 標的（tenant-b Public 行も含めて
@@ -497,6 +597,26 @@ fn recover4_read_breach_attempts_never_return_foreign_private_rows() {
         // 直接指定しても、不可視のため `NotFound` に統一される（RLS-9）。
         let get_result = core.get_row(&attacker, TABLE, TENANT_B, *victim_id);
         assert!(matches!(get_result, Err(engine::core::CoreError::NotFound)));
+        // エラーの Display/Debug 文字列に被害側テナント名・対象 id が含まれないこと
+        // （security.md P0「存在情報を漏らさない」の回帰検証。書き込み側と同種の
+        // 非漏えい確認を読み取り側の `CoreError` にも拡張する）。
+        if let Err(e) = &get_result {
+            let display = format!("{e}");
+            let debug = format!("{e:?}");
+            assert!(
+                !display.contains(TENANT_B),
+                "Display leaked tenant: {display}"
+            );
+            assert!(!debug.contains(TENANT_B), "Debug leaked tenant: {debug}");
+            assert!(
+                !display.contains(&victim_id.to_string()),
+                "Display leaked row id: {display}"
+            );
+            assert!(
+                !debug.contains(&victim_id.to_string()),
+                "Debug leaked row id: {debug}"
+            );
+        }
     }
 
     let query = &before[&(TENANT_B.to_string(), victim_ids[0])].1;
@@ -530,6 +650,20 @@ fn recover4_read_breach_attempts_never_return_foreign_private_rows() {
     assert_eq!(
         exposures, 0,
         "victim private row content must never be exposed to the attacker across any read path"
+    );
+
+    // RECOVER-4「対象データが試行前後で不変」（永続イメージ側）: `EngineCore` は
+    // `Storage` の所有権を持つためプロセス内ビューを直接再取得できない。ハンドルを
+    // 閉じてディスクから再オープンし、フェーズ 2 の読み取り試行（`get_row`・`search`・
+    // `execute_sql`。いずれも読み取り専用でトランザクションを開始しない）がディスク上の
+    // 状態に一切影響していないことを検証する。
+    drop(core);
+    let reopened = Storage::open(&path).expect("reopen storage after read breach attempts");
+    let after_reopen = snapshot_table(&reopened);
+    assert_snapshot_unchanged(
+        &before,
+        &after_reopen,
+        "persisted image after all read breach attempts",
     );
 }
 
@@ -628,6 +762,15 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
     let mut expected = vec![new_id, own_id, delete_target];
     expected.sort_unstable();
     assert_eq!(changed, expected);
+
+    // ハッシュ検査器の非 vacuous 化: 行数は insert 1・delete 1 で相殺され得る
+    // （本テストでは +1 のまま）が、内容ハッシュは正当な 3 件の変更後に必ず変わる
+    // ことを固定する。`assert_snapshot_unchanged` が差分を見逃さないことの検証。
+    assert_ne!(
+        snapshot_fingerprint(&before),
+        snapshot_fingerprint(&after),
+        "content hash must detect the 3 legitimate changes"
+    );
 
     // `EngineCore` 委譲メソッド経由でも 1 件ずつ成功することを確認する。
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
