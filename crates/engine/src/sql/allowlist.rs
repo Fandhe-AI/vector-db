@@ -40,7 +40,13 @@ fn is_allowed_order_by_function_name(name: &str) -> bool {
 
 /// WHERE の述語呼び出し形（空引数）で許可する述語名を照合する（大文字小文字を
 /// 区別しない）。未知の名前は fail-closed に拒否する。
-fn is_allowed_where_predicate_name(name: &str) -> bool {
+///
+/// `pub`: `wire-server::http::query::filter`（NoSQL 表層の `filter` 配列。
+/// Issue #761・TASK-175・NOSQL-7）が、クライアント指定の `column` が RLS
+/// 述語名と衝突しないことを確認するために呼ぶ（RLS はサーバー側暗黙適用の
+/// みであり、`filter` 経由で述語名を指定・解除できる経路を作らないための
+/// 判定。RLS 述語名を 2 クレートにハードコードしない単一情報源）。
+pub fn is_allowed_where_predicate_name(name: &str) -> bool {
     matches!(name.to_ascii_uppercase().as_str(), "VISIBLE")
 }
 

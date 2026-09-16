@@ -22,7 +22,10 @@
 //!   呼ぶ唯一の呼び出し元
 //! - [`query`]: `POST /v1/query` の op 別写像の親モジュール（TASK-175。
 //!   `query::schema` が JSON クエリオブジェクトの意味的検証（必須キー欠落・
-//!   未知キー・型不一致 → `42601`）を担う。Issue #760）
+//!   未知キー・型不一致 → `42601`）を担う。Issue #760。`query::filter` は
+//!   `filter` 配列の `op` 語彙（`eq`／`prefix`）を
+//!   `engine::declarative_filter::DeclarativeFilter` へ写像し `bind_all` へ
+//!   委譲する（Issue #761・NOSQL-7）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - ヘッダパーサ（Issue #741。[`request::parse_request_line`] が返す
@@ -32,7 +35,7 @@
 //! - 接続ハンドラ本体（[`listener::accept_loop_stub`] を置き換える有界読み取り・
 //!   EOF 時の無応答クローズ判断・panic 非伝播。Issue #747）
 //! - op 語彙の許可リストと未知 op（`0A000`）判定・各 op の実行計画への写像
-//!   （Issue #759 以降）
+//!   （Issue #759・#763・#766・#768 以降）
 //!
 //! 対応: TASK-173〜TASK-175（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア
 //! HTTP-1〜13・NOSQL-1〜NOSQL-10。PoC-15/TASK-182 は private 資産のため
