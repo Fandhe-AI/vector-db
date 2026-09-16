@@ -14,24 +14,27 @@
 //! [`crate::limits::READ_TIMEOUT`]（WIRE-5）を SQL wire と**共有**する
 //! （`main.rs::run_server` が `match surface` の前に 1 回だけ構築した同一
 //! インスタンスを渡す。プロセス内で 1 表層しか起動しないため「共有」は
-//! 「同じ構築箇所・同じ定数・同じ型」で満たされる）。以下はいずれも後続
-//! Issue の担当で、本関数の設計そのものと誤解しないこと:
-//! - 要求の読み取り・[`crate::http::request`] によるパース・応答生成、
-//!   panic の非伝播（Issue #747）。本 Issue の [`crate::http::conn::
-//!   handle_connection_interim`] は意図的な暫定ハンドラ（有界 1 回 read →
-//!   無応答クローズ）にとどまる
-//! - 応答エンコーダ（[`crate::http::error_body`]／[`crate::http::status`] を
-//!   使った実応答。同時接続数上限超過時の 503 応答は本 Issue で最小実装した
-//!   [`crate::http::conn::reject_too_many_connections`] が担う）
+//! 「同じ構築箇所・同じ定数・同じ型」で満たされる）。要求の読み取り・
+//! パース・応答生成・panic の非伝播は接続ハンドラ本体
+//! （[`crate::http::conn::handle_connection_with`]。Issue #747）が担い、本モジュール
+//! はハンドラの選び方（`accept_loop_with_limiter` は production 用の
+//! [`crate::http::conn::PlaceholderRouter`] を固定で使う）と、受理・
+//! タイムアウト適用・拒否・スレッド分岐にとどめる。テスト（`conn.rs`・#749
+//! の層 A 網羅テスト）は [`accept_loop_with_handler`] へ任意の
+//! [`crate::http::conn::RequestHandler`] 実装を注入できる。
+//!
+//! 同時接続数上限超過時の 503 応答は
+//! [`crate::http::conn::reject_too_many_connections`] が担う。
 //!
 //! untrusted なバイト列は [`crate::http::conn`] 側でのみ扱う（本モジュールは
 //! 受理・タイムアウト適用・スレッド分岐のみで、ストリームの中身を読み書き
 //! しない）。
 
 use std::net::{Shutdown, TcpListener};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::http::conn;
+use crate::http::conn::{self, RequestHandler};
 use crate::limits::{self, ConnectionLimiter, RejectWorkerLimiter};
 
 /// 接続を受理した直後に閉じるだけの accept ループ（stub）。
@@ -57,20 +60,8 @@ pub fn accept_loop_stub(listener: TcpListener) {
     }
 }
 
-/// NoSQL 表層の accept ループ本体。SQL wire の
-/// [`crate::server::accept_loop_inner`] と同じ資源保護契約
-/// （WIRE-5, WIRE-6。契約値は [`crate::limits`] に集約）を適用する:
-///
-/// - `limiter` の枠を確保できない接続は [`crate::http::conn::
-///   handle_connection_interim`] へ進ませず、`limiter` の枠を消費しない
-///   短命な使い捨てスレッドへ [`crate::http::conn::
-///   reject_too_many_connections`] を委譲し、HTTP 503／`wire_code` 53300 の
-///   JSON 応答を返してから即座にクローズする。この拒否スレッド自体も
-///   [`RejectWorkerLimiter`]（`MAX_REJECT_WORKERS`）で別枠に有界化し、上限
-///   到達後は応答を書かずに即座にクローズする（`accept_loop_inner` と同じ
-///   review 是正: 拒否経路の無制限 `thread::spawn` による DoS 対策）
-/// - 受理した接続には読み取り・書き込み双方に `read_timeout` を一度だけ
-///   設定してから [`crate::http::conn::handle_connection_interim`] へ渡す
+/// NoSQL 表層の accept ループ本体（production 入口）。[`crate::http::conn::
+/// PlaceholderRouter`] を使う [`accept_loop_with_handler`] の薄いラッパー。
 ///
 /// `limiter` は呼び出し元（`main.rs::run_server`）が `match surface` の前に
 /// 1 回だけ構築したインスタンスを受け取る（SQL wire 側と同じ構築箇所・同じ
@@ -79,6 +70,40 @@ pub fn accept_loop_with_limiter(
     listener: TcpListener,
     limiter: ConnectionLimiter,
     read_timeout: Duration,
+) {
+    accept_loop_with_handler(
+        listener,
+        limiter,
+        read_timeout,
+        Arc::new(conn::PlaceholderRouter),
+    );
+}
+
+/// [`accept_loop_with_limiter`] の本体。SQL wire の
+/// [`crate::server::accept_loop_inner`] と同じ資源保護契約
+/// （WIRE-5, WIRE-6。契約値は [`crate::limits`] に集約）を適用したうえで、
+/// 接続 1 本ごとに `handler`（[`crate::http::conn::handle_connection_with`]
+/// への注入 seam）を使う:
+///
+/// - `limiter` の枠を確保できない接続は `handler` へ進ませず、`limiter` の
+///   枠を消費しない短命な使い捨てスレッドへ [`crate::http::conn::
+///   reject_too_many_connections`] を委譲し、HTTP 503／`wire_code` 53300 の
+///   JSON 応答を返してから即座にクローズする。この拒否スレッド自体も
+///   [`RejectWorkerLimiter`]（`MAX_REJECT_WORKERS`）で別枠に有界化し、上限
+///   到達後は応答を書かずに即座にクローズする（`accept_loop_inner` と同じ
+///   review 是正: 拒否経路の無制限 `thread::spawn` による DoS 対策）
+/// - 受理した接続には読み取り・書き込み双方に `read_timeout` を一度だけ
+///   設定してから [`crate::http::conn::handle_connection_with`] へ `handler`
+///   （`Arc` で各接続スレッドへ複製）を渡す
+///
+/// `H: 'static` は `thread::Builder::spawn`（`join` しない）の要件。テスト
+/// （`conn.rs`・#749 の層 A 網羅テスト）は任意の [`RequestHandler`] 実装
+/// （panic 注入を含む）を渡せる。
+pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static>(
+    listener: TcpListener,
+    limiter: ConnectionLimiter,
+    read_timeout: Duration,
+    handler: Arc<H>,
 ) {
     // 拒否応答ワーカースレッドの有界化専用リミッター（`limiter` とは別枠。
     // `crate::server::accept_loop_inner` と同じ review 是正方針）。
@@ -136,11 +161,17 @@ pub fn accept_loop_with_limiter(
         // 拒否ワーカー経路と同じく panic しない `Builder::spawn` を使い、
         // 失敗時は当該接続の `permit`／ストリームを解放して accept ループを
         // 継続する（fail-closed。プロセス全体を落とさない）。
+        let handler_for_thread = Arc::clone(&handler);
         if let Err(e) = std::thread::Builder::new().spawn(move || {
             // 接続処理中は `permit` を保持し続け、スレッド終了時（正常終了・
             // panic いずれも）に Drop で確実に枠を解放する。
             let _permit = permit;
-            conn::handle_connection_interim(stream);
+            // `read_timeout` を要求全体（頭＋本文）の絶対読み取り期限としても
+            // 渡す（`conn::handle_connection_with` の doc・Slowloris 対策
+            // 参照）。接続受理直後に `apply_read_timeout` へ渡した値と同じ
+            // 1 つの値を「受理直後のソケットタイムアウト」と「要求読み取り
+            // 全体の期限」の双方に使う契約。
+            conn::handle_connection_with(stream, handler_for_thread.as_ref(), read_timeout);
         }) {
             eprintln!("wire-server: failed to spawn connection handler thread: {e}");
             // クロージャへ move された `permit` はスレッド生成失敗時に

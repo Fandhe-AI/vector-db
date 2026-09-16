@@ -90,7 +90,7 @@ pub(crate) fn reject_and_close(
     )?;
     stream.flush()?;
 
-    reject_and_close_with(stream, LINGER_DRAIN_TIMEOUT, LINGER_DRAIN_MAX_BYTES);
+    drain_and_close(stream, LINGER_DRAIN_TIMEOUT, LINGER_DRAIN_MAX_BYTES);
     Ok(())
 }
 
@@ -131,7 +131,7 @@ fn describe_kind(kind: FrontendMessageKind) -> String {
     }
 }
 
-/// ErrorResponse 送出後の有界 lingering close 本体。書き込み方向を先に閉じて
+/// 応答送出後の有界 lingering close 本体。書き込み方向を先に閉じて
 /// （FIN 送出）クライアントへ「これ以上送るな」を伝えたうえ、読み取りタイムアウトを
 /// 設定してパイプライン済みの残データを固定長バッファへ読み捨てる。
 ///
@@ -142,7 +142,13 @@ fn describe_kind(kind: FrontendMessageKind) -> String {
 ///
 /// 受信データを解釈しないため未検証の長さフィールドを信用する経路がなく、
 /// バッファは固定長のスタック配列（`Vec::with_capacity` を使わない）。
-fn reject_and_close_with(stream: &mut TcpStream, timeout: Duration, max_bytes: usize) {
+///
+/// `pub(crate)`: SQL wire（[`reject_and_close`]。`LINGER_DRAIN_TIMEOUT`・
+/// `LINGER_DRAIN_MAX_BYTES` を渡す）に加え、NoSQL 表層の接続ハンドラ
+/// （[`crate::http::conn`]。Issue #747）が同じ有界読み捨て契約（PoC-15 の実装
+/// ガイドライン）を共有するために `pub(crate)` へ昇格した（旧名
+/// `reject_and_close_with`。private のため互換義務を負わない改名）。
+pub(crate) fn drain_and_close(stream: &mut TcpStream, timeout: Duration, max_bytes: usize) {
     // 書き込み方向を閉じてクライアントへ FIN を送る。失敗しても drain は続行する
     // （読み取り自体は shutdown 非依存で機能するため）。
     let _ = stream.shutdown(Shutdown::Write);
@@ -282,11 +288,11 @@ mod tests {
     }
 
     #[test]
-    fn reject_and_close_with_bounds_drain_by_timeout() {
+    fn drain_and_close_bounds_drain_by_timeout() {
         let (mut server, mut client) = loopback_pair();
 
         let start = Instant::now();
-        reject_and_close_with(&mut server, Duration::from_millis(150), 64 * 1024);
+        drain_and_close(&mut server, Duration::from_millis(150), 64 * 1024);
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),
@@ -298,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_and_close_with_bounds_drain_by_max_bytes() {
+    fn drain_and_close_bounds_drain_by_max_bytes() {
         let (mut server, mut client) = loopback_pair();
 
         let sender = std::thread::spawn(move || {
@@ -312,7 +318,7 @@ mod tests {
         });
 
         let start = Instant::now();
-        reject_and_close_with(&mut server, Duration::from_secs(10), 8 * 1024);
+        drain_and_close(&mut server, Duration::from_secs(10), 8 * 1024);
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),
