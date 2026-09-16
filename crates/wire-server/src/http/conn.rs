@@ -1,58 +1,485 @@
-//! HTTP 接続 1 本ぶんの受理後処理（Issue #743・TASK-173／HTTP-11。対象
-//! ポインタ: `docs/spec/05-tasks.md` TASK-69・WIRE-5, WIRE-6）。
+//! HTTP 接続 1 本ぶんの受理後処理（Issue #747・TASK-173／HTTP-12。関連
+//! ビヘイビア HTTP-2・HTTP-3・HTTP-11。対象ポインタ: `docs/spec/05-tasks.md`
+//! TASK-173・`docs/spec/04-behavior/http-transport.md`）。
 //!
-//! `http::listener::accept_loop_with_limiter` から呼ばれる、接続単位の 2 経路:
-//! - [`handle_connection_interim`][]: 同時接続数の枠を確保できた接続の
-//!   **暫定**ハンドラ。要求の解釈・ルーティング・応答生成は本 Issue の
-//!   スコープ外（Issue #747 が置き換える）ため、固定長スタックバッファへの
-//!   **有界 1 回 read** だけを行い、タイムアウト・EOF・データ到着の
-//!   いずれでも応答を書かずにクローズする。「読む」ことを要求する
-//!   `read_timeout`（[`crate::limits::READ_TIMEOUT`]）の受け入れ条件を
-//!   反証可能にすることが本関数の存在理由であり、要求内容の解釈はまだ
-//!   行わない
+//! `http::listener::accept_loop_with_limiter`（production では
+//! [`PlaceholderRouter`] を `Arc` で包んで渡す）から呼ばれる、接続単位の 2 経路:
+//! - [`handle_connection_with`][]: 接続ハンドラ本体。要求行
+//!   （[`crate::http::request`]）→ ヘッダ（[`crate::http::headers`]）→ 本文長・
+//!   `Content-Type` の読み取り前検証（[`crate::http::body`]）→ 本文読み取り →
+//!   `handler: &impl RequestHandler` へのルーティング（本 Issue 時点では全パス
+//!   `08P01` の [`PlaceholderRouter`]。実ルータは Issue #758 が置き換える）の
+//!   順に 1 往復だけ処理し、応答を 1 回書き込んでからクローズする
+//!   （keep-alive・パイプライン非対応。応答は常に `Connection: close`）。
+//!   `handler` はテスト（本ファイル・#749 の層 A 網羅テスト）が任意の
+//!   [`RequestHandler`] 実装（panic 注入を含む）を差し込むための注入 seam
 //! - [`reject_too_many_connections`][]: 同時接続数の枠を確保できなかった
-//!   接続へ HTTP 503 ＋ JSON 本文（`wire_code`＝`53300`）を返してから
-//!   クローズする拒否経路。`crate::server::accept_loop_inner` の拒否経路
-//!   （[`crate::limits::reject_too_many_connections`]）の HTTP 版に相当する
+//!   接続へ HTTP 503 ＋ JSON 本文（`wire_code`＝`53300`）を返してからクローズ
+//!   する拒否経路（Issue #743 で実装済み・本 Issue では無変更）
 //!
-//! いずれも `pub(crate)`（#747 が接続ハンドラ本体を置き換える前提のため、
-//! `pub` 昇格に伴う `#[deprecated]` 残置義務〔P1 互換方針〕を負わない）。
-//! 結合テストが到達する公開 API は
-//! [`crate::http::listener::accept_loop_with_limiter`] のみ。
+//! ## 不正フレームでも応答を失わない（PoC-15 実装ガイドライン）
 //!
-//! 受信データ経路（[`handle_connection_interim`] の read バッファ）のため
+//! 要求行・ヘッダ・本文のいずれかが不正で早期拒否する場合も、応答バイト列を
+//! 書き込んだ**後**に、SQL wire の [`crate::protocol_dispatch::reject_and_close`]
+//! と同じ有界 lingering close（[`crate::protocol_dispatch::drain_and_close`]。
+//! `LINGER_DRAIN_TIMEOUT`＝1 秒・`LINGER_DRAIN_MAX_BYTES`＝64 KiB を共有）で
+//! 未読データを読み捨ててからクローズする。書き込み直後に `shutdown(Both)` で
+//! 即座に閉じると、クライアントが送信済み・送信中のバイト列と応答の競合で
+//! TCP RST を受け取り応答を読めなくなりうるため（PoC-15）。
+//!
+//! ## panic 非伝播と RECOVER-8（fail-fast）との関係
+//!
+//! [`handle_connection_with`] は要求の解析・ルーティングを
+//! `std::panic::catch_unwind` で包み、書き込みは **catch_unwind の外**（`Result`
+//! を見てから）でのみ行う。これにより「途中まで書いた通常応答に 500 を
+//! 追記する」経路が構造的に存在しない。
+//!
+//! production バイナリは `main.rs::run_server` が起動時に
+//! `engine::recovery::fail_fast::install`（TASK-99・RECOVER-8）を導入して
+//! おり、その panic hook は unwind **前** に `std::process::abort()` する。
+//! したがって production では本モジュールの `catch_unwind` へ実際には
+//! 到達せずプロセスが終了する（RECOVER-8 の意図した契約であり本 Issue は
+//! それを変更しない）。ここでの `catch_unwind` は (a) `wire-server` を lib
+//! として使う経路・テストでの防御、(b) panic 時でも応答・クローズ・
+//! `ConnectionPermit` 解放（呼び出し元 `listener` が Drop で解放）を
+//! 接続単位で決定的に行うための多層防御であり、HTTP-12 の「他接続へ
+//! panic が波及しない」という受け入れ条件の本体は、各パーサ群が不正
+//! フレームで panic しない（fail-closed な `Result` 型）ことで満たす。
+//! 「panic 注入時に他接続が継続する」ことを検証するテストは、
+//! `fail_fast::install` を**呼ばずに**（Rust 既定の panic hook のまま）
+//! in-process で行う（呼ぶとテストバイナリ内の全 panic が abort になる）。
+//!
+//! 受信データ経路（要求行・ヘッダ・本文の読み取り）のため
 //! `unwrap`／`expect`／添字アクセス（`[]`）を用いない。
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::time::SystemTime;
 
 use engine::error_format::ErrorClass;
 
-use crate::http::{error_body, status};
+use crate::framing::FrameError;
+use crate::http::headers::{parse_headers, HeaderParse, Headers};
+use crate::http::request::{parse_request_line, Method, RequestLine, RequestLineParse};
+use crate::http::response;
+use crate::http::{body, error_body, status};
 use crate::limits::REJECT_WRITE_TIMEOUT;
+use crate::protocol_dispatch::{drain_and_close, LINGER_DRAIN_MAX_BYTES, LINGER_DRAIN_TIMEOUT};
 
-/// `handle_connection_interim` が 1 回だけ読む read バッファ長。本 Issue では
-/// 要求内容を解釈しないため、タイムアウト／EOF／データ到着の 3 状態を
-/// 区別できる最小長（1 バイト）で足りる。
-const INTERIM_READ_BUF_LEN: usize = 1;
+/// 要求の「頭」（要求行＋ヘッダ部）を読み取る固定長スタックバッファの長さ。
+///
+/// [`crate::http::request::MAX_REQUEST_LINE_LEN`]（要求行の上限）＋
+/// [`crate::http::headers::MAX_HEADER_SECTION_LEN`]（ヘッダ部の上限）に等しい。
+/// この長さを取ることで、要求行がどれだけ短くても（最短で数バイト）ヘッダ部が
+/// 自身の内部上限（`MAX_HEADER_SECTION_LEN`）に到達するまでの余地が常に
+/// バッファ内に残る（要求行の消費 ≤ `MAX_REQUEST_LINE_LEN` なので、残り
+/// ≥ `MAX_HEADER_SECTION_LEN`）。したがって「バッファが満杯なのにどちらの
+/// パーサも Incomplete のまま」という状態は構造的に起こらない契約になる
+/// （[`read_head`] の `filled >= HEAD_BUF_LEN` 分岐は、この契約が破れた場合の
+/// 安全弁として fail-closed に `08P01` を返すのみで、通常経路では到達しない）。
+const HEAD_BUF_LEN: usize =
+    crate::http::request::MAX_REQUEST_LINE_LEN + crate::http::headers::MAX_HEADER_SECTION_LEN;
 
-/// 同時接続数の枠を確保できた接続の暫定ハンドラ。
+/// 解析済みの 1 要求（要求行・ヘッダ・本文）。フィールドはいずれも接続ハンドラが
+/// 保持するバッファからの借用であり、`RequestHandler` 実装へ読み取り専用で渡す。
 ///
-/// 固定長スタックバッファへの有界 read を 1 回行うだけで、結果（タイムアウト
-/// 〔`WouldBlock`／`TimedOut`〕・EOF・データ到着のいずれか）を問わず応答を
-/// 書かずに `shutdown` する。呼び出し元（`listener::accept_loop_with_limiter`）
-/// が受理直後に一度だけ `read_timeout` を設定した後のソケットを渡す前提。
+/// 本 Issue 時点の唯一の production 実装（[`PlaceholderRouter`]）はパス・
+/// メソッドを問わず一律拒否するため各フィールドを読まず、`dead_code` 警告が
+/// 出る（実ルータ Issue #758 が `line.target`／`headers`／`body` を読む唯一の
+/// 消費者になる）。フィールド自体は接続ハンドラの契約（`RequestHandler` へ
+/// 何を渡すか）の一部であり削除しない。
+#[allow(dead_code)]
+pub(crate) struct Request<'a> {
+    pub(crate) line: RequestLine<'a>,
+    pub(crate) headers: Headers<'a>,
+    pub(crate) body: &'a [u8],
+}
+
+/// 1 要求を受け取り応答バイト列を返す trait。`handle_connection_with` の注入
+/// seam であり、production では [`PlaceholderRouter`]（本 Issue。実ルータは
+/// Issue #758）を、テストでは任意のスタブ実装（panic 注入を含む）を渡す。
+pub(crate) trait RequestHandler {
+    fn handle(&self, req: &Request<'_>) -> Vec<u8>;
+}
+
+/// 本 Issue 時点のルータ: パス・メソッドを問わず常に `08P01`
+/// （`ErrorClass::ProtocolViolation`）で拒否する placeholder。実ルータ
+/// （`/v1/session`・`/v1/session/close`・`/v1/query` の 3 エンドポイント限定・
+/// 非 POST／未知パス／クエリ文字列付き拒否）は Issue #758 が置き換える。
+pub(crate) struct PlaceholderRouter;
+
+impl RequestHandler for PlaceholderRouter {
+    fn handle(&self, _req: &Request<'_>) -> Vec<u8> {
+        response::encode_error(
+            ErrorClass::ProtocolViolation,
+            "unknown request target",
+            SystemTime::now(),
+        )
+    }
+}
+
+/// [`build_outcome`] の結果。書き込みは呼び出し元（`handle_connection_with`）が
+/// `catch_unwind` の外で行うため、本 enum は「何を書くか／書かずに閉じるか」の
+/// 判断結果のみを保持する。
+pub(crate) enum Outcome {
+    /// 応答バイト列を 1 回 `write_all` してから [`drain_and_close`] する。
+    Respond(Vec<u8>),
+    /// 応答を書かずに `shutdown` する（相手が何も送らず切断した場合等）。
+    CloseSilently,
+}
+
+/// 接続ハンドラ本体。`handler` は要求 1 件ぶんの処理を受け持つ
+/// [`RequestHandler`] 実装（production は [`PlaceholderRouter`]、テストは
+/// 任意のスタブ）。呼び出し元（`listener::accept_loop_with_handler`）が受理
+/// 直後に一度だけ `read_timeout`／`write_timeout` を設定した後のソケットを
+/// 渡す前提（[`crate::limits::apply_read_timeout`] が両方向へ同じ値を設定
+/// 済み）。
 ///
-/// 意図的な暫定挙動: 08P01 ルーティング・要求パース・応答生成は Issue #747
-/// の担当であり、本関数をその設計の完成形と誤解しないこと。
-pub(crate) fn handle_connection_interim(mut stream: TcpStream) {
-    let mut buf = [0u8; INTERIM_READ_BUF_LEN];
-    // 読み取り結果（Ok/Err いずれも）は本 Issue の時点では一切解釈しない。
-    // 「読む」動作そのものが `read_timeout` の受け入れ条件を反証可能にする
-    // ために必要（stub のように無読みで閉じると、タイムアウト超過の検証が
-    // 空虚になる）。
-    let _ = stream.read(&mut buf);
-    let _ = stream.shutdown(Shutdown::Both);
+/// panic 非伝播の設計はモジュール doc を参照。書き込み・[`drain_and_close`]・
+/// クローズはすべて `catch_unwind` の**外**で行う。
+pub(crate) fn handle_connection_with<H: RequestHandler>(mut stream: TcpStream, handler: &H) {
+    let outcome = catch_unwind(AssertUnwindSafe(|| build_outcome(&mut stream, handler)));
+    match outcome {
+        Ok(Outcome::Respond(bytes)) => {
+            respond_and_close(&mut stream, &bytes);
+        }
+        Ok(Outcome::CloseSilently) => {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        Err(_panic_payload) => {
+            // panic payload（`Any`）はログ・応答のいずれにも出さない（内部詳細の
+            // 非漏えい。P0）。固定文言の 1 行ログのみ残す。
+            eprintln!(
+                "wire-server: http connection handler panicked; responding with a fixed internal error and closing"
+            );
+            let bytes = response::encode_error(
+                ErrorClass::InternalError,
+                "internal error",
+                SystemTime::now(),
+            );
+            respond_and_close(&mut stream, &bytes);
+        }
+    }
+}
+
+/// 応答バイト列を 1 回 `write_all` し、未読データを有界に読み捨ててから戻る
+/// （呼び出し元がその後 `stream` を drop することで接続が閉じる。SQL wire の
+/// `protocol_dispatch::reject_and_close` と同じ「書き込み → drain → drop」の
+/// 形）。書き込み失敗は無視する（新たなブロッキング点・panic を作らない）。
+fn respond_and_close(stream: &mut TcpStream, bytes: &[u8]) {
+    let _ = stream.write_all(bytes);
+    drain_and_close(stream, LINGER_DRAIN_TIMEOUT, LINGER_DRAIN_MAX_BYTES);
+}
+
+/// `catch_unwind` の中身。要求の頭（要求行＋ヘッダ）→ 本文長・`Content-Type`
+/// の検証 → 本文読み取り → ルーティングの順に進め、[`Outcome`] を返す。
+/// I/O・パースはすべてここで行うが、応答の書き込みは一切行わない
+/// （呼び出し元の責務。モジュール doc 参照）。
+fn build_outcome<H: RequestHandler>(stream: &mut TcpStream, handler: &H) -> Outcome {
+    let mut head_buf = [0u8; HEAD_BUF_LEN];
+    let (line, headers, residual) = match read_head(stream, &mut head_buf) {
+        HeadOutcome::Parsed {
+            line,
+            headers,
+            residual,
+        } => (line, headers, residual),
+        HeadOutcome::Respond(bytes) => return Outcome::Respond(bytes),
+        HeadOutcome::CloseSilently => return Outcome::CloseSilently,
+    };
+
+    let plan = match body::plan_body(&headers) {
+        Ok(plan) => plan,
+        Err(e) => return Outcome::Respond(frame_error_bytes(&e)),
+    };
+
+    let body_bytes = match read_body(stream, residual, plan.content_length()) {
+        Ok(BodyOutcome::Bytes(bytes)) => bytes,
+        Ok(BodyOutcome::CloseSilently) => return Outcome::CloseSilently,
+        Err(bytes) => return Outcome::Respond(bytes),
+    };
+
+    // メソッドは要求行パーサ（`crate::http::request::parse_method`）が
+    // 既に `POST` のみへ絞り込み済み（`Method` は単一 variant の閉じた語彙）。
+    // ここでの分岐は将来 `Method` へ variant が増えた場合の fail-closed 安全弁。
+    let Method::Post = line.method;
+
+    let req = Request {
+        line,
+        headers,
+        body: &body_bytes,
+    };
+    Outcome::Respond(handler.handle(&req))
+}
+
+/// [`read_head`] の結果。`Parsed` の各フィールドは呼び出し元が渡した
+/// バッファ（[`HEAD_BUF_LEN`] 長）からの借用。
+///
+/// `Parsed`（`Headers` が固定長配列を持つため大きい）と他 variant の
+/// サイズ差は意図的（[`crate::http::headers::HeaderParse`] と同じ方針。
+/// ヒープへ逃がすと本モジュール・`headers` モジュールの「ヒープ確保なし」
+/// 方針に反する）。
+#[allow(clippy::large_enum_variant)]
+enum HeadOutcome<'a> {
+    Parsed {
+        line: RequestLine<'a>,
+        headers: Headers<'a>,
+        /// 要求の頭より後に既にバッファへ読み込まれていた本文の先頭部分
+        /// （本文読み取りが 1 回の read で頭と本文をまたいで届いた場合）。
+        residual: &'a [u8],
+    },
+    /// 応答バイト列を書いてから閉じる（不正フレーム・上限超過）。
+    Respond(Vec<u8>),
+    /// 応答を書かずに閉じる（EOF・タイムアウト）。
+    CloseSilently,
+}
+
+/// [`head_parse_state`] の結果。借用データを一切保持しない（`buf` への
+/// 借用に依存しない enum）ことが要点で、これにより `read_head` のループ内で
+/// 「今のバイト列で頭が完成しているか」を確認する処理と、「追加のバイトを
+/// 読むために `buf` を可変借用する」処理を同じ周回内で安全に共存させられる
+/// （Rust の借用チェッカが単一の呼び出しへ 1 つのライフタイムしか割り当て
+/// られない制約〔いわゆる NLL problem case #3〕を、借用を返さない設計で
+/// 構造的に回避する）。実際に借用済みの `RequestLine`／`Headers` を得る
+/// パースは、読み取りループが完全に終わった後に 1 度だけ行う
+/// （[`parse_completed_head`]）。
+enum HeadParseState {
+    /// 要求行・ヘッダともに解析でき、頭の読み取りが完了している。
+    Complete,
+    /// 追加のバイトが必要（要求行・ヘッダのいずれかが `Incomplete`）。
+    NeedMore,
+    /// 応答バイト列を書いてから閉じる（不正フレーム・上限超過）。
+    Respond(Vec<u8>),
+}
+
+/// `buf[..filled]` の時点で要求の頭を解析できるかを判定する（借用非依存）。
+fn head_parse_state(buf: &[u8; HEAD_BUF_LEN], filled: usize) -> HeadParseState {
+    let head_slice = match buf.get(..filled) {
+        Some(s) => s,
+        None => return HeadParseState::Respond(protocol_violation_bytes("request head bounds")),
+    };
+
+    match parse_request_line(head_slice) {
+        Ok(RequestLineParse::Complete {
+            consumed: line_consumed,
+            ..
+        }) => {
+            let headers_input = match buf.get(line_consumed..filled) {
+                Some(s) => s,
+                None => {
+                    return HeadParseState::Respond(protocol_violation_bytes("request head bounds"))
+                }
+            };
+            match parse_headers(headers_input) {
+                Ok(HeaderParse::Complete { .. }) => HeadParseState::Complete,
+                Ok(HeaderParse::Incomplete) => HeadParseState::NeedMore,
+                Err(e) => HeadParseState::Respond(frame_error_bytes(&e)),
+            }
+        }
+        Ok(RequestLineParse::Incomplete) => HeadParseState::NeedMore,
+        Err(e) => HeadParseState::Respond(frame_error_bytes(&e)),
+    }
+}
+
+/// [`head_parse_state`] が `Complete` を返した後に、実際に借用済みの
+/// `RequestLine`／`Headers`／本文残余を取り出す。読み取りループの外
+/// （`buf` への可変借用が以後発生しない箇所）から 1 度だけ呼ぶ契約。
+fn parse_completed_head(
+    buf: &[u8; HEAD_BUF_LEN],
+    filled: usize,
+) -> Result<(RequestLine<'_>, Headers<'_>, &[u8]), Vec<u8>> {
+    let head_slice = buf
+        .get(..filled)
+        .ok_or_else(|| protocol_violation_bytes("request head bounds"))?;
+    let (line, line_consumed) = match parse_request_line(head_slice) {
+        Ok(RequestLineParse::Complete { line, consumed }) => (line, consumed),
+        _ => return Err(protocol_violation_bytes("request head bounds")),
+    };
+    let headers_input = buf
+        .get(line_consumed..filled)
+        .ok_or_else(|| protocol_violation_bytes("request head bounds"))?;
+    let (headers, header_consumed) = match parse_headers(headers_input) {
+        Ok(HeaderParse::Complete { headers, consumed }) => (headers, consumed),
+        _ => return Err(protocol_violation_bytes("request head bounds")),
+    };
+    let head_len = line_consumed
+        .checked_add(header_consumed)
+        .ok_or_else(|| protocol_violation_bytes("request head length overflow"))?;
+    let residual = buf
+        .get(head_len..filled)
+        .ok_or_else(|| protocol_violation_bytes("request head bounds"))?;
+    Ok((line, headers, residual))
+}
+
+/// 要求の頭（要求行＋ヘッダ部）を有界に読み取り、解析する。
+///
+/// ループの各周回で「今持っているバイト列で頭が完成しているか
+/// （[`head_parse_state`]。借用を返さない）を確認する→不足なら追加で 1 回
+/// read する」を繰り返し、完成した時点でループを抜けてから
+/// [`parse_completed_head`] で実際の借用データを 1 度だけ取り出す。各段の
+/// 内部上限（`request::MAX_REQUEST_LINE_LEN`・`headers::
+/// MAX_HEADER_SECTION_LEN`）は [`HEAD_BUF_LEN`] の doc が説明するとおり
+/// バッファが満杯になる前に必ず先に効く契約。
+fn read_head<'buf>(stream: &mut TcpStream, buf: &'buf mut [u8; HEAD_BUF_LEN]) -> HeadOutcome<'buf> {
+    let mut filled = 0usize;
+
+    // このループは `buf` への可変借用（`stream.read` 用）と、借用非依存の
+    // 判定（`head_parse_state`）だけを行い、借用済みデータは一切保持しない。
+    enum LoopExit {
+        Complete,
+        Respond(Vec<u8>),
+        CloseSilently,
+    }
+    let exit = loop {
+        match head_parse_state(buf, filled) {
+            HeadParseState::Complete => break LoopExit::Complete,
+            HeadParseState::NeedMore => {
+                // 追加のバイトを読んで次周回で再試行する。
+            }
+            HeadParseState::Respond(bytes) => break LoopExit::Respond(bytes),
+        }
+
+        if filled >= HEAD_BUF_LEN {
+            // [`HEAD_BUF_LEN`] の doc が説明する契約が破れた場合の安全弁
+            // （通常経路では到達しない）。
+            break LoopExit::Respond(protocol_violation_bytes("request head exceeds limit"));
+        }
+        let read_target = match buf.get_mut(filled..) {
+            Some(s) => s,
+            None => break LoopExit::Respond(protocol_violation_bytes("request head bounds")),
+        };
+        match stream.read(read_target) {
+            Ok(0) => {
+                if filled == 0 {
+                    // 接続して何も送らずに切断（HTTP-11: 無応答で良い）。
+                    break LoopExit::CloseSilently;
+                }
+                // 要求の途中で切断された。応答は書ける状態のため書く。
+                break LoopExit::Respond(protocol_violation_bytes(
+                    "connection closed before request head completed",
+                ));
+            }
+            Ok(n) => {
+                filled = match filled.checked_add(n) {
+                    Some(v) => v,
+                    None => {
+                        break LoopExit::Respond(protocol_violation_bytes(
+                            "request head length overflow",
+                        ))
+                    }
+                };
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // HTTP-11: 段階を問わず、タイムアウトは無応答でクローズする。
+                break LoopExit::CloseSilently;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                continue;
+            }
+            Err(_) => break LoopExit::CloseSilently,
+        }
+    };
+
+    match exit {
+        LoopExit::Complete => match parse_completed_head(buf, filled) {
+            Ok((line, headers, residual)) => HeadOutcome::Parsed {
+                line,
+                headers,
+                residual,
+            },
+            Err(bytes) => HeadOutcome::Respond(bytes),
+        },
+        LoopExit::Respond(bytes) => HeadOutcome::Respond(bytes),
+        LoopExit::CloseSilently => HeadOutcome::CloseSilently,
+    }
+}
+
+/// [`read_body`] の結果（正常系）。
+enum BodyOutcome {
+    Bytes(Vec<u8>),
+    CloseSilently,
+}
+
+/// 本文（宣言済み `content_length` バイト）を読み取る。`residual` は
+/// [`read_head`] が頭の読み取り時に既に取得していた本文の先頭部分（1 回の
+/// read が頭と本文の境界をまたいだ場合）。
+///
+/// アロケーションサイズ（`vec![0u8; content_length]`）は呼び出し元
+/// （[`build_outcome`]）が [`body::plan_body`] を通した後の `content_length`
+/// のみを渡す契約（[`MAX_BODY_LEN`](body::MAX_BODY_LEN) 以下であることが
+/// 型で保証された値）であり、未検証の宣言長を直接確保に使わない。
+fn read_body(
+    stream: &mut TcpStream,
+    residual: &[u8],
+    content_length: usize,
+) -> Result<BodyOutcome, Vec<u8>> {
+    if residual.len() > content_length {
+        // 頭の読み取り時点で本文の宣言長を超えるバイト列が既に届いている
+        // （Content-Length との不一致: 超過）。
+        return Err(protocol_violation_bytes(
+            "request body exceeds declared content-length",
+        ));
+    }
+
+    let mut buf = vec![0u8; content_length];
+    let copy_len = residual.len().min(content_length);
+    let src = match residual.get(..copy_len) {
+        Some(s) => s,
+        None => return Err(protocol_violation_bytes("request body bounds")),
+    };
+    match buf.get_mut(..copy_len) {
+        Some(dst) => dst.copy_from_slice(src),
+        None => return Err(protocol_violation_bytes("request body bounds")),
+    }
+
+    let remaining = match buf.get_mut(copy_len..) {
+        Some(s) => s,
+        None => return Err(protocol_violation_bytes("request body bounds")),
+    };
+    if !remaining.is_empty() {
+        match stream.read_exact(remaining) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Content-Length との不一致: 不足（相手が早期に切断した）。
+                return Err(protocol_violation_bytes(
+                    "request body ended before declared content-length",
+                ));
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Ok(BodyOutcome::CloseSilently);
+            }
+            Err(_) => return Ok(BodyOutcome::CloseSilently),
+        }
+    }
+
+    Ok(BodyOutcome::Bytes(buf))
+}
+
+/// [`FrameError`]（要求行・ヘッダ・本文長のいずれかのパーサが返す）を応答
+/// バイト列へ変換する。`error_class()`／`client_message()` が `None`／空文字を
+/// 返すのは `Truncated`／`Io`（本層のパーサ群は生成しない variant）のみの
+/// ため、防御的に `ProtocolViolation`／固定文言へ fail-closed に縮退する。
+fn frame_error_bytes(err: &FrameError) -> Vec<u8> {
+    let class = err.error_class().unwrap_or(ErrorClass::ProtocolViolation);
+    let message = err.client_message();
+    let message = if message.is_empty() {
+        "invalid request"
+    } else {
+        message
+    };
+    response::encode_error(class, message, SystemTime::now())
+}
+
+/// 固定文言の `08P01`（`ErrorClass::ProtocolViolation`）応答バイト列を組み立てる
+/// 共通ヘルパ。
+fn protocol_violation_bytes(message: &str) -> Vec<u8> {
+    response::encode_error(ErrorClass::ProtocolViolation, message, SystemTime::now())
 }
 
 /// 同時接続数の枠を確保できなかった接続へ HTTP 503 ＋ JSON 本文
@@ -73,8 +500,8 @@ pub(crate) fn reject_too_many_connections(mut stream: TcpStream) {
 
 /// 同時接続数上限超過時の HTTP 応答バイト列を組み立てる純関数。
 ///
-/// `crate::http::response`（Issue #746。本 Issue 時点では未マージ）が入れば
-/// そちらへ委譲する形に差し替える想定の最小エンベロープ。ステータス行
+/// [`crate::http::response`]（Issue #746）が入る前の暫定実装（Issue #743）の
+/// まま維持している最小エンベロープ。ステータス行
 /// （`http::status::http_status(ErrorClass::ConnectionLimitExceeded)` ＝
 /// 503 固定のため reason phrase も固定表記）・`Connection: close`・
 /// `Content-Type: application/json; charset=utf-8`・`Content-Length`・
@@ -101,26 +528,307 @@ mod tests {
     use std::net::TcpListener;
     use std::time::Duration;
 
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        (server, client)
+    }
+
     /// `stream.read` が実際に EOF（`Ok(0)`）で終わったことを確認する。
-    ///
-    /// `read(...).unwrap_or(0)` は、クライアント側の read が `WouldBlock`／
-    /// `TimedOut` で終わった場合も `Ok(0)`（EOF）と同一視してしまい、
-    /// 「サーバーの `read_timeout` 超過後に接続が閉じる」という検証対象の
-    /// 契約が破れていてもテストを通してしまう（codex-review 指摘）。
-    /// ここでは `Ok(0)` のみを合格とし、それ以外（`WouldBlock`／`TimedOut`
-    /// を含む）はテスト失敗として明示する。
     fn assert_eof(stream: &mut TcpStream) {
         let mut buf = [0u8; 8];
         match stream.read(&mut buf) {
             Ok(0) => {}
-            Ok(n) => panic!("expected EOF without any response bytes, got {n} bytes"),
+            Ok(n) => panic!("expected EOF without extra bytes, got {n} bytes"),
             Err(e) => panic!("expected EOF (Ok(0)), got read error: {e:?}"),
         }
     }
 
-    /// `encode_reject_response` の構造（ステータス行・ヘッダ・
-    /// `Content-Length` の一致・ヘッダ終端がちょうど 1 箇所・本文が
-    /// `error.wire_code == "53300"` で `data` キーを含まない）を固定する。
+    fn read_all(stream: &mut TcpStream) -> Vec<u8> {
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        received
+    }
+
+    fn status_line(bytes: &[u8]) -> String {
+        let text = String::from_utf8_lossy(bytes);
+        text.lines().next().unwrap_or_default().to_string()
+    }
+
+    fn wire_code_of(bytes: &[u8]) -> String {
+        let text = String::from_utf8_lossy(bytes);
+        let body_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
+        let body = &text[body_start..];
+        let parsed = engine::json::parse_json(body).expect("body must be valid JSON");
+        let engine::json::JsonValue::Object(top) = parsed else {
+            panic!("top level must be an object");
+        };
+        let engine::json::JsonValue::Object(error_obj) = top.get("error").expect("error key")
+        else {
+            panic!("error value must be an object");
+        };
+        let engine::json::JsonValue::String(code) = error_obj
+            .get("wire_code")
+            .expect("wire_code present")
+            .clone()
+        else {
+            panic!("wire_code must be a string");
+        };
+        code
+    }
+
+    /// production 相当の `PlaceholderRouter` を使い、正常形の要求が単一の
+    /// `08P01` 応答（1 往復で完結）へ落ちること。
+    #[test]
+    fn placeholder_router_answers_08p01_for_well_formed_request() {
+        let (server, mut client) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter);
+        });
+
+        client
+            .write_all(b"POST /v1/query HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+            .expect("write request");
+
+        let received = read_all(&mut client);
+        assert_eq!(status_line(&received), "HTTP/1.1 400 Bad Request");
+        assert_eq!(wire_code_of(&received), "08P01");
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// 要求行不正（非対応メソッド）は 400／`08P01` で 1 往復完結する。
+    #[test]
+    fn rejects_malformed_request_line() {
+        let (server, mut client) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter);
+        });
+
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").expect("write");
+        let received = read_all(&mut client);
+        assert_eq!(status_line(&received), "HTTP/1.1 400 Bad Request");
+        assert_eq!(wire_code_of(&received), "08P01");
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// ヘッダ部不正（`Transfer-Encoding` 指定）は 400／`08P01`。
+    #[test]
+    fn rejects_malformed_headers() {
+        let (server, mut client) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter);
+        });
+
+        client
+            .write_all(b"POST /v1/query HTTP/1.1\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .expect("write");
+        let received = read_all(&mut client);
+        assert_eq!(status_line(&received), "HTTP/1.1 400 Bad Request");
+        assert_eq!(wire_code_of(&received), "08P01");
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// RST 回帰の核心: `Content-Length` 超過（413）の応答が、クライアントが
+    /// 本文を送り続けている最中でも末尾まで完全に到達する。
+    #[test]
+    fn oversized_content_length_response_arrives_completely_while_client_keeps_sending() {
+        let (server, mut client) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter);
+        });
+
+        let declared = body::MAX_BODY_LEN + 1;
+        let header = format!(
+            "POST /v1/query HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n\r\n"
+        );
+        client.write_all(header.as_bytes()).expect("write head");
+
+        let sender = std::thread::spawn(move || {
+            let chunk = vec![b'a'; 8192];
+            for _ in 0..256 {
+                if client.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+            client
+        });
+
+        let mut client = sender.join().expect("sender thread must not panic");
+        let received = read_all(&mut client);
+        assert_eq!(status_line(&received), "HTTP/1.1 413 Content Too Large");
+        assert_eq!(wire_code_of(&received), "54000");
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// 本文不足（宣言長 > 実送信、クライアントが早期に書き込み方向を閉じる）は
+    /// 400／`08P01`。
+    #[test]
+    fn rejects_body_shorter_than_declared_content_length() {
+        let (server, mut client) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter);
+        });
+
+        client
+            .write_all(
+                b"POST /v1/query HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\nab",
+            )
+            .expect("write");
+        client.shutdown(Shutdown::Write).expect("shutdown write");
+
+        let received = read_all(&mut client);
+        assert_eq!(status_line(&received), "HTTP/1.1 400 Bad Request");
+        assert_eq!(wire_code_of(&received), "08P01");
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// 本文余剰（宣言長 < head 内に既に届いた残余）は 400／`08P01`。
+    #[test]
+    fn rejects_body_longer_than_declared_content_length_within_head_buffer() {
+        let (server, mut client) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter);
+        });
+
+        client
+            .write_all(
+                b"POST /v1/query HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\nabc",
+            )
+            .expect("write");
+
+        let received = read_all(&mut client);
+        assert_eq!(status_line(&received), "HTTP/1.1 400 Bad Request");
+        assert_eq!(wire_code_of(&received), "08P01");
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// 本文の途中で読み取りタイムアウトへ達した場合は無応答 EOF。
+    #[test]
+    fn closes_silently_when_body_read_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        server
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .expect("set server read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter);
+        });
+
+        client
+            .write_all(
+                b"POST /v1/query HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\nab",
+            )
+            .expect("write partial body, then stall");
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set client read timeout");
+        assert_eof(&mut client);
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// 接続して何も送らず切断した場合は無応答 EOF。
+    #[test]
+    fn closes_silently_when_client_sends_nothing() {
+        let (server, mut client) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter);
+        });
+
+        client.shutdown(Shutdown::Write).expect("shutdown write");
+        assert_eof(&mut client);
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// panic 注入: `RequestHandler` 実装が `handle` で panic しても、
+    /// `handle_connection_with` は panic せずに戻り（スレッドが正常終了し）、
+    /// クライアントは 500／`XX000` 応答または EOF のいずれかを受け取る
+    /// （書き込み後に相手が読み切れない場合もあるため、応答を最後まで受け
+    /// 取れることまでは要求せず「サーバースレッドが panic で死なない」ことを
+    /// 主眼にする。ここでは `join` の成功と、受信できた場合の内容を確認する）。
+    #[test]
+    fn handler_panic_does_not_propagate_and_thread_returns() {
+        struct PanickingHandler;
+        impl RequestHandler for PanickingHandler {
+            fn handle(&self, _req: &Request<'_>) -> Vec<u8> {
+                panic!("injected handler panic for HTTP-12 verification");
+            }
+        }
+
+        let (server, mut client) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PanickingHandler);
+        });
+
+        client
+            .write_all(b"POST /v1/query HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+            .expect("write request");
+
+        let received = read_all(&mut client);
+        if !received.is_empty() {
+            assert_eq!(status_line(&received), "HTTP/1.1 500 Internal Server Error");
+            assert_eq!(wire_code_of(&received), "XX000");
+        }
+
+        handle
+            .join()
+            .expect("handler thread must return normally despite the injected panic");
+    }
+
+    /// 同時接続数上限超過時の HTTP 応答バイト列（既存の Issue #743 テスト
+    /// 内容をそのまま維持）。
     #[test]
     fn encode_reject_response_has_53300_body_and_matching_content_length() {
         let response = encode_reject_response();
@@ -175,75 +883,19 @@ mod tests {
         );
     }
 
-    /// `handle_connection_interim` はデータを送らないクライアントに対して、
-    /// 短縮タイムアウト超過後も一切応答を書かずに EOF（0 バイト）へ倒れる。
-    #[test]
-    fn handle_connection_interim_closes_without_response_after_timeout() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let addr = listener.local_addr().expect("local addr");
-        let mut client = TcpStream::connect(addr).expect("connect");
-        let (server_stream, _) = listener.accept().expect("accept");
-        server_stream
-            .set_read_timeout(Some(Duration::from_millis(150)))
-            .expect("set read timeout");
-
-        std::thread::spawn(move || {
-            handle_connection_interim(server_stream);
-        });
-
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("set client read timeout");
-        assert_eof(&mut client);
-    }
-
-    /// `handle_connection_interim` はデータを送ったクライアントに対しても
-    /// 応答を返さず EOF になる（要求解釈は本 Issue のスコープ外）。
-    #[test]
-    fn handle_connection_interim_closes_without_response_after_data_arrives() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let addr = listener.local_addr().expect("local addr");
-        let mut client = TcpStream::connect(addr).expect("connect");
-        let (server_stream, _) = listener.accept().expect("accept");
-        server_stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("set read timeout");
-
-        std::thread::spawn(move || {
-            handle_connection_interim(server_stream);
-        });
-
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("set client read timeout");
-        let _ = client.write_all(b"GET / HTTP/1.1\r\n\r\n");
-        assert_eof(&mut client);
-    }
-
     /// `reject_too_many_connections` は 503 応答を書き込んでから EOF になる。
     #[test]
     fn reject_too_many_connections_writes_response_and_closes() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let addr = listener.local_addr().expect("local addr");
-        let mut client = TcpStream::connect(addr).expect("connect");
-        let (server_stream, _) = listener.accept().expect("accept");
+        let (server, mut client) = loopback_pair();
 
         std::thread::spawn(move || {
-            reject_too_many_connections(server_stream);
+            reject_too_many_connections(server);
         });
 
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set read timeout");
-        let mut received = Vec::new();
-        let mut buf = [0u8; 512];
-        loop {
-            match client.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => received.extend_from_slice(&buf[..n]),
-                Err(_) => break,
-            }
-        }
+        let received = read_all(&mut client);
         let text = String::from_utf8_lossy(&received);
         assert!(text.starts_with("HTTP/1.1 503 "), "got: {text:?}");
         assert!(text.contains("53300"), "got: {text:?}");

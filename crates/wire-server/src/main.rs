@@ -25,11 +25,13 @@
 //! 両表層とも `GuardedBindAddrs::resolve`／`bind()` を共有した**後**に
 //! accept ループだけを分岐する（HTTP-9: nosql 選択時も WIRE-7 と同じ bind
 //! ガードを通る）。`sql` は `server::accept_loop_with_engine`、`nosql` は
-//! `http::listener::accept_loop_with_limiter`（Issue #743。読み取り 30 秒
-//! タイムアウト・同時接続数 64 の共有リミッターを SQL wire と同一契約で
-//! 適用する。要求の解釈・応答生成は暫定ハンドラ〔`http::conn::
-//! handle_connection_interim`〕にとどまり、本体は Issue #747）を呼ぶ。
-//! いずれも `match surface` の前に 1 回だけ構築した同一の
+//! `http::listener::accept_loop_with_limiter`（Issue #743・#747。読み取り
+//! 30 秒タイムアウト・同時接続数 64 の共有リミッターを SQL wire と同一契約で
+//! 適用したうえで、接続ハンドラ本体〔`http::conn::handle_connection_with`〕
+//! を呼ぶ。要求パース・ルーティング（本 Issue 時点では全パス `08P01` の
+//! `conn::PlaceholderRouter`。実ルータは Issue #758）・panic 非伝播は
+//! Issue #747 で実装済み）を呼ぶ。いずれも `match surface` の前に
+//! 1 回だけ構築した同一の
 //! `limits::ConnectionLimiter` インスタンスを受け取る。選ばれていない
 //! 側のリスナーは構造的に bind されない（HTTP-1 の排他方針）。
 //! `--fault-inject post-commit-panic`（Issue #705。feature `fault-injection`
@@ -521,7 +523,7 @@ fn run_server(args: &[String]) -> ExitCode {
     // 同一のまま保つ）。
     if surface == wire_server::surface::Surface::Nosql {
         eprintln!(
-            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; request handling lands in Issue #747)"
+            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; all requests rejected with 08P01 pending Issue #758 router)"
         );
     }
 
@@ -545,9 +547,10 @@ fn run_server(args: &[String]) -> ExitCode {
             server::accept_loop_with_engine(listener, store, core, limiter, limits::READ_TIMEOUT);
         }
         wire_server::surface::Surface::Nosql => {
-            // `store`／`core` は本 Issue 時点の暫定ハンドラでは使わない
-            // （要求を読まないため）。接続ハンドラ本体（Issue #747）が両者を
-            // 使う前提で、ここまでの構築順序を SQL 側と揃えている。
+            // `store`／`core` は接続ハンドラ本体（Issue #747。全パス `08P01`
+            // の `conn::PlaceholderRouter` を固定で使う）ではまだ使わない。
+            // 実ルータ（Issue #758）がセッション認証・クエリ実行のために
+            // 両者を使う前提で、ここまでの構築順序を SQL 側と揃えている。
             let _ = (&store, &core);
             wire_server::http::listener::accept_loop_with_limiter(
                 listener,

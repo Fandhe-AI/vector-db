@@ -15,9 +15,11 @@
 //! 1. stderr に現れる `wire-server: listening on` 行がちょうど 1 行
 //!    （`bind()` が 1 回しか呼ばれないことの外形証跡）
 //! 2. その唯一の addr で選択表層の挙動が判別できること
-//!    （`sql`: SSLRequest → 先頭バイト `N`。`nosql`: 暫定ハンドラ
-//!    〔Issue #743・`handle_connection_interim`〕が有界 1 回 read の後
-//!    応答を書かずに閉じるため `N`/`E` を返さない）
+//!    （`sql`: SSLRequest → 先頭バイト `N`。`nosql`: 接続ハンドラ
+//!    〔Issue #747・`http::conn::handle_connection_with`〕へ SSLRequest の
+//!    8 バイト（HTTP 要求行として不正）を送ると、`N`／`E`（pg wire の応答
+//!    バイト）は返らず、EOF または HTTP 応答〔`HTTP/1.1 400` 先頭〕の
+//!    いずれかで判別できる）
 //!
 //! sql 側の bind ガード自体（loopback 以外の拒否）は `tests/wire7_bind_guard.rs`
 //! が担い、本ファイルは表層選択と分岐に焦点を当てる。
@@ -35,10 +37,13 @@ use common::{run_wire_server_to_exit, write_empty_user_store, SpawnedServer, Tem
 enum Probe {
     /// sql wire: 認証前に SSLRequest へ応答する（`N`＝非対応）。
     PgWireAnswersN,
-    /// nosql 暫定ハンドラ（Issue #735・#743。固定長 1 バイトの有界
-    /// 1 回 read の後、応答を書かずに shutdown する）: 応答しない
-    /// （EOF／`ConnectionReset`／`BrokenPipe` のいずれも許容）。
-    StubDoesNotAnswer,
+    /// nosql 接続ハンドラ（Issue #747・`http::conn::handle_connection_with`）:
+    /// SSLRequest の 8 バイトは HTTP 要求行として不正（CRLF を含まない）
+    /// なので、`shutdown(Write)` で「これ以上送らない」ことを伝えたあとは
+    /// EOF（頭が空のまま切断）または `HTTP/1.1 400` 応答（頭の一部が届いた
+    /// 状態での切断・`08P01`）のいずれかへ倒れる。pg wire の応答バイト
+    /// （`N`／`E`）は構造的に返らないことをここで確認する。
+    HttpRejectsOrCloses,
 }
 
 /// テーブルテストの 1 ケース（受理側）。
@@ -72,7 +77,7 @@ fn surface_selection_accepts_and_starts_single_listener() {
             label: "nosql",
             extra_args: &["--surface", "nosql"],
             surface_line: true,
-            probe: Probe::StubDoesNotAnswer,
+            probe: Probe::HttpRejectsOrCloses,
         },
     ];
 
@@ -143,25 +148,41 @@ fn probe_listener(addr: &str, probe: &Probe, label: &str) {
                 "label={label}: expected SQL wire to answer SSLRequest with 'N'"
             );
         }
-        Probe::StubDoesNotAnswer => match stream.write_all(&ssl_request) {
+        Probe::HttpRejectsOrCloses => match stream.write_all(&ssl_request) {
             Ok(()) => {
-                let mut byte = [0u8; 1];
-                match stream.read(&mut byte) {
-                    Ok(0) => {}
-                    Ok(_) => assert!(
-                        byte[0] != b'N' && byte[0] != b'E',
-                        "label={label}: nosql http listener must not answer like the SQL wire, got byte {:?}",
-                        byte[0]
-                    ),
-                    Err(e) => {
-                        let kind = e.kind();
-                        assert!(
-                            kind == std::io::ErrorKind::ConnectionReset
-                                || kind == std::io::ErrorKind::BrokenPipe,
-                            "label={label}: unexpected read error from nosql http listener: {e:?}"
-                        );
+                // SSLRequest は CRLF を含まないため要求行の途中で終わる。
+                // `shutdown(Write)` で「これ以上送らない」ことを伝え、
+                // 接続ハンドラ〔Issue #747〕が「頭が完成しないまま切断」を
+                // 検出して応答するか、無応答のまま EOF になるかのいずれかへ
+                // 倒れることを確認する（`08P01` 応答か EOF のみ許容）。
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let mut received = Vec::new();
+                let mut buf = [0u8; 512];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => received.extend_from_slice(&buf[..n]),
+                        Err(e) => {
+                            let kind = e.kind();
+                            assert!(
+                                kind == std::io::ErrorKind::ConnectionReset
+                                    || kind == std::io::ErrorKind::BrokenPipe
+                                    || kind == std::io::ErrorKind::WouldBlock
+                                    || kind == std::io::ErrorKind::TimedOut,
+                                "label={label}: unexpected read error from nosql http listener: {e:?}"
+                            );
+                            break;
+                        }
                     }
                 }
+                assert!(
+                    received.first() != Some(&b'N') && received.first() != Some(&b'E'),
+                    "label={label}: nosql http listener must not answer like the SQL wire, got {received:?}"
+                );
+                assert!(
+                    received.is_empty() || received.starts_with(b"HTTP/1.1 400"),
+                    "label={label}: expected EOF or an HTTP/1.1 400 response, got {received:?}"
+                );
             }
             Err(e) => {
                 let kind = e.kind();

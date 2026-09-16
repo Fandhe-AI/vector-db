@@ -87,8 +87,12 @@ bind は同じ理由で起動拒否されます。`nosql` を選択すると、�
 表層（SQL wire）のリスナーは一切 bind されず、代わりに HTTP/1.1 の
 リスナーが 1 本だけ bind されます。読み取り 30 秒タイムアウト・同時接続数 64
 （超過時は HTTP 503／`wire_code` `53300`）は SQL wire と同一契約で適用済み
-です（Issue #743）。要求の解釈・応答生成（接続ハンドラ本体）は後続 Issue
-（#747）の担当です。
+です（Issue #743）。要求行・ヘッダ・本文の読み取りと解析、応答の書き込み・
+不正フレーム時の有界な読み捨てクローズ、panic の非伝播は接続ハンドラ本体
+（Issue #747）として実装済みですが、`POST /v1/query` 等の実ルーティングは
+まだ無く、全パスが `08P01`（`unknown request target`）で拒否されます。実
+ルータ（`/v1/session`・`/v1/session/close`・`/v1/query` の 3 エンドポイント
+限定）は後続 Issue（#758）の担当です。
 
 `--search-engine`（Issue #656）は検索エンジン選択の opt-in CLI 引数です。
 `--planner-endpoint`／`--planner-model`／`--embedder-hashing-dim`

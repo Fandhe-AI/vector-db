@@ -24,11 +24,15 @@
 //!   TASK-173・HTTP-3, HTTP-11）
 //! - [`status`]: `ErrorClass` → HTTP ステータスの決定的射影（Issue #744・ERR-4）
 //! - [`error_body`]: `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）
-//! - [`conn`][]: 接続単位の暫定処理（読み取りタイムアウト超過・EOF・データ到着の
-//!   いずれでも応答なしでクローズする [`conn::handle_connection_interim`]、
+//! - [`conn`][]: 接続 1 本ぶんの受理後処理。要求行→ヘッダ→本文の読み取りと
+//!   パース → `RequestHandler` へのルーティング（本 Issue 時点では全パス
+//!   `08P01` の `conn::PlaceholderRouter`。実ルータは Issue #758）を
+//!   [`conn::handle_connection_with`] として実装し、不正フレーム時も応答を
+//!   書いてから有界に読み捨ててクローズする（PoC-15）・panic は
+//!   `catch_unwind` で多層防御する（Issue #747・TASK-173・HTTP-12）。
 //!   同時接続数上限超過時に 503／`53300` を返す
-//!   [`conn::reject_too_many_connections`]。Issue #743・TASK-69・WIRE-5,
-//!   WIRE-6）
+//!   [`conn::reject_too_many_connections`]（Issue #743・TASK-69・WIRE-5,
+//!   WIRE-6）も担う
 //! - [`listener`]: `--surface nosql` の accept ループ本体
 //!   （[`listener::accept_loop_with_limiter`]。読み取り 30 秒タイムアウト・
 //!   同時接続数 64 の共有リミッターを SQL wire と同一契約で適用する。
@@ -55,10 +59,10 @@
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - `explain: true` 時の `{"explain":[...]}` 応答（#765）
-//! - 接続ハンドラ本体（[`conn::handle_connection_interim`] を置き換える
-//!   要求パース・ルーティング・panic 非伝播。Issue #747）
-//! - op 語彙の許可リストと未知 op（`0A000`）判定・各 op の実行計画への写像
-//!   （Issue #759・#763・#766・#768 以降）
+//! - `conn::PlaceholderRouter` を置き換える実ルータ（`/v1/session`・
+//!   `/v1/session/close`・`/v1/query` の 3 エンドポイント限定・op 語彙の
+//!   許可リストと未知 op（`0A000`）判定・各 op の実行計画への写像。
+//!   Issue #758・#759・#763・#766・#768 以降）
 //!
 //! 対応: TASK-173〜TASK-175（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア
 //! HTTP-1〜13・NOSQL-1〜NOSQL-10。PoC-15/TASK-182 は private 資産のため
