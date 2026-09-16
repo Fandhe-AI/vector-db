@@ -179,18 +179,31 @@ impl MetadataFilter {
     }
 }
 
+/// `count` 件のフィルタが [`MAX_METADATA_FILTERS`] を超えないことを検証する
+/// （`54000`）。[`bind_all`] の件数検査本体を切り出したもので、`Vec` 確保・
+/// 要素の複製より**前**に呼べる形にする（`.claude/rules/security.md`
+/// 「不安全な設計｜無制限リソース確保（DoS）」対応）。
+///
+/// `pub`: `wire-server::http::query::filter`（NoSQL 表層の `filter` 配列。
+/// Issue #761・TASK-175・NOSQL-7）が、JSON 配列要素を [`DeclarativeFilter`]
+/// へ写像する**前**（`String` 複製・`Vec` 確保より前）に同じ上限を検査する
+/// ために呼ぶ。`bind_all` と別々に上限を持たない単一情報源。
+pub fn check_filter_count(count: usize) -> Result<(), SqlSurfaceError> {
+    if count > MAX_METADATA_FILTERS {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "metadata filter count {count} exceeds limit {MAX_METADATA_FILTERS}"
+        )));
+    }
+    Ok(())
+}
+
 /// `filters` を `schema` へ一括束縛する。件数が [`MAX_METADATA_FILTERS`] を超える
 /// 場合は `Vec` を確保する**前**に `54000` で拒否する。
 pub fn bind_all(
     filters: &[DeclarativeFilter],
     schema: &TableSchema,
 ) -> Result<Vec<MetadataFilter>, SqlSurfaceError> {
-    if filters.len() > MAX_METADATA_FILTERS {
-        return Err(SqlSurfaceError::payload_too_large(format!(
-            "metadata filter count {} exceeds limit {MAX_METADATA_FILTERS}",
-            filters.len()
-        )));
-    }
+    check_filter_count(filters.len())?;
     let mut bound = Vec::with_capacity(filters.len());
     for filter in filters {
         bound.push(filter.bind(schema)?);
@@ -338,6 +351,17 @@ mod tests {
             .collect();
         let err = bind_all(&filters, &schema()).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn check_filter_count_accepts_at_limit_and_rejects_over_limit() {
+        assert!(check_filter_count(MAX_METADATA_FILTERS).is_ok());
+        assert_eq!(
+            check_filter_count(MAX_METADATA_FILTERS + 1)
+                .unwrap_err()
+                .wire_code(),
+            "54000"
+        );
     }
 
     #[test]

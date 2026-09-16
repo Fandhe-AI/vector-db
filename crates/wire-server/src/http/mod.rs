@@ -8,8 +8,8 @@
 //!
 //! エラー契約は SQL 表層（`wire_code` ＝ [`engine::error_format::ErrorClass`]）と
 //! 完全共有し、新規 `wire_code` は追加しない。本モジュール配下は `ErrorClass` を
-//! HTTP 上の表現（ステータス・応答本文等）へ写像する各要素、および要求側の
-//! パース処理を集約する。
+//! HTTP 上の表現（ステータス・応答本文等）へ写像する各要素、要求側のパース処理、
+//! および `POST /v1/query` の JSON クエリオブジェクト検証を集約する。
 //!
 //! モジュール構成（現時点）:
 //! - [`request`]: 要求行（メソッド・ターゲット・バージョン）の解析（Issue #740・
@@ -23,6 +23,12 @@
 //!   を即クローズ。Issue #735・TASK-171／HTTP-1・HTTP-9）。`main.rs::run_server`
 //!   が SQL wire の [`crate::server::accept_loop_with_engine`] と排他選択で
 //!   呼ぶ唯一の呼び出し元
+//! - [`query`]: `POST /v1/query` の op 別写像の親モジュール（TASK-175。
+//!   `query::schema` が JSON クエリオブジェクトの意味的検証（必須キー欠落・
+//!   未知キー・型不一致 → `42601`）を担う。Issue #760。`query::filter` は
+//!   `filter` 配列の `op` 語彙（`eq`／`prefix`）を
+//!   `engine::declarative_filter::DeclarativeFilter` へ写像し `bind_all` へ
+//!   委譲する（Issue #761・NOSQL-7）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - `Content-Type`／本文長上限の検証（[`headers::Headers::get_single`] で
@@ -30,13 +36,16 @@
 //! - 応答エンコーダ（Issue #746）
 //! - 接続ハンドラ本体（[`listener::accept_loop_stub`] を置き換える有界読み取り・
 //!   EOF 時の無応答クローズ判断・panic 非伝播。Issue #747）
+//! - op 語彙の許可リストと未知 op（`0A000`）判定・各 op の実行計画への写像
+//!   （Issue #759・#763・#766・#768 以降）
 //!
-//! 対応: TASK-173（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア HTTP-1〜13。
-//! PoC-15/TASK-182 は private 資産のためポインタ参照のみで、コード・所見は
-//! 転記しない）。
+//! 対応: TASK-173〜TASK-175（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア
+//! HTTP-1〜13・NOSQL-1〜NOSQL-10。PoC-15/TASK-182 は private 資産のため
+//! ポインタ参照のみで、コード・所見は転記しない）。
 
 pub mod error_body;
 pub mod headers;
 pub mod listener;
+pub mod query;
 pub mod request;
 pub mod status;
