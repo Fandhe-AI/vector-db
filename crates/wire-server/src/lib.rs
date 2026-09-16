@@ -17,10 +17,12 @@
 //!   は `--surface nosql` の accept ループ stub（Issue #735・HTTP-9）。
 //!   `http::body` は本文を読み取る前の `Content-Type`（`application/json`・
 //!   `charset=utf-8` のみ）検証と本文長 1 MiB 上限判定（`08P01`／`54000`）、
-//!   読み取り後の UTF-8 昇格（`42601`。Issue #742）を担う。`http::query::schema`
-//!   は `POST /v1/query` の JSON クエリオブジェクトの意味的検証ヘルパー
-//!   （必須欠落・未知キー・型不一致 → `42601`。Issue #760）。`http::query::filter`
-//!   は `filter` 配列の `op` 語彙（`eq`／`prefix`）を
+//!   読み取り後の UTF-8 昇格（`42601`。Issue #742）を担う。
+//!   `http::session` はセッション認証のトークン生成・base64url 表現
+//!   （TASK-174・HTTP-4・Issue #750。ストア・エンドポイントは後続 Issue の担当）。
+//!   `http::query::schema` は `POST /v1/query` の JSON クエリオブジェクトの
+//!   意味的検証ヘルパー（必須欠落・未知キー・型不一致 → `42601`。Issue #760）。
+//!   `http::query::filter` は `filter` 配列の `op` 語彙（`eq`／`prefix`）を
 //!   `engine::declarative_filter::DeclarativeFilter` へ写像し `bind_all` で
 //!   `TableSchema` へ束縛する（Issue #761・NOSQL-7）。後続の応答エンコーダ・
 //!   接続ハンドラ本体は #746〜#747 が `http` 配下へ追加していく

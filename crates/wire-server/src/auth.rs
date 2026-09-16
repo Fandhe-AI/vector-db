@@ -320,6 +320,9 @@ pub fn verify(
 /// salt 生成用の CSPRNG。新規依存を追加せず `/dev/urandom` から読む（Unix 前提。
 /// 読めない場合はエラー終了の fail-closed。WIRE-2: salt はユーザーごとにランダム
 /// 生成する）。`main.rs` の `hash-password` サブコマンドから呼ばれる。
+/// [`crate::http::session::token::SessionToken::generate`]（NoSQL 表層の
+/// セッショントークン生成。TASK-174・HTTP-4。Issue #750）からも同じ乱数源
+/// として再利用される。
 pub fn read_urandom(len: usize) -> std::io::Result<Vec<u8>> {
     let mut f = std::fs::File::open("/dev/urandom")?;
     let mut buf = vec![0u8; len];
