@@ -29,7 +29,16 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
+use wire_server::http::headers::MAX_HEADER_SECTION_LEN;
+use wire_server::http::request::MAX_REQUEST_LINE_LEN;
 use wire_server::limits::ConnectionLimiter;
+
+/// `http::conn::read_head` の内部読み取りバッファ長（`MAX_REQUEST_LINE_LEN`
+/// ＋ `MAX_HEADER_SECTION_LEN`。非公開の `conn::HEAD_BUF_LEN` と同じ計算式）。
+/// 「読み捨てクローズ」の回帰検出力を保証するため、末尾ゴミバイト列の長さは
+/// これを超える必要がある（下記 `http12_malformed_request_line_with_pending_bytes_still_delivers_response`
+/// の doc 参照）。
+const HEAD_BUF_LEN_FOR_TEST: usize = MAX_REQUEST_LINE_LEN + MAX_HEADER_SECTION_LEN;
 
 /// `accept_loop_with_limiter` をサーバースレッドで起動し、
 /// `(接続先アドレス, リミッターのクローン)` を返す（`tests/http_limits.rs`
@@ -278,11 +287,28 @@ fn http12_content_length_shortfall_in_flight_does_not_block_other_connection() {
 }
 
 /// ケース 2: 要求行が構文不正（メソッド・バージョンとも非対応）かつ末尾に
-/// ゴミバイト列（数 KiB）を同一書き込みで付加し `shutdown(Write)` しない
-/// 状態で応答を待つ。未読データが残ったまま応答→drain→close する経路
-/// （読み捨てクローズ。PoC-15）を非 vacuous に踏ませ、A が応答全体を
-/// `Ok(0)` まで受信できること（RST が発生しないこと）を確認する。A の
-/// 送信直後に B を完了させ、その後 A を読む（逐次ではない到達順序）。
+/// ゴミバイト列（`HEAD_BUF_LEN_FOR_TEST` 超過長）を同一書き込みで付加し
+/// `shutdown(Write)` しない状態で応答を待つ。未読データが残ったまま
+/// 応答→drain→close する経路（読み捨てクローズ。PoC-15）を非 vacuous に
+/// 踏ませ、A が応答全体を `Ok(0)` まで受信できること（RST が発生しない
+/// こと）を確認する。A の送信直後に B を完了させ、その後 A を読む
+/// （逐次ではない到達順序）。
+///
+/// ゴミバイト列の長さを `read_head` の内部バッファ長（`HEAD_BUF_LEN`＝
+/// `HEAD_BUF_LEN_FOR_TEST`）より確実に大きくしている（数バイトの
+/// マージンではなく 1 バッファ分丸ごと超過させる）。`read_head` は
+/// 要求行が `Malformed` と判定でき次第ループを抜けるが、判定前の
+/// `stream.read` 呼び出し自体は「バッファの空き全体」を読み取り範囲として
+/// 渡すため、ゴミが `HEAD_BUF_LEN_FOR_TEST` 以下だと最初の 1 回の read で
+/// カーネル受信バッファの中身をすべて読み切ってしまい得る（実装は正しい
+/// まま、未読データが 1 バイトも残らない）。その場合 drain-and-close の
+/// 読み捨てループは空ソケットを待つだけになり、drain 処理自体を省略・
+/// 破損させる回帰が起きてもこのテストは変わらず pass してしまう
+/// （検出力が無い）。ゴミを `HEAD_BUF_LEN_FOR_TEST` 超過長にすることで、
+/// `read_head` 側の read がどれだけ多くのバイトを一括で読めても
+/// バッファ容量（`HEAD_BUF_LEN_FOR_TEST`）を超えては読めない以上、
+/// 超過分は構造的にカーネル受信バッファに残り続け、drain が実際に
+/// 未読バイトを読み捨てる経路を毎回確実に踏む。
 #[test]
 fn http12_malformed_request_line_with_pending_bytes_still_delivers_response() {
     let (addr, limiter) = spawn_http_server(4, Duration::from_secs(10));
@@ -292,7 +318,10 @@ fn http12_malformed_request_line_with_pending_bytes_still_delivers_response() {
     // いずれも `parse_request_line` を `Malformed` にする形状。CRLF は
     // 含むため `Incomplete` へは倒れない。
     let mut payload = b"GET / HTTP/1.0\r\n".to_vec();
-    payload.extend(std::iter::repeat_n(b'x', 4096));
+    // `read_head` の読み取りバッファ（`HEAD_BUF_LEN_FOR_TEST`）を
+    // 丸ごと超過させ、未読データが drain 対象として必ず残ることを保証する
+    // （doc 参照）。
+    payload.extend(std::iter::repeat_n(b'x', HEAD_BUF_LEN_FOR_TEST + 4096));
     a.write_all(&payload)
         .expect("write malformed request line with trailing garbage");
     // `shutdown(Write)` しない: 未読データが残った状態のまま応答を待つ。
