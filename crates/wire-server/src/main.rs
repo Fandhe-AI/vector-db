@@ -974,7 +974,7 @@ mod tests {
     }
 
     // Issue #734: `--surface` の解決結果パーステスト。wire 経由の実行契約
-    // （受理・拒否の外形挙動）は `tests/wire_surface_cli.rs`（子プロセス）が
+    // （受理・拒否の外形挙動）は `tests/http1_surface_select.rs`（子プロセス）が
     // 担う。
 
     #[test]
