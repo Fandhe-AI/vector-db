@@ -59,9 +59,7 @@ fn seed_two_tenants(storage: &Storage) {
     storage.create_table(&schema()).expect("create table");
     let ctx_a = PolicyContext::with_visibilities("tenant-a", [Visibility::Public])
         .expect("valid tenant-a ctx");
-    let ctx_b =
-        PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
-            .expect("valid tenant-b ctx");
+    let ctx_b = ctx_b_full();
 
     let langs = ["ja", "ja", "ja", "en", "en"];
     for (idx, lang) in langs.iter().enumerate() {
@@ -467,7 +465,21 @@ fn cross_tenant_interleaving_never_leaks_private_rows_through_shared_caches() {
 
     let assert_tenant_a_result = |result: &QueryResult, label: &str| {
         for row in &result.rows {
-            if let Cell::Text(lang) = &row.cells.first().cloned().unwrap_or(Cell::Null) {
+            // `group_sql` の形（`cells[0]` が `lang` の `Cell::Text`）はここで
+            // 直接検査できるが、`scan_sql`（`SELECT id, lang FROM docs LIMIT 10`）
+            // は `cells[0]` が `id` の `Cell::Integer` になるため、`Cell::Text`
+            // ガードだけでは scan 形状の非漏えい検査が一度も実行されない
+            // （vacuous）。scan 形状は tenant-b の Private 行 id（101..=103）が
+            // 混入していないことを直接検査することで、形状によらず非漏えいを
+            // 固定する（レビュー指摘）。
+            assert!(
+                !(101..=103).contains(&row.id),
+                "tenant-a {label} leaked tenant-b-only row id {}",
+                row.id
+            );
+            if let Some(Cell::Text(lang)) =
+                row.cells.iter().find(|cell| matches!(cell, Cell::Text(_)))
+            {
                 assert_ne!(lang, "xx", "tenant-a {label} leaked tenant-b-only group");
             }
         }
@@ -630,14 +642,20 @@ fn bound_and_sql_paths_share_error_classification_for_same_invalid_input() {
             bind_aggregate(&validated_aggregate, schema, udfs)
         })
         .expect_err("SUM(embedding) should be rejected on the bound path");
+    // 両経路の `wire_code` が一致するだけでなく、その一致先が実際に契約どおりの
+    // `22000`（invalid input）であることを固定オラクルとして検査する。一致検査
+    // のみでは両経路が「同じ間違ったコード」で一致する vacuous pass を防げない
+    // （レビュー指摘）。
+    assert_eq!(sql_err.wire_code(), "22000", "sql_err={sql_err:?}");
+    assert_eq!(bound_err.wire_code(), "22000", "bound_err={bound_err:?}");
     assert_eq!(
         sql_err.wire_code(),
         bound_err.wire_code(),
         "SUM(embedding) wire_code mismatch: sql={sql_err:?} bound={bound_err:?}"
     );
 
-    // `GROUP BY` キー列を HAVING で直接比較する形は `42601` で拒否される
-    // （`tests/sql_group_by.rs` の既存契約と同一）。
+    // `GROUP BY` キー列を HAVING で直接比較する形は `22000`（invalid input）
+    // で拒否される（`tests/sql_group_by.rs` の既存契約と同一）。
     let sql_having_key = "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang HAVING lang > 1";
     let mut session2 = SessionState::default();
     let sql_err2 = core
@@ -657,6 +675,9 @@ fn bound_and_sql_paths_share_error_classification_for_same_invalid_input() {
         .expect_err(
             "HAVING referencing the GROUP BY key column should be rejected on the bound path",
         );
+    // 同様に `22000`（invalid input）を固定オラクルとして検査する。
+    assert_eq!(sql_err2.wire_code(), "22000", "sql_err2={sql_err2:?}");
+    assert_eq!(bound_err2.wire_code(), "22000", "bound_err2={bound_err2:?}");
     assert_eq!(
         sql_err2.wire_code(),
         bound_err2.wire_code(),
