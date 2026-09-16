@@ -13,8 +13,8 @@
 //!
 //! `nosql` を選択した場合、`main.rs::run_server` は本モジュールの解決結果に
 //! 応じて [`crate::server::accept_loop_with_engine`]（`Sql`）／
-//! [`crate::http::listener::accept_loop_stub`]（`Nosql`）のいずれか 1 本だけを
-//! 呼ぶ（HTTP-1 の排他方針・Issue #735）。両表層とも bind 自体は
+//! [`crate::http::listener::accept_loop_with_limiter`]（`Nosql`）のいずれか
+//! 1 本だけを呼ぶ（HTTP-1 の排他方針・Issue #735・#743）。両表層とも bind 自体は
 //! `main.rs::run_server` が単一の `GuardedBindAddrs::resolve`／`bind` 呼び出し
 //! を共有した後に分岐するため、`nosql` 選択時にも WIRE-7 の bind ガード
 //! （TLS 未構成時は loopback 限定）が同じ経路で適用される（HTTP-9）。
@@ -32,8 +32,10 @@ pub enum Surface {
     /// 既定（未指定時）。PostgreSQL wire プロトコル互換の SQL 表層。
     #[default]
     Sql,
-    /// NoSQL 表層（HTTP/1.1 最小サブセット）。`http::listener::accept_loop_stub`
-    /// が受け皿（Issue #735。本 Issue 時点は accept 直後にクローズする stub）。
+    /// NoSQL 表層（HTTP/1.1 最小サブセット）。`http::listener::
+    /// accept_loop_with_limiter` が受け皿（Issue #735・#743。読み取り
+    /// 30 秒タイムアウト・同時接続数 64 を SQL wire と同一契約で適用する。
+    /// 要求の解釈・応答生成は暫定ハンドラにとどまり、本体は Issue #747）。
     Nosql,
 }
 

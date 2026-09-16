@@ -1,4 +1,4 @@
-//! NoSQL 表層（`--surface nosql`）の accept ループ **stub**（Issue #735・
+//! NoSQL 表層（`--surface nosql`）の accept ループ（Issue #735・#743・
 //! TASK-171／HTTP-1・HTTP-9）。
 //!
 //! `main.rs::run_server` が `--surface nosql` を選んだ場合に、SQL wire の
@@ -7,32 +7,41 @@
 //! の bind ガード適用は `main.rs` 側のディスパッチ構造で担保する）、本モジュール
 //! の責務は「1 本だけ listen される」ことの受け皿にとどめる。
 //!
-//! 本 Issue 時点では要求を一切読まず、接続を受理した直後に閉じるだけの stub
-//! である（意図的な最小実装。以下はいずれも後続 Issue の担当で、本関数の
-//! 設計そのものと誤解しないこと）:
-//! - 読み取りタイムアウト・同時接続数リミッター（[`crate::limits`] 相当。Issue #743）
+//! [`accept_loop_with_limiter`] は [`crate::server::accept_loop_inner`] と
+//! 同構造（受理 → `read_timeout` 適用 → ハンドラへ委譲／拒否 →
+//! `RejectWorkerLimiter` で有界化した使い捨てスレッドへ委譲）で、
+//! [`crate::limits::ConnectionLimiter`]（WIRE-6）・
+//! [`crate::limits::READ_TIMEOUT`]（WIRE-5）を SQL wire と**共有**する
+//! （`main.rs::run_server` が `match surface` の前に 1 回だけ構築した同一
+//! インスタンスを渡す。プロセス内で 1 表層しか起動しないため「共有」は
+//! 「同じ構築箇所・同じ定数・同じ型」で満たされる）。以下はいずれも後続
+//! Issue の担当で、本関数の設計そのものと誤解しないこと:
 //! - 要求の読み取り・[`crate::http::request`] によるパース・応答生成、
-//!   panic の非伝播（Issue #747）
+//!   panic の非伝播（Issue #747）。本 Issue の [`crate::http::conn::
+//!   handle_connection_interim`] は意図的な暫定ハンドラ（有界 1 回 read →
+//!   無応答クローズ）にとどまる
 //! - 応答エンコーダ（[`crate::http::error_body`]／[`crate::http::status`] を
-//!   使った実応答。Issue #746）
+//!   使った実応答。同時接続数上限超過時の 503 応答は本 Issue で最小実装した
+//!   [`crate::http::conn::reject_too_many_connections`] が担う）
 //!
-//! untrusted なバイト列を一切読み書きしないため、受信データ経路の
-//! `unwrap`／`expect`／添字アクセス禁止（`.claude/rules/coding-rust.md`）は
-//! 本モジュールでは該当しない。
+//! untrusted なバイト列は [`crate::http::conn`] 側でのみ扱う（本モジュールは
+//! 受理・タイムアウト適用・スレッド分岐のみで、ストリームの中身を読み書き
+//! しない）。
 
 use std::net::{Shutdown, TcpListener};
+use std::time::Duration;
+
+use crate::http::conn;
+use crate::limits::{self, ConnectionLimiter, RejectWorkerLimiter};
 
 /// 接続を受理した直後に閉じるだけの accept ループ（stub）。
 ///
-/// `listener.incoming()` は `Err` を返しても走査を止めないため、accept
-/// エラーは 1 行ログに残して次の接続へ進む（`crate::server` の accept ループ
-/// と同じ「1 接続の失敗でプロセス全体を落とさない」方針）。ログにはピア
-/// アドレス等の識別情報を含めない（本関数が受理する接続はまだ認証されて
-/// おらず、untrusted な入力を伴うログはテナント情報漏えいの経路になり
-/// うるため）。
-///
-/// 戻り値なし（`crate::server::accept_loop_with_engine` と同様、呼び出し元は
-/// プロセス終了までこの関数から戻らない前提で呼ぶ）。
+/// Issue #743 で [`accept_loop_with_limiter`] が正式な接続処理経路になった
+/// ため、`main.rs::run_server` 本体はもう本関数を呼ばない。すでに公開 API
+/// として利用側に届いている可能性があるため、AGENTS.md の「公開 API・
+/// エラー契約の互換性（P1）」に従い削除せず残す（`server::bind_loopback`
+/// と同じ後方互換方針）。
+#[deprecated(since = "0.1.0", note = "use accept_loop_with_limiter instead")]
 pub fn accept_loop_stub(listener: TcpListener) {
     for conn in listener.incoming() {
         match conn {
@@ -48,17 +57,128 @@ pub fn accept_loop_stub(listener: TcpListener) {
     }
 }
 
+/// NoSQL 表層の accept ループ本体。SQL wire の
+/// [`crate::server::accept_loop_inner`] と同じ資源保護契約
+/// （WIRE-5, WIRE-6。契約値は [`crate::limits`] に集約）を適用する:
+///
+/// - `limiter` の枠を確保できない接続は [`crate::http::conn::
+///   handle_connection_interim`] へ進ませず、`limiter` の枠を消費しない
+///   短命な使い捨てスレッドへ [`crate::http::conn::
+///   reject_too_many_connections`] を委譲し、HTTP 503／`wire_code` 53300 の
+///   JSON 応答を返してから即座にクローズする。この拒否スレッド自体も
+///   [`RejectWorkerLimiter`]（`MAX_REJECT_WORKERS`）で別枠に有界化し、上限
+///   到達後は応答を書かずに即座にクローズする（`accept_loop_inner` と同じ
+///   review 是正: 拒否経路の無制限 `thread::spawn` による DoS 対策）
+/// - 受理した接続には読み取り・書き込み双方に `read_timeout` を一度だけ
+///   設定してから [`crate::http::conn::handle_connection_interim`] へ渡す
+///
+/// `limiter` は呼び出し元（`main.rs::run_server`）が `match surface` の前に
+/// 1 回だけ構築したインスタンスを受け取る（SQL wire 側と同じ構築箇所・同じ
+/// 定数・同じ型を共有する構造。本ループが独自にリミッターを作ることはない）。
+pub fn accept_loop_with_limiter(
+    listener: TcpListener,
+    limiter: ConnectionLimiter,
+    read_timeout: Duration,
+) {
+    // 拒否応答ワーカースレッドの有界化専用リミッター（`limiter` とは別枠。
+    // `crate::server::accept_loop_inner` と同じ review 是正方針）。
+    let reject_limiter = RejectWorkerLimiter::new(limits::MAX_REJECT_WORKERS);
+
+    for incoming in listener.incoming() {
+        let stream = match incoming {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("wire-server: accept error: {e}");
+                continue;
+            }
+        };
+
+        let Some(permit) = limiter.try_acquire() else {
+            // 上限超過: ハンドラへ進ませず、スレッドを生成せずに 503／53300 を
+            // 返してから即座にクローズする（WIRE-6）。ピアアドレス等の識別
+            // 情報はログに出さない。
+            eprintln!(
+                "wire-server: rejecting connection: too many connections (active={}, max={})",
+                limiter.active(),
+                limiter.max()
+            );
+            match reject_limiter.try_acquire() {
+                Some(reject_permit) => {
+                    // `std::thread::spawn` はスレッド生成失敗時に panic し、
+                    // accept ループ自体を停止させうるため、panic しない
+                    // `Builder::spawn` を使い、失敗時はログのみで継続する。
+                    if let Err(e) = std::thread::Builder::new().spawn(move || {
+                        let _reject_permit = reject_permit;
+                        conn::reject_too_many_connections(stream);
+                    }) {
+                        eprintln!("wire-server: failed to spawn reject worker thread: {e}");
+                    }
+                }
+                None => {
+                    // 拒否ワーカーも枯渇: 新たにスレッドを生成せず、応答を
+                    // 書かずに即座にクローズする（有界化を優先し fail-closed
+                    // に倒す）。
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            }
+            continue;
+        };
+
+        if let Err(e) = limits::apply_read_timeout(&stream, read_timeout) {
+            eprintln!("wire-server: failed to configure connection timeouts: {e}");
+            // `permit` はここでスコープを抜けて解放される。
+            continue;
+        }
+
+        // `std::thread::spawn` はスレッド生成失敗時に panic し、accept
+        // ループ自体を停止させうる（OS のスレッド数制限・メモリ不足は
+        // 同時接続数上限（`MAX_CONNECTIONS`）を満たしていても発生しうる）。
+        // 拒否ワーカー経路と同じく panic しない `Builder::spawn` を使い、
+        // 失敗時は当該接続の `permit`／ストリームを解放して accept ループを
+        // 継続する（fail-closed。プロセス全体を落とさない）。
+        if let Err(e) = std::thread::Builder::new().spawn(move || {
+            // 接続処理中は `permit` を保持し続け、スレッド終了時（正常終了・
+            // panic いずれも）に Drop で確実に枠を解放する。
+            let _permit = permit;
+            conn::handle_connection_interim(stream);
+        }) {
+            eprintln!("wire-server: failed to spawn connection handler thread: {e}");
+            // クロージャへ move された `permit` はスレッド生成失敗時に
+            // 即座に Drop され枠が解放される。ストリームは outgoing の
+            // `spawn` 失敗で誰も所有しなくなるため、OS の接続クローズに
+            // 任せる（追加の `shutdown` 呼び出しは不要）。
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Read;
     use std::net::TcpStream;
-    use std::time::Duration;
+
+    /// `stream.read` が実際に EOF（`Ok(0)`）で終わったことを確認する。
+    ///
+    /// `read(...).unwrap_or(0)` は、クライアント側の read が `WouldBlock`／
+    /// `TimedOut` で終わった場合も `Ok(0)`（EOF）と同一視してしまい、
+    /// 「サーバーの `read_timeout` 超過後に接続が閉じる」という検証対象の
+    /// 契約が破れていてもテストを通してしまう（codex-review 指摘）。
+    /// ここでは `Ok(0)` のみを合格とし、それ以外（`WouldBlock`／`TimedOut`
+    /// を含む）はテスト失敗として明示する。
+    fn assert_eof(stream: &mut TcpStream) {
+        let mut buf = [0u8; 8];
+        match stream.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("expected EOF without any response bytes, got {n} bytes"),
+            Err(e) => panic!("expected EOF (Ok(0)), got read error: {e:?}"),
+        }
+    }
 
     /// stub リスナーが接続を受理した直後に閉じ、要求を読まないこと・
     /// 応答を書かないこと・ループが次の接続を受理し続けること（1 回の
     /// 接続で終了しない）を確認する。
     #[test]
+    #[allow(deprecated)]
     fn accept_loop_stub_closes_connections_without_reading_or_writing() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral loopback");
         let addr = listener.local_addr().expect("local addr");
@@ -77,10 +197,6 @@ mod tests {
             let mut buf = [0u8; 8];
             let read_result = stream.read(&mut buf);
             match read_result {
-                // stub は accept 直後にクローズするため EOF（0 バイト）を
-                // 期待するのが基本形だが、シャットダウンの伝播タイミングに
-                // よっては OS が RST を返すこともある（いずれも「応答を
-                // 待ち受けている」状態ではないことの証跡として許容する）。
                 Ok(n) => assert_eq!(n, 0, "expected EOF (0 bytes), got {n} bytes"),
                 Err(e) => {
                     let kind = e.kind();
@@ -91,6 +207,84 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// 上限超過接続が HTTP 503／`53300` を受けて `active()` が枠を消費
+    /// しないこと（`server.rs` の同名テストの HTTP 版）。
+    #[test]
+    fn accept_loop_with_limiter_rejects_connection_over_capacity_with_503() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let limiter = ConnectionLimiter::new(1);
+        let limiter_for_loop = limiter.clone();
+
+        std::thread::spawn(move || {
+            accept_loop_with_limiter(listener, limiter_for_loop, Duration::from_secs(5));
+        });
+
+        // 1 本目: 枠を保持し続ける（何も送らない）。
+        let holder = TcpStream::connect(addr).expect("connect holder");
+
+        // limiter に反映されるまで待つ。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while limiter.active() < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for permit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 2 本目: 拒否されるはず。
+        let mut rejected = TcpStream::connect(addr).expect("connect rejected");
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut received = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            match rejected.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&received);
+        assert!(text.starts_with("HTTP/1.1 503 "), "got: {text:?}");
+        assert!(text.contains("53300"), "got: {text:?}");
+
+        assert_eq!(limiter.active(), 1, "reject path must not consume a permit");
+        drop(holder);
+    }
+
+    /// 短縮タイムアウトで受理した接続が、タイムアウト後に応答なしで
+    /// EOF になり、枠が解放されること。
+    #[test]
+    fn accept_loop_with_limiter_releases_permit_after_read_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let limiter = ConnectionLimiter::new(1);
+        let limiter_for_loop = limiter.clone();
+        let short_timeout = Duration::from_millis(150);
+
+        std::thread::spawn(move || {
+            accept_loop_with_limiter(listener, limiter_for_loop, short_timeout);
+        });
+
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        assert_eof(&mut stream);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while limiter.active() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for permit release"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }

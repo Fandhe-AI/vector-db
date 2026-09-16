@@ -15,7 +15,9 @@
 //! 1. stderr に現れる `wire-server: listening on` 行がちょうど 1 行
 //!    （`bind()` が 1 回しか呼ばれないことの外形証跡）
 //! 2. その唯一の addr で選択表層の挙動が判別できること
-//!    （`sql`: SSLRequest → 先頭バイト `N`。`nosql`: `N`/`E` を返さない）
+//!    （`sql`: SSLRequest → 先頭バイト `N`。`nosql`: 暫定ハンドラ
+//!    〔Issue #743・`handle_connection_interim`〕が有界 1 回 read の後
+//!    応答を書かずに閉じるため `N`/`E` を返さない）
 //!
 //! sql 側の bind ガード自体（loopback 以外の拒否）は `tests/wire7_bind_guard.rs`
 //! が担い、本ファイルは表層選択と分岐に焦点を当てる。
@@ -33,7 +35,8 @@ use common::{run_wire_server_to_exit, write_empty_user_store, SpawnedServer, Tem
 enum Probe {
     /// sql wire: 認証前に SSLRequest へ応答する（`N`＝非対応）。
     PgWireAnswersN,
-    /// nosql stub（Issue #735。要求を一切読まない）: 応答しない
+    /// nosql 暫定ハンドラ（Issue #735・#743。固定長 1 バイトの有界
+    /// 1 回 read の後、応答を書かずに shutdown する）: 応答しない
     /// （EOF／`ConnectionReset`／`BrokenPipe` のいずれも許容）。
     StubDoesNotAnswer,
 }
@@ -147,7 +150,7 @@ fn probe_listener(addr: &str, probe: &Probe, label: &str) {
                     Ok(0) => {}
                     Ok(_) => assert!(
                         byte[0] != b'N' && byte[0] != b'E',
-                        "label={label}: nosql stub must not answer like the SQL wire, got byte {:?}",
+                        "label={label}: nosql http listener must not answer like the SQL wire, got byte {:?}",
                         byte[0]
                     ),
                     Err(e) => {
@@ -155,7 +158,7 @@ fn probe_listener(addr: &str, probe: &Probe, label: &str) {
                         assert!(
                             kind == std::io::ErrorKind::ConnectionReset
                                 || kind == std::io::ErrorKind::BrokenPipe,
-                            "label={label}: unexpected read error from nosql stub: {e:?}"
+                            "label={label}: unexpected read error from nosql http listener: {e:?}"
                         );
                     }
                 }
@@ -165,7 +168,7 @@ fn probe_listener(addr: &str, probe: &Probe, label: &str) {
                 assert!(
                     kind == std::io::ErrorKind::ConnectionReset
                         || kind == std::io::ErrorKind::BrokenPipe,
-                    "label={label}: unexpected write error to nosql stub: {kind:?}"
+                    "label={label}: unexpected write error to nosql http listener: {kind:?}"
                 );
             }
         },

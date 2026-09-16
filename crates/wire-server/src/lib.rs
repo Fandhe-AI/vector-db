@@ -16,11 +16,14 @@
 //!   `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）。`http::response`
 //!   はステータスコード＋JSON 本文 → HTTP/1.1 応答バイト列（ステータス行・
 //!   `Connection: close`・`Content-Type`／`Content-Length`・CRLF の組み立て。
-//!   Issue #746・HTTP-2・HTTP-3・ERR-4・ERR-5）。`http::listener` は
-//!   `--surface nosql` の accept ループ stub（Issue #735・HTTP-9）。
-//!   `http::body` は本文を読み取る前の `Content-Type`（`application/json`・
-//!   `charset=utf-8` のみ）検証と本文長 1 MiB 上限判定（`08P01`／`54000`）、
-//!   読み取り後の UTF-8 昇格（`42601`。Issue #742）を担う。
+//!   Issue #746・HTTP-2・HTTP-3・ERR-4・ERR-5）。`http::listener`
+//!   は `--surface nosql` の accept ループ本体（Issue #735・#743・HTTP-9。
+//!   読み取り 30 秒タイムアウト・同時接続数 64（超過は 503／`53300`）を
+//!   SQL wire と同一契約で適用する。要求の解釈・応答生成は `http::conn` の
+//!   暫定ハンドラにとどまり、本体は #747）。`http::body` は本文を読み取る前の
+//!   `Content-Type`（`application/json`・`charset=utf-8` のみ）検証と本文長
+//!   1 MiB 上限判定（`08P01`／`54000`）、読み取り後の UTF-8 昇格
+//!   （`42601`。Issue #742）を担う。
 //!   `http::session` はセッション認証のトークン生成・base64url 表現
 //!   （TASK-174・HTTP-4・Issue #750）と、TTL 固定〔[`limits::SESSION_TTL`]〕・
 //!   同時有効数上限〔[`limits::SessionLimiter`]／[`limits::MAX_SESSIONS`]〕
@@ -34,8 +37,8 @@
 //!   `TableSchema` へ束縛する（Issue #761・NOSQL-7）。`http::query::response`
 //!   は `search`／`scan`／`aggregate` 成功時の `engine::sql::exec::QueryResult`
 //!   → JSON 応答本文（`columns`／`rows`／`row_count`、`result_encoder` と
-//!   同じ型写像。Issue #762・NOSQL-11）。後続の接続ハンドラ本体は #747 が
-//!   `http` 配下へ追加していく
+//!   同じ型写像。Issue #762・NOSQL-11）。接続ハンドラ本体（要求パース・
+//!   ルーティング）は #747 が `http` 配下へ追加していく
 //! - [`bind_guard`]: bind アドレスの通信路保護要件検証（TLS 未構成時は loopback 限定。
 //!   TASK-70・WIRE-7）。`main.rs::run_server` の唯一の bind 経路
 //! - [`server`]: 接続受け付けループ・同時接続数の有界化・I/O タイムアウト適用
@@ -58,8 +61,8 @@
 //! - [`surface`]: `--surface` opt-in CLI 引数の閉じた語彙パーサ（Issue #734・
 //!   TASK-171／HTTP-1。SQL／NoSQL の 2 表層排他選択へ untrusted な CLI
 //!   文字列から到達する唯一の入口。`main.rs::run_server` がこの選択に応じて
-//!   `server::accept_loop_with_engine`／`http::listener::accept_loop_stub` の
-//!   いずれか 1 本だけを呼ぶ。Issue #735）
+//!   `server::accept_loop_with_engine`／`http::listener::accept_loop_with_limiter`
+//!   のいずれか 1 本だけを呼ぶ（Issue #735・#743）
 //! - `fault_injection`（feature `fault-injection` 限定・テスト専用。
 //!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
 //!   語彙パーサと、`simple_query::execute_and_respond` の登録ブロック内から
