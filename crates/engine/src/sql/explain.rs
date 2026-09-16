@@ -29,6 +29,14 @@
 //!
 //! `docs/design/explain-search-engine-exposure.md` に露出する行・語彙・
 //! 露出しない値と理由をまとめる。
+//!
+//! TASK-186・NOSQL-10 の前提として Issue #730 で [`ExplainEngine`]・
+//! [`build_explain_result`] を公開 API へ昇格した（`BoundScan`／`BoundAggregate`
+//! と同じ「同作法」）。外部から [`PlannedQuery`] を得るには
+//! `EngineCore::plan_query_with_mode`（`pub`）を使う（`PlannedQuery::new` 自体は
+//! `pub(crate)` のまま。対象外）。[`ExplainEngine`] は `Self::new` で構築し、
+//! `EXPLAIN` が検索本体を実行しない契約（本ファイル冒頭「責務境界」参照）は
+//! 呼び出し元にも求められる。
 
 use crate::query_planner::PlannedQuery;
 use crate::search_engine::SearchEngineKind;
@@ -53,7 +61,8 @@ const CUSTOM_PROVIDER_LABEL: &str = "(custom_provider)";
 /// 源泉（`EngineCore::search_engine_kind()`・`sql::hnsw_cache::classify_ann_plan`）
 /// から組み立てる。
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ExplainEngine {
+#[non_exhaustive]
+pub struct ExplainEngine {
     /// [`crate::core::EngineCore::search_engine_kind`] の戻り値そのまま。
     pub(crate) kind: Option<SearchEngineKind>,
     /// [`crate::sql::hnsw_cache::classify_ann_plan`] の判定結果（静的判定）。
@@ -61,6 +70,39 @@ pub(crate) struct ExplainEngine {
     /// [`crate::sql::scalar_plan::classify_scalar_plan`] の判定結果
     /// （静的判定。Issue #474）。
     pub(crate) scalar_plan: ScalarPlan,
+}
+
+impl ExplainEngine {
+    /// [`build_explain_result`] の入力を組み立てる（TASK-186・NOSQL-10 の前提。
+    /// Issue #730）。`kind`・`ann_plan`・`scalar_plan` はいずれも
+    /// `core.rs::EngineCore::execute_sql_in_session` の `Statement::Explain` アーム
+    /// が SQL `EXPLAIN` 経路で使うのと同じ源泉（`EngineCore::search_engine_kind()`・
+    /// [`crate::sql::hnsw_cache::classify_ann_plan`]・
+    /// [`crate::sql::scalar_plan::classify_scalar_plan`]）から組み立てる想定
+    /// （呼び出し元がこの単一情報源を経由しない値を渡した場合、`EXPLAIN` の
+    /// 出力と一致しなくなる）。
+    pub fn new(kind: Option<SearchEngineKind>, ann_plan: AnnPlan, scalar_plan: ScalarPlan) -> Self {
+        Self {
+            kind,
+            ann_plan,
+            scalar_plan,
+        }
+    }
+
+    /// [`crate::core::EngineCore::search_engine_kind`] の戻り値そのまま。
+    pub fn kind(&self) -> Option<SearchEngineKind> {
+        self.kind
+    }
+
+    /// ANN（HNSW）経路の静的適用判定（Issue #411）。
+    pub fn ann_plan(&self) -> AnnPlan {
+        self.ann_plan
+    }
+
+    /// SCALAR 索引の静的適用判定（Issue #474）。
+    pub fn scalar_plan(&self) -> ScalarPlan {
+        self.scalar_plan
+    }
 }
 
 /// [`ExplainEngine::kind`] を `engine:` 行の値（閉じた語彙・snake_case）へ変換する。
@@ -114,7 +156,7 @@ fn scalar_plan_token(plan: ScalarPlan) -> &'static str {
 /// 行順序: `search_terms[i]`（展開結果の件数分）→ `path_hint` → `kind_hint` →
 /// `mode` → `mode_source` → `engine` → （`engine: hnsw` のときのみ）
 /// `hnsw_params` → `ann_plan` → `scalar_plan`。
-pub(crate) fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngine) -> QueryResult {
+pub fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngine) -> QueryResult {
     let expansion = planned.expansion();
     let resolved = planned.mode();
 
