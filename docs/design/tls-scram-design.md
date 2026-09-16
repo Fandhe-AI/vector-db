@@ -48,9 +48,14 @@ sql|nosql`（TASK-171・HTTP-1）で選択する SQL 表層・NoSQL 表層のい
   選んでも非ループバックアドレスへの bind は起動時に fail-closed で拒否
   される（WIRE-7・HTTP-9 の既存契約）。
 - NoSQL 表層側で独自の暗号化方式（別 TLS 経路・独自スキーム）を新設しない。
-  TLS 導入時は `TransportSecurity` へ variant を追加する 1 箇所の変更で
-  両表層に同時適用される（enum の exhaustive match による型強制。
-  `bind_guard.rs` の既存設計意図を踏襲する）。
+  TLS 導入時に `TransportSecurity` へ variant を追加すると、Rust の
+  exhaustive match により `GuardedBindAddrs::resolve` の分岐更新が両表層
+  共有の 1 箇所で強制される（`bind_guard.rs` の既存設計意図を踏襲する）。
+  ただし、この型強制が保証するのは bind 可否判定（`resolve`）の更新の
+  みであり、`bind()` 自体は通常の `TcpListener` を返す。TLS ハンドシェ
+  イク・証明書ロードを含む実際の接続処理（SQL 表層・NoSQL 表層それぞれの
+  accept ループ）への TLS 適用は本設計の対象外であり、各表層側で別途
+  実装・確認する必要がある。
 - 認証方式（SCRAM 採否）は通信路暗号化とは別軸として扱う点も WIRE-9 と
   同一とする。
 
