@@ -6,7 +6,7 @@
 //! 有界読み取り・EOF 判断は呼び出し元（Issue #747 の接続ハンドラ）が担い、
 //! 本モジュールが返す `consumed`（ヘッダ部先頭からの消費バイト数）は本文の
 //! 開始位置を指す。後続の `Content-Type`・本文長検証（Issue #742）・
-//! `Authorization` の解釈（Issue #754）はいずれも [`Headers::get_single`] 等
+//! `Authorization` の解釈（`crate::http::session::bearer`。Issue #753・#754）はいずれも [`Headers::get_single`] 等
 //! 本モジュールの公開 API 経由でヘッダへアクセスする。
 //!
 //! ヘッダ部合計バイト数・個数の上限（[`MAX_HEADER_SECTION_LEN`]・
@@ -78,7 +78,8 @@ impl<'a> Headers<'a> {
     /// その値（前後の OWS はトリム済み）を返す。
     ///
     /// 0 件は `Ok(None)`、2 件以上（重複ヘッダ）は `Malformed`（fail-closed）。
-    /// `Content-Type`（Issue #742）・`Authorization`（Issue #754）が消費する
+    /// `Content-Type`（Issue #742）・`Authorization`（`crate::http::session::bearer`。
+    /// Issue #753・#754）が消費する
     /// 想定の共通 API。
     pub fn get_single(&self, name: &[u8]) -> Result<Option<&'a [u8]>, FrameError> {
         let mut found: Option<&'a [u8]> = None;

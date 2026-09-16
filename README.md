@@ -91,10 +91,15 @@ bind は同じ理由で起動拒否されます。`nosql` を選択すると、�
 不正フレーム時の有界な読み捨てクローズ、接続ハンドラ本体の `catch_unwind`
 による panic 隔離は接続ハンドラ本体（Issue #747）として実装済みです。
 `POST /v1/session`（Argon2id 照合・SQL wire と同一の固定遅延・ダミー KDF
-対称性・セッション発行。Issue #752・TASK-174・HTTP-4・HTTP-6）は実装済みで、
-それ以外のパス（`/v1/session/close`・`/v1/query` を含む）は引き続き `08P01`
-（`unknown request target`）で拒否されます。`/v1/session/close`・
-`Authorization: Bearer` 検証（Issue #753・#754）・3 エンドポイント限定の
+対称性・セッション発行。Issue #752・TASK-174・HTTP-4・HTTP-6）・
+`POST /v1/session/close`（`Authorization: Bearer` の受信データ経路検証・
+ワンタイム失効。Issue #753・TASK-174・HTTP-8）は実装済みです。
+`Authorization: Bearer` の欠落・重複・スキーム不一致・トークン不正・
+失効済み・二重 close はいずれも `wire_code` `28000`（HTTP 401・
+`WWW-Authenticate: Bearer` 付き）へ集約され、区別可能な情報は一切
+返しません。それ以外のパス（`/v1/query` を含む）は引き続き `08P01`
+（`unknown request target`）で拒否されます。`/v1/query` 前段の
+`Authorization: Bearer` ミドルウェア（Issue #754）・3 エンドポイント限定の
 実ルータ完成（#758）は後続 Issue の担当です。この `catch_unwind` は
 `wire-server` を lib として使う
 経路・テストでの防御であり、production バイナリでは起動時に導入する
