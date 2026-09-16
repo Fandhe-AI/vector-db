@@ -1,6 +1,6 @@
 //! `POST /v1/query` の JSON クエリオブジェクトに対する意味的検証ヘルパー
 //! （Issue #760。対象ビヘイビア TASK-175・NOSQL-8・HTTP-7。ポインタ:
-//! `docs/spec/05-tasks.md` TASK-175・`docs/spec/04-behavior/nosql.md`
+//! `docs/spec/05-tasks.md` TASK-175・`docs/spec/04-behavior/nosql-surface.md`
 //! NOSQL-2〜NOSQL-10）。
 //!
 //! 責務境界: `engine::json::parse_json` は構文解析（untrusted テキスト →

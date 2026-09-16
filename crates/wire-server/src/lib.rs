@@ -17,11 +17,13 @@
 //!   は `--surface nosql` の accept ループ stub（Issue #735・HTTP-9）。
 //!   `http::query::schema` は `POST /v1/query` の JSON クエリオブジェクトの
 //!   意味的検証ヘルパー（必須欠落・未知キー・型不一致 → `42601`。Issue #760）。
-//!   `http::query::response` は `search`／`scan`／`aggregate` 成功時の
-//!   `engine::sql::exec::QueryResult` → JSON 応答本文（`columns`／`rows`／
-//!   `row_count`、`result_encoder` と同じ型写像。Issue #762・NOSQL-11）。
-//!   後続のヘッダ・本文検証・応答エンベロープ・接続ハンドラ本体は
-//!   #741〜#747 が `http` 配下へ追加していく
+//!   `http::query::filter` は `filter` 配列の `op` 語彙（`eq`／`prefix`）を
+//!   `engine::declarative_filter::DeclarativeFilter` へ写像し `bind_all` で
+//!   `TableSchema` へ束縛する（Issue #761・NOSQL-7）。`http::query::response`
+//!   は `search`／`scan`／`aggregate` 成功時の `engine::sql::exec::QueryResult`
+//!   → JSON 応答本文（`columns`／`rows`／`row_count`、`result_encoder` と
+//!   同じ型写像。Issue #762・NOSQL-11）。後続のヘッダ・本文検証・応答
+//!   エンベロープ・接続ハンドラ本体は #741〜#747 が `http` 配下へ追加していく
 //! - [`bind_guard`]: bind アドレスの通信路保護要件検証（TLS 未構成時は loopback 限定。
 //!   TASK-70・WIRE-7）。`main.rs::run_server` の唯一の bind 経路
 //! - [`server`]: 接続受け付けループ・同時接続数の有界化・I/O タイムアウト適用
