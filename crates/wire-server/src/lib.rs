@@ -54,8 +54,8 @@
 //! - [`surface`]: `--surface` opt-in CLI 引数の閉じた語彙パーサ（Issue #734・
 //!   TASK-171／HTTP-1。SQL／NoSQL の 2 表層排他選択へ untrusted な CLI
 //!   文字列から到達する唯一の入口。`main.rs::run_server` がこの選択に応じて
-//!   `server::accept_loop_with_engine`／`http::listener::accept_loop_stub` の
-//!   いずれか 1 本だけを呼ぶ。Issue #735）
+//!   `server::accept_loop_with_engine`／`http::listener::accept_loop_with_limiter`
+//!   のいずれか 1 本だけを呼ぶ（Issue #735・#743）
 //! - `fault_injection`（feature `fault-injection` 限定・テスト専用。
 //!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
 //!   語彙パーサと、`simple_query::execute_and_respond` の登録ブロック内から

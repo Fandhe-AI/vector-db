@@ -275,7 +275,7 @@ fn invalid_or_missing_or_duplicate_surface_arg_is_rejected() {
 /// `listening on` に到達し、かつちょうど 1 行であり、表層表示行を伴うことを
 /// 確認する（HTTP-1 の排他方針）。
 #[test]
-fn nosql_starts_single_http_stub_listener_and_does_not_serve_pg_wire() {
+fn nosql_starts_single_http_listener_and_does_not_serve_pg_wire() {
     let fixture = TempFixtureDir::new("nosql-stub");
     let users_path = fixture.users_path_str();
     write_empty_user_store(&users_path);
@@ -320,10 +320,12 @@ fn nosql_starts_single_http_stub_listener_and_does_not_serve_pg_wire() {
         }
     };
 
-    // stub は要求を読まない: SSLRequest（8 バイト）を送っても、SQL wire の
-    // ような応答（先頭バイト `N`／`E`）は返らず、接続は書き込み失敗
-    // （リセット系）または読み取り側の即時 EOF/リセットに終わる。
-    let mut stream = TcpStream::connect(&addr).expect("connect to nosql stub listener");
+    // 暫定ハンドラ（handle_connection_interim）は固定長 1 バイトの有界 1 回
+    // read しか行わない: SSLRequest（8 バイト）を送っても、SQL wire の
+    // ような応答（先頭バイト `N`／`E`）は返らず、応答を書かずに shutdown
+    // する。未読のまま残る送信データにより接続は書き込み失敗（リセット系）
+    // または読み取り側の即時 EOF/リセットに終わる。
+    let mut stream = TcpStream::connect(&addr).expect("connect to nosql http listener");
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set read timeout");
@@ -335,7 +337,7 @@ fn nosql_starts_single_http_stub_listener_and_does_not_serve_pg_wire() {
                 Ok(0) => {}
                 Ok(_) => assert!(
                     byte[0] != b'N' && byte[0] != b'E',
-                    "nosql stub must not answer like the SQL wire, got byte {:?}",
+                    "nosql http listener must not answer like the SQL wire, got byte {:?}",
                     byte[0]
                 ),
                 Err(e) => {
@@ -343,7 +345,7 @@ fn nosql_starts_single_http_stub_listener_and_does_not_serve_pg_wire() {
                     assert!(
                         kind == std::io::ErrorKind::ConnectionReset
                             || kind == std::io::ErrorKind::BrokenPipe,
-                        "unexpected read error from nosql stub: {e:?}"
+                        "unexpected read error from nosql http listener: {e:?}"
                     );
                 }
             }
@@ -353,7 +355,7 @@ fn nosql_starts_single_http_stub_listener_and_does_not_serve_pg_wire() {
             assert!(
                 kind == std::io::ErrorKind::ConnectionReset
                     || kind == std::io::ErrorKind::BrokenPipe,
-                "unexpected write error to nosql stub: {kind:?}"
+                "unexpected write error to nosql http listener: {kind:?}"
             );
         }
     }
