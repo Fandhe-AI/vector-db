@@ -130,12 +130,24 @@ pub fn accept_loop_with_limiter(
             continue;
         }
 
-        std::thread::spawn(move || {
+        // `std::thread::spawn` はスレッド生成失敗時に panic し、accept
+        // ループ自体を停止させうる（OS のスレッド数制限・メモリ不足は
+        // 同時接続数上限（`MAX_CONNECTIONS`）を満たしていても発生しうる）。
+        // 拒否ワーカー経路と同じく panic しない `Builder::spawn` を使い、
+        // 失敗時は当該接続の `permit`／ストリームを解放して accept ループを
+        // 継続する（fail-closed。プロセス全体を落とさない）。
+        if let Err(e) = std::thread::Builder::new().spawn(move || {
             // 接続処理中は `permit` を保持し続け、スレッド終了時（正常終了・
             // panic いずれも）に Drop で確実に枠を解放する。
             let _permit = permit;
             conn::handle_connection_interim(stream);
-        });
+        }) {
+            eprintln!("wire-server: failed to spawn connection handler thread: {e}");
+            // クロージャへ move された `permit` はスレッド生成失敗時に
+            // 即座に Drop され枠が解放される。ストリームは outgoing の
+            // `spawn` 失敗で誰も所有しなくなるため、OS の接続クローズに
+            // 任せる（追加の `shutdown` 呼び出しは不要）。
+        }
     }
 }
 
