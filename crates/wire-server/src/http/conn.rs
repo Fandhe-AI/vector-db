@@ -44,9 +44,11 @@
 //! TCP RST を受け取り応答を読めなくなりうるため（PoC-15）。
 //!
 //! `LINGER_DRAIN_TIMEOUT`（1 秒）は SQL wire と共有するが、読み捨て上限
-//! バイト数は [`HTTP_LINGER_DRAIN_MAX_BYTES`] として本モジュール独自に持つ
-//! （SQL wire の `LINGER_DRAIN_MAX_BYTES`＝64 KiB をそのまま使わない理由は
-//! 同定数の doc を参照）。
+//! バイト数（`drain_budget`）は固定定数ではなく [`Outcome::Respond`] ごとに
+//! 呼び出し元（[`build_outcome`]）が動的に決める（codex-review 指摘・PR
+//! #810 再指摘。詳細は [`drain_budget_after_headers`] の doc を参照）。
+//! SQL wire の `LINGER_DRAIN_MAX_BYTES`＝64 KiB を流用しない理由・固定上限を
+//! 採らない理由も同 doc に記す。
 //!
 //! ## panic 非伝播と RECOVER-8（fail-fast）との関係
 //!
@@ -102,21 +104,56 @@ use crate::protocol_dispatch::{drain_and_close, LINGER_DRAIN_TIMEOUT};
 const HEAD_BUF_LEN: usize =
     crate::http::request::MAX_REQUEST_LINE_LEN + crate::http::headers::MAX_HEADER_SECTION_LEN;
 
-/// HTTP 経路の lingering close（[`drain_and_close`]）が読み捨てる上限バイト数
-/// （Cursor Bugbot 指摘・PR #810）。
+/// 宣言済みヘッダを持たない（＝`Content-Length` を一切知り得ない）状態で
+/// 拒否する経路（[`read_head`] が要求行・ヘッダ自体を不正と判定した場合、
+/// および panic 捕捉時）向けの読み捨て予算のフォールバック値。
 ///
-/// SQL wire の `protocol_dispatch::LINGER_DRAIN_MAX_BYTES`（64 KiB）を流用
-/// すると、本文を 1 バイトも読まずに拒否する経路（[`body::plan_body`] の
-/// `Content-Length` 超過・不正 `Content-Type`・[`reject_if_expect`] 等）で、
-/// クライアントが待たずに送信中の本文（最大 [`body::MAX_BODY_LEN`］＝1 MiB）
-/// のほとんどが未読のまま `drain_and_close` の打ち切りに達しうる。読み捨て
-/// られなかった残りが `shutdown`／`stream` の drop 時点で受信バッファに
-/// 残っていると、書き込み済みの応答バイト列と競合して TCP RST が発行され
-/// 応答が失われうる（モジュール doc の PoC-15 節と同じ懸念の HTTP 版）。
-/// 本文の宣言長そのものが [`body::MAX_BODY_LEN`] を超えられない（超えれば
-/// `plan_body` が読み取り前に拒否する）ため、これを上限に取れば「未読分を
-/// 読み切るまで読み捨てる」契約を保証できる。
-const HTTP_LINGER_DRAIN_MAX_BYTES: usize = body::MAX_BODY_LEN;
+/// この経路ではクライアントが実際に何バイト送るつもりかを知る手がかりが
+/// 無い（宣言長どころかヘッダ自体が届いていない／壊れている）ため、
+/// 「予算が尽きたら即座に打ち切る」設計では原理的に安全な値を選びようが
+/// ない。[`LINGER_DRAIN_TIMEOUT`]（1 秒）が実質的な唯一の資源上限になる
+/// ことを踏まえ、`usize::MAX` を渡してバイト数側の早期終了を無効化し、
+/// 時間切れ（[`drain_and_close`] の `WouldBlock`／`TimedOut` 分岐）にのみ
+/// 委ねる（nginx の `lingering_close` と同様、時間のみを資源境界とする
+/// 設計）。読み取りバッファ自体は [`drain_and_close`] 内部で 4096 バイトの
+/// 固定長スタック配列のまま変わらないため、単位時間あたりの作業量は
+/// 変化しない。
+const HTTP_LINGER_DRAIN_FALLBACK_BUDGET: usize = usize::MAX;
+
+/// ヘッダ解析済み（＝`Content-Length` が既知）の状態で本文読み取り前に
+/// 拒否する経路（[`reject_if_expect`]・[`body::plan_body`] のいずれかが
+/// `Err` を返した場合）向けの読み捨て予算を求める（codex-review 再指摘・
+/// PR #810）。
+///
+/// # 背景（先行修正 8d3ec05 が不十分だった理由）
+///
+/// 先行修正は本予算を [`body::MAX_BODY_LEN`]（1 MiB）に固定していたが、
+/// `Content-Length` の宣言値そのもの（[`Headers::content_length`]）は
+/// untrusted な入力であり `MAX_BODY_LEN` を上回りうる（`plan_body` は宣言長が
+/// `MAX_BODY_LEN` を超えていることを理由に拒否するのであって、宣言長を
+/// `MAX_BODY_LEN` へ切り詰めるわけではない）。したがって「本文を受理できる
+/// 上限」（`MAX_BODY_LEN`）と「拒否後に読み捨てるべき未読データ量」は別の
+/// 量であり、前者を後者に流用すると、宣言長が `MAX_BODY_LEN` を超える
+/// 拒否応答（413／`54000` 等）でクライアントが実際にそれだけの量を送信中の
+/// 場合に読み捨てが打ち切られ、未読データを残した `close` による TCP RST
+/// で応答自体が失われうる（モジュール doc の PoC-15 節と同じ懸念）。
+///
+/// # 予算の求め方
+///
+/// 宣言済み本文長（`content_length`）から、[`read_head`] が要求の頭を
+/// 読み取る際に**既にバッファへ読み込み済み**の本文先頭部分（`residual`。
+/// ソケットからは読み取り済みのため drain 不要）を差し引いた残りを予算と
+/// する。`content_length` は untrusted なため上限を持たず（`MAX_BODY_LEN`
+/// を超えていてもそのまま使う）、`residual.len()` を超えることは無い
+/// （超えていれば `read_body` の「本文が宣言長を超える」経路であり本関数は
+/// 呼ばれない）ため `saturating_sub` で十分。宣言長が巨大な場合は事実上
+/// `usize::MAX` に近い予算になり、[`HTTP_LINGER_DRAIN_FALLBACK_BUDGET`] と
+/// 同じく [`LINGER_DRAIN_TIMEOUT`] のみが実質的な資源上限として働く
+/// （固定バッファ・時間制限は維持したまま、小さい固定上限への到達だけで
+/// 即座に打ち切らない設計。codex-review 指摘の修正方針どおり）。
+fn drain_budget_after_headers(content_length: usize, residual: &[u8]) -> usize {
+    content_length.saturating_sub(residual.len())
+}
 
 /// 解析済みの 1 要求（要求行・ヘッダ・本文）。フィールドはいずれも接続ハンドラが
 /// 保持するバッファからの借用であり、`RequestHandler` 実装へ読み取り専用で渡す。
@@ -161,7 +198,10 @@ impl RequestHandler for PlaceholderRouter {
 /// 判断結果のみを保持する。
 pub(crate) enum Outcome {
     /// 応答バイト列を 1 回 `write_all` してから [`drain_and_close`] する。
-    Respond(Vec<u8>),
+    /// `drain_budget` は読み捨てる上限バイト数（呼び出し元が
+    /// [`drain_budget_after_headers`]／[`HTTP_LINGER_DRAIN_FALLBACK_BUDGET`]
+    /// のいずれかで決める。doc 参照）。
+    Respond { bytes: Vec<u8>, drain_budget: usize },
     /// 応答を書かずに `shutdown` する（相手が何も送らず切断した場合等）。
     CloseSilently,
 }
@@ -178,8 +218,11 @@ pub(crate) enum Outcome {
 pub(crate) fn handle_connection_with<H: RequestHandler>(mut stream: TcpStream, handler: &H) {
     let outcome = catch_unwind(AssertUnwindSafe(|| build_outcome(&mut stream, handler)));
     match outcome {
-        Ok(Outcome::Respond(bytes)) => {
-            respond_and_close(&mut stream, &bytes);
+        Ok(Outcome::Respond {
+            bytes,
+            drain_budget,
+        }) => {
+            respond_and_close(&mut stream, &bytes, drain_budget);
         }
         Ok(Outcome::CloseSilently) => {
             let _ = stream.shutdown(Shutdown::Both);
@@ -195,7 +238,11 @@ pub(crate) fn handle_connection_with<H: RequestHandler>(mut stream: TcpStream, h
                 "internal error",
                 SystemTime::now(),
             );
-            respond_and_close(&mut stream, &bytes);
+            // panic 発生時点でどこまで読み取りが進んでいたか（ヘッダ解析
+            // 済みか）を安全に復元する手段が無いため、宣言長を知らない
+            // 場合と同じフォールバック予算を使う（[`HTTP_LINGER_DRAIN_FALLBACK_BUDGET`]
+            // の doc 参照）。
+            respond_and_close(&mut stream, &bytes, HTTP_LINGER_DRAIN_FALLBACK_BUDGET);
         }
     }
 }
@@ -204,9 +251,11 @@ pub(crate) fn handle_connection_with<H: RequestHandler>(mut stream: TcpStream, h
 /// （呼び出し元がその後 `stream` を drop することで接続が閉じる。SQL wire の
 /// `protocol_dispatch::reject_and_close` と同じ「書き込み → drain → drop」の
 /// 形）。書き込み失敗は無視する（新たなブロッキング点・panic を作らない）。
-fn respond_and_close(stream: &mut TcpStream, bytes: &[u8]) {
+/// `drain_budget` は呼び出し元（[`build_outcome`]）が [`Outcome::Respond`]
+/// ごとに決めた読み捨て上限バイト数。
+fn respond_and_close(stream: &mut TcpStream, bytes: &[u8], drain_budget: usize) {
     let _ = stream.write_all(bytes);
-    drain_and_close(stream, LINGER_DRAIN_TIMEOUT, HTTP_LINGER_DRAIN_MAX_BYTES);
+    drain_and_close(stream, LINGER_DRAIN_TIMEOUT, drain_budget);
 }
 
 /// `catch_unwind` の中身。要求の頭（要求行＋ヘッダ）→ 本文長・`Content-Type`
@@ -221,23 +270,54 @@ fn build_outcome<H: RequestHandler>(stream: &mut TcpStream, handler: &H) -> Outc
             headers,
             residual,
         } => (line, headers, residual),
-        HeadOutcome::Respond(bytes) => return Outcome::Respond(bytes),
+        // ヘッダ自体が未解析・不正なため `Content-Length` を知り得ない
+        // （フォールバック予算。doc 参照）。
+        HeadOutcome::Respond(bytes) => {
+            return Outcome::Respond {
+                bytes,
+                drain_budget: HTTP_LINGER_DRAIN_FALLBACK_BUDGET,
+            }
+        }
         HeadOutcome::CloseSilently => return Outcome::CloseSilently,
     };
 
     if let Err(bytes) = reject_if_expect(&headers) {
-        return Outcome::Respond(bytes);
+        // ヘッダ解析済み（`Content-Length` 既知）のため未読分だけを狙って
+        // 読み捨てる。
+        return Outcome::Respond {
+            bytes,
+            drain_budget: drain_budget_after_headers(headers.content_length(), residual),
+        };
     }
 
     let plan = match body::plan_body(&headers) {
         Ok(plan) => plan,
-        Err(e) => return Outcome::Respond(frame_error_bytes(&e)),
+        // codex-review 再指摘（PR #810）の核心経路: `Content-Length` が
+        // `MAX_BODY_LEN` を超える・`Content-Type` 不正等で本文を 1 バイトも
+        // 読まずに拒否する場合、宣言長ぶんの未読データがまだソケットに
+        // 残っている（または残りうる）ため、`MAX_BODY_LEN` ではなく宣言長
+        // 基準の予算を使う。
+        Err(e) => {
+            return Outcome::Respond {
+                bytes: frame_error_bytes(&e),
+                drain_budget: drain_budget_after_headers(headers.content_length(), residual),
+            }
+        }
     };
 
     let body_bytes = match read_body(stream, residual, plan.content_length()) {
         Ok(BodyOutcome::Bytes(bytes)) => bytes,
         Ok(BodyOutcome::CloseSilently) => return Outcome::CloseSilently,
-        Err(bytes) => return Outcome::Respond(bytes),
+        // `read_body` の失敗は「宣言長との不一致」（超過／不足）であり、
+        // 以後クライアントが `Content-Length` の宣言どおりに振る舞う保証が
+        // 無い（プロトコル違反そのもの）ため、宣言長を根拠にした予算では
+        // なくフォールバック予算（時間のみが実質的な上限）を使う。
+        Err(bytes) => {
+            return Outcome::Respond {
+                bytes,
+                drain_budget: HTTP_LINGER_DRAIN_FALLBACK_BUDGET,
+            }
+        }
     };
 
     // メソッドは要求行パーサ（`crate::http::request::parse_method`）が
@@ -250,7 +330,14 @@ fn build_outcome<H: RequestHandler>(stream: &mut TcpStream, handler: &H) -> Outc
         headers,
         body: &body_bytes,
     };
-    Outcome::Respond(handler.handle(&req))
+    // 本文（宣言長ぶん）は `read_body` が既に読み切っている。これ以上
+    // 届くバイト列は「宣言」を持たない非パイプライン設計上の想定外の
+    // 追加データであり、量を見積もる根拠が無いためフォールバック予算
+    // （時間のみが実質的な上限）を使う。
+    Outcome::Respond {
+        bytes: handler.handle(&req),
+        drain_budget: HTTP_LINGER_DRAIN_FALLBACK_BUDGET,
+    }
 }
 
 /// [`read_head`] の結果。`Parsed` の各フィールドは呼び出し元が渡した
@@ -787,7 +874,12 @@ mod tests {
             handle_connection_with(server, &PlaceholderRouter);
         });
 
-        let declared = body::MAX_BODY_LEN + 1;
+        // codex-review 再指摘（PR #810）の回帰: 宣言長（`declared`）と実際に
+        // 送信する量を一致させ、旧実装（`body::MAX_BODY_LEN`＝1 MiB 固定の
+        // drain 予算）なら 1 MiB を超えた時点で drain が打ち切られ、
+        // 未読データを残した `close` により送信スレッドが `write_all` の
+        // 失敗（`ECONNRESET`／`EPIPE`）を観測しうる量（2 MiB）を送る。
+        let declared = 2 * 1024 * 1024usize;
         let header = format!(
             "POST /v1/query HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n\r\n"
         );
@@ -795,10 +887,54 @@ mod tests {
 
         let sender = std::thread::spawn(move || {
             let chunk = vec![b'a'; 8192];
-            for _ in 0..256 {
-                if client.write_all(&chunk).is_err() {
-                    break;
-                }
+            let chunks = declared / chunk.len();
+            for _ in 0..chunks {
+                // 修正後の実装は宣言長基準の drain 予算（実質無制限。1 秒の
+                // 時間制限のみが上限）を使うため、送信側は 1 度も
+                // エラーを観測せずに送り切れるはずである。
+                client
+                    .write_all(&chunk)
+                    .expect("send full declared body without error");
+            }
+            client
+        });
+
+        let mut client = sender.join().expect("sender thread must not panic");
+        let received = read_all(&mut client);
+        assert_eq!(status_line(&received), "HTTP/1.1 413 Content Too Large");
+        assert_eq!(wire_code_of(&received), "54000");
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// codex-review 再指摘（PR #810）の回帰: 宣言長が `MAX_BODY_LEN` を
+    /// 大幅に超える（実際には送らない）場合でも、実送信分（数 MiB）は
+    /// 予算計算（`content_length.saturating_sub(residual.len())`）が
+    /// 事実上無制限になるため drain され、応答が失われない。
+    #[test]
+    fn absurdly_large_declared_content_length_still_lets_response_arrive() {
+        let (server, mut client) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter);
+        });
+
+        // 1 GiB を宣言するが実際にはその一部（3 MiB）しか送らない
+        // （現実のクライアントが誤って巨大な `Content-Length` を宣言した
+        // ケースを模す）。
+        let declared = 1024 * 1024 * 1024usize;
+        let header = format!(
+            "POST /v1/query HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n\r\n"
+        );
+        client.write_all(header.as_bytes()).expect("write head");
+
+        let sender = std::thread::spawn(move || {
+            let chunk = vec![b'a'; 8192];
+            for _ in 0..(3 * 1024 * 1024 / chunk.len()) {
+                client.write_all(&chunk).expect("send bytes without error");
             }
             client
         });
