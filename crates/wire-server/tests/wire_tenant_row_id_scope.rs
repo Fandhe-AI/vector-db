@@ -331,25 +331,52 @@ fn split_even_odd(samples: &[u128]) -> (Vec<u128>, Vec<u128>) {
     (even, odd)
 }
 
-/// `a` と `b` の対称相対差（`|a/b - 1|`）。`b == 0` は往復レイテンシとして
-/// 現実的に到達しないが、fail-closed に「区別可能」側へ倒す（`a == 0` も
-/// 同時に成立する場合のみ差なしとみなす）。
+/// `a` と `b` の対称相対差（`|a-b| / max(a,b)`）。分母に大小どちらの引数を
+/// 渡しても同じ値を返す（Issue #738 codex-review 指摘: 旧実装 `|a/b - 1|`
+/// は `b` を分母に固定しており、どちらの腕を第 2 引数に渡すかで判定が
+/// 反転しうる非対称バグだった）。両者とも 0 の場合のみ差なしとみなす。
 fn relative_diff(a: u128, b: u128) -> f64 {
-    if b == 0 {
-        return if a == 0 { 0.0 } else { f64::INFINITY };
+    let (a, b) = (a as f64, b as f64);
+    let denom = a.max(b);
+    if denom == 0.0 {
+        return 0.0;
     }
-    ((a as f64) / (b as f64) - 1.0).abs()
+    (a - b).abs() / denom
 }
 
-/// 1 腕のサンプル列を計測順の偶奇で 2 分割し、median・p95 それぞれの
+/// 分位点ラダー上の 1 点が使う帯の種別（`median` 系はタイトな固定帯・
+/// `tail` 系（p90 以上）はサンプル数が薄くなる分だけ緩い固定帯を使う。
+/// `judge` の量子化点ごとの帯選択を型で明示する）。
+#[derive(Debug, Clone, Copy)]
+enum BandKind {
+    Median,
+    Tail,
+}
+
+/// 分布同一性の判定に使う分位点ラダー（Issue #738 codex-review 指摘:
+/// median・p95 の 2 点だけでは、下位分位点にのみ現れる部分母集団混入
+/// （例: 200 件中 80 件だけ他方より大きく異なる二峰性分布）を median・p95
+/// が偶然一致することで見逃しうる。`min`〜`p99` の分布全体を尾部まで
+/// 均等に走査することで、どの分位点にサブ集団が現れても検出できるように
+/// する）。
+const QUANTILE_LADDER: &[(f64, BandKind)] = &[
+    (0.00, BandKind::Median),
+    (0.10, BandKind::Median),
+    (0.25, BandKind::Median),
+    (0.50, BandKind::Median),
+    (0.75, BandKind::Median),
+    (0.90, BandKind::Tail),
+    (0.95, BandKind::Tail),
+    (0.99, BandKind::Tail),
+];
+
+/// 1 腕のサンプル列を計測順の偶奇で 2 分割し、指定した分位点における
 /// 相対差（A/A 帯）を返す。
-fn aa_band(samples: &[u128]) -> (f64, f64) {
+fn quantile_aa_diff(samples: &[u128], p: f64) -> f64 {
     let (mut even, mut odd) = split_even_odd(samples);
     even.sort_unstable();
     odd.sort_unstable();
-    let median_diff = relative_diff(percentile(&even, 0.50), percentile(&odd, 0.50));
-    let p95_diff = relative_diff(percentile(&even, 0.95), percentile(&odd, 0.95));
-    (median_diff, p95_diff)
+    relative_diff(percentile(&even, p), percentile(&odd, p))
 }
 
 /// レイテンシ分布同一性の判定結果（計画 §3.3）。
@@ -365,8 +392,8 @@ enum Verdict {
     Indistinguishable,
 }
 
-/// 固定相対帯・A/A 帯上限のペア（median・p95）。テストから閾値を差し替え
-/// られるよう構造体化する。
+/// 固定相対帯・A/A 帯上限のペア（median 系・tail 系）。テストから閾値を
+/// 差し替えられるよう構造体化する。
 #[derive(Debug, Clone, Copy)]
 struct Bands {
     fixed_median: f64,
@@ -386,36 +413,57 @@ impl Default for Bands {
     }
 }
 
+impl Bands {
+    /// `BandKind` に応じた (固定帯, A/A 帯上限) のペアを返す。
+    fn for_kind(&self, kind: BandKind) -> (f64, f64) {
+        match kind {
+            BandKind::Median => (self.fixed_median, self.aa_median_cap),
+            BandKind::Tail => (self.fixed_p95, self.aa_p95_cap),
+        }
+    }
+}
+
 /// (b)（他テナント保持 id）・(c)（未存在 id）2 腕のサンプル列からレイテンシ
 /// 分布の同一性を判定する（時間非依存の純関数。実測タイマー・env を一切
 /// 参照しない。`tier_latency_bench.rs::judge` と同じ「計測本体から分離した
 /// 判定ロジック」の方針）。`b`・`c` は各腕の生サンプル列（計測順のまま。
 /// 内部でソート・A/A 分割の双方に使う）。
+///
+/// median・p95 の 2 点だけでなく `QUANTILE_LADDER` の全分位点を走査する
+/// （Issue #738 codex-review 指摘への対応。ある分位点の A/A 帯が上限を
+/// 超えていても他の分位点の判定は継続し、最終的に 1 点でも上限超過が
+/// あれば `Inconclusive` を優先する——既存の「Inconclusive が
+/// Distinguishable より優先される」契約をラダー全体へ拡張する）。
 fn judge(b: &[u128], c: &[u128], bands: &Bands) -> Verdict {
-    let (aa_median_b, aa_p95_b) = aa_band(b);
-    let (aa_median_c, aa_p95_c) = aa_band(c);
-    let aa_median = aa_median_b.max(aa_median_c);
-    let aa_p95 = aa_p95_b.max(aa_p95_c);
-
-    // A/A 帯そのものが上限を超える場合は環境ノイズが判定に使えないほど
-    // 大きいとみなし、固定帯との比較より先に `Inconclusive` で打ち切る
-    // （両者が同時に成立しても「区別できた」と誤認しない vacuous pass 防止）。
-    if aa_median > bands.aa_median_cap || aa_p95 > bands.aa_p95_cap {
-        return Verdict::Inconclusive;
-    }
-
     let mut b_sorted = b.to_vec();
     let mut c_sorted = c.to_vec();
     b_sorted.sort_unstable();
     c_sorted.sort_unstable();
 
-    let delta_median = relative_diff(percentile(&b_sorted, 0.50), percentile(&c_sorted, 0.50));
-    let delta_p95 = relative_diff(percentile(&b_sorted, 0.95), percentile(&c_sorted, 0.95));
+    let mut any_aa_over_cap = false;
+    let mut any_distinguishable = false;
 
-    if delta_median > bands.fixed_median.max(aa_median) || delta_p95 > bands.fixed_p95.max(aa_p95) {
-        return Verdict::Distinguishable;
+    for &(p, kind) in QUANTILE_LADDER {
+        let (fixed_band, aa_cap) = bands.for_kind(kind);
+        let aa = quantile_aa_diff(b, p).max(quantile_aa_diff(c, p));
+
+        if aa > aa_cap {
+            any_aa_over_cap = true;
+            continue;
+        }
+
+        let delta = relative_diff(percentile(&b_sorted, p), percentile(&c_sorted, p));
+        if delta > fixed_band.max(aa) {
+            any_distinguishable = true;
+        }
     }
 
+    if any_aa_over_cap {
+        return Verdict::Inconclusive;
+    }
+    if any_distinguishable {
+        return Verdict::Distinguishable;
+    }
     Verdict::Indistinguishable
 }
 
@@ -580,9 +628,6 @@ fn rls9_wire_insert_latency_distribution_is_indistinguishable_for_foreign_held_i
     let bands = Bands::default();
     let verdict = judge(&b_samples, &c_samples, &bands);
 
-    let (aa_median_b, aa_p95_b) = aa_band(&b_samples);
-    let (aa_median_c, aa_p95_c) = aa_band(&c_samples);
-
     println!("=== rls9_wire_insert_latency_distribution ===");
     println!("rounds={rounds} warmup={warmup}");
     println!("nproc={:?}", std::thread::available_parallelism());
@@ -600,15 +645,26 @@ fn rls9_wire_insert_latency_distribution_is_indistinguishable_for_foreign_held_i
         percentile(&c_sorted, 0.95),
         c_sorted.last().copied().unwrap_or(0)
     );
-    println!(
-        "delta_median={:.4} delta_p95={:.4}",
-        relative_diff(percentile(&b_sorted, 0.50), percentile(&c_sorted, 0.50)),
-        relative_diff(percentile(&b_sorted, 0.95), percentile(&c_sorted, 0.95))
-    );
-    println!(
-        "aa_median=max({aa_median_b:.4},{aa_median_c:.4}) aa_p95=max({aa_p95_b:.4},{aa_p95_c:.4})"
-    );
+    // 分位点ラダー全点の delta・A/A 帯を出力する（`judge` が実際に走査する
+    // 判定根拠を隠さず記録する。codex-review 指摘への対応で median・p95 の
+    // 2 点表示から全 8 点表示へ拡張）。
+    for &(p, kind) in QUANTILE_LADDER {
+        let (fixed_band, aa_cap) = bands.for_kind(kind);
+        let delta = relative_diff(percentile(&b_sorted, p), percentile(&c_sorted, p));
+        let aa = quantile_aa_diff(&b_samples, p).max(quantile_aa_diff(&c_samples, p));
+        println!(
+            "quantile p={p:.2} b={} c={} delta={delta:.4} aa={aa:.4} fixed_band={fixed_band:.4} aa_cap={aa_cap:.4}",
+            percentile(&b_sorted, p),
+            percentile(&c_sorted, p)
+        );
+    }
     println!("verdict={verdict:?}");
+    // per-run 生データ（両腕・取得順のまま）を必須で残す
+    // （`benchmark-judgement-policy.md` §3 の per-run 生データ必須の教訓・
+    // codex-review 指摘への対応。事後の再判定・別の判定方式への差し替えを
+    // 可能にする）。
+    println!("foreign_held(b)_raw_us_acquisition_order={b_samples:?}");
+    println!("absent(c)_raw_us_acquisition_order={c_samples:?}");
     println!(
         "note: shared/CI environment values are reference-only per docs/design/benchmark-judgement-policy.md"
     );
@@ -775,6 +831,48 @@ mod tenant_latency_judge_tests {
     #[test]
     fn relative_diff_handles_zero_denominator() {
         assert_eq!(relative_diff(0, 0), 0.0);
-        assert_eq!(relative_diff(1, 0), f64::INFINITY);
+        assert_eq!(relative_diff(1, 0), 1.0);
+        assert_eq!(relative_diff(0, 1), 1.0);
+    }
+
+    /// Cursor Bugbot 指摘（Issue #738）: 旧実装 `|a/b - 1|` は分母が第 2
+    /// 引数に固定される非対称形で、引数の順序を入れ替えると異なる値を
+    /// 返しうるバグだった。新実装（`|a-b| / max(a,b)`）は引数の順序に
+    /// 依存しないことを固定する。
+    #[test]
+    fn relative_diff_is_symmetric_regardless_of_argument_order() {
+        assert_eq!(relative_diff(1000, 1300), relative_diff(1300, 1000));
+        assert_eq!(relative_diff(500, 2000), relative_diff(2000, 500));
+        assert_eq!(relative_diff(7, 7), 0.0);
+    }
+
+    /// codex-review 指摘（Issue #738）: median・p95 の 2 点比較だけでは、
+    /// 200 件中 80 件だけが他方と大きく異なる二峰性分布（存在情報が下位
+    /// 分位点にのみ現れるケース）を median・p95 が偶然一致することで
+    /// 見逃してしまう反例。分位点ラダー全体を走査する新 `judge` は
+    /// この反例を `Distinguishable` として検出できることを固定する。
+    #[test]
+    fn judge_detects_bimodal_subpopulation_hidden_from_median_and_p95() {
+        // b: 前半 80 件が 500（他方に存在しない値域）・後半 120 件が 1000。
+        // median（idx=round(199*0.5)=100 → 1000 側）・p95（idx=round(199*0.95)
+        // =189 → 1000 側）はいずれも c の 1000 と一致するが、下位分位点
+        // （p10・p25）には 500 側の値が現れる。
+        let mut b: Vec<u128> = Vec::with_capacity(200);
+        b.extend(std::iter::repeat_n(500u128, 80));
+        b.extend(std::iter::repeat_n(1000u128, 120));
+        let c = identical_samples(200, 1000);
+
+        // 旧実装（median・p95 のみ）ならここは見逃していたはずの反例。
+        assert_eq!(judge(&b, &c, &Bands::default()), Verdict::Distinguishable);
+    }
+
+    /// 固定オフセット（4%）は固定帯（5%）以内で pass する既定動作の確認
+    /// （codex-review コメントで挙げられた例。バグではなく許容差の意図
+    /// どおりの挙動であることを固定する）。
+    #[test]
+    fn judge_reports_indistinguishable_for_small_constant_offset_within_fixed_band() {
+        let b = identical_samples(200, 1040);
+        let c = identical_samples(200, 1000);
+        assert_eq!(judge(&b, &c, &Bands::default()), Verdict::Indistinguishable);
     }
 }
