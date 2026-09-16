@@ -788,6 +788,16 @@ else
 	@echo "skip: Cargo.toml 未追加のため bench-wire-concurrency をスキップ"
 endif
 
+.PHONY: wire-tenant-latency
+wire-tenant-latency: ## Issue #738（TASK-95・TABLE-12・RLS-9）(b) 他テナント保持 id・(c) 未存在 id への自テナント名義 INSERT の wire 往復レイテンシ分布が統計的に区別できないことを実測する（`#[ignore]`・release 専用・spec 閾値を持たない同一性検証のため ci 非配線・CI ワークフローにも配線しない。手動実行専用）。TENANT_LATENCY_ROUNDS（既定 200・200 未満は拒否）／TENANT_LATENCY_WARMUP（既定 20）で規模を上書きできる。1 プロセス = 1 計測（docs/design/benchmark-judgement-policy.md §5 準拠）。実行記録（日付・SHA・rounds・両腕 median/p95・A/A 帯・判定）は PR 本文へ転記する
+	@echo "date: $$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	@echo "sha: $$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+ifdef HAS_CARGO
+	cargo test --release -p fandhe-vector-db-wire-server --test wire_tenant_row_id_scope -- --ignored --nocapture --exact rls9_wire_insert_latency_distribution_is_indistinguishable_for_foreign_held_id_and_absent_id
+else
+	@echo "skip: Cargo.toml 未追加のため wire-tenant-latency をスキップ"
+endif
+
 # --------------------------------------------------
 # 評価スクリプト（scripts/eval。TASK-118）
 # --------------------------------------------------
