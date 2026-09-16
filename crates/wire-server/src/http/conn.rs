@@ -78,7 +78,7 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use engine::error_format::ErrorClass;
 
@@ -119,6 +119,54 @@ const HEAD_BUF_LEN: usize =
 /// 固定長スタック配列のまま変わらないため、単位時間あたりの作業量は
 /// 変化しない。
 const HTTP_LINGER_DRAIN_FALLBACK_BUDGET: usize = usize::MAX;
+
+/// 要求の頭（要求行＋ヘッダ）＋本文の読み取り全体に適用する絶対期限
+/// （Slowloris 対策。codex-review 再指摘・PR #810）。
+///
+/// 呼び出し元（`http::listener::accept_loop_with_handler`）が受理直後に
+/// [`crate::limits::apply_read_timeout`] で設定する `read_timeout`
+/// （[`crate::limits::READ_TIMEOUT`]）は**個々の `read` 呼び出し**の待機上限
+/// にすぎない。[`read_head`]・[`read_body`] のように複数回の `read` を
+/// ループする経路でこの値をそのまま使い続けると、攻撃者が各回のタイムアウトが
+/// 切れる直前に 1 バイトずつ送り続けることで「読み取りは常に進んでいる」
+/// 状態を保ち続け、`WouldBlock`／`TimedOut` に到達せずループ全体の所要時間を
+/// 無期限に引き延ばせる。結果として [`crate::limits::MAX_CONNECTIONS`] の
+/// 接続枠を長時間占有し続けられる（Slowloris 型 DoS。読み取りタイムアウトが
+/// 個々の `read` 単位にしか効かず要求全体の期限にならない構造的欠陥）。
+///
+/// 対策として [`build_outcome`] が要求の読み取り開始時刻を基準にこの定数を
+/// 1 度だけ絶対期限（[`Instant`]）へ変換し、[`read_head`]・[`read_body`] の
+/// 各 `read` 呼び出し**前**に「期限までの残り時間」を都度 `set_read_timeout`
+/// へ設定するループへ変更する（`protocol_dispatch::drain_and_close` と同じ
+/// パターン）。個々の `read` がどれだけ速く応答しても、ループ全体は必ずこの
+/// 期限内に完了するか、期限到達でタイムアウト同様に打ち切られる。値は接続
+/// 受理時に適用済みの [`crate::limits::READ_TIMEOUT`] と同じ 30 秒とし、
+/// 新たなチューニング可能値を増やさない。
+///
+/// production 経路（`http::listener::accept_loop_with_handler`）は
+/// [`crate::limits::READ_TIMEOUT`] そのものを [`handle_connection_with`] の
+/// `request_read_deadline` 引数へ渡すため（`main.rs` が `apply_read_timeout`
+/// と同じ値を両方へ渡す契約。[`handle_connection_with`] の doc 参照）、
+/// この定数自体は production 経路からは直接参照されない。本ファイルの
+/// 単体テスト（既定期限での検証）向けの命名済み定数として残す
+/// （`#[cfg(test)]` 外の doc コメントから意味づけを共有するため、
+/// テスト専用の `#[cfg(test)]` 定数へは分離しない）。
+#[cfg_attr(not(test), allow(dead_code))]
+const REQUEST_READ_DEADLINE: Duration = crate::limits::READ_TIMEOUT;
+
+/// 期限までの残り時間を求め、`stream` の読み取りタイムアウトへ反映する。
+/// 残り時間が実質的に無い（1ms 以下）場合・`set_read_timeout` 自体が失敗した
+/// 場合は `None` を返し、呼び出し元は無応答クローズ（HTTP-11）へ倒す。
+///
+/// [`read_head`]・[`read_body`] の読み取りループが共有する（`protocol_dispatch::
+/// drain_and_close` と同型のパターンをこの 1 関数へ集約し重複させない）。
+fn arm_read_timeout_for_deadline(stream: &TcpStream, deadline: Instant) -> Option<()> {
+    let remaining = match deadline.checked_duration_since(Instant::now()) {
+        Some(d) if d > Duration::from_millis(1) => d,
+        _ => return None,
+    };
+    stream.set_read_timeout(Some(remaining)).ok()
+}
 
 /// ヘッダ解析済み（＝`Content-Length` が既知）の状態で本文読み取り前に
 /// 拒否する経路（[`reject_if_expect`]・[`body::plan_body`] のいずれかが
@@ -222,8 +270,24 @@ pub(crate) enum Outcome {
 ///
 /// panic 非伝播の設計はモジュール doc を参照。書き込み・[`drain_and_close`]・
 /// クローズはすべて `catch_unwind` の**外**で行う。
-pub(crate) fn handle_connection_with<H: RequestHandler>(mut stream: TcpStream, handler: &H) {
-    let outcome = catch_unwind(AssertUnwindSafe(|| build_outcome(&mut stream, handler)));
+///
+/// `request_read_deadline` は要求の頭＋本文の読み取り全体に適用する絶対期限
+/// （[`REQUEST_READ_DEADLINE`] の doc 参照。Slowloris 対策）。呼び出し元
+/// （[`crate::http::listener::accept_loop_with_handler`]）が接続受理直後に
+/// [`crate::limits::apply_read_timeout`] へ渡すのと**同じ** `read_timeout`
+/// をここへも渡す契約とし、「受理直後に設定するタイムアウト」と「要求読み取り
+/// 全体の期限」を同じ 1 つの値として扱う（2 つの別々の期限に分裂させない。
+/// production では常に [`crate::limits::READ_TIMEOUT`]＝30 秒だが、値そのものは
+/// 呼び出し元が決める）。本ファイルの単体テストはこの引数へ短縮値を渡すことで
+/// [`crate::limits::READ_TIMEOUT`]（30 秒）を待たずに期限切れ経路を検証する。
+pub(crate) fn handle_connection_with<H: RequestHandler>(
+    mut stream: TcpStream,
+    handler: &H,
+    request_read_deadline: Duration,
+) {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        build_outcome(&mut stream, handler, request_read_deadline)
+    }));
     match outcome {
         Ok(Outcome::Respond {
             bytes,
@@ -269,9 +333,19 @@ fn respond_and_close(stream: &mut TcpStream, bytes: &[u8], drain_budget: usize) 
 /// の検証 → 本文読み取り → ルーティングの順に進め、[`Outcome`] を返す。
 /// I/O・パースはすべてここで行うが、応答の書き込みは一切行わない
 /// （呼び出し元の責務。モジュール doc 参照）。
-fn build_outcome<H: RequestHandler>(stream: &mut TcpStream, handler: &H) -> Outcome {
+///
+/// 要求の読み取り開始時刻を基準に `request_read_deadline`
+/// （呼び出し元 [`handle_connection_with`] の doc 参照）を 1 度だけ
+/// 絶対期限へ変換し、頭・本文の読み取り（[`read_head`]・[`read_body`]）の
+/// 双方へ同じ期限を渡す（期限はリセットしない。Slowloris 対策の doc 参照）。
+fn build_outcome<H: RequestHandler>(
+    stream: &mut TcpStream,
+    handler: &H,
+    request_read_deadline: Duration,
+) -> Outcome {
+    let deadline = Instant::now() + request_read_deadline;
     let mut head_buf = [0u8; HEAD_BUF_LEN];
-    let (line, headers, residual) = match read_head(stream, &mut head_buf) {
+    let (line, headers, residual) = match read_head(stream, &mut head_buf, deadline) {
         HeadOutcome::Parsed {
             line,
             headers,
@@ -312,7 +386,7 @@ fn build_outcome<H: RequestHandler>(stream: &mut TcpStream, handler: &H) -> Outc
         }
     };
 
-    let body_bytes = match read_body(stream, residual, plan.content_length()) {
+    let body_bytes = match read_body(stream, residual, plan.content_length(), deadline) {
         Ok(BodyOutcome::Bytes(bytes)) => bytes,
         Ok(BodyOutcome::CloseSilently) => return Outcome::CloseSilently,
         // `read_body` の失敗は「宣言長との不一致」（超過／不足）であり、
@@ -455,7 +529,16 @@ fn parse_completed_head(
 /// 内部上限（`request::MAX_REQUEST_LINE_LEN`・`headers::
 /// MAX_HEADER_SECTION_LEN`）は [`HEAD_BUF_LEN`] の doc が説明するとおり
 /// バッファが満杯になる前に必ず先に効く契約。
-fn read_head<'buf>(stream: &mut TcpStream, buf: &'buf mut [u8; HEAD_BUF_LEN]) -> HeadOutcome<'buf> {
+///
+/// `deadline` は要求全体（頭＋本文）の絶対読み取り期限（[`REQUEST_READ_DEADLINE`]
+/// の doc 参照）。各 `read` 呼び出しの**前**に [`arm_read_timeout_for_deadline`]
+/// で残り時間をソケットへ反映し、期限切れなら（個々の read が速く応答して
+/// いても）無応答クローズへ倒す。
+fn read_head<'buf>(
+    stream: &mut TcpStream,
+    buf: &'buf mut [u8; HEAD_BUF_LEN],
+    deadline: Instant,
+) -> HeadOutcome<'buf> {
     let mut filled = 0usize;
 
     // このループは `buf` への可変借用（`stream.read` 用）と、借用非依存の
@@ -478,6 +561,11 @@ fn read_head<'buf>(stream: &mut TcpStream, buf: &'buf mut [u8; HEAD_BUF_LEN]) ->
             // [`HEAD_BUF_LEN`] の doc が説明する契約が破れた場合の安全弁
             // （通常経路では到達しない）。
             break LoopExit::Respond(protocol_violation_bytes("request head exceeds limit"));
+        }
+        // 期限切れなら、ここまでにどれだけ read が完了していても打ち切る
+        // （Slowloris 対策。[`REQUEST_READ_DEADLINE`] の doc 参照）。
+        if arm_read_timeout_for_deadline(stream, deadline).is_none() {
+            break LoopExit::CloseSilently;
         }
         let read_target = match buf.get_mut(filled..) {
             Some(s) => s,
@@ -546,10 +634,18 @@ enum BodyOutcome {
 /// （[`build_outcome`]）が [`body::plan_body`] を通した後の `content_length`
 /// のみを渡す契約（[`MAX_BODY_LEN`](body::MAX_BODY_LEN) 以下であることが
 /// 型で保証された値）であり、未検証の宣言長を直接確保に使わない。
+///
+/// `deadline` は [`read_head`] と共有する要求全体の絶対読み取り期限
+/// （[`REQUEST_READ_DEADLINE`] の doc 参照）。`std::io::Read::read_exact` は
+/// 内部で複数回 `read` をループしても呼び出し前に設定した 1 つの
+/// `read_timeout` しか効かせられず、[`read_head`] と同型の Slowloris 経路を
+/// 残してしまうため使わず、[`read_head`] と同じ「各 `read` 前に残り時間を
+/// 都度反映する」手書きループ（[`fill_remaining_body`]）に委ねる。
 fn read_body(
     stream: &mut TcpStream,
     residual: &[u8],
     content_length: usize,
+    deadline: Instant,
 ) -> Result<BodyOutcome, Vec<u8>> {
     if residual.len() > content_length {
         // 頭の読み取り時点で本文の宣言長を超えるバイト列が既に届いている
@@ -575,25 +671,65 @@ fn read_body(
         None => return Err(protocol_violation_bytes("request body bounds")),
     };
     if !remaining.is_empty() {
-        match stream.read_exact(remaining) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        match fill_remaining_body(stream, remaining, deadline)? {
+            FillOutcome::Complete => {}
+            FillOutcome::CloseSilently => return Ok(BodyOutcome::CloseSilently),
+        }
+    }
+
+    Ok(BodyOutcome::Bytes(buf))
+}
+
+/// [`fill_remaining_body`] の結果（正常系）。
+enum FillOutcome {
+    Complete,
+    CloseSilently,
+}
+
+/// `target` を宣言長ぶんの本文で埋めるまで、期限を都度反映しながら `read` を
+/// 繰り返す（[`read_head`] の読み取りループと同じ Slowloris 対策パターン。
+/// [`REQUEST_READ_DEADLINE`] の doc 参照）。
+fn fill_remaining_body(
+    stream: &mut TcpStream,
+    target: &mut [u8],
+    deadline: Instant,
+) -> Result<FillOutcome, Vec<u8>> {
+    let mut filled = 0usize;
+    while filled < target.len() {
+        // 期限切れなら、ここまでにどれだけ読めていても打ち切る。
+        if arm_read_timeout_for_deadline(stream, deadline).is_none() {
+            return Ok(FillOutcome::CloseSilently);
+        }
+        let dst = match target.get_mut(filled..) {
+            Some(s) => s,
+            None => return Err(protocol_violation_bytes("request body bounds")),
+        };
+        match stream.read(dst) {
+            Ok(0) => {
                 // Content-Length との不一致: 不足（相手が早期に切断した）。
                 return Err(protocol_violation_bytes(
                     "request body ended before declared content-length",
                 ));
             }
+            Ok(n) => {
+                filled = match filled.checked_add(n) {
+                    Some(v) => v,
+                    None => return Err(protocol_violation_bytes("request body length overflow")),
+                };
+            }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                return Ok(BodyOutcome::CloseSilently);
+                return Ok(FillOutcome::CloseSilently);
             }
-            Err(_) => return Ok(BodyOutcome::CloseSilently),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                continue;
+            }
+            Err(_) => return Ok(FillOutcome::CloseSilently),
         }
     }
-
-    Ok(BodyOutcome::Bytes(buf))
+    Ok(FillOutcome::Complete)
 }
 
 /// `Expect` ヘッダの名前（ASCII 大文字小文字非区別で [`Headers::get_single`]
@@ -707,6 +843,32 @@ mod tests {
         }
     }
 
+    /// サーバー側が応答を書かずに接続を閉じたことを緩やかに確認する
+    /// （クリーンな EOF・`ConnectionReset` のいずれも許容する）。
+    ///
+    /// [`assert_eof`] は「相手がまだ何か送っている最中ではない」クリーンな
+    /// クローズのみを検証する既存テスト向けに残すが、Slowloris 回帰テスト
+    /// （[`head_read_deadline_closes_connection_despite_steady_trickle`]・
+    /// [`body_read_deadline_closes_connection_despite_steady_trickle`]）は
+    /// クライアントが送信を続けている最中にサーバー側が期限切れで
+    /// `shutdown` するため、OS が未読データの残ったソケットの close を
+    /// RST として観測しうる（一般的な TCP の挙動。HTTP レベルの契約とは
+    /// 無関係なテスト構成上の副作用）。本ヘルパは「サーバーが無期限に
+    /// ハングせず接続を閉じたこと」だけを確認する。`set_read_timeout`
+    /// 自体が（RST 後のソケット状態次第で）`EINVAL` を返すことがあるため
+    /// 失敗は無視する（無視しても、既に閉じている接続への読み取りは
+    /// タイムアウトを介さず即座に結果を返すため待機は発生しない）。
+    fn assert_closed_without_hanging(stream: &mut TcpStream) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut buf = [0u8; 8];
+        match stream.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("expected connection close without extra bytes, got {n} bytes"),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("expected EOF or connection reset, got read error: {e:?}"),
+        }
+    }
+
     fn read_all(stream: &mut TcpStream) -> Vec<u8> {
         let mut received = Vec::new();
         let mut buf = [0u8; 4096];
@@ -757,7 +919,7 @@ mod tests {
             .expect("set read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PlaceholderRouter);
+            handle_connection_with(server, &PlaceholderRouter, REQUEST_READ_DEADLINE);
         });
 
         client
@@ -780,7 +942,7 @@ mod tests {
             .expect("set read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PlaceholderRouter);
+            handle_connection_with(server, &PlaceholderRouter, REQUEST_READ_DEADLINE);
         });
 
         client.write_all(b"GET / HTTP/1.1\r\n\r\n").expect("write");
@@ -800,7 +962,7 @@ mod tests {
             .expect("set read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PlaceholderRouter);
+            handle_connection_with(server, &PlaceholderRouter, REQUEST_READ_DEADLINE);
         });
 
         client
@@ -826,7 +988,7 @@ mod tests {
             .expect("set read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PlaceholderRouter);
+            handle_connection_with(server, &PlaceholderRouter, REQUEST_READ_DEADLINE);
         });
 
         // 本文は宣言だけして実際には送らない（100-continue を待つ実装の模倣）。
@@ -852,7 +1014,7 @@ mod tests {
             .expect("set read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PlaceholderRouter);
+            handle_connection_with(server, &PlaceholderRouter, REQUEST_READ_DEADLINE);
         });
 
         client
@@ -878,7 +1040,7 @@ mod tests {
             .expect("set read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PlaceholderRouter);
+            handle_connection_with(server, &PlaceholderRouter, REQUEST_READ_DEADLINE);
         });
 
         // codex-review 再指摘（PR #810）の回帰: 宣言長（`declared`）と実際に
@@ -926,7 +1088,7 @@ mod tests {
             .expect("set read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PlaceholderRouter);
+            handle_connection_with(server, &PlaceholderRouter, REQUEST_READ_DEADLINE);
         });
 
         // 1 GiB を宣言するが実際にはその一部（3 MiB）しか送らない
@@ -964,7 +1126,7 @@ mod tests {
             .expect("set read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PlaceholderRouter);
+            handle_connection_with(server, &PlaceholderRouter, REQUEST_READ_DEADLINE);
         });
 
         client
@@ -990,7 +1152,7 @@ mod tests {
             .expect("set read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PlaceholderRouter);
+            handle_connection_with(server, &PlaceholderRouter, REQUEST_READ_DEADLINE);
         });
 
         client
@@ -1006,7 +1168,18 @@ mod tests {
         handle.join().expect("handler thread must not panic");
     }
 
-    /// 本文の途中で読み取りタイムアウトへ達した場合は無応答 EOF。
+    /// 本文の途中で要求読み取りの絶対期限へ達した場合は無応答 EOF。
+    ///
+    /// production の期限（[`REQUEST_READ_DEADLINE`]。30 秒）をそのまま
+    /// 待つと単体テストとして長すぎるため、[`handle_connection_with`]
+    /// （`request_read_deadline` 引数。doc 参照）へ短い期限を渡す。かつての
+    /// 実装は接続受理時に設定済みの `read_timeout`（ここでは 150ms へ
+    /// 上書き）がそのまま本文読み取りの実効タイムアウトになっていたが、
+    /// 本 PR の Slowloris 対策（`REQUEST_READ_DEADLINE` の doc 参照）で
+    /// `build_outcome` が各 `read` 前に残り時間を都度 `set_read_timeout`
+    /// へ反映するようになったため、ソケットへ事前設定した値は
+    /// 上書きされる。したがって本テストの `server.set_read_timeout` 呼び出し
+    /// 自体はもはや期限を左右しない（初期値として残すのみ）。
     #[test]
     fn closes_silently_when_body_read_times_out() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -1018,7 +1191,7 @@ mod tests {
             .expect("set server read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PlaceholderRouter);
+            handle_connection_with(server, &PlaceholderRouter, Duration::from_millis(150));
         });
 
         client
@@ -1035,6 +1208,78 @@ mod tests {
         handle.join().expect("handler thread must not panic");
     }
 
+    /// Slowloris 回帰テスト（codex-review 再指摘・PR #810）: 要求の頭を
+    /// 1 バイトずつ、個々の `read` タイムアウトより短い間隔で送り続ける
+    /// クライアントは、どの 1 回の `read` もタイムアウトしないため
+    /// [`arm_read_timeout_for_deadline`] が無ければ無期限に接続枠を
+    /// 占有できてしまう。要求全体の絶対期限（ここではテスト専用の
+    /// 短縮値）に確実に到達し、無応答クローズへ倒れることを固定する。
+    #[test]
+    fn head_read_deadline_closes_connection_despite_steady_trickle() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+
+        // 期限を 200ms とし、40ms 間隔（個々の read の待機上限より確実に
+        // 短い）で 1 バイトずつ送り続けることで「個々の read は毎回進んで
+        // いる」状態を作る。期限がなければこのループは要求行が完成する
+        // （数十バイト × 40ms）よりずっと長く、テストが検証したい「期限切れ
+        // で打ち切られる」経路には決して届かない。
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter, Duration::from_millis(200));
+        });
+
+        let trickle = b"GET /v1/query HTTP/1.1\r\n";
+        for &byte in trickle {
+            if client.write_all(&[byte]).is_err() {
+                // サーバーが期限切れで先に閉じた（テストの目的どおり）。
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+
+        assert_closed_without_hanging(&mut client);
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// Slowloris 回帰テスト（codex-review 再指摘・PR #810）: 宣言済み本文
+    /// （`Content-Length`）を 1 バイトずつ、個々の `read` タイムアウトより
+    /// 短い間隔で送り続けるクライアントに対しても、要求全体の絶対期限に
+    /// 到達し次第、無応答クローズへ倒れることを固定する
+    /// （[`closes_silently_when_body_read_times_out`] は完全に停止する
+    /// クライアントを検証するのに対し、本テストは「常に何か送っている」
+    /// クライアントを検証する点が異なる）。
+    #[test]
+    fn body_read_deadline_closes_connection_despite_steady_trickle() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter, Duration::from_millis(200));
+        });
+
+        client
+            .write_all(b"POST /v1/query HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n")
+            .expect("write head");
+
+        // 宣言長 10 バイトのうち、40ms 間隔で 1 バイトずつ送り続ける
+        // （期限 200ms を優に超える所要時間）。
+        for byte in b"abcdefghij" {
+            if client.write_all(&[*byte]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+
+        assert_closed_without_hanging(&mut client);
+
+        handle.join().expect("handler thread must not panic");
+    }
+
     /// 接続して何も送らず切断した場合は無応答 EOF。
     #[test]
     fn closes_silently_when_client_sends_nothing() {
@@ -1044,7 +1289,7 @@ mod tests {
             .expect("set read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PlaceholderRouter);
+            handle_connection_with(server, &PlaceholderRouter, REQUEST_READ_DEADLINE);
         });
 
         client.shutdown(Shutdown::Write).expect("shutdown write");
@@ -1074,7 +1319,7 @@ mod tests {
             .expect("set read timeout");
 
         let handle = std::thread::spawn(move || {
-            handle_connection_with(server, &PanickingHandler);
+            handle_connection_with(server, &PanickingHandler, REQUEST_READ_DEADLINE);
         });
 
         client

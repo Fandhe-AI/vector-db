@@ -166,7 +166,12 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
             // 接続処理中は `permit` を保持し続け、スレッド終了時（正常終了・
             // panic いずれも）に Drop で確実に枠を解放する。
             let _permit = permit;
-            conn::handle_connection_with(stream, handler_for_thread.as_ref());
+            // `read_timeout` を要求全体（頭＋本文）の絶対読み取り期限としても
+            // 渡す（`conn::handle_connection_with` の doc・Slowloris 対策
+            // 参照）。接続受理直後に `apply_read_timeout` へ渡した値と同じ
+            // 1 つの値を「受理直後のソケットタイムアウト」と「要求読み取り
+            // 全体の期限」の双方に使う契約。
+            conn::handle_connection_with(stream, handler_for_thread.as_ref(), read_timeout);
         }) {
             eprintln!("wire-server: failed to spawn connection handler thread: {e}");
             // クロージャへ move された `permit` はスレッド生成失敗時に
