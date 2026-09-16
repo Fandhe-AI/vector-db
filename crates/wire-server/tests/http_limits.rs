@@ -153,7 +153,7 @@ fn http_accept_loop_reflects_shared_limiter_state() {
     drop(second);
 }
 
-/// `tests/wire_surface_cli.rs` の子プロセス経由 `--surface nosql` 起動が
+/// `tests/http1_surface_select.rs` の子プロセス経由 `--surface nosql` 起動が
 /// 本 Issue の変更後も無変更のまま green であることの確認は、当該ファイル
 /// 自体（別プロセスの結合テスト）が担う。本ファイルはライブラリ内 API を
 /// 直接呼ぶ経路のみを対象とする。
