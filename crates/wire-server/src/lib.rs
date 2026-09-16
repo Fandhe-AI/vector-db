@@ -28,8 +28,11 @@
 //!   （TASK-174・HTTP-4・Issue #750）と、TTL 固定〔[`limits::SESSION_TTL`]〕・
 //!   同時有効数上限〔[`limits::SessionLimiter`]／[`limits::MAX_SESSIONS`]〕
 //!   付きのメモリ内セッションストア `http::session::store::SessionStore`
-//!   （TASK-174・HTTP-4・HTTP-5・Issue #751。エンドポイント・Bearer 検証は
-//!   後続 Issue の担当）。
+//!   （TASK-174・HTTP-4・HTTP-5・Issue #751）、`Authorization: Bearer` の
+//!   受信データ経路 `http::session::bearer::extract_bearer_token`・
+//!   `POST /v1/session/close` のワンタイム失効パイプライン
+//!   `http::session::close::handle`（TASK-174・HTTP-8・Issue #753）を担う。
+//!   `/v1/query` 前段の Bearer ミドルウェアは後続 Issue の担当（#754）。
 //!   `http::query::schema` は `POST /v1/query` の JSON クエリオブジェクトの
 //!   意味的検証ヘルパー（必須欠落・未知キー・型不一致 → `42601`。Issue #760）。
 //!   `http::query::filter` は `filter` 配列の `op` 語彙（`eq`／`prefix`）を

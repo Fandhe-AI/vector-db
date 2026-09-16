@@ -71,6 +71,37 @@ pub fn spawn_http_listener(
     (addr, limiter)
 }
 
+/// `wire_server::http::listener::accept_loop_with_router`（production 入口。
+/// [`wire_server::http::router::Router`] を使う。`/v1/session`・
+/// `/v1/session/close` を実ハンドラへディスパッチする）をサーバースレッドで
+/// 起動し、接続先アドレスを返す。
+///
+/// `http4_session_issue.rs::spawn_router_server`（Issue #752）と同じ流儀の
+/// 昇格版（Issue #753。`/v1/session/close` の結合テスト・#754 以降も本関数を
+/// 再利用する想定）。`sessions` は呼び出し元が上限・TTL を制御できるよう
+/// `SessionStore` をそのまま受け取る。
+pub fn spawn_router_listener(
+    users_path: &std::path::Path,
+    sessions: wire_server::http::session::store::SessionStore,
+) -> SocketAddr {
+    let store = wire_server::auth::UserStore::load_from_file(users_path).expect("valid store");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let limiter = ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS);
+    let router = wire_server::http::router::Router::new(std::sync::Arc::new(store), sessions);
+
+    std::thread::spawn(move || {
+        wire_server::http::listener::accept_loop_with_router(
+            listener,
+            limiter,
+            wire_server::limits::READ_TIMEOUT,
+            router,
+        );
+    });
+
+    addr
+}
+
 /// 応答受信後にクライアントがソケットへ対して何をするか。
 ///
 /// `HalfClose`（既定・推奨）は書き込み側を即座に閉じ、サーバーの

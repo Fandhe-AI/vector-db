@@ -216,13 +216,12 @@ fn drain_budget_after_headers(content_length: usize, residual: &[u8]) -> usize {
 /// 保持するバッファからの借用であり、`RequestHandler` 実装へ読み取り専用で渡す。
 ///
 /// production ルータ（[`crate::http::router::Router`]。Issue #752）は
-/// `line.target`／`body` を読む。`headers` は `Authorization: Bearer` 検証
-/// （Issue #754）が消費するまで未使用のため `dead_code` 警告が出る。フィールド
-/// 自体は接続ハンドラの契約（`RequestHandler` へ何を渡すか）の一部であり
-/// 削除しない。
+/// `line.target`／`body` を読む。`headers` は `/v1/session/close` の
+/// `Authorization: Bearer` 検証（`crate::http::session::bearer`。Issue #753）
+/// が消費し、`/v1/query` 前段ミドルウェア（Issue #754）も同モジュールを
+/// 再利用して消費する想定。
 pub(crate) struct Request<'a> {
     pub(crate) line: RequestLine<'a>,
-    #[allow(dead_code)]
     pub(crate) headers: Headers<'a>,
     pub(crate) body: &'a [u8],
 }

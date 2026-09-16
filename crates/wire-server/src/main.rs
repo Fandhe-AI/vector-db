@@ -29,9 +29,10 @@
 //! 30 秒タイムアウト・同時接続数 64 の共有リミッターを SQL wire と同一契約で
 //! 適用したうえで、接続ハンドラ本体〔`http::conn::handle_connection_with`〕
 //! を呼ぶ。要求パース・panic 非伝播は Issue #747、ルーティング（`/v1/session`
-//! を `http::session::issue::handle` へディスパッチ・他パスは `08P01`）は
-//! Issue #752 で実装済み。`/v1/session/close`・`/v1/query` は Issue #753・
-//! #758 が追記する）を呼ぶ。いずれも `match surface` の前に
+//! を `http::session::issue::handle` へ、`/v1/session/close` を
+//! `http::session::close::handle` へディスパッチ・他パスは `08P01`）は
+//! Issue #752・#753 で実装済み。`/v1/query` は Issue #758 が追記する）を
+//! 呼ぶ。いずれも `match surface` の前に
 //! 1 回だけ構築した同一の
 //! `limits::ConnectionLimiter` インスタンスを受け取る。選ばれていない
 //! 側のリスナーは構造的に bind されない（HTTP-1 の排他方針）。
@@ -524,7 +525,7 @@ fn run_server(args: &[String]) -> ExitCode {
     // 同一のまま保つ）。
     if surface == wire_server::surface::Surface::Nosql {
         eprintln!(
-            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; POST /v1/session available, other paths rejected with 08P01 pending Issue #753/#758 router)"
+            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; POST /v1/session and POST /v1/session/close available, other paths rejected with 08P01 pending Issue #758 router)"
         );
     }
 

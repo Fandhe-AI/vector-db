@@ -128,11 +128,12 @@ mod tests {
     }
 
     #[test]
-    fn auth_required_projects_to_401_even_without_connected_send_path() {
-        // `AuthRequired` は送出経路未接続（`has_connected_send_path() == false`）だが、
-        // 射影テーブル上は他の認証系分類と同じ 401 として確定している
-        // （#753/#754 の Bearer 欠落経路が消費する契約の先取り固定）。
-        assert!(!ErrorClass::AuthRequired.has_connected_send_path());
+    fn auth_required_projects_to_401_with_connected_send_path() {
+        // `AuthRequired` の送出経路は TASK-174／HTTP-8（Issue #753）で
+        // `http::session::close`／`http::session::bearer` から接続済み
+        // （`has_connected_send_path() == true`）。射影テーブル上は他の
+        // 認証系分類と同じ 401 として確定している。
+        assert!(ErrorClass::AuthRequired.has_connected_send_path());
         assert_eq!(http_status(ErrorClass::AuthRequired), 401);
     }
 
