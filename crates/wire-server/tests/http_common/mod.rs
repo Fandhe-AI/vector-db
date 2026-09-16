@@ -297,9 +297,17 @@ fn error_field(resp: &HttpResponse, field: &str) -> String {
     }
 }
 
-/// 応答が `expected_status`／`expected_wire_code` の拒否応答であることを
-/// 検証する（[`parse_single_response`] の不変条件を含む）。
-pub fn assert_rejected(resp: &HttpResponse, expected_status: u16, expected_wire_code: &str) {
+/// `expected_status`／`expected_wire_code` の応答本文であることだけを検証
+/// する（[`parse_single_response`] の不変条件を含む）。[`PlaceholderRouter`]
+/// の固定応答（`400`／`08P01`）と偶然一致する場合も通してしまうため、
+/// フレーミング層の拒否を主張したいテストからは直接呼ばず
+/// [`assert_rejected`] を使うこと（[`PlaceholderRouter`]: `wire_server::
+/// http::conn::PlaceholderRouter`）。
+fn assert_status_and_wire_code(
+    resp: &HttpResponse,
+    expected_status: u16,
+    expected_wire_code: &str,
+) {
     assert_eq!(
         resp.status,
         expected_status,
@@ -321,11 +329,31 @@ pub fn assert_rejected(resp: &HttpResponse, expected_status: u16, expected_wire_
 /// 更新すればよい。
 pub const ROUTER_PLACEHOLDER_MESSAGE: &str = "unknown request target";
 
+/// 応答が `expected_status`／`expected_wire_code` の拒否応答であることを
+/// 検証する（[`parse_single_response`] の不変条件を含む）。
+///
+/// `PlaceholderRouter` の固定応答も `400`／`08P01` を返すため、本文だけの
+/// 一致では「フレーミング層で本当に拒否された」ことと「フレーミング層を
+/// 素通りしてルータへ到達し、たまたま同じ応答形状になった」ことを区別
+/// できない（後者は検証対象の入力検証が抜け落ちる退行を検出できなくする）。
+/// そのため `message` が [`ROUTER_PLACEHOLDER_MESSAGE`] と異なることも
+/// あわせて固定し、フレーミング層の拒否であることを保証する。
+pub fn assert_rejected(resp: &HttpResponse, expected_status: u16, expected_wire_code: &str) {
+    assert_status_and_wire_code(resp, expected_status, expected_wire_code);
+    let message = error_message_of(resp);
+    assert_ne!(
+        message,
+        ROUTER_PLACEHOLDER_MESSAGE,
+        "response reached PlaceholderRouter instead of being rejected by the framing layer          (body: {:?})",
+        String::from_utf8_lossy(&resp.body)
+    );
+}
+
 /// 「要求がパースを通ってハンドラへ到達した」ことを検証する（本 Issue 時点は
 /// [`ROUTER_PLACEHOLDER_MESSAGE`] を返す `PlaceholderRouter` のみが production
 /// ハンドラのため、到達＝この固定応答になる。モジュール doc 参照）。
 pub fn assert_reached_router(resp: &HttpResponse) {
-    assert_rejected(resp, 400, "08P01");
+    assert_status_and_wire_code(resp, 400, "08P01");
     assert_eq!(error_message_of(resp), ROUTER_PLACEHOLDER_MESSAGE);
 }
 
