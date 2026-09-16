@@ -14,6 +14,9 @@
 //! モジュール構成（現時点）:
 //! - [`request`]: 要求行（メソッド・ターゲット・バージョン）の解析（Issue #740・
 //!   TASK-173・HTTP-2, HTTP-11）
+//! - [`headers`]: ヘッダ部（`name: value` 行群と終端空行）の解析。合計 8 KiB・
+//!   32 個の固定上限、`Content-Length` 必須・一意・digits-only、
+//!   `Transfer-Encoding` 拒否（Issue #741・TASK-173・HTTP-2, HTTP-11）
 //! - [`status`]: `ErrorClass` → HTTP ステータスの決定的射影（Issue #744・ERR-4）
 //! - [`error_body`]: `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）
 //! - [`listener`]: `--surface nosql` の accept ループ stub（要求を読まず接続
@@ -22,9 +25,8 @@
 //!   呼ぶ唯一の呼び出し元
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
-//! - ヘッダパーサ（Issue #741。[`request::parse_request_line`] が返す
-//!   `consumed` オフセットから読み始める）
-//! - `Content-Type`／本文長上限の検証（Issue #742）
+//! - `Content-Type`／本文長上限の検証（[`headers::Headers::get_single`] で
+//!   `Content-Type` を取り出す。Issue #742）
 //! - 応答エンコーダ（Issue #746）
 //! - 接続ハンドラ本体（[`listener::accept_loop_stub`] を置き換える有界読み取り・
 //!   EOF 時の無応答クローズ判断・panic 非伝播。Issue #747）
@@ -34,6 +36,7 @@
 //! 転記しない）。
 
 pub mod error_body;
+pub mod headers;
 pub mod listener;
 pub mod request;
 pub mod status;
