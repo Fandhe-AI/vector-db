@@ -9,10 +9,11 @@
 //!   行がちょうど 1 行だけであること（表層表示行が混じらないこと）
 //! - `bogus`・大文字小文字違い・値欠落・重複指定はいずれも非 0 終了・
 //!   stderr に `--surface` を含む説明が出ること
-//! - `--surface nosql` は SQL wire リスナーを一切 bind せず、HTTP/1.1 stub
-//!   リスナー（Issue #735。要求を読まず接続を即クローズする）だけを 1 本
-//!   bind すること（`listening on` に到達し、`listening on` はちょうど 1 行、
-//!   かつ表層表示行を含む）
+//! - `--surface nosql` は SQL wire リスナーを一切 bind せず、HTTP/1.1
+//!   リスナー（Issue #735・#743。読み取りタイムアウト・接続数リミッター
+//!   適用済みだが要求の解釈・応答生成はまだ行わない暫定ハンドラ）だけを
+//!   1 本 bind すること（`listening on` に到達し、`listening on` はちょうど
+//!   1 行、かつ表層表示行を含む）
 //! - `--surface nosql --bind 0.0.0.0:...` は既存 WIRE-7 と同じ理由（TLS 未構成
 //!   時の非ループバック拒否）で起動拒否されること（HTTP-9）
 
@@ -268,10 +269,11 @@ fn invalid_or_missing_or_duplicate_surface_arg_is_rejected() {
     );
 }
 
-/// `--surface nosql` は SQL wire リスナーを一切 bind せず、HTTP/1.1 stub
-/// リスナー（Issue #735。要求を一切読まず接続を即クローズする）だけを 1 本
-/// bind する。`listening on` に到達し、かつちょうど 1 行であり、表層表示行
-/// を伴うことを確認する（HTTP-1 の排他方針）。
+/// `--surface nosql` は SQL wire リスナーを一切 bind せず、HTTP/1.1
+/// リスナー（Issue #735・#743。読み取りタイムアウト・接続数リミッター
+/// 適用済みの暫定ハンドラ。要求の解釈はまだ行わない）だけを 1 本 bind する。
+/// `listening on` に到達し、かつちょうど 1 行であり、表層表示行を伴うことを
+/// 確認する（HTTP-1 の排他方針）。
 #[test]
 fn nosql_starts_single_http_stub_listener_and_does_not_serve_pg_wire() {
     let fixture = TempFixtureDir::new("nosql-stub");

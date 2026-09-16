@@ -85,9 +85,10 @@ bind アドレスの通信路保護要件検証（TLS 未構成時は loopback �
 共有した後にリスナーだけが分岐するため、`nosql` 選択時も非ループバック
 bind は同じ理由で起動拒否されます。`nosql` を選択すると、選ばれていない
 表層（SQL wire）のリスナーは一切 bind されず、代わりに HTTP/1.1 の
-リスナーが 1 本だけ bind されます。本 Issue（#735）時点の HTTP リスナーは要求を一切
-読まずに接続を受理直後にクローズする stub です（読み取りタイムアウト・
-接続数リミッター・接続ハンドラ本体・応答生成は後続 Issue の担当）。
+リスナーが 1 本だけ bind されます。読み取り 30 秒タイムアウト・同時接続数 64
+（超過時は HTTP 503／`wire_code` `53300`）は SQL wire と同一契約で適用済み
+です（Issue #743）。要求の解釈・応答生成（接続ハンドラ本体）は後続 Issue
+（#747）の担当です。
 
 `--search-engine`（Issue #656）は検索エンジン選択の opt-in CLI 引数です。
 `--planner-endpoint`／`--planner-model`／`--embedder-hashing-dim`

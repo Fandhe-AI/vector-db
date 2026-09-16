@@ -1,10 +1,14 @@
 //! 接続資源保護（読み取りタイムアウト・同時接続数リミッター）を担う共有モジュール。
 //!
-//! `server::accept_loop_with_limiter` から呼ばれ、未認証クライアントの大量接続・
-//! Slowloris による
+//! `server::accept_loop_with_limiter`（SQL 表層）・
+//! `http::listener::accept_loop_with_limiter`（NoSQL 表層。Issue #743）の
+//! 双方から呼ばれ、未認証クライアントの大量接続・Slowloris による
 //! スレッド／メモリ枯渇を防ぐ。契約値（読み取りタイムアウト・同時接続数上限・
 //! 上限超過時の SQLSTATE）をこのモジュールに集約し、`handshake.rs` や `server.rs`
-//! に暫定値が分散しないようにする。
+//! に暫定値が分散しないようにする。`ConnectionLimiter` は `main.rs::run_server`
+//! が `match surface` の前に 1 回だけ構築したインスタンスを両表層のループへ渡す
+//! ため、プロセス内で選ばれた表層が同一の枠・同一の定数を使う（同時起動しない
+//! 前提のため「共有」は構築箇所の単一化で満たされる）。
 //!
 //! 対応: TASK-69（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-5, WIRE-6）。
 //! `SQLSTATE_TOO_MANY_CONNECTIONS` はポインタ: `docs/spec/04-behavior/error-format.md`
