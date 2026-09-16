@@ -144,11 +144,18 @@ const HTTP_LINGER_DRAIN_FALLBACK_BUDGET: usize = usize::MAX;
 /// 読み取る際に**既にバッファへ読み込み済み**の本文先頭部分（`residual`。
 /// ソケットからは読み取り済みのため drain 不要）を差し引いた残りを予算と
 /// する。`content_length` は untrusted なため上限を持たず（`MAX_BODY_LEN`
-/// を超えていてもそのまま使う）、`residual.len()` を超えることは無い
-/// （超えていれば `read_body` の「本文が宣言長を超える」経路であり本関数は
-/// 呼ばれない）ため `saturating_sub` で十分。宣言長が巨大な場合は事実上
-/// `usize::MAX` に近い予算になり、[`HTTP_LINGER_DRAIN_FALLBACK_BUDGET`] と
-/// 同じく [`LINGER_DRAIN_TIMEOUT`] のみが実質的な資源上限として働く
+/// を超えていてもそのまま使う）ため通常は `residual.len()` を上回り、
+/// その差分が予算になる。逆に `residual.len()` が `content_length` を
+/// 上回ること（例: `Content-Length: 1` かつ不正な `Content-Type` の
+/// 要求で本文 `abc` が頭の読み取り時点で既にバッファへ入っていた場合）
+/// もあり得る——超過分はいずれにせよ既にソケットから読み取り済みで
+/// drain の必要が無いため、`saturating_sub` が 0 を返すだけで正しい
+/// （本関数は「本文が宣言長を超える」ことを理由に拒否する経路ではなく、
+/// `reject_if_expect`／`plan_body` の拒否から呼ばれる。両者は
+/// `residual.len()` と `content_length` の大小関係を検査しない）。
+/// 宣言長が巨大な場合は事実上 `usize::MAX` に近い予算になり、
+/// [`HTTP_LINGER_DRAIN_FALLBACK_BUDGET`] と同じく
+/// [`LINGER_DRAIN_TIMEOUT`] のみが実質的な資源上限として働く
 /// （固定バッファ・時間制限は維持したまま、小さい固定上限への到達だけで
 /// 即座に打ち切らない設計。codex-review 指摘の修正方針どおり）。
 fn drain_budget_after_headers(content_length: usize, residual: &[u8]) -> usize {
