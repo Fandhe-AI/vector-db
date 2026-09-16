@@ -9,8 +9,9 @@
 //!
 //! 収録範囲は「engine・wire-server が現に返している `wire_code`」を基本とし、TASK-153
 //! （対象ビヘイビア ERR-1）が wire-server 側の横断写像（`wire-server/src/
-//! error_response.rs`）の網羅対象として `AuthRequired`（`28000`）を追加した
-//! （送出経路はまだ接続していない集約のみの追加）。分類の追加自体は TASK-101
+//! error_response.rs`）の網羅対象として `AuthRequired`（`28000`）を追加した。送出経路は
+//! TASK-174／HTTP-8（Issue #753）で wire-server の `http::session::close`／`http::
+//! session::bearer` から接続済み。分類の追加自体は TASK-101
 //! （`operation_id` 内容照合。RECOVER-10）で行った。「他分類（特に `23505`）へ写像しない」
 //! ことの正式検証は TASK-154（対象ビヘイビア ERR-3）が担い、`tests/error_format_err3.rs`
 //! の結合テストで検証済み。分類の定義そのものは spec 側の管理事項であり、本コメント・
@@ -82,8 +83,10 @@ define_error_classes! {
     AuthInvalid => ("28P01", "AUTH_INVALID"),
     /// 認証資格情報が提示されなかった（`28000`）。TASK-153（対象ビヘイビア ERR-1）が
     /// wire-server 側の横断写像（`wire-server/src/error_response.rs`）の網羅対象へ
-    /// 追加した分類（engine・wire-server とも現時点で送出経路は未接続。写像
-    /// テーブルの網羅性を保つための集約のみ）。
+    /// 追加した分類。送出経路は TASK-174／HTTP-8（Issue #753）で wire-server の
+    /// `http::session::close`／`http::session::bearer` から接続済み
+    /// （`Authorization: Bearer` の欠落・不正・失効済み・二重 close、
+    /// `POST /v1/session/close` の再送）。
     AuthRequired => ("28000", "AUTH_REQUIRED"),
     /// テナント帰属不一致（`42501`）。[`crate::tenant::TenantWriteError::Forbidden`]
     /// の写像。
@@ -151,14 +154,14 @@ impl ErrorClass {
 
     /// この分類が engine・wire-server のいずれかから現に送出されているか
     /// （モジュール冒頭の「収録範囲は現に返している `wire_code` に限る」という
-    /// 不変条件の唯一の例外を、prose だけでなくコード側でも明示・網羅テスト可能に
-    /// するための判定。`false` を返すのは [`ErrorClass::AuthRequired`] のみで、
-    /// 理由はモジュール冒頭・variant 定義のドキュメンテーションコメント参照
-    /// （TASK-153・ERR-1 の写像テーブル網羅対応での追加。送出経路は未接続）。
-    /// この判定を `false` にする分類を新たに追加する場合は、モジュール冒頭の
-    /// 不変条件コメントも合わせて更新すること（codex-review Low 指摘対応・PR #101）。
+    /// 不変条件を、prose だけでなくコード側でも明示・網羅テスト可能にするための
+    /// 判定。`AuthRequired` の送出経路が TASK-174／HTTP-8（Issue #753）で接続された
+    /// ことにより、本メソッドが `false` を返す分類は現時点で存在しない。メソッド
+    /// 自体は `wire-server::http::status` の既存参照・公開 API 後方互換のため残す。
+    /// 将来 `false` を返すべき分類を追加する場合は、モジュール冒頭の不変条件
+    /// コメントも合わせて更新すること（codex-review Low 指摘対応・PR #101）。
     pub const fn has_connected_send_path(self) -> bool {
-        !matches!(self, ErrorClass::AuthRequired)
+        true
     }
 }
 
@@ -297,15 +300,16 @@ mod tests {
     }
 
     /// モジュール冒頭が宣言する「収録範囲は現に返している `wire_code` に限る」
-    /// 不変条件の唯一の許容例外が `AuthRequired` であることを機械的に固定する
-    /// （codex-review Low 指摘対応・PR #101。将来 2 個目以降の未接続分類が
+    /// 不変条件について、`AuthRequired` の送出経路接続（TASK-174／HTTP-8・
+    /// Issue #753）後は未接続分類の集合が空であることを機械的に固定する
+    /// （codex-review Low 指摘対応・PR #101。将来、未接続分類が
     /// ドキュメント更新なしに紛れ込むことをこのテストが検出する）。
     #[test]
-    fn auth_required_is_the_sole_documented_unconnected_exception() {
+    fn no_unconnected_exceptions_remain() {
         let unconnected: Vec<ErrorClass> = ErrorClass::ALL
             .into_iter()
             .filter(|c| !c.has_connected_send_path())
             .collect();
-        assert_eq!(unconnected, vec![ErrorClass::AuthRequired]);
+        assert_eq!(unconnected, Vec::<ErrorClass>::new());
     }
 }
