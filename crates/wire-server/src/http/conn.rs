@@ -101,6 +101,23 @@ mod tests {
     use std::net::TcpListener;
     use std::time::Duration;
 
+    /// `stream.read` が実際に EOF（`Ok(0)`）で終わったことを確認する。
+    ///
+    /// `read(...).unwrap_or(0)` は、クライアント側の read が `WouldBlock`／
+    /// `TimedOut` で終わった場合も `Ok(0)`（EOF）と同一視してしまい、
+    /// 「サーバーの `read_timeout` 超過後に接続が閉じる」という検証対象の
+    /// 契約が破れていてもテストを通してしまう（codex-review 指摘）。
+    /// ここでは `Ok(0)` のみを合格とし、それ以外（`WouldBlock`／`TimedOut`
+    /// を含む）はテスト失敗として明示する。
+    fn assert_eof(stream: &mut TcpStream) {
+        let mut buf = [0u8; 8];
+        match stream.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("expected EOF without any response bytes, got {n} bytes"),
+            Err(e) => panic!("expected EOF (Ok(0)), got read error: {e:?}"),
+        }
+    }
+
     /// `encode_reject_response` の構造（ステータス行・ヘッダ・
     /// `Content-Length` の一致・ヘッダ終端がちょうど 1 箇所・本文が
     /// `error.wire_code == "53300"` で `data` キーを含まない）を固定する。
@@ -177,9 +194,7 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set client read timeout");
-        let mut buf = [0u8; 8];
-        let n = client.read(&mut buf).unwrap_or(0);
-        assert_eq!(n, 0, "expected EOF without any response bytes");
+        assert_eof(&mut client);
     }
 
     /// `handle_connection_interim` はデータを送ったクライアントに対しても
@@ -202,9 +217,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set client read timeout");
         let _ = client.write_all(b"GET / HTTP/1.1\r\n\r\n");
-        let mut buf = [0u8; 8];
-        let n = client.read(&mut buf).unwrap_or(0);
-        assert_eq!(n, 0, "expected EOF without any response bytes");
+        assert_eof(&mut client);
     }
 
     /// `reject_too_many_connections` は 503 応答を書き込んでから EOF になる。

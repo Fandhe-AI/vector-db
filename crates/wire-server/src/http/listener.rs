@@ -157,6 +157,23 @@ mod tests {
     use std::io::Read;
     use std::net::TcpStream;
 
+    /// `stream.read` が実際に EOF（`Ok(0)`）で終わったことを確認する。
+    ///
+    /// `read(...).unwrap_or(0)` は、クライアント側の read が `WouldBlock`／
+    /// `TimedOut` で終わった場合も `Ok(0)`（EOF）と同一視してしまい、
+    /// 「サーバーの `read_timeout` 超過後に接続が閉じる」という検証対象の
+    /// 契約が破れていてもテストを通してしまう（codex-review 指摘）。
+    /// ここでは `Ok(0)` のみを合格とし、それ以外（`WouldBlock`／`TimedOut`
+    /// を含む）はテスト失敗として明示する。
+    fn assert_eof(stream: &mut TcpStream) {
+        let mut buf = [0u8; 8];
+        match stream.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("expected EOF without any response bytes, got {n} bytes"),
+            Err(e) => panic!("expected EOF (Ok(0)), got read error: {e:?}"),
+        }
+    }
+
     /// stub リスナーが接続を受理した直後に閉じ、要求を読まないこと・
     /// 応答を書かないこと・ループが次の接続を受理し続けること（1 回の
     /// 接続で終了しない）を確認する。
@@ -259,9 +276,7 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set read timeout");
-        let mut buf = [0u8; 8];
-        let n = stream.read(&mut buf).unwrap_or(0);
-        assert_eq!(n, 0, "expected EOF without any response bytes");
+        assert_eof(&mut stream);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while limiter.active() > 0 {
