@@ -359,12 +359,33 @@ enum BandKind {
 /// が偶然一致することで見逃しうる。`min`〜`p99` の分布全体を尾部まで
 /// 均等に走査することで、どの分位点にサブ集団が現れても検出できるように
 /// する）。
+///
+/// 5% 刻み（Issue #738 codex-review 追加指摘: 前回の 8 点ラダー（10% 刻み
+/// 中心）でも、両腕の分位点が偶然一致する位置の**間**にだけ現れる部分母
+/// 集団（例: 200 件中 38 件＝19% だけが異なる値を取り、その区間の境界が
+/// ラダー上の 10% 刻みの点をすべて跨いで通過する反例）は見逃しうる。
+/// 刻み幅を反例の部分母集団幅（19%）より十分細かい 5% へ狭めることで、
+/// 分布中のどこに現れる部分母集団もいずれかのラダー点に必ず引っかかる
+/// ようにする。`judge_detects_gap_between_quantile_ladder_points` 参照）。
 const QUANTILE_LADDER: &[(f64, BandKind)] = &[
     (0.00, BandKind::Median),
+    (0.05, BandKind::Median),
     (0.10, BandKind::Median),
+    (0.15, BandKind::Median),
+    (0.20, BandKind::Median),
     (0.25, BandKind::Median),
+    (0.30, BandKind::Median),
+    (0.35, BandKind::Median),
+    (0.40, BandKind::Median),
+    (0.45, BandKind::Median),
     (0.50, BandKind::Median),
+    (0.55, BandKind::Median),
+    (0.60, BandKind::Median),
+    (0.65, BandKind::Median),
+    (0.70, BandKind::Median),
     (0.75, BandKind::Median),
+    (0.80, BandKind::Median),
+    (0.85, BandKind::Median),
     (0.90, BandKind::Tail),
     (0.95, BandKind::Tail),
     (0.99, BandKind::Tail),
@@ -874,5 +895,57 @@ mod tenant_latency_judge_tests {
         let b = identical_samples(200, 1040);
         let c = identical_samples(200, 1000);
         assert_eq!(judge(&b, &c, &Bands::default()), Verdict::Indistinguishable);
+    }
+
+    /// codex-review 追加指摘（Issue #738）: 8 点ラダー（10% 刻み中心）は
+    /// 固定分位点「の間」だけに現れる部分母集団を見逃す反例。
+    ///
+    /// b は取得順で 1000×60 件・2000×38 件・3000×102 件（計 200 件）の
+    /// ブロック、c は同じ並びで中央ブロックだけ 2500 に置き換えたもの
+    /// （1000×60・2500×38・3000×102）。旧 8 点ラダー（0/10/25/50/75/90/95/99%）
+    /// はいずれも累積比率 0%・30.15%（境界と一致するがブロック先頭側の
+    /// 1000 を指す）〜48.74% の中央ブロック区間を跨いで通過してしまい、
+    /// median（idx=100 → 3000）・p95（idx=189 → 3000）を含むどの固定点でも
+    /// b・c が一致してしまうため `Indistinguishable` を誤って返す
+    /// （このブロックは全体の 19% を占め、2000 対 2500 は相対差 20% で
+    /// 実際には区別可能）。5% 刻みへ狭めた新ラダーは 30/35/40/45% の各点が
+    /// この区間内に入り検出できることを固定する。
+    #[test]
+    fn judge_detects_gap_between_quantile_ladder_points() {
+        let mut b: Vec<u128> = Vec::with_capacity(200);
+        b.extend(std::iter::repeat_n(1000u128, 60));
+        b.extend(std::iter::repeat_n(2000u128, 38));
+        b.extend(std::iter::repeat_n(3000u128, 102));
+
+        let mut c: Vec<u128> = Vec::with_capacity(200);
+        c.extend(std::iter::repeat_n(1000u128, 60));
+        c.extend(std::iter::repeat_n(2500u128, 38));
+        c.extend(std::iter::repeat_n(3000u128, 102));
+
+        // 反例の前提: 旧 8 点ラダーではすべての固定点で b・c が一致する
+        // （このアサーション自体が「なぜ旧ラダーが見逃すか」の根拠）。
+        const OLD_LADDER: &[(f64, BandKind)] = &[
+            (0.00, BandKind::Median),
+            (0.10, BandKind::Median),
+            (0.25, BandKind::Median),
+            (0.50, BandKind::Median),
+            (0.75, BandKind::Median),
+            (0.90, BandKind::Tail),
+            (0.95, BandKind::Tail),
+            (0.99, BandKind::Tail),
+        ];
+        let mut b_sorted = b.clone();
+        let mut c_sorted = c.clone();
+        b_sorted.sort_unstable();
+        c_sorted.sort_unstable();
+        for &(p, _) in OLD_LADDER {
+            assert_eq!(
+                percentile(&b_sorted, p),
+                percentile(&c_sorted, p),
+                "old 8-point ladder must miss this counterexample at p={p}"
+            );
+        }
+
+        assert_eq!(judge(&b, &c, &Bands::default()), Verdict::Distinguishable);
     }
 }
