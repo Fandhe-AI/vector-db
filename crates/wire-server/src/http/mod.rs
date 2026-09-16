@@ -16,19 +16,24 @@
 //!   TASK-173・HTTP-2, HTTP-11）
 //! - [`status`]: `ErrorClass` → HTTP ステータスの決定的射影（Issue #744・ERR-4）
 //! - [`error_body`]: `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）
+//! - [`listener`]: `--surface nosql` の accept ループ stub（要求を読まず接続
+//!   を即クローズ。Issue #735・TASK-171／HTTP-1・HTTP-9）。`main.rs::run_server`
+//!   が SQL wire の [`crate::server::accept_loop_with_engine`] と排他選択で
+//!   呼ぶ唯一の呼び出し元
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - ヘッダパーサ（Issue #741。[`request::parse_request_line`] が返す
 //!   `consumed` オフセットから読み始める）
 //! - `Content-Type`／本文長上限の検証（Issue #742）
 //! - 応答エンコーダ（Issue #746）
-//! - 接続ハンドラ（ストリームからの有界読み取り・EOF 時の無応答クローズ判断。
-//!   Issue #747）
+//! - 接続ハンドラ本体（[`listener::accept_loop_stub`] を置き換える有界読み取り・
+//!   EOF 時の無応答クローズ判断・panic 非伝播。Issue #747）
 //!
 //! 対応: TASK-173（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア HTTP-1〜13。
 //! PoC-15/TASK-182 は private 資産のためポインタ参照のみで、コード・所見は
 //! 転記しない）。
 
 pub mod error_body;
+pub mod listener;
 pub mod request;
 pub mod status;
