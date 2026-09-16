@@ -2,17 +2,19 @@
 //! ビヘイビア HTTP-2・HTTP-3・HTTP-11。対象ポインタ: `docs/spec/05-tasks.md`
 //! TASK-173・`docs/spec/04-behavior/http-transport.md`）。
 //!
-//! `http::listener::accept_loop_with_limiter`（production では
-//! [`PlaceholderRouter`] を `Arc` で包んで渡す）から呼ばれる、接続単位の 2 経路:
+//! `http::listener::accept_loop_with_router`（production では
+//! [`crate::http::router::Router`] を `Arc` で包んで渡す。`accept_loop_with_limiter`
+//! は後方互換 API で [`PlaceholderRouter`] を使う）から呼ばれる、接続単位の
+//! 2 経路:
 //! - [`handle_connection_with`][]: 接続ハンドラ本体。要求行
 //!   （[`crate::http::request`]）→ ヘッダ（[`crate::http::headers`]）→
 //!   `Expect` ヘッダの拒否（[`reject_if_expect`]。下記「`Expect` の扱い」節）
 //!   → 本文長・`Content-Type` の読み取り前検証（[`crate::http::body`]）→
-//!   本文読み取り → `handler: &impl RequestHandler` へのルーティング（本
-//!   Issue 時点では全パス `08P01` の [`PlaceholderRouter`]。実ルータは
-//!   Issue #758 が置き換える）の順に 1 往復だけ処理し、応答を 1 回書き込んで
-//!   からクローズする（keep-alive・パイプライン非対応。応答は常に
-//!   `Connection: close`）。
+//!   本文読み取り → `handler: &impl RequestHandler` へのルーティング
+//!   （production は [`crate::http::router::Router`]。`/v1/session` のみ発行
+//!   パイプラインへ委譲し、他パスは `08P01`。Issue #752）の順に 1 往復だけ
+//!   処理し、応答を 1 回書き込んでからクローズする（keep-alive・パイプライン
+//!   非対応。応答は常に `Connection: close`）。
 //!   `handler` はテスト（本ファイル・#749 の層 A 網羅テスト）が任意の
 //!   [`RequestHandler`] 実装（panic 注入を含む）を差し込むための注入 seam
 //! - [`reject_too_many_connections`][]: 同時接続数の枠を確保できなかった
@@ -213,29 +215,32 @@ fn drain_budget_after_headers(content_length: usize, residual: &[u8]) -> usize {
 /// 解析済みの 1 要求（要求行・ヘッダ・本文）。フィールドはいずれも接続ハンドラが
 /// 保持するバッファからの借用であり、`RequestHandler` 実装へ読み取り専用で渡す。
 ///
-/// 本 Issue 時点の唯一の production 実装（[`PlaceholderRouter`]）はパス・
-/// メソッドを問わず一律拒否するため各フィールドを読まず、`dead_code` 警告が
-/// 出る（実ルータ Issue #758 が `line.target`／`headers`／`body` を読む唯一の
-/// 消費者になる）。フィールド自体は接続ハンドラの契約（`RequestHandler` へ
-/// 何を渡すか）の一部であり削除しない。
-#[allow(dead_code)]
+/// production ルータ（[`crate::http::router::Router`]。Issue #752）は
+/// `line.target`／`body` を読む。`headers` は `Authorization: Bearer` 検証
+/// （Issue #754）が消費するまで未使用のため `dead_code` 警告が出る。フィールド
+/// 自体は接続ハンドラの契約（`RequestHandler` へ何を渡すか）の一部であり
+/// 削除しない。
 pub(crate) struct Request<'a> {
     pub(crate) line: RequestLine<'a>,
+    #[allow(dead_code)]
     pub(crate) headers: Headers<'a>,
     pub(crate) body: &'a [u8],
 }
 
 /// 1 要求を受け取り応答バイト列を返す trait。`handle_connection_with` の注入
-/// seam であり、production では [`PlaceholderRouter`]（本 Issue。実ルータは
-/// Issue #758）を、テストでは任意のスタブ実装（panic 注入を含む）を渡す。
+/// seam であり、production では [`crate::http::router::Router`]（Issue #752）
+/// を、`accept_loop_with_limiter`（後方互換 API）は [`PlaceholderRouter`] を、
+/// テストでは任意のスタブ実装（panic 注入を含む）を渡す。
 pub(crate) trait RequestHandler {
     fn handle(&self, req: &Request<'_>) -> Vec<u8>;
 }
 
-/// 本 Issue 時点のルータ: パス・メソッドを問わず常に `08P01`
-/// （`ErrorClass::ProtocolViolation`）で拒否する placeholder。実ルータ
-/// （`/v1/session`・`/v1/session/close`・`/v1/query` の 3 エンドポイント限定・
-/// 非 POST／未知パス／クエリ文字列付き拒否）は Issue #758 が置き換える。
+/// パス・メソッドを問わず常に `08P01`（`ErrorClass::ProtocolViolation`）で
+/// 拒否する placeholder。`http::listener::accept_loop_with_limiter`
+/// （後方互換 API）が使う。production 入口は
+/// [`crate::http::router::Router`]（Issue #752。`/v1/session` を
+/// `session::issue::handle` へディスパッチし、他パスは本型と同じバイト列
+/// で拒否する）。
 pub(crate) struct PlaceholderRouter;
 
 impl RequestHandler for PlaceholderRouter {
