@@ -15,13 +15,15 @@
 //!   HTTP ステータスの決定的射影（Issue #744・ERR-4）。`http::error_body` は
 //!   `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）。`http::listener`
 //!   は `--surface nosql` の accept ループ stub（Issue #735・HTTP-9）。
-//!   `http::query::schema` は `POST /v1/query` の JSON クエリオブジェクトの
-//!   意味的検証ヘルパー（必須欠落・未知キー・型不一致 → `42601`。Issue #760）。
-//!   `http::query::filter` は `filter` 配列の `op` 語彙（`eq`／`prefix`）を
+//!   `http::body` は本文を読み取る前の `Content-Type`（`application/json`・
+//!   `charset=utf-8` のみ）検証と本文長 1 MiB 上限判定（`08P01`／`54000`）、
+//!   読み取り後の UTF-8 昇格（`42601`。Issue #742）を担う。`http::query::schema`
+//!   は `POST /v1/query` の JSON クエリオブジェクトの意味的検証ヘルパー
+//!   （必須欠落・未知キー・型不一致 → `42601`。Issue #760）。`http::query::filter`
+//!   は `filter` 配列の `op` 語彙（`eq`／`prefix`）を
 //!   `engine::declarative_filter::DeclarativeFilter` へ写像し `bind_all` で
-//!   `TableSchema` へ束縛する（Issue #761・NOSQL-7）。後続のヘッダ・本文
-//!   検証・応答エンコーダ・接続ハンドラ本体は #741〜#747 が `http` 配下へ
-//!   追加していく
+//!   `TableSchema` へ束縛する（Issue #761・NOSQL-7）。後続の応答エンコーダ・
+//!   接続ハンドラ本体は #746〜#747 が `http` 配下へ追加していく
 //! - [`bind_guard`]: bind アドレスの通信路保護要件検証（TLS 未構成時は loopback 限定。
 //!   TASK-70・WIRE-7）。`main.rs::run_server` の唯一の bind 経路
 //! - [`server`]: 接続受け付けループ・同時接続数の有界化・I/O タイムアウト適用

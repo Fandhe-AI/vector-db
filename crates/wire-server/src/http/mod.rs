@@ -17,6 +17,10 @@
 //! - [`headers`]: ヘッダ部（`name: value` 行群と終端空行）の解析。合計 8 KiB・
 //!   32 個の固定上限、`Content-Length` 必須・一意・digits-only、
 //!   `Transfer-Encoding` 拒否（Issue #741・TASK-173・HTTP-2, HTTP-11）
+//! - [`body`]: 本文を読み取る前の `Content-Type`（`application/json`・
+//!   `charset=utf-8` のみ）検証と本文長 1 MiB 上限判定（`08P01`／`54000`）、
+//!   および読み取り後の本文バイト列 → UTF-8 文字列昇格（`42601`。Issue #742・
+//!   TASK-173・HTTP-3, HTTP-11）
 //! - [`status`]: `ErrorClass` → HTTP ステータスの決定的射影（Issue #744・ERR-4）
 //! - [`error_body`]: `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）
 //! - [`listener`]: `--surface nosql` の accept ループ stub（要求を読まず接続
@@ -31,8 +35,6 @@
 //!   委譲する（Issue #761・NOSQL-7）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
-//! - `Content-Type`／本文長上限の検証（[`headers::Headers::get_single`] で
-//!   `Content-Type` を取り出す。Issue #742）
 //! - 応答エンコーダ（Issue #746）
 //! - 接続ハンドラ本体（[`listener::accept_loop_stub`] を置き換える有界読み取り・
 //!   EOF 時の無応答クローズ判断・panic 非伝播。Issue #747）
@@ -43,6 +45,7 @@
 //! HTTP-1〜13・NOSQL-1〜NOSQL-10。PoC-15/TASK-182 は private 資産のため
 //! ポインタ参照のみで、コード・所見は転記しない）。
 
+pub mod body;
 pub mod error_body;
 pub mod headers;
 pub mod listener;
