@@ -111,8 +111,6 @@ private メソッド）へ抽出した。SQL 経路は
   テキスト非経由で外部から使えるのは TASK-177 以降になる。
 - search（`BoundStatement`）向けの同型エントリ: 同じ `read_txn` の壁に当たるが
   TASK-186 の対象外。TASK-175 へ申し送り。
-- SQL 経路と束縛済み経路の混在実行・結果一致テスト、`wire_scan.rs`／
-  `wire_aggregate.rs` の pass 件数記録: Issue #729 の担当。
 - `execute_insert`／`build_explain_result` の公開: Issue #730。
 
 ## テスト
@@ -134,3 +132,28 @@ private メソッド）へ抽出した。SQL 経路は
 `sql_aggregate.rs`・`sql_aggregate_public_api.rs`・`sql_group_by.rs`・
 `scalar_index_aggregate.rs`・`sql_surface.rs`・wire-server `wire_scan.rs`
 （7 件）・`wire_aggregate.rs`（7 件）。
+
+`crates/engine/tests/bound_plan_public_api.rs`（Issue #729。単一 `Storage` 上で
+SQL 経由の実行と束縛済み計画経由の実行が混在しても結果が一致し、テナント境界
+（RLS-7・RLS-8）を破らないことを固定）:
+
+- scan: `SELECT` の複数形（`WHERE`・`SELECT *` を含む）で `id` ソート後の行が
+  両経路で完全一致（`LIMIT` が可視行数を下回る場合は SQL-15 の順序保証なし
+  契約に合わせ件数・可視範囲のみ比較）
+- 集計（`GROUP BY` なし）: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`・UDF（`vec_norm`）
+  経由の式項目が固定オラクルと両経路で一致
+- `GROUP BY`／`HAVING`／`ORDER BY ... LIMIT`: 順序込みで両経路が固定オラクルと
+  一致
+- 書き込み（`insert_row`）を挟んだ世代進行の前後で両経路が同時に新しい世代を
+  反映し、`VisibleBitmapCache` が実際にヒットした状態（非 vacuous）であることを
+  確認
+- 一方のテナントを束縛経路、他方を SQL 経路で交互実行（往復）しても
+  `Visibility::Private` 行が他テナントへ非漏えい（`Visibility::Public` は
+  テナント非依存の全体公開契約どおり両テナントから見える）
+- `Arc<EngineCore>` を複数スレッドで共有し SQL 経路・束縛済み経路を交互実行
+  しても単一スレッド参照結果と一致
+- 同一の拒否入力（`SUM(embedding)`・`HAVING` での `GROUP BY` キー列比較）に
+  対する `wire_code` が両経路で一致
+
+再実測した wire 回帰の pass 件数（本 Issue 時点で無変更）: `wire_scan.rs`
+7 件・`wire_aggregate.rs` 7 件、いずれも pass。
