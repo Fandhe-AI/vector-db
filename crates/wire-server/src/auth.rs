@@ -18,7 +18,13 @@ use std::time::{Duration, Instant};
 use argon2id::Params;
 
 /// 認証失敗時に課す固定遅延。ポインタ: TASK-67・WIRE-3（`docs/spec/04-behavior/wire-protocol.md`）。
-const AUTH_FAILURE_DELAY: Duration = Duration::from_millis(200);
+///
+/// `pub`（Issue #752）: NoSQL 表層の `POST /v1/session`
+/// （`http::session::issue`。TASK-174・HTTP-6）も [`verify`] を直接呼び、この
+/// 固定遅延・ダミー KDF による対称性を SQL wire と共有する。結合テストが
+/// 「応答時間が最低この値以上である」ことを検証する際の単一情報源として
+/// 参照できるよう公開する（値そのものはこの公開より前から変わらない）。
+pub const AUTH_FAILURE_DELAY: Duration = Duration::from_millis(200);
 
 /// wire プロトコルの認証失敗応答が用いる SQLSTATE（invalid_password）。値は
 /// `engine::error_format::ErrorClass`（SSOT。TASK-152・ERR-2）を単一の真実源とし、
@@ -244,6 +250,10 @@ fn dummy_phc() -> &'static str {
 
 /// cleartext password 認証を照合し、成功時は `engine::policy::PolicyContext` を返す。
 /// `handshake.rs` の接続ハンドラから呼ばれる（ポインタ: TASK-67・WIRE-3）。
+/// `http::session::issue`（`POST /v1/session`・TASK-174・HTTP-6。Issue #752）
+/// からも同じ関数がそのまま呼ばれ、固定遅延・ダミー KDF による対称性・
+/// `MAX_CONCURRENT_ARGON2_KDF` のブロッキングセマフォは SQL wire・NoSQL 表層の
+/// 両方で共有される（HTTP 側で `sleep` を追加する等の再実装はしない）。
 ///
 /// 失敗時は未知ユーザー・誤パスワードのいずれも [`dummy_phc`] を用いて実ユーザーと
 /// 同一コストの Argon2id 計算を必ず実行してから固定遅延 [`AUTH_FAILURE_DELAY`] 込みで

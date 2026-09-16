@@ -25,12 +25,13 @@
 //! 両表層とも `GuardedBindAddrs::resolve`／`bind()` を共有した**後**に
 //! accept ループだけを分岐する（HTTP-9: nosql 選択時も WIRE-7 と同じ bind
 //! ガードを通る）。`sql` は `server::accept_loop_with_engine`、`nosql` は
-//! `http::listener::accept_loop_with_limiter`（Issue #743・#747。読み取り
+//! `http::listener::accept_loop_with_router`（Issue #743・#747・#752。読み取り
 //! 30 秒タイムアウト・同時接続数 64 の共有リミッターを SQL wire と同一契約で
 //! 適用したうえで、接続ハンドラ本体〔`http::conn::handle_connection_with`〕
-//! を呼ぶ。要求パース・ルーティング（本 Issue 時点では全パス `08P01` の
-//! `conn::PlaceholderRouter`。実ルータは Issue #758）・panic 非伝播は
-//! Issue #747 で実装済み）を呼ぶ。いずれも `match surface` の前に
+//! を呼ぶ。要求パース・panic 非伝播は Issue #747、ルーティング（`/v1/session`
+//! を `http::session::issue::handle` へディスパッチ・他パスは `08P01`）は
+//! Issue #752 で実装済み。`/v1/session/close`・`/v1/query` は Issue #753・
+//! #758 が追記する）を呼ぶ。いずれも `match surface` の前に
 //! 1 回だけ構築した同一の
 //! `limits::ConnectionLimiter` インスタンスを受け取る。選ばれていない
 //! 側のリスナーは構造的に bind されない（HTTP-1 の排他方針）。
@@ -523,7 +524,7 @@ fn run_server(args: &[String]) -> ExitCode {
     // 同一のまま保つ）。
     if surface == wire_server::surface::Surface::Nosql {
         eprintln!(
-            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; all requests rejected with 08P01 pending Issue #758 router)"
+            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; POST /v1/session available, other paths rejected with 08P01 pending Issue #753/#758 router)"
         );
     }
 
@@ -547,15 +548,20 @@ fn run_server(args: &[String]) -> ExitCode {
             server::accept_loop_with_engine(listener, store, core, limiter, limits::READ_TIMEOUT);
         }
         wire_server::surface::Surface::Nosql => {
-            // `store`／`core` は接続ハンドラ本体（Issue #747。全パス `08P01`
-            // の `conn::PlaceholderRouter` を固定で使う）ではまだ使わない。
-            // 実ルータ（Issue #758）がセッション認証・クエリ実行のために
-            // 両者を使う前提で、ここまでの構築順序を SQL 側と揃えている。
-            let _ = (&store, &core);
-            wire_server::http::listener::accept_loop_with_limiter(
+            // Issue #752: `store` はセッション認証（`POST /v1/session`）の
+            // ユーザーストアとして `Router` へ渡す。セッションストアは
+            // 表層選択のたびに新規構築する（プロセス内で 1 表層のみ起動
+            // するため、SQL wire 側の `store`／`limiter` と同じ「1 回だけ
+            // 構築」方針）。`core`（クエリ実行）はまだ使わない
+            // （`/v1/query` の実行結線は Issue #758 以降の担当）。
+            let _ = &core;
+            let sessions = wire_server::http::session::store::SessionStore::new();
+            let router = wire_server::http::router::Router::new(Arc::clone(&store), sessions);
+            wire_server::http::listener::accept_loop_with_router(
                 listener,
                 limiter,
                 limits::READ_TIMEOUT,
+                router,
             );
         }
     }

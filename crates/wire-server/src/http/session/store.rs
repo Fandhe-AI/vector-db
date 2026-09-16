@@ -237,6 +237,16 @@ impl SessionStore {
     pub fn active_sessions(&self) -> usize {
         self.limiter.active()
     }
+
+    /// このストアの TTL（[`SessionStore::issue`] が発行するセッションの
+    /// 有効期限）。応答の `expires_in` 等、呼び出し元が実際の保持契約値を
+    /// 参照する必要がある箇所は [`crate::limits::SESSION_TTL`] 定数を直接
+    /// 使わずこのアクセサーを経由する（[`SessionStore::with_limits`] で
+    /// 既定と異なる TTL を注入したストアとの乖離を防ぐため。Issue #813
+    /// codex-review P2 指摘）。
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
 }
 
 #[cfg(test)]
