@@ -110,6 +110,20 @@ fn ctx_b_full() -> PolicyContext {
         .expect("valid tenant-b ctx")
 }
 
+/// tenant-a に対して `[Public, Private]` を許可した `PolicyContext`（tenant-b と
+/// 同一の可視性権限集合）。tenant-a は自身の `Visibility::Private` 行を 1 件も
+/// 持たないため、`row_tenant == ctx.tenant_id()` の tenant_id 照合が正しく効いて
+/// いれば可視行数は `ctx_public("tenant-a")` と変わらない（5 行のまま）。この
+/// 照合が欠落し可視性ラベルの集合一致だけで判定される退行が起きると、tenant-a
+/// からも tenant-b の Private 行（id 101..=103・lang="xx"）が見えてしまう
+/// （[`cross_tenant_interleaving_with_symmetric_visibility_never_leaks_private_rows`]。
+/// レビュー指摘: RLS-7・RLS-8 のテナント境界検証では両コンテキストの可視性権限を
+/// 揃え、可視性ラベルの一致だけで期待結果になってしまう構成を避ける）。
+fn ctx_a_full() -> PolicyContext {
+    PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+        .expect("valid tenant-a full ctx")
+}
+
 fn open_engine_core(path: &std::path::Path) -> EngineCore {
     let storage = Storage::open(path).expect("open storage");
     seed_two_tenants(&storage);
@@ -487,13 +501,40 @@ fn cross_tenant_interleaving_never_leaks_private_rows_through_shared_caches() {
     let assert_tenant_b_result = |result: &QueryResult, label: &str| {
         // tenant-b（`[Public, Private]` ctx）は tenant-a の Public 行（グローバル
         // 公開）に加え、自分の Private 行（`lang` = `"xx"`）も見えてよい。
-        // ここでは「自分の Private データが正しく見える」ことのみ確認する
-        // （tenant-a の Public データが見えるのは `Visibility::Public` の
-        // 契約どおりであり漏えいではない）。
+        // 非空確認だけでは、tenant-a の結果（Public 5 行のみ）を誤って再利用
+        // しても成立してしまう（レビュー指摘）。scan・GROUP BY はそれぞれの
+        // 形状で「自分の Private データが実際に含まれる」ことを直接固定する。
         assert!(
             !result.rows.is_empty(),
             "tenant-b {label} unexpectedly empty"
         );
+        if label == scan_sql {
+            // scan_sql（`SELECT id, lang FROM docs LIMIT 10`）は `cells[0]` が
+            // `id`（`Cell::Integer`）。自分の Private 行 id（101..=103）が
+            // 全件含まれることを確認する。
+            let seen_ids: std::collections::BTreeSet<u64> =
+                result.rows.iter().map(|row| row.id).collect();
+            for id in 101..=103u64 {
+                assert!(
+                    seen_ids.contains(&id),
+                    "tenant-b {label} missing own private row id {id}"
+                );
+            }
+        } else if label == group_sql {
+            // group_sql（`SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang`）は
+            // `cells[0]` が `lang`。`xx` グループの件数が 3（自分の Private 行数）
+            // であることを直接固定する。
+            let xx_row = result
+                .rows
+                .iter()
+                .find(|row| row.cells[0] == Cell::Text("xx".to_string()))
+                .unwrap_or_else(|| panic!("tenant-b {label} missing xx group"));
+            assert_eq!(
+                xx_row.cells[1],
+                Cell::Integer(3),
+                "tenant-b {label} xx group count"
+            );
+        }
     };
 
     // ラウンド 1: tenant-a は束縛経路、tenant-b は SQL 経路。
@@ -535,6 +576,99 @@ fn cross_tenant_interleaving_never_leaks_private_rows_through_shared_caches() {
     );
 }
 
+// --- T7: 同一の可視性権限（[Public, Private]）を両テナントに許可しても分離される ---
+
+/// [`cross_tenant_interleaving_never_leaks_private_rows_through_shared_caches`]
+/// は tenant-a が Public のみ・tenant-b が `[Public, Private]` という非対称な
+/// 権限構成のため、テナント ID の照合が欠落し可視性ラベルの集合一致だけで
+/// 判定される退行があっても検出できない（レビュー指摘）。本テストは両
+/// コンテキストに `[Public, Private]` を許可し、tenant_id 照合が実際に効いて
+/// いることを確認する（RLS-7・RLS-8）。
+#[test]
+fn cross_tenant_interleaving_with_symmetric_visibility_never_leaks_private_rows() {
+    let path = unique_db_path("bound-plan-mixed-cross-tenant-symmetric");
+    let _guard = CleanupGuard(path.clone());
+    let core = open_engine_core(&path);
+    let ctx_a = ctx_a_full();
+    let ctx_b = ctx_b_full();
+    let count_sql = "SELECT COUNT(*) AS n FROM docs";
+    let group_sql = "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang";
+    let scan_sql = "SELECT id, lang FROM docs LIMIT 10";
+
+    // tenant-a（`[Public, Private]` ctx。ただし自身の Private 行は 0 件）から
+    // tenant-b の Private 行（id 101..=103・lang="xx"）が一切見えないことを、
+    // scan（`row.id` 直接検査）・GROUP BY（`lang` セル検査）の両形状で固定する。
+    let assert_no_tenant_b_private_leak = |result: &QueryResult, label: &str| {
+        for row in &result.rows {
+            assert!(
+                !(101..=103).contains(&row.id),
+                "tenant-a (symmetric visibility) {label} leaked tenant-b private row id {}",
+                row.id
+            );
+            if let Some(Cell::Text(lang)) =
+                row.cells.iter().find(|cell| matches!(cell, Cell::Text(_)))
+            {
+                assert_ne!(
+                    lang, "xx",
+                    "tenant-a (symmetric visibility) {label} leaked tenant-b private group"
+                );
+            }
+        }
+    };
+    // tenant-b 側は自分の Private データが実際に見えることを T6 と同じ形で確認する。
+    let assert_tenant_b_own_private_data = |result: &QueryResult, label: &str| {
+        assert!(
+            !result.rows.is_empty(),
+            "tenant-b {label} unexpectedly empty"
+        );
+        if label == scan_sql {
+            let seen_ids: std::collections::BTreeSet<u64> =
+                result.rows.iter().map(|row| row.id).collect();
+            for id in 101..=103u64 {
+                assert!(
+                    seen_ids.contains(&id),
+                    "tenant-b {label} missing own private row id {id}"
+                );
+            }
+        } else if label == group_sql {
+            let xx_row = result
+                .rows
+                .iter()
+                .find(|row| row.cells[0] == Cell::Text("xx".to_string()))
+                .unwrap_or_else(|| panic!("tenant-b {label} missing xx group"));
+            assert_eq!(
+                xx_row.cells[1],
+                Cell::Integer(3),
+                "tenant-b {label} xx group count"
+            );
+        }
+    };
+
+    // ラウンド 1: tenant-a は束縛経路、tenant-b は SQL 経路。
+    for sql in [count_sql, group_sql, scan_sql] {
+        let a_result = run_bound_via(&core, &ctx_a, sql);
+        let b_result = run_sql(&core, &ctx_b, sql);
+        assert_no_tenant_b_private_leak(&a_result, sql);
+        assert_tenant_b_own_private_data(&b_result, sql);
+    }
+    // ラウンド 2: tenant-a は SQL 経路、tenant-b は束縛経路（経路を反転）。
+    for sql in [count_sql, group_sql, scan_sql] {
+        let a_result = run_sql(&core, &ctx_a, sql);
+        let b_result = run_bound_via(&core, &ctx_b, sql);
+        assert_no_tenant_b_private_leak(&a_result, sql);
+        assert_tenant_b_own_private_data(&b_result, sql);
+    }
+
+    // 固定オラクル: tenant-a は Private 権限を得ても自身の Private 行を
+    // 持たないため可視行数は 5 のまま変わらない（tenant_id 照合が正しく
+    // 効いている証拠。可視性ラベルの集合一致だけで判定される退行が起きると
+    // ここが 8〔tenant-a Public 5 + tenant-b Private 3〕へ膨れる）。
+    let a_count_sql = run_sql(&core, &ctx_a, count_sql);
+    let a_count_bound = run_bound_via(&core, &ctx_a, count_sql);
+    assert_eq!(a_count_sql.rows, a_count_bound.rows);
+    assert_eq!(a_count_sql.rows[0].cells[0], Cell::Integer(5));
+}
+
 /// `SELECT lang, ...` 形と `SELECT id, ...` 形の両方を単一ヘルパで扱うため、
 /// クエリ文字列の先頭トークン（`SELECT ... FROM docs GROUP BY` の有無ではなく
 /// 具体的な SQL 種別）を見ず、`validate_sql` の分類結果（`Statement::Scan` /
@@ -550,7 +684,7 @@ fn run_bound_via(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> QueryResu
     }
 }
 
-// --- T7: 複数スレッドから `Arc<EngineCore>` を共有して SQL・束縛済み経路を交互実行 ---
+// --- T8: 複数スレッドから `Arc<EngineCore>` を共有して SQL・束縛済み経路を交互実行 ---
 
 #[test]
 fn concurrent_mixed_paths_over_shared_engine_core_match_reference() {
@@ -616,7 +750,7 @@ fn concurrent_mixed_paths_over_shared_engine_core_match_reference() {
     });
 }
 
-// --- T8: 同一の拒否入力に対して SQL 経路・束縛済み経路の wire_code 分類が一致する ---
+// --- T9: 同一の拒否入力に対して SQL 経路・束縛済み経路の wire_code 分類が一致する ---
 
 #[test]
 fn bound_and_sql_paths_share_error_classification_for_same_invalid_input() {
