@@ -33,7 +33,7 @@ use crate::limits::REJECT_WRITE_TIMEOUT;
 
 /// `handle_connection_interim` が 1 回だけ読む read バッファ長。本 Issue では
 /// 要求内容を解釈しないため、タイムアウト／EOF／データ到着の 3 状態を
-/// 区別できる最小長（1 バイト）で足りる（決定 10）。
+/// 区別できる最小長（1 バイト）で足りる。
 const INTERIM_READ_BUF_LEN: usize = 1;
 
 /// 同時接続数の枠を確保できた接続の暫定ハンドラ。
