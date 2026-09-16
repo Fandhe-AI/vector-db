@@ -22,7 +22,11 @@
 //!   1 MiB 上限判定（`08P01`／`54000`）、読み取り後の UTF-8 昇格
 //!   （`42601`。Issue #742）を担う。
 //!   `http::session` はセッション認証のトークン生成・base64url 表現
-//!   （TASK-174・HTTP-4・Issue #750。ストア・エンドポイントは後続 Issue の担当）。
+//!   （TASK-174・HTTP-4・Issue #750）と、TTL 固定〔[`limits::SESSION_TTL`]〕・
+//!   同時有効数上限〔[`limits::SessionLimiter`]／[`limits::MAX_SESSIONS`]〕
+//!   付きのメモリ内セッションストア `http::session::store::SessionStore`
+//!   （TASK-174・HTTP-4・HTTP-5・Issue #751。エンドポイント・Bearer 検証は
+//!   後続 Issue の担当）。
 //!   `http::query::schema` は `POST /v1/query` の JSON クエリオブジェクトの
 //!   意味的検証ヘルパー（必須欠落・未知キー・型不一致 → `42601`。Issue #760）。
 //!   `http::query::filter` は `filter` 配列の `op` 語彙（`eq`／`prefix`）を

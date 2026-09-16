@@ -10,7 +10,12 @@
 //! ため、プロセス内で選ばれた表層が同一の枠・同一の定数を使う（同時起動しない
 //! 前提のため「共有」は構築箇所の単一化で満たされる）。
 //!
-//! 対応: TASK-69（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-5, WIRE-6）。
+//! HTTP セッション認証（TASK-174・HTTP-5）の同時有効セッション数上限も
+//! [`SessionLimiter`] として本モジュールに集約する（[`MAX_CONNECTIONS`] の
+//! 接続数カウンタとは独立。`http::session::store::SessionStore` から使われる）。
+//!
+//! 対応: TASK-69（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-5, WIRE-6）、
+//! TASK-174（対象ビヘイビア HTTP-5）。
 //! `SQLSTATE_TOO_MANY_CONNECTIONS` はポインタ: `docs/spec/04-behavior/error-format.md`
 //! の `53300` 行を参照。
 
@@ -68,6 +73,30 @@ pub const EMERGENCY_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 応答が返らない方を、資源枯渇を許す方より安全側とする）。
 pub const MAX_REJECT_WORKERS: usize = 16;
 
+/// 「使用中カウンタが `max` 未満なら 1 加算して受理する」CAS 取得ループの
+/// 共有実装。[`ConnectionLimiter`]・[`RejectWorkerLimiter`]・[`SessionLimiter`]
+/// の 3 者が同一のループを個別に複製していたのを集約する（挙動は完全に不変
+/// ―― 呼び出し元の公開 API・シグネチャ・観測可能な振る舞いは変わらない）。
+/// 競合下でも「読み取り→上限比較→加算」の間に他スレッドの加算が割り込んでも
+/// `max` を超えて受理しないことを `compare_exchange_weak` ループで保証し、
+/// 加算は `checked_add` で行いカウンタのオーバーフローを未定義動作にしない
+/// （coding-rust.md 準拠）。
+fn try_acquire_slot(active: &AtomicUsize, max: usize) -> bool {
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= max {
+            return false;
+        }
+        let Some(next) = current.checked_add(1) else {
+            return false;
+        };
+        match active.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// 拒否応答ワーカー 1 本ぶんの所有権。`Drop` で確実に解放する（`ConnectionPermit`
 /// と同じ RAII パターン）。
 pub struct RejectWorkerPermit {
@@ -99,27 +128,15 @@ impl RejectWorkerLimiter {
     }
 
     /// `active` が `max` 未満なら枠を 1 つ確保して `Some` を返す。`ConnectionLimiter`
-    /// と同じ CAS ループで競合下でも `max` を超えて確保しない。
+    /// と同じ CAS ループ（[`try_acquire_slot`] へ集約済み）で競合下でも `max` を
+    /// 超えて確保しない。
     pub fn try_acquire(&self) -> Option<RejectWorkerPermit> {
-        let mut current = self.active.load(Ordering::Acquire);
-        loop {
-            if current >= self.max {
-                return None;
-            }
-            let next = current.checked_add(1)?;
-            match self.active.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(RejectWorkerPermit {
-                        active: Arc::clone(&self.active),
-                    })
-                }
-                Err(actual) => current = actual,
-            }
+        if try_acquire_slot(&self.active, self.max) {
+            Some(RejectWorkerPermit {
+                active: Arc::clone(&self.active),
+            })
+        } else {
+            None
         }
     }
 }
@@ -169,34 +186,88 @@ impl ConnectionLimiter {
         }
     }
 
-    /// `active` が `max` 未満なら枠を 1 つ確保して `Some` を返す。CAS ループで
-    /// 「読み取り→上限比較→加算」の間の競合を許さず、複数スレッドが同時に accept
-    /// しても上限を超えて確保できないようにする。加算は `checked_add` で行い、
-    /// カウンタのオーバーフローを未定義動作にしない（coding-rust.md 準拠）。
+    /// `active` が `max` 未満なら枠を 1 つ確保して `Some` を返す。CAS ループ
+    /// （[`try_acquire_slot`] へ集約済み）で「読み取り→上限比較→加算」の間の
+    /// 競合を許さず、複数スレッドが同時に accept しても上限を超えて確保できない
+    /// ようにする。加算は `checked_add` で行い、カウンタのオーバーフローを
+    /// 未定義動作にしない（coding-rust.md 準拠）。
     pub fn try_acquire(&self) -> Option<ConnectionPermit> {
-        let mut current = self.active.load(Ordering::Acquire);
-        loop {
-            if current >= self.max {
-                return None;
-            }
-            let next = current.checked_add(1)?;
-            match self.active.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(ConnectionPermit {
-                        active: Arc::clone(&self.active),
-                    })
-                }
-                Err(actual) => current = actual,
-            }
+        if try_acquire_slot(&self.active, self.max) {
+            Some(ConnectionPermit {
+                active: Arc::clone(&self.active),
+            })
+        } else {
+            None
         }
     }
 
     /// 現在の使用中枠数（テスト・ログ用の観測）。
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// 上限値（テスト用の観測）。
+    pub fn max(&self) -> usize {
+        self.max
+    }
+}
+
+/// 同時有効セッション数の上限（TASK-174・HTTP-5）。[`MAX_CONNECTIONS`]（接続数の枠）
+/// とは独立のカウンタで、一方の枯渇が他方へ波及しない（`http::session::store`
+/// モジュール doc 参照）。
+pub const MAX_SESSIONS: usize = 256;
+
+/// セッショントークンの固定有効期間（TASK-174・HTTP-4）。発行時刻起点で
+/// スライドしない（`http::session::store::SessionStore::lookup` は
+/// `issued_at` を更新しない）。
+pub const SESSION_TTL: Duration = Duration::from_secs(3600);
+
+/// セッション枠 1 つぶんの所有権。`Drop` で確実に解放する（[`ConnectionPermit`]
+/// と同じ RAII パターン）。`http::session::store::SessionStore` のエントリが
+/// この permit を保持し、エントリの削除（`close`・期限切れ回収）がそのまま
+/// 枠解放になる。
+pub struct SessionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for SessionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 同時有効セッション数の共有リミッター。`http::session::store::SessionStore`
+/// が保持し、発行（`issue`）のたびに [`SessionLimiter::try_acquire`] を呼ぶ。
+/// `ConnectionLimiter`・`RejectWorkerLimiter` と同じ CAS ループ
+/// （[`try_acquire_slot`]）を使うが、`Arc<AtomicUsize>` は独立に持つため
+/// 3 者のカウンタは互いに影響しない。
+#[derive(Clone)]
+pub struct SessionLimiter {
+    active: Arc<AtomicUsize>,
+    max: usize,
+}
+
+impl SessionLimiter {
+    /// 同時有効セッション数の上限を `max` として新しいリミッターを作る。
+    pub fn new(max: usize) -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            max,
+        }
+    }
+
+    /// `active` が `max` 未満なら枠を 1 つ確保して `Some` を返す。
+    pub fn try_acquire(&self) -> Option<SessionPermit> {
+        if try_acquire_slot(&self.active, self.max) {
+            Some(SessionPermit {
+                active: Arc::clone(&self.active),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// 現在の使用中枠数（テスト・観測用）。
     pub fn active(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
@@ -368,5 +439,73 @@ mod tests {
         let mut extra = [0u8; 1];
         let n = client.read(&mut extra).unwrap_or(0);
         assert_eq!(n, 0, "connection must be closed after the rejection");
+    }
+
+    /// [`SessionLimiter`] も [`ConnectionLimiter`] と同じ RAII 契約（上限到達で
+    /// 拒否・drop で解放）を持つこと。`ConnectionLimiter` とはカウンタを
+    /// 共有しないため、片方の枠を使い切ってももう片方には影響しない。
+    #[test]
+    fn session_limiter_enforces_max_independently_of_connection_limiter() {
+        let sessions = SessionLimiter::new(2);
+        let connections = ConnectionLimiter::new(2);
+
+        let s1 = sessions.try_acquire().expect("first session permit");
+        let s2 = sessions.try_acquire().expect("second session permit");
+        assert!(
+            sessions.try_acquire().is_none(),
+            "third session permit must be rejected at max=2"
+        );
+        assert_eq!(sessions.active(), 2);
+
+        // 接続枠は未使用のままであること（独立カウンタの確認）。
+        assert_eq!(connections.active(), 0);
+        let c1 = connections.try_acquire().expect("connection permit");
+        assert_eq!(sessions.active(), 2, "session count must not be affected");
+
+        drop(s1);
+        assert_eq!(sessions.active(), 1);
+        let s3 = sessions
+            .try_acquire()
+            .expect("permit must be released on drop");
+
+        drop(s2);
+        drop(s3);
+        drop(c1);
+        assert_eq!(sessions.active(), 0);
+        assert_eq!(connections.active(), 0);
+    }
+
+    /// 並行 `try_acquire` を回しても [`SessionLimiter`] の使用中枠数が `max`
+    /// を超えないこと（CAS ループの競合耐性）。
+    #[test]
+    fn session_limiter_never_exceeds_max_under_concurrency() {
+        const MAX: usize = 8;
+        const THREADS: usize = 16;
+        const ITERS: usize = 200;
+
+        let limiter = SessionLimiter::new(MAX);
+        let max_observed = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let limiter = limiter.clone();
+                let max_observed = Arc::clone(&max_observed);
+                scope.spawn(move || {
+                    for _ in 0..ITERS {
+                        if let Some(permit) = limiter.try_acquire() {
+                            let observed = limiter.active();
+                            max_observed.fetch_max(observed, Ordering::AcqRel);
+                            drop(permit);
+                        }
+                    }
+                });
+            }
+        });
+
+        assert!(
+            max_observed.load(Ordering::Acquire) <= MAX,
+            "observed active count must never exceed max={MAX}"
+        );
+        assert_eq!(limiter.active(), 0, "all permits must be released");
     }
 }

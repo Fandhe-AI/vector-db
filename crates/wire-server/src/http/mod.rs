@@ -44,10 +44,11 @@
 //!   `aggregate` 成功時の `QueryResult` → JSON 応答本文（`columns`／`rows`／
 //!   `row_count`、`crate::result_encoder` と同じ型写像。Issue #762・
 //!   NOSQL-11）を担う
-//! - [`session`]: HTTP セッション認証の構成要素（トークン生成・エンコード等。
-//!   Issue #750・TASK-174・HTTP-4）。ストア・エンドポイント・Bearer 検証は
-//!   本モジュールの対象外（後続 Issue の担当。[`session`] のモジュール doc
-//!   を参照）
+//! - [`session`]: HTTP セッション認証の構成要素（トークン生成・エンコード
+//!   〔Issue #750・TASK-174・HTTP-4〕と、TTL 固定・同時有効数上限付きの
+//!   メモリ内セッションストア〔`session::store::SessionStore`。Issue #751・
+//!   TASK-174・HTTP-4・HTTP-5〕）。エンドポイント・Bearer 検証は本モジュール
+//!   の対象外（後続 Issue の担当。[`session`] のモジュール doc を参照）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - 汎用の応答エンベロープ（ステータス行・`Connection: close`・
