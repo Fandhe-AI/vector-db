@@ -1,5 +1,6 @@
-//! TASK-72（WIRE-9）に対応するテスト。成果物（`docs/design/tls-scram-design.md`）
-//! の存在と必須ポインタ表記・見出し構造を検証する。
+//! TASK-72（WIRE-9）・TASK-174（HTTP-10。WIRE-9 と同一方針）に対応するテスト。
+//! 成果物（`docs/design/tls-scram-design.md`）の存在と必須ポインタ表記・見出し
+//! 構造、および Issue #755 で追加した NoSQL 表層節の非 vacuous な内容検証を行う。
 
 use std::fs;
 use std::path::PathBuf;
@@ -49,7 +50,8 @@ fn design_doc_has_required_pointers_and_sections() {
     );
 }
 
-/// 必須の見出し構造（`##` レベル）を検証する。
+/// 必須の見出し構造（`##` レベル）を検証する。Issue #755 で NoSQL 表層
+/// （HTTP-10）節を必須見出しへ追加した。
 #[test]
 fn design_doc_has_required_heading_structure() {
     let content = read_design_doc();
@@ -58,6 +60,7 @@ fn design_doc_has_required_heading_structure() {
         "## 背景",
         "## 論点",
         "## 影響",
+        "## NoSQL 表層",
         "## スコープ外",
         "## 参照",
     ];
@@ -67,6 +70,58 @@ fn design_doc_has_required_heading_structure() {
             "必須の見出し '{heading}' が見つからない"
         );
     }
+}
+
+/// NoSQL 表層節（Issue #755・TASK-174・HTTP-10）が存在し、節本文（次の `## `
+/// 見出しまでの区間）に必須ポインタ・識別子の言及があることを検証する。
+/// 文書全体ではなく切り出した節本文で判定することで、他節にたまたま同じ語が
+/// 含まれているだけの vacuous pass を防ぐ。
+#[test]
+fn design_doc_has_nosql_surface_section_with_pointers() {
+    let content = read_design_doc();
+
+    // 文書全体に対する存在確認（HTTP-10・TASK-174 のポインタ表記）。
+    assert!(
+        content.contains("HTTP-10"),
+        "HTTP-10 へのポインタ表記が見つからない"
+    );
+    assert!(
+        content.contains("TASK-174"),
+        "TASK-174 へのポインタ表記が見つからない"
+    );
+
+    // NoSQL 表層節の本文（見出し行の次から、次の `## ` 見出しの手前まで）を
+    // 添字アクセスなしに `lines()` の走査で切り出す。
+    let mut section_lines: Vec<&str> = Vec::new();
+    let mut in_section = false;
+    for line in content.lines() {
+        if line.starts_with("## NoSQL 表層") {
+            in_section = true;
+            continue;
+        }
+        if in_section {
+            if line.starts_with("## ") {
+                break;
+            }
+            section_lines.push(line);
+        }
+    }
+    assert!(
+        !section_lines.is_empty(),
+        "'## NoSQL 表層' 見出しが見つからない、または節本文が空"
+    );
+    let section_body = section_lines.join("\n");
+
+    // 節本文内で、SQL 表層（WIRE-9）と通信路保護状態を共有する方針が
+    // ポインタ表記で示されていることを検証する（spec 本文は転記しない）。
+    assert!(
+        section_body.contains("TransportSecurity"),
+        "NoSQL 表層節に 'TransportSecurity' の言及が見つからない"
+    );
+    assert!(
+        section_body.contains("WIRE-9"),
+        "NoSQL 表層節に 'WIRE-9' へのポインタ表記が見つからない"
+    );
 }
 
 /// ステータス行が「確定」を主張していないことを検証する。設計タスクの成果物が

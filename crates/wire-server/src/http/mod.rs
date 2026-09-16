@@ -9,11 +9,15 @@
 //! エラー契約は SQL 表層（`wire_code` ＝ [`engine::error_format::ErrorClass`]）と
 //! 完全共有し、新規 `wire_code` は追加しない。本モジュール配下は `ErrorClass` を
 //! HTTP 上の表現（ステータス・応答本文等）へ写像する各要素、要求側のパース処理、
-//! および `POST /v1/query` の JSON クエリオブジェクト検証を集約する。
+//! `POST /v1/query` の JSON クエリオブジェクト検証、およびセッション認証の
+//! 構成要素を集約する。
 //!
 //! モジュール構成（現時点）:
 //! - [`request`]: 要求行（メソッド・ターゲット・バージョン）の解析（Issue #740・
 //!   TASK-173・HTTP-2, HTTP-11）
+//! - [`headers`]: ヘッダ部（`name: value` 行群と終端空行）の解析。合計 8 KiB・
+//!   32 個の固定上限、`Content-Length` 必須・一意・digits-only、
+//!   `Transfer-Encoding` 拒否（Issue #741・TASK-173・HTTP-2, HTTP-11）
 //! - [`status`]: `ErrorClass` → HTTP ステータスの決定的射影（Issue #744・ERR-4）
 //! - [`error_body`]: `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）
 //! - [`listener`]: `--surface nosql` の accept ループ stub（要求を読まず接続
@@ -29,11 +33,14 @@
 //!   `aggregate` 成功時の `QueryResult` → JSON 応答本文（`columns`／`rows`／
 //!   `row_count`、`crate::result_encoder` と同じ型写像。Issue #762・
 //!   NOSQL-11）を担う
+//! - [`session`]: HTTP セッション認証の構成要素（トークン生成・エンコード等。
+//!   Issue #750・TASK-174・HTTP-4）。ストア・エンドポイント・Bearer 検証は
+//!   本モジュールの対象外（後続 Issue の担当。[`session`] のモジュール doc
+//!   を参照）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
-//! - ヘッダパーサ（Issue #741。[`request::parse_request_line`] が返す
-//!   `consumed` オフセットから読み始める）
-//! - `Content-Type`／本文長上限の検証（Issue #742）
+//! - `Content-Type`／本文長上限の検証（[`headers::Headers::get_single`] で
+//!   `Content-Type` を取り出す。Issue #742）
 //! - 応答エンベロープ（ステータス行・`Connection: close`・`Content-Type`／
 //!   `Content-Length`・CRLF の組み立て。Issue #746）
 //! - `explain: true` 時の `{"explain":[...]}` 応答（#765）
@@ -47,7 +54,9 @@
 //! ポインタ参照のみで、コード・所見は転記しない）。
 
 pub mod error_body;
+pub mod headers;
 pub mod listener;
 pub mod query;
 pub mod request;
+pub mod session;
 pub mod status;

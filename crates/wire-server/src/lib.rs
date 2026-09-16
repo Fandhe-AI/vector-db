@@ -15,6 +15,8 @@
 //!   HTTP ステータスの決定的射影（Issue #744・ERR-4）。`http::error_body` は
 //!   `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）。`http::listener`
 //!   は `--surface nosql` の accept ループ stub（Issue #735・HTTP-9）。
+//!   `http::session` はセッション認証のトークン生成・base64url 表現
+//!   （TASK-174・HTTP-4・Issue #750。ストア・エンドポイントは後続 Issue の担当）。
 //!   `http::query::schema` は `POST /v1/query` の JSON クエリオブジェクトの
 //!   意味的検証ヘルパー（必須欠落・未知キー・型不一致 → `42601`。Issue #760）。
 //!   `http::query::filter` は `filter` 配列の `op` 語彙（`eq`／`prefix`）を
