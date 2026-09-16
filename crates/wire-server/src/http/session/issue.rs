@@ -42,7 +42,6 @@ use crate::http::query::schema::{FieldSpec, FieldType, ObjectSchema, Presence};
 use crate::http::response;
 use crate::http::session::store::SessionStore;
 use crate::http::{body, session};
-use crate::limits::SESSION_TTL;
 
 /// `POST /v1/session` の要求本文スキーマ: `user`・`password` の 2 つの必須
 /// 文字列フィールドのみを許可する（未知キーは [`crate::http::query::schema`]
@@ -88,19 +87,27 @@ impl HandleError {
 /// `POST /v1/session` を処理し応答バイト列を返す。[`crate::http::router::Router`]
 /// から呼ばれる唯一の入口。
 ///
-/// `now_mono` は [`SessionStore::issue`] の TTL 起点（単調時計）、`now_wall` は
-/// 応答の `Date` ヘッダ（壁時計）に使う。呼び出し元が両方とも `Instant::now()`／
-/// `SystemTime::now()` を渡す（本関数自身は時刻を参照しない。決定的単体テストの
-/// ための注入 seam）。
+/// `now_mono` は [`SessionStore::issue`] の TTL 起点（単調時計）を取得する
+/// サンク（`Fn() -> Instant`）で、本文パース・スキーマ検証・Argon2id 照合が
+/// すべて成功した**後**、`SessionStore::issue` を呼ぶ直前にのみ 1 回呼ぶ
+/// （即値 `Instant` ではなくサンクにするのは、呼び出し元が要求受理時点の
+/// 時刻を先取りして渡すと、Argon2id 計算・セマフォ待機の時間ぶん TTL 起点が
+/// 早まり「発行時刻起点で TTL 開始」という `SessionStore` の契約より実質的に
+/// 短い TTL になってしまうため。Issue #813 codex-review P1 指摘）。
+/// `now_wall` は応答の `Date` ヘッダ（壁時計）に使う。production は
+/// `Instant::now`（関数参照）／`SystemTime::now()` を渡し、決定的単体テストは
+/// 固定時刻を返すクロージャを注入できる。
 pub fn handle(
     users: &UserStore,
     sessions: &SessionStore,
     body: &[u8],
-    now_mono: Instant,
+    now_mono: impl Fn() -> Instant,
     now_wall: SystemTime,
 ) -> Vec<u8> {
     match handle_inner(users, sessions, body, now_mono) {
-        Ok(token_encoded) => response::encode_ok(&success_body(&token_encoded), now_wall),
+        Ok(token_encoded) => {
+            response::encode_ok(&success_body(&token_encoded, sessions.ttl()), now_wall)
+        }
         Err(e) => response::encode_error(e.class, &e.message, now_wall),
     }
 }
@@ -113,7 +120,7 @@ fn handle_inner(
     users: &UserStore,
     sessions: &SessionStore,
     raw_body: &[u8],
-    now_mono: Instant,
+    now_mono: impl Fn() -> Instant,
 ) -> Result<String, HandleError> {
     let text = body::body_as_utf8(raw_body)
         .map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
@@ -145,8 +152,10 @@ fn handle_inner(
 
     // セッション上限の判定は認証成功後にのみ行う（未認証クライアントへ
     // KDF を経ない高速経路・セッション数のオラクルを与えないための順序）。
+    // `now_mono()` の呼び出し自体もここまで遅延させ、Argon2id 照合・セマフォ
+    // 待機の時間が TTL 起点に含まれてしまわないようにする（本関数 doc 参照）。
     let token = sessions
-        .issue(ctx, now_mono)
+        .issue(ctx, now_mono())
         .map_err(|e| HandleError::new(e.error_class(), issue_error_message(&e)))?;
 
     Ok(token.encoded())
@@ -166,13 +175,20 @@ fn issue_error_message(e: &session::store::IssueError) -> &'static str {
 /// 成功本文（`{"token":"...","expires_in":<秒数>}`）を組み立てる。トークンは
 /// base64url アルファベットのみで JSON エスケープ不要な文字集合だが、
 /// 将来の表現変更への防御として [`escape_json_string_into`] を通す。
-fn success_body(token_encoded: &str) -> String {
+///
+/// `ttl` は呼び出し元（[`handle`]）が実際にトークンを発行した
+/// [`SessionStore`] の [`SessionStore::ttl`] から取る。固定定数
+/// `crate::limits::SESSION_TTL` を直接使わないのは、[`SessionStore::with_limits`] で
+/// 既定と異なる TTL を注入したストアを `Router::new` が受け取った場合に
+/// 応答の `expires_in` と実際の失効時刻が乖離しないようにするため
+/// （Issue #813 codex-review P2 指摘）。
+fn success_body(token_encoded: &str, ttl: std::time::Duration) -> String {
     let mut out = String::with_capacity(64);
     out.push('{');
     out.push_str("\"token\":\"");
     escape_json_string_into(&mut out, token_encoded);
     out.push_str("\",\"expires_in\":");
-    out.push_str(&SESSION_TTL.as_secs().to_string());
+    out.push_str(&ttl.as_secs().to_string());
     out.push('}');
     out
 }
@@ -181,6 +197,7 @@ fn success_body(token_encoded: &str) -> String {
 mod tests {
     use super::*;
     use crate::auth::argon2id;
+    use crate::limits::SESSION_TTL;
 
     fn store_with(records: &[(&str, &str, &str)]) -> UserStore {
         let mut content = String::new();
@@ -211,7 +228,7 @@ mod tests {
         let sessions = SessionStore::new();
         let body = br#"{"user":"alice","password":"pw-alice"}"#;
 
-        let response = handle(&store, &sessions, body, Instant::now(), SystemTime::now());
+        let response = handle(&store, &sessions, body, Instant::now, SystemTime::now());
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 200 "), "got: {text}");
         assert!(text.contains("\"expires_in\":3600"), "got: {text}");
@@ -224,7 +241,7 @@ mod tests {
         let sessions = SessionStore::new();
         let body = br#"{"user":"bob","password":"whatever"}"#;
 
-        let response = handle(&store, &sessions, body, Instant::now(), SystemTime::now());
+        let response = handle(&store, &sessions, body, Instant::now, SystemTime::now());
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 401 "), "got: {text}");
         assert!(text.contains("28P01"), "got: {text}");
@@ -236,7 +253,7 @@ mod tests {
         let sessions = SessionStore::new();
         let body = br#"{"user":"alice","password":"wrong"}"#;
 
-        let response = handle(&store, &sessions, body, Instant::now(), SystemTime::now());
+        let response = handle(&store, &sessions, body, Instant::now, SystemTime::now());
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 401 "), "got: {text}");
         assert!(text.contains("28P01"), "got: {text}");
@@ -248,7 +265,7 @@ mod tests {
         let sessions = SessionStore::new();
         let body = br#"{"user":"alice"}"#;
 
-        let response = handle(&store, &sessions, body, Instant::now(), SystemTime::now());
+        let response = handle(&store, &sessions, body, Instant::now, SystemTime::now());
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
         assert!(text.contains("42601"), "got: {text}");
@@ -260,7 +277,7 @@ mod tests {
         let sessions = SessionStore::new();
         let body = br#"{"user":"alice","password":"pw-alice","tenant_id":"other"}"#;
 
-        let response = handle(&store, &sessions, body, Instant::now(), SystemTime::now());
+        let response = handle(&store, &sessions, body, Instant::now, SystemTime::now());
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
         assert!(text.contains("42601"), "got: {text}");
@@ -272,7 +289,7 @@ mod tests {
         let sessions = SessionStore::new();
         let body = b"not json";
 
-        let response = handle(&store, &sessions, body, Instant::now(), SystemTime::now());
+        let response = handle(&store, &sessions, body, Instant::now, SystemTime::now());
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
         assert!(text.contains("42601"), "got: {text}");
@@ -284,10 +301,10 @@ mod tests {
         let sessions = SessionStore::with_limits(1, SESSION_TTL);
         let body = br#"{"user":"alice","password":"pw-alice"}"#;
 
-        let first = handle(&store, &sessions, body, Instant::now(), SystemTime::now());
+        let first = handle(&store, &sessions, body, Instant::now, SystemTime::now());
         assert!(String::from_utf8_lossy(&first).starts_with("HTTP/1.1 200 "));
 
-        let second = handle(&store, &sessions, body, Instant::now(), SystemTime::now());
+        let second = handle(&store, &sessions, body, Instant::now, SystemTime::now());
         let text = String::from_utf8(second).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 503 "), "got: {text}");
         assert!(text.contains("53300"), "got: {text}");
@@ -299,8 +316,8 @@ mod tests {
         let sessions = SessionStore::new();
         let body = br#"{"user":"alice","password":"pw-alice"}"#;
 
-        let first = handle(&store, &sessions, body, Instant::now(), SystemTime::now());
-        let second = handle(&store, &sessions, body, Instant::now(), SystemTime::now());
+        let first = handle(&store, &sessions, body, Instant::now, SystemTime::now());
+        let second = handle(&store, &sessions, body, Instant::now, SystemTime::now());
         assert_ne!(first, second, "reissued tokens must differ");
     }
 }

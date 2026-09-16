@@ -50,7 +50,7 @@ impl RequestHandler for Router {
                 &self.users,
                 &self.sessions,
                 req.body,
-                Instant::now(),
+                Instant::now,
                 SystemTime::now(),
             );
         }
