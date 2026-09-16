@@ -353,20 +353,18 @@ enum BandKind {
     Tail,
 }
 
-/// 分布同一性の判定に使う分位点ラダー（Issue #738 codex-review 指摘:
-/// median・p95 の 2 点だけでは、下位分位点にのみ現れる部分母集団混入
-/// （例: 200 件中 80 件だけ他方より大きく異なる二峰性分布）を median・p95
-/// が偶然一致することで見逃しうる。`min`〜`p99` の分布全体を尾部まで
-/// 均等に走査することで、どの分位点にサブ集団が現れても検出できるように
-/// する）。
-///
-/// 5% 刻み（Issue #738 codex-review 追加指摘: 前回の 8 点ラダー（10% 刻み
-/// 中心）でも、両腕の分位点が偶然一致する位置の**間**にだけ現れる部分母
-/// 集団（例: 200 件中 38 件＝19% だけが異なる値を取り、その区間の境界が
-/// ラダー上の 10% 刻みの点をすべて跨いで通過する反例）は見逃しうる。
-/// 刻み幅を反例の部分母集団幅（19%）より十分細かい 5% へ狭めることで、
-/// 分布中のどこに現れる部分母集団もいずれかのラダー点に必ず引っかかる
-/// ようにする。`judge_detects_gap_between_quantile_ladder_points` 参照）。
+/// 診断表示（実行記録の可読なサマリ）専用の分位点ラダー。**`judge` 自身の
+/// 判定基盤としてはもう使われない**（Issue #738 codex-review 追加指摘:
+/// 固定分位点をどれだけ細かく刻んでも、両腕の差分がその刻み幅より狭い
+/// 部分母集団として現れれば、ラダー点の**間**を通過して見逃される反例が
+/// 常に構築できる——例えば 200 件中 62〜67 件目だけが他方と異なる
+/// b=[1000×62,2000×6,3000×132] / c=[1000×62,2500×6,3000×132] は、5% 刻み
+/// ラダー〔p30=idx60・p35=idx70〕の間をすり抜ける。刻み幅を狭める対症療法
+/// では原理的に解消できないため、`judge` は固定分位点ではなく b・c 両ソート
+/// 済み配列の**全順序統計量**（`0..rounds` の全インデックス）を直接比較する
+/// 方式へ変更した（`judge_detects_subpopulation_between_any_fixed_quantile_
+/// points` 参照）。このラダーは実行記録（層 B の println! 出力）を人間が
+/// 読みやすい代表点に絞って提示するためだけに残置する）。
 const QUANTILE_LADDER: &[(f64, BandKind)] = &[
     (0.00, BandKind::Median),
     (0.05, BandKind::Median),
@@ -444,36 +442,80 @@ impl Bands {
     }
 }
 
+/// 偶奇 2 分割済み（呼び出し元でソート済み）の 2 配列から、指定した
+/// 分位点における相対差（A/A 帯）を返す（`quantile_aa_diff` の事前計算版。
+/// `judge` の全順序統計量走査で同じ偶奇分割・ソートを毎回作り直さない
+/// ための最適化。分割方法・意味は `quantile_aa_diff` と同一）。
+fn aa_diff_from_sorted_split(even_sorted: &[u128], odd_sorted: &[u128], p: f64) -> f64 {
+    relative_diff(percentile(even_sorted, p), percentile(odd_sorted, p))
+}
+
 /// (b)（他テナント保持 id）・(c)（未存在 id）2 腕のサンプル列からレイテンシ
 /// 分布の同一性を判定する（時間非依存の純関数。実測タイマー・env を一切
 /// 参照しない。`tier_latency_bench.rs::judge` と同じ「計測本体から分離した
 /// 判定ロジック」の方針）。`b`・`c` は各腕の生サンプル列（計測順のまま。
-/// 内部でソート・A/A 分割の双方に使う）。
+/// 内部でソート・A/A 分割の双方に使う）。両腕は同じラウンド数で計測される
+/// 契約のため長さ不一致は呼び出し元の不変条件違反として `assert_eq!` で
+/// fail-closed に落とす（長さが異なると「同じ分位点」の対応が取れない）。
 ///
-/// median・p95 の 2 点だけでなく `QUANTILE_LADDER` の全分位点を走査する
-/// （Issue #738 codex-review 指摘への対応。ある分位点の A/A 帯が上限を
-/// 超えていても他の分位点の判定は継続し、最終的に 1 点でも上限超過が
-/// あれば `Inconclusive` を優先する——既存の「Inconclusive が
-/// Distinguishable より優先される」契約をラダー全体へ拡張する）。
+/// 固定分位点のラダーではなく、b・c 両ソート済み配列の**全順序統計量**
+/// （インデックス `0..rounds` の全点）を直接比較する（Issue #738
+/// codex-review 追加指摘への対応: 固定ラダーは刻み幅をどれだけ狭めても、
+/// 両腕の差分がその刻み幅より狭い部分母集団として現れれば、ラダー点の
+/// **間**を通過して見逃される反例が原理的に常に構築できる。ソート済み
+/// 配列を全インデックスで直接比較すれば、どの部分母集団も必ずどこかの
+/// インデックスで捕捉されるため、この種の"間"自体が存在しなくなる）。
+/// A/A 帯も同じ全インデックス走査に合わせ、各インデックスの相対位置
+/// `idx/(n-1)` を分位点として使う（`quantile_aa_diff` と同じ計算式）。
+/// ある位置の A/A 帯が上限を超えていても他の位置の判定は継続し、最終的に
+/// 1 点でも上限超過があれば `Inconclusive` を優先する（既存の
+/// 「Inconclusive が Distinguishable より優先される」契約を維持する）。
 fn judge(b: &[u128], c: &[u128], bands: &Bands) -> Verdict {
+    assert_eq!(
+        b.len(),
+        c.len(),
+        "judge requires both arms to have the same sample count (rounds); got b={} c={}",
+        b.len(),
+        c.len()
+    );
+
     let mut b_sorted = b.to_vec();
     let mut c_sorted = c.to_vec();
     b_sorted.sort_unstable();
     c_sorted.sort_unstable();
 
+    let (mut b_even, mut b_odd) = split_even_odd(b);
+    b_even.sort_unstable();
+    b_odd.sort_unstable();
+    let (mut c_even, mut c_odd) = split_even_odd(c);
+    c_even.sort_unstable();
+    c_odd.sort_unstable();
+
+    let n = b_sorted.len();
     let mut any_aa_over_cap = false;
     let mut any_distinguishable = false;
 
-    for &(p, kind) in QUANTILE_LADDER {
+    for idx in 0..n {
+        let p = if n > 1 {
+            idx as f64 / (n - 1) as f64
+        } else {
+            0.0
+        };
+        let kind = if p >= 0.90 {
+            BandKind::Tail
+        } else {
+            BandKind::Median
+        };
         let (fixed_band, aa_cap) = bands.for_kind(kind);
-        let aa = quantile_aa_diff(b, p).max(quantile_aa_diff(c, p));
+        let aa = aa_diff_from_sorted_split(&b_even, &b_odd, p)
+            .max(aa_diff_from_sorted_split(&c_even, &c_odd, p));
 
         if aa > aa_cap {
             any_aa_over_cap = true;
             continue;
         }
 
-        let delta = relative_diff(percentile(&b_sorted, p), percentile(&c_sorted, p));
+        let delta = relative_diff(b_sorted[idx], c_sorted[idx]);
         if delta > fixed_band.max(aa) {
             any_distinguishable = true;
         }
@@ -666,9 +708,12 @@ fn rls9_wire_insert_latency_distribution_is_indistinguishable_for_foreign_held_i
         percentile(&c_sorted, 0.95),
         c_sorted.last().copied().unwrap_or(0)
     );
-    // 分位点ラダー全点の delta・A/A 帯を出力する（`judge` が実際に走査する
-    // 判定根拠を隠さず記録する。codex-review 指摘への対応で median・p95 の
-    // 2 点表示から全 8 点表示へ拡張）。
+    // 分位点ラダー代表点の delta・A/A 帯を出力する（人間が読みやすい要約
+    // 表示専用。`judge` 自身の判定基盤は Issue #738 codex-review 追加指摘
+    // への対応でこのラダーではなく全順序統計量走査へ変更済み——固定分位点
+    // をどれだけ細かく刻んでも刻み幅より狭い部分母集団は原理的に見逃し
+    // うるため。実際の判定根拠を隠さず記録するため、次に全 `rounds` 点の
+    // 走査で delta が最大だったインデックスも出力する）。
     for &(p, kind) in QUANTILE_LADDER {
         let (fixed_band, aa_cap) = bands.for_kind(kind);
         let delta = relative_diff(percentile(&b_sorted, p), percentile(&c_sorted, p));
@@ -677,6 +722,33 @@ fn rls9_wire_insert_latency_distribution_is_indistinguishable_for_foreign_held_i
             "quantile p={p:.2} b={} c={} delta={delta:.4} aa={aa:.4} fixed_band={fixed_band:.4} aa_cap={aa_cap:.4}",
             percentile(&b_sorted, p),
             percentile(&c_sorted, p)
+        );
+    }
+    // `judge` が実際に使う全順序統計量走査（`0..rounds` の全インデックス）
+    // のうち delta が最大だった点を記録する（ラダー代表点表示だけでは
+    // `judge` が実際に見ている情報の一部しか示せないため）。
+    let full_scan_len = b_sorted.len().min(c_sorted.len());
+    let mut worst: Option<(usize, f64, f64, f64)> = None; // (idx, p, delta, aa)
+    for idx in 0..full_scan_len {
+        let p = if full_scan_len > 1 {
+            idx as f64 / (full_scan_len - 1) as f64
+        } else {
+            0.0
+        };
+        let delta = relative_diff(b_sorted[idx], c_sorted[idx]);
+        let aa = quantile_aa_diff(&b_samples, p).max(quantile_aa_diff(&c_samples, p));
+        let is_worse = match worst {
+            Some((_, _, best_delta, _)) => delta > best_delta,
+            None => true,
+        };
+        if is_worse {
+            worst = Some((idx, p, delta, aa));
+        }
+    }
+    if let Some((idx, p, delta, aa)) = worst {
+        println!(
+            "full_scan_worst_index idx={idx} p={p:.4} b={} c={} delta={delta:.4} aa={aa:.4}",
+            b_sorted[idx], c_sorted[idx]
         );
     }
     println!("verdict={verdict:?}");
@@ -908,8 +980,11 @@ mod tenant_latency_judge_tests {
     /// median（idx=100 → 3000）・p95（idx=189 → 3000）を含むどの固定点でも
     /// b・c が一致してしまうため `Indistinguishable` を誤って返す
     /// （このブロックは全体の 19% を占め、2000 対 2500 は相対差 20% で
-    /// 実際には区別可能）。5% 刻みへ狭めた新ラダーは 30/35/40/45% の各点が
-    /// この区間内に入り検出できることを固定する。
+    /// 実際には区別可能）。現在の `judge` は固定ラダーではなく全順序統計量
+    /// 走査（`0..rounds` の全インデックス）で判定するため、この反例も
+    /// 60〜97 件目の各インデックスで直接捕捉できることを固定する
+    /// （固定ラダー自体は診断表示専用として残置しているため、この反例で
+    /// 旧 8 点ラダーが見逃す事実自体は変わらず、以下でそれも確認する）。
     #[test]
     fn judge_detects_gap_between_quantile_ladder_points() {
         let mut b: Vec<u128> = Vec::with_capacity(200);
@@ -943,6 +1018,47 @@ mod tenant_latency_judge_tests {
                 percentile(&b_sorted, p),
                 percentile(&c_sorted, p),
                 "old 8-point ladder must miss this counterexample at p={p}"
+            );
+        }
+
+        assert_eq!(judge(&b, &c, &Bands::default()), Verdict::Distinguishable);
+    }
+
+    /// codex-review 追加指摘（PR #797・Issue #738）: 5% 刻みへ狭めた
+    /// ラダーでも、両腕の分位点が偶然一致する位置の**間**にだけ現れる
+    /// より狭い部分母集団（全体の 3%＝6/200 件）は依然として見逃しうる
+    /// 反例。b=[1000×62,2000×6,3000×132]・c=[1000×62,2500×6,3000×132]
+    /// （差分ブロックは 62〜67 件目）は、p30（idx=round(199*0.30)=60）・
+    /// p35（idx=round(199*0.35)=70）のいずれも 60〜67 件目の 1000/2000 側
+    /// （b）・1000/2500 側（c）ではなくブロック境界を跨いだ位置を指すため、
+    /// 固定ラダーの刻み幅をどれだけ狭めても同型の反例が原理的に構築できる
+    /// ことを示す（刻み幅より部分母集団の幅を狭く取ればよいだけのため）。
+    /// 全順序統計量走査に置き換えた `judge` はこの反例も 62〜67 件目の
+    /// 各インデックスで直接捕捉できることを固定する。
+    #[test]
+    fn judge_detects_subpopulation_narrower_than_any_fixed_quantile_ladder_step() {
+        let mut b: Vec<u128> = Vec::with_capacity(200);
+        b.extend(std::iter::repeat_n(1000u128, 62));
+        b.extend(std::iter::repeat_n(2000u128, 6));
+        b.extend(std::iter::repeat_n(3000u128, 132));
+
+        let mut c: Vec<u128> = Vec::with_capacity(200);
+        c.extend(std::iter::repeat_n(1000u128, 62));
+        c.extend(std::iter::repeat_n(2500u128, 6));
+        c.extend(std::iter::repeat_n(3000u128, 132));
+
+        // 反例の前提: 現行の 5% 刻みラダー（診断表示専用。`QUANTILE_LADDER`）
+        // でもすべての固定点で b・c が一致する（このアサーション自体が
+        // 「なぜ固定ラダー方式そのものが原理的に不十分か」の根拠）。
+        let mut b_sorted = b.clone();
+        let mut c_sorted = c.clone();
+        b_sorted.sort_unstable();
+        c_sorted.sort_unstable();
+        for &(p, _) in QUANTILE_LADDER {
+            assert_eq!(
+                percentile(&b_sorted, p),
+                percentile(&c_sorted, p),
+                "5%-step ladder must still miss this narrower counterexample at p={p}"
             );
         }
 
