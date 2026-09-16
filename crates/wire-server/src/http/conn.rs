@@ -5,27 +5,48 @@
 //! `http::listener::accept_loop_with_limiter`（production では
 //! [`PlaceholderRouter`] を `Arc` で包んで渡す）から呼ばれる、接続単位の 2 経路:
 //! - [`handle_connection_with`][]: 接続ハンドラ本体。要求行
-//!   （[`crate::http::request`]）→ ヘッダ（[`crate::http::headers`]）→ 本文長・
-//!   `Content-Type` の読み取り前検証（[`crate::http::body`]）→ 本文読み取り →
-//!   `handler: &impl RequestHandler` へのルーティング（本 Issue 時点では全パス
-//!   `08P01` の [`PlaceholderRouter`]。実ルータは Issue #758 が置き換える）の
-//!   順に 1 往復だけ処理し、応答を 1 回書き込んでからクローズする
-//!   （keep-alive・パイプライン非対応。応答は常に `Connection: close`）。
+//!   （[`crate::http::request`]）→ ヘッダ（[`crate::http::headers`]）→
+//!   `Expect` ヘッダの拒否（[`reject_if_expect`]。下記「`Expect` の扱い」節）
+//!   → 本文長・`Content-Type` の読み取り前検証（[`crate::http::body`]）→
+//!   本文読み取り → `handler: &impl RequestHandler` へのルーティング（本
+//!   Issue 時点では全パス `08P01` の [`PlaceholderRouter`]。実ルータは
+//!   Issue #758 が置き換える）の順に 1 往復だけ処理し、応答を 1 回書き込んで
+//!   からクローズする（keep-alive・パイプライン非対応。応答は常に
+//!   `Connection: close`）。
 //!   `handler` はテスト（本ファイル・#749 の層 A 網羅テスト）が任意の
 //!   [`RequestHandler`] 実装（panic 注入を含む）を差し込むための注入 seam
 //! - [`reject_too_many_connections`][]: 同時接続数の枠を確保できなかった
 //!   接続へ HTTP 503 ＋ JSON 本文（`wire_code`＝`53300`）を返してからクローズ
 //!   する拒否経路（Issue #743 で実装済み・本 Issue では無変更）
 //!
+//! ## `Expect` ヘッダの扱い（codex-review 指摘・PR #810）
+//!
+//! 本ハンドラは 1 要求につき応答を 1 回だけ書く非パイプライン設計であり、
+//! `100 Continue` の暫定応答を送る経路を持たない。`Expect: 100-continue` を
+//! 送るクライアントは、この暫定応答を受け取るまで本文の送信を待つ実装が
+//! ある（[`crate::http::body`] のモジュール doc も「実際の... `Expect:
+//! 100-continue`... 処理は接続ハンドラの責務」と明記している）。これを
+//! 無視して本文読み取りへ進むと、サーバーは届かない本文を待ち、クライアント
+//! は届かない暫定応答を待つ形で双方が待機し、最終的に無応答のまま
+//! タイムアウト切断になる。[`reject_if_expect`] が本文読み取りより前
+//! （[`body::plan_body`] の前）で `Expect` ヘッダの有無を検査し、1 件でも
+//! 付いていれば（値を問わず）暫定応答の代わりに最終エラー応答
+//! （`ErrorClass::FeatureNotSupported`）を返すことで、この待機を構造的に
+//! 回避する。
+//!
 //! ## 不正フレームでも応答を失わない（PoC-15 実装ガイドライン）
 //!
 //! 要求行・ヘッダ・本文のいずれかが不正で早期拒否する場合も、応答バイト列を
 //! 書き込んだ**後**に、SQL wire の [`crate::protocol_dispatch::reject_and_close`]
-//! と同じ有界 lingering close（[`crate::protocol_dispatch::drain_and_close`]。
-//! `LINGER_DRAIN_TIMEOUT`＝1 秒・`LINGER_DRAIN_MAX_BYTES`＝64 KiB を共有）で
+//! と同じ有界 lingering close（[`crate::protocol_dispatch::drain_and_close`]）で
 //! 未読データを読み捨ててからクローズする。書き込み直後に `shutdown(Both)` で
 //! 即座に閉じると、クライアントが送信済み・送信中のバイト列と応答の競合で
 //! TCP RST を受け取り応答を読めなくなりうるため（PoC-15）。
+//!
+//! `LINGER_DRAIN_TIMEOUT`（1 秒）は SQL wire と共有するが、読み捨て上限
+//! バイト数は [`HTTP_LINGER_DRAIN_MAX_BYTES`] として本モジュール独自に持つ
+//! （SQL wire の `LINGER_DRAIN_MAX_BYTES`＝64 KiB をそのまま使わない理由は
+//! 同定数の doc を参照）。
 //!
 //! ## panic 非伝播と RECOVER-8（fail-fast）との関係
 //!
@@ -65,7 +86,7 @@ use crate::http::request::{parse_request_line, Method, RequestLine, RequestLineP
 use crate::http::response;
 use crate::http::{body, error_body, status};
 use crate::limits::REJECT_WRITE_TIMEOUT;
-use crate::protocol_dispatch::{drain_and_close, LINGER_DRAIN_MAX_BYTES, LINGER_DRAIN_TIMEOUT};
+use crate::protocol_dispatch::{drain_and_close, LINGER_DRAIN_TIMEOUT};
 
 /// 要求の「頭」（要求行＋ヘッダ部）を読み取る固定長スタックバッファの長さ。
 ///
@@ -80,6 +101,22 @@ use crate::protocol_dispatch::{drain_and_close, LINGER_DRAIN_MAX_BYTES, LINGER_D
 /// 安全弁として fail-closed に `08P01` を返すのみで、通常経路では到達しない）。
 const HEAD_BUF_LEN: usize =
     crate::http::request::MAX_REQUEST_LINE_LEN + crate::http::headers::MAX_HEADER_SECTION_LEN;
+
+/// HTTP 経路の lingering close（[`drain_and_close`]）が読み捨てる上限バイト数
+/// （Cursor Bugbot 指摘・PR #810）。
+///
+/// SQL wire の `protocol_dispatch::LINGER_DRAIN_MAX_BYTES`（64 KiB）を流用
+/// すると、本文を 1 バイトも読まずに拒否する経路（[`body::plan_body`] の
+/// `Content-Length` 超過・不正 `Content-Type`・[`reject_if_expect`] 等）で、
+/// クライアントが待たずに送信中の本文（最大 [`body::MAX_BODY_LEN`］＝1 MiB）
+/// のほとんどが未読のまま `drain_and_close` の打ち切りに達しうる。読み捨て
+/// られなかった残りが `shutdown`／`stream` の drop 時点で受信バッファに
+/// 残っていると、書き込み済みの応答バイト列と競合して TCP RST が発行され
+/// 応答が失われうる（モジュール doc の PoC-15 節と同じ懸念の HTTP 版）。
+/// 本文の宣言長そのものが [`body::MAX_BODY_LEN`] を超えられない（超えれば
+/// `plan_body` が読み取り前に拒否する）ため、これを上限に取れば「未読分を
+/// 読み切るまで読み捨てる」契約を保証できる。
+const HTTP_LINGER_DRAIN_MAX_BYTES: usize = body::MAX_BODY_LEN;
 
 /// 解析済みの 1 要求（要求行・ヘッダ・本文）。フィールドはいずれも接続ハンドラが
 /// 保持するバッファからの借用であり、`RequestHandler` 実装へ読み取り専用で渡す。
@@ -169,7 +206,7 @@ pub(crate) fn handle_connection_with<H: RequestHandler>(mut stream: TcpStream, h
 /// 形）。書き込み失敗は無視する（新たなブロッキング点・panic を作らない）。
 fn respond_and_close(stream: &mut TcpStream, bytes: &[u8]) {
     let _ = stream.write_all(bytes);
-    drain_and_close(stream, LINGER_DRAIN_TIMEOUT, LINGER_DRAIN_MAX_BYTES);
+    drain_and_close(stream, LINGER_DRAIN_TIMEOUT, HTTP_LINGER_DRAIN_MAX_BYTES);
 }
 
 /// `catch_unwind` の中身。要求の頭（要求行＋ヘッダ）→ 本文長・`Content-Type`
@@ -187,6 +224,10 @@ fn build_outcome<H: RequestHandler>(stream: &mut TcpStream, handler: &H) -> Outc
         HeadOutcome::Respond(bytes) => return Outcome::Respond(bytes),
         HeadOutcome::CloseSilently => return Outcome::CloseSilently,
     };
+
+    if let Err(bytes) = reject_if_expect(&headers) {
+        return Outcome::Respond(bytes);
+    }
 
     let plan = match body::plan_body(&headers) {
         Ok(plan) => plan,
@@ -461,6 +502,32 @@ fn read_body(
     Ok(BodyOutcome::Bytes(buf))
 }
 
+/// `Expect` ヘッダの名前（ASCII 大文字小文字非区別で [`Headers::get_single`]
+/// へ渡す）。
+const EXPECT_HEADER: &[u8] = b"expect";
+
+/// 本文読み取り（[`body::plan_body`]・[`read_body`]）より前に呼び、`Expect`
+/// ヘッダの拒否を行う。モジュール doc「`Expect` ヘッダの扱い」節参照。
+///
+/// 値を問わず（`100-continue` であっても、それ以外の未知のトークンで
+/// あっても）1 件でも付いていれば拒否する。本モジュールは暫定応答
+/// （`100 Continue`）を送出する経路を持たないため、値ごとに対応を分ける
+/// 意味がなく、fail-closed に一律拒否する方が「対応する暫定応答を送るか
+/// 非対応として最終エラー応答を返す」の後者を漏れなく満たせる。
+/// `get_single` 自体が重複ヘッダを `FrameError::Malformed` として拒否する
+/// ため、その経路も同じ最終エラー応答（[`frame_error_bytes`] 経由）へ倒す。
+fn reject_if_expect(headers: &Headers<'_>) -> Result<(), Vec<u8>> {
+    match headers.get_single(EXPECT_HEADER) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(response::encode_error(
+            ErrorClass::FeatureNotSupported,
+            "Expect header is not supported on this connection",
+            SystemTime::now(),
+        )),
+        Err(e) => Err(frame_error_bytes(&e)),
+    }
+}
+
 /// [`FrameError`]（要求行・ヘッダ・本文長のいずれかのパーサが返す）を応答
 /// バイト列へ変換する。`error_class()`／`client_message()` が `None`／空文字を
 /// 返すのは `Truncated`／`Io`（本層のパーサ群は生成しない variant）のみの
@@ -648,6 +715,61 @@ mod tests {
         let received = read_all(&mut client);
         assert_eq!(status_line(&received), "HTTP/1.1 400 Bad Request");
         assert_eq!(wire_code_of(&received), "08P01");
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// codex-review 指摘（PR #810）の回帰テスト: `Expect: 100-continue` を
+    /// 付けたクライアントが、本文を一切送信しなくても（暫定応答を待つ実装を
+    /// 模した状態でも）最終エラー応答を受け取れる。本文を待って `read_body`
+    /// へ進んでいれば、クライアントが送らない本文を待ち続け、この
+    /// `read_all` は読み取りタイムアウトまで応答を受け取れずテストが失敗する。
+    #[test]
+    fn rejects_expect_100_continue_without_waiting_for_body() {
+        let (server, mut client) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter);
+        });
+
+        // 本文は宣言だけして実際には送らない（100-continue を待つ実装の模倣）。
+        client
+            .write_all(
+                b"POST /v1/query HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 1024\r\nExpect: 100-continue\r\n\r\n",
+            )
+            .expect("write head only");
+
+        let received = read_all(&mut client);
+        assert_eq!(status_line(&received), "HTTP/1.1 501 Not Implemented");
+        assert_eq!(wire_code_of(&received), "0A000");
+
+        handle.join().expect("handler thread must not panic");
+    }
+
+    /// `Expect` は値を問わず拒否する（未知のトークンでも同じ最終エラー応答）。
+    #[test]
+    fn rejects_expect_with_unknown_token() {
+        let (server, mut client) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        let handle = std::thread::spawn(move || {
+            handle_connection_with(server, &PlaceholderRouter);
+        });
+
+        client
+            .write_all(
+                b"POST /v1/query HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\nExpect: unknown-token\r\n\r\n{}",
+            )
+            .expect("write");
+
+        let received = read_all(&mut client);
+        assert_eq!(status_line(&received), "HTTP/1.1 501 Not Implemented");
+        assert_eq!(wire_code_of(&received), "0A000");
 
         handle.join().expect("handler thread must not panic");
     }
