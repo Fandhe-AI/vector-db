@@ -9,7 +9,8 @@
 //! エラー契約は SQL 表層（`wire_code` ＝ [`engine::error_format::ErrorClass`]）と
 //! 完全共有し、新規 `wire_code` は追加しない。本モジュール配下は `ErrorClass` を
 //! HTTP 上の表現（ステータス・応答本文等）へ写像する各要素、要求側のパース処理、
-//! および `POST /v1/query` の JSON クエリオブジェクト検証を集約する。
+//! `POST /v1/query` の JSON クエリオブジェクト検証、およびセッション認証の
+//! 構成要素を集約する。
 //!
 //! モジュール構成（現時点）:
 //! - [`request`]: 要求行（メソッド・ターゲット・バージョン）の解析（Issue #740・
@@ -29,6 +30,10 @@
 //!   `filter` 配列の `op` 語彙（`eq`／`prefix`）を
 //!   `engine::declarative_filter::DeclarativeFilter` へ写像し `bind_all` へ
 //!   委譲する（Issue #761・NOSQL-7）
+//! - [`session`]: HTTP セッション認証の構成要素（トークン生成・エンコード等。
+//!   Issue #750・TASK-174・HTTP-4）。ストア・エンドポイント・Bearer 検証は
+//!   本モジュールの対象外（後続 Issue の担当。[`session`] のモジュール doc
+//!   を参照）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - `Content-Type`／本文長上限の検証（[`headers::Headers::get_single`] で
@@ -48,4 +53,5 @@ pub mod headers;
 pub mod listener;
 pub mod query;
 pub mod request;
+pub mod session;
 pub mod status;
