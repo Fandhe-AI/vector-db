@@ -49,11 +49,11 @@
 //!   メモリ内セッションストア〔`session::store::SessionStore`。Issue #751・
 //!   TASK-174・HTTP-4・HTTP-5〕）。エンドポイント・Bearer 検証は本モジュール
 //!   の対象外（後続 Issue の担当。[`session`] のモジュール doc を参照）
+//! - [`response`]: ステータスコード＋JSON 本文 → HTTP/1.1 応答バイト列
+//!   （ステータス行・`Connection: close`・`Content-Type`／`Content-Length`・
+//!   CRLF の組み立て。Issue #746・HTTP-2・HTTP-3・ERR-4・ERR-5）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
-//! - 汎用の応答エンベロープ（ステータス行・`Connection: close`・
-//!   `Content-Type`／`Content-Length`・CRLF の組み立て。`conn::
-//!   encode_reject_response` は 503 応答専用の最小実装にとどまる。Issue #746）
 //! - `explain: true` 時の `{"explain":[...]}` 応答（#765）
 //! - 接続ハンドラ本体（[`conn::handle_connection_interim`] を置き換える
 //!   要求パース・ルーティング・panic 非伝播。Issue #747）
@@ -66,10 +66,12 @@
 
 pub mod body;
 pub(crate) mod conn;
+pub mod date;
 pub mod error_body;
 pub mod headers;
 pub mod listener;
 pub mod query;
 pub mod request;
+pub mod response;
 pub mod session;
 pub mod status;
