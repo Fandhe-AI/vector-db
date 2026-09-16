@@ -774,9 +774,21 @@ fn frame_error_bytes(err: &FrameError) -> Vec<u8> {
 }
 
 /// 固定文言の `08P01`（`ErrorClass::ProtocolViolation`）応答バイト列を組み立てる
-/// 共通ヘルパ。
-fn protocol_violation_bytes(message: &str) -> Vec<u8> {
-    response::encode_error(ErrorClass::ProtocolViolation, message, SystemTime::now())
+/// 共通ヘルパ（codex-review 指摘・PR #810）。
+///
+/// `reason` は呼び出し元ごとの内部的な検証境界名（例: `"request head
+/// bounds"`）であり、ワイヤへ送る `message` フィールドには使わない。
+/// [`frame_error_bytes`] が `FrameError::client_message()` の空文字を
+/// 汎用文言 `"invalid request"` へ縮退させているのと同じ契約に揃え、
+/// 実装内部の検証境界名を常にログ専用（`eprintln!`）に留めてクライアント
+/// へは固定の汎用文言のみを返す。
+fn protocol_violation_bytes(reason: &str) -> Vec<u8> {
+    eprintln!("wire-server: http protocol violation: {reason}");
+    response::encode_error(
+        ErrorClass::ProtocolViolation,
+        "invalid request",
+        SystemTime::now(),
+    )
 }
 
 /// 同時接続数の枠を確保できなかった接続へ HTTP 503 ＋ JSON 本文
