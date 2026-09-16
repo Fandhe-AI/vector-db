@@ -10,14 +10,20 @@
 //! - [`auth`]: ユーザーストア・Argon2id 照合・`PolicyContext` へのテナント導出（WIRE-2, WIRE-3）
 //! - [`framing`]: メッセージフレーミングの長さ検証・fail-closed エラー分類（WIRE-4, WIRE-10）
 //! - [`handshake`]: TCP 接続ごとのメッセージ読み書き・StartupMessage・認証フロー（WIRE-1）
-//! - [`http`]: NoSQL 表層（HTTP/1.1 最小サブセットの転送路。TASK-180）の入口。
-//!   `http::status` は `ErrorClass` → HTTP ステータスの決定的射影（Issue #744・ERR-4）。
-//!   `http::error_body` は `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）。
-//!   `http::listener` は `--surface nosql` の accept ループ stub（Issue #735・
-//!   HTTP-9）。`http::session` はセッション認証のトークン生成・base64url 表現
+//! - [`http`]: NoSQL 表層（HTTP/1.1 最小サブセットの転送路。TASK-173〜175。
+//!   wire プロトコルとは独立した経路）の入口。`http::status` は `ErrorClass` →
+//!   HTTP ステータスの決定的射影（Issue #744・ERR-4）。`http::error_body` は
+//!   `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）。`http::listener`
+//!   は `--surface nosql` の accept ループ stub（Issue #735・HTTP-9）。
+//!   `http::session` はセッション認証のトークン生成・base64url 表現
 //!   （TASK-174・HTTP-4・Issue #750。ストア・エンドポイントは後続 Issue の担当）。
-//!   後続のヘッダ・本文検証・応答エンコーダ・接続ハンドラ本体は
-//!   #741〜#747 が `http` 配下へ追加していく
+//!   `http::query::schema` は `POST /v1/query` の JSON クエリオブジェクトの
+//!   意味的検証ヘルパー（必須欠落・未知キー・型不一致 → `42601`。Issue #760）。
+//!   `http::query::filter` は `filter` 配列の `op` 語彙（`eq`／`prefix`）を
+//!   `engine::declarative_filter::DeclarativeFilter` へ写像し `bind_all` で
+//!   `TableSchema` へ束縛する（Issue #761・NOSQL-7）。後続のヘッダ・本文
+//!   検証・応答エンコーダ・接続ハンドラ本体は #741〜#747 が `http` 配下へ
+//!   追加していく
 //! - [`bind_guard`]: bind アドレスの通信路保護要件検証（TLS 未構成時は loopback 限定。
 //!   TASK-70・WIRE-7）。`main.rs::run_server` の唯一の bind 経路
 //! - [`server`]: 接続受け付けループ・同時接続数の有界化・I/O タイムアウト適用
