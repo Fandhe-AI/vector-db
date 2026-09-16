@@ -16,16 +16,18 @@
 //! （既定 bind: `127.0.0.1:5432`）。`--db` は必須（省略時は fail-closed で
 //! 非 0 終了。匿名・揮発 DB の暗黙生成はしない。TASK-73・WIRE-1）。
 //!
-//! `--surface`（Issue #734・TASK-171／HTTP-1）: クエリインターフェースを
-//! SQL 表層（現行の PostgreSQL wire プロトコル）／NoSQL 表層（HTTP/1.1 最小
-//! サブセット。TASK-172 以降）の 2 択で排他選択する opt-in 注入点。未指定は
-//! `sql`（既定・現行経路のままビット同一）。値の解決は `surface::parse` に
-//! 一本化し、不正な値・値欠落・2 回目以降の重複指定はいずれも fail-closed で
-//! 起動エラー（既定へ黙って読み替えない）。`nosql` はパーサとしては受理する
-//! が、NoSQL リスナー本体の配線は Issue #735 の担当のため、それまでは
-//! bind 直前で明示メッセージ付きに非 0 終了する（選ばれていない SQL wire を
-//! 黙って listen する fail-open を避けるための暫定停止。#735 でリスナー分岐へ
-//! 置き換わる）。
+//! `--surface`（Issue #734・#735・TASK-171／HTTP-1・HTTP-9）: クエリ
+//! インターフェースを SQL 表層（現行の PostgreSQL wire プロトコル）／NoSQL
+//! 表層（HTTP/1.1 最小サブセット。TASK-172 以降）の 2 択で排他選択する
+//! opt-in 注入点。未指定は `sql`（既定・現行経路のままビット同一）。値の
+//! 解決は `surface::parse` に一本化し、不正な値・値欠落・2 回目以降の
+//! 重複指定はいずれも fail-closed で起動エラー（既定へ黙って読み替えない）。
+//! 両表層とも `GuardedBindAddrs::resolve`／`bind()` を共有した**後**に
+//! accept ループだけを分岐する（HTTP-9: nosql 選択時も WIRE-7 と同じ bind
+//! ガードを通る）。`sql` は `server::accept_loop_with_engine`、`nosql` は
+//! `http::listener::accept_loop_stub`（本 Issue 時点は要求を読まず接続を
+//! 即クローズする stub。接続ハンドラ本体は Issue #747）を呼ぶ。選ばれていない
+//! 側のリスナーは構造的に bind されない（HTTP-1 の排他方針）。
 //! `--fault-inject post-commit-panic`（Issue #705。feature `fault-injection`
 //! 有効ビルド限定・**テスト専用**）: `INSERT` の commit 成功直後に自プロセスを
 //! 1 回だけ panic させ、TASK-97・RECOVER-6 の緊急応答
@@ -424,18 +426,6 @@ fn run_server(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    // Issue #734: `nosql` 選択時は SQL wire リスナーを一切 bind しない
-    // （HTTP-1 の排他方針。選ばれていない表層を公開する fail-open を防ぐ）。
-    // NoSQL リスナー本体の配線は Issue #735 の担当のため、それまでは
-    // fail-closed に起動を停止する（#735 がこのブロックをリスナー分岐へ
-    // 置き換える）。
-    if surface == wire_server::surface::Surface::Nosql {
-        eprintln!(
-            "wire-server: --surface nosql: the NoSQL surface listener is not wired yet (Issue #735); refusing to start the SQL listener instead (fail-closed)"
-        );
-        return ExitCode::FAILURE;
-    }
-
     // TLS（TASK-72・WIRE-9）は未実装のため常に `Cleartext` を渡す。bind の
     // loopback 検証をユーザーストア読込より前に行うことで、ユーザーストアの
     // 内容に関わらず bind 先が拒否対象であれば即座に終了できる（fail-closed を
@@ -518,6 +508,19 @@ fn run_server(args: &[String]) -> ExitCode {
         eprintln!("wire-server: fault injection armed: post-commit-panic (test only)");
     }
 
+    // Issue #735（HTTP-1）: `nosql` 選択時のみ、選ばれた表層を示す 1 行を
+    // `listening on` の直前に出す（`listening on` より前に置くのは、
+    // `wait_for_listening` 系ヘルパーがその行で読み取りを打ち切るため。
+    // 停止後に stderr を drain するテストであれば収集済み行に必ず含まれる）。
+    // `sql` では出力しない（既存の E2E ハーネスが `fault injection armed` →
+    // `listening on` の行順序に依存しているため、SQL 側の stderr をビット
+    // 同一のまま保つ）。
+    if surface == wire_server::surface::Surface::Nosql {
+        eprintln!(
+            "wire-server: surface nosql: HTTP/1.1 listener (stub: accepts and closes; handler lands in Issue #747)"
+        );
+    }
+
     // 実際に bind されたアドレスを出す（`--bind 127.0.0.1:0` の ephemeral port
     // 割り当て結果を E2E テストハーネスがこの行から取得する前提。TASK-73）。
     match listener.local_addr() {
@@ -525,13 +528,27 @@ fn run_server(args: &[String]) -> ExitCode {
         Err(_) => eprintln!("wire-server: listening on {bind_addr}"),
     }
 
-    server::accept_loop_with_engine(
-        listener,
-        store,
-        core,
-        limits::ConnectionLimiter::new(limits::MAX_CONNECTIONS),
-        limits::READ_TIMEOUT,
-    );
+    // Issue #735（HTTP-1）: 選択された表層のリスナーだけを 1 本起動する。
+    // 両表層とも直前までの `GuardedBindAddrs::resolve`／`bind()` を共有して
+    // いるため（HTTP-9）、ここでは accept ループの実装だけが分岐する。
+    match surface {
+        wire_server::surface::Surface::Sql => {
+            server::accept_loop_with_engine(
+                listener,
+                store,
+                core,
+                limits::ConnectionLimiter::new(limits::MAX_CONNECTIONS),
+                limits::READ_TIMEOUT,
+            );
+        }
+        wire_server::surface::Surface::Nosql => {
+            // `store`／`core` は本 Issue 時点の stub では使わない（要求を
+            // 読まないため）。接続ハンドラ本体（Issue #747）が両者を使う
+            // 前提で、ここまでの構築順序を SQL 側と揃えている。
+            let _ = (&store, &core);
+            wire_server::http::listener::accept_loop_stub(listener);
+        }
+    }
     ExitCode::SUCCESS
 }
 

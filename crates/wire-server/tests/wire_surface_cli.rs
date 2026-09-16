@@ -1,19 +1,23 @@
-//! `--surface` opt-in（Issue #734・TASK-171／HTTP-1）をバイナリ子プロセスと
-//! して起動し、CLI 引数の受理・拒否（fail-closed）を外形的に検証する結合
-//! テスト。`tests/wire_search_engine_cli.rs` と同じ流儀（実バイナリを
-//! `Command::new(env!("CARGO_BIN_EXE_wire-server"))` で起動し、stderr の
-//! `listening on` 行または非 0 終了・エラーメッセージを外形的に確認する）。
+//! `--surface` opt-in（Issue #734・#735・TASK-171／HTTP-1・HTTP-9）をバイナリ
+//! 子プロセスとして起動し、CLI 引数の受理・拒否（fail-closed）・選択表層に
+//! 応じたリスナー分岐を外形的に検証する結合テスト。`tests/wire_search_engine_cli.rs`
+//! と同じ流儀（実バイナリを `Command::new(env!("CARGO_BIN_EXE_wire-server"))`
+//! で起動し、stderr の `listening on` 行または非 0 終了・エラーメッセージを
+//! 外形的に確認する）。
 //!
-//! - 未指定／`--surface sql` の 2 プロセスは `listening on` に到達すること
+//! - 未指定／`--surface sql` の 2 プロセスは `listening on` に到達し、その
+//!   行がちょうど 1 行だけであること（表層表示行が混じらないこと）
 //! - `bogus`・大文字小文字違い・値欠落・重複指定はいずれも非 0 終了・
 //!   stderr に `--surface` を含む説明が出ること
-//! - `--surface nosql` は**パーサとしては受理する**（`must be one of`／
-//!   `specified more than once` を stderr に含まない）が、NoSQL リスナー本体
-//!   の配線が Issue #735 の担当であるため非 0 終了・stderr に
-//!   「not wired yet」を含み、`listening on` には到達しないこと（#735 で
-//!   「HTTP リスナーのみ listen」へ置き換わる暫定契約）
+//! - `--surface nosql` は SQL wire リスナーを一切 bind せず、HTTP/1.1 stub
+//!   リスナー（Issue #735。要求を読まず接続を即クローズする）だけを 1 本
+//!   bind すること（`listening on` に到達し、`listening on` はちょうど 1 行、
+//!   かつ表層表示行を含む）
+//! - `--surface nosql --bind 0.0.0.0:...` は既存 WIRE-7 と同じ理由（TLS 未構成
+//!   時の非ループバック拒否）で起動拒否されること（HTTP-9）
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -72,11 +76,10 @@ fn write_empty_user_store(path: &str) {
     std::fs::write(path, "").expect("write empty user store");
 }
 
-/// 子プロセスの stderr を専用スレッドで読み、`listening on` を待つ
-/// （`wire_search_engine_cli.rs::wait_for_listening` と同じ理由:
-/// `BufReader::read_line` はデッドラインを持たないブロッキング呼び出しの
-/// ため、`mpsc::Receiver::recv_timeout` で確実に打ち切れるようにする）。
-fn wait_for_listening(child: &mut Child) -> bool {
+/// 子プロセスの stderr を専用スレッドで読み続け、行を `mpsc::Receiver` 経由で
+/// 届ける（`BufReader::read_line` はデッドラインを持たないブロッキング呼び出し
+/// のため、呼び出し元は `recv_timeout` で確実に打ち切れるようにする）。
+fn spawn_stderr_reader(child: &mut Child) -> mpsc::Receiver<String> {
     let stderr = child.stderr.take().expect("piped stderr");
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -90,22 +93,57 @@ fn wait_for_listening(child: &mut Child) -> bool {
             }
         }
     });
+    rx
+}
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// `listening on` を含む行が来るまで待ち、読み取った行を `seen` へ積む
+/// （`recv_timeout` は一度読んだ行を再度読めないため、`listening on` 行数の
+/// 厳密検証をする呼び出し元は本関数が読んだ行を `drain_remaining` の結果と
+/// 合算する必要がある）。
+fn wait_for_listening(
+    rx: &mpsc::Receiver<String>,
+    deadline: Instant,
+    seen: &mut Vec<String>,
+) -> bool {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return false;
         }
         match rx.recv_timeout(remaining) {
-            Ok(line) if line.contains("listening on") => return true,
-            Ok(_) => continue,
+            Ok(line) => {
+                let is_listening = line.contains("listening on");
+                seen.push(line);
+                if is_listening {
+                    return true;
+                }
+            }
             Err(_) => return false,
         }
     }
 }
 
-/// 未指定／`--surface sql` はいずれも `listening on` に到達すること。
+/// 子プロセス停止（`kill`＋`wait`）後、stderr 読み取りスレッドが送信済みの
+/// 残り行をすべて回収する（送信側スレッドはパイプが閉じれば終了し
+/// `recv`/`recv_timeout` は `Err` を返すため、有限時間で必ず終わる）。
+fn drain_remaining(rx: &mpsc::Receiver<String>, deadline: Instant) -> Vec<String> {
+    let mut lines = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(line) => lines.push(line),
+            Err(_) => break,
+        }
+    }
+    lines
+}
+
+/// 未指定／`--surface sql` はいずれも `listening on` に到達し、`listening on`
+/// を含む行がちょうど 1 行（表層表示行は SQL では出さない契約。Issue #735）
+/// であること。
 #[test]
 fn unset_and_sql_token_start_listening() {
     for extra_args in [Vec::<&str>::new(), vec!["--surface", "sql"]] {
@@ -129,13 +167,35 @@ fn unset_and_sql_token_start_listening() {
             .spawn()
             .expect("spawn wire-server");
 
-        let listening = wait_for_listening(&mut child);
+        let rx = spawn_stderr_reader(&mut child);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut collected: Vec<String> = Vec::new();
+        let listening = wait_for_listening(&rx, deadline, &mut collected);
+
         let _ = child.kill();
         let _ = child.wait();
+        collected.extend(drain_remaining(
+            &rx,
+            Instant::now() + Duration::from_secs(5),
+        ));
+        let remaining = collected;
 
         assert!(
             listening,
             "args={extra_args:?}: expected to reach listening state"
+        );
+
+        let listening_lines = remaining
+            .iter()
+            .filter(|l| l.contains("listening on"))
+            .count();
+        assert_eq!(
+            listening_lines, 1,
+            "args={extra_args:?}: expected exactly one 'listening on' line, got: {remaining:?}"
+        );
+        assert!(
+            !remaining.iter().any(|l| l.contains("surface nosql")),
+            "args={extra_args:?}: sql surface must not print the nosql surface line, got: {remaining:?}"
         );
     }
 }
@@ -208,18 +268,18 @@ fn invalid_or_missing_or_duplicate_surface_arg_is_rejected() {
     );
 }
 
-/// `--surface nosql` はパーサとしては受理するが、NoSQL リスナー本体の配線が
-/// Issue #735 の担当であるため非 0 終了・stderr に「not wired yet」を含み
-/// `listening on` には到達しない（#735 で「HTTP リスナーのみ listen」へ
-/// 置き換わる暫定契約。本テストはその置き換え時に更新が必要になる）。
+/// `--surface nosql` は SQL wire リスナーを一切 bind せず、HTTP/1.1 stub
+/// リスナー（Issue #735。要求を一切読まず接続を即クローズする）だけを 1 本
+/// bind する。`listening on` に到達し、かつちょうど 1 行であり、表層表示行
+/// を伴うことを確認する（HTTP-1 の排他方針）。
 #[test]
-fn nosql_token_is_accepted_by_parser_but_listener_is_not_wired_yet() {
+fn nosql_starts_single_http_stub_listener_and_does_not_serve_pg_wire() {
     let fixture = TempFixtureDir::new("nosql-stub");
     let users_path = fixture.users_path_str();
     write_empty_user_store(&users_path);
     let db_path = fixture.db_path_str();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
         .args([
             "--users",
             &users_path,
@@ -230,28 +290,125 @@ fn nosql_token_is_accepted_by_parser_but_listener_is_not_wired_yet() {
             "--surface",
             "nosql",
         ])
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("spawn wire-server");
 
-    assert!(
-        !output.status.success(),
-        "expected non-zero exit until Issue #735 wires the NoSQL listener"
+    let rx = spawn_stderr_reader(&mut child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    // `listening on` に到達するまでの行を手元にも積んでおく（アドレス抽出用。
+    // `wait_for_listening` は到達を判定するだけで行そのものは返さないため、
+    // ここでは専用に読み切る）。
+    let mut collected: Vec<String> = Vec::new();
+    let addr = 'wait: loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for listening on");
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                if let Some(addr) = line.trim_end().strip_prefix("wire-server: listening on ") {
+                    let addr = addr.to_string();
+                    collected.push(line);
+                    break 'wait addr;
+                }
+                collected.push(line);
+            }
+            Err(_) => panic!("stderr reader stopped before listening on: {collected:?}"),
+        }
+    };
+
+    // stub は要求を読まない: SSLRequest（8 バイト）を送っても、SQL wire の
+    // ような応答（先頭バイト `N`／`E`）は返らず、接続は書き込み失敗
+    // （リセット系）または読み取り側の即時 EOF/リセットに終わる。
+    let mut stream = TcpStream::connect(&addr).expect("connect to nosql stub listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let ssl_request: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
+    match stream.write_all(&ssl_request) {
+        Ok(()) => {
+            let mut byte = [0u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {}
+                Ok(_) => assert!(
+                    byte[0] != b'N' && byte[0] != b'E',
+                    "nosql stub must not answer like the SQL wire, got byte {:?}",
+                    byte[0]
+                ),
+                Err(e) => {
+                    let kind = e.kind();
+                    assert!(
+                        kind == std::io::ErrorKind::ConnectionReset
+                            || kind == std::io::ErrorKind::BrokenPipe,
+                        "unexpected read error from nosql stub: {e:?}"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            let kind = e.kind();
+            assert!(
+                kind == std::io::ErrorKind::ConnectionReset
+                    || kind == std::io::ErrorKind::BrokenPipe,
+                "unexpected write error to nosql stub: {kind:?}"
+            );
+        }
+    }
+    drop(stream);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let remaining = drain_remaining(&rx, Instant::now() + Duration::from_secs(5));
+    collected.extend(remaining);
+
+    let listening_lines = collected
+        .iter()
+        .filter(|l| l.contains("listening on"))
+        .count();
+    assert_eq!(
+        listening_lines, 1,
+        "expected exactly one 'listening on' line, got: {collected:?}"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stderr.contains("must be one of"),
-        "unexpected parser rejection, got: {stderr}"
+        collected.iter().any(|l| l.contains("surface nosql")),
+        "expected a nosql surface indicator line, got: {collected:?}"
     );
-    assert!(
-        !stderr.contains("specified more than once"),
-        "unexpected duplicate rejection, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("not wired yet"),
-        "expected stderr to mention the pending listener wiring, got: {stderr}"
-    );
-    assert!(
-        !stderr.contains("listening on"),
-        "must not reach listening state before Issue #735, got: {stderr}"
-    );
+}
+
+/// `--surface nosql --bind 0.0.0.0:...` は既存 WIRE-7 と同じ理由（TLS 未構成
+/// 時の非ループバック拒否）で起動拒否される（HTTP-9: 両表層が同じ
+/// `GuardedBindAddrs` を通ることの確認）。
+#[test]
+fn nosql_non_loopback_bind_exits_non_zero() {
+    let fixture = TempFixtureDir::new("nosql-non-loopback");
+    let users_path = fixture.users_path_str();
+    write_empty_user_store(&users_path);
+    let db_path = fixture.db_path_str();
+
+    for bind_addr in ["0.0.0.0:0", "[::]:0"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+            .args([
+                "--users",
+                &users_path,
+                "--db",
+                &db_path,
+                "--bind",
+                bind_addr,
+                "--surface",
+                "nosql",
+            ])
+            .output()
+            .expect("spawn wire-server");
+
+        assert!(
+            !output.status.success(),
+            "non-loopback bind {bind_addr} with --surface nosql must exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("refusing to bind non-loopback") && stderr.contains("TLS"),
+            "stderr for {bind_addr} should explain the TLS-related refusal, got: {stderr}"
+        );
+    }
 }
