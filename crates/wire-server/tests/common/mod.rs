@@ -1,15 +1,26 @@
-//! `tests/wire_extended_query.rs`（TASK-71・WIRE-8）専用の結合テストヘルパー。
+//! wire-server crate の複数の結合テスト・ベンチから `#[path = "common/mod.rs"]`
+//! （または `../tests/common/mod.rs`）で include される共有ヘルパー集。
+//! 元は `tests/wire_extended_query.rs`（TASK-71・WIRE-8）専用として作られたが
+//! （`tests/wire_auth.rs` 側の同種ヘルパーとの統合は見送られたまま）、その後
+//! 多数の wire テスト・ベンチが in-process サーバースレッド起動・pg wire
+//! クライアントヘルパーとして共有するに至っている。
 //!
-//! `tests/wire_auth.rs` 側にも同種のヘルパーが既に存在するが、並列実装中の
-//! 兄弟イシュー（TASK-68/69・framing/limits）が同ファイルを編集しうるため、
-//! 本タスクでは移設・共通化せず独立に用意する（統合は別途フォローアップ）。
+//! 本ファイル末尾の節（Issue #736・TASK-171／HTTP-1・HTTP-9）は、実
+//! `wire-server` バイナリを子プロセスとして起動し CLI 引数の受理・拒否・
+//! 選択表層のリスナー分岐を外形的に検証するテスト
+//! （`tests/http1_surface_select.rs`）向けの独立したヘルパー群であり、
+//! 上記の in-process ヘルパーとは前提を共有しない（`#[path]` で include する
+//! 各ファイルはそれぞれ独立にコンパイルされるモジュールになるため、
+//! 同一ファイル内に共存させても他ファイルとのシンボル衝突は起きない）。
 #![allow(dead_code)]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wire_server::auth::{argon2id, UserStore};
 use wire_server::limits::ConnectionLimiter;
@@ -460,4 +471,186 @@ pub fn read_ready_for_query(stream: &mut TcpStream) {
     let len = i32::from_be_bytes(len_buf) as usize;
     let mut body = vec![0u8; len - 4];
     stream.read_exact(&mut body).expect("read body");
+}
+
+// ---------------------------------------------------------------------------
+// 子プロセス起動ヘルパー（Issue #736・TASK-171／HTTP-1・HTTP-9）。
+//
+// `tests/http1_surface_select.rs` から使われる。実バイナリ
+// （`env!("CARGO_BIN_EXE_wire-server")`）を子プロセスとして起動し、CLI 引数の
+// 受理・拒否（fail-closed）・選択表層に応じたリスナー分岐を stderr の外形
+// 観測だけで検証する結合テストの土台。旧 `tests/wire_surface_cli.rs` に
+// 個別実装されていた同型ヘルパーをここへ集約する（PR #795 で本ファイルへの
+// 共通化が「対象外」として申し送られた分）。`tests/wire_search_engine_cli.rs`
+// は独自の同型ヘルパーを個別に持ったままで本集約の対象外（スコープ外）。
+// ---------------------------------------------------------------------------
+
+/// 子プロセス用フィクスチャの一時ディレクトリ名が他テスト・他プロセスと
+/// 衝突しないためのプロセス内単調カウンタ（上記 `FIXTURE_SEQ` とは独立の
+/// カウンタ空間。子プロセス起動ヘルパー専用に分ける）。
+static CHILD_PROCESS_FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 子プロセス（`wire-server` バイナリ）に渡すユーザーストア・DB ファイルの
+/// 置き場となる一時ディレクトリ。`Drop` で確実に削除する
+/// （`wire_search_engine_cli.rs::TempFixtureDir` と同型）。
+pub struct TempFixtureDir {
+    dir: std::path::PathBuf,
+}
+
+impl TempFixtureDir {
+    pub fn new(label: &str) -> Self {
+        let seq = CHILD_PROCESS_FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "wire-server-child-process-{label}-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos(),
+            seq
+        ));
+        std::fs::create_dir(&dir).expect("create unique fixture dir");
+        Self { dir }
+    }
+
+    pub fn users_path_str(&self) -> String {
+        self.dir
+            .join("users.txt")
+            .to_str()
+            .expect("utf-8 path")
+            .to_string()
+    }
+
+    pub fn db_path_str(&self) -> String {
+        self.dir
+            .join("db.redb")
+            .to_str()
+            .expect("utf-8 path")
+            .to_string()
+    }
+}
+
+impl Drop for TempFixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// 空のユーザーストア（子プロセス起動ヘルパーを使うテストの多くは認証まで
+/// 到達する必要がない）。
+pub fn write_empty_user_store(path: &str) {
+    std::fs::write(path, "").expect("write empty user store");
+}
+
+/// 子プロセス（`wire-server`）を起動し、stderr の行読み取りスレッド・
+/// これまでに読んだ行の蓄積を束ねたハンドル。`Drop` で未 stop なら
+/// kill＋wait する（呼び出し元テストが途中で panic してもゾンビ・ポート
+/// 占有を残さない。既存の子プロセステストにはこの保護が無かった）。
+pub struct SpawnedServer {
+    child: Child,
+    rx: mpsc::Receiver<String>,
+    seen: Vec<String>,
+    stopped: bool,
+}
+
+impl SpawnedServer {
+    /// `wire-server` バイナリを `extra_args` 付きで起動する。stdout は
+    /// 捨て、stderr はパイプして専用スレッドで読み続ける
+    /// （`BufReader::read_line` はデッドラインを持たないブロッキング呼び出し
+    /// のため、呼び出し元は `recv_timeout` で確実に打ち切れるようにする）。
+    pub fn spawn(extra_args: &[&str]) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+            .args(extra_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wire-server");
+
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).unwrap_or(0);
+                if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            child,
+            rx,
+            seen: Vec::new(),
+            stopped: false,
+        }
+    }
+
+    /// `wire-server: listening on <addr>` 行が来るまで待ち、その `<addr>`
+    /// を返す（到達しなければ `None`）。読み取った行はすべて内部へ蓄積し、
+    /// `stop_and_drain` の戻り値と合算できるようにする（`listening on` の
+    /// 行数検証・表層表示行の有無検証に必要）。
+    pub fn wait_for_listening(&mut self, deadline: Instant) -> Option<String> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(line) => {
+                    let addr = line
+                        .trim_end()
+                        .strip_prefix("wire-server: listening on ")
+                        .map(str::to_string);
+                    self.seen.push(line);
+                    if addr.is_some() {
+                        return addr;
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// 子プロセスを kill＋wait したうえで、stderr 読み取りスレッドが送信
+    /// 済みの残り行を回収し、蓄積済みの行と合算して返す（送信側スレッドは
+    /// パイプが閉じれば終了し `recv`/`recv_timeout` は有限時間内に必ず
+    /// `Err` を返す）。
+    pub fn stop_and_drain(mut self, drain_deadline: Instant) -> Vec<String> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.stopped = true;
+        loop {
+            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(line) => self.seen.push(line),
+                Err(_) => break,
+            }
+        }
+        std::mem::take(&mut self.seen)
+    }
+}
+
+impl Drop for SpawnedServer {
+    fn drop(&mut self) {
+        if !self.stopped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// `wire-server` バイナリを `extra_args` 付きで起動し、終了まで待って
+/// `Output` を返す（起動 CLI 引数の拒否ケース向け。listen へ到達しない
+/// ことを前提に `Command::output()` で完了同期する）。
+pub fn run_wire_server_to_exit(extra_args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_wire-server"))
+        .args(extra_args)
+        .output()
+        .expect("spawn wire-server")
 }
