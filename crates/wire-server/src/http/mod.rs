@@ -58,6 +58,7 @@
 //! ポインタ参照のみで、コード・所見は転記しない）。
 
 pub mod body;
+pub mod date;
 pub mod error_body;
 pub mod headers;
 pub mod listener;
