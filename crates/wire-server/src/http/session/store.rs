@@ -1,0 +1,413 @@
+//! NoSQL 表層のセッション認証（TASK-174・HTTP-4・HTTP-5）が使う、
+//! 発行済み [`SessionToken`] → `engine::policy::PolicyContext` の対応を
+//! プロセス内メモリだけで保持するストア。
+//!
+//! 呼び出し文脈: `POST /v1/session`（Issue #752）が認証成功時に [`SessionStore::issue`]
+//! を呼びトークンを発行し、以後のリクエストで `Authorization: Bearer <token>`
+//! （Issue #753・#754）を検証するミドルウェアが [`SessionStore::lookup`] を、
+//! `POST /v1/session/close`（Issue #753）が [`SessionStore::close`] を呼ぶ。
+//! 本モジュールはこの 3 メソッドと保持契約（TTL・上限）を提供するのみで、
+//! HTTP 側の受理点（ヘッダ解析・`28000` の送出）はいずれも後続 Issue の担当。
+//!
+//! ## 保持契約
+//! - TTL は [`crate::limits::SESSION_TTL`] 固定（発行時刻起点。`lookup` で
+//!   延長しない）。期限切れは参照時（`lookup`／`close`／枠不足時の `issue`）に
+//!   失効扱いとし、バックグラウンドの掃除スレッドは持たない
+//! - 同時有効数は [`crate::limits::SessionLimiter`]（[`crate::limits::MAX_SESSIONS`]）
+//!   で有界化する。エントリは permit 取得後にしか挿入されないため、常に
+//!   エントリ数 ≤ 上限が構造的に保証される
+//! - ディスク・環境変数・ログへトークン／`PolicyContext` を書き出さない
+//!   （`Debug` は件数のみ）
+//!
+//! ## 時刻注入
+//! `Instant::now()` を一切呼ばず、全メソッドが `now: Instant` を引数で受け取る
+//! （単調時計。`SystemTime` は使わない）。production では後続 Issue の router が
+//! `Instant::now()` を渡す。テストは任意の `now` を注入して境界（TTL ちょうど）
+//! を決定的に検証できる。
+//!
+//! ## トークン照合の比較方式
+//! `HashMap<SessionToken, Entry>` を採用する（[`token`](super::token) モジュール
+//! doc の「定数時間比較は #751／#754 の設計事項」に対する本 Issue の決定）。
+//! `HashMap` の `RandomState` はプロセスごとにランダムな `SipHash` 鍵を使うため、
+//! 攻撃者がハッシュ衝突（バケット一致）まで到達するには鍵を知る必要があり、
+//! バケット一致後の `[u8; 32]::eq` の短絡比較は実質的な側チャネルにならないと
+//! 判断する。この判断はプロセス起動ごとに鍵が変わる `HashMap` の性質に依存する
+//! ため、Bearer 受理点を実装する #754 で再評価対象とする。
+
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::limits::{SessionLimiter, SessionPermit, MAX_SESSIONS, SESSION_TTL};
+
+use super::token::SessionToken;
+
+/// [`SessionStore::issue`] の拒否理由。
+#[derive(Debug)]
+pub enum IssueError {
+    /// 同時有効セッション数が上限（[`MAX_SESSIONS`]）に達しており、期限切れ
+    /// エントリの回収後もなお枠が確保できなかった。
+    LimitExceeded,
+    /// OS の CSPRNG からのトークン生成に失敗した（[`SessionToken::generate`]）。
+    TokenGeneration(std::io::Error),
+    /// 内部不整合（生成トークンのキー衝突・`Mutex` の poison）。fail-closed に
+    /// 拒否する経路で、通常の運用では到達しない想定（RECOVER-8 のプロセス
+    /// fail-fast が panic を捕捉するため）。
+    Internal,
+}
+
+impl fmt::Display for IssueError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IssueError::LimitExceeded => write!(f, "session limit exceeded"),
+            IssueError::TokenGeneration(e) => write!(f, "session token generation failed: {e}"),
+            IssueError::Internal => write!(f, "internal session store error"),
+        }
+    }
+}
+
+impl std::error::Error for IssueError {}
+
+impl IssueError {
+    /// この拒否理由に対応する `wire_code` 分類。`LimitExceeded` は
+    /// [`crate::limits::SQLSTATE_TOO_MANY_CONNECTIONS`] と同じ分類
+    /// （`engine::error_format::ErrorClass::ConnectionLimitExceeded`）を
+    /// 再利用し、セッション用の新規 `wire_code` は追加しない（`http/mod.rs`
+    /// の「新規 `wire_code` を追加しない」契約）。
+    pub fn error_class(&self) -> engine::error_format::ErrorClass {
+        match self {
+            IssueError::LimitExceeded => engine::error_format::ErrorClass::ConnectionLimitExceeded,
+            IssueError::TokenGeneration(_) | IssueError::Internal => {
+                engine::error_format::ErrorClass::InternalError
+            }
+        }
+    }
+}
+
+/// ストア内の 1 セッションぶんの状態。`_permit` は保持しているだけで直接
+/// 参照しない（`Entry` の drop で自動的に [`SessionLimiter`] の枠が解放される
+/// ―― 枠解放を明示的な減算経路として複製しない設計）。
+struct Entry {
+    ctx: engine::policy::PolicyContext,
+    issued_at: Instant,
+    _permit: SessionPermit,
+}
+
+/// TTL 固定・同時有効数上限付きのメモリ内セッションストア（TASK-174・
+/// HTTP-4・HTTP-5）。`Clone` は内部状態（`Mutex` 越しの `HashMap`・
+/// [`SessionLimiter`]）を共有する（`Arc` によるハンドル複製）。
+#[derive(Clone)]
+pub struct SessionStore {
+    inner: Arc<Mutex<HashMap<SessionToken, Entry>>>,
+    limiter: SessionLimiter,
+    ttl: Duration,
+}
+
+impl fmt::Debug for SessionStore {
+    /// トークン・`PolicyContext`（`tenant_id` を含む）を一切印字しない
+    /// （件数・上限のみ。security.md「エラー・ログ経由で他テナントのデータ・
+    /// 存在情報を漏らさない」に対する予防的な配慮）。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionStore")
+            .field("active_sessions", &self.limiter.active())
+            .field("max_sessions", &self.limiter.max())
+            .finish()
+    }
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionStore {
+    /// 既定の契約値（[`MAX_SESSIONS`]＝256・[`SESSION_TTL`]＝3600 秒）で
+    /// 新しいストアを作る。production の唯一の構築経路。
+    pub fn new() -> Self {
+        Self::with_limits(MAX_SESSIONS, SESSION_TTL)
+    }
+
+    /// 上限・TTL を明示指定して新しいストアを作る（テスト用途・将来の CLI
+    /// opt-in 用途。既定値は [`SessionStore::new`] のまま不変）。
+    pub fn with_limits(max_sessions: usize, ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            limiter: SessionLimiter::new(max_sessions),
+            ttl,
+        }
+    }
+
+    /// `now` 時点で `issued_at + ttl` を超えていないかを判定する（TTL ちょうど
+    /// で失効。発行時刻起点・スライドしない）。
+    fn is_alive(&self, issued_at: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(issued_at) < self.ttl
+    }
+
+    /// 期限切れエントリを一括回収する（`retain` に伴い `Entry` が drop され
+    /// [`SessionPermit`] の枠が解放される）。呼び出しは [`SessionStore::issue`]
+    /// が枠不足時にのみ行う（O(現在のエントリ数) ≤ [`MAX_SESSIONS`] で有界。
+    /// バックグラウンド掃除スレッドは持たない）。
+    fn sweep_expired_locked(&self, table: &mut HashMap<SessionToken, Entry>, now: Instant) {
+        table.retain(|_, entry| self.is_alive(entry.issued_at, now));
+    }
+
+    /// `ctx` を束縛した新しいセッショントークンを発行する。
+    ///
+    /// 手順（fail-closed）: (1) 枠確保を試み、失敗したら期限切れエントリを
+    /// 一括回収してから再試行し、それでも失敗すれば [`IssueError::LimitExceeded`]。
+    /// (2) [`SessionToken::generate`] が失敗したら [`IssueError::TokenGeneration`]
+    /// （確保済みの枠は `permit` の drop で自動解放される）。(3) 生成したトークンが
+    /// 既にテーブルに存在する場合は上書きしない（別テナントの `ctx` への再束縛
+    /// 経路を作らないため）で [`IssueError::Internal`] を返す。
+    pub fn issue(
+        &self,
+        ctx: engine::policy::PolicyContext,
+        now: Instant,
+    ) -> Result<SessionToken, IssueError> {
+        let permit = match self.limiter.try_acquire() {
+            Some(permit) => permit,
+            None => {
+                {
+                    let mut table = self.inner.lock().map_err(|_| IssueError::Internal)?;
+                    self.sweep_expired_locked(&mut table, now);
+                }
+                self.limiter
+                    .try_acquire()
+                    .ok_or(IssueError::LimitExceeded)?
+            }
+        };
+
+        let token = SessionToken::generate().map_err(IssueError::TokenGeneration)?;
+
+        let mut table = self.inner.lock().map_err(|_| IssueError::Internal)?;
+        if table.contains_key(&token) {
+            // CSPRNG 32 バイト出力の衝突は実務上無視できる確率だが、万一
+            // 発生した場合に既存エントリ（別テナントの可能性がある）を
+            // 上書きしない fail-closed な多層防御。
+            return Err(IssueError::Internal);
+        }
+        table.insert(
+            token.clone(),
+            Entry {
+                ctx,
+                issued_at: now,
+                _permit: permit,
+            },
+        );
+        Ok(token)
+    }
+
+    /// `token` に束縛された `PolicyContext` を返す。存在しない・期限切れの
+    /// いずれも `None`（両者を呼び出し側から区別できない存在オラクル非公開
+    /// 設計。期限切れエントリはその場で回収し枠を解放する）。
+    ///
+    /// `issued_at` は更新しない（TTL は固定・スライドしない）。
+    pub fn lookup(
+        &self,
+        token: &SessionToken,
+        now: Instant,
+    ) -> Option<engine::policy::PolicyContext> {
+        let mut table = self.inner.lock().ok()?;
+        let alive = self.is_alive(table.get(token)?.issued_at, now);
+        if alive {
+            table.get(token).map(|entry| entry.ctx.clone())
+        } else {
+            table.remove(token);
+            None
+        }
+    }
+
+    /// `token` を無効化する。取り出したエントリが有効期限内だった場合のみ
+    /// `true`（未知・期限切れは `false`。二重 close が「無効」として観測
+    /// できる）。枠解放は取り出した `Entry` の drop に一本化する。
+    pub fn close(&self, token: &SessionToken, now: Instant) -> bool {
+        let Ok(mut table) = self.inner.lock() else {
+            return false;
+        };
+        match table.remove(token) {
+            Some(entry) => self.is_alive(entry.issued_at, now),
+            None => false,
+        }
+    }
+
+    /// 現在の有効セッション数（観測用。期限切れだが未回収のエントリも含む
+    /// ―― [`SessionLimiter::active`] をそのまま公開する）。
+    pub fn active_sessions(&self) -> usize {
+        self.limiter.active()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::policy::PolicyContext;
+
+    fn ctx(tenant: &str) -> PolicyContext {
+        PolicyContext::new(tenant).expect("valid tenant id in test")
+    }
+
+    #[test]
+    fn issue_up_to_max_then_rejects_with_limit_exceeded() {
+        let store = SessionStore::new();
+        let now = Instant::now();
+
+        for i in 0..MAX_SESSIONS {
+            store
+                .issue(ctx("tenant"), now)
+                .unwrap_or_else(|_| panic!("issue #{i} must succeed"));
+        }
+        assert_eq!(store.active_sessions(), MAX_SESSIONS);
+
+        let err = store
+            .issue(ctx("tenant"), now)
+            .expect_err("issue beyond MAX_SESSIONS must fail");
+        assert!(matches!(err, IssueError::LimitExceeded));
+        assert_eq!(
+            err.error_class(),
+            engine::error_format::ErrorClass::ConnectionLimitExceeded
+        );
+    }
+
+    #[test]
+    fn ttl_boundary_expires_exactly_at_ttl() {
+        let store = SessionStore::new();
+        let base = Instant::now();
+        let token = store.issue(ctx("tenant"), base).expect("issue");
+
+        let just_before = base + SESSION_TTL - Duration::from_secs(1);
+        assert!(store.lookup(&token, just_before).is_some());
+
+        // just_before の lookup で issued_at が延長されないことを確認する
+        // （固定 TTL 契約）。境界ちょうどで失効する。
+        let at_ttl = base + SESSION_TTL;
+        assert!(store.lookup(&token, at_ttl).is_none());
+    }
+
+    #[test]
+    fn expired_entry_frees_slot_allowing_new_issue_beyond_max() {
+        let store = SessionStore::with_limits(4, Duration::from_secs(60));
+        let base = Instant::now();
+        for _ in 0..4 {
+            store.issue(ctx("tenant"), base).expect("issue");
+        }
+        assert_eq!(store.active_sessions(), 4);
+
+        let after_ttl = base + Duration::from_secs(61);
+        let token = store
+            .issue(ctx("tenant"), after_ttl)
+            .expect("expired entries must be swept to free a slot");
+        assert_eq!(store.active_sessions(), 1);
+        assert!(store.lookup(&token, after_ttl).is_some());
+    }
+
+    #[test]
+    fn lookup_of_expired_token_recovers_slot() {
+        let store = SessionStore::with_limits(4, Duration::from_secs(60));
+        let base = Instant::now();
+        let token = store.issue(ctx("tenant"), base).expect("issue");
+        assert_eq!(store.active_sessions(), 1);
+
+        let after_ttl = base + Duration::from_secs(61);
+        assert!(store.lookup(&token, after_ttl).is_none());
+        assert_eq!(store.active_sessions(), 0);
+    }
+
+    #[test]
+    fn close_returns_true_once_then_false() {
+        let store = SessionStore::new();
+        let now = Instant::now();
+        let token = store.issue(ctx("tenant"), now).expect("issue");
+
+        assert!(store.close(&token, now));
+        assert!(store.lookup(&token, now).is_none());
+        assert_eq!(store.active_sessions(), 0);
+
+        assert!(!store.close(&token, now), "double close must return false");
+    }
+
+    #[test]
+    fn unknown_token_lookup_and_close_have_no_side_effects() {
+        let store = SessionStore::new();
+        let now = Instant::now();
+        let issued = store.issue(ctx("tenant"), now).expect("issue");
+        let unknown = SessionToken::generate().expect("generate unrelated token");
+
+        assert!(store.lookup(&unknown, now).is_none());
+        assert!(!store.close(&unknown, now));
+        assert_eq!(store.active_sessions(), 1);
+        assert!(store.lookup(&issued, now).is_some());
+    }
+
+    #[test]
+    fn tokens_resolve_only_to_their_own_tenant_context() {
+        let store = SessionStore::new();
+        let now = Instant::now();
+        let token_a = store.issue(ctx("tenant-a"), now).expect("issue a");
+        let token_b = store.issue(ctx("tenant-b"), now).expect("issue b");
+
+        assert_eq!(store.lookup(&token_a, now), Some(ctx("tenant-a")));
+        assert_eq!(store.lookup(&token_b, now), Some(ctx("tenant-b")));
+        assert_ne!(
+            store.lookup(&token_a, now),
+            store.lookup(&token_b, now),
+            "tokens must not cross-resolve to another tenant's context"
+        );
+    }
+
+    #[test]
+    fn concurrent_issue_never_exceeds_max_sessions() {
+        const MAX: usize = 16;
+        let store = SessionStore::with_limits(MAX, Duration::from_secs(60));
+        let now = Instant::now();
+
+        let results: Vec<bool> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..(MAX * 2))
+                .map(|_| {
+                    let store = store.clone();
+                    scope.spawn(move || store.issue(ctx("tenant"), now).is_ok())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread join"))
+                .collect()
+        });
+
+        let successes = results.iter().filter(|ok| **ok).count();
+        assert_eq!(successes, MAX, "exactly MAX issues may succeed");
+        assert!(store.active_sessions() <= MAX);
+    }
+
+    #[test]
+    fn debug_output_does_not_leak_tokens_or_tenant_ids() {
+        let store = SessionStore::new();
+        let now = Instant::now();
+        let token = store.issue(ctx("super-secret-tenant"), now).expect("issue");
+        let encoded = token.encoded();
+
+        let debug_output = format!("{store:?}");
+        assert!(!debug_output.contains(&encoded));
+        assert!(!debug_output.contains("super-secret-tenant"));
+        assert!(debug_output.contains("active_sessions"));
+    }
+
+    #[test]
+    fn with_limits_uses_given_bounds_not_defaults() {
+        let store = SessionStore::with_limits(1, Duration::from_secs(1));
+        let now = Instant::now();
+        store.issue(ctx("tenant"), now).expect("first issue");
+        assert!(matches!(
+            store.issue(ctx("tenant"), now),
+            Err(IssueError::LimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn default_new_matches_production_constants() {
+        let store = SessionStore::new();
+        assert_eq!(store.limiter.max(), MAX_SESSIONS);
+        assert_eq!(store.ttl, SESSION_TTL);
+    }
+}

@@ -30,10 +30,11 @@
 //!   `filter` 配列の `op` 語彙（`eq`／`prefix`）を
 //!   `engine::declarative_filter::DeclarativeFilter` へ写像し `bind_all` へ
 //!   委譲する（Issue #761・NOSQL-7）
-//! - [`session`]: HTTP セッション認証の構成要素（トークン生成・エンコード等。
-//!   Issue #750・TASK-174・HTTP-4）。ストア・エンドポイント・Bearer 検証は
-//!   本モジュールの対象外（後続 Issue の担当。[`session`] のモジュール doc
-//!   を参照）
+//! - [`session`]: HTTP セッション認証の構成要素（トークン生成・エンコード
+//!   〔Issue #750・TASK-174・HTTP-4〕と、TTL 固定・同時有効数上限付きの
+//!   メモリ内セッションストア〔`session::store::SessionStore`。Issue #751・
+//!   TASK-174・HTTP-4・HTTP-5〕）。エンドポイント・Bearer 検証は本モジュール
+//!   の対象外（後続 Issue の担当。[`session`] のモジュール doc を参照）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - `Content-Type`／本文長上限の検証（[`headers::Headers::get_single`] で
