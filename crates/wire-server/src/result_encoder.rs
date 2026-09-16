@@ -7,7 +7,10 @@
 //! ResultRow}` から wire v3 の text フォーマットへの写像がここに閉じる
 //! （TASK-73・WIRE-1）。
 //!
-//! 型写像（すべて format code 0 = text）:
+//! 型写像（すべて format code 0 = text）。単一情報源は [`WireType`]（本モジュール
+//! `pub(crate)`）で、`crate::http::query::response`（NoSQL 表層の JSON 応答
+//! スキーマ `columns[].type`。Issue #762・NOSQL-11）もこの enum を経由して
+//! 同じ写像を参照する（2 箇所に写像表を持たない）:
 //! - `ColumnMeta::Id` → `numeric`（OID 1700, typlen -1）。engine の行 ID は
 //!   `u64` 全域（`u64::MAX` を含む）を有効値とするため、符号付き 64bit の
 //!   `int8`（OID 20）では `i64::MAX` を超える正当な ID を表現できない
@@ -31,17 +34,72 @@ use engine::sql::exec::{Cell, ColumnMeta, ResultRow};
 #[derive(Debug)]
 pub struct EncodeError;
 
-/// `ColumnMeta` 1 個の PostgreSQL 型 OID・typlen を返す（本モジュール先頭の
-/// 型写像表を参照）。
-fn column_type_oid_and_len(meta: &ColumnMeta) -> (i32, i16) {
-    match meta {
-        ColumnMeta::Id => (1700, -1), // numeric（u64 全域を表現するため int8 ではなく numeric）
-        ColumnMeta::Scalar { .. } => (25, -1), // text（Vector も text 表現で返す）
-        ColumnMeta::Computed { .. } => (25, -1), // text
+/// `RowDescription` が公告する PostgreSQL 型（型写像表の単一情報源。
+/// Issue #762・NOSQL-11）。`crate::http::query::response`（NoSQL 表層の JSON
+/// 応答スキーマ `columns[].type`）も本 enum を経由して同じ写像を参照し、
+/// wire 側 `RowDescription` と JSON `columns` の型名が乖離しない構造にする
+/// （2 箇所に写像表を持たない）。`#[deny(clippy::wildcard_enum_match_arm)]`
+/// を付けた網羅 `match`（`http/status.rs` と同方針）で
+/// [`ColumnMeta`] に variant が増えたら両表層が同時にコンパイルエラーになる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WireType {
+    /// `ColumnMeta::Id`。engine の行 ID は `u64` 全域（`u64::MAX` を含む）を
+    /// 有効値とするため、符号付き 64bit の `int8`（OID 20）では表現できない
+    /// 値が生じる（PR #210 レビュー指摘）。
+    Numeric,
+    /// `ColumnMeta::Scalar{ty: Text}`／`Scalar{ty: Vector(_)}`／`Computed{..}`。
+    Text,
+}
+
+impl WireType {
+    /// PostgreSQL 型 OID（`pg_type.oid`）。
+    pub(crate) const fn oid(self) -> i32 {
+        match self {
+            WireType::Numeric => 1700,
+            WireType::Text => 25,
+        }
+    }
+
+    /// 型長（`pg_type.typlen`）。可変長型のみを扱うためいずれも `-1`。
+    pub(crate) const fn typlen(self) -> i16 {
+        match self {
+            WireType::Numeric | WireType::Text => -1,
+        }
+    }
+
+    /// PostgreSQL 型名（`pg_type.typname`）。JSON 応答スキーマ
+    /// （`crate::http::query::response`）の `columns[].type` が使う。
+    pub(crate) const fn pg_type_name(self) -> &'static str {
+        match self {
+            WireType::Numeric => "numeric",
+            WireType::Text => "text",
+        }
+    }
+
+    /// OID からの逆引き（単体テスト専用。結合テスト側は独立の固定表を持つ
+    /// ため非テストビルドでは未使用となり `#[cfg(test)]` で dead_code を
+    /// 回避する）。
+    #[cfg(test)]
+    pub(crate) fn from_oid(oid: i32) -> Option<Self> {
+        match oid {
+            1700 => Some(WireType::Numeric),
+            25 => Some(WireType::Text),
+            _ => None,
+        }
     }
 }
 
-fn column_name(meta: &ColumnMeta) -> &str {
+/// `ColumnMeta` 1 個が公告する [`WireType`]（本モジュール先頭の型写像表を参照）。
+#[deny(clippy::wildcard_enum_match_arm)]
+pub(crate) fn column_wire_type(meta: &ColumnMeta) -> WireType {
+    match meta {
+        ColumnMeta::Id => WireType::Numeric, // u64 全域を表現するため int8 ではなく numeric
+        ColumnMeta::Scalar { .. } => WireType::Text, // Vector も text 表現で返す
+        ColumnMeta::Computed { .. } => WireType::Text,
+    }
+}
+
+pub(crate) fn column_name(meta: &ColumnMeta) -> &str {
     match meta {
         ColumnMeta::Id => "id",
         ColumnMeta::Scalar { name, .. } => name.as_str(),
@@ -69,9 +127,9 @@ pub fn encode_row_description(columns: &[ColumnMeta]) -> Result<Vec<u8>, EncodeE
         body.push(0);
         body.extend_from_slice(&0i32.to_be_bytes()); // table OID
         body.extend_from_slice(&0i16.to_be_bytes()); // attr number
-        let (type_oid, type_len) = column_type_oid_and_len(meta);
-        body.extend_from_slice(&type_oid.to_be_bytes());
-        body.extend_from_slice(&type_len.to_be_bytes());
+        let wire_type = column_wire_type(meta);
+        body.extend_from_slice(&wire_type.oid().to_be_bytes());
+        body.extend_from_slice(&wire_type.typlen().to_be_bytes());
         body.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
         body.extend_from_slice(&0i16.to_be_bytes()); // format code (text)
     }
