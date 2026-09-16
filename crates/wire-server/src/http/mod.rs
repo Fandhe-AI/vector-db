@@ -30,17 +30,22 @@
 //!   呼ぶ唯一の呼び出し元
 //! - [`query`]: `POST /v1/query` の op 別写像の親モジュール（TASK-175。
 //!   `query::schema` が JSON クエリオブジェクトの意味的検証（必須キー欠落・
-//!   未知キー・型不一致 → `42601`）を担う。Issue #760。`query::filter` は
+//!   未知キー・型不一致 → `42601`）を担う（Issue #760）。`query::filter` は
 //!   `filter` 配列の `op` 語彙（`eq`／`prefix`）を
 //!   `engine::declarative_filter::DeclarativeFilter` へ写像し `bind_all` へ
-//!   委譲する（Issue #761・NOSQL-7）
+//!   委譲する（Issue #761・NOSQL-7）。`query::response` は `search`／`scan`／
+//!   `aggregate` 成功時の `QueryResult` → JSON 応答本文（`columns`／`rows`／
+//!   `row_count`、`crate::result_encoder` と同じ型写像。Issue #762・
+//!   NOSQL-11）を担う
 //! - [`session`]: HTTP セッション認証の構成要素（トークン生成・エンコード等。
 //!   Issue #750・TASK-174・HTTP-4）。ストア・エンドポイント・Bearer 検証は
 //!   本モジュールの対象外（後続 Issue の担当。[`session`] のモジュール doc
 //!   を参照）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
-//! - 応答エンコーダ（Issue #746）
+//! - 応答エンベロープ（ステータス行・`Connection: close`・`Content-Type`／
+//!   `Content-Length`・CRLF の組み立て。Issue #746）
+//! - `explain: true` 時の `{"explain":[...]}` 応答（#765）
 //! - 接続ハンドラ本体（[`listener::accept_loop_stub`] を置き換える有界読み取り・
 //!   EOF 時の無応答クローズ判断・panic 非伝播。Issue #747）
 //! - op 語彙の許可リストと未知 op（`0A000`）判定・各 op の実行計画への写像

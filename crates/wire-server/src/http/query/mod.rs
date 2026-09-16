@@ -7,7 +7,11 @@
 //! `engine::declarative_filter::DeclarativeFilter` へ写像し、`bind_all` で
 //! `TableSchema` へ束縛する（Issue #761・TASK-175・NOSQL-7）。op 語彙の
 //! 許可リストと未知 op（`0A000`）判定・各 op の実行計画への写像は後続 Issue
-//! （#759・#763・#766・#768 以降）がここへ追加する。
+//! （#759・#763・#766・#768 以降）がここへ追加する。[`response`] は
+//! `search`／`scan`／`aggregate` 成功時の `engine::sql::exec::QueryResult`
+//! → JSON 応答本文（`columns`／`rows`／`row_count`）への写像を担う
+//! （Issue #762・NOSQL-11）。
 
 pub mod filter;
+pub mod response;
 pub mod schema;
