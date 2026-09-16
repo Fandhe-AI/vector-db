@@ -89,11 +89,14 @@ bind は同じ理由で起動拒否されます。`nosql` を選択すると、�
 （超過時は HTTP 503／`wire_code` `53300`）は SQL wire と同一契約で適用済み
 です（Issue #743）。要求行・ヘッダ・本文の読み取りと解析、応答の書き込み・
 不正フレーム時の有界な読み捨てクローズ、接続ハンドラ本体の `catch_unwind`
-による panic 隔離は接続ハンドラ本体（Issue #747）として実装済みですが、
-`POST /v1/query` 等の実ルーティングはまだ無く、全パスが `08P01`
-（`unknown request target`）で拒否されます。実ルータ（`/v1/session`・
-`/v1/session/close`・`/v1/query` の 3 エンドポイント限定）は後続 Issue
-（#758）の担当です。この `catch_unwind` は `wire-server` を lib として使う
+による panic 隔離は接続ハンドラ本体（Issue #747）として実装済みです。
+`POST /v1/session`（Argon2id 照合・SQL wire と同一の固定遅延・ダミー KDF
+対称性・セッション発行。Issue #752・TASK-174・HTTP-4・HTTP-6）は実装済みで、
+それ以外のパス（`/v1/session/close`・`/v1/query` を含む）は引き続き `08P01`
+（`unknown request target`）で拒否されます。`/v1/session/close`・
+`Authorization: Bearer` 検証（Issue #753・#754）・3 エンドポイント限定の
+実ルータ完成（#758）は後続 Issue の担当です。この `catch_unwind` は
+`wire-server` を lib として使う
 経路・テストでの防御であり、production バイナリでは起動時に導入する
 panic hook（RECOVER-8）が unwind 前に `abort()` するため
 `catch_unwind` へは実際には到達せず、1 接続の panic でも他接続を含め

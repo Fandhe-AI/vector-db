@@ -7,21 +7,22 @@
 //! の bind ガード適用は `main.rs` 側のディスパッチ構造で担保する）、本モジュール
 //! の責務は「1 本だけ listen される」ことの受け皿にとどめる。
 //!
-//! [`accept_loop_with_limiter`] は [`crate::server::accept_loop_inner`] と
-//! 同構造（受理 → `read_timeout` 適用 → ハンドラへ委譲／拒否 →
-//! `RejectWorkerLimiter` で有界化した使い捨てスレッドへ委譲）で、
-//! [`crate::limits::ConnectionLimiter`]（WIRE-6）・
+//! [`accept_loop_with_router`]（production 入口。Issue #752）は
+//! [`crate::server::accept_loop_inner`] と同構造（受理 → `read_timeout` 適用
+//! → ハンドラへ委譲／拒否 → `RejectWorkerLimiter` で有界化した使い捨て
+//! スレッドへ委譲）で、[`crate::limits::ConnectionLimiter`]（WIRE-6）・
 //! [`crate::limits::READ_TIMEOUT`]（WIRE-5）を SQL wire と**共有**する
 //! （`main.rs::run_server` が `match surface` の前に 1 回だけ構築した同一
 //! インスタンスを渡す。プロセス内で 1 表層しか起動しないため「共有」は
 //! 「同じ構築箇所・同じ定数・同じ型」で満たされる）。要求の読み取り・
 //! パース・応答生成・panic の非伝播は接続ハンドラ本体
 //! （[`crate::http::conn::handle_connection_with`]。Issue #747）が担い、本モジュール
-//! はハンドラの選び方（`accept_loop_with_limiter` は production 用の
-//! [`crate::http::conn::PlaceholderRouter`] を固定で使う）と、受理・
-//! タイムアウト適用・拒否・スレッド分岐にとどめる。テスト（`conn.rs`・#749
-//! の層 A 網羅テスト）は [`accept_loop_with_handler`] へ任意の
-//! [`crate::http::conn::RequestHandler`] 実装を注入できる。
+//! はハンドラの選び方（`accept_loop_with_router` は production 用の
+//! [`crate::http::router::Router`] を使う。`accept_loop_with_limiter` は
+//! `PlaceholderRouter` 固定の後方互換 API）と、受理・タイムアウト適用・
+//! 拒否・スレッド分岐にとどめる。テスト（`conn.rs`・#749 の層 A 網羅
+//! テスト）は [`accept_loop_with_handler`] へ任意の [`crate::http::conn::
+//! RequestHandler`] 実装を注入できる。
 //!
 //! 同時接続数上限超過時の 503 応答は
 //! [`crate::http::conn::reject_too_many_connections`] が担う。
@@ -35,6 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::http::conn::{self, RequestHandler};
+use crate::http::router::Router;
 use crate::limits::{self, ConnectionLimiter, RejectWorkerLimiter};
 
 /// 接続を受理した直後に閉じるだけの accept ループ（stub）。
@@ -60,12 +62,15 @@ pub fn accept_loop_stub(listener: TcpListener) {
     }
 }
 
-/// NoSQL 表層の accept ループ本体（production 入口）。[`crate::http::conn::
-/// PlaceholderRouter`] を使う [`accept_loop_with_handler`] の薄いラッパー。
+/// [`crate::http::conn::PlaceholderRouter`] を使う [`accept_loop_with_handler`]
+/// の薄いラッパー。`main.rs::run_server` はもう本関数を呼ばない
+/// （production 入口は [`accept_loop_with_router`]。Issue #752）が、
+/// `PlaceholderRouter` を注入したい既存呼び出し元向けに後方互換 API として
+/// 残置する（AGENTS.md P1「公開 API・エラー契約の互換性」）。
 ///
-/// `limiter` は呼び出し元（`main.rs::run_server`）が `match surface` の前に
-/// 1 回だけ構築したインスタンスを受け取る（SQL wire 側と同じ構築箇所・同じ
-/// 定数・同じ型を共有する構造。本ループが独自にリミッターを作ることはない）。
+/// `limiter` は呼び出し元が `match surface` の前に 1 回だけ構築したインスタンス
+/// を受け取る（SQL wire 側と同じ構築箇所・同じ定数・同じ型を共有する構造。
+/// 本ループが独自にリミッターを作ることはない）。
 pub fn accept_loop_with_limiter(
     listener: TcpListener,
     limiter: ConnectionLimiter,
@@ -77,6 +82,23 @@ pub fn accept_loop_with_limiter(
         read_timeout,
         Arc::new(conn::PlaceholderRouter),
     );
+}
+
+/// NoSQL 表層の accept ループ本体（production 入口。Issue #752）。
+/// [`crate::http::router::Router`] を使う [`accept_loop_with_handler`] の
+/// 薄いラッパー。`main.rs::run_server` が nosql 選択時に構築する `router` を
+/// そのまま渡す。
+///
+/// `limiter` は呼び出し元（`main.rs::run_server`）が `match surface` の前に
+/// 1 回だけ構築したインスタンスを受け取る（SQL wire 側と同じ構築箇所・同じ
+/// 定数・同じ型を共有する構造。本ループが独自にリミッターを作ることはない）。
+pub fn accept_loop_with_router(
+    listener: TcpListener,
+    limiter: ConnectionLimiter,
+    read_timeout: Duration,
+    router: Router,
+) {
+    accept_loop_with_handler(listener, limiter, read_timeout, Arc::new(router));
 }
 
 /// [`accept_loop_with_limiter`] の本体。SQL wire の

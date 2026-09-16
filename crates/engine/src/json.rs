@@ -208,6 +208,12 @@ impl<'a> JsonParser<'a> {
     fn parse_string(&mut self) -> Result<String, JsonError> {
         self.expect_byte(b'"')?;
         let mut out = String::new();
+        // 呼び出しのたびに `out.chars().count()` で文字列全体を再走査すると
+        // エスケープを多く含む入力で O(n^2) になる（未認証入力が到達し得る
+        // 経路で DoS になり得るため P0。codex-review PR #813 指摘）。
+        // 1 文字（またはバイト列片）を追加するたびに増分カウントし、
+        // 全体再走査を行わない O(n) 方式へ変更する。
+        let mut char_count: usize = 0;
         loop {
             let b = self.bump().ok_or(JsonError)?;
             match b {
@@ -281,10 +287,18 @@ impl<'a> JsonParser<'a> {
                     let Ok(s) = std::str::from_utf8(slice) else {
                         return Err(JsonError);
                     };
+                    // この 1 片ぶんの文字数だけを数える（`out` 全体は再走査しない）。
+                    char_count += s.chars().count();
                     out.push_str(s);
+                    if char_count > MAX_JSON_STRING_CHARS {
+                        return Err(JsonError);
+                    }
+                    continue;
                 }
             }
-            if out.chars().count() > MAX_JSON_STRING_CHARS {
+            // エスケープ経路はいずれも 1 文字だけを `out` へ追加する。
+            char_count += 1;
+            if char_count > MAX_JSON_STRING_CHARS {
                 return Err(JsonError);
             }
         }
