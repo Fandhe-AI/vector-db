@@ -24,9 +24,16 @@
 //!   TASK-173・HTTP-3, HTTP-11）
 //! - [`status`]: `ErrorClass` → HTTP ステータスの決定的射影（Issue #744・ERR-4）
 //! - [`error_body`]: `ErrorClass` → JSON エラー本文（Issue #745・ERR-4・ERR-5）
-//! - [`listener`]: `--surface nosql` の accept ループ stub（要求を読まず接続
-//!   を即クローズ。Issue #735・TASK-171／HTTP-1・HTTP-9）。`main.rs::run_server`
-//!   が SQL wire の [`crate::server::accept_loop_with_engine`] と排他選択で
+//! - [`conn`][]: 接続単位の暫定処理（読み取りタイムアウト超過・EOF・データ到着の
+//!   いずれでも応答なしでクローズする [`conn::handle_connection_interim`]、
+//!   同時接続数上限超過時に 503／`53300` を返す
+//!   [`conn::reject_too_many_connections`]。Issue #743・TASK-69・WIRE-5,
+//!   WIRE-6）
+//! - [`listener`]: `--surface nosql` の accept ループ本体
+//!   （[`listener::accept_loop_with_limiter`]。読み取り 30 秒タイムアウト・
+//!   同時接続数 64 の共有リミッターを SQL wire と同一契約で適用する。
+//!   Issue #735・#743・TASK-171／HTTP-1・HTTP-9）。`main.rs::run_server` が
+//!   SQL wire の [`crate::server::accept_loop_with_engine`] と排他選択で
 //!   呼ぶ唯一の呼び出し元
 //! - [`query`]: `POST /v1/query` の op 別写像の親モジュール（TASK-175。
 //!   `query::schema` が JSON クエリオブジェクトの意味的検証（必須キー欠落・
@@ -44,11 +51,12 @@
 //!   の対象外（後続 Issue の担当。[`session`] のモジュール doc を参照）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
-//! - 応答エンベロープ（ステータス行・`Connection: close`・`Content-Type`／
-//!   `Content-Length`・CRLF の組み立て。Issue #746）
+//! - 汎用の応答エンベロープ（ステータス行・`Connection: close`・
+//!   `Content-Type`／`Content-Length`・CRLF の組み立て。`conn::
+//!   encode_reject_response` は 503 応答専用の最小実装にとどまる。Issue #746）
 //! - `explain: true` 時の `{"explain":[...]}` 応答（#765）
-//! - 接続ハンドラ本体（[`listener::accept_loop_stub`] を置き換える有界読み取り・
-//!   EOF 時の無応答クローズ判断・panic 非伝播。Issue #747）
+//! - 接続ハンドラ本体（[`conn::handle_connection_interim`] を置き換える
+//!   要求パース・ルーティング・panic 非伝播。Issue #747）
 //! - op 語彙の許可リストと未知 op（`0A000`）判定・各 op の実行計画への写像
 //!   （Issue #759・#763・#766・#768 以降）
 //!
@@ -57,6 +65,7 @@
 //! ポインタ参照のみで、コード・所見は転記しない）。
 
 pub mod body;
+pub(crate) mod conn;
 pub mod error_body;
 pub mod headers;
 pub mod listener;
