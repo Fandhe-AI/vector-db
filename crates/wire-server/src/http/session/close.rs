@@ -12,9 +12,14 @@
 //! 1. [`crate::http::session::bearer::extract_bearer_token`] で
 //!    `Authorization: Bearer` を検証し [`crate::http::session::token::
 //!    SessionToken`] を取り出す（失敗はすべて `28000`）。**本文を読む前に
-//!    行う**——不正な本文を送りつけて `42601` に落とすことでトークンの
-//!    有無を推測させない（AC 2 の「Bearer 欠落は常に `28000`」を本文の
-//!    正しさに依存させない）
+//!    行う**——本ハンドラ内の本文検証（UTF-8・JSON・[`CLOSE_REQUEST_SCHEMA`]
+//!    のスキーマ）に限り、不正な本文を送りつけて `42601` に落とすことで
+//!    トークンの有無を推測させない（AC 2 の「Bearer 欠落は常に `28000`」を
+//!    本文の正しさに依存させない）。接続ハンドラ層（Issue #742。
+//!    `Content-Type` 不一致は `08P01`・`Content-Length` 上限超過は
+//!    `54000`）はこのハンドラより前段でルーティング前に確定するため、
+//!    その場合は Bearer 欠落であっても `28000` にはならず別コードで
+//!    先に落ちる契約であり、この保証の対象外
 //! 2. 本文を検証する。空本文（`Content-Length: 0`）、または
 //!    [`CLOSE_REQUEST_SCHEMA`]（フィールドを 1 つも持たない
 //!    [`crate::http::query::schema::ObjectSchema`]）を満たす JSON
