@@ -287,14 +287,19 @@ fn expired_token_is_rejected_on_query_and_close_with_28000_identically_to_unknow
     // 削除してしまい、後続の close 呼び出しは実質「未知トークンの拒否」
     // しか検証できず close 経路自身の TTL 失効判定を確認できない
     // （PR #817 codex-review 指摘）。
+    //
+    // 各トークンの有効性確認（1 回だけのプローブ）は、そのトークンの
+    // `login` 呼び出し直後・次の `login` を呼ぶ前に行う（発行 → 即プローブ
+    // → 次の発行、の順に直列化する）。2 回の `login` を先に済ませてから
+    // まとめてプローブすると、本番と共通の Argon2id KDF セマフォ（並行
+    // ログイン数を絞る待ち行列）の混雑度合い次第で 2 回目の `login` 完了
+    // までに [`SHORT_TTL`]（1.5 秒）の大半〜全部を消費し、token_for_query
+    // に対する「発行直後は有効」という前提が本番相当の実装でも崩れて
+    // テストが不安定化しうる（PR #817 codex-review 指摘）。発行直後に
+    // プローブすることでこの依存を断つ。
     let token_for_query = login(addr, "alice", "pw-alice");
-    let token_for_close = login(addr, "alice", "pw-alice");
-
-    // 発行直後は両方とも有効（TTL 1.5 秒に対し十分な余裕がある 1 回だけの
-    // プローブ）。query によるプローブは `lookup` を経由するが有効な間は
-    // エントリを消費しないため、token_for_close の期限切れ判定は後段の
-    // close 呼び出しが初めて行う。
     assert_query_accepted(&query_with_bearer(addr, &token_for_query));
+    let token_for_close = login(addr, "alice", "pw-alice");
     assert_query_accepted(&query_with_bearer(addr, &token_for_close));
 
     std::thread::sleep(EXPIRY_WAIT);
