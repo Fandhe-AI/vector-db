@@ -19,7 +19,14 @@
 //! → JSON 応答本文（`columns`／`rows`／`row_count`）への写像を担う
 //! （Issue #762・NOSQL-11）。[`scan`] は `op: "scan"` を
 //! `engine::sql::parser::BoundScan` へ束縛し `EngineCore` で実行する（Issue
-//! #766・TASK-176・NOSQL-3。結線済み）。[`gate`] は認証済み要求
+//! #766・TASK-176・NOSQL-3。結線済み）。[`search`] は `op: search` の JSON
+//! クエリオブジェクトを SQL 表層の `bind_in_session` と同一形の
+//! `engine::sql::parser::BoundStatement` へ束縛する（Issue #763・TASK-175・
+//! NOSQL-2。`vector`／`plan` 排他・`hybrid`／`mode`／`columns` の意味論は
+//! SQL 表層の既存公開関数へ委譲する）。`plan` 指定は LLM 展開が engine 内部
+//! I/O を要するため束縛済み部品のみの中間形 `PlanSearch` に留め、
+//! `BoundStatement` までの完成・実行結線・`gate.rs` の暫定応答
+//! （`PLACEHOLDER_MESSAGE`）置換は #764 の担当。[`gate`] は認証済み要求
 //! （`crate::http::session::middleware::SessionPrincipal`）に対する
 //! `POST /v1/query` の入口本体で、`tenant_id` 相当ヘッダの拒否・op 許可
 //! リスト判定・本文のスキーマ検証を行い、`engine` 接続済みの場合に限り
@@ -36,3 +43,4 @@ pub mod op;
 pub mod response;
 pub mod scan;
 pub mod schema;
+pub mod search;
