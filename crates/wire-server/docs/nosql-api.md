@@ -449,19 +449,138 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 
 ## エラー応答
 
-失敗時の本文形（緊急応答時のみ `data.state` が付く場合がある）:
+本節の数値・文言は spec 由来の閾値ではなく、`crates/wire-server/src/http/
+status.rs`（`wire_code` → HTTP ステータスの射影）・`error_body.rs`（JSON 本文
+エンコーダ）・`response.rs`（ステータス行・ヘッダ）を単一情報源とする実装
+既定値である（ERR-4・ERR-5 ポインタ）。表とコードの一致は
+`tests/nosql_api_doc.rs` が機械検証する。
+
+### 本文仕様
+
+通常応答の本文形（`http::error_body::encode`）:
 
 ```json
-{"error": {"wire_code": "42601", "code": "...", "message": "..."}}
+{"wire_code": "XX000", "code": "INTERNAL_ERROR", "message": "internal error"}
 ```
 
-`wire_code` → HTTP ステータスの全射影表・ラベル一覧・表↔コード一致テストは
-本文書では扱わない（別 Issue の担当。予約見出しのみ確保）。本文書の各 op 節
-（[op 別スキーマ](#op-別スキーマ)・[`filter` 配列](#filter-配列)・
-[`explain`](#explain)）では `wire_code` のみを示し、HTTP ステータス列は付けない。
-[セッション認証](#セッション認証)・[転送路の共通規則](#転送路の共通規則)節で
-触れた `401`／`503` は、`WWW-Authenticate` の付与条件・接続数上限の説明に必要な
-範囲でのみ言及している。
+- 実際にはトップレベルが `{"error": { ... }}` で包まれる。上の例はキー順・値の
+  固定を示すための `error` オブジェクトの中身のみの抜粋であり、下記の
+  golden 例が実際のトップレベル形を示す
+- キー順は `wire_code` → `code` → `message` →（緊急応答時のみ）`data` に固定。
+  空白を含まないコンパクト形・改行を含まない 1 行（0x20 未満のバイトを一切
+  含まない）
+- `code` は `ErrorClass::label()`（`SCREAMING_SNAKE_CASE`。人間可読な補助
+  ラベルであり、契約として確定しているのは `wire_code` のみ）
+- エスケープ規則: `"`・`\`・U+0000〜U+001F のみをエスケープする。
+  `\b`／`\t`／`\n`／`\f`／`\r` はよく使う短縮形、それ以外の一般制御文字は
+  小文字 `\u00xx`。非 ASCII（日本語・補助面文字を含む）・U+007F は
+  エスケープせず UTF-8 のまま透過する
+- `message` の契約: 固定の英語文言、または内部エラー時に固定文言へ
+  差し替えられた `WireError` 由来の値のみ（長さ上限あり）。他テナントの
+  データ・存在情報・内部詳細を含まない（存在オラクルを提供しない）。
+  利用者は `message` の具体的な文言そのものを契約として依存しないこと
+- 通常応答は `data` キーを**決して**含まない。緊急応答専用の
+  `encode_may_be_committed` と本文組み立てが構造的に分離されている
+  （[緊急応答の `data`](#緊急応答の-data) を参照）
+
+golden 例（`ErrorClass::InternalError`・`message="internal error"` から
+`error_body::encode`／`encode_may_be_committed` が実際に返す本文。
+バイト単位で一致することをテストが固定する）:
+
+```json
+{"error":{"wire_code":"XX000","code":"INTERNAL_ERROR","message":"internal error"}}
+```
+
+```json
+{"error":{"wire_code":"XX000","code":"INTERNAL_ERROR","message":"internal error","data":{"state":"may_be_committed"}}}
+```
+
+### ステータス行・ヘッダ
+
+```text
+HTTP/1.1 400 Bad Request
+Content-Type: application/json; charset=utf-8
+Content-Length: <本文バイト長>
+Connection: close
+Date: <IMF-fixdate>
+```
+
+- `Content-Type` は常に `application/json; charset=utf-8`
+- `Content-Length` は本文の実バイト長（`Content-Type` と同じく必須固定ヘッダ）
+- `Connection: close` を常に付ける（1 応答ごとに接続を閉じる。
+  [転送路の共通規則](#転送路の共通規則)参照）
+- `Date` は RFC 9110 IMF-fixdate。システムクロックが `UNIX_EPOCH` より前の
+  異常値を指す場合でも応答送出自体は止めず、`UNIX_EPOCH` 相当へ fail-closed
+  に縮退する（可用性を優先し `Date` の正確性を犠牲にする設計判断）
+- `401`（`AuthRequired`／`AuthInvalid`）応答のみ、RFC 9110 §11.6.1 が要求する
+  認証チャレンジとして `WWW-Authenticate: Bearer` を追加する。他のステータス
+  では付与しない
+- 射影表の値域（`{400, 401, 403, 404, 409, 413, 500, 501, 503}`）外のステータス
+  が渡された場合、理由句を捏造せず `500`＋`XX000` 固定本文へ fail-closed に
+  縮退する。`ErrorClass` の値域は `#[deny(clippy::wildcard_enum_match_arm)]`
+  で網羅性が強制されるため、現状はこの縮退経路自体が到達不能な防波堤
+
+### `wire_code` → HTTP ステータス射影表
+
+「1 つの `wire_code` → 常に 1 つの HTTP ステータス」の方向にのみ 1:1 の射影
+であり、逆方向（ステータス → `wire_code`）は 1:1 ではない（例えば `400` は
+6 分類が共有する）。
+
+| `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
+| --- | --- | --- | --- | --- |
+| `08P01` | `PROTOCOL_VIOLATION` | 400 | Bad Request | 要求行・ヘッダ形状違反、未知ターゲットへのアクセス |
+| `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |
+| `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー |
+| `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
+| `23502` | `MISSING_OPERATION_ID` | 400 | Bad Request | `insert` の `operation_id` 欠落 |
+| `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
+| `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
+| `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
+| `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
+| `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
+| `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
+| `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | `insert` の `operation_id` 重複（内容一致の再送） |
+| `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過 |
+| `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
+| `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
+| `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
+
+到達不能な 2 分類（`42501`・`P0002`）の理由: NoSQL 表層はテナントを
+セッション（`SessionPrincipal::policy_context()`）からのみ導出し、
+クライアント自己申告の `tenant_id` 相当値は JSON／ヘッダ／パスいずれの
+位置でも `42601` で先に拒否するため、`ForbiddenTenantMismatch` を実要求から
+誘発する経路が構造的に存在しない。`RowNotFound` に対応する op（更新・削除系）
+も NoSQL 表層の許可リストに無い。テナント境界の検査を緩める・バイパスする
+production 経路をこの 2 分類のために新設することはせず（`.claude/rules/
+security.md` P0）、射影表としての一致のみを production の応答エンコーダ経由で
+固定する。
+
+本節の各 op スキーマ節（[op 別スキーマ](#op-別スキーマ)・
+[`filter` 配列](#filter-配列)・[`explain`](#explain)）では引き続き
+`wire_code` のみを示す。HTTP ステータスを引く際は本表を参照すること。
+
+### 緊急応答の `data`
+
+`data` キーは緊急応答（ERR-5・`RECOVER-5` (3) ポインタ。commit 成功境界を
+跨いだ panic 時に「commit は成功しているかもしれない」ことを伝える契約）
+にのみ付き、通常応答の直後の 3 キーに加えて
+`"data":{"state":"may_be_committed"}` を追加する（golden 例は
+[本文仕様](#本文仕様)を参照）。SQL 表層側（`ErrorResponse` の `D` フィールド
+`state=may_be_committed`）と状態語を共有しており、両表層で乖離しないことを
+テストで固定している。
+
+**現状の到達性**: `http::response::encode_error_may_be_committed` を呼び出す
+production 経路は本リポジトリの `http/` 配下にまだ存在せず、commit 成功境界を
+跨いだ panic は RECOVER-8 の panic hook が既にプロセス abort へ倒すため、
+NoSQL 表層の実要求からは `data` 付き応答は現時点で観測できない。エンコーダの
+契約としては予約済みであり、production 経路が接続された場合に備えてここに
+記載する。
+
+利用者向け指針（接続され次第有効になる契約。現時点では観測不能）:
+`data.state == "may_be_committed"` を受け取った場合、同一 `operation_id` で
+`insert` を再送し、台帳照合の結果（内容一致なら `23505`・不一致なら
+`22023`）で確定させる。これは `insert` の既存の再送契約をそのまま使うもので
+あり、`data` 付き応答専用の新たな再送契約を追加するものではない。
 
 ## curl 例
 
@@ -505,7 +624,7 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `http_insert_response_boundary.rs`・`wire_insert_operation_id.rs`
 - `filter`: `nosql7_filter_mapping.rs`
 - 応答形: `nosql11_response_schema.rs`
-- エラー射影: `err4_http_projection.rs`
+- エラー射影: `err4_http_projection.rs`・`nosql_api_doc.rs`
 
 ## spec 側への申し送り候補
 
