@@ -360,7 +360,15 @@ fn err4_b_schema_violation_projects_42601_to_400() {
     assert_projected(&resp, "42601");
 }
 
-// --- (c) op 語彙外／語彙内だが未対応 → 0A000／501 --------------------------
+// --- (c) op 語彙外 → 0A000／501 ---------------------------------------------
+//
+// 「語彙内だが未対応」の従来サブケース（aggregate の explain: true）は
+// NOSQL-10（Issue #765）の実装完了により `42601` へ写像されるようになり
+// 本クラスの例として成立しなくなったため撤去した（base ブランチ取り込みに
+// 伴う意味論変化。PR #832）。`engine` 未接続（`Router::new` 経由）時の
+// 全 op プレースホルダー応答は `crates/wire-server/src/http/query/gate.rs`
+// の単体テスト（`valid_scan_reaches_placeholder_response_when_engine_is_not_connected`
+// 等）で別途固定済み。
 
 #[test]
 fn err4_c_unsupported_op_projects_0a000_to_501() {
@@ -369,13 +377,6 @@ fn err4_c_unsupported_op_projects_0a000_to_501() {
 
     // 語彙外 op。
     let resp = query_as_alice(addr, br#"{"op":"delete","table":"docs"}"#);
-    assert_projected(&resp, "0A000");
-
-    // 語彙内だが未対応（aggregate の explain: true。NOSQL-10 未実装）。
-    let resp = query_as_alice(
-        addr,
-        br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"explain":true}"#,
-    );
     assert_projected(&resp, "0A000");
 }
 
