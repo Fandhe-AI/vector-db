@@ -13,7 +13,9 @@ use engine::row_codec::Value;
 use engine::sql::aggregate::execute_aggregate;
 use engine::sql::allowlist::{validate_sql, AggregateFunc, Statement};
 use engine::sql::exec::Cell;
-use engine::sql::parser::{bind_aggregate, AggregateTarget, BoundAggregate, BoundAggregateItem};
+use engine::sql::parser::{
+    bind_aggregate, AggregateTarget, BoundAggregate, BoundAggregateItem, HavingOp, HavingSpec,
+};
 use engine::sql::udf_call::UdfRegistry;
 use engine::storage::{Storage, Visibility};
 use redb::ReadableDatabase;
@@ -435,4 +437,241 @@ fn bound_aggregate_item_bind_rejects_unknown_column() {
     )
     .expect_err("unknown column must be rejected");
     assert_eq!(err.wire_code(), "22000");
+}
+
+// --- Issue #769・TASK-186・NOSQL-5: `BoundAggregate::new_grouped`
+// （SQL テキスト非経由の `GROUP BY`／`HAVING` 直接構築）の到達性・SQL 経路との
+// 同一結果契約 ----------------------------------------------------------------
+
+/// `BoundAggregate::new_grouped` で組んだ計画が、等価な SQL テキスト
+/// （`validate_sql` → `bind_aggregate`）から得た `BoundAggregate` と完全一致
+/// することを固定する（NOSQL-5 の「SQL 表層と同一結果」契約の中核）。
+#[test]
+fn bound_aggregate_new_grouped_matches_sql_text_bind() {
+    let path = unique_db_path("sql-aggregate-public-api-new-grouped-matches-sql");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let schema_val = storage.get_table_schema(TABLE).expect("get_table_schema");
+
+    let sql = "SELECT lang, COUNT(*), SUM(id) FROM docs GROUP BY lang HAVING count >= 2";
+    let validated = validate_sql(sql, &storage).expect("validate_sql should accept group by form");
+    let Statement::Aggregate(validated_aggregate) = validated else {
+        panic!("expected Statement::Aggregate");
+    };
+    let via_sql = bind_aggregate(&validated_aggregate, &schema_val, &UdfRegistry::default())
+        .expect("bind_aggregate should succeed");
+
+    let items = vec![
+        BoundAggregateItem::bind(AggregateFunc::Count, AggregateTarget::Star, &schema_val)
+            .expect("count(*) should bind"),
+        BoundAggregateItem::bind(
+            AggregateFunc::Sum,
+            AggregateTarget::Column("id".to_string()),
+            &schema_val,
+        )
+        .expect("sum(id) should bind"),
+    ];
+    let having = vec![HavingSpec {
+        item_index: 0,
+        op: HavingOp::Ge,
+        literal: 2.0,
+    }];
+    let via_direct = BoundAggregate::new_grouped(
+        TABLE.to_string(),
+        items,
+        Vec::new(),
+        Vec::new(),
+        "lang",
+        having,
+        &schema_val,
+    )
+    .expect("new_grouped should succeed");
+
+    assert_eq!(via_direct, via_sql);
+}
+
+/// `execute_aggregate` を通し、直接構築した `GROUP BY`／`HAVING` 計画が
+/// SQL テキスト経由と同一の実行結果（RLS 境界を含む）になることを固定する。
+#[test]
+fn execute_aggregate_dispatches_new_grouped_plan_without_caches() {
+    let path = unique_db_path("sql-aggregate-public-api-new-grouped-execute");
+    let _guard = CleanupGuard(path.clone());
+
+    let (schema_val, bound) = {
+        let storage = Storage::open(&path).expect("open storage");
+        seed_two_tenants(&storage);
+        let schema_val = storage.get_table_schema(TABLE).expect("get_table_schema");
+        let items = vec![BoundAggregateItem::bind(
+            AggregateFunc::Count,
+            AggregateTarget::Star,
+            &schema_val,
+        )
+        .expect("count(*) should bind")];
+        let bound = BoundAggregate::new_grouped(
+            TABLE.to_string(),
+            items,
+            Vec::new(),
+            Vec::new(),
+            "lang",
+            Vec::new(),
+            &schema_val,
+        )
+        .expect("new_grouped should succeed");
+        assert!(bound.has_group_by());
+        (schema_val, bound)
+    };
+
+    let db = redb::Database::open(&path).expect("reopen raw database");
+    let read_txn = db.begin_read().expect("begin_read");
+    let ctx_a = ctx_for("tenant-a");
+
+    // tenant-b 専有のグループ値 `"xx"` は現れない（RLS-7・RLS-8）。`ORDER BY`
+    // 省略時の既定順はグループキーのバイト順昇順（"en" < "ja"）。
+    let result = execute_aggregate(&read_txn, &ctx_a, &schema_val, &bound)
+        .expect("execute_aggregate should dispatch to group by execution");
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0].cells[0], Cell::Text("en".to_string()));
+    assert_eq!(result.rows[0].cells[1], Cell::Integer(2));
+    assert_eq!(result.rows[1].cells[0], Cell::Text("ja".to_string()));
+    assert_eq!(result.rows[1].cells[1], Cell::Integer(3));
+}
+
+/// `GROUP BY` 列が `TEXT` 列でない（`VECTOR`・疑似列 `id`・未知列）場合は
+/// `22000` で拒否する（SQL テキスト経由の `bind_group_by_clause` と同じ分類）。
+#[test]
+fn bound_aggregate_new_grouped_rejects_non_text_group_by_column() {
+    let schema_val = schema();
+    let items =
+        vec![
+            BoundAggregateItem::bind(AggregateFunc::Count, AggregateTarget::Star, &schema_val)
+                .expect("count(*) should bind"),
+        ];
+    for column in ["embedding", "id", "nope"] {
+        let err = BoundAggregate::new_grouped(
+            TABLE.to_string(),
+            items.clone(),
+            Vec::new(),
+            Vec::new(),
+            column,
+            Vec::new(),
+            &schema_val,
+        )
+        .expect_err("non-TEXT group by column must be rejected");
+        assert_eq!(err.wire_code(), "22000", "column={column}");
+    }
+}
+
+/// `HAVING` が `MIN`/`MAX(<TEXT 列>)` を参照すると `22000`（`COUNT(<TEXT 列>)`
+/// は許可。SQL テキスト経由の `check_having_target_is_numeric` を共有）。
+#[test]
+fn bound_aggregate_new_grouped_rejects_having_on_text_min_max() {
+    let schema_val = schema();
+    let items = vec![BoundAggregateItem::bind(
+        AggregateFunc::Min,
+        AggregateTarget::Column("lang".to_string()),
+        &schema_val,
+    )
+    .expect("min(lang) should bind")];
+    let having = vec![HavingSpec {
+        item_index: 0,
+        op: HavingOp::Ge,
+        literal: 1.0,
+    }];
+    let err = BoundAggregate::new_grouped(
+        TABLE.to_string(),
+        items,
+        Vec::new(),
+        Vec::new(),
+        "lang",
+        having,
+        &schema_val,
+    )
+    .expect_err("HAVING on MIN(TEXT) must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+/// `HAVING` の `item_index` が `items` の範囲外なら `22000`。
+#[test]
+fn bound_aggregate_new_grouped_rejects_having_item_index_out_of_range() {
+    let schema_val = schema();
+    let items =
+        vec![
+            BoundAggregateItem::bind(AggregateFunc::Count, AggregateTarget::Star, &schema_val)
+                .expect("count(*) should bind"),
+        ];
+    let having = vec![HavingSpec {
+        item_index: 1,
+        op: HavingOp::Ge,
+        literal: 1.0,
+    }];
+    let err = BoundAggregate::new_grouped(
+        TABLE.to_string(),
+        items,
+        Vec::new(),
+        Vec::new(),
+        "lang",
+        having,
+        &schema_val,
+    )
+    .expect_err("out-of-range item_index must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+/// `HAVING` 述語数が [`engine::sql::allowlist::MAX_AGGREGATE_ITEMS`] を超過
+/// すると `54000`（`Vec` 確保前の検査）。
+#[test]
+fn bound_aggregate_new_grouped_rejects_having_predicate_count_over_limit() {
+    let schema_val = schema();
+    let items =
+        vec![
+            BoundAggregateItem::bind(AggregateFunc::Count, AggregateTarget::Star, &schema_val)
+                .expect("count(*) should bind"),
+        ];
+    let max = engine::sql::allowlist::MAX_AGGREGATE_ITEMS;
+    let having: Vec<HavingSpec> = (0..=max)
+        .map(|_| HavingSpec {
+            item_index: 0,
+            op: HavingOp::Ge,
+            literal: 1.0,
+        })
+        .collect();
+    let err = BoundAggregate::new_grouped(
+        TABLE.to_string(),
+        items,
+        Vec::new(),
+        Vec::new(),
+        "lang",
+        having,
+        &schema_val,
+    )
+    .expect_err("over-limit HAVING predicate count must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+}
+
+/// `HAVING` の `literal` が非有限なら `42601`。
+#[test]
+fn bound_aggregate_new_grouped_rejects_non_finite_having_literal() {
+    let schema_val = schema();
+    let items =
+        vec![
+            BoundAggregateItem::bind(AggregateFunc::Count, AggregateTarget::Star, &schema_val)
+                .expect("count(*) should bind"),
+        ];
+    let having = vec![HavingSpec {
+        item_index: 0,
+        op: HavingOp::Ge,
+        literal: f64::INFINITY,
+    }];
+    let err = BoundAggregate::new_grouped(
+        TABLE.to_string(),
+        items,
+        Vec::new(),
+        Vec::new(),
+        "lang",
+        having,
+        &schema_val,
+    )
+    .expect_err("non-finite HAVING literal must be rejected");
+    assert_eq!(err.wire_code(), "42601");
 }

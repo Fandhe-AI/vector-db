@@ -18,8 +18,9 @@
 //!
 //! 対象外（後続 Issue の担当。二重実装しない）:
 //! - フィールド値の**語彙・範囲**検査（`filter[].op` の `eq`／`prefix`、
-//!   `aggregates[].fn` の関数名、`limit` の非負性等。#761・#763・#766・
-//!   #768・#769）
+//!   `aggregates[].fn`／`having[].fn`／`having[].op` の関数名・演算子語彙、
+//!   `limit` の非負性等。#761・#763・#766・#768。`group_by`／`having` の
+//!   意味検証は [`super::aggregate`]（#769）が担う）
 //! - `insert` の `operation_id` 欠落／`null`／空文字 → `23502`、`rows[*]` の
 //!   列検証（#771）
 //!
@@ -554,7 +555,8 @@ pub static SCAN_SCHEMA: ObjectSchema = ObjectSchema {
 };
 
 /// `aggregate` op のトップレベルスキーマ（NOSQL-4〜NOSQL-7 ポインタ）。
-/// `group_by`／`having` の意味検証は #769 が担う。
+/// `group_by`／`having` の意味検証（語彙・列名解決・上限判定）は
+/// [`super::aggregate`]（#769）が担う。
 pub static AGGREGATE_SCHEMA: ObjectSchema = ObjectSchema {
     name: "aggregate",
     fields: &[
