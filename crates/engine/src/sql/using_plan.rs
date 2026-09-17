@@ -123,7 +123,7 @@ pub(crate) fn pre_check_bindable(
     stmt: &ValidatedStatement,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
-) -> Result<PreCheckShape, SqlSurfaceError> {
+) -> Result<crate::sql::explain::ExplainShape, SqlSurfaceError> {
     if let Some(literal) = stmt.search_mode() {
         crate::sql::mode::SearchMode::parse_literal(literal)?;
     }
@@ -133,39 +133,14 @@ pub(crate) fn pre_check_bindable(
     parser::bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
     let (metadata_filters, expr_filters, _rls_predicate_present) =
         parser::bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
-    // Issue #474: `EXPLAIN` の `scalar_plan:` 行（`sql::explain`）が要求する
-    // 静的判定。`USING PLAN` は `HINT ORDER` を受理しない（SQL-5・許可リスト層）
-    // ため `scalar_prefilter` は常に `true`（`sql::exec` の SCALAR 段は常に
-    // DISTANCE 段より先に評価される）。
-    let scalar_plan =
-        crate::sql::scalar_plan::classify_scalar_plan(&crate::sql::scalar_plan::ScalarShapeInput {
-            scalar_prefilter: true,
-            metadata_filters: &metadata_filters,
-            expr_filters: &expr_filters,
-        });
-    Ok(PreCheckShape {
-        filters_empty: metadata_filters.is_empty() && expr_filters.is_empty(),
-        scalar_plan,
-    })
-}
-
-/// [`pre_check_bindable`] が束縛結果自体は破棄しつつ、`EXPLAIN`（Issue #411・
-/// `sql::explain`）の ANN 静的判定（`sql::hnsw_cache::classify_ann_plan`）が
-/// 必要とする形状情報のみを持ち帰るための最小限の戻り値。
-///
-/// `WHERE visible()`（[`crate::sql::parser::WherePredicate::PredicateCall`]）は
-/// `bind_where_predicates` の `rls_predicate_present` フラグを立てるだけで
-/// `metadata_filters`／`expr_filters` を増やさないため、`stmt.where_predicates()`
-/// が非空でも `filters_empty` は `true` になりうる（`sql::exec` の
-/// `bound.metadata_filters.is_empty() && bound.expr_filters.is_empty()` と
-/// 同じ定義。呼び出し元 `core.rs` はこの値を `stmt.where_predicates().is_empty()`
-/// で代替してはならない）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PreCheckShape {
-    pub(crate) filters_empty: bool,
-    /// Issue #474: `sql::explain` の `scalar_plan:` 行が要求する静的判定
-    /// （[`crate::sql::scalar_plan::classify_scalar_plan`] の結果）。
-    pub(crate) scalar_plan: crate::sql::scalar_plan::ScalarPlan,
+    // Issue #474・#765: `EXPLAIN` の `scalar_plan:` 行（`sql::explain`）が
+    // 要求する静的判定は [`crate::sql::explain::ExplainShape::from_filters`]
+    // （`scalar_prefilter: true` 固定。`USING PLAN` は `HINT ORDER` を受理
+    // しないため SCALAR 段は常に DISTANCE 段より先に評価される）へ委譲する。
+    Ok(crate::sql::explain::ExplainShape::from_filters(
+        &metadata_filters,
+        &expr_filters,
+    ))
 }
 
 /// `stmt`（`using_plan()` が `Some` である前提）・展開結果 `expansion`・埋め込み

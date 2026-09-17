@@ -24,16 +24,19 @@
 //!    `SET search_mode` 相当フィールドはここで未知キーとして拒否される）
 //! 5. `op` と `engine`（接続済み `EngineCore`。`Router::new` 経由では
 //!    `None`・`Router::with_engine` 経由でのみ `Some`）の組でディスパッチ
-//!    する。`(Op::Scan, Some(engine))` は [`crate::http::query::scan::
+//!    する。`(Op::Search, Some(engine))` かつ `explain: true` は
+//!    [`super::explain::handle`]（TASK-186・NOSQL-10・Issue #765。検索本体を
+//!    実行せず `QUERY PLAN` を返す。通常の `search` 実行より必ず先に
+//!    判定される）、`(Op::Scan, Some(engine))` は [`crate::http::query::scan::
 //!    handle`]（TASK-186・NOSQL-3・Issue #766）、`(Op::Aggregate,
 //!    Some(engine))` は [`super::aggregate::handle`]（Issue #768・
-//!    TASK-177・NOSQL-4）、`(Op::Insert, Some(engine))` は
-//!    [`super::insert::handle`]（Issue #772・TASK-178・NOSQL-6）、
-//!    `(Op::Search, Some(engine))` は [`super::search::handle`]（TASK-186・
-//!    NOSQL-2・Issue #764）へそれぞれ束縛・実行を委譲する。`engine` 未接続時
-//!    の `Op::Scan`／`Op::Aggregate`／`Op::Insert`／`Op::Search` は暫定の
-//!    `0A000`／501（[`PLACEHOLDER_MESSAGE`]）を返す（4 op すべてが実行結線
-//!    済みのため、この応答は `engine` 未接続時にのみ到達する）
+//!    TASK-177・NOSQL-4）、`explain` なしの `(Op::Search, Some(engine))` は
+//!    [`super::search::handle`]（TASK-186・NOSQL-2・Issue #764）、
+//!    `(Op::Insert, Some(engine))` は [`super::insert::handle`]（Issue
+//!    #772・TASK-178・NOSQL-6）へそれぞれ束縛・実行を委譲する。`engine`
+//!    未接続時の `Op::Scan`／`Op::Aggregate`／`Op::Insert`／`Op::Search` は
+//!    暫定の `0A000`／501（[`PLACEHOLDER_MESSAGE`]）を返す（4 op すべてが
+//!    実行結線済みのため、この応答は `engine` 未接続時にのみ到達する）
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
 //! `op` にスキーマ検証由来の情報（未知キー等）が先に返ることはない
@@ -50,6 +53,7 @@ use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::parse_json;
 
 use crate::http::query::op::{classify_op, Op};
+use crate::http::query::schema::Validated;
 use crate::http::query::{insert, scan};
 use crate::http::session::middleware::{self, SessionPrincipal};
 use crate::http::{body, response};
@@ -57,9 +61,10 @@ use crate::http::{body, response};
 pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 
 /// 検証を通過したが実行結線が未接続（`engine` 未接続）の要求に返す暫定応答
-/// の文言。`scan`・`aggregate`・`insert`・`search` の 4 op すべてが実行結線
-/// 済み（Issue #766・#768・#772・#764）のため、この応答は `Router::new`
-/// 経由（`engine` 未接続）の場合にのみ到達する。
+/// の文言。`scan`・`aggregate`・`insert`・`search`（`explain: true` の
+/// `search` を含む）の 4 op すべてが実行結線済み（Issue #766・#768・
+/// #772・#764・#765）のため、この応答は `Router::new` 経由（`engine`
+/// 未接続）の場合にのみ到達する。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
 
 /// `POST /v1/query` を処理し応答バイト列を返す（認証済み要求のみ）。
@@ -111,6 +116,14 @@ pub fn handle(
     // 4 op すべてが実行結線済みのため `(_, _)` は `engine` 未接続時にのみ
     // 到達する。
     match (op, engine) {
+        // `explain: true` は通常の `search` 実行（#764 が結線する
+        // `(Op::Search, Some(engine)) => search::handle(...)` 相当）より
+        // 必ず先に判定する（Issue #765・TASK-186・NOSQL-10）。`explain: true`
+        // が構造的に実行経路へ落ちないことを match の腕の順序自体で保証する
+        // （`aggregate.rs::reject_explain` と同じ fail-open 防止の思想）。
+        (Op::Search, Some(engine)) if explain_requested(&validated) => {
+            super::explain::handle(engine, principal, &validated, now_wall)
+        }
         (Op::Scan, Some(engine)) => scan::handle(engine, principal, &validated, now_wall),
         (Op::Aggregate, Some(engine)) => {
             super::aggregate::handle(engine, principal, &validated, now_wall)
@@ -125,6 +138,15 @@ pub fn handle(
             now_wall,
         ),
     }
+}
+
+/// `validated`（`Op::Search` のスキーマ検証済み要求）が `explain: true` を
+/// 伴うかを判定する（Issue #765）。`optional_bool` の `Err`（多層防御の域。
+/// `SEARCH_SCHEMA` 検証を既に通過しているため通常到達しない）は `false`
+/// 扱いにせず、後段のスキーマ検証と同じ判定経路（`(_, _)` アーム）へ
+/// 委ねる意図で `matches!` により厳密に `Ok(Some(true))` のみを真とする。
+fn explain_requested(validated: &Validated<'_>) -> bool {
+    matches!(validated.optional_bool("explain"), Ok(Some(true)))
 }
 
 #[cfg(test)]

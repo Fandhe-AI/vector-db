@@ -40,8 +40,13 @@
 //! `{"inserted","operation_id"}`（[`insert::encode_success_body`]）を
 //! `gate.rs` の `Op::Insert` アームへ結線する
 //! （Issue #771・#772・TASK-178・NOSQL-6・TABLE-12・RLS-9）。
+//! [`explain`] は `op: search`・`explain: true` を検索本体を実行せず
+//! `EngineCore::explain_bound_plan_in_session` へ写像し、SQL `EXPLAIN
+//! SELECT ... USING PLAN(...)` と同一内容の `{"explain":[...]}` 応答を返す
+//! （Issue #765・TASK-186・NOSQL-10。`vector` 指定・`plan` 未指定は `42601`）。
 
 pub mod aggregate;
+pub mod explain;
 pub mod filter;
 pub mod gate;
 pub mod ident;
