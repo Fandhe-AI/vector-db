@@ -404,8 +404,12 @@ fn explicit_columns_row_set_matches_sql_oracle_ignoring_order() {
     assert_eq!(row_count, rows.len() as u64);
 
     let oracle_body = sql_oracle_body(&core, "tenant-a", "SELECT id, lang FROM docs LIMIT 10");
-    let (oracle_columns, oracle_rows, _oracle_row_count) = parse_body_str(&oracle_body);
+    let (oracle_columns, oracle_rows, oracle_row_count) = parse_body_str(&oracle_body);
     assert_eq!(columns, oracle_columns);
+    // `id_lang_set` は `BTreeSet` へ変換するため重複行を握りつぶす。行数を
+    // 先に照合し、HTTP 側が同じ行を余分に返す重複混入を検出できるように
+    // する（件数が一致して初めて集合比較の等値性に意味がある）。
+    assert_eq!(rows.len() as u64, oracle_row_count);
     assert_eq!(
         id_lang_set(&columns, &rows),
         id_lang_set(&oracle_columns, &oracle_rows)
@@ -450,7 +454,11 @@ fn filter_eq_row_set_matches_sql_where_oracle() {
         "tenant-a",
         "SELECT id, lang FROM docs WHERE lang = 'ja' LIMIT 10",
     );
-    let (oracle_columns, oracle_rows, _oracle_row_count) = parse_body_str(&oracle_body);
+    let (oracle_columns, oracle_rows, oracle_row_count) = parse_body_str(&oracle_body);
+    // `id_lang_set` は `BTreeSet` へ変換するため重複行を握りつぶす。行数を
+    // 先に照合し、HTTP 側が同じ行を余分に返す重複混入を検出できるように
+    // する（件数が一致して初めて集合比較の等値性に意味がある）。
+    assert_eq!(rows.len() as u64, oracle_row_count);
     assert_eq!(
         id_lang_set(&columns, &rows),
         id_lang_set(&oracle_columns, &oracle_rows)
