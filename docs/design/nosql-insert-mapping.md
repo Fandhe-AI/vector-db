@@ -98,12 +98,18 @@
   参照）。
 - 契約全体（`operation_id` 必須化・台帳照合による再送判定・INDEX-4 処理量
   上限・TABLE-12 同一テナント内 `id` 衝突・RLS-9 秘匿）の層 A 結合テスト群を
-  `crates/wire-server/tests/nosql6_insert.rs` として追加（Issue #773）:
+  `crates/wire-server/tests/nosql6_insert.rs` として追加（Issue #773。
+  codex-review 指摘・PR #830 で②の境界値検証を追加）:
   production ルータ経由（生バイトクライアント）で `23502`（欠落・`null`・
   空文字の 3 状態）・`23505`／`22023`（台帳照合。表層を跨いだ再送判定の
   一致を含む）・INDEX-4 の 4 上限（①③④は engine 公開 API・SQL 文字列
-  バッチとのパリティを含む。②は行形では `TEXT`／`VECTOR` 長のみが対象の
-  ため対象外）・束縛エラー（空 `rows`・バッチ内 `id` 重複・未存在テーブル・
+  バッチとのパリティを含む。②は行形では `TEXT`／`VECTOR` 長の合計値が
+  `execute_bound_insert_in_session` 判定 6 を通じて `batch_limits::
+  validate_batch_shape` の同じ per-file 上限へそのまま適用されるため、
+  行形でも上限ちょうど（受理）／上限未満（`54000`・副作用なし）の境界を
+  検証する。①③④との「SQL 経路とのパリティ」主張はファイル形の概念
+  （複数ファイルのバッチ投入）に紐づくため、行の合計バイト長を対象とする
+  ②単体では主張しない）・束縛エラー（空 `rows`・バッチ内 `id` 重複・未存在テーブル・
   判定順序）・TABLE-12 同一テナント内 `id` 衝突（SQL wire との `message`
   一致）・RLS-9（他テナント保持行の有無で重複拒否応答バイト列が完全一致
   すること）・拒否の連続がセッショントークンを損なわないことを固定する。

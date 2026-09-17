@@ -604,6 +604,36 @@ fn rows_over_max_files_per_batch_matches_sql_batch_wire_code() {
 }
 
 #[test]
+fn rows_over_max_file_body_bytes_is_54000_without_side_effects() {
+    // ②（1 行あたり最大本文サイズ）は `execute_bound_insert_in_session` 判定 6 が
+    // 行ごとのバイト量（`embedding VECTOR(3)` = 12 バイト/行。`lang` 省略で
+    // 0 バイト寄与）を `(0, row_bytes)` として `batch_limits::validate_batch_shape`
+    // へ渡すことで行形にも適用される（`core.rs` 判定 6 のドキュメント参照。
+    // codex-review 指摘: 他の C1〜C4 テストは max_file_body_bytes を 10_000 と
+    // 十分大きく固定しているため②単体では発火しない。本テストは③④を
+    // 十分大きくして②のみを発火させ、上限ちょうど（12）は成功・
+    // 上限未満（11）は拒否・副作用なしであることを固定する）。
+    let (core, _guard) = new_core(Some(limits(10, 11, 10_000, 10_000)));
+    let (both, _sql) = spawn_both(core.clone());
+
+    let resp = query(&both, &insert_body_n_rows(1, "nosql-op-file-body-bytes"));
+    assert_eq!(resp.status, 413, "body={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "54000");
+    assert_eq!(
+        ledger_state(&core, "nosql-op-file-body-bytes"),
+        LedgerLookup::NotRecorded
+    );
+    assert!(read_back_ids(&core).is_empty());
+
+    // 境界値（上限ちょうど＝12 バイト）は成功する。
+    let (core, _guard) = new_core(Some(limits(10, 12, 10_000, 10_000)));
+    let (both, _sql) = spawn_both(core.clone());
+    let ok = query(&both, &insert_body_n_rows(1, "nosql-op-file-body-bytes"));
+    let (inserted, _) = parse_insert_success_body(&ok);
+    assert_eq!(inserted, 1);
+}
+
+#[test]
 fn rows_over_max_batch_total_bytes_is_54000() {
     // `embedding VECTOR(3)` = 12 バイト/行（`lang` 省略で 0 バイト寄与）。
     // 1 行（12 バイト）は通り、2 行（24 バイト）は max_batch_total_bytes=20 を
