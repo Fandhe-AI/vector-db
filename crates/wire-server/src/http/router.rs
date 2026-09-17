@@ -35,11 +35,12 @@
 //! `42601` を返す。両者の優先順位は本リポの実装上の判断であり、
 //! spec 側での明文化は申し送り事項とする（Issue #758 実装記録参照）。
 //!
-//! op 許可リストの正式化（Issue #759）は完了済み。`scan` op の束縛・実行
-//! （TASK-186・NOSQL-3・Issue #766）・`aggregate` op の束縛・実行
-//! （Issue #768）・`insert` op の束縛・実行（Issue #771・#772）は
-//! [`crate::http::query::gate::handle`] へ `engine` を渡すことで結線済みで、
-//! `search`（#764）は引き続き別 Issue が本ルータ以降の層へ追記する。
+//! op 許可リストの正式化（Issue #759）は完了済み。`search`（TASK-186・
+//! NOSQL-2・Issue #764）・`scan`（TASK-186・NOSQL-3・Issue #766）・
+//! `aggregate`（Issue #768）・`insert`（Issue #771・#772）の 4 op すべての
+//! 束縛・実行は [`crate::http::query::gate::handle`] へ `engine` を渡すことで
+//! 結線済み（`engine` 未接続の [`Router::new`] 経由時のみ全 op が暫定
+//! `0A000`／501 を返す）。
 //!
 //! メソッド（`POST` 以外を拒否）は [`crate::http::conn`] が要求行パース時点で
 //! 既に絞り込み済み（[`crate::http::request::Method`] は `Post` の 1 variant
@@ -150,10 +151,11 @@ fn resolve_target(target: &str) -> Route {
 /// production 入口のルータ。`users`（ユーザーストアの共有ハンドル）・
 /// `sessions`（[`SessionStore`]。`Clone` で内部状態を共有する型のため、
 /// `Router` 自身は `Arc` で包まず値として保持する）を束ねる。`engine` は
-/// `/v1/query` の `scan`（TASK-186・NOSQL-3・Issue #766）・`aggregate`
-/// （Issue #768）・`insert`（Issue #771・#772。`search` は #764 が追加）を
-/// 実行するための接続済み `EngineCore`（`Router::new` 経由では `None` の
-/// まま。実行器なしで応答を偽装しない fail-closed 設計）。
+/// `/v1/query` の `search`（TASK-186・NOSQL-2・Issue #764）・`scan`
+/// （TASK-186・NOSQL-3・Issue #766）・`aggregate`（Issue #768）・`insert`
+/// （Issue #771・#772）の 4 op すべてを実行するための接続済み `EngineCore`
+/// （`Router::new` 経由では `None` のまま。実行器なしで応答を偽装しない
+/// fail-closed 設計）。
 pub struct Router {
     users: Arc<UserStore>,
     sessions: SessionStore,

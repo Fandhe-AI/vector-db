@@ -82,8 +82,10 @@
   `InsertOutcome::incremental` は行形では常に `None`（ファイル形専用）の
   ため本文へは含めない。
 - `handle`（`scan::handle`／`aggregate::handle` と同一シグネチャ形）を
-  `gate.rs` 手順 5 の `(Op::Insert, Some(engine))` アームへ結線し、`search`
-  のみが引き続き暫定 `0A000`／501 を返す状態にした。
+  `gate.rs` 手順 5 の `(Op::Insert, Some(engine))` アームへ結線した。`search`
+  も別 Issue（#764）で同時期に結線済みであり、暫定 `0A000`／501 は
+  `engine` 未接続（`Router::new` 経由）の場合にのみ全 op が返す状態に
+  なった。
 - 行 `id` のテナント内スコープ契約（TABLE-12・RLS-9）の NoSQL 表層越し
   検証を `crates/wire-server/tests/nosql6_tenant_row_id_scope.rs` として
   追加（SQL wire 版 `wire_tenant_row_id_scope.rs::rls9_wire_insert_
