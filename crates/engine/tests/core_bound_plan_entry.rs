@@ -793,6 +793,72 @@ fn plan_entry_does_not_invoke_llm_when_binder_fails_pre_check() {
     );
 }
 
+/// `pre_check`（binder）が返すエラーは、辞書必須列（`path`/`body`）を欠く
+/// テーブルに対しても辞書必須列検証（`22000`）より優先される（codex-review
+/// P1 指摘対応・PR #828。`run_using_plan_select` が辞書必須列検証を
+/// `pre_check` より先に行うと、辞書必須列を欠くテーブルに対して `pre_check`
+/// が返すべきエラー——ここでは `declarative_filter::check_filter_count` が
+/// フィルタ件数超過時に返す `54000`——より先に `22000` が確定してしまう
+/// 回帰。`crates/engine/tests/core_explain_plan_entry.rs::
+/// explain_entry_prioritizes_binder_plan_missing_error_over_dictionary_columns`
+/// と対になる検証で、`run_explain_plan`〔`EXPLAIN` 経路〕・
+/// `run_using_plan_select`〔通常検索経路〕の双方が同一の優先順位を保つ
+/// ことを固定する）。
+#[test]
+fn plan_entry_prioritizes_pre_check_error_over_dictionary_columns() {
+    let path = unique_db_path("bound-plan-plan-pre-check-vs-dictionary");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    // `path`/`body` 列を欠くスキーマ（辞書必須列検証の対象。`schema()` は
+    // scan／aggregate 専用の最小スキーマで `embedding`／`lang` のみ持つ）。
+    storage.create_table(&schema()).expect("create table");
+    let ctx_a = ctx_for("tenant-a");
+    let op_id = engine::recovery::required_op_id::OperationId::parse("dict-vs-pre-check-op-1")
+        .expect("valid operation_id");
+    engine::tenant::insert_typed_row(
+        &storage,
+        TABLE,
+        &ctx_a,
+        1,
+        Visibility::Public,
+        &[
+            Value::Vector(vec![0.1, 0.2, 0.3, 0.4]),
+            Value::Text("ja".to_string()),
+        ],
+        &op_id,
+    )
+    .expect("insert tenant-a row");
+
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_query_planner(
+        Box::new(CountingStubLlmClient {
+            response: SEARCH_EXPANSION_RESPONSE,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    let session = SessionState::default();
+
+    // `declarative_filter::check_filter_count` がフィルタ件数超過時に返す
+    // `54000`（`pub(crate)` のため直接呼べず、同型のエラーをここで模す）。
+    let err = core
+        .execute_bound_plan_search_in_session(
+            &ctx_a,
+            &session,
+            TABLE,
+            "find content",
+            None,
+            10,
+            |_schema, _udfs| {
+                Err(SqlSurfaceError::PayloadTooLarge {
+                    detail: "metadata filter count exceeds limit".to_string(),
+                })
+            },
+        )
+        .expect_err("pre_check payload-too-large error must win over dictionary column check");
+
+    assert!(matches!(err, SqlSurfaceError::PayloadTooLarge { .. }));
+    assert_eq!(err.wire_code(), "54000");
+}
+
 /// `query_planner`／`embedder` のいずれも未注入だと fail-closed（`XX000`）で
 /// 拒否される（SQL 表層の既存契約と同一分類。`crates/engine/tests/
 /// sql_using_plan.rs::using_plan_fails_closed_without_query_planner` と同型）。

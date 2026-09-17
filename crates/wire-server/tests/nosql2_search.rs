@@ -739,9 +739,10 @@ fn explain_with_vector_rejects_with_42601() {
 }
 
 /// `vector` と `plan` を両方指定した要求に `explain: true` を伴っても、
-/// `explain` 専用の分類（`plan` 指定時 `0A000`）ではなく、本来の排他違反
-/// `42601` が優先される（cursor[bot] 指摘・PR #827。`execute` が排他判定を
-/// `explain` 判定より先に行う順序の回帰）。
+/// `explain` 専用の分類（`plan` のみ指定時は NOSQL-10・Issue #765 の
+/// `explain::handle` へ委譲）ではなく、本来の排他違反 `42601` が優先される
+/// （cursor[bot] 指摘・PR #827。`execute` が排他判定を `explain` 判定より
+/// 先に行う順序の回帰）。
 #[test]
 fn vector_and_plan_both_present_with_explain_still_rejects_with_42601() {
     let (core, _guard) = new_core_seed();
@@ -752,22 +753,26 @@ fn vector_and_plan_both_present_with_explain_still_rejects_with_42601() {
     assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
 }
 
-/// `plan` + `explain: true` は `0A000`（NOSQL-10・Issue #765 の未実装扱い。
-/// LLM 呼び出しを一切行わないことをスタブ core で確認する——スタブ未注入の
-/// core で `XX000` ではなく `0A000` が返ることが、実行前に拒否されている
-/// 非 vacuous な証跡になる）。
+/// `plan` + `explain: true` は NOSQL-10（Issue #765）の結線により
+/// `super::explain::handle` へ委譲される（`0A000` の未実装扱いではない。
+/// この検証は本ファイル作成時点〔PR #827〕でまだ NOSQL-10 が未着手だった
+/// 前提の回帰。マージ後は `nosql10_explain.rs` が実装済みの契約を検証する
+/// 単一の情報源であり、本テストはプランナー未注入の `core` でも
+/// `explain` 判定が LLM I/O より前に完結し `query_planner`／`embedder`
+/// 未注入エラー〔`XX000`〕として一貫して拒否されることのみを確認する
+/// （`nosql10_explain.rs::explain_true_without_planner_fails_closed_with_xx000`
+/// と同じ core 構成での重複確認）。
 #[test]
-fn explain_with_plan_rejects_with_0a000_without_invoking_planner() {
+fn explain_with_plan_is_routed_to_explain_handler_and_fails_closed_without_planner() {
     let (core, _guard) = new_core_seed();
     let addr = spawn(Arc::clone(&core));
 
     let body = br#"{"op":"search","table":"docs","plan":"find content","limit":10,"explain":true}"#;
     let resp = query_as_alice(addr, body);
-    // `core` に `query_planner`／`embedder` を注入していないため、もし
-    // `explain` 拒否より先に LLM 展開へ進んでいれば `XX000`
-    // （プランナー未注入）になるはずである。`0A000` が返ることは、
-    // `explain` 拒否が I/O より前に完結している証跡になる。
-    assert_eq!(http_common::wire_code_of(&resp), "0A000", "resp={resp:?}");
+    // `core` に `query_planner`／`embedder` を注入していないため、
+    // `explain` 経路（NOSQL-10）が実際に LLM 展開まで進もうとした結果として
+    // `XX000`（プランナー未注入）が返る。
+    assert_eq!(http_common::wire_code_of(&resp), "XX000", "resp={resp:?}");
 }
 
 /// 応答本文・エラー応答にテナント ID・ユーザー名・トークンを含まない。

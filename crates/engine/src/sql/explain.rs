@@ -38,11 +38,13 @@
 //! `EXPLAIN` が検索本体を実行しない契約（本ファイル冒頭「責務境界」参照）は
 //! 呼び出し元にも求められる。
 
+use crate::declarative_filter::MetadataFilter;
 use crate::query_planner::PlannedQuery;
 use crate::search_engine::SearchEngineKind;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::hnsw_cache::AnnPlan;
-use crate::sql::scalar_plan::ScalarPlan;
+use crate::sql::scalar_plan::{classify_scalar_plan, ScalarPlan, ScalarShapeInput};
+use crate::sql::udf_call::BoundExpr;
 
 /// `EXPLAIN` 応答の列名（安定契約。一度出したら変えない）。
 const QUERY_PLAN_COLUMN: &str = "QUERY PLAN";
@@ -100,6 +102,60 @@ impl ExplainEngine {
     }
 
     /// SCALAR 索引の静的適用判定（Issue #474）。
+    pub fn scalar_plan(&self) -> ScalarPlan {
+        self.scalar_plan
+    }
+}
+
+/// [`crate::sql::using_plan::pre_check_bindable`]（`Statement::Explain`
+/// アーム・[`crate::core::EngineCore::explain_bound_plan_in_session`] が共有
+/// する私的ヘルパー `run_explain_plan` が LLM I/O より前に一度だけ呼ぶ binder
+/// closure）の戻り値。`WHERE` 述語の構造のみから決まる、束縛の副産物である
+/// 形状情報のみを運ぶ（旧 `sql::using_plan::PreCheckShape` を TASK-186・
+/// NOSQL-10 の前提として `sql::explain` の公開型へ昇格したもの。Issue #765）。
+///
+/// `filters_empty`（[`AnnShapeInput::filters_empty`](crate::sql::hnsw_cache::AnnShapeInput)
+/// が要求する形状）は `metadata_filters`／`expr_filters` の両方が空である
+/// ことを指す。`WHERE visible()`
+/// （[`crate::sql::parser::WherePredicate::PredicateCall`]）はこの 2 つの列を
+/// 増やさず RLS フラグのみを立てるため、`WHERE` 句自体が非空でも
+/// `filters_empty` が `true` になりうる（`sql::exec` の
+/// `bound.metadata_filters.is_empty() && bound.expr_filters.is_empty()` と
+/// 同じ定義）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExplainShape {
+    filters_empty: bool,
+    scalar_plan: ScalarPlan,
+}
+
+impl ExplainShape {
+    /// `metadata_filters`／`expr_filters`（`USING PLAN` の `WHERE` 束縛結果。
+    /// [`crate::sql::parser::bind_where_predicates`] の戻り値の一部）から
+    /// [`ExplainShape`] を組み立てる。`USING PLAN` は `HINT ORDER` を受理
+    /// しない（SQL-5・許可リスト層）ため SCALAR 段は常に DISTANCE 段より先に
+    /// 評価される契約に基づき、`scalar_prefilter: true` 固定で
+    /// [`classify_scalar_plan`] を呼ぶ（[`crate::sql::using_plan::
+    /// pre_check_bindable`] の既存契約をそのまま引き継ぐ）。
+    pub fn from_filters(metadata_filters: &[MetadataFilter], expr_filters: &[BoundExpr]) -> Self {
+        let scalar_plan = classify_scalar_plan(&ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters,
+            expr_filters,
+        });
+        Self {
+            filters_empty: metadata_filters.is_empty() && expr_filters.is_empty(),
+            scalar_plan,
+        }
+    }
+
+    /// `ann_plan:` 行（Issue #411・[`crate::sql::hnsw_cache::classify_ann_plan`]）
+    /// が要求する形状情報。
+    pub fn filters_empty(&self) -> bool {
+        self.filters_empty
+    }
+
+    /// `scalar_plan:` 行（Issue #474）が要求する静的判定。
     pub fn scalar_plan(&self) -> ScalarPlan {
         self.scalar_plan
     }

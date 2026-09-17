@@ -10,8 +10,12 @@
 //! `Connection: close`・`Content-Type`／`Content-Length`・CRLF の組み立てや
 //! ソケット I/O は含まない（応答エンベロープは #746 の責務）。
 //!
+//! `explain: true` 時の `{"explain":["<行>", ...]}` 応答は [`encode_explain`]
+//! が担う（TASK-186・NOSQL-10。Issue #765）。`encode`（`columns`／`rows`／
+//! `row_count`）とは独立の関数として分離し、`search`／`scan`／`aggregate` の
+//! 通常応答へ影響を与えない。
+//!
 //! スコープ外（隣接 Issue と二重実装しない）:
-//! - `explain: true` 時の `{"explain":[...]}` 応答（#765）
 //! - `score` の送出有無・`columns` 指定に応じた投影の絞り込み（#763・#766。
 //!   本モジュールは `QueryResult.columns`／`rows[].cells` をそのまま写像し、
 //!   `ResultRow.score`／`id` を独自に付加しない）
@@ -193,6 +197,52 @@ pub fn encode(result: &QueryResult) -> Result<String, ResponseEncodeError> {
     let _ = write!(out, "{}", result.rows.len());
     out.push('}');
 
+    Ok(out)
+}
+
+/// `explain: true` の `search` 要求が返す `EXPLAIN` 応答本文
+/// `{"explain":["<行>", ...]}`（TASK-186・NOSQL-10。Issue #765）への写像。
+///
+/// `result` は [`crate::core::EngineCore::explain_bound_plan_in_session`]（SQL
+/// `EXPLAIN SELECT ... USING PLAN(...)` の `Statement::Explain` アームと同一の
+/// 私的ヘルパーを共有する。`crate::core::EngineCore` モジュールドキュメント参照）
+/// の戻り値をそのまま渡す想定で、列が `Computed { name: "QUERY PLAN" }` 1 本・
+/// 各行が [`Cell::Text`] 1 個であることを検証してから写像する。この形状
+/// （`sql::explain::build_explain_result` の固定契約）から逸脱する場合は
+/// best-effort に描画せず `Err`（`ErrorClass::InternalError`）で fail-closed に
+/// 拒否する。
+pub fn encode_explain(result: &QueryResult) -> Result<String, ResponseEncodeError> {
+    if result.columns.len() != 1
+        || result.columns[0]
+            != (ColumnMeta::Computed {
+                name: "QUERY PLAN".to_string(),
+            })
+    {
+        return Err(ResponseEncodeError);
+    }
+
+    let capacity_hint = 16
+        + result
+            .rows
+            .len()
+            .saturating_mul(48 /* 行文字列の目安長 + 区切り文字 */);
+    let mut out = String::with_capacity(capacity_hint);
+    out.push_str("{\"explain\":[");
+    for (i, row) in result.rows.iter().enumerate() {
+        if row.cells.len() != 1 {
+            return Err(ResponseEncodeError);
+        }
+        let Cell::Text(text) = &row.cells[0] else {
+            return Err(ResponseEncodeError);
+        };
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        escape_json_string_into(&mut out, text);
+        out.push('"');
+    }
+    out.push_str("]}");
     Ok(out)
 }
 

@@ -520,7 +520,9 @@ fn having_predicate_count_over_limit_rejects_with_54000() {
 }
 
 #[test]
-fn explain_true_is_still_rejected_with_0a000_even_with_group_by() {
+fn explain_true_is_still_rejected_with_42601_even_with_group_by() {
+    // SQL-6 の「`EXPLAIN` は `USING PLAN` 付き検索 `SELECT` 専用」契約の写像
+    // として `42601` へ拒否する（NOSQL-10・Issue #765）。
     let (core, _guard) = new_core();
     let addr = spawn(Arc::clone(&core));
 
@@ -529,7 +531,7 @@ fn explain_true_is_still_rejected_with_0a000_even_with_group_by() {
         "group_by":["lang"],
         "explain":true}"#;
     let resp = query_as_alice(addr, body);
-    assert_eq!(http_common::wire_code_of(&resp), "0A000", "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
     assert!(
         !body_utf8(&resp).contains("row_count"),
         "{}",
