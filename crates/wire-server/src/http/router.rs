@@ -35,8 +35,10 @@
 //! `42601` を返す。両者の優先順位は本リポの実装上の判断であり、
 //! spec 側での明文化は申し送り事項とする（Issue #758 実装記録参照）。
 //!
-//! op 許可リストの正式化（Issue #759）・束縛・実行（#763 以降）は
-//! 別 Issue が本ルータ以降の層へ追記する。
+//! op 許可リストの正式化（Issue #759）は完了済み。`scan` op の束縛・実行
+//! （TASK-186・NOSQL-3・Issue #766）は [`crate::http::query::gate::handle`]
+//! へ `core` を渡すことで結線済みで、`search`／`aggregate`／`insert`
+//! （#763・#768・#771）は引き続き別 Issue が本ルータ以降の層へ追記する。
 //!
 //! メソッド（`POST` 以外を拒否）は [`crate::http::conn`] が要求行パース時点で
 //! 既に絞り込み済み（[`crate::http::request::Method`] は `Post` の 1 variant
@@ -58,6 +60,7 @@ use crate::http::session::close as session_close;
 use crate::http::session::issue as session_issue;
 use crate::http::session::middleware;
 use crate::http::session::store::SessionStore;
+use engine::core::EngineCore;
 use engine::error_format::ErrorClass;
 
 /// `/v1/session` の要求ターゲット（バイト厳密一致のみ受理。クエリ文字列付き・
@@ -145,16 +148,23 @@ fn resolve_target(target: &str) -> Route {
 
 /// production 入口のルータ。`users`（ユーザーストアの共有ハンドル）・
 /// `sessions`（[`SessionStore`]。`Clone` で内部状態を共有する型のため、
-/// `Router` 自身は `Arc` で包まず値として保持する）を束ねる。
+/// `Router` 自身は `Arc` で包まず値として保持する）・`core`（`/v1/query`
+/// の `scan` op が束縛済み計画を実行する先。TASK-186・NOSQL-3。Issue #766）
+/// を束ねる。
 pub struct Router {
     users: Arc<UserStore>,
     sessions: SessionStore,
+    core: Arc<EngineCore>,
 }
 
 impl Router {
     /// `main.rs::run_server` の nosql 分岐から呼ばれる唯一の構築経路。
-    pub fn new(users: Arc<UserStore>, sessions: SessionStore) -> Router {
-        Router { users, sessions }
+    pub fn new(users: Arc<UserStore>, sessions: SessionStore, core: Arc<EngineCore>) -> Router {
+        Router {
+            users,
+            sessions,
+            core,
+        }
     }
 }
 
@@ -184,9 +194,13 @@ impl RequestHandler for Router {
             ),
             Route::Endpoint(Endpoint::Query) => {
                 match middleware::authenticate(&self.sessions, &req.headers, Instant::now) {
-                    Ok(principal) => {
-                        query_gate::handle(&principal, &req.headers, req.body, SystemTime::now())
-                    }
+                    Ok(principal) => query_gate::handle(
+                        &self.core,
+                        &principal,
+                        &req.headers,
+                        req.body,
+                        SystemTime::now(),
+                    ),
                     Err(e) => response::encode_error(
                         e.error_class(),
                         e.client_message(),

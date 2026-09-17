@@ -10,11 +10,13 @@
 //! `POST /v1/query` を送り、HTTP 応答（ステータス・`wire_code`・
 //! エラーコード・メッセージ）を確認する。
 //!
-//! 受理（4 op）と語彙外拒否はいずれも HTTP 501・`wire_code` `0A000`・
-//! `code` `FEATURE_NOT_SUPPORTED` で status だけでは区別できないため、
-//! 必ず `error_message_of` で [`wire_server::http::query::gate::
-//! PLACEHOLDER_MESSAGE`]（受理側）／[`wire_server::http::query::gate::
-//! UNSUPPORTED_OP_MESSAGE`]（拒否側）を突き合わせる。
+//! 受理（3 op: `search`／`aggregate`／`insert`）と語彙外拒否はいずれも
+//! HTTP 501・`wire_code` `0A000`・`code` `FEATURE_NOT_SUPPORTED` で status
+//! だけでは区別できないため、必ず `error_message_of` で
+//! [`wire_server::http::query::gate::PLACEHOLDER_MESSAGE`]（受理側）／
+//! [`wire_server::http::query::gate::UNSUPPORTED_OP_MESSAGE`]（拒否側）を
+//! 突き合わせる。`scan` は TASK-186・NOSQL-3（Issue #766）で実行結線済み
+//! のため、この 3 op とは別に到達の証跡（`42P01`／404）を確認する。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -87,14 +89,21 @@ fn spawn() -> SocketAddr {
     http_common::spawn_router_listener(&users_path, SessionStore::new())
 }
 
-// --- 受理 4 op: いずれも 501・0A000・PLACEHOLDER_MESSAGE ------------------
+// --- 受理 4 op: `scan` は実行結線済み（42P01・非 501）・他 3 op は
+// 501・0A000・PLACEHOLDER_MESSAGE ------------------------------------------
 
 #[test]
 fn four_allowlisted_ops_reach_placeholder_response() {
     let addr = spawn();
-    let bodies: [&[u8]; 4] = [
+
+    // `scan` は TASK-186・NOSQL-3（Issue #766）で実行結線済みのため、
+    // スローアウェイ `EngineCore`（テーブル未作成）上では `42P01`／404 が
+    // 到達の証跡になる（他 3 op と異なり暫定 `0A000`／501 はもう返らない）。
+    let scan_resp = query(addr, br#"{"op":"scan","table":"docs","limit":1}"#);
+    http_common::assert_reached_query_gate(&scan_resp);
+
+    let bodies: [&[u8]; 3] = [
         br#"{"op":"search","table":"docs","limit":1}"#,
-        br#"{"op":"scan","table":"docs","limit":1}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"id"}]}"#,
         br#"{"op":"insert","table":"docs","rows":[]}"#,
     ];

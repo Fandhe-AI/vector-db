@@ -431,7 +431,12 @@ fn default_expr_alias(expr: &Expr) -> String {
 /// SQL-5 で `bind_in_session` から切り出した。`USING PLAN` 経路（`sql::using_plan`）も
 /// 同一の投影列解決規則（実カラム優先・疑似列 `id`・`AS` エイリアス付き式項目）を
 /// 必要とするため、この 1 箇所に集約する）。
-pub(crate) fn bind_projection(
+///
+/// TASK-186・NOSQL-3（Issue #766）で `pub(crate)` から `pub` へ昇格した:
+/// `wire-server` の NoSQL 表層 `scan` 写像（`http::query::scan`）が SQL テキストを
+/// 経由せず `Projection` を直接組み立てて束縛するために、[`bind_scan`] と
+/// 同一の投影列解決規則をこの 1 箇所から共有する（第 2 の実装を作らない）。
+pub fn bind_projection(
     projection: &Projection,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
@@ -577,7 +582,12 @@ pub fn bind(
 /// 対応、PR #266: 高コスト処理の後段でのみ検証すると、`LIMIT 0`／`LIMIT
 /// 4294967295` のような必ず拒否される入力でも untrusted 入力によるリソース
 /// 増幅を許してしまう）。
-pub(crate) fn validate_search_limit(raw: u32) -> Result<usize, SqlSurfaceError> {
+///
+/// TASK-186・NOSQL-3（Issue #766）で `pub(crate)` から `pub` へ昇格した:
+/// `wire-server` の NoSQL 表層 `scan` 写像（`http::query::scan`）が JSON `limit`
+/// の範囲検証に同一のロジック・`wire_code`（`22000`）を再利用する（第 2 の
+/// 実装を作らない）。
+pub fn validate_search_limit(raw: u32) -> Result<usize, SqlSurfaceError> {
     let limit = usize::try_from(raw)
         .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed LIMIT value: {raw}")))?;
     if limit == 0 || limit > crate::core::MAX_SEARCH_K {
@@ -1375,8 +1385,10 @@ impl BoundScan {
     /// （[`compile_expr_filter_programs`]）は内部で行う。
     ///
     /// **`limit` はここでは検証しない**（[`validate_search_limit`] は
-    /// `pub(crate)` のまま・SQL テキスト経由の [`bind_scan`] のみが検証を強制する。
-    /// `BoundStatement::new` と同じ設計判断）。ただし [`crate::sql::scan::execute_scan`]
+    /// `pub`（TASK-186・NOSQL-3〔Issue #766〕で昇格）だが、呼び出しは呼び出し元の
+    /// 任意判断に委ねる。`new` 自身が検証を強制しない契約は不変。SQL テキスト
+    /// 経由の [`bind_scan`] は引き続き必ず検証する。`BoundStatement::new` と
+    /// 同じ設計判断）。ただし [`crate::sql::scan::execute_scan`]
     /// は `bound.limit` の値によらず結果セットの累計バイト予算
     /// （`MAX_SCAN_RESULT_BYTES`）で走査を打ち切るため、未検証の巨大な `limit` を
     /// 渡しても無制限なメモリ確保には至らない（fail-closed。OWASP「不安全な設計」

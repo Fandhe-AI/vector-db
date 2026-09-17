@@ -102,19 +102,15 @@ fn close_with_bearer(addr: std::net::SocketAddr, token: &str) -> http_common::Ht
 }
 
 /// 有効な Bearer で到達した `/v1/query` の現時点の期待値を 1 箇所へ集約する。
-/// 本 Issue 時点は `session::middleware::authenticate` を通過した要求が
-/// `query::gate::handle` の暫定ゲート応答（`501`／`0A000`）へ到達する
-/// （`http5_query_bearer.rs::valid_bearer_and_valid_json_reaches_placeholder_response`
-/// と同じ観測点）。op 許可リストの正式化・実行結線（Issue #758・#759）で
-/// この期待値が変わった際、更新箇所をこの関数だけに閉じ込める。
+/// `scan` op は TASK-186・NOSQL-3（Issue #766）で実行結線済みのため、
+/// スローアウェイ `EngineCore`（テーブル未作成）上では `42P01`／404
+/// （`http_common::assert_reached_query_gate`）が「認証 → op 許可リスト →
+/// スキーマ検証 → engine 呼び出し」到達の非 vacuous な証跡になる
+/// （`http5_query_bearer.rs` と同じ観測点）。`search`／`aggregate`／
+/// `insert`（#763・#768・#771）の結線でこの期待値が変わった際、更新箇所を
+/// この関数だけに閉じ込める。
 fn assert_query_accepted(resp: &http_common::HttpResponse) {
-    assert_eq!(
-        resp.status,
-        501,
-        "expected placeholder gate response, got body={:?}",
-        String::from_utf8_lossy(&resp.body)
-    );
-    assert_eq!(http_common::wire_code_of(resp), "0A000");
+    http_common::assert_reached_query_gate(resp);
 }
 
 fn json_object(body: &[u8]) -> std::collections::BTreeMap<String, JsonValue> {
