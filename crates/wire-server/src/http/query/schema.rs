@@ -12,9 +12,11 @@
 //! に写像する（`engine::json::JsonError` と同じ分類。構文エラー・意味エラーが
 //! クライアントには同じ `wire_code` として収束する）。
 //!
+//! op 名の許可リスト・未知 op の `0A000` 判定は [`super::op::Op`]
+//! （Issue #759・TASK-179・NOSQL-1・NOSQL-9）が担い、[`schema_for`] は
+//! `super::op::Op::parse` へ委譲する薄い表引きに留まる。
+//!
 //! 対象外（後続 Issue の担当。二重実装しない）:
-//! - op 名の許可リスト・未知 op の `0A000` 判定（[`schema_for`] は語彙外に
-//!   `None` を返すのみ。判定・応答は #759）
 //! - フィールド値の**語彙・範囲**検査（`filter[].op` の `eq`／`prefix`、
 //!   `aggregates[].fn` の関数名、`limit` の非負性等。#761・#763・#766・
 //!   #768・#769）
@@ -645,12 +647,10 @@ pub const OP_SCHEMAS: [(&str, &ObjectSchema); 4] = [
 ];
 
 /// `op` 名からスキーマを引く。語彙外は `None`（`0A000` への写像・応答は
-/// #759 の呼び出し元が行う。本モジュールは表引きのみ）。
+/// [`super::op::classify_op`] の呼び出し元が行う。本モジュールは表引きの
+/// みで、実体は [`super::op::Op::parse`] への委譲）。
 pub fn schema_for(op: &str) -> Option<&'static ObjectSchema> {
-    OP_SCHEMAS
-        .iter()
-        .find(|(name, _)| *name == op)
-        .map(|(_, schema)| *schema)
+    super::op::Op::parse(op).map(super::op::Op::schema)
 }
 
 /// スキーマ本体（`op` 以外のキー）を検証する前段として、トップレベルから

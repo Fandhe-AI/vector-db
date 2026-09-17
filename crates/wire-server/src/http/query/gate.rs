@@ -13,15 +13,22 @@
 //! 1. [`crate::http::session::middleware::reject_tenant_headers`]（`tenant_id`
 //!    相当ヘッダの拒否。`42601`）
 //! 2. 本文検証: [`crate::http::body::body_as_utf8`] → `engine::json::
-//!    parse_json` → [`crate::http::query::schema::extract_op`] →
-//!    [`crate::http::query::schema::schema_for`] →
-//!    `ObjectSchema::validate`（必須欠落・未知キー・型不一致 → `42601`。
-//!    `tenant_id` の JSON 自己申告はここで未知キーとして自然に拒否される）
-//! 3. 語彙外 op（`schema_for` が `None`）は暫定 `0A000`
-//!    （[`UNSUPPORTED_OP_MESSAGE`]。正式な許可リスト分類は #759 の担当）
-//! 4. ここまで通過した要求は暫定的に `0A000`／501
+//!    parse_json` → [`crate::http::query::schema::extract_op`]（本文の構文・
+//!    `op` フィールドの形の検証。`42601`）
+//! 3. [`crate::http::query::op::classify_op`]（`op` 名を閉じた語彙 4 値へ
+//!    分類する許可リスト。DDL・UDF 呼び出し・トランザクション制御・
+//!    UPDATE／DELETE 相当を含む語彙外はすべて `0A000`。
+//!    Issue #759・TASK-179・NOSQL-1・NOSQL-9）
+//! 4. `Op::schema().validate(...)`（必須欠落・未知キー・型不一致 →
+//!    `42601`。`tenant_id` の JSON 自己申告・`HINT ORDER`／
+//!    `SET search_mode` 相当フィールドはここで未知キーとして拒否される）
+//! 5. ここまで通過した要求は暫定的に `0A000`／501
 //!    （[`PLACEHOLDER_MESSAGE`]）を返す（束縛・実行の結線は #763 以降が
 //!    本 seam を置き換える）
+//!
+//! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
+//! `op` にスキーマ検証由来の情報（未知キー等）が先に返ることはない
+//! （fail-closed の判定順序も契約の一部）。
 //!
 //! 応答本文・ログにテナント ID・トークンを含めない
 //! （`.claude/rules/security.md`「エラー・ログ経由で他テナントのデータ・
@@ -32,18 +39,15 @@ use std::time::SystemTime;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::parse_json;
 
-use crate::http::query::schema::schema_for;
+use crate::http::query::op::classify_op;
 use crate::http::session::middleware::{self, SessionPrincipal};
 use crate::http::{body, response};
 
-/// 検証を通過した要求に返す暫定応答の文言（束縛・実行は #759／#763
+pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
+
+/// 検証を通過した要求に返す暫定応答の文言（束縛・実行は #763
 /// 以降の担当。本 Issue 時点は seam のみ）。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
-
-/// 語彙外の `op`（[`schema_for`] が `None`）に返す暫定文言。正式な op
-/// 許可リスト・DDL／UDF／トランザクション相当の分類は #759 が本 seam を
-/// 置き換える。
-pub const UNSUPPORTED_OP_MESSAGE: &str = "unsupported op";
 
 /// [`handle`] 内部の分類済みエラー。
 struct HandleError {
@@ -88,26 +92,24 @@ fn handle_inner(
     middleware::reject_tenant_headers(headers)
         .map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
 
-    // 手順 2: 本文検証。
+    // 手順 2: 本文検証（構文・`op` フィールドの形）。
     let text = body::body_as_utf8(raw_body)
         .map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
     let value =
         parse_json(text).map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
-    let op = crate::http::query::schema::extract_op(&value)
+    let raw_op = crate::http::query::schema::extract_op(&value)
         .map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
 
-    let Some(schema) = schema_for(op) else {
-        // 手順 3: 語彙外 op。正式な許可リスト分類・0A000 判定は #759。
-        return Err(HandleError::new(
-            ErrorClass::FeatureNotSupported,
-            UNSUPPORTED_OP_MESSAGE,
-        ));
-    };
-    schema
+    // 手順 3: op 許可リスト判定（スキーマ検証より前。語彙外は 0A000）。
+    let op =
+        classify_op(raw_op).map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
+
+    // 手順 4: スキーマ検証（必須欠落・未知キー・型不一致 → 42601）。
+    op.schema()
         .validate(&value)
         .map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
 
-    // 手順 4: 検証を通過した要求への暫定 placeholder 応答。
+    // 手順 5: 検証を通過した要求への暫定 placeholder 応答。
     Ok(PLACEHOLDER_MESSAGE)
 }
 
@@ -215,6 +217,55 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
         assert!(text.contains("0A000"), "got: {text}");
         assert!(text.contains(UNSUPPORTED_OP_MESSAGE), "got: {text}");
+    }
+
+    #[test]
+    fn ddl_udf_transaction_update_delete_ops_reject_with_0a000() {
+        // DDL・UDF 呼び出し・トランザクション制御・UPDATE／DELETE 相当・
+        // 表記揺れは、いずれも許可リスト（Op::parse の 4 値）に無いため
+        // 0A000 に落ちる（拒否リストを別途持たない設計の回帰確認）。
+        let ops = [
+            "create_table",
+            "alter_table",
+            "drop_table",
+            "call",
+            "udf",
+            "begin",
+            "commit",
+            "rollback",
+            "update",
+            "delete",
+            "explain",
+            "set",
+            "SEARCH",
+            " search",
+            "",
+        ];
+        for op in ops {
+            let body = format!(r#"{{"op":"{op}","table":"docs"}}"#);
+            let response = run(body.as_bytes(), &[]);
+            let text = String::from_utf8(response).expect("utf-8 response");
+            assert!(text.starts_with("HTTP/1.1 501 "), "op {op:?} got: {text}");
+            assert!(text.contains("0A000"), "op {op:?} got: {text}");
+            assert!(
+                text.contains(UNSUPPORTED_OP_MESSAGE),
+                "op {op:?} got: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn op_allowlist_check_precedes_schema_validation() {
+        // 語彙外 op に未知キー（本来ならスキーマ検証で 42601）が同時に
+        // 付与されていても、op 許可リスト判定（0A000）が先に効く
+        // （手順の順序が契約であることの回帰確認）。
+        let body = br#"{"op":"drop_table","table":"docs","hint_order":["path"]}"#;
+        let response = run(body, &[]);
+        let text = String::from_utf8(response).expect("utf-8 response");
+        assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
+        assert!(text.contains("0A000"), "got: {text}");
+        assert!(text.contains(UNSUPPORTED_OP_MESSAGE), "got: {text}");
+        assert!(!text.contains("42601"), "got: {text}");
     }
 
     #[test]
