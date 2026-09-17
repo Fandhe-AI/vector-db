@@ -195,8 +195,9 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 ```
 
 `mode` の解決（`resolve_mode_with_planner`。優先順位: 要求の `mode` フィールド
-＞ セッション変数（`SET` 相当。NoSQL 表層には対応形が無く `1 要求 = 1 セッション`
-のため常に未設定）＞ プランナー推定 ＞ 既定 `recall`）:
+＞ セッション変数（`SET` 相当。NoSQL 表層には対応する構文が無く、`/v1/query` は
+要求ごとに既定の `SessionState` で実行されるため常に未設定）＞ プランナー推定
+＞ 既定 `recall`）:
 
 - `vector` 検索: `mode` 省略時は常に既定 `recall`（プランナーを経由しないため
   推定ヒントが存在しない）
