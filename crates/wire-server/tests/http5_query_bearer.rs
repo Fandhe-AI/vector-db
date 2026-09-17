@@ -154,11 +154,16 @@ fn valid_bearer_and_valid_json_reaches_placeholder_response() {
         VALID_SCAN_BODY,
     );
     let (status_line, resp_body) = split_response(&response);
+    // `scan` は TASK-186・NOSQL-3（Issue #766）で実行結線済みのため、
+    // スローアウェイ `EngineCore`（テーブル未作成）上では `42P01`／404 が
+    // 「認証 → op 許可リスト → スキーマ検証 → engine 呼び出し」到達の
+    // 非 vacuous な証跡になる（`http_common::assert_reached_query_gate` と
+    // 同じ判断）。
     assert!(
-        status_line.starts_with("HTTP/1.1 501 "),
+        status_line.starts_with("HTTP/1.1 404 "),
         "got: {status_line}"
     );
-    assert_eq!(wire_code_of_body(&resp_body), "0A000");
+    assert_eq!(wire_code_of_body(&resp_body), "42P01");
 }
 
 // --- (2)〜(5) Bearer 欠落・不正・close 済みの収束 --------------------------
@@ -399,8 +404,10 @@ fn repeated_query_requests_do_not_consume_session_slot() {
     for _ in 0..5 {
         let response = send_request(addr, "/v1/query", Some(&auth), VALID_SCAN_BODY);
         let (status_line, _) = split_response(&response);
+        // `scan` 実行結線後（TASK-186・NOSQL-3・Issue #766）はスローアウェイ
+        // `EngineCore` 上で `42P01`／404 が到達の証跡になる。
         assert!(
-            status_line.starts_with("HTTP/1.1 501 "),
+            status_line.starts_with("HTTP/1.1 404 "),
             "got: {status_line}"
         );
     }
@@ -454,14 +461,16 @@ fn closing_one_tenant_session_does_not_affect_another_tenants_query_access() {
     );
     assert!(split_response(&close_a).0.starts_with("HTTP/1.1 200 "));
 
-    // bob のセッションはまだ有効で /v1/query に到達できる。
+    // bob のセッションはまだ有効で /v1/query に到達できる（`scan` 実行結線後
+    // 〔TASK-186・NOSQL-3・Issue #766〕はスローアウェイ `EngineCore` 上で
+    // `42P01`／404 が到達の証跡になる）。
     let query_b = send_request(
         addr,
         "/v1/query",
         Some(&format!("Bearer {token_b}")),
         VALID_SCAN_BODY,
     );
-    assert!(split_response(&query_b).0.starts_with("HTTP/1.1 501 "));
+    assert!(split_response(&query_b).0.starts_with("HTTP/1.1 404 "));
 
     // alice のセッションは close 済みで 28000。
     let query_a = send_request(
@@ -506,13 +515,14 @@ fn valid_bearer_reaches_gate_for_every_op_schema_minimal_form() {
     let token = login(addr, "alice", "pw-alice");
     let auth = format!("Bearer {token}");
 
-    let cases: [&[u8]; 4] = [
+    // `scan`（TASK-186・NOSQL-3・Issue #766）・`aggregate`（Issue #768）は
+    // 実行結線済みのため、他 2 op（暫定 `0A000`／501）とは異なり
+    // `42P01`／404 が到達の証跡になる。
+    let placeholder_cases: [&[u8]; 2] = [
         br#"{"op":"search","table":"docs","limit":1}"#,
-        br#"{"op":"scan","table":"docs","limit":1}"#,
-        br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"id"}]}"#,
         br#"{"op":"insert","table":"docs","rows":[]}"#,
     ];
-    for body in cases {
+    for body in placeholder_cases {
         let response = send_request(addr, "/v1/query", Some(&auth), body);
         let (status_line, resp_body) = split_response(&response);
         assert!(
@@ -520,5 +530,19 @@ fn valid_bearer_reaches_gate_for_every_op_schema_minimal_form() {
             "body {body:?}: got {status_line}"
         );
         assert_eq!(wire_code_of_body(&resp_body), "0A000");
+    }
+
+    let executed_cases: [&[u8]; 2] = [
+        VALID_SCAN_BODY,
+        br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"id"}]}"#,
+    ];
+    for body in executed_cases {
+        let response = send_request(addr, "/v1/query", Some(&auth), body);
+        let (status_line, resp_body) = split_response(&response);
+        assert!(
+            status_line.starts_with("HTTP/1.1 404 "),
+            "body {body:?}: got {status_line}"
+        );
+        assert_eq!(wire_code_of_body(&resp_body), "42P01");
     }
 }

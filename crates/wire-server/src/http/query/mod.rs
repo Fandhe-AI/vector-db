@@ -14,23 +14,26 @@
 //! `op: aggregate`（`group_by`／`having`／`explain: true` を除く）を
 //! SQL テキストを経由せずに `engine::sql::parser::BoundAggregate` へ束縛・
 //! 実行する（Issue #768・TASK-177・NOSQL-4）。他 op の実行計画への写像は
-//! 後続 Issue（#763・#766）がここへ追加する。[`response`] は
+//! 後続 Issue（#763・#771）がここへ追加する。[`response`] は
 //! `search`／`scan`／`aggregate` 成功時の `engine::sql::exec::QueryResult`
 //! → JSON 応答本文（`columns`／`rows`／`row_count`）への写像を担う
-//! （Issue #762・NOSQL-11）。[`gate`] は認証済み要求（`crate::http::session::
-//! middleware::SessionPrincipal`）に対する `POST /v1/query` の入口本体で、
-//! `tenant_id` 相当ヘッダの拒否・op 許可リスト判定・本文のスキーマ検証を
-//! 行い、`op: aggregate` かつ `engine` 接続済みの場合は [`aggregate::handle`]
-//! （Issue #768）へ、それ以外は暫定の `0A000`／501 応答を返す
-//! （Issue #754・#759。`search`／`scan`／`insert` の結線は #763 以降が
-//! 本 seam を置き換える）。
-//! [`search`] は `op: search` の JSON クエリオブジェクトを SQL 表層の
-//! `bind_in_session` と同一形の `engine::sql::parser::BoundStatement` へ
-//! 束縛する（Issue #763・TASK-175・NOSQL-2。`vector`／`plan` 排他・
-//! `hybrid`／`mode`／`columns` の意味論は SQL 表層の既存公開関数へ委譲する）。
-//! `plan` 指定は LLM 展開が engine 内部 I/O を要するため束縛済み部品のみの
-//! 中間形 `PlanSearch` に留め、`BoundStatement` までの完成・実行結線・
-//! `gate.rs` の暫定応答（`PLACEHOLDER_MESSAGE`）置換は #764 の担当。
+//! （Issue #762・NOSQL-11）。[`scan`] は `op: "scan"` を
+//! `engine::sql::parser::BoundScan` へ束縛し `EngineCore` で実行する（Issue
+//! #766・TASK-176・NOSQL-3。結線済み）。[`search`] は `op: search` の JSON
+//! クエリオブジェクトを SQL 表層の `bind_in_session` と同一形の
+//! `engine::sql::parser::BoundStatement` へ束縛する（Issue #763・TASK-175・
+//! NOSQL-2。`vector`／`plan` 排他・`hybrid`／`mode`／`columns` の意味論は
+//! SQL 表層の既存公開関数へ委譲する）。`plan` 指定は LLM 展開が engine 内部
+//! I/O を要するため束縛済み部品のみの中間形 `PlanSearch` に留め、
+//! `BoundStatement` までの完成・実行結線・`gate.rs` の暫定応答
+//! （`PLACEHOLDER_MESSAGE`）置換は #764 の担当。[`gate`] は認証済み要求
+//! （`crate::http::session::middleware::SessionPrincipal`）に対する
+//! `POST /v1/query` の入口本体で、`tenant_id` 相当ヘッダの拒否・op 許可
+//! リスト判定・本文のスキーマ検証を行い、`engine` 接続済みの場合に限り
+//! `op: scan` を [`scan::handle`] へ、`op: aggregate` を
+//! [`aggregate::handle`]（Issue #768）へそれぞれディスパッチする
+//! （`search`／`insert` は引き続き暫定の `0A000`／501 応答。
+//! Issue #754・#759。束縛・実行は #763・#771 が本 seam を置き換える）。
 //! [`insert`] は `insert` op を
 //! `engine::sql::exec::execute_insert_batch`／
 //! `EngineCore::execute_bound_insert_in_session` へ写像する
@@ -43,5 +46,6 @@ pub mod ident;
 pub mod insert;
 pub mod op;
 pub mod response;
+pub mod scan;
 pub mod schema;
 pub mod search;

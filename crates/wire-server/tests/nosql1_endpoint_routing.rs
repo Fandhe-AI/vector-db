@@ -107,15 +107,13 @@ fn three_endpoints_reach_distinct_handler_specific_responses() {
     let close_text = String::from_utf8_lossy(&close_resp.body).into_owned();
     assert!(close_text.contains("\"closed\":true"), "got: {close_text}");
 
-    // /v1/query: 有効 Bearer（別トークン）+ 最小 scan 本文で 501（暫定応答）。
+    // /v1/query: 有効 Bearer（別トークン）+ 最小 scan 本文。`scan` は
+    // TASK-186・NOSQL-3（Issue #766）で実行結線済みのため、スローアウェイ
+    // `EngineCore`（テーブル未作成）上では `42P01`／404 が到達の証跡になる。
     let token2 = login(addr, "alice", "pw-alice");
     let query_resp = post(addr, "/v1/query", Some(&token2), VALID_SCAN_BODY);
-    assert_eq!(query_resp.status, 501);
+    http_common::assert_reached_query_gate(&query_resp);
     let query_text = String::from_utf8_lossy(&query_resp.body).into_owned();
-    assert!(
-        query_text.contains(wire_server::http::query::gate::PLACEHOLDER_MESSAGE),
-        "got: {query_text}"
-    );
 
     // 3 応答が互いに異なることで非 vacuous（同じ固定応答へ縮退していない）。
     assert_ne!(login_text, close_text);
@@ -228,7 +226,7 @@ fn routing_precedes_authentication_and_does_not_consume_or_invalidate_session() 
     // 同一トークンで `/v1/query` へは引き続き到達できる（未知パス要求が
     // トークンを失効させていない証跡）。
     let query_resp = post(addr, "/v1/query", Some(&token), VALID_SCAN_BODY);
-    assert_eq!(query_resp.status, 501);
+    http_common::assert_reached_query_gate(&query_resp);
 }
 
 // --- (T4b) ルーティングはセッション枠を確保しない --------------------------

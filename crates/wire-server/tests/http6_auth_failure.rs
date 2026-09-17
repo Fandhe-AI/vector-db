@@ -240,11 +240,13 @@ fn expired_token_on_query_rejects_with_28000() {
     let token = login(addr, "alice", "pw-alice");
     let auth = format!("Bearer {token}");
 
-    // TTL 内: ゲートへ到達し暫定 0A000／501（非 vacuous 証跡）。
+    // TTL 内: ゲートへ到達し `scan` 実行結線後（TASK-186・NOSQL-3・
+    // Issue #766）はスローアウェイ `EngineCore` 上で 42P01／404
+    // （非 vacuous 証跡）。
     let fresh_request = query_request(Some(&auth), &[], VALID_SCAN_BODY);
     let fresh_resp = parse_single_response(&send_raw(addr, &fresh_request, AfterWrite::HalfClose));
-    assert_eq!(fresh_resp.status, 501, "token must still be valid");
-    assert_eq!(wire_code_of(&fresh_resp), "0A000");
+    assert_eq!(fresh_resp.status, 404, "token must still be valid");
+    assert_eq!(wire_code_of(&fresh_resp), "42P01");
 
     // TTL 超過後: 同一トークンが 28000 へ収束する。
     std::thread::sleep(ttl + Duration::from_millis(150));

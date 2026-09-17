@@ -15,10 +15,17 @@
 #[path = "common/mod.rs"]
 mod common;
 
+// engine 側のテスト専用一時 DB ヘルパー（`std` のみに依存し `crate::` を
+// 参照しないため取り込み可能。`Router::with_engine`〔Issue #766・#768〕へ
+// 渡すスローアウェイ core を本ファイル固有に用意するため取り込む）。
+#[path = "../../engine/src/test_util/temp_db.rs"]
+mod temp_db;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
+use engine::core::EngineCore;
 use engine::json::{parse_json, JsonValue};
 use wire_server::auth::AUTH_FAILURE_DELAY;
 use wire_server::http::router::Router;
@@ -29,7 +36,9 @@ use wire_server::limits::{ConnectionLimiter, SESSION_TTL};
 /// `accept_loop_with_router` を in-process サーバースレッドで起動し、
 /// 接続先アドレスを返す。`sessions` は呼び出し元が上限・TTL を制御できる
 /// よう `SessionStore` をそのまま受け取る（`with_limits` でセッション上限を
-/// 小さくしたケースを検証するため）。
+/// 小さくしたケースを検証するため）。`core` は本ファイルのテストが
+/// `/v1/query` を送らないため、テーブルを一切持たないスローアウェイ
+/// `EngineCore` で十分（TASK-186・NOSQL-3）。
 fn spawn_router_server(
     users_path: &std::path::Path,
     sessions: SessionStore,
@@ -38,7 +47,13 @@ fn spawn_router_server(
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let limiter = ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS);
-    let router = Router::new(std::sync::Arc::new(store), sessions);
+    let core_path = temp_db::unique_db_path("http4-session-issue-throwaway");
+    let core = EngineCore::open(&core_path).expect("open throwaway engine core");
+    let router = Router::with_engine(
+        std::sync::Arc::new(store),
+        sessions,
+        std::sync::Arc::new(core),
+    );
 
     std::thread::spawn(move || {
         wire_server::http::listener::accept_loop_with_router(

@@ -31,8 +31,22 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
+use engine::core::EngineCore;
 use engine::json::{parse_json, JsonValue};
 use wire_server::limits::ConnectionLimiter;
+
+/// engine 側のテスト専用一時 DB ヘルパー（`unique_db_path`。`std` のみに
+/// 依存し `crate::` を一切参照しないため取り込み可能。`crates/wire-server/
+/// tests/wire_aggregate.rs` 等の既存結合テストと同じ流儀。本ファイルは
+/// 実ディレクトリ `tests/http_common/` の直下（`mod.rs` 相当）のため、
+/// ネストしたモジュール宣言に対応する非実在ディレクトリを介さず `..` を
+/// 辿れる）。`pub` にして `http_common` を取り込む側のテストファイルが
+/// スローアウェイ `EngineCore` 用に再利用できるようにする（同じファイルを
+/// 別の `#[path]` で二重に取り込むと `clippy::duplicate_mod` に抵触する
+/// ため、取り込み元は本モジュールを再利用し、独自の `mod temp_db;` を
+/// 追加で宣言しないこと）。
+#[path = "../../../engine/src/test_util/temp_db.rs"]
+pub mod temp_db;
 
 /// クライアント側ソケットの読み取り／書き込みタイムアウト。
 ///
@@ -84,35 +98,34 @@ pub fn spawn_http_listener(
 /// 昇格版（Issue #753。`/v1/session/close` の結合テスト・#754 以降も本関数を
 /// 再利用する想定）。`sessions` は呼び出し元が上限・TTL を制御できるよう
 /// `SessionStore` をそのまま受け取る。
+///
+/// `core`（クエリ実行）は `scan` op の束縛・実行が結線された後（TASK-186・
+/// NOSQL-3・Issue #766）はテーブルを一切持たないスローアウェイ
+/// `EngineCore` を内部で構築して渡す。`table: "docs"` への `scan` はこの
+/// スローアウェイ core 上では `SqlSurfaceError::UndefinedTable`
+/// （`42P01`／404）となるため、「認証 → op 許可リスト → スキーマ検証 →
+/// engine 呼び出し」が最後まで走ったことの非 vacuous な証跡が
+/// [`assert_reached_query_gate`] として得られる（データを investigate
+/// したいテストは [`spawn_router_listener_with_engine`] を使うこと）。
 pub fn spawn_router_listener(
     users_path: &std::path::Path,
     sessions: wire_server::http::session::store::SessionStore,
 ) -> SocketAddr {
-    let store = wire_server::auth::UserStore::load_from_file(users_path).expect("valid store");
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    let limiter = ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS);
-    let router = wire_server::http::router::Router::new(std::sync::Arc::new(store), sessions);
-
-    std::thread::spawn(move || {
-        wire_server::http::listener::accept_loop_with_router(
-            listener,
-            limiter,
-            wire_server::limits::READ_TIMEOUT,
-            router,
-        );
-    });
-
-    addr
+    let path = temp_db::unique_db_path("query-gate-throwaway");
+    let core = EngineCore::open(&path).expect("open throwaway engine core");
+    spawn_router_listener_with_engine(users_path, sessions, std::sync::Arc::new(core))
 }
 
-/// [`spawn_router_listener`] の `engine` 接続版（Issue #768・TASK-177・
-/// NOSQL-4。`wire_server::http::router::Router::with_engine` 経由）。
-/// `POST /v1/query`（`op: aggregate`）が実行可能なリスナーを起動する。
+/// [`spawn_router_listener`] と同一の production 入口
+/// （[`wire_server::http::router::Router`]）を、呼び出し元が用意した
+/// `engine`（データを事前に seed 済みの `EngineCore` 等）を接続した状態
+/// （`Router::with_engine` 経由。Issue #766・TASK-176・NOSQL-3・Issue #768・
+/// TASK-177・NOSQL-4）で起動する。`POST /v1/query`（`op: scan`／
+/// `op: aggregate`）が実行可能なリスナーを起動する。
 pub fn spawn_router_listener_with_engine(
     users_path: &std::path::Path,
     sessions: wire_server::http::session::store::SessionStore,
-    engine: std::sync::Arc<engine::core::EngineCore>,
+    engine: std::sync::Arc<EngineCore>,
 ) -> SocketAddr {
     let store = wire_server::auth::UserStore::load_from_file(users_path).expect("valid store");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -427,6 +440,23 @@ pub fn assert_rejected(resp: &HttpResponse, expected_status: u16, expected_wire_
 pub fn assert_reached_router(resp: &HttpResponse) {
     assert_status_and_wire_code(resp, 400, "08P01");
     assert_eq!(error_message_of(resp), ROUTER_PLACEHOLDER_MESSAGE);
+}
+
+/// `op: "scan"` の最小要求本文。[`spawn_router_listener`] のスローアウェイ
+/// `EngineCore`（テーブル未作成）へ送ると「認証 → op 許可リスト → スキーマ
+/// 検証 → engine 呼び出し」が最後まで走ったうえで `table: "docs"` が
+/// 未存在と判定される（TASK-186・NOSQL-3・Issue #766 で `scan` が実行結線
+/// されたため、他 3 op と異なりもう暫定 `0A000`／501 を返さない）。
+pub const GATE_PROBE_BODY: &[u8] = br#"{"op":"scan","table":"docs","limit":1}"#;
+
+/// [`GATE_PROBE_BODY`] を [`spawn_router_listener`] のスローアウェイ
+/// `EngineCore` へ送った応答が「認証・op 許可リスト・スキーマ検証を通過し
+/// engine まで到達したこと」の非 vacuous な証跡（`42P01`／404。SQL 経路の
+/// 未存在テーブル判定と同一分類）であることを検証する。`search`／
+/// `aggregate`／`insert` が後続 Issue で結線されても、本アサーションは
+/// `scan` のみを対象とするため影響を受けない。
+pub fn assert_reached_query_gate(resp: &HttpResponse) {
+    assert_status_and_wire_code(resp, 404, "42P01");
 }
 
 /// 応答本文（`message` フィールド・生バイト列の双方）に `marker` が含まれて

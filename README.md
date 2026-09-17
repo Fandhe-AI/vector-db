@@ -106,18 +106,21 @@ bind は同じ理由で起動拒否されます。`nosql` を選択すると、�
 `insert`）の許可リストへ照らし、語彙外（DDL・UDF 呼び出し・トランザクション
 制御・UPDATE／DELETE 相当を含む）は `wire_code` `0A000`（HTTP 501）で
 拒否します（Issue #759・TASK-179・NOSQL-1・NOSQL-9）。語彙内の要求は
-本文スキーマ検証を経て、`op: aggregate`（`explain: true` を除く単一行集計・
-`GROUP BY`／`HAVING` 集計の双方）は SQL テキストを組み立てずに
-`engine::sql::parser::BoundAggregate` へ直接束縛・実行し、SQL 表層と
-同一の結果（NULL・オーバーフロー `22003`・`VECTOR` 列拒否を含む）を返します
-（Issue #768・TASK-177・NOSQL-4）。`group_by`（単一列限定）・`having`
-（`=`／`<`／`<=`／`>`／`>=` の 5 演算子）は SQL-14 の `GROUP BY` 実行計画
-（`engine::sql::group_by::execute_grouped_aggregate`）へ写像し、グループ数
-上限（`MAX_GROUPS`＝10,000）・グループキー累計バイト・`HAVING` 述語数上限
-の超過はいずれも `wire_code` `54000` で拒否します（Issue #769・TASK-177・
-NOSQL-5）。それ以外の op（`search`／`scan`／`insert`）は現時点では暫定の
-`wire_code` `0A000`（HTTP 501）を返します（束縛・実行計画への写像は
-Issue #763・#766 の担当）。`/v1/session`・
+本文スキーマ検証を経て、`scan` は束縛済み実行計画（`BoundScan`）へ写像し
+`EngineCore` で実行して `{"columns":...,"rows":...,"row_count":...}` を
+返します（`vector`／`plan`／`mode`／`hybrid` の付与・`explain: true` は
+いずれも `wire_code` `42601` で拒否。Issue #766・TASK-176・NOSQL-3）。
+`op: aggregate`（`explain: true` を除く単一行集計・`GROUP BY`／`HAVING`
+集計の双方）は SQL テキストを組み立てずに `engine::sql::parser::BoundAggregate`
+へ直接束縛・実行し、SQL 表層と同一の結果（NULL・オーバーフロー `22003`・
+`VECTOR` 列拒否を含む）を返します（Issue #768・TASK-177・NOSQL-4）。
+`group_by`（単一列限定）・`having`（`=`／`<`／`<=`／`>`／`>=` の 5 演算子）は
+SQL-14 の `GROUP BY` 実行計画（`engine::sql::group_by::execute_grouped_aggregate`）
+へ写像し、グループ数上限（`MAX_GROUPS`＝10,000）・グループキー累計バイト・
+`HAVING` 述語数上限の超過はいずれも `wire_code` `54000` で拒否します
+（Issue #769・TASK-177・NOSQL-5）。それ以外の op（`search`／`insert`）は
+現時点では暫定の `wire_code` `0A000`（HTTP 501）を返します（束縛・実行
+計画への写像は Issue #763・#771 の担当）。`/v1/session`・
 `/v1/session/close`・`/v1/query` の 3 エンドポイントは
 バイト厳密一致でのみ受理し、それ以外のパス（完全未知パス・クエリ文字列
 付き・末尾スラッシュ／余剰セグメント・大文字小文字違い等）はすべて

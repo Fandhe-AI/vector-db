@@ -37,8 +37,10 @@
 mod common;
 #[path = "http_common/mod.rs"]
 mod http_common;
-#[path = "../../engine/src/test_util/temp_db.rs"]
-mod temp_db;
+// `temp_db` は `http_common` が `pub mod temp_db;` として再エクスポートする
+// ため、ここでは独自に `mod temp_db;` を宣言しない
+// （`clippy::duplicate_mod` 回避。`http_common/mod.rs` のコメント参照）。
+use http_common::temp_db;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
