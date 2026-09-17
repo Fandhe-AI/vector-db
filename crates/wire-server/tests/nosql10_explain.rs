@@ -366,6 +366,40 @@ fn undefined_table_rejects_with_42p01_before_invalid_mode_with_explain_true() {
     assert_eq!(http_common::wire_code_of(&resp), "42P01", "resp={resp:?}");
 }
 
+/// 未知テーブル＋`plan` 欠落は `explain: true` 経路でも `42P01` が `plan`
+/// 欠落の `42601` より優先される（codex-review P1 指摘・PR #828。
+/// `explain::execute` が `plan` 欠落判定をテーブル解決前に行うと、未知
+/// テーブル＋ `plan` 欠落の要求で `42P01` より先に `42601` が確定して
+/// しまう回帰。`super::search::execute` が `vector`／`plan` 両方欠落の
+/// 判定をテーブル解決後の `bind_search` へ委ねるのと同じ優先順位を
+/// `explain: true` 経路でも保証する）。
+#[test]
+fn undefined_table_rejects_with_42p01_before_missing_plan_with_explain_true() {
+    let (core, _guard) = new_core();
+    let (addr, token) = spawn_alice_session(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"missing","limit":1,"explain":true}"#;
+    let resp = query(addr, &token, body);
+    assert_eq!(http_common::wire_code_of(&resp), "42P01", "resp={resp:?}");
+}
+
+/// 未知テーブル＋`limit` 範囲外は `explain: true` 経路でも `limit` の
+/// 範囲検証（`22000`）がテーブル解決（`42P01`）より優先される（codex-review
+/// P1 指摘・PR #828。対応する SQL `EXPLAIN`〔`core.rs` の `Statement::
+/// Explain` アーム〕が `run_explain_plan` 呼び出し前〔テーブル解決前〕に
+/// `validate_search_limit` を呼ぶのと同一の優先順位を、通常の `plan` 検索
+/// 〔`search.rs::execute`〕と同様に `explain: true` 経路でも保証する）。
+#[test]
+fn limit_out_of_range_rejects_with_22000_before_undefined_table_with_explain_true() {
+    let (core, _guard) = new_core();
+    let (addr, token) = spawn_alice_session(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"missing","plan":"find content","limit":0,
+        "explain":true}"#;
+    let resp = query(addr, &token, body);
+    assert_eq!(http_common::wire_code_of(&resp), "22000", "resp={resp:?}");
+}
+
 #[test]
 fn explain_true_reports_hnsw_params_and_does_not_touch_hnsw_index_cache() {
     let (core, _guard) = new_hnsw_core();

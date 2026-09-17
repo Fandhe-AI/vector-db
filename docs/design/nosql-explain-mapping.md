@@ -59,21 +59,38 @@
   透過）・`ExplainRequiresPlan`（`vector` 指定または `plan` 未指定。`42601`。
   SQL-6 の「`EXPLAIN` は `USING PLAN` 付き検索 `SELECT` 専用」契約の写像）・
   `Engine(SqlSurfaceError)`・`Encode(ResponseEncodeError)` の 4 種。
-- `execute`: `table`（識別子形状検査）→ `vector` 指定拒否 → `plan` 未指定
-  拒否＋長さ検証（`validate_using_plan_question`）→ `mode`（識別子形状検査
-  のみ。語彙検証は行わない）を読み取ってから `EngineCore::
-  explain_bound_plan_in_session` を生リテラルのまま渡して呼ぶ（Cursor
-  Bugbot 指摘対応・PR #828 レビュー。`mode` の語彙検証〔`SearchMode::
-  parse_literal`〕をここで先に行うと、テーブル未存在＋ mode 値不正の要求で
-  `22000` が `42P01` より先に確定してしまう。`explain_bound_plan_in_session`
-  がテーブル解決後に初めて解析することで SQL `EXPLAIN` 経路と同一の
-  fail-closed 順序を保つ）。binder closure は `bind_search`（Issue #763）の
-  完全な束縛結果から `BoundSearch::Plan` のフィルタのみを取り出して
-  `ExplainShape::from_filters` を組み立てる（`BoundSearch::Vector` への
-  到達は構造上ないが、多層防御として `ExplainRequiresPlan` へ拒否する）。
-  `table`／`plan`／`mode` の検証は `bind_search` 内でも再度行われる（二重
-  検査。`EngineCore::explain_bound_plan_in_session` のドキュメント参照）。
-  第 2 の実行器は作らない。
+- `execute`: `table`（識別子形状検査）→ `vector` 指定拒否（`42601`。`plan`
+  の有無によらずテーブル解決を要さない構造的違反のため最優先。同時指定も
+  この分岐で拒否）→ `plan` が指定されている場合のみ長さ検証
+  （`validate_using_plan_question`。`54000`）→ `limit` の型・範囲検証
+  （`validate_search_limit`。`22000`）→ `mode`（識別子形状検査のみ。語彙
+  検証は行わない）を読み取ってから `EngineCore::explain_bound_plan_in_
+  session` を（`plan` 未指定の場合もプレースホルダの空文字列を渡して）
+  呼ぶ。binder closure はテーブル解決後に初めて `plan` 欠落を判定してから
+  `bind_search`（Issue #763）の完全な束縛結果から `BoundSearch::Plan` の
+  フィルタのみを取り出して `ExplainShape::from_filters` を組み立てる
+  （`BoundSearch::Vector` への到達は構造上ないが、多層防御として
+  `ExplainRequiresPlan` へ拒否する）。`table`／`plan`／`mode` の検証は
+  `bind_search` 内でも再度行われる（二重検査。`EngineCore::
+  explain_bound_plan_in_session` のドキュメント参照）。第 2 の実行器は
+  作らない。
+  - `mode` の語彙検証（`SearchMode::parse_literal`）をここで先に行うと、
+    テーブル未存在＋ mode 値不正の要求で `22000` が `42P01` より先に確定
+    してしまう。`explain_bound_plan_in_session` がテーブル解決後に初めて
+    解析することで SQL `EXPLAIN` 経路と同一の fail-closed 順序を保つ
+    （Cursor Bugbot 指摘対応・PR #828 レビュー）。
+  - `limit` の検証をテーブル解決後（binder closure 内）まで遅延させると、
+    未知テーブル＋ `limit` 範囲外の要求で `42P01` が `22000` より先に確定
+    してしまう。SQL `EXPLAIN` 経路〔`core.rs` の `Statement::Explain` アーム〕
+    が `run_explain_plan` 呼び出し前に `validate_search_limit` を呼ぶのと
+    同一の優先順位を、通常の `plan` 検索（`search.rs::execute`）と同様に
+    ここでも保つ（codex-review P1 指摘対応・PR #828）。
+  - `plan` 欠落判定をテーブル解決前に行うと、未知テーブル＋ `plan` 欠落の
+    要求で `42601` が `42P01` より先に確定してしまう。`super::search::
+    execute` が `vector`／`plan` 両方欠落の判定を `bind_search` 自身の
+    テーブル解決後へ委ねるのと同じ優先順位を保つため、判定を binder
+    closure（テーブル解決後）まで遅延させる（codex-review P1 指摘対応・
+    PR #828）。
 - `response::encode_explain`: `QueryResult` が `Computed { name: "QUERY
   PLAN" }` 1 列・各行 `Cell::Text` 1 個であることを検証してから
   `{"explain":["<行>", ...]}`（キー固定・空白なし）へ写像する。逸脱時は
@@ -104,9 +121,12 @@
   経由の層 A）: SQL `EXPLAIN` との行単位一致（フィルタなし・フィルタ
   あり・`mode` あり）・HNSW opt-in 時の `hnsw_params:` 行・`vector` 指定
   拒否・`vector`＋`plan` 併存拒否・未知テーブル＋ `mode` 値不正で `42P01`
-  が `22000` より優先されること（PR #828 レビュー対応）・プランナー未注入
-  時の `XX000`・`aggregate`／`scan` の `explain: true` が引き続き
-  `42601`・他テナント行内容の非漏えいを検証。
+  が `22000` より優先されること（PR #828 レビュー対応）・未知テーブル＋
+  `plan` 欠落で `42P01` が `42601` より優先されること・未知テーブル＋
+  `limit` 範囲外で `22000` が `42P01` より優先されること（いずれも
+  codex-review P1 指摘対応・PR #828）・プランナー未注入時の `XX000`・
+  `aggregate`／`scan` の `explain: true` が引き続き `42601`・他テナント
+  行内容の非漏えいを検証。
 - `crates/wire-server/tests/nosql4_aggregate.rs`: `explain_true_rejects_
   with_0a000_and_does_not_execute` を `explain_true_rejects_with_42601_
   and_does_not_execute` へ改名・期待値を `42601` へ更新。

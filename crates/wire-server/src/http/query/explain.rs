@@ -40,6 +40,7 @@ use engine::sql::allowlist::{validate_using_plan_question, SqlSurfaceError};
 use engine::sql::exec::QueryResult;
 use engine::sql::explain::ExplainShape;
 use engine::sql::mode::SessionState;
+use engine::sql::parser::validate_search_limit;
 
 use super::ident::{self, InvalidIdentifier};
 use super::response::{self, ResponseEncodeError};
@@ -124,22 +125,36 @@ impl ClassifiedError for ExplainError {
 /// `explain: true` 判定は呼び出し元 [`super::gate::handle`] が行う）から
 /// `EXPLAIN` 応答を組み立てる。
 ///
-/// 処理順序（fail-closed。順序自体が契約の一部）:
+/// 処理順序（fail-closed。順序自体が契約の一部。[`super::search::execute`]・
+/// SQL `EXPLAIN` 経路〔`core.rs::run_explain_plan`〕と同一の優先順位に
+/// 揃える。codex-review P1 指摘対応・PR #828）:
 /// 1. `table`（識別子形状検査）を読み取る。
-/// 2. `vector` 指定を拒否する（`42601`）。
-/// 3. `plan` 未指定を拒否する（`42601`）。`plan`（`USING PLAN` 質問文字列）は
-///    [`validate_using_plan_question`] で長さ上限を検証する。
-/// 4. `mode` は識別子形状検査のみここで行い、語彙検証（`SearchMode::
+/// 2. `vector` 指定を拒否する（`42601`。`plan` の有無によらずテーブル解決を
+///    要さない構造的な契約違反のため最優先。`vector`／`plan` 同時指定も
+///    この分岐で拒否される）。
+/// 3. `plan` が指定されている場合のみ、[`validate_using_plan_question`] で
+///    長さ上限を検証する（`54000`。[`super::search::execute`] の `plan`
+///    分岐と同じくテーブル解決より前に行う）。`plan` 未指定（`None`）は
+///    ここでは拒否せず手順 6 へ委ねる。
+/// 4. `limit` の型・範囲を [`validate_search_limit`] で検証する（`22000`。
+///    SQL `EXPLAIN` 経路が `run_explain_plan` 呼び出し前に同じ検証を行うのと
+///    同一の優先順位でテーブル解決より前に行う）。
+/// 5. `mode` は識別子形状検査のみここで行い、語彙検証（`SearchMode::
 ///    parse_literal`）は生リテラルのまま
 ///    [`engine::core::EngineCore::explain_bound_plan_in_session`] へ渡し、
-///    テーブル解決後に解析させる（Cursor Bugbot 指摘対応: 未知テーブル
-///    〔`42P01`〕が `mode` 値不正〔`22000`〕より優先される順序を、SQL
-///    `EXPLAIN` 経路〔`core.rs::run_explain_plan`〕と同一に保つため）。
-/// 5. [`engine::core::EngineCore::explain_bound_plan_in_session`] を呼ぶ。
-///    binder closure は [`bind_search`] の完全な束縛結果から
-///    [`BoundSearch::Plan`] のフィルタのみを取り出す（`BoundSearch::Vector`
-///    への到達は手順 2 により構造上ないが、多層防御として
-///    [`ExplainError::ExplainRequiresPlan`] へ拒否する）。
+///    テーブル解決後に解析させる（未知テーブル〔`42P01`〕が `mode` 値不正
+///    〔`22000`〕より優先される順序を、SQL `EXPLAIN` 経路と同一に保つ）。
+/// 6. [`engine::core::EngineCore::explain_bound_plan_in_session`] を呼ぶ
+///    （`plan` 未指定の場合もプレースホルダの空文字列を渡して呼び出し自体は
+///    行う。テーブル解決が先に走り、テーブルが存在すれば binder closure が
+///    テーブル解決後に初めて `plan` 欠落を判定するため、未知テーブルの
+///    `42P01` が `plan` 欠落の `42601` より優先される。LLM I/O
+///    〔`plan_query_with_mode`〕は binder closure がエラーを返した時点で
+///    呼ばれないため、空文字列が実際に使われることはない）。binder closure
+///    は [`bind_search`] の完全な束縛結果から [`BoundSearch::Plan`] の
+///    フィルタのみを取り出す（`BoundSearch::Vector` への到達は手順 2 により
+///    構造上ないが、多層防御として [`ExplainError::ExplainRequiresPlan`]
+///    へ拒否する）。
 pub fn execute(
     core: &EngineCore,
     ctx: &PolicyContext,
@@ -151,10 +166,17 @@ pub fn execute(
     if validated.optional_array("vector")?.is_some() {
         return Err(ExplainError::ExplainRequiresPlan);
     }
-    let question = validated
-        .optional_str("plan")?
-        .ok_or(ExplainError::ExplainRequiresPlan)?;
-    validate_using_plan_question(question)?;
+
+    // `plan` が指定されている場合のみ長さ上限を検証する。未指定はここでは
+    // 拒否しない（手順 6 のコメント参照。未知テーブルの `42P01` を `plan`
+    // 欠落の `42601` より優先させるため）。
+    let question = validated.optional_str("plan")?;
+    if let Some(q) = question {
+        validate_using_plan_question(q)?;
+    }
+
+    let limit_raw = validated.required_u32("limit")?;
+    validate_search_limit(limit_raw)?;
 
     // `mode` の語彙解析（`SearchMode::parse_literal`）はここでは行わない
     // （Cursor Bugbot 指摘対応: `engine::core::EngineCore::
@@ -172,9 +194,14 @@ pub fn execute(
         ctx,
         &session,
         table,
-        question,
+        question.unwrap_or(""),
         mode_literal,
         |schema, _udfs| -> Result<ExplainShape, ExplainError> {
+            // テーブル解決後に初めて `plan` 欠落を判定する（codex-review P1
+            // 指摘対応・PR #828。`super::search::execute` が `vector`／`plan`
+            // 両方欠落の判定を `bind_search` 自身のテーブル解決後へ委ねるのと
+            // 同じ設計）。
+            question.ok_or(ExplainError::ExplainRequiresPlan)?;
             match bind_search(validated, schema)? {
                 BoundSearch::Plan(plan) => {
                     Ok(ExplainShape::from_filters(plan.metadata_filters(), &[]))
