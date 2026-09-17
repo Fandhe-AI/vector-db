@@ -45,6 +45,7 @@ use engine::sql::parser::{bind_projection, validate_search_limit, BoundScan};
 use engine::sql::udf_call::MAX_EXPR_NODES;
 
 use super::filter::{map_filter_items, FilterError};
+use super::ident::{self, InvalidIdentifier};
 use super::schema::{SchemaError, Validated};
 use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
@@ -62,8 +63,15 @@ pub enum ScanError {
     /// [`validate_search_limit`] の範囲（`1..=`
     /// [`engine::core::MAX_SEARCH_K`]）外（固定文言。SQL-15 と同じ分類 `42601`）。
     InvalidLimit,
-    /// `columns` が空配列、または要素に空文字列・制御文字を含む文字列がある
-    /// （固定文言。untrusted な列名文字列そのものは含めない）。
+    /// `table`／`columns` の要素が識別子形状検査（[`super::ident::
+    /// check_identifier`]）を満たさない。`search`／`aggregate` の
+    /// `InvalidIdentifier` と同じ判断（cursor[bot] 指摘。SQL レキサーが
+    /// 拒否する形状の文字列を engine のスキーマ解決より前に `42601` へ
+    /// 落とし、63 文字を超える長大文字列を schema 突き合わせより前に
+    /// 打ち切る）。
+    InvalidIdentifier,
+    /// `columns` が空配列、または要素に空文字列を含む（固定文言。untrusted
+    /// な列名文字列そのものは含めない）。
     InvalidColumns,
     /// `explain: true` の指定（SQL-15 の bare 形は `EXPLAIN` 前置を拒否する
     /// 契約と同じ判断を NoSQL 表層側で明示的に適用する）。
@@ -85,6 +93,12 @@ impl From<FilterError> for ScanError {
     }
 }
 
+impl From<InvalidIdentifier> for ScanError {
+    fn from(_err: InvalidIdentifier) -> Self {
+        ScanError::InvalidIdentifier
+    }
+}
+
 impl From<SqlSurfaceError> for ScanError {
     fn from(err: SqlSurfaceError) -> Self {
         ScanError::Engine(err)
@@ -97,6 +111,7 @@ impl ClassifiedError for ScanError {
             ScanError::Shape(err) => err.error_class(),
             ScanError::Filter(err) => err.error_class(),
             ScanError::InvalidLimit
+            | ScanError::InvalidIdentifier
             | ScanError::InvalidColumns
             | ScanError::ExplainNotSupported => ErrorClass::UnsupportedSqlSyntax,
             ScanError::Engine(err) => err.error_class(),
@@ -110,6 +125,7 @@ impl ClassifiedError for ScanError {
             ScanError::InvalidLimit => {
                 "limit must be a positive integer within the supported range".to_string()
             }
+            ScanError::InvalidIdentifier => "invalid identifier".to_string(),
             ScanError::InvalidColumns => {
                 "columns must be a non-empty array of non-empty column name strings".to_string()
             }
@@ -150,9 +166,9 @@ fn build_projection(validated: &Validated<'_>) -> Result<Projection, ScanError> 
         let JsonValue::String(s) = item else {
             return Err(ScanError::InvalidColumns);
         };
-        if s.is_empty() || s.chars().any(char::is_control) {
-            return Err(ScanError::InvalidColumns);
-        }
+        // `search`／`aggregate` と同じ識別子形状検査（SQL レキサーが `Ident`
+        // として読む文字集合・63 文字上限）を先に通す（cursor[bot] 指摘）。
+        ident::check_identifier(s)?;
         names.push(s.clone());
     }
     Ok(Projection::Columns(names))
@@ -190,6 +206,11 @@ pub fn execute(
     }
 
     let table = validated.required_str("table")?;
+    // `search`／`aggregate` と同じ識別子形状検査を engine のスキーマ解決
+    // （`resolve_scan_input`）より前に適用する（cursor[bot] 指摘。SQL レキサー
+    // が拒否する形状の `table` を `42P01`／`22000` ではなく `42601` へ揃え、
+    // 63 文字を超える長大文字列を schema 走査より前に打ち切る）。
+    ident::check_identifier(table)?;
     let raw_limit = validated.required_number("limit")?;
     let limit = validate_search_limit(limit_to_u32(raw_limit)?)?;
     let projection = build_projection(validated)?;
@@ -262,7 +283,19 @@ mod tests {
     #[test]
     fn scan_error_wire_codes_match_expected_classes() {
         assert_eq!(ScanError::InvalidLimit.wire_code(), "42601");
+        assert_eq!(ScanError::InvalidIdentifier.wire_code(), "42601");
         assert_eq!(ScanError::InvalidColumns.wire_code(), "42601");
         assert_eq!(ScanError::ExplainNotSupported.wire_code(), "42601");
+    }
+
+    /// `ScanError::InvalidIdentifier` の応答文言は固定文言であり、
+    /// untrusted な識別子文字列をそのまま含まない（`ident::
+    /// check_identifier` の非漏えい契約を `ScanError` 側でも維持する）。
+    #[test]
+    fn invalid_identifier_client_message_is_fixed_and_does_not_leak_input() {
+        assert_eq!(
+            ScanError::InvalidIdentifier.client_message(),
+            "invalid identifier"
+        );
     }
 }

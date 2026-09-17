@@ -422,6 +422,73 @@ fn undefined_table_rejects_with_42p01() {
     assert_eq!(http_common::wire_code_of(&resp), "42P01");
 }
 
+// --- (12b) `table`／`columns` の識別子形状検査（cursor[bot] 指摘） ----------
+
+/// `table` が SQL レキサーの識別子形状（先頭 ASCII 英字／`_`、以降 ASCII
+/// 英数字／`_`、63 文字以下）を満たさない場合、engine のスキーマ解決
+/// （`42P01`／`22000`）ではなく `ident::check_identifier` による `42601` に
+/// なることを固定する（`search`／`aggregate` op と同じ分類）。
+#[test]
+fn table_with_invalid_shape_rejects_with_42601() {
+    let (core, _guard) = new_core_scan_docs();
+    let (addr, token) = spawn_alice_session(core);
+
+    for table in ["1abc", "doc s", "doc;s", "doc.s", "-abc"] {
+        let body = format!(r#"{{"op":"scan","table":"{table}","limit":1}}"#);
+        let resp = query(addr, &token, body.as_bytes());
+        assert_eq!(resp.status, 400, "table={table:?} body={resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), "42601", "table={table:?}");
+    }
+}
+
+/// `table` が 64 文字（`MAX_IDENTIFIER_LEN` 超過）の場合、schema 走査より
+/// 前に `42601` で拒否される（DoS 対策としての事前フィルタ。長大文字列は
+/// JSON パーサ自体〔`engine::json::MAX_JSON_STRING_CHARS`〕は受理しうる）。
+#[test]
+fn table_over_length_limit_rejects_with_42601() {
+    let (core, _guard) = new_core_scan_docs();
+    let (addr, token) = spawn_alice_session(core);
+
+    let oversized = "a".repeat(64);
+    let body = format!(r#"{{"op":"scan","table":"{oversized}","limit":1}}"#);
+    let resp = query(addr, &token, body.as_bytes());
+    assert_eq!(resp.status, 400, "body={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "42601");
+}
+
+/// `columns` の要素が識別子形状を満たさない場合も `42601` で拒否される
+/// （空文字列・制御文字のみを弾いていた既存判定〔Issue #766〕を、`search`／
+/// `aggregate` op と同じ字句解析相当の検査へ揃える。cursor[bot] 指摘）。
+#[test]
+fn columns_with_invalid_shape_rejects_with_42601() {
+    let (core, _guard) = new_core_scan_docs();
+    let (addr, token) = spawn_alice_session(core);
+
+    for column in ["1abc", "la ng", "la;ng", "la.ng"] {
+        let body = format!(r#"{{"op":"scan","table":"docs","limit":1,"columns":["{column}"]}}"#);
+        let resp = query(addr, &token, body.as_bytes());
+        assert_eq!(resp.status, 400, "column={column:?} body={resp:?}");
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "42601",
+            "column={column:?}"
+        );
+    }
+}
+
+/// `columns` 要素が 64 文字（`MAX_IDENTIFIER_LEN` 超過）の場合も `42601`。
+#[test]
+fn columns_element_over_length_limit_rejects_with_42601() {
+    let (core, _guard) = new_core_scan_docs();
+    let (addr, token) = spawn_alice_session(core);
+
+    let oversized = "a".repeat(64);
+    let body = format!(r#"{{"op":"scan","table":"docs","limit":1,"columns":["{oversized}"]}}"#);
+    let resp = query(addr, &token, body.as_bytes());
+    assert_eq!(resp.status, 400, "body={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "42601");
+}
+
 // --- (13) 応答本文の非漏えい -------------------------------------------------
 
 #[test]
