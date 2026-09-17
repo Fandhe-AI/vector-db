@@ -10,6 +10,9 @@
 //! `execute_sql_in_session`（SQL テキスト経由）の `QueryResult` を
 //! `wire_server::http::query::response::encode` へ通した JSON 本文
 //! （wire 応答の本文と**バイト単位で完全一致**することを確認する。
+//!
+//! `wire_aggregate.rs` と同一 seed による pg wire ↔ NoSQL 2 表層パリティ検証は
+//! `nosql4_5_aggregate_wire_parity.rs` を参照（Issue #770）。
 
 #[path = "common/mod.rs"]
 mod common;
