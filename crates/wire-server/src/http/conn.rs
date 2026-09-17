@@ -234,21 +234,27 @@ pub(crate) trait RequestHandler {
     fn handle(&self, req: &Request<'_>) -> Vec<u8>;
 }
 
+/// 未知の要求ターゲットに対する固定応答バイト列（`08P01`）を組み立てる
+/// 共通ヘルパ（Issue #758）。[`PlaceholderRouter`]（フレーミング層テスト用）
+/// と production [`crate::http::router::Router`] の双方がこれを呼ぶことで、
+/// 「未知パスの応答は両者でバイト同一」という契約を構造的に保証する
+/// （文言 `"unknown request target"` は `tests/http_common` 等が固定値として
+/// 依存しているため変更しない）。
+pub(crate) fn unknown_target_response(now: SystemTime) -> Vec<u8> {
+    response::encode_error(ErrorClass::ProtocolViolation, "unknown request target", now)
+}
+
 /// パス・メソッドを問わず常に `08P01`（`ErrorClass::ProtocolViolation`）で
 /// 拒否する placeholder。`http::listener::accept_loop_with_limiter`
 /// （後方互換 API）が使う。production 入口は
-/// [`crate::http::router::Router`]（Issue #752。`/v1/session` を
-/// `session::issue::handle` へディスパッチし、他パスは本型と同じバイト列
-/// で拒否する）。
+/// [`crate::http::router::Router`]（Issue #752・#758。`/v1/session`・
+/// `/v1/session/close`・`/v1/query` の 3 エンドポイントへディスパッチし、
+/// 他パスは [`unknown_target_response`] で本型と同じバイト列で拒否する）。
 pub(crate) struct PlaceholderRouter;
 
 impl RequestHandler for PlaceholderRouter {
     fn handle(&self, _req: &Request<'_>) -> Vec<u8> {
-        response::encode_error(
-            ErrorClass::ProtocolViolation,
-            "unknown request target",
-            SystemTime::now(),
-        )
+        unknown_target_response(SystemTime::now())
     }
 }
 

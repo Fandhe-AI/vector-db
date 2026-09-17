@@ -4,20 +4,25 @@
 //!
 //! `http::conn::handle_connection_with`（Issue #747・PR #810）は不正フレーム
 //! でも応答を書いてから未読データを有界に読み捨ててクローズする
-//! （lingering close）。本ファイルは production 入口
+//! （lingering close）。本ファイルは
 //! [`wire_server::http::listener::accept_loop_with_limiter`]（`PlaceholderRouter`
-//! 固定）を経由し、1 本の接続（A）が 3 種の不正フレームのいずれかを送っている
-//! 最中・直後でも、別の接続（B）が正常形の要求を完了できることを固定する。
+//! 固定。フレーミング層専用のテストヘルパーであり production ルータ経由
+//! ではない。モジュール doc「フレーミング層テスト用」節参照）を経由し、
+//! 1 本の接続（A）が 3 種の不正フレームのいずれかを送っている最中・直後でも、
+//! 別の接続（B）が正常形の要求を完了できることを固定する。
 //!
 //! ## 「B が成功」の定義（観測境界）
 //!
-//! 本テスト時点のルータは [`wire_server::http::conn::PlaceholderRouter`]（全
-//! パス `08P01` 固定）であり、実ルータ（Issue #758）はまだ無い。そのため
+//! 本ファイルは [`wire_server::http::conn::PlaceholderRouter`]（全パス
+//! `08P01` 固定）を意図的に使い続ける（production ルータ経由の同型検証は
+//! `tests/nosql1_endpoint_routing.rs`〔Issue #758〕が担う）。そのため
 //! ここでの「B が成功」は「要求行・ヘッダ・本文の全段を読み切りルータへ
 //! 到達した証跡として `message == "unknown request target"` を完全受信し、
-//! 最終 read が `Ok(0)`（クリーンな EOF）で終わること」で定義する。実ルータ
-//! 導入後は B の期待をステータス `200` へ反転させる想定（Issue #758 側の
-//! 申し送り）。
+//! 最終 read が `Ok(0)`（クリーンな EOF）で終わること」で定義する。
+//! production ルータでは `/v1/session`・`/v1/session/close`・`/v1/query`
+//! 以外の未知パスも同じく `08P01`（`ROUTER_PLACEHOLDER_MESSAGE` と同一
+//! バイト列）のままであり、本ファイルの前提はそのまま成立する
+//! （Issue #758 実装記録参照）。
 //!
 //! ## EOF 判定規約
 //!
@@ -222,7 +227,8 @@ fn assert_08p01(bytes: &[u8], expected_message: &str) {
 
 /// B 側（正常形）の応答: `PlaceholderRouter` に到達した証跡として
 /// `400`／`08P01`／`"unknown request target"` を確認する（§「B が成功」の
-/// 定義」参照。実ルータ導入〔Issue #758〕後はこの期待を `200` へ反転する）。
+/// 定義」参照。本ファイルは `PlaceholderRouter` 固定のフレーミング層テスト
+/// のため、production ルータ導入〔Issue #758〕後もこの期待は反転しない）。
 fn assert_router_success(bytes: &[u8]) {
     assert_08p01(bytes, "unknown request target");
 }

@@ -36,7 +36,7 @@ use crate::http::query::schema::schema_for;
 use crate::http::session::middleware::{self, SessionPrincipal};
 use crate::http::{body, response};
 
-/// 検証を通過した要求に返す暫定応答の文言（束縛・実行は #758／#759／#763
+/// 検証を通過した要求に返す暫定応答の文言（束縛・実行は #759／#763
 /// 以降の担当。本 Issue 時点は seam のみ）。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
 

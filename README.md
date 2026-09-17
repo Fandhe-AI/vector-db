@@ -104,9 +104,14 @@ bind は同じ理由で起動拒否されます。`nosql` を選択すると、�
 み導出。Issue #754・TASK-174・HTTP-5・HTTP-6・HTTP-7）。検証を通過した
 要求には現時点では暫定の `wire_code` `0A000`（HTTP 501）を返します
 （op 許可リストの正式化・束縛・実行計画への写像は Issue #759・#763 以降の
-担当）。それ以外のパス（クエリ文字列付き・末尾スラッシュ違い等）は引き続き
-`08P01`（`unknown request target`）で拒否されます。3 エンドポイント限定の
-実ルータ完成（#758）は後続 Issue の担当です。この `catch_unwind` は
+担当）。`/v1/session`・`/v1/session/close`・`/v1/query` の 3 エンドポイントは
+バイト厳密一致でのみ受理し、それ以外のパス（完全未知パス・クエリ文字列
+付き・末尾スラッシュ／余剰セグメント・大文字小文字違い等）はすべて
+`08P01`（`unknown request target`。ルータでの判定）で拒否します。
+`POST` 以外のメソッドは要求行パーサ（HTTP-2）の段階で先に `08P01`
+（`invalid message frame`）として拒否されるため、ルータへは到達しません
+（Issue #758・TASK-179・NOSQL-1。`/v1/query` 配下の tenant マーカー判定
+〔`42601`。Issue #754〕は本 08P01 判定より優先します）。この `catch_unwind` は
 `wire-server` を lib として使う
 経路・テストでの防御であり、production バイナリでは起動時に導入する
 panic hook（RECOVER-8）が unwind 前に `abort()` するため
