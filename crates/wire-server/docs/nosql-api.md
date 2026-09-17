@@ -212,7 +212,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `limit` | ○ | number | `1..=10000` |
 | `filter` | △ | object[] | |
 | `columns` | △ | string[]（非空） | 省略時は `id`＋全実列 |
-| `explain` | △ | bool | 常に `42601`（拒否。後述） |
+| `explain` | △ | bool | `true` は `42601`（拒否。後述）。`false`／省略時は通常実行 |
 
 `vector`／`plan`／`mode`／`hybrid` はスキーマが宣言しないフィールドのため、
 未知キーとして `42601` になる（`scan` への付与自体を個別に判定するロジックは
@@ -244,7 +244,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `filter` | △ | object[] | |
 | `group_by` | △ | string[]（ちょうど 1 要素） | `TEXT` 列限定 |
 | `having` | △ | object[]（`{"fn","column","op","value"}`） | `group_by` 必須。`op` は `=`／`<`／`<=`／`>`／`>=` の完全一致 |
-| `explain` | △ | bool | 常に `42601`（拒否） |
+| `explain` | △ | bool | `true` は `42601`（拒否）。`false`／省略時は通常実行 |
 
 要求例（単一行集計）:
 
@@ -297,8 +297,9 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 {"inserted": 1, "operation_id": "op-1"}
 ```
 
-- `VECTOR` 列は数値配列、nullable 列は省略または `null` 可、未知キー・次元
-  不一致・型不一致は `22000`
+- `VECTOR` 列は数値配列。`nullable` の宣言値に関わらず常に必須で、省略・`null`
+  はいずれも `22000`（省略・`null` が可能なのは nullable な `TEXT` 列限定）
+- 未知キー・次元不一致・型不一致は `22000`
 - 同一 `operation_id` の再送: 内容が一致すれば `23505`、不一致なら `22023`
   （台帳照合。TASK-101・RECOVER-10 の再送判定を透過する）
 - 同一テナント内の `id` 重複は `23505`（他テナントの同 `id` とは衝突せず、
