@@ -2361,9 +2361,26 @@ pub fn execute_insert(
     bound: &crate::sql::parser::BoundInsert,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
-    use crate::catalog::CatalogError;
-    use crate::storage::{StorageError, Visibility};
-    use crate::tenant::TenantWriteError;
+    execute_insert_with_schema(storage, ctx, bound, ledger_mode, None)
+}
+
+/// [`execute_insert`] の実体（`pub(crate)`）。`expected_schema` を追加で受け取る点
+/// のみが異なる（codex-review P1 指摘・PR #823）。[`execute_insert`] 自身は
+/// Issue #730 で公開 API へ昇格済みのため、シグネチャ変更（`check_core_api.sh`
+/// スナップショット更新）を避けてこの内部版へ切り出した。呼び出し元は
+/// [`execute_insert`]（`None` を渡す既存動作）と、`Some(&schema)` を渡す
+/// [`execute_insert_batch_with_schema`]（`bounds.len() == 1` の委譲先）・
+/// `core::EngineCore::execute_bound_insert_in_session`（束縛時スキーマと
+/// write トランザクション内で再取得したスキーマの不一致検査。詳細は
+/// `tenant::insert_typed_row_unchecked` のドキュメント参照）。
+pub(crate) fn execute_insert_with_schema(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundInsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    use crate::storage::Visibility;
 
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
@@ -2377,18 +2394,36 @@ pub fn execute_insert(
         Visibility::Private,
         &bound.values,
         ledger_write,
+        expected_schema,
     )
-    .map_err(|e| match e {
+    .map_err(map_insert_write_error)?;
+
+    Ok(InsertOutcome {
+        rows_affected: 1,
+        incremental: None,
+    })
+}
+
+/// [`execute_insert`]・[`execute_insert_batch`] が共有する
+/// `TenantWriteError` → `SqlSurfaceError` の写像本体（Issue #771・TASK-178・
+/// NOSQL-6 で切り出し。写像内容は切り出し前と完全に同一）。
+fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError {
+    use crate::catalog::CatalogError;
+    use crate::storage::StorageError;
+    use crate::tenant::TenantWriteError;
+
+    match e {
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
         // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
         TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
-        // `tenant::insert_typed_row_unchecked` 自体は `operation_id` 必須化ガード
-        // （`recovery::required_op_id::LedgerMode`）を持たない（`tenant.rs` モジュール
-        // ドキュメント参照）。本経路（SQL `INSERT`）ではガードを
-        // `sql::allowlist::validate_insert` が書き込みトランザクション開始前に
-        // 既に適用済みのため、この写像アームは実際には到達しない。ただし
-        // `TenantWriteError` の網羅性を保ち、`23502` を返す正しい写像を明示しておく
-        // （TASK-92・対象ビヘイビア: RECOVER-1）。
+        // `tenant::insert_typed_row_unchecked`／`insert_typed_rows_unchecked` 自体は
+        // `operation_id` 必須化ガード（`recovery::required_op_id::LedgerMode`）を
+        // 持たない（`tenant.rs` モジュールドキュメント参照）。本経路（SQL `INSERT`・
+        // NoSQL `insert` op）ではガードを呼び出し元（[`execute_insert`]・
+        // [`execute_insert_batch`]）が書き込みトランザクション開始前に既に適用済み
+        // のため、この写像アームは実際には到達しない。ただし `TenantWriteError` の
+        // 網羅性を保ち、`23502` を返す正しい写像を明示しておく（TASK-92・対象
+        // ビヘイビア: RECOVER-1）。
         TenantWriteError::MissingOperationId => SqlSurfaceError::MissingOperationId,
         // 台帳照合（TASK-101・RECOVER-10）: 同一 operation_id・同一内容の再送は
         // `23505`、内容不一致（v1 レガシーエントリへの再送を含む）は `22023` へ
@@ -2420,10 +2455,101 @@ pub fn execute_insert(
         _ => SqlSurfaceError::Internal {
             detail: "insert failed".to_string(),
         },
-    })?;
+    }
+}
 
+/// NoSQL 表層（`wire-server::http::query::insert`。Issue #771・TASK-178・NOSQL-6）
+/// の `insert` op が `rows` 配列全体を 1 つの `operation_id` に対応づけて書き込む
+/// ための複数行版。SQL-10 の [`execute_insert`]（1 呼び出し = 1 台帳エントリ）とは
+/// 異なり、`bounds` 全体を単一の write トランザクション・単一の台帳エントリへ
+/// まとめる（`crate::tenant::insert_typed_rows_unchecked`／
+/// `crate::recovery::content_hash::for_typed_insert_batch` のドキュメント参照）。
+///
+/// `bounds` は呼び出し元（wire-server）が JSON `rows[*]` を `BoundInsert` へ
+/// 束縛した結果。以下を呼び出し元の責務としてではなく、ここで検証する
+/// （engine クレート外から `BoundInsert` を直接構築してガード・整合性検査を
+/// 迂回できる経路を作らないため。`execute_insert` と同じ設計判断）:
+///
+/// - `bounds` が空 → `22000`（`insert_typed_rows_unchecked` 自体は空バッチを
+///   `Ok(())` で受理するが、`rows: []` は NoSQL 表層の意味論として拒否する。
+///   `core.rs::execute_bound_insert_in_session` の判定順序ドキュメント参照）
+/// - 全要素の `table`・`operation_id` が一致しない → `22000`（fail-closed。
+///   1 要求 = 1 テーブル・1 `operation_id` という契約を守る）
+///
+/// `operation_id` 必須化ガード（TASK-92・RECOVER-1）は本関数が自己完結して
+/// 適用する（`bounds[0].operation_id` を代表値として使う。上記の一致検証により
+/// 全要素で同一であることが保証されている）。`bounds.len() == 1` は
+/// [`execute_insert`] へ委譲し、単行の NoSQL insert が SQL-10 単行 INSERT と
+/// 同一の台帳ハッシュ空間に属するようにする（表層を跨いだ再送も同じ
+/// `(tenant, table, operation_id)` キーで判定される）。
+///
+/// 可視性は [`execute_insert`] と同じく常に [`crate::storage::Visibility::Private`]
+/// に固定する（`Public` 既定は越境露出になるため。上記ドキュメント参照）。
+pub fn execute_insert_batch(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bounds: &[crate::sql::parser::BoundInsert],
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    execute_insert_batch_with_schema(storage, ctx, bounds, ledger_mode, None)
+}
+
+/// [`execute_insert_batch`] の実体（`pub(crate)`）。`expected_schema` を追加で
+/// 受け取る点のみが異なる（codex-review P1 指摘・PR #823。[`execute_insert_with_schema`]
+/// のドキュメント参照。[`execute_insert_batch`] 自身は Issue #771 で公開 API へ
+/// 昇格済みのためシグネチャは変更しない）。唯一の呼び出し元は
+/// `core::EngineCore::execute_bound_insert_in_session`。
+pub(crate) fn execute_insert_batch_with_schema(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bounds: &[crate::sql::parser::BoundInsert],
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    use crate::storage::Visibility;
+
+    let Some(first) = bounds.first() else {
+        return Err(SqlSurfaceError::invalid_input(
+            "INSERT batch must contain at least one row",
+        ));
+    };
+    if bounds.len() == 1 {
+        return execute_insert_with_schema(storage, ctx, first, ledger_mode, expected_schema);
+    }
+
+    let table = first.table.as_str();
+    if bounds
+        .iter()
+        .any(|b| b.table != table || b.operation_id != first.operation_id)
+    {
+        return Err(SqlSurfaceError::invalid_input(
+            "INSERT batch rows must share the same table and operation_id",
+        ));
+    }
+
+    let ledger_write = ledger_mode
+        .resolve(first.operation_id.as_ref())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+
+    let rows: Vec<(u64, &[crate::row_codec::Value])> =
+        bounds.iter().map(|b| (b.id, b.values.as_slice())).collect();
+
+    crate::tenant::insert_typed_rows_unchecked(
+        storage,
+        table,
+        ctx,
+        Visibility::Private,
+        &rows,
+        ledger_write,
+        expected_schema,
+    )
+    .map_err(map_insert_write_error)?;
+
+    let rows_affected = u64::try_from(bounds.len()).map_err(|_| SqlSurfaceError::Internal {
+        detail: "insert batch row count overflow".to_string(),
+    })?;
     Ok(InsertOutcome {
-        rows_affected: 1,
+        rows_affected,
         incremental: None,
     })
 }
@@ -2663,6 +2789,163 @@ mod tests {
     fn try_clone_text_handles_empty_string() {
         let cloned = try_clone_text("").expect("empty copy must succeed");
         assert!(cloned.is_empty());
+    }
+
+    // codex-review P1 指摘（PR #823）の回帰テスト: `execute_insert_batch_with_schema`／
+    // `execute_insert_with_schema`（`core::EngineCore::execute_bound_insert_in_session`
+    // の実書き込み経路。`tenant::insert_typed_row_unchecked`／
+    // `insert_typed_rows_unchecked` のドキュメント参照）が、`expected_schema` に
+    // 渡した束縛時点のスキーマと、実際の write トランザクションで再取得したスキーマの
+    // 不一致を検出することを固定する。
+    //
+    // シナリオ: `TEXT` 列 2 個（`lang`・`title`）を持つテーブルへ、`schema_before`
+    // （`lang` が先・`title` が後）の列順で束縛した `values` を渡す。書き込み直前に
+    // `DROP TABLE` → 同名・同じ `VECTOR` 列位置/次元だが `TEXT` 2 列の宣言順だけを
+    // 入れ替えて `CREATE TABLE` した状態（`schema_after`）を実際のスキーマとして
+    // 用意する。`expected_schema` チェックが無ければ `insert_typed_row_unchecked` は
+    // `schema_after`（新しい列順）を使って `values` を位置ベースで再解釈し、
+    // `lang` の値が `title` 列へ（逆も同様）誤って保存され得る（`VECTOR` 列の位置・
+    // 次元は不変のため `validate_embedding_dim` はこの入れ替えを検出しない）。
+    mod bound_schema_mismatch {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::policy::PolicyContext;
+        use crate::recovery::required_op_id::{LedgerMode, OperationId};
+        use crate::row_codec::Value;
+        use crate::sql::parser::BoundInsert;
+        use crate::storage::Storage;
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+        const TABLE: &str = "docs";
+
+        fn schema_before() -> TableSchema {
+            TableSchema::new(
+                TABLE,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("lang", ColumnType::Text, false),
+                    ColumnDef::new("title", ColumnType::Text, false),
+                ],
+            )
+        }
+
+        /// `schema_before` と同じ `VECTOR` 列位置・次元・列名集合だが、`TEXT` 2 列
+        /// （`lang`・`title`）の宣言順だけを入れ替えたスキーマ（`DROP TABLE` →
+        /// 再 `CREATE TABLE` で再現する、production の TOCTOU シナリオそのもの）。
+        fn schema_after_swap() -> TableSchema {
+            TableSchema::new(
+                TABLE,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("title", ColumnType::Text, false),
+                    ColumnDef::new("lang", ColumnType::Text, false),
+                ],
+            )
+        }
+
+        fn bound(id: u64, op_id: &OperationId) -> BoundInsert {
+            // `schema_before` の列順（embedding は VECTOR 列のためスキップ・lang→title）
+            // で束縛した値配列。
+            BoundInsert {
+                table: TABLE.to_string(),
+                id,
+                values: vec![
+                    Value::Vector(vec![1.0, 0.0]),
+                    Value::Text("ja".to_string()),
+                    Value::Text("hello".to_string()),
+                ],
+                operation_id: Some(op_id.clone()),
+            }
+        }
+
+        #[test]
+        fn execute_insert_with_schema_rejects_stale_schema_after_column_reorder() {
+            let path = unique_db_path("exec-insert-schema-mismatch-single");
+            let _guard = CleanupGuard(path.clone());
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&schema_before())
+                .expect("create table");
+            storage.drop_table(TABLE).expect("drop table");
+            storage
+                .create_table(&schema_after_swap())
+                .expect("recreate table with swapped column order");
+
+            let ctx = PolicyContext::new("tenant-a").expect("valid tenant ctx");
+            let op_id = OperationId::parse("op-1").expect("valid operation_id");
+            let bound_row = bound(1, &op_id);
+
+            let before = schema_before();
+            let err = super::super::execute_insert_with_schema(
+                &storage,
+                &ctx,
+                &bound_row,
+                LedgerMode::Ledgered,
+                Some(&before),
+            )
+            .expect_err("stale bound schema must be rejected, not silently written");
+            assert_eq!(
+                err.wire_code(),
+                "22000",
+                "schema mismatch must map to the existing invalid-row classification"
+            );
+        }
+
+        #[test]
+        fn execute_insert_with_schema_accepts_matching_schema() {
+            // 対照テスト: `expected_schema` が実際のスキーマと一致する（通常経路・
+            // 競合なし）場合は従来どおり書き込みが成功する（fail-closed 化が
+            // 通常経路を巻き込んで壊していないことを確認する）。
+            let path = unique_db_path("exec-insert-schema-mismatch-single-ok");
+            let _guard = CleanupGuard(path.clone());
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&schema_before())
+                .expect("create table");
+
+            let ctx = PolicyContext::new("tenant-a").expect("valid tenant ctx");
+            let op_id = OperationId::parse("op-1").expect("valid operation_id");
+            let bound_row = bound(1, &op_id);
+
+            let expected = schema_before();
+            let outcome = super::super::execute_insert_with_schema(
+                &storage,
+                &ctx,
+                &bound_row,
+                LedgerMode::Ledgered,
+                Some(&expected),
+            )
+            .expect("matching schema must still succeed");
+            assert_eq!(outcome.rows_affected, 1);
+        }
+
+        #[test]
+        fn execute_insert_batch_with_schema_rejects_stale_schema_after_column_reorder() {
+            let path = unique_db_path("exec-insert-schema-mismatch-batch");
+            let _guard = CleanupGuard(path.clone());
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&schema_before())
+                .expect("create table");
+            storage.drop_table(TABLE).expect("drop table");
+            storage
+                .create_table(&schema_after_swap())
+                .expect("recreate table with swapped column order");
+
+            let ctx = PolicyContext::new("tenant-a").expect("valid tenant ctx");
+            let op_id = OperationId::parse("op-1").expect("valid operation_id");
+            let bounds = vec![bound(1, &op_id), bound(2, &op_id)];
+
+            let before = schema_before();
+            let err = super::super::execute_insert_batch_with_schema(
+                &storage,
+                &ctx,
+                &bounds,
+                LedgerMode::Ledgered,
+                Some(&before),
+            )
+            .expect_err("stale bound schema must be rejected for multi-row batches too");
+            assert_eq!(err.wire_code(), "22000");
+        }
     }
 
     // Issue #453・3.5 節「契約上の注記」の回帰テスト: `defer_projection` は

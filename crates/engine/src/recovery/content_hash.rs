@@ -27,6 +27,13 @@
 //! 操作種別タグ（1 バイト）を置き、他コンテキストでの SHA-256 利用や操作種別間の
 //! 衝突を避ける。
 //!
+//! 長さプレフィクスだけでは**複数行を 1 ハッシュへ連結する**操作（[`for_typed_insert_batch`]）
+//! の行境界までは一意に定まらない（ある行の列データが次の行の固定長フィールドへ
+//! 「はみ出して」再解釈され得る。codex-review P1 指摘・PR #823）。1 ハッシュ = 1 行
+//! （列データが常に入力全体の末尾）の操作（[`for_typed_insert`]・
+//! [`for_replace_by_text_key`]）はこの曖昧性の対象外のため、対応は
+//! [`for_typed_insert_batch`] のドキュメント（行ごとの列数プレフィクス）に限定する。
+//!
 //! 呼び出し元は `crate::tenant::*_unchecked`（6 箇所。TASK-93 の台帳追記と同一の
 //! write トランザクション内でハッシュ計算済みの値を渡す設計）。各操作種別の入力
 //! レイアウトは対応する `for_*` 関数のコメントを参照。
@@ -357,6 +364,63 @@ pub(crate) fn for_typed_insert(
     b.push_u8(visibility.to_byte());
     push_vector(&mut b, embedding)?;
     push_named_scalar_columns(&mut b, columns)?;
+    Ok(b.finish())
+}
+
+/// [`for_typed_insert_batch`]・`tenant::insert_typed_rows_unchecked` が共有する
+/// 1 行分のハッシュ材料（`(id, visibility, embedding, 非 VECTOR 列の列名付き
+/// ペア列)`）。`clippy::type_complexity` 回避のための型エイリアス（意味は
+/// タプルの並びそのもの。`tenant.rs` からも参照する）。
+pub(crate) type TypedInsertBatchRow<'a> = (u64, Visibility, &'a [f32], &'a [(&'a str, &'a Value)]);
+
+/// `insert_typed_rows_unchecked` 用（Issue #771・TASK-178・NOSQL-6。TASK-101・
+/// RECOVER-10 の型付き挿入経路をバッチへ拡張したもの）。1 つの `operation_id` が
+/// 要求記載順の複数行をまとめて覆う点は [`OpTag::InsertBatch`]（[`for_insert_batch_encoded`]
+/// と共有するタグ。「新規挿入をバッチでまとめて行う」操作として同じ操作種別に
+/// 属する）で表す。入力: 要求記載順の `(id, visibility, embedding, 非 VECTOR 列の
+/// 列名付きペア列)`。各行のハッシュ材料は [`for_typed_insert`] と同一の組み立て
+/// （`push_u64(id)` → `push_u8(visibility)` → [`push_vector`] → 列数プレフィクス →
+/// [`push_named_scalar_columns`]）を行ごとに連結する（列名ベース・PR #248 の教訓を
+/// 踏襲。`ALTER TABLE ADD COLUMN` を挟んだ再送でも列幅がずれない）。並び替えた
+/// 同一集合の再送は意図的に区別する（[`for_insert_batch_encoded`] と同じ設計。
+/// 件数プレフィクスに続けて行ごとのフィールドを連結する）。
+///
+/// 行境界の曖昧性回避（codex-review P1 指摘・PR #823）: [`push_named_scalar_columns`]
+/// は 1 行分の列を「列数を明示しない、末尾まで連結するだけ」の形式で書く。
+/// [`for_typed_insert`]／[`for_replace_by_text_key`] のように 1 ハッシュ = 1 行
+/// （列データが常に入力全体の末尾）ならこれで一意に復元できるが、本関数は複数行を
+/// 1 ハッシュへ連結するため、ある行の列データが**次の行**の `id`／`visibility`／
+/// `embedding` 長さへ「はみ出して」再解釈されても、`push_bytes` の長さプレフィクス
+/// 契約自体は内部的に自己無矛盾なまま別の行分割として復元できてしまい、異なる
+/// 行数・列配置を持つ 2 つのバッチが同一バイト列（同一ハッシュ）に還元されうる
+/// （回帰テスト `for_typed_insert_batch_rejects_row_boundary_reinterpretation`
+/// 参照）。この曖昧性は行ごとの列**数**を明示すれば解消するため、
+/// [`push_named_scalar_columns`] 自体（[`for_typed_insert`]／[`for_replace_by_text_key`]
+/// も共有する既存レイアウト）は変更せず、本関数（Issue #771 で新設された
+/// バッチ入力レイアウトのみ）に列数プレフィクス（`Value::Null` 除外後の非 NULL 列数。
+/// `push_named_scalar_columns` が実際に書き込む列数と一致させる）を追加する形で
+/// 閉じる。
+pub(crate) fn for_typed_insert_batch(
+    rows: &[TypedInsertBatchRow<'_>],
+) -> Result<ContentHash, StorageError> {
+    let count = u32::try_from(rows.len())
+        .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
+    let mut b = HashInputBuilder::new(OpTag::InsertBatch);
+    b.push_raw(&count.to_le_bytes());
+    for (id, visibility, embedding, columns) in rows {
+        b.push_u64(*id);
+        b.push_u8(visibility.to_byte());
+        push_vector(&mut b, embedding)?;
+        let non_null_columns = columns
+            .iter()
+            .filter(|(_, value)| !matches!(value, Value::Null))
+            .count();
+        let non_null_columns = u32::try_from(non_null_columns).map_err(|_| {
+            StorageError::Codec("content hash batch row column count too large".to_string())
+        })?;
+        b.push_raw(&non_null_columns.to_le_bytes());
+        push_named_scalar_columns(&mut b, columns)?;
+    }
     Ok(b.finish())
 }
 
@@ -970,6 +1034,118 @@ mod tests {
         let h_public = for_typed_insert(7, Visibility::Public, &embedding, &cols).expect("hash");
         let h_private = for_typed_insert(7, Visibility::Private, &embedding, &cols).expect("hash");
         assert_ne!(h_public, h_private);
+    }
+
+    // Issue #771: `for_typed_insert_batch` は要求記載順を入力に含めるため、
+    // 同一集合でも並び替えると別ハッシュになる（`for_insert_batch_encoded` と
+    // 同じ設計判断。並び替えた同一集合の再送は意図的に区別する）。
+    #[test]
+    fn for_typed_insert_batch_differs_when_row_order_changes() {
+        let embedding_a = [1.0_f32, 0.0, 0.0];
+        let embedding_b = [0.0_f32, 1.0, 0.0];
+        let title = Value::Text("hello".to_string());
+        let cols: [(&str, &Value); 1] = [("title", &title)];
+        let rows_forward: [TypedInsertBatchRow<'_>; 2] = [
+            (1, Visibility::Private, &embedding_a, &cols),
+            (2, Visibility::Private, &embedding_b, &cols),
+        ];
+        let rows_reversed: [TypedInsertBatchRow<'_>; 2] = [
+            (2, Visibility::Private, &embedding_b, &cols),
+            (1, Visibility::Private, &embedding_a, &cols),
+        ];
+        let h_forward = for_typed_insert_batch(&rows_forward).expect("hash");
+        let h_reversed = for_typed_insert_batch(&rows_reversed).expect("hash");
+        assert_ne!(h_forward, h_reversed);
+    }
+
+    // 行ごとの `visibility` の違いはバッチ全体のハッシュへ反映される
+    // （`for_typed_insert_differs_by_visibility` の複数行版）。
+    #[test]
+    fn for_typed_insert_batch_differs_by_row_visibility() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let title = Value::Text("hello".to_string());
+        let cols: [(&str, &Value); 1] = [("title", &title)];
+        let rows_public: [TypedInsertBatchRow<'_>; 1] =
+            [(7, Visibility::Public, &embedding, &cols)];
+        let rows_private: [TypedInsertBatchRow<'_>; 1] =
+            [(7, Visibility::Private, &embedding, &cols)];
+        let h_public = for_typed_insert_batch(&rows_public).expect("hash");
+        let h_private = for_typed_insert_batch(&rows_private).expect("hash");
+        assert_ne!(h_public, h_private);
+    }
+
+    // `for_typed_insert` と同じく、`ALTER TABLE ADD COLUMN` 相当（未提供 →
+    // `Value::Null` の追加列）を挟んでもバッチ全体のハッシュは不変（列名ベース・
+    // `Null` 除外の設計を複数行版でも維持する）。
+    #[test]
+    fn for_typed_insert_batch_is_stable_across_added_nullable_column() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let title = Value::Text("hello".to_string());
+        let before: [(&str, &Value); 1] = [("title", &title)];
+        let rows_before: [TypedInsertBatchRow<'_>; 1] =
+            [(7, Visibility::Public, &embedding, &before)];
+        let h_before = for_typed_insert_batch(&rows_before).expect("hash");
+
+        let null_note = Value::Null;
+        let after: [(&str, &Value); 2] = [("title", &title), ("note", &null_note)];
+        let rows_after: [TypedInsertBatchRow<'_>; 1] =
+            [(7, Visibility::Public, &embedding, &after)];
+        let h_after = for_typed_insert_batch(&rows_after).expect("hash");
+
+        assert_eq!(h_before, h_after);
+    }
+
+    // codex-review P1 指摘（PR #823）の回帰固定: 行境界を示す列数プレフィクスが
+    // 無いと、ある行の列データが「次の行」の `id`／`visibility`／`embedding` 長さへ
+    // 意図的にはみ出す形で再解釈でき、実際には異なる行 id 集合へ書き込む 2 つの
+    // バッチが同一バイト列（同一ハッシュ）へ還元されてしまう。
+    //
+    // 具体的には以下の 2 バッチを手計算で構築する（コメント中の 16 進バイト列は
+    // `push_bytes`（4 バイト LE 長さ＋本体）・`push_value`（Null=0／Text=1 タグ＋
+    // 長さ付き本体）のレイアウトから逆算した値。空ベクトル・空文字列値のみを使い
+    // フィールド境界の算術を単純化してある）:
+    //
+    // - batch A: [(id1, "WXYZ"→"" の列あり), (id2a, 列なし)]
+    // - batch B: [(id1, 列なし), (id2b, "PQRS"→"" の列あり)]
+    //
+    // id1 は共通だが、batch A は id2a を、batch B は id2b（id2a とは異なる値）を
+    // 書き込む——つまり書き込み対象の行 id 集合そのものが異なる。列数プレフィクス
+    // 導入前は、batch A の「行1の列データ」が batch B の「行2のヘッダ（id/vis/
+    // vector 長）」として、batch A の「行2のヘッダ」が batch B の「行2の列データ」
+    // として、それぞれ再解釈可能なバイト列になるよう choose してあり、両者は
+    // バイト単位で完全に一致していた（本テストは列数プレフィクス導入後、この
+    // 2 バッチが異なるハッシュになることを固定する）。
+    #[test]
+    fn for_typed_insert_batch_rejects_row_boundary_reinterpretation() {
+        let id1 = 42u64;
+        // id2a = u64::from_le_bytes([namelen=4, 'P','Q','R','S']) の逆算値。
+        let id2a = u64::from_le_bytes([0x04, 0x00, 0x00, 0x00, b'P', b'Q', b'R', b'S']);
+        // id2b = u64::from_le_bytes([namelen=4, 'W','X','Y','Z']) の逆算値。
+        let id2b = u64::from_le_bytes([0x04, 0x00, 0x00, 0x00, b'W', b'X', b'Y', b'Z']);
+        assert_ne!(id2a, id2b, "test construction requires distinct row ids");
+
+        let empty_vec: [f32; 0] = [];
+        let wxyz_value = Value::Text(String::new());
+        let pqrs_value = Value::Text(String::new());
+        let wxyz_col: [(&str, &Value); 1] = [("WXYZ", &wxyz_value)];
+        let pqrs_col: [(&str, &Value); 1] = [("PQRS", &pqrs_value)];
+        let no_cols: [(&str, &Value); 0] = [];
+
+        let rows_a: [TypedInsertBatchRow<'_>; 2] = [
+            (id1, Visibility::Public, &empty_vec, &wxyz_col),
+            (id2a, Visibility::Public, &empty_vec, &no_cols),
+        ];
+        let rows_b: [TypedInsertBatchRow<'_>; 2] = [
+            (id1, Visibility::Public, &empty_vec, &no_cols),
+            (id2b, Visibility::Public, &empty_vec, &pqrs_col),
+        ];
+
+        let h_a = for_typed_insert_batch(&rows_a).expect("hash");
+        let h_b = for_typed_insert_batch(&rows_b).expect("hash");
+        assert_ne!(
+            h_a, h_b,
+            "batches writing to different row-id sets must not collide"
+        );
     }
 
     // Issue #397 のピン留め: `for_insert_encoded` は「呼び出し元が事前エンコードした

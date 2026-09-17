@@ -194,7 +194,7 @@ fn parse_success_body(resp: &HttpResponse) -> (Vec<String>, Vec<Vec<JsonValue>>,
         other => panic!("rows must be an array, got {other:?}"),
     };
     let row_count = match top.remove("row_count") {
-        Some(JsonValue::Number(n)) => n as u64,
+        Some(JsonValue::Number(n)) => n.as_f64() as u64,
         other => panic!("row_count must be a number, got {other:?}"),
     };
     (columns, rows, row_count)
@@ -341,7 +341,7 @@ fn filter_matches_sql_where_equivalent_id_set() {
         }
         match &row[id_index] {
             JsonValue::Number(n) => {
-                ids.insert(*n as u64);
+                ids.insert(n.as_f64() as u64);
             }
             other => panic!("id cell must be a number, got {other:?}"),
         }
@@ -396,7 +396,8 @@ fn tenant_b_private_rows_never_appear_for_tenant_a() {
     for row in &rows {
         match &row[id_index] {
             JsonValue::Number(n) => {
-                assert!(!(101.0..=103.0).contains(n), "tenant-b row id leaked: {n}")
+                let n = n.as_f64();
+                assert!(!(101.0..=103.0).contains(&n), "tenant-b row id leaked: {n}")
             }
             other => panic!("id cell must be a number, got {other:?}"),
         }

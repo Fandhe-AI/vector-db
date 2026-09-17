@@ -2762,6 +2762,166 @@ impl EngineCore {
         self.run_aggregate_plan(&read_txn, ctx, &schema, &bound)
     }
 
+    /// 束縛済み複数行 `INSERT` 計画（[`crate::sql::parser::BoundInsert`] の列）を
+    /// 単一スナップショット上で実行する（Issue #771・TASK-178・NOSQL-6）。
+    /// SQL テキストを経由せず、NoSQL 表層（`wire-server::http::query::insert`）が
+    /// `rows` 配列全体を 1 回の要求として書き込むためのセッション対応エントリで、
+    /// 設計判断は [`Self::execute_bound_scan_in_session`]・
+    /// [`Self::execute_bound_aggregate_in_session`]（Issue #728）と同型
+    /// （`docs/design/bound-plan-session-entry.md` 参照）。異なる点は書き込み系で
+    /// あるため binder closure が `read_txn` の下でスキーマのみを見て束縛し、
+    /// 実際の書き込みは束縛結果を使って別途 [`crate::sql::exec::execute_insert_batch`]
+    /// （独自の write トランザクション）へ委譲すること。
+    ///
+    /// 判定順序（fail-closed。この順が契約）:
+    ///
+    /// 1. `operation_id` 必須化ガード（TASK-92・RECOVER-1）: `self.ledger_mode` が
+    ///    `operation_id` を要求する構成で `operation_id` が `None` なら
+    ///    [`crate::sql::allowlist::SqlSurfaceError::MissingOperationId`]（`23502`）。
+    ///    スキーマ取得・束縛より**前**に判定する（SQL 表層の
+    ///    `sql::allowlist::validate_insert` が構造検証段階で同じ順序を守るのと同じ
+    ///    理由。`sql/allowlist.rs::SqlSurfaceError::MissingOperationId` ドキュメント
+    ///    参照）。
+    /// 2. `row_count == 0` → [`crate::sql::allowlist::SqlSurfaceError::invalid_input`]
+    ///    （`22000`。`EngineCore::execute_insert_sql_batch` の「空バッチ拒否」と同じ
+    ///    契約）。
+    /// 3. ①（バッチあたり最大ファイル数を「1 要求あたり最大行数」に読み替える。
+    ///    `batch_limits.rs` INDEX-4 ドキュメント参照）: `row_count` が
+    ///    `self.batch_limits.max_files_per_batch` を超えるなら
+    ///    [`crate::sql::allowlist::SqlSurfaceError::payload_too_large`]（`54000`）。
+    ///    カタログ参照・束縛より前に判定する（`row_count` だけで判定できるため。
+    ///    coding-rust.md「不安全な設計 / DoS」対応）。
+    /// 4. [`Self::read_txn_with_schema`] で `table` のスキーマを取得（`bind` はまだ
+    ///    呼ばない）。テーブル不存在は `UndefinedTable`（`42P01`）。
+    /// 5. `bind(&schema)` で束縛済み `Vec<BoundInsert>` を得る（`read_txn` が開いて
+    ///    いる間に呼ぶ。[`Self::execute_bound_scan_in_session`] と同じ単一
+    ///    スナップショット契約）。戻り値の `table` が引数 `table` と一致し、
+    ///    `len() == row_count` であることを検証する（不一致は `22000`）。あわせて
+    ///    各 `BoundInsert.operation_id` が判定 1 で検査した引数 `operation_id` と
+    ///    一致することも検証する（不一致は同じく `22000`。判定 7 の実書き込みが
+    ///    `bounds[0].operation_id` を台帳キーとして再解決するため、判定 1 の
+    ///    早期ガードと実書き込みが異なる `operation_id` を使う fail-closed でない
+    ///    経路を閉じる）。
+    /// 6. ②③④（`batch_limits.rs`）: 各行のバイト量
+    ///    `Σ Text.len() + Vector.len() × size_of::<f32>()`（`checked_add`。`Null` は
+    ///    0）を `(0, row_bytes)` として `batch_limits::validate_batch_shape` へ渡し
+    ///    （行形には「パス」が無いため `path_len` は常に 0）、
+    ///    `batch_limits::validate_chunk_total(row_count, ..)`（1 行 = 1 チャンクと
+    ///    みなす。INDEX-4 の「生成チャンク数」上限をここでは「行数」上限に読み替える）
+    ///    で判定する。いずれも `payload_too_large`（`54000`）。
+    /// 7. `read_txn` を drop してから
+    ///    [`crate::sql::exec::execute_insert_batch`]（独自の write トランザクション。
+    ///    `operation_id` の再解決を含む。単一行なら `execute_insert` へ委譲し
+    ///    SQL-10 と同一の台帳ハッシュ空間で再送判定される）を呼ぶ。
+    pub fn execute_bound_insert_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        row_count: usize,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        bind: F,
+    ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            Vec<crate::sql::parser::BoundInsert>,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
+        self.ledger_mode
+            .resolve(operation_id)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+
+        // 判定 2: 空バッチ拒否。
+        if row_count == 0 {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "INSERT batch must contain at least one row",
+            ));
+        }
+
+        // 判定 3（①）: 件数上限。カタログ参照・束縛より前。
+        if row_count > self.batch_limits.max_files_per_batch {
+            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                crate::batch_limits::BatchLimitsError::TooManyFiles {
+                    count: row_count,
+                    max: self.batch_limits.max_files_per_batch,
+                }
+                .to_string(),
+            ));
+        }
+
+        // 判定 4・5: スキーマ取得 → 束縛（同一 read_txn 下）。
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let bounds = bind(&schema)?;
+        if bounds.len() != row_count
+            || bounds
+                .iter()
+                .any(|b| b.table != table || b.operation_id.as_ref() != operation_id)
+        {
+            // `bounds[*].operation_id` は判定 1 の早期ガードが検査した引数
+            // `operation_id` と独立に `bind` closure（呼び出し元）が構築するため、
+            // 一致検証なしでは判定 1 が通過させた値と実書き込み（判定 7・
+            // `sql::exec::execute_insert_batch` が `bounds[0].operation_id` を
+            // 台帳キーとして再解決する）が異なる `operation_id` を使い得る
+            // （PR #823 Bugbot 指摘。`execute_insert_batch` 自身の
+            // 「全要素で `operation_id` が一致」検証だけでは、判定 1 の引数との
+            // 食い違いまでは検出できない）。
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "bound insert plan does not match the requested table, row count, or operation_id",
+            ));
+        }
+        drop(read_txn);
+
+        // 判定 6（②③④）: バイト量・チャンク数上限。行内容自体（テキスト・
+        // ベクトル）は複製せず長さのみを積算する（coding-rust.md）。
+        let mut shapes: Vec<(usize, usize)> = Vec::new();
+        shapes.try_reserve_exact(bounds.len()).map_err(|_| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "failed to reserve batch shape buffer".to_string(),
+            }
+        })?;
+        for bound in &bounds {
+            let mut row_bytes: usize = 0;
+            for value in &bound.values {
+                let value_len = match value {
+                    crate::row_codec::Value::Null => 0,
+                    crate::row_codec::Value::Text(s) => s.len(),
+                    crate::row_codec::Value::Vector(v) => {
+                        v.len().saturating_mul(std::mem::size_of::<f32>())
+                    }
+                };
+                row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
+                    crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                        "INSERT batch row byte size overflow",
+                    )
+                })?;
+            }
+            shapes.push((0, row_bytes));
+        }
+        crate::batch_limits::validate_batch_shape(&shapes, &self.batch_limits).map_err(|e| {
+            crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string())
+        })?;
+        crate::batch_limits::validate_chunk_total(bounds.len(), &self.batch_limits).map_err(
+            |e| crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string()),
+        )?;
+
+        // 判定 7: 実書き込み（独自の write トランザクション）。`Some(&schema)`
+        // （判定 4・5 で取得した束縛時点のスキーマ）を渡すことで、実書き込みが
+        // write トランザクション内で改めて取得するスキーマとの不一致を fail-closed
+        // に検出する（codex-review P1 指摘・PR #823。`tenant::insert_typed_row_unchecked`
+        // のドキュメント参照。束縛後・書き込み前にテーブルが再定義され列順が
+        // 入れ替わっても、値が誤った列へ保存されるのを防ぐ）。
+        crate::sql::exec::execute_insert_batch_with_schema(
+            &self.storage,
+            ctx,
+            &bounds,
+            self.ledger_mode,
+            Some(&schema),
+        )
+    }
+
     /// `USING PLAN('<query>')`（TASK-77・SQL-5）経路のうち、スキーマに依存しない
     /// I/O 部分（LLM によるクエリ展開・再埋め込み）だけを行う。呼び出し元は
     /// [`Self::execute_sql_in_session`] の `Statement::Select` アームのみ

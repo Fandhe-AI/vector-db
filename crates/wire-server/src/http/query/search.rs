@@ -234,12 +234,33 @@ fn columns_as_strings(items: &[JsonValue]) -> Result<Vec<String>, SearchError> {
 }
 
 /// `vector` フィールド（`&[JsonValue]`。要素はスキーマ検証済みの `Number`
-/// のはずだが多層防御として再検査する）を `Vec<f64>` へ写像する。
-fn vector_as_f64(items: &[JsonValue]) -> Result<Vec<f64>, SearchError> {
+/// のはずだが多層防御として再検査する）を `Vec<f32>` へ写像する。
+///
+/// [`engine::json::JsonNumber::as_f32`] を使う（`str -> f64 -> f32` の 2 回
+/// 丸めになる `as_f64() as f32` ではなく、保持した生リテラル文字列を SQL 表層
+/// `sql::parser::parse_vector_literal` と同一の `str -> f32` 単一丸めで変換
+/// する。`insert.rs::bind_row` の VECTOR 列要素判定と同じ理由——表層横断で
+/// 同一リテラルが同一の `f32` になることを保証するため。Issue #771 レビュー
+/// 指摘対応）。非有限（`as_f32` が `None` を返す）は本関数の時点で
+/// `SearchError::Bind` へ拒否し、`bind_vector_values`（呼び出し元）側でも
+/// 多層防御として再検査される。
+fn vector_as_f32(items: &[JsonValue]) -> Result<Vec<f32>, SearchError> {
     let mut values = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            JsonValue::Number(n) => values.push(*n),
+            JsonValue::Number(n) => match n.as_f32() {
+                Some(v) => values.push(v),
+                None => {
+                    // `SqlSurfaceError::invalid_input` コンストラクタは
+                    // `pub(crate)`（engine クレート内限定）のため、wire-server
+                    // からは列挙子のフィールドを直接構築する（`insert.rs::
+                    // invalid_input_error` と同じ判断）。
+                    return Err(SearchError::Bind(SqlSurfaceError::InvalidInput {
+                        detail: "vector element must be finite (NaN/Inf are not allowed)"
+                            .to_string(),
+                    }));
+                }
+            },
             _ => {
                 return Err(SearchError::Shape(SchemaError::TypeMismatch {
                     key: "vector",
@@ -319,7 +340,7 @@ pub fn bind_search(
     };
 
     if let VectorOrPlan::Vector(vector_items) = vector_or_plan {
-        let values = vector_as_f64(vector_items)?;
+        let values = vector_as_f32(vector_items)?;
         let query = bind_vector_values(&values, schema)?;
         let ranking = match hybrid {
             Some(hybrid_obj) => {
@@ -386,7 +407,7 @@ pub fn bind_search(
 mod tests {
     use super::*;
     use engine::catalog::{ColumnDef, ColumnType};
-    use engine::json::parse_json;
+    use engine::json::{parse_json, JsonNumber};
 
     use crate::http::query::schema::SEARCH_SCHEMA;
 
@@ -423,6 +444,34 @@ mod tests {
         assert_eq!(stmt.limit(), 10);
         assert!(!stmt.rls_predicate_present());
         assert_eq!(stmt.evaluation_order(), EvaluationOrder::DEFAULT);
+    }
+
+    // 表層横断の丸め一貫性（Issue #771 レビュー指摘対応）: `vector` 要素の
+    // JSON 数値リテラルは SQL 表層 `parse_vector_literal`（`str -> f32` 単一
+    // 丸め）と同一のビットパターンへ変換される。`1.0000000596046448` は
+    // `str -> f64 -> f32` の 2 回丸め経路だと `1.0` になる値
+    // （`engine::json` の `as_f32_matches_direct_str_parse_and_differs_from_f64_roundtrip`
+    // と同じ数値）。
+    #[test]
+    fn vector_element_matches_sql_surface_single_rounding() {
+        let bound = bind(
+            r#"{"op":"search","table":"docs","vector":[1.0000000596046448,0.2,0.3,0.4],"limit":10}"#,
+        )
+        .expect("bind ok");
+        let BoundSearch::Vector(stmt) = bound else {
+            panic!("expected BoundSearch::Vector");
+        };
+        let Ranking::Distance { query } = stmt.ranking() else {
+            panic!("expected Ranking::Distance");
+        };
+        let expected =
+            engine::sql::parser::parse_vector_literal("[1.0000000596046448,0.2,0.3,0.4]", 4)
+                .expect("SQL literal parses");
+        assert_eq!(
+            query[0].to_bits(),
+            expected[0].to_bits(),
+            "NoSQL vector element must match SQL parse_vector_literal bit-for-bit"
+        );
     }
 
     #[test]
@@ -616,13 +665,28 @@ mod tests {
         object.insert(
             "vector".to_string(),
             JsonValue::Array(vec![
-                JsonValue::Number(0.1),
-                JsonValue::Number(0.2),
-                JsonValue::Number(0.3),
-                JsonValue::Number(0.4),
+                JsonValue::Number(JsonNumber::Float {
+                    value: 0.1,
+                    text: Box::from("0.1"),
+                }),
+                JsonValue::Number(JsonNumber::Float {
+                    value: 0.2,
+                    text: Box::from("0.2"),
+                }),
+                JsonValue::Number(JsonNumber::Float {
+                    value: 0.3,
+                    text: Box::from("0.3"),
+                }),
+                JsonValue::Number(JsonNumber::Float {
+                    value: 0.4,
+                    text: Box::from("0.4"),
+                }),
             ]),
         );
-        object.insert("limit".to_string(), JsonValue::Number(5.0));
+        object.insert(
+            "limit".to_string(),
+            JsonValue::Number(JsonNumber::PosInt(5)),
+        );
         object.insert(
             "mode".to_string(),
             JsonValue::String("re\u{0}call".to_string()),

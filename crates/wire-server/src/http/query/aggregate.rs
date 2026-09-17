@@ -888,8 +888,13 @@ mod tests {
         // 返す（JSON パーサ自身は構文エラーにしない）。
         let having_item = obj(r#"{"fn":"count","column":"*","op":">=","value":1e400}"#);
         if let engine::json::JsonValue::Object(map) = &having_item {
+            // `engine::json::JsonNumber` は `is_finite()` を持たない（`PosInt`／
+            // `NegInt` 整数リテラルは常に有限なため、非有限判定は `f64` へ変換した
+            // `Float` variant にのみ意味を持つ。`as_f64()` は丸めを伴いうるが、
+            // `1e400` は元より `f64::INFINITY` へしか丸まらないため本フィクスチャの
+            // 検証には影響しない）。
             assert!(
-                matches!(map.get("value"), Some(engine::json::JsonValue::Number(n)) if !n.is_finite()),
+                matches!(map.get("value"), Some(engine::json::JsonValue::Number(n)) if !n.as_f64().is_finite()),
                 "fixture must actually be non-finite"
             );
         }

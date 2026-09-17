@@ -34,11 +34,16 @@
 //! [`aggregate::handle`]（Issue #768）へそれぞれディスパッチする
 //! （`search`／`insert` は引き続き暫定の `0A000`／501 応答。
 //! Issue #754・#759。束縛・実行は #763・#771 が本 seam を置き換える）。
+//! [`insert`] は `insert` op を
+//! `engine::sql::exec::execute_insert_batch`／
+//! `EngineCore::execute_bound_insert_in_session` へ写像する
+//! （Issue #771・TASK-178・NOSQL-6。`gate.rs` への結線は対象外・別 Issue の担当）。
 
 pub mod aggregate;
 pub mod filter;
 pub mod gate;
 pub mod ident;
+pub mod insert;
 pub mod op;
 pub mod response;
 pub mod scan;
