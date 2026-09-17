@@ -145,6 +145,11 @@ panic hook（RECOVER-8）が unwind 前に `abort()` するため
 プロセス全体が終了します（詳細: `crates/wire-server/src/http/conn.rs`
 モジュール doc「panic 非伝播と RECOVER-8（fail-fast）との関係」節）。
 
+NoSQL 表層の 3 エンドポイント・`op` 4 値それぞれの JSON スキーマ・応答形・
+SQL 構文との対応表は `crates/wire-server/docs/nosql-api.md`（Issue #780）に
+まとめています（上記段落は Issue #772 以降の `insert` 実装結線を未反映の
+まま残しており、最新の契約は同ドキュメントを参照してください）。
+
 `--search-engine`（Issue #656）は検索エンジン選択の opt-in CLI 引数です。
 `--planner-endpoint`／`--planner-model`／`--embedder-hashing-dim`
 （TASK-117）と同型の「プロセス起動時にのみ明示指定する注入点」で、未指定
