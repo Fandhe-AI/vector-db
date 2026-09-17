@@ -341,13 +341,16 @@ fn id_lang_set(columns: &[String], rows: &[Vec<JsonValue>]) -> BTreeSet<(u64, St
         .collect()
 }
 
-/// 行（セル列の `Debug` 文字列表現）の順序非依存 multiset を作る。
-/// `embedding`（`JsonValue::Array`）セルを含む投影の比較に使う。
-fn row_multiset(rows: &[Vec<JsonValue>]) -> BTreeSet<String> {
-    // 重複行を区別するため `BTreeSet<String>` ではなく件数付き文字列にする
-    // （本テストの fixture には重複行が無いため単純な `BTreeSet` で足りるが、
-    // 将来の fixture 変更に備え `Vec` をソートした文字列表現も残す）。
-    rows.iter().map(|row| format!("{row:?}")).collect()
+/// 行（セル列の `Debug` 文字列表現）の順序非依存 multiset を作る（`Vec`
+/// をソートした文字列表現）。`embedding`（`JsonValue::Array`）セルを含む
+/// 投影の比較に使う。件数比較のため `BTreeSet` ではなく重複を保持した
+/// `Vec` をソートして返す（`BTreeSet` だと同一行の重複が握りつぶされ、
+/// HTTP 側が同じ行を余分に返しても `rows.len()`／`row_count` が一致する
+/// 限り検出できないため）。
+fn row_multiset(rows: &[Vec<JsonValue>]) -> Vec<String> {
+    let mut v: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
+    v.sort();
+    v
 }
 
 /// 誤コピー検出用の自己検査を兼ねる: alice/bob/carol 全員が wire スコープ
@@ -578,7 +581,11 @@ fn private_rows_are_invisible_to_every_tenant_and_yield_empty_result_not_error()
 
 /// 成功・空集合いずれの応答本文にも Private 行の値（`"xx"`）・id=11・
 /// テナント ID・パスワード・Bearer トークン文字列が現れないことを固定する
-/// （`nosql3_scan_mapping.rs` (13) と同型）。
+/// （`nosql3_scan_mapping.rs` (13) と同型）。id=11 の非漏えい検査は
+/// `"[11,"`（本モジュール doc に記す `response.rs` の空白なし・キー順
+/// 固定の出力不変条件どおり、行は `[id,...]` の JSON 配列で始まり、
+/// 本テストの全 body で `id` が投影の先頭列になる）を探す——`",11,"` では
+/// id が先頭列である本文の形状に一致せず検出漏れになるため使わない。
 #[test]
 fn responses_never_leak_private_rows_tenant_ids_credentials_or_token() {
     let (core, _guard) = new_core_wire_seed();
@@ -601,7 +608,7 @@ fn responses_never_leak_private_rows_tenant_ids_credentials_or_token() {
             let resp = post(addr, token, body);
             let text = body_utf8(&resp);
             assert!(!text.contains("\"xx\""), "body={body:?} text={text}");
-            assert!(!text.contains(",11,"), "body={body:?} text={text}");
+            assert!(!text.contains("[11,"), "body={body:?} text={text}");
             assert!(!text.contains(tenant), "body={body:?} text={text}");
             assert!(!text.contains(pw), "body={body:?} text={text}");
             assert!(!text.contains(token.as_str()), "body={body:?} text={text}");
