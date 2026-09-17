@@ -5,8 +5,9 @@
 //! 呼び出し文脈: [`crate::http::session::close::handle`] が要求本文を読む前に
 //! [`extract_bearer_token`] を呼び、`Authorization` ヘッダから
 //! [`crate::http::session::token::SessionToken`] を取り出す。
-//! `POST /v1/query` 前段の認証ミドルウェア（Issue #754）も本モジュールを
-//! 再利用する想定の共有 seam であり、`close` モジュールへインライン化しない。
+//! `POST /v1/query` 前段の認証ミドルウェア（`session::middleware::
+//! authenticate`。Issue #754）も本モジュールを再利用する共有 seam であり、
+//! `close` モジュールへインライン化しない。
 //!
 //! 受信データ経路のため `unwrap`／`expect`／添字アクセス（`[]`）を用いず、
 //! [`crate::http::headers::Headers::get_single`]・`from_utf8`・

@@ -97,9 +97,15 @@ bind は同じ理由で起動拒否されます。`nosql` を選択すると、�
 `Authorization: Bearer` の欠落・重複・スキーム不一致・トークン不正・
 失効済み・二重 close はいずれも `wire_code` `28000`（HTTP 401・
 `WWW-Authenticate: Bearer` 付き）へ集約され、区別可能な情報は一切
-返しません。それ以外のパス（`/v1/query` を含む）は引き続き `08P01`
-（`unknown request target`）で拒否されます。`/v1/query` 前段の
-`Authorization: Bearer` ミドルウェア（Issue #754）・3 エンドポイント限定の
+返しません。`POST /v1/query` は `Authorization: Bearer` 検証（同じ `28000`
+集約）を通過した要求のみを受け付け、クライアント自己申告の `tenant_id`
+相当（JSON の未知キー・ヘッダ・パス位置のいずれも）は `wire_code` `42601`
+で拒否します（テナント文脈はセッションに束縛された `PolicyContext` からの
+み導出。Issue #754・TASK-174・HTTP-5・HTTP-6・HTTP-7）。検証を通過した
+要求には現時点では暫定の `wire_code` `0A000`（HTTP 501）を返します
+（op 許可リストの正式化・束縛・実行計画への写像は Issue #759・#763 以降の
+担当）。それ以外のパス（クエリ文字列付き・末尾スラッシュ違い等）は引き続き
+`08P01`（`unknown request target`）で拒否されます。3 エンドポイント限定の
 実ルータ完成（#758）は後続 Issue の担当です。この `catch_unwind` は
 `wire-server` を lib として使う
 経路・テストでの防御であり、production バイナリでは起動時に導入する

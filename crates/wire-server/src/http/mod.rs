@@ -57,24 +57,26 @@
 //!   〔`session::issue::handle`。Issue #752・HTTP-6〕、`Authorization: Bearer`
 //!   ヘッダの受信データ経路〔`session::bearer::extract_bearer_token`〕、
 //!   `POST /v1/session/close` のワンタイム失効パイプライン本体
-//!   〔`session::close::handle`。いずれも Issue #753・HTTP-8〕）。
-//!   `/v1/query` 前段の Bearer ミドルウェアは本モジュールの対象外（Issue #754。
-//!   [`session`] のモジュール doc を参照）
+//!   〔`session::close::handle`。いずれも Issue #753・HTTP-8〕、`/v1/query`
+//!   前段の Bearer ミドルウェア〔`session::middleware::authenticate`。
+//!   `SessionPrincipal` の導出・`tenant_id` 相当ヘッダの拒否。Issue #754・
+//!   HTTP-5・HTTP-6・HTTP-7〕）。
 //! - [`router`]: production 入口のルータ（[`router::Router`]）。`target ==
 //!   "/v1/session"` を [`session::issue::handle`] へ、`"/v1/session/close"`
-//!   を [`session::close::handle`] へディスパッチし、それ以外（`/v1/query`
-//!   を含む）は `conn::PlaceholderRouter` と同一のバイト列（`08P01`）で
-//!   拒否する。`main.rs::run_server` が nosql 選択時に構築する唯一の
-//!   呼び出し元（Issue #752・#753・TASK-171／HTTP-1・HTTP-6・HTTP-8）
+//!   を [`session::close::handle`] へ、`"/v1/query"` を
+//!   [`session::middleware::authenticate`] 経由で [`query::gate::handle`] へ
+//!   ディスパッチし、それ以外（クエリ文字列付き・末尾スラッシュ違い等）は
+//!   `conn::PlaceholderRouter` と同一のバイト列（`08P01`）で拒否する。
+//!   `main.rs::run_server` が nosql 選択時に構築する唯一の呼び出し元
+//!   （Issue #752・#753・#754・TASK-171／HTTP-1・HTTP-6・HTTP-7・HTTP-8）
 //! - [`response`]: ステータスコード＋JSON 本文 → HTTP/1.1 応答バイト列
 //!   （ステータス行・`Connection: close`・`Content-Type`／`Content-Length`・
 //!   CRLF の組み立て。Issue #746・HTTP-2・HTTP-3・ERR-4・ERR-5）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - `explain: true` 時の `{"explain":[...]}` 応答（#765）
-//! - [`router::Router`] への `/v1/query` の追記（op 語彙の許可リストと
-//!   未知 op（`0A000`）判定・各 op の実行計画への写像を含む。
-//!   Issue #759・#763・#766・#768 以降）
+//! - [`query::gate`] の暫定 `0A000`／501 応答を op 許可リストの正式化・
+//!   束縛・実行計画への写像で置き換える（Issue #759・#763・#766・#768 以降）
 //!
 //! 対応: TASK-173〜TASK-175（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア
 //! HTTP-1〜13・NOSQL-1〜NOSQL-10。PoC-15/TASK-182 は private 資産のため

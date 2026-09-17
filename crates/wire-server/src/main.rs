@@ -30,8 +30,10 @@
 //! 適用したうえで、接続ハンドラ本体〔`http::conn::handle_connection_with`〕
 //! を呼ぶ。要求パース・panic 非伝播は Issue #747、ルーティング（`/v1/session`
 //! を `http::session::issue::handle` へ、`/v1/session/close` を
-//! `http::session::close::handle` へディスパッチ・他パスは `08P01`）は
-//! Issue #752・#753 で実装済み。`/v1/query` は Issue #758 が追記する）を
+//! `http::session::close::handle` へ、`/v1/query` を
+//! `http::session::middleware::authenticate` 経由で `http::query::gate::
+//! handle` へディスパッチ・他パスは `08P01`）は Issue #752・#753・#754 で
+//! 実装済み。`/v1/query` の op 束縛・実行は Issue #758・#759 以降が追記する）を
 //! 呼ぶ。いずれも `match surface` の前に
 //! 1 回だけ構築した同一の
 //! `limits::ConnectionLimiter` インスタンスを受け取る。選ばれていない
@@ -525,7 +527,7 @@ fn run_server(args: &[String]) -> ExitCode {
     // 同一のまま保つ）。
     if surface == wire_server::surface::Surface::Nosql {
         eprintln!(
-            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; POST /v1/session and POST /v1/session/close available, other paths rejected with 08P01 pending Issue #758 router)"
+            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; POST /v1/session, POST /v1/session/close, and POST /v1/query (Bearer-gated) available; POST /v1/query binding/execution pending Issue #758/#759; other paths rejected with 08P01)"
         );
     }
 

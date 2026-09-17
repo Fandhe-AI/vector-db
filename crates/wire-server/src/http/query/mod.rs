@@ -10,8 +10,13 @@
 //! （#759・#763・#766・#768 以降）がここへ追加する。[`response`] は
 //! `search`／`scan`／`aggregate` 成功時の `engine::sql::exec::QueryResult`
 //! → JSON 応答本文（`columns`／`rows`／`row_count`）への写像を担う
-//! （Issue #762・NOSQL-11）。
+//! （Issue #762・NOSQL-11）。[`gate`] は認証済み要求（`crate::http::session::
+//! middleware::SessionPrincipal`）に対する `POST /v1/query` の入口本体で、
+//! `tenant_id` 相当ヘッダの拒否・本文のスキーマ検証までを行い、検証を通過
+//! した要求には暫定の `0A000`／501 応答を返す（Issue #754。op 許可リストの
+//! 正式化・束縛・実行は #759・#763 以降が本 seam を置き換える）。
 
 pub mod filter;
+pub mod gate;
 pub mod response;
 pub mod schema;

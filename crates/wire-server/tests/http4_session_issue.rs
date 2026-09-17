@@ -336,7 +336,7 @@ fn unsupported_paths_are_rejected_with_08p01() {
     let addr = spawn_router_server(&users_path, SessionStore::new());
 
     for target in [
-        "/v1/query",
+        "/v1/query?x=1",
         "/v1/session?x=1",
         "/v1/session/close?x=1",
         "/v1/session/close/",

@@ -11,13 +11,15 @@
 //! 経路。[`store::SessionStore`] のトークン検証に必要な `SessionToken` への
 //! 変換。Issue #753・HTTP-8）・[`close`]（`POST /v1/session/close` のワンタイム
 //! 失効パイプライン本体。`bearer::extract_bearer_token`→本文検証→
-//! `store::SessionStore::close`。Issue #753・HTTP-8）で、以下は別 Issue の担当の
-//! まま本モジュールには含まれない:
-//! - `POST /v1/query` 前段の `Authorization: Bearer` ミドルウェア適用・
-//!   `tenant_id` 拒否（[`bearer`] を再利用する。Issue #754）
+//! `store::SessionStore::close`。Issue #753・HTTP-8）・[`middleware`]
+//! （`POST /v1/query` 前段の `Authorization: Bearer` ミドルウェア。[`bearer`]・
+//! [`store::SessionStore::lookup`] を再利用して [`middleware::
+//! SessionPrincipal`]（唯一のテナント文脈）を導出し、`tenant_id` 相当ヘッダの
+//! 拒否も担う。Issue #754・HTTP-5・HTTP-6・HTTP-7）を提供する。
 
 pub mod bearer;
 pub mod close;
 pub mod issue;
+pub mod middleware;
 pub mod store;
 pub mod token;

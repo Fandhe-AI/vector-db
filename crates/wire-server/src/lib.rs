@@ -31,8 +31,10 @@
 //!   （TASK-174・HTTP-4・HTTP-5・Issue #751）、`Authorization: Bearer` の
 //!   受信データ経路 `http::session::bearer::extract_bearer_token`・
 //!   `POST /v1/session/close` のワンタイム失効パイプライン
-//!   `http::session::close::handle`（TASK-174・HTTP-8・Issue #753）を担う。
-//!   `/v1/query` 前段の Bearer ミドルウェアは後続 Issue の担当（#754）。
+//!   `http::session::close::handle`（TASK-174・HTTP-8・Issue #753）、
+//!   `/v1/query` 前段の Bearer ミドルウェア `http::session::middleware::
+//!   authenticate`（`SessionPrincipal` 導出・`tenant_id` 相当ヘッダ拒否。
+//!   TASK-174・HTTP-5・HTTP-6・HTTP-7・Issue #754）を担う。
 //!   `http::query::schema` は `POST /v1/query` の JSON クエリオブジェクトの
 //!   意味的検証ヘルパー（必須欠落・未知キー・型不一致 → `42601`。Issue #760）。
 //!   `http::query::filter` は `filter` 配列の `op` 語彙（`eq`／`prefix`）を
