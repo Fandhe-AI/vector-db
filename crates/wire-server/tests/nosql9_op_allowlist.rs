@@ -19,6 +19,10 @@
 //! HTTP 501・`wire_code` `0A000`・`code` `FEATURE_NOT_SUPPORTED` で status
 //! だけでは区別できないため、必ず `error_message_of` で
 //! [`wire_server::http::query::gate::UNSUPPORTED_OP_MESSAGE`] を突き合わせる。
+//!
+//! 役割分担（Issue #774）: seed 済み 2 テナント fixture 上での 4 op **成功
+//! 応答**・RLS-5／RLS-7／RLS-8 系の検証は `nosql1_op_vocabulary.rs` が担う。
+//! 本ファイルはスローアウェイ core 上の到達判定（本 doc 上記）に閉じる。
 
 #[path = "common/mod.rs"]
 mod common;
