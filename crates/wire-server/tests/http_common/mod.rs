@@ -313,6 +313,12 @@ pub fn error_message_of(resp: &HttpResponse) -> String {
     error_field(resp, "message")
 }
 
+/// [`wire_code_of`] と同じ枠組みで `code`（`AUTH_INVALID`／`AUTH_REQUIRED` 等の
+/// アプリケーション側分類名）を取り出す（Issue #757・HTTP-6）。
+pub fn error_code_of(resp: &HttpResponse) -> String {
+    error_field(resp, "code")
+}
+
 fn error_field(resp: &HttpResponse, field: &str) -> String {
     let body_str = std::str::from_utf8(&resp.body).expect("error body must be valid utf-8");
     let parsed = parse_json(body_str)
