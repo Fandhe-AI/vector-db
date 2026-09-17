@@ -279,7 +279,7 @@ impl<'a> Validated<'a> {
         match self.map.get(key) {
             None => Ok(None),
             Some(JsonValue::Null) if spec.nullable => Ok(None),
-            Some(JsonValue::Number(n)) => Ok(Some(*n)),
+            Some(JsonValue::Number(n)) => Ok(Some(n.as_f64())),
             _ => Err(SchemaError::TypeMismatch { key }),
         }
     }

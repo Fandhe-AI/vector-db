@@ -71,10 +71,55 @@ impl ClassifiedError for JsonError {
 pub enum JsonValue {
     Null,
     Bool(bool),
-    Number(f64),
+    Number(JsonNumber),
     String(String),
     Array(Vec<JsonValue>),
     Object(BTreeMap<String, JsonValue>),
+}
+
+/// JSON 数値リテラルの分類済み表現（Issue #823・PR #823 レビュー指摘対応）。
+///
+/// `f64` 単一表現では 2^53 を超える整数が桁落ちし、`insert.rs` の `id`
+/// 疑似列のような「精度を落とさず整数として受理するか判定したい」呼び出し元が
+/// 丸め後の値でしか判定できなかった（例: `9007199254740993` が最近傍の
+/// 偶数である `9007199254740992` へ丸められ、上限検査を通過して別の行 id へ
+/// 書き込まれ得た）。構文上「小数点・指数部を含まない整数リテラル」かどうかは
+/// パース時点のテキストでのみ判定できるため、[`JsonParser::parse_number`] が
+/// 精度を失う `f64` 変換の**前**に整数／小数を分類し、整数は `u64`／`i64` の
+/// 無損失表現で保持する（オーバーフロー時のみ `Float` へ縮退。RFC 8259 上は
+/// 有効な数値のため拒否はしない）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JsonNumber {
+    /// 小数点・指数部を含まない非負整数リテラル（`"-"` 始まりでない）。
+    /// `u64` の範囲で無損失に表現できる。
+    PosInt(u64),
+    /// 小数点・指数部を含まない負の整数リテラル（`"-"` 始まり。`-0` を含む）。
+    /// `i64` の範囲で無損失に表現できる。
+    NegInt(i64),
+    /// 小数点・指数部を含む、または整数として `u64`／`i64` に収まらない
+    /// リテラル。`f64` 変換（丸めを伴いうる）で保持する。
+    Float(f64),
+}
+
+impl JsonNumber {
+    /// 全 variant を `f64` へ変換する（丸めを伴いうる。表示・比較等、精度が
+    /// 問題にならない用途向け）。
+    pub fn as_f64(self) -> f64 {
+        match self {
+            JsonNumber::PosInt(n) => n as f64,
+            JsonNumber::NegInt(n) => n as f64,
+            JsonNumber::Float(f) => f,
+        }
+    }
+
+    /// `PosInt` のときのみ無損失な `u64` を返す（`id` 疑似列のように
+    /// 非負整数を精度を落とさず要求する呼び出し元向け）。
+    pub fn as_exact_u64(self) -> Option<u64> {
+        match self {
+            JsonNumber::PosInt(n) => Some(n),
+            _ => None,
+        }
+    }
 }
 
 struct JsonParser<'a> {
@@ -361,7 +406,8 @@ impl<'a> JsonParser<'a> {
     /// 構造的に到達しないため、ここでは扱わない（Issue #732）。
     fn parse_number(&mut self) -> Result<JsonValue, JsonError> {
         let start = self.pos;
-        if self.peek() == Some(b'-') {
+        let negative = self.peek() == Some(b'-');
+        if negative {
             self.pos += 1;
         }
         match self.peek() {
@@ -374,7 +420,11 @@ impl<'a> JsonParser<'a> {
             }
             _ => return Err(JsonError),
         }
+        // 小数点・指数部の有無を記録する（両方とも不在の場合のみ整数リテラルとして
+        // `u64`／`i64` の無損失表現を試みる。丸めを伴う `f64` 変換は最後の手段）。
+        let mut is_integer_literal = true;
         if self.peek() == Some(b'.') {
+            is_integer_literal = false;
             self.pos += 1;
             let frac_start = self.pos;
             while matches!(self.peek(), Some(b'0'..=b'9')) {
@@ -385,6 +435,7 @@ impl<'a> JsonParser<'a> {
             }
         }
         if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+            is_integer_literal = false;
             self.pos += 1;
             if matches!(self.peek(), Some(b'+') | Some(b'-')) {
                 self.pos += 1;
@@ -406,8 +457,23 @@ impl<'a> JsonParser<'a> {
         let Ok(text) = std::str::from_utf8(slice) else {
             return Err(JsonError);
         };
+        if is_integer_literal {
+            // 小数点・指数部を含まない整数リテラル。`f64` へ変換する前に
+            // `u64`／`i64` へのパースを試み、範囲内なら無損失表現で保持する
+            // （PR #823 レビュー指摘: 2^53 を超える整数が `f64` の丸めで
+            // 別の整数へエイリアスし、`id` 上限検査等をすり抜ける問題への対応）。
+            // オーバーフローのみ `Float` へフォールバックする（RFC 8259 上は
+            // 有効な数値のため受理自体は継続する）。
+            if negative {
+                if let Ok(n) = text.parse::<i64>() {
+                    return Ok(JsonValue::Number(JsonNumber::NegInt(n)));
+                }
+            } else if let Ok(n) = text.parse::<u64>() {
+                return Ok(JsonValue::Number(JsonNumber::PosInt(n)));
+            }
+        }
         text.parse::<f64>()
-            .map(JsonValue::Number)
+            .map(|f| JsonValue::Number(JsonNumber::Float(f)))
             .map_err(|_| JsonError)
     }
 }
@@ -496,8 +562,14 @@ mod tests {
         let value = parse_json(r#"{"a":1,"b":2}"#).unwrap();
         match value {
             JsonValue::Object(map) => {
-                assert_eq!(map.get("a"), Some(&JsonValue::Number(1.0)));
-                assert_eq!(map.get("b"), Some(&JsonValue::Number(2.0)));
+                assert_eq!(
+                    map.get("a"),
+                    Some(&JsonValue::Number(JsonNumber::PosInt(1)))
+                );
+                assert_eq!(
+                    map.get("b"),
+                    Some(&JsonValue::Number(JsonNumber::PosInt(2)))
+                );
             }
             _ => panic!("expected object"),
         }
@@ -534,23 +606,47 @@ mod tests {
 
     #[test]
     fn parse_json_accepts_rfc8259_numbers() {
-        let accepted: &[(&str, f64)] = &[
-            ("0", 0.0),
-            ("-0", -0.0),
-            ("0.5", 0.5),
-            ("-0.5", -0.5),
-            ("123", 123.0),
-            ("-123", -123.0),
-            ("1.5e10", 1.5e10),
-            ("1.5E-10", 1.5e-10),
-            ("0e0", 0.0),
-            ("100", 100.0),
+        let accepted: &[(&str, JsonNumber)] = &[
+            ("0", JsonNumber::PosInt(0)),
+            ("-0", JsonNumber::NegInt(0)),
+            ("0.5", JsonNumber::Float(0.5)),
+            ("-0.5", JsonNumber::Float(-0.5)),
+            ("123", JsonNumber::PosInt(123)),
+            ("-123", JsonNumber::NegInt(-123)),
+            ("1.5e10", JsonNumber::Float(1.5e10)),
+            ("1.5E-10", JsonNumber::Float(1.5e-10)),
+            ("0e0", JsonNumber::Float(0.0)),
+            ("100", JsonNumber::PosInt(100)),
         ];
         for (input, expected) in accepted {
             let value =
                 parse_json(input).unwrap_or_else(|_| panic!("expected accept for {input:?}"));
             assert_eq!(value, JsonValue::Number(*expected), "input={input:?}");
         }
+    }
+
+    // 精度を失う `f64` 変換の前に整数リテラルを判定する契約（PR #823 レビュー
+    // 指摘対応）: 2^53 を超える整数リテラルが最近傍の偶数へ丸められて
+    // 別の整数値へエイリアスすることなく、無損失な `u64`／`i64` 表現のまま
+    // 保持されることを固定する。
+    #[test]
+    fn parse_json_number_preserves_integer_precision_beyond_f64_safe_range() {
+        // 2^53 + 1。`f64` へ直接変換すると最近傍の偶数 2^53 へ丸められる値。
+        let value = parse_json("9007199254740993").expect("valid JSON number");
+        assert_eq!(
+            value,
+            JsonValue::Number(JsonNumber::PosInt(9_007_199_254_740_993))
+        );
+
+        // u64::MAX も無損失に保持される。
+        let value = parse_json(&u64::MAX.to_string()).expect("valid JSON number");
+        assert_eq!(value, JsonValue::Number(JsonNumber::PosInt(u64::MAX)));
+
+        // 小数点を含む場合は整数であっても丸めを伴う Float 表現になる
+        // （`id` 疑似列等の呼び出し元は `as_exact_u64()` が `None` を返すため
+        // 拒否する。桁数上限 64 文字の範囲内で構成する）。
+        let value = parse_json("9007199254740993.0").expect("valid JSON number");
+        assert!(matches!(value, JsonValue::Number(JsonNumber::Float(_))));
     }
 
     #[test]

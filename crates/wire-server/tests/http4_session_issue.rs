@@ -145,7 +145,7 @@ fn valid_credentials_return_200_with_token_and_expires_in() {
         "token must be a valid SessionToken encoding: {token}"
     );
     match obj.get("expires_in") {
-        Some(JsonValue::Number(n)) => assert_eq!(*n, SESSION_TTL.as_secs() as f64),
+        Some(JsonValue::Number(n)) => assert_eq!(n.as_f64(), SESSION_TTL.as_secs() as f64),
         other => panic!("expected numeric expires_in field, got {other:?}"),
     }
 

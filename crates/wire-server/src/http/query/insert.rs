@@ -107,18 +107,36 @@ fn bind_row(item: &JsonValue, schema: &TableSchema) -> Result<(u64, Vec<Value>),
         )));
     };
 
-    // `id` 疑似列: JSON 数値のうち非負整数として表現できるものだけを受理する
-    // （`u64` 全域を JSON の IEEE754 倍精度で表現できるわけではないため、
-    // 2^53 を安全域の上限とする。文字列形の `id` は受理しない）。
+    // `id` 疑似列: `engine::json::JsonNumber::PosInt`（小数点・指数部を含まない
+    // 非負整数リテラルで、パース時点で `u64` として無損失にパース済みの表現）
+    // のときのみ受理する。SQL 表層 `sql::parser::bind_insert` が SQL リテラルの
+    // 生テキストから `u64` を `.parse()` するのと同じ「テキスト → 整数」の
+    // 精度を持たせるための判定であり、`u64` 全域を許容範囲とする（SQL 表層との
+    // パリティ。`sql::parser::bind_insert` 参照）。
+    //
+    // 以前は `JsonValue::Number(f64)` の丸め後の値を `fract() == 0.0` 等で
+    // 事後判定していたが、`f64` 変換自体が精度を失うため
+    // `9007199254740993`（2^53+1）のような safe range 境界直上の整数が
+    // 最近傍の偶数 `9007199254740992` へ丸められ、上限検査をすり抜けて
+    // 別の行 id へ書き込まれ得た（PR #823 レビュー指摘）。`JsonNumber` は
+    // [`engine::json::JsonParser::parse_number`] が `f64` へ変換する前に
+    // 整数リテラルを分類するため、この丸めが発生しない。
+    //
+    // `NegInt`（負の整数）・`Float`（小数点／指数部を含むリテラル。整数値に
+    // 丸められる小数——例: `1.0`——を含む）はいずれも `id` として拒否する
+    // （`id` は非負整数のみが妥当なため。文字列形の `id` も受理しない）。
     let id: u64 = match map.get("id") {
-        Some(JsonValue::Number(n))
-            if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 9_007_199_254_740_992.0 =>
-        {
-            *n as u64
-        }
+        Some(JsonValue::Number(n)) => match n.as_exact_u64() {
+            Some(id) => id,
+            None => {
+                return Err(InsertError::Bind(invalid_input_error(
+                    "INSERT row id must be a non-negative integer JSON number",
+                )))
+            }
+        },
         _ => {
             return Err(InsertError::Bind(invalid_input_error(
-                "INSERT row id must be a non-negative integer JSON number within the safe range",
+                "INSERT row id must be a non-negative integer JSON number",
             )))
         }
     };
@@ -152,7 +170,7 @@ fn bind_row(item: &JsonValue, schema: &TableSchema) -> Result<(u64, Vec<Value>),
                             "INSERT row VECTOR column element must be a JSON number",
                         )));
                     };
-                    let f = *n as f32;
+                    let f = n.as_f64() as f32;
                     if !f.is_finite() {
                         return Err(InsertError::Bind(invalid_input_error(
                             "INSERT row VECTOR column element must be finite",
@@ -178,9 +196,21 @@ fn bind_row(item: &JsonValue, schema: &TableSchema) -> Result<(u64, Vec<Value>),
 
     for (idx, column) in schema.columns.iter().enumerate() {
         let is_provided = provided.get(idx).copied().unwrap_or(false);
-        if !is_provided && !column.nullable {
+        // VECTOR 列は `nullable` の値に関わらず常に必須として扱う。
+        // `tenant::insert_typed_rows_unchecked`（実行層。`EngineCore::
+        // execute_bound_insert_in_session` から呼ばれる）が VECTOR 列の値を
+        // 無条件に `Value::Vector` として要求し、欠落・`Null` を
+        // `CatalogError::Invalid` で拒否する契約のため（`sql::parser::
+        // bind_insert` の SQL 表層束縛と同じ既存の制約で、schema 上
+        // `nullable: true` の VECTOR 列を宣言できても実行層では意味を持たない）。
+        // これを bind 層で先取りして検査しないと、明示 `null` は本関数の
+        // 直前の `match` で `22000`（`InsertError::Bind`）になる一方、値を
+        // 丸ごと省略した場合だけ実行層まで素通りし別の `wire_code` で
+        // 拒否される非対称が生じる（PR #823 レビュー指摘）。
+        let is_required = !column.nullable || matches!(column.ty, ColumnType::Vector(_));
+        if !is_provided && is_required {
             return Err(InsertError::Bind(invalid_input_error(
-                "INSERT row is missing a value for a non-nullable column",
+                "INSERT row is missing a value for a required column",
             )));
         }
     }
@@ -351,6 +381,87 @@ mod tests {
     fn bind_rows_rejects_missing_non_nullable_column() {
         let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0]}]"#);
         let err = bind_rows(&items, "docs", None, &schema()).expect_err("must reject");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // id 精度（PR #823 レビュー指摘対応）: `JsonNumber::PosInt` は `f64` へ丸める
+    // 前の整数リテラルをそのまま `u64` として保持するため、2^53 を超える整数でも
+    // 別の値へエイリアスせず正確に束縛されることを固定する。
+    #[test]
+    fn bind_rows_preserves_id_precision_beyond_f64_safe_integer_range() {
+        // 2^53 + 1。旧実装（`f64` の丸め後に safe range 上限で判定）では
+        // 最近傍の偶数 `9007199254740992`（2^53）へ丸められて上限検査を通過し、
+        // 別の id の行として束縛され得た。
+        let items = rows_from(r#"[{"id":9007199254740993,"embedding":[1,0,0,0],"lang":"ja"}]"#);
+        let bounds = bind_rows(&items, "docs", None, &schema()).expect("bind ok");
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].id, 9_007_199_254_740_993);
+    }
+
+    #[test]
+    fn bind_rows_preserves_id_precision_at_u64_max() {
+        let body = format!(
+            r#"[{{"id":{},"embedding":[1,0,0,0],"lang":"ja"}}]"#,
+            u64::MAX
+        );
+        let items = rows_from(&body);
+        let bounds = bind_rows(&items, "docs", None, &schema()).expect("bind ok");
+        assert_eq!(bounds[0].id, u64::MAX);
+    }
+
+    #[test]
+    fn bind_rows_rejects_negative_id() {
+        let items = rows_from(r#"[{"id":-1,"embedding":[1,0,0,0],"lang":"ja"}]"#);
+        let err = bind_rows(&items, "docs", None, &schema()).expect_err("must reject");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_rows_rejects_decimal_id_even_when_numerically_integral() {
+        // `1.0` は数値としては整数だが、リテラルの構文上は小数点付き（`Float`
+        // variant）であり、`id` は `PosInt`（整数リテラル）のみを受理する。
+        let items = rows_from(r#"[{"id":1.0,"embedding":[1,0,0,0],"lang":"ja"}]"#);
+        let err = bind_rows(&items, "docs", None, &schema()).expect_err("must reject");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // P2（nullable VECTOR 列省略時の bind/exec 非対称。PR #823 レビュー指摘対応）:
+    // 明示 `null` は既存の `match` で拒否されるが、省略時も同じく `22000` で
+    // 拒否されることを固定する（`tenant::insert_typed_rows_unchecked` が
+    // VECTOR 列を無条件必須として扱う実行層の契約に bind 層を合わせる）。
+    fn schema_with_nullable_vector() -> TableSchema {
+        TableSchema::new(
+            "docs_nullable_vec",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), true),
+                ColumnDef::new("lang", ColumnType::Text, false),
+            ],
+        )
+    }
+
+    #[test]
+    fn bind_rows_rejects_omitted_nullable_vector_column() {
+        let items = rows_from(r#"[{"id":1,"lang":"ja"}]"#);
+        let err = bind_rows(
+            &items,
+            "docs_nullable_vec",
+            None,
+            &schema_with_nullable_vector(),
+        )
+        .expect_err("must reject");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_rows_rejects_explicit_null_vector_column() {
+        let items = rows_from(r#"[{"id":1,"embedding":null,"lang":"ja"}]"#);
+        let err = bind_rows(
+            &items,
+            "docs_nullable_vec",
+            None,
+            &schema_with_nullable_vector(),
+        )
+        .expect_err("must reject");
         assert_eq!(err.wire_code(), "22000");
     }
 

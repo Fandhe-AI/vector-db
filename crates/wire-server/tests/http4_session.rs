@@ -218,7 +218,10 @@ fn issued_token_is_43_char_padless_base64url_decoding_to_32_bytes() {
 
     match obj.get("expires_in") {
         Some(JsonValue::Number(n)) => {
-            assert_eq!(*n, wire_server::limits::SESSION_TTL.as_secs() as f64)
+            assert_eq!(
+                n.as_f64(),
+                wire_server::limits::SESSION_TTL.as_secs() as f64
+            )
         }
         other => panic!("expected numeric expires_in field, got {other:?}"),
     }

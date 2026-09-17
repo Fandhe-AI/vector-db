@@ -229,7 +229,7 @@ fn row_description_oid_and_json_type_agree_for_computed_column() {
     let engine::json::JsonValue::Number(row_count) = &top["row_count"] else {
         panic!("row_count must be a number");
     };
-    assert_eq!(*row_count, result.rows.len() as f64);
+    assert_eq!(row_count.as_f64(), result.rows.len() as f64);
 }
 
 #[test]
@@ -259,7 +259,11 @@ fn row_count_tracks_rows_len_below_and_above_limit() {
             panic!("row_count must be a number");
         };
         assert_eq!(rows.len(), result.rows.len(), "limit={limit}");
-        assert_eq!(*row_count, result.rows.len() as f64, "limit={limit}");
+        assert_eq!(
+            row_count.as_f64(),
+            result.rows.len() as f64,
+            "limit={limit}"
+        );
         assert!(result.rows.len() <= limit, "limit={limit}");
     }
 }

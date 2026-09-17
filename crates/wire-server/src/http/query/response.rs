@@ -280,15 +280,15 @@ mod tests {
             panic!("row must be an array");
         };
         assert_eq!(cells.len(), 4);
-        assert!(matches!(cells[0], JsonValue::Number(n) if n == 42.0));
+        assert!(matches!(cells[0], JsonValue::Number(n) if n.as_f64() == 42.0));
         assert!(matches!(&cells[1], JsonValue::String(s) if s == "ja"));
         let JsonValue::Array(vec_cell) = &cells[2] else {
             panic!("vector cell must be an array");
         };
         assert_eq!(vec_cell.len(), 2);
-        assert!(matches!(cells[3], JsonValue::Number(n) if n == 3.5));
+        assert!(matches!(cells[3], JsonValue::Number(n) if n.as_f64() == 3.5));
 
-        assert!(matches!(top["row_count"], JsonValue::Number(n) if n == 1.0));
+        assert!(matches!(top["row_count"], JsonValue::Number(n) if n.as_f64() == 1.0));
     }
 
     /// 型名一致テーブルテスト: 各 `ColumnMeta` について `encode_row_description`
@@ -368,7 +368,7 @@ mod tests {
             let body = encode(&result).expect("encode");
             let top = parse_top(&body);
             assert!(
-                matches!(top["row_count"], JsonValue::Number(v) if v == n as f64),
+                matches!(top["row_count"], JsonValue::Number(v) if v.as_f64() == n as f64),
                 "n={n}"
             );
             let JsonValue::Array(rows) = &top["rows"] else {
@@ -514,9 +514,11 @@ mod tests {
 
     #[test]
     fn u64_max_integer_cell_has_no_precision_loss_in_decimal_text() {
-        // `JsonValue::Number` は `f64` のため `parse_json` 経由の往復では
-        // `u64::MAX` の精度が丸められる。したがって桁落ちの検証は
-        // `encode` が生成した文字列そのものに対する文字列一致で行う。
+        // `engine::json::JsonNumber::PosInt` は `u64::MAX` を無損失に表現できる
+        // ため（Issue #823 レビュー指摘対応）`parse_json` 経由の往復でも精度は
+        // 失われないが、本テストは `encode` が生成する 10 進テキスト自体が
+        // `u64::MAX` と一致することを検証する（JSON パーサの実装詳細に
+        // 依存しない、応答文字列そのものに対する直接検証）。
         let result = QueryResult {
             columns: vec![ColumnMeta::Id],
             rows: vec![row(vec![Cell::Integer(u64::MAX)])],
@@ -550,7 +552,7 @@ mod tests {
         let numbers: Vec<f64> = vec_cell
             .iter()
             .map(|v| match v {
-                JsonValue::Number(n) => *n,
+                JsonValue::Number(n) => n.as_f64(),
                 other => panic!("expected number, got {other:?}"),
             })
             .collect();
