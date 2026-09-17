@@ -12,6 +12,9 @@
 //! `wire_aggregate.rs`（pg wire 経由）と同じ「値そのものは engine 側テストが
 //! 確定オラクル」という方針を踏襲し、本ファイルは NoSQL 表層への写像が
 //! それを壊していないことに徹する。
+//!
+//! `wire_aggregate.rs` と同一 seed による pg wire ↔ NoSQL 2 表層パリティ検証は
+//! `nosql4_5_aggregate_wire_parity.rs` を参照（Issue #770）。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -374,18 +377,41 @@ fn malformed_identifier_shape_is_rejected_without_leaking_input() {
 }
 
 #[test]
-fn group_by_having_and_explain_true_reject_with_0a000_and_do_not_execute() {
+fn explain_true_rejects_with_0a000_and_does_not_execute() {
+    // `explain: true` は本モジュール（NOSQL-4）の対象外のまま
+    // （NOSQL-10・Issue #765 の担当）。
     let (core, _guard) = new_core();
     let addr = spawn(Arc::clone(&core));
 
-    let cases: [&[u8]; 3] = [
+    let body =
+        br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"explain":true}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(http_common::wire_code_of(&resp), "0A000", "resp={resp:?}");
+    // 実行していない（`row_count` が本文に一切現れない）ことを確認する。
+    assert!(
+        !body_utf8(&resp).contains("row_count"),
+        "{}",
+        body_utf8(&resp)
+    );
+}
+
+#[test]
+fn malformed_group_by_having_shapes_reject_with_42601_and_do_not_execute() {
+    // `group_by`／`having` は Issue #769（NOSQL-5）で `bind` が直接処理する
+    // ようになったため、形の逸脱（`group_by` 空配列・`having` の単独指定）は
+    // `0A000`（未実装扱い）ではなく `42601`（構文層の拒否と同分類）になる。
+    // `group_by`／`having` の詳細な受理・拒否契約は
+    // `crates/wire-server/tests/nosql5_group_by.rs` が別途固定する。
+    let (core, _guard) = new_core();
+    let addr = spawn(Arc::clone(&core));
+
+    let cases: [&[u8]; 2] = [
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":[]}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"having":[]}"#,
-        br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"explain":true}"#,
     ];
     for body in cases {
         let resp = query_as_alice(addr, body);
-        assert_eq!(http_common::wire_code_of(&resp), "0A000", "resp={resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
         // 実行していない（`row_count` が本文に一切現れない）ことを確認する。
         assert!(
             !body_utf8(&resp).contains("row_count"),
