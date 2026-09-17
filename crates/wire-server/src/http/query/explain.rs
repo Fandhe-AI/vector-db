@@ -39,7 +39,7 @@ use engine::policy::PolicyContext;
 use engine::sql::allowlist::{validate_using_plan_question, SqlSurfaceError};
 use engine::sql::exec::QueryResult;
 use engine::sql::explain::ExplainShape;
-use engine::sql::mode::{SearchMode, SessionState};
+use engine::sql::mode::SessionState;
 
 use super::ident::{self, InvalidIdentifier};
 use super::response::{self, ResponseEncodeError};
@@ -129,7 +129,12 @@ impl ClassifiedError for ExplainError {
 /// 2. `vector` 指定を拒否する（`42601`）。
 /// 3. `plan` 未指定を拒否する（`42601`）。`plan`（`USING PLAN` 質問文字列）は
 ///    [`validate_using_plan_question`] で長さ上限を検証する。
-/// 4. `mode`（識別子形状検査・語彙検証）を解決前のまま読み取る。
+/// 4. `mode` は識別子形状検査のみここで行い、語彙検証（`SearchMode::
+///    parse_literal`）は生リテラルのまま
+///    [`engine::core::EngineCore::explain_bound_plan_in_session`] へ渡し、
+///    テーブル解決後に解析させる（Cursor Bugbot 指摘対応: 未知テーブル
+///    〔`42P01`〕が `mode` 値不正〔`22000`〕より優先される順序を、SQL
+///    `EXPLAIN` 経路〔`core.rs::run_explain_plan`〕と同一に保つため）。
 /// 5. [`engine::core::EngineCore::explain_bound_plan_in_session`] を呼ぶ。
 ///    binder closure は [`bind_search`] の完全な束縛結果から
 ///    [`BoundSearch::Plan`] のフィルタのみを取り出す（`BoundSearch::Vector`
@@ -151,13 +156,16 @@ pub fn execute(
         .ok_or(ExplainError::ExplainRequiresPlan)?;
     validate_using_plan_question(question)?;
 
-    let query_mode = match validated.optional_str("mode")? {
-        Some(literal) => {
-            ident::check_identifier(literal)?;
-            Some(SearchMode::parse_literal(literal)?)
-        }
-        None => None,
-    };
+    // `mode` の語彙解析（`SearchMode::parse_literal`）はここでは行わない
+    // （Cursor Bugbot 指摘対応: `engine::core::EngineCore::
+    // explain_bound_plan_in_session` がテーブル解決を終えた後で初めて解析
+    // することで、未知テーブル（`42P01`）が `mode` 値不正（`22000`）より
+    // 優先される fail-closed 順序を保つ。識別子としての形状検査のみここで
+    // 完結させる）。
+    let mode_literal = validated.optional_str("mode")?;
+    if let Some(literal) = mode_literal {
+        ident::check_identifier(literal)?;
+    }
 
     let session = SessionState::default();
     let result = core.explain_bound_plan_in_session(
@@ -165,7 +173,7 @@ pub fn execute(
         &session,
         table,
         question,
-        query_mode,
+        mode_literal,
         |schema, _udfs| -> Result<ExplainShape, ExplainError> {
             match bind_search(validated, schema)? {
                 BoundSearch::Plan(plan) => {

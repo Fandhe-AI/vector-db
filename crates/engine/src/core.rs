@@ -2341,15 +2341,26 @@ impl EngineCore {
 
                 crate::sql::parser::validate_search_limit(validated.limit())?;
 
-                let query_mode = match validated.search_mode() {
-                    Some(literal) => Some(crate::sql::mode::SearchMode::parse_literal(literal)?),
-                    None => None,
-                };
-
-                // 手順本体（テーブル世代の事前記録 → 辞書必須列検証 → 束縛検証
-                // → LLM クエリ展開・モード解決 → 世代の事後照合 → 辞書必須列の
-                // 再検証 → 使用エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN`
-                // 整形）は [`Self::run_explain_plan`] が [`Self::
+                // `USING MODE` リテラルの解析は `run_explain_plan` に委譲し、
+                // ここでは行わない（cursor[bot] Bugbot 指摘対応・Issue #765
+                // 後続。`Statement::Select` アームの `USING PLAN` 経路
+                // 〔`run_using_plan_select`。PR #827〕と同じ理由: ここで先に
+                // 解析すると、テーブル未存在（`42P01` 相当）と `USING MODE`
+                // 値の不正（`22000`）が同時に成立する要求で、テーブル解決
+                // より先に mode 解析エラーが確定してしまう。
+                // `run_explain_plan` はテーブル解決（`read_txn_with_schema`）
+                // を終えた後で初めて mode リテラルを解析するため、生
+                // リテラルをそのまま渡すことで両表層（SQL テキスト経由・
+                // 束縛済み計画経由）が共有する fail-closed 順序〔LIMIT →
+                // 辞書列 → テーブル解決 → mode 解析 → 事前束縛検証 →
+                // I/O（LLM 展開・再埋め込み）→ 世代照合 → 再検証 → 束縛〕を
+                // 保つ。詳細は [`Self::run_explain_plan`] のドキュメント参照）。
+                //
+                // 手順本体（テーブル世代の事前記録 → 辞書必須列検証 → mode
+                // リテラル解析 → 束縛検証 → LLM クエリ展開・モード解決 →
+                // 世代の事後照合 → 辞書必須列の再検証 → 使用エンジン・
+                // ANN／SCALAR 静的判定 → `QUERY PLAN` 整形）は
+                // [`Self::run_explain_plan`] が [`Self::
                 // explain_bound_plan_in_session`]（TASK-186・NOSQL-10・
                 // Issue #765）と共有する（第 2 の実装を持たない）。
                 let result = self.run_explain_plan(
@@ -2357,7 +2368,7 @@ impl EngineCore {
                     session,
                     validated.table_name(),
                     question,
-                    query_mode,
+                    validated.search_mode(),
                     |schema, udfs| {
                         crate::sql::using_plan::pre_check_bindable(&validated, schema, udfs)
                     },
@@ -2766,6 +2777,15 @@ impl EngineCore {
     /// LLM I/O・世代照合の影響を受けないため最後まで使い回してよい
     /// （[`crate::sql::using_plan::pre_check_bindable`] の既存契約と同じ）。
     ///
+    /// `mode_literal`（`USING MODE` 相当の生リテラル）はテーブル解決
+    /// （最初の `read_txn_with_schema`）より後で初めて解析する（cursor[bot]
+    /// Bugbot 指摘対応・Issue #765 後続）。判定順序は「未知テーブル
+    /// （`42P01`）が `mode` 値不正（`22000`）より優先される」ことが契約
+    /// であり、[`Self::run_using_plan_select`]（PR #827）と同一の順序を
+    /// `EXPLAIN` 経路でも保つ。呼び出し元（SQL `Statement::Explain` アーム・
+    /// [`Self::explain_bound_plan_in_session`]）はいずれも解析前の生
+    /// リテラルをそのまま渡すこと。
+    ///
     /// エラー型 `E` は `E: From<SqlSurfaceError>` の境界のみを課す
     /// （呼び出し元ごとに異なるエラー型を返せるようにするため。SQL アーム
     /// 自身は blanket `impl<T> From<T> for T` により `E = SqlSurfaceError`
@@ -2776,7 +2796,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         table: &str,
         question: &str,
-        query_mode: Option<crate::sql::mode::SearchMode>,
+        mode_literal: Option<&str>,
         bind: F,
     ) -> Result<crate::sql::exec::QueryResult, E>
     where
@@ -2803,9 +2823,16 @@ impl EngineCore {
         dictionary_required_columns(&pre_check_schema)
             .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
 
-        // `USING MODE` リテラル・`VECTOR` 列の存在・投影列／`WHERE` 述語の
-        // 事前束縛検証を LLM I/O（`plan_query_with_mode`）より前に完結させる
-        // （`Statement::Select` アームの `USING PLAN` 経路と同じ理由）。
+        // `mode_literal` の解析はテーブル解決（上記 `read_txn_with_schema`）
+        // より後で行う（cursor[bot] Bugbot 指摘対応。上記ドキュメント参照）。
+        let query_mode = match mode_literal {
+            Some(literal) => Some(crate::sql::mode::SearchMode::parse_literal(literal)?),
+            None => None,
+        };
+
+        // `VECTOR` 列の存在・投影列／`WHERE` 述語の事前束縛検証を LLM I/O
+        // （`plan_query_with_mode`）より前に完結させる（`Statement::Select`
+        // アームの `USING PLAN` 経路と同じ理由）。
         let explain_shape = bind(&pre_check_schema, session.udfs())?;
 
         let planned = self
@@ -2889,13 +2916,20 @@ impl EngineCore {
     /// 境界を持つ——呼び出し元（wire-server）の binder が SQL 表層の束縛
     /// ヘルパー（`sql::parser`）を経由して独自のエラー型（`search::
     /// SearchError` 等）を返すため。
+    ///
+    /// `mode_literal`（`USING MODE` 相当の生リテラル）はここでは解析しない
+    /// （cursor[bot] Bugbot 指摘対応。[`Self::run_explain_plan`] がテーブル
+    /// 解決後に初めて解析することで、未知テーブル＋ `mode` 値不正の要求で
+    /// `42P01` が `22000` より優先される SQL テキスト経由と同一の
+    /// fail-closed 順序を保つ。[`Self::execute_bound_plan_search_in_session`]
+    /// と同じ設計）。
     pub fn explain_bound_plan_in_session<F, E>(
         &self,
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         table: &str,
         question: &str,
-        query_mode: Option<crate::sql::mode::SearchMode>,
+        mode_literal: Option<&str>,
         bind: F,
     ) -> Result<crate::sql::exec::QueryResult, E>
     where
@@ -2905,7 +2939,7 @@ impl EngineCore {
         ) -> Result<crate::sql::explain::ExplainShape, E>,
         E: From<crate::sql::allowlist::SqlSurfaceError>,
     {
-        self.run_explain_plan(ctx, session, table, question, query_mode, bind)
+        self.run_explain_plan(ctx, session, table, question, mode_literal, bind)
     }
 
     /// 束縛済み広域取得計画（[`crate::sql::parser::BoundScan`]）を単一

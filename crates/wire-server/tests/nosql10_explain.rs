@@ -348,6 +348,24 @@ fn explain_true_matches_sql_explain_rows_with_mode() {
     assert!(wire_lines.contains(&"mode_source: query_clause".to_string()));
 }
 
+/// 未知テーブル＋`mode` 値不正は `explain: true` 経路でも `42P01` が
+/// `22000` より優先される（Cursor Bugbot 指摘対応・PR #828 レビュー。
+/// `explain_bound_plan_in_session` がテーブル解決より先に `mode` リテラルを
+/// 解析すると、テーブル未存在＋ mode 値不正の要求で `42P01` より先に
+/// `22000` が確定してしまう回帰。通常の `search`（`nosql2_search.rs::
+/// undefined_table_rejects_with_42p01_before_invalid_mode_on_plan_path`）
+/// と同じ優先順位を `explain: true` 経路でも保証する）。
+#[test]
+fn undefined_table_rejects_with_42p01_before_invalid_mode_with_explain_true() {
+    let (core, _guard) = new_core();
+    let (addr, token) = spawn_alice_session(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"missing","plan":"find content","limit":1,
+        "mode":"fuzzy","explain":true}"#;
+    let resp = query(addr, &token, body);
+    assert_eq!(http_common::wire_code_of(&resp), "42P01", "resp={resp:?}");
+}
+
 #[test]
 fn explain_true_reports_hnsw_params_and_does_not_touch_hnsw_index_cache() {
     let (core, _guard) = new_hnsw_core();

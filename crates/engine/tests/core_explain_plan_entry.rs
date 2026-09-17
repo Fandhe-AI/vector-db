@@ -382,6 +382,42 @@ fn explain_entry_rejects_undefined_table_before_invoking_binder() {
     );
 }
 
+/// 未知テーブル＋`mode_literal` 値不正は `42P01` が `22000` より優先される
+/// （Cursor Bugbot 指摘対応・PR #828 レビュー。`run_explain_plan` が
+/// テーブル解決より先に `mode_literal` を解析すると、テーブル未存在＋
+/// mode 値不正の要求で `42P01` より先に `22000` が確定してしまう回帰。
+/// `execute_bound_plan_search_in_session`〔`run_using_plan_select`〕と
+/// 同じ優先順位を `EXPLAIN` 経路でも保証する）。
+#[test]
+fn explain_entry_rejects_undefined_table_before_invalid_mode_literal() {
+    let path = unique_db_path("core-explain-plan-entry-undefined-table-bad-mode");
+    let _guard = CleanupGuard(path.clone());
+    // テーブルを一切作らないスローアウェイ core。
+    let core = EngineCore::open(&path)
+        .expect("open engine core")
+        .with_query_planner(Box::new(CountingLlmClient::new(EXPANSION_RESPONSE)));
+
+    let binder_calls = std::sync::atomic::AtomicUsize::new(0);
+    let result = core.explain_bound_plan_in_session(
+        &ctx("tenant-a"),
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        Some("fuzzy"),
+        |_schema, _udfs| -> Result<ExplainShape, SqlSurfaceError> {
+            binder_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ExplainShape::from_filters(&[], &[]))
+        },
+    );
+    let err = result.expect_err("undefined table must be rejected before mode literal parsing");
+    assert_eq!(err.wire_code(), "42P01");
+    assert_eq!(
+        binder_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "binder must not be invoked when the table does not exist"
+    );
+}
+
 #[test]
 fn explain_entry_propagates_binder_error_and_skips_llm_call() {
     let path = unique_db_path("core-explain-plan-entry-binder-error");

@@ -26,14 +26,23 @@
   固定。`USING PLAN` は `HINT ORDER` を受理しないため SCALAR 段は常に
   DISTANCE 段より先に評価される契約に基づく）。
 - `core.rs::EngineCore::run_explain_plan`（private）: 既存 `Statement::
-  Explain` アームの本体（テーブル世代の事前記録 → 辞書必須列検証 → 束縛
-  検証（LLM I/O より前）→ LLM クエリ展開・モード解決 → 世代の事後照合 →
-  辞書必須列の再検証 → 使用エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN`
-  整形）を抽出した私的ヘルパー。binder closure は `&TableSchema`／
-  `&UdfRegistry` を受け取り `Result<ExplainShape, E>`（`E: From<
-  SqlSurfaceError>`）を返す。`Statement::Explain` アームはこのヘルパーを
-  呼ぶだけの薄いラッパーへ縮約した（挙動不変。手順順序・エラー分類は
-  ビット同一）。
+  Explain` アームの本体（テーブル世代の事前記録 → 辞書必須列検証 →
+  `mode_literal` 解析（テーブル解決後）→ 束縛検証（LLM I/O より前）→ LLM
+  クエリ展開・モード解決 → 世代の事後照合 → 辞書必須列の再検証 → 使用
+  エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN` 整形）を抽出した私的
+  ヘルパー。binder closure は `&TableSchema`／`&UdfRegistry` を受け取り
+  `Result<ExplainShape, E>`（`E: From<SqlSurfaceError>`）を返す。
+  `Statement::Explain` アームはこのヘルパーを呼ぶだけの薄いラッパーへ縮約
+  した（挙動不変。手順順序・エラー分類はビット同一）。`mode_literal`
+  （`Option<&str>`。`USING MODE` 相当の生リテラル）はテーブル解決（最初の
+  `read_txn_with_schema`）より後で初めて解析する（Cursor Bugbot 指摘
+  対応・PR #828 レビュー。未知テーブル〔`42P01`〕が `mode` 値不正
+  〔`22000`〕より優先される順序を、`Statement::Select` アームの `USING
+  PLAN` 経路〔`run_using_plan_select`。PR #827〕・`execute_bound_plan_
+  search_in_session`〔Issue #764〕と同一に保つ。当初の実装〔Issue #765〕
+  では呼び出し元がテーブル解決前に `SearchMode::parse_literal` を済ませて
+  から `run_explain_plan` へ渡していたため、未知テーブル＋ `mode` 値不正の
+  要求で `22000` が `42P01` より先に確定する回帰があった）。
 - `core.rs::EngineCore::explain_bound_plan_in_session`（`pub`）:
   `run_explain_plan` をそのまま公開する薄いラッパー。`execute_bound_scan_
   in_session`・`execute_bound_aggregate_in_session`（Issue #728）と同型の
@@ -51,16 +60,20 @@
   SQL-6 の「`EXPLAIN` は `USING PLAN` 付き検索 `SELECT` 専用」契約の写像）・
   `Engine(SqlSurfaceError)`・`Encode(ResponseEncodeError)` の 4 種。
 - `execute`: `table`（識別子形状検査）→ `vector` 指定拒否 → `plan` 未指定
-  拒否＋長さ検証（`validate_using_plan_question`）→ `mode`（識別子形状検査・
-  語彙検証）を LLM I/O より前に済ませてから
-  `EngineCore::explain_bound_plan_in_session` を呼ぶ。binder closure は
-  `bind_search`（Issue #763）の完全な束縛結果から `BoundSearch::Plan` の
-  フィルタのみを取り出して `ExplainShape::from_filters` を組み立てる
-  （`BoundSearch::Vector` への到達は構造上ないが、多層防御として
-  `ExplainRequiresPlan` へ拒否する）。`table`／`plan`／`mode` の検証は
-  `bind_search` 内でも再度行われる（二重検査。`EngineCore::
-  explain_bound_plan_in_session` のドキュメント参照）。第 2 の実行器は
-  作らない。
+  拒否＋長さ検証（`validate_using_plan_question`）→ `mode`（識別子形状検査
+  のみ。語彙検証は行わない）を読み取ってから `EngineCore::
+  explain_bound_plan_in_session` を生リテラルのまま渡して呼ぶ（Cursor
+  Bugbot 指摘対応・PR #828 レビュー。`mode` の語彙検証〔`SearchMode::
+  parse_literal`〕をここで先に行うと、テーブル未存在＋ mode 値不正の要求で
+  `22000` が `42P01` より先に確定してしまう。`explain_bound_plan_in_session`
+  がテーブル解決後に初めて解析することで SQL `EXPLAIN` 経路と同一の
+  fail-closed 順序を保つ）。binder closure は `bind_search`（Issue #763）の
+  完全な束縛結果から `BoundSearch::Plan` のフィルタのみを取り出して
+  `ExplainShape::from_filters` を組み立てる（`BoundSearch::Vector` への
+  到達は構造上ないが、多層防御として `ExplainRequiresPlan` へ拒否する）。
+  `table`／`plan`／`mode` の検証は `bind_search` 内でも再度行われる（二重
+  検査。`EngineCore::explain_bound_plan_in_session` のドキュメント参照）。
+  第 2 の実行器は作らない。
 - `response::encode_explain`: `QueryResult` が `Computed { name: "QUERY
   PLAN" }` 1 列・各行 `Cell::Text` 1 個であることを検証してから
   `{"explain":["<行>", ...]}`（キー固定・空白なし）へ写像する。逸脱時は
@@ -83,15 +96,17 @@
   `explain_bound_plan_in_session` の行単位完全一致（フィルタなし・等価
   フィルタあり）・HNSW opt-in 時の `hnsw_params:` 行一致と索引キャッシュ
   非タッチ（`lookup`／`prepare_*` 不呼び出しの非 vacuous 証跡）・未定義
-  テーブルの binder 呼び出し前拒否・binder エラーの伝播と LLM 呼び出し
-  スキップ・プランナー未注入時の `XX000`・辞書必須列欠如の `22000`・他
-  テナント行内容の非漏えいを固定。
+  テーブルの binder 呼び出し前拒否・未定義テーブル＋ `mode_literal` 値不正
+  で `42P01` が `22000` より優先されること（PR #828 レビュー対応）・binder
+  エラーの伝播と LLM 呼び出しスキップ・プランナー未注入時の `XX000`・
+  辞書必須列欠如の `22000`・他テナント行内容の非漏えいを固定。
 - `crates/wire-server/tests/nosql10_explain.rs`（新設。production ルータ
   経由の層 A）: SQL `EXPLAIN` との行単位一致（フィルタなし・フィルタ
   あり・`mode` あり）・HNSW opt-in 時の `hnsw_params:` 行・`vector` 指定
-  拒否・`vector`＋`plan` 併存拒否・プランナー未注入時の `XX000`・
-  `aggregate`／`scan` の `explain: true` が引き続き `42601`・他テナント
-  行内容の非漏えいを検証。
+  拒否・`vector`＋`plan` 併存拒否・未知テーブル＋ `mode` 値不正で `42P01`
+  が `22000` より優先されること（PR #828 レビュー対応）・プランナー未注入
+  時の `XX000`・`aggregate`／`scan` の `explain: true` が引き続き
+  `42601`・他テナント行内容の非漏えいを検証。
 - `crates/wire-server/tests/nosql4_aggregate.rs`: `explain_true_rejects_
   with_0a000_and_does_not_execute` を `explain_true_rejects_with_42601_
   and_does_not_execute` へ改名・期待値を `42601` へ更新。
