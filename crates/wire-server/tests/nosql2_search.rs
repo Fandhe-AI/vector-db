@@ -641,6 +641,61 @@ fn vector_and_plan_both_present_rejects_with_42601() {
     assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
 }
 
+/// `vector`・`plan` 両方指定に加えて `mode`（不正な識別子形状ではなく
+/// 未知リテラル）まで併指定しても、排他違反 `42601` が `mode` 解析失敗
+/// （`22000`）より優先される（codex-review P1 指摘・PR #827。修正前は
+/// `execute` の `plan_present` 分岐内でローカルな `mode` 解析が排他判定
+/// より先に走り `22000` を誤って返していた）。
+#[test]
+fn vector_and_plan_both_present_with_invalid_mode_still_rejects_with_42601() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"plan":"find content","limit":10,"mode":"fuzzy"}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+}
+
+/// `vector`・`plan` 両方指定に加えて `plan` が長さ上限を超えていても、
+/// 排他違反 `42601` が長さ超過（`54000`）より優先される（同上・codex-review
+/// P1 指摘・PR #827）。
+///
+/// 実装の上限値（engine 側の非 `pub` 定数）は転記せず、以下の 2 点だけを
+/// 満たす長さで代表させる: (1) 単体で `plan` を渡した場合に実際に長さ超過
+/// （`54000`）で拒否される長さであること（非 vacuous 性は下の
+/// `oversized_plan_alone_rejects_with_54000` で固定）、(2) JSON 文字列長上限・
+/// HTTP 本文長上限のいずれにも達しない長さであること（達すると `42601` の
+/// 検証対象が変わってしまう）。
+const OVERSIZED_PLAN_LEN: usize = 200_000;
+
+#[test]
+fn vector_and_plan_both_present_with_oversized_plan_still_rejects_with_42601() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    let oversized_plan = "q".repeat(OVERSIZED_PLAN_LEN);
+    let body = format!(
+        r#"{{"op":"search","table":"docs","vector":[1.0,0.0],"plan":"{oversized_plan}","limit":10}}"#
+    );
+    let resp = query_as_alice(addr, body.as_bytes());
+    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+}
+
+/// 上の `OVERSIZED_PLAN_LEN` が本当に `plan` の長さ超過（`54000`）を引き
+/// 起こす長さであることを、`vector` を伴わない単体指定で固定する（非
+/// vacuous 性の担保。`vector` を外すと排他違反ではなく長さ超過そのものが
+/// 前面に出るはず）。
+#[test]
+fn oversized_plan_alone_rejects_with_54000() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    let oversized_plan = "q".repeat(OVERSIZED_PLAN_LEN);
+    let body = format!(r#"{{"op":"search","table":"docs","plan":"{oversized_plan}","limit":10}}"#);
+    let resp = query_as_alice(addr, body.as_bytes());
+    assert_eq!(http_common::wire_code_of(&resp), "54000", "resp={resp:?}");
+}
+
 /// `vector` + `explain: true` は `42601`（SQL-6 の `EXPLAIN SELECT ...
 /// ORDER BY` 拒否と同じ分類）。
 #[test]
