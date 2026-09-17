@@ -1,6 +1,6 @@
 # NoSQL `insert` op の写像（NOSQL-6）
 
-- Issue: #771・#772
+- Issue: #771・#772・#773
 - 対象タスク: TASK-178
 - 対象ビヘイビア: NOSQL-6（関連: SQL-10・INDEX-4・RECOVER-1／2／3／10・TABLE-12・RLS-9）
 - ステータス: Implemented
@@ -96,6 +96,25 @@
   他テナント名・行 id（重複対象自身の id を含む）が現れないことを固定。
   レイテンシ分布の区別不能性検証（SQL wire 版の層 B）は対象外（§対象外
   参照）。
+- 契約全体（`operation_id` 必須化・台帳照合による再送判定・INDEX-4 処理量
+  上限・TABLE-12 同一テナント内 `id` 衝突・RLS-9 秘匿）の層 A 結合テスト群を
+  `crates/wire-server/tests/nosql6_insert.rs` として追加（Issue #773）:
+  production ルータ経由（生バイトクライアント）で `23502`（欠落・`null`・
+  空文字の 3 状態）・`23505`／`22023`（台帳照合。表層を跨いだ再送判定の
+  一致を含む）・INDEX-4 の 4 上限（①③④は engine 公開 API・SQL 文字列
+  バッチとのパリティを含む。②は行形では `TEXT`／`VECTOR` 長のみが対象の
+  ため対象外）・束縛エラー（空 `rows`・バッチ内 `id` 重複・未存在テーブル・
+  判定順序）・TABLE-12 同一テナント内 `id` 衝突（SQL wire との `message`
+  一致）・RLS-9（他テナント保持行の有無で重複拒否応答バイト列が完全一致
+  すること）・拒否の連続がセッショントークンを損なわないことを固定する。
+  `insert.rs` 内 unit tests・`nosql6_tenant_row_id_scope.rs`（Issue #772）・
+  `wire_insert_operation_id.rs`（SQL wire 版）・
+  `crates/engine/tests/sql_insert_batch_public_api.rs` と役割分担しており
+  重複再検証はしない（ファイル冒頭のモジュール doc 参照）。INDEX-4 ③④の
+  「SQL 経路との一致」は SQL 表層に複数行 `INSERT` 構文が無いため主張でき
+  ず、共有 Rust 入口（`EngineCore::execute_bound_insert_in_session`）に
+  対する一致としてのみ主張する（①は `execute_insert_sql_batch` とのパリ
+  ティで検証）。
 
 ## spec 側への申し送り事項
 
@@ -108,8 +127,6 @@
 
 ## 対象外（後続 Issue の担当）
 
-- 全契約（`23502`・`23505`／`22023`・INDEX-4 上限・SQL 経路との `wire_code`
-  一致）の層 A テスト群（`nosql6_insert.rs`。#773）
 - `EXPLAIN` フィールド（NOSQL-10。#765）
 - (b) 他テナント保持 id・(c) 未存在 id への insert のレイテンシ分布の
   区別不能性検証（NoSQL 表層版の層 B 計測ハーネス。SQL wire 版は
