@@ -44,7 +44,7 @@
   4. スキーマ取得 → 束縛（同一 `read_txn` 下。単一スナップショット契約）。
      束縛結果の各 `BoundInsert.operation_id` が判定 1 で検査した引数
      `operation_id` と一致することも検証する（不一致は `22000`。PR #823
-     Bugbot 指摘: 判定 7 の実書き込みは `bounds[0].operation_id` を台帳
+     Bugbot 指摘: 6. の実書き込み（`execute_insert_batch`）は `bounds[0].operation_id` を台帳
      キーとして再解決するため、この一致検証がないと判定 1 のガードと
      実書き込みが異なる `operation_id` を使い得た）
   5. INDEX-4 ②③④（バイト量・チャンク数上限。1 行 = 1 チャンクとみなす。

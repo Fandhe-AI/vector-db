@@ -748,13 +748,44 @@ pub fn insert_typed_row(
     operation_id: &OperationId,
 ) -> Result<(), TenantWriteError> {
     let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
-    insert_typed_row_unchecked(storage, table, ctx, id, visibility, values, ledger_write)
+    insert_typed_row_unchecked(
+        storage,
+        table,
+        ctx,
+        id,
+        visibility,
+        values,
+        ledger_write,
+        None,
+    )
 }
 
 /// [`insert_typed_row`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と
 /// 同じ設計）。呼び出し元は本モジュール内の [`insert_typed_row`] と
-/// `crate::sql::exec::execute_insert`（`allowlist::validate_insert` でガード済み。
-/// `LedgerMode::resolve` の結果をそのまま渡す。TASK-93・RECOVER-2）。
+/// `crate::sql::exec::execute_insert_with_schema`（`allowlist::validate_insert` で
+/// ガード済み。`LedgerMode::resolve` の結果をそのまま渡す。TASK-93・RECOVER-2）。
+///
+/// `expected_schema`（codex-review P1 指摘・PR #823）: 呼び出し元が値配列
+/// `values` を束縛した時点のスキーマ（`TableSchema`。`PartialEq`／`Eq` 実装
+/// 済みで列名・型・`nullable`・宣言順を丸ごと比較できる）。`Some` の場合、
+/// 本関数が `require_table_schema_write` で write トランザクション内に
+/// **改めて**取得したスキーマと不一致なら fail-closed に拒否する
+/// （`CatalogError::Invalid` → `sql::exec::map_insert_write_error` 経由で
+/// 既存の `22000` へ収束。新規 `wire_code` は追加しない）。
+///
+/// この検証が無いと、呼び出し元が読み取り専用トランザクションで束縛した
+/// `values`（列の**位置**で `schema.columns` に対応づけられる）と、本関数が
+/// 実際に書き込み時点で参照するスキーマとの間に競合（束縛後・書き込み前に
+/// 同名テーブルが `DROP`・再作成され `TEXT` 列の宣言順が入れ替わった等）が
+/// 生じても検出できず、`VECTOR` 列の位置・次元さえ一致していれば
+/// `validate_embedding_dim` を素通りしたうえで値が意図しない列へ保存され得る
+/// （`core::EngineCore::execute_bound_insert_in_session` が read トランザクション
+/// で束縛した後にトランザクションを閉じ、実書き込みは別の write トランザクション
+/// で行う構造のため発生しうる TOCTOU）。`values` 自体を使い回さない他の呼び出し元
+/// （テスト専用の [`insert_typed_row`] 等）は `None` を渡し既存動作のまま不変。
+// `expected_schema`（codex-review P1 指摘・PR #823）追加で 8 引数。既存の
+// `arena.rs`・`hnsw.rs` と同じ方針で許容する。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_typed_row_unchecked(
     storage: &Storage,
     table: &str,
@@ -763,11 +794,19 @@ pub(crate) fn insert_typed_row_unchecked(
     visibility: crate::storage::Visibility,
     values: &[crate::row_codec::Value],
     ledger_write: LedgerWrite<'_>,
+    expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
+        if let Some(expected) = expected_schema {
+            if expected != &schema {
+                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                    "table schema changed after the insert values were bound".to_string(),
+                )));
+            }
+        }
         let vector_idx = schema
             .columns
             .iter()
@@ -859,6 +898,12 @@ pub(crate) fn insert_typed_row_unchecked(
 /// 単一の write トランザクションで完結し、失敗時は部分書き込みが残らない
 /// （台帳追記は各行の書き込みより前に同一トランザクション内で行う。
 /// `for_typed_insert_batch` のドキュメント参照）。
+///
+/// `expected_schema`（codex-review P1 指摘・PR #823）は
+/// [`insert_typed_row_unchecked`] と同じ契約（`Some` なら束縛時スキーマと
+/// write トランザクション内で再取得したスキーマの不一致を `22000` で拒否）。
+/// 詳細・不一致時の TOCTOU シナリオは [`insert_typed_row_unchecked`] の
+/// ドキュメント参照。
 pub(crate) fn insert_typed_rows_unchecked(
     storage: &Storage,
     table: &str,
@@ -866,6 +911,7 @@ pub(crate) fn insert_typed_rows_unchecked(
     visibility: crate::storage::Visibility,
     rows: &[(u64, &[crate::row_codec::Value])],
     ledger_write: LedgerWrite<'_>,
+    expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     if rows.is_empty() {
@@ -889,6 +935,13 @@ pub(crate) fn insert_typed_rows_unchecked(
     let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
+        if let Some(expected) = expected_schema {
+            if expected != &schema {
+                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                    "table schema changed after the insert values were bound".to_string(),
+                )));
+            }
+        }
         let vector_idx = schema
             .columns
             .iter()

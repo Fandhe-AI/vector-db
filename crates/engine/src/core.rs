@@ -2907,8 +2907,19 @@ impl EngineCore {
             |e| crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string()),
         )?;
 
-        // 判定 7: 実書き込み（独自の write トランザクション）。
-        crate::sql::exec::execute_insert_batch(&self.storage, ctx, &bounds, self.ledger_mode)
+        // 判定 7: 実書き込み（独自の write トランザクション）。`Some(&schema)`
+        // （判定 4・5 で取得した束縛時点のスキーマ）を渡すことで、実書き込みが
+        // write トランザクション内で改めて取得するスキーマとの不一致を fail-closed
+        // に検出する（codex-review P1 指摘・PR #823。`tenant::insert_typed_row_unchecked`
+        // のドキュメント参照。束縛後・書き込み前にテーブルが再定義され列順が
+        // 入れ替わっても、値が誤った列へ保存されるのを防ぐ）。
+        crate::sql::exec::execute_insert_batch_with_schema(
+            &self.storage,
+            ctx,
+            &bounds,
+            self.ledger_mode,
+            Some(&schema),
+        )
     }
 
     /// `USING PLAN('<query>')`（TASK-77・SQL-5）経路のうち、スキーマに依存しない
