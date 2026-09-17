@@ -106,6 +106,36 @@ pub fn spawn_router_listener(
     addr
 }
 
+/// [`spawn_router_listener`] の `engine` 接続版（Issue #768・TASK-177・
+/// NOSQL-4。`wire_server::http::router::Router::with_engine` 経由）。
+/// `POST /v1/query`（`op: aggregate`）が実行可能なリスナーを起動する。
+pub fn spawn_router_listener_with_engine(
+    users_path: &std::path::Path,
+    sessions: wire_server::http::session::store::SessionStore,
+    engine: std::sync::Arc<engine::core::EngineCore>,
+) -> SocketAddr {
+    let store = wire_server::auth::UserStore::load_from_file(users_path).expect("valid store");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let limiter = ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS);
+    let router = wire_server::http::router::Router::with_engine(
+        std::sync::Arc::new(store),
+        sessions,
+        engine,
+    );
+
+    std::thread::spawn(move || {
+        wire_server::http::listener::accept_loop_with_router(
+            listener,
+            limiter,
+            wire_server::limits::READ_TIMEOUT,
+            router,
+        );
+    });
+
+    addr
+}
+
 /// 応答受信後にクライアントがソケットへ対して何をするか。
 ///
 /// `HalfClose`（既定・推奨）は書き込み側を即座に閉じ、サーバーの

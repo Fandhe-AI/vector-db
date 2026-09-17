@@ -58,6 +58,7 @@ use crate::http::session::close as session_close;
 use crate::http::session::issue as session_issue;
 use crate::http::session::middleware;
 use crate::http::session::store::SessionStore;
+use engine::core::EngineCore;
 use engine::error_format::ErrorClass;
 
 /// `/v1/session` の要求ターゲット（バイト厳密一致のみ受理。クエリ文字列付き・
@@ -145,16 +146,40 @@ fn resolve_target(target: &str) -> Route {
 
 /// production 入口のルータ。`users`（ユーザーストアの共有ハンドル）・
 /// `sessions`（[`SessionStore`]。`Clone` で内部状態を共有する型のため、
-/// `Router` 自身は `Arc` で包まず値として保持する）を束ねる。
+/// `Router` 自身は `Arc` で包まず値として保持する）を束ねる。`engine` は
+/// `/v1/query` の `aggregate` op（Issue #768。他 op は #763・#766 が
+/// 追加）を実行するための接続済み `EngineCore`（`Router::new` 経由では
+/// `None` のまま。実行器なしで応答を偽装しない fail-closed 設計）。
 pub struct Router {
     users: Arc<UserStore>,
     sessions: SessionStore,
+    engine: Option<Arc<EngineCore>>,
 }
 
 impl Router {
-    /// `main.rs::run_server` の nosql 分岐から呼ばれる唯一の構築経路。
+    /// `engine` 未接続の構築経路。既存呼び出し元・既存テストの契約
+    /// （`aggregate` op も含め全 op が placeholder 応答）を維持する。
     pub fn new(users: Arc<UserStore>, sessions: SessionStore) -> Router {
-        Router { users, sessions }
+        Router {
+            users,
+            sessions,
+            engine: None,
+        }
+    }
+
+    /// `engine` 接続済みの構築経路（Issue #768。`main.rs::run_server` の
+    /// nosql 分岐から呼ばれる）。`aggregate` op は [`super::query::aggregate::
+    /// handle`] へ結線され実行可能になる。
+    pub fn with_engine(
+        users: Arc<UserStore>,
+        sessions: SessionStore,
+        engine: Arc<EngineCore>,
+    ) -> Router {
+        Router {
+            users,
+            sessions,
+            engine: Some(engine),
+        }
     }
 }
 
@@ -184,9 +209,13 @@ impl RequestHandler for Router {
             ),
             Route::Endpoint(Endpoint::Query) => {
                 match middleware::authenticate(&self.sessions, &req.headers, Instant::now) {
-                    Ok(principal) => {
-                        query_gate::handle(&principal, &req.headers, req.body, SystemTime::now())
-                    }
+                    Ok(principal) => query_gate::handle(
+                        &principal,
+                        &req.headers,
+                        req.body,
+                        self.engine.as_deref(),
+                        SystemTime::now(),
+                    ),
                     Err(e) => response::encode_error(
                         e.error_class(),
                         e.client_message(),
