@@ -1,6 +1,6 @@
 # NoSQL `insert` op の写像（NOSQL-6）
 
-- Issue: #771
+- Issue: #771・#772
 - 対象タスク: TASK-178
 - 対象ビヘイビア: NOSQL-6（関連: SQL-10・INDEX-4・RECOVER-1／2／3／10・TABLE-12・RLS-9）
 - ステータス: Implemented
@@ -69,6 +69,32 @@
   ヘッダからテナント相当の値を読む経路をシグネチャ上持たない。可視性は
   engine 側が常に `Private` 固定で書き込む（`execute_insert` と同じ判断）。
 
+### 成功応答（Issue #772）
+
+- `execute` の戻り値を `InsertOutcome` から `InsertSuccess`（`inserted`／
+  `operation_id`。`execute` 内で 1 回だけ検証した `OperationId` をそのまま
+  持ち回る）へ変更し、`encode_success_body`（`{"inserted":<n>,
+  "operation_id":"<escaped>"}`。キー順固定・空白なしのコンパクト形）が
+  唯一の情報源として本文を組み立てる。`operation_id` はクライアント要求の
+  値をそのまま echo するため、`crate::http::error_body::
+  escape_json_string_into` を通す（`"`／`\` の混入がありうるため。制御
+  文字は `OperationId::parse` が既に拒否済みだが多層防御として統一する）。
+  `InsertOutcome::incremental` は行形では常に `None`（ファイル形専用）の
+  ため本文へは含めない。
+- `handle`（`scan::handle`／`aggregate::handle` と同一シグネチャ形）を
+  `gate.rs` 手順 5 の `(Op::Insert, Some(engine))` アームへ結線し、`search`
+  のみが引き続き暫定 `0A000`／501 を返す状態にした。
+- 行 `id` のテナント内スコープ契約（TABLE-12・RLS-9）の NoSQL 表層越し
+  検証を `crates/wire-server/tests/nosql6_tenant_row_id_scope.rs` として
+  追加（SQL wire 版 `wire_tenant_row_id_scope.rs::rls9_wire_insert_
+  response_bytes_are_identical_...`／`table12_wire_insert_duplicate_...`
+  の写し）: 他テナント（tenant-b）保持 id・未存在 id への自テナント名義
+  `insert` の応答（`operation_id`／`Date` をマスクした後の全バイト列）が
+  完全に一致すること、同一テナント内重複は `23505` で拒否され応答本文に
+  他テナント名・行 id（重複対象自身の id を含む）が現れないことを固定。
+  レイテンシ分布の区別不能性検証（SQL wire 版の層 B）は対象外（§対象外
+  参照）。
+
 ## spec 側への申し送り事項
 
 - `id` の JSON 数値表現域（`JsonNumber::PosInt` による `u64::MAX` までの
@@ -80,7 +106,14 @@
 
 ## 対象外（後続 Issue の担当）
 
-- `gate.rs` の placeholder 置換・`Router` への `EngineCore` 注入・成功応答
-  JSON（`{"inserted", "operation_id"}`）への写像（#772）
-- 全契約の層 A テスト群（SQL 経由との seed 一致を含む。#773）
+- 全契約（`23502`・`23505`／`22023`・INDEX-4 上限・SQL 経路との `wire_code`
+  一致）の層 A テスト群（`nosql6_insert.rs`。#773）
 - `EXPLAIN` フィールド（NOSQL-10。#765）
+- (b) 他テナント保持 id・(c) 未存在 id への insert のレイテンシ分布の
+  区別不能性検証（NoSQL 表層版の層 B 計測ハーネス。SQL wire 版は
+  `wire_tenant_row_id_scope.rs` の Issue #738 層 B・`make
+  wire-tenant-latency` を参照）
+- commit 後 panic 時の緊急応答（RECOVER-6）の HTTP 表層対応（`insert` は
+  HTTP 表層で初めて到達可能になる書き込み op のため、commit 境界を跨いだ
+  panic の観測可能性は別途整理が必要。production では RECOVER-8 の
+  panic hook が abort するため実害は限定的）
