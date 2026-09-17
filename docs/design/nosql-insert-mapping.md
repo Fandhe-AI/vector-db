@@ -102,12 +102,14 @@
   codex-review 指摘・PR #830 で②の境界値検証を追加）:
   production ルータ経由（生バイトクライアント）で `23502`（欠落・`null`・
   空文字の 3 状態）・`23505`／`22023`（台帳照合。表層を跨いだ再送判定の
-  一致を含む）・INDEX-4 の 4 上限（①③④は engine 公開 API・SQL 文字列
-  バッチとのパリティを含む。②は行形では `TEXT`／`VECTOR` 長の合計値が
-  `execute_bound_insert_in_session` 判定 6 を通じて `batch_limits::
+  一致を含む）・INDEX-4 の 4 上限（①は engine 公開 API・SQL 文字列
+  バッチとのパリティを含む。③④は SQL 表層に複数行 `INSERT` 構文が無い
+  ため、共有 Rust 入口（`EngineCore::execute_bound_insert_in_session`）を
+  経由した HTTP 契約としてのみ検証する。②は行形では `TEXT`／`VECTOR` 長の
+  合計値が `execute_bound_insert_in_session` 判定 6 を通じて `batch_limits::
   validate_batch_shape` の同じ per-file 上限へそのまま適用されるため、
   行形でも上限ちょうど（受理）／上限未満（`54000`・副作用なし）の境界を
-  検証する。①③④との「SQL 経路とのパリティ」主張はファイル形の概念
+  検証する。①との「SQL 経路とのパリティ」主張はファイル形の概念
   （複数ファイルのバッチ投入）に紐づくため、行の合計バイト長を対象とする
   ②単体では主張しない）・束縛エラー（空 `rows`・バッチ内 `id` 重複・未存在テーブル・
   判定順序）・TABLE-12 同一テナント内 `id` 衝突（SQL wire との `message`
