@@ -2796,7 +2796,12 @@ impl EngineCore {
     /// 5. `bind(&schema)` で束縛済み `Vec<BoundInsert>` を得る（`read_txn` が開いて
     ///    いる間に呼ぶ。[`Self::execute_bound_scan_in_session`] と同じ単一
     ///    スナップショット契約）。戻り値の `table` が引数 `table` と一致し、
-    ///    `len() == row_count` であることを検証する（不一致は `22000`）。
+    ///    `len() == row_count` であることを検証する（不一致は `22000`）。あわせて
+    ///    各 `BoundInsert.operation_id` が判定 1 で検査した引数 `operation_id` と
+    ///    一致することも検証する（不一致は同じく `22000`。判定 7 の実書き込みが
+    ///    `bounds[0].operation_id` を台帳キーとして再解決するため、判定 1 の
+    ///    早期ガードと実書き込みが異なる `operation_id` を使う fail-closed でない
+    ///    経路を閉じる）。
     /// 6. ②③④（`batch_limits.rs`）: 各行のバイト量
     ///    `Σ Text.len() + Vector.len() × size_of::<f32>()`（`checked_add`。`Null` は
     ///    0）を `(0, row_bytes)` として `batch_limits::validate_batch_shape` へ渡し
@@ -2850,9 +2855,21 @@ impl EngineCore {
         // 判定 4・5: スキーマ取得 → 束縛（同一 read_txn 下）。
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bounds = bind(&schema)?;
-        if bounds.len() != row_count || bounds.iter().any(|b| b.table != table) {
+        if bounds.len() != row_count
+            || bounds
+                .iter()
+                .any(|b| b.table != table || b.operation_id.as_ref() != operation_id)
+        {
+            // `bounds[*].operation_id` は判定 1 の早期ガードが検査した引数
+            // `operation_id` と独立に `bind` closure（呼び出し元）が構築するため、
+            // 一致検証なしでは判定 1 が通過させた値と実書き込み（判定 7・
+            // `sql::exec::execute_insert_batch` が `bounds[0].operation_id` を
+            // 台帳キーとして再解決する）が異なる `operation_id` を使い得る
+            // （PR #823 Bugbot 指摘。`execute_insert_batch` 自身の
+            // 「全要素で `operation_id` が一致」検証だけでは、判定 1 の引数との
+            // 食い違いまでは検出できない）。
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
-                "bound insert plan does not match the requested table or row count",
+                "bound insert plan does not match the requested table, row count, or operation_id",
             ));
         }
         drop(read_txn);

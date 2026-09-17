@@ -275,6 +275,33 @@ fn execute_bound_insert_in_session_rejects_empty_batch() {
 }
 
 #[test]
+fn execute_bound_insert_in_session_rejects_operation_id_mismatch_between_guard_and_bound() {
+    // 判定 1（早期ガード。引数 `operation_id`）を通過した値と、`bind` closure が
+    // 構築した `BoundInsert.operation_id` が異なる場合は `22000` で拒否する
+    // （PR #823 Bugbot 指摘）。実書き込み（`execute_insert_batch`）は
+    // `bounds[0].operation_id` を台帳キーとして再解決するため、この一致検証
+    // がないと判定 1 のガードと実際の台帳キーが食い違い得る。
+    let (core, path) = open_engine("core-insert-session-op-id-mismatch-guard-vs-bound");
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a", [Visibility::Private]);
+    let guard_op_id = OperationId::parse("op-guard").expect("valid operation_id");
+
+    let err = core
+        .execute_bound_insert_in_session(&policy, TABLE, 1, Some(&guard_op_id), |_schema| {
+            Ok(vec![bound(1, Some("op-bound-differs"))])
+        })
+        .expect_err("must reject operation_id mismatch");
+    assert_eq!(err.wire_code(), "22000");
+
+    // 実際には書き込まれていない（いずれの operation_id 台帳にも記録されない）。
+    assert_eq!(
+        core.operation_recorded(&policy, TABLE, &guard_op_id)
+            .expect("ledger lookup should succeed"),
+        LedgerLookup::NotRecorded
+    );
+}
+
+#[test]
 fn execute_bound_insert_in_session_row_count_limit_precedes_bind() {
     let (core, path) = open_engine_with_limits(
         "core-insert-session-row-limit",
