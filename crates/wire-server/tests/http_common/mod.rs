@@ -9,15 +9,19 @@
 //! `message` 抽出・拒否応答のアサーション」を 1 箇所へ集約する
 //! （`#[path = "http_common/mod.rs"] mod http_common;` で include する）。
 //!
-//! 到達できる唯一の production 入口は
+//! 本モジュールのヘルパーが起動する入口は
 //! [`wire_server::http::listener::accept_loop_with_limiter`] であり、これは
 //! 内部で [`wire_server::http::conn::PlaceholderRouter`]（`pub(crate)`。
-//! 本 Issue 時点は全パスを `08P01`／`"unknown request target"` で拒否する
-//! 実ルータ未実装の placeholder。実ルータは Issue #758）を固定で使う。
+//! 全パスを `08P01`／`"unknown request target"` で拒否する固定応答）を
+//! 使う。これはフレーミング層（要求行・ヘッダ・本文検証）のテストを
+//! production ルータ（[`wire_server::http::router::Router`]。Issue #752・
+//! #758 で 3 エンドポイント限定化まで実装済み）から意図的に切り離すための
+//! 設計であり、`PlaceholderRouter` は撤去しない。production ルータの未知
+//! パス応答は `conn::unknown_target_response` を共有するため
+//! `PlaceholderRouter` と同一バイト列になる（Issue #758）。
 //! したがって「要求が受理されパースを通ってハンドラへ到達した」ことは、
-//! 現状では常にこの固定応答としてしか観測できない。[`assert_reached_router`]
-//! はその観測境界を 1 箇所へ閉じ込めており、実ルータ置き換え時に更新する
-//! 箇所はここだけになる。
+//! 本モジュール経由では常にこの固定応答としてしか観測できない。
+//! [`assert_reached_router`] はその観測境界を 1 箇所へ閉じ込めている。
 //!
 //! 対応: TASK-173（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア HTTP-2,
 //! HTTP-3, HTTP-11）。
@@ -354,10 +358,11 @@ fn assert_status_and_wire_code(
     );
 }
 
-/// 本 Issue 時点で唯一到達できるハンドラ（[`wire_server::http::conn::
-/// PlaceholderRouter`]）の固定応答文言。実ルータ（Issue #758）が
-/// `PlaceholderRouter` を置き換えた際、本文言に依存する箇所はここ 1 箇所だけ
-/// 更新すればよい。
+/// 本モジュール経由（`accept_loop_with_limiter`＋[`wire_server::http::conn::
+/// PlaceholderRouter`]）で唯一到達できるハンドラの固定応答文言。production
+/// ルータ（[`wire_server::http::router::Router`]）の未知パス応答も
+/// `conn::unknown_target_response` を共有するため同一バイト列になる
+/// （Issue #758）。
 pub const ROUTER_PLACEHOLDER_MESSAGE: &str = "unknown request target";
 
 /// 応答が `expected_status`／`expected_wire_code` の拒否応答であることを

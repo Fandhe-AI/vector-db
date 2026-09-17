@@ -32,8 +32,9 @@
 //! を `http::session::issue::handle` へ、`/v1/session/close` を
 //! `http::session::close::handle` へ、`/v1/query` を
 //! `http::session::middleware::authenticate` 経由で `http::query::gate::
-//! handle` へディスパッチ・他パスは `08P01`）は Issue #752・#753・#754 で
-//! 実装済み。`/v1/query` の op 束縛・実行は Issue #758・#759 以降が追記する）を
+//! handle` へディスパッチ・他パスは `08P01`）は Issue #752・#753・#754・
+//! #758 で実装済み（3 エンドポイント限定・未知パス／非 POST の網羅は
+//! #758）。`/v1/query` の op 束縛・実行は Issue #759 以降が追記する）を
 //! 呼ぶ。いずれも `match surface` の前に
 //! 1 回だけ構築した同一の
 //! `limits::ConnectionLimiter` インスタンスを受け取る。選ばれていない
@@ -527,7 +528,7 @@ fn run_server(args: &[String]) -> ExitCode {
     // 同一のまま保つ）。
     if surface == wire_server::surface::Surface::Nosql {
         eprintln!(
-            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; POST /v1/session, POST /v1/session/close, and POST /v1/query (Bearer-gated) available; POST /v1/query binding/execution pending Issue #758/#759; other paths rejected with 08P01)"
+            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; POST /v1/session, POST /v1/session/close, and POST /v1/query (Bearer-gated) available; POST /v1/query binding/execution pending Issue #759; other paths and non-POST methods rejected with 08P01)"
         );
     }
 
@@ -556,7 +557,7 @@ fn run_server(args: &[String]) -> ExitCode {
             // 表層選択のたびに新規構築する（プロセス内で 1 表層のみ起動
             // するため、SQL wire 側の `store`／`limiter` と同じ「1 回だけ
             // 構築」方針）。`core`（クエリ実行）はまだ使わない
-            // （`/v1/query` の実行結線は Issue #758 以降の担当）。
+            // （`/v1/query` の op 束縛・実行結線は Issue #759 以降の担当）。
             let _ = &core;
             let sessions = wire_server::http::session::store::SessionStore::new();
             let router = wire_server::http::router::Router::new(Arc::clone(&store), sessions);
