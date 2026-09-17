@@ -605,7 +605,7 @@ mod tests {
     /// `mode` に NUL バイトを含む値を与えても識別子形状検査で拒否され、
     /// untrusted な生文字列がエラー文言へ埋め込まれないことを固定する
     /// （`error_response::encode` の制御文字拒否による `XX000` への縮退を
-    /// 未然に防ぐ）。`engine::json::parse_json` は ` ` エスケープ経由の
+    /// 未然に防ぐ）。`engine::json::parse_json` は `\u0000` エスケープ経由の
     /// 制御文字も拒否するため、JSON テキストを経由せず `JsonValue` を直接
     /// 組み立てて schema 検証以降の経路だけを検証する。
     #[test]
