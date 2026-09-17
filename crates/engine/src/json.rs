@@ -88,7 +88,7 @@ pub enum JsonValue {
 /// 精度を失う `f64` 変換の**前**に整数／小数を分類し、整数は `u64`／`i64` の
 /// 無損失表現で保持する（オーバーフロー時のみ `Float` へ縮退。RFC 8259 上は
 /// 有効な数値のため拒否はしない）。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JsonNumber {
     /// 小数点・指数部を含まない非負整数リテラル（`"-"` 始まりでない）。
     /// `u64` の範囲で無損失に表現できる。
@@ -98,7 +98,20 @@ pub enum JsonNumber {
     NegInt(i64),
     /// 小数点・指数部を含む、または整数として `u64`／`i64` に収まらない
     /// リテラル。`f64` 変換（丸めを伴いうる）で保持する。
-    Float(f64),
+    ///
+    /// `text`（パース時点の生リテラル文字列）を併せて保持する（Issue #771
+    /// レビュー指摘対応）。`value` だけを経由して `f32` を得ると
+    /// `str -> f64 -> f32` の 2 回丸めになり、SQL 表層 `sql::parser::
+    /// parse_vector_literal` の `str -> f32` 単一丸めと異なる結果になりうる
+    /// （例: `"1.0000000596046448"` は `f64` 丸めで厳密に表現可能な値へ
+    /// 丸まった後さらに `f32` へ丸めると `1.0` になるが、直接 `f32` へ
+    /// 丸めると異なるビットパターンになる）。同一リテラル・同一
+    /// `operation_id` を NoSQL・SQL 表層を跨いで再送した際に、ベクトル列の
+    /// `content_hash`（`recovery::content_hash::push_vector`）が表層ごとに
+    /// 異なり「同一内容の再送」（`23505`）ではなく「内容不一致」（`22023`）
+    /// と誤判定されるのを防ぐため、[`JsonNumber::as_f32`] は `text` を
+    /// [`parse_f32_text`] で直接 `f32` へ変換し `value` を経由しない。
+    Float { value: f64, text: Box<str> },
 }
 
 impl JsonNumber {
@@ -108,23 +121,58 @@ impl JsonNumber {
     /// `content_hash::push_vector` は符号ビットを含めてハッシュするため、
     /// 正のゼロへ潰すと表層横断の `operation_id` 再送判定（同一内容 `23505`／
     /// 内容不一致 `22023`）が食い違う（PR #823 codex-review 指摘）。
-    pub fn as_f64(self) -> f64 {
-        match self {
+    pub fn as_f64(&self) -> f64 {
+        match *self {
             JsonNumber::PosInt(n) => n as f64,
             JsonNumber::NegInt(0) => -0.0,
             JsonNumber::NegInt(n) => n as f64,
-            JsonNumber::Float(f) => f,
+            JsonNumber::Float { value, .. } => value,
         }
     }
 
     /// `PosInt` のときのみ無損失な `u64` を返す（`id` 疑似列のように
     /// 非負整数を精度を落とさず要求する呼び出し元向け）。
-    pub fn as_exact_u64(self) -> Option<u64> {
-        match self {
+    pub fn as_exact_u64(&self) -> Option<u64> {
+        match *self {
             JsonNumber::PosInt(n) => Some(n),
             _ => None,
         }
     }
+
+    /// 全 variant を `f32` へ変換する（Issue #771 レビュー指摘対応。SQL 表層
+    /// `sql::parser::parse_vector_literal` の各要素と同一の丸め結果を保証する
+    /// ための唯一の実装）。整数 variant は `f64` を経由せず直接キャストする
+    /// （整数から `f32` への丸めは単一丸めであり、10 進整数テキストを直接
+    /// `f32` へパースする場合と同じ最近接丸め結果になる。`NegInt(0)` は
+    /// `as_f64` と同じ理由で `-0.0` へ復元する）。`Float` variant は保持した
+    /// `text` を [`parse_f32_text`] で直接 `f32` へ変換し、`value`（`f64`）を
+    /// 経由する 2 回丸めを避ける。非有限（`NaN`／`Infinity`。指数部が大きい
+    /// リテラルが `f32` の範囲を超える場合を含む）または構文上パース不能な
+    /// 場合は `None`（呼び出し元が fail-closed に拒否する）。
+    pub fn as_f32(&self) -> Option<f32> {
+        let v = match self {
+            JsonNumber::PosInt(n) => *n as f32,
+            JsonNumber::NegInt(0) => -0.0,
+            JsonNumber::NegInt(n) => *n as f32,
+            JsonNumber::Float { text, .. } => parse_f32_text(text).ok()?,
+        };
+        if v.is_finite() {
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
+/// `text` を `f32` として解析する（`str::parse::<f32>` の単一丸めのみを行い、
+/// 非有限判定は呼び出し元に委ねる）。[`JsonNumber::as_f32`]・
+/// `sql::parser::parse_vector_literal`（SQL ベクトルリテラルの各要素）の
+/// 双方がこの関数を経由することで、JSON 数値リテラルと SQL 数値リテラルの
+/// テキストが同一であれば変換結果もビット単位で一致することを保証する
+/// （表層横断の `content_hash` 一貫性のための唯一の変換経路。第 2 の実装を
+/// 作らない）。
+pub fn parse_f32_text(text: &str) -> Result<f32, std::num::ParseFloatError> {
+    text.parse::<f32>()
 }
 
 struct JsonParser<'a> {
@@ -478,7 +526,12 @@ impl<'a> JsonParser<'a> {
             }
         }
         text.parse::<f64>()
-            .map(|f| JsonValue::Number(JsonNumber::Float(f)))
+            .map(|f| {
+                JsonValue::Number(JsonNumber::Float {
+                    value: f,
+                    text: Box::from(text),
+                })
+            })
             .map_err(|_| JsonError)
     }
 }
@@ -609,24 +662,37 @@ mod tests {
         }
     }
 
+    /// `Float { value, text }` を組み立てるテスト専用ヘルパー（`text` は
+    /// `input` そのものをそのまま保持する契約のため、期待値もこの形で構成する）。
+    fn float_num(text: &str, value: f64) -> JsonNumber {
+        JsonNumber::Float {
+            value,
+            text: Box::from(text),
+        }
+    }
+
     #[test]
     fn parse_json_accepts_rfc8259_numbers() {
         let accepted: &[(&str, JsonNumber)] = &[
             ("0", JsonNumber::PosInt(0)),
             ("-0", JsonNumber::NegInt(0)),
-            ("0.5", JsonNumber::Float(0.5)),
-            ("-0.5", JsonNumber::Float(-0.5)),
+            ("0.5", float_num("0.5", 0.5)),
+            ("-0.5", float_num("-0.5", -0.5)),
             ("123", JsonNumber::PosInt(123)),
             ("-123", JsonNumber::NegInt(-123)),
-            ("1.5e10", JsonNumber::Float(1.5e10)),
-            ("1.5E-10", JsonNumber::Float(1.5e-10)),
-            ("0e0", JsonNumber::Float(0.0)),
+            ("1.5e10", float_num("1.5e10", 1.5e10)),
+            ("1.5E-10", float_num("1.5E-10", 1.5e-10)),
+            ("0e0", float_num("0e0", 0.0)),
             ("100", JsonNumber::PosInt(100)),
         ];
         for (input, expected) in accepted {
             let value =
                 parse_json(input).unwrap_or_else(|_| panic!("expected accept for {input:?}"));
-            assert_eq!(value, JsonValue::Number(*expected), "input={input:?}");
+            assert_eq!(
+                value,
+                JsonValue::Number(expected.clone()),
+                "input={input:?}"
+            );
         }
     }
 
@@ -651,7 +717,7 @@ mod tests {
         // （`id` 疑似列等の呼び出し元は `as_exact_u64()` が `None` を返すため
         // 拒否する。桁数上限 64 文字の範囲内で構成する）。
         let value = parse_json("9007199254740993.0").expect("valid JSON number");
-        assert!(matches!(value, JsonValue::Number(JsonNumber::Float(_))));
+        assert!(matches!(value, JsonValue::Number(JsonNumber::Float { .. })));
     }
 
     #[test]
@@ -668,5 +734,81 @@ mod tests {
         assert!(v.is_sign_negative(), "-0 must map to -0.0, got {v:?}");
         assert!(JsonNumber::PosInt(0).as_f64().is_sign_positive());
         assert_eq!(JsonNumber::NegInt(-5).as_f64(), -5.0);
+    }
+
+    // `as_f32` の表層横断一貫性（Issue #771 レビュー指摘対応）: `str -> f64 ->
+    // f32` の 2 回丸めではなく、保持した生リテラル文字列を SQL 表層と同一の
+    // `str -> f32` 単一丸めで変換することを固定する。
+    #[test]
+    fn as_f32_matches_direct_str_parse_and_differs_from_f64_roundtrip() {
+        // 1 + 2^-24。`f64` へ丸めると厳密に表現可能なためそのまま保持されるが、
+        // さらに `f32` へ丸める（2 回目の丸め）と最近傍偶数の `1.0` になる。
+        // 直接 `f32` としてパースすると 2^-24 の桁が失われず `1.0` より大きい
+        // 値になり、2 回丸め経路とはビットパターンが異なる。
+        let text = "1.0000000596046448";
+        let value = parse_json(text).expect("valid JSON number");
+        let JsonValue::Number(n) = value else {
+            panic!("expected number");
+        };
+
+        let direct: f32 = text.parse().expect("text parses as f32");
+        let double_rounded = n.as_f64() as f32;
+
+        assert_eq!(
+            n.as_f32().expect("finite").to_bits(),
+            direct.to_bits(),
+            "as_f32 must match single-rounding str->f32 parse"
+        );
+        assert_ne!(
+            direct.to_bits(),
+            double_rounded.to_bits(),
+            "test fixture must actually exercise the double-rounding discrepancy"
+        );
+    }
+
+    #[test]
+    fn as_f32_preserves_negative_zero_sign() {
+        let value = parse_json("-0").expect("valid JSON number");
+        let JsonValue::Number(n) = value else {
+            panic!("expected number");
+        };
+        let f = n.as_f32().expect("finite");
+        assert_eq!(f, 0.0);
+        assert!(f.is_sign_negative(), "-0 must map to -0.0f32, got {f:?}");
+    }
+
+    #[test]
+    fn as_f32_rejects_literal_exceeding_f32_range() {
+        // `1e39` は `f64` としては有限だが `f32` の表現範囲を超え `+inf` になる
+        // （SQL 表層 `parse_vector_literal` の非有限判定と同じ境界）。
+        let value = parse_json("1e39").expect("valid JSON number (finite as f64)");
+        let JsonValue::Number(n) = value else {
+            panic!("expected number");
+        };
+        assert_eq!(n.as_f32(), None);
+    }
+
+    #[test]
+    fn as_f32_integer_variants_match_text_parse() {
+        // 整数 variant（`PosInt`／`NegInt`）も、10 進整数テキストを直接 `f32`
+        // としてパースした場合とビット単位で一致することを固定する（`f64` を
+        // 経由しないため 2 回丸めの余地自体が無いが、念のため機械検証する）。
+        let cases = [
+            "9007199254740993",
+            "-9007199254740993",
+            &u64::MAX.to_string(),
+        ];
+        for text in cases {
+            let value = parse_json(text).expect("valid JSON number");
+            let JsonValue::Number(n) = value else {
+                panic!("expected number for {text:?}");
+            };
+            let direct: f32 = text.parse().expect("text parses as f32");
+            assert_eq!(
+                n.as_f32().expect("finite").to_bits(),
+                direct.to_bits(),
+                "mismatch for {text:?}"
+            );
+        }
     }
 }

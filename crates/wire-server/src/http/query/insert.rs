@@ -191,12 +191,19 @@ fn bind_row(item: &JsonValue, schema: &TableSchema) -> Result<(u64, Vec<Value>),
                             "INSERT row VECTOR column element must be a JSON number",
                         )));
                     };
-                    let f = n.as_f64() as f32;
-                    if !f.is_finite() {
-                        return Err(InsertError::Bind(invalid_input_error(
+                    // `n.as_f64() as f32`（`str -> f64 -> f32` の 2 回丸め）ではなく
+                    // `as_f32()`（保持した生リテラル文字列を SQL 表層
+                    // `sql::parser::parse_vector_literal` と同一の `str -> f32`
+                    // 単一丸めで変換）を使う。同一リテラル・同一 `operation_id` を
+                    // NoSQL・SQL 表層を跨いで再送した際、ここで丸めが食い違うと
+                    // `content_hash` が一致せず「同一内容の再送」（`23505`）ではなく
+                    // 「内容不一致」（`22023`）に誤判定されるため（Issue #771 レビュー
+                    // 指摘対応）。
+                    let f = n.as_f32().ok_or_else(|| {
+                        InsertError::Bind(invalid_input_error(
                             "INSERT row VECTOR column element must be finite",
-                        )));
-                    }
+                        ))
+                    })?;
                     vec_values.push(f);
                 }
                 Value::Vector(vec_values)
@@ -678,6 +685,87 @@ mod tests {
 
         let outcome = execute(&core, &principal, &validated).expect("insert ok");
         assert_eq!(outcome.rows_affected, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 表層横断の content_hash 一貫性（Issue #771 レビュー指摘対応）: SQL 表層
+    // `execute_sql_in_session`（`sql::parser::parse_vector_literal`。`str -> f32`
+    // 単一丸め）と NoSQL 表層 `execute`（`bind_row`。かつては
+    // `JsonNumber::as_f64() as f32` の `str -> f64 -> f32` 2 回丸めだった）は
+    // 同一のベクトルリテラル文字列を異なる丸めで `f32` へ変換しうるため、
+    // 同一テナント・同一テーブル・同一 `id`・同一 `operation_id` で表層を跨いで
+    // 再送しても `content_hash`（`recovery::content_hash::push_vector`）が
+    // 一致せず「同一内容の再送」（`23505`）ではなく「内容不一致」（`22023`）と
+    // 誤判定されうる。`1.0000000596046448` は 2 回丸め経路だと `1.0` になる一方
+    // 単一丸め（`str -> f32` 直接パース）では異なるビットパターンになる値
+    // （`json.rs::as_f32_matches_direct_str_parse_and_differs_from_f64_roundtrip`
+    // と同じ数値）を使い、SQL → NoSQL・NoSQL → SQL の双方向で `23505` になる
+    // ことを固定する。
+    const DOUBLE_ROUNDING_LITERAL: &str = "1.0000000596046448";
+
+    #[test]
+    fn cross_surface_resend_same_vector_literal_is_23505_sql_then_nosql() {
+        let (core, path) = open_core();
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let mut session = engine::sql::mode::SessionState::default();
+
+        core.execute_sql_in_session(
+            &ctx,
+            &mut session,
+            &format!(
+                "INSERT INTO docs (id, embedding, lang) VALUES (1, '[{DOUBLE_ROUNDING_LITERAL},0.2,0.3,0.4]', 'ja') USING OPERATION_ID 'op-cross-1'"
+            ),
+        )
+        .expect("SQL insert ok");
+
+        let http_principal = principal("tenant-a");
+        let body = format!(
+            r#"{{"op":"insert","table":"docs","rows":[{{"id":1,"embedding":[{DOUBLE_ROUNDING_LITERAL},0.2,0.3,0.4],"lang":"ja"}}],"operation_id":"op-cross-1"}}"#
+        );
+        let value = parse_json(&body).expect("valid json");
+        let validated = super::super::schema::INSERT_SCHEMA
+            .validate(&value)
+            .expect("schema ok");
+
+        let err = execute(&core, &http_principal, &validated)
+            .expect_err("resend of identical content across surfaces must be detected");
+        assert_eq!(
+            err.wire_code(),
+            "23505",
+            "SQL insert followed by identical NoSQL resend must be recognized as same-content"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cross_surface_resend_same_vector_literal_is_23505_nosql_then_sql() {
+        let (core, path) = open_core();
+        let http_principal = principal("tenant-a");
+        let body = format!(
+            r#"{{"op":"insert","table":"docs","rows":[{{"id":1,"embedding":[{DOUBLE_ROUNDING_LITERAL},0.2,0.3,0.4],"lang":"ja"}}],"operation_id":"op-cross-2"}}"#
+        );
+        let value = parse_json(&body).expect("valid json");
+        let validated = super::super::schema::INSERT_SCHEMA
+            .validate(&value)
+            .expect("schema ok");
+        execute(&core, &http_principal, &validated).expect("NoSQL insert ok");
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let mut session = engine::sql::mode::SessionState::default();
+        let err = core
+            .execute_sql_in_session(
+                &ctx,
+                &mut session,
+                &format!(
+                    "INSERT INTO docs (id, embedding, lang) VALUES (1, '[{DOUBLE_ROUNDING_LITERAL},0.2,0.3,0.4]', 'ja') USING OPERATION_ID 'op-cross-2'"
+                ),
+            )
+            .expect_err("resend of identical content across surfaces must be detected");
+        assert_eq!(
+            err.wire_code(),
+            "23505",
+            "NoSQL insert followed by identical SQL resend must be recognized as same-content"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

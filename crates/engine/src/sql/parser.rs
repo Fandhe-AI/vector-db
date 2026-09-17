@@ -266,7 +266,12 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
     if !inner.trim().is_empty() {
         for part in inner.split(',') {
             let part = part.trim();
-            let v: f32 = part.parse().map_err(|_| {
+            // `crate::json::parse_f32_text` と同一の実装を経由する（NoSQL 表層
+            // `engine::json::JsonNumber::as_f32` が JSON 数値リテラルを `f32` へ
+            // 変換する際の丸めと単一実装を共有し、表層横断で同一リテラル・
+            // 同一 `operation_id` を再送した際の `content_hash` 一致を保証する。
+            // Issue #771 レビュー指摘対応）。
+            let v: f32 = crate::json::parse_f32_text(part).map_err(|_| {
                 SqlSurfaceError::invalid_input(format!(
                     "vector literal element is not a number: {part:?}"
                 ))
@@ -379,19 +384,29 @@ pub fn bind_column_projection(
 }
 
 /// NoSQL 表層（Issue #763・TASK-175・NOSQL-2）向けのベクトル値束縛ヘルパー。
-/// `search.vector`（JSON 数値配列。`f64` 要素）を、SQL 表層の
-/// [`parse_vector_literal`] と同一の不変条件（次元一致・各要素が `f32` として
-/// 有限）で `Vec<f32>` へ変換する。
+/// `search.vector`（JSON 数値配列）の各要素を呼び出し元が
+/// `engine::json::JsonNumber::as_f32`（SQL 表層 [`parse_vector_literal`] と
+/// 同一の丸め――生リテラル文字列を直接 `f32` へ変換する単一丸め――を経由する
+/// 唯一の実装）で `f32` へ変換した後の `values` を受け取り、次元一致のみを
+/// 検証して `Vec<f32>` へ束ねる。
+///
+/// 以前は `&[f64]` を受け取り本関数内で `as f32` キャストしていたが、
+/// `JsonNumber::as_f64() -> f64` を経由する呼び出し元が存在すると
+/// `str -> f64 -> f32` の 2 回丸めになり、SQL 表層の `str -> f32` 単一丸めと
+/// 異なる結果になりうる（`json.rs::JsonNumber::Float` のドキュメンテーション
+/// コメント参照）。表層横断で同一リテラルが同一の `f32` になることを
+/// 呼び出し元の変換方法に依存させないため、本関数の入力型を `&[f32]` へ
+/// 変更した（Issue #771 レビュー指摘対応）。非有限判定は呼び出し元
+/// （`JsonNumber::as_f32` が非有限を `None` として弾く）が既に行っている
+/// 前提だが、多層防御としてここでも再検査する。
 ///
 /// 検証順序: (1) `values.len()` を [`vector_column`] が返す宣言次元
-/// （`u32`）と**`Vec<f32>` を確保する前に**照合する（次元不一致は
-/// [`SqlSurfaceError::invalid_input`]。`.claude/rules/security.md`
-/// 「不安全な設計｜無制限リソース確保（DoS）」対応。`values.len()` が
-/// `u32::MAX` を超える場合も同じ分岐で拒否する）。(2) 各要素を `as f32` へ
-/// キャストし、`f64` では有限でも `f32` へ縮小した結果が非有限になる値
-/// （例: `1e39`）を [`parse_vector_literal`] の (3)(4) と同じ判定で拒否する。
+/// （`u32`）と照合する（次元不一致は [`SqlSurfaceError::invalid_input`]。
+/// `values.len()` が `u32::MAX` を超える場合も同じ分岐で拒否する）。
+/// (2) 各要素が有限であることを再検査する（[`parse_vector_literal`] の
+/// (3)(4) と同じ判定）。
 pub fn bind_vector_values(
-    values: &[f64],
+    values: &[f32],
     schema: &TableSchema,
 ) -> Result<Vec<f32>, SqlSurfaceError> {
     let (_vec_idx, vec_dim) = vector_column(schema)?;
@@ -408,13 +423,12 @@ pub fn bind_vector_values(
     }
     let mut out = Vec::with_capacity(values.len());
     for value in values {
-        let as_f32 = *value as f32;
-        if !as_f32.is_finite() {
+        if !value.is_finite() {
             return Err(SqlSurfaceError::invalid_input(
                 "vector element must be finite (NaN/Inf are not allowed)",
             ));
         }
-        out.push(as_f32);
+        out.push(*value);
     }
     Ok(out)
 }
@@ -2842,44 +2856,37 @@ mod tests {
 
     #[test]
     fn bind_vector_values_accepts_matching_dim() {
-        let values = vec![1.0_f64, 2.0, 3.0];
+        let values = vec![1.0_f32, 2.0, 3.0];
         let bound = bind_vector_values(&values, &docs_schema()).expect("bind ok");
         assert_eq!(bound, vec![1.0_f32, 2.0, 3.0]);
     }
 
     #[test]
     fn bind_vector_values_rejects_dim_mismatch() {
-        let values = vec![1.0_f64, 2.0];
+        let values = vec![1.0_f32, 2.0];
         let err = bind_vector_values(&values, &docs_schema()).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
     }
 
     #[test]
     fn bind_vector_values_rejects_empty_when_dim_nonzero() {
-        let values: Vec<f64> = vec![];
+        let values: Vec<f32> = vec![];
         let err = bind_vector_values(&values, &docs_schema()).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
     }
 
     #[test]
-    fn bind_vector_values_rejects_f32_non_finite_after_cast() {
-        // `1e39` は `f64` としては有限だが `f32` へキャストすると `+inf` になる
-        // （`parse_vector_literal` の (3)(4) と同じ非有限判定を共有する）。
-        let values = vec![1e39_f64, 2.0, 3.0];
-        let err = bind_vector_values(&values, &docs_schema()).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
-    }
-
-    #[test]
-    fn bind_vector_values_rejects_nan_and_inf() {
-        let values = vec![f64::NAN, 2.0, 3.0];
+    fn bind_vector_values_rejects_non_finite_defense_in_depth() {
+        // 呼び出し元（`JsonNumber::as_f32`）が非有限を既に `None` として弾く
+        // 契約だが、本関数自身も多層防御として非有限を拒否することを固定する。
+        let values = vec![f32::NAN, 2.0, 3.0];
         assert_eq!(
             bind_vector_values(&values, &docs_schema())
                 .unwrap_err()
                 .wire_code(),
             "22000"
         );
-        let values = vec![f64::INFINITY, 2.0, 3.0];
+        let values = vec![f32::INFINITY, 2.0, 3.0];
         assert_eq!(
             bind_vector_values(&values, &docs_schema())
                 .unwrap_err()

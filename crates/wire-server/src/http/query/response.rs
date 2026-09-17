@@ -280,15 +280,15 @@ mod tests {
             panic!("row must be an array");
         };
         assert_eq!(cells.len(), 4);
-        assert!(matches!(cells[0], JsonValue::Number(n) if n.as_f64() == 42.0));
+        assert!(matches!(&cells[0], JsonValue::Number(n) if n.as_f64() == 42.0));
         assert!(matches!(&cells[1], JsonValue::String(s) if s == "ja"));
         let JsonValue::Array(vec_cell) = &cells[2] else {
             panic!("vector cell must be an array");
         };
         assert_eq!(vec_cell.len(), 2);
-        assert!(matches!(cells[3], JsonValue::Number(n) if n.as_f64() == 3.5));
+        assert!(matches!(&cells[3], JsonValue::Number(n) if n.as_f64() == 3.5));
 
-        assert!(matches!(top["row_count"], JsonValue::Number(n) if n.as_f64() == 1.0));
+        assert!(matches!(&top["row_count"], JsonValue::Number(n) if n.as_f64() == 1.0));
     }
 
     /// 型名一致テーブルテスト: 各 `ColumnMeta` について `encode_row_description`
@@ -368,7 +368,7 @@ mod tests {
             let body = encode(&result).expect("encode");
             let top = parse_top(&body);
             assert!(
-                matches!(top["row_count"], JsonValue::Number(v) if v.as_f64() == n as f64),
+                matches!(&top["row_count"], JsonValue::Number(v) if v.as_f64() == n as f64),
                 "n={n}"
             );
             let JsonValue::Array(rows) = &top["rows"] else {
