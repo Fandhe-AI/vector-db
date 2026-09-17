@@ -34,6 +34,11 @@
 //!   （[`engine::sql::allowlist::check_having_predicate_count`]）
 //! - `group_by` 要素数 ≠ 1・`having` のみ（`group_by` なし）・語彙外
 //!   `op`／`fn`・非有限 `value`・識別子形状不正 → `42601`
+//! - `aggregates` が空リスト → `group_by`／`having` の有無・形状によらず
+//!   一律 `42601`（`having` の参照解決より必ず先に検査する。PR #824
+//!   codex-review 指摘。参照解決を先に走らせると `group_by` あり経路のみ
+//!   `22000`（未知の HAVING 参照）へ落ち、`group_by` なし経路（`42601`）
+//!   と非対称になる）
 //! - `group_by` 列が `TEXT` 列でない・`having` が `MIN`/`MAX(<TEXT 列>)` を
 //!   参照・参照先が `aggregates` に存在しない／曖昧 → `22000`
 //!
@@ -349,6 +354,22 @@ pub fn bind(
         let parsed = bind_item(item, schema)?;
         item_specs.push((parsed.func, parsed.target));
         items.push(parsed.bound);
+    }
+
+    // `aggregates` が空リストなら、`group_by`／`having` の有無によらず一律
+    // `42601` で拒否する。`BoundAggregate::new`（`group_by` なし経路）・
+    // `new_grouped`（`group_by` あり経路）はいずれも同じ検査を持つが、
+    // `group_by` あり経路では `having` を `item_specs`（この時点で空）へ
+    // 照合する `bind_having_item` がこの検査より先に走ってしまうと、
+    // `having` 側の「未知の HAVING 参照」（`22000`）が先に確定してしまい
+    // `group_by` なし経路（`42601`）と異なる `wire_code` を返す非対称が
+    // 生じる（codex-review 指摘。`crates/engine/src/sql/parser.rs` の
+    // `BoundAggregate::new_grouped` 冒頭の同検査を参照）。ここで先に検査
+    // することで両経路の `wire_code` を揃える。
+    if items.is_empty() {
+        return Err(AggregateError::Engine(SqlSurfaceError::UnsupportedSyntax {
+            detail: "aggregate SELECT list must have at least one item".to_string(),
+        }));
     }
 
     let metadata_filters = match validated.optional_array("filter")? {
@@ -748,6 +769,33 @@ mod tests {
         let err = bind(&v, &schema()).expect_err("having:[] without group_by must be rejected");
         assert!(matches!(err, AggregateError::GroupByShape));
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_rejects_empty_aggregates_with_42601_regardless_of_group_by_shape() {
+        // codex-review 指摘（PR #824）: `aggregates:[]` は `group_by`／`having`
+        // の有無によらず一律 `42601` であるべき。`group_by` あり・`having` が
+        // `aggregates` を参照する形（本来なら `item_specs` 未存在で `22000`
+        // になり得た形）でも `42601` が先に確定することを固定する。
+        validated_aggregate!(
+            v,
+            r#"{"op":"aggregate","table":"docs",
+               "aggregates":[],
+               "group_by":["lang"],
+               "having":[{"fn":"count","column":"*","op":"=","value":1}]}"#
+        );
+        let err = bind(&v, &schema()).expect_err("aggregates:[] must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+
+        // `group_by` なし経路（`BoundAggregate::new`）も同じ `42601` のまま
+        // であることを対照として固定する。
+        validated_aggregate!(
+            v_ungrouped,
+            r#"{"op":"aggregate","table":"docs","aggregates":[]}"#
+        );
+        let err_ungrouped =
+            bind(&v_ungrouped, &schema()).expect_err("aggregates:[] must be rejected");
+        assert_eq!(err_ungrouped.wire_code(), "42601");
     }
 
     #[test]
