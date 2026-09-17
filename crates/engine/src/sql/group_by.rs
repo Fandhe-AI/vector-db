@@ -49,7 +49,11 @@ use redb::ReadableTable;
 use std::collections::BTreeMap;
 
 /// `GROUP BY` が生成してよいグループ数の上限（無制限 `BTreeMap` 確保を避ける）。
-pub(crate) const MAX_GROUPS: usize = 10_000;
+///
+/// `pub`（TASK-186・NOSQL-5）: `crates/wire-server/tests/nosql5_group_by.rs` が
+/// この値ちょうど＋1 グループのフィクスチャを組み立てて上限超過（`54000`）を
+/// 検証するために参照する（値・挙動そのものは不変）。
+pub const MAX_GROUPS: usize = 10_000;
 
 /// グループキー文字列（`Some` 側）が累計で保持してよいバイト数の上限。`TEXT` 列は
 /// 1 件あたり最大 4 MiB を許容するため、[`MAX_GROUPS`] 件数だけでは有界にならない。
