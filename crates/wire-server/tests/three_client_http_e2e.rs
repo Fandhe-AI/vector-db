@@ -137,12 +137,21 @@ fn spawn_nosql_server(users_path: &str, db_path: &str) -> (common::SpawnedServer
 
 /// curl 応答の本文上限（untrusted な外部プロセス出力を無制限に読み込まない
 /// ための固定上限。本テストが扱う応答は高々数百バイトで十分足りる）。
+/// curl 自体にも `--max-filesize` として同じ上限を課し、上限超過時は
+/// ディスクへ書き切ってから事後検査するのではなく curl の時点で転送を
+/// 中断させる（fail-closed。curl は非 0 終了で応答し既存の非 0 終了検査で
+/// `panic!` される）。
 const MAX_RESPONSE_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
 /// `curl` を 1 要求 = 1 プロセスで起動し、HTTP ステータスコードと応答本文を
 /// 返す（NoSQL 表層は `Connection: close` 固定のため `--next` 連結はしない）。
 /// `Command` の引数配列で起動しシェルを介さない。curl の spawn 失敗・非 0
 /// 終了はいずれも案内メッセージ付き `panic!`（silent skip しない）。
+///
+/// トークン（`Authorization` ヘッダ）・パスワードを含む要求本文は、
+/// `ps`／プロセス一覧経由で一時的にでも観測されないよう `Command` の
+/// 引数へ直接載せず、`out_dir` 配下の一時ファイル経由（ヘッダは `-H @file`・
+/// 本文は `--data-binary @file`）で curl へ渡す。
 fn curl_post(
     port: u16,
     target: &str,
@@ -152,29 +161,37 @@ fn curl_post(
     seq: u32,
 ) -> (u16, String) {
     let out_path = out_dir.join(format!("{seq}.body"));
+    let body_path = out_dir.join(format!("{seq}.req.json"));
+    let headers_path = out_dir.join(format!("{seq}.headers"));
     let url = format!("http://127.0.0.1:{port}{target}");
 
-    let mut args: Vec<String> = vec![
+    std::fs::write(&body_path, json_body)
+        .unwrap_or_else(|e| panic!("failed to write curl request body {body_path:?}: {e}"));
+
+    // 100-continue の余地を消す（本文が小さく即座に送れるため不要）。
+    let mut headers = String::from("Content-Type: application/json\nExpect:\n");
+    if let Some(token) = bearer {
+        headers.push_str(&format!("Authorization: Bearer {token}\n"));
+    }
+    std::fs::write(&headers_path, &headers)
+        .unwrap_or_else(|e| panic!("failed to write curl header file {headers_path:?}: {e}"));
+
+    let args: Vec<String> = vec![
         "-sS".to_string(),
         "--max-time".to_string(),
         "10".to_string(),
+        "--max-filesize".to_string(),
+        MAX_RESPONSE_BODY_BYTES.to_string(),
         "-H".to_string(),
-        "Content-Type: application/json".to_string(),
-        // 100-continue の余地を消す（本文が小さく即座に送れるため不要）。
-        "-H".to_string(),
-        "Expect:".to_string(),
+        format!("@{}", headers_path.to_str().expect("utf-8 headers path")),
         "--data-binary".to_string(),
-        json_body.to_string(),
+        format!("@{}", body_path.to_str().expect("utf-8 body path")),
         "-o".to_string(),
         out_path.to_str().expect("utf-8 out path").to_string(),
         "-w".to_string(),
         "%{http_code}".to_string(),
+        url,
     ];
-    if let Some(token) = bearer {
-        args.push("-H".to_string());
-        args.push(format!("Authorization: Bearer {token}"));
-    }
-    args.push(url);
 
     let curl_bin = resolve_tool("CURL_BIN", "curl");
     let output = Command::new(&curl_bin)
@@ -219,6 +236,17 @@ fn curl_post(
         .unwrap_or_else(|e| panic!("curl response body for target {target} is not utf-8: {e}"));
 
     (status, body)
+}
+
+/// curl 応答・要求本文の一時保存先ディレクトリを `Drop` で確実に削除する
+/// ガード（`temp_db::CleanupGuard` と同じ idiom。テスト内 `assert!` の
+/// panic 経路でも解放されるようにする）。
+struct CurlOutDirGuard(PathBuf);
+
+impl Drop for CurlOutDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn json_object(body: &str) -> std::collections::BTreeMap<String, JsonValue> {
@@ -272,6 +300,7 @@ fn curl_runs_session_search_close_over_nosql_surface() {
             .as_nanos()
     ));
     std::fs::create_dir(&out_dir).expect("create curl output dir");
+    let _out_dir_guard = CurlOutDirGuard(out_dir.clone());
 
     // 1. session 発行。
     let (status, body) = curl_post(
@@ -344,6 +373,4 @@ fn curl_runs_session_search_close_over_nosql_surface() {
         "stderr must not leak tenant id"
     );
     assert!(!joined.contains("alice"), "stderr must not leak username");
-
-    let _ = std::fs::remove_dir_all(&out_dir);
 }

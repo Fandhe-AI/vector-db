@@ -254,49 +254,7 @@ FATAL エラー結果の陰に隠して送出する。結果として `cur.execu
 確認した。個別実行時の観測 `[e2e-record]` 出力（実行環境固有の文言・
 接続情報は含まない）は PR 本文の Test plan に転記した。
 
-## 影響
-
-- `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・
-  `handshake.rs`／`server.rs`／`main.rs`（拡張）により、簡易クエリが
-  `engine::core::EngineCore` の SQL 表層へ到達する（TASK-73 本体）。
-- `wire-server --db <path>` が必須化された（省略時は fail-closed で
-  起動拒否。匿名・揮発 DB の暗黙生成はしない）。
-- `Makefile` に `e2e-three-client`（opt-in・`ci` には含めない）を追加した。
-- `Makefile` に `test-default-build`（`ci` に含む）・
-  `.github/workflows/ci.yml` に同名の独立ジョブを追加し、既定ビルド拒否
-  テストを常時検査する経路を整備した（Issue #715・#716・PR #718）。
-- `crates/wire-server/Cargo.toml` に `fault-injection` feature（default 外）
-  を追加し、`e2e-three-client` の `three_client_e2e` 行はこの feature 付きで
-  ビルドするよう変更した（Issue #705）。
-- `three_client_e2e.rs::spawn_wire_server` が `extra_args: &[String]` を
-  受け取れるよう拡張され（`extended_syntax_e2e.rs` と同型）、`ServerGuard`
-  が起動時 stderr の全行と `wait_for_exit` を保持するようになった。
-  `tests/three_client/{psycopg_client.py,pg_client.js}` は失敗時に
-  `[DETAIL=<detail>]` を stderr へ追記する（いずれも Issue #706）。
-
-## スコープ外
-
-- `psql`・`psycopg`・`pg` の CI 自動導入ジョブ（バージョン確認・pin の確定は
-  別途ユーザー承認を要する）
-- Docker 開発コンテナへの `psql`／`psycopg` 追加
-- SQL `INSERT` が書き込む行の可視性（`Visibility::Private` 固定）と wire 認証
-  経由の `PolicyContext`（`Public` のみ許可）の非対称の解消（wire セッションへの
-  自テナント `Private` 行の読み戻し可視性付与）。TASK-82（SQL-10）で `INSERT`
-  自体は wire 経由で受理するよう切り替えたが（旧: 当面 `INSERT` 自体を
-  公開しない方針だった。codex-review P1・PR #210 指摘の検討過程の判断）、
-  `Private` 許可を wire 認証側へ広げる案は
-  `wire1_three_tenant_visibility_public_shared_private_hidden`
-  （自テナント自身の `Private` 行も含め wire 越しには不可視、という既存の
-  最小権限境界）を壊すため引き続き不採用とし、非対称（書いた本人も同一
-  セッションでは読み戻せない）はそのまま残した。本項目は「wire セッションへの
-  読み戻し可視性付与」の設計が定まるまで引き続きスコープ外
-- `EXPLAIN` 応答での実効モード・指定元の可視化（SQL-12 が SQL-6 と併せて
-  期待する項目）: engine に `EXPLAIN` 自体が未実装のため対象外（SQL-6 の
-  確定化で扱う）
-- 拡張クエリプロトコル経由の `USING MODE $n`: WIRE-8 で拡張クエリ自体を
-  拒否しているため、MVP は簡易クエリの `42601` 拒否のみを検証する
-
-## TASK-183／HTTP-13: NoSQL 表層の 3 クライアント統合ハーネス（Issue #776）
+### TASK-183／HTTP-13: NoSQL 表層の 3 クライアント統合ハーネス（Issue #776）
 
 NoSQL 表層（`--surface nosql`。HTTP/1.1 自作リスナー・`/v1/session`／
 `/v1/session/close`／`/v1/query`）は Issue #734〜#772 で production 結線まで
@@ -343,3 +301,45 @@ session→search→close スモーク 1 本＋`make e2e-three-client-http` に�
 urllib／fetch ランナー・3 クライアント一連手順・失効後 `28000` の検証・
 実行記録の整備・psql（SQL 経路）との結果一致比較は後続 Issue（#777〜#779）
 へ申し送る。
+
+## 影響
+
+- `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・
+  `handshake.rs`／`server.rs`／`main.rs`（拡張）により、簡易クエリが
+  `engine::core::EngineCore` の SQL 表層へ到達する（TASK-73 本体）。
+- `wire-server --db <path>` が必須化された（省略時は fail-closed で
+  起動拒否。匿名・揮発 DB の暗黙生成はしない）。
+- `Makefile` に `e2e-three-client`（opt-in・`ci` には含めない）を追加した。
+- `Makefile` に `test-default-build`（`ci` に含む）・
+  `.github/workflows/ci.yml` に同名の独立ジョブを追加し、既定ビルド拒否
+  テストを常時検査する経路を整備した（Issue #715・#716・PR #718）。
+- `crates/wire-server/Cargo.toml` に `fault-injection` feature（default 外）
+  を追加し、`e2e-three-client` の `three_client_e2e` 行はこの feature 付きで
+  ビルドするよう変更した（Issue #705）。
+- `three_client_e2e.rs::spawn_wire_server` が `extra_args: &[String]` を
+  受け取れるよう拡張され（`extended_syntax_e2e.rs` と同型）、`ServerGuard`
+  が起動時 stderr の全行と `wait_for_exit` を保持するようになった。
+  `tests/three_client/{psycopg_client.py,pg_client.js}` は失敗時に
+  `[DETAIL=<detail>]` を stderr へ追記する（いずれも Issue #706）。
+
+## スコープ外
+
+- `psql`・`psycopg`・`pg` の CI 自動導入ジョブ（バージョン確認・pin の確定は
+  別途ユーザー承認を要する）
+- Docker 開発コンテナへの `psql`／`psycopg` 追加
+- SQL `INSERT` が書き込む行の可視性（`Visibility::Private` 固定）と wire 認証
+  経由の `PolicyContext`（`Public` のみ許可）の非対称の解消（wire セッションへの
+  自テナント `Private` 行の読み戻し可視性付与）。TASK-82（SQL-10）で `INSERT`
+  自体は wire 経由で受理するよう切り替えたが（旧: 当面 `INSERT` 自体を
+  公開しない方針だった。codex-review P1・PR #210 指摘の検討過程の判断）、
+  `Private` 許可を wire 認証側へ広げる案は
+  `wire1_three_tenant_visibility_public_shared_private_hidden`
+  （自テナント自身の `Private` 行も含め wire 越しには不可視、という既存の
+  最小権限境界）を壊すため引き続き不採用とし、非対称（書いた本人も同一
+  セッションでは読み戻せない）はそのまま残した。本項目は「wire セッションへの
+  読み戻し可視性付与」の設計が定まるまで引き続きスコープ外
+- `EXPLAIN` 応答での実効モード・指定元の可視化（SQL-12 が SQL-6 と併せて
+  期待する項目）: engine に `EXPLAIN` 自体が未実装のため対象外（SQL-6 の
+  確定化で扱う）
+- 拡張クエリプロトコル経由の `USING MODE $n`: WIRE-8 で拡張クエリ自体を
+  拒否しているため、MVP は簡易クエリの `42601` 拒否のみを検証する
