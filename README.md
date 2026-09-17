@@ -56,6 +56,7 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 | `make bench-simd` / `make bench-c1` / `make recall-regression` / `make precision-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`.github/workflows/bench.yml`・`recall.yml` から実行。`precision-regression` は目標値未確定のため `recall.yml` へ未接続。詳細は下記「`precision` 評価ハーネス」参照） |
 | `make precision-report` | TASK-163 の判断材料レポート・パラメータ感度スイープ（実測値を標準出力へ出すため**ローカル専用**。CI・GitHub Actions からは実行しない） |
 | `make e2e-three-client` | TASK-73（WIRE-1）／TASK-165（SQL-12・SEARCH-9）／TASK-168（SQL-13・SQL-14）／TASK-153（ERR-5。commit 後 panic 緊急応答の 3 クライアント detail 到達検証）実 `psql`／`psycopg`／`pg` クライアント統合テスト（`ci` には含めない opt-in。要 `psql`・`python3`+`psycopg`・`node`+`pg`。`PSQL_BIN`/`PYTHON_BIN`/`NODE_BIN` で上書き可） |
+| `make e2e-three-client-http` | TASK-183（HTTP-13）NoSQL 表層（`--surface nosql`）の無改造 HTTP クライアント統合テスト（`ci` には含めない opt-in。要 `curl`。`CURL_BIN` で上書き可。urllib／fetch ランナーは Issue #777 で追加予定） |
 
 ターゲット一覧は `make help` で確認できます。
 
