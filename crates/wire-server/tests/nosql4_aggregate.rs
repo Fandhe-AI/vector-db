@@ -12,6 +12,9 @@
 //! `wire_aggregate.rs`（pg wire 経由）と同じ「値そのものは engine 側テストが
 //! 確定オラクル」という方針を踏襲し、本ファイルは NoSQL 表層への写像が
 //! それを壊していないことに徹する。
+//!
+//! `wire_aggregate.rs` と同一 seed による pg wire ↔ NoSQL 2 表層パリティ検証は
+//! `nosql4_5_aggregate_wire_parity.rs` を参照（Issue #770）。
 
 #[path = "common/mod.rs"]
 mod common;
