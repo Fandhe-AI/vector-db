@@ -27,22 +27,29 @@
   DISTANCE 段より先に評価される契約に基づく）。
 - `core.rs::EngineCore::run_explain_plan`（private）: 既存 `Statement::
   Explain` アームの本体（テーブル世代の事前記録 → 辞書必須列検証 →
-  `mode_literal` 解析（テーブル解決後）→ 束縛検証（LLM I/O より前）→ LLM
-  クエリ展開・モード解決 → 世代の事後照合 → 辞書必須列の再検証 → 使用
+  束縛検証（`bind`。LLM I/O より前）→ `mode_literal` 解析（`bind` より後）→
+  LLM クエリ展開・モード解決 → 世代の事後照合 → 辞書必須列の再検証 → 使用
   エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN` 整形）を抽出した私的
   ヘルパー。binder closure は `&TableSchema`／`&UdfRegistry` を受け取り
   `Result<ExplainShape, E>`（`E: From<SqlSurfaceError>`）を返す。
   `Statement::Explain` アームはこのヘルパーを呼ぶだけの薄いラッパーへ縮約
   した（挙動不変。手順順序・エラー分類はビット同一）。`mode_literal`
   （`Option<&str>`。`USING MODE` 相当の生リテラル）はテーブル解決（最初の
-  `read_txn_with_schema`）より後で初めて解析する（Cursor Bugbot 指摘
-  対応・PR #828 レビュー。未知テーブル〔`42P01`〕が `mode` 値不正
-  〔`22000`〕より優先される順序を、`Statement::Select` アームの `USING
-  PLAN` 経路〔`run_using_plan_select`。PR #827〕・`execute_bound_plan_
-  search_in_session`〔Issue #764〕と同一に保つ。当初の実装〔Issue #765〕
-  では呼び出し元がテーブル解決前に `SearchMode::parse_literal` を済ませて
-  から `run_explain_plan` へ渡していたため、未知テーブル＋ `mode` 値不正の
-  要求で `22000` が `42P01` より先に確定する回帰があった）。
+  `read_txn_with_schema`）・`bind` 呼び出しより後で初めて解析する
+  （Cursor Bugbot 指摘対応・PR #828 レビュー継続。未知テーブル〔`42P01`〕・
+  `bind` が返す `42601` 系エラー（NoSQL 経路の `plan` 欠落を含む）が
+  いずれも `mode` 値不正〔`22000`〕より優先される順序を、`Statement::
+  Select` アームの `USING PLAN` 経路〔`run_using_plan_select`。PR #827〕が
+  `pre_check`（束縛検証）を `mode_literal` 解析より先に呼ぶのと同一に保つ。
+  当初の実装〔Issue #765〕では呼び出し元がテーブル解決前に
+  `SearchMode::parse_literal` を済ませてから `run_explain_plan` へ渡して
+  いたため、未知テーブル＋ `mode` 値不正の要求で `22000` が `42P01` より
+  先に確定する回帰があった。その修正〔PR #828〕でも `mode_literal` 解析を
+  `bind` 呼び出しより先に置いたままだったため、既存テーブル＋ NoSQL の
+  `plan` 欠落＋ `mode` 値不正が同時に揃う要求で `22000` が `42601` より
+  先に確定する回帰が残っていた（Cursor Bugbot 指摘・Issue #765 継続対応。
+  `bind` を `mode_literal` 解析より先に呼ぶ現在の順序で解消し、
+  `run_using_plan_select` と整合させた）。
 - `core.rs::EngineCore::explain_bound_plan_in_session`（`pub`）:
   `run_explain_plan` をそのまま公開する薄いラッパー。`execute_bound_scan_
   in_session`・`execute_bound_aggregate_in_session`（Issue #728）と同型の
@@ -76,9 +83,13 @@
   作らない。
   - `mode` の語彙検証（`SearchMode::parse_literal`）をここで先に行うと、
     テーブル未存在＋ mode 値不正の要求で `22000` が `42P01` より先に確定
-    してしまう。`explain_bound_plan_in_session` がテーブル解決後に初めて
-    解析することで SQL `EXPLAIN` 経路と同一の fail-closed 順序を保つ
-    （Cursor Bugbot 指摘対応・PR #828 レビュー）。
+    してしまう。`explain_bound_plan_in_session`（`run_explain_plan`）が
+    テーブル解決・`bind`（`plan` 欠落判定を含む）を終えた後で初めて解析
+    することで、未知テーブル（`42P01`）・`plan` 欠落（`42601`）のいずれも
+    `mode` 値不正（`22000`）より優先される fail-closed 順序を保つ
+    （Cursor Bugbot 指摘対応・PR #828 レビュー継続。`vector`／`plan` の
+    排他判定を `mode` 解析より先に行う `search::bind_search`〔`vector`
+    指定検索〕と同一の優先順位）。
   - `limit` の検証をテーブル解決後（binder closure 内）まで遅延させると、
     未知テーブル＋ `limit` 範囲外の要求で `42P01` が `22000` より先に確定
     してしまう。SQL `EXPLAIN` 経路〔`core.rs` の `Statement::Explain` アーム〕
@@ -124,9 +135,11 @@
   が `22000` より優先されること（PR #828 レビュー対応）・未知テーブル＋
   `plan` 欠落で `42P01` が `42601` より優先されること・未知テーブル＋
   `limit` 範囲外で `22000` が `42P01` より優先されること（いずれも
-  codex-review P1 指摘対応・PR #828）・プランナー未注入時の `XX000`・
-  `aggregate`／`scan` の `explain: true` が引き続き `42601`・他テナント
-  行内容の非漏えいを検証。
+  codex-review P1 指摘対応・PR #828）・既存テーブル＋ `plan` 欠落＋
+  `mode` 値不正が同時に揃う要求で `42601` が `22000` より優先されること
+  （Cursor Bugbot 指摘・Issue #765 継続対応）・プランナー未注入時の
+  `XX000`・`aggregate`／`scan` の `explain: true` が引き続き `42601`・
+  他テナント行内容の非漏えいを検証。
 - `crates/wire-server/tests/nosql4_aggregate.rs`: `explain_true_rejects_
   with_0a000_and_does_not_execute` を `explain_true_rejects_with_42601_
   and_does_not_execute` へ改名・期待値を `42601` へ更新。

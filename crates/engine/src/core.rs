@@ -2778,11 +2778,15 @@ impl EngineCore {
     /// （[`crate::sql::using_plan::pre_check_bindable`] の既存契約と同じ）。
     ///
     /// `mode_literal`（`USING MODE` 相当の生リテラル）はテーブル解決
-    /// （最初の `read_txn_with_schema`）より後で初めて解析する（cursor[bot]
-    /// Bugbot 指摘対応・Issue #765 後続）。判定順序は「未知テーブル
-    /// （`42P01`）が `mode` 値不正（`22000`）より優先される」ことが契約
-    /// であり、[`Self::run_using_plan_select`]（PR #827）と同一の順序を
-    /// `EXPLAIN` 経路でも保つ。呼び出し元（SQL `Statement::Explain` アーム・
+    /// （最初の `read_txn_with_schema`）・`bind` 呼び出しより後で初めて
+    /// 解析する（cursor[bot] Bugbot 指摘対応・Issue #765 後続）。判定順序は
+    /// 「未知テーブル（`42P01`）が `mode` 値不正（`22000`）より優先される」
+    /// ことが契約であり、[`Self::run_using_plan_select`]（PR #827）と同一の
+    /// 順序を `EXPLAIN` 経路でも保つ。加えて `bind` を `mode_literal` 解析
+    /// より先に呼ぶことで、`plan` 欠落等 `bind` 自身が返す `42601` 系エラーが
+    /// `mode` 値不正（`22000`）より優先される（`vector`／`plan` の排他判定を
+    /// `mode` 解析より先に行う `search::bind_search` と同一の優先順位。
+    /// Cursor Bugbot 指摘対応）。呼び出し元（SQL `Statement::Explain` アーム・
     /// [`Self::explain_bound_plan_in_session`]）はいずれも解析前の生
     /// リテラルをそのまま渡すこと。
     ///
@@ -2823,17 +2827,27 @@ impl EngineCore {
         dictionary_required_columns(&pre_check_schema)
             .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
 
+        // `VECTOR` 列の存在・投影列／`WHERE` 述語の事前束縛検証を LLM I/O
+        // （`plan_query_with_mode`）より前に完結させる（`Statement::Select`
+        // アームの `USING PLAN` 経路と同じ理由）。`mode_literal` の解析
+        // （下記）より先にここで `bind` を呼ぶ（Cursor Bugbot 指摘対応・
+        // Issue #765。`bind`（[`crate::http::query::explain::execute`] の
+        // closure）は `plan` 欠落を [`crate::sql::allowlist::
+        // SqlSurfaceError`] 相当の `42601` 系エラーとして返すため、既存
+        // テーブル・`plan` 欠落・`mode` 値不正が同時に揃う要求で「`plan`
+        // 欠落（`42601`）が `mode` 値不正（`22000`）より優先される」
+        // 順序——`vector`／`plan` の排他判定を `mode` 解析より先に行う
+        // `search::bind_search`（`vector` 指定検索）と同一の優先順位——を
+        // 保つ）。
+        let explain_shape = bind(&pre_check_schema, session.udfs())?;
+
         // `mode_literal` の解析はテーブル解決（上記 `read_txn_with_schema`）
-        // より後で行う（cursor[bot] Bugbot 指摘対応。上記ドキュメント参照）。
+        // ・`bind`（上記）より後で行う（cursor[bot] Bugbot 指摘対応。上記
+        // ドキュメント参照）。
         let query_mode = match mode_literal {
             Some(literal) => Some(crate::sql::mode::SearchMode::parse_literal(literal)?),
             None => None,
         };
-
-        // `VECTOR` 列の存在・投影列／`WHERE` 述語の事前束縛検証を LLM I/O
-        // （`plan_query_with_mode`）より前に完結させる（`Statement::Select`
-        // アームの `USING PLAN` 経路と同じ理由）。
-        let explain_shape = bind(&pre_check_schema, session.udfs())?;
 
         let planned = self
             .plan_query_with_mode(ctx, table, question, query_mode, session.search_mode())

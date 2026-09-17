@@ -400,6 +400,22 @@ fn limit_out_of_range_rejects_with_22000_before_undefined_table_with_explain_tru
     assert_eq!(http_common::wire_code_of(&resp), "22000", "resp={resp:?}");
 }
 
+/// 既存テーブル＋`plan` 欠落＋`mode` 値不正が同時に揃う要求では `plan`
+/// 欠落（`42601`）が `mode` 値不正（`22000`）より優先される（Cursor
+/// Bugbot 指摘対応・PR #828 レビュー。`core.rs::run_explain_plan` が
+/// `mode_literal` を `bind`（`plan` 欠落判定を含む束縛 closure）より後で
+/// 解析するよう順序を修正。`vector`／`plan` の排他判定を `mode` 解析より
+/// 先に行う `search::bind_search`〔`vector` 指定検索〕と同一の優先順位）。
+#[test]
+fn missing_plan_rejects_with_42601_before_invalid_mode_on_existing_table_with_explain_true() {
+    let (core, _guard) = new_core();
+    let (addr, token) = spawn_alice_session(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"docs","limit":1,"mode":"fuzzy","explain":true}"#;
+    let resp = query(addr, &token, body);
+    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+}
+
 #[test]
 fn explain_true_reports_hnsw_params_and_does_not_touch_hnsw_index_cache() {
     let (core, _guard) = new_hnsw_core();

@@ -180,10 +180,12 @@ pub fn execute(
 
     // `mode` の語彙解析（`SearchMode::parse_literal`）はここでは行わない
     // （Cursor Bugbot 指摘対応: `engine::core::EngineCore::
-    // explain_bound_plan_in_session` がテーブル解決を終えた後で初めて解析
-    // することで、未知テーブル（`42P01`）が `mode` 値不正（`22000`）より
-    // 優先される fail-closed 順序を保つ。識別子としての形状検査のみここで
-    // 完結させる）。
+    // explain_bound_plan_in_session`（`core.rs::run_explain_plan`）がテーブル
+    // 解決・binder closure（`plan` 欠落判定を含む）を終えた後で初めて解析
+    // することで、未知テーブル（`42P01`）・`plan` 欠落（`42601`）のいずれも
+    // `mode` 値不正（`22000`）より優先される fail-closed 順序を保つ
+    // （`run_explain_plan` が `mode_literal` を `bind` 呼び出しより後で解析
+    // する契約。identifier としての形状検査のみここで完結させる）。
     let mode_literal = validated.optional_str("mode")?;
     if let Some(literal) = mode_literal {
         ident::check_identifier(literal)?;
