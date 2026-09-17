@@ -74,6 +74,32 @@ const MAX_AGGREGATE_ITEMS: usize = 32;
 /// （意味論側の決定的切り詰めは `query_planner::MAX_QUESTION_CHARS` が別途担う）。
 const MAX_USING_PLAN_LEN: usize = 64 * 1024;
 
+/// `USING PLAN('<query>')` のリテラル値検証本体（空文字・[`MAX_USING_PLAN_LEN`]
+/// 超過を拒否する）を、SQL 表層のパーサ内 inline 判定
+/// （[`Parser::parse_using_plan_clause`]）と NoSQL 表層（`wire-server::http::
+/// query::search`。Issue #763・TASK-175・NOSQL-2）の `search.plan` 束縛とで
+/// 共有する単一実装。SQL 表層は字句解析済みの文字列リテラルを渡すため本関数
+/// より前に受理済みだが、NoSQL 表層は JSON 文字列（1 MiB 上限まで到達し得る）を
+/// そのまま渡すため、この検証で SQL 側と同じ上限（`54000`）まで縮小する。
+///
+/// 空リテラルは [`SqlSurfaceError::invalid_input`]（`22000`）、
+/// [`MAX_USING_PLAN_LEN`] 超過は [`SqlSurfaceError::payload_too_large`]
+/// （`54000`）で拒否する。
+pub fn validate_using_plan_question(question: &str) -> Result<(), SqlSurfaceError> {
+    if question.is_empty() {
+        return Err(SqlSurfaceError::invalid_input(
+            "USING PLAN value must not be empty",
+        ));
+    }
+    if question.len() > MAX_USING_PLAN_LEN {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "USING PLAN value length {} exceeds limit {MAX_USING_PLAN_LEN}",
+            question.len()
+        )));
+    }
+    Ok(())
+}
+
 fn truncate_for_error(s: &str) -> String {
     if s.len() <= MAX_ERROR_DETAIL_LEN {
         return s.to_string();
@@ -1490,17 +1516,7 @@ impl<'a> Parser<'a> {
         self.expect_punct('(')?;
         let value = self.expect_string_literal()?;
         self.expect_punct(')')?;
-        if value.is_empty() {
-            return Err(SqlSurfaceError::invalid_input(
-                "USING PLAN value must not be empty",
-            ));
-        }
-        if value.len() > MAX_USING_PLAN_LEN {
-            return Err(SqlSurfaceError::payload_too_large(format!(
-                "USING PLAN value length {} exceeds limit {MAX_USING_PLAN_LEN}",
-                value.len()
-            )));
-        }
+        validate_using_plan_question(&value)?;
         Ok(value)
     }
 
@@ -3425,6 +3441,35 @@ mod tests {
             "x".repeat(MAX_USING_PLAN_LEN + 1)
         );
         let err = validate_statement(&huge, &lookup).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    // --- validate_using_plan_question（Issue #763・NOSQL-2） --------------------
+    // NoSQL 表層（`wire-server::http::query::search`）の `search.plan` 束縛が
+    // SQL 表層と同一の検証を共有することを直接固定する（第 2 の実行器を
+    // 作らない方針の裏付け）。
+
+    #[test]
+    fn validate_using_plan_question_accepts_nonempty_within_limit() {
+        assert!(validate_using_plan_question("hello world").is_ok());
+    }
+
+    #[test]
+    fn validate_using_plan_question_rejects_empty() {
+        let err = validate_using_plan_question("").unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn validate_using_plan_question_accepts_at_limit() {
+        let at_limit = "x".repeat(MAX_USING_PLAN_LEN);
+        assert!(validate_using_plan_question(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn validate_using_plan_question_rejects_over_limit() {
+        let over_limit = "x".repeat(MAX_USING_PLAN_LEN + 1);
+        let err = validate_using_plan_question(&over_limit).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
     }
 

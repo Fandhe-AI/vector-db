@@ -338,6 +338,85 @@ pub(crate) fn text_column_index(
         })
 }
 
+/// NoSQL 表層（`wire-server::http::query::search`。Issue #763・TASK-175・
+/// NOSQL-2）向けの投影束縛ヘルパー。SQL 表層の `SELECT` リスト構文を経由せず、
+/// JSON クエリオブジェクトの `columns`（`Option<&[String]>`）を直接
+/// [`bind_projection`] の入力形（[`Projection`]）へ組み立てて委譲する薄い
+/// ラッパー。`columns` 省略（`None`）は `SELECT *` と同じ [`Projection::All`]
+/// へ、指定時は列名リストをそのまま [`Projection::Columns`] へ写像する。
+/// NoSQL 表層に式項目（UDF 呼び出し）は存在しないため空の
+/// [`crate::sql::udf_call::UdfRegistry`] で足りる（`bind_projection` が返す
+/// [`ProjectedColumn::Computed`] へは到達しない）。実カラム優先・疑似列
+/// `id`・未知列 `22000` の判定規則は SQL 表層と完全に共有する
+/// （第 2 の実行器を作らない方針）。
+pub fn bind_column_projection(
+    columns: Option<&[String]>,
+    schema: &TableSchema,
+) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
+    let projection = match columns {
+        None => Projection::All,
+        Some(names) => Projection::Columns(names.to_vec()),
+    };
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    bind_projection(
+        &projection,
+        schema,
+        &crate::sql::udf_call::UdfRegistry::default(),
+        &mut node_budget,
+    )
+}
+
+/// NoSQL 表層（Issue #763・TASK-175・NOSQL-2）向けのベクトル値束縛ヘルパー。
+/// `search.vector`（JSON 数値配列。`f64` 要素）を、SQL 表層の
+/// [`parse_vector_literal`] と同一の不変条件（次元一致・各要素が `f32` として
+/// 有限）で `Vec<f32>` へ変換する。
+///
+/// 検証順序: (1) `values.len()` を [`vector_column`] が返す宣言次元
+/// （`u32`）と**`Vec<f32>` を確保する前に**照合する（次元不一致は
+/// [`SqlSurfaceError::invalid_input`]。`.claude/rules/security.md`
+/// 「不安全な設計｜無制限リソース確保（DoS）」対応。`values.len()` が
+/// `u32::MAX` を超える場合も同じ分岐で拒否する）。(2) 各要素を `as f32` へ
+/// キャストし、`f64` では有限でも `f32` へ縮小した結果が非有限になる値
+/// （例: `1e39`）を [`parse_vector_literal`] の (3)(4) と同じ判定で拒否する。
+pub fn bind_vector_values(
+    values: &[f64],
+    schema: &TableSchema,
+) -> Result<Vec<f32>, SqlSurfaceError> {
+    let (_vec_idx, vec_dim) = vector_column(schema)?;
+    let len = u32::try_from(values.len()).map_err(|_| {
+        SqlSurfaceError::invalid_input(format!(
+            "vector value count {} exceeds representable range",
+            values.len()
+        ))
+    })?;
+    if len != vec_dim {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "vector dimension mismatch: expected {vec_dim}, got {len}"
+        )));
+    }
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let as_f32 = *value as f32;
+        if !as_f32.is_finite() {
+            return Err(SqlSurfaceError::invalid_input(
+                "vector element must be finite (NaN/Inf are not allowed)",
+            ));
+        }
+        out.push(as_f32);
+    }
+    Ok(out)
+}
+
+/// NoSQL 表層（Issue #763・TASK-175・NOSQL-2）向けの本文列束縛ヘルパー。
+/// `search.hybrid.text`（JSON 形状には対象列名が無いため）の疎側入力列を、
+/// `USING PLAN`（TASK-77・SQL-5）と同じ規約列 [`crate::sql::using_plan::
+/// BODY_COLUMN_NAME`]（`body`）へ固定して解決する。欠落・非 `TEXT` 列は
+/// [`text_column_index`] と同じ `22000` で拒否する（spec 側への申し送り:
+/// `hybrid` の対象テキスト列を JSON 形状で選択可能にするかは spec 判断）。
+pub fn bind_body_text_column(schema: &TableSchema) -> Result<usize, SqlSurfaceError> {
+    text_column_index(schema, crate::sql::using_plan::BODY_COLUMN_NAME)
+}
+
 /// `ORDER BY` 式（[`OrderByForm`]）を [`Ranking`] へ束縛する。
 fn bind_ranking(order_by: &OrderByForm, schema: &TableSchema) -> Result<Ranking, SqlSurfaceError> {
     let (vec_idx, vec_dim) = vector_column(schema)?;
@@ -577,7 +656,12 @@ pub fn bind(
 /// 対応、PR #266: 高コスト処理の後段でのみ検証すると、`LIMIT 0`／`LIMIT
 /// 4294967295` のような必ず拒否される入力でも untrusted 入力によるリソース
 /// 増幅を許してしまう）。
-pub(crate) fn validate_search_limit(raw: u32) -> Result<usize, SqlSurfaceError> {
+///
+/// Issue #763（TASK-175・NOSQL-2）で `pub(crate)` から `pub` へ昇格した。
+/// NoSQL 表層（`wire-server::http::query::search`）の `search.limit` 束縛も
+/// SQL 表層と同一の範囲検証・`wire_code`（`22000`）を共有するため
+/// （第 2 の実行器を作らない方針）。
+pub fn validate_search_limit(raw: u32) -> Result<usize, SqlSurfaceError> {
     let limit = usize::try_from(raw)
         .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed LIMIT value: {raw}")))?;
     if limit == 0 || limit > crate::core::MAX_SEARCH_K {
@@ -2425,5 +2509,129 @@ mod tests {
             bound.items[0].input,
             AggregateInput::TextColumn(_)
         ));
+    }
+
+    // --- bind_column_projection（Issue #763・NOSQL-2） -------------------------
+
+    #[test]
+    fn bind_column_projection_none_is_select_all() {
+        let cols = bind_column_projection(None, &docs_schema()).expect("bind ok");
+        // 疑似列 `id` を先頭に、以降はスキーマの列順（`Projection::All` と同じ）。
+        assert_eq!(cols.len(), docs_schema().columns.len() + 1);
+        assert_eq!(cols[0], ProjectedColumn::Id);
+    }
+
+    #[test]
+    fn bind_column_projection_real_column_takes_priority_over_id_pseudo_column() {
+        let schema = TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("id", ColumnType::Text, false),
+            ],
+        );
+        let names = vec!["id".to_string()];
+        let cols = bind_column_projection(Some(&names), &schema).expect("bind ok");
+        assert_eq!(cols.len(), 1);
+        assert!(matches!(&cols[0], ProjectedColumn::Column { name, .. } if name == "id"));
+    }
+
+    #[test]
+    fn bind_column_projection_maps_id_pseudo_column_when_no_real_column() {
+        let names = vec!["id".to_string()];
+        let cols = bind_column_projection(Some(&names), &docs_schema()).expect("bind ok");
+        assert_eq!(cols, vec![ProjectedColumn::Id]);
+    }
+
+    #[test]
+    fn bind_column_projection_rejects_unknown_column() {
+        let names = vec!["nope".to_string()];
+        let err = bind_column_projection(Some(&names), &docs_schema()).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- bind_vector_values（Issue #763・NOSQL-2） ------------------------------
+
+    #[test]
+    fn bind_vector_values_accepts_matching_dim() {
+        let values = vec![1.0_f64, 2.0, 3.0];
+        let bound = bind_vector_values(&values, &docs_schema()).expect("bind ok");
+        assert_eq!(bound, vec![1.0_f32, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn bind_vector_values_rejects_dim_mismatch() {
+        let values = vec![1.0_f64, 2.0];
+        let err = bind_vector_values(&values, &docs_schema()).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_vector_values_rejects_empty_when_dim_nonzero() {
+        let values: Vec<f64> = vec![];
+        let err = bind_vector_values(&values, &docs_schema()).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_vector_values_rejects_f32_non_finite_after_cast() {
+        // `1e39` は `f64` としては有限だが `f32` へキャストすると `+inf` になる
+        // （`parse_vector_literal` の (3)(4) と同じ非有限判定を共有する）。
+        let values = vec![1e39_f64, 2.0, 3.0];
+        let err = bind_vector_values(&values, &docs_schema()).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_vector_values_rejects_nan_and_inf() {
+        let values = vec![f64::NAN, 2.0, 3.0];
+        assert_eq!(
+            bind_vector_values(&values, &docs_schema())
+                .unwrap_err()
+                .wire_code(),
+            "22000"
+        );
+        let values = vec![f64::INFINITY, 2.0, 3.0];
+        assert_eq!(
+            bind_vector_values(&values, &docs_schema())
+                .unwrap_err()
+                .wire_code(),
+            "22000"
+        );
+    }
+
+    // --- bind_body_text_column（Issue #763・NOSQL-2） ---------------------------
+
+    #[test]
+    fn bind_body_text_column_resolves_body_column() {
+        let idx = bind_body_text_column(&docs_schema()).expect("bind ok");
+        let schema = docs_schema();
+        assert_eq!(schema.columns[idx].name, "body");
+    }
+
+    #[test]
+    fn bind_body_text_column_rejects_missing_body_column() {
+        let schema = TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+            ],
+        );
+        let err = bind_body_text_column(&schema).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_body_text_column_rejects_non_text_body_column() {
+        let schema = TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Vector(3), false),
+            ],
+        );
+        let err = bind_body_text_column(&schema).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
     }
 }
