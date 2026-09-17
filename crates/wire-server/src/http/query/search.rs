@@ -189,6 +189,16 @@ impl ClassifiedError for SearchError {
     }
 }
 
+/// `vector`／`plan` の排他判定（[`bind_search`]）が、判定と同時に以降の
+/// 分岐が使う値を確定するための内部区分。受信データ経路で
+/// `Option::expect` により「到達しないはずの分岐」を後段に残さないための
+/// 構造（`.claude/rules/coding-rust.md`「受信データ経路では `unwrap`/
+/// `expect`... を禁止する」）。
+enum VectorOrPlan<'a> {
+    Vector(&'a [JsonValue]),
+    Plan(&'a str),
+}
+
 /// `columns` フィールド（`Option<&[JsonValue]>`。要素はスキーマ検証済みの
 /// `String` のはずだが多層防御として再検査する）を `Vec<String>` へ写像する。
 fn columns_as_strings(items: &[JsonValue]) -> Result<Vec<String>, SearchError> {
@@ -249,11 +259,15 @@ pub fn bind_search(
     let plan = validated.optional_str("plan")?;
     let hybrid = validated.optional_object("hybrid")?;
 
-    match (vector_items, plan) {
+    // 排他判定と同時に、以降の分岐が使う値をここで確定する（`.expect()` で
+    // 「到達しないはず」の分岐を後段に残さない。受信データ経路では
+    // `unwrap`/`expect` を使わない方針 `.claude/rules/coding-rust.md`）。
+    let vector_or_plan = match (vector_items, plan) {
+        (Some(items), None) => VectorOrPlan::Vector(items),
+        (None, Some(question)) => VectorOrPlan::Plan(question),
         (Some(_), Some(_)) => return Err(SearchError::VectorAndPlanBothPresent),
         (None, None) => return Err(SearchError::VectorAndPlanBothMissing),
-        _ => {}
-    }
+    };
     if plan.is_some() && hybrid.is_some() {
         return Err(SearchError::PlanWithHybrid);
     }
@@ -273,7 +287,7 @@ pub fn bind_search(
         None => None,
     };
 
-    if let Some(vector_items) = vector_items {
+    if let VectorOrPlan::Vector(vector_items) = vector_or_plan {
         let values = vector_as_f64(vector_items)?;
         let query = bind_vector_values(&values, schema)?;
         let ranking = match hybrid {
@@ -312,9 +326,11 @@ pub fn bind_search(
         return Ok(BoundSearch::Vector(bound));
     }
 
-    // ここへ到達するのは `plan.is_some()` の場合のみ（直上の排他判定で
-    // `vector`／`plan` のいずれか一方が必ず `Some`）。
-    let question = plan.expect("plan must be Some when vector is None (exclusivity checked above)");
+    // ここへ到達するのは `vector_or_plan` が `Plan` の場合のみ（直上の
+    // `if let` が `Vector` を早期 return 済み）。
+    let VectorOrPlan::Plan(question) = vector_or_plan else {
+        return Err(SearchError::VectorAndPlanBothMissing);
+    };
     validate_using_plan_question(question)?;
     // `USING PLAN`（SQL-5）は本文列必須の契約を束縛時に確認する
     // （`sql::using_plan::bind_expansion` と同じ判断）。
