@@ -528,7 +528,7 @@ fn run_server(args: &[String]) -> ExitCode {
     // 同一のまま保つ）。
     if surface == wire_server::surface::Surface::Nosql {
         eprintln!(
-            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; POST /v1/session, POST /v1/session/close, and POST /v1/query (Bearer-gated) available; POST /v1/query op:aggregate is executable, other ops pending Issue #763/#766; other paths and non-POST methods rejected with 08P01)"
+            "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; POST /v1/session, POST /v1/session/close, and POST /v1/query (Bearer-gated) available; POST /v1/query op=scan and op=aggregate execute against the engine, other ops binding/execution pending Issue #763/#771; other paths and non-POST methods rejected with 08P01)"
         );
     }
 
@@ -556,9 +556,10 @@ fn run_server(args: &[String]) -> ExitCode {
             // ユーザーストアとして `Router` へ渡す。セッションストアは
             // 表層選択のたびに新規構築する（プロセス内で 1 表層のみ起動
             // するため、SQL wire 側の `store`／`limiter` と同じ「1 回だけ
-            // 構築」方針）。`core`（クエリ実行）は Issue #768 で `aggregate`
-            // op の実行に使うようになった（`search`／`scan`／`insert` の
-            // 束縛・実行結線は #763・#766 以降の担当のまま）。
+            // 構築」方針）。`core`（クエリ実行）は `scan` op の束縛・実行
+            // （TASK-186・NOSQL-3・Issue #766）・`aggregate` op の実行
+            // （Issue #768）で使う（`search`／`insert` は引き続き
+            // #763・#771 の担当）。
             let sessions = wire_server::http::session::store::SessionStore::new();
             let router = wire_server::http::router::Router::with_engine(
                 Arc::clone(&store),

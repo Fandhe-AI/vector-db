@@ -22,12 +22,15 @@
 //! 4. `Op::schema().validate(...)`（必須欠落・未知キー・型不一致 →
 //!    `42601`。`tenant_id` の JSON 自己申告・`HINT ORDER`／
 //!    `SET search_mode` 相当フィールドはここで未知キーとして拒否される）
-//! 5. `op` ごとにディスパッチする（Issue #768）。`op == Aggregate` かつ
-//!    `engine` が接続済み（`Some`）の場合のみ [`super::aggregate::handle`]
-//!    （Issue #768・TASK-177・NOSQL-4）へ委譲し実行結果（成功／束縛・実行
-//!    エラーいずれも）をそのまま最終応答とする。それ以外（`search`／
-//!    `scan`／`insert`、および `engine` 未接続）は暫定の `0A000`／501
-//!    （[`PLACEHOLDER_MESSAGE`]）を返す（束縛・実行の結線は #763 以降が
+//! 5. `op` と `engine`（接続済み `EngineCore`。`Router::new` 経由では
+//!    `None`・`Router::with_engine` 経由でのみ `Some`）の組でディスパッチ
+//!    する。`(Op::Scan, Some(engine))` は [`crate::http::query::scan::
+//!    handle`]（TASK-186・NOSQL-3・Issue #766）、`(Op::Aggregate,
+//!    Some(engine))` は [`super::aggregate::handle`]（Issue #768・
+//!    TASK-177・NOSQL-4）へそれぞれ束縛・実行を委譲する。それ以外
+//!    （`Op::Search`／`Op::Insert`、および `engine` 未接続時の
+//!    `Op::Scan`／`Op::Aggregate`）は暫定の `0A000`／501
+//!    （[`PLACEHOLDER_MESSAGE`]）を返す（束縛・実行の結線は #763・#771 が
 //!    本 seam を置き換える）
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
@@ -45,14 +48,16 @@ use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::parse_json;
 
 use crate::http::query::op::{classify_op, Op};
+use crate::http::query::scan;
 use crate::http::session::middleware::{self, SessionPrincipal};
 use crate::http::{body, response};
 
 pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 
-/// 検証を通過したが実行結線が未接続（`op` が `aggregate` 以外、または
-/// `engine` 未接続）の要求に返す暫定応答の文言（束縛・実行は #763 以降の
-/// 担当。本 Issue 時点は `aggregate` op のみ seam を置き換え済み）。
+/// 検証を通過したが実行結線が未接続（`op` が `scan`／`aggregate` 以外、
+/// または該当 op でも `engine` 未接続）の要求に返す暫定応答の文言
+/// （束縛・実行は #763・#771 の担当。本 Issue 時点は `scan`・`aggregate`
+/// の 2 op のみ seam を置き換え済み）。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
 
 /// `POST /v1/query` を処理し応答バイト列を返す（認証済み要求のみ）。
@@ -99,10 +104,11 @@ pub fn handle(
         Err(e) => return response::encode_error(e.error_class(), &e.client_message(), now_wall),
     };
 
-    // 手順 5: op ごとのディスパッチ（Issue #768）。各 op アームは対応する
-    // モジュールへの 1 行委譲に留め、後続 Issue（#763・#766）が並行して
-    // 追加する他 op アームとの衝突面を小さくする。
+    // 手順 5: op と engine 接続有無の組でディスパッチする（Issue #766・
+    // #768）。各アームは対応するモジュールへの 1 行委譲に留め、後続 Issue
+    // （#763・#771）が並行して追加する他 op アームとの衝突面を小さくする。
     match (op, engine) {
+        (Op::Scan, Some(engine)) => scan::handle(engine, principal, &validated, now_wall),
         (Op::Aggregate, Some(engine)) => {
             super::aggregate::handle(engine, principal, &validated, now_wall)
         }
@@ -124,6 +130,49 @@ mod tests {
 
     fn leak(v: Vec<u8>) -> &'static [u8] {
         Box::leak(v.into_boxed_slice())
+    }
+
+    /// テストごとに一意な一時 DB ファイルパスを払い出す（`EngineCore::open`
+    /// に渡す前提。ファイル自体は作成しない）。`gate.rs` は `mod gate;` 経由
+    /// で読み込まれる非ルートファイルのため、`#[path]` によるエンジン側
+    /// `test_util/temp_db.rs` の取り込みは、ネストしたモジュール宣言に
+    /// 対応する仮想ディレクトリ（`query/gate/`・`query/gate/tests/`）が
+    /// 実ファイルシステム上に存在せず `..` を辿れない（OS のパス解決は
+    /// 中間コンポーネントの実在を要求する）ため使えない。本ヘルパーは
+    /// その代わりに最小限の一意名生成のみをその場で行う（`std` のみに依存。
+    /// dependency-policy 準拠）。
+    fn unique_temp_db_path(label: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "vector-db-wire-server-query-gate-{label}-{}-{seq}.redb",
+            std::process::id()
+        ));
+        path
+    }
+
+    /// [`unique_temp_db_path`] で払い出したパスのファイルを、値が drop
+    /// されるタイミングで削除する RAII ガード（`engine::test_util::temp_db::
+    /// CleanupGuard` と同じ意図の最小版）。
+    struct CleanupGuard(std::path::PathBuf);
+
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// テーブルを一切作らないスローアウェイ `EngineCore`。`table: "docs"` への
+    /// `scan` はスキーマ取得の時点で `SqlSurfaceError::UndefinedTable`
+    /// （`42P01`／404）となり、「認証 → op 許可リスト → スキーマ検証 →
+    /// engine 呼び出し」がすべて走ったことの非 vacuous な証跡になる
+    /// （`http_common::assert_reached_query_gate` と同じ判断）。
+    fn empty_core() -> (EngineCore, CleanupGuard) {
+        let path = unique_temp_db_path("query-gate");
+        let guard = CleanupGuard(path.clone());
+        let core = EngineCore::open(&path).expect("open throwaway engine core");
+        (core, guard)
     }
 
     fn headers_with_body(body: &[u8], extra: &[&str]) -> crate::http::headers::Headers<'static> {
@@ -161,8 +210,36 @@ mod tests {
         handle(&p, &headers, body, None, std::time::SystemTime::now())
     }
 
+    /// `engine` 接続済み（`Router::with_engine` 相当）の経路。`scan` op の
+    /// 実行結線（TASK-186・NOSQL-3・Issue #766）を検証するテストが使う。
+    fn run_with_engine(core: &EngineCore, body: &[u8], extra_headers: &[&str]) -> Vec<u8> {
+        let p = principal();
+        let headers = headers_with_body(body, extra_headers);
+        handle(&p, &headers, body, Some(core), std::time::SystemTime::now())
+    }
+
     #[test]
-    fn valid_scan_reaches_placeholder_response() {
+    fn valid_scan_is_dispatched_to_the_engine_and_reports_undefined_table() {
+        // `scan` は TASK-186・NOSQL-3 で実行結線済みのため、`engine` 接続済み
+        // であれば他 op のような暫定 placeholder（`0A000`／501）はもう
+        // 返らない。存在しないテーブルへの `scan` が `42P01`／404（SQL 経路と
+        // 同一分類）になることで、「認証 → op 許可リスト → スキーマ検証 →
+        // engine 呼び出し」がすべて走ったことを非 vacuous に確認する。
+        let (core, _guard) = empty_core();
+        let body = br#"{"op":"scan","table":"docs","limit":1}"#;
+        let response = run_with_engine(&core, body, &[]);
+        let text = String::from_utf8(response).expect("utf-8 response");
+        assert!(text.starts_with("HTTP/1.1 404 "), "got: {text}");
+        assert!(text.contains("42P01"), "got: {text}");
+        assert!(!text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+    }
+
+    #[test]
+    fn valid_scan_reaches_placeholder_response_when_engine_is_not_connected() {
+        // `engine` 未接続（`Router::new` 経由）では `scan` も従来どおり
+        // placeholder のまま（実行器なしで応答を偽装しない。
+        // `router.rs::Router::new` の既定・`nosql9_op_allowlist.rs` と
+        // 同じ契約）。
         let body = br#"{"op":"scan","table":"docs","limit":1}"#;
         let response = run(body, &[]);
         let text = String::from_utf8(response).expect("utf-8 response");

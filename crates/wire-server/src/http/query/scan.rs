@@ -1,0 +1,301 @@
+//! `POST /v1/query` の `scan` op を `engine::sql::parser::BoundScan` へ束縛し
+//! `EngineCore::execute_bound_scan_in_session` で実行する写像本体（Issue #766・
+//! TASK-176・対象ビヘイビア NOSQL-3。ポインタ: `docs/spec/05-tasks.md`
+//! TASK-176・`docs/spec/04-behavior/nosql-surface.md` NOSQL-3・
+//! `docs/spec/04-behavior/sql-surface.md` SQL-15）。
+//!
+//! 呼び出し文脈: [`super::gate::handle`] が op 許可リスト判定（[`super::op`]）・
+//! スキーマ検証（[`super::schema::SCAN_SCHEMA`]）を通過させた
+//! [`super::schema::Validated`] を [`handle`] へ渡す。テナント文脈は
+//! [`crate::http::session::middleware::SessionPrincipal::policy_context`] の
+//! みから導出し、本モジュールはヘッダ・JSON からテナントを読む経路を持たない。
+//!
+//! 実行意味論は SQL 表層の bare 広域取得形（`SELECT ... [WHERE ...] LIMIT n`。
+//! SQL-15・`docs/design/wide-retrieval-scan.md`）と同一——順序保証なし・
+//! `limit` 件到達で早期終了・取得モード非適用——であり、第 2 の実行器は作らない
+//! （[`engine::core::EngineCore::execute_bound_scan_in_session`] へ束縛済み
+//! [`engine::sql::parser::BoundScan`] を渡すのみ。TASK-186・NOSQL-3。
+//! `docs/design/bound-plan-session-entry.md` 参照）。
+//!
+//! `vector`／`plan`／`mode`／`hybrid` の付与は [`super::schema::SCAN_SCHEMA`]
+//! が宣言しないフィールドのため、スキーマ検証（[`super::gate::handle`] 手順 4）
+//! の未知キー判定で本モジュールへ到達する前に `42601` へ落ちる（個別の除外
+//! ロジックをここに持たない）。`explain: true` は `SCAN_SCHEMA` が型としては
+//! 受理するが、SQL-15 の bare 形への `EXPLAIN` 前置は `42601`
+//! （`docs/design/wide-retrieval-scan.md`）であるため、本モジュールが
+//! fail-closed に拒否する（NOSQL-10〔`USING PLAN` の `EXPLAIN`〕とは別の判断。
+//! 「spec 側への申し送り」は呼び出し元 PR 本文が担う）。
+//!
+//! 応答は `score` を一切含まない: `Projection::All`（`columns` 省略時）は
+//! `schema.columns` の実列と疑似列 `id` のみを列挙し（`bind_projection` の
+//! 既存契約）、`hybrid`／`ORDER BY` を経由しない広域取得には合成スコア列が
+//! 構造上存在しない。
+
+use std::time::SystemTime;
+
+use engine::core::EngineCore;
+use engine::declarative_filter::{self, DeclarativeFilter};
+use engine::error_format::{ClassifiedError, ErrorClass};
+use engine::json::JsonValue;
+use engine::policy::PolicyContext;
+use engine::sql::allowlist::{Projection, SqlSurfaceError};
+use engine::sql::exec::QueryResult;
+use engine::sql::mode::SessionState;
+use engine::sql::parser::{bind_projection, validate_search_limit, BoundScan};
+use engine::sql::udf_call::MAX_EXPR_NODES;
+
+use super::filter::{map_filter_items, FilterError};
+use super::ident::{self, InvalidIdentifier};
+use super::schema::{SchemaError, Validated};
+use crate::http::response as http_response;
+use crate::http::session::middleware::SessionPrincipal;
+
+/// [`bind_request`]／[`execute`] の失敗を表す。いずれも [`ClassifiedError`]
+/// を実装し、HTTP エラー応答へ射影される。
+#[derive(Debug)]
+pub enum ScanError {
+    /// [`Validated`] アクセサの型・キー不整合（多層防御。通常は
+    /// [`super::schema::SCAN_SCHEMA::validate`] 済みのため到達しない）。
+    Shape(SchemaError),
+    /// `filter` 配列の写像・束縛エラー（[`super::filter`] 参照）。
+    Filter(FilterError),
+    /// `limit` が有限の非負整数として `u32` の範囲に収まらない、または
+    /// [`validate_search_limit`] の範囲（`1..=`
+    /// [`engine::core::MAX_SEARCH_K`]）外（固定文言。SQL-15 と同じ分類 `42601`）。
+    InvalidLimit,
+    /// `table`／`columns` の要素が識別子形状検査（[`super::ident::
+    /// check_identifier`]）を満たさない。`search`／`aggregate` の
+    /// `InvalidIdentifier` と同じ判断（cursor[bot] 指摘。SQL レキサーが
+    /// 拒否する形状の文字列を engine のスキーマ解決より前に `42601` へ
+    /// 落とし、63 文字を超える長大文字列を schema 突き合わせより前に
+    /// 打ち切る）。
+    InvalidIdentifier,
+    /// `columns` が空配列、または要素に空文字列を含む（固定文言。untrusted
+    /// な列名文字列そのものは含めない）。
+    InvalidColumns,
+    /// `explain: true` の指定（SQL-15 の bare 形は `EXPLAIN` 前置を拒否する
+    /// 契約と同じ判断を NoSQL 表層側で明示的に適用する）。
+    ExplainNotSupported,
+    /// engine 側の束縛・実行エラー（未知列・`VECTOR` 列・テーブル不存在・
+    /// 内部エラー等）をそのまま透過する。
+    Engine(SqlSurfaceError),
+}
+
+impl From<SchemaError> for ScanError {
+    fn from(err: SchemaError) -> Self {
+        ScanError::Shape(err)
+    }
+}
+
+impl From<FilterError> for ScanError {
+    fn from(err: FilterError) -> Self {
+        ScanError::Filter(err)
+    }
+}
+
+impl From<InvalidIdentifier> for ScanError {
+    fn from(_err: InvalidIdentifier) -> Self {
+        ScanError::InvalidIdentifier
+    }
+}
+
+impl From<SqlSurfaceError> for ScanError {
+    fn from(err: SqlSurfaceError) -> Self {
+        ScanError::Engine(err)
+    }
+}
+
+impl ClassifiedError for ScanError {
+    fn error_class(&self) -> ErrorClass {
+        match self {
+            ScanError::Shape(err) => err.error_class(),
+            ScanError::Filter(err) => err.error_class(),
+            ScanError::InvalidLimit
+            | ScanError::InvalidIdentifier
+            | ScanError::InvalidColumns
+            | ScanError::ExplainNotSupported => ErrorClass::UnsupportedSqlSyntax,
+            ScanError::Engine(err) => err.error_class(),
+        }
+    }
+
+    fn client_message(&self) -> String {
+        match self {
+            ScanError::Shape(err) => err.client_message(),
+            ScanError::Filter(err) => err.client_message(),
+            ScanError::InvalidLimit => {
+                "limit must be a positive integer within the supported range".to_string()
+            }
+            ScanError::InvalidIdentifier => "invalid identifier".to_string(),
+            ScanError::InvalidColumns => {
+                "columns must be a non-empty array of non-empty column name strings".to_string()
+            }
+            ScanError::ExplainNotSupported => "explain is not supported for scan".to_string(),
+            ScanError::Engine(err) => err.client_message(),
+        }
+    }
+}
+
+/// JSON `limit`（`f64`。[`Validated::required_number`] が返す）が非負の
+/// 有限整数として `u32` の範囲へ丸めなく収まることを検証する（確保前の
+/// untrusted 数値検証。`.claude/rules/security.md` DoS 対応）。範囲は
+/// [`validate_search_limit`] がさらに `1..=MAX_SEARCH_K` へ絞り込む。
+fn limit_to_u32(raw: f64) -> Result<u32, ScanError> {
+    if !raw.is_finite() || raw.fract() != 0.0 || raw < 0.0 || raw > f64::from(u32::MAX) {
+        return Err(ScanError::InvalidLimit);
+    }
+    // 直前の範囲検査で `[0, u32::MAX]` の整数値であることを確定させたため、
+    // `as` 変換は値の損失を伴わない（`u32::try_from` と同じ結果になる）。
+    Ok(raw as u32)
+}
+
+/// `columns`（[`Validated::optional_array`]`("columns")` の結果）を
+/// [`Projection`] へ写像する。未指定は `Projection::All`（`id` 疑似列＋
+/// 実列を宣言順で列挙。`score` に相当する合成列は構造上存在しない）。
+fn build_projection(validated: &Validated<'_>) -> Result<Projection, ScanError> {
+    let Some(items) = validated.optional_array("columns")? else {
+        return Ok(Projection::All);
+    };
+    if items.is_empty() {
+        return Err(ScanError::InvalidColumns);
+    }
+    let mut names = Vec::with_capacity(items.len());
+    for item in items {
+        // `SCAN_SCHEMA` が `Array(ElementType::String)` として型検査済みだが、
+        // 本モジュール単体で呼ばれても安全なよう再検証する（多層防御。
+        // `filter.rs::map_filter_item` と同じ方針）。
+        let JsonValue::String(s) = item else {
+            return Err(ScanError::InvalidColumns);
+        };
+        // `search`／`aggregate` と同じ識別子形状検査（SQL レキサーが `Ident`
+        // として読む文字集合・63 文字上限）を先に通す（cursor[bot] 指摘）。
+        ident::check_identifier(s)?;
+        names.push(s.clone());
+    }
+    Ok(Projection::Columns(names))
+}
+
+/// `filter`（[`Validated::optional_array`]`("filter")` の結果）を未束縛の
+/// [`DeclarativeFilter`] 列へ写像する。未指定は空 `Vec`（AND 結合の単位元）。
+fn build_declared_filters(validated: &Validated<'_>) -> Result<Vec<DeclarativeFilter>, ScanError> {
+    match validated.optional_array("filter")? {
+        Some(items) => Ok(map_filter_items(items)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// [`execute`] の本体。`table` のスキーマ取得・束縛・実行を単一スナップショット
+/// 上で行う（[`EngineCore::execute_bound_scan_in_session`] の契約）。
+///
+/// 手順: (1) `explain: true` の拒否、(2) `table`／`limit`／`columns`／`filter`
+/// をスキーマに依存しない範囲で検証・写像（[`limit_to_u32`]・
+/// [`validate_search_limit`]・[`build_projection`]・[`build_declared_filters`]。
+/// いずれも `TableSchema` を必要としないため、テーブル解決より前に完結させる
+/// ——未知テーブルへの要求でも `limit`／`columns`／`filter` の構文エラーを
+/// 先に確定させて構わない。SQL 表層の許可リスト検証段と同じ判定順序の思想）、
+/// (3) [`EngineCore::execute_bound_scan_in_session`] の bind closure 内で
+/// [`bind_projection`]・`declarative_filter::bind_all`（いずれもスキーマ依存の
+/// 検証。未知列・`VECTOR` 列は `22000`）を適用して [`BoundScan::new`] を組み立て、
+/// (4) 実行する。
+pub fn execute(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    validated: &Validated<'_>,
+) -> Result<QueryResult, ScanError> {
+    if validated.optional_bool("explain")?.unwrap_or(false) {
+        return Err(ScanError::ExplainNotSupported);
+    }
+
+    let table = validated.required_str("table")?;
+    // `search`／`aggregate` と同じ識別子形状検査を engine のスキーマ解決
+    // （`resolve_scan_input`）より前に適用する（cursor[bot] 指摘。SQL レキサー
+    // が拒否する形状の `table` を `42P01`／`22000` ではなく `42601` へ揃え、
+    // 63 文字を超える長大文字列を schema 走査より前に打ち切る）。
+    ident::check_identifier(table)?;
+    let raw_limit = validated.required_number("limit")?;
+    let limit = validate_search_limit(limit_to_u32(raw_limit)?)?;
+    let projection = build_projection(validated)?;
+    let declared_filters = build_declared_filters(validated)?;
+
+    let session = SessionState::default();
+    let result = core.execute_bound_scan_in_session(ctx, &session, table, |schema, udfs| {
+        let mut node_budget = MAX_EXPR_NODES;
+        let bound_projection = bind_projection(&projection, schema, udfs, &mut node_budget)?;
+        let bound_filters = declarative_filter::bind_all(&declared_filters, schema)?;
+        Ok(BoundScan::new(
+            table.to_string(),
+            bound_projection,
+            bound_filters,
+            Vec::new(),
+            limit,
+        ))
+    })?;
+    Ok(result)
+}
+
+/// `POST /v1/query`（`op: "scan"`）を処理し応答バイト列を返す（[`super::gate`]
+/// から呼ばれる。認証・スキーマ検証済みの要求のみ）。
+pub fn handle(
+    core: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+    now_wall: SystemTime,
+) -> Vec<u8> {
+    match execute(core, principal.policy_context(), validated) {
+        Ok(result) => match super::response::encode(&result) {
+            Ok(body) => http_response::encode_ok(&body, now_wall),
+            Err(err) => {
+                http_response::encode_error(err.error_class(), &err.client_message(), now_wall)
+            }
+        },
+        Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limit_to_u32_accepts_boundary_integers() {
+        assert_eq!(limit_to_u32(0.0).unwrap(), 0);
+        assert_eq!(limit_to_u32(1.0).unwrap(), 1);
+        assert_eq!(limit_to_u32(10_000.0).unwrap(), 10_000);
+        assert_eq!(limit_to_u32(f64::from(u32::MAX)).unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn limit_to_u32_rejects_non_integers_and_out_of_range_values() {
+        for raw in [
+            1.5,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from(u32::MAX) + 1.0,
+        ] {
+            assert!(
+                matches!(limit_to_u32(raw), Err(ScanError::InvalidLimit)),
+                "raw={raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_error_wire_codes_match_expected_classes() {
+        assert_eq!(ScanError::InvalidLimit.wire_code(), "42601");
+        assert_eq!(ScanError::InvalidIdentifier.wire_code(), "42601");
+        assert_eq!(ScanError::InvalidColumns.wire_code(), "42601");
+        assert_eq!(ScanError::ExplainNotSupported.wire_code(), "42601");
+    }
+
+    /// `ScanError::InvalidIdentifier` の応答文言は固定文言であり、
+    /// untrusted な識別子文字列をそのまま含まない（`ident::
+    /// check_identifier` の非漏えい契約を `ScanError` 側でも維持する）。
+    #[test]
+    fn invalid_identifier_client_message_is_fixed_and_does_not_leak_input() {
+        assert_eq!(
+            ScanError::InvalidIdentifier.client_message(),
+            "invalid identifier"
+        );
+    }
+}
