@@ -307,9 +307,14 @@ fn all_four_ops_succeed_against_seeded_fixture_with_distinct_bodies() {
     let (core, _guard) = new_core_two_tenant_docs();
     let addr = spawn(Arc::clone(&core));
 
+    // `columns` に `scan_resp`（`["id"]` のみ）と異なる列集合 `["id","lang"]`
+    // を指定する。scan は順序保証のない契約（Issue #831 レビュー指摘）のため、
+    // 行順序だけに頼った `assert_ne!` は「scan がたまたま search と同じ順序を
+    // 返す」正当な実装でも失敗しうる。列集合そのものを変えることで、行順序に
+    // 依存せず本文が構造的に異なることを保証する。
     let search_resp = query_as_alice(
         addr,
-        br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":10,"columns":["id"]}"#,
+        br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":10,"columns":["id","lang"]}"#,
     );
     assert_eq!(search_resp.status, 200, "search resp={search_resp:?}");
     assert!(
