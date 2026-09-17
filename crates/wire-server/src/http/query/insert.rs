@@ -24,6 +24,10 @@
 //! INDEX-4 の 4 上限（バッチ相当の判定を「1 要求の `rows` 行数」に読み替えたもの）は
 //! `EngineCore::execute_bound_insert_in_session` が判定する。
 //!
+//! `table` は兄弟 op（`search`／`scan`／`aggregate`）と同じ識別子形状検査
+//! （[`super::ident::check_identifier`]）を engine へ渡す前に適用する（`42601`。
+//! Cursor Bugbot 指摘・PR #823）。
+//!
 //! 対象外: `gate.rs` の placeholder 置換・`Router` への `EngineCore` 注入・成功応答
 //! JSON（`{"inserted", "operation_id"}`）への写像（後続 Issue の担当）。
 
@@ -39,6 +43,7 @@ use engine::sql::parser::BoundInsert;
 
 use crate::http::session::middleware::SessionPrincipal;
 
+use super::ident::{self, InvalidIdentifier};
 use super::schema::{SchemaError, Validated};
 
 /// [`bind_row`] が返す `InsertError::Bind` 用の `SqlSurfaceError::InvalidInput`
@@ -60,6 +65,14 @@ pub enum InsertError {
     /// `rows` の形（`schema.rs` の意味的検証を通過した後の、行要素単位の検証）が
     /// 不正。`SchemaError` は untrusted な値・キー名を保持しない固定文言。
     Shape(SchemaError),
+    /// `table` が識別子として意味を持ちうる形状（[`super::ident::check_identifier`]）
+    /// を満たさない。兄弟 op（`search`／`scan`／`aggregate`）と同じ検査を `table` を
+    /// `EngineCore::execute_bound_insert_in_session` へ渡す前に適用する（`42601`）。
+    /// この検査がないと、NUL 等の制御文字を含む `table` 文字列が engine 側の
+    /// `validate_identifier`（`22000`／`42P01`／`XX000` のいずれかに丸められる）まで
+    /// 素通りし、兄弟 op と異なる `wire_code` として露出しうる（Cursor Bugbot 指摘・
+    /// PR #823）。
+    InvalidIdentifier,
     /// `engine::sql::parser::BoundInsert` への束縛時のエラー（未知列・型不一致・
     /// 次元不一致・非 nullable 列の欠落等。`22000`）。
     Bind(SqlSurfaceError),
@@ -74,10 +87,17 @@ impl From<SchemaError> for InsertError {
     }
 }
 
+impl From<InvalidIdentifier> for InsertError {
+    fn from(_err: InvalidIdentifier) -> Self {
+        InsertError::InvalidIdentifier
+    }
+}
+
 impl ClassifiedError for InsertError {
     fn error_class(&self) -> ErrorClass {
         match self {
             InsertError::Shape(err) => err.error_class(),
+            InsertError::InvalidIdentifier => ErrorClass::UnsupportedSqlSyntax,
             InsertError::Bind(err) | InsertError::Exec(err) => err.error_class(),
         }
     }
@@ -85,6 +105,7 @@ impl ClassifiedError for InsertError {
     fn client_message(&self) -> String {
         match self {
             InsertError::Shape(err) => err.client_message(),
+            InsertError::InvalidIdentifier => "invalid identifier".to_string(),
             InsertError::Bind(err) | InsertError::Exec(err) => err.client_message(),
         }
     }
@@ -263,6 +284,7 @@ pub fn execute(
     let table = validated
         .required_str("table")
         .map_err(InsertError::Shape)?;
+    ident::check_identifier(table)?;
     let rows = validated
         .required_array("rows")
         .map_err(InsertError::Shape)?;
@@ -280,9 +302,15 @@ pub fn execute(
         |schema| {
             bind_rows(rows, table, Some(&operation_id), schema).map_err(|e| match e {
                 InsertError::Bind(err) | InsertError::Exec(err) => err,
-                InsertError::Shape(_) => SqlSurfaceError::Internal {
-                    detail: "unexpected shape error during INSERT row binding".to_string(),
-                },
+                // `bind_rows` は `InsertError::Shape`／`InsertError::InvalidIdentifier`
+                // を構築しない（前者は `schema.rs` の意味的検証、後者は本関数冒頭の
+                // `ident::check_identifier` がそれぞれ独立に検査する）。到達不能だが
+                // `SqlSurfaceError` へ丸めて fail-closed のまま `match` を網羅する。
+                InsertError::Shape(_) | InsertError::InvalidIdentifier => {
+                    SqlSurfaceError::Internal {
+                        detail: "unexpected shape error during INSERT row binding".to_string(),
+                    }
+                }
             })
         },
     )
@@ -530,6 +558,27 @@ mod tests {
 
         let outcome = execute(&core, &principal, &validated).expect("insert ok");
         assert_eq!(outcome.rows_affected, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Cursor Bugbot 指摘（PR #823）: `table` が識別子形状検査
+    // （`ident::check_identifier`）を通らずに engine へ渡ると、NUL 等の制御文字を
+    // 含む値が `22000`／`42P01`／`XX000` のいずれかへ丸められ、兄弟 op（`search`／
+    // `scan`／`aggregate`）と異なる `wire_code` として露出しうる。JSON 文字列は
+    // `\u0000` エスケープ経由で NUL を表現できるため、この経路で `42601` が
+    // 返ることを固定する。
+    #[test]
+    fn execute_rejects_table_name_containing_nul_as_invalid_identifier() {
+        let (core, path) = open_core();
+        let principal = principal("tenant-a");
+        let body = r#"{"op":"insert","table":"docs\u0000","rows":[{"id":1,"embedding":[1,0,0,0],"lang":"ja"}],"operation_id":"op-1"}"#;
+        let value = parse_json(body).expect("valid json");
+        let validated = super::super::schema::INSERT_SCHEMA
+            .validate(&value)
+            .expect("schema ok");
+
+        let err = execute(&core, &principal, &validated).expect_err("must reject");
+        assert_eq!(err.wire_code(), "42601");
         let _ = std::fs::remove_file(&path);
     }
 
