@@ -1022,6 +1022,25 @@ pub(crate) enum AggregateInput {
     VectorColumnPresence,
 }
 
+/// 集計項目 1 つの引数を SQL テキスト非経由で表す形（TASK-186・NOSQL-4）。
+/// [`crate::sql::allowlist::AggregateArg`] の 2 variant（`Star`／`Expr`）を、
+/// クレート外から構築できる最小の閉じた形へ単純化したもの。`Column` は
+/// 単純な識別子（`id`・実カラム名）のみを表し、複合式（`vec_norm(...)` 等）は
+/// 対象外（[`crate::sql::udf_call::BoundExpr`] を公開せずに式を組み立てる
+/// 手段が無いため。式が必要な集計は引き続き SQL テキスト経由
+/// （[`bind_aggregate`]）でのみ構築できる）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateTarget {
+    /// `COUNT(*)` 相当。[`BoundAggregateItem::bind`] は
+    /// `func != AggregateFunc::Count` の場合これを構文層の拒否と同じ
+    /// `42601`（[`SqlSurfaceError::unsupported`]）で拒否する（SQL 表層の
+    /// `Parser::parse_aggregate_item` が `Star` を `COUNT` 専用に絞り込む
+    /// 構造的制約を、直接構築経路でも同じ分類で再現する）。
+    Star,
+    /// 識別子（疑似列 `id`・実カラム名）。
+    Column(String),
+}
+
 /// 束縛済みの集計項目 1 つ（TASK-166・SQL-13）。
 ///
 /// フィールドは `pub(crate)` のまま公開しない（`BoundScan`・`BoundStatement` と
@@ -1040,6 +1059,47 @@ pub struct BoundAggregateItem {
 }
 
 impl BoundAggregateItem {
+    /// クレート外から集計項目 1 つを直接構築する（TASK-186・NOSQL-4。SQL
+    /// テキストの構文解析を経由しない入口）。列名解決は [`resolve_aggregate_input`]
+    /// （[`bind_aggregate`] と共有する単一実装）へそのまま委譲するため、
+    /// 型不整合（`VECTOR`／`TEXT` 列と関数の組み合わせ・未知列）の判定は SQL
+    /// 表層と完全に同一。
+    ///
+    /// `target == AggregateTarget::Star` かつ `func != AggregateFunc::Count`
+    /// は、SQL 表層では構文層（`Parser::parse_aggregate_item`）が構造的に
+    /// 拒否する組み合わせであり、意味論層（`resolve_aggregate_input`）には
+    /// 到達しない。直接構築経路にはその構文層が存在しないため、ここで
+    /// 同じ分類（`42601`）を明示的に再現する（さもなければ
+    /// `resolve_aggregate_input` の `AggregateArg::Star` 分岐が無条件で
+    /// `AggregateInput::AllVisible` を返し、`SUM(*)` 相当が誤って受理
+    /// されてしまう）。
+    ///
+    /// `name`（出力列名）は常に [`crate::sql::allowlist::AggregateFunc::
+    /// default_alias`]（`AS <alias>` 相当の指定は本入口では対象外）。
+    pub fn bind(
+        func: crate::sql::allowlist::AggregateFunc,
+        target: AggregateTarget,
+        schema: &TableSchema,
+    ) -> Result<Self, SqlSurfaceError> {
+        use crate::sql::allowlist::{AggregateArg, AggregateFunc};
+
+        if matches!(target, AggregateTarget::Star) && func != AggregateFunc::Count {
+            return Err(SqlSurfaceError::unsupported("* is only allowed with COUNT"));
+        }
+
+        let arg = match target {
+            AggregateTarget::Star => AggregateArg::Star,
+            AggregateTarget::Column(name) => AggregateArg::Expr(Expr::Ident(name)),
+        };
+
+        let udfs = crate::sql::udf_call::UdfRegistry::default();
+        let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+        let input = resolve_aggregate_input(func, &arg, schema, &udfs, &mut node_budget)?;
+        let name = func.default_alias().to_string();
+
+        Ok(BoundAggregateItem { func, input, name })
+    }
+
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`）。
     pub fn func(&self) -> crate::sql::allowlist::AggregateFunc {
         self.func
@@ -1108,10 +1168,9 @@ pub(crate) struct BoundGroupBy {
 /// （[`ProjectionColumn`]）・`group_by`（[`BoundGroupBy`]）は非公開のまま維持し
 /// （`GroupKey`/`Aggregate` の内部添字・`BoundHaving`/`BoundOrderBy` を経由しない
 /// 独立したアクセサーが必要になるため）、代わりに [`Self::has_group_by`] のみを
-/// 公開する。SQL テキストを経由しない直接構築（`BoundScan::new` 相当の
-/// `BoundAggregate::new`）は本 Issue の対象外（`AggregateInput`／`ExprProgram`／
-/// `ProjectionColumn`／`BoundGroupBy` の公開設計が必要なため。TASK-186・
-/// NOSQL-4・NOSQL-5）。
+/// 公開する。SQL テキストを経由しない直接構築は [`Self::new`]（`BoundScan::new`
+/// と同じ作法。`GROUP BY` を持たない単一行集計〔TASK-166・SQL-13〕限定。
+/// TASK-186・NOSQL-4）。
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct BoundAggregate {
@@ -1131,6 +1190,60 @@ pub struct BoundAggregate {
 }
 
 impl BoundAggregate {
+    /// クレート外から `BoundAggregate` を直接構築する constructor（TASK-186・
+    /// NOSQL-4。SQL テキストの構文解析・[`crate::sql::allowlist::validate_sql`]
+    /// を経由せずに束縛済み実行計画を組み立てる入口。[`BoundScan::new`] と同じ
+    /// 作法）。`GROUP BY` を持たない単一行集計（TASK-166・SQL-13）限定
+    /// （`group_by: None` 固定。`GROUP BY`／`HAVING` を伴う計画
+    /// 〔TASK-167・SQL-14〕は [`BoundGroupBy`] 等が非公開のため本入口の対象外。
+    /// NOSQL-5 の担当）。
+    ///
+    /// `items` が空なら [`SqlSurfaceError::unsupported`]（`42601`。SQL 側で
+    /// 集計項目 0 個の SELECT リストは構文エラーになるのと同じ分類）、
+    /// [`crate::sql::allowlist::MAX_AGGREGATE_ITEMS`] 超過なら
+    /// [`SqlSurfaceError::payload_too_large`]（`54000`）で拒否する
+    /// （[`crate::sql::allowlist::check_aggregate_item_count`] と同じ判定を
+    /// `Vec` 確保より前に行う）。`rls_predicate_present` は常に `false`
+    /// 固定とする（クレート外の呼び出し元は `WHERE` 句の構文を持たないため、
+    /// RLS 相当の述語をクライアントが明示的に指定する経路が存在しない。
+    /// `EngineCore::execute_bound_aggregate_in_session`（Issue #728）が
+    /// `ctx`〔`PolicyContext`〕から RLS を暗黙適用する既存契約はこのフィールド
+    /// に依存しないため、`false` 固定でも RLS 境界は保たれる）。
+    pub fn new(
+        table: String,
+        items: Vec<BoundAggregateItem>,
+        metadata_filters: Vec<MetadataFilter>,
+        expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+    ) -> Result<Self, SqlSurfaceError> {
+        if items.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "aggregate SELECT list must have at least one item",
+            ));
+        }
+        crate::sql::allowlist::check_aggregate_item_count(items.len())?;
+
+        let projection = items
+            .iter()
+            .enumerate()
+            .map(|(item_index, item)| ProjectionColumn::Aggregate {
+                item_index,
+                name: item.name.clone(),
+            })
+            .collect();
+        let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
+
+        Ok(BoundAggregate {
+            table,
+            items,
+            metadata_filters,
+            expr_filters,
+            expr_filter_programs,
+            rls_predicate_present: false,
+            projection,
+            group_by: None,
+        })
+    }
+
     /// 束縛対象のテーブル名。
     pub fn table(&self) -> &str {
         &self.table

@@ -105,10 +105,10 @@ private メソッド）へ抽出した。SQL 経路は
 
 ## スコープ外
 
-- `BoundAggregate::new`（SQL テキスト非経由の直接構築 constructor）:
-  `AggregateInput`／`ExprProgram`／`ProjectionColumn`／`BoundGroupBy` の公開設計
-  が必要。TASK-177（aggregate 写像）へ申し送り。aggregate エントリが SQL
-  テキスト非経由で外部から使えるのは TASK-177 以降になる。
+- `BoundAggregate::new`（SQL テキスト非経由の直接構築 constructor）: Issue #768・
+  TASK-177（aggregate 写像・NOSQL-4）で実装済み（`BoundScan::new` と同じ作法。
+  `GROUP BY` を持たない単一行集計〔TASK-166・SQL-13〕限定。`AggregateInput` の
+  `ScalarExpr` variant（複合式）は対象外のまま SQL テキスト経由のみ）。
 - search（`BoundStatement`）向けの同型エントリ: 同じ `read_txn` の壁に当たるが
   TASK-186 の対象外。TASK-175 へ申し送り。
 - `execute_insert`／`build_explain_result` の公開: Issue #730。
