@@ -13,7 +13,7 @@ use engine::row_codec::Value;
 use engine::sql::aggregate::execute_aggregate;
 use engine::sql::allowlist::{validate_sql, AggregateFunc, Statement};
 use engine::sql::exec::Cell;
-use engine::sql::parser::bind_aggregate;
+use engine::sql::parser::{bind_aggregate, AggregateTarget, BoundAggregate, BoundAggregateItem};
 use engine::sql::udf_call::UdfRegistry;
 use engine::storage::{Storage, Visibility};
 use redb::ReadableDatabase;
@@ -237,4 +237,202 @@ fn execute_aggregate_returns_empty_set_contract_for_table_without_visible_rows()
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].cells[0], Cell::Integer(0));
     assert_eq!(result.rows[0].cells[1], Cell::Null);
+}
+
+// --- Issue #768・TASK-186・NOSQL-4: `BoundAggregate::new`／`BoundAggregateItem::bind`
+// （SQL テキスト非経由の直接構築）の到達性・SQL 経路との同一結果契約 -------------
+
+/// `BoundAggregate::new` で組んだ計画が、等価な SQL テキスト（`validate_sql` →
+/// `bind_aggregate`）から得た `BoundAggregate` と完全一致することを固定する
+/// （NOSQL-4 の「SQL 表層と同一結果」契約の中核）。5 関数 × `*`／`id`（疑似列）／
+/// `TEXT` 列（`lang`）／`VECTOR` 列（`embedding`、`COUNT` のみ）を横断する。
+#[test]
+fn bound_aggregate_new_matches_sql_text_bind_for_all_functions() {
+    let path = unique_db_path("sql-aggregate-public-api-new-matches-sql");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let schema_val = storage.get_table_schema(TABLE).expect("get_table_schema");
+
+    let sql = "SELECT COUNT(*), COUNT(id), SUM(id), AVG(id), MIN(id), MAX(id), \
+               MIN(lang), MAX(lang), COUNT(lang), COUNT(embedding) FROM docs WHERE lang = 'ja'";
+    let validated = validate_sql(sql, &storage).expect("validate_sql should accept aggregate form");
+    let Statement::Aggregate(validated_aggregate) = validated else {
+        panic!("expected Statement::Aggregate");
+    };
+    let via_sql = bind_aggregate(&validated_aggregate, &schema_val, &UdfRegistry::default())
+        .expect("bind_aggregate should succeed");
+
+    let items = vec![
+        BoundAggregateItem::bind(AggregateFunc::Count, AggregateTarget::Star, &schema_val)
+            .expect("count(*) should bind"),
+        BoundAggregateItem::bind(
+            AggregateFunc::Count,
+            AggregateTarget::Column("id".to_string()),
+            &schema_val,
+        )
+        .expect("count(id) should bind"),
+        BoundAggregateItem::bind(
+            AggregateFunc::Sum,
+            AggregateTarget::Column("id".to_string()),
+            &schema_val,
+        )
+        .expect("sum(id) should bind"),
+        BoundAggregateItem::bind(
+            AggregateFunc::Avg,
+            AggregateTarget::Column("id".to_string()),
+            &schema_val,
+        )
+        .expect("avg(id) should bind"),
+        BoundAggregateItem::bind(
+            AggregateFunc::Min,
+            AggregateTarget::Column("id".to_string()),
+            &schema_val,
+        )
+        .expect("min(id) should bind"),
+        BoundAggregateItem::bind(
+            AggregateFunc::Max,
+            AggregateTarget::Column("id".to_string()),
+            &schema_val,
+        )
+        .expect("max(id) should bind"),
+        BoundAggregateItem::bind(
+            AggregateFunc::Min,
+            AggregateTarget::Column("lang".to_string()),
+            &schema_val,
+        )
+        .expect("min(lang) should bind"),
+        BoundAggregateItem::bind(
+            AggregateFunc::Max,
+            AggregateTarget::Column("lang".to_string()),
+            &schema_val,
+        )
+        .expect("max(lang) should bind"),
+        BoundAggregateItem::bind(
+            AggregateFunc::Count,
+            AggregateTarget::Column("lang".to_string()),
+            &schema_val,
+        )
+        .expect("count(lang) should bind"),
+        BoundAggregateItem::bind(
+            AggregateFunc::Count,
+            AggregateTarget::Column("embedding".to_string()),
+            &schema_val,
+        )
+        .expect("count(embedding) should bind"),
+    ];
+    let metadata_filters = via_sql.metadata_filters().to_vec();
+    let expr_filters = via_sql.expr_filters().to_vec();
+    let via_direct = BoundAggregate::new(TABLE.to_string(), items, metadata_filters, expr_filters)
+        .expect("BoundAggregate::new should succeed");
+
+    assert_eq!(via_direct, via_sql);
+}
+
+/// `*` は `COUNT` 以外の関数では受理しない（SQL 表層の構文層が
+/// `Parser::parse_aggregate_item` で `SUM(*)` 等を構造的に拒否するのと同じ
+/// `42601` 分類を、直接構築経路でも再現する）。
+#[test]
+fn bound_aggregate_item_bind_rejects_star_with_non_count_function() {
+    let schema_val = schema();
+    let err = BoundAggregateItem::bind(AggregateFunc::Sum, AggregateTarget::Star, &schema_val)
+        .expect_err("SUM(*) must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+/// 集計項目が 0 個の `BoundAggregate::new` は SQL 側の構文エラー（集計項目なしの
+/// SELECT リスト）と同じ `42601` で拒否する。
+#[test]
+fn bound_aggregate_new_rejects_empty_items() {
+    let err = BoundAggregate::new(TABLE.to_string(), Vec::new(), Vec::new(), Vec::new())
+        .expect_err("empty items must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+/// [`engine::sql::allowlist::MAX_AGGREGATE_ITEMS`] 超過は `Vec` 確保後であっても
+/// `54000`（`payload_too_large`）で拒否する。
+#[test]
+fn bound_aggregate_new_rejects_item_count_over_limit() {
+    let schema_val = schema();
+    let max = engine::sql::allowlist::MAX_AGGREGATE_ITEMS;
+    let items: Vec<BoundAggregateItem> = (0..=max)
+        .map(|_| {
+            BoundAggregateItem::bind(AggregateFunc::Count, AggregateTarget::Star, &schema_val)
+                .expect("count(*) should bind")
+        })
+        .collect();
+    let err = BoundAggregate::new(TABLE.to_string(), items, Vec::new(), Vec::new())
+        .expect_err("over-limit item count must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+}
+
+/// ちょうど上限件数は受理する（境界値）。
+#[test]
+fn bound_aggregate_new_accepts_item_count_at_limit() {
+    let schema_val = schema();
+    let max = engine::sql::allowlist::MAX_AGGREGATE_ITEMS;
+    let items: Vec<BoundAggregateItem> = (0..max)
+        .map(|_| {
+            BoundAggregateItem::bind(AggregateFunc::Count, AggregateTarget::Star, &schema_val)
+                .expect("count(*) should bind")
+        })
+        .collect();
+    let bound = BoundAggregate::new(TABLE.to_string(), items, Vec::new(), Vec::new())
+        .expect("at-limit item count must be accepted");
+    assert_eq!(bound.items().len(), max);
+}
+
+/// `VECTOR` 列は `SUM`/`AVG`/`MIN`/`MAX` と組み合わせると型不整合（`22000`）。
+/// `COUNT` のみ非 NULL 行数として受理する（SQL-13・PR #229 と同一の例外）。
+#[test]
+fn bound_aggregate_item_bind_rejects_vector_column_for_sum_avg_min_max_but_accepts_count() {
+    let schema_val = schema();
+    for func in [
+        AggregateFunc::Sum,
+        AggregateFunc::Avg,
+        AggregateFunc::Min,
+        AggregateFunc::Max,
+    ] {
+        let err = BoundAggregateItem::bind(
+            func,
+            AggregateTarget::Column("embedding".to_string()),
+            &schema_val,
+        )
+        .expect_err("VECTOR column with SUM/AVG/MIN/MAX must be rejected");
+        assert_eq!(err.wire_code(), "22000", "func={func:?}");
+    }
+    BoundAggregateItem::bind(
+        AggregateFunc::Count,
+        AggregateTarget::Column("embedding".to_string()),
+        &schema_val,
+    )
+    .expect("COUNT(embedding) must be accepted");
+}
+
+/// `TEXT` 列は `SUM`/`AVG` と組み合わせると型不整合（`22000`）。
+#[test]
+fn bound_aggregate_item_bind_rejects_text_column_for_sum_and_avg() {
+    let schema_val = schema();
+    for func in [AggregateFunc::Sum, AggregateFunc::Avg] {
+        let err = BoundAggregateItem::bind(
+            func,
+            AggregateTarget::Column("lang".to_string()),
+            &schema_val,
+        )
+        .expect_err("TEXT column with SUM/AVG must be rejected");
+        assert_eq!(err.wire_code(), "22000", "func={func:?}");
+    }
+}
+
+/// 未知の列名は `22000`（`resolve_aggregate_input` の既存契約をそのまま透過）。
+#[test]
+fn bound_aggregate_item_bind_rejects_unknown_column() {
+    let schema_val = schema();
+    let err = BoundAggregateItem::bind(
+        AggregateFunc::Sum,
+        AggregateTarget::Column("nope".to_string()),
+        &schema_val,
+    )
+    .expect_err("unknown column must be rejected");
+    assert_eq!(err.wire_code(), "22000");
 }

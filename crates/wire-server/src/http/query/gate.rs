@@ -22,7 +22,11 @@
 //! 4. `Op::schema().validate(...)`（必須欠落・未知キー・型不一致 →
 //!    `42601`。`tenant_id` の JSON 自己申告・`HINT ORDER`／
 //!    `SET search_mode` 相当フィールドはここで未知キーとして拒否される）
-//! 5. ここまで通過した要求は暫定的に `0A000`／501
+//! 5. `op` ごとにディスパッチする（Issue #768）。`op == Aggregate` かつ
+//!    `engine` が接続済み（`Some`）の場合のみ [`super::aggregate::handle`]
+//!    （Issue #768・TASK-177・NOSQL-4）へ委譲し実行結果（成功／束縛・実行
+//!    エラーいずれも）をそのまま最終応答とする。それ以外（`search`／
+//!    `scan`／`insert`、および `engine` 未接続）は暫定の `0A000`／501
 //!    （[`PLACEHOLDER_MESSAGE`]）を返す（束縛・実行の結線は #763 以降が
 //!    本 seam を置き換える）
 //!
@@ -36,81 +40,78 @@
 
 use std::time::SystemTime;
 
+use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::parse_json;
 
-use crate::http::query::op::classify_op;
+use crate::http::query::op::{classify_op, Op};
 use crate::http::session::middleware::{self, SessionPrincipal};
 use crate::http::{body, response};
 
 pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 
-/// 検証を通過した要求に返す暫定応答の文言（束縛・実行は #763
-/// 以降の担当。本 Issue 時点は seam のみ）。
+/// 検証を通過したが実行結線が未接続（`op` が `aggregate` 以外、または
+/// `engine` 未接続）の要求に返す暫定応答の文言（束縛・実行は #763 以降の
+/// 担当。本 Issue 時点は `aggregate` op のみ seam を置き換え済み）。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
-
-/// [`handle`] 内部の分類済みエラー。
-struct HandleError {
-    class: ErrorClass,
-    message: std::borrow::Cow<'static, str>,
-}
-
-impl HandleError {
-    fn new(class: ErrorClass, message: impl Into<std::borrow::Cow<'static, str>>) -> Self {
-        Self {
-            class,
-            message: message.into(),
-        }
-    }
-}
 
 /// `POST /v1/query` を処理し応答バイト列を返す（認証済み要求のみ）。
 ///
 /// `principal` は [`crate::http::session::middleware::authenticate`] を通過
-/// した要求のテナント文脈（唯一の入口）。`now_wall` は応答の `Date` ヘッダ
-/// （壁時計）に使う。
+/// した要求のテナント文脈（唯一の入口）。`engine` は接続済みの
+/// `EngineCore`（`Router::new` 経由では `None`。`Router::with_engine` 経由
+/// でのみ `Some`）。`now_wall` は応答の `Date` ヘッダ（壁時計）に使う。
 pub fn handle(
     principal: &SessionPrincipal,
     headers: &crate::http::headers::Headers<'_>,
-    body: &[u8],
+    raw_body: &[u8],
+    engine: Option<&EngineCore>,
     now_wall: SystemTime,
 ) -> Vec<u8> {
-    match handle_inner(principal, headers, body) {
-        Ok(message) => response::encode_error(ErrorClass::FeatureNotSupported, message, now_wall),
-        Err(e) => response::encode_error(e.class, &e.message, now_wall),
-    }
-}
-
-/// [`handle`] の本体。成功時も本 Issue 時点では常に `0A000`／501 の暫定応答
-/// メッセージを返す（`Ok` の意味は「ここまでの検証を通過した」こと）。
-fn handle_inner(
-    _principal: &SessionPrincipal,
-    headers: &crate::http::headers::Headers<'_>,
-    raw_body: &[u8],
-) -> Result<&'static str, HandleError> {
     // 手順 1: テナント指定ヘッダの拒否（本文検証より先）。
-    middleware::reject_tenant_headers(headers)
-        .map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
+    if let Err(e) = middleware::reject_tenant_headers(headers) {
+        return response::encode_error(e.error_class(), e.client_message(), now_wall);
+    }
 
     // 手順 2: 本文検証（構文・`op` フィールドの形）。
-    let text = body::body_as_utf8(raw_body)
-        .map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
-    let value =
-        parse_json(text).map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
-    let raw_op = crate::http::query::schema::extract_op(&value)
-        .map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
+    let text = match body::body_as_utf8(raw_body) {
+        Ok(text) => text,
+        Err(e) => return response::encode_error(e.error_class(), e.client_message(), now_wall),
+    };
+    let value = match parse_json(text) {
+        Ok(value) => value,
+        Err(e) => return response::encode_error(e.error_class(), &e.client_message(), now_wall),
+    };
+    let raw_op = match crate::http::query::schema::extract_op(&value) {
+        Ok(raw_op) => raw_op,
+        Err(e) => return response::encode_error(e.error_class(), &e.client_message(), now_wall),
+    };
 
     // 手順 3: op 許可リスト判定（スキーマ検証より前。語彙外は 0A000）。
-    let op =
-        classify_op(raw_op).map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
+    let op = match classify_op(raw_op) {
+        Ok(op) => op,
+        Err(e) => return response::encode_error(e.error_class(), &e.client_message(), now_wall),
+    };
 
     // 手順 4: スキーマ検証（必須欠落・未知キー・型不一致 → 42601）。
-    op.schema()
-        .validate(&value)
-        .map_err(|e| HandleError::new(e.error_class(), e.client_message()))?;
+    let validated = match op.schema().validate(&value) {
+        Ok(validated) => validated,
+        Err(e) => return response::encode_error(e.error_class(), &e.client_message(), now_wall),
+    };
 
-    // 手順 5: 検証を通過した要求への暫定 placeholder 応答。
-    Ok(PLACEHOLDER_MESSAGE)
+    // 手順 5: op ごとのディスパッチ（Issue #768）。各 op アームは対応する
+    // モジュールへの 1 行委譲に留め、後続 Issue（#763・#766）が並行して
+    // 追加する他 op アームとの衝突面を小さくする。
+    match (op, engine) {
+        (Op::Aggregate, Some(engine)) => {
+            super::aggregate::handle(engine, principal, &validated, now_wall)
+        }
+        (_, _) => response::encode_error(
+            ErrorClass::FeatureNotSupported,
+            PLACEHOLDER_MESSAGE,
+            now_wall,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -152,10 +153,12 @@ mod tests {
         middleware::authenticate(&sessions, &headers, move || now).expect("authenticate")
     }
 
+    /// `engine` 未接続（`Router::new` 経由）の従来経路。全 op がプレース
+    /// ホルダー応答へ落ちることを検証する既存テスト群が使う。
     fn run(body: &[u8], extra_headers: &[&str]) -> Vec<u8> {
         let p = principal();
         let headers = headers_with_body(body, extra_headers);
-        handle(&p, &headers, body, std::time::SystemTime::now())
+        handle(&p, &headers, body, None, std::time::SystemTime::now())
     }
 
     #[test]
@@ -177,12 +180,17 @@ mod tests {
     }
 
     #[test]
-    fn valid_aggregate_reaches_placeholder_response() {
+    fn valid_aggregate_reaches_placeholder_response_when_engine_is_not_connected() {
+        // `engine` 未接続（`Router::new` 経由）では `aggregate` も従来どおり
+        // placeholder のまま（実行器なしで応答を偽装しない。
+        // `router.rs::Router::new` の既定・`nosql9_op_allowlist.rs` と
+        // 同じ契約）。
         let body =
             br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"id"}]}"#;
         let response = run(body, &[]);
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
+        assert!(text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
     }
 
     #[test]

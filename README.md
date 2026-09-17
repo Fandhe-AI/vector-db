@@ -106,8 +106,14 @@ bind は同じ理由で起動拒否されます。`nosql` を選択すると、�
 `insert`）の許可リストへ照らし、語彙外（DDL・UDF 呼び出し・トランザクション
 制御・UPDATE／DELETE 相当を含む）は `wire_code` `0A000`（HTTP 501）で
 拒否します（Issue #759・TASK-179・NOSQL-1・NOSQL-9）。語彙内の要求は
-本文スキーマ検証を経て、現時点では暫定の `wire_code` `0A000`（HTTP 501）を
-返します（束縛・実行計画への写像は Issue #763 以降の担当）。`/v1/session`・`/v1/session/close`・`/v1/query` の 3 エンドポイントは
+本文スキーマ検証を経て、`op: aggregate`（`group_by`／`having`／
+`explain: true` を除く単一行集計）は SQL テキストを組み立てずに
+`engine::sql::parser::BoundAggregate` へ直接束縛・実行し、SQL 表層と
+同一の結果（NULL・オーバーフロー `22003`・`VECTOR` 列拒否を含む）を返します
+（Issue #768・TASK-177・NOSQL-4）。それ以外の op（`search`／`scan`／
+`insert`）は現時点では暫定の `wire_code` `0A000`（HTTP 501）を返します
+（束縛・実行計画への写像は Issue #763・#766 の担当）。`/v1/session`・
+`/v1/session/close`・`/v1/query` の 3 エンドポイントは
 バイト厳密一致でのみ受理し、それ以外のパス（完全未知パス・クエリ文字列
 付き・末尾スラッシュ／余剰セグメント・大文字小文字違い等）はすべて
 `08P01`（`unknown request target`。ルータでの判定）で拒否します。
