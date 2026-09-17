@@ -530,6 +530,18 @@ fn explain_entry_does_not_leak_other_tenant_row_content() {
             "辞書スナップショットに他テナントの body 内容が混入している: {prompt}"
         );
     }
+    // 上記の非混入アサーションだけでは、辞書スナップショット自体が空
+    // （＝そもそも何も渡していない）場合にも同じく green になってしまい
+    // 非漏えい検証として vacuous になる（advisor 指摘）。tenant-a 自身の
+    // `path`（`render_prompt_prefix` の `# Files` 節に決定的にそのまま
+    // 現れる。`crates/engine/src/query_planner.rs::render_prompt_prefix`）
+    // が実際にプロンプトへ含まれていることを固定し、辞書内容そのものが
+    // 渡っていることを非 vacuous に確認する。
+    assert!(
+        prompts.iter().any(|prompt| prompt.contains("docs/a.md")),
+        "自テナント（tenant-a）の辞書内容がプロンプトに含まれていない\
+         （非漏えい検証が vacuous）"
+    );
 }
 
 /// クレート外（本テストファイル）からの直接呼び出しが `EngineCore::
