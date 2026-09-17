@@ -87,6 +87,20 @@ pub fn check_aggregate_item_count(count: usize) -> Result<(), SqlSurfaceError> {
     Ok(())
 }
 
+/// `count` 件の `HAVING` 述語が [`MAX_AGGREGATE_ITEMS`] を超えないことを検証する
+/// （`54000`）。[`Parser::parse_having`] の構文層と同じ上限値を用いる
+/// （TASK-186・NOSQL-5: `wire-server::http::query::aggregate::bind` が `having`
+/// 配列要素を写像する**前**に呼ぶ。[`check_aggregate_item_count`] と同じ
+/// 設計判断）。
+pub fn check_having_predicate_count(count: usize) -> Result<(), SqlSurfaceError> {
+    if count > MAX_AGGREGATE_ITEMS {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "HAVING predicate count {count} exceeds limit {MAX_AGGREGATE_ITEMS}"
+        )));
+    }
+    Ok(())
+}
+
 /// `USING PLAN('<query>')`（TASK-77・SQL-5）に渡せる自然言語クエリ本文のバイト長
 /// 上限。アロケーション（字句解析・LLM プロンプトへの組み込み）に入る前に拒否する
 /// （`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」対応）。
