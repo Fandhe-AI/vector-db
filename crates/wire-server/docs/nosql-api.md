@@ -195,7 +195,8 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 ```
 
 `mode` の解決（`resolve_mode_with_planner`。優先順位: 要求の `mode` フィールド
-＞ セッション変数 ＞ プランナー推定 ＞ 既定 `recall`）:
+＞ セッション変数（`SET` 相当。NoSQL 表層には対応形が無く `1 要求 = 1 セッション`
+のため常に未設定）＞ プランナー推定 ＞ 既定 `recall`）:
 
 - `vector` 検索: `mode` 省略時は常に既定 `recall`（プランナーを経由しないため
   推定ヒントが存在しない）
@@ -324,15 +325,15 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 - `rows` の行数上限は既定 64（`EngineCore::execute_bound_insert_in_session` が
   `rows.len()` を INDEX-4 の件数上限相当として判定。環境変数
   `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
-- `rows` 自体にはバイト上限がない（行形は SQL 表層と同じくバイト上限を持たない
-  設計。[spec 側への申し送り候補](#spec-側への申し送り候補)参照）が、行単位・
-  バッチ単位それぞれに別の INDEX-4 上限が適用される。各行のバイト量は
-  `Σ TEXT 列.len() + VECTOR 列.len() × 4`（`Null` は 0。`validate_batch_shape`）
-  として積算し、1 行あたりの上限（既定は `chunking::MAX_INPUT_BYTES` 相当）・
-  バッチ合計の上限（既定値、環境変数 `VECTOR_DB_BATCH_MAX_TOTAL_BYTES` で
-  上書き可能）のいずれかを超えると `54000`。行数自体も 1 行＝1 チャンク相当
-  として別枠のチャンク数上限（`validate_chunk_total`）で判定される（超過は
-  同じく `54000`）
+- 行・バッチ単位のバイト上限（INDEX-4 ②③。`batch_limits::validate_batch_shape`）:
+  各行のバイト量を `Σ TEXT 列.len() + VECTOR 列.len() × 4`（`Null` は 0）として
+  積算し、1 行あたり `chunking::MAX_INPUT_BYTES`（固定）、またはバッチ合計
+  `VECTOR_DB_BATCH_MAX_TOTAL_BYTES`（未設定時は
+  `incremental::MAX_INDEX_TOTAL_BYTES`）を超えると `54000`
+- 行数は上記の件数上限（①）とは別枠でチャンク数上限（④。
+  `batch_limits::validate_chunk_total`。1 行＝1 チャンク換算。既定は
+  `incremental::MAX_CHUNKS_PER_FILE`、環境変数 `VECTOR_DB_BATCH_MAX_CHUNKS` で
+  上書き可能）でも判定され、超過は同じく `54000`
 
 検証コード: `crates/wire-server/tests/nosql2_search.rs`・
 `nosql2_search_binding.rs`・`nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`・
