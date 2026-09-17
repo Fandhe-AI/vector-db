@@ -11,6 +11,10 @@
 //! `scan::bind_request`／`execute` → `EngineCore::
 //! execute_bound_scan_in_session`）越しに成立することを wire フレーミング
 //! 込みで再確認する（`wire_scan.rs` の SQL wire 版と対になる）。
+//!
+//! `wire_scan.rs` の seed に対する pg wire ↔ NoSQL 2 表層の行集合パリティ
+//! （順序保証なし・早期終了・RLS 暗黙適用）は `nosql3_scan_wire_parity.rs`
+//! （Issue #767）が別途固定する。本ファイルはそれを再検証しない。
 
 #[path = "common/mod.rs"]
 mod common;
