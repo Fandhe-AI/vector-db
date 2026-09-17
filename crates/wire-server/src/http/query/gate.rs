@@ -31,11 +31,12 @@
 //!    handle`]（TASK-186・NOSQL-3・Issue #766）、`(Op::Aggregate,
 //!    Some(engine))` は [`super::aggregate::handle`]（Issue #768・
 //!    TASK-177・NOSQL-4）、`explain` なしの `(Op::Search, Some(engine))` は
-//!    [`super::search::handle`]（TASK-186・NOSQL-2・Issue #764）へ
-//!    それぞれ束縛・実行を委譲する。それ以外（`Op::Insert`、および
-//!    `engine` 未接続時の `Op::Scan`／`Op::Aggregate`／`Op::Search`）は
-//!    暫定の `0A000`／501（[`PLACEHOLDER_MESSAGE`]）を返す（束縛・実行の
-//!    結線は #771 が本 seam を置き換える）
+//!    [`super::search::handle`]（TASK-186・NOSQL-2・Issue #764）、
+//!    `(Op::Insert, Some(engine))` は [`super::insert::handle`]（Issue
+//!    #772・TASK-178・NOSQL-6）へそれぞれ束縛・実行を委譲する。`engine`
+//!    未接続時の `Op::Scan`／`Op::Aggregate`／`Op::Insert`／`Op::Search` は
+//!    暫定の `0A000`／501（[`PLACEHOLDER_MESSAGE`]）を返す（4 op すべてが
+//!    実行結線済みのため、この応答は `engine` 未接続時にのみ到達する）
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
 //! `op` にスキーマ検証由来の情報（未知キー等）が先に返ることはない
@@ -52,18 +53,18 @@ use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::parse_json;
 
 use crate::http::query::op::{classify_op, Op};
-use crate::http::query::scan;
 use crate::http::query::schema::Validated;
+use crate::http::query::{insert, scan};
 use crate::http::session::middleware::{self, SessionPrincipal};
 use crate::http::{body, response};
 
 pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 
-/// 検証を通過したが実行結線が未接続（`op` が `scan`／`aggregate`／`search`
-/// （`explain: true` の `search` を含む）以外、または該当 op でも `engine`
-/// 未接続）の要求に返す暫定応答の文言（`Op::Insert` の結線は #771 の担当。
-/// 本 Issue 時点は `scan`・`aggregate`・`search`（`explain` 判定を含む）の
-/// 3 op のみ seam を置き換え済み）。
+/// 検証を通過したが実行結線が未接続（`engine` 未接続）の要求に返す暫定応答
+/// の文言。`scan`・`aggregate`・`insert`・`search`（`explain: true` の
+/// `search` を含む）の 4 op すべてが実行結線済み（Issue #766・#768・
+/// #772・#764・#765）のため、この応答は `Router::new` 経由（`engine`
+/// 未接続）の場合にのみ到達する。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
 
 /// `POST /v1/query` を処理し応答バイト列を返す（認証済み要求のみ）。
@@ -111,8 +112,9 @@ pub fn handle(
     };
 
     // 手順 5: op と engine 接続有無の組でディスパッチする（Issue #766・
-    // #768）。各アームは対応するモジュールへの 1 行委譲に留め、後続 Issue
-    // （#763・#771）が並行して追加する他 op アームとの衝突面を小さくする。
+    // #768・#772・#764）。各アームは対応するモジュールへの 1 行委譲に留め、
+    // 4 op すべてが実行結線済みのため `(_, _)` は `engine` 未接続時にのみ
+    // 到達する。
     match (op, engine) {
         // `explain: true` は通常の `search` 実行（#764 が結線する
         // `(Op::Search, Some(engine)) => search::handle(...)` 相当）より
@@ -126,6 +128,7 @@ pub fn handle(
         (Op::Aggregate, Some(engine)) => {
             super::aggregate::handle(engine, principal, &validated, now_wall)
         }
+        (Op::Insert, Some(engine)) => insert::handle(engine, principal, &validated, now_wall),
         (Op::Search, Some(engine)) => {
             super::search::handle(engine, principal, &validated, now_wall)
         }
@@ -305,6 +308,42 @@ mod tests {
         let response = run(body, &[]);
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
+    }
+
+    #[test]
+    fn valid_insert_is_dispatched_to_the_engine_and_reports_undefined_table() {
+        // `insert` は Issue #772 で実行結線済みのため、`engine` 接続済み
+        // であれば `scan`／`aggregate` と同様もう暫定 placeholder
+        // （`0A000`／501）を返さない。存在しないテーブルへの `insert` が
+        // `42P01`／404（SQL 経路と同一分類）になることで、「認証 → op
+        // 許可リスト → スキーマ検証 → engine 呼び出し」がすべて走った
+        // ことを非 vacuous に確認する（`valid_scan_is_dispatched_to_...`
+        // と同型）。
+        let (core, _guard) = empty_core();
+        let body = br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[1,0,0]}],"operation_id":"op-gate-1"}"#;
+        let response = run_with_engine(&core, body, &[]);
+        let text = String::from_utf8(response).expect("utf-8 response");
+        assert!(text.starts_with("HTTP/1.1 404 "), "got: {text}");
+        assert!(text.contains("42P01"), "got: {text}");
+        assert!(!text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+    }
+
+    #[test]
+    fn valid_search_is_dispatched_to_the_engine_and_reports_undefined_table() {
+        // `search` は TASK-186・NOSQL-2（Issue #764）で実行結線済みのため、
+        // `engine` 接続済みであれば `scan`／`aggregate`／`insert` と同様もう
+        // 暫定 placeholder（`0A000`／501）を返さない。存在しないテーブルへの
+        // `search` が `42P01`／404（SQL 経路と同一分類）になることで、
+        // 「認証 → op 許可リスト → スキーマ検証 → engine 呼び出し」が
+        // すべて走ったことを非 vacuous に確認する
+        // （`valid_scan_is_dispatched_to_...` と同型）。
+        let (core, _guard) = empty_core();
+        let body = br#"{"op":"search","table":"docs","limit":1}"#;
+        let response = run_with_engine(&core, body, &[]);
+        let text = String::from_utf8(response).expect("utf-8 response");
+        assert!(text.starts_with("HTTP/1.1 404 "), "got: {text}");
+        assert!(text.contains("42P01"), "got: {text}");
+        assert!(!text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
     }
 
     #[test]

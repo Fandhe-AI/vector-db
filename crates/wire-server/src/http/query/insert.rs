@@ -28,8 +28,21 @@
 //! （[`super::ident::check_identifier`]）を engine へ渡す前に適用する（`42601`。
 //! Cursor Bugbot 指摘・PR #823）。
 //!
-//! 対象外: `gate.rs` の placeholder 置換・`Router` への `EngineCore` 注入・成功応答
-//! JSON（`{"inserted", "operation_id"}`）への写像（後続 Issue の担当）。
+//! [`execute`] は成功時 [`InsertSuccess`] を返し、[`handle`] が
+//! [`encode_success_body`]（`{"inserted":<n>,"operation_id":"<escaped>"}`。
+//! キー順固定・空白なしのコンパクト形）を経由して `gate.rs` の `Op::Insert`
+//! アームへディスパッチ可能な応答バイト列へ写像する（Issue #772・TASK-178。
+//! `scan::handle`／`aggregate::handle` と同一シグネチャ形）。`operation_id` は
+//! クライアント要求から検証済みの値をそのまま echo するため
+//! [`crate::http::error_body::escape_json_string_into`] を通し（`"`／`\` の
+//! 混入がありうる。制御文字は `OperationId::parse` が既に拒否済みだが
+//! 多層防御として統一する）、`InsertOutcome::incremental` は行形では常に
+//! `None`（ファイル形専用フィールド）のため成功本文へ含めない。
+//!
+//! 対象外: `EXPLAIN` フィールド（NOSQL-10・#765）・全契約の層 A テスト群
+//! （SQL 経由との seed 一致を含む・#773）。
+
+use std::fmt::Write as _;
 
 use engine::catalog::{ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -41,6 +54,8 @@ use engine::sql::allowlist::SqlSurfaceError;
 use engine::sql::exec::InsertOutcome;
 use engine::sql::parser::BoundInsert;
 
+use crate::http::error_body::escape_json_string_into;
+use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
 
 use super::ident::{self, InvalidIdentifier};
@@ -276,6 +291,42 @@ pub fn bind_rows(
     Ok(bounds)
 }
 
+/// `insert` op 成功時の応答材料（[`encode_success_body`] の唯一の情報源）。
+/// `operation_id` は `execute` 内で 1 回だけ `OperationId::parse` した値を
+/// そのまま持ち回る（`validated` から `handle` が再抽出する二重パースは
+/// 行わない。情報源を単一に保つ設計判断）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertSuccess {
+    /// [`InsertOutcome::rows_affected`]（書き込んだ行数）。
+    pub inserted: u64,
+    /// 要求で検証済みの `operation_id`。
+    pub operation_id: OperationId,
+}
+
+/// [`InsertSuccess`] を成功応答本文（JSON）へ写像する（infallible）。
+///
+/// 出力形 `{"inserted":<n>,"operation_id":"<escaped>"}`。キー順固定・空白
+/// なし・0x20 未満のバイトを含まない（[`crate::http::error_body::encode`]・
+/// `super::response::encode` と同じ不変条件。`Content-Length` 算出対象を
+/// 安定させるため）。`operation_id` は [`escape_json_string_into`] を通す
+/// （`"`／`\` の混入がありうるため。`OperationId::parse` は制御文字を既に
+/// 拒否済みだが多層防御として統一する）。`InsertOutcome::incremental` は
+/// 行形では常に `None`（ファイル形専用）のため本文へは含めない。
+pub fn encode_success_body(success: &InsertSuccess) -> String {
+    // 固定オーバーヘッド + `operation_id`（≤ 256 バイト。`OperationId::parse`
+    // が検証済み）+ u64 の最大桁数の概算のみを事前確保する（`inserted` の
+    // 具体的な桁数は `write!` が可変長で埋める）。
+    let mut out = String::with_capacity(success.operation_id.as_str().len() + 64);
+    out.push_str("{\"inserted\":");
+    // `u64` の `Display` 実装は infallible（`write!` への `String` 追記も
+    // アロケーション失敗以外で失敗しない）ため戻り値は捨ててよい。
+    let _ = write!(out, "{}", success.inserted);
+    out.push_str(",\"operation_id\":\"");
+    escape_json_string_into(&mut out, success.operation_id.as_str());
+    out.push_str("\"}");
+    out
+}
+
 /// `POST /v1/query` の `insert` op を実行する。`validated` は
 /// [`super::schema::ObjectSchema::validate`]（`super::schema::INSERT_SCHEMA` に対する呼び出し）
 /// を通過済みの JSON オブジェクト。
@@ -287,7 +338,7 @@ pub fn execute(
     core: &EngineCore,
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
-) -> Result<InsertOutcome, InsertError> {
+) -> Result<InsertSuccess, InsertError> {
     let table = validated
         .required_str("table")
         .map_err(InsertError::Shape)?;
@@ -301,27 +352,61 @@ pub fn execute(
         .unwrap_or("");
     let operation_id = OperationId::parse(operation_id_raw).map_err(InsertError::Exec)?;
 
-    core.execute_bound_insert_in_session(
-        principal.policy_context(),
-        table,
-        rows.len(),
-        Some(&operation_id),
-        |schema| {
-            bind_rows(rows, table, Some(&operation_id), schema).map_err(|e| match e {
-                InsertError::Bind(err) | InsertError::Exec(err) => err,
-                // `bind_rows` は `InsertError::Shape`／`InsertError::InvalidIdentifier`
-                // を構築しない（前者は `schema.rs` の意味的検証、後者は本関数冒頭の
-                // `ident::check_identifier` がそれぞれ独立に検査する）。到達不能だが
-                // `SqlSurfaceError` へ丸めて fail-closed のまま `match` を網羅する。
-                InsertError::Shape(_) | InsertError::InvalidIdentifier => {
-                    SqlSurfaceError::Internal {
-                        detail: "unexpected shape error during INSERT row binding".to_string(),
+    let outcome: InsertOutcome = core
+        .execute_bound_insert_in_session(
+            principal.policy_context(),
+            table,
+            rows.len(),
+            Some(&operation_id),
+            |schema| {
+                bind_rows(rows, table, Some(&operation_id), schema).map_err(|e| match e {
+                    InsertError::Bind(err) | InsertError::Exec(err) => err,
+                    // `bind_rows` は `InsertError::Shape`／`InsertError::InvalidIdentifier`
+                    // を構築しない（前者は `schema.rs` の意味的検証、後者は本関数冒頭の
+                    // `ident::check_identifier` がそれぞれ独立に検査する）。到達不能だが
+                    // `SqlSurfaceError` へ丸めて fail-closed のまま `match` を網羅する。
+                    InsertError::Shape(_) | InsertError::InvalidIdentifier => {
+                        SqlSurfaceError::Internal {
+                            detail: "unexpected shape error during INSERT row binding".to_string(),
+                        }
                     }
-                }
-            })
-        },
-    )
-    .map_err(InsertError::Exec)
+                })
+            },
+        )
+        .map_err(InsertError::Exec)?;
+
+    // Issue #829（テスト専用・feature `fault-injection` 限定）: この直前の
+    // `execute_bound_insert_in_session` が commit まで成功した直後（＝
+    // `crate::http::conn::build_outcome` の `ResponseBoundaryGuard` が
+    // 保護している区間の内側）にだけ検査する。これより後ろへ移動すると
+    // 呼び出し元（`handle`）の応答整形（`encode_success_body`）まで通過して
+    // しまい「commit 成功後の panic」を再現できなくなる。feature 無効時は
+    // この呼び出しごとコンパイルされず、既定ビルドの挙動・コード生成は
+    // 完全に不変（`crate::simple_query` の同型コメント参照）。
+    #[cfg(feature = "fault-injection")]
+    crate::fault_injection::maybe_panic_after_http_insert_commit();
+
+    Ok(InsertSuccess {
+        inserted: outcome.rows_affected,
+        operation_id,
+    })
+}
+
+/// `POST /v1/query` の `insert` op を処理し応答バイト列を返す
+/// （`gate.rs` 手順 5 から `engine` 接続済み時のみ呼ばれる。`scan::handle`／
+/// `aggregate::handle` と同一シグネチャ形）。成功時は [`encode_success_body`]
+/// を `200` で、失敗時は [`InsertError`] の分類を `http_response::encode_error`
+/// でそれぞれ応答へ写像する。
+pub fn handle(
+    core: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+    now_wall: std::time::SystemTime,
+) -> Vec<u8> {
+    match execute(core, principal, validated) {
+        Ok(success) => http_response::encode_ok(&encode_success_body(&success), now_wall),
+        Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
+    }
 }
 
 #[cfg(test)]
@@ -513,6 +598,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn encode_success_body_is_compact_with_fixed_key_order() {
+        let success = InsertSuccess {
+            inserted: 2,
+            operation_id: OperationId::parse("op-1").expect("valid operation_id"),
+        };
+        assert_eq!(
+            encode_success_body(&success),
+            r#"{"inserted":2,"operation_id":"op-1"}"#
+        );
+    }
+
+    #[test]
+    fn encode_success_body_escapes_quotes_and_backslashes_in_operation_id() {
+        let success = InsertSuccess {
+            inserted: 1,
+            operation_id: OperationId::parse("a\"b\\c").expect("valid operation_id"),
+        };
+        assert_eq!(
+            encode_success_body(&success),
+            r#"{"inserted":1,"operation_id":"a\"b\\c"}"#
+        );
+    }
+
     fn open_core() -> (EngineCore, std::path::PathBuf) {
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
@@ -563,8 +672,63 @@ mod tests {
             .validate(&value)
             .expect("schema ok");
 
-        let outcome = execute(&core, &principal, &validated).expect("insert ok");
-        assert_eq!(outcome.rows_affected, 1);
+        let success = execute(&core, &principal, &validated).expect("insert ok");
+        assert_eq!(success.inserted, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn execute_returns_operation_id_that_was_validated() {
+        let (core, path) = open_core();
+        let principal = principal("tenant-a");
+        let body = r#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[1,0,0,0],"lang":"ja"}],"operation_id":"op-echo"}"#;
+        let value = parse_json(body).expect("valid json");
+        let validated = super::super::schema::INSERT_SCHEMA
+            .validate(&value)
+            .expect("schema ok");
+
+        let success = execute(&core, &principal, &validated).expect("insert ok");
+        assert_eq!(success.operation_id.as_str(), "op-echo");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handle_returns_200_with_success_body() {
+        let (core, path) = open_core();
+        let principal = principal("tenant-a");
+        let body = r#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[1,0,0,0],"lang":"ja"}],"operation_id":"op-handle"}"#;
+        let value = parse_json(body).expect("valid json");
+        let validated = super::super::schema::INSERT_SCHEMA
+            .validate(&value)
+            .expect("schema ok");
+
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(0);
+        let response = handle(&core, &principal, &validated, now);
+        let text = String::from_utf8(response).expect("utf-8 response");
+        assert!(text.starts_with("HTTP/1.1 200 "), "got: {text}");
+        assert!(
+            text.ends_with(r#"{"inserted":1,"operation_id":"op-handle"}"#),
+            "got: {text}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handle_maps_engine_error_to_error_response() {
+        let (core, path) = open_core();
+        let principal = principal("tenant-a");
+        let body =
+            r#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[1,0,0,0],"lang":"ja"}]}"#;
+        let value = parse_json(body).expect("valid json");
+        let validated = super::super::schema::INSERT_SCHEMA
+            .validate(&value)
+            .expect("schema ok");
+
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(0);
+        let response = handle(&core, &principal, &validated, now);
+        let text = String::from_utf8(response).expect("utf-8 response");
+        assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
+        assert!(text.contains("23502"), "got: {text}");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -683,8 +847,8 @@ mod tests {
             .validate(&value)
             .expect("schema ok");
 
-        let outcome = execute(&core, &principal, &validated).expect("insert ok");
-        assert_eq!(outcome.rows_affected, 2);
+        let success = execute(&core, &principal, &validated).expect("insert ok");
+        assert_eq!(success.inserted, 2);
         let _ = std::fs::remove_file(&path);
     }
 
