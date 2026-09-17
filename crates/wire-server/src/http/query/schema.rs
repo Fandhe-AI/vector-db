@@ -285,6 +285,30 @@ impl<'a> Validated<'a> {
         }
     }
 
+    /// `required_number` の結果を `u32` として再検査する（Issue #763・#766・
+    /// TASK-175）。SQL 表層の `LIMIT` 許可リスト検査（`sql::allowlist`）が
+    /// `LIMIT 1.5`／`LIMIT -1`／`u32` 超過をいずれも構文段階の `42601` で
+    /// 拒否するのと対応させ、NoSQL 表層でも同じ 3 条件（整数値・非負・
+    /// `u32::MAX` 以下）を JSON 数値から `u32` へ変換する時点で検査する
+    /// （範囲検証そのものは呼び出し元が
+    /// `engine::sql::parser::validate_search_limit` 等へ委譲する）。
+    pub fn required_u32(&self, key: &'static str) -> Result<u32, SchemaError> {
+        self.optional_u32(key)?
+            .ok_or(SchemaError::MissingRequired { key })
+    }
+
+    pub fn optional_u32(&self, key: &'static str) -> Result<Option<u32>, SchemaError> {
+        let Some(raw) = self.optional_number(key)? else {
+            return Ok(None);
+        };
+        if !raw.is_finite() || raw.fract() != 0.0 || raw < 0.0 || raw > f64::from(u32::MAX) {
+            return Err(SchemaError::TypeMismatch { key });
+        }
+        // 直上の範囲検査（`0.0..=f64::from(u32::MAX)`・整数値）により
+        // `raw as u32` は必ず可逆な変換になる。
+        Ok(Some(raw as u32))
+    }
+
     pub fn required_bool(&self, key: &'static str) -> Result<bool, SchemaError> {
         self.optional_bool(key)?
             .ok_or(SchemaError::MissingRequired { key })
@@ -1142,6 +1166,77 @@ mod tests {
         assert_eq!(
             hybrid.get("text"),
             Some(&JsonValue::String("x".to_string()))
+        );
+    }
+
+    // --- required_u32 / optional_u32（Issue #763・#766・TASK-175） ------------
+
+    #[test]
+    fn optional_u32_accepts_zero_and_u32_max() {
+        let v = obj(r#"{"op":"search","table":"docs","limit":0}"#);
+        let validated = SEARCH_SCHEMA.validate(&v).unwrap();
+        assert_eq!(validated.required_u32("limit").unwrap(), 0);
+
+        let v2 = obj(&format!(
+            r#"{{"op":"search","table":"docs","limit":{}}}"#,
+            u32::MAX
+        ));
+        let validated2 = SEARCH_SCHEMA.validate(&v2).unwrap();
+        assert_eq!(validated2.required_u32("limit").unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn optional_u32_rejects_fractional_value() {
+        let v = obj(r#"{"op":"search","table":"docs","limit":1.5}"#);
+        let validated = SEARCH_SCHEMA.validate(&v).unwrap();
+        assert_eq!(
+            validated.required_u32("limit").unwrap_err(),
+            SchemaError::TypeMismatch { key: "limit" }
+        );
+    }
+
+    #[test]
+    fn optional_u32_rejects_negative_value() {
+        let v = obj(r#"{"op":"search","table":"docs","limit":-1}"#);
+        let validated = SEARCH_SCHEMA.validate(&v).unwrap();
+        assert_eq!(
+            validated.required_u32("limit").unwrap_err(),
+            SchemaError::TypeMismatch { key: "limit" }
+        );
+    }
+
+    #[test]
+    fn optional_u32_rejects_value_exceeding_u32_max() {
+        let v = obj(&format!(
+            r#"{{"op":"search","table":"docs","limit":{}}}"#,
+            u64::from(u32::MAX) + 1
+        ));
+        let validated = SEARCH_SCHEMA.validate(&v).unwrap();
+        assert_eq!(
+            validated.required_u32("limit").unwrap_err(),
+            SchemaError::TypeMismatch { key: "limit" }
+        );
+    }
+
+    #[test]
+    fn optional_u32_rejects_non_number_field() {
+        let v = obj(r#"{"op":"search","table":"docs","limit":10}"#);
+        let validated = SEARCH_SCHEMA.validate(&v).unwrap();
+        // `explain` はスキーマ上 Bool なので Number 用アクセサでは取得しない
+        // （`optional_u32` は非該当型のキーで `TypeMismatch` を返す）。
+        assert_eq!(
+            validated.optional_u32("explain").unwrap_err(),
+            SchemaError::TypeMismatch { key: "explain" }
+        );
+    }
+
+    #[test]
+    fn required_u32_reports_unknown_key_for_schema_foreign_key() {
+        let v = obj(r#"{"op":"search","table":"docs","limit":10}"#);
+        let validated = SEARCH_SCHEMA.validate(&v).unwrap();
+        assert_eq!(
+            validated.required_u32("nonexistent_field_placeholder"),
+            Err(SchemaError::UnknownKey)
         );
     }
 

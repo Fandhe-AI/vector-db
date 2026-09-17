@@ -23,7 +23,15 @@
 //! 行い、`op: aggregate` かつ `engine` 接続済みの場合は [`aggregate::handle`]
 //! （Issue #768）へ、それ以外は暫定の `0A000`／501 応答を返す
 //! （Issue #754・#759。`search`／`scan`／`insert` の結線は #763 以降が
-//! 本 seam を置き換える）。[`insert`] は `insert` op を
+//! 本 seam を置き換える）。
+//! [`search`] は `op: search` の JSON クエリオブジェクトを SQL 表層の
+//! `bind_in_session` と同一形の `engine::sql::parser::BoundStatement` へ
+//! 束縛する（Issue #763・TASK-175・NOSQL-2。`vector`／`plan` 排他・
+//! `hybrid`／`mode`／`columns` の意味論は SQL 表層の既存公開関数へ委譲する）。
+//! `plan` 指定は LLM 展開が engine 内部 I/O を要するため束縛済み部品のみの
+//! 中間形 `PlanSearch` に留め、`BoundStatement` までの完成・実行結線・
+//! `gate.rs` の暫定応答（`PLACEHOLDER_MESSAGE`）置換は #764 の担当。
+//! [`insert`] は `insert` op を
 //! `engine::sql::exec::execute_insert_batch`／
 //! `EngineCore::execute_bound_insert_in_session` へ写像する
 //! （Issue #771・TASK-178・NOSQL-6。`gate.rs` への結線は対象外・別 Issue の担当）。
@@ -36,3 +44,4 @@ pub mod insert;
 pub mod op;
 pub mod response;
 pub mod schema;
+pub mod search;
