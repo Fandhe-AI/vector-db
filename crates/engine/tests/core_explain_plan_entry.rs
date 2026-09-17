@@ -511,6 +511,52 @@ fn explain_entry_rejects_table_missing_dictionary_columns() {
     assert_eq!(err.wire_code(), "22000");
 }
 
+/// `plan` 欠落（binder closure が `42601` 系エラーを返す状況）は、辞書必須列
+/// （`path`/`body`）を欠くテーブルに対しても `22000`（辞書必須列検証）より
+/// 優先される（codex-review P1 指摘対応・PR #828。`run_explain_plan` が
+/// 辞書必須列検証を `bind` 呼び出しより先に行うと、`crates/wire-server/src/
+/// http/query/explain.rs::execute` の binder closure（`question.ok_or(..)?`）
+/// が返す `plan` 欠落エラーより先に `22000` が確定してしまう回帰。通常検索
+/// （`search::bind_search` の `VectorAndPlanBothMissing`＝`42601`）と同じ
+/// `wire_code` を、辞書必須列を欠くテーブルに対しても保証する）。
+#[test]
+fn explain_entry_prioritizes_binder_plan_missing_error_over_dictionary_columns() {
+    let path = unique_db_path("core-explain-plan-entry-plan-missing-no-dict");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    // `path`/`body` 列を欠くスキーマ（辞書必須列検証の対象）。
+    storage
+        .create_table(&TableSchema::new(
+            TABLE,
+            vec![ColumnDef::new("embedding", ColumnType::Vector(DIM), false)],
+        ))
+        .expect("create table");
+    drop(storage);
+
+    let core = EngineCore::open(&path)
+        .expect("open engine core")
+        .with_query_planner(Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE,
+        }));
+
+    // `wire-server::http::query::explain::execute` の binder closure が
+    // `plan` 欠落時に返す `ExplainRequiresPlan`（`42601`）を模した closure。
+    let result = core.explain_bound_plan_in_session(
+        &ctx("tenant-a"),
+        &SessionState::default(),
+        TABLE,
+        "", // `plan` 欠落（`explain::execute` のプレースホルダ空文字列と同型）
+        None,
+        |_schema, _udfs| -> Result<ExplainShape, SqlSurfaceError> {
+            Err(SqlSurfaceError::UnsupportedSyntax {
+                detail: "explain is only supported for search requests with \"plan\"".to_string(),
+            })
+        },
+    );
+    let err = result.expect_err("plan-missing binder error must win over dictionary column check");
+    assert_eq!(err.wire_code(), "42601");
+}
+
 #[test]
 fn explain_entry_does_not_leak_other_tenant_row_content() {
     let path = unique_db_path("core-explain-plan-entry-rls");

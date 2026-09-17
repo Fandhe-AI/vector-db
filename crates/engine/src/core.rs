@@ -2762,10 +2762,12 @@ impl EngineCore {
     /// Explain` アームと、束縛済み計画向けセッション対応エントリ
     /// [`Self::explain_bound_plan_in_session`]（TASK-186・NOSQL-10・
     /// Issue #765）が共有する実行本体。fail-closed の手順順序（テーブル
-    /// 世代の事前記録 → 辞書必須列検証 → 束縛検証（LLM I/O より前）→
-    /// LLM クエリ展開・モード解決 → 世代の事後照合 → 辞書必須列の再検証 →
-    /// 使用エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN` 整形）はどちらの
-    /// 呼び出し元でもビット同一に保たれる（第 2 の実装を持たない）。
+    /// 世代の事前記録 → 束縛検証（`plan` 欠落判定を含む。LLM I/O より前）→
+    /// 辞書必須列検証 → LLM クエリ展開・モード解決 → 世代の事後照合 →
+    /// 辞書必須列の再検証 → 使用エンジン・ANN／SCALAR 静的判定 →
+    /// `QUERY PLAN` 整形。束縛検証を辞書必須列検証より先に行う順序は
+    /// codex-review P1 指摘対応・PR #828）はどちらの呼び出し元でも
+    /// ビット同一に保たれる（第 2 の実装を持たない）。
     /// 検索本体（`hnsw_state` の `lookup`／`prepare_*`・
     /// `SearchProvider::search`）はいずれの経路でも呼ばれない（`EXPLAIN`
     /// は検索を実行しない契約。[`crate::sql::explain`] モジュールドキュメント
@@ -2824,22 +2826,31 @@ impl EngineCore {
             drop(pre_check_txn);
             (schema, generation)
         };
+
+        // `VECTOR` 列の存在・投影列／`WHERE` 述語の事前束縛検証（`plan`
+        // 欠落判定を含む）を辞書必須列検証・LLM I/O（`plan_query_with_mode`）
+        // より前に完結させる（`Statement::Select` アームの `USING PLAN`
+        // 経路と同じ理由。加えて codex-review P1 指摘対応・PR #828:
+        // `bind`（[`crate::http::query::explain::execute`] の closure）が
+        // 返す `plan` 欠落エラー〔`42601`〕を辞書必須列検証〔`22000`〕より
+        // 先に確定させることで、`table` が存在し辞書必須列を欠くテーブルに
+        // 対して `plan` を省略した要求が、通常検索〔`search::bind_search`
+        // の `VectorAndPlanBothMissing`＝`42601`〕と同じ `wire_code` を
+        // 返す。`mode_literal` の解析（下記）より先にここで `bind` を呼ぶ
+        // ことで、既存テーブル・`plan` 欠落・`mode` 値不正が同時に揃う要求
+        // でも「`plan` 欠落（`42601`）が `mode` 値不正（`22000`）より優先
+        // される」順序——`vector`／`plan` の排他判定を `mode` 解析より先に
+        // 行う `search::bind_search`（`vector` 指定検索）と同一の優先順位
+        // ——を保つ）。
+        let explain_shape = bind(&pre_check_schema, session.udfs())?;
+
+        // 辞書必須列（`path`/`body`）の検証は `bind`（`plan` 欠落判定を含む）
+        // より後に行う（codex-review P1 指摘対応・PR #828。SQL `EXPLAIN`
+        // 経路〔`Statement::Explain` アーム〕は `question` が構文上必ず
+        // `Some` のため `bind` が `plan` 欠落で失敗することはなく、本順序
+        // 変更はその経路の挙動を変えない）。
         dictionary_required_columns(&pre_check_schema)
             .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
-
-        // `VECTOR` 列の存在・投影列／`WHERE` 述語の事前束縛検証を LLM I/O
-        // （`plan_query_with_mode`）より前に完結させる（`Statement::Select`
-        // アームの `USING PLAN` 経路と同じ理由）。`mode_literal` の解析
-        // （下記）より先にここで `bind` を呼ぶ（Cursor Bugbot 指摘対応・
-        // Issue #765。`bind`（[`crate::http::query::explain::execute`] の
-        // closure）は `plan` 欠落を [`crate::sql::allowlist::
-        // SqlSurfaceError`] 相当の `42601` 系エラーとして返すため、既存
-        // テーブル・`plan` 欠落・`mode` 値不正が同時に揃う要求で「`plan`
-        // 欠落（`42601`）が `mode` 値不正（`22000`）より優先される」
-        // 順序——`vector`／`plan` の排他判定を `mode` 解析より先に行う
-        // `search::bind_search`（`vector` 指定検索）と同一の優先順位——を
-        // 保つ）。
-        let explain_shape = bind(&pre_check_schema, session.udfs())?;
 
         // `mode_literal` の解析はテーブル解決（上記 `read_txn_with_schema`）
         // ・`bind`（上記）より後で行う（cursor[bot] Bugbot 指摘対応。上記

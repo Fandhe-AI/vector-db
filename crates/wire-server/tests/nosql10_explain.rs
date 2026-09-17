@@ -366,6 +366,26 @@ fn undefined_table_rejects_with_42p01_before_invalid_mode_with_explain_true() {
     assert_eq!(http_common::wire_code_of(&resp), "42P01", "resp={resp:?}");
 }
 
+/// 未知テーブル＋`mode` の**識別子形状**不正（先頭が ASCII 英字／`_` 以外）
+/// は `explain: true` 経路でも `42P01` が形状違反の `42601` より優先される
+/// （codex-review P1 指摘・PR #828。上の
+/// `undefined_table_rejects_with_42p01_before_invalid_mode_with_explain_true`
+/// が使う `"fuzzy"` は識別子として正しい形状のため語彙エラー（`SearchMode::
+/// parse_literal` 由来の `22000`）の優先順位しか固定できていなかった。本
+/// テストは `ident::check_identifier` 自身が拒否する形状（数字始まり）を
+/// 使い、`explain::execute` がテーブル解決より前に `mode` の識別子形状検査
+/// を行っていないことを固定する）。
+#[test]
+fn undefined_table_rejects_with_42p01_before_malformed_mode_shape_with_explain_true() {
+    let (core, _guard) = new_core();
+    let (addr, token) = spawn_alice_session(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"missing","plan":"find content","limit":1,
+        "mode":"1bad","explain":true}"#;
+    let resp = query(addr, &token, body);
+    assert_eq!(http_common::wire_code_of(&resp), "42P01", "resp={resp:?}");
+}
+
 /// 未知テーブル＋`plan` 欠落は `explain: true` 経路でも `42P01` が `plan`
 /// 欠落の `42601` より優先される（codex-review P1 指摘・PR #828。
 /// `explain::execute` が `plan` 欠落判定をテーブル解決前に行うと、未知

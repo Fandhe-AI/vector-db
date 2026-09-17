@@ -20,10 +20,13 @@
 //! （`sql::allowlist` が `ORDER BY` 形・集計・広域取得への `EXPLAIN` 前置を
 //! 拒否するのと同じ分類）。
 //!
-//! `table`／`plan`／`mode` の識別子形状・`USING PLAN` 質問文字列の長さ検証は
+//! `table` の識別子形状・`USING PLAN` 質問文字列の長さ検証は
 //! [`engine::core::EngineCore::explain_bound_plan_in_session`] を呼ぶより前に
-//! ここで一度行う（[`super::search::bind_search`] が LLM I/O より前の binder
-//! closure 内で同じ検証を再度行う二重検査は多層防御として許容する。
+//! ここで一度行う。`mode` の識別子形状・語彙検証はここでは一切行わず、
+//! テーブル解決後の binder closure（[`super::search::bind_search`]）へ委ねる
+//! （未知テーブル〔`42P01`〕・`plan` 欠落〔`42601`〕が `mode` 値不正
+//! 〔`22000`〕より優先される順序を、通常検索（[`super::search::execute`]）
+//! と揃えるため。codex-review P1 指摘対応・PR #828。
 //! `EngineCore::explain_bound_plan_in_session` のドキュメント参照）。
 //!
 //! RLS: `PolicyContext` は呼び出し元が渡す
@@ -139,22 +142,24 @@ impl ClassifiedError for ExplainError {
 /// 4. `limit` の型・範囲を [`validate_search_limit`] で検証する（`22000`。
 ///    SQL `EXPLAIN` 経路が `run_explain_plan` 呼び出し前に同じ検証を行うのと
 ///    同一の優先順位でテーブル解決より前に行う）。
-/// 5. `mode` は識別子形状検査のみここで行い、語彙検証（`SearchMode::
-///    parse_literal`）は生リテラルのまま
-///    [`engine::core::EngineCore::explain_bound_plan_in_session`] へ渡し、
-///    テーブル解決後に解析させる（未知テーブル〔`42P01`〕が `mode` 値不正
-///    〔`22000`〕より優先される順序を、SQL `EXPLAIN` 経路と同一に保つ）。
+/// 5. `mode` は識別子形状検査を含め一切ここでは検証しない（生リテラルの
+///    まま手順 6 へ渡す）。
 /// 6. [`engine::core::EngineCore::explain_bound_plan_in_session`] を呼ぶ
 ///    （`plan` 未指定の場合もプレースホルダの空文字列を渡して呼び出し自体は
 ///    行う。テーブル解決が先に走り、テーブルが存在すれば binder closure が
 ///    テーブル解決後に初めて `plan` 欠落を判定するため、未知テーブルの
-///    `42P01` が `plan` 欠落の `42601` より優先される。LLM I/O
-///    〔`plan_query_with_mode`〕は binder closure がエラーを返した時点で
-///    呼ばれないため、空文字列が実際に使われることはない）。binder closure
-///    は [`bind_search`] の完全な束縛結果から [`BoundSearch::Plan`] の
-///    フィルタのみを取り出す（`BoundSearch::Vector` への到達は手順 2 により
-///    構造上ないが、多層防御として [`ExplainError::ExplainRequiresPlan`]
-///    へ拒否する）。
+///    `42P01` が `plan` 欠落の `42601` より優先される。binder closure は
+///    [`bind_search`] の完全な束縛結果から [`BoundSearch::Plan`] のフィルタ
+///    のみを取り出す——`bind_search` 自身がテーブル解決後に初めて `mode`
+///    の識別子形状検査・語彙解析（`SearchMode::parse_literal`）の双方を
+///    行うため、未知テーブル（`42P01`）・`plan` 欠落（`42601`）のいずれも
+///    `mode` 値不正（`22000`）より優先される（`BoundSearch::Vector` への
+///    到達は手順 2 により構造上ないが、多層防御として [`ExplainError::
+///    ExplainRequiresPlan`] へ拒否する）。`run_explain_plan` はこの
+///    binder closure（`bind`）が返す `explain_shape` を得たあとに初めて
+///    `mode_literal` を独立に再解析して `SearchMode` へ変換するが、その
+///    時点では `bind_search` の検証を既に通過しているため、この再解析が
+///    未検証の生リテラルを直接処理することはない）。
 pub fn execute(
     core: &EngineCore,
     ctx: &PolicyContext,
@@ -178,18 +183,17 @@ pub fn execute(
     let limit_raw = validated.required_u32("limit")?;
     validate_search_limit(limit_raw)?;
 
-    // `mode` の語彙解析（`SearchMode::parse_literal`）はここでは行わない
-    // （Cursor Bugbot 指摘対応: `engine::core::EngineCore::
-    // explain_bound_plan_in_session`（`core.rs::run_explain_plan`）がテーブル
-    // 解決・binder closure（`plan` 欠落判定を含む）を終えた後で初めて解析
-    // することで、未知テーブル（`42P01`）・`plan` 欠落（`42601`）のいずれも
-    // `mode` 値不正（`22000`）より優先される fail-closed 順序を保つ
-    // （`run_explain_plan` が `mode_literal` を `bind` 呼び出しより後で解析
-    // する契約。identifier としての形状検査のみここで完結させる）。
+    // `mode` は識別子形状検査を含め一切ここでは検証しない（codex-review
+    // P1 指摘対応・PR #828）。ここで形状検査だけでも先に行うと、テーブル
+    // 未存在＋ `mode` 形状不正の要求で `42P01`（テーブル未存在）より先に
+    // `42601`（識別子形状違反）が確定してしまい、通常検索（`search::
+    // bind_search` は識別子形状検査もテーブル解決後の binder closure 内で
+    // 行う）と優先順位が食い違う。生リテラルのまま
+    // [`engine::core::EngineCore::explain_bound_plan_in_session`]
+    // （`core.rs::run_explain_plan`）へ渡し、テーブル解決・`bind` 呼び出し
+    // （`plan` 欠落判定を含む）を終えた後で初めて識別子形状検査・語彙解析
+    // （`SearchMode::parse_literal`）の双方を行わせる。
     let mode_literal = validated.optional_str("mode")?;
-    if let Some(literal) = mode_literal {
-        ident::check_identifier(literal)?;
-    }
 
     let session = SessionState::default();
     let result = core.explain_bound_plan_in_session(
