@@ -1,0 +1,516 @@
+//! `EngineCore::explain_bound_plan_in_session`（TASK-186・NOSQL-10。
+//! Issue #765）が、単一の `Storage` を `EngineCore` が所有したまま SQL
+//! テキストを経由せずに束縛済み `USING PLAN` 検索計画の `EXPLAIN` を実行
+//! できること、SQL 表層の `Statement::Explain` アーム（`tests/sql_explain.rs`）
+//! と行単位で完全一致すること、検索本体を実行しないこと、fail-closed に
+//! 拒否すべき入力を拒否することを固定する結合テスト。
+//!
+//! `tests/core_bound_plan_entry.rs`（scan／aggregate。Issue #728）・
+//! `tests/sql_insert_explain_public_api.rs`（insert／explain 公開 API の
+//! 到達性。Issue #730）と同じ流儀で、`Storage` を `EngineCore::from_storage`
+//! （または `from_storage_with_engine`）へそのまま渡して単一 `Storage`
+//! 構成を保つ。決定的スタブ `LlmClient` を使い、実 Ollama への疎通は対象外
+//! （`tests/sql_explain.rs::StubLlmClient` と同型）。
+
+use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::core::EngineCore;
+use engine::declarative_filter::{self, DeclarativeFilter};
+use engine::kernel::CpuScalarProvider;
+use engine::policy::PolicyContext;
+use engine::query_planner::{LlmClient, PlanError};
+use engine::recovery::required_op_id::OperationId;
+use engine::row_codec::Value;
+use engine::search_engine;
+use engine::sql::allowlist::SqlSurfaceError;
+use engine::sql::exec::{Cell, ColumnMeta};
+use engine::sql::explain::ExplainShape;
+use engine::sql::mode::SessionState;
+use engine::sql::SqlOutcome;
+use engine::storage::{Storage, Visibility};
+
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
+
+const TABLE: &str = "docs";
+const DIM: u32 = 4;
+
+fn schema() -> TableSchema {
+    TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+            ColumnDef::new("lang", ColumnType::Text, false),
+            ColumnDef::new("path", ColumnType::Text, false),
+            ColumnDef::new("body", ColumnType::Text, false),
+        ],
+    )
+}
+
+fn ctx(tenant: &str) -> PolicyContext {
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant ctx")
+}
+
+/// tenant-a に `lang="ja"` の可視行を 1 件投入した `Storage` を返す。
+fn seeded_storage(path: &std::path::Path) -> Storage {
+    let storage = Storage::open(path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let op_id = OperationId::parse("explain-plan-entry-op-1").expect("valid operation_id");
+    engine::tenant::insert_typed_row(
+        &storage,
+        TABLE,
+        &ctx("tenant-a"),
+        1,
+        Visibility::Public,
+        &[
+            Value::Vector(vec![0.1, 0.2, 0.3, 0.4]),
+            Value::Text("ja".to_string()),
+            Value::Text("docs/a.md".to_string()),
+            Value::Text("alpha content in english".to_string()),
+        ],
+        &op_id,
+    )
+    .expect("insert tenant-a row");
+    storage
+}
+
+/// tenant-b 専用の可視行（`docs/b-secret.md`）を追加で投入する（RLS 非漏えい
+/// 確認用）。
+fn seed_tenant_b_row(storage: &Storage) {
+    let op_id = OperationId::parse("explain-plan-entry-op-101").expect("valid operation_id");
+    engine::tenant::insert_typed_row(
+        storage,
+        TABLE,
+        &ctx("tenant-b"),
+        101,
+        Visibility::Private,
+        &[
+            Value::Vector(vec![1.0, 0.0, 0.0, 0.0]),
+            Value::Text("xx".to_string()),
+            Value::Text("docs/b-secret.md".to_string()),
+            Value::Text("tenant-b only content".to_string()),
+        ],
+        &op_id,
+    )
+    .expect("insert tenant-b row");
+}
+
+/// `sql_explain.rs::StubLlmClient` と同型の決定的スタブ。
+struct StubLlmClient {
+    response: &'static str,
+}
+
+impl LlmClient for StubLlmClient {
+    fn complete(&self, _prompt: &str) -> Result<String, PlanError> {
+        Ok(self.response.to_string())
+    }
+}
+
+/// 呼び出し回数を記録するスタブ（`sql_explain.rs::CountingLlmClient` と同構成）。
+/// 束縛失敗が LLM 呼び出しより前に完結することを直接確認するために使う。
+struct CountingLlmClient {
+    response: &'static str,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingLlmClient {
+    fn new(response: &'static str) -> Self {
+        Self {
+            response,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl LlmClient for CountingLlmClient {
+    fn complete(&self, _prompt: &str) -> Result<String, PlanError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.response.to_string())
+    }
+}
+
+const EXPANSION_RESPONSE: &str =
+    r#"{"search_terms": ["alpha", "beta"], "path_hint": "docs/", "kind_hint": "fn"}"#;
+const EXPANSION_RESPONSE_NO_HINTS: &str =
+    r#"{"search_terms": [], "path_hint": null, "kind_hint": null}"#;
+
+fn explain_result_lines(outcome: SqlOutcome) -> Vec<String> {
+    match outcome {
+        SqlOutcome::Explain(result) => {
+            assert_eq!(result.columns.len(), 1);
+            assert_eq!(
+                result.columns[0],
+                ColumnMeta::Computed {
+                    name: "QUERY PLAN".to_string()
+                }
+            );
+            result
+                .rows
+                .iter()
+                .map(|row| match &row.cells[0] {
+                    Cell::Text(s) => s.clone(),
+                    other => panic!("expected Cell::Text, got {other:?}"),
+                })
+                .collect()
+        }
+        other => panic!("expected SqlOutcome::Explain, got {other:?}"),
+    }
+}
+
+/// 新エントリの結果を SQL `EXPLAIN` と同じ `Vec<String>` 形へ揃える。
+fn explain_entry_lines(
+    result: Result<engine::sql::exec::QueryResult, SqlSurfaceError>,
+) -> Vec<String> {
+    let result = result.expect("explain_bound_plan_in_session should succeed");
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(
+        result.columns[0],
+        ColumnMeta::Computed {
+            name: "QUERY PLAN".to_string()
+        }
+    );
+    result
+        .rows
+        .iter()
+        .map(|row| match &row.cells[0] {
+            Cell::Text(s) => s.clone(),
+            other => panic!("expected Cell::Text, got {other:?}"),
+        })
+        .collect()
+}
+
+/// フィルタなしの binder closure（`ExplainShape::from_filters(&[], &[])`）。
+fn no_filter_bind(
+    _schema: &engine::catalog::TableSchema,
+    _udfs: &engine::sql::udf_call::UdfRegistry,
+) -> Result<ExplainShape, SqlSurfaceError> {
+    Ok(ExplainShape::from_filters(&[], &[]))
+}
+
+#[test]
+fn explain_entry_matches_sql_explain_rows_without_filter() {
+    let path = unique_db_path("core-explain-plan-entry-no-filter");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    drop(storage);
+
+    let core = EngineCore::open(&path)
+        .expect("open engine core")
+        .with_query_planner(Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE,
+        }));
+    assert_eq!(
+        core.search_engine_kind(),
+        Some(search_engine::SearchEngineKind::ParallelBruteForce)
+    );
+
+    let tenant_ctx = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let sql_outcome = core
+        .execute_sql_in_session(
+            &tenant_ctx,
+            &mut session,
+            "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 5",
+        )
+        .expect("EXPLAIN should succeed");
+    let sql_lines = explain_result_lines(sql_outcome);
+
+    let entry_result = core.explain_bound_plan_in_session(
+        &tenant_ctx,
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        None,
+        no_filter_bind,
+    );
+    let entry_lines = explain_entry_lines(entry_result);
+
+    assert_eq!(
+        sql_lines, entry_lines,
+        "SQL EXPLAIN と行単位で完全一致すること"
+    );
+    assert_eq!(sql_lines.len(), 9);
+    assert!(sql_lines.contains(&"engine: parallel_brute_force".to_string()));
+    assert!(sql_lines.contains(&"ann_plan: plain_scan_engine".to_string()));
+    assert!(sql_lines.contains(&"scalar_plan: plain_scan".to_string()));
+}
+
+#[test]
+fn explain_entry_matches_sql_explain_rows_with_equality_filter() {
+    let path = unique_db_path("core-explain-plan-entry-filter");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    drop(storage);
+
+    let core = EngineCore::open(&path)
+        .expect("open engine core")
+        .with_query_planner(Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE_NO_HINTS,
+        }));
+
+    let tenant_ctx = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let sql_outcome = core
+        .execute_sql_in_session(
+            &tenant_ctx,
+            &mut session,
+            "EXPLAIN SELECT id FROM docs WHERE lang = 'ja' USING PLAN('find content') LIMIT 5",
+        )
+        .expect("EXPLAIN should succeed");
+    let sql_lines = explain_result_lines(sql_outcome);
+
+    let entry_result = core.explain_bound_plan_in_session(
+        &tenant_ctx,
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        None,
+        |schema, _udfs| {
+            let filters =
+                declarative_filter::bind_all(&[DeclarativeFilter::equals("lang", "ja")], schema)?;
+            Ok(ExplainShape::from_filters(&filters, &[]))
+        },
+    );
+    let entry_lines = explain_entry_lines(entry_result);
+
+    assert_eq!(sql_lines, entry_lines);
+    assert!(sql_lines.contains(&"scalar_plan: index_equality".to_string()));
+}
+
+#[test]
+fn explain_entry_reports_hnsw_params_and_does_not_touch_hnsw_index_cache() {
+    let path = unique_db_path("core-explain-plan-entry-hnsw");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core = EngineCore::from_storage_with_engine(storage, kind).with_query_planner(Box::new(
+        StubLlmClient {
+            response: EXPANSION_RESPONSE_NO_HINTS,
+        },
+    ));
+
+    let tenant_ctx = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let sql_outcome = core
+        .execute_sql_in_session(
+            &tenant_ctx,
+            &mut session,
+            "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 5",
+        )
+        .expect("EXPLAIN should succeed");
+    let sql_lines = explain_result_lines(sql_outcome);
+    assert!(sql_lines.iter().any(|l| l.starts_with("hnsw_params:")));
+
+    let stats_before = core.hnsw_index_cache_stats();
+    let entry_result = core.explain_bound_plan_in_session(
+        &tenant_ctx,
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        None,
+        no_filter_bind,
+    );
+    let entry_lines = explain_entry_lines(entry_result);
+    let stats_after = core.hnsw_index_cache_stats();
+
+    assert_eq!(sql_lines, entry_lines);
+    // `EXPLAIN` は索引の `lookup`／`prepare_*` を一切呼ばない契約
+    // （`run_explain_plan` モジュールドキュメント参照）。
+    assert_eq!(stats_before.hits, 0);
+    assert_eq!(stats_before.misses, 0);
+    assert_eq!(stats_before.builds, 0);
+    assert_eq!(stats_after.hits, 0);
+    assert_eq!(stats_after.misses, 0);
+    assert_eq!(stats_after.builds, 0);
+}
+
+#[test]
+fn explain_entry_rejects_undefined_table_before_invoking_binder() {
+    let path = unique_db_path("core-explain-plan-entry-undefined-table");
+    let _guard = CleanupGuard(path.clone());
+    // テーブルを一切作らないスローアウェイ core。
+    let core = EngineCore::open(&path)
+        .expect("open engine core")
+        .with_query_planner(Box::new(CountingLlmClient::new(EXPANSION_RESPONSE)));
+
+    let binder_calls = std::sync::atomic::AtomicUsize::new(0);
+    let result = core.explain_bound_plan_in_session(
+        &ctx("tenant-a"),
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        None,
+        |_schema, _udfs| -> Result<ExplainShape, SqlSurfaceError> {
+            binder_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ExplainShape::from_filters(&[], &[]))
+        },
+    );
+    let err = result.expect_err("undefined table must be rejected");
+    assert_eq!(err.wire_code(), "42P01");
+    assert_eq!(
+        binder_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "binder must not be invoked when the table does not exist"
+    );
+}
+
+#[test]
+fn explain_entry_propagates_binder_error_and_skips_llm_call() {
+    let path = unique_db_path("core-explain-plan-entry-binder-error");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    drop(storage);
+
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    struct ArcLlmClient(std::sync::Arc<CountingLlmClient>);
+    impl LlmClient for ArcLlmClient {
+        fn complete(&self, prompt: &str) -> Result<String, PlanError> {
+            self.0.complete(prompt)
+        }
+    }
+    let core = EngineCore::open(&path)
+        .expect("open engine core")
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let result = core.explain_bound_plan_in_session(
+        &ctx("tenant-a"),
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        None,
+        |_schema, _udfs| -> Result<ExplainShape, SqlSurfaceError> {
+            Err(SqlSurfaceError::InvalidInput {
+                detail: "unknown column: nope".to_string(),
+            })
+        },
+    );
+    let err = result.expect_err("binder error must propagate unchanged");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "binder failure must be rejected before invoking the LLM (I/O amplification防止)"
+    );
+}
+
+#[test]
+fn explain_entry_fails_closed_without_query_planner() {
+    let path = unique_db_path("core-explain-plan-entry-no-planner");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    drop(storage);
+
+    // `with_query_planner` を呼ばない core（プランナー未注入）。
+    let core = EngineCore::open(&path).expect("open engine core");
+
+    let result = core.explain_bound_plan_in_session(
+        &ctx("tenant-a"),
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        None,
+        no_filter_bind,
+    );
+    let err = result.expect_err("must fail closed without a query planner");
+    assert_eq!(err.wire_code(), "XX000");
+}
+
+#[test]
+fn explain_entry_rejects_table_missing_dictionary_columns() {
+    let path = unique_db_path("core-explain-plan-entry-no-body-column");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    // `path`/`body` 列を欠くスキーマ（辞書必須列検証の対象）。
+    storage
+        .create_table(&TableSchema::new(
+            TABLE,
+            vec![ColumnDef::new("embedding", ColumnType::Vector(DIM), false)],
+        ))
+        .expect("create table");
+    drop(storage);
+
+    let core = EngineCore::open(&path)
+        .expect("open engine core")
+        .with_query_planner(Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE,
+        }));
+
+    let result = core.explain_bound_plan_in_session(
+        &ctx("tenant-a"),
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        None,
+        no_filter_bind,
+    );
+    let err = result.expect_err("must reject tables without path/body columns");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+#[test]
+fn explain_entry_does_not_leak_other_tenant_row_content() {
+    let path = unique_db_path("core-explain-plan-entry-rls");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    seed_tenant_b_row(&storage);
+    drop(storage);
+
+    let core = EngineCore::open(&path)
+        .expect("open engine core")
+        .with_query_planner(Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE,
+        }));
+
+    let entry_result = core.explain_bound_plan_in_session(
+        &ctx("tenant-a"),
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        None,
+        no_filter_bind,
+    );
+    let entry_lines = explain_entry_lines(entry_result);
+    let joined = entry_lines.join("\n");
+    assert!(
+        !joined.contains("docs/b-secret.md"),
+        "EXPLAIN の展開結果はスタブ固定値のため他テナント語彙が混入しないこと"
+    );
+    assert!(!joined.contains("tenant-b"));
+}
+
+/// クレート外（本テストファイル）からの直接呼び出しが `EngineCore::
+/// execute_sql_in_session`（セッション必須のエントリ）を経由せずに使える
+/// ことの非 vacuous 確認: `Storage` を単一に保ったまま `EngineCore::open`
+/// 直後（`SessionState::default()`）でも成功する。
+#[test]
+fn explain_entry_works_without_a_prior_sql_session() {
+    let path = unique_db_path("core-explain-plan-entry-fresh-session");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    drop(storage);
+
+    let core = EngineCore::open(&path)
+        .expect("open engine core")
+        .with_query_planner(Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE_NO_HINTS,
+        }));
+
+    let result = core.explain_bound_plan_in_session(
+        &ctx("tenant-a"),
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        None,
+        no_filter_bind,
+    );
+    let _ = explain_entry_lines(result);
+    // 呼び出し自体が `CpuScalarProvider` の直接依存を持たないことも確認
+    // （import が unused にならないよう明示的に参照する）。
+    let _ = CpuScalarProvider;
+}

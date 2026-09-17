@@ -38,8 +38,13 @@
 //! `engine::sql::exec::execute_insert_batch`／
 //! `EngineCore::execute_bound_insert_in_session` へ写像する
 //! （Issue #771・TASK-178・NOSQL-6。`gate.rs` への結線は対象外・別 Issue の担当）。
+//! [`explain`] は `op: search`・`explain: true` を検索本体を実行せず
+//! `EngineCore::explain_bound_plan_in_session` へ写像し、SQL `EXPLAIN
+//! SELECT ... USING PLAN(...)` と同一内容の `{"explain":[...]}` 応答を返す
+//! （Issue #765・TASK-186・NOSQL-10。`vector` 指定・`plan` 未指定は `42601`）。
 
 pub mod aggregate;
+pub mod explain;
 pub mod filter;
 pub mod gate;
 pub mod ident;

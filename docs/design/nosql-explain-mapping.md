@@ -1,0 +1,115 @@
+# NoSQL `explain` フィールドの写像（NOSQL-10）
+
+- Issue: #765
+- 対象タスク: TASK-175・TASK-186
+- 対象ビヘイビア: NOSQL-10（関連: SQL-6・SQL-5・PLAN-11・NOSQL-2）
+- ステータス: Implemented
+
+## 背景
+
+`POST /v1/query`（`op: search`）の `explain: true` は、SQL 表層
+`EXPLAIN SELECT ... USING PLAN(...)`（SQL-6）と同一内容を検索本体を実行せず
+返す契約。Issue #763 の `bind_search` は `explain` フィールドの値を保持する
+のみで判定には使っていなかった。`scan`（Issue #766）は `explain: true` を
+`42601` で拒否、`aggregate`（Issue #768）は本 Issue に委ねる暫定 `0A000` を
+返していた。
+
+## 採用した設計
+
+### engine 側: SQL `EXPLAIN` アームと NoSQL エントリの共有ヘルパー
+
+- `sql::explain::ExplainShape`（`pub`・`#[non_exhaustive]`）: `WHERE` 述語の
+  構造のみから決まる形状情報（`filters_empty`・`scalar_plan`）を運ぶ型。
+  `sql::using_plan::pre_check_bindable`（`pub(crate)`）の戻り値をこの型へ
+  差し替えた（旧 `PreCheckShape` を撤去）。構築は `ExplainShape::from_filters
+  (metadata_filters, expr_filters)` の 1 本のみ（`scalar_prefilter: true`
+  固定。`USING PLAN` は `HINT ORDER` を受理しないため SCALAR 段は常に
+  DISTANCE 段より先に評価される契約に基づく）。
+- `core.rs::EngineCore::run_explain_plan`（private）: 既存 `Statement::
+  Explain` アームの本体（テーブル世代の事前記録 → 辞書必須列検証 → 束縛
+  検証（LLM I/O より前）→ LLM クエリ展開・モード解決 → 世代の事後照合 →
+  辞書必須列の再検証 → 使用エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN`
+  整形）を抽出した私的ヘルパー。binder closure は `&TableSchema`／
+  `&UdfRegistry` を受け取り `Result<ExplainShape, E>`（`E: From<
+  SqlSurfaceError>`）を返す。`Statement::Explain` アームはこのヘルパーを
+  呼ぶだけの薄いラッパーへ縮約した（挙動不変。手順順序・エラー分類は
+  ビット同一）。
+- `core.rs::EngineCore::explain_bound_plan_in_session`（`pub`）:
+  `run_explain_plan` をそのまま公開する薄いラッパー。`execute_bound_scan_
+  in_session`・`execute_bound_aggregate_in_session`（Issue #728）と同型の
+  セッション対応エントリだが、エラー型 `E` が `From<SqlSurfaceError>` の
+  ジェネリック境界のみを課す点が異なる——呼び出し元（wire-server）の binder
+  が SQL 表層の束縛ヘルパーを経由して独自のエラー型（`search::SearchError`
+  等）を返すため。検索本体（`hnsw_state` の `lookup`／`prepare_*`・
+  `SearchProvider::search`）はどちらの呼び出し元でも呼ばれない（`EXPLAIN`
+  は検索を実行しない契約）。
+
+### wire-server 側: `http/query/explain.rs`
+
+- `ExplainError`: `SearchError`（[`super::search::bind_search`] の全エラーを
+  透過）・`ExplainRequiresPlan`（`vector` 指定または `plan` 未指定。`42601`。
+  SQL-6 の「`EXPLAIN` は `USING PLAN` 付き検索 `SELECT` 専用」契約の写像）・
+  `Engine(SqlSurfaceError)`・`Encode(ResponseEncodeError)` の 4 種。
+- `execute`: `table`（識別子形状検査）→ `vector` 指定拒否 → `plan` 未指定
+  拒否＋長さ検証（`validate_using_plan_question`）→ `mode`（識別子形状検査・
+  語彙検証）を LLM I/O より前に済ませてから
+  `EngineCore::explain_bound_plan_in_session` を呼ぶ。binder closure は
+  `bind_search`（Issue #763）の完全な束縛結果から `BoundSearch::Plan` の
+  フィルタのみを取り出して `ExplainShape::from_filters` を組み立てる
+  （`BoundSearch::Vector` への到達は構造上ないが、多層防御として
+  `ExplainRequiresPlan` へ拒否する）。`table`／`plan`／`mode` の検証は
+  `bind_search` 内でも再度行われる（二重検査。`EngineCore::
+  explain_bound_plan_in_session` のドキュメント参照）。第 2 の実行器は
+  作らない。
+- `response::encode_explain`: `QueryResult` が `Computed { name: "QUERY
+  PLAN" }` 1 列・各行 `Cell::Text` 1 個であることを検証してから
+  `{"explain":["<行>", ...]}`（キー固定・空白なし）へ写像する。逸脱時は
+  best-effort に描画せず `Err`（`InternalError`／`XX000`）で fail-closed。
+- `gate.rs`: 手順 5 の `match (op, engine)` に `(Op::Search, Some(engine))
+  if explain_requested(&validated)` を、通常の `search` 実行アーム（#764 が
+  追加する見込み）より必ず先に置く。`explain: true` は match の腕の順序
+  自体により構造的に実行経路へ落ちない（`aggregate.rs::reject_explain` と
+  同じ fail-open 防止の思想）。
+- `aggregate.rs`: `AggregateError::NotYetSupported`（`0A000`・
+  `EXPLAIN_NOT_YET_SUPPORTED_MESSAGE`）を `ExplainNotSupported`（`42601`・
+  `EXPLAIN_NOT_SUPPORTED_MESSAGE`）へ変更した（`reject_not_yet_supported`
+  → `reject_explain` に改名）。SQL-6 が集計 `SELECT` への `EXPLAIN` 前置を
+  `42601` で拒否する契約の写像であり、`scan.rs::ScanError::
+  ExplainNotSupported` と同型。
+
+## テスト
+
+- `crates/engine/tests/core_explain_plan_entry.rs`（新設）: SQL `EXPLAIN` と
+  `explain_bound_plan_in_session` の行単位完全一致（フィルタなし・等価
+  フィルタあり）・HNSW opt-in 時の `hnsw_params:` 行一致と索引キャッシュ
+  非タッチ（`lookup`／`prepare_*` 不呼び出しの非 vacuous 証跡）・未定義
+  テーブルの binder 呼び出し前拒否・binder エラーの伝播と LLM 呼び出し
+  スキップ・プランナー未注入時の `XX000`・辞書必須列欠如の `22000`・他
+  テナント行内容の非漏えいを固定。
+- `crates/wire-server/tests/nosql10_explain.rs`（新設。production ルータ
+  経由の層 A）: SQL `EXPLAIN` との行単位一致（フィルタなし・フィルタ
+  あり・`mode` あり）・HNSW opt-in 時の `hnsw_params:` 行・`vector` 指定
+  拒否・`vector`＋`plan` 併存拒否・プランナー未注入時の `XX000`・
+  `aggregate`／`scan` の `explain: true` が引き続き `42601`・他テナント
+  行内容の非漏えいを検証。
+- `crates/wire-server/tests/nosql4_aggregate.rs`: `explain_true_rejects_
+  with_0a000_and_does_not_execute` を `explain_true_rejects_with_42601_
+  and_does_not_execute` へ改名・期待値を `42601` へ更新。
+
+レイテンシ（`explain` 応答時間 vs 同一 core での通常 `USING PLAN` 検索
+時間）は run-to-run 変動で flaky になるためアサーションには使わず、
+Issue 本文の受け入れ条件からは対象外とした（`docs/design/
+benchmark-judgement-policy.md` の計測規約と同じ判断）。
+
+## spec 側への申し送り事項
+
+NOSQL-10 は `search`／`scan`／`aggregate` を対象に挙げるが、対応する SQL-6
+の `EXPLAIN` は `USING PLAN` 付き検索 `SELECT` 専用（`scan`／`aggregate`／
+`vector` 形は `42601`）。本実装は SQL-6 と同一の拒否契約を写像した。集計・
+広域取得向け `EXPLAIN` を規範化するかは spec 側の判断に委ねる。
+
+## 対象外（後続 Issue の担当）
+
+- `search`（`explain` なし）の実行結線（#764）
+- `insert` の `gate.rs` 結線・成功応答（別 Issue）
+- 3 クライアント統合テスト（TASK-183）・確定化判定（TASK-185）

@@ -24,13 +24,16 @@
 //!    `SET search_mode` 相当フィールドはここで未知キーとして拒否される）
 //! 5. `op` と `engine`（接続済み `EngineCore`。`Router::new` 経由では
 //!    `None`・`Router::with_engine` 経由でのみ `Some`）の組でディスパッチ
-//!    する。`(Op::Scan, Some(engine))` は [`crate::http::query::scan::
+//!    する。`(Op::Search, Some(engine))` かつ `explain: true` は
+//!    [`super::explain::handle`]（TASK-186・NOSQL-10・Issue #765。検索本体を
+//!    実行せず `QUERY PLAN` を返す。通常の `search` 実行より必ず先に
+//!    判定される）、`(Op::Scan, Some(engine))` は [`crate::http::query::scan::
 //!    handle`]（TASK-186・NOSQL-3・Issue #766）、`(Op::Aggregate,
 //!    Some(engine))` は [`super::aggregate::handle`]（Issue #768・
 //!    TASK-177・NOSQL-4）へそれぞれ束縛・実行を委譲する。それ以外
-//!    （`Op::Search`／`Op::Insert`、および `engine` 未接続時の
+//!    （`explain` なしの `Op::Search`／`Op::Insert`、および `engine` 未接続時の
 //!    `Op::Scan`／`Op::Aggregate`）は暫定の `0A000`／501
-//!    （[`PLACEHOLDER_MESSAGE`]）を返す（束縛・実行の結線は #763・#771 が
+//!    （[`PLACEHOLDER_MESSAGE`]）を返す（束縛・実行の結線は #764・#771 が
 //!    本 seam を置き換える）
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
@@ -49,6 +52,7 @@ use engine::json::parse_json;
 
 use crate::http::query::op::{classify_op, Op};
 use crate::http::query::scan;
+use crate::http::query::schema::Validated;
 use crate::http::session::middleware::{self, SessionPrincipal};
 use crate::http::{body, response};
 
@@ -108,6 +112,14 @@ pub fn handle(
     // #768）。各アームは対応するモジュールへの 1 行委譲に留め、後続 Issue
     // （#763・#771）が並行して追加する他 op アームとの衝突面を小さくする。
     match (op, engine) {
+        // `explain: true` は通常の `search` 実行（#764 が結線する
+        // `(Op::Search, Some(engine)) => search::handle(...)` 相当）より
+        // 必ず先に判定する（Issue #765・TASK-186・NOSQL-10）。`explain: true`
+        // が構造的に実行経路へ落ちないことを match の腕の順序自体で保証する
+        // （`aggregate.rs::reject_explain` と同じ fail-open 防止の思想）。
+        (Op::Search, Some(engine)) if explain_requested(&validated) => {
+            super::explain::handle(engine, principal, &validated, now_wall)
+        }
         (Op::Scan, Some(engine)) => scan::handle(engine, principal, &validated, now_wall),
         (Op::Aggregate, Some(engine)) => {
             super::aggregate::handle(engine, principal, &validated, now_wall)
@@ -118,6 +130,15 @@ pub fn handle(
             now_wall,
         ),
     }
+}
+
+/// `validated`（`Op::Search` のスキーマ検証済み要求）が `explain: true` を
+/// 伴うかを判定する（Issue #765）。`optional_bool` の `Err`（多層防御の域。
+/// `SEARCH_SCHEMA` 検証を既に通過しているため通常到達しない）は `false`
+/// 扱いにせず、後段のスキーマ検証と同じ判定経路（`(_, _)` アーム）へ
+/// 委ねる意図で `matches!` により厳密に `Ok(Some(true))` のみを真とする。
+fn explain_requested(validated: &Validated<'_>) -> bool {
+    matches!(validated.optional_bool("explain"), Ok(Some(true)))
 }
 
 #[cfg(test)]

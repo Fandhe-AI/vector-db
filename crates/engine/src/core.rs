@@ -2301,9 +2301,10 @@ impl EngineCore {
                     // I/O（`plan_using_plan_expansion`）より前に完結させる（多層防御
                     // として I/O 後の再束縛でも同じ検証を通す。詳細は
                     // [`crate::sql::using_plan::pre_check_bindable`] のドキュメント参照）。
-                    // `Select` アームは形状情報（`PreCheckShape`）を使わない
-                    // （`EXPLAIN` 用の `ann_plan:` 判定は `Statement::Explain`
-                    // アームのみが必要とする。Issue #411）。
+                    // `Select` アームは形状情報（`sql::explain::ExplainShape`）を
+                    // 使わない（`EXPLAIN` 用の `ann_plan:` 判定は
+                    // `Statement::Explain` アーム・[`Self::explain_bound_plan_in_session`]
+                    // （TASK-186・NOSQL-10）のみが必要とする。Issue #411）。
                     let _ = crate::sql::using_plan::pre_check_bindable(
                         &validated,
                         &pre_check_schema,
@@ -2478,152 +2479,22 @@ impl EngineCore {
                     None => None,
                 };
 
-                // 計画開始時の対象テーブル世代を記録する（codex-review P1 指摘対応、
-                // PR #267。`Statement::Select` アームの `USING PLAN` 経路〔上記
-                // ドキュメント・[`crate::catalog::table_generation_in_txn`] 参照〕と
-                // 同じ理由: `plan_query_with_mode` 内の辞書スナップショット構築・
-                // LLM クエリ展開の間に対象テーブルへの DDL（`DROP`/同名再作成含む）・
-                // 行書き込みが起きると、`EXPLAIN` が無効化された辞書由来の検索語・
-                // ヒントをあたかも現在有効な計画として返してしまう。`EXPLAIN` は
-                // 検索本体を実行しないため実データ不整合は生じないが、返す
-                // `QUERY PLAN` 自体が古いテーブル世代を前提にした偽の計画になり、
-                // 通常 `SELECT ... USING PLAN(...)` 経路の fail-closed 契約との
-                // 一貫性を欠く（security.md「不安全な設計」対応）。
-                let (pre_check_schema, planning_generation) = {
-                    let (pre_check_txn, schema) =
-                        self.read_txn_with_schema(validated.table_name())?;
-                    let generation = crate::catalog::table_generation_in_txn(
-                        &pre_check_txn,
-                        validated.table_name(),
-                    )
-                    .map_err(|e| {
-                        crate::sql::allowlist::SqlSurfaceError::Internal {
-                            detail: format!("failed to read table generation: {e}"),
-                        }
-                    })?;
-                    drop(pre_check_txn);
-                    (schema, generation)
-                };
-                dictionary_required_columns(&pre_check_schema)
-                    .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
-
-                // `USING MODE` リテラル・`VECTOR` 列の存在・投影列／`WHERE` 述語の
-                // 事前束縛検証（codex-review P1 指摘・Cursor Bugbot 指摘対応、PR
-                // #267）: `Statement::Select` アームの `USING PLAN` 経路（上記
-                // ドキュメント・[`crate::sql::using_plan::pre_check_bindable`]
-                // 参照）と同じ理由で、`EXPLAIN` 経路もこの検証を LLM I/O
-                // （`plan_query_with_mode` 内のクエリ展開）より前に完結させる。
-                // 従来この検証を欠いていたため、対応する通常 `SELECT ... USING
-                // PLAN(...)` なら `22000`（未知列・型不正 WHERE・未登録 UDF）で
-                // 拒否されるはずのクエリが、`EXPLAIN` 経由では LLM I/O まで実行した
-                // うえで成功してしまっていた。
-                // 戻り値（`PreCheckShape::filters_empty`）は `EXPLAIN` の
-                // `ann_plan:` 行（Issue #411・`sql::hnsw_cache::classify_ann_plan`）
-                // が要求する形状情報。`WHERE` 句の構造のみから決まる純粋に構文的な
-                // 値であり、以下の LLM I/O・世代照合の影響を受けないため、ここで
-                // 確定させたまま最後まで使い回してよい。
-                let pre_check_shape = crate::sql::using_plan::pre_check_bindable(
-                    &validated,
-                    &pre_check_schema,
-                    session.udfs(),
-                )?;
-
-                let planned = self
-                    .plan_query_with_mode(
-                        ctx,
-                        validated.table_name(),
-                        question,
-                        query_mode,
-                        session.search_mode(),
-                    )
-                    .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: format!("EXPLAIN query expansion failed: {e}"),
-                    })?;
-
-                // I/O 完了後の世代照合（codex-review P1 指摘対応、PR #267）:
-                // `Statement::Select` アームの `USING PLAN` 経路（上記ドキュメント参照）
-                // と同じ契約を `EXPLAIN` にも適用する。新しい `read_txn` で対象
-                // テーブルの現在世代を取得し、`planning_generation` と一致しなければ
-                // `plan_query_with_mode` が使った辞書スナップショット・LLM 展開結果が
-                // 現在のテーブル世代に対して有効である保証がないため、fail-closed に
-                // 拒否する（`Internal`／`XX000`。クライアントへは
-                // `Internal::client_message()` の固定の一般化メッセージのみを返し、
-                // 他テナント・他クエリの書き込み有無という存在情報を漏らさない）。
-                let (post_check_txn, post_check_schema) =
-                    self.read_txn_with_schema(validated.table_name())?;
-                let current_generation = crate::catalog::table_generation_in_txn(
-                    &post_check_txn,
+                // 手順本体（テーブル世代の事前記録 → 辞書必須列検証 → 束縛検証
+                // → LLM クエリ展開・モード解決 → 世代の事後照合 → 辞書必須列の
+                // 再検証 → 使用エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN`
+                // 整形）は [`Self::run_explain_plan`] が [`Self::
+                // explain_bound_plan_in_session`]（TASK-186・NOSQL-10・
+                // Issue #765）と共有する（第 2 の実装を持たない）。
+                let result = self.run_explain_plan(
+                    ctx,
+                    session,
                     validated.table_name(),
-                )
-                .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
-                    detail: format!("failed to read table generation: {e}"),
-                })?;
-                drop(post_check_txn);
-                if current_generation != planning_generation {
-                    return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: "table generation changed during EXPLAIN USING PLAN query \
-                                 expansion; rejecting stale plan"
-                            .to_string(),
-                    });
-                }
-
-                // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する
-                // （`Statement::Select` アームの `USING PLAN` 経路〔上記ドキュメント参照〕
-                // と同じ多層防御）: 上記の世代照合はストレージ全体の粗い世代のみを見る
-                // ため、同一世代内であってもこのスキーマが `pre_check_schema` と異なる
-                // 可能性を狭義には排除できない。現行の `bump_generation_and_commit`
-                // 実装では書き込みごとに必ず世代が進むため通常到達しないが、
-                // `dictionary_required_columns` は軽量な検証であり多層防御として維持する。
-                dictionary_required_columns(&post_check_schema)
-                    .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
-
-                // Issue #411: `engine:`／`hnsw_params:`／`ann_plan:` 行の入力を
-                // 組み立てる。`EXPLAIN` は `USING PLAN` 専用（`using_plan::
-                // bind_expansion` は常に `Ranking::Hybrid` を構成する）ため
-                // `is_hybrid` は常に `true`。`hnsw_enabled`（`self.hnsw_state`）は
-                // 実行時に executor が経由する索引キャッシュそのものの有無であり、
-                // `search_engine_kind() == Some(Hnsw(_))` と同値であることは
-                // `explain_hnsw_enabled_matches_hnsw_state_presence` で固定する。
-                // `EXPLAIN` はこの判定のためだけに `hnsw_state` の `lookup`／
-                // `prepare_*`（索引構築・統計加算という副作用を持つ）を一切呼ばず、
-                // `is_some()` の有無だけを見る（検索本体を実行しない契約は不変）。
-                let ann_plan = crate::sql::hnsw_cache::classify_ann_plan(
-                    crate::sql::hnsw_cache::AnnShapeInput {
-                        hnsw_enabled: self.hnsw_state.is_some(),
-                        // codex-review P1 指摘対応（PR #437）: `with_provider`／
-                        // `from_storage` 経由でカスタム provider を注入した場合
-                        // （`self.search_engine_kind() == None`）、`EngineCore`
-                        // は実行方式が ANN か brute-force かを判別できない。
-                        // `hnsw_enabled == false` を無条件に「厳密 brute-force
-                        // と確定している」`AnnPlan::PlainScanEngine` へ丸めると、
-                        // `engine: (custom_provider)` としながら実行方式を
-                        // plain scan と断定してしまい誤表示になる（既知の
-                        // `SearchEngineKind::CpuScalarBruteForce`／
-                        // `ParallelBruteForce` は `PlainScanEngine` のまま
-                        // 正確）。ここで `search_engine_kind().is_none()` を
-                        // 併せて渡し、`classify_ann_plan` 側で
-                        // `AnnPlan::UnknownCustomProvider` へ振り分ける。
-                        engine_kind_unknown: self.search_engine_kind().is_none(),
-                        is_hybrid: true,
-                        is_precision: planned.mode().mode()
-                            == crate::sql::mode::SearchMode::Precision,
-                        filters_empty: pre_check_shape.filters_empty,
-                        scalar_prefilter: crate::sql::plan::ExecutionPlan::from_evaluation_order(
-                            validated.evaluation_order(),
-                        )
-                        .scalar_prefilter,
+                    question,
+                    query_mode,
+                    |schema, udfs| {
+                        crate::sql::using_plan::pre_check_bindable(&validated, schema, udfs)
                     },
-                );
-                let explain_engine = crate::sql::explain::ExplainEngine {
-                    kind: self.search_engine_kind(),
-                    ann_plan,
-                    // Issue #474: `pre_check_bindable` が構文段のみから確定
-                    // させた静的判定（LLM I/O・世代照合の影響を受けない。
-                    // 上記コメント「戻り値…このまま使い回してよい」と同じ
-                    // 理由）。
-                    scalar_plan: pre_check_shape.scalar_plan,
-                };
-                let result = crate::sql::explain::build_explain_result(&planned, &explain_engine);
+                )?;
                 Ok(crate::sql::SqlOutcome::Explain(result))
             }
         }
@@ -2680,6 +2551,167 @@ impl EngineCore {
                 cache: &self.scalar_index_cache,
             }),
         )
+    }
+
+    /// `EXPLAIN SELECT ... USING PLAN(...)`（SQL-6・TASK-78）の `Statement::
+    /// Explain` アームと、束縛済み計画向けセッション対応エントリ
+    /// [`Self::explain_bound_plan_in_session`]（TASK-186・NOSQL-10・
+    /// Issue #765）が共有する実行本体。fail-closed の手順順序（テーブル
+    /// 世代の事前記録 → 辞書必須列検証 → 束縛検証（LLM I/O より前）→
+    /// LLM クエリ展開・モード解決 → 世代の事後照合 → 辞書必須列の再検証 →
+    /// 使用エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN` 整形）はどちらの
+    /// 呼び出し元でもビット同一に保たれる（第 2 の実装を持たない）。
+    /// 検索本体（`hnsw_state` の `lookup`／`prepare_*`・
+    /// `SearchProvider::search`）はいずれの経路でも呼ばれない（`EXPLAIN`
+    /// は検索を実行しない契約。[`crate::sql::explain`] モジュールドキュメント
+    /// 参照）。
+    ///
+    /// `bind` は LLM I/O（`plan_query_with_mode` 内）より前、テーブル世代の
+    /// 事前記録直後に一度だけ呼ばれる。返す [`crate::sql::explain::
+    /// ExplainShape`] は `WHERE` 述語の構造のみから決まる値であり、以降の
+    /// LLM I/O・世代照合の影響を受けないため最後まで使い回してよい
+    /// （[`crate::sql::using_plan::pre_check_bindable`] の既存契約と同じ）。
+    ///
+    /// エラー型 `E` は `E: From<SqlSurfaceError>` の境界のみを課す
+    /// （呼び出し元ごとに異なるエラー型を返せるようにするため。SQL アーム
+    /// 自身は blanket `impl<T> From<T> for T` により `E = SqlSurfaceError`
+    /// のまま変更なく動く）。
+    fn run_explain_plan<F, E>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        question: &str,
+        query_mode: Option<crate::sql::mode::SearchMode>,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, E>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+        ) -> Result<crate::sql::explain::ExplainShape, E>,
+        E: From<crate::sql::allowlist::SqlSurfaceError>,
+    {
+        // 計画開始時の対象テーブル世代を記録する（`Statement::Select` アーム
+        // の `USING PLAN` 経路と同じ理由: `plan_query_with_mode` 内の辞書
+        // スナップショット構築・LLM クエリ展開の間に対象テーブルへの DDL・
+        // 行書き込みが起きると、古いテーブル世代を前提にした偽の計画を返して
+        // しまう。security.md「不安全な設計」対応）。
+        let (pre_check_schema, planning_generation) = {
+            let (pre_check_txn, schema) = self.read_txn_with_schema(table)?;
+            let generation = crate::catalog::table_generation_in_txn(&pre_check_txn, table)
+                .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: format!("failed to read table generation: {e}"),
+                })?;
+            drop(pre_check_txn);
+            (schema, generation)
+        };
+        dictionary_required_columns(&pre_check_schema)
+            .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
+
+        // `USING MODE` リテラル・`VECTOR` 列の存在・投影列／`WHERE` 述語の
+        // 事前束縛検証を LLM I/O（`plan_query_with_mode`）より前に完結させる
+        // （`Statement::Select` アームの `USING PLAN` 経路と同じ理由）。
+        let explain_shape = bind(&pre_check_schema, session.udfs())?;
+
+        let planned = self
+            .plan_query_with_mode(ctx, table, question, query_mode, session.search_mode())
+            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: format!("EXPLAIN query expansion failed: {e}"),
+            })?;
+
+        // I/O 完了後の世代照合: `planning_generation` と現在の対象テーブル
+        // 世代が一致しなければ、計画時に使った辞書スナップショット・展開
+        // 結果が現在のテーブル世代に対して有効である保証がないため
+        // fail-closed に拒否する（クライアントへは `Internal::
+        // client_message()` の固定の一般化メッセージのみを返し、他テナント・
+        // 他クエリの書き込み有無という存在情報を漏らさない）。
+        let (post_check_txn, post_check_schema) = self.read_txn_with_schema(table)?;
+        let current_generation = crate::catalog::table_generation_in_txn(&post_check_txn, table)
+            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: format!("failed to read table generation: {e}"),
+            })?;
+        drop(post_check_txn);
+        if current_generation != planning_generation {
+            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "table generation changed during EXPLAIN USING PLAN query \
+                         expansion; rejecting stale plan"
+                    .to_string(),
+            }
+            .into());
+        }
+
+        // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する（多層防御。
+        // `Statement::Select` アームの `USING PLAN` 経路と同じ理由）。
+        dictionary_required_columns(&post_check_schema)
+            .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
+
+        // Issue #411: `engine:`／`hnsw_params:`／`ann_plan:` 行の入力を
+        // 組み立てる。`EXPLAIN` は `USING PLAN` 専用（束縛結果は常に
+        // `Ranking::Hybrid`）のため `is_hybrid` は常に `true`。
+        // `hnsw_enabled`（`self.hnsw_state`）は実行時に executor が経由する
+        // 索引キャッシュそのものの有無であり、`EXPLAIN` はこの判定のためだけに
+        // `hnsw_state` の `lookup`／`prepare_*`（索引構築・統計加算という
+        // 副作用を持つ）を一切呼ばず、`is_some()` の有無だけを見る（検索本体を
+        // 実行しない契約は不変）。`USING PLAN` は `HINT ORDER` を受理しない
+        // （SQL-5・許可リスト層）ため評価順序は常に既定（`EvaluationOrder::
+        // DEFAULT`）であり、`scalar_prefilter` はここで固定的に導出できる。
+        let ann_plan =
+            crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
+                hnsw_enabled: self.hnsw_state.is_some(),
+                engine_kind_unknown: self.search_engine_kind().is_none(),
+                is_hybrid: true,
+                is_precision: planned.mode().mode() == crate::sql::mode::SearchMode::Precision,
+                filters_empty: explain_shape.filters_empty(),
+                scalar_prefilter: crate::sql::plan::ExecutionPlan::from_evaluation_order(
+                    crate::sql::plan::EvaluationOrder::DEFAULT,
+                )
+                .scalar_prefilter,
+            });
+        let explain_engine = crate::sql::explain::ExplainEngine::new(
+            self.search_engine_kind(),
+            ann_plan,
+            // Issue #474: `bind` が構文段のみから確定させた静的判定（LLM
+            // I/O・世代照合の影響を受けない。上記コメントと同じ理由）。
+            explain_shape.scalar_plan(),
+        );
+        Ok(crate::sql::explain::build_explain_result(
+            &planned,
+            &explain_engine,
+        ))
+    }
+
+    /// 束縛済み `USING PLAN` 検索計画の EXPLAIN（TASK-186・NOSQL-10。
+    /// Issue #765）。SQL の `Statement::Explain` アームと同一の私的ヘルパー
+    /// （[`Self::run_explain_plan`]）を共有し、検索本体は実行しない。SQL
+    /// テキストを経由せず束縛済み計画を実行したい呼び出し元（`wire-server`
+    /// の NoSQL 表層。TASK-175 のポインタ）向けのセッション対応エントリで、
+    /// [`Self::execute_bound_scan_in_session`]・[`Self::
+    /// execute_bound_aggregate_in_session`]（Issue #728）と同型の設計
+    /// （`docs/design/bound-plan-session-entry.md` 参照）。
+    ///
+    /// `bind` のエラー型 `E` は上記 2 エントリと異なり
+    /// `E: From<crate::sql::allowlist::SqlSurfaceError>` というジェネリック
+    /// 境界を持つ——呼び出し元（wire-server）の binder が SQL 表層の束縛
+    /// ヘルパー（`sql::parser`）を経由して独自のエラー型（`search::
+    /// SearchError` 等）を返すため。
+    pub fn explain_bound_plan_in_session<F, E>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        question: &str,
+        query_mode: Option<crate::sql::mode::SearchMode>,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, E>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+        ) -> Result<crate::sql::explain::ExplainShape, E>,
+        E: From<crate::sql::allowlist::SqlSurfaceError>,
+    {
+        self.run_explain_plan(ctx, session, table, question, query_mode, bind)
     }
 
     /// 束縛済み広域取得計画（[`crate::sql::parser::BoundScan`]）を単一

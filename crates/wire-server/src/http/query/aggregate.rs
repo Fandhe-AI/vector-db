@@ -14,11 +14,12 @@
 //! `resolve_group_by_column`・`check_having_target_is_numeric`）を SQL テキスト
 //! 経由の `bind_aggregate` と完全に共有する。
 //!
-//! `explain: true` のみ本モジュールの対象外（NOSQL-10 は #765 の担当。
-//! 黙って無視すると fail-open になるため `0A000`——
-//! [`super::gate::PLACEHOLDER_MESSAGE`] と同型の未実装扱い——で拒否し実行
-//! しない）。`group_by`／`having` は本 Issue（#769）で SQL-14
-//! （`sql::group_by::execute_grouped_aggregate`）へ写像する。
+//! `explain: true` は SQL-6 の「`EXPLAIN` は `USING PLAN` 付き検索 `SELECT`
+//! 専用」契約の写像として `42601`（[`AggregateError::ExplainNotSupported`]）
+//! で拒否し実行しない（黙って無視すると `explain` なしの通常実行へ fail-open
+//! に縮退してしまうため。Issue #765・NOSQL-10）。`group_by`／`having` は
+//! Issue #769 で SQL-14（`sql::group_by::execute_grouped_aggregate`）へ
+//! 写像する。
 //!
 //! `table`／`aggregates[].column`／`group_by[0]`／`having[].column`
 //! （`*` を除く）は [`super::ident::check_identifier`] で識別子形状を検査
@@ -63,10 +64,12 @@ use super::schema::{SchemaError, Validated, HAVING_ITEM_SCHEMA};
 
 use crate::http::session::middleware::SessionPrincipal;
 
-/// `explain: true` を伴う `aggregate` 要求に返す固定文言（[`super::gate::
-/// PLACEHOLDER_MESSAGE`] と同型の「未実装」扱い。NOSQL-10・Issue #765 の
-/// 担当）。
-pub const EXPLAIN_NOT_YET_SUPPORTED_MESSAGE: &str = "aggregate explain is not yet available";
+/// `explain: true` を伴う `aggregate` 要求に返す固定文言（Issue #765・
+/// TASK-186・NOSQL-10。SQL-6 の `EXPLAIN` が `USING PLAN` 付き検索 `SELECT`
+/// 専用で、集計 `SELECT` への `EXPLAIN` 前置を `42601` で拒否する契約
+/// （`sql::allowlist`）の写像。`scan.rs::ScanError::ExplainNotSupported` と
+/// 同型の判断）。
+pub const EXPLAIN_NOT_SUPPORTED_MESSAGE: &str = "explain is not supported for aggregate";
 
 /// `fn`（[`engine::sql::allowlist::AggregateFunc`]）の受理語彙。`Op::parse`
 /// （Issue #759）と同じ方針で**小文字完全一致のみ**を受理する（大文字小文字
@@ -122,9 +125,10 @@ pub enum AggregateError {
     /// `HAVING` 述語数・グループ数上限超過 `54000`・`having` 参照先なし／
     /// 曖昧 `22000` 等）をそのまま透過する（TASK-186・NOSQL-5）。
     Engine(SqlSurfaceError),
-    /// `explain: true` を伴う要求（本モジュールの対象外。NOSQL-10・
-    /// Issue #765 の担当）。
-    NotYetSupported,
+    /// `explain: true` を伴う要求（SQL-6 の `EXPLAIN` が `USING PLAN` 付き
+    /// 検索 `SELECT` 専用で、集計 `SELECT` への適用を拒否する契約の写像。
+    /// `42601`。Issue #765・NOSQL-10）。
+    ExplainNotSupported,
     /// `group_by`／`having` の形の逸脱（TASK-186・NOSQL-5）: `group_by`
     /// 要素数が 1 でない、または `having`（空配列を含む）が `group_by` なしに
     /// 単独で指定されている。黙って無視すると `GROUP BY` なしの単一行集計
@@ -175,7 +179,7 @@ impl ClassifiedError for AggregateError {
             | AggregateError::NonFiniteHavingLiteral => ErrorClass::UnsupportedSqlSyntax,
             AggregateError::Filter(err) => err.error_class(),
             AggregateError::Engine(err) => err.error_class(),
-            AggregateError::NotYetSupported => ErrorClass::FeatureNotSupported,
+            AggregateError::ExplainNotSupported => ErrorClass::UnsupportedSqlSyntax,
         }
     }
 
@@ -190,7 +194,7 @@ impl ClassifiedError for AggregateError {
             AggregateError::InvalidIdentifier => "invalid identifier".to_string(),
             AggregateError::Filter(err) => err.client_message(),
             AggregateError::Engine(err) => err.client_message(),
-            AggregateError::NotYetSupported => EXPLAIN_NOT_YET_SUPPORTED_MESSAGE.to_string(),
+            AggregateError::ExplainNotSupported => EXPLAIN_NOT_SUPPORTED_MESSAGE.to_string(),
             AggregateError::GroupByShape => {
                 "group_by must have exactly one element, and having requires group_by".to_string()
             }
@@ -207,15 +211,15 @@ impl ClassifiedError for AggregateError {
 }
 
 /// `validated`（[`super::schema::AGGREGATE_SCHEMA`] を通過済みの `aggregate`
-/// 要求本文）が `explain: true` を伴うかを判定する（NOSQL-10・Issue #765 の
-/// 担当。本モジュールの対象外）。伴う場合は `Err(AggregateError::
-/// NotYetSupported)` を返し、呼び出し元は束縛・実行を一切行わない
-/// （黙って無視すると `explain` なしの通常実行へ fail-open に縮退して
-/// しまうため）。`group_by`／`having` は [`bind`] が直接処理する
-/// （TASK-186・NOSQL-5・Issue #769）。
-fn reject_not_yet_supported(validated: &Validated<'_>) -> Result<(), AggregateError> {
+/// 要求本文）が `explain: true` を伴うかを判定する（SQL-6 の「`EXPLAIN` は
+/// `USING PLAN` 付き検索 `SELECT` 専用」契約の写像。Issue #765・NOSQL-10）。
+/// 伴う場合は `Err(AggregateError::ExplainNotSupported)` を返し、呼び出し元は
+/// 束縛・実行を一切行わない（黙って無視すると `explain` なしの通常実行へ
+/// fail-open に縮退してしまうため）。`group_by`／`having` は [`bind`] が
+/// 直接処理する（TASK-186・NOSQL-5・Issue #769）。
+fn reject_explain(validated: &Validated<'_>) -> Result<(), AggregateError> {
     if validated.optional_bool("explain")? == Some(true) {
-        return Err(AggregateError::NotYetSupported);
+        return Err(AggregateError::ExplainNotSupported);
     }
     Ok(())
 }
@@ -331,7 +335,7 @@ fn bind_having_item(
 /// `validated`（`aggregate` op のスキーマ検証済み要求本文）を `schema` へ
 /// 束縛し、[`BoundAggregate`] を得る（TASK-186・NOSQL-4・NOSQL-5。SQL
 /// テキストを一切組み立てない）。`explain: true` の拒否は
-/// [`reject_not_yet_supported`] を呼び出し元（[`execute`]）が先に行う契約
+/// [`reject_explain`] を呼び出し元（[`execute`]）が先に行う契約
 /// のため、ここでは繰り返さない。`group_by`（要素数 1 限定）が指定されて
 /// いれば [`BoundAggregate::new_grouped`]（SQL-14）へ、指定されていなければ
 /// 従来どおり [`BoundAggregate::new`]（SQL-13）へ振り分ける（Issue #769）。
@@ -437,7 +441,7 @@ pub fn execute(
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
 ) -> Result<engine::sql::exec::QueryResult, AggregateError> {
-    reject_not_yet_supported(validated)?;
+    reject_explain(validated)?;
 
     let table = validated.required_str("table")?;
     ident::check_identifier(table)?;
@@ -664,26 +668,26 @@ mod tests {
     }
 
     #[test]
-    fn reject_not_yet_supported_detects_only_explain_true() {
+    fn reject_explain_detects_only_explain_true() {
         validated_aggregate!(
             v,
             r#"{"op":"aggregate","table":"docs","aggregates":[],"explain":true}"#
         );
-        let err = reject_not_yet_supported(&v).expect_err("explain:true must reject");
-        assert!(matches!(err, AggregateError::NotYetSupported));
-        assert_eq!(err.wire_code(), "0A000");
+        let err = reject_explain(&v).expect_err("explain:true must reject");
+        assert!(matches!(err, AggregateError::ExplainNotSupported));
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
-    fn reject_not_yet_supported_allows_group_by_and_having() {
-        // `group_by`／`having` は #769 で `reject_not_yet_supported` の対象外に
+    fn reject_explain_allows_group_by_and_having() {
+        // `group_by`／`having` は #769 で `reject_explain` の対象外に
         // なった（`bind` が直接処理する）。
         for json in [
             r#"{"op":"aggregate","table":"docs","aggregates":[],"group_by":["lang"]}"#,
             r#"{"op":"aggregate","table":"docs","aggregates":[],"group_by":[],"having":[]}"#,
         ] {
             validated_aggregate!(v, json);
-            assert!(reject_not_yet_supported(&v).is_ok(), "json={json}");
+            assert!(reject_explain(&v).is_ok(), "json={json}");
         }
     }
 
@@ -924,12 +928,12 @@ mod tests {
     }
 
     #[test]
-    fn reject_not_yet_supported_allows_plain_aggregate() {
+    fn reject_explain_allows_plain_aggregate() {
         validated_aggregate!(
             v,
             r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],
                "explain":false}"#
         );
-        assert!(reject_not_yet_supported(&v).is_ok());
+        assert!(reject_explain(&v).is_ok());
     }
 }
