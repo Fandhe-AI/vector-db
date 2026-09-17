@@ -10,6 +10,10 @@
 //! ことに徹する（`wire_aggregate.rs`・`wire_search_mode.rs` と同方針）。
 //! 無改造の実クライアント（psql／psycopg／pg）を使う 3 クライアント統合検証は
 //! `tests/extended_syntax_e2e.rs`（`#[ignore]`）が層 B として担う。
+//!
+//! 本ファイルの seed に対する pg wire ↔ NoSQL 2 表層の行集合パリティ
+//! （順序保証なし・早期終了・RLS 暗黙適用）は `nosql3_scan_wire_parity.rs`
+//! （Issue #767）が別途固定する。
 
 #[path = "common/mod.rs"]
 mod common;
