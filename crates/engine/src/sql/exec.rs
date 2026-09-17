@@ -2361,9 +2361,7 @@ pub fn execute_insert(
     bound: &crate::sql::parser::BoundInsert,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
-    use crate::catalog::CatalogError;
-    use crate::storage::{StorageError, Visibility};
-    use crate::tenant::TenantWriteError;
+    use crate::storage::Visibility;
 
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
@@ -2378,17 +2376,34 @@ pub fn execute_insert(
         &bound.values,
         ledger_write,
     )
-    .map_err(|e| match e {
+    .map_err(map_insert_write_error)?;
+
+    Ok(InsertOutcome {
+        rows_affected: 1,
+        incremental: None,
+    })
+}
+
+/// [`execute_insert`]・[`execute_insert_batch`] が共有する
+/// `TenantWriteError` → `SqlSurfaceError` の写像本体（Issue #771・TASK-178・
+/// NOSQL-6 で切り出し。写像内容は切り出し前と完全に同一）。
+fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError {
+    use crate::catalog::CatalogError;
+    use crate::storage::StorageError;
+    use crate::tenant::TenantWriteError;
+
+    match e {
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
         // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
         TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
-        // `tenant::insert_typed_row_unchecked` 自体は `operation_id` 必須化ガード
-        // （`recovery::required_op_id::LedgerMode`）を持たない（`tenant.rs` モジュール
-        // ドキュメント参照）。本経路（SQL `INSERT`）ではガードを
-        // `sql::allowlist::validate_insert` が書き込みトランザクション開始前に
-        // 既に適用済みのため、この写像アームは実際には到達しない。ただし
-        // `TenantWriteError` の網羅性を保ち、`23502` を返す正しい写像を明示しておく
-        // （TASK-92・対象ビヘイビア: RECOVER-1）。
+        // `tenant::insert_typed_row_unchecked`／`insert_typed_rows_unchecked` 自体は
+        // `operation_id` 必須化ガード（`recovery::required_op_id::LedgerMode`）を
+        // 持たない（`tenant.rs` モジュールドキュメント参照）。本経路（SQL `INSERT`・
+        // NoSQL `insert` op）ではガードを呼び出し元（[`execute_insert`]・
+        // [`execute_insert_batch`]）が書き込みトランザクション開始前に既に適用済み
+        // のため、この写像アームは実際には到達しない。ただし `TenantWriteError` の
+        // 網羅性を保ち、`23502` を返す正しい写像を明示しておく（TASK-92・対象
+        // ビヘイビア: RECOVER-1）。
         TenantWriteError::MissingOperationId => SqlSurfaceError::MissingOperationId,
         // 台帳照合（TASK-101・RECOVER-10）: 同一 operation_id・同一内容の再送は
         // `23505`、内容不一致（v1 レガシーエントリへの再送を含む）は `22023` へ
@@ -2420,10 +2435,85 @@ pub fn execute_insert(
         _ => SqlSurfaceError::Internal {
             detail: "insert failed".to_string(),
         },
-    })?;
+    }
+}
 
+/// NoSQL 表層（`wire-server::http::query::insert`。Issue #771・TASK-178・NOSQL-6）
+/// の `insert` op が `rows` 配列全体を 1 つの `operation_id` に対応づけて書き込む
+/// ための複数行版。SQL-10 の [`execute_insert`]（1 呼び出し = 1 台帳エントリ）とは
+/// 異なり、`bounds` 全体を単一の write トランザクション・単一の台帳エントリへ
+/// まとめる（`crate::tenant::insert_typed_rows_unchecked`／
+/// `crate::recovery::content_hash::for_typed_insert_batch` のドキュメント参照）。
+///
+/// `bounds` は呼び出し元（wire-server）が JSON `rows[*]` を `BoundInsert` へ
+/// 束縛した結果。以下を呼び出し元の責務としてではなく、ここで検証する
+/// （engine クレート外から `BoundInsert` を直接構築してガード・整合性検査を
+/// 迂回できる経路を作らないため。`execute_insert` と同じ設計判断）:
+///
+/// - `bounds` が空 → `22000`（`insert_typed_rows_unchecked` 自体は空バッチを
+///   `Ok(())` で受理するが、`rows: []` は NoSQL 表層の意味論として拒否する。
+///   `core.rs::execute_bound_insert_in_session` の判定順序ドキュメント参照）
+/// - 全要素の `table`・`operation_id` が一致しない → `22000`（fail-closed。
+///   1 要求 = 1 テーブル・1 `operation_id` という契約を守る）
+///
+/// `operation_id` 必須化ガード（TASK-92・RECOVER-1）は本関数が自己完結して
+/// 適用する（`bounds[0].operation_id` を代表値として使う。上記の一致検証により
+/// 全要素で同一であることが保証されている）。`bounds.len() == 1` は
+/// [`execute_insert`] へ委譲し、単行の NoSQL insert が SQL-10 単行 INSERT と
+/// 同一の台帳ハッシュ空間に属するようにする（表層を跨いだ再送も同じ
+/// `(tenant, table, operation_id)` キーで判定される）。
+///
+/// 可視性は [`execute_insert`] と同じく常に [`crate::storage::Visibility::Private`]
+/// に固定する（`Public` 既定は越境露出になるため。上記ドキュメント参照）。
+pub fn execute_insert_batch(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bounds: &[crate::sql::parser::BoundInsert],
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    use crate::storage::Visibility;
+
+    let Some(first) = bounds.first() else {
+        return Err(SqlSurfaceError::invalid_input(
+            "INSERT batch must contain at least one row",
+        ));
+    };
+    if bounds.len() == 1 {
+        return execute_insert(storage, ctx, first, ledger_mode);
+    }
+
+    let table = first.table.as_str();
+    if bounds
+        .iter()
+        .any(|b| b.table != table || b.operation_id != first.operation_id)
+    {
+        return Err(SqlSurfaceError::invalid_input(
+            "INSERT batch rows must share the same table and operation_id",
+        ));
+    }
+
+    let ledger_write = ledger_mode
+        .resolve(first.operation_id.as_ref())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+
+    let rows: Vec<(u64, &[crate::row_codec::Value])> =
+        bounds.iter().map(|b| (b.id, b.values.as_slice())).collect();
+
+    crate::tenant::insert_typed_rows_unchecked(
+        storage,
+        table,
+        ctx,
+        Visibility::Private,
+        &rows,
+        ledger_write,
+    )
+    .map_err(map_insert_write_error)?;
+
+    let rows_affected = u64::try_from(bounds.len()).map_err(|_| SqlSurfaceError::Internal {
+        detail: "insert batch row count overflow".to_string(),
+    })?;
     Ok(InsertOutcome {
-        rows_affected: 1,
+        rows_affected,
         incremental: None,
     })
 }

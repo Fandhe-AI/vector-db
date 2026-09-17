@@ -52,7 +52,12 @@
 //!   NOSQL-11）を担う。`query::op` は `op` 名を閉じた語彙 4 値（`search`／
 //!   `scan`／`aggregate`／`insert`）へ分類する許可リストで、語彙外
 //!   （DDL・UDF 呼び出し・トランザクション制御・UPDATE／DELETE 相当を含む）
-//!   を `0A000` へ写像する（Issue #759・TASK-179・NOSQL-1・NOSQL-9）
+//!   を `0A000` へ写像する（Issue #759・TASK-179・NOSQL-1・NOSQL-9）。`query::insert`
+//!   は `insert` op を `engine::sql::exec::execute_insert_batch`／
+//!   `EngineCore::execute_bound_insert_in_session` へ写像し、`operation_id` 必須化
+//!   （`23502`）・台帳照合による再送判定（`23505`／`22023`）・INDEX-4 上限
+//!   （`54000`）を適用する（Issue #771・TASK-178・NOSQL-6。`gate.rs` への結線は
+//!   対象外）
 //! - [`session`]: HTTP セッション認証の構成要素（トークン生成・エンコード
 //!   〔Issue #750・TASK-174・HTTP-4〕、TTL 固定・同時有効数上限付きの
 //!   メモリ内セッションストア〔`session::store::SessionStore`。Issue #751・

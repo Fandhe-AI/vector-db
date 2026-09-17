@@ -360,6 +360,39 @@ pub(crate) fn for_typed_insert(
     Ok(b.finish())
 }
 
+/// [`for_typed_insert_batch`]・`tenant::insert_typed_rows_unchecked` が共有する
+/// 1 行分のハッシュ材料（`(id, visibility, embedding, 非 VECTOR 列の列名付き
+/// ペア列)`）。`clippy::type_complexity` 回避のための型エイリアス（意味は
+/// タプルの並びそのもの。`tenant.rs` からも参照する）。
+pub(crate) type TypedInsertBatchRow<'a> = (u64, Visibility, &'a [f32], &'a [(&'a str, &'a Value)]);
+
+/// `insert_typed_rows_unchecked` 用（Issue #771・TASK-178・NOSQL-6。TASK-101・
+/// RECOVER-10 の型付き挿入経路をバッチへ拡張したもの）。1 つの `operation_id` が
+/// 要求記載順の複数行をまとめて覆う点は [`OpTag::InsertBatch`]（[`for_insert_batch_encoded`]
+/// と共有するタグ。「新規挿入をバッチでまとめて行う」操作として同じ操作種別に
+/// 属する）で表す。入力: 要求記載順の `(id, visibility, embedding, 非 VECTOR 列の
+/// 列名付きペア列)`。各行のハッシュ材料は [`for_typed_insert`] と同一の組み立て
+/// （`push_u64(id)` → `push_u8(visibility)` → [`push_vector`] → [`push_named_scalar_columns`]）
+/// を行ごとに連結する（列名ベース・PR #248 の教訓を踏襲。`ALTER TABLE ADD COLUMN`
+/// を挟んだ再送でも列幅がずれない）。並び替えた同一集合の再送は意図的に区別する
+/// （[`for_insert_batch_encoded`] と同じ設計。件数プレフィクスに続けて行ごとの
+/// フィールドを連結する）。
+pub(crate) fn for_typed_insert_batch(
+    rows: &[TypedInsertBatchRow<'_>],
+) -> Result<ContentHash, StorageError> {
+    let count = u32::try_from(rows.len())
+        .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
+    let mut b = HashInputBuilder::new(OpTag::InsertBatch);
+    b.push_raw(&count.to_le_bytes());
+    for (id, visibility, embedding, columns) in rows {
+        b.push_u64(*id);
+        b.push_u8(visibility.to_byte());
+        push_vector(&mut b, embedding)?;
+        push_named_scalar_columns(&mut b, columns)?;
+    }
+    Ok(b.finish())
+}
+
 /// `update_row_unchecked` 用（TASK-101 対象経路 4）。入力: `(id, encoded_row)`。
 /// `encoded_row` は呼び出し元が事前に 1 回だけ `encode_row` した結果
 /// （[`for_insert_encoded`] と同じ理由。Issue #397）。
@@ -970,6 +1003,65 @@ mod tests {
         let h_public = for_typed_insert(7, Visibility::Public, &embedding, &cols).expect("hash");
         let h_private = for_typed_insert(7, Visibility::Private, &embedding, &cols).expect("hash");
         assert_ne!(h_public, h_private);
+    }
+
+    // Issue #771: `for_typed_insert_batch` は要求記載順を入力に含めるため、
+    // 同一集合でも並び替えると別ハッシュになる（`for_insert_batch_encoded` と
+    // 同じ設計判断。並び替えた同一集合の再送は意図的に区別する）。
+    #[test]
+    fn for_typed_insert_batch_differs_when_row_order_changes() {
+        let embedding_a = [1.0_f32, 0.0, 0.0];
+        let embedding_b = [0.0_f32, 1.0, 0.0];
+        let title = Value::Text("hello".to_string());
+        let cols: [(&str, &Value); 1] = [("title", &title)];
+        let rows_forward: [TypedInsertBatchRow<'_>; 2] = [
+            (1, Visibility::Private, &embedding_a, &cols),
+            (2, Visibility::Private, &embedding_b, &cols),
+        ];
+        let rows_reversed: [TypedInsertBatchRow<'_>; 2] = [
+            (2, Visibility::Private, &embedding_b, &cols),
+            (1, Visibility::Private, &embedding_a, &cols),
+        ];
+        let h_forward = for_typed_insert_batch(&rows_forward).expect("hash");
+        let h_reversed = for_typed_insert_batch(&rows_reversed).expect("hash");
+        assert_ne!(h_forward, h_reversed);
+    }
+
+    // 行ごとの `visibility` の違いはバッチ全体のハッシュへ反映される
+    // （`for_typed_insert_differs_by_visibility` の複数行版）。
+    #[test]
+    fn for_typed_insert_batch_differs_by_row_visibility() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let title = Value::Text("hello".to_string());
+        let cols: [(&str, &Value); 1] = [("title", &title)];
+        let rows_public: [TypedInsertBatchRow<'_>; 1] =
+            [(7, Visibility::Public, &embedding, &cols)];
+        let rows_private: [TypedInsertBatchRow<'_>; 1] =
+            [(7, Visibility::Private, &embedding, &cols)];
+        let h_public = for_typed_insert_batch(&rows_public).expect("hash");
+        let h_private = for_typed_insert_batch(&rows_private).expect("hash");
+        assert_ne!(h_public, h_private);
+    }
+
+    // `for_typed_insert` と同じく、`ALTER TABLE ADD COLUMN` 相当（未提供 →
+    // `Value::Null` の追加列）を挟んでもバッチ全体のハッシュは不変（列名ベース・
+    // `Null` 除外の設計を複数行版でも維持する）。
+    #[test]
+    fn for_typed_insert_batch_is_stable_across_added_nullable_column() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let title = Value::Text("hello".to_string());
+        let before: [(&str, &Value); 1] = [("title", &title)];
+        let rows_before: [TypedInsertBatchRow<'_>; 1] =
+            [(7, Visibility::Public, &embedding, &before)];
+        let h_before = for_typed_insert_batch(&rows_before).expect("hash");
+
+        let null_note = Value::Null;
+        let after: [(&str, &Value); 2] = [("title", &title), ("note", &null_note)];
+        let rows_after: [TypedInsertBatchRow<'_>; 1] =
+            [(7, Visibility::Public, &embedding, &after)];
+        let h_after = for_typed_insert_batch(&rows_after).expect("hash");
+
+        assert_eq!(h_before, h_after);
     }
 
     // Issue #397 のピン留め: `for_insert_encoded` は「呼び出し元が事前エンコードした

@@ -20,8 +20,9 @@
 //! - フィールド値の**語彙・範囲**検査（`filter[].op` の `eq`／`prefix`、
 //!   `aggregates[].fn` の関数名、`limit` の非負性等。#761・#763・#766・
 //!   #768・#769）
-//! - `insert` の `operation_id` 欠落／`null`／空文字 → `23502`、`rows[*]` の
-//!   列検証（#771）
+//!
+//! `insert` op の `operation_id` 欠落／`null`／空文字 → `23502`・`rows[*]` の
+//! 列検証・engine への束縛・実行は [`super::insert`]（Issue #771・NOSQL-6）が担う。
 //!
 //! 未知キーは無視せず拒否する（NOSQL-8 の一般則。クライアント自己申告の
 //! `tenant_id`（HTTP-7）・`HINT ORDER`／`SET search_mode` 相当フィールド
@@ -604,9 +605,9 @@ pub static AGGREGATE_SCHEMA: ObjectSchema = ObjectSchema {
 };
 
 /// `insert` op のトップレベルスキーマ（NOSQL-6 ポインタ）。`operation_id` の
-/// 欠落／`null`／空文字 → `23502`、`rows[*]` の列検証は #771 が担う（本
-/// ヘルパーでは `operation_id` を Required にせず、`rows` は任意列名を
-/// 持つため `Array(Any)` として型のみ検査する）。
+/// 欠落／`null`／空文字 → `23502`、`rows[*]` の列検証は [`super::insert`]
+/// （Issue #771）が担う（本ヘルパーでは `operation_id` を Required にせず、`rows`
+/// は任意列名を持つため `Array(Any)` として型のみ検査する）。
 pub static INSERT_SCHEMA: ObjectSchema = ObjectSchema {
     name: "insert",
     fields: &[

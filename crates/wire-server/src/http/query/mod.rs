@@ -16,10 +16,14 @@
 //! middleware::SessionPrincipal`）に対する `POST /v1/query` の入口本体で、
 //! `tenant_id` 相当ヘッダの拒否・op 許可リスト判定・本文のスキーマ検証
 //! までを行い、検証を通過した要求には暫定の `0A000`／501 応答を返す
-//! （Issue #754・#759。束縛・実行は #763 以降が本 seam を置き換える）。
+//! （Issue #754・#759。束縛・実行は #763 以降が本 seam を置き換える）。[`insert`] は
+//! `insert` op を `engine::sql::exec::execute_insert_batch`／
+//! `EngineCore::execute_bound_insert_in_session` へ写像する（Issue #771・TASK-178・
+//! NOSQL-6。`gate.rs` への結線は対象外・別 Issue の担当）。
 
 pub mod filter;
 pub mod gate;
+pub mod insert;
 pub mod op;
 pub mod response;
 pub mod schema;

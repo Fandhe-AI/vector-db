@@ -841,6 +841,149 @@ pub(crate) fn insert_typed_row_unchecked(
     Ok(())
 }
 
+/// [`insert_typed_row_unchecked`] の複数行版（Issue #771・TASK-178・NOSQL-6）。
+/// NoSQL 表層（`wire-server::http::query::insert`）の `insert` op が 1 回の要求で
+/// `rows` 配列全体を 1 つの `operation_id` に対応づけて書き込むために必要とする
+/// （`crate::sql::exec::execute_insert`／`insert_typed_row_unchecked` は 1 呼び出し
+/// = 1 台帳エントリのため、複数行を同一 `operation_id` で逐次呼ぶと 2 行目以降が
+/// 誤って再送判定される。`insert_rows_unchecked` が生 `RowInput` 向けに持つのと
+/// 同型のバッチ経路を、型付き値列向けに提供する）。
+///
+/// ガードなし実体（`pub(crate)`。[`insert_typed_row_unchecked`] と同じ設計）。
+/// クレート外の唯一の呼び出し元は [`crate::sql::exec::execute_insert_batch`]
+/// （`operation_id` 必須化ガードを自己完結して適用する）。
+///
+/// 各行の `values` はスキーマ列順（`id` 疑似列を含まない）。バッチ内 `id` 重複は
+/// [`insert_rows_unchecked`] と同じく [`TenantWriteError::IdConflict`] で拒否する
+/// （行ストアへ触れる前に検出。同一テナント名前空間内のスコープであることも同じ）。
+/// 単一の write トランザクションで完結し、失敗時は部分書き込みが残らない
+/// （台帳追記は各行の書き込みより前に同一トランザクション内で行う。
+/// `for_typed_insert_batch` のドキュメント参照）。
+pub(crate) fn insert_typed_rows_unchecked(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    visibility: crate::storage::Visibility,
+    rows: &[(u64, &[crate::row_codec::Value])],
+    ledger_write: LedgerWrite<'_>,
+) -> Result<(), TenantWriteError> {
+    validate_identifier(table)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    // バッチ内 id 重複検出（`insert_rows_unchecked` と同じ設計。確保はフォール
+    // ブルにする。coding-rust.md）。
+    let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    seen_ids.try_reserve(rows.len()).map_err(|_| {
+        TenantWriteError::Storage(StorageError::Codec(
+            "failed to reserve batch id set".to_string(),
+        ))
+    })?;
+    for (id, _) in rows {
+        if !seen_ids.insert(*id) {
+            return Err(TenantWriteError::IdConflict);
+        }
+    }
+
+    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    {
+        let schema = require_table_schema_write(&write_txn, table)?;
+        let vector_idx = schema
+            .columns
+            .iter()
+            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
+            .ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "table has no VECTOR column".to_string(),
+                ))
+            })?;
+
+        // ハッシュ材料（`(id, visibility, embedding, 列名付きペア列)`）を要求記載順で
+        // 事前に組み立てる（`for_typed_insert_batch` ドキュメント参照）。列名付き
+        // ペア列は行ごとに新規確保するため、[`content_hash::TypedInsertBatchRow`]
+        // （スライス版）ではなく `Vec` を保持する中間型を使う
+        // （`clippy::type_complexity` 回避のためのエイリアス）。
+        type HashRow<'a> = (
+            u64,
+            crate::storage::Visibility,
+            &'a [f32],
+            Vec<(&'a str, &'a crate::row_codec::Value)>,
+        );
+        let mut hash_rows: Vec<HashRow<'_>> = Vec::new();
+        hash_rows.try_reserve_exact(rows.len()).map_err(|_| {
+            TenantWriteError::Storage(StorageError::Codec(
+                "failed to reserve batch hash input".to_string(),
+            ))
+        })?;
+        for (id, values) in rows {
+            let embedding: &[f32] = match values.get(vector_idx) {
+                Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                _ => {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "VECTOR column value missing or not a Vector".to_string(),
+                    )))
+                }
+            };
+            schema.validate_embedding_dim(embedding.len())?;
+            let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(idx, column)| {
+                    *idx != vector_idx
+                        && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
+                })
+                .filter_map(|(idx, column)| {
+                    values.get(idx).map(|value| (column.name.as_str(), value))
+                })
+                .collect();
+            hash_rows.push((*id, visibility, embedding, named_columns));
+        }
+        let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
+            .iter()
+            .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
+            .collect();
+        let content_hash = content_hash::for_typed_insert_batch(&hash_input)?;
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            &content_hash,
+        )?;
+
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+        for (id, values) in rows {
+            let embedding: &[f32] = match values.get(vector_idx) {
+                Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                _ => {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "VECTOR column value missing or not a Vector".to_string(),
+                    )))
+                }
+            };
+            let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
+                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+            let row = RowInput {
+                tenant_id: ctx.tenant_id(),
+                visibility,
+                embedding,
+                metadata: &metadata,
+            };
+            let key = (ctx.tenant_id(), *id);
+            let encoded = encode_row(&row)?;
+            insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+        }
+    }
+    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
+    crate::recovery::commit_boundary::commit(write_txn)?;
+    Ok(())
+}
+
 /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
 ///
 /// `row.tenant_id` が `ctx` のテナントと不一致なら
