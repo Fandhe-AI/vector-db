@@ -76,6 +76,21 @@
 //!
 //! 受信データ経路（要求行・ヘッダ・本文の読み取り）のため
 //! `unwrap`／`expect`／添字アクセス（`[]`）を用いない。
+//!
+//! ## RECOVER-5（応答境界）と `catch_unwind` の相互作用
+//!
+//! 上記の `catch_unwind` は production では `fail_fast` の panic hook が
+//! 先に発火するため実際には到達しないが、`fail_fast::install` を呼ばない
+//! ライブラリ利用では commit 成功後の panic を「通常の `500` へ縮退させて
+//! 処理を継続する」経路になってしまう（`insert` op が engine の commit
+//! 境界へ到達する唯一の HTTP 書き込み op。RECOVER-5 違反）。
+//! [`build_outcome`] は `handler.handle` の呼び出しを
+//! `engine::recovery::commit_boundary::ResponseBoundaryGuard` で覆い、
+//! `catch_unwind` が panic を捕捉するより前（unwind 中）にこのガードの
+//! `Drop` が作用して `std::process::abort()` することで、`catch_unwind` の
+//! 有無に関わらず commit 成功後の panic を常にプロセス終了へ倒す
+//! （`crate::simple_query::execute_and_respond` が SQL wire 側で使うのと
+//! 同じ機構。詳細は [`build_outcome`] 内のコメント参照）。
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -334,6 +349,19 @@ pub(crate) fn handle_connection_with<H: RequestHandler>(
 /// 形）。書き込み失敗は無視する（新たなブロッキング点・panic を作らない）。
 /// `drain_budget` は呼び出し元（[`build_outcome`]）が [`Outcome::Respond`]
 /// ごとに決めた読み捨て上限バイト数。
+///
+/// 本関数は `handle_connection_with` の `catch_unwind` の**外側**（`Result` を
+/// 見てから呼ばれる区間）で実行され、`build_outcome` の
+/// `ResponseBoundaryGuard` の保護区間には含まれない（モジュール doc「panic
+/// 非伝播と RECOVER-8（fail-fast）との関係」節参照）。ここへ到達する時点で
+/// `Outcome::Respond` の `bytes` は既に確定済み（commit を伴う分岐は
+/// `build_outcome` 側で完了している）であり、本関数自体は commit を一切
+/// 行わないため保護対象の区間には当たらない。ガードをここまで広げようとして
+/// `handle_connection_with` 側に外側ガードを追加で置くと、`ResponseBoundaryGuard`
+/// のネスト規約（外側が境界を所有し内側は no-op で drop する設計。
+/// `commit_boundary.rs` 参照）により、`catch_unwind` 内側の panic が
+/// `catch_unwind` で止まった時点でスレッドは非 panicking に戻り、外側ガードの
+/// 通常 drop は abort しない——保護がかえって失われるため意図的に行わない。
 fn respond_and_close(stream: &mut TcpStream, bytes: &[u8], drain_budget: usize) {
     let _ = stream.write_all(bytes);
     drain_and_close(stream, LINGER_DRAIN_TIMEOUT, drain_budget);
@@ -421,6 +449,37 @@ fn build_outcome<H: RequestHandler>(
         headers,
         body: &body_bytes,
     };
+
+    // commit 成功から `handler.handle` が応答バイト列を返し終えるまでの区間を
+    // 覆う RAII ガード（RECOVER-5 (3)。`crate::simple_query::execute_and_respond`
+    // が `ResponseBoundaryGuard` を使う契約と同じ機構を HTTP 側の書き込み経路
+    // （`insert` op。`crate::http::query::insert::execute` が
+    // `EngineCore::execute_bound_insert_in_session` 経由で commit する）にも
+    // 適用する（codex-review P1 指摘・PR #829）。
+    //
+    // 本モジュール（`build_outcome`）は `handle_connection_with` の
+    // `catch_unwind` の**中身**として呼ばれる（モジュール doc「panic 非伝播と
+    // RECOVER-8（fail-fast）との関係」節参照）。production では
+    // `main.rs::run_server` が起動時に導入する `engine::recovery::fail_fast`
+    // の panic hook が unwind 前に `abort()` するためこの `catch_unwind` へは
+    // 実際には到達しないが、`fail_fast::install` を呼ばない**ライブラリ利用**
+    // （`wire-server` を lib として使う経路・テスト）では `catch_unwind` が
+    // panic を捕捉し、書き込み未着手のまま `500`／`ErrorClass::InternalError`
+    // へ縮退させてしまう（commit 済みの書き込みを通常失敗として応答する
+    // RECOVER-5 違反）。`ResponseBoundaryGuard::drop` は
+    // `std::thread::panicking()`（unwind 中かどうか）だけを見て
+    // `std::process::abort()` するため、`catch_unwind` に頼らず
+    // **`handler.handle` が unwind してこのスコープを抜ける時点**（＝
+    // `catch_unwind` が payload を捕捉するより前）で作用する。これにより
+    // `catch_unwind` の存在有無に関わらず、commit 成功後の panic は常に
+    // プロセス終了へ倒れる（`fail_fast` と同じ帰結を構造的に保証する）。
+    //
+    // `_response_boundary` を `let _ = ...`（無名束縛）に書き換えると即座に
+    // drop され、この保護区間全体が無効化される（`ResponseBoundaryGuard` は
+    // `#[must_use]`。`handler.handle` の呼び出しを跨いで生存させるため必ず
+    // この名前付き束縛のまま保つ。`simple_query.rs` の同型コメント参照）。
+    let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
+
     // 本文（宣言長ぶん）は `read_body` が既に読み切っている。これ以上
     // 届くバイト列は「宣言」を持たない非パイプライン設計上の想定外の
     // 追加データであり、量を見積もる根拠が無いためフォールバック予算

@@ -375,6 +375,17 @@ pub fn execute(
         )
         .map_err(InsertError::Exec)?;
 
+    // Issue #829（テスト専用・feature `fault-injection` 限定）: この直前の
+    // `execute_bound_insert_in_session` が commit まで成功した直後（＝
+    // `crate::http::conn::build_outcome` の `ResponseBoundaryGuard` が
+    // 保護している区間の内側）にだけ検査する。これより後ろへ移動すると
+    // 呼び出し元（`handle`）の応答整形（`encode_success_body`）まで通過して
+    // しまい「commit 成功後の panic」を再現できなくなる。feature 無効時は
+    // この呼び出しごとコンパイルされず、既定ビルドの挙動・コード生成は
+    // 完全に不変（`crate::simple_query` の同型コメント参照）。
+    #[cfg(feature = "fault-injection")]
+    crate::fault_injection::maybe_panic_after_http_insert_commit();
+
     Ok(InsertSuccess {
         inserted: outcome.rows_affected,
         operation_id,

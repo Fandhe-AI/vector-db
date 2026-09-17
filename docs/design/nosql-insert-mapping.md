@@ -113,7 +113,14 @@
   区別不能性検証（NoSQL 表層版の層 B 計測ハーネス。SQL wire 版は
   `wire_tenant_row_id_scope.rs` の Issue #738 層 B・`make
   wire-tenant-latency` を参照）
-- commit 後 panic 時の緊急応答（RECOVER-6）の HTTP 表層対応（`insert` は
-  HTTP 表層で初めて到達可能になる書き込み op のため、commit 境界を跨いだ
-  panic の観測可能性は別途整理が必要。production では RECOVER-8 の
-  panic hook が abort するため実害は限定的）
+- commit 後 panic 時の緊急応答（RECOVER-6。`ErrorResponse` 相当の同期送出）の
+  HTTP 表層対応。応答境界の安全性側（RECOVER-5。commit 成功後の panic を
+  通常の `500` へ縮退させず必ずプロセス終了へ倒す）は
+  `crate::http::conn::build_outcome` が `engine::recovery::commit_boundary::
+  ResponseBoundaryGuard` で `insert` op の実行区間を覆うことで対応済み
+  （codex-review P1 指摘・PR #829）。一方、observability 側（RECOVER-6。
+  SQL wire の `crate::simple_query::build_emergency_response_bytes` に相当する
+  「commit 済みかもしれない」旨の同期 HTTP 応答をクライアントへ返す経路）は
+  未実装のまま（`insert` は HTTP 表層で初めて到達可能になる書き込み op。
+  production では RECOVER-8 の panic hook が先に abort するため、緊急応答が
+  未実装でも「サイレントな接続断」に留まり応答一意性そのものは損なわれない）
