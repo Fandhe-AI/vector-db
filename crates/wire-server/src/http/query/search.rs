@@ -19,22 +19,35 @@
 //! フィールド `embedder`／`query_planner` 経由の I/O）が必要なため、本
 //! モジュールでは束縛可能な部品（投影・フィルタ・`limit`・未解決 `mode`・
 //! 原質問）を [`PlanSearch`] として返すに留める。`BoundStatement` までの
-//! 完成は #764（`EngineCore` への binder-closure 型エントリ追加）の担当。
+//! 完成・実行は [`execute`]／[`handle`] が [`EngineCore::
+//! execute_bound_search_in_session`]（`vector` 指定）・[`EngineCore::
+//! execute_bound_plan_search_in_session`]（`plan` 指定。TASK-186・
+//! NOSQL-2・Issue #764）へ委譲する（第 2 の実行器を作らない設計。
+//! `docs/design/bound-plan-session-entry.md` 参照）。
 //!
 //! RLS はサーバー側の `PolicyContext` 暗黙適用のみで、クライアントは述語を
-//! 書けない（`security.md` P0「テナント境界」）。本モジュールは
+//! 書けない（`security.md` P0「テナント境界」）。[`bind_search`] は
 //! `PolicyContext` を一切受け取らず、`BoundStatement::new` の
-//! `rls_predicate_present` は常に `false` で構築する。
+//! `rls_predicate_present` は常に `false` で構築する。`vector`／`plan` いずれ
+//! でも RLS 暗黙適用は [`EngineCore`] 側（`execute_statement_with_cache` の
+//! `ImplicitRlsHook`。RLS-7）が担い、本モジュールはテナント判定を一切行わ
+//! ない。
 //!
-//! 対象外: 実行そのもの（#764）・`explain` フィールドの判定利用（#765。
-//! 本モジュールは値の保持のみ）。
+//! `explain: true` は [`execute`] が実行前に拒否する（黙って無視すると
+//! fail-open になるため。`vector` 指定は `42601`——SQL-6 の `EXPLAIN SELECT
+//! ... ORDER BY` 拒否と同じ分類、`plan` 指定は `0A000`——[`super::gate::
+//! PLACEHOLDER_MESSAGE`] と同型の未実装扱い。正式な `explain` op 写像は
+//! NOSQL-10・Issue #765 の担当）。
+
+use std::time::SystemTime;
 
 use engine::catalog::TableSchema;
+use engine::core::{EngineCore, PlanSearchBinding};
 use engine::declarative_filter::MetadataFilter;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::sql::allowlist::{validate_using_plan_question, SqlSurfaceError};
-use engine::sql::mode::{self, SearchMode};
+use engine::sql::mode::{self, SearchMode, SessionState};
 use engine::sql::parser::{
     bind_body_text_column, bind_column_projection, bind_vector_values, require_vector_column,
     validate_search_limit, BoundStatement, ProjectedColumn, Ranking,
@@ -44,6 +57,8 @@ use engine::sql::plan::EvaluationOrder;
 use super::filter::{bind_filter, FilterError};
 use super::ident::{self, InvalidIdentifier};
 use super::schema::{SchemaError, Validated};
+use crate::http::response as http_response;
+use crate::http::session::middleware::SessionPrincipal;
 
 /// `plan` 指定の束縛結果（Issue #763 時点での中間形）。LLM 展開・再埋め込みは
 /// engine 内部 I/O（`EngineCore` の private フィールド経由）を要するため、
@@ -138,9 +153,18 @@ pub enum SearchError {
     InvalidIdentifier,
     /// `filter` 配列の写像・束縛エラー（[`FilterError`] をそのまま透過）。
     Filter(FilterError),
-    /// engine の束縛ヘルパー（投影・ベクトル値・本文列・`LIMIT`・`mode`）の
-    /// エラーをそのまま透過する（`22000`／`54000`）。
+    /// engine の束縛ヘルパー（投影・ベクトル値・本文列・`LIMIT`・`mode`）・
+    /// [`EngineCore::execute_bound_search_in_session`]／[`EngineCore::
+    /// execute_bound_plan_search_in_session`] の実行エラーをそのまま透過する
+    /// （`22000`／`54000`／`42P01`／`XX000` 等）。
     Bind(SqlSurfaceError),
+    /// `vector` 指定に `explain: true` を伴う要求（SQL-6 の `EXPLAIN SELECT
+    /// ... ORDER BY` 拒否と同じ分類。`42601`）。
+    ExplainRequiresPlan,
+    /// `plan` 指定に `explain: true` を伴う要求（正式な `explain` op 写像は
+    /// NOSQL-10・Issue #765 の担当。[`super::gate::PLACEHOLDER_MESSAGE`] と
+    /// 同型の未実装扱い。`0A000`）。
+    ExplainNotSupported,
 }
 
 impl From<SchemaError> for SearchError {
@@ -175,7 +199,9 @@ impl ClassifiedError for SearchError {
             | SearchError::VectorAndPlanBothMissing
             | SearchError::PlanWithHybrid
             | SearchError::EmptyColumns
-            | SearchError::InvalidIdentifier => ErrorClass::UnsupportedSqlSyntax,
+            | SearchError::InvalidIdentifier
+            | SearchError::ExplainRequiresPlan => ErrorClass::UnsupportedSqlSyntax,
+            SearchError::ExplainNotSupported => ErrorClass::FeatureNotSupported,
             SearchError::Filter(err) => err.error_class(),
             SearchError::Bind(err) => err.error_class(),
         }
@@ -197,6 +223,10 @@ impl ClassifiedError for SearchError {
                 "search request \"columns\" must not be an empty array".to_string()
             }
             SearchError::InvalidIdentifier => "invalid identifier".to_string(),
+            SearchError::ExplainRequiresPlan => {
+                "explain is not supported for a vector search".to_string()
+            }
+            SearchError::ExplainNotSupported => EXPLAIN_NOT_YET_SUPPORTED_MESSAGE.to_string(),
             SearchError::Filter(err) => err.client_message(),
             SearchError::Bind(err) => err.client_message(),
         }
@@ -401,6 +431,190 @@ pub fn bind_search(
         query_mode,
         explain,
     }))
+}
+
+/// `explain: true` を伴う `plan` 検索に返す固定文言（[`super::gate::
+/// PLACEHOLDER_MESSAGE`]・`aggregate.rs::EXPLAIN_NOT_YET_SUPPORTED_MESSAGE`
+/// と同型の「未実装」扱い。NOSQL-10・Issue #765 の担当）。
+pub const EXPLAIN_NOT_YET_SUPPORTED_MESSAGE: &str = "search explain is not yet available";
+
+/// binder closure（`Fn(...) -> Result<_, SqlSurfaceError>`）の戻り値型に
+/// [`SearchError`] をそのまま渡せないため、`Bind`（engine 側の分類をそのまま
+/// 持つ）・`Filter(FilterError::Bind(_))`（`declarative_filter::bind_all` 由来。
+/// `22000`／`54000` 等の分類を保つ）は中身の [`SqlSurfaceError`] をそのまま
+/// 使う。それ以外（形状・排他判定・識別子形状・`filter` の演算子語彙／RLS
+/// 述語名違反等）はいずれも `SqlSurfaceError::UnsupportedSyntax` 自身と同じ
+/// 分類（`42601`）のため、その variant として復元してよい（`aggregate.rs::
+/// to_sql_surface_error` と同じ判断。[`EngineCore::
+/// execute_bound_search_in_session`]／[`EngineCore::
+/// execute_bound_plan_search_in_session`] は binder のエラーをそのまま
+/// 呼び出し元へ返す契約のため、[`execute`] 側の `From<SqlSurfaceError> for
+/// SearchError` により最終的な `wire_code`／`client_message` はここでの分類
+/// のまま保たれる）。
+fn to_sql_surface_error(err: SearchError) -> SqlSurfaceError {
+    match err {
+        SearchError::Bind(inner) | SearchError::Filter(FilterError::Bind(inner)) => inner,
+        other => SqlSurfaceError::UnsupportedSyntax {
+            detail: other.client_message(),
+        },
+    }
+}
+
+/// `validated`（`search` op のスキーマ検証済み要求本文）を `engine` 上で
+/// 実行する。`principal` の [`SessionPrincipal::policy_context`] のみから
+/// RLS 境界（テナント）を導出し（RLS-7・本モジュールはテナント判定を一切
+/// 行わない）、`explain: true` の拒否をここで行う。
+///
+/// `vector`・`plan` の両方指定（排他違反）は、スキーマ解決を要さない
+/// 構造的な契約違反として本関数の先頭で確定させ（[`SearchError::
+/// VectorAndPlanBothPresent`]）、以降のディスパッチには進まない。よって
+/// 以下のディスパッチ先（[`EngineCore::execute_bound_search_in_session`]／
+/// [`EngineCore::execute_bound_plan_search_in_session`]）の呼び分けが実際に
+/// 見るのは「ちょうど一方だけ指定」／「両方欠落」の 3 ケースで、これも
+/// スキーマに依存しない `plan` フィールドの有無のみで決める（`plan` あり
+/// なら `Plan` 側エントリ、`plan` なしなら `Vector` 側エントリを呼べば、
+/// 両方欠落の場合も含め `bind_search` 自身が正しい分岐・エラーを返す）。
+/// `bind_search` は schema 依存の束縛を担うため、実際の呼び分け確定は各
+/// エントリの binder closure 内で行う。
+pub fn execute(
+    engine: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+) -> Result<engine::sql::exec::QueryResult, SearchError> {
+    let table = validated.required_str("table")?;
+    ident::check_identifier(table)?;
+
+    let vector_present = validated.optional_array("vector")?.is_some();
+    let plan_present = validated.optional_str("plan")?.is_some();
+
+    // `vector`・`plan` の両方指定はスキーマ解決（テーブルの存在確認）を
+    // 一切要さない、要求本文自身が抱える構造的な契約違反であるため、他の
+    // どの検証よりも先にここで確定させる（codex-review P1 指摘・PR #827）。
+    // 修正前は下の `plan_present` 分岐内でローカルに行う
+    // `validate_using_plan_question`・`mode` 解析（いずれも engine 呼び出し
+    // 前のローカル処理）が、`bind_search` の排他判定（engine 呼び出し内の
+    // closure 経由。テーブル解決後に実行される）より手前に位置していたため、
+    // `vector` も同時に指定された要求では排他違反（`42601`）より先に
+    // `plan` の長さ超過（`54000`）や `mode` の解析失敗（`22000`）が
+    // 返ってしまっていた——つまり修正前もこの組合せでは「テーブル解決が
+    // 排他判定に先行する」優先順位は元々保証されていなかった（ローカル
+    // 検証が先に確定するため）。本行はこの構造をそのまま踏襲し、両方指定
+    // という契約違反自体をテーブル解決より前に確定させる。未知テーブル単体
+    // （`vector`／`plan` のどちらか一方だけを指定）に対する `42P01` 優先
+    // （`undefined_table_rejects_with_42p01_before_exclusivity_check`）は
+    // この判定が `vector_present && plan_present` のときにしか発火しない
+    // ため変わらない。
+    if vector_present && plan_present {
+        return Err(SearchError::VectorAndPlanBothPresent);
+    }
+
+    // `explain: true` の拒否は `vector`／`plan` のどちらか一方だけが指定
+    // された「（排他契約上）有効な形の要求」に限って行う（cursor[bot]
+    // 指摘・PR #827）。両方指定は上の排他判定で既に確定済みのためここへは
+    // 到達しない。両方欠落のときにここで `explain` 専用の分類（`plan`
+    // 指定時 `0A000`・`vector` 指定時 `42601`）へ先回りして拒否すると、
+    // 未知テーブルが排他判定より先に `42P01` で拒否される既存の優先順位
+    // 契約（`undefined_table_rejects_with_42p01_before_exclusivity_check`。
+    // 本関数はテーブル存在確認の前にここへ到達するため、`table` なしで
+    // 判定してしまうと `42P01` より先に応答が確定してしまう）を壊す。
+    // `vector_present != plan_present`（ちょうど一方だけ true。上の早期
+    // 判定により両方 true は既に排除済みなので実質 `||` と等価）のときのみ
+    // 早期拒否し、それ以外（いずれも false）は通常のディスパッチへ進めて
+    // `bind_search` 自身のテーブル存在確認の優先順位に委ねる（両方欠落かつ
+    // `explain: true` の場合も、テーブルが存在すれば最終的に `bind_search`
+    // が `VectorAndPlanBothMissing`＝`42601` を返すため、旧来の
+    // `ExplainRequiresPlan`＝`42601` と wire_code は変わらない）。
+    if validated.optional_bool("explain")?.unwrap_or(false) && vector_present != plan_present {
+        return Err(if plan_present {
+            SearchError::ExplainNotSupported
+        } else {
+            SearchError::ExplainRequiresPlan
+        });
+    }
+
+    let session = SessionState::default();
+    let ctx = principal.policy_context();
+
+    if plan_present {
+        let question = validated.required_str("plan")?;
+        validate_using_plan_question(question)?;
+        let limit_raw = validated.required_u32("limit")?;
+        // `EngineCore::execute_bound_plan_search_in_session` は範囲検証前の
+        // 生 `u32` を受け取り、内部で `validate_search_limit` を通す（多層
+        // 防御としてここでも一度通し、範囲外を engine 呼び出し前に拒否する。
+        // `bind_search`〔schema 依存の束縛〕側でも同じ検証が再度行われる）。
+        validate_search_limit(limit_raw)?;
+        // `mode` の識別子形状検査・`SearchMode::parse_literal` はここでは
+        // 行わない（cursor[bot] 指摘対応・PR #827）。以前はここで先に解析
+        // していたため、テーブル未存在＋ `mode` 値不正の要求で `42P01` より
+        // 先に `22000` が確定してしまっていた（`vector` 指定検索は
+        // `bind_search` が同じ解析をテーブル解決後〔`execute_bound_search_
+        // in_session` の `read_txn_with_schema` 後〕に行うため、この問題が
+        // 無かった）。生リテラルをそのまま渡し、
+        // `EngineCore::run_using_plan_select` がテーブル解決後に初めて
+        // 解析することで `vector` 指定検索と同一の fail-closed 順序を保つ。
+        let mode_literal = validated.optional_str("mode")?;
+        let result = engine.execute_bound_plan_search_in_session(
+            ctx,
+            &session,
+            table,
+            question,
+            mode_literal,
+            limit_raw,
+            |schema, _udfs| match bind_search(validated, schema).map_err(to_sql_surface_error)? {
+                BoundSearch::Plan(plan) => Ok(PlanSearchBinding::new(
+                    plan.projection().to_vec(),
+                    plan.metadata_filters().to_vec(),
+                )),
+                // `plan_present` が `true` の間は `bind_search` が
+                // `BoundSearch::Vector` を返すことはない（両者は同一の
+                // `validated` を見て同じ排他判定を行うため）。到達した場合は
+                // 受信データ経路での `unwrap`/`expect` を避けつつ fail-closed
+                // に拒否する（`.claude/rules/coding-rust.md`）。
+                BoundSearch::Vector(_) => Err(SqlSurfaceError::Internal {
+                    detail: "search binder returned a vector form for a plan request".to_string(),
+                }),
+            },
+        )?;
+        Ok(result)
+    } else {
+        let result =
+            engine.execute_bound_search_in_session(ctx, &session, table, |schema, _udfs| {
+                match bind_search(validated, schema).map_err(to_sql_surface_error)? {
+                    BoundSearch::Vector(stmt) => Ok(stmt),
+                    // 上記と対称の到達しないはずの分岐（`plan_present ==
+                    // false` の間は `bind_search` が `BoundSearch::Plan` を
+                    // 返すことはない）。
+                    BoundSearch::Plan(_) => Err(SqlSurfaceError::Internal {
+                        detail: "search binder returned a plan form for a vector request"
+                            .to_string(),
+                    }),
+                }
+            })?;
+        Ok(result)
+    }
+}
+
+/// `POST /v1/query`（`op: "search"`）を処理し応答バイト列を返す
+/// （[`super::gate::handle`] から呼ばれる。認証・スキーマ検証済みの要求の
+/// み）。`scan.rs::handle`／`aggregate.rs::handle` と同型: 成功時は
+/// [`super::response::encode`] を経て `200 OK`、失敗時は [`SearchError::
+/// error_class`]／[`SearchError::client_message`] をエラー応答へ写像する。
+pub fn handle(
+    engine: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+    now_wall: SystemTime,
+) -> Vec<u8> {
+    match execute(engine, principal, validated) {
+        Ok(result) => match super::response::encode(&result) {
+            Ok(body) => http_response::encode_ok(&body, now_wall),
+            Err(err) => {
+                http_response::encode_error(err.error_class(), &err.client_message(), now_wall)
+            }
+        },
+        Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
+    }
 }
 
 #[cfg(test)]

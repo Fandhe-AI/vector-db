@@ -452,9 +452,10 @@ pub const GATE_PROBE_BODY: &[u8] = br#"{"op":"scan","table":"docs","limit":1}"#;
 /// [`GATE_PROBE_BODY`] を [`spawn_router_listener`] のスローアウェイ
 /// `EngineCore` へ送った応答が「認証・op 許可リスト・スキーマ検証を通過し
 /// engine まで到達したこと」の非 vacuous な証跡（`42P01`／404。SQL 経路の
-/// 未存在テーブル判定と同一分類）であることを検証する。`search`／
-/// `aggregate`／`insert` が後続 Issue で結線されても、本アサーションは
-/// `scan` のみを対象とするため影響を受けない。
+/// 未存在テーブル判定と同一分類）であることを検証する。`aggregate`／
+/// `search`（実行結線済み）・`insert`（後続 Issue で結線予定）が
+/// [`GATE_PROBE_BODY`] とは別の要求本文で呼び出されても、本アサーションは
+/// `42P01`／404 という結果の形のみを見るため影響を受けない。
 pub fn assert_reached_query_gate(resp: &HttpResponse) {
     assert_status_and_wire_code(resp, 404, "42P01");
 }
