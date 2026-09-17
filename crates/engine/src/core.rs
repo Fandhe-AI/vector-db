@@ -2246,9 +2246,11 @@ impl EngineCore {
                     // pre_check_bindable` が同一リテラルを再検証する）で初めて
                     // mode リテラルを解析するため、生リテラルをそのまま渡す
                     // ことで両表層（SQL テキスト経由・束縛済み計画経由）が
-                    // 共有する fail-closed 順序〔LIMIT → 辞書列 → テーブル解決 →
-                    // 事前束縛検証（mode 解析含む） → I/O（LLM 展開・再埋め込み）
-                    // → 世代照合 → 再検証 → 束縛〕を保つ。詳細は
+                    // 共有する fail-closed 順序〔LIMIT → テーブル解決 → 事前
+                    // 束縛検証（mode 解析含む） → 辞書列検証 → I/O（LLM 展開・
+                    // 再埋め込み） → 世代照合 → 再検証 → 束縛〕を保つ
+                    // （辞書列検証を事前束縛検証より後に行う順序は
+                    // codex-review P1 指摘対応・PR #828）。詳細は
                     // [`Self::run_using_plan_select`] のドキュメント参照）。
                     let result = self.run_using_plan_select(
                         ctx,
@@ -2437,13 +2439,15 @@ impl EngineCore {
     /// [`Self::execute_bound_plan_search_in_session`]（NoSQL 表層の束縛済み
     /// `plan` 検索。`wire-server::http::query::search`）の双方が、この
     /// メソッドへ委譲することで fail-closed 判定順序（`LIMIT` 範囲検証 →
-    /// 辞書必須列 `path`/`body` の事前スキーマ検証 → `pre_check`（呼び出し元
-    /// 提供のスキーマ依存事前束縛検証）→ 計画開始時のテーブル世代記録 →
-    /// I/O（`plan_using_plan_expansion`。LLM クエリ展開・再埋め込み）→
-    /// I/O 完了後の世代照合 → 辞書必須列の再検証 → `bind`（呼び出し元提供の
-    /// 最終束縛）→ [`Self::run_select_plan`] による実行、という一連の手順を
-    /// 複製しない（第 2 の実行器を作らない設計。`docs/design/
-    /// bound-plan-session-entry.md` 参照）。
+    /// 計画開始時のテーブル世代記録 → `pre_check`（呼び出し元提供のスキーマ
+    /// 依存事前束縛検証）→ 辞書必須列 `path`/`body` の事前スキーマ検証
+    /// （`pre_check` より後。codex-review P1 指摘対応・PR #828。[`Self::
+    /// run_explain_plan`] と同一の優先順位）→ I/O（`plan_using_plan_
+    /// expansion`。LLM クエリ展開・再埋め込み）→ I/O 完了後の世代照合 →
+    /// 辞書必須列の再検証 → `bind`（呼び出し元提供の最終束縛）→ [`Self::
+    /// run_select_plan`] による実行、という一連の手順を複製しない（第 2 の
+    /// 実行器を作らない設計。`docs/design/bound-plan-session-entry.md`
+    /// 参照）。
     ///
     /// `pre_check` は I/O（LLM 呼び出し・再埋め込み）より前にスキーマ依存の
     /// 検証（`USING MODE` リテラル・`VECTOR` 列の存在・投影列／`WHERE` 述語の
@@ -2489,11 +2493,10 @@ impl EngineCore {
         // リソース増幅の防止。`bind` 側の検証は多層防御として残る）。
         crate::sql::parser::validate_search_limit(limit)?;
 
-        // I/O（LLM 呼び出し）前のスキーマ事前検証（辞書必須列 `path`/`body`）。
-        // 計画開始時のテーブル世代もここで記録する（対象テーブル限定化の
-        // 理由は [`Self::plan_using_plan_expansion`] 呼び出し元の既存
-        // ドキュメント〔`docs/design/table-generation-rejection-granularity.md`〕
-        // 参照）。
+        // I/O（LLM 呼び出し）前のスキーマ取得。計画開始時のテーブル世代も
+        // ここで記録する（対象テーブル限定化の理由は
+        // [`Self::plan_using_plan_expansion`] 呼び出し元の既存ドキュメント
+        // 〔`docs/design/table-generation-rejection-granularity.md`〕参照）。
         let (pre_check_schema, planning_generation) = {
             let (pre_check_txn, schema) = self.read_txn_with_schema(table)?;
             let generation = crate::catalog::table_generation_in_txn(&pre_check_txn, table)
@@ -2503,12 +2506,21 @@ impl EngineCore {
             drop(pre_check_txn);
             (schema, generation)
         };
-        dictionary_required_columns(&pre_check_schema)
-            .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
 
         // 呼び出し元提供のスキーマ依存事前束縛検証（`USING MODE` リテラル・
-        // `VECTOR` 列・投影列／`WHERE` 述語）。I/O より前に完結させる。
+        // `VECTOR` 列・投影列／`WHERE` 述語）を辞書必須列検証より先に行う
+        // （codex-review P1 指摘対応・PR #828。[`Self::run_explain_plan`]
+        // と同一の理由・同一の優先順位——`pre_check` が返し得る `42601`／
+        // `22000`／`54000` 系エラーが、辞書必須列を欠くテーブルに対しても
+        // `Self::run_explain_plan` 側と一致した優先順位で確定するよう揃える。
+        // 詳細は [`Self::run_explain_plan`] のドキュメント参照）。I/O より
+        // 前に完結させる。
         pre_check(&pre_check_schema, session.udfs())?;
+
+        // 辞書必須列（`path`/`body`）の検証は `pre_check`（上記）より後に
+        // 行う（codex-review P1 指摘対応・PR #828）。
+        dictionary_required_columns(&pre_check_schema)
+            .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
 
         // `USING MODE` リテラルの解析はテーブル解決（上記 `read_txn_with_
         // schema`）より後で行う（cursor[bot] 指摘対応・PR #827。テーブル
