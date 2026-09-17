@@ -235,11 +235,21 @@ fn columns_as_strings(items: &[JsonValue]) -> Result<Vec<String>, SearchError> {
 
 /// `vector` フィールド（`&[JsonValue]`。要素はスキーマ検証済みの `Number`
 /// のはずだが多層防御として再検査する）を `Vec<f64>` へ写像する。
+///
+/// [`engine::json::JsonNumber`] は整数リテラルを `f64` 変換前に無損失表現
+/// （`PosInt`/`NegInt`）で保持する（Issue #823 レビュー指摘。詳細はコメントを
+/// `insert.rs::bind_row` の `id` 疑似列判定に譲る）が、ベクトル要素は元々
+/// `bind_vector_values` が `f64 -> f32` キャストと非有限判定を行う契約
+/// （`engine::sql::parser::bind_vector_values`）であり、`id` のような無損失
+/// 整数の要求は無い。ここでは [`engine::json::JsonNumber::as_f64`]（丸めを
+/// 伴いうる）で `f64` へ変換するだけに留め、非有限判定は既存どおり
+/// `bind_vector_values` 側に委譲する（`insert.rs::bind_row` の VECTOR 列要素
+/// 判定と同じ方針）。
 fn vector_as_f64(items: &[JsonValue]) -> Result<Vec<f64>, SearchError> {
     let mut values = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            JsonValue::Number(n) => values.push(*n),
+            JsonValue::Number(n) => values.push(n.as_f64()),
             _ => {
                 return Err(SearchError::Shape(SchemaError::TypeMismatch {
                     key: "vector",
@@ -386,7 +396,7 @@ pub fn bind_search(
 mod tests {
     use super::*;
     use engine::catalog::{ColumnDef, ColumnType};
-    use engine::json::parse_json;
+    use engine::json::{parse_json, JsonNumber};
 
     use crate::http::query::schema::SEARCH_SCHEMA;
 
@@ -616,13 +626,16 @@ mod tests {
         object.insert(
             "vector".to_string(),
             JsonValue::Array(vec![
-                JsonValue::Number(0.1),
-                JsonValue::Number(0.2),
-                JsonValue::Number(0.3),
-                JsonValue::Number(0.4),
+                JsonValue::Number(JsonNumber::Float(0.1)),
+                JsonValue::Number(JsonNumber::Float(0.2)),
+                JsonValue::Number(JsonNumber::Float(0.3)),
+                JsonValue::Number(JsonNumber::Float(0.4)),
             ]),
         );
-        object.insert("limit".to_string(), JsonValue::Number(5.0));
+        object.insert(
+            "limit".to_string(),
+            JsonValue::Number(JsonNumber::PosInt(5)),
+        );
         object.insert(
             "mode".to_string(),
             JsonValue::String("re\u{0}call".to_string()),
