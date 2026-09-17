@@ -106,8 +106,10 @@ bind は同じ理由で起動拒否されます。`nosql` を選択すると、�
 （op 許可リストの正式化・束縛・実行計画への写像は Issue #759・#763 以降の
 担当）。`/v1/session`・`/v1/session/close`・`/v1/query` の 3 エンドポイントは
 バイト厳密一致でのみ受理し、それ以外のパス（完全未知パス・クエリ文字列
-付き・末尾スラッシュ／余剰セグメント・大文字小文字違い等）と `POST` 以外の
-メソッドはすべて `08P01`（`unknown request target`）で拒否します
+付き・末尾スラッシュ／余剰セグメント・大文字小文字違い等）はすべて
+`08P01`（`unknown request target`。ルータでの判定）で拒否します。
+`POST` 以外のメソッドは要求行パーサ（HTTP-2）の段階で先に `08P01`
+（`invalid message frame`）として拒否されるため、ルータへは到達しません
 （Issue #758・TASK-179・NOSQL-1。`/v1/query` 配下の tenant マーカー判定
 〔`42601`。Issue #754〕は本 08P01 判定より優先します）。この `catch_unwind` は
 `wire-server` を lib として使う
