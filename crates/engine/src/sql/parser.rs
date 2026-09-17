@@ -312,6 +312,18 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
 
+/// NoSQL 表層（Issue #763・TASK-175・NOSQL-2）の `search.plan` 経路向け。`VECTOR`
+/// 列の存在のみを束縛時点で検査する公開ラッパー（次元照合は `Embedder` 出力を
+/// 要するため #764 の担当）。SQL 表層の `USING PLAN` が
+/// `sql::using_plan::pre_check_bindable`／`bind_expansion` で `vector_column
+/// (schema)?` を同じ理由で呼び `22000` へ拒否するのと同一の契約を、`VECTOR`
+/// 列なしテーブルへの `plan` 受理を束縛時点で塞ぐために wire-server 側へ
+/// 公開する（[`bind_body_text_column`] が `text_column_index` を公開する
+/// のと同じ判断）。
+pub fn require_vector_column(schema: &TableSchema) -> Result<(), SqlSurfaceError> {
+    vector_column(schema).map(|_| ())
+}
+
 /// `name` に一致する `Text` 列のインデックスを返す（`id` 疑似列は対象外）。
 /// `sql::using_plan`（TASK-77・SQL-5）が本文列（規約列 `body`）の解決にも使う
 /// ため `pub(crate)`。

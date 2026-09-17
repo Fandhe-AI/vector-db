@@ -36,8 +36,8 @@ use engine::json::JsonValue;
 use engine::sql::allowlist::{validate_using_plan_question, SqlSurfaceError};
 use engine::sql::mode::{self, SearchMode};
 use engine::sql::parser::{
-    bind_body_text_column, bind_column_projection, bind_vector_values, validate_search_limit,
-    BoundStatement, ProjectedColumn, Ranking,
+    bind_body_text_column, bind_column_projection, bind_vector_values, require_vector_column,
+    validate_search_limit, BoundStatement, ProjectedColumn, Ranking,
 };
 use engine::sql::plan::EvaluationOrder;
 
@@ -332,8 +332,12 @@ pub fn bind_search(
         return Err(SearchError::VectorAndPlanBothMissing);
     };
     validate_using_plan_question(question)?;
-    // `USING PLAN`（SQL-5）は本文列必須の契約を束縛時に確認する
-    // （`sql::using_plan::bind_expansion` と同じ判断）。
+    // `USING PLAN`（SQL-5）は `VECTOR` 列必須・本文列必須の契約を束縛時に
+    // 確認する（`sql::using_plan::pre_check_bindable`／`bind_expansion` と
+    // 同じ判断。`VECTOR` 列なしテーブルへの `plan` 受理をここで塞がないと、
+    // 失敗が本来のバインド契約より後——プラン検索の完了・実行時点、#764 で
+    // LLM I/O が追加された後は高価な LLM 呼び出しの後——まで遅延する）。
+    require_vector_column(schema)?;
     bind_body_text_column(schema)?;
 
     Ok(BoundSearch::Plan(PlanSearch {
@@ -427,6 +431,30 @@ mod tests {
                 .expect_err("must reject");
         assert!(matches!(err, SearchError::PlanWithHybrid));
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// `VECTOR` 列を持たないテーブル（広域取得専用。SQL-15・Issue #454）の
+    /// 束縛。`plan` 経路の `VECTOR` 列存在チェック（Issue #763 PR #820
+    /// Bugbot 指摘）を単体で検証するための fixture。
+    fn scan_only_schema() -> TableSchema {
+        TableSchema::new(
+            "notes",
+            vec![
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        )
+    }
+
+    #[test]
+    fn plan_on_table_without_vector_column_is_rejected_at_bind_time() {
+        let value =
+            validate(r#"{"op":"search","table":"notes","plan":"find something","limit":5}"#);
+        let validated = SEARCH_SCHEMA.validate(&value).expect("must validate shape");
+        let err = bind_search(&validated, &scan_only_schema()).expect_err("must reject");
+        assert!(matches!(err, SearchError::Bind(_)));
+        assert_eq!(err.wire_code(), "22000");
     }
 
     #[test]
