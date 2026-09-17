@@ -1000,6 +1000,33 @@ struct UsingPlanExpansionResult {
     resolved_mode: crate::sql::mode::ResolvedMode,
 }
 
+/// [`EngineCore::execute_bound_plan_search_in_session`] の `bind` closure が
+/// 返す束縛済み部品（TASK-186・NOSQL-2。Issue #764）。`Ranking::Hybrid` の
+/// `query`（再埋め込みベクトル）・`text_column_index`・`query_text`・`mode`
+/// （`resolved_mode`）は engine 側（[`EngineCore::run_using_plan_select`] の
+/// `bind` closure 内、[`crate::sql::using_plan::bind_expansion`] と同一の
+/// ロジック）が組み立てるため、本構造体は含まない（NoSQL 表層からクエリ
+/// ベクトル・ランキング方式・モードを差し替えられない設計。
+/// `.claude/rules/security.md`「アクセス制御の不備」対応）。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct PlanSearchBinding {
+    projection: Vec<crate::sql::parser::ProjectedColumn>,
+    metadata_filters: Vec<crate::declarative_filter::MetadataFilter>,
+}
+
+impl PlanSearchBinding {
+    pub fn new(
+        projection: Vec<crate::sql::parser::ProjectedColumn>,
+        metadata_filters: Vec<crate::declarative_filter::MetadataFilter>,
+    ) -> Self {
+        Self {
+            projection,
+            metadata_filters,
+        }
+    }
+}
+
 /// `VectorCore` の製品実装。永続化・カタログ・アリーナ構築・検索 provider を束ねる。
 ///
 /// 実行バックエンド実装型へ直接依存せず `Box<dyn SearchProvider>` で保持する（CORE-13）。
@@ -2207,166 +2234,46 @@ impl EngineCore {
                             .to_string(),
                     });
                 }
-                let bound_result = if let Some(question) = validated.using_plan() {
-                    // `LIMIT` の範囲検証（codex-review P1 指摘対応、PR #266）:
-                    // 従来は範囲検証（`22000`）が `sql::using_plan::bind_expansion`
-                    // 内、すなわち下記の `plan_using_plan_expansion`（辞書スナップ
-                    // ショット構築＋LLM クエリ展開＋再埋め込み）・スキーマ事前検証用
-                    // `read_txn` のいずれよりも後で行われていた。`LIMIT 0`／
-                    // `LIMIT 4294967295` のように構文上は受理されるが必ず拒否される
-                    // 入力でも、検証が高コスト処理・DB I/O の後段にあると外部 API・
-                    // CPU・メモリ・DB スナップショット取得を consume させてしまい、
-                    // untrusted 入力によるリソース増幅になる。fail-closed な拒否は
-                    // I/O 開始前に完結させる。`bind_expansion` 側の検証（下記）は
-                    // 多層防御として残し、この前倒しチェックとの間で挙動・
-                    // `wire_code`・メッセージが食い違わないよう同一関数
-                    // （[`crate::sql::parser::validate_search_limit`]）を共有する。
-                    crate::sql::parser::validate_search_limit(validated.limit())?;
-
-                    // I/O（LLM 呼び出し）前のスキーマ事前検証（codex-review P1 指摘
-                    // 対応、PR #266）: `plan_using_plan_expansion` 内の `plan_query` は
-                    // `dictionary_snapshot`（LLM プロンプトの固定接頭辞構築用）を
-                    // 経由するが、`dictionary_snapshot` が `path`/`body` 列の存在・
-                    // 型・nullability 不備で失敗すると `CoreError::Catalog(
-                    // CatalogError::Invalid)` に丸め込まれ、`plan_using_plan_expansion`
-                    // の `map_err` で一律 `Internal`（`XX000`）へ変換されてしまう。
-                    // body 列欠落・非 TEXT 等の通常の利用者スキーマ不備は本来
-                    // `SqlSurfaceError::InvalidInput`（`22000`）であるべきなので、
-                    // 同じ判定条件（[`dictionary_required_columns`]）を LLM 呼び出し
-                    // 前にこの位置で検証し、満たさなければ `22000` で即座に拒否する
-                    // （`read_txn` は判定用のスキーマを読んだら即 drop し、I/O の間
-                    // 保持しない。上記コメントの分割方針を踏襲）。この事前検証を
-                    // 通過した後に `dictionary_snapshot` 自身が失敗する場合
-                    // （デコード不整合・世代競合の再試行枯渇・走査量上限超過等）は
-                    // 真にサーバー側の内部/一時的障害であり、引き続き `Internal`
-                    // として扱う。
-                    // 計画開始時の世代を記録する（codex-review P1 指摘対応、PR #266。
-                    // 対象テーブル限定化: codex-review P1 再指摘、PR #266）:
-                    // `plan_using_plan_expansion` は `dictionary_snapshot`（LLM プロンプト
-                    // 用の固定接頭辞）を、下記の I/O 前スキーマ検証に使う
-                    // `pre_check_txn` とは別スナップショットの内部 `read_txn` から構築する
-                    // （`DictionaryCache` のドキュメント参照）。I/O（LLM 呼び出し・
-                    // 再埋め込み）の間に対象テーブルが `DROP TABLE`→同名再作成される、
-                    // またはデータ・スキーマが更新されると、計画時の辞書語彙（旧テーブル
-                    // 由来）による展開・再埋め込みベクトルが、I/O 完了後に新規取得する
-                    // 最新スキーマ・行データ（新テーブル）へ適用され、テーブルの同一性を
-                    // 跨いだ不整合な結果になりうる。当初 `storage.current_generation()`
-                    // （ストレージ全体で任意の write commit ごとに単調増加する世代）で
-                    // 照合していたが、書き込みが継続する運用では無関係な他テーブル・
-                    // 他テナントへの通常の書き込みが 1 回でも I/O 中に完了しただけで
-                    // `USING PLAN` が恒常的に `XX000` 拒否される可用性問題を生む
-                    // （codex-review P1 再指摘）。対象テーブル（`validated.table_name`）
-                    // 固有の世代 [`crate::catalog::table_generation_in_txn`] へ切り替え、
-                    // 当該テーブルの DDL（`CREATE`/`DROP`/`ALTER TABLE`）・行書き込みが
-                    // あった場合にのみ拒否する（`crate::catalog::
-                    // bump_table_generation_in_txn` のドキュメント参照。書き込み経路
-                    // すべてで commit 前に呼ばれる契約）。無関係な他テーブルへの書き込みは
-                    // 本世代へ影響しない。`user_rows/{table_name}` は複数テナントの行を
-                    // 同居させる単一の物理テーブルのため、同一テーブルへの他テナントの
-                    // 書き込みは本世代の対象に含める（拒否側に倒す）: `dictionary_snapshot`
-                    // が読む行集合は `tenant::visible_rows`（`ctx` に基づく RLS 可視性
-                    // 判定。TASK-137・RLS-6, RLS-7）を経由するため、他テナントが
-                    // `Visibility::Public` で書き込んだ行は要求元テナントの辞書内容にも
-                    // 影響しうる（可視性は `Public`/`Private` の 2 値のみ）。行ごとの
-                    // 可視性を見ずにテーブル単位で一括して拒否側へ倒すのは過剰検知
-                    // （他テナントの `Private` 専用の書き込みまで拒否対象に含む）を
-                    // 許容する設計判断であり、テナント単位の精密な世代を持たないことの
-                    // 限界だが、fail-open で見逃すよりも安全側に倒す（security.md
-                    // 「fail-closed を維持する」）。この粒度の是非は Issue #285 で
-                    // 現状維持として確定した設計判断であり、根拠・移行トリガーは
-                    // `docs/design/table-generation-rejection-granularity.md` を参照。
-                    // 再計画（辞書再構築・再展開）は行わず、単純に拒否する。
-                    let (pre_check_schema, planning_generation) = {
-                        let (pre_check_txn, schema) =
-                            self.read_txn_with_schema(&validated.table_name)?;
-                        let generation = crate::catalog::table_generation_in_txn(
-                            &pre_check_txn,
-                            &validated.table_name,
-                        )
-                        .map_err(|e| {
-                            crate::sql::allowlist::SqlSurfaceError::Internal {
-                                detail: format!("failed to read table generation: {e}"),
-                            }
-                        })?;
-                        drop(pre_check_txn);
-                        (schema, generation)
-                    };
-                    dictionary_required_columns(&pre_check_schema).map_err(|msg| {
-                        crate::sql::allowlist::SqlSurfaceError::invalid_input(msg)
-                    })?;
-
-                    // `USING MODE` リテラル・`VECTOR` 列の存在・投影列／`WHERE` 述語の
-                    // 事前束縛検証（codex-review P1 指摘対応、PR #266）: 上記の辞書用
-                    // `path`/`body` 列検証・`LIMIT` 範囲検証と同じ理由で、これらも
-                    // I/O（`plan_using_plan_expansion`）より前に完結させる（多層防御
-                    // として I/O 後の再束縛でも同じ検証を通す。詳細は
-                    // [`crate::sql::using_plan::pre_check_bindable`] のドキュメント参照）。
-                    // `Select` アームは形状情報（`sql::explain::ExplainShape`）を
-                    // 使わない（`EXPLAIN` 用の `ann_plan:` 判定は
-                    // `Statement::Explain` アーム・[`Self::explain_bound_plan_in_session`]
-                    // （TASK-186・NOSQL-10）のみが必要とする。Issue #411）。
-                    let _ = crate::sql::using_plan::pre_check_bindable(
-                        &validated,
-                        &pre_check_schema,
-                        session.udfs(),
-                    )?;
-
-                    let planned =
-                        self.plan_using_plan_expansion(ctx, session, &validated, question)?;
-                    let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
-
-                    // I/O 完了後の世代照合（codex-review P1 指摘対応、PR #266。対象
-                    // テーブル限定化: codex-review P1 再指摘、PR #266）: 上記コメントの
-                    // とおり、`planning_generation` と現在の**対象テーブル**世代が
-                    // 一致しなければ、計画時に使った辞書スナップショット・展開結果・
-                    // 再埋め込みベクトルが現在のテーブル世代に対して有効である保証が
-                    // ないため、fail-closed に拒否する（`SqlSurfaceError::Internal`。
-                    // `plan_using_plan_expansion` 自体の既存 fail-closed 契約
-                    // 〔本メソッドのドキュメント参照〕と同じ `XX000` 分類を使い、新規
-                    // 分類は追加しない。クライアントへは `Internal::client_message()`
-                    // による固定の一般化メッセージのみを返し、他テナント・他クエリの
-                    // 書き込み有無という存在情報を漏らさない）。無関係な他テーブルへの
-                    // 書き込みでは変化しない世代（[`crate::catalog::table_generation_in_txn`]。
-                    // 上記の計画開始時取得箇所のコメント参照）を使うため、書き込みが
-                    // 継続する運用でも対象テーブル・辞書が無変化であれば拒否されない。
-                    let current_generation =
-                        crate::catalog::table_generation_in_txn(&read_txn, &validated.table_name)
-                            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
-                            detail: format!("failed to read table generation: {e}"),
-                        })?;
-                    if current_generation != planning_generation {
-                        return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                            detail: "table generation changed during USING PLAN query \
-                                     expansion; rejecting stale plan"
-                                .to_string(),
-                        });
-                    }
-
-                    // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する
-                    // （codex-review P1 指摘対応、PR #266）: 上記の世代照合は対象
-                    // テーブル単位の世代（[`crate::catalog::table_generation_in_txn`]。
-                    // 粒度の設計判断は `docs/design/
-                    // table-generation-rejection-granularity.md` を参照）のみを見る
-                    // ため、同一世代内であってもこのスキーマが `pre_check_schema` と
-                    // 異なる可能性を狭義には排除できない（世代不変条件が将来変わった
-                    // 場合の多層防御。現行の `bump_table_generation_in_txn` 実装では
-                    // 対象テーブルへの書き込みごとに必ず世代が進むため通常到達しないが、
-                    // `dictionary_required_columns` は軽量な検証であり多層防御として
-                    // 維持する）。
-                    dictionary_required_columns(&schema).map_err(|msg| {
-                        crate::sql::allowlist::SqlSurfaceError::invalid_input(msg)
-                    })?;
-
-                    let bound = crate::sql::using_plan::bind_expansion(
-                        &validated,
-                        &schema,
+                if let Some(question) = validated.using_plan() {
+                    // `USING MODE` リテラルの解析は `run_using_plan_select` に
+                    // 委譲し、ここでは行わない（cursor[bot] 指摘対応・PR #827）。
+                    // 以前はここで `SearchMode::parse_literal` を先に解析して
+                    // いたため、テーブル未存在（`42P01` 相当）と `USING MODE`
+                    // 値の不正（`22000`）が同時に成立する要求で、テーブル解決
+                    // より先に mode 解析エラーが確定してしまっていた。
+                    // `run_using_plan_select` はテーブル解決（`read_txn_with_
+                    // schema`）を終えた後の `pre_check`（`sql::using_plan::
+                    // pre_check_bindable` が同一リテラルを再検証する）で初めて
+                    // mode リテラルを解析するため、生リテラルをそのまま渡す
+                    // ことで両表層（SQL テキスト経由・束縛済み計画経由）が
+                    // 共有する fail-closed 順序〔LIMIT → 辞書列 → テーブル解決 →
+                    // 事前束縛検証（mode 解析含む） → I/O（LLM 展開・再埋め込み）
+                    // → 世代照合 → 再検証 → 束縛〕を保つ。詳細は
+                    // [`Self::run_using_plan_select`] のドキュメント参照）。
+                    let result = self.run_using_plan_select(
+                        ctx,
+                        session,
+                        &validated.table_name,
                         question,
-                        &planned.expansion,
-                        planned.query_vector,
-                        session.udfs(),
-                        planned.resolved_mode,
+                        validated.search_mode(),
+                        validated.limit(),
+                        |schema, udfs| {
+                            crate::sql::using_plan::pre_check_bindable(&validated, schema, udfs)
+                                .map(|_| ())
+                        },
+                        |schema, udfs, planned| {
+                            crate::sql::using_plan::bind_expansion(
+                                &validated,
+                                schema,
+                                question,
+                                &planned.expansion,
+                                planned.query_vector,
+                                udfs,
+                                planned.resolved_mode,
+                            )
+                        },
                     )?;
-                    (read_txn, schema, bound)
+                    Ok(crate::sql::SqlOutcome::Query(result))
                 } else {
                     let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
                     let bound = crate::sql::parser::bind_in_session(
@@ -2375,49 +2282,9 @@ impl EngineCore {
                         session.search_mode(),
                         session.udfs(),
                     )?;
-                    (read_txn, schema, bound)
-                };
-                let (read_txn, schema, bound) = bound_result;
-                // Issue #357: hybrid 実行が参照する SparseIndex のテーブル世代整合
-                // キャッシュ。Issue #363: SQL 表層の SELECT（`USING PLAN` 展開経由を
-                // 含む、本アーム全体）は sql_arena_cache（テーブル世代整合キャッシュ）
-                // を経由して VectorArena の再構築（redb 全行走査・デコード）を同一
-                // テーブル世代内で再利用する（詳細は `SqlArenaCache`・
-                // `sql::exec::execute_statement_with_cache` のドキュメント参照）。
-                let result = crate::sql::exec::execute_statement_with_cache(
-                    &read_txn,
-                    self.provider.as_ref(),
-                    ctx,
-                    &schema,
-                    &bound,
-                    &self.precision_policy,
-                    Some(crate::sql::sparse_cache::SparseCacheAccess {
-                        storage: &self.storage,
-                        cache: &self.sparse_index_cache,
-                    }),
-                    Some(crate::sql::arena_cache::ArenaCacheAccess {
-                        storage: &self.storage,
-                        cache: &self.sql_arena_cache,
-                    }),
-                    // Issue #408: `SearchEngineKind::Hnsw` opt-in 構築時のみ
-                    // `Some`（`hnsw_state`）。フィルタなし `Ranking::Distance` の
-                    // DISTANCE 段を索引済みノード＋未索引分 brute-force の併用へ
-                    // 載せ替える（詳細は `sql::hnsw_cache` のドキュメント参照）。
-                    self.hnsw_state
-                        .as_ref()
-                        .map(|s| crate::sql::hnsw_cache::HnswCacheAccess {
-                            storage: &self.storage,
-                            cache: &s.cache,
-                            provider: s.provider,
-                        }),
-                    // Issue #473: スカラー列二次索引の gated 構築（応答には未使用。
-                    // 詳細は `sql::scalar_index` のドキュメント参照）。
-                    Some(crate::sql::scalar_index::ScalarCacheAccess {
-                        storage: &self.storage,
-                        cache: &self.scalar_index_cache,
-                    }),
-                )?;
-                Ok(crate::sql::SqlOutcome::Query(result))
+                    let result = self.run_select_plan(&read_txn, ctx, &schema, &bound)?;
+                    Ok(crate::sql::SqlOutcome::Query(result))
+                }
             }
             // TASK-166（SQL-13）: 集計 SELECT はスキーマ取得（`bind_aggregate` 用）・
             // 行走査（`sql::aggregate::execute_aggregate`）を、既存の検索 SELECT
@@ -2498,6 +2365,333 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::Explain(result))
             }
         }
+    }
+
+    /// [`Self::execute_validated_in_session`] の `Statement::Select` アーム
+    /// （`USING PLAN` 経由を含む）・[`Self::execute_bound_search_in_session`]・
+    /// [`Self::run_using_plan_select`] が共有する実行本体（TASK-186・
+    /// NOSQL-2。Issue #764）。`read_txn`・`schema` は呼び出し元が同一
+    /// スナップショットから取得済みのものをそのまま渡す。SQL 経路専用の
+    /// キャッシュ（`SparseIndexCache`〔Issue #357〕・`SqlArenaCache`
+    /// 〔Issue #363〕・`HnswIndexCache`〔Issue #408〕・`ScalarIndexCache`
+    /// 〔Issue #473〕）を配線した `execute_statement_with_cache` を経由する
+    /// ことで、束縛済み計画エントリも SQL テキスト経由と同一のキャッシュ
+    /// 最適化・ANN opt-in・precision fail-closed 契約（SEARCH-9）を受ける。
+    fn run_select_plan(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        ctx: &PolicyContext,
+        schema: &crate::catalog::TableSchema,
+        bound: &crate::sql::parser::BoundStatement,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::exec::execute_statement_with_cache(
+            read_txn,
+            self.provider.as_ref(),
+            ctx,
+            schema,
+            bound,
+            &self.precision_policy,
+            Some(crate::sql::sparse_cache::SparseCacheAccess {
+                storage: &self.storage,
+                cache: &self.sparse_index_cache,
+            }),
+            Some(crate::sql::arena_cache::ArenaCacheAccess {
+                storage: &self.storage,
+                cache: &self.sql_arena_cache,
+            }),
+            // Issue #408: `SearchEngineKind::Hnsw` opt-in 構築時のみ
+            // `Some`（`hnsw_state`）。フィルタなし `Ranking::Distance` の
+            // DISTANCE 段を索引済みノード＋未索引分 brute-force の併用へ
+            // 載せ替える（詳細は `sql::hnsw_cache` のドキュメント参照）。
+            self.hnsw_state
+                .as_ref()
+                .map(|s| crate::sql::hnsw_cache::HnswCacheAccess {
+                    storage: &self.storage,
+                    cache: &s.cache,
+                    provider: s.provider,
+                }),
+            // Issue #473: スカラー列二次索引の gated 構築（応答には未使用。
+            // 詳細は `sql::scalar_index` のドキュメント参照）。
+            Some(crate::sql::scalar_index::ScalarCacheAccess {
+                storage: &self.storage,
+                cache: &self.scalar_index_cache,
+            }),
+        )
+    }
+
+    /// `USING PLAN('<query>')`（TASK-77・SQL-5）経路の共有骨格（TASK-186・
+    /// NOSQL-2。Issue #764）。[`Self::execute_validated_in_session`] の
+    /// `Statement::Select` アーム（SQL テキスト経由）・
+    /// [`Self::execute_bound_plan_search_in_session`]（NoSQL 表層の束縛済み
+    /// `plan` 検索。`wire-server::http::query::search`）の双方が、この
+    /// メソッドへ委譲することで fail-closed 判定順序（`LIMIT` 範囲検証 →
+    /// 辞書必須列 `path`/`body` の事前スキーマ検証 → `pre_check`（呼び出し元
+    /// 提供のスキーマ依存事前束縛検証）→ 計画開始時のテーブル世代記録 →
+    /// I/O（`plan_using_plan_expansion`。LLM クエリ展開・再埋め込み）→
+    /// I/O 完了後の世代照合 → 辞書必須列の再検証 → `bind`（呼び出し元提供の
+    /// 最終束縛）→ [`Self::run_select_plan`] による実行、という一連の手順を
+    /// 複製しない（第 2 の実行器を作らない設計。`docs/design/
+    /// bound-plan-session-entry.md` 参照）。
+    ///
+    /// `pre_check` は I/O（LLM 呼び出し・再埋め込み）より前にスキーマ依存の
+    /// 検証（`USING MODE` リテラル・`VECTOR` 列の存在・投影列／`WHERE` 述語の
+    /// 事前束縛可能性）を行い、戻り値（`Result<(), _>`）は捨てる（呼び出し元
+    /// が必要な形状情報を自分で保持する。SQL アームは
+    /// [`crate::sql::using_plan::pre_check_bindable`] をそのまま委譲する）。
+    /// `bind` は I/O 完了後に取得し直した最新スキーマ上で最終
+    /// [`crate::sql::parser::BoundStatement`] を組み立てる（SQL アームは
+    /// [`crate::sql::using_plan::bind_expansion`] を委譲する）。
+    ///
+    /// `pre_check`・`bind` はいずれも `read_txn` が開いている間（`pre_check`
+    /// は計画開始時のスキーマ取得直後、`bind` は I/O 完了後の再取得直後）に
+    /// 呼ばれる契約であり、[`Self::execute_bound_scan_in_session`] と同じ
+    /// 理由で重い処理（I/O・LLM 呼び出し）を closure 内で行わないこと。
+    #[allow(clippy::too_many_arguments)]
+    fn run_using_plan_select<Pre, Bind>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        question: &str,
+        mode_literal: Option<&str>,
+        limit: u32,
+        pre_check: Pre,
+        bind: Bind,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        Pre: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+        ) -> Result<(), crate::sql::allowlist::SqlSurfaceError>,
+        Bind: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+            UsingPlanExpansionResult,
+        ) -> Result<
+            crate::sql::parser::BoundStatement,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        // `LIMIT` の範囲検証（codex-review P1 指摘対応、PR #266 の踏襲）:
+        // 高コスト処理・DB I/O より前に完結させる（untrusted 入力による
+        // リソース増幅の防止。`bind` 側の検証は多層防御として残る）。
+        crate::sql::parser::validate_search_limit(limit)?;
+
+        // I/O（LLM 呼び出し）前のスキーマ事前検証（辞書必須列 `path`/`body`）。
+        // 計画開始時のテーブル世代もここで記録する（対象テーブル限定化の
+        // 理由は [`Self::plan_using_plan_expansion`] 呼び出し元の既存
+        // ドキュメント〔`docs/design/table-generation-rejection-granularity.md`〕
+        // 参照）。
+        let (pre_check_schema, planning_generation) = {
+            let (pre_check_txn, schema) = self.read_txn_with_schema(table)?;
+            let generation = crate::catalog::table_generation_in_txn(&pre_check_txn, table)
+                .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: format!("failed to read table generation: {e}"),
+                })?;
+            drop(pre_check_txn);
+            (schema, generation)
+        };
+        dictionary_required_columns(&pre_check_schema)
+            .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
+
+        // 呼び出し元提供のスキーマ依存事前束縛検証（`USING MODE` リテラル・
+        // `VECTOR` 列・投影列／`WHERE` 述語）。I/O より前に完結させる。
+        pre_check(&pre_check_schema, session.udfs())?;
+
+        // `USING MODE` リテラルの解析はテーブル解決（上記 `read_txn_with_
+        // schema`）より後で行う（cursor[bot] 指摘対応・PR #827。テーブル
+        // 未存在＋ mode リテラル不正の要求で `42P01` が `22000` より優先
+        // される既存の fail-closed 順序契約を維持する）。SQL テキスト経由
+        // では `pre_check`（`sql::using_plan::pre_check_bindable`）が同一
+        // リテラルを既に検証済みのため、ここでの解析結果は成功している
+        // ことが保証される。
+        let query_mode = match mode_literal {
+            Some(literal) => Some(crate::sql::mode::SearchMode::parse_literal(literal)?),
+            None => None,
+        };
+
+        let planned = self.plan_using_plan_expansion(ctx, session, table, query_mode, question)?;
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+
+        // I/O 完了後の世代照合（対象テーブル限定化の理由は上記・
+        // [`Self::plan_using_plan_expansion`] 呼び出し元の既存ドキュメント参照）。
+        let current_generation = crate::catalog::table_generation_in_txn(&read_txn, table)
+            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: format!("failed to read table generation: {e}"),
+            })?;
+        if current_generation != planning_generation {
+            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "table generation changed during USING PLAN query \
+                         expansion; rejecting stale plan"
+                    .to_string(),
+            });
+        }
+
+        // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する（多層防御。
+        // 理由は上記呼び出し元の既存ドキュメント参照）。
+        dictionary_required_columns(&schema)
+            .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
+
+        let bound = bind(&schema, session.udfs(), planned)?;
+        self.run_select_plan(&read_txn, ctx, &schema, &bound)
+    }
+
+    /// 束縛済み検索計画（[`crate::sql::parser::BoundStatement`]）を単一
+    /// スナップショット上で実行する（TASK-186・NOSQL-2。Issue #764）。SQL
+    /// テキストを経由せず束縛済み計画を直接実行したい呼び出し元（`wire-server`
+    /// の NoSQL 表層 `search` op の `vector` 指定。TASK-175）向けのセッション
+    /// 対応エントリで、単一の `Storage` を `EngineCore` が所有したまま
+    /// [`Self::execute_sql_in_session`] の `Statement::Select` アーム（`ORDER
+    /// BY` 経由。`USING PLAN` は対象外——[`Self::execute_bound_plan_search_in_session`]
+    /// が別に担う）と同一のトランザクション・スキーマ・実行本体
+    /// （[`Self::run_select_plan`]）を共有する（第 2 の実行器を作らない設計。
+    /// `docs/design/bound-plan-session-entry.md` 参照）。
+    ///
+    /// 処理順は [`Self::execute_bound_scan_in_session`] と同一（(1) スキーマ
+    /// 取得、(2) `bind(&schema, udfs)` で束縛、(3) 対象テーブル一致検証、
+    /// (4) 実行）。`bind` は `read_txn` が開いている間に呼ばれるため、
+    /// closure は純粋・軽量に保つこと。`mode`（`precision`／`recall`）は
+    /// `bind` が返す [`crate::sql::parser::BoundStatement::mode`] にすでに
+    /// 解決済みの値として含まれている必要がある（NoSQL 表層には `SET
+    /// search_mode` 相当が無いため、呼び出し元が `mode::resolve_mode` 等で
+    /// 解決してから束縛する。`wire-server::http::query::search::bind_search`
+    /// 参照）。RLS 暗黙適用（RLS-7）は [`Self::run_select_plan`] が経由する
+    /// `execute_statement_with_cache` 側で行われ、本メソッド自身はテナント
+    /// 判定を一切行わない。
+    pub fn execute_bound_search_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+        ) -> Result<
+            crate::sql::parser::BoundStatement,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let bound = bind(&schema, session.udfs())?;
+        if bound.table() != table {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "bound search plan targets a different table than requested",
+            ));
+        }
+        self.run_select_plan(&read_txn, ctx, &schema, &bound)
+    }
+
+    /// 束縛済み `plan` 検索（NoSQL 表層 `search` op の `plan` 指定。TASK-175・
+    /// NOSQL-2。Issue #764）を、SQL 表層の `USING PLAN('<query>')`
+    /// （TASK-77・SQL-5）と同一の fail-closed 判定順序・LLM 展開・再埋め込み・
+    /// RLS 暗黙適用（RLS-7）・`precision` fail-closed 契約（SEARCH-9）で実行
+    /// する。[`Self::run_using_plan_select`] へ委譲し、`bind` closure が
+    /// [`PlanSearchBinding`]（投影・フィルタのみ）を返す点だけが
+    /// [`crate::sql::using_plan::bind_expansion`] と異なる——`Ranking::
+    /// Hybrid`（再埋め込みベクトル・本文列インデックス・展開後クエリ文字列）
+    /// ・`mode` は本メソッドが `planned`（[`UsingPlanExpansionResult`]）から
+    /// 直接組み立て、NoSQL 表層からは差し替えられない。
+    ///
+    /// `bind` は `Fn`（`FnOnce` ではない）: [`Self::run_using_plan_select`]
+    /// の `pre_check`（I/O 前）・`bind`（I/O 後）の双方から同一の束縛ロジック
+    /// を 2 回呼ぶため（`pre_check` は投影・フィルタが対象スキーマ上で
+    /// 束縛可能かどうかだけを確認し、戻り値は捨てる。I/O 前拒否のための
+    /// 多層防御。`bind`〔本体〕はその戻り値を実際に使う）。`bind` が I/O
+    /// 前後で異なる結果を返す（非決定的）場合でも、I/O 完了後の呼び出し
+    /// 結果のみが実行に使われる契約（`pre_check` 側の戻り値は捨てるため）。
+    ///
+    /// `body_column_index`（本文列規約）は
+    /// [`crate::sql::using_plan::body_column_index`] を共有する
+    /// （`sql::using_plan::bind_expansion` と同一の列インデックス解決。
+    /// 第 2 の実装を作らない）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_bound_plan_search_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        question: &str,
+        mode_literal: Option<&str>,
+        limit: u32,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: Fn(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+        ) -> Result<PlanSearchBinding, crate::sql::allowlist::SqlSurfaceError>,
+    {
+        // `LIMIT`・`question` の多層防御（`Self::run_using_plan_select` 側の
+        // 検証に加え、engine 側でも独立に通す。NoSQL 表層の `search.rs::
+        // bind_search` が既に同じ検証を通しているが、本メソッドが engine の
+        // 公開 API として単独呼び出しされる場合の fail-closed 契約を維持）。
+        // `mode_literal`（`USING MODE` 相当の生リテラル）はここでは解析しない
+        // （cursor[bot] 指摘対応・PR #827）。`Self::run_using_plan_select` が
+        // テーブル解決後に初めて解析することで、テーブル未存在＋ mode 値不正の
+        // 要求で `42P01` が優先される SQL テキスト経由と同一の fail-closed
+        // 順序を保つ。
+        let validated_limit = crate::sql::parser::validate_search_limit(limit)?;
+        crate::sql::allowlist::validate_using_plan_question(question)?;
+
+        self.run_using_plan_select(
+            ctx,
+            session,
+            table,
+            question,
+            mode_literal,
+            limit,
+            |schema, udfs| {
+                // `VECTOR` 列の存在は LLM 展開・再埋め込み（高コスト I/O）より
+                // 前に確定させる（`sql::using_plan::pre_check_bindable` と同じ
+                // fail-closed 順序。codex-review 指摘対応・PR #827。`VECTOR`
+                // 列を持たないテーブルへの `vector` 指定検索が、プランナー・
+                // 埋め込みのコストを消費したうえで拒否される増幅を防ぐ）。
+                crate::sql::parser::vector_column(schema)?;
+                bind(schema, udfs).map(|_| ())
+            },
+            |schema, udfs, planned| {
+                let parts = bind(schema, udfs)?;
+                let text_column_index = crate::sql::using_plan::body_column_index(schema)?;
+                let query_text =
+                    crate::sql::using_plan::expanded_query_text(question, &planned.expansion);
+                let (_, vec_dim) = crate::sql::parser::vector_column(schema)?;
+                let got_dim = u32::try_from(planned.query_vector.len()).map_err(|_| {
+                    crate::sql::allowlist::SqlSurfaceError::invalid_input(format!(
+                        "USING PLAN re-embedded vector length {} exceeds representable range",
+                        planned.query_vector.len()
+                    ))
+                })?;
+                if got_dim != vec_dim {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(format!(
+                        "USING PLAN re-embedded vector dimension mismatch: expected {vec_dim}, got {got_dim}"
+                    )));
+                }
+                if planned.query_vector.iter().any(|v| !v.is_finite()) {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                        "USING PLAN re-embedded vector must not contain NaN/Inf".to_string(),
+                    ));
+                }
+                Ok(crate::sql::parser::BoundStatement {
+                    table: table.to_string(),
+                    projection: parts.projection,
+                    metadata_filters: parts.metadata_filters,
+                    rls_predicate_present: false,
+                    expr_filters: Vec::new(),
+                    expr_filter_programs: Vec::new(),
+                    ranking: crate::sql::parser::Ranking::Hybrid {
+                        query: planned.query_vector,
+                        text_column_index,
+                        query_text,
+                    },
+                    limit: validated_limit,
+                    mode: planned.resolved_mode,
+                    evaluation_order: crate::sql::plan::EvaluationOrder::DEFAULT,
+                })
+            },
+        )
     }
 
     /// [`Self::execute_validated_in_session`] の `Statement::Scan` アーム・
@@ -2956,11 +3150,21 @@ impl EngineCore {
 
     /// `USING PLAN('<query>')`（TASK-77・SQL-5）経路のうち、スキーマに依存しない
     /// I/O 部分（LLM によるクエリ展開・再埋め込み）だけを行う。呼び出し元は
-    /// [`Self::execute_sql_in_session`] の `Statement::Select` アームのみ
-    /// （`validated.using_plan()` が `Some` のとき）。`self.embedder`／
+    /// [`Self::run_using_plan_select`]（SQL テキスト経由の `Statement::Select`
+    /// アーム・束縛済み `plan` 検索〔`Self::execute_bound_plan_search_in_session`。
+    /// TASK-186・NOSQL-2・Issue #764〕の双方が共有する骨格）のみ。`self.embedder`／
     /// `self.query_planner` はいずれも private フィールドで `sql::using_plan`
     /// （束縛の純粋なロジックのみを持つ）からは不可視なため、これらへアクセスする
     /// 処理（LLM 展開・再埋め込みの実行そのもの）は本メソッドに置く。
+    ///
+    /// `query_mode`（`USING MODE`／`search.mode` リテラルの解決済み値）は
+    /// 呼び出し元が事前に解析して渡す（SQL テキスト経由は `ValidatedStatement::
+    /// search_mode()` を、NoSQL 表層は `PlanSearch::query_mode()` を、
+    /// いずれも呼び出し元が本メソッド呼び出し前に解析済み。以前は本メソッド内
+    /// （末尾。I/O 完了後）で `ValidatedStatement` から直接解析していたが、
+    /// `ValidatedStatement` を要求しない形へ一般化するため呼び出し元へ委譲した。
+    /// 呼び出し元はいずれも I/O 前の事前束縛検証で同一リテラルを既に検証済みの
+    /// ため、ここでの解析結果は変わらない）。
     ///
     /// 列インデックス解決（`sql::using_plan::bind_expansion`）は本メソッドに含めない
     /// （codex-review P1 指摘対応。呼び出し元が本メソッドの結果を使って I/O 完了後に
@@ -2977,7 +3181,8 @@ impl EngineCore {
         &self,
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
-        validated: &crate::sql::allowlist::ValidatedStatement,
+        table: &str,
+        query_mode: Option<crate::sql::mode::SearchMode>,
         question: &str,
     ) -> Result<UsingPlanExpansionResult, crate::sql::allowlist::SqlSurfaceError> {
         let embedder = self.embedder.as_deref().ok_or_else(|| {
@@ -3005,11 +3210,11 @@ impl EngineCore {
             )
         })?;
 
-        let expansion = self
-            .plan_query(ctx, validated.table_name(), question)
-            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+        let expansion = self.plan_query(ctx, table, question).map_err(|e| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: format!("USING PLAN query expansion failed: {e}"),
-            })?;
+            }
+        })?;
 
         // PLAN-10 ポインタ: 密側（再埋め込み）と疎側（`hybrid_search` の全文検索側）は
         // 別々のテキストを使う（codex-review P1 指摘対応、PR #266）。密側は
@@ -3076,13 +3281,10 @@ impl EngineCore {
             }
         })?;
 
-        // `USING MODE`／`SET search_mode` の優先順位解決は既存の検索 SELECT 経路
-        // （`sql::parser::bind_in_session`）と同一の規則（クエリ句 > セッション変数 >
-        // 既定）を踏襲する。スキーマに依存しないためここで解決してよい。
-        let query_mode = match validated.search_mode() {
-            Some(literal) => Some(crate::sql::mode::SearchMode::parse_literal(literal)?),
-            None => None,
-        };
+        // `USING MODE`／`SET search_mode`（もしくは NoSQL 表層の `search.mode`）の
+        // 優先順位解決は既存の検索 SELECT 経路（`sql::parser::bind_in_session`）と
+        // 同一の規則（クエリ句 > セッション変数 > 既定）を踏襲する。`query_mode`
+        // は呼び出し元が既に解析済み（本メソッドのドキュメント参照）。
         // TASK-164（PLAN-11）: プランナー推定（`expansion.mode_hint`）も優先順位
         // 解決へ含める（明示指定〔クエリ句・セッション変数〕> プランナー推定 >
         // 既定。codex-review P1 指摘対応: 従来はここで `resolve_mode` を使い
@@ -4997,7 +5199,7 @@ mod tests {
 
         // I/O フェーズ（スキーマに依存しない）。
         let planned = core
-            .plan_using_plan_expansion(&ctx, &session, &validated, question)
+            .plan_using_plan_expansion(&ctx, &session, validated.table_name(), None, question)
             .expect("plan_using_plan_expansion should succeed");
 
         // I/O 完了後・束縛前に DDL が挟まる（同名テーブルの列順を入れ替えて再作成）。
@@ -5710,7 +5912,7 @@ mod tests {
         let question = validated.using_plan().expect("USING PLAN present");
 
         let planned = core
-            .plan_using_plan_expansion(&ctx, &session, &validated, question)
+            .plan_using_plan_expansion(&ctx, &session, validated.table_name(), None, question)
             .expect("plan_using_plan_expansion should succeed");
 
         let seen = spy.seen.lock().expect("spy lock not poisoned");

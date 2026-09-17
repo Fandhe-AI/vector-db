@@ -69,7 +69,12 @@ pub(crate) fn expanded_query_text(question: &str, expansion: &QueryExpansion) ->
 
 /// `schema` 内の規約列 [`BODY_COLUMN_NAME`]（`TEXT`）のインデックスを返す。
 /// 欠落・型不一致は [`SqlSurfaceError::invalid_input`]（`22000`）。
-fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfaceError> {
+///
+/// `pub(crate)`（Issue #764・TASK-186・NOSQL-2）: `core.rs::EngineCore::
+/// execute_bound_plan_search_in_session` が束縛済み `plan` 検索
+/// （NoSQL 表層）の `text_column_index` 解決に本関数をそのまま再利用する
+/// （[`bind_expansion`] と同一の本文列規約を共有し、第 2 の実装を作らない）。
+pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfaceError> {
     let idx = schema
         .columns
         .iter()
