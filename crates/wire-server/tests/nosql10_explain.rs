@@ -17,7 +17,7 @@ mod common;
 #[path = "http_common/mod.rs"]
 mod http_common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -65,6 +65,28 @@ impl LlmClient for StubLlmClient {
     }
 }
 
+/// プロンプト（辞書スナップショットを含む展開入力）を記録する決定的スタブ
+/// （`crates/engine/tests/core_explain_plan_entry.rs::RecordingLlmClient` と
+/// 同構成）。`StubLlmClient` は固定応答のみを返しプロンプト内容を無視する
+/// ため、RLS 非漏えいの確認には「応答に他テナント語彙が現れないこと」しか
+/// 固定できない（codex-review 指摘 PR #828）。本スタブは wire 経由でも
+/// `EngineCore` へ実際に渡されたプロンプトそのものへ他テナント語彙が
+/// 混入していないことを固定するために使う。
+struct RecordingLlmClient {
+    response: &'static str,
+    seen_prompts: Arc<Mutex<Vec<String>>>,
+}
+
+impl LlmClient for RecordingLlmClient {
+    fn complete(&self, prompt: &str) -> Result<String, PlanError> {
+        self.seen_prompts
+            .lock()
+            .expect("recording stub lock poisoned")
+            .push(prompt.to_string());
+        Ok(self.response.to_string())
+    }
+}
+
 const EXPANSION_RESPONSE: &str =
     r#"{"search_terms": ["alpha", "beta"], "path_hint": "docs/", "kind_hint": "fn"}"#;
 
@@ -74,6 +96,15 @@ const EXPANSION_RESPONSE: &str =
 /// `sql_insert_explain_public_api.rs::build_explain_result_is_reachable_and_matches_sql_explain_rows`
 /// と同じ理由で選ぶ）。
 fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    new_core_with_planner(Box::new(StubLlmClient {
+        response: EXPANSION_RESPONSE,
+    }))
+}
+
+/// [`new_core`] と同じ行データを持ち、注入する `LlmClient` を差し替えられる版。
+/// RLS 非漏えいの確認でプロンプト内容そのものを記録したい呼び出し元
+/// （`RecordingLlmClient`）向け。
+fn new_core_with_planner(planner: Box<dyn LlmClient>) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("nosql10-explain-default");
     let guard = temp_db::CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -120,9 +151,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     drop(storage);
     let core = EngineCore::open(&path)
         .expect("open engine core")
-        .with_query_planner(Box::new(StubLlmClient {
-            response: EXPANSION_RESPONSE,
-        }));
+        .with_query_planner(planner);
     (Arc::new(core), guard)
 }
 
@@ -411,7 +440,11 @@ fn aggregate_and_scan_explain_true_still_reject_with_42601() {
 
 #[test]
 fn other_tenant_row_content_does_not_leak_into_explain_response() {
-    let (core, _guard) = new_core();
+    let seen_prompts = Arc::new(Mutex::new(Vec::new()));
+    let (core, _guard) = new_core_with_planner(Box::new(RecordingLlmClient {
+        response: EXPANSION_RESPONSE,
+        seen_prompts: Arc::clone(&seen_prompts),
+    }));
     let (addr, token) = spawn_alice_session(Arc::clone(&core));
 
     let body = br#"{"op":"search","table":"docs","plan":"find content","limit":5,"explain":true}"#;
@@ -423,4 +456,29 @@ fn other_tenant_row_content_does_not_leak_into_explain_response() {
     // 再確認）は現れない。
     assert!(!joined.contains("docs/b-secret.md"));
     assert!(!joined.contains("tenant-b"));
+
+    // `RecordingLlmClient` は固定応答を無視せず実際に wire 経由で
+    // `EngineCore` へ渡されたプロンプトを記録するため、辞書スナップショット
+    // を含む展開入力そのものに他テナント語彙が混入していないことも固定する
+    // （codex-review 指摘 PR #828: 固定応答スタブでは応答側しか検証できず、
+    // プロンプト側の混入は見逃せる）。
+    let prompts = seen_prompts.lock().expect("recording stub lock poisoned");
+    assert!(
+        !prompts.is_empty(),
+        "LLM 呼び出しが発生していない（テストが vacuous）"
+    );
+    for prompt in prompts.iter() {
+        assert!(
+            !prompt.contains("docs/b-secret.md"),
+            "辞書スナップショットに他テナントの path が混入している: {prompt}"
+        );
+        assert!(
+            !prompt.contains("tenant-b"),
+            "プロンプトに他テナント語彙が混入している: {prompt}"
+        );
+        assert!(
+            !prompt.contains("tenant-b only content"),
+            "辞書スナップショットに他テナントの body 内容が混入している: {prompt}"
+        );
+    }
 }

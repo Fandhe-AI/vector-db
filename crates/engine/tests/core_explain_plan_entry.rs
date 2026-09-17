@@ -27,6 +27,7 @@ use engine::sql::explain::ExplainShape;
 use engine::sql::mode::SessionState;
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
+use std::sync::{Arc, Mutex};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
@@ -103,6 +104,27 @@ struct StubLlmClient {
 
 impl LlmClient for StubLlmClient {
     fn complete(&self, _prompt: &str) -> Result<String, PlanError> {
+        Ok(self.response.to_string())
+    }
+}
+
+/// プロンプト（辞書スナップショットを含む展開入力）を記録する決定的スタブ
+/// （`tests/query_planner.rs::MockLlmClient` と同構成）。`StubLlmClient` は
+/// 固定応答のみを返しプロンプト内容を無視するため、RLS 非漏えいの確認には
+/// 「応答に他テナント語彙が現れないこと」しか固定できない（codex-review
+/// 指摘 PR #828）。本スタブは実際に `EngineCore` から渡されたプロンプト
+/// そのものへ他テナント語彙が混入していないことを固定するために使う。
+struct RecordingLlmClient {
+    response: &'static str,
+    seen_prompts: Arc<Mutex<Vec<String>>>,
+}
+
+impl LlmClient for RecordingLlmClient {
+    fn complete(&self, prompt: &str) -> Result<String, PlanError> {
+        self.seen_prompts
+            .lock()
+            .expect("recording stub lock poisoned")
+            .push(prompt.to_string());
         Ok(self.response.to_string())
     }
 }
@@ -461,10 +483,12 @@ fn explain_entry_does_not_leak_other_tenant_row_content() {
     seed_tenant_b_row(&storage);
     drop(storage);
 
+    let seen_prompts = Arc::new(Mutex::new(Vec::new()));
     let core = EngineCore::open(&path)
         .expect("open engine core")
-        .with_query_planner(Box::new(StubLlmClient {
+        .with_query_planner(Box::new(RecordingLlmClient {
             response: EXPANSION_RESPONSE,
+            seen_prompts: Arc::clone(&seen_prompts),
         }));
 
     let entry_result = core.explain_bound_plan_in_session(
@@ -482,6 +506,30 @@ fn explain_entry_does_not_leak_other_tenant_row_content() {
         "EXPLAIN の展開結果はスタブ固定値のため他テナント語彙が混入しないこと"
     );
     assert!(!joined.contains("tenant-b"));
+
+    // `RecordingLlmClient` はスタブ応答を無視せず実際に渡されたプロンプトを
+    // 記録するため、辞書スナップショットを含む展開入力そのものに他テナント
+    // 語彙が混入していないことも固定する（codex-review 指摘 PR #828:
+    // 固定応答スタブでは応答側しか検証できず、プロンプト側の混入は見逃せる）。
+    let prompts = seen_prompts.lock().expect("recording stub lock poisoned");
+    assert!(
+        !prompts.is_empty(),
+        "LLM 呼び出しが発生していない（テストが vacuous）"
+    );
+    for prompt in prompts.iter() {
+        assert!(
+            !prompt.contains("docs/b-secret.md"),
+            "辞書スナップショットに他テナントの path が混入している: {prompt}"
+        );
+        assert!(
+            !prompt.contains("tenant-b"),
+            "プロンプトに他テナント語彙が混入している: {prompt}"
+        );
+        assert!(
+            !prompt.contains("tenant-b only content"),
+            "辞書スナップショットに他テナントの body 内容が混入している: {prompt}"
+        );
+    }
 }
 
 /// クレート外（本テストファイル）からの直接呼び出しが `EngineCore::
