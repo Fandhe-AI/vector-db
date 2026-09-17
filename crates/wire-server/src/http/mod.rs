@@ -49,7 +49,10 @@
 //!   委譲する（Issue #761・NOSQL-7）。`query::response` は `search`／`scan`／
 //!   `aggregate` 成功時の `QueryResult` → JSON 応答本文（`columns`／`rows`／
 //!   `row_count`、`crate::result_encoder` と同じ型写像。Issue #762・
-//!   NOSQL-11）を担う
+//!   NOSQL-11）を担う。`query::op` は `op` 名を閉じた語彙 4 値（`search`／
+//!   `scan`／`aggregate`／`insert`）へ分類する許可リストで、語彙外
+//!   （DDL・UDF 呼び出し・トランザクション制御・UPDATE／DELETE 相当を含む）
+//!   を `0A000` へ写像する（Issue #759・TASK-179・NOSQL-1・NOSQL-9）
 //! - [`session`]: HTTP セッション認証の構成要素（トークン生成・エンコード
 //!   〔Issue #750・TASK-174・HTTP-4〕、TTL 固定・同時有効数上限付きの
 //!   メモリ内セッションストア〔`session::store::SessionStore`。Issue #751・
@@ -75,8 +78,10 @@
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - `explain: true` 時の `{"explain":[...]}` 応答（#765）
-//! - [`query::gate`] の暫定 `0A000`／501 応答を op 許可リストの正式化・
-//!   束縛・実行計画への写像で置き換える（Issue #759・#763・#766・#768 以降）
+//! - [`query::gate`] の暫定 `0A000`／501 応答を op ごとの束縛・実行計画への
+//!   写像で置き換える（op 許可リスト自体は [`query::op`] として実装済み
+//!   〔Issue #759・TASK-179・NOSQL-1・NOSQL-9〕。#763・#766・#768 以降が
+//!   本 seam を置き換える）
 //!
 //! 対応: TASK-173〜TASK-175（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア
 //! HTTP-1〜13・NOSQL-1〜NOSQL-10。PoC-15/TASK-182 は private 資産のため
