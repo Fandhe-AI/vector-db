@@ -653,6 +653,20 @@ fn explain_with_vector_rejects_with_42601() {
     assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
 }
 
+/// `vector` と `plan` を両方指定した要求に `explain: true` を伴っても、
+/// `explain` 専用の分類（`plan` 指定時 `0A000`）ではなく、本来の排他違反
+/// `42601` が優先される（cursor[bot] 指摘・PR #827。`execute` が排他判定を
+/// `explain` 判定より先に行う順序の回帰）。
+#[test]
+fn vector_and_plan_both_present_with_explain_still_rejects_with_42601() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"plan":"find content","limit":10,"explain":true}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+}
+
 /// `plan` + `explain: true` は `0A000`（NOSQL-10・Issue #765 の未実装扱い。
 /// LLM 呼び出しを一切行わないことをスタブ core で確認する——スタブ未注入の
 /// core で `XX000` ではなく `0A000` が返ることが、実行前に拒否されている

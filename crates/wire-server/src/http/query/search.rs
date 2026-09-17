@@ -483,9 +483,29 @@ pub fn execute(
     let table = validated.required_str("table")?;
     ident::check_identifier(table)?;
 
+    let vector_present = validated.optional_array("vector")?.is_some();
     let plan_present = validated.optional_str("plan")?.is_some();
 
-    if validated.optional_bool("explain")?.unwrap_or(false) {
+    // `explain: true` の拒否は `vector`／`plan` のどちらか一方だけが指定
+    // された「（排他契約上）有効な形の要求」に限って行う（cursor[bot]
+    // 指摘・PR #827）。両方指定・両方欠落のときにここで `explain` 専用の
+    // 分類（`plan` 指定時 `0A000`・`vector` 指定時 `42601`）へ先回りして
+    // 拒否すると、以下 2 つの既存の優先順位契約を壊してしまう:
+    //   1. 未知テーブルは排他判定より先に `42P01` で拒否される
+    //      （`undefined_table_rejects_with_42p01_before_exclusivity_check`。
+    //      本関数はテーブル存在確認の前にここへ到達するため、`table`
+    //      なしで判定してしまうと `42P01` より先に応答が確定してしまう）。
+    //   2. `vector`・`plan` を両方指定した要求は「サーバーが対応していない」
+    //      と読める `0A000` ではなく、契約違反を表す `42601`
+    //      （[`bind_search`] が返す [`SearchError::VectorAndPlanBothPresent`]）
+    //      を返すべき。
+    // `vector_present != plan_present`（ちょうど一方だけ true）のときのみ
+    // 早期拒否し、それ以外（両方・いずれも false）は通常のディスパッチへ
+    // 進めて `bind_search` 自身の排他判定・テーブル存在確認の優先順位に
+    // 委ねる（両方欠落かつ `explain: true` の場合も、テーブルが存在すれば
+    // 最終的に `bind_search` が `VectorAndPlanBothMissing`＝`42601` を返す
+    // ため、旧来の `ExplainRequiresPlan`＝`42601` と wire_code は変わらない）。
+    if validated.optional_bool("explain")?.unwrap_or(false) && vector_present != plan_present {
         return Err(if plan_present {
             SearchError::ExplainNotSupported
         } else {
