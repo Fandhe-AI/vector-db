@@ -628,6 +628,36 @@ fn undefined_table_rejects_with_42p01_before_exclusivity_check() {
     assert_eq!(http_common::wire_code_of(&resp), "42P01", "resp={resp:?}");
 }
 
+/// 未知テーブル＋`mode` 値不正（`plan` 指定）は `42P01` が `22000` より
+/// 優先される（cursor[bot] 指摘対応・PR #827。テーブル解決より先に `mode`
+/// リテラルを解析すると、テーブル未存在＋ mode 値不正の要求で `42P01` より
+/// 先に `22000` が確定してしまう既存回帰。`vector` 指定検索（`bind_search`
+/// がテーブル解決後に `mode` を解析する）と同じ優先順位を `plan` 指定検索
+/// でも保証する）。
+#[test]
+fn undefined_table_rejects_with_42p01_before_invalid_mode_on_plan_path() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    let body =
+        br#"{"op":"search","table":"missing","plan":"find content","limit":1,"mode":"fuzzy"}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(http_common::wire_code_of(&resp), "42P01", "resp={resp:?}");
+}
+
+/// 未知テーブル＋`mode` 値不正（`vector` 指定）も同じ優先順位を保つ
+/// （`bind_search` がテーブル解決後に `mode` を解析するため、以前から
+/// `42P01` が優先されていた経路の回帰防止）。
+#[test]
+fn undefined_table_rejects_with_42p01_before_invalid_mode_on_vector_path() {
+    let (core, _guard) = new_core_seed();
+    let addr = spawn(Arc::clone(&core));
+
+    let body = br#"{"op":"search","table":"missing","vector":[1.0,0.0],"limit":1,"mode":"fuzzy"}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(http_common::wire_code_of(&resp), "42P01", "resp={resp:?}");
+}
+
 /// `vector` と `plan` の両方指定は `42601`（SQL の `ORDER BY`／`USING PLAN`
 /// 相互排他と同じ分類）。
 #[test]

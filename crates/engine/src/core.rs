@@ -2235,27 +2235,27 @@ impl EngineCore {
                     });
                 }
                 if let Some(question) = validated.using_plan() {
-                    // `USING MODE` リテラルは事前に一度だけ解析する（`sql::
-                    // using_plan::pre_check_bindable` が同一リテラルを I/O 前に
-                    // 再検証するため、ここでの解析結果は成功していることが以後
-                    // 保証される。`run_using_plan_select`（TASK-186・NOSQL-2。
-                    // Issue #764）が SQL テキスト経由・束縛済み計画経由の双方で
-                    // 共有する fail-closed 順序〔LIMIT → 辞書列 → 事前束縛検証 →
-                    // I/O（LLM 展開・再埋め込み）→ 世代照合 → 再検証 → 束縛〕は
-                    // 本アームが従来内蔵していた手順と同一。詳細は
+                    // `USING MODE` リテラルの解析は `run_using_plan_select` に
+                    // 委譲し、ここでは行わない（cursor[bot] 指摘対応・PR #827）。
+                    // 以前はここで `SearchMode::parse_literal` を先に解析して
+                    // いたため、テーブル未存在（`42P01` 相当）と `USING MODE`
+                    // 値の不正（`22000`）が同時に成立する要求で、テーブル解決
+                    // より先に mode 解析エラーが確定してしまっていた。
+                    // `run_using_plan_select` はテーブル解決（`read_txn_with_
+                    // schema`）を終えた後の `pre_check`（`sql::using_plan::
+                    // pre_check_bindable` が同一リテラルを再検証する）で初めて
+                    // mode リテラルを解析するため、生リテラルをそのまま渡す
+                    // ことで両表層（SQL テキスト経由・束縛済み計画経由）が
+                    // 共有する fail-closed 順序〔LIMIT → 辞書列 → テーブル解決 →
+                    // 事前束縛検証（mode 解析含む） → I/O（LLM 展開・再埋め込み）
+                    // → 世代照合 → 再検証 → 束縛〕を保つ。詳細は
                     // [`Self::run_using_plan_select`] のドキュメント参照）。
-                    let query_mode = match validated.search_mode() {
-                        Some(literal) => {
-                            Some(crate::sql::mode::SearchMode::parse_literal(literal)?)
-                        }
-                        None => None,
-                    };
                     let result = self.run_using_plan_select(
                         ctx,
                         session,
                         &validated.table_name,
                         question,
-                        query_mode,
+                        validated.search_mode(),
                         validated.limit(),
                         |schema, udfs| {
                             crate::sql::using_plan::pre_check_bindable(&validated, schema, udfs)
@@ -2583,7 +2583,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         table: &str,
         question: &str,
-        query_mode: Option<crate::sql::mode::SearchMode>,
+        mode_literal: Option<&str>,
         limit: u32,
         pre_check: Pre,
         bind: Bind,
@@ -2627,6 +2627,18 @@ impl EngineCore {
         // 呼び出し元提供のスキーマ依存事前束縛検証（`USING MODE` リテラル・
         // `VECTOR` 列・投影列／`WHERE` 述語）。I/O より前に完結させる。
         pre_check(&pre_check_schema, session.udfs())?;
+
+        // `USING MODE` リテラルの解析はテーブル解決（上記 `read_txn_with_
+        // schema`）より後で行う（cursor[bot] 指摘対応・PR #827。テーブル
+        // 未存在＋ mode リテラル不正の要求で `42P01` が `22000` より優先
+        // される既存の fail-closed 順序契約を維持する）。SQL テキスト経由
+        // では `pre_check`（`sql::using_plan::pre_check_bindable`）が同一
+        // リテラルを既に検証済みのため、ここでの解析結果は成功している
+        // ことが保証される。
+        let query_mode = match mode_literal {
+            Some(literal) => Some(crate::sql::mode::SearchMode::parse_literal(literal)?),
+            None => None,
+        };
 
         let planned = self.plan_using_plan_expansion(ctx, session, table, query_mode, question)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
@@ -2732,7 +2744,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         table: &str,
         question: &str,
-        query_mode: Option<crate::sql::mode::SearchMode>,
+        mode_literal: Option<&str>,
         limit: u32,
         bind: F,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
@@ -2746,6 +2758,11 @@ impl EngineCore {
         // 検証に加え、engine 側でも独立に通す。NoSQL 表層の `search.rs::
         // bind_search` が既に同じ検証を通しているが、本メソッドが engine の
         // 公開 API として単独呼び出しされる場合の fail-closed 契約を維持）。
+        // `mode_literal`（`USING MODE` 相当の生リテラル）はここでは解析しない
+        // （cursor[bot] 指摘対応・PR #827）。`Self::run_using_plan_select` が
+        // テーブル解決後に初めて解析することで、テーブル未存在＋ mode 値不正の
+        // 要求で `42P01` が優先される SQL テキスト経由と同一の fail-closed
+        // 順序を保つ。
         let validated_limit = crate::sql::parser::validate_search_limit(limit)?;
         crate::sql::allowlist::validate_using_plan_question(question)?;
 
@@ -2754,7 +2771,7 @@ impl EngineCore {
             session,
             table,
             question,
-            query_mode,
+            mode_literal,
             limit,
             |schema, udfs| {
                 // `VECTOR` 列の存在は LLM 展開・再埋め込み（高コスト I/O）より

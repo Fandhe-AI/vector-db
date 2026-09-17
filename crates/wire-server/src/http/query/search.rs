@@ -544,21 +544,22 @@ pub fn execute(
         // 防御としてここでも一度通し、範囲外を engine 呼び出し前に拒否する。
         // `bind_search`〔schema 依存の束縛〕側でも同じ検証が再度行われる）。
         validate_search_limit(limit_raw)?;
-        // `mode` は [`bind_search`] と同一の識別子形状検査・解析規則を通す
-        // （多層防御。両者は同一の `validated` から決定的に同じ結果になる）。
-        let query_mode = match validated.optional_str("mode")? {
-            Some(literal) => {
-                ident::check_identifier(literal)?;
-                Some(SearchMode::parse_literal(literal)?)
-            }
-            None => None,
-        };
+        // `mode` の識別子形状検査・`SearchMode::parse_literal` はここでは
+        // 行わない（cursor[bot] 指摘対応・PR #827）。以前はここで先に解析
+        // していたため、テーブル未存在＋ `mode` 値不正の要求で `42P01` より
+        // 先に `22000` が確定してしまっていた（`vector` 指定検索は
+        // `bind_search` が同じ解析をテーブル解決後〔`execute_bound_search_
+        // in_session` の `read_txn_with_schema` 後〕に行うため、この問題が
+        // 無かった）。生リテラルをそのまま渡し、
+        // `EngineCore::run_using_plan_select` がテーブル解決後に初めて
+        // 解析することで `vector` 指定検索と同一の fail-closed 順序を保つ。
+        let mode_literal = validated.optional_str("mode")?;
         let result = engine.execute_bound_plan_search_in_session(
             ctx,
             &session,
             table,
             question,
-            query_mode,
+            mode_literal,
             limit_raw,
             |schema, _udfs| match bind_search(validated, schema).map_err(to_sql_surface_error)? {
                 BoundSearch::Plan(plan) => Ok(PlanSearchBinding::new(
