@@ -302,8 +302,19 @@ pub fn bind_search(
     let filter_items = validated.optional_array("filter")?.unwrap_or(&[]);
     let metadata_filters = bind_filter(filter_items, schema)?;
 
+    // `mode` は `table`／`columns` と同じ識別子形状検査（`ident::
+    // check_identifier`）を先に通す（cursor[bot] 指摘・PR #820。`"recall"`／
+    // `"precision"` はいずれもこの形状に収まるため受理側の挙動は不変。
+    // `SearchMode::parse_literal` のエラーメッセージは不一致値をそのまま
+    // 埋め込むため、事前に長さ上限（`MAX_IDENTIFIER_LEN`）・NUL／制御文字・
+    // 非 ASCII を弾いておくことで、巨大な値や NUL を含む値がエラー応答本文の
+    // 肥大化や `error_response::encode` の制御文字拒否による `XX000` への
+    // 縮退を引き起こさないようにする）。
     let query_mode = match validated.optional_str("mode")? {
-        Some(literal) => Some(SearchMode::parse_literal(literal)?),
+        Some(literal) => {
+            ident::check_identifier(literal)?;
+            Some(SearchMode::parse_literal(literal)?)
+        }
         None => None,
     };
 
@@ -571,6 +582,57 @@ mod tests {
         )
         .expect_err("must reject");
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// `mode` に巨大な値を与えても `table`／`columns` と同じ識別子形状検査
+    /// （`ident::check_identifier`）で長さ上限超過として拒否され、
+    /// `SearchMode::parse_literal` のエラーメッセージ（不一致値をそのまま
+    /// 埋め込む）へは到達しないことを固定する（cursor[bot] 指摘・PR #820）。
+    #[test]
+    fn mode_oversized_literal_is_rejected_before_parse_literal() {
+        let oversized = "a".repeat(10_000);
+        let err = bind(&format!(
+            r#"{{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,"mode":"{oversized}"}}"#
+        ))
+        .expect_err("must reject");
+        assert!(matches!(err, SearchError::InvalidIdentifier));
+        assert_eq!(err.wire_code(), "42601");
+        // untrusted な mode 文字列を含まない固定文言であること（エラー応答
+        // 本文の肥大化を防ぐ）。
+        assert_eq!(err.client_message(), "invalid identifier");
+    }
+
+    /// `mode` に NUL バイトを含む値を与えても識別子形状検査で拒否され、
+    /// untrusted な生文字列がエラー文言へ埋め込まれないことを固定する
+    /// （`error_response::encode` の制御文字拒否による `XX000` への縮退を
+    /// 未然に防ぐ）。`engine::json::parse_json` は ` ` エスケープ経由の
+    /// 制御文字も拒否するため、JSON テキストを経由せず `JsonValue` を直接
+    /// 組み立てて schema 検証以降の経路だけを検証する。
+    #[test]
+    fn mode_literal_with_nul_byte_is_rejected() {
+        let mut object = std::collections::BTreeMap::new();
+        object.insert("op".to_string(), JsonValue::String("search".to_string()));
+        object.insert("table".to_string(), JsonValue::String("docs".to_string()));
+        object.insert(
+            "vector".to_string(),
+            JsonValue::Array(vec![
+                JsonValue::Number(0.1),
+                JsonValue::Number(0.2),
+                JsonValue::Number(0.3),
+                JsonValue::Number(0.4),
+            ]),
+        );
+        object.insert("limit".to_string(), JsonValue::Number(5.0));
+        object.insert(
+            "mode".to_string(),
+            JsonValue::String("re\u{0}call".to_string()),
+        );
+        let value = JsonValue::Object(object);
+        let validated = SEARCH_SCHEMA.validate(&value).expect("must validate shape");
+        let err = bind_search(&validated, &schema()).expect_err("must reject");
+        assert!(matches!(err, SearchError::InvalidIdentifier));
+        assert_eq!(err.wire_code(), "42601");
+        assert_eq!(err.client_message(), "invalid identifier");
     }
 
     #[test]
