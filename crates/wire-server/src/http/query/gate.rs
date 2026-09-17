@@ -27,11 +27,12 @@
 //!    する。`(Op::Scan, Some(engine))` は [`crate::http::query::scan::
 //!    handle`]（TASK-186・NOSQL-3・Issue #766）、`(Op::Aggregate,
 //!    Some(engine))` は [`super::aggregate::handle`]（Issue #768・
-//!    TASK-177・NOSQL-4）へそれぞれ束縛・実行を委譲する。それ以外
-//!    （`Op::Search`／`Op::Insert`、および `engine` 未接続時の
-//!    `Op::Scan`／`Op::Aggregate`）は暫定の `0A000`／501
-//!    （[`PLACEHOLDER_MESSAGE`]）を返す（束縛・実行の結線は #763・#771 が
-//!    本 seam を置き換える）
+//!    TASK-177・NOSQL-4）、`(Op::Search, Some(engine))` は
+//!    [`super::search::handle`]（TASK-186・NOSQL-2・Issue #764）へ
+//!    それぞれ束縛・実行を委譲する。それ以外（`Op::Insert`、および
+//!    `engine` 未接続時の `Op::Scan`／`Op::Aggregate`／`Op::Search`）は
+//!    暫定の `0A000`／501（[`PLACEHOLDER_MESSAGE`]）を返す（束縛・実行の
+//!    結線は #771 が本 seam を置き換える）
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
 //! `op` にスキーマ検証由来の情報（未知キー等）が先に返ることはない
@@ -54,10 +55,10 @@ use crate::http::{body, response};
 
 pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 
-/// 検証を通過したが実行結線が未接続（`op` が `scan`／`aggregate` 以外、
-/// または該当 op でも `engine` 未接続）の要求に返す暫定応答の文言
-/// （束縛・実行は #763・#771 の担当。本 Issue 時点は `scan`・`aggregate`
-/// の 2 op のみ seam を置き換え済み）。
+/// 検証を通過したが実行結線が未接続（`op` が `scan`／`aggregate`／`search`
+/// 以外、または該当 op でも `engine` 未接続）の要求に返す暫定応答の文言
+/// （束縛・実行は #771 の担当。本 Issue 時点は `scan`・`aggregate`・`search`
+/// の 3 op のみ seam を置き換え済み）。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
 
 /// `POST /v1/query` を処理し応答バイト列を返す（認証済み要求のみ）。
@@ -111,6 +112,9 @@ pub fn handle(
         (Op::Scan, Some(engine)) => scan::handle(engine, principal, &validated, now_wall),
         (Op::Aggregate, Some(engine)) => {
             super::aggregate::handle(engine, principal, &validated, now_wall)
+        }
+        (Op::Search, Some(engine)) => {
+            super::search::handle(engine, principal, &validated, now_wall)
         }
         (_, _) => response::encode_error(
             ErrorClass::FeatureNotSupported,
@@ -249,7 +253,10 @@ mod tests {
     }
 
     #[test]
-    fn valid_search_reaches_placeholder_response() {
+    fn valid_search_reaches_placeholder_response_when_engine_is_not_connected() {
+        // `engine` 未接続（`Router::new` 経由）では `search` も従来どおり
+        // placeholder のまま（実行器なしで応答を偽装しない。`scan`・
+        // `aggregate` と同じ契約）。
         let body = br#"{"op":"search","table":"docs","limit":1}"#;
         let response = run(body, &[]);
         let text = String::from_utf8(response).expect("utf-8 response");

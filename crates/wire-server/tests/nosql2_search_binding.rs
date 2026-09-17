@@ -150,8 +150,11 @@ fn c4_hybrid_matches_sql_order_by_hybrid_function() {
 
 #[test]
 fn plan_only_binds_projection_filter_and_limit_matching_a_placeholder_order_by_form() {
-    // `plan` 指定は LLM 展開（engine 内部 I/O）を要するため `BoundStatement`
-    // までは完成しない（#764 の担当）。ここでは `PlanSearch` に束縛された
+    // `plan` 指定は LLM 展開（engine 内部 I/O）を要するため、本ファイルの
+    // `bind_search` 単体テストでは `BoundStatement` まで完成させない
+    // （実行結線・`BoundStatement` 完成は `EngineCore::
+    // execute_bound_plan_search_in_session`。TASK-186・NOSQL-2・
+    // Issue #764・`nosql2_search.rs` 参照）。ここでは `PlanSearch` に束縛された
     // 投影・フィルタ・`limit` が、同条件の `ORDER BY` 形 `BoundStatement`
     // （プレースホルダのベクトルリテラルを使った SQL）のアクセサー値と
     // 一致することだけを固定する（`ranking`／`mode` の完成は対象外）。

@@ -10,15 +10,18 @@
 //! 固定したいのはまさに「単一 `Storage` 構成での実行」であるため）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
-use engine::core::EngineCore;
+use engine::core::{EngineCore, PlanSearchBinding};
+use engine::embedding::{EmbedError, Embedder};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::query_planner::{LlmClient, PlanError};
 use engine::row_codec::Value;
 use engine::sql::allowlist::{validate_sql, SqlSurfaceError, Statement, TableLookup};
 use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
 use engine::sql::parser::{
-    bind_aggregate, bind_scan, AggregateTarget, BoundAggregate, BoundAggregateItem, BoundScan,
+    bind_aggregate, bind_in_session, bind_scan, AggregateTarget, BoundAggregate,
+    BoundAggregateItem, BoundScan, BoundStatement,
 };
 use engine::sql::udf_call::{define_function, Expr};
 use engine::storage::{Storage, Visibility};
@@ -440,4 +443,383 @@ fn aggregate_entry_accepts_binder_built_without_sql_text() {
     assert_eq!(bound_result.rows, sql_result.rows);
     assert_eq!(bound_result.rows[0].cells[0], Cell::Integer(5));
     assert_eq!(bound_result.rows[0].cells[1], Cell::Text("en".to_string()));
+}
+// --- search（TASK-186・NOSQL-2。Issue #764）: `execute_bound_search_in_session`
+// （`vector` 指定）・`execute_bound_plan_search_in_session`（`plan` 指定）------
+
+/// `body` 列を持つスキーマ（`USING PLAN` の本文列規約に必要。`schema()` は
+/// scan／aggregate 専用のため search 系テストでは別スキーマを使う）。
+fn search_schema() -> TableSchema {
+    TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(4), false),
+            ColumnDef::new("lang", ColumnType::Text, false),
+            // `USING PLAN` の辞書必須列（`path`／`body`。TASK-109・PLAN-5）を
+            // 満たす（`plan_entry_*` テストが `dictionary_required_columns`
+            // の `path` 欠落で `22000` へ落ちないようにする）。
+            ColumnDef::new("path", ColumnType::Text, false),
+            ColumnDef::new("body", ColumnType::Text, false),
+        ],
+    )
+}
+
+/// tenant-a に `Public` 行 id 1・2（`alpha`／`beta` 語彙）、tenant-b に
+/// `Private` 行 id 101（tenant-a のクエリ結果に混入してはならない RLS 境界
+/// 対照。`lang` = `"xx"`）を投入する。
+fn seed_search_two_tenants(storage: &Storage) {
+    storage
+        .create_table(&search_schema())
+        .expect("create table");
+    let ctx_a = PolicyContext::with_visibilities("tenant-a", [Visibility::Public])
+        .expect("valid tenant-a ctx");
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant-b ctx");
+
+    let rows: [(u64, [f32; 4], &str, &str, &str); 2] = [
+        (
+            1,
+            [0.1, 0.2, 0.3, 0.4],
+            "ja",
+            "docs/a.md",
+            "alpha content in english",
+        ),
+        (
+            2,
+            [0.4, 0.3, 0.2, 0.1],
+            "en",
+            "docs/b.md",
+            "beta content in english",
+        ),
+    ];
+    for (id, emb, lang, path, body) in rows {
+        let op_id = engine::recovery::required_op_id::OperationId::parse(&format!(
+            "search-tenant-a-op-{id}"
+        ))
+        .expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            storage,
+            TABLE,
+            &ctx_a,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(emb.to_vec()),
+                Value::Text(lang.to_string()),
+                Value::Text(path.to_string()),
+                Value::Text(body.to_string()),
+            ],
+            &op_id,
+        )
+        .expect("insert tenant-a row");
+    }
+    let op_id_b = engine::recovery::required_op_id::OperationId::parse("search-tenant-b-op-101")
+        .expect("valid operation_id");
+    engine::tenant::insert_typed_row(
+        storage,
+        TABLE,
+        &ctx_b,
+        101,
+        Visibility::Private,
+        &[
+            Value::Vector(vec![0.1, 0.2, 0.3, 0.4]),
+            Value::Text("xx".to_string()),
+            Value::Text("docs/private.md".to_string()),
+            Value::Text("alpha content belonging to tenant-b".to_string()),
+        ],
+        &op_id_b,
+    )
+    .expect("insert tenant-b row");
+}
+
+fn open_search_engine_core(path: &std::path::Path) -> EngineCore {
+    let storage = Storage::open(path).expect("open storage");
+    seed_search_two_tenants(&storage);
+    EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+}
+
+/// テキスト長だけを成分へ埋め込む決定的・ネットワーク不要な埋め込み
+/// （`crates/wire-server/tests/nosql2_search.rs::DeterministicEmbedder` と同じ
+/// 方針）。
+struct DeterministicEmbedder {
+    dim: u32,
+}
+
+impl Embedder for DeterministicEmbedder {
+    fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|t| vec![t.len() as f32 * 0.01; self.dim as usize])
+            .collect())
+    }
+}
+
+/// 固定の展開結果を返し、呼び出し回数を記録するスタブ `LlmClient`
+/// （`plan_entry_does_not_invoke_llm_when_binder_fails_pre_check` が非
+/// vacuous な「呼ばれなかった」証跡を取るために使う）。
+struct CountingStubLlmClient {
+    response: &'static str,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl LlmClient for CountingStubLlmClient {
+    fn complete(&self, _prompt: &str) -> Result<String, PlanError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.response.to_string())
+    }
+}
+
+const SEARCH_EXPANSION_RESPONSE: &str =
+    r#"{"search_terms": ["alpha", "beta"], "path_hint": null, "kind_hint": null}"#;
+
+/// `vector` 指定エントリが RLS を暗黙適用し、SQL テキスト経由（`ORDER BY
+/// <=>`）と `Cell` レベルで完全一致することを固定する。
+#[test]
+fn search_entry_applies_rls_implicitly_and_matches_sql_path() {
+    let path = unique_db_path("bound-plan-search-rls");
+    let _guard = CleanupGuard(path.clone());
+    let core = open_search_engine_core(&path);
+    let ctx_a = ctx_for("tenant-a");
+    let session = SessionState::default();
+    let sql = "SELECT id FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10";
+
+    let result = core
+        .execute_bound_search_in_session(&ctx_a, &session, TABLE, |schema, udfs| {
+            let validated = validate_sql(sql, &FixedTableLookup).expect("validate_sql");
+            let Statement::Select(validated_select) = validated else {
+                panic!("expected Statement::Select");
+            };
+            bind_in_session(&validated_select, schema, session.search_mode(), udfs)
+        })
+        .expect("execute_bound_search_in_session should succeed");
+
+    let mut sql_session = SessionState::default();
+    let sql_outcome = core
+        .execute_sql_in_session(&ctx_a, &mut sql_session, sql)
+        .expect("execute_sql_in_session should succeed");
+    let engine::sql::SqlOutcome::Query(sql_result) = sql_outcome else {
+        panic!("expected SqlOutcome::Query");
+    };
+    assert_eq!(result.rows, sql_result.rows);
+
+    // tenant-b の Private 行（id=101）は 2 件（tenant-a 可視行数）を超えて
+    // 混入しない（RLS-7）。
+    assert_eq!(result.rows.len(), 2);
+    let ids: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match row.cells[0] {
+            Cell::Integer(id) => id as i64,
+            ref other => panic!("expected Cell::Integer for id, got {other:?}"),
+        })
+        .collect();
+    assert!(!ids.contains(&101));
+}
+
+#[test]
+fn search_entry_rejects_undefined_table_before_invoking_binder() {
+    let path = unique_db_path("bound-plan-search-undefined-table");
+    let _guard = CleanupGuard(path.clone());
+    let core = open_search_engine_core(&path);
+    let ctx_a = ctx_for("tenant-a");
+    let session = SessionState::default();
+
+    let binder_called = std::sync::atomic::AtomicBool::new(false);
+    let err = core
+        .execute_bound_search_in_session(&ctx_a, &session, "no_such_table", |_schema, _udfs| {
+            binder_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            unreachable!("binder must not be invoked for an undefined table");
+        })
+        .expect_err("undefined table should be rejected before the binder runs");
+
+    assert!(!binder_called.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(matches!(err, SqlSurfaceError::UndefinedTable { .. }));
+}
+
+#[test]
+fn search_entry_propagates_binder_error_unchanged() {
+    let path = unique_db_path("bound-plan-search-binder-error");
+    let _guard = CleanupGuard(path.clone());
+    let core = open_search_engine_core(&path);
+    let ctx_a = ctx_for("tenant-a");
+    let session = SessionState::default();
+
+    let err = core
+        .execute_bound_search_in_session(&ctx_a, &session, TABLE, |_schema, _udfs| {
+            Err(SqlSurfaceError::InvalidInput {
+                detail: "synthetic binder failure".to_string(),
+            })
+        })
+        .expect_err("binder error should propagate unchanged");
+
+    assert!(matches!(err, SqlSurfaceError::InvalidInput { .. }));
+}
+
+#[test]
+fn search_entry_rejects_bound_plan_for_another_table() {
+    let path = unique_db_path("bound-plan-search-table-mismatch");
+    let _guard = CleanupGuard(path.clone());
+    let core = open_search_engine_core(&path);
+    let ctx_a = ctx_for("tenant-a");
+    let session = SessionState::default();
+
+    let err = core
+        .execute_bound_search_in_session(&ctx_a, &session, TABLE, |_schema, _udfs| {
+            Ok(BoundStatement::new(
+                "other_table".to_string(),
+                Vec::new(),
+                Vec::new(),
+                false,
+                engine::sql::parser::Ranking::Distance {
+                    query: vec![0.1, 0.2, 0.3, 0.4],
+                },
+                10,
+                engine::sql::plan::EvaluationOrder::DEFAULT,
+            ))
+        })
+        .expect_err("table mismatch should be rejected");
+
+    assert!(matches!(err, SqlSurfaceError::InvalidInput { .. }));
+}
+
+/// `plan` 指定エントリが SQL `USING PLAN(...)` と `Cell` レベルで完全一致
+/// することを固定する（決定的スタブ経由。実 Ollama 疎通は対象外）。
+#[test]
+fn plan_entry_matches_sql_using_plan_path() {
+    let path = unique_db_path("bound-plan-plan-sql-parity");
+    let _guard = CleanupGuard(path.clone());
+    let core = open_search_engine_core(&path)
+        .with_embedder(Box::new(DeterministicEmbedder { dim: 4 }))
+        .with_query_planner(Box::new(CountingStubLlmClient {
+            response: SEARCH_EXPANSION_RESPONSE,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }));
+    let ctx_a = ctx_for("tenant-a");
+    let session = SessionState::default();
+    let question = "find content";
+
+    let result = core
+        .execute_bound_plan_search_in_session(
+            &ctx_a,
+            &session,
+            TABLE,
+            question,
+            None,
+            10,
+            |_schema, _udfs| {
+                Ok(PlanSearchBinding::new(
+                    vec![engine::sql::parser::ProjectedColumn::Id],
+                    Vec::new(),
+                ))
+            },
+        )
+        .expect("execute_bound_plan_search_in_session should succeed");
+
+    let mut sql_session = SessionState::default();
+    let sql_outcome = core
+        .execute_sql_in_session(
+            &ctx_a,
+            &mut sql_session,
+            "SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+        )
+        .expect("execute_sql_in_session should succeed");
+    let engine::sql::SqlOutcome::Query(sql_result) = sql_outcome else {
+        panic!("expected SqlOutcome::Query");
+    };
+    assert_eq!(result.rows, sql_result.rows);
+    assert_eq!(result.rows.len(), 2);
+}
+
+/// `pre_check`（I/O 前）で binder が拒否する場合、LLM 呼び出しが 0 回のまま
+/// 拒否されることを固定する（`run_using_plan_select` の I/O 前拒否契約の
+/// 非 vacuous な証跡）。
+#[test]
+fn plan_entry_does_not_invoke_llm_when_binder_fails_pre_check() {
+    let path = unique_db_path("bound-plan-plan-pre-check-fails");
+    let _guard = CleanupGuard(path.clone());
+    let planner = std::sync::Arc::new(CountingStubLlmClient {
+        response: SEARCH_EXPANSION_RESPONSE,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    // `LlmClient` 注入は所有権を要求する（`Box<dyn LlmClient>`）ため、
+    // 呼び出し回数を後から観測できるよう別スレッド共有可能な `Arc` を経由し、
+    // `EngineCore` へは `Arc` をラップする薄い転送実装を渡す。
+    struct ForwardingLlmClient(std::sync::Arc<CountingStubLlmClient>);
+    impl LlmClient for ForwardingLlmClient {
+        fn complete(&self, prompt: &str) -> Result<String, PlanError> {
+            self.0.complete(prompt)
+        }
+    }
+    let core = open_search_engine_core(&path)
+        .with_embedder(Box::new(DeterministicEmbedder { dim: 4 }))
+        .with_query_planner(Box::new(ForwardingLlmClient(std::sync::Arc::clone(
+            &planner,
+        ))));
+    let ctx_a = ctx_for("tenant-a");
+    let session = SessionState::default();
+
+    let bind_call_count = std::sync::atomic::AtomicUsize::new(0);
+    let err = core
+        .execute_bound_plan_search_in_session(
+            &ctx_a,
+            &session,
+            TABLE,
+            "find content",
+            None,
+            10,
+            |_schema, _udfs| {
+                bind_call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(SqlSurfaceError::InvalidInput {
+                    detail: "synthetic pre-check failure".to_string(),
+                })
+            },
+        )
+        .expect_err("pre_check failure should reject before I/O");
+
+    assert!(matches!(err, SqlSurfaceError::InvalidInput { .. }));
+    // `bind` は `pre_check` としての 1 回のみ呼ばれ（`Err` を返して即座に
+    // 拒否するため `bind`〔本体〕としての 2 回目は呼ばれない）、I/O
+    // （`plan_query`／LLM 呼び出し）へは一切進んでいない。
+    assert_eq!(bind_call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        planner.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "LLM must not be invoked when the pre-check rejects the request"
+    );
+}
+
+/// `query_planner`／`embedder` のいずれも未注入だと fail-closed（`XX000`）で
+/// 拒否される（SQL 表層の既存契約と同一分類。`crates/engine/tests/
+/// sql_using_plan.rs::using_plan_fails_closed_without_query_planner` と同型）。
+#[test]
+fn plan_entry_fails_closed_without_query_planner_or_embedder() {
+    let path = unique_db_path("bound-plan-plan-unconfigured");
+    let _guard = CleanupGuard(path.clone());
+    let core = open_search_engine_core(&path);
+    let ctx_a = ctx_for("tenant-a");
+    let session = SessionState::default();
+
+    let err = core
+        .execute_bound_plan_search_in_session(
+            &ctx_a,
+            &session,
+            TABLE,
+            "find content",
+            None,
+            10,
+            |_schema, _udfs| {
+                Ok(PlanSearchBinding::new(
+                    vec![engine::sql::parser::ProjectedColumn::Id],
+                    Vec::new(),
+                ))
+            },
+        )
+        .expect_err("plan search without embedder/query_planner must fail closed");
+
+    assert_eq!(err.wire_code(), "XX000");
 }

@@ -96,23 +96,25 @@ fn spawn() -> SocketAddr {
 fn four_allowlisted_ops_reach_placeholder_response() {
     let addr = spawn();
 
-    // `scan`（TASK-186・NOSQL-3・Issue #766）・`aggregate`（Issue #768）は
-    // 実行結線済みのため、スローアウェイ `EngineCore`（テーブル未作成）上
-    // では `42P01`／404 が到達の証跡になる（他 2 op と異なり暫定
-    // `0A000`／501 はもう返らない）。
-    let executed_bodies: [&[u8]; 2] = [
+    // `scan`（TASK-186・NOSQL-3・Issue #766）・`aggregate`（Issue #768）・
+    // `search`（TASK-186・NOSQL-2・Issue #764）は実行結線済みのため、
+    // スローアウェイ `EngineCore`（テーブル未作成）上では `42P01`／404 が
+    // 到達の証跡になる（`insert` と異なり暫定 `0A000`／501 はもう返らない）。
+    // `search` は `vector`／`plan` いずれも未指定だが、テーブル解決
+    // （`EngineCore::execute_bound_search_in_session` の schema 取得）が
+    // binder（`vector`／`plan` 排他判定）より先に走るため `42P01` になる
+    // （§2.3 の判定順序どおり）。
+    let executed_bodies: [&[u8]; 3] = [
         br#"{"op":"scan","table":"docs","limit":1}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"id"}]}"#,
+        br#"{"op":"search","table":"docs","limit":1}"#,
     ];
     for body in executed_bodies {
         let resp = query(addr, body);
         http_common::assert_reached_query_gate(&resp);
     }
 
-    let bodies: [&[u8]; 2] = [
-        br#"{"op":"search","table":"docs","limit":1}"#,
-        br#"{"op":"insert","table":"docs","rows":[]}"#,
-    ];
+    let bodies: [&[u8]; 1] = [br#"{"op":"insert","table":"docs","rows":[]}"#];
     for body in bodies {
         let resp = query(addr, body);
         assert_eq!(resp.status, 501, "body={body:?} resp={resp:?}");
