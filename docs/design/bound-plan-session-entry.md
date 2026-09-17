@@ -145,7 +145,7 @@ fn run_using_plan_select<Pre, Bind>(
     session: &SessionState,
     table: &str,
     question: &str,
-    query_mode: Option<SearchMode>,
+    mode_literal: Option<&str>,
     limit: u32,
     pre_check: Pre,
     bind: Bind,
@@ -161,13 +161,19 @@ pub fn execute_bound_plan_search_in_session<F>(
     session: &SessionState,
     table: &str,
     question: &str,
-    query_mode: Option<SearchMode>,
+    mode_literal: Option<&str>,
     limit: u32,
     bind: F,
 ) -> Result<QueryResult, SqlSurfaceError>
 where
     F: Fn(&TableSchema, &UdfRegistry) -> Result<PlanSearchBinding, SqlSurfaceError>;
 ```
+
+`mode_literal`（`USING MODE` 相当の生リテラル）は `execute_bound_plan_search_in_session`
+自身では解析しない。`run_using_plan_select` がテーブル解決後に初めて解析する
+ことで、テーブル未存在＋ `mode` 値不正の要求でも `42P01` が優先される
+（SQL テキスト経由の `USING PLAN` と同一の fail-closed 順序。PR #827
+codex-review 指摘対応で `Option<SearchMode>` から変更）。
 
 設計上のポイント:
 
@@ -195,17 +201,29 @@ where
 ### 判定順序（`wire-server::http::query::search::execute` が固定する契約）
 
 1. `table` の識別子形状検査（`42601`）
-2. `explain: true` の拒否（`vector` 指定は `42601`——SQL-6 の `EXPLAIN
-   SELECT ... ORDER BY` 拒否と同じ分類、`plan` 指定は `0A000`——NOSQL-10・
-   Issue #765 が正式な `explain` op 写像へ置き換えるまでの暫定の未実装扱い）
-3. `vector`／`plan` の有無（スキーマ非依存の JSON 上の存在確認）で
+2. `vector`／`plan` の同時指定（排他違反）の拒否（`42601`）。スキーマ解決
+   （テーブルの存在確認）を一切要さない、要求本文自身が抱える構造的な
+   契約違反のため、他のどの検証よりも先にここで確定する（PR #827
+   codex-review 指摘対応。以前は `plan` 分岐内のローカル検証
+   〔`validate_using_plan_question`・`mode` 解析〕がテーブル解決前に
+   位置していたため、`vector` も同時指定された要求では排他違反より先に
+   別のエラーが返ってしまっていた）
+3. `explain: true` の拒否（`vector`／`plan` のどちらか一方だけが指定された
+   場合に限る。`vector` 指定は `42601`——SQL-6 の `EXPLAIN SELECT ...
+   ORDER BY` 拒否と同じ分類、`plan` 指定は `0A000`——NOSQL-10・Issue #765
+   が正式な `explain` op 写像へ置き換えるまでの暫定の未実装扱い。両方
+   欠落のときはここで先回りせず、未知テーブルが `42P01` で拒否される
+   優先順位契約〔手順 4〕を壊さないよう通常のディスパッチへ進める）
+4. `vector`／`plan` の有無（スキーマ非依存の JSON 上の存在確認）で
    `execute_bound_search_in_session`／`execute_bound_plan_search_in_session`
-   のどちらを呼ぶかを決める
-4. 選んだエントリが `table` のスキーマを取得（未知テーブルは `42P01`。
-   この判定は binder の排他判定〔`vector`／`plan` 同時指定・両方欠落〕より
-   **先に**確定する——テーブル解決が binder 呼び出しの前提条件のため）
+   のどちらを呼ぶかを決め、選んだエントリが `table` のスキーマを取得
+   （未知テーブルは `42P01`。この判定は binder の排他判定〔`vector`／
+   `plan` 両方欠落〕・`mode` リテラルの解析より**先に**確定する——
+   テーブル解決が binder 呼び出し・`mode` 解析の前提条件のため。手順 2 の
+   同時指定判定とは異なり、こちらはスキーマ依存の判定〔両方欠落・`mode`
+   値不正〕に対する優先順位）
 5. binder（`wire-server::http::query::search::bind_search`）が schema 依存の
-   束縛・排他判定を行う
+   束縛・`mode` リテラルの解析・（両方欠落の場合の）排他判定を行う
 
 ### 却下した設計案（追加分）
 
