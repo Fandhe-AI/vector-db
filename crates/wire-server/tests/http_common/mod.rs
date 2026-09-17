@@ -118,17 +118,24 @@ pub fn spawn_router_listener(
 
 /// [`spawn_router_listener`] と同一の production 入口
 /// （[`wire_server::http::router::Router`]）を、呼び出し元が用意した
-/// `core`（データを事前に seed 済みの `EngineCore` 等）付きで起動する。
+/// `engine`（データを事前に seed 済みの `EngineCore` 等）を接続した状態
+/// （`Router::with_engine` 経由。Issue #766・TASK-176・NOSQL-3・Issue #768・
+/// TASK-177・NOSQL-4）で起動する。`POST /v1/query`（`op: scan`／
+/// `op: aggregate`）が実行可能なリスナーを起動する。
 pub fn spawn_router_listener_with_engine(
     users_path: &std::path::Path,
     sessions: wire_server::http::session::store::SessionStore,
-    core: std::sync::Arc<EngineCore>,
+    engine: std::sync::Arc<EngineCore>,
 ) -> SocketAddr {
     let store = wire_server::auth::UserStore::load_from_file(users_path).expect("valid store");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let limiter = ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS);
-    let router = wire_server::http::router::Router::new(std::sync::Arc::new(store), sessions, core);
+    let router = wire_server::http::router::Router::with_engine(
+        std::sync::Arc::new(store),
+        sessions,
+        engine,
+    );
 
     std::thread::spawn(move || {
         wire_server::http::listener::accept_loop_with_router(

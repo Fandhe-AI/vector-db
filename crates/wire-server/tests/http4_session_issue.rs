@@ -16,9 +16,8 @@
 mod common;
 
 // engine 側のテスト専用一時 DB ヘルパー（`std` のみに依存し `crate::` を
-// 参照しないため取り込み可能。TASK-186・NOSQL-3〔Issue #766〕で
-// `Router::new` が `Arc<EngineCore>` を必須引数として要求するようになった
-// ため、本ファイル固有のスローアウェイ core 用に取り込む）。
+// 参照しないため取り込み可能。`Router::with_engine`〔Issue #766・#768〕へ
+// 渡すスローアウェイ core を本ファイル固有に用意するため取り込む）。
 #[path = "../../engine/src/test_util/temp_db.rs"]
 mod temp_db;
 
@@ -50,7 +49,7 @@ fn spawn_router_server(
     let limiter = ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS);
     let core_path = temp_db::unique_db_path("http4-session-issue-throwaway");
     let core = EngineCore::open(&core_path).expect("open throwaway engine core");
-    let router = Router::new(
+    let router = Router::with_engine(
         std::sync::Arc::new(store),
         sessions,
         std::sync::Arc::new(core),

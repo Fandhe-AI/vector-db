@@ -65,7 +65,41 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
 /// 1 文の集計項目リストが持てる要素数の上限（TASK-166・SQL-13）。無制限 `Vec` 確保を
 /// 避ける（`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」
 /// 対応）。
-const MAX_AGGREGATE_ITEMS: usize = 32;
+///
+/// `pub`（TASK-186・NOSQL-4）: `wire-server::http::query::aggregate` が
+/// `POST /v1/query`（`op: aggregate`）の `aggregates` 配列を写像する**前**
+/// （`Vec` 確保・`String` 複製より前）に、SQL 表層と同じ上限を検査するために
+/// 参照する（[`check_aggregate_item_count`] 経由。`declarative_filter::
+/// MAX_METADATA_FILTERS`／`check_filter_count` と同じ設計判断）。
+pub const MAX_AGGREGATE_ITEMS: usize = 32;
+
+/// `count` 件の集計項目が [`MAX_AGGREGATE_ITEMS`] を超えないことを検証する
+/// （`54000`）。`Vec` 確保・要素の複製より**前**に呼べる形にする
+/// （[`crate::declarative_filter::check_filter_count`] と同じ設計判断。
+/// TASK-186・NOSQL-4: `wire-server::http::query::aggregate::bind` が
+/// JSON 配列要素を写像する前に呼ぶ）。
+pub fn check_aggregate_item_count(count: usize) -> Result<(), SqlSurfaceError> {
+    if count > MAX_AGGREGATE_ITEMS {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "aggregate item count {count} exceeds limit {MAX_AGGREGATE_ITEMS}"
+        )));
+    }
+    Ok(())
+}
+
+/// `count` 件の `HAVING` 述語が [`MAX_AGGREGATE_ITEMS`] を超えないことを検証する
+/// （`54000`）。[`Parser::parse_having`] の構文層と同じ上限値を用いる
+/// （TASK-186・NOSQL-5: `wire-server::http::query::aggregate::bind` が `having`
+/// 配列要素を写像する**前**に呼ぶ。[`check_aggregate_item_count`] と同じ
+/// 設計判断）。
+pub fn check_having_predicate_count(count: usize) -> Result<(), SqlSurfaceError> {
+    if count > MAX_AGGREGATE_ITEMS {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "HAVING predicate count {count} exceeds limit {MAX_AGGREGATE_ITEMS}"
+        )));
+    }
+    Ok(())
+}
 
 /// `USING PLAN('<query>')`（TASK-77・SQL-5）に渡せる自然言語クエリ本文のバイト長
 /// 上限。アロケーション（字句解析・LLM プロンプトへの組み込み）に入る前に拒否する

@@ -515,11 +515,11 @@ fn valid_bearer_reaches_gate_for_every_op_schema_minimal_form() {
     let token = login(addr, "alice", "pw-alice");
     let auth = format!("Bearer {token}");
 
-    // `scan` は TASK-186・NOSQL-3（Issue #766）で実行結線済みのため、他 3 op
-    // （暫定 `0A000`／501）とは異なり `42P01`／404 が到達の証跡になる。
-    let placeholder_cases: [&[u8]; 3] = [
+    // `scan`（TASK-186・NOSQL-3・Issue #766）・`aggregate`（Issue #768）は
+    // 実行結線済みのため、他 2 op（暫定 `0A000`／501）とは異なり
+    // `42P01`／404 が到達の証跡になる。
+    let placeholder_cases: [&[u8]; 2] = [
         br#"{"op":"search","table":"docs","limit":1}"#,
-        br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"id"}]}"#,
         br#"{"op":"insert","table":"docs","rows":[]}"#,
     ];
     for body in placeholder_cases {
@@ -532,11 +532,17 @@ fn valid_bearer_reaches_gate_for_every_op_schema_minimal_form() {
         assert_eq!(wire_code_of_body(&resp_body), "0A000");
     }
 
-    let scan_response = send_request(addr, "/v1/query", Some(&auth), VALID_SCAN_BODY);
-    let (scan_status, scan_body) = split_response(&scan_response);
-    assert!(
-        scan_status.starts_with("HTTP/1.1 404 "),
-        "got {scan_status}"
-    );
-    assert_eq!(wire_code_of_body(&scan_body), "42P01");
+    let executed_cases: [&[u8]; 2] = [
+        VALID_SCAN_BODY,
+        br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"id"}]}"#,
+    ];
+    for body in executed_cases {
+        let response = send_request(addr, "/v1/query", Some(&auth), body);
+        let (status_line, resp_body) = split_response(&response);
+        assert!(
+            status_line.starts_with("HTTP/1.1 404 "),
+            "body {body:?}: got {status_line}"
+        );
+        assert_eq!(wire_code_of_body(&resp_body), "42P01");
+    }
 }

@@ -105,10 +105,17 @@ private メソッド）へ抽出した。SQL 経路は
 
 ## スコープ外
 
-- `BoundAggregate::new`（SQL テキスト非経由の直接構築 constructor）:
-  `AggregateInput`／`ExprProgram`／`ProjectionColumn`／`BoundGroupBy` の公開設計
-  が必要。TASK-177（aggregate 写像）へ申し送り。aggregate エントリが SQL
-  テキスト非経由で外部から使えるのは TASK-177 以降になる。
+- `BoundAggregate::new`（SQL テキスト非経由の直接構築 constructor）: Issue #768・
+  TASK-177（aggregate 写像・NOSQL-4）で実装済み（`BoundScan::new` と同じ作法。
+  `GROUP BY` を持たない単一行集計〔TASK-166・SQL-13〕限定。`AggregateInput` の
+  `ScalarExpr` variant（複合式）は対象外のまま SQL テキスト経由のみ）。
+  `GROUP BY`／`HAVING` を伴う計画〔TASK-167・SQL-14〕の直接構築は
+  `BoundAggregate::new_grouped` として Issue #769・TASK-186・NOSQL-5 で実装
+  済み（列名解決〔`resolve_group_by_column`〕・HAVING 対象の型検査
+  〔`check_having_target_is_numeric`〕を SQL テキスト経由の
+  `bind_group_by_clause` と共有。`ORDER BY`／`LIMIT` 相当は対象外のまま
+  ——本エントリ・NoSQL 表層のスキーマにこれらに相当するキーが存在しない
+  ため。上記の TASK-186 申し送りは解消済み）。
 - search（`BoundStatement`）向けの同型エントリ: 同じ `read_txn` の壁に当たるが
   TASK-186 の対象外。TASK-175 へ申し送り。
 - `execute_insert`／`build_explain_result` の公開: Issue #730。

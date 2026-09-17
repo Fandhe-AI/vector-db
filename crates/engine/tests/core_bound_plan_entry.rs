@@ -17,7 +17,9 @@ use engine::row_codec::Value;
 use engine::sql::allowlist::{validate_sql, SqlSurfaceError, Statement, TableLookup};
 use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
-use engine::sql::parser::{bind_aggregate, bind_scan, BoundScan};
+use engine::sql::parser::{
+    bind_aggregate, bind_scan, AggregateTarget, BoundAggregate, BoundAggregateItem, BoundScan,
+};
 use engine::sql::udf_call::{define_function, Expr};
 use engine::storage::{Storage, Visibility};
 
@@ -385,4 +387,57 @@ fn binder_receives_session_udf_registry() {
         *observed.lock().expect("lock"),
         "binder should observe the session's registered UDF"
     );
+}
+
+/// TASK-186・NOSQL-4（Issue #768）: `execute_bound_aggregate_in_session` の
+/// binder closure が `BoundAggregate::new`（SQL テキスト非経由の直接構築）を
+/// 返す形で、SQL テキスト経由（`bind_aggregate`）と `Cell` レベルで完全一致し
+/// RLS（`ctx`）を暗黙適用することを固定する。`bound-plan-session-entry.md` が
+/// 「TASK-177 へ申し送り」としていた `BoundAggregate::new` の到達性が、本 Issue
+/// で初めて成立することの非 vacuous 証跡（`wire-server::http::query::aggregate`
+/// が呼ぶ経路そのものを in-process で再現する）。
+#[test]
+fn aggregate_entry_accepts_binder_built_without_sql_text() {
+    let path = unique_db_path("bound-plan-aggregate-no-sql-text");
+    let _guard = CleanupGuard(path.clone());
+    let core = open_engine_core(&path);
+    let ctx_a = ctx_for("tenant-a");
+    let session = SessionState::default();
+
+    let bound_result = core
+        .execute_bound_aggregate_in_session(&ctx_a, &session, TABLE, |schema, _udfs| {
+            let items = vec![
+                BoundAggregateItem::bind(
+                    engine::sql::allowlist::AggregateFunc::Count,
+                    AggregateTarget::Star,
+                    schema,
+                )?,
+                BoundAggregateItem::bind(
+                    engine::sql::allowlist::AggregateFunc::Min,
+                    AggregateTarget::Column("lang".to_string()),
+                    schema,
+                )?,
+            ];
+            BoundAggregate::new(TABLE.to_string(), items, Vec::new(), Vec::new())
+        })
+        .expect("execute_bound_aggregate_in_session should succeed without SQL text");
+
+    let mut sql_session = SessionState::default();
+    let sql_outcome = core
+        .execute_sql_in_session(
+            &ctx_a,
+            &mut sql_session,
+            "SELECT COUNT(*), MIN(lang) FROM docs",
+        )
+        .expect("execute_sql_in_session should succeed");
+    let engine::sql::SqlOutcome::Query(sql_result) = sql_outcome else {
+        panic!("expected SqlOutcome::Query");
+    };
+
+    // tenant-a の可視行は 5 件（`lang` = "ja" 3 件・"en" 2 件）。tenant-b の
+    // Private 行（`lang = "xx"`）が RLS 越しに混入していれば `MIN(lang)` は
+    // 辞書順最小の `"en"` ではなく別値になる（RLS-7・RLS-8 相当の非漏えい確認）。
+    assert_eq!(bound_result.rows, sql_result.rows);
+    assert_eq!(bound_result.rows[0].cells[0], Cell::Integer(5));
+    assert_eq!(bound_result.rows[0].cells[1], Cell::Text("en".to_string()));
 }

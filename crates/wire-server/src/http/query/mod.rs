@@ -5,11 +5,16 @@
 //! （必須キー欠落・未知キー・型不一致 → `42601`）の橋渡しを担う。[`filter`]
 //! は `filter` 配列の `op` 語彙（`eq`／`prefix`）を
 //! `engine::declarative_filter::DeclarativeFilter` へ写像し、`bind_all` で
-//! `TableSchema` へ束縛する（Issue #761・TASK-175・NOSQL-7）。[`op`] は
-//! `op` 名を閉じた語彙 4 値（`search`／`scan`／`aggregate`／`insert`）へ
-//! 分類する許可リストで、語彙外は `0A000` へ写像する（Issue #759・
-//! TASK-179・NOSQL-1・NOSQL-9）。各 op の実行計画への写像は後続 Issue
-//! （#763・#766・#768 以降）がここへ追加する。[`response`] は
+//! `TableSchema` へ束縛する（Issue #761・TASK-175・NOSQL-7）。[`ident`] は
+//! `table`／列名等の識別子形状（SQL 表層の字句解析と同じ文字集合）を検査する
+//! 共有ヘルパー（Issue #768。`search`／`scan`〔#763・#766〕からも再利用する
+//! 想定）。[`op`] は `op` 名を閉じた語彙 4 値（`search`／`scan`／
+//! `aggregate`／`insert`）へ分類する許可リストで、語彙外は `0A000` へ写像
+//! する（Issue #759・TASK-179・NOSQL-1・NOSQL-9）。[`aggregate`] は
+//! `op: aggregate`（`group_by`／`having`／`explain: true` を除く）を
+//! SQL テキストを経由せずに `engine::sql::parser::BoundAggregate` へ束縛・
+//! 実行する（Issue #768・TASK-177・NOSQL-4）。他 op の実行計画への写像は
+//! 後続 Issue（#763・#771）がここへ追加する。[`response`] は
 //! `search`／`scan`／`aggregate` 成功時の `engine::sql::exec::QueryResult`
 //! → JSON 応答本文（`columns`／`rows`／`row_count`）への写像を担う
 //! （Issue #762・NOSQL-11）。[`scan`] は `op: "scan"` を
@@ -17,12 +22,16 @@
 //! #766・TASK-176・NOSQL-3。結線済み）。[`gate`] は認証済み要求
 //! （`crate::http::session::middleware::SessionPrincipal`）に対する
 //! `POST /v1/query` の入口本体で、`tenant_id` 相当ヘッダの拒否・op 許可
-//! リスト判定・本文のスキーマ検証を行ったうえで [`scan`] へディスパッチする
-//! （`search`／`aggregate`／`insert` は引き続き暫定の `0A000`／501 応答。
-//! Issue #754・#759。束縛・実行は #763・#768・#771 が本 seam を置き換える）。
+//! リスト判定・本文のスキーマ検証を行い、`engine` 接続済みの場合に限り
+//! `op: scan` を [`scan::handle`] へ、`op: aggregate` を
+//! [`aggregate::handle`]（Issue #768）へそれぞれディスパッチする
+//! （`search`／`insert` は引き続き暫定の `0A000`／501 応答。
+//! Issue #754・#759。束縛・実行は #763・#771 が本 seam を置き換える）。
 
+pub mod aggregate;
 pub mod filter;
 pub mod gate;
+pub mod ident;
 pub mod op;
 pub mod response;
 pub mod scan;
