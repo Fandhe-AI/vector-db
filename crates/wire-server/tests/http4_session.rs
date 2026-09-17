@@ -148,6 +148,23 @@ const SHORT_TTL: Duration = Duration::from_millis(1_500);
 /// [`SHORT_TTL`] の 2 倍以上の余裕を持つ待機時間（期限切れを確実に観測する）。
 const EXPIRY_WAIT: Duration = Duration::from_millis(3_000);
 
+/// `expired_sessions_are_swept_on_issue_without_lookup` 専用の TTL。
+/// 同テストは alice のログイン直後（sleep を挟まず）に carol のログイン
+/// （枠不足・`53300` 期待）を行うため、両ログインの Argon2id 照合が完了
+/// するまでの実時間が TTL に対して十分な余裕を持つ必要がある。`verify`
+/// は本番同様の Argon2id とプロセス全体の KDF セマフォ
+/// （`argon2id::MAX_CONCURRENT_ARGON2_KDF`）を使うため、同一バイナリ内で
+/// 並行実行される他テストのログインとキューイングを共有しうる。
+/// [`SHORT_TTL`]（1.5 秒）のままだとこのキューイング遅延次第で alice の
+/// セッションが carol の 2 回目のログイン要求より先に TTL 失効し、期待
+/// する `53300` が `200` に化ける flaky window があった
+/// （PR #817 Bugbot 指摘）。KDF セマフォの競合下でも 2 回の逐次ログインが
+/// 確実に収まる余裕を持たせるため、他の TTL テストより大幅に長い専用値を
+/// 使う。
+const SWEEP_WITHOUT_LOOKUP_TTL: Duration = Duration::from_secs(6);
+/// [`SWEEP_WITHOUT_LOOKUP_TTL`] の 1.5 倍以上の余裕を持つ待機時間。
+const SWEEP_WITHOUT_LOOKUP_WAIT: Duration = Duration::from_secs(9);
+
 // === (A) トークン形式（HTTP-4） =============================================
 
 #[test]
@@ -265,18 +282,28 @@ fn expired_token_is_rejected_on_query_and_close_with_28000_identically_to_unknow
         &users_path,
         SessionStore::with_limits(MAX_SESSIONS, SHORT_TTL),
     );
-    let token = login(addr, "alice", "pw-alice");
+    // query 用・close 用に別トークンを発行する。同一トークンで query →
+    // close の順に呼ぶと、query が `lookup` で期限切れエントリを既に
+    // 削除してしまい、後続の close 呼び出しは実質「未知トークンの拒否」
+    // しか検証できず close 経路自身の TTL 失効判定を確認できない
+    // （PR #817 codex-review 指摘）。
+    let token_for_query = login(addr, "alice", "pw-alice");
+    let token_for_close = login(addr, "alice", "pw-alice");
 
-    // 発行直後は有効（TTL 1.5 秒に対し十分な余裕がある 1 回だけのプローブ）。
-    assert_query_accepted(&query_with_bearer(addr, &token));
+    // 発行直後は両方とも有効（TTL 1.5 秒に対し十分な余裕がある 1 回だけの
+    // プローブ）。query によるプローブは `lookup` を経由するが有効な間は
+    // エントリを消費しないため、token_for_close の期限切れ判定は後段の
+    // close 呼び出しが初めて行う。
+    assert_query_accepted(&query_with_bearer(addr, &token_for_query));
+    assert_query_accepted(&query_with_bearer(addr, &token_for_close));
 
     std::thread::sleep(EXPIRY_WAIT);
 
-    let expired_query = query_with_bearer(addr, &token);
+    let expired_query = query_with_bearer(addr, &token_for_query);
     assert_eq!(expired_query.status, 401);
     assert_eq!(http_common::wire_code_of(&expired_query), "28000");
 
-    let expired_close = close_with_bearer(addr, &token);
+    let expired_close = close_with_bearer(addr, &token_for_close);
     assert_eq!(expired_close.status, 401);
     assert_eq!(http_common::wire_code_of(&expired_close), "28000");
 
@@ -296,7 +323,7 @@ fn expired_sessions_are_swept_on_issue_without_lookup() {
         ("alice", "tenant-a", "pw-alice"),
         ("carol", "tenant-c", "pw-carol"),
     ]);
-    let sessions = SessionStore::with_limits(1, SHORT_TTL);
+    let sessions = SessionStore::with_limits(1, SWEEP_WITHOUT_LOOKUP_TTL);
     // production 経路（wire 越し）と並行して手元のハンドルで `active_sessions`
     // を観測する（`SessionStore::clone` は内部状態を共有するハンドル複製）。
     let sessions_handle = sessions.clone();
@@ -305,14 +332,16 @@ fn expired_sessions_are_swept_on_issue_without_lookup() {
     let token_a = login(addr, "alice", "pw-alice");
     assert_eq!(sessions_handle.active_sessions(), 1);
 
-    // 上限 1 のため、2 人目のログインは枠不足で拒否される。
+    // 上限 1 のため、2 人目のログインは枠不足で拒否される
+    // （[`SWEEP_WITHOUT_LOOKUP_TTL`] により、この時点で alice のセッションは
+    // KDF セマフォの競合下でも確実にまだ有効）。
     let second = login_raw(addr, "carol", "pw-carol");
     assert_eq!(second.status, 503);
     assert_eq!(http_common::wire_code_of(&second), "53300");
     assert_eq!(sessions_handle.active_sessions(), 1);
 
     // A のトークンには一切触れず（`lookup`／`close` を呼ばず）待機する。
-    std::thread::sleep(EXPIRY_WAIT);
+    std::thread::sleep(SWEEP_WITHOUT_LOOKUP_WAIT);
 
     // `issue` 時の枠不足回収により、A の期限切れエントリが回収されて
     // C の発行が成功する（`lookup` を経由しない一括回収の非 vacuous 証跡）。
