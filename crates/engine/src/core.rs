@@ -2319,10 +2319,11 @@ impl EngineCore {
             }
             // TASK-78（SQL-6）: `EXPLAIN SELECT ... USING PLAN(...)` は検索本体
             // （ハイブリッド実行）を実行しない。行うのは LIMIT 範囲検証 →
-            // 辞書必須列（`path`/`body`）の事前スキーマ検証 → `USING MODE`
-            // リテラル・`VECTOR` 列・投影列／`WHERE` 述語の事前束縛検証
-            // （[`crate::sql::using_plan::pre_check_bindable`]。PR #267 の是正
-            // 対応）→ LLM クエリ展開・モード解決（`Self::plan_query_with_mode`）
+            // `USING MODE` リテラル・`VECTOR` 列・投影列／`WHERE` 述語の事前
+            // 束縛検証（[`crate::sql::using_plan::pre_check_bindable`]。
+            // PR #267 の是正対応）→ 辞書必須列（`path`/`body`）の事前スキーマ
+            // 検証（束縛検証より後。codex-review P1 指摘対応・PR #828）→
+            // LLM クエリ展開・モード解決（`Self::plan_query_with_mode`）
             // までで、すべての拒否を LLM I/O 開始前に完結させる（`Statement::Select`
             // アームの `USING PLAN` 経路〔PR #266・#267 の是正方針〕を踏襲。
             // security.md「不安全な設計」対応）。再埋め込み（`Embedder`）は
@@ -2356,10 +2357,10 @@ impl EngineCore {
                 // I/O（LLM 展開・再埋め込み）→ 世代照合 → 再検証 → 束縛〕を
                 // 保つ。詳細は [`Self::run_explain_plan`] のドキュメント参照）。
                 //
-                // 手順本体（テーブル世代の事前記録 → 辞書必須列検証 → mode
-                // リテラル解析 → 束縛検証 → LLM クエリ展開・モード解決 →
-                // 世代の事後照合 → 辞書必須列の再検証 → 使用エンジン・
-                // ANN／SCALAR 静的判定 → `QUERY PLAN` 整形）は
+                // 手順本体（テーブル世代の事前記録 → 束縛検証（`plan`
+                // 欠落判定を含む） → 辞書必須列検証 → LLM クエリ展開・
+                // モード解決 → 世代の事後照合 → 辞書必須列の再検証 →
+                // 使用エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN` 整形）は
                 // [`Self::run_explain_plan`] が [`Self::
                 // explain_bound_plan_in_session`]（TASK-186・NOSQL-10・
                 // Issue #765）と共有する（第 2 の実装を持たない）。
