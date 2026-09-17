@@ -103,10 +103,15 @@ pub enum JsonNumber {
 
 impl JsonNumber {
     /// 全 variant を `f64` へ変換する（丸めを伴いうる。表示・比較等、精度が
-    /// 問題にならない用途向け）。
+    /// 問題にならない用途向け）。`NegInt(0)`（JSON の `-0`）は負のゼロへ
+    /// 復元する: SQL 表層の `parse_vector_literal` は `-0` を `-0.0` として保持し
+    /// `content_hash::push_vector` は符号ビットを含めてハッシュするため、
+    /// 正のゼロへ潰すと表層横断の `operation_id` 再送判定（同一内容 `23505`／
+    /// 内容不一致 `22023`）が食い違う（PR #823 codex-review 指摘）。
     pub fn as_f64(self) -> f64 {
         match self {
             JsonNumber::PosInt(n) => n as f64,
+            JsonNumber::NegInt(0) => -0.0,
             JsonNumber::NegInt(n) => n as f64,
             JsonNumber::Float(f) => f,
         }
@@ -653,5 +658,15 @@ mod tests {
     fn parse_json_number_rejection_reports_unsupported_sql_syntax_wire_code() {
         let err = parse_json("01").unwrap_err();
         assert_eq!(err.wire_code(), "42601");
+    }
+    #[test]
+    fn neg_int_zero_converts_to_negative_zero_f64() {
+        // JSON の `-0` は `NegInt(0)` として分類されるが、`f64` 化では SQL 表層の
+        // `-0.0` と同じ符号ビットを保つ（content_hash の表層横断一致のため）。
+        let v = JsonNumber::NegInt(0).as_f64();
+        assert_eq!(v, 0.0);
+        assert!(v.is_sign_negative(), "-0 must map to -0.0, got {v:?}");
+        assert!(JsonNumber::PosInt(0).as_f64().is_sign_positive());
+        assert_eq!(JsonNumber::NegInt(-5).as_f64(), -5.0);
     }
 }
