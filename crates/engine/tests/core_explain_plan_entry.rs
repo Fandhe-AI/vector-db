@@ -557,6 +557,88 @@ fn explain_entry_prioritizes_binder_plan_missing_error_over_dictionary_columns()
     assert_eq!(err.wire_code(), "42601");
 }
 
+/// `explain_bound_plan_in_session` を NoSQL 表層の事前検証
+/// （`http/query/explain.rs::execute` の `validate_using_plan_question`
+/// 呼び出し）を経由せず直接呼ぶ経路（多層防御の対象）で、`bind`（`plan`
+/// 欠落判定を含む）が成功したにもかかわらず `question` が空文字列の場合、
+/// LLM 呼び出しより前に `22000` で拒否されることを固定する（codex-review
+/// P1 指摘対応・PR #828 追加分）。
+#[test]
+fn explain_entry_rejects_empty_question_after_successful_bind_before_llm_call() {
+    let path = unique_db_path("core-explain-plan-entry-empty-question");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    drop(storage);
+
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    struct ArcLlmClient(std::sync::Arc<CountingLlmClient>);
+    impl LlmClient for ArcLlmClient {
+        fn complete(&self, prompt: &str) -> Result<String, PlanError> {
+            self.0.complete(prompt)
+        }
+    }
+    let core = EngineCore::open(&path)
+        .expect("open engine core")
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    // `bind` は `plan` 欠落時とは異なり成功する（`no_filter_bind` は
+    // `question` の中身を一切見ない）——NoSQL 表層のプレースホルダ空文字列
+    // 規約に頼らず、engine 単独で空文字列を拒否できることを確認する。
+    let result = core.explain_bound_plan_in_session(
+        &ctx("tenant-a"),
+        &SessionState::default(),
+        TABLE,
+        "",
+        None,
+        no_filter_bind,
+    );
+    let err = result.expect_err("empty question must be rejected even when bind succeeds");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "empty question must be rejected before invoking the LLM (I/O amplification防止)"
+    );
+}
+
+/// [`MAX_USING_PLAN_LEN`]（`sql::allowlist`）を超える `question` も、`bind`
+/// 成功後・LLM 呼び出し前に `54000` で拒否されることを固定する（同上）。
+#[test]
+fn explain_entry_rejects_oversized_question_before_llm_call() {
+    let path = unique_db_path("core-explain-plan-entry-oversized-question");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    drop(storage);
+
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    struct ArcLlmClient(std::sync::Arc<CountingLlmClient>);
+    impl LlmClient for ArcLlmClient {
+        fn complete(&self, prompt: &str) -> Result<String, PlanError> {
+            self.0.complete(prompt)
+        }
+    }
+    let core = EngineCore::open(&path)
+        .expect("open engine core")
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let oversized_question = "a".repeat(64 * 1024 + 1);
+    let result = core.explain_bound_plan_in_session(
+        &ctx("tenant-a"),
+        &SessionState::default(),
+        TABLE,
+        &oversized_question,
+        None,
+        no_filter_bind,
+    );
+    let err = result.expect_err("oversized question must be rejected even when bind succeeds");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "oversized question must be rejected before invoking the LLM (I/O amplification防止)"
+    );
+}
+
 #[test]
 fn explain_entry_does_not_leak_other_tenant_row_content() {
     let path = unique_db_path("core-explain-plan-entry-rls");

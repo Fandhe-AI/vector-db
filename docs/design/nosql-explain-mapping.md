@@ -26,12 +26,15 @@
   固定。`USING PLAN` は `HINT ORDER` を受理しないため SCALAR 段は常に
   DISTANCE 段より先に評価される契約に基づく）。
 - `core.rs::EngineCore::run_explain_plan`（private）: 既存 `Statement::
-  Explain` アームの本体（テーブル世代の事前記録 → 辞書必須列検証 →
-  束縛検証（`bind`。LLM I/O より前）→ `mode_literal` 解析（`bind` より後）→
-  LLM クエリ展開・モード解決 → 世代の事後照合 → 辞書必須列の再検証 → 使用
-  エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN` 整形）を抽出した私的
-  ヘルパー。binder closure は `&TableSchema`／`&UdfRegistry` を受け取り
-  `Result<ExplainShape, E>`（`E: From<SqlSurfaceError>`）を返す。
+  Explain` アームの本体（テーブル世代の事前記録 → 束縛検証（`bind`。`plan`
+  欠落判定を含む。LLM I/O より前）→ `question`（`USING PLAN` 本文）の
+  空文字・長さ上限検証（`bind` より後。codex-review P1 指摘対応・PR #828）→
+  辞書必須列検証（`question` 検証より後。同 PR）→ `mode_literal` 解析
+  （辞書必須列検証より後）→ LLM クエリ展開・モード解決 → 世代の事後照合 →
+  辞書必須列の再検証 → 使用エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN`
+  整形）を抽出した私的ヘルパー。binder closure は `&TableSchema`／
+  `&UdfRegistry` を受け取り `Result<ExplainShape, E>`
+  （`E: From<SqlSurfaceError>`）を返す。
   `Statement::Explain` アームはこのヘルパーを呼ぶだけの薄いラッパーへ縮約
   した（挙動不変。手順順序・エラー分類はビット同一）。`mode_literal`
   （`Option<&str>`。`USING MODE` 相当の生リテラル）はテーブル解決（最初の
@@ -49,7 +52,19 @@
   `plan` 欠落＋ `mode` 値不正が同時に揃う要求で `22000` が `42601` より
   先に確定する回帰が残っていた（Cursor Bugbot 指摘・Issue #765 継続対応。
   `bind` を `mode_literal` 解析より先に呼ぶ現在の順序で解消し、
-  `run_using_plan_select` と整合させた）。
+  `run_using_plan_select` と整合させた）。`question` の空文字・長さ上限
+  検証（`sql::allowlist::validate_using_plan_question`）は NoSQL 表層側
+  （`http/query/explain.rs::execute`）で既に行っているが、engine 公開 API
+  （`explain_bound_plan_in_session`）を NoSQL 表層の事前検証を経由せず直接
+  呼ぶ経路の多層防御として `run_explain_plan` 内でも独立に検証する
+  （codex-review P1 指摘対応・PR #828 追加分。`execute_bound_plan_search_
+  in_session`〔通常の `plan` 検索〕が engine 側で無条件に同じ検証を行うのと
+  エラー契約を揃える）。`bind`（`plan` 欠落判定）成功後にのみ検証すること
+  で、NoSQL 表層が `plan` 未指定時に渡すプレースホルダの空文字列
+  （`question.unwrap_or("")`）を実在する `plan` と誤認せず、既存の
+  「`plan` 欠落（`42601`）が優先される」順序を壊さない。SQL `EXPLAIN`
+  経路は字句解析時点（`Parser::parse_using_plan_clause`）で既に同じ検証を
+  通過済みの `question` を渡すため、この呼び出しは常に成功し挙動を変えない。
 - `core.rs::EngineCore::explain_bound_plan_in_session`（`pub`）:
   `run_explain_plan` をそのまま公開する薄いラッパー。`execute_bound_scan_
   in_session`・`execute_bound_aggregate_in_session`（Issue #728）と同型の
@@ -126,8 +141,11 @@
   非タッチ（`lookup`／`prepare_*` 不呼び出しの非 vacuous 証跡）・未定義
   テーブルの binder 呼び出し前拒否・未定義テーブル＋ `mode_literal` 値不正
   で `42P01` が `22000` より優先されること（PR #828 レビュー対応）・binder
-  エラーの伝播と LLM 呼び出しスキップ・プランナー未注入時の `XX000`・
-  辞書必須列欠如の `22000`・他テナント行内容の非漏えいを固定。
+  エラーの伝播と LLM 呼び出しスキップ・`bind` 成功後の空文字列・64 KiB 超
+  `question` がそれぞれ `22000`／`54000` で LLM 呼び出し前に拒否されること
+  （engine 公開 API 単独での多層防御。codex-review P1 指摘対応・PR #828
+  追加分）・プランナー未注入時の `XX000`・辞書必須列欠如の `22000`・他
+  テナント行内容の非漏えいを固定。
 - `crates/wire-server/tests/nosql10_explain.rs`（新設。production ルータ
   経由の層 A）: SQL `EXPLAIN` との行単位一致（フィルタなし・フィルタ
   あり・`mode` あり）・HNSW opt-in 時の `hnsw_params:` 行・`vector` 指定

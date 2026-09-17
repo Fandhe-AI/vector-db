@@ -2321,14 +2321,18 @@ impl EngineCore {
             }
             // TASK-78（SQL-6）: `EXPLAIN SELECT ... USING PLAN(...)` は検索本体
             // （ハイブリッド実行）を実行しない。行うのは LIMIT 範囲検証 →
-            // `USING MODE` リテラル・`VECTOR` 列・投影列／`WHERE` 述語の事前
-            // 束縛検証（[`crate::sql::using_plan::pre_check_bindable`]。
-            // PR #267 の是正対応）→ 辞書必須列（`path`/`body`）の事前スキーマ
+            // テーブル解決 → `VECTOR` 列・投影列／`WHERE` 述語の事前束縛検証
+            // （[`crate::sql::using_plan::pre_check_bindable`]。PR #267 の
+            // 是正対応）→ `question`（`USING PLAN` 本文）の空文字・長さ上限
             // 検証（束縛検証より後。codex-review P1 指摘対応・PR #828）→
-            // LLM クエリ展開・モード解決（`Self::plan_query_with_mode`）
-            // までで、すべての拒否を LLM I/O 開始前に完結させる（`Statement::Select`
-            // アームの `USING PLAN` 経路〔PR #266・#267 の是正方針〕を踏襲。
-            // security.md「不安全な設計」対応）。再埋め込み（`Embedder`）は
+            // 辞書必須列（`path`/`body`）の事前スキーマ検証（`question` 検証
+            // より後。同 PR）→ `USING MODE` リテラルの解析（辞書必須列検証
+            // より後）→ LLM クエリ展開・モード解決（`Self::
+            // plan_query_with_mode`）までで、すべての拒否を LLM I/O 開始前に
+            // 完結させる（`Statement::Select` アームの `USING PLAN` 経路
+            // 〔PR #266・#267 の是正方針〕を踏襲。security.md「不安全な設計」
+            // 対応。正確な手順は [`Self::run_explain_plan`] のドキュメント
+            // 参照）。再埋め込み（`Embedder`）は
             // 応答に不要なため呼ばない（`embedder` 未注入でも `EXPLAIN` 可能）。
             crate::sql::allowlist::Statement::Explain(validated) => {
                 // `allowlist::validate_sql` は `using_plan` が `Some` の場合のみ
@@ -2355,17 +2359,19 @@ impl EngineCore {
                 // を終えた後で初めて mode リテラルを解析するため、生
                 // リテラルをそのまま渡すことで両表層（SQL テキスト経由・
                 // 束縛済み計画経由）が共有する fail-closed 順序〔LIMIT →
-                // 辞書列 → テーブル解決 → mode 解析 → 事前束縛検証 →
-                // I/O（LLM 展開・再埋め込み）→ 世代照合 → 再検証 → 束縛〕を
-                // 保つ。詳細は [`Self::run_explain_plan`] のドキュメント参照）。
+                // テーブル解決 → 束縛検証（`plan` 欠落判定を含む） →
+                // `question` 検証 → 辞書必須列検証 → mode 解析 →
+                // I/O（LLM 展開・再埋め込み）→ 世代照合 → 辞書必須列の
+                // 再検証〕を保つ。詳細は [`Self::run_explain_plan`] の
+                // ドキュメント参照）。
                 //
                 // 手順本体（テーブル世代の事前記録 → 束縛検証（`plan`
-                // 欠落判定を含む） → 辞書必須列検証 → LLM クエリ展開・
-                // モード解決 → 世代の事後照合 → 辞書必須列の再検証 →
-                // 使用エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN` 整形）は
-                // [`Self::run_explain_plan`] が [`Self::
-                // explain_bound_plan_in_session`]（TASK-186・NOSQL-10・
-                // Issue #765）と共有する（第 2 の実装を持たない）。
+                // 欠落判定を含む） → `question` 検証 → 辞書必須列検証 →
+                // mode 解析 → LLM クエリ展開・モード解決 → 世代の事後照合 →
+                // 辞書必須列の再検証 → 使用エンジン・ANN／SCALAR 静的判定 →
+                // `QUERY PLAN` 整形）は [`Self::run_explain_plan`] が
+                // [`Self::explain_bound_plan_in_session`]（TASK-186・
+                // NOSQL-10・Issue #765）と共有する（第 2 の実装を持たない）。
                 let result = self.run_explain_plan(
                     ctx,
                     session,
@@ -2776,10 +2782,12 @@ impl EngineCore {
     /// [`Self::explain_bound_plan_in_session`]（TASK-186・NOSQL-10・
     /// Issue #765）が共有する実行本体。fail-closed の手順順序（テーブル
     /// 世代の事前記録 → 束縛検証（`plan` 欠落判定を含む。LLM I/O より前）→
-    /// 辞書必須列検証 → LLM クエリ展開・モード解決 → 世代の事後照合 →
-    /// 辞書必須列の再検証 → 使用エンジン・ANN／SCALAR 静的判定 →
-    /// `QUERY PLAN` 整形。束縛検証を辞書必須列検証より先に行う順序は
-    /// codex-review P1 指摘対応・PR #828）はどちらの呼び出し元でも
+    /// `question`（`USING PLAN` 本文）の空文字・長さ上限検証 → 辞書必須列
+    /// 検証 → LLM クエリ展開・モード解決 → 世代の事後照合 → 辞書必須列の
+    /// 再検証 → 使用エンジン・ANN／SCALAR 静的判定 → `QUERY PLAN` 整形。
+    /// 束縛検証を辞書必須列検証より先に行う順序は codex-review P1 指摘対応・
+    /// PR #828、`question` 検証を束縛検証の直後・辞書必須列検証より前に置く
+    /// 順序は同 PR の追加 P1 指摘対応）はどちらの呼び出し元でも
     /// ビット同一に保たれる（第 2 の実装を持たない）。
     /// 検索本体（`hnsw_state` の `lookup`／`prepare_*`・
     /// `SearchProvider::search`）はいずれの経路でも呼ばれない（`EXPLAIN`
@@ -2856,6 +2864,30 @@ impl EngineCore {
         // 行う `search::bind_search`（`vector` 指定検索）と同一の優先順位
         // ——を保つ）。
         let explain_shape = bind(&pre_check_schema, session.udfs())?;
+
+        // `question`（`USING PLAN` 相当の自然言語クエリ本文）の空文字・
+        // 長さ上限検証は `bind`（`plan` 欠落判定を含む）より後、辞書必須列
+        // 検証・LLM I/O（`plan_query_with_mode`）より前に行う（codex-review
+        // P1 指摘対応・PR #828 継続。[`Self::execute_bound_plan_search_in_
+        // session`] は呼び出し元（NoSQL 表層の `search.rs::execute`）が
+        // 常に `plan` 実在確認後にのみ呼ぶため engine 側で無条件に検証できる
+        // のに対し、[`Self::explain_bound_plan_in_session`] は `plan` 欠落時
+        // にも呼び出し元（`http/query/explain.rs::execute`）がプレースホルダ
+        // の空文字列を渡す設計（`bind` closure がテーブル解決後に初めて
+        // `plan` 欠落を判定する）ため、`bind` を先に呼ぶことで両者を区別
+        // する: `bind` が失敗する場合（`plan` 欠落＝プレースホルダ）は
+        // ここへ到達せず既存の `42601` 優先順位を保ったまま、`bind` が成功
+        // する場合（`plan` が実在——SQL `EXPLAIN` 経路は構文上常にこちら）
+        // に限り、その実在する `question` を検証する。これにより
+        // `explain_bound_plan_in_session` を NoSQL 表層の事前検証
+        // （`http/query/explain.rs::execute` の `validate_using_plan_question`
+        // 呼び出し）を経由せず直接呼ぶ経路でも、空文字列・64 KiB 超の
+        // `question` で LLM 呼び出しまで進んでしまうことを防ぐ（engine 公開
+        // API 単独でのエラー契約を通常検索〔`execute_bound_plan_search_in_
+        // session`〕と揃える）。SQL `EXPLAIN` 経路は字句解析時点
+        // （`Parser::parse_using_plan_clause`）で既に同じ検証を通過済みの
+        // `question` を渡すため、本呼び出しは常に成功し挙動を変えない。
+        crate::sql::allowlist::validate_using_plan_question(question)?;
 
         // 辞書必須列（`path`/`body`）の検証は `bind`（`plan` 欠落判定を含む）
         // より後に行う（codex-review P1 指摘対応・PR #828。SQL `EXPLAIN`
