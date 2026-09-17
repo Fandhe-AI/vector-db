@@ -31,13 +31,16 @@
 //! `POST /v1/query` の入口本体で、`tenant_id` 相当ヘッダの拒否・op 許可
 //! リスト判定・本文のスキーマ検証を行い、`engine` 接続済みの場合に限り
 //! `op: scan` を [`scan::handle`] へ、`op: aggregate` を
-//! [`aggregate::handle`]（Issue #768）へそれぞれディスパッチする
-//! （`search`／`insert` は引き続き暫定の `0A000`／501 応答。
-//! Issue #754・#759。束縛・実行は #763・#771 が本 seam を置き換える）。
+//! [`aggregate::handle`]（Issue #768）へ、`op: insert` を
+//! [`insert::handle`]（Issue #772）へそれぞれディスパッチする
+//! （`search` は引き続き暫定の `0A000`／501 応答。Issue #754・#759。
+//! 束縛・実行は #764 が本 seam を置き換える）。
 //! [`insert`] は `insert` op を
 //! `engine::sql::exec::execute_insert_batch`／
-//! `EngineCore::execute_bound_insert_in_session` へ写像する
-//! （Issue #771・TASK-178・NOSQL-6。`gate.rs` への結線は対象外・別 Issue の担当）。
+//! `EngineCore::execute_bound_insert_in_session` へ写像し、成功応答
+//! `{"inserted","operation_id"}`（[`insert::encode_success_body`]）を
+//! `gate.rs` の `Op::Insert` アームへ結線する
+//! （Issue #771・#772・TASK-178・NOSQL-6・TABLE-12・RLS-9）。
 
 pub mod aggregate;
 pub mod filter;

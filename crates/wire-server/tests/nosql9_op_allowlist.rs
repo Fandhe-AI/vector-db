@@ -89,30 +89,28 @@ fn spawn() -> SocketAddr {
     http_common::spawn_router_listener(&users_path, SessionStore::new())
 }
 
-// --- 受理 4 op: `scan`／`aggregate` は実行結線済み（42P01・非 501）・他 2 op
-// は 501・0A000・PLACEHOLDER_MESSAGE ----------------------------------------
+// --- 受理 4 op: `scan`／`aggregate`／`insert` は実行結線済み（42P01・非
+// 501）・残る 1 op（`search`）は 501・0A000・PLACEHOLDER_MESSAGE ----------
 
 #[test]
 fn four_allowlisted_ops_reach_placeholder_response() {
     let addr = spawn();
 
-    // `scan`（TASK-186・NOSQL-3・Issue #766）・`aggregate`（Issue #768）は
-    // 実行結線済みのため、スローアウェイ `EngineCore`（テーブル未作成）上
-    // では `42P01`／404 が到達の証跡になる（他 2 op と異なり暫定
-    // `0A000`／501 はもう返らない）。
-    let executed_bodies: [&[u8]; 2] = [
+    // `scan`（TASK-186・NOSQL-3・Issue #766）・`aggregate`（Issue #768）・
+    // `insert`（Issue #772）は実行結線済みのため、スローアウェイ
+    // `EngineCore`（テーブル未作成）上では `42P01`／404 が到達の証跡に
+    // なる（残る `search` と異なり暫定 `0A000`／501 はもう返らない）。
+    let executed_bodies: [&[u8]; 3] = [
         br#"{"op":"scan","table":"docs","limit":1}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"id"}]}"#,
+        br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2,0.3]}],"operation_id":"nosql9-op-1"}"#,
     ];
     for body in executed_bodies {
         let resp = query(addr, body);
         http_common::assert_reached_query_gate(&resp);
     }
 
-    let bodies: [&[u8]; 2] = [
-        br#"{"op":"search","table":"docs","limit":1}"#,
-        br#"{"op":"insert","table":"docs","rows":[]}"#,
-    ];
+    let bodies: [&[u8]; 1] = [br#"{"op":"search","table":"docs","limit":1}"#];
     for body in bodies {
         let resp = query(addr, body);
         assert_eq!(resp.status, 501, "body={body:?} resp={resp:?}");

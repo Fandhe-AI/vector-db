@@ -37,9 +37,9 @@
 //!
 //! op 許可リストの正式化（Issue #759）は完了済み。`scan` op の束縛・実行
 //! （TASK-186・NOSQL-3・Issue #766）・`aggregate` op の束縛・実行
-//! （Issue #768）は [`crate::http::query::gate::handle`] へ `engine` を
-//! 渡すことで結線済みで、`search`／`insert`（#763・#771）は引き続き
-//! 別 Issue が本ルータ以降の層へ追記する。
+//! （Issue #768）・`insert` op の束縛・実行（Issue #771・#772）は
+//! [`crate::http::query::gate::handle`] へ `engine` を渡すことで結線済みで、
+//! `search`（#764）は引き続き別 Issue が本ルータ以降の層へ追記する。
 //!
 //! メソッド（`POST` 以外を拒否）は [`crate::http::conn`] が要求行パース時点で
 //! 既に絞り込み済み（[`crate::http::request::Method`] は `Post` の 1 variant
@@ -151,9 +151,9 @@ fn resolve_target(target: &str) -> Route {
 /// `sessions`（[`SessionStore`]。`Clone` で内部状態を共有する型のため、
 /// `Router` 自身は `Arc` で包まず値として保持する）を束ねる。`engine` は
 /// `/v1/query` の `scan`（TASK-186・NOSQL-3・Issue #766）・`aggregate`
-/// （Issue #768。他 op は #763・#771 が追加）を実行するための接続済み
-/// `EngineCore`（`Router::new` 経由では `None` のまま。実行器なしで応答を
-/// 偽装しない fail-closed 設計）。
+/// （Issue #768）・`insert`（Issue #771・#772。`search` は #764 が追加）を
+/// 実行するための接続済み `EngineCore`（`Router::new` 経由では `None` の
+/// まま。実行器なしで応答を偽装しない fail-closed 設計）。
 pub struct Router {
     users: Arc<UserStore>,
     sessions: SessionStore,
@@ -171,9 +171,10 @@ impl Router {
         }
     }
 
-    /// `engine` 接続済みの構築経路（Issue #766・#768。`main.rs::run_server`
-    /// の nosql 分岐から呼ばれる）。`scan`／`aggregate` op は
-    /// [`super::query::scan::handle`]／[`super::query::aggregate::handle`]
+    /// `engine` 接続済みの構築経路（Issue #766・#768・#772。
+    /// `main.rs::run_server` の nosql 分岐から呼ばれる）。`scan`／
+    /// `aggregate`／`insert` op は [`super::query::scan::handle`]／
+    /// [`super::query::aggregate::handle`]／[`super::query::insert::handle`]
     /// へ結線され実行可能になる。
     pub fn with_engine(
         users: Arc<UserStore>,
