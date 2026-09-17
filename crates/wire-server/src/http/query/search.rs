@@ -42,6 +42,7 @@ use engine::sql::parser::{
 use engine::sql::plan::EvaluationOrder;
 
 use super::filter::{bind_filter, FilterError};
+use super::ident::{self, InvalidIdentifier};
 use super::schema::{SchemaError, Validated};
 
 /// `plan` 指定の束縛結果（Issue #763 時点での中間形）。LLM 展開・再埋め込みは
@@ -130,6 +131,11 @@ pub enum SearchError {
     /// `columns: []`（空配列）。SQL 表層に等価形（空の SELECT リスト）が
     /// 存在しないため fail-closed に拒否する（`42601`）。
     EmptyColumns,
+    /// `table`／`columns` の要素が識別子として意味を持ちうる形状
+    /// （[`super::ident::check_identifier`]）を満たさない。SQL 表層の
+    /// 字句解析段階の拒否と同じ `42601` 分類へ揃える（`aggregate.rs`
+    /// `AggregateError::InvalidIdentifier` と同じ判断）。
+    InvalidIdentifier,
     /// `filter` 配列の写像・束縛エラー（[`FilterError`] をそのまま透過）。
     Filter(FilterError),
     /// engine の束縛ヘルパー（投影・ベクトル値・本文列・`LIMIT`・`mode`）の
@@ -149,6 +155,12 @@ impl From<FilterError> for SearchError {
     }
 }
 
+impl From<InvalidIdentifier> for SearchError {
+    fn from(_err: InvalidIdentifier) -> Self {
+        SearchError::InvalidIdentifier
+    }
+}
+
 impl From<SqlSurfaceError> for SearchError {
     fn from(err: SqlSurfaceError) -> Self {
         SearchError::Bind(err)
@@ -162,7 +174,8 @@ impl ClassifiedError for SearchError {
             SearchError::VectorAndPlanBothPresent
             | SearchError::VectorAndPlanBothMissing
             | SearchError::PlanWithHybrid
-            | SearchError::EmptyColumns => ErrorClass::UnsupportedSqlSyntax,
+            | SearchError::EmptyColumns
+            | SearchError::InvalidIdentifier => ErrorClass::UnsupportedSqlSyntax,
             SearchError::Filter(err) => err.error_class(),
             SearchError::Bind(err) => err.error_class(),
         }
@@ -183,6 +196,7 @@ impl ClassifiedError for SearchError {
             SearchError::EmptyColumns => {
                 "search request \"columns\" must not be an empty array".to_string()
             }
+            SearchError::InvalidIdentifier => "invalid identifier".to_string(),
             SearchError::Filter(err) => err.client_message(),
             SearchError::Bind(err) => err.client_message(),
         }
@@ -205,7 +219,10 @@ fn columns_as_strings(items: &[JsonValue]) -> Result<Vec<String>, SearchError> {
     let mut names = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            JsonValue::String(s) => names.push(s.clone()),
+            JsonValue::String(s) => {
+                ident::check_identifier(s)?;
+                names.push(s.clone())
+            }
             _ => {
                 return Err(SearchError::Shape(SchemaError::TypeMismatch {
                     key: "columns",
@@ -239,10 +256,12 @@ fn vector_as_f64(items: &[JsonValue]) -> Result<Vec<f64>, SearchError> {
 ///
 /// 処理順序（fail-closed。順序自体が契約の一部）:
 /// 1. `table`・`limit`・`explain` を読み取る（`limit` は
-///    [`validate_search_limit`] で範囲検証）。
+///    [`validate_search_limit`] で範囲検証、`table` は
+///    [`super::ident::check_identifier`] で識別子形状を検証）。
 /// 2. `vector`／`plan` の排他判定（4 ケース）。
 /// 3. `plan` かつ `hybrid` 同時指定を拒否。
-/// 4. `columns` を投影へ束縛（`Some([])` は拒否）。
+/// 4. `columns` を投影へ束縛（`Some([])` は拒否。各要素は
+///    [`super::ident::check_identifier`] で識別子形状を検証してから使う）。
 /// 5. `filter` を束縛。
 /// 6. `mode` を検証（値は分岐によって確定／未解決のまま保持）。
 /// 7. `vector`／`plan` いずれかへ分岐して最終形を組み立てる。
@@ -251,6 +270,7 @@ pub fn bind_search(
     schema: &TableSchema,
 ) -> Result<BoundSearch, SearchError> {
     let table = validated.required_str("table")?;
+    ident::check_identifier(table)?;
     let limit_raw = validated.required_u32("limit")?;
     let limit = validate_search_limit(limit_raw)?;
     let explain = validated.optional_bool("explain")?.unwrap_or(false);
@@ -465,6 +485,28 @@ mod tests {
         .expect_err("must reject");
         assert!(matches!(err, SearchError::EmptyColumns));
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_rejects_malformed_identifier_table() {
+        let err = bind(r#"{"op":"search","table":"do cs","vector":[0.1,0.2,0.3,0.4],"limit":5}"#)
+            .expect_err("must reject");
+        assert!(matches!(err, SearchError::InvalidIdentifier));
+        assert_eq!(err.wire_code(), "42601");
+        // untrusted なテーブル名文字列を含まない固定文言であること。
+        assert_eq!(err.client_message(), "invalid identifier");
+    }
+
+    #[test]
+    fn bind_rejects_malformed_identifier_column() {
+        let err = bind(
+            r#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,"columns":["do cs"]}"#,
+        )
+        .expect_err("must reject");
+        assert!(matches!(err, SearchError::InvalidIdentifier));
+        assert_eq!(err.wire_code(), "42601");
+        // untrusted な列名文字列を含まない固定文言であること。
+        assert_eq!(err.client_message(), "invalid identifier");
     }
 
     #[test]
