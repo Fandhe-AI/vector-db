@@ -169,7 +169,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `vector` | △ | number[] | `plan` と排他かつどちらか必須 |
 | `plan` | △ | string | `vector` と排他かつどちらか必須。LLM クエリ展開 |
 | `hybrid` | △ | `{"text": string}` | `vector` とのみ併用可（`plan` と併用は `42601`）。疎側テキスト列は固定で `body` 列 |
-| `mode` | △ | string | `"recall"`（既定）／`"precision"` |
+| `mode` | △ | string | `"recall"`（`vector` 検索の既定）／`"precision"`。`plan` 検索で省略時は下記参照 |
 | `columns` | △ | string[]（非空） | 省略時は `id`＋全実列 |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照 |
 | `explain` | △ | bool | [`explain`](#explain)参照 |
@@ -193,6 +193,17 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 ```json
 {"op": "search", "table": "docs", "plan": "find content", "limit": 10}
 ```
+
+`mode` の解決（`resolve_mode_with_planner`。優先順位: 要求の `mode` フィールド
+＞ セッション変数 ＞ プランナー推定 ＞ 既定 `recall`）:
+
+- `vector` 検索: `mode` 省略時は常に既定 `recall`（プランナーを経由しないため
+  推定ヒントが存在しない）
+- `plan` 検索: `mode` 省略時はクエリ展開（LLM プランナー）の推定結果
+  `mode_hint`（TASK-164・PLAN-11）が採用されうる。`mode_hint` が
+  `"precision"` と推定されれば `mode` を明示指定しなくても `precision`
+  モードで実行される（確信度ゲート・`explain` での `mode_source` 確認は
+  SQL 表層の `USING PLAN` と同一契約）
 
 応答例は [応答スキーマ](#応答スキーマ)を参照。
 
@@ -275,7 +286,10 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
   → `54000`
 - `group_by` 列が `TEXT` 列でない・`having` が `MIN`/`MAX(<TEXT列>)` を参照・
   参照先が `aggregates` に存在しない／曖昧 → `22000`
-- `VECTOR` 列の集計・`sum` オーバーフロー → `22000`／`22003`
+- `VECTOR` 列の集計: `count` は列の裸の列参照を受理し非 `NULL` 行数を数える
+  （`resolve_aggregate_input` の `AggregateInput::VectorColumnPresence`）。
+  `sum`／`avg`／`min`／`max` は同じ `VECTOR` 列参照を一律 `22000` で拒否
+- `sum` オーバーフロー → `22003`
 
 ### `insert`
 
@@ -310,8 +324,15 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 - `rows` の行数上限は既定 64（`EngineCore::execute_bound_insert_in_session` が
   `rows.len()` を INDEX-4 の件数上限相当として判定。環境変数
   `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
-- `rows` にはバイト上限がない（行形は SQL 表層と同じくバイト上限を持たない設計。
-  [spec 側への申し送り候補](#spec-側への申し送り候補)参照）
+- `rows` 自体にはバイト上限がない（行形は SQL 表層と同じくバイト上限を持たない
+  設計。[spec 側への申し送り候補](#spec-側への申し送り候補)参照）が、行単位・
+  バッチ単位それぞれに別の INDEX-4 上限が適用される。各行のバイト量は
+  `Σ TEXT 列.len() + VECTOR 列.len() × 4`（`Null` は 0。`validate_batch_shape`）
+  として積算し、1 行あたりの上限（既定は `chunking::MAX_INPUT_BYTES` 相当）・
+  バッチ合計の上限（既定値、環境変数 `VECTOR_DB_BATCH_MAX_TOTAL_BYTES` で
+  上書き可能）のいずれかを超えると `54000`。行数自体も 1 行＝1 チャンク相当
+  として別枠のチャンク数上限（`validate_chunk_total`）で判定される（超過は
+  同じく `54000`）
 
 検証コード: `crates/wire-server/tests/nosql2_search.rs`・
 `nosql2_search_binding.rs`・`nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`・
