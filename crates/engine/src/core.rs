@@ -2756,7 +2756,15 @@ impl EngineCore {
             question,
             query_mode,
             limit,
-            |schema, udfs| bind(schema, udfs).map(|_| ()),
+            |schema, udfs| {
+                // `VECTOR` 列の存在は LLM 展開・再埋め込み（高コスト I/O）より
+                // 前に確定させる（`sql::using_plan::pre_check_bindable` と同じ
+                // fail-closed 順序。codex-review 指摘対応・PR #827。`VECTOR`
+                // 列を持たないテーブルへの `vector` 指定検索が、プランナー・
+                // 埋め込みのコストを消費したうえで拒否される増幅を防ぐ）。
+                crate::sql::parser::vector_column(schema)?;
+                bind(schema, udfs).map(|_| ())
+            },
             |schema, udfs, planned| {
                 let parts = bind(schema, udfs)?;
                 let text_column_index = crate::sql::using_plan::body_column_index(schema)?;

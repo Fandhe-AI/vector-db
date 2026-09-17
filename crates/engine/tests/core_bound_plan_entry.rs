@@ -823,3 +823,72 @@ fn plan_entry_fails_closed_without_query_planner_or_embedder() {
 
     assert_eq!(err.wire_code(), "XX000");
 }
+
+/// `VECTOR` 列を持たないテーブルへの `plan` 指定検索は、LLM 展開・再埋め込み
+/// （高コスト I/O）を一切行わずに `22000` で拒否される（`sql::using_plan::
+/// pre_check_bindable` が SQL 表層 `USING PLAN` で保証する fail-closed 順序と
+/// 同一。codex-review 指摘対応・PR #827。`crate::sql::parser::vector_column`
+/// が pre_check クロージャ内で先に呼ばれることの非 vacuous な証跡として
+/// `CountingStubLlmClient` の呼び出し回数を 0 のまま固定する）。
+#[test]
+fn plan_entry_rejects_table_without_vector_column_before_llm_call() {
+    let path = unique_db_path("bound-plan-plan-no-vector-column");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let no_vector_schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("lang", ColumnType::Text, false),
+            ColumnDef::new("path", ColumnType::Text, false),
+            ColumnDef::new("body", ColumnType::Text, false),
+        ],
+    );
+    storage
+        .create_table(&no_vector_schema)
+        .expect("create table without VECTOR column");
+    let planner = std::sync::Arc::new(CountingStubLlmClient {
+        response: SEARCH_EXPANSION_RESPONSE,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    // `LlmClient` 注入は所有権を要求するため、呼び出し回数を後から観測できる
+    // よう `Arc` 経由の薄い転送実装を渡す（`plan_entry_does_not_invoke_llm_
+    // when_binder_fails_pre_check` と同じ理由）。
+    struct ForwardingLlmClient(std::sync::Arc<CountingStubLlmClient>);
+    impl LlmClient for ForwardingLlmClient {
+        fn complete(&self, prompt: &str) -> Result<String, PlanError> {
+            self.0.complete(prompt)
+        }
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(DeterministicEmbedder { dim: 4 }))
+        .with_query_planner(Box::new(ForwardingLlmClient(std::sync::Arc::clone(
+            &planner,
+        ))));
+    let ctx_a = ctx_for("tenant-a");
+    let session = SessionState::default();
+
+    let err = core
+        .execute_bound_plan_search_in_session(
+            &ctx_a,
+            &session,
+            TABLE,
+            "find content",
+            None,
+            10,
+            |_schema, _udfs| {
+                Ok(PlanSearchBinding::new(
+                    vec![engine::sql::parser::ProjectedColumn::Id],
+                    Vec::new(),
+                ))
+            },
+        )
+        .expect_err("plan search on a table without a VECTOR column must be rejected");
+
+    assert!(matches!(err, SqlSurfaceError::InvalidInput { .. }));
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "LLM must not be invoked when the table has no VECTOR column"
+    );
+}
