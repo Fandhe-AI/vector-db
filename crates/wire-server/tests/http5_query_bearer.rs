@@ -516,10 +516,11 @@ fn valid_bearer_reaches_gate_for_every_op_schema_minimal_form() {
     let auth = format!("Bearer {token}");
 
     // `scan`（TASK-186・NOSQL-3・Issue #766）・`aggregate`（Issue #768）・
-    // `search`（TASK-186・NOSQL-2・Issue #764）は実行結線済みのため、
-    // `insert`（暫定 `0A000`／501）とは異なり `42P01`／404 が到達の証跡に
-    // なる。
-    let placeholder_cases: [&[u8]; 1] = [br#"{"op":"insert","table":"docs","rows":[]}"#];
+    // `insert`（Issue #772）・`search`（TASK-186・NOSQL-2・Issue #764）は
+    // いずれも実行結線済みのため、暫定 `0A000`／501 へ到達する op は
+    // 存在しない（`placeholder_cases` は空のまま維持し、将来 op が増えた
+    // 際の回帰検知点として残す）。
+    let placeholder_cases: [&[u8]; 0] = [];
     for body in placeholder_cases {
         let response = send_request(addr, "/v1/query", Some(&auth), body);
         let (status_line, resp_body) = split_response(&response);
@@ -530,9 +531,10 @@ fn valid_bearer_reaches_gate_for_every_op_schema_minimal_form() {
         assert_eq!(wire_code_of_body(&resp_body), "0A000");
     }
 
-    let executed_cases: [&[u8]; 3] = [
+    let executed_cases: [&[u8]; 4] = [
         VALID_SCAN_BODY,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"id"}]}"#,
+        br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2,0.3]}],"operation_id":"http5-op-1"}"#,
         br#"{"op":"search","table":"docs","limit":1}"#,
     ];
     for body in executed_cases {

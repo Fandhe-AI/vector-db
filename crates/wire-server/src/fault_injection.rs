@@ -8,15 +8,25 @@
 //! panic を再現する）でしか観測できず、`wire-server` バイナリを外部クライアント
 //! から commit 後 panic させる手段が無かった。本モジュールは `main.rs`
 //! （CLI 引数 `--fault-inject post-commit-panic`）と `simple_query.rs`
-//! （実際の注入点）が共有する、untrusted な CLI 文字列から「自プロセスを
+//! （SQL wire 側の注入点）が共有する、untrusted な CLI 文字列から「自プロセスを
 //! 1 回だけ commit 後 panic させる」という単一の能力へ到達する唯一の入口を
 //! 提供する（Issue #656 の `search_engine_opt` と同型の設計）。
 //!
+//! [`maybe_panic_after_http_insert_commit`]（Issue #829・codex-review P1
+//! 指摘対応）は同じ arm・take-once 消費（[`take_post_commit_panic_if`]）を
+//! HTTP 表層の `insert` op（`crate::http::query::insert::execute`）からも
+//! 呼べるようにした注入点。HTTP 側は RECOVER-6（緊急応答の同期送出）を
+//! まだ実装していないため（`docs/design/nosql-insert-mapping.md`「対象外」
+//! 節参照）、この経路で検証できるのは RECOVER-5（応答境界。
+//! `crate::http::conn::build_outcome` の `ResponseBoundaryGuard`）の
+//! 安全性側——commit 後 panic が通常の `500` へ縮退せずプロセス終了へ倒れる
+//! こと——のみである。
+//!
 //! 安全性: default features に含めないため、既定ビルド・crates.io 公開の
 //! 既定構成にはシンボルもフラグも存在しない。feature を有効化しても露出する
-//! のは上記 1 能力のみで、テナント境界・RLS・認証・fail-closed 経路を迂回する
-//! API は一切露出しない（発火経路自体は production の RECOVER-6 経路
-//! そのもので、追加するのはトリガーだけ）。詳細な判断根拠は
+//! のは上記の能力のみで、テナント境界・RLS・認証・fail-closed 経路を迂回する
+//! API は一切露出しない（発火経路自体は production の RECOVER-5／RECOVER-6
+//! 経路そのもので、追加するのはトリガーだけ）。詳細な判断根拠は
 //! `docs/design/three-client-e2e-harness.md`「Issue #705」節参照。
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,6 +104,24 @@ pub(crate) fn take_post_commit_panic_if(committed_insert: bool) -> bool {
 /// テナント ID を含まない固定文言で panic する（security.md P0）。
 pub(crate) fn maybe_panic_after_commit(outcome: &Result<SqlOutcome, SqlSurfaceError>) {
     if take_post_commit_panic_if(is_committed_insert(outcome)) {
+        panic!("fault-injection: injected post-commit panic (test only)");
+    }
+}
+
+/// `crate::http::query::insert::execute` の commit 成功直後から呼ぶ
+/// （呼び出し位置の契約は同関数のコメント参照。`crate::http::conn::
+/// build_outcome` の `ResponseBoundaryGuard`（RECOVER-5 (3)。PR #829）が
+/// 保護している区間の内側でだけ発火させる契約）。
+///
+/// `crate::http::query::insert` は `SqlOutcome` を経由しない（NoSQL 表層は
+/// `engine::sql::parser::BoundInsert` を直接束縛する第 2 の実行器を作らない
+/// 設計。`insert.rs` モジュール doc 参照）ため、[`maybe_panic_after_commit`]
+/// が判定に使う `is_committed_insert` は適用できない。呼び出し元
+/// （`insert::execute`）が「commit まで成功した」ことを自ら知っている
+/// 呼び出し位置からのみ呼ばれる契約とし、[`take_post_commit_panic_if`] へは
+/// 常に `true` を渡す（arm の take-once 消費ロジック自体は SQL 経路と共有）。
+pub(crate) fn maybe_panic_after_http_insert_commit() {
+    if take_post_commit_panic_if(true) {
         panic!("fault-injection: injected post-commit panic (test only)");
     }
 }

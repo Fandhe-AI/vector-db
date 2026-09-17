@@ -10,13 +10,15 @@
 //! `POST /v1/query` を送り、HTTP 応答（ステータス・`wire_code`・
 //! エラーコード・メッセージ）を確認する。
 //!
-//! 受理（3 op: `search`／`aggregate`／`insert`）と語彙外拒否はいずれも
+//! 許可リストの 4 op（`search`／`scan`／`aggregate`／`insert`）はいずれも
+//! 実行結線済み（TASK-186・NOSQL-2〜6・Issue #764・#766・#768・#772）の
+//! ため、`engine` 接続済みでは暫定 `0A000`／501
+//! （[`wire_server::http::query::gate::PLACEHOLDER_MESSAGE`]）を返さず、
+//! 存在しないテーブルへの到達を示す `42P01`／404 で「認証 → op 許可リスト →
+//! スキーマ検証 → engine 呼び出し」が走ったことを確認する。語彙外拒否は
 //! HTTP 501・`wire_code` `0A000`・`code` `FEATURE_NOT_SUPPORTED` で status
 //! だけでは区別できないため、必ず `error_message_of` で
-//! [`wire_server::http::query::gate::PLACEHOLDER_MESSAGE`]（受理側）／
-//! [`wire_server::http::query::gate::UNSUPPORTED_OP_MESSAGE`]（拒否側）を
-//! 突き合わせる。`scan` は TASK-186・NOSQL-3（Issue #766）で実行結線済み
-//! のため、この 3 op とは別に到達の証跡（`42P01`／404）を確認する。
+//! [`wire_server::http::query::gate::UNSUPPORTED_OP_MESSAGE`] を突き合わせる。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -26,7 +28,7 @@ mod http_common;
 use std::net::SocketAddr;
 
 use http_common::{AfterWrite, HttpResponse};
-use wire_server::http::query::gate::{PLACEHOLDER_MESSAGE, UNSUPPORTED_OP_MESSAGE};
+use wire_server::http::query::gate::UNSUPPORTED_OP_MESSAGE;
 use wire_server::http::session::store::SessionStore;
 
 /// `POST /v1/session` へログインしてトークン（base64url 表現）を取り出す。
@@ -89,37 +91,30 @@ fn spawn() -> SocketAddr {
     http_common::spawn_router_listener(&users_path, SessionStore::new())
 }
 
-// --- 受理 4 op: `scan`／`aggregate` は実行結線済み（42P01・非 501）・他 2 op
-// は 501・0A000・PLACEHOLDER_MESSAGE ----------------------------------------
+// --- 許可リスト 4 op はいずれも実行結線済み（42P01・非 501） -------------
 
 #[test]
-fn four_allowlisted_ops_reach_placeholder_response() {
+fn four_allowlisted_ops_reach_the_engine_and_report_undefined_table() {
     let addr = spawn();
 
     // `scan`（TASK-186・NOSQL-3・Issue #766）・`aggregate`（Issue #768）・
-    // `search`（TASK-186・NOSQL-2・Issue #764）は実行結線済みのため、
-    // スローアウェイ `EngineCore`（テーブル未作成）上では `42P01`／404 が
-    // 到達の証跡になる（`insert` と異なり暫定 `0A000`／501 はもう返らない）。
-    // `search` は `vector`／`plan` いずれも未指定だが、テーブル解決
+    // `insert`（Issue #772）・`search`（TASK-186・NOSQL-2・Issue #764）は
+    // いずれも実行結線済みのため、スローアウェイ `EngineCore`（テーブル
+    // 未作成）上では `42P01`／404 が到達の証跡になる（暫定 `0A000`／501
+    // へ到達する op はもう存在しない）。`search` は `vector`／`plan`
+    // いずれも未指定だが、テーブル解決
     // （`EngineCore::execute_bound_search_in_session` の schema 取得）が
     // binder（`vector`／`plan` 排他判定）より先に走るため `42P01` になる
     // （§2.3 の判定順序どおり）。
-    let executed_bodies: [&[u8]; 3] = [
+    let executed_bodies: [&[u8]; 4] = [
         br#"{"op":"scan","table":"docs","limit":1}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"id"}]}"#,
+        br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2,0.3]}],"operation_id":"nosql9-op-1"}"#,
         br#"{"op":"search","table":"docs","limit":1}"#,
     ];
     for body in executed_bodies {
         let resp = query(addr, body);
         http_common::assert_reached_query_gate(&resp);
-    }
-
-    let bodies: [&[u8]; 1] = [br#"{"op":"insert","table":"docs","rows":[]}"#];
-    for body in bodies {
-        let resp = query(addr, body);
-        assert_eq!(resp.status, 501, "body={body:?} resp={resp:?}");
-        assert_eq!(http_common::wire_code_of(&resp), "0A000");
-        assert_eq!(http_common::error_message_of(&resp), PLACEHOLDER_MESSAGE);
     }
 }
 
