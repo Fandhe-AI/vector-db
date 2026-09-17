@@ -116,9 +116,139 @@ private メソッド）へ抽出した。SQL 経路は
   `bind_group_by_clause` と共有。`ORDER BY`／`LIMIT` 相当は対象外のまま
   ——本エントリ・NoSQL 表層のスキーマにこれらに相当するキーが存在しない
   ため。上記の TASK-186 申し送りは解消済み）。
-- search（`BoundStatement`）向けの同型エントリ: 同じ `read_txn` の壁に当たるが
-  TASK-186 の対象外。TASK-175 へ申し送り。
 - `execute_insert`／`build_explain_result` の公開: Issue #730。
+
+## search（`BoundStatement`）向けエントリ（Issue #764・TASK-186・NOSQL-2）
+
+`vector` 指定は `execute_bound_scan_in_session` と同型の
+`execute_bound_search_in_session<F>`（`F: FnOnce(&TableSchema, &UdfRegistry)
+-> Result<BoundStatement, SqlSurfaceError>`）で足りる。`mode`（`precision`／
+`recall`）は NoSQL 表層に `SET search_mode` 相当が無いため、呼び出し元が
+`bind` の戻り値である `BoundStatement::mode` にすでに解決済みの値として
+含める契約（`wire-server::http::query::search::bind_search` が
+`mode::resolve_mode` を通す）。
+
+`plan` 指定（`USING PLAN` 相当）は LLM 展開・再埋め込みという高コスト I/O を
+挟むため、値渡しの束縛済み計画では表せない。SQL テキスト経由の
+`Statement::Select`（`USING PLAN` 分岐）が内蔵していた一連の fail-closed
+手順（`LIMIT` 範囲検証 → 辞書必須列の事前スキーマ検証 → スキーマ依存の
+事前束縛検証 → 計画開始時のテーブル世代記録 → I/O（`plan_using_plan_expansion`）
+→ I/O 完了後の世代照合 → 辞書必須列の再検証 → 束縛 → 実行）を、`core.rs`
+内の private ジェネリック `run_using_plan_select<Pre, Bind>` へ抽出し、
+SQL アーム・新エントリ `execute_bound_plan_search_in_session<F>` の双方が
+共有する（第 2 の実行器を作らない設計を I/O を挟む経路にも一貫させる）。
+
+```rust
+fn run_using_plan_select<Pre, Bind>(
+    &self,
+    ctx: &PolicyContext,
+    session: &SessionState,
+    table: &str,
+    question: &str,
+    mode_literal: Option<&str>,
+    limit: u32,
+    pre_check: Pre,
+    bind: Bind,
+) -> Result<QueryResult, SqlSurfaceError>
+where
+    Pre: FnOnce(&TableSchema, &UdfRegistry) -> Result<(), SqlSurfaceError>,
+    Bind: FnOnce(&TableSchema, &UdfRegistry, UsingPlanExpansionResult)
+        -> Result<BoundStatement, SqlSurfaceError>;
+
+pub fn execute_bound_plan_search_in_session<F>(
+    &self,
+    ctx: &PolicyContext,
+    session: &SessionState,
+    table: &str,
+    question: &str,
+    mode_literal: Option<&str>,
+    limit: u32,
+    bind: F,
+) -> Result<QueryResult, SqlSurfaceError>
+where
+    F: Fn(&TableSchema, &UdfRegistry) -> Result<PlanSearchBinding, SqlSurfaceError>;
+```
+
+`mode_literal`（`USING MODE` 相当の生リテラル）は `execute_bound_plan_search_in_session`
+自身では解析しない。`run_using_plan_select` がテーブル解決後に初めて解析する
+ことで、テーブル未存在＋ `mode` 値不正の要求でも `42P01` が優先される
+（SQL テキスト経由の `USING PLAN` と同一の fail-closed 順序。PR #827
+codex-review 指摘対応で `Option<SearchMode>` から変更）。
+
+設計上のポイント:
+
+- `bind: F` は `Fn`（`FnOnce` ではない）。`run_using_plan_select` は
+  `pre_check`（I/O 前・戻り値を捨てる多層防御）と `bind`（I/O 後・実際に
+  使う）の 2 回、異なる用途で同じ束縛ロジックを必要とするため、
+  `execute_bound_plan_search_in_session` は `bind` を両方へ渡す（呼び出し元
+  の closure は 2 回呼ばれても副作用のない純粋な束縛のみを行う契約）。
+- `bind` の戻り値 [`PlanSearchBinding`]（投影・フィルタのみを持つ
+  `#[non_exhaustive]` 構造体）は、SQL アームの `sql::using_plan::
+  bind_expansion` が返す `BoundStatement` から意図的に絞り込んである。
+  `Ranking::Hybrid`（再埋め込みベクトル・本文列インデックス・展開後クエリ
+  文字列）・`mode`（`resolved_mode`）は `execute_bound_plan_search_in_session`
+  自身が `planned`（`UsingPlanExpansionResult`）から組み立てる——NoSQL
+  表層（呼び出し元）はクエリベクトル・ランキング方式・モードを一切
+  差し替えられない（`.claude/rules/security.md`「アクセス制御の不備」対応。
+  `plan_using_plan_expansion` の `query_mode` は呼び出し元が事前に解析した
+  値を渡す形へ一般化し、`ValidatedStatement` への依存を除去した）。
+- `run_select_plan`（`execute_statement_with_cache` の薄いラッパー）を新設し、
+  SQL アームの `ORDER BY` 分岐・`run_using_plan_select`・
+  `execute_bound_search_in_session` の 3 箇所が同一のキャッシュ配線
+  （`SparseIndexCache`・`SqlArenaCache`・`HnswIndexCache`・`ScalarIndexCache`）
+  を共有する。
+
+### 判定順序（`wire-server::http::query::search::execute` が固定する契約）
+
+1. `table` の識別子形状検査（`42601`）
+2. `vector`／`plan` の同時指定（排他違反）の拒否（`42601`）。スキーマ解決
+   （テーブルの存在確認）を一切要さない、要求本文自身が抱える構造的な
+   契約違反のため、他のどの検証よりも先にここで確定する（PR #827
+   codex-review 指摘対応。以前は `plan` 分岐内のローカル検証
+   〔`validate_using_plan_question`・`mode` 解析〕がテーブル解決前に
+   位置していたため、`vector` も同時指定された要求では排他違反より先に
+   別のエラーが返ってしまっていた）
+3. `explain: true` の拒否（`vector`／`plan` のどちらか一方だけが指定された
+   場合に限る。`vector` 指定は `42601`——SQL-6 の `EXPLAIN SELECT ...
+   ORDER BY` 拒否と同じ分類、`plan` 指定は `0A000`——NOSQL-10・Issue #765
+   が正式な `explain` op 写像へ置き換えるまでの暫定の未実装扱い。両方
+   欠落のときはここで先回りせず、未知テーブルが `42P01` で拒否される
+   優先順位契約〔手順 4〕を壊さないよう通常のディスパッチへ進める）
+4. `vector`／`plan` の有無（スキーマ非依存の JSON 上の存在確認）で
+   `execute_bound_search_in_session`／`execute_bound_plan_search_in_session`
+   のどちらを呼ぶかを決め、選んだエントリが `table` のスキーマを取得
+   （未知テーブルは `42P01`。この判定は binder の排他判定〔`vector`／
+   `plan` 両方欠落〕・`mode` リテラルの解析より**先に**確定する——
+   テーブル解決が binder 呼び出し・`mode` 解析の前提条件のため。手順 2 の
+   同時指定判定とは異なり、こちらはスキーマ依存の判定〔両方欠落・`mode`
+   値不正〕に対する優先順位）
+5. binder（`wire-server::http::query::search::bind_search`）が schema 依存の
+   束縛・`mode` リテラルの解析・（両方欠落の場合の）排他判定を行う
+
+### 却下した設計案（追加分）
+
+| 案 | 内容 | 却下理由 |
+| --- | --- | --- |
+| D | wire 側で `ValidatedStatement::new(..).with_using_plan(..)` を組み立てて SQL アーム（`Statement::Select`）へ流す | `WherePredicate::Prefix { pattern }` は LIKE パターン（`declarative_filter::parse_prefix_pattern` が末尾 `%` 必須）を要求するが、NoSQL `filter.prefix` は生プレフィックス（`DeclarativeFilter::prefix`）であり意味が食い違う。SQL 文字列を経由しない設計方針にも反する |
+
+### テスト（search エントリ追加分）
+
+`crates/engine/tests/core_bound_plan_entry.rs`（Issue #764 で追加）:
+
+- `vector` 指定: RLS 暗黙適用・未定義テーブルの binder 呼び出し前拒否・
+  binder エラーの伝播・対象テーブル不一致の拒否・SQL 経由（`USING MODE`
+  含む）と `Cell` レベル一致（`precision` の確信度ゲートを含む）
+- `plan` 指定: SQL の `USING PLAN` 経由と行一致（決定的スタブ）・binder が
+  I/O 前に拒否する場合は LLM 呼び出し 0 回（`bind` が 2 回とも純粋に
+  呼ばれることの非 vacuous な証跡）・`query_planner`／`embedder` 未注入の
+  fail-closed・PLAN-11 のプランナー推定モードとクエリ句明示指定の優先順位
+
+既存回帰（無変更で green を確認）: `sql_using_plan.rs`・`sql_precision_mode.rs`・
+`sql_search_mode.rs`・`bound_plan_public_api.rs`。wire-server 側は
+`crates/wire-server/tests/nosql2_search.rs`（新設）が `wire_search_mode.rs`・
+`wire_using_plan.rs` と同型の決定的フィクスチャで SQL 経由とのバイト単位
+パリティ・RLS 非漏えい・precision fail-closed・`explain` の 2 分岐拒否を
+固定する。
 
 ## テスト
 

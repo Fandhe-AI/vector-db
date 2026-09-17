@@ -21,19 +21,20 @@
 //! `engine::sql::parser::BoundScan` へ束縛し `EngineCore` で実行する（Issue
 //! #766・TASK-176・NOSQL-3。結線済み）。[`search`] は `op: search` の JSON
 //! クエリオブジェクトを SQL 表層の `bind_in_session` と同一形の
-//! `engine::sql::parser::BoundStatement` へ束縛する（Issue #763・TASK-175・
-//! NOSQL-2。`vector`／`plan` 排他・`hybrid`／`mode`／`columns` の意味論は
-//! SQL 表層の既存公開関数へ委譲する）。`plan` 指定は LLM 展開が engine 内部
-//! I/O を要するため束縛済み部品のみの中間形 `PlanSearch` に留め、
-//! `BoundStatement` までの完成・実行結線・`gate.rs` の暫定応答
-//! （`PLACEHOLDER_MESSAGE`）置換は #764 の担当。[`gate`] は認証済み要求
-//! （`crate::http::session::middleware::SessionPrincipal`）に対する
+//! `engine::sql::parser::BoundStatement` へ束縛し実行する（Issue #763・
+//! #764・TASK-175・NOSQL-2。`vector`／`plan` 排他・`hybrid`／`mode`／
+//! `columns` の意味論は SQL 表層の既存公開関数へ委譲する）。`plan` 指定は
+//! LLM 展開が engine 内部 I/O を要するため、`EngineCore::
+//! execute_bound_plan_search_in_session`（TASK-186）が SQL 表層
+//! `USING PLAN` と同一の fail-closed 判定順序で実行する。[`gate`] は認証済み
+//! 要求（`crate::http::session::middleware::SessionPrincipal`）に対する
 //! `POST /v1/query` の入口本体で、`tenant_id` 相当ヘッダの拒否・op 許可
 //! リスト判定・本文のスキーマ検証を行い、`engine` 接続済みの場合に限り
 //! `op: scan` を [`scan::handle`] へ、`op: aggregate` を
-//! [`aggregate::handle`]（Issue #768）へそれぞれディスパッチする
-//! （`search`／`insert` は引き続き暫定の `0A000`／501 応答。
-//! Issue #754・#759。束縛・実行は #763・#771 が本 seam を置き換える）。
+//! [`aggregate::handle`]（Issue #768）へ、`op: search` を [`search::handle`]
+//! （Issue #764）へそれぞれディスパッチする（`insert` は引き続き暫定の
+//! `0A000`／501 応答。Issue #754・#759。束縛・実行は #771 が本 seam を
+//! 置き換える）。
 //! [`insert`] は `insert` op を
 //! `engine::sql::exec::execute_insert_batch`／
 //! `EngineCore::execute_bound_insert_in_session` へ写像する

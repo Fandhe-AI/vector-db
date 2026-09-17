@@ -118,9 +118,18 @@ bind は同じ理由で起動拒否されます。`nosql` を選択すると、�
 SQL-14 の `GROUP BY` 実行計画（`engine::sql::group_by::execute_grouped_aggregate`）
 へ写像し、グループ数上限（`MAX_GROUPS`＝10,000）・グループキー累計バイト・
 `HAVING` 述語数上限の超過はいずれも `wire_code` `54000` で拒否します
-（Issue #769・TASK-177・NOSQL-5）。それ以外の op（`search`／`insert`）は
-現時点では暫定の `wire_code` `0A000`（HTTP 501）を返します（束縛・実行
-計画への写像は Issue #763・#771 の担当）。`/v1/session`・
+（Issue #769・TASK-177・NOSQL-5）。`op: search`（`vector`／`plan` 排他・
+`hybrid`／`mode`／`columns`）は SQL 表層の検索 `SELECT` と同一形の
+`engine::sql::parser::BoundStatement` へ束縛・実行し、`vector` 指定は
+`EngineCore::execute_bound_search_in_session`、`plan` 指定は
+`EngineCore::execute_bound_plan_search_in_session`（`USING PLAN` と同一の
+fail-closed 判定順序・LLM 展開・`precision` 確信度ゲート〔SEARCH-9〕）へ
+それぞれ委譲します。`explain: true` は `vector` 指定なら `wire_code`
+`42601`、`plan` 指定なら `0A000`（正式な `explain` op 写像は NOSQL-10・
+Issue #765 の担当）で拒否します（Issue #764・TASK-186・NOSQL-2）。
+それ以外の op（`insert`）は現時点では暫定の `wire_code` `0A000`
+（HTTP 501）を返します（束縛・実行計画への写像は Issue #771 の担当）。
+`/v1/session`・
 `/v1/session/close`・`/v1/query` の 3 エンドポイントは
 バイト厳密一致でのみ受理し、それ以外のパス（完全未知パス・クエリ文字列
 付き・末尾スラッシュ／余剰セグメント・大文字小文字違い等）はすべて
