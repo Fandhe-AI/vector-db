@@ -68,7 +68,8 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
   [--search-engine default|hnsw|hnsw_f16|hnsw_i8] \
   [--hnsw-full-scan-ratio <num>/<den>] \
   [--hnsw-acorn-max-visible-ratio <num>/<den>] \
-  [--hnsw-sparse-visited-max <N>]
+  [--hnsw-sparse-visited-max <N>] \
+  [--durability immediate|none]
 ```
 
 `--users`・`--db` はいずれも必須です（省略時は匿名ログイン・匿名 DB を暗黙生成せず
@@ -182,6 +183,22 @@ opt-in CLI 引数です。`--search-engine` が `hnsw`／`hnsw_f16`／`hnsw_i8` 
 `EXPLAIN` の `hnsw_params:` 行へは出しません（Issue #411 の非露出方針を維持。
 `sparse_visited_max=` は Issue #497 で既に露出済みのため現状どおり出力され
 ます）。閾値の既定値の見直し・実測は Issue #659 の担当です。
+
+`--durability`（Issue #850）は書き込みトランザクションの durability
+（`engine::storage::WriteDurability`。Issue #849 が公開した構築時オプション）
+を選ぶ opt-in CLI 引数です。`--search-engine` と同型の「プロセス起動時にのみ
+明示指定する注入点」で、未指定（または `immediate`）は現行どおり
+`WriteDurability::Immediate`（`redb` 自身の既定と同一。commit 完了までに
+fsync 相当の同期を伴う）のまま不変です。不正な値・値欠落・2 回目以降の
+重複指定はいずれも fail-closed で起動エラーとなり、既定へ黙って読み替わる
+ことはありません。`none` を明示選択すると、commit 成功応答はディスクへの
+永続を保証しなくなります（`recovery::fail_fast`（RECOVER-8）の
+`abort()`・プロセス強制終了・電源断が発生すると、直前の `Immediate` commit
+以降の commit が失われ得る損失ウィンドウの詳細は
+`docs/design/ingest-write-path.md`「Issue #849 追記」節参照）。この安全上の
+含意を運用者が見落とさないよう、`none` を選んだ場合に限り起動ログへ英語の
+`WARNING` 行を 1 行出します（`immediate`・未指定では出力されません）。
+`EXPLAIN` への durability 設定の露出は対象外です。
 
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 
