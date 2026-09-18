@@ -640,3 +640,227 @@ fn group_by_enumeration_falls_back_to_full_scan_when_column_excluded_by_avg_leng
         assert_eq!(row.get(1), Some(&Cell::Integer(1)));
     }
 }
+
+// --- Issue #660 系: `COUNT(*)` のみの索引信頼経路（件数直読み） ------------
+//
+// `sql::aggregate::count_star_only` の不変条件下で、索引の候補スロット列・
+// 値グループの長さをそのまま件数に使う経路（行デコード・述語再適用なし）を
+// 検証する。対照は「意味的に同値だが索引で完全被覆されない述語」を足して
+// `ScalarPlan::PlainScan` へ落とした plain scan 経路（`id + 0 > 0` は
+// `id_predicate_from_expr` が受理しない残余述語であり、`id >= 1` の本
+// フィクスチャでは常に真）。
+
+/// `sql`（索引信頼経路）と `control_sql`（plain scan 経路）の結果が完全一致し、
+/// かつ前者が実際に索引経路（`aggregate_index_scans` 増加）・後者が
+/// plain scan 経路であることを確認する。
+fn assert_index_count_matches_plain_scan(
+    core: &EngineCore,
+    tenant: &str,
+    sql: &str,
+    control_sql: &str,
+) {
+    // 索引を温めてから（cold は piggyback 構築のみのことがある）計測する。
+    let _ = run(core, tenant, sql);
+    let before = core.scalar_index_cache_stats().aggregate_index_scans;
+    let indexed = run(core, tenant, sql);
+    let after = core.scalar_index_cache_stats().aggregate_index_scans;
+    assert!(
+        after > before,
+        "index path must be taken (non-vacuous) for: {sql}"
+    );
+
+    let before_control = core.scalar_index_cache_stats().aggregate_index_scans;
+    let control = run(core, tenant, control_sql);
+    let after_control = core.scalar_index_cache_stats().aggregate_index_scans;
+    assert_eq!(
+        after_control, before_control,
+        "control query must stay on the plain scan path: {control_sql}"
+    );
+
+    assert_eq!(
+        group_rows(&indexed),
+        group_rows(&control),
+        "index-trusted COUNT(*) must equal the plain scan result: {sql} vs {control_sql}"
+    );
+}
+
+#[test]
+fn count_star_index_trusted_path_matches_plain_scan_for_each_predicate_shape() {
+    let path = unique_db_path("scalar-index-aggregate-count-trusted");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    // 等価（IndexEquality）
+    assert_index_count_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind = 'a'",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind = 'a' AND id + 0 > 0",
+    );
+    // `id` 範囲（IndexIdRange）
+    assert_index_count_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) AS n FROM docs WHERE id > 5",
+        "SELECT COUNT(*) AS n FROM docs WHERE id > 5 AND id + 0 > 0",
+    );
+    // 交差（IndexConjunction）
+    assert_index_count_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind = 'a' AND id > 5",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind = 'a' AND id > 5 AND id + 0 > 0",
+    );
+    // 前方一致（IndexPrefix）
+    assert_index_count_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind LIKE 'a%'",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind LIKE 'a%' AND id + 0 > 0",
+    );
+    // 値が索引に存在しない（0 件）
+    assert_index_count_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind = 'zzz'",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind = 'zzz' AND id + 0 > 0",
+    );
+}
+
+#[test]
+fn group_by_count_star_enumeration_matches_plain_scan_including_null_group() {
+    let path = unique_db_path("scalar-index-aggregate-group-count-trusted");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    // `lang` は 3 グループ（"ja"・"en"・NULL）。列挙形（`WHERE` なし）が
+    // NULL グループを落とさないことを plain scan 対照で固定する。
+    assert_index_count_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY n DESC LIMIT 10",
+        "SELECT lang, COUNT(*) AS n FROM docs WHERE id + 0 > 0 GROUP BY lang \
+         ORDER BY n DESC LIMIT 10",
+    );
+    assert_index_count_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang HAVING n > 1 \
+         ORDER BY n DESC LIMIT 5",
+        "SELECT lang, COUNT(*) AS n FROM docs WHERE id + 0 > 0 GROUP BY lang HAVING n > 1 \
+         ORDER BY n DESC LIMIT 5",
+    );
+}
+
+#[test]
+fn count_star_index_trusted_path_never_counts_other_tenant_rows() {
+    let path = unique_db_path("scalar-index-aggregate-count-trusted-rls");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    // 他テナントの行。TABLE-12（`id` の一意性スコープはテナント内）の境界を
+    // 突くため `id` を tenant-a と**重複**させる: `id = 2` は `Public`
+    // （tenant-a から可視＝数える）、`id = 4` は `Private`（不可視＝数えない）。
+    // 残り 3 件（`id` 13〜15・`kind = 'b'`）は選択度ゲート
+    // （`FallbackSelectivity`。一致率 > 1/2 で plain scan へ縮退）に掛からない
+    // よう母数を増やすための詰め物。索引が `(table, ctx)` ごとに構築される
+    // 契約どおりなら、tenant-a の `COUNT(*) WHERE kind = 'a'` は
+    // 自テナント 5 件＋他テナント Public 1 件＝ 6 件になる。
+    let other = ctx("tenant-b");
+    insert_row(
+        &storage,
+        &other,
+        2,
+        Some("a"),
+        Some("ja"),
+        Visibility::Public,
+    );
+    insert_row(
+        &storage,
+        &other,
+        4,
+        Some("a"),
+        Some("ja"),
+        Visibility::Private,
+    );
+    for id in 13..=15u64 {
+        insert_row(
+            &storage,
+            &other,
+            id,
+            Some("b"),
+            Some("en"),
+            Visibility::Public,
+        );
+    }
+    let core = new_core(storage);
+
+    assert_index_count_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind = 'a'",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind = 'a' AND id + 0 > 0",
+    );
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind = 'a'",
+    );
+    assert_eq!(
+        single_row_cells(&result),
+        vec![Cell::Integer(6)],
+        "other tenant's Public duplicate id must be counted and its Private duplicate must not"
+    );
+
+    // tenant-b 自身からは自テナント 2 件（id=2 Public・id=4 Private）＋
+    // tenant-a の Public 5 件＝ 7 件
+    // （選択度によっては plain scan へ縮退するため件数のみを検証する）。
+    let from_b = run(
+        &core,
+        "tenant-b",
+        "SELECT COUNT(*) AS n FROM docs WHERE kind = 'a'",
+    );
+    assert_eq!(single_row_cells(&from_b), vec![Cell::Integer(7)]);
+}
+
+#[test]
+fn count_star_index_trusted_path_reflects_writes_after_generation_bump() {
+    let path = unique_db_path("scalar-index-aggregate-count-trusted-generation");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    let sql = "SELECT COUNT(*) AS n FROM docs WHERE kind = 'a'";
+    // 索引を温める（以降この世代の索引がキャッシュに載る）。
+    let _ = run(&core, "tenant-a", sql);
+    let warm = run(&core, "tenant-a", sql);
+    assert_eq!(single_row_cells(&warm), vec![Cell::Integer(5)]);
+
+    // 書き込みでテーブル世代が進む → 索引↔スナップショット同一性ガードにより
+    // 古い索引の件数をそのまま返してはならない。
+    // `EngineCore` が `Storage` の所有権を握るため SQL 表層の `INSERT` を経由する
+    // （`tests/sql_arena_cache.rs` と同じ流儀。SQL 表層の `INSERT` は可視性を
+    // `Private` に固定する契約のため、`ctx` は `Private` も許可済み）。
+    core.execute_insert_sql(
+        &ctx("tenant-a"),
+        "INSERT INTO docs (id, embedding, kind, lang) \
+         VALUES (99, '[99.0,0.0]', 'a', 'ja') USING OPERATION_ID 'count-trusted-bump'",
+    )
+    .expect("insert must succeed");
+
+    let after = run(&core, "tenant-a", sql);
+    assert_eq!(
+        single_row_cells(&after),
+        vec![Cell::Integer(6)],
+        "stale index must never be trusted across a table generation bump"
+    );
+}

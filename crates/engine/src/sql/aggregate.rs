@@ -367,6 +367,27 @@ impl Accumulator {
         }
     }
 
+    /// `n` 件の可視行を「存在のみ」でまとめて観測する（`COUNT(*)` 専用の
+    /// 一括版）。`sql::scalar_index::ScalarIndex` の候補列・値グループが
+    /// 「その述語／グループに属する可視行の**正確な**集合」であると静的に
+    /// 判定できた場合に限り、行ごとのデコード・述語再適用を省いて件数だけを
+    /// 加算する経路（[`count_star_only`] のドキュメント参照）から呼ぶ。
+    /// `Count` 以外のアキュムレータへ到達したら実装バグとして fail-closed に
+    /// 拒否する（[`Self::observe_present`] と同じ方針）。
+    pub(crate) fn observe_present_n(&mut self, n: u64) -> Result<(), SqlSurfaceError> {
+        match self {
+            Accumulator::Count(current) => {
+                *current = current.checked_add(n).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("COUNT exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            _ => Err(accumulator_bug(
+                "observe_present_n on a non-Count accumulator",
+            )),
+        }
+    }
+
     fn observe_id(&mut self, id: u64) -> Result<(), SqlSurfaceError> {
         match self {
             Accumulator::Count(n) => {
@@ -1006,6 +1027,43 @@ fn finish_aggregate_result(accumulators: Vec<Accumulator>, bound: &BoundAggregat
 }
 
 /// Issue #475: `GROUP BY` なし・索引対応述語のみの `WHERE` を持つ集計を、
+/// Issue #660 系（索引経路の残存コスト削減）: 集計項目がすべて `COUNT(*)`
+/// （[`AggregateInput::AllVisible`]）だけで構成されるかを判定する。
+///
+/// 真のとき、集計結果は「対象行の**件数**」だけで確定し、行の内容
+/// （スカラー列値・embedding・`id`）を一切参照しない。このため
+/// `sql::scalar_index::ScalarIndex` が返す候補スロット列・値グループが
+/// 「対象行の正確な集合」であると静的に保証できる場合に限り、行ごとの
+/// デコード・述語再適用（`observe_candidate_slots`／
+/// `sql::group_by::observe_group_slots`）をまるごと省いて
+/// [`Accumulator::observe_present_n`] で件数のみを加算できる。
+///
+/// **信頼してよい範囲（維持すべき不変条件）**: 索引由来の集合をそのまま
+/// 件数として使えるのは次をすべて満たす場合のみで、1 つでも崩れたら従来の
+/// 候補再適用・全走査経路へ落とす（索引は「絞る」ことしかできないという
+/// Issue #474 の多層防御は、この 3 条件下でのみ「索引で完全被覆された
+/// 述語に限って信頼する」形へ緩和する）:
+///
+/// 1. 本関数が `true`（`COUNT(*)` のみ。`COUNT(<列>)` の NULL 意味論は対象外）。
+/// 2. `WHERE` が索引で完全被覆されている——`sql::scalar_plan::
+///    classify_scalar_plan` が `PlainScan` 以外を返し、かつ
+///    `ScalarIndex::resolve_candidates` が `Use` を返した場合。
+///    `classify_scalar_plan` は索引非対応の残余述語が 1 つでもあれば
+///    `PlainScan` を返す契約（`sql::scalar_plan` モジュールドキュメント）
+///    のため、`PlainScan` 以外＝残余述語なしが静的に保証される。
+///    `GROUP BY` 列挙形では `WHERE` そのものが空であることが前提。
+/// 3. 索引↔スナップショット同一性ガード（行数・構築世代の一致。
+///    `ensure_scalar_index_snapshot`／`sql::exec` の SELECT 経路と同じ検査）を
+///    通過している——索引の母集合が当該 `(table, ctx)` の可視集合そのもの
+///    であることの担保。世代不一致時はこの経路へ入らない。
+pub(crate) fn count_star_only(items: &[crate::sql::parser::BoundAggregateItem]) -> bool {
+    !items.is_empty()
+        && items.iter().all(|item| {
+            item.func == crate::sql::allowlist::AggregateFunc::Count
+                && matches!(item.input, AggregateInput::AllVisible)
+        })
+}
+
 /// `sql::scalar_index::ScalarIndex::resolve_candidates` の候補削減経由で実行
 /// できるか試みる。`Ok(Some(_))` は索引経由で確定した応答（呼び出し元はこれを
 /// そのまま返す）、`Ok(None)` は索引が使えない・構築できない・選択度が悪い等の
@@ -1063,14 +1121,28 @@ fn try_scalar_index_aggregate(
     for item in &bound.items {
         accumulators.push(Accumulator::new(item.func, &item.input)?);
     }
-    observe_candidate_slots(
-        &snapshot,
-        &slots,
-        schema,
-        bound,
-        referenced,
-        &mut accumulators,
-    )?;
+    if count_star_only(&bound.items) {
+        // 索引で完全被覆された述語のみ（`classify_scalar_plan` が `PlainScan`
+        // 以外・`resolve_candidates` が `Use`）かつ `COUNT(*)` だけの集計は、
+        // 候補スロット列がそのまま対象行の正確な集合になる（[`count_star_only`]
+        // の不変条件 1〜3 参照。同一性ガードは `ensure_scalar_index_snapshot`
+        // が通過済み）。行ごとの `scan_scalar_columns_masked`＋`matches_all`＋
+        // 式述語の再適用を省き件数のみを加算する。
+        let hits = u64::try_from(slots.len())
+            .map_err(|_| accumulator_bug("candidate slot count does not fit in u64"))?;
+        for acc in &mut accumulators {
+            acc.observe_present_n(hits)?;
+        }
+    } else {
+        observe_candidate_slots(
+            &snapshot,
+            &slots,
+            schema,
+            bound,
+            referenced,
+            &mut accumulators,
+        )?;
+    }
     scalar_access.cache.record_aggregate_index_scan();
     Ok(Some(finish_aggregate_result(accumulators, bound)))
 }

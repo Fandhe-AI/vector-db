@@ -300,6 +300,18 @@ fn observe_group_enumeration(
         return Ok(false);
     };
 
+    // Issue #660 系（索引経路の残存コスト削減）: 集計項目がすべて `COUNT(*)` のとき、
+    // 列挙形の各グループの結果は「そのグループに属する可視行の件数」だけで
+    // 確定し行の内容を参照しない。`ScalarIndex::column_groups`／
+    // `slots_without_value` は当該列の可視行を漏れなく値グループ／NULL 群へ
+    // 分割する契約（`sql::scalar_index` モジュールドキュメント・本関数冒頭の
+    // 説明参照）であり、かつ本経路は `WHERE` なし（列挙形の前提）・索引↔
+    // スナップショット同一性ガード通過済みのため、スロット列の長さがそのまま
+    // グループ件数になる（`sql::aggregate::count_star_only` の不変条件 1〜3）。
+    // この場合だけ `observe_group_slots`（全スロットの
+    // `scan_scalar_columns_masked`）を丸ごと省く。
+    let count_star_only = crate::sql::aggregate::count_star_only(&bound.items);
+
     // `groups`（索引本体への借用イテレータ）はループの間ずっと `index` を借用
     // したままにし、キー・スロットいずれも `check_new_group_budget` の容量検査
     // を通過した分だけ所有データへ複製する（fail-closed 契約。容量超過時は
@@ -310,6 +322,11 @@ fn observe_group_enumeration(
         let current_group_count = string_groups.len() + usize::from(null_group.is_some());
         check_new_group_budget(current_group_count, total_key_bytes, value.len())?;
         let mut accs = new_accumulators(&bound.items)?;
+        if count_star_only {
+            observe_group_count_only(slots, &mut accs)?;
+            string_groups.insert(try_clone_str(value)?, accs);
+            continue;
+        }
         match observe_group_slots(
             snapshot,
             slots,
@@ -339,6 +356,11 @@ fn observe_group_enumeration(
         let current_group_count = string_groups.len() + usize::from(null_group.is_some());
         check_new_group_budget(current_group_count, total_key_bytes, 0)?;
         let mut accs = new_accumulators(&bound.items)?;
+        if count_star_only {
+            observe_group_count_only(&null_slots, &mut accs)?;
+            *null_group = Some(accs);
+            return Ok(true);
+        }
         match observe_group_slots(
             snapshot,
             &null_slots,
@@ -361,6 +383,22 @@ fn observe_group_enumeration(
         *null_group = Some(accs);
     }
     Ok(true)
+}
+
+/// Issue #660 系（索引経路の残存コスト削減）: `COUNT(*)` のみの列挙形専用。`slots`
+/// （そのグループに属する可視行スロットの正確な集合）の件数だけを `accs` へ
+/// 加算し、行のデコード（`scan_scalar_columns_masked`）を一切行わない。
+/// 適用条件（不変条件）は `sql::aggregate::count_star_only` のドキュメント参照。
+fn observe_group_count_only(
+    slots: &[u32],
+    accs: &mut [Accumulator],
+) -> Result<(), SqlSurfaceError> {
+    let hits = u64::try_from(slots.len())
+        .map_err(|_| accumulator_bug("group slot count does not fit in u64"))?;
+    for acc in accs.iter_mut() {
+        acc.observe_present_n(hits)?;
+    }
+    Ok(())
 }
 
 /// Issue #475: `slots`（`snapshot` 上の添字。同一グループに属することが呼び
