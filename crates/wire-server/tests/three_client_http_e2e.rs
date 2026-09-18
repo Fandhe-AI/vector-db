@@ -30,7 +30,7 @@
 //!
 //! スコープ外（後続 Issue への申し送り）:
 //! - urllib.request／fetch のクライアントスクリプトとランナー: #777
-//! - 3 クライアント × 一連手順・失効後 `28000` の検証・実行記録の整備: #778
+//! - 3 クライアント一括実行・実行記録の整備: #778
 //! - psql（SQL 経路）との結果一致比較（search／scan／aggregate）: #779
 
 #[path = "common/mod.rs"]
@@ -272,11 +272,12 @@ fn assert_valid_session_token(token: &str) {
 }
 
 /// curl（無改造の外部 HTTP クライアント）で `POST /v1/session`（発行）→
-/// `POST /v1/query`（`op: search`）→ `POST /v1/session/close`（失効）が順に
-/// 成功することを確認するスモークテスト（Issue #776 の受け入れ条件 R2）。
+/// `POST /v1/query`（`op: search`）→ `POST /v1/session/close`（失効）→
+/// 失効後の同一トークン再送が `401`／`28000` で拒否されることまでを
+/// 確認するスモークテスト（Issue #776 の受け入れ条件 R1〜R3）。
 ///
-/// 失効後のトークン再利用 → `28000` の検証・3 クライアントの一連手順・
-/// SQL 経路とのパリティは #778／#779 のスコープ（本 Issue のスコープ外）。
+/// 3 クライアント一括の実行記録・SQL 経路とのパリティは #778／#779 の
+/// スコープ（本 Issue のスコープ外）。
 #[test]
 #[ignore = "requires curl; run via `make e2e-three-client-http`"]
 fn curl_runs_session_search_close_over_nosql_surface() {
@@ -362,8 +363,26 @@ fn curl_runs_session_search_close_over_nosql_surface() {
         "expected closed:true, got: {body}"
     );
 
+    // 4. 失効後の同一トークン再送は `401`／`28000` で拒否される（Issue #776
+    //    の受け入れ条件 R3。close が実際にトークンを失効させたことの
+    //    非 vacuous な証跡。`http8_session_close.rs` の同種検証と同じ
+    //    `wire_code` 判定基準）。
+    let (status, body) = curl_post(port, "/v1/query", Some(&token), search_body, &out_dir, 4);
+    assert_eq!(status, 401, "revoked token must be rejected: {body}");
+    assert!(
+        body.contains("\"wire_code\":\"28000\""),
+        "expected wire_code 28000 for revoked token, got: {body}"
+    );
+
     let seen = server.stop_and_drain(Instant::now() + Duration::from_secs(5));
     let joined = seen.join("");
+    // Issue #776 の受け入れ条件 R1: SQL 表層が誤って起動していないことの
+    // 非 vacuous な証跡（`main.rs` は `--surface nosql` 選択時のみこの行を
+    // `listening on` の直前に出す契約）。
+    assert!(
+        joined.contains("wire-server: surface nosql:"),
+        "expected nosql surface banner in stderr, got: {joined:?}"
+    );
     assert!(
         !joined.contains(&token),
         "stderr must not leak the session token"
