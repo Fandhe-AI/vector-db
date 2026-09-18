@@ -1,0 +1,215 @@
+{
+  "meta": {
+    "db": "elasticsearch",
+    "version": "elasticsearch 9.1.4 (image docker.elastic.co/elasticsearch/elasticsearch:9.1.4)",
+    "connection": "loopback HTTP (http.client, keep-alive)",
+    "config": "exact",
+    "rows": 25000,
+    "dim": 128,
+    "timestamp": "2026-09-18T16:32:06+0900",
+    "nproc": 16,
+    "loadavg": [
+      4.73046875,
+      3.94384765625,
+      3.8955078125
+    ],
+    "python": "3.14.6",
+    "host": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "warmup": 5,
+    "iters": 50,
+    "similarity": "dot_product",
+    "index_options": null,
+    "doc_count": 25703
+  },
+  "phases": {
+    "ingest_bulk": {
+      "rows": 25000,
+      "seconds": 1.121318374760449,
+      "rows_per_sec": 22295.184456725623,
+      "note": "_bulk（5,000 行/chunk）+ 末尾 _refresh を含む所要時間"
+    },
+    "vector_knn": {
+      "n": 50,
+      "min_us": 3914.6249182522297,
+      "p50_us": 4767.291247844696,
+      "p95_us": 6519.957911223173,
+      "p99_us": 26871.707756072283,
+      "mean_us": 5332.093322649598,
+      "max_us": 26871.707756072283
+    },
+    "vector_knn_where": {
+      "n": 50,
+      "min_us": 1889.24977555871,
+      "p50_us": 2277.000341564417,
+      "p95_us": 2711.708191782236,
+      "p99_us": 2956.8327590823174,
+      "mean_us": 2306.760037317872,
+      "max_us": 2956.8327590823174
+    },
+    "point_where": {
+      "note": "vector_knn_where と同一クエリ形のため統合",
+      "n": 50,
+      "min_us": 1889.24977555871,
+      "p50_us": 2277.000341564417,
+      "p95_us": 2711.708191782236,
+      "p99_us": 2956.8327590823174,
+      "mean_us": 2306.760037317872,
+      "max_us": 2956.8327590823174
+    },
+    "where_compound_count": {
+      "n": 50,
+      "min_us": 864.1663007438183,
+      "p50_us": 1134.0840719640255,
+      "p95_us": 1681.2076792120934,
+      "p99_us": 2253.541722893715,
+      "mean_us": 1224.1150252521038,
+      "max_us": 2253.541722893715,
+      "result": 7599
+    },
+    "agg_count": {
+      "n": 50,
+      "min_us": 800.959300249815,
+      "p50_us": 929.9172088503838,
+      "p95_us": 2365.3749376535416,
+      "p99_us": 2740.9172616899014,
+      "mean_us": 1115.8208642154932,
+      "max_us": 2740.9172616899014,
+      "result": 23000
+    },
+    "agg_multi": {
+      "n": 50,
+      "min_us": 876.8332190811634,
+      "p50_us": 1357.87483304739,
+      "p95_us": 1791.8329685926437,
+      "p99_us": 2087.959088385105,
+      "mean_us": 1360.7433065772057,
+      "max_us": 2087.959088385105,
+      "result": [
+        23000,
+        283511500.0,
+        12326.58695652174,
+        1.0,
+        25000.0
+      ]
+    },
+    "group_by_having": {
+      "n": 50,
+      "min_us": 885.9168738126755,
+      "p50_us": 1304.1249476373196,
+      "p95_us": 1764.7496424615383,
+      "p99_us": 2756.7921206355095,
+      "mean_us": 1367.956018075347,
+      "max_us": 2756.7921206355095,
+      "result": [
+        [
+          "en",
+          15379
+        ],
+        [
+          "ja",
+          7621
+        ]
+      ]
+    },
+    "hybrid_rrf": {
+      "unsupported": true,
+      "reason": "retriever.rrf が利用できない（実エラー: HTTP 403: {\"error\": {\"root_cause\": [{\"type\": \"security_exception\", \"reason\": \"current license is non-compliant for [Reciprocal Rank Fusion (RRF)]\", \"license.expired.feature\": \"Reciprocal Rank Fusion (RRF)\"}], \"type\": \"security_exception\", \"reason\": \"current license is non-compliant for [Reciprocal Rank Fusion (RRF)]\", \"license.expired.feature\": \"Reciprocal Rank Fusion (RRF)\"}, \"status\": 403}）"
+    },
+    "mode_recall": {
+      "unsupported": true,
+      "reason": "Elasticsearch にモード切替（recall/precision）の概念が無い"
+    },
+    "mode_precision": {
+      "unsupported": true,
+      "reason": "Elasticsearch にモード切替（recall/precision）の概念が無い"
+    },
+    "udf_call": {
+      "unsupported": true,
+      "reason": "自作 DB の宣言的 UDF 呼び出し相当の機能が無い"
+    },
+    "bulk_knn_k200": {
+      "n": 50,
+      "min_us": 4966.666921973228,
+      "p50_us": 5930.791143327951,
+      "p95_us": 6453.790701925755,
+      "p99_us": 6834.291853010654,
+      "mean_us": 5909.037468954921,
+      "max_us": 6834.291853010654,
+      "k": 200,
+      "rows_returned": 200
+    },
+    "bulk_knn_k1000": {
+      "n": 50,
+      "min_us": 14590.166974812746,
+      "p50_us": 15930.625144392252,
+      "p95_us": 16947.292257100344,
+      "p99_us": 17929.91580441594,
+      "mean_us": 15902.427388355136,
+      "max_us": 17929.91580441594,
+      "k": 1000,
+      "rows_returned": 1000
+    },
+    "bulk_knn_where_k200": {
+      "n": 50,
+      "min_us": 4272.041842341423,
+      "p50_us": 4844.8326997458935,
+      "p95_us": 5356.334149837494,
+      "p99_us": 5552.167072892189,
+      "mean_us": 4835.056662559509,
+      "max_us": 5552.167072892189,
+      "k": 200,
+      "rows_returned": 200
+    },
+    "bulk_hybrid_k200": {
+      "unsupported": true,
+      "reason": "retriever.rrf が利用できない（実エラー: HTTP 403: {\"error\": {\"root_cause\": [{\"type\": \"security_exception\", \"reason\": \"current license is non-compliant for [Reciprocal Rank Fusion (RRF)]\", \"license.expired.feature\": \"Reciprocal Rank Fusion (RRF)\"}], \"type\": \"security_exception\", \"reason\": \"current license is non-compliant for [Reciprocal Rank Fusion (RRF)]\", \"license.expired.feature\": \"Reciprocal Rank Fusion (RRF)\"}, \"status\": 403}）"
+    },
+    "scan_where_nosort_k500": {
+      "n": 50,
+      "min_us": 6739.125121384859,
+      "p50_us": 7790.583185851574,
+      "p95_us": 8862.416259944439,
+      "p99_us": 11518.04206892848,
+      "mean_us": 7882.040040567517,
+      "max_us": 11518.04206892848,
+      "k": 500,
+      "rows_returned": 500
+    },
+    "rls_isolation": {
+      "n": 50,
+      "min_us": 653.5002030432224,
+      "p50_us": 845.1254107058048,
+      "p95_us": 1275.9161181747913,
+      "p99_us": 1332.8329659998417,
+      "mean_us": 903.7916548550129,
+      "max_us": 1332.8329659998417,
+      "tenant_b_count": 23000,
+      "note": "Elasticsearch にテナント別セッションの概念が無いため agg_count と同一フィルタで再実行（値の一致確認用）"
+    },
+    "explain": {
+      "n": 50,
+      "min_us": 2243.3330304920673,
+      "p50_us": 2704.666927456856,
+      "p95_us": 3196.5826638042927,
+      "p99_us": 3365.1250414550304,
+      "mean_us": 2733.706720173359,
+      "max_us": 3365.1250414550304,
+      "sample_output": [
+        "script score function, computed with script:\"Script{type=inline, lang='painless', idOrCode='dotProduct(params.query_vector, 'embedding') + 1.0', options={}, params={query_vector=[-0.28867513, 0, 0, 0, 0.28867513, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0.28867513, 0, 0, 0, 0.28867513, 0, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}}\"",
+        "script score function, computed with script:\"Script{type=inline, lang='painless', idOrCode='dotProduct(params.query_vector, 'embedding') + 1.0', options={}, params={query_vector=[-0.28867513, 0, 0, 0, 0.28867513, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0.28867513, 0, 0, 0, 0.28867513, 0, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}}\"",
+        "script score function, computed with script:\"Script{type=inline, lang='painless', idOrCode='dotProduct(params.query_vector, 'embedding') + 1.0', options={}, params={query_vector=[-0.28867513, 0, 0, 0, 0.28867513, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0.28867513, 0, 0, 0, 0.28867513, 0, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0, 0, -0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.28867513, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}}\""
+      ]
+    },
+    "ingest_single_stmt": {
+      "rows": 1000,
+      "seconds": 1.6740771671757102,
+      "rows_per_sec": 597.344029061141,
+      "note": "PUT /docs/_doc/<id> ×1,000・refresh なし（既定の translog fsync のみ）"
+    },
+    "recall_at_10": {
+      "recall_at_10": 1.0,
+      "recall_at_10_strict": 0.9995,
+      "queries": 200
+    }
+  }
+}

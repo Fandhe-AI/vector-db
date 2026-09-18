@@ -1,0 +1,2 @@
+done: plan_probe table ready (3 rows, dim 128)
+wrote: $WORK/results/self_hnsw.json

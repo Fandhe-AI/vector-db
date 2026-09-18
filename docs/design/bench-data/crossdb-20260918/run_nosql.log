@@ -1,0 +1,16 @@
+bench-mongodb: waiting for readiness...
+bench-mongodb: ready
+== 16:28:19 loadavg={ 3.07 3.28 3.74 } mongodb exact
+== 16:28:28 loadavg={ 3.46 3.35 3.76 } mongodb hnsw
+bench-mongodb-plain: waiting for readiness...
+bench-mongodb-plain: ready
+== 16:28:35 loadavg={ 3.35 3.33 3.75 } mongodb_plain exact
+bench-redis: waiting for readiness...
+bench-redis: ready
+== 16:30:42 loadavg={ 5.50 3.78 3.84 } redis exact
+== 16:30:46 loadavg={ 5.50 3.78 3.84 } redis hnsw
+bench-elasticsearch: waiting for readiness...
+bench-elasticsearch: ready
+== 16:31:02 loadavg={ 5.53 3.89 3.88 } elasticsearch exact
+== 16:31:09 loadavg={ 5.49 3.91 3.88 } elasticsearch hnsw
+== 16:31:17 done FAILED=none

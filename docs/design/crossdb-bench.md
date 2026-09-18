@@ -1144,3 +1144,50 @@ informational 参考値。受け入れ判定はクラスタ構造ありフィク
 フェーズ）の #654 適用前後比較（段別プロファイル・crossdb self 双方）は
 [`scalar-index-mask-search.md`「前後比較実測（Issue #655）」節](scalar-index-mask-search.md)
 を参照（本 doc の表は再転記しない）。
+
+## 2026-09-18 再計測（Apple M4 Max・NoSQL 対照追加・是正前後の勝敗）
+
+- 環境: MacBook Pro（Apple M4 Max 16 コア・64 GB・macOS 26.6）。共有デスクトップ機（loadavg 2〜6）の参考値。self・sqlite-vec・LanceDB は native、pgvector・Qdrant・MySQL・NoSQL 4 系統は Docker Desktop VM（16 CPU／15.6 GiB・arm64）越し
+- 対象: 既存 5 DB に NoSQL 対照 4 系統（Redis 8.10.1／RediSearch・Elasticsearch 9.1.4・MongoDB Atlas local 8.3.11〔`$vectorSearch`／`$rankFusion`〕・MongoDB Community 8.3.11〔ベクトル検索なし〕）と self の HTTP NoSQL 表層（`self_nosql`）を追加。ハーネスは `scripts/crossdb_bench/`（Issue #846）
+- HEAD `64cb381`・fixture 25,000 行（可視 23,000）・dim 128・warmup 5／iters 50。生データ: `docs/design/bench-data/crossdb-20260918/`
+- 前回（2026-09-08・QEMU x86_64 専有環境）との p50 直接比較は環境差のため行わない。`1deae29..64cb381` の engine に検索経路の性能変更は無い
+- Redis `FT.HYBRID` の RRF WINDOW は 50・ES の RRF retriever は無償ライセンスで 403 のためクライアント側 RRF・ES 2 フェーズは単発 run（exact／hnsw 列で約 30% 乖離）の参考値
+
+### 是正前後の勝敗（p50 µs・対照 DB 越しの順位）
+
+「改善前」は 2026-09-18 単発 run、「改善後」は同一 fixture・同一機で交互 5 ペア計測した after 側（Issue #843・#844 の是正）5 run median を同じ対照値へ当てた再判定（参考値。対照 DB の再取得は Issue #848）。「比」は最速他 DB ÷ self（1 未満が負け）。
+
+| フェーズ | 最速他 DB | self 改善前 | 比 | 勝敗 | self 改善後 | 比 | 勝敗 |
+| --- | --- | ---: | ---: | --- | ---: | ---: | --- |
+| `vector_knn` | Qdrant 861 | 547 | 1.57 | 1 位 | 594 | 1.45 | 1 位 |
+| `vector_knn_where` | Qdrant 669 | 1,007 | 0.66 | 3 位 | 251 | 2.67 | 1 位 |
+| `where_compound_count` | LanceDB HNSW 641 | 903 | 0.71 | 4 位 | 93 | 6.88 | 1 位 |
+| `agg_count` | LanceDB HNSW 374 | 127 | 2.95 | 1 位 | 106 | 3.51 | 1 位 |
+| `agg_multi` | Elasticsearch HNSW 867 | 247 | 3.51 | 1 位 | 245 | 3.54 | 1 位 |
+| `group_by_having` | Elasticsearch HNSW 952 | 1,445 | 0.66 | 3 位 | 75 | 12.72 | 1 位 |
+| `hybrid_rrf` | Redis FLAT 1,336 | 4,800 | 0.28 | 9 位 | 1,492 | 0.90 | 2 位 |
+| `bulk_knn_k200` | LanceDB HNSW 2,579 | 722 | 3.57 | 1 位 | 733 | 3.52 | 1 位 |
+| `bulk_knn_k1000` | LanceDB HNSW 3,624 | 1,332 | 2.72 | 1 位 | 1,327 | 2.73 | 1 位 |
+| `bulk_knn_where_k200` | pgvector 2,477 | 1,652 | 1.50 | 1 位 | 394 | 6.29 | 1 位 |
+| `bulk_hybrid_k200` | Redis FLAT 2,256 | 6,268 | 0.36 | 8 位 | 1,538 | 1.47 | 1 位 |
+| `scan_where_nosort_k500` | sqlite-vec 203（in-process） | 427 | 0.48 | 2 位 | 423 | 0.48 | 2 位 |
+| `rls_isolation` | LanceDB HNSW 377 | 112 | 3.37 | 1 位 | 107 | 3.51 | 1 位 |
+
+合計: 改善前 7 勝 0 僅差 6 敗 → 改善後 11 勝 0 僅差 2 敗（self 固有の `mode_recall`・`mode_precision`・`udf_call` は対象外）。残る 2 敗は `hybrid_rrf`（self はプール深さ 200・Redis は WINDOW 50 で 0.90 倍）と `scan_where_nosort_k500`（engine 内部 227µs は sqlite-vec 203µs と同水準。残差は loopback＋psycopg）。
+
+### 単文 INSERT の durability 既定値（比較条件の非対称）
+
+`ingest_single_stmt` は self 181 rows/s 対 Redis 3,566 rows/s。self は redb commit ごとの `sync_data` が macOS では `F_FULLFSYNC`（p50 約 4.2 ms。同一ボリュームの `fsync(2)` は約 18 µs）となる一方、対照 DB の既定は次のとおり永続化を待たない。engine 側の既定は変えず、opt-in は Issue #849〜#851 の担当。
+
+| DB | 単一書き込みの既定 durability |
+| --- | --- |
+| self（redb） | 毎 commit `Durability::Immediate`（macOS では `F_FULLFSYNC`） |
+| Redis（RediSearch） | AOF 既定無効・周期的 RDB のみ。fsync なし |
+| LanceDB | fsync なし（OS ページキャッシュ止まり） |
+| MongoDB（WiredTiger） | journal（WAL）のみ 100 ms 間隔で flush。データページは checkpoint |
+| SQLite（sqlite-vec） | `synchronous=FULL`。macOS では `F_FULLFSYNC` 優先 |
+| PostgreSQL（pgvector） | `synchronous_commit=on`（WAL fsync） |
+
+### 原因分析と是正
+
+フェーズ別の原因（self 側機構と最速他 DB の手法）・A/B 生データ・チップ最適化の考察は `docs/design/crossdb-loss-analysis-20260918.md`（Issue #845）を参照。

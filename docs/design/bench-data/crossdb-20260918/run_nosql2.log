@@ -1,0 +1,9 @@
+bench-redis: waiting for readiness...
+bench-redis: ready
+== 16:31:42 loadavg={ 4.57 3.86 3.86 } redis exact
+== 16:31:46 loadavg={ 4.57 3.86 3.86 } redis hnsw
+bench-elasticsearch: waiting for readiness...
+bench-elasticsearch: ready
+== 16:31:59 loadavg={ 4.71 3.93 3.89 } elasticsearch exact
+== 16:32:06 loadavg={ 4.73 3.94 3.90 } elasticsearch hnsw
+== 16:32:14 done FAILED=none
