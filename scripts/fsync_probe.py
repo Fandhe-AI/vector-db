@@ -25,6 +25,7 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 import time
 
 # Python の `fcntl` モジュールは `F_FULLFSYNC` を公開している（Darwin 限定）が、
@@ -71,8 +72,10 @@ def probe_fsync(directory: str, iters: int) -> dict:
     """`os.fsync`（全 OS 共通）を計測する。"""
     samples: list[int] = []
     for _ in range(iters):
-        path = os.path.join(directory, f".fsync_probe_fsync_{os.getpid()}_{len(samples)}")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # `tempfile.mkstemp` は `O_EXCL` 相当の排他的生成を行うため、
+        # 予測可能なパスへの直接 `open(..., O_TRUNC)`（symlink 攻撃・
+        # TOCTOU の温床）を避けられる（codex-review 指摘・Issue #857）。
+        fd, path = tempfile.mkstemp(prefix=".fsync_probe_fsync_", dir=directory)
         try:
             os.write(fd, _PAYLOAD)
             samples.append(_time_op(lambda: os.fsync(fd)))
@@ -88,8 +91,7 @@ def probe_fdatasync(directory: str, iters: int) -> dict | None:
         return None
     samples: list[int] = []
     for _ in range(iters):
-        path = os.path.join(directory, f".fsync_probe_fdatasync_{os.getpid()}_{len(samples)}")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd, path = tempfile.mkstemp(prefix=".fsync_probe_fdatasync_", dir=directory)
         try:
             os.write(fd, _PAYLOAD)
             samples.append(_time_op(lambda: os.fdatasync(fd)))
@@ -106,10 +108,7 @@ def _probe_fcntl_sync(directory: str, iters: int, cmd: int, label: str) -> dict:
     samples: list[int] = []
     try:
         for _ in range(iters):
-            path = os.path.join(
-                directory, f".fsync_probe_{label}_{os.getpid()}_{len(samples)}"
-            )
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd, path = tempfile.mkstemp(prefix=f".fsync_probe_{label}_", dir=directory)
             try:
                 os.write(fd, _PAYLOAD)
                 samples.append(_time_op(lambda: fcntl.fcntl(fd, cmd)))
