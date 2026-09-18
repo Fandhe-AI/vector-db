@@ -238,9 +238,9 @@ else
 endif
 
 .PHONY: e2e-three-client-http
-e2e-three-client-http: ## TASK-183（HTTP-13）NoSQL 表層（--surface nosql）の無改造 HTTP クライアント（curl／urllib／fetch）統合テスト（opt-in・`ci` には含めない。要 curl・python3・node（≥18）。CURL_BIN／PYTHON_BIN／NODE_BIN で上書き可）
+e2e-three-client-http: ## TASK-183（HTTP-13）NoSQL 表層（--surface nosql）の無改造 HTTP クライアント（curl／urllib／fetch）統合テスト（opt-in・`ci` には含めない。要 curl・python3・node（≥18）。CURL_BIN／PYTHON_BIN／NODE_BIN で上書き可。各テストが `[e2e-record]` 行を stderr へ出力（秘密情報非含有）。記録様式は docs/design/three-client-e2e-harness.md 参照）
 ifdef HAS_CARGO
-	cargo test -p fandhe-vector-db-wire-server --test three_client_http_e2e -- --ignored
+	cargo test -p fandhe-vector-db-wire-server --test three_client_http_e2e -- --ignored --nocapture --test-threads=1
 else
 	@echo "skip: Cargo.toml 未追加のため e2e-three-client-http をスキップ"
 endif

@@ -39,8 +39,16 @@
 //! アサーション弱体化で CI を通さない」の精神を、明示的に選択実行するこの
 //! 導線でも維持する）。
 //!
+//! 実行記録（Issue #778）: 各テストはシナリオ完走後に `[e2e-record]` 行を
+//! stderr へ出力する（`tests/three_client_e2e.rs` の先例と同型）。使用した
+//! クライアントバイナリの版（`HttpClient::version`）・各段の観測要点
+//! （HTTP ステータス・`row_count`・返却 id 集合等）のみを含み、トークン・
+//! ユーザー名・パスワード・テナント id は出力前に機械検証して含めない
+//! （`--nocapture` で表示しても安全）。PR 本文への記録様式・再実行手順は
+//! `docs/design/three-client-e2e-harness.md`「実行記録の様式と運用手順
+//! （Issue #778）」節を参照。
+//!
 //! スコープ外（後続 Issue への申し送り）:
-//! - 3 クライアント一括実行の実行記録の整備: #778
 //! - psql（SQL 経路）との結果一致比較（search／scan／aggregate）: #779
 
 #[path = "common/mod.rs"]
@@ -388,6 +396,73 @@ impl HttpClient {
             HttpClient::Fetch => fetch_post(port, target, bearer, json_body),
         }
     }
+
+    /// 実際に使うインタプリタ／バイナリの `--version` 出力を取得する
+    /// （Issue #778。PR 記録テンプレートへ転記する「クライアント版」欄の
+    /// 出所。`resolve_tool` が返す実際の解決先——環境変数上書きを含む——に
+    /// 対して問い合わせるため、記録された版は実行に使われたものと一致する）。
+    /// spawn 失敗・非 0 終了・空出力はいずれも案内付き `panic!`
+    /// （ツール自体が必須のため fail-closed。silent skip・"unknown" 埋めは
+    /// しない）。サーバー起動前（シナリオ冒頭）に呼び、ツール不在を早期に
+    /// 判明させる想定。
+    fn version(&self) -> String {
+        let (env_var, default_bin) = match self {
+            HttpClient::Curl => ("CURL_BIN", "curl"),
+            HttpClient::Urllib => ("PYTHON_BIN", "python3"),
+            HttpClient::Fetch => ("NODE_BIN", "node"),
+        };
+        let bin = resolve_tool(env_var, default_bin);
+        let output = Command::new(&bin)
+            .arg("--version")
+            .output()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to spawn {default_bin} (bin={bin:?}) for --version: {e}; \
+                 install it or set {env_var} to an alternative binary"
+                )
+            });
+        if !output.status.success() {
+            panic!(
+                "{bin} --version exited non-zero (status={:?}): stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // Python の一部ビルドは `--version` を stdout ではなく stderr へ
+        // 出す（歴史的経緯。3.4 以降は stdout だが、環境差を吸収するため
+        // stdout が空なら stderr にフォールバックする）。
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let raw_first_line = if stdout.trim().is_empty() {
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        } else {
+            stdout.lines().next().unwrap_or("").to_string()
+        };
+        let sanitized = sanitize_untrusted_first_line(&raw_first_line);
+        if sanitized.trim().is_empty() {
+            panic!(
+                "{bin} --version produced no usable output (stdout={stdout:?}, stderr={:?}); \
+                 install a version that prints a version string or set {env_var} to an \
+                 alternative binary",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        sanitized
+    }
+}
+
+/// untrusted な外部プロセス出力（`--version` の 1 行目）を、意味解釈せず
+/// 印字可能 ASCII のみへ絞り上限 200 バイトへ切り詰める（Issue #778。
+/// `[e2e-record]` 行・PR 本文への転記に使うため、制御文字・非 ASCII の
+/// 混入を防ぐ）。
+fn sanitize_untrusted_first_line(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| (' '..='~').contains(c))
+        .take(200)
+        .collect()
 }
 
 fn json_object(body: &str) -> std::collections::BTreeMap<String, JsonValue> {
@@ -419,9 +494,13 @@ fn assert_valid_session_token(token: &str) {
 /// urllib／fetch への拡張は Issue #777）。curl／urllib／fetch の 3 テストが
 /// 本関数へ委譲することでシナリオ内容の重複を避ける。
 ///
-/// 3 クライアント一括の実行記録・SQL 経路とのパリティは #778／#779 の
-/// スコープ（本 Issue のスコープ外）。
+/// 実行記録（`[e2e-record]`）の出力は Issue #778。SQL 経路とのパリティは
+/// #779 のスコープ（本関数のスコープ外）。
 fn run_session_search_close_scenario(client: HttpClient) {
+    // サーバー起動前（シナリオ冒頭）に取得し、ツール不在を早期に判明させる
+    // （Issue #778）。
+    let client_version = client.version();
+
     let (db_path, _db_guard) = seed_three_tenant_db();
     let users_path = common::write_user_store_file(&[
         ("alice", "tenant-a", "pw-alice"),
@@ -464,10 +543,10 @@ fn run_session_search_close_scenario(client: HttpClient) {
         other => panic!("expected string token field, got {other:?}"),
     };
     assert_valid_session_token(&token);
-    match session_obj.get("expires_in") {
-        Some(JsonValue::Number(_)) => {}
+    let expires_in = match session_obj.get("expires_in") {
+        Some(JsonValue::Number(n)) => n.as_f64(),
         other => panic!("expected numeric expires_in field, got {other:?}"),
-    }
+    };
 
     // 2. search（alice は tenant-a・全行 Public のため RLS 暗黙適用でも
     //    3 行とも可視。クエリ [1,0] に対する cosine は id1=1.0／id2=0.0／
@@ -501,22 +580,27 @@ fn run_session_search_close_scenario(client: HttpClient) {
     assert_eq!(ids, vec![1.0, 2.0, 3.0], "unexpected id set: {body}");
 
     // 3. session close。
-    let (status, body) = client.post(port, "/v1/session/close", Some(&token), "{}", &out_dir, 3);
-    assert_eq!(status, 200, "session close failed: {body}");
+    let (close_status, close_body) =
+        client.post(port, "/v1/session/close", Some(&token), "{}", &out_dir, 3);
+    assert_eq!(close_status, 200, "session close failed: {close_body}");
     assert!(
-        body.contains("\"closed\":true"),
-        "expected closed:true, got: {body}"
+        close_body.contains("\"closed\":true"),
+        "expected closed:true, got: {close_body}"
     );
 
     // 4. 失効後の同一トークン再送は `401`／`28000` で拒否される（Issue #776
     //    の受け入れ条件 R3。close が実際にトークンを失効させたことの
     //    非 vacuous な証跡。`http8_session_close.rs` の同種検証と同じ
     //    `wire_code` 判定基準）。
-    let (status, body) = client.post(port, "/v1/query", Some(&token), search_body, &out_dir, 4);
-    assert_eq!(status, 401, "revoked token must be rejected: {body}");
+    let (revoked_status, revoked_body) =
+        client.post(port, "/v1/query", Some(&token), search_body, &out_dir, 4);
+    assert_eq!(
+        revoked_status, 401,
+        "revoked token must be rejected: {revoked_body}"
+    );
     assert!(
-        body.contains("\"wire_code\":\"28000\""),
-        "expected wire_code 28000 for revoked token, got: {body}"
+        revoked_body.contains("\"wire_code\":\"28000\""),
+        "expected wire_code 28000 for revoked token, got: {revoked_body}"
     );
 
     let seen = server.stop_and_drain(Instant::now() + Duration::from_secs(5));
@@ -537,6 +621,37 @@ fn run_session_search_close_scenario(client: HttpClient) {
         "stderr must not leak tenant id"
     );
     assert!(!joined.contains("alice"), "stderr must not leak username");
+
+    // 実行記録（Issue #778）: PR 本文の Test plan へ転記する 1 行を stderr へ
+    // 出力する（`three_client_e2e.rs` の `[e2e-record]` 先例と同型）。
+    // トークン・ユーザー名・パスワード・テナント id を一切含めないことを
+    // 出力前に機械検証する（`--nocapture` で表示しても安全であることの保証。
+    // 上記の stderr 非漏えい assert とは独立に、この行自体に対しても行う）。
+    let record = format!(
+        "[e2e-record] {label}: client_version={client_version:?} \
+         session(status=200,expires_in={expires_in:?}) \
+         search(status=200,row_count=3,ids={ids:?}) \
+         close(status={close_status},closed=true) \
+         revoked(status={revoked_status},wire_code=28000)",
+        label = client.label(),
+    );
+    assert!(
+        !record.contains(&token),
+        "e2e-record line must not leak the session token"
+    );
+    assert!(
+        !record.contains("alice"),
+        "e2e-record line must not leak username"
+    );
+    assert!(
+        !record.contains("tenant-a"),
+        "e2e-record line must not leak tenant id"
+    );
+    assert!(
+        !record.contains("pw-alice"),
+        "e2e-record line must not leak password"
+    );
+    eprintln!("{record}");
 }
 
 #[test]
