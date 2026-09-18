@@ -44,7 +44,6 @@ def load_round_results(
     out: dict[tuple[str, str], list[dict | None]] = {}
     for r in range(1, rounds + 1):
         round_dir = os.path.join(dir_path, "results", f"{round_dir_prefix}{r}")
-        found_this_round: set[tuple[str, str]] = set()
         for f in sorted(glob.glob(os.path.join(round_dir, "*.json"))):
             base = os.path.basename(f)[: -len(".json")]
             # ファイル名は `{db}_{config}.json`。db 名自体に `_` を含む
@@ -61,7 +60,6 @@ def load_round_results(
             key = (db, config)
             out.setdefault(key, [None] * rounds)
             out[key][r - 1] = data
-            found_this_round.add(key)
     return out
 
 

@@ -1217,9 +1217,10 @@ PR #853）が main に取り込まれた後、`docs/design/benchmark-judgement-p
   1468〜1681µs）、機械全体の輻輳が原因と判断できる——特定フェーズだけが
   悪化していないため、後述の min-of-N 判定はこの影響を受けにくい
 - **ドライバ**: `scripts/bench_crossdb_ab.sh`（新設。`run_all.sh` フル一括を
-  1 ラウンドとみなし `CROSSDB_RUN_TAG=round<N>` で輪番実行する。cand が
-  DB の数だけある構造のため、baseline→cand→baseline→cand... の厳密な 2 arm
-  輪番からの意図的な逸脱——詳細は同スクリプトのコメント参照）
+  1 ラウンドとみなし `CROSSDB_RUN_TAG=<ts>-round<N>`（`<ts>` はセッション
+  起動時刻）で輪番実行する。cand が DB の数だけある構造のため、
+  baseline→cand→baseline→cand... の厳密な 2 arm 輪番からの意図的な
+  逸脱——詳細は同スクリプトのコメント参照）
 - 全 5 ラウンド × 18 arm（self exact/hnsw/nosql・対照 8 系統 exact/hnsw 混在）
   ＝ 90 run すべて成功（`FAILED` 0 件）。生データ一式（絶対パス）は
   `docs/design/bench-data/crossdb-20260918T142251Z-ab/`（`env.txt`・
@@ -1250,9 +1251,15 @@ PR #853）が main に取り込まれた後、`docs/design/benchmark-judgement-p
 | `rls_isolation` | LanceDB exact | 370.8 | 110.3 | 3.36 | self win |
 
 単位は p50 µs。全フェーズの生データ（5 run の値・run-to-run 幅・self との
-比較表）は `scripts/bench_crossdb_ab_summarize.py` の出力そのもの
+比較表）は `scripts/bench_crossdb_ab_summarize.py` の出力
 （`docs/design/bench-data/crossdb-20260918T142251Z-ab/summarize-output.md`
-参照）。改善前（7 敗）・改善後単発対照（2 敗）に対し、**N=5 再計測では
+参照。本ファイルは計測当時の集計スクリプト版で生成したもので、
+`dir=/tmp/crossdb848` という旧セッションのパス表記のまま残置しており、
+後日の堅牢化修正（欠損・非観測の扱い変更）で追加された「非観測」行群は
+含まない。ただし「self との比較」win/loss 表——本節が引用する数値・判定——は
+旧版・新版の集計スクリプトを同一データへ再実行して出力が一致することを
+確認済みで、本節の結論には影響しない）。改善前（7 敗）・改善後単発対照
+（2 敗）に対し、**N=5 再計測では
 確定的な負けは `scan_where_nosort_k500`（測定条件の非対称。既知・対処
 しない）の 1 件のみ**で、`hybrid_rrf`／`bulk_hybrid_k200` は Redis との差が
 run-to-run ノイズ帯に収まり確定的な勝敗を付けられない「僅差」へ後退した
