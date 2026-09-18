@@ -173,6 +173,17 @@ def _ingest_single_stmt(r: "redis.Redis", dim: int, n_rows: int = 1000) -> dict:
     }
 
 
+# FT.HYBRID が「存在しない／構文非対応」として拒否されたときの応答文（RediSearch の
+# unknown command・Syntax error 系）。これ以外の ResponseError（メモリ上限・
+# 実行時エラー）は未対応機能ではないため unsupported へ丸めない。
+_HYBRID_UNAVAILABLE_MARKERS = ("unknown command", "unknown subcommand", "syntax error", "not supported", "unsupported")
+
+
+def _is_hybrid_unavailable(e: redis.exceptions.ResponseError) -> bool:
+    text = str(e).lower()
+    return any(m in text for m in _HYBRID_UNAVAILABLE_MARKERS)
+
+
 def run(args, docs: list[dict], queries: list[dict]) -> dict:
     r = _connect()
     dim = len(docs[0]["embedding"]) if docs else 128
@@ -312,8 +323,12 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     try:
         stats, _ = measure(hybrid, idxs)
         phases["hybrid_rrf"] = stats
-    except Exception as e:  # noqa: BLE001 — ネイティブ機能の実行時エラーを unsupported として記録する
-        phases["hybrid_rrf"] = unsupported(f"FT.HYBRID 実行時エラー: {e!r}")
+    except redis.exceptions.ResponseError as e:
+        # 既知の「機能が無い／構文非対応」応答のみ unsupported へ。接続断・タイムアウト・
+        # 結果処理の例外は fail-closed（そのまま伝播して計測全体を失敗させる）
+        if not _is_hybrid_unavailable(e):
+            raise
+        phases["hybrid_rrf"] = unsupported(f"FT.HYBRID が利用できない: {e}")
 
     phases["mode_recall"] = unsupported("RediSearch にモード切替（recall/precision）の概念が無い")
     phases["mode_precision"] = unsupported("RediSearch にモード切替（recall/precision）の概念が無い")
@@ -368,8 +383,10 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     try:
         stats, last = measure(bulk_hybrid, idxs)
         phases["bulk_hybrid_k200"] = {**stats, "k": 200, "rows_returned": len(last)}
-    except Exception as e:  # noqa: BLE001
-        phases["bulk_hybrid_k200"] = unsupported(f"FT.HYBRID 実行時エラー: {e!r}")
+    except redis.exceptions.ResponseError as e:
+        if not _is_hybrid_unavailable(e):
+            raise
+        phases["bulk_hybrid_k200"] = unsupported(f"FT.HYBRID が利用できない: {e}")
 
     def scan_nosort(_):
         q = (

@@ -225,7 +225,12 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     query_vecs = [[float(x) for x in q["embedding"]] for q in queries]
     query_texts = [q.get("text", "") for q in queries]
 
-    _wait_probe_stable(coll, query_vecs[0], 10)
+    # プローブの期待件数は可視（public）行数に合わせる（可視行が k 未満の fixture でも
+    # 索引準備完了を判定できるように）。可視行 0 件は計測対象として成立しないため拒否する
+    n_public = sum(1 for d in docs if doc_visibility(d) == "public")
+    if n_public == 0:
+        raise RuntimeError("fixture has no public rows; nothing to probe or measure")
+    _wait_probe_stable(coll, query_vecs[0], min(10, n_public))
 
     public_only_filter = {"visibility": {"$eq": "public"}}
     public_only_lang_ja_filter = {"$and": [{"visibility": {"$eq": "public"}}, {"lang": {"$eq": "ja"}}]}

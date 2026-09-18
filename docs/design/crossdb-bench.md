@@ -1151,7 +1151,7 @@ informational 参考値。受け入れ判定はクラスタ構造ありフィク
 - 対象: 既存 5 DB に NoSQL 対照 4 系統（Redis 8.10.1／RediSearch・Elasticsearch 9.1.4・MongoDB Atlas local 8.3.11〔`$vectorSearch`／`$rankFusion`〕・MongoDB Community 8.3.11〔ベクトル検索なし〕）と self の HTTP NoSQL 表層（`self_nosql`）を追加。ハーネスは `scripts/crossdb_bench/`（Issue #846）
 - HEAD `64cb381`・fixture 25,000 行（可視 23,000）・dim 128・warmup 5／iters 50。生データ: `docs/design/bench-data/crossdb-20260918/`
 - 前回（2026-09-08・QEMU x86_64 専有環境）との p50 直接比較は環境差のため行わない。`1deae29..64cb381` の engine に検索経路の性能変更は無い
-- Redis `FT.HYBRID` の RRF WINDOW は 50・ES の RRF retriever は無償ライセンスで 403 のためクライアント側 RRF・ES 2 フェーズは単発 run（exact／hnsw 列で約 30% 乖離）の参考値
+- Redis `FT.HYBRID` の RRF WINDOW は 50。Elasticsearch の RRF retriever（`retriever.rrf`）は無償ライセンスで 403 のため `hybrid_rrf`／`bulk_hybrid_k200` は unsupported（未計測）として記録。Elasticsearch が最速他 DB となる `agg_multi`・`group_by_having` の 2 フェーズは採用 run が 1 回のみ（exact／hnsw 列で約 30% 乖離）の参考値
 
 ### 是正前後の勝敗（p50 µs・対照 DB 越しの順位）
 
@@ -1190,4 +1190,4 @@ informational 参考値。受け入れ判定はクラスタ構造ありフィク
 
 ### 原因分析と是正
 
-フェーズ別の原因（self 側機構と最速他 DB の手法）・A/B 生データ・チップ最適化の考察は `docs/design/crossdb-loss-analysis-20260918.md`（Issue #845）を参照。
+フェーズ別の原因（self 側機構と最速他 DB の手法）・改善後 5 run の A/B 生データ（`docs/design/bench-data/crossdb-20260918-loss-ab/`）・チップ最適化の考察は `docs/design/crossdb-loss-analysis-20260918.md` を参照（Issue #845・PR #853 で追加。本節の「改善後」列はその生データの after 側 5 run median）。

@@ -306,10 +306,43 @@ def _search_id_body(client: EsClient, body: dict) -> list[tuple[int, str]]:
     return [(int(h["_id"]), h["_source"].get("body")) for h in data["hits"]["hits"]]
 
 
-def _try_hybrid_rrf(client: EsClient, qv: list[float], qt: str, config: str, k: int, rank_window: int) -> list[int]:
+class EsFeatureUnavailable(RuntimeError):
+    """ES ネイティブ機能（`retriever.rrf` 等）がライセンス・非対応で使えない場合の
+    例外。呼び出し元（`run`）はこの例外**のみ**を unsupported へ変換し、それ以外の
+    HTTP エラー（429／500／接続断）は fail-closed で計測全体を失敗させる。"""
+
+
+# retriever.rrf がライセンス（無償 basic では 403 security_exception／
+# license 系）または未対応（400 parsing_exception）で拒否されたときの判定。
+_RRF_UNAVAILABLE_STATUS = {400, 403}
+_RRF_UNAVAILABLE_TYPES = ("security_exception", "license", "parsing_exception", "unknown_retriever", "x_content_parse_exception")
+
+
+def _classify_rrf_error(e: EsHttpError) -> EsFeatureUnavailable | None:
+    """既知の「機能が使えない」応答だけを `EsFeatureUnavailable` へ写像する。"""
+    if e.status not in _RRF_UNAVAILABLE_STATUS:
+        return None
+    text = str(e.body)
+    if any(t in text for t in _RRF_UNAVAILABLE_TYPES):
+        return EsFeatureUnavailable(f"retriever.rrf が利用できない（HTTP {e.status}: {text[:200]}）")
+    return None
+
+
+def _try_hybrid_rrf(
+    client: EsClient,
+    qv: list[float],
+    qt: str,
+    config: str,
+    k: int,
+    rank_window: int,
+    *,
+    with_body: bool = False,
+) -> list[int] | list[tuple[int, str]]:
     """ES ネイティブの `retriever.rrf`（standard: match body ＋ knn／
-    script_score のベクトル側）で RRF 融合する。`RuntimeError` は
-    呼び出し元（`run`）が実エラー文付きの unsupported へ変換する。"""
+    script_score のベクトル側）で RRF 融合する。`with_body=True` は広域取得契約
+    （id＋body の Top-N）どおり `_source: ["body"]` で本文も取得して
+    `(id, body)` を返す。機能が使えない既知の応答は `EsFeatureUnavailable` を送出し、
+    それ以外の `EsHttpError` はそのまま伝播する（fail-closed）。"""
     vector_retriever: dict
     if config == "hnsw":
         vector_retriever = {
@@ -354,10 +387,19 @@ def _try_hybrid_rrf(client: EsClient, qv: list[float], qt: str, config: str, k: 
             }
         },
         "size": k,
-        "_source": False,
+        "_source": ["body"] if with_body else False,
     }
-    data = client.json_request("POST", f"/{INDEX}/_search", body)
-    return [int(h["_id"]) for h in data["hits"]["hits"]]
+    try:
+        data = client.json_request("POST", f"/{INDEX}/_search", body)
+    except EsHttpError as e:
+        unavailable = _classify_rrf_error(e)
+        if unavailable is not None:
+            raise unavailable from e
+        raise
+    hits = data["hits"]["hits"]
+    if with_body:
+        return [(int(h["_id"]), h["_source"].get("body")) for h in hits]
+    return [int(h["_id"]) for h in hits]
 
 
 def run(args, docs: list[dict], queries: list[dict]) -> dict:
@@ -453,8 +495,10 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     try:
         stats, _ = measure(hybrid, idxs)
         phases["hybrid_rrf"] = stats
-    except (EsHttpError, RuntimeError) as e:
-        phases["hybrid_rrf"] = unsupported(f"retriever.rrf が利用できない（実エラー: {e}）")
+    except EsFeatureUnavailable as e:
+        # 既知の「機能が使えない」応答のみ unsupported へ。他の HTTP エラー・接続断は
+        # fail-closed（そのまま伝播して計測全体を失敗させる）
+        phases["hybrid_rrf"] = unsupported(str(e))
 
     phases["mode_recall"] = unsupported("Elasticsearch にモード切替（recall/precision）の概念が無い")
     phases["mode_precision"] = unsupported("Elasticsearch にモード切替（recall/precision）の概念が無い")
@@ -478,16 +522,14 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     phases["bulk_knn_where_k200"] = {**stats, "k": 200, "rows_returned": len(last)}
 
     def bulk_hybrid(i):
-        return [
-            (rid, None)
-            for rid in _try_hybrid_rrf(client, query_vecs[i], query_texts[i], args.config, 200, 200)
-        ]
+        # 広域取得契約（id＋body の Top-200）どおり本文も取得する
+        return _try_hybrid_rrf(client, query_vecs[i], query_texts[i], args.config, 200, 200, with_body=True)
 
     try:
         stats, last = measure(bulk_hybrid, idxs)
         phases["bulk_hybrid_k200"] = {**stats, "k": 200, "rows_returned": len(last)}
-    except (EsHttpError, RuntimeError) as e:
-        phases["bulk_hybrid_k200"] = unsupported(f"retriever.rrf が利用できない（実エラー: {e}）")
+    except EsFeatureUnavailable as e:
+        phases["bulk_hybrid_k200"] = unsupported(str(e))
 
     def scan_nosort(_):
         body = {
