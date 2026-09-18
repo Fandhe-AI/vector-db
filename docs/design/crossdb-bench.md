@@ -1177,15 +1177,16 @@ informational 参考値。受け入れ判定はクラスタ構造ありフィク
 
 ### 単文 INSERT の durability 既定値（比較条件の非対称）
 
-`ingest_single_stmt` は self 181 rows/s 対 Redis 3,566 rows/s。self は redb commit ごとの `sync_data` が macOS では `F_FULLFSYNC`（p50 約 4.2 ms。同一ボリュームの `fsync(2)` は約 18 µs）となる一方、対照 DB の既定は次のとおり永続化を待たない。engine 側の既定は変えず、opt-in は Issue #849〜#851 の担当。
+`ingest_single_stmt` は self 181 rows/s 対 Redis 3,566 rows/s。self は redb commit ごとの `sync_data` が macOS では `F_FULLFSYNC`（p50 約 4.2 ms。同一ボリュームの `fsync(2)` は約 18 µs）となる一方、対照 DB の既定は次のとおり（MongoDB Atlas local・PostgreSQL を除き）応答時点で永続化を待たない。engine 側の既定は変えず、opt-in は Issue #849〜#851 の担当。
 
 | DB | 単一書き込みの既定 durability |
 | --- | --- |
 | self（redb） | 毎 commit `Durability::Immediate`（macOS では `F_FULLFSYNC`） |
 | Redis（RediSearch） | AOF 既定無効・周期的 RDB のみ。fsync なし |
 | LanceDB | fsync なし（OS ページキャッシュ止まり） |
-| MongoDB（WiredTiger） | journal（WAL）のみ 100 ms 間隔で flush。データページは checkpoint |
-| SQLite（sqlite-vec） | `synchronous=FULL`。macOS では `F_FULLFSYNC` 優先 |
+| MongoDB Atlas local（`mongodb_db.py`・単一ノード replica set） | 既定 write concern `w:majority`（`writeConcernMajorityJournalDefault=true`）。応答前に journal の永続化を待つ |
+| MongoDB Community（`mongodb_plain_db.py`・standalone） | 既定 write concern `w:1`（`j` 未指定）。journal は 100 ms 間隔で flush し応答時点では永続化を待たない。データページは checkpoint |
+| SQLite（sqlite-vec） | `synchronous=FULL`（`fsync(2)`）。`PRAGMA fullfsync` は既定 OFF で `sqlite_vec_db.py` も有効化しないため macOS でも `F_FULLFSYNC` は使わない |
 | PostgreSQL（pgvector） | `synchronous_commit=on`（WAL fsync） |
 
 ### 原因分析と是正
