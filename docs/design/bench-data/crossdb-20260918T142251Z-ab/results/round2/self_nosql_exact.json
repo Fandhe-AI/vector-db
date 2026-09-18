@@ -1,0 +1,230 @@
+{
+  "meta": {
+    "db": "self_nosql",
+    "version": "wire-server (path=/Users/nancy/fandhe/library/vector-db/.claude/worktrees/wf_18f011bc-517-22/target/release/wire-server; sha256=627b5c53c6a9)",
+    "connection": "loopback TCP (HTTP/1.1 POST /v1/query; 1 request per TCP connection; Connection: close — NoSQL 表層は keep-alive 非対応。crates/wire-server/docs/nosql-api.md「転送路の共通規則」節)",
+    "config": "exact",
+    "rows": 23000,
+    "dim": 128,
+    "timestamp": "2026-09-18T23:28:13+0900",
+    "nproc": 16,
+    "loadavg": [
+      19.61279296875,
+      9.8935546875,
+      6.14599609375
+    ],
+    "python": "3.14.6",
+    "host": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "warmup": 5,
+    "iters": 50,
+    "surface": "nosql",
+    "index": "exact (no index)",
+    "search_engine": "default",
+    "keepalive": false
+  },
+  "phases": {
+    "vector_knn": {
+      "n": 50,
+      "min_us": 536.2918600440025,
+      "p50_us": 733.2079112529755,
+      "p95_us": 922.6673282682896,
+      "p99_us": 988.1658479571342,
+      "mean_us": 741.419093683362,
+      "max_us": 988.1658479571342
+    },
+    "vector_knn_where": {
+      "n": 50,
+      "min_us": 436.79121881723404,
+      "p50_us": 579.7911435365677,
+      "p95_us": 1210.749614983797,
+      "p99_us": 2835.2923691272736,
+      "mean_us": 713.4208548814058,
+      "max_us": 2835.2923691272736
+    },
+    "point_where": {
+      "note": "vector_knn_where と同一クエリ形のため統合（task 指示準拠）",
+      "n": 50,
+      "min_us": 436.79121881723404,
+      "p50_us": 579.7911435365677,
+      "p95_us": 1210.749614983797,
+      "p99_us": 2835.2923691272736,
+      "mean_us": 713.4208548814058,
+      "max_us": 2835.2923691272736
+    },
+    "where_compound_count": {
+      "unsupported": true,
+      "reason": "NoSQL filter[].op は eq/prefix のみで範囲比較演算子が無いため `id > 100` を表現できない（crates/wire-server/docs/nosql-api.md「filter 配列」節）"
+    },
+    "agg_count": {
+      "n": 50,
+      "min_us": 234.75009948015213,
+      "p50_us": 315.9167245030403,
+      "p95_us": 888.1250396370888,
+      "p99_us": 1459.4588428735733,
+      "mean_us": 401.355866342783,
+      "max_us": 1459.4588428735733,
+      "result": 23000
+    },
+    "agg_multi": {
+      "n": 50,
+      "min_us": 326.9580192863941,
+      "p50_us": 414.54238817095757,
+      "p95_us": 1120.5421760678291,
+      "p99_us": 2857.2501614689827,
+      "mean_us": 563.6957939714193,
+      "max_us": 2857.2501614689827,
+      "result": [
+        23000,
+        283511500,
+        12326.58695652174,
+        1,
+        25000
+      ]
+    },
+    "group_by_having": {
+      "note": "NoSQL の GROUP BY には ORDER BY/LIMIT が無いため全件取得（self_db.py は ORDER BY n DESC LIMIT 5）。集計・HAVING 条件は同一",
+      "n": 50,
+      "min_us": 141.5838487446308,
+      "p50_us": 357.33263939619064,
+      "p95_us": 993.3747351169586,
+      "p99_us": 1523.1668949127197,
+      "mean_us": 431.59833177924156,
+      "max_us": 1523.1668949127197,
+      "result": [
+        [
+          "en",
+          15379
+        ],
+        [
+          "ja",
+          7621
+        ]
+      ]
+    },
+    "hybrid_rrf": {
+      "n": 50,
+      "min_us": 1789.250411093235,
+      "p50_us": 2357.250079512596,
+      "p95_us": 4855.624865740538,
+      "p99_us": 10464.124847203493,
+      "mean_us": 2831.357605755329,
+      "max_us": 10464.124847203493
+    },
+    "mode_recall": {
+      "n": 50,
+      "min_us": 813.5423995554447,
+      "p50_us": 1057.2918690741062,
+      "p95_us": 1953.9580680429935,
+      "p99_us": 2555.3330779075623,
+      "mean_us": 1166.7216382920742,
+      "max_us": 2555.3330779075623
+    },
+    "mode_precision": {
+      "n": 50,
+      "min_us": 677.0831532776356,
+      "p50_us": 784.9577814340591,
+      "p95_us": 897.4173106253147,
+      "p99_us": 989.7500276565552,
+      "mean_us": 789.635730907321,
+      "max_us": 989.7500276565552
+    },
+    "bulk_knn_k200": {
+      "n": 50,
+      "min_us": 1005.5419988930225,
+      "p50_us": 1135.5839669704437,
+      "p95_us": 1282.7920727431774,
+      "p99_us": 3961.37498319149,
+      "mean_us": 1197.610953822732,
+      "max_us": 3961.37498319149,
+      "k": 200,
+      "rows_returned": 200,
+      "ef_search": null,
+      "ef_effective": null
+    },
+    "bulk_knn_k1000": {
+      "n": 50,
+      "min_us": 1900.6249494850636,
+      "p50_us": 2235.9169088304043,
+      "p95_us": 2515.3332389891148,
+      "p99_us": 2779.7077782452106,
+      "mean_us": 2245.919117704034,
+      "max_us": 2779.7077782452106,
+      "k": 1000,
+      "rows_returned": 1000,
+      "ef_search": null,
+      "ef_effective": null
+    },
+    "bulk_knn_where_k200": {
+      "n": 50,
+      "min_us": 568.0406466126442,
+      "p50_us": 696.5841166675091,
+      "p95_us": 801.249872893095,
+      "p99_us": 824.4588971138,
+      "mean_us": 699.3824988603592,
+      "max_us": 824.4588971138,
+      "k": 200,
+      "rows_returned": 200,
+      "ef_search": null,
+      "ef_effective": null
+    },
+    "bulk_hybrid_k200": {
+      "n": 50,
+      "min_us": 1780.9169366955757,
+      "p50_us": 2266.1667317152023,
+      "p95_us": 3326.9161358475685,
+      "p99_us": 7876.500021666288,
+      "mean_us": 2455.5082991719246,
+      "max_us": 7876.500021666288,
+      "k": 200,
+      "rows_returned": 200,
+      "ef_search": null,
+      "ef_effective": null,
+      "dense_fetch_k_initial": null,
+      "dense_fetch_k_may_expand": null
+    },
+    "scan_where_nosort_k500": {
+      "n": 50,
+      "min_us": 753.4581236541271,
+      "p50_us": 990.3330355882645,
+      "p95_us": 2470.2497757971287,
+      "p99_us": 6800.66691711545,
+      "mean_us": 1285.408427938819,
+      "max_us": 6800.66691711545,
+      "k": 500,
+      "rows_returned": 500
+    },
+    "rls_isolation": {
+      "n": 50,
+      "min_us": 162.1670089662075,
+      "p50_us": 172.66720533370972,
+      "p95_us": 874.2078207433224,
+      "p99_us": 1634.374726563692,
+      "mean_us": 249.6358659118414,
+      "max_us": 1634.374726563692,
+      "tenant_b_count": 23000
+    },
+    "udf_call": {
+      "unsupported": true,
+      "reason": "宣言的 UDF 呼び出し（CREATE FUNCTION 相当）は NoSQL op 許可リスト （search/scan/aggregate/insert）に対応形が無い（crates/wire-server/docs/nosql-api.md「SQL ↔ NoSQL 対応表」節）"
+    },
+    "explain": {
+      "unsupported": true,
+      "reason": "vector 指定の検索への explain:true は 42601 で拒否される契約（plan 検索の EXPLAIN は LLM プランナー未接続のため対象外。crates/wire-server/docs/nosql-api.md「explain」節）"
+    },
+    "ingest_bulk": {
+      "unsupported": true,
+      "reason": "op: insert の rows 配列は 1 要求あたり既定上限 64 行（INDEX-4 ①。VECTOR_DB_BATCH_MAX_FILES で上書き可能）であり、feature_bench.rs の ingest_bulk（ファイル形一括投入）に相当する規模の意味論を持たない（crates/wire-server/docs/nosql-api.md「insert」節）"
+    },
+    "ingest_single_stmt": {
+      "rows": 1000,
+      "seconds": 5.830873082857579,
+      "rows_per_sec": 171.50090317347855,
+      "commit_granularity": "per_request"
+    },
+    "recall_at_10": {
+      "recall_at_10": 1.0,
+      "recall_at_10_strict": 1.0,
+      "queries": 200
+    }
+  }
+}

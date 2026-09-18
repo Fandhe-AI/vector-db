@@ -1,0 +1,224 @@
+{
+  "meta": {
+    "db": "lancedb",
+    "version": "lancedb 0.38.0",
+    "connection": "in-process",
+    "config": "hnsw",
+    "rows": 25000,
+    "dim": 128,
+    "timestamp": "2026-09-18T23:23:29+0900",
+    "nproc": 16,
+    "loadavg": [
+      4.85546875,
+      3.97119140625,
+      3.6806640625
+    ],
+    "python": "3.14.6",
+    "host": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "warmup": 5,
+    "iters": 50,
+    "index": "IVF_HNSW_FLAT(m=16,ef_construction=100,ef=64)",
+    "storage": "per-run temp dir under --workdir (removed on exit)"
+  },
+  "phases": {
+    "ingest_bulk": {
+      "rows": 25000,
+      "seconds": 0.10944649996235967,
+      "rows_per_sec": 228422.10585626663
+    },
+    "vector_knn": {
+      "n": 50,
+      "min_us": 1468.4582129120827,
+      "p50_us": 1544.2082658410072,
+      "p95_us": 2020.999789237976,
+      "p99_us": 2629.584167152643,
+      "mean_us": 1603.1549405306578,
+      "max_us": 2629.584167152643
+    },
+    "vector_knn_where": {
+      "n": 50,
+      "min_us": 1834.4996497035027,
+      "p50_us": 2342.33308583498,
+      "p95_us": 2793.333027511835,
+      "p99_us": 3127.624746412039,
+      "mean_us": 2343.3032631874084,
+      "max_us": 3127.624746412039
+    },
+    "point_where": {
+      "note": "vector_knn_where と同一クエリ形のため統合",
+      "n": 50,
+      "min_us": 1834.4996497035027,
+      "p50_us": 2342.33308583498,
+      "p95_us": 2793.333027511835,
+      "p99_us": 3127.624746412039,
+      "mean_us": 2343.3032631874084,
+      "max_us": 3127.624746412039
+    },
+    "where_compound_count": {
+      "n": 50,
+      "min_us": 583.5830233991146,
+      "p50_us": 608.0423481762409,
+      "p95_us": 634.457916021347,
+      "p99_us": 649.9579176306725,
+      "mean_us": 610.7091624289751,
+      "max_us": 649.9579176306725,
+      "result": 7599
+    },
+    "agg_count": {
+      "n": 50,
+      "min_us": 353.1668335199356,
+      "p50_us": 373.6671060323715,
+      "p95_us": 390.3340548276901,
+      "p99_us": 396.4160569012165,
+      "mean_us": 373.2367046177387,
+      "max_us": 396.4160569012165,
+      "result": 23000
+    },
+    "agg_multi": {
+      "n": 50,
+      "min_us": 5410.7909090816975,
+      "p50_us": 5610.290914773941,
+      "p95_us": 5981.500260531902,
+      "p99_us": 6408.874876797199,
+      "mean_us": 5661.01829521358,
+      "max_us": 6408.874876797199,
+      "result": [
+        23000,
+        283511500,
+        12326.58695652174,
+        1,
+        25000
+      ]
+    },
+    "group_by_having": {
+      "n": 50,
+      "min_us": 6380.916107445955,
+      "p50_us": 6748.334039002657,
+      "p95_us": 7114.416919648647,
+      "p99_us": 7227.208930999041,
+      "mean_us": 6767.937559634447,
+      "max_us": 7227.208930999041,
+      "result": [
+        [
+          "en",
+          15379
+        ],
+        [
+          "ja",
+          7621
+        ]
+      ]
+    },
+    "hybrid_rrf": {
+      "n": 50,
+      "min_us": 2129.3750032782555,
+      "p50_us": 2299.1662845015526,
+      "p95_us": 2579.000312834978,
+      "p99_us": 3003.3751390874386,
+      "mean_us": 2338.4600412100554,
+      "max_us": 3003.3751390874386
+    },
+    "bulk_knn_k200": {
+      "n": 50,
+      "min_us": 2273.417077958584,
+      "p50_us": 2490.3747253119946,
+      "p95_us": 2982.12468624115,
+      "p99_us": 5582.500249147415,
+      "mean_us": 2585.749039426446,
+      "max_us": 5582.500249147415,
+      "k": 200,
+      "rows_returned": 200,
+      "ef": 200
+    },
+    "bulk_knn_k1000": {
+      "n": 50,
+      "min_us": 3265.5405811965466,
+      "p50_us": 3562.7498291432858,
+      "p95_us": 4153.291694819927,
+      "p99_us": 4952.082876116037,
+      "mean_us": 3642.0707777142525,
+      "max_us": 4952.082876116037,
+      "k": 1000,
+      "rows_returned": 1000,
+      "ef": 1000
+    },
+    "bulk_knn_where_k200": {
+      "n": 50,
+      "min_us": 2556.41620606184,
+      "p50_us": 3267.08285138011,
+      "p95_us": 3979.1250601410866,
+      "p99_us": 4279.582761228085,
+      "mean_us": 3255.629064515233,
+      "max_us": 4279.582761228085,
+      "k": 200,
+      "rows_returned": 200,
+      "ef": 200
+    },
+    "bulk_hybrid_k200": {
+      "n": 50,
+      "min_us": 3292.874898761511,
+      "p50_us": 3778.624814003706,
+      "p95_us": 4142.625257372856,
+      "p99_us": 4151.707980781794,
+      "mean_us": 3791.5924936532974,
+      "max_us": 4151.707980781794,
+      "k": 200,
+      "rows_returned": 200,
+      "ef": 200
+    },
+    "scan_where_nosort_k500": {
+      "n": 50,
+      "min_us": 1315.2500614523888,
+      "p50_us": 1390.1670463383198,
+      "p95_us": 1499.250065535307,
+      "p99_us": 1583.1668861210346,
+      "mean_us": 1399.315893650055,
+      "max_us": 1583.1668861210346,
+      "k": 500,
+      "rows_returned": 500
+    },
+    "mode_recall": {
+      "unsupported": true,
+      "reason": "LanceDB にモード切替（recall/precision）の概念が無い"
+    },
+    "mode_precision": {
+      "unsupported": true,
+      "reason": "LanceDB にモード切替（recall/precision）の概念が無い"
+    },
+    "udf_call": {
+      "unsupported": true,
+      "reason": "自作 DB の宣言的 UDF 呼び出し相当の機能が無い"
+    },
+    "rls_isolation": {
+      "n": 50,
+      "min_us": 363.41696977615356,
+      "p50_us": 380.66692650318146,
+      "p95_us": 413.33306580781937,
+      "p99_us": 439.58378955721855,
+      "mean_us": 383.01088847219944,
+      "max_us": 439.58378955721855,
+      "tenant_b_count": 23000,
+      "note": "LanceDB にテナント別セッションの概念が無いため agg_count と同一フィルタで再実行（値の一致確認用）"
+    },
+    "explain": {
+      "n": 50,
+      "min_us": 290.16612097620964,
+      "p50_us": 309.7918815910816,
+      "p95_us": 365.66611379384995,
+      "p99_us": 384.9170170724392,
+      "mean_us": 318.4407763183117,
+      "max_us": 384.9170170724392,
+      "sample_output": "ProjectionExec: expr=[id@2 as id, vector@3 as vector, tenant@4 as tenant, visibility@5 as visibility, lang@6 as lang, topic@7 as topic, body@8 as body, _distance@0 as _distance]\n  LanceRead: uri=tmp/crossdb848/lancedb_bench_67978_liqpjagh/docs.lance/data, projection=[id, vector, tenant, visibility, lang, topic, body], source=stream(_rowid)\n    SortExec: TopK(fetch=10), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST], preserve_partitioning=[false]\n      ANNSubIndex: name=vector_idx, k=10, deltas=1, metric=Dot\n        ANNIvfPartition: uuid=2570148e-3051-412a-a5eb-acd95a06d7cb, minimum_nprobes=20, maximum_nprobes=Some(20), deltas=1\n        LanceRead: uri=tmp/crossdb848/lancedb_bench_67978_liqpjagh/docs.lance/data, projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=visibility = Utf8(\"public\"), refine_filter=visibility = Utf8(\"public\")\n"
+    },
+    "ingest_single_stmt": {
+      "rows": 1000,
+      "seconds": 1.3043792080134153,
+      "rows_per_sec": 766.6482215114511
+    },
+    "recall_at_10": {
+      "recall_at_10": 0.8345,
+      "recall_at_10_strict": 0.619,
+      "queries": 200
+    }
+  }
+}

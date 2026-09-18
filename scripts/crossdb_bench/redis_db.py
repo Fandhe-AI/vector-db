@@ -22,6 +22,7 @@ VSIM 句 = KNN、COMBINE RRF）をネイティブ機能として計測する。
 
 from __future__ import annotations
 
+import os
 import struct
 import time
 
@@ -48,6 +49,26 @@ HOST = "127.0.0.1"
 # 既定値 36379 は containers.sh の `${CROSSDB_REDIS_PORT:-36379}` と一致させること。
 PORT = env_port("CROSSDB_REDIS_PORT", 36379)
 INDEX = "docs_idx"
+
+
+def _hybrid_window(default: int) -> int:
+    """`hybrid_rrf` フェーズの RRF `WINDOW` を診断目的で上書きする opt-in
+    （Issue #848。self の hybrid_rrf は既定でプール深さ 200〔`hybrid.rs::
+    RrfConfig::default`〕を使うため、Redis 側の既定 WINDOW=50 との条件差が
+    negative の主因かを切り分けるための informational 追加 arm）。
+
+    本番スコアボードの計測条件（WINDOW=50）を変えないため、未設定・空文字
+    なら必ず `default` を返す。設定時は 1 以上の 10 進整数のみ受理し、
+    不正値は fail-closed に `ValueError` で拒否する（`env_port` と同方針）。
+    """
+    raw = os.environ.get("CROSSDB_REDIS_HYBRID_WINDOW")
+    if raw is None or raw == "":
+        return default
+    if not (raw.isascii() and raw.isdigit()) or int(raw) < 1:
+        raise ValueError(f"CROSSDB_REDIS_HYBRID_WINDOW must be a positive integer (got: {raw!r})")
+    return int(raw)
+
+
 PREFIX = "doc:"
 
 
@@ -312,7 +333,7 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
             filter=HybridFilter("@visibility:{public}"),
         )
         hq = HybridQuery(sq, vq)
-        combine = CombineResultsMethod(CombinationMethods.RRF, WINDOW=50)
+        combine = CombineResultsMethod(CombinationMethods.RRF, WINDOW=_hybrid_window(50))
         pp = HybridPostProcessingConfig().load("@id").limit(0, 10)
         res = r.ft(INDEX).hybrid_search(
             hq, combine_method=combine, post_processing=pp, params_substitution={"vec": _vec_bytes(qv)}

@@ -1,0 +1,174 @@
+{
+  "meta": {
+    "db": "mysql",
+    "version": "MySQL 9.7.2",
+    "connection": "loopback TCP (mysql-connector-python)",
+    "config": "none (ANN 索引・KNN 関数が存在しないため索引構成の区別なし)",
+    "rows": 25000,
+    "dim": 128,
+    "timestamp": "2026-09-18T23:33:44+0900",
+    "nproc": 16,
+    "loadavg": [
+      7.087890625,
+      8.70849609375,
+      6.88916015625
+    ],
+    "python": "3.14.6",
+    "host": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "warmup": 5,
+    "iters": 50
+  },
+  "phases": {
+    "ingest_bulk": {
+      "rows": 25000,
+      "seconds": 1.3145622909069061,
+      "rows_per_sec": 19017.737061933138
+    },
+    "vector_knn": {
+      "unsupported": true,
+      "reason": "VECTOR 型は作成できるが KNN 用の DISTANCE() 関数が存在しない（実機確認: ERROR 1305 (42000): FUNCTION bench.DISTANCE does not exist）"
+    },
+    "vector_knn_where": {
+      "unsupported": true,
+      "reason": "VECTOR 型は作成できるが KNN 用の DISTANCE() 関数が存在しない（実機確認: ERROR 1305 (42000): FUNCTION bench.DISTANCE does not exist）"
+    },
+    "point_where": {
+      "unsupported": true,
+      "reason": "VECTOR 型は作成できるが KNN 用の DISTANCE() 関数が存在しない（実機確認: ERROR 1305 (42000): FUNCTION bench.DISTANCE does not exist）"
+    },
+    "hybrid_rrf": {
+      "unsupported": true,
+      "reason": "VECTOR 型は作成できるが KNN 用の DISTANCE() 関数が存在しない（実機確認: ERROR 1305 (42000): FUNCTION bench.DISTANCE does not exist）（hybrid は KNN 側が成立しないため対象外）"
+    },
+    "mode_recall": {
+      "unsupported": true,
+      "reason": "MySQL にモード切替（recall/precision）の概念が無い"
+    },
+    "mode_precision": {
+      "unsupported": true,
+      "reason": "MySQL にモード切替（recall/precision）の概念が無い"
+    },
+    "udf_call": {
+      "unsupported": true,
+      "reason": "自作 DB の宣言的 UDF 呼び出し相当の機能が無い"
+    },
+    "_ann_index_note": "CREATE VECTOR INDEX は構文エラー（実機確認: ERROR 1064 (42000): syntax error near 'VECTOR INDEX ...'）",
+    "where_compound_count": {
+      "n": 50,
+      "min_us": 3406.667150557041,
+      "p50_us": 3579.7497257590294,
+      "p95_us": 3944.499883800745,
+      "p99_us": 4238.1673119962215,
+      "mean_us": 3610.376650467515,
+      "max_us": 4238.1673119962215,
+      "result": 7599
+    },
+    "agg_count": {
+      "n": 50,
+      "min_us": 2089.2079919576645,
+      "p50_us": 2189.9580024182796,
+      "p95_us": 2302.9157891869545,
+      "p99_us": 2548.833843320608,
+      "mean_us": 2201.8798626959324,
+      "max_us": 2548.833843320608,
+      "result": 23000
+    },
+    "agg_multi": {
+      "n": 50,
+      "min_us": 2600.916661322117,
+      "p50_us": 2767.79243722558,
+      "p95_us": 2885.2499090135098,
+      "p99_us": 2938.167192041874,
+      "mean_us": 2760.691698640585,
+      "max_us": 2938.167192041874,
+      "result": [
+        23000.0,
+        283511500.0,
+        12326.587,
+        1.0,
+        25000.0
+      ]
+    },
+    "group_by_having": {
+      "n": 50,
+      "min_us": 12457.417324185371,
+      "p50_us": 13349.291868507862,
+      "p95_us": 13535.74963286519,
+      "p99_us": 13643.624726682901,
+      "mean_us": 13158.634072169662,
+      "max_us": 13643.624726682901,
+      "result": [
+        [
+          "en",
+          15379
+        ],
+        [
+          "ja",
+          7621
+        ]
+      ]
+    },
+    "bulk_knn_k200": {
+      "unsupported": true,
+      "reason": "VECTOR 型は作成できるが KNN 用の DISTANCE() 関数が存在しない（実機確認: ERROR 1305 (42000): FUNCTION bench.DISTANCE does not exist）"
+    },
+    "bulk_knn_k1000": {
+      "unsupported": true,
+      "reason": "VECTOR 型は作成できるが KNN 用の DISTANCE() 関数が存在しない（実機確認: ERROR 1305 (42000): FUNCTION bench.DISTANCE does not exist）"
+    },
+    "bulk_knn_where_k200": {
+      "unsupported": true,
+      "reason": "VECTOR 型は作成できるが KNN 用の DISTANCE() 関数が存在しない（実機確認: ERROR 1305 (42000): FUNCTION bench.DISTANCE does not exist）"
+    },
+    "bulk_hybrid_k200": {
+      "unsupported": true,
+      "reason": "VECTOR 型は作成できるが KNN 用の DISTANCE() 関数が存在しない（実機確認: ERROR 1305 (42000): FUNCTION bench.DISTANCE does not exist）（hybrid は KNN 側が成立しないため対象外）"
+    },
+    "scan_where_nosort_k500": {
+      "n": 50,
+      "min_us": 1312.9999861121178,
+      "p50_us": 1899.0421667695045,
+      "p95_us": 2941.4170421659946,
+      "p99_us": 3268.1250013411045,
+      "mean_us": 2023.0600703507662,
+      "max_us": 3268.1250013411045,
+      "k": 500,
+      "rows_returned": 500
+    },
+    "rls_isolation": {
+      "n": 50,
+      "min_us": 1988.2917404174805,
+      "p50_us": 2173.583023250103,
+      "p95_us": 2256.2500089406967,
+      "p99_us": 2282.66604244709,
+      "mean_us": 2165.162432938814,
+      "max_us": 2282.66604244709,
+      "tenant_b_count": 23000,
+      "note": "MySQL にテナント別セッションの概念が無いため agg_count と同一フィルタで再実行（値の一致確認用）"
+    },
+    "explain": {
+      "n": 50,
+      "min_us": 473.87462109327316,
+      "p50_us": 604.3747998774052,
+      "p95_us": 949.2919780313969,
+      "p99_us": 6987.167056649923,
+      "mean_us": 740.0533650070429,
+      "max_us": 6987.167056649923,
+      "sample_output": [
+        [
+          "-> Filter: (docs.visibility = 'public')  (cost=416 rows=4154)\n    -> Index lookup on docs using docs_lang_idx (lang = 'ja')  (cost=416 rows=8309)\n"
+        ]
+      ]
+    },
+    "ingest_single_stmt": {
+      "rows": 1000,
+      "seconds": 1.0331987501122057,
+      "rows_per_sec": 967.8679923793942,
+      "commit_granularity": "per_statement"
+    },
+    "recall_at_10": {
+      "unsupported": true,
+      "reason": "vector_knn が unsupported、または docs ファイルが見つからない"
+    }
+  }
+}

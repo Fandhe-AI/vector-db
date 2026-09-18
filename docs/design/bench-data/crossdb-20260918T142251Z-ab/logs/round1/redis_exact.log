@@ -1,0 +1,23 @@
+/Users/nancy/fandhe/library/vector-db/.claude/worktrees/wf_18f011bc-517-22/scripts/crossdb_bench/redis_db.py:325: UserWarning: HybridSearchQuery is an experimental and may change or be removed in future versions.
+  sq = HybridSearchQuery(f"(@visibility:{{public}}) @body:({terms})")
+/Users/nancy/fandhe/library/vector-db/.claude/worktrees/wf_18f011bc-517-22/scripts/crossdb_bench/redis_db.py:331: UserWarning: HybridFilter is an experimental and may change or be removed in future versions.
+  filter=HybridFilter("@visibility:{public}"),
+/Users/nancy/fandhe/library/vector-db/.claude/worktrees/wf_18f011bc-517-22/scripts/crossdb_bench/redis_db.py:326: UserWarning: HybridVsimQuery is an experimental and may change or be removed in future versions.
+  vq = HybridVsimQuery(
+/Users/nancy/fandhe/library/vector-db/.claude/worktrees/wf_18f011bc-517-22/scripts/crossdb_bench/redis_db.py:334: UserWarning: CombineResultsMethod is an experimental and may change or be removed in future versions.
+  combine = CombineResultsMethod(CombinationMethods.RRF, WINDOW=_hybrid_window(50))
+/Users/nancy/fandhe/library/vector-db/.claude/worktrees/wf_18f011bc-517-22/scripts/crossdb_bench/redis_db.py:335: UserWarning: HybridPostProcessingConfig is an experimental and may change or be removed in future versions.
+  pp = HybridPostProcessingConfig().load("@id").limit(0, 10)
+/private/tmp/crossdb848/venv/lib/python3.14/site-packages/redis/utils.py:463: UserWarning: Call to experimental method hybrid_search. Be aware that the function arguments can change or be removed in future versions.
+  warn_experimental(func.__name__, stacklevel=2)
+/Users/nancy/fandhe/library/vector-db/.claude/worktrees/wf_18f011bc-517-22/scripts/crossdb_bench/redis_db.py:386: UserWarning: HybridSearchQuery is an experimental and may change or be removed in future versions.
+  sq = HybridSearchQuery(f"(@visibility:{{public}}) @body:({terms})")
+/Users/nancy/fandhe/library/vector-db/.claude/worktrees/wf_18f011bc-517-22/scripts/crossdb_bench/redis_db.py:392: UserWarning: HybridFilter is an experimental and may change or be removed in future versions.
+  filter=HybridFilter("@visibility:{public}"),
+/Users/nancy/fandhe/library/vector-db/.claude/worktrees/wf_18f011bc-517-22/scripts/crossdb_bench/redis_db.py:387: UserWarning: HybridVsimQuery is an experimental and may change or be removed in future versions.
+  vq = HybridVsimQuery(
+/Users/nancy/fandhe/library/vector-db/.claude/worktrees/wf_18f011bc-517-22/scripts/crossdb_bench/redis_db.py:395: UserWarning: CombineResultsMethod is an experimental and may change or be removed in future versions.
+  combine = CombineResultsMethod(CombinationMethods.RRF, WINDOW=200)
+/Users/nancy/fandhe/library/vector-db/.claude/worktrees/wf_18f011bc-517-22/scripts/crossdb_bench/redis_db.py:396: UserWarning: HybridPostProcessingConfig is an experimental and may change or be removed in future versions.
+  pp = HybridPostProcessingConfig().load("@id", "@body").limit(0, 200)
+wrote: /tmp/crossdb848/results/round1/redis_exact.json

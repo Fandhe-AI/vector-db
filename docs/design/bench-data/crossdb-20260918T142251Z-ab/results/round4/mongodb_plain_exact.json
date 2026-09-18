@@ -1,0 +1,191 @@
+{
+  "meta": {
+    "db": "mongodb_plain",
+    "version": "mongodb 8.3.11 (image mongo:8, mongot 非搭載)",
+    "connection": "pymongo (loopback TCP)",
+    "config": "exact",
+    "rows": 25000,
+    "dim": 128,
+    "timestamp": "2026-09-18T23:41:01+0900",
+    "nproc": 16,
+    "loadavg": [
+      5.732421875,
+      6.19091796875,
+      6.27685546875
+    ],
+    "python": "3.14.6",
+    "host": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "warmup": 5,
+    "iters": 50,
+    "distance": "dot product ($zip+$reduce による自前計算。ネイティブベクトル検索なし)",
+    "indexes": [
+      "visibility",
+      "lang",
+      "topic",
+      "(visibility,lang)",
+      "(visibility,topic)"
+    ],
+    "row_count_after_ingest": 26000
+  },
+  "phases": {
+    "ingest_bulk": {
+      "rows": 25000,
+      "seconds": 0.3238034169189632,
+      "rows_per_sec": 77207.33844589612
+    },
+    "vector_knn": {
+      "unsupported": true,
+      "reason": "mongot（Atlas Search）非搭載イメージ（mongo:8）のため $vectorSearch が使えず、ベクトル検索機能そのものが無い"
+    },
+    "vector_knn_where": {
+      "unsupported": true,
+      "reason": "mongot（Atlas Search）非搭載イメージ（mongo:8）のため $vectorSearch が使えず、ベクトル検索機能そのものが無い"
+    },
+    "point_where": {
+      "note": "vector_knn_where と同一クエリ形のため統合",
+      "unsupported": true,
+      "reason": "mongot（Atlas Search）非搭載イメージ（mongo:8）のため $vectorSearch が使えず、ベクトル検索機能そのものが無い"
+    },
+    "bulk_knn_k200": {
+      "unsupported": true,
+      "reason": "mongot（Atlas Search）非搭載イメージ（mongo:8）のため $vectorSearch が使えず、ベクトル検索機能そのものが無い"
+    },
+    "bulk_knn_k1000": {
+      "unsupported": true,
+      "reason": "mongot（Atlas Search）非搭載イメージ（mongo:8）のため $vectorSearch が使えず、ベクトル検索機能そのものが無い"
+    },
+    "bulk_knn_where_k200": {
+      "unsupported": true,
+      "reason": "mongot（Atlas Search）非搭載イメージ（mongo:8）のため $vectorSearch が使えず、ベクトル検索機能そのものが無い"
+    },
+    "bulk_hybrid_k200": {
+      "unsupported": true,
+      "reason": "ベクトル検索機能が無いため hybrid（ベクトル+全文検索の RRF 融合）も構成不能"
+    },
+    "hybrid_rrf": {
+      "unsupported": true,
+      "reason": "ベクトル検索機能が無く、かつ mongot（Atlas Search）非搭載のため全文検索 $search も使えない（DB ネイティブ hybrid/RRF 機能を計測する task 指示のため対象外）"
+    },
+    "mode_recall": {
+      "unsupported": true,
+      "reason": "MongoDB にモード切替（recall/precision）の概念が無い"
+    },
+    "mode_precision": {
+      "unsupported": true,
+      "reason": "MongoDB にモード切替（recall/precision）の概念が無い"
+    },
+    "udf_call": {
+      "unsupported": true,
+      "reason": "自作 DB の宣言的 UDF 呼び出し相当の機能が無い"
+    },
+    "vector_knn_pipeline_bruteforce": {
+      "n": 50,
+      "min_us": 550949.2917917669,
+      "p50_us": 564010.5828642845,
+      "p95_us": 584645.5828286707,
+      "p99_us": 587152.7078561485,
+      "mean_us": 565901.2557938695,
+      "max_us": 587152.7078561485,
+      "k": 10,
+      "recall_at_10_self_computed": 1.0,
+      "recall_at_10_strict_self_computed": 0.96,
+      "note": "$vectorSearch ではなく $zip+$reduce による内積の集約パイプライン（索引を使わない総当たり全件走査）。DB ネイティブのベクトル検索機能ではない。recall は run.py のvector_knn ゲート対象外のためここで自己計算する"
+    },
+    "where_compound_count": {
+      "n": 50,
+      "min_us": 2630.542032420635,
+      "p50_us": 2791.0834178328514,
+      "p95_us": 2905.7920910418034,
+      "p99_us": 2953.500021249056,
+      "mean_us": 2782.4674546718597,
+      "max_us": 2953.500021249056,
+      "result": 7599
+    },
+    "agg_count": {
+      "n": 50,
+      "min_us": 2245.8327002823353,
+      "p50_us": 2391.2498727440834,
+      "p95_us": 2755.291759967804,
+      "p99_us": 3611.708991229534,
+      "mean_us": 2420.7040946930647,
+      "max_us": 3611.708991229534,
+      "result": 23000
+    },
+    "agg_multi": {
+      "n": 50,
+      "min_us": 9517.958853393793,
+      "p50_us": 9910.583030432463,
+      "p95_us": 10351.540986448526,
+      "p99_us": 10627.042036503553,
+      "mean_us": 9947.693357244134,
+      "max_us": 10627.042036503553,
+      "result": {
+        "count": 23000,
+        "sum_id": 283511500,
+        "avg_id": 12326.58695652174,
+        "min_id": 1,
+        "max_id": 25000
+      }
+    },
+    "group_by_having": {
+      "n": 50,
+      "min_us": 3970.166202634573,
+      "p50_us": 4160.6249287724495,
+      "p95_us": 4385.875072330236,
+      "p99_us": 4411.958623677492,
+      "mean_us": 4180.5116180330515,
+      "max_us": 4411.958623677492,
+      "result": [
+        [
+          "en",
+          15379
+        ],
+        [
+          "ja",
+          7621
+        ]
+      ]
+    },
+    "scan_where_nosort_k500": {
+      "n": 50,
+      "min_us": 1219.6670286357403,
+      "p50_us": 1340.6658545136452,
+      "p95_us": 2019.7909325361252,
+      "p99_us": 4059.332888573408,
+      "mean_us": 1484.435023739934,
+      "max_us": 4059.332888573408,
+      "k": 500,
+      "rows_returned": 500
+    },
+    "rls_isolation": {
+      "n": 50,
+      "min_us": 2193.707972764969,
+      "p50_us": 2281.8748839199543,
+      "p95_us": 2417.2919802367687,
+      "p99_us": 2457.499969750643,
+      "mean_us": 2293.7284130603075,
+      "max_us": 2457.499969750643,
+      "tenant_b_count": 23000,
+      "note": "MongoDB にテナント別セッションの概念が無いため agg_count と同一フィルタで再実行（値の一致確認用）"
+    },
+    "explain": {
+      "n": 50,
+      "min_us": 939.7082030773163,
+      "p50_us": 1141.5001936256886,
+      "p95_us": 1495.7920648157597,
+      "p99_us": 2631.2503032386303,
+      "mean_us": 1225.0533234328032,
+      "max_us": 2631.2503032386303,
+      "winning_plan_stage": "LIMIT"
+    },
+    "ingest_single_stmt": {
+      "rows": 1000,
+      "seconds": 0.2948256251402199,
+      "rows_per_sec": 3391.8354265318594
+    },
+    "recall_at_10": {
+      "unsupported": true,
+      "reason": "vector_knn が unsupported、または docs ファイルが見つからない"
+    }
+  }
+}

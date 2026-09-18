@@ -390,10 +390,16 @@ Metal・CUDA・ROCm）を投入してもそこには到達しない。逆に dot
 - **ES の交互再計測**: `report-elasticsearch.md` は ES 対照値を単発 run で取得しており、
   `agg_count`／`rls_isolation` 系と同様に exact/hnsw 列で ±30% 程度の乖離が生じうる
   （`docs/design/scan-stage-profile.md` の既存所見）。ES を含む再計測時は交互 N≥5 ペアでの
-  再取得が望ましい。
+  再取得が望ましい。**Issue #848 で解消済み**: self・ES を含む全対照 DB を交互 N=5
+  ラウンドで再計測した結果、ES の run-to-run 幅は N=5 でも `agg_multi` 171.1%・
+  `group_by_having` 120.1% と単発 run の ±30% 所見を上回る大きさだったが、self の
+  優位幅（2.6〜9.2 倍）がこの幅を大きく上回るため勝敗判定は揺らがなかった。詳細は
+  `docs/design/crossdb-bench.md`「再計測（Issue #848）」節参照。
 - **pub フィールド追加の記録**: §4.2 で `sql/aggregate.rs::count_star_only` の不変条件
   ドキュメントを追加・`sql/group_by.rs::observe_group_count_only` を新設した。公開 API
   シグネチャ変更は無い（いずれも `pub(crate)`）。
-- **スコアボード更新**: 本 doc の是正後、`docs/design/crossdb-bench.md` のスコアボードを
-  2026-09-18 実測値のまま「6 フェーズ是正済み（本 doc 参照）」として更新することをオーナー
-  へ申し送る（crossdb ハーネス自体の再実行は別途必要）。
+- **スコアボード更新**: **Issue #848 で解消済み**。crossdb ハーネスを是正後の main
+  （`0ab63b3`）で再実行し、`docs/design/crossdb-bench.md`「再計測（Issue #848）」節へ
+  N=5 実測のスコアボードを追記した。確定的な負けは `scan_where_nosort_k500`（測定条件の
+  非対称。§5 参照）の 1 件のみへ縮小し、`hybrid_rrf`／`bulk_hybrid_k200` は run-to-run
+  ノイズ帯内の「僅差」（確定判定不能）となった。

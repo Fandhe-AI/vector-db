@@ -1,0 +1,190 @@
+{
+  "meta": {
+    "db": "qdrant",
+    "version": "qdrant 1.19.1 (image qdrant/qdrant:latest)",
+    "connection": "gRPC",
+    "config": "hnsw",
+    "rows": 25000,
+    "dim": 128,
+    "timestamp": "2026-09-18T23:37:55+0900",
+    "nproc": 16,
+    "loadavg": [
+      4.82177734375,
+      6.59814453125,
+      6.4140625
+    ],
+    "python": "3.14.6",
+    "host": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "warmup": 5,
+    "iters": 50,
+    "distance": "DOT",
+    "hnsw_config": {
+      "m": 16,
+      "ef_construct": 100
+    },
+    "search_params": "hnsw_ef=64",
+    "points_count": 25000
+  },
+  "phases": {
+    "ingest_bulk": {
+      "rows": 25000,
+      "seconds": 1.5095057501457632,
+      "rows_per_sec": 16561.712333713145,
+      "note": "payload に body を追加（bulk_* フェーズの本文返却用。他 DB の投入内容と同等化）"
+    },
+    "index_build": {
+      "seconds": 0.5084462920203805,
+      "final_status": "green",
+      "indexed_vectors_count": 25000
+    },
+    "vector_knn": {
+      "n": 50,
+      "min_us": 644.5408798754215,
+      "p50_us": 814.5421743392944,
+      "p95_us": 1104.5001447200775,
+      "p99_us": 1139.5001783967018,
+      "mean_us": 842.6058664917946,
+      "max_us": 1139.5001783967018
+    },
+    "vector_knn_where": {
+      "n": 50,
+      "min_us": 591.2920460104942,
+      "p50_us": 686.3749586045742,
+      "p95_us": 799.4999177753925,
+      "p99_us": 856.2086150050163,
+      "mean_us": 687.803253531456,
+      "max_us": 856.2086150050163
+    },
+    "point_where": {
+      "note": "vector_knn_where と同一クエリ形のため統合",
+      "n": 50,
+      "min_us": 591.2920460104942,
+      "p50_us": 686.3749586045742,
+      "p95_us": 799.4999177753925,
+      "p99_us": 856.2086150050163,
+      "mean_us": 687.803253531456,
+      "max_us": 856.2086150050163
+    },
+    "where_compound_count": {
+      "n": 50,
+      "min_us": 6971.125025302172,
+      "p50_us": 7441.374938935041,
+      "p95_us": 8083.165623247623,
+      "p99_us": 8235.541637986898,
+      "mean_us": 7476.580003276467,
+      "max_us": 8235.541637986898,
+      "result": 7599
+    },
+    "agg_count": {
+      "n": 50,
+      "min_us": 1604.3749637901783,
+      "p50_us": 1698.0827786028385,
+      "p95_us": 1883.2078203558922,
+      "p99_us": 1899.207942187786,
+      "mean_us": 1723.0866570025682,
+      "max_us": 1899.207942187786,
+      "result": 23000
+    },
+    "agg_multi": {
+      "unsupported": true,
+      "reason": "Qdrant に SUM/AVG/MIN/MAX 相当の集計 API が無い（count のみ）"
+    },
+    "group_by_having": {
+      "unsupported": true,
+      "reason": "Qdrant に GROUP BY/HAVING 相当の API が無い"
+    },
+    "hybrid_rrf": {
+      "unsupported": true,
+      "reason": "疎ベクトルを自前生成すると自作 DB の BM25 系 hybrid と非等価なため対象外（task 指示）"
+    },
+    "mode_recall": {
+      "unsupported": true,
+      "reason": "Qdrant にモード切替（recall/precision）の概念が無い"
+    },
+    "mode_precision": {
+      "unsupported": true,
+      "reason": "Qdrant にモード切替（recall/precision）の概念が無い"
+    },
+    "udf_call": {
+      "unsupported": true,
+      "reason": "自作 DB の宣言的 UDF 呼び出し相当の機能が無い"
+    },
+    "bulk_knn_k200": {
+      "n": 50,
+      "min_us": 2936.2919740378857,
+      "p50_us": 3067.7500180900097,
+      "p95_us": 5299.457814544439,
+      "p99_us": 5752.749741077423,
+      "mean_us": 3319.184146821499,
+      "max_us": 5752.749741077423,
+      "k": 200,
+      "rows_returned": 200,
+      "hnsw_ef": 200
+    },
+    "bulk_knn_k1000": {
+      "n": 50,
+      "min_us": 11634.958442300558,
+      "p50_us": 12213.833630084991,
+      "p95_us": 13175.500091165304,
+      "p99_us": 36009.62460041046,
+      "mean_us": 12749.874144792557,
+      "max_us": 36009.62460041046,
+      "k": 1000,
+      "rows_returned": 1000,
+      "hnsw_ef": 1000
+    },
+    "bulk_knn_where_k200": {
+      "n": 50,
+      "min_us": 2999.7089877724648,
+      "p50_us": 3234.6658408641815,
+      "p95_us": 3465.833142399788,
+      "p99_us": 3491.2079572677612,
+      "mean_us": 3232.1616541594267,
+      "max_us": 3491.2079572677612,
+      "k": 200,
+      "rows_returned": 200,
+      "hnsw_ef": 200
+    },
+    "bulk_hybrid_k200": {
+      "unsupported": true,
+      "reason": "疎ベクトルを自前生成すると自作 DB の BM25 系 hybrid と非等価なため対象外（task 指示）"
+    },
+    "scan_where_nosort_k500": {
+      "n": 50,
+      "min_us": 4346.958361566067,
+      "p50_us": 4602.083005011082,
+      "p95_us": 5384.50013846159,
+      "p99_us": 5474.250297993422,
+      "mean_us": 4802.573341876268,
+      "max_us": 5474.250297993422,
+      "k": 500,
+      "rows_returned": 500
+    },
+    "rls_isolation": {
+      "n": 50,
+      "min_us": 1536.0424295067787,
+      "p50_us": 1598.5001809895039,
+      "p95_us": 1665.2089543640614,
+      "p99_us": 1688.0002804100513,
+      "mean_us": 1602.5591548532248,
+      "max_us": 1688.0002804100513,
+      "tenant_b_count": 23000,
+      "note": "Qdrant にテナント別セッションの概念が無いため agg_count と同一フィルタで再実行（値の一致確認用）"
+    },
+    "explain": {
+      "unsupported": true,
+      "reason": "Qdrant に EXPLAIN 相当の API が無い"
+    },
+    "ingest_single_stmt": {
+      "rows": 1000,
+      "seconds": 1.2987323328852654,
+      "rows_per_sec": 769.981600272012,
+      "note": "payload に body を追加（bulk_* フェーズの本文返却用。他 DB の投入内容と同等化）"
+    },
+    "recall_at_10": {
+      "recall_at_10": 1.0,
+      "recall_at_10_strict": 0.755,
+      "queries": 200
+    }
+  }
+}
