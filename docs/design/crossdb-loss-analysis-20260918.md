@@ -186,8 +186,8 @@ CPU アーキテクチャ・ノイズ環境・対照 DB 構成が異なるため
   MongoDB（WiredTiger）は macOS で `F_FULLFSYNC` を使うが **WAL のみ**に対象を限定し
   データページはチェックポイントへ分離する設計（`os_fs.c:154-205`・`log.c:224-260`）。
 - **帰属**: **durability 契約の差**（自作 DB は明示的に選択した「1 コミット = 1
-  フェイルクローズな永続化契約」、他 DB の多くは既定で耐久性を要求しない、または
-  WAL のみに fsync 範囲を限定）。engine・wire の実装コストではない。→ §5 で対処しない。
+  フェイルクローズな永続化契約」、他 DB の多くは既定で応答時点の耐久性を要求しない、または
+  WAL のみに fsync 範囲を限定。MongoDB Atlas local の `w:majority` は例外で journal 永続化を待つ）。engine・wire の実装コストではない。→ §5 で対処しない。
 
 ## 4. 実装した対処
 
@@ -329,8 +329,9 @@ aggregate` の早期リターン・`sql/group_by.rs::observe_group_count_only` �
 | self（redb） | 毎 commit `Durability::Immediate`→`sync_data()`（macOS では `F_FULLFSYNC`） | `redb-4.2.0/src/transactions.rs:954-955`・std `sys/fs/unix.rs:1413-1434` |
 | Redis（RediSearch） | AOF 既定無効・周期的 RDB のみ。単一コマンドに fsync なし | `containers.sh:107-121`・`indexes.c:398` |
 | LanceDB | 全レイヤで fsync 呼び出しなし。OS ページキャッシュ止まり | `ostore/src/local.rs:352-372` |
-| MongoDB（WiredTiger） | journal flush は WAL のみ 100ms 間隔（単発 `w:1`+journal は即時トリガー）。データページは checkpoint 分離 | `journal_flusher.cpp:257-286`・`os_fs.c:154-205` |
-| SQLite（sqlite-vec 経由） | `synchronous=FULL`（既定）。macOS では `F_FULLFSYNC` 優先、失敗時のみ `fsync` | `os_unix.c:3817-3830` |
+| MongoDB Atlas local（`mongodb_db.py`・単一ノード replica set） | 既定 write concern `w:majority`（`writeConcernMajorityJournalDefault=true`）。応答前に journal の永続化を待つ。データページは checkpoint 分離 | `env.txt:40`・`journal_flusher.cpp:257-286`・`os_fs.c:154-205` |
+| MongoDB Community（`mongodb_plain_db.py`・standalone） | 既定 write concern `w:1`（`j` 未指定）。journal flush は WAL のみ 100ms 間隔で応答時点では永続化を待たない | `env.txt:40`・`journal_flusher.cpp:257-286` |
+| SQLite（sqlite-vec 経由） | `synchronous=FULL`（既定）→ `fsync(2)`。`PRAGMA fullfsync` は既定 OFF で `sqlite_vec_db.py` も有効化しないため macOS でも `F_FULLFSYNC` は使わない | `os_unix.c:3817-3830`・`pragma.html#pragma_fullfsync` |
 | PostgreSQL（pgvector） | `autocommit=True`＝1 文 1 トランザクション。`synchronous_commit=on` 既定（WAL fsync 経路は本調査のスコープ外） | `pgvector_db.py:52,149` |
 
 **RediSearch（RSALv2/SSPL/AGPLv3）・Elasticsearch（AGPL/SSPL/ELv2）・MongoDB（SSPL）は本リポ
