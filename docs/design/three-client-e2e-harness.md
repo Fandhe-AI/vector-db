@@ -305,6 +305,61 @@ session→search→close→失効後再送（`401`／`28000`）スモーク 1 �
 3 クライアント一連手順の実行記録の整備・psql（SQL 経路）との結果一致比較は
 後続 Issue（#777〜#779）へ申し送る。
 
+### urllib／fetch ランナー（Issue #777）
+
+Issue #776 で curl のみだった `three_client_http_e2e.rs` へ、Python 標準
+ライブラリ `urllib.request`・Node.js 組み込み `fetch` の 2 クライアントを
+追加した。SQL 表層側の `tests/three_client/{psycopg_client.py,pg_client.js}`
+と同じ配置・起動方式（`tests/three_client_http/{urllib_client.py,
+fetch_client.js}`・`PYTHON_BIN`／`NODE_BIN` 環境変数でインタプリタを解決）を
+踏襲し、外部パッケージ（pip／npm）には一切依存しない
+（`.claude/rules/dependency-policy.md`）。
+
+**入出力契約**: 3 クライアント共通で接続先・要求本文・bearer トークンは
+すべて `HTTP_HOST`／`HTTP_PORT`／`HTTP_TARGET`／`HTTP_BODY`／`HTTP_BEARER`
+環境変数経由（argv・stdin は使わない。security.md P0）。成功時は stdout
+1 行目に HTTP ステータス（10 進数字のみ）、2 行目以降に応答本文をそのまま
+出力し終了コード 0（4xx／5xx も「応答を受信できた」として扱う。失効後
+トークン再送で `401` を確認するステップに必要な契約）。転送路・プロトコル
+障害（接続不能・タイムアウト・応答本文の上限超過・UTF-8 デコード不正・
+必須環境変数の欠落）はいずれも終了コード 1 とし、stderr には障害種別のみを
+書く（要求本文・bearer 値・env の値は echo しない）。応答本文の上限は
+curl 経路と同じ `2 MiB`（拒否閾値として）、タイムアウトは 10 秒に揃えた。
+`urllib_client.py` は `read(LIMIT + 1)` で受信量そのものを上限に抑えるが、
+`fetch_client.js` は `res.arrayBuffer()` で先に全量を読み切ってから長さを
+検査する（Node 組み込み `fetch` の標準 API では読み取り量の事前制限が
+できないため）。本テストの対象はいずれも自前サーバー（本文は高々数百
+バイト）で上限超過は想定しない経路のため、ストリーミング読み取りの
+複雑化は見送った。
+
+**curl との差分**: `fetch` は既定でリダイレクトを追従するため
+`redirect: "error"` を明示し、サーバーが 3xx を返さない契約
+（`crates/wire-server/docs/nosql-api.md`）から外れた場合は fail-closed に
+倒す（curl 側は追従しても到達しない想定でそのまま）。要求ヘッダは両者とも
+`Content-Type: application/json` を明示する（urllib の既定
+`application/x-www-form-urlencoded`・Node fetch の文字列本文既定
+`text/plain;charset=UTF-8` のままだと `08P01` になるため）。
+
+**Node.js ≥18 前提**: `fetch` は Node の組み込みグローバル
+（`require` 不要）だが Node 18 未満には存在しない。`typeof fetch !==
+"function"` を検査し、非搭載環境では案内メッセージ付きで終了コード 1 にする
+（ローカル実行環境は Node v24 系で確認済み）。
+
+**Rust ランナーの共有化**: `curl_post` と同じシグネチャの
+`urllib_post`／`fetch_post` を追加し、共通の `spawn_script_client`
+（`three_client_e2e.rs::spawn_psycopg_client` と同型。`Command` 引数配列で
+起動しシェル非経由）へ委譲した。テスト本体は
+`run_session_search_close_scenario(client: HttpClient)` へ抽出し、
+`curl_runs_session_search_close_over_nosql_surface`（既存名を維持）・
+`urllib_runs_session_search_close_over_nosql_surface`・
+`fetch_runs_session_search_close_over_nosql_surface` の 3 本の
+`#[test] #[ignore]` から呼ぶ。シナリオ内容（session 発行→トークン形状検証→
+search 3 行→close→失効後再送→stderr 非漏えい検証）はクライアント種別に
+依存しない。`make e2e-three-client-http` は 3 テストとも一括実行する。
+
+production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
+無変更（テスト・スクリプト専任）。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・

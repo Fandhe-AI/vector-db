@@ -10,10 +10,21 @@
 //! 束縛・`operation_id` 必須化・precision fail-closed・RLS 暗黙適用等）の
 //! 回帰保護は既存の層 A（`http4_session_issue.rs`・`http5_query_bearer.rs`・
 //! `http8_session_close.rs`・`nosql1_*`〜`nosql11_*`。常時 `make ci`）が担う。
-//! 本ファイルはその上澄みとして、無改造の外部 HTTP クライアント（curl）が
-//! 実バイナリへ接続して `session → search → close` を実行できることを
-//! 外形的に確認する導入ハーネスであり、`#[ignore]` とし
+//! 本ファイルはその上澄みとして、無改造の外部 HTTP クライアント
+//! （curl／Python 標準ライブラリ `urllib.request`／Node.js 組み込み
+//! `fetch`）が実バイナリへ接続して `session → search → close` を実行
+//! できることを外形的に確認する導入ハーネスであり、`#[ignore]` とし
 //! `make e2e-three-client-http` から明示的に実行する（`ci` には含めない）。
+//! 3 クライアントとも `run_session_search_close_scenario` を共有し、
+//! シナリオ内容（session 発行→トークン形状検証→search 3 行→close→
+//! 失効後再送の `401`／`28000`→stderr 非漏えい検証）はクライアント種別に
+//! 依存しない（Issue #777・TASK-183・HTTP-13）。urllib／fetch のクライアント
+//! スクリプト本体は `tests/three_client_http/{urllib_client.py,
+//! fetch_client.js}` に置き、SQL 表層側の `tests/three_client/
+//! {psycopg_client.py, pg_client.js}` と同じ配置・入出力規約
+//! （接続情報・要求本文はすべて環境変数経由・`PYTHON_BIN`／`NODE_BIN` で
+//! インタプリタを上書き可）を踏襲する。外部パッケージ（pip／npm）には
+//! 依存しない（`.claude/rules/dependency-policy.md`）。
 //!
 //! 起動・ポート取得は `common::SpawnedServer`（`http4_session_issue.rs` の
 //! `spawned_binary_accepts_valid_login_over_nosql_surface` と同型）を再利用
@@ -22,15 +33,14 @@
 //! 専用に複製する（`extended_syntax_e2e.rs` の前例と同方針。private 関数の
 //! ため import できない）。
 //!
-//! ツール未検出（`curl` が見つからない）・curl の非 0 終了・応答形状の不一致は
-//! いずれも `panic!` で失敗させ、silent skip はしない
+//! ツール未検出（curl／python3／node が見つからない）・非 0 終了・応答形状の
+//! 不一致はいずれも `panic!` で失敗させ、silent skip はしない
 //! （`.claude/rules/coding-rust.md` の実行規約「テストの skip・ignore・
 //! アサーション弱体化で CI を通さない」の精神を、明示的に選択実行するこの
 //! 導線でも維持する）。
 //!
 //! スコープ外（後続 Issue への申し送り）:
-//! - urllib.request／fetch のクライアントスクリプトとランナー: #777
-//! - 3 クライアント一括実行・実行記録の整備: #778
+//! - 3 クライアント一括実行の実行記録の整備: #778
 //! - psql（SQL 経路）との結果一致比較（search／scan／aggregate）: #779
 
 #[path = "common/mod.rs"]
@@ -40,7 +50,7 @@ mod common;
 mod temp_db;
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -249,6 +259,137 @@ impl Drop for CurlOutDirGuard {
     }
 }
 
+/// `tests/three_client_http/` 配下のスクリプトをインタプリタの子プロセスとして
+/// 1 要求 = 1 プロセスで起動する共通実装（`three_client_e2e.rs::spawn_psycopg_client`
+/// と同型）。接続先・要求本文・bearer はすべて `HTTP_*` 環境変数で渡し
+/// （argv・stdin は使わない。security.md P0）、スクリプトの契約
+/// （`tests/three_client_http/urllib_client.py`／`fetch_client.js` の
+/// モジュール先頭コメント参照）どおり stdout 1 行目のステータス・2 行目以降の
+/// 本文を返す。
+///
+/// インタプリタの spawn 失敗（未インストール・`PYTHON_BIN`／`NODE_BIN` 誤設定）
+/// は案内付きで `panic!` する。スクリプト自身の非 0 終了（転送路障害）は
+/// 呼び出し元（`HttpClient::post`）が要求ステップの文脈で `panic!` する。
+fn spawn_script_client(
+    interpreter_env: &str,
+    default_bin: &str,
+    script_rel_path: &str,
+    port: u16,
+    target: &str,
+    bearer: Option<&str>,
+    json_body: &str,
+) -> std::process::Output {
+    let interpreter = resolve_tool(interpreter_env, default_bin);
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join(script_rel_path);
+    let mut cmd = Command::new(&interpreter);
+    cmd.arg(&script)
+        .env("HTTP_HOST", "127.0.0.1")
+        .env("HTTP_PORT", port.to_string())
+        .env("HTTP_TARGET", target)
+        .env("HTTP_BODY", json_body);
+    if let Some(token) = bearer {
+        cmd.env("HTTP_BEARER", token);
+    }
+    cmd.output().unwrap_or_else(|e| {
+        panic!(
+            "failed to spawn {default_bin} (bin={interpreter:?}): {e}; \
+             install it or set {interpreter_env} to an alternative binary"
+        )
+    })
+}
+
+/// `spawn_script_client` の出力（stdout 1 行目のステータス・2 行目以降の本文）
+/// を解析する。非 0 終了・非数値ステータス行はいずれも案内付き `panic!`
+/// （untrusted なスクリプト出力を fail-closed に扱う。curl 経路の
+/// `curl_post` と同じ検査水準）。
+fn parse_script_client_output(
+    client_label: &str,
+    target: &str,
+    output: &std::process::Output,
+) -> (u16, String) {
+    if !output.status.success() {
+        panic!(
+            "{client_label} exited non-zero (status={:?}) for target {target}: stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (status_line, rest) = stdout.split_once('\n').unwrap_or_else(|| {
+        panic!("{client_label} produced no status line for target {target}: stdout={stdout:?}")
+    });
+    let status: u16 = status_line.trim().parse().unwrap_or_else(|e| {
+        panic!(
+            "{client_label} did not report a numeric http status for target {target}: {e} \
+             (line={status_line:?})"
+        )
+    });
+    (status, rest.to_string())
+}
+
+/// `urllib_client.py`（Python 標準ライブラリ `urllib.request`）で 1 要求を送る。
+fn urllib_post(port: u16, target: &str, bearer: Option<&str>, json_body: &str) -> (u16, String) {
+    let output = spawn_script_client(
+        "PYTHON_BIN",
+        "python3",
+        "tests/three_client_http/urllib_client.py",
+        port,
+        target,
+        bearer,
+        json_body,
+    );
+    parse_script_client_output("urllib_client.py", target, &output)
+}
+
+/// `fetch_client.js`（Node.js 組み込み `fetch`）で 1 要求を送る。
+fn fetch_post(port: u16, target: &str, bearer: Option<&str>, json_body: &str) -> (u16, String) {
+    let output = spawn_script_client(
+        "NODE_BIN",
+        "node",
+        "tests/three_client_http/fetch_client.js",
+        port,
+        target,
+        bearer,
+        json_body,
+    );
+    parse_script_client_output("fetch_client.js", target, &output)
+}
+
+/// 3 クライアント種別のディスパッチ（`run_session_search_close_scenario` が
+/// クライアント非依存に書けるようにする薄い抽象化）。curl のみ
+/// `out_dir`／`seq`（一時ファイル経由の要求本文・応答本文受け渡し）を使う。
+enum HttpClient {
+    Curl,
+    Urllib,
+    Fetch,
+}
+
+impl HttpClient {
+    fn label(&self) -> &'static str {
+        match self {
+            HttpClient::Curl => "curl",
+            HttpClient::Urllib => "urllib",
+            HttpClient::Fetch => "fetch",
+        }
+    }
+
+    fn post(
+        &self,
+        port: u16,
+        target: &str,
+        bearer: Option<&str>,
+        json_body: &str,
+        out_dir: &std::path::Path,
+        seq: u32,
+    ) -> (u16, String) {
+        match self {
+            HttpClient::Curl => curl_post(port, target, bearer, json_body, out_dir, seq),
+            HttpClient::Urllib => urllib_post(port, target, bearer, json_body),
+            HttpClient::Fetch => fetch_post(port, target, bearer, json_body),
+        }
+    }
+}
+
 fn json_object(body: &str) -> std::collections::BTreeMap<String, JsonValue> {
     match parse_json(body)
         .unwrap_or_else(|e| panic!("response body must be valid JSON: {e:?} (body={body:?})"))
@@ -271,16 +412,16 @@ fn assert_valid_session_token(token: &str) {
     );
 }
 
-/// curl（無改造の外部 HTTP クライアント）で `POST /v1/session`（発行）→
-/// `POST /v1/query`（`op: search`）→ `POST /v1/session/close`（失効）→
-/// 失効後の同一トークン再送が `401`／`28000` で拒否されることまでを
-/// 確認するスモークテスト（Issue #776 の受け入れ条件 R1〜R3）。
+/// 無改造の外部 HTTP クライアント（`client` で切替）で `POST /v1/session`
+/// （発行）→ `POST /v1/query`（`op: search`）→ `POST /v1/session/close`
+/// （失効）→ 失効後の同一トークン再送が `401`／`28000` で拒否されることまでを
+/// 確認するスモークシナリオ（Issue #776 の受け入れ条件 R1〜R3。
+/// urllib／fetch への拡張は Issue #777）。curl／urllib／fetch の 3 テストが
+/// 本関数へ委譲することでシナリオ内容の重複を避ける。
 ///
 /// 3 クライアント一括の実行記録・SQL 経路とのパリティは #778／#779 の
 /// スコープ（本 Issue のスコープ外）。
-#[test]
-#[ignore = "requires curl; run via `make e2e-three-client-http`"]
-fn curl_runs_session_search_close_over_nosql_surface() {
+fn run_session_search_close_scenario(client: HttpClient) {
     let (db_path, _db_guard) = seed_three_tenant_db();
     let users_path = common::write_user_store_file(&[
         ("alice", "tenant-a", "pw-alice"),
@@ -292,19 +433,23 @@ fn curl_runs_session_search_close_over_nosql_surface() {
     let (server, port) =
         spawn_nosql_server(users_path.to_str().expect("utf-8 users path"), &db_path_str);
 
+    // curl のみ要求・応答本文をファイル経由で受け渡す（`curl_post` 参照）。
+    // urllib／fetch は使わないが、`HttpClient::post` のシグネチャ統一のため
+    // 引数として受け取る。
     let out_dir = std::env::temp_dir().join(format!(
-        "wire-server-three-client-http-e2e-curl-out-{}-{}",
+        "wire-server-three-client-http-e2e-{}-out-{}-{}",
+        client.label(),
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
             .as_nanos()
     ));
-    std::fs::create_dir(&out_dir).expect("create curl output dir");
+    std::fs::create_dir(&out_dir).expect("create client output dir");
     let _out_dir_guard = CurlOutDirGuard(out_dir.clone());
 
     // 1. session 発行。
-    let (status, body) = curl_post(
+    let (status, body) = client.post(
         port,
         "/v1/session",
         None,
@@ -331,7 +476,7 @@ fn curl_runs_session_search_close_over_nosql_surface() {
     //    行数・行集合が返る」非 vacuous な証跡に限定する）。
     let search_body =
         r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"columns":["id"]}"#;
-    let (status, body) = curl_post(port, "/v1/query", Some(&token), search_body, &out_dir, 2);
+    let (status, body) = client.post(port, "/v1/query", Some(&token), search_body, &out_dir, 2);
     assert_eq!(status, 200, "search query failed: {body}");
     let result_obj = json_object(&body);
     match result_obj.get("row_count") {
@@ -356,7 +501,7 @@ fn curl_runs_session_search_close_over_nosql_surface() {
     assert_eq!(ids, vec![1.0, 2.0, 3.0], "unexpected id set: {body}");
 
     // 3. session close。
-    let (status, body) = curl_post(port, "/v1/session/close", Some(&token), "{}", &out_dir, 3);
+    let (status, body) = client.post(port, "/v1/session/close", Some(&token), "{}", &out_dir, 3);
     assert_eq!(status, 200, "session close failed: {body}");
     assert!(
         body.contains("\"closed\":true"),
@@ -367,7 +512,7 @@ fn curl_runs_session_search_close_over_nosql_surface() {
     //    の受け入れ条件 R3。close が実際にトークンを失効させたことの
     //    非 vacuous な証跡。`http8_session_close.rs` の同種検証と同じ
     //    `wire_code` 判定基準）。
-    let (status, body) = curl_post(port, "/v1/query", Some(&token), search_body, &out_dir, 4);
+    let (status, body) = client.post(port, "/v1/query", Some(&token), search_body, &out_dir, 4);
     assert_eq!(status, 401, "revoked token must be rejected: {body}");
     assert!(
         body.contains("\"wire_code\":\"28000\""),
@@ -392,4 +537,22 @@ fn curl_runs_session_search_close_over_nosql_surface() {
         "stderr must not leak tenant id"
     );
     assert!(!joined.contains("alice"), "stderr must not leak username");
+}
+
+#[test]
+#[ignore = "requires curl; run via `make e2e-three-client-http`"]
+fn curl_runs_session_search_close_over_nosql_surface() {
+    run_session_search_close_scenario(HttpClient::Curl);
+}
+
+#[test]
+#[ignore = "requires python3; run via `make e2e-three-client-http`"]
+fn urllib_runs_session_search_close_over_nosql_surface() {
+    run_session_search_close_scenario(HttpClient::Urllib);
+}
+
+#[test]
+#[ignore = "requires node (>= 18); run via `make e2e-three-client-http`"]
+fn fetch_runs_session_search_close_over_nosql_surface() {
+    run_session_search_close_scenario(HttpClient::Fetch);
 }
