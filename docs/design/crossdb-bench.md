@@ -1189,6 +1189,68 @@ informational 参考値。受け入れ判定はクラスタ構造ありフィク
 | SQLite（sqlite-vec） | `synchronous=FULL`（`fsync(2)`）。`PRAGMA fullfsync` は既定 OFF で `sqlite_vec_db.py` も有効化しないため macOS でも `F_FULLFSYNC` は使わない |
 | PostgreSQL（pgvector） | `synchronous_commit=on`（WAL fsync） |
 
+### Issue #851: durability 別実測と比較条件
+
+計測環境: MacBook Pro（Apple M4 Max・共有 GUI 常駐機。`docs/design/
+benchmark-judgement-policy.md` §5 の「共有環境」区分。他プロセス実行数
+952〜956・専有実測ではない）・macOS 26.6.2・APFS（`Macintosh HD - Data`）。
+`wire-server` バイナリ sha256 は既存の crossdb 計測と同型に `meta.version`
+で確認する契約だが、本節は engine 側ベンチのみ実施したため wire-server
+バイナリは未使用。commit `3d36cf7`（origin/main。#849〔`WriteDurability`
+opt-in〕・#850〔`--durability` CLI〕マージ後）。生データ・summary.tsv は
+`docs/design/bench-data/ingest-durability-ab/20260918T205301Z/`。
+
+**実施範囲**: `crates/engine/benches/ingest_profile_bench.rs`
+（`BENCH_INGEST_PROFILE_MODE=single`。E0/S0/I1〜I8 の内訳を持つ既存
+ベンチ。Issue #484）へ `BENCH_INGEST_PROFILE_DURABILITY=immediate|none`
+opt-in（Issue #851）を追加し、`scripts/bench_ingest_durability_ab.sh`
+から既定 `immediate` と opt-in `none` を同一バイナリ・同一 fixture
+（単文数 2,000・dim 128。crossdb の 25,000 より小さい値を N=5 ペア交互で
+現実的な時間に収めるため採用）で交互 N=5 ペア実測した。**crossdb ベンチ
+本体（`ingest_single_stmt`・wire 経由）の durability A/B は未実施**（本
+Issue の作業時間内では fixture〔`docs25k.redb` 等〕・専用 venv の準備が
+間に合わなかったため。`scripts/crossdb_bench/self_durability.py`・
+`self_db.py::run` への `CROSSDB_SELF_DURABILITY` opt-in 結線は実装済みで、
+次回の crossdb 計測時にそのまま使える）。Linux ext4 環境の実測も同様に
+未実施。
+
+**A/B 結果（min-of-N・median。N=5）**:
+
+| 指標 | immediate | none | ratio（none/immediate） |
+| --- | ---: | ---: | ---: |
+| I8（commit）ns/row・median | 4,577,625 ns（≈4.58 ms） | 8,583 ns（≈8.6 µs） | 0.0019（約 533 分の1） |
+| E0（typed_row_api）median | 4.565 ms | 0.019 ms | 0.0042 |
+| S0（sql_surface）median | 4.629 ms | 0.026 ms | 0.0056 |
+
+**fsync 系原始操作プローブ（`scripts/fsync_probe.py --iters 100`。同一
+ボリューム）**:
+
+| 原始操作 | min | p50 | p95 |
+| --- | ---: | ---: | ---: |
+| `fsync(2)` | 21.5 µs | 23.9 µs | 29.7 µs |
+| `F_BARRIERFSYNC` | 188.4 µs | 385.5 µs | 730.4 µs |
+| `F_FULLFSYNC` | 3.31 ms | 4.35 ms | 5.32 ms |
+
+**帰属の考察**: `Immediate − None` の per-commit 差（約 4.57 ms）は
+`F_FULLFSYNC` の p50（約 4.35 ms）とほぼ同水準であり、Issue 本文の参考値
+（4.2 ms／18 µs／350 µs）とも整合する。ただし redb 4.2.0 の
+`Durability::None` は `write()` も `sync_data()` も発行せずプロセス内
+バッファに留まる契約（`storage.rs::WriteDurability::None` doc。#849）の
+ため、この差は「fsync だけ」ではなく commit の I/O 全体（`write()` 発行分を
+含む）である点に注意。`fsync(2)` 単体（約 24 µs）との比較では、macOS が
+`F_FULLFSYNC` を選ぶことによる追加コストが支配的であることも確認できる。
+
+**整合性検証**: `none` arm でも `ingest_profile_bench.rs` の既存整合性検証
+（E0↔レプリカのバイト一致・`table_generation`・台帳 content_hash 照合）は
+全 run で通過した。redb `Database::drop`（クリーンクローズ時に pending の
+非 durable commit を通常の durability commit へ昇格させる契約）により、
+プロセス正常終了後の再オープンでも行が失われないことを実測で確認した。
+
+参照区間（`docs/design/benchmark-judgement-policy.md` §4）は本節では未採取
+（`immediate`/`none` の差が 2〜3 桁と極めて大きく、ノイズ帯を跨いだ判定
+不能のリスクが無いため）。共有環境の参考値であり、専有環境での再実測・
+crossdb 本体経由の実測はオーナー作業として申し送る。
+
 ### 原因分析と是正
 
 フェーズ別の原因（self 側機構と最速他 DB の手法）・改善後 5 run の A/B 生データ（`docs/design/bench-data/crossdb-20260918-loss-ab/`）・チップ最適化の考察は `docs/design/crossdb-loss-analysis-20260918.md` を参照（Issue #845・PR #853 で追加。本節の「改善後」列はその生データの after 側 5 run median）。

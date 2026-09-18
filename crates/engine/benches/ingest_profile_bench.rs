@@ -83,10 +83,10 @@ use harness::env_report::EnvReport;
 use harness::ingest_profile::{
     content_hash_insert_batch_reimpl, content_hash_typed_insert_reimpl,
     decode_ledger_entry_v2_reimpl, encode_row_reimpl, last_op_entry_reimpl, ledger_entry_v2_reimpl,
-    ns_per_row, parse_bounded_env, parse_insert_mode, parse_profile_mode,
+    ns_per_row, parse_bounded_env, parse_durability, parse_insert_mode, parse_profile_mode,
     refuse_under_github_actions, render_stage_line, residual_ns_per_row, rows_per_sec,
-    sum_durations, IngestProfileError, InsertMode, ProfileMode, StageId, StageSamples,
-    DEFAULT_SINGLE_STATEMENTS, MAX_SINGLE_STATEMENTS, MIN_SINGLE_STATEMENTS,
+    sum_durations, BenchDurability, IngestProfileError, InsertMode, ProfileMode, StageId,
+    StageSamples, DEFAULT_SINGLE_STATEMENTS, MAX_SINGLE_STATEMENTS, MIN_SINGLE_STATEMENTS,
     SINGLE_WARMUP_STATEMENTS,
 };
 use harness::protocol::MeasurementConfig;
@@ -106,7 +106,7 @@ use engine::sql::allowlist::validate_insert;
 use engine::sql::mode::SessionState;
 use engine::sql::parser::{bind_insert_form, BoundInsertForm};
 use engine::sql::SqlOutcome;
-use engine::storage::{RowInput, Storage, Visibility};
+use engine::storage::{RowInput, Storage, Visibility, WriteDurability};
 use engine::tenant;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -277,6 +277,20 @@ fn run_batch_mode() {
         InsertMode::Insert => "insert",
         InsertMode::Reserve => "reserve",
     };
+    // batch モードは durability A/B（`run_single_mode` 専用機能。Issue #851）に
+    // 対応しない。未設定・明示 "immediate" のみ受理し、"none" は fail-closed に
+    // 拒否する（`insert_mode_raw` と同じ「他モード専用 env を黙って無視しない」
+    // 方針。coding-rust.md「untrusted 入力の扱い」）。
+    let durability_raw = match read_env_var("BENCH_INGEST_PROFILE_DURABILITY") {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    match durability_raw.as_deref() {
+        None | Some("immediate") => {}
+        Some(other) => fail_closed(format!(
+            "BENCH_INGEST_PROFILE_DURABILITY={other:?} is not supported in batch mode (only \"immediate\" or unset)"
+        )),
+    }
 
     println!(
         "{}",
@@ -615,13 +629,30 @@ fn run_single_mode() {
             "BENCH_INGEST_PROFILE_INSERT_MODE={other:?} is not supported in single mode (only \"insert\" or unset)"
         )),
     }
+    // durability A/B（Issue #851）。未設定は既定 `Immediate` のままビット同一の
+    // 出力を保つ。`BenchDurability` から `engine::storage::WriteDurability`
+    // （Issue #849）への写像は本関数内でのみ行う（harness は engine に依存しない
+    // 独立コンパイル単位のため）。
+    let durability_raw = match read_env_var("BENCH_INGEST_PROFILE_DURABILITY") {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    let bench_durability = match parse_durability(durability_raw.as_deref()) {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    let write_durability = match bench_durability {
+        BenchDurability::Immediate => WriteDurability::Immediate,
+        BenchDurability::None => WriteDurability::None,
+    };
 
     println!(
         "{}",
         EnvReport::capture(format!("{:?}", engine::isa::current().isa()))
     );
     println!(
-        "ingest_profile_bench: mode=single statements={statements} dim={dim} tenant={TENANT} table={TABLE}"
+        "ingest_profile_bench: mode=single statements={statements} dim={dim} tenant={TENANT} table={TABLE} durability={}",
+        bench_durability.token()
     );
 
     let warmup = SINGLE_WARMUP_STATEMENTS as u64;
@@ -677,7 +708,8 @@ fn run_single_mode() {
     let e0_path = unique_db_path("issue484-ingest-single-e0");
     let _e0_guard = CleanupGuard(e0_path.clone());
     let (e0_summary, e0_total, e0_min) = {
-        let e0_storage = Storage::open(&e0_path).expect("open E0 storage");
+        let e0_storage = Storage::open_with_durability(&e0_path, write_durability)
+            .expect("open E0 storage with durability");
         e0_storage
             .create_table(&table_schema)
             .expect("create E0 table");
@@ -723,7 +755,8 @@ fn run_single_mode() {
     let s0_path = unique_db_path("issue484-ingest-single-s0");
     let _s0_guard = CleanupGuard(s0_path.clone());
     let (s0_summary, s0_total, s0_min) = {
-        let s0_storage = Storage::open(&s0_path).expect("open S0 storage");
+        let s0_storage = Storage::open_with_durability(&s0_path, write_durability)
+            .expect("open S0 storage with durability");
         s0_storage
             .create_table(&table_schema)
             .expect("create S0 table");
@@ -769,7 +802,7 @@ fn run_single_mode() {
     for n in 0..total_stmts {
         let row = make_single_row(1, n, dim);
         if n < warmup {
-            run_replica_single(&replica_db, &table_schema, &row, n, None);
+            run_replica_single(&replica_db, &table_schema, &row, n, None, bench_durability);
         } else {
             run_replica_single(
                 &replica_db,
@@ -777,6 +810,7 @@ fn run_single_mode() {
                 &row,
                 n,
                 Some(&mut stage_samples),
+                bench_durability,
             );
         }
     }
@@ -979,6 +1013,7 @@ fn run_replica_single(
     row: &SingleRow,
     n: u64,
     mut stage_samples: Option<&mut StageSamples>,
+    durability: BenchDurability,
 ) {
     // I1: VECTOR 列位置探索 ＋ validate_embedding_dim。
     let t = Instant::now();
@@ -993,11 +1028,19 @@ fn run_replica_single(
         .expect("validate_embedding_dim for I1");
     record(&mut stage_samples, StageId::Precheck, t.elapsed());
 
-    // I2: begin_write。
+    // I2: begin_write（durability none の場合は `set_durability` 呼び出しも
+    // I2 の計時内に含める。production の `Storage::begin_write_txn` が
+    // `begin_write` と `set_durability` を同一関数内で連続実行する契約
+    // と対応させるため。Issue #851）。
     let t = Instant::now();
-    let write_txn = db
+    let mut write_txn = db
         .begin_write()
         .expect("begin_write for replica single stmt");
+    if matches!(durability, BenchDurability::None) {
+        write_txn
+            .set_durability(redb::Durability::None)
+            .expect("set_durability(None) for replica single stmt");
+    }
     record(&mut stage_samples, StageId::BeginWrite, t.elapsed());
 
     // I5: encode（storage::encode_row 相当。行ごとに 1 回のみ。I3・I6 の双方が

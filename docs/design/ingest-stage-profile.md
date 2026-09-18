@@ -749,3 +749,15 @@ decode 1 回・tokenize 1 回・512B の複製 1 回）は S0（58µs）の数 %
   別途設計判断が必要）。
 - 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測・crossdb `ingest_single_stmt`
   rows/s の実測確定はオーナー作業として申し送る。
+
+## Issue #851 追記: durability 別実測
+
+`I8`（durable commit）の durability 契約差そのものの実測は
+`docs/design/ingest-write-path.md`「10. Issue #851 追記」・
+`docs/design/crossdb-bench.md`「Issue #851: durability 別実測と比較条件」
+節を参照（`BENCH_INGEST_PROFILE_DURABILITY=immediate|none` opt-in。既定
+`immediate` と opt-in `none` の A/B で I8 median が約 4.58ms→約 8.6µs
+（ratio ≈ 0.0019）まで縮小することを実測。redb `Durability::None` は
+本節が扱う「上位段（P0〜I7 相当）の削減」とは独立の軸であり、I8 自体の
+コスト構造は本節の対象外のまま）。production コード無変更・テスト・
+ベンチ・docs 専任。

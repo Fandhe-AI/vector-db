@@ -1,0 +1,16 @@
+metric	arm	n	min	median
+E0_min_ms	immediate	5	3.4420	3.4580
+E0_median_ms	immediate	5	4.4700	4.5650
+S0_min_ms	immediate	5	3.4670	3.5710
+S0_median_ms	immediate	5	4.5820	4.6290
+I8_commit_ns_per_row	immediate	5	4230500.0000	4577625.0000
+E0_min_ms	none	5	0.0160	0.0170
+E0_median_ms	none	5	0.0190	0.0190
+S0_min_ms	none	5	0.0230	0.0230
+S0_median_ms	none	5	0.0250	0.0260
+I8_commit_ns_per_row	none	5	8375.0000	8583.0000
+E0_min_ms	ratio(none/immediate)	n/a	0.0046	0.0049
+E0_median_ms	ratio(none/immediate)	n/a	0.0043	0.0042
+S0_min_ms	ratio(none/immediate)	n/a	0.0066	0.0064
+S0_median_ms	ratio(none/immediate)	n/a	0.0055	0.0056
+I8_commit_ns_per_row	ratio(none/immediate)	n/a	0.0020	0.0019

@@ -1,0 +1,23 @@
+loadavg={ 1.68 1.86 1.89 }
+    Finished `bench` profile [optimized] target(s) in 0.04s
+     Running benches/ingest_profile_bench.rs (target/release/deps/ingest_profile_bench-993d1a9b6dc03ac9)
+env: os=macos arch=aarch64 logical_cpus=16 isa=Neon loadavg=unavailable
+ingest_profile_bench: mode=single statements=2000 dim=128 tenant=tenant-ingest table=docs durability=none
+integrity: user_rows/docs byte-identical across E0/replica (count=2000)
+integrity: table_generation == 2001 (E0, includes create_table) / 2000 (replica)
+integrity: op_ledger content_hash matches content_hash_typed_insert_reimpl for 200 sampled measured statements (E0)
+tier(P0_parse_bind): stmts=1000 min=0.008ms median=0.008ms rows_per_sec=119250.4
+tier(E0_typed_row_api): stmts=1000 min=0.016ms median=0.019ms rows_per_sec=42588.1
+tier(S0_sql_surface): stmts=1000 min=0.024ms median=0.026ms rows_per_sec=32599.2
+stage(I1_precheck): rows=1 median=0.000ms ns_per_row=0.0
+stage(I2_begin_write): rows=1 median=0.000ms ns_per_row=292.0
+stage(I3_content_hash): rows=1 median=0.002ms ns_per_row=1875.0
+stage(I4_ledger): rows=1 median=0.004ms ns_per_row=4042.0
+stage(I5_encode): rows=1 median=0.000ms ns_per_row=209.0
+stage(I6_redb_insert): rows=1 median=0.002ms ns_per_row=1875.0
+stage(I7_generation_bump): rows=1 median=0.001ms ns_per_row=792.0
+stage(I8_commit): rows=1 median=0.009ms ns_per_row=8708.0
+stage(SUM_I1_I8): stmts=1 median=0.018ms
+residual(E0-SUM): median=0.001ms (schema fetch / commit_boundary guard / abstraction overhead)
+attribution(S0-E0, parse/bind/dispatch informational): median=0.008ms (P0 direct measurement: 0.008ms)
+ingest_profile_bench: OK
