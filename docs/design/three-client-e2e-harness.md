@@ -360,6 +360,63 @@ search 3 行→close→失効後再送→stderr 非漏えい検証）はクラ�
 production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
 無変更（テスト・スクリプト専任）。
 
+### 実行記録の様式と運用手順（Issue #778）
+
+**目的**: HTTP-13 の確定化判定（TASK-185）は製品コードでの実測を前提とする
+ため、`make e2e-three-client-http` の実行結果を「いつ・どのコミット・どの
+クライアント版で・何件 pass・何を観測したか」の形で再現可能に記録できる
+導線が要る。SQL 表層側の `three_client_e2e.rs`（Issue #706・PR #708）が
+採った `[e2e-record]` 出力・PR 本文への転記という様式をそのまま踏襲する。
+
+**ハーネス側の変更**: `three_client_http_e2e.rs` の `HttpClient::version`
+（実際に使う `CURL_BIN`／`PYTHON_BIN`／`NODE_BIN` 解決先の `--version` 出力を
+取得。印字可能 ASCII・200 バイト上限へサニタイズ）と、シナリオ完走時の
+`[e2e-record]` 行（クライアント種別・版・session／search／close／失効後
+再送の各段の観測要点）を追加した。記録行はトークン・ユーザー名・
+パスワード・テナント id を含まないことを出力前に `assert!` で機械検証する
+（`--nocapture` で表示しても安全であることの保証。既存の stderr 非漏えい
+assert とは独立に行う）。
+
+**`Makefile` の変更**: `e2e-three-client-http` を
+`-- --ignored --nocapture --test-threads=1` へ変更した。受け入れ条件が
+「この make ターゲットを実行して記録する」ことに結びつくため、記録行が
+make 実行そのものの出力に現れる必要がある。記録行は上記の assert で
+秘密情報非含有が保証されるため `--nocapture` は安全と判断した。
+`--test-threads=1` は 3 テストの `[e2e-record]` 行（および失敗時の診断
+出力）が交錯して読み取れなくなることを防ぐ。SQL 表層側の
+`e2e-three-client` は変更しない（先例どおり個別実行での記録取得のまま。
+統一は対象外と判断）。
+
+**記録テンプレート**（PR #708 の Test plan と同型。PR 本文の Test plan へ
+以下を転記する）:
+
+- 実行日（UTC）
+- 対象コミット SHA（PR head）
+- ツールチェーン（`rustc --version`）
+- クライアント版（`[e2e-record]` の `client_version` を 3 クライアント分
+  転記）
+- テスト名 × 結果の表（3 行: curl／urllib／fetch）
+- pass 件数
+- `[e2e-record]` 3 行の転記
+
+**秘匿規則**: トークン・ユーザー名・パスワード・テナント id・実行環境固有の
+接続情報は記録しない。ハーネス側の `assert!`（上記）で機械的に保証する。
+
+**再実行手順**:
+
+```sh
+make e2e-three-client-http 2>&1 | tee <scratch>/e2e-http.log
+grep '\[e2e-record\]' <scratch>/e2e-http.log
+```
+
+出力された `[e2e-record]` 行と `test result:` 行を記録テンプレートへ転記
+する。
+
+**#779（SQL 経路パリティ）との分担**: 本節が扱うのは実行記録の様式・運用
+手順のみであり、NoSQL 表層と SQL 表層の結果一致比較（search／scan／
+aggregate）は #779 のスコープのまま。production コード
+（`crates/engine/src/`・`crates/wire-server/src/`）は無変更。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・

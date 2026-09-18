@@ -627,7 +627,8 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
 - エラー射影: `err4_http_projection.rs`・`nosql_api_doc.rs`
 - 層 B（無改造の外部 HTTP クライアント）: `three_client_http_e2e.rs`・
   `tests/three_client_http/{urllib_client.py,fetch_client.js}`
-  （`make e2e-three-client-http`。opt-in・`ci` 非包含）
+  （`make e2e-three-client-http`。opt-in・`ci` 非包含）。実行記録の様式は
+  `docs/design/three-client-e2e-harness.md` 参照
 
 ## spec 側への申し送り候補
 
