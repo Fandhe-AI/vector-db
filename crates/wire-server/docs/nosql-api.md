@@ -1,0 +1,640 @@
+# NoSQL API
+
+`wire-server --surface nosql` が公開する 3 エンドポイント（`POST /v1/session`・
+`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 4 値
+（`search`／`scan`／`aggregate`／`insert`）の JSON スキーマを利用者向けに整理する。
+
+**この文書の情報源はコードとテストのみ**であり、`docs/spec`（private submodule）
+の本文は転記しない。参照が必要な箇所は TASK-nn・ビヘイビア ID のポインタ表記に
+限る（詳細は同 ID を持つ spec 側ファイルを、アクセス権のある人が別途参照する）。
+本文中の数値・上限・応答コードは実装既定値であり、将来の変更で上書きされうる
+（規範文書ではない）。
+
+## 目次
+
+- [概要・位置づけ](#概要位置づけ)
+- [転送路の共通規則](#転送路の共通規則)
+- [セッション認証](#セッション認証)
+- [`POST /v1/query` 共通規則](#post-v1query-共通規則)
+- [op 別スキーマ](#op-別スキーマ)
+- [`filter` 配列](#filter-配列)
+- [`explain`](#explain)
+- [応答スキーマ](#応答スキーマ)
+- [SQL ↔ NoSQL 対応表](#sql--nosql-対応表)
+- [エラー応答](#エラー応答)
+- [curl 例](#curl-例)
+- [検証コード索引](#検証コード索引)
+- [spec 側への申し送り候補](#spec-側への申し送り候補)
+
+## 概要・位置づけ
+
+NoSQL 表層は `wire-server --surface nosql` で SQL wire（pg wire v3 互換実装）と
+排他選択する、HTTP/1.1 最小サブセット上の転送路である（TASK-171・HTTP-1・
+HTTP-9）。`AGENTS.md` がスコープ外とする汎用「Web API」フレームワークとは別物で、
+spec で規範化された内部転送プロトコルの実装にすぎない。
+
+エラー契約は SQL 表層と完全共有する。NoSQL 表層は新規 `wire_code` を追加せず、
+`engine::error_format::ErrorClass` を HTTP 応答（ステータス・本文）へ写像するのみ
+（ERR-4）。
+
+spec ポインタ一覧: TASK-184（基盤）・HTTP-1〜13・NOSQL-1〜11・ERR-4・SQL-1〜15・
+RLS-7・RLS-9・TABLE-12。
+
+## 転送路の共通規則
+
+`wire-server --users <path> --db <path> --surface nosql [--bind <addr:port>]` で
+起動する。`--users`・`--db` は必須（fail-closed。省略時は起動しない）。`--bind`
+の既定値は `127.0.0.1:5432`。TLS 未構成時は非ループバックアドレスへの bind を
+起動時に拒否する（loopback 限定）。
+
+要求の受理条件（いずれも接続ハンドラ層で判定し、違反はすべて `08P01`）:
+
+- メソッドは `POST` のみ、バージョンは `HTTP/1.1` のみ
+- 要求行は 4 KiB 以下
+- ヘッダ部は合計 8 KiB 以下・32 個以下
+- `Content-Length` は必須・一意（欠落・重複・非数字は `08P01`）
+- `Transfer-Encoding` は拒否
+- `Content-Type` は `application/json`（パラメータなし、または
+  `charset=utf-8` 1 個のみ）。不一致・欠落は `08P01`
+- 本文長は 1 MiB 以下（超過は `54000`）。UTF-8 として不正な本文は `42601`
+- 要求読み取りには 30 秒のタイムアウトがある
+
+同時接続数の上限は 64（`MAX_CONNECTIONS`）。超過接続はメインの接続枠を消費しない
+拒否専用ワーカースレッドへ委譲され、通常は `503`／`53300` を返してから切断する。
+ただしこの拒否ワーカー自体にも別枠の上限（`MAX_REJECT_WORKERS`＝16）があり、
+拒否ワーカーの枠まで枯渇している場合はスレッドを生成せず応答を書かずに
+即座に切断する（fail-closed 優先の縮退。運用上は稀）。
+
+応答は常に `Content-Type: application/json; charset=utf-8`・`Content-Length`・
+`Connection: close`・`Date` を付け、1 要求ごとに接続を閉じる。`401` 応答のみ
+`WWW-Authenticate: Bearer` を追加で付ける（RFC 9110 §11.6.1 準拠）。
+
+検証コード: `crates/wire-server/tests/http2_framing.rs`・`http3_content_type.rs`・
+`http11_limits.rs`・`http12_fail_closed.rs`・`http_limits.rs`。
+
+## セッション認証
+
+### `POST /v1/session`
+
+要求本文は `user`・`password` の 2 つの必須文字列フィールドのみ（未知キーは
+`42601`）。
+
+```json
+{"user": "alice", "password": "pw-alice"}
+```
+
+成功時（`200`）:
+
+```json
+{"token": "<43文字の base64url 文字列>", "expires_in": 3600}
+```
+
+- トークンは 256bit（32 バイト）の CSPRNG 出力をパディングなし base64url
+  （RFC 4648 §5）で符号化した固定 43 文字
+- TTL は発行時刻から 3600 秒固定（スライドしない）
+- 同時有効セッション数の上限は 256（超過は `53300`）
+- 資格情報の照合失敗・未知ユーザーはいずれも区別せず `28P01`（`401`）で拒否し、
+  Argon2id の固定遅延・ダミー KDF による対称性を維持する（存在オラクルを与えない）
+
+### `POST /v1/session/close`
+
+`Authorization: Bearer <token>` ヘッダが必須。本文は空、または `{}`（それ以外の
+キーを持つ本文は `42601`）。
+
+成功時（`200`）:
+
+```json
+{"closed": true}
+```
+
+ワンタイム失効のため、二重 `close`・未知トークン・期限切れトークンはいずれも
+区別せず `28000`（`401`）になる。
+
+### `Authorization: Bearer` の扱い（`/v1/query` 共通）
+
+`Authorization: Bearer` ヘッダの欠落・スキーム不一致（例: `Basic`）・トークン
+不正・未知・期限切れ・close 済みは、すべて同一の `28000`（`401`）・固定文言へ
+収束する（存在オラクルを与えない設計）。
+
+テナント文脈はセッションに束縛された内部状態からのみ導出する。要求側が
+JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接頭辞・
+`_`/`-` の揺れを正規化してから判定）でテナントを自己申告しても無視されず、
+`42601` で拒否される。
+
+検証コード: `crates/wire-server/tests/http4_session.rs`・`http5_query_bearer.rs`・
+`http6_auth_failure.rs`・`http8_session_close.rs`。
+
+## `POST /v1/query` 共通規則
+
+3 パスとも要求ターゲットのバイト厳密一致でのみ受理する（クエリ文字列付き・
+末尾スラッシュ・大文字小文字違いはすべて `08P01`）。
+
+判定順序（fail-closed。この順が契約）:
+
+1. パス上の `tenant_id` 相当マーカー（`/v1/query?tenant_id=...`・
+   `/v1/query/tenant-id/...` 等）の拒否（`42601`。認証より前）
+2. `Authorization: Bearer` 認証（`28000`）
+3. ヘッダの `tenant_id` 相当拒否（`42601`）
+4. 本文の UTF-8／JSON 構文／`op` フィールドの形（`42601`）
+5. `op` 許可リスト判定（4 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
+   トランザクション制御・`UPDATE`／`DELETE` 相当を含む）
+6. op 別スキーマ検証（必須キー欠落・未知キー・型不一致・`null` は `42601`）
+7. op 別の意味検証・実行（`search` は `explain: true` を通常実行より先に判定）
+
+`op` は完全一致のみで判定する（大文字小文字の読み替え・前後空白のトリムは
+しない）。`"SEARCH"`・`" search"`・`"select"`・`"explain"`・`"begin"` 等はいずれも
+`0A000`。
+
+JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネスト深さ 16 まで・
+文字列 1 個あたり 1 MiB まで・配列/オブジェクトの要素数 65,536 まで、オブジェクト
+の重複キーは拒否（後勝ちで無警告に上書きしない）、数値リテラルは RFC 8259 準拠
+（先頭ゼロ・小数部/指数部の数字欠落は拒否）。いずれの違反も `42601`。
+
+検証コード: `crates/wire-server/tests/nosql1_endpoint_routing.rs`・
+`nosql9_op_allowlist.rs`・`nosql1_op_vocabulary.rs`・`nosql8_schema_validation.rs`。
+
+## op 別スキーマ
+
+以下、各 op のトップレベルフィールドと `wire_code` を表にする。値の**語彙・範囲**
+（`filter[].op` の語彙、`aggregates[].fn`／`having[].op` の語彙等）は別途本節の
+説明文で扱う。
+
+### `search`
+
+| キー | 必須 | 型 | 備考 |
+| --- | --- | --- | --- |
+| `op` | ○ | string | `"search"` |
+| `table` | ○ | string | 識別子形状（後述） |
+| `limit` | ○ | number | `1..=10000`。非整数・負値・`u32` 超過等の形状不正は `42601`、`0` または `10001` 以上の範囲外は `22000` |
+| `vector` | △ | number[] | `plan` と排他かつどちらか必須 |
+| `plan` | △ | string | `vector` と排他かつどちらか必須。LLM クエリ展開 |
+| `hybrid` | △ | `{"text": string}` | `vector` とのみ併用可（`plan` と併用は `42601`）。疎側テキスト列は固定で `body` 列 |
+| `mode` | △ | string | `"recall"`（`vector` 検索の既定）／`"precision"`。`plan` 検索で省略時は下記参照 |
+| `columns` | △ | string[]（非空） | 省略時は `id`＋全実列 |
+| `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照 |
+| `explain` | △ | bool | [`explain`](#explain)参照 |
+
+要求例（ベクトル検索）:
+
+```json
+{"op": "search", "table": "docs", "vector": [0.1, 0.2, 0.3, 0.4], "limit": 10,
+ "columns": ["id", "lang"]}
+```
+
+要求例（ハイブリッド検索）:
+
+```json
+{"op": "search", "table": "docs", "vector": [1.0, 0.0], "limit": 3,
+ "columns": ["id"], "hybrid": {"text": "alpha"}}
+```
+
+要求例（クエリ展開検索）:
+
+```json
+{"op": "search", "table": "docs", "plan": "find content", "limit": 10}
+```
+
+`mode` の解決（`resolve_mode_with_planner`。優先順位: 要求の `mode` フィールド
+＞ セッション変数（`SET` 相当。NoSQL 表層には対応する構文が無く、`/v1/query` は
+要求ごとに既定の `SessionState` で実行されるため常に未設定）＞ プランナー推定
+＞ 既定 `recall`）:
+
+- `vector` 検索: `mode` 省略時は常に既定 `recall`（プランナーを経由しないため
+  推定ヒントが存在しない）
+- `plan` 検索: `mode` 省略時はクエリ展開（LLM プランナー）の推定結果
+  `mode_hint`（TASK-164・PLAN-11）が採用されうる。`mode_hint` が
+  `"precision"` と推定されれば `mode` を明示指定しなくても `precision`
+  モードで実行される（確信度ゲート・`explain` での `mode_source` 確認は
+  SQL 表層の `USING PLAN` と同一契約）
+
+応答例は [応答スキーマ](#応答スキーマ)を参照。
+
+主な `wire_code`:
+
+- `vector`／`plan` 両方指定・両方欠落・`plan`＋`hybrid` 併用・`columns: []`・
+  識別子形状不正 → `42601`
+- 未知テーブル → `42P01`
+- 未知列・`VECTOR` 列でない列への `ORDER BY` 相当・非有限ベクトル要素等 → `22000`
+
+### `scan`
+
+順序保証なしの広域取得（SQL-15 の bare 形 `SELECT ... [WHERE ...] LIMIT n` と
+同一実行意味論。`limit` 件到達で早期終了・取得モード非適用）。
+
+| キー | 必須 | 型 | 備考 |
+| --- | --- | --- | --- |
+| `op` | ○ | string | `"scan"` |
+| `table` | ○ | string | |
+| `limit` | ○ | number | `1..=10000`。非整数・負値・`u32` 超過等の形状不正は `42601`、`0` または `10001` 以上の範囲外は `22000` |
+| `filter` | △ | object[] | |
+| `columns` | △ | string[]（非空） | 省略時は `id`＋全実列 |
+| `explain` | △ | bool | `true` は `42601`（拒否。後述）。`false`／省略時は通常実行 |
+
+`vector`／`plan`／`mode`／`hybrid` はスキーマが宣言しないフィールドのため、
+未知キーとして `42601` になる（`scan` への付与自体を個別に判定するロジックは
+持たない）。
+
+要求例:
+
+```json
+{"op": "scan", "table": "docs", "limit": 10, "columns": ["id", "lang"],
+ "filter": [{"column": "lang", "op": "eq", "value": "ja"}]}
+```
+
+応答には `score` 列相当が一切含まれない（`ORDER BY`／`hybrid` を経由しないため
+合成スコア列が構造上存在しない）。
+
+`explain: true` は `scan`（SQL-15 の bare 形）への `EXPLAIN` 前置が拒否される
+契約の写像として `42601`。
+
+### `aggregate`
+
+単一行集計（`GROUP BY` なし）と `GROUP BY`／`HAVING` 集計の両方を、SQL テキストを
+一切組み立てずに束縛・実行する（SQL-13・SQL-14 と同一の実行計画）。
+
+| キー | 必須 | 型 | 備考 |
+| --- | --- | --- | --- |
+| `op` | ○ | string | `"aggregate"` |
+| `table` | ○ | string | |
+| `aggregates` | ○ | object[]（`{"fn","column"}`。1〜32 要素） | `fn` は `count`／`sum`／`avg`／`min`／`max`（小文字完全一致）。`column` は列名、または `count` 専用の `"*"` |
+| `filter` | △ | object[] | |
+| `group_by` | △ | string[]（ちょうど 1 要素） | `TEXT` 列限定 |
+| `having` | △ | object[]（`{"fn","column","op","value"}`） | `group_by` 必須。`op` は `=`／`<`／`<=`／`>`／`>=` の完全一致 |
+| `explain` | △ | bool | `true` は `42601`（拒否）。`false`／省略時は通常実行 |
+
+要求例（単一行集計）:
+
+```json
+{"op": "aggregate", "table": "docs",
+ "aggregates": [{"fn": "count", "column": "*"}, {"fn": "sum", "column": "id"}]}
+```
+
+要求例（`GROUP BY`／`HAVING`）:
+
+```json
+{"op": "aggregate", "table": "docs",
+ "aggregates": [{"fn": "count", "column": "*"}],
+ "group_by": ["lang"],
+ "having": [{"fn": "count", "column": "*", "op": ">=", "value": 2}]}
+```
+
+主な `wire_code`:
+
+- `aggregates` が空配列 → `group_by`／`having` の有無を問わず一律 `42601`
+  （`having` の参照解決より必ず先に検査する）
+- `group_by` 要素数が 1 でない・`having` のみ単独指定（`group_by` なし）・
+  `fn`／`op` が語彙外・識別子形状不正 → `42601`
+- グループ数上限（10,000）・グループキー累計バイト・`having` 述語数上限超過
+  → `54000`
+- `group_by` 列が `TEXT` 列でない・`having` が `MIN`/`MAX(<TEXT列>)` を参照・
+  参照先が `aggregates` に存在しない／曖昧 → `22000`
+- `VECTOR` 列の集計: `count` は列の裸の列参照を受理し非 `NULL` 行数を数える
+  （`resolve_aggregate_input` の `AggregateInput::VectorColumnPresence`）。
+  `sum`／`avg`／`min`／`max` は同じ `VECTOR` 列参照を一律 `22000` で拒否
+- `sum` オーバーフロー → `22003`
+
+### `insert`
+
+| キー | 必須 | 型 | 備考 |
+| --- | --- | --- | --- |
+| `op` | ○ | string | `"insert"` |
+| `table` | ○ | string | |
+| `rows` | ○ | object[] | 各行は `id`（非負整数）＋スキーマ列名をキーとする値 |
+| `operation_id` | △（実質必須） | string | 欠落・`null`・空文字はいずれも `23502` |
+
+要求例:
+
+```json
+{"op": "insert", "table": "docs",
+ "rows": [{"id": 1, "embedding": [0.1, 0.2, 0.3], "lang": "ja"}],
+ "operation_id": "op-1"}
+```
+
+成功時（`200`）:
+
+```json
+{"inserted": 1, "operation_id": "op-1"}
+```
+
+- `VECTOR` 列は数値配列。`nullable` の宣言値に関わらず常に必須で、省略・`null`
+  はいずれも `22000`（省略・`null` が可能なのは nullable な `TEXT` 列限定）
+- 未知キー・次元不一致・型不一致は `22000`
+- 同一 `operation_id` の再送: 内容が一致すれば `23505`、不一致なら `22023`
+  （台帳照合。TASK-101・RECOVER-10 の再送判定を透過する）
+- 同一テナント内の `id` 重複は `23505`（他テナントの同 `id` とは衝突せず、
+  応答は「不在時」と同一——TABLE-12・RLS-9）
+- `rows` の行数上限は既定 64（`EngineCore::execute_bound_insert_in_session` が
+  `rows.len()` を INDEX-4 の件数上限相当として判定。環境変数
+  `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
+- 行・バッチ単位のバイト上限（INDEX-4 ②③。`batch_limits::validate_batch_shape`）:
+  各行のバイト量を `Σ TEXT 列.len() + VECTOR 列.len() × 4`（`Null` は 0）として
+  積算し、1 行あたり `chunking::MAX_INPUT_BYTES`（固定）、またはバッチ合計
+  `VECTOR_DB_BATCH_MAX_TOTAL_BYTES`（未設定時は
+  `incremental::MAX_INDEX_TOTAL_BYTES`）を超えると `54000`
+- 行数は上記の件数上限（①）とは別枠でチャンク数上限（④。
+  `batch_limits::validate_chunk_total`。1 行＝1 チャンク換算。既定は
+  `incremental::MAX_CHUNKS_PER_FILE`、環境変数 `VECTOR_DB_BATCH_MAX_CHUNKS` で
+  上書き可能）でも判定され、超過は同じく `54000`
+
+検証コード: `crates/wire-server/tests/nosql2_search.rs`・
+`nosql2_search_binding.rs`・`nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`・
+`nosql4_aggregate.rs`・`nosql5_group_by.rs`・`nosql4_5_aggregate_wire_parity.rs`・
+`nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
+`http_insert_response_boundary.rs`・`wire_insert_operation_id.rs`。
+
+## `filter` 配列
+
+`search`／`scan`／`aggregate` 共通で使える事前フィルタ配列。
+
+```json
+[{"column": "lang", "op": "eq", "value": "ja"}]
+```
+
+- 各要素は `column`・`op`・`value` の 3 つの必須文字列フィールドのみ
+- `op` は `eq`（一致）・`prefix`（前方一致）の 2 語彙のみ（`or`・否定・範囲比較の
+  構文は存在しない）。複数要素は常に AND 結合
+- 要素数は 256 個まで（超過は `54000`）
+- `column` にサーバー側 RLS 述語名相当（`visible`／`visible()`。大文字小文字
+  非区別）を指定する経路は `42601`（RLS はサーバー側暗黙適用のみで、クライアント
+  は述語を書けない）
+- 列名解決・未知列／`VECTOR` 列拒否（`22000`）は `engine::declarative_filter`
+  の既存契約をそのまま透過する
+
+検証コード: `crates/wire-server/tests/nosql7_filter_mapping.rs`。
+
+## `explain`
+
+`op: search` かつ `plan` 指定かつ `explain: true` のときのみ、検索本体を実行せず
+SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
+
+要求例:
+
+```json
+{"op": "search", "table": "docs", "plan": "find content", "limit": 10,
+ "explain": true}
+```
+
+応答例（`200`）:
+
+```json
+{"explain": ["<QUERY PLAN の行>", "..."]}
+```
+
+- `vector` 指定＋`explain: true` → `42601`
+- `plan` 欠落＋`explain: true`（`vector`も欠落）→ `42601`
+- `scan`／`aggregate` への `explain: true` → `42601`（別 op なので `search` の
+  上記条件とは独立に、各 op のハンドラが拒否する）
+
+検証コード: `crates/wire-server/tests/nosql10_explain.rs`・`wire_explain.rs`。
+
+## 応答スキーマ
+
+`search`（`explain` なし）／`scan`／`aggregate` 成功時は共通形:
+
+```json
+{"columns": [{"name": "id", "type": "numeric"}, {"name": "lang", "type": "text"}],
+ "rows": [[1, "ja"], [2, "en"]],
+ "row_count": 2}
+```
+
+- キー順固定（`columns` → `rows` → `row_count`）・空白なし
+- `row_count` は常に `rows` の長さ
+- `columns[].type` は SQL 表層 `RowDescription` と同じ型名写像: 疑似列 `id` は
+  `"numeric"`、それ以外（実列・`VECTOR` 列・式項目）はすべて `"text"`
+  （型名は wire 側との一致を優先する一方、値そのものは native JSON——配列・
+  数値・真偽値・文字列——で返す。値表現を型名に合わせて文字列化してはいない）
+- `Cell::Vector` は `[1,2.5]` のような JSON 数値配列として返る
+- 非有限（`NaN`／`±Infinity`）な浮動小数は `null` に丸めず内部エラーとして
+  fail-closed に拒否する（通常は engine 側の評価時点で `22000` になり到達しない）
+
+`insert`・`explain: true` の応答形は前節の専用形（`{"inserted",...}`／
+`{"explain":[...]}`）を参照。
+
+検証コード: `crates/wire-server/tests/nosql11_response_schema.rs`。
+
+## SQL ↔ NoSQL 対応表
+
+| SQL | NoSQL |
+| --- | --- |
+| `SELECT id, lang FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10` | `search` + `vector` + `columns` |
+| `SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'alpha') LIMIT 3` | `search` + `vector` + `hybrid.text`（疎側列は `body` 固定） |
+| `SELECT id FROM docs USING PLAN('find content') LIMIT 10` | `search` + `plan` |
+| `... LIMIT n USING MODE 'recall'` | `"mode":"recall"` |
+| `WHERE lang = 'ja'` | `filter` 要素 `{"op":"eq",...}` |
+| `WHERE lang LIKE 'j%'` | `filter` 要素 `{"op":"prefix",...}` |
+| `EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10` | `search` + `plan` + `"explain":true` |
+| `SELECT id, lang FROM docs WHERE lang = 'ja' LIMIT 10`（広域取得 SQL-15） | `scan` |
+| `SELECT COUNT(*), SUM(id) FROM docs` | `aggregate` |
+| `SELECT lang, COUNT(*) FROM docs GROUP BY lang HAVING count >= 2` | `aggregate` + `group_by` + `having` |
+| `INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID 'op-1'` | `insert` + `operation_id` |
+
+対応の無いもの（NoSQL 側に受理形が存在しない。実際の応答は語彙外 `op` として
+`0A000`、または未知キーとして `42601`）:
+
+- `HINT ORDER(...)` によるソフトブースト
+- UDF 呼び出し・`CREATE FUNCTION`
+- `SET`（`search_mode` 等のセッション変数設定）
+- 定数のみの `SELECT`
+- `ORDER BY` 形／集計／広域取得への `EXPLAIN` 前置（`USING PLAN` 付き検索
+  `SELECT` への `EXPLAIN` のみ受理）
+- `LIKE` の前方一致（`prefix`）以外の一致方式
+- `INSERT` のファイル形（`path`／`body` 列指定の増分インデックス投入）
+- `GROUP BY` への `ORDER BY`／`LIMIT` の付与
+
+逆方向（NoSQL にあって SQL に対応形がないもの）は無い。
+
+検証コード: `crates/wire-server/tests/nosql3_scan_wire_parity.rs`・
+`nosql4_5_aggregate_wire_parity.rs`・`wire_using_plan.rs`・
+`wire_insert_operation_id.rs`・`crates/engine/tests/default_preset.rs`。
+
+## エラー応答
+
+本節の数値・文言は spec 由来の閾値ではなく、`crates/wire-server/src/http/
+status.rs`（`wire_code` → HTTP ステータスの射影）・`error_body.rs`（JSON 本文
+エンコーダ）・`response.rs`（ステータス行・ヘッダ）を単一情報源とする実装
+既定値である（ERR-4・ERR-5 ポインタ）。表とコードの一致は
+`tests/nosql_api_doc.rs` が機械検証する。
+
+### 本文仕様
+
+通常応答の本文形（`http::error_body::encode`）:
+
+```json
+{"wire_code": "XX000", "code": "INTERNAL_ERROR", "message": "internal error"}
+```
+
+- 実際にはトップレベルが `{"error": { ... }}` で包まれる。上の例はキー順・値の
+  固定を示すための `error` オブジェクトの中身のみの抜粋であり、下記の
+  golden 例が実際のトップレベル形を示す
+- キー順は `wire_code` → `code` → `message` →（緊急応答時のみ）`data` に固定。
+  空白を含まないコンパクト形・改行を含まない 1 行（0x20 未満のバイトを一切
+  含まない）
+- `code` は `ErrorClass::label()`（`SCREAMING_SNAKE_CASE`。人間可読な補助
+  ラベルであり、契約として確定しているのは `wire_code` のみ）
+- エスケープ規則: `"`・`\`・U+0000〜U+001F のみをエスケープする。
+  `\b`／`\t`／`\n`／`\f`／`\r` はよく使う短縮形、それ以外の一般制御文字は
+  小文字 `\u00xx`。非 ASCII（日本語・補助面文字を含む）・U+007F は
+  エスケープせず UTF-8 のまま透過する
+- `message` の契約: 固定の英語文言、または内部エラー時に固定文言へ
+  差し替えられた `WireError` 由来の値のみ（長さ上限あり）。他テナントの
+  データ・存在情報・内部詳細を含まない（存在オラクルを提供しない）。
+  利用者は `message` の具体的な文言そのものを契約として依存しないこと
+- 通常応答は `data` キーを**決して**含まない。緊急応答専用の
+  `encode_may_be_committed` と本文組み立てが構造的に分離されている
+  （[緊急応答の `data`](#緊急応答の-data) を参照）
+
+golden 例（`ErrorClass::InternalError`・`message="internal error"` から
+`error_body::encode`／`encode_may_be_committed` が実際に返す本文。
+バイト単位で一致することをテストが固定する）:
+
+```json
+{"error":{"wire_code":"XX000","code":"INTERNAL_ERROR","message":"internal error"}}
+```
+
+```json
+{"error":{"wire_code":"XX000","code":"INTERNAL_ERROR","message":"internal error","data":{"state":"may_be_committed"}}}
+```
+
+### ステータス行・ヘッダ
+
+```text
+HTTP/1.1 400 Bad Request
+Content-Type: application/json; charset=utf-8
+Content-Length: <本文バイト長>
+Connection: close
+Date: <IMF-fixdate>
+```
+
+- `Content-Type` は常に `application/json; charset=utf-8`
+- `Content-Length` は本文の実バイト長（`Content-Type` と同じく必須固定ヘッダ）
+- `Connection: close` を常に付ける（1 応答ごとに接続を閉じる。
+  [転送路の共通規則](#転送路の共通規則)参照）
+- `Date` は RFC 9110 IMF-fixdate。システムクロックが `UNIX_EPOCH` より前の
+  異常値を指す場合でも応答送出自体は止めず、`UNIX_EPOCH` 相当へ fail-closed
+  に縮退する（可用性を優先し `Date` の正確性を犠牲にする設計判断）
+- `401`（`AuthRequired`／`AuthInvalid`）応答のみ、RFC 9110 §11.6.1 が要求する
+  認証チャレンジとして `WWW-Authenticate: Bearer` を追加する。他のステータス
+  では付与しない
+- 射影表の値域（`{400, 401, 403, 404, 409, 413, 500, 501, 503}`）外のステータス
+  が渡された場合、理由句を捏造せず `500`＋`XX000` 固定本文へ fail-closed に
+  縮退する。`ErrorClass` の値域は `#[deny(clippy::wildcard_enum_match_arm)]`
+  で網羅性が強制されるため、現状はこの縮退経路自体が到達不能な防波堤
+
+### `wire_code` → HTTP ステータス射影表
+
+「1 つの `wire_code` → 常に 1 つの HTTP ステータス」の方向にのみ 1:1 の射影
+であり、逆方向（ステータス → `wire_code`）は 1:1 ではない（例えば `400` は
+6 分類が共有する）。
+
+| `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
+| --- | --- | --- | --- | --- |
+| `08P01` | `PROTOCOL_VIOLATION` | 400 | Bad Request | 要求行・ヘッダ形状違反、未知ターゲットへのアクセス |
+| `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |
+| `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー |
+| `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
+| `23502` | `MISSING_OPERATION_ID` | 400 | Bad Request | `insert` の `operation_id` 欠落 |
+| `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
+| `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
+| `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
+| `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
+| `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
+| `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
+| `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | `insert` の `operation_id` 重複（内容一致の再送） |
+| `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過 |
+| `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
+| `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
+| `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
+
+到達不能な 2 分類（`42501`・`P0002`）の理由: NoSQL 表層はテナントを
+セッション（`SessionPrincipal::policy_context()`）からのみ導出し、
+クライアント自己申告の `tenant_id` 相当値は JSON／ヘッダ／パスいずれの
+位置でも `42601` で先に拒否するため、`ForbiddenTenantMismatch` を実要求から
+誘発する経路が構造的に存在しない。`RowNotFound` に対応する op（更新・削除系）
+も NoSQL 表層の許可リストに無い。テナント境界の検査を緩める・バイパスする
+production 経路をこの 2 分類のために新設することはせず（`.claude/rules/
+security.md` P0）、射影表としての一致のみを production の応答エンコーダ経由で
+固定する。
+
+本節の各 op スキーマ節（[op 別スキーマ](#op-別スキーマ)・
+[`filter` 配列](#filter-配列)・[`explain`](#explain)）では引き続き
+`wire_code` のみを示す。HTTP ステータスを引く際は本表を参照すること。
+
+### 緊急応答の `data`
+
+`data` キーは緊急応答（ERR-5・`RECOVER-5` (3) ポインタ。commit 成功境界を
+跨いだ panic 時に「commit は成功しているかもしれない」ことを伝える契約）
+にのみ付き、通常応答の直後の 3 キーに加えて
+`"data":{"state":"may_be_committed"}` を追加する（golden 例は
+[本文仕様](#本文仕様)を参照）。SQL 表層側（`ErrorResponse` の `D` フィールド
+`state=may_be_committed`）と状態語を共有しており、両表層で乖離しないことを
+テストで固定している。
+
+**現状の到達性**: `http::response::encode_error_may_be_committed` を呼び出す
+production 経路は本リポジトリの `http/` 配下にまだ存在せず、commit 成功境界を
+跨いだ panic は RECOVER-8 の panic hook が既にプロセス abort へ倒すため、
+NoSQL 表層の実要求からは `data` 付き応答は現時点で観測できない。エンコーダの
+契約としては予約済みであり、production 経路が接続された場合に備えてここに
+記載する。
+
+利用者向け指針（接続され次第有効になる契約。現時点では観測不能）:
+`data.state == "may_be_committed"` を受け取った場合、同一 `operation_id` で
+`insert` を再送し、台帳照合の結果（内容一致なら `23505`・不一致なら
+`22023`）で確定させる。これは `insert` の既存の再送契約をそのまま使うもので
+あり、`data` 付き応答専用の新たな再送契約を追加するものではない。
+
+## curl 例
+
+```sh
+# 1) セッション発行
+TOKEN=$(curl -s -X POST http://127.0.0.1:5432/v1/session \
+  -H 'Content-Type: application/json' \
+  -d '{"user":"alice","password":"pw-alice"}' | \
+  sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+
+# 2) 検索
+curl -s -X POST http://127.0.0.1:5432/v1/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":10}'
+
+# 3) セッション終了
+curl -s -X POST http://127.0.0.1:5432/v1/session/close \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+（`alice`／`pw-alice` は既存テストと同じダミー資格情報の一例。実運用では
+`--users` で構成したストアの実クレデンシャルを使う。）
+
+## 検証コード索引
+
+- 転送路: `crates/wire-server/tests/http1_surface_select.rs`・
+  `http2_framing.rs`・`http3_content_type.rs`・`http11_limits.rs`・
+  `http12_fail_closed.rs`・`http_limits.rs`
+- セッション: `http4_session.rs`・`http4_session_issue.rs`・
+  `http5_query_bearer.rs`・`http6_auth_failure.rs`・`http8_session_close.rs`
+- ルーティング・op 許可リスト・スキーマ: `nosql1_endpoint_routing.rs`・
+  `nosql1_op_vocabulary.rs`・`nosql9_op_allowlist.rs`・`nosql8_schema_validation.rs`
+- `search`: `nosql2_search.rs`・`nosql2_search_binding.rs`・`nosql10_explain.rs`・
+  `wire_using_plan.rs`・`wire_explain.rs`
+- `scan`: `nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`
+- `aggregate`: `nosql4_aggregate.rs`・`nosql5_group_by.rs`・
+  `nosql4_5_aggregate_wire_parity.rs`
+- `insert`: `nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
+  `http_insert_response_boundary.rs`・`wire_insert_operation_id.rs`
+- `filter`: `nosql7_filter_mapping.rs`
+- 応答形: `nosql11_response_schema.rs`
+- エラー射影: `err4_http_projection.rs`・`nosql_api_doc.rs`
+
+## spec 側への申し送り候補
+
+以下は既存モジュールコメントが「spec 判断」として明示している事項の一覧で
+あり、本文書執筆にあたって新たな判断は行っていない:
+
+- `hybrid.text` の疎側テキスト列を JSON で選択可能にするか（現状は `body`
+  固定）
+- `/v1/session/close` 成功応答のキー名（`{"closed":true}`。実装既定値）
+- `/v1/query` 配下のパス上 `tenant_id` マーカーと未知ターゲットの優先順位
+  （本リポの実装判断であり spec 側での明文化は未定）
+- 集計 `id` 列等の巨大整数（`u64`。2^53 超）を JSON number としてそのまま返す
+  ことの是非（文字列化への変更は spec 側判断に委ねられている）
