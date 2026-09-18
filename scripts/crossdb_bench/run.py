@@ -28,7 +28,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import load_jsonl, write_result  # noqa: E402
 from recall import build_ground_truth, recall_at_k, recall_at_k_tie_tolerant  # noqa: E402
 
-DB_MODULES = ["self", "pgvector", "sqlite_vec", "qdrant", "lancedb", "mysql"]
+DB_MODULES = [
+    "self",
+    "self_nosql",
+    "pgvector",
+    "sqlite_vec",
+    "qdrant",
+    "lancedb",
+    "mysql",
+    "mongodb",
+    "mongodb_plain",
+    "redis",
+    "elasticsearch",
+]
+
+# self（SQL wire）・self_nosql（HTTP NoSQL 表層）はいずれも --rows-file に redb
+# ファイルパスを取り、docs jsonl は不要（wire-server が既存 redb をそのまま開く）。
+# self 専用の分岐（resolve_docs_file・dispatch）をこの集合で共有する。
+_SELF_DB_MODULES = ("self", "self_nosql")
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,7 +87,7 @@ def resolve_docs_file(args: argparse.Namespace) -> str:
     """
     if args.docs_file:
         return args.docs_file
-    if args.db == "self":
+    if args.db in _SELF_DB_MODULES:
         base = os.path.splitext(os.path.basename(args.rows_file))[0]
         candidate = os.path.join(os.path.dirname(os.path.abspath(args.rows_file)), f"{base}.jsonl")
         return candidate
@@ -177,7 +194,7 @@ def main() -> int:
     # 不正な結果 JSON を書き出してしまう。self は queries と `--docs-file`（省略時
     # は `resolve_docs_file`）の docs を、他 DB は `--rows-file`（docs 本体）を
     # 突き合わせる（Issue #466。unsupported へ丸めず非 0 終了で拒否する）。
-    dim_source_docs = resolve_docs_file(args) if args.db == "self" else args.rows_file
+    dim_source_docs = resolve_docs_file(args) if args.db in _SELF_DB_MODULES else args.rows_file
     query_dim = len(queries[0]["embedding"]) if queries and queries[0].get("embedding") is not None else None
     docs_dim = None
     if os.path.exists(dim_source_docs):
@@ -257,6 +274,10 @@ def main() -> int:
         import self_db
 
         result = self_db.run(args, queries)
+    elif args.db == "self_nosql":
+        import self_nosql
+
+        result = self_nosql.run(args, queries)
     else:
         docs = load_jsonl(args.rows_file)
         module = {
@@ -265,6 +286,12 @@ def main() -> int:
             "qdrant": "qdrant_db",
             "lancedb": "lancedb_db",
             "mysql": "mysql_db",
+            # NoSQL 対照（2026-09-18 追加）。mongodb は Atlas local（mongot 同梱・
+            # ベクトル検索あり）、mongodb_plain は Community（ベクトル検索なし）。
+            "mongodb": "mongodb_db",
+            "mongodb_plain": "mongodb_plain_db",
+            "redis": "redis_db",
+            "elasticsearch": "elasticsearch_db",
         }[args.db]
         db_mod = __import__(module)
         result = db_mod.run(args, docs, queries)

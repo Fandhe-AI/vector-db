@@ -80,7 +80,7 @@ up() {
 }
 
 # 対象以外のコンテナを止める（本ハーネスが起動したもののみ）
-for c in pgvector qdrant mysql; do bash "$B/containers.sh" down "$c" >/dev/null 2>&1 || true; done
+for c in pgvector qdrant mysql mongodb mongodb_plain redis elasticsearch; do bash "$B/containers.sh" down "$c" >/dev/null 2>&1 || true; done
 
 run "$ROWS_REDB" self exact
 # self の hnsw 構成（`--search-engine hnsw` opt-in。Issue #656〜#658）は
@@ -93,6 +93,9 @@ if [ -n "$HNSW_ARGS_FOR_SELF_HNSW" ]; then
 fi
 run "$ROWS_REDB" self hnsw
 unset CROSSDB_SELF_HNSW_ARGS
+# self の NoSQL 表層（HTTP `--surface nosql`。self_nosql.py）は exact 構成のみ
+# 対応する（HNSW opt-in は self（SQL wire）側の担当のまま）。
+run "$ROWS_REDB" self_nosql exact
 run "$ROWS_JSONL" sqlite_vec exact
 run "$ROWS_JSONL" lancedb exact
 run "$ROWS_JSONL" lancedb hnsw
@@ -110,6 +113,28 @@ if up mysql; then
   run "$ROWS_JSONL" mysql exact
 fi
 bash "$B/containers.sh" down mysql
+# NoSQL 対照（2026-09-18 追加）。mongodb（Atlas local・ベクトル検索あり）・redis・
+# elasticsearch は exact/hnsw 両構成、mongodb_plain（Community・ベクトル検索なし）は
+# exact のみ（hnsw は module 側が ValueError で拒否する）。
+if up mongodb; then
+  run "$ROWS_JSONL" mongodb exact
+  run "$ROWS_JSONL" mongodb hnsw
+fi
+bash "$B/containers.sh" down mongodb
+if up mongodb_plain; then
+  run "$ROWS_JSONL" mongodb_plain exact
+fi
+bash "$B/containers.sh" down mongodb_plain
+if up redis; then
+  run "$ROWS_JSONL" redis exact
+  run "$ROWS_JSONL" redis hnsw
+fi
+bash "$B/containers.sh" down redis
+if up elasticsearch; then
+  run "$ROWS_JSONL" elasticsearch exact
+  run "$ROWS_JSONL" elasticsearch hnsw
+fi
+bash "$B/containers.sh" down elasticsearch
 if [ "${#FAILED[@]}" -gt 0 ]; then
   echo "== $(date +%T) FAILED (${#FAILED[@]}): ${FAILED[*]}"
   exit 1

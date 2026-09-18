@@ -9,3 +9,6 @@ lancedb==0.38.0
 pyarrow==25.0.1
 mysql-connector-python==26.7.0
 numpy==2.5.2
+# NoSQL 対照（2026-09-18 追加。要オーナー承認）。Elasticsearch は標準ライブラリのみ。
+pymongo==4.18.1
+redis==8.1.0
