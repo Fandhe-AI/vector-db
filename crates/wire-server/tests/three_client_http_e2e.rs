@@ -441,7 +441,16 @@ impl HttpClient {
         } else {
             stdout.lines().next().unwrap_or("").to_string()
         };
-        sanitize_untrusted_first_line(&raw_first_line)
+        let sanitized = sanitize_untrusted_first_line(&raw_first_line);
+        if sanitized.trim().is_empty() {
+            panic!(
+                "{bin} --version produced no usable output (stdout={stdout:?}, stderr={:?}); \
+                 install a version that prints a version string or set {env_var} to an \
+                 alternative binary",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        sanitized
     }
 }
 
