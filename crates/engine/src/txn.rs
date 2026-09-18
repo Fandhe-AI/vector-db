@@ -84,7 +84,7 @@ impl Storage {
     /// 呼び出す際は、無制限ブロック（DoS）を防ぐ上位側のタイムアウト・キャンセル
     /// 制御を検討すること（[`Storage::begin_batch_write`] も同じ排他ロック契約）。
     pub fn begin_write(&self) -> crate::storage::Result<WriteTxn> {
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write_txn()?;
         Ok(WriteTxn {
             txn,
             has_writes: false,
@@ -100,7 +100,7 @@ impl Storage {
     /// 互いに同時オープンできない）。戻り値の [`BatchWriteTxn`] が保証する不変条件は
     /// [`BatchWriteTxn`] のドキュメントコメント参照。
     pub fn begin_batch_write(&self) -> crate::storage::Result<BatchWriteTxn> {
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write_txn()?;
         Ok(BatchWriteTxn {
             txn,
             pending_row_count: 0,
@@ -616,5 +616,26 @@ mod tests {
             "EmptyBatch で拒否された log_batch は redb に触れないため、\
              その後の commit は世代を進めないこと"
         );
+    }
+
+    /// 取りこぼし検査（Issue #849）: 宣言済み分離レベルの書き込みトランザクション API
+    /// （`begin_write`・`begin_batch_write`）が
+    /// [`crate::storage::Storage::begin_write_txn`] choke point を経由することを、
+    /// 呼び出し前後の `write_txn_creations()` の差分で非 vacuous に確認する。
+    #[test]
+    fn begin_write_and_begin_batch_write_go_through_storage_choke_point() {
+        let path = unique_db_path("durability-choke-point-txn");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        assert_eq!(storage.write_txn_creations(), 0);
+
+        let txn = storage.begin_write().expect("begin_write");
+        txn.commit().expect("commit");
+        assert_eq!(storage.write_txn_creations(), 1, "begin_write");
+
+        let txn = storage.begin_batch_write().expect("begin_batch_write");
+        txn.commit().expect("commit");
+        assert_eq!(storage.write_txn_creations(), 2, "begin_batch_write");
     }
 }

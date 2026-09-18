@@ -1253,6 +1253,26 @@ impl EngineCore {
         ))
     }
 
+    /// [`Self::open`] の durability 版（Issue #849・構築時オプション）。
+    /// `durability` に既定値（[`crate::storage::WriteDurability::default`]）を渡した
+    /// 場合は [`Self::open`] と完全に同一の挙動になる（両者は同じ
+    /// [`Storage::open_with_durability`] 呼び出しへ委譲し実装を共有するため、
+    /// この等価性は構造的に保証される）。durability を非既定値にした場合の
+    /// 損失ウィンドウは [`crate::storage::WriteDurability`] のドキュメンテーション
+    /// コメント・`docs/design/ingest-write-path.md`「Issue #849 追記」節参照。
+    pub fn open_with_durability(
+        path: impl AsRef<Path>,
+        durability: crate::storage::WriteDurability,
+    ) -> Result<Self, CoreError> {
+        let provider = search_engine::default_engine();
+        let storage = Storage::open_with_durability(path, durability)?;
+        Ok(Self::assemble(
+            storage,
+            provider,
+            Some(search_engine::default_kind()),
+        ))
+    }
+
     /// 検索 provider を差し替えて構築する（テスト・将来の GPU/ANN provider 導入用）。
     ///
     /// `provider` は呼び出し元が直接組み立てた値であり、対応する
