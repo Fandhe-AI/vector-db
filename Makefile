@@ -565,7 +565,7 @@ else
 endif
 
 .PHONY: bench-ingest-durability-ab
-bench-ingest-durability-ab: ## Issue #851（`ingest_single_stmt` の durability 別実測。既定 immediate と opt-in none を同一バイナリ・同一 fixture で交互 N≥5 ペア実行し、I8〔redb commit〕・E0/S0 tier・fsync 系原始操作の参考値を記録する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。AB_PAIRS=<N>〔既定 5〕・STATEMENTS=<N>〔既定 5,000・2,000〜100,000〕・FSYNC_PROBE_DIR=<dir>〔既定 OUT_DIR〕で上書きできる。ログは target/bench-ingest-durability-ab/<UTC ts>/ 配下。python3 scripts/bench_ingest_durability_ab_summarize.py <dir> で TSV 集約）
+bench-ingest-durability-ab: ## Issue #851（`ingest_single_stmt` の durability 別実測。既定 immediate と opt-in none を同一バイナリ・同一 fixture で交互 N≥5 ペア実行し、I8〔redb commit〕・E0/S0 tier・fsync 系原始操作の参考値を記録する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。AB_PAIRS=<N>〔既定 5〕・STATEMENTS=<N>〔既定 5,000・2,000〜100,000〕・FSYNC_PROBE_DIR=<dir>〔既定 ${TMPDIR:-/tmp}＝DB 実配置先ボリューム。Issue #857〕で上書きできる。ログは target/bench-ingest-durability-ab/<UTC ts>/ 配下。python3 scripts/bench_ingest_durability_ab_summarize.py <dir> で TSV 集約）
 ifdef HAS_CARGO
 	scripts/bench_ingest_durability_ab.sh
 else

@@ -24,20 +24,22 @@
 #     確保しつつ `immediate` arm（1 commit ごとに数 ms の同期）を N=5 ペアで
 #     現実的な時間に収める値。
 #   env FSYNC_PROBE_DIR: `scripts/fsync_probe.py` の対象ディレクトリ
-#     （既定: OUT_DIR と同じボリューム）。
+#     （既定: DB の実配置先ボリューム。下記参照）。
 #
-# 注意（codex-review P2 指摘・Issue #857）: `FSYNC_PROBE_DIR` の既定はリポジトリ
-# 配下（`OUT_DIR`）だが、ベンチ本体の E0/S0/replica DB は `unique_db_path`
-# 経由で Rust `std::env::temp_dir()`（`$TMPDIR` 優先・未設定時は `/tmp`）に
-# 作られるため、`$TMPDIR` が tmpfs でリポジトリが別ディスクにある環境等では
-# 「fsync プローブ計測先」と「DB 実配置先」が別ボリュームになり得る。両者が
-# 一致することを前提にせず、実際の DB 配置先ボリューム情報を `env.txt` へ
-# 別途記録する（`db_temp_dir`・`db_temp_dir_df` 行）ことで、前後比較時に
-# ボリューム不一致の有無を確認できるようにする。
+# 注意（codex-review P2 指摘・Issue #857）: ベンチ本体の E0/S0/replica DB は
+# `unique_db_path` 経由で Rust `std::env::temp_dir()`（`$TMPDIR` 優先・
+# 未設定時は `/tmp`）に作られる。`OUT_DIR`（ログ出力先。常にリポジトリ配下）を
+# fsync プローブの既定対象にすると、`$TMPDIR` がリポジトリと別ディスク・別
+# ファイルシステムの環境（tmpfs 等）では「fsync プローブ計測先」と「DB 実配置先」
+# が別ボリュームになり前提が崩れるため、`FSYNC_PROBE_DIR` の既定は
+# `${TMPDIR:-/tmp}`（DB の実配置先と同じ解決規則）に合わせる。ログ出力先
+# （`OUT_DIR`・リポジトリ配下）と計測先ボリュームが異なる場合があることを
+# 踏まえ、実際に計測したボリューム情報も `env.txt` へ記録する
+# （`fsync_probe_dir`・`db_temp_dir`・`db_temp_dir_df` 行）。
 #
 # 出力: <OUT_DIR>/<pair>-<arm>.log に env スナップショット・stdout 全文、
-# <OUT_DIR>/fsync-probe.json に同一ボリュームでの fsync 系原始操作の参考値、
-# env.txt に DB 実配置先ボリューム情報（上記）。
+# <OUT_DIR>/fsync-probe.json に DB 実配置先ボリューム（既定）での fsync 系
+# 原始操作の参考値、env.txt に計測先・DB 実配置先ボリューム情報（上記）。
 # 集計は `scripts/bench_ingest_durability_ab_summarize.py <OUT_DIR>`。
 
 set -euo pipefail
@@ -69,7 +71,14 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${REPO_ROOT}/target/bench-ingest-durability-ab/${TS}"
 mkdir -p "${OUT_DIR}"
 
-FSYNC_PROBE_DIR="${FSYNC_PROBE_DIR:-${OUT_DIR}}"
+# `crates/engine/src/test_util/temp_db.rs::unique_db_path` が呼ぶ Rust
+# `std::env::temp_dir()` と同じ解決規則（Unix: `$TMPDIR` があればそれ、
+# なければ `/tmp`）。E0/S0/replica DB の実配置先ボリュームであり、
+# `FSYNC_PROBE_DIR` の既定先として使う（codex-review P2 指摘・Issue #857。
+# 上記「注意」参照）。
+DB_TEMP_DIR="${TMPDIR:-/tmp}"
+
+FSYNC_PROBE_DIR="${FSYNC_PROBE_DIR:-${DB_TEMP_DIR}}"
 
 # macOS/Linux 両対応の CPU 情報 best-effort 収集
 # （`scripts/bench_knn_f16_resident_ab.sh::collect_env_cpu_lines` と同型）。
@@ -105,14 +114,6 @@ log_noise() {
 concurrent_process_count() {
   ps ax 2>/dev/null | wc -l | tr -d ' '
 }
-
-# `crates/engine/src/test_util/temp_db.rs::unique_db_path` が呼ぶ Rust
-# `std::env::temp_dir()` と同じ解決規則（Unix: `$TMPDIR` があればそれ、
-# なければ `/tmp`）で DB の実配置先ボリュームを記録する（codex-review P2
-# 指摘・Issue #857。計測対象ボリューム〔OUT_DIR／FSYNC_PROBE_DIR〕と DB 実配置先
-# が異なり得ることを事後確認できるようにするための参考情報。DB 配置先自体は
-# 変更しない）。
-DB_TEMP_DIR="${TMPDIR:-/tmp}"
 
 {
   echo "commit=$(cd "${REPO_ROOT}" && git rev-parse HEAD)"
