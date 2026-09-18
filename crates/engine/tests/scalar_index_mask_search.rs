@@ -492,3 +492,276 @@ fn mask_path_stays_consistent_after_table_generation_bump() {
     let after_insert_hot = run(&core, "tenant-a", sql);
     assert_eq!(result_ids(&after_insert), result_ids(&after_insert_hot));
 }
+
+// --- Issue #660 系（Step 4）: 索引信頼マスク経路（候補への再適用省略） -------
+//
+// `classify_scalar_plan != PlainScan`（残余述語なしが静的に保証される）かつ
+// 索引↔スナップショット同一性ガード通過時に限り、候補スロットへの
+// `on_visible_row` 再適用（masked decode ＋ `matches_all` ＋ 式述語評価）を省き、
+// 候補スロット列をそのまま `search_subset` のマスクとして渡す経路の検証。
+//
+// 対照は「意味的に同値だが索引で完全被覆されない述語」を足して
+// `ScalarPlan::PlainScan` へ落とした従来の再適用経路（`id + 0 > 0` は
+// `id_predicate_from_expr` が受理しない残余述語であり、本フィクスチャ〔`id >= 1`〕
+// では常に真）。
+
+fn new_core_plain(storage: Storage) -> EngineCore {
+    EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider))
+}
+
+/// `sql`（索引信頼経路）と `control_sql`（plain scan 経路）の結果が
+/// id・スコアのビットパターン・投影セルまで完全一致し、かつ前者が実際に
+/// 索引信頼経路（`index_trusted_mask_scans` 増加）・後者が plain scan 経路
+/// （同カウンタ非増加）であることを確認する。
+fn assert_trusted_mask_matches_plain_scan(
+    core: &EngineCore,
+    tenant: &str,
+    sql: &str,
+    control_sql: &str,
+) {
+    // 索引を温める（cold は piggyback 構築のみで信頼経路に乗らないため）。
+    let _ = run(core, tenant, sql);
+    let before = core.scalar_index_cache_stats().index_trusted_mask_scans;
+    let trusted = run(core, tenant, sql);
+    let after = core.scalar_index_cache_stats().index_trusted_mask_scans;
+    assert!(
+        after > before,
+        "index-trusted mask path must be taken (non-vacuous) for: {sql}"
+    );
+
+    let before_control = core.scalar_index_cache_stats().index_trusted_mask_scans;
+    let control = run(core, tenant, control_sql);
+    let after_control = core.scalar_index_cache_stats().index_trusted_mask_scans;
+    assert_eq!(
+        after_control, before_control,
+        "control query must stay on the re-applied plain scan path: {control_sql}"
+    );
+
+    assert_eq!(
+        result_rows_with_cells(&trusted),
+        result_rows_with_cells(&control),
+        "index-trusted mask result must equal the re-applied path bit-for-bit: \
+         {sql} vs {control_sql}"
+    );
+}
+
+#[test]
+fn trusted_mask_matches_plain_scan_for_each_predicate_shape() {
+    let path = unique_db_path("scalar-index-mask-trusted-shapes");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core_plain(storage);
+
+    // 等価（IndexEquality）・`SELECT id` のみ（投影列なし）
+    assert_trusted_mask_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT id FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[10.0,0.0]' LIMIT 10",
+        "SELECT id FROM docs WHERE kind = 'a' AND id + 0 > 0 \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 10",
+    );
+    // 等価・スカラー列投影あり（投影遅延で Top-k 分のみデコード）
+    assert_trusted_mask_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT id, kind, path FROM docs WHERE kind = 'a' \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 3",
+        "SELECT id, kind, path FROM docs WHERE kind = 'a' AND id + 0 > 0 \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 3",
+    );
+    // 前方一致（IndexPrefix）
+    assert_trusted_mask_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT id, path FROM docs WHERE path LIKE 'even/%' \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 10",
+        "SELECT id, path FROM docs WHERE path LIKE 'even/%' AND id + 0 > 0 \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 10",
+    );
+    // `id` 範囲（IndexIdRange）
+    assert_trusted_mask_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT id, kind FROM docs WHERE id > 5 ORDER BY embedding <=> '[10.0,0.0]' LIMIT 10",
+        "SELECT id, kind FROM docs WHERE id > 5 AND id + 0 > 0 \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 10",
+    );
+    // 交差（IndexConjunction）
+    assert_trusted_mask_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT id, kind FROM docs WHERE kind = 'a' AND id > 5 \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 10",
+        "SELECT id, kind FROM docs WHERE kind = 'a' AND id > 5 AND id + 0 > 0 \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 10",
+    );
+    // `precision` モード（SEARCH-9 の確信度ゲート）。ゲートは DISTANCE 段が
+    // 返す Top-2 のマージンで判定するため、索引信頼マスクが一致集合そのもの
+    // （超集合でない）でなければ誤ったマージンを見て fail-open／fail-closed を
+    // 取り違える。信頼経路でも再適用経路と完全一致することを固定する。
+    assert_trusted_mask_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT id FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[10.0,0.0]' \
+         LIMIT 1 USING MODE 'precision'",
+        "SELECT id FROM docs WHERE kind = 'a' AND id + 0 > 0 \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 1 USING MODE 'precision'",
+    );
+    // 一致 0 件
+    assert_trusted_mask_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT id FROM docs WHERE kind = 'zzz' ORDER BY embedding <=> '[10.0,0.0]' LIMIT 10",
+        "SELECT id FROM docs WHERE kind = 'zzz' AND id + 0 > 0 \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 10",
+    );
+}
+
+#[test]
+fn trusted_mask_matches_plain_scan_on_tie_inducing_corpus() {
+    let path = unique_db_path("scalar-index-mask-trusted-ties");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_tie_inducing_rows(&storage, "tenant-a");
+    let core = new_core_plain(storage);
+
+    // 偶数 `id`（kind='a'）は全て同一 embedding。同点タイブレーク（id 昇順）が
+    // 信頼経路と再適用経路で完全一致することを固定する。
+    assert_trusted_mask_matches_plain_scan(
+        &core,
+        "tenant-a",
+        "SELECT id, kind FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 5",
+        "SELECT id, kind FROM docs WHERE kind = 'a' AND id + 0 > 0 \
+         ORDER BY embedding <=> '[1.0,0.0]' LIMIT 5",
+    );
+}
+
+#[test]
+fn trusted_mask_never_leaks_other_tenant_private_rows() {
+    let path = unique_db_path("scalar-index-mask-trusted-rls");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    // TABLE-12（`id` の一意性スコープはテナント内）の境界を突くため `id` を
+    // tenant-a と重複させる: `id = 2` は `Public`（tenant-a から可視）、
+    // `id = 4` は `Private`（不可視）。`id` 11〜13 は選択度ゲート
+    // （一致率 > 1/2 で plain scan へ縮退）に掛からないための詰め物。
+    let other = ctx("tenant-b");
+    insert_row(
+        &storage,
+        &other,
+        2,
+        [2.0, 5.0],
+        "a",
+        "other/2",
+        Visibility::Public,
+    );
+    insert_row(
+        &storage,
+        &other,
+        4,
+        [4.0, 5.0],
+        "a",
+        "other/4",
+        Visibility::Private,
+    );
+    for id in 11..=13u64 {
+        insert_row(
+            &storage,
+            &other,
+            id,
+            [id as f32, 5.0],
+            "b",
+            &format!("other/{id}"),
+            Visibility::Public,
+        );
+    }
+    let core = new_core_plain(storage);
+
+    let sql = "SELECT id, path FROM docs WHERE kind = 'a' \
+               ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20";
+    assert_trusted_mask_matches_plain_scan(
+        &core,
+        "tenant-a",
+        sql,
+        "SELECT id, path FROM docs WHERE kind = 'a' AND id + 0 > 0 \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20",
+    );
+
+    let result = run(&core, "tenant-a", sql);
+    // 自テナント 5 件（id 2,4,6,8,10）＋他テナントの Public 重複 id=2 の 1 件。
+    // 他テナントの Private（id=4・path "other/4"）は含まれない。
+    assert_eq!(result_ids(&result), vec![2, 2, 4, 6, 8, 10]);
+    let cells = result
+        .rows
+        .iter()
+        .map(|r| format!("{:?}", r.cells))
+        .collect::<Vec<_>>()
+        .join("|");
+    assert!(
+        !cells.contains("other/4"),
+        "other tenant's Private row must never appear: {cells}"
+    );
+    assert!(
+        cells.contains("other/2"),
+        "other tenant's Public duplicate id must appear: {cells}"
+    );
+}
+
+#[test]
+fn trusted_mask_is_not_used_across_a_table_generation_bump() {
+    let path = unique_db_path("scalar-index-mask-trusted-generation");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core_plain(storage);
+
+    let sql = "SELECT id FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20";
+    let _ = run(&core, "tenant-a", sql);
+    let warm = run(&core, "tenant-a", sql);
+    assert_eq!(result_ids(&warm), vec![2, 4, 6, 8, 10]);
+    let before = core.scalar_index_cache_stats().index_trusted_mask_scans;
+    assert!(before > 0, "warm 実行で索引信頼経路へ到達しているはず");
+
+    // 書き込みでテーブル世代が進む。`EngineCore` が `Storage` の所有権を握るため
+    // SQL 表層の `INSERT` を経由する（`tests/sql_arena_cache.rs` と同じ流儀）。
+    core.execute_insert_sql(
+        &ctx("tenant-a"),
+        "INSERT INTO docs (id, embedding, kind, path) \
+         VALUES (99, '[99.0,0.0]', 'a', 'even/99') USING OPERATION_ID 'mask-trusted-bump'",
+    )
+    .expect("insert must succeed");
+    // 選択度ゲート（一致率 > 1/2 で plain scan へ縮退）に掛からないよう、
+    // `kind = 'b'` の詰め物も同時に投入する（kind='a' は 6/14）。
+    for id in 101..=103u64 {
+        core.execute_insert_sql(
+            &ctx("tenant-a"),
+            &format!(
+                "INSERT INTO docs (id, embedding, kind, path) \
+                 VALUES ({id}, '[{id}.0,1.0]', 'b', 'odd/{id}') \
+                 USING OPERATION_ID 'mask-trusted-pad-{id}'"
+            ),
+        )
+        .expect("insert must succeed");
+    }
+
+    // 直後のクエリは索引・スナップショットとも失効しており、信頼経路へは入らず
+    // （カウンタ非増加）新しい行を反映した正しい結果を返す。
+    let after_write = run(&core, "tenant-a", sql);
+    let after = core.scalar_index_cache_stats().index_trusted_mask_scans;
+    assert_eq!(
+        after, before,
+        "stale index must never be trusted right after a table generation bump"
+    );
+    assert_eq!(result_ids(&after_write), vec![2, 4, 6, 8, 10, 99]);
+
+    // 再構築後は再び信頼経路へ戻り、結果は不変。
+    let rewarm = run(&core, "tenant-a", sql);
+    assert!(core.scalar_index_cache_stats().index_trusted_mask_scans > after);
+    assert_eq!(result_ids(&rewarm), vec![2, 4, 6, 8, 10, 99]);
+}

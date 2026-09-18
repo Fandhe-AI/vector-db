@@ -180,3 +180,32 @@ build_from_cached_rls_rows_subset_with_all_slots_matches_full_scan`）。非昇�
 段別プロファイル・crossdb 双方を実施済み（`vector_knn_where` の e2e min-of-N
 比で段別 0.5177・crossdb 0.6767。同ドキュメント「前後比較実測（Issue #655）」
 節参照。共有環境の参考値のため専有環境再実測は引き続きオーナーへ申し送り）。
+
+## Issue #844: 索引で完全被覆された述語の候補再検証省略（多層防御の限定緩和）
+
+本 doc の「索引は行を『絞る』ことしかできず『通す』ことはできない」設計を、オーナー承認（2026-09-18）のもと次の 3 条件を**全て**満たす場合に限り緩和し、候補スロットへ `on_visible_row`（マスク済みデコード＋ `matches_all` 再適用）を掛け直さずに候補集合をそのまま信頼する。
+
+1. `classify_scalar_plan` が `PlainScan` 以外で、残余述語（索引非対応述語・式述語）が無い（静的判定）
+2. `ScalarIndex::resolve_candidates` が `Use` を返す（`FallbackSelectivity`〔1/2〕による plain scan 縮退は従来どおり）
+3. 索引↔スナップショット同一性ガード（行数＋テーブル世代）を通過する
+
+索引は `(table, PolicyContext)` 可視スナップショットから構築される（Issue #473）ため、この緩和でテナント境界は変わらない。hybrid・HNSW `Subset` 形状・`HINT ORDER`・`COUNT(col)`（NULL 判定が必要）は従来経路のまま。
+
+### 実装箇所
+
+- `sql/exec.rs`: 信頼マスク分岐 `mask_trusted_defer`（候補スロットを直接 `ScalarSource::Deferred(DeferredScalars::Snapshot)` へ渡す。`SELECT id` 単独投影でも `EagerSubset` へ落ちない）
+- `sql/aggregate.rs::count_star_only`／`Accumulator::observe_present_n`（`COUNT(*)` のみの集計で候補件数を直読み。非 Count 累算器へ到達した場合は `accumulator_bug` として fail-closed）
+- `sql/group_by.rs::observe_group_count_only`（列挙形・`COUNT(*)` のみ・`WHERE` なしのとき辞書 posting 長をグループ件数として直読み。`MAX_GROUPS`・キーバイト上限は維持）
+- `sql/scalar_index.rs::ScalarIndexCacheStats::index_trusted_mask_scans`（非 vacuous 証跡用カウンタ。`SqlArenaCacheStats::fast_path_borrows`／`full_rebuild_copies` と合わせて pub フィールド 3 件を追加）
+
+### 差し戻し手順
+
+設計方針を元に戻す場合は次の 3 箇所を撤去すれば Issue #474 の候補再適用経路へ戻る（他の変更はそのまま残せる）。
+
+1. `sql/exec.rs` の `mask_trusted_defer` 分岐（`hnsw_subset_eligible` 判定の直後）
+2. `sql/aggregate.rs::try_scalar_index_aggregate` の `count_star_only` 早期リターン
+3. `sql/group_by.rs::observe_group_count_only` の呼び出し
+
+### 検証
+
+`crates/engine/tests/scalar_index_mask_search.rs`（5 述語形状で plain-scan オラクル〔`AND id + 0 > 0` で索引を無効化〕と結果一致・他テナント private 行の非漏えい・世代 bump 後の不使用）・`tests/scalar_index_aggregate.rs`（NULL グループ・TABLE-12 重複 id を含む）。A/B 実測は `docs/design/crossdb-loss-analysis-20260918.md` §4.4。

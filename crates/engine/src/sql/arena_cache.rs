@@ -76,6 +76,16 @@ pub struct SqlArenaCacheStats {
     pub capacity_evictions: u64,
     /// 現在キャッシュが保持しているエントリ数。
     pub entries: usize,
+    /// キャッシュヒット後に SCALAR 段が恒等写像と判定でき、`VectorArena` を
+    /// 一切複製せずキャッシュ済みスナップショットを借用したまま実行できた回数
+    /// （`sql::exec::execute_statement_with_cache` の高速経路。Issue #363・
+    /// hybrid への拡張は Issue #660 の改善候補 P1）。
+    pub fast_path_borrows: u64,
+    /// キャッシュヒットにもかかわらず、SCALAR 段に実質的な処理があるため
+    /// 可視全行を `VectorArena::build_from_cached_rls_rows` で複製し直した回数。
+    /// hybrid 経路が高速経路へ載ったことの非 vacuous な証跡（＝この値が増えない
+    /// こと）として `tests/sql_arena_cache.rs` が固定する。
+    pub full_rebuild_copies: u64,
 }
 
 /// `sql::exec::execute_statement_with_cache` が [`SqlArenaCache`] に格納・再利用する
@@ -179,6 +189,8 @@ pub(crate) struct SqlArenaCache {
     misses: AtomicU64,
     stale_evictions: AtomicU64,
     capacity_evictions: AtomicU64,
+    fast_path_borrows: AtomicU64,
+    full_rebuild_copies: AtomicU64,
 }
 
 impl SqlArenaCache {
@@ -190,7 +202,22 @@ impl SqlArenaCache {
             misses: AtomicU64::new(0),
             stale_evictions: AtomicU64::new(0),
             capacity_evictions: AtomicU64::new(0),
+            fast_path_borrows: AtomicU64::new(0),
+            full_rebuild_copies: AtomicU64::new(0),
         }
+    }
+
+    /// キャッシュヒット後に借用高速経路（複製なし）を選んだことを記録する。
+    /// 呼び出し元は `sql::exec::execute_statement_with_cache` のみ。
+    pub(crate) fn record_fast_path_borrow(&self) {
+        self.fast_path_borrows.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// キャッシュヒット後に可視全行の複製（`build_from_cached_rls_rows`）へ
+    /// 落ちたことを記録する。呼び出し元は
+    /// `sql::exec::execute_statement_with_cache` のみ。
+    pub(crate) fn record_full_rebuild_copy(&self) {
+        self.full_rebuild_copies.fetch_add(1, Ordering::Relaxed);
     }
 
     /// `(table, ctx)` に一致し、`read_txn` のスナップショットにおけるテーブル世代と
@@ -362,6 +389,8 @@ impl SqlArenaCache {
             stale_evictions: self.stale_evictions.load(Ordering::Relaxed),
             capacity_evictions: self.capacity_evictions.load(Ordering::Relaxed),
             entries,
+            fast_path_borrows: self.fast_path_borrows.load(Ordering::Relaxed),
+            full_rebuild_copies: self.full_rebuild_copies.load(Ordering::Relaxed),
         }
     }
 }

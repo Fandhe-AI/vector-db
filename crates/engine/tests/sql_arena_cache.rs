@@ -455,3 +455,93 @@ fn deferred_scalar_projection_cache_hit_matches_cold_cache() {
         "SELECT id, body FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 4",
     );
 }
+
+/// Issue #660 P1（hybrid の借用高速経路）: `SparseIndexCache` がヒットした
+/// 2 回目以降の hybrid クエリは、SCALAR 段が恒等写像になるため `VectorArena` を
+/// 一切複製せずキャッシュ済みスナップショットを借用する。
+///
+/// cold（1 回目）は疎索引キャッシュがミスのため本文列を蓄積する必要があり
+/// 複製経路（`full_rebuild_copies`）を通り、warm（2 回目以降）は借用経路
+/// （`fast_path_borrows`）へ載ることをカウンタで固定する（非 vacuous 性）。
+/// 結果自体が cold と完全一致することは
+/// `hybrid_rrf_cache_hit_matches_cold_cache` が別途固定している。
+#[test]
+fn hybrid_cache_hit_takes_borrowed_fast_path_without_arena_copy() {
+    let path = unique_db_path("sql-arena-cache-hybrid-fast-path");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    setup_hybrid_docs_table(&storage);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let core = new_core(storage);
+
+    let sql =
+        "SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'vector database') \
+         LIMIT 4";
+
+    let cold = core.execute_sql(&ctx, sql).expect("cold hybrid query");
+    let after_cold = core.sql_arena_cache_stats();
+    assert_eq!(after_cold.misses, 1, "1 回目はアリーナキャッシュミス");
+    assert_eq!(
+        after_cold.fast_path_borrows, 0,
+        "1 回目はキャッシュミスのため借用高速経路を通らない"
+    );
+
+    let warm = core.execute_sql(&ctx, sql).expect("warm hybrid query");
+    let after_warm = core.sql_arena_cache_stats();
+    assert_eq!(after_warm.hits, 1, "2 回目はアリーナキャッシュヒット");
+    assert_eq!(
+        after_warm.fast_path_borrows, 1,
+        "疎索引キャッシュヒット後の hybrid は借用高速経路へ載る（Issue #660 P1）"
+    );
+    assert_eq!(
+        after_warm.full_rebuild_copies, 0,
+        "借用高速経路では可視全行の VectorArena 複製が発生しない"
+    );
+    assert_eq!(cold, warm, "借用高速経路の結果は複製経路と完全一致する");
+}
+
+/// Issue #660 P2（hybrid の投影遅延）: 疎索引キャッシュヒット時は hybrid でも
+/// `defer_projection` が効き、`body` 等のスカラー投影は Top-k 確定後の k 行
+/// だけをデコードする。cold（複製経路・全行 `body` 複製）と warm（借用高速
+/// 経路・遅延デコード）で投影セル値まで完全一致することを固定する。
+#[test]
+fn hybrid_scalar_projection_cache_hit_matches_cold_cache_deferred() {
+    assert_cold_equals_warm(
+        "sql-arena-cache-hybrid-deferred",
+        "SELECT id, body FROM docs \
+         ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'vector database') LIMIT 3",
+    );
+}
+
+/// Issue #660 P2 の非 vacuous 性: `body` を投影する hybrid でも warm 実行は
+/// 借用高速経路（複製 0 回）へ載る。
+#[test]
+fn hybrid_scalar_projection_cache_hit_takes_borrowed_fast_path() {
+    let path = unique_db_path("sql-arena-cache-hybrid-proj-fast-path");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    setup_hybrid_docs_table(&storage);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let core = new_core(storage);
+
+    let sql = "SELECT id, body FROM docs \
+               ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'vector database') LIMIT 3";
+
+    let cold = core
+        .execute_sql(&ctx, sql)
+        .expect("cold hybrid projection query");
+    let warm = core
+        .execute_sql(&ctx, sql)
+        .expect("warm hybrid projection query");
+    let stats = core.sql_arena_cache_stats();
+    assert_eq!(stats.hits, 1);
+    assert_eq!(
+        stats.fast_path_borrows, 1,
+        "投影列ありの hybrid も疎索引キャッシュヒット後は借用高速経路へ載る"
+    );
+    assert_eq!(
+        stats.full_rebuild_copies, 0,
+        "借用高速経路では可視全行の VectorArena 複製が発生しない"
+    );
+    assert_eq!(cold, warm, "遅延デコードの投影値は複製経路と完全一致する");
+}

@@ -1049,6 +1049,15 @@ pub struct ScalarIndexCacheStats {
     /// キャッシュ済みスナップショットの `VectorArena` を借用したまま
     /// スロットマスクで直接探索できた回数（`index_scans` の部分集合）。
     pub index_mask_scans: u64,
+    /// Issue #660 系（索引経路の残存コスト削減。Step 4）: `index_mask_scans`
+    /// のうち、候補スロットへの `on_visible_row` 再適用（masked decode ＋
+    /// `matches_all` ＋ 式述語評価）自体を省き、索引の候補集合をそのまま
+    /// 一致集合として `SearchProvider::search_subset` のマスクへ渡した回数
+    /// （`index_mask_scans` の部分集合）。信頼してよい不変条件は
+    /// `sql::aggregate::count_star_only` のドキュメント（1〜3）と同じで、
+    /// DISTANCE 経路では「`COUNT(*)` のみ」の代わりに「hybrid でない・
+    /// HNSW `Subset` 形状でない」を要求する（`sql::exec` の該当分岐参照）。
+    pub index_trusted_mask_scans: u64,
     /// Issue #474: `sql::exec` が索引対応述語を持つクエリで全走査へ縮退した
     /// 回数（`FallbackNoIndex`／`FallbackSelectivity`／同一性ガード不一致
     /// いずれも含む）。
@@ -1131,6 +1140,7 @@ pub(crate) struct ScalarIndexCache {
     build_failures: AtomicU64,
     index_scans: AtomicU64,
     index_mask_scans: AtomicU64,
+    index_trusted_mask_scans: AtomicU64,
     plain_scan_fallbacks: AtomicU64,
     aggregate_index_scans: AtomicU64,
     aggregate_plain_scan_fallbacks: AtomicU64,
@@ -1149,6 +1159,7 @@ impl ScalarIndexCache {
             build_failures: AtomicU64::new(0),
             index_scans: AtomicU64::new(0),
             index_mask_scans: AtomicU64::new(0),
+            index_trusted_mask_scans: AtomicU64::new(0),
             plain_scan_fallbacks: AtomicU64::new(0),
             aggregate_index_scans: AtomicU64::new(0),
             aggregate_plain_scan_fallbacks: AtomicU64::new(0),
@@ -1316,6 +1327,7 @@ impl ScalarIndexCache {
             entries,
             index_scans: self.index_scans.load(Ordering::Relaxed),
             index_mask_scans: self.index_mask_scans.load(Ordering::Relaxed),
+            index_trusted_mask_scans: self.index_trusted_mask_scans.load(Ordering::Relaxed),
             plain_scan_fallbacks: self.plain_scan_fallbacks.load(Ordering::Relaxed),
             aggregate_index_scans: self.aggregate_index_scans.load(Ordering::Relaxed),
             aggregate_plain_scan_fallbacks: self
@@ -1343,6 +1355,15 @@ impl ScalarIndexCache {
     /// 探索できたことを観測用統計へ計上する（`index_scans` の部分集合）。
     pub(crate) fn record_index_mask_scan(&self) {
         self.index_mask_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Issue #660 系（Step 4）: `sql::exec` が索引の候補集合を一致集合として
+    /// 信頼し、候補スロットへの `on_visible_row` 再適用を省いたことを観測用
+    /// 統計へ計上する（`index_mask_scans` の部分集合）。テストが「索引信頼
+    /// 経路が実際に使われた」ことを非 vacuous に固定するために参照する。
+    pub(crate) fn record_index_trusted_mask_scan(&self) {
+        self.index_trusted_mask_scans
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Issue #474: `sql::exec` が索引対応述語を持つクエリで全走査へ縮退した

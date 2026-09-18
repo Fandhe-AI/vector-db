@@ -590,9 +590,19 @@ pub(crate) fn execute_statement_with_cache(
     // 3 条件が成り立つ場合、SCALAR 段は `HINT ORDER` の内容に関係なく事前・事後
     // いずれの等価条件判定も持たない恒等写像になるため、遅延しても既存の実行順序
     // 契約（モジュールドキュメント「RLS → SCALAR → DISTANCE」）を変えない。
+    //
+    // Issue #660 の改善候補 P2: 「hybrid でない」条件を
+    // 「hybrid なら疎索引キャッシュヒット時のみ」へ緩和する。hybrid が
+    // 遅延対象外だったのは `on_visible_row` が疎コーパス（本文 `TEXT` 列）の
+    // 蓄積のために必ず行を走査する必要があったためで、`SparseIndexCache`
+    // （Issue #357）がヒットしていれば（`skip_sparse_accumulation`）その蓄積は
+    // 行われず SCALAR 段は恒等写像になる。この場合の投影列デコードは
+    // Top-k 確定後（`ScalarSource::Deferred`）へ安全に遅らせられる
+    // （hybrid の Top-k スロット番号はアリーナ＝スナップショットのスロット
+    // 番号そのものであり、`DeferredScalars::Snapshot` の添字と一致する）。
     let defer_projection = bound.metadata_filters.is_empty()
         && bound.expr_filters.is_empty()
-        && !is_hybrid
+        && (!is_hybrid || skip_sparse_accumulation)
         && !needed_column_indices.is_empty();
 
     // `candidate_columns` に保持する Text 値の実バイト数に加え、行ごとに必ず確保する
@@ -781,8 +791,27 @@ pub(crate) fn execute_statement_with_cache(
     // 影響しなくなった（`defer_projection` が真のとき `on_visible_row` は
     // `needed_column_indices` の中身に関係なく空 `Vec` を積むだけの早期リターンに
     // なる）ため、この条件は不要になり撤去した。
-    let cache_fast_path_eligible =
-        bound.metadata_filters.is_empty() && bound.expr_filters.is_empty() && !is_hybrid;
+    //
+    // Issue #660 の改善候補 P1: (c) の「hybrid でない」は、hybrid が
+    // `on_visible_row` で疎コーパス（本文 `TEXT` 列）を蓄積する必要があることに
+    // 由来する条件だった。`SparseIndexCache`（Issue #357）がヒットした場合
+    // （`skip_sparse_accumulation`）はその蓄積自体が省略される
+    // （`on_visible_row` 本体の `if is_hybrid && !skip_sparse_accumulation`）ため、
+    // hybrid でも SCALAR 段は恒等写像になり高速経路へ載せられる。ヒットした
+    // 疎索引の `DocId` は構築時のスロット番号であり、高速経路が借用する
+    // スナップショットのスロット番号と同一（同一 `(table, ctx)` × 同一テーブル
+    // 世代のキャッシュキーで揃う。複製経路でも `build_from_cached_rls_rows` は
+    // 全行を順に通すためスロット写像は恒等）。`skip_sparse_accumulation` が偽
+    // （疎キャッシュミス・`sparse_cache` 非配線）の場合は従来どおり複製経路。
+    //
+    // 投影が候補スカラー列を参照する場合（`needed_column_indices` が非空）は
+    // `defer_projection`（Issue #453・P2 で hybrid へも拡張）が Top-k 確定後の
+    // 遅延デコードを担うため、高速経路側に追加条件は要らない
+    // （`defer_projection` と本条件はいずれも同じ「SCALAR 段が恒等写像」を
+    // 判定しており、hybrid 時の `skip_sparse_accumulation` 要求も共通）。
+    let cache_fast_path_eligible = bound.metadata_filters.is_empty()
+        && bound.expr_filters.is_empty()
+        && (!is_hybrid || skip_sparse_accumulation);
 
     // Issue #474: SCALAR 事前フィルタの索引対応述語形状の静的判定
     // （`sql::scalar_plan::classify_scalar_plan`）。索引の gated 構築（下記）と
@@ -840,6 +869,14 @@ pub(crate) fn execute_statement_with_cache(
     // モジュールドキュメント冒頭・`docs/design/scalar-index-mask-search.md`・
     // `docs/design/hnsw-rls-cardinality-switch.md` 参照）。
     let mut mask_kept_slots: Option<Vec<u32>> = None;
+    // Issue #660 系（Step 4）: 索引信頼マスク経路（下記）を通った場合に立てる。
+    // この経路は `on_visible_row` を一度も呼ばないため `candidate_columns` が
+    // 空のままになる。投影がスカラー列を参照する場合の取得元は
+    // `defer_projection`（Issue #453）と同じ `ScalarSource::Deferred`
+    // （キャッシュヒット済みスナップショットの metadata をスロット添字で引く）
+    // に委ねる必要があるため、投影段の分岐で `defer_projection` と同値に扱う。
+    // `defer_projection` 自体は `WHERE` なしを要求するためこの経路では常に偽。
+    let mut mask_trusted_defer = false;
     let arena: &VectorArena = match arena_cache {
         None => owned_arena.insert(
             VectorArena::build_filtered_with_rows_in_txn(
@@ -883,6 +920,10 @@ pub(crate) fn execute_statement_with_cache(
                     // 共有借用（`scalar_source` の組み立て）と競合する（E0502）。
                     // 共有借用同士は共存できるためこの形にする。
                     scalar_snapshot_for_index = Some(std::sync::Arc::clone(&snapshot));
+                    // 借用高速経路の観測用カウンタ（`SqlArenaCacheStats::
+                    // fast_path_borrows`）。hybrid がこの経路へ載ったことの
+                    // 非 vacuous な証跡としてテストが参照する。
+                    sql_cache.record_fast_path_borrow();
                     cache_hit_snapshot = Some(snapshot);
                     cache_hit_snapshot
                         .as_ref()
@@ -982,18 +1023,63 @@ pub(crate) fn execute_statement_with_cache(
                     // 参照）。hybrid の `Subset` 形状（疎コーパスの `DocId` が
                     // スロット番号に依存するため）のみ対象外で従来どおり複製経路
                     // を使う。
-                    if let Some(slots) = index_candidate_slots.as_ref() {
+                    if let Some(slots) = index_candidate_slots.take() {
                         if !is_hybrid {
-                            let kept = VectorArena::filter_cached_rls_rows_subset(
-                                expected_dim,
-                                snapshot.arena(),
-                                snapshot.metadata(),
-                                slots,
-                                on_visible_row,
-                                crate::arena::MAX_ARENA_ROWS,
-                                crate::arena::MAX_ARENA_TOTAL_BYTES,
-                            )
-                            .map_err(|e| map_arena_error(&bound.table, e))?;
+                            // Issue #660 系（Step 4）: 索引の候補集合を一致集合と
+                            // して信頼し、候補スロットへの `on_visible_row` 再適用
+                            // （masked decode ＋ `matches_all` ＋ 式述語評価）を
+                            // 省く。信頼してよい不変条件は
+                            // `sql::aggregate::count_star_only` のドキュメント
+                            // （1〜3）と同型で、DISTANCE 経路では次をすべて満たす
+                            // 場合に限る:
+                            //
+                            // 1. `WHERE` が索引で完全被覆されている——この分岐は
+                            //    `scalar_plan_kind != PlainScan`（残余述語ゼロが
+                            //    `sql::scalar_plan` の契約により静的に保証される）
+                            //    かつ `resolve_candidates` が `Use` を返した場合
+                            //    にしか到達しない。
+                            // 2. 索引↔スナップショット同一性ガード（行数・構築
+                            //    世代の一致）を通過している（直上の分岐で検査済み）。
+                            // 3. hybrid でない（疎コーパスの `DocId` 割当が絡まない）
+                            //    かつ HNSW `Subset` 形状でない——後者は ANN 探索へ
+                            //    進む場合に `candidate_columns` をスロット写像
+                            //    （`ScalarSource::EagerSubset`）で引く既存契約
+                            //    （Issue #676）があり、本 Step の対象外として
+                            //    従来どおり再適用経路を通す。
+                            //
+                            // 崩れた場合は下の従来経路（`filter_cached_rls_rows_
+                            // subset` による候補行への `on_visible_row` 再適用）へ
+                            // 落ちるだけで、クエリの正しさ・テナント境界は不変。
+                            let kept = if !hnsw_subset_eligible {
+                                if let Some(scalar_access) = scalar_cache.as_ref() {
+                                    scalar_access.cache.record_index_trusted_mask_scan();
+                                }
+                                // 投影段は常に `ScalarSource::Deferred(Snapshot)`
+                                // 側へ倒す。`EagerSubset` は
+                                // `candidate_columns` が候補行ぶん埋まっている
+                                // ことを前提に `kept_slots` 経由で引く契約
+                                // （Issue #654）であり、この経路では
+                                // `on_visible_row` を一度も呼ばないため空のまま
+                                // ＝ fail-closed な内部エラーになる。投影列が
+                                // 無い（`SELECT id`）場合も `needed_mask` が
+                                // 全 false になるだけで Top-k 行のデコードは
+                                // 実質発生しない（`tests/scalar_index_mask_search.rs::
+                                // trusted_mask_matches_plain_scan_for_each_predicate_shape`
+                                // の `SELECT id` ケースが固定する）。
+                                mask_trusted_defer = true;
+                                slots
+                            } else {
+                                VectorArena::filter_cached_rls_rows_subset(
+                                    expected_dim,
+                                    snapshot.arena(),
+                                    snapshot.metadata(),
+                                    &slots,
+                                    on_visible_row,
+                                    crate::arena::MAX_ARENA_ROWS,
+                                    crate::arena::MAX_ARENA_TOTAL_BYTES,
+                                )
+                                .map_err(|e| map_arena_error(&bound.table, e))?
+                            };
                             if let Some(scalar_access) = scalar_cache.as_ref() {
                                 scalar_access.cache.record_index_scan();
                                 scalar_access.cache.record_index_mask_scan();
@@ -1018,7 +1104,7 @@ pub(crate) fn execute_statement_with_cache(
                                 expected_dim,
                                 snapshot.arena(),
                                 snapshot.metadata(),
-                                slots,
+                                &slots,
                                 on_visible_row,
                                 crate::arena::MAX_ARENA_ROWS,
                                 crate::arena::MAX_ARENA_TOTAL_BYTES,
@@ -1030,6 +1116,10 @@ pub(crate) fn execute_statement_with_cache(
                             owned_arena.insert(built)
                         }
                     } else {
+                        // 可視全行の複製経路（`SqlArenaCacheStats::
+                        // full_rebuild_copies`）。高速経路が働いていれば
+                        // hybrid ではこのカウンタが増えない。
+                        sql_cache.record_full_rebuild_copy();
                         let built = VectorArena::build_from_cached_rls_rows(
                             &bound.table,
                             expected_dim,
@@ -1783,7 +1873,8 @@ pub(crate) fn execute_statement_with_cache(
     // Top-k 行の metadata 取得元（キャッシュヒットなら `SqlArenaSnapshot`、
     // それ以外は候補選択と同一 `read_txn` 上での行テーブル再取得）を
     // `project_rows` へ渡す。
-    let needed_mask: Vec<bool> = if defer_projection {
+    let deferred_projection_source = defer_projection || mask_trusted_defer;
+    let needed_mask: Vec<bool> = if deferred_projection_source {
         let mut mask = vec![false; schema.columns.len()];
         for idx in &needed_column_indices {
             if let Some(slot) = mask.get_mut(*idx) {
@@ -1794,7 +1885,7 @@ pub(crate) fn execute_statement_with_cache(
     } else {
         Vec::new()
     };
-    let scalar_source = if defer_projection {
+    let scalar_source = if deferred_projection_source {
         match &cache_hit_snapshot {
             Some(snapshot) => {
                 ScalarSource::Deferred(DeferredScalars::Snapshot(snapshot.metadata()))
