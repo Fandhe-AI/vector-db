@@ -90,7 +90,7 @@
 //! とも一致させ、両表層が同じ誤りを返すケースを排除する。
 //!
 //! **クエリ集合**: `nosql-api.md`「SQL ↔ NoSQL 対応表」に対応する
-//! search-1〜4・scan-1・agg-1〜4 の 9 ケース（`PARITY_CASES`）を、alice
+//! search-1〜5・scan-1・agg-1〜4 の 10 ケース（`PARITY_CASES`）を、alice
 //! （tenant-a）・bob（tenant-b）・carol（tenant-c）の 3 テナントそれぞれで
 //! 実行する（3 テナントいずれも他テナントの Private 行〔id=11／12〕が
 //! 両表層のどの応答にも現れないことをあわせて検証する）。
@@ -545,7 +545,7 @@ struct ParityCase {
     expected_rows: &'static [&'static [&'static str]],
 }
 
-/// `nosql-api.md`「SQL ↔ NoSQL 対応表」に対応する 9 ケース（Issue #779）。
+/// `nosql-api.md`「SQL ↔ NoSQL 対応表」に対応する 10 ケース（Issue #779）。
 const PARITY_CASES: &[ParityCase] = &[
     ParityCase {
         label: "search1",
@@ -578,6 +578,23 @@ const PARITY_CASES: &[ParityCase] = &[
         json_body: r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"columns":["id"],"hybrid":{"text":"zzz-term-absent-from-any-seed-body"}}"#,
         ordered: true,
         expected_rows: &[&["1"], &["2"], &["3"]],
+    },
+    // codex-review 指摘対応（PR #838）: search4 は語彙不一致の疎側項（どの
+    // seed body にも出現しない語）を使うため、密のみ結果（search1）と偶然
+    // 同一になり、`hybrid.text` を無視して密検索のみへ縮退する退行を本
+    // 比較ハーネスが検出できない。search5 は id=3 の body（"unrelated
+    // topic"）に実在する語 "unrelated" を疎側項に使い、密のみ順位
+    // （id=1,2,3。距離昇順）とは異なる順位（id=3 が繰り上がる）を要求する
+    // ことで、疎側チャネルが実際にランキングへ寄与していることを検出可能
+    // にする（`expected_rows` は `crates/engine/tests/default_preset.rs` と
+    // 同じ `EngineCore::execute_sql` 直接呼び出しで実測して手計算・固定した
+    // 値であり、`docs/spec` には依存しない）。
+    ParityCase {
+        label: "search5",
+        sql: "SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'unrelated') LIMIT 3",
+        json_body: r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"columns":["id"],"hybrid":{"text":"unrelated"}}"#,
+        ordered: true,
+        expected_rows: &[&["3"], &["1"], &["2"]],
     },
     ParityCase {
         label: "scan1",
@@ -1143,7 +1160,7 @@ struct SqlObservation {
 }
 
 /// 無改造の外部 HTTP クライアント（`client` で切替）で、`PARITY_CASES`
-/// 9 ケースを 3 テナント（alice／bob／carol）それぞれで SQL 表層（psql・
+/// 10 ケースを 3 テナント（alice／bob／carol）それぞれで SQL 表層（psql・
 /// 生 wire）と NoSQL 表層（`client`）の双方へ投げ、列名・型・行集合が
 /// 一致することを確認するシナリオ（Issue #779。curl／urllib／fetch の
 /// 3 テストが本関数へ委譲する）。モジュールドキュメント「SQL 経路

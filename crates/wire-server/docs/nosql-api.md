@@ -446,7 +446,7 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 検証コード: `crates/wire-server/tests/nosql3_scan_wire_parity.rs`・
 `nosql4_5_aggregate_wire_parity.rs`・`wire_using_plan.rs`・
 `wire_insert_operation_id.rs`・`crates/engine/tests/default_preset.rs`。
-本対応表の 9 ケース（search-1〜4・scan-1・agg-1〜4）は無改造 `psql`（SQL
+本対応表の 10 ケース（search-1〜5・scan-1・agg-1〜4）は無改造 `psql`（SQL
 表層）と無改造 HTTP クライアント（NoSQL 表層）の双方を実バイナリ経由で
 実行して列名・型・行集合の一致を検証する層 B `three_client_http_e2e.rs`
 （Issue #779。`make e2e-three-client-http`）でも固定している。

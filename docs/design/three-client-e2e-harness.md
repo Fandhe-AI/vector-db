@@ -458,15 +458,20 @@ psql のテキスト表現へ正規化してから比較する（`Cell::Integer`
 ケースを排除する。
 
 **クエリ集合**: `crates/wire-server/docs/nosql-api.md`「SQL ↔ NoSQL 対応
-表」に対応する search-1〜4・scan-1・agg-1〜4 の 9 ケース（`PARITY_CASES`）
+表」に対応する search-1〜5・scan-1・agg-1〜4 の 10 ケース（`PARITY_CASES`）
 を、alice（tenant-a）・bob（tenant-b）・carol（tenant-c）の 3 テナント
 それぞれで実行し、3 テナントいずれも他テナントの Private 行（id=11／12）
-が両表層のどの応答にも現れないことをあわせて検証する。
+が両表層のどの応答にも現れないことをあわせて検証する。search5 は
+codex-review 指摘（PR #838）対応で追加したケースで、search4（どの seed
+body にも出現しない語を疎側項に使う）だけでは `hybrid.text` を無視して
+密検索のみへ縮退する退行を検出できないため、id=3 の body に実在する語
+（"unrelated"）を疎側項に使い密のみ順位とは異なる順位（id=3 が繰り上が
+る）を期待値に固定して疎側チャネルの寄与を検出可能にした。
 
-**実測結果**: 3 クライアント（curl／urllib／fetch）× 3 テナント × 9 ケース
-＝ 81 組すべてで列名・型・行集合が一致することを確認済み（本開発環境。
-`make e2e-three-client-http` の `[e2e-record] parity/<client>: ...` 行で
-`match=true` を確認できる）。実測で発見した意味差は無かった。
+**実測結果**: 3 クライアント（curl／urllib／fetch）× 3 テナント × 10
+ケース＝ 90 組すべてで列名・型・行集合が一致することを確認済み（本開発
+環境。`make e2e-three-client-http` の `[e2e-record] parity/<client>: ...`
+行で `match=true` を確認できる）。実測で発見した意味差は無かった。
 
 production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
 無変更（テスト・docs 専任）。
