@@ -46,6 +46,10 @@
 //!   ルーティング）は #747 が `http` 配下へ追加していく
 //! - [`bind_guard`]: bind アドレスの通信路保護要件検証（TLS 未構成時は loopback 限定。
 //!   TASK-70・WIRE-7）。`main.rs::run_server` の唯一の bind 経路
+//! - [`durability_opt`]: `--durability` opt-in CLI 引数の閉じた語彙パーサ
+//!   （Issue #850。`engine::storage::WriteDurability` へ untrusted な CLI
+//!   文字列から到達する唯一の入口。非既定値選択時の起動ログ警告は
+//!   `main.rs::run_server` の責務）
 //! - [`server`]: 接続受け付けループ・同時接続数の有界化・I/O タイムアウト適用
 //!   （契約値・実装は [`limits`] に委譲）
 //! - [`limits`]: 読み取りタイムアウト・共有接続数リミッター（TASK-69・WIRE-5, WIRE-6）
@@ -81,6 +85,7 @@
 
 pub mod auth;
 pub mod bind_guard;
+pub mod durability_opt;
 pub mod error_response;
 #[cfg(feature = "fault-injection")]
 pub mod fault_injection;

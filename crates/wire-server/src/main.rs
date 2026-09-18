@@ -75,6 +75,24 @@
 //! テナント存在情報に繋がるため `EXPLAIN` の `hnsw_params:` 行へは出さない
 //! （Issue #411 の方針を維持。`sparse_visited_max=` は Issue #497 で既に
 //! 露出済み）。
+//!
+//! `--durability`（Issue #850。親 Issue #849 が公開した
+//! `engine::storage::WriteDurability`・`EngineCore::open_with_durability` へ
+//! `--search-engine`（Issue #656）と同型の opt-in CLI から到達する）:
+//! `immediate`／`none` の閉じた語彙のみを受理し、未指定は `immediate`
+//! （既定・既存挙動とビット同一）のまま不変。不正な値・値欠落・2 回目以降の
+//! 重複指定はいずれも fail-closed で起動エラー（既定へ黙って読み替えない）。
+//! `none` を明示選択すると commit 成功応答は永続を保証しなくなる
+//! （損失ウィンドウの詳細は `docs/design/ingest-write-path.md`「Issue #849
+//! 追記」節参照）ため、`none` 選択時のみ起動ログへ英語の警告を 1 行出す
+//! （`durability_opt::token_for` で診断用トークンへ変換）。値の解決は
+//! `durability_opt::parse` に一本化し、`--search-engine` との組合せは
+//! `open_engine_core` の 4 分岐（既定 durability × エンジン有無・非既定
+//! durability × エンジン有無）で処理する（`EngineCore::from_storage` は
+//! `search_engine_kind()` が構造的に `None` になり `EXPLAIN` の `engine:` 行が
+//! divergent するため使わない。`open_engine_core` のドキュメント参照）。
+//! `EXPLAIN` への durability 設定の露出は対象外。
+//!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
 //! ログ・引数に残さない）。
@@ -156,6 +174,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut full_scan_ratio_raw: Option<String> = None;
     let mut acorn_max_visible_ratio_raw: Option<String> = None;
     let mut sparse_visited_max_raw: Option<String> = None;
+    let mut durability_raw: Option<String> = None;
     // Issue #705（テスト専用・feature `fault-injection` 限定）。feature 無効
     // ビルドではこの変数自体が存在せず、`--fault-inject` は下記 `other =>`
     // 分岐で未知引数として拒否される。
@@ -311,6 +330,28 @@ fn run_server(args: &[String]) -> ExitCode {
                 sparse_visited_max_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::durability_opt::FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires one of {:?}",
+                        wire_server::durability_opt::FLAG,
+                        wire_server::durability_opt::TOKENS
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #850: 起動後に変更できない構成値のため、
+                // `--search-engine`（D6）と同じ理由で 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if durability_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::durability_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                durability_raw = Some(v.clone());
+                i += 2;
+            }
             // Issue #705（テスト専用・feature `fault-injection` 限定）。feature
             // 無効ビルドではこのアームごとコンパイルされず、`--fault-inject`
             // は下の `other =>` で未知引数として拒否される（fail-closed）。
@@ -396,6 +437,23 @@ fn run_server(args: &[String]) -> ExitCode {
             }
         };
 
+    // Issue #850: `--search-engine` と同じく bind・ユーザーストア読込より前に
+    // 決着させる（fail-closed。受理不能な構成のまま listen へ進む経路を
+    // 作らない）。未指定は `resolve_durability(None)` が既定値
+    // （`WriteDurability::Immediate`）を返し、後段の `open_engine_core` が
+    // 既存の `EngineCore::open`／`open_with_engine` 経路とビット同一の分岐を
+    // 通る。
+    let durability = match resolve_durability(durability_raw.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "wire-server: invalid {}: {e}",
+                wire_server::durability_opt::FLAG
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #705（テスト専用・feature `fault-injection` 限定）: `--search-engine`
     // と同じく bind・ユーザーストア読込より前に確定させる（fail-closed。
     // 不正な構成のまま listen へ進む経路を作らない）。`arm` 自体は listen
@@ -462,26 +520,17 @@ fn run_server(args: &[String]) -> ExitCode {
     // 開くことで、DB を開けない状態のまま listen してしまう経路を避ける
     // （fail-closed。TASK-73・WIRE-1）。
     //
-    // Issue #656: `search_engine_kind` が `None`（未指定／`default`）の場合は
-    // `EngineCore::open` を従来どおりそのまま呼ぶ（`open_with_engine
-    // (default_kind())` へは委譲しない。エラー型・メッセージまで既存経路と
-    // ビット同一に保つ設計判断。`search_engine_opt.rs` モジュールドキュメント
-    // 参照）。`Some(kind)` の場合のみ opt-in 経路 `open_with_engine` を使う。
-    let mut core = match search_engine_kind {
-        None => match engine::core::EngineCore::open(&db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("wire-server: failed to open database at {db_path:?}: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
-        Some(kind) => match engine::core::EngineCore::open_with_engine(&db_path, kind) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("wire-server: failed to open database at {db_path:?}: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
+    // Issue #656・#850: `search_engine_kind`（`None`＝未指定／`default`）と
+    // `durability`（既定＝`WriteDurability::Immediate`）の組合せに応じて
+    // 4 分岐で構築する（詳細は [`open_engine_core`] のドキュメント参照）。
+    // 両方が既定のときは従来どおり `EngineCore::open` をそのまま呼ぶため、
+    // エラー型・メッセージまで既存経路とビット同一に保たれる。
+    let mut core = match open_engine_core(&db_path, durability, search_engine_kind) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("wire-server: {e}");
+            return ExitCode::FAILURE;
+        }
     };
     // TASK-117（PLAN-9）: opt-in 注入。未指定（既定）では `query_planner`/
     // `embedder` とも未設定のままとなり、`USING PLAN` は従来どおり
@@ -517,6 +566,18 @@ fn run_server(args: &[String]) -> ExitCode {
     if let Some(kind) = fault_kind {
         wire_server::fault_injection::arm(kind);
         eprintln!("wire-server: fault injection armed: post-commit-panic (test only)");
+    }
+
+    // Issue #850: 非既定 durability（`WriteDurability::None`）を選んだ場合に
+    // 限り、commit 成功応答が永続を保証しない旨を起動ログへ明示する。既定
+    // （`Immediate`）選択時・未指定時はこの行を一切出さない（既存 stderr を
+    // ビット同一のまま保つ。`fault injection armed` → `listening on` の行順序
+    // 依存ハーネスと同じ理由で、`listening on` より前・bind 成功後に置く）。
+    if durability != engine::storage::WriteDurability::default() {
+        eprintln!(
+            "wire-server: WARNING: --durability {} selected; commit success responses do not guarantee data survives a process crash or power loss until a later durable commit (see docs/design/ingest-write-path.md, RECOVER-5/RECOVER-6)",
+            wire_server::durability_opt::token_for(durability)
+        );
     }
 
     // Issue #735（HTTP-1）: `nosql` 選択時のみ、選ばれた表層を示す 1 行を
@@ -713,6 +774,62 @@ fn resolve_surface(raw: Option<&str>) -> Result<wire_server::surface::Surface, S
     match raw {
         None => Ok(wire_server::surface::Surface::Sql),
         Some(raw) => wire_server::surface::parse(raw),
+    }
+}
+
+/// `--durability` の値（未指定は `None`）から
+/// [`engine::storage::WriteDurability`] を解決する（Issue #850）。純関数として
+/// 切り出し、`std::env::args()` を直接読まずに単体テストできるようにする
+/// （`resolve_search_engine`・`resolve_surface` と同じ流儀）。`raw` が `None`
+/// は既定 [`engine::storage::WriteDurability::default`]（`Immediate`）、
+/// [`wire_server::durability_opt::TOKENS`] のいずれとも厳密一致しない場合は
+/// `Err`（fail-closed。既定へ黙って読み替えない）。
+fn resolve_durability(raw: Option<&str>) -> Result<engine::storage::WriteDurability, String> {
+    match raw {
+        None => Ok(engine::storage::WriteDurability::default()),
+        Some(raw) => wire_server::durability_opt::parse(raw),
+    }
+}
+
+/// `durability`・`search_engine_kind` の組合せから `EngineCore` を構築する
+/// choke point（Issue #850）。4 分岐すべてを 1 箇所へ集約することで、
+/// `run_server` からは `match` を持ち出さずに呼べるようにし、`main.rs` 内
+/// `#[cfg(test)] mod tests` から直接呼んで検証できるようにする。
+///
+/// - 既定 durability・既定エンジン: [`engine::core::EngineCore::open`] を
+///   従来どおりそのまま呼ぶ（エラー型・メッセージまで既存経路とビット同一に
+///   保つ設計判断。`search_engine_opt.rs` モジュールドキュメント参照）。
+/// - 既定 durability・ANN opt-in: [`engine::core::EngineCore::open_with_engine`]。
+/// - 非既定 durability・既定エンジン: [`engine::core::EngineCore::open_with_durability`]
+///   （Issue #849 が公開した durability 版）。
+/// - 非既定 durability・ANN opt-in: [`engine::storage::Storage::open_with_durability`]
+///   で `Storage` を開いたうえで [`engine::core::EngineCore::from_storage_with_engine`]
+///   へ渡す。
+///
+/// **`EngineCore::from_storage`（`search_engine_kind()` が構造的に `None` に
+/// なる）は使わない**: 非既定 durability・既定エンジンのセルでこれを使うと
+/// `EXPLAIN` の `engine:` 行が `parallel_brute_force` から `(custom_provider)`
+/// へ divergent し、Issue #411 の契約が崩れる。
+fn open_engine_core(
+    db_path: &std::path::Path,
+    durability: engine::storage::WriteDurability,
+    search_engine_kind: Option<engine::search_engine::SearchEngineKind>,
+) -> Result<engine::core::EngineCore, String> {
+    let is_default_durability = durability == engine::storage::WriteDurability::default();
+    match (is_default_durability, search_engine_kind) {
+        (true, None) => engine::core::EngineCore::open(db_path)
+            .map_err(|e| format!("failed to open database at {db_path:?}: {e}")),
+        (true, Some(kind)) => engine::core::EngineCore::open_with_engine(db_path, kind)
+            .map_err(|e| format!("failed to open database at {db_path:?}: {e}")),
+        (false, None) => engine::core::EngineCore::open_with_durability(db_path, durability)
+            .map_err(|e| format!("failed to open database at {db_path:?}: {e}")),
+        (false, Some(kind)) => {
+            let storage = engine::storage::Storage::open_with_durability(db_path, durability)
+                .map_err(|e| format!("failed to open database at {db_path:?}: {e}"))?;
+            Ok(engine::core::EngineCore::from_storage_with_engine(
+                storage, kind,
+            ))
+        }
     }
 }
 
@@ -1028,5 +1145,146 @@ mod tests {
     fn resolve_surface_rejects_case_variant() {
         // 厳密一致のみ受理（`surface::parse` の契約）。
         expect_err(resolve_surface(Some("SQL")));
+    }
+
+    // Issue #850: `--durability` の解決・`open_engine_core` 4 分岐の単体テスト。
+    // 子プロセス経由の外形的検証（起動受理・拒否・警告出力）は
+    // `tests/wire_durability_cli.rs` が担う。
+
+    #[test]
+    fn resolve_durability_none_is_immediate_default() {
+        assert_eq!(
+            resolve_durability(None),
+            Ok(engine::storage::WriteDurability::default())
+        );
+        assert_eq!(
+            engine::storage::WriteDurability::default(),
+            engine::storage::WriteDurability::Immediate
+        );
+    }
+
+    #[test]
+    fn resolve_durability_accepts_both_tokens() {
+        assert_eq!(
+            resolve_durability(Some("immediate")),
+            Ok(engine::storage::WriteDurability::Immediate)
+        );
+        assert_eq!(
+            resolve_durability(Some("none")),
+            Ok(engine::storage::WriteDurability::None)
+        );
+    }
+
+    #[test]
+    fn resolve_durability_rejects_unknown_value_fail_closed() {
+        let err = expect_err(resolve_durability(Some("sync")));
+        assert!(
+            err.contains(wire_server::durability_opt::FLAG),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_durability_rejects_case_variant() {
+        // 厳密一致のみ受理（`durability_opt::parse` の契約）。
+        expect_err(resolve_durability(Some("Immediate")));
+    }
+
+    /// テストごとに衝突しない一時ディレクトリ（DB ファイルの置き場）を確保し、
+    /// `Drop` で確実に削除するガード（`tests/wire_search_engine_cli.rs::
+    /// TempFixtureDir` と同型）。`open_engine_core` のテストは redb ファイルを
+    /// 実際に作成するため、テスト間の衝突・残留を避ける。
+    struct TempDbDir {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempDbDir {
+        fn new(label: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "wire-server-open-engine-core-{label}-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_nanos(),
+                seq
+            ));
+            std::fs::create_dir(&dir).expect("create unique fixture dir");
+            Self { dir }
+        }
+
+        fn db_path(&self) -> std::path::PathBuf {
+            self.dir.join("db.redb")
+        }
+    }
+
+    impl Drop for TempDbDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// (true, None) セル: 既定 durability・既定エンジン。`EngineCore::open`
+    /// 経路がそのまま通るため `search_engine_kind()` は既定エンジンを表す
+    /// `Some(default_kind())` のまま（advisor 指摘 2: `open_engine_core` が
+    /// 誤って `EngineCore::from_storage` を使うと構造的に `None` へ化ける
+    /// ため、ここでしか検出できない非 vacuous な回帰点）。
+    #[test]
+    fn open_engine_core_default_durability_no_engine_keeps_default_kind() {
+        let fixture = TempDbDir::new("default-default");
+        let core = open_engine_core(
+            &fixture.db_path(),
+            engine::storage::WriteDurability::default(),
+            None,
+        )
+        .expect("open default engine core");
+        assert_eq!(
+            core.search_engine_kind(),
+            Some(engine::search_engine::default_kind())
+        );
+    }
+
+    /// (false, None) セル: 非既定 durability・既定エンジン。
+    /// `EngineCore::open_with_durability` 経由でも `search_engine_kind()` は
+    /// 既定エンジンを表す `Some(default_kind())` のまま保たれること
+    /// （`EngineCore::from_storage` を誤用していないことの検証。誤用すると
+    /// `None` へ化ける）。
+    #[test]
+    fn open_engine_core_non_default_durability_no_engine_keeps_default_kind() {
+        let fixture = TempDbDir::new("none-default");
+        let core = open_engine_core(
+            &fixture.db_path(),
+            engine::storage::WriteDurability::None,
+            None,
+        )
+        .expect("open non-default durability engine core");
+        assert_eq!(
+            core.search_engine_kind(),
+            Some(engine::search_engine::default_kind())
+        );
+    }
+
+    /// (false, Some(hnsw_kind)) セル: 非既定 durability・ANN opt-in。
+    /// `Storage::open_with_durability` + `EngineCore::from_storage_with_engine`
+    /// 経由で `search_engine_kind()` が指定した Hnsw kind を保持すること。
+    #[test]
+    fn open_engine_core_non_default_durability_with_hnsw_engine_sets_hnsw_kind() {
+        let fixture = TempDbDir::new("none-hnsw");
+        let hnsw_kind = wire_server::search_engine_opt::SearchEngineChoice::Hnsw
+            .to_engine_kind()
+            .expect("valid hnsw params")
+            .expect("Some for hnsw");
+        let core = open_engine_core(
+            &fixture.db_path(),
+            engine::storage::WriteDurability::None,
+            Some(hnsw_kind),
+        )
+        .expect("open non-default durability + hnsw engine core");
+        assert!(matches!(
+            core.search_engine_kind(),
+            Some(engine::search_engine::SearchEngineKind::Hnsw(_))
+        ));
     }
 }

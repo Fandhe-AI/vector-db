@@ -332,11 +332,55 @@ commit はディスクへ反映されずに失われ得る（損失ウィンド�
 
 ### 8.5 スコープ外・申し送り
 
-- wire-server への `--durability` CLI opt-in 露出（`--search-engine`／
-  Issue #656 の前例と同型）。
 - `EXPLAIN` への durability 設定の露出。
 - 周期的な `Immediate` チェックポイント（`None` 運用時の損失ウィンドウを縮める
   運用機構）。
 - crossdb ベンチ（`ingest_single_stmt`）での `WriteDurability::None` 実測・
   Redis／LanceDB との差の再検証（本 Issue は注入点の追加のみが目的で、性能実測は
   対象外）。
+
+## 9. Issue #850 追記: wire-server `--durability` CLI opt-in
+
+- ステータス: Accepted・実装済み。対応: Issue #850（親 Issue #849）
+- 対象: `crates/wire-server/src/durability_opt.rs`（新規）・
+  `crates/wire-server/src/main.rs`（CLI 引数走査・`resolve_durability`・
+  `open_engine_core`・起動時警告）
+
+`--durability immediate|none` を、`--search-engine`（Issue #656）と同じ
+「閉じた語彙のみ受理・fail-closed・既定不変」の作法で公開した。値の解決は
+`durability_opt::parse` に一本化し、`engine::storage::WriteDurability`
+（Issue #849 が公開）へ untrusted な CLI 文字列から到達する唯一の入口とする。
+未指定は `immediate`（既定・既存挙動とビット同一）のまま不変で、不正な値・
+値欠落・2 回目以降の重複指定はいずれも fail-closed で起動エラーとなる。
+
+`EngineCore` の構築は `durability`（既定／非既定）と `search_engine_kind`
+（既定／ANN opt-in）の組合せで 4 分岐する（`main.rs::open_engine_core`）。
+
+| durability | search engine | 構築経路 |
+| ---------- | -------------- | -------- |
+| 既定 | 既定 | `EngineCore::open` |
+| 既定 | ANN opt-in | `EngineCore::open_with_engine` |
+| 非既定 | 既定 | `EngineCore::open_with_durability`（Issue #849） |
+| 非既定 | ANN opt-in | `Storage::open_with_durability` → `EngineCore::from_storage_with_engine` |
+
+非既定 durability・既定エンジンのセルで `EngineCore::from_storage` を使うと
+`search_engine_kind()` が構造的に `None` へ化け、`EXPLAIN` の `engine:` 行が
+`parallel_brute_force` から `(custom_provider)` へ divergent する（Issue #411
+の契約破壊）落とし穴があったため、`open_with_durability`／
+`open_with_engine`／`from_storage_with_engine` の 3 者のみを使う設計とし、
+4 分岐すべてを機械的な単体テスト
+（`open_engine_core_default_durability_no_engine_keeps_default_kind` 等）で
+固定した。
+
+`none` を明示選択した場合のみ、起動ログへ commit 成功応答が永続を保証しない
+旨の英語 `WARNING` 行を 1 行出す（`immediate`・未指定では出力しない。8.3 節の
+損失ウィンドウへのポインタを含む）。`crates/wire-server/tests/
+wire_durability_cli.rs`（層 A・子プロセス結合テスト）で、R1（両トークンの
+起動受理）・R2（未指定と `immediate` の wire バイト完全一致）・R3（不正値・
+値欠落・重複指定の fail-closed 拒否）・R4（`WARNING` 行の有無）・R5（非既定
+durability × ANN opt-in の組合せセルの起動受理）を固定した。
+
+スコープ外・申し送り: durability 別の `ingest_single_stmt` 実測（別 Issue の
+担当）・`EXPLAIN` への durability 設定の露出（8.5 節から継続）。engine
+クレート（`crates/engine/src/`）は無変更のまま、Issue #849 が公開した API
+のみを組み合わせている。
