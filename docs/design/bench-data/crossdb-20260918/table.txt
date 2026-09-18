@@ -1,0 +1,33 @@
+phase                            self        self2        selfH       selfH2        selfN       selfN2           pg          pgH          sqv           qd          qdH          lan         lanH           my
+vector_knn                    547/691      565/676      428/602      418/600      684/803      706/809    3327/3587    3237/3469    2419/2511     861/1041    1170/1843    3134/3458    1592/1790            —
+vector_knn_where            1007/1072    1068/1198    2059/2267    2104/2187    1172/1267    1190/1248    2237/2326    2345/3248    2011/2045      669/768    1001/1323    3513/3773    2298/2627            —
+where_compound_count          903/943      904/999      895/912      899/926            —            —    1638/1720    1775/2109    1301/1348    7663/8147    7734/8218      647/687      641/688    3601/3797
+agg_count                     127/129      126/128      126/131      118/123      209/214      213/239    1913/2016    1792/2148      975/984    2156/2428    1830/1975      385/406      374/385    2017/2161
+agg_multi                     247/259      251/261      268/286      254/273      352/368      343/361    2151/2263    2026/2352    1700/1743            —            —    5567/5830    5611/5782    2758/3229
+group_by_having             1445/1493    1469/1527    1464/1496    1498/1522    1677/1713    1687/1722    3053/3203    3220/3630    3119/3163            —            —    6659/6798    6576/6901  11592/12002
+hybrid_rrf                  4800/5389    4882/5612    4665/5569    4674/5327    5066/5880    5185/5898    4068/4601    4164/4485    3820/4541            —            —    3690/4005    2295/2491            —
+bulk_knn_k200                 722/823      747/828      587/712      543/697     908/1017     899/1019    3963/4190    3800/4383    5235/5941    3198/5601    2981/4883    4157/4516    2579/2901            —
+bulk_knn_k1000              1332/1512    1325/1501    1117/1463    1129/1459    1646/1825    1684/1843    4686/5315    4680/7478  17723/18875  12427/13790  11624/12193    6479/6813    3624/4255            —
+bulk_knn_where_k200         1652/1749    1673/1776    2712/2861    2752/2982    1884/1972    1952/2040    2477/2814    2654/2862    5894/6176    3130/3356    2973/3124    4458/4853    3085/3763            —
+bulk_hybrid_k200            6268/7009    6343/6987    6401/7439    6324/7223    6987/7721    6937/7642    4758/5076    4633/5041    6231/6927            —            —    5102/5481    3735/4215            —
+scan_where_nosort_k500        427/436      439/454      419/434      427/450      605/656      593/614    1272/1732    1207/1660      203/214    4432/4608    4499/4631    1508/1673    1444/1578    1658/1992
+rls_isolation                 112/114      110/115      108/116      113/129      211/218      210/236    1915/2048    1746/1880      981/998    1973/2183    1630/1758      380/397      377/397    2095/2555
+mode_recall                   530/613      542/585      433/599      426/580      642/734      689/750            —            —            —            —            —            —            —            —
+mode_precision                552/622      537/637      547/639      532/582      633/773      671/749            —            —            —            —            —            —            —            —
+udf_call                      543/638      550/659      399/440      388/457            —            —            —            —            —            —            —            —            —            —
+explain                             —            —            —            —            —            —      359/416      348/376          3/4            —            —      630/658      306/360      568/724
+--- ingest / recall / meta
+self single= None bulk= None recall= 1.0 strict= 1.0 load= [2.96435546875, 8.1328125, 6.81201171875] ver= wire-server (path=$REPO/targ warm= None
+self2 single= None bulk= None recall= 1.0 strict= 1.0 load= [3.42529296875, 7.81787109375, 6.7353515625] ver= wire-server (path=$REPO/targ warm= None
+selfH single= None bulk= None recall= 0.9129999999999999 strict= 0.9109999999999999 load= [2.58154296875, 7.880859375, 6.73779296875] ver= wire-server (path=$REPO/targ warm= {'first_query_us': 213067.54229590297}
+selfH2 single= None bulk= None recall= 0.8695 strict= 0.867 load= [3.21240234375, 7.62646484375, 6.6796875] ver= wire-server (path=$REPO/targ warm= {'first_query_us': 219395.04193142056}
+selfN single= None bulk= None recall= 1.0 strict= 1.0 load= [3.37548828125, 7.8828125, 6.751953125] ver= wire-server (path=$REPO/targ warm= None
+selfN2 single= None bulk= None recall= 1.0 strict= 1.0 load= [3.1953125, 7.54931640625, 6.65771484375] ver= wire-server (path=$REPO/targ warm= None
+pg single= None bulk= None recall= 1.0 strict= 0.9875 load= [3.3671875, 3.7646484375, 5.25146484375] ver= PostgreSQL 17.11 (Debian 17.11-1.pgdg12+2) on aarch64-unknow warm= None
+pgH single= None bulk= None recall= 1.0 strict= 0.9875 load= [3.89306640625, 3.86962890625, 5.27099609375] ver= PostgreSQL 17.11 (Debian 17.11-1.pgdg12+2) on aarch64-unknow warm= None
+sqv single= None bulk= None recall= 1.0 strict= 0.9740000000000001 load= [1.95361328125, 3.54345703125, 5.203125] ver= sqlite3 3.53.3 / sqlite-vec v0.1.9 warm= None
+qd single= None bulk= None recall= 1.0 strict= 0.7545000000000001 load= [3.8212890625, 3.85498046875, 5.25732421875] ver= qdrant 1.19.1 (image qdrant/qdrant:latest) warm= None
+qdH single= None bulk= None recall= 1.0 strict= 0.779 load= [4.00830078125, 3.89208984375, 5.25390625] ver= qdrant 1.19.1 (image qdrant/qdrant:latest) warm= None
+lan single= None bulk= None recall= 1.0 strict= 0.9990000000000001 load= [2.1171875, 3.55078125, 5.19580078125] ver= lancedb 0.38.0 warm= None
+lanH single= None bulk= None recall= 0.867 strict= 0.6375 load= [2.267578125, 3.55810546875, 5.1884765625] ver= lancedb 0.38.0 warm= None
+my single= None bulk= None recall= None strict= None load= [3.8525390625, 3.8623046875, 5.22705078125] ver= MySQL 9.7.2 warm= None

@@ -1,0 +1,19 @@
+CROSSDB_DIR="$WORK" CROSSDB_PYTHON="$WORK/venv/bin/python" bash scripts/crossdb_bench/run_all.sh
+== 15:28:35 self exact
+== 15:28:43 self hnsw
+== 15:29:27 sqlite_vec exact
+== 15:29:32 lancedb exact
+== 15:29:38 lancedb hnsw
+bench-pgvector: waiting for readiness...
+bench-pgvector: ready
+== 15:29:44 pgvector exact
+== 15:29:49 pgvector hnsw
+bench-qdrant: waiting for readiness...
+bench-qdrant: ready
+== 15:29:57 qdrant exact
+== 15:30:03 qdrant hnsw
+bench-mysql: waiting for readiness...
+bench-mysql: ready
+== 15:30:17 mysql exact
+== 15:30:22 done: $WORK/results
+CROSSDB_DONE rc=0 dur=107

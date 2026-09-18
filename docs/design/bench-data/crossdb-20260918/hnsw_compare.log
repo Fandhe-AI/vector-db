@@ -1,0 +1,66 @@
+cargo bench --bench hnsw_compare_bench -p fandhe-vector-db-engine --features contrast-bench
+   Compiling proc-macro2 v1.0.107
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling foldhash v0.2.0
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.2
+   Compiling scratch v1.0.9
+   Compiling unicode-width v0.2.2
+   Compiling cxxbridge-flags v1.0.200
+   Compiling termcolor v1.4.1
+   Compiling cc v1.4.5
+   Compiling codespan-reporting v0.13.1
+   Compiling indexmap v2.14.2
+   Compiling link-cplusplus v1.0.12
+   Compiling cxx v1.0.200
+   Compiling numkong v7.8.2
+   Compiling quote v1.0.47
+   Compiling syn v3.0.5
+   Compiling syn v2.0.119
+   Compiling cxx-build v1.0.200
+   Compiling thiserror-impl v2.0.20
+   Compiling bytemuck_derive v1.12.0
+   Compiling cxxbridge-macro v1.0.200
+   Compiling zerocopy-derive v0.8.57
+   Compiling bytemuck v1.25.2
+   Compiling thiserror v2.0.20
+   Compiling zerocopy v0.8.57
+   Compiling usearch v2.26.2
+   Compiling naga-types v30.0.1
+   Compiling wgpu-types v30.0.1
+   Compiling half v2.7.1
+   Compiling naga v30.0.1
+   Compiling wgpu-naga-bridge v30.0.1
+   Compiling wgpu-hal v30.0.1
+   Compiling wgpu-core-deps-apple v30.0.1
+   Compiling wgpu-core v30.0.1
+   Compiling wgpu v30.0.1
+   Compiling fandhe-vector-db-engine v0.1.0 ($REPO/crates/engine)
+    Finished `bench` profile [optimized] target(s) in 32.78s
+     Running benches/hnsw_compare_bench.rs (target/release/deps/hnsw_compare_bench-0066a7f2c57de11a)
+env: os=macos arch=aarch64 logical_cpus=16 isa=Neon loadavg=unavailable
+hnsw_compare: rows=100000 dim=64 queries=200 thread_ladder=[1, 2, 4, 8, 16] corpus=l2_normalized
+hnsw_compare: params engine=self m=16 ef_construction=100 ef_search=64
+hnsw_compare: params engine=usearch connectivity=16 expansion_add=100 expansion_search=64 metric=IP quantization=F32 multi=false
+hnsw_compare: engine=self threads=1 build_median=9290.972ms speedup=1.000x
+hnsw_compare: engine=usearch threads=1 build_median=10137.590ms speedup=1.000x
+hnsw_compare: ratio threads=1 self_over_usearch=0.916x
+hnsw_compare: engine=self threads=2 build_median=4803.356ms speedup=1.934x
+hnsw_compare: engine=usearch threads=2 build_median=5000.792ms speedup=2.027x
+hnsw_compare: ratio threads=2 self_over_usearch=0.961x
+hnsw_compare: engine=self threads=4 build_median=2449.701ms speedup=3.793x
+hnsw_compare: engine=usearch threads=4 build_median=2612.801ms speedup=3.880x
+hnsw_compare: ratio threads=4 self_over_usearch=0.938x
+hnsw_compare: engine=self threads=8 build_median=1507.623ms speedup=6.163x
+hnsw_compare: engine=usearch threads=8 build_median=1709.504ms speedup=5.930x
+hnsw_compare: ratio threads=8 self_over_usearch=0.882x
+hnsw_compare: engine=self threads=16 build_median=1172.068ms speedup=7.927x
+hnsw_compare: engine=usearch threads=16 build_median=1404.136ms speedup=7.220x
+hnsw_compare: ratio threads=16 self_over_usearch=0.835x
+hnsw_compare: recall engine=self threads=1 recall@10=0.4905
+hnsw_compare: recall engine=self threads=16 recall@10=0.5005
+hnsw_compare: recall engine=usearch threads=16 recall@10=0.4965
+hnsw_compare: search_latency engine=self median_us=50.417
+hnsw_compare: search_latency engine=usearch median_us=56.146
+HNSW_COMPARE_RC=0

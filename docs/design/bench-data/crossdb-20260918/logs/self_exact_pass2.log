@@ -1,0 +1,25 @@
+Traceback (most recent call last):
+  File "$REPO/scripts/crossdb_bench/run.py", line 316, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "$REPO/scripts/crossdb_bench/run.py", line 264, in main
+    result = self_db.run(args, queries)
+  File "$REPO/scripts/crossdb_bench/self_db.py", line 411, in run
+    return _run_phases(
+        args,
+    ...<3 lines>...
+        hnsw_args=hnsw_args,
+    )
+  File "$REPO/scripts/crossdb_bench/self_db.py", line 522, in _run_phases
+    stats, last = measure(agg_multi, [None])
+                  ~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "$REPO/scripts/crossdb_bench/common.py", line 150, in measure
+    last = fn(inputs[i % n])
+  File "$REPO/scripts/crossdb_bench/self_db.py", line 519, in agg_multi
+    cur.execute("SELECT COUNT(*), SUM(id), AVG(id), MIN(id), MAX(id) FROM docs")
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "$WORK/venv/lib/python3.14/site-packages/psycopg/cursor.py", line 117, in execute
+    raise ex.with_traceback(None)
+psycopg.OperationalError: consuming input failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.

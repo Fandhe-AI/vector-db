@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# crossdb_bench: 対照 DB（pgvector・Qdrant・MySQL）の Docker コンテナ起動・停止。
+# crossdb_bench: 対照 DB（pgvector・Qdrant・MySQL・MongoDB Atlas local・MongoDB Community・
+# Redis・Elasticsearch）の Docker コンテナ起動・停止。
 #
 # ポートは 127.0.0.1 の非既定ポートへ bind する（他コンテナと衝突しないため）。
 # 環境変数で上書きでき、接続側の Python（pgvector_db.py・qdrant_db.py・mysql_db.py。
@@ -13,7 +14,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 up|down <pgvector|qdrant|mysql>" >&2
+  echo "usage: $0 up|down <pgvector|qdrant|mysql|mongodb|mongodb_plain|redis|elasticsearch>" >&2
   exit 1
 }
 
@@ -27,6 +28,12 @@ PG_PORT="${CROSSDB_PG_PORT:-15433}"
 QDRANT_HTTP_PORT="${CROSSDB_QDRANT_HTTP_PORT:-16333}"
 QDRANT_GRPC_PORT="${CROSSDB_QDRANT_GRPC_PORT:-16334}"
 MYSQL_PORT="${CROSSDB_MYSQL_PORT:-33306}"
+# NoSQL 対照（2026-09-18 追加）。mongodb_db.py 37017・mongodb_plain_db.py 37018・
+# redis_db.py 36379・elasticsearch_db.py 39200 と同じ既定値。
+MONGODB_PORT="${CROSSDB_MONGODB_PORT:-37017}"
+MONGODB_PLAIN_PORT="${CROSSDB_MONGODB_PLAIN_PORT:-37018}"
+REDIS_PORT="${CROSSDB_REDIS_PORT:-36379}"
+ES_PORT="${CROSSDB_ES_PORT:-39200}"
 
 # コンテナ名は既定で `bench-<db>` 固定だが、同一ホストで並行して計測する
 # 別セッション（他エージェント・運用者）が同名コンテナを既に使っている場合、
@@ -50,6 +57,91 @@ MYSQL_CONTAINER="${CROSSDB_MYSQL_CONTAINER:-bench-mysql}"
 validate_container_name "$PG_CONTAINER" "CROSSDB_PG_CONTAINER"
 validate_container_name "$QDRANT_CONTAINER" "CROSSDB_QDRANT_CONTAINER"
 validate_container_name "$MYSQL_CONTAINER" "CROSSDB_MYSQL_CONTAINER"
+MONGODB_CONTAINER="${CROSSDB_MONGODB_CONTAINER:-bench-mongodb}"
+MONGODB_PLAIN_CONTAINER="${CROSSDB_MONGODB_PLAIN_CONTAINER:-bench-mongodb-plain}"
+REDIS_CONTAINER="${CROSSDB_REDIS_CONTAINER:-bench-redis}"
+ES_CONTAINER="${CROSSDB_ES_CONTAINER:-bench-elasticsearch}"
+validate_container_name "$MONGODB_CONTAINER" "CROSSDB_MONGODB_CONTAINER"
+validate_container_name "$MONGODB_PLAIN_CONTAINER" "CROSSDB_MONGODB_PLAIN_CONTAINER"
+validate_container_name "$REDIS_CONTAINER" "CROSSDB_REDIS_CONTAINER"
+validate_container_name "$ES_CONTAINER" "CROSSDB_ES_CONTAINER"
+
+# MongoDB Atlas local（mongod + mongot 同梱。Atlas Vector Search をローカルで提供）。
+# イメージ内蔵の healthcheck が mongod・mongot 双方の起動を含むため `healthy` を待つ。
+# 索引の非同期反映は mongodb_db.py 側が `$listSearchIndexes`＋プローブ KNN で確認する。
+up_mongodb() {
+  docker rm -f "$MONGODB_CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --name "$MONGODB_CONTAINER" \
+    -p "127.0.0.1:${MONGODB_PORT}:27017" \
+    mongodb/mongodb-atlas-local:latest >/dev/null
+  echo "${MONGODB_CONTAINER}: waiting for readiness..."
+  for _ in $(seq 1 120); do
+    if [ "$(docker inspect --format '{{.State.Health.Status}}' "$MONGODB_CONTAINER" 2>/dev/null)" = "healthy" ]; then
+      echo "${MONGODB_CONTAINER}: ready"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${MONGODB_CONTAINER}: timed out waiting for healthy" >&2
+  exit 1
+}
+
+# MongoDB Community（mongot なし＝ベクトル検索機能なしの対照）。
+up_mongodb_plain() {
+  docker rm -f "$MONGODB_PLAIN_CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --name "$MONGODB_PLAIN_CONTAINER" \
+    -p "127.0.0.1:${MONGODB_PLAIN_PORT}:27017" \
+    mongo:8 >/dev/null
+  echo "${MONGODB_PLAIN_CONTAINER}: waiting for readiness..."
+  for _ in $(seq 1 60); do
+    if docker exec "$MONGODB_PLAIN_CONTAINER" mongosh --quiet --eval 'db.runCommand({ping:1}).ok' 2>/dev/null | grep -q 1; then
+      echo "${MONGODB_PLAIN_CONTAINER}: ready"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${MONGODB_PLAIN_CONTAINER}: timed out waiting for ping" >&2
+  exit 1
+}
+
+# Redis 8（Query Engine＝RediSearch 同梱。ベクトル索引 FLAT/HNSW・FT.HYBRID あり）。
+up_redis() {
+  docker rm -f "$REDIS_CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --name "$REDIS_CONTAINER" \
+    -p "127.0.0.1:${REDIS_PORT}:6379" \
+    redis:8 >/dev/null
+  echo "${REDIS_CONTAINER}: waiting for readiness..."
+  for _ in $(seq 1 60); do
+    if docker exec "$REDIS_CONTAINER" redis-cli MODULE LIST 2>/dev/null | grep -q '^search$'; then
+      echo "${REDIS_CONTAINER}: ready"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${REDIS_CONTAINER}: timed out waiting for search module" >&2
+  exit 1
+}
+
+# Elasticsearch 9（single-node・security 無効・JVM heap 2 GiB 固定）。
+up_elasticsearch() {
+  docker rm -f "$ES_CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --name "$ES_CONTAINER" \
+    -p "127.0.0.1:${ES_PORT}:9200" \
+    -e discovery.type=single-node \
+    -e xpack.security.enabled=false \
+    -e "ES_JAVA_OPTS=-Xms2g -Xmx2g" \
+    docker.elastic.co/elasticsearch/elasticsearch:9.1.4 >/dev/null
+  echo "${ES_CONTAINER}: waiting for readiness..."
+  for _ in $(seq 1 120); do
+    if curl -sf "http://127.0.0.1:${ES_PORT}/_cluster/health?wait_for_status=yellow&timeout=1s" >/dev/null 2>&1; then
+      echo "${ES_CONTAINER}: ready"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${ES_CONTAINER}: timed out waiting for cluster health" >&2
+  exit 1
+}
 
 up_pgvector() {
   docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
@@ -158,6 +250,34 @@ case "$db" in
     case "$cmd" in
       up) up_mysql ;;
       down) docker rm -f "$MYSQL_CONTAINER" >/dev/null 2>&1 || true ;;
+      *) usage ;;
+    esac
+    ;;
+  mongodb)
+    case "$cmd" in
+      up) up_mongodb ;;
+      down) docker rm -f "$MONGODB_CONTAINER" >/dev/null 2>&1 || true ;;
+      *) usage ;;
+    esac
+    ;;
+  mongodb_plain)
+    case "$cmd" in
+      up) up_mongodb_plain ;;
+      down) docker rm -f "$MONGODB_PLAIN_CONTAINER" >/dev/null 2>&1 || true ;;
+      *) usage ;;
+    esac
+    ;;
+  redis)
+    case "$cmd" in
+      up) up_redis ;;
+      down) docker rm -f "$REDIS_CONTAINER" >/dev/null 2>&1 || true ;;
+      *) usage ;;
+    esac
+    ;;
+  elasticsearch)
+    case "$cmd" in
+      up) up_elasticsearch ;;
+      down) docker rm -f "$ES_CONTAINER" >/dev/null 2>&1 || true ;;
       *) usage ;;
     esac
     ;;

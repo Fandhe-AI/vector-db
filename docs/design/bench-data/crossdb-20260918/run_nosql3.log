@@ -1,0 +1,5 @@
+bench-redis: waiting for readiness...
+bench-redis: ready
+== 16:38:11 loadavg={ 3.70 3.80 3.83 } redis exact
+== 16:38:15 loadavg={ 3.57 3.77 3.82 } redis hnsw
+== 16:38:20 done FAILED=none

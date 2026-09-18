@@ -1,0 +1,23 @@
+$REPO/scripts/crossdb_bench/redis_db.py:295: UserWarning: HybridSearchQuery is an experimental and may change or be removed in future versions.
+  sq = HybridSearchQuery(f"(@visibility:{{public}}) @body:({terms})")
+$REPO/scripts/crossdb_bench/redis_db.py:301: UserWarning: HybridFilter is an experimental and may change or be removed in future versions.
+  filter=HybridFilter("@visibility:{public}"),
+$REPO/scripts/crossdb_bench/redis_db.py:296: UserWarning: HybridVsimQuery is an experimental and may change or be removed in future versions.
+  vq = HybridVsimQuery(
+$REPO/scripts/crossdb_bench/redis_db.py:304: UserWarning: CombineResultsMethod is an experimental and may change or be removed in future versions.
+  combine = CombineResultsMethod(CombinationMethods.RRF, WINDOW=50)
+$REPO/scripts/crossdb_bench/redis_db.py:305: UserWarning: HybridPostProcessingConfig is an experimental and may change or be removed in future versions.
+  pp = HybridPostProcessingConfig().load("@id").limit(0, 10)
+$WORK/venv/lib/python3.14/site-packages/redis/utils.py:463: UserWarning: Call to experimental method hybrid_search. Be aware that the function arguments can change or be removed in future versions.
+  warn_experimental(func.__name__, stacklevel=2)
+$REPO/scripts/crossdb_bench/redis_db.py:352: UserWarning: HybridSearchQuery is an experimental and may change or be removed in future versions.
+  sq = HybridSearchQuery(f"(@visibility:{{public}}) @body:({terms})")
+$REPO/scripts/crossdb_bench/redis_db.py:358: UserWarning: HybridFilter is an experimental and may change or be removed in future versions.
+  filter=HybridFilter("@visibility:{public}"),
+$REPO/scripts/crossdb_bench/redis_db.py:353: UserWarning: HybridVsimQuery is an experimental and may change or be removed in future versions.
+  vq = HybridVsimQuery(
+$REPO/scripts/crossdb_bench/redis_db.py:361: UserWarning: CombineResultsMethod is an experimental and may change or be removed in future versions.
+  combine = CombineResultsMethod(CombinationMethods.RRF, WINDOW=200)
+$REPO/scripts/crossdb_bench/redis_db.py:362: UserWarning: HybridPostProcessingConfig is an experimental and may change or be removed in future versions.
+  pp = HybridPostProcessingConfig().load("@id", "@body").limit(0, 200)
+wrote: $WORK/results-nosql3/redis_hnsw.json

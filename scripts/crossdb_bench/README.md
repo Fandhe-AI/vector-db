@@ -1,8 +1,8 @@
 # crossdb_bench
 
 自作ベクトル DB（本リポジトリの `wire-server`＋`engine`。以下 "self"）と他 DB
-（pgvector・sqlite-vec・Qdrant・LanceDB・MySQL）の機能別ベンチマークを行う
-Python ハーネス。
+（pgvector・sqlite-vec・Qdrant・LanceDB・MySQL・MongoDB・Redis・Elasticsearch）の
+機能別ベンチマークを行う Python ハーネス。
 
 private spec（`docs/spec`）の内容はここでは参照・転記しない。数値基準（warmup・
 反復回数）は本ハーネス独自の実装既定値（`crates/engine/examples/feature_bench.rs`
@@ -12,10 +12,17 @@ private spec（`docs/spec`）の内容はここでは参照・転記しない。
 
 ## 前提
 
-- Docker（`pgvector/pgvector:pg17`・`qdrant/qdrant:latest`・`mysql:9` を
-  取得済みであること。`docker inspect` で digest／実バージョンを確認してから
-  計測結果の meta に記録する）
-- Python venv（`requirements.txt` を `pip install -r` 済み）
+- Docker（`pgvector/pgvector:pg17`・`qdrant/qdrant:latest`・`mysql:9`・
+  `mongodb/mongodb-atlas-local:latest`・`mongo:8`・`redis:8`・
+  `docker.elastic.co/elasticsearch/elasticsearch:9.1.4` を取得済みであること。
+  `docker inspect` で digest／実バージョンを確認してから計測結果の meta に記録する）
+  2026-09-18 計測（`docs/design/bench-data/crossdb-20260918/`）で解決されたバージョン:
+  `redis:8` = Redis 8.10.1（RediSearch 8.10.0）・
+  `docker.elastic.co/elasticsearch/elasticsearch:9.1.4` = 9.1.4・
+  `mongodb/mongodb-atlas-local:latest` = mongod 8.3.11・`mongo:8` = 8.3.11（mongot 非搭載）。
+  `latest`／メジャータグは計測ごとに `docker image ls --digests` で digest を記録する
+- Python venv（`requirements.txt` を `pip install -r` 済み。`pymongo==4.18.1`・
+  `redis==8.1.0` が必要。Elasticsearch は標準ライブラリのみ）
 - `target/release/wire-server`（`cargo build --release -p fandhe-vector-db-wire-server` でビルド済み）
 - `crates/engine/examples/seed_docs.rs`（別 agent 生成）等で作成した
   `docs25k.redb`・`docs25k.jsonl`・`queries200.jsonl`
@@ -36,16 +43,25 @@ cargo build --release -p fandhe-vector-db-wire-server
 scripts/crossdb_bench/containers.sh up pgvector
 scripts/crossdb_bench/containers.sh up qdrant
 scripts/crossdb_bench/containers.sh up mysql
+scripts/crossdb_bench/containers.sh up mongodb
+scripts/crossdb_bench/containers.sh up mongodb_plain
+scripts/crossdb_bench/containers.sh up redis
+scripts/crossdb_bench/containers.sh up elasticsearch
 scripts/crossdb_bench/containers.sh down pgvector
 scripts/crossdb_bench/containers.sh down qdrant
 scripts/crossdb_bench/containers.sh down mysql
+scripts/crossdb_bench/containers.sh down mongodb
+scripts/crossdb_bench/containers.sh down mongodb_plain
+scripts/crossdb_bench/containers.sh down redis
+scripts/crossdb_bench/containers.sh down elasticsearch
 ```
 
 `up mysql` は `mysql:9` イメージからコンテナ名 `bench-mysql`
 （127.0.0.1:33306 既定、`MYSQL_ROOT_PASSWORD=bench`・`MYSQL_DATABASE=bench`）を
 `docker rm -f` で毎回冪等に作り直し、`mysqladmin ping` で起動を待つ
 （pgvector・Qdrant と同じ up/down 管理。`down mysql` も `docker rm -f` で
-コンテナごと破棄する）。
+コンテナごと破棄する）。MongoDB・Redis・Elasticsearch も同様に `docker rm -f` で
+毎回冪等に管理される。
 
 sqlite-vec・LanceDB は in-process（コンテナ不要）。sqlite-vec は他 DB（永続ストレージ）
 と投入速度の比較条件を揃えるため `--workdir` 配下のファイルベース DB を使う
@@ -69,6 +85,10 @@ sqlite-vec・LanceDB は in-process（コンテナ不要）。sqlite-vec は他 
 | `CROSSDB_QDRANT_HTTP_PORT` | 16333（gpu/ は 17333） | Qdrant HTTP（`containers.sh up qdrant`・`qdrant_db.py`。`gpu/containers_gpu.sh`・`gpu/qdrant_gpu_build_bench.py` も同じ変数名を読むが既定値は 17333） |
 | `CROSSDB_QDRANT_GRPC_PORT` | 16334（gpu/ は 17334） | Qdrant gRPC（同上。gpu/ の既定値は 17334） |
 | `CROSSDB_MYSQL_PORT` | 33306 | MySQL（`containers.sh up mysql`・`mysql_db.py`） |
+| `CROSSDB_MONGODB_PORT` | 37017 | MongoDB Atlas local（`containers.sh up mongodb`・`mongodb_db.py`） |
+| `CROSSDB_MONGODB_PLAIN_PORT` | 37018 | MongoDB Community（`containers.sh up mongodb_plain`・`mongodb_plain_db.py`） |
+| `CROSSDB_REDIS_PORT` | 36379 | Redis（`containers.sh up redis`・`redis_db.py`） |
+| `CROSSDB_ES_PORT` | 39200 | Elasticsearch（`containers.sh up elasticsearch`・`elasticsearch_db.py`） |
 
 ```bash
 CROSSDB_PG_PORT=25433 scripts/crossdb_bench/containers.sh up pgvector
@@ -178,6 +198,45 @@ CROSSDB_DIR="$S" CROSSDB_PYTHON=/path/to/venv/bin/python \
 scripts/bench_crossdb_self_hnsw_ab.sh --summarize docs/design/bench-data/crossdb-self-hnsw-ab
 ```
 
+### self_nosql（NoSQL 表層経由。`--db self_nosql`）
+
+`self_db.py`（PostgreSQL wire・SQL 表層）と同じ `wire-server` バイナリ・同じ
+fixture（redb）を使いつつ、`--surface nosql`（TASK-171・HTTP-1・HTTP-9）で起動し
+HTTP/1.1 最小サブセット（`POST /v1/session`・`/v1/session/close`・`/v1/query`）
+経由で計測する。JSON 契約の単一情報源は `crates/wire-server/docs/nosql-api.md`
+（本 README では要点のみ記載する）。`--config exact` のみ対応（HNSW opt-in は
+`self`（SQL wire）側の担当のまま）。Cargo・pip 依存は追加していない
+（Python 標準ライブラリ `http.client`／`json` のみ）。
+
+```bash
+python scripts/crossdb_bench/run.py --db self_nosql --config exact \
+  --rows-file "$S/docs25k.redb" --queries-file "$S/queries200.jsonl"
+```
+
+**keep-alive 非対応**: NoSQL 表層は 1 要求ごとに応答へ `Connection: close` を
+付けて接続を閉じる契約（`crates/wire-server/src/http/conn.rs` のモジュール
+doc・`crates/wire-server/docs/nosql-api.md`「転送路の共通規則」節）。そのため
+`self_nosql.py` は毎 HTTP 要求ごとに新規 TCP 接続を張る（`meta.connection` に
+明記）。
+
+`self_db.py` の 20 フェーズのうち、NoSQL の `op` 語彙（`search`／`scan`／
+`aggregate`／`insert` の 4 値のみ）で表現できるものはそのまま計測し、次の
+5 フェーズは構造的に `unsupported` として記録する（HTTP 要求を送らず理由の
+みを記録。実行障害〔非 2xx 応答〕はいずれも unsupported へ丸めず例外として
+計測全体を止める fail-closed 方針は `self_db.py` と同じ）:
+
+| フェーズ | unsupported の理由 |
+| -------- | ------------------- |
+| `where_compound_count` | `filter[].op` が `eq`／`prefix` のみで範囲比較演算子が無く `id > 100` を表現できない |
+| `udf_call` | 宣言的 UDF 呼び出しに対応する `op` が許可リスト（4 値）に無い |
+| `explain` | `vector` 指定検索への `explain:true` は `42601` で拒否される契約（`plan` 検索の `EXPLAIN` は LLM プランナー未接続のため対象外） |
+| `ingest_bulk` | `op: insert` の `rows` 配列は 1 要求あたり既定上限 64 行（INDEX-4 ①）であり、ファイル形一括投入に相当する規模の意味論を持たない |
+
+`group_by_having` は NoSQL の `aggregate`（`group_by`／`having`）に `ORDER BY`／
+`LIMIT` 相当のフィールドが無いため、`self_db.py` の `... ORDER BY n DESC
+LIMIT 5` とは全件取得の点で異なる（集計・`HAVING` 条件自体は同一。結果 JSON
+の `note` フィールドに明記）。
+
 ### 環境変数（コンテナ名）
 
 `containers.sh` が起動する各コンテナの名前は既定で `bench-<db>` 固定だが、
@@ -194,6 +253,10 @@ scripts/bench_crossdb_self_hnsw_ab.sh --summarize docs/design/bench-data/crossdb
 | `CROSSDB_PG_CONTAINER` | `bench-pgvector` | pgvector コンテナ名 |
 | `CROSSDB_QDRANT_CONTAINER` | `bench-qdrant` | Qdrant コンテナ名 |
 | `CROSSDB_MYSQL_CONTAINER` | `bench-mysql` | MySQL コンテナ名 |
+| `CROSSDB_MONGODB_CONTAINER` | `bench-mongodb` | MongoDB Atlas local コンテナ名 |
+| `CROSSDB_MONGODB_PLAIN_CONTAINER` | `bench-mongodb-plain` | MongoDB Community コンテナ名 |
+| `CROSSDB_REDIS_CONTAINER` | `bench-redis` | Redis コンテナ名 |
+| `CROSSDB_ES_CONTAINER` | `bench-elasticsearch` | Elasticsearch コンテナ名 |
 
 ```bash
 # 外部 bench-qdrant（既定ポート）と衝突しない別名・別ポートで計測する例
@@ -244,6 +307,42 @@ python scripts/crossdb_bench/run.py --db lancedb --config hnsw \
 # MySQL（KNN 系は構造的に unsupported）
 scripts/crossdb_bench/containers.sh up mysql
 python scripts/crossdb_bench/run.py --db mysql --config exact \
+  --rows-file "$S/docs25k.jsonl" --queries-file "$S/queries200.jsonl"
+
+# MongoDB Atlas local（exact は vectorSearch 索引ありで `exact: true`、
+#   hnsw は numCandidates=max(64,k)）
+scripts/crossdb_bench/containers.sh up mongodb
+python scripts/crossdb_bench/run.py --db mongodb --config exact \
+  --rows-file "$S/docs25k.jsonl" --queries-file "$S/queries200.jsonl"
+scripts/crossdb_bench/containers.sh down mongodb
+scripts/crossdb_bench/containers.sh up mongodb
+python scripts/crossdb_bench/run.py --db mongodb --config hnsw \
+  --rows-file "$S/docs25k.jsonl" --queries-file "$S/queries200.jsonl"
+
+# MongoDB Community（ベクトル検索なし。exact のみ。
+#   vector_knn_pipeline_bruteforce は aggregation パイプラインの汎用演算であり、
+#   ベクトル検索機能ではない）
+scripts/crossdb_bench/containers.sh up mongodb_plain
+python scripts/crossdb_bench/run.py --db mongodb_plain --config exact \
+  --rows-file "$S/docs25k.jsonl" --queries-file "$S/queries200.jsonl"
+
+# Redis（FLAT=exact / HNSW、FT.HYBRID で hybrid）
+scripts/crossdb_bench/containers.sh up redis
+python scripts/crossdb_bench/run.py --db redis --config exact \
+  --rows-file "$S/docs25k.jsonl" --queries-file "$S/queries200.jsonl"
+scripts/crossdb_bench/containers.sh down redis
+scripts/crossdb_bench/containers.sh up redis
+python scripts/crossdb_bench/run.py --db redis --config hnsw \
+  --rows-file "$S/docs25k.jsonl" --queries-file "$S/queries200.jsonl"
+
+# Elasticsearch（exact は index:false の script_score、hnsw は knn。
+#   RRF は無償ライセンスで 403 のため unsupported）
+scripts/crossdb_bench/containers.sh up elasticsearch
+python scripts/crossdb_bench/run.py --db elasticsearch --config exact \
+  --rows-file "$S/docs25k.jsonl" --queries-file "$S/queries200.jsonl"
+scripts/crossdb_bench/containers.sh down elasticsearch
+scripts/crossdb_bench/containers.sh up elasticsearch
+python scripts/crossdb_bench/run.py --db elasticsearch --config hnsw \
   --rows-file "$S/docs25k.jsonl" --queries-file "$S/queries200.jsonl"
 ```
 
@@ -410,6 +509,16 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
   hybrid と非等価）・`mode_recall`/`mode_precision`・`udf_call`・`explain`。
 - **pgvector・LanceDB**: `mode_recall`/`mode_precision`・`udf_call`
   （取得モード切替・宣言的 UDF 呼び出しの概念自体が無い）。
+- **MongoDB Community（`mongodb_plain`）**: `vector_knn`・`vector_knn_where`・
+  `point_where`・`bulk_knn_k200`・`bulk_knn_k1000`・`bulk_knn_where_k200`・
+  `hybrid_rrf`（ベクトル検索 API そのものが無い。`vector_knn_pipeline_bruteforce`
+  のみ aggregation パイプラインの汎用演算で実装）。
+- **Elasticsearch**: `hybrid_rrf`・`bulk_hybrid_k200`（RRF retriever が無償
+  ライセンスで `403 security_exception` として拒否される）・`mode_recall`/
+  `mode_precision`・`udf_call`。
+- **Redis**: `mode_recall`/`mode_precision`・`udf_call`（集計は `FT.AGGREGATE`、
+  hybrid は `FT.HYBRID`、EXPLAIN は `FT.EXPLAIN` で計測する）。
+- **MongoDB（Atlas local）**: `mode_recall`/`mode_precision`・`udf_call`。
 - **self**: `ingest_bulk`（wire プロトコルに COPY 相当が無く、SQL 表層は
   単文 INSERT のみ受理する。`EngineCore::execute_insert_sql_batch` は
   Rust API であり wire 未露出）。
@@ -420,14 +529,19 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
 | -------- | ---- |
 | `common.py` | フィクスチャ読み込み・レイテンシ統計・meta 構築・計測ループの共通部品 |
 | `recall.py` | numpy による内積正解集合の計算（同点許容込み）・Recall@10 突き合わせ |
-| `self_db.py` | self（wire-server 経由）の全フェーズ実装 |
+| `self_db.py` | self（wire-server 経由・SQL wire 表層）の全フェーズ実装 |
+| `self_nosql.py` | self（wire-server `--surface nosql`・HTTP NoSQL 表層）の全フェーズ実装 |
 | `pgvector_db.py` | pgvector の全フェーズ実装 |
 | `sqlite_vec_db.py` | sqlite-vec の全フェーズ実装 |
 | `qdrant_db.py` | Qdrant の全フェーズ実装 |
 | `lancedb_db.py` | LanceDB の全フェーズ実装 |
 | `mysql_db.py` | MySQL の全フェーズ実装 |
+| `mongodb_db.py` | MongoDB Atlas local の全フェーズ実装 |
+| `mongodb_plain_db.py` | MongoDB Community の全フェーズ実装 |
+| `redis_db.py` | Redis の全フェーズ実装 |
+| `elasticsearch_db.py` | Elasticsearch の全フェーズ実装 |
 | `run.py` | CLI エントリポイント（フィクスチャ読み込み → 各 db モジュール呼び出し → recall 計算 → JSON 書き出し） |
-| `containers.sh` | pgvector・Qdrant・MySQL コンテナの起動・停止（`docker rm -f` で毎回冪等に作り直す） |
+| `containers.sh` | pgvector・Qdrant・MySQL・MongoDB・Redis・Elasticsearch コンテナの起動・停止（`docker rm -f` で毎回冪等に作り直す） |
 
 ## 前後比較用ハーネス（Issue #633）
 
