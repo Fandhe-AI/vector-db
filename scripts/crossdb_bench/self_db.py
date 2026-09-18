@@ -44,6 +44,7 @@ import time
 
 import psycopg
 
+import self_durability
 import self_hnsw
 from common import (
     DIM,
@@ -406,14 +407,22 @@ def run(args, queries: list[dict]) -> dict:
             extra_args += ["--search-engine", self_hnsw.SEARCH_ENGINE_TOKEN]
             extra_args += hnsw_args
 
+        # durability A/B opt-in（Issue #851。`--config` とは独立の軸）。
+        durability_token = self_durability.durability_source()
+        extra_args += self_durability.durability_extra_args(durability_token)
+
         server = SelfServer(db_path=work_db, workdir=workdir, extra_args=extra_args)
         server.start()
+        # arm 取り違え防止（fail-closed。起動ログの警告行有無と要求した
+        # durability トークンが一致しない run は計測を進めず即座に失敗させる）。
+        self_durability.verify_arm_identity(durability_token, server._read_log_tail())
         return _run_phases(
             args,
             queries,
             server,
             run_ann_probe=run_ann_probe,
             hnsw_args=hnsw_args,
+            durability_token=durability_token,
         )
     finally:
         if server is not None:
@@ -429,6 +438,7 @@ def _run_phases(
     server: SelfServer,
     run_ann_probe: bool = False,
     hnsw_args: list[str] | None = None,
+    durability_token: str | None = None,
 ) -> dict:
     """起動済み wire-server に対して全フェーズを実行する（`run` から呼ばれる）。
 
@@ -828,6 +838,12 @@ def _run_phases(
                 "search_engine": self_hnsw.SEARCH_ENGINE_TOKEN if is_hnsw else "default",
                 "hnsw_args": hnsw_args,
                 "planner": "loopback stub (fixed expansion)" if run_ann_probe else None,
+                # durability A/B（Issue #851）。`verify_arm_identity` が run() で
+                # 既に一致を確認済みのため、ここでは記録のみ（再計算しない）。
+                "durability": self_durability.env_token_for_meta(durability_token),
+                "durability_warning_observed": self_durability.warning_line_expected(
+                    durability_token
+                ),
             },
         )
         return {"meta": meta, "phases": phases}

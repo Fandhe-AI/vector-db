@@ -384,3 +384,44 @@ durability × ANN opt-in の組合せセルの起動受理）を固定した。
 担当）・`EXPLAIN` への durability 設定の露出（8.5 節から継続）。engine
 クレート（`crates/engine/src/`）は無変更のまま、Issue #849 が公開した API
 のみを組み合わせている。
+
+## 10. Issue #851 追記: `ingest_single_stmt` の durability 別実測
+
+- ステータス: 実施済み（engine ベンチ経由の A/B のみ。crossdb 本体〔wire
+  経由〕・Linux ext4 は未実施）。対応: Issue #851（親 #849・#850）
+- 対象: `crates/engine/benches/harness/ingest_profile.rs`
+  （`BenchDurability`・`parse_durability`）・`ingest_profile_bench.rs`
+  （single モードの E0/S0/replica へ durability 注入）・`scripts/
+  fsync_probe.py`（新規）・`scripts/bench_ingest_durability_ab.sh`（新規）・
+  `scripts/bench_ingest_durability_ab_summarize.py`（新規）・
+  `scripts/crossdb_bench/self_durability.py`（新規。`CROSSDB_SELF_DURABILITY`
+  opt-in を `self_db.py::run` へ結線したが、実測自体は未実施）
+
+`docs/design/crossdb-bench.md`「Issue #851: durability 別実測と比較条件」
+節に測定条件・結果表を記録した。要点のみ再掲する:
+
+- 8 節の A/B（`insert_mode`。redb `insert`／`insert_reserve`）と同じ
+  ベンチ骨格を再利用し、`BENCH_INGEST_PROFILE_DURABILITY=immediate|none`
+  で I8（commit）段の durability を切り替えて N=5 ペア交互実測した。
+- I8 commit の median は `immediate` 約 4.58 ms・`none` 約 8.6 µs
+  （ratio ≈ 0.0019）。`scripts/fsync_probe.py` による同一ボリュームでの
+  macOS `F_FULLFSYNC` 単体実測（p50 約 4.35 ms）とほぼ同水準であり、
+  差分の大半が `F_FULLFSYNC` 相当の同期コストに帰属することを確認した。
+- `none` arm でも既存の整合性検証（E0↔レプリカのバイト一致・
+  `table_generation`・台帳 content_hash 照合）は全 run で通過し、redb
+  `Database::drop` によるクリーンクローズ時の pending commit 昇格
+  （8.1〜8.3 節）が実測でも機能することを確認した。
+- crossdb ベンチ本体（`ingest_single_stmt`・wire 経由・25,000 行）での
+  A/B は本 Issue の作業時間内では実施できなかった（fixture・venv 未準備）。
+  `self_durability.py` の結線は実装済みのため、次回の crossdb 計測時に
+  `CROSSDB_SELF_DURABILITY=none` を渡すだけで測定できる。
+- Linux ext4 環境での実測も未実施（本 Mac〔APFS〕のみ）。2026-09-08 の
+  ext4 参考値（`docs/design/crossdb-bench.md`「`ingest_single_stmt` の FS
+  切り分け」節。約 2,000 rows/s・`Immediate` のみ）は durability 別実測
+  ではないため、本節の結果と直接比較しない。
+
+再現手順: `make bench-ingest-durability-ab`（既定 `AB_PAIRS=5`・
+`STATEMENTS=5000`）。本節の生データは `STATEMENTS=2000`（N=5 ペアを
+共有機で現実的な時間に収めるための縮小値）で採取し
+`docs/design/bench-data/ingest-durability-ab/20260918T205301Z/` に保存
+した（`env.txt`・`fsync-probe.json`・`pair*.log`・`summary.tsv`）。

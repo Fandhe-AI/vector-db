@@ -184,6 +184,7 @@ hybrid_rrf(...)` は `sql/hnsw_hybrid.rs::HnswDenseProvider` 経由で HNSW 密�
 | `CROSSDB_PLAN_PROBE_BINARY` | `target/release/examples/crossdb_plan_probe` | probe example バイナリのパス上書き（絶対パス正規化・存在検査は fail-closed） |
 | `CROSSDB_SELF_HNSW_ARGS` | 未設定（空） | `--config hnsw` の起動引数へ追加する `--hnsw-*` 探索パラメータ opt-in（例: `--hnsw-full-scan-ratio 1/2`）。`shlex.split` 後、フラグ名が `--hnsw-` 接頭辞であること・各フラグの直後に値トークンが 1 個続くことを検証し、不適合は `ValueError` で拒否する（許可リスト方式）。`--config exact` で設定されていた場合も拒否する |
 | `CROSSDB_SELF_ANN_PROBE` | 未設定（`0`） | `1` を指定すると `--config exact` でも `ann_probe`（`engine: parallel_brute_force` を期待）を実行する（既定 off。対照値の記録用） |
+| `CROSSDB_SELF_DURABILITY` | 未設定（既定 `immediate`） | wire-server の `--durability` opt-in（Issue #851。`self_durability.py`）。`immediate`／`none` の厳密一致のみ受理し、`--config` を問わず適用される。未指定は起動引数を追加せず既定経路のまま不変。`none` 選択時は起動ログの `WARNING` 行有無を検証し arm 取り違えを fail-closed に検出する（`self_durability.verify_arm_identity`） |
 
 `hnsw_f16`/`hnsw_i8` トークン（`--search-engine` が受理する他の ANN 構成）は
 出力ファイル名 `self_hnsw.json` の衝突を避けるため本ハーネスの対象外

@@ -557,11 +557,19 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-ingest-profile
-bench-ingest-profile: ## Issue #396（ingest 経路の段別内訳プロファイル。所有権検査・content_hash・台帳記録・encode・redb insert・世代更新・commit の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_INGEST_PROFILE_MODE=batch|single〔既定 batch。single は Issue #484: 単文 INSERT 経路の P0/E0/S0/I1〜I8 内訳〕。batch モード: BENCH_INGEST_PROFILE_ROWS／BENCH_INGEST_PROFILE_DIM で規模を上書き可能。BENCH_INGEST_PROFILE_INSERT_MODE=insert|reserve で I6 段の redb insert_reserve A/B 計測モードを切替可能〔Issue #400・既定 insert・single モードは insert のみ対応〕。single モード: BENCH_INGEST_PROFILE_STATEMENTS（既定 25,000・2,000〜100,000）で単文数を上書き可能）
+bench-ingest-profile: ## Issue #396（ingest 経路の段別内訳プロファイル。所有権検査・content_hash・台帳記録・encode・redb insert・世代更新・commit の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_INGEST_PROFILE_MODE=batch|single〔既定 batch。single は Issue #484: 単文 INSERT 経路の P0/E0/S0/I1〜I8 内訳〕。batch モード: BENCH_INGEST_PROFILE_ROWS／BENCH_INGEST_PROFILE_DIM で規模を上書き可能。BENCH_INGEST_PROFILE_INSERT_MODE=insert|reserve で I6 段の redb insert_reserve A/B 計測モードを切替可能〔Issue #400・既定 insert・single モードは insert のみ対応〕。single モード: BENCH_INGEST_PROFILE_STATEMENTS（既定 25,000・2,000〜100,000）で単文数を上書き可能。BENCH_INGEST_PROFILE_DURABILITY=immediate|none〔Issue #851・既定 immediate・single モードのみ対応〕で durability A/B 計測モードを切替可能）
 ifdef HAS_CARGO
 	cargo bench --bench ingest_profile_bench -p fandhe-vector-db-engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-ingest-profile をスキップ"
+endif
+
+.PHONY: bench-ingest-durability-ab
+bench-ingest-durability-ab: ## Issue #851（`ingest_single_stmt` の durability 別実測。既定 immediate と opt-in none を同一バイナリ・同一 fixture で交互 N≥5 ペア実行し、I8〔redb commit〕・E0/S0 tier・fsync 系原始操作の参考値を記録する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。AB_PAIRS=<N>〔既定 5〕・STATEMENTS=<N>〔既定 5,000・2,000〜100,000〕・FSYNC_PROBE_DIR=<dir>〔既定 OUT_DIR〕で上書きできる。ログは target/bench-ingest-durability-ab/<UTC ts>/ 配下。python3 scripts/bench_ingest_durability_ab_summarize.py <dir> で TSV 集約）
+ifdef HAS_CARGO
+	scripts/bench_ingest_durability_ab.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-ingest-durability-ab をスキップ"
 endif
 
 # --------------------------------------------------

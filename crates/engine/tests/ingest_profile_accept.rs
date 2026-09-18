@@ -20,11 +20,11 @@ mod harness;
 use harness::ingest_profile::{
     content_hash_insert_batch_reimpl, content_hash_typed_insert_reimpl,
     decode_ledger_entry_v2_reimpl, encode_row_reimpl, encode_row_reimpl_into_slice,
-    last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row, parse_bounded_env, parse_insert_mode,
-    parse_profile_mode, refuse_under_github_actions, residual_ns_per_row, rows_per_sec,
-    sha256_reimpl, sum_durations, IngestProfileError, InsertMode, ProfileMode, StageId,
-    StageSamples, DEFAULT_SINGLE_STATEMENTS, MAX_SINGLE_STATEMENTS, MIN_SINGLE_STATEMENTS,
-    SINGLE_WARMUP_STATEMENTS,
+    last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row, parse_bounded_env, parse_durability,
+    parse_insert_mode, parse_profile_mode, refuse_under_github_actions, residual_ns_per_row,
+    rows_per_sec, sha256_reimpl, sum_durations, BenchDurability, IngestProfileError, InsertMode,
+    ProfileMode, StageId, StageSamples, DEFAULT_SINGLE_STATEMENTS, MAX_SINGLE_STATEMENTS,
+    MIN_SINGLE_STATEMENTS, SINGLE_WARMUP_STATEMENTS,
 };
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -454,6 +454,43 @@ fn parse_insert_mode_accepts_insert_and_reserve() {
         parse_insert_mode(Some("reserve")).expect("reserve"),
         InsertMode::Reserve
     );
+}
+
+#[test]
+fn parse_durability_defaults_to_immediate_when_unset() {
+    assert_eq!(
+        parse_durability(None).expect("default"),
+        BenchDurability::Immediate
+    );
+}
+
+#[test]
+fn parse_durability_accepts_immediate_and_none() {
+    assert_eq!(
+        parse_durability(Some("immediate")).expect("immediate"),
+        BenchDurability::Immediate
+    );
+    assert_eq!(
+        parse_durability(Some("none")).expect("none"),
+        BenchDurability::None
+    );
+}
+
+#[test]
+fn parse_durability_rejects_empty_string_and_unknown_value() {
+    // fail-closed: 空文字・未知値を黙って既定へフォールバックしない
+    // （coding-rust.md「untrusted 入力の扱い」）。
+    assert!(matches!(
+        parse_durability(Some("")).unwrap_err(),
+        IngestProfileError::InvalidEnv { .. }
+    ));
+    assert!(parse_durability(Some("eventual")).is_err());
+}
+
+#[test]
+fn parse_durability_rejects_wrong_case() {
+    assert!(parse_durability(Some("Immediate")).is_err());
+    assert!(parse_durability(Some("NONE")).is_err());
 }
 
 #[test]
