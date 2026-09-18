@@ -254,6 +254,57 @@ FATAL エラー結果の陰に隠して送出する。結果として `cur.execu
 確認した。個別実行時の観測 `[e2e-record]` 出力（実行環境固有の文言・
 接続情報は含まない）は PR 本文の Test plan に転記した。
 
+### TASK-183／HTTP-13: NoSQL 表層の 3 クライアント統合ハーネス（Issue #776）
+
+NoSQL 表層（`--surface nosql`。HTTP/1.1 自作リスナー・`/v1/session`／
+`/v1/session/close`／`/v1/query`）は Issue #734〜#772 で production 結線まで
+実装済みだが、無改造の外部 HTTP クライアントから実バイナリへ接続する層 B
+統合テストは未整備だった。SQL 表層側の層 A/層 B 分割方針（本 ADR 冒頭「決定」
+節）をそのまま踏襲し、以下の形で追加した。
+
+- **層 A**（既存。`tests/http4_session_issue.rs`・`tests/http5_query_bearer.rs`・
+  `tests/http8_session_close.rs`・`tests/nosql1_*`〜`tests/nosql11_*`）:
+  in-process サーバースレッド・生 HTTP/1.1 バイトの自作クライアントによる
+  常時回帰テスト。NoSQL 表層自体の契約（`op` 許可リスト・束縛規則・
+  `operation_id` 必須化・precision fail-closed・RLS 暗黙適用等）はこちらが
+  主として担う。
+- **層 B**（新規。`tests/three_client_http_e2e.rs`）: 実 `wire-server --surface
+  nosql` を子プロセスとして起動し、無改造の `curl` から `POST /v1/session`
+  （発行）→ `POST /v1/query`（`op: search`）→ `POST /v1/session/close`
+  （失効）→ 失効後の同一トークン再送が `401`／`wire_code 28000` で
+  拒否されることまでを確認するスモークテスト。あわせて stderr に
+  `--surface nosql` 起動時の告知行が含まれること（SQL 表層が誤って
+  起動していないことの非 vacuous な証跡）も検証する。`#[ignore]` とし
+  `make e2e-three-client-http` から明示的に実行する（`ci` には含めない）。
+
+**起動・ポート取得**: `tests/common/mod.rs::SpawnedServer`（`Drop` ガード付き。
+`tests/http4_session_issue.rs::spawned_binary_accepts_valid_login_over_nosql_surface`
+の前例と同型）をそのまま再利用した。SQL 表層側の `three_client_e2e.rs` が持つ
+`spawn_wire_server`／`ServerGuard` の第 3 コピーは作らない判断とした。
+
+**seed の複製**: `three_client_e2e.rs::seed_three_tenant_db`（`docs` テーブル・
+3 テナント × Public 1 行）は private 関数のため import できず、
+`extended_syntax_e2e.rs` の前例と同じ方式で `three_client_http_e2e.rs` 専用に
+複製した。3 行とも Public のため、wire 認証が導出する `PolicyContext`
+（Public のみ）でも alice（tenant-a）から全 3 行が可視という既存オラクルを
+そのまま流用できる。
+
+**curl 起動の設計**: `Command` の引数配列で `curl` を起動しシェルを介さない。
+要求 JSON は固定 `const`／リテラルで、未検証の文字列連結は行わない。
+`Content-Type: application/json` を明示し、`Expect:` を空値で送って
+100-continue の余地を消した。NoSQL 表層は `Connection: close` 固定のため
+1 要求 = 1 curl プロセスとし `--next` 連結はしない。取得したセッション
+トークンは形状検証（43 文字・base64url アルファベット限定）を経てから
+`Authorization` ヘッダへ載せる（untrusted な外部プロセス応答をそのまま
+信頼しない）。curl 未検出・非 0 終了・応答形状不一致はいずれも `panic!` で
+失敗させ、silent skip はしない。
+
+**本 Issue のスコープ**: ハーネス＋curl ランナー＋curl での
+session→search→close→失効後再送（`401`／`28000`）スモーク 1 本＋
+`make e2e-three-client-http` に限定した。urllib／fetch ランナー・
+3 クライアント一連手順の実行記録の整備・psql（SQL 経路）との結果一致比較は
+後続 Issue（#777〜#779）へ申し送る。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・

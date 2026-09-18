@@ -237,6 +237,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため e2e-three-client をスキップ"
 endif
 
+.PHONY: e2e-three-client-http
+e2e-three-client-http: ## TASK-183（HTTP-13）NoSQL 表層（--surface nosql）の無改造 HTTP クライアント統合テスト（opt-in・`ci` には含めない。要 curl。CURL_BIN で上書き可。urllib／fetch は Issue #777 で追加）
+ifdef HAS_CARGO
+	cargo test -p fandhe-vector-db-wire-server --test three_client_http_e2e -- --ignored
+else
+	@echo "skip: Cargo.toml 未追加のため e2e-three-client-http をスキップ"
+endif
+
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY)),)
