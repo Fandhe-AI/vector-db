@@ -505,20 +505,115 @@ pub struct Row {
     pub metadata: Vec<u8>,
 }
 
+/// 書き込みトランザクションの durability（Issue #849。構築時オプション）。
+///
+/// `redb::Durability` への写像は [`From<WriteDurability> for redb::Durability`] が
+/// 単一の情報源。既定は [`WriteDurability::Immediate`]（`redb` 自身の既定と同一）で、
+/// [`Storage::open`] はこの既定のまま挙動を変えない。[`WriteDurability::None`] を
+/// 明示的に選んだ場合、commit 成功境界（RECOVER-5・`recovery::commit_boundary`）自体の
+/// 判定契約は変わらないが、`abort()`（RECOVER-8・`recovery::fail_fast`）やプロセス
+/// 強制終了・電源断が発生すると、直前の `Immediate` commit 以降の commit はディスクへ
+/// 反映されずに失われ得る（損失ウィンドウ。詳細は
+/// `docs/design/ingest-write-path.md`「Issue #849 追記」節参照）。
+///
+/// `redb::Durability` は `#[non_exhaustive]` だが、本 enum は engine の公開契約として
+/// 独立に管理する（値の追加は破壊的変更として扱う。`IsolationLevel`〔`txn.rs`〕と
+/// 同じ注記方針）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteDurability {
+    /// commit 完了までに fsync 相当の同期を伴う（`redb` の既定・本 enum の既定）。
+    #[default]
+    Immediate,
+    /// commit は `redb` プロセス内のバッファ上でのみ完結し、OS への `write`／
+    /// `sync_data` のいずれも即座には発行しない（変更は次の `Immediate` commit・
+    /// チェックポイント・キャッシュ退避まで OS に一切渡らないことがある。
+    /// `storage::tests::power_loss::power_loss_scenario5_...` で実測確認済み）。
+    /// 損失ウィンドウは本型のドキュメンテーションコメント参照。
+    None,
+}
+
+impl From<WriteDurability> for redb::Durability {
+    fn from(value: WriteDurability) -> Self {
+        match value {
+            WriteDurability::Immediate => redb::Durability::Immediate,
+            WriteDurability::None => redb::Durability::None,
+        }
+    }
+}
+
 /// `redb::Database` を保持する永続化層のハンドル。
 ///
 /// wire-server の接続ハンドラや検索カーネルからは直接ではなく、このハンドルを介して
 /// 行データへアクセスする想定（呼び出し元は `Storage` を通じてのみ永続化状態を触る）。
 pub struct Storage {
     db: redb::Database,
+    /// 書き込みトランザクション生成の choke point（[`Storage::begin_write_txn`]）が
+    /// 適用する durability 設定（Issue #849）。
+    durability: WriteDurability,
+    /// [`Storage::begin_write_txn`] の呼び出し回数（テスト専用の非 vacuous 証跡）。
+    /// production ビルドには含めない。取りこぼし検査（全書き込みトランザクション
+    /// 生成箇所が choke point を通ることの検証）に使う。
+    #[cfg(test)]
+    write_txn_creations: std::sync::atomic::AtomicU64,
 }
 
 impl Storage {
     /// 指定パスの `redb` データベースを開く。ファイルが存在しなければ新規作成する
-    /// （`redb::Database::create` の契約）。
+    /// （`redb::Database::create` の契約）。durability は既定
+    /// （[`WriteDurability::Immediate`]）のまま固定（挙動は変更しない）。
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_durability(path, WriteDurability::default())
+    }
+
+    /// 指定パスの `redb` データベースを、書き込みトランザクションの durability を
+    /// 明示指定して開く（Issue #849。構築時オプション）。[`WriteDurability::default`]
+    /// を渡した場合は [`Storage::open`] と完全に同一の挙動になる。
+    pub fn open_with_durability(
+        path: impl AsRef<Path>,
+        durability: WriteDurability,
+    ) -> Result<Self> {
         let db = redb::Database::create(path)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            durability,
+            #[cfg(test)]
+            write_txn_creations: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// 書き込みトランザクション生成の choke point（Issue #849）。
+    ///
+    /// 本メソッドのみが `redb::Database::begin_write` を呼ぶ（単文/バッチ INSERT・
+    /// UPDATE・DELETE・DDL・ファイル形 INSERT・宣言済み分離レベル API〔`txn.rs`〕を
+    /// 含む全書き込み経路が本メソッド経由になるよう `storage.rs`・`txn.rs`・
+    /// `tenant.rs`・`catalog.rs` の生成箇所を統一する。取りこぼし検査は
+    /// `crates/engine/src/storage.rs` の `durability` 系テスト参照）。
+    ///
+    /// 既定値（[`WriteDurability::Immediate`]）は `redb` 自身の既定と同一のため
+    /// `set_durability` を呼ばない（挙動・トランザクション開始シーケンスをビット同一に
+    /// 保つ。受け入れ条件1「既存シグネチャ・挙動がビット同一」対応）。
+    /// `set_durability` は「このトランザクションで persistent savepoint を
+    /// 作成/削除していない限り成功する」契約（`redb` `=4.2.0`）であり、`begin_write`
+    /// 直後に呼ぶ本実装は構造的に失敗しない。
+    pub(crate) fn begin_write_txn(
+        &self,
+    ) -> std::result::Result<redb::WriteTransaction, redb::Error> {
+        let mut txn = self.db.begin_write()?;
+        if !matches!(self.durability, WriteDurability::Immediate) {
+            txn.set_durability(self.durability.into())?;
+        }
+        #[cfg(test)]
+        self.write_txn_creations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(txn)
+    }
+
+    /// [`Storage::begin_write_txn`] の呼び出し回数（テスト専用）。全書き込み経路が
+    /// choke point を経由していることの非 vacuous な証跡として使う。
+    #[cfg(test)]
+    pub(crate) fn write_txn_creations(&self) -> u64 {
+        self.write_txn_creations
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 内部 `redb::Database` ハンドルへの `pub(crate)` アクセサ。
@@ -540,7 +635,7 @@ impl Storage {
     /// [`Storage::begin_batch_write`] が返す [`crate::txn::BatchWriteTxn`] を使うこと。
     pub fn put(&self, id: u64, row: &RowInput<'_>) -> Result<()> {
         let encoded = encode_row(row)?;
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let mut table = write_txn
                 .open_table(ROWS_TABLE)
@@ -565,7 +660,7 @@ impl Storage {
         if rows.is_empty() {
             return Ok(());
         }
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let mut table = write_txn
                 .open_table(ROWS_TABLE)
@@ -2103,6 +2198,68 @@ mod tests {
         );
     }
 
+    /// 取りこぼし検査（Issue #849）: `Storage::put`/`put_batch`（Rust API 単行/複数行
+    /// 書き込み）が [`Storage::begin_write_txn`] choke point を経由することを、
+    /// 呼び出し前後の `write_txn_creations()` の差分で非 vacuous に確認する。
+    /// 空バッチはトランザクションを開かない既存契約（[`Storage::put_batch`] の
+    /// ドキュメンテーションコメント参照）に対応し、カウンタが増加しないことも固定する。
+    #[test]
+    fn put_and_put_batch_go_through_storage_choke_point() {
+        let path = unique_db_path("durability-choke-point-put");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        assert_eq!(storage.write_txn_creations(), 0);
+
+        storage
+            .put(
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0],
+                    metadata: &[],
+                },
+            )
+            .expect("put");
+        assert_eq!(storage.write_txn_creations(), 1, "put");
+
+        storage
+            .put_batch(&[
+                (
+                    2,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &[2.0],
+                        metadata: &[],
+                    },
+                ),
+                (
+                    3,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &[3.0],
+                        metadata: &[],
+                    },
+                ),
+            ])
+            .expect("put_batch");
+        assert_eq!(
+            storage.write_txn_creations(),
+            2,
+            "put_batch は複数行でも単一トランザクション"
+        );
+
+        storage.put_batch(&[]).expect("empty put_batch");
+        assert_eq!(
+            storage.write_txn_creations(),
+            2,
+            "空バッチはトランザクションを開かない既存契約が choke point 経由でも不変"
+        );
+    }
+
     #[test]
     fn scan_page_paginates_in_id_order_and_reports_continuation_cursor() {
         let path = unique_db_path("scan-page");
@@ -2646,7 +2803,11 @@ mod tests {
         #[test]
         fn power_loss_scenario4_rls_fields_survive_crash_after_commit() {
             let (backend, raw_db) = open_fresh();
-            let storage = Storage { db: raw_db };
+            let storage = Storage {
+                db: raw_db,
+                durability: WriteDurability::default(),
+                write_txn_creations: std::sync::atomic::AtomicU64::new(0),
+            };
 
             // embedding/metadata は空スライスにしない。空だと encoder/decoder が
             // これらのフィールドを常に欠落させる退行があっても電源断前後の比較が
@@ -2704,6 +2865,8 @@ mod tests {
                 reopen_from_image(crash_image).expect("reopen after crash must succeed");
             let recovered_storage = Storage {
                 db: recovered_raw_db,
+                durability: WriteDurability::default(),
+                write_txn_creations: std::sync::atomic::AtomicU64::new(0),
             };
 
             let row1_after = recovered_storage
@@ -2740,6 +2903,72 @@ mod tests {
             assert_eq!(
                 row2_after.metadata, row2_metadata,
                 "row 2 の metadata フィールドが電源断後も欠落・変質なく保持されているはず"
+            );
+        }
+
+        // シナリオ 5（Issue #849。`WriteDurability::None` opt-in の損失ウィンドウを
+        // シナリオ 4 と対にして固定する）。`Storage { durability: WriteDurability::None }`
+        // を本モジュールの特権で直接構築し、commit 成功応答を受け取った直後の行を
+        // 読み出せること（read-your-writes は維持される）を確認したうえで、
+        // `sync_data()` を一度も呼ばずに取った `durable_snapshot()`（＝電源断で必ず
+        // 残る像）から再オープンすると、その行が失われることを確認する。シナリオ 4
+        // （`WriteDurability::Immediate` は同じ手順で行が残る）との対比により、
+        // `Storage::begin_write_txn` の `set_durability` 分岐が実際に効いていることを
+        // 非 vacuous に固定する。`docs/design/ingest-write-path.md`「Issue #849 追記」節の
+        // 損失ウィンドウの記述に対応する回帰固定。
+        #[test]
+        fn power_loss_scenario5_none_durability_commit_can_be_lost_before_sync() {
+            let (backend, raw_db) = open_fresh();
+            let storage = Storage {
+                db: raw_db,
+                durability: WriteDurability::None,
+                write_txn_creations: std::sync::atomic::AtomicU64::new(0),
+            };
+
+            let embedding = [1.5_f32, -2.0, 0.25];
+            let metadata = b"scenario5-metadata".to_vec();
+
+            storage
+                .put(
+                    1,
+                    &RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &embedding,
+                        metadata: &metadata,
+                    },
+                )
+                .expect("put via production Storage API with WriteDurability::None");
+
+            // commit 成功応答を受け取った直後の行が、この時点で読み出せることを
+            // 確認する（read-your-writes は `redb` の契約として維持される）。
+            let row_before_crash = storage
+                .get("tenant-a", 1)
+                .expect("decode row via production Storage API before crash");
+            assert_eq!(row_before_crash.embedding, embedding);
+
+            // 電源断像は「直近 sync_data() 時点」のみを反映する（`durable_snapshot()`
+            // のドキュメンテーションコメント参照）。本テストでは一度も `sync_data()` を
+            // 呼んでいないため、`None` durability の commit 内容は一切含まれない。
+            let crash_image = backend.durable_snapshot();
+            drop(storage);
+
+            let recovered_raw_db =
+                reopen_from_image(crash_image).expect("reopen after crash must succeed");
+            let recovered_storage = Storage {
+                db: recovered_raw_db,
+                durability: WriteDurability::default(),
+                write_txn_creations: std::sync::atomic::AtomicU64::new(0),
+            };
+
+            // commit 成功応答を受け取ったはずの行が、電源断後は失われている
+            // （`docs/design/ingest-write-path.md`「Issue #849 追記」節の損失ウィンドウ）。
+            let after = recovered_storage.get("tenant-a", 1);
+            assert!(
+                matches!(after, Err(StorageError::NotFound(1))),
+                "WriteDurability::None の commit は sync 前の電源断で失われ得る \
+                 （fail-closed に NotFound を返すべきで、破損データを黙って返しては \
+                 ならない）: {after:?}"
             );
         }
 

@@ -1,7 +1,8 @@
 # 書き込み経路改善（Phase 2）の総括: 前後比較と Durability／バッチ上限の判断記録
 
-- ステータス: Accepted（記録のみ。production コード〔`crates/engine/src/`〕は
-  本コミットで無変更）
+- ステータス: Accepted。Phase 2（Issue #401）は記録のみで production コード
+  無変更だったが、8 節（Issue #849）で `crates/engine/src/storage.rs`・
+  `core.rs` へ production 変更を追加した
 - 対応: Issue #401
 - 親: Issue #395（「ingest 書き込み経路の固定コスト削減」Phase 2）
 - 前提 doc: `docs/design/ingest-stage-profile.md`（Issue #396・#397 追記・#398 追記）・
@@ -260,3 +261,82 @@ make bench-ingest-profile
 - CLAUDE.md「ステータス」段落が現状 2 回重複している点の解消（本 Issue の
   変更では両方に同一の追記を行うことで整合を保っているが、重複自体の解消は
   別途の申し送りとする）。
+
+## 8. Issue #849 追記: 書き込みトランザクションの durability を構築時オプションで選択可能にする
+
+- ステータス: Accepted・実装済み。対応: Issue #849
+- 対象: `crates/engine/src/storage.rs`（`WriteDurability` 型・
+  `Storage::open_with_durability`・choke point `Storage::begin_write_txn`）・
+  `crates/engine/src/core.rs`（`EngineCore::open_with_durability`）
+
+### 8.1 背景
+
+`redb`（`=4.2.0`）の書き込みトランザクションは `set_durability` を明示指定しない
+限り既定で `Durability::Immediate` として commit される。本リポの engine は
+この既定を一度も変更していなかった（choke point 導入前は `begin_write` 呼び出し
+17 箇所すべてが `redb::Database::begin_write()` の既定挙動のまま）。crossdb
+横断ベンチ（`docs/design/crossdb-bench.md`）で `ingest_single_stmt` が fsync を
+行わない一部の対照 DB に劣後するのは durability 契約の差であり、性能バグでは
+ない。本 Issue は既定 `Immediate` を一切変えないまま、`Storage`／`EngineCore`
+構築時オプションとして durability（`Immediate`／`None`）を選べる注入点を追加した。
+
+### 8.2 設計
+
+- `Storage::begin_write_txn`（`pub(crate)`）を全書き込みトランザクション生成の
+  単一 choke point とし、`storage.rs`（`put`／`put_batch`）・`txn.rs`
+  （`begin_write`／`begin_batch_write`）・`tenant.rs`（単文/バッチ INSERT・型付き
+  単文/バッチ INSERT・UPDATE・DELETE・ファイル形 INSERT の 7 箇所）・
+  `catalog.rs`（DDL 3 種・生行挿入 3 種の 6 箇所）の計 17 箇所すべてをこの choke
+  point 経由へ揃えた。既定値（`WriteDurability::Immediate`）は `redb` 自身の
+  既定と同一のため `set_durability` を呼ばず、挙動・トランザクション開始
+  シーケンスをビット同一に保つ（`Storage::open`／`EngineCore::open` 等の既存
+  公開 API は無変更のまま同じ内部経路を共有する）。
+- 取りこぼし検査は `#[cfg(test)]` 専用の呼び出し回数カウンタ
+  `Storage::write_txn_creations`（production ビルドには含めない）を choke
+  point 自身に持たせ、`storage::tests`・`txn::tests`・`tenant::tests`・
+  `catalog::tests` の各テストで「呼んだ回数と一致」まで厳密一致で確認した
+  （取りこぼし・二重発火の両方を検出できる非 vacuous な証跡）。
+
+### 8.3 `WriteDurability::None` の損失ウィンドウ
+
+`WriteDurability::None` を明示指定した場合、commit 成功境界
+（RECOVER-5・`recovery::commit_boundary`）自体の判定契約（「`commit()` が `Ok`
+を返した時点を point of no return とする」）は変わらない。しかし
+`recovery::fail_fast`（RECOVER-8）の `std::process::abort()`・プロセス強制終了
+（SIGKILL）・OS 電源断が発生すると、直前の `Immediate` commit 以降の `None`
+commit はディスクへ反映されずに失われ得る（損失ウィンドウ）。
+
+`crates/engine/src/storage.rs::tests::power_loss` へ、既存シナリオ 4
+（`Immediate`。commit 後は電源断像に必ず残る）と対にしたシナリオ 5 を追加し、
+`WriteDurability::None` で commit した行が commit 成功応答（read-your-writes で
+読み出せる）を受け取った直後でも、`sync_data()` を一度も呼ばずに取った電源断
+像から再オープンすると失われる（`Err(StorageError::NotFound)`。fail-closed に
+拒否し、破損データを黙って返さない）ことを固定した。本開発環境の `redb`
+`=4.2.0` の実測では、`None` commit の内容は OS へ一切引き渡されず `redb`
+プロセス内のバッファに留まる（`write()`／`sync_data()` いずれも backend へ
+到達しない）ため、損失は「fsync 前」というよりプロセス終了・電源断のいずれで
+も再現する（`crates/engine/src/storage.rs::WriteDurability::None` のドキュメン
+テーションコメント参照）。
+
+台帳（TASK-101・RECOVER-10）との整合: 行データと台帳エントリは同一トランザク
+ション内で commit されるため、`None` 下で損失が起きても両者は常に「揃って
+残る／揃って消える」（部分書き込みは残らない）。`operation_id` 台帳照合による
+再送判定（同一内容は `DuplicateOperationId`・内容不一致は
+`OperationIdContentMismatch`）が `WriteDurability::None` でも既定と同一結果に
+なることは `tenant::tests::ledger_duplicate_and_mismatch_contract_is_unchanged_under_none_durability`
+で固定した。
+
+### 8.4 spec 側改訂の要否
+
+本追記時点では判断せず、オーナー報告に委ねる。
+
+### 8.5 スコープ外・申し送り
+
+- wire-server への `--durability` CLI opt-in 露出（`--search-engine`／
+  Issue #656 の前例と同型）。
+- `EXPLAIN` への durability 設定の露出。
+- 周期的な `Immediate` チェックポイント（`None` 運用時の損失ウィンドウを縮める
+  運用機構）。
+- crossdb ベンチ（`ingest_single_stmt`）での `WriteDurability::None` 実測・
+  Redis／LanceDB との差の再検証（本 Issue は注入点の追加のみが目的で、性能実測は
+  対象外）。

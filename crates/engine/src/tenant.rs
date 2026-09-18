@@ -518,7 +518,7 @@ pub(crate) fn insert_row_unchecked(
     if !ctx.is_owner(row.tenant_id) {
         return Err(TenantWriteError::Forbidden);
     }
-    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
@@ -627,7 +627,7 @@ pub(crate) fn insert_rows_unchecked(
         }
     }
 
-    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         if rows.is_empty() {
@@ -797,7 +797,7 @@ pub(crate) fn insert_typed_row_unchecked(
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
-    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         if let Some(expected) = expected_schema {
@@ -932,7 +932,7 @@ pub(crate) fn insert_typed_rows_unchecked(
         }
     }
 
-    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         if let Some(expected) = expected_schema {
@@ -1088,7 +1088,7 @@ pub(crate) fn update_row_unchecked(
     if !ctx.is_owner(row.tenant_id) {
         return Err(TenantWriteError::Forbidden);
     }
-    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
@@ -1184,7 +1184,7 @@ pub(crate) fn delete_row_unchecked(
     ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
-    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
     {
         // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
         // `insert_row`/`update_row` と同じ前段を通す。
@@ -1307,7 +1307,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
         ledger_write,
     } = req;
     validate_identifier(table)?;
-    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
     // `row_table` の借用（`write_txn.open_table(..)`）をこのブロック内に閉じ込め、
     // ブロックを抜けた後に `write_txn` を（成功なら commit、無変更なら drop で
     // abort）自由に扱えるようにする（`insert_rows` の空バッチ早期 return と異なり、
@@ -2352,5 +2352,255 @@ mod tests {
             );
             assert_eq!(row.metadata, metadatas[i as usize], "row {i} metadata");
         }
+    }
+
+    /// 取りこぼし検査（Issue #849）: 本ファイルが提供する全書き込み経路
+    /// （単文/バッチ INSERT・型付き単文/バッチ INSERT・UPDATE・DELETE・
+    /// ファイル形 INSERT）が [`Storage::begin_write_txn`] choke point を
+    /// 1 回ずつ経由することを、呼び出し前後の `write_txn_creations()` の
+    /// 差分で非 vacuous に確認する（受け入れ条件2「取りこぼしがないことを
+    /// 非 vacuous なテストで固定」対応。台帳〔`ledger::record_in_txn`〕は
+    /// 各書き込み関数が開いた同一トランザクション内で呼ばれる設計のため、
+    /// 台帳分の choke point 通過は本テストのカウンタ増分に自動的に含まれる）。
+    #[test]
+    fn all_tenant_write_paths_go_through_storage_choke_point() {
+        let path = unique_db_path("durability-choke-point-tenant");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        // 生 `RowInput` 経路（メタデータ形が任意）用の素のテーブルと、型付き値配列
+        // 経路（スキーマ列に沿った `TEXT` 列を要求）用のテーブルを分ける。両テーブルの
+        // `create_table` 自体も choke point を経由するため、ここでは 2 テーブル作成後の
+        // 値を基準に取り直し、以降の各操作が「+1」であることだけを確認する。
+        storage
+            .create_table(&schema("raw_docs"))
+            .expect("create raw table");
+        storage
+            .create_table(&file_schema("typed_docs"))
+            .expect("create typed table");
+        let mut expected = storage.write_txn_creations();
+
+        // 単文 INSERT（生 RowInput 経路）。
+        insert_row(
+            &storage,
+            "raw_docs",
+            &ctx,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 0.0],
+                metadata: &[],
+            },
+            &OperationId::parse("choke-insert-row").expect("valid operation_id"),
+        )
+        .expect("insert_row");
+        expected += 1;
+        assert_eq!(storage.write_txn_creations(), expected, "insert_row");
+
+        // バッチ INSERT（生 RowInput 経路）。複数行でも単一トランザクション。
+        insert_rows(
+            &storage,
+            "raw_docs",
+            &ctx,
+            &[
+                (
+                    2,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &[0.0, 1.0],
+                        metadata: &[],
+                    },
+                ),
+                (
+                    3,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &[1.0, 1.0],
+                        metadata: &[],
+                    },
+                ),
+            ],
+            &OperationId::parse("choke-insert-rows").expect("valid operation_id"),
+        )
+        .expect("insert_rows");
+        expected += 1;
+        assert_eq!(storage.write_txn_creations(), expected, "insert_rows");
+
+        // UPDATE。
+        update_row(
+            &storage,
+            "raw_docs",
+            &ctx,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[9.0, 9.0],
+                metadata: &[],
+            },
+            &OperationId::parse("choke-update-row").expect("valid operation_id"),
+        )
+        .expect("update_row");
+        expected += 1;
+        assert_eq!(storage.write_txn_creations(), expected, "update_row");
+
+        // DELETE。
+        delete_row(
+            &storage,
+            "raw_docs",
+            &ctx,
+            2,
+            &OperationId::parse("choke-delete-row").expect("valid operation_id"),
+        )
+        .expect("delete_row");
+        expected += 1;
+        assert_eq!(storage.write_txn_creations(), expected, "delete_row");
+
+        // 単文 INSERT（型付き値配列経路。SQL 表層の単文 INSERT が最終的に通る経路）。
+        insert_typed_row(
+            &storage,
+            "typed_docs",
+            &ctx,
+            4,
+            Visibility::Public,
+            &row_values([2.0, 0.0], "a.txt", "body-a"),
+            &OperationId::parse("choke-insert-typed-row").expect("valid operation_id"),
+        )
+        .expect("insert_typed_row");
+        expected += 1;
+        assert_eq!(storage.write_txn_creations(), expected, "insert_typed_row");
+
+        // バッチ INSERT（型付き値配列経路。SQL 表層のバッチ INSERT が通る経路）。
+        let op_id = OperationId::parse("choke-insert-typed-rows").expect("valid operation_id");
+        let ledger_write = LedgerMode::Ledgered
+            .resolve(Some(&op_id))
+            .expect("resolve ledger write");
+        insert_typed_rows_unchecked(
+            &storage,
+            "typed_docs",
+            &ctx,
+            Visibility::Public,
+            &[(5, &row_values([0.0, 2.0], "b.txt", "body-b"))],
+            ledger_write,
+            None,
+        )
+        .expect("insert_typed_rows_unchecked");
+        expected += 1;
+        assert_eq!(
+            storage.write_txn_creations(),
+            expected,
+            "insert_typed_rows_unchecked"
+        );
+
+        // ファイル形 INSERT（TASK-120 の同一パス置換書き込み経路）。
+        replace_typed_rows_by_text_key(
+            &storage,
+            &ctx,
+            ReplaceByTextKey {
+                table: "typed_docs",
+                key_column: "path",
+                key_value: "c.txt",
+                visibility: Visibility::Public,
+                rows: &[row_values([3.0, 3.0], "c.txt", "body-c")],
+                content_hash_path: "c.txt",
+                content_hash_body: "body-c",
+                content_hash_template_values: &[],
+                ledger_write: LedgerWrite::Disabled,
+            },
+        )
+        .expect("replace_typed_rows_by_text_key");
+        expected += 1;
+        assert_eq!(
+            storage.write_txn_creations(),
+            expected,
+            "replace_typed_rows_by_text_key"
+        );
+    }
+
+    /// RECOVER-5・台帳契約不変（Issue #849 受け入れ条件3）: `WriteDurability::None`
+    /// を明示指定した `Storage` でも、`operation_id` 台帳照合による再送判定
+    /// （同一内容の再送は [`TenantWriteError::DuplicateOperationId`]・内容不一致は
+    /// [`TenantWriteError::OperationIdContentMismatch`]。TASK-101・RECOVER-10）が
+    /// 既定（[`WriteDurability::Immediate`]）と同じ判定結果になることを固定する。
+    /// durability は commit 前の設定であり、commit 成功境界（RECOVER-5）・台帳照合
+    /// ロジック自体には影響しない契約を確認する。
+    #[test]
+    fn ledger_duplicate_and_mismatch_contract_is_unchanged_under_none_durability() {
+        let path = unique_db_path("durability-none-ledger-contract");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open_with_durability(&path, crate::storage::WriteDurability::None)
+            .expect("open storage with WriteDurability::None");
+        storage.create_table(&schema("docs")).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id = OperationId::parse("dur-none-ledger").expect("valid operation_id");
+
+        // 初回は成功する。
+        insert_row(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 0.0],
+                metadata: b"content-a",
+            },
+            &op_id,
+        )
+        .expect("first insert_row with WriteDurability::None must succeed");
+
+        // 同一 operation_id・同一内容の再送は DuplicateOperationId（23505 相当）。
+        let dup = insert_row(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 0.0],
+                metadata: b"content-a",
+            },
+            &op_id,
+        );
+        assert!(
+            matches!(dup, Err(TenantWriteError::DuplicateOperationId)),
+            "同一内容の再送は DuplicateOperationId であるべき: {dup:?}"
+        );
+
+        // 同一 operation_id・内容不一致は OperationIdContentMismatch（22023 相当）。
+        let mismatch = insert_row(
+            &storage,
+            "docs",
+            &ctx,
+            2,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[9.0, 9.0],
+                metadata: b"content-b",
+            },
+            &op_id,
+        );
+        assert!(
+            matches!(mismatch, Err(TenantWriteError::OperationIdContentMismatch)),
+            "内容不一致の再送は OperationIdContentMismatch であるべき: {mismatch:?}"
+        );
+
+        // 台帳照合が Err を返した書き込みは commit されない（行 id=2 は残らない）
+        // ことを確認する。fail-closed の原子性契約（TASK-94・RECOVER-3）が
+        // durability の値に関わらず維持されることの証跡。
+        assert!(
+            visible_rows(&storage, "docs", &ctx)
+                .expect("visible_rows")
+                .iter()
+                .all(|r| r.id != 2),
+            "内容不一致で拒否された書き込みは id=2 の行を残してはならない"
+        );
     }
 }

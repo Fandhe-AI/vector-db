@@ -737,7 +737,7 @@ impl Storage {
         // スキーマ検証は `encode_schema` 内の `validate_schema` に集約する（write txn を
         // 開く前に fail-closed に拒否される。ここで別途 `validate_schema` を呼ぶ必要はない）。
         let encoded = encode_schema(schema)?;
-        let write_txn = self.db().begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             if table.get(schema.name.as_str())?.is_some() {
@@ -775,7 +775,7 @@ impl Storage {
     /// エントリが引き継がれ、正当な書き込みを誤って重複拒否する事故を防ぐ）。
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
         validate_identifier(table_name)?;
-        let write_txn = self.db().begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let mut table = match write_txn.open_table(CATALOG_TABLE) {
                 Ok(table) => table,
@@ -813,7 +813,7 @@ impl Storage {
                 "column added via ALTER TABLE ADD COLUMN must be nullable".to_string(),
             ));
         }
-        let write_txn = self.db().begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             let existing: Vec<u8> = {
@@ -892,7 +892,7 @@ impl Storage {
         row: &RowInput<'_>,
     ) -> Result<()> {
         validate_identifier(table_name)?;
-        let write_txn = self.db().begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
             schema.validate_embedding_dim(row.embedding.len())?;
@@ -932,7 +932,7 @@ impl Storage {
         rows: &[(u64, RowInput<'_>)],
     ) -> Result<()> {
         validate_identifier(table_name)?;
-        let write_txn = self.db().begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
             if rows.is_empty() {
@@ -990,7 +990,7 @@ impl Storage {
         values: &[RowCodecValue],
     ) -> Result<()> {
         validate_identifier(table_name)?;
-        let write_txn = self.db().begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
             let vector_idx = schema
@@ -1926,5 +1926,95 @@ mod tests {
             CatalogError::Invalid(msg) => assert!(msg.contains("scan_table_page"), "{msg}"),
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// 取りこぼし検査（Issue #849）: `catalog.rs` が提供する DDL・生行挿入経路
+    /// （`create_table`・`drop_table`・`alter_table_add_column`・
+    /// `insert_row_into_table`・`insert_rows_into_table`・`insert_typed_row`）が
+    /// [`Storage::begin_write_txn`] choke point を 1 回ずつ経由することを、呼び出し
+    /// 前後の `write_txn_creations()` の差分で非 vacuous に確認する
+    /// （`tenant.rs::tests::all_tenant_write_paths_go_through_storage_choke_point` の
+    /// catalog 層対応）。
+    #[test]
+    fn all_catalog_write_paths_go_through_storage_choke_point() {
+        let path = unique_db_path("durability-choke-point-catalog");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let mut expected: u64 = 0;
+
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create_table");
+        expected += 1;
+        assert_eq!(storage.write_txn_creations(), expected, "create_table");
+
+        storage
+            .alter_table_add_column("docs", ColumnDef::new("note", ColumnType::Text, true))
+            .expect("alter_table_add_column");
+        expected += 1;
+        assert_eq!(
+            storage.write_txn_creations(),
+            expected,
+            "alter_table_add_column"
+        );
+
+        storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert_row_into_table");
+        expected += 1;
+        assert_eq!(
+            storage.write_txn_creations(),
+            expected,
+            "insert_row_into_table"
+        );
+
+        storage
+            .insert_rows_into_table(
+                "docs",
+                &[(
+                    2,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &[0.0, 1.0],
+                        metadata: &[],
+                    },
+                )],
+            )
+            .expect("insert_rows_into_table");
+        expected += 1;
+        assert_eq!(
+            storage.write_txn_creations(),
+            expected,
+            "insert_rows_into_table"
+        );
+
+        storage
+            .insert_typed_row(
+                "docs",
+                3,
+                "tenant-a",
+                Visibility::Public,
+                &[RowCodecValue::Vector(vec![1.0, 1.0])],
+            )
+            .expect("insert_typed_row");
+        expected += 1;
+        assert_eq!(storage.write_txn_creations(), expected, "insert_typed_row");
+
+        storage.drop_table("docs").expect("drop_table");
+        expected += 1;
+        assert_eq!(storage.write_txn_creations(), expected, "drop_table");
     }
 }
