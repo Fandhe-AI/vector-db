@@ -271,7 +271,10 @@ NoSQL 表層（`--surface nosql`。HTTP/1.1 自作リスナー・`/v1/session`�
 - **層 B**（新規。`tests/three_client_http_e2e.rs`）: 実 `wire-server --surface
   nosql` を子プロセスとして起動し、無改造の `curl` から `POST /v1/session`
   （発行）→ `POST /v1/query`（`op: search`）→ `POST /v1/session/close`
-  （失効）が順に成功することを確認するスモークテスト。`#[ignore]` とし
+  （失効）→ 失効後の同一トークン再送が `401`／`wire_code 28000` で
+  拒否されることまでを確認するスモークテスト。あわせて stderr に
+  `--surface nosql` 起動時の告知行が含まれること（SQL 表層が誤って
+  起動していないことの非 vacuous な証跡）も検証する。`#[ignore]` とし
   `make e2e-three-client-http` から明示的に実行する（`ci` には含めない）。
 
 **起動・ポート取得**: `tests/common/mod.rs::SpawnedServer`（`Drop` ガード付き。
@@ -297,10 +300,10 @@ NoSQL 表層（`--surface nosql`。HTTP/1.1 自作リスナー・`/v1/session`�
 失敗させ、silent skip はしない。
 
 **本 Issue のスコープ**: ハーネス＋curl ランナー＋curl での
-session→search→close スモーク 1 本＋`make e2e-three-client-http` に限定した。
-urllib／fetch ランナー・3 クライアント一連手順・失効後 `28000` の検証・
-実行記録の整備・psql（SQL 経路）との結果一致比較は後続 Issue（#777〜#779）
-へ申し送る。
+session→search→close→失効後再送（`401`／`28000`）スモーク 1 本＋
+`make e2e-three-client-http` に限定した。urllib／fetch ランナー・
+3 クライアント一連手順の実行記録の整備・psql（SQL 経路）との結果一致比較は
+後続 Issue（#777〜#779）へ申し送る。
 
 ## 影響
 
