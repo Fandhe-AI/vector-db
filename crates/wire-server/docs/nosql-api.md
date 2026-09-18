@@ -446,6 +446,10 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 検証コード: `crates/wire-server/tests/nosql3_scan_wire_parity.rs`・
 `nosql4_5_aggregate_wire_parity.rs`・`wire_using_plan.rs`・
 `wire_insert_operation_id.rs`・`crates/engine/tests/default_preset.rs`。
+本対応表の 9 ケース（search-1〜4・scan-1・agg-1〜4）は無改造 `psql`（SQL
+表層）と無改造 HTTP クライアント（NoSQL 表層）の双方を実バイナリ経由で
+実行して列名・型・行集合の一致を検証する層 B `three_client_http_e2e.rs`
+（Issue #779。`make e2e-three-client-http`）でも固定している。
 
 ## エラー応答
 
@@ -625,7 +629,8 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
 - `filter`: `nosql7_filter_mapping.rs`
 - 応答形: `nosql11_response_schema.rs`
 - エラー射影: `err4_http_projection.rs`・`nosql_api_doc.rs`
-- 層 B（無改造の外部 HTTP クライアント）: `three_client_http_e2e.rs`・
+- 層 B（無改造の外部 HTTP クライアント。SQL 経路〔`psql`〕との search／
+  scan／aggregate 結果一致比較を含む・Issue #779）: `three_client_http_e2e.rs`・
   `tests/three_client_http/{urllib_client.py,fetch_client.js}`
   （`make e2e-three-client-http`。opt-in・`ci` 非包含）。実行記録の様式は
   `docs/design/three-client-e2e-harness.md` 参照

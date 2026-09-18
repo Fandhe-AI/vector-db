@@ -414,8 +414,62 @@ grep '\[e2e-record\]' <scratch>/e2e-http.log
 
 **#779（SQL 経路パリティ）との分担**: 本節が扱うのは実行記録の様式・運用
 手順のみであり、NoSQL 表層と SQL 表層の結果一致比較（search／scan／
-aggregate）は #779 のスコープのまま。production コード
+aggregate）は次節が担う。production コード
 （`crates/engine/src/`・`crates/wire-server/src/`）は無変更。
+
+### SQL 経路パリティ（Issue #779）
+
+**目的**: `run_session_search_close_scenario`（#776〜#778）は search 1 本の
+外形確認にとどまり、SQL 表層との結果一致は明示的にスコープ外としていた
+（上記「#779（SQL 経路パリティ）との分担」節）。本節はその後続として、
+同一クエリ意図を SQL 表層（実 `wire-server`・無改造 `psql`）と NoSQL 表層
+（実 `wire-server --surface nosql`・無改造 HTTP クライアント）の双方へ
+投げ、**列名・型・行集合**が一致することを層 B へ組み込む。
+
+**起動方式（順次 2 プロセス）**: redb は単一ライターのため同一 DB
+ファイルを 2 プロセス同時には開けない。`seed_parity_db` で 1 回だけ seed
+した DB ファイルに対し、SQL 表層（`--surface` なし）を起動して psql・
+生 wire で全クエリを採取したのち `stop_and_drain`（SIGKILL）で終了させ、
+同じ DB ファイルで NoSQL 表層（`--surface nosql`）を起動して HTTP
+クライアントで全クエリを採取する。SIGKILL 後の再オープンは非クリーン
+終了からの回復（open 時修復）を伴いうるが、本シナリオは読み取り専用の
+ため無害であり欠陥ではない。
+
+**型の観測方法（psql では取得不能）**: 拡張クエリプロトコルは `0A000` で
+未対応のため `\gdesc` は使えない。列名・値は psql（`-A`・ヘッダ付き・
+`-F '|'`・`-P footer=off`）から取り、型は同じ SQL 表層プロセスへの生
+simple query（`RowDescription` の型 OID）から取る
+（`sql_column_types_via_raw_wire`。固定表 OID 1700→`numeric`／25→`text`
+以外は fail-closed に `panic!`。`crate::result_encoder::WireType` の
+公告表と単一情報源）。
+
+**正規化モデル**: NoSQL 応答の JSON セルは `json_cell_to_pg_text` で
+psql のテキスト表現へ正規化してから比較する（`Cell::Integer`/
+`Cell::Float` は両表層とも Rust `Display` 経由で同じ 10 進テキストになる
+契約を利用）。正規化して通す**表現差**は、`VECTOR` 列・式項目（集計）の
+型名がいずれも一律 `"text"` として公告される一方値は native JSON で
+届く非対称、および `u64` が `2^53` を超える場合の JS 側丸め可能性。
+**意味差**（行集合・件数・キー順・列名・型 OID 対応の不一致）は正規化や
+アサート弱体化で吸収せず、テストを fail させる契約とした。
+
+**比較順序**: `search`（`ORDER BY` あり）・`aggregate`（`GROUP BY` 既定
+キー順）は順序付き比較、`scan`（SQL-15。順序保証なし）は多重集合比較を
+行う。各ケースは固定オラクルとも一致させ、両表層が同じ誤りを返す
+ケースを排除する。
+
+**クエリ集合**: `crates/wire-server/docs/nosql-api.md`「SQL ↔ NoSQL 対応
+表」に対応する search-1〜4・scan-1・agg-1〜4 の 9 ケース（`PARITY_CASES`）
+を、alice（tenant-a）・bob（tenant-b）・carol（tenant-c）の 3 テナント
+それぞれで実行し、3 テナントいずれも他テナントの Private 行（id=11／12）
+が両表層のどの応答にも現れないことをあわせて検証する。
+
+**実測結果**: 3 クライアント（curl／urllib／fetch）× 3 テナント × 9 ケース
+＝ 81 組すべてで列名・型・行集合が一致することを確認済み（本開発環境。
+`make e2e-three-client-http` の `[e2e-record] parity/<client>: ...` 行で
+`match=true` を確認できる）。実測で発見した意味差は無かった。
+
+production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
+無変更（テスト・docs 専任）。
 
 ## 影響
 
