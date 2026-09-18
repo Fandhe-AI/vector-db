@@ -220,6 +220,9 @@ def write_result(out_dir: str, db: str, config: str, meta: dict, phases: dict) -
     payload = {"meta": meta, "phases": phases}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
+        # editorconfig の insert_final_newline 規約（lint-docs / editorconfig-checker）に
+        # 合わせるため、json.dump が付けない末尾改行を明示的に書く。
+        f.write("\n")
     return path
 
 

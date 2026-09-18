@@ -10,7 +10,9 @@
 # 各 exact/hnsw 構成）をまとめて 1 ラウンドとみなし、そのラウンドを
 # `AB_PAIRS`（既定 5）回繰り返すラウンドロビン方式を取る（cand が 1 個では
 # なく DB の数だけあるため、baseline→cand→baseline→cand... という厳密な
-# 2 arm 輪番を適用できない構造的な理由による意図的な逸脱）。
+# 2 arm 輪番を適用できない構造的な理由による意図的な逸脱。この逸脱の
+# 評価上の扱いは `docs/design/benchmark-judgement-policy.md` §3「多 arm
+# 横断ベンチの輪番（意図的な例外）」に明示済み）。
 #
 # production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
 # 一切変更しない（本スクリプト・生成物はテスト・ベンチ専任）。
@@ -22,11 +24,19 @@
 #   BENCH_DEDICATED_ENV=1（専有環境で実施した場合にのみ設定。env.txt へ記録
 #     するだけで動作は変えない）
 #
-# 出力: <CROSSDB_DIR>/results/round<N>/*.json・<CROSSDB_DIR>/logs/round<N>/*.log
+# 出力: <CROSSDB_DIR>/results/<ts>-round<N>/*.json・
+#       <CROSSDB_DIR>/logs/<ts>-round<N>/*.log
+#       （ラウンドディレクトリ名にセッション起動時刻 `<ts>` を含めるのは、
+#       同じ `CROSSDB_DIR` へ複数セッションを実行した際に前回の JSON が
+#       `results/round<N>` に残留して混在するのを防ぐため）
 #       docs/design/bench-data/crossdb-<ts>-ab/env.txt
 #
-# --summarize <dir> <ts> で Markdown 表を出力する
-# （scripts/bench_crossdb_ab_summarize.py の実体へ委譲）。
+# --summarize <dir> <rounds> [<round_dir_prefix>] で Markdown 表を出力する
+# （scripts/bench_crossdb_ab_summarize.py の実体へ委譲。`<round_dir_prefix>`
+# 省略時は既定 `round`（旧セッション形式・`docs/design/bench-data/
+# crossdb-20260918T142251Z-ab/` 等の既存コミット済みデータとの後方互換）。
+# 本スクリプトが最後に出力する `summarize with: ...` コマンドはセッション
+# 固有の prefix を渡す）。
 
 set -euo pipefail
 
@@ -56,12 +66,20 @@ if ! [[ "${AB_PAIRS}" =~ ^[0-9]+$ ]] || [ "${AB_PAIRS}" -lt 5 ]; then
   die "AB_PAIRS must be an integer >= 5 (got ${AB_PAIRS})"
 fi
 
+# `self_db.py::SelfServer._default_binary` は `CROSSDB_SELF_BINARY` が
+# 相対パスならそのプロセスの cwd を基準に再解決するため、ここで絶対パス化した
+# 値を export せずに使うと、以下で sha256 を取るバイナリと `run_all.sh` の
+# 子プロセスが実際に起動するバイナリが異なる cwd 解決により食い違いうる
+# （`scripts/bench_crossdb_self_hnsw_ab.sh` と同型の対策）。ここで一度だけ
+# パスを解決し、存在確認・ハッシュ算出・`CROSSDB_SELF_BINARY` への
+# 再代入のいずれにも同じ絶対パスを使う。
 WIRE_SERVER_BIN="${CROSSDB_SELF_BINARY:-${REPO_ROOT}/target/release/wire-server}"
 case "${WIRE_SERVER_BIN}" in
   /*) : ;;
   *) WIRE_SERVER_BIN="$(pwd)/${WIRE_SERVER_BIN}" ;;
 esac
 [ -x "${WIRE_SERVER_BIN}" ] || die "wire-server binary not found: ${WIRE_SERVER_BIN} (run: cargo build --release -p fandhe-vector-db-wire-server)"
+export CROSSDB_SELF_BINARY="${WIRE_SERVER_BIN}"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DOC_DIR="${REPO_ROOT}/docs/design/bench-data/crossdb-${TS}-ab"
@@ -70,18 +88,27 @@ mkdir -p "${OUT_DOC_DIR}"
 # CPU モデル・コア数・loadavg は macOS（`sysctl`）／Linux（`/proc/*`）の両対応
 # で取得する（本 Issue の計測環境が macOS のため。既存 AB ドライバ群は
 # Linux 専有の `/proc/loadavg` 等を前提にしており macOS では unavailable に
-# なる）。
+# なる）。判定は `uname -s` で行う（`command -v sysctl` は procps 由来の
+# `sysctl` バイナリを $PATH に持つ Linux 環境でも真になり、`machdep.cpu.*`／
+# `vm.loadavg` のような BSD 専用キーの誤参照や `fs_type_of` の macOS 専用
+# `mount` 出力解析への誤分岐を招く）。
+IS_MACOS=0
+[ "$(uname -s 2>/dev/null)" = "Darwin" ] && IS_MACOS=1
 cpu_model() {
-  if command -v sysctl >/dev/null 2>&1 && sysctl -n machdep.cpu.brand_string 2>/dev/null; then
+  if [ "${IS_MACOS}" = 1 ] && sysctl -n machdep.cpu.brand_string 2>/dev/null; then
     return 0
   fi
   grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || echo unavailable
 }
 cpu_count() {
-  sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo unavailable
+  if [ "${IS_MACOS}" = 1 ]; then
+    sysctl -n hw.ncpu 2>/dev/null || echo unavailable
+    return 0
+  fi
+  nproc 2>/dev/null || echo unavailable
 }
 loadavg_now() {
-  if command -v sysctl >/dev/null 2>&1 && sysctl -n vm.loadavg 2>/dev/null; then
+  if [ "${IS_MACOS}" = 1 ] && sysctl -n vm.loadavg 2>/dev/null; then
     return 0
   fi
   cat /proc/loadavg 2>/dev/null || echo unavailable
@@ -100,7 +127,7 @@ fs_type_of() {
   # デバイス（シンボリックリンク・bind mount を辿った後の実マウント点）を
   # 手掛かりに `mount` 出力（`<device> on <path> (<fstype>, ...)`）から拾う。
   # Linux では `df -T` の 2 列目（filesystem type）をそのまま使う。
-  if command -v sysctl >/dev/null 2>&1; then
+  if [ "${IS_MACOS}" = 1 ]; then
     local dev
     dev="$(df "$1" 2>/dev/null | tail -n1 | awk '{print $1}')"
     [ -n "${dev}" ] || { echo unavailable; return 0; }
@@ -136,7 +163,15 @@ docker_image_digest() {
   echo "fs_type_crossdb_dir: $(fs_type_of "${CROSSDB_DIR}")"
 } >"${OUT_DOC_DIR}/env.txt"
 
-echo "writing per-round results under ${CROSSDB_DIR}/results/round<N>/ (logs: ${CROSSDB_DIR}/logs/round<N>/)"
+# `results/round<N>` を毎回同じ名前で再利用すると、同じ `CROSSDB_DIR` に対して
+# 本スクリプトを複数回実行した際に前回セッションの JSON が残留・混在し、
+# summarize が古い round の生データを新しいセッションの計測と誤って
+# 混ぜて集計しうる。`TS`（本セッションの起動時刻。数字・`T`・`Z` のみで
+# `CROSSDB_RUN_TAG` の許容文字集合を満たす）を prefix に含めたセッション
+# 固有のラウンドディレクトリ名にすることで、セッションをまたいだ残留を防ぐ。
+ROUND_TAG_PREFIX="${TS}-round"
+
+echo "writing per-round results under ${CROSSDB_DIR}/results/${ROUND_TAG_PREFIX}<N>/ (logs: ${CROSSDB_DIR}/logs/${ROUND_TAG_PREFIX}<N>/)"
 
 FAILED_ROUNDS=()
 for n in $(seq 1 "${AB_PAIRS}"); do
@@ -144,8 +179,8 @@ for n in $(seq 1 "${AB_PAIRS}"); do
   {
     echo "round_${n}_loadavg_start: $(loadavg_now)"
   } >>"${OUT_DOC_DIR}/env.txt"
-  if ! CROSSDB_RUN_TAG="round${n}" bash "${REPO_ROOT}/scripts/crossdb_bench/run_all.sh"; then
-    echo "round ${n}: run_all.sh reported failures (see logs/round${n}/*.log for FAILED entries)" >&2
+  if ! CROSSDB_RUN_TAG="${ROUND_TAG_PREFIX}${n}" bash "${REPO_ROOT}/scripts/crossdb_bench/run_all.sh"; then
+    echo "round ${n}: run_all.sh reported failures (see logs/${ROUND_TAG_PREFIX}${n}/*.log for FAILED entries)" >&2
     FAILED_ROUNDS+=("${n}")
   fi
   {
@@ -154,9 +189,12 @@ for n in $(seq 1 "${AB_PAIRS}"); do
 done
 
 if [ "${#FAILED_ROUNDS[@]}" -gt 0 ]; then
-  echo "WARNING: rounds with at least one FAILED arm: ${FAILED_ROUNDS[*]} (see logs/round<N>/*.log). generated JSON for successful arms is still usable; do not silently drop missing arms." >&2
+  echo "ERROR: rounds with at least one FAILED arm: ${FAILED_ROUNDS[*]} (see logs/${ROUND_TAG_PREFIX}<N>/*.log). generated JSON for successful arms is still usable; do not silently drop missing arms." >&2
+  echo "env record: ${OUT_DOC_DIR}/env.txt" >&2
+  echo "summarize with: $0 --summarize ${CROSSDB_DIR} ${AB_PAIRS} ${ROUND_TAG_PREFIX}" >&2
+  exit 1
 fi
 
-echo "done: ${AB_PAIRS} rounds written under ${CROSSDB_DIR}/results/round*/"
+echo "done: ${AB_PAIRS} rounds written under ${CROSSDB_DIR}/results/${ROUND_TAG_PREFIX}*/"
 echo "env record: ${OUT_DOC_DIR}/env.txt"
-echo "summarize with: $0 --summarize ${CROSSDB_DIR} ${AB_PAIRS}"
+echo "summarize with: $0 --summarize ${CROSSDB_DIR} ${AB_PAIRS} ${ROUND_TAG_PREFIX}"

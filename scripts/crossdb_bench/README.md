@@ -569,17 +569,25 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
 理由による意図的な逸脱）。
 
 ```bash
-CROSSDB_DIR="$S" CROSSDB_PYTHON="$V" scripts/bench_crossdb_ab.sh   # AB_PAIRS（既定 5）
-scripts/bench_crossdb_ab.sh --summarize "$S" 5                    # Markdown 集約表
+CROSSDB_DIR="$S" CROSSDB_PYTHON="$V" scripts/bench_crossdb_ab.sh
+# 標準出力の最後の行が実際に使うべき --summarize コマンド
+# （例: scripts/bench_crossdb_ab.sh --summarize "$S" 5 20260919T000000Z-round）
 ```
 
 - `run_all.sh` は任意環境変数 `CROSSDB_RUN_TAG`（英数字・ハイフン・
   アンダースコアのみ）を受け付け、指定時は `results`／`logs` の下へさらに
-  1 段のサブディレクトリを切る（`bench_crossdb_ab.sh` が `round<N>` として
-  使う）。未設定時は完全に既存動作のまま（後方互換）。
-- 生データ: `$S/results/round<N>/<db>_<config>.json`・
-  `$S/logs/round<N>/<db>_<config>.log`。環境記録:
+  1 段のサブディレクトリを切る。`bench_crossdb_ab.sh` はセッション起動時刻
+  `<ts>` を含む `<ts>-round<N>` を使う（同じ `CROSSDB_DIR` へ複数セッション
+  を実行しても前回セッションの JSON が残留・混在しないようにするため）。
+  未設定時は `run_all.sh` 自体は完全に既存動作のまま（後方互換）。
+- 生データ: `$S/results/<ts>-round<N>/<db>_<config>.json`・
+  `$S/logs/<ts>-round<N>/<db>_<config>.log`。環境記録:
   `docs/design/bench-data/crossdb-<ts>-ab/env.txt`。
+- `--summarize <dir> <rounds> [<round_dir_prefix>]`（`round_dir_prefix` 省略時は
+  既定 `round`。既存コミット済み生データ `docs/design/bench-data/
+  crossdb-20260918T142251Z-ab/` はこの旧セッション形式〔`results/round<N>`〕
+  のため省略形のまま集計できる。`bench_crossdb_ab.sh` 自身の実行結果を集計
+  するときは、その標準出力が示す `<ts>-round` を第 3 引数に渡す）。
 - `hybrid_rrf` フェーズ診断用に `redis_db.py` が任意環境変数
   `CROSSDB_REDIS_HYBRID_WINDOW`（正の 10 進整数のみ・既定 50）を受け付ける。
   self の `hybrid_rrf` は既定でプール深さ 200（`hybrid.rs::RrfConfig::
