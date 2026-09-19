@@ -15,6 +15,17 @@
 #                  CROSSDB_REDB／CROSSDB_DOCS／CROSSDB_QUERIES の明示指定はこの既定より
 #                  常に優先する。未設定なら従来どおり docs25k.*／queries200.jsonl／
 #                  results／logs を使う（後方互換）。
+#
+# 任意環境変数（Issue #848）:
+#   CROSSDB_RUN_TAG  英数字・ハイフン・アンダースコアのみ（例 round3）。指定時は
+#                    結果・ログの出力先へさらに 1 段のサブディレクトリ
+#                    results[/d${DIM}]/${CROSSDB_RUN_TAG}／
+#                    logs[/d${DIM}]/${CROSSDB_RUN_TAG} を切る（交互 N ラウンド計測で
+#                    ラウンドごとに生データを分離するため。scripts/bench_crossdb_ab.sh
+#                    が使う）。未設定なら従来どおり（後方互換）。パス構成要素として
+#                    シェル・ファイルシステムへそのまま使うため、上記文字集合以外
+#                    （ディレクトリトラバーサル `../`・スラッシュ・シェルメタ文字を含む）
+#                    は拒否する（fail-closed）。
 set -u
 R=$(cd "$(dirname "$0")/../.." && pwd)
 B=$R/scripts/crossdb_bench
@@ -29,6 +40,14 @@ case "$DIM" in
     ;;
   *) SUFFIX="-d${DIM}" ;;
 esac
+RUN_TAG=${CROSSDB_RUN_TAG:-}
+case "$RUN_TAG" in
+  '') ;;
+  *[!A-Za-z0-9_-]*)
+    echo "CROSSDB_RUN_TAG must contain only [A-Za-z0-9_-] (got: $RUN_TAG)" >&2
+    exit 1
+    ;;
+esac
 ROWS_REDB=${CROSSDB_REDB:-$S/docs25k${SUFFIX}.redb}
 ROWS_JSONL=${CROSSDB_DOCS:-$S/docs25k${SUFFIX}.jsonl}
 QUERIES=${CROSSDB_QUERIES:-$S/queries200${SUFFIX}.jsonl}
@@ -38,6 +57,10 @@ if [ -n "$DIM" ]; then
 else
   RESULTS_DIR="$S/results"
   LOGS_DIR="$S/logs"
+fi
+if [ -n "$RUN_TAG" ]; then
+  RESULTS_DIR="$RESULTS_DIR/$RUN_TAG"
+  LOGS_DIR="$LOGS_DIR/$RUN_TAG"
 fi
 cd "$R"
 mkdir -p "$RESULTS_DIR" "$LOGS_DIR"

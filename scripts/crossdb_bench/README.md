@@ -557,3 +557,43 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
   環境変数で上書き）で `self_db.py` の既定ポート（15432）以外を使う。
   他ジョブが同時に crossdb_bench を実行していてもポート衝突で計測が
   止まらないようにするため。
+
+## 交互 N ラウンド再計測ハーネス（Issue #848）
+
+`run_all.sh` フル一括（self exact/hnsw/nosql・対照 DB 全系統。Elasticsearch を
+含む）を N≥5 ラウンド輪番実行し、self との勝敗を
+`docs/design/benchmark-judgement-policy.md` 規約（min-of-N＋median・run-to-run
+幅）で集計するドライバ。`bench_crossdb_self_hnsw_ab.sh` 等の 2 arm 厳密輪番
+とは異なり、`run_all.sh` 自体が 1 回で十数 arm を実行する構造のため、
+そのフル一括を 1 ラウンドとみなしてラウンドロビンする（cand が DB の数だけ
+あり baseline→cand→baseline→cand... の 2 arm 輪番を適用できない構造的な
+理由による意図的な逸脱）。
+
+```bash
+CROSSDB_DIR="$S" CROSSDB_PYTHON="$V" scripts/bench_crossdb_ab.sh
+# 標準出力の最後の行が実際に使うべき --summarize コマンド
+# （例: scripts/bench_crossdb_ab.sh --summarize "$S" 5 20260919T000000Z-round）
+```
+
+- `run_all.sh` は任意環境変数 `CROSSDB_RUN_TAG`（英数字・ハイフン・
+  アンダースコアのみ）を受け付け、指定時は `results`／`logs` の下へさらに
+  1 段のサブディレクトリを切る。`bench_crossdb_ab.sh` はセッション起動時刻
+  `<ts>` を含む `<ts>-round<N>` を使う（同じ `CROSSDB_DIR` へ複数セッション
+  を実行しても前回セッションの JSON が残留・混在しないようにするため）。
+  未設定時は `run_all.sh` 自体は完全に既存動作のまま（後方互換）。
+- 生データ: `$S/results/<ts>-round<N>/<db>_<config>.json`・
+  `$S/logs/<ts>-round<N>/<db>_<config>.log`。環境記録:
+  `docs/design/bench-data/crossdb-<ts>-ab/env.txt`。
+- `--summarize <dir> <rounds> [<round_dir_prefix>]`（`round_dir_prefix` 省略時は
+  既定 `round`。既存コミット済み生データ `docs/design/bench-data/
+  crossdb-20260918T142251Z-ab/` はこの旧セッション形式〔`results/round<N>`〕
+  のため省略形のまま集計できる。`bench_crossdb_ab.sh` 自身の実行結果を集計
+  するときは、その標準出力が示す `<ts>-round` を第 3 引数に渡す）。
+- `hybrid_rrf` フェーズ診断用に `redis_db.py` が任意環境変数
+  `CROSSDB_REDIS_HYBRID_WINDOW`（正の 10 進整数のみ・既定 50）を受け付ける。
+  self の `hybrid_rrf` は既定でプール深さ 200（`hybrid.rs::RrfConfig::
+  default`）を使う一方、Redis 側の既定 `WINDOW` は 50、pgvector 側の
+  hybrid 候補プールは各 50（`bulk_hybrid_k200` のみ 200 に揃えてある）と
+  条件が異なる。`CROSSDB_REDIS_HYBRID_WINDOW=200` で Redis 側を self の
+  pool_depth に揃えた informational な追加計測ができる（本番スコアボードの
+  既定計測条件は変えない。`redis_db.py` 側の既定値は 50 のまま不変）。

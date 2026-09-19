@@ -1,0 +1,225 @@
+{
+  "meta": {
+    "db": "mongodb",
+    "version": "mongod 8.3.11 (image mongodb/mongodb-atlas-local:latest)",
+    "connection": "TCP (directConnection)",
+    "config": "exact",
+    "rows": 25000,
+    "dim": 128,
+    "timestamp": "2026-09-18T23:43:09+0900",
+    "nproc": 16,
+    "loadavg": [
+      10.02978515625,
+      7.02978515625,
+      6.560546875
+    ],
+    "python": "3.14.6",
+    "host": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "warmup": 5,
+    "iters": 50,
+    "similarity": "dotProduct",
+    "vector_index": "vectorSearch (exact=True)",
+    "text_index": "search (dynamic=False, body:string)"
+  },
+  "phases": {
+    "ingest_bulk": {
+      "rows": 25000,
+      "seconds": 0.4225139580667019,
+      "rows_per_sec": 59169.64285485989
+    },
+    "vector_knn": {
+      "n": 50,
+      "min_us": 2124.208025634289,
+      "p50_us": 2932.208590209484,
+      "p95_us": 3889.292012900114,
+      "p99_us": 4527.874756604433,
+      "mean_us": 2993.880109861493,
+      "max_us": 4527.874756604433
+    },
+    "vector_knn_where": {
+      "n": 50,
+      "min_us": 1432.3331415653229,
+      "p50_us": 1673.9577986299992,
+      "p95_us": 2136.500086635351,
+      "p99_us": 2276.9998759031296,
+      "mean_us": 1725.1949198544025,
+      "max_us": 2276.9998759031296
+    },
+    "point_where": {
+      "note": "vector_knn_where と同一クエリ形のため統合",
+      "n": 50,
+      "min_us": 1432.3331415653229,
+      "p50_us": 1673.9577986299992,
+      "p95_us": 2136.500086635351,
+      "p99_us": 2276.9998759031296,
+      "mean_us": 1725.1949198544025,
+      "max_us": 2276.9998759031296
+    },
+    "where_compound_count": {
+      "n": 50,
+      "min_us": 3293.583169579506,
+      "p50_us": 3398.79235252738,
+      "p95_us": 3925.125114619732,
+      "p99_us": 4856.542218476534,
+      "mean_us": 3460.4442957788706,
+      "max_us": 4856.542218476534,
+      "result": 7599
+    },
+    "agg_count": {
+      "n": 50,
+      "min_us": 2297.624945640564,
+      "p50_us": 2477.4158373475075,
+      "p95_us": 3132.165875285864,
+      "p99_us": 4372.040741145611,
+      "mean_us": 2564.660022035241,
+      "max_us": 4372.040741145611,
+      "result": 23000
+    },
+    "agg_multi": {
+      "n": 50,
+      "min_us": 9422.665927559137,
+      "p50_us": 9870.583657175303,
+      "p95_us": 10157.540906220675,
+      "p99_us": 10298.875160515308,
+      "mean_us": 9853.564100340009,
+      "max_us": 10298.875160515308,
+      "result": [
+        23000,
+        283511500,
+        12326.58695652174,
+        1,
+        25000
+      ]
+    },
+    "group_by_having": {
+      "n": 50,
+      "min_us": 7625.832688063383,
+      "p50_us": 8101.665880531073,
+      "p95_us": 9197.374805808067,
+      "p99_us": 11041.583027690649,
+      "mean_us": 8239.245843142271,
+      "max_us": 11041.583027690649,
+      "result": [
+        [
+          "en",
+          15379
+        ],
+        [
+          "ja",
+          7621
+        ]
+      ]
+    },
+    "hybrid_rrf": {
+      "n": 50,
+      "min_us": 4450.125154107809,
+      "p50_us": 5795.666947960854,
+      "p95_us": 8060.54100394249,
+      "p99_us": 11446.499731391668,
+      "mean_us": 5994.355883449316,
+      "max_us": 11446.499731391668
+    },
+    "mode_recall": {
+      "unsupported": true,
+      "reason": "MongoDB にモード切替（recall/precision）の概念が無い"
+    },
+    "mode_precision": {
+      "unsupported": true,
+      "reason": "MongoDB にモード切替（recall/precision）の概念が無い"
+    },
+    "udf_call": {
+      "unsupported": true,
+      "reason": "自作 DB の宣言的 UDF 呼び出し相当の機能が無い"
+    },
+    "explain": {
+      "n": 50,
+      "min_us": 2980.45901581645,
+      "p50_us": 3503.2089799642563,
+      "p95_us": 4728.500265628099,
+      "p99_us": 12574.70902055502,
+      "mean_us": 3843.7791261821985,
+      "max_us": 12574.70902055502,
+      "sample_output": "[{'$vectorSearch': {'index': 'vec_idx', 'path': 'embedding', 'queryVector': 'redacted', 'limit': 10, 'filter': {'visibility': {'$eq': 'public'}}, 'exact': True, 'explain': {'query': {'type': 'WrappedKnnQuery', 'args': {'query': [{'type': 'ExactVectorSearchQuery', 'args': {'field': '$type:knnVector/embedding', 'similarityFunction': 'dotProduct', 'filter': {'type': 'BoostQuery', 'args': {'query': {'type': 'ConstantScoreQuery', 'args': {'query': {'type': 'IndexOrDocValuesQuery', 'args': {'query': [{'type': 'ConstantScoreQuery', 'args': {'query': {'type': 'TermQuery', 'args': {'path': 'visibility', 'value': 'public'}}}}, {'type': 'SortedSetDocValuesRangeQuery', 'args': {}}]}}}}, 'boost': 0.0}}}}]}}, 'metadata': {'mongotVersion': '1.75.1', 'mongotHostName': 'mongot-local-dev', 'indexName': 'vec_idx', 'lucene': {'totalSegments': 8, 'totalDocs': 25000}}, 'featureFlags': [{'featureFlag': 'mongot.featureFlag.enableVectorSearchQueryTimeout', 'evaluationResult': False, 'decisiveField': 'Fallback'}, {'featureFlag': 'mongot.featureFlag.queryOptimizer', 'evaluationResult': False, 'decisiveField': 'Fallback'}]}}}, {'$_internalSearchIdLookup': {'limit': 10, 'subPipeline': [{'$match': {'_id': {'$eq': '_id placeholder'}}}]}}, {'$project': {'id': True, '_id': False}}]"
+    },
+    "bulk_knn_k200": {
+      "n": 50,
+      "min_us": 3150.000236928463,
+      "p50_us": 3589.209169149399,
+      "p95_us": 4001.874942332506,
+      "p99_us": 10561.124887317419,
+      "mean_us": 3676.1741898953915,
+      "max_us": 10561.124887317419,
+      "k": 200,
+      "rows_returned": 200,
+      "num_candidates": null
+    },
+    "bulk_knn_k1000": {
+      "n": 50,
+      "min_us": 8819.791954010725,
+      "p50_us": 9364.292025566101,
+      "p95_us": 12059.874832630157,
+      "p99_us": 16105.666756629944,
+      "mean_us": 9803.800750523806,
+      "max_us": 16105.666756629944,
+      "k": 1000,
+      "rows_returned": 1000,
+      "num_candidates": null
+    },
+    "bulk_knn_where_k200": {
+      "n": 50,
+      "min_us": 2901.9592329859734,
+      "p50_us": 3314.1658641397953,
+      "p95_us": 4569.584038108587,
+      "p99_us": 6854.083389043808,
+      "mean_us": 3573.8441348075867,
+      "max_us": 6854.083389043808,
+      "k": 200,
+      "rows_returned": 200,
+      "num_candidates": null
+    },
+    "bulk_hybrid_k200": {
+      "n": 50,
+      "min_us": 7837.249897420406,
+      "p50_us": 11286.375112831593,
+      "p95_us": 18378.166016191244,
+      "p99_us": 25150.70792287588,
+      "mean_us": 11770.815839990973,
+      "max_us": 25150.70792287588,
+      "k": 200,
+      "rows_returned": 200,
+      "candidate_pool": 200
+    },
+    "scan_where_nosort_k500": {
+      "n": 50,
+      "min_us": 1080.6666687130928,
+      "p50_us": 1283.917110413313,
+      "p95_us": 4328.8329616189,
+      "p99_us": 4710.959270596504,
+      "mean_us": 1726.7391830682755,
+      "max_us": 4710.959270596504,
+      "k": 500,
+      "rows_returned": 500
+    },
+    "rls_isolation": {
+      "n": 50,
+      "min_us": 2199.999988079071,
+      "p50_us": 2275.1251235604286,
+      "p95_us": 11709.707789123058,
+      "p99_us": 19727.20818594098,
+      "mean_us": 3041.2783939391375,
+      "max_us": 19727.20818594098,
+      "tenant_b_count": 23000,
+      "note": "MongoDB にテナント別セッションの概念が無いため agg_count と同一フィルタで再実行（値の一致確認用）"
+    },
+    "ingest_single_stmt": {
+      "rows": 1000,
+      "seconds": 0.9264309168793261,
+      "rows_per_sec": 1079.4112996233875
+    },
+    "recall_at_10": {
+      "recall_at_10": 1.0,
+      "recall_at_10_strict": 0.757,
+      "queries": 200
+    }
+  }
+}

@@ -54,6 +54,17 @@ median か）・ペア数（3〜5）・ノイズ帯の定義（固定 ±5% か�
 - **ビルド条件の統一**: before/after は同一プロファイル・同一 `Cargo.lock` で
   ビルドする。バイナリを退避し、同一プロセス条件（同時実行プロセス等）で実行
   する。
+- **多 arm 横断ベンチの輪番（意図的な例外）**: `baseline/cand1/baseline/cand2/…`
+  の 2 arm 交互輪番は「1 baseline 対 1 candidate」の比較を前提とする。crossdb
+  横断ベンチ（`docs/design/crossdb-bench.md`）のように candidate が DB の数だけ
+  存在し、1 回の実行（`run_all.sh`）が self・対照 DB 全系統を一括で走らせる
+  構造の場合、2 arm 輪番は適用できない。この場合は「一括実行を 1 ラウンドと
+  見なし、ラウンド全体を N ≥ 5 回繰り返す」方式（`scripts/bench_crossdb_ab.sh`）
+  を代わりに使ってよい。判定は self（baseline 相当の 1 arm）と各対照 DB の
+  min-of-N・run-to-run 幅をラウンド単位で比較し、本 doc §4 のノイズ帯判定を
+  そのまま適用する（実行順序が「baseline→cand→baseline→cand」ではなく
+  「(全 arm)→(全 arm)→…」になる点のみが 2 arm 輪番との差分であり、交互実行・
+  per-run 生データ保持・ノイズ帯判定は本 doc の規約を満たす）。
 - **per-run 生データの記録を必須とする**（Issue #366 の教訓: min-of-N のみを
   保持し生データを残さなかったため、事後の再判定ができなくなった経緯がある）。
   実測記録には min・median・各 run の値（または値列）を残す。

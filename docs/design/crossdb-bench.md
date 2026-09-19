@@ -1254,3 +1254,140 @@ crossdb 本体経由の実測はオーナー作業として申し送る。
 ### 原因分析と是正
 
 フェーズ別の原因（self 側機構と最速他 DB の手法）・改善後 5 run の A/B 生データ（`docs/design/bench-data/crossdb-20260918-loss-ab/`）・チップ最適化の考察は `docs/design/crossdb-loss-analysis-20260918.md` を参照（Issue #845・PR #853 で追加。本節の「改善後」列はその生データの after 側 5 run median）。
+
+## 再計測（Issue #848。是正後・Elasticsearch を含む交互 N=5 ラウンド）
+
+2026-09-18 の「是正前後の勝敗」節は、対照 DB 側が単発 run（一部 ES は 1 回のみ）の
+まま「改善後」列だけを交互 5 ペアで取り直した参考値だった。是正（#843・#844・
+PR #853）が main に取り込まれた後、`docs/design/benchmark-judgement-policy.md`
+の規約（交互 N≥5・per-run 生データ必須・min-of-N＋median・run-to-run 幅による
+ノイズ帯判定）に従い、**self・ES を含む対照 DB 全系統を同一セッションで N=5
+ラウンド再計測**した。
+
+### 環境・実行条件
+
+- HEAD `0ab63b3`（#853 の直後）・wire-server sha256 `627b5c53c6a9…`（`docs/design/
+  crossdb-loss-analysis-20260918.md` の after ビルドと同一 sha256）
+- MacBook Pro（Apple M4 Max・16 コア・64 GB・macOS 26.6）。fixture は APFS
+  （`/tmp` 配下）
+- **共有機の参考値**: 本セッションと並行して複数の Issue エージェントが同一機で
+  実行されており（ハーネス指示に明記の前提どおり）、`BENCH_DEDICATED_ENV` は
+  設定していない。ラウンド間の loadavg 実測: round1 開始 4.93→終了 15.75（他
+  ジョブの起動と重なった）、round2 終了 8.12、round3 終了 5.04、round4 終了
+  5.98、round5 終了 5.74（1 分間平均）。round2 は全フェーズで一様に p50 が
+  他ラウンドより高く（例: self `hybrid_rrf` 2023µs 対 他 4 ラウンド
+  1468〜1681µs）、機械全体の輻輳が原因と判断できる——特定フェーズだけが
+  悪化していないため、後述の min-of-N 判定はこの影響を受けにくい
+- **ドライバ**: `scripts/bench_crossdb_ab.sh`（新設。`run_all.sh` フル一括を
+  1 ラウンドとみなし `CROSSDB_RUN_TAG=<ts>-round<N>`（`<ts>` はセッション
+  起動時刻）で輪番実行する。cand が DB の数だけある構造のため、
+  baseline→cand→baseline→cand... の厳密な 2 arm 輪番からの意図的な
+  逸脱——詳細は同スクリプトのコメント参照）
+- 全 5 ラウンド × 18 arm（self exact/hnsw/nosql・対照 8 系統 exact/hnsw 混在）
+  ＝ 90 run すべて成功（`FAILED` 0 件）。生データ一式（絶対パス）は
+  `docs/design/bench-data/crossdb-20260918T142251Z-ab/`（`env.txt`・
+  `results/round{1..5}/*.json`・`logs/round{1..5}/*.log`・
+  `summarize-output.md`・`redis_window_diag/`）にコミット済み
+
+### スコアボード（min-of-N・自身の実測ノイズ帯を踏まえた勝敗）
+
+「最速他 DB」は 8 対照 DB 系統（exact/hnsw 混在）の中で min-of-N が最小のもの。
+「判定」は `scripts/bench_crossdb_ab_summarize.py` の規則——比の乖離が
+固定 ±5% 帯**かつ** self・対照双方の run-to-run 幅（5 run の `(max-min)/min`）
+の広い方を超える場合のみ確定（win/loss）、それ以外は「僅差」（ノイズ帯内）。
+
+| フェーズ | 最速他 DB | 他 DB min-of-N | self min-of-N | 比（他/self） | 判定 |
+| --- | --- | ---: | ---: | ---: | --- |
+| `vector_knn` | Qdrant exact | 707.6 | 573.3 | 1.23 | self win |
+| `vector_knn_where` | Qdrant exact | 650.2 | 246.2 | 2.64 | self win |
+| `where_compound_count` | Elasticsearch hnsw | 530.0 | 87.4 | 6.06 | self win |
+| `agg_count` | LanceDB exact | 365.2 | 104.5 | 3.49 | self win |
+| `agg_multi` | Elasticsearch hnsw | 637.5 | 249.0 | 2.56 | self win |
+| `group_by_having` | Elasticsearch hnsw | 650.8 | 70.6 | 9.22 | self win |
+| `hybrid_rrf` | Redis FLAT exact | 1,044.9 | 1,467.9 | 0.71 | **僅差**（run-to-run 幅 self 37.8%・Redis 37.7% が乖離幅 29%を上回るためノイズ帯内） |
+| `bulk_knn_k200` | LanceDB hnsw | 2,490.4 | 714.7 | 3.48 | self win |
+| `bulk_knn_k1000` | LanceDB hnsw | 3,562.7 | 1,353.9 | 2.63 | self win |
+| `bulk_knn_where_k200` | pgvector hnsw | 2,440.0 | 391.7 | 6.23 | self win |
+| `bulk_hybrid_k200` | Redis FLAT exact | 1,950.5 | 1,628.3 | 1.20 | 僅差（乖離幅 20% が run-to-run 幅を超えず） |
+| `scan_where_nosort_k500` | sqlite-vec（in-process） | 197.0 | 438.3 | 0.45 | **self loss**（測定条件の非対称。§「単文 INSERT の durability 既定値」節・下記参照） |
+| `rls_isolation` | LanceDB exact | 370.8 | 110.3 | 3.36 | self win |
+
+単位は p50 µs。全フェーズの生データ（5 run の値・run-to-run 幅・self との
+比較表）は `scripts/bench_crossdb_ab_summarize.py` の出力
+（`docs/design/bench-data/crossdb-20260918T142251Z-ab/summarize-output.md`
+参照。本ファイルは計測当時の集計スクリプト版で生成したもので、
+`dir=/tmp/crossdb848` という旧セッションのパス表記のまま残置しており、
+後日の堅牢化修正（欠損・非観測の扱い変更）で追加された「非観測」行群は
+含まない。ただし「self との比較」win/loss 表——本節が引用する数値・判定——は
+旧版・新版の集計スクリプトを同一データへ再実行して出力が一致することを
+確認済みで、本節の結論には影響しない）。改善前（7 敗）・改善後単発対照
+（2 敗）に対し、**N=5 再計測では
+確定的な負けは `scan_where_nosort_k500`（測定条件の非対称。既知・対処
+しない）の 1 件のみ**で、`hybrid_rrf`／`bulk_hybrid_k200` は Redis との差が
+run-to-run ノイズ帯に収まり確定的な勝敗を付けられない「僅差」へ後退した
+（is-loss ではなく not-confirmed-win という区分。数値上は self が遅いが、
+本環境のノイズが大きすぎて Redis との実力差と言い切れない）。
+
+**Elasticsearch の run-to-run 変動**: N=5 でも `agg_multi`（run-to-run 幅
+171.1%）・`group_by_having`（同 120.1%）と非常に大きく、2026-09-18 時点の
+「exact/hnsw 列で ±30% 乖離」という所見は氷山の一角だったと判明した。
+ただし self の優位幅（2.6〜9.2 倍）がこのノイズ幅を大きく上回るため、
+勝敗判定そのものは揺らがない。
+
+### `hybrid_rrf` が残る「僅差」の理由確認（受け入れ条件 3）
+
+2026-09-18 節の説明「self はプール深さ 200 で候補を取り Redis は WINDOW 50」
+（`hybrid.rs::RrfConfig::default` の pool_depth=200 対 `redis_db.py` の
+既定 `WINDOW=50`）を実測で確認した。
+
+- pgvector 側の `env.txt` 注記「WINDOW=50（self・pgvector の各プール 50 と
+  同条件）」は、pgvector 自身の hybrid 候補プール（`pgvector_db.py::hybrid`
+  の `LIMIT 50`。`bulk_hybrid_k200` のみ `LIMIT 200` に拡張）を指しており、
+  **self の pool_depth とは無関係**（self は `hybrid_rrf`・`bulk_hybrid_k200`
+  いずれも既定 pool_depth=200 のまま不変）。旧記述の「self・pgvector」は
+  誤読を招く書き方だったため本節で訂正する
+- 診断用 opt-in `CROSSDB_REDIS_HYBRID_WINDOW`（`redis_db.py` へ本 Issue で
+  追加。既定 50・本番スコアボードの計測条件は変えない）で Redis 側の
+  `WINDOW` を self の pool_depth と同じ 200 に揃え、N=5 で追加計測した:
+
+  | WINDOW | min-of-5 (µs) | median (µs) |
+  | --- | ---: | ---: |
+  | 50（既定・本番スコアボードと同一条件） | 1,044.9 | 1,272.4 |
+  | 200（self の pool_depth と同条件） | 1,044.1 | 1,058.3 |
+
+  **WINDOW を 50→200 へ 4 倍に拡張しても Redis 側の `hybrid_rrf` レイテンシは
+  ほぼ不変**（min-of-N の差は 0.1%）。「self がプール深さ 4 倍ぶん余分に
+  候補処理をしているから遅い」という従来の説明は、この診断実測では
+  **支持されない**——RediSearch の `WINDOW`（各サブクエリの取得件数上限）を
+  広げても実測レイテンシが増えないことから、self・Redis の差はプール深さ
+  ではなく他の要因（SQL 表層固定コスト・BM25 posting 走査・RRF 融合の実装
+  差。`docs/design/crossdb-loss-analysis-20260918.md` §3.1 が既に挙げている
+  「Redis は転置索引が書き込み時に確定済みでクエリ時の再構築という概念が
+  無い」という構造差が引き続き主因候補）にあると考えられる。ただし
+  そもそも上記スコアボードの判定は「僅差」（確定的な負けではない）である
+  ため、この理由確認は原因追究というより従来説明の反証記録として申し送る
+
+### 是正前後の比較（旧節との対比）
+
+| フェーズ | 改善前（2026-09-18・単発対照） | 改善後（2026-09-18・単発対照） | 再計測（Issue #848・N=5 対照） |
+| --- | --- | --- | --- |
+| `hybrid_rrf` | 9 位（0.28 倍） | 2 位（0.90 倍・self loss 扱い） | 僅差（0.71 倍・run-to-run ノイズ帯内で判定不能） |
+| `bulk_hybrid_k200` | 8 位（0.36 倍） | 1 位（1.47 倍） | 僅差（1.20 倍・ノイズ帯内） |
+| `scan_where_nosort_k500` | 2 位（0.48 倍） | 2 位（0.48 倍） | self loss（0.45 倍。対照 DB を sqlite-vec 固定で再計測しても変わらず） |
+| 他 11 フェーズ | 1 位（是正後） | 1 位 | 1 位（N=5 でも維持） |
+
+対照 DB を単発 run から N=5 へ拡充したことで、`hybrid_rrf`／`bulk_hybrid_k200`
+の「self loss」「1 位だが僅差」という評価は、より保守的な「判定不能（ノイズ
+帯内）」へ変わった。これは self の実装が改善前後で変化した結果ではなく
+（本 Issue は production コード無変更）、対照 DB 側の測定条件を初めて
+self と同水準（交互 N=5）に揃えたことによる評価の精緻化である。
+
+### 単文 INSERT・`scan_where_nosort_k500` の非対処事項（不変）
+
+`ingest_single_stmt`（self 145〜213 rows/s。`docs/design/crossdb-loss-
+analysis-20260918.md` §3.6 の durability 契約差）・`scan_where_nosort_k500`
+（同 §3.5 の wire＋psycopg 測定条件差）はいずれも本 Issue のスコープ外の
+まま変化なし。N=5 実測でも `scan_where_nosort_k500` の self min-of-N
+438.3µs は sqlite-vec（in-process・197.0µs）の約 2.2 倍にとどまり、
+2026-09-18 時点の分析（engine 内部コストは sqlite-vec と同水準、差は
+wire 経由の測定条件）と整合する。
