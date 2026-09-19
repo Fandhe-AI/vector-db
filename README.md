@@ -465,6 +465,19 @@ ROUNDS` で割り切れる値のみ〕・`BENCH_INGEST_WIRE_ROUNDS`〔既定 5�
 `BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定可能）。実測結果は
 `docs/design/ingest-stage-profile.md`「Issue #484 追記」節を参照してください。
 
+`single` モードでは `BENCH_INGEST_PROFILE_DURABILITY`（`immediate`〔既定〕／
+`none`。Issue #851）で書き込みトランザクションの durability を切り替えられ、
+`immediate` 以外は `batch` モードでは fail-closed に拒否されます。
+`make bench-ingest-durability-ab`（`scripts/bench_ingest_durability_ab.sh`。
+`AB_PAIRS`〔既定 5〕・`STATEMENTS`〔既定 5,000・2,000〜100,000〕）は既定
+`immediate` と opt-in `none` を交互 N ペアで実測し、`scripts/fsync_probe.py`
+（macOS `F_FULLFSYNC`／`F_BARRIERFSYNC`・`fsync(2)` の原始操作プローブ）も
+同時に採取します。`python3 scripts/bench_ingest_durability_ab_summarize.py
+<出力ディレクトリ>` で TSV 集約できます。実測結果・比較条件は
+`docs/design/crossdb-bench.md`「Issue #851: durability 別実測と比較条件」
+節・`docs/design/ingest-write-path.md`「10. Issue #851 追記」節を参照して
+ください。
+
 ### クロスエンコーダリランカーの実測手順（Issue #333）
 
 `make rerank-cross-encoder-eval`（`crates/engine/tests/rerank_cross_encoder_recall.rs`。

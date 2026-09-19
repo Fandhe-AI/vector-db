@@ -75,6 +75,13 @@ mkdir -p "$RESULTS_DIR" "$LOGS_DIR"
 HNSW_ARGS_FOR_SELF_HNSW=${CROSSDB_SELF_HNSW_ARGS:-}
 unset CROSSDB_SELF_HNSW_ARGS
 
+# `CROSSDB_SELF_DURABILITY` は `scripts/bench_ingest_durability_ab.sh`（Issue #851）
+# 専用の opt-in で、`self_db.py::run` は `--config` を問わず参照する。一括実行
+# スコアボードでこの変数が呼び出し元の環境に残っていると、意図せず `none`
+# arm（durability を落とした非永続計測）でスコアボードが走ってしまう
+# （`CROSSDB_SELF_HNSW_ARGS` と同じ漏れ防止パターン）。
+unset CROSSDB_SELF_DURABILITY
+
 # 失敗した DB/構成・コンテナ起動を蓄積し、後片付け後に非 0 で終了する
 # （握りつぶすと結果 JSON が欠けても make bench-crossdb が成功に見え、既存の古い
 # JSON を今回の結果と誤認しうる）。

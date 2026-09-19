@@ -178,6 +178,46 @@ pub fn parse_profile_mode(raw: Option<&str>) -> Result<ProfileMode, IngestProfil
     }
 }
 
+/// single モードの durability A/B 計測モード（Issue #851）。`engine::storage::
+/// WriteDurability`（Issue #849）の値を harness 側で独立に表現する（`InsertMode`
+/// と同じ理由: ベンチは engine クレートと独立コンパイル単位のため、production の
+/// enum をそのまま re-export せず値だけを写像する）。既定は `Immediate`（redb 自身・
+/// `WriteDurability::default()` と同一）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchDurability {
+    /// 既定。1 commit ごとに fsync 相当の同期を伴う（`WriteDurability::Immediate`）。
+    Immediate,
+    /// opt-in。commit はプロセス内バッファに留まり write すら発行しない
+    /// （`WriteDurability::None`。`engine::storage` モジュールドキュメント参照）。
+    None,
+}
+
+/// `BENCH_INGEST_PROFILE_DURABILITY` を解釈する（R2・fail-closed）。未設定は
+/// 既定 `Immediate` へ倒す一方、空文字・大文字小文字違い・未知値は黙って既定へ
+/// フォールバックせず拒否する（[`parse_insert_mode`] と同じ方針）。
+pub fn parse_durability(raw: Option<&str>) -> Result<BenchDurability, IngestProfileError> {
+    match raw {
+        None => Ok(BenchDurability::Immediate),
+        Some("immediate") => Ok(BenchDurability::Immediate),
+        Some("none") => Ok(BenchDurability::None),
+        Some(other) => Err(IngestProfileError::InvalidEnv {
+            name: "BENCH_INGEST_PROFILE_DURABILITY",
+            reason: format!("unknown durability: {other:?} (expected \"immediate\" or \"none\")"),
+        }),
+    }
+}
+
+impl BenchDurability {
+    /// ヘッダ行・summarize 側の arm 照合に使う短いトークン表現
+    /// （`durability_opt.rs::token_for` と同じ語彙）。
+    pub fn token(self) -> &'static str {
+        match self {
+            BenchDurability::Immediate => "immediate",
+            BenchDurability::None => "none",
+        }
+    }
+}
+
 /// single モードの既定単文数（crossdb ベンチと同じ 25,000 行。
 /// `docs/design/crossdb-bench.md` 参照）。
 pub const DEFAULT_SINGLE_STATEMENTS: usize = 25_000;
