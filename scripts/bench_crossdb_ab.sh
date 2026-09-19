@@ -169,9 +169,32 @@ docker_image_digest() {
 # 混ぜて集計しうる。`TS`（本セッションの起動時刻。数字・`T`・`Z` のみで
 # `CROSSDB_RUN_TAG` の許容文字集合を満たす）を prefix に含めたセッション
 # 固有のラウンドディレクトリ名にすることで、セッションをまたいだ残留を防ぐ。
-ROUND_TAG_PREFIX="${TS}-round"
+# `run_all.sh` は `CROSSDB_DIM` 指定時に結果・ログの出力先を
+# `results/d${CROSSDB_DIM}/<RUN_TAG>`／`logs/d${CROSSDB_DIM}/<RUN_TAG>` へ
+# ネストする（`scripts/crossdb_bench/run_all.sh` 参照）。この `d${CROSSDB_DIM}/`
+# は `CROSSDB_RUN_TAG`（`[A-Za-z0-9_-]` のみ許容。`/` を含めると run_all.sh が
+# 拒否する）には含められないため、`RUN_TAG_PREFIX`（`CROSSDB_RUN_TAG` へ渡す
+# 値）と `SUMMARIZE_PREFIX`（表示・`--summarize` 呼び出しに使う値。
+# `summarize.py` は `os.path.join(dir, "results", f"{prefix}{r}")` で
+# 結合するだけなので `/` を含んでいてよい）を分けて持つ。両者を分けずに
+# `${TS}-round` のままにすると、本スクリプトが表示するパス・
+# `--summarize` 呼び出しコマンドが実際の出力先と食い違い、そのままコピー
+# した summarize コマンドが `results/${TS}-roundN/` を探しに行って何も
+# 見つからない（または既定 dim の残留データを誤って拾う）。`run_all.sh`
+# と同じ検証（十進数字のみ）を通したうえで `SUMMARIZE_PREFIX` にだけ
+# `d${CROSSDB_DIM}/` を含める。
+DIM="${CROSSDB_DIM:-}"
+case "${DIM}" in
+  '') DIM_PREFIX='' ;;
+  *[!0-9]*)
+    die "CROSSDB_DIM must contain only decimal digits (got: ${DIM})"
+    ;;
+  *) DIM_PREFIX="d${DIM}/" ;;
+esac
+RUN_TAG_PREFIX="${TS}-round"
+SUMMARIZE_PREFIX="${DIM_PREFIX}${RUN_TAG_PREFIX}"
 
-echo "writing per-round results under ${CROSSDB_DIR}/results/${ROUND_TAG_PREFIX}<N>/ (logs: ${CROSSDB_DIR}/logs/${ROUND_TAG_PREFIX}<N>/)"
+echo "writing per-round results under ${CROSSDB_DIR}/results/${SUMMARIZE_PREFIX}<N>/ (logs: ${CROSSDB_DIR}/logs/${SUMMARIZE_PREFIX}<N>/)"
 
 FAILED_ROUNDS=()
 for n in $(seq 1 "${AB_PAIRS}"); do
@@ -179,8 +202,8 @@ for n in $(seq 1 "${AB_PAIRS}"); do
   {
     echo "round_${n}_loadavg_start: $(loadavg_now)"
   } >>"${OUT_DOC_DIR}/env.txt"
-  if ! CROSSDB_RUN_TAG="${ROUND_TAG_PREFIX}${n}" bash "${REPO_ROOT}/scripts/crossdb_bench/run_all.sh"; then
-    echo "round ${n}: run_all.sh reported failures (see logs/${ROUND_TAG_PREFIX}${n}/*.log for FAILED entries)" >&2
+  if ! CROSSDB_RUN_TAG="${RUN_TAG_PREFIX}${n}" bash "${REPO_ROOT}/scripts/crossdb_bench/run_all.sh"; then
+    echo "round ${n}: run_all.sh reported failures (see logs/${SUMMARIZE_PREFIX}${n}/*.log for FAILED entries)" >&2
     FAILED_ROUNDS+=("${n}")
   fi
   {
@@ -189,12 +212,12 @@ for n in $(seq 1 "${AB_PAIRS}"); do
 done
 
 if [ "${#FAILED_ROUNDS[@]}" -gt 0 ]; then
-  echo "ERROR: rounds with at least one FAILED arm: ${FAILED_ROUNDS[*]} (see logs/${ROUND_TAG_PREFIX}<N>/*.log). generated JSON for successful arms is still usable; do not silently drop missing arms." >&2
+  echo "ERROR: rounds with at least one FAILED arm: ${FAILED_ROUNDS[*]} (see logs/${SUMMARIZE_PREFIX}<N>/*.log). generated JSON for successful arms is still usable; do not silently drop missing arms." >&2
   echo "env record: ${OUT_DOC_DIR}/env.txt" >&2
-  echo "summarize with: $0 --summarize ${CROSSDB_DIR} ${AB_PAIRS} ${ROUND_TAG_PREFIX}" >&2
+  echo "summarize with: $0 --summarize ${CROSSDB_DIR} ${AB_PAIRS} ${SUMMARIZE_PREFIX}" >&2
   exit 1
 fi
 
-echo "done: ${AB_PAIRS} rounds written under ${CROSSDB_DIR}/results/${ROUND_TAG_PREFIX}*/"
+echo "done: ${AB_PAIRS} rounds written under ${CROSSDB_DIR}/results/${SUMMARIZE_PREFIX}*/"
 echo "env record: ${OUT_DOC_DIR}/env.txt"
-echo "summarize with: $0 --summarize ${CROSSDB_DIR} ${AB_PAIRS} ${ROUND_TAG_PREFIX}"
+echo "summarize with: $0 --summarize ${CROSSDB_DIR} ${AB_PAIRS} ${SUMMARIZE_PREFIX}"
