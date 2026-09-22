@@ -31,6 +31,14 @@ const MAX_ERROR_DETAIL_LEN: usize = crate::error_format::MAX_MESSAGE_LEN;
 /// リソース確保（DoS）」対応）。`catalog::MAX_COLUMN_COUNT` と同値を採用する。
 const MAX_INSERT_COLUMNS: usize = 256;
 
+/// 複数行 `VALUES (...), (...), ...`（SQL-16、TASK-190）が 1 文に持てる行数の上限。
+/// `sql/group_by.rs::MAX_GROUPS` と同じ「本リポ独自の実装既定値・無制限 `Vec`
+/// 確保を避ける」設計方針を踏襲する（security.md「不安全な設計｜無制限リソース
+/// 確保（DoS）」対応）。超過は行を `rows` へ追加する直前（書き込みトランザクション
+/// 開始のはるか手前・構造検証段階）に検出し、[`SqlSurfaceError::payload_too_large`]
+/// （`54000`）で fail-closed に拒否する（副作用ゼロ）。
+const MAX_INSERT_ROWS_PER_STATEMENT: usize = 1_000;
+
 /// ORDER BY の関数呼び出し形で許可する関数名を照合する（大文字小文字を区別しない）。
 /// 未知の名前は fail-closed に拒否し、識別子であれば任意の名前を関数呼び出しとして
 /// 受理してしまう構造上の抜け穴を作らない。
@@ -858,21 +866,25 @@ pub enum InsertLiteral {
     Number(String),
 }
 
-/// 許可形状の構造判定を通過した INSERT 文（SQL-10、TASK-80）。`ValidatedStatement`
-/// と同様、本モジュールが保証するのはここまでの構造情報のみで、列名・値の
-/// 意味論的妥当性は検証しない（`sql::parser::bind_insert` の責務）。
+/// 許可形状の構造判定を通過した INSERT 文（SQL-10・SQL-16、TASK-80・TASK-190）。
+/// `ValidatedStatement` と同様、本モジュールが保証するのはここまでの構造情報のみで、
+/// 列名・値の意味論的妥当性は検証しない（`sql::parser::bind_insert` の責務）。
 ///
-/// 受理する形は `INSERT INTO <table> (<col>[, <col>]*) VALUES (<lit>[, <lit>]*)
-/// USING OPERATION_ID '<id>' [;]` の単一行形のみ（複数行 VALUES・RETURNING・
-/// 可視性ラベル指定は許可リスト外）。
+/// 受理する形は `INSERT INTO <table> (<col>[, <col>]*)
+/// VALUES (<lit>[, <lit>]*)[, (<lit>[, <lit>]*)]*
+/// USING OPERATION_ID '<id>' [;]`（複数行 `VALUES` を許容する。SQL-16、TASK-190）。
+/// 各行のリテラル数は列数と一致することを行ごとに検証済み（`rows.len() >= 1`）。
+/// RETURNING・可視性ラベル指定は引き続き許可リスト外。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedInsert {
     /// INTO に指定され、カタログ存在確認を通過したテーブル名。
     pub table_name: String,
-    /// 列リストの宣言順（`columns[i]` は `values[i]` に対応する。個数は
-    /// `parse_insert` が既に一致を確認済み）。
+    /// 列リストの宣言順（`columns[i]` は `rows[r][i]` に対応する。個数は
+    /// `parse_insert` が行ごとに一致を確認済み）。
     pub columns: Vec<String>,
-    pub values: Vec<InsertLiteral>,
+    /// `VALUES` 句の行の宣言順（`rows.len() >= 1`。単一行形も `rows.len() == 1`
+    /// として同じ形で保持する。SQL-16、TASK-190）。
+    pub rows: Vec<Vec<InsertLiteral>>,
     /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-10）。句の欠落・明示
     /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。`validate_insert` は
     /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション開始前に
@@ -1626,9 +1638,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `INSERT INTO <table> (<col>[, <col>]*) VALUES (<lit>[, <lit>]*)
-    /// USING OPERATION_ID '<id>' [;]` の単一行形のみを受理する（SQL-10、TASK-80）。
-    /// 複数行 VALUES・RETURNING・可視性ラベル指定は構造的に受理しない。
+    /// `INSERT INTO <table> (<col>[, <col>]*)
+    /// VALUES (<lit>[, <lit>]*)[, (<lit>[, <lit>]*)]*
+    /// USING OPERATION_ID '<id>' [;]` を受理する（SQL-10・SQL-16、TASK-80・TASK-190）。
+    /// 複数行 `VALUES` は行の繰り返し（`, (...)`）として受理し、行数は
+    /// [`MAX_INSERT_ROWS_PER_STATEMENT`] を超えない（超過は `54000`）。各行の
+    /// リテラル数は列数と一致する必要がある（不一致は行ごとに検出して拒否）。
+    /// RETURNING・可視性ラベル指定は引き続き構造的に受理しない。
     fn parse_insert(&mut self) -> Result<ParsedInsertShape, SqlSurfaceError> {
         self.expect_contextual_keyword("INSERT")?;
         self.expect_contextual_keyword("INTO")?;
@@ -1646,6 +1662,41 @@ impl<'a> Parser<'a> {
         self.expect_punct(')')?;
 
         self.expect_contextual_keyword("VALUES")?;
+        let mut rows: Vec<Vec<InsertLiteral>> = vec![self.parse_insert_values_row(&columns)?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            if rows.len() >= MAX_INSERT_ROWS_PER_STATEMENT {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "INSERT statement exceeds the allowed row count ({MAX_INSERT_ROWS_PER_STATEMENT})"
+                )));
+            }
+            rows.push(self.parse_insert_values_row(&columns)?);
+        }
+
+        // 文末専用句の構造パースのみをここで行う（省略・明示 `NULL` はいずれも
+        // `None`）。必須化の判定（`23502`）は `validate_insert` が
+        // `LedgerMode::require` へ委譲し、この時点でまだ FROM/INTO テーブルの
+        // カタログ照会を一切行っていない＝書き込みトランザクションは絶対に
+        // 開始されていない段階で行われる（TASK-92・RECOVER-1）。全行の VALUES
+        // 解析が終わった後に 1 回だけ呼ぶ（行ごとに書かれた場合は次の `(` の
+        // 期待が外れて構文エラーとして自然に拒否される）。
+        let operation_id = self.parse_operation_id_clause()?;
+
+        Ok(ParsedInsertShape {
+            table_name,
+            columns,
+            rows,
+            operation_id,
+        })
+    }
+
+    /// `VALUES` の 1 行分 `(<lit>[, <lit>]*)` を解析し、リテラル数が列数と一致する
+    /// ことを検証する（SQL-16、TASK-190）。複数行形・単一行形のいずれからも
+    /// 呼ばれる共有ヘルパ。
+    fn parse_insert_values_row(
+        &mut self,
+        columns: &[String],
+    ) -> Result<Vec<InsertLiteral>, SqlSurfaceError> {
         self.expect_punct('(')?;
         let mut values = vec![self.expect_literal()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
@@ -1665,19 +1716,7 @@ impl<'a> Parser<'a> {
             )));
         }
 
-        // 文末専用句の構造パースのみをここで行う（省略・明示 `NULL` はいずれも
-        // `None`）。必須化の判定（`23502`）は `validate_insert` が
-        // `LedgerMode::require` へ委譲し、この時点でまだ FROM/INTO テーブルの
-        // カタログ照会を一切行っていない＝書き込みトランザクションは絶対に
-        // 開始されていない段階で行われる（TASK-92・RECOVER-1）。
-        let operation_id = self.parse_operation_id_clause()?;
-
-        Ok(ParsedInsertShape {
-            table_name,
-            columns,
-            values,
-            operation_id,
-        })
+        Ok(values)
     }
 
     /// 文末専用句 `USING OPERATION_ID '<id>'`（SQL-10、TASK-80）の構造パースのみを
@@ -2220,11 +2259,12 @@ pub fn validate_statement(
     }
 }
 
-/// 構文木（[`ValidatedInsert`] の元）。カタログ存在確認前の中間結果（SQL-10、TASK-80）。
+/// 構文木（[`ValidatedInsert`] の元）。カタログ存在確認前の中間結果
+/// （SQL-10・SQL-16、TASK-80・TASK-190）。
 struct ParsedInsertShape {
     table_name: String,
     columns: Vec<String>,
-    values: Vec<InsertLiteral>,
+    rows: Vec<Vec<InsertLiteral>>,
     operation_id: Option<OperationId>,
 }
 
@@ -2274,7 +2314,7 @@ pub(crate) fn validate_insert_tokens(
     Ok(ValidatedInsert {
         table_name: shape.table_name,
         columns: shape.columns,
-        values: shape.values,
+        rows: shape.rows,
         operation_id: shape.operation_id,
     })
 }
@@ -3238,6 +3278,60 @@ mod tests {
         let err =
             validate_insert(&sql, &lookup, LedgerMode::Ledgered).expect_err("must be rejected");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn accepts_insert_at_max_row_count_boundary() {
+        // SQL-16・TASK-190: 実装既定値ちょうど（[`MAX_INSERT_ROWS_PER_STATEMENT`]）の
+        // 行数は受理される（境界値検証。`tests/insert_multi_row.rs` の結合テストは
+        // 定数値へ依存せず「明らかに超過する規模」を使う方針のため、境界値ちょうどの
+        // 検証は本ユニットテストが担う）。
+        let lookup = catalog_with(&["documents"]);
+        let rows: Vec<String> = (0..MAX_INSERT_ROWS_PER_STATEMENT)
+            .map(|i| format!("({i})"))
+            .collect();
+        let sql = format!(
+            "INSERT INTO documents (id) VALUES {} USING OPERATION_ID 'op-0001'",
+            rows.join(", ")
+        );
+        let stmt = validate_insert(&sql, &lookup, LedgerMode::Ledgered)
+            .expect("row count at the limit must be accepted");
+        assert_eq!(stmt.rows.len(), MAX_INSERT_ROWS_PER_STATEMENT);
+    }
+
+    #[test]
+    fn rejects_insert_exceeding_max_row_count_before_catalog_lookup() {
+        // SQL-16・TASK-190: [`MAX_INSERT_ROWS_PER_STATEMENT`] を 1 行超えると
+        // `54000` で拒否され、かつ判定は行を積む最中（構造検証段階）に完結する
+        // ため `TableLookup::table_exists` へは一切到達しない（副作用ゼロの
+        // 根拠。`explicit_null_operation_id_does_not_reach_catalog_lookup` と
+        // 同じ `FlaggingCatalog` パターン）。
+        struct FlaggingCatalog {
+            called: std::cell::Cell<bool>,
+        }
+        impl TableLookup for FlaggingCatalog {
+            fn table_exists(&self, _name: &str) -> Result<bool, SqlSurfaceError> {
+                self.called.set(true);
+                Ok(true)
+            }
+        }
+        let lookup = FlaggingCatalog {
+            called: std::cell::Cell::new(false),
+        };
+        let rows: Vec<String> = (0..MAX_INSERT_ROWS_PER_STATEMENT + 1)
+            .map(|i| format!("({i})"))
+            .collect();
+        let sql = format!(
+            "INSERT INTO documents (id) VALUES {} USING OPERATION_ID 'op-0001'",
+            rows.join(", ")
+        );
+        let err =
+            validate_insert(&sql, &lookup, LedgerMode::Ledgered).expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "54000");
+        assert!(
+            !lookup.called.get(),
+            "row count limit must be rejected before the catalog lookup"
+        );
     }
 
     #[test]

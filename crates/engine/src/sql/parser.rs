@@ -787,12 +787,21 @@ pub fn bind_in_session(
 /// （`core.rs::EngineCore::execute_insert_sql`）が `Storage::get_table_schema` で
 /// 取得済みのものを渡す。
 ///
+/// **単一行契約**: `stmt.rows.len() == 1` の場合のみ束縛する（`stmt.rows[0]` を
+/// 見る）。複数行 `VALUES`（SQL-16、TASK-190。`stmt.rows.len() > 1`）は
+/// [`SqlSurfaceError::InvalidInput`]（`22000`）で拒否し、2 行目以降を黙って
+/// 無視しない（fail-open な取りこぼしを防ぐ。複数行の束縛は本関数を経由せず
+/// [`bind_insert_form`] の `RowBatch` 分岐が担う）。パーサーは常に
+/// `rows.len() >= 1` を保証するため、単一行 `INSERT` に対する外部観測可能な
+/// 挙動は本関数導入前とビット同一のまま不変。
+///
 /// 検出する違反はすべて [`SqlSurfaceError::InvalidInput`]（`22000`）:
-/// 列名重複・列リストに疑似列 `id` を含まない・`id` 値が `u64` として解釈不能
-/// （範囲外を含む）・未知の列名・列型とリテラル種別の不一致（`VECTOR` 列に
-/// 数値、`TEXT` 列にベクトルリテラルを渡す等）・非 nullable 列の欠落。
-/// ベクトルリテラル自体の形式・次元・64 KiB 上限は既存の [`parse_vector_literal`]
-/// をそのまま再利用する（アロケーション前のサイズ検証を二重管理しない）。
+/// 複数行 `VALUES`・列名重複・列リストに疑似列 `id` を含まない・`id` 値が
+/// `u64` として解釈不能（範囲外を含む）・未知の列名・列型とリテラル種別の
+/// 不一致（`VECTOR` 列に数値、`TEXT` 列にベクトルリテラルを渡す等）・非
+/// nullable 列の欠落。ベクトルリテラル自体の形式・次元・64 KiB 上限は既存の
+/// [`parse_vector_literal`] をそのまま再利用する（アロケーション前のサイズ検証を
+/// 二重管理しない）。
 ///
 /// テナント・可視性はここで解決しない（`exec::execute_insert` の責務。
 /// クライアントが列リストへ `tenant_id`・可視性ラベル相当の名前を指定しても、
@@ -801,14 +810,48 @@ pub fn bind_insert(
     stmt: &ValidatedInsert,
     schema: &TableSchema,
 ) -> Result<BoundInsert, SqlSurfaceError> {
-    if stmt.columns.len() != stmt.values.len() {
+    // 複数行 `VALUES`（SQL-16、TASK-190）は本関数の単一行契約外であり、2 行目
+    // 以降を黙って無視する fail-open を避けるため明示的に拒否する（複数行の
+    // 束縛は `bind_insert_form` の `RowBatch` 分岐を経由すること）。
+    if stmt.rows.len() != 1 {
+        return Err(SqlSurfaceError::invalid_input(
+            "bind_insert only accepts a single VALUES row (use bind_insert_form for multi-row VALUES)",
+        ));
+    }
+    let values = stmt
+        .rows
+        .first()
+        .ok_or_else(|| SqlSurfaceError::invalid_input("INSERT statement has no VALUES row"))?;
+    bind_insert_row(
+        &stmt.table_name,
+        &stmt.columns,
+        values,
+        &stmt.operation_id,
+        schema,
+    )
+}
+
+/// [`bind_insert`] の 1 行分の束縛本体（SQL-16、TASK-190）。複数行 `VALUES` の
+/// 各行が行キー `id`・列値の意味論検証（列名重複・`id` 欠落・未知列名・型不一致・
+/// 非 nullable 列欠落）を個別に受けられるよう、[`bind_insert`]（単一行形・
+/// `stmt.rows[0]` のみを見る）と [`bind_insert_form`] の複数行分岐の双方から
+/// 共有する。`table_name`・`operation_id` は行に依存しないため呼び出し元が
+/// 1 度だけ渡す。
+fn bind_insert_row(
+    table_name: &str,
+    columns: &[String],
+    values: &[InsertLiteral],
+    operation_id: &Option<OperationId>,
+    schema: &TableSchema,
+) -> Result<BoundInsert, SqlSurfaceError> {
+    if columns.len() != values.len() {
         return Err(SqlSurfaceError::invalid_input(
             "INSERT column count does not match value count",
         ));
     }
 
     let mut seen_columns: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for name in &stmt.columns {
+    for name in columns {
         if !seen_columns.insert(name.as_str()) {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "duplicate column in INSERT column list: {name}"
@@ -816,11 +859,10 @@ pub fn bind_insert(
         }
     }
 
-    let id_pos = stmt.columns.iter().position(|c| c == "id").ok_or_else(|| {
+    let id_pos = columns.iter().position(|c| c == "id").ok_or_else(|| {
         SqlSurfaceError::invalid_input("INSERT column list must include the id pseudo-column")
     })?;
-    let id_literal = stmt
-        .values
+    let id_literal = values
         .get(id_pos)
         .ok_or_else(|| SqlSurfaceError::invalid_input("missing value for id pseudo-column"))?;
     let id: u64 = match id_literal {
@@ -834,11 +876,11 @@ pub fn bind_insert(
         }
     };
 
-    let mut values: Vec<crate::row_codec::Value> =
+    let mut bound_values: Vec<crate::row_codec::Value> =
         vec![crate::row_codec::Value::Null; schema.columns.len()];
     let mut provided = vec![false; schema.columns.len()];
 
-    for (name, literal) in stmt.columns.iter().zip(stmt.values.iter()) {
+    for (name, literal) in columns.iter().zip(values.iter()) {
         if name == "id" {
             // 疑似列 `id` は行キーとして上で処理済みであり、スキーマ実列とは
             // 照合しない（既存の SELECT 側 `bind` と同様、実カラム名 `id` を
@@ -873,7 +915,7 @@ pub fn bind_insert(
                 )))
             }
         };
-        if let Some(slot) = values.get_mut(col_idx) {
+        if let Some(slot) = bound_values.get_mut(col_idx) {
             *slot = value;
         }
         if let Some(flag) = provided.get_mut(col_idx) {
@@ -892,10 +934,10 @@ pub fn bind_insert(
     }
 
     Ok(BoundInsert {
-        table: stmt.table_name.clone(),
+        table: table_name.to_string(),
         id,
-        values,
-        operation_id: stmt.operation_id.clone(),
+        values: bound_values,
+        operation_id: operation_id.clone(),
     })
 }
 
@@ -923,28 +965,42 @@ pub struct BoundFileInsert {
     pub operation_id: Option<OperationId>,
 }
 
-/// [`bind_insert_form`] の束縛結果。行形（既存の 1 行 1 ID `INSERT`）とファイル形
-/// （TASK-120。サーバー側チャンク化・ベクトル化を経由する `INSERT`）を区別する。
+/// [`bind_insert_form`] の束縛結果。行形（既存の 1 行 1 ID `INSERT`）・複数行形
+/// （SQL-16、TASK-190。複数行 `VALUES` を持つ行形）・ファイル形（TASK-120。
+/// サーバー側チャンク化・ベクトル化を経由する `INSERT`）を区別する。
 #[derive(Debug, Clone)]
 pub enum BoundInsertForm {
     Row(BoundInsert),
+    /// 複数行 `VALUES (...), (...), ...`（SQL-16、TASK-190）を束縛した行の並び
+    /// （投入順を保持）。全行が同一テーブル・同一 `operation_id`
+    /// （`ValidatedInsert` 由来のため構造的に保証される）。実行は
+    /// `sql::exec::execute_insert_batch_with_schema` が NoSQL 表層の `rows[]`
+    /// （NOSQL-6・TASK-178）と共有する（第 2 の書き込み経路を作らない）。
+    RowBatch(Vec<BoundInsert>),
     File(BoundFileInsert),
 }
 
 /// `ValidatedInsert` の列リストから行形・ファイル形いずれの `INSERT` かを束縛段階で
-/// 判別し、対応する束縛結果を返す（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2）。
-/// 許可リスト（`sql::allowlist`）・構文（`sql::lexer`）は行形・ファイル形で共通の
-/// ままであり、本関数だけが形を分岐させる（`sql/exec.rs`・`core.rs` の呼び出し元
-/// モジュールドキュメント参照）。
+/// 判別し、対応する束縛結果を返す（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2。
+/// 複数行 `VALUES` の受理は SQL-16・TASK-190）。許可リスト（`sql::allowlist`）・
+/// 構文（`sql::lexer`）は行形・ファイル形で共通のままであり、本関数だけが形を
+/// 分岐させる（`sql/exec.rs`・`core.rs` の呼び出し元モジュールドキュメント参照）。
 ///
-/// 判別規則（すべて満たす場合のみファイル形）:
+/// 判別規則（すべて満たす場合のみファイル形。行数には依存しない）:
 /// - 列リストに疑似列 `id` を含まない
 /// - 列リストに、スキーマ上 `VECTOR` 型である列を含まない
 /// - 列リストに Text 列 `path` と `body` を両方含む
 ///
 /// いずれか 1 つでも欠ける場合（`id` または VECTOR 列を同時指定した場合を含む）は
-/// 行形として扱い、[`bind_insert`] の既存の検証（`22000`）にそのまま委ねる
-/// （黙って片方の形へ丸めない。行形の既存テスト・エラー契約は本関数導入後も無変更）。
+/// 行形として扱う。ファイル形と判定されたにもかかわらず複数行 `VALUES` を持つ文は
+/// `42601` で拒否する（ファイル複数投入は既存の [`crate::sql::exec::execute_insert_batch`]
+/// 系の別経路が担い、複数行 `VALUES` との併用は受理しない設計判断。将来ファイル形の
+/// 複数行対応が必要になれば別途構文を起こす）。行形は `stmt.rows.len() == 1` なら
+/// 既存の [`bind_insert`] へそのまま委譲し外部観測可能な挙動をビット同一に保ち
+/// （黙って別セマンティクスへ丸めない。行形の既存テスト・エラー契約は本関数
+/// 導入後も無変更）、`> 1` なら各行を束縛して [`BoundInsertForm::RowBatch`] を返す
+/// （束縛失敗はどの行で失敗したかに関わらず全体を `Err` として拒否し、部分成功は
+/// しない）。
 pub fn bind_insert_form(
     stmt: &ValidatedInsert,
     schema: &TableSchema,
@@ -960,18 +1016,44 @@ pub fn bind_insert_form(
     let has_body = stmt.columns.iter().any(|c| c == "body");
 
     if !has_id && !has_vector_column && has_path && has_body {
+        if stmt.rows.len() > 1 {
+            return Err(SqlSurfaceError::unsupported(
+                "multi-row VALUES is not supported for file-form INSERT (path/body columns)",
+            ));
+        }
         bind_file_insert(stmt, schema).map(BoundInsertForm::File)
-    } else {
+    } else if stmt.rows.len() <= 1 {
         bind_insert(stmt, schema).map(BoundInsertForm::Row)
+    } else {
+        let mut bounds: Vec<BoundInsert> = Vec::new();
+        bounds.try_reserve_exact(stmt.rows.len()).map_err(|_| {
+            SqlSurfaceError::payload_too_large("failed to reserve INSERT row batch buffer")
+        })?;
+        for values in &stmt.rows {
+            bounds.push(bind_insert_row(
+                &stmt.table_name,
+                &stmt.columns,
+                values,
+                &stmt.operation_id,
+                schema,
+            )?);
+        }
+        Ok(BoundInsertForm::RowBatch(bounds))
     }
 }
 
-/// [`bind_insert_form`] がファイル形と判定した場合の束縛本体。
+/// [`bind_insert_form`] がファイル形と判定した場合の束縛本体。呼び出し元
+/// （[`bind_insert_form`]）が `stmt.rows.len() > 1` を先に `42601` で拒否するため、
+/// ここでは常に `stmt.rows.first()` の単一行を見る（SQL-16、TASK-190）。
 fn bind_file_insert(
     stmt: &ValidatedInsert,
     schema: &TableSchema,
 ) -> Result<BoundFileInsert, SqlSurfaceError> {
-    if stmt.columns.len() != stmt.values.len() {
+    let values = stmt
+        .rows
+        .first()
+        .ok_or_else(|| SqlSurfaceError::invalid_input("INSERT statement has no VALUES row"))?;
+    if stmt.columns.len() != values.len() {
         return Err(SqlSurfaceError::invalid_input(
             "INSERT column count does not match value count",
         ));
@@ -1016,7 +1098,7 @@ fn bind_file_insert(
     let mut path_value: Option<String> = None;
     let mut body_value: Option<String> = None;
 
-    for (name, literal) in stmt.columns.iter().zip(stmt.values.iter()) {
+    for (name, literal) in stmt.columns.iter().zip(values.iter()) {
         let col_idx = schema
             .columns
             .iter()
@@ -2493,7 +2575,7 @@ mod tests {
                     Some(&crate::row_codec::Value::Null)
                 );
             }
-            BoundInsertForm::Row(_) => panic!("expected file form"),
+            other => panic!("expected file form, got {other:?}"),
         }
     }
 
@@ -2508,7 +2590,7 @@ mod tests {
             BoundInsertForm::Row(r) => {
                 assert_eq!(r.id, 1);
             }
-            BoundInsertForm::File(_) => panic!("expected row form"),
+            other => panic!("expected row form, got {other:?}"),
         }
     }
 
@@ -2561,7 +2643,7 @@ mod tests {
                     Some(&crate::row_codec::Value::Text("ja".to_string()))
                 );
             }
-            BoundInsertForm::Row(_) => panic!("expected file form"),
+            other => panic!("expected file form, got {other:?}"),
         }
     }
 
