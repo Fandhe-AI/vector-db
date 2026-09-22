@@ -173,11 +173,14 @@ impl Router {
         }
     }
 
-    /// `engine` 接続済みの構築経路（Issue #766・#768・#772。
+    /// `engine` 接続済みの構築経路（Issue #766・#768・#772・#876。
     /// `main.rs::run_server` の nosql 分岐から呼ばれる）。`scan`／
-    /// `aggregate`／`insert` op は [`super::query::scan::handle`]／
-    /// [`super::query::aggregate::handle`]／[`super::query::insert::handle`]
-    /// へ結線され実行可能になる。
+    /// `aggregate`／`insert`／`update`／`delete` op は
+    /// [`super::query::scan::handle`]／[`super::query::aggregate::handle`]／
+    /// [`super::query::insert::handle`]／[`super::query::update::handle`]／
+    /// [`super::query::delete::handle`] へ結線され実行可能になる
+    /// （`update`／`delete` は `where` 形のみ。`filter` 形は Issue #871 の
+    /// 実行結線待ち）。
     pub fn with_engine(
         users: Arc<UserStore>,
         sessions: SessionStore,

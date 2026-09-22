@@ -11,17 +11,19 @@
 //! `POST /v1/query` を送り、HTTP 応答（ステータス・`wire_code`・
 //! エラーコード・メッセージ）を確認する。
 //!
-//! 許可リストの `search`／`scan`／`aggregate`／`insert` の 4 op はいずれも
-//! 実行結線済み（TASK-186・NOSQL-2〜6・Issue #764・#766・#768・#772）の
+//! 許可リストの `search`／`scan`／`aggregate`／`insert`／`update`（`where`
+//! 形）／`delete`（`where` 形）の 6 op はいずれも実行結線済み
+//! （TASK-186・NOSQL-2〜6・NOSQL-12・Issue #764・#766・#768・#772・#876）の
 //! ため、`engine` 接続済みでは暫定 `0A000`／501
 //! （[`wire_server::http::query::gate::PLACEHOLDER_MESSAGE`]）を返さず、
 //! 存在しないテーブルへの到達を示す `42P01`／404 で「認証 → op 許可リスト →
 //! スキーマ検証 → engine 呼び出し」が走ったことを確認する。一方
-//! `update`／`delete` は語彙・スキーマ検証を通過するが束縛・実行結線は
-//! Issue #876 の担当のため、`engine` 接続有無を問わず暫定 `0A000`／501 の
-//! ままに留まる（本ファイルでは実行結線 4 op と分けて確認する）。語彙外拒否は
-//! HTTP 501・`wire_code` `0A000`・`code` `FEATURE_NOT_SUPPORTED` で status
-//! だけでは区別できないため、必ず `error_message_of` で
+//! `update`／`delete` の `filter`（述語形）指定は語彙・スキーマ検証を通過
+//! するが実行結線は Issue #871 の担当のため、`engine` 接続有無を問わず
+//! `0A000`／501 のままに留まる（本ファイルでは実行結線 6 op と分けて
+//! 確認する）。語彙外拒否は HTTP 501・`wire_code` `0A000`・`code`
+//! `FEATURE_NOT_SUPPORTED` で status だけでは区別できないため、必ず
+//! `error_message_of` で
 //! [`wire_server::http::query::gate::UNSUPPORTED_OP_MESSAGE`] を突き合わせる。
 //!
 //! 役割分担（Issue #774）: seed 済み 2 テナント fixture 上での 4 op **成功
@@ -99,26 +101,29 @@ fn spawn() -> SocketAddr {
     http_common::spawn_router_listener(&users_path, SessionStore::new())
 }
 
-// --- 許可リスト 4 op はいずれも実行結線済み（42P01・非 501） -------------
+// --- 許可リスト 6 op（where 形の update／delete を含む）はいずれも実行結線済み（42P01・非 501） ---
 
 #[test]
-fn four_allowlisted_ops_reach_the_engine_and_report_undefined_table() {
+fn six_allowlisted_ops_reach_the_engine_and_report_undefined_table() {
     let addr = spawn();
 
     // `scan`（TASK-186・NOSQL-3・Issue #766）・`aggregate`（Issue #768）・
-    // `insert`（Issue #772）・`search`（TASK-186・NOSQL-2・Issue #764）は
-    // いずれも実行結線済みのため、スローアウェイ `EngineCore`（テーブル
+    // `insert`（Issue #772）・`search`（TASK-186・NOSQL-2・Issue #764）・
+    // `update`（`where` 形。Issue #876）・`delete`（`where` 形。Issue #876）
+    // はいずれも実行結線済みのため、スローアウェイ `EngineCore`（テーブル
     // 未作成）上では `42P01`／404 が到達の証跡になる（暫定 `0A000`／501
-    // へ到達する op はもう存在しない）。`search` は `vector`／`plan`
-    // いずれも未指定だが、テーブル解決
+    // へ到達する op は `filter`〔述語形〕指定のみになった）。`search` は
+    // `vector`／`plan` いずれも未指定だが、テーブル解決
     // （`EngineCore::execute_bound_search_in_session` の schema 取得）が
     // binder（`vector`／`plan` 排他判定）より先に走るため `42P01` になる
     // （§2.3 の判定順序どおり）。
-    let executed_bodies: [&[u8]; 4] = [
+    let executed_bodies: [&[u8]; 6] = [
         br#"{"op":"scan","table":"docs","limit":1}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"id"}]}"#,
         br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2,0.3]}],"operation_id":"nosql9-op-1"}"#,
         br#"{"op":"search","table":"docs","limit":1}"#,
+        br#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1},"operation_id":"nosql9-op-2"}"#,
+        br#"{"op":"delete","table":"docs","where":{"id":1},"operation_id":"nosql9-op-3"}"#,
     ];
     for body in executed_bodies {
         let resp = query(addr, body);
@@ -126,18 +131,20 @@ fn four_allowlisted_ops_reach_the_engine_and_report_undefined_table() {
     }
 }
 
-// --- update／delete: 語彙・スキーマは通過するが実行結線は未接続 -----------
+// --- update／delete: `filter`（述語形）は実行器未接続のため 0A000 のまま ---
 
 #[test]
-fn update_and_delete_pass_allowlist_but_stay_at_placeholder() {
-    // Issue #875 で語彙へ加わった `update`／`delete` は op 許可リスト・
-    // スキーマ検証は通過するが、束縛・実行結線は Issue #876 の担当のため
-    // `four_allowlisted_ops_reach_the_engine_and_report_undefined_table` の
-    // 4 op と異なり `42P01` には到達せず、暫定 `0A000`／501 のまま留まる。
+fn update_and_delete_predicate_form_pass_allowlist_but_stay_at_placeholder() {
+    // `update`／`delete`（Issue #875・NOSQL-12）は `where`（単一行 `id`
+    // 指定形）は Issue #876 で実行結線済みだが、`filter`（述語形）は実行器
+    // 未接続（Issue #871 の担当）のため語彙・スキーマ検証を通過しても
+    // `42P01` には到達せず、`0A000`／501 のまま留まる
+    // （`super::dml_target::PREDICATE_FORM_UNAVAILABLE_MESSAGE`。
+    // `gate::PLACEHOLDER_MESSAGE` とは異なる固定文言）。
     let addr = spawn();
     let bodies: [&[u8]; 2] = [
-        br#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1}}"#,
-        br#"{"op":"delete","table":"docs","where":{"id":1}}"#,
+        br#"{"op":"update","table":"docs","set":{"lang":"en"},"filter":[]}"#,
+        br#"{"op":"delete","table":"docs","filter":[]}"#,
     ];
     for body in bodies {
         let resp = query(addr, body);
@@ -145,7 +152,7 @@ fn update_and_delete_pass_allowlist_but_stay_at_placeholder() {
         assert_eq!(http_common::wire_code_of(&resp), "0A000");
         assert_eq!(
             http_common::error_message_of(&resp),
-            wire_server::http::query::gate::PLACEHOLDER_MESSAGE
+            wire_server::http::query::dml_target::PREDICATE_FORM_UNAVAILABLE_MESSAGE
         );
     }
 }

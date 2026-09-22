@@ -28,9 +28,10 @@
 //! `update`／`delete` op（Issue #875・NOSQL-12）の `set` 禁止列（`id`／
 //! `tenant_id`／`visibility`）検査・`where`／`filter` の排他判定・列名解決・
 //! `operation_id` 欠落／`null`／空文字 → `23502`・engine への束縛・実行は
-//! いずれも後続 Issue（#876）が担う。本モジュールでは `UPDATE_SCHEMA`
-//! （`set` を任意キーのオブジェクトとして型のみ検査する [`FieldType::AnyObject`]）・
-//! `DELETE_SCHEMA` の宣言に留める。
+//! [`super::update`]・[`super::delete`]・[`super::dml_target`]（Issue
+//! #876・TASK-186・NOSQL-6・NOSQL-12）が担う。本モジュールでは
+//! `UPDATE_SCHEMA`（`set` を任意キーのオブジェクトとして型のみ検査する
+//! [`FieldType::AnyObject`]）・`DELETE_SCHEMA` の宣言に留める。
 //!
 //! 未知キーは無視せず拒否する（NOSQL-8 の一般則。クライアント自己申告の
 //! `tenant_id`（HTTP-7）・`HINT ORDER`／`SET search_mode` 相当フィールド
@@ -699,8 +700,8 @@ pub static WHERE_ID_SCHEMA: ObjectSchema = ObjectSchema {
 /// `update` op のトップレベルスキーマ（NOSQL-12 ポインタ。Issue #875）。
 /// `set` の禁止列（`id`／`tenant_id`／`visibility`）検査・列名解決・
 /// `where`／`filter` の排他判定・`operation_id` 欠落／`null`／空文字 →
-/// `23502`・engine への束縛・実行はいずれも Issue #876 が担う（本スキーマは
-/// 型のみを検査する）。
+/// `23502`・engine への束縛・実行は [`super::update`]・[`super::dml_target`]
+/// （Issue #876）が担う（本スキーマは型のみを検査する）。
 pub static UPDATE_SCHEMA: ObjectSchema = ObjectSchema {
     name: "update",
     fields: &[
@@ -745,7 +746,8 @@ pub static UPDATE_SCHEMA: ObjectSchema = ObjectSchema {
 
 /// `delete` op のトップレベルスキーマ（NOSQL-12 ポインタ。Issue #875）。
 /// `where`／`filter` の排他判定・`operation_id` 欠落／`null`／空文字 →
-/// `23502`・engine への束縛・実行はいずれも Issue #876 が担う。
+/// `23502`・engine への束縛・実行は [`super::delete`]・[`super::dml_target`]
+/// （Issue #876）が担う。
 pub static DELETE_SCHEMA: ObjectSchema = ObjectSchema {
     name: "delete",
     fields: &[

@@ -3,8 +3,9 @@
 `wire-server --surface nosql` が公開する 3 エンドポイント（`POST /v1/session`・
 `POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 6 値
 （`search`／`scan`／`aggregate`／`insert`／`update`／`delete`）の JSON スキーマを
-利用者向けに整理する。`update`／`delete` は語彙・スキーマ検証のみ実装済みで、
-束縛・実行結線は未実装（後述の各節参照）。
+利用者向けに整理する。`update`／`delete` は `where`（単一行・`id` 完全一致形）は
+束縛・実行結線済みで、`filter`（述語形）は語彙・スキーマ検証のみ実装済み
+（実行結線は未実装。後述の各節参照）。
 
 **この文書の情報源はコードとテストのみ**であり、`docs/spec`（private submodule）
 の本文は転記しない。参照が必要な箇所は TASK-nn・ビヘイビア ID のポインタ表記に
@@ -346,22 +347,36 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 
 ### `update`
 
-語彙・スキーマ検証のみ実装済み（Issue #875・NOSQL-12）。**束縛・engine への
-実行結線は未実装**で、以下のスキーマを満たす要求でも常に暫定応答
-（`0A000`／501・`"query execution not yet available"`）が返る。実行結線は
-後続 Issue（#876）の担当。
+`where`（単一行・`id` 完全一致形）は束縛・実行結線済み（Issue #876・
+TASK-186・NOSQL-6・NOSQL-12）で、SQL 表層 `UPDATE ... WHERE id = <n>
+USING OPERATION_ID`（SQL-17）と同一の実行器
+（`engine::sql::exec::execute_update_with_schema`）・同一の台帳キー空間
+（`(tenant, table, operation_id)`）へ到達する。`filter`（述語形）は語彙・
+スキーマ検証のみ実装済みで、**実行結線は未実装**（Issue #871 の担当）の
+ため、指定すると常に `0A000`／501（固定文言。`gate.rs::PLACEHOLDER_MESSAGE`
+とは異なる文言）が返る。
 
 | キー | 必須 | 型 | 備考 |
 | --- | --- | --- | --- |
 | `op` | ○ | string | `"update"` |
 | `table` | ○ | string | |
-| `set` | ○ | object（任意キー） | 列名をキーに持つ部分更新。禁止列（`id`／`tenant_id`／`visibility`）検査・値の型検査は未実装 |
-| `where` | △ | `{"id": number}` | 単一行・`id` 指定形。`filter` との排他判定は未実装 |
-| `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。`where` との排他判定は未実装 |
-| `operation_id` | △ | string | 欠落・`null`・空文字の `23502` 判定は未実装（束縛結線後に有効化予定） |
+| `set` | ○ | object（任意キー・非空） | 列名をキーに持つ部分更新。`id`／`tenant_id`／`visibility` は `42601`。`TEXT` 列は JSON 文字列、`VECTOR` 列は数値配列（**文字列形のベクトルリテラルは受理しない**）のみ受理。型不一致・未知列・次元不一致は `22000` |
+| `where` | △ | `{"id": number}` | 単一行・`id` 完全一致形。小数は `22000`、負数は `42601`（SQL 表層の字句解析・束縛とのパリティ。詳細は design doc 参照）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
+| `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。指定のみ（`where` 欠落）だと `0A000`（実行器未接続） |
+| `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により内容一致 `23505`・不一致 `22023`（SQL 表層と共有） |
 
-要求例（`where` 形。現時点ではスキーマ検証を通過したうえで暫定応答へ
-落ちる）:
+成功応答: `{"updated":<n>,"operation_id":"<echo>"}`（`n` は `0` または `1`。
+他テナント所有 id・未存在 id はいずれも `updated:0`・`200` で応答バイト列が
+完全一致する。RLS-9）。
+
+**既知の制約**: 複数列 `set` は JSON パース時点でキーのアルファベット順へ
+正規化されるため、SQL 表層がアルファベット順でない宣言順で書いた
+`UPDATE`（例: `SET lang = .., embedding = ..`）と同一値の NoSQL `update`
+は、同一 `operation_id` への再送であっても内容不一致（`22023`）に
+誤判定されうる（単一列の `set` は影響を受けない。詳細は
+`docs/design/nosql-update-delete-mapping.md`「既知の制約」節参照）。
+
+要求例（`where` 形）:
 
 ```json
 {"op": "update", "table": "docs", "set": {"lang": "en"}, "where": {"id": 1},
@@ -370,18 +385,24 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 
 ### `delete`
 
-語彙・スキーマ検証のみ実装済み（Issue #875・NOSQL-12）。**束縛・engine への
-実行結線は未実装**で、以下のスキーマを満たす要求でも常に暫定応答
-（`0A000`／501・`"query execution not yet available"`）が返る。実行結線は
-後続 Issue（#876）の担当。
+`where`（単一行・`id` 完全一致形）は束縛・実行結線済み（Issue #876・
+TASK-186・NOSQL-6・NOSQL-12）で、SQL 表層 `DELETE FROM ... WHERE id = <n>
+USING OPERATION_ID`（SQL-18）と同一の実行器（`engine::sql::exec::
+execute_delete`）・同一の台帳キー空間を共有する。`filter`（述語形）は
+`update` と同様に語彙・スキーマ検証のみ実装済みで `0A000`／501 が返る
+（Issue #871 の担当）。
 
 | キー | 必須 | 型 | 備考 |
 | --- | --- | --- | --- |
 | `op` | ○ | string | `"delete"` |
 | `table` | ○ | string | |
-| `where` | △ | `{"id": number}` | 単一行・`id` 指定形。`filter` との排他判定は未実装 |
-| `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。`where` との排他判定は未実装 |
-| `operation_id` | △ | string | 欠落・`null`・空文字の `23502` 判定は未実装（束縛結線後に有効化予定） |
+| `where` | △ | `{"id": number}` | 単一行・`id` 完全一致形。小数は `22000`、負数は `42601`（SQL 表層とのパリティ）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
+| `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。指定のみだと `0A000`（実行器未接続） |
+| `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により `23505`（内容一致。`DELETE` は行の有無に関わらず同一内容） |
+
+成功応答: `{"deleted":<n>,"operation_id":"<echo>"}`（`n` は `0` または `1`。
+他テナント所有 id・未存在 id はいずれも `deleted:0`・`200` で応答バイト列が
+完全一致する。RLS-9）。
 
 要求例:
 
@@ -390,8 +411,10 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 ```
 
 検証コード: `crates/wire-server/src/http/query/op.rs`・`schema.rs`・
-`gate.rs`（単体テスト）・`crates/wire-server/tests/nosql9_op_allowlist.rs`・
-`nosql1_op_vocabulary.rs`。
+`dml_target.rs`・`update.rs`・`delete.rs`・`gate.rs`（単体テスト）・
+`crates/wire-server/tests/nosql9_op_allowlist.rs`・`nosql1_op_vocabulary.rs`・
+`nosql12_update_delete.rs`・
+`crates/engine/tests/sql_update_delete_session_public_api.rs`。
 
 ## `filter` 配列
 
@@ -478,10 +501,10 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 | `SELECT COUNT(*), SUM(id) FROM docs` | `aggregate` |
 | `SELECT lang, COUNT(*) FROM docs GROUP BY lang HAVING count >= 2` | `aggregate` + `group_by` + `having` |
 | `INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID 'op-1'` | `insert` + `operation_id` |
-| `UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-1'` | `update` + `where.id` + `operation_id`（語彙・スキーマのみ実装済み。実行結線は未実装） |
-| `UPDATE docs SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `update` + `filter` + `operation_id`（同上） |
-| `DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-1'` | `delete` + `where.id` + `operation_id`（同上） |
-| `DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `delete` + `filter` + `operation_id`（同上） |
+| `UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-1'` | `update` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
+| `UPDATE docs SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `update` + `filter` + `operation_id`（語彙・スキーマのみ実装済み。実行結線は Issue #871 の担当） |
+| `DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-1'` | `delete` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
+| `DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `delete` + `filter` + `operation_id`（語彙・スキーマのみ実装済み。実行結線は Issue #871 の担当） |
 
 対応の無いもの（NoSQL 側に受理形が存在しない。実際の応答は語彙外 `op` として
 `0A000`、または未知キーとして `42601`）:

@@ -33,12 +33,16 @@
 //!    TASK-177・NOSQL-4）、`explain` なしの `(Op::Search, Some(engine))` は
 //!    [`super::search::handle`]（TASK-186・NOSQL-2・Issue #764）、
 //!    `(Op::Insert, Some(engine))` は [`super::insert::handle`]（Issue
-//!    #772・TASK-178・NOSQL-6）へそれぞれ束縛・実行を委譲する。
-//!    `(Op::Update, _)`／`(Op::Delete, _)` は `engine` 接続有無を問わず常に
-//!    暫定の `0A000`／501（[`PLACEHOLDER_MESSAGE`]）へ落ちる（許可リスト・
-//!    スキーマ検証は通過するが束縛・実行結線は Issue #876 の担当。実行器
-//!    なしで応答を偽装しない）。`engine` 未接続時の `Op::Scan`／
-//!    `Op::Aggregate`／`Op::Insert`／`Op::Search` も同じ暫定応答へ落ちる
+//!    #772・TASK-178・NOSQL-6）へ、`(Op::Update, Some(engine))` は
+//!    [`super::update::handle`]（Issue #876・TASK-186・NOSQL-6・NOSQL-12）
+//!    へ、`(Op::Delete, Some(engine))` は [`super::delete::handle`]（Issue
+//!    #876・TASK-186・NOSQL-6・NOSQL-12）へそれぞれ束縛・実行を委譲する。
+//!    `update`／`delete` は `where`（単一行 `id` 指定形）のみ実行し、
+//!    `filter`（述語形）は実行器未接続（Issue #871 の担当）のため
+//!    `0A000`／501 のまま拒否する（`super::dml_target::
+//!    DmlTargetError::PredicateFormUnavailable`）。`engine` 未接続時の
+//!    `Op::Scan`／`Op::Aggregate`／`Op::Insert`／`Op::Search`／`Op::Update`／
+//!    `Op::Delete` はすべて [`PLACEHOLDER_MESSAGE`] へ落ちる
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
 //! `op` にスキーマ検証由来の情報（未知キー等）が先に返ることはない
@@ -56,7 +60,7 @@ use engine::json::parse_json;
 
 use crate::http::query::op::{classify_op, Op};
 use crate::http::query::schema::Validated;
-use crate::http::query::{insert, scan};
+use crate::http::query::{delete, insert, scan, update};
 use crate::http::session::middleware::{self, SessionPrincipal};
 use crate::http::{body, response};
 
@@ -64,11 +68,13 @@ pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 
 /// 検証を通過したが実行結線が未接続の要求に返す暫定応答の文言。
 /// `scan`・`aggregate`・`insert`・`search`（`explain: true` の `search` を
-/// 含む）の 4 op は実行結線済み（Issue #766・#768・#772・#764・#765）のため
-/// `Router::new` 経由（`engine` 未接続）の場合にのみこの応答へ落ちる。一方
-/// `update`／`delete`（Issue #875・NOSQL-12）は語彙・スキーマ検証を通過して
-/// もなお束縛・実行結線が未実装（Issue #876 の担当）のため、`engine` 接続
-/// 有無によらず常にこの応答へ落ちる。
+/// 含む）・`update`・`delete`（`where` 形。Issue #876）は実行結線済み
+/// （Issue #766・#768・#772・#764・#765・#876）のため `Router::new` 経由
+/// （`engine` 未接続）の場合にのみこの応答へ落ちる。`update`／`delete` の
+/// `filter`（述語形）指定は `engine` 接続の有無によらず、実行器未接続
+/// （Issue #871 の担当）を理由に別途 `0A000`／501 を返す
+/// （`super::dml_target::PREDICATE_FORM_UNAVAILABLE_MESSAGE`。本定数とは
+/// 別の固定文言で、実行器なしで応答を偽装しないことを明示する）。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
 
 /// `POST /v1/query` を処理し応答バイト列を返す（認証済み要求のみ）。
@@ -116,11 +122,9 @@ pub fn handle(
     };
 
     // 手順 5: op と engine 接続有無の組でディスパッチする（Issue #766・
-    // #768・#772・#764）。各アームは対応するモジュールへの 1 行委譲に留め、
-    // `update`／`delete` は束縛・実行結線が Issue #876 の担当のため明示的に
-    // placeholder へ落とす（実行器なしで応答を偽装しない）。それ以外の
-    // 4 op はすべて実行結線済みのため `(_, _)` は `engine` 未接続時にのみ
-    // 到達する。
+    // #768・#772・#764・#876）。各アームは対応するモジュールへの 1 行委譲に
+    // 留める。全 6 op が実行結線済みのため `(_, _)` は `engine` 未接続時
+    // （`Router::new` 経由）にのみ到達する。
     match (op, engine) {
         // `explain: true` は通常の `search` 実行（#764 が結線する
         // `(Op::Search, Some(engine)) => search::handle(...)` 相当）より
@@ -138,12 +142,16 @@ pub fn handle(
         (Op::Search, Some(engine)) => {
             super::search::handle(engine, principal, &validated, now_wall)
         }
-        // `(Op::Update, _)`／`(Op::Delete, _)`（Issue #875・NOSQL-12）は
-        // 語彙・スキーマ検証を通過するが束縛・engine 呼び出しは Issue #876
-        // の担当のため、`engine` 接続有無を問わず必ずここへ落ちる
-        // （`Op::Update`／`Op::Delete` にマッチする専用アームを持たない
-        // ことで、実行器なしで応答を偽装しないことを保証する）。`engine`
-        // 未接続時の他 4 op もここへ落ちる。
+        // `update`／`delete`（Issue #875・NOSQL-12）は Issue #876 で束縛・
+        // 実行結線済み。`where`（単一行 `id` 指定形）は実行し、`filter`
+        // （述語形）は各モジュール内部で `0A000`／501
+        // （`super::dml_target::DmlTargetError::PredicateFormUnavailable`）
+        // へ fail-closed に落とす（実行器〔Issue #871〕なしで成功を
+        // 偽装しない）。
+        (Op::Update, Some(engine)) => update::handle(engine, principal, &validated, now_wall),
+        (Op::Delete, Some(engine)) => delete::handle(engine, principal, &validated, now_wall),
+        // `engine` 未接続時（`Router::new` 経由）は全 op がこの暫定応答へ
+        // 落ちる（実行器なしで応答を偽装しない）。
         (_, _) => response::encode_error(
             ErrorClass::FeatureNotSupported,
             PLACEHOLDER_MESSAGE,
@@ -359,24 +367,66 @@ mod tests {
     }
 
     #[test]
-    fn valid_update_and_delete_reach_placeholder_even_when_engine_is_connected() {
-        // `update`／`delete`（Issue #875・NOSQL-12）は許可リスト・スキーマ
-        // 検証を通過するが、束縛・実行結線は Issue #876 の担当のため、
-        // `engine` 接続済みでも `42P01`（`scan`／`insert`／`search` のように
-        // engine へ到達した証跡）ではなく従来どおりの placeholder
-        // （`0A000`／501）に留まることを固定する。
+    fn valid_update_and_delete_where_form_are_dispatched_to_the_engine_and_report_undefined_table()
+    {
+        // `update`／`delete`（Issue #875・NOSQL-12）は Issue #876 で束縛・
+        // 実行結線済みのため、`engine` 接続済みであれば `scan`／`insert`／
+        // `search` と同様もう暫定 placeholder（`0A000`／501）を返さない。
+        // 存在しないテーブルへの要求が `42P01`／404（SQL 経路と同一分類）に
+        // なることで、「認証 → op 許可リスト → スキーマ検証 → engine 呼び
+        // 出し」がすべて走ったことを非 vacuous に確認する。
         let (core, _guard) = empty_core();
         let cases: [&[u8]; 2] = [
-            br#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1}}"#,
-            br#"{"op":"delete","table":"docs","where":{"id":1}}"#,
+            br#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1},"operation_id":"gate-update-1"}"#,
+            br#"{"op":"delete","table":"docs","where":{"id":1},"operation_id":"gate-delete-1"}"#,
+        ];
+        for body in cases {
+            let response = run_with_engine(&core, body, &[]);
+            let text = String::from_utf8(response).expect("utf-8 response");
+            assert!(text.starts_with("HTTP/1.1 404 "), "got: {text}");
+            assert!(text.contains("42P01"), "got: {text}");
+            assert!(!text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+        }
+    }
+
+    #[test]
+    fn valid_update_and_delete_filter_form_reject_with_0a000_even_when_engine_is_connected() {
+        // `filter`（述語形）は実行器未接続（Issue #871 の担当）のため、
+        // `engine` 接続済みでも `0A000`／501 のまま拒否する（実行器なしで
+        // 成功を偽装しない。`super::dml_target::
+        // PREDICATE_FORM_UNAVAILABLE_MESSAGE`）。
+        let (core, _guard) = empty_core();
+        let cases: [&[u8]; 2] = [
+            br#"{"op":"update","table":"docs","set":{"lang":"en"},"filter":[]}"#,
+            br#"{"op":"delete","table":"docs","filter":[]}"#,
         ];
         for body in cases {
             let response = run_with_engine(&core, body, &[]);
             let text = String::from_utf8(response).expect("utf-8 response");
             assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
             assert!(text.contains("0A000"), "got: {text}");
-            assert!(text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+            assert!(
+                text.contains(super::super::dml_target::PREDICATE_FORM_UNAVAILABLE_MESSAGE),
+                "got: {text}"
+            );
             assert!(!text.contains("42P01"), "got: {text}");
+        }
+    }
+
+    #[test]
+    fn valid_update_and_delete_reach_placeholder_when_engine_is_not_connected() {
+        // `engine` 未接続（`Router::new` 経由）では `update`／`delete` も
+        // 従来どおり placeholder のまま（実行器なしで応答を偽装しない）。
+        let cases: [&[u8]; 2] = [
+            br#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1}}"#,
+            br#"{"op":"delete","table":"docs","where":{"id":1}}"#,
+        ];
+        for body in cases {
+            let response = run(body, &[]);
+            let text = String::from_utf8(response).expect("utf-8 response");
+            assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
+            assert!(text.contains("0A000"), "got: {text}");
+            assert!(text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
         }
     }
 
