@@ -2852,11 +2852,12 @@ struct ParsedUpdateShape {
 ///
 /// 受理する形は `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE
 /// <述語>[ AND <述語>]* USING OPERATION_ID '<id>' [;]`（`<述語>` は `SELECT` の
-/// `WHERE` と同一形状。[`WherePredicate`]）。`WHERE` 省略・`visible()` 単独の
-/// 恒等述語は許可リスト構造としては受理するが、実質的な全行更新になるため
-/// [`crate::sql::parser::bind_update_form`] が束縛時に `42601` で拒否する
-/// （`WHERE` 省略自体は本モジュールの `expect_keyword(Keyword::Where)` が
-/// 構造的に拒否済み）。
+/// `WHERE` と同一形状。[`WherePredicate`]）。`WHERE` 句自体の省略は本モジュールの
+/// `expect_keyword(Keyword::Where)` が構造的に拒否する（`42601`）ため本型は
+/// 構築されない。`WHERE` 句が存在しても中身が `visible()` 単独の恒等述語のみ
+/// （非 `visible()` 述語が 1 つも無い）場合は許可リスト構造としては受理するが、
+/// 実質的な全行更新になるため [`crate::sql::parser::bind_update_form`] が
+/// 束縛時に `42601` で拒否する。
 ///
 /// フィールドは `pub(crate)` のまま公開しない（[`crate::sql::parser::
 /// BoundPredicateUpdate`] と同じ作法）。本型は `validate_update_form_tokens`

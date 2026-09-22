@@ -1264,9 +1264,12 @@ pub fn check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError> {
 /// （[`BoundUpdateForm`] 参照）。
 ///
 /// フィールドは `pub(crate)` のまま公開しない（[`BoundScan`] と同じ作法）。
-/// クレート外からはアクセサーメソッド経由で読み取り、[`Self::new`] 経由で
-/// 構築する（NoSQL 表層の `update` op・Issue #876 が SQL テキストを経由しない
-/// 直接束縛の入口として使う想定）。
+/// [`Self::new`] も `pub(crate)` の raw constructor であり、クレート外からは
+/// 呼べない（詳細は [`Self::new`] のドキュメント参照）。クレート外からは
+/// アクセサーメソッド経由で読み取るのみで、構築は [`bind_update_form`] の
+/// ような検証済み公開束縛 API を経由してのみ可能（NoSQL 表層の `update` op・
+/// Issue #876 が直接束縛の入口を必要とする場合も、同じ検証を実施する別の
+/// 公開 API を新設し、本 `new` はその内部実装としてのみ使う）。
 ///
 /// `expr_filter_programs`（ステップ列コンパイル済み実行形。Issue #353 と同型）は
 /// 本型では保持しない。実行結線（#871）が候補行確定後に
