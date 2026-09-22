@@ -90,8 +90,18 @@ execute_scan` の走査ループと同一の意味論（`declarative_filter::mat
   （`SELECT` では見えるが述語つき `UPDATE`／`DELETE` の対象外）。
 - engine 直呼び出しの既定 ctx（`Public` のみ）でも自テナント `Private` 行は候補に
   なる（単一行 DELETE と同じ）。
-- 他テナント行はキー範囲の外にあるためデコードすら行わない（不可視行に触れない
-  という受け入れ条件を構造的に満たす）。
+- `enumerate_dml_candidates` は `execute_scan`／`execute_aggregate` と同型の
+  「テーブル全体を `.iter()` で全走査し、`ctx.is_owner` 判定は行ヘッダの
+  デコード後に行う」実装である（redb の複合キー `(&str, u64)` の部分範囲
+  指定を避けるための既存踏襲。TABLE-12・security.md）。他テナント行も
+  `decode_row_header`／`decode_row_dim_and_metadata_borrowed`（または
+  `needs_embedding` 時は `decode_row_body_into`）でデコードされたうえで
+  `is_owner` 判定により除外される——「キー範囲の外にあるためデコードすら
+  行わない」わけではない。不可視行の内容（embedding・metadata・述語評価
+  結果）が呼び出し元・応答へ一切露出しない、という秘匿性の受け入れ条件は
+  `is_owner` 判定による除外で満たされるが、走査・デコードそのものの回避は
+  性能上の最適化課題であり本 Issue のスコープ外（§9「スカラー列二次索引
+  による候補削減の適用」参照）。
 
 `WHERE visible() のみ` の述語つき DELETE は #870 の既存決定（自テナント全行を候補
 にする。歯止めは影響行数上限のみ）をそのまま継承し、本 Issue で再決定していない
@@ -143,7 +153,10 @@ limit)`、`UPDATE` 側は `MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows(cou
   （DELETE／UPDATE）・RLS 境界（他テナント行の非影響・非漏えい）・0 行一致の台帳
   記録と再送拒否・内容照合ハッシュ（述語順入替での `22023`）・`WHERE visible()`
   のみの DELETE・`operation_id` 欠落・`execute_sql`（セッション無し）の既存拒否・
-  影響行数上限超過（`54000`・副作用ゼロ）。
+  影響行数上限超過（`54000`・副作用ゼロ。DELETE 側
+  `predicate_delete_over_limit_is_rejected_with_no_side_effects`・UPDATE 側
+  `predicate_update_over_limit_is_rejected_with_no_side_effects`——§6 の上限
+  API 並立を踏まえ両者を独立に固定）。
 - `crates/engine/tests/predicate_dml_failure_injection.rs`: 候補列挙途中の式評価
   エラー（0 除算）が write トランザクション全体を副作用ゼロで拒否すること（RLS 可視
   列は `TEXT` を算術に使えないため、疑似列 `id` の算術で誘発）・台帳未記録（同一

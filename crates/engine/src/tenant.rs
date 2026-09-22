@@ -1796,12 +1796,17 @@ pub(crate) struct DmlCandidate<'a> {
 }
 
 /// [`delete_rows_where_unchecked`]／[`update_rows_where_unchecked`] が共有する
-/// 候補行列挙本体。テナント所有範囲 `(tenant, 0)..=(tenant, u64::MAX)`
-/// （TABLE-12・`is_owner` の二重防御。RLS 可視性フィルタではなくテナント
-/// **所有**スコープである点は単一行 DELETE・TRUNCATE と同じ——`docs/design/
-/// predicate-dml-exec.md`「削除・更新スコープ」参照）を走査し、`predicate` が
-/// 真を返した行の `id` を `limit + 1` 件に達するまで `Vec` へ蓄積する
-/// （早期終了。行データそのものは複製せず `id` のみを保持する）。
+/// 候補行列挙本体。対象スコープはテナント**所有**（`(tenant, 0)..=(tenant,
+/// u64::MAX)` のキー名前空間＋`is_owner` の二重防御。RLS 可視性フィルタでは
+/// なくテナント**所有**スコープである点は単一行 DELETE・TRUNCATE と同じ——
+/// `docs/design/predicate-dml-exec.md`「削除・更新スコープ」参照）だが、
+/// `execute_scan`／`execute_aggregate` と同型の実装上の理由（redb の複合キー
+/// `(&str, u64)` の部分範囲指定を避ける）により、実際の走査はテーブル全体を
+/// `.iter()` で行い、`is_owner` 判定は各行のヘッダデコード後に行う（他テナ
+/// ント行もヘッダ・スカラー列はデコードされたうえで除外される。走査・デコー
+/// ドの回避自体はスコープ外）。`predicate` が真を返した行の `id` を
+/// `limit + 1` 件に達するまで `Vec` へ蓄積する（早期終了。行データそのもの
+/// は複製せず `id` のみを保持する）。
 ///
 /// `predicate` が `Err(e)` を返した場合はその時点で呼び出し元へ伝播する
 /// （呼び出し元が `write_txn` を破棄することで副作用ゼロを保つ）。
