@@ -201,10 +201,12 @@ pub struct QueryResult {
 }
 
 /// `EngineCore::execute_insert_sql` の成功応答（SQL-10、TASK-80）。行形 `INSERT` は
-/// 単一行のみを受理するため `rows_affected` は常に `1` になるが、
-/// `INSERT 0 1` 相当の wire 応答（TASK-73）へ写像しやすいよう件数フィールドとして
-/// 保持する。ファイル形 `INSERT`（TASK-120・INDEX-1, INDEX-2）は複数チャンク行を
-/// 書き込むため `incremental` に計測・件数を保持し、行形では常に `None`。
+/// 単一行 `VALUES (...)` では `rows_affected` が常に `1` になるが、複数行
+/// `VALUES (...), (...)`（SQL-16・TASK-190）では束縛した行数がそのまま
+/// `rows_affected` になる（`INSERT 0 N` 相当の wire 応答〔TASK-73〕へ写像しやすい
+/// よう件数フィールドとして保持する設計は不変）。ファイル形 `INSERT`
+/// （TASK-120・INDEX-1, INDEX-2）は複数チャンク行を書き込むため `incremental` に
+/// 計測・件数を保持し、行形では常に `None`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InsertOutcome {
     pub rows_affected: u64,
@@ -2693,8 +2695,13 @@ pub fn execute_insert_batch(
 /// [`execute_insert_batch`] の実体（`pub(crate)`）。`expected_schema` を追加で
 /// 受け取る点のみが異なる（codex-review P1 指摘・PR #823。[`execute_insert_with_schema`]
 /// のドキュメント参照。[`execute_insert_batch`] 自身は Issue #771 で公開 API へ
-/// 昇格済みのためシグネチャは変更しない）。唯一の呼び出し元は
-/// `core::EngineCore::execute_bound_insert_in_session`。
+/// 昇格済みのためシグネチャは変更しない）。呼び出し元は
+/// `core::EngineCore::execute_bound_insert_in_session`（NoSQL 表層 `rows[]`・
+/// NOSQL-6・TASK-178）と `core::EngineCore::execute_insert_form` の `RowBatch`
+/// 分岐（SQL 表層の複数行 `VALUES`・SQL-16・TASK-190・Issue #863）の 2 箇所
+/// （第 2 の書き込み経路を作らず本関数を共有する設計。両呼び出し元とも
+/// `operation_id` 必須化ガード・INDEX-4 上限は各自が本関数呼び出しの前段で
+/// 適用済みの `bounds` を渡す）。
 pub(crate) fn execute_insert_batch_with_schema(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
