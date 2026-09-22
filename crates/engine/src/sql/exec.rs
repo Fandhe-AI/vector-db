@@ -2643,6 +2643,13 @@ pub fn execute_delete_returning(
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
+    // codex-review Low 指摘（PR #873）対応: `column_meta` は `projection`・
+    // `schema` のみに依存する純粋な計算（redb I/O を伴わない）であり、
+    // `returning_bug`（`XX000`）以外で失敗しない。書き込み（commit 境界）の
+    // *前* に呼ぶことで、投影メタデータの構築失敗が「書き込みは成功したのに
+    // エラー応答を返す」（commit 成功境界後の失敗）経路に紛れ込むのを防ぐ。
+    let columns = crate::sql::returning::column_meta(returning, schema)?;
+
     let (outcome, captured) = crate::tenant::delete_row_ledgered_capturing_unchecked(
         storage,
         &bound.table,
@@ -2658,7 +2665,6 @@ pub fn execute_delete_returning(
         crate::tenant::DeleteRowOutcome::NotFound => 0,
     };
 
-    let columns = crate::sql::returning::column_meta(returning, schema)?;
     let mut rows = Vec::new();
     if let Some(row) = captured {
         if ctx.is_visible(&row.tenant_id, row.visibility) {
@@ -2858,10 +2864,16 @@ pub fn execute_insert_returning(
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
+    // codex-review Low 指摘（PR #873）対応: `column_meta` は `projection`・
+    // `schema` のみに依存する純粋な計算（redb I/O を伴わない）であり、
+    // `returning_bug`（`XX000`）以外で失敗しない。書き込み（commit 境界）の
+    // *前* に呼ぶことで、投影メタデータの構築失敗が「書き込みは成功したのに
+    // エラー応答を返す」（commit 成功境界後の失敗）経路に紛れ込むのを防ぐ。
+    let columns = crate::sql::returning::column_meta(returning, schema)?;
+
     let insert_outcome =
         execute_insert_batch_with_schema(storage, ctx, bounds, ledger_mode, Some(schema))?;
 
-    let columns = crate::sql::returning::column_meta(returning, schema)?;
     let is_visible = ctx.is_visible(ctx.tenant_id(), crate::storage::Visibility::Private);
     let mut rows = Vec::new();
     if is_visible {
