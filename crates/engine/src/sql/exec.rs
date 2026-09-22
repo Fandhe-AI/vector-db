@@ -2631,6 +2631,22 @@ pub fn execute_delete(
 /// 実際に削除した件数のまま変えない（[`ReturningOutcome`] のドキュメント
 /// 参照）。`schema` は呼び出し元が束縛した時点のスキーマで、`tenant.rs` の
 /// TOCTOU 対策（束縛後・削除実行前のスキーマ変更検出）に使われる。
+///
+/// **投影は commit 前・同一トランザクション内で行う（codex-review P1 指摘・
+/// PR #991 対応）**: [`execute_insert_returning`] は書き込み予定値
+/// （`bounds[*].values`）が呼び出し前から既知なので `column_meta`・
+/// `project_row` を書き込みより先に呼べるが、DELETE の場合は捕捉行の実体
+/// （`CapturedRow::values`）が `tenant::delete_row_ledgered_capturing_unchecked`
+/// の write トランザクション内でしか得られない。そこで `project_row`
+/// （文字列・ベクトルの `try_reserve_exact` 失敗や結果容量超過で失敗しうる）
+/// は `project` コールバックとして渡し、`tenant::delete_row_impl` に
+/// **commit の前**に呼ばせる（`tenant.rs` の `project` ドキュメント参照）。
+/// これにより、投影の失敗は `write_txn` の abort（行削除・台帳追記ともに
+/// 破棄）を伴うため、「DELETE は失敗応答なのに行は既に永続化されている」と
+/// いう commit 成功境界違反が起きない——旧実装は commit 後に `project_row` を
+/// 呼んでいたため、この違反が起こり得た。`column_meta` 自体は `projection`・
+/// `schema` のみに依存する純粋な計算（redb I/O を伴わない）であり、書き込み
+/// より前に呼んでも同じ理由で安全なため従来どおり先に呼ぶ。
 pub fn execute_delete_returning(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
@@ -2643,20 +2659,40 @@ pub fn execute_delete_returning(
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
-    // codex-review Low 指摘（PR #873）対応: `column_meta` は `projection`・
-    // `schema` のみに依存する純粋な計算（redb I/O を伴わない）であり、
-    // `returning_bug`（`XX000`）以外で失敗しない。書き込み（commit 境界）の
-    // *前* に呼ぶことで、投影メタデータの構築失敗が「書き込みは成功したのに
-    // エラー応答を返す」（commit 成功境界後の失敗）経路に紛れ込むのを防ぐ。
     let columns = crate::sql::returning::column_meta(returning, schema)?;
 
-    let (outcome, captured) = crate::tenant::delete_row_ledgered_capturing_unchecked(
+    // `project` コールバック（`tenant::delete_row_impl` が commit 前に呼ぶ）の
+    // 結果をここへ書き戻す。クロージャは `FnMut` のため 1 回しか呼ばれない
+    // 前提でも所有権を返せず、外側の可変変数へ書き込む形にする。
+    let mut projected_row: Option<ResultRow> = None;
+    let mut budget = 0usize;
+    let mut project =
+        |row: &crate::tenant::CapturedRow| -> Result<(), crate::tenant::TenantWriteError> {
+            if !ctx.is_visible(&row.tenant_id, row.visibility) {
+                return Ok(());
+            }
+            match crate::sql::returning::project_row(row.id, &row.values, returning, &mut budget) {
+                Ok(result_row) => {
+                    projected_row = Some(result_row);
+                    Ok(())
+                }
+                Err(SqlSurfaceError::PayloadTooLarge { detail }) => {
+                    Err(crate::tenant::TenantWriteError::ReturningProjectionTooLarge(detail))
+                }
+                Err(other) => Err(crate::tenant::TenantWriteError::ReturningProjectionFailed(
+                    other.to_string(),
+                )),
+            }
+        };
+
+    let (outcome, _captured) = crate::tenant::delete_row_ledgered_capturing_unchecked(
         storage,
         &bound.table,
         ctx,
         bound.id,
         ledger_write,
         Some(schema),
+        Some(&mut project),
     )
     .map_err(map_insert_write_error)?;
 
@@ -2666,16 +2702,8 @@ pub fn execute_delete_returning(
     };
 
     let mut rows = Vec::new();
-    if let Some(row) = captured {
-        if ctx.is_visible(&row.tenant_id, row.visibility) {
-            let mut budget = 0usize;
-            rows.push(crate::sql::returning::project_row(
-                row.id,
-                &row.values,
-                returning,
-                &mut budget,
-            )?);
-        }
+    if let Some(row) = projected_row {
+        rows.push(row);
     }
 
     Ok(ReturningOutcome {
@@ -2714,6 +2742,18 @@ fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError
         // 判別できなくなる。
         TenantWriteError::DuplicateOperationId => SqlSurfaceError::DuplicateOperationId,
         TenantWriteError::OperationIdContentMismatch => SqlSurfaceError::OperationIdContentMismatch,
+        // `RETURNING` 句（Issue #873・SQL-21）の捕捉行投影が容量上限超過で失敗した
+        // （[`execute_delete_returning`] の `project` コールバック。commit **前**に
+        // 検出し `write_txn` を abort させる設計のため、この写像に到達する時点で
+        // 削除は永続化されていない）。`_` 節（`XX000`）へ丸めると `54000` を失う。
+        TenantWriteError::ReturningProjectionTooLarge(_) => {
+            SqlSurfaceError::payload_too_large("RETURNING result exceeds capacity")
+        }
+        // 同じく commit 前 abort の内部事象版（型不整合等。untrusted 入力起因では
+        // ないため `XX000`。`_` 節と同じ分類だが意図を明示する）。
+        TenantWriteError::ReturningProjectionFailed(_) => SqlSurfaceError::Internal {
+            detail: "RETURNING projection failed".to_string(),
+        },
         TenantWriteError::Catalog(CatalogError::TableNotFound(name)) => {
             SqlSurfaceError::UndefinedTable { name }
         }
@@ -2870,9 +2910,12 @@ pub fn execute_insert_returning(
     // 伴わない）であり、`returning_bug`／`54000`（バイト予算超過）以外では
     // 失敗しない。書き込み（commit 境界）の *前* に呼ぶことで、投影の構築
     // 失敗が「書き込みは成功したのにエラー応答を返す」（commit 成功境界後の
-    // 失敗）経路に紛れ込むのを防ぐ（[`execute_delete_returning`] は削除前の
-    // 行内容をトランザクション内で捕捉する必要があるため同じ並べ替えができ
-    // ない。ドキュメント参照）。
+    // 失敗）経路に紛れ込むのを防ぐ（[`execute_delete_returning`] は捕捉行の
+    // 実体が write トランザクション内でしか得られないため `project_row` を
+    // 書き込みより前には呼べず、`tenant::delete_row_impl` の `project`
+    // コールバックとして commit の**前**（トランザクション内）に呼ばせる、
+    // 同じ目的の別経路を使う。codex-review P1 指摘・PR #991 対応。
+    // ドキュメント参照）。
     let columns = crate::sql::returning::column_meta(returning, schema)?;
     let is_visible = ctx.is_visible(ctx.tenant_id(), crate::storage::Visibility::Private);
     let mut rows = Vec::new();

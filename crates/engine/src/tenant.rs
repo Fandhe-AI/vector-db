@@ -297,6 +297,20 @@ pub enum TenantWriteError {
     /// （TASK-101・RECOVER-10）。commit 済み確定の根拠にしない fail-closed 判定
     /// （`22023`）。行内容・テナント・他テナントの存在情報は含まない。
     OperationIdContentMismatch,
+    /// `RETURNING` 句（Issue #873・SQL-21）向けの捕捉行投影（呼び出し元が
+    /// [`delete_row_impl`] の `project` コールバックへ渡す処理。実体は
+    /// `sql::returning::project_row` の `SqlSurfaceError::Internal`）が失敗した
+    /// （型不整合・実装バグ検出等、untrusted 入力起因ではない事象）。
+    /// **write トランザクションが commit される前**にこの `Err` を返すことで
+    /// `write_txn` を drop・abort させ、「削除は永続化されたのにエラー応答」
+    /// という commit 成功境界違反（codex-review P1 指摘・PR #991）を防ぐ。
+    /// `XX000`（内部事象）へ写像する。
+    ReturningProjectionFailed(String),
+    /// 上記と同じ commit 前 abort 契約だが、原因が `RETURNING` 結果セットの
+    /// バイト量上限超過（`sql::returning::MAX_RETURNING_RESULT_BYTES`）である
+    /// 場合の専用 variant。`54000`（`PayloadTooLarge`）へ写像し、クライアントが
+    /// 内部事象（`XX000`）と取り違えないようにする。
+    ReturningProjectionTooLarge(String),
 }
 
 impl TenantWriteError {
@@ -326,6 +340,8 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             | TenantWriteError::Storage(_)
             | TenantWriteError::LedgerCorrupted(_) => ErrorClass::InternalError,
             TenantWriteError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
+            TenantWriteError::ReturningProjectionFailed(_) => ErrorClass::InternalError,
+            TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,
         }
     }
 
@@ -360,6 +376,12 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::OperationIdContentMismatch => {
                 write!(f, "operation_id already recorded with different content")
             }
+            TenantWriteError::ReturningProjectionFailed(_) => {
+                write!(f, "tenant write returning projection failed")
+            }
+            TenantWriteError::ReturningProjectionTooLarge(_) => {
+                write!(f, "tenant write returning projection exceeds capacity")
+            }
         }
     }
 }
@@ -380,6 +402,12 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::LedgerCorrupted(_) => f.write_str("LedgerCorrupted(<redacted>)"),
             TenantWriteError::OperationIdContentMismatch => {
                 f.write_str("OperationIdContentMismatch")
+            }
+            TenantWriteError::ReturningProjectionFailed(_) => {
+                f.write_str("ReturningProjectionFailed(<redacted>)")
+            }
+            TenantWriteError::ReturningProjectionTooLarge(_) => {
+                f.write_str("ReturningProjectionTooLarge(<redacted>)")
             }
         }
     }
@@ -1251,14 +1279,56 @@ pub(crate) struct CapturedRow {
 /// [`delete_row_unchecked`]・[`delete_row_ledgered_unchecked`] のドキュメント
 /// 参照）。
 ///
-/// `capture`（Issue #873・SQL-21。`RETURNING` 句）: `Some(expected_schema)` の
-/// 場合のみ、`row_table.remove` の**直前**に対象行を完全デコードして
-/// [`CapturedRow`] として返す（削除前の値）。`expected_schema` は
+/// [`DeleteCapture::project`] の関数型（clippy::type_complexity 対応で型別名化）。
+type ReturningProjectFn<'a> = dyn FnMut(&CapturedRow) -> Result<(), TenantWriteError> + 'a;
+
+/// `delete_row_impl` の `capture` 引数（Issue #991・clippy::too_many_arguments
+/// 対応で `capture`・`project` の 2 引数を 1 引数へ集約。両者は常に一緒に使う
+/// ——`project` は `capture` が捕捉した行にしか適用できないため）。
+struct DeleteCapture<'a> {
+    /// [`delete_row_impl`] の `capture` ドキュメント参照（束縛時スキーマ）。
+    schema: &'a crate::catalog::TableSchema,
+    /// [`delete_row_impl`] の `project` ドキュメント参照（commit 前フック）。
+    /// `None` は「捕捉のみ行い投影しない」（現状の呼び出し元では未使用だが、
+    /// `capture: Some` かつ `project: None` を表現できるよう分離しておく）。
+    project: Option<&'a mut ReturningProjectFn<'a>>,
+}
+
+/// [`delete_row_unchecked`]・[`delete_row_ledgered_unchecked`] が共有する実体。
+/// `not_found_ledger` で `NotFound` 時の台帳追記の扱いのみを分岐する
+/// （それ以外の判定順序・二重防御はいずれのモードでも同一）。
+///
+/// `ledger`（TASK-93・RECOVER-2、TASK-94・RECOVER-3、TASK-101・RECOVER-10）:
+/// 台帳照合・追記を所有権判定（`owns_existing`）より**前**に行う（両モード共通。
+/// [`delete_row_unchecked`]・[`delete_row_ledgered_unchecked`] のドキュメント
+/// 参照）。
+///
+/// `capture`（Issue #873・SQL-21。`RETURNING` 句）: `Some(DeleteCapture {
+/// schema, .. })` の場合のみ、`row_table.remove` の**直前**に対象行を完全
+/// デコードして [`CapturedRow`] として返す（削除前の値）。`schema` は
 /// [`insert_typed_row_unchecked`] の `expected_schema` と同じ TOCTOU 対策——
 /// 呼び出し元が束縛した時点のスキーマと、本関数が write トランザクション内で
 /// 改めて取得したスキーマが不一致なら `CatalogError::Invalid`（`22000`）で
 /// 拒否する。`None`（既存の 2 呼び出し元）では捕捉を一切行わずビット同一の
 /// 挙動を保つ。
+///
+/// `capture.project`（Issue #991・codex-review P1 指摘対応）: 実際に行を
+/// 捕捉できた場合（対象行を削除できた場合のみ）、**`bump_table_generation_in_txn`・
+/// `commit_boundary::commit` の呼び出しより前**に 1 回だけ呼ぶコールバック。
+/// `RETURNING` 行の投影（`sql::returning::project_row`。文字列・ベクトルの
+/// `try_reserve_exact` 失敗や結果容量超過で失敗しうる）を、行削除・台帳追記の
+/// **commit 成功境界の内側**で行わせるための注入点——`Err` を返すと本関数は
+/// その `Err`（[`TenantWriteError::ReturningProjectionFailed`]／
+/// [`TenantWriteError::ReturningProjectionTooLarge`] を想定）をそのまま伝播し、
+/// `write_txn` は commit されずに drop（abort）される。これにより「DELETE は
+/// 失敗応答なのに行は既に永続化されている」という commit 成功境界違反
+/// （RECOVER-5・RECOVER-6・TASK-96/97 の一貫性契約）を防ぐ——`sql::returning`
+/// 側（呼び出し元）が確定させた列メタデータ（`column_meta`）は redb I/O を
+/// 伴わない純粋計算のため書き込み**前**に呼べるが（[`crate::sql::exec::
+/// execute_delete_returning`] 参照）、行の値そのもの（`CapturedRow::values`）は
+/// この write トランザクション内でしか得られないため、投影自体を同じ
+/// トランザクション内・commit 前に実行する必要がある。`None`（既存呼び出し元）
+/// では一切呼ばずビット同一の挙動を保つ。
 fn delete_row_impl(
     storage: &Storage,
     table: &str,
@@ -1266,7 +1336,7 @@ fn delete_row_impl(
     id: u64,
     ledger_write: LedgerWrite<'_>,
     not_found_ledger: DeleteNotFoundLedger,
-    capture: Option<&crate::catalog::TableSchema>,
+    mut capture: Option<DeleteCapture<'_>>,
 ) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     validate_identifier(table)?;
     let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
@@ -1276,8 +1346,8 @@ fn delete_row_impl(
             // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
             // `insert_row`/`update_row` と同じ前段を通す。
             let schema = require_table_schema_write(&write_txn, table)?;
-            if let Some(expected) = capture {
-                if expected != &schema {
+            if let Some(expected) = capture.as_ref() {
+                if expected.schema != &schema {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                         "table schema changed after the delete was bound".to_string(),
                     )));
@@ -1361,6 +1431,19 @@ fn delete_row_impl(
             }
             owns_existing
         };
+    // `project` は commit **前**・`row_table`（可変借用）が上記ブロックの終端で
+    // 既に解放された後に呼ぶ（`delete_row_impl` ドキュメントの `project` 節参照）。
+    // `captured_row` が `Some` になるのは `owns_existing && capture.is_some()` の
+    // 場合のみ（上記ブロック参照）であり、`project` が `Some` でも対象行を実際に
+    // 削除できなかった場合（`NotFound`）は呼ばない——`RETURNING` は削除できた行
+    // のみを返す契約（[`crate::sql::exec::execute_delete_returning`] ドキュメント
+    // 参照）。
+    if let (Some(project), Some(captured)) = (
+        capture.as_mut().and_then(|c| c.project.as_mut()),
+        captured_row.as_ref(),
+    ) {
+        project(captured)?;
+    }
     if owns_existing {
         crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     }
@@ -1410,22 +1493,26 @@ pub(crate) fn delete_row_ledgered_unchecked(
     id: u64,
     ledger_write: LedgerWrite<'_>,
 ) -> Result<DeleteRowOutcome, TenantWriteError> {
-    delete_row_ledgered_capturing_unchecked(storage, table, ctx, id, ledger_write, None)
+    delete_row_ledgered_capturing_unchecked(storage, table, ctx, id, ledger_write, None, None)
         .map(|(outcome, _)| outcome)
 }
 
 /// [`delete_row_ledgered_unchecked`] の捕捉版（Issue #873・SQL-21。`RETURNING`
 /// 句）。`capture`（束縛時スキーマ）が `Some` の場合のみ削除前の行内容を
 /// [`CapturedRow`] として返す（[`delete_row_impl`] の `capture` ドキュメント
-/// 参照）。`sql::exec::execute_delete_returning` の唯一の到達経路。
-/// `capture: None` を渡すと [`delete_row_ledgered_unchecked`] とビット同一。
-pub(crate) fn delete_row_ledgered_capturing_unchecked(
+/// 参照）。`project`（Issue #991）は [`delete_row_impl`] の同名引数へそのまま
+/// 委譲する（commit 前・同一トランザクション内で `RETURNING` 行を投影させる
+/// ための注入点。`delete_row_impl` ドキュメント参照）。`sql::exec::
+/// execute_delete_returning` の唯一の到達経路。`capture: None`・`project: None`
+/// を渡すと [`delete_row_ledgered_unchecked`] とビット同一。
+pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
     ledger_write: LedgerWrite<'_>,
-    capture: Option<&crate::catalog::TableSchema>,
+    capture: Option<&'a crate::catalog::TableSchema>,
+    project: Option<&'a mut ReturningProjectFn<'a>>,
 ) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     delete_row_impl(
         storage,
@@ -1434,7 +1521,7 @@ pub(crate) fn delete_row_ledgered_capturing_unchecked(
         id,
         ledger_write,
         DeleteNotFoundLedger::Record,
-        capture,
+        capture.map(|schema| DeleteCapture { schema, project }),
     )
 }
 
@@ -2883,6 +2970,105 @@ mod tests {
                 .iter()
                 .all(|r| r.id != 2),
             "内容不一致で拒否された書き込みは id=2 の行を残してはならない"
+        );
+    }
+
+    /// `RETURNING` の投影コールバック（`delete_row_impl` の `project`。Issue #991・
+    /// codex-review P1 指摘対応）が `Err` を返した場合に、行削除・台帳追記の
+    /// **どちらも commit されない**（`write_txn` が abort される）ことを固定する。
+    /// 修正前は `project_row` を commit **後**に呼んでいたため、この `Err` は
+    /// 「DELETE は失敗応答なのに行は既に永続化されている」という commit
+    /// 成功境界違反を起こし得た。
+    #[test]
+    fn delete_row_impl_aborts_commit_when_project_callback_fails() {
+        let path = unique_db_path("delete-project-abort");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema("docs");
+        storage.create_table(&schema).expect("create table");
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let insert_op_id = OperationId::parse("test-op-insert").expect("valid operation_id");
+        insert_row(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 0.0],
+                metadata: &[],
+            },
+            &insert_op_id,
+        )
+        .expect("seed row");
+
+        // 削除の operation_id は挿入と別にする（同一 op_id を使い回すと台帳の
+        // 内容照合（TASK-101・RECOVER-10）が `for_insert` と `for_delete` の
+        // ハッシュ不一致で `OperationIdContentMismatch` を返してしまい、本テストが
+        // 検証したい「project コールバック失敗による abort」を確認できないため）。
+        let delete_op_id = OperationId::parse("test-op-delete").expect("valid operation_id");
+        let ledger_write = LedgerMode::Ledgered
+            .resolve(Some(&delete_op_id))
+            .expect("resolve ledger write");
+        let mut project = |_: &CapturedRow| -> Result<(), TenantWriteError> {
+            Err(TenantWriteError::ReturningProjectionFailed(
+                "forced failure for test".to_string(),
+            ))
+        };
+        let result = delete_row_ledgered_capturing_unchecked(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            ledger_write,
+            Some(&schema),
+            Some(&mut project),
+        );
+        assert!(
+            matches!(result, Err(TenantWriteError::ReturningProjectionFailed(_))),
+            "project コールバックの Err はそのまま伝播するべき: {result:?}"
+        );
+
+        // 行削除は commit されず、行はまだ存在する。
+        assert!(
+            visible_rows(&storage, "docs", &ctx)
+                .expect("visible_rows")
+                .iter()
+                .any(|r| r.id == 1),
+            "project コールバック失敗時、行 id=1 は削除されてはならない \
+             （commit 成功境界違反の防止）"
+        );
+
+        // 台帳への tentative 追記も commit されていないため、同一 operation_id を
+        // 再送すると DuplicateOperationId/OperationIdContentMismatch ではなく
+        // 通常の削除として成功する（1 回目が commit されていた場合、この 2 回目は
+        // Record モードの「NotFound でも台帳を commit する」契約により
+        // DuplicateOperationId になってしまうはずの操作）。
+        let ledger_write2 = LedgerMode::Ledgered
+            .resolve(Some(&delete_op_id))
+            .expect("resolve ledger write");
+        let retry = delete_row_ledgered_capturing_unchecked(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            ledger_write2,
+            None,
+            None,
+        );
+        assert!(
+            matches!(retry, Ok((DeleteRowOutcome::Deleted, None))),
+            "project 失敗で abort された操作の operation_id は台帳に残ってはならず、\
+             同一 operation_id での再送は通常の削除として成功するべき: {retry:?}"
+        );
+        assert!(
+            visible_rows(&storage, "docs", &ctx)
+                .expect("visible_rows")
+                .iter()
+                .all(|r| r.id != 1),
+            "2 回目の削除は正常に commit され行 id=1 を削除するべき"
         );
     }
 }

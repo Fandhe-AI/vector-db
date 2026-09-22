@@ -67,6 +67,17 @@ DELETE FROM <table> WHERE id = <n>
 - `sql::returning` モジュールが投影（`column_meta`・`project_row`）を担う。
   `SELECT` の投影束縛規則（実カラム優先・疑似列 `id`）をそのまま再利用し、
   第 2 の投影実装を作らない。
+- **commit 成功境界（codex-review P1 指摘・PR #991 対応）**: `DELETE` の
+  `project_row`（文字列・ベクトルの `try_reserve_exact` 失敗や結果容量超過
+  で失敗しうる）は、捕捉行の実体が write トランザクション内でしか得られない
+  ため `column_meta` と違って書き込みより前には呼べない。旧実装は commit
+  **後**に呼んでいたため、投影失敗時に「DELETE は失敗応答なのに行は既に
+  永続化されている」という一貫性違反が起こり得た。修正後は `tenant::
+  delete_row_impl` に `project` コールバックとして渡し、行削除・台帳追記と
+  **同じ write トランザクション内・commit の直前**に呼ばせる——投影が
+  失敗すれば `write_txn` は commit されず abort されるため、削除も台帳追記
+  も一切永続化されない。`INSERT` は書き込み予定値が呼び出し前から既知の
+  ため引き続き書き込みより前に投影する（対称ではない別経路）。
 
 ## RLS 再判定（多層防御）
 

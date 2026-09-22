@@ -37,6 +37,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::LedgerCorrupted(_) => ErrorClass::InternalError,
         TenantWriteError::DuplicateOperationId => ErrorClass::UniqueViolation,
         TenantWriteError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
+        TenantWriteError::ReturningProjectionFailed(_) => ErrorClass::InternalError,
+        TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,
     }
 }
 
@@ -54,6 +56,8 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
         TenantWriteError::MissingOperationId,
         TenantWriteError::DuplicateOperationId,
         TenantWriteError::OperationIdContentMismatch,
+        TenantWriteError::ReturningProjectionFailed("test".to_string()),
+        TenantWriteError::ReturningProjectionTooLarge("test".to_string()),
     ];
     for case in &cases {
         assert_eq!(
