@@ -151,3 +151,25 @@
   未実装のまま（`insert` は HTTP 表層で初めて到達可能になる書き込み op。
   production では RECOVER-8 の panic hook が先に abort するため、緊急応答が
   未実装でも「サイレントな接続断」に留まり応答一意性そのものは損なわれない）
+
+## SQL-16 結線後の更新（Issue #863）
+
+SQL 表層へ複数行 `VALUES (...), (...)`（SQL-16・TASK-190・PR #978）が結線され、
+`core::EngineCore::execute_insert_form` の `RowBatch` 分岐が本ファイルの
+`execute_insert_batch_with_schema` を NoSQL 表層 `rows[]` と共有するように
+なった。上記「③④は SQL 表層に複数行 `INSERT` 構文が無いため…」の記述は
+SQL-16 結線前（Issue #771〜#773 時点）の状態を指すものであり、現在は以下の
+とおり更新する。
+
+- ②③④（1 行あたり・バッチ合計のバイト量・チャンク総量）は共有 Rust 入口
+  （`execute_insert_batch_with_schema`）に対する一致に加えて、SQL 表層の
+  複数行 `VALUES` 文そのものとの一致も主張できる。SQL 経路固有の②④テストは
+  `crates/engine/tests/insert_multi_row.rs` が担う（③は同ファイルの既存
+  テストが検証済み）。
+- SQL 複数行 `VALUES` ⇄ HTTP `rows[]` の再送判定パリティ（同一内容
+  `23505`・内容不一致 `22023`。両方向）は
+  `crates/wire-server/tests/nosql6_insert.rs` の
+  `sql_multi_row_then_http_rows_*`／`http_rows_then_sql_multi_row_*` が固定する。
+- SQL 表層固有の受入基準（行順保持・ファイル形との非併用〔`42601`〕・
+  1 文あたり行数上限・単一行の既存挙動不変・台帳キー空間の共有）は
+  `docs/design/sql-multi-row-insert.md` を参照。
