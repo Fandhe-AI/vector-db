@@ -105,7 +105,9 @@ DELETE FROM <table> WHERE <predicates> USING OPERATION_ID '<id>'
 `ValidatedPredicateDelete::where_predicates` は `AND` 結合の宣言順を保持し
 **並べ替えない**（`ValidatedUpdate::assignments` と同じ判断）。複数行変更の
 `operation_id` 内容照合ハッシュ（Issue #868 の担当）が「正規化した文」を入力と
-する場合、その情報源はこの宣言順そのものになる。
+する場合、その情報源はこの宣言順そのものになる。ハッシュ入力レイアウト・
+実行時の記録順序・原子性契約は `docs/design/multi-row-dml-operation-id.md`
+（Issue #868・ステータス Proposed）に記載。
 
 ## 対象外（本 Issue の範囲外）
 
