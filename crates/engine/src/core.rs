@@ -3861,6 +3861,30 @@ impl EngineCore {
                     self.ledger_mode,
                 )
             }
+            // `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・
+            // TASK-193、Issue #872）。複数行 `VALUES` を伴う UPSERT にも
+            // `RowBatch` 分岐と同じ INDEX-4 上限（①行数・②③④バイト量・
+            // チャンク総量）を適用する（SQL/NoSQL 機能パリティの方針を UPSERT
+            // にも揃える）。
+            crate::sql::parser::BoundInsertForm::Upsert(bound) => {
+                if bound.rows.len() > self.batch_limits.max_files_per_batch {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                        crate::batch_limits::BatchLimitsError::TooManyFiles {
+                            count: bound.rows.len(),
+                            max: self.batch_limits.max_files_per_batch,
+                        }
+                        .to_string(),
+                    ));
+                }
+                self.validate_insert_batch_byte_and_chunk_limits(&bound.rows)?;
+                crate::sql::exec::execute_upsert(
+                    &self.storage,
+                    ctx,
+                    &bound,
+                    self.ledger_mode,
+                    &schema,
+                )
+            }
         }
     }
 
@@ -4094,9 +4118,14 @@ impl EngineCore {
                 }
                 // 行形が 1 件でも混在した場合は黙って行形として処理せず拒否する
                 // （「複数ファイルのバッチ投入」という本メソッドの契約を維持する。
-                // 単一行・複数行 VALUES〔SQL-16、TASK-190〕のいずれも同じ扱い）。
+                // 単一行・複数行 VALUES〔SQL-16、TASK-190〕・UPSERT〔SQL-20・
+                // TASK-193、Issue #872。`bind_insert_form` がファイル形との
+                // 併用〔`ON CONFLICT` かつ `path`/`body` 列指定〕を既に `42601`
+                // で拒否しているため、ここへ到達する `Upsert` は必ず行形相当〕の
+                // いずれも同じ扱い）。
                 crate::sql::parser::BoundInsertForm::Row(_)
-                | crate::sql::parser::BoundInsertForm::RowBatch(_) => {
+                | crate::sql::parser::BoundInsertForm::RowBatch(_)
+                | crate::sql::parser::BoundInsertForm::Upsert(_) => {
                     return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
                         "INSERT batch requires every statement to be file-form (path/body columns)",
                     ));
