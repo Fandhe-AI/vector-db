@@ -18,7 +18,7 @@ use crate::catalog::{ColumnType, TableSchema};
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
     FunctionArg, InsertLiteral, OrderByForm, Projection, ValidatedDelete, ValidatedInsert,
-    ValidatedStatement, WherePredicate,
+    ValidatedPredicateDelete, ValidatedStatement, WherePredicate,
 };
 use crate::sql::plan::EvaluationOrder;
 use crate::sql::udf_call::Expr;
@@ -813,6 +813,134 @@ pub fn bind_delete(stmt: &ValidatedDelete) -> Result<BoundDelete, SqlSurfaceErro
         table: stmt.table_name.clone(),
         id,
         operation_id: stmt.operation_id.clone(),
+    })
+}
+
+/// 述語つき `DELETE`／`UPDATE`（Issue #870・#869）が 1 文で変更してよい行数の
+/// 既定上限（本リポの実装既定値であり、spec 由来の数値ではない）。`INSERT` の
+/// `MAX_INSERT_ROWS_PER_STATEMENT`（`allowlist.rs`・private・1_000）と同じ
+/// 桁に揃える。実際の判定（[`check_affected_row_count`]）は変更開始前・
+/// 副作用ゼロの時点で呼ぶ実行結線（#871）の担当（本モジュールは上限値を
+/// [`BoundPredicateDelete::max_affected_rows`] として運搬するのみ）。
+pub const DEFAULT_MAX_DML_AFFECTED_ROWS: usize = 1_000;
+
+/// 影響行数 `count` が上限 `limit` を超えないことを検査する（Issue #870・#871
+/// が結線する実行時判定の共有ヘルパー）。超過は
+/// [`SqlSurfaceError::PayloadTooLarge`]（`54000`）。呼び出し元は書き込み開始前・
+/// 副作用ゼロの時点で本関数を呼ぶことで、上限超過を「変更を一部だけ適用して
+/// から中断」ではなく「一切変更しないまま拒否」にする契約を維持する。
+pub fn check_affected_row_count(count: usize, limit: usize) -> Result<(), SqlSurfaceError> {
+    if count > limit {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "DML affected row count {count} exceeds limit {limit}"
+        )));
+    }
+    Ok(())
+}
+
+/// 束縛済みの述語つき `DELETE ... WHERE` 文（Issue #870・TASK-192・SQL-19）。
+/// `BoundScan`（Issue #454）と同じく `WHERE` の意味論
+/// （`metadata_filters`／`expr_filters`）を共有し、第 2 の述語評価器を作らない。
+/// 実行結線（可視行列挙・1 トランザクション一括適用・影響行数上限の実測判定・
+/// 台帳照合）は #871 の担当（本 Issue の成果物は束縛済み実行計画までで、
+/// `core.rs`・`sql/exec.rs` の実行経路は変更しない）。
+///
+/// フィールドは `pub(crate)`（クレート外からの直読み・直書き不可。カプセル化の
+/// 方針は `BoundScan` と同じ）。クレート外からはアクセサーメソッド経由で読み取り、
+/// [`Self::new`] 経由で構築する（NoSQL 表層 `delete` op〔#875・#876・NOSQL-12〕が
+/// SQL テキストを経由せず直接構築する入口。`BoundScan::new` と同じ契約）。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct BoundPredicateDelete {
+    pub(crate) table: String,
+    pub(crate) metadata_filters: Vec<MetadataFilter>,
+    pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+    /// `expr_filters` をステップ列コンパイルした実行形（Issue #353 と同じ
+    /// 契約。`sql::expr_program` が `pub(crate) mod` のためクレート外に型を
+    /// 出せず、アクセサーは設けない。`BoundScan::expr_filter_programs` と
+    /// 同じ判断）。
+    pub(crate) expr_filter_programs: Vec<crate::sql::expr_program::ExprProgram>,
+    pub(crate) operation_id: Option<OperationId>,
+    /// 影響行数の上限（[`check_affected_row_count`] へ渡す運搬役。既定値は
+    /// [`DEFAULT_MAX_DML_AFFECTED_ROWS`]）。
+    pub(crate) max_affected_rows: usize,
+}
+
+impl BoundPredicateDelete {
+    /// クレート外から `BoundPredicateDelete` を直接構築する constructor
+    /// （NoSQL 表層 `delete` op〔#875・#876・NOSQL-12〕の入口。`BoundScan::new`
+    /// と同じ契約。`expr_filters` のステップ列コンパイルは内部で行う）。
+    pub fn new(
+        table: String,
+        metadata_filters: Vec<MetadataFilter>,
+        expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+        operation_id: Option<OperationId>,
+        max_affected_rows: usize,
+    ) -> Self {
+        let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
+        Self {
+            table,
+            metadata_filters,
+            expr_filters,
+            expr_filter_programs,
+            operation_id,
+            max_affected_rows,
+        }
+    }
+
+    /// 束縛対象のテーブル名。
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// SCALAR 段で適用するメタデータフィルタ一覧（等価・前方一致、TASK-147・EXT-3）。
+    pub fn metadata_filters(&self) -> &[MetadataFilter] {
+        &self.metadata_filters
+    }
+
+    /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済み。
+    pub fn expr_filters(&self) -> &[crate::sql::udf_call::BoundExpr] {
+        &self.expr_filters
+    }
+
+    /// 文末専用句で搬送された、検証済みの `operation_id`。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.operation_id.as_ref()
+    }
+
+    /// 影響行数の上限（[`check_affected_row_count`] へ渡す値）。
+    pub fn max_affected_rows(&self) -> usize {
+        self.max_affected_rows
+    }
+}
+
+/// [`ValidatedPredicateDelete`] を `schema`・UDF レジストリ `udfs` と照合して
+/// [`BoundPredicateDelete`] へ束縛する（Issue #870・TASK-192・SQL-19 の公開
+/// API）。`WHERE` の意味論は検索 SELECT（[`bind_in_session`]）・集計 SELECT
+/// （[`bind_aggregate`]）・広域取得（[`bind_scan`]）と共有する
+/// （[`bind_where_predicates`]。第 2 の述語評価器を作らない）。影響行数上限は
+/// 既定値（[`DEFAULT_MAX_DML_AFFECTED_ROWS`]）を保持するのみで、実際の判定
+/// （[`check_affected_row_count`]）は実行結線（#871）が変更開始前・副作用
+/// ゼロの時点で呼ぶ。
+pub fn bind_predicate_delete(
+    stmt: &ValidatedPredicateDelete,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundPredicateDelete, SqlSurfaceError> {
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+
+    let (metadata_filters, expr_filters, _rls_predicate_present) =
+        bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+
+    let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
+
+    Ok(BoundPredicateDelete {
+        table: stmt.table_name().to_string(),
+        metadata_filters,
+        expr_filters,
+        expr_filter_programs,
+        operation_id: stmt.operation_id().cloned(),
+        max_affected_rows: DEFAULT_MAX_DML_AFFECTED_ROWS,
     })
 }
 
@@ -2902,6 +3030,184 @@ mod tests {
         };
         let err = bind_delete(&stmt).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- bind_predicate_delete（述語つき DELETE、Issue #870・TASK-192・SQL-19） ---
+
+    fn bind_predicate_delete_sql(sql: &str) -> Result<BoundPredicateDelete, SqlSurfaceError> {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_delete_statement(
+            sql,
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+        let pd = match stmt {
+            crate::sql::allowlist::DeleteStatement::Predicate(pd) => pd,
+            crate::sql::allowlist::DeleteStatement::SingleRow(_) => {
+                panic!("must classify as predicate form")
+            }
+        };
+        bind_predicate_delete(
+            &pd,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+    }
+
+    #[test]
+    fn bind_predicate_delete_maps_equality_and_prefix_predicates_to_metadata_filters() {
+        let bound = bind_predicate_delete_sql(
+            "DELETE FROM documents WHERE lang = 'ja' AND body LIKE 'src/%' USING OPERATION_ID 'op-0001'",
+        )
+        .expect("bind_predicate_delete should succeed");
+        assert_eq!(bound.table, "documents");
+        assert_eq!(bound.metadata_filters.len(), 2);
+        assert!(bound.expr_filters.is_empty());
+        assert_eq!(
+            bound.operation_id.as_ref().map(OperationId::as_str),
+            Some("op-0001")
+        );
+        assert_eq!(bound.max_affected_rows, DEFAULT_MAX_DML_AFFECTED_ROWS);
+    }
+
+    #[test]
+    fn bind_predicate_delete_maps_comparison_predicate_to_expr_filters() {
+        let bound = bind_predicate_delete_sql(
+            "DELETE FROM documents WHERE id > 5 USING OPERATION_ID 'op-0001'",
+        )
+        .expect("bind_predicate_delete should succeed");
+        assert!(bound.metadata_filters.is_empty());
+        assert_eq!(bound.expr_filters.len(), 1);
+    }
+
+    #[test]
+    fn bind_predicate_delete_accepts_visible_predicate_without_producing_a_filter() {
+        let bound = bind_predicate_delete_sql(
+            "DELETE FROM documents WHERE visible() USING OPERATION_ID 'op-0001'",
+        )
+        .expect("bind_predicate_delete should succeed");
+        assert!(bound.metadata_filters.is_empty());
+        assert!(bound.expr_filters.is_empty());
+    }
+
+    #[test]
+    fn rejects_predicate_delete_unknown_column() {
+        let err = bind_predicate_delete_sql(
+            "DELETE FROM documents WHERE ghost = 'x' USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_predicate_delete_vector_column_predicate() {
+        let err = bind_predicate_delete_sql(
+            "DELETE FROM documents WHERE embedding = 'x' USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_predicate_delete_rejects_metadata_filter_count_over_limit() {
+        // 字句解析のトークン上限に先に当たらないよう、許可リストを直接構築する
+        // （`declarative_filter::check_filter_count_accepts_at_limit_and_rejects_over_limit`
+        // と同じ手法。`MAX_METADATA_FILTERS` = 256）。
+        let where_predicates: Vec<WherePredicate> = (0
+            ..=crate::declarative_filter::MAX_METADATA_FILTERS)
+            .map(|i| WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: format!("v{i}"),
+            })
+            .collect();
+        let stmt = ValidatedPredicateDelete {
+            table_name: "documents".to_string(),
+            where_predicates,
+            operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+        };
+        let err = bind_predicate_delete(
+            &stmt,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// R1: 同一述語・同一スキーマで `bind_predicate_delete` の
+    /// `metadata_filters`／`expr_filters` が `bind_scan`（広域取得、Issue #454）
+    /// のものと構造的に一致することを機械検証する（第 2 の述語評価器を作らない
+    /// 契約の固定）。
+    #[test]
+    fn bind_predicate_delete_matches_bind_scan_for_same_predicate_text() {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let predicate_text = "lang = 'ja' AND id > 5";
+
+        let delete_bound = bind_predicate_delete_sql(&format!(
+            "DELETE FROM documents WHERE {predicate_text} USING OPERATION_ID 'op-0001'"
+        ))
+        .expect("bind_predicate_delete should succeed");
+
+        let scan_stmt = match crate::sql::allowlist::validate_sql(
+            &format!("SELECT id FROM documents WHERE {predicate_text} LIMIT 1"),
+            &lookup,
+        )
+        .expect("SELECT ... LIMIT should be accepted as a scan statement")
+        {
+            crate::sql::allowlist::Statement::Scan(scan) => scan,
+            other => panic!("must classify as Statement::Scan, got {other:?}"),
+        };
+        let scan_bound = bind_scan(
+            &scan_stmt,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+        .expect("bind_scan should succeed");
+
+        assert_eq!(delete_bound.metadata_filters, scan_bound.metadata_filters);
+        assert_eq!(delete_bound.expr_filters, scan_bound.expr_filters);
+    }
+
+    // --- check_affected_row_count（Issue #870・#871 が結線する実行時判定の
+    // 共有ヘルパー。本 Issue の時点では呼び出し元が存在しないため、境界値
+    // （`count == limit` と `count == limit + 1`）を直接固定する） -------------
+
+    #[test]
+    fn check_affected_row_count_accepts_count_at_limit() {
+        assert!(check_affected_row_count(
+            DEFAULT_MAX_DML_AFFECTED_ROWS,
+            DEFAULT_MAX_DML_AFFECTED_ROWS
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn check_affected_row_count_rejects_count_over_limit_by_one() {
+        let err = check_affected_row_count(
+            DEFAULT_MAX_DML_AFFECTED_ROWS + 1,
+            DEFAULT_MAX_DML_AFFECTED_ROWS,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn check_affected_row_count_accepts_zero_count_against_zero_limit() {
+        // `limit == 0` は「一切変更を許さない」極端値。0 行の変更は許容される
+        // ことを固定する（`count > limit` の厳密な比較が境界で崩れていないか
+        // の確認）。
+        assert!(check_affected_row_count(0, 0).is_ok());
+    }
+
+    #[test]
+    fn check_affected_row_count_rejects_any_count_against_zero_limit() {
+        let err = check_affected_row_count(1, 0).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 
     // --- bind_update（SQL-17、TASK-191） ----------------------------------------
