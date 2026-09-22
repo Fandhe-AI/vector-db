@@ -1,16 +1,22 @@
-//! `POST /v1/query` の受理語彙（閉じた 4 値）を許可リストとして表現する
-//! モジュール（Issue #759・TASK-179。対象ビヘイビア NOSQL-1・NOSQL-9。
-//! ポインタ: `docs/spec/05-tasks.md` TASK-179・
-//! `docs/spec/04-behavior/nosql-surface.md` NOSQL-1・NOSQL-9）。
+//! `POST /v1/query` の受理語彙（閉じた 6 値）を許可リストとして表現する
+//! モジュール（Issue #759・TASK-179。`update`／`delete` 追加は Issue #875・
+//! NOSQL-12。対象ビヘイビア NOSQL-1・NOSQL-9・NOSQL-12。ポインタ:
+//! `docs/spec/05-tasks.md` TASK-179・`docs/spec/04-behavior/nosql-surface.md`
+//! NOSQL-1・NOSQL-9・NOSQL-12）。
 //!
 //! 責務境界: [`super::schema::extract_op`] が取り出した `op` 文字列を、
 //! [`Op::parse`] により **完全一致（大文字小文字・trim の読み替えなし）**
-//! でこの 4 値のいずれかへ分類する。これ以外の値（DDL・UDF 呼び出し・
-//! トランザクション制御・UPDATE／DELETE 相当・表記揺れをすべて含む）は
-//! [`UnsupportedOp`] として `ErrorClass::FeatureNotSupported`（`0A000`）へ
-//! fail-closed に写像する。この判定は SQL 表層の許可リスト検証
-//! （`engine::sql::allowlist`・SQL-8）と同じ設計原則（許可リスト方式。
-//! 「既知の未対応名」を列挙する拒否リストにしない）に従う。
+//! でこの 6 値のいずれかへ分類する。これ以外の値（DDL・UDF 呼び出し・
+//! トランザクション制御・表記揺れをすべて含む）は [`UnsupportedOp`] として
+//! `ErrorClass::FeatureNotSupported`（`0A000`）へ fail-closed に写像する。
+//! この判定は SQL 表層の許可リスト検証（`engine::sql::allowlist`・SQL-8）
+//! と同じ設計原則（許可リスト方式。「既知の未対応名」を列挙する拒否リストに
+//! しない）に従う。
+//!
+//! `update`／`delete` は語彙へ加わり許可リストは通過するが、実行結線
+//! （束縛・engine 呼び出し）は後続 Issue（#876）の担当であり、本モジュール
+//! 追加時点では [`super::gate::handle`] の明示アームから暫定応答
+//! （`0A000`／501）へ落ちる（実行器なしで成功を偽装しない）。
 //!
 //! [`super::schema::schema_for`] はこのモジュールの表引き（[`Op::schema`]）
 //! へ委譲し、`op` 名 → [`super::schema::ObjectSchema`] の対応表を単一情報源
@@ -22,19 +28,28 @@ use super::schema::ObjectSchema;
 
 /// `POST /v1/query` の `op` が取りうる閉じた語彙。
 ///
-/// この 4 値以外を表す variant を追加しない（許可リストの意味が崩れる）。
+/// この 6 値以外を表す variant を追加しない（許可リストの意味が崩れる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Search,
     Scan,
     Aggregate,
     Insert,
+    Update,
+    Delete,
 }
 
 impl Op {
     /// 全 variant（宣言順）。[`super::schema::OP_SCHEMAS`] と名前列が
     /// 順序込みで一致することをテストで固定する。
-    pub const ALL: [Op; 4] = [Op::Search, Op::Scan, Op::Aggregate, Op::Insert];
+    pub const ALL: [Op; 6] = [
+        Op::Search,
+        Op::Scan,
+        Op::Aggregate,
+        Op::Insert,
+        Op::Update,
+        Op::Delete,
+    ];
 
     /// `raw` を語彙へ分類する。完全一致のみ（大文字小文字の読み替え・
     /// 前後空白のトリムを行わない）。語彙外は `None`。
@@ -44,6 +59,8 @@ impl Op {
             "scan" => Some(Op::Scan),
             "aggregate" => Some(Op::Aggregate),
             "insert" => Some(Op::Insert),
+            "update" => Some(Op::Update),
+            "delete" => Some(Op::Delete),
             _ => None,
         }
     }
@@ -55,6 +72,8 @@ impl Op {
             Op::Scan => "scan",
             Op::Aggregate => "aggregate",
             Op::Insert => "insert",
+            Op::Update => "update",
+            Op::Delete => "delete",
         }
     }
 
@@ -66,6 +85,8 @@ impl Op {
             Op::Scan => &super::schema::SCAN_SCHEMA,
             Op::Aggregate => &super::schema::AGGREGATE_SCHEMA,
             Op::Insert => &super::schema::INSERT_SCHEMA,
+            Op::Update => &super::schema::UPDATE_SCHEMA,
+            Op::Delete => &super::schema::DELETE_SCHEMA,
         }
     }
 }
@@ -107,15 +128,17 @@ mod tests {
     use crate::http::query::schema::OP_SCHEMAS;
 
     #[test]
-    fn parse_accepts_exact_four_values() {
+    fn parse_accepts_exact_six_values() {
         assert_eq!(Op::parse("search"), Some(Op::Search));
         assert_eq!(Op::parse("scan"), Some(Op::Scan));
         assert_eq!(Op::parse("aggregate"), Some(Op::Aggregate));
         assert_eq!(Op::parse("insert"), Some(Op::Insert));
+        assert_eq!(Op::parse("update"), Some(Op::Update));
+        assert_eq!(Op::parse("delete"), Some(Op::Delete));
     }
 
     #[test]
-    fn parse_rejects_vocabulary_outside_four_values() {
+    fn parse_rejects_vocabulary_outside_six_values() {
         let negatives = [
             "",
             " search",
@@ -132,9 +155,17 @@ mod tests {
             "begin",
             "commit",
             "rollback",
-            "update",
-            "delete",
             "set",
+            "UPDATE",
+            " update",
+            "update ",
+            "DELETE",
+            " delete",
+            "delete ",
+            "upsert",
+            "truncate",
+            "merge",
+            "patch",
         ];
         for raw in negatives {
             assert_eq!(Op::parse(raw), None, "unexpected accept for {raw:?}");

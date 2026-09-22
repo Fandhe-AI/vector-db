@@ -365,10 +365,14 @@ fn err4_b_schema_violation_projects_42601_to_400() {
 // 「語彙内だが未対応」の従来サブケース（aggregate の explain: true）は
 // NOSQL-10（Issue #765）の実装完了により `42601` へ写像されるようになり
 // 本クラスの例として成立しなくなったため撤去した（base ブランチ取り込みに
-// 伴う意味論変化。PR #832）。`engine` 未接続（`Router::new` 経由）時の
+// 伴う意味論変化。PR #832）。同じ理由で `delete` op も本クラスの fixture
+// から外した（Issue #875・NOSQL-12 で語彙へ加わったため、この fixture は
+// もう語彙外の例にならない。`engine` 未接続時の `update`／`delete` を含む
 // 全 op プレースホルダー応答は `crates/wire-server/src/http/query/gate.rs`
 // の単体テスト（`valid_scan_reaches_placeholder_response_when_engine_is_not_connected`
-// 等）で別途固定済み。
+// 等）で、`update`／`delete` の `engine` 接続済みでも placeholder に留まる
+// 契約は `valid_update_and_delete_reach_placeholder_even_when_engine_is_connected`
+// で別途固定済み）。
 
 #[test]
 fn err4_c_unsupported_op_projects_0a000_to_501() {
@@ -376,7 +380,7 @@ fn err4_c_unsupported_op_projects_0a000_to_501() {
     let addr = spawn(core);
 
     // 語彙外 op。
-    let resp = query_as_alice(addr, br#"{"op":"delete","table":"docs"}"#);
+    let resp = query_as_alice(addr, br#"{"op":"drop_table","table":"docs"}"#);
     assert_projected(&resp, "0A000");
 }
 

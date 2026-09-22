@@ -49,10 +49,12 @@
 //!   委譲する（Issue #761・NOSQL-7）。`query::response` は `search`／`scan`／
 //!   `aggregate` 成功時の `QueryResult` → JSON 応答本文（`columns`／`rows`／
 //!   `row_count`、`crate::result_encoder` と同じ型写像。Issue #762・
-//!   NOSQL-11）を担う。`query::op` は `op` 名を閉じた語彙 4 値（`search`／
-//!   `scan`／`aggregate`／`insert`）へ分類する許可リストで、語彙外
-//!   （DDL・UDF 呼び出し・トランザクション制御・UPDATE／DELETE 相当を含む）
-//!   を `0A000` へ写像する（Issue #759・TASK-179・NOSQL-1・NOSQL-9）。`query::insert`
+//!   NOSQL-11）を担う。`query::op` は `op` 名を閉じた語彙 6 値（`search`／
+//!   `scan`／`aggregate`／`insert`／`update`／`delete`）へ分類する許可リストで、
+//!   語彙外（DDL・UDF 呼び出し・トランザクション制御を含む）を `0A000` へ
+//!   写像する（Issue #759・TASK-179・NOSQL-1・NOSQL-9。`update`／`delete`
+//!   の追加は Issue #875・NOSQL-12。束縛・実行結線は Issue #876 の担当）。
+//!   `query::insert`
 //!   は `insert` op を `engine::sql::exec::execute_insert_batch`／
 //!   `EngineCore::execute_bound_insert_in_session` へ写像し、`operation_id` 必須化
 //!   （`23502`）・台帳照合による再送判定（`23505`／`22023`）・INDEX-4 上限
