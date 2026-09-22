@@ -2006,7 +2006,8 @@ impl EngineCore {
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
-                    | crate::sql::SqlOutcome::Insert(_) => {
+                    | crate::sql::SqlOutcome::Insert(_)
+                    | crate::sql::SqlOutcome::Truncate(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -2029,7 +2030,8 @@ impl EngineCore {
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
-                    | crate::sql::SqlOutcome::Insert(_) => {
+                    | crate::sql::SqlOutcome::Insert(_)
+                    | crate::sql::SqlOutcome::Truncate(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -2049,7 +2051,8 @@ impl EngineCore {
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
-                    | crate::sql::SqlOutcome::Insert(_) => {
+                    | crate::sql::SqlOutcome::Insert(_)
+                    | crate::sql::SqlOutcome::Truncate(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -2169,6 +2172,25 @@ impl EngineCore {
                 )?;
                 let outcome = self.execute_insert_form(ctx, &stmt, &lookup)?;
                 return Ok(crate::sql::SqlOutcome::Insert(outcome));
+            }
+
+            // TASK-195（SQL-22）: `INSERT` と同じ設計で `TRUNCATE` を覗き見判定する。
+            // `EXPLAIN TRUNCATE ...` は先頭トークンが `TRUNCATE` ではなく `EXPLAIN` に
+            // なるため、ここでは捕捉されず後続の `validate_sql` の `EXPLAIN` 分岐
+            // （次のトークンが `SELECT` であることを要求）へ流れて `42601` で拒否
+            // される（`INSERT` の既存コメント「Issue #485」節と同じ経路）。
+            let is_truncate_statement = matches!(
+                tokens.first(),
+                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("TRUNCATE")
+            );
+            if is_truncate_statement {
+                let stmt = crate::sql::allowlist::validate_truncate_tokens(
+                    &tokens,
+                    &self.storage,
+                    self.ledger_mode,
+                )?;
+                let outcome = self.execute_truncate_form(ctx, &stmt)?;
+                return Ok(crate::sql::SqlOutcome::Truncate(outcome));
             }
         }
 
@@ -3757,6 +3779,37 @@ impl EngineCore {
                 )
             }
         }
+    }
+
+    /// SQL 表層の単一 TRUNCATE 文実行エントリポイント（TASK-195、対象ビヘイビア:
+    /// SQL-22）。`execute_insert_sql` と同じ構造（`execute_sql`（TASK-75、SELECT
+    /// 専用）とは独立した固有メソッド。`VectorCore` trait への昇格は行わない）。
+    ///
+    /// `sql::allowlist::validate_truncate`（構造検証。文末専用句
+    /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
+    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
+    /// RECOVER-1）→ [`Self::execute_truncate_form`]（実行本体）の順に呼ぶ。
+    pub fn execute_truncate_sql(
+        &self,
+        ctx: &PolicyContext,
+        sql: &str,
+    ) -> Result<crate::sql::exec::TruncateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let stmt = crate::sql::allowlist::validate_truncate(sql, &self.storage, self.ledger_mode)?;
+        self.execute_truncate_form(ctx, &stmt)
+    }
+
+    /// [`Self::execute_truncate_sql`]・[`Self::execute_sql_in_session`] の
+    /// TRUNCATE 分岐が共有する実行本体（`execute_insert_form` と同じ設計）。
+    /// TRUNCATE はスキーマを参照しない（列単位の意味論検証を持たない）ため、
+    /// `execute_insert_form` の `InsertSchemaLookup` キャッシュに相当する仕組みは
+    /// 不要で、`sql::exec::execute_truncate` を直接呼ぶだけの薄い委譲になる。
+    fn execute_truncate_form(
+        &self,
+        ctx: &PolicyContext,
+        stmt: &crate::sql::allowlist::ValidatedTruncate,
+    ) -> Result<crate::sql::exec::TruncateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::exec::execute_truncate(&self.storage, ctx, stmt, self.ledger_mode)
     }
 
     /// SQL 表層のバッチ INSERT 実行エントリポイント（TASK-122、対象ビヘイビア:
