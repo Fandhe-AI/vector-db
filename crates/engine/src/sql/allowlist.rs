@@ -908,8 +908,10 @@ pub struct ValidatedInsert {
 ///
 /// 受理する形は `DELETE FROM <table> WHERE id = <number>
 /// USING OPERATION_ID '<id>' [;]` の単一行・`id` 等価指定形のみ（`id` 以外の
-/// 列に対する述語・`AND` 結合・`WHERE` 省略は許可リスト外。述語つき `DELETE`
-/// は別 Issue の管轄）。
+/// 列に対する述語・`AND` 結合・`WHERE` 省略は許可リスト外）。述語つき `DELETE`
+/// （`id` 以外の列・`AND` 結合を伴う `WHERE`）は [`ValidatedPredicateDelete`]・
+/// [`validate_delete_statement`] の管轄（Issue #870・TASK-192・SQL-19）。本型・
+/// [`validate_delete`] 自体の受理範囲はそちらの追加後も一切変わらない。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedDelete {
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。
@@ -922,6 +924,65 @@ pub struct ValidatedDelete {
     /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
     /// 開始前に `23502` で拒否するため、この構成では常に `Some`。
     pub operation_id: Option<OperationId>,
+}
+
+/// 許可形状の構造判定を通過した述語つき `DELETE ... WHERE` 文（Issue #870・
+/// TASK-192・SQL-19）。単一行・`id` 完全一致形（[`ValidatedDelete`]）とは別の
+/// 型として保持し、既存の `ValidatedDelete`／[`validate_delete`] の受理範囲・
+/// 挙動を一切変えない（[`DeleteStatement`] が両者を束ねる）。
+///
+/// 受理する述語形状は `SELECT`／集計／広域取得（scan）が共有する
+/// [`Parser::parse_where`]（等価・前方一致・`visible()`・式比較の `Vec<WherePredicate>`）
+/// そのものであり、第 2 の述語実装を持たない（R1: `sql::parser::bind_predicate_delete`
+/// が `sql::parser::bind_scan` と同じ [`sql::parser::bind_where_predicates`] を
+/// 共有する）。`WHERE` 句自体の省略は許可リスト外（[`Parser::parse_delete`] が
+/// `Keyword::Where` を必須とする）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedPredicateDelete {
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    pub(crate) table_name: String,
+    /// `WHERE` 句に含まれる述語（AND 結合の宣言順のまま保持し並べ替えない。
+    /// RECOVER-11（#868 の担当）の内容照合ハッシュが「正規化した文」を入力と
+    /// する際の情報源はこの宣言順そのもの。`ValidatedUpdate::assignments` と
+    /// 同じ判断）。
+    pub(crate) where_predicates: Vec<WherePredicate>,
+    /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
+    /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。[`validate_delete_statement`]
+    /// は `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
+    /// 開始前に `23502` で拒否するため、この構成では常に `Some`。
+    pub(crate) operation_id: Option<OperationId>,
+}
+
+impl ValidatedPredicateDelete {
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// `WHERE` 句に含まれる述語（AND 結合順・宣言順保持）。空にはならない
+    /// （空述語列は先読みにより単一行形と誤認しない限り [`ValidatedDelete`] 側
+    /// には落ちないが、`WHERE` 自体の省略は許可リスト外のため本型が構築される
+    /// 時点で `parse_where` は必ず 1 件以上を返す）。
+    pub fn where_predicates(&self) -> &[WherePredicate] {
+        &self.where_predicates
+    }
+
+    /// 文末専用句で搬送された、検証済みの `operation_id`。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.operation_id.as_ref()
+    }
+}
+
+/// [`validate_delete_statement`]（Issue #870・TASK-192・SQL-19 の公開 API）が
+/// 返す `DELETE` statement 種別。単一行・`id` 完全一致形（既存 SQL-18・
+/// [`ValidatedDelete`]）と述語形（[`ValidatedPredicateDelete`]）を束ねる。
+/// 実行結線（可視行列挙・1 トランザクション一括適用・影響行数上限の実測判定・
+/// 台帳照合）は #871 の担当（本 Issue の成果物は束縛済み実行計画までで、
+/// `core.rs`・`sql/exec.rs` の実行経路は変更しない）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteStatement {
+    SingleRow(ValidatedDelete),
+    Predicate(ValidatedPredicateDelete),
 }
 
 /// 許可形状の構造判定を通過した TRUNCATE 文（SQL-22、TASK-195）。テーブル定義
@@ -1793,33 +1854,65 @@ impl<'a> Parser<'a> {
         Ok(values)
     }
 
-    /// `DELETE FROM <table> WHERE id = <number> USING OPERATION_ID '<id>' [;]`
-    /// の単一行・`id` 指定形のみを受理する（SQL-18・TASK-191）。`WHERE` 句の
-    /// 省略・`id` 以外の列への述語・`AND` 結合・`=` 以外の比較演算子はいずれも
-    /// 許可リスト外として構造的に拒否する（述語つき `DELETE` は別 Issue の管轄。
-    /// 汎用 `parse_where` は意図的に再利用しない）。
+    /// `DELETE FROM <table> WHERE <where> USING OPERATION_ID '<id>' [;]` を
+    /// 受理する（SQL-18・TASK-191 の単一行・`id` 完全一致形、Issue #870・
+    /// TASK-192・SQL-19 の述語形の両方をここで構造判定する）。`WHERE` 句の
+    /// 省略は両形式共通で許可リスト外（`Keyword::Where` を必須とする）。
+    ///
+    /// `WHERE` 直後が [`Self::peek_single_row_delete_id`] に一致する場合
+    /// （`id = <number>` の直後が文末／`;`／`USING`）のみ [`ParsedDeleteWhere::RowId`]
+    /// とし、それ以外はすべて汎用 `WHERE` パーサー（[`Self::parse_where`]。
+    /// `SELECT`／集計／広域取得と共有）へ委譲して [`ParsedDeleteWhere::Predicates`]
+    /// とする。AST 分類ではなくこの狭いトークン先読みにすることで、単一行形
+    /// （[`ValidatedDelete`]）の受理範囲を SQL-18・TASK-191 の既存契約から
+    /// 1 バイトも広げない（`parse_where` は `id = 1` と `id = 1 AND ...` を
+    /// 区別なく式として正規化できてしまうため）。
     fn parse_delete(&mut self) -> Result<ParsedDeleteShape, SqlSurfaceError> {
         self.expect_contextual_keyword("DELETE")?;
         self.expect_keyword(Keyword::From)?;
         let table_name = self.expect_ident()?;
 
         self.expect_keyword(Keyword::Where)?;
-        let column = self.expect_ident()?;
-        if column != "id" {
-            return Err(SqlSurfaceError::unsupported(format!(
-                "DELETE WHERE clause must target the id pseudo-column, got {column:?}"
-            )));
-        }
-        self.expect_punct('=')?;
-        let id_literal = self.expect_number()?;
+
+        let where_clause = if self.peek_single_row_delete_id() {
+            self.advance(); // "id"
+            self.advance(); // '='
+            let id_literal = self.expect_number()?;
+            ParsedDeleteWhere::RowId { id_literal }
+        } else {
+            let predicates = self.parse_where()?;
+            ParsedDeleteWhere::Predicates(predicates)
+        };
 
         let operation_id = self.parse_operation_id_clause()?;
 
         Ok(ParsedDeleteShape {
             table_name,
-            id_literal,
+            where_clause,
             operation_id,
         })
+    }
+
+    /// `WHERE` 直後（消費前）が単一行・`id` 完全一致指定形（`id = <number>` の
+    /// 直後のトークンが文末／`;`／文脈的キーワード `USING`）かどうかを、
+    /// トークンを一切消費せずに判定する（Issue #870・§3.2）。添字アクセス
+    /// （`[]`）は使わず `self.tokens.get` のみで先読みする（untrusted 入力
+    /// 経由のパーサーの原則。`.claude/rules/coding-rust.md`）。
+    fn peek_single_row_delete_id(&self) -> bool {
+        let is_id_eq_number = matches!(
+            self.tokens.get(self.pos),
+            Some(Token::Ident(name)) if name == "id"
+        ) && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::Number(_)));
+        if !is_id_eq_number {
+            return false;
+        }
+        match self.tokens.get(self.pos + 3) {
+            None => true,
+            Some(Token::Punct(';')) => true,
+            Some(Token::Ident(w)) => w.eq_ignore_ascii_case("USING"),
+            _ => false,
+        }
     }
 
     /// `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE id = <n>
@@ -2454,19 +2547,47 @@ struct ParsedInsertShape {
     operation_id: Option<OperationId>,
 }
 
-/// 構文木（[`ValidatedDelete`] の元）。カタログ存在確認前の中間結果（SQL-18・
-/// TASK-191）。
+/// `DELETE` の `WHERE` 句の構造形状（Issue #870・SQL-19）。単一行・`id` 完全
+/// 一致指定形（[`RowId`](Self::RowId)。SQL-18・TASK-191 の既存受理範囲）と、
+/// `SELECT`／集計／広域取得が共有する [`WherePredicate`] 列で表す述語形
+/// （[`Predicates`](Self::Predicates)）の 2 種。[`Parser::parse_delete`] の
+/// 先読み（[`Parser::peek_single_row_delete_id`]）が単一行形と完全に一致する
+/// 入力だけを `RowId` へ分類し、それ以外はすべて `Predicates` へ落ちる。
+enum ParsedDeleteWhere {
+    RowId { id_literal: String },
+    Predicates(Vec<WherePredicate>),
+}
+
+/// 構文木（[`ValidatedDelete`]／[`ValidatedPredicateDelete`] の元）。カタログ
+/// 存在確認前の中間結果（SQL-18・SQL-19、TASK-191・TASK-192）。
 struct ParsedDeleteShape {
     table_name: String,
-    id_literal: String,
+    where_clause: ParsedDeleteWhere,
     operation_id: Option<OperationId>,
+}
+
+/// [`Parser::parse_delete`] ＋ 文末検証を共有する private ヘルパー（Issue #870）。
+/// [`validate_delete_tokens`]（単一行形専用入口）・
+/// [`validate_delete_statement_tokens`]（述語形を含む入口）の双方がここを
+/// 通ることで、構文解析そのものを複製しない。
+fn parse_delete_statement_shape(
+    tokens: &[lexer::Token],
+) -> Result<ParsedDeleteShape, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let shape = p.parse_delete()?;
+    p.expect_end_of_statement()?;
+    Ok(shape)
 }
 
 /// `DELETE` 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を通じて
 /// FROM テーブルがカタログに実在するかを確認する（SQL-18・TASK-191 の公開 API）。
 /// `validate_sql`（SELECT 系専用）・`validate_insert` とは独立した
 /// エントリポイントとする（`operation_id` 必須化ガードをカタログ照会より前に
-/// 評価する必要があるため。[`validate_insert`] のドキュメント参照）。
+/// 評価する必要があるため。[`validate_insert`] のドキュメント参照）。単一行・
+/// `id` 完全一致形のみを受理し、述語形（Issue #870・TASK-192・SQL-19）は
+/// [`validate_delete_statement`] の管轄として構造段（`mode.require`・カタログ
+/// 照会より前）で `42601` を返す（優先順位の保存は [`validate_delete_tokens`]
+/// のドキュメント参照）。
 ///
 /// 検証順序は決定的（同一入力には常に同一の [`SqlSurfaceError`] を返す）:
 /// 構造検証 → `operation_id` 必須化ガード（`mode.require`。TASK-92・RECOVER-1）
@@ -2484,14 +2605,27 @@ pub fn validate_delete(
 /// （#867 が結線する `core.rs::execute_sql_in_session` 相当）が既に先頭
 /// トークン判定のためにトークナイズ済みの場合、同一 SQL 文字列の再
 /// トークナイズを避けられる（`validate_insert_tokens`／Issue #485 と同じ設計）。
+///
+/// 述語形（[`ParsedDeleteWhere::Predicates`]）は、[`validate_delete`] 導入時
+/// （SQL-18・TASK-191）からの受理範囲を一切広げないため、`mode.require`・
+/// カタログ照会に進む前の構造判定の時点で `42601` を返す（Issue #870 追加後も
+/// `validate_delete` のエラー優先順位契約 —— 述語形は `operation_id` の
+/// 有無・テーブルの実在によらず常に `42601` —— を保存する）。
 pub(crate) fn validate_delete_tokens(
     tokens: &[lexer::Token],
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedDelete, SqlSurfaceError> {
-    let mut p = Parser::new(tokens);
-    let shape = p.parse_delete()?;
-    p.expect_end_of_statement()?;
+    let shape = parse_delete_statement_shape(tokens)?;
+
+    let id_literal = match shape.where_clause {
+        ParsedDeleteWhere::RowId { id_literal } => id_literal,
+        ParsedDeleteWhere::Predicates(_) => {
+            return Err(SqlSurfaceError::unsupported(
+                "predicate DELETE must be dispatched via validate_delete_statement",
+            ));
+        }
+    };
 
     mode.require(shape.operation_id.as_ref())?;
 
@@ -2502,8 +2636,61 @@ pub(crate) fn validate_delete_tokens(
 
     Ok(ValidatedDelete {
         table_name: shape.table_name,
-        id_literal: shape.id_literal,
+        id_literal,
         operation_id: shape.operation_id,
+    })
+}
+
+/// `DELETE` 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を
+/// 通じて FROM テーブルがカタログに実在するかを確認する（Issue #870・
+/// TASK-192・SQL-19 の公開 API）。単一行・`id` 完全一致形（[`validate_delete`]
+/// の既存受理範囲）に加え、述語形 `WHERE`（等価・前方一致・`visible()`・式
+/// 比較の `AND` 結合。`SELECT`／集計／広域取得と共有する述語表現）を受理する
+/// 唯一の入口。実行結線（可視行列挙・1 トランザクション一括適用・台帳照合。
+/// #871 の担当）はこの入口を使う。
+///
+/// 検証順序は [`validate_delete`] と同一（決定的）: 構造検証 →
+/// `operation_id` 必須化ガード（`mode.require`。TASK-92・RECOVER-1）→
+/// FROM テーブルのカタログ存在確認。
+pub fn validate_delete_statement(
+    sql: &str,
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<DeleteStatement, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_delete_statement_tokens(&tokens, lookup, mode)
+}
+
+/// [`validate_delete_statement`] の本体。トークン列を受け取ることで、呼び出し
+/// 元が既にトークナイズ済みの場合の再トークナイズを避ける
+/// （[`validate_delete_tokens`]・`validate_insert_tokens` と同じ設計）。
+pub(crate) fn validate_delete_statement_tokens(
+    tokens: &[lexer::Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<DeleteStatement, SqlSurfaceError> {
+    let shape = parse_delete_statement_shape(tokens)?;
+
+    mode.require(shape.operation_id.as_ref())?;
+
+    let exists = lookup.table_exists(&shape.table_name)?;
+    if !exists {
+        return Err(SqlSurfaceError::undefined_table(shape.table_name));
+    }
+
+    Ok(match shape.where_clause {
+        ParsedDeleteWhere::RowId { id_literal } => DeleteStatement::SingleRow(ValidatedDelete {
+            table_name: shape.table_name,
+            id_literal,
+            operation_id: shape.operation_id,
+        }),
+        ParsedDeleteWhere::Predicates(where_predicates) => {
+            DeleteStatement::Predicate(ValidatedPredicateDelete {
+                table_name: shape.table_name,
+                where_predicates,
+                operation_id: shape.operation_id,
+            })
+        }
     })
 }
 
@@ -3751,6 +3938,348 @@ mod tests {
         )
         .expect_err("negative id literal must be rejected");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    // --- validate_delete_statement（述語つき DELETE、Issue #870・TASK-192・SQL-19） ---
+
+    #[test]
+    fn accepts_delete_statement_with_equality_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("equality predicate DELETE should be accepted");
+        match stmt {
+            DeleteStatement::Predicate(pd) => {
+                assert_eq!(pd.table_name(), "documents");
+                assert_eq!(
+                    pd.where_predicates(),
+                    &[WherePredicate::Equality {
+                        column: "lang".to_string(),
+                        value: "ja".to_string(),
+                    }]
+                );
+            }
+            DeleteStatement::SingleRow(_) => panic!("must classify as predicate form"),
+        }
+    }
+
+    #[test]
+    fn accepts_delete_statement_with_prefix_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete_statement(
+            "DELETE FROM documents WHERE path LIKE 'src/%' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("prefix predicate DELETE should be accepted");
+        assert!(matches!(stmt, DeleteStatement::Predicate(_)));
+    }
+
+    #[test]
+    fn accepts_delete_statement_with_expression_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete_statement(
+            "DELETE FROM documents WHERE id > 5 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("expression predicate DELETE should be accepted");
+        assert!(matches!(stmt, DeleteStatement::Predicate(_)));
+    }
+
+    #[test]
+    fn accepts_delete_statement_with_and_combined_predicates_preserving_declared_order() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete_statement(
+            "DELETE FROM documents WHERE id = 1 AND lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("AND-combined predicate DELETE should be accepted");
+        match stmt {
+            DeleteStatement::Predicate(pd) => {
+                // `id = 1` は先頭で `AND` 結合されるため単一行形には分類され
+                // ない（§3.2）。宣言順（id → lang）を保持する。
+                assert_eq!(
+                    pd.where_predicates(),
+                    &[
+                        WherePredicate::Expression(Expr::Binary {
+                            op: BinOp::Eq,
+                            lhs: Box::new(Expr::Ident("id".to_string())),
+                            rhs: Box::new(Expr::Number("1".to_string())),
+                        }),
+                        WherePredicate::Equality {
+                            column: "lang".to_string(),
+                            value: "ja".to_string(),
+                        },
+                    ]
+                );
+            }
+            DeleteStatement::SingleRow(_) => panic!("must classify as predicate form"),
+        }
+    }
+
+    #[test]
+    fn accepts_delete_statement_with_visible_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete_statement(
+            "DELETE FROM documents WHERE visible() USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("visible() predicate DELETE should be accepted (scan/aggregate と同じく受理のみ)");
+        assert!(matches!(stmt, DeleteStatement::Predicate(_)));
+    }
+
+    #[test]
+    fn accepts_delete_statement_single_row_form_with_trailing_semicolon() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete_statement(
+            "DELETE FROM documents WHERE id = 1 USING OPERATION_ID 'op-0001';",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("single-row form must still be accepted via validate_delete_statement");
+        match stmt {
+            DeleteStatement::SingleRow(sr) => {
+                assert_eq!(sr.table_name, "documents");
+                assert_eq!(sr.id_literal, "1");
+            }
+            DeleteStatement::Predicate(_) => panic!("must classify as single-row form"),
+        }
+    }
+
+    /// R1: 同一述語テキストについて、`validate_delete_statement` の
+    /// `where_predicates()` と `SELECT ... LIMIT` の広域取得（scan、Issue #454）
+    /// 側 `where_predicates()` が構造的に一致することを機械検証する
+    /// （第 2 の述語実装を作らない契約の固定）。
+    #[test]
+    fn where_predicates_match_scan_for_same_predicate_text() {
+        let lookup = catalog_with(&["documents"]);
+        let predicate_text = "lang = 'ja' AND id > 5";
+
+        let delete_stmt = validate_delete_statement(
+            &format!("DELETE FROM documents WHERE {predicate_text} USING OPERATION_ID 'op-0001'"),
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("predicate DELETE should be accepted");
+        let delete_predicates = match delete_stmt {
+            DeleteStatement::Predicate(pd) => pd.where_predicates,
+            DeleteStatement::SingleRow(_) => panic!("must classify as predicate form"),
+        };
+
+        let scan_stmt = validate_sql(
+            &format!("SELECT id FROM documents WHERE {predicate_text} LIMIT 1"),
+            &lookup,
+        )
+        .expect("SELECT ... LIMIT should be accepted as a scan statement");
+        let scan_predicates = match scan_stmt {
+            Statement::Scan(scan) => scan.where_predicates,
+            other => panic!("must classify as Statement::Scan, got {other:?}"),
+        };
+
+        assert_eq!(delete_predicates, scan_predicates);
+    }
+
+    #[test]
+    fn rejects_delete_statement_without_where_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete_statement(
+            "DELETE FROM documents USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("DELETE without WHERE must be rejected (全行削除は TRUNCATE の管轄)");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_statement_with_hint_order_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja' HINT ORDER(RLS, SCALAR, VECTOR) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("HINT ORDER suffix is out of the allowed shape");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_statement_with_order_by_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja' ORDER BY id USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("ORDER BY suffix is out of the allowed shape");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_statement_with_limit_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja' LIMIT 5 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("LIMIT suffix is out of the allowed shape");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_statement_with_using_mode_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja' USING MODE 'precision' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("USING MODE suffix is out of the allowed shape");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_statement_with_returning_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja' RETURNING id USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("RETURNING suffix is out of the allowed shape");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_statement_with_or_combined_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja' OR lang = 'en' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("OR-combined predicate is out of the allowed shape");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_statement_duplicate_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja' USING OPERATION_ID 'a' USING OPERATION_ID 'b'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("duplicate operation_id clause must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn explain_delete_statement_is_rejected() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete_statement(
+            "EXPLAIN DELETE FROM documents WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("EXPLAIN prefix on DELETE is out of the allowed shape");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn validate_delete_rejects_predicate_form_regardless_of_operation_id_and_table_existence() {
+        // 述語形は `validate_delete`（単一行形専用入口）へ渡すと、`operation_id`
+        // の有無・テーブルの実在によらず常に構造段で `42601` になる
+        // （`validate_delete` のエラー優先順位契約を Issue #870 追加後も保存する）。
+        let lookup = catalog_with(&["documents"]);
+
+        let err = validate_delete(
+            "DELETE FROM documents WHERE lang = 'ja'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("predicate form without operation_id must still be 42601, not 23502");
+        assert_eq!(err.wire_code(), "42601");
+
+        let err = validate_delete(
+            "DELETE FROM ghost WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("predicate form against an undefined table must still be 42601, not 42P01");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn predicate_delete_structural_validation_never_queries_catalog_when_operation_id_is_missing() {
+        struct FlaggingCatalog {
+            called: std::cell::Cell<bool>,
+        }
+        impl TableLookup for FlaggingCatalog {
+            fn table_exists(&self, _name: &str) -> Result<bool, SqlSurfaceError> {
+                self.called.set(true);
+                Ok(true)
+            }
+        }
+        let lookup = FlaggingCatalog {
+            called: std::cell::Cell::new(false),
+        };
+        let err = validate_delete_statement(
+            "DELETE FROM nope WHERE lang = 'ja'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "23502");
+        assert!(
+            !lookup.called.get(),
+            "catalog lookup must not be reached before the operation_id clause is validated"
+        );
+    }
+
+    #[test]
+    fn rejects_delete_statement_undefined_table_for_predicate_form() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete_statement(
+            "DELETE FROM ghost WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("undefined table must be rejected");
+        assert_eq!(err.wire_code(), "42P01");
+    }
+
+    #[test]
+    fn compare_only_without_ledger_accepts_missing_operation_id_clause_for_predicate_delete() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja'",
+            &lookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect("compare-only mode must not require operation_id");
+        match stmt {
+            DeleteStatement::Predicate(pd) => assert_eq!(pd.operation_id(), None),
+            DeleteStatement::SingleRow(_) => panic!("must classify as predicate form"),
+        }
+    }
+
+    #[test]
+    fn validate_delete_statement_is_deterministic_across_repeated_calls() {
+        let lookup = catalog_with(&["documents"]);
+        let sql = "DELETE FROM documents WHERE lang = 'ja' AND id > 5 USING OPERATION_ID 'op-0001'";
+        let first = validate_delete_statement(sql, &lookup, LedgerMode::Ledgered)
+            .expect("first call should succeed");
+        let second = validate_delete_statement(sql, &lookup, LedgerMode::Ledgered)
+            .expect("second call should succeed");
+        assert_eq!(first, second);
     }
 
     #[test]
