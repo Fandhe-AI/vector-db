@@ -1160,10 +1160,22 @@ pub struct BoundPredicateUpdate {
 }
 
 impl BoundPredicateUpdate {
-    /// クレート外から `BoundPredicateUpdate` を直接構築する constructor
-    /// （NoSQL 表層の `update` op・Issue #876 向け。[`BoundScan::new`] と同じ
-    /// 設計判断で、値の意味論検証は呼び出し元の責務のまま強制しない）。
-    pub fn new(
+    /// クレート内限定の raw constructor（値の意味論検証を強制しない）。
+    ///
+    /// **`pub` にしない**: [`bind_update_form`] が要求する安全性検証
+    /// （`bind_set_assignments` による `id`／`tenant_id`／`visibility` 列への
+    /// SET 拒否、`metadata_filters`・`expr_filters` が両方空＝実質無条件更新の
+    /// 拒否、`LedgerMode::Ledgered` 下での `operation_id` 必須化は
+    /// [`crate::sql::allowlist::validate_update`] が `ValidatedUpdateForm` の
+    /// 構築時点で強制する）は、これらの検査を経ていない生のフィールドを
+    /// そのまま受け取れる公開 constructor を crate 外へ晒した時点で迂回可能に
+    /// なる（[`BoundScan::new`] は読み取り専用でありこの意味の安全性検査を
+    /// 持たないため同じ設計にはしない）。NoSQL 表層の `update` op
+    /// （Issue #876）が SQL テキストを経由しない直接束縛の入口を必要とする
+    /// 場合は、[`bind_update_form`] と同じ検証（SET／述語／`operation_id`）を
+    /// 必ず実施したうえで [`BoundPredicateUpdate`] を返す**別の**公開 API を
+    /// 新設し、本 `new` はその内部実装としてのみ使うこと。
+    pub(crate) fn new(
         table: String,
         assignments: Vec<(usize, crate::row_codec::Value)>,
         metadata_filters: Vec<MetadataFilter>,
@@ -1252,13 +1264,13 @@ pub fn bind_update_form(
                 ));
             }
 
-            Ok(BoundUpdateForm::Predicate(BoundPredicateUpdate {
-                table: predicate.table_name.clone(),
+            Ok(BoundUpdateForm::Predicate(BoundPredicateUpdate::new(
+                predicate.table_name.clone(),
                 assignments,
                 metadata_filters,
                 expr_filters,
-                operation_id: predicate.operation_id.clone(),
-            }))
+                predicate.operation_id.clone(),
+            )))
         }
     }
 }
@@ -3191,6 +3203,11 @@ mod tests {
 
     #[test]
     fn bound_predicate_update_new_round_trips_through_accessors() {
+        // `BoundPredicateUpdate::new` は `pub(crate)` の raw constructor
+        // （codex-review 指摘・PR #985 是正）であり、意味論検証（SET 対象列・
+        // 無条件更新拒否・`operation_id` 必須化）は行わない契約のまま。
+        // 本テストはアクセサーの往復のみを検証し、「空フィルタが安全に構築できる
+        // 公開 API がある」ことは意味しない（crate 外からの直接構築は不可能）。
         let bound = BoundPredicateUpdate::new(
             "documents".to_string(),
             vec![(1, crate::row_codec::Value::Text("x".to_string()))],

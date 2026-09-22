@@ -157,8 +157,15 @@ pub fn check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError>; // 
   変更開始前に呼ぶ。
 - **#870**（述語つき `DELETE`）: `UpdateWhereForm` の振り分け規則・`visible()` のみ
   拒否・`MAX_DML_AFFECTED_ROWS` をそのまま再利用する想定。
-- **#876**（NoSQL `update` op）: `BoundPredicateUpdate::new`（`BoundScan::new` と
-  同型の直接構築入口）を使う。
+- **#876**（NoSQL `update` op）: `BoundPredicateUpdate::new` は `pub(crate)`
+  （codex-review 指摘・PR #985 是正）。生フィールドをそのまま受け取れる公開
+  constructor は `bind_set_assignments`（`id`／`tenant_id`／`visibility` 列への
+  SET 拒否）・`metadata_filters`／`expr_filters` 両方空＝無条件更新の拒否・
+  `LedgerMode::Ledgered` 下の `operation_id` 必須化（`validate_update` が
+  `ValidatedUpdateForm` 構築時点で強制）を丸ごと迂回できてしまうため、
+  #876 は `bind_update_form` と同じ検証を内部で必ず通したうえで
+  `BoundPredicateUpdate` を返す**別の**公開 API を新設すること（`new` 自体は
+  pub 化しない）。
 - **#865**（`core.rs` の `UPDATE` ディスパッチ）: `validate_update`（単一行）を
   引き続き使ってよい。述語形へ拡張する際は `validate_update_form` の `Single`
   腕が既存と同一の `ValidatedUpdate` を返すことを利用できる。
