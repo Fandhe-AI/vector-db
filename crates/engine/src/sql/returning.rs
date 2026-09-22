@@ -128,10 +128,15 @@ pub(crate) fn column_meta(
 }
 
 /// 1 行分の投影（`id`・スキーマ列順の `values`）を [`ResultRow`] へ写像する。
-/// `values` は `schema.columns` の列順に対応する必要がある（`sql::exec::
-/// BoundInsert::values`・`row_codec::DecodedRow::values` のいずれも同一契約）。
-/// `score` は検索結果ではないため常に `0.0`（`sql::scan::execute_scan` と同じ
-/// 「順序を持たない結果セット」の扱い）。
+/// `values` は `schema.columns` の列順に対応し、`VECTOR` 列の位置には実際の
+/// `Value::Vector` が入っている必要がある（`sql::parser::BoundInsert::values`
+/// はこの契約を直接満たす。`tenant::CapturedRow::values` は
+/// `row_codec::decode_scalar_columns` が返す `VECTOR` 列 `Value::Null` を
+/// `Row::embedding` で明示的に差し替えたうえでこの契約を満たす——`tenant.rs`
+/// の捕捉ロジック参照。`row_codec::decode_row`〔別バージョンの物理行フォーマット。
+/// 本モジュールの通常の書き込み経路では使われない〕の `DecodedRow::values` は
+/// この契約を満たさないため使わない）。`score` は検索結果ではないため常に
+/// `0.0`（`sql::scan::execute_scan` と同じ「順序を持たない結果セット」の扱い）。
 pub(crate) fn project_row(
     id: u64,
     values: &[Value],
@@ -167,4 +172,26 @@ pub(crate) fn project_row(
         score: 0.0,
         cells,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 累計が上限を超える場合は確保前に `54000`（`PayloadTooLarge`）で拒否する
+    /// （`try_accumulate_budget` は private のため本モジュール内でのみ検証可能）。
+    #[test]
+    fn try_accumulate_budget_rejects_when_cap_is_exceeded() {
+        let cap = 100usize;
+        let err = try_accumulate_budget(cap - 1, 2, cap).expect_err("must exceed cap");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// ちょうど上限に達する場合は許容する（境界値）。
+    #[test]
+    fn try_accumulate_budget_allows_exact_cap() {
+        let cap = 100usize;
+        let next = try_accumulate_budget(0, cap, cap).expect("must fit exactly at cap");
+        assert_eq!(next, cap);
+    }
 }
