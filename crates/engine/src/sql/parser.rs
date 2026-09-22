@@ -941,6 +941,117 @@ fn bind_insert_row(
     })
 }
 
+/// 束縛済みの UPDATE 文（SQL-17、TASK-191。実行結線は #865 の担当）。
+///
+/// `assignments` は SET 句が書かれた宣言順を保持する **部分更新** の表現であり、
+/// `BoundInsert.values`（`Null` 埋めの全列ベクトル）とは意図的に異なる形にしている。
+/// `tenant::update_row_unchecked` は行全体を置換する API であるため、実行結線側
+/// （#865）は既存行を読み取り、ここで返す対象列だけを上書きしてから `RowInput` を
+/// 構築する（read-merge-write）。宣言順を保持する理由は、`operation_id` の内容照合
+/// （RECOVER-10/11 系。#868）が正規化した文字列から計算される想定であり、実装側で
+/// 列順を並べ替えるとクライアントの記述順序に同一文の再送判定が依存して崩れうる
+/// ため。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundUpdate {
+    pub table: String,
+    /// `WHERE id = <n>` の行キー（疑似列 `id`）。
+    pub id: u64,
+    /// SET 句の (`schema.columns` の列インデックス, 束縛済み値) 対応。宣言順を
+    /// 保持する（並べ替えない）。
+    pub assignments: Vec<(usize, crate::row_codec::Value)>,
+    /// TASK-92（RECOVER-1）: [`ValidatedUpdate::operation_id`] をそのまま素通しする。
+    /// `LedgerMode::Ledgered`（既定）では `sql::allowlist::validate_update` が既に
+    /// `None` を `23502` で拒否済みのため常に `Some`。`CompareOnlyWithoutLedger`
+    /// でのみ `None` になり得る。
+    pub operation_id: Option<OperationId>,
+}
+
+/// [`ValidatedUpdate`] を `schema` と照合して [`BoundUpdate`] へ束縛する
+/// （SQL-17、TASK-191 の公開 API）。`schema` は呼び出し元が
+/// `Storage::get_table_schema` で取得済みのものを渡す想定（`bind_insert` と同じ
+/// 契約）。
+///
+/// 検出する違反はすべて [`SqlSurfaceError::InvalidInput`]（`22000`）:
+/// SET 対象列に疑似列 `id`・RLS 内部列 `tenant_id`／`visibility` を指定（構造上
+/// スキーマに存在しない列だが、`22000`「unknown column」ではなく専用の判定を
+/// 先に行い `42601` で拒否する。下記参照）・SET 内の列名重複・未知の列名・
+/// 列型とリテラル種別の不一致（`VECTOR` 列に数値、`TEXT` 列にベクトルリテラルを
+/// 渡す等）・`id` 値が `u64` として解釈不能（範囲外を含む）。ベクトルリテラル
+/// 自体の形式・次元・64 KiB 上限は既存の [`parse_vector_literal`] をそのまま
+/// 再利用する。
+///
+/// `id`／`tenant_id`／`visibility` の SET 対象化は `42601`（許可リスト外の形と同じ
+/// 分類）で拒否する: これらはスキーマ実列ではない疑似列・RLS 内部列であり、
+/// 未知列として `22000`（型・値の意味論的不正）に丸めるとクライアントが
+/// 「別の列名を使えば通る」と誤解しうる。構造的に受理しない形として先に判定する
+/// （SQL-17 の「ユーザー列のみを SET 対象にできる」契約。テナント・可視性は
+/// `exec::execute_update`〔#865〕がサーバー側で `PolicyContext` から導出・固定し、
+/// クライアントが行の所有者・可視性を書き換える経路を作らない）。
+///
+/// UPDATE は部分更新であるため、`bind_insert` の非 nullable 列欠落チェックは行わない
+/// （SET で指定しなかった列は `assignments` に一切現れず、実行結線側の
+/// read-merge-write が既存値を保持する）。
+pub fn bind_update(
+    stmt: &crate::sql::allowlist::ValidatedUpdate,
+    schema: &TableSchema,
+) -> Result<BoundUpdate, SqlSurfaceError> {
+    let mut seen_columns: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut assignments: Vec<(usize, crate::row_codec::Value)> =
+        Vec::with_capacity(stmt.assignments.len());
+
+    for (name, literal) in &stmt.assignments {
+        if name == "id" || name == "tenant_id" || name == "visibility" {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "column {name:?} cannot be targeted by SET"
+            )));
+        }
+        if !seen_columns.insert(name.as_str()) {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "duplicate column in SET clause: {name}"
+            )));
+        }
+        let col_idx = schema
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+        let column = schema
+            .columns
+            .get(col_idx)
+            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+        let value = match (column.ty, literal) {
+            (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
+                crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+            }
+            (ColumnType::Vector(_), InsertLiteral::Number(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a vector literal, got a number"
+                )))
+            }
+            (ColumnType::Text, InsertLiteral::String(s)) => {
+                crate::row_codec::Value::Text(s.clone())
+            }
+            (ColumnType::Text, InsertLiteral::Number(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a text literal, got a number"
+                )))
+            }
+        };
+        assignments.push((col_idx, value));
+    }
+
+    let id: u64 = stmt.id_literal.parse().map_err(|_| {
+        SqlSurfaceError::invalid_input(format!("malformed id value: {}", stmt.id_literal))
+    })?;
+
+    Ok(BoundUpdate {
+        table: stmt.table_name.clone(),
+        id,
+        assignments,
+        operation_id: stmt.operation_id.clone(),
+    })
+}
+
 /// ファイル形 `INSERT` の束縛結果（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2）。
 ///
 /// `sql::exec::execute_file_insert` → `incremental::index_file` へ渡され、`path`/`body`
@@ -2510,6 +2621,166 @@ mod tests {
     fn rejects_insert_duplicate_column_in_list() {
         let err = bind_insert_sql(
             "INSERT INTO documents (id, id) VALUES (1, 2) USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- bind_update（SQL-17、TASK-191） ----------------------------------------
+
+    fn bind_update_sql(sql: &str) -> Result<BoundUpdate, SqlSurfaceError> {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_update(
+            sql,
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+        bind_update(&stmt, &docs_schema())
+    }
+
+    #[test]
+    fn binds_update_of_text_column() {
+        let bound = bind_update_sql(
+            "UPDATE documents SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .expect("bind_update should succeed");
+        assert_eq!(bound.table, "documents");
+        assert_eq!(bound.id, 1);
+        assert_eq!(
+            bound.operation_id.as_ref().map(OperationId::as_str),
+            Some("op-0001")
+        );
+        // `lang` は `docs_schema()` の列順で index 2（embedding=0, body=1, lang=2）。
+        assert_eq!(
+            bound.assignments,
+            vec![(2, crate::row_codec::Value::Text("en".to_string()))]
+        );
+    }
+
+    #[test]
+    fn binds_update_of_vector_column_with_matching_dim() {
+        let bound = bind_update_sql(
+            "UPDATE documents SET embedding = '[0.1,0.2,0.3]' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .expect("bind_update should succeed");
+        assert_eq!(
+            bound.assignments,
+            vec![(0, crate::row_codec::Value::Vector(vec![0.1, 0.2, 0.3]))]
+        );
+    }
+
+    #[test]
+    fn binds_update_of_multiple_columns_preserving_declared_order() {
+        let bound = bind_update_sql(
+            "UPDATE documents SET lang = 'ja', body = 'x' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .expect("bind_update should succeed");
+        // 宣言順（lang → body）を保持し、スキーマ列順（body=1 → lang=2）へは
+        // 並べ替えない（部分更新の正規化基準。BoundUpdate ドキュメンテーション
+        // コメント参照）。
+        assert_eq!(
+            bound.assignments,
+            vec![
+                (2, crate::row_codec::Value::Text("ja".to_string())),
+                (1, crate::row_codec::Value::Text("x".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn bind_update_is_partial_and_omits_unset_columns() {
+        let bound = bind_update_sql(
+            "UPDATE documents SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .expect("bind_update should succeed");
+        // SET で指定していない列（embedding・body）は assignments に一切現れない
+        // （部分更新。INSERT の Null 埋め全列ベクトルとは異なる契約）。
+        assert_eq!(bound.assignments.len(), 1);
+        assert!(bound
+            .assignments
+            .iter()
+            .all(|(idx, _)| *idx != 0 && *idx != 1));
+    }
+
+    #[test]
+    fn rejects_update_vector_column_with_dim_mismatch() {
+        let err = bind_update_sql(
+            "UPDATE documents SET embedding = '[0.1,0.2]' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_update_vector_column_with_number_literal() {
+        let err = bind_update_sql(
+            "UPDATE documents SET embedding = 5 WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_update_text_column_with_number_literal() {
+        let err = bind_update_sql(
+            "UPDATE documents SET lang = 5 WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_update_unknown_column() {
+        let err = bind_update_sql(
+            "UPDATE documents SET ghost = 'x' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_update_duplicate_column_in_set_clause() {
+        let err = bind_update_sql(
+            "UPDATE documents SET lang = 'en', lang = 'ja' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_update_set_id_pseudo_column() {
+        let err = bind_update_sql(
+            "UPDATE documents SET id = 5 WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_set_tenant_id_column() {
+        let err = bind_update_sql(
+            "UPDATE documents SET tenant_id = 'evil' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_set_visibility_column() {
+        let err = bind_update_sql(
+            "UPDATE documents SET visibility = 'public' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_id_out_of_u64_range() {
+        let err = bind_update_sql(
+            "UPDATE documents SET lang = 'en' WHERE id = 99999999999999999999 USING OPERATION_ID 'op-0001'",
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "22000");
