@@ -18,8 +18,10 @@
   `crates/engine/src/sql/parser.rs`（`bind_update_form`・`bind_predicate_delete`・
   `check_dml_affected_rows`・`MAX_DML_AFFECTED_ROWS`・`check_affected_row_count`・
   `DEFAULT_MAX_DML_AFFECTED_ROWS`）・`crates/engine/src/sql/udf_call.rs`（`Expr`・
-  `BinOp`・`parse_number_literal`・`MAX_EXPR_NODES`）・
+  `BinOp`・`parse_number_literal`・`MAX_EXPR_NODES`・`UdfRegistry`・
+  `UdfDefinition`・`define_function`・`MAX_SESSION_UDFS`）・
   `crates/engine/src/sql/expr_program.rs`（`ExprProgram::compile`）・
+  `crates/engine/src/wasm_udf.rs`（`WasmUdfBackend`）・
   `crates/engine/src/tenant.rs`（`delete_row_ledgered_unchecked`・
   `update_row_unchecked` 系・`truncate_table_unchecked`）
 - 関連 doc: `docs/design/predicate-dml-where.md`（Issue #869。述語つき `UPDATE` の
@@ -83,7 +85,7 @@ op）・#865（単一行 `UPDATE` 実行結線）が従う契約にする。
 
 | 候補 | 内容 | 採否 |
 | --- | --- | --- |
-| A（採用） | 1 文 = 1 台帳エントリ。ハッシュ入力は**検証済み構文形**（テーブル名・`SET` の (列名, リテラル) 宣言順・`WHERE` 述語の宣言順）の正準バイト列とし、対象行集合・影響行数・変更前後の行内容は一切含めない | 採用 |
+| A（採用） | 1 文 = 1 台帳エントリ。ハッシュ入力は**検証済み構文形**（テーブル名・`SET` の (列名, リテラル) 宣言順・`WHERE` 述語の宣言順・式中で参照する**セッション UDF の正準定義**）の正準バイト列とし、対象行集合・影響行数・変更前後の行内容は一切含めない | 採用 |
 | B | 影響行ごとに `(operation_id, row id)` の台帳エントリを別々に持つ | 不採用: 台帳キーの一意制約と衝突しうる・上限（1,000 行）分のエントリ増幅・一部の行だけ台帳に載った状態が commit 途中で生じうる・再送時にどの行が commit 済みかを判定できない |
 | C | 対象行の id 集合、または変更前後の行内容（before/after image）をハッシュへ含める | 不採用: DB 状態依存になる。再送時点でテーブルのスナップショットが変わっていると、クライアントが送った文は同一でも対象行集合が変わり別ハッシュになる。回復手順（RECOVER-7 系の「再送して commit 済みか確認する」手段）が、たまたま状態が変わっただけで `22023`（誤用）と誤判定してしまう |
 | D | SQL テキストの生バイト列をそのままハッシュする | 不採用: 空白・大文字小文字・末尾セミコロンの有無で不一致になり同一操作の再送を誤検知する。SQL 表層（テキスト経由）と NoSQL 表層（#876。JSON から直接束縛）で同一操作でも別ハッシュになり、複数行 `INSERT`（`rows[]`）が既に確立している「表層を跨いだキー空間共有」を破る |
@@ -102,9 +104,17 @@ op）・#865（単一行 `UPDATE` 実行結線）が従う契約にする。
 ### 4.2 想定シグネチャ（#871 が実装）
 
 ```text
-for_update_where(table: &str, assignments: &[(&str, &InsertLiteral)], where_predicates: &[WherePredicate]) -> Result<ContentHash, StorageError>
-for_delete_where(table: &str, where_predicates: &[WherePredicate]) -> Result<ContentHash, StorageError>
+for_update_where(table: &str, assignments: &[(&str, &InsertLiteral)], where_predicates: &[WherePredicate], udf_registry: &UdfRegistry) -> Result<ContentHash, StorageError>
+for_delete_where(table: &str, where_predicates: &[WherePredicate], udf_registry: &UdfRegistry) -> Result<ContentHash, StorageError>
 ```
+
+`udf_registry` は 4.4 節で述べる「参照 UDF 定義の正準化」のために式中の
+`Call` 名を解決する読み取り専用の入力であり、呼び出し元（`bind_update_form`／
+`bind_predicate_delete`。5.1 節）がその時点の `SessionState` から借用して渡す。
+計算位置自体（束縛前・同一セッション内）は変わらないため、ハッシュが
+DB 状態非依存であるという契約（2 節）は保たれる——`UdfRegistry` はテーブルの
+行データではなく、同一セッションでクライアントが `CREATE FUNCTION` として
+送った内容（クライアント要求由来）そのものだからである。
 
 `pub(crate)`（既存 `for_*` 関数と同じ可視性）。`crates/engine/src/recovery/
 content_hash.rs` への追加は #871 の担当であり、本 ADR は入力レイアウトの
@@ -156,16 +166,21 @@ content_hash.rs` への追加は #871 の担当であり、本 ADR は入力レ�
 `Binary` の 4 variant）であり、束縛済みの実行形（`ExprProgram`・
 `BoundExpr` 相当）ではない。理由:
 
-1. 束縛済み実行形は UDF 呼び出しをセッションスコープのレジストリから
-   インライン展開した結果を保持しうる。同一の文でも、接続を跨いで
-   UDF 定義が変わっていれば展開結果が変わり、束縛形をハッシュすると
-   同一文の再送が `22023`（内容不一致）と誤判定されうる。
-2. `MetadataFilter`・`assignments` の束縛済み形は列インデックス基準で
+1. `MetadataFilter`・`assignments` の束縛済み形は列インデックス基準で
    組み立てられる。`ALTER TABLE ADD COLUMN` を挟むと位置がずれる
    （PR #248 で列名基準へ改めた既存の教訓と同じ性質の問題）。
-3. 構文段 AST は表層非依存（SQL テキスト経由でも NoSQL 表層の JSON から
+2. 構文段 AST は表層非依存（SQL テキスト経由でも NoSQL 表層の JSON から
    直接構築した構文形でも同じ木になる）であり、4.3 節冒頭で述べた
    表層横断のキー空間共有（5.2 節）にそのまま使える。
+
+**構文段 AST を直接ハッシュするだけでは不十分**（4.4.1 節）。`Call { name,
+args }` を呼び出し先の名前・引数のみで直列化すると、`WHERE f(x) > 1` は
+`f` がどう定義されているかに関わらず常に同一のバイト列になる。台帳は
+`(tenant, table, operation_id)` にのみ紐づき UDF 定義そのものは保持しない
+ため、この設計のままでは「同じ `operation_id` で、実質的に異なる操作
+（別定義の `f` を呼ぶ文）を送る」という誤用が `23505`（同一内容の再送）
+として通ってしまい、`22023`（内容不一致）を返すべき場面を取り逃がす
+（PR #987 codex-review 指摘）。4.4.1 節でこの穴を閉じる。
 
 直列化はタグ付き前置順（prefix order）:
 
@@ -180,10 +195,102 @@ content_hash.rs` への追加は #871 の担当であり、本 ADR は入力レ�
   `Sub`＝2・`Mul`＝3・`Div`＝4・`Gt`＝5・`Lt`＝6・`Ge`＝7・`Le`＝8・
   `Eq`＝9）・lhs を再帰的に直列化・rhs を再帰的に直列化
 
+呼び出し先の名前（`push_bytes(name を小文字化したもの)`）は不変のまま
+残す——組み込み関数呼び出しとの区別が不要になるうえ、4.4.1 節の UDF
+定義直列化と組み合わせても「同名の異なる定義」と「異名の同一定義」を
+どちらも意図どおり別内容として扱える。
+
 入力サイズの有界性: `assignments` は `MAX_UPDATE_SET_ASSIGNMENTS`
 （256）、述語は `MAX_METADATA_FILTERS`（256）、式のノード数は
 `MAX_EXPR_NODES`（1024）で既に上限が掛かっており、`push_bytes` 自体も
-u32 長を超えるフィールドを拒否する。本 ADR は新たな上限を追加しない。
+u32 長を超えるフィールドを拒否する。本 ADR は新たな上限を追加しない
+（4.4.1 節の UDF 定義直列化も `MAX_SESSION_UDFS`・`MAX_UDF_PARAMS`・
+`MAX_EXPR_NODES` という既存の上限の範囲内に収まる）。
+
+#### 4.4.1 参照 UDF 定義の正準化（内容照合ハッシュへの組み込み）
+
+**前提の確認**: `sql::udf_call::UdfRegistry` は追記専用であり、
+`define_function`（`is_name_taken` による衝突検査）は**同一セッション内**
+での同名 UDF の再定義を構造的に拒否する。したがって、1 つの接続（1
+セッション）の中で「同じ文を送った後に同名 UDF だけ差し替えて再送する」
+という経路は起こらない。codex-review が指摘する脅威は、**接続を跨いだ
+再送**（RECOVER-7 が想定する「再送して commit 済みか確認する」回復手順・
+クライアントの再接続後の再送を含む）である——`UdfRegistry` はセッション
+単位（`sql::mode::SessionState` が保持）であり永続化されないため、
+新しい接続で同名だが異なる本体の UDF を定義してから、以前と同じ
+`operation_id` を持つ `UPDATE ... WHERE f(x) > 1` を送ることは可能であり、
+その場合 `f` が指す操作の意味は変わっている。台帳はこの意味の違いを
+`22023` として検出できなければならない。
+
+**設計**: `Call { name, args }` を直列化する際、`name`（小文字化したもの）
+を呼び出し時点の `udf_registry`（4.2 節。`bind_update_form`／
+`bind_predicate_delete` が保持するセッションの `UdfRegistry`）で引き、
+**組み込み関数か・セッション UDF かを判別したうえで**、セッション UDF の
+場合のみ、その定義（`UdfDefinition { params, body }`）を同じ直列化スキーム
+で末尾に連結する。
+
+1. `WHERE`（`Expression(Expr)`。`SET` 側の値は `InsertLiteral` のみで
+   `Expr` を経由しないため対象外）の式木を走査し、出現する `Call` の
+   `name`（小文字化）を集める。
+2. 各名前を `udf_registry.get(name)` で引く。`None`（組み込み関数・
+   `catalog`／`allowlist` の許可名）なら 4.4 節の既存直列化のまま
+   （呼び出し先の変化は名前自体の変化としてのみハッシュに現れる）。
+   `Some(def)`（セッション宣言的 UDF）なら**参照 UDF 集合**へ追加する。
+3. **推移閉包**: 追加した UDF の `body`（`Expr`）自体にも `Call` が
+   含まれうる（UDF 本体が別の登録済み UDF を呼ぶ多段呼び出し。
+   `define_function` は「登録済み UDF 呼び出しのみで構成される」本体を
+   許可する）。この `Call` も同じ手順で解決し、`Some` なら参照 UDF
+   集合へ追加する。`UdfRegistry` は追記専用で UDF は**自身より前に
+   登録済みの UDF のみ**を呼べる（`define_function` の検証時点で
+   `registry` に無い名前への `Call` は拒否される）ため、この走査は
+   有向非巡回（サイクルなし）であり必ず停止する。
+4. **決定的な順序**: 参照 UDF 集合は名前（小文字化。`UdfRegistry` の
+   キーと同じ）の辞書順にソートしてから直列化する（初出順ではなく
+   名前順。複数の呼び出し箇所・複数の式から同じ UDF が参照されても
+   重複なく 1 回だけ現れる）。
+5. **参照 UDF 定義セクション**の直列化（`WHERE` 述語直列化〔4.3 節〕の
+   末尾に追記する新規セクション）: 件数プレフィクス（u32 LE。参照 UDF
+   が無ければ 0——UDF を呼ばない文は本節導入前とビット同一のハッシュに
+   なる）→ 各 UDF につき `push_bytes(name を小文字化したもの)`・
+   パラメータ件数プレフィクス（u32 LE）・各 `push_bytes(param)`（宣言順・
+   大文字小文字はそのまま。`define_function` が保持する順序と同じ）・
+   `body`（`Expr`）を 4.4 節の直列化スキームでそのまま再帰的に直列化
+   （パラメータ参照は本体中で `Ident(param_name)` として現れる）。
+
+これにより「同名・同定義」の UDF を呼ぶ再送は常に同一ハッシュ（`23505`）
+になり、「同名・異なる定義」（本節が閉じる穴）や「異名・同一定義」
+（呼び出し先の名前が直列化に含まれるため）はいずれも異なるハッシュ
+（`22023`）になる。定義自体はクライアントが同一セッションへ
+`CREATE FUNCTION` として送った内容であり、4 節冒頭の正規化方針
+（クライアント要求由来の内容のみ・DB 状態非依存）の例外ではなく、その
+まま適用範囲を「呼び出し文だけでなく、呼び出し文が依存する同一セッション
+内のクライアント入力（UDF 定義）まで」へ広げたものである。
+
+**却下した代替案**（記録のみ）: 束縛済み実行形（インライン展開後の
+`BoundExpr` 相当）をそのままハッシュする案は、4.4 節冒頭の理由 1・2
+（列インデックス依存）により不採用のまま据え置く。構文形は維持しつつ
+UDF 呼び出しだけを事前にインライン展開してからハッシュする案（`WHERE
+f(x) > 1` を `f` の本体で置換してハッシュする）も、置換後の木が別の
+リテラル式（例: `WHERE x*2 > 1`）と偶然一致しうる——「関数呼び出しを
+使った文」と「同じ計算を式で書いた文」が別の要求であるにもかかわらず
+同一ハッシュ（`23505`）に落ちてしまう——ため不採用とし、本節の
+「呼び出し先の名前は残したまま定義を追記する」設計を採る。
+
+**WASM UDF（TASK-149・EXT-5, EXT-6）は本節の対象外**とし、predicate 形
+`UPDATE`／`DELETE` の `WHERE` から `Call` が WASM UDF（
+`UdfRegistry::get_wasm` で解決される名前）に解決される場合は許可形状外
+として拒否する（既存の「サポート対象外の構文要素」と同じ `0A000`。
+Issue #871 が実装する `bind_update_form`／`bind_predicate_delete` の
+検証項目へ追加する）。理由: `WasmUdfBackend` trait
+（`crates/engine/src/wasm_udf.rs`）
+は `call_vector_scalar` のみを公開し、登録済みモジュールの内容・バージョン
+を指し示す安定な識別子（ハッシュ・ダイジェスト等）を一切保持しない
+契約層のみの実装（wasmtime バックエンド自体が依存追加のユーザー承認
+待ち。Issue #97）であるため、本節の「定義の正準形をハッシュへ含める」
+設計を宣言的 UDF と同じ形では今は満たせない。`WasmUdfBackend` へ
+安定な定義識別子を返すメソッドを追加し、登録（`define_wasm_function`）
+時点でその識別子を記録する設計は、wasmtime バックエンド接続時の
+別 Issue（#871 または新規 Issue）へ申し送る。
 
 ## 5. 計算位置と表層横断のキー空間共有
 
@@ -200,7 +307,12 @@ u32 長を超えるフィールドを拒否する。本 ADR は新たな上限�
 フィールドとして保持させ、`tenant::*_unchecked` 側へそのまま渡す。
 これは `for_insert_encoded` 系が「呼び出し元が 1 回だけ計算した値を
 台帳記録と行書き込みの双方へ渡す」設計（Issue #397）と同じ運び方であり、
-束縛と実行の間でハッシュ材料を再構築しない。
+束縛と実行の間でハッシュ材料を再構築しない。`bind_update_form`／
+`bind_predicate_delete` は式の型検査（`bind_where_predicates` の
+`Expression` 腕）で既に `SessionState` の `UdfRegistry` を参照しているため、
+4.4.1 節の UDF 定義解決に必要な `udf_registry` はこの型検査と同じ借用を
+`for_update_where`／`for_delete_where` へ渡すだけでよく、新たな
+状態アクセスを追加しない。
 
 ### 5.2 SQL⇄NoSQL 表層横断のキー空間共有
 
@@ -210,6 +322,11 @@ JSON リクエストから直接 `Validated*` 相当の検証済み構文形（�
 `for_update_where`／`for_delete_where` へ渡すこと。これにより、同一操作を
 SQL 表層と NoSQL 表層のどちらから送っても同一ハッシュ空間で再送判定が
 働く（複数行 `INSERT`〔`rows[]`〕・`nosql6_insert.rs` の先例と同じ設計）。
+`for_update_where`／`for_delete_where` は表層を問わず「呼び出し元の
+セッションが保持する `UdfRegistry`」を受け取る契約（4.2 節・4.4.1 節）
+であるため、NoSQL 表層が式（`WHERE` 相当の JSON 述語）内で UDF 呼び出しを
+許容する場合も、SQL 表層と同じ手順（同一セッションの `UdfRegistry` を
+そのまま渡す）で同一ハッシュ空間を維持できる。
 
 `BoundPredicateUpdate::new` を `pub` 化しない方針（PR #985 の是正）とも
 整合させ、NoSQL 表層は `bind_update_form` と同じ検証（`SET` 対象列の
@@ -312,6 +429,8 @@ RECOVER-11（検討中）の確定に向けて、以下をポインタ表記で�
 - 上限超過時は台帳未記録（RECOVER-11・INDEX-4 相当）
 - SQL・NoSQL 表層で同一ハッシュ空間を共有する契約（RECOVER-11・NOSQL-12）
 - ハッシュ源は束縛前の構文形とする契約（RECOVER-11・SQL-19）
+- 参照するセッション UDF の定義（推移閉包・名前順）をハッシュ入力へ含める
+  契約（RECOVER-11・SQL-9・SQL-19。4.4.1 節）
 - 単一行 `UPDATE` のハッシュ源見直し（RECOVER-10・SQL-17・Issue #865）
 
 ## 10. 判断記録（オーナー記入欄）
@@ -335,6 +454,10 @@ RECOVER-11（検討中）の確定に向けて、以下をポインタ表記で�
 - `OpTag::UpdateWhere`／`DeleteWhere` の実コード追加（#871 の担当。本 ADR は
   値の割当方針〔既存 1〜6 の続番〕のみを示す）
 - UPSERT（#872）・明示トランザクション台帳（RECOVER-12・#942）の詳細設計
+- `WasmUdfBackend`（`crates/engine/src/wasm_udf.rs`）への安定な定義識別子
+  メソッドの追加（4.4.1 節。wasmtime バックエンド接続時の別 Issue へ
+  申し送り。本 ADR は predicate 形 `UPDATE`／`DELETE` の `WHERE` から
+  WASM UDF への `Call` を拒否する契約〔4.4.1 節〕のみを定める）
 
 ## 参照
 
