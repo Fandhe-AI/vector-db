@@ -1153,15 +1153,41 @@ pub struct BoundUpdate {
 /// UPDATE は部分更新であるため、`bind_insert` の非 nullable 列欠落チェックは行わない
 /// （SET で指定しなかった列は `assignments` に一切現れず、実行結線側の
 /// read-merge-write が既存値を保持する）。
+///
+/// SET 句の束縛本体（[`bind_set_assignments`]）は [`bind_update`]（単一行・id 指定形。
+/// SQL-17）と [`bind_update_form`] の述語形腕（SQL-19、TASK-192・Issue #869）が
+/// 共有する。
 pub fn bind_update(
     stmt: &crate::sql::allowlist::ValidatedUpdate,
     schema: &TableSchema,
 ) -> Result<BoundUpdate, SqlSurfaceError> {
-    let mut seen_columns: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut assignments: Vec<(usize, crate::row_codec::Value)> =
-        Vec::with_capacity(stmt.assignments.len());
+    let assignments = bind_set_assignments(&stmt.assignments, schema)?;
 
-    for (name, literal) in &stmt.assignments {
+    let id: u64 = stmt.id_literal.parse().map_err(|_| {
+        SqlSurfaceError::invalid_input(format!("malformed id value: {}", stmt.id_literal))
+    })?;
+
+    Ok(BoundUpdate {
+        table: stmt.table_name.clone(),
+        id,
+        assignments,
+        operation_id: stmt.operation_id.clone(),
+    })
+}
+
+/// `UPDATE` の SET 句（(列名, リテラル) 対応の宣言順スライス）を `schema` と
+/// 照合して束縛する共通ヘルパー（SQL-17・SQL-19、TASK-191・TASK-192・
+/// Issue #869 で [`bind_update`] から抽出）。検出する違反・拒否コードは
+/// [`bind_update`] のドキュメントに記載のとおり（疑似列・RLS 内部列の SET 対象化は
+/// `42601`、それ以外の意味論的不正は `22000`）。
+fn bind_set_assignments(
+    assignments: &[(String, InsertLiteral)],
+    schema: &TableSchema,
+) -> Result<Vec<(usize, crate::row_codec::Value)>, SqlSurfaceError> {
+    let mut seen_columns: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut bound: Vec<(usize, crate::row_codec::Value)> = Vec::with_capacity(assignments.len());
+
+    for (name, literal) in assignments {
         if name == "id" || name == "tenant_id" || name == "visibility" {
             return Err(SqlSurfaceError::unsupported(format!(
                 "column {name:?} cannot be targeted by SET"
@@ -1199,19 +1225,185 @@ pub fn bind_update(
                 )))
             }
         };
-        assignments.push((col_idx, value));
+        bound.push((col_idx, value));
     }
 
-    let id: u64 = stmt.id_literal.parse().map_err(|_| {
-        SqlSurfaceError::invalid_input(format!("malformed id value: {}", stmt.id_literal))
-    })?;
+    Ok(bound)
+}
 
-    Ok(BoundUpdate {
-        table: stmt.table_name.clone(),
-        id,
-        assignments,
-        operation_id: stmt.operation_id.clone(),
-    })
+/// 1 文の `UPDATE`／`DELETE`（述語形。SQL-19・SQL-20 系）が変更してよい行数の
+/// 上限（本リポの実装既定値。SQL-16・TASK-190 の `MAX_INSERT_ROWS_PER_STATEMENT`
+/// と同じ「1 文あたり」の桁に揃える）。束縛段階では対象行数が確定しないため、
+/// 実行結線（Issue #871・#870）が変更を開始する前に [`check_dml_affected_rows`]
+/// を呼ぶ契約とする（構造検証・束縛のみを担う本モジュールは値を提供するのみで、
+/// 判定自体はここでは行わない）。`count` は対象行集合の全件列挙結果である必要は
+/// なく、広い述語（例: 全行に一致する `WHERE`）による無制限列挙を避けるため、
+/// 呼び出し元は候補行を `MAX_DML_AFFECTED_ROWS + 1` 件に達した時点で列挙を
+/// 打ち切ってその件数を渡してよい（早期終了。security.md「不安全な設計」＝
+/// 未検証入力によるリソース増幅の回避）。
+pub const MAX_DML_AFFECTED_ROWS: usize = 1_000;
+
+/// `count`（対象行数。[`MAX_DML_AFFECTED_ROWS`] を超えたかどうかの判定にのみ
+/// 使うため、呼び出し元は `MAX_DML_AFFECTED_ROWS + 1` 件で打ち切った列挙結果を
+/// 渡してよい）が [`MAX_DML_AFFECTED_ROWS`] を超えないか検証する。超過は
+/// [`SqlSurfaceError::PayloadTooLarge`]（`54000`）。`detail` には件数と上限のみを
+/// 含め、テナント・行内容には触れない（fail-closed。実行前・副作用ゼロの段階で
+/// 拒否する契約。呼び出し元は Issue #871（述語つき `UPDATE` 実行結線）・#870
+/// （述語つき `DELETE`）が変更開始前に呼ぶ）。
+pub fn check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError> {
+    if count > MAX_DML_AFFECTED_ROWS {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "statement would affect {count} rows, exceeding the per-statement limit of {MAX_DML_AFFECTED_ROWS}"
+        )));
+    }
+    Ok(())
+}
+
+/// 束縛済みの述語つき `UPDATE` 文（SQL-19、TASK-192・Issue #869。実行結線は
+/// Issue #871 の担当）。[`BoundUpdate`]（単一行・id 指定形）とは別型として扱う
+/// （[`BoundUpdateForm`] 参照）。
+///
+/// フィールドは `pub(crate)` のまま公開しない（[`BoundScan`] と同じ作法）。
+/// [`Self::new`] も `pub(crate)` の raw constructor であり、クレート外からは
+/// 呼べない（詳細は [`Self::new`] のドキュメント参照）。クレート外からは
+/// アクセサーメソッド経由で読み取るのみで、構築は [`bind_update_form`] の
+/// ような検証済み公開束縛 API を経由してのみ可能（NoSQL 表層の `update` op・
+/// Issue #876 が直接束縛の入口を必要とする場合も、同じ検証を実施する別の
+/// 公開 API を新設し、本 `new` はその内部実装としてのみ使う）。
+///
+/// `expr_filter_programs`（ステップ列コンパイル済み実行形。Issue #353 と同型）は
+/// 本型では保持しない。実行結線（#871）が候補行確定後に
+/// `crate::sql::expr_program::ExprProgram::compile` で都度コンパイルする契約
+/// （束縛時点では行ループを持たないため、コンパイル結果を保持しても
+/// 使う読み手が本 Issue の範囲には存在しない）。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct BoundPredicateUpdate {
+    pub(crate) table: String,
+    /// SET 句の (`schema.columns` の列インデックス, 束縛済み値) 対応。宣言順を
+    /// 保持する（[`BoundUpdate::assignments`] と同じ契約）。
+    pub(crate) assignments: Vec<(usize, crate::row_codec::Value)>,
+    /// SCALAR 段で適用するメタデータフィルタ一覧（等価・前方一致、TASK-147・EXT-3）。
+    pub(crate) metadata_filters: Vec<MetadataFilter>,
+    /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済み。
+    pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+    pub(crate) operation_id: Option<OperationId>,
+}
+
+impl BoundPredicateUpdate {
+    /// クレート内限定の raw constructor（値の意味論検証を強制しない）。
+    ///
+    /// **`pub` にしない**: [`bind_update_form`] が要求する安全性検証
+    /// （`bind_set_assignments` による `id`／`tenant_id`／`visibility` 列への
+    /// SET 拒否、`metadata_filters`・`expr_filters` が両方空＝実質無条件更新の
+    /// 拒否、`LedgerMode::Ledgered` 下での `operation_id` 必須化は
+    /// [`crate::sql::allowlist::validate_update_form`] が `ValidatedUpdateForm` の
+    /// 構築時点で強制する）は、これらの検査を経ていない生のフィールドを
+    /// そのまま受け取れる公開 constructor を crate 外へ晒した時点で迂回可能に
+    /// なる（[`BoundScan::new`] は読み取り専用でありこの意味の安全性検査を
+    /// 持たないため同じ設計にはしない）。NoSQL 表層の `update` op
+    /// （Issue #876）が SQL テキストを経由しない直接束縛の入口を必要とする
+    /// 場合は、[`bind_update_form`] と同じ検証（SET／述語／`operation_id`）を
+    /// 必ず実施したうえで [`BoundPredicateUpdate`] を返す**別の**公開 API を
+    /// 新設し、本 `new` はその内部実装としてのみ使うこと。
+    pub(crate) fn new(
+        table: String,
+        assignments: Vec<(usize, crate::row_codec::Value)>,
+        metadata_filters: Vec<MetadataFilter>,
+        expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+        operation_id: Option<OperationId>,
+    ) -> Self {
+        Self {
+            table,
+            assignments,
+            metadata_filters,
+            expr_filters,
+            operation_id,
+        }
+    }
+
+    /// 束縛対象のテーブル名。
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// SET 句の (列インデックス, 束縛済み値) 対応（宣言順）。
+    pub fn assignments(&self) -> &[(usize, crate::row_codec::Value)] {
+        &self.assignments
+    }
+
+    /// SCALAR 段で適用するメタデータフィルタ一覧。
+    pub fn metadata_filters(&self) -> &[MetadataFilter] {
+        &self.metadata_filters
+    }
+
+    /// `WHERE` の式述語（UDF インライン展開済み）。
+    pub fn expr_filters(&self) -> &[crate::sql::udf_call::BoundExpr] {
+        &self.expr_filters
+    }
+
+    /// 文末専用句で搬送された、検証済みの `operation_id`。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.operation_id.as_ref()
+    }
+}
+
+/// [`bind_update_form`] の戻り値。`UPDATE` の `WHERE` 句が単一行・id 指定形
+/// （SQL-17）か述語形（SQL-19）かで variant を分ける（[`crate::sql::allowlist::
+/// ValidatedUpdateForm`] と対になる束縛結果）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundUpdateForm {
+    Single(BoundUpdate),
+    Predicate(BoundPredicateUpdate),
+}
+
+/// [`crate::sql::allowlist::ValidatedUpdateForm`] を `schema`・UDF レジストリ
+/// `udfs` と照合して [`BoundUpdateForm`] へ束縛する（SQL-19、TASK-192・
+/// Issue #869 の公開 API）。`Single` 腕は既存 [`bind_update`] と完全に同一の
+/// `BoundUpdate` を返す（SET 束縛を [`bind_set_assignments`] で共有するため）。
+///
+/// `Predicate` 腕は SET 束縛の後、`WHERE` 述語列を [`bind_where_predicates`]
+/// （`SELECT`・集計 `SELECT`・広域取得 `SELECT` と同一の意味論。`VECTOR` 列への
+/// 等価／前方一致は `declarative_filter` が `22000`、述語件数は既存の
+/// `MAX_METADATA_FILTERS`〔54000〕、式ノードは `MAX_EXPR_NODES` が頭打ちにする）
+/// で束縛する。両フィルタが空（`WHERE` 省略に構造上相当する `visible()` 単独の
+/// 恒等述語）の場合は実質的な全行更新になるため [`SqlSurfaceError::unsupported`]
+/// （`42601`）で拒否する（`WHERE` 自体の省略は許可リスト層〔`sql::allowlist`〕が
+/// 構造的に拒否済み。ここでの判定は `visible()` のみという実質的な無条件更新
+/// への fail-closed な追加防御）。
+pub fn bind_update_form(
+    stmt: &crate::sql::allowlist::ValidatedUpdateForm,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundUpdateForm, SqlSurfaceError> {
+    use crate::sql::allowlist::ValidatedUpdateForm;
+
+    match stmt {
+        ValidatedUpdateForm::Single(single) => {
+            Ok(BoundUpdateForm::Single(bind_update(single, schema)?))
+        }
+        ValidatedUpdateForm::Predicate(predicate) => {
+            let assignments = bind_set_assignments(&predicate.assignments, schema)?;
+
+            let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+            let (metadata_filters, expr_filters, _rls_predicate_present) =
+                bind_where_predicates(&predicate.where_predicates, schema, udfs, &mut node_budget)?;
+
+            if metadata_filters.is_empty() && expr_filters.is_empty() {
+                return Err(SqlSurfaceError::unsupported(
+                    "predicate-form UPDATE WHERE clause must contain at least one non-visible() predicate (unconditional UPDATE is not supported; use TRUNCATE for whole-table operations)",
+                ));
+            }
+
+            Ok(BoundUpdateForm::Predicate(BoundPredicateUpdate::new(
+                predicate.table_name.clone(),
+                assignments,
+                metadata_filters,
+                expr_filters,
+                predicate.operation_id.clone(),
+            )))
+        }
+    }
 }
 
 /// ファイル形 `INSERT` の束縛結果（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2）。
@@ -3179,6 +3371,177 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- bind_update_form（SQL-19、TASK-192・Issue #869） -----------------------
+
+    fn bind_update_form_sql(sql: &str) -> Result<BoundUpdateForm, SqlSurfaceError> {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_update_form(
+            sql,
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+        bind_update_form(
+            &stmt,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+    }
+
+    #[test]
+    fn bind_update_form_single_arm_matches_bind_update() {
+        let sql = "UPDATE documents SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-0001'";
+        let via_bind_update = bind_update_sql(sql).expect("bind_update must succeed");
+        let via_form = bind_update_form_sql(sql).expect("bind_update_form must succeed");
+        match via_form {
+            BoundUpdateForm::Single(bound) => assert_eq!(bound, via_bind_update),
+            BoundUpdateForm::Predicate(_) => panic!("expected Single variant"),
+        }
+    }
+
+    #[test]
+    fn bind_update_form_predicate_arm_binds_equality_metadata_filter() {
+        let bound = bind_update_form_sql(
+            "UPDATE documents SET body = 'x' WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+        )
+        .expect("predicate-form UPDATE must bind");
+        match bound {
+            BoundUpdateForm::Predicate(p) => {
+                assert_eq!(p.metadata_filters().len(), 1);
+                assert!(p.expr_filters().is_empty());
+                assert_eq!(
+                    p.assignments(),
+                    &[(1, crate::row_codec::Value::Text("x".to_string()))]
+                );
+            }
+            BoundUpdateForm::Single(_) => panic!("expected Predicate variant"),
+        }
+    }
+
+    #[test]
+    fn bind_update_form_predicate_arm_binds_expression_filter_for_id_comparison() {
+        let bound = bind_update_form_sql(
+            "UPDATE documents SET body = 'x' WHERE id > 10 USING OPERATION_ID 'op-0001'",
+        )
+        .expect("id > 10 must bind as an expression filter");
+        match bound {
+            BoundUpdateForm::Predicate(p) => {
+                assert!(p.metadata_filters().is_empty());
+                assert_eq!(p.expr_filters().len(), 1);
+            }
+            BoundUpdateForm::Single(_) => panic!("expected Predicate variant"),
+        }
+    }
+
+    #[test]
+    fn bind_update_form_predicate_arm_rejects_set_of_id_column() {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_update_form(
+            "UPDATE documents SET id = '5' WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+        let err = bind_update_form(
+            &stmt,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_update_form_predicate_arm_rejects_vector_column_predicate() {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE embedding = 'x' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+        let err = bind_update_form(
+            &stmt,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_update_form_predicate_arm_rejects_visible_only_where() {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE visible() USING OPERATION_ID 'op-0001'",
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+        let err = bind_update_form(
+            &stmt,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_update_form_predicate_arm_rejects_id_equality_with_non_numeric_literal() {
+        // `WHERE id = 'x'` は id 単純形の 3 トークン一致（`Number` 期待）に外れて
+        // 述語形へ流れ、`declarative_filter` が `id` を未知列として `22000` で
+        // 拒否する（`validate_update` 経由の `42601` とは異なるエントリポイント
+        // ごとの契約差。計画 §2.2 参照）。
+        let err = bind_update_form_sql(
+            "UPDATE documents SET body = 'x' WHERE id = 'x' USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bound_predicate_update_new_round_trips_through_accessors() {
+        // `BoundPredicateUpdate::new` は `pub(crate)` の raw constructor
+        // （codex-review 指摘・PR #985 是正）であり、意味論検証（SET 対象列・
+        // 無条件更新拒否・`operation_id` 必須化）は行わない契約のまま。
+        // 本テストはアクセサーの往復のみを検証し、「空フィルタが安全に構築できる
+        // 公開 API がある」ことは意味しない（crate 外からの直接構築は不可能）。
+        let bound = BoundPredicateUpdate::new(
+            "documents".to_string(),
+            vec![(1, crate::row_codec::Value::Text("x".to_string()))],
+            vec![],
+            vec![],
+            Some(OperationId::parse("op-0001").expect("valid operation_id")),
+        );
+        assert_eq!(bound.table(), "documents");
+        assert_eq!(
+            bound.assignments(),
+            &[(1, crate::row_codec::Value::Text("x".to_string()))]
+        );
+        assert!(bound.metadata_filters().is_empty());
+        assert!(bound.expr_filters().is_empty());
+        assert_eq!(
+            bound.operation_id().map(OperationId::as_str),
+            Some("op-0001")
+        );
+    }
+
+    #[test]
+    fn check_dml_affected_rows_accepts_up_to_limit_and_rejects_over_limit() {
+        assert!(check_dml_affected_rows(MAX_DML_AFFECTED_ROWS).is_ok());
+        let err = check_dml_affected_rows(MAX_DML_AFFECTED_ROWS + 1).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 
     // --- bind_insert_form: 形判別（TASK-120・INDEX-1, INDEX-2） -----------------

@@ -1915,12 +1915,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE id = <n>
-    /// USING OPERATION_ID '<id>' [;]` の単一行・id 指定形のみを受理する
-    /// （SQL-17、TASK-191）。述語形 WHERE（`lang = 'ja'` 等）・複数テーブル・
-    /// サブクエリ・`RETURNING` は本メソッドが生成できる文法にそもそも存在しない
-    /// ため構造的に受理しない（個別の拒否コードを持たず、`expect_end_of_statement`
-    /// が余剰トークンとして `42601` へ落とす）。
+    /// `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE <where_form>
+    /// USING OPERATION_ID '<id>' [;]` を受理する。`WHERE` 句は [`Self::parse_update_where`]
+    /// が単一行・id 指定形（SQL-17、TASK-191）と述語形（SQL-19、TASK-192）を
+    /// 振り分ける（[`UpdateWhereForm`] のドキュメント参照）。振り分け後の受理判定
+    /// （id 指定形以外は許可しない等）は呼び出し元（[`validate_update_tokens`]・
+    /// [`validate_update_form_tokens`]）の責務とし、本メソッドは構造パースのみを行う。
+    /// 複数テーブル・サブクエリ・`RETURNING` は本メソッドが生成できる文法に
+    /// そもそも存在しないため構造的に受理しない（個別の拒否コードを持たず、
+    /// `expect_end_of_statement` が余剰トークンとして `42601` へ落とす）。
     fn parse_update(&mut self) -> Result<ParsedUpdateShape, SqlSurfaceError> {
         self.expect_contextual_keyword("UPDATE")?;
         let table_name = self.expect_ident()?;
@@ -1937,29 +1940,58 @@ impl<'a> Parser<'a> {
             assignments.push(self.parse_update_assignment()?);
         }
 
-        // WHERE は述語形 WHERE パーサー（`parse_where`）を意図的に使わず、
-        // `id = <n>` の完全一致形のみを狭く受理する（SQL-17 のスコープ。
-        // 述語形 WHERE を伴う UPDATE は別ビヘイビア ID・別 Issue 群の担当）。
         self.expect_keyword(Keyword::Where)?;
-        let where_column = self.expect_ident()?;
-        if where_column != "id" {
-            return Err(SqlSurfaceError::unsupported(
-                "UPDATE WHERE clause must be the form: WHERE id = <n>",
-            ));
-        }
-        self.expect_punct('=')?;
-        let id_literal = self.expect_number()?;
+        let where_form = self.parse_update_where()?;
 
         // 文末専用句の構造パースのみをここで行う（INSERT と同じ順序契約。
-        // 必須化の判定は `validate_update` が `LedgerMode::require` へ委譲する）。
+        // 必須化の判定は `validate_update`／`validate_update_form` が
+        // `LedgerMode::require` へ委譲する）。
         let operation_id = self.parse_operation_id_clause()?;
 
         Ok(ParsedUpdateShape {
             table_name,
             assignments,
-            id_literal,
+            where_form,
             operation_id,
         })
+    }
+
+    /// `UPDATE` の `WHERE`（`Keyword::Where` 消費済み）を [`UpdateWhereForm`] へ
+    /// 振り分ける（SQL-17・SQL-19、TASK-191・TASK-192）。
+    ///
+    /// 判定は決定的: 直後の 3 トークンが `Ident("id")`・`Punct('=')`・
+    /// `Token::Number` で、かつその次のトークンが文末（`None`）・`Punct(';')`・
+    /// 文脈的キーワード `USING` のいずれかである場合に限り [`UpdateWhereForm::Id`]
+    /// （単一行・id 指定形）とし、それ以外はすべて位置を巻き戻して
+    /// [`Self::parse_where`]（`SELECT`・集計 `SELECT`・広域取得 `SELECT` と同一の
+    /// 許可述語列表現）で [`UpdateWhereForm::Predicates`] を構築する。`id = 'x'`
+    /// （数値以外の id 比較）・`lang = 'ja'` は先頭 3 トークン一致条件（`Ident("id")`・
+    /// `Punct('=')`・`Number`）そのものに外れるため述語形へ流れる。`id = 5 AND
+    /// lang = 'ja'` は先頭 3 トークンには一致するが、4 番目のトークンが終端
+    /// （`None`・`Punct(';')`・`USING`）ではなく `AND` であるため 4 番目の条件で
+    /// 述語形へ流れる——`validate_update`（既存の id 指定形専用エントリ
+    /// ポイント）はこの結果が `Predicates` なら `42601` で拒否することで、
+    /// 旧来の狭い受理形をそのまま維持する（後方互換）。
+    fn parse_update_where(&mut self) -> Result<UpdateWhereForm, SqlSurfaceError> {
+        let start = self.pos;
+        let is_id_simple_prefix = matches!(self.tokens.get(self.pos), Some(Token::Ident(name)) if name == "id")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::Number(_)));
+        let has_terminator = matches!(
+            self.tokens.get(self.pos + 3),
+            None | Some(Token::Punct(';'))
+        ) || matches!(self.tokens.get(self.pos + 3), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("USING"));
+
+        if is_id_simple_prefix && has_terminator {
+            self.advance(); // "id"
+            self.advance(); // '='
+            let id_literal = self.expect_number()?;
+            return Ok(UpdateWhereForm::Id(id_literal));
+        }
+
+        self.pos = start;
+        let predicates = self.parse_where()?;
+        Ok(UpdateWhereForm::Predicates(predicates))
     }
 
     /// UPDATE の SET 句の 1 要素（`<col> = <lit>`）を構造パースする。
@@ -2788,12 +2820,102 @@ pub(crate) fn validate_truncate_tokens(
     })
 }
 
-/// 構文木（[`ValidatedUpdate`] の元）。カタログ存在確認前の中間結果（SQL-17、TASK-191）。
+/// `UPDATE` の `WHERE` 句が単一行・id 指定形（SQL-17、TASK-191）か述語形
+/// （SQL-19、TASK-192）かを表す内部表現。[`Parser::parse_update_where`] が
+/// 決定的に振り分ける。`validate_update`（既存の id 指定形専用エントリ
+/// ポイント）は `Predicates` を `42601` で拒否し、`validate_update_form`
+/// （SQL-19 の新エントリポイント）は両方を受理して [`ValidatedUpdateForm`]
+/// の該当 variant へ写像する。
+enum UpdateWhereForm {
+    /// `WHERE id = <n>`（`USING OPERATION_ID`／文末／`;` が直後に続く狭い形）。
+    /// 生数値文字列を保持し、`u64` への意味論的解釈は `sql::parser` の責務。
+    Id(String),
+    /// 述語形（`SELECT`・集計 `SELECT`・広域取得 `SELECT` と同一の
+    /// [`WherePredicate`] 列。`AND` 結合順を保持）。
+    Predicates(Vec<WherePredicate>),
+}
+
+/// 構文木（[`ValidatedUpdate`]／[`ValidatedPredicateUpdate`] の元）。カタログ
+/// 存在確認前の中間結果（SQL-17・SQL-19、TASK-191・TASK-192）。
 struct ParsedUpdateShape {
     table_name: String,
     assignments: Vec<(String, InsertLiteral)>,
-    id_literal: String,
+    where_form: UpdateWhereForm,
     operation_id: Option<OperationId>,
+}
+
+/// 許可形状の構造判定を通過した述語つき `UPDATE` 文（SQL-19、TASK-192）。
+/// [`ValidatedUpdate`]（単一行・id 指定形）とは別 variant として扱う
+/// （[`ValidatedUpdateForm`] 参照）。本モジュールが保証するのはここまでの
+/// 構造情報のみで、列名・値・述語の意味論的妥当性は検証しない
+/// （`sql::parser::bind_update_form` の責務）。
+///
+/// 受理する形は `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE
+/// <述語>[ AND <述語>]* USING OPERATION_ID '<id>' [;]`（`<述語>` は `SELECT` の
+/// `WHERE` と同一形状。[`WherePredicate`]）。`WHERE` 句自体の省略は本モジュールの
+/// `expect_keyword(Keyword::Where)` が構造的に拒否する（`42601`）ため本型は
+/// 構築されない。`WHERE` 句が存在しても中身が `visible()` 単独の恒等述語のみ
+/// （非 `visible()` 述語が 1 つも無い）場合は許可リスト構造としては受理するが、
+/// 実質的な全行更新になるため [`crate::sql::parser::bind_update_form`] が
+/// 束縛時に `42601` で拒否する。
+///
+/// フィールドは `pub(crate)` のまま公開しない（[`crate::sql::parser::
+/// BoundPredicateUpdate`] と同じ作法）。本型は `validate_update_form_tokens`
+/// 内でのみ構築され、構築前に `mode.require(shape.operation_id.as_ref())`
+/// （`operation_id` 必須化ガード。TASK-92・RECOVER-1）を必ず通す。フィールドを
+/// `pub` にすると、クレート外の呼び出し元が `operation_id: None` を含む値を
+/// この検証を経ずに直接組み立て、`bind_update_form`（同ゲートを再検証しない。
+/// 検証済み入力である本型の契約を信頼する設計）へそのまま渡してガードを
+/// 迂回できてしまう（codex-review 指摘・PR #985）。クレート外からはアクセサー
+/// メソッド経由で読み取る。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ValidatedPredicateUpdate {
+    /// UPDATE に指定され、カタログ存在確認を通過したテーブル名。
+    pub(crate) table_name: String,
+    /// SET 句の (列名, リテラル) 対応。宣言順を保持する（[`ValidatedUpdate::assignments`]
+    /// と同じ契約）。
+    pub(crate) assignments: Vec<(String, InsertLiteral)>,
+    /// `WHERE` 句に含まれる述語（`AND` 結合順）。`SELECT`（[`ValidatedStatement::
+    /// where_predicates`]）と同一の許可形状を再利用する。
+    pub(crate) where_predicates: Vec<WherePredicate>,
+    /// 文末専用句で搬送された、検証済みの `operation_id`。契約は
+    /// [`ValidatedUpdate::operation_id`] と同一。
+    pub(crate) operation_id: Option<OperationId>,
+}
+
+impl ValidatedPredicateUpdate {
+    /// UPDATE に指定され、カタログ存在確認を通過したテーブル名。
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// SET 句の (列名, リテラル) 対応（宣言順）。
+    pub fn assignments(&self) -> &[(String, InsertLiteral)] {
+        &self.assignments
+    }
+
+    /// `WHERE` 句に含まれる述語（`AND` 結合順）。
+    pub fn where_predicates(&self) -> &[WherePredicate] {
+        &self.where_predicates
+    }
+
+    /// 文末専用句で搬送された、検証済みの `operation_id`。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.operation_id.as_ref()
+    }
+}
+
+/// [`validate_update_form`] の戻り値。`UPDATE` の `WHERE` 句が単一行・id 指定形
+/// （SQL-17）か述語形（SQL-19）かで variant を分ける（破壊的変更を避けるため
+/// 既存 [`validate_update`]／[`ValidatedUpdate`] はそのまま残し、本 enum は
+/// 追加型として提供する）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidatedUpdateForm {
+    /// 単一行・id 指定形（既存の [`ValidatedUpdate`] と同一の意味論）。
+    Single(ValidatedUpdate),
+    /// 述語形（SQL-19、TASK-192）。
+    Predicate(ValidatedPredicateUpdate),
 }
 
 /// UPDATE 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を通じて
@@ -2831,6 +2953,20 @@ pub(crate) fn validate_update_tokens(
     let shape = p.parse_update()?;
     p.expect_end_of_statement()?;
 
+    // 述語形 WHERE（SQL-19、TASK-192）は本エントリポイントのスコープ外
+    // （`validate_update` は id 指定形〔SQL-17〕専用のまま維持する。後方互換）。
+    // `operation_id` 必須化ガード・カタログ存在確認より前に判定することで、
+    // 既存テスト（`rejects_update_with_predicate_where_clause` 等）の
+    // エラーコード（`42601`）・判定順序を変えない。
+    let id_literal = match shape.where_form {
+        UpdateWhereForm::Id(id_literal) => id_literal,
+        UpdateWhereForm::Predicates(_) => {
+            return Err(SqlSurfaceError::unsupported(
+                "UPDATE WHERE clause must be the form: WHERE id = <n> (predicate-form WHERE is supported by the predicate-form entry point, SQL-19)",
+            ));
+        }
+    };
+
     mode.require(shape.operation_id.as_ref())?;
 
     let exists = lookup.table_exists(&shape.table_name)?;
@@ -2841,8 +2977,67 @@ pub(crate) fn validate_update_tokens(
     Ok(ValidatedUpdate {
         table_name: shape.table_name,
         assignments: shape.assignments,
-        id_literal: shape.id_literal,
+        id_literal,
         operation_id: shape.operation_id,
+    })
+}
+
+/// `UPDATE` 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を
+/// 通じて UPDATE 対象テーブルがカタログに実在するかを確認する（SQL-19、
+/// TASK-192 の公開 API）。単一行・id 指定形（SQL-17）・述語形（SQL-19）の
+/// 両方を受理し、[`ValidatedUpdateForm`] の該当 variant へ振り分ける。
+/// 既存の [`validate_update`]（id 指定形専用・[`ValidatedUpdate`] を返す）は
+/// 挙動・シグネチャとも変更しない（破壊的変更を避けるための追加型 API。
+/// `sql.rs` モジュールドキュメント参照）。
+///
+/// 検証順序は決定的（同一入力には常に同一の [`SqlSurfaceError`] を返す）:
+/// 構造検証（`WHERE` 省略は `42601`） → `operation_id` 必須化ガード
+/// （`mode.require`。TASK-92・RECOVER-1） → UPDATE 対象テーブルのカタログ
+/// 存在確認。意味論的束縛（`sql::parser::bind_update_form`）・RLS 可視集合に
+/// 基づく実行・影響行数上限の適用は別 Issue の担当（#871）。
+pub fn validate_update_form(
+    sql: &str,
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_update_form_tokens(&tokens, lookup, mode)
+}
+
+/// [`validate_update_form`] の本体。トークン列を受け取ることで、呼び出し元が
+/// 既に先頭トークン判定のために `tokenize` 済みの場合、同一 SQL 文字列の
+/// 再トークナイズを避けられる（`validate_update_tokens` と同じ設計）。
+pub(crate) fn validate_update_form_tokens(
+    tokens: &[lexer::Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let shape = p.parse_update()?;
+    p.expect_end_of_statement()?;
+
+    mode.require(shape.operation_id.as_ref())?;
+
+    let exists = lookup.table_exists(&shape.table_name)?;
+    if !exists {
+        return Err(SqlSurfaceError::undefined_table(shape.table_name));
+    }
+
+    Ok(match shape.where_form {
+        UpdateWhereForm::Id(id_literal) => ValidatedUpdateForm::Single(ValidatedUpdate {
+            table_name: shape.table_name,
+            assignments: shape.assignments,
+            id_literal,
+            operation_id: shape.operation_id,
+        }),
+        UpdateWhereForm::Predicates(where_predicates) => {
+            ValidatedUpdateForm::Predicate(ValidatedPredicateUpdate {
+                table_name: shape.table_name,
+                assignments: shape.assignments,
+                where_predicates,
+                operation_id: shape.operation_id,
+            })
+        }
     })
 }
 
@@ -5583,6 +5778,266 @@ mod tests {
         )
         .expect_err("undefined table must be rejected");
         assert_eq!(err.wire_code(), "42P01");
+    }
+
+    // --- SQL-19・TASK-192: 述語つき UPDATE ... WHERE の許可リスト・振り分け ---
+
+    #[test]
+    fn validate_update_form_accepts_equality_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let form = validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("equality predicate WHERE must be accepted");
+        match form {
+            ValidatedUpdateForm::Predicate(p) => {
+                assert_eq!(p.where_predicates.len(), 1);
+                assert!(matches!(
+                    &p.where_predicates[0],
+                    WherePredicate::Equality { column, value }
+                        if column == "lang" && value == "ja"
+                ));
+            }
+            ValidatedUpdateForm::Single(_) => panic!("expected Predicate variant"),
+        }
+    }
+
+    #[test]
+    fn validate_update_form_accepts_prefix_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let form = validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE path LIKE 'src/%' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("prefix predicate WHERE must be accepted");
+        assert!(matches!(form, ValidatedUpdateForm::Predicate(_)));
+    }
+
+    #[test]
+    fn validate_update_form_accepts_id_range_and_equality_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let form = validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE id > 10 AND lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("id range combined with equality must be accepted as predicate form");
+        match form {
+            ValidatedUpdateForm::Predicate(p) => assert_eq!(p.where_predicates.len(), 2),
+            ValidatedUpdateForm::Single(_) => panic!("expected Predicate variant"),
+        }
+    }
+
+    #[test]
+    fn validate_update_form_accepts_id_equality_combined_with_and_as_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let form = validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE id = 5 AND lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("id = 5 AND ... must fall through to predicate form");
+        match form {
+            ValidatedUpdateForm::Predicate(p) => {
+                assert_eq!(p.where_predicates.len(), 2);
+                assert!(matches!(
+                    &p.where_predicates[0],
+                    WherePredicate::Expression(Expr::Binary { op: BinOp::Eq, .. })
+                ));
+            }
+            ValidatedUpdateForm::Single(_) => panic!("expected Predicate variant"),
+        }
+    }
+
+    #[test]
+    fn validate_update_form_accepts_visible_combined_with_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let form = validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE visible() AND lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("visible() combined with a predicate must be accepted");
+        match form {
+            ValidatedUpdateForm::Predicate(p) => assert_eq!(p.where_predicates.len(), 2),
+            ValidatedUpdateForm::Single(_) => panic!("expected Predicate variant"),
+        }
+    }
+
+    #[test]
+    fn validate_update_form_dispatches_id_simple_form_with_operation_id_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let form = validate_update_form(
+            "UPDATE documents SET lang = 'en' WHERE id = 5 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("id simple form must be accepted");
+        match form {
+            ValidatedUpdateForm::Single(u) => assert_eq!(u.id_literal, "5"),
+            ValidatedUpdateForm::Predicate(_) => panic!("expected Single variant"),
+        }
+    }
+
+    #[test]
+    fn validate_update_form_dispatches_id_simple_form_with_semicolon() {
+        let lookup = catalog_with(&["documents"]);
+        let form = validate_update_form(
+            "UPDATE documents SET lang = 'en' WHERE id = 5;",
+            &lookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect("id simple form followed by ';' must be accepted");
+        assert!(matches!(form, ValidatedUpdateForm::Single(_)));
+    }
+
+    #[test]
+    fn validate_update_form_dispatches_id_simple_form_with_end_of_statement() {
+        let lookup = catalog_with(&["documents"]);
+        let form = validate_update_form(
+            "UPDATE documents SET lang = 'en' WHERE id = 5",
+            &lookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect("id simple form at end of statement must be accepted");
+        assert!(matches!(form, ValidatedUpdateForm::Single(_)));
+    }
+
+    #[test]
+    fn validate_update_form_still_rejects_missing_where_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update_form(
+            "UPDATE documents SET lang = 'en' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("missing WHERE clause must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn validate_update_form_still_rejects_hint_order_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE lang = 'ja' HINT ORDER(RLS, SCALAR, DISTANCE) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("HINT ORDER suffix must be rejected as trailing tokens");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn validate_update_form_still_rejects_using_mode_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE lang = 'ja' USING MODE 'recall' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("USING MODE suffix must be rejected as trailing tokens");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn validate_update_form_still_rejects_order_by_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE lang = 'ja' ORDER BY id LIMIT 1 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("ORDER BY suffix must be rejected as trailing tokens");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn validate_update_form_still_rejects_limit_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE lang = 'ja' LIMIT 1 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("LIMIT suffix must be rejected as trailing tokens");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn validate_update_form_still_rejects_returning_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update_form(
+            "UPDATE documents SET body = 'x' WHERE lang = 'ja' USING OPERATION_ID 'op-0001' RETURNING id",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("RETURNING suffix must be rejected as trailing tokens");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn validate_update_form_still_rejects_multiple_tables() {
+        let lookup = catalog_with(&["documents", "notes"]);
+        let err = validate_update_form(
+            "UPDATE documents, notes SET body = 'x' WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("multiple tables must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn validate_update_form_predicate_operation_id_guard_precedes_catalog_lookup() {
+        struct FlaggingCatalog {
+            called: std::cell::Cell<bool>,
+        }
+        impl TableLookup for FlaggingCatalog {
+            fn table_exists(&self, _name: &str) -> Result<bool, SqlSurfaceError> {
+                self.called.set(true);
+                Ok(true)
+            }
+        }
+        let lookup = FlaggingCatalog {
+            called: std::cell::Cell::new(false),
+        };
+        let err = validate_update_form(
+            "UPDATE nope SET lang = 'en' WHERE lang = 'ja'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("missing operation_id must be rejected before catalog lookup");
+        assert_eq!(err.wire_code(), "23502");
+        assert!(
+            !lookup.called.get(),
+            "catalog lookup must not be reached before the operation_id clause is validated"
+        );
+    }
+
+    #[test]
+    fn validate_update_form_rejects_undefined_table_for_predicate_form() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update_form(
+            "UPDATE ghost SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("undefined table must be rejected");
+        assert_eq!(err.wire_code(), "42P01");
+    }
+
+    #[test]
+    fn validate_update_form_is_deterministic_across_repeated_calls() {
+        let lookup = catalog_with(&["documents"]);
+        let sql = "UPDATE documents SET body = 'x' WHERE lang = 'ja' AND path LIKE 'src/%' AND id > 10 USING OPERATION_ID 'op-0001'";
+        let first = validate_update_form(sql, &lookup, LedgerMode::Ledgered)
+            .expect("first call must succeed");
+        let second = validate_update_form(sql, &lookup, LedgerMode::Ledgered)
+            .expect("second call must succeed");
+        assert_eq!(first, second);
     }
 
     #[test]

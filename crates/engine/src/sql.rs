@@ -104,6 +104,17 @@
 //! [`using_plan::bind_expansion`] → [`exec::execute_statement`] という一意の
 //! 経路へディスパッチし、`core.rs::EngineCore::execute_sql_in_session` が
 //! `ValidatedStatement::using_plan` の有無で分岐する。
+//!
+//! Issue #869（対象ビヘイビア: SQL-19・TASK-192）: 述語つき `UPDATE ... WHERE`
+//! （`lang = 'ja'` 等。単一行・id 指定形 `UPDATE`〔SQL-17・TASK-191〕とは別型）の
+//! 許可リスト・束縛を追加型 API として実装した。構文は
+//! [`allowlist::validate_update_form`]（[`allowlist::ValidatedUpdateForm`] を
+//! 返す。既存 `validate_update` は id 指定形専用のまま無変更）、束縛は
+//! [`parser::bind_update_form`]（`WHERE` 述語表現は [`parser::bind_where_predicates`]
+//! を `SELECT`・集計 `SELECT`・広域取得 `SELECT` と共有し二重実装を作らない）。
+//! 1 文あたりの影響行数上限は [`parser::MAX_DML_AFFECTED_ROWS`]／
+//! [`parser::check_dml_affected_rows`] として用意し、実行結線（候補行の確定・
+//! 一括適用・原子性）は別 Issue（#871）の担当。
 
 pub mod aggregate;
 pub mod allowlist;
