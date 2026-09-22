@@ -3076,7 +3076,10 @@ pub(crate) fn validate_update_tokens(
         assignments: shape.assignments,
         id_literal,
         operation_id: shape.operation_id,
-        returning: shape.returning,
+        // 直前のガードで `shape.returning.is_some()` は既に `42601` で
+        // 拒否済みのため、ここへ到達する時点で常に `None`
+        // （`validate_update_form_tokens` の同型ガードと表記を揃える）。
+        returning: None,
     })
 }
 
