@@ -363,17 +363,17 @@ fn tenant_a_group_by_does_not_reveal_tenant_b_exclusive_group() {
 }
 
 #[test]
-fn tenant_b_group_by_sees_cross_tenant_public_rows_but_not_own_private_row() {
+fn tenant_b_group_by_sees_cross_tenant_public_rows_and_own_private_row() {
     // `PolicyContext::is_visible`（`engine::policy`）の契約は「`Public` 行は
     // テナントを問わず可視・`Private` 行は所有テナントかつ明示許可
     // （`with_visibilities` に `Private` を含む場合のみ）可視」。wire の
-    // ログインセッションが導出する `PolicyContext`（`auth::verify` →
-    // `PolicyContext::new`）は常に `Public` のみを許可可視性集合とするため
-    // （`Private` は対象外。`simple_query.rs` モジュール doc・`auth.rs`
-    // 参照）、tenant-b（bob）から見ても tenant-a の `Public` 行のグループは
-    // そのまま見える一方、tenant-b 自身の唯一の行（`Visibility::Private`）は
-    // 可視化されない——「他テナントの `Public` 行は見える」「自テナントでも
-    // `Private` 行は wire ログイン経由では見えない」の両方を固定する。
+    // ログインセッションが導出する `PolicyContext`（`auth::verify`）は
+    // `Public` ＋ 自テナント `Private` を許可可視性集合とするため（RLS-11・
+    // TASK-195・read-your-writes。`auth.rs` 参照）、tenant-b（bob）から見て
+    // tenant-a の `Public` 行のグループはそのまま見え、かつ tenant-b 自身の
+    // `Visibility::Private` 行も可視化される——「他テナントの `Public` 行は
+    // 見える」「自テナントの `Private` 行は read-your-writes により見える」
+    // の両方を固定する。
     let (core, _guard) = new_core();
     let addr = spawn(Arc::clone(&core));
 
@@ -383,7 +383,8 @@ fn tenant_b_group_by_sees_cross_tenant_public_rows_but_not_own_private_row() {
     let resp = query_as_bob(addr, body);
     assert_eq!(resp.status, 200, "resp={resp:?}");
     let wire_scoped_ctx_b =
-        PolicyContext::new("tenant-b").expect("valid tenant-b ctx (Public only, wire 既定)");
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant-b ctx (Public + own tenant Private, wire 既定)");
     let mut session = SessionState::default();
     let outcome = core
         .execute_sql_in_session(
@@ -397,9 +398,11 @@ fn tenant_b_group_by_sees_cross_tenant_public_rows_but_not_own_private_row() {
     };
     let oracle = encode_query_result(&result).expect("oracle result should encode");
     assert_eq!(body_utf8(&resp), oracle);
-    assert!(!body_utf8(&resp).contains("xx"), "{}", body_utf8(&resp));
-    // tenant-a の Public 行（"en"・"ja"・NULL の 3 グループ）は可視。
-    assert_eq!(result.rows.len(), 3);
+    // tenant-a の Public 行（"en"・"ja"・NULL の 3 グループ）に加え、
+    // tenant-b 自身の Private 行（lang="xx"）のグループも可視（RLS-11・
+    // TASK-195・read-your-writes）。
+    assert!(body_utf8(&resp).contains("xx"), "{}", body_utf8(&resp));
+    assert_eq!(result.rows.len(), 4);
 }
 
 #[test]

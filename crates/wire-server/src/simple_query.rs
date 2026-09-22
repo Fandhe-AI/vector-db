@@ -11,20 +11,18 @@
 //! `INSERT` は wire 経由で受理する（TASK-82・SQL-10。`EngineCore::
 //! execute_sql_in_session` が先頭トークンを見て `execute_insert_sql`（TASK-80）
 //! へ委譲し `SqlOutcome::Insert` を返す。`crates/engine/src/core.rs` 参照）。
-//! ただし engine 側の `INSERT`（`sql::exec::execute_insert`）は行を常に
-//! `Visibility::Private` で書き込む固定仕様である一方、wire 認証経由の
-//! `PolicyContext`（`auth::verify` → `PolicyContext::new`）は `Public` のみを
-//! 許可可視性とする最小権限の既定を維持している（
-//! `wire1_three_tenant_visibility_public_shared_private_hidden` が、認証した
-//! テナント自身の `Private` 行も含めて wire 越しには不可視であることを
-//! 回帰確認済み。codex-review P1・PR #210 指摘の検討過程で確認）。そのため
-//! **読み取り可視性の既定は変更しない**（権限拡大なし）: wire 経由で書いた
-//! `Private` 行は wire の `SELECT` では引き続き不可視であり、書いた本人が
-//! その場で読み戻すことはできない（`tests/wire_insert_operation_id.rs` が
-//! この非対称性を契約として固定する。永続化自体は engine API 側の `Private`
-//! 可視 `PolicyContext` から確認できる）。wire セッションへの自テナント
-//! `Private` 行の読み戻し可視性付与は別途の RLS 設計課題としてスコープ外
-//! （PR 本文参照）。
+//! engine 側の `INSERT`（`sql::exec::execute_insert`）は行を常に
+//! `Visibility::Private` で書き込む固定仕様であり、wire 認証経由の
+//! `PolicyContext`（`auth::verify`）は `Public` ＋ 自テナントの `Private` を
+//! 許可可視性とする（RLS-11・TASK-195。read-your-writes: 書いた本人が
+//! 同一テナントの別セッションも含めて commit 済みの自分の行を読み戻せる）。
+//! 他テナントの `Private` 行は引き続き不可視のまま
+//! （`wire1_three_tenant_visibility_public_shared_own_private_visible` が
+//! 回帰確認）。wire 経由で書いた `Private` 行は同一 wire セッションの
+//! `SELECT` でも可視であり、書いた本人がその場で読み戻せる
+//! （`wire1_insert_is_accepted_and_row_is_visible_over_wire_select_to_own_tenant`
+//! が契約を固定する。永続化自体は engine API 側の `Private` 可視
+//! `PolicyContext` からも同じく確認できる）。
 
 use std::io::{self, Write};
 use std::net::TcpStream;

@@ -7,12 +7,14 @@
 //! （`accept_loop_with_engine`）に対し C1 相当のクエリ・INSERT・SET・
 //! 空クエリ・不正 UTF-8・エラー後の接続維持・3 テナント RLS 分離を検証する。
 //! `INSERT` は wire の簡易クエリプロトコル経由で受理する（TASK-82・SQL-10。
-//! `simple_query.rs` のモジュールコメント参照）。ただし書き込む行は常に
-//! `Visibility::Private` の固定仕様であり、wire 認証経由の `PolicyContext` は
-//! `Public` のみを許可可視性とする最小権限の既定を維持するため、書いた本人も
-//! 同一 wire セッションではその行を読み戻せない（下記
-//! `wire1_insert_is_accepted_but_row_is_invisible_over_wire_select` が固定する
-//! 契約）。実 `psql` 等の外部クライアントを使う 3 クライアント統合検証は
+//! `simple_query.rs` のモジュールコメント参照）。書き込む行は常に
+//! `Visibility::Private` の固定仕様である一方、wire 認証経由の `PolicyContext`
+//! は `Public` ＋ 自テナントの `Private` を許可可視性とする（RLS-11・
+//! TASK-195。read-your-writes）ため、書いた本人は同一 wire セッションでも
+//! その行を読み戻せる（下記
+//! `wire1_insert_is_accepted_and_row_is_visible_over_wire_select_to_own_tenant`
+//! が固定する契約）。他テナントの `Private` 行は引き続き不可視のまま。実
+//! `psql` 等の外部クライアントを使う 3 クライアント統合検証は
 //! `tests/extended_syntax_e2e.rs`（`#[ignore]`）が担い、本ファイルはその契約の
 //! 中核（受信バイト列は同一）を常時（`make ci`）回帰保護する。
 
@@ -117,22 +119,16 @@ fn wire1_c1_query_returns_row_description_and_data_rows() {
 /// execute_sql_in_session` が先頭トークンを見て `execute_insert_sql`
 /// （TASK-80）へ委譲する。`crates/engine/src/core.rs` 参照）。
 ///
-/// ただし SQL `INSERT` が書き込む行は常に `Visibility::Private`（`sql::exec::
+/// SQL `INSERT` が書き込む行は常に `Visibility::Private`（`sql::exec::
 /// execute_insert` の固定仕様）である一方、wire 認証経由の `PolicyContext`
-/// （`auth::verify` → `PolicyContext::new`）は `Public` のみを許可可視性とする
-/// （`wire1_three_tenant_visibility_public_shared_private_hidden` が回帰確認する
-/// 既存の最小権限境界であり、自テナント自身の `Private` 行も対象に含めて
-/// 意図的に不可視。codex-review P1・PR #210 指摘の検討過程で確認済み）。
-/// TASK-82 はこの最小権限境界を緩めない（読み取り可視性の既定は拡大しない）
-/// 判断のもとで `INSERT` のみを受理するため、書いた本人も**同一 wire
-/// セッションの SELECT ではその行を読み戻せない**（wire セッションへの
-/// 自テナント `Private` 行の読み戻し可視性付与は別途の RLS 設計課題として
-/// スコープ外。PR 本文参照）。本テストはその非対称性——(1) wire 経由の
-/// `INSERT` 成功・(2) 直後の wire `SELECT` では不可視・(3) engine API
-/// （`Private` 可視 `PolicyContext`）では永続化済みとして読める——を 1 つの
-/// 契約として固定する。
+/// （`auth::verify`）は `Public` ＋ 自テナントの `Private` を許可可視性とする
+/// （RLS-11・TASK-195。read-your-writes）ため、書いた本人は**同一 wire
+/// セッションの SELECT でもその行を読み戻せる**。本テストはその契約——(1) wire
+/// 経由の `INSERT` 成功・(2) 直後の wire `SELECT` で可視・(3) engine API
+/// （`Private` 可視 `PolicyContext`）でも同じく永続化済みとして読める——を
+/// 1 つの契約として固定する。
 #[test]
-fn wire1_insert_is_accepted_but_row_is_invisible_over_wire_select() {
+fn wire1_insert_is_accepted_and_row_is_visible_over_wire_select_to_own_tenant() {
     let (core, _guard) = new_core_single_tenant();
     // `spawn_server_with_engine` は `Arc<EngineCore>` の所有権を消費する
     // （サーバースレッドへ move）。永続化確認（下記）は同一 `Arc` の clone を
@@ -150,9 +146,9 @@ fn wire1_insert_is_accepted_but_row_is_invisible_over_wire_select() {
     assert_eq!(tag, "INSERT 0 1");
     read_ready_for_query(&mut stream);
 
-    // (2) 同一 wire セッションの SELECT では書き込んだ id=99 が見えない
-    // （`Public` のみ許可可視性の wire `PolicyContext` に対し、書き込んだ行は
-    // `Private`）。既存 3 行のみが返ること。
+    // (2) 同一 wire セッションの SELECT で書き込んだ id=99 が見える
+    // （`Public` ＋ 自テナント `Private` 許可可視性の wire `PolicyContext`。
+    // RLS-11）。既存 3 行 + id=99 の計 4 行が返ること。
     send_simple_query(
         &mut stream,
         "SELECT * FROM docs ORDER BY embedding <=> '[0.0,0.0,1.0]' LIMIT 4",
@@ -160,20 +156,21 @@ fn wire1_insert_is_accepted_but_row_is_invisible_over_wire_select() {
     let columns = read_row_description(&mut stream);
     assert_eq!(columns, vec!["id", "embedding", "lang"]);
     let mut seen_ids = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let row = read_data_row(&mut stream);
         seen_ids.push(row[0].clone().expect("id is not null"));
     }
     assert!(
-        !seen_ids.contains(&"99".to_string()),
-        "wire SELECT must not observe the Private row written by wire INSERT, got {seen_ids:?}"
+        seen_ids.contains(&"99".to_string()),
+        "wire SELECT must observe the own-tenant Private row written by wire INSERT, got {seen_ids:?}"
     );
     let tag = read_command_complete(&mut stream);
-    assert_eq!(tag, "SELECT 3");
+    assert_eq!(tag, "SELECT 4");
     read_ready_for_query(&mut stream);
 
-    // (3) engine API 側の `Private` 可視 `PolicyContext` では、書き込んだ id=99
-    // が永続化済みとして読める（wire 不可視＝未永続化ではないことの確認）。
+    // (3) engine API 側の `Private` 可視 `PolicyContext` でも、書き込んだ id=99
+    // が同じく永続化済みとして読める（wire・engine API 間で可視性の食い違いが
+    // 無いことの確認）。
     let private_ctx =
         PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
             .expect("valid tenant");
@@ -311,8 +308,9 @@ fn wire1_vector_and_null_cells_are_text_encoded() {
 }
 
 /// 3 テナント（alice/bob/carol）が wire 経由で同一 C1 を実行したとき、
-/// `Private` 行は所有テナントを含めて誰にも見えず（`auth::verify` が導出する
-/// `PolicyContext` は `Public` のみ許可。ポインタ: RLS-6）、`Public` 行は
+/// 各テナントは自分自身の `Private` 行のみ可視で他テナントの `Private` 行は
+/// 見えず（`auth::verify` が導出する `PolicyContext` は `Public` ＋ 自テナント
+/// `Private` を許可。RLS-11・TASK-195・ポインタ: RLS-6）、`Public` 行は
 /// テナント跨ぎで全員に見えること（`PolicyContext::is_visible` の許可可視性
 /// 判定。ポインタ: RLS-7）を確認する。
 ///
@@ -322,7 +320,7 @@ fn wire1_vector_and_null_cells_are_text_encoded() {
 /// 3 ユーザーがそれぞれ自分のテナントの `Public` 行を見分けられることで
 /// 間接的に確認する（テナント混線があれば行の内訳が一致しなくなる）。
 #[test]
-fn wire1_three_tenant_visibility_public_shared_private_hidden() {
+fn wire1_three_tenant_visibility_public_shared_own_private_visible() {
     let path = temp_db::unique_db_path("wire1-rls");
     let guard = temp_db::CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -384,13 +382,13 @@ fn wire1_three_tenant_visibility_public_shared_private_hidden() {
     ]);
     let addr = spawn_server_with_engine(&users_path, core);
 
-    // Public 行 3 件すべてが可視集合（全 id の合計 = 3 件、Private id は含まれない）。
-    let expected_public_ids: std::collections::BTreeSet<&str> = ["1", "2", "3"].into();
+    // Public 行 3 件は常に可視集合に含まれる（テナント跨ぎで全員に見える）。
+    let public_ids: std::collections::BTreeSet<&str> = ["1", "2", "3"].into();
 
-    for (user, pw) in [
-        ("alice", "pw-alice"),
-        ("bob", "pw-bob"),
-        ("carol", "pw-carol"),
+    for (user, pw, own_private_id) in [
+        ("alice", "pw-alice", "11"),
+        ("bob", "pw-bob", "12"),
+        ("carol", "pw-carol", "13"),
     ] {
         let mut stream = authenticate_to_ready_for_query(addr, user, pw);
         send_simple_query(
@@ -398,22 +396,24 @@ fn wire1_three_tenant_visibility_public_shared_private_hidden() {
             "SELECT * FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
         );
         let _columns = read_row_description(&mut stream);
-        // LIMIT 10 だが可視な Public 行はちょうど 3 件（許可可視性が
-        // `Private` を含まないため、他テナントを含む全 `Private` 行は候補にすら
-        // 入らない。`VectorArena::build_filtered` が構築時点で除外する）。
+        // LIMIT 10 だが可視行はちょうど 4 件（Public 3 件 + 自テナントの
+        // `Private` 1 件。RLS-11・TASK-195。他テナントの `Private` 行は候補に
+        // すら入らない。`VectorArena::build_filtered` が構築時点で除外する）。
         let mut seen_ids = std::collections::BTreeSet::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let row = read_data_row(&mut stream);
             let id = row[0].clone().expect("id is not null");
             seen_ids.insert(id);
         }
+        let mut expected_ids: std::collections::BTreeSet<String> =
+            public_ids.iter().map(|s| s.to_string()).collect();
+        expected_ids.insert(own_private_id.to_string());
         assert_eq!(
-            seen_ids,
-            expected_public_ids.iter().map(|s| s.to_string()).collect(),
-            "tenant {user} must see exactly the 3 Public rows and no Private rows"
+            seen_ids, expected_ids,
+            "tenant {user} must see the 3 Public rows and only its own Private row"
         );
         let tag = read_command_complete(&mut stream);
-        assert_eq!(tag, "SELECT 3");
+        assert_eq!(tag, "SELECT 4");
         read_ready_for_query(&mut stream);
     }
 

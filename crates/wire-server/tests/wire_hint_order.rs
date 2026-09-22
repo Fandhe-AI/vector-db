@@ -32,13 +32,15 @@ use engine::storage::{Storage, Visibility};
 use common::*;
 
 /// `docs`（`embedding VECTOR(2)` + `lang TEXT`）に 2 テナント分の行を仕込む。
-/// wire 認証経由の `PolicyContext`（`alice`/`tenant-a`）は `Public` のみを
-/// 許可可視性とする既定（`auth::verify` → `PolicyContext::new`）のため、
-/// `Private` 行は他テナント（id=99）・自テナント（id=100）のいずれも許可
-/// 可視性の外にあり、`HINT ORDER` のどの並びでも見えてはならない。両行とも
-/// クエリベクトルと完全一致（距離 0）させ、暗黙 RLS 事前フィルタが `HINT
-/// ORDER` で外れれば結果集合の先頭に混入して即座に検出できるようにする
-/// （`crates/engine/tests/sql_evaluation_order.rs::
+/// wire 認証経由の `PolicyContext`（`alice`/`tenant-a`）は `Public` ＋ 自テナント
+/// `Private` を許可可視性とする（RLS-11・TASK-195・`auth::verify`）ため、
+/// 他テナント（tenant-b）の `Private` 行（id=99）は許可可視性の外にあり
+/// `HINT ORDER` のどの並びでも見えてはならない一方、自テナント（tenant-a）
+/// の `Private` 行（id=100）は read-your-writes により可視である（RLS 違反
+/// ではない）。両行ともクエリベクトルと完全一致（距離 0）させ、暗黙 RLS 事前
+/// フィルタが `HINT ORDER` で外れて他テナント行が混入すれば結果集合の先頭に
+/// 現れて即座に検出できるようにする（`crates/engine/tests/
+/// sql_evaluation_order.rs::
 /// hybrid_search_succeeds_and_stays_rls_clean_across_all_six_orders` と同型の
 /// 構成）。
 fn new_core_two_tenant_docs() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
@@ -92,8 +94,8 @@ fn new_core_two_tenant_docs() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     )
     .expect("insert tenant-b row");
 
-    // tenant-a 自身の Private 行（wire ctx には許可可視性として付与されて
-    // いないため、自テナントであっても見えてはならない。距離 0）。
+    // tenant-a 自身の Private 行（RLS-11・TASK-195 により wire ctx でも
+    // read-your-writes として可視。距離 0 のため既定順序では先頭に来る）。
     engine::tenant::insert_typed_row(
         &storage,
         "docs",
@@ -131,7 +133,7 @@ fn wire_hint_order_default_matches_explicit_rls_scalar_distance() {
     );
     let default_columns = read_row_description(&mut stream);
     let mut default_ids = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let row = read_data_row(&mut stream);
         default_ids.push(row[0].clone().expect("id is not null"));
     }
@@ -146,7 +148,7 @@ fn wire_hint_order_default_matches_explicit_rls_scalar_distance() {
     );
     let explicit_columns = read_row_description(&mut stream);
     let mut explicit_ids = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let row = read_data_row(&mut stream);
         explicit_ids.push(row[0].clone().expect("id is not null"));
     }
@@ -156,12 +158,17 @@ fn wire_hint_order_default_matches_explicit_rls_scalar_distance() {
     assert_eq!(default_columns, explicit_columns);
     assert_eq!(default_ids, explicit_ids);
     assert_eq!(default_tag, explicit_tag);
-    for leaked_id in ["99", "100"] {
-        assert!(
-            !default_ids.contains(&leaked_id.to_string()),
-            "Private row (id={leaked_id}) must never appear in tenant-a's wire result, got {default_ids:?}"
-        );
-    }
+    assert_eq!(default_tag, "SELECT 4");
+    // id=100 は自テナント（tenant-a）の Private 行で read-your-writes により
+    // 可視（RLS-11・TASK-195）。距離 0 のため既定順序の先頭に来る。
+    assert!(
+        default_ids.contains(&"100".to_string()),
+        "own-tenant Private row (id=100) must be visible via read-your-writes, got {default_ids:?}"
+    );
+    assert!(
+        !default_ids.contains(&"99".to_string()),
+        "other-tenant Private row (id=99) must never appear in tenant-a's wire result, got {default_ids:?}"
+    );
 }
 
 /// `DISTANCE` を先頭に置く許可順列（`HINT ORDER(DISTANCE, SCALAR, RLS)`）でも
@@ -181,20 +188,24 @@ fn wire_hint_order_distance_first_does_not_leak_other_tenant_row() {
     );
     read_row_description(&mut stream);
     let mut ids = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let row = read_data_row(&mut stream);
         ids.push(row[0].clone().expect("id is not null"));
     }
     let tag = read_command_complete(&mut stream);
-    assert_eq!(tag, "SELECT 3");
+    assert_eq!(tag, "SELECT 4");
     read_ready_for_query(&mut stream);
 
-    for leaked_id in ["99", "100"] {
-        assert!(
-            !ids.contains(&leaked_id.to_string()),
-            "DISTANCE-first HINT ORDER must not leak Private row (id={leaked_id}) over wire, got {ids:?}"
-        );
-    }
+    // id=100（自テナント Private・read-your-writes）は可視、id=99（他テナント
+    // Private）は不可視のまま（RLS-11・TASK-195）。
+    assert!(
+        ids.contains(&"100".to_string()),
+        "own-tenant Private row (id=100) must be visible via read-your-writes, got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"99".to_string()),
+        "DISTANCE-first HINT ORDER must not leak other-tenant Private row (id=99) over wire, got {ids:?}"
+    );
 }
 
 /// 段の省略・重複・未知トークンはいずれも `42601` で拒否され、接続は維持される
@@ -226,10 +237,10 @@ fn wire_hint_order_malformed_forms_are_rejected_and_connection_survives() {
         &format!("SELECT * FROM docs ORDER BY embedding <=> {QUERY_VECTOR} LIMIT 10"),
     );
     read_row_description(&mut stream);
-    for _ in 0..3 {
+    for _ in 0..4 {
         read_data_row(&mut stream);
     }
     let tag = read_command_complete(&mut stream);
-    assert_eq!(tag, "SELECT 3");
+    assert_eq!(tag, "SELECT 4");
     read_ready_for_query(&mut stream);
 }

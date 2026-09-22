@@ -26,15 +26,15 @@
 //! scan_result_order_is_deterministic_across_repeated_calls` が担うため、
 //! 本ファイルでは主張しない（SQL-15 は順序保証を持たない契約のため）。
 //!
-//! RLS 注意（誤コピー防止）: `wire_scan.rs` の seed は tenant-a **自身**が
-//! Private 行（id=11, lang="xx"）を持つ。wire ログインが導出する
-//! `PolicyContext` は常に `PolicyContext::new`（Public のみ。
-//! `crate::auth::verify` 参照）であるため、SQL オラクルも必ず
-//! `PolicyContext::new(tenant)`（Public のみ）で実行しなければならない。
-//! `with_visibilities(tenant, [Public, Private])` をそのまま使うと
-//! tenant-a のオラクルだけ id=11 を含んでしまい NoSQL 応答（Private 行を
-//! 含まない）と食い違う。`self_check_all_tenants_see_public_only_row_set`
-//! が最初にこの取り違えを自己検査する。
+//! RLS 注意: `wire_scan.rs` の seed は tenant-a **自身**が Private 行
+//! （id=11, lang="xx"）を持つ。wire ログインが導出する `PolicyContext` は
+//! `Public` ＋ 自テナント `Private`（RLS-11・TASK-195・read-your-writes。
+//! `crate::auth::verify` 参照）であるため、SQL オラクルも
+//! `with_visibilities(tenant, [Public, Private])` で実行する
+//! （`PolicyContext::new`（Public のみ）を使うと tenant-a のオラクルだけ
+//! id=11 を欠き NoSQL 応答〔Private 行を含む〕と食い違う）。
+//! `self_check_tenants_see_wire_scoped_row_set_via_wire_and_oracle`
+//! が最初にこの整合を自己検査する。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -74,11 +74,12 @@ fn schema() -> TableSchema {
     )
 }
 
-/// wire ログインが導出する `PolicyContext` と同じ Public-only ctx
-/// （`PolicyContext::new`）。オラクルは必ずこれを使う（モジュール doc の
-/// RLS 注意を参照）。
+/// wire ログインが導出する `PolicyContext` と同じ可視性（`Public` ＋
+/// 自テナント `Private`。RLS-11・TASK-195・read-your-writes）を持つ ctx。
+/// オラクルは必ずこれを使う（モジュール doc の RLS 注意を参照）。
 fn wire_scoped_ctx(tenant: &str) -> PolicyContext {
-    PolicyContext::new(tenant).expect("valid tenant ctx (Public only, wire 既定)")
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant ctx (Public + own tenant Private, wire 既定)")
 }
 
 /// `wire_scan.rs::new_core_scan_docs` と同一内容の複製。可視行（wire 認証
@@ -353,37 +354,43 @@ fn row_multiset(rows: &[Vec<JsonValue>]) -> Vec<String> {
     v
 }
 
-/// 誤コピー検出用の自己検査を兼ねる: alice/bob/carol 全員が wire スコープ
-/// （Public のみ）オラクルどおり固定の行集合
-/// `{(1,"ja"),(2,"en"),(3,"ja")}` を観測することを確認する（モジュール doc
-/// の RLS 注意を参照）。
+/// wire スコープ ctx とオラクルの整合性を確認する自己検査: bob/carol は
+/// Public のみの固定行集合 `{(1,"ja"),(2,"en"),(3,"ja")}`、alice（自テナント
+/// Private 行 id=11 を持つ）はそれに自テナント Private 行を加えた集合を
+/// wire・SQL オラクルの双方で観測することを確認する（RLS-11・TASK-195・
+/// read-your-writes。モジュール doc の RLS 注意を参照）。
 #[test]
-fn self_check_all_tenants_see_public_only_row_set_via_wire_and_oracle() {
+fn self_check_tenants_see_wire_scoped_row_set_via_wire_and_oracle() {
     let (core, _guard) = new_core_wire_seed();
     let addr = spawn(Arc::clone(&core));
 
-    let expected: BTreeSet<(u64, String)> = BTreeSet::from([
+    let public_only: BTreeSet<(u64, String)> = BTreeSet::from([
         (1, "ja".to_string()),
         (2, "en".to_string()),
         (3, "ja".to_string()),
     ]);
+    // alice（tenant-a）は自テナントの Private 行（id=11, lang="xx"）も可視
+    // （RLS-11・TASK-195・read-your-writes）。bob／carol は自テナントの
+    // Private 行を持たないため Public のみ。
+    let mut alice_expected = public_only.clone();
+    alice_expected.insert((11, "xx".to_string()));
 
-    for (user, pw, tenant) in [
-        ("alice", "pw-alice", "tenant-a"),
-        ("bob", "pw-bob", "tenant-b"),
-        ("carol", "pw-carol", "tenant-c"),
+    for (user, pw, tenant, expected, expected_count) in [
+        ("alice", "pw-alice", "tenant-a", &alice_expected, 4u64),
+        ("bob", "pw-bob", "tenant-b", &public_only, 3u64),
+        ("carol", "pw-carol", "tenant-c", &public_only, 3u64),
     ] {
         let body = br#"{"op":"scan","table":"docs","limit":10000,"columns":["id","lang"]}"#;
         let resp = query_as(addr, user, pw, body);
         let (columns, rows, row_count) = parse_success_body(&resp);
-        assert_eq!(row_count, 3, "user={user}");
-        assert_eq!(id_lang_set(&columns, &rows), expected, "user={user}");
+        assert_eq!(row_count, expected_count, "user={user}");
+        assert_eq!(&id_lang_set(&columns, &rows), expected, "user={user}");
 
         let oracle = sql_oracle_body(&core, tenant, "SELECT id, lang FROM docs LIMIT 10000");
         let (oracle_columns, oracle_rows, oracle_row_count) = parse_body_str(&oracle);
-        assert_eq!(oracle_row_count, 3, "user={user}");
+        assert_eq!(oracle_row_count, expected_count, "user={user}");
         assert_eq!(
-            id_lang_set(&oracle_columns, &oracle_rows),
+            &id_lang_set(&oracle_columns, &oracle_rows),
             expected,
             "user={user}"
         );
@@ -500,13 +507,16 @@ fn limit_at_or_above_visible_count_returns_every_visible_row_once() {
     let body = br#"{"op":"scan","table":"docs","limit":10000,"columns":["id","lang"]}"#;
     let resp = query_as_alice(addr, body);
     let (columns, rows, row_count) = parse_success_body(&resp);
-    assert_eq!(row_count, 3);
+    // alice（tenant-a）は Public 3 件 + 自テナント Private 行（id=11, lang="xx"）
+    // 1 件の計 4 件を見る（RLS-11・TASK-195・read-your-writes）。
+    assert_eq!(row_count, 4);
     assert_eq!(
         id_lang_set(&columns, &rows),
         BTreeSet::from([
             (1, "ja".to_string()),
             (2, "en".to_string()),
             (3, "ja".to_string()),
+            (11, "xx".to_string()),
         ])
     );
 }
@@ -555,45 +565,75 @@ fn filter_with_limit_terminates_early_on_larger_corpus() {
     assert_eq!(rows_all.len(), 10);
 }
 
-/// alice（自テナントの Private 行 id=11 を持つ）・bob（他テナント）双方で
-/// `lang="xx"` を検索しても `200`・`rows:[]`・`row_count:0` になる
-/// （エラーではなく空集合。存在情報を漏らさない。SQL オラクルも 0 件で
-/// 一致する）。
+/// bob（他テナント）が `lang="xx"` を検索すると `200`・`rows:[]`・
+/// `row_count:0` になる（エラーではなく空集合。存在情報を漏らさない。SQL
+/// オラクルも 0 件で一致する）。alice（自テナントの Private 行 id=11 を持つ）
+/// は read-your-writes（RLS-11・TASK-195）により同じフィルタで id=11 が
+/// 1 件ヒットする（漏えいではない）。
 #[test]
-fn private_rows_are_invisible_to_every_tenant_and_yield_empty_result_not_error() {
+fn private_rows_are_invisible_to_other_tenants_and_yield_empty_result_not_error() {
     let (core, _guard) = new_core_wire_seed();
     let addr = spawn(Arc::clone(&core));
 
     let body =
         br#"{"op":"scan","table":"docs","limit":10,"columns":["id","lang"],"filter":[{"column":"lang","op":"eq","value":"xx"}]}"#;
-    for (user, pw, tenant) in [
-        ("alice", "pw-alice", "tenant-a"),
-        ("bob", "pw-bob", "tenant-b"),
-    ] {
-        let resp = query_as(addr, user, pw, body);
-        assert_eq!(resp.status, 200, "user={user} resp={resp:?}");
-        let (_columns, rows, row_count) = parse_success_body(&resp);
-        assert_eq!(row_count, 0, "user={user}");
-        assert!(rows.is_empty(), "user={user} rows={rows:?}");
 
-        let oracle_body = sql_oracle_body(
-            &core,
-            tenant,
-            "SELECT id, lang FROM docs WHERE lang = 'xx' LIMIT 10",
-        );
-        let (_oracle_columns, oracle_rows, oracle_row_count) = parse_body_str(&oracle_body);
-        assert_eq!(oracle_row_count, 0, "user={user}");
-        assert!(oracle_rows.is_empty(), "user={user}");
-    }
+    // bob（tenant-b）は id=11（tenant-a の Private 行）を含め自テナントに
+    // `Private` 行を持たないため、フィルタは空集合のまま（他テナントの
+    // Private 行は不可視。RLS-6/RLS-7 の既存契約）。
+    let resp = query_as(addr, "bob", "pw-bob", body);
+    assert_eq!(resp.status, 200, "user=bob resp={resp:?}");
+    let (_columns, rows, row_count) = parse_success_body(&resp);
+    assert_eq!(row_count, 0, "user=bob");
+    assert!(rows.is_empty(), "user=bob rows={rows:?}");
+
+    let oracle_body = sql_oracle_body(
+        &core,
+        "tenant-b",
+        "SELECT id, lang FROM docs WHERE lang = 'xx' LIMIT 10",
+    );
+    let (_oracle_columns, oracle_rows, oracle_row_count) = parse_body_str(&oracle_body);
+    assert_eq!(oracle_row_count, 0, "user=bob");
+    assert!(oracle_rows.is_empty(), "user=bob");
+
+    // alice（tenant-a）は自テナントの Private 行（id=11, lang="xx"）を
+    // read-your-writes により可視のまま filter にマッチする（RLS-11・
+    // TASK-195。漏えいではない）。
+    let resp_alice = query_as(addr, "alice", "pw-alice", body);
+    assert_eq!(resp_alice.status, 200, "user=alice resp={resp_alice:?}");
+    let (alice_columns, alice_rows, alice_row_count) = parse_success_body(&resp_alice);
+    assert_eq!(alice_row_count, 1, "user=alice");
+    assert_eq!(
+        id_lang_set(&alice_columns, &alice_rows),
+        BTreeSet::from([(11, "xx".to_string())]),
+        "user=alice"
+    );
+
+    let oracle_body_alice = sql_oracle_body(
+        &core,
+        "tenant-a",
+        "SELECT id, lang FROM docs WHERE lang = 'xx' LIMIT 10",
+    );
+    let (oracle_columns_alice, oracle_rows_alice, oracle_row_count_alice) =
+        parse_body_str(&oracle_body_alice);
+    assert_eq!(oracle_row_count_alice, 1, "user=alice");
+    assert_eq!(
+        id_lang_set(&oracle_columns_alice, &oracle_rows_alice),
+        BTreeSet::from([(11, "xx".to_string())]),
+        "user=alice"
+    );
 }
 
-/// 成功・空集合いずれの応答本文にも Private 行の値（`"xx"`）・id=11・
-/// テナント ID・パスワード・Bearer トークン文字列が現れないことを固定する
-/// （`nosql3_scan_mapping.rs` (13) と同型）。id=11 の非漏えい検査は
-/// `"[11,"`（本モジュール doc に記す `response.rs` の空白なし・キー順
-/// 固定の出力不変条件どおり、行は `[id,...]` の JSON 配列で始まり、
-/// 本テストの全 body で `id` が投影の先頭列になる）を探す——`",11,"` では
-/// id が先頭列である本文の形状に一致せず検出漏れになるため使わない。
+/// bob（他テナント）の応答本文には Private 行の値（`"xx"`）・id=11 が
+/// 一切現れないことを固定する（`nosql3_scan_mapping.rs` (13) と同型）。
+/// id=11 の非漏えい検査は `"[11,"`（本モジュール doc に記す `response.rs`
+/// の空白なし・キー順固定の出力不変条件どおり、行は `[id,...]` の JSON
+/// 配列で始まり、本テストの全 body で `id` が投影の先頭列になる）を探す
+/// ——`",11,"` では id が先頭列である本文の形状に一致せず検出漏れになる
+/// ため使わない。alice（自テナントの Private 行を持つ）は read-your-writes
+/// （RLS-11・TASK-195）によりこれらの値を legitimately 観測しうるため、
+/// alice についてはテナント ID・パスワード・Bearer トークン文字列の
+/// 非漏えいのみを固定する。
 #[test]
 fn responses_never_leak_private_rows_tenant_ids_credentials_or_token() {
     let (core, _guard) = new_core_wire_seed();
@@ -609,17 +649,46 @@ fn responses_never_leak_private_rows_tenant_ids_credentials_or_token() {
         br#"{"op":"scan","table":"docs","limit":2}"#,
     ];
     for body in bodies {
-        for (token, tenant, pw) in [
-            (&token_alice, "tenant-a", "pw-alice"),
-            (&token_bob, "tenant-b", "pw-bob"),
-        ] {
-            let resp = post(addr, token, body);
-            let text = body_utf8(&resp);
-            assert!(!text.contains("\"xx\""), "body={body:?} text={text}");
-            assert!(!text.contains("[11,"), "body={body:?} text={text}");
-            assert!(!text.contains(tenant), "body={body:?} text={text}");
-            assert!(!text.contains(pw), "body={body:?} text={text}");
-            assert!(!text.contains(token.as_str()), "body={body:?} text={text}");
-        }
+        // bob（他テナント）はどのクエリでも tenant-a の Private 行（id=11,
+        // lang="xx"）を一切観測できないため、値そのものの非出現まで厳密に
+        // 固定する。
+        let resp_bob = post(addr, &token_bob, body);
+        let text_bob = body_utf8(&resp_bob);
+        assert!(
+            !text_bob.contains("\"xx\""),
+            "body={body:?} text={text_bob}"
+        );
+        assert!(!text_bob.contains("[11,"), "body={body:?} text={text_bob}");
+        assert!(
+            !text_bob.contains("tenant-b"),
+            "body={body:?} text={text_bob}"
+        );
+        assert!(
+            !text_bob.contains("pw-bob"),
+            "body={body:?} text={text_bob}"
+        );
+        assert!(
+            !text_bob.contains(token_bob.as_str()),
+            "body={body:?} text={text_bob}"
+        );
+
+        // alice（tenant-a）は自テナントの Private 行（id=11, lang="xx"）を
+        // read-your-writes（RLS-11・TASK-195）により観測しうるため、値の
+        // 非出現は求めない。テナント ID・パスワード・Bearer トークン文字列の
+        // 非漏えいのみ固定する。
+        let resp_alice = post(addr, &token_alice, body);
+        let text_alice = body_utf8(&resp_alice);
+        assert!(
+            !text_alice.contains("tenant-a"),
+            "body={body:?} text={text_alice}"
+        );
+        assert!(
+            !text_alice.contains("pw-alice"),
+            "body={body:?} text={text_alice}"
+        );
+        assert!(
+            !text_alice.contains(token_alice.as_str()),
+            "body={body:?} text={text_alice}"
+        );
     }
 }

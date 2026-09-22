@@ -65,15 +65,29 @@ use wire_server::limits::SESSION_TTL;
 
 const TABLE: &str = "docs";
 
-/// 距離 0 の罠行（他テナント Private・自テナント Private）の id。wire
-/// ログインが導出する `PolicyContext`（`auth::verify` → `PolicyContext::new`）
-/// は Public のみを許可可視性とするため、いずれも受理された応答に混入して
-/// はならない。
-const TRAP_IDS: [u64; 2] = [99, 100];
+/// 距離 0 の他テナント（tenant-b）罠行の id。wire ログインが導出する
+/// `PolicyContext`（`auth::verify`）は `Public` ＋ 自テナント `Private` のみを
+/// 許可可視性とする（RLS-11・TASK-195・read-your-writes）ため、この id は
+/// alice（tenant-a）のいずれの応答にも混入してはならない。
+const OTHER_TENANT_TRAP_ID: u64 = 99;
+
+/// 距離 0 の自テナント（tenant-a）罠行の id。RLS-11・TASK-195（read-your-writes）
+/// により alice 自身のクエリでは legitimately 可視になりうる（漏えいではない）。
+#[allow(dead_code)]
+const OWN_TENANT_PRIVATE_ID: u64 = 100;
+
+const TRAP_IDS: [u64; 1] = [OTHER_TENANT_TRAP_ID];
 
 /// 罠行を一意に識別するセンチネル（`lang` 列。短い値は他の語の部分文字列と
-/// 誤一致しうるため一意な値を使う）。
-const TRAP_SENTINELS: [&str; 2] = ["trap-b-99", "trap-a-100"];
+/// 誤一致しうるため一意な値を使う）。他テナント（tenant-b）罠行のセンチネル。
+/// alice の応答には絶対に現れてはならない。
+const OTHER_TENANT_TRAP_SENTINEL: &str = "trap-b-99";
+
+/// 自テナント（tenant-a）罠行のセンチネル。RLS-11・TASK-195（read-your-writes）
+/// により `lang` 列を投影する alice のクエリには legitimately 現れうる
+/// （漏えいではない）。
+#[allow(dead_code)]
+const OWN_TENANT_PRIVATE_SENTINEL: &str = "trap-a-100";
 
 fn schema() -> TableSchema {
     TableSchema::new(
@@ -268,17 +282,18 @@ fn parse_columns_rows(text: &str) -> Option<(Vec<String>, Vec<Vec<JsonValue>>)> 
 
 /// 応答が RLS clean であることを検証する: (1) 本文にいずれの罠センチネルも
 /// 現れない、(2) `tenant-` マーカーが現れない、(3) 200 応答かつ `columns` に
-/// `id` があれば、いずれの行の `id` も [`TRAP_IDS`] を含まない（`search`／
-/// `scan` の行集合応答を解析ベースで検査する。`aggregate`／`insert` の成功
-/// 応答には `id` 列が無いため (3) は無害に skip される）。
+/// `id` があれば、いずれの行の `id` も [`TRAP_IDS`]（他テナントの罠行 id）を
+/// 含まない（`search`／`scan` の行集合応答を解析ベースで検査する。
+/// `aggregate`／`insert` の成功応答には `id` 列が無いため (3) は無害に
+/// skip される）。自テナント（tenant-a）の罠行 id=100・センチネルは
+/// RLS-11・TASK-195（read-your-writes）により legitimately 現れうるため
+/// ここでは検査しない。
 fn assert_rls_clean(resp: &HttpResponse) {
     let text = body_utf8(resp);
-    for sentinel in TRAP_SENTINELS {
-        assert!(
-            !text.contains(sentinel),
-            "response leaked trap sentinel {sentinel:?}: {text}"
-        );
-    }
+    assert!(
+        !text.contains(OTHER_TENANT_TRAP_SENTINEL),
+        "response leaked other tenant's trap sentinel {OTHER_TENANT_TRAP_SENTINEL:?}: {text}"
+    );
     assert!(
         !text.contains("tenant-"),
         "response leaked tenant id marker: {text}"
@@ -317,8 +332,11 @@ fn all_four_ops_succeed_against_seeded_fixture_with_distinct_bodies() {
         br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":10,"columns":["id","lang"]}"#,
     );
     assert_eq!(search_resp.status, 200, "search resp={search_resp:?}");
+    // 可視行は Public 3 件 + 自テナント（tenant-a）Private 罠行 1 件（id=100。
+    // RLS-11・TASK-195・read-your-writes）の計 4 件。他テナント罠行（id=99）は
+    // `assert_rls_clean` が非混入を固定する。
     assert!(
-        body_utf8(&search_resp).contains(r#""row_count":3"#),
+        body_utf8(&search_resp).contains(r#""row_count":4"#),
         "{}",
         body_utf8(&search_resp)
     );
@@ -330,7 +348,7 @@ fn all_four_ops_succeed_against_seeded_fixture_with_distinct_bodies() {
     );
     assert_eq!(scan_resp.status, 200, "scan resp={scan_resp:?}");
     assert!(
-        body_utf8(&scan_resp).contains(r#""row_count":3"#),
+        body_utf8(&scan_resp).contains(r#""row_count":4"#),
         "{}",
         body_utf8(&scan_resp)
     );
@@ -349,9 +367,10 @@ fn all_four_ops_succeed_against_seeded_fixture_with_distinct_bodies() {
         aggregate_resp.status, 200,
         "aggregate resp={aggregate_resp:?}"
     );
-    // 可視行（Public のみ）3 件を数え、罠行 2 件（Private）を含まない。
+    // 可視行（Public 3 件 + 自テナント Private 罠行 1 件）を数え、他テナント
+    // 罠行（id=99）は含まない（RLS-11・TASK-195）。
     assert!(
-        body_utf8(&aggregate_resp).contains("[3]"),
+        body_utf8(&aggregate_resp).contains("[4]"),
         "{}",
         body_utf8(&aggregate_resp)
     );
@@ -384,22 +403,26 @@ fn all_four_ops_succeed_against_seeded_fixture_with_distinct_bodies() {
         }
     }
 
-    // insert の永続化を確認する。NoSQL 表層の `insert` は SQL-10 `execute_insert`
-    // と同じく常に `Visibility::Private` 固定で書き込み、wire 認証が導出する
-    // `PolicyContext`（Public のみ許可）はその行を読み戻せない（既知の非対称。
-    // `docs/design/three-client-e2e-harness.md`「非対称」節・
-    // `nosql6_tenant_row_id_scope.rs::insert_success_body_has_exact_shape_and_is_persisted`
-    // と同じ検証方法）。同一 wire scan（Public のみ）で `row_count` が不変の
-    // ままであることをまず確認したうえで、保持している `Arc<EngineCore>` から
-    // `Private` を含む ctx で直接 `SELECT` して非 vacuous な永続化証跡を得る。
+    // insert の永続化を確認する。NoSQL 表層の `insert` は SQL-10
+    // `execute_insert` と同じく常に `Visibility::Private` 固定で書き込み、
+    // wire 認証が導出する `PolicyContext`（`Public` ＋ 自テナント `Private`。
+    // RLS-11・TASK-195）は同一テナントが書いた `Private` 行を読み戻せる
+    // （read-your-writes）ため、alice 自身の直後の wire scan で id=500 が
+    // 可視になる。永続化自体も、保持している `Arc<EngineCore>` から
+    // `Private` を含む ctx で直接 `SELECT` して二重に確認する。
     let scan_after_insert = query_as_alice(
         addr,
         br#"{"op":"scan","table":"docs","limit":10,"columns":["id"]}"#,
     );
     assert_eq!(scan_after_insert.status, 200, "resp={scan_after_insert:?}");
     assert!(
-        body_utf8(&scan_after_insert).contains(r#""row_count":3"#),
-        "wire scan (Public のみ) は Private 行 id=500 を読み戻さない: {}",
+        body_utf8(&scan_after_insert).contains(r#""row_count":5"#),
+        "wire scan (Public 3 + 自テナント Private 2 件: id=100, id=500) must be 5: {}",
+        body_utf8(&scan_after_insert)
+    );
+    assert!(
+        body_utf8(&scan_after_insert).contains("[500]"),
+        "wire scan must observe the newly-inserted own-tenant Private row (id=500) via read-your-writes: {}",
         body_utf8(&scan_after_insert)
     );
     assert_rls_clean(&scan_after_insert);
@@ -477,7 +500,7 @@ fn vocabulary_outside_four_ops_rejects_with_0a000_and_has_no_side_effect() {
     );
     assert_eq!(resp.status, 200, "resp={resp:?}");
     assert!(
-        body_utf8(&resp).contains(r#""row_count":3"#),
+        body_utf8(&resp).contains(r#""row_count":4"#),
         "{}",
         body_utf8(&resp)
     );
@@ -761,7 +784,7 @@ fn rejected_requests_do_not_consume_or_expire_the_session() {
     );
     assert_eq!(contrast.status, 200, "resp={contrast:?}");
     assert!(
-        body_utf8(&contrast).contains(r#""row_count":3"#),
+        body_utf8(&contrast).contains(r#""row_count":4"#),
         "{}",
         body_utf8(&contrast)
     );
@@ -809,11 +832,12 @@ fn success_and_rejection_bodies_never_leak_tenant_credentials_or_trap_sentinels(
         assert!(!body.contains("tenant-a"), "leaked tenant-a: {body}");
         assert!(!body.contains("tenant-b"), "leaked tenant-b: {body}");
         assert!(!body.contains("pw-alice"), "leaked password: {body}");
-        for sentinel in TRAP_SENTINELS {
-            assert!(
-                !body.contains(sentinel),
-                "leaked sentinel {sentinel}: {body}"
-            );
-        }
+        // 自テナント（tenant-a）の罠センチネルは RLS-11・TASK-195
+        // （read-your-writes）により legitimately 現れうるため検査しない
+        // （他テナントのセンチネルのみ絶対禁止）。
+        assert!(
+            !body.contains(OTHER_TENANT_TRAP_SENTINEL),
+            "leaked other tenant's sentinel {OTHER_TENANT_TRAP_SENTINEL}: {body}"
+        );
     }
 }
