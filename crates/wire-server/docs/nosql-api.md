@@ -1,8 +1,10 @@
 # NoSQL API
 
 `wire-server --surface nosql` が公開する 3 エンドポイント（`POST /v1/session`・
-`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 4 値
-（`search`／`scan`／`aggregate`／`insert`）の JSON スキーマを利用者向けに整理する。
+`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 6 値
+（`search`／`scan`／`aggregate`／`insert`／`update`／`delete`）の JSON スキーマを
+利用者向けに整理する。`update`／`delete` は語彙・スキーマ検証のみ実装済みで、
+束縛・実行結線は未実装（後述の各節参照）。
 
 **この文書の情報源はコードとテストのみ**であり、`docs/spec`（private submodule）
 の本文は転記しない。参照が必要な箇所は TASK-nn・ビヘイビア ID のポインタ表記に
@@ -136,8 +138,8 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
 2. `Authorization: Bearer` 認証（`28000`）
 3. ヘッダの `tenant_id` 相当拒否（`42601`）
 4. 本文の UTF-8／JSON 構文／`op` フィールドの形（`42601`）
-5. `op` 許可リスト判定（4 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
-   トランザクション制御・`UPDATE`／`DELETE` 相当を含む）
+5. `op` 許可リスト判定（6 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
+   トランザクション制御を含む）
 6. op 別スキーマ検証（必須キー欠落・未知キー・型不一致・`null` は `42601`）
 7. op 別の意味検証・実行（`search` は `explain: true` を通常実行より先に判定）
 
@@ -342,6 +344,55 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 `nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
 `http_insert_response_boundary.rs`・`wire_insert_operation_id.rs`。
 
+### `update`
+
+語彙・スキーマ検証のみ実装済み（Issue #875・NOSQL-12）。**束縛・engine への
+実行結線は未実装**で、以下のスキーマを満たす要求でも常に暫定応答
+（`0A000`／501・`"query execution not yet available"`）が返る。実行結線は
+後続 Issue（#876）の担当。
+
+| キー | 必須 | 型 | 備考 |
+| --- | --- | --- | --- |
+| `op` | ○ | string | `"update"` |
+| `table` | ○ | string | |
+| `set` | ○ | object（任意キー） | 列名をキーに持つ部分更新。禁止列（`id`／`tenant_id`／`visibility`）検査・値の型検査は未実装 |
+| `where` | △ | `{"id": number}` | 単一行・`id` 指定形。`filter` との排他判定は未実装 |
+| `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。`where` との排他判定は未実装 |
+| `operation_id` | △ | string | 欠落・`null`・空文字の `23502` 判定は未実装（束縛結線後に有効化予定） |
+
+要求例（`where` 形。現時点ではスキーマ検証を通過したうえで暫定応答へ
+落ちる）:
+
+```json
+{"op": "update", "table": "docs", "set": {"lang": "en"}, "where": {"id": 1},
+ "operation_id": "op-1"}
+```
+
+### `delete`
+
+語彙・スキーマ検証のみ実装済み（Issue #875・NOSQL-12）。**束縛・engine への
+実行結線は未実装**で、以下のスキーマを満たす要求でも常に暫定応答
+（`0A000`／501・`"query execution not yet available"`）が返る。実行結線は
+後続 Issue（#876）の担当。
+
+| キー | 必須 | 型 | 備考 |
+| --- | --- | --- | --- |
+| `op` | ○ | string | `"delete"` |
+| `table` | ○ | string | |
+| `where` | △ | `{"id": number}` | 単一行・`id` 指定形。`filter` との排他判定は未実装 |
+| `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。`where` との排他判定は未実装 |
+| `operation_id` | △ | string | 欠落・`null`・空文字の `23502` 判定は未実装（束縛結線後に有効化予定） |
+
+要求例:
+
+```json
+{"op": "delete", "table": "docs", "where": {"id": 1}, "operation_id": "op-1"}
+```
+
+検証コード: `crates/wire-server/src/http/query/op.rs`・`schema.rs`・
+`gate.rs`（単体テスト）・`crates/wire-server/tests/nosql9_op_allowlist.rs`・
+`nosql1_op_vocabulary.rs`。
+
 ## `filter` 配列
 
 `search`／`scan`／`aggregate` 共通で使える事前フィルタ配列。
@@ -427,6 +478,10 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 | `SELECT COUNT(*), SUM(id) FROM docs` | `aggregate` |
 | `SELECT lang, COUNT(*) FROM docs GROUP BY lang HAVING count >= 2` | `aggregate` + `group_by` + `having` |
 | `INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID 'op-1'` | `insert` + `operation_id` |
+| `UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-1'` | `update` + `where.id` + `operation_id`（語彙・スキーマのみ実装済み。実行結線は未実装） |
+| `UPDATE docs SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `update` + `filter` + `operation_id`（同上） |
+| `DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-1'` | `delete` + `where.id` + `operation_id`（同上） |
+| `DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `delete` + `filter` + `operation_id`（同上） |
 
 対応の無いもの（NoSQL 側に受理形が存在しない。実際の応答は語彙外 `op` として
 `0A000`、または未知キーとして `42601`）:

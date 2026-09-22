@@ -10,8 +10,11 @@
 use engine::json::parse_json;
 use wire_server::http::query::schema::{extract_op, schema_for, SchemaError};
 
-/// 受理 4 件: `search`／`scan`／`aggregate`／`insert` それぞれの最小構成が
-/// 構文解析・意味検証を通しで通過する。
+/// 受理 6 件: `search`／`scan`／`aggregate`／`insert`／`update`／`delete`
+/// それぞれの最小構成が構文解析・意味検証を通しで通過する（`update`／
+/// `delete` は Issue #875・NOSQL-12 で語彙へ加わったが、束縛・実行結線は
+/// 未実装のため、ここでは「語彙・スキーマ検証を通過する」ことのみを固定
+/// する）。
 #[test]
 fn parse_extract_schema_validate_accepts_each_op_minimal_form() {
     let cases = [
@@ -22,6 +25,11 @@ fn parse_extract_schema_validate_accepts_each_op_minimal_form() {
             "aggregate",
         ),
         (r#"{"op":"insert","table":"docs","rows":[]}"#, "insert"),
+        (
+            r#"{"op":"update","table":"docs","set":{"lang":"en"}}"#,
+            "update",
+        ),
+        (r#"{"op":"delete","table":"docs"}"#, "delete"),
     ];
     for (text, expected_op) in cases {
         let value = parse_json(text).expect("valid JSON fixture");
@@ -66,9 +74,11 @@ fn parse_extract_schema_validate_rejects_three_violation_types_as_unsupported_sq
 /// `None` を返すのみで、本ヘルパー自体はエラー型を持たない。
 #[test]
 fn schema_for_returns_none_for_out_of_vocabulary_op() {
-    let value = parse_json(r#"{"op":"delete","table":"docs"}"#).expect("valid JSON fixture");
+    // `delete` は Issue #875（NOSQL-12）で語彙へ加わったため、語彙外 op の
+    // fixture としては `drop_table`（DDL 相当・引き続き語彙外）を使う。
+    let value = parse_json(r#"{"op":"drop_table","table":"docs"}"#).expect("valid JSON fixture");
     let op = extract_op(&value).expect("op must be present");
-    assert_eq!(op, "delete");
+    assert_eq!(op, "drop_table");
     assert!(schema_for(op).is_none());
 }
 

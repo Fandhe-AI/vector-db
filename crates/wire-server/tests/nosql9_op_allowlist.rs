@@ -1,8 +1,9 @@
 //! `POST /v1/query` の op 許可リスト（`search`／`scan`／`aggregate`／
-//! `insert` の閉じた 4 値）を、production ルータ経由（生バイトクライアント）
-//! で検証する層 A 結合テスト（Issue #759・TASK-179。対象ビヘイビア
-//! NOSQL-1・NOSQL-9。ポインタ: `docs/spec/05-tasks.md` TASK-179・
-//! `docs/spec/04-behavior/nosql-surface.md` NOSQL-1・NOSQL-9）。
+//! `insert`／`update`／`delete` の閉じた 6 値）を、production ルータ経由
+//! （生バイトクライアント）で検証する層 A 結合テスト（Issue #759・
+//! TASK-179。`update`／`delete` の追加は Issue #875。対象ビヘイビア
+//! NOSQL-1・NOSQL-9・NOSQL-12。ポインタ: `docs/spec/05-tasks.md` TASK-179・
+//! `docs/spec/04-behavior/nosql-surface.md` NOSQL-1・NOSQL-9・NOSQL-12）。
 //!
 //! `wire_server::http::query::op` の単体テストは crate 内部から `Op::parse`
 //! を直接叩くが、本ファイルは `nosql1_endpoint_routing.rs` と同じ流儀で
@@ -10,12 +11,15 @@
 //! `POST /v1/query` を送り、HTTP 応答（ステータス・`wire_code`・
 //! エラーコード・メッセージ）を確認する。
 //!
-//! 許可リストの 4 op（`search`／`scan`／`aggregate`／`insert`）はいずれも
+//! 許可リストの `search`／`scan`／`aggregate`／`insert` の 4 op はいずれも
 //! 実行結線済み（TASK-186・NOSQL-2〜6・Issue #764・#766・#768・#772）の
 //! ため、`engine` 接続済みでは暫定 `0A000`／501
 //! （[`wire_server::http::query::gate::PLACEHOLDER_MESSAGE`]）を返さず、
 //! 存在しないテーブルへの到達を示す `42P01`／404 で「認証 → op 許可リスト →
-//! スキーマ検証 → engine 呼び出し」が走ったことを確認する。語彙外拒否は
+//! スキーマ検証 → engine 呼び出し」が走ったことを確認する。一方
+//! `update`／`delete` は語彙・スキーマ検証を通過するが束縛・実行結線は
+//! Issue #876 の担当のため、`engine` 接続有無を問わず暫定 `0A000`／501 の
+//! ままに留まる（本ファイルでは実行結線 4 op と分けて確認する）。語彙外拒否は
 //! HTTP 501・`wire_code` `0A000`・`code` `FEATURE_NOT_SUPPORTED` で status
 //! だけでは区別できないため、必ず `error_message_of` で
 //! [`wire_server::http::query::gate::UNSUPPORTED_OP_MESSAGE`] を突き合わせる。
@@ -122,10 +126,34 @@ fn four_allowlisted_ops_reach_the_engine_and_report_undefined_table() {
     }
 }
 
-// --- 語彙外 op: DDL・UDF・トランザクション・UPDATE/DELETE・表記揺れ -------
+// --- update／delete: 語彙・スキーマは通過するが実行結線は未接続 -----------
 
 #[test]
-fn vocabulary_outside_four_ops_rejects_with_0a000_and_unsupported_message() {
+fn update_and_delete_pass_allowlist_but_stay_at_placeholder() {
+    // Issue #875 で語彙へ加わった `update`／`delete` は op 許可リスト・
+    // スキーマ検証は通過するが、束縛・実行結線は Issue #876 の担当のため
+    // `four_allowlisted_ops_reach_the_engine_and_report_undefined_table` の
+    // 4 op と異なり `42P01` には到達せず、暫定 `0A000`／501 のまま留まる。
+    let addr = spawn();
+    let bodies: [&[u8]; 2] = [
+        br#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1}}"#,
+        br#"{"op":"delete","table":"docs","where":{"id":1}}"#,
+    ];
+    for body in bodies {
+        let resp = query(addr, body);
+        assert_eq!(resp.status, 501, "body={body:?} resp={resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), "0A000");
+        assert_eq!(
+            http_common::error_message_of(&resp),
+            wire_server::http::query::gate::PLACEHOLDER_MESSAGE
+        );
+    }
+}
+
+// --- 語彙外 op: DDL・UDF・トランザクション・表記揺れ -----------------------
+
+#[test]
+fn vocabulary_outside_six_ops_rejects_with_0a000_and_unsupported_message() {
     let addr = spawn();
     let unsupported_ops = [
         // DDL 相当
@@ -139,9 +167,6 @@ fn vocabulary_outside_four_ops_rejects_with_0a000_and_unsupported_message() {
         "begin",
         "commit",
         "rollback",
-        // UPDATE/DELETE 相当
-        "update",
-        "delete",
         // SQL 系・表記揺れ
         "select",
         "explain",
@@ -187,7 +212,7 @@ fn op_allowlist_check_precedes_schema_validation_over_wire() {
 #[test]
 fn unknown_fields_on_valid_ops_reject_with_42601() {
     let addr = spawn();
-    let cases: [(&str, &str); 15] = [
+    let cases: [(&str, &str); 17] = [
         (
             "search",
             r#"{"op":"search","table":"docs","limit":1,"hint_order":["path"]}"#,
@@ -247,6 +272,14 @@ fn unknown_fields_on_valid_ops_reject_with_42601() {
         (
             "scan",
             r#"{"op":"scan","table":"docs","limit":1,"transaction":"begin"}"#,
+        ),
+        (
+            "update",
+            r#"{"op":"update","table":"docs","set":{"lang":"en"},"hint_order":["path"]}"#,
+        ),
+        (
+            "delete",
+            r#"{"op":"delete","table":"docs","where":{"id":1},"search_mode":"precision"}"#,
         ),
     ];
     for (label, body) in cases {
