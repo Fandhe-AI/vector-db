@@ -17,8 +17,8 @@
 use crate::catalog::{ColumnType, TableSchema};
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
-    FunctionArg, InsertLiteral, OrderByForm, Projection, ValidatedDelete, ValidatedInsert,
-    ValidatedPredicateDelete, ValidatedStatement, WherePredicate,
+    FunctionArg, InsertLiteral, OnConflictAction, OrderByForm, Projection, UpsertValue,
+    ValidatedDelete, ValidatedInsert, ValidatedPredicateDelete, ValidatedStatement, WherePredicate,
 };
 use crate::sql::plan::EvaluationOrder;
 use crate::sql::udf_call::Expr;
@@ -1010,6 +1010,15 @@ pub fn bind_insert(
             "bind_insert only accepts a single VALUES row (use bind_insert_form for multi-row VALUES)",
         ));
     }
+    // `ON CONFLICT ...`（SQL-20・TASK-193、Issue #872）は本関数の契約外であり、
+    // 黙って落として plain INSERT として束縛する fail-open を避けるため明示的に
+    // 拒否する（複数行 `VALUES` と同じ理由。UPSERT の束縛は必ず
+    // `bind_insert_form` の `Upsert` 分岐を経由すること）。
+    if stmt.on_conflict.is_some() {
+        return Err(SqlSurfaceError::invalid_input(
+            "bind_insert does not accept ON CONFLICT (use bind_insert_form for UPSERT)",
+        ));
+    }
     let values = stmt
         .rows
         .first()
@@ -1460,9 +1469,43 @@ pub struct BoundFileInsert {
     pub operation_id: Option<OperationId>,
 }
 
+/// [`OnConflictAction::DoUpdate`] の SET 右辺を束縛した形（SQL-20・TASK-193、
+/// Issue #872）。`EXCLUDED.<col>` は新規挿入しようとした行（[`BoundUpsert::
+/// rows`] の対応する行）の `values` 列インデックス参照へ束縛する（実行時に
+/// 都度列名を引き直さない）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundUpsertValue {
+    /// `BoundInsert::values` の列インデックス（同じ行の束縛済み値を指す）。
+    Excluded(usize),
+    Literal(crate::row_codec::Value),
+}
+
+/// 束縛済みの `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・
+/// TASK-193、Issue #872）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundConflictAction {
+    DoNothing,
+    /// (`schema.columns` の対象列インデックス, 右辺) 対応。宣言順を保持する
+    /// （[`BoundUpdate::assignments`] と同じ契約）。
+    DoUpdate(Vec<(usize, BoundUpsertValue)>),
+}
+
+/// 束縛済みの UPSERT 文（SQL-20・TASK-193、Issue #872。実行結線は
+/// `sql::exec::execute_upsert`）。`rows` は [`bind_insert_row`] で個別に束縛
+/// 済みの行（行数に関わらず 1 件以上）で、`action` は全行が共有する衝突分岐
+/// （`ValidatedInsert` 由来のため構造的に同一テーブル・同一 `operation_id`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundUpsert {
+    pub table: String,
+    pub rows: Vec<BoundInsert>,
+    pub action: BoundConflictAction,
+    pub operation_id: Option<OperationId>,
+}
+
 /// [`bind_insert_form`] の束縛結果。行形（既存の 1 行 1 ID `INSERT`）・複数行形
 /// （SQL-16、TASK-190。複数行 `VALUES` を持つ行形）・ファイル形（TASK-120。
-/// サーバー側チャンク化・ベクトル化を経由する `INSERT`）を区別する。
+/// サーバー側チャンク化・ベクトル化を経由する `INSERT`）・UPSERT（SQL-20・
+/// TASK-193、Issue #872）を区別する。
 #[derive(Debug, Clone)]
 pub enum BoundInsertForm {
     Row(BoundInsert),
@@ -1473,6 +1516,10 @@ pub enum BoundInsertForm {
     /// （NOSQL-6・TASK-178）と共有する（第 2 の書き込み経路を作らない）。
     RowBatch(Vec<BoundInsert>),
     File(BoundFileInsert),
+    /// `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・TASK-193、
+    /// Issue #872）。単一行・複数行 `VALUES` のいずれも本 variant を経由する
+    /// （`Row`／`RowBatch` とは独立。`ON CONFLICT` の有無で分岐する）。
+    Upsert(BoundUpsert),
 }
 
 /// `ValidatedInsert` の列リストから行形・ファイル形いずれの `INSERT` かを束縛段階で
@@ -1509,8 +1556,21 @@ pub fn bind_insert_form(
     });
     let has_path = stmt.columns.iter().any(|c| c == "path");
     let has_body = stmt.columns.iter().any(|c| c == "body");
+    let is_file_form_shape = !has_id && !has_vector_column && has_path && has_body;
 
-    if !has_id && !has_vector_column && has_path && has_body {
+    // `ON CONFLICT ...`（SQL-20・TASK-193、Issue #872）は判別規則より前に分岐
+    // する（ファイル形との併用は明示的に `42601` で拒否し、行形との併用は
+    // 行数に関わらず必ず `bind_upsert_form` を経由させる）。
+    if let Some(action) = &stmt.on_conflict {
+        if is_file_form_shape {
+            return Err(SqlSurfaceError::unsupported(
+                "ON CONFLICT is not supported for file-form INSERT (path/body columns)",
+            ));
+        }
+        return bind_upsert_form(stmt, action, schema);
+    }
+
+    if is_file_form_shape {
         if stmt.rows.len() > 1 {
             return Err(SqlSurfaceError::unsupported(
                 "multi-row VALUES is not supported for file-form INSERT (path/body columns)",
@@ -1535,6 +1595,194 @@ pub fn bind_insert_form(
         }
         Ok(BoundInsertForm::RowBatch(bounds))
     }
+}
+
+/// [`bind_insert_form`] が `stmt.on_conflict` を検出した場合の束縛本体
+/// （SQL-20・TASK-193、Issue #872）。行数に関わらず全行を [`bind_insert_row`]
+/// で個別に束縛してからバッチ内 `id` 重複を検出する（`tenant::insert_typed_
+/// rows_unchecked` の `TenantWriteError::IdConflict`〔`23505`〕は UPSERT の
+/// 衝突分岐とは意味が異なり使えないため、束縛時点〔write トランザクション開始
+/// 前・決定的〕で `22000` として拒否する。2 行目を「1 行目への更新」と解釈
+/// しない）。最後に `DO UPDATE SET` の右辺（[`bind_upsert_assignments`]）を
+/// 束縛し、`EXCLUDED.<col>` が参照する列が `Null` かつ対象列が非 nullable の
+/// 組み合わせを行ごとに検出する（`docs/design/sql-upsert.md` 参照）。
+fn bind_upsert_form(
+    stmt: &ValidatedInsert,
+    action: &OnConflictAction,
+    schema: &TableSchema,
+) -> Result<BoundInsertForm, SqlSurfaceError> {
+    let mut rows: Vec<BoundInsert> = Vec::new();
+    rows.try_reserve_exact(stmt.rows.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large("failed to reserve UPSERT row batch buffer")
+    })?;
+    for values in &stmt.rows {
+        rows.push(bind_insert_row(
+            &stmt.table_name,
+            &stmt.columns,
+            values,
+            &stmt.operation_id,
+            schema,
+        )?);
+    }
+
+    let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    seen_ids
+        .try_reserve(rows.len())
+        .map_err(|_| SqlSurfaceError::payload_too_large("failed to reserve UPSERT id set"))?;
+    for row in &rows {
+        if !seen_ids.insert(row.id) {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "duplicate id {} within the same UPSERT statement",
+                row.id
+            )));
+        }
+    }
+
+    let bound_action = match action {
+        OnConflictAction::DoNothing => BoundConflictAction::DoNothing,
+        OnConflictAction::DoUpdate(assignments) => {
+            let bound_assignments = bind_upsert_assignments(assignments, schema)?;
+            for row in &rows {
+                for (col_idx, value) in &bound_assignments {
+                    let BoundUpsertValue::Excluded(src_idx) = value else {
+                        continue;
+                    };
+                    let is_null = !matches!(
+                        row.values.get(*src_idx),
+                        Some(crate::row_codec::Value::Vector(_))
+                            | Some(crate::row_codec::Value::Text(_))
+                    );
+                    let target_nullable = schema
+                        .columns
+                        .get(*col_idx)
+                        .map(|c| c.nullable)
+                        .unwrap_or(false);
+                    if is_null && !target_nullable {
+                        let target_name = schema
+                            .columns
+                            .get(*col_idx)
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("?");
+                        let src_name = schema
+                            .columns
+                            .get(*src_idx)
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("?");
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {target_name:?} is not nullable but EXCLUDED.{src_name} is NULL for row id {}",
+                            row.id
+                        )));
+                    }
+                }
+            }
+            BoundConflictAction::DoUpdate(bound_assignments)
+        }
+    };
+
+    Ok(BoundInsertForm::Upsert(BoundUpsert {
+        table: stmt.table_name.clone(),
+        rows,
+        action: bound_action,
+        operation_id: stmt.operation_id.clone(),
+    }))
+}
+
+/// `ON CONFLICT ... DO UPDATE SET` の右辺を束縛する（SQL-20・TASK-193、
+/// Issue #872）。対象列の検証（禁止列・重複・未知列）は
+/// [`bind_set_assignments`] と同じ規約だが、右辺が `EXCLUDED.<col>`
+/// （[`UpsertValue::Excluded`]）を取り得る点が異なるため独立した実装とする
+/// （`UpdateWhereForm`／`OnConflictAction` は互いに独立した文法であり、右辺の
+/// 型が異なる〔`InsertLiteral` 対 `UpsertValue`〕ため共通化すると分岐が
+/// かえって読みにくくなる）。
+///
+/// 検出する違反（拒否コードは [`bind_set_assignments`] と同じ分類）:
+/// - 対象列に疑似列 `id`・RLS 内部列 `tenant_id`／`visibility` を指定 → `42601`
+/// - `EXCLUDED.<src>` の `src` に同じ禁止列を指定 → `42601`（サーバー側が
+///   導出・固定する `id`／`tenant_id`／`visibility` を、新規行側の値を経由して
+///   書き換える迂回路を作らないため）
+/// - SET 内の対象列名重複 → `22000`
+/// - 対象列・`src` 列のいずれかが未知の列名 → `22000`
+/// - `EXCLUDED.<src>` の型が対象列の型と不一致（`ColumnType` は `VECTOR(N)`
+///   の次元も含めて `PartialEq` で完全一致比較する）→ `22000`
+/// - リテラル右辺の型不一致（列型とリテラル種別）→ `22000`
+fn bind_upsert_assignments(
+    assignments: &[(String, UpsertValue)],
+    schema: &TableSchema,
+) -> Result<Vec<(usize, BoundUpsertValue)>, SqlSurfaceError> {
+    let mut seen_columns: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut bound: Vec<(usize, BoundUpsertValue)> = Vec::with_capacity(assignments.len());
+
+    for (name, value) in assignments {
+        if name == "id" || name == "tenant_id" || name == "visibility" {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "column {name:?} cannot be targeted by SET"
+            )));
+        }
+        if !seen_columns.insert(name.as_str()) {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "duplicate column in SET clause: {name}"
+            )));
+        }
+        let col_idx = schema
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+        let column = schema
+            .columns
+            .get(col_idx)
+            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+
+        let bound_value = match value {
+            UpsertValue::Excluded(src) => {
+                if src == "id" || src == "tenant_id" || src == "visibility" {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "column {src:?} cannot be referenced by EXCLUDED"
+                    )));
+                }
+                let src_idx = schema
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == src)
+                    .ok_or_else(|| {
+                        SqlSurfaceError::invalid_input(format!("unknown column: {src}"))
+                    })?;
+                let src_column = schema.columns.get(src_idx).ok_or_else(|| {
+                    SqlSurfaceError::invalid_input(format!("unknown column: {src}"))
+                })?;
+                if src_column.ty != column.ty {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} and EXCLUDED.{src} have mismatched types"
+                    )));
+                }
+                BoundUpsertValue::Excluded(src_idx)
+            }
+            UpsertValue::Literal(literal) => {
+                let v = match (column.ty, literal) {
+                    (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
+                        crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+                    }
+                    (ColumnType::Vector(_), InsertLiteral::Number(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a vector literal, got a number"
+                        )))
+                    }
+                    (ColumnType::Text, InsertLiteral::String(s)) => {
+                        crate::row_codec::Value::Text(s.clone())
+                    }
+                    (ColumnType::Text, InsertLiteral::Number(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a text literal, got a number"
+                        )))
+                    }
+                };
+                BoundUpsertValue::Literal(v)
+            }
+        };
+        bound.push((col_idx, bound_value));
+    }
+
+    Ok(bound)
 }
 
 /// [`bind_insert_form`] がファイル形と判定した場合の束縛本体。呼び出し元

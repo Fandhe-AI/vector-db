@@ -255,6 +255,34 @@ fn insert_returning_file_form_is_rejected_and_writes_no_rows() {
     assert_eq!(count_star(&core, &alice, "docs"), 0);
 }
 
+/// `RETURNING`（Issue #873・SQL-21）と `ON CONFLICT`（Issue #872・SQL-20）の
+/// 併用は実行結線未着手のため `42601` で拒否し、書き込みを一切行わない
+/// （main ブランチとの merge で両機能が合流した際の統合確認。
+/// `core.rs::execute_insert_returning_form` の `BoundInsertForm::Upsert` 分岐
+/// 参照）。許可リスト段では受理される構文（`RETURNING` の位置は `USING
+/// OPERATION_ID` の直前という契約を `ON CONFLICT` 追加後も維持しているため）
+/// だが、束縛後のチョークポイントで一律拒否する。
+#[test]
+fn insert_returning_with_on_conflict_is_rejected_and_writes_no_rows() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            "INSERT INTO documents (id, embedding, lang, body) \
+             VALUES (1, '[1.0,0.0]', 'en', 'hello') \
+             ON CONFLICT (id) DO NOTHING \
+             RETURNING * USING OPERATION_ID 'op-upsert-returning'",
+        )
+        .expect_err("INSERT ... ON CONFLICT ... RETURNING must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
+}
+
 /// 非セッション入口（`execute_insert_sql`）は `RETURNING` 付き文を検証直後・
 /// 書き込み前に `42601` で拒否し、台帳を一切消費しない——同一 `operation_id`
 /// をその後セッション経由（`RETURNING` なし）で使うと成功する。

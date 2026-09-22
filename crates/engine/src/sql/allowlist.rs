@@ -874,6 +874,33 @@ pub enum InsertLiteral {
     Number(String),
 }
 
+/// `ON CONFLICT (id) DO UPDATE SET <col> = <value>` の SET 右辺（SQL-20・
+/// TASK-193、Issue #872）。`EXCLUDED.<col>`（新規挿入しようとした行の束縛済み
+/// 値。列名は `sql::parser::bind_upsert_assignments` が `id`/`tenant_id`/
+/// `visibility` を含む禁止列・未知列・型不一致を検証する）か、`UPDATE ... SET`
+/// と同じリテラル値のいずれか。式・関数呼び出し・他列参照は許可リスト外。
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpsertValue {
+    /// `EXCLUDED.<col>`（大小無視で照合した `EXCLUDED` 修飾子。列名は宣言どおりの
+    /// 大小を保持する）。
+    Excluded(String),
+    Literal(InsertLiteral),
+}
+
+/// `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...` の衝突分岐（SQL-20・
+/// TASK-193、Issue #872）。衝突判定スコープは `(tenant_id, id)` の**所有**
+/// （`tenant::upsert_typed_rows_unchecked` が既存 DML 実行器
+/// `update_row_unchecked`／`delete_row_impl` と同じ二重防御で判定する。
+/// 可視性ではない）。`ValidatedInsert::on_conflict` が `None` の場合は本 Issue
+/// 導入前と完全に同じ「行 `id` 衝突は常に `23505`」の挙動になる。
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnConflictAction {
+    /// 衝突した行はそのまま変更しない（新規挿入もしない）。
+    DoNothing,
+    /// 衝突した行の指定列だけを上書きする（宣言順を保持。read-merge-write）。
+    DoUpdate(Vec<(String, UpsertValue)>),
+}
+
 /// 許可形状の構造判定を通過した INSERT 文（SQL-10・SQL-16、TASK-80・TASK-190）。
 /// `ValidatedStatement` と同様、本モジュールが保証するのはここまでの構造情報のみで、
 /// 列名・値の意味論的妥当性は検証しない（`sql::parser::bind_insert` の責務）。
@@ -905,6 +932,12 @@ pub struct ValidatedInsert {
     /// 句の直前にのみ置ける（[`Parser::parse_returning_clause`] 参照）。関数呼び出し
     /// 項目（[`Projection::Items`]）はここには到達しない（構造検証段で `42601`）。
     pub returning: Option<Projection>,
+    /// `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・TASK-193、
+    /// Issue #872）。句の省略は `None`（本 Issue 導入前と完全に同じ「行 `id`
+    /// 衝突は常に `23505`」の挙動）。複数行 `VALUES` と併用可能（全行が同じ
+    /// 衝突分岐を共有する）。ファイル形 INSERT との併用は
+    /// `sql::parser::bind_insert_form` が `42601` で拒否する。
+    pub on_conflict: Option<OnConflictAction>,
 }
 
 /// 許可形状の構造判定を通過した単一行・`id` 指定形 `DELETE` 文（SQL-18・
@@ -1827,7 +1860,19 @@ impl<'a> Parser<'a> {
             rows.push(self.parse_insert_values_row(&columns)?);
         }
 
-        // `RETURNING`（Issue #873・SQL-21）は `USING OPERATION_ID` 句の直前。
+        // `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・TASK-193、
+        // Issue #872）: 任意句。`VALUES` 群の直後・文末専用句 `USING
+        // OPERATION_ID` の**前**に置く（`USING OPERATION_ID` の後ろに書いた形は
+        // `parse_operation_id_clause` が先に `USING ...` を消費してしまい、
+        // 残った `ON CONFLICT ...` が `expect_end_of_statement` の余剰トークンと
+        // して `42601` へ落ちる。優先順位の明示は `docs/design/sql-upsert.md`
+        // 参照）。
+        let on_conflict = self.parse_on_conflict_clause()?;
+
+        // `RETURNING`（Issue #873・SQL-21）は `ON CONFLICT` の後・`USING
+        // OPERATION_ID` 句の直前（`docs/design/sql-returning.md`「UPSERT（#872）
+        // との併用」節。RETURNING の文法上の位置＝`USING OPERATION_ID` の直前
+        // という契約を維持したまま `ON CONFLICT` を挿入する形）。
         let returning = self.parse_returning_clause()?;
 
         // 文末専用句の構造パースのみをここで行う（省略・明示 `NULL` はいずれも
@@ -1845,7 +1890,86 @@ impl<'a> Parser<'a> {
             returning,
             rows,
             operation_id,
+            on_conflict,
         })
+    }
+
+    /// `ON CONFLICT (id) DO NOTHING | DO UPDATE SET <col> = <value>[, ...]`
+    /// を受理する（SQL-20・TASK-193、Issue #872）。任意句のため、先頭が
+    /// 文脈的キーワード `ON` でなければ `None` を返し呼び出し元の位置を進めない。
+    ///
+    /// 対象列リストは `(id)` のみを受理する（複数列・他列名・`ON CONSTRAINT` は
+    /// いずれも `42601`）。`DO UPDATE SET` の後ろに `WHERE` を続けた形・句の重複は
+    /// 専用の判定を持たず、構造的に余剰トークンとして
+    /// `Parser::expect_end_of_statement`（呼び出し元 [`parse_delete_statement_shape`]
+    /// 等と同じ、本メソッドの直接の呼び出し元 [`Parser::parse_insert`] が最終的に
+    /// 委ねる契約）が `42601` で拒否する。
+    ///
+    /// `id` は列識別子であり `ON`/`CONFLICT`/`DO`/`EXCLUDED`（文脈的キーワード。
+    /// `eq_ignore_ascii_case` で判定）とは扱いが異なる。本 SQL 表層の字句解析は
+    /// 識別子を大文字小文字保存のまま字句化し（`sql/lexer.rs` は識別子の
+    /// 正規化を行わない）、列名解決（`schema.columns.iter().position(|c| &c.name
+    /// == name)`。`sql/parser.rs`）・単一行 `DELETE`/`UPDATE` の `id` 指定形
+    /// （[`Self::peek_single_row_delete_id`]・[`Self::parse_update_where`]）を含む
+    /// SQL 表層全体で識別子は一貫して大文字小文字を区別する。したがって
+    /// `ON CONFLICT (ID)` / `(Id)` は実在しない列名として `42601` になる
+    /// （キーワードの大文字小文字非依存と矛盾しない、識別子側の既定契約
+    /// どおりの挙動）。
+    fn parse_on_conflict_clause(&mut self) -> Result<Option<OnConflictAction>, SqlSurfaceError> {
+        if !self.peek_contextual_keyword("ON") {
+            return Ok(None);
+        }
+        self.advance();
+        self.expect_contextual_keyword("CONFLICT")?;
+        self.expect_punct('(')?;
+        match self.advance() {
+            Some(Token::Ident(name)) if name == "id" => {}
+            other => {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "ON CONFLICT target list must be (id), got {other:?}"
+                )))
+            }
+        }
+        self.expect_punct(')')?;
+        self.expect_contextual_keyword("DO")?;
+        if self.peek_contextual_keyword("NOTHING") {
+            self.advance();
+            return Ok(Some(OnConflictAction::DoNothing));
+        }
+        self.expect_contextual_keyword("UPDATE")?;
+        self.expect_contextual_keyword("SET")?;
+        let mut assignments = vec![self.parse_upsert_assignment()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            if assignments.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
+                return Err(SqlSurfaceError::unsupported(
+                    "too many ON CONFLICT DO UPDATE SET assignments",
+                ));
+            }
+            assignments.push(self.parse_upsert_assignment()?);
+        }
+        Ok(Some(OnConflictAction::DoUpdate(assignments)))
+    }
+
+    /// `ON CONFLICT ... DO UPDATE SET` の 1 要素（`<col> = (EXCLUDED.<col> |
+    /// <lit>)`）を構造パースする（SQL-20・TASK-193、Issue #872。
+    /// `Parser::parse_update_assignment` と同じ形だが、右辺に
+    /// [`Token::QualifiedIdent`]（`EXCLUDED.<col>`）も受理する点が異なる）。
+    fn parse_upsert_assignment(&mut self) -> Result<(String, UpsertValue), SqlSurfaceError> {
+        let column = self.expect_ident()?;
+        self.expect_punct('=')?;
+        let value = if let Some(Token::QualifiedIdent { qualifier, name }) = self.peek().cloned() {
+            self.advance();
+            if !qualifier.eq_ignore_ascii_case("EXCLUDED") {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "unsupported ON CONFLICT SET qualifier: {qualifier}"
+                )));
+            }
+            UpsertValue::Excluded(name)
+        } else {
+            UpsertValue::Literal(self.expect_literal()?)
+        };
+        Ok((column, value))
     }
 
     /// `VALUES` の 1 行分 `(<lit>[, <lit>]*)` を解析し、リテラル数が列数と一致する
@@ -2645,6 +2769,7 @@ struct ParsedInsertShape {
     rows: Vec<Vec<InsertLiteral>>,
     operation_id: Option<OperationId>,
     returning: Option<Projection>,
+    on_conflict: Option<OnConflictAction>,
 }
 
 /// `DELETE` の `WHERE` 句の構造形状（Issue #870・SQL-19）。単一行・`id` 完全
@@ -2856,6 +2981,7 @@ pub(crate) fn validate_insert_tokens(
         rows: shape.rows,
         operation_id: shape.operation_id,
         returning: shape.returning,
+        on_conflict: shape.on_conflict,
     })
 }
 
@@ -4039,6 +4165,220 @@ mod tests {
             LedgerMode::Ledgered,
         )
         .is_ok());
+    }
+
+    // --- ON CONFLICT（SQL-20・TASK-193、Issue #872） ---
+
+    #[test]
+    fn accepts_upsert_do_nothing() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
+             ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-upsert-1'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("DO NOTHING should be accepted");
+        assert_eq!(stmt.on_conflict, Some(OnConflictAction::DoNothing));
+    }
+
+    #[test]
+    fn accepts_upsert_do_update_set_excluded_and_literal_mixed_case_qualifier() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding, lang) VALUES (1, '[0.1,0.2]', 'ja') \
+             ON CONFLICT (id) DO UPDATE SET embedding = excluded.embedding, lang = 'en' \
+             USING OPERATION_ID 'op-upsert-2'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("DO UPDATE SET should be accepted");
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictAction::DoUpdate(vec![
+                (
+                    "embedding".to_string(),
+                    UpsertValue::Excluded("embedding".to_string())
+                ),
+                (
+                    "lang".to_string(),
+                    UpsertValue::Literal(InsertLiteral::String("en".to_string()))
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn accepts_upsert_with_multi_row_values() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]'), (2, '[0.3,0.4]') \
+             ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-upsert-3'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("multi-row VALUES with ON CONFLICT should be accepted");
+        assert_eq!(stmt.rows.len(), 2);
+        assert_eq!(stmt.on_conflict, Some(OnConflictAction::DoNothing));
+    }
+
+    #[test]
+    fn rejects_upsert_missing_target_column_list() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT DO NOTHING \
+             USING OPERATION_ID 'op-upsert-4'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_non_id_target_column() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, 'ja') ON CONFLICT (lang) DO NOTHING \
+             USING OPERATION_ID 'op-upsert-5'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_target_column_with_mismatched_case() {
+        // `id` は列識別子であり、`ON`/`CONFLICT`/`DO` のような文脈的キーワード
+        // ではない（大文字小文字保存・区別。`parse_on_conflict_clause` の
+        // ドキュメンテーションコメント参照。cursor(Bugbot) 指摘
+        // https://github.com/Fandhe-AI/vector-db/pull/990#discussion_r4075151521）。
+        let lookup = catalog_with(&["documents"]);
+        for target in ["ID", "Id"] {
+            let sql = format!(
+                "INSERT INTO documents (id) VALUES (1) ON CONFLICT ({target}) DO NOTHING \
+                 USING OPERATION_ID 'op-upsert-case'"
+            );
+            let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
+            assert_eq!(err.wire_code(), "42601");
+        }
+    }
+
+    #[test]
+    fn rejects_upsert_multiple_target_columns() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, 'ja') ON CONFLICT (id, lang) DO NOTHING \
+             USING OPERATION_ID 'op-upsert-6'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_on_constraint_form() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT ON CONSTRAINT documents_pkey \
+             DO NOTHING USING OPERATION_ID 'op-upsert-7'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_do_update_without_set() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT (id) DO UPDATE \
+             USING OPERATION_ID 'op-upsert-8'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_do_update_set_with_empty_assignment_list() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET \
+             USING OPERATION_ID 'op-upsert-9'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_do_update_set_where_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, 'ja') ON CONFLICT (id) \
+             DO UPDATE SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-upsert-10'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_duplicate_on_conflict_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT (id) DO NOTHING \
+             ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-upsert-11'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_on_conflict_after_using_operation_id() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID 'op-upsert-12' \
+             ON CONFLICT (id) DO NOTHING",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_excluded_qualifier_used_bare() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED \
+             USING OPERATION_ID 'op-upsert-13'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_missing_operation_id_before_catalog_lookup() {
+        let lookup = FailingCatalog;
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT (id) DO NOTHING",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "23502");
     }
 
     #[test]

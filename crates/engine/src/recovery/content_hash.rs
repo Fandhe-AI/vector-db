@@ -93,6 +93,9 @@ enum OpTag {
     Delete = 4,
     ReplaceByTextKey = 5,
     Truncate = 6,
+    /// `tenant::upsert_typed_rows_unchecked` 用（SQL-20・TASK-193、Issue #872）。
+    /// [`for_typed_upsert`] ドキュメント参照。
+    Upsert = 7,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -407,6 +410,99 @@ pub(crate) fn for_typed_insert_batch(
     let count = u32::try_from(rows.len())
         .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
     let mut b = HashInputBuilder::new(OpTag::InsertBatch);
+    b.push_raw(&count.to_le_bytes());
+    for (id, visibility, embedding, columns) in rows {
+        b.push_u64(*id);
+        b.push_u8(visibility.to_byte());
+        push_vector(&mut b, embedding)?;
+        let non_null_columns = columns
+            .iter()
+            .filter(|(_, value)| !matches!(value, Value::Null))
+            .count();
+        let non_null_columns = u32::try_from(non_null_columns).map_err(|_| {
+            StorageError::Codec("content hash batch row column count too large".to_string())
+        })?;
+        b.push_raw(&non_null_columns.to_le_bytes());
+        push_named_scalar_columns(&mut b, columns)?;
+    }
+    Ok(b.finish())
+}
+
+/// [`for_typed_upsert`] の `SET` 右辺（ハッシュ入力専用の最小表現。SQL-20・
+/// TASK-193、Issue #872）。本モジュールは `sql` に依存しない設計を維持するため、
+/// `sql::allowlist::UpsertValue` をそのまま受け取らず、呼び出し元
+/// （`tenant::upsert_typed_rows_unchecked`）が変換した最小 enum を受け取る。
+pub(crate) enum UpsertAssignmentHashValue<'a> {
+    /// `EXCLUDED.<col>`。ハッシュには新規挿入しようとした行の値ではなく
+    /// **参照元の列名**を含める（同一 `EXCLUDED.<col>` 参照は新規行の内容が
+    /// 変われば行ハッシュ側〔`rows` レイアウト〕で自然に区別されるため、ここで
+    /// 実際の値を重複してハッシュ化する必要はない。列名自体が異なれば当然
+    /// ハッシュも変わる）。
+    Excluded(&'a str),
+    Literal(&'a Value),
+}
+
+/// [`for_typed_upsert`] の衝突分岐（SQL-20・TASK-193、Issue #872）。
+/// `sql::allowlist::OnConflictAction` に対応する最小表現。
+pub(crate) enum UpsertHashAction<'a> {
+    DoNothing,
+    /// `(対象列名, 右辺)` の宣言順スライス（並べ替えない。`Parser::parse_
+    /// upsert_assignment` の宣言順をそのまま保持する契約は
+    /// `sql::parser::bind_upsert_assignments` が担う）。
+    DoUpdate(&'a [(String, UpsertAssignmentHashValue<'a>)]),
+}
+
+/// `tenant::upsert_typed_rows_unchecked` 用（SQL-20・TASK-193、Issue #872）。
+/// `INSERT ... ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...` を単一の
+/// 「新規挿入かもしれないし更新かもしれない」操作として、[`OpTag::Upsert`]
+/// タグの下でハッシュ化する（[`OpTag::Insert`]／[`OpTag::Update`] のいずれとも
+/// 共有しない専用タグ。同一 `VALUES` でも plain `INSERT`／`DO NOTHING`／
+/// `DO UPDATE`／`SET` 内容差は必ず異なるハッシュになる——衝突分岐そのものを
+/// 先頭で `push_u8` してから行データを連結するため）。
+///
+/// 入力レイアウト: `push_u8(action_tag)`（`0` = DO NOTHING、`1` = DO UPDATE）
+/// → DO UPDATE のみ `push_raw(assignment_count)` に続けて各割当を宣言順で
+/// `push_bytes(target_column_name)` → `push_u8(value_kind)`（`0` = `EXCLUDED`、
+/// `1` = リテラル）→ `EXCLUDED` なら `push_bytes(src_column_name)`、リテラル
+/// なら [`push_value`] → その後は [`for_typed_insert_batch`] と**完全に同一**の
+/// 行データレイアウト（件数プレフィクス＋行ごとの `(id, visibility, embedding,
+/// 列数プレフィクス, 列名付きスカラー列)`）を連結する。単一行 UPSERT も
+/// `rows.len() == 1` としてこのレイアウトを使う（`for_typed_insert` へは
+/// 委譲しない——plain `INSERT` と同一 `operation_id` での UPSERT 再送を
+/// `OpTag` の違いで機械的に内容不一致〔`22023`〕として検出させるため）。
+/// 行境界の曖昧性回避（[`for_typed_insert_batch`] ドキュメント参照）は行数
+/// プレフィクスを持つ本レイアウトにもそのまま適用される。
+pub(crate) fn for_typed_upsert(
+    action: &UpsertHashAction<'_>,
+    rows: &[TypedInsertBatchRow<'_>],
+) -> Result<ContentHash, StorageError> {
+    let mut b = HashInputBuilder::new(OpTag::Upsert);
+    match action {
+        UpsertHashAction::DoNothing => b.push_u8(0),
+        UpsertHashAction::DoUpdate(assignments) => {
+            b.push_u8(1);
+            let count = u32::try_from(assignments.len()).map_err(|_| {
+                StorageError::Codec("content hash upsert assignment count too large".to_string())
+            })?;
+            b.push_raw(&count.to_le_bytes());
+            for (name, value) in assignments.iter() {
+                b.push_bytes(name.as_bytes())?;
+                match value {
+                    UpsertAssignmentHashValue::Excluded(src) => {
+                        b.push_u8(0);
+                        b.push_bytes(src.as_bytes())?;
+                    }
+                    UpsertAssignmentHashValue::Literal(v) => {
+                        b.push_u8(1);
+                        push_value(&mut b, v)?;
+                    }
+                }
+            }
+        }
+    }
+
+    let count = u32::try_from(rows.len())
+        .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
     b.push_raw(&count.to_le_bytes());
     for (id, visibility, embedding, columns) in rows {
         b.push_u64(*id);
@@ -1321,5 +1417,111 @@ mod tests {
             for_insert_batch_encoded_reference(&hash_input).expect("hash"),
             for_insert_batch_encoded(&hash_input).expect("hash")
         );
+    }
+
+    // --- for_typed_upsert（SQL-20・TASK-193、Issue #872） ---
+
+    #[test]
+    fn for_typed_upsert_is_deterministic() {
+        let embedding = [1.0_f32, 0.0, 0.0];
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang)];
+        let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
+        let a = for_typed_upsert(&UpsertHashAction::DoNothing, &rows).expect("hash");
+        let b = for_typed_upsert(&UpsertHashAction::DoNothing, &rows).expect("hash");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn for_typed_upsert_differs_from_plain_insert_for_same_values() {
+        let embedding = [1.0_f32, 0.0, 0.0];
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang)];
+        let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
+        let plain_insert =
+            for_typed_insert(1, Visibility::Private, &embedding, &cols).expect("hash");
+        let do_nothing = for_typed_upsert(&UpsertHashAction::DoNothing, &rows).expect("hash");
+        assert_ne!(plain_insert, do_nothing);
+    }
+
+    #[test]
+    fn for_typed_upsert_differs_between_do_nothing_and_do_update() {
+        let embedding = [1.0_f32, 0.0, 0.0];
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang)];
+        let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
+        let assignments = vec![(
+            "lang".to_string(),
+            UpsertAssignmentHashValue::Literal(&lang),
+        )];
+        let do_nothing = for_typed_upsert(&UpsertHashAction::DoNothing, &rows).expect("hash");
+        let do_update =
+            for_typed_upsert(&UpsertHashAction::DoUpdate(&assignments), &rows).expect("hash");
+        assert_ne!(do_nothing, do_update);
+    }
+
+    #[test]
+    fn for_typed_upsert_differs_by_set_assignment_content() {
+        let embedding = [1.0_f32, 0.0, 0.0];
+        let lang_ja = Value::Text("ja".to_string());
+        let lang_en = Value::Text("en".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang_ja)];
+        let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
+        let assignments_ja = vec![(
+            "lang".to_string(),
+            UpsertAssignmentHashValue::Literal(&lang_ja),
+        )];
+        let assignments_en = vec![(
+            "lang".to_string(),
+            UpsertAssignmentHashValue::Literal(&lang_en),
+        )];
+        let h_ja =
+            for_typed_upsert(&UpsertHashAction::DoUpdate(&assignments_ja), &rows).expect("hash");
+        let h_en =
+            for_typed_upsert(&UpsertHashAction::DoUpdate(&assignments_en), &rows).expect("hash");
+        assert_ne!(h_ja, h_en);
+    }
+
+    #[test]
+    fn for_typed_upsert_differs_between_excluded_and_literal_with_same_target_column() {
+        let embedding = [1.0_f32, 0.0, 0.0];
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang)];
+        let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
+        let assignments_excluded = vec![(
+            "lang".to_string(),
+            UpsertAssignmentHashValue::Excluded("lang"),
+        )];
+        let assignments_literal = vec![(
+            "lang".to_string(),
+            UpsertAssignmentHashValue::Literal(&lang),
+        )];
+        let h_excluded =
+            for_typed_upsert(&UpsertHashAction::DoUpdate(&assignments_excluded), &rows)
+                .expect("hash");
+        let h_literal = for_typed_upsert(&UpsertHashAction::DoUpdate(&assignments_literal), &rows)
+            .expect("hash");
+        assert_ne!(h_excluded, h_literal);
+    }
+
+    #[test]
+    fn for_typed_upsert_differs_when_row_order_changes() {
+        let embedding_a = [1.0_f32, 0.0, 0.0];
+        let embedding_b = [0.0_f32, 1.0, 0.0];
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang)];
+        let rows_forward: [TypedInsertBatchRow<'_>; 2] = [
+            (1, Visibility::Private, &embedding_a, &cols),
+            (2, Visibility::Private, &embedding_b, &cols),
+        ];
+        let rows_reversed: [TypedInsertBatchRow<'_>; 2] = [
+            (2, Visibility::Private, &embedding_b, &cols),
+            (1, Visibility::Private, &embedding_a, &cols),
+        ];
+        let h_forward =
+            for_typed_upsert(&UpsertHashAction::DoNothing, &rows_forward).expect("hash");
+        let h_reversed =
+            for_typed_upsert(&UpsertHashAction::DoNothing, &rows_reversed).expect("hash");
+        assert_ne!(h_forward, h_reversed);
     }
 }
