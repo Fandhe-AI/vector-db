@@ -451,13 +451,16 @@ fn all_four_ops_succeed_against_seeded_fixture_with_distinct_bodies() {
 // --- T2: 語彙外 op は seed 済み・実行可能状態でも 0A000 で副作用なし（受入 2） ---
 
 #[test]
-fn vocabulary_outside_four_ops_rejects_with_0a000_and_has_no_side_effect() {
+fn vocabulary_outside_six_ops_rejects_with_0a000_and_has_no_side_effect() {
     let (core, _guard) = new_core_two_tenant_docs();
     let addr = spawn(Arc::clone(&core));
 
-    // `nosql9_op_allowlist.rs` と同じ語彙外集合。受理形（`vector`／`limit`
-    // 等）の残りフィールドを備えた本文で送り、「op 判定が実行可能な状態でも
-    // 手前で止まる」ことを固定する。
+    // `nosql9_op_allowlist.rs` と同じ語彙外集合（`update`／`delete` は
+    // Issue #875 で語彙へ加わったため対象外。その 2 op の「実行可能な状態
+    // でも副作用なし」は下の
+    // `update_and_delete_pass_allowlist_but_have_no_side_effect` が固定する）。
+    // 受理形（`vector`／`limit` 等）の残りフィールドを備えた本文で送り、
+    // 「op 判定が実行可能な状態でも手前で止まる」ことを固定する。
     let unsupported_ops = [
         "create_table",
         "alter_table",
@@ -467,8 +470,6 @@ fn vocabulary_outside_four_ops_rejects_with_0a000_and_has_no_side_effect() {
         "begin",
         "commit",
         "rollback",
-        "update",
-        "delete",
         "select",
         "explain",
         "set",
@@ -492,8 +493,45 @@ fn vocabulary_outside_four_ops_rejects_with_0a000_and_has_no_side_effect() {
         }
     }
 
-    // 全拒否後も行数は不変（`delete`／`update`／`drop_table` 相当のいずれも
-    // 何も変更していないことを非 vacuous に確認する）。
+    // 全拒否後も行数は不変（`drop_table` 相当が何も変更していないことを
+    // 非 vacuous に確認する）。
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"scan","table":"docs","limit":10,"columns":["id"]}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(
+        body_utf8(&resp).contains(r#""row_count":4"#),
+        "{}",
+        body_utf8(&resp)
+    );
+}
+
+// --- update／delete: 語彙は通過するが実行結線未接続で副作用なし（Issue #875） ---
+
+#[test]
+fn update_and_delete_pass_allowlist_but_have_no_side_effect() {
+    // `update`／`delete`（Issue #875・NOSQL-12）は語彙・スキーマ検証を通過
+    // するが束縛・実行結線は Issue #876 の担当のため、seed 済み・実行可能な
+    // 状態でも `42P01`（他 4 op が到達する証跡）ではなく暫定 `0A000`／501 の
+    // まま留まり、行データへの副作用も生じないことを固定する。
+    let (core, _guard) = new_core_two_tenant_docs();
+    let addr = spawn(Arc::clone(&core));
+
+    let bodies: [&[u8]; 2] = [
+        br#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1}}"#,
+        br#"{"op":"delete","table":"docs","where":{"id":1}}"#,
+    ];
+    for body in bodies {
+        let resp = query_as_alice(addr, body);
+        assert_eq!(resp.status, 501, "body={body:?} resp={resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), "0A000");
+        assert_eq!(
+            http_common::error_message_of(&resp),
+            wire_server::http::query::gate::PLACEHOLDER_MESSAGE
+        );
+    }
+
     let resp = query_as_alice(
         addr,
         br#"{"op":"scan","table":"docs","limit":10,"columns":["id"]}"#,
