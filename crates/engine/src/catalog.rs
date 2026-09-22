@@ -90,12 +90,15 @@ pub enum CatalogError {
     /// 識別子・スキーマ定義）が渡した値そのものの検証失敗であり、`detail` は
     /// 呼び出し元が把握済みの情報のみを含む。
     Invalid(String),
-    /// redb に格納済みのカタログ値（[`decode_schema`]）のデコードに失敗した。
-    /// ユーザーが今回渡した入力の構文エラーではなく、ストレージ側の破損・想定外の
-    /// 格納状態を示す。`detail` には格納済みバイト列由来の断片（`cols_line` 等）が
-    /// 含まれ得るため、`Invalid` と区別し、wire クライアントへは detail を渡さず
-    /// 汎用メッセージへ丸める（Issue #55 レビュー指摘。`.claude/rules/security.md`
-    /// 「不安全な設計」「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」対応）。
+    /// redb に格納済みのカタログ値（[`decode_schema`]）、または格納済み行の
+    /// スカラーペイロード（`tenant::update_row_columns_unchecked` が
+    /// `row_codec::decode_scalar_columns` を呼ぶ経路。Issue #865）のデコードに
+    /// 失敗した。ユーザーが今回渡した入力の構文エラーではなく、ストレージ側の
+    /// 破損・想定外の格納状態を示す。`detail` には格納済みバイト列由来の断片
+    /// （`cols_line` 等）が含まれ得るため、`Invalid` と区別し、wire クライアントへは
+    /// detail を渡さず汎用メッセージへ丸める（Issue #55 レビュー指摘。
+    /// `.claude/rules/security.md`「不安全な設計」「エラー・ログ経由で他テナントの
+    /// データ・存在情報を漏らさない」対応）。
     CorruptSchema(String),
     /// 指定したテーブルがカタログに存在しない。
     TableNotFound(String),

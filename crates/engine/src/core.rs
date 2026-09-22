@@ -2009,7 +2009,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Insert(_)
                     | crate::sql::SqlOutcome::Truncate(_)
                     | crate::sql::SqlOutcome::Delete(_)
-                    | crate::sql::SqlOutcome::Returning(_) => {
+                    | crate::sql::SqlOutcome::Returning(_)
+                    | crate::sql::SqlOutcome::Update(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -2035,7 +2036,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Insert(_)
                     | crate::sql::SqlOutcome::Truncate(_)
                     | crate::sql::SqlOutcome::Delete(_)
-                    | crate::sql::SqlOutcome::Returning(_) => {
+                    | crate::sql::SqlOutcome::Returning(_)
+                    | crate::sql::SqlOutcome::Update(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -2058,7 +2060,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Insert(_)
                     | crate::sql::SqlOutcome::Truncate(_)
                     | crate::sql::SqlOutcome::Delete(_)
-                    | crate::sql::SqlOutcome::Returning(_) => {
+                    | crate::sql::SqlOutcome::Returning(_)
+                    | crate::sql::SqlOutcome::Update(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -2235,6 +2238,27 @@ impl EngineCore {
                 }
                 let outcome = self.execute_delete_form(ctx, &stmt)?;
                 return Ok(crate::sql::SqlOutcome::Delete(outcome));
+            }
+
+            // Issue #865（SQL-17・TASK-191）: `INSERT`・`TRUNCATE` と同じ設計で
+            // `UPDATE` を覗き見判定する。`EXPLAIN UPDATE ...` は先頭トークンが
+            // `UPDATE` ではなく `EXPLAIN` になるため、ここでは捕捉されず後続の
+            // `validate_sql` の `EXPLAIN` 分岐（次のトークンが `SELECT` であることを
+            // 要求）へ流れて `42601` で拒否される（`INSERT`・`TRUNCATE` の既存
+            // コメントと同じ経路）。
+            let is_update_statement = matches!(
+                tokens.first(),
+                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("UPDATE")
+            );
+            if is_update_statement {
+                let lookup = InsertSchemaLookup::new(&self.storage);
+                let stmt = crate::sql::allowlist::validate_update_tokens(
+                    &tokens,
+                    &lookup,
+                    self.ledger_mode,
+                )?;
+                let outcome = self.execute_update_form(ctx, &stmt, &lookup)?;
+                return Ok(crate::sql::SqlOutcome::Update(outcome));
             }
         }
 
@@ -4114,6 +4138,65 @@ impl EngineCore {
             self.ledger_mode,
             &returning,
             &schema,
+        )
+    }
+
+    /// SQL 表層の単一 UPDATE 文実行エントリポイント（Issue #865、対象ビヘイビア:
+    /// SQL-17・TASK-191）。`execute_insert_sql` と同じ構造（`execute_sql`（TASK-75、
+    /// SELECT 専用）とは独立した固有メソッド。`VectorCore` trait への昇格は行わない）。
+    ///
+    /// `sql::allowlist::validate_update`（構造検証。文末専用句
+    /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
+    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
+    /// RECOVER-1）→ [`Self::execute_update_form`]（束縛・実行本体）の順に呼ぶ。
+    pub fn execute_update_sql(
+        &self,
+        ctx: &PolicyContext,
+        sql: &str,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // `execute_insert_sql` と同じく `InsertSchemaLookup` を `validate_update` へ
+        // 渡し、`table_exists` が取得したスキーマを `take_schema` で再利用する
+        // ことで、1 文あたりのスキーマ取得を 1 回へ減らす。
+        let lookup = InsertSchemaLookup::new(&self.storage);
+        let stmt = crate::sql::allowlist::validate_update(sql, &lookup, self.ledger_mode)?;
+        self.execute_update_form(ctx, &stmt, &lookup)
+    }
+
+    /// [`Self::execute_update_sql`]・[`Self::execute_sql_in_session`] の UPDATE
+    /// 分岐が共有する束縛〜実行本体（`execute_insert_form` と同じ設計）。
+    /// `validate_update`／`validate_update_tokens` が返した `stmt` と、その検証時に
+    /// 使った `lookup`（`table_exists` 呼び出しでスキーマをキャッシュ済み）を受け取り、
+    /// [`InsertSchemaLookup::take_schema`] でスキーマを再取得できればそれを使い、
+    /// できなければ `get_table_schema` 単独呼び出しへ fail-closed にフォール
+    /// バックする。
+    fn execute_update_form(
+        &self,
+        ctx: &PolicyContext,
+        stmt: &crate::sql::allowlist::ValidatedUpdate,
+        lookup: &InsertSchemaLookup<'_>,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let schema = match lookup.take_schema(&stmt.table_name) {
+            Some(schema) => schema,
+            None => self
+                .storage
+                .get_table_schema(&stmt.table_name)
+                .map_err(|e| match e {
+                    CatalogError::TableNotFound(name) => {
+                        crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                    }
+                    _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "failed to load table schema".to_string(),
+                    },
+                })?,
+        };
+        let bound = crate::sql::parser::bind_update(stmt, &schema)?;
+        crate::sql::exec::execute_update_with_schema(
+            &self.storage,
+            ctx,
+            &bound,
+            self.ledger_mode,
+            Some(&schema),
         )
     }
 

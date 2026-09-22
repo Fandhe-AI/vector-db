@@ -6,8 +6,9 @@
 ようにする。単一行・`id` 完全一致形 `DELETE`（SQL-18・TASK-191。実行結線
 済み）と行形 `INSERT`（単一行・複数行 `VALUES`。SQL-10・SQL-16）に
 `RETURNING <投影>` を追加した。述語つき `DELETE`（Issue #870・#871）・
-`UPDATE`（単一行・述語形とも Issue #864・#869・#865）は本 Issue の範囲外
-のまま（下記「対象外」参照）。
+`UPDATE`（単一行・述語形とも。`UPDATE` 自体の実行結線は Issue #864・#865 で
+別途完了済みだが、`RETURNING` の実行結線は本 Issue の範囲外のまま）は
+下記「対象外」のとおり未着手（下記「対象外」参照）。
 
 ## 構文
 
@@ -21,6 +22,10 @@ INSERT INTO <table> (<col>[, <col>]*) VALUES (<lit>[, <lit>]*)[, (...)]*
 DELETE FROM <table> WHERE id = <n>
   [RETURNING <投影>] USING OPERATION_ID '<id>' [;]
 ```
+
+`UPDATE`（単一行・id 指定）自体の実行結線は Issue #865（SQL-17・TASK-191）で
+別途完了しているが、`UPDATE ... RETURNING ...` の実行結線は本 Issue・#865
+いずれの対象でもなく未着手のまま（下記「対象外」参照）。
 
 `<投影>` は `*` または裸の列名リスト（疑似列 `id` を含む。`SELECT` の
 `Projection::Columns`／`Projection::All` を再利用）。関数呼び出し項目
@@ -41,7 +46,7 @@ DELETE FROM <table> WHERE id = <n>
 | `TRUNCATE TABLE <table> ... RETURNING *` | `42601`（`TRUNCATE` は対象外） |
 | ファイル形 `INSERT`（`path`/`body` 列指定）＋ `RETURNING` | `42601`（束縛段。サーバー側チャンク化行を返す応答形が未定義のため fail-closed） |
 | 述語つき `DELETE ... WHERE <非 id 述語> RETURNING ...` | `42601`（実行結線〔#871〕未着手のためチョークポイントで一律拒否） |
-| 単一行・述語形いずれの `UPDATE ... RETURNING ...` | `42601`（実行結線〔#865〕未着手のためチョークポイントで一律拒否） |
+| 単一行・述語形いずれの `UPDATE ... RETURNING ...` | `42601`（`UPDATE` 自体の実行結線〔#865〕は完了済みだが `RETURNING` 側の実行結線は本 Issue・#865 いずれの対象でもなく未着手のためチョークポイントで一律拒否） |
 | `EngineCore::execute_insert_sql`／`execute_insert_sql_batch`／`execute_delete_sql`（非セッション入口）＋ `RETURNING` | `42601`（検証直後・書き込み前。台帳は消費しない） |
 
 ## 実行経路
@@ -137,10 +142,13 @@ MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と同じ
 
 ## 対象外・申し送り
 
-- **UPDATE（単一行・述語形とも）の RETURNING 実行結線**: `UPDATE` の実行
-  結線自体（#865）が未着手のため、構文・束縛段は受理するがチョークポイント
-  で常に `42601`。#865 が結線する際は、`DELETE` の `capture` と同型の
-  update-後の値捕捉を追加する。
+- **UPDATE（単一行・述語形とも）の RETURNING 実行結線**: `UPDATE` 自体の
+  実行結線（#865。`sql::exec::execute_update`／`execute_update_with_schema`・
+  `core.rs::execute_update_sql`／`execute_update_form`）は完了済みだが、
+  `RETURNING` 側の結線は本 Issue・#865 いずれの対象でもなく未着手のため、
+  構文・束縛段は受理するがチョークポイントで常に `42601`。結線する際は、
+  `DELETE` の `capture` と同型の update-後の値捕捉を
+  `tenant::update_row_columns_unchecked` へ追加する。
 - **述語つき DELETE の RETURNING 実行結線**: #871（実行結線）・#868（複数行
   変更の `operation_id` 内容照合ハッシュ仕様）の担当。正規化文から
   `RETURNING` を除外する必要がある旨を申し送る。

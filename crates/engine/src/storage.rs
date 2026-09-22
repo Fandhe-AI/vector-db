@@ -137,7 +137,11 @@ pub(crate) const MAX_TENANT_ID_LEN: u16 = 256;
 pub(crate) const MAX_EMBEDDING_DIM: u32 = 65_536;
 
 /// メタデータ列のバイト長上限。埋め込みと同様、デコード前に上限検証する。
-const MAX_METADATA_LEN: u32 = 4 * 1024 * 1024;
+/// `row_codec::encode_scalar_columns` が複数 `TEXT` 列を連結して組み立てる出力
+/// バッファの累計上限としても共有する（`pub(crate)`。列ごとの上限
+/// `row_codec::MAX_TEXT_FIELD_LEN` だけでは列数分の掛け算で本値を大幅に超え得るため、
+/// row_codec 側の確保前検証が本値と同期していることを下部の const assert で強制する）。
+pub(crate) const MAX_METADATA_LEN: u32 = 4 * 1024 * 1024;
 
 /// [`Storage::scan_page`] が 1 回の呼び出しで返す行数の上限。
 /// [`Storage::scan`] は行数に上限がなく、最大サイズの行（[`MAX_EMBEDDING_DIM`]・

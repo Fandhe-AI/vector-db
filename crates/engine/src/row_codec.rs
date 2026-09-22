@@ -49,6 +49,37 @@ const _: () = assert!(
     "row_codec::MAX_EMBEDDING_DIM must stay in sync with storage::MAX_EMBEDDING_DIM"
 );
 
+/// [`encode_scalar_columns`] が複数 `TEXT` 列を連結して積む出力バッファ全体の
+/// 累計バイト上限。列ごとの上限 [`MAX_TEXT_FIELD_LEN`]（4 MiB）は列数分の
+/// 掛け算で数百 MiB〜GiB 規模まで届き得るため、それとは別に累計側でも
+/// 確保前に上限検証する（security.md「不安全な設計｜無制限リソース確保（DoS）」・
+/// codex-review 指摘・PR #989「小さい SET でも既存の大きな行に対し無制限確保が
+/// 可能」対応）。値は `storage::MAX_METADATA_LEN`（最終的にこの出力を格納する
+/// `RowInput::metadata` 側の上限）と同期させ、片方だけの変更を防ぐため下部の
+/// const assert でコンパイル時に強制する。
+pub(crate) const MAX_SCALAR_PAYLOAD_LEN: u32 = 4 * 1024 * 1024;
+
+const _: () = assert!(
+    MAX_SCALAR_PAYLOAD_LEN == crate::storage::MAX_METADATA_LEN,
+    "row_codec::MAX_SCALAR_PAYLOAD_LEN must stay in sync with storage::MAX_METADATA_LEN"
+);
+
+/// `TEXT` 列 1 個分のフレーミングオーバーヘッド（presence タグ 1 バイト＋長さ
+/// プレフィックス 4 バイト）。[`encode_scalar_columns`] の実エンコードと
+/// [`tenant::update_row_columns_unchecked`]（UPDATE の SET 値の対象行探索より
+/// 前の累計上限検証）が同じ計算式を共有するために公開する（片方だけの更新で
+/// 事前検証と実エンコードが乖離すると、行の存在有無で異なる応答を返す既存
+/// テナント境界漏えいの再発につながる）。
+pub(crate) const SCALAR_TEXT_ENTRY_OVERHEAD: u32 = 5;
+
+/// `TEXT` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + 長さ(4) + 本文）を計算する。オーバーフロー時は `Err`。
+pub(crate) fn scalar_text_entry_len(text_len: u32) -> Result<u32> {
+    SCALAR_TEXT_ENTRY_OVERHEAD
+        .checked_add(text_len)
+        .ok_or_else(|| RowCodecError::Invalid("scalar payload entry length overflow".to_string()))
+}
+
 /// 列値の有無を示すタグバイト。未知の値は fail-closed に拒否する（presence の
 /// 黙殺フォールバックは NULL/値ありの取り違えに直結するため許容しない）。
 const PRESENCE_NULL: u8 = 0x00;
@@ -428,7 +459,36 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
         )));
     }
 
+    // 累計出力バイト数を確保前に検証する（[`MAX_SCALAR_PAYLOAD_LEN`] 参照）。
+    // 列ごとの `MAX_TEXT_FIELD_LEN` 検査だけでは、多数の `TEXT` 列を持つ
+    // スキーマで `buf` が列数倍に膨らみ得るため、1 バイト書き込むより前に
+    // 累計上限を跨いでいないか判定してから `push`/`extend_from_slice` する
+    // （`buf` 自体は `MAX_SCALAR_PAYLOAD_LEN` を超えて確保されない）。
     let mut buf = Vec::new();
+    let mut total_len: u32 = 0;
+    let mut reserve = |buf: &mut Vec<u8>, additional: u32| -> Result<()> {
+        total_len = total_len
+            .checked_add(additional)
+            .ok_or_else(|| RowCodecError::Invalid("scalar payload length overflow".to_string()))?;
+        if total_len > MAX_SCALAR_PAYLOAD_LEN {
+            return Err(RowCodecError::Invalid(format!(
+                "scalar payload length {total_len} exceeds limit {MAX_SCALAR_PAYLOAD_LEN}"
+            )));
+        }
+        // `try_reserve_exact` の `additional` は `buf.len()` からの追加要素数であり
+        // `buf.capacity()` からの差分ではない（アロケータが要求量より多い容量を
+        // 返した場合、`capacity()` 基準の差分計算は必要量を過小に見積もり、
+        // 後続の `push`/`extend_from_slice` が意図した `Invalid` エラーではなく
+        // 暗黙の再確保（OOM 時は panic）経路へ落ちてしまう。Cursor Bugbot Low
+        // 指摘・PR #989）。`buf.len()` 基準で不足分のみを計算する。
+        if buf.capacity() < total_len as usize {
+            let needed = (total_len as usize).saturating_sub(buf.len());
+            buf.try_reserve_exact(needed).map_err(|_| {
+                RowCodecError::Invalid("failed to reserve scalar payload buffer".to_string())
+            })?;
+        }
+        Ok(())
+    };
     for (idx, column) in schema.columns.iter().enumerate() {
         if matches!(column.ty, ColumnType::Vector(_)) {
             // VECTOR 列は storage.rs 側の embedding スロットが担当するため、
@@ -444,6 +504,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                         column.name
                     )));
                 }
+                reserve(&mut buf, 1)?;
                 buf.push(PRESENCE_NULL);
             }
             Value::Text(text) => {
@@ -459,6 +520,9 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                         "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
                     )));
                 }
+                // presence(1) + 長さ(4) + 本文（text_len）の合計を確保前に検証する。
+                let entry_len = scalar_text_entry_len(text_len)?;
+                reserve(&mut buf, entry_len)?;
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&text_len.to_le_bytes());
                 buf.extend_from_slice(text_bytes);
@@ -468,6 +532,136 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     "column {:?} expects a non-Vector value, got Vector",
                     column.name
                 )))
+            }
+        }
+    }
+
+    Ok(buf)
+}
+
+/// UPDATE の列指定マージ（`crate::tenant::update_row_columns_unchecked`）専用の
+/// マージ＋再エンコード。`existing`（[`scan_scalar_columns`] が返す借用 `&str`。
+/// `VECTOR` 列・実際の `NULL` 列はいずれも `None`）を土台に、`overrides`
+/// （SET 句で上書きする列 index と値）で指定された列だけを差し替えてエンコード
+/// する。[`decode_scalar_columns`] のように SET 対象でない列を `Value::Text`
+/// （`String` への複製）へいったん変換してから [`encode_scalar_columns`] へ渡す
+/// 経路は、部分 UPDATE 1 回あたり「対象行の全 `TEXT` 列を複製する `decode` バッファ」
+/// と「同程度の出力を確保する `encode` バッファ」の 2 つのピーク確保を必要とする
+/// （codex-review P1 指摘・PR #989）。本関数は SET 対象でない列を `existing` の
+/// 借用 `&str` のまま直接 `buf` へ書き込むことで、複製されるのは SET 句の値
+/// （`overrides`。呼び出し元がクライアント入力からすでに所有している）のみに
+/// 抑え、`decode` 側のピーク確保を丸ごと避ける。累計上限検証・確保前 reserve の
+/// 規則は [`encode_scalar_columns`] と完全に同一（両者は将来の乖離を防ぐため
+/// [`scalar_text_entry_len`]／[`MAX_SCALAR_PAYLOAD_LEN`] を共有する）。
+///
+/// `existing.len()` は呼び出し元（`scan_scalar_columns`）の契約により常に
+/// `schema.columns.len()` と一致する想定だが、untrusted な格納済みデータに
+/// 由来する不変条件のため、念のため上限超過は同じ `Err` で fail-closed に拒否する。
+pub(crate) fn merge_encode_scalar_columns(
+    schema: &TableSchema,
+    existing: &[Option<&str>],
+    overrides: &[(usize, &Value)],
+) -> Result<Vec<u8>> {
+    if existing.len() > schema.columns.len() {
+        return Err(RowCodecError::Invalid(format!(
+            "too many existing values: schema has {} columns, got {}",
+            schema.columns.len(),
+            existing.len()
+        )));
+    }
+
+    // 累計上限検証・確保前 reserve は encode_scalar_columns と同一（コメントは
+    // 重複させず同関数を参照）。
+    let mut buf = Vec::new();
+    let mut total_len: u32 = 0;
+    let mut reserve = |buf: &mut Vec<u8>, additional: u32| -> Result<()> {
+        total_len = total_len
+            .checked_add(additional)
+            .ok_or_else(|| RowCodecError::Invalid("scalar payload length overflow".to_string()))?;
+        if total_len > MAX_SCALAR_PAYLOAD_LEN {
+            return Err(RowCodecError::Invalid(format!(
+                "scalar payload length {total_len} exceeds limit {MAX_SCALAR_PAYLOAD_LEN}"
+            )));
+        }
+        if buf.capacity() < total_len as usize {
+            let needed = (total_len as usize).saturating_sub(buf.len());
+            buf.try_reserve_exact(needed).map_err(|_| {
+                RowCodecError::Invalid("failed to reserve scalar payload buffer".to_string())
+            })?;
+        }
+        Ok(())
+    };
+
+    let write_text = |buf: &mut Vec<u8>,
+                      reserve: &mut dyn FnMut(&mut Vec<u8>, u32) -> Result<()>,
+                      text_bytes: &[u8]|
+     -> Result<()> {
+        let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
+            RowCodecError::Invalid(format!("text field too long: {} bytes", text_bytes.len()))
+        })?;
+        if text_len > MAX_TEXT_FIELD_LEN {
+            return Err(RowCodecError::Invalid(format!(
+                "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+            )));
+        }
+        let entry_len = scalar_text_entry_len(text_len)?;
+        reserve(buf, entry_len)?;
+        buf.push(PRESENCE_VALUE);
+        buf.extend_from_slice(&text_len.to_le_bytes());
+        buf.extend_from_slice(text_bytes);
+        Ok(())
+    };
+
+    for (idx, column) in schema.columns.iter().enumerate() {
+        if matches!(column.ty, ColumnType::Vector(_)) {
+            // VECTOR 列は encode_scalar_columns と同じくスキップ（embedding は
+            // storage.rs 側のスロットが担当。`overrides` に含まれていても無視）。
+            continue;
+        }
+        if let Some((_, value)) = overrides.iter().find(|(o_idx, _)| *o_idx == idx) {
+            // SET 対象列（クライアント入力）を書き込む。encode_scalar_columns と
+            // 同じ検証・書式。
+            match value {
+                Value::Null => {
+                    if !column.nullable {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} is not nullable but value is missing",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, 1)?;
+                    buf.push(PRESENCE_NULL);
+                }
+                Value::Text(text) => {
+                    write_text(&mut buf, &mut reserve, text.as_bytes())?;
+                }
+                Value::Vector(_) => {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Vector value, got Vector",
+                        column.name
+                    )))
+                }
+            }
+        } else {
+            // SET 対象でない列は既存の借用 `&str`（またはNULL）をそのまま書き込む。
+            // `existing` は `scan_scalar_columns` の契約により non-nullable 列で
+            // `None` になり得ないが（構造検証済み）、untrusted な格納済みデータに
+            // 由来する不変条件のため呼び出し元契約が破れた場合も fail-closed に
+            // 拒否する。
+            match existing.get(idx).copied().flatten() {
+                None => {
+                    if !column.nullable {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} is not nullable but existing value is missing",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, 1)?;
+                    buf.push(PRESENCE_NULL);
+                }
+                Some(text) => {
+                    write_text(&mut buf, &mut reserve, text.as_bytes())?;
+                }
             }
         }
     }
@@ -751,6 +945,34 @@ mod tests {
         let values = vec![Value::Text(huge_text)];
         let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
         assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    /// 列ごとには [`MAX_TEXT_FIELD_LEN`] 以下でも、複数 `TEXT` 列の合計が
+    /// [`MAX_SCALAR_PAYLOAD_LEN`] を超える場合は `encode_scalar_columns` が
+    /// 確保前に拒否する（codex-review 指摘・PR #989「小さい SET でも既存の
+    /// 大きな行に対し無制限確保が可能」対応。列数を増やして列単体の上限検査
+    /// だけでは検出できない累計超過を再現する）。
+    #[test]
+    fn encode_scalar_columns_rejects_cumulative_text_length_overflow() {
+        // 各列は MAX_TEXT_FIELD_LEN の半分強に収め、2 列の合計が
+        // MAX_SCALAR_PAYLOAD_LEN（= MAX_TEXT_FIELD_LEN と同値）を超えるようにする。
+        let per_column_len = (MAX_TEXT_FIELD_LEN as usize) / 2 + 1;
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, false),
+                ColumnDef::new("b", ColumnType::Text, false),
+            ],
+        );
+        let values = vec![
+            Value::Text("x".repeat(per_column_len)),
+            Value::Text("y".repeat(per_column_len)),
+        ];
+        let result = encode_scalar_columns(&schema, &values);
+        assert!(
+            matches!(result, Err(RowCodecError::Invalid(_))),
+            "cumulative scalar payload length must be rejected before allocation"
+        );
     }
 
     #[test]
