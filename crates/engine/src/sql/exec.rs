@@ -3209,6 +3209,26 @@ mod tests {
     // 非現実的なため、上限判定を担う純粋関数を直接検証する（`try_accumulate_budget`
     // と同方針）。
 
+    // codex-review P1・Bugbot 指摘（PR #991）の回帰テスト: DELETE RETURNING が
+    // 削除直前の既存行を捕捉する際のデコード失敗（`tenant::TenantWriteError::
+    // CapturedRowDecodeFailed`）は、送信されたクライアント入力の不正ではなく
+    // サーバー内部事象のため、`22000`（`insert rejected: invalid row`）ではなく
+    // `XX000`（内部事象）へ写像されなければならない。旧実装は
+    // `TenantWriteError::Storage`/`Catalog(Invalid)` を共用していたため
+    // `map_insert_write_error` の `22000` アームに誤って丸め込まれていた。
+    #[test]
+    fn map_insert_write_error_maps_captured_row_decode_failed_to_internal_not_invalid_input() {
+        let mapped =
+            map_insert_write_error(crate::tenant::TenantWriteError::CapturedRowDecodeFailed(
+                "test decode failure".to_string(),
+            ));
+        assert!(
+            matches!(mapped, SqlSurfaceError::Internal { .. }),
+            "CapturedRowDecodeFailed はクライアント入力不正（22000）ではなく \
+             内部事象（XX000）へ写像されるべき: {mapped:?}"
+        );
+    }
+
     #[test]
     fn precision_completeness_unbounded_false_when_recall_mode() {
         // `is_precision == false`（recall）は本経路自体を通らないため常に `false`。

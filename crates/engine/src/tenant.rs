@@ -311,6 +311,16 @@ pub enum TenantWriteError {
     /// 場合の専用 variant。`54000`（`PayloadTooLarge`）へ写像し、クライアントが
     /// 内部事象（`XX000`）と取り違えないようにする。
     ReturningProjectionTooLarge(String),
+    /// `RETURNING` 句（Issue #873・SQL-21）向けに削除直前の**既存**行を捕捉する際の
+    /// デコード失敗（[`delete_row_impl`] が `storage::decode_row`／
+    /// `row_codec::decode_scalar_columns` を呼ぶ箇所）。対象は今回のクライアント入力
+    /// ではなく「既に永続化済みの行」であるため、失敗原因はストレージ破損・過去の
+    /// エンコード不整合等のサーバー内部事象であり、クライアントが送った値の不正では
+    /// ない（codex-review P1・Bugbot 指摘・PR #991: 汎用の `Storage`/`Catalog(Invalid)`
+    /// を共用すると `map_insert_write_error` がクライアント入力エラー `22000` へ
+    /// 丸めてしまい、クライアントに誤った再試行判断を誘発する）。専用 variant として
+    /// 分離し `XX000`（内部事象）へ固定する。
+    CapturedRowDecodeFailed(String),
 }
 
 impl TenantWriteError {
@@ -342,6 +352,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             TenantWriteError::ReturningProjectionFailed(_) => ErrorClass::InternalError,
             TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,
+            TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
         }
     }
 
@@ -382,6 +393,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::ReturningProjectionTooLarge(_) => {
                 write!(f, "tenant write returning projection exceeds capacity")
             }
+            TenantWriteError::CapturedRowDecodeFailed(_) => {
+                write!(f, "tenant write captured row decode failed")
+            }
         }
     }
 }
@@ -408,6 +422,9 @@ impl std::fmt::Debug for TenantWriteError {
             }
             TenantWriteError::ReturningProjectionTooLarge(_) => {
                 f.write_str("ReturningProjectionTooLarge(<redacted>)")
+            }
+            TenantWriteError::CapturedRowDecodeFailed(_) => {
+                f.write_str("CapturedRowDecodeFailed(<redacted>)")
             }
         }
     }
@@ -1722,96 +1739,103 @@ fn delete_row_impl(
     validate_identifier(table)?;
     let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
     let mut captured_row: Option<CapturedRow> = None;
-    let owns_existing =
-        {
-            // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
-            // `insert_row`/`update_row` と同じ前段を通す。
-            let schema = require_table_schema_write(&write_txn, table)?;
-            if let Some(expected) = capture.as_ref() {
-                if expected.schema != &schema {
-                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                        "table schema changed after the delete was bound".to_string(),
-                    )));
-                }
+    let owns_existing = {
+        // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
+        // `insert_row`/`update_row` と同じ前段を通す。
+        let schema = require_table_schema_write(&write_txn, table)?;
+        if let Some(expected) = capture.as_ref() {
+            if expected.schema != &schema {
+                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                    "table schema changed after the delete was bound".to_string(),
+                )));
             }
-            // 削除要求のクライアント由来の内容は id のみ（`content_hash::for_delete`
-            // ドキュメント参照）。
-            let content_hash = content_hash::for_delete(id);
-            ledger::record_in_txn(
-                &write_txn,
-                ctx.tenant_id(),
-                table,
-                ledger_write,
-                &content_hash,
-            )?;
+        }
+        // 削除要求のクライアント由来の内容は id のみ（`content_hash::for_delete`
+        // ドキュメント参照）。
+        let content_hash = content_hash::for_delete(id);
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            &content_hash,
+        )?;
 
-            let row_table_name = user_rows_table_name(table);
-            let mut row_table = write_txn
-                .open_table(user_rows_table_def(&row_table_name))
-                .map_err(map_row_table_error)?;
-            // `update_row` と同じく `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御。
-            let key = (ctx.tenant_id(), id);
-            let owns_existing =
-                match row_table.get(&key).map_err(CatalogError::from)? {
-                    Some(guard) => {
-                        let (existing_tenant, _existing_visibility) =
-                            decode_row_tenant_and_visibility(guard.value())?;
-                        let owns = ctx.is_owner(existing_tenant);
-                        if owns && capture.is_some() {
-                            // `remove` の直前・同一 `guard` 生存期間内にフルデコードする
-                            // （削除後では対象バイト列が失われるため）。物理行フォーマット
-                            // は `storage.rs::decode_row`（`ROW_FORMAT_VERSION`。tenant_id・
-                            // visibility・embedding・不透明な `metadata` バイト列を持つ）で
-                            // あり、`row_codec::decode_row`（別バージョン・別フォーマット。
-                            // 本モジュールの通常の書き込み経路では使われない）ではない。
-                            // `metadata` は `row_codec::decode_scalar_columns` で
-                            // `schema.columns` 順の `Value` 列へ変換する（`VECTOR` 列の位置は
-                            // 常に `Value::Null` を返す契約——`sql::scan` の同じ規約参照）
-                            // ため、`VECTOR` 列位置だけは `Row::embedding` を明示的に
-                            // 差し替える（`dim == 0`／embedding 空は列が NULL である
-                            // 既存契約のため差し替えない）。`StorageError`／`RowCodecError`
-                            // は「既に永続化された行のデコード失敗」＝クライアント入力の
-                            // 不正ではなくサーバー内部事象として扱う（`map_insert_write_error`
-                            // が他の内部事象と同じ fail-closed 経路へ丸め込む）。
-                            let row = crate::storage::decode_row(id, guard.value())
-                                .map_err(TenantWriteError::Storage)?;
-                            let mut values =
-                                crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
-                                    .map_err(|e| {
-                                        TenantWriteError::Catalog(CatalogError::Invalid(format!(
-                                            "captured row decode failed: {e}"
-                                        )))
-                                    })?;
-                            if !row.embedding.is_empty() {
-                                if let Some(vec_idx) = schema.columns.iter().position(|c| {
-                                    matches!(c.ty, crate::catalog::ColumnType::Vector(_))
-                                }) {
-                                    if let Some(slot) = values.get_mut(vec_idx) {
-                                        *slot = crate::row_codec::Value::Vector(row.embedding);
-                                    }
-                                }
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+        // `update_row` と同じく `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御。
+        let key = (ctx.tenant_id(), id);
+        let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
+            Some(guard) => {
+                let (existing_tenant, _existing_visibility) =
+                    decode_row_tenant_and_visibility(guard.value())?;
+                let owns = ctx.is_owner(existing_tenant);
+                if owns && capture.is_some() {
+                    // `remove` の直前・同一 `guard` 生存期間内にフルデコードする
+                    // （削除後では対象バイト列が失われるため）。物理行フォーマット
+                    // は `storage.rs::decode_row`（`ROW_FORMAT_VERSION`。tenant_id・
+                    // visibility・embedding・不透明な `metadata` バイト列を持つ）で
+                    // あり、`row_codec::decode_row`（別バージョン・別フォーマット。
+                    // 本モジュールの通常の書き込み経路では使われない）ではない。
+                    // `metadata` は `row_codec::decode_scalar_columns` で
+                    // `schema.columns` 順の `Value` 列へ変換する（`VECTOR` 列の位置は
+                    // 常に `Value::Null` を返す契約——`sql::scan` の同じ規約参照）
+                    // ため、`VECTOR` 列位置だけは `Row::embedding` を明示的に
+                    // 差し替える（`dim == 0`／embedding 空は列が NULL である
+                    // 既存契約のため差し替えない）。`StorageError`／`RowCodecError`
+                    // は「既に永続化された行のデコード失敗」＝クライアント入力の
+                    // 不正ではなくサーバー内部事象として扱う（codex-review P1・
+                    // Bugbot 指摘・PR #991: 汎用の `Storage`/`Catalog(Invalid)` を
+                    // 共用すると `map_insert_write_error` が `22000`（クライアント
+                    // 入力不正）へ丸めてしまうため、専用 variant
+                    // `CapturedRowDecodeFailed` で `XX000` に固定する）。
+                    let row = crate::storage::decode_row(id, guard.value()).map_err(|e| {
+                        TenantWriteError::CapturedRowDecodeFailed(format!(
+                            "captured row decode failed: {e}"
+                        ))
+                    })?;
+                    let mut values =
+                        crate::row_codec::decode_scalar_columns(&schema, &row.metadata).map_err(
+                            |e| {
+                                TenantWriteError::CapturedRowDecodeFailed(format!(
+                                    "captured row decode failed: {e}"
+                                ))
+                            },
+                        )?;
+                    if !row.embedding.is_empty() {
+                        if let Some(vec_idx) = schema
+                            .columns
+                            .iter()
+                            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
+                        {
+                            if let Some(slot) = values.get_mut(vec_idx) {
+                                *slot = crate::row_codec::Value::Vector(row.embedding);
                             }
-                            captured_row = Some(CapturedRow {
-                                id,
-                                tenant_id: row.tenant_id,
-                                visibility: row.visibility,
-                                values,
-                            });
                         }
-                        owns
                     }
-                    None => false,
-                };
-            if owns_existing {
-                row_table.remove(&key).map_err(CatalogError::from)?;
-            } else if not_found_ledger == DeleteNotFoundLedger::Discard {
-                // 台帳への tentative 追記はこの早期 `return` により `write_txn` が
-                // commit されず破棄されるため、副作用として残らない
-                // （[`delete_row_unchecked`] のドキュメント参照）。
-                return Err(TenantWriteError::NotFound);
+                    captured_row = Some(CapturedRow {
+                        id,
+                        tenant_id: row.tenant_id,
+                        visibility: row.visibility,
+                        values,
+                    });
+                }
+                owns
             }
-            owns_existing
+            None => false,
         };
+        if owns_existing {
+            row_table.remove(&key).map_err(CatalogError::from)?;
+        } else if not_found_ledger == DeleteNotFoundLedger::Discard {
+            // 台帳への tentative 追記はこの早期 `return` により `write_txn` が
+            // commit されず破棄されるため、副作用として残らない
+            // （[`delete_row_unchecked`] のドキュメント参照）。
+            return Err(TenantWriteError::NotFound);
+        }
+        owns_existing
+    };
     // `project` は commit **前**・`row_table`（可変借用）が上記ブロックの終端で
     // 既に解放された後に呼ぶ（`delete_row_impl` ドキュメントの `project` 節参照）。
     // `captured_row` が `Some` になるのは `owns_existing && capture.is_some()` の
