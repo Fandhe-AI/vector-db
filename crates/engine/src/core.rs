@@ -3323,6 +3323,30 @@ impl EngineCore {
     /// `self.batch_limits.max_files_per_batch`）は各呼び出し元が個別に行う
     /// （NoSQL 表層はスキーマ取得・束縛より前に判定する契約のため、束縛済み
     /// `bounds` だけを受け取る本関数には含められない）。
+    /// SQL 表層の複数行 `VALUES`（①行数上限＋②③④バイト量・チャンク総量）
+    /// 上限検証本体。`execute_insert_form`・`execute_insert_returning_form`
+    /// （`RETURNING` 付き。Issue #873・SQL-21）の `RowBatch` 分岐がいずれも
+    /// 束縛済み `bounds` に対して同一の判定（①は `self.batch_limits.
+    /// max_files_per_batch` との比較、②③④は [`Self::
+    /// validate_insert_batch_byte_and_chunk_limits`] への委譲）を行っていた
+    /// 重複を解消する（codex-review Low 指摘・PR #873）。判定内容・エラー写像は
+    /// 集約前と完全に同一。
+    fn validate_insert_row_batch_limits(
+        &self,
+        bounds: &[crate::sql::parser::BoundInsert],
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        if bounds.len() > self.batch_limits.max_files_per_batch {
+            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                crate::batch_limits::BatchLimitsError::TooManyFiles {
+                    count: bounds.len(),
+                    max: self.batch_limits.max_files_per_batch,
+                }
+                .to_string(),
+            ));
+        }
+        self.validate_insert_batch_byte_and_chunk_limits(bounds)
+    }
+
     fn validate_insert_batch_byte_and_chunk_limits(
         &self,
         bounds: &[crate::sql::parser::BoundInsert],
@@ -3853,25 +3877,15 @@ impl EngineCore {
             //
             // INDEX-4 上限も NoSQL 表層と揃える（Issue #860 SQL/NoSQL 機能
             // パリティ。SQL 表層の複数行 VALUES が `self.batch_limits` を迂回して
-            // NoSQL 表層より緩い上限で受理されないようにする）。①（行数上限）は
-            // `execute_bound_insert_in_session` 判定3と同じ「束縛済みバッチ長のみで
-            // 判定できる軽量ガード」としてここで行い、②③④（バイト量・チャンク
-            // 総量）は同メソッド判定6と本体を共有する
-            // [`Self::validate_insert_batch_byte_and_chunk_limits`] へ委譲する。
+            // NoSQL 表層より緩い上限で受理されないようにする）。①（行数上限）・
+            // ②③④（バイト量・チャンク総量）はいずれも [`Self::
+            // validate_insert_row_batch_limits`]（`execute_insert_returning_form`
+            // の `RowBatch` 分岐と共有）へ委譲する。
             // `sql::parser::MAX_INSERT_ROWS_PER_STATEMENT`（構文解析段階の
             // 1 文あたり行数上限）とは独立な、運用者が調整可能な上限
             // （`self.batch_limits`）である点に注意。
             crate::sql::parser::BoundInsertForm::RowBatch(bounds) => {
-                if bounds.len() > self.batch_limits.max_files_per_batch {
-                    return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
-                        crate::batch_limits::BatchLimitsError::TooManyFiles {
-                            count: bounds.len(),
-                            max: self.batch_limits.max_files_per_batch,
-                        }
-                        .to_string(),
-                    ));
-                }
-                self.validate_insert_batch_byte_and_chunk_limits(&bounds)?;
+                self.validate_insert_row_batch_limits(&bounds)?;
                 crate::sql::exec::execute_insert_batch_with_schema(
                     &self.storage,
                     ctx,
@@ -3939,16 +3953,7 @@ impl EngineCore {
                 )
             }
             crate::sql::parser::BoundInsertForm::RowBatch(bounds) => {
-                if bounds.len() > self.batch_limits.max_files_per_batch {
-                    return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
-                        crate::batch_limits::BatchLimitsError::TooManyFiles {
-                            count: bounds.len(),
-                            max: self.batch_limits.max_files_per_batch,
-                        }
-                        .to_string(),
-                    ));
-                }
-                self.validate_insert_batch_byte_and_chunk_limits(&bounds)?;
+                self.validate_insert_row_batch_limits(&bounds)?;
                 crate::sql::exec::execute_insert_returning(
                     &self.storage,
                     ctx,
