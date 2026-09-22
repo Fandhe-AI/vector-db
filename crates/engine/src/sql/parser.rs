@@ -2984,6 +2984,43 @@ mod tests {
         assert_eq!(delete_bound.expr_filters, scan_bound.expr_filters);
     }
 
+    // --- check_affected_row_count（Issue #870・#871 が結線する実行時判定の
+    // 共有ヘルパー。本 Issue の時点では呼び出し元が存在しないため、境界値
+    // （`count == limit` と `count == limit + 1`）を直接固定する） -------------
+
+    #[test]
+    fn check_affected_row_count_accepts_count_at_limit() {
+        assert!(check_affected_row_count(
+            DEFAULT_MAX_DML_AFFECTED_ROWS,
+            DEFAULT_MAX_DML_AFFECTED_ROWS
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn check_affected_row_count_rejects_count_over_limit_by_one() {
+        let err = check_affected_row_count(
+            DEFAULT_MAX_DML_AFFECTED_ROWS + 1,
+            DEFAULT_MAX_DML_AFFECTED_ROWS,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn check_affected_row_count_accepts_zero_count_against_zero_limit() {
+        // `limit == 0` は「一切変更を許さない」極端値。0 行の変更は許容される
+        // ことを固定する（`count > limit` の厳密な比較が境界で崩れていないか
+        // の確認）。
+        assert!(check_affected_row_count(0, 0).is_ok());
+    }
+
+    #[test]
+    fn check_affected_row_count_rejects_any_count_against_zero_limit() {
+        let err = check_affected_row_count(1, 0).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
     // --- bind_update（SQL-17、TASK-191） ----------------------------------------
 
     fn bind_update_sql(sql: &str) -> Result<BoundUpdate, SqlSurfaceError> {
