@@ -41,6 +41,16 @@
 //! RECOVER-10）により内容一致なら `23505`・不一致なら `22023` へ収束する
 //! （SQL 表層と同じ台帳キー空間 `(tenant, table, operation_id)` を共有する。
 //! `crates/engine/tests/sql_update_delete_session_public_api.rs` で固定）。
+//! 本モジュールの `set`（[`Validated::optional_object`] 由来の `BTreeMap`）は
+//! キーがアルファベット順へ正規化されるが、内容一致判定に使う
+//! `content_hash::for_update_columns` はスキーマ列順（`tenant::
+//! update_row_columns_unchecked` が呼び出し前に正規化する）で計算されるため、
+//! SQL 表層が非アルファベット順の宣言で書いた `UPDATE` と同一の
+//! `operation_id`・同一内容で本 op から再送しても列の記述順の違いだけで
+//! `22023` に誤判定されることはない（Issue #876 レビュー指摘の是正。
+//! `crates/wire-server/tests/nosql12_update_delete.rs::
+//! cross_surface_multi_column_set_declared_out_of_alphabetical_order_is_treated_as_duplicate`
+//! で固定）。
 //!
 //! [`execute`] は成功時 [`UpdateSuccess`] を返し、[`handle`] が
 //! [`encode_success_body`]（`{"updated":<n>,"operation_id":"<escaped>"}`。

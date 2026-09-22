@@ -127,7 +127,7 @@ update_rejects_non_integer_where_id_matching_sql_lexer_parity`）:
 振り分け vs 束縛段のパース失敗）で拒否することを確認し、上記のとおり
 修正した。
 
-## 既知の制約: 複数列 `set` の宣言順と `content_hash`
+## 複数列 `set` の宣言順と `content_hash`（Issue #876 レビュー指摘の是正）
 
 `engine::json` は JSON オブジェクトを `BTreeMap<String, JsonValue>`（キーの
 アルファベット順）へパースする。`update.rs::map_set_assignments` はこの
@@ -137,25 +137,28 @@ update_rejects_non_integer_where_id_matching_sql_lexer_parity`）:
 col2 = ..` はクライアントが記述した宣言順をそのまま保持する
 （`sql::parser::bind_update` のドキュメント参照）。
 
-`recovery::content_hash::for_update_columns` は `assignments` の**宣言順**
-に依存してハッシュを計算する契約（`for_update_columns_differs_by_declared_
-order` で固定済み）であるため、SQL 表層がアルファベット順**でない**宣言順
-（例: `SET lang = 'en', embedding = '[...]'`）で書いた `UPDATE` と、同じ
-値を持つ NoSQL 表層の `update`（常にアルファベット順 `embedding, lang`
-へ正規化される）は、同一 `operation_id` への再送であっても
-**内容不一致（`22023`）に誤判定される**（`23505` にならない）。
+`recovery::content_hash::for_update_columns` 自体は渡された列スライスの
+**宣言順**に依存してハッシュを計算する契約（`for_update_columns_differs_
+by_declared_order` で固定済みの、この関数単体の低レベル契約）のまま
+変更していない。代わりに、その唯一の呼び出し元である
+`tenant::update_row_columns_unchecked` が `for_update_columns` へ渡す
+直前に列を**スキーマの列 index（宣言順ではなく固定の列定義順）**へ
+安定ソートするよう変更した。SET 対象の列は index 基準で適用されるため
+並び順自体は書き込み結果に一切影響せず、ハッシュ入力のみを正規化できる
+（`for_typed_insert` が挿入時に常にスキーマ列順の `named_columns` を渡す
+既存契約と同じ考え方）。
 
-実測で確認済み（`crates/wire-server/tests/nosql12_update_delete.rs::
-cross_surface_multi_column_set_declared_out_of_alphabetical_order_is_a_
-known_mismatch`）。単一列の `set` はこの問題の影響を受けない（本 Issue の
-他の全クロスサーフェステストは単一列のため到達しない）。
+この結果、SQL 表層がアルファベット順**でない**宣言順（例: `SET lang =
+'en', embedding = '[...]'`）で書いた `UPDATE` と、同じ値を持つ NoSQL
+表層の `update`（常にアルファベット順 `embedding, lang` へ正規化される）
+は、同一 `operation_id` への再送であれば列の記述順に関わらず
+**同一内容の再送（`23505`）として正しく判定される**。
 
-是正には `for_update_columns`（または呼び出し元）を列名順（またはその他の
-正規化された順序）でハッシュするよう変更する必要があり、これは
-`content_hash` の互換性・既存台帳エントリへの影響を伴う engine 側の設計
-判断（SQL 表層の宣言順依存という既存契約自体を見直すか、NoSQL 表層側で
-何らかの形で宣言順を復元するか）を要するため、本 Issue のスコープ外として
-別 Issue へ申し送る。
+回帰テストで固定済み（`crates/engine/tests/sql_update_single_row.rs::
+resending_same_operation_id_with_different_set_clause_order_is_23505`・
+`crates/wire-server/tests/nosql12_update_delete.rs::
+cross_surface_multi_column_set_declared_out_of_alphabetical_order_is_
+treated_as_duplicate`）。
 
 ## 対象外・申し送り
 
@@ -168,8 +171,6 @@ known_mismatch`）。単一列の `set` はこの問題の影響を受けない�
   の担当
 - RETURNING（Issue #873・PR #991）との統合: 本 Issue では `rows_affected`
   のみ
-- 複数列 `set` の宣言順と `content_hash` の依存関係（上記「既知の制約」
-  節）: engine 側の設計判断を要するため別 Issue へ申し送る
 
 ## 検証
 

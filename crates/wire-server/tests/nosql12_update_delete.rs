@@ -581,23 +581,22 @@ fn update_and_delete_reject_explain_true_with_42601() {
     }
 }
 
-// --- J: 複数列 SET の宣言順（既知の制約。docs/design/
-//        nosql-update-delete-mapping.md「既知の制約」節参照） -------------
+// --- J: 複数列 SET の宣言順は content_hash に影響しない（Issue #876
+//        レビュー指摘の是正。docs/design/nosql-update-delete-mapping.md
+//        「複数列 SET の宣言順と content_hash」節参照） -------------------
 
 #[test]
-fn cross_surface_multi_column_set_declared_out_of_alphabetical_order_is_a_known_mismatch() {
+fn cross_surface_multi_column_set_declared_out_of_alphabetical_order_is_treated_as_duplicate() {
     // `set` は JSON パース時点で `BTreeMap`（キーのアルファベット順）へ
     // 正規化されるため、SQL 表層が宣言順（例: `lang, embedding`）で書いた
     // 場合と NoSQL 表層（常にアルファベット順 `embedding, lang`）とで
-    // `BoundUpdate::assignments` の順序が食い違いうる。`content_hash::
-    // for_update_columns` は宣言順に依存する契約（`for_update_columns_
-    // differs_by_declared_order`）のため、この食い違いは「同一内容の再送」
-    // （`23505`）ではなく「内容不一致」（`22023`）に**誤判定**される。
-    // これは本 Issue（#876）のスコープ外の既知の制約であり、正規化（例:
-    // ハッシュ側で列名順に正規化する）は engine 側の設計変更を要するため
-    // 別 Issue へ申し送る。本テストはこの制約を回帰的に固定し、将来
-    // 無意識に解消・悪化しないことを検知する（fixed shape の green を
-    // 維持したままにしない——`22023` である事実を明示的にアサートする）。
+    // `BoundUpdate::assignments` の順序が食い違いうる。`tenant::
+    // update_row_columns_unchecked` が `content_hash::for_update_columns`
+    // へ渡す前に列をスキーマ順へ正規化する（宣言順は SET 意味論に一切
+    // 影響しない）ため、この食い違いは「内容不一致」（`22023`）へ誤判定
+    // されず「同一内容の再送」（`23505`）として正しく扱われる。本テストは
+    // SQL・NoSQL 表層を跨いだ同一 `operation_id` 再送の内容一致判定が列の
+    // 記述順に依存しないことを固定する。
     let (core, _guard) = new_core();
     let (both, mut sql) = spawn_both(core);
     query(&both, &insert_body(1, "ja", "n12-order-seed"));
@@ -613,17 +612,13 @@ fn cross_surface_multi_column_set_declared_out_of_alphabetical_order_is_a_known_
     common::read_ready_for_query(&mut sql);
 
     // NoSQL: JSON 内の記述順に関わらず `BTreeMap` により
-    // `embedding, lang`（アルファベット順）へ正規化される。
+    // `embedding, lang`（アルファベット順）へ正規化される。列の値・意味は
+    // SQL 表層で送った内容と完全に同一のため、同一 `operation_id` の再送は
+    // `23505`（重複）として拒否される。
     let resp = query(
         &both,
         br#"{"op":"update","table":"docs","set":{"embedding":[0.4,0.5,0.6],"lang":"en"},"where":{"id":1},"operation_id":"n12-order-1"}"#,
     );
-    assert_eq!(resp.status, 400, "resp={resp:?}");
-    assert_eq!(
-        http_common::wire_code_of(&resp),
-        "22023",
-        "既知の制約（列宣言順と content_hash の依存関係）。挙動が変わった場合は \
-         docs/design/nosql-update-delete-mapping.md の該当節と本テストを \
-         合わせて更新すること。"
-    );
+    assert_eq!(resp.status, 409, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23505");
 }

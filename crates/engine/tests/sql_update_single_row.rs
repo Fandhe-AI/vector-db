@@ -376,10 +376,16 @@ fn resending_same_operation_id_with_different_id_is_22023() {
     assert_eq!(err.wire_code(), "22023");
 }
 
-/// 同一 `operation_id` で SET 句の列宣言順が異なる再送も内容不一致 `22023`
-/// （`for_update_columns` は宣言順を並べ替えずにハッシュ化するため）。
+/// 同一 `operation_id` で SET 句の列宣言順のみが異なる再送は同一内容の再送
+/// として `23505`（`tenant::update_row_columns_unchecked` が `content_hash::
+/// for_update_columns` へ渡す前に列をスキーマ順へ正規化するため。宣言順は
+/// SET 意味論に影響しない一方、NoSQL 表層〔`wire-server::http::query::
+/// update`〕は JSON `set` オブジェクトを `BTreeMap` でパースし常にアルファ
+/// ベット順へ正規化するため、宣言順に依存したままでは SQL・NoSQL 間の同一
+/// `operation_id` 再送が誤って内容不一致 `22023` に丸められてしまう。
+/// Issue #876 レビュー指摘）。
 #[test]
-fn resending_same_operation_id_with_different_set_clause_order_is_22023() {
+fn resending_same_operation_id_with_different_set_clause_order_is_23505() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -405,8 +411,8 @@ fn resending_same_operation_id_with_different_set_clause_order_is_22023() {
                  USING OPERATION_ID 'op-order'"
             ),
         )
-        .expect_err("resend with a different SET clause order must be a content mismatch");
-    assert_eq!(err.wire_code(), "22023");
+        .expect_err("resend with only a different SET clause order must be a duplicate");
+    assert_eq!(err.wire_code(), "23505");
 }
 
 /// 同一 `operation_id` を INSERT で使った後に UPDATE で再利用すると、

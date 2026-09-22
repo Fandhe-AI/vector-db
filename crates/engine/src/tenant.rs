@@ -1587,7 +1587,9 @@ pub(crate) fn update_row_columns_unchecked(
         // トランザクション内で再取得したスキーマと不一致がありうる場合に備え、
         // `get()` で境界外アクセスを構造的に防ぐ（`insert_typed_row_unchecked` の
         // `expected_schema` 比較と多層防御）。
-        let mut named_columns: Vec<(&str, &crate::row_codec::Value)> =
+        // `(スキーマ列 index, 列名, 値)` の順で構築し、ハッシュ計算前に列
+        // index でソートして宣言順非依存にする（下記コメント参照）。
+        let mut named_columns: Vec<(usize, &str, &crate::row_codec::Value)> =
             Vec::with_capacity(assignments.len());
         // SET 対象の TEXT 列だけを対象にした累計フレームサイズ（presence(1)+
         // 長さ(4)+本文）。対象行の実データ（探索前は不明）を含めず、リクエスト
@@ -1654,8 +1656,29 @@ pub(crate) fn update_row_columns_unchecked(
                     )))
                 }
             }
-            named_columns.push((column.name.as_str(), value));
+            named_columns.push((*idx, column.name.as_str(), value));
         }
+        // 台帳の内容照合ハッシュ（`content_hash::for_update_columns`）へ渡す前に
+        // スキーマの列 index（宣言順）で安定ソートする（Issue #876 レビュー指摘。
+        // `named_columns` はここまで `assignments`（SET 句の宣言順）の順序で
+        // 構築されており、SQL 表層の `UPDATE ... SET col1=.., col2=..` はクライアント
+        // が書いた宣言順をそのまま保持する一方、NoSQL 表層（`wire-server::http::
+        // query::update::map_set_assignments`）は JSON `set` オブジェクトを
+        // `engine::json` の `BTreeMap` でパースするためキーが常にアルファベット順へ
+        // 正規化される。ハッシュが宣言順に依存したままだと、SQL 表層が非アルファ
+        // ベット順で書いた `UPDATE` と同一内容の NoSQL `update`（常にアルファベット
+        // 順）を同一 `operation_id` で再送した場合に、本来は同一内容の再送（`23505`・
+        // TASK-101・RECOVER-10 の契約）であるべきところが内容不一致（`22023`）へ
+        // 誤判定される。列の並び順は書き込み対象・SET 意味論に一切影響しない
+        // （`assignments` は index 基準で適用済み）ため、ハッシュ入力のみをスキーマ
+        // 列順へ正規化することで SQL・NoSQL 双方の入力順序に依存しない決定的な
+        // ハッシュにする（`for_typed_insert` がスキーマ列順を渡す既存契約と同じ
+        // 考え方）。
+        named_columns.sort_by_key(|(idx, _, _)| *idx);
+        let named_columns: Vec<(&str, &crate::row_codec::Value)> = named_columns
+            .into_iter()
+            .map(|(_, name, value)| (name, value))
+            .collect();
         // SET 値の形状検証（上記ループ内の次元・TEXT 長上限）は、対象行の存在・
         // RLS 可視性を一切参照せずスキーマのみから判定できる。存在しない／
         // 他テナント所有／不可視な行に対する UPDATE は本来 `rows_affected: 0` の
