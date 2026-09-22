@@ -522,24 +522,22 @@ doc コメント）の範囲で自分の言葉として整理する。
   組めず、現行動作の記述ではなく実行結線そのものの前提条件として問題に
   なる。
 
-**2. 選択肢と得失**
+**2. 採用方針**
 
-- **維持案**（`Public` のみ許可を継続）: 最小権限境界が最も狭く、旧
-  `wire1_three_tenant_visibility_public_shared_private_hidden` のような
-  「自テナント自身の `Private` 行も wire 越しには不可視」という契約が
-  不変のまま保てる。反面 read-your-writes が成立せず、Phase 1 以降の
-  DML 経路が組めない・RDBMS の一般的な慣行（自分の書き込みは自分で
-  読める）と乖離する。
-- **既定変更案**（採用。`Public` ＋ 自テナントの `Private` を許可）:
-  read-your-writes が成立し DML 経路の前提を満たす。テナント境界は
-  `engine::policy::PolicyContext::is_visible` のテナント一致判定が
-  引き続き担うため、他テナントの `Private` 行は拡張後も不可視のまま
-  （`session_policy_context` のドキュメンテーションコメント参照）。
-  可視性は **テナント単位であってセッション単位ではない**点に注意——
-  同一テナントの別セッションからも自分（同テナントの別ユーザーを含む）が
-  書いた `Private` 行が見える。拡張は wire 認証導出点
-  （`auth::session_policy_context`）に閉じ、engine 側
-  `crate::policy::PolicyContext::new`（既定 = `Public` のみ）は不変。
+RLS-11・TASK-195（`docs/spec/04-behavior/*.md`。ポインタのみ）に従い、
+wire 認証導出点（`auth::session_policy_context`）の許可可視性を
+`Public` ＋ 自テナントの `Private` へ拡張した。テナント境界は
+`engine::policy::PolicyContext::is_visible` のテナント一致判定が
+引き続き担うため、他テナントの `Private` 行は拡張後も不可視のまま
+（`session_policy_context` のドキュメンテーションコメント参照）。
+可視性は **テナント単位であってセッション単位ではない**点に注意——
+同一テナントの別セッションからも自分（同テナントの別ユーザーを含む）が
+書いた `Private` 行が見える。拡張は wire 認証導出点
+（`auth::session_policy_context`）に閉じ、engine 側
+`crate::policy::PolicyContext::new`（既定 = `Public` のみ）は不変。
+検討した選択肢・得失比較・却下理由の詳細は private spec 側の記録
+（`docs/spec/04-behavior/records/rdbms-parity-decision-2026-09-22.md`。
+ポインタのみ）を参照。
 
 **3. 判断待ち事項**: なし（2026-09-22 オーナー判断で解消済み）。spec 側で
 RLS-11・TASK-195 を新設し、RLS-7・RLS-9 は改訂注記付きで残置（RLS-11
