@@ -8,9 +8,12 @@
 //! `TableSchema` へ束縛する（Issue #761・TASK-175・NOSQL-7）。[`ident`] は
 //! `table`／列名等の識別子形状（SQL 表層の字句解析と同じ文字集合）を検査する
 //! 共有ヘルパー（Issue #768。`search`／`scan`〔#763・#766〕からも再利用する
-//! 想定）。[`op`] は `op` 名を閉じた語彙 4 値（`search`／`scan`／
-//! `aggregate`／`insert`）へ分類する許可リストで、語彙外は `0A000` へ写像
-//! する（Issue #759・TASK-179・NOSQL-1・NOSQL-9）。[`aggregate`] は
+//! 想定）。[`op`] は `op` 名を閉じた語彙 6 値（`search`／`scan`／
+//! `aggregate`／`insert`／`update`／`delete`）へ分類する許可リストで、語彙外
+//! は `0A000` へ写像する（Issue #759・TASK-179・NOSQL-1・NOSQL-9。
+//! `update`／`delete` の追加は Issue #875・NOSQL-12。束縛・実行結線は
+//! Issue #876 の担当のため、`gate.rs` はこの 2 op を常に placeholder へ
+//! 落とす）。[`aggregate`] は
 //! `op: aggregate`（`group_by`／`having`／`explain: true` を除く）を
 //! SQL テキストを経由せずに `engine::sql::parser::BoundAggregate` へ束縛・
 //! 実行する（Issue #768・TASK-177・NOSQL-4）。他 op の実行計画への写像は

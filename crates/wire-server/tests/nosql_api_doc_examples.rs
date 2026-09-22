@@ -10,6 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use engine::json::{parse_json, JsonValue};
+use wire_server::http::query::op::Op;
 use wire_server::http::query::schema::schema_for;
 
 /// テスト対象ドキュメントの絶対パス。`CARGO_MANIFEST_DIR` は
@@ -143,14 +144,16 @@ fn op_tagged_fences_validate_against_their_schema() {
     }
 }
 
-/// 非 vacuous 条件: 4 op それぞれについて、要求例として最低 1 件の
-/// `json` フェンスが存在する（`op` キーを持ち、対応するフィールドが
-/// スキーマ検証を通過するブロック）。
+/// 非 vacuous 条件: [`Op::ALL`]（6 op）それぞれについて、要求例として
+/// 最低 1 件の `json` フェンスが存在する（`op` キーを持ち、対応する
+/// フィールドがスキーマ検証を通過するブロック）。`Op::ALL` 駆動にすることで
+/// 語彙が増えた際（Issue #875 の `update`／`delete` 追加を含む）にこの
+/// テストが黙って旧語彙のままにならない。
 #[test]
-fn all_four_ops_have_at_least_one_example() {
+fn all_ops_have_at_least_one_example() {
     let markdown = read_doc();
     let fences = extract_json_fences(&markdown);
-    for expected_op in ["search", "scan", "aggregate", "insert"] {
+    for expected_op in Op::ALL.iter().map(|op| op.name()) {
         let found = fences.iter().any(|fence| {
             !fence.expect_reject
                 && parse_json(&fence.body)

@@ -297,20 +297,22 @@ fn missing_bearer_with_tenant_id_json_still_rejects_with_28000() {
     assert_eq!(wire_code_of_body(&resp_body), "28000");
 }
 
-// --- (7) 有効 Bearer + JSON tenant_id（4 op）→ 42601 ------------------------
+// --- (7) 有効 Bearer + JSON tenant_id（6 op）→ 42601 ------------------------
 
 #[test]
-fn valid_bearer_with_tenant_id_json_rejects_with_42601_for_all_four_ops() {
+fn valid_bearer_with_tenant_id_json_rejects_with_42601_for_all_six_ops() {
     let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
     let addr = http_common::spawn_router_listener(&users_path, SessionStore::new());
     let token = login(addr, "alice", "pw-alice");
     let auth = format!("Bearer {token}");
 
-    let cases: [&[u8]; 4] = [
+    let cases: [&[u8]; 6] = [
         br#"{"op":"search","table":"docs","limit":1,"tenant_id":"evil"}"#,
         br#"{"op":"scan","table":"docs","limit":1,"tenant_id":"evil"}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[],"tenant_id":"evil"}"#,
         br#"{"op":"insert","table":"docs","rows":[],"tenant_id":"evil"}"#,
+        br#"{"op":"update","table":"docs","set":{"lang":"en"},"tenant_id":"evil"}"#,
+        br#"{"op":"delete","table":"docs","where":{"id":1},"tenant_id":"evil"}"#,
     ];
     for body in cases {
         let response = send_request(addr, "/v1/query", Some(&auth), body);
