@@ -71,15 +71,22 @@ pub fn arm(kind: FaultKind) {
     }
 }
 
-/// `Ok(SqlOutcome::Insert(_))` のときだけ真を返す（commit 成功の wire 側判定
-/// 材料。`Ok(Insert)` は `EngineCore::execute_sql_in_session` が
-/// `execute_insert_sql` → `recovery::commit_boundary::commit` の成功を経て
-/// 初めて返す値であり、`Err(_)` や他の読み取り専用 variant では commit は
-/// 発生しない。実際に commit-pending 世代が有効かどうかの最終判定は
-/// `engine::recovery::panic_hook::emergency_send_decision` 側が担うため、
-/// wire 側でそれ以上の判定は行わない）。
+/// `Ok(SqlOutcome::Insert(_))`（または `RETURNING` 付き `INSERT`。Issue #873・
+/// SQL-21）のときだけ真を返す（commit 成功の wire 側判定材料。`Ok(Insert)`・
+/// `Ok(Returning { command: Insert, .. })` はいずれも `EngineCore::
+/// execute_sql_in_session` が `execute_insert_sql`／`execute_insert_returning_form`
+/// → `recovery::commit_boundary::commit` の成功を経て初めて返す値であり、
+/// `Err(_)` や他の読み取り専用 variant では commit は発生しない。`DELETE`／
+/// `RETURNING` 付き `DELETE` は commit 成功しても行削除であり本フォールト
+/// 注入ハーネスの対象外のまま（既存契約を変更しない）。実際に commit-pending
+/// 世代が有効かどうかの最終判定は `engine::recovery::panic_hook::
+/// emergency_send_decision` 側が担うため、wire 側でそれ以上の判定は行わない）。
 pub(crate) fn is_committed_insert(outcome: &Result<SqlOutcome, SqlSurfaceError>) -> bool {
     matches!(outcome, Ok(SqlOutcome::Insert(_)))
+        || matches!(
+            outcome,
+            Ok(SqlOutcome::Returning(o)) if o.command == engine::sql::returning::DmlCommand::Insert
+        )
 }
 
 /// `committed_insert` が真のときだけ arm を消費する（`compare_exchange` に
@@ -160,6 +167,33 @@ mod tests {
         })
     }
 
+    /// Issue #873（SQL-21）: `RETURNING` 付き `INSERT` の commit も本ハーネスの
+    /// 対象に含まれることを固定する（`is_committed_insert_matches_only_ok_insert`
+    /// が使う）。
+    fn ok_returning_insert() -> Result<SqlOutcome, SqlSurfaceError> {
+        Ok(SqlOutcome::Returning(engine::sql::exec::ReturningOutcome {
+            command: engine::sql::returning::DmlCommand::Insert,
+            rows_affected: 1,
+            result: engine::sql::exec::QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+            },
+        }))
+    }
+
+    /// `RETURNING` 付き `DELETE` は commit 成功でも行削除であり、
+    /// `is_committed_insert` の対象外のまま（既存契約を変更しない）ことを固定する。
+    fn ok_returning_delete() -> Result<SqlOutcome, SqlSurfaceError> {
+        Ok(SqlOutcome::Returning(engine::sql::exec::ReturningOutcome {
+            command: engine::sql::returning::DmlCommand::Delete,
+            rows_affected: 1,
+            result: engine::sql::exec::QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+            },
+        }))
+    }
+
     #[test]
     fn parse_accepts_the_single_token() {
         assert_eq!(parse("post-commit-panic"), Ok(FaultKind::PostCommitPanic));
@@ -182,6 +216,8 @@ mod tests {
     #[test]
     fn is_committed_insert_matches_only_ok_insert() {
         assert!(is_committed_insert(&ok_insert()));
+        assert!(is_committed_insert(&ok_returning_insert()));
+        assert!(!is_committed_insert(&ok_returning_delete()));
         assert!(!is_committed_insert(&ok_set_search_mode()));
         assert!(!is_committed_insert(&err_internal()));
     }

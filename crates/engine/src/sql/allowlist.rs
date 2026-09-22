@@ -909,7 +909,9 @@ pub enum OnConflictAction {
 /// VALUES (<lit>[, <lit>]*)[, (<lit>[, <lit>]*)]*
 /// USING OPERATION_ID '<id>' [;]`（複数行 `VALUES` を許容する。SQL-16、TASK-190）。
 /// 各行のリテラル数は列数と一致することを行ごとに検証済み（`rows.len() >= 1`）。
-/// RETURNING・可視性ラベル指定は引き続き許可リスト外。
+/// `USING OPERATION_ID` 句の直前に任意で `RETURNING <投影>` を置ける
+/// （Issue #873・SQL-21。`returning` フィールド参照）。可視性ラベル指定は
+/// 引き続き許可リスト外。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedInsert {
     /// INTO に指定され、カタログ存在確認を通過したテーブル名。
@@ -926,6 +928,10 @@ pub struct ValidatedInsert {
     /// `23502` で拒否するため、この構成では常に `Some` になる。
     /// `LedgerMode::CompareOnlyWithoutLedger` では `None` を許す。
     pub operation_id: Option<OperationId>,
+    /// `RETURNING` 句（Issue #873・SQL-21）。省略時は `None`。`USING OPERATION_ID`
+    /// 句の直前にのみ置ける（[`Parser::parse_returning_clause`] 参照）。関数呼び出し
+    /// 項目（[`Projection::Items`]）はここには到達しない（構造検証段で `42601`）。
+    pub returning: Option<Projection>,
     /// `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・TASK-193、
     /// Issue #872）。句の省略は `None`（本 Issue 導入前と完全に同じ「行 `id`
     /// 衝突は常に `23505`」の挙動）。複数行 `VALUES` と併用可能（全行が同じ
@@ -957,6 +963,11 @@ pub struct ValidatedDelete {
     /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
     /// 開始前に `23502` で拒否するため、この構成では常に `Some`。
     pub operation_id: Option<OperationId>,
+    /// `RETURNING` 句（Issue #873・SQL-21）。単一行・`id` 完全一致形は実行結線
+    /// 済み（[`crate::sql::exec::execute_delete_returning`]）のため受理する。
+    /// 述語形（[`ValidatedPredicateDelete`]）はフィールドを持たず、構造検証段
+    /// （`validate_delete_statement_tokens` の `Predicate` 腕）で常に `42601`。
+    pub returning: Option<Projection>,
 }
 
 /// 許可形状の構造判定を通過した述語つき `DELETE ... WHERE` 文（Issue #870・
@@ -1043,7 +1054,9 @@ pub struct ValidatedTruncate {
 ///
 /// 受理する形は `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE id = <n>
 /// USING OPERATION_ID '<id>' [;]` の単一行・id 指定形のみ（述語形 WHERE・複数テーブル・
-/// サブクエリ・`RETURNING` は許可リスト外。実行結線・可視性判定は #865 の担当）。
+/// サブクエリは許可リスト外。`RETURNING` は構造上受理できるが実行結線（#865）
+/// が未着手のため `validate_update_tokens`／`validate_update_form_tokens` が
+/// 一律 `42601` 拒否する〔Issue #873・SQL-21〕。実行結線・可視性判定は #865 の担当）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedUpdate {
     /// UPDATE に指定され、カタログ存在確認を通過したテーブル名。
@@ -1059,6 +1072,12 @@ pub struct ValidatedUpdate {
     /// `23502` で拒否するため、この構成では常に `Some` になる。
     /// `LedgerMode::CompareOnlyWithoutLedger` では `None` を許す。
     pub operation_id: Option<OperationId>,
+    /// `RETURNING` 句（Issue #873・SQL-21）。`UPDATE` は実行結線（#865）が
+    /// 未着手のため、`validate_update_tokens`／`validate_update_form_tokens` が
+    /// `Some` を構造検証段で常に `42601` 拒否する（黙って保持し将来の実行器が
+    /// 無視する fail-open を防ぐチョークポイント）。この型が構築される時点では
+    /// 常に `None`。
+    pub returning: Option<Projection>,
 }
 
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
@@ -1850,6 +1869,12 @@ impl<'a> Parser<'a> {
         // 参照）。
         let on_conflict = self.parse_on_conflict_clause()?;
 
+        // `RETURNING`（Issue #873・SQL-21）は `ON CONFLICT` の後・`USING
+        // OPERATION_ID` 句の直前（`docs/design/sql-returning.md`「UPSERT（#872）
+        // との併用」節。RETURNING の文法上の位置＝`USING OPERATION_ID` の直前
+        // という契約を維持したまま `ON CONFLICT` を挿入する形）。
+        let returning = self.parse_returning_clause()?;
+
         // 文末専用句の構造パースのみをここで行う（省略・明示 `NULL` はいずれも
         // `None`）。必須化の判定（`23502`）は `validate_insert` が
         // `LedgerMode::require` へ委譲し、この時点でまだ FROM/INTO テーブルの
@@ -1862,6 +1887,7 @@ impl<'a> Parser<'a> {
         Ok(ParsedInsertShape {
             table_name,
             columns,
+            returning,
             rows,
             operation_id,
             on_conflict,
@@ -2005,20 +2031,27 @@ impl<'a> Parser<'a> {
             ParsedDeleteWhere::Predicates(predicates)
         };
 
+        // `RETURNING`（Issue #873・SQL-21）は `USING OPERATION_ID` 句の直前。
+        let returning = self.parse_returning_clause()?;
         let operation_id = self.parse_operation_id_clause()?;
 
         Ok(ParsedDeleteShape {
             table_name,
             where_clause,
             operation_id,
+            returning,
         })
     }
 
     /// `WHERE` 直後（消費前）が単一行・`id` 完全一致指定形（`id = <number>` の
-    /// 直後のトークンが文末／`;`／文脈的キーワード `USING`）かどうかを、
-    /// トークンを一切消費せずに判定する（Issue #870・§3.2）。添字アクセス
-    /// （`[]`）は使わず `self.tokens.get` のみで先読みする（untrusted 入力
-    /// 経由のパーサーの原則。`.claude/rules/coding-rust.md`）。
+    /// 直後のトークンが文末／`;`／文脈的キーワード `USING`／`RETURNING`〔Issue
+    /// #873・SQL-21〕）かどうかを、トークンを一切消費せずに判定する（Issue
+    /// #870・§3.2）。添字アクセス（`[]`）は使わず `self.tokens.get` のみで
+    /// 先読みする（untrusted 入力経由のパーサーの原則。
+    /// `.claude/rules/coding-rust.md`）。`RETURNING` を終端として受理しないと
+    /// `WHERE id = 1 RETURNING ...` が `parse_where`（述語形）へ流れてしまい、
+    /// `RETURNING` を実行結線済みの単一行形（[`ValidatedDelete`]）で使えなく
+    /// なる。
     fn peek_single_row_delete_id(&self) -> bool {
         let is_id_eq_number = matches!(
             self.tokens.get(self.pos),
@@ -2031,20 +2064,26 @@ impl<'a> Parser<'a> {
         match self.tokens.get(self.pos + 3) {
             None => true,
             Some(Token::Punct(';')) => true,
-            Some(Token::Ident(w)) => w.eq_ignore_ascii_case("USING"),
+            Some(Token::Ident(w)) => {
+                w.eq_ignore_ascii_case("USING") || w.eq_ignore_ascii_case("RETURNING")
+            }
             _ => false,
         }
     }
 
     /// `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE <where_form>
-    /// USING OPERATION_ID '<id>' [;]` を受理する。`WHERE` 句は [`Self::parse_update_where`]
-    /// が単一行・id 指定形（SQL-17、TASK-191）と述語形（SQL-19、TASK-192）を
-    /// 振り分ける（[`UpdateWhereForm`] のドキュメント参照）。振り分け後の受理判定
-    /// （id 指定形以外は許可しない等）は呼び出し元（[`validate_update_tokens`]・
-    /// [`validate_update_form_tokens`]）の責務とし、本メソッドは構造パースのみを行う。
-    /// 複数テーブル・サブクエリ・`RETURNING` は本メソッドが生成できる文法に
-    /// そもそも存在しないため構造的に受理しない（個別の拒否コードを持たず、
-    /// `expect_end_of_statement` が余剰トークンとして `42601` へ落とす）。
+    /// [RETURNING <投影>] USING OPERATION_ID '<id>' [;]` を受理する。`WHERE`
+    /// 句は [`Self::parse_update_where`] が単一行・id 指定形（SQL-17、
+    /// TASK-191）と述語形（SQL-19、TASK-192）を振り分ける（[`UpdateWhereForm`]
+    /// のドキュメント参照）。`RETURNING`（Issue #873・SQL-21）は構造として
+    /// 受理するが、`UPDATE` の実行結線（#865）が未着手のため呼び出し元
+    /// （[`validate_update_tokens`]・[`validate_update_form_tokens`]）が
+    /// 一律 `42601` で拒否する単一のチョークポイントを持つ。振り分け後の
+    /// 受理判定（id 指定形以外は許可しない等）も同じ呼び出し元の責務とし、
+    /// 本メソッドは構造パースのみを行う。複数テーブル・サブクエリは本メソッド
+    /// が生成できる文法にそもそも存在しないため構造的に受理しない（個別の
+    /// 拒否コードを持たず、`expect_end_of_statement` が余剰トークンとして
+    /// `42601` へ落とす）。
     fn parse_update(&mut self) -> Result<ParsedUpdateShape, SqlSurfaceError> {
         self.expect_contextual_keyword("UPDATE")?;
         let table_name = self.expect_ident()?;
@@ -2064,6 +2103,12 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Where)?;
         let where_form = self.parse_update_where()?;
 
+        // `RETURNING`（Issue #873・SQL-21）は `USING OPERATION_ID` 句の直前。
+        // 構造パースのみ行い、実行結線（#865）未着手のため常に `42601` で
+        // 拒否する判定は呼び出し元（`validate_update_tokens`／
+        // `validate_update_form_tokens`）のチョークポイントに委ねる。
+        let returning = self.parse_returning_clause()?;
+
         // 文末専用句の構造パースのみをここで行う（INSERT と同じ順序契約。
         // 必須化の判定は `validate_update`／`validate_update_form` が
         // `LedgerMode::require` へ委譲する）。
@@ -2074,6 +2119,7 @@ impl<'a> Parser<'a> {
             assignments,
             where_form,
             operation_id,
+            returning,
         })
     }
 
@@ -2121,6 +2167,30 @@ impl<'a> Parser<'a> {
         self.expect_punct('=')?;
         let literal = self.expect_literal()?;
         Ok((column, literal))
+    }
+
+    /// `RETURNING <投影>`（Issue #873・SQL-21）の構造パースのみを行う。書き込み系
+    /// 文（`INSERT`／`DELETE`／`UPDATE`）の `USING OPERATION_ID` 句の**直前**
+    /// にのみ置ける（`parse_insert`／`parse_delete`／`parse_update` が
+    /// [`Self::parse_operation_id_clause`] の直前で呼ぶ。それより後ろに置いた
+    /// `RETURNING` は `expect_end_of_statement` が余剰トークンとして `42601` へ
+    /// 落とす）。省略時は `Ok(None)`。投影は `SELECT` と同じ許可形状
+    /// （[`Self::parse_select_list`]）を再利用するが、関数呼び出し項目
+    /// （[`Projection::Items`]）はここでは受理しない（`RETURNING` が返す行は
+    /// 書き込み結果そのものであり、式評価のためのセッション UDF レジストリを
+    /// 持たないこのパーサー段では意味を持たないため）。
+    fn parse_returning_clause(&mut self) -> Result<Option<Projection>, SqlSurfaceError> {
+        if !self.peek_contextual_keyword("RETURNING") {
+            return Ok(None);
+        }
+        self.advance();
+        let projection = self.parse_select_list()?;
+        if matches!(projection, Projection::Items(_)) {
+            return Err(SqlSurfaceError::unsupported(
+                "RETURNING does not support function-call items",
+            ));
+        }
+        Ok(Some(projection))
     }
 
     /// 文末専用句 `USING OPERATION_ID '<id>'`（SQL-10、TASK-80）の構造パースのみを
@@ -2698,6 +2768,7 @@ struct ParsedInsertShape {
     columns: Vec<String>,
     rows: Vec<Vec<InsertLiteral>>,
     operation_id: Option<OperationId>,
+    returning: Option<Projection>,
     on_conflict: Option<OnConflictAction>,
 }
 
@@ -2718,6 +2789,7 @@ struct ParsedDeleteShape {
     table_name: String,
     where_clause: ParsedDeleteWhere,
     operation_id: Option<OperationId>,
+    returning: Option<Projection>,
 }
 
 /// [`Parser::parse_delete`] ＋ 文末検証を共有する private ヘルパー（Issue #870）。
@@ -2792,6 +2864,7 @@ pub(crate) fn validate_delete_tokens(
         table_name: shape.table_name,
         id_literal,
         operation_id: shape.operation_id,
+        returning: shape.returning,
     })
 }
 
@@ -2837,8 +2910,19 @@ pub(crate) fn validate_delete_statement_tokens(
             table_name: shape.table_name,
             id_literal,
             operation_id: shape.operation_id,
+            returning: shape.returning,
         }),
         ParsedDeleteWhere::Predicates(where_predicates) => {
+            // 述語形 DELETE の実行結線（#871）は未着手のため、`RETURNING` を
+            // 黙って保持し将来の実行器が無視する fail-open を防ぐ単一の
+            // チョークポイント（Issue #873・SQL-21）。単一行形（上の腕）は
+            // 実行結線済み（`sql::exec::execute_delete_returning`）のため
+            // 受理する。
+            if shape.returning.is_some() {
+                return Err(SqlSurfaceError::unsupported(
+                    "RETURNING is not supported for predicate-form DELETE",
+                ));
+            }
             DeleteStatement::Predicate(ValidatedPredicateDelete {
                 table_name: shape.table_name,
                 where_predicates,
@@ -2896,6 +2980,7 @@ pub(crate) fn validate_insert_tokens(
         columns: shape.columns,
         rows: shape.rows,
         operation_id: shape.operation_id,
+        returning: shape.returning,
         on_conflict: shape.on_conflict,
     })
 }
@@ -2965,6 +3050,7 @@ struct ParsedUpdateShape {
     assignments: Vec<(String, InsertLiteral)>,
     where_form: UpdateWhereForm,
     operation_id: Option<OperationId>,
+    returning: Option<Projection>,
 }
 
 /// 許可形状の構造判定を通過した述語つき `UPDATE` 文（SQL-19、TASK-192）。
@@ -3076,6 +3162,20 @@ pub(crate) fn validate_update_tokens(
     let shape = p.parse_update()?;
     p.expect_end_of_statement()?;
 
+    // `RETURNING`（Issue #873・SQL-21）: `UPDATE` の実行結線（#865）は未着手
+    // のため、構造検証段で常に `42601` 拒否する単一のチョークポイント（黙って
+    // 保持し将来の実行器が無視する fail-open を防ぐ）。述語形 WHERE の判定
+    // よりも前に置く——`parse_update_where` は `RETURNING` を終端として
+    // 特別扱いしないため、`WHERE id = 1 RETURNING ...` は構造上
+    // `UpdateWhereForm::Predicates` へ分類されうるが、`RETURNING` の拒否は
+    // WHERE 形状に関わらず常に同じ「単一のチョークポイント」で行う
+    // （`validate_update_form_tokens` と同じ判定順序に揃える）。
+    if shape.returning.is_some() {
+        return Err(SqlSurfaceError::unsupported(
+            "RETURNING is not supported for UPDATE",
+        ));
+    }
+
     // 述語形 WHERE（SQL-19、TASK-192）は本エントリポイントのスコープ外
     // （`validate_update` は id 指定形〔SQL-17〕専用のまま維持する。後方互換）。
     // `operation_id` 必須化ガード・カタログ存在確認より前に判定することで、
@@ -3102,6 +3202,10 @@ pub(crate) fn validate_update_tokens(
         assignments: shape.assignments,
         id_literal,
         operation_id: shape.operation_id,
+        // 直前のガードで `shape.returning.is_some()` は既に `42601` で
+        // 拒否済みのため、ここへ到達する時点で常に `None`
+        // （`validate_update_form_tokens` の同型ガードと表記を揃える）。
+        returning: None,
     })
 }
 
@@ -3139,6 +3243,15 @@ pub(crate) fn validate_update_form_tokens(
     let shape = p.parse_update()?;
     p.expect_end_of_statement()?;
 
+    // `RETURNING`（Issue #873・SQL-21）: `validate_update_tokens` と同じ
+    // チョークポイント。`UPDATE` は単一行・述語形いずれも実行結線（#865）が
+    // 未着手のため、`WHERE` 形状の判定より前に一律拒否する。
+    if shape.returning.is_some() {
+        return Err(SqlSurfaceError::unsupported(
+            "RETURNING is not supported for UPDATE",
+        ));
+    }
+
     mode.require(shape.operation_id.as_ref())?;
 
     let exists = lookup.table_exists(&shape.table_name)?;
@@ -3152,6 +3265,7 @@ pub(crate) fn validate_update_form_tokens(
             assignments: shape.assignments,
             id_literal,
             operation_id: shape.operation_id,
+            returning: None,
         }),
         UpdateWhereForm::Predicates(where_predicates) => {
             ValidatedUpdateForm::Predicate(ValidatedPredicateUpdate {
@@ -3862,6 +3976,184 @@ mod tests {
             stmt.operation_id.as_ref().map(OperationId::as_str),
             Some("op-0001")
         );
+    }
+
+    // --- RETURNING（Issue #873・SQL-21） ---
+
+    #[test]
+    fn accepts_insert_with_returning_star_before_using_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
+             RETURNING * USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("RETURNING * before USING should be accepted");
+        assert_eq!(stmt.returning, Some(Projection::All));
+    }
+
+    #[test]
+    fn accepts_insert_with_returning_column_list() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
+             RETURNING id, embedding USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("RETURNING column list should be accepted");
+        assert_eq!(
+            stmt.returning,
+            Some(Projection::Columns(vec![
+                "id".to_string(),
+                "embedding".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn insert_without_returning_clause_has_none() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("plain INSERT should be accepted");
+        assert_eq!(stmt.returning, None);
+    }
+
+    #[test]
+    fn rejects_insert_with_returning_after_using_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
+             USING OPERATION_ID 'op-0001' RETURNING id",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("RETURNING after USING must be rejected as trailing tokens");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_insert_with_missing_returning_projection() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
+             RETURNING USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("RETURNING without a projection must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_insert_with_duplicate_returning_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
+             RETURNING id RETURNING embedding USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("duplicate RETURNING clause must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_insert_with_function_call_returning_item() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
+             RETURNING vec_norm(embedding) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("function-call RETURNING items must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_truncate_with_returning_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_truncate(
+            "TRUNCATE TABLE documents USING OPERATION_ID 'op-0001' RETURNING *",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("TRUNCATE does not support RETURNING");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn accepts_delete_single_row_with_returning_before_using_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete(
+            "DELETE FROM documents WHERE id = 1 RETURNING * USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("single-row DELETE RETURNING should be accepted");
+        assert_eq!(stmt.returning, Some(Projection::All));
+    }
+
+    #[test]
+    fn validate_delete_statement_single_row_with_returning_yields_single_row_variant() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete_statement(
+            "DELETE FROM documents WHERE id = 1 RETURNING id USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("single-row DELETE RETURNING via validate_delete_statement should be accepted");
+        match stmt {
+            DeleteStatement::SingleRow(inner) => {
+                assert_eq!(
+                    inner.returning,
+                    Some(Projection::Columns(vec!["id".to_string()]))
+                );
+            }
+            other => panic!("expected DeleteStatement::SingleRow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_predicate_delete_with_returning_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja' RETURNING id USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("predicate-form DELETE RETURNING must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_single_row_with_returning_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = 'en' WHERE id = 1 RETURNING id USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("single-row UPDATE RETURNING must be rejected (execution not wired, #865)");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_predicate_form_with_returning_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update_form(
+            "UPDATE documents SET lang = 'en' WHERE lang = 'ja' RETURNING id USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("predicate-form UPDATE RETURNING must be rejected (execution not wired, #865)");
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]

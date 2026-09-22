@@ -11,6 +11,10 @@
 //! `INSERT` は wire 経由で受理する（TASK-82・SQL-10。`EngineCore::
 //! execute_sql_in_session` が先頭トークンを見て `execute_insert_sql`（TASK-80）
 //! へ委譲し `SqlOutcome::Insert` を返す。`crates/engine/src/core.rs` 参照）。
+//! `INSERT`／単一行 `DELETE` に `RETURNING` 句を付けた場合は `SqlOutcome::
+//! Returning` を返し、`respond_rows_with_tag` が `RowDescription`／`DataRow`*
+//! に続けて `rows_affected`（`result.rows.len()` とは独立）由来の
+//! `CommandComplete` タグを送出する（Issue #873・SQL-21）。
 //! engine 側の `INSERT`（`sql::exec::execute_insert`）は行を常に
 //! `Visibility::Private` で書き込む固定仕様であり、wire 認証経由の
 //! `PolicyContext`（`auth::verify`）は `Public` ＋ 自テナントの `Private` を
@@ -257,6 +261,29 @@ pub(crate) fn execute_and_respond(
                 "failed to encode command complete response",
             ),
         },
+        // Issue #873（SQL-21）: `RETURNING` 句付き `INSERT`／`DELETE` の応答。
+        // `RowDescription`／`DataRow`* は通常の検索 SELECT・`EXPLAIN` と同じ
+        // `respond_rows_with_tag`（`respond_query_result` から切り出した共通
+        // 本体）で組み立てるが、`CommandComplete` タグの件数は
+        // `result.rows.len()`（RLS 再判定後に絞られた投影行数）ではなく
+        // `outcome.rows_affected`（実際に変更した行数。`ReturningOutcome` の
+        // ドキュメント参照）を使う——両者は書き込み本人にも不可視な行がある
+        // 場合に一致しないことが契約上ありうるため、`SELECT`/`EXPLAIN` と同じ
+        // `format!("{tag} {}", result.rows.len())` を再利用できない。
+        Ok(SqlOutcome::Returning(outcome)) => {
+            let tag = match outcome.command {
+                engine::sql::returning::DmlCommand::Insert => {
+                    format!("INSERT 0 {}", outcome.rows_affected)
+                }
+                engine::sql::returning::DmlCommand::Update => {
+                    format!("UPDATE {}", outcome.rows_affected)
+                }
+                engine::sql::returning::DmlCommand::Delete => {
+                    format!("DELETE {}", outcome.rows_affected)
+                }
+            };
+            respond_rows_with_tag(stream, &outcome.result, &tag)
+        }
         // Issue #865（SQL-17・TASK-191）: `UPDATE`（単一行・id 指定。
         // `exec::UpdateOutcome::rows_affected` に更新件数を保持する。
         // `sql/exec.rs` ドキュメント参照）の応答を pg 互換の `CommandComplete`
@@ -394,6 +421,27 @@ fn respond_query_result(
     result: &engine::sql::exec::QueryResult,
     command_tag: &str,
 ) -> io::Result<()> {
+    let tag = if command_tag == "EXPLAIN" {
+        command_tag.to_string()
+    } else {
+        format!("{command_tag} {}", result.rows.len())
+    };
+    respond_rows_with_tag(stream, result, &tag)
+}
+
+/// `RowDescription`／`DataRow`* の組み立てとフレーム送出を担う共通本体
+/// （Issue #873・SQL-21 で [`respond_query_result`] から切り出した）。`tag` は
+/// 呼び出し元が完成済みで渡す `CommandComplete` の中身（`SELECT`／`EXPLAIN` は
+/// `respond_query_result` が `result.rows.len()` から組み立て、`RETURNING` は
+/// `outcome.rows_affected` から組み立てる。`simple_query::handle` の
+/// `SqlOutcome::Returning` 分岐参照）。バイト列の組み立て自体（`ResponseBuffer`
+/// によるバッファリング・上限超過時のフレーム境界分割送出）は本切り出しの
+/// 前後で完全に同一。
+fn respond_rows_with_tag(
+    stream: &mut TcpStream,
+    result: &engine::sql::exec::QueryResult,
+    tag: &str,
+) -> io::Result<()> {
     let row_desc = match result_encoder::encode_row_description(&result.columns) {
         Ok(msg) => msg,
         Err(_) => {
@@ -443,12 +491,7 @@ fn respond_query_result(
         }
     }
 
-    let tag = if command_tag == "EXPLAIN" {
-        command_tag.to_string()
-    } else {
-        format!("{command_tag} {}", result.rows.len())
-    };
-    match result_encoder::encode_command_complete(&tag) {
+    match result_encoder::encode_command_complete(tag) {
         Ok(msg) => {
             buffer.push_frame(stream, &msg)?;
             buffer.push_frame(stream, &result_encoder::encode_ready_for_query())?;

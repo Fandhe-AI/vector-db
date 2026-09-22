@@ -239,6 +239,22 @@ pub struct DeleteOutcome {
     pub rows_affected: u64,
 }
 
+/// `RETURNING` 句（Issue #873・SQL-21）付き `INSERT`／`DELETE` の成功応答。
+/// `rows_affected` は既存の `InsertOutcome`／`DeleteOutcome` と同じ意味（実際に
+/// 変更した行数）で、`result.rows.len()` とは**独立**の値である——RLS 再判定
+/// （[`crate::policy::PolicyContext::is_visible`]。多層防御）で書き込み本人にも
+/// 不可視な行は `result.rows` から除外されるため、`rows.len() < rows_affected`
+/// になりうる（`PolicyContext::new`〔`Public` のみ可視〕で `Private` 行を
+/// `RETURNING` した場合など）。`CommandComplete` のタグ（`INSERT 0 <n>` 等）は
+/// 必ず `rows_affected` を使い、`result.rows.len()` を使わない
+/// （`wire-server::simple_query` 参照）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturningOutcome {
+    pub command: crate::sql::returning::DmlCommand,
+    pub rows_affected: u64,
+    pub result: QueryResult,
+}
+
 /// `EngineCore::execute_update_sql` の成功応答（SQL-17・TASK-191。Issue #865）。
 /// `TruncateOutcome` とは異なり `UPDATE` は pg 互換の `CommandComplete` タグ
 /// （`UPDATE <n>`）が更新行数を要求するため、`rows_affected` を保持する。
@@ -2613,6 +2629,108 @@ pub fn execute_delete(
     }
 }
 
+/// `RETURNING` 句（Issue #873・SQL-21）付き単一行 `DELETE`（SQL-18・TASK-191 の
+/// 唯一到達経路。述語形 `DELETE` は許可リスト段〔`sql::allowlist::
+/// validate_delete_statement_tokens`〕で `RETURNING` を一律 `42601` 拒否する
+/// ため本関数へは到達しない）の実行入口。[`execute_delete`] と同じ
+/// `tenant::delete_row_ledgered_capturing_unchecked` を `capture: Some(schema)`
+/// で呼び、削除**前**の行内容を `crate::tenant::CapturedRow`（クレート内部型）
+/// として捕捉する。
+///
+/// **RLS 再判定（多層防御）**: 捕捉行は書き込み経路（テナント名前空間キー
+/// `(tenant_id, id)`・TABLE-12）由来のため通常は `ctx` から可視だが、
+/// `ctx.is_visible(row_tenant, row_visibility)`（RLS-7・RLS-8 と同じ判定）を
+/// 再適用し、不可視の場合は `result.rows` を空にする——`rows_affected` は
+/// 実際に削除した件数のまま変えない（[`ReturningOutcome`] のドキュメント
+/// 参照）。`schema` は呼び出し元が束縛した時点のスキーマで、`tenant.rs` の
+/// TOCTOU 対策（束縛後・削除実行前のスキーマ変更検出）に使われる。
+///
+/// **投影は commit 前・同一トランザクション内で行う（codex-review P1 指摘・
+/// PR #991 対応）**: [`execute_insert_returning`] は書き込み予定値
+/// （`bounds[*].values`）が呼び出し前から既知なので `column_meta`・
+/// `project_row` を書き込みより先に呼べるが、DELETE の場合は捕捉行の実体
+/// （`CapturedRow::values`）が `tenant::delete_row_ledgered_capturing_unchecked`
+/// の write トランザクション内でしか得られない。そこで `project_row`
+/// （文字列・ベクトルの `try_reserve_exact` 失敗や結果容量超過で失敗しうる）
+/// は `project` コールバックとして渡し、`tenant::delete_row_impl` に
+/// **commit の前**に呼ばせる（`tenant.rs` の `project` ドキュメント参照）。
+/// これにより、投影の失敗は `write_txn` の abort（行削除・台帳追記ともに
+/// 破棄）を伴うため、「DELETE は失敗応答なのに行は既に永続化されている」と
+/// いう commit 成功境界違反が起きない——旧実装は commit 後に `project_row` を
+/// 呼んでいたため、この違反が起こり得た。`column_meta` 自体は `projection`・
+/// `schema` のみに依存する純粋な計算（redb I/O を伴わない）であり、書き込み
+/// より前に呼んでも同じ理由で安全なため従来どおり先に呼ぶ。
+pub fn execute_delete_returning(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundDelete,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    returning: &[crate::sql::parser::ProjectedColumn],
+    schema: &TableSchema,
+) -> Result<ReturningOutcome, SqlSurfaceError> {
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id.as_ref())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+
+    let columns = crate::sql::returning::column_meta(returning, schema)?;
+
+    // `project` コールバック（`tenant::delete_row_impl` が commit 前に呼ぶ）の
+    // 結果をここへ書き戻す。クロージャは `FnMut` のため 1 回しか呼ばれない
+    // 前提でも所有権を返せず、外側の可変変数へ書き込む形にする。
+    let mut projected_row: Option<ResultRow> = None;
+    let mut budget = 0usize;
+    let mut project =
+        |row: &crate::tenant::CapturedRow| -> Result<(), crate::tenant::TenantWriteError> {
+            if !ctx.is_visible(&row.tenant_id, row.visibility) {
+                return Ok(());
+            }
+            match crate::sql::returning::project_row(row.id, &row.values, returning, &mut budget) {
+                Ok(result_row) => {
+                    projected_row = Some(result_row);
+                    Ok(())
+                }
+                Err(SqlSurfaceError::PayloadTooLarge { detail }) => {
+                    Err(crate::tenant::TenantWriteError::ReturningProjectionTooLarge(detail))
+                }
+                Err(other) => Err(crate::tenant::TenantWriteError::ReturningProjectionFailed(
+                    other.to_string(),
+                )),
+            }
+        };
+
+    let (outcome, _captured) = crate::tenant::delete_row_ledgered_capturing_unchecked(
+        storage,
+        &bound.table,
+        ctx,
+        bound.id,
+        ledger_write,
+        Some(schema),
+        Some(&mut project),
+    )
+    // [`execute_delete`]（RETURNING なし）と同じ `"delete"` 語彙で写像する
+    // （Cursor Bugbot Low 指摘・PR #991）。本関数は DELETE の実行であり、
+    // `map_insert_write_error`（固定文言 `"insert"`）を使うと束縛後のスキーマ
+    // 変更・捕捉行デコード失敗・ストレージエラー等の一般的な書き込み失敗で
+    // 「insert rejected」という誤った操作名がクライアントへ返っていた。
+    .map_err(|e| map_write_error(e, "delete"))?;
+
+    let rows_affected = match outcome {
+        crate::tenant::DeleteRowOutcome::Deleted => 1,
+        crate::tenant::DeleteRowOutcome::NotFound => 0,
+    };
+
+    let mut rows = Vec::new();
+    if let Some(row) = projected_row {
+        rows.push(row);
+    }
+
+    Ok(ReturningOutcome {
+        command: crate::sql::returning::DmlCommand::Delete,
+        rows_affected,
+        result: QueryResult { columns, rows },
+    })
+}
+
 /// SQL 表層 `UPDATE <table> SET <col> = <lit>[, ...] WHERE id = <n>
 /// USING OPERATION_ID '<id>'`（SQL-17、TASK-191。Issue #865）の実行入口。
 /// `bound`（`sql::parser::bind_update` 済み）の `operation_id` を `ledger_mode` で
@@ -2713,6 +2831,18 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
         // 判別できなくなる。
         TenantWriteError::DuplicateOperationId => SqlSurfaceError::DuplicateOperationId,
         TenantWriteError::OperationIdContentMismatch => SqlSurfaceError::OperationIdContentMismatch,
+        // `RETURNING` 句（Issue #873・SQL-21）の捕捉行投影が容量上限超過で失敗した
+        // （[`execute_delete_returning`] の `project` コールバック。commit **前**に
+        // 検出し `write_txn` を abort させる設計のため、この写像に到達する時点で
+        // 削除は永続化されていない）。`_` 節（`XX000`）へ丸めると `54000` を失う。
+        TenantWriteError::ReturningProjectionTooLarge(_) => {
+            SqlSurfaceError::payload_too_large("RETURNING result exceeds capacity")
+        }
+        // 同じく commit 前 abort の内部事象版（型不整合等。untrusted 入力起因では
+        // ないため `XX000`。`_` 節と同じ分類だが意図を明示する）。
+        TenantWriteError::ReturningProjectionFailed(_) => SqlSurfaceError::Internal {
+            detail: "RETURNING projection failed".to_string(),
+        },
         TenantWriteError::Catalog(CatalogError::TableNotFound(name)) => {
             SqlSurfaceError::UndefinedTable { name }
         }
@@ -2838,6 +2968,65 @@ pub(crate) fn execute_insert_batch_with_schema(
     Ok(InsertOutcome {
         rows_affected,
         incremental: None,
+    })
+}
+
+/// `RETURNING` 句（Issue #873・SQL-21）付き行形 `INSERT`（単一行・複数行
+/// `VALUES` の双方）の実行入口。ファイル形（`BoundInsertForm::File`）は
+/// 呼び出し元（`core.rs`）が束縛段で `42601` 拒否するため本関数へは到達しない
+/// 契約（サーバー側チャンク化行を返す応答形が未定義のため fail-closed）。
+/// 既存の書き込み経路（[`execute_insert_batch_with_schema`]）をそのまま通した
+/// うえで、書き込んだ値そのもの（`bounds[*].values`。既定値・トリガの類は
+/// 存在しないため常に書き込んだ値と一致する）を `RowDescription` へ再読み込み
+/// なしで投影する。
+///
+/// **RLS 再判定（多層防御）**: 挿入行の tenant は常に `ctx.tenant_id()`・
+/// visibility は常に `crate::storage::Visibility::Private` 固定
+/// （`execute_insert_with_schema` と同じ契約）のため `ctx.is_visible` は通常
+/// 常に真だが、[`execute_delete_returning`] と同じ形で再適用し判定経路を
+/// 統一する（security.md「テナント境界」多層防御方針）。
+pub fn execute_insert_returning(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bounds: &[crate::sql::parser::BoundInsert],
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    returning: &[crate::sql::parser::ProjectedColumn],
+    schema: &TableSchema,
+) -> Result<ReturningOutcome, SqlSurfaceError> {
+    // codex-review Low 指摘（PR #873）対応: `column_meta`・`project_row` は
+    // いずれも `bounds`（呼び出し元が既に束縛済みの書き込み予定値）・
+    // `projection`・`schema`・`ctx` のみに依存する純粋な計算（redb I/O を
+    // 伴わない）であり、`returning_bug`／`54000`（バイト予算超過）以外では
+    // 失敗しない。書き込み（commit 境界）の *前* に呼ぶことで、投影の構築
+    // 失敗が「書き込みは成功したのにエラー応答を返す」（commit 成功境界後の
+    // 失敗）経路に紛れ込むのを防ぐ（[`execute_delete_returning`] は捕捉行の
+    // 実体が write トランザクション内でしか得られないため `project_row` を
+    // 書き込みより前には呼べず、`tenant::delete_row_impl` の `project`
+    // コールバックとして commit の**前**（トランザクション内）に呼ばせる、
+    // 同じ目的の別経路を使う。codex-review P1 指摘・PR #991 対応。
+    // ドキュメント参照）。
+    let columns = crate::sql::returning::column_meta(returning, schema)?;
+    let is_visible = ctx.is_visible(ctx.tenant_id(), crate::storage::Visibility::Private);
+    let mut rows = Vec::new();
+    if is_visible {
+        let mut budget = 0usize;
+        for bound in bounds {
+            rows.push(crate::sql::returning::project_row(
+                bound.id,
+                &bound.values,
+                returning,
+                &mut budget,
+            )?);
+        }
+    }
+
+    let insert_outcome =
+        execute_insert_batch_with_schema(storage, ctx, bounds, ledger_mode, Some(schema))?;
+
+    Ok(ReturningOutcome {
+        command: crate::sql::returning::DmlCommand::Insert,
+        rows_affected: insert_outcome.rows_affected,
+        result: QueryResult { columns, rows },
     })
 }
 
@@ -3106,6 +3295,26 @@ mod tests {
     // （`execute_statement`）を `MAX_SEARCH_K` 超の巨大データで再現するのは
     // 非現実的なため、上限判定を担う純粋関数を直接検証する（`try_accumulate_budget`
     // と同方針）。
+
+    // codex-review P1・Bugbot 指摘（PR #991）の回帰テスト: DELETE RETURNING が
+    // 削除直前の既存行を捕捉する際のデコード失敗（`tenant::TenantWriteError::
+    // CapturedRowDecodeFailed`）は、送信されたクライアント入力の不正ではなく
+    // サーバー内部事象のため、`22000`（`insert rejected: invalid row`）ではなく
+    // `XX000`（内部事象）へ写像されなければならない。旧実装は
+    // `TenantWriteError::Storage`/`Catalog(Invalid)` を共用していたため
+    // `map_insert_write_error` の `22000` アームに誤って丸め込まれていた。
+    #[test]
+    fn map_insert_write_error_maps_captured_row_decode_failed_to_internal_not_invalid_input() {
+        let mapped =
+            map_insert_write_error(crate::tenant::TenantWriteError::CapturedRowDecodeFailed(
+                "test decode failure".to_string(),
+            ));
+        assert!(
+            matches!(mapped, SqlSurfaceError::Internal { .. }),
+            "CapturedRowDecodeFailed はクライアント入力不正（22000）ではなく \
+             内部事象（XX000）へ写像されるべき: {mapped:?}"
+        );
+    }
 
     #[test]
     fn precision_completeness_unbounded_false_when_recall_mode() {
