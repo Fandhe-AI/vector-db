@@ -2864,16 +2864,16 @@ pub fn execute_insert_returning(
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
-    // codex-review Low 指摘（PR #873）対応: `column_meta` は `projection`・
-    // `schema` のみに依存する純粋な計算（redb I/O を伴わない）であり、
-    // `returning_bug`（`XX000`）以外で失敗しない。書き込み（commit 境界）の
-    // *前* に呼ぶことで、投影メタデータの構築失敗が「書き込みは成功したのに
-    // エラー応答を返す」（commit 成功境界後の失敗）経路に紛れ込むのを防ぐ。
+    // codex-review Low 指摘（PR #873）対応: `column_meta`・`project_row` は
+    // いずれも `bounds`（呼び出し元が既に束縛済みの書き込み予定値）・
+    // `projection`・`schema`・`ctx` のみに依存する純粋な計算（redb I/O を
+    // 伴わない）であり、`returning_bug`／`54000`（バイト予算超過）以外では
+    // 失敗しない。書き込み（commit 境界）の *前* に呼ぶことで、投影の構築
+    // 失敗が「書き込みは成功したのにエラー応答を返す」（commit 成功境界後の
+    // 失敗）経路に紛れ込むのを防ぐ（[`execute_delete_returning`] は削除前の
+    // 行内容をトランザクション内で捕捉する必要があるため同じ並べ替えができ
+    // ない。ドキュメント参照）。
     let columns = crate::sql::returning::column_meta(returning, schema)?;
-
-    let insert_outcome =
-        execute_insert_batch_with_schema(storage, ctx, bounds, ledger_mode, Some(schema))?;
-
     let is_visible = ctx.is_visible(ctx.tenant_id(), crate::storage::Visibility::Private);
     let mut rows = Vec::new();
     if is_visible {
@@ -2887,6 +2887,9 @@ pub fn execute_insert_returning(
             )?);
         }
     }
+
+    let insert_outcome =
+        execute_insert_batch_with_schema(storage, ctx, bounds, ledger_mode, Some(schema))?;
 
     Ok(ReturningOutcome {
         command: crate::sql::returning::DmlCommand::Insert,
