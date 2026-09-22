@@ -45,7 +45,9 @@ use crate::rls::{ImplicitRlsHook, RlsSafetyNet, RlsVerifiedHits};
 use crate::row_codec::{self, RowCodecError, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
-use crate::sql::parser::{BoundStatement, ProjectedColumn, Ranking};
+use crate::sql::parser::{
+    BoundConflictAction, BoundStatement, BoundUpsert, BoundUpsertValue, ProjectedColumn, Ranking,
+};
 use crate::sql::plan::ExecutionPlan;
 use crate::sql::udf_call;
 use crate::storage::StorageError;
@@ -2751,6 +2753,100 @@ pub(crate) fn execute_insert_batch_with_schema(
     let rows_affected = u64::try_from(bounds.len()).map_err(|_| SqlSurfaceError::Internal {
         detail: "insert batch row count overflow".to_string(),
     })?;
+    Ok(InsertOutcome {
+        rows_affected,
+        incremental: None,
+    })
+}
+
+/// SQL 表層 `INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (id)
+/// DO NOTHING | DO UPDATE SET ... USING OPERATION_ID '<id>'`（SQL-20、
+/// TASK-193、Issue #872）の実行入口。`bound`（`sql::parser::bind_insert_form`
+/// の `Upsert` 分岐が束縛済み）を `crate::tenant::upsert_typed_rows_unchecked`
+/// へ委譲する（[`execute_insert`]・[`execute_insert_batch`] と同じ設計）。
+///
+/// **衝突判定スコープ・応答意味論**: `docs/design/sql-upsert.md` 参照。行 `id`
+/// 衝突は本構文では常に `DO NOTHING`／`DO UPDATE` のいずれかへ分岐し、行制約
+/// 由来の [`SqlSurfaceError::IdConflict`]（`23505`）は構造的に到達しない
+/// （テナント名前空間化された物理キー内の衝突は必ずこの経路で処理される）。
+/// `InsertOutcome::rows_affected` は「新規挿入した行数＋更新した行数」（全行
+/// `DO NOTHING` で衝突した場合は `0`）。
+///
+/// `ledger_mode` の解決・`operation_id` 必須化ガード（TASK-92・RECOVER-1）は
+/// [`execute_insert`] と同じ契約。
+pub fn execute_upsert(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &BoundUpsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    execute_upsert_with_schema(storage, ctx, bound, ledger_mode, None)
+}
+
+/// [`execute_upsert`] の実体（`pub(crate)`）。`expected_schema` を追加で受け取る
+/// 点のみが異なる（[`execute_insert_with_schema`] と同じ設計）。
+pub(crate) fn execute_upsert_with_schema(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &BoundUpsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    use crate::storage::Visibility;
+
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id.as_ref())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+
+    let rows: Vec<(u64, &[crate::row_codec::Value])> = bound
+        .rows
+        .iter()
+        .map(|b| (b.id, b.values.as_slice()))
+        .collect();
+
+    // `sql::parser::BoundConflictAction`／`BoundUpsertValue` を
+    // `tenant::UpsertAction`／`UpsertSetValue`（`sql` へ依存しない最小表現）へ
+    // 変換する（`tenant.rs` モジュールドキュメント参照）。
+    let tenant_assignments: Vec<(usize, crate::tenant::UpsertSetValue<'_>)> = match &bound.action {
+        BoundConflictAction::DoNothing => Vec::new(),
+        BoundConflictAction::DoUpdate(assignments) => assignments
+            .iter()
+            .map(|(col_idx, value)| {
+                let v = match value {
+                    BoundUpsertValue::Excluded(src_idx) => {
+                        crate::tenant::UpsertSetValue::Excluded(*src_idx)
+                    }
+                    BoundUpsertValue::Literal(v) => crate::tenant::UpsertSetValue::Literal(v),
+                };
+                (*col_idx, v)
+            })
+            .collect(),
+    };
+    let tenant_action = match &bound.action {
+        BoundConflictAction::DoNothing => crate::tenant::UpsertAction::DoNothing,
+        BoundConflictAction::DoUpdate(_) => {
+            crate::tenant::UpsertAction::DoUpdate(&tenant_assignments)
+        }
+    };
+
+    let outcome = crate::tenant::upsert_typed_rows_unchecked(
+        storage,
+        &bound.table,
+        ctx,
+        Visibility::Private,
+        &rows,
+        &tenant_action,
+        ledger_write,
+        expected_schema,
+    )
+    .map_err(map_insert_write_error)?;
+
+    let rows_affected = outcome
+        .inserted
+        .checked_add(outcome.updated)
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "upsert row count overflow".to_string(),
+        })?;
     Ok(InsertOutcome {
         rows_affected,
         incremental: None,

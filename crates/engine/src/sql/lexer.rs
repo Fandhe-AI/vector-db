@@ -41,6 +41,21 @@ pub enum Token {
     Le,
     /// `>=`（TASK-79・SQL-9: 式述語の比較演算子）。
     Ge,
+    /// `<qualifier>.<name>`（SQL-20・TASK-193・Issue #872）。`ON CONFLICT ...
+    /// DO UPDATE SET` の右辺 `EXCLUDED.<col>` 専用の 2 語 1 トークン化。
+    /// `lex_word` の直後に空白を挟まず `.` ＋識別子開始文字（英字・`_`）が続く
+    /// 場合のみこの形になる（`.5`・`1.`・`1..2`・`a.`・`a. b`・`a.b.c` はいずれも
+    /// 該当せず、従来どおり許可リスト外の `.` として `LexError` になる——
+    /// `qualifier`／`name` の 2 段しか許さないため `a.b.c` は `a.b` の直後に
+    /// 孤立した `.c` が続く形になり、`allowlist::Parser` 側でこの `.` が
+    /// 未対応のトークン境界として構文的に拒否される）。許可リスト
+    /// （`sql::allowlist::Parser`）は `qualifier` を `EXCLUDED` と大小無視で
+    /// 照合し、`ON CONFLICT ... SET` の右辺以外の位置に現れた場合は
+    /// `expect_ident` 系ヘルパーが受理せず `42601` へ落とす。
+    QualifiedIdent {
+        qualifier: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +239,32 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 
         if c.is_ascii_alphabetic() || c == '_' {
             let (word, next_offset) = lex_word(input, offset);
+            // `Token::QualifiedIdent`（Issue #872・SQL-20）: 予約語（`Keyword`）は
+            // 修飾子として使わせない（`EXCLUDED` はそもそも `Keyword` 化されて
+            // いない語であり、予約語直後の `.` を新たに受理対象へ広げる必要が
+            // ないため）。空白を挟まず「`.` の直後に識別子開始文字（英字・`_`）」
+            // が続く場合のみ 2 語 1 トークンへまとめる（1 文字先読みで確定させ、
+            // `a.`（末尾 `.`）・`a. b`（空白を挟む）を誤って飲み込まない。
+            // `lex_number` の小数点先読みと同じ設計）。
+            if keyword_from_str(&word).is_none() {
+                if let Some(rest) = input.get(next_offset..) {
+                    let mut dot_lookahead = rest.char_indices();
+                    if matches!(dot_lookahead.next(), Some((_, '.'))) {
+                        let name_start_in_rest = dot_lookahead.next();
+                        if matches!(name_start_in_rest, Some((_, nc)) if nc.is_ascii_alphabetic() || nc == '_')
+                        {
+                            let name_start = next_offset + 1;
+                            let (name, name_end) = lex_word(input, name_start);
+                            tokens.push(Token::QualifiedIdent {
+                                qualifier: word,
+                                name,
+                            });
+                            advance_to(&mut chars, name_end);
+                            continue;
+                        }
+                    }
+                }
+            }
             match keyword_from_str(&word) {
                 Some(kw) => tokens.push(Token::Keyword(kw)),
                 None => tokens.push(Token::Ident(word)),
@@ -369,6 +410,45 @@ mod tests {
                 Token::Number("10".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn qualified_ident_lexes_excluded_dot_column() {
+        // Issue #872・SQL-20: `ON CONFLICT ... DO UPDATE SET` の右辺
+        // `EXCLUDED.<col>` の規範形。大小混在（`excluded`）も同様に扱う
+        // （照合自体は `allowlist::Parser` 側で大小無視する）。
+        let tokens = tokenize("EXCLUDED.embedding").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![Token::QualifiedIdent {
+                qualifier: "EXCLUDED".to_string(),
+                name: "embedding".to_string(),
+            }]
+        );
+        let tokens = tokenize("excluded.lang").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![Token::QualifiedIdent {
+                qualifier: "excluded".to_string(),
+                name: "lang".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn qualified_ident_rejects_malformed_dot_forms() {
+        // `.5`（数値側の既存拒否。`rejects_leading_dot_number_literal` と重複
+        // 確認）・`1.`（数値側。`rejects_trailing_dot_number_literal` と重複
+        // 確認）・`1..2`（数値側）はいずれも既存契約のまま。識別子側の新規
+        // 拒否形状: `a.`（末尾 `.`）・`a. b`（空白を挟む）・`a.b.c`（3 段）・
+        // `a.5`（`.` の直後が数字）。
+        assert!(tokenize(".5").is_err());
+        assert!(tokenize("1.").is_err());
+        assert!(tokenize("1..2").is_err());
+        assert!(tokenize("a.").is_err());
+        assert!(tokenize("a. b").is_err());
+        assert!(tokenize("a.b.c").is_err());
+        assert!(tokenize("a.5").is_err());
     }
 
     #[test]

@@ -1037,6 +1037,357 @@ pub(crate) fn insert_typed_rows_unchecked(
     Ok(())
 }
 
+/// [`upsert_typed_rows_unchecked`] の `DO UPDATE SET` 右辺（SQL-20・TASK-193、
+/// Issue #872）。`sql::parser::BoundUpsertValue` に対応する最小表現（本モジュールは
+/// `sql` に依存しない設計を維持するため独自 enum を持つ。`upsert_typed_rows_
+/// unchecked` の呼び出し元〔`sql::exec::execute_upsert_with_schema`〕が
+/// `BoundUpsertValue` から変換する）。
+pub(crate) enum UpsertSetValue<'a> {
+    /// 新規挿入しようとした行（`upsert_typed_rows_unchecked` の呼び出し元の
+    /// `rows` スライスにおける同じ行の値列）の列インデックス参照。
+    Excluded(usize),
+    Literal(&'a crate::row_codec::Value),
+}
+
+/// [`upsert_typed_rows_unchecked`] の衝突分岐（SQL-20・TASK-193、Issue #872）。
+/// `sql::parser::BoundConflictAction` に対応する最小表現。
+pub(crate) enum UpsertAction<'a> {
+    DoNothing,
+    /// (`schema.columns` の対象列インデックス, 右辺) の宣言順スライス
+    /// （並べ替えない。`content_hash::for_typed_upsert` の再送判定がこの順序に
+    /// 依存する）。
+    DoUpdate(&'a [(usize, UpsertSetValue<'a>)]),
+}
+
+/// [`upsert_typed_rows_unchecked`] の成功時の結果（SQL-20・TASK-193、
+/// Issue #872）。`inserted + updated` が `sql::exec::InsertOutcome::rows_affected`
+/// へそのまま写像される（`DO NOTHING` で衝突した行はいずれにも数えない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct UpsertOutcome {
+    pub(crate) inserted: u64,
+    pub(crate) updated: u64,
+}
+
+/// `table` へ `INSERT ... ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`
+/// を実行する（SQL-20・TASK-193、Issue #872）。[`insert_typed_rows_unchecked`]
+/// の複数行版と同じ「1 write トランザクション・1 台帳エントリ」構造を持つが、
+/// 行ごとの衝突判定・分岐（新規挿入／`DO NOTHING`／`DO UPDATE` の read-merge-
+/// write）を追加で行う。
+///
+/// ## 衝突判定スコープ（TABLE-12・RLS-9。`docs/design/sql-upsert.md`「衝突判定
+/// スコープ」節参照）
+///
+/// 物理キー `(ctx.tenant_id(), id)` の**所有**で判定する（RLS 可視性ではない）。
+/// [`update_row_unchecked`]／[`delete_row_impl`] と同じ二重防御
+/// （`decode_row_for_key` によるキー↔ヘッダ tenant 整合検査＋`ctx.is_owner`）を
+/// 使う。物理キーが既にテナント名前空間化されているため、他テナントの同一
+/// `id` は取得すらされず、常に「非衝突＝新規挿入」として扱われる（他テナント
+/// 行の存在で分岐するコードを一切持たない）。
+///
+/// ## 判定順序（`docs/design/sql-upsert.md`「判定順序」節参照）
+///
+/// 台帳照合・追記（[`content_hash::for_typed_upsert`]・`ledger::record_in_txn`）
+/// を行ごとの衝突分岐より**前**に行う（[`update_row_unchecked`]・
+/// [`delete_row_impl`] と同じ契約。TASK-101・RECOVER-10。commit 済み操作の
+/// 再送が行状態の変化に左右されず検出される）。台帳へ書き込む内容ハッシュは
+/// 「新規挿入しようとした値」（`rows` そのもの。既存行の内容には依存しない）
+/// から決定的に計算するため、本関数は**同一の `rows`／`action` の再送に対して
+/// 常に同一ハッシュを返す**（再送検知の前提条件。`content_hash` モジュール
+/// ドキュメントの「正規化の方針」参照）。
+///
+/// 本関数が変更を加えた行が 1 件もない場合（全行 `DO NOTHING` で衝突）は
+/// テーブル世代を進行させない（`DeleteRowOutcome::NotFound` と同じ設計。
+/// 内容が変わらないため世代整合キャッシュ〔`SqlArenaCache` 等〕は有効のまま
+/// でよい。台帳エントリ自体は変更ゼロでも commit する）。
+///
+/// `expected_schema` は [`insert_typed_rows_unchecked`] と同じ契約（`Some` なら
+/// 束縛時スキーマと write トランザクション内で再取得したスキーマの不一致を
+/// `22000` で拒否）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn upsert_typed_rows_unchecked(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    insert_visibility: crate::storage::Visibility,
+    rows: &[(u64, &[crate::row_codec::Value])],
+    action: &UpsertAction<'_>,
+    ledger_write: LedgerWrite<'_>,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<UpsertOutcome, TenantWriteError> {
+    validate_identifier(table)?;
+    if rows.is_empty() {
+        return Ok(UpsertOutcome::default());
+    }
+
+    // バッチ内 id 重複検出（`insert_typed_rows_unchecked` と同じ設計。呼び出し元
+    // `sql::parser::bind_upsert_form` が束縛時点で既に `22000` として拒否済みの
+    // ため通常は到達しないが、本関数単体でも fail-closed を保つ）。
+    let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    seen_ids.try_reserve(rows.len()).map_err(|_| {
+        TenantWriteError::Storage(StorageError::Codec(
+            "failed to reserve upsert batch id set".to_string(),
+        ))
+    })?;
+    for (id, _) in rows {
+        if !seen_ids.insert(*id) {
+            return Err(TenantWriteError::IdConflict);
+        }
+    }
+
+    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
+    let mut inserted: u64 = 0;
+    let mut updated: u64 = 0;
+    {
+        let schema = require_table_schema_write(&write_txn, table)?;
+        if let Some(expected) = expected_schema {
+            if expected != &schema {
+                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                    "table schema changed after the insert values were bound".to_string(),
+                )));
+            }
+        }
+        let vector_idx = schema
+            .columns
+            .iter()
+            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
+            .ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "table has no VECTOR column".to_string(),
+                ))
+            })?;
+
+        // ハッシュ材料（`(id, visibility, embedding, 列名付きペア列)`）を要求記載順で
+        // 事前に組み立てる（`insert_typed_rows_unchecked` と同じ構造。`content_hash::
+        // for_typed_upsert` ドキュメント参照）。
+        type HashRow<'a> = (
+            u64,
+            crate::storage::Visibility,
+            &'a [f32],
+            Vec<(&'a str, &'a crate::row_codec::Value)>,
+        );
+        let mut hash_rows: Vec<HashRow<'_>> = Vec::new();
+        hash_rows.try_reserve_exact(rows.len()).map_err(|_| {
+            TenantWriteError::Storage(StorageError::Codec(
+                "failed to reserve upsert batch hash input".to_string(),
+            ))
+        })?;
+        for (id, values) in rows {
+            let embedding: &[f32] = match values.get(vector_idx) {
+                Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                _ => {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "VECTOR column value missing or not a Vector".to_string(),
+                    )))
+                }
+            };
+            schema.validate_embedding_dim(embedding.len())?;
+            let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(idx, column)| {
+                    *idx != vector_idx
+                        && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
+                })
+                .filter_map(|(idx, column)| {
+                    values.get(idx).map(|value| (column.name.as_str(), value))
+                })
+                .collect();
+            hash_rows.push((*id, insert_visibility, embedding, named_columns));
+        }
+        let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
+            .iter()
+            .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
+            .collect();
+
+        // `UpsertAction::DoUpdate` の右辺をハッシュ材料の最小表現へ変換する
+        // （宣言順を保持。`content_hash::UpsertHashAction::DoUpdate` が参照を
+        // 借用するため、`hash_assignments` は `match` の外側で寿命を確保する）。
+        let mut hash_assignments: Vec<(String, content_hash::UpsertAssignmentHashValue<'_>)> =
+            Vec::new();
+        if let UpsertAction::DoUpdate(assignments) = action {
+            hash_assignments
+                .try_reserve_exact(assignments.len())
+                .map_err(|_| {
+                    TenantWriteError::Storage(StorageError::Codec(
+                        "failed to reserve upsert hash assignments".to_string(),
+                    ))
+                })?;
+            for (col_idx, value) in assignments.iter() {
+                let col_name = schema
+                    .columns
+                    .get(*col_idx)
+                    .map(|c| c.name.as_str())
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "unknown SET target column index".to_string(),
+                        ))
+                    })?;
+                let hash_value = match value {
+                    UpsertSetValue::Excluded(src_idx) => {
+                        let src_name = schema
+                            .columns
+                            .get(*src_idx)
+                            .map(|c| c.name.as_str())
+                            .ok_or_else(|| {
+                                TenantWriteError::Catalog(CatalogError::Invalid(
+                                    "unknown EXCLUDED source column index".to_string(),
+                                ))
+                            })?;
+                        content_hash::UpsertAssignmentHashValue::Excluded(src_name)
+                    }
+                    UpsertSetValue::Literal(v) => {
+                        content_hash::UpsertAssignmentHashValue::Literal(v)
+                    }
+                };
+                hash_assignments.push((col_name.to_string(), hash_value));
+            }
+        }
+        let hash_action = match action {
+            UpsertAction::DoNothing => content_hash::UpsertHashAction::DoNothing,
+            UpsertAction::DoUpdate(_) => {
+                content_hash::UpsertHashAction::DoUpdate(&hash_assignments)
+            }
+        };
+        let content_hash_value = content_hash::for_typed_upsert(&hash_action, &hash_input)?;
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            &content_hash_value,
+        )?;
+
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+
+        for (id, values) in rows {
+            let key = (ctx.tenant_id(), *id);
+            // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用
+            // （`insert`）と衝突しないようにする（`update_row_unchecked` と
+            // 同じパターン）。所有権判定は `decode_row_for_key`（キー↔ヘッダ
+            // tenant 整合検査。TABLE-12）＋ `ctx.is_owner` の二重防御。
+            let existing_owned: Option<crate::storage::Row> =
+                match row_table.get(&key).map_err(CatalogError::from)? {
+                    Some(guard) => {
+                        let row =
+                            crate::storage::decode_row_for_key(ctx.tenant_id(), *id, guard.value())
+                                .map_err(TenantWriteError::Storage)?;
+                        Some(row)
+                    }
+                    None => None,
+                };
+            let owns_existing = existing_owned
+                .as_ref()
+                .map(|row| ctx.is_owner(row.tenant_id.as_str()))
+                .unwrap_or(false);
+
+            if owns_existing {
+                let existing = match existing_owned {
+                    Some(row) => row,
+                    None => {
+                        // `owns_existing` は `existing_owned.is_some()` の場合に
+                        // のみ真になり得ない（`unwrap_or(false)` の契約）ため
+                        // 到達しない。untrusted 経路の添字禁止（coding-rust.md）
+                        // に従い `unwrap` の代わりに fail-closed な内部エラーで
+                        // 閉じる。
+                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                            "internal: owns_existing without an existing row".to_string(),
+                        )));
+                    }
+                };
+                match action {
+                    UpsertAction::DoNothing => {
+                        // 変更なし（新規挿入もしない）。
+                    }
+                    UpsertAction::DoUpdate(assignments) => {
+                        // read-merge-write: 既存行のスカラー列を復元し、SET 対象
+                        // 列だけを新しい値で上書きする（宣言順を保持する必要は
+                        // ない——最終的な行内容は適用順に依存しない一意な値へ
+                        // 収束する。同一列への重複代入は `bind_upsert_assignments`
+                        // が束縛時に `22000` で拒否済み）。
+                        let mut merged_values =
+                            crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
+                                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                        let mut embedding_value: Vec<f32> = existing.embedding.clone();
+
+                        for (col_idx, value) in assignments.iter() {
+                            let new_value = match value {
+                                UpsertSetValue::Excluded(src_idx) => values
+                                    .get(*src_idx)
+                                    .cloned()
+                                    .unwrap_or(crate::row_codec::Value::Null),
+                                UpsertSetValue::Literal(v) => (*v).clone(),
+                            };
+                            if *col_idx == vector_idx {
+                                if let crate::row_codec::Value::Vector(v) = new_value {
+                                    embedding_value = v;
+                                }
+                            } else if let Some(slot) = merged_values.get_mut(*col_idx) {
+                                *slot = new_value;
+                            }
+                        }
+                        schema.validate_embedding_dim(embedding_value.len())?;
+                        let metadata =
+                            crate::row_codec::encode_scalar_columns(&schema, &merged_values)
+                                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                        let row = RowInput {
+                            tenant_id: ctx.tenant_id(),
+                            // 既存行の可視性を保持する（SET で触れない列と同じ
+                            // 扱い。新規挿入行のみ `insert_visibility` を使う）。
+                            visibility: existing.visibility,
+                            embedding: &embedding_value,
+                            metadata: &metadata,
+                        };
+                        let encoded = encode_row(&row)?;
+                        row_table
+                            .insert(key, encoded.as_slice())
+                            .map_err(CatalogError::from)?;
+                        updated = updated.checked_add(1).ok_or_else(|| {
+                            TenantWriteError::Storage(StorageError::Codec(
+                                "upsert updated row counter overflow".to_string(),
+                            ))
+                        })?;
+                    }
+                }
+            } else {
+                // 非衝突（新規挿入）。既存 `insert_typed_rows_unchecked` と同じ
+                // 組み立て。
+                let embedding: &[f32] = match values.get(vector_idx) {
+                    Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                    _ => {
+                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                            "VECTOR column value missing or not a Vector".to_string(),
+                        )))
+                    }
+                };
+                let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
+                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                let row = RowInput {
+                    tenant_id: ctx.tenant_id(),
+                    visibility: insert_visibility,
+                    embedding,
+                    metadata: &metadata,
+                };
+                let encoded = encode_row(&row)?;
+                insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+                inserted = inserted.checked_add(1).ok_or_else(|| {
+                    TenantWriteError::Storage(StorageError::Codec(
+                        "upsert inserted row counter overflow".to_string(),
+                    ))
+                })?;
+            }
+        }
+    }
+    if inserted > 0 || updated > 0 {
+        crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
+    }
+    crate::recovery::commit_boundary::commit(write_txn)?;
+    Ok(UpsertOutcome { inserted, updated })
+}
+
 /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
 ///
 /// `row.tenant_id` が `ctx` のテナントと不一致なら
