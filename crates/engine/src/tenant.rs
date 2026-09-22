@@ -1686,24 +1686,45 @@ pub(crate) fn update_row_columns_unchecked(
         // `AccessGuard` の借用はこのブロック内に閉じ込め、後続の可変借用
         // （`insert`）と衝突しないようにする（`update_row_unchecked` と同じ設計）。
         let key = (ctx.tenant_id(), id);
-        let target: Option<Row> = match row_table.get(&key).map_err(CatalogError::from)? {
-            Some(guard) => {
-                let row = crate::storage::decode_row_for_key(ctx.tenant_id(), id, guard.value())?;
-                // 判断 D: 所有者一致（TABLE-12 の名前空間キーに加える二重防御）
-                // ∩ RLS 可視集合（読み取り経路の暗黙適用・RLS-7／RLS-10 と判定を
-                // 揃える）。いずれか一方でも満たさない行は「不存在」と同一に扱う
-                // （区別しない。security.md P0）。
-                if ctx.is_owner(&row.tenant_id) && ctx.is_visible(&row.tenant_id, row.visibility) {
-                    Some(row)
-                } else {
-                    None
-                }
-            }
+        // 物理行の有無だけを判定する（テナント一致・RLS 可視性はまだ問わない）。
+        // TABLE-12 の名前空間キー（`key = (ctx.tenant_id(), id)`）により
+        // `row.tenant_id` は常に `ctx.tenant_id()` と一致する（他テナントの行は
+        // このキーでは物理的に取得できない）ため、他テナント行の混入は構造的に
+        // 起こらない。残る変数は「RLS 可視性（`is_visible`）」のみであり、これを
+        // 後段のマージ・再エンコード可否の判定に混ぜないことが本判断の核心。
+        let physical_row: Option<Row> = match row_table.get(&key).map_err(CatalogError::from)? {
+            Some(guard) => Some(crate::storage::decode_row_for_key(
+                ctx.tenant_id(),
+                id,
+                guard.value(),
+            )?),
             None => None,
         };
 
-        rows_affected = match target {
+        rows_affected = match physical_row {
             Some(row) => {
+                // 判断 D 改訂（codex-review P0 指摘・PR #989 再指摘）: マージ・
+                // 再エンコード（`encode_scalar_columns` の累計上限超過を含む）は
+                // 「物理行が存在する」ことのみを条件に**必ず**実行し、RLS 可視性
+                // （`is_visible`）では分岐させない。可視性は後述のとおり「実際に
+                // 書き込むか」だけを決める。
+                //
+                // 旧実装は `is_owner && is_visible` を満たす行だけをマージ対象
+                // にしていたため、SET 値と既存の未変更 TEXT 列を組み合わせた際の
+                // `MAX_SCALAR_PAYLOAD_LEN` 超過判定が「可視な既存行のときだけ
+                // 走る」——つまり可視な大きな既存行には `22000`、同じ SET 値を
+                // 不可視な（Private・`ctx` が `Public` のみ許可）既存行へ送ると
+                // `UPDATE 0` 成功、という応答差になり、可視性の狭い呼び出し元が
+                // 「不可視な行の中身がどれくらい大きいか」を推測できる経路になって
+                // いた（security.md「テナント境界（RLS 相当）の弱体化」）。可視・
+                // 不可視のどちらでも同一のマージ処理を通すことで、この応答差を
+                // 閉じる（実測データに依存する `MAX_SCALAR_PAYLOAD_LEN` 超過判定を
+                // 対象行の有無に関わらず静的に決定することは、`MAX_TEXT_FIELD_LEN`
+                // と `MAX_SCALAR_PAYLOAD_LEN` が同値である現行の列長上限設計では
+                // 2 列以上の `TEXT` 列を持つ任意のスキーマで事実上すべての部分
+                // 更新を拒否する退化した契約になってしまうため採用しない。
+                // 詳細は `docs/design/update-single-row.md`「判断 D」参照）。
+                //
                 // `row.metadata` は今回の UPDATE 要求ではなく、過去に書き込まれ
                 // 済みの行データである。ここでのデコード失敗はクライアント入力の
                 // 不正ではなく、ストレージ側の破損・実装不整合を示す。`CatalogError::
@@ -1717,10 +1738,21 @@ pub(crate) fn update_row_columns_unchecked(
                 // の `_` 節経由で `XX000`／`SqlSurfaceError::Internal` へ丸まり、
                 // detail はクライアントへ渡らない）を使い、正しくサーバー内部事象
                 // として分類する。
-                let mut values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                //
+                // `decode_scalar_columns`（全 `TEXT` 列を `Value::Text` へ複製）
+                // ではなく借用版 `scan_scalar_columns` を使う（codex-review P1
+                // 指摘・PR #989 再指摘: 部分 UPDATE 1 回あたり「対象行の全 `TEXT`
+                // 列を複製する decode バッファ」＋「同程度を確保する encode
+                // バッファ」という 2 重のピーク確保が発生していた）。SET 対象で
+                // ない列は `merge_encode_scalar_columns` が借用 `&str` のまま
+                // 直接書き込むため、複製されるのは SET 句の値（クライアント入力）
+                // のみに抑えられる。
+                let existing = crate::row_codec::scan_scalar_columns(&schema, &row.metadata)
                     .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
                 let mut embedding = row.embedding;
                 let mut vector_assigned = false;
+                let mut overrides: Vec<(usize, &crate::row_codec::Value)> =
+                    Vec::with_capacity(assignments.len());
                 for (idx, value) in assignments {
                     match value {
                         crate::row_codec::Value::Vector(v) => {
@@ -1728,9 +1760,7 @@ pub(crate) fn update_row_columns_unchecked(
                             vector_assigned = true;
                         }
                         other => {
-                            if let Some(slot) = values.get_mut(*idx) {
-                                *slot = other.clone();
-                            }
+                            overrides.push((*idx, other));
                         }
                     }
                 }
@@ -1742,22 +1772,32 @@ pub(crate) fn update_row_columns_unchecked(
                 if vector_assigned {
                     schema.validate_embedding_dim(embedding.len())?;
                 }
-                let metadata = crate::row_codec::encode_scalar_columns(&schema, &values)
-                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-                let row_input = RowInput {
-                    tenant_id: ctx.tenant_id(),
-                    // クライアントは `visibility` を SET 対象にできない
-                    // （`sql::parser::bind_update` が `42601` で拒否済み。判断 D）。
-                    // 既存値をそのまま維持する。
-                    visibility: row.visibility,
-                    embedding: &embedding,
-                    metadata: &metadata,
-                };
-                let encoded = encode_row(&row_input)?;
-                row_table
-                    .insert(key, encoded.as_slice())
-                    .map_err(CatalogError::from)?;
-                1
+                let metadata =
+                    crate::row_codec::merge_encode_scalar_columns(&schema, &existing, &overrides)
+                        .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                // 所有者一致は TABLE-12 の名前空間キーにより構造的に保証される
+                // （多層防御として明示検査。冒頭コメント参照）。実際に書き込むか
+                // どうかは RLS 可視性（`is_visible`）だけで決める——上記のマージ・
+                // 再エンコードは可視性に関わらず既に完了しているため、ここでの
+                // 分岐は「対象行の存在有無・エラー有無」を漏らさない。
+                if ctx.is_owner(&row.tenant_id) && ctx.is_visible(&row.tenant_id, row.visibility) {
+                    let row_input = RowInput {
+                        tenant_id: ctx.tenant_id(),
+                        // クライアントは `visibility` を SET 対象にできない
+                        // （`sql::parser::bind_update` が `42601` で拒否済み。判断 D）。
+                        // 既存値をそのまま維持する。
+                        visibility: row.visibility,
+                        embedding: &embedding,
+                        metadata: &metadata,
+                    };
+                    let encoded = encode_row(&row_input)?;
+                    row_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(CatalogError::from)?;
+                    1
+                } else {
+                    0
+                }
             }
             None => 0,
         };
@@ -3245,6 +3285,116 @@ mod tests {
             values[2],
             crate::row_codec::Value::Text("v1".to_string()),
             "row must be unchanged when the SET value is rejected before the write"
+        );
+    }
+
+    // codex-review P0 再指摘（PR #989・Issue #865）: SET 対象の TEXT 値単体は
+    // 上限内でも、対象行に既に格納されている**未変更**の TEXT 列（`body`）と
+    // 組み合わさって初めて `MAX_SCALAR_PAYLOAD_LEN` を超えるケースは、対象行の
+    // 有無に関わらず判定できる冒頭ループの範囲外であり、旧実装は
+    // `is_owner && is_visible` を満たす行だけをマージ対象にしていたため、
+    // 「対象行が可視（＝マージが走る）なら `22000`」「対象行が不可視（＝マージを
+    // スキップして 0 行更新扱い）なら `UPDATE 0`」という応答差が生じ、可視性の
+    // 狭いセッションが「不可視な行の中身が大きいかどうか」を推測できてしまって
+    // いた。本テストは、同一の実データ（同一 id・同一 SET 値・同一の既存
+    // `body`）に対し、対象行を見える `ctx`（`Private` 許可）と見えない `ctx`
+    // （`Public` のみ許可）の双方で `update_row_columns_unchecked` を呼び、
+    // いずれも**同一のエラー**（`UPDATE 0` との応答差が生じない）になることを
+    // 固定する（`docs/design/update-single-row.md`「判断 D」参照）。
+    #[test]
+    fn update_row_columns_overflow_from_unchanged_column_is_identical_regardless_of_rls_visibility()
+    {
+        let path = unique_db_path("update-columns-overflow-visibility-parity");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+
+        // `ctx_owner` は書き込み用（`insert_typed_row` は所有権のみを見るため
+        // 可視性は問わない）。行の可視性そのものは `Visibility::Private` で
+        // 固定し、読み取り側の 2 つの `ctx`（可視／不可視）で挙動を比較する。
+        let ctx_owner = PolicyContext::new("tenant-a").expect("valid tenant");
+        // `body`（未変更列）をほぼ上限一杯まで埋めておく。SET 対象の `path` は
+        // 個別には上限内でも、この未変更 `body` と組み合わせると
+        // `MAX_SCALAR_PAYLOAD_LEN` を超える大きさにする。
+        let body_len = (4 * 1024 * 1024) - 1000;
+        let large_body = "b".repeat(body_len);
+        insert_typed_row(
+            &storage,
+            "docs",
+            &ctx_owner,
+            1,
+            Visibility::Private,
+            &row_values([0.1, 0.2], "orig", &large_body),
+            &OperationId::parse("seed-overflow-visibility-parity").expect("valid operation_id"),
+        )
+        .expect("seed row");
+
+        // SET 対象（`path`、index=1）。単体では `MAX_TEXT_FIELD_LEN` を大きく
+        // 下回るが、上記 `large_body` との合算では上限を超える。
+        let set_path_text = "p".repeat(2000);
+        let assignments = [(1, crate::row_codec::Value::Text(set_path_text))];
+
+        // ケース (a): 行が見える `ctx`（`Private` 許可）。
+        let ctx_visible =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let op_visible = OperationId::parse("op-overflow-visible").expect("valid operation_id");
+        let err_visible = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &ctx_visible,
+            1,
+            &assignments,
+            LedgerWrite::Record(&op_visible),
+            None,
+        )
+        .expect_err(
+            "SET path combined with the existing large body must overflow the scalar payload cap",
+        );
+
+        // ケース (b): 同じ行だが見えない `ctx`（`Public` のみ許可・行は `Private`）。
+        let ctx_invisible = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_invisible = OperationId::parse("op-overflow-invisible").expect("valid operation_id");
+        let err_invisible = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &ctx_invisible,
+            1,
+            &assignments,
+            LedgerWrite::Record(&op_invisible),
+            None,
+        )
+        .expect_err(
+            "the same overflow must occur identically even when the row is RLS-invisible to ctx \
+             (the overflow decision must not depend on RLS visibility)",
+        );
+
+        // 可視・不可視のいずれでも同一のエラー（= 同一の判定経路）になることを
+        // 固定する。`UPDATE 0`（`Ok(0)`）に分岐していないことも
+        // `expect_err` の成功により機械的に保証される。
+        assert_eq!(format!("{err_visible:?}"), format!("{err_invisible:?}"));
+        assert!(
+            matches!(
+                &err_visible,
+                TenantWriteError::Catalog(CatalogError::Invalid(msg))
+                    if msg.contains("scalar payload length")
+            ),
+            "unexpected error shape: {err_visible:?}"
+        );
+
+        // 対象行は無変更のまま（いずれの呼び出しもマージ検証段で拒否され書き込み
+        // は発生しない）。
+        let row = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("row must still exist");
+        let values = crate::row_codec::decode_scalar_columns(&file_schema("docs"), &row.metadata)
+            .expect("decode scalar columns");
+        assert_eq!(
+            values[1],
+            crate::row_codec::Value::Text("orig".to_string()),
+            "row must be unchanged when the merged SET value is rejected before the write"
         );
     }
 

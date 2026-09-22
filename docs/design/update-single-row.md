@@ -176,16 +176,50 @@ detail 文言（`"{op} rejected: invalid row"`）に操作名を埋め込む。U
 対象行探索より前のループで検証し、SET 値自身だけで決定的に判定できる
 超過は同一の拒否へ揃えた。
 
-既知の残存差異: 個々の SET 値は上限内でも、対象行に既に格納されている
-**未変更の** `TEXT` 列（探索前は内容不明）と組み合わさって初めて
-`MAX_SCALAR_PAYLOAD_LEN` を超えるケースは、対象行探索後の
-`encode_scalar_columns` 呼び出しでのみ判明するため、対象行の有無で
-応答が分かれる余地が理論上残る（既存行の合計メタデータ長は常に
-`MAX_SCALAR_PAYLOAD_LEN` 以下という不変条件を前提にした残存幅）。
-この残差を完全に閉じるには、スキーマの `TEXT` 列数に応じた列単位の
-上限を導入する（例: `MAX_SCALAR_PAYLOAD_LEN / n_text_columns`）等の
-契約変更が必要で、INSERT 側の許容値にも影響するためオーナー判断が
-要る（フォローアップ Issue 化を推奨）。
+追記（codex-review P0 再指摘・PR #989）: 上記 2 点の対策後も、個々の SET 値は
+上限内でも、対象行に既に格納されている**未変更の** `TEXT` 列（探索前は内容
+不明）と組み合わさって初めて `MAX_SCALAR_PAYLOAD_LEN` を超えるケースは対象行
+探索後の `encode_scalar_columns`（現 `merge_encode_scalar_columns`）呼び出し
+でのみ判明するため対象行探索より前のループでは判定できない、という限界が
+残っていた。旧実装はこの判定を「`is_owner && is_visible` を満たす行だけ」を
+マージ対象にしていたため、可視な大きな既存行への SET は `22000`、同じ SET を
+不可視な（`Private`・呼び出し元 `ctx` が `Public` のみ許可）既存行へ送ると
+`UPDATE 0` 成功という応答差になり、可視性の狭いセッションが「不可視な行の
+中身がどれくらい大きいか」を推測できる経路になっていた。
+
+この残差を「探索前に対象行の有無へ関わらず静的に決定できる契約」へ変更する
+ことは、`MAX_TEXT_FIELD_LEN` と `MAX_SCALAR_PAYLOAD_LEN` が同値である現行の
+列長上限設計では、2 列以上の `TEXT` 列を持つ任意のスキーマで事実上すべての
+部分更新を拒否する退化した契約になってしまう（`TEXT` 列 1 本だけで単体が
+上限一杯まで埋まり得るため）ため採用しなかった。列単位の縮小上限
+（`MAX_SCALAR_PAYLOAD_LEN / n_text_columns` 等）は INSERT 側の許容値にも
+影響する契約変更でありオーナー判断が要るため、引き続き対象外とする。
+
+代わりに、`update_row_columns_unchecked` を「物理行が存在する（TABLE-12 の
+名前空間キーで取得できる）ことのみを条件に、RLS 可視性を問わずマージ・
+再エンコードを必ず実行し、実際に書き込むかどうかだけを `is_owner && is_visible`
+で決める」設計へ変更した。これにより、同一の実データ（同一 id・同一 SET 値・
+同一の既存未変更列）に対する応答は可視・不可視のいずれでも同一になり、
+RLS 可視性を分岐点にした推測経路は閉じる（`tenant::tests::
+update_row_columns_overflow_from_unchanged_column_is_identical_regardless_of_rls_visibility`
+で固定）。TABLE-12 の名前空間キー（`key = (ctx.tenant_id(), id)`）により
+他テナントの行はこのキーで物理的に取得できないため、「他テナント所有 id」が
+この経路で混入することは構造的に起こらない。残る唯一の観測差は「対象行が
+（可視性を問わず）物理的に存在するか否か」であり、これは全行置換 API
+（`update_row_unchecked`・`delete_row_unchecked`）が `is_owner` 単独判定で
+既に持っている「対象の有無で応答が分岐する」性質と同型の、部分マージを伴う
+書き込み API 一般に内在する限界であって RLS 可視性やテナント境界の越境では
+ない（可視性の異なる 2 セッションが同一の観測を得る）。
+
+あわせて、部分 UPDATE の実装（codex-review P1 指摘・PR #989 再指摘）は
+`decode_scalar_columns`（対象行の全 `TEXT` 列を `Value::Text` へ複製）ではなく
+借用版 `scan_scalar_columns` と、それを土台に SET 対象列だけを差し替えて
+直接エンコードする新設 `row_codec::merge_encode_scalar_columns` へ置き換えた。
+SET 対象でない列は借用 `&str` のまま `buf` へ書き込まれるため、複製される
+のは SET 句の値（クライアント入力）のみに抑えられ、「decode バッファ＋encode
+バッファ」の 2 重のピーク確保（`storage::MAX_METADATA_LEN` 上限により実際は
+両者とも 4 MiB 以下に収まるが、部分 UPDATE 1 回あたりのピークをさらに縮小
+する）を避ける。
 
 ## wire 応答: `CommandComplete` タグ
 

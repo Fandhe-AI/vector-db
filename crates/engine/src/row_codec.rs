@@ -539,6 +539,136 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
     Ok(buf)
 }
 
+/// UPDATE の列指定マージ（`crate::tenant::update_row_columns_unchecked`）専用の
+/// マージ＋再エンコード。`existing`（[`scan_scalar_columns`] が返す借用 `&str`。
+/// `VECTOR` 列・実際の `NULL` 列はいずれも `None`）を土台に、`overrides`
+/// （SET 句で上書きする列 index と値）で指定された列だけを差し替えてエンコード
+/// する。[`decode_scalar_columns`] のように SET 対象でない列を `Value::Text`
+/// （`String` への複製）へいったん変換してから [`encode_scalar_columns`] へ渡す
+/// 経路は、部分 UPDATE 1 回あたり「対象行の全 `TEXT` 列を複製する `decode` バッファ」
+/// と「同程度の出力を確保する `encode` バッファ」の 2 つのピーク確保を必要とする
+/// （codex-review P1 指摘・PR #989）。本関数は SET 対象でない列を `existing` の
+/// 借用 `&str` のまま直接 `buf` へ書き込むことで、複製されるのは SET 句の値
+/// （`overrides`。呼び出し元がクライアント入力からすでに所有している）のみに
+/// 抑え、`decode` 側のピーク確保を丸ごと避ける。累計上限検証・確保前 reserve の
+/// 規則は [`encode_scalar_columns`] と完全に同一（両者は将来の乖離を防ぐため
+/// [`scalar_text_entry_len`]／[`MAX_SCALAR_PAYLOAD_LEN`] を共有する）。
+///
+/// `existing.len()` は呼び出し元（`scan_scalar_columns`）の契約により常に
+/// `schema.columns.len()` と一致する想定だが、untrusted な格納済みデータに
+/// 由来する不変条件のため、念のため上限超過は同じ `Err` で fail-closed に拒否する。
+pub(crate) fn merge_encode_scalar_columns(
+    schema: &TableSchema,
+    existing: &[Option<&str>],
+    overrides: &[(usize, &Value)],
+) -> Result<Vec<u8>> {
+    if existing.len() > schema.columns.len() {
+        return Err(RowCodecError::Invalid(format!(
+            "too many existing values: schema has {} columns, got {}",
+            schema.columns.len(),
+            existing.len()
+        )));
+    }
+
+    // 累計上限検証・確保前 reserve は encode_scalar_columns と同一（コメントは
+    // 重複させず同関数を参照）。
+    let mut buf = Vec::new();
+    let mut total_len: u32 = 0;
+    let mut reserve = |buf: &mut Vec<u8>, additional: u32| -> Result<()> {
+        total_len = total_len
+            .checked_add(additional)
+            .ok_or_else(|| RowCodecError::Invalid("scalar payload length overflow".to_string()))?;
+        if total_len > MAX_SCALAR_PAYLOAD_LEN {
+            return Err(RowCodecError::Invalid(format!(
+                "scalar payload length {total_len} exceeds limit {MAX_SCALAR_PAYLOAD_LEN}"
+            )));
+        }
+        if buf.capacity() < total_len as usize {
+            let needed = (total_len as usize).saturating_sub(buf.len());
+            buf.try_reserve_exact(needed).map_err(|_| {
+                RowCodecError::Invalid("failed to reserve scalar payload buffer".to_string())
+            })?;
+        }
+        Ok(())
+    };
+
+    let write_text = |buf: &mut Vec<u8>,
+                      reserve: &mut dyn FnMut(&mut Vec<u8>, u32) -> Result<()>,
+                      text_bytes: &[u8]|
+     -> Result<()> {
+        let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
+            RowCodecError::Invalid(format!("text field too long: {} bytes", text_bytes.len()))
+        })?;
+        if text_len > MAX_TEXT_FIELD_LEN {
+            return Err(RowCodecError::Invalid(format!(
+                "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+            )));
+        }
+        let entry_len = scalar_text_entry_len(text_len)?;
+        reserve(buf, entry_len)?;
+        buf.push(PRESENCE_VALUE);
+        buf.extend_from_slice(&text_len.to_le_bytes());
+        buf.extend_from_slice(text_bytes);
+        Ok(())
+    };
+
+    for (idx, column) in schema.columns.iter().enumerate() {
+        if matches!(column.ty, ColumnType::Vector(_)) {
+            // VECTOR 列は encode_scalar_columns と同じくスキップ（embedding は
+            // storage.rs 側のスロットが担当。`overrides` に含まれていても無視）。
+            continue;
+        }
+        if let Some((_, value)) = overrides.iter().find(|(o_idx, _)| *o_idx == idx) {
+            // SET 対象列（クライアント入力）を書き込む。encode_scalar_columns と
+            // 同じ検証・書式。
+            match value {
+                Value::Null => {
+                    if !column.nullable {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} is not nullable but value is missing",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, 1)?;
+                    buf.push(PRESENCE_NULL);
+                }
+                Value::Text(text) => {
+                    write_text(&mut buf, &mut reserve, text.as_bytes())?;
+                }
+                Value::Vector(_) => {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Vector value, got Vector",
+                        column.name
+                    )))
+                }
+            }
+        } else {
+            // SET 対象でない列は既存の借用 `&str`（またはNULL）をそのまま書き込む。
+            // `existing` は `scan_scalar_columns` の契約により non-nullable 列で
+            // `None` になり得ないが（構造検証済み）、untrusted な格納済みデータに
+            // 由来する不変条件のため呼び出し元契約が破れた場合も fail-closed に
+            // 拒否する。
+            match existing.get(idx).copied().flatten() {
+                None => {
+                    if !column.nullable {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} is not nullable but existing value is missing",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, 1)?;
+                    buf.push(PRESENCE_NULL);
+                }
+                Some(text) => {
+                    write_text(&mut buf, &mut reserve, text.as_bytes())?;
+                }
+            }
+        }
+    }
+
+    Ok(buf)
+}
+
 /// [`encode_scalar_columns`] の構造検証のみを行う borrow 版パーサー（Issue #56
 /// レビュー指摘対応・codex P1: `sql::exec::execute_statement` の `on_visible_row` は
 /// RLS/SCALAR フィルタ列・投影に不要な列も含め毎行デコードするが、旧
