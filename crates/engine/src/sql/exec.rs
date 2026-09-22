@@ -237,6 +237,22 @@ pub struct DeleteOutcome {
     pub rows_affected: u64,
 }
 
+/// `RETURNING` 句（Issue #873・SQL-21）付き `INSERT`／`DELETE` の成功応答。
+/// `rows_affected` は既存の `InsertOutcome`／`DeleteOutcome` と同じ意味（実際に
+/// 変更した行数）で、`result.rows.len()` とは**独立**の値である——RLS 再判定
+/// （[`crate::policy::PolicyContext::is_visible`]。多層防御）で書き込み本人にも
+/// 不可視な行は `result.rows` から除外されるため、`rows.len() < rows_affected`
+/// になりうる（`PolicyContext::new`〔`Public` のみ可視〕で `Private` 行を
+/// `RETURNING` した場合など）。`CommandComplete` のタグ（`INSERT 0 <n>` 等）は
+/// 必ず `rows_affected` を使い、`result.rows.len()` を使わない
+/// （`wire-server::simple_query` 参照）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturningOutcome {
+    pub command: crate::sql::returning::DmlCommand,
+    pub rows_affected: u64,
+    pub result: QueryResult,
+}
+
 impl From<RowCodecError> for SqlSurfaceError {
     /// スカラーペイロードのデコード失敗は、格納済みデータの破損・実装バグの
     /// いずれかであり、SQL 入力自体の不正ではないため fail-closed に `XX000` へ
@@ -2600,6 +2616,69 @@ pub fn execute_delete(
     }
 }
 
+/// `RETURNING` 句（Issue #873・SQL-21）付き単一行 `DELETE`（SQL-18・TASK-191 の
+/// 唯一到達経路。述語形 `DELETE` は許可リスト段〔`sql::allowlist::
+/// validate_delete_statement_tokens`〕で `RETURNING` を一律 `42601` 拒否する
+/// ため本関数へは到達しない）の実行入口。[`execute_delete`] と同じ
+/// `tenant::delete_row_ledgered_capturing_unchecked` を `capture: Some(schema)`
+/// で呼び、削除**前**の行内容を `crate::tenant::CapturedRow`（クレート内部型）
+/// として捕捉する。
+///
+/// **RLS 再判定（多層防御）**: 捕捉行は書き込み経路（テナント名前空間キー
+/// `(tenant_id, id)`・TABLE-12）由来のため通常は `ctx` から可視だが、
+/// `ctx.is_visible(row_tenant, row_visibility)`（RLS-7・RLS-8 と同じ判定）を
+/// 再適用し、不可視の場合は `result.rows` を空にする——`rows_affected` は
+/// 実際に削除した件数のまま変えない（[`ReturningOutcome`] のドキュメント
+/// 参照）。`schema` は呼び出し元が束縛した時点のスキーマで、`tenant.rs` の
+/// TOCTOU 対策（束縛後・削除実行前のスキーマ変更検出）に使われる。
+pub fn execute_delete_returning(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundDelete,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    returning: &[crate::sql::parser::ProjectedColumn],
+    schema: &TableSchema,
+) -> Result<ReturningOutcome, SqlSurfaceError> {
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id.as_ref())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+
+    let (outcome, captured) = crate::tenant::delete_row_ledgered_capturing_unchecked(
+        storage,
+        &bound.table,
+        ctx,
+        bound.id,
+        ledger_write,
+        Some(schema),
+    )
+    .map_err(map_insert_write_error)?;
+
+    let rows_affected = match outcome {
+        crate::tenant::DeleteRowOutcome::Deleted => 1,
+        crate::tenant::DeleteRowOutcome::NotFound => 0,
+    };
+
+    let columns = crate::sql::returning::column_meta(returning, schema)?;
+    let mut rows = Vec::new();
+    if let Some(row) = captured {
+        if ctx.is_visible(&row.tenant_id, row.visibility) {
+            let mut budget = 0usize;
+            rows.push(crate::sql::returning::project_row(
+                row.id,
+                &row.values,
+                returning,
+                &mut budget,
+            )?);
+        }
+    }
+
+    Ok(ReturningOutcome {
+        command: crate::sql::returning::DmlCommand::Delete,
+        rows_affected,
+        result: QueryResult { columns, rows },
+    })
+}
+
 /// [`execute_insert`]・[`execute_insert_batch`]・[`execute_truncate`] が共有する
 /// `TenantWriteError` → `SqlSurfaceError` の写像本体（Issue #771・TASK-178・
 /// NOSQL-6 で切り出し。写像内容は切り出し前と完全に同一。TASK-195 で TRUNCATE の
@@ -2754,6 +2833,53 @@ pub(crate) fn execute_insert_batch_with_schema(
     Ok(InsertOutcome {
         rows_affected,
         incremental: None,
+    })
+}
+
+/// `RETURNING` 句（Issue #873・SQL-21）付き行形 `INSERT`（単一行・複数行
+/// `VALUES` の双方）の実行入口。ファイル形（`BoundInsertForm::File`）は
+/// 呼び出し元（`core.rs`）が束縛段で `42601` 拒否するため本関数へは到達しない
+/// 契約（サーバー側チャンク化行を返す応答形が未定義のため fail-closed）。
+/// 既存の書き込み経路（[`execute_insert_batch_with_schema`]）をそのまま通した
+/// うえで、書き込んだ値そのもの（`bounds[*].values`。既定値・トリガの類は
+/// 存在しないため常に書き込んだ値と一致する）を `RowDescription` へ再読み込み
+/// なしで投影する。
+///
+/// **RLS 再判定（多層防御）**: 挿入行の tenant は常に `ctx.tenant_id()`・
+/// visibility は常に `crate::storage::Visibility::Private` 固定
+/// （`execute_insert_with_schema` と同じ契約）のため `ctx.is_visible` は通常
+/// 常に真だが、[`execute_delete_returning`] と同じ形で再適用し判定経路を
+/// 統一する（security.md「テナント境界」多層防御方針）。
+pub fn execute_insert_returning(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bounds: &[crate::sql::parser::BoundInsert],
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    returning: &[crate::sql::parser::ProjectedColumn],
+    schema: &TableSchema,
+) -> Result<ReturningOutcome, SqlSurfaceError> {
+    let insert_outcome =
+        execute_insert_batch_with_schema(storage, ctx, bounds, ledger_mode, Some(schema))?;
+
+    let columns = crate::sql::returning::column_meta(returning, schema)?;
+    let is_visible = ctx.is_visible(ctx.tenant_id(), crate::storage::Visibility::Private);
+    let mut rows = Vec::new();
+    if is_visible {
+        let mut budget = 0usize;
+        for bound in bounds {
+            rows.push(crate::sql::returning::project_row(
+                bound.id,
+                &bound.values,
+                returning,
+                &mut budget,
+            )?);
+        }
+    }
+
+    Ok(ReturningOutcome {
+        command: crate::sql::returning::DmlCommand::Insert,
+        rows_affected: insert_outcome.rows_affected,
+        result: QueryResult { columns, rows },
     })
 }
 

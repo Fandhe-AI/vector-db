@@ -1198,7 +1198,10 @@ pub(crate) fn delete_row_unchecked(
         id,
         ledger_write,
         DeleteNotFoundLedger::Discard,
-    )? {
+        None,
+    )?
+    .0
+    {
         DeleteRowOutcome::Deleted => Ok(()),
         DeleteRowOutcome::NotFound => Err(TenantWriteError::NotFound),
     }
@@ -1227,6 +1230,18 @@ enum DeleteNotFoundLedger {
     Record,
 }
 
+/// `RETURNING` 句（Issue #873・SQL-21）向けに、削除**前**の行内容を捕捉した
+/// 結果（`delete_row_impl` の `capture` が `Some` かつ対象行を実際に削除した
+/// 場合のみ `Some`）。`sql::exec::execute_delete_returning` がこれを RLS 再判定
+/// （`PolicyContext::is_visible`）・投影へ渡す。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CapturedRow {
+    pub id: u64,
+    pub tenant_id: String,
+    pub visibility: crate::storage::Visibility,
+    pub values: Vec<crate::row_codec::Value>,
+}
+
 /// [`delete_row_unchecked`]・[`delete_row_ledgered_unchecked`] が共有する実体。
 /// `not_found_ledger` で `NotFound` 時の台帳追記の扱いのみを分岐する
 /// （それ以外の判定順序・二重防御はいずれのモードでも同一）。
@@ -1235,6 +1250,15 @@ enum DeleteNotFoundLedger {
 /// 台帳照合・追記を所有権判定（`owns_existing`）より**前**に行う（両モード共通。
 /// [`delete_row_unchecked`]・[`delete_row_ledgered_unchecked`] のドキュメント
 /// 参照）。
+///
+/// `capture`（Issue #873・SQL-21。`RETURNING` 句）: `Some(expected_schema)` の
+/// 場合のみ、`row_table.remove` の**直前**に対象行を完全デコードして
+/// [`CapturedRow`] として返す（削除前の値）。`expected_schema` は
+/// [`insert_typed_row_unchecked`] の `expected_schema` と同じ TOCTOU 対策——
+/// 呼び出し元が束縛した時点のスキーマと、本関数が write トランザクション内で
+/// 改めて取得したスキーマが不一致なら `CatalogError::Invalid`（`22000`）で
+/// 拒否する。`None`（既存の 2 呼び出し元）では捕捉を一切行わずビット同一の
+/// 挙動を保つ。
 fn delete_row_impl(
     storage: &Storage,
     table: &str,
@@ -1242,48 +1266,101 @@ fn delete_row_impl(
     id: u64,
     ledger_write: LedgerWrite<'_>,
     not_found_ledger: DeleteNotFoundLedger,
-) -> Result<DeleteRowOutcome, TenantWriteError> {
+    capture: Option<&crate::catalog::TableSchema>,
+) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     validate_identifier(table)?;
     let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
-    let owns_existing = {
-        // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
-        // `insert_row`/`update_row` と同じ前段を通す。
-        require_table_schema_write(&write_txn, table)?;
-        // 削除要求のクライアント由来の内容は id のみ（`content_hash::for_delete`
-        // ドキュメント参照）。
-        let content_hash = content_hash::for_delete(id);
-        ledger::record_in_txn(
-            &write_txn,
-            ctx.tenant_id(),
-            table,
-            ledger_write,
-            &content_hash,
-        )?;
-
-        let row_table_name = user_rows_table_name(table);
-        let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(map_row_table_error)?;
-        // `update_row` と同じく `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御。
-        let key = (ctx.tenant_id(), id);
-        let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
-            Some(guard) => {
-                let (existing_tenant, _existing_visibility) =
-                    decode_row_tenant_and_visibility(guard.value())?;
-                ctx.is_owner(existing_tenant)
+    let mut captured_row: Option<CapturedRow> = None;
+    let owns_existing =
+        {
+            // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
+            // `insert_row`/`update_row` と同じ前段を通す。
+            let schema = require_table_schema_write(&write_txn, table)?;
+            if let Some(expected) = capture {
+                if expected != &schema {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "table schema changed after the delete was bound".to_string(),
+                    )));
+                }
             }
-            None => false,
+            // 削除要求のクライアント由来の内容は id のみ（`content_hash::for_delete`
+            // ドキュメント参照）。
+            let content_hash = content_hash::for_delete(id);
+            ledger::record_in_txn(
+                &write_txn,
+                ctx.tenant_id(),
+                table,
+                ledger_write,
+                &content_hash,
+            )?;
+
+            let row_table_name = user_rows_table_name(table);
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(map_row_table_error)?;
+            // `update_row` と同じく `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御。
+            let key = (ctx.tenant_id(), id);
+            let owns_existing =
+                match row_table.get(&key).map_err(CatalogError::from)? {
+                    Some(guard) => {
+                        let (existing_tenant, _existing_visibility) =
+                            decode_row_tenant_and_visibility(guard.value())?;
+                        let owns = ctx.is_owner(existing_tenant);
+                        if owns && capture.is_some() {
+                            // `remove` の直前・同一 `guard` 生存期間内にフルデコードする
+                            // （削除後では対象バイト列が失われるため）。物理行フォーマット
+                            // は `storage.rs::decode_row`（`ROW_FORMAT_VERSION`。tenant_id・
+                            // visibility・embedding・不透明な `metadata` バイト列を持つ）で
+                            // あり、`row_codec::decode_row`（別バージョン・別フォーマット。
+                            // 本モジュールの通常の書き込み経路では使われない）ではない。
+                            // `metadata` は `row_codec::decode_scalar_columns` で
+                            // `schema.columns` 順の `Value` 列へ変換する（`VECTOR` 列の位置は
+                            // 常に `Value::Null` を返す契約——`sql::scan` の同じ規約参照）
+                            // ため、`VECTOR` 列位置だけは `Row::embedding` を明示的に
+                            // 差し替える（`dim == 0`／embedding 空は列が NULL である
+                            // 既存契約のため差し替えない）。`StorageError`／`RowCodecError`
+                            // は「既に永続化された行のデコード失敗」＝クライアント入力の
+                            // 不正ではなくサーバー内部事象として扱う（`map_insert_write_error`
+                            // が他の内部事象と同じ fail-closed 経路へ丸め込む）。
+                            let row = crate::storage::decode_row(id, guard.value())
+                                .map_err(TenantWriteError::Storage)?;
+                            let mut values =
+                                crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                                    .map_err(|e| {
+                                        TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                                            "captured row decode failed: {e}"
+                                        )))
+                                    })?;
+                            if !row.embedding.is_empty() {
+                                if let Some(vec_idx) = schema.columns.iter().position(|c| {
+                                    matches!(c.ty, crate::catalog::ColumnType::Vector(_))
+                                }) {
+                                    if let Some(slot) = values.get_mut(vec_idx) {
+                                        *slot = crate::row_codec::Value::Vector(row.embedding);
+                                    }
+                                }
+                            }
+                            captured_row = Some(CapturedRow {
+                                id,
+                                tenant_id: row.tenant_id,
+                                visibility: row.visibility,
+                                values,
+                            });
+                        }
+                        owns
+                    }
+                    None => false,
+                };
+            if owns_existing {
+                row_table.remove(&key).map_err(CatalogError::from)?;
+            } else if not_found_ledger == DeleteNotFoundLedger::Discard {
+                // 台帳への tentative 追記はこの早期 `return` により `write_txn` が
+                // commit されず破棄されるため、副作用として残らない
+                // （[`delete_row_unchecked`] のドキュメント参照）。
+                return Err(TenantWriteError::NotFound);
+            }
+            owns_existing
         };
-        if owns_existing {
-            row_table.remove(&key).map_err(CatalogError::from)?;
-        } else if not_found_ledger == DeleteNotFoundLedger::Discard {
-            // 台帳への tentative 追記はこの早期 `return` により `write_txn` が
-            // commit されず破棄されるため、副作用として残らない
-            // （[`delete_row_unchecked`] のドキュメント参照）。
-            return Err(TenantWriteError::NotFound);
-        }
-        owns_existing
-    };
     if owns_existing {
         crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     }
@@ -1291,11 +1368,12 @@ fn delete_row_impl(
     // する（台帳の tentative 追記のみを確定させる。テーブル世代は進行させない
     // ため既存のキャッシュ失効契約に影響しない）。
     crate::recovery::commit_boundary::commit(write_txn)?;
-    Ok(if owns_existing {
+    let outcome = if owns_existing {
         DeleteRowOutcome::Deleted
     } else {
         DeleteRowOutcome::NotFound
-    })
+    };
+    Ok((outcome, captured_row))
 }
 
 /// SQL 表層 `DELETE FROM <table> WHERE id = <n> USING OPERATION_ID '<id>'`
@@ -1332,6 +1410,23 @@ pub(crate) fn delete_row_ledgered_unchecked(
     id: u64,
     ledger_write: LedgerWrite<'_>,
 ) -> Result<DeleteRowOutcome, TenantWriteError> {
+    delete_row_ledgered_capturing_unchecked(storage, table, ctx, id, ledger_write, None)
+        .map(|(outcome, _)| outcome)
+}
+
+/// [`delete_row_ledgered_unchecked`] の捕捉版（Issue #873・SQL-21。`RETURNING`
+/// 句）。`capture`（束縛時スキーマ）が `Some` の場合のみ削除前の行内容を
+/// [`CapturedRow`] として返す（[`delete_row_impl`] の `capture` ドキュメント
+/// 参照）。`sql::exec::execute_delete_returning` の唯一の到達経路。
+/// `capture: None` を渡すと [`delete_row_ledgered_unchecked`] とビット同一。
+pub(crate) fn delete_row_ledgered_capturing_unchecked(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    ledger_write: LedgerWrite<'_>,
+    capture: Option<&crate::catalog::TableSchema>,
+) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     delete_row_impl(
         storage,
         table,
@@ -1339,6 +1434,7 @@ pub(crate) fn delete_row_ledgered_unchecked(
         id,
         ledger_write,
         DeleteNotFoundLedger::Record,
+        capture,
     )
 }
 

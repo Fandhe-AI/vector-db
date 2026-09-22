@@ -2008,7 +2008,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Explain(_)
                     | crate::sql::SqlOutcome::Insert(_)
                     | crate::sql::SqlOutcome::Truncate(_)
-                    | crate::sql::SqlOutcome::Delete(_) => {
+                    | crate::sql::SqlOutcome::Delete(_)
+                    | crate::sql::SqlOutcome::Returning(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -2033,7 +2034,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Explain(_)
                     | crate::sql::SqlOutcome::Insert(_)
                     | crate::sql::SqlOutcome::Truncate(_)
-                    | crate::sql::SqlOutcome::Delete(_) => {
+                    | crate::sql::SqlOutcome::Delete(_)
+                    | crate::sql::SqlOutcome::Returning(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -2055,7 +2057,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Explain(_)
                     | crate::sql::SqlOutcome::Insert(_)
                     | crate::sql::SqlOutcome::Truncate(_)
-                    | crate::sql::SqlOutcome::Delete(_) => {
+                    | crate::sql::SqlOutcome::Delete(_)
+                    | crate::sql::SqlOutcome::Returning(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -2173,6 +2176,14 @@ impl EngineCore {
                     &lookup,
                     self.ledger_mode,
                 )?;
+                // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路
+                // 専用（`execute_insert_sql`／`execute_insert_sql_batch` は
+                // 検証直後に `42601` で拒否する。`Self` モジュールドキュメント
+                // 参照）。
+                if stmt.returning.is_some() {
+                    let outcome = self.execute_insert_returning_form(ctx, &stmt, &lookup)?;
+                    return Ok(crate::sql::SqlOutcome::Returning(outcome));
+                }
                 let outcome = self.execute_insert_form(ctx, &stmt, &lookup)?;
                 return Ok(crate::sql::SqlOutcome::Insert(outcome));
             }
@@ -2215,6 +2226,13 @@ impl EngineCore {
                     &self.storage,
                     self.ledger_mode,
                 )?;
+                // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路
+                // 専用（`execute_delete_sql` は検証直後に `42601` で拒否する。
+                // `Self` モジュールドキュメント参照）。
+                if stmt.returning.is_some() {
+                    let outcome = self.execute_delete_returning_form(ctx, &stmt)?;
+                    return Ok(crate::sql::SqlOutcome::Returning(outcome));
+                }
                 let outcome = self.execute_delete_form(ctx, &stmt)?;
                 return Ok(crate::sql::SqlOutcome::Delete(outcome));
             }
@@ -3775,6 +3793,17 @@ impl EngineCore {
         // execute_sql_in_session` の INSERT 分岐と共有し二重実装を避けるため）。
         let lookup = InsertSchemaLookup::new(&self.storage);
         let stmt = crate::sql::allowlist::validate_insert(sql, &lookup, self.ledger_mode)?;
+        // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路
+        // （[`Self::execute_sql_in_session`]）専用。本エントリポイントは
+        // `SqlOutcome` を持たず戻り値型が `InsertOutcome` 固定のため、
+        // `RowDescription`／結果行を運べない——構文検証直後・書き込み
+        // トランザクション開始前（`execute_insert_form` 呼び出し前）に
+        // `42601` で拒否し、台帳を一切消費しない（fail-closed）。
+        if stmt.returning.is_some() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                "RETURNING requires the session-aware entry point",
+            ));
+        }
         self.execute_insert_form(ctx, &stmt, &lookup)
     }
 
@@ -3864,6 +3893,79 @@ impl EngineCore {
         }
     }
 
+    /// [`Self::execute_sql_in_session`] の `RETURNING` 付き `INSERT`（Issue #873・
+    /// SQL-21）分岐が呼ぶ実行本体。`execute_insert_form` と同じスキーマ取得
+    /// （`InsertSchemaLookup::take_schema` 優先・フォールバック `get_table_schema`）
+    /// を経てから `sql::parser::bind_returning`・`bind_insert_form` を束縛する。
+    /// ファイル形（`BoundInsertForm::File`）は呼び出し元がサーバー側チャンク化
+    /// 行を返す応答形を持たないため `42601` で拒否する（fail-closed。行形
+    /// （単一行・複数行 `VALUES`）のみ [`crate::sql::exec::execute_insert_returning`]
+    /// へ委譲する）。`stmt.returning` は呼び出し元が `Some` であることを検証
+    /// 済みの前提（`is_none()` は `Internal` として拒否）。
+    fn execute_insert_returning_form(
+        &self,
+        ctx: &PolicyContext,
+        stmt: &crate::sql::allowlist::ValidatedInsert,
+        lookup: &InsertSchemaLookup<'_>,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let schema = match lookup.take_schema(&stmt.table_name) {
+            Some(schema) => schema,
+            None => self
+                .storage
+                .get_table_schema(&stmt.table_name)
+                .map_err(|e| match e {
+                    CatalogError::TableNotFound(name) => {
+                        crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                    }
+                    _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "failed to load table schema".to_string(),
+                    },
+                })?,
+        };
+        let returning = crate::sql::parser::bind_returning(stmt.returning.as_ref(), &schema)?
+            .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "execute_insert_returning_form called without RETURNING".to_string(),
+            })?;
+        let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
+        match bound {
+            crate::sql::parser::BoundInsertForm::Row(bound) => {
+                crate::sql::exec::execute_insert_returning(
+                    &self.storage,
+                    ctx,
+                    std::slice::from_ref(&bound),
+                    self.ledger_mode,
+                    &returning,
+                    &schema,
+                )
+            }
+            crate::sql::parser::BoundInsertForm::RowBatch(bounds) => {
+                if bounds.len() > self.batch_limits.max_files_per_batch {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                        crate::batch_limits::BatchLimitsError::TooManyFiles {
+                            count: bounds.len(),
+                            max: self.batch_limits.max_files_per_batch,
+                        }
+                        .to_string(),
+                    ));
+                }
+                self.validate_insert_batch_byte_and_chunk_limits(&bounds)?;
+                crate::sql::exec::execute_insert_returning(
+                    &self.storage,
+                    ctx,
+                    &bounds,
+                    self.ledger_mode,
+                    &returning,
+                    &schema,
+                )
+            }
+            crate::sql::parser::BoundInsertForm::File(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "RETURNING is not supported for file-form INSERT (path/body columns)",
+                ))
+            }
+        }
+    }
+
     /// SQL 表層の単一 TRUNCATE 文実行エントリポイント（TASK-195、対象ビヘイビア:
     /// SQL-22）。`execute_insert_sql` と同じ構造（`execute_sql`（TASK-75、SELECT
     /// 専用）とは独立した固有メソッド。`VectorCore` trait への昇格は行わない）。
@@ -3910,6 +4012,13 @@ impl EngineCore {
         sql: &str,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let stmt = crate::sql::allowlist::validate_delete(sql, &self.storage, self.ledger_mode)?;
+        // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路専用
+        // （`execute_insert_sql` と同じ理由・同じ判定順序）。
+        if stmt.returning.is_some() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                "RETURNING requires the session-aware entry point",
+            ));
+        }
         self.execute_delete_form(ctx, &stmt)
     }
 
@@ -3926,6 +4035,43 @@ impl EngineCore {
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let bound = crate::sql::parser::bind_delete(stmt)?;
         crate::sql::exec::execute_delete(&self.storage, ctx, &bound, self.ledger_mode)
+    }
+
+    /// [`Self::execute_sql_in_session`] の `RETURNING` 付き単一行 `DELETE`
+    /// （Issue #873・SQL-21）分岐が呼ぶ実行本体。DELETE は元々スキーマ非依存
+    /// （`id` 疑似列以外を参照しない。`execute_delete_form` ドキュメント参照）
+    /// だが、`RETURNING` の投影束縛・削除前捕捉行の TOCTOU 対策のためここで
+    /// 初めてスキーマを取得する。`stmt.returning` は呼び出し元が `Some` で
+    /// あることを検証済みの前提（`is_none()` は `Internal` として拒否）。
+    fn execute_delete_returning_form(
+        &self,
+        ctx: &PolicyContext,
+        stmt: &crate::sql::allowlist::ValidatedDelete,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let schema = self
+            .storage
+            .get_table_schema(&stmt.table_name)
+            .map_err(|e| match e {
+                CatalogError::TableNotFound(name) => {
+                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                }
+                _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "failed to load table schema".to_string(),
+                },
+            })?;
+        let returning = crate::sql::parser::bind_returning(stmt.returning.as_ref(), &schema)?
+            .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "execute_delete_returning_form called without RETURNING".to_string(),
+            })?;
+        let bound = crate::sql::parser::bind_delete(stmt)?;
+        crate::sql::exec::execute_delete_returning(
+            &self.storage,
+            ctx,
+            &bound,
+            self.ledger_mode,
+            &returning,
+            &schema,
+        )
     }
 
     /// SQL 表層のバッチ INSERT 実行エントリポイント（TASK-122、対象ビヘイビア:
@@ -4039,6 +4185,16 @@ impl EngineCore {
             // 起こらない）。
             let lookup = InsertSchemaLookup::new(&self.storage);
             let stmt = crate::sql::allowlist::validate_insert(sql, &lookup, self.ledger_mode)?;
+            // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路専用
+            // （`execute_insert_sql` と同じ理由）。本エントリポイントはファイル形
+            // 専用のバッチ投入であり、`RETURNING` はいずれにせよファイル形では
+            // 未対応（サーバー側チャンク化行を返す応答形が未定義）のため、
+            // 束縛より前に一律 `42601` で拒否する。
+            if stmt.returning.is_some() {
+                return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "RETURNING requires the session-aware entry point",
+                ));
+            }
             let schema = match lookup.take_schema(&stmt.table_name) {
                 Some(schema) => schema,
                 None => self

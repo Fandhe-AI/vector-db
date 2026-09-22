@@ -159,10 +159,17 @@ delete_shares_ledger_key_space_with_insert` が以下を固定する:
 NOSQL-9）に `delete` は含まれない。NoSQL 側への `delete` op 追加は別 Issue
 （#875・#876）の担当。
 
+## `RETURNING` 句（実装済み）
+
+単一行・`id` 完全一致形 `DELETE` は `RETURNING <投影>` を `WHERE` 句の直後・
+`USING OPERATION_ID` 句の直前に置ける（Issue #873・SQL-21。実行結線は
+`sql::exec::execute_delete_returning`）。詳細は `docs/design/sql-returning.md`
+参照。述語つき `DELETE`（本 doc の管轄）は引き続き `RETURNING` を受理しない
+（下記「対象外」参照）。
+
 ## 対象外（申し送り）
 
 - NoSQL `delete` op・SQL/NoSQL パリティ検証（#875・#876・#877）
-- `RETURNING` 句（#873）
 - 述語つき `DELETE ... WHERE <非 id 述語>`（#870・#871）
 - 複数行 `operation_id` 設計（#868）
 - 層 B の 3 クライアント e2e（`extended_syntax_e2e.rs`）への `DELETE` 追加

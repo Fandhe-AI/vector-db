@@ -1,0 +1,170 @@
+//! `INSERT`／`DELETE`（単一行）の `RETURNING` 句（Issue #873・SQL-21）の投影・
+//! 行組み立てを担う。`RETURNING` が返す行は「その文が書き込んだ（削除前の）
+//! 値」そのものであり、`sql::scan`／`sql::exec` の SELECT 経路が行う
+//! redb 走査・RLS 述語評価は経由しない——呼び出し元（`sql::exec::
+//! execute_insert_returning`／`execute_delete_returning`）が既に確定させた
+//! `(id, values)` を、`SELECT` の投影束縛（`sql::parser::bind_projection`）と
+//! 同じ列解決規則（実カラム優先・疑似列 `id`）で `sql::exec::QueryResult` へ
+//! 写像するだけの薄い層とする（第 2 の投影実装を作らない）。
+
+use crate::catalog::TableSchema;
+use crate::row_codec::Value;
+use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::exec::{Cell, ColumnMeta, ResultRow};
+use crate::sql::parser::ProjectedColumn;
+
+/// 結果セット全体（テキスト・ベクトル各セルの複製バイト量の合計）の累計上限。
+/// `sql::scan::MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と
+/// 同じ定数（[`crate::arena::MAX_ARENA_TOTAL_BYTES`]）を流用し、確保前に検証する
+/// （security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
+pub(crate) const MAX_RETURNING_RESULT_BYTES: usize = crate::arena::MAX_ARENA_TOTAL_BYTES;
+
+/// `RETURNING` を持ちうる DML の種別。`wire-server::simple_query` が
+/// `CommandComplete` タグ（`INSERT 0 <n>`／`DELETE <n>`／`UPDATE <n>`）を
+/// 組み立てる際の接頭辞選択に使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmlCommand {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl DmlCommand {
+    /// pg 互換の `CommandComplete` タグ接頭辞。
+    pub fn tag_prefix(self) -> &'static str {
+        match self {
+            DmlCommand::Insert => "INSERT",
+            DmlCommand::Update => "UPDATE",
+            DmlCommand::Delete => "DELETE",
+        }
+    }
+}
+
+/// `current` に `add` を加えた累計が `cap` を超えないことを確保前に検証する
+/// （`sql::scan`・`sql::exec` の同名ヘルパーと同方針）。
+fn try_accumulate_budget(current: usize, add: usize, cap: usize) -> Result<usize, SqlSurfaceError> {
+    let next = current.saturating_add(add);
+    if next > cap {
+        return Err(SqlSurfaceError::payload_too_large(
+            "RETURNING result exceeds capacity",
+        ));
+    }
+    Ok(next)
+}
+
+/// テキストセルの選択的複製（累計バイト量を確保前に検証。`try_reserve_exact`
+/// によりホスト側メモリ不足時も abort ではなく `Err` を返す）。
+fn try_alloc_text_for_budget(
+    text: &str,
+    budget: &mut usize,
+    cap: usize,
+) -> Result<String, SqlSurfaceError> {
+    *budget = try_accumulate_budget(*budget, text.len(), cap)?;
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(text.len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve RETURNING text field: {e}"),
+        })?;
+    owned.push_str(text);
+    Ok(owned)
+}
+
+/// ベクトルセルの選択的複製（累計バイト量を確保前に検証。上記テキスト版と同方針）。
+fn try_clone_vector_for_budget(
+    vector: &[f32],
+    budget: &mut usize,
+    cap: usize,
+) -> Result<Vec<f32>, SqlSurfaceError> {
+    let bytes = vector.len().saturating_mul(std::mem::size_of::<f32>());
+    *budget = try_accumulate_budget(*budget, bytes, cap)?;
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(vector.len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve RETURNING vector field: {e}"),
+        })?;
+    owned.extend_from_slice(vector);
+    Ok(owned)
+}
+
+/// 型不整合・実装バグの検出用（untrusted 入力起因ではないため `wire_code` は
+/// `XX000`。`sql::scan::scan_bug` と同方針）。`RETURNING` の投影は
+/// `sql::parser::bind_returning` が `Computed`（式項目）を構造的に排除した
+/// うえで返すため、通常はここへ到達しない契約だが、多層防御として
+/// fail-closed に扱う。
+fn returning_bug(detail: &str) -> SqlSurfaceError {
+    SqlSurfaceError::Internal {
+        detail: format!("RETURNING projection mismatch: {detail}"),
+    }
+}
+
+/// 投影列メタデータ（`RowDescription` 相当）を組み立てる（`sql::scan` の同名
+/// 処理と同じ規則）。
+pub(crate) fn column_meta(
+    projection: &[ProjectedColumn],
+    schema: &TableSchema,
+) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+    projection
+        .iter()
+        .map(|col| match col {
+            ProjectedColumn::Id => Ok(ColumnMeta::Id),
+            ProjectedColumn::Column { index, name } => {
+                let ty = schema
+                    .columns
+                    .get(*index)
+                    .map(|c| c.ty)
+                    .ok_or_else(|| returning_bug("projected column index out of range"))?;
+                Ok(ColumnMeta::Scalar {
+                    name: name.clone(),
+                    ty,
+                })
+            }
+            ProjectedColumn::Computed { .. } => {
+                Err(returning_bug("computed projection items are not supported"))
+            }
+        })
+        .collect()
+}
+
+/// 1 行分の投影（`id`・スキーマ列順の `values`）を [`ResultRow`] へ写像する。
+/// `values` は `schema.columns` の列順に対応する必要がある（`sql::exec::
+/// BoundInsert::values`・`row_codec::DecodedRow::values` のいずれも同一契約）。
+/// `score` は検索結果ではないため常に `0.0`（`sql::scan::execute_scan` と同じ
+/// 「順序を持たない結果セット」の扱い）。
+pub(crate) fn project_row(
+    id: u64,
+    values: &[Value],
+    projection: &[ProjectedColumn],
+    budget: &mut usize,
+) -> Result<ResultRow, SqlSurfaceError> {
+    let mut cells = Vec::with_capacity(projection.len());
+    for col in projection {
+        let cell = match col {
+            ProjectedColumn::Id => Cell::Integer(id),
+            ProjectedColumn::Column { index, .. } => match values.get(*index) {
+                Some(Value::Null) => Cell::Null,
+                Some(Value::Text(s)) => Cell::Text(try_alloc_text_for_budget(
+                    s,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
+                Some(Value::Vector(v)) => Cell::Vector(try_clone_vector_for_budget(
+                    v,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
+                None => return Err(returning_bug("value index out of range")),
+            },
+            ProjectedColumn::Computed { .. } => {
+                return Err(returning_bug("computed projection items are not supported"));
+            }
+        };
+        cells.push(cell);
+    }
+    Ok(ResultRow {
+        id,
+        score: 0.0,
+        cells,
+    })
+}

@@ -399,6 +399,36 @@ pub fn bind_column_projection(
     )
 }
 
+/// `RETURNING` 句（Issue #873・SQL-21）の投影束縛。`INSERT`／`DELETE`（単一行）が
+/// 実行結線済みのため、`sql::allowlist::ValidatedInsert::returning`／
+/// `sql::allowlist::ValidatedDelete::returning` の `Option<Projection>` を
+/// [`bind_column_projection`] と同じ [`bind_projection`] へ委譲する（第 2 の
+/// 投影実装を作らない）。UDF レジストリを持たないため `Projection::Items`
+/// （関数呼び出し項目）は多層防御として `42601` で拒否する——`sql::allowlist::
+/// Parser::parse_returning_clause` が構造検証段で既に同じ判定を行っており、
+/// 通常はここへ到達しない契約。
+pub fn bind_returning(
+    returning: Option<&Projection>,
+    schema: &TableSchema,
+) -> Result<Option<Vec<ProjectedColumn>>, SqlSurfaceError> {
+    let Some(projection) = returning else {
+        return Ok(None);
+    };
+    if matches!(projection, Projection::Items(_)) {
+        return Err(SqlSurfaceError::unsupported(
+            "RETURNING does not support function-call items",
+        ));
+    }
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    bind_projection(
+        projection,
+        schema,
+        &crate::sql::udf_call::UdfRegistry::default(),
+        &mut node_budget,
+    )
+    .map(Some)
+}
+
 /// NoSQL 表層（Issue #763・TASK-175・NOSQL-2）向けのベクトル値束縛ヘルパー。
 /// `search.vector`（JSON 数値配列）の各要素を呼び出し元が
 /// `engine::json::JsonNumber::as_f32`（SQL 表層 [`parse_vector_literal`] と
@@ -3016,6 +3046,7 @@ mod tests {
             table_name: "documents".to_string(),
             id_literal: "18446744073709551616".to_string(),
             operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+            returning: None,
         };
         let err = bind_delete(&stmt).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
@@ -3030,6 +3061,7 @@ mod tests {
             table_name: "documents".to_string(),
             id_literal: "1.5".to_string(),
             operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+            returning: None,
         };
         let err = bind_delete(&stmt).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
