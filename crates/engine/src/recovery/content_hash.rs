@@ -92,6 +92,7 @@ enum OpTag {
     Update = 3,
     Delete = 4,
     ReplaceByTextKey = 5,
+    Truncate = 6,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -469,6 +470,18 @@ pub(crate) fn for_delete(id: u64) -> ContentHash {
 /// ドキュメント参照: `ALTER TABLE ADD COLUMN` を挟むと同一クライアント要求の
 /// 再送でも配列幅・位置がずれる）。呼び出し元 `tenant::replace_typed_rows_by_text_key`
 /// が現在のスキーマから（列名, 値）ペアへ変換して渡す。
+/// `truncate_table_unchecked`（SQL-22。`TRUNCATE TABLE <table> USING
+/// OPERATION_ID '<id>'`）用。入力: なし（台帳キー自体が `(tenant, table,
+/// operation_id)` でテーブル名を既に一意に識別しており、TRUNCATE 要求は
+/// クライアント由来の可変フィールドをテーブル名以外に持たないため、他の
+/// `for_*` と異なり本体に何も追記しない。同一 `operation_id` への TRUNCATE
+/// 再送は常に内容一致となり `23505`（`DuplicateOperationId`）に収束する
+/// （`22023` は構造的に到達不能だが、他操作と同じハッシュ機構を再利用することで
+/// 台帳照合の実装を一貫させる）。
+pub(crate) fn for_truncate() -> ContentHash {
+    HashInputBuilder::new(OpTag::Truncate).finish()
+}
+
 pub(crate) fn for_replace_by_text_key(
     key_column: &str,
     key_value: &str,
@@ -899,6 +912,15 @@ mod tests {
     fn for_delete_is_deterministic_and_differs_by_id() {
         assert_eq!(for_delete(1), for_delete(1));
         assert_ne!(for_delete(1), for_delete(2));
+    }
+
+    // for_truncate は入力を持たないため常に同一値を返す（決定性の固定）。
+    // OpTag が異なる for_delete とはハッシュが一致しないことも合わせて固定する
+    // （ドメイン分離タグ・OpTag のみで区別できることの確認）。
+    #[test]
+    fn for_truncate_is_deterministic_and_differs_from_other_ops() {
+        assert_eq!(for_truncate(), for_truncate());
+        assert_ne!(for_truncate(), for_delete(1));
     }
 
     // for_replace_by_text_key はクライアント要求由来の body/template_values の

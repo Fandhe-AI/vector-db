@@ -14,9 +14,10 @@
 //!   explain_reports_hnsw_engine_and_full_visible_ann_plan` と同型の構成を
 //!   4 エンジン分へ拡張する）
 //! - R5: RLS 相当のテナント境界が選択エンジンによらず不変であること
-//!   （3 テナント・`Public`/`Private` 混在コーパスで `Private` 行の非漏えい・
-//!   3 テナントの可視結果一致・HNSW opt-in 3 種は非 vacuous な索引構築
-//!   （`hnsw_index_cache_stats()`）まで固定する）
+//!   （3 テナント・`Public`/`Private` 混在コーパスで、他テナントの `Private`
+//!   行の非漏えい・自テナントの `Private` 行の可視（RLS-11・TASK-195・
+//!   read-your-writes）・3 テナントの Public 可視結果一致・HNSW opt-in 3 種は
+//!   非 vacuous な索引構築（`hnsw_index_cache_stats()`）まで固定する）
 //!
 //! Issue #657（フィルタ付き ANN の探索パラメータ opt-in 露出）分:
 //!
@@ -335,9 +336,11 @@ fn rls_boundary_holds_with_hnsw_tuning_opt_in() {
 ///
 /// 3 テナント × `Public`（コーパス）+ 各テナント固有の `Private` 行を投入し、
 /// フィルタなし `DISTANCE` クエリが選択エンジン・チューニングによらず
-/// (a) `Private` 行を一切返さない、(b) 3 テナントの可視結果が一致する、
-/// (c) HNSW opt-in 3 種は索引が実際に構築される（非 vacuous。build 失敗 0・
-/// 自動縮退カウンタ 0）ことを固定する。
+/// (a) 他テナントの `Private` 行を一切返さない一方、自テナントの `Private`
+/// 行は可視である（RLS-11・TASK-195・read-your-writes）、(b) 3 テナントの
+/// Public 可視結果（各自の Private 行を除く）が一致する、(c) HNSW opt-in
+/// 3 種は索引が実際に構築される（非 vacuous。build 失敗 0・自動縮退
+/// カウンタ 0）ことを固定する。
 ///
 /// 行数は `sql::hnsw_cache` の非公開下限 `MIN_INDEXED_ROWS`（Issue #408。
 /// `docs/design/hnsw-generation-cache.md` 参照。ここでは数値を転記せず、本
@@ -376,8 +379,14 @@ fn run_rls_boundary_check(token: &str, tuning: HnswTuning) {
                     .expect("valid tenant");
             for i in 0..ROWS_PER_TENANT {
                 // Public 行は最近傍から少し外れたベクトルにする（id によって
-                // 角度をずらす決定的分布。クエリと厳密一致しない）。
-                let angle = (i as f32) * 0.001 + 0.01;
+                // 角度をずらす決定的分布。クエリと厳密一致しない）。基準角度は
+                // 0.3 rad（cos 距離 ≈ 0.045）とし、距離 0 の自テナント
+                // `Private` 行（RLS-11・TASK-195・read-your-writes）との差を
+                // ANN（HNSW opt-in）の量子化誤差より十分大きく取ることで、
+                // 自テナント Private 行が常に厳密な最近傍（rank 0）になる
+                // ことをエンジン非依存で保証する（僅差の近傍点で ANN の
+                // 近似探索・タイブレークが競合し得る領域を避ける）。
+                let angle = (i as f32) * 0.001 + 0.3;
                 let vec = vec![angle.cos(), angle.sin(), 0.0, 0.0];
                 let op_id =
                     OperationId::parse(&format!("seed-{tenant}-{i}")).expect("valid operation_id");
@@ -436,33 +445,41 @@ fn run_rls_boundary_check(token: &str, tuning: HnswTuning) {
             result_sets.push(ids);
         }
 
-        // (a) Private 行の id（`next_id` の各テナント最終行）が他テナントの
-        // 結果に混入していないこと。自分自身の Private 行 id も、可視集合が
-        // 3 テナントとも同一（(b)）である以上ここには現れないはずだが、念の
-        // ため個別にも固定する: この fixture の Public 行は角度を故意に
-        // ずらしてあり、クエリと厳密一致する Private 行だけが真の最近傍の
-        // ため、いずれのテナントの LIMIT 20 にも Private id は出現しない
-        // （全テナント同一の Public プールからのみ選ばれる）。
+        // (a) 他テナントの Private 行 id（`next_id` の各テナント最終行）が
+        // 自テナント以外の結果に混入していないこと。RLS-11・TASK-195 により
+        // 各テナント自身の Private 行（クエリと厳密一致・距離 0）は自分の
+        // 結果に可視である（read-your-writes）。Public 行の基準角度（0.3 rad）
+        // は量子化誤差より十分大きく取ってあるため、自テナント Private 行は
+        // エンジン（ANN opt-in 含む）によらず常に厳密な最近傍（rank 0）になる。
         let private_ids: Vec<u64> = (1..=3).map(|k| k * (ROWS_PER_TENANT + 1)).collect();
         for (idx, ids) in result_sets.iter().enumerate() {
+            let own_private_id = private_ids[idx];
             for id_str in ids {
                 let id: u64 = id_str.parse().expect("numeric id");
-                assert!(
-                    !private_ids.contains(&id),
-                    "token={token} tenant_idx={idx}: private row id {id} leaked into results"
-                );
+                if private_ids.contains(&id) {
+                    assert_eq!(
+                        id, own_private_id,
+                        "token={token} tenant_idx={idx}: other tenant's private row id {id} leaked into results"
+                    );
+                }
             }
+            assert_eq!(
+                ids.first().map(String::as_str),
+                Some(own_private_id.to_string().as_str()),
+                "token={token} tenant_idx={idx}: own-tenant Private row (id={own_private_id}) must rank first via read-your-writes, got {ids:?}"
+            );
         }
 
-        // (b) 3 テナントの可視集合（Public 行のみ）は完全一致するため、
-        // 同一クエリに対する結果 id 列も一致する。
+        // (b) 3 テナントの Public 可視集合は完全一致するため、各自の Private
+        // 行（rank 0）を除いた残り 19 件は同一クエリに対して一致する。
+        let public_tail: Vec<&[String]> = result_sets.iter().map(|ids| &ids[1..]).collect();
         assert_eq!(
-            result_sets[0], result_sets[1],
-            "token={token}: tenant alice/bob result mismatch"
+            public_tail[0], public_tail[1],
+            "token={token}: tenant alice/bob Public-only result mismatch"
         );
         assert_eq!(
-            result_sets[1], result_sets[2],
-            "token={token}: tenant bob/carol result mismatch"
+            public_tail[1], public_tail[2],
+            "token={token}: tenant bob/carol Public-only result mismatch"
         );
 
         // (c) HNSW opt-in 3 種は非 vacuous（索引が実際に構築され、構築失敗・

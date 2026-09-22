@@ -211,6 +211,14 @@ pub struct InsertOutcome {
     pub incremental: Option<crate::incremental::IndexOutcome>,
 }
 
+/// `EngineCore::execute_truncate_sql` の成功応答（SQL-22、TASK-195）。削除件数を
+/// 一切返さない契約（SQL-22。自テナント件数であっても再送側が件数推定に使えない
+/// ようにする設計）を型で表現する固定タグのみの応答。フィールドを持たないが、
+/// 将来の拡張余地を残すため `#[non_exhaustive]` にする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct TruncateOutcome {}
+
 impl From<RowCodecError> for SqlSurfaceError {
     /// スカラーペイロードのデコード失敗は、格納済みデータの破損・実装バグの
     /// いずれかであり、SQL 入力自体の不正ではないため fail-closed に `XX000` へ
@@ -2495,9 +2503,38 @@ pub(crate) fn execute_insert_with_schema(
     })
 }
 
-/// [`execute_insert`]・[`execute_insert_batch`] が共有する
+/// SQL 表層 `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`
+/// （SQL-22、TASK-195）の実行入口。`validated`（`sql::allowlist::validate_truncate`
+/// 済み構造）の `operation_id` を `ledger_mode` で台帳書き込み指示へ解決してから
+/// [`crate::tenant::truncate_table_unchecked`] へ委譲する（[`execute_insert`] と
+/// 同じ設計）。
+///
+/// `LedgerMode::Ledgered`（既定）で `operation_id` が `None` の場合は `resolve` が
+/// `Err` を返し [`SqlSurfaceError::MissingOperationId`]（`23502`）へ写像される——
+/// SQL 表層経由（`core.rs`）では `sql::allowlist::validate_truncate` の事前検査が
+/// 同じ判定を本関数の呼び出し前に既に行っているため通常は到達しないが、
+/// `execute_insert` と同じく本関数単体でも fail-closed を保つ。
+pub fn execute_truncate(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    validated: &crate::sql::allowlist::ValidatedTruncate,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+) -> Result<TruncateOutcome, SqlSurfaceError> {
+    let ledger_write = ledger_mode
+        .resolve(validated.operation_id.as_ref())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+
+    crate::tenant::truncate_table_unchecked(storage, &validated.table_name, ctx, ledger_write)
+        .map_err(map_insert_write_error)?;
+
+    Ok(TruncateOutcome {})
+}
+
+/// [`execute_insert`]・[`execute_insert_batch`]・[`execute_truncate`] が共有する
 /// `TenantWriteError` → `SqlSurfaceError` の写像本体（Issue #771・TASK-178・
-/// NOSQL-6 で切り出し。写像内容は切り出し前と完全に同一）。
+/// NOSQL-6 で切り出し。写像内容は切り出し前と完全に同一。TASK-195 で TRUNCATE の
+/// 書き込み経路も同じ写像を再利用する——`TenantWriteError` の variant 集合は
+/// `insert`／`truncate` で共通のため、専用の写像本体は追加しない）。
 fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError {
     use crate::catalog::CatalogError;
     use crate::storage::StorageError;
