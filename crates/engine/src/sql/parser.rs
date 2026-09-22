@@ -17,8 +17,8 @@
 use crate::catalog::{ColumnType, TableSchema};
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
-    FunctionArg, InsertLiteral, OrderByForm, Projection, ValidatedInsert, ValidatedStatement,
-    WherePredicate,
+    FunctionArg, InsertLiteral, OrderByForm, Projection, ValidatedDelete, ValidatedInsert,
+    ValidatedStatement, WherePredicate,
 };
 use crate::sql::plan::EvaluationOrder;
 use crate::sql::udf_call::Expr;
@@ -233,6 +233,22 @@ pub struct BoundInsert {
     /// `LedgerMode::Ledgered`（既定）では `sql::allowlist::validate_insert` が既に
     /// `None` を `23502` で拒否済みのため常に `Some`。`CompareOnlyWithoutLedger`
     /// でのみ `None` になり得る。
+    pub operation_id: Option<OperationId>,
+}
+
+/// 束縛済みの単一行・`id` 指定形 `DELETE` 文（SQL-18・TASK-191。#867 が
+/// `EngineCore::delete_row`〔既存の RLS 可視集合判定・`operation_id` ガード
+/// 込みの Rust API〕へ渡す入力形）。`BoundInsert` と異なり `values`／列型情報
+/// を持たない（`DELETE` は `id` 以外の列を参照しないため）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundDelete {
+    pub table: String,
+    pub id: u64,
+    /// TASK-92（RECOVER-1）: `ValidatedDelete.operation_id` をそのまま
+    /// 素通しする。`LedgerMode::Ledgered`（既定）では
+    /// `sql::allowlist::validate_delete` が既に `None` を `23502` で
+    /// 拒否済みのため常に `Some`。`CompareOnlyWithoutLedger` でのみ
+    /// `None` になり得る。
     pub operation_id: Option<OperationId>,
 }
 
@@ -779,6 +795,24 @@ pub fn bind_in_session(
         limit,
         mode: resolved_mode,
         evaluation_order: stmt.evaluation_order,
+    })
+}
+
+/// [`ValidatedDelete`] を意味論的に束縛する（SQL-18・TASK-191 の公開 API）。
+/// `id` 疑似列の値を `u64` として解釈する以外に検証すべき列・型情報を
+/// 持たないため、`bind_insert` と異なり `TableSchema` を引数に取らない
+/// （`DELETE` は `id` 以外のスキーマ実列を一切参照しない）。
+///
+/// 検出する違反: `id` 値が `u64` として解釈不能（範囲外を含む。`22000`）。
+pub fn bind_delete(stmt: &ValidatedDelete) -> Result<BoundDelete, SqlSurfaceError> {
+    let id: u64 = stmt.id_literal.parse().map_err(|_| {
+        SqlSurfaceError::invalid_input(format!("malformed id value: {}", stmt.id_literal))
+    })?;
+
+    Ok(BoundDelete {
+        table: stmt.table_name.clone(),
+        id,
+        operation_id: stmt.operation_id.clone(),
     })
 }
 
@@ -2623,6 +2657,61 @@ mod tests {
             "INSERT INTO documents (id, id) VALUES (1, 2) USING OPERATION_ID 'op-0001'",
         )
         .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- bind_delete（SQL-18、TASK-191） ----------------------------------------
+
+    fn bind_delete_sql(sql: &str) -> Result<BoundDelete, SqlSurfaceError> {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_delete(
+            sql,
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+        bind_delete(&stmt)
+    }
+
+    #[test]
+    fn bind_delete_accepts_valid_id() {
+        let bound =
+            bind_delete_sql("DELETE FROM documents WHERE id = 1 USING OPERATION_ID 'op-0001'")
+                .expect("bind_delete should succeed");
+        assert_eq!(bound.table, "documents");
+        assert_eq!(bound.id, 1);
+        assert_eq!(
+            bound.operation_id.as_ref().map(OperationId::as_str),
+            Some("op-0001")
+        );
+    }
+
+    #[test]
+    fn bind_delete_rejects_id_overflowing_u64() {
+        // 構文解析（`expect_number`）は桁数を制限しないため、`u64` の範囲外は
+        // bind 段で明示的に検出する必要がある（許可リストを直接構築して固定）。
+        let stmt = ValidatedDelete {
+            table_name: "documents".to_string(),
+            id_literal: "18446744073709551616".to_string(),
+            operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+        };
+        let err = bind_delete(&stmt).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_delete_rejects_decimal_id() {
+        // 構文解析は `WHERE id = 1.5` の小数形を `Token::Number("1.5")` として
+        // 通過させうる（字句解析は小数を数値として許容するため）。`u64` への
+        // 解釈不能は bind 段で明示的に拒否する。
+        let stmt = ValidatedDelete {
+            table_name: "documents".to_string(),
+            id_literal: "1.5".to_string(),
+            operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+        };
+        let err = bind_delete(&stmt).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
     }
 

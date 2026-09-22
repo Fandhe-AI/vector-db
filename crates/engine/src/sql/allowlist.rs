@@ -901,6 +901,29 @@ pub struct ValidatedInsert {
     pub operation_id: Option<OperationId>,
 }
 
+/// 許可形状の構造判定を通過した単一行・`id` 指定形 `DELETE` 文（SQL-18・
+/// TASK-191）。`ValidatedInsert` と同様、本モジュールが保証するのはここまでの
+/// 構造情報のみで、`id` 値の意味論的妥当性（`u64` として解釈可能か）は
+/// `sql::parser::bind_delete` の責務とする。
+///
+/// 受理する形は `DELETE FROM <table> WHERE id = <number>
+/// USING OPERATION_ID '<id>' [;]` の単一行・`id` 等価指定形のみ（`id` 以外の
+/// 列に対する述語・`AND` 結合・`WHERE` 省略は許可リスト外。述語つき `DELETE`
+/// は別 Issue の管轄）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedDelete {
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    pub table_name: String,
+    /// `WHERE id = <n>` の `<n>`（`Token::Number` の生文字列）。`u64` への
+    /// 意味論的解釈は `sql::parser::bind_delete` の責務。
+    pub id_literal: String,
+    /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
+    /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。`validate_delete` は
+    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
+    /// 開始前に `23502` で拒否するため、この構成では常に `Some`。
+    pub operation_id: Option<OperationId>,
+}
+
 /// 許可形状の構造判定を通過した TRUNCATE 文（SQL-22、TASK-195）。テーブル定義
 /// （カタログ）は残したまま、セッションのテナントが所有する全行を削除する
 /// 書き込み系操作（DDL ではない）として扱う。
@@ -1770,6 +1793,35 @@ impl<'a> Parser<'a> {
         Ok(values)
     }
 
+    /// `DELETE FROM <table> WHERE id = <number> USING OPERATION_ID '<id>' [;]`
+    /// の単一行・`id` 指定形のみを受理する（SQL-18・TASK-191）。`WHERE` 句の
+    /// 省略・`id` 以外の列への述語・`AND` 結合・`=` 以外の比較演算子はいずれも
+    /// 許可リスト外として構造的に拒否する（述語つき `DELETE` は別 Issue の管轄。
+    /// 汎用 `parse_where` は意図的に再利用しない）。
+    fn parse_delete(&mut self) -> Result<ParsedDeleteShape, SqlSurfaceError> {
+        self.expect_contextual_keyword("DELETE")?;
+        self.expect_keyword(Keyword::From)?;
+        let table_name = self.expect_ident()?;
+
+        self.expect_keyword(Keyword::Where)?;
+        let column = self.expect_ident()?;
+        if column != "id" {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "DELETE WHERE clause must target the id pseudo-column, got {column:?}"
+            )));
+        }
+        self.expect_punct('=')?;
+        let id_literal = self.expect_number()?;
+
+        let operation_id = self.parse_operation_id_clause()?;
+
+        Ok(ParsedDeleteShape {
+            table_name,
+            id_literal,
+            operation_id,
+        })
+    }
+
     /// `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE id = <n>
     /// USING OPERATION_ID '<id>' [;]` の単一行・id 指定形のみを受理する
     /// （SQL-17、TASK-191）。述語形 WHERE（`lang = 'ja'` 等）・複数テーブル・
@@ -2400,6 +2452,59 @@ struct ParsedInsertShape {
     columns: Vec<String>,
     rows: Vec<Vec<InsertLiteral>>,
     operation_id: Option<OperationId>,
+}
+
+/// 構文木（[`ValidatedDelete`] の元）。カタログ存在確認前の中間結果（SQL-18・
+/// TASK-191）。
+struct ParsedDeleteShape {
+    table_name: String,
+    id_literal: String,
+    operation_id: Option<OperationId>,
+}
+
+/// `DELETE` 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を通じて
+/// FROM テーブルがカタログに実在するかを確認する（SQL-18・TASK-191 の公開 API）。
+/// `validate_sql`（SELECT 系専用）・`validate_insert` とは独立した
+/// エントリポイントとする（`operation_id` 必須化ガードをカタログ照会より前に
+/// 評価する必要があるため。[`validate_insert`] のドキュメント参照）。
+///
+/// 検証順序は決定的（同一入力には常に同一の [`SqlSurfaceError`] を返す）:
+/// 構造検証 → `operation_id` 必須化ガード（`mode.require`。TASK-92・RECOVER-1）
+/// → FROM テーブルのカタログ存在確認。
+pub fn validate_delete(
+    sql: &str,
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<ValidatedDelete, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_delete_tokens(&tokens, lookup, mode)
+}
+
+/// [`validate_delete`] の本体。トークン列を受け取ることで、呼び出し元
+/// （#867 が結線する `core.rs::execute_sql_in_session` 相当）が既に先頭
+/// トークン判定のためにトークナイズ済みの場合、同一 SQL 文字列の再
+/// トークナイズを避けられる（`validate_insert_tokens`／Issue #485 と同じ設計）。
+pub(crate) fn validate_delete_tokens(
+    tokens: &[lexer::Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<ValidatedDelete, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let shape = p.parse_delete()?;
+    p.expect_end_of_statement()?;
+
+    mode.require(shape.operation_id.as_ref())?;
+
+    let exists = lookup.table_exists(&shape.table_name)?;
+    if !exists {
+        return Err(SqlSurfaceError::undefined_table(shape.table_name));
+    }
+
+    Ok(ValidatedDelete {
+        table_name: shape.table_name,
+        id_literal: shape.id_literal,
+        operation_id: shape.operation_id,
+    })
 }
 
 /// INSERT 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を通じて
@@ -3416,6 +3521,250 @@ mod tests {
         )
         .expect_err("control character must still be rejected");
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- validate_delete（SQL-18、TASK-191） -----------------------------------
+
+    #[test]
+    fn accepts_delete_with_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete(
+            "DELETE FROM documents WHERE id = 1 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("basic DELETE shape should be accepted");
+        assert_eq!(stmt.table_name, "documents");
+        assert_eq!(stmt.id_literal, "1");
+        assert_eq!(
+            stmt.operation_id.as_ref().map(OperationId::as_str),
+            Some("op-0001")
+        );
+    }
+
+    #[test]
+    fn accepts_delete_with_trailing_semicolon() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_delete(
+            "DELETE FROM documents WHERE id = 1 USING OPERATION_ID 'op-0001';",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_delete_missing_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents WHERE id = 1",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("missing clause must be rejected");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn rejects_delete_with_explicit_null_operation_id() {
+        // 明示 `NULL` は句の欠落と同様に扱う（TASK-92・RECOVER-1）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents WHERE id = 1 USING OPERATION_ID NULL",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("explicit NULL must be rejected as missing");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn rejects_delete_with_explicit_null_operation_id_case_insensitive() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents WHERE id = 1 USING OPERATION_ID null",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("lowercase null must be rejected as missing");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn explicit_null_operation_id_does_not_reach_catalog_lookup_for_delete() {
+        struct FlaggingCatalog {
+            called: std::cell::Cell<bool>,
+        }
+        impl TableLookup for FlaggingCatalog {
+            fn table_exists(&self, _name: &str) -> Result<bool, SqlSurfaceError> {
+                self.called.set(true);
+                Ok(true)
+            }
+        }
+        let lookup = FlaggingCatalog {
+            called: std::cell::Cell::new(false),
+        };
+        let err = validate_delete(
+            "DELETE FROM nope WHERE id = 1 USING OPERATION_ID NULL",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "23502");
+        assert!(
+            !lookup.called.get(),
+            "catalog lookup must not be reached before the operation_id clause is validated"
+        );
+    }
+
+    #[test]
+    fn rejects_delete_with_empty_operation_id_value() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents WHERE id = 1 USING OPERATION_ID ''",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("empty value must be rejected as missing");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn rejects_delete_operation_id_dollar_placeholder() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents WHERE id = 1 USING OPERATION_ID $1",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("$n placeholder must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_operation_id_non_string_value() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents WHERE id = 1 USING OPERATION_ID 123",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("non-string value must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_with_duplicate_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents WHERE id = 1 USING OPERATION_ID 'a' USING OPERATION_ID 'b'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("duplicate clause must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn compare_only_without_ledger_accepts_missing_operation_id_clause_for_delete() {
+        // サーバー構成のみが必須化の可否を決める（TASK-92・RECOVER-1）:
+        // `CompareOnlyWithoutLedger` では句の省略を許す。
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete(
+            "DELETE FROM documents WHERE id = 1",
+            &lookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect("compare-only mode must not require operation_id");
+        assert_eq!(stmt.operation_id, None);
+    }
+
+    #[test]
+    fn rejects_delete_undefined_table() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM ghost WHERE id = 1 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("undefined table must be rejected");
+        assert_eq!(err.wire_code(), "42P01");
+    }
+
+    #[test]
+    fn rejects_delete_without_where_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("DELETE without WHERE must be rejected (full-table delete is out of scope)");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_with_and_predicate() {
+        // 述語つき DELETE（`id` 以外の列・`AND` 結合）は別 Issue の管轄。
+        // ここで受理範囲を広げないことを固定する。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents WHERE id = 1 AND lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("AND-combined predicate must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_with_non_id_column() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("non-id predicate column must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_with_string_id_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents WHERE id = '1' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("string id literal must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_delete_with_negative_id_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_delete(
+            "DELETE FROM documents WHERE id = -1 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("negative id literal must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn validate_sql_still_rejects_delete_statement() {
+        // #867 が dispatch を結線するまで DELETE は `execute_sql_in_session`
+        // 相当の SELECT/SET 専用エントリポイント（`validate_sql`）経由では
+        // 実行できないことを明示的に固定する（現状維持の確認）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "DELETE FROM documents WHERE id = 1 USING OPERATION_ID 'op-0001'",
+            &lookup,
+        )
+        .expect_err("validate_sql must not accept DELETE statements yet");
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
