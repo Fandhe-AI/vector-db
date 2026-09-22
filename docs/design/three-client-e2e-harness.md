@@ -595,7 +595,7 @@ submodule 追随は PR #951。
   `PolicyContext` が `Public` ＋ 自テナントの `Private` へ拡張されたことに
   伴い、層 B の seed／期待値（`three_client_e2e.rs`・
   `extended_syntax_e2e.rs`・`three_client_http_e2e.rs`）が「own Private
-  行を含む」前提へ更新された（Issue #974・PR #980）。詳細は後述
+  行を含む」前提へ更新された（Issue #974・PR #980）。詳細は前述
   「Issue #878: wire セッションの可視性非対称と DML の相互作用
   （判断記録）」節参照。
 
@@ -620,7 +620,7 @@ submodule 追随は PR #951。
   `wire1_three_tenant_visibility_public_shared_own_private_visible`
   へ改名。契約固定テストは
   `wire1_insert_is_accepted_and_row_is_visible_over_wire_select_to_own_tenant`
-  も参照）。詳細は後述「Issue #878: wire セッションの可視性非対称と
+  も参照）。詳細は前述「Issue #878: wire セッションの可視性非対称と
   DML の相互作用（判断記録）」節参照
 - `EXPLAIN` 応答での実効モード・指定元の可視化（SQL-12 が SQL-6 と併せて
   期待する項目）: engine に `EXPLAIN` 自体が未実装のため対象外（SQL-6 の
