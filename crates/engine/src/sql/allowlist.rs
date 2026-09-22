@@ -1878,6 +1878,17 @@ impl<'a> Parser<'a> {
     /// `Parser::expect_end_of_statement`（呼び出し元 [`parse_delete_statement_shape`]
     /// 等と同じ、本メソッドの直接の呼び出し元 [`Parser::parse_insert`] が最終的に
     /// 委ねる契約）が `42601` で拒否する。
+    ///
+    /// `id` は列識別子であり `ON`/`CONFLICT`/`DO`/`EXCLUDED`（文脈的キーワード。
+    /// `eq_ignore_ascii_case` で判定）とは扱いが異なる。本 SQL 表層の字句解析は
+    /// 識別子を大文字小文字保存のまま字句化し（`sql/lexer.rs` は識別子の
+    /// 正規化を行わない）、列名解決（`schema.columns.iter().position(|c| &c.name
+    /// == name)`。`sql/parser.rs`）・単一行 `DELETE`/`UPDATE` の `id` 指定形
+    /// （[`Self::peek_single_row_delete_id`]・[`Self::parse_update_where`]）を含む
+    /// SQL 表層全体で識別子は一貫して大文字小文字を区別する。したがって
+    /// `ON CONFLICT (ID)` / `(Id)` は実在しない列名として `42601` になる
+    /// （キーワードの大文字小文字非依存と矛盾しない、識別子側の既定契約
+    /// どおりの挙動）。
     fn parse_on_conflict_clause(&mut self) -> Result<Option<OnConflictAction>, SqlSurfaceError> {
         if !self.peek_contextual_keyword("ON") {
             return Ok(None);
@@ -3943,6 +3954,23 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_target_column_with_mismatched_case() {
+        // `id` は列識別子であり、`ON`/`CONFLICT`/`DO` のような文脈的キーワード
+        // ではない（大文字小文字保存・区別。`parse_on_conflict_clause` の
+        // ドキュメンテーションコメント参照。cursor(Bugbot) 指摘
+        // https://github.com/Fandhe-AI/vector-db/pull/990#discussion_r4075151521）。
+        let lookup = catalog_with(&["documents"]);
+        for target in ["ID", "Id"] {
+            let sql = format!(
+                "INSERT INTO documents (id) VALUES (1) ON CONFLICT ({target}) DO NOTHING \
+                 USING OPERATION_ID 'op-upsert-case'"
+            );
+            let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
+            assert_eq!(err.wire_code(), "42601");
+        }
     }
 
     #[test]
