@@ -2670,16 +2670,22 @@ fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError
 }
 
 /// [`execute_insert`]・[`execute_insert_batch`]・[`execute_truncate`]・
-/// [`execute_update`] が共有する `TenantWriteError` → `SqlSurfaceError` の写像
-/// 本体（Issue #771・TASK-178・NOSQL-6 で切り出し、Issue #865 で `op` を追加
-/// パラメータ化した。`TenantWriteError::Catalog(CatalogError::Invalid(_))` /
-/// `TenantWriteError::Storage(StorageError::Codec(_))` アームの detail 文言
+/// [`execute_update`]・[`execute_delete`] が共有する `TenantWriteError` →
+/// `SqlSurfaceError` の写像本体（Issue #771・TASK-178・NOSQL-6 で切り出し、
+/// Issue #865 で `op` を追加パラメータ化した。`TenantWriteError::
+/// Catalog(CatalogError::Invalid(_))` / `TenantWriteError::
+/// Storage(StorageError::Codec(_))` アームの detail 文言
 /// （`"{op} rejected: invalid row"`）に呼び出し元の操作名を埋め込む点のみが
 /// 変更点で、`wire_code` 自体は不変。UPDATE の既存行デコード失敗・列値の不正
-/// （TEXT の `MAX_TEXT_FIELD_LEN` 超過等）を「insert が拒否された」という誤った
-/// 文言でクライアントへ返さないための変更（`client_message()` はこの detail を
-/// そのまま含める）。呼び出し元ごとに専用の写像本体は追加しない
-/// （`TenantWriteError` の variant 集合は insert／update／truncate で共通のため）。
+/// （TEXT の `MAX_TEXT_FIELD_LEN` 超過等）・DELETE の失敗を「insert が拒否
+/// された」という誤った文言でクライアントへ返さないための変更（`client_message()`
+/// はこの detail をそのまま含める）。呼び出し元ごとに専用の写像本体は追加しない
+/// （`TenantWriteError` の variant 集合は insert／update／truncate／delete で
+/// 共通のため）。`execute_truncate` は本 Issue のスコープ外のため引き続き
+/// `map_insert_write_error`（固定文言 `"insert"`）を呼んでおり、TRUNCATE 失敗時の
+/// detail が `"insert rejected"`／`"insert failed"` になる既存の不整合は本 PR
+/// 時点でも未解消のまま残る（新規のリグレッションではない。是正は別 Issue の
+/// 担当）。
 fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlSurfaceError {
     use crate::catalog::CatalogError;
     use crate::storage::StorageError;
