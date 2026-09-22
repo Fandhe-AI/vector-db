@@ -96,6 +96,7 @@ enum OpTag {
     /// `tenant::upsert_typed_rows_unchecked` 用（SQL-20・TASK-193、Issue #872）。
     /// [`for_typed_upsert`] ドキュメント参照。
     Upsert = 7,
+    UpdateColumns = 8,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -544,6 +545,44 @@ pub(crate) fn for_delete(id: u64) -> ContentHash {
     let mut b = HashInputBuilder::new(OpTag::Delete);
     b.push_u64(id);
     b.finish()
+}
+
+/// `tenant::update_row_columns_unchecked` 用（Issue #865・SQL-17・TASK-191。
+/// 部分更新 `UPDATE <table> SET <col> = <lit>[, ...] WHERE id = <n>` の実行結線が
+/// 使う専用ハッシュ。既存の [`for_update_encoded`]（`update_row_unchecked` が使う
+/// 全行置換 API 向け。マージ後の行全体を対象）とは意図的に別 [`OpTag`] を持たせる
+/// （ドメイン分離。同一 `operation_id` を全行置換 UPDATE と部分更新 UPDATE の
+/// 双方で使い回した場合に、内容が実質同じでも異なる操作として `22023` へ倒す）。
+///
+/// 入力はクライアント要求由来の内容のみ（DB の現在状態＝マージ後の行内容には
+/// 依存しない。本モジュールドキュメント「正規化の方針」参照）: `id` と、SET 句に
+/// 書かれた（列名, 値）ペア列を **宣言順のまま**（呼び出し元は並べ替えない）連結
+/// する。列の位置ではなく名前で連結する理由・`Value::Null` 列の扱いは
+/// [`push_named_scalar_columns`] と共有する（`ALTER TABLE ADD COLUMN` 耐性）。
+///
+/// 行境界の曖昧性回避（[`for_typed_insert_batch`] と同じ理由）: 本関数は 1 回の
+/// 呼び出しで 1 行分の SET 句しか扱わないため複数行の境界問題は生じないが、
+/// SET 句の列**数**（`Value::Null` 除外後）を先頭にプレフィクスすることで、将来
+/// `SET col = NULL` を許容する変更が入った場合でも [`push_named_scalar_columns`]
+/// の「末尾まで連結するだけ」の形式が列挙順・列数のいずれについても一意に復元
+/// できる状態を維持する（[`for_typed_insert_batch`] の行ごとの列数プレフィクスと
+/// 同じ設計）。
+pub(crate) fn for_update_columns(
+    id: u64,
+    columns: &[(&str, &Value)],
+) -> Result<ContentHash, StorageError> {
+    let mut b = HashInputBuilder::new(OpTag::UpdateColumns);
+    b.push_u64(id);
+    let non_null_columns = columns
+        .iter()
+        .filter(|(_, value)| !matches!(value, Value::Null))
+        .count();
+    let non_null_columns = u32::try_from(non_null_columns).map_err(|_| {
+        StorageError::Codec("content hash update column count too large".to_string())
+    })?;
+    b.push_raw(&non_null_columns.to_le_bytes());
+    push_named_scalar_columns(&mut b, columns)?;
+    Ok(b.finish())
 }
 
 /// `replace_typed_rows_by_text_key`（ファイル形 `INSERT` の置換経路）用（TASK-101
@@ -1346,6 +1385,98 @@ mod tests {
         let h_new = for_update_encoded(3, &encoded).expect("hash");
         let h_ref = for_update(3, &row).expect("hash");
         assert_eq!(h_new, h_ref);
+    }
+
+    // --- for_update_columns（Issue #865・SQL-17・TASK-191） --------------------
+
+    #[test]
+    fn for_update_columns_is_deterministic() {
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang)];
+        assert_eq!(
+            for_update_columns(1, &cols).expect("hash"),
+            for_update_columns(1, &cols).expect("hash")
+        );
+    }
+
+    #[test]
+    fn for_update_columns_differs_by_id() {
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang)];
+        assert_ne!(
+            for_update_columns(1, &cols).expect("hash"),
+            for_update_columns(2, &cols).expect("hash")
+        );
+    }
+
+    #[test]
+    fn for_update_columns_differs_by_value() {
+        let ja = Value::Text("ja".to_string());
+        let en = Value::Text("en".to_string());
+        let cols_ja: [(&str, &Value); 1] = [("lang", &ja)];
+        let cols_en: [(&str, &Value); 1] = [("lang", &en)];
+        assert_ne!(
+            for_update_columns(1, &cols_ja).expect("hash"),
+            for_update_columns(1, &cols_en).expect("hash")
+        );
+    }
+
+    #[test]
+    fn for_update_columns_differs_by_declared_order() {
+        let a = Value::Text("a".to_string());
+        let b = Value::Text("b".to_string());
+        let forward: [(&str, &Value); 2] = [("col_a", &a), ("col_b", &b)];
+        let reversed: [(&str, &Value); 2] = [("col_b", &b), ("col_a", &a)];
+        assert_ne!(
+            for_update_columns(1, &forward).expect("hash"),
+            for_update_columns(1, &reversed).expect("hash")
+        );
+    }
+
+    // Vector 列を含む SET も同じ経路で受理できることを確認する（判断 C）。
+    #[test]
+    fn for_update_columns_accepts_vector_values() {
+        let vec_a: Value = Value::Vector(vec![1.0, 2.0]);
+        let vec_b: Value = Value::Vector(vec![1.0, 2.5]);
+        let cols_a: [(&str, &Value); 1] = [("embedding", &vec_a)];
+        let cols_b: [(&str, &Value); 1] = [("embedding", &vec_b)];
+        assert_ne!(
+            for_update_columns(1, &cols_a).expect("hash"),
+            for_update_columns(1, &cols_b).expect("hash")
+        );
+    }
+
+    // 専用 OpTag（UpdateColumns）を持つため、同じ id・同種の列名付きペアでも
+    // 既存の Update（全行置換・`for_update_encoded`）・Insert とはハッシュが
+    // 一致しない（ドメイン分離。判断 C）。
+    #[test]
+    fn for_update_columns_differs_from_other_op_tags() {
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang)];
+        let h_update_columns = for_update_columns(1, &cols).expect("hash");
+
+        let h_update = for_update_encoded(1, b"unrelated-encoded-row").expect("hash");
+        assert_ne!(h_update_columns, h_update);
+
+        let h_insert = for_typed_insert(1, Visibility::Private, &[], &cols).expect("hash");
+        assert_ne!(h_update_columns, h_insert);
+    }
+
+    // 列数プレフィクスにより、列境界の再解釈（異なる列数・並びが同一バイト列へ
+    // 還元される事故）が起きないことを固定する（`for_typed_insert_batch_rejects_row_boundary_reinterpretation`
+    // と同種の回帰テスト）。
+    #[test]
+    fn for_update_columns_null_valued_columns_are_excluded_from_the_count_prefix() {
+        let non_null = Value::Text("x".to_string());
+        let null = Value::Null;
+        let with_null: [(&str, &Value); 2] = [("a", &non_null), ("b", &null)];
+        let without_null: [(&str, &Value); 1] = [("a", &non_null)];
+        // NULL 列は push_named_scalar_columns が除外するため、列数プレフィクス・
+        // ハッシュ入力とも NULL 列を含まない形と一致する。
+        assert_eq!(
+            for_update_columns(1, &with_null).expect("hash"),
+            for_update_columns(1, &without_null).expect("hash")
+        );
     }
 
     // Issue #399 受け入れ 2: ストリーミング版（本番経路 `for_insert_batch_encoded`）と
