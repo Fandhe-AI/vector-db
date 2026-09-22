@@ -1040,7 +1040,7 @@ pub(crate) fn insert_typed_rows_unchecked(
 /// [`upsert_typed_rows_unchecked`] の `DO UPDATE SET` 右辺（SQL-20・TASK-193、
 /// Issue #872）。`sql::parser::BoundUpsertValue` に対応する最小表現（本モジュールは
 /// `sql` に依存しない設計を維持するため独自 enum を持つ。`upsert_typed_rows_
-/// unchecked` の呼び出し元〔`sql::exec::execute_upsert_with_schema`〕が
+/// unchecked` の呼び出し元〔`sql::exec::execute_upsert`〕が
 /// `BoundUpsertValue` から変換する）。
 pub(crate) enum UpsertSetValue<'a> {
     /// 新規挿入しようとした行（`upsert_typed_rows_unchecked` の呼び出し元の
@@ -1314,18 +1314,48 @@ pub(crate) fn upsert_typed_rows_unchecked(
                         let mut embedding_value: Vec<f32> = existing.embedding.clone();
 
                         for (col_idx, value) in assignments.iter() {
+                            // `src_idx`／`col_idx` は束縛時点のスキーマ（`bind_upsert_assignments`）
+                            // が `schema.columns` に対して検証済みの位置インデックスであり、
+                            // `expected_schema` 照合（`Some` の場合。呼び出し元
+                            // `sql::exec::execute_upsert` ドキュメント参照）によって
+                            // 本 write トランザクション内の `schema` と一致することが
+                            // 保証されている。したがって範囲外・型不一致はいずれも
+                            // 到達しないはずの内部不変条件違反であり、値を黙って
+                            // `Null` へ差し替えたり SET を無視したりせず fail-closed に
+                            // 拒否する（cursor bugbot 指摘・PR #990。黙って無視すると
+                            // `updated` カウント・テーブル世代だけが進み、実際には
+                            // 適用されなかった SET が適用されたかのような不整合が
+                            // 生じる）。
                             let new_value = match value {
-                                UpsertSetValue::Excluded(src_idx) => values
-                                    .get(*src_idx)
-                                    .cloned()
-                                    .unwrap_or(crate::row_codec::Value::Null),
+                                UpsertSetValue::Excluded(src_idx) => {
+                                    values.get(*src_idx).cloned().ok_or_else(|| {
+                                        CatalogError::Invalid(
+                                            "internal: EXCLUDED source column index out of range"
+                                                .to_string(),
+                                        )
+                                    })?
+                                }
                                 UpsertSetValue::Literal(v) => (*v).clone(),
                             };
                             if *col_idx == vector_idx {
-                                if let crate::row_codec::Value::Vector(v) = new_value {
-                                    embedding_value = v;
+                                match new_value {
+                                    crate::row_codec::Value::Vector(v) => embedding_value = v,
+                                    _ => {
+                                        return Err(TenantWriteError::Catalog(
+                                            CatalogError::Invalid(
+                                                "VECTOR column SET value must be a vector"
+                                                    .to_string(),
+                                            ),
+                                        ))
+                                    }
                                 }
-                            } else if let Some(slot) = merged_values.get_mut(*col_idx) {
+                            } else {
+                                let slot = merged_values.get_mut(*col_idx).ok_or_else(|| {
+                                    CatalogError::Invalid(
+                                        "internal: SET target column index out of range"
+                                            .to_string(),
+                                    )
+                                })?;
                                 *slot = new_value;
                             }
                         }
@@ -3138,6 +3168,84 @@ mod tests {
                 .iter()
                 .all(|r| r.id != 2),
             "内容不一致で拒否された書き込みは id=2 の行を残してはならない"
+        );
+    }
+
+    // cursor bugbot 指摘（PR #990・Issue #872）の回帰テスト: `DO UPDATE SET` の
+    // 右辺が `VECTOR` 列に対して `Value::Vector` 以外へ解決した場合、
+    // `upsert_typed_rows_unchecked` は既存 embedding を黙って維持したまま
+    // `updated` カウント・テーブル世代だけを進めてはならない（fail-closed に
+    // 拒否し、行・世代とも変更しない）。`upsert_typed_rows_unchecked` は
+    // `pub(crate)` のため、束縛段階の型検査（`sql::parser::bind_upsert_
+    // assignments`）を経由せず直接 `UpsertAction::DoUpdate` を組み立てて
+    // 呼び出すことで、この分岐を直接検証する。
+    #[test]
+    fn upsert_do_update_rejects_non_vector_value_for_vector_column_instead_of_ignoring_it() {
+        let path = unique_db_path("upsert-vector-set-type-mismatch");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+
+        // `PolicyContext::new` は `Public` のみ可視（既定・最小権限。`policy.rs`
+        // ドキュメント参照）。`Private` 行の可視化には明示的な許可が必要なため、
+        // 本テストは擬似的なオーナー確認に `Public` 行を使う（衝突分岐に到達
+        // できれば十分で、可視性ラベル自体は本テストの検証対象ではない）。
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id = OperationId::parse("op-seed").expect("valid operation_id");
+        insert_row(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 0.0],
+                metadata: &[],
+            },
+            &op_id,
+        )
+        .expect("seed row insert must succeed");
+
+        // vector_idx（唯一の VECTOR 列。位置 0）へ非 Vector（Null）を SET しようと
+        // する不正な `UpsertAction`（本来は `bind_upsert_assignments` が束縛時に
+        // 拒否するはずの形。本関数単体の fail-closed 契約を直接検証する）。
+        let null_value = crate::row_codec::Value::Null;
+        let assignments = [(0usize, UpsertSetValue::Literal(&null_value))];
+        let action = UpsertAction::DoUpdate(&assignments);
+        // 行の `values`（`(id, values)`）は衝突判定より前のハッシュ材料組み立て
+        // でも `values[vector_idx]` を `Value::Vector` として要求するため、
+        // 実際には使われない（`DO UPDATE` は SET 対象列だけを反映し `values` の
+        // vector_idx はハッシュ用途のみ）が妥当な Vector 値を渡しておく。
+        let seed_values = [crate::row_codec::Value::Vector(vec![9.0, 9.0])];
+        let rows: [(u64, &[crate::row_codec::Value]); 1] = [(1, &seed_values)];
+
+        let result = upsert_typed_rows_unchecked(
+            &storage,
+            "docs",
+            &ctx,
+            Visibility::Private,
+            &rows,
+            &action,
+            LedgerWrite::Disabled,
+            None,
+        );
+        assert!(
+            matches!(result, Err(TenantWriteError::Catalog(_))),
+            "VECTOR 列への非 Vector SET は fail-closed に拒否されるべき: {result:?}"
+        );
+
+        // 拒否された呼び出しは commit されない（write_txn が早期 return で drop
+        // される）ため、既存行の embedding は変更されない。
+        let rows_after = visible_rows(&storage, "docs", &ctx).expect("visible_rows");
+        let row1 = rows_after
+            .iter()
+            .find(|r| r.id == 1)
+            .expect("seed row must still exist");
+        assert_eq!(
+            row1.embedding,
+            vec![1.0, 0.0],
+            "拒否された SET が既存 embedding を書き換えてはならない"
         );
     }
 }

@@ -3877,12 +3877,12 @@ impl EngineCore {
                     ));
                 }
                 self.validate_insert_batch_byte_and_chunk_limits(&bound.rows)?;
-                crate::sql::exec::execute_upsert_with_schema(
+                crate::sql::exec::execute_upsert(
                     &self.storage,
                     ctx,
                     &bound,
                     self.ledger_mode,
-                    Some(&schema),
+                    &schema,
                 )
             }
         }

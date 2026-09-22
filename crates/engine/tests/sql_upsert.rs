@@ -9,7 +9,7 @@
 //!
 //! `EngineCore::execute_sql_in_session`（先頭トークン `INSERT` の覗き見判定 →
 //! `sql::allowlist::validate_insert_tokens` → `sql::parser::bind_insert_form`
-//! の `Upsert` 分岐 → `sql::exec::execute_upsert_with_schema`）を production
+//! の `Upsert` 分岐 → `sql::exec::execute_upsert`）を production
 //! 経路として検証する。`sql_delete_single_row.rs`・`insert_multi_row.rs` と
 //! 同じ流儀（実 `Storage` ＋ `CpuScalarProvider`、`unique_db_path`／
 //! `CleanupGuard`）。
