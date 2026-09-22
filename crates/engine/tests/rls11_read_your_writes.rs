@@ -101,27 +101,97 @@ const SCAN_SQL: &str = "SELECT id FROM docs LIMIT 20";
 const COUNT_SQL: &str = "SELECT COUNT(*) AS n FROM docs";
 const WHERE_DENSE_SQL: &str =
     "SELECT id FROM docs WHERE lang = 'ja' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 20";
+/// (a)〜(d) それぞれ個別の `id` 集合と、`COUNT(*)` の件数を保持する。
+/// 形状ごとに独立してアサートすることで、特定の世代整合キャッシュ
+/// （例: `SparseIndexCache` の失効漏れで hybrid だけ挿入行を返さない）
+/// だけが失効漏れを起こすケースを、他形状の結果に隠さず検出できる。
+struct ShapeResults {
+    dense: std::collections::BTreeSet<String>,
+    hybrid: std::collections::BTreeSet<String>,
+    scan: std::collections::BTreeSet<String>,
+    where_dense: std::collections::BTreeSet<String>,
+    count: u64,
+}
 
-/// (a)〜(e) をすべて実行し、`id` 列に現れる id の集合を返す（`WHERE lang =
-/// 'ja'` は挿入行にも `lang='ja'` を持たせるため base 集合と一致する）。
-/// `COUNT(*)` は件数のみ別途返す。
+impl ShapeResults {
+    /// 4 形状すべてが `id` を含むことを確認する（1 つでも欠ければ
+    /// どの形状のキャッシュが失効漏れかを assert メッセージで特定できる）。
+    fn assert_all_contain(&self, id: &str, tenant: &str) {
+        assert!(
+            self.dense.contains(id),
+            "tenant {tenant}: dense shape must observe id={id}, got {:?}",
+            self.dense
+        );
+        assert!(
+            self.hybrid.contains(id),
+            "tenant {tenant}: hybrid shape must observe id={id}, got {:?}",
+            self.hybrid
+        );
+        assert!(
+            self.scan.contains(id),
+            "tenant {tenant}: scan shape must observe id={id}, got {:?}",
+            self.scan
+        );
+        assert!(
+            self.where_dense.contains(id),
+            "tenant {tenant}: WHERE dense shape must observe id={id}, got {:?}",
+            self.where_dense
+        );
+    }
+
+    /// 4 形状すべてが `id` を含まないことを確認する。
+    fn assert_all_lack(&self, id: &str, tenant: &str) {
+        assert!(
+            !self.dense.contains(id),
+            "tenant {tenant}: dense shape must NOT observe id={id}, got {:?}",
+            self.dense
+        );
+        assert!(
+            !self.hybrid.contains(id),
+            "tenant {tenant}: hybrid shape must NOT observe id={id}, got {:?}",
+            self.hybrid
+        );
+        assert!(
+            !self.scan.contains(id),
+            "tenant {tenant}: scan shape must NOT observe id={id}, got {:?}",
+            self.scan
+        );
+        assert!(
+            !self.where_dense.contains(id),
+            "tenant {tenant}: WHERE dense shape must NOT observe id={id}, got {:?}",
+            self.where_dense
+        );
+    }
+}
+
+/// (a)〜(d) をそれぞれ独立に実行し、形状ごとの `id` 列の集合を返す
+/// （`WHERE lang = 'ja'` は挿入行にも `lang='ja'` を持たせるため base 集合
+/// と一致する）。`COUNT(*)` は件数のみ別途返す。
 fn run_all_shapes(
     core: &EngineCore,
     ctx: &PolicyContext,
     session: &mut SessionState,
-) -> (std::collections::BTreeSet<String>, u64) {
-    let mut ids = std::collections::BTreeSet::new();
-    for sql in [DENSE_SQL, HYBRID_SQL, SCAN_SQL, WHERE_DENSE_SQL] {
-        let outcome = core
-            .execute_sql_in_session(ctx, session, sql)
-            .unwrap_or_else(|e| panic!("sql {sql:?} must succeed: {e:?}"));
-        let SqlOutcome::Query(result) = outcome else {
-            panic!("expected Query outcome for {sql:?}, got {outcome:?}");
+) -> ShapeResults {
+    let run_ids =
+        |core: &EngineCore, ctx: &PolicyContext, session: &mut SessionState, sql: &str| {
+            let outcome = core
+                .execute_sql_in_session(ctx, session, sql)
+                .unwrap_or_else(|e| panic!("sql {sql:?} must succeed: {e:?}"));
+            let SqlOutcome::Query(result) = outcome else {
+                panic!("expected Query outcome for {sql:?}, got {outcome:?}");
+            };
+            result
+                .rows
+                .into_iter()
+                .map(|row| row.id.to_string())
+                .collect::<std::collections::BTreeSet<String>>()
         };
-        for row in result.rows {
-            ids.insert(row.id.to_string());
-        }
-    }
+
+    let dense = run_ids(core, ctx, session, DENSE_SQL);
+    let hybrid = run_ids(core, ctx, session, HYBRID_SQL);
+    let scan = run_ids(core, ctx, session, SCAN_SQL);
+    let where_dense = run_ids(core, ctx, session, WHERE_DENSE_SQL);
+
     let outcome = core
         .execute_sql_in_session(ctx, session, COUNT_SQL)
         .expect("count sql must succeed");
@@ -132,7 +202,13 @@ fn run_all_shapes(
         engine::sql::exec::Cell::Integer(n) => *n,
         other => panic!("expected Integer COUNT(*) cell, got {other:?}"),
     };
-    (ids, count)
+    ShapeResults {
+        dense,
+        hybrid,
+        scan,
+        where_dense,
+        count,
+    }
 }
 
 fn new_core(path: &std::path::Path) -> (EngineCore, Vec<RowTruth>) {
@@ -158,20 +234,17 @@ fn rls11_own_private_row_is_visible_in_same_and_other_session_of_same_tenant_aft
         let ctx = session_ctx(tenant);
         let mut session = SessionState::default();
 
-        // ウォーム: 挿入前に (a)〜(e) を一度実行する（seed の Public 3 行の
+        // ウォーム: 挿入前に (a)〜(d) を一度実行する（seed の Public 3 行の
         // うち自テナント分だけが見える）。
-        let (before_ids, before_count) = run_all_shapes(&core, &ctx, &mut session);
+        let before = run_all_shapes(&core, &ctx, &mut session);
         let own_seed_id: String = truth
             .iter()
             .find(|r| r.tenant == tenant)
             .expect("seed row for tenant")
             .id
             .to_string();
-        assert!(
-            before_ids.contains(&own_seed_id),
-            "tenant {tenant} must see its own Public seed row before insert, got {before_ids:?}"
-        );
-        assert_eq!(before_count, 3, "3 テナントの Public 行が全員に可視のはず");
+        before.assert_all_contain(&own_seed_id, tenant);
+        assert_eq!(before.count, 3, "3 テナントの Public 行が全員に可視のはず");
 
         // INSERT（自身の Private 行。挿入 id はテナントごとに一意にする）。
         let insert_id = 100 + TENANTS.iter().position(|t| *t == tenant).unwrap() as u64;
@@ -190,15 +263,13 @@ fn rls11_own_private_row_is_visible_in_same_and_other_session_of_same_tenant_aft
             other => panic!("expected Insert outcome, got {other:?}"),
         }
 
-        // (1) 同一セッションで直ちに読み戻せる。
-        let (same_session_ids, same_session_count) = run_all_shapes(&core, &ctx, &mut session);
-        assert!(
-            same_session_ids.contains(&insert_id.to_string()),
-            "tenant {tenant}: same session must observe its own just-inserted Private row, \
-             got {same_session_ids:?}"
-        );
+        // (1) 同一セッションで直ちに読み戻せる。形状ごとに個別確認すること
+        // で、特定形状（例: hybrid のみ SparseIndexCache 失効漏れ）を
+        // 他形状の結果に隠さず検出する。
+        let same_session = run_all_shapes(&core, &ctx, &mut session);
+        same_session.assert_all_contain(&insert_id.to_string(), tenant);
         assert_eq!(
-            same_session_count, 4,
+            same_session.count, 4,
             "tenant {tenant}: own Private 行 1 件が加わるはず"
         );
 
@@ -206,16 +277,27 @@ fn rls11_own_private_row_is_visible_in_same_and_other_session_of_same_tenant_aft
         //     SessionState）でも同じ集合が見える。新規構築した ctx は
         //     `(table, ctx)` キャッシュキーとしては (1) と等価であり、
         //     ウォーム済みエントリを踏むため「失効が効いている」ことの
-        //     強い証跡になる。
+        //     強い証跡になる。形状ごとに個別比較する。
         let other_ctx = session_ctx(tenant);
-        let mut other_session = SessionState::default();
-        let (other_session_ids, other_session_count) =
-            run_all_shapes(&core, &other_ctx, &mut other_session);
+        let mut other_session_state = SessionState::default();
+        let other_session = run_all_shapes(&core, &other_ctx, &mut other_session_state);
         assert_eq!(
-            other_session_ids, same_session_ids,
-            "tenant {tenant}: fresh same-tenant session must see the identical visible set"
+            other_session.dense, same_session.dense,
+            "tenant {tenant}: fresh same-tenant session must see the identical dense set"
         );
-        assert_eq!(other_session_count, same_session_count);
+        assert_eq!(
+            other_session.hybrid, same_session.hybrid,
+            "tenant {tenant}: fresh same-tenant session must see the identical hybrid set"
+        );
+        assert_eq!(
+            other_session.scan, same_session.scan,
+            "tenant {tenant}: fresh same-tenant session must see the identical scan set"
+        );
+        assert_eq!(
+            other_session.where_dense, same_session.where_dense,
+            "tenant {tenant}: fresh same-tenant session must see the identical WHERE dense set"
+        );
+        assert_eq!(other_session.count, same_session.count);
     }
 }
 
@@ -256,12 +338,8 @@ fn rls11_other_tenant_never_observes_private_row_across_all_read_shapes() {
             }
             let ctx = session_ctx(other_tenant);
             let mut session = SessionState::default();
-            let (ids, _count) = run_all_shapes(&core, &ctx, &mut session);
-            assert!(
-                !ids.contains(&insert_id.to_string()),
-                "tenant {other_tenant} must never observe tenant {tenant}'s Private row \
-                 (id={insert_id}), got {ids:?}"
-            );
+            let results = run_all_shapes(&core, &ctx, &mut session);
+            results.assert_all_lack(&insert_id.to_string(), other_tenant);
 
             // 述語一致の WHERE でも 0 件（エラーではない）。
             let where_sql = format!(
@@ -316,14 +394,10 @@ fn engine_default_policy_context_still_hides_own_private_rows() {
     // の同一テナントであっても Private 行は見えない。
     let default_ctx = PolicyContext::new(tenant).expect("valid tenant");
     let mut default_session = SessionState::default();
-    let (ids, count) = run_all_shapes(&core, &default_ctx, &mut default_session);
-    assert!(
-        !ids.contains("300"),
-        "engine 既定 PolicyContext::new must NOT observe the Private row even for its own \
-         tenant, got {ids:?}"
-    );
+    let results = run_all_shapes(&core, &default_ctx, &mut default_session);
+    results.assert_all_lack("300", tenant);
     assert_eq!(
-        count, 3,
+        results.count, 3,
         "engine 既定 PolicyContext::new must only see the 3 shared Public seed rows \
          (unaffected by the Private insert)"
     );

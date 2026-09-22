@@ -256,14 +256,10 @@ fn http_query(addr: std::net::SocketAddr, token: &str, body: &[u8]) -> HttpRespo
     ))
 }
 
-/// `op: scan` 応答を解析し、`id` 列の値集合を返す（`columns: ["id"]` 前提）。
-fn http_scan_ids(addr: std::net::SocketAddr, token: &str) -> BTreeSet<String> {
-    let resp = http_query(
-        addr,
-        token,
-        br#"{"op":"scan","table":"docs","limit":100,"columns":["id"]}"#,
-    );
-    assert_eq!(resp.status, 200, "scan must succeed: {resp:?}");
+/// `{"columns":...,"rows":[[...],...],"row_count":n}` 応答本文から `rows`
+/// 配列を取り出す（`op: scan`／`search`／`aggregate` いずれも共通の応答形状。
+/// `wire_server::http::query::response::encode` 参照）。
+fn extract_rows(resp: &HttpResponse) -> Vec<JsonValue> {
     let text = std::str::from_utf8(&resp.body).expect("utf-8 body");
     let JsonValue::Object(mut top) = parse_json(text).expect("valid json") else {
         panic!("top level must be an object: {text}");
@@ -271,6 +267,11 @@ fn http_scan_ids(addr: std::net::SocketAddr, token: &str) -> BTreeSet<String> {
     let JsonValue::Array(rows) = top.remove("rows").expect("rows field") else {
         panic!("rows must be an array");
     };
+    rows
+}
+
+/// 単一列（`id`）の `rows` を `id` の値集合へ変換する。
+fn rows_to_id_set(rows: Vec<JsonValue>) -> BTreeSet<String> {
     rows.into_iter()
         .map(|row| match row {
             JsonValue::Array(mut cells) => match cells.pop() {
@@ -281,6 +282,48 @@ fn http_scan_ids(addr: std::net::SocketAddr, token: &str) -> BTreeSet<String> {
             other => panic!("row must be an array, got {other:?}"),
         })
         .collect()
+}
+
+/// `op: scan` 応答を解析し、`id` 列の値集合を返す（`columns: ["id"]` 前提）。
+fn http_scan_ids(addr: std::net::SocketAddr, token: &str) -> BTreeSet<String> {
+    let resp = http_query(
+        addr,
+        token,
+        br#"{"op":"scan","table":"docs","limit":100,"columns":["id"]}"#,
+    );
+    assert_eq!(resp.status, 200, "scan must succeed: {resp:?}");
+    rows_to_id_set(extract_rows(&resp))
+}
+
+/// `op: search`（`vector` 経由の dense ORDER BY 相当）応答を解析し、`id` 列
+/// の値集合を返す（`columns: ["id"]` 前提。`limit` は可視総数を上回る値）。
+fn http_search_ids(addr: std::net::SocketAddr, token: &str) -> BTreeSet<String> {
+    let resp = http_query(
+        addr,
+        token,
+        br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":100,"columns":["id"]}"#,
+    );
+    assert_eq!(resp.status, 200, "search must succeed: {resp:?}");
+    rows_to_id_set(extract_rows(&resp))
+}
+
+/// `op: aggregate`（`COUNT(*)`）応答を解析し、件数を返す。
+fn http_aggregate_count(addr: std::net::SocketAddr, token: &str) -> u64 {
+    let resp = http_query(
+        addr,
+        token,
+        br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}]}"#,
+    );
+    assert_eq!(resp.status, 200, "aggregate must succeed: {resp:?}");
+    let rows = extract_rows(&resp);
+    let row = rows.into_iter().next().expect("aggregate returns 1 row");
+    match row {
+        JsonValue::Array(cells) => match cells.into_iter().next() {
+            Some(JsonValue::Number(n)) => n.as_f64() as u64,
+            other => panic!("expected numeric COUNT(*) cell, got {other:?}"),
+        },
+        other => panic!("row must be an array, got {other:?}"),
+    }
 }
 
 fn http_insert(addr: std::net::SocketAddr, token: &str, id: u64, op_id: &str) {
@@ -381,7 +424,8 @@ fn rls11_cross_surface_read_your_writes() {
     let http_addr =
         http_common::spawn_router_listener_with_engine(&users_path, SessionStore::new(), core);
 
-    // wire で書いた行を HTTP の scan で読み戻せる（alice/tenant-a）。
+    // wire で書いた行を HTTP の search／scan／aggregate すべてで読み戻せる
+    // （alice/tenant-a）。
     let mut wire_stream = authenticate_to_ready_for_query(wire_addr, "alice", "pw-alice");
     send_simple_query(
         &mut wire_stream,
@@ -398,6 +442,18 @@ fn rls11_cross_surface_read_your_writes() {
         "tenant-a: row inserted via wire must be visible over HTTP scan, \
          got {alice_ids_after_wire_insert:?}"
     );
+    let alice_search_ids_after_wire_insert = http_search_ids(http_addr, &alice_token);
+    assert!(
+        alice_search_ids_after_wire_insert.contains("201"),
+        "tenant-a: row inserted via wire must be visible over HTTP search, \
+         got {alice_search_ids_after_wire_insert:?}"
+    );
+    let alice_count_after_wire_insert = http_aggregate_count(http_addr, &alice_token);
+    assert_eq!(
+        alice_count_after_wire_insert, 4,
+        "tenant-a: HTTP aggregate COUNT(*) must include the wire-inserted row \
+         (3 shared Public seed rows + 1 own Private row)"
+    );
 
     // HTTP で書いた行を wire の SELECT で読み戻せる（bob/tenant-b）。
     let bob_token = http_session(http_addr, "bob", "pw-bob");
@@ -412,7 +468,7 @@ fn rls11_cross_surface_read_your_writes() {
     );
 
     // 越境しない: alice(tenant-a) は bob(tenant-b) の HTTP 挿入行 (id=202)
-    // を wire からも HTTP からも見えない。
+    // を wire からも HTTP（scan／search／aggregate いずれも）からも見えない。
     let mut alice_wire = authenticate_to_ready_for_query(wire_addr, "alice", "pw-alice");
     let alice_wire_ids = wire_select_ids(&mut alice_wire);
     assert!(
@@ -425,5 +481,17 @@ fn rls11_cross_surface_read_your_writes() {
         !alice_scan_ids.contains("202"),
         "tenant-a must not observe tenant-b's HTTP-inserted row over HTTP scan, \
          got {alice_scan_ids:?}"
+    );
+    let alice_search_ids = http_search_ids(http_addr, &alice_token);
+    assert!(
+        !alice_search_ids.contains("202"),
+        "tenant-a must not observe tenant-b's HTTP-inserted row over HTTP search, \
+         got {alice_search_ids:?}"
+    );
+    let alice_count_after_bob_insert = http_aggregate_count(http_addr, &alice_token);
+    assert_eq!(
+        alice_count_after_bob_insert, 4,
+        "tenant-a: HTTP aggregate COUNT(*) must be unaffected by tenant-b's HTTP-inserted \
+         Private row"
     );
 }
