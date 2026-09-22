@@ -1166,7 +1166,7 @@ impl BoundPredicateUpdate {
     /// （`bind_set_assignments` による `id`／`tenant_id`／`visibility` 列への
     /// SET 拒否、`metadata_filters`・`expr_filters` が両方空＝実質無条件更新の
     /// 拒否、`LedgerMode::Ledgered` 下での `operation_id` 必須化は
-    /// [`crate::sql::allowlist::validate_update`] が `ValidatedUpdateForm` の
+    /// [`crate::sql::allowlist::validate_update_form`] が `ValidatedUpdateForm` の
     /// 構築時点で強制する）は、これらの検査を経ていない生のフィールドを
     /// そのまま受け取れる公開 constructor を crate 外へ晒した時点で迂回可能に
     /// なる（[`BoundScan::new`] は読み取り専用でありこの意味の安全性検査を

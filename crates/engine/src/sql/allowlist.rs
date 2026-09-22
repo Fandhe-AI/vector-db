@@ -2670,19 +2670,52 @@ struct ParsedUpdateShape {
 /// [`crate::sql::parser::bind_update_form`] が束縛時に `42601` で拒否する
 /// （`WHERE` 省略自体は本モジュールの `expect_keyword(Keyword::Where)` が
 /// 構造的に拒否済み）。
+///
+/// フィールドは `pub(crate)` のまま公開しない（[`crate::sql::parser::
+/// BoundPredicateUpdate`] と同じ作法）。本型は `validate_update_form_tokens`
+/// 内でのみ構築され、構築前に `mode.require(shape.operation_id.as_ref())`
+/// （`operation_id` 必須化ガード。TASK-92・RECOVER-1）を必ず通す。フィールドを
+/// `pub` にすると、クレート外の呼び出し元が `operation_id: None` を含む値を
+/// この検証を経ずに直接組み立て、`bind_update_form`（同ゲートを再検証しない。
+/// 検証済み入力である本型の契約を信頼する設計）へそのまま渡してガードを
+/// 迂回できてしまう（codex-review 指摘・PR #985）。クレート外からはアクセサー
+/// メソッド経由で読み取る。
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ValidatedPredicateUpdate {
     /// UPDATE に指定され、カタログ存在確認を通過したテーブル名。
-    pub table_name: String,
+    pub(crate) table_name: String,
     /// SET 句の (列名, リテラル) 対応。宣言順を保持する（[`ValidatedUpdate::assignments`]
     /// と同じ契約）。
-    pub assignments: Vec<(String, InsertLiteral)>,
+    pub(crate) assignments: Vec<(String, InsertLiteral)>,
     /// `WHERE` 句に含まれる述語（`AND` 結合順）。`SELECT`（[`ValidatedStatement::
     /// where_predicates`]）と同一の許可形状を再利用する。
-    pub where_predicates: Vec<WherePredicate>,
+    pub(crate) where_predicates: Vec<WherePredicate>,
     /// 文末専用句で搬送された、検証済みの `operation_id`。契約は
     /// [`ValidatedUpdate::operation_id`] と同一。
-    pub operation_id: Option<OperationId>,
+    pub(crate) operation_id: Option<OperationId>,
+}
+
+impl ValidatedPredicateUpdate {
+    /// UPDATE に指定され、カタログ存在確認を通過したテーブル名。
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// SET 句の (列名, リテラル) 対応（宣言順）。
+    pub fn assignments(&self) -> &[(String, InsertLiteral)] {
+        &self.assignments
+    }
+
+    /// `WHERE` 句に含まれる述語（`AND` 結合順）。
+    pub fn where_predicates(&self) -> &[WherePredicate] {
+        &self.where_predicates
+    }
+
+    /// 文末専用句で搬送された、検証済みの `operation_id`。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.operation_id.as_ref()
+    }
 }
 
 /// [`validate_update_form`] の戻り値。`UPDATE` の `WHERE` 句が単一行・id 指定形
