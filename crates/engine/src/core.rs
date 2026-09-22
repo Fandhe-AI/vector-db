@@ -2007,7 +2007,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
                     | crate::sql::SqlOutcome::Insert(_)
-                    | crate::sql::SqlOutcome::Truncate(_) => {
+                    | crate::sql::SqlOutcome::Truncate(_)
+                    | crate::sql::SqlOutcome::Delete(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -2031,7 +2032,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
                     | crate::sql::SqlOutcome::Insert(_)
-                    | crate::sql::SqlOutcome::Truncate(_) => {
+                    | crate::sql::SqlOutcome::Truncate(_)
+                    | crate::sql::SqlOutcome::Delete(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -2052,7 +2054,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
                     | crate::sql::SqlOutcome::Insert(_)
-                    | crate::sql::SqlOutcome::Truncate(_) => {
+                    | crate::sql::SqlOutcome::Truncate(_)
+                    | crate::sql::SqlOutcome::Delete(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -2191,6 +2194,29 @@ impl EngineCore {
                 )?;
                 let outcome = self.execute_truncate_form(ctx, &stmt)?;
                 return Ok(crate::sql::SqlOutcome::Truncate(outcome));
+            }
+
+            // SQL-18（TASK-191・#867）: `INSERT`／`TRUNCATE` と同じ設計で `DELETE`
+            // を覗き見判定する。`EXPLAIN DELETE ...`・`WHERE` を伴わない `DELETE`
+            // は先頭トークンが `DELETE` であっても許可リスト外の形状のため、
+            // `sql::allowlist::validate_delete_tokens`（`Parser::parse_delete`）が
+            // `42601` で拒否する（`INSERT`・`TRUNCATE` の既存コメントと同じ経路。
+            // `EXPLAIN DELETE ...` は先頭トークンが `DELETE` ではなく `EXPLAIN` に
+            // なるためここでは捕捉されず、後続の `validate_sql` の `EXPLAIN`
+            // 分岐〔次のトークンが `SELECT` であることを要求〕へ流れて `42601`
+            // で拒否される）。
+            let is_delete_statement = matches!(
+                tokens.first(),
+                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DELETE")
+            );
+            if is_delete_statement {
+                let stmt = crate::sql::allowlist::validate_delete_tokens(
+                    &tokens,
+                    &self.storage,
+                    self.ledger_mode,
+                )?;
+                let outcome = self.execute_delete_form(ctx, &stmt)?;
+                return Ok(crate::sql::SqlOutcome::Delete(outcome));
             }
         }
 
@@ -3867,6 +3893,39 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedTruncate,
     ) -> Result<crate::sql::exec::TruncateOutcome, crate::sql::allowlist::SqlSurfaceError> {
         crate::sql::exec::execute_truncate(&self.storage, ctx, stmt, self.ledger_mode)
+    }
+
+    /// SQL 表層の単一 DELETE 文実行エントリポイント（SQL-18、TASK-191、#867）。
+    /// `execute_truncate_sql` と同じ構造（`execute_sql`（TASK-75、SELECT
+    /// 専用）とは独立した固有メソッド。`VectorCore` trait への昇格は行わない）。
+    ///
+    /// `sql::allowlist::validate_delete`（構造検証。文末専用句
+    /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
+    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
+    /// RECOVER-1）→ [`Self::execute_delete_form`]（実行本体）の順に呼ぶ。
+    pub fn execute_delete_sql(
+        &self,
+        ctx: &PolicyContext,
+        sql: &str,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let stmt = crate::sql::allowlist::validate_delete(sql, &self.storage, self.ledger_mode)?;
+        self.execute_delete_form(ctx, &stmt)
+    }
+
+    /// [`Self::execute_delete_sql`]・[`Self::execute_sql_in_session`] の
+    /// DELETE 分岐が共有する実行本体（`execute_truncate_form` と同じ設計）。
+    /// DELETE は `id` 疑似列以外の列を参照しない（`sql::parser::bind_delete`
+    /// ドキュメント参照）ため、`execute_insert_form` の `InsertSchemaLookup`
+    /// キャッシュに相当する仕組みは不要で、`sql::parser::bind_delete` →
+    /// `sql::exec::execute_delete` の薄い委譲になる。
+    fn execute_delete_form(
+        &self,
+        ctx: &PolicyContext,
+        stmt: &crate::sql::allowlist::ValidatedDelete,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let bound = crate::sql::parser::bind_delete(stmt)?;
+        crate::sql::exec::execute_delete(&self.storage, ctx, &bound, self.ledger_mode)
     }
 
     /// SQL 表層のバッチ INSERT 実行エントリポイント（TASK-122、対象ビヘイビア:
