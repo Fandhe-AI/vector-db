@@ -881,6 +881,25 @@ pub struct ValidatedInsert {
     pub operation_id: Option<OperationId>,
 }
 
+/// 許可形状の構造判定を通過した TRUNCATE 文（SQL-22、TASK-195）。テーブル定義
+/// （カタログ）は残したまま、セッションのテナントが所有する全行を削除する
+/// 書き込み系操作（DDL ではない）として扱う。
+///
+/// 受理する形は `TRUNCATE TABLE <table> USING OPERATION_ID '<id>' [;]` のみ
+/// （複数テーブル指定・`CASCADE`/`RESTART IDENTITY` 等の PostgreSQL 拡張句は
+/// 許可リスト外）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedTruncate {
+    /// TABLE に指定され、カタログ存在確認を通過したテーブル名。
+    pub table_name: String,
+    /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-22）。句の欠落・明示
+    /// `NULL` はいずれも `None`（`ValidatedInsert::operation_id` と同じ契約）。
+    /// `validate_truncate` は `LedgerMode::Ledgered`（既定）では `None` を
+    /// 書き込みトランザクション開始前に `23502` で拒否するため、この構成では
+    /// 常に `Some` になる。
+    pub operation_id: Option<OperationId>,
+}
+
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
 /// 再帰下降だが文法の深さは定数（statement → select_list/where/order_by の 1 階層）で、
 /// 深いネストによるスタック消費は発生しない。
@@ -1705,6 +1724,34 @@ impl<'a> Parser<'a> {
             Ok(None)
         }
     }
+
+    /// `TRUNCATE TABLE <table> USING OPERATION_ID '<id>' [;]` の単一テーブル形
+    /// のみを受理する（SQL-22、TASK-195）。複数テーブル指定・`CASCADE`／
+    /// `RESTART IDENTITY` 等の PostgreSQL 拡張句は構造的に受理しない
+    /// （`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
+    fn parse_truncate(&mut self) -> Result<ParsedTruncateShape, SqlSurfaceError> {
+        self.expect_contextual_keyword("TRUNCATE")?;
+        self.expect_contextual_keyword("TABLE")?;
+        let table_name = self.expect_ident()?;
+
+        // 文末専用句の構造パースのみをここで行う（`parse_insert` と同じ設計。
+        // 必須化の判定は `validate_truncate` が `mode.require` へ委譲する。
+        // TASK-92・RECOVER-1 と同じ理由で、この時点ではまだカタログ照会を
+        // 一切行っておらず書き込みトランザクションは開始されていない）。
+        let operation_id = self.parse_operation_id_clause()?;
+
+        Ok(ParsedTruncateShape {
+            table_name,
+            operation_id,
+        })
+    }
+}
+
+/// 構文木（[`ValidatedTruncate`] の元）。カタログ存在確認前の中間結果
+/// （SQL-22、TASK-195）。
+struct ParsedTruncateShape {
+    table_name: String,
+    operation_id: Option<OperationId>,
 }
 
 /// 構文木（[`ValidatedStatement`] の元）。カタログ存在確認前の中間結果。
@@ -2275,6 +2322,49 @@ pub(crate) fn validate_insert_tokens(
         table_name: shape.table_name,
         columns: shape.columns,
         values: shape.values,
+        operation_id: shape.operation_id,
+    })
+}
+
+/// TRUNCATE 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を
+/// 通じて対象テーブルがカタログに実在するかを確認する（SQL-22、TASK-195 の
+/// 公開 API）。`validate_insert` と全く同じ設計（構造検証のみを担当し、意味論
+/// 検証・実行本体は呼び出し元 `sql::exec::execute_truncate` へ委譲する）。
+///
+/// 検証順序は決定的（同一入力には常に同一の [`SqlSurfaceError`] を返す）。
+/// `operation_id` 必須化ガード（`mode.require`。TASK-92・RECOVER-1）を含む段階構成の
+/// 詳細は `recovery::required_op_id` モジュールドキュメント参照。
+pub fn validate_truncate(
+    sql: &str,
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<ValidatedTruncate, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_truncate_tokens(&tokens, lookup, mode)
+}
+
+/// [`validate_truncate`] の本体。トークン列を受け取ることで、呼び出し元
+/// （`core.rs::execute_sql_in_session`）が既に先頭トークン判定のために
+/// `tokenize` 済みの場合、同一 SQL 文字列の再トークナイズを避けられる
+/// （`validate_insert_tokens` と同じ設計。Issue #485 の INSERT 側対応を踏襲）。
+pub(crate) fn validate_truncate_tokens(
+    tokens: &[lexer::Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<ValidatedTruncate, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let shape = p.parse_truncate()?;
+    p.expect_end_of_statement()?;
+
+    mode.require(shape.operation_id.as_ref())?;
+
+    let exists = lookup.table_exists(&shape.table_name)?;
+    if !exists {
+        return Err(SqlSurfaceError::undefined_table(shape.table_name));
+    }
+
+    Ok(ValidatedTruncate {
+        table_name: shape.table_name,
         operation_id: shape.operation_id,
     })
 }
@@ -3251,6 +3341,129 @@ mod tests {
             .unwrap_err()
             .wire_code();
         assert_eq!(first, second);
+    }
+
+    // --- validate_truncate（SQL-22、TASK-195） ---------------------------------
+
+    #[test]
+    fn accepts_truncate_with_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_truncate(
+            "TRUNCATE TABLE documents USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("basic TRUNCATE shape should be accepted");
+        assert_eq!(stmt.table_name, "documents");
+        assert_eq!(
+            stmt.operation_id.as_ref().map(OperationId::as_str),
+            Some("op-0001")
+        );
+    }
+
+    #[test]
+    fn accepts_truncate_with_trailing_semicolon() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_truncate(
+            "TRUNCATE TABLE documents USING OPERATION_ID 'op-0001';",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_truncate_missing_table_keyword() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_truncate(
+            "TRUNCATE documents USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("missing TABLE keyword must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_truncate_with_multiple_tables() {
+        let lookup = catalog_with(&["documents", "other"]);
+        let err = validate_truncate(
+            "TRUNCATE TABLE documents, other USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("multiple tables must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_truncate_missing_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_truncate("TRUNCATE TABLE documents", &lookup, LedgerMode::Ledgered)
+            .expect_err("missing clause must be rejected");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn rejects_truncate_with_explicit_null_operation_id() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_truncate(
+            "TRUNCATE TABLE documents USING OPERATION_ID NULL",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("explicit NULL must be rejected as missing");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn rejects_truncate_operation_id_dollar_placeholder() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_truncate(
+            "TRUNCATE TABLE documents USING OPERATION_ID $1",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("$n placeholder must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_truncate_with_trailing_tokens() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_truncate(
+            "TRUNCATE TABLE documents USING OPERATION_ID 'op-0001' CASCADE",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("trailing tokens must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_truncate_of_undefined_table() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_truncate(
+            "TRUNCATE TABLE ghost USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("undefined table must be rejected");
+        assert_eq!(err.wire_code(), "42P01");
+    }
+
+    #[test]
+    fn compare_only_without_ledger_accepts_truncate_missing_operation_id_clause() {
+        // サーバー構成のみが必須化の可否を決める（TASK-92・RECOVER-1）:
+        // `CompareOnlyWithoutLedger` では句の省略を許す（validate_insert と同じ契約）。
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_truncate(
+            "TRUNCATE TABLE documents",
+            &lookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect("compare-only mode must not require operation_id");
+        assert_eq!(stmt.operation_id, None);
     }
 
     // --- TASK-161（SQL-12: `USING MODE`／`SET search_mode`）------------------------

@@ -1224,6 +1224,74 @@ pub(crate) fn delete_row_unchecked(
     Ok(())
 }
 
+/// SQL 表層 `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`（SQL-22、TASK-195）
+/// の実体。テーブル定義（カタログ）は残したまま、セッションのテナントが所有する
+/// 全行（`Visibility` を問わない）を単一 write トランザクションで削除する
+/// （[`delete_row_unchecked`]・[`replace_typed_rows_by_text_key`] と並ぶ 3 つ目の
+/// 削除系プリミティブ）。唯一の到達経路は `sql::exec::execute_truncate`
+/// （`operation_id` 必須化ガードを適用済み）。
+///
+/// - 削除スコープは「RLS 可視集合（`is_visible`）」ではなく「テナント所有
+///   （`(tenant_id, id)` の物理キー名前空間。TABLE-12）」全体。`Public`／`Private`
+///   を問わず自テナント行はすべて削除対象になる（SQL-22 の要件。RLS-7 が既定で
+///   適用する可視性フィルタとは独立の削除スコープ判断であり、意図的に緩めていない）。
+/// - `row_table.retain_in` の述語（`bool` 返却・panic 不可）内で行ヘッダを
+///   デコードして所有権を再チェックしない。`retain_in` の範囲引数
+///   `(tenant_id, 0)..=(tenant_id, u64::MAX)`（`(tenant_id, &str)` 辞書順の
+///   キー名前空間分離。TABLE-12）自体が唯一の境界であり、フォールブルな
+///   デコード失敗を `retain_in` 内から `Err` として伝播する手段がないため
+///   （panic はトランザクション破損＝coding-rust.md 違反）、レンジそのものを
+///   境界とする設計が安全側かつ [`replace_typed_rows_by_text_key`] のテナント
+///   名前空間走査と同じ既存規約に整合する。
+/// - `MAX_SCANNED_ROWS`／`MAX_VISIBLE_ROWS` は適用しない（SQL-22 は TRUNCATE を
+///   1 文あたり影響行数上限〔SQL-19〕の対象外とする。`retain_in` は候補 id を
+///   `Vec` へ materialize しないため、DoS 上限が本来的に不要な操作でもある）。
+/// - 台帳記録を行削除より**先**に行う（[`delete_row_unchecked`] と同じ理由。
+///   再送時に `23505`／`22023` を正しく検出するため）。
+/// - 削除対象が 0 件でも、台帳記録が必ず発生する（write トランザクションが
+///   commit される）ため、常にテーブル世代を進める（`insert_rows` の空バッチ
+///   ショートカットとは意図的に非対称。0 件 TRUNCATE の再送冪等性を台帳側だけで
+///   保証し、コード分岐の非対称性によるバグを避ける）。
+pub(crate) fn truncate_table_unchecked(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+) -> Result<(), TenantWriteError> {
+    validate_identifier(table)?;
+    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
+    {
+        // テーブル不存在の判定・並行 DDL との整合のため他の書き込み系操作と
+        // 同じ前段を通す。
+        require_table_schema_write(&write_txn, table)?;
+        // TRUNCATE 要求のクライアント由来の内容はテーブル名（台帳キー
+        // `(tenant, table, operation_id)` に既に含まれる）以外に存在しない
+        // （`content_hash::for_truncate` ドキュメント参照）。
+        let content_hash = content_hash::for_truncate();
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            &content_hash,
+        )?;
+
+        let tenant = ctx.tenant_id();
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+        let start = std::ops::Bound::Included((tenant, 0u64));
+        let end = std::ops::Bound::Included((tenant, u64::MAX));
+        row_table
+            .retain_in((start, end), |_, _| false)
+            .map_err(CatalogError::from)?;
+    }
+    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
+    crate::recovery::commit_boundary::commit(write_txn)?;
+    Ok(())
+}
+
 /// [`replace_typed_rows_by_text_key`] の成功応答。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplaceOutcome {

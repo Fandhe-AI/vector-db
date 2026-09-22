@@ -222,6 +222,24 @@ pub(crate) fn execute_and_respond(
                 "failed to encode command complete response",
             ),
         },
+        // TASK-195（SQL-22）: `TRUNCATE TABLE`（`exec::TruncateOutcome`。削除件数を
+        // 一切返さない契約。`sql/exec.rs` ドキュメント参照）の応答を pg 互換の
+        // `CommandComplete` タグ `TRUNCATE TABLE`（PostgreSQL の `TRUNCATE` タグに
+        // 準拠。件数を持たない固定タグ）へ整形する。`SetSearchMode`（`SET`）と
+        // 同型で、行データを返さない書き込み系操作の応答形。
+        Ok(SqlOutcome::Truncate(_)) => {
+            match result_encoder::encode_command_complete("TRUNCATE TABLE") {
+                Ok(msg) => {
+                    write_all(stream, &msg)?;
+                    crate::handshake::write_ready_for_query_io(stream)
+                }
+                Err(_) => respond_error_and_ready(
+                    stream,
+                    ErrorClass::InternalError,
+                    "failed to encode command complete response",
+                ),
+            }
+        }
         Err(e) => respond_error_and_ready(stream, e.error_class(), &e.client_message()),
     }
 }
