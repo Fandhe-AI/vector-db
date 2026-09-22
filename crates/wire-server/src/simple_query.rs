@@ -238,6 +238,25 @@ pub(crate) fn execute_and_respond(
                 ),
             }
         }
+        // SQL-18（TASK-191・#867）: `DELETE`（単一行・`id` 等価指定形。
+        // `exec::DeleteOutcome::rows_affected` は自テナント削除件数
+        // `0`／`1` のみを保持する。`sql/exec.rs` ドキュメント参照）の応答を
+        // pg 互換の `CommandComplete` タグ `DELETE <rows>`（PostgreSQL の
+        // `DELETE` タグに準拠）へ整形する。`INSERT 0 <rows>` と同じ設計。
+        Ok(SqlOutcome::Delete(outcome)) => match result_encoder::encode_command_complete(&format!(
+            "DELETE {}",
+            outcome.rows_affected
+        )) {
+            Ok(msg) => {
+                write_all(stream, &msg)?;
+                crate::handshake::write_ready_for_query_io(stream)
+            }
+            Err(_) => respond_error_and_ready(
+                stream,
+                ErrorClass::InternalError,
+                "failed to encode command complete response",
+            ),
+        },
         Err(e) => respond_error_and_ready(stream, e.error_class(), &e.client_message()),
     }
 }
