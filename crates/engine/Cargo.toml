@@ -7,7 +7,7 @@
 # 据え置き、ソース内の `use engine::...`・`cargo test`/`bench` の `--test`/`--bench` 名は
 # 不変。`-p`/`--package` で指定するパッケージ名だけが変わる。
 name = "fandhe-vector-db-engine"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

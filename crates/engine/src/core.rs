@@ -3246,15 +3246,50 @@ impl EngineCore {
         }
         drop(read_txn);
 
-        // 判定 6（②③④）: バイト量・チャンク数上限。行内容自体（テキスト・
-        // ベクトル）は複製せず長さのみを積算する（coding-rust.md）。
+        // 判定 6（②③④）: バイト量・チャンク数上限。SQL 表層の複数行 VALUES
+        // （`execute_insert_form` の `RowBatch` 分岐。SQL-16・TASK-190）と判定本体を
+        // 共有する [`Self::validate_insert_batch_byte_and_chunk_limits`] へ委譲する
+        // （Issue #860 SQL/NoSQL 機能パリティ。計算内容・エラー写像は本 Issue 導入前
+        // と不変）。
+        self.validate_insert_batch_byte_and_chunk_limits(&bounds)?;
+
+        // 判定 7: 実書き込み（独自の write トランザクション）。`Some(&schema)`
+        // （判定 4・5 で取得した束縛時点のスキーマ）を渡すことで、実書き込みが
+        // write トランザクション内で改めて取得するスキーマとの不一致を fail-closed
+        // に検出する（codex-review P1 指摘・PR #823。`tenant::insert_typed_row_unchecked`
+        // のドキュメント参照。束縛後・書き込み前にテーブルが再定義され列順が
+        // 入れ替わっても、値が誤った列へ保存されるのを防ぐ）。
+        crate::sql::exec::execute_insert_batch_with_schema(
+            &self.storage,
+            ctx,
+            &bounds,
+            self.ledger_mode,
+            Some(&schema),
+        )
+    }
+
+    /// バッチ INSERT の②③④上限（1 行あたり・バッチ合計のバイト量／チャンク総量。
+    /// `batch_limits.rs`・INDEX-4）を検証する。行内容自体（テキスト・ベクトル）は
+    /// 複製せず長さのみを積算する（coding-rust.md「不安全な設計 / DoS」対応）。
+    ///
+    /// [`Self::execute_bound_insert_in_session`]（NoSQL 表層 `rows[]`・NOSQL-6・
+    /// TASK-178・判定6）と `execute_insert_form` の `RowBatch` 分岐（SQL 表層の
+    /// 複数行 VALUES・SQL-16・TASK-190）が同一の判定本体を共有し、表層間で上限を
+    /// 迂回できないようにする（Issue #860 SQL/NoSQL 機能パリティ）。①（行数上限。
+    /// `self.batch_limits.max_files_per_batch`）は各呼び出し元が個別に行う
+    /// （NoSQL 表層はスキーマ取得・束縛より前に判定する契約のため、束縛済み
+    /// `bounds` だけを受け取る本関数には含められない）。
+    fn validate_insert_batch_byte_and_chunk_limits(
+        &self,
+        bounds: &[crate::sql::parser::BoundInsert],
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         let mut shapes: Vec<(usize, usize)> = Vec::new();
         shapes.try_reserve_exact(bounds.len()).map_err(|_| {
             crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "failed to reserve batch shape buffer".to_string(),
             }
         })?;
-        for bound in &bounds {
+        for bound in bounds {
             let mut row_bytes: usize = 0;
             for value in &bound.values {
                 let value_len = match value {
@@ -3278,20 +3313,7 @@ impl EngineCore {
         crate::batch_limits::validate_chunk_total(bounds.len(), &self.batch_limits).map_err(
             |e| crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string()),
         )?;
-
-        // 判定 7: 実書き込み（独自の write トランザクション）。`Some(&schema)`
-        // （判定 4・5 で取得した束縛時点のスキーマ）を渡すことで、実書き込みが
-        // write トランザクション内で改めて取得するスキーマとの不一致を fail-closed
-        // に検出する（codex-review P1 指摘・PR #823。`tenant::insert_typed_row_unchecked`
-        // のドキュメント参照。束縛後・書き込み前にテーブルが再定義され列順が
-        // 入れ替わっても、値が誤った列へ保存されるのを防ぐ）。
-        crate::sql::exec::execute_insert_batch_with_schema(
-            &self.storage,
-            ctx,
-            &bounds,
-            self.ledger_mode,
-            Some(&schema),
-        )
+        Ok(())
     }
 
     /// `USING PLAN('<query>')`（TASK-77・SQL-5）経路のうち、スキーマに依存しない
@@ -3768,6 +3790,41 @@ impl EngineCore {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
                 crate::sql::exec::execute_insert(&self.storage, ctx, &bound, self.ledger_mode)
             }
+            // 複数行 `VALUES`（SQL-16、TASK-190）。NoSQL 表層の `rows[]`
+            // （NOSQL-6・TASK-178・`Self::execute_bound_insert_in_session`）と同じ
+            // 「同一テーブル・同一 operation_id」の 1 write トランザクション・
+            // 1 台帳エントリ実行を共有する（第 2 の書き込み経路を作らない設計。
+            // `sql::exec::execute_insert_batch_with_schema` ドキュメント参照）。
+            //
+            // INDEX-4 上限も NoSQL 表層と揃える（Issue #860 SQL/NoSQL 機能
+            // パリティ。SQL 表層の複数行 VALUES が `self.batch_limits` を迂回して
+            // NoSQL 表層より緩い上限で受理されないようにする）。①（行数上限）は
+            // `execute_bound_insert_in_session` 判定3と同じ「束縛済みバッチ長のみで
+            // 判定できる軽量ガード」としてここで行い、②③④（バイト量・チャンク
+            // 総量）は同メソッド判定6と本体を共有する
+            // [`Self::validate_insert_batch_byte_and_chunk_limits`] へ委譲する。
+            // `sql::parser::MAX_INSERT_ROWS_PER_STATEMENT`（構文解析段階の
+            // 1 文あたり行数上限）とは独立な、運用者が調整可能な上限
+            // （`self.batch_limits`）である点に注意。
+            crate::sql::parser::BoundInsertForm::RowBatch(bounds) => {
+                if bounds.len() > self.batch_limits.max_files_per_batch {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                        crate::batch_limits::BatchLimitsError::TooManyFiles {
+                            count: bounds.len(),
+                            max: self.batch_limits.max_files_per_batch,
+                        }
+                        .to_string(),
+                    ));
+                }
+                self.validate_insert_batch_byte_and_chunk_limits(&bounds)?;
+                crate::sql::exec::execute_insert_batch_with_schema(
+                    &self.storage,
+                    ctx,
+                    &bounds,
+                    self.ledger_mode,
+                    Some(&schema),
+                )
+            }
             crate::sql::parser::BoundInsertForm::File(bound) => {
                 crate::sql::exec::execute_file_insert(
                     &self.storage,
@@ -3814,9 +3871,11 @@ impl EngineCore {
 
     /// SQL 表層のバッチ INSERT 実行エントリポイント（TASK-122、対象ビヘイビア:
     /// INDEX-4）。[`Self::execute_insert_sql`] の複数ファイル版で、複数ファイルを
-    /// 1 バッチとして受け取る engine ローカル API の入口（SQL 表層に複数文・複数行
-    /// VALUES の構文拡張は導入しない。1 文 = 1 ファイルの検証済み `INSERT` 文の列
-    /// （`sqls`）を 1 バッチとして受け取る）。`VectorCore` trait への昇格は行わない
+    /// 1 バッチとして受け取る engine ローカル API の入口（1 文 = 1 ファイルの
+    /// 検証済み `INSERT` 文の列（`sqls`）を 1 バッチとして受け取る。行形の
+    /// 複数行 `VALUES`（SQL-16、TASK-190）はこの API とは別経路——`sql::parser::
+    /// BoundInsertForm::RowBatch` を経由し、ファイル形が混在した場合と同じく
+    /// 本メソッドは行形を一切受理しない）。`VectorCore` trait への昇格は行わない
     /// （`execute_insert_sql` と同じ理由）。
     ///
     /// 手順:
@@ -3975,8 +4034,10 @@ impl EngineCore {
                     file_binds.push(file_bound);
                 }
                 // 行形が 1 件でも混在した場合は黙って行形として処理せず拒否する
-                // （「複数ファイルのバッチ投入」という本メソッドの契約を維持する）。
-                crate::sql::parser::BoundInsertForm::Row(_) => {
+                // （「複数ファイルのバッチ投入」という本メソッドの契約を維持する。
+                // 単一行・複数行 VALUES〔SQL-16、TASK-190〕のいずれも同じ扱い）。
+                crate::sql::parser::BoundInsertForm::Row(_)
+                | crate::sql::parser::BoundInsertForm::RowBatch(_) => {
                     return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
                         "INSERT batch requires every statement to be file-form (path/body columns)",
                     ));

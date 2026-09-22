@@ -200,3 +200,31 @@ fn session_explain_insert_is_rejected_as_unsupported_syntax() {
         .expect_err("EXPLAIN INSERT must be rejected");
     assert_eq!(err.wire_code(), "42601");
 }
+
+/// 複数行 `VALUES`（SQL-16、TASK-190）もセッション経由（`execute_sql_in_session`
+/// → `execute_insert_sql` → `execute_insert_form`）で同じ契約のまま実行される
+/// （`crates/engine/tests/insert_multi_row.rs` が `execute_insert_sql` 直呼び出しで
+/// 固定する契約の、セッション経由経路での到達性確認。実行本体は共有のため
+/// 契約自体の再検証はしない）。
+#[test]
+fn session_multi_row_insert_writes_all_rows_and_returns_insert_outcome() {
+    let path = unique_db_path("session-insert-multi-row");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "INSERT INTO documents (id, embedding, body) VALUES \
+             (1, '[0.1,0.2,0.3]', 'a'), (2, '[0.4,0.5,0.6]', 'b'), (3, '[0.7,0.8,0.9]', 'c') \
+             USING OPERATION_ID 'op-session-multi-row'",
+        )
+        .expect("session multi-row INSERT should succeed");
+    match outcome {
+        SqlOutcome::Insert(insert_outcome) => assert_eq!(insert_outcome.rows_affected, 3),
+        other => panic!("expected SqlOutcome::Insert, got {other:?}"),
+    }
+}
