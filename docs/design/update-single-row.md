@@ -228,6 +228,29 @@ update_row_columns_overflow_from_unchanged_column_is_rejected_only_when_visible_
 セッションが同一 id へ同一 SET 値を送っても、対象行が RLS 不可視である限り
 双方とも `UPDATE 0`・内容無参照で同一の観測を得る）。
 
+**追記（codex-review P0 再々々指摘・PR #989・`crates/engine/src/tenant.rs:1696`）**:
+判断 D 再改訂は「内容依存の処理を `is_owner && is_visible` を満たす行のみへ
+限定する」ところまでは正しく反映していたが、その判定に使う対象行そのものを
+`decode_row_for_key`（embedding・metadata を含むフル本体デコード）で取得して
+おり、この呼び出しが `is_visible` 判定より**前**に無条件で実行されていた。
+そのため、不可視な既存行の embedding・metadata が破損している場合、`is_owner
+&& is_visible` の判定に到達する前に `decode_row_for_key` 自体が `Err`
+（`XX000`）を返してしまい、「不存在（`UPDATE 0`）」と区別できてしまっていた
+（新設した「可視・不可視の応答差」ではなく、判断 D 再改訂で閉じたはずの
+「不可視な既存行」と「不存在な id」の応答差が、超過判定ではなくデコード
+失敗という別経路から再び開いていた）。対応として、`storage::
+decode_row_tenant_and_visibility`（tenant_id・visibility の固定長フィールド
+のみを読むヘッダ専用デコード。embedding dim・metadata 長に依存しないため
+可視性判定そのものが内容依存にならない）で `is_owner && is_visible` を先に
+確定し、それを満たす行だけをフル本体デコード（`decode_row_for_key`）の対象に
+する形へ変更した。ヘッダのデコード自体が失敗した場合も「不可視」と同一に
+扱い（本体には一切触れない）、可視と確定した行のみが本体デコード失敗時に
+`XX000` を返す（この場合は対象が「存在し、かつ可視」と確定済みのため、
+エラー有無で存在情報は漏れない）。`tenant::tests::
+update_row_columns_corrupt_invisible_row_body_is_indistinguishable_from_not_found`
+で、末尾切り詰めにより本体デコードのみが失敗する不可視行に対する更新が
+`UPDATE 0` になることを固定する。
+
 あわせて、部分 UPDATE の実装（codex-review P1 指摘・PR #989 再指摘）は
 `decode_scalar_columns`（対象行の全 `TEXT` 列を `Value::Text` へ複製）ではなく
 借用版 `scan_scalar_columns` と、それを土台に SET 対象列だけを差し替えて
