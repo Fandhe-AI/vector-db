@@ -25,6 +25,13 @@
 //! `insert` op の `operation_id` 欠落／`null`／空文字 → `23502`・`rows[*]` の
 //! 列検証・engine への束縛・実行は [`super::insert`]（Issue #771・NOSQL-6）が担う。
 //!
+//! `update`／`delete` op（Issue #875・NOSQL-12）の `set` 禁止列（`id`／
+//! `tenant_id`／`visibility`）検査・`where`／`filter` の排他判定・列名解決・
+//! `operation_id` 欠落／`null`／空文字 → `23502`・engine への束縛・実行は
+//! いずれも後続 Issue（#876）が担う。本モジュールでは `UPDATE_SCHEMA`
+//! （`set` を任意キーのオブジェクトとして型のみ検査する [`FieldType::AnyObject`]）・
+//! `DELETE_SCHEMA` の宣言に留める。
+//!
 //! 未知キーは無視せず拒否する（NOSQL-8 の一般則。クライアント自己申告の
 //! `tenant_id`（HTTP-7）・`HINT ORDER`／`SET search_mode` 相当フィールド
 //! （NOSQL-9）・`scan` への `vector`／`plan`／`mode`／`hybrid` 付与拒否
@@ -107,6 +114,12 @@ pub enum FieldType {
     Array(ElementType),
     /// 値が [`ObjectSchema`] に従うオブジェクトであることを再帰検証する。
     Object(&'static ObjectSchema),
+    /// 値が JSON オブジェクトであることのみを検証する（固定フィールド集合を
+    /// 持たない。`update` op の `set`〔列名をキーに持つ部分更新オブジェクト〕
+    /// のように、キー集合がクライアント指定の列名に依存し静的に宣言できない
+    /// フィールド向け。[`ElementType::Any`]〔`insert` の `rows[*]`〕と同じ
+    /// 思想。禁止列・値の型検査は本モジュールの対象外〔Issue #876〕）。
+    AnyObject,
 }
 
 /// スキーマ 1 フィールドの宣言。
@@ -153,6 +166,7 @@ fn check_field_type(
             schema.validate(value)?;
             Ok(())
         }
+        (FieldType::AnyObject, JsonValue::Object(_)) => Ok(()),
         _ => Err(SchemaError::TypeMismatch { key }),
     }
 }
@@ -367,7 +381,10 @@ impl<'a> Validated<'a> {
         let Some(spec) = self.field_spec(key) else {
             return Err(SchemaError::UnknownKey);
         };
-        if !matches!(spec.ty, FieldType::Object(_)) {
+        // `Object(_)`（固定フィールド集合）・`AnyObject`（`update` の `set`
+        // のように任意列名を持つオブジェクト。Issue #875）のいずれも
+        // このアクセサで読める（値としては両方 `JsonValue::Object` のため）。
+        if !matches!(spec.ty, FieldType::Object(_) | FieldType::AnyObject) {
             return Err(SchemaError::TypeMismatch { key });
         }
         match self.map.get(key) {
@@ -664,13 +681,116 @@ pub static INSERT_SCHEMA: ObjectSchema = ObjectSchema {
     ],
 };
 
+/// `where` フィールドのサブスキーマ（`update`／`delete` op。単一行・`id`
+/// 指定形。Issue #875・NOSQL-12）。`where`／`filter` の排他・双方欠落の
+/// 意味検証はここでは行わず（両方 `Optional`）、後続 Issue（#876）の
+/// バインダが担う（`search` op の `vector`／`plan` 排他判定を #763 の
+/// バインダへ置いた前例と同じ設計）。
+pub static WHERE_ID_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "where",
+    fields: &[FieldSpec {
+        key: "id",
+        presence: Presence::Required,
+        ty: FieldType::Number,
+        nullable: false,
+    }],
+};
+
+/// `update` op のトップレベルスキーマ（NOSQL-12 ポインタ。Issue #875）。
+/// `set` の禁止列（`id`／`tenant_id`／`visibility`）検査・列名解決・
+/// `where`／`filter` の排他判定・`operation_id` 欠落／`null`／空文字 →
+/// `23502`・engine への束縛・実行はいずれも Issue #876 が担う（本スキーマは
+/// 型のみを検査する）。
+pub static UPDATE_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "update",
+    fields: &[
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "table",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "set",
+            presence: Presence::Required,
+            ty: FieldType::AnyObject,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "where",
+            presence: Presence::Optional,
+            ty: FieldType::Object(&WHERE_ID_SCHEMA),
+            nullable: false,
+        },
+        FieldSpec {
+            key: "filter",
+            presence: Presence::Optional,
+            ty: FieldType::Array(ElementType::Object(&FILTER_ITEM_SCHEMA)),
+            nullable: false,
+        },
+        FieldSpec {
+            key: "operation_id",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: true,
+        },
+    ],
+};
+
+/// `delete` op のトップレベルスキーマ（NOSQL-12 ポインタ。Issue #875）。
+/// `where`／`filter` の排他判定・`operation_id` 欠落／`null`／空文字 →
+/// `23502`・engine への束縛・実行はいずれも Issue #876 が担う。
+pub static DELETE_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "delete",
+    fields: &[
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "table",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "where",
+            presence: Presence::Optional,
+            ty: FieldType::Object(&WHERE_ID_SCHEMA),
+            nullable: false,
+        },
+        FieldSpec {
+            key: "filter",
+            presence: Presence::Optional,
+            ty: FieldType::Array(ElementType::Object(&FILTER_ITEM_SCHEMA)),
+            nullable: false,
+        },
+        FieldSpec {
+            key: "operation_id",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: true,
+        },
+    ],
+};
+
 /// op 名（厳密一致。trim・大文字小文字の読み替えはしない）→ [`ObjectSchema`]
 /// の対応表。`schema_for` の実体であり、単一情報源として扱う。
-pub const OP_SCHEMAS: [(&str, &ObjectSchema); 4] = [
+pub const OP_SCHEMAS: [(&str, &ObjectSchema); 6] = [
     ("search", &SEARCH_SCHEMA),
     ("scan", &SCAN_SCHEMA),
     ("aggregate", &AGGREGATE_SCHEMA),
     ("insert", &INSERT_SCHEMA),
+    ("update", &UPDATE_SCHEMA),
+    ("delete", &DELETE_SCHEMA),
 ];
 
 /// `op` 名からスキーマを引く。語彙外は `None`（`0A000` への写像・応答は
@@ -709,7 +829,10 @@ mod tests {
     #[test]
     fn op_schemas_cover_expected_ops_and_schema_for_matches() {
         let ops: Vec<&str> = OP_SCHEMAS.iter().map(|(name, _)| *name).collect();
-        assert_eq!(ops, vec!["search", "scan", "aggregate", "insert"]);
+        assert_eq!(
+            ops,
+            vec!["search", "scan", "aggregate", "insert", "update", "delete"]
+        );
         for (name, schema) in OP_SCHEMAS.iter() {
             assert!(std::ptr::eq(schema_for(name).unwrap(), *schema));
         }
@@ -817,6 +940,100 @@ mod tests {
         assert!(INSERT_SCHEMA.validate(&null_id).is_ok());
     }
 
+    #[test]
+    fn update_accepts_full_valid_object() {
+        // `where` 形。
+        let v = obj(
+            r#"{"op":"update","table":"docs","set":{"lang":"en","body":"x"},
+               "where":{"id":1},"operation_id":"op-1"}"#,
+        );
+        assert!(UPDATE_SCHEMA.validate(&v).is_ok());
+        // `filter` 形。
+        let v2 = obj(r#"{"op":"update","table":"docs","set":{"lang":"en"},
+               "filter":[{"column":"lang","op":"eq","value":"ja"}]}"#);
+        assert!(UPDATE_SCHEMA.validate(&v2).is_ok());
+    }
+
+    #[test]
+    fn delete_accepts_full_valid_object() {
+        let v = obj(r#"{"op":"delete","table":"docs","where":{"id":1},"operation_id":"op-1"}"#);
+        assert!(DELETE_SCHEMA.validate(&v).is_ok());
+        let v2 = obj(r#"{"op":"delete","table":"docs",
+               "filter":[{"column":"lang","op":"eq","value":"ja"}]}"#);
+        assert!(DELETE_SCHEMA.validate(&v2).is_ok());
+    }
+
+    #[test]
+    fn update_and_delete_accept_missing_and_null_operation_id() {
+        let update_missing = obj(r#"{"op":"update","table":"docs","set":{"lang":"en"}}"#);
+        assert!(UPDATE_SCHEMA.validate(&update_missing).is_ok());
+        let update_null =
+            obj(r#"{"op":"update","table":"docs","set":{"lang":"en"},"operation_id":null}"#);
+        assert!(UPDATE_SCHEMA.validate(&update_null).is_ok());
+
+        let delete_missing = obj(r#"{"op":"delete","table":"docs","where":{"id":1}}"#);
+        assert!(DELETE_SCHEMA.validate(&delete_missing).is_ok());
+        let delete_null =
+            obj(r#"{"op":"delete","table":"docs","where":{"id":1},"operation_id":null}"#);
+        assert!(DELETE_SCHEMA.validate(&delete_null).is_ok());
+    }
+
+    #[test]
+    fn update_missing_set_is_rejected() {
+        let v = obj(r#"{"op":"update","table":"docs","where":{"id":1}}"#);
+        assert_eq!(
+            UPDATE_SCHEMA.validate(&v).unwrap_err(),
+            SchemaError::MissingRequired { key: "set" }
+        );
+    }
+
+    #[test]
+    fn update_set_non_object_is_rejected() {
+        for set_json in [r#""set":[]"#, r#""set":"x""#, r#""set":null"#, r#""set":1"#] {
+            let json = format!(r#"{{"op":"update","table":"docs",{set_json}}}"#);
+            let v = obj(&json);
+            assert_eq!(
+                UPDATE_SCHEMA.validate(&v).unwrap_err(),
+                SchemaError::TypeMismatch { key: "set" },
+                "set_json={set_json}"
+            );
+        }
+    }
+
+    #[test]
+    fn where_id_type_mismatch_is_rejected() {
+        let v = obj(r#"{"op":"delete","table":"docs","where":{"id":"1"}}"#);
+        assert_eq!(
+            DELETE_SCHEMA.validate(&v).unwrap_err(),
+            SchemaError::TypeMismatch { key: "id" }
+        );
+        let v2 = obj(r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":"x"}"#);
+        assert_eq!(
+            UPDATE_SCHEMA.validate(&v2).unwrap_err(),
+            SchemaError::TypeMismatch { key: "where" }
+        );
+    }
+
+    #[test]
+    fn nested_where_rejects_unknown_key() {
+        let v = obj(r#"{"op":"delete","table":"docs","where":{"id":1,"extra":1}}"#);
+        assert_eq!(
+            DELETE_SCHEMA.validate(&v).unwrap_err(),
+            SchemaError::UnknownKey
+        );
+    }
+
+    #[test]
+    fn any_object_accessor_returns_map() {
+        // `required_object` は `AnyObject`（`set`）も `Object(_)`（`where`）
+        // と同様に読める（Issue #876 の `bind_set_assignments` 相当が
+        // `required_object("set")` で列名マップを取得する前提）。
+        let v = obj(r#"{"op":"update","table":"docs","set":{"lang":"en"}}"#);
+        let validated = UPDATE_SCHEMA.validate(&v).unwrap();
+        let set = validated.required_object("set").unwrap();
+        assert_eq!(set.get("lang"), Some(&JsonValue::String("en".to_string())));
+    }
+
     // --- 必須欠落 ---------------------------------------------------------
 
     #[test]
@@ -889,7 +1106,7 @@ mod tests {
 
     #[test]
     fn unknown_key_is_rejected_per_op() {
-        let cases: [(&'static ObjectSchema, &str); 4] = [
+        let cases: [(&'static ObjectSchema, &str); 6] = [
             (
                 &SEARCH_SCHEMA,
                 r#"{"op":"search","table":"docs","limit":1,"bogus":1}"#,
@@ -905,6 +1122,14 @@ mod tests {
             (
                 &INSERT_SCHEMA,
                 r#"{"op":"insert","table":"docs","rows":[],"bogus":1}"#,
+            ),
+            (
+                &UPDATE_SCHEMA,
+                r#"{"op":"update","table":"docs","set":{"lang":"en"},"bogus":1}"#,
+            ),
+            (
+                &DELETE_SCHEMA,
+                r#"{"op":"delete","table":"docs","where":{"id":1},"bogus":1}"#,
             ),
         ];
         for (schema, json) in cases {
@@ -926,6 +1151,14 @@ mod tests {
             (
                 &INSERT_SCHEMA,
                 r#"{"op":"insert","table":"docs","rows":[],"tenant_id":"evil"}"#,
+            ),
+            (
+                &UPDATE_SCHEMA,
+                r#"{"op":"update","table":"docs","set":{"lang":"en"},"tenant_id":"evil"}"#,
+            ),
+            (
+                &DELETE_SCHEMA,
+                r#"{"op":"delete","table":"docs","where":{"id":1},"tenant_id":"evil"}"#,
             ),
         ] {
             let v = obj(json);
@@ -949,6 +1182,45 @@ mod tests {
             SEARCH_SCHEMA.validate(&v2).unwrap_err(),
             SchemaError::UnknownKey
         );
+        let v3 = obj(r#"{"op":"update","table":"docs","set":{"lang":"en"},"hint_order":["path"]}"#);
+        assert_eq!(
+            UPDATE_SCHEMA.validate(&v3).unwrap_err(),
+            SchemaError::UnknownKey
+        );
+        let v4 =
+            obj(r#"{"op":"delete","table":"docs","where":{"id":1},"search_mode":"precision"}"#);
+        assert_eq!(
+            DELETE_SCHEMA.validate(&v4).unwrap_err(),
+            SchemaError::UnknownKey
+        );
+    }
+
+    #[test]
+    fn update_and_delete_reject_explain_and_search_only_fields() {
+        // NOSQL-12 ポインタ: update／delete は explain／vector／limit／mode を
+        // 宣言しないため、未知キーとして 42601 で拒否される（一般則から自然に
+        // 成立する。個別の除外ロジックは持たない）。
+        for field_json in [
+            r#""explain":true"#,
+            r#""vector":[0.1]"#,
+            r#""limit":10"#,
+            r#""mode":"precision""#,
+        ] {
+            let update_json =
+                format!(r#"{{"op":"update","table":"docs","set":{{"lang":"en"}},{field_json}}}"#);
+            assert_eq!(
+                UPDATE_SCHEMA.validate(&obj(&update_json)).unwrap_err(),
+                SchemaError::UnknownKey,
+                "update field_json={field_json}"
+            );
+            let delete_json =
+                format!(r#"{{"op":"delete","table":"docs","where":{{"id":1}},{field_json}}}"#);
+            assert_eq!(
+                DELETE_SCHEMA.validate(&obj(&delete_json)).unwrap_err(),
+                SchemaError::UnknownKey,
+                "delete field_json={field_json}"
+            );
+        }
     }
 
     #[test]

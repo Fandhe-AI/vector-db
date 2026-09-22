@@ -104,10 +104,13 @@ bind は同じ理由で起動拒否されます。`nosql` を選択すると、�
 相当（JSON の未知キー・ヘッダ・パス位置のいずれも）は `wire_code` `42601`
 で拒否します（テナント文脈はセッションに束縛された `PolicyContext` からの
 み導出。Issue #754・TASK-174・HTTP-5・HTTP-6・HTTP-7）。検証を通過した
-要求は、`op` フィールドを閉じた語彙 4 値（`search`／`scan`／`aggregate`／
-`insert`）の許可リストへ照らし、語彙外（DDL・UDF 呼び出し・トランザクション
-制御・UPDATE／DELETE 相当を含む）は `wire_code` `0A000`（HTTP 501）で
-拒否します（Issue #759・TASK-179・NOSQL-1・NOSQL-9）。語彙内の要求は
+要求は、`op` フィールドを閉じた語彙 6 値（`search`／`scan`／`aggregate`／
+`insert`／`update`／`delete`）の許可リストへ照らし、語彙外（DDL・UDF 呼び出し・
+トランザクション制御を含む）は `wire_code` `0A000`（HTTP 501）で
+拒否します（Issue #759・TASK-179・NOSQL-1・NOSQL-9。`update`／`delete` の
+追加は Issue #875・NOSQL-12。語彙・スキーマ検証のみ実装済みで、束縛・
+実行結線は Issue #876 の担当のため現時点では常に `0A000`（HTTP 501）に
+留まります）。語彙内の要求は
 本文スキーマ検証を経て、`scan` は束縛済み実行計画（`BoundScan`）へ写像し
 `EngineCore` で実行して `{"columns":...,"rows":...,"row_count":...}` を
 返します（`vector`／`plan`／`mode`／`hybrid` の付与・`explain: true` は
@@ -147,7 +150,7 @@ panic hook（RECOVER-8）が unwind 前に `abort()` するため
 プロセス全体が終了します（詳細: `crates/wire-server/src/http/conn.rs`
 モジュール doc「panic 非伝播と RECOVER-8（fail-fast）との関係」節）。
 
-NoSQL 表層の 3 エンドポイント・`op` 4 値それぞれの JSON スキーマ・応答形・
+NoSQL 表層の 3 エンドポイント・`op` 6 値それぞれの JSON スキーマ・応答形・
 SQL 構文との対応表は `crates/wire-server/docs/nosql-api.md`（Issue #780）に
 まとめています（上記段落は Issue #772 以降の `insert` 実装結線を未反映の
 まま残しており、最新の契約は同ドキュメントを参照してください）。
