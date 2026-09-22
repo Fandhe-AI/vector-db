@@ -57,12 +57,28 @@ const _: () = assert!(
 /// 可能」対応）。値は `storage::MAX_METADATA_LEN`（最終的にこの出力を格納する
 /// `RowInput::metadata` 側の上限）と同期させ、片方だけの変更を防ぐため下部の
 /// const assert でコンパイル時に強制する。
-const MAX_SCALAR_PAYLOAD_LEN: u32 = 4 * 1024 * 1024;
+pub(crate) const MAX_SCALAR_PAYLOAD_LEN: u32 = 4 * 1024 * 1024;
 
 const _: () = assert!(
     MAX_SCALAR_PAYLOAD_LEN == crate::storage::MAX_METADATA_LEN,
     "row_codec::MAX_SCALAR_PAYLOAD_LEN must stay in sync with storage::MAX_METADATA_LEN"
 );
+
+/// `TEXT` 列 1 個分のフレーミングオーバーヘッド（presence タグ 1 バイト＋長さ
+/// プレフィックス 4 バイト）。[`encode_scalar_columns`] の実エンコードと
+/// [`tenant::update_row_columns_unchecked`]（UPDATE の SET 値の対象行探索より
+/// 前の累計上限検証）が同じ計算式を共有するために公開する（片方だけの更新で
+/// 事前検証と実エンコードが乖離すると、行の存在有無で異なる応答を返す既存
+/// テナント境界漏えいの再発につながる）。
+pub(crate) const SCALAR_TEXT_ENTRY_OVERHEAD: u32 = 5;
+
+/// `TEXT` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + 長さ(4) + 本文）を計算する。オーバーフロー時は `Err`。
+pub(crate) fn scalar_text_entry_len(text_len: u32) -> Result<u32> {
+    SCALAR_TEXT_ENTRY_OVERHEAD
+        .checked_add(text_len)
+        .ok_or_else(|| RowCodecError::Invalid("scalar payload entry length overflow".to_string()))
+}
 
 /// 列値の有無を示すタグバイト。未知の値は fail-closed に拒否する（presence の
 /// 黙殺フォールバックは NULL/値ありの取り違えに直結するため許容しない）。
@@ -459,11 +475,17 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 "scalar payload length {total_len} exceeds limit {MAX_SCALAR_PAYLOAD_LEN}"
             )));
         }
+        // `try_reserve_exact` の `additional` は `buf.len()` からの追加要素数であり
+        // `buf.capacity()` からの差分ではない（アロケータが要求量より多い容量を
+        // 返した場合、`capacity()` 基準の差分計算は必要量を過小に見積もり、
+        // 後続の `push`/`extend_from_slice` が意図した `Invalid` エラーではなく
+        // 暗黙の再確保（OOM 時は panic）経路へ落ちてしまう。Cursor Bugbot Low
+        // 指摘・PR #989）。`buf.len()` 基準で不足分のみを計算する。
         if buf.capacity() < total_len as usize {
-            buf.try_reserve_exact(total_len as usize - buf.capacity())
-                .map_err(|_| {
-                    RowCodecError::Invalid("failed to reserve scalar payload buffer".to_string())
-                })?;
+            let needed = (total_len as usize).saturating_sub(buf.len());
+            buf.try_reserve_exact(needed).map_err(|_| {
+                RowCodecError::Invalid("failed to reserve scalar payload buffer".to_string())
+            })?;
         }
         Ok(())
     };
@@ -499,12 +521,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     )));
                 }
                 // presence(1) + 長さ(4) + 本文（text_len）の合計を確保前に検証する。
-                let entry_len = 1u32
-                    .checked_add(4)
-                    .and_then(|n| n.checked_add(text_len))
-                    .ok_or_else(|| {
-                        RowCodecError::Invalid("scalar payload entry length overflow".to_string())
-                    })?;
+                let entry_len = scalar_text_entry_len(text_len)?;
                 reserve(&mut buf, entry_len)?;
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&text_len.to_le_bytes());

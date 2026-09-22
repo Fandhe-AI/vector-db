@@ -165,6 +165,28 @@ detail 文言（`"{op} rejected: invalid row"`）に操作名を埋め込む。U
    変更し、対象の有無に関わらず常に同一の判定（拒否または合格）になる契約へ
    揃えた。
 
+追記（Cursor Bugbot Medium 指摘・PR #989 再指摘）: 上記 2 点目の対策後も、
+列ごとの `MAX_TEXT_FIELD_LEN` 検査単独では `encode_scalar_columns` の
+フレーミングオーバーヘッド（presence(1)＋長さ(4)）を考慮しないため、
+`MAX_TEXT_FIELD_LEN` ちょうどの SET 値が「対象行が存在する場合のみ」
+`encode_scalar_columns` 側の `MAX_SCALAR_PAYLOAD_LEN` 超過で `22000` に
+なり、不存在・不可視の場合は `UPDATE 0` になるという同型の漏えいが残って
+いた。SET 対象の `TEXT` 列だけを対象にした累計フレームサイズ
+（`row_codec::scalar_text_entry_len` を `encode_scalar_columns` と共有）を
+対象行探索より前のループで検証し、SET 値自身だけで決定的に判定できる
+超過は同一の拒否へ揃えた。
+
+既知の残存差異: 個々の SET 値は上限内でも、対象行に既に格納されている
+**未変更の** `TEXT` 列（探索前は内容不明）と組み合わさって初めて
+`MAX_SCALAR_PAYLOAD_LEN` を超えるケースは、対象行探索後の
+`encode_scalar_columns` 呼び出しでのみ判明するため、対象行の有無で
+応答が分かれる余地が理論上残る（既存行の合計メタデータ長は常に
+`MAX_SCALAR_PAYLOAD_LEN` 以下という不変条件を前提にした残存幅）。
+この残差を完全に閉じるには、スキーマの `TEXT` 列数に応じた列単位の
+上限を導入する（例: `MAX_SCALAR_PAYLOAD_LEN / n_text_columns`）等の
+契約変更が必要で、INSERT 側の許容値にも影響するためオーナー判断が
+要る（フォローアップ Issue 化を推奨）。
+
 ## wire 応答: `CommandComplete` タグ
 
 `UpdateOutcome { rows_affected: u64 }`（0 または 1）を pg 互換の `CommandComplete`

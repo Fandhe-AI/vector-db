@@ -1589,6 +1589,17 @@ pub(crate) fn update_row_columns_unchecked(
         // `expected_schema` 比較と多層防御）。
         let mut named_columns: Vec<(&str, &crate::row_codec::Value)> =
             Vec::with_capacity(assignments.len());
+        // SET 対象の TEXT 列だけを対象にした累計フレームサイズ（presence(1)+
+        // 長さ(4)+本文）。対象行の実データ（探索前は不明）を含めず、リクエスト
+        // 自身が持つ SET 値のみから決定的に計算できる下限を先に検証すること
+        // で、「SET 値単体が `encode_scalar_columns` のフレーミングオーバー
+        // ヘッド込みで `MAX_SCALAR_PAYLOAD_LEN` を超える」ケース（列ごとの
+        // `MAX_TEXT_FIELD_LEN` 検査だけでは通過してしまう）を対象行の有無に
+        // 関わらず同一の拒否にする（Cursor Bugbot Medium 指摘・PR #989。
+        // security.md「テナント境界」）。未変更列を含む本当の累計上限超過は
+        // 対象行データに依存するため `encode_scalar_columns` 側の検証に委ねる
+        // （既知の残存差異。`docs/design/update-single-row.md` 判断 D 参照）。
+        let mut set_text_payload_total: u32 = 0;
         for (idx, value) in assignments {
             let column = schema.columns.get(*idx).ok_or_else(|| {
                 TenantWriteError::Catalog(CatalogError::Invalid(
@@ -1617,6 +1628,23 @@ pub(crate) fn update_row_columns_unchecked(
                         return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
                             "text field length {text_len} exceeds limit {}",
                             crate::row_codec::MAX_TEXT_FIELD_LEN
+                        ))));
+                    }
+                    let entry_len =
+                        crate::row_codec::scalar_text_entry_len(text_len).map_err(|e| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(e.to_string()))
+                        })?;
+                    set_text_payload_total = set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                    if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                            "scalar payload length {set_text_payload_total} exceeds limit {}",
+                            crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
                         ))));
                     }
                 }
@@ -3124,6 +3152,100 @@ mod tests {
              generation (same-table writes are not treated as unrelated)"
         );
         assert_eq!(read_gen("sibling"), sibling_gen);
+    }
+
+    // Cursor Bugbot Medium 指摘・PR #989（Issue #865）: `TEXT` 列への SET 値が
+    // ちょうど `row_codec::MAX_TEXT_FIELD_LEN`（4 MiB）の場合、列単体の長さ
+    // 検査は通過するが `row_codec::encode_scalar_columns` のフレーミング
+    // オーバーヘッド（presence(1)+長さ(4)）込みで
+    // `row_codec::MAX_SCALAR_PAYLOAD_LEN` を超える。この超過判定を対象行
+    // 探索より前の累計フレームサイズ検証（`update_row_columns_unchecked` 冒頭の
+    // ループ）で行うことで、対象行の存在有無に関わらず同一の拒否になることを
+    // 固定する（`sql_update_single_row.rs` の SQL 経由テストは `sql::lexer::
+    // MAX_INPUT_LEN`（1 MiB）により 4 MiB の SET リテラルを構成できないため、
+    // `update_row_columns_unchecked` を直接呼ぶ本テストでのみ再現できる）。
+    #[test]
+    fn update_row_columns_set_text_at_max_field_len_rejects_identically_regardless_of_row_existence(
+    ) {
+        let path = unique_db_path("update-columns-max-text-len");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        insert_typed_row(
+            &storage,
+            "docs",
+            &a,
+            1,
+            Visibility::Private,
+            &row_values([0.1, 0.2], "note.txt", "v1"),
+            &OperationId::parse("seed-max-text-len").expect("valid operation_id"),
+        )
+        .expect("seed row");
+
+        // `MAX_TEXT_FIELD_LEN`（4 MiB）ちょうどの SET 値（`body` 列、index=2）。
+        let max_len_text = "x".repeat(4 * 1024 * 1024);
+        let assignments = [(2, crate::row_codec::Value::Text(max_len_text))];
+
+        // ケース (a): 対象行が存在する（id=1）。
+        let op_existing = OperationId::parse("op-maxlen-existing").expect("valid operation_id");
+        let err_existing = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &a,
+            1,
+            &assignments,
+            LedgerWrite::Record(&op_existing),
+            None,
+        )
+        .expect_err("SET value at MAX_TEXT_FIELD_LEN must overflow the scalar payload cap");
+
+        // ケース (b): 対象行が存在しない（id=999）。
+        let op_missing = OperationId::parse("op-maxlen-missing").expect("valid operation_id");
+        let err_missing = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &a,
+            999,
+            &assignments,
+            LedgerWrite::Record(&op_missing),
+            None,
+        )
+        .expect_err(
+            "SET value at MAX_TEXT_FIELD_LEN must overflow identically for a nonexistent row",
+        );
+
+        // 対象行の有無に関わらず同一のエラー文言（= 同一の判定経路）になる
+        // ことを固定する（`Debug` 表現の比較。存在有無で異なる variant/detail
+        // に分岐していないことを機械的に確認する）。
+        assert_eq!(format!("{err_existing:?}"), format!("{err_missing:?}"));
+        assert!(
+            matches!(
+                &err_existing,
+                TenantWriteError::Catalog(CatalogError::Invalid(msg))
+                    if msg.contains("scalar payload length")
+            ),
+            "unexpected error shape: {err_existing:?}"
+        );
+
+        // 対象行（id=1）は無変更のまま（束縛/検証段の拒否であり書き込みは
+        // 発生しない）。`Storage::get` は単一グローバル行テーブル
+        // （`ROWS_TABLE`）専用のため、名前付きテーブル（`user_rows/{table}`）の
+        // 行は `get_row_from_table` で読む（`insert_typed_row` 系はこちらの
+        // 物理テーブルへ書く。`arena.rs`・`core.rs` の既存利用箇所と同じ経路）。
+        let row = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("row must still exist");
+        let values = crate::row_codec::decode_scalar_columns(&file_schema("docs"), &row.metadata)
+            .expect("decode scalar columns");
+        assert_eq!(
+            values[2],
+            crate::row_codec::Value::Text("v1".to_string()),
+            "row must be unchanged when the SET value is rejected before the write"
+        );
     }
 
     // Issue #398: `insert_rows_unchecked` を連続 arena（`arena: Vec<u8>` ＋
