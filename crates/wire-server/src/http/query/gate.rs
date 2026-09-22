@@ -15,10 +15,10 @@
 //! 2. 本文検証: [`crate::http::body::body_as_utf8`] → `engine::json::
 //!    parse_json` → [`crate::http::query::schema::extract_op`]（本文の構文・
 //!    `op` フィールドの形の検証。`42601`）
-//! 3. [`crate::http::query::op::classify_op`]（`op` 名を閉じた語彙 4 値へ
-//!    分類する許可リスト。DDL・UDF 呼び出し・トランザクション制御・
-//!    UPDATE／DELETE 相当を含む語彙外はすべて `0A000`。
-//!    Issue #759・TASK-179・NOSQL-1・NOSQL-9）
+//! 3. [`crate::http::query::op::classify_op`]（`op` 名を閉じた語彙 6 値へ
+//!    分類する許可リスト。DDL・UDF 呼び出し・トランザクション制御を含む
+//!    語彙外はすべて `0A000`。Issue #759・TASK-179・NOSQL-1・NOSQL-9。
+//!    `update`／`delete` の追加は Issue #875・NOSQL-12）
 //! 4. `Op::schema().validate(...)`（必須欠落・未知キー・型不一致 →
 //!    `42601`。`tenant_id` の JSON 自己申告・`HINT ORDER`／
 //!    `SET search_mode` 相当フィールドはここで未知キーとして拒否される）
@@ -33,10 +33,12 @@
 //!    TASK-177・NOSQL-4）、`explain` なしの `(Op::Search, Some(engine))` は
 //!    [`super::search::handle`]（TASK-186・NOSQL-2・Issue #764）、
 //!    `(Op::Insert, Some(engine))` は [`super::insert::handle`]（Issue
-//!    #772・TASK-178・NOSQL-6）へそれぞれ束縛・実行を委譲する。`engine`
-//!    未接続時の `Op::Scan`／`Op::Aggregate`／`Op::Insert`／`Op::Search` は
-//!    暫定の `0A000`／501（[`PLACEHOLDER_MESSAGE`]）を返す（4 op すべてが
-//!    実行結線済みのため、この応答は `engine` 未接続時にのみ到達する）
+//!    #772・TASK-178・NOSQL-6）へそれぞれ束縛・実行を委譲する。
+//!    `(Op::Update, _)`／`(Op::Delete, _)` は `engine` 接続有無を問わず常に
+//!    暫定の `0A000`／501（[`PLACEHOLDER_MESSAGE`]）へ落ちる（許可リスト・
+//!    スキーマ検証は通過するが束縛・実行結線は Issue #876 の担当。実行器
+//!    なしで応答を偽装しない）。`engine` 未接続時の `Op::Scan`／
+//!    `Op::Aggregate`／`Op::Insert`／`Op::Search` も同じ暫定応答へ落ちる
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
 //! `op` にスキーマ検証由来の情報（未知キー等）が先に返ることはない
@@ -60,11 +62,13 @@ use crate::http::{body, response};
 
 pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 
-/// 検証を通過したが実行結線が未接続（`engine` 未接続）の要求に返す暫定応答
-/// の文言。`scan`・`aggregate`・`insert`・`search`（`explain: true` の
-/// `search` を含む）の 4 op すべてが実行結線済み（Issue #766・#768・
-/// #772・#764・#765）のため、この応答は `Router::new` 経由（`engine`
-/// 未接続）の場合にのみ到達する。
+/// 検証を通過したが実行結線が未接続の要求に返す暫定応答の文言。
+/// `scan`・`aggregate`・`insert`・`search`（`explain: true` の `search` を
+/// 含む）の 4 op は実行結線済み（Issue #766・#768・#772・#764・#765）のため
+/// `Router::new` 経由（`engine` 未接続）の場合にのみこの応答へ落ちる。一方
+/// `update`／`delete`（Issue #875・NOSQL-12）は語彙・スキーマ検証を通過して
+/// もなお束縛・実行結線が未実装（Issue #876 の担当）のため、`engine` 接続
+/// 有無によらず常にこの応答へ落ちる。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
 
 /// `POST /v1/query` を処理し応答バイト列を返す（認証済み要求のみ）。
@@ -113,7 +117,9 @@ pub fn handle(
 
     // 手順 5: op と engine 接続有無の組でディスパッチする（Issue #766・
     // #768・#772・#764）。各アームは対応するモジュールへの 1 行委譲に留め、
-    // 4 op すべてが実行結線済みのため `(_, _)` は `engine` 未接続時にのみ
+    // `update`／`delete` は束縛・実行結線が Issue #876 の担当のため明示的に
+    // placeholder へ落とす（実行器なしで応答を偽装しない）。それ以外の
+    // 4 op はすべて実行結線済みのため `(_, _)` は `engine` 未接続時にのみ
     // 到達する。
     match (op, engine) {
         // `explain: true` は通常の `search` 実行（#764 が結線する
@@ -132,6 +138,12 @@ pub fn handle(
         (Op::Search, Some(engine)) => {
             super::search::handle(engine, principal, &validated, now_wall)
         }
+        // `(Op::Update, _)`／`(Op::Delete, _)`（Issue #875・NOSQL-12）は
+        // 語彙・スキーマ検証を通過するが束縛・engine 呼び出しは Issue #876
+        // の担当のため、`engine` 接続有無を問わず必ずここへ落ちる
+        // （`Op::Update`／`Op::Delete` にマッチする専用アームを持たない
+        // ことで、実行器なしで応答を偽装しないことを保証する）。`engine`
+        // 未接続時の他 4 op もここへ落ちる。
         (_, _) => response::encode_error(
             ErrorClass::FeatureNotSupported,
             PLACEHOLDER_MESSAGE,
@@ -347,12 +359,68 @@ mod tests {
     }
 
     #[test]
-    fn tenant_id_in_json_is_rejected_for_all_four_ops() {
-        let cases: [&[u8]; 4] = [
+    fn valid_update_and_delete_reach_placeholder_even_when_engine_is_connected() {
+        // `update`／`delete`（Issue #875・NOSQL-12）は許可リスト・スキーマ
+        // 検証を通過するが、束縛・実行結線は Issue #876 の担当のため、
+        // `engine` 接続済みでも `42P01`（`scan`／`insert`／`search` のように
+        // engine へ到達した証跡）ではなく従来どおりの placeholder
+        // （`0A000`／501）に留まることを固定する。
+        let (core, _guard) = empty_core();
+        let cases: [&[u8]; 2] = [
+            br#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1}}"#,
+            br#"{"op":"delete","table":"docs","where":{"id":1}}"#,
+        ];
+        for body in cases {
+            let response = run_with_engine(&core, body, &[]);
+            let text = String::from_utf8(response).expect("utf-8 response");
+            assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
+            assert!(text.contains("0A000"), "got: {text}");
+            assert!(text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+            assert!(!text.contains("42P01"), "got: {text}");
+        }
+    }
+
+    #[test]
+    fn update_missing_set_rejects_with_42601() {
+        let body = br#"{"op":"update","table":"docs","where":{"id":1}}"#;
+        let response = run(body, &[]);
+        let text = String::from_utf8(response).expect("utf-8 response");
+        assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
+        assert!(text.contains("42601"), "got: {text}");
+    }
+
+    #[test]
+    fn update_with_hint_order_rejects_with_42601_not_0a000() {
+        // op 許可リストを通過した（`0A000` ではない）うえでスキーマ検証段の
+        // 未知キーとして `42601` が返ることを固定する（手順の順序が契約で
+        // あることの `update` 版回帰確認。`op_allowlist_check_precedes_
+        // schema_validation` と対をなす）。
+        let body = br#"{"op":"update","table":"docs","set":{"lang":"en"},"hint_order":["path"]}"#;
+        let response = run(body, &[]);
+        let text = String::from_utf8(response).expect("utf-8 response");
+        assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
+        assert!(text.contains("42601"), "got: {text}");
+        assert!(!text.contains("0A000"), "got: {text}");
+    }
+
+    #[test]
+    fn nested_where_unknown_key_rejects_with_42601() {
+        let body = br#"{"op":"delete","table":"docs","where":{"id":1,"extra":1}}"#;
+        let response = run(body, &[]);
+        let text = String::from_utf8(response).expect("utf-8 response");
+        assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
+        assert!(text.contains("42601"), "got: {text}");
+    }
+
+    #[test]
+    fn tenant_id_in_json_is_rejected_for_all_six_ops() {
+        let cases: [&[u8]; 6] = [
             br#"{"op":"search","table":"docs","limit":1,"tenant_id":"evil"}"#,
             br#"{"op":"scan","table":"docs","limit":1,"tenant_id":"evil"}"#,
             br#"{"op":"aggregate","table":"docs","aggregates":[],"tenant_id":"evil"}"#,
             br#"{"op":"insert","table":"docs","rows":[],"tenant_id":"evil"}"#,
+            br#"{"op":"update","table":"docs","set":{"lang":"en"},"tenant_id":"evil"}"#,
+            br#"{"op":"delete","table":"docs","where":{"id":1},"tenant_id":"evil"}"#,
         ];
         for body in cases {
             let response = run(body, &[]);
@@ -373,10 +441,13 @@ mod tests {
     }
 
     #[test]
-    fn ddl_udf_transaction_update_delete_ops_reject_with_0a000() {
-        // DDL・UDF 呼び出し・トランザクション制御・UPDATE／DELETE 相当・
-        // 表記揺れは、いずれも許可リスト（Op::parse の 4 値）に無いため
-        // 0A000 に落ちる（拒否リストを別途持たない設計の回帰確認）。
+    fn ddl_udf_transaction_ops_reject_with_0a000() {
+        // DDL・UDF 呼び出し・トランザクション制御・表記揺れは、いずれも
+        // 許可リスト（Op::parse の 6 値）に無いため 0A000 に落ちる
+        // （拒否リストを別途持たない設計の回帰確認。`update`／`delete` は
+        // Issue #875 で語彙へ加わったため本テストの対象から除外し、
+        // `valid_update_and_delete_reach_placeholder_even_when_engine_is_connected`
+        // 等へ移した）。
         let ops = [
             "create_table",
             "alter_table",
@@ -386,8 +457,6 @@ mod tests {
             "begin",
             "commit",
             "rollback",
-            "update",
-            "delete",
             "explain",
             "set",
             "SEARCH",
