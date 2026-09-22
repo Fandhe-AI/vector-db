@@ -154,7 +154,8 @@ pub fn check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError>; // 
 - **#871**（述語つき `UPDATE` 実行結線）: `BoundPredicateUpdate::metadata_filters()`／
   `expr_filters()` を RLS 可視行の SCALAR 段（`matches_all` ＋ `ExprProgram`
   コンパイル）に適用して候補集合を確定し、`check_dml_affected_rows(count)` を
-  変更開始前に呼ぶ。
+  変更開始前に呼ぶ。`operation_id` 内容照合ハッシュの入力仕様・記録順序は
+  `docs/design/multi-row-dml-operation-id.md`（Issue #868）に従う。
 - **#870**（述語つき `DELETE`）: `UpdateWhereForm` の振り分け規則・`visible()` のみ
   拒否・`MAX_DML_AFFECTED_ROWS` をそのまま再利用する想定。
 - **#876**（NoSQL `update` op）: `BoundPredicateUpdate::new` は `pub(crate)`
