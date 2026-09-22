@@ -3312,17 +3312,6 @@ impl EngineCore {
         )
     }
 
-    /// バッチ INSERT の②③④上限（1 行あたり・バッチ合計のバイト量／チャンク総量。
-    /// `batch_limits.rs`・INDEX-4）を検証する。行内容自体（テキスト・ベクトル）は
-    /// 複製せず長さのみを積算する（coding-rust.md「不安全な設計 / DoS」対応）。
-    ///
-    /// [`Self::execute_bound_insert_in_session`]（NoSQL 表層 `rows[]`・NOSQL-6・
-    /// TASK-178・判定6）と `execute_insert_form` の `RowBatch` 分岐（SQL 表層の
-    /// 複数行 VALUES・SQL-16・TASK-190）が同一の判定本体を共有し、表層間で上限を
-    /// 迂回できないようにする（Issue #860 SQL/NoSQL 機能パリティ）。①（行数上限。
-    /// `self.batch_limits.max_files_per_batch`）は各呼び出し元が個別に行う
-    /// （NoSQL 表層はスキーマ取得・束縛より前に判定する契約のため、束縛済み
-    /// `bounds` だけを受け取る本関数には含められない）。
     /// SQL 表層の複数行 `VALUES`（①行数上限＋②③④バイト量・チャンク総量）
     /// 上限検証本体。`execute_insert_form`・`execute_insert_returning_form`
     /// （`RETURNING` 付き。Issue #873・SQL-21）の `RowBatch` 分岐がいずれも
@@ -3347,6 +3336,18 @@ impl EngineCore {
         self.validate_insert_batch_byte_and_chunk_limits(bounds)
     }
 
+    /// バッチ INSERT の②③④上限（1 行あたり・バッチ合計のバイト量／チャンク総量。
+    /// `batch_limits.rs`・INDEX-4）を検証する。行内容自体（テキスト・ベクトル）は
+    /// 複製せず長さのみを積算する（coding-rust.md「不安全な設計 / DoS」対応）。
+    ///
+    /// [`Self::execute_bound_insert_in_session`]（NoSQL 表層 `rows[]`・NOSQL-6・
+    /// TASK-178・判定6）と [`Self::validate_insert_row_batch_limits`]（SQL 表層の
+    /// 複数行 VALUES・SQL-16・TASK-190・`RETURNING` 付き経路を含む）が同一の
+    /// 判定本体を共有し、表層間で上限を迂回できないようにする（Issue #860
+    /// SQL/NoSQL 機能パリティ）。①（行数上限。`self.batch_limits.
+    /// max_files_per_batch`）は各呼び出し元が個別に行う（NoSQL 表層は
+    /// スキーマ取得・束縛より前に判定する契約のため、束縛済み `bounds` だけを
+    /// 受け取る本関数には含められない）。
     fn validate_insert_batch_byte_and_chunk_limits(
         &self,
         bounds: &[crate::sql::parser::BoundInsert],
