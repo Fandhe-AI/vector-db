@@ -1871,10 +1871,12 @@ impl<'a> Parser<'a> {
     /// 文脈的キーワード `USING` のいずれかである場合に限り [`UpdateWhereForm::Id`]
     /// （単一行・id 指定形）とし、それ以外はすべて位置を巻き戻して
     /// [`Self::parse_where`]（`SELECT`・集計 `SELECT`・広域取得 `SELECT` と同一の
-    /// 許可述語列表現）で [`UpdateWhereForm::Predicates`] を構築する。`id = 5 AND
-    /// lang = 'ja'`・`id = 'x'`（数値以外の id 比較）・`lang = 'ja'` はいずれも
-    /// 3 トークン一致条件に外れる（`id = 5 AND ...` は 4 番目の条件にも外れる）
-    /// ため述語形へ流れる——`validate_update`（既存の id 指定形専用エントリ
+    /// 許可述語列表現）で [`UpdateWhereForm::Predicates`] を構築する。`id = 'x'`
+    /// （数値以外の id 比較）・`lang = 'ja'` は先頭 3 トークン一致条件（`Ident("id")`・
+    /// `Punct('=')`・`Number`）そのものに外れるため述語形へ流れる。`id = 5 AND
+    /// lang = 'ja'` は先頭 3 トークンには一致するが、4 番目のトークンが終端
+    /// （`None`・`Punct(';')`・`USING`）ではなく `AND` であるため 4 番目の条件で
+    /// 述語形へ流れる——`validate_update`（既存の id 指定形専用エントリ
     /// ポイント）はこの結果が `Predicates` なら `42601` で拒否することで、
     /// 旧来の狭い受理形をそのまま維持する（後方互換）。
     fn parse_update_where(&mut self) -> Result<UpdateWhereForm, SqlSurfaceError> {

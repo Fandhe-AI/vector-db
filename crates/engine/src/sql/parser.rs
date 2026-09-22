@@ -1106,16 +1106,22 @@ fn bind_set_assignments(
 /// 1 文の `UPDATE`／`DELETE`（述語形。SQL-19・SQL-20 系）が変更してよい行数の
 /// 上限（本リポの実装既定値。SQL-16・TASK-190 の `MAX_INSERT_ROWS_PER_STATEMENT`
 /// と同じ「1 文あたり」の桁に揃える）。束縛段階では対象行数が確定しないため、
-/// 実行結線（Issue #871・#870）が対象行集合を確定させた後・変更を開始する前に
-/// [`check_dml_affected_rows`] を呼ぶ契約とする（構造検証・束縛のみを担う本
-/// モジュールは値を提供するのみで、判定自体はここでは行わない）。
+/// 実行結線（Issue #871・#870）が変更を開始する前に [`check_dml_affected_rows`]
+/// を呼ぶ契約とする（構造検証・束縛のみを担う本モジュールは値を提供するのみで、
+/// 判定自体はここでは行わない）。`count` は対象行集合の全件列挙結果である必要は
+/// なく、広い述語（例: 全行に一致する `WHERE`）による無制限列挙を避けるため、
+/// 呼び出し元は候補行を `MAX_DML_AFFECTED_ROWS + 1` 件に達した時点で列挙を
+/// 打ち切ってその件数を渡してよい（早期終了。security.md「不安全な設計」＝
+/// 未検証入力によるリソース増幅の回避）。
 pub const MAX_DML_AFFECTED_ROWS: usize = 1_000;
 
-/// `count`（確定した対象行数）が [`MAX_DML_AFFECTED_ROWS`] を超えないか検証する。
-/// 超過は [`SqlSurfaceError::PayloadTooLarge`]（`54000`）。`detail` には件数と
-/// 上限のみを含め、テナント・行内容には触れない（fail-closed。実行前・副作用
-/// ゼロの段階で拒否する契約。呼び出し元は Issue #871（述語つき `UPDATE` 実行結線）・
-/// #870（述語つき `DELETE`）が対象行集合確定後・変更開始前に呼ぶ）。
+/// `count`（対象行数。[`MAX_DML_AFFECTED_ROWS`] を超えたかどうかの判定にのみ
+/// 使うため、呼び出し元は `MAX_DML_AFFECTED_ROWS + 1` 件で打ち切った列挙結果を
+/// 渡してよい）が [`MAX_DML_AFFECTED_ROWS`] を超えないか検証する。超過は
+/// [`SqlSurfaceError::PayloadTooLarge`]（`54000`）。`detail` には件数と上限のみを
+/// 含め、テナント・行内容には触れない（fail-closed。実行前・副作用ゼロの段階で
+/// 拒否する契約。呼び出し元は Issue #871（述語つき `UPDATE` 実行結線）・#870
+/// （述語つき `DELETE`）が変更開始前に呼ぶ）。
 pub fn check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError> {
     if count > MAX_DML_AFFECTED_ROWS {
         return Err(SqlSurfaceError::payload_too_large(format!(
