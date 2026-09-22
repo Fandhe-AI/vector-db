@@ -52,8 +52,10 @@ encode → write を**単一の write トランザクション内**で行う設�
 レイアウトであることを要求する。SQL 表層の `INSERT`・型付き挿入 API はすべてこの
 経路を通るため本番では常に満たされるが、旧フォーマットの raw metadata（全行置換版
 `RowInput` を直接構築する非 SQL 呼び出し元専用の Rust API）が書いた行を対象にした
-場合は `decode_scalar_columns` が構造不整合を検出し `CatalogError::Invalid`
-（`22000`）で fail-closed に拒否する。
+場合は `decode_scalar_columns` が構造不整合を検出し、格納済みデータの破損・
+実装不整合として `CatalogError::CorruptSchema`（`sql::exec::map_write_error`
+経由で `XX000`）で fail-closed に拒否する（クライアント入力エラー `22000` には
+丸めない。codex-review P1 指摘・PR #989）。
 
 `EngineCore::update_row`（全行置換の既存 Rust API）・`tenant::update_row`（同）は
 無変更のまま維持する。
@@ -115,10 +117,12 @@ SET 句の（列名, 値）ペアを**宣言順のまま**（呼び出し元は�
 `map_insert_write_error`（`TenantWriteError` → `SqlSurfaceError`）を、呼び出し元の
 操作名を追加パラメータとして受け取る `map_write_error(e, op)` へ切り出した。
 `wire_code` 自体は不変だが、`CatalogError::Invalid`／`StorageError::Codec` アームの
-detail 文言（`"{op} rejected: invalid row"`）に操作名を埋め込む。UPDATE の既存行
-デコード失敗・列値の不正を「insert が拒否された」という誤った文言でクライアントへ
+detail 文言（`"{op} rejected: invalid row"`）に操作名を埋め込む。UPDATE の SET
+列値の不正・スキーマ不一致を「insert が拒否された」という誤った文言でクライアントへ
 返さないための変更（`client_message()` はこの detail をそのままクライアントへ
-含める）。`execute_update` は新設の `op = "update"` 呼び出しとして本経路に乗る。
+含める）。`execute_update` は新設の `op = "update"` 呼び出しとして本経路に乗る
+（対象行の既存 metadata デコード失敗は `CorruptSchema` として別経路の catch-all
+`XX000` へ分類され、この detail 文言は付与されない）。
 
 あわせて `execute_delete`（Issue #983 で `map_insert_write_error` を暫定使用して
 いた既存箇所）も `map_write_error(e, "delete")` へ切り替え、DELETE 失敗時に誤って
