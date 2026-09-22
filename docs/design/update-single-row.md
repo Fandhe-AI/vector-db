@@ -139,6 +139,32 @@ detail 文言（`"{op} rejected: invalid row"`）に操作名を埋め込む。U
 残し、`execute_insert`／`execute_insert_batch`／`execute_truncate` の既存呼び出しは
 無変更のまま維持する。
 
+## 判断 D: SET 値の形状検証は対象行探索より前・列出力の累計サイズは確保前に検証する
+
+コードレビュー（codex-review P1・Cursor Bugbot Medium）で 2 件の指摘があり、
+いずれも本判断として対処した。
+
+1点目（無制限確保）: `row_codec::encode_scalar_columns`（`decode_scalar_columns`
+   と対になる書き込み側）は列ごとには `MAX_TEXT_FIELD_LEN`（4 MiB）を検査するが、
+   複数 `TEXT` 列の合計サイズを確保前に検証していなかった。多数の `TEXT` 列を
+   持つスキーマに対する小さな SET 句の UPDATE でも、既存行の再エンコードが
+   列数倍（最大で `storage::MAX_METADATA_LEN` を大きく超える規模）まで
+   膨らみ得た（security.md「不安全な設計｜無制限リソース確保（DoS）」）。
+   `row_codec::MAX_SCALAR_PAYLOAD_LEN`（`storage::MAX_METADATA_LEN` と同値を
+   const assert で強制）を新設し、`encode_scalar_columns` が 1 バイト書き込む
+   前に累計出力サイズを検証してから `try_reserve_exact` する方式へ変更した。
+   INSERT・UPDATE 双方が同じ関数を経由するため、この修正は両経路に効く。
+
+2点目（存在情報の漏えい）: SET 値の妥当性（`VECTOR` 列の次元・`TEXT` 列の長さ
+   上限）を対象行 lookup **後**の `Some(row) => { ... }` 分岐内でのみ検証していた
+   ため、同一の不正な SET 値でも「対象行が存在する場合は `22000` エラー」
+   「対象行が不存在・他テナント所有・RLS 不可視の場合は `UPDATE 0` 成功」という
+   応答の分岐が生じ、エラーの有無そのものが行の存在を漏らす識別子になっていた
+   （security.md「テナント境界」）。列 index・型の検証と同じループ内（対象行
+   探索より前）で次元・長さ上限を検証するよう `update_row_columns_unchecked` を
+   変更し、対象の有無に関わらず常に同一の判定（拒否または合格）になる契約へ
+   揃えた。
+
 ## wire 応答: `CommandComplete` タグ
 
 `UpdateOutcome { rows_affected: u64 }`（0 または 1）を pg 互換の `CommandComplete`

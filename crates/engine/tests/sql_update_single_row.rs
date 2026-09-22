@@ -495,6 +495,32 @@ fn set_embedding_with_wrong_dimension_is_rejected_with_22000() {
     assert_eq!(err.wire_code(), "22000");
 }
 
+/// 不正な SET 値（次元不一致）は、対象行が実在するかどうかに関わらず同一の
+/// `22000` 拒否になる（Cursor Bugbot 指摘・PR #989。値の形状検証を対象行 lookup
+/// より前に行うことで、エラー有無そのものが行の存在を漏らす識別子にならない
+/// ことを固定する）。対象行が存在する場合は上の
+/// `set_embedding_with_wrong_dimension_is_rejected_with_22000` が同じ契約を検証する。
+#[test]
+fn set_embedding_with_wrong_dimension_is_rejected_with_22000_even_for_nonexistent_row() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    // id = 1 は投入しない（対象行が存在しない状態で SET 値の妥当性のみを問う）。
+
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET embedding = '[1.0,2.0,3.0]' WHERE id = 1 \
+                 USING OPERATION_ID 'op-dim-missing'"
+            ),
+        )
+        .expect_err("dimension mismatch must be rejected even when the target row is absent");
+    assert_eq!(err.wire_code(), "22000");
+}
+
 /// 未知の列への SET は `22000`。
 #[test]
 fn set_unknown_column_is_rejected_with_22000() {

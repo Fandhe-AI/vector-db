@@ -45,7 +45,9 @@ use crate::rls::{ImplicitRlsHook, RlsSafetyNet, RlsVerifiedHits};
 use crate::row_codec::{self, RowCodecError, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
-use crate::sql::parser::{BoundStatement, ProjectedColumn, Ranking};
+use crate::sql::parser::{
+    BoundConflictAction, BoundStatement, BoundUpsert, BoundUpsertValue, ProjectedColumn, Ranking,
+};
 use crate::sql::plan::ExecutionPlan;
 use crate::sql::udf_call;
 use crate::storage::StorageError;
@@ -2839,6 +2841,104 @@ pub(crate) fn execute_insert_batch_with_schema(
     })
 }
 
+/// SQL 表層 `INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (id)
+/// DO NOTHING | DO UPDATE SET ... USING OPERATION_ID '<id>'`（SQL-20、
+/// TASK-193、Issue #872）の実行入口。`bound`（`sql::parser::bind_insert_form`
+/// の `Upsert` 分岐が束縛済み）を `crate::tenant::upsert_typed_rows_unchecked`
+/// へ委譲する（[`execute_insert`]・[`execute_insert_batch`] と同じ設計）。
+///
+/// **衝突判定スコープ・応答意味論**: `docs/design/sql-upsert.md` 参照。行 `id`
+/// 衝突は本構文では常に `DO NOTHING`／`DO UPDATE` のいずれかへ分岐し、行制約
+/// 由来の [`SqlSurfaceError::IdConflict`]（`23505`）は構造的に到達しない
+/// （テナント名前空間化された物理キー内の衝突は必ずこの経路で処理される）。
+/// `InsertOutcome::rows_affected` は「新規挿入した行数＋更新した行数」（全行
+/// `DO NOTHING` で衝突した場合は `0`）。
+///
+/// `ledger_mode` の解決・`operation_id` 必須化ガード（TASK-92・RECOVER-1）は
+/// [`execute_insert`] と同じ契約。
+///
+/// `bound_schema` は `bound`（`BoundUpsert`）の列インデックス（`DO UPDATE SET`
+/// の対象列・`EXCLUDED` 参照列を含む）を解決した時点のスキーマを**必須**で
+/// 受け取る（`Option` ではない。codex-review P1 指摘・PR #990。
+/// [`execute_insert_with_schema`]・[`execute_insert_batch_with_schema`] は
+/// `Option<&TableSchema>`（`None` を許す `pub` 経由路が存在するが、それらは
+/// Issue #730・#823 で既に確定した既存契約であり本 PR の対象外）だが、
+/// `execute_upsert` は本 PR（Issue #872）で新設される唯一の公開入口であり
+/// 後方互換の制約が無いため、スキーマ照合を省略できる経路をそもそも作らない
+/// 設計にする。これが無いと、束縛後・書き込み前に同名テーブルが `DROP`・
+/// 再作成され列の宣言順・型が入れ替わった場合、`DO UPDATE SET` の列インデックス
+/// が別の列を指したまま `crate::tenant::upsert_typed_rows_unchecked` へ渡り、
+/// 意図しない列を更新し得る（TOCTOU）。呼び出し元は必ず「束縛直前に取得した
+/// スキーマ」を渡すこと（`core::EngineCore::execute_insert_sql` の唯一の
+/// 呼び出し元を参照）。
+pub fn execute_upsert(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &BoundUpsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    bound_schema: &crate::catalog::TableSchema,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    use crate::storage::Visibility;
+
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id.as_ref())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+
+    let rows: Vec<(u64, &[crate::row_codec::Value])> = bound
+        .rows
+        .iter()
+        .map(|b| (b.id, b.values.as_slice()))
+        .collect();
+
+    // `sql::parser::BoundConflictAction`／`BoundUpsertValue` を
+    // `tenant::UpsertAction`／`UpsertSetValue`（`sql` へ依存しない最小表現）へ
+    // 変換する（`tenant.rs` モジュールドキュメント参照）。
+    let tenant_assignments: Vec<(usize, crate::tenant::UpsertSetValue<'_>)> = match &bound.action {
+        BoundConflictAction::DoNothing => Vec::new(),
+        BoundConflictAction::DoUpdate(assignments) => assignments
+            .iter()
+            .map(|(col_idx, value)| {
+                let v = match value {
+                    BoundUpsertValue::Excluded(src_idx) => {
+                        crate::tenant::UpsertSetValue::Excluded(*src_idx)
+                    }
+                    BoundUpsertValue::Literal(v) => crate::tenant::UpsertSetValue::Literal(v),
+                };
+                (*col_idx, v)
+            })
+            .collect(),
+    };
+    let tenant_action = match &bound.action {
+        BoundConflictAction::DoNothing => crate::tenant::UpsertAction::DoNothing,
+        BoundConflictAction::DoUpdate(_) => {
+            crate::tenant::UpsertAction::DoUpdate(&tenant_assignments)
+        }
+    };
+
+    let outcome = crate::tenant::upsert_typed_rows_unchecked(
+        storage,
+        &bound.table,
+        ctx,
+        Visibility::Private,
+        &rows,
+        &tenant_action,
+        ledger_write,
+        Some(bound_schema),
+    )
+    .map_err(map_insert_write_error)?;
+
+    let rows_affected = outcome
+        .inserted
+        .checked_add(outcome.updated)
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "upsert row count overflow".to_string(),
+        })?;
+    Ok(InsertOutcome {
+        rows_affected,
+        incremental: None,
+    })
+}
+
 /// ファイル形 `INSERT`（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2）を実行する。
 /// `sql::parser::bind_insert_form` が判別した `BoundFileInsert` を受け取り、
 /// `incremental::index_file` へ委譲する。`embedder` が未設定（`None`）の場合は
@@ -3229,6 +3329,90 @@ mod tests {
                 Some(&before),
             )
             .expect_err("stale bound schema must be rejected for multi-row batches too");
+            assert_eq!(err.wire_code(), "22000");
+        }
+
+        // codex-review P1 指摘（PR #990・Issue #872）の回帰テスト: `execute_upsert`
+        // は `bound_schema` を必須引数（`Option` ではない）として要求し、
+        // `DO UPDATE SET` の対象列インデックスを解決した束縛時点のスキーマと、
+        // write トランザクション内で再取得した実際のスキーマとの不一致を検出する。
+        // 上記 `execute_insert_with_schema_rejects_stale_schema_after_column_reorder`
+        // と同じシナリオ（`TEXT` 2 列の宣言順入れ替え）で、`SET title = 'ja'`
+        // （束縛時点では `title` 列を指す col_idx）が再作成後のスキーマでは
+        // `lang` 列を指してしまう TOCTOU を固定する。
+        #[test]
+        fn execute_upsert_rejects_stale_schema_after_column_reorder() {
+            use crate::sql::parser::{BoundConflictAction, BoundUpsert, BoundUpsertValue};
+
+            let path = unique_db_path("exec-upsert-schema-mismatch");
+            let _guard = CleanupGuard(path.clone());
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&schema_before())
+                .expect("create table");
+            // 既存行を 1 件用意する（DO UPDATE 分岐に到達させるため）。
+            let ctx = PolicyContext::new("tenant-a").expect("valid tenant ctx");
+            let op_id = OperationId::parse("op-1").expect("valid operation_id");
+            super::super::execute_insert(&storage, &ctx, &bound(1, &op_id), LedgerMode::Ledgered)
+                .expect("seed row insert must succeed");
+
+            storage.drop_table(TABLE).expect("drop table");
+            storage
+                .create_table(&schema_after_swap())
+                .expect("recreate table with swapped column order");
+            // 再作成直後にテナント名前空間つきの物理キーへ既存行を再投入し
+            // （`schema_after_swap` の列順で）、`DO UPDATE` の衝突分岐へ到達
+            // させる（`TABLE-12` のテナント整合検査を満たすため
+            // `execute_insert` を経由する）。
+            let seed_op_id = OperationId::parse("op-seed").expect("valid operation_id");
+            super::super::execute_insert(
+                &storage,
+                &ctx,
+                &BoundInsert {
+                    table: TABLE.to_string(),
+                    id: 1,
+                    values: vec![
+                        Value::Vector(vec![1.0, 0.0]),
+                        Value::Text("hello".to_string()),
+                        Value::Text("ja".to_string()),
+                    ],
+                    operation_id: Some(seed_op_id),
+                },
+                LedgerMode::Ledgered,
+            )
+            .expect("reseed row insert under swapped schema must succeed");
+
+            // 束縛時点のスキーマ（`schema_before`）で `SET title = 'stale'` を
+            // 束縛する（`title` の col_idx は `schema_before` では 2）。
+            let upsert_op_id = OperationId::parse("op-2").expect("valid operation_id");
+            let stale_bound = BoundUpsert {
+                table: TABLE.to_string(),
+                rows: vec![BoundInsert {
+                    table: TABLE.to_string(),
+                    id: 1,
+                    values: vec![
+                        Value::Vector(vec![0.0, 1.0]),
+                        Value::Text("en".to_string()),
+                        Value::Text("world".to_string()),
+                    ],
+                    operation_id: Some(upsert_op_id.clone()),
+                }],
+                action: BoundConflictAction::DoUpdate(vec![(
+                    2,
+                    BoundUpsertValue::Literal(Value::Text("stale".to_string())),
+                )]),
+                operation_id: Some(upsert_op_id),
+            };
+
+            let before_for_call = schema_before();
+            let err = super::super::execute_upsert(
+                &storage,
+                &ctx,
+                &stale_bound,
+                LedgerMode::Ledgered,
+                &before_for_call,
+            )
+            .expect_err("stale bound schema must be rejected for upsert too");
             assert_eq!(err.wire_code(), "22000");
         }
     }

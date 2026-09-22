@@ -49,6 +49,21 @@ const _: () = assert!(
     "row_codec::MAX_EMBEDDING_DIM must stay in sync with storage::MAX_EMBEDDING_DIM"
 );
 
+/// [`encode_scalar_columns`] が複数 `TEXT` 列を連結して積む出力バッファ全体の
+/// 累計バイト上限。列ごとの上限 [`MAX_TEXT_FIELD_LEN`]（4 MiB）は列数分の
+/// 掛け算で数百 MiB〜GiB 規模まで届き得るため、それとは別に累計側でも
+/// 確保前に上限検証する（security.md「不安全な設計｜無制限リソース確保（DoS）」・
+/// codex-review 指摘・PR #989「小さい SET でも既存の大きな行に対し無制限確保が
+/// 可能」対応）。値は `storage::MAX_METADATA_LEN`（最終的にこの出力を格納する
+/// `RowInput::metadata` 側の上限）と同期させ、片方だけの変更を防ぐため下部の
+/// const assert でコンパイル時に強制する。
+const MAX_SCALAR_PAYLOAD_LEN: u32 = 4 * 1024 * 1024;
+
+const _: () = assert!(
+    MAX_SCALAR_PAYLOAD_LEN == crate::storage::MAX_METADATA_LEN,
+    "row_codec::MAX_SCALAR_PAYLOAD_LEN must stay in sync with storage::MAX_METADATA_LEN"
+);
+
 /// 列値の有無を示すタグバイト。未知の値は fail-closed に拒否する（presence の
 /// 黙殺フォールバックは NULL/値ありの取り違えに直結するため許容しない）。
 const PRESENCE_NULL: u8 = 0x00;
@@ -428,7 +443,30 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
         )));
     }
 
+    // 累計出力バイト数を確保前に検証する（[`MAX_SCALAR_PAYLOAD_LEN`] 参照）。
+    // 列ごとの `MAX_TEXT_FIELD_LEN` 検査だけでは、多数の `TEXT` 列を持つ
+    // スキーマで `buf` が列数倍に膨らみ得るため、1 バイト書き込むより前に
+    // 累計上限を跨いでいないか判定してから `push`/`extend_from_slice` する
+    // （`buf` 自体は `MAX_SCALAR_PAYLOAD_LEN` を超えて確保されない）。
     let mut buf = Vec::new();
+    let mut total_len: u32 = 0;
+    let mut reserve = |buf: &mut Vec<u8>, additional: u32| -> Result<()> {
+        total_len = total_len
+            .checked_add(additional)
+            .ok_or_else(|| RowCodecError::Invalid("scalar payload length overflow".to_string()))?;
+        if total_len > MAX_SCALAR_PAYLOAD_LEN {
+            return Err(RowCodecError::Invalid(format!(
+                "scalar payload length {total_len} exceeds limit {MAX_SCALAR_PAYLOAD_LEN}"
+            )));
+        }
+        if buf.capacity() < total_len as usize {
+            buf.try_reserve_exact(total_len as usize - buf.capacity())
+                .map_err(|_| {
+                    RowCodecError::Invalid("failed to reserve scalar payload buffer".to_string())
+                })?;
+        }
+        Ok(())
+    };
     for (idx, column) in schema.columns.iter().enumerate() {
         if matches!(column.ty, ColumnType::Vector(_)) {
             // VECTOR 列は storage.rs 側の embedding スロットが担当するため、
@@ -444,6 +482,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                         column.name
                     )));
                 }
+                reserve(&mut buf, 1)?;
                 buf.push(PRESENCE_NULL);
             }
             Value::Text(text) => {
@@ -459,6 +498,14 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                         "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
                     )));
                 }
+                // presence(1) + 長さ(4) + 本文（text_len）の合計を確保前に検証する。
+                let entry_len = 1u32
+                    .checked_add(4)
+                    .and_then(|n| n.checked_add(text_len))
+                    .ok_or_else(|| {
+                        RowCodecError::Invalid("scalar payload entry length overflow".to_string())
+                    })?;
+                reserve(&mut buf, entry_len)?;
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&text_len.to_le_bytes());
                 buf.extend_from_slice(text_bytes);
@@ -751,6 +798,34 @@ mod tests {
         let values = vec![Value::Text(huge_text)];
         let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
         assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    /// 列ごとには [`MAX_TEXT_FIELD_LEN`] 以下でも、複数 `TEXT` 列の合計が
+    /// [`MAX_SCALAR_PAYLOAD_LEN`] を超える場合は `encode_scalar_columns` が
+    /// 確保前に拒否する（codex-review 指摘・PR #989「小さい SET でも既存の
+    /// 大きな行に対し無制限確保が可能」対応。列数を増やして列単体の上限検査
+    /// だけでは検出できない累計超過を再現する）。
+    #[test]
+    fn encode_scalar_columns_rejects_cumulative_text_length_overflow() {
+        // 各列は MAX_TEXT_FIELD_LEN の半分強に収め、2 列の合計が
+        // MAX_SCALAR_PAYLOAD_LEN（= MAX_TEXT_FIELD_LEN と同値）を超えるようにする。
+        let per_column_len = (MAX_TEXT_FIELD_LEN as usize) / 2 + 1;
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, false),
+                ColumnDef::new("b", ColumnType::Text, false),
+            ],
+        );
+        let values = vec![
+            Value::Text("x".repeat(per_column_len)),
+            Value::Text("y".repeat(per_column_len)),
+        ];
+        let result = encode_scalar_columns(&schema, &values);
+        assert!(
+            matches!(result, Err(RowCodecError::Invalid(_))),
+            "cumulative scalar payload length must be rejected before allocation"
+        );
     }
 
     #[test]
