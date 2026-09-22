@@ -219,6 +219,22 @@ pub struct InsertOutcome {
 #[non_exhaustive]
 pub struct TruncateOutcome {}
 
+/// `EngineCore::execute_delete_sql` の成功応答（SQL-18、TASK-191、#867）。
+/// `DELETE FROM <table> WHERE id = <n> USING OPERATION_ID '<id>'` は単一行
+/// （`id` 等価指定）のみを受理するため `rows_affected` は `0` または `1` の
+/// いずれかになる——他テナント保持 id・未存在 id への削除要求は
+/// [`execute_delete`] のドキュメント参照のとおり `0` へ写像し、対象行の
+/// 有無（他テナント所有か未存在か）を応答から一切区別しない（RLS-9・RLS-10。
+/// security.md「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」）。
+/// `rows_affected` は自テナントの結果を表すのみのため、`TruncateOutcome` と
+/// 異なり露出しても再送側の件数推定材料にはならない（`INSERT 0 <rows>` と
+/// 同じ pg 互換タグ `DELETE <rows>` へ写像する。`wire-server::simple_query`
+/// 参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    pub rows_affected: u64,
+}
+
 impl From<RowCodecError> for SqlSurfaceError {
     /// スカラーペイロードのデコード失敗は、格納済みデータの破損・実装バグの
     /// いずれかであり、SQL 入力自体の不正ではないため fail-closed に `XX000` へ
@@ -2528,6 +2544,48 @@ pub fn execute_truncate(
         .map_err(map_insert_write_error)?;
 
     Ok(TruncateOutcome {})
+}
+
+/// SQL 表層 `DELETE FROM <table> WHERE id = <n> USING OPERATION_ID '<id>'`
+/// （SQL-18、TASK-191、#867）の実行入口。`bound`（`sql::parser::bind_delete`
+/// 束縛済み）の `operation_id` を `ledger_mode` で台帳書き込み指示へ解決してから
+/// [`crate::tenant::delete_row_unchecked`] へ委譲する（[`execute_insert`]・
+/// [`execute_truncate`] と同じ設計）。
+///
+/// **0 行成功への写像（#867 設計判断・安全側）**: `delete_row_unchecked` は
+/// 「対象行が不存在」と「対象行が存在するが他テナント所有」を区別せず
+/// [`crate::tenant::TenantWriteError::NotFound`] を返す契約（`tenant.rs`
+/// ドキュメント参照。RLS-9・RLS-10）。本関数はこの `NotFound` を
+/// エラーとして伝播せず `Ok(DeleteOutcome { rows_affected: 0 })` へ写像する
+/// （`map_insert_write_error` の `_` アーム〔`XX000`〕には渡さない。他テナント
+/// 保持 id・未存在 id のいずれでも成否・件数・`wire_code`・文言・副作用が完全に
+/// 同一になるため、これらのケースを応答から区別できない）。`NotFound` の場合
+/// `delete_row_unchecked` 内の write トランザクションは早期 `return` により
+/// commit されず破棄されるため、台帳への tentative 追記・テーブル世代の進行は
+/// いずれも発生しない（`TRUNCATE` の「0 件でも必ず台帳記録・世代進行」契約とは
+/// 意図的に非対称。`tenant::delete_row_unchecked` の既存 Rust API 契約
+/// （`recover4_*` テスト群）を変更しないための設計判断）。
+///
+/// `LedgerMode::Ledgered`（既定）で `operation_id` が `None` の場合は `resolve` が
+/// `Err` を返し [`SqlSurfaceError::MissingOperationId`]（`23502`）へ写像される——
+/// SQL 表層経由（`core.rs`）では `sql::allowlist::validate_delete` の事前検査が
+/// 同じ判定を本関数の呼び出し前に既に行っているため通常は到達しないが、
+/// `execute_insert`／`execute_truncate` と同じく本関数単体でも fail-closed を保つ。
+pub fn execute_delete(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundDelete,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+) -> Result<DeleteOutcome, SqlSurfaceError> {
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id.as_ref())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+
+    match crate::tenant::delete_row_unchecked(storage, &bound.table, ctx, bound.id, ledger_write) {
+        Ok(()) => Ok(DeleteOutcome { rows_affected: 1 }),
+        Err(crate::tenant::TenantWriteError::NotFound) => Ok(DeleteOutcome { rows_affected: 0 }),
+        Err(e) => Err(map_insert_write_error(e)),
+    }
 }
 
 /// [`execute_insert`]・[`execute_insert_batch`]・[`execute_truncate`] が共有する

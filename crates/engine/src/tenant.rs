@@ -1159,8 +1159,15 @@ pub fn delete_row(
 }
 
 /// [`delete_row`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と同じ
-/// 設計）。呼び出し元は本モジュール内の [`delete_row`] と
-/// `crate::core::EngineCore::delete_row`（`self.ledger_mode` でガード済み）。
+/// 設計）。呼び出し元は本モジュール内の [`delete_row`]・
+/// `crate::core::EngineCore::delete_row`（`self.ledger_mode` でガード済み）に加え、
+/// SQL 表層 `DELETE FROM <table> WHERE id = <n> USING OPERATION_ID '<id>'`
+/// （SQL-18・TASK-191・#867）の唯一の到達経路 `crate::sql::exec::execute_delete`
+/// （`core.rs::EngineCore::execute_delete_sql`／`execute_sql_in_session` の
+/// `DELETE` 分岐から呼ばれる）。`execute_delete` は本関数が返す `NotFound`
+/// （対象行が不存在／他テナント所有のいずれかを区別しない契約）を SQL 表層の
+/// エラーとして伝播せず `0` 行成功へ写像する（`docs/design/
+/// sql-delete-single-row.md` 参照。この写像は本関数の契約自体には影響しない）。
 ///
 /// `ledger`（TASK-93・RECOVER-2、TASK-94・RECOVER-3、TASK-101・RECOVER-10）:
 /// [`update_row_unchecked`] と同じく、台帳照合・追記を所有権判定（`owns_existing`）
