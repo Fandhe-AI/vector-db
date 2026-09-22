@@ -111,8 +111,11 @@ pub fn check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError>; // 
 既定値 1,000 は本リポの実装既定値（spec 由来の数値ではない）。`SQL-16`・
 `TASK-190` の `MAX_INSERT_ROWS_PER_STATEMENT`（1 文あたり 1,000 行）と桁を揃えた。
 実行結線（Issue #871・述語つき `UPDATE`。Issue #870・述語つき `DELETE`）が
-**対象行集合を確定させた後・変更を開始する前**に呼ぶ契約（実行前・副作用ゼロの
-段階で拒否する fail-closed 設計）。
+**変更を開始する前**に呼ぶ契約（実行前・副作用ゼロの段階で拒否する fail-closed
+設計）。`check_dml_affected_rows` は超過の有無だけを判定するため、呼び出し元は
+対象行集合を全件列挙する必要はなく、広い述語（例: 全行に一致する `WHERE`）による
+無制限列挙を避けるため `MAX_DML_AFFECTED_ROWS + 1` 件に達した時点で列挙を打ち切り
+その件数を渡してよい（早期終了。未検証入力によるリソース増幅の回避）。
 
 ## `BoundPredicateUpdate`: `expr_filter_programs` を保持しない
 
