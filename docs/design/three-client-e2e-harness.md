@@ -2,7 +2,7 @@
 
 - ステータス: Accepted
 - 対応: TASK-73（WIRE-1）、TASK-165（SQL-12・SEARCH-9）、TASK-168（SQL-13・SQL-14）、
-  TASK-82（SQL-5〜7・9・10）
+  TASK-82（SQL-5〜7・9・10）、TASK-195（RLS-11。Issue #878 判断記録）
 - 関連: TASK-67・TASK-68・TASK-69・TASK-70・TASK-71（wire プロトコル層）、
   TASK-74・TASK-75・TASK-80・TASK-161・TASK-162・TASK-166・TASK-167（SQL 表層）、
   TASK-137（RLS 暗黙適用）
@@ -112,7 +112,11 @@ psql・psycopg・pg の導入自動化を確定させるには、pip/npm の実�
 **INSERT の wire 受理（判断の記録）**: TASK-82（SQL-10）の定義に基づき、本タスク
 で wire 経由の `INSERT` 受理へ切り替えた（下記「スコープ外」の旧項目を参照。
 判断の詳細は `simple_query.rs` モジュールコメント）。読み取り可視性の既定
-（`Public` のみ）は拡大していない。
+（`Public` のみ）は当時拡大しなかった。RLS-11・TASK-195（Issue #973・
+PR #977）で wire 認証導出の `PolicyContext` が `Public` ＋ 自テナントの
+`Private` を許可可視性とするよう改訂され、この非対称は解消済み
+（詳細は後述「Issue #878: wire セッションの可視性非対称と DML の相互作用
+（判断記録）」節参照）。
 
 ### Issue #454: 広域取得（ソートなしのフィルタ取得）の検証範囲
 
@@ -285,9 +289,12 @@ NoSQL 表層（`--surface nosql`。HTTP/1.1 自作リスナー・`/v1/session`�
 **seed の複製**: `three_client_e2e.rs::seed_three_tenant_db`（`docs` テーブル・
 3 テナント × Public 1 行）は private 関数のため import できず、
 `extended_syntax_e2e.rs` の前例と同じ方式で `three_client_http_e2e.rs` 専用に
-複製した。3 行とも Public のため、wire 認証が導出する `PolicyContext`
-（Public のみ）でも alice（tenant-a）から全 3 行が可視という既存オラクルを
-そのまま流用できる。
+複製した。この seed は Public 3 行のみで Private 行を持たないため、
+wire 認証が導出する `PolicyContext` の許可可視性が RLS-11・TASK-195
+（Issue #973）後に `Public` ＋ 自テナントの `Private` へ広がった後も、
+alice（tenant-a）から全 3 行が可視という既存オラクルはそのまま成立する
+（自テナント `Private` 行が存在しないため RLS-11 の拡張が可視結果へ
+影響しない）。
 
 **curl 起動の設計**: `Command` の引数配列で `curl` を起動しシェルを介さない。
 要求 JSON は固定 `const`／リテラルで、未検証の文字列連結は行わない。
@@ -460,21 +467,110 @@ psql のテキスト表現へ正規化してから比較する（`Cell::Integer`
 **クエリ集合**: `crates/wire-server/docs/nosql-api.md`「SQL ↔ NoSQL 対応
 表」に対応する search-1〜5・scan-1・agg-1〜4 の 10 ケース（`PARITY_CASES`）
 を、alice（tenant-a）・bob（tenant-b）・carol（tenant-c）の 3 テナント
-それぞれで実行し、3 テナントいずれも他テナントの Private 行（id=11／12）
-が両表層のどの応答にも現れないことをあわせて検証する。search5 は
-codex-review 指摘（PR #838）対応で追加したケースで、search4（どの seed
-body にも出現しない語を疎側項に使う）だけでは `hybrid.text` を無視して
-密検索のみへ縮退する退行を検出できないため、id=3 の body に実在する語
-（"unrelated"）を疎側項に使い密のみ順位とは異なる順位（id=3 が繰り上が
-る）を期待値に固定して疎側チャネルの寄与を検出可能にした。
+それぞれで実行する。seed には alice の Private 行（id=11）・bob の
+Private 行（id=12）が含まれ、RLS-11・TASK-195（read-your-writes）後の
+許可可視性（`Public` ＋ 自テナントの `Private`）により alice は自身の
+id=11 を、bob は自身の id=12 をそれぞれの応答に legitimate に含む。
+非漏えい検証は「自分の id ではない方の Private id」のみを禁止する形
+（alice には id=12、bob には id=11、Private 行を持たない carol には
+id=11／12 の両方を禁止）とし、3 テナントいずれも**他テナント**の
+Private 行が両表層のどの応答にも現れないことをあわせて検証する。
+search5 は codex-review 指摘（PR #838）対応で追加したケースで、search4
+（どの seed body にも出現しない語を疎側項に使う）だけでは `hybrid.text`
+を無視して密検索のみへ縮退する退行を検出できないため、id=3 の body に
+実在する語（"unrelated"）を疎側項に使い密のみ順位とは異なる順位（id=3
+が繰り上がる）を期待値に固定して疎側チャネルの寄与を検出可能にした。
+own Private 行（alice の id=11・bob の id=12）は密側でクエリベクトルと
+同一のため search3／search4 で上位へ現れ、search5 では RRF 融合後の
+近接により alice の順位のみ変化する（`ParityCase` の doc コメント参照）。
 
 **実測結果**: 3 クライアント（curl／urllib／fetch）× 3 テナント × 10
-ケース＝ 90 組すべてで列名・型・行集合が一致することを確認済み（本開発
+ケース＝ 90 組すべてで列名・型・行集合が RLS-11 後の期待値（own Private
+行を含む）と一致することを確認済み（本開発
 環境。`make e2e-three-client-http` の `[e2e-record] parity/<client>: ...`
 行で `match=true` を確認できる）。実測で発見した意味差は無かった。
 
 production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
 無変更（テスト・docs 専任）。
+
+### Issue #878: wire セッションの可視性非対称と DML の相互作用（判断記録）
+
+Phase 0（#972）の最終 Issue として、旧「スコープ外」項の可視性非対称を
+RLS-11・TASK-195 の確定に合わせて棚卸しした判断記録。private spec
+（`docs/spec/04-behavior/records/rdbms-parity-decision-2026-09-22.md`。
+ポインタのみ・本文は転記しない）の詳細議論は転記せず、本リポの公開情報
+（旧 doc・`auth.rs`／`simple_query.rs` のモジュールコメント・各テストの
+doc コメント）の範囲で自分の言葉として整理する。
+
+**1. 非対称の内容と影響範囲**
+
+- 書き込み: engine `sql::exec::execute_insert` は行を常に
+  `Visibility::Private` で書き込む固定仕様（NoSQL `insert` 写像も同一。
+  `docs/design/nosql-insert-mapping.md:70`）。
+- 読み取り（旧）: wire／HTTP 認証が導出する `PolicyContext`
+  （`wire-server/src/auth.rs::session_policy_context`）は `Public` のみを
+  許可可視性としていた。
+- 影響 (a) 同一セッション内: `INSERT` 直後の `SELECT`（Dense・Hybrid・
+  scan・aggregate のいずれも）で自分が書いた行が見えない。
+- 影響 (b) テナント内の別セッション: 同一テナントの別接続からも見えない
+  （セッション単位ではなくテナント単位の非対称）。
+- 影響 (c) DML 経路の前提: Phase 1 以降の `UPDATE`／`DELETE`
+  （SQL-17／SQL-18 系。#975・#976 は許可リスト・束縛のみで実行結線は別
+  Issue の担当）・NoSQL `update`／`delete` 写像は、書いた行を読み戻し・
+  対象として特定できることを前提にする。非対称を残したままでは
+  「同一セッション内で `INSERT` した行を `UPDATE`／`DELETE` する」操作が
+  組めず、現行動作の記述ではなく実行結線そのものの前提条件として問題に
+  なる。
+
+**2. 選択肢と得失**
+
+- **維持案**（`Public` のみ許可を継続）: 最小権限境界が最も狭く、旧
+  `wire1_three_tenant_visibility_public_shared_private_hidden` のような
+  「自テナント自身の `Private` 行も wire 越しには不可視」という契約が
+  不変のまま保てる。反面 read-your-writes が成立せず、Phase 1 以降の
+  DML 経路が組めない・RDBMS の一般的な慣行（自分の書き込みは自分で
+  読める）と乖離する。
+- **既定変更案**（採用。`Public` ＋ 自テナントの `Private` を許可）:
+  read-your-writes が成立し DML 経路の前提を満たす。テナント境界は
+  `engine::policy::PolicyContext::is_visible` のテナント一致判定が
+  引き続き担うため、他テナントの `Private` 行は拡張後も不可視のまま
+  （`session_policy_context` のドキュメンテーションコメント参照）。
+  可視性は **テナント単位であってセッション単位ではない**点に注意——
+  同一テナントの別セッションからも自分（同テナントの別ユーザーを含む）が
+  書いた `Private` 行が見える。拡張は wire 認証導出点
+  （`auth::session_policy_context`）に閉じ、engine 側
+  `crate::policy::PolicyContext::new`（既定 = `Public` のみ）は不変。
+
+**3. 判断待ち事項**: なし（2026-09-22 オーナー判断で解消済み）。spec 側で
+RLS-11・TASK-195 を新設し、RLS-7・RLS-9 は改訂注記付きで残置（RLS-11
+確定より前の記述は従来契約が正、という関係を保つ）。
+
+**4. ポインタ**: RLS-11・TASK-195・RLS-7・RLS-9・TASK-82・TASK-183
+（`docs/spec/04-behavior/*.md`・`05-tasks.md`）。Issue #973（PR #977）・
+Issue #974（PR #980）・親 Issue #972（Phase 0）・ルート Issue #860。
+private spec 記録:
+`docs/spec/04-behavior/records/rdbms-parity-decision-2026-09-22.md`
+（ポインタのみ）。spec 側リビジョンは vector-db-spec #21・本リポの
+submodule 追随は PR #951。
+
+**5. 検証の所在**: `crates/engine/tests/rls11_read_your_writes.rs`
+（`rls11_own_private_row_is_visible_in_same_and_other_session_of_same_tenant_after_cache_warm`・
+`rls11_other_tenant_never_observes_private_row_across_all_read_shapes`・
+`engine_default_policy_context_still_hides_own_private_rows`）・
+`crates/wire-server/tests/rls11_read_your_writes.rs`（wire／HTTP／表層
+横断 matrix）。層 B（`three_client_e2e.rs`・`extended_syntax_e2e.rs`・
+`three_client_http_e2e.rs`）の更新箇所は上記「影響」節参照。
+
+**6. 申し送り（本 Issue では編集しない）**:
+`docs/design/scan-stage-profile.md`・
+`visible-bitmap-cache-verification.md`・`knn-wire-stage-profile.md`・
+`crossdb-bench.md`「可視性モデル」にある「wire セッションは Public
+のみ可視」という記述は、いずれも**計測時点の条件記述**であり書き換えると
+計測記録の意味が変わるため本 Issue では編集しない。RLS-11 下での再計測・
+条件再記載は別 Issue 候補（PR #980 でも同旨を申し送り済み）。Issue
+起票はオーナー承認事項のため自動運転では起票せず、対応 PR の「対象外」
+節に記載する。`docs/design/nosql-insert-mapping.md:70`（書き込みは
+`Private` 固定）は現在も正しい記述のため無変更。
 
 ## 影響
 
@@ -495,23 +591,37 @@ production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
   が起動時 stderr の全行と `wait_for_exit` を保持するようになった。
   `tests/three_client/{psycopg_client.py,pg_client.js}` は失敗時に
   `[DETAIL=<detail>]` を stderr へ追記する（いずれも Issue #706）。
+- RLS-11・TASK-195（Issue #973・PR #977）で wire 認証導出の
+  `PolicyContext` が `Public` ＋ 自テナントの `Private` へ拡張されたことに
+  伴い、層 B の seed／期待値（`three_client_e2e.rs`・
+  `extended_syntax_e2e.rs`・`three_client_http_e2e.rs`）が「own Private
+  行を含む」前提へ更新された（Issue #974・PR #980）。詳細は後述
+  「Issue #878: wire セッションの可視性非対称と DML の相互作用
+  （判断記録）」節参照。
 
 ## スコープ外
 
 - `psql`・`psycopg`・`pg` の CI 自動導入ジョブ（バージョン確認・pin の確定は
   別途ユーザー承認を要する）
 - Docker 開発コンテナへの `psql`／`psycopg` 追加
-- SQL `INSERT` が書き込む行の可視性（`Visibility::Private` 固定）と wire 認証
-  経由の `PolicyContext`（`Public` のみ許可）の非対称の解消（wire セッションへの
-  自テナント `Private` 行の読み戻し可視性付与）。TASK-82（SQL-10）で `INSERT`
-  自体は wire 経由で受理するよう切り替えたが（旧: 当面 `INSERT` 自体を
-  公開しない方針だった。codex-review P1・PR #210 指摘の検討過程の判断）、
-  `Private` 許可を wire 認証側へ広げる案は
+- **解消済み**: SQL `INSERT` が書き込む行の可視性（`Visibility::Private`
+  固定）と wire 認証経由の `PolicyContext`（当時は `Public` のみ許可）の
+  非対称。TASK-82（SQL-10）で `INSERT` 自体は wire 経由で受理するよう
+  切り替えたが（旧: 当面 `INSERT` 自体を公開しない方針だった。
+  codex-review P1・PR #210 指摘の検討過程の判断）、`Private` 許可を wire
+  認証側へ広げる案は当時
   `wire1_three_tenant_visibility_public_shared_private_hidden`
-  （自テナント自身の `Private` 行も含め wire 越しには不可視、という既存の
-  最小権限境界）を壊すため引き続き不採用とし、非対称（書いた本人も同一
-  セッションでは読み戻せない）はそのまま残した。本項目は「wire セッションへの
-  読み戻し可視性付与」の設計が定まるまで引き続きスコープ外
+  （自テナント自身の `Private` 行も含め wire 越しには不可視、という
+  旧最小権限境界）を壊すため不採用とし、非対称（書いた
+  本人も同一セッションでは読み戻せない）を残していた。オーナー判断
+  （2026-09-22）により RLS-11・TASK-195 として read-your-writes を既定化
+  し、Issue #973（PR #977）・Issue #974（PR #980）で実装・テスト更新済み
+  （旧テストは
+  `wire1_three_tenant_visibility_public_shared_own_private_visible`
+  へ改名。契約固定テストは
+  `wire1_insert_is_accepted_and_row_is_visible_over_wire_select_to_own_tenant`
+  も参照）。詳細は後述「Issue #878: wire セッションの可視性非対称と
+  DML の相互作用（判断記録）」節参照
 - `EXPLAIN` 応答での実効モード・指定元の可視化（SQL-12 が SQL-6 と併せて
   期待する項目）: engine に `EXPLAIN` 自体が未実装のため対象外（SQL-6 の
   確定化で扱う）
