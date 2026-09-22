@@ -30,14 +30,17 @@
 //! `wire_tenant_row_id_scope.rs::judge` 相当）は別 Issue（design doc 申し送り）。
 //! `explain` フィールド（NOSQL-10・#765）。
 //!
-//! ## 既知の制約（INDEX-4 ③④）
+//! ## 役割分担の補足（SQL-16 結線後・Issue #863）
 //!
-//! SQL 表層には複数行 `INSERT` 構文が無いため、③（バッチ合計バイト数）・
-//! ④（バッチ生成チャンク数。行形では「1 行 = 1 チャンク」に読み替え）の
-//! 「SQL 経路との一致」は主張できない。共有 Rust 入口
-//! （`EngineCore::execute_bound_insert_in_session`）に対する一致としてのみ
-//! 主張する（①はファイル形 `execute_insert_sql_batch` の判定と比較可能なため
-//! `C2` で検証する）。
+//! SQL 表層へ複数行 `VALUES`（SQL-16・TASK-190・PR #978）が結線された後は、
+//! HTTP `rows[]` と SQL 複数行 `VALUES` の両方が `sql::exec::
+//! execute_insert_batch_with_schema` を共有する（第 2 の書き込み経路を作らない
+//! 設計。`crates/engine/tests/insert_multi_row.rs` モジュール doc 参照）ため、
+//! 本ファイルは両表層間の再送判定パリティ（SQL 複数行 → HTTP `rows[]`・
+//! その逆方向の `23505`／`22023`）も固定する。INDEX-4 ②③④（1 行あたり・
+//! バッチ合計のバイト量・チャンク総量）の SQL 経路固有テストは
+//! `crates/engine/tests/insert_multi_row.rs` が担う（本ファイルは NoSQL 側の
+//! `54000` と `wire_code` 一致・副作用なしに限定する）。
 //!
 //! ## RLS 注意（誤コピー防止）
 //!
@@ -283,6 +286,20 @@ fn insert_body_n_rows(n: u64, op_id: &str) -> Vec<u8> {
 fn insert_sql(id: u64, lang: &str, op_id: &str) -> String {
     format!(
         "INSERT INTO docs (id, embedding, lang) VALUES ({id}, '[0.1,0.2,0.3]', '{lang}') USING OPERATION_ID '{op_id}'"
+    )
+}
+
+/// SQL 表層の複数行 `VALUES`（SQL-16・TASK-190）文（`(id, lang)` の列）。
+/// `insert_body_multi` と同じ行集合表現で SQL↔NoSQL 表層のパリティ検証に使う
+/// （Issue #863）。
+fn multi_row_sql(rows: &[(u64, &str)], op_id: &str) -> String {
+    let values: Vec<String> = rows
+        .iter()
+        .map(|(id, lang)| format!("({id}, '[0.1,0.2,0.3]', '{lang}')"))
+        .collect();
+    format!(
+        "INSERT INTO docs (id, embedding, lang) VALUES {} USING OPERATION_ID '{op_id}'",
+        values.join(", ")
     )
 }
 
@@ -556,6 +573,98 @@ fn multi_row_batch_resend_same_content_is_23505_and_mismatch_is_22023() {
     assert_eq!(http_common::wire_code_of(&resend_mismatch), "22023");
 
     assert_eq!(read_back_ids(&core).len(), 2, "no extra rows from resends");
+}
+
+// --- SQL 複数行 VALUES ⇄ HTTP rows[] の再送判定パリティ（Issue #863。
+//     SQL-16 結線後は「共有 Rust 入口への一致」に留まらず、SQL 表層の複数行
+//     `VALUES` 文そのものとの一致を主張できる） ----------------------------
+
+#[test]
+fn sql_multi_row_then_http_rows_resend_same_content_is_23505() {
+    let (core, _guard) = new_core(None);
+    let (both, mut sql) = spawn_both(core);
+
+    let rows = [(1u64, "ja"), (2u64, "en")];
+    common::send_simple_query(
+        &mut sql,
+        &multi_row_sql(&rows, "nosql-op-sql-multi-then-http"),
+    );
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "INSERT 0 2");
+    common::read_ready_for_query(&mut sql);
+
+    let resp = query(
+        &both,
+        &insert_body_multi(&rows, "nosql-op-sql-multi-then-http"),
+    );
+    assert_eq!(resp.status, 409, "body={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23505");
+}
+
+#[test]
+fn http_rows_then_sql_multi_row_resend_same_content_is_23505() {
+    let (core, _guard) = new_core(None);
+    let (both, mut sql) = spawn_both(core);
+
+    let rows = [(1u64, "ja"), (2u64, "en")];
+    let first = query(
+        &both,
+        &insert_body_multi(&rows, "nosql-op-http-then-sql-multi"),
+    );
+    let (inserted, _) = parse_insert_success_body(&first);
+    assert_eq!(inserted, 2);
+
+    common::send_simple_query(
+        &mut sql,
+        &multi_row_sql(&rows, "nosql-op-http-then-sql-multi"),
+    );
+    common::expect_error_response_with_sqlstate(&mut sql, "23505");
+    common::read_ready_for_query(&mut sql);
+}
+
+#[test]
+fn sql_multi_row_then_http_rows_different_content_is_22023() {
+    let (core, _guard) = new_core(None);
+    let (both, mut sql) = spawn_both(core);
+
+    let rows = [(1u64, "ja"), (2u64, "en")];
+    common::send_simple_query(
+        &mut sql,
+        &multi_row_sql(&rows, "nosql-op-sql-multi-http-mismatch"),
+    );
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "INSERT 0 2");
+    common::read_ready_for_query(&mut sql);
+
+    let mismatched = [(1u64, "ja"), (2u64, "de")];
+    let resp = query(
+        &both,
+        &insert_body_multi(&mismatched, "nosql-op-sql-multi-http-mismatch"),
+    );
+    assert_eq!(resp.status, 400, "body={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "22023");
+}
+
+#[test]
+fn http_rows_then_sql_multi_row_different_content_is_22023() {
+    let (core, _guard) = new_core(None);
+    let (both, mut sql) = spawn_both(core);
+
+    let rows = [(1u64, "ja"), (2u64, "en")];
+    let first = query(
+        &both,
+        &insert_body_multi(&rows, "nosql-op-http-sql-multi-mismatch"),
+    );
+    let (inserted, _) = parse_insert_success_body(&first);
+    assert_eq!(inserted, 2);
+
+    let mismatched = [(1u64, "ja"), (2u64, "de")];
+    common::send_simple_query(
+        &mut sql,
+        &multi_row_sql(&mismatched, "nosql-op-http-sql-multi-mismatch"),
+    );
+    common::expect_error_response_with_sqlstate(&mut sql, "22023");
+    common::read_ready_for_query(&mut sql);
 }
 
 // --- C: INDEX-4 処理量上限（`54000`） ---------------------------------------

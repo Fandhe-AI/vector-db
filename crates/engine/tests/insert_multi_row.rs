@@ -16,9 +16,12 @@ use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
-use engine::recovery::required_op_id::LedgerMode;
+use engine::recovery::ledger::LedgerLookup;
+use engine::recovery::required_op_id::{LedgerMode, OperationId};
 use engine::sql::allowlist::validate_insert;
+use engine::sql::mode::SessionState;
 use engine::sql::parser::{bind_insert_form, BoundInsertForm};
+use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
@@ -83,6 +86,31 @@ fn open_engine_with_limits(
     let core =
         EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(limits);
     (core, path)
+}
+
+/// `core` を `tenant` の可視範囲（`Public`＋`Private`）で読み戻し、可視な行
+/// `id` の一覧を返す（副作用ゼロ・原子性の確定オラクル。
+/// `nosql6_insert.rs::read_back_ids` と同じ設計）。
+fn read_back_ids(core: &EngineCore, tenant: &str) -> Vec<u64> {
+    let policy = ctx(tenant);
+    let mut session = SessionState::default();
+    let sql = format!("SELECT id FROM {TABLE} LIMIT 100");
+    let outcome = core
+        .execute_sql_in_session(&policy, &mut session, &sql)
+        .expect("select ok");
+    let SqlOutcome::Query(result) = outcome else {
+        panic!("expected Query outcome, got {outcome:?}");
+    };
+    result.rows.iter().map(|row| row.id).collect()
+}
+
+/// `core.operation_recorded` の薄いラッパー（tenant 固定なし。
+/// `nosql6_insert.rs::ledger_state` と同じ設計）。
+fn ledger_state(core: &EngineCore, tenant: &str, op_id: &str) -> LedgerLookup {
+    let policy = ctx(tenant);
+    let parsed = OperationId::parse(op_id).expect("valid operation_id");
+    core.operation_recorded(&policy, TABLE, &parsed)
+        .expect("ledger lookup must not error")
 }
 
 // ---------------------------------------------------------------------
@@ -272,6 +300,56 @@ fn multi_row_insert_rejects_duplicate_id_within_batch() {
         .execute_insert_sql(&policy, &sql)
         .expect_err("duplicate id within the batch must be rejected");
     assert_eq!(err.wire_code(), "23505");
+
+    // 副作用ゼロ: 行ストア・台帳のいずれも変更されていない（単一 write
+    // トランザクション内で id 重複検出が行ストアへ触れる前に完結する契約。
+    // `tenant::insert_typed_rows_unchecked` ドキュメント参照）。
+    assert!(
+        read_back_ids(&core, "tenant-a").is_empty(),
+        "no row must persist after a within-batch id conflict"
+    );
+    assert_eq!(
+        ledger_state(&core, "tenant-a", "op-dup-id"),
+        LedgerLookup::NotRecorded
+    );
+}
+
+#[test]
+fn multi_row_insert_id_collision_with_existing_row_rejects_whole_statement() {
+    // 受け入れ基準③: バッチ内の 1 行（k>0）が既存テナント行と衝突する場合でも
+    // 文全体が単一 write トランザクションのまま原子的に拒否され、他の行が
+    // 部分的に永続しないことを固定する（TABLE-12・RECOVER-10）。
+    let (core, path) = open_engine("insert-multi-row-existing-collision");
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    // id=2 を先に単独 INSERT しておき、後続バッチの 2 行目（k=1）と衝突させる。
+    let seed_sql = multi_row_sql(TABLE, &[2], "op-seed");
+    core.execute_insert_sql(&policy, &seed_sql)
+        .expect("seed insert succeeds");
+
+    let sql = multi_row_sql(TABLE, &[1, 2, 3], "op-collide");
+    let err = core
+        .execute_insert_sql(&policy, &sql)
+        .expect_err("collision with an existing row must reject the whole statement");
+    assert_eq!(err.wire_code(), "23505");
+
+    // 副作用ゼロ: id=1・id=3 は永続されず、可視な行は seed の id=2 のみ。
+    let mut ids = read_back_ids(&core, "tenant-a");
+    ids.sort_unstable();
+    assert_eq!(ids, vec![2], "only the pre-seeded row must remain visible");
+    assert_eq!(
+        ledger_state(&core, "tenant-a", "op-collide"),
+        LedgerLookup::NotRecorded
+    );
+
+    // 衝突を解消（id=2 を除外）したうえで同じ operation_id を再送すると成功する
+    // （台帳が拒否時点で未記録のままだったことの逆方向確認）。
+    let retry_sql = multi_row_sql(TABLE, &[1, 3], "op-collide");
+    let outcome = core
+        .execute_insert_sql(&policy, &retry_sql)
+        .expect("retry with the same operation_id must succeed once the conflict is resolved");
+    assert_eq!(outcome.rows_affected, 2);
 }
 
 #[test]
@@ -395,4 +473,96 @@ fn multi_row_insert_over_batch_limits_total_bytes_is_rejected_with_54000() {
         "batch total byte size over batch_limits.max_batch_total_bytes must be rejected",
     );
     assert_eq!(err.wire_code(), "54000");
+}
+
+// ---------------------------------------------------------------------
+// INDEX-4 ②（1 行あたりバイト量）・④（バッチ総チャンク数）: SQL 表層の
+// 複数行 VALUES が NoSQL 表層 rows[]（NOSQL-6・判定6）と同一の判定本体
+// （`EngineCore::validate_insert_batch_byte_and_chunk_limits`）を共有すること
+// の確定化（Issue #863。`tests/sql_insert_batch_public_api.rs`・
+// `nosql6_insert.rs` の対応する ②④ テストと同型）。
+// ---------------------------------------------------------------------
+
+#[test]
+fn multi_row_insert_over_batch_limits_row_body_bytes_is_rejected_with_54000_and_no_side_effects() {
+    let (core, path) = open_engine_with_limits(
+        "insert-multi-row-batch-limits-row-body",
+        engine::batch_limits::BatchLimits {
+            max_file_body_bytes: 1,
+            ..engine::batch_limits::BatchLimits::default()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let sql = multi_row_sql(TABLE, &[1, 2], "op-batch-limit-row-body");
+    let err = core
+        .execute_insert_sql(&policy, &sql)
+        .expect_err("single row byte size over batch_limits.max_file_body_bytes must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+
+    // 副作用ゼロ: 書き込み txn へ到達しないため行・台帳とも変更されない。
+    assert!(read_back_ids(&core, "tenant-a").is_empty());
+    assert_eq!(
+        ledger_state(&core, "tenant-a", "op-batch-limit-row-body"),
+        LedgerLookup::NotRecorded
+    );
+}
+
+#[test]
+fn multi_row_insert_over_batch_limits_chunk_total_is_rejected_with_54000_and_no_side_effects() {
+    let (core, path) = open_engine_with_limits(
+        "insert-multi-row-batch-limits-chunks",
+        engine::batch_limits::BatchLimits {
+            max_batch_chunks: 1,
+            ..engine::batch_limits::BatchLimits::default()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    // 行形は「1 行 = 1 チャンク」に読み替える契約（モジュール doc「既知の制約」
+    // 参照）。2 行の投入で `max_batch_chunks = 1` を超過させる。
+    let sql = multi_row_sql(TABLE, &[1, 2], "op-batch-limit-chunks");
+    let err = core.execute_insert_sql(&policy, &sql).expect_err(
+        "batch row count (as chunk count) over batch_limits.max_batch_chunks must be rejected",
+    );
+    assert_eq!(err.wire_code(), "54000");
+
+    assert!(read_back_ids(&core, "tenant-a").is_empty());
+    assert_eq!(
+        ledger_state(&core, "tenant-a", "op-batch-limit-chunks"),
+        LedgerLookup::NotRecorded
+    );
+}
+
+// ---------------------------------------------------------------------
+// 受け入れ条件④（台帳キー空間の共有）: 複数行 → 単一行の逆方向再送判定
+// ---------------------------------------------------------------------
+
+#[test]
+fn multi_row_insert_then_single_row_same_operation_id_is_content_mismatch() {
+    // 複数行 INSERT で記録した operation_id へ、単一行 INSERT で同じ
+    // operation_id を再送すると内容不一致（22023）になる（単一行と複数行が
+    // 同一の `(tenant, table, operation_id)` 台帳キー空間を共有することの
+    // 逆方向確認。`execute_insert_sql_single_row_behavior_is_unchanged` の
+    // 順方向確認と対になる）。
+    let (core, path) = open_engine("insert-multi-row-then-single-row-key-space");
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let multi_sql = multi_row_sql(TABLE, &[1, 2], "op-key-space");
+    core.execute_insert_sql(&policy, &multi_sql)
+        .expect("multi-row insert succeeds");
+
+    let single_sql = multi_row_sql(TABLE, &[3], "op-key-space");
+    let err = core
+        .execute_insert_sql(&policy, &single_sql)
+        .expect_err("single-row resend with the same operation_id must fail");
+    assert_eq!(err.wire_code(), "22023");
+
+    // 副作用ゼロ: id=3 は永続されない。
+    let mut ids = read_back_ids(&core, "tenant-a");
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2]);
 }
