@@ -31,6 +31,13 @@ const MAX_ERROR_DETAIL_LEN: usize = crate::error_format::MAX_MESSAGE_LEN;
 /// リソース確保（DoS）」対応）。`catalog::MAX_COLUMN_COUNT` と同値を採用する。
 const MAX_INSERT_COLUMNS: usize = 256;
 
+/// UPDATE の SET 句が持てる代入要素数の上限（SQL-17、TASK-191）。`MAX_INSERT_COLUMNS`
+/// とは独立した定数にする（UPDATE は部分更新であり INSERT の列数上限とは意味論が
+/// 異なるため、将来どちらかだけを見直す際に互いへ波及しないようにする）。無制限
+/// `Vec` 確保を避ける（`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
+/// （DoS）」対応）。
+const MAX_UPDATE_SET_ASSIGNMENTS: usize = 256;
+
 /// ORDER BY の関数呼び出し形で許可する関数名を照合する（大文字小文字を区別しない）。
 /// 未知の名前は fail-closed に拒否し、識別子であれば任意の名前を関数呼び出しとして
 /// 受理してしまう構造上の抜け穴を作らない。
@@ -851,7 +858,8 @@ impl ValidatedScan {
 
 /// INSERT の VALUES リストの 1 リテラル（SQL-10、TASK-80）。トークン種別
 /// （文字列リテラル／数値）のみを構造として保持し、列型との照合・意味論的解釈は
-/// `sql::parser::bind_insert` の責務とする。
+/// `sql::parser::bind_insert` の責務とする。UPDATE の SET 句のリテラル値表現としても
+/// 共有する（SQL-17、TASK-191。`sql::parser::bind_update` の責務）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum InsertLiteral {
     String(String),
@@ -875,6 +883,30 @@ pub struct ValidatedInsert {
     pub values: Vec<InsertLiteral>,
     /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-10）。句の欠落・明示
     /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。`validate_insert` は
+    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション開始前に
+    /// `23502` で拒否するため、この構成では常に `Some` になる。
+    /// `LedgerMode::CompareOnlyWithoutLedger` では `None` を許す。
+    pub operation_id: Option<OperationId>,
+}
+
+/// 許可形状の構造判定を通過した UPDATE 文（SQL-17、TASK-191）。`ValidatedInsert` と
+/// 同様、本モジュールが保証するのはここまでの構造情報のみで、列名・値の意味論的
+/// 妥当性は検証しない（`sql::parser::bind_update` の責務）。
+///
+/// 受理する形は `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE id = <n>
+/// USING OPERATION_ID '<id>' [;]` の単一行・id 指定形のみ（述語形 WHERE・複数テーブル・
+/// サブクエリ・`RETURNING` は許可リスト外。実行結線・可視性判定は #865 の担当）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedUpdate {
+    /// UPDATE に指定され、カタログ存在確認を通過したテーブル名。
+    pub table_name: String,
+    /// SET 句の (列名, リテラル) 対応。宣言順を保持する（`bind_update` の出力順・
+    /// 将来の `operation_id` 内容照合の正規化基準になるため並べ替えない）。
+    pub assignments: Vec<(String, InsertLiteral)>,
+    /// `WHERE id = <n>` の生数値文字列。範囲検証は `sql::parser::bind_update` が行う。
+    pub id_literal: String,
+    /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-17）。句の欠落・明示
+    /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。`validate_update` は
     /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション開始前に
     /// `23502` で拒否するため、この構成では常に `Some` になる。
     /// `LedgerMode::CompareOnlyWithoutLedger` では `None` を許す。
@@ -1680,6 +1712,61 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE id = <n>
+    /// USING OPERATION_ID '<id>' [;]` の単一行・id 指定形のみを受理する
+    /// （SQL-17、TASK-191）。述語形 WHERE（`lang = 'ja'` 等）・複数テーブル・
+    /// サブクエリ・`RETURNING` は本メソッドが生成できる文法にそもそも存在しない
+    /// ため構造的に受理しない（個別の拒否コードを持たず、`expect_end_of_statement`
+    /// が余剰トークンとして `42601` へ落とす）。
+    fn parse_update(&mut self) -> Result<ParsedUpdateShape, SqlSurfaceError> {
+        self.expect_contextual_keyword("UPDATE")?;
+        let table_name = self.expect_ident()?;
+
+        self.expect_ident_matching("SET")?;
+        let mut assignments = vec![self.parse_update_assignment()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            if assignments.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
+                return Err(SqlSurfaceError::unsupported(
+                    "too many UPDATE SET assignments",
+                ));
+            }
+            assignments.push(self.parse_update_assignment()?);
+        }
+
+        // WHERE は述語形 WHERE パーサー（`parse_where`）を意図的に使わず、
+        // `id = <n>` の完全一致形のみを狭く受理する（SQL-17 のスコープ。
+        // 述語形 WHERE を伴う UPDATE は別ビヘイビア ID・別 Issue 群の担当）。
+        self.expect_keyword(Keyword::Where)?;
+        let where_column = self.expect_ident()?;
+        if where_column != "id" {
+            return Err(SqlSurfaceError::unsupported(
+                "UPDATE WHERE clause must be the form: WHERE id = <n>",
+            ));
+        }
+        self.expect_punct('=')?;
+        let id_literal = self.expect_number()?;
+
+        // 文末専用句の構造パースのみをここで行う（INSERT と同じ順序契約。
+        // 必須化の判定は `validate_update` が `LedgerMode::require` へ委譲する）。
+        let operation_id = self.parse_operation_id_clause()?;
+
+        Ok(ParsedUpdateShape {
+            table_name,
+            assignments,
+            id_literal,
+            operation_id,
+        })
+    }
+
+    /// UPDATE の SET 句の 1 要素（`<col> = <lit>`）を構造パースする。
+    fn parse_update_assignment(&mut self) -> Result<(String, InsertLiteral), SqlSurfaceError> {
+        let column = self.expect_ident()?;
+        self.expect_punct('=')?;
+        let literal = self.expect_literal()?;
+        Ok((column, literal))
+    }
+
     /// 文末専用句 `USING OPERATION_ID '<id>'`（SQL-10、TASK-80）の構造パースのみを
     /// 行う（値の意味論的検証は [`OperationId::parse`]）。句の省略・明示
     /// `USING OPERATION_ID NULL`（大小無視。字句解析上は `Token::Ident("NULL")`）は
@@ -2275,6 +2362,64 @@ pub(crate) fn validate_insert_tokens(
         table_name: shape.table_name,
         columns: shape.columns,
         values: shape.values,
+        operation_id: shape.operation_id,
+    })
+}
+
+/// 構文木（[`ValidatedUpdate`] の元）。カタログ存在確認前の中間結果（SQL-17、TASK-191）。
+struct ParsedUpdateShape {
+    table_name: String,
+    assignments: Vec<(String, InsertLiteral)>,
+    id_literal: String,
+    operation_id: Option<OperationId>,
+}
+
+/// UPDATE 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を通じて
+/// UPDATE 対象テーブルがカタログに実在するかを確認する（SQL-17、TASK-191 の公開 API）。
+/// `validate_statement`（SELECT 専用、TASK-74）・`validate_insert`（SQL-10、TASK-80）
+/// とは独立したエントリポイントとする（`operation_id` 必須化ガードを関数内部で
+/// 自己完結して適用する必要があるため、INSERT と同じ理由で `Statement`／
+/// `validate_sql` へ統合しない。他の文種別に `USING OPERATION_ID`／`SET` 句を付けた
+/// 入力は各エントリポイントの `expect_end_of_statement` が余剰トークンとして `42601`
+/// で拒否するため、文種別を誤って混同受理する経路は構造的に存在しない）。
+///
+/// 検証順序は決定的（同一入力には常に同一の [`SqlSurfaceError`] を返す）。
+/// `operation_id` 必須化ガード（`mode.require`。TASK-92・RECOVER-1）を含む段階構成の
+/// 詳細は `recovery::required_op_id` モジュールドキュメント参照。実行結線・意味論的
+/// 束縛（`sql::parser::bind_update`）・RLS 可視集合に基づく実行は別 Issue の担当。
+pub fn validate_update(
+    sql: &str,
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<ValidatedUpdate, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_update_tokens(&tokens, lookup, mode)
+}
+
+/// [`validate_update`] の本体。トークン列を受け取ることで、呼び出し元が既に
+/// 先頭トークン判定のために `tokenize` 済みの場合、同一 SQL 文字列の再トークナイズを
+/// 避けられる（Issue #485 が INSERT に施した「二重パース排除」と同型の設計を
+/// UPDATE 側でも最初から可能にしておく）。
+pub(crate) fn validate_update_tokens(
+    tokens: &[lexer::Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<ValidatedUpdate, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let shape = p.parse_update()?;
+    p.expect_end_of_statement()?;
+
+    mode.require(shape.operation_id.as_ref())?;
+
+    let exists = lookup.table_exists(&shape.table_name)?;
+    if !exists {
+        return Err(SqlSurfaceError::undefined_table(shape.table_name));
+    }
+
+    Ok(ValidatedUpdate {
+        table_name: shape.table_name,
+        assignments: shape.assignments,
+        id_literal: shape.id_literal,
         operation_id: shape.operation_id,
     })
 }
@@ -4042,5 +4187,254 @@ mod tests {
         let first = validate_sql(sql, &lookup).expect("first call should succeed");
         let second = validate_sql(sql, &lookup).expect("second call should succeed");
         assert_eq!(first, second);
+    }
+
+    // --- validate_update（SQL-17、TASK-191） -----------------------------------
+
+    #[test]
+    fn accepts_update_with_single_assignment() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_update(
+            "UPDATE documents SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("basic UPDATE shape should be accepted");
+        assert_eq!(stmt.table_name, "documents");
+        assert_eq!(
+            stmt.assignments,
+            vec![("lang".to_string(), InsertLiteral::String("en".to_string()))]
+        );
+        assert_eq!(stmt.id_literal, "1");
+        assert_eq!(
+            stmt.operation_id.as_ref().map(OperationId::as_str),
+            Some("op-0001")
+        );
+    }
+
+    #[test]
+    fn accepts_update_with_multiple_assignments_preserving_declared_order() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_update(
+            "UPDATE documents SET body = 'x', lang = 'ja' WHERE id = 7 USING OPERATION_ID 'op-0002'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("multiple SET assignments should be accepted");
+        assert_eq!(
+            stmt.assignments,
+            vec![
+                ("body".to_string(), InsertLiteral::String("x".to_string())),
+                ("lang".to_string(), InsertLiteral::String("ja".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_update_with_trailing_semicolon() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_update(
+            "UPDATE documents SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-0001';",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_update_missing_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = 'en' WHERE id = 1",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("missing clause must be rejected");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn rejects_update_with_explicit_null_operation_id() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = 'en' WHERE id = 1 USING OPERATION_ID NULL",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("explicit NULL must be rejected as missing");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn update_structural_validation_never_queries_catalog_when_operation_id_is_missing() {
+        struct FlaggingCatalog {
+            called: std::cell::Cell<bool>,
+        }
+        impl TableLookup for FlaggingCatalog {
+            fn table_exists(&self, _name: &str) -> Result<bool, SqlSurfaceError> {
+                self.called.set(true);
+                Ok(true)
+            }
+        }
+        let lookup = FlaggingCatalog {
+            called: std::cell::Cell::new(false),
+        };
+        let err = validate_update(
+            "UPDATE nope SET lang = 'en' WHERE id = 1",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "23502");
+        assert!(
+            !lookup.called.get(),
+            "catalog lookup must not be reached before the operation_id clause is validated"
+        );
+    }
+
+    #[test]
+    fn rejects_update_operation_id_dollar_placeholder() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = 'en' WHERE id = 1 USING OPERATION_ID $1",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("$n placeholder must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_with_duplicate_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'a' USING OPERATION_ID 'b'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("duplicate clause must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_with_returning_suffix() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-0001' RETURNING id",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("RETURNING must be rejected as trailing tokens");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_with_multiple_tables() {
+        let lookup = catalog_with(&["documents", "notes"]);
+        let err = validate_update(
+            "UPDATE documents, notes SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("multiple tables must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_with_subquery_set_value() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = (SELECT lang FROM documents) WHERE id = 1 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("subquery SET value must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_with_predicate_where_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET body = 'x' WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("predicate-form WHERE must be rejected (SQL-19 scope, not SQL-17)");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_missing_where_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = 'en' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("missing WHERE clause must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_update_where_id_with_non_numeric_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = 'en' WHERE id = 'x' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("non-numeric id literal must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_undefined_table_for_update_with_42p01() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE ghost SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("undefined table must be rejected");
+        assert_eq!(err.wire_code(), "42P01");
+    }
+
+    #[test]
+    fn rejects_update_set_assignment_count_over_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let assignments: Vec<String> = (0..=MAX_UPDATE_SET_ASSIGNMENTS)
+            .map(|i| format!("col{i} = 'v'"))
+            .collect();
+        let sql = format!(
+            "UPDATE documents SET {} WHERE id = 1 USING OPERATION_ID 'op-0001'",
+            assignments.join(", ")
+        );
+        let err = validate_update(&sql, &lookup, LedgerMode::Ledgered)
+            .expect_err("SET assignment count over limit must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn update_validation_is_deterministic_across_repeated_calls() {
+        let lookup = catalog_with(&["documents"]);
+        let sql = "UPDATE documents SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-0001'";
+        let first =
+            validate_update(sql, &lookup, LedgerMode::Ledgered).expect("first call should succeed");
+        let second = validate_update(sql, &lookup, LedgerMode::Ledgered)
+            .expect("second call should succeed");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn compare_only_without_ledger_accepts_missing_operation_id_clause_for_update() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_update(
+            "UPDATE documents SET lang = 'en' WHERE id = 1",
+            &lookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect("compare-only mode must not require operation_id");
+        assert_eq!(stmt.operation_id, None);
     }
 }
