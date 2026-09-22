@@ -33,9 +33,10 @@ use engine::storage::{Storage, Visibility};
 use common::*;
 
 /// `docs(embedding VECTOR(2), lang TEXT)` を持つ `EngineCore` を新設する。
-/// 可視行（wire 認証経路では Public のみ）: id=1 (tenant-a, "ja") /
-/// id=2 (tenant-b, "en") / id=3 (tenant-c, "ja")。`lang="xx"` の Private 行
-/// （id=11, tenant-a）は wire 越しには不可視で、RLS 非漏えいの対照に使う。
+/// 常に可視な Public 行: id=1 (tenant-a, "ja") / id=2 (tenant-b, "en") /
+/// id=3 (tenant-c, "ja")。`lang="xx"` の Private 行（id=11, tenant-a）は
+/// wire 認証したテナント自身（alice＝tenant-a）には可視（RLS-11・TASK-195。
+/// read-your-writes）で、他テナントには不可視のまま。
 fn new_core_scan_docs() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("wire-scan-docs");
     let guard = temp_db::CleanupGuard(path.clone());
@@ -102,10 +103,13 @@ fn spawn_with_alice(core: Arc<EngineCore>) -> (std::net::TcpStream, std::path::P
 }
 
 /// Issue #454: `ORDER BY`／`USING PLAN` を伴わない `SELECT ... LIMIT n` が
-/// `RowDescription`／`DataRow`（複数行）／`CommandComplete` として返る。RLS
-/// 非漏えい（`lang="xx"` の Private 行が現れない）もあわせて確認する。
+/// `RowDescription`／`DataRow`（複数行）／`CommandComplete` として返る。alice
+/// （tenant-a）は自テナントの `Private` 行（id=11, lang="xx"）も可視になる
+/// （RLS-11・TASK-195）。他テナントの `Private` 行が存在しないことは
+/// `wire1_three_tenant_visibility_public_shared_own_private_visible` が別途
+/// 固定する。
 #[test]
-fn bare_limit_scan_returns_rows_over_wire_without_leaking_private_rows() {
+fn bare_limit_scan_returns_rows_over_wire_including_own_tenant_private_row() {
     let (core, _guard) = new_core_scan_docs();
     let (mut stream, _users_path) = spawn_with_alice(core);
 
@@ -113,20 +117,21 @@ fn bare_limit_scan_returns_rows_over_wire_without_leaking_private_rows() {
     let columns = read_row_description(&mut stream);
     assert_eq!(columns, vec!["id", "lang"]);
 
-    let mut seen_ids: Vec<String> = Vec::new();
-    for _ in 0..3 {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for _ in 0..4 {
         let row = read_data_row(&mut stream);
-        seen_ids.push(row[0].clone().expect("id must not be NULL"));
-        let lang = row[1].as_deref().expect("lang must not be NULL");
-        assert_ne!(
-            lang, "xx",
-            "Private row's lang value must not leak over wire"
-        );
+        let id = row[0].clone().expect("id must not be NULL");
+        let lang = row[1].clone().expect("lang must not be NULL");
+        seen.push((id, lang));
     }
-    let mut sorted = seen_ids.clone();
-    sorted.sort();
-    assert_eq!(sorted, vec!["1", "2", "3"]);
-    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+    let mut sorted_ids: Vec<String> = seen.iter().map(|(id, _)| id.clone()).collect();
+    sorted_ids.sort();
+    assert_eq!(sorted_ids, vec!["1", "11", "2", "3"]);
+    assert!(
+        seen.iter().any(|(id, lang)| id == "11" && lang == "xx"),
+        "alice must observe her own tenant's Private row (read-your-writes), got {seen:?}"
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 4");
     read_ready_for_query(&mut stream);
 }
 
@@ -161,10 +166,12 @@ fn scan_limit_larger_than_visible_set_returns_all_visible_rows() {
 
     send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10000");
     let _columns = read_row_description(&mut stream);
-    for _ in 0..3 {
+    // alice の可視行は Public 3 件 + 自テナント Private 1 件の計 4 件
+    // （RLS-11・TASK-195）。
+    for _ in 0..4 {
         let _ = read_data_row(&mut stream);
     }
-    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+    assert_eq!(read_command_complete(&mut stream), "SELECT 4");
     read_ready_for_query(&mut stream);
 }
 
@@ -221,9 +228,11 @@ fn scan_result_unaffected_by_search_mode_over_wire() {
 
     send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10000");
     let _columns = read_row_description(&mut stream);
-    for _ in 0..3 {
+    // alice の可視行は Public 3 件 + 自テナント Private 1 件の計 4 件
+    // （RLS-11・TASK-195）。
+    for _ in 0..4 {
         let _ = read_data_row(&mut stream);
     }
-    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+    assert_eq!(read_command_complete(&mut stream), "SELECT 4");
     read_ready_for_query(&mut stream);
 }

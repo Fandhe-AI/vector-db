@@ -10,10 +10,11 @@
 //! （`execute_sql_in_session` 経由）が確定オラクルとして検証済みのため、
 //! 本ファイルは同じ規則が **wire フレーミング** 越しに観測できることの確認に
 //! 徹する（`wire_explain.rs`・`wire_hint_order.rs`・`wire_udf_call.rs` と
-//! 同じ流儀）。基本的な受理（`CommandComplete("INSERT 0 1")`）・可視性の
-//! 非対称性は `crates/wire-server/tests/wire1_simple_query.rs`
-//! （`wire1_insert_is_accepted_but_row_is_invisible_over_wire_select`）が
-//! 常時（`make ci`）回帰保護する主契約であるため、本ファイルはそれ以外の
+//! 同じ流儀）。基本的な受理（`CommandComplete("INSERT 0 1")`）・可視性の契約
+//! （RLS-11・TASK-195。書いた本人は同一 wire セッションでも自テナントの
+//! `Private` 行を読み戻せる）は `crates/wire-server/tests/wire1_simple_query.rs`
+//! （`wire1_insert_is_accepted_and_row_is_visible_over_wire_select_to_own_tenant`）
+//! が常時（`make ci`）回帰保護する主契約であるため、本ファイルはそれ以外の
 //! 経路（省略・再送・内容不一致・パラメータ形式禁止）に集中する。
 
 #[path = "common/mod.rs"]

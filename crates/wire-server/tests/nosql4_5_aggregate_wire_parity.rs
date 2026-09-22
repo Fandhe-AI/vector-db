@@ -22,16 +22,15 @@
 //! オラクル方針: 固定値は本ファイル内の手計算（`wire_aggregate.rs` で既に
 //! 公開済みの値）のみを使い、engine 実装を読み直して再計算しない。
 //!
-//! RLS 注意（誤コピー防止）: `wire_aggregate.rs` の seed は tenant-a **自身**
-//! が Private 行（id=11）を持つ。wire ログインが導出する `PolicyContext`
-//! は常に `PolicyContext::new`（Public のみ）であるため
-//! （`crate::auth::verify` 参照）、SQL オラクルも
-//! `PolicyContext::new(tenant)`（Public のみ）で実行しなければならない。
-//! `nosql4_aggregate.rs`／`nosql5_group_by.rs` の `ctx_for`
-//! （`with_visibilities(tenant, [Public, Private])`）をそのまま複製すると、
-//! tenant-a のオラクルだけ Private 行を含んでしまい wire 応答（COUNT=3）と
-//! 食い違う（COUNT=4 になる）。`tenant_a_and_others_see_identical_public_only_aggregates`
-//! が最初にこの取り違えを自己検査する。
+//! RLS 注意: `wire_aggregate.rs` の seed は tenant-a・tenant-b それぞれが
+//! 自身の Private 行（id=11／id=12）を持つ。wire ログインが導出する
+//! `PolicyContext` は `Public` ＋ 自テナント `Private`（RLS-11・TASK-195・
+//! read-your-writes。`crate::auth::verify` 参照）であるため、SQL オラクルも
+//! `with_visibilities(tenant, [Public, Private])` で実行する
+//! （`nosql4_aggregate.rs`／`nosql5_group_by.rs` の `ctx_for` と同型）。
+//! tenant-a／tenant-b は COUNT=4、tenant-c（自テナント Private 行なし）は
+//! COUNT=3 になる。`tenant_a_and_b_see_own_private_row_but_not_each_others`
+//! が最初にこの整合を自己検査する。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -69,11 +68,12 @@ fn schema() -> TableSchema {
     )
 }
 
-/// wire ログインが導出する `PolicyContext` と同じ Public-only ctx
-/// （`PolicyContext::new`）。オラクルは必ずこれを使う（モジュール doc の
-/// RLS 注意を参照）。
+/// wire ログインが導出する `PolicyContext` と同じ可視性（`Public` ＋
+/// 自テナント `Private`。RLS-11・TASK-195・read-your-writes）を持つ ctx。
+/// オラクルは必ずこれを使う（モジュール doc の RLS 注意を参照）。
 fn wire_scoped_ctx(tenant: &str) -> PolicyContext {
-    PolicyContext::new(tenant).expect("valid tenant ctx (Public only, wire 既定)")
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant ctx (Public + own tenant Private, wire 既定)")
 }
 
 /// `wire_aggregate.rs::new_core_aggregate_docs` と同一内容の複製
@@ -307,21 +307,29 @@ fn body_utf8(resp: &HttpResponse) -> String {
 /// wire スコープ（Public のみ）オラクルどおり固定値 3 であることを確認
 /// する（モジュール doc の RLS 注意を参照）。
 #[test]
-fn tenant_a_and_others_see_identical_public_only_aggregates() {
+fn tenant_a_and_b_see_own_private_row_but_not_each_others() {
     let (core, _guard) = new_core_wire_seed();
     let addr = spawn(Arc::clone(&core));
 
     let body = br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}]}"#;
-    for (user, pw, tenant) in [
-        ("alice", "pw-alice", "tenant-a"),
-        ("bob", "pw-bob", "tenant-b"),
-        ("carol", "pw-carol", "tenant-c"),
+    // alice（tenant-a）・bob（tenant-b）は自テナントの Private 行（id=11／
+    // id=12）を含め COUNT=4（RLS-11・TASK-195・read-your-writes）。
+    // carol（tenant-c）は自テナントの Private 行を持たないため COUNT=3 の
+    // まま。いずれのテナントも他テナントの Private 行は不可視のまま。
+    for (user, pw, tenant, expected_count) in [
+        ("alice", "pw-alice", "tenant-a", 4),
+        ("bob", "pw-bob", "tenant-b", 4),
+        ("carol", "pw-carol", "tenant-c", 3),
     ] {
         let resp = query_as(addr, user, pw, body);
         assert_eq!(resp.status, 200, "user={user} resp={resp:?}");
         let oracle = sql_oracle_body(&core, tenant, "SELECT COUNT(*) FROM docs");
         assert_eq!(body_utf8(&resp), oracle, "user={user}");
-        assert!(body_utf8(&resp).contains("[[3]]"), "{}", body_utf8(&resp));
+        assert!(
+            body_utf8(&resp).contains(&format!("[[{expected_count}]]")),
+            "user={user} {}",
+            body_utf8(&resp)
+        );
     }
 }
 
@@ -352,8 +360,10 @@ fn five_functions_single_request_match_sql_and_fixed_oracle() {
          MIN(lang), MAX(lang) FROM docs",
     );
     assert_eq!(body_utf8(&resp), oracle);
+    // alice（tenant-a）は Public 3 件 + 自テナント Private 行（id=11）1 件の
+    // 計 4 件を可視とする（RLS-11・TASK-195・read-your-writes）。
     assert!(
-        body_utf8(&resp).contains(r#""rows":[[3,3,6,2,1,3,"en","ja"]]"#),
+        body_utf8(&resp).contains(r#""rows":[[4,4,17,4.25,1,11,"en","xx"]]"#),
         "{}",
         body_utf8(&resp)
     );
@@ -562,8 +572,10 @@ fn group_by_matches_sql_default_key_order() {
         "SELECT lang, COUNT(*), SUM(id) FROM docs GROUP BY lang",
     );
     assert_eq!(body_utf8(&resp), oracle);
+    // alice（tenant-a）は自テナント Private 行（id=11, lang="xx"）を含め
+    // 3 グループ（キー昇順: en/ja/xx。RLS-11・TASK-195）になる。
     assert!(
-        body_utf8(&resp).contains(r#"[["en",1,2],["ja",2,4]]"#),
+        body_utf8(&resp).contains(r#"[["en",1,2],["ja",2,4],["xx",1,11]]"#),
         "{}",
         body_utf8(&resp)
     );
@@ -595,23 +607,36 @@ fn having_count_ge_2_matches_sql() {
     );
 }
 
-/// RLS-7・RLS-8: 3 テナント全員が同一の `COUNT(*)`／`group_by` キー集合
-/// （`{"en","ja"}`。Private 専用の `"xx"` グループは現れない）を観測する
-/// ことを確認する（`wire_aggregate.rs::
+/// RLS-7・RLS-8・RLS-11（TASK-195）: 自テナントの `Private` 専用グループ
+/// （`"xx"`）は read-your-writes により alice（tenant-a）・bob（tenant-b）
+/// 自身には現れるが、他テナントの `Private` グループは決して混入しないこと
+/// を確認する（`wire_aggregate.rs::
 /// rls_count_and_groups_never_reveal_other_tenants_private_rows` の
-/// NoSQL 版・非対称性検証部分）。
+/// NoSQL 版）。
 #[test]
-fn three_tenants_see_identical_aggregates_and_no_private_only_group() {
+fn tenants_see_own_private_group_but_never_other_tenants() {
     let (core, _guard) = new_core_wire_seed();
     let addr = spawn(Arc::clone(&core));
 
     let body = br#"{"op":"aggregate","table":"docs",
         "aggregates":[{"fn":"count","column":"*"}],
         "group_by":["lang"]}"#;
-    for (user, pw, tenant) in [
-        ("alice", "pw-alice", "tenant-a"),
-        ("bob", "pw-bob", "tenant-b"),
-        ("carol", "pw-carol", "tenant-c"),
+    // alice（tenant-a）・bob（tenant-b）は自テナントの Private 行（lang="xx"）
+    // による "xx" グループを追加で持つ（RLS-11・TASK-195）。carol は持たない。
+    for (user, pw, tenant, expected_rows) in [
+        (
+            "alice",
+            "pw-alice",
+            "tenant-a",
+            r#"[["en",1],["ja",2],["xx",1]]"#,
+        ),
+        (
+            "bob",
+            "pw-bob",
+            "tenant-b",
+            r#"[["en",1],["ja",2],["xx",1]]"#,
+        ),
+        ("carol", "pw-carol", "tenant-c", r#"[["en",1],["ja",2]]"#),
     ] {
         let resp = query_as(addr, user, pw, body);
         assert_eq!(resp.status, 200, "user={user} resp={resp:?}");
@@ -622,12 +647,7 @@ fn three_tenants_see_identical_aggregates_and_no_private_only_group() {
         );
         assert_eq!(body_utf8(&resp), oracle, "user={user}");
         assert!(
-            body_utf8(&resp).contains(r#"[["en",1],["ja",2]]"#),
-            "user={user} {}",
-            body_utf8(&resp)
-        );
-        assert!(
-            !body_utf8(&resp).contains("xx"),
+            body_utf8(&resp).contains(expected_rows),
             "user={user} {}",
             body_utf8(&resp)
         );
@@ -655,8 +675,10 @@ fn results_are_invariant_after_adding_50_private_rows_to_another_tenant() {
 
     let resp_before = query_as(addr, "bob", "pw-bob", count_body);
     assert_eq!(resp_before.status, 200);
+    // bob（tenant-b）は Public 3 件 + 自テナント Private 行（id=12）1 件の
+    // 計 4 件を可視とする（RLS-11・TASK-195・read-your-writes）。
     assert!(
-        body_utf8(&resp_before).contains("[[3]]"),
+        body_utf8(&resp_before).contains("[[4]]"),
         "{}",
         body_utf8(&resp_before)
     );
@@ -699,12 +721,14 @@ fn results_are_invariant_after_adding_50_private_rows_to_another_tenant() {
 
     let resp_group_after = query_as(addr, "bob", "pw-bob", group_body);
     assert_eq!(resp_group_after.status, 200);
+    // bob 自身の Private 行（id=12, lang="xx"）による "xx" グループは
+    // read-your-writes（RLS-11・TASK-195）により legitimately 現れる。
+    // tenant-a への 50 件追加は bob からは見えないため不変のまま。
     assert!(
-        body_utf8(&resp_group_after).contains(r#"[["en",1],["ja",2]]"#),
+        body_utf8(&resp_group_after).contains(r#"[["en",1],["ja",2],["xx",1]]"#),
         "{}",
         body_utf8(&resp_group_after)
     );
-    assert!(!body_utf8(&resp_group_after).contains("xx"));
 }
 
 /// `aggregates` が [`engine::sql::allowlist::MAX_AGGREGATE_ITEMS`]（32）を
@@ -806,8 +830,9 @@ fn rejections_do_not_poison_session_token() {
     assert_eq!(resp_ok.status, 200, "resp={resp_ok:?}");
     let oracle = sql_oracle_body(&core, "tenant-a", "SELECT COUNT(*) FROM docs");
     assert_eq!(body_utf8(&resp_ok), oracle);
+    // alice は自テナント Private 行を含め 4 件（RLS-11・TASK-195）。
     assert!(
-        body_utf8(&resp_ok).contains("[[3]]"),
+        body_utf8(&resp_ok).contains("[[4]]"),
         "{}",
         body_utf8(&resp_ok)
     );

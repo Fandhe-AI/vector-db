@@ -16,6 +16,30 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use argon2id::Params;
+use engine::storage::Visibility;
+
+/// 認証成功時に導出する `PolicyContext` が持つ可視性集合を一箇所に定める
+/// ヘルパー（RLS-11・TASK-195。ポインタ: `docs/spec/04-behavior/*.md`）。
+/// `UserStore::load_from_file` の起動時検証（tenant_id の妥当性のみを確認）と
+/// [`verify`] の実行時導出が同一コンストラクタを使うことで、両者の意味的な
+/// 乖離（起動時は通るが実行時の可視性集合が異なる、といった食い違い）を防ぐ。
+///
+/// 可視性は `Public` ＋ 自テナントの `Private`（read-your-writes。書いた本人が
+/// 同一テナントの別セッションも含めて commit 済みの自分の行を読み戻せる）。
+/// 他テナントの `Private` 行は `engine::policy::PolicyContext::is_visible` の
+/// テナント一致判定により不可視のまま（このヘルパーはあくまで「自テナントに
+/// 何を許可するか」の集合であり、テナント境界そのものは engine 側の判定が担う）。
+///
+/// engine 側 `crate::policy::PolicyContext::new`（既定 = `Public` のみ）は
+/// 変更しない。可視性の拡張はこの wire 認証導出点に閉じる。
+fn session_policy_context(
+    tenant_id: &str,
+) -> Result<engine::policy::PolicyContext, engine::policy::PolicyError> {
+    engine::policy::PolicyContext::with_visibilities(
+        tenant_id,
+        [Visibility::Public, Visibility::Private],
+    )
+}
 
 /// 認証失敗時に課す固定遅延。ポインタ: TASK-67・WIRE-3（`docs/spec/04-behavior/wire-protocol.md`）。
 ///
@@ -172,7 +196,7 @@ impl UserStore {
             if params != argon2id::RECOMMENDED_PARAMS {
                 return Err(LoadError::InvalidPhc { line: line_no });
             }
-            engine::policy::PolicyContext::new(tenant_id)
+            session_policy_context(tenant_id)
                 .map_err(|_| LoadError::InvalidTenantId { line: line_no })?;
 
             if users
@@ -249,6 +273,8 @@ fn dummy_phc() -> &'static str {
 }
 
 /// cleartext password 認証を照合し、成功時は `engine::policy::PolicyContext` を返す。
+/// 返す `PolicyContext` の可視性は `Public` ＋ 自テナントの `Private`
+/// （RLS-11・TASK-195。[`session_policy_context`] 参照）。
 /// `handshake.rs` の接続ハンドラから呼ばれる（ポインタ: TASK-67・WIRE-3）。
 /// `http::session::issue`（`POST /v1/session`・TASK-174・HTTP-6。Issue #752）
 /// からも同じ関数がそのまま呼ばれ、固定遅延・ダミー KDF による対称性・
@@ -309,19 +335,18 @@ pub fn verify(
 
     match outcome {
         Ok(tenant_id) => {
-            // tenant_id はロード時に `PolicyContext::new` で検証済みだが、契約変更に
-            // 備えて再検証する（fail-closed。ここでの失敗も認証失敗として扱う）。
+            // tenant_id はロード時に `session_policy_context` で検証済みだが、
+            // 契約変更に備えて再検証する（fail-closed。ここでの失敗も認証失敗
+            // として扱う）。
             //
-            // `Public` のみ許可し `Private` は含めない（既定・最小権限）。
-            // `wire1_three_tenant_visibility_public_shared_private_hidden`
-            // （`crates/wire-server/tests/wire1_simple_query.rs`）が、認証した
-            // テナント自身の `Private` 行であっても wire 経由の SELECT では
-            // 不可視であることを回帰確認しており、ここを `Private` 許可へ
-            // 広げるとその境界を壊す（codex-review P1・PR #210 指摘の検討過程で
-            // 確認。テナント越境ではなく自テナント自身の可視性でも意図的に
-            // 最小権限のまま。対応は `simple_query.rs` 側で wire の INSERT 自体を
-            // 公開しない方針とした）。
-            engine::policy::PolicyContext::new(&tenant_id).map_err(|_| AuthFailure)
+            // `Public` ＋ 自テナントの `Private` を許可する（RLS-11・TASK-195。
+            // read-your-writes: 書いた本人が同一テナントの別セッションも含めて
+            // commit 済みの自分の行を読み戻せる）。他テナントの `Private` 行は
+            // `PolicyContext::is_visible` のテナント一致判定により不可視のまま
+            // （テナント境界そのものは変更しない）。engine 側
+            // `crate::policy::PolicyContext::new`（既定 = `Public` のみ）は
+            // 変更せず、可視性の拡張はこの導出点に閉じる。
+            session_policy_context(&tenant_id).map_err(|_| AuthFailure)
         }
         Err(()) => Err(AuthFailure),
     }
@@ -389,6 +414,29 @@ mod tests {
         let store = store_with_user("alice", "tenant-a", b"correct-horse");
         let ctx = verify(&store, "alice", b"correct-horse").expect("valid credentials");
         assert_eq!(ctx.tenant_id(), "tenant-a");
+    }
+
+    /// RLS-11・TASK-195: `verify()` が返す `PolicyContext` は自テナントの
+    /// `Private` 行を可視とし（read-your-writes）、他テナントの `Private` 行は
+    /// 不可視のまま。`Public` 行は引き続き全テナントから可視
+    /// （RLS-6/RLS-7 の既存契約が壊れていないことの直接確認）。
+    #[test]
+    fn verify_grants_own_tenant_private_visibility_but_not_other_tenant() {
+        let store = store_with_user("alice", "tenant-a", b"correct-horse");
+        let ctx = verify(&store, "alice", b"correct-horse").expect("valid credentials");
+
+        assert!(
+            ctx.is_visible("tenant-a", Visibility::Private),
+            "own tenant's Private rows must be visible (read-your-writes)"
+        );
+        assert!(
+            !ctx.is_visible("tenant-b", Visibility::Private),
+            "other tenant's Private rows must remain invisible"
+        );
+        assert!(
+            ctx.is_visible("tenant-b", Visibility::Public),
+            "Public rows must remain visible across tenants"
+        );
     }
 
     /// 誤りパスワードは拒否され、固定遅延が実際に課されること（下限のみ確認し
