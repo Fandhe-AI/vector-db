@@ -43,10 +43,15 @@
 //!
 //! 読み戻しオラクル（[`read_back_ids`]）は必ず
 //! `PolicyContext::with_visibilities(TENANT_A, [Public, Private])` を使う。
-//! HTTP 経由の `insert` は常に `Private` 固定で書き込まれる一方、SQL wire の
-//! ログインセッションは `PolicyContext::new`（`Public` のみ）を使うため、
-//! HTTP 経由で書いた行は同一 SQL wire セッションからは読み戻せない
-//! （既知の非対称。`docs/design/three-client-e2e-harness.md` 参照）。
+//! HTTP 経由の `insert` は常に `Private` 固定で書き込まれる。wire-server の
+//! 認証導出点（`auth.rs::session_policy_context`）は pg wire・HTTP セッション
+//! 発行の双方で `Public` ＋ 自テナントの `Private` を許可可視性とする
+//! （RLS-11・TASK-195。read-your-writes）ため、production の SQL wire
+//! セッションからも同一テナントであれば読み戻せる——本ファイルの
+//! `read_back_ids` は wire を経由しない engine API 直呼び出しのオラクルで
+//! あり、production の SQL wire 経路とは別の検証経路であることに注意する
+//! （production の SQL wire 経由読み戻しは `crates/wire-server/tests/
+//! rls11_read_your_writes.rs` が担う）。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -306,8 +311,8 @@ fn parse_insert_success_body(resp: &HttpResponse) -> (u64, String) {
 }
 
 /// `core` を tenant-a（`with_visibilities([Public, Private])`）で読み戻し、
-/// 可視な行 `id` の一覧を返す（HTTP 経由 insert は同一 SQL wire セッションからは
-/// 読み戻せないため。モジュール doc「RLS 注意」参照）。
+/// 可視な行 `id` の一覧を返す（wire を経由しない engine API 直呼び出しの
+/// オラクル。モジュール doc「RLS 注意」参照）。
 fn read_back_ids(core: &EngineCore) -> Vec<u64> {
     let ctx = PolicyContext::with_visibilities(TENANT_A, [Visibility::Public, Visibility::Private])
         .expect("valid tenant-a ctx");

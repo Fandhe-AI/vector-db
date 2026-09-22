@@ -198,11 +198,12 @@ fn insert_success_body_has_exact_shape_and_is_persisted() {
     assert_eq!(inserted, 1);
     assert_eq!(operation_id, "nosql-op-shape");
 
-    // 非 vacuous 化: HTTP 経由の insert は同一セッションからは読み戻せない
-    // （既知の非対称。`docs/design/three-client-e2e-harness.md` 参照）ため、
-    // 保持している `Arc<EngineCore>` から直接 `SELECT`（SQL-15 広域取得）で
-    // 実際に永続化されたことを確認する。200 応答が「ハンドラが走った」以上の
-    // 証跡になるようにする。
+    // 非 vacuous 化: 保持している `Arc<EngineCore>` から直接 `SELECT`
+    // （SQL-15 広域取得）で実際に永続化されたことを確認する（RLS-11・
+    // TASK-195 導入後は production の SQL wire セッションからも同一テナント
+    // であれば読み戻せるが、その経路自体の検証は
+    // `crates/wire-server/tests/rls11_read_your_writes.rs` に委ねる）。
+    // 200 応答が「ハンドラが走った」以上の証跡になるようにする。
     let ctx = PolicyContext::with_visibilities(TENANT_A, [Visibility::Public, Visibility::Private])
         .expect("valid tenant-a ctx");
     let mut session = engine::sql::mode::SessionState::default();

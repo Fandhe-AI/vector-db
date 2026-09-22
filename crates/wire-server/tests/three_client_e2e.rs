@@ -204,10 +204,11 @@ fn spawn_wire_server(users_path: &Path, db_path: &Path, extra_args: &[String]) -
 
 /// 3 テナント（alice/bob/carol）に Public 行 1 件ずつを投入した `docs`
 /// テーブルを持つ一時 DB を用意する（層 A の
-/// `wire1_three_tenant_visibility_public_shared_private_hidden` と同じ seed
-/// 方針。可視性の非対称は同テストのドキュメンテーションコメント参照）。
-/// C1〜C4（TASK-73／WIRE-1）すべてを同じ 3 行のコーパスで検証できるよう
-/// 列を構成する（codex-review P2 指摘・PR #210）。
+/// `wire1_three_tenant_visibility_public_shared_own_private_visible` と同じ
+/// seed 方針。本 seed は `Private` 行を持たないため RLS-11・TASK-195
+/// （read-your-writes。ポインタ: `docs/spec/04-behavior/rls.md` RLS-11）の
+/// 影響を受けない）。C1〜C4（TASK-73／WIRE-1）すべてを同じ 3 行のコーパスで
+/// 検証できるよう列を構成する（codex-review P2 指摘・PR #210）。
 fn seed_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("three-client-e2e-docs");
     let guard = temp_db::CleanupGuard(path.clone());
@@ -319,9 +320,13 @@ fn seed_arbitrary_table_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
 /// `seed_three_tenant_db` と同じ Public 3 行（`embedding`/`lang`/`body`）に加え、
 /// tenant-a の Private 行（id=11, lang="xx"）・tenant-b の Private 行
 /// （id=12, lang="ja"）を投入した一時 DB を用意する（TASK-168・SQL-13/14）。
-/// wire 認証経路の `PolicyContext` は Public のみ許可のため、Private 行は
-/// どのユーザーの接続からも不可視。既存 C1〜C4 テストの seed
-/// （`seed_three_tenant_db`）はこの関数の追加では変更しない。
+/// wire 認証経路の `PolicyContext` は `Public` ＋ 自テナントの `Private` を
+/// 許可可視性とする（RLS-11・TASK-195。read-your-writes）ため、tenant-a の
+/// 接続では id=11 が、tenant-b の接続では id=12 が集計・GROUP BY の対象に
+/// 含まれる。他テナントの `Private` 行は引き続きどの接続からも不可視
+/// （carol は Private 行を持たないため元の集計結果のまま不変）。既存
+/// C1〜C4 テストの seed（`seed_three_tenant_db`）はこの関数の追加では
+/// 変更しない。
 fn seed_aggregate_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("three-client-e2e-aggregate-docs");
     let guard = temp_db::CleanupGuard(path.clone());
@@ -419,11 +424,13 @@ const C3_SQL: &str =
 const C4_SQL: &str = "SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'zzz-term-absent-from-any-seed-body') LIMIT 3";
 
 /// TASK-187（SQL-11）: `docs` 以外の任意テーブル（`kb_articles`）での C1 相当。
-/// `LIMIT` を `docs` 版（3）より大きい 5 にし、Public 行（3 件）しか無い
-/// コーパスで万一 RLS が破綻し Private 行（id=11）が漏れても `LIMIT` で
-/// 隠れず必ず観測できる形にする（非 vacuous な RLS チェック）。
+/// `LIMIT` は本ファイルの `INSERT` 検証（`three_clients_run_c1_and_insert_on_
+/// arbitrary_table`）で 3 テナント分の追加行（最大 9 行）を積んでも総行数
+/// （最大 3 Public + 1 Private + 9 = 13）を上回る 20 に設定し、RLS-11・
+/// TASK-195（read-your-writes）の許可可視性で行が増減しても `LIMIT` に隠れず
+/// 必ず観測できる形にする（非 vacuous な RLS チェック）。
 const C1_SQL_ARBITRARY_TABLE: &str =
-    "SELECT id FROM kb_articles ORDER BY embedding <=> '[1.0,0.0]' LIMIT 5";
+    "SELECT id FROM kb_articles ORDER BY embedding <=> '[1.0,0.0]' LIMIT 20";
 
 /// psql（無改造）で任意の SQL を実行し、返却された各行を `|` 区切りで結合した
 /// 文字列の集合として返す（単一列なら値そのもの）。`-F '|'` で区切り文字を
@@ -760,7 +767,7 @@ fn spawn_pg_client(
 /// 3 クライアント（psql / psycopg / pg）それぞれで、3 テナントいずれの
 /// ユーザーで接続しても C1〜C4（TASK-73／WIRE-1）の結果が独立オラクルと一致
 /// すること・誤りパスワードが拒否されることを検証する（可視性契約は層 A の
-/// `wire1_three_tenant_visibility_public_shared_private_hidden` と同じ。
+/// `wire1_three_tenant_visibility_public_shared_own_private_visible` と同じ。
 /// codex-review P2 指摘・PR #210）。ツール未導入・スクリプト失敗は silent
 /// skip せず `panic!` で失敗させる（本ファイル先頭のドキュメンテーション
 /// コメント参照）。
@@ -900,10 +907,23 @@ fn three_clients_verify_search_mode_switch_and_precision_contract() {
 /// 経由で確認する。閾値・拒否形状そのものの回帰保護は層 A
 /// （`tests/wire_aggregate.rs`、常時 `make ci`）が担う。
 ///
+/// wire 認証経路の `PolicyContext` は `Public` ＋ 自テナントの `Private` を
+/// 許可可視性とする（RLS-11・TASK-195。read-your-writes）ため、tenant-a
+/// （alice）は自身の Private 行（id=11, lang="xx"）を、tenant-b（bob）は
+/// 自身の Private 行（id=12, lang="ja"）を集計対象に含む。期待値は
+/// `EngineCore::execute_sql_in_session` を `seed_aggregate_three_tenant_db`
+/// と同じ seed・各テナントの `PolicyContext::with_visibilities(tenant,
+/// [Public, Private])` で直接呼ぶ独立オラクルにより導出した固定リテラルで、
+/// production の判定関数を経由しない（carol は Private 行を持たないため
+/// 元の集計結果のまま不変であることも非漏えいの証跡になる）。
+///
 /// すべての SELECT に一意の `AS` 別名を付け、NULL を返す SQL は使わない
 /// （Node `pg` は `Object.values(row)` で行を出力するため同名列が潰れ、NULL の
 /// 描画も psql（空文字）／pg（`Array.join` で空文字）／psycopg（`str(None)`=
-/// "None"）で異なる。NULL 契約の検証は層 A に閉じる）。
+/// "None"）で異なる。NULL 契約の検証は層 A に閉じる）。集計列は
+/// `result_encoder.rs` の `ColumnMeta::Computed` 契約により実行時型に関わらず
+/// 常に wire 型 `text`（OID 25）で送出されるため、`AVG` の非整数値（"4.25"
+/// 等）も 3 クライアントで文字列として同一に描画される。
 #[test]
 #[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
 fn three_clients_verify_aggregate_queries_and_rls_invariance() {
@@ -915,37 +935,58 @@ fn three_clients_verify_aggregate_queries_and_rls_invariance() {
     let server = spawn_wire_server(&users_path, &db_path, &[]);
     let port = server.port;
 
-    // 独立オラクル（可視行は id=1/2/3 の Public 3 行のみ。Private 行
-    // （lang="xx"）は wire 認証経路では不可視。`seed_aggregate_three_tenant_db`
-    // のドキュメンテーションコメント参照）。
     const AGG1_SQL: &str = "SELECT COUNT(*) AS n, SUM(id) AS s, AVG(id) AS a, MIN(lang) AS l_min, MAX(lang) AS l_max FROM docs";
-    let expected_agg1 = vec!["3|6|2|en|ja".to_string()];
-
     const AGG2_SQL: &str = "SELECT COUNT(*) AS n FROM docs WHERE lang = 'ja'";
-    let expected_agg2 = vec!["2".to_string()];
-
     const AGG3_SQL: &str = "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY n DESC";
-    let expected_agg3 = vec!["ja|2".to_string(), "en|1".to_string()];
-
     const AGG4_SQL: &str = "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang HAVING n >= 2";
-    let expected_agg4 = vec!["ja|2".to_string()];
 
-    for (user, pw) in [
-        ("alice", "pw-alice"),
-        ("bob", "pw-bob"),
-        ("carol", "pw-carol"),
+    // テナント別の独立オラクル値（RLS-11 導入後。alice=own Private id=11
+    // lang="xx"・bob=own Private id=12 lang="ja"・carol=Private 行なし）。
+    let alice_agg1 = vec!["4|17|4.25|en|xx".to_string()];
+    let alice_agg2 = vec!["2".to_string()];
+    let alice_agg3 = vec!["ja|2".to_string(), "en|1".to_string(), "xx|1".to_string()];
+    let alice_agg4 = vec!["ja|2".to_string()];
+
+    let bob_agg1 = vec!["4|18|4.5|en|ja".to_string()];
+    let bob_agg2 = vec!["3".to_string()];
+    let bob_agg3 = vec!["ja|3".to_string(), "en|1".to_string()];
+    let bob_agg4 = vec!["ja|3".to_string()];
+
+    let carol_agg1 = vec!["3|6|2|en|ja".to_string()];
+    let carol_agg2 = vec!["2".to_string()];
+    let carol_agg3 = vec!["ja|2".to_string(), "en|1".to_string()];
+    let carol_agg4 = vec!["ja|2".to_string()];
+
+    for (user, pw, expected_agg1, expected_agg2, expected_agg3, expected_agg4) in [
+        (
+            "alice",
+            "pw-alice",
+            &alice_agg1,
+            &alice_agg2,
+            &alice_agg3,
+            &alice_agg4,
+        ),
+        ("bob", "pw-bob", &bob_agg1, &bob_agg2, &bob_agg3, &bob_agg4),
+        (
+            "carol",
+            "pw-carol",
+            &carol_agg1,
+            &carol_agg2,
+            &carol_agg3,
+            &carol_agg4,
+        ),
     ] {
         for (label, sql, expected) in [
-            ("AGG1", AGG1_SQL, &expected_agg1),
-            ("AGG2", AGG2_SQL, &expected_agg2),
-            ("AGG3", AGG3_SQL, &expected_agg3),
-            ("AGG4", AGG4_SQL, &expected_agg4),
+            ("AGG1", AGG1_SQL, expected_agg1),
+            ("AGG2", AGG2_SQL, expected_agg2),
+            ("AGG3", AGG3_SQL, expected_agg3),
+            ("AGG4", AGG4_SQL, expected_agg4),
         ] {
             let psql_rows = run_psql(port, user, pw, sql);
             assert_eq!(
                 &psql_rows, expected,
-                "psql: unexpected {label} result for user {user} (must not reveal the \
-                 Private-only \"xx\" group of another tenant)"
+                "psql: unexpected {label} result for user {user} (must include only this \
+                 tenant's own Private group, never another tenant's)"
             );
 
             let psycopg_rows = run_psycopg(port, user, pw, sql);
@@ -984,12 +1025,18 @@ fn three_clients_verify_aggregate_queries_and_rls_invariance() {
 /// 確認する。評価順序・台帳スコープ・複数次元共存・`42P01` は engine 側
 /// `crates/engine/tests/arbitrary_table.rs`（TASK-81）が既に機械検証済みの
 /// ため、本テストは wire 経由の C1 相当 SELECT・`INSERT` の成否契約確認に
-/// 限定する。TASK-82／`docs/design/three-client-e2e-harness.md` の既定契約
-/// （wire 認証経路の `PolicyContext` は Public のみ・書いた本人も同一 wire
-/// セッションでは読み戻せない非対称）はここでも維持されるため、`INSERT`
-/// 後に C1 を再実行して可視性を確認することはしない（`docs` の
-/// `three_clients_run_insert_with_operation_id` 相当と同じく「成功したこと」
-/// のみを確認する）。
+/// 限定する。
+///
+/// wire 認証経路の `PolicyContext` は `Public` ＋ 自テナントの `Private` を
+/// 許可可視性とする（RLS-11・TASK-195。read-your-writes）ため、
+/// `seed_arbitrary_table_three_tenant_db` の tenant-a 自身の Private 行
+/// （id=11）は alice の C1 に含まれる（bob・carol は Private 行を持たない
+/// ため元の Public 3 行のまま）。さらに本テストは `INSERT` 後の可視性を
+/// (1) 同一接続（`run_*_session` の prelude に `INSERT` を積み、続く C1 を
+/// 同じ接続で実行）、(2) 同一テナントの新規接続（`run_*` で改めて接続）の
+/// 双方で確認し、(3) 後続テナントの反復で先行テナントの挿入 id が現れない
+/// こと（他テナントへ越境しないこと）を、反復ごとに再構築する期待集合との
+/// 完全一致（`assert_eq!` の集合比較）で固定する。
 #[test]
 #[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
 fn three_clients_run_c1_and_insert_on_arbitrary_table() {
@@ -1001,10 +1048,6 @@ fn three_clients_run_c1_and_insert_on_arbitrary_table() {
     let server = spawn_wire_server(&users_path, &db_path, &[]);
     let port = server.port;
 
-    // 独立オラクル（Public 3 行のみ。tenant-a の Private 行 id=11 は wire
-    // 認証経路では不可視のため、現れれば RLS 暗黙適用の破綻として検出される）。
-    let expected_c1 = vec!["1".to_string(), "2".to_string(), "3".to_string()];
-
     let insert_sql = |id: u64, op: &str| -> String {
         format!(
             "INSERT INTO kb_articles (id, embedding, lang, body) VALUES \
@@ -1012,6 +1055,15 @@ fn three_clients_run_c1_and_insert_on_arbitrary_table() {
              USING OPERATION_ID '{op}'"
         )
     };
+
+    // `assert_set_eq` は順序を問わない集合一致（distance の同点タイブレーク
+    // 順まで固定オラクルへ持ち込まないための比較。id の重複が無いことは
+    // production の `id` 主キー一意性契約に委ねる）。
+    let assert_set_eq =
+        |actual: Vec<String>, expected: &std::collections::BTreeSet<String>, ctx: &str| {
+            let actual_set: std::collections::BTreeSet<String> = actual.into_iter().collect();
+            assert_eq!(&actual_set, expected, "{ctx}");
+        };
 
     // tenant ごとに id・operation_id のブロックを分け、台帳（TASK-93・
     // RECOVER-2）の内容照合ハッシュ（TASK-101・RECOVER-10）が誤って
@@ -1024,51 +1076,69 @@ fn three_clients_run_c1_and_insert_on_arbitrary_table() {
     .into_iter()
     .enumerate()
     {
-        // C1 相当 SELECT。
-        assert_eq!(
+        // このテナントの可視集合は seed 由来の Public 3 行 + （alice のみ）
+        // 自身の Private 行 id=11 から始まる。他テナントが直前の反復で
+        // kb_articles へ挿入した id はここには含まれない（越境しないことの
+        // 証跡そのもの）。
+        let mut expected: std::collections::BTreeSet<String> =
+            ["1", "2", "3"].into_iter().map(str::to_string).collect();
+        if user == "alice" {
+            expected.insert("11".to_string());
+        }
+
+        // 挿入前: 新規接続の C1 は seed 由来の可視集合とちょうど一致する。
+        assert_set_eq(
             run_psql(port, user, pw, C1_SQL_ARBITRARY_TABLE),
-            expected_c1,
-            "psql: unexpected C1 result on kb_articles for user {user}"
-        );
-        assert_eq!(
-            run_psycopg(port, user, pw, C1_SQL_ARBITRARY_TABLE),
-            expected_c1,
-            "psycopg: unexpected C1 result on kb_articles for user {user}"
-        );
-        assert_eq!(
-            run_pg(port, user, pw, C1_SQL_ARBITRARY_TABLE),
-            expected_c1,
-            "pg: unexpected C1 result on kb_articles for user {user}"
+            &expected,
+            &format!("psql: unexpected pre-insert C1 result on kb_articles for user {user}"),
         );
 
-        // INSERT ... USING OPERATION_ID（3 クライアントとも成功のみ確認）。
         let base_id: u64 = 200 + (i as u64) * 10;
-        run_psql_session(
-            port,
-            user,
-            pw,
-            &[],
-            &insert_sql(base_id, &format!("arbitrary-table-e2e-insert-psql-{user}")),
+
+        // psql: 同一接続（prelude の INSERT → 同じ接続で C1）で自分が
+        // 書いた行を直ちに読み戻せる（RLS-11・read-your-writes）。
+        let insert1 = insert_sql(base_id, &format!("arbitrary-table-e2e-insert-psql-{user}"));
+        let rows = run_psql_session(port, user, pw, &[&insert1], C1_SQL_ARBITRARY_TABLE);
+        expected.insert(base_id.to_string());
+        assert_set_eq(
+            rows,
+            &expected,
+            &format!("psql: same-connection C1 must observe the row just inserted by {user}"),
         );
-        run_psycopg_session(
-            port,
-            user,
-            pw,
-            &[],
-            &insert_sql(
-                base_id + 1,
-                &format!("arbitrary-table-e2e-insert-psycopg-{user}"),
-            ),
+
+        // psycopg: 同様に同一接続での read-your-writes を確認する。
+        let insert2 = insert_sql(
+            base_id + 1,
+            &format!("arbitrary-table-e2e-insert-psycopg-{user}"),
         );
-        run_pg_session(
-            port,
-            user,
-            pw,
-            &[],
-            &insert_sql(
-                base_id + 2,
-                &format!("arbitrary-table-e2e-insert-pg-{user}"),
-            ),
+        let rows = run_psycopg_session(port, user, pw, &[&insert2], C1_SQL_ARBITRARY_TABLE);
+        expected.insert((base_id + 1).to_string());
+        assert_set_eq(
+            rows,
+            &expected,
+            &format!("psycopg: same-connection C1 must observe the row just inserted by {user}"),
+        );
+
+        // pg: 同様に同一接続での read-your-writes を確認する。
+        let insert3 = insert_sql(
+            base_id + 2,
+            &format!("arbitrary-table-e2e-insert-pg-{user}"),
+        );
+        let rows = run_pg_session(port, user, pw, &[&insert3], C1_SQL_ARBITRARY_TABLE);
+        expected.insert((base_id + 2).to_string());
+        assert_set_eq(
+            rows,
+            &expected,
+            &format!("pg: same-connection C1 must observe the row just inserted by {user}"),
+        );
+
+        // 挿入後: 同一テナントの**新規接続**（`run_psql` は毎回新しい接続を
+        // 張る）でも 3 件すべてが可視のまま（同一テナント別セッションの
+        // read-your-writes）。
+        assert_set_eq(
+            run_psql(port, user, pw, C1_SQL_ARBITRARY_TABLE),
+            &expected,
+            &format!("psql: fresh same-tenant connection must observe all rows {user} inserted"),
         );
     }
 

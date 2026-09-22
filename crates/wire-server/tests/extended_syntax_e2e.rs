@@ -350,13 +350,9 @@ fn run_psql_session(port: u16, prelude: &[&str], sql: &str) -> Vec<String> {
         .collect()
 }
 
-fn spawn_psycopg_client(port: u16, sql: &str) -> std::process::Output {
-    spawn_psycopg_client_session(port, &[], sql)
-}
-
 /// `psycopg_client.py` に `WIRE_SQL_PRELUDE`（JSON 配列）を渡し、`prelude` の
-/// 各文を同一接続で先行実行してから `sql` を実行する（`spawn_psycopg_client` は
-/// 本関数の prelude 無しの薄いラッパー。`tests/three_client_e2e.rs` と同型）。
+/// 各文を同一接続で先行実行してから `sql` を実行する（`tests/three_client_e2e.rs`
+/// と同型）。
 fn spawn_psycopg_client_session(port: u16, prelude: &[&str], sql: &str) -> std::process::Output {
     let python = resolve_tool("PYTHON_BIN", "python3");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/psycopg_client.py");
@@ -395,13 +391,9 @@ fn run_psycopg_session(port: u16, prelude: &[&str], sql: &str) -> Vec<String> {
         .collect()
 }
 
-fn spawn_pg_client(port: u16, sql: &str) -> std::process::Output {
-    spawn_pg_client_session(port, &[], sql)
-}
-
 /// `pg_client.js` に `WIRE_SQL_PRELUDE`（JSON 配列）を渡し、`prelude` の各文を
-/// 同一接続で先行実行してから `sql` を実行する（`spawn_pg_client` は本関数の
-/// prelude 無しの薄いラッパー。`tests/three_client_e2e.rs` と同型）。
+/// 同一接続で先行実行してから `sql` を実行する（`tests/three_client_e2e.rs` と
+/// 同型）。
 fn spawn_pg_client_session(port: u16, prelude: &[&str], sql: &str) -> std::process::Output {
     let node = resolve_tool("NODE_BIN", "node");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/pg_client.js");
@@ -668,7 +660,13 @@ fn three_clients_run_create_function_then_call() {
 }
 
 /// SQL-10: `INSERT ... USING OPERATION_ID '<id>'` が 3 クライアントいずれからも
-/// `INSERT 0 1` として成功する。
+/// `INSERT 0 1` として成功し、wire 認証経路の `PolicyContext` が `Public` ＋
+/// 自テナントの `Private` を許可可視性とする（RLS-11・TASK-195。
+/// read-your-writes）ことから、書いた本人が同一接続の後続 SELECT でその行を
+/// 直ちに読み戻せることを固定する。`seed_plain_docs` は単一テナント
+/// （alice/tenant-a）構成のため他テナントへの越境検証は行わない
+/// （`tests/three_client_e2e.rs::three_clients_run_c1_and_insert_on_arbitrary_table`
+/// が複数テナント構成でその検証を担う）。
 #[test]
 #[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
 fn three_clients_run_insert_with_operation_id() {
@@ -686,45 +684,55 @@ fn three_clients_run_insert_with_operation_id() {
              USING OPERATION_ID '{op}'"
         )
     };
+    // seed の 3 行より大きい `LIMIT` にし、読み戻しが `LIMIT` に隠れないよう
+    // にする（`seed_plain_docs` 3 行 + 挿入 3 行 = 6 行を上回る 10）。
+    const SELECT_SQL: &str = "SELECT id FROM docs ORDER BY embedding <=> '[0.5,0.5]' LIMIT 10";
 
-    // psql は CommandComplete タグを標準の `\pset` では出力しないため、
-    // `-c` 実行の終了コードのみで成功可否を判定する（`run_psql` はデータ行を
-    // 前提とした薄いラッパーのため、ここでは直接 Command を組み立てる）。
-    let psql = resolve_tool("PSQL_BIN", "psql");
-    let status = Command::new(&psql)
-        .env("PGPASSWORD", "pw-alice")
-        .args([
-            "-h",
-            "127.0.0.1",
-            "-p",
-            &port.to_string(),
-            "-U",
-            "alice",
-            "-d",
-            "irrelevant-db-name",
-            "-X",
-            "-w",
-            "-q",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-c",
-            &insert_sql(100, "extended-e2e-insert-psql"),
-        ])
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn {psql}: {e}"));
-    assert!(status.success(), "psql: INSERT must succeed");
-
-    let psycopg_out = spawn_psycopg_client(port, &insert_sql(101, "extended-e2e-insert-psycopg"));
+    // psql: 同一接続（prelude の INSERT → 同じ接続で SELECT）で自分が
+    // 書いた id=100 を直ちに読み戻せる。
+    let rows = run_psql_session(
+        port,
+        &[&insert_sql(100, "extended-e2e-insert-psql")],
+        SELECT_SQL,
+    );
     assert!(
-        psycopg_out.status.success(),
-        "psycopg: INSERT must succeed: stderr={}",
-        String::from_utf8_lossy(&psycopg_out.stderr)
+        rows.contains(&"100".to_string()),
+        "psql: same-connection SELECT must observe the row it just inserted, got {rows:?}"
     );
 
-    let pg_out = spawn_pg_client(port, &insert_sql(102, "extended-e2e-insert-pg"));
+    // psycopg: 同様に同一接続での read-your-writes を確認する。
+    let rows = run_psycopg_session(
+        port,
+        &[&insert_sql(101, "extended-e2e-insert-psycopg")],
+        SELECT_SQL,
+    );
     assert!(
-        pg_out.status.success(),
-        "pg: INSERT must succeed: stderr={}",
-        String::from_utf8_lossy(&pg_out.stderr)
+        rows.contains(&"101".to_string()),
+        "psycopg: same-connection SELECT must observe the row it just inserted, got {rows:?}"
+    );
+
+    // pg: 同様に同一接続での read-your-writes を確認する。
+    let rows = run_pg_session(
+        port,
+        &[&insert_sql(102, "extended-e2e-insert-pg")],
+        SELECT_SQL,
+    );
+    assert!(
+        rows.contains(&"102".to_string()),
+        "pg: same-connection SELECT must observe the row it just inserted, got {rows:?}"
+    );
+
+    // 新規接続（同一テナント alice の別セッション）でも 3 件すべてが可視の
+    // まま（同一テナント別セッションの read-your-writes）。既存 3 行 +
+    // 挿入 3 行の計 6 行を確認する。
+    let expected: std::collections::BTreeSet<String> = ["1", "2", "3", "100", "101", "102"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let actual: std::collections::BTreeSet<String> =
+        run_psql(port, SELECT_SQL).into_iter().collect();
+    assert_eq!(
+        actual, expected,
+        "fresh connection must observe all 3 seed rows and all 3 inserted rows"
     );
 }
