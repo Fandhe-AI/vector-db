@@ -179,6 +179,10 @@ pub use visible_cache::VisibleBitmapCacheStats;
 /// **TASK-191（SQL-18・#867）で追加した破壊的変更（BREAKING CHANGE）**: `Delete`
 /// variant を追加した（既存の網羅的 `match` はワイルドカードアームの追加が
 /// 必要）。
+///
+/// **Issue #865（SQL-17・TASK-191）で追加した破壊的変更（BREAKING CHANGE）**:
+/// `Update` variant を追加した（既存の網羅的 `match` はワイルドカードアームの
+/// 追加が必要）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlOutcome {
     Query(exec::QueryResult),
@@ -212,4 +216,11 @@ pub enum SqlOutcome {
     /// variant はその [`exec::DeleteOutcome`] をそのまま運ぶ薄いラッパー
     /// （`Insert`・`Truncate` と同じ設計）。
     Delete(exec::DeleteOutcome),
+    /// `UPDATE <table> SET <col> = <lit>[, ...] WHERE id = <n>
+    /// USING OPERATION_ID '<id>'`（Issue #865・SQL-17・TASK-191）がセッション経由の
+    /// 実行経路で成功したことを示す応答。検証・実行本体は
+    /// [`crate::core::EngineCore::execute_update_sql`] に委譲しており、本 variant
+    /// はその [`exec::UpdateOutcome`] をそのまま運ぶ薄いラッパー（`Insert`・
+    /// `Truncate` と同じ設計）。
+    Update(exec::UpdateOutcome),
 }

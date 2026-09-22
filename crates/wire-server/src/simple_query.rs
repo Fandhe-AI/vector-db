@@ -257,6 +257,25 @@ pub(crate) fn execute_and_respond(
                 "failed to encode command complete response",
             ),
         },
+        // Issue #865（SQL-17・TASK-191）: `UPDATE`（単一行・id 指定。
+        // `exec::UpdateOutcome::rows_affected` に更新件数を保持する。
+        // `sql/exec.rs` ドキュメント参照）の応答を pg 互換の `CommandComplete`
+        // タグ `UPDATE <rows>` へ整形する（`INSERT` の `<oid> <rows>` と異なり
+        // OID フィールドを持たない pg の `UPDATE` タグ規範に準拠）。
+        Ok(SqlOutcome::Update(outcome)) => match result_encoder::encode_command_complete(&format!(
+            "UPDATE {}",
+            outcome.rows_affected
+        )) {
+            Ok(msg) => {
+                write_all(stream, &msg)?;
+                crate::handshake::write_ready_for_query_io(stream)
+            }
+            Err(_) => respond_error_and_ready(
+                stream,
+                ErrorClass::InternalError,
+                "failed to encode command complete response",
+            ),
+        },
         Err(e) => respond_error_and_ready(stream, e.error_class(), &e.client_message()),
     }
 }

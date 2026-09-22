@@ -1138,6 +1138,178 @@ pub(crate) fn update_row_unchecked(
     Ok(())
 }
 
+/// SQL `UPDATE <table> SET <col> = <lit>[, ...] WHERE id = <n>`（SQL-17・TASK-191。
+/// 実行結線は Issue #865）専用の書き込み入口。[`update_row_unchecked`]（全行置換 API）
+/// と**同一の書き込みプリミティブ**（`validate_identifier`・
+/// `require_table_schema_write`・`content_hash`・`ledger::record_in_txn`・
+/// `user_rows_table_def`・`decode_row_for_key`・`encode_row`・
+/// `bump_table_generation_in_txn`・`recovery::commit_boundary::commit`）だけで
+/// 組み立てた**列指定の入口**であり、第 2 の書き込み経路ではない。
+///
+/// `assignments` は `sql::parser::BoundUpdate::assignments`（束縛時スキーマの列
+/// インデックス・宣言順を保持する部分更新表現）をそのまま受け取る。
+/// `update_row_unchecked` が要求する `RowInput`（全列を埋めた全行置換）とは異なり、
+/// SET で指定されなかった列は本関数が既存行から読み取って維持する
+/// （read-merge-write）。read（対象行の既存 `metadata`／`embedding`）→
+/// merge（SET 対象列だけを上書き）→ encode → write を**単一の write トランザクション
+/// 内**で行う設計は必須: 別 read トランザクションで先に読んでから
+/// `update_row_unchecked` へ渡す 2 段構成にすると、同一行への並行 UPDATE（列が
+/// 互いに素）で read スナップショットと write の間に他セッションの commit が挟まり
+/// lost update が起きる。
+///
+/// 0 行更新（他テナントの行・未存在 id・RLS 可視集合外の行のいずれも区別しない。
+/// security.md P0）でも台帳記録・テーブル世代進行・commit は**必ず**行う
+/// （`truncate_table_unchecked` と同じ非対称設計。`update_row_unchecked` の
+/// `NotFound` 早期 return とは意図的に異なる契約: 応答・`wire_code`・
+/// レイテンシ・台帳の有無のいずれからも「対象行の有無」を観測できないようにする
+/// ため）。台帳の内容照合ハッシュ（`content_hash::for_update_columns`。TASK-101・
+/// RECOVER-10）は DB の現在状態に依存しないクライアント入力のみから計算する
+/// ため、同一 `(id, assignments)` の送信は対象行の状態に関わらず同一ハッシュに
+/// なる。
+///
+/// 前提: 対象行の既存 `metadata` は `row_codec::encode_scalar_columns` が書いた
+/// 正規レイアウト（SQL 表層の `INSERT`・型付き挿入 API はすべてこの経路を通る）
+/// であることを要求する。旧フォーマットの raw metadata（全行置換版 `RowInput` を
+/// 直接構築する Rust API 経由。本モジュール外の非 SQL 呼び出し元専用）が書いた行を
+/// 対象にした場合は `decode_scalar_columns` が構造不整合を検出し `CatalogError::
+/// Invalid`（`22000`）で fail-closed に拒否する（黙ってスカラー列を欠損させたり
+/// 誤ったオフセットで読まない）。
+///
+/// 戻り値は更新行数（`0` または `1`）。呼び出し元は `sql::exec::execute_update`。
+pub(crate) fn update_row_columns_unchecked(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    assignments: &[(usize, crate::row_codec::Value)],
+    ledger_write: LedgerWrite<'_>,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<usize, TenantWriteError> {
+    validate_identifier(table)?;
+    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
+    let rows_affected: usize;
+    {
+        let schema = require_table_schema_write(&write_txn, table)?;
+        if let Some(expected) = expected_schema {
+            if expected != &schema {
+                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                    "table schema changed after the update assignments were bound".to_string(),
+                )));
+            }
+        }
+
+        // `assignments` の列 index をスキーマ幅・型で再検証する（untrusted 経路の
+        // 添字アクセス回避。coding-rust.md「受信データ経路では unwrap/expect/[]
+        // を禁止」）。`bind_update` は束縛時点のスキーマで検証済みだが、write
+        // トランザクション内で再取得したスキーマと不一致がありうる場合に備え、
+        // `get()` で境界外アクセスを構造的に防ぐ（`insert_typed_row_unchecked` の
+        // `expected_schema` 比較と多層防御）。
+        let mut named_columns: Vec<(&str, &crate::row_codec::Value)> =
+            Vec::with_capacity(assignments.len());
+        for (idx, value) in assignments {
+            let column = schema.columns.get(*idx).ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "SET column index out of range for the current table schema".to_string(),
+                ))
+            })?;
+            match (&column.ty, value) {
+                (crate::catalog::ColumnType::Vector(_), crate::row_codec::Value::Vector(_)) => {}
+                (crate::catalog::ColumnType::Text, crate::row_codec::Value::Text(_)) => {}
+                _ => {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "SET column type does not match the current table schema".to_string(),
+                    )))
+                }
+            }
+            named_columns.push((column.name.as_str(), value));
+        }
+
+        // 台帳照合（TASK-101・RECOVER-10）を所有権判定より**前**に行う
+        // （`update_row_unchecked` と同じ順序契約。同ドキュメント参照）。
+        let content_hash = content_hash::for_update_columns(id, &named_columns)?;
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            &content_hash,
+        )?;
+
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+        // `AccessGuard` の借用はこのブロック内に閉じ込め、後続の可変借用
+        // （`insert`）と衝突しないようにする（`update_row_unchecked` と同じ設計）。
+        let key = (ctx.tenant_id(), id);
+        let target: Option<Row> = match row_table.get(&key).map_err(CatalogError::from)? {
+            Some(guard) => {
+                let row = crate::storage::decode_row_for_key(ctx.tenant_id(), id, guard.value())?;
+                // 判断 D: 所有者一致（TABLE-12 の名前空間キーに加える二重防御）
+                // ∩ RLS 可視集合（読み取り経路の暗黙適用・RLS-7／RLS-10 と判定を
+                // 揃える）。いずれか一方でも満たさない行は「不存在」と同一に扱う
+                // （区別しない。security.md P0）。
+                if ctx.is_owner(&row.tenant_id) && ctx.is_visible(&row.tenant_id, row.visibility) {
+                    Some(row)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        rows_affected = match target {
+            Some(row) => {
+                let mut values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                let mut embedding = row.embedding;
+                let mut vector_assigned = false;
+                for (idx, value) in assignments {
+                    match value {
+                        crate::row_codec::Value::Vector(v) => {
+                            embedding = v.clone();
+                            vector_assigned = true;
+                        }
+                        other => {
+                            if let Some(slot) = values.get_mut(*idx) {
+                                *slot = other.clone();
+                            }
+                        }
+                    }
+                }
+                // VECTOR 列の SET があった場合に限り次元検証する
+                // （`validate_embedding_dim` は VECTOR 列を持たないテーブルで
+                // `Err` を返すため、TEXT 列のみの UPDATE では既存 embedding を
+                // 無検証のまま維持し、VECTOR 列なしテーブルを壊さない。Issue #454
+                // の VECTOR 列なしテーブルと同じ前提）。
+                if vector_assigned {
+                    schema.validate_embedding_dim(embedding.len())?;
+                }
+                let metadata = crate::row_codec::encode_scalar_columns(&schema, &values)
+                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                let row_input = RowInput {
+                    tenant_id: ctx.tenant_id(),
+                    // クライアントは `visibility` を SET 対象にできない
+                    // （`sql::parser::bind_update` が `42601` で拒否済み。判断 D）。
+                    // 既存値をそのまま維持する。
+                    visibility: row.visibility,
+                    embedding: &embedding,
+                    metadata: &metadata,
+                };
+                let encoded = encode_row(&row_input)?;
+                row_table
+                    .insert(key, encoded.as_slice())
+                    .map_err(CatalogError::from)?;
+                1
+            }
+            None => 0,
+        };
+    }
+    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
+    crate::recovery::commit_boundary::commit(write_txn)?;
+    Ok(rows_affected)
+}
+
 /// `table` の既存行を 1 件削除する（TASK-95・対象ビヘイビア: RECOVER-4）。
 ///
 /// 対象行が不存在、または既存行の所有者が `ctx` と一致しない場合は
@@ -2375,6 +2547,57 @@ mod tests {
         .expect("update_row");
         let next = read_gen("docs");
         assert!(next > prev, "update_row must bump docs' generation");
+        prev = next;
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        // `update_row_columns_unchecked`（Issue #865・SQL-17・TASK-191。列指定の
+        // 部分更新入口）は 1 行更新・0 行更新のいずれでも世代を進める
+        // （`update_row_columns_unchecked` ドキュメントの非対称設計）。
+        let update_columns_op = op("bump-update-row-columns");
+        let ledger_write = LedgerWrite::Record(&update_columns_op);
+        update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &a,
+            // id=3 は `insert_typed_row`（`encode_scalar_columns` 経由の正規
+            // metadata レイアウト）で書き込まれた行。id=1 は本テスト冒頭で
+            // `insert_row`／`update_row`（全行置換 API・任意バイト列の raw
+            // metadata）が上書き済みのため、スキーマ整合前提の
+            // `decode_scalar_columns` を要する列指定更新の対象には使えない。
+            3,
+            &[(0, crate::row_codec::Value::Vector(vec![5.0, 5.0]))],
+            ledger_write,
+            None,
+        )
+        .expect("update_row_columns_unchecked (1 row)");
+        let next = read_gen("docs");
+        assert!(
+            next > prev,
+            "update_row_columns_unchecked (1 row) must bump docs' generation"
+        );
+        prev = next;
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        // 0 行更新（未存在 id）でも台帳記録・世代進行が必ず発生する（判断 B。
+        // `truncate_table_unchecked` と同じ非対称設計）。
+        let update_columns_zero_op = op("bump-update-row-columns-zero");
+        let ledger_write_zero = LedgerWrite::Record(&update_columns_zero_op);
+        let rows_affected = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &a,
+            999,
+            &[(0, crate::row_codec::Value::Vector(vec![6.0, 6.0]))],
+            ledger_write_zero,
+            None,
+        )
+        .expect("update_row_columns_unchecked (0 rows)");
+        assert_eq!(rows_affected, 0);
+        let next = read_gen("docs");
+        assert!(
+            next > prev,
+            "update_row_columns_unchecked (0 rows) must still bump docs' generation"
+        );
         prev = next;
         assert_eq!(read_gen("sibling"), sibling_gen);
 

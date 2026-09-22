@@ -237,6 +237,17 @@ pub struct DeleteOutcome {
     pub rows_affected: u64,
 }
 
+/// `EngineCore::execute_update_sql` の成功応答（SQL-17・TASK-191。Issue #865）。
+/// `TruncateOutcome` とは異なり `UPDATE` は pg 互換の `CommandComplete` タグ
+/// （`UPDATE <n>`）が更新行数を要求するため、`rows_affected` を保持する。
+/// 対象行が他テナントの行・未存在 id・RLS 可視集合外のいずれであっても
+/// `Ok(UpdateOutcome { rows_affected: 0 })` を返す（区別しない。
+/// `tenant::update_row_columns_unchecked` ドキュメント参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateOutcome {
+    pub rows_affected: u64,
+}
+
 impl From<RowCodecError> for SqlSurfaceError {
     /// スカラーペイロードのデコード失敗は、格納済みデータの破損・実装バグの
     /// いずれかであり、SQL 入力自体の不正ではないため fail-closed に `XX000` へ
@@ -2596,16 +2607,80 @@ pub fn execute_delete(
     ) {
         Ok(crate::tenant::DeleteRowOutcome::Deleted) => Ok(DeleteOutcome { rows_affected: 1 }),
         Ok(crate::tenant::DeleteRowOutcome::NotFound) => Ok(DeleteOutcome { rows_affected: 0 }),
-        Err(e) => Err(map_insert_write_error(e)),
+        Err(e) => Err(map_write_error(e, "delete")),
     }
 }
 
-/// [`execute_insert`]・[`execute_insert_batch`]・[`execute_truncate`] が共有する
-/// `TenantWriteError` → `SqlSurfaceError` の写像本体（Issue #771・TASK-178・
-/// NOSQL-6 で切り出し。写像内容は切り出し前と完全に同一。TASK-195 で TRUNCATE の
-/// 書き込み経路も同じ写像を再利用する——`TenantWriteError` の variant 集合は
-/// `insert`／`truncate` で共通のため、専用の写像本体は追加しない）。
+/// SQL 表層 `UPDATE <table> SET <col> = <lit>[, ...] WHERE id = <n>
+/// USING OPERATION_ID '<id>'`（SQL-17、TASK-191。Issue #865）の実行入口。
+/// `bound`（`sql::parser::bind_update` 済み）の `operation_id` を `ledger_mode` で
+/// 台帳書き込み指示へ解決してから [`crate::tenant::update_row_columns_unchecked`]
+/// へ委譲する（[`execute_truncate`] と同じ設計）。
+///
+/// `LedgerMode::Ledgered`（既定）で `operation_id` が `None` の場合は `resolve` が
+/// `Err` を返し [`SqlSurfaceError::MissingOperationId`]（`23502`）へ写像される——
+/// SQL 表層経由（`core.rs`）では `sql::allowlist::validate_update` の事前検査が
+/// 同じ判定を本関数の呼び出し前に既に行っているため通常は到達しないが、
+/// `execute_insert`／`execute_truncate` と同じく本関数単体でも fail-closed を保つ。
+pub fn execute_update(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundUpdate,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+) -> Result<UpdateOutcome, SqlSurfaceError> {
+    execute_update_with_schema(storage, ctx, bound, ledger_mode, None)
+}
+
+/// [`execute_update`] の実体（`pub(crate)`）。`expected_schema` を追加で受け取る点
+/// のみが異なる（`execute_insert_with_schema` と同型。`core.rs::
+/// execute_update_form` が `InsertSchemaLookup` でキャッシュ済みのスキーマを渡す
+/// 経路として使う）。
+pub(crate) fn execute_update_with_schema(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundUpdate,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<UpdateOutcome, SqlSurfaceError> {
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id.as_ref())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+
+    let rows_affected = crate::tenant::update_row_columns_unchecked(
+        storage,
+        &bound.table,
+        ctx,
+        bound.id,
+        &bound.assignments,
+        ledger_write,
+        expected_schema,
+    )
+    .map_err(|e| map_write_error(e, "update"))?;
+
+    Ok(UpdateOutcome {
+        rows_affected: rows_affected as u64,
+    })
+}
+
+/// [`map_write_error`] の `"insert"` 版ラッパー（既存呼び出し元との後方互換用。
+/// Issue #865 で `op` パラメータ化した本体へ切り出した。挙動は切り出し前と
+/// 完全に同一）。
 fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError {
+    map_write_error(e, "insert")
+}
+
+/// [`execute_insert`]・[`execute_insert_batch`]・[`execute_truncate`]・
+/// [`execute_update`] が共有する `TenantWriteError` → `SqlSurfaceError` の写像
+/// 本体（Issue #771・TASK-178・NOSQL-6 で切り出し、Issue #865 で `op` を追加
+/// パラメータ化した。`TenantWriteError::Catalog(CatalogError::Invalid(_))` /
+/// `TenantWriteError::Storage(StorageError::Codec(_))` アームの detail 文言
+/// （`"{op} rejected: invalid row"`）に呼び出し元の操作名を埋め込む点のみが
+/// 変更点で、`wire_code` 自体は不変。UPDATE の既存行デコード失敗・列値の不正
+/// （TEXT の `MAX_TEXT_FIELD_LEN` 超過等）を「insert が拒否された」という誤った
+/// 文言でクライアントへ返さないための変更（`client_message()` はこの detail を
+/// そのまま含める）。呼び出し元ごとに専用の写像本体は追加しない
+/// （`TenantWriteError` の variant 集合は insert／update／truncate で共通のため）。
+fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlSurfaceError {
     use crate::catalog::CatalogError;
     use crate::storage::StorageError;
     use crate::tenant::TenantWriteError;
@@ -2614,14 +2689,15 @@ fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
         // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
         TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
-        // `tenant::insert_typed_row_unchecked`／`insert_typed_rows_unchecked` 自体は
-        // `operation_id` 必須化ガード（`recovery::required_op_id::LedgerMode`）を
-        // 持たない（`tenant.rs` モジュールドキュメント参照）。本経路（SQL `INSERT`・
+        // `tenant::insert_typed_row_unchecked`／`insert_typed_rows_unchecked`／
+        // `update_row_columns_unchecked` 自体は `operation_id` 必須化ガード
+        // （`recovery::required_op_id::LedgerMode`）を持たない（`tenant.rs`
+        // モジュールドキュメント参照）。本経路（SQL `INSERT`／`UPDATE`・
         // NoSQL `insert` op）ではガードを呼び出し元（[`execute_insert`]・
-        // [`execute_insert_batch`]）が書き込みトランザクション開始前に既に適用済み
-        // のため、この写像アームは実際には到達しない。ただし `TenantWriteError` の
-        // 網羅性を保ち、`23502` を返す正しい写像を明示しておく（TASK-92・対象
-        // ビヘイビア: RECOVER-1）。
+        // [`execute_insert_batch`]・[`execute_update`]）が書き込みトランザクション
+        // 開始前に既に適用済みのため、この写像アームは実際には到達しない。ただし
+        // `TenantWriteError` の網羅性を保ち、`23502` を返す正しい写像を明示して
+        // おく（TASK-92・対象ビヘイビア: RECOVER-1）。
         TenantWriteError::MissingOperationId => SqlSurfaceError::MissingOperationId,
         // 台帳照合（TASK-101・RECOVER-10）: 同一 operation_id・同一内容の再送は
         // `23505`、内容不一致（v1 レガシーエントリへの再送を含む）は `22023` へ
@@ -2643,7 +2719,7 @@ fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError
         // `_` 節（`XX000`）へ委ねる。
         TenantWriteError::Catalog(CatalogError::Invalid(_))
         | TenantWriteError::Storage(StorageError::Codec(_)) => {
-            SqlSurfaceError::invalid_input("insert rejected: invalid row")
+            SqlSurfaceError::invalid_input(format!("{op} rejected: invalid row"))
         }
         // それ以外（redb バックエンド障害・commit 失敗・カタログ破損・認可失敗・
         // 台帳破損等）はサーバー側の内部事象として `XX000` へ写像する
@@ -2651,7 +2727,7 @@ fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError
         // 再試行・障害判定を誤らせる。また `TenantWriteError` の `Display`/`Debug` は
         // 原因を秘匿する契約のため、detail には原因を一切展開せず固定文言に留める）。
         _ => SqlSurfaceError::Internal {
-            detail: "insert failed".to_string(),
+            detail: format!("{op} failed"),
         },
     }
 }

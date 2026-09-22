@@ -185,10 +185,15 @@ fn new_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
-/// 42601（unsupported_sql_syntax）: `UPDATE` は許可リストに存在しない statement
-/// 種別のため拒否される（TASK-82 で `INSERT` は受理するようになったため
-/// （`crate::simple_query` モジュールコメント参照）、本ケースは許可リスト外の
-/// 別 statement 種別へ差し替えた）。
+/// 42601（unsupported_sql_syntax）: `UPDATE` は Issue #865（SQL-17・TASK-191）で
+/// 実行結線されたため、構造として正しい `UPDATE` 文（`USING OPERATION_ID` 付き）
+/// は許可リスト外の statement 種別としては拒否されなくなった（この点は本ケースが
+/// 元々検証していた「許可リストに存在しない statement 種別」の対象から外れた）。
+/// `SET id = ...`（疑似列の書き換え）は `sql::parser::bind_update` が構造上受理
+/// しない形として引き続き `42601` を返す契約（`crates/engine/tests/
+/// sql_update_single_row.rs::set_id_is_rejected_as_unsupported_syntax` が確定
+/// オラクル）のため、本ケースはそちらへ差し替えて `42601` 分類の wire 経由確認を
+/// 維持する。
 #[test]
 fn err1_update_returns_42601_fields() {
     let (core, _guard) = new_core_with_docs_table();
@@ -196,7 +201,10 @@ fn err1_update_returns_42601_fields() {
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
-    send_simple_query(&mut stream, "UPDATE docs SET id = 2 WHERE id = 1");
+    send_simple_query(
+        &mut stream,
+        "UPDATE docs SET id = 2 WHERE id = 1 USING OPERATION_ID 'err1-update-set-id'",
+    );
 
     assert_error_response(&mut stream, "42601");
 }
