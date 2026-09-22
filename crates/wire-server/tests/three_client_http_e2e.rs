@@ -92,8 +92,12 @@
 //! **クエリ集合**: `nosql-api.md`「SQL ↔ NoSQL 対応表」に対応する
 //! search-1〜5・scan-1・agg-1〜4 の 10 ケース（`PARITY_CASES`）を、alice
 //! （tenant-a）・bob（tenant-b）・carol（tenant-c）の 3 テナントそれぞれで
-//! 実行する（3 テナントいずれも他テナントの Private 行〔id=11／12〕が
-//! 両表層のどの応答にも現れないことをあわせて検証する）。
+//! 実行する。wire 認証経路の `PolicyContext` は `Public` ＋ 自テナントの
+//! `Private` を許可可視性とする（RLS-11・TASK-195。read-your-writes）ため、
+//! alice は自身の Private 行（id=11）・bob は自身の Private 行（id=12）を
+//! 両表層の応答に一致して含む（`ParityCase::expected_rows_{alice,bob}` の
+//! テナント別固定オラクル）。3 テナントいずれも**他テナント**の Private
+//! 行 id が両表層のどの応答にも現れないことをあわせて検証する。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -236,9 +240,12 @@ fn spawn_sql_server(users_path: &str, db_path: &str) -> (common::SpawnedServer, 
 /// 同方針でこのファイル専用に複製する）。`docs` テーブルに 3 テナント各 1 件の
 /// Public 行（id=1/2/3）と、tenant-a・tenant-b それぞれの Private 行
 /// （id=11 lang="xx"／id=12 lang="ja"）を投入する。wire 認証経路が導出する
-/// `PolicyContext` は常に Public のみ許可（`PolicyContext::new`）のため、
-/// Private 行はどのユーザーの接続からも不可視——SQL 経路・NoSQL 経路の
-/// いずれの応答にも id=11／12 が現れないことをパリティ検証の非漏えい証跡に
+/// `PolicyContext` は `Public` ＋ 自テナントの `Private` を許可可視性とする
+/// （RLS-11・TASK-195。read-your-writes）ため、tenant-a（alice）は id=11 を、
+/// tenant-b（bob）は id=12 を自身の接続で見る——SQL 経路・NoSQL 経路の
+/// いずれの応答でも一致することを `ParityCase::expected_rows_{alice,bob}`
+/// で検証する。**他テナント**の接続には両表層のどの応答にも現れないこと
+/// （tenant-c／carol はどちらも見えない）をパリティ検証の非漏えい証跡に
 /// 使う。
 fn seed_parity_db() -> (PathBuf, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("three-client-http-e2e-parity-docs");
@@ -535,14 +542,37 @@ fn json_cell_to_pg_text(cell: &JsonValue, null_sentinel: &str) -> String {
 /// wire 型採取の双方に、`json_body` は NoSQL `/v1/query` にそれぞれ渡す
 /// リテラル定数（クライアント応答由来の文字列を SQL／JSON へ連結しない）。
 /// `ordered` は `scan`（SQL-15。順序保証なし）のみ `false` にする。
-/// `expected_rows` は両表層が同じ誤りを返すケースを排除するための固定
-/// オラクル（`docs/spec` 非依存・本 seed から手計算した値）。
+///
+/// `expected_rows_{alice,bob,carol}` は両表層が同じ誤りを返すケースを排除
+/// するための固定オラクル（`docs/spec` 非依存・`seed_parity_db` に対する
+/// `EngineCore::execute_sql_in_session` 直接呼び出しで手計算した値）。
+/// wire 認証経路の `PolicyContext` は `Public` ＋ 自テナントの `Private` を
+/// 許可可視性とする（RLS-11・TASK-195。read-your-writes）ため、tenant-a
+/// （alice）は自身の Private 行（id=11）を、tenant-b（bob）は自身の
+/// Private 行（id=12）をそれぞれの応答に含む。carol は Private 行を持たない
+/// ため元の値のまま不変（3 テナント共通の単一 `expected_rows` だった旧版
+/// との差はこの 2 テナントの追加行のみ）。
 struct ParityCase {
     label: &'static str,
     sql: &'static str,
     json_body: &'static str,
     ordered: bool,
-    expected_rows: &'static [&'static [&'static str]],
+    expected_rows_alice: &'static [&'static [&'static str]],
+    expected_rows_bob: &'static [&'static [&'static str]],
+    expected_rows_carol: &'static [&'static [&'static str]],
+}
+
+impl ParityCase {
+    /// テナント別固定オラクルをユーザー名から選択する（`user` は
+    /// `run_sql_nosql_parity_scenario` の `USERS` 定数由来の既知の 3 値のみ）。
+    fn expected_rows(&self, user: &str) -> &'static [&'static [&'static str]] {
+        match user {
+            "alice" => self.expected_rows_alice,
+            "bob" => self.expected_rows_bob,
+            "carol" => self.expected_rows_carol,
+            other => panic!("unknown parity user: {other}"),
+        }
+    }
 }
 
 /// `nosql-api.md`「SQL ↔ NoSQL 対応表」に対応する 10 ケース（Issue #779）。
@@ -552,21 +582,37 @@ const PARITY_CASES: &[ParityCase] = &[
         sql: "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3",
         json_body: r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"columns":["id"]}"#,
         ordered: true,
-        expected_rows: &[&["1"], &["2"], &["3"]],
+        expected_rows_alice: &[&["1"], &["11"], &["2"]],
+        expected_rows_bob: &[&["1"], &["2"], &["12"]],
+        expected_rows_carol: &[&["1"], &["2"], &["3"]],
     },
     ParityCase {
         label: "search2",
         sql: "SELECT id, lang FROM docs WHERE lang = 'ja' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3",
         json_body: r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"columns":["id","lang"],"filter":[{"column":"lang","op":"eq","value":"ja"}]}"#,
         ordered: true,
-        expected_rows: &[&["1", "ja"], &["3", "ja"]],
+        // alice の own Private 行（id=11）は lang="xx" のため `lang = 'ja'`
+        // に一致せず、この形状は alice でも seed のまま不変。
+        expected_rows_alice: &[&["1", "ja"], &["3", "ja"]],
+        expected_rows_bob: &[&["1", "ja"], &["12", "ja"], &["3", "ja"]],
+        expected_rows_carol: &[&["1", "ja"], &["3", "ja"]],
     },
     ParityCase {
         label: "search3",
         sql: "SELECT id, lang, embedding FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3",
         json_body: r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"columns":["id","lang","embedding"]}"#,
         ordered: true,
-        expected_rows: &[
+        expected_rows_alice: &[
+            &["1", "ja", "[1,0]"],
+            &["11", "xx", "[1,0]"],
+            &["2", "en", "[0,1]"],
+        ],
+        expected_rows_bob: &[
+            &["1", "ja", "[1,0]"],
+            &["2", "en", "[0,1]"],
+            &["12", "ja", "[0,1]"],
+        ],
+        expected_rows_carol: &[
             &["1", "ja", "[1,0]"],
             &["2", "en", "[0,1]"],
             &["3", "ja", "[-1,0]"],
@@ -577,7 +623,12 @@ const PARITY_CASES: &[ParityCase] = &[
         sql: "SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'zzz-term-absent-from-any-seed-body') LIMIT 3",
         json_body: r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"columns":["id"],"hybrid":{"text":"zzz-term-absent-from-any-seed-body"}}"#,
         ordered: true,
-        expected_rows: &[&["1"], &["2"], &["3"]],
+        // 語彙不一致の疎側項は寄与せず密のみ順位（`embedding <=>` 昇順）へ
+        // 帰着する。own Private 行はクエリと同一ベクトルのため密側で
+        // 最上位に入り、alice/bob それぞれで先頭へ現れる。
+        expected_rows_alice: &[&["11"], &["1"], &["2"]],
+        expected_rows_bob: &[&["12"], &["1"], &["2"]],
+        expected_rows_carol: &[&["1"], &["2"], &["3"]],
     },
     // codex-review 指摘対応（PR #838）: search4 は語彙不一致の疎側項（どの
     // seed body にも出現しない語）を使うため、密のみ結果（search1）と偶然
@@ -586,50 +637,72 @@ const PARITY_CASES: &[ParityCase] = &[
     // topic"）に実在する語 "unrelated" を疎側項に使い、密のみ順位
     // （id=1,2,3。距離昇順）とは異なる順位（id=3 が繰り上がる）を要求する
     // ことで、疎側チャネルが実際にランキングへ寄与していることを検出可能
-    // にする（`expected_rows` は `crates/engine/tests/default_preset.rs` と
-    // 同じ `EngineCore::execute_sql` 直接呼び出しで実測して手計算・固定した
-    // 値であり、`docs/spec` には依存しない）。
+    // にする（`expected_rows_*` は `crates/engine/tests/default_preset.rs`
+    // と同じ `EngineCore::execute_sql_in_session` 直接呼び出しで実測して
+    // 手計算・固定した値であり、`docs/spec` には依存しない）。
     ParityCase {
         label: "search5",
         sql: "SELECT id FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'unrelated') LIMIT 3",
         json_body: r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"columns":["id"],"hybrid":{"text":"unrelated"}}"#,
         ordered: true,
-        expected_rows: &[&["3"], &["1"], &["2"]],
+        // own Private 行の body（"private body"）は疎側項 "unrelated" と
+        // 無関係のため疎側で寄与しないが、alice の own Private 行（id=11）
+        // は密側で id=1 と同一ベクトル（同一密スコア）のため RRF 融合後の
+        // 順位が id=1 と近接し、carol と同じ並びだった 3 件目（id=2）を
+        // 押し出して 3 件目に現れる（`EngineCore::execute_sql_in_session`
+        // 直接呼び出しで実測して固定）。bob の own Private 行（id=12）は
+        // 同水準の近接が生じず carol と同じ並びのまま不変。
+        expected_rows_alice: &[&["3"], &["1"], &["11"]],
+        expected_rows_bob: &[&["3"], &["1"], &["2"]],
+        expected_rows_carol: &[&["3"], &["1"], &["2"]],
     },
     ParityCase {
         label: "scan1",
         sql: "SELECT id, lang FROM docs WHERE lang = 'ja' LIMIT 10",
         json_body: r#"{"op":"scan","table":"docs","limit":10,"columns":["id","lang"],"filter":[{"column":"lang","op":"eq","value":"ja"}]}"#,
         ordered: false,
-        expected_rows: &[&["1", "ja"], &["3", "ja"]],
+        // alice の own Private 行は lang="xx" のため `lang = 'ja'` に一致
+        // せず、seed のまま不変。
+        expected_rows_alice: &[&["1", "ja"], &["3", "ja"]],
+        expected_rows_bob: &[&["1", "ja"], &["12", "ja"], &["3", "ja"]],
+        expected_rows_carol: &[&["1", "ja"], &["3", "ja"]],
     },
     ParityCase {
         label: "agg1",
         sql: "SELECT COUNT(*), SUM(id), AVG(id), MIN(lang), MAX(lang) FROM docs",
         json_body: r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"},{"fn":"sum","column":"id"},{"fn":"avg","column":"id"},{"fn":"min","column":"lang"},{"fn":"max","column":"lang"}]}"#,
         ordered: true,
-        expected_rows: &[&["3", "6", "2", "en", "ja"]],
+        expected_rows_alice: &[&["4", "17", "4.25", "en", "xx"]],
+        expected_rows_bob: &[&["4", "18", "4.5", "en", "ja"]],
+        expected_rows_carol: &[&["3", "6", "2", "en", "ja"]],
     },
     ParityCase {
         label: "agg2",
         sql: "SELECT COUNT(*) FROM docs WHERE lang = 'ja'",
         json_body: r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"filter":[{"column":"lang","op":"eq","value":"ja"}]}"#,
         ordered: true,
-        expected_rows: &[&["2"]],
+        // alice の own Private 行は lang="xx" のため不変。
+        expected_rows_alice: &[&["2"]],
+        expected_rows_bob: &[&["3"]],
+        expected_rows_carol: &[&["2"]],
     },
     ParityCase {
         label: "agg3",
         sql: "SELECT lang, COUNT(*) FROM docs GROUP BY lang",
         json_body: r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["lang"]}"#,
         ordered: true,
-        expected_rows: &[&["en", "1"], &["ja", "2"]],
+        expected_rows_alice: &[&["en", "1"], &["ja", "2"], &["xx", "1"]],
+        expected_rows_bob: &[&["en", "1"], &["ja", "3"]],
+        expected_rows_carol: &[&["en", "1"], &["ja", "2"]],
     },
     ParityCase {
         label: "agg4",
         sql: "SELECT lang, COUNT(*) FROM docs GROUP BY lang HAVING count >= 2",
         json_body: r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["lang"],"having":[{"fn":"count","column":"*","op":">=","value":2}]}"#,
         ordered: true,
-        expected_rows: &[&["ja", "2"]],
+        expected_rows_alice: &[&["ja", "2"]],
+        expected_rows_bob: &[&["ja", "3"]],
+        expected_rows_carol: &[&["ja", "2"]],
     },
 ];
 
@@ -1339,13 +1412,31 @@ fn run_sql_nosql_parity_scenario(client: HttpClient) {
                 case.label
             );
 
-            // 非漏えい証跡: どの応答にも Private 行（id=11／12）が現れない。
+            // 非漏えい証跡: 他テナントの Private 行 id が応答に現れない
+            // （RLS-11・TASK-195。read-your-writes により alice は自身の
+            // id=11・bob は自身の id=12 を legitimate に見るため、ここでは
+            // 「自分の id ではない方の Private id」のみを禁止する）。
+            let forbidden_private_id = match user {
+                "alice" => "12",
+                "bob" => "11",
+                // carol は Private 行を持たないため両方とも越境になる。
+                _ => "11",
+            };
             for row in &nosql_rows {
                 assert!(
-                    !row.iter().any(|cell| cell == "11" || cell == "12"),
-                    "case={} user={user}: private row id leaked into NoSQL response: {row:?}",
+                    !row.iter().any(|cell| cell == forbidden_private_id),
+                    "case={} user={user}: another tenant's private row id leaked into NoSQL \
+                     response: {row:?}",
                     case.label
                 );
+                if user == "carol" {
+                    assert!(
+                        !row.iter().any(|cell| cell == "12"),
+                        "case={} user={user}: another tenant's private row id leaked into \
+                         NoSQL response: {row:?}",
+                        case.label
+                    );
+                }
             }
 
             let sql_obs = sql_observations
@@ -1383,7 +1474,7 @@ fn run_sql_nosql_parity_scenario(client: HttpClient) {
             );
 
             let expected_rows: Vec<Vec<String>> = case
-                .expected_rows
+                .expected_rows(user)
                 .iter()
                 .map(|row| row.iter().map(|cell| cell.to_string()).collect())
                 .collect();

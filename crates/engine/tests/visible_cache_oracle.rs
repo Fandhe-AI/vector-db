@@ -431,10 +431,13 @@ fn stale_eviction_after_unrelated_tenant_write_does_not_leak() {
 }
 
 /// セッション経由（wire の入口。`EngineCore::execute_sql_in_session`）でも
-/// 対照 DB と一致することを確認する。wire セッションは常に Public のみ可視
-/// （`allow_private=false`）で運用されるため、ここでは ctx1（tenant-a）・ctx3
-/// （tenant-b）相当のみを確認する（ctx2 相当の「セッション越しに Private を
-/// 見る」経路は wire には存在しない）。
+/// 対照 DB と一致することを確認する。ここでは ctx1（tenant-a）・ctx3
+/// （tenant-b）相当のみを確認する（ctx2 相当の「明示的に Private 可視の
+/// `PolicyContext` を構築して問い合わせる」経路は本テストの対象外。
+/// production の wire-server 認証導出点（`auth.rs::session_policy_context`）
+/// が実際に返す `PolicyContext`〔`Public` ＋ 自テナントの `Private`。
+/// RLS-11・TASK-195〕とキャッシュ整合の統合検証は
+/// `crates/wire-server/tests/rls11_read_your_writes.rs` に委ねる）。
 #[test]
 fn session_entrypoint_matches_oracle_db() {
     // キャッシュキーは `(table, PolicyContext)` のみで集計式を含まない

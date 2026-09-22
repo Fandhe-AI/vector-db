@@ -12,7 +12,9 @@
 //! （`tests/sql_explain.rs`・`tests/wire_using_plan.rs` と同方針）。
 //! wire プロトコル経由・生バイトクライアントでの検証は
 //! `crates/wire-server/tests/wire1_simple_query.rs`
-//! （`wire1_insert_is_accepted_but_row_is_invisible_over_wire_select`）が担う。
+//! （`wire1_insert_is_accepted_and_row_is_visible_over_wire_select_to_own_tenant`。
+//! RLS-11・TASK-195 導入後の読み取り可視性契約は同テストのドキュメンテーション
+//! コメント参照）が担う。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
