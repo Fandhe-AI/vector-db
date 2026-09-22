@@ -1171,9 +1171,11 @@ pub(crate) fn update_row_unchecked(
 /// 正規レイアウト（SQL 表層の `INSERT`・型付き挿入 API はすべてこの経路を通る）
 /// であることを要求する。旧フォーマットの raw metadata（全行置換版 `RowInput` を
 /// 直接構築する Rust API 経由。本モジュール外の非 SQL 呼び出し元専用）が書いた行を
-/// 対象にした場合は `decode_scalar_columns` が構造不整合を検出し `CatalogError::
-/// Invalid`（`22000`）で fail-closed に拒否する（黙ってスカラー列を欠損させたり
-/// 誤ったオフセットで読まない）。
+/// 対象にした場合は `decode_scalar_columns` が構造不整合を検出し、格納済みデータの
+/// 破損・実装不整合として `CatalogError::CorruptSchema`（`sql::exec::map_write_error`
+/// 経由で `XX000`）で fail-closed に拒否する（黙ってスカラー列を欠損させたり
+/// 誤ったオフセットで読まない。クライアント入力エラー `22000` に丸めない。
+/// codex-review P1 指摘・PR #989）。
 ///
 /// 戻り値は更新行数（`0` または `1`）。呼び出し元は `sql::exec::execute_update`。
 pub(crate) fn update_row_columns_unchecked(
@@ -1260,8 +1262,21 @@ pub(crate) fn update_row_columns_unchecked(
 
         rows_affected = match target {
             Some(row) => {
+                // `row.metadata` は今回の UPDATE 要求ではなく、過去に書き込まれ
+                // 済みの行データである。ここでのデコード失敗はクライアント入力の
+                // 不正ではなく、ストレージ側の破損・実装不整合を示す。`CatalogError::
+                // Invalid`（ユーザー入力の検証失敗）へ丸めると `map_write_error`
+                // （`sql/exec.rs`）が `22000` へ写像し「UPDATE の入力が不正」という
+                // 誤ったクライアントエラーになってしまう（同じ `sql/exec.rs` の
+                // `From<RowCodecError> for SqlSurfaceError` が格納済みペイロードの
+                // デコード失敗を fail-closed に `XX000` へ丸める契約と整合しない。
+                // codex-review P1 指摘・PR #989）。`CatalogError::CorruptSchema`
+                // （格納済みデータのデコード失敗を表す既存 variant。`map_write_error`
+                // の `_` 節経由で `XX000`／`SqlSurfaceError::Internal` へ丸まり、
+                // detail はクライアントへ渡らない）を使い、正しくサーバー内部事象
+                // として分類する。
                 let mut values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
-                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                    .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
                 let mut embedding = row.embedding;
                 let mut vector_assigned = false;
                 for (idx, value) in assignments {

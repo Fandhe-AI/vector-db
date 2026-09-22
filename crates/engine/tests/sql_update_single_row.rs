@@ -21,8 +21,9 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
+use engine::sql::using_operation_id::OperationId;
 use engine::sql::SqlOutcome;
-use engine::storage::{Storage, Visibility};
+use engine::storage::{RowInput, Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
@@ -671,4 +672,58 @@ fn execute_update_sql_direct_entry_point_matches_session_dispatch_contract() {
         .expect("direct entry point UPDATE should succeed");
     assert_eq!(outcome.rows_affected, 1);
     assert_eq!(count_where(&core, &alice, "lang = 'en'"), 1);
+}
+
+// --- 格納済み行の破損（codex-review P1 指摘・PR #989） ----------------------
+
+/// 対象行の既存 `metadata` が `row_codec::encode_scalar_columns` の正規レイアウト
+/// でない場合（`tenant::insert_row` の raw `RowInput` 経路。本モジュール外の
+/// 非 SQL 呼び出し元専用と `update_row_columns_unchecked` のドキュメントが明記する
+/// 前提を外れた、ストレージ側の破損・想定外の格納状態を模す）、`UPDATE` は
+/// クライアント入力エラー（`22000`）ではなく、サーバー内部事象として `XX000`
+/// （`SqlSurfaceError::Internal`）を返す。`decode_scalar_columns` の失敗を
+/// `CatalogError::Invalid` へ丸めると `map_write_error` が一律 `22000` へ誤写像
+/// してしまう問題の回帰防止（PR #989 レビュー指摘対応）。
+#[test]
+fn update_against_row_with_corrupt_stored_metadata_is_rejected_with_xx000() {
+    let path = unique_db_path("sql-update-corrupt-metadata");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+
+    let alice = ctx_for("alice");
+    // `row_codec::encode_scalar_columns` を経由しない raw metadata（列レイアウトと
+    // 矛盾する任意バイト列）で行を直接投入する。`update_row_columns_unchecked` が
+    // 読み出し時に `decode_scalar_columns` で構造不整合を検出する対象行を作る。
+    let operation_id = OperationId::parse("seed-corrupt-1").expect("valid operation_id");
+    engine::tenant::insert_row(
+        &storage,
+        TABLE,
+        &alice,
+        1,
+        &RowInput {
+            tenant_id: alice.tenant_id(),
+            visibility: Visibility::Private,
+            embedding: &[0.1, 0.2],
+            metadata: b"\xff\xff not a valid scalar column encoding \xff\xff",
+        },
+        &operation_id,
+    )
+    .expect("seed row with corrupt stored metadata");
+
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!("UPDATE {TABLE} SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-corrupt'"),
+        )
+        .expect_err("decode failure on stored data must not succeed");
+    assert_eq!(
+        err.wire_code(),
+        "XX000",
+        "stored row decode failure must classify as a server-side internal error, \
+         not a client input error (22000)"
+    );
 }
