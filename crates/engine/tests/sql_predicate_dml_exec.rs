@@ -420,3 +420,66 @@ fn predicate_delete_over_limit_is_rejected_with_no_side_effects() {
     .expect_err("resend of an unrecorded operation_id must be the same over-limit rejection");
     assert_eq!(err_again.wire_code(), "54000");
 }
+
+/// DELETE 側（[`predicate_delete_over_limit_is_rejected_with_no_side_effects`]）
+/// と同じ契約が述語つき UPDATE 側にも成立することを固定する（`§6` の上限 API
+/// 並立〔`MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows`〕は DELETE 側の
+/// `DEFAULT_MAX_DML_AFFECTED_ROWS`＋`check_affected_row_count`と値は同じ
+/// 1,000 だが別 API のため、UPDATE 側でも独立に検証する）。
+#[test]
+fn predicate_update_over_limit_is_rejected_with_no_side_effects() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+
+    let limit = engine::sql::parser::MAX_DML_AFFECTED_ROWS;
+    let over = limit + 1; // 1,001 件（1,000 件ちょうどは成功する対照として別テストへ）
+
+    for id in 1..=over {
+        insert_row(
+            &core,
+            &alice,
+            TABLE,
+            id as u64,
+            "ja",
+            "b",
+            &format!("over-{id}"),
+        );
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), over as u64);
+
+    let err = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET lang = 'fr' WHERE lang = 'ja' USING OPERATION_ID 'op-upd-over-limit'"
+        ),
+    )
+    .expect_err("over-limit predicate UPDATE must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+    // 副作用ゼロ: 行不変（lang 列は書き換わっていない。1,001 行全件を
+    // `scan_lang_rows` の `LIMIT 100` で確認するのは非現実的なため、
+    // `WHERE lang = 'fr'` の一致数が 0 のままであることで代替確認する）
+    // ・台帳未記録（同一 operation_id は再送しても再び 54000 になる。
+    // 23505/22023 にはならない）。
+    assert_eq!(count_star(&core, &alice, TABLE), over as u64);
+    let unchanged = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT COUNT(*) FROM {TABLE} WHERE lang = 'fr'"),
+        )
+        .expect("count(*) should succeed");
+    match &unchanged.rows[0].cells[0] {
+        Cell::Integer(v) => assert_eq!(*v, 0, "no row should have been updated to lang = 'fr'"),
+        other => panic!("expected Cell::Integer, got {other:?}"),
+    }
+    let err_again = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET lang = 'fr' WHERE lang = 'ja' USING OPERATION_ID 'op-upd-over-limit'"
+        ),
+    )
+    .expect_err("resend of an unrecorded operation_id must be the same over-limit rejection");
+    assert_eq!(err_again.wire_code(), "54000");
+}
