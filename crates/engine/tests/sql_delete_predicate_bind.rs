@@ -105,20 +105,30 @@ fn new_core_with_documents_table(path: &std::path::Path) -> EngineCore {
 /// `execute_sql_in_session` 経由では実行できないことを明示的に固定する
 /// （`sql::allowlist::validate_sql_still_rejects_delete_statement` の
 /// セッション経由版）。
+///
+/// Issue #871 で `execute_sql_in_session` の `DELETE` 分岐が述語形まで実行結線
+/// されたため、本テストは「まだ拒否される」固定から「0 件一致で成功する」
+/// 固定へ反転する（テーブルに行が無いため `rows_affected == 0`。台帳は
+/// commit 済みで、同一 `operation_id` の再送は `23505` に収束する契約
+/// （`docs/design/predicate-dml-exec.md` 参照）は `tests/sql_predicate_dml_exec.rs`
+/// が固定する）。
 #[test]
-fn session_still_rejects_predicate_delete_statement() {
-    let path = unique_db_path("delete-predicate-bind-session-rejects");
+fn session_executes_predicate_delete_statement() {
+    let path = unique_db_path("delete-predicate-bind-session-executes");
     let _guard = CleanupGuard(path.clone());
     let core = new_core_with_documents_table(&path);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
 
-    let err = core
+    let outcome = core
         .execute_sql_in_session(
             &ctx,
             &mut session,
             "DELETE FROM documents WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
         )
-        .expect_err("session DELETE (predicate form) must still be rejected");
-    assert_eq!(err.wire_code(), "42601");
+        .expect("session DELETE (predicate form) must now execute");
+    match outcome {
+        engine::sql::SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 0),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
 }

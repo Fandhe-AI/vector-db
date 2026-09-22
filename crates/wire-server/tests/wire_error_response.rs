@@ -196,7 +196,17 @@ fn err1_update_returns_42601_fields() {
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
-    send_simple_query(&mut stream, "UPDATE docs SET id = 2 WHERE id = 1");
+    // Issue #871: `UPDATE` の覗き見判定が `validate_update_form_tokens`
+    // （単一行・述語形の双方を受理）へ切り替わったため、`operation_id` 必須化
+    // ガード（TASK-92・RECOVER-1・`23502`）より先にこの入力が拒否されるよう
+    // `USING OPERATION_ID` を付与する（`docs/design/predicate-dml-exec.md`
+    // 「PR #989 との整合ルール」参照）。単一行・`id` 完全一致形の実行結線は
+    // 本 Issue（#871）の対象外のため `EngineCore::execute_predicate_update_form`
+    // が `42601`（許可形状外。Issue #865 の担当）で拒否する。
+    send_simple_query(
+        &mut stream,
+        "UPDATE docs SET id = 2 WHERE id = 1 USING OPERATION_ID 'wire-err1-update-1'",
+    );
 
     assert_error_response(&mut stream, "42601");
 }

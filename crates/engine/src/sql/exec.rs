@@ -46,7 +46,8 @@ use crate::row_codec::{self, RowCodecError, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::parser::{
-    BoundConflictAction, BoundStatement, BoundUpsert, BoundUpsertValue, ProjectedColumn, Ranking,
+    BoundConflictAction, BoundPredicateDelete, BoundPredicateUpdate, BoundStatement, BoundUpsert,
+    BoundUpsertValue, ProjectedColumn, Ranking,
 };
 use crate::sql::plan::ExecutionPlan;
 use crate::sql::udf_call;
@@ -224,18 +225,35 @@ pub struct InsertOutcome {
 pub struct TruncateOutcome {}
 
 /// `EngineCore::execute_delete_sql` の成功応答（SQL-18、TASK-191、#867）。
-/// `DELETE FROM <table> WHERE id = <n> USING OPERATION_ID '<id>'` は単一行
-/// （`id` 等価指定）のみを受理するため `rows_affected` は `0` または `1` の
-/// いずれかになる——他テナント保持 id・未存在 id への削除要求は
+/// 単一行・`id` 等価指定形（[`execute_delete`]）では `rows_affected` は `0`
+/// または `1` のいずれかになる——他テナント保持 id・未存在 id への削除要求は
 /// [`execute_delete`] のドキュメント参照のとおり `0` へ写像し、対象行の
 /// 有無（他テナント所有か未存在か）を応答から一切区別しない（RLS-9・RLS-10。
 /// security.md「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」）。
+///
+/// 述語形（SQL-19・TASK-192、Issue #871。[`execute_predicate_delete`]）では
+/// `rows_affected` は `0..=MAX_DML_AFFECTED_ROWS`（`sql::parser::
+/// DEFAULT_MAX_DML_AFFECTED_ROWS`）の範囲を取り、一致した自テナント所有行の
+/// 件数をそのまま表す（同じく他テナント行・不可視行は候補にすら含まれない）。
+///
 /// `rows_affected` は自テナントの結果を表すのみのため、`TruncateOutcome` と
 /// 異なり露出しても再送側の件数推定材料にはならない（`INSERT 0 <rows>` と
 /// 同じ pg 互換タグ `DELETE <rows>` へ写像する。`wire-server::simple_query`
 /// 参照）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeleteOutcome {
+    pub rows_affected: u64,
+}
+
+/// `EngineCore::execute_sql_in_session` の `UPDATE`（述語形。SQL-19・TASK-192、
+/// Issue #871）が成功したことを示す応答。[`DeleteOutcome`] の述語形と同じ意味論
+/// （`rows_affected` は `0..=MAX_DML_AFFECTED_ROWS`。他テナント行・不可視行は
+/// 候補にすら含まれない）。単一行・`id` 等価指定形（SQL-17、Issue #865）の実行
+/// 結線は本 Issue（#871）の対象外——`core.rs::EngineCore` の `UPDATE` 分岐の
+/// `ValidatedUpdateForm::Single` 腕は現状 [`SqlSurfaceError::unsupported`] を
+/// 返す（`docs/design/predicate-dml-exec.md`「PR #989 との整合ルール」参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateOutcome {
     pub rows_affected: u64,
 }
 
@@ -2608,6 +2626,17 @@ pub fn execute_delete(
 /// 書き込み経路も同じ写像を再利用する——`TenantWriteError` の variant 集合は
 /// `insert`／`truncate` で共通のため、専用の写像本体は追加しない）。
 fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError {
+    map_write_error(e, "insert")
+}
+
+/// [`map_insert_write_error`] の一般化版（Issue #871。述語つき `DELETE`／`UPDATE`
+/// 実行結線〔[`execute_predicate_delete`]・[`execute_predicate_update`]〕が
+/// `map_insert_write_error` と写像内容を完全に共有しつつ、`invalid_input`／
+/// `Internal` の固定文言（"insert rejected"／"insert failed"）を操作名で
+/// パラメータ化するために追加した。`map_insert_write_error` は本関数へ
+/// `op = "insert"` で委譲する薄いラッパーのまま残す（既存呼び出し元・既存
+/// エラー文言はいずれも変更しない）。
+fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlSurfaceError {
     use crate::catalog::CatalogError;
     use crate::storage::StorageError;
     use crate::tenant::TenantWriteError;
@@ -2645,7 +2674,7 @@ fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError
         // `_` 節（`XX000`）へ委ねる。
         TenantWriteError::Catalog(CatalogError::Invalid(_))
         | TenantWriteError::Storage(StorageError::Codec(_)) => {
-            SqlSurfaceError::invalid_input("insert rejected: invalid row")
+            SqlSurfaceError::invalid_input(format!("{op} rejected: invalid row"))
         }
         // それ以外（redb バックエンド障害・commit 失敗・カタログ破損・認可失敗・
         // 台帳破損等）はサーバー側の内部事象として `XX000` へ写像する
@@ -2653,8 +2682,189 @@ fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError
         // 再試行・障害判定を誤らせる。また `TenantWriteError` の `Display`/`Debug` は
         // 原因を秘匿する契約のため、detail には原因を一切展開せず固定文言に留める）。
         _ => SqlSurfaceError::Internal {
-            detail: "insert failed".to_string(),
+            detail: format!("{op} failed"),
         },
+    }
+}
+
+/// 述語つき `DELETE FROM <table> WHERE ... USING OPERATION_ID '<id>'`
+/// （SQL-19・TASK-192、Issue #871）の実行本体。唯一の到達経路は
+/// `core.rs::EngineCore` の `DELETE` 分岐（述語形。
+/// `EngineCore::execute_predicate_delete_form`）。`pub(crate)`（`execute_file_insert`
+/// と同じ理由でクレート外へ公開しない）。
+///
+/// `content_hash_value` は呼び出し元（`core.rs`）が束縛の直前に
+/// `recovery::content_hash::for_delete_where` で 1 回だけ計算した値を渡す
+/// （計算位置の詳細は `docs/design/predicate-dml-exec.md` 参照）。`schema` は
+/// 呼び出し元が既に取得済みのスキーマ（`bind_predicate_delete` と同一のもの）を
+/// 渡し、`tenant::delete_rows_where_unchecked` の `expected_schema` 照合へ
+/// 引き継ぐ（並行 `ALTER TABLE` 検知。`upsert_typed_rows_unchecked` と同じ判断）。
+///
+/// `WHERE` 述語の評価は `sql/scan.rs::execute_scan` の走査ループと同一の意味論
+/// （`declarative_filter::matches_all` → 各 `expr_filters` を `ExprProgram::eval`。
+/// `references_embedding && dim == 0` の行は無条件除外。第 2 の述語評価器を
+/// 作らない）を、候補行列挙のクロージャとして `tenant::delete_rows_where_unchecked`
+/// へ注入する。
+pub(crate) fn execute_predicate_delete(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &BoundPredicateDelete,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    schema: &TableSchema,
+    content_hash_value: &crate::recovery::content_hash::ContentHash,
+) -> Result<DeleteOutcome, SqlSurfaceError> {
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+
+    let metadata_filters = bound.metadata_filters();
+    let expr_filters = bound.expr_filters();
+    let needs_embedding = expr_filters.iter().any(udf_call::references_embedding);
+    let expr_programs: Vec<crate::sql::expr_program::ExprProgram> = expr_filters
+        .iter()
+        .map(crate::sql::expr_program::ExprProgram::compile)
+        .collect();
+    let mut scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
+
+    let predicate = |candidate: &crate::tenant::DmlCandidate<'_>| -> Result<bool, SqlSurfaceError> {
+        let scanned = row_codec::scan_scalar_columns(schema, candidate.metadata)?;
+        if !declarative_filter::matches_all(metadata_filters, &scanned) {
+            return Ok(false);
+        }
+        for (expr, program) in expr_filters.iter().zip(&expr_programs) {
+            let references_embedding = udf_call::references_embedding(expr);
+            if references_embedding && candidate.dim == 0 {
+                return Ok(false);
+            }
+            let embedding: &[f32] = if references_embedding {
+                candidate.embedding
+            } else {
+                &[]
+            };
+            match program.eval(candidate.id, embedding, &mut scratch)? {
+                udf_call::ExprValue::Bool(true) => {}
+                udf_call::ExprValue::Bool(false) => return Ok(false),
+                _ => {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "WHERE expression did not evaluate to a boolean",
+                    ))
+                }
+            }
+        }
+        Ok(true)
+    };
+
+    let limit = bound.max_affected_rows();
+    match crate::tenant::delete_rows_where_unchecked(
+        storage,
+        bound.table(),
+        ctx,
+        ledger_write,
+        content_hash_value,
+        Some(schema),
+        needs_embedding,
+        limit,
+        predicate,
+    ) {
+        Ok(crate::tenant::PredicateDmlOutcome::Applied { rows_affected }) => Ok(DeleteOutcome {
+            rows_affected: rows_affected as u64,
+        }),
+        Ok(crate::tenant::PredicateDmlOutcome::LimitExceeded { count }) => {
+            crate::sql::parser::check_affected_row_count(count, limit)?;
+            Err(SqlSurfaceError::Internal {
+                detail: "predicate DELETE limit check did not reject an over-limit count"
+                    .to_string(),
+            })
+        }
+        Err(crate::tenant::PredicateDmlError::Predicate(e)) => Err(e),
+        Err(crate::tenant::PredicateDmlError::Write(e)) => Err(map_write_error(e, "delete")),
+    }
+}
+
+/// 述語つき `UPDATE <table> SET ... WHERE ... USING OPERATION_ID '<id>'`
+/// （SQL-19・TASK-192、Issue #871）の実行本体。唯一の到達経路は
+/// `core.rs::EngineCore` の `UPDATE` 分岐（述語形。
+/// `EngineCore::execute_predicate_update_form`）。[`execute_predicate_delete`]
+/// と同じ設計（候補行列挙のクロージャ注入・`content_hash_value`／`schema` を
+/// 呼び出し元から受け取る）で、適用段のみ `tenant::update_rows_where_unchecked`
+/// の read-merge-write（`upsert_typed_rows_unchecked` の `DoUpdate` 腕と同型）に
+/// 委譲する。
+pub(crate) fn execute_predicate_update(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &BoundPredicateUpdate,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    schema: &TableSchema,
+    content_hash_value: &crate::recovery::content_hash::ContentHash,
+) -> Result<UpdateOutcome, SqlSurfaceError> {
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+
+    let metadata_filters = bound.metadata_filters();
+    let expr_filters = bound.expr_filters();
+    let needs_embedding = expr_filters.iter().any(udf_call::references_embedding);
+    let expr_programs: Vec<crate::sql::expr_program::ExprProgram> = expr_filters
+        .iter()
+        .map(crate::sql::expr_program::ExprProgram::compile)
+        .collect();
+    let mut scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
+
+    let predicate = |candidate: &crate::tenant::DmlCandidate<'_>| -> Result<bool, SqlSurfaceError> {
+        let scanned = row_codec::scan_scalar_columns(schema, candidate.metadata)?;
+        if !declarative_filter::matches_all(metadata_filters, &scanned) {
+            return Ok(false);
+        }
+        for (expr, program) in expr_filters.iter().zip(&expr_programs) {
+            let references_embedding = udf_call::references_embedding(expr);
+            if references_embedding && candidate.dim == 0 {
+                return Ok(false);
+            }
+            let embedding: &[f32] = if references_embedding {
+                candidate.embedding
+            } else {
+                &[]
+            };
+            match program.eval(candidate.id, embedding, &mut scratch)? {
+                udf_call::ExprValue::Bool(true) => {}
+                udf_call::ExprValue::Bool(false) => return Ok(false),
+                _ => {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "WHERE expression did not evaluate to a boolean",
+                    ))
+                }
+            }
+        }
+        Ok(true)
+    };
+
+    // `MAX_DML_AFFECTED_ROWS`／`check_dml_affected_rows`（ADR §6「上限 API の
+    // 並立（申し送り）」。両上限 API の統合は本 Issue の対象外のまま）。
+    let limit = crate::sql::parser::MAX_DML_AFFECTED_ROWS;
+    match crate::tenant::update_rows_where_unchecked(
+        storage,
+        bound.table(),
+        ctx,
+        ledger_write,
+        content_hash_value,
+        Some(schema),
+        bound.assignments(),
+        needs_embedding,
+        limit,
+        predicate,
+    ) {
+        Ok(crate::tenant::PredicateDmlOutcome::Applied { rows_affected }) => Ok(UpdateOutcome {
+            rows_affected: rows_affected as u64,
+        }),
+        Ok(crate::tenant::PredicateDmlOutcome::LimitExceeded { count }) => {
+            crate::sql::parser::check_dml_affected_rows(count)?;
+            Err(SqlSurfaceError::Internal {
+                detail: "predicate UPDATE limit check did not reject an over-limit count"
+                    .to_string(),
+            })
+        }
+        Err(crate::tenant::PredicateDmlError::Predicate(e)) => Err(e),
+        Err(crate::tenant::PredicateDmlError::Write(e)) => Err(map_write_error(e, "update")),
     }
 }
 

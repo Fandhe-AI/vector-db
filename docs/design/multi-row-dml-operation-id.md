@@ -488,6 +488,15 @@ RECOVER-11（検討中）の確定に向けて、以下をポインタ表記で�
   契約（RECOVER-11・SQL-9・SQL-19。4.4.1 節）
 - 単一行 `UPDATE` のハッシュ源見直し（RECOVER-10・SQL-17・Issue #865）
 
+## 9.5 実装記録（Issue #871）
+
+本 ADR はステータス Proposed（オーナー承認待ち）のままだが、Issue #871
+（述語つき UPDATE/DELETE の実行結線）は自動運転モードのため承認待ちを待たず、
+本 ADR を現時点の最有力案＝作業前提として実行結線した（詳細・受け入れ条件・
+テストは `docs/design/predicate-dml-exec.md` 参照）。ADR からの意図的な変更点
+（§4.2 の計算位置・エラー型）も同 doc に記録済み。`OpTag::UpdateWhere = 8`／
+`DeleteWhere = 9`（既存 1〜7 の続番。値の変更なし）。
+
 ## 10. 判断記録（オーナー記入欄）
 
 | 項目 | 内容 |

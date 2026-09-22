@@ -257,6 +257,25 @@ pub(crate) fn execute_and_respond(
                 "failed to encode command complete response",
             ),
         },
+        // SQL-19（TASK-192、Issue #871）: 述語つき `UPDATE`（`exec::UpdateOutcome::
+        // rows_affected` は自テナント所有・一致行の更新件数を保持する。`sql/exec.rs`
+        // ドキュメント参照）の応答を pg 互換の `CommandComplete` タグ
+        // `UPDATE <rows>`（PostgreSQL の `UPDATE` タグに準拠）へ整形する。
+        // `DELETE <rows>` と同じ設計。
+        Ok(SqlOutcome::Update(outcome)) => match result_encoder::encode_command_complete(&format!(
+            "UPDATE {}",
+            outcome.rows_affected
+        )) {
+            Ok(msg) => {
+                write_all(stream, &msg)?;
+                crate::handshake::write_ready_for_query_io(stream)
+            }
+            Err(_) => respond_error_and_ready(
+                stream,
+                ErrorClass::InternalError,
+                "failed to encode command complete response",
+            ),
+        },
         Err(e) => respond_error_and_ready(stream, e.error_class(), &e.client_message()),
     }
 }

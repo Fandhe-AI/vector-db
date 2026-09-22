@@ -1751,6 +1751,362 @@ pub(crate) fn delete_row_ledgered_unchecked(
 ///   commit される）ため、常にテーブル世代を進める（`insert_rows` の空バッチ
 ///   ショートカットとは意図的に非対称。0 件 TRUNCATE の再送冪等性を台帳側だけで
 ///   保証し、コード分岐の非対称性によるバグを避ける）。
+///
+/// 述語つき `UPDATE`／`DELETE ... WHERE`（SQL-19・TASK-192、Issue #871・対象
+/// ビヘイビア: RECOVER-11）の実行結果。呼び出し元（`sql::exec::
+/// execute_predicate_delete`／`execute_predicate_update`）はこの enum を
+/// `wire_code` へ写像する（`Applied` は `DELETE n`／`UPDATE n`、
+/// `LimitExceeded` は `54000`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PredicateDmlOutcome {
+    /// 影響行数（`0` を含む）。write トランザクションは commit 済み
+    /// （台帳エントリも commit されている）。
+    Applied { rows_affected: usize },
+    /// 一致行数が上限を超えた（`limit + 1` 件目で列挙を打ち切った時点の件数を
+    /// そのまま運ぶ。呼び出し元が `check_dml_affected_rows`／
+    /// `check_affected_row_count` へ渡す）。write トランザクションは commit
+    /// されず、行・台帳エントリのいずれにも痕跡が残らない。
+    LimitExceeded { count: usize },
+}
+
+/// [`delete_rows_where_unchecked`]／[`update_rows_where_unchecked`] のエラー。
+/// テナント境界・台帳照合由来のエラー（[`TenantWriteError`]）と、呼び出し元が
+/// 注入する述語クロージャ由来のエラー（`E`）を型で区別する。本モジュールは
+/// `sql` 型（`SqlSurfaceError` 等）に依存しないため、`E` はジェネリックのまま
+/// 運ぶ（`sql::exec` 側が `SqlSurfaceError` として具体化する）。
+#[derive(Debug)]
+pub(crate) enum PredicateDmlError<E> {
+    Write(TenantWriteError),
+    Predicate(E),
+}
+
+fn dml_write_err<E>(e: impl Into<TenantWriteError>) -> PredicateDmlError<E> {
+    PredicateDmlError::Write(e.into())
+}
+
+/// 候補行 1 件分の借用ビュー（述語クロージャへ渡す入力。行データを複製しない）。
+/// `embedding` は呼び出し元が `needs_embedding = false` を渡した場合は常に空
+/// スライス（`WHERE` が embedding を参照しない場合、デコードコストを避ける。
+/// `sql/scan.rs` の `DecodeTier` と同じ判断）。
+pub(crate) struct DmlCandidate<'a> {
+    pub id: u64,
+    pub dim: u32,
+    pub embedding: &'a [f32],
+    pub metadata: &'a [u8],
+}
+
+/// [`delete_rows_where_unchecked`]／[`update_rows_where_unchecked`] が共有する
+/// 候補行列挙本体。テナント所有範囲 `(tenant, 0)..=(tenant, u64::MAX)`
+/// （TABLE-12・`is_owner` の二重防御。RLS 可視性フィルタではなくテナント
+/// **所有**スコープである点は単一行 DELETE・TRUNCATE と同じ——`docs/design/
+/// predicate-dml-exec.md`「削除・更新スコープ」参照）を走査し、`predicate` が
+/// 真を返した行の `id` を `limit + 1` 件に達するまで `Vec` へ蓄積する
+/// （早期終了。行データそのものは複製せず `id` のみを保持する）。
+///
+/// `predicate` が `Err(e)` を返した場合はその時点で呼び出し元へ伝播する
+/// （呼び出し元が `write_txn` を破棄することで副作用ゼロを保つ）。
+fn enumerate_dml_candidates<E>(
+    row_table: &redb::Table<'_, (&'static str, u64), &'static [u8]>,
+    ctx: &PolicyContext,
+    needs_embedding: bool,
+    limit: usize,
+    predicate: &mut impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+) -> Result<Vec<u64>, PredicateDmlError<E>> {
+    let mut candidate_ids: Vec<u64> = Vec::new();
+    let mut embedding_scratch: Vec<f32> = Vec::new();
+
+    // `execute_scan`／`execute_aggregate` と同じくテーブル全体を `.iter()` で
+    // 走査し、テナント**所有**スコープの判定は物理走査中の `ctx.is_owner`
+    // 判定に委ねる（redb の `Table::range` はキー参照の借用型を要求し、
+    // `(&str, u64)` 複合キーの部分範囲指定は型が煩雑になるため、既存の
+    // 走査系実装と同じ「全走査＋所有権判定」に統一する。TABLE-12・security.md）。
+    for entry in row_table
+        .iter()
+        .map_err(|e| dml_write_err(CatalogError::from(e)))?
+    {
+        let (k, v) = entry.map_err(|e| dml_write_err(CatalogError::from(e)))?;
+        let (key_tenant, id) = k.value();
+        let buf = v.value();
+
+        let (row_tenant, _visibility, offset) =
+            crate::storage::decode_row_header(buf).map_err(|e| dml_write_err(e))?;
+        crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
+            .map_err(|e| dml_write_err(e))?;
+        // テナント**所有**スコープ（RLS 可視性フィルタではない。TRUNCATE・
+        // 単一行 DELETE と同じ判断。`docs/design/predicate-dml-exec.md` 参照）。
+        if !ctx.is_owner(row_tenant) {
+            continue;
+        }
+
+        let (dim, metadata): (u32, &[u8]) = if needs_embedding {
+            crate::storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
+                .map_err(|e| dml_write_err(e))?
+        } else {
+            crate::storage::decode_row_dim_and_metadata_borrowed(buf)
+                .map_err(|e| dml_write_err(e))?
+        };
+        let embedding: &[f32] = if needs_embedding {
+            embedding_scratch.as_slice()
+        } else {
+            &[]
+        };
+
+        let candidate = DmlCandidate {
+            id,
+            dim,
+            embedding,
+            metadata,
+        };
+        if predicate(&candidate).map_err(PredicateDmlError::Predicate)? {
+            candidate_ids.push(id);
+            // `limit + 1` 件に達した時点で打ち切る（副作用ゼロで `54000` を
+            // 返すために、呼び出し元が超過を判定できる最小限の 1 件超過分だけ
+            // 余分に蓄積する。ADR `docs/design/multi-row-dml-operation-id.md`
+            // §6「3.」）。
+            if candidate_ids.len() > limit {
+                break;
+            }
+        }
+    }
+    Ok(candidate_ids)
+}
+
+/// 述語つき `DELETE FROM <table> WHERE ... USING OPERATION_ID '<id>'`
+/// （SQL-19・TASK-192、Issue #871）の実体。唯一の到達経路は
+/// `sql::exec::execute_predicate_delete`。
+///
+/// 処理順序（ADR `docs/design/multi-row-dml-operation-id.md` §6）:
+/// 1. `begin_write_txn` → スキーマ取得（`expected_schema` があれば束縛時点の
+///    スキーマと一致するか照合し、並行 `ALTER TABLE` を検知する。
+///    `upsert_typed_rows_unchecked` と同じ判断）。
+/// 2. `ledger::record_in_txn`（候補列挙より**先**。使用済み `operation_id` は
+///    可視集合を一切走査せず `23505`／`22023` へ短絡する）。
+/// 3. [`enumerate_dml_candidates`] で候補 `id` を確定する。
+/// 4. `limit` を超えていれば `write_txn` を drop し
+///    [`PredicateDmlOutcome::LimitExceeded`] を返す（行・台帳とも痕跡ゼロ）。
+/// 5. 候補 `id` をすべて `remove`。
+/// 6. 影響行数が 1 件以上のときのみ `bump_table_generation_in_txn`。
+/// 7. `commit_boundary::commit`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn delete_rows_where_unchecked<E>(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash_value: &content_hash::ContentHash,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    needs_embedding: bool,
+    limit: usize,
+    mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
+    validate_identifier(table).map_err(dml_write_err)?;
+    let write_txn = storage
+        .begin_write_txn()
+        .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+
+    let candidate_ids = {
+        let schema = require_table_schema_write(&write_txn, table).map_err(dml_write_err)?;
+        if let Some(expected) = expected_schema {
+            if expected != &schema {
+                return Err(dml_write_err(CatalogError::Invalid(
+                    "table schema changed after the statement was bound".to_string(),
+                )));
+            }
+        }
+
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            content_hash_value,
+        )
+        .map_err(dml_write_err)?;
+
+        let row_table_name = user_rows_table_name(table);
+        let row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+        enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?
+    };
+
+    if candidate_ids.len() > limit {
+        // `write_txn` をここで drop する（commit しない）。台帳の tentative
+        // 追記・行変更のいずれも痕跡が残らない（ADR §6「4.」）。
+        return Ok(PredicateDmlOutcome::LimitExceeded {
+            count: candidate_ids.len(),
+        });
+    }
+
+    {
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+        for id in &candidate_ids {
+            let key = (ctx.tenant_id(), *id);
+            row_table
+                .remove(&key)
+                .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+        }
+    }
+
+    let rows_affected = candidate_ids.len();
+    if rows_affected > 0 {
+        crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(dml_write_err)?;
+    }
+    crate::recovery::commit_boundary::commit(write_txn).map_err(dml_write_err)?;
+    Ok(PredicateDmlOutcome::Applied { rows_affected })
+}
+
+/// 述語つき `UPDATE <table> SET ... WHERE ... USING OPERATION_ID '<id>'`
+/// （SQL-19・TASK-192、Issue #871）の実体。唯一の到達経路は
+/// `sql::exec::execute_predicate_update`。
+///
+/// 処理順序は [`delete_rows_where_unchecked`] と同一（ADR §6）。適用段のみが
+/// 異なり、候補 `id` ごとに既存行を read-merge-write する
+/// （`upsert_typed_rows_unchecked` の `DoUpdate` 腕と同じ組み立て。`assignments`
+/// は束縛済みの `(列インデックス, 値)` 対応——`VECTOR` 列を対象とする割当は
+/// embedding を差し替え、それ以外は `merged_values` の対応スロットを上書きする。
+/// SET で触れない列・embedding・可視性は既存行の値を保持する）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_rows_where_unchecked<E>(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash_value: &content_hash::ContentHash,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    assignments: &[(usize, crate::row_codec::Value)],
+    needs_embedding: bool,
+    limit: usize,
+    mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
+    validate_identifier(table).map_err(dml_write_err)?;
+    let write_txn = storage
+        .begin_write_txn()
+        .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+
+    let (candidate_ids, schema) = {
+        let schema = require_table_schema_write(&write_txn, table).map_err(dml_write_err)?;
+        if let Some(expected) = expected_schema {
+            if expected != &schema {
+                return Err(dml_write_err(CatalogError::Invalid(
+                    "table schema changed after the statement was bound".to_string(),
+                )));
+            }
+        }
+
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            content_hash_value,
+        )
+        .map_err(dml_write_err)?;
+
+        let row_table_name = user_rows_table_name(table);
+        let row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+        let candidate_ids =
+            enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?;
+        (candidate_ids, schema)
+    };
+
+    if candidate_ids.len() > limit {
+        return Ok(PredicateDmlOutcome::LimitExceeded {
+            count: candidate_ids.len(),
+        });
+    }
+
+    let vector_idx = schema
+        .columns
+        .iter()
+        .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)));
+
+    {
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+        for id in &candidate_ids {
+            let key = (ctx.tenant_id(), *id);
+            let existing = match row_table
+                .get(&key)
+                .map_err(|e| dml_write_err(CatalogError::from(e)))?
+            {
+                Some(guard) => {
+                    crate::storage::decode_row_for_key(ctx.tenant_id(), *id, guard.value())
+                        .map_err(dml_write_err)?
+                }
+                None => {
+                    // 列挙後・適用前の並行削除（同一トランザクション内で候補行は
+                    // 列挙時に読み取り済みのため、redb の単一ライター制約下では
+                    // 通常到達しないが、fail-closed に内部エラーとして拒否する
+                    // （`unwrap`/添字禁止・coding-rust.md）。
+                    return Err(dml_write_err(CatalogError::Invalid(
+                        "internal: candidate row disappeared before apply".to_string(),
+                    )));
+                }
+            };
+
+            let mut merged_values =
+                crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
+                    .map_err(|e| CatalogError::Invalid(e.to_string()))
+                    .map_err(dml_write_err)?;
+            let mut embedding_value: Vec<f32> = existing.embedding.clone();
+
+            for (col_idx, value) in assignments {
+                if Some(*col_idx) == vector_idx {
+                    match value {
+                        crate::row_codec::Value::Vector(v) => embedding_value = v.clone(),
+                        _ => {
+                            return Err(dml_write_err(CatalogError::Invalid(
+                                "VECTOR column SET value must be a vector".to_string(),
+                            )))
+                        }
+                    }
+                } else {
+                    let slot = merged_values.get_mut(*col_idx).ok_or_else(|| {
+                        CatalogError::Invalid(
+                            "internal: SET target column index out of range".to_string(),
+                        )
+                    });
+                    let slot = slot.map_err(dml_write_err)?;
+                    *slot = value.clone();
+                }
+            }
+
+            schema
+                .validate_embedding_dim(embedding_value.len())
+                .map_err(dml_write_err)?;
+            let metadata = crate::row_codec::encode_scalar_columns(&schema, &merged_values)
+                .map_err(|e| CatalogError::Invalid(e.to_string()))
+                .map_err(dml_write_err)?;
+            let row = RowInput {
+                tenant_id: ctx.tenant_id(),
+                // 既存行の可視性を保持する（SET で触れない列と同じ扱い）。
+                visibility: existing.visibility,
+                embedding: &embedding_value,
+                metadata: &metadata,
+            };
+            let encoded = encode_row(&row).map_err(dml_write_err)?;
+            row_table
+                .insert(key, encoded.as_slice())
+                .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+        }
+    }
+
+    let rows_affected = candidate_ids.len();
+    if rows_affected > 0 {
+        crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(dml_write_err)?;
+    }
+    crate::recovery::commit_boundary::commit(write_txn).map_err(dml_write_err)?;
+    Ok(PredicateDmlOutcome::Applied { rows_affected })
+}
+
 pub(crate) fn truncate_table_unchecked(
     storage: &Storage,
     table: &str,
