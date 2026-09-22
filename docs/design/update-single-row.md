@@ -195,21 +195,38 @@ detail 文言（`"{op} rejected: invalid row"`）に操作名を埋め込む。U
 （`MAX_SCALAR_PAYLOAD_LEN / n_text_columns` 等）は INSERT 側の許容値にも
 影響する契約変更でありオーナー判断が要るため、引き続き対象外とする。
 
-代わりに、`update_row_columns_unchecked` を「物理行が存在する（TABLE-12 の
+一時、`update_row_columns_unchecked` を「物理行が存在する（TABLE-12 の
 名前空間キーで取得できる）ことのみを条件に、RLS 可視性を問わずマージ・
 再エンコードを必ず実行し、実際に書き込むかどうかだけを `is_owner && is_visible`
-で決める」設計へ変更した。これにより、同一の実データ（同一 id・同一 SET 値・
-同一の既存未変更列）に対する応答は可視・不可視のいずれでも同一になり、
-RLS 可視性を分岐点にした推測経路は閉じる（`tenant::tests::
-update_row_columns_overflow_from_unchanged_column_is_identical_regardless_of_rls_visibility`
+で決める」設計へ変更したが、これは「可視・不可視の応答差」を閉じる代わりに
+「不可視な既存行」と「不存在な id」の応答差（`22000`／`XX000` と `UPDATE 0`）
+という**別種の漏えい**を生んでいた（codex-review P0 再指摘・PR #989 再々指摘・
+`crates/engine/src/tenant.rs:1750`）。可視性の狭いセッションが、対象 id が
+「不存在」なのか「不可視だが存在し、かつ内容依存で大きい／壊れている」のかを
+エラー種別から区別でき、不可視行の存在・内容状態を推測できてしまうため、
+security.md「テナント境界（RLS 相当）の弱体化」に抵触する。
+
+**判断 D 再改訂**: 内容依存の処理（`scan_scalar_columns`・
+`merge_encode_scalar_columns`。超過判定・デコード失敗を含む）は
+`is_owner && is_visible`（実際に書き込む対象）を満たす行に対してのみ実行する
+設計へ戻した（`update_row_unchecked`・`delete_row_unchecked` と同じ「所有・
+可視でない対象は探索直後に打ち切り、内容には一切触れない」設計に揃える）。
+これにより「可視な大きな既存行は `22000`、同じ SET 値を不可視な既存行へ
+送っても不存在と同じ `UPDATE 0`」となり、可視・不可視の応答差は解消される
+一方、「不可視な既存行」と「不存在な id」はいずれも `UPDATE 0`・内容無参照で
+完全に同一になる（`tenant::tests::
+update_row_columns_overflow_from_unchanged_column_is_rejected_only_when_visible_and_invisible_matches_not_found`
 で固定）。TABLE-12 の名前空間キー（`key = (ctx.tenant_id(), id)`）により
 他テナントの行はこのキーで物理的に取得できないため、「他テナント所有 id」が
-この経路で混入することは構造的に起こらない。残る唯一の観測差は「対象行が
-（可視性を問わず）物理的に存在するか否か」であり、これは全行置換 API
-（`update_row_unchecked`・`delete_row_unchecked`）が `is_owner` 単独判定で
-既に持っている「対象の有無で応答が分岐する」性質と同型の、部分マージを伴う
-書き込み API 一般に内在する限界であって RLS 可視性やテナント境界の越境では
-ない（可視性の異なる 2 セッションが同一の観測を得る）。
+この経路で混入することは構造的に起こらない。残る唯一の観測差は「対象 id が
+`is_owner && is_visible`（実際に書き込む対象）を満たす既存行かどうか」であり、
+「不存在」「他テナント所有」「所有だが RLS 不可視」はいずれも `UPDATE 0`・
+内容無参照で区別なく扱われる。これは全行置換 API（`update_row_unchecked`・
+`delete_row_unchecked`）が `is_owner` 単独判定で既に持っている「対象の有無で
+応答が分岐する」性質と同型の、部分マージを伴う書き込み API 一般に内在する
+限界であって RLS 可視性やテナント境界の越境ではない（可視性の異なる 2
+セッションが同一 id へ同一 SET 値を送っても、対象行が RLS 不可視である限り
+双方とも `UPDATE 0`・内容無参照で同一の観測を得る）。
 
 あわせて、部分 UPDATE の実装（codex-review P1 指摘・PR #989 再指摘）は
 `decode_scalar_columns`（対象行の全 `TEXT` 列を `Value::Text` へ複製）ではなく
