@@ -2707,7 +2707,12 @@ pub fn execute_delete_returning(
         Some(schema),
         Some(&mut project),
     )
-    .map_err(map_insert_write_error)?;
+    // [`execute_delete`]（RETURNING なし）と同じ `"delete"` 語彙で写像する
+    // （Cursor Bugbot Low 指摘・PR #991）。本関数は DELETE の実行であり、
+    // `map_insert_write_error`（固定文言 `"insert"`）を使うと束縛後のスキーマ
+    // 変更・捕捉行デコード失敗・ストレージエラー等の一般的な書き込み失敗で
+    // 「insert rejected」という誤った操作名がクライアントへ返っていた。
+    .map_err(|e| map_write_error(e, "delete"))?;
 
     let rows_affected = match outcome {
         crate::tenant::DeleteRowOutcome::Deleted => 1,
