@@ -68,8 +68,11 @@ const COMMIT_BOUNDARY_MODULE_FILE: &str = "recovery/commit_boundary.rs";
 const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #849（`Storage::begin_write_txn` choke point 追加）で `Storage::put`/
     // `Storage::put_batch` の行番号が移動したための追随（旧: 553／584）。
-    ("storage.rs", 648),
-    ("storage.rs", 679),
+    // Issue #865（PR #989 マージ）で `MAX_METADATA_LEN` のドキュメンテーション
+    // コメントが `pub(crate)` 化に伴い増量し、行番号がさらに移動したための追随
+    // （旧: 648／679）。
+    ("storage.rs", 652),
+    ("storage.rs", 683),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 191),
     ("txn.rs", 362),

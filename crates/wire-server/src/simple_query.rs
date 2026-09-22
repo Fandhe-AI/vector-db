@@ -257,10 +257,12 @@ pub(crate) fn execute_and_respond(
                 "failed to encode command complete response",
             ),
         },
-        // SQL-19（TASK-192、Issue #871）: 述語つき `UPDATE`（`exec::UpdateOutcome::
-        // rows_affected` は自テナント所有・一致行の更新件数を保持する。`sql/exec.rs`
-        // ドキュメント参照）の応答を pg 互換の `CommandComplete` タグ
-        // `UPDATE <rows>`（PostgreSQL の `UPDATE` タグに準拠）へ整形する。
+        // `UPDATE`（単一行・id 指定形。SQL-17・TASK-191、Issue #865。述語形。
+        // SQL-19・TASK-192、Issue #871。`exec::UpdateOutcome::rows_affected` は
+        // いずれの形式でも自テナント所有・一致行の更新件数を保持する。
+        // `sql/exec.rs` ドキュメント参照）の応答を pg 互換の `CommandComplete`
+        // タグ `UPDATE <rows>`（PostgreSQL の `UPDATE` タグに準拠。`INSERT` の
+        // `<oid> <rows>` と異なり OID フィールドを持たない）へ整形する。
         // `DELETE <rows>` と同じ設計。
         Ok(SqlOutcome::Update(outcome)) => match result_encoder::encode_command_complete(&format!(
             "UPDATE {}",

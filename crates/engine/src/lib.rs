@@ -104,6 +104,14 @@
 //! 昇格しない。機械検証は `tests/tenant_breach.rs`（詳細は `tenant.rs` モジュール
 //! ドキュメント参照）。
 //!
+//! Issue #865（対象ビヘイビア: SQL-17・TASK-191）: SQL 表層 `UPDATE <table> SET
+//! <col> = <lit>[, ...] WHERE id = <n> USING OPERATION_ID '<id>'`（部分更新・
+//! 単一行）を `tenant::update_row_columns_unchecked`（`update_row_unchecked` と
+//! 同一の書き込みプリミティブを共有する列指定の書き込み入口。read-merge-write を
+//! 単一 write トランザクション内で行う）へ結線した。0 行更新でも台帳記録・
+//! テーブル世代進行・commit を必ず行う非対称設計を含め、詳細は
+//! `docs/design/update-single-row.md` 参照。
+//!
 //! TASK-89/TASK-95（対象ビヘイビア: TABLE-12, RLS-9）: 行 `id` の一意性スコープは
 //! テナント内であり、行ストア（`catalog.rs` の `user_rows/{table}`）の物理キーを
 //! `(tenant_id, id)` で名前空間化する（`catalog.rs::user_rows_table_def`）。

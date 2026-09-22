@@ -185,10 +185,16 @@ fn new_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
-/// 42601（unsupported_sql_syntax）: `UPDATE` は許可リストに存在しない statement
-/// 種別のため拒否される（TASK-82 で `INSERT` は受理するようになったため
-/// （`crate::simple_query` モジュールコメント参照）、本ケースは許可リスト外の
-/// 別 statement 種別へ差し替えた）。
+/// 42601（unsupported_sql_syntax）: `UPDATE` は Issue #865（SQL-17・TASK-191。
+/// 単一行・`id` 完全一致形）・Issue #871（SQL-19・TASK-192。述語形）で
+/// 実行結線されたため、構造として正しい `UPDATE` 文（`USING OPERATION_ID` 付き）
+/// は許可リスト外の statement 種別としては拒否されなくなった（この点は本ケースが
+/// 元々検証していた「許可リストに存在しない statement 種別」の対象から外れた）。
+/// `SET id = ...`（疑似列の書き換え）は `sql::parser::bind_update` が構造上受理
+/// しない形として引き続き `42601` を返す契約（`crates/engine/tests/
+/// sql_update_single_row.rs::set_id_is_rejected_as_unsupported_syntax` が確定
+/// オラクル）のため、本ケースはそちらへ差し替えて `42601` 分類の wire 経由確認を
+/// 維持する。
 #[test]
 fn err1_update_returns_42601_fields() {
     let (core, _guard) = new_core_with_docs_table();
@@ -196,16 +202,16 @@ fn err1_update_returns_42601_fields() {
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
-    // Issue #871: `UPDATE` の覗き見判定が `validate_update_form_tokens`
-    // （単一行・述語形の双方を受理）へ切り替わったため、`operation_id` 必須化
-    // ガード（TASK-92・RECOVER-1・`23502`）より先にこの入力が拒否されるよう
-    // `USING OPERATION_ID` を付与する（`docs/design/predicate-dml-exec.md`
-    // 「PR #989 との整合ルール」参照）。単一行・`id` 完全一致形の実行結線は
-    // 本 Issue（#871）の対象外のため `EngineCore::execute_predicate_update_form`
-    // が `42601`（許可形状外。Issue #865 の担当）で拒否する。
+    // `operation_id` 必須化ガード（TASK-92・RECOVER-1・`23502`）より先に
+    // このケースが検証したい `42601`（`SET id = ...` の構造拒否）へ到達させる
+    // ため `USING OPERATION_ID` を付与する。単一行・述語形いずれの
+    // `ValidatedUpdateForm` 経由でも `sql::parser::bind_update` の疑似列拒否は
+    // 変わらない（Issue #871 で `EngineCore::execute_predicate_update_form` の
+    // `Single` 腕が実行結線に切り替わった後も本ケースの `42601` は
+    // `bind_update` 由来のまま）。
     send_simple_query(
         &mut stream,
-        "UPDATE docs SET id = 2 WHERE id = 1 USING OPERATION_ID 'wire-err1-update-1'",
+        "UPDATE docs SET id = 2 WHERE id = 1 USING OPERATION_ID 'err1-update-set-id'",
     );
 
     assert_error_response(&mut stream, "42601");

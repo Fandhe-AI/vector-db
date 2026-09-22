@@ -2234,15 +2234,18 @@ impl EngineCore {
                 return Ok(crate::sql::SqlOutcome::Delete(outcome));
             }
 
-            // SQL-19（TASK-192、Issue #869・#871）: 述語形 `UPDATE ... WHERE`
-            // を覗き見判定する。単一行・`id` 完全一致形（SQL-17）の実行結線は
-            // 本 Issue（#871）の対象外——`ValidatedUpdateForm::Single` 腕は
-            // `Self::execute_predicate_update_form` 内で `42601`（単一行 `UPDATE`
-            // の実行結線は Issue #865 の担当）へ拒否する
-            // （`docs/design/predicate-dml-exec.md`「PR #989 との整合ルール」参照）。
-            // `EXPLAIN UPDATE ...` は先頭トークンが `UPDATE` ではなく `EXPLAIN`
-            // になるためここでは捕捉されず、`DELETE`・`TRUNCATE` と同じ経路で
-            // `42601` へ流れる。
+            // SQL-17（Issue #865・TASK-191。単一行・id 完全一致形）・SQL-19
+            // （TASK-192、Issue #869・#871。述語形 `UPDATE ... WHERE`）:
+            // `INSERT`・`TRUNCATE`・`DELETE` と同じ設計で `UPDATE` を覗き見判定
+            // する。単一行・述語形の両方を構造的に受理する
+            // `validate_update_form_tokens` へ一本化し、
+            // [`crate::sql::allowlist::ValidatedUpdateForm`] の variant で実行
+            // 本体を [`Self::execute_predicate_update_form`] 内で振り分ける
+            // （`Single` 腕は Issue #865 の単一行実行結線・`Predicate` 腕は
+            // Issue #871 の述語形実行結線。`docs/design/predicate-dml-exec.md`
+            // 「PR #989 との整合ルール」参照）。`EXPLAIN UPDATE ...` は先頭
+            // トークンが `UPDATE` ではなく `EXPLAIN` になるためここでは捕捉
+            // されず、`DELETE`・`TRUNCATE` と同じ経路で `42601` へ流れる。
             let is_update_statement = matches!(
                 tokens.first(),
                 Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("UPDATE")
@@ -4038,17 +4041,90 @@ impl EngineCore {
         )
     }
 
+    /// SQL 表層の単一 UPDATE 文実行エントリポイント（Issue #865、対象ビヘイビア:
+    /// SQL-17・TASK-191）。`execute_insert_sql` と同じ構造（`execute_sql`（TASK-75、
+    /// SELECT 専用）とは独立した固有メソッド。`VectorCore` trait への昇格は行わない）。
+    ///
+    /// `sql::allowlist::validate_update`（構造検証。文末専用句
+    /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
+    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
+    /// RECOVER-1）→ [`Self::execute_update_form`]（束縛・実行本体）の順に呼ぶ。
+    ///
+    /// このエントリポイントは単一行・`id` 完全一致形専用のまま残す
+    /// （`sql::allowlist::validate_update`・[`crate::sql::allowlist::ValidatedUpdate`]
+    /// を経由）。述語形（SQL-19）を含む両形式のディスパッチは
+    /// [`Self::execute_sql_in_session`] の `UPDATE` 分岐・
+    /// [`Self::execute_predicate_update_form`] が担う。
+    pub fn execute_update_sql(
+        &self,
+        ctx: &PolicyContext,
+        sql: &str,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // `execute_insert_sql` と同じく `InsertSchemaLookup` を `validate_update` へ
+        // 渡し、`table_exists` が取得したスキーマを `take_schema` で再利用する
+        // ことで、1 文あたりのスキーマ取得を 1 回へ減らす。
+        let lookup = InsertSchemaLookup::new(&self.storage);
+        let stmt = crate::sql::allowlist::validate_update(sql, &lookup, self.ledger_mode)?;
+        self.execute_update_form(ctx, &stmt, &lookup)
+    }
+
+    /// [`Self::execute_update_sql`] の単一行 UPDATE 分岐が使う束縛〜実行本体
+    /// （`execute_insert_form` と同じ設計）。`validate_update`／
+    /// `validate_update_tokens` が返した `stmt` と、その検証時に使った `lookup`
+    /// （`table_exists` 呼び出しでスキーマをキャッシュ済み）を受け取り、
+    /// [`InsertSchemaLookup::take_schema`] でスキーマを再取得できればそれを使い、
+    /// できなければ `get_table_schema` 単独呼び出しへ fail-closed にフォール
+    /// バックする。
+    ///
+    /// [`Self::execute_sql_in_session`] 経由（`validate_update_form_tokens` が
+    /// 単一行・述語形の双方を受理する）の単一行 UPDATE は、スキーマを
+    /// `InsertSchemaLookup` ではなく [`Self::execute_predicate_update_form`] が
+    /// 直接取得するため本メソッドを経由しない
+    /// （`crate::sql::exec::execute_update_with_schema` を直接呼ぶ）。
+    fn execute_update_form(
+        &self,
+        ctx: &PolicyContext,
+        stmt: &crate::sql::allowlist::ValidatedUpdate,
+        lookup: &InsertSchemaLookup<'_>,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let schema = match lookup.take_schema(&stmt.table_name) {
+            Some(schema) => schema,
+            None => self
+                .storage
+                .get_table_schema(&stmt.table_name)
+                .map_err(|e| match e {
+                    CatalogError::TableNotFound(name) => {
+                        crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                    }
+                    _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "failed to load table schema".to_string(),
+                    },
+                })?,
+        };
+        let bound = crate::sql::parser::bind_update(stmt, &schema)?;
+        crate::sql::exec::execute_update_with_schema(
+            &self.storage,
+            ctx,
+            &bound,
+            self.ledger_mode,
+            Some(&schema),
+        )
+    }
+
     /// [`Self::execute_sql_in_session`] の `UPDATE` 分岐が呼ぶ実行本体
-    /// （SQL-19・TASK-192、Issue #871）。単一行・`id` 完全一致形（SQL-17）の
-    /// 実行結線は本 Issue の対象外のため、`ValidatedUpdateForm::Single` 腕は
-    /// `42601`（許可形状外）で拒否する——`sql::allowlist::validate_update_form`
-    /// 自体は単一行・述語形の双方を構造的に受理するが、単一行形の実行結線は
-    /// Issue #865（並行 PR #989）の担当であり、本メソッドがそれを横取りしない
-    /// （`docs/design/predicate-dml-exec.md`「PR #989 との整合ルール」参照。
-    /// PR #989 マージ後は `Single` 腕をその実行結線へ差し替えること）。
-    /// `Predicate` 腕は [`Self::execute_predicate_delete_form`] と同じ手順
-    /// （スキーマ取得 → 束縛 → 内容照合ハッシュ計算 →
-    /// [`crate::sql::exec::execute_predicate_update`]）で実行する。
+    /// （SQL-17・TASK-191、Issue #865 の単一行 `id` 完全一致形と、SQL-19・
+    /// TASK-192、Issue #871 の述語形の両方を扱う）。
+    /// `sql::allowlist::validate_update_form` 自体は単一行・述語形の双方を
+    /// 構造的に受理するため、本メソッドが [`crate::sql::parser::BoundUpdateForm`]
+    /// の variant で実行本体を振り分ける（`Single` 腕は
+    /// [`crate::sql::exec::execute_update_with_schema`]（PR #989 の単一行実行
+    /// 結線と同一の実行本体。`docs/design/predicate-dml-exec.md`「PR #989 との
+    /// 整合ルール」参照）、`Predicate` 腕は本メソッド内で内容照合ハッシュ
+    /// （RECOVER-11）を計算したうえで [`crate::sql::exec::execute_predicate_update`]
+    /// へ委譲する。[`Self::execute_predicate_delete_form`] と同じ手順
+    /// （スキーマ取得 → 束縛 → （述語形のみ）内容照合ハッシュ計算 → 実行本体）
+    /// で実行する。
     fn execute_predicate_update_form(
         &self,
         ctx: &PolicyContext,
@@ -4074,10 +4150,14 @@ impl EngineCore {
             })?;
         let bound_form = crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?;
         let predicate = match bound_form {
-            crate::sql::parser::BoundUpdateForm::Single(_) => {
-                return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
-                    "single-row UPDATE (WHERE id = <n>) execution is not wired yet (Issue #865)",
-                ))
+            crate::sql::parser::BoundUpdateForm::Single(bound) => {
+                return crate::sql::exec::execute_update_with_schema(
+                    &self.storage,
+                    ctx,
+                    &bound,
+                    self.ledger_mode,
+                    Some(&schema),
+                );
             }
             crate::sql::parser::BoundUpdateForm::Predicate(bound) => bound,
         };
@@ -4109,6 +4189,7 @@ impl EngineCore {
         )
     }
 
+    /// SQL 表層のバッチ INSERT 実行エントリポイント（TASK-122、対象ビヘイビア:
     /// SQL 表層のバッチ INSERT 実行エントリポイント（TASK-122、対象ビヘイビア:
     /// INDEX-4）。[`Self::execute_insert_sql`] の複数ファイル版で、複数ファイルを
     /// 1 バッチとして受け取る engine ローカル API の入口（1 文 = 1 ファイルの

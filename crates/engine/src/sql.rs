@@ -179,6 +179,10 @@ pub use visible_cache::VisibleBitmapCacheStats;
 /// **TASK-191（SQL-18・#867）で追加した破壊的変更（BREAKING CHANGE）**: `Delete`
 /// variant を追加した（既存の網羅的 `match` はワイルドカードアームの追加が
 /// 必要）。
+///
+/// **Issue #865（SQL-17・TASK-191）で追加した破壊的変更（BREAKING CHANGE）**:
+/// `Update` variant を追加した（既存の網羅的 `match` はワイルドカードアームの
+/// 追加が必要）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlOutcome {
     Query(exec::QueryResult),
@@ -212,15 +216,18 @@ pub enum SqlOutcome {
     /// variant はその [`exec::DeleteOutcome`] をそのまま運ぶ薄いラッパー
     /// （`Insert`・`Truncate` と同じ設計）。
     Delete(exec::DeleteOutcome),
-    /// `UPDATE <table> SET ... WHERE ... USING OPERATION_ID '<id>'`（述語形。
-    /// SQL-19・TASK-192、Issue #871）がセッション経由の実行経路で成功したことを
-    /// 示す応答。検証・実行本体は
+    /// `UPDATE` がセッション経由の実行経路で成功したことを示す応答。単一行・
+    /// `id` 完全一致形（`UPDATE <table> SET <col> = <lit>[, ...] WHERE id = <n>
+    /// USING OPERATION_ID '<id>'`。SQL-17・TASK-191、Issue #865）は
+    /// [`crate::core::EngineCore::execute_update_sql`] に、述語形
+    /// （`UPDATE <table> SET ... WHERE ... USING OPERATION_ID '<id>'`。
+    /// SQL-19・TASK-192、Issue #871）は
     /// [`crate::core::EngineCore::execute_sql_in_session`] の `UPDATE` 分岐に
-    /// 委譲しており、本 variant はその [`exec::UpdateOutcome`] をそのまま運ぶ
-    /// 薄いラッパー（`Delete` と同じ設計）。単一行・`id` 完全一致形（SQL-17）の
-    /// 実行結線は本 variant 導入時点（#871）では対象外（Issue #865）。
+    /// それぞれ委譲しており、本 variant はいずれの場合もその
+    /// [`exec::UpdateOutcome`] をそのまま運ぶ薄いラッパー（`Insert`・
+    /// `Truncate`・`Delete` と同じ設計）。
     ///
-    /// **BREAKING CHANGE**（Issue #871）: 本 variant の追加により `SqlOutcome`
+    /// **BREAKING CHANGE**（Issue #865）: 本 variant の追加により `SqlOutcome`
     /// を網羅的にマッチする既存コード（`crate::core::EngineCore`・
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
