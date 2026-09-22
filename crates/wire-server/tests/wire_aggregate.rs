@@ -31,20 +31,23 @@ use engine::storage::{RowInput, Storage, Visibility};
 use common::*;
 
 /// `docs(embedding VECTOR(2), lang TEXT)` を持つ `EngineCore` を新設し、
-/// 3 テナントそれぞれの Public 行 1 件（可視集合 = {1,2,3}）に加え、
-/// wire 越しには不可視な Private 行 2 件（tenant-a: id=11／tenant-b: id=12）を
-/// 投入する。`"xx"` は Private 行にしか存在しない `lang` 値で、`GROUP BY` の
-/// グループ値から他テナントの Private 行の存在が漏れないことの対照に使う。
+/// 3 テナントそれぞれの Public 行 1 件（常に可視 = {1,2,3}）に加え、
+/// `Private` 行 2 件（tenant-a: id=11／tenant-b: id=12）を投入する。
+/// `Private` 行は各行の所有テナント自身には wire 越しにも可視（RLS-11・
+/// TASK-195。read-your-writes）で、他テナントには不可視のまま。`"xx"` は
+/// `Private` 行にしか存在しない `lang` 値で、`GROUP BY` のグループ値から
+/// 他テナントの `Private` 行の存在が漏れないことの対照に使う。
 ///
 /// 独立オラクル（手計算・固定値。`crates/engine/src/sql/aggregate.rs`・
-/// `group_by.rs` の実装を読み直して再計算しない）。可視行（Public のみ、
-/// wire 認証経路の `PolicyContext` は Public のみ許可）:
+/// `group_by.rs` の実装を読み直して再計算しない）。alice（tenant-a）の可視行
+/// （Public 3 件 + 自テナント Private 1 件。wire 認証経路の `PolicyContext` は
+/// `Public` ＋ 自テナント `Private` を許可）:
 /// id=1 (tenant-a, [1,0], "ja") / id=2 (tenant-b, [0,1], "en") /
-/// id=3 (tenant-c, [-1,0], "ja")。
-/// `COUNT(*)=3`・`SUM(id)=6`・`AVG(id)=2`・`MIN(id)=1`・`MAX(id)=3`・
-/// `MIN(lang)="en"`・`MAX(lang)="ja"`・各ノルムが 1 のため
-/// `SUM(vec_norm(embedding))=3`。`GROUP BY lang` → `en:(n=1,s=2)`,
-/// `ja:(n=2,s=4)`（キー昇順）。
+/// id=3 (tenant-c, [-1,0], "ja") / id=11 (tenant-a, [1,0], "xx")。
+/// `COUNT(*)=4`・`SUM(id)=17`・`AVG(id)=4.25`・`MIN(id)=1`・`MAX(id)=11`・
+/// `MIN(lang)="en"`・`MAX(lang)="xx"`・各ノルムが 1 のため
+/// `SUM(vec_norm(embedding))=4`。`GROUP BY lang` → `en:(n=1,s=2)`,
+/// `ja:(n=2,s=4)`, `xx:(n=1,s=11)`（キー昇順）。
 fn new_core_aggregate_docs() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("wire-aggregate-docs");
     let guard = temp_db::CleanupGuard(path.clone());
@@ -139,14 +142,14 @@ fn sql13_single_row_aggregates_are_returned_as_text_columns_over_wire() {
     );
     let row = read_data_row(&mut stream);
     let expected: Vec<Option<&str>> = vec![
-        Some("3"),
-        Some("3"),
-        Some("6"),
-        Some("2"),
+        Some("4"),
+        Some("4"),
+        Some("17"),
+        Some("4.25"),
         Some("1"),
-        Some("3"),
+        Some("11"),
         Some("en"),
-        Some("ja"),
+        Some("xx"),
     ];
     let actual: Vec<Option<&str>> = row.iter().map(|c| c.as_deref()).collect();
     assert_eq!(actual, expected);
@@ -158,7 +161,7 @@ fn sql13_single_row_aggregates_are_returned_as_text_columns_over_wire() {
     let columns = read_row_description(&mut stream);
     assert_eq!(columns, vec!["count"]);
     let row = read_data_row(&mut stream);
-    assert_eq!(row[0].as_deref(), Some("3"));
+    assert_eq!(row[0].as_deref(), Some("4"));
     assert_eq!(read_command_complete(&mut stream), "SELECT 1");
     read_ready_for_query(&mut stream);
 }
@@ -185,7 +188,7 @@ fn sql13_where_filter_and_scalar_expression_aggregate() {
     );
     let _columns = read_row_description(&mut stream);
     let row = read_data_row(&mut stream);
-    assert_eq!(row[0].as_deref(), Some("3"));
+    assert_eq!(row[0].as_deref(), Some("4"));
     assert_eq!(read_command_complete(&mut stream), "SELECT 1");
     read_ready_for_query(&mut stream);
 }
@@ -222,7 +225,7 @@ fn sql14_group_by_default_order_having_order_by_limit() {
     let columns = read_row_description(&mut stream);
     assert_eq!(columns, vec!["lang", "n", "s"]);
     let mut rows = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..3 {
         let row = read_data_row(&mut stream);
         rows.push(
             row.iter()
@@ -233,10 +236,10 @@ fn sql14_group_by_default_order_having_order_by_limit() {
     }
     assert_eq!(
         rows,
-        vec!["en|1|2", "ja|2|4"],
-        "groups must be key-ascending"
+        vec!["en|1|2", "ja|2|4", "xx|1|11"],
+        "groups must be key-ascending (own-tenant Private row forms its own \"xx\" group)"
     );
-    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
+    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
     read_ready_for_query(&mut stream);
 
     send_simple_query(
@@ -261,12 +264,13 @@ fn sql14_group_by_default_order_having_order_by_limit() {
     read_ready_for_query(&mut stream);
 }
 
-/// RLS-7・RLS-8: `COUNT(*)`・`GROUP BY` のグループ集合が他テナントの Private
-/// 行の存在・件数を漏らさない。さらに、既存接続へ tenant-a の Private 行
-/// （`lang="xx"`）を大量追加した前後で結果が不変であることを確認する
-/// （`crates/engine/tests/sql_aggregate.rs`
-/// `sql13_rls_count_is_invariant_to_other_tenants_private_rows` と同じ手順を
-/// wire 越しに再現する）。
+/// RLS-7・RLS-8・RLS-11（TASK-195）: `COUNT(*)`・`GROUP BY` のグループ集合が
+/// 他テナントの `Private` 行の存在・件数を漏らさない一方、自テナントの
+/// `Private` 行（read-your-writes）は含めて集計されること。さらに、既存接続へ
+/// tenant-a の `Private` 行（`lang="xx"`）を大量追加した前後で、他テナント
+/// （bob）から見た結果が不変であることを確認する（`crates/engine/tests/
+/// sql_aggregate.rs::sql13_rls_count_is_invariant_to_other_tenants_private_rows`
+/// と同じ手順を wire 越しに再現する）。
 #[test]
 fn rls_count_and_groups_never_reveal_other_tenants_private_rows() {
     let (core, _guard) = new_core_aggregate_docs();
@@ -277,17 +281,26 @@ fn rls_count_and_groups_never_reveal_other_tenants_private_rows() {
     ]);
     let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
 
-    for (user, pw) in [
-        ("alice", "pw-alice"),
-        ("bob", "pw-bob"),
-        ("carol", "pw-carol"),
+    // alice（tenant-a）・bob（tenant-b）は自テナントの Private 行（id=11／
+    // id=12、いずれも lang="xx"）を持つため可視行 4 件・3 グループ
+    // （en/ja/xx）。carol（tenant-c）は自テナントの Private 行を持たないため
+    // 可視行 3 件・2 グループ（en/ja）のまま。いずれのテナントも他テナントの
+    // Private 行は不可視のまま。
+    for (user, pw, expected_count, expected_groups) in [
+        ("alice", "pw-alice", "4", &["en", "ja", "xx"][..]),
+        ("bob", "pw-bob", "4", &["en", "ja", "xx"][..]),
+        ("carol", "pw-carol", "3", &["en", "ja"][..]),
     ] {
         let mut stream = authenticate_to_ready_for_query(addr, user, pw);
 
         send_simple_query(&mut stream, "SELECT COUNT(*) AS n FROM docs");
         let _columns = read_row_description(&mut stream);
         let row = read_data_row(&mut stream);
-        assert_eq!(row[0].as_deref(), Some("3"), "COUNT(*) for user {user}");
+        assert_eq!(
+            row[0].as_deref(),
+            Some(expected_count),
+            "COUNT(*) for user {user}"
+        );
         assert_eq!(read_command_complete(&mut stream), "SELECT 1");
         read_ready_for_query(&mut stream);
 
@@ -299,7 +312,7 @@ fn rls_count_and_groups_never_reveal_other_tenants_private_rows() {
         let row = read_data_row(&mut stream);
         assert_eq!(
             row[0].as_deref(),
-            Some("3"),
+            Some(expected_count),
             "COUNT(*) WHERE visible() for user {user}"
         );
         assert_eq!(read_command_complete(&mut stream), "SELECT 1");
@@ -311,22 +324,28 @@ fn rls_count_and_groups_never_reveal_other_tenants_private_rows() {
         );
         let _columns = read_row_description(&mut stream);
         let mut rows = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..expected_groups.len() {
             let row = read_data_row(&mut stream);
             rows.push(row[0].clone().expect("lang must not be NULL"));
         }
         assert_eq!(
             rows,
-            vec!["en".to_string(), "ja".to_string()],
-            "GROUP BY lang must not surface the Private-only \"xx\" group for user {user}"
+            expected_groups
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "GROUP BY lang must not surface other tenants' Private-only groups for user {user}"
         );
-        assert_eq!(read_command_complete(&mut stream), "SELECT 2");
+        assert_eq!(
+            read_command_complete(&mut stream),
+            format!("SELECT {}", expected_groups.len())
+        );
         read_ready_for_query(&mut stream);
     }
 
-    // tenant-a の Private 行（lang="xx"）を 50 件追加してから再クエリし、
-    // COUNT(*)・GROUP BY の結果が不変であることを確認する（他テナントの
-    // 存在・件数が集計値から推測できないことの検証）。
+    // tenant-a の Private 行（lang="xx"）を 50 件追加してから bob として
+    // 再クエリし、COUNT(*)・GROUP BY の結果が不変であることを確認する（他
+    // テナントの存在・件数が集計値から推測できないことの検証）。
     let writer_ctx =
         PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
             .expect("valid tenant");
@@ -362,13 +381,16 @@ fn rls_count_and_groups_never_reveal_other_tenants_private_rows() {
         .expect("insert additional private row");
     }
 
+    // bob（tenant-b）は自テナントの Private 行 1 件（id=12）を含め可視行 4 件・
+    // 3 グループ（en/ja/xx）のまま不変（tenant-a への 50 件追加は bob からは
+    // 見えない）。
     let mut stream_bob = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
     send_simple_query(&mut stream_bob, "SELECT COUNT(*) AS n FROM docs");
     let _columns = read_row_description(&mut stream_bob);
     let row = read_data_row(&mut stream_bob);
     assert_eq!(
         row[0].as_deref(),
-        Some("3"),
+        Some("4"),
         "COUNT(*) must stay invariant after adding 50 private rows to another tenant"
     );
     assert_eq!(read_command_complete(&mut stream_bob), "SELECT 1");
@@ -380,16 +402,16 @@ fn rls_count_and_groups_never_reveal_other_tenants_private_rows() {
     );
     let _columns = read_row_description(&mut stream_bob);
     let mut rows = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..3 {
         let row = read_data_row(&mut stream_bob);
         rows.push(row[0].clone().expect("lang must not be NULL"));
     }
     assert_eq!(
         rows,
-        vec!["en".to_string(), "ja".to_string()],
+        vec!["en".to_string(), "ja".to_string(), "xx".to_string()],
         "GROUP BY must stay invariant after adding 50 private rows to another tenant"
     );
-    assert_eq!(read_command_complete(&mut stream_bob), "SELECT 2");
+    assert_eq!(read_command_complete(&mut stream_bob), "SELECT 3");
     read_ready_for_query(&mut stream_bob);
 }
 
@@ -420,7 +442,7 @@ fn sql_aggregate_rejections_are_fail_closed_and_connection_survives() {
     send_simple_query(&mut stream, "SELECT COUNT(*) AS n FROM docs");
     let _columns = read_row_description(&mut stream);
     let row = read_data_row(&mut stream);
-    assert_eq!(row[0].as_deref(), Some("3"));
+    assert_eq!(row[0].as_deref(), Some("4"));
     assert_eq!(read_command_complete(&mut stream), "SELECT 1");
     read_ready_for_query(&mut stream);
 }
