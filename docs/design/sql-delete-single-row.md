@@ -51,40 +51,61 @@ Issue #864）・束縛（`sql::parser::BoundDelete`・`bind_delete`。Issue #864
 `CommandComplete` タグ `DELETE <rows_affected>`（`INSERT 0 <rows>` と同じ設計）へ
 写像する（`wire-server::simple_query`）。
 
-## 0 行成功への写像と台帳非記録（安全側の設計判断）
+## 0 行成功への写像と台帳記録（#983 で訂正・codex-review P1 指摘）
 
-`tenant::delete_row_unchecked` は「対象行が不存在」と「対象行が存在するが他テナント
-所有」を **区別せず** `TenantWriteError::NotFound` を返す契約（TASK-95・RECOVER-4。
-`tenant.rs` モジュールドキュメント参照。既存の Rust API 契約であり本 Issue では変更
-しない）。`sql::exec::execute_delete` はこの `NotFound` を **エラーとして伝播せず**
-`Ok(DeleteOutcome { rows_affected: 0 })` へ写像する（`map_insert_write_error` の `_`
-アーム〔`XX000`〕には渡さない）。
+`tenant::delete_row_ledgered_unchecked`（SQL 表層専用。`tenant::delete_row_unchecked`
+とは別関数）は「対象行が不存在」と「対象行が存在するが他テナント所有」を **区別せず**
+`DeleteRowOutcome::NotFound` を返す契約（TASK-95・RECOVER-4。`tenant.rs` モジュール
+ドキュメント参照）。`sql::exec::execute_delete` はこれを **エラーとして伝播せず**
+`Ok(DeleteOutcome { rows_affected: 0 })` へ写像する。
 
-`NotFound` の場合、`delete_row_unchecked` 内の write トランザクションは早期 `return`
-により commit されず破棄されるため、**台帳への tentative 追記・テーブル世代の進行は
-いずれも発生しない**。これは `TRUNCATE`（0 件でも必ず台帳記録・世代進行が発生する
-非対称設計。`truncate-table.md` 参照）とは意図的に非対称になっている。
+当初（#867 マージ時点）は `NotFound` の場合に write トランザクションを commit せず
+破棄する設計だった（台帳への tentative 追記・テーブル世代の進行がいずれも発生しない）。
+しかしこの設計には再送安全性違反があった: 0 行成功として応答した `operation_id` が
+台帳に一切記録されないため、その後対象 `id` へ新規 INSERT が行われ、通信断等で
+同じ `operation_id` が再送されると、2 回目は実際に行が存在し実削除が発生してしまう
+（codex-review P1 指摘・PR #983。再現: (1) 未存在／他テナント所有 id への DELETE
+`op=X` が 0 行成功 → (2) 対象 id へ INSERT → (3) 通信断等で `op=X` を再送 →
+(4) 旧実装では今度は実削除される）。
+
+修正後（#983）は `NotFound` でも台帳への tentative 追記を同一トランザクションで
+**commit する**（`TRUNCATE` の「0 件でも必ず台帳記録」契約と同じ考え方。
+`truncate-table.md` 参照。ただしテーブル世代は進行させない——対象行が変化して
+いないため「キャッシュ失効」節の契約は変更しない）。この commit により、同一
+`operation_id` の再送は台帳照合（TASK-101・RECOVER-10）で
+`DuplicateOperationId`（同一 `id` への再送・`23505`）／
+`OperationIdContentMismatch`（異なる `id` への再送・`22023`）のいずれかへ確定的に
+収束し、実削除は発生しない。`sql_delete_single_row.rs::
+delete_resending_a_0_row_operation_id_after_the_target_id_is_inserted_does_not_delete_it`
+が上記再現シナリオの回帰を固定する。
 
 判断根拠:
 
 1. 他テナント保持 id・未存在 id のいずれでも、成否・件数・`wire_code`・文言・副作用が
-   完全に同一になる（RLS-9・RLS-10。テナント存在情報の非漏えい）。
-2. `delete_row_unchecked`（TASK-95）の既存 Rust API 契約（`recover4_*` テスト群が
-   固定する「不存在と他テナント所有を区別しない」契約）を変更しない。
-3. 0 行 DELETE の再送は台帳非記録のため、同一 `operation_id` を再送しても常に同じ
-   0 行成功へ収束する（冪等）——`23505` にならない（`TRUNCATE` の 0 件時とは異なる
-   選択だが、`DELETE` は「対象が無ければ何もしない」操作として自然な冪等性を保つ）。
+   完全に同一になる（RLS-9・RLS-10。テナント存在情報の非漏えい）。この応答同一性は
+   台帳記録の有無を変更しても維持される。
+2. `tenant::delete_row_unchecked`（TASK-95・Rust API・`recover4_*` テスト群が固定する
+   「不存在と他テナント所有を区別しない」契約）は変更しない。同テストは同一
+   `operation_id` を 4 回（update ×2・delete ×2）使い回すため、`NotFound` 時に台帳を
+   commit すると 2 回目以降が `DuplicateOperationId`／`OperationIdContentMismatch` へ
+   変わってしまう。この制約により、SQL 表層専用の `delete_row_ledgered_unchecked` を
+   別関数として追加し（`delete_row_impl` を共有本体として抽出）、Rust API 側の契約は
+   変更していない。
+3. 0 行 DELETE の再送は台帳記録される（再送安全性を優先し、冪等な no-op ではなく
+   `23505`／`22023` として明示的に拒否する。`TRUNCATE` の 0 件時と同じ選択）。
 
-**#865（UPDATE 実行結線）への申し送り**: 同じ判断（0 件時の台帳非記録）を UPDATE 側
-でも揃えるかどうかは #865 側の実装判断として委ねる。`update_row_unchecked` も同じ
-「不存在／他テナント所有を区別しない `NotFound`」契約を持つため、対称的な設計に
-揃えることが自然だと考えられる。
+**#865（UPDATE 実行結線）への申し送り**: `update_row_unchecked` も同じ「不存在／
+他テナント所有を区別しない `NotFound`」契約を持つ。#865 が UPDATE を SQL 表層へ
+結線する際は、本 Issue（#983）と同じ再送安全性違反が生じないよう、`NotFound` でも
+台帳を commit する設計（`delete_row_ledgered_unchecked` と同じパターン）を最初から
+採用することを推奨する。
 
 ## 台帳照合の優先順位（RECOVER-4・RECOVER-10）
 
-`delete_row_unchecked` は台帳照合（内容一致／不一致判定）を所有権判定
-（`owns_existing`）より **前** に行う（TASK-101・RECOVER-10。`tenant.rs` ドキュメント
-参照）。`content_hash::for_delete(id)` は削除対象 `id` のみを内容とするため、
+`delete_row_ledgered_unchecked`（および Rust API 側の `delete_row_unchecked`）は
+台帳照合（内容一致／不一致判定）を所有権判定（`owns_existing`）より **前** に行う
+（TASK-101・RECOVER-10。`tenant.rs` ドキュメント参照）。`content_hash::for_delete(id)`
+は削除対象 `id` のみを内容とするため、
 
 - 使用済み `operation_id` を **同一 `id`** へ再送 → 内容一致 → `23505`
   （対象行は既に削除済みで `NotFound` になり得る状態だが、台帳照合が先に働くため
@@ -98,8 +119,9 @@ delete_resending_used_operation_id_hits_ledger_before_ownership_check` が固定
 
 ## 削除スコープ: 「所有（`is_owner`）」（`TRUNCATE` と同じ、可視性とは独立）
 
-`delete_row_unchecked` の判定は `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の
-二重防御であり、RLS 可視性（`is_visible`）ではない。`TRUNCATE` と同じ「テナント所有」
+`delete_row_ledgered_unchecked` の判定は `(tenant_id, id)` キー（TABLE-12）＋
+`is_owner` の二重防御であり、RLS 可視性（`is_visible`）ではない。`TRUNCATE` と同じ
+「テナント所有」
 スコープをそのまま採用する（他テナントの `Public` 行は可視でも所有でないため削除
 不能 → 0 行成功）。
 

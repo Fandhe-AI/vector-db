@@ -234,16 +234,101 @@ fn delete_response_is_identical_for_other_tenant_row_and_nonexistent_id() {
     }
     assert_eq!(outcome_other_tenant, outcome_nonexistent);
 
-    // 0 行 DELETE は台帳へ記録されない（#867 設計判断）ため、同一 operation_id
-    // を再送しても再び同じ 0 行成功になる（23505 にならない）。
-    let outcome_other_tenant_resend = core
+    // 0 行 DELETE でも台帳へ commit される（codex-review P1 指摘・PR #983 対応。
+    // `tenant::delete_row_ledgered_unchecked` ドキュメント参照）ため、同一 id
+    // への再送は内容一致で `23505` になる（0 行成功の再現ではない）。
+    let err_same_id_resend = core
         .execute_sql_in_session(
             &alice,
             &mut session,
             &format!("DELETE FROM {TABLE} WHERE id = 7 USING OPERATION_ID 'op-other-tenant'"),
         )
-        .expect("resending a 0-row DELETE's operation_id must succeed identically (not 23505)");
-    assert_eq!(outcome_other_tenant, outcome_other_tenant_resend);
+        .expect_err(
+            "resending a 0-row DELETE's operation_id against the same id must be a duplicate",
+        );
+    assert_eq!(err_same_id_resend.wire_code(), "23505");
+
+    // 異なる id への再送は内容不一致で `22023`（他テナント保持 id・未存在 id の
+    // 両方で応答が完全に一致し、存在情報を漏らさない。RLS-9・RLS-10）。
+    let err_other_tenant_id_mismatch = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!("DELETE FROM {TABLE} WHERE id = 999 USING OPERATION_ID 'op-other-tenant'"),
+        )
+        .expect_err("resending against a different id must mismatch on content");
+    assert_eq!(err_other_tenant_id_mismatch.wire_code(), "22023");
+}
+
+/// codex-review P1 指摘（PR #983）の再現シナリオの回帰: 0 行 DELETE の
+/// `operation_id` を、対象 `id` へ後から INSERT した後に再送しても、実削除
+/// ではなく台帳照合による `23505`（同一内容）で拒否される。
+///
+/// (a) alice 自身のテナント内で対象 id が未存在 → 後から同じ id へ INSERT。
+/// (b) 対象 id が他テナント（bob）保持 → 後から alice 自身が同じ id へ
+///     INSERT（TABLE-12: id はテナント内スコープのため許可される）。
+/// いずれも再送は `23505` で拒否され、新規に作られた行は無傷のまま残る。
+#[test]
+fn delete_resending_a_0_row_operation_id_after_the_target_id_is_inserted_does_not_delete_it() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    insert_row(&core, &bob, TABLE, 7, "bob body", "7");
+
+    let mut session = SessionState::default();
+
+    // (a) 未存在 id（999）への 0 行 DELETE。
+    let outcome = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!("DELETE FROM {TABLE} WHERE id = 999 USING OPERATION_ID 'op-replay-a'"),
+        )
+        .expect("DELETE against a nonexistent id must succeed as a 0-row no-op");
+    match outcome {
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 0),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
+    // 通信断等で対象 id へ新規 INSERT が行われた後の再送。
+    insert_row(&core, &alice, TABLE, 999, "alice new body", "999");
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!("DELETE FROM {TABLE} WHERE id = 999 USING OPERATION_ID 'op-replay-a'"),
+        )
+        .expect_err("resend after the target id now exists must not silently delete it");
+    assert_eq!(err.wire_code(), "23505");
+    // 新規に挿入した行は無傷のまま残る。
+    assert_eq!(count_star(&core, &alice, TABLE), 1);
+
+    // (b) 他テナント（bob）保持 id（7）への 0 行 DELETE。
+    let outcome = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!("DELETE FROM {TABLE} WHERE id = 7 USING OPERATION_ID 'op-replay-b'"),
+        )
+        .expect("DELETE against another tenant's row must succeed as a 0-row no-op");
+    match outcome {
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 0),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
+    // alice 自身が同じ id（7）へ INSERT（TABLE-12: テナント内スコープのため
+    // bob の行 7 とは独立に成功する）。
+    insert_row(&core, &alice, TABLE, 7, "alice body", "7");
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            &format!("DELETE FROM {TABLE} WHERE id = 7 USING OPERATION_ID 'op-replay-b'"),
+        )
+        .expect_err("resend after alice inserts her own id=7 must not silently delete it");
+    assert_eq!(err.wire_code(), "23505");
+    // alice の新規行・bob の行の双方が無傷のまま残る。
+    assert_eq!(count_star(&core, &alice, TABLE), 2);
+    assert_eq!(count_star(&core, &bob, TABLE), 1);
 }
 
 /// RECOVER-4・RECOVER-10 の優先順位: 使用済み `operation_id` を再送すると、

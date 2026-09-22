@@ -1160,14 +1160,21 @@ pub fn delete_row(
 
 /// [`delete_row`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と同じ
 /// 設計）。呼び出し元は本モジュール内の [`delete_row`]・
-/// `crate::core::EngineCore::delete_row`（`self.ledger_mode` でガード済み）に加え、
+/// `crate::core::EngineCore::delete_row`（`self.ledger_mode` でガード済み）。
+///
+/// 対象行が不存在／他テナント所有（`NotFound`）の場合は台帳への tentative
+/// 追記を**破棄**する（[`DeleteNotFoundLedger::Discard`]。`write_txn` が
+/// commit されないため副作用は残らない）。この「不存在と他テナント所有を
+/// 区別しない」Rust API 契約は `recover4_cross_tenant_update_and_delete_are_
+/// uniformly_not_found`（`tests/row_id_tenant_scope.rs`）が固定するため変更
+/// しない——同テストは同一 `operation_id`（`"test-op"`）を 4 回（update ×2・
+/// delete ×2）使い回しており、NotFound 時に台帳を commit すると 2 回目以降が
+/// `DuplicateOperationId`／`OperationIdContentMismatch` へ変わってしまう。
+///
 /// SQL 表層 `DELETE FROM <table> WHERE id = <n> USING OPERATION_ID '<id>'`
-/// （SQL-18・TASK-191・#867）の唯一の到達経路 `crate::sql::exec::execute_delete`
-/// （`core.rs::EngineCore::execute_delete_sql`／`execute_sql_in_session` の
-/// `DELETE` 分岐から呼ばれる）。`execute_delete` は本関数が返す `NotFound`
-/// （対象行が不存在／他テナント所有のいずれかを区別しない契約）を SQL 表層の
-/// エラーとして伝播せず `0` 行成功へ写像する（`docs/design/
-/// sql-delete-single-row.md` 参照。この写像は本関数の契約自体には影響しない）。
+/// （SQL-18・TASK-191・#867）の唯一の到達経路は本関数ではなく
+/// [`delete_row_ledgered_unchecked`]（`NotFound` でも台帳を commit する版。
+/// codex-review P1 指摘・PR #983 対応。詳細は同関数のドキュメント参照）。
 ///
 /// `ledger`（TASK-93・RECOVER-2、TASK-94・RECOVER-3、TASK-101・RECOVER-10）:
 /// [`update_row_unchecked`] と同じく、台帳照合・追記を所有権判定（`owns_existing`）
@@ -1177,12 +1184,6 @@ pub fn delete_row(
 /// 返すと、この正当な重複再送がハッシュ一致による再送検知（`DuplicateOperationId`・
 /// `23505`）ではなく `NotFound` として観測され、RECOVER-3 の「同一 `operation_id` の
 /// 2 回目以降は重複として拒否する」契約を壊す（codex-review P1 指摘・PR #247）。
-/// 台帳照合を先に行うことで、「未使用の `operation_id` で対象行が不存在」の通常
-/// ケースは `NotFound` のまま維持しつつ（台帳への tentative 追記はこの後の早期
-/// `return` で `write_txn` が commit されず破棄されるため、副作用として残らない）、
-/// 「使用済みの `operation_id` を対象行削除後に再送」のケースを
-/// `DuplicateOperationId`（内容一致）・`OperationIdContentMismatch`（内容不一致）
-/// として区別する。
 pub(crate) fn delete_row_unchecked(
     storage: &Storage,
     table: &str,
@@ -1190,9 +1191,61 @@ pub(crate) fn delete_row_unchecked(
     id: u64,
     ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
+    match delete_row_impl(
+        storage,
+        table,
+        ctx,
+        id,
+        ledger_write,
+        DeleteNotFoundLedger::Discard,
+    )? {
+        DeleteRowOutcome::Deleted => Ok(()),
+        DeleteRowOutcome::NotFound => Err(TenantWriteError::NotFound),
+    }
+}
+
+/// [`delete_row_impl`] の成功時の結果（対象行を実際に削除できたか）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteRowOutcome {
+    /// 対象行を削除した（テーブル世代も進行させた）。
+    Deleted,
+    /// 対象行が不存在、または他テナント所有だった（`owns_existing == false`）。
+    NotFound,
+}
+
+/// [`delete_row_impl`] が `NotFound`（`owns_existing == false`）の場合に
+/// 台帳への tentative 追記をどう扱うかの選択（codex-review P1 指摘・PR #983。
+/// 元は [`delete_row_unchecked`] 1 本だったが、SQL 表層専用の
+/// [`delete_row_ledgered_unchecked`] を追加する際に分岐を抽出した）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteNotFoundLedger {
+    /// 台帳追記を破棄する（`write_txn` を commit しない）。[`delete_row_unchecked`]
+    /// （Rust API・`recover4_*` テストが固定する既存契約）が使う。
+    Discard,
+    /// 台帳追記を commit する（テーブル世代は進行させない）。
+    /// [`delete_row_ledgered_unchecked`]（SQL 表層専用）が使う。
+    Record,
+}
+
+/// [`delete_row_unchecked`]・[`delete_row_ledgered_unchecked`] が共有する実体。
+/// `not_found_ledger` で `NotFound` 時の台帳追記の扱いのみを分岐する
+/// （それ以外の判定順序・二重防御はいずれのモードでも同一）。
+///
+/// `ledger`（TASK-93・RECOVER-2、TASK-94・RECOVER-3、TASK-101・RECOVER-10）:
+/// 台帳照合・追記を所有権判定（`owns_existing`）より**前**に行う（両モード共通。
+/// [`delete_row_unchecked`]・[`delete_row_ledgered_unchecked`] のドキュメント
+/// 参照）。
+fn delete_row_impl(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    ledger_write: LedgerWrite<'_>,
+    not_found_ledger: DeleteNotFoundLedger,
+) -> Result<DeleteRowOutcome, TenantWriteError> {
     validate_identifier(table)?;
     let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
-    {
+    let owns_existing = {
         // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
         // `insert_row`/`update_row` と同じ前段を通す。
         require_table_schema_write(&write_txn, table)?;
@@ -1221,14 +1274,72 @@ pub(crate) fn delete_row_unchecked(
             }
             None => false,
         };
-        if !owns_existing {
+        if owns_existing {
+            row_table.remove(&key).map_err(CatalogError::from)?;
+        } else if not_found_ledger == DeleteNotFoundLedger::Discard {
+            // 台帳への tentative 追記はこの早期 `return` により `write_txn` が
+            // commit されず破棄されるため、副作用として残らない
+            // （[`delete_row_unchecked`] のドキュメント参照）。
             return Err(TenantWriteError::NotFound);
         }
-        row_table.remove(&key).map_err(CatalogError::from)?;
+        owns_existing
+    };
+    if owns_existing {
+        crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     }
-    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
+    // `Record` モードで `owns_existing == false` の場合もここへ到達し commit
+    // する（台帳の tentative 追記のみを確定させる。テーブル世代は進行させない
+    // ため既存のキャッシュ失効契約に影響しない）。
     crate::recovery::commit_boundary::commit(write_txn)?;
-    Ok(())
+    Ok(if owns_existing {
+        DeleteRowOutcome::Deleted
+    } else {
+        DeleteRowOutcome::NotFound
+    })
+}
+
+/// SQL 表層 `DELETE FROM <table> WHERE id = <n> USING OPERATION_ID '<id>'`
+/// （SQL-18・TASK-191・#867）の唯一の到達経路 `crate::sql::exec::execute_delete`
+/// （`core.rs::EngineCore::execute_delete_sql`／`execute_sql_in_session` の
+/// `DELETE` 分岐から呼ばれる）専用のガードなし実体。
+///
+/// [`delete_row_unchecked`] との違いは `NotFound`（対象行が不存在／他テナント
+/// 所有。いずれも区別しない）の場合の台帳の扱いのみ: 本関数は `NotFound` でも
+/// 台帳への tentative 追記を同一トランザクションで **commit する**
+/// （[`truncate_table_unchecked`] の「0 件でも必ず台帳記録」契約と同じ考え方。
+/// テーブル世代は進行させない——対象行が変化していないため既存のキャッシュ
+/// 失効契約はそのまま維持する）。
+///
+/// この commit により、`execute_delete` が `NotFound` を `0` 行成功へ写像した
+/// 後でも、同一 `operation_id` の再送は台帳照合（TASK-101・RECOVER-10）で
+/// `DuplicateOperationId`（同一 `id` への再送・`23505`）／
+/// `OperationIdContentMismatch`（異なる `id` への再送・`22023`）のいずれかへ
+/// 確定的に収束する。旧実装（[`delete_row_unchecked`] を流用し `NotFound` は
+/// 台帳を commit しない設計）では、0 行 DELETE の `operation_id` を台帳が一切
+/// 覚えていなかったため、後から対象 `id` が INSERT され、通信断等で同じ
+/// `operation_id` が再送されると、2 回目は実際に行が存在し実削除が発生して
+/// しまう再送安全性違反があった（codex-review P1 指摘・PR #983。
+/// `docs/design/sql-delete-single-row.md`「台帳記録（NotFound を含む。#983 で
+/// 修正）」節参照）。
+///
+/// [`delete_row_unchecked`]（Rust API・`recover4_*` テストが固定する既存契約。
+/// `NotFound` は台帳を commit しない）とは意図的に別関数とし、その呼び出し元
+/// （`delete_row`・`EngineCore::delete_row`）の挙動は変更しない。
+pub(crate) fn delete_row_ledgered_unchecked(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    ledger_write: LedgerWrite<'_>,
+) -> Result<DeleteRowOutcome, TenantWriteError> {
+    delete_row_impl(
+        storage,
+        table,
+        ctx,
+        id,
+        ledger_write,
+        DeleteNotFoundLedger::Record,
+    )
 }
 
 /// SQL 表層 `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`（SQL-22、TASK-195）

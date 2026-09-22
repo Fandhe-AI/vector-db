@@ -2549,22 +2549,26 @@ pub fn execute_truncate(
 /// SQL 表層 `DELETE FROM <table> WHERE id = <n> USING OPERATION_ID '<id>'`
 /// （SQL-18、TASK-191、#867）の実行入口。`bound`（`sql::parser::bind_delete`
 /// 束縛済み）の `operation_id` を `ledger_mode` で台帳書き込み指示へ解決してから
-/// [`crate::tenant::delete_row_unchecked`] へ委譲する（[`execute_insert`]・
+/// [`crate::tenant::delete_row_ledgered_unchecked`] へ委譲する（[`execute_insert`]・
 /// [`execute_truncate`] と同じ設計）。
 ///
-/// **0 行成功への写像（#867 設計判断・安全側）**: `delete_row_unchecked` は
+/// **0 行成功への写像（RLS-9・RLS-10）**: `delete_row_ledgered_unchecked` は
 /// 「対象行が不存在」と「対象行が存在するが他テナント所有」を区別せず
-/// [`crate::tenant::TenantWriteError::NotFound`] を返す契約（`tenant.rs`
-/// ドキュメント参照。RLS-9・RLS-10）。本関数はこの `NotFound` を
-/// エラーとして伝播せず `Ok(DeleteOutcome { rows_affected: 0 })` へ写像する
-/// （`map_insert_write_error` の `_` アーム〔`XX000`〕には渡さない。他テナント
-/// 保持 id・未存在 id のいずれでも成否・件数・`wire_code`・文言・副作用が完全に
-/// 同一になるため、これらのケースを応答から区別できない）。`NotFound` の場合
-/// `delete_row_unchecked` 内の write トランザクションは早期 `return` により
-/// commit されず破棄されるため、台帳への tentative 追記・テーブル世代の進行は
-/// いずれも発生しない（`TRUNCATE` の「0 件でも必ず台帳記録・世代進行」契約とは
-/// 意図的に非対称。`tenant::delete_row_unchecked` の既存 Rust API 契約
-/// （`recover4_*` テスト群）を変更しないための設計判断）。
+/// [`crate::tenant::DeleteRowOutcome::NotFound`] を返す契約（`tenant.rs`
+/// ドキュメント参照）。本関数はこれを `Ok(DeleteOutcome { rows_affected: 0 })`
+/// へ写像する。他テナント保持 id・未存在 id のいずれでも成否・件数・
+/// `wire_code`・文言・副作用が完全に同一になるため、これらのケースを応答から
+/// 区別できない。
+///
+/// **台帳記録（`NotFound` を含む。codex-review P1 指摘・PR #983 対応）**:
+/// `delete_row_ledgered_unchecked` は `NotFound` の場合でも台帳への tentative
+/// 追記を同一トランザクションで commit する（テーブル世代は進行させない）。
+/// これにより、0 行成功として応答した `operation_id` を後から実在する `id`
+/// （新規 INSERT 後）へ再送しても、台帳照合（TASK-101・RECOVER-10）が
+/// `DuplicateOperationId`（`23505`）／`OperationIdContentMismatch`（`22023`）
+/// のいずれかとして検出し、意図しない実削除を防ぐ（`docs/design/
+/// sql-delete-single-row.md` 参照。旧実装は `delete_row_unchecked` を流用し
+/// `NotFound` で台帳を commit しなかったため、この再送安全性違反があった）。
 ///
 /// `LedgerMode::Ledgered`（既定）で `operation_id` が `None` の場合は `resolve` が
 /// `Err` を返し [`SqlSurfaceError::MissingOperationId`]（`23502`）へ写像される——
@@ -2581,9 +2585,15 @@ pub fn execute_delete(
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
-    match crate::tenant::delete_row_unchecked(storage, &bound.table, ctx, bound.id, ledger_write) {
-        Ok(()) => Ok(DeleteOutcome { rows_affected: 1 }),
-        Err(crate::tenant::TenantWriteError::NotFound) => Ok(DeleteOutcome { rows_affected: 0 }),
+    match crate::tenant::delete_row_ledgered_unchecked(
+        storage,
+        &bound.table,
+        ctx,
+        bound.id,
+        ledger_write,
+    ) {
+        Ok(crate::tenant::DeleteRowOutcome::Deleted) => Ok(DeleteOutcome { rows_affected: 1 }),
+        Ok(crate::tenant::DeleteRowOutcome::NotFound) => Ok(DeleteOutcome { rows_affected: 0 }),
         Err(e) => Err(map_insert_write_error(e)),
     }
 }
