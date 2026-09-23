@@ -2199,17 +2199,22 @@ fn apply_nosql_dml_step(
 /// `stop_and_drain`（`sql_seen`／`nosql_seen`／`db_s_nosql_seen`／
 /// `db_n_sql_seen`）が返す生 stderr にもそれぞれ適用する
 /// （codex-review 指摘・PR #994）。
-fn assert_dml_scenario_no_leak(haystack: &str, tokens: &[&str]) {
+fn assert_dml_scenario_no_leak(source: &str, haystack: &str, tokens: &[&str]) {
+    // 検査対象の生文字列（`haystack`）には実セッショントークン・実パスワード
+    // が含まれ得るため、失敗時のパニックメッセージへは検査対象そのものを
+    // 埋め込まない。`source`（呼び出し元が識別する非機密なラベル。例:
+    // "sql_seen"）だけを出力し、CI ログへ秘密値が再出力されるのを防ぐ
+    // （codex-review P0 指摘・PR #994）。
     for secret in ["alice", "bob", "pw-alice", "pw-bob", "tenant-a", "tenant-b"] {
         assert!(
             !haystack.contains(secret),
-            "must not leak {secret:?}: {haystack:?}"
+            "must not leak a credential/tenant identifier in {source} (value redacted)"
         );
     }
     for token in tokens {
         assert!(
             !haystack.contains(token),
-            "must not leak session token: {haystack:?}"
+            "must not leak a session token in {source} (value redacted)"
         );
     }
 }
@@ -2262,7 +2267,7 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
     // codex-review 指摘（PR #994）: `[e2e-record]` だけでなく各 stop_and_drain
     // が返す生 stderr にも機密値の非漏えい検査を適用する。この時点ではまだ
     // セッショントークンを発行していないため tokens は空。
-    assert_dml_scenario_no_leak(&sql_seen.join("\n"), &[]);
+    assert_dml_scenario_no_leak("sql_seen", &sql_seen.join("\n"), &[]);
 
     // --- Phase 2: 同一内容で複製した DB-N を NoSQL 表層で駆動し、同じ手順を
     //     `client` で適用する。
@@ -2384,6 +2389,7 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
         "expected nosql surface banner in stderr, got: {nosql_seen:?}"
     );
     assert_dml_scenario_no_leak(
+        "nosql_seen",
         &nosql_seen.join("\n"),
         &[alice_token.as_str(), bob_token.as_str()],
     );
@@ -2445,6 +2451,7 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
         "expected nosql surface banner in stderr, got: {db_s_nosql_seen:?}"
     );
     assert_dml_scenario_no_leak(
+        "db_s_nosql_seen",
         &db_s_nosql_seen.join("\n"),
         &[
             alice_token.as_str(),
@@ -2476,6 +2483,7 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
         "SQL surface must not print the nosql surface banner: {db_n_sql_seen:?}"
     );
     assert_dml_scenario_no_leak(
+        "db_n_sql_seen",
         &db_n_sql_seen.join("\n"),
         &[
             alice_token.as_str(),
@@ -2514,6 +2522,7 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
     // DB-F／DB-M（SQL 表層）はセッショントークンを発行しないため、この
     // 時点までに発行済みの NoSQL トークンのみを対象に検査する。
     assert_dml_scenario_no_leak(
+        "db_f_sql_seen",
         &db_f_sql_seen.join("\n"),
         &[
             alice_token.as_str(),
@@ -2522,6 +2531,7 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
         ],
     );
     assert_dml_scenario_no_leak(
+        "db_m_sql_seen",
         &db_m_sql_seen.join("\n"),
         &[
             alice_token.as_str(),
@@ -2569,6 +2579,7 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
     );
     let db_f2_nosql_seen = db_f2_nosql.stop_and_drain(Instant::now() + Duration::from_secs(5));
     assert_dml_scenario_no_leak(
+        "db_f2_nosql_seen",
         &db_f2_nosql_seen.join("\n"),
         &[
             alice_token.as_str(),
@@ -2604,6 +2615,7 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
     );
     let db_m2_nosql_seen = db_m2_nosql.stop_and_drain(Instant::now() + Duration::from_secs(5));
     assert_dml_scenario_no_leak(
+        "db_m2_nosql_seen",
         &db_m2_nosql_seen.join("\n"),
         &[
             alice_token.as_str(),
@@ -2634,7 +2646,7 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
         label = client.label(),
         n = DML_STEPS.len(),
     );
-    assert_dml_scenario_no_leak(&record, &issued_tokens);
+    assert_dml_scenario_no_leak("record", &record, &issued_tokens);
     eprintln!("{record}");
 }
 
