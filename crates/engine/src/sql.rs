@@ -129,6 +129,7 @@ pub mod lexer;
 pub mod mode;
 pub mod parser;
 pub mod plan;
+pub mod returning;
 pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
 pub mod scan;
@@ -180,6 +181,10 @@ pub use visible_cache::VisibleBitmapCacheStats;
 /// variant を追加した（既存の網羅的 `match` はワイルドカードアームの追加が
 /// 必要）。
 ///
+/// **Issue #873（SQL-21）で追加した破壊的変更（BREAKING CHANGE）**: `Returning`
+/// variant を追加した（既存の網羅的 `match` はワイルドカードアームの追加が
+/// 必要）。
+///
 /// **Issue #865（SQL-17・TASK-191）で追加した破壊的変更（BREAKING CHANGE）**:
 /// `Update` variant を追加した（既存の網羅的 `match` はワイルドカードアームの
 /// 追加が必要）。
@@ -216,6 +221,17 @@ pub enum SqlOutcome {
     /// variant はその [`exec::DeleteOutcome`] をそのまま運ぶ薄いラッパー
     /// （`Insert`・`Truncate` と同じ設計）。
     Delete(exec::DeleteOutcome),
+    /// `RETURNING` 句（Issue #873・SQL-21）付きの `INSERT`／`DELETE` がセッション
+    /// 経由の実行経路で成功したことを示す応答。`INSERT`／`DELETE` 単独の
+    /// `Insert`／`Delete` variant とは別 variant として保持する
+    /// （`RowDescription` を伴う応答形が異なるため。`wire-server::simple_query`
+    /// は `result` から `RowDescription`／`DataRow`* を、`command`・
+    /// `rows_affected` から `CommandComplete` タグ〔`INSERT 0 <n>`／
+    /// `DELETE <n>`／`UPDATE <n>`〕を組み立てる）。検証・実行本体は
+    /// [`exec::execute_insert_returning`]／[`exec::execute_delete_returning`]
+    /// に委譲しており、本 variant はその [`exec::ReturningOutcome`] をそのまま
+    /// 運ぶ薄いラッパー（`Insert`・`Delete` と同じ設計）。
+    Returning(exec::ReturningOutcome),
     /// `UPDATE` がセッション経由の実行経路で成功したことを示す応答。単一行・
     /// `id` 完全一致形（`UPDATE <table> SET <col> = <lit>[, ...] WHERE id = <n>
     /// USING OPERATION_ID '<id>'`。SQL-17・TASK-191、Issue #865）は

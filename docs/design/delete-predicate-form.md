@@ -72,7 +72,8 @@ DELETE FROM <table> WHERE <predicates> USING OPERATION_ID '<id>'
 | `WHERE id = 1 AND lang = 'ja'` | 述語形 | `DeleteStatement::Predicate`（宣言順 2 件） |
 | `WHERE visible()` | 述語形 | `DeleteStatement::Predicate`（`PredicateCall`。受理して無視。下記参照） |
 | `WHERE` 省略 | — | `42601`（全行削除の意図は `TRUNCATE TABLE` の管轄） |
-| `... HINT ORDER(...)` / `ORDER BY ...` / `LIMIT ...` / `USING MODE ...` / `RETURNING ...` | — | `42601`（許可形状外の余剰トークン） |
+| `... HINT ORDER(...)` / `ORDER BY ...` / `LIMIT ...` / `USING MODE ...` | — | `42601`（許可形状外の余剰トークン） |
+| `... RETURNING ...`（述語形） | — | `42601`（構造上は受理するが、実行結線〔#871〕が未着手のため `validate_delete_statement_tokens` の `Predicate` 腕が単一のチョークポイントで拒否する。単一行形は実行結線済みのため受理する——Issue #873・SQL-21・`docs/design/sql-returning.md` 参照） |
 | `WHERE ... OR ...` | — | `42601`（`OR` 非対応） |
 | `EXPLAIN DELETE ...` | — | `42601`（`EXPLAIN` は `SELECT` 系専用） |
 
@@ -121,5 +122,8 @@ DELETE FROM <table> WHERE <predicates> USING OPERATION_ID '<id>'
 - `core.rs::execute_sql_in_session` への `validate_delete_statement_tokens` dispatch:
   Issue #867（単一行）・#871（述語形）
 - NoSQL 表層 `delete` op（`BoundPredicateDelete::new` の利用）: Issue #875・#876
-- `EXPLAIN DELETE`・`RETURNING`（Issue #873 の管轄）・`OR`／括弧付き述語
-  （SQL-24 拡張述語）は本 Issue では `42601` のまま
+- `EXPLAIN DELETE`・`OR`／括弧付き述語（SQL-24 拡張述語）は本 Issue では
+  `42601` のまま。`RETURNING`（Issue #873・SQL-21）は述語形の実行結線
+  （#871）が未着手のため引き続き `42601`（チョークポイントの実装自体は
+  `sql::allowlist::validate_delete_statement_tokens` に追加済み。上記
+  「受理・拒否の一覧」参照）

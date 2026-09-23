@@ -126,26 +126,36 @@ limit)`、`UPDATE` 側は `MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows(cou
 `crates/engine/src/sql/parser.rs`。値はいずれも 1,000）。両者の統合は本 Issue の対
 象外のまま。
 
-## 7. PR #989（#865 単一行 UPDATE 実行結線）との整合ルール
+## 7. PR #989（#865 単一行 UPDATE 実行結線）・PR #991（RETURNING）との整合ルール
 
 実装開始時点（origin/main `b790abd`）で PR #989（単一行 `id` 完全一致形 UPDATE の
 実行結線）・PR #991（`RETURNING`）はいずれも未マージ（OPEN）だったため、本 Issue
-は「PR #989 未マージ」の経路（計画 §4.6-B）で実装した:
+は当初「PR #989 未マージ」の経路（計画 §4.6-B）で実装した。その後 origin/main への
+追随（PR #989・PR #991 の順にマージ済み）により、本ブランチは両 PR の定義をそのまま
+再利用する形へ整合させた:
 
-- `core.rs::execute_predicate_update_form` は `bind_update_form` の戻り値
-  （`BoundUpdateForm`）の `Single` 腕を `42601`（許可形状外。「単一行 UPDATE の実行
-  結線は #865」文言）で拒否する。`Predicate` 腕のみ実行する。
 - `exec::UpdateOutcome { rows_affected: u64 }`・`SqlOutcome::Update
-  (exec::UpdateOutcome)`・`simple_query.rs` の `UPDATE <n>` アームは本 Issue が
-  導入した。PR #989 がリベース後にマージされる場合は、本 Issue が導入したこれら
-  の定義をそのまま再利用し、`Single` 腕の `42601` 拒否をその実行結線へ差し替える
-  こと。
-- `SqlOutcome::Update` の追加は **BREAKING CHANGE**（既存の網羅的 `match` 3 箇所
-  〔`core.rs`〕・1 箇所〔`simple_query.rs`〕を更新済み）。
+  (exec::UpdateOutcome)`・`simple_query.rs` の `UPDATE <n>` アームは PR #989
+  （#865）が導入した定義をそのまま再利用する（本 Issue が独自に導入していた
+  同名定義は PR #989 マージ時に置き換え済み）。`core.rs::execute_sql_in_session`
+  の `UPDATE` 分岐は `bind_update_form` の戻り値（`BoundUpdateForm`）を
+  `Single` 腕（PR #989 の `execute_update_with_schema` へ委譲）・`Predicate`
+  腕（本 Issue の `execute_predicate_update_form` へ委譲）へ振り分ける。
+- `SqlOutcome::Update` の追加は PR #989 で **BREAKING CHANGE** として導入済み。
+  本 Issue はこの型を変更しない。
+- `DELETE` は `crate::sql::allowlist::DeleteStatement`（`SingleRow`／
+  `Predicate`）で振り分ける。`SingleRow` 腕はさらに `RETURNING`（PR #991・
+  Issue #873）の有無で `execute_delete_returning_form`（PR #991 導入）／
+  `execute_delete_form`（既存）へ分岐し、`Predicate` 腕は常に
+  `execute_predicate_delete_form`（本 Issue）へ委譲する。述語形 DELETE／UPDATE
+  と `RETURNING` の組合せは、構造検証段（`sql::allowlist::
+  validate_delete_statement_tokens`／`validate_update_form_tokens`）が
+  `RETURNING` 併用を `42601` で拒否するため、実行結線側では到達しない
+  （PR #991 が導入した契約をそのまま維持）。
 - `crates/wire-server/tests/wire_error_response.rs::err1_update_returns_42601_fields`
   の入力へ `USING OPERATION_ID` を付与した（`validate_update_form_tokens` が
   `operation_id` 必須化ガードを構造検証の直後に行うため、欠落時は `42601` ではなく
-  `23502` になる。この変更は PR #989 が予定する変更と同型）。
+  `23502` になる。この変更は PR #989 で正式に取り込み済み）。
 
 ## 8. テスト
 
@@ -168,7 +178,6 @@ limit)`、`UPDATE` 側は `MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows(cou
 ## 9. 申し送り・スコープ外
 
 - NoSQL `update`／`delete` op の束縛・結線（#876）・SQL/NoSQL パリティ（#877）。
-- `RETURNING`（#873・PR #991）との統合。
 - 上限 API（§6）の統合・既定値の確定（オーナー判断）。
 - ADR #868 の承認・spec 側 RECOVER-11 の確定化（オーナー作業）。
 - `WasmUdfBackend` への安定な定義識別子の追加（wasmtime 接続時）。

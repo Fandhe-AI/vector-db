@@ -139,11 +139,19 @@ pub fn check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError>; // 
 
 ## 構文上の余剰トークンの扱い
 
-`HINT ORDER(...)`・`USING MODE '...'`・`ORDER BY ...`・`LIMIT n`・`RETURNING ...`・
-複数テーブル指定・サブクエリはいずれも `parse_update` の文法に存在しないため、
+`HINT ORDER(...)`・`USING MODE '...'`・`ORDER BY ...`・`LIMIT n`・複数テーブル
+指定・サブクエリはいずれも `parse_update` の文法に存在しないため、
 `expect_end_of_statement` が余剰トークンとして構造的に `42601` へ落とす（述語形
 でも id 指定形でも同じ経路。個別の拒否コードを持たない）。結合テストで両形状に
 対して固定している。
+
+`RETURNING <投影>`（Issue #873・SQL-21）は `parse_update` の文法上は
+`USING OPERATION_ID` 句の直前に受理できるが、`UPDATE` の実行結線（#865）が
+未着手のため `validate_update_tokens`／`validate_update_form_tokens` が
+`WHERE` 形状の判定より前に単一のチョークポイントで一律 `42601` 拒否する
+（`sql::allowlist` のドキュメントコメント参照。余剰トークンによる拒否とは
+判定経路が異なるが、応答の `wire_code`（`42601`）は不変）。詳細は
+`docs/design/sql-returning.md` 参照。
 
 ## RLS・テナント境界
 
