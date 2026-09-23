@@ -322,14 +322,17 @@ pub enum TenantWriteError {
     /// 分離し `XX000`（内部事象）へ固定する。
     CapturedRowDecodeFailed(String),
     /// 述語つき `UPDATE`／`DELETE ... WHERE`（[`enumerate_dml_candidates`]）の
-    /// 候補列挙が、テーブル全体を `.iter()` で走査する構造上 [`MAX_SCANNED_ROWS`]
-    /// を超える総走査行数（可視・不可視・他テナント所有を問わない）に達した
-    /// （codex-review P1 指摘・PR #993 系・Issue #871。一致行数の上限
-    /// （[`PredicateDmlOutcome::LimitExceeded`]）とは独立: 一致しない述語では
-    /// 一致件数上限に到達しないまま任意規模の全表走査が繰り返せてしまう経路を
-    /// 塞ぐ。[`visible_rows`] の `TooManyRowsScanned` と同じ「部分結果を返さず
-    /// fail-closed に拒否する」判断。`write_txn` は commit せず破棄する（行・
-    /// 台帳とも痕跡ゼロ）ため `54000`（`PayloadTooLarge`）へ写像する。
+    /// 候補列挙が、対象テナントの物理キー領域（`(tenant, 0)` からの `range`
+    /// 走査。テナント境界を跨いだ時点で打ち切り、他テナント領域には触れない）
+    /// を走査した総行数（対象テナント所有行のみを計数。可視・不可視は問わない）
+    /// で [`MAX_SCANNED_ROWS`] を超えた（codex-review P1 指摘・PR #993 系・
+    /// Issue #871。一致行数の上限（[`PredicateDmlOutcome::LimitExceeded`]）とは
+    /// 独立: 一致しない述語では一致件数上限に到達しないまま対象テナント名前空間
+    /// 内で任意規模の走査が繰り返せてしまう経路を塞ぐ。[`visible_rows`] の
+    /// `TooManyRowsScanned` と同じ「部分結果を返さず fail-closed に拒否する」
+    /// 判断。この上限は他テナントのデータ量に一切依存しない。`write_txn` は
+    /// commit せず破棄する（行・台帳とも痕跡ゼロ）ため `54000`
+    /// （`PayloadTooLarge`）へ写像する。
     TooManyRowsScanned,
 }
 
