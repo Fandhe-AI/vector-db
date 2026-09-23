@@ -104,9 +104,10 @@
 //! 上記 2 シナリオ（読み取り専用）とは異なり、`UPDATE`／`DELETE`（SQL-17・
 //! SQL-18・SQL-19。単一行 `id` 完全一致形のみ。述語形 `filter` は NoSQL 側
 //! 未接続のため対象外）が SQL 表層と NoSQL 表層で同一の実行結果（影響行数・
-//! エラー `wire_code`＋message・操作後の状態）を返すことを
-//! `run_sql_nosql_dml_parity_scenario` で固定する（curl／urllib／fetch の
-//! 3 テストが共有）。
+//! エラー `wire_code`・操作後の状態）を返すことを `run_sql_nosql_dml_parity_scenario`
+//! で固定する（curl／urllib／fetch の 3 テストが共有）。エラー時の `message`
+//! はケースごとに束縛段階が表層間で異なりうるため比較対象に含めない
+//! （`DmlExpectation::Error`・`DmlOutcomeSummary` のコメントを参照）。
 //!
 //! **起動方式（複数 DB・順次プロセス）**: DML は状態を変えるうえ、0 行の
 //! `UPDATE`／`DELETE` も台帳に記録される（`docs/design/sql-delete-single-row.md`
