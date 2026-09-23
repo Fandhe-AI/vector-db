@@ -146,10 +146,21 @@ impl<'a> ResultFormats<'a> {
 ///
 /// 判定は公告型（[`ColumnMeta`]／[`WireType`]）で静的に行い、実行時の
 /// `Cell` は参照しない（型公告と実値の不一致を防ぐ）。
+///
+/// `columns.len() != formats.len()` は本来 [`ResultFormats::resolve`] の
+/// 呼び出し規約違反（Bind 形式コードの解決結果が列数と食い違う）だが、
+/// `.zip()` は短い方に合わせて黙って打ち切るため、この不一致をここで
+/// 検査しないと後段のエンコーダまで持ち越され `EncodeError`（`XX000`）
+/// として現れてしまう。入力由来の不整合は `08P01`
+/// （[`BinaryFormatError::FormatCountMismatch`]）として、事前検査という
+/// 本関数の契約どおりここで拒否する。
 pub fn validate_binary_formats(
     columns: &[ColumnMeta],
     formats: &[FormatCode],
 ) -> Result<(), BinaryFormatError> {
+    if columns.len() != formats.len() {
+        return Err(BinaryFormatError::FormatCountMismatch);
+    }
     for (index, (meta, format)) in columns.iter().zip(formats.iter()).enumerate() {
         if matches!(format, FormatCode::Binary) && !column_binary_support(meta) {
             return Err(BinaryFormatError::UnsupportedType {
@@ -936,6 +947,42 @@ mod tests {
         let err = validate_binary_formats(&columns, &formats).unwrap_err();
         assert_eq!(err, BinaryFormatError::UnsupportedType { column_index: 0 });
         assert_eq!(err.error_class(), ErrorClass::FeatureNotSupported);
+    }
+
+    #[test]
+    fn validate_binary_formats_rejects_formats_shorter_than_columns() {
+        // `.zip()` の共通部分のみ検査すると formats が短い（列数不足）場合に
+        // 素通りしてしまう（codex-review 指摘・Issue #936 PR #998）。
+        // 事前検査という契約どおり `08P01` で拒否する。
+        let columns = vec![
+            ColumnMeta::Scalar {
+                name: "lang".to_string(),
+                ty: engine::catalog::ColumnType::Text,
+            },
+            ColumnMeta::Scalar {
+                name: "body".to_string(),
+                ty: engine::catalog::ColumnType::Text,
+            },
+        ];
+        let formats = vec![FormatCode::Text];
+        let err = validate_binary_formats(&columns, &formats).unwrap_err();
+        assert_eq!(err, BinaryFormatError::FormatCountMismatch);
+        assert_eq!(err.error_class(), ErrorClass::ProtocolViolation);
+    }
+
+    #[test]
+    fn validate_binary_formats_rejects_formats_longer_than_columns() {
+        // formats が列数より多い場合も同様に `08P01` で拒否する
+        // （`.zip()` は左側 `columns` の長さで打ち切るため長すぎる側も
+        // 素通りしていた）。
+        let columns = vec![ColumnMeta::Scalar {
+            name: "lang".to_string(),
+            ty: engine::catalog::ColumnType::Text,
+        }];
+        let formats = vec![FormatCode::Text, FormatCode::Text];
+        let err = validate_binary_formats(&columns, &formats).unwrap_err();
+        assert_eq!(err, BinaryFormatError::FormatCountMismatch);
+        assert_eq!(err.error_class(), ErrorClass::ProtocolViolation);
     }
 
     #[test]
