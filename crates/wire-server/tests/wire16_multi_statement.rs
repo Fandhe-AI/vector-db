@@ -366,6 +366,41 @@ fn set_search_mode_is_rolled_back_when_a_later_statement_in_the_message_fails() 
     read_ready_for_query(&mut stream);
 }
 
+/// 複数文メッセージが最後まで成功した場合、`SET search_mode` は巻き戻らず
+/// 次のメッセージへ持ち越される（PostgreSQL の暗黙トランザクションが commit
+/// された場合と同じ意味論）。
+#[test]
+fn set_search_mode_persists_when_the_whole_message_succeeds() {
+    let (core, _guard) = new_core_three_tenant_docs();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "SET search_mode = 'precision'; SELECT id FROM docs LIMIT 1",
+    );
+    assert_eq!(read_command_complete(&mut stream), "SET");
+    let _columns = read_row_description(&mut stream);
+    let _row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    // 次のメッセージの句なし `SELECT` が `precision` のまま（top1 のみ明確な
+    // クエリで 1 行のみ返る）であることで、成功時は持ち越されることを確認する。
+    send_simple_query(
+        &mut stream,
+        "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 3",
+    );
+    let _columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("1"));
+    assert_eq!(
+        read_command_complete(&mut stream),
+        "SELECT 1",
+        "SET search_mode = 'precision' must persist across messages on success"
+    );
+    read_ready_for_query(&mut stream);
+}
+
 /// `CREATE FUNCTION` を含む複数文メッセージが途中で失敗した場合も同様に
 /// 巻き戻り、次のメッセージでその関数は未定義のまま（未定義関数呼び出しは
 /// `sql::udf_call` の束縛時検証により `22000`〔`InvalidInput`〕になる）。

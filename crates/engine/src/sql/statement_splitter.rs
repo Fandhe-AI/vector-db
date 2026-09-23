@@ -120,7 +120,15 @@ pub enum StatementEffect {
 pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementError> {
     let mut in_literal = false;
     let mut chars = input.char_indices().peekable();
-    let mut semicolon_offsets: Vec<usize> = Vec::new();
+    // 1 パスで非空文を直接切り出す（`;` の位置をいったん `Vec<usize>` へ
+    // 集めてから 2 パス目で切り出す方式は、`;;;;...` のような入力で
+    // 「区切りだけの無制限 `Vec` 確保」に相当し untrusted 入力経路の防御的
+    // 上限（`.claude/rules/coding-rust.md`「無制限リソース確保」対応）と
+    // 相性が悪いため避ける。`statements` は上限到達時点で即座に `Err` を
+    // 返すため `MAX_STATEMENTS_PER_QUERY + 1` 要素までしか伸びない）。
+    let mut statements: Vec<&str> = Vec::new();
+    let mut semicolon_count: usize = 0;
+    let mut start = 0usize;
 
     while let Some(&(offset, c)) = chars.peek() {
         if in_literal {
@@ -171,7 +179,16 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
                 chars.next();
             }
             ';' => {
-                semicolon_offsets.push(offset);
+                let piece = input.get(start..offset).unwrap_or("").trim();
+                if !piece.is_empty() {
+                    statements.push(piece);
+                    if statements.len() > MAX_STATEMENTS_PER_QUERY {
+                        return Err(MultiStatementError::TooManyStatements);
+                    }
+                }
+                semicolon_count = semicolon_count.saturating_add(1);
+                // `;` は ASCII 1 バイトなので `offset + 1` は必ず次の文字境界。
+                start = offset.saturating_add(1);
                 chars.next();
             }
             _ => {
@@ -186,23 +203,10 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
         return Ok(SplitOutcome::Single);
     }
 
-    // リテラル外の `;` を区切りとして非空文（前後空白 trim 済み）を集める。
-    let mut statements: Vec<&str> = Vec::new();
-    let mut start = 0usize;
-    for &sc in &semicolon_offsets {
-        let piece = input.get(start..sc).unwrap_or("").trim();
-        if !piece.is_empty() {
-            statements.push(piece);
-            if statements.len() > MAX_STATEMENTS_PER_QUERY {
-                return Err(MultiStatementError::TooManyStatements);
-            }
-        }
-        // `;` は ASCII 1 バイトなので `sc + 1` は必ず次の文字境界。
-        start = sc + 1;
-    }
-    let tail = input.get(start..).unwrap_or("").trim();
-    if !tail.is_empty() {
-        statements.push(tail);
+    let tail = input.get(start..).unwrap_or("");
+    let tail_trimmed = tail.trim();
+    if !tail_trimmed.is_empty() {
+        statements.push(tail_trimmed);
         if statements.len() > MAX_STATEMENTS_PER_QUERY {
             return Err(MultiStatementError::TooManyStatements);
         }
@@ -210,23 +214,16 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
 
     match statements.len() {
         0 => Ok(SplitOutcome::Empty),
-        1 => match semicolon_offsets.len() {
+        1 => match semicolon_count {
             0 => Ok(SplitOutcome::Single),
-            1 => {
-                // 唯一の `;` が文の直後（後ろは空白のみ）であれば既存の単一文
-                // 経路（`expect_end_of_statement` がそのまま受理する形）と同じ
-                // 意味になるため `Single` を返す。先頭に `;` がある場合
-                // （`;SELECT 1` 等）はここに該当せず `Statements` へ回す
-                // （元テキストのままでは先頭の `;` トークンで構文エラーになる
-                // ため、除去した形で渡す必要がある）。
-                let sc = semicolon_offsets[0];
-                let tail_after = input.get(sc + 1..).unwrap_or("");
-                if tail_after.trim().is_empty() {
-                    Ok(SplitOutcome::Single)
-                } else {
-                    Ok(SplitOutcome::Statements(statements))
-                }
-            }
+            // 唯一の `;` が文の直後（後ろは空白のみ）であれば既存の単一文
+            // 経路（`expect_end_of_statement` がそのまま受理する形）と同じ
+            // 意味になるため `Single` を返す。先頭に `;` がある場合
+            // （`;SELECT 1` 等）は `tail_trimmed`（＝唯一の `;` の後ろの
+            // テキスト）が非空になるためここに該当せず `Statements` へ回す
+            // （元テキストのままでは先頭の `;` トークンで構文エラーになる
+            // ため、除去した形で渡す必要がある）。
+            1 if tail_trimmed.is_empty() => Ok(SplitOutcome::Single),
             _ => Ok(SplitOutcome::Statements(statements)),
         },
         _ => Ok(SplitOutcome::Statements(statements)),
