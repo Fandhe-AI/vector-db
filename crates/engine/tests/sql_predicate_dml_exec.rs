@@ -421,6 +421,121 @@ fn predicate_delete_over_limit_is_rejected_with_no_side_effects() {
     assert_eq!(err_again.wire_code(), "54000");
 }
 
+/// 指定 `id` の行が持つ `embedding`（`VECTOR` 列）の現在値を直接読み取る
+/// ヘルパー（広域取得 `SELECT embedding FROM {table} WHERE id = {id} LIMIT 1`。
+/// SQL-15・Issue #454）。`ORDER BY <=> ...` の近傍探索（ランキングが未正規化
+/// 内積によるため、大きさの異なるベクトル間では「値が完全一致する行」が
+/// Top-1 に来るとは限らない）を経由せず、値そのものを比較する。
+fn embedding_of(core: &EngineCore, ctx: &PolicyContext, table: &str, id: u64) -> Vec<f32> {
+    let result = core
+        .execute_sql(
+            ctx,
+            &format!("SELECT embedding FROM {table} WHERE id = {id} LIMIT 1"),
+        )
+        .expect("select should succeed");
+    assert_eq!(result.rows.len(), 1, "expected exactly one row for id={id}");
+    match &result.rows[0].cells[0] {
+        Cell::Vector(v) => v.clone(),
+        other => panic!("expected Cell::Vector, got {other:?}"),
+    }
+}
+
+/// 述語つき UPDATE が `VECTOR` 列（`embedding`）への SET も一括適用できる
+/// ことを確認する（`tenant::update_rows_where_unchecked` の
+/// `Some(vector_idx) == col_idx` 分岐。read-merge-write で埋め込みを丸ごと
+/// 差し替え、TEXT 列は無変更のまま残る）。
+#[test]
+fn predicate_update_set_vector_column_replaces_embedding_for_matching_rows() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    insert_row(&core, &alice, TABLE, 1, "ja", "a", "1");
+    insert_row(&core, &alice, TABLE, 2, "en", "b", "2");
+
+    let outcome = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET embedding = '[9.0,9.0]' WHERE lang = 'ja' \
+             USING OPERATION_ID 'op-upd-vec'"
+        ),
+    )
+    .expect("predicate UPDATE with VECTOR column SET should succeed");
+    match outcome {
+        SqlOutcome::Update(o) => assert_eq!(o.rows_affected, 1),
+        other => panic!("expected SqlOutcome::Update, got {other:?}"),
+    }
+
+    // id=1（一致行）の embedding は更新後の値に置き換わる（クエリ [9.0,9.0]
+    // の Top-1 が id=1 になる）。TEXT 列（lang）は無変更のまま。
+    assert_eq!(embedding_of(&core, &alice, TABLE, 1), vec![9.0, 9.0]);
+    let rows = scan_lang_rows(&core, &alice, TABLE);
+    assert!(rows.contains(&(1, "ja".to_string())));
+
+    // id=2（非一致行）の embedding は無変更のまま（クエリ [0.1,0.2] の Top-1
+    // が id=2 になる。元の値のまま残っている証跡）。
+    assert_eq!(embedding_of(&core, &alice, TABLE, 2), vec![0.1, 0.2]);
+}
+
+/// `VECTOR` 列への SET でリテラルの次元がスキーマと不一致なら束縛段で `22000`
+/// （`sql::parser::bind_set_assignments` を単一行 UPDATE と共有するため、
+/// `sql_update_single_row.rs::set_embedding_with_wrong_dimension_is_rejected_with_22000`
+/// と同じ契約。対象行の実在有無に関わらず束縛段で拒否されるため副作用ゼロ）。
+#[test]
+fn predicate_update_set_vector_column_with_wrong_dimension_is_rejected_with_22000() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    insert_row(&core, &alice, TABLE, 1, "ja", "a", "1");
+
+    let err = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET embedding = '[1.0,2.0,3.0]' WHERE lang = 'ja' \
+             USING OPERATION_ID 'op-upd-vec-dim'"
+        ),
+    )
+    .expect_err("dimension mismatch must be rejected at bind time");
+    assert_eq!(err.wire_code(), "22000");
+    // 副作用ゼロ: 行不変・台帳未記録（同一 operation_id の再送も同じ束縛
+    // エラーになる。23505/22023 にはならない）。
+    assert_eq!(embedding_of(&core, &alice, TABLE, 1), vec![0.1, 0.2]);
+    let err_again = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET embedding = '[1.0,2.0,3.0]' WHERE lang = 'ja' \
+             USING OPERATION_ID 'op-upd-vec-dim'"
+        ),
+    )
+    .expect_err("resend of an unrecorded operation_id must be the same bind-time rejection");
+    assert_eq!(err_again.wire_code(), "22000");
+}
+
+/// `VECTOR` 列への SET に非ベクトル値（数値リテラル）を与えると束縛段で
+/// `22000`（`bind_set_assignments` の `(ColumnType::Vector(_), InsertLiteral::Number(_))`
+/// 分岐）。
+#[test]
+fn predicate_update_set_vector_column_with_non_vector_value_is_rejected_with_22000() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    insert_row(&core, &alice, TABLE, 1, "ja", "a", "1");
+
+    let err = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET embedding = 42 WHERE lang = 'ja' \
+             USING OPERATION_ID 'op-upd-vec-nonvec'"
+        ),
+    )
+    .expect_err("non-vector literal for a VECTOR column must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(embedding_of(&core, &alice, TABLE, 1), vec![0.1, 0.2]);
+}
+
 /// DELETE 側（[`predicate_delete_over_limit_is_rejected_with_no_side_effects`]）
 /// と同じ契約が述語つき UPDATE 側にも成立することを固定する（`§6` の上限 API
 /// 並立〔`MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows`〕は DELETE 側の
