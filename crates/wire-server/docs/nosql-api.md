@@ -369,12 +369,14 @@ USING OPERATION_ID`（SQL-17）と同一の実行器
 他テナント所有 id・未存在 id はいずれも `updated:0`・`200` で応答バイト列が
 完全一致する。RLS-9）。
 
-**既知の制約**: 複数列 `set` は JSON パース時点でキーのアルファベット順へ
-正規化されるため、SQL 表層がアルファベット順でない宣言順で書いた
-`UPDATE`（例: `SET lang = .., embedding = ..`）と同一値の NoSQL `update`
-は、同一 `operation_id` への再送であっても内容不一致（`22023`）に
-誤判定されうる（単一列の `set` は影響を受けない。詳細は
-`docs/design/nosql-update-delete-mapping.md`「既知の制約」節参照）。
+複数列 `set` は JSON パース時点でキーのアルファベット順へ正規化される一方、
+SQL 表層の `UPDATE ... SET col1 = .., col2 = ..` はクライアントが記述した
+宣言順をそのまま保持する。台帳の内容照合ハッシュはこの列の記述順に依存
+しないようスキーマの列定義順へ正規化済み（PR #992）のため、SQL 表層が
+アルファベット順でない宣言順で書いた `UPDATE` と同一値の NoSQL `update`
+は、同一 `operation_id` への再送であれば内容一致の再送（`23505`）として
+正しく判定される（詳細は `docs/design/nosql-update-delete-mapping.md`
+「複数列 `set` の宣言順と `content_hash`」節参照）。
 
 要求例（`where` 形）:
 

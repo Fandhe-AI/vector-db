@@ -160,6 +160,27 @@ resending_same_operation_id_with_different_set_clause_order_is_23505`・
 cross_surface_multi_column_set_declared_out_of_alphabetical_order_is_
 treated_as_duplicate`）。
 
+### 正規化導入前の台帳エントリとの互換性（PR #992 レビュー指摘の是正）
+
+上記の正規化（宣言順 → スキーマ列順）を導入する**前**に記録された台帳
+エントリは、宣言順のままハッシュ計算されている。正規化後のコードが
+それを常に「内容不一致」（`22023`）へ倒すと、アップグレード前に記録
+済みの `operation_id` を同一 SQL で再送しただけの正当な操作が誤って
+拒否されてしまう。
+
+`tenant::update_row_columns_unchecked` は宣言順のまま計算した
+`legacy_hash` も保持し、`ledger::record_in_txn_accepting`
+（`ledger::record_in_txn` の一般化版）が正準ハッシュ（スキーマ列順）に
+加えてこの宣言順ハッシュとも照合する。新規記録・以降の照合には常に
+正準ハッシュのみを使う（keep-first 契約は変えない）。同一
+`operation_id` だが内容が異なる再送は、正準ハッシュ・宣言順ハッシュの
+いずれとも一致しないため引き続き `22023` になる（`22023` 契約は
+弱めていない）。
+
+回帰テストで固定済み（`crates/engine/src/tenant.rs::tests::
+update_row_columns_resend_matches_pre_normalization_declared_order_
+ledger_entry`）。
+
 ## 対象外・申し送り
 
 - 述語形（`filter`）の実行結線: Issue #871 の担当。結線後は D1 の `0A000`
