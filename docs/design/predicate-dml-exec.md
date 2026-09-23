@@ -8,7 +8,7 @@
   本実装は自動運転モードのため承認を待たずこの ADR を作業前提として実行結線し、
   PR #993 のレビューでオーナー承認〔2026-09-23・ADR ステータス Accepted〕を得た）
 - 関連ポインタ: `docs/spec/05-tasks.md` TASK-192・`docs/spec/04-behavior/sql-surface.md`
-  SQL-19・`docs/spec/04-behavior/recovery.md` RECOVER-11（検討中）・RECOVER-9・
+  SQL-19・`docs/spec/04-behavior/recovery.md` RECOVER-11（2026-09-23 確定）・RECOVER-9・
   RECOVER-10・`docs/spec/04-behavior/rls.md` RLS-7・RLS-9・RLS-10・TABLE-12。
   spec 本文は転記しない。
 - 関連コード: `crates/engine/src/recovery/content_hash.rs`（`OpTag::UpdateWhere`／
@@ -194,7 +194,8 @@ limit)`、`UPDATE` 側は `MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows(cou
 
 - NoSQL `update`／`delete` op の束縛・結線（#876）・SQL/NoSQL パリティ（#877）。
 - 上限 API（§6）の統合・既定値の確定（オーナー判断）。
-- spec 側 RECOVER-11 の確定化（spec リポへ申し送り。ADR #868 は 2026-09-23 承認済み）。
+- spec 側 RECOVER-11 は 2026-09-23 に確定済み（`docs/spec` submodule を確定後の参照へ更新。
+  確定は本 PR のマージを条件とする）。
 - `WasmUdfBackend` への安定な定義識別子の追加（wasmtime 接続時）。
 - スカラー列二次索引（`sql::scalar_index`）による候補削減の適用（本 Issue は write
   txn 内の全走査で正しさを優先。性能改善は後続）。
