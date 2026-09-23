@@ -2726,11 +2726,15 @@ pub(crate) fn update_rows_where_unchecked<E>(
                     .map_err(|e| CatalogError::CorruptSchema(e.to_string()))
                     .map_err(dml_write_err)?;
             let mut embedding_value: Vec<f32> = existing.embedding.clone();
+            let mut vector_assigned = false;
 
             for (col_idx, value) in assignments {
                 if Some(*col_idx) == vector_idx {
                     match value {
-                        crate::row_codec::Value::Vector(v) => embedding_value = v.clone(),
+                        crate::row_codec::Value::Vector(v) => {
+                            embedding_value = v.clone();
+                            vector_assigned = true;
+                        }
                         _ => {
                             return Err(dml_write_err(CatalogError::Invalid(
                                 "VECTOR column SET value must be a vector".to_string(),
@@ -2748,9 +2752,17 @@ pub(crate) fn update_rows_where_unchecked<E>(
                 }
             }
 
-            schema
-                .validate_embedding_dim(embedding_value.len())
-                .map_err(dml_write_err)?;
+            // VECTOR 列の SET があった場合に限り次元検証する（単一行版
+            // `update_row_columns_unchecked` と同じ契約。`validate_embedding_dim`
+            // は VECTOR 列を持たないスキーマで常に `Err` を返すため、無条件に
+            // 呼ぶと TEXT 列のみのテーブルへの正当な述語つき UPDATE が一致行を
+            // 持つだけで失敗してしまう。codex-review P1 指摘・PR #993 系・
+            // Issue #871）。
+            if vector_assigned {
+                schema
+                    .validate_embedding_dim(embedding_value.len())
+                    .map_err(dml_write_err)?;
+            }
             let metadata = crate::row_codec::encode_scalar_columns(&schema, &merged_values)
                 .map_err(|e| CatalogError::Invalid(e.to_string()))
                 .map_err(dml_write_err)?;
@@ -4165,6 +4177,113 @@ mod tests {
                 "expected TenantWriteError::Catalog(CorruptSchema(..)) (internal error), \
                  got {other:?}"
             ),
+        }
+    }
+
+    // codex-review P1 指摘（Issue #871）: `update_rows_where_unchecked` が
+    // 一致行ごとに `schema.validate_embedding_dim(embedding_value.len())` を
+    // `VECTOR` 列への SET 有無にかかわらず無条件で呼んでいたため、
+    // `validate_embedding_dim` が `VECTOR` 列を持たないスキーマで常に `Err` を
+    // 返す契約と衝突し、正当な `TEXT` 列のみの述語つき `UPDATE` が一致行を
+    // 持つだけで失敗していた。単一行版 `update_row_columns_unchecked` は
+    // `VECTOR` 列への SET があった場合のみ次元検証しており、本テストは述語形を
+    // 同じ契約に揃えたことを固定する。
+    //
+    // 現行の全 INSERT 系公開・準公開 API（`insert_row`/`insert_typed_row`/
+    // `insert_typed_row_unchecked`/`Storage::insert_row_into_table` 等）は
+    // いずれも `schema.validate_embedding_dim` を無条件で呼ぶため、`VECTOR`
+    // 列を持たないテーブルへは現状経由できない（本 Issue のスコープ外）。
+    // そのため本テストは `redb` への直接書き込みでスキーマ検証を迂回し、
+    // `update_rows_where_unchecked`（適用対象の関数そのもの）だけを検証する。
+    #[test]
+    fn update_rows_where_unchecked_applies_text_assignments_on_table_without_vector_column() {
+        let path = unique_db_path("predicate-update-no-vector-column");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "notes",
+            vec![
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        );
+        storage
+            .create_table(&schema)
+            .expect("create table without a VECTOR column");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let write_txn = storage.begin_write_txn().expect("begin seed write txn");
+        {
+            let row_table_name = user_rows_table_name("notes");
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .expect("open row table for seeding");
+            for (id, lang, body) in [(1u64, "ja", "a"), (2u64, "en", "b"), (3u64, "ja", "c")] {
+                let metadata = crate::row_codec::encode_scalar_columns(
+                    &schema,
+                    &[
+                        crate::row_codec::Value::Text(lang.to_string()),
+                        crate::row_codec::Value::Text(body.to_string()),
+                    ],
+                )
+                .expect("encode scalar columns");
+                let row = RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Private,
+                    embedding: &[],
+                    metadata: &metadata,
+                };
+                let encoded = encode_row(&row).expect("encode seeded row");
+                row_table
+                    .insert(("tenant-a", id), encoded.as_slice())
+                    .expect("seed row without a VECTOR column");
+            }
+        }
+        crate::recovery::commit_boundary::commit(write_txn).expect("commit seed txn");
+
+        // SET 対象は `lang`（宣言順インデックス 0）。`body`（インデックス 1）は
+        // 対象外のまま残ることも下で確認する。
+        let assignments = [(0usize, crate::row_codec::Value::Text("fr".to_string()))];
+        let content_hash_value =
+            content_hash::ContentHash::for_test(b"predicate-update-no-vector-column");
+        let match_lang_ja = |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> {
+            let existing = crate::row_codec::scan_scalar_columns(&schema, c.metadata)
+                .expect("decode seeded metadata");
+            Ok(matches!(existing.first(), Some(Some(s)) if *s == "ja"))
+        };
+        let op_id = OperationId::parse("op-pred-no-vector-column").expect("valid operation_id");
+
+        let outcome = update_rows_where_unchecked(
+            &storage,
+            "notes",
+            &ctx,
+            LedgerWrite::Record(&op_id),
+            &content_hash_value,
+            None,
+            &assignments,
+            false,
+            100,
+            match_lang_ja,
+        )
+        .expect("predicate UPDATE on a table without a VECTOR column should succeed");
+        assert_eq!(outcome, PredicateDmlOutcome::Applied { rows_affected: 2 });
+
+        for (id, expected_lang, expected_body) in
+            [(1u64, "fr", "a"), (2u64, "en", "b"), (3u64, "fr", "c")]
+        {
+            let row = storage
+                .get_row_from_table("notes", "tenant-a", id)
+                .expect("read back row");
+            let values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                .expect("decode updated metadata");
+            assert_eq!(
+                values,
+                vec![
+                    crate::row_codec::Value::Text(expected_lang.to_string()),
+                    crate::row_codec::Value::Text(expected_body.to_string()),
+                ],
+                "row {id} must reflect the expected lang/body after the predicate UPDATE"
+            );
         }
     }
 
