@@ -58,8 +58,10 @@ match にもワイルドカード腕（`_ =>`）を入れない。variant を追
 
 ### D9: `is_vector()` ヘルパ
 
-`ColumnType::is_vector(&self) -> bool` を追加し、`catalog.rs`・`row_codec.rs`
-内の `matches!(ty, ColumnType::Vector(_))` を置き換えた（挙動不変・可読性向上）。
+`ColumnType::is_vector(&self) -> bool` を追加し、`catalog.rs` 内の
+`matches!(ty, ColumnType::Vector(_))` を置き換えた（挙動不変・可読性向上）。
+`row_codec.rs` 内の同型の `matches!` は本 Issue の時点では手つかずのまま
+残置し、後続の型追加時のチェックリスト対象へ申し送る。
 
 ## スコープ縮小の判断
 
