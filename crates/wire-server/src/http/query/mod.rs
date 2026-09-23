@@ -12,8 +12,16 @@
 //! `aggregate`／`insert`／`update`／`delete`）へ分類する許可リストで、語彙外
 //! は `0A000` へ写像する（Issue #759・TASK-179・NOSQL-1・NOSQL-9。
 //! `update`／`delete` の追加は Issue #875・NOSQL-12。束縛・実行結線は
-//! Issue #876 の担当のため、`gate.rs` はこの 2 op を常に placeholder へ
-//! 落とす）。[`aggregate`] は
+//! Issue #876 で結線済み——`where`（単一行 `id` 指定形）のみ実行し、
+//! `filter`（述語形）は Issue #871 の実行結線待ちのため `0A000`／501 のまま）。
+//! [`dml_target`] は `update`／`delete` が共有する「対象行の指定形」判定
+//! （`where`／`filter` の排他判定・`where.id` の読み取り。Issue #876）。
+//! [`update`] は `update` op を `engine::sql::parser::bind_update`／
+//! `EngineCore::execute_bound_update_in_session` へ束縛・実行する（Issue
+//! #876・TASK-186・NOSQL-6・NOSQL-12）。[`delete`] は `delete` op を
+//! `engine::sql::exec::execute_delete`／`EngineCore::
+//! execute_bound_delete_in_session` へ束縛・実行する（Issue #876・
+//! TASK-186・NOSQL-6・NOSQL-12）。[`aggregate`] は
 //! `op: aggregate`（`group_by`／`having`／`explain: true` を除く）を
 //! SQL テキストを経由せずに `engine::sql::parser::BoundAggregate` へ束縛・
 //! 実行する（Issue #768・TASK-177・NOSQL-4）。他 op の実行計画への写像は
@@ -49,6 +57,8 @@
 //! （Issue #765・TASK-186・NOSQL-10。`vector` 指定・`plan` 未指定は `42601`）。
 
 pub mod aggregate;
+pub mod delete;
+pub mod dml_target;
 pub mod explain;
 pub mod filter;
 pub mod gate;
@@ -59,3 +69,4 @@ pub mod response;
 pub mod scan;
 pub mod schema;
 pub mod search;
+pub mod update;

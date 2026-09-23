@@ -456,9 +456,10 @@ fn vocabulary_outside_six_ops_rejects_with_0a000_and_has_no_side_effect() {
     let addr = spawn(Arc::clone(&core));
 
     // `nosql9_op_allowlist.rs` と同じ語彙外集合（`update`／`delete` は
-    // Issue #875 で語彙へ加わったため対象外。その 2 op の「実行可能な状態
-    // でも副作用なし」は下の
-    // `update_and_delete_pass_allowlist_but_have_no_side_effect` が固定する）。
+    // Issue #875 で語彙へ加わったため対象外。その 2 op の `filter`
+    // （述語形）指定での「実行可能な状態でも副作用なし」は下の
+    // `update_and_delete_predicate_form_pass_allowlist_but_have_no_side_effect`
+    // が固定する）。
     // 受理形（`vector`／`limit` 等）の残りフィールドを備えた本文で送り、
     // 「op 判定が実行可能な状態でも手前で止まる」ことを固定する。
     let unsupported_ops = [
@@ -507,30 +508,115 @@ fn vocabulary_outside_six_ops_rejects_with_0a000_and_has_no_side_effect() {
     );
 }
 
-// --- update／delete: 語彙は通過するが実行結線未接続で副作用なし（Issue #875） ---
+// --- update／delete: filter（述語形）は実行結線未接続で副作用なし（Issue #875・#876） ---
 
 #[test]
-fn update_and_delete_pass_allowlist_but_have_no_side_effect() {
-    // `update`／`delete`（Issue #875・NOSQL-12）は語彙・スキーマ検証を通過
-    // するが束縛・実行結線は Issue #876 の担当のため、seed 済み・実行可能な
-    // 状態でも `42P01`（他 4 op が到達する証跡）ではなく暫定 `0A000`／501 の
-    // まま留まり、行データへの副作用も生じないことを固定する。
+fn update_and_delete_predicate_form_pass_allowlist_but_have_no_side_effect() {
+    // `update`／`delete`（Issue #875・NOSQL-12）の `filter`（述語形）は
+    // 語彙・スキーマ検証を通過するが実行結線は Issue #871 の担当のため、
+    // seed 済み・実行可能な状態でも `42P01`（`where` 形が到達する証跡）
+    // ではなく `0A000`／501 のまま留まり、行データへの副作用も生じない
+    // ことを固定する。
     let (core, _guard) = new_core_two_tenant_docs();
     let addr = spawn(Arc::clone(&core));
 
     let bodies: [&[u8]; 2] = [
-        br#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1}}"#,
-        br#"{"op":"delete","table":"docs","where":{"id":1}}"#,
+        br#"{"op":"update","table":"docs","set":{"lang":"en"},"filter":[]}"#,
+        br#"{"op":"delete","table":"docs","filter":[]}"#,
     ];
     for body in bodies {
         let resp = query_as_alice(addr, body);
         assert_eq!(resp.status, 501, "body={body:?} resp={resp:?}");
         assert_eq!(http_common::wire_code_of(&resp), "0A000");
-        assert_eq!(
-            http_common::error_message_of(&resp),
-            wire_server::http::query::gate::PLACEHOLDER_MESSAGE
-        );
     }
+
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"scan","table":"docs","limit":10,"columns":["id"]}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(
+        body_utf8(&resp).contains(r#""row_count":4"#),
+        "{}",
+        body_utf8(&resp)
+    );
+}
+
+// --- update／delete: where（単一行 id 指定形）は実行結線済み（Issue #876） ---
+
+#[test]
+fn update_where_form_executes_and_updates_the_targeted_row() {
+    // `update`（`where` 形。Issue #876）は seed 済み・実行可能な状態では
+    // 自テナント（alice/tenant-a）が所有する行 id=1 を実際に更新する。
+    let (core, _guard) = new_core_two_tenant_docs();
+    let addr = spawn(Arc::clone(&core));
+
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"update","table":"docs","set":{"lang":"fr"},"where":{"id":1},"operation_id":"nosql1-update-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(
+        body_utf8(&resp).contains(r#""updated":1"#),
+        "{}",
+        body_utf8(&resp)
+    );
+
+    // 行数は不変（更新であり削除ではない）。
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"scan","table":"docs","limit":10,"columns":["id"]}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(
+        body_utf8(&resp).contains(r#""row_count":4"#),
+        "{}",
+        body_utf8(&resp)
+    );
+}
+
+#[test]
+fn delete_where_form_executes_and_removes_the_targeted_row() {
+    // `delete`（`where` 形。Issue #876）は seed 済み・実行可能な状態では
+    // 自テナント（alice/tenant-a）が所有する行 id=1 を実際に削除する。
+    let (core, _guard) = new_core_two_tenant_docs();
+    let addr = spawn(Arc::clone(&core));
+
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"delete","table":"docs","where":{"id":1},"operation_id":"nosql1-delete-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(
+        body_utf8(&resp).contains(r#""deleted":1"#),
+        "{}",
+        body_utf8(&resp)
+    );
+
+    // 行数が 1 件減る。
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"scan","table":"docs","limit":10,"columns":["id"]}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(
+        body_utf8(&resp).contains(r#""row_count":3"#),
+        "{}",
+        body_utf8(&resp)
+    );
+}
+
+#[test]
+fn update_where_form_without_operation_id_rejects_with_23502_and_no_side_effect() {
+    let (core, _guard) = new_core_two_tenant_docs();
+    let addr = spawn(Arc::clone(&core));
+
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"update","table":"docs","set":{"lang":"fr"},"where":{"id":1}}"#,
+    );
+    assert_eq!(resp.status, 400, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23502");
 
     let resp = query_as_alice(
         addr,

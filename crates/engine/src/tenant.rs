@@ -1632,7 +1632,9 @@ pub(crate) fn update_row_columns_unchecked(
         // トランザクション内で再取得したスキーマと不一致がありうる場合に備え、
         // `get()` で境界外アクセスを構造的に防ぐ（`insert_typed_row_unchecked` の
         // `expected_schema` 比較と多層防御）。
-        let mut named_columns: Vec<(&str, &crate::row_codec::Value)> =
+        // `(スキーマ列 index, 列名, 値)` の順で構築し、ハッシュ計算前に列
+        // index でソートして宣言順非依存にする（下記コメント参照）。
+        let mut named_columns: Vec<(usize, &str, &crate::row_codec::Value)> =
             Vec::with_capacity(assignments.len());
         // SET 対象の TEXT 列だけを対象にした累計フレームサイズ（presence(1)+
         // 長さ(4)+本文）。対象行の実データ（探索前は不明）を含めず、リクエスト
@@ -1699,8 +1701,47 @@ pub(crate) fn update_row_columns_unchecked(
                     )))
                 }
             }
-            named_columns.push((column.name.as_str(), value));
+            named_columns.push((*idx, column.name.as_str(), value));
         }
+        // 台帳の内容照合ハッシュ（`content_hash::for_update_columns`）へ渡す前に
+        // スキーマの列 index（宣言順）で安定ソートする（Issue #876 レビュー指摘。
+        // `named_columns` はここまで `assignments`（SET 句の宣言順）の順序で
+        // 構築されており、SQL 表層の `UPDATE ... SET col1=.., col2=..` はクライアント
+        // が書いた宣言順をそのまま保持する一方、NoSQL 表層（`wire-server::http::
+        // query::update::map_set_assignments`）は JSON `set` オブジェクトを
+        // `engine::json` の `BTreeMap` でパースするためキーが常にアルファベット順へ
+        // 正規化される。ハッシュが宣言順に依存したままだと、SQL 表層が非アルファ
+        // ベット順で書いた `UPDATE` と同一内容の NoSQL `update`（常にアルファベット
+        // 順）を同一 `operation_id` で再送した場合に、本来は同一内容の再送（`23505`・
+        // TASK-101・RECOVER-10 の契約）であるべきところが内容不一致（`22023`）へ
+        // 誤判定される。列の並び順は書き込み対象・SET 意味論に一切影響しない
+        // （`assignments` は index 基準で適用済み）ため、ハッシュ入力のみをスキーマ
+        // 列順へ正規化することで SQL・NoSQL 双方の入力順序に依存しない決定的な
+        // ハッシュにする（`for_typed_insert` がスキーマ列順を渡す既存契約と同じ
+        // 考え方）。
+        //
+        // 互換性（PR #992 レビュー指摘）: この正規化の変更前は `named_columns` を
+        // 宣言順のままハッシュ計算へ渡していた（旧 `for_update_columns` 呼び出し
+        // 契約。SQL 表層のみが到達可能で NoSQL `update` は未接続だった）ため、
+        // 既に台帳へ記録済みのエントリは宣言順ハッシュを保持している場合がある。
+        // 正規化後のコードがそれをそのまま「内容不一致」（`22023`）へ倒すと、
+        // アップグレード前に記録済みの `operation_id` を同一 SQL で再送しただけの
+        // 正当な操作が誤って拒否されてしまう（AGENTS.md「公開 API・エラー契約の
+        // 互換性」）。宣言順のまま（ソート前）のビューを `legacy_hash` として
+        // 保持しておき、`ledger::record_in_txn_accepting` が正準ハッシュ
+        // （スキーマ列順）に加えてこの宣言順ハッシュとも照合することで、
+        // アップグレード前に記録されたエントリへの同一 SQL 再送も
+        // `Duplicate`（`23505`）と判定できるようにする。新規記録・以降の照合には
+        // 常に正準ハッシュ（スキーマ列順）のみを使う（keep-first 契約は変えない）。
+        let declared_order_columns: Vec<(&str, &crate::row_codec::Value)> = named_columns
+            .iter()
+            .map(|(_, name, value)| (*name, *value))
+            .collect();
+        named_columns.sort_by_key(|(idx, _, _)| *idx);
+        let named_columns: Vec<(&str, &crate::row_codec::Value)> = named_columns
+            .into_iter()
+            .map(|(_, name, value)| (name, value))
+            .collect();
         // SET 値の形状検証（上記ループ内の次元・TEXT 長上限）は、対象行の存在・
         // RLS 可視性を一切参照せずスキーマのみから判定できる。存在しない／
         // 他テナント所有／不可視な行に対する UPDATE は本来 `rows_affected: 0` の
@@ -1714,14 +1755,19 @@ pub(crate) fn update_row_columns_unchecked(
         // 常に同一の拒否（またはいずれも合格）になる fail-closed 契約を保つ。
 
         // 台帳照合（TASK-101・RECOVER-10）を所有権判定より**前**に行う
-        // （`update_row_unchecked` と同じ順序契約。同ドキュメント参照）。
+        // （`update_row_unchecked` と同じ順序契約。同ドキュメント参照）。単一列
+        // SET は宣言順・スキーマ列順が一致するため `legacy_hash` は常に
+        // `content_hash` と等しくなるが、`record_in_txn_accepting` 呼び出し自体は
+        // 統一して行い分岐を増やさない。
         let content_hash = content_hash::for_update_columns(id, &named_columns)?;
-        ledger::record_in_txn(
+        let legacy_hash = content_hash::for_update_columns(id, &declared_order_columns)?;
+        ledger::record_in_txn_accepting(
             &write_txn,
             ctx.tenant_id(),
             table,
             ledger_write,
             &content_hash,
+            &[legacy_hash],
         )?;
 
         let row_table_name = user_rows_table_name(table);
@@ -3873,6 +3919,114 @@ mod tests {
             values[2],
             crate::row_codec::Value::Text("v1".to_string()),
             "row must be unchanged when the SET value is rejected before the write"
+        );
+    }
+
+    // PR #992 レビュー指摘（Issue #876）: `named_columns` をハッシュ計算前に
+    // スキーマ列 index 順へ正規化する変更（表層をまたいだ再送の一貫性のため）
+    // により、正規化を導入する**前**に宣言順のままハッシュ計算されて台帳へ
+    // 記録されたエントリを同一 SQL で再送した場合に、内容不一致（`22023`）へ
+    // 誤判定されないことを固定する。`ledger::record_in_txn`（正規化前の呼び出し
+    // 契約と同じ、宣言順の列スライスをそのまま渡す形）で「アップグレード前に
+    // 記録されたエントリ」を直接構築し、`update_row_columns_unchecked` を
+    // 宣言順が非アルファベット順・非スキーマ列順の複数列 SET で呼び出す。
+    #[test]
+    fn update_row_columns_resend_matches_pre_normalization_declared_order_ledger_entry() {
+        let path = unique_db_path("update-columns-legacy-hash-compat");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        insert_typed_row(
+            &storage,
+            "docs",
+            &a,
+            1,
+            Visibility::Public,
+            &row_values([0.1, 0.2], "note.txt", "v1"),
+            &OperationId::parse("seed-legacy-hash-compat").expect("valid operation_id"),
+        )
+        .expect("seed row");
+
+        // `file_schema("docs")` の列 index: embedding=0, path=1, body=2。
+        // 宣言順（body, path）はスキーマ列順（path, body）と一致しない。
+        let declared_order_columns: [(&str, &crate::row_codec::Value); 2] = [
+            ("body", &crate::row_codec::Value::Text("v2".to_string())),
+            (
+                "path",
+                &crate::row_codec::Value::Text("note2.txt".to_string()),
+            ),
+        ];
+        let legacy_hash =
+            crate::recovery::content_hash::for_update_columns(1, &declared_order_columns)
+                .expect("legacy content hash");
+
+        // 正規化導入前のコード（宣言順のままハッシュ計算する旧契約）が記録した
+        // であろう台帳エントリを、旧 `record_in_txn` 呼び出し契約（`legacy_hashes`
+        // なし）で直接再現する。行の書き込みは伴わない（台帳エントリの有無のみが
+        // 本テストの関心事）。
+        let legacy_op = OperationId::parse("op-legacy-declared-order").expect("valid operation_id");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        crate::recovery::ledger::record_in_txn(
+            &write_txn,
+            a.tenant_id(),
+            "docs",
+            LedgerWrite::Record(&legacy_op),
+            &legacy_hash,
+        )
+        .expect("seed legacy ledger entry");
+        write_txn.commit().expect("commit legacy ledger entry");
+
+        // 同一 `operation_id`・同一内容（宣言順 body, path）を現行コード経由で
+        // 再送する。現行コードはハッシュ計算前にスキーマ列順（path, body）へ
+        // 正規化するため、正準ハッシュは `legacy_hash` と異なるが、
+        // `record_in_txn_accepting` が宣言順の legacy_hash とも照合するため
+        // 内容一致の再送（`Duplicate`）として扱われるはずである。
+        let resend_assignments = [
+            (2, crate::row_codec::Value::Text("v2".to_string())),
+            (1, crate::row_codec::Value::Text("note2.txt".to_string())),
+        ];
+        let err = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &a,
+            1,
+            &resend_assignments,
+            LedgerWrite::Record(&legacy_op),
+            None,
+        )
+        .expect_err(
+            "resend against a pre-normalization ledger entry must not succeed as a fresh write",
+        );
+        assert!(
+            matches!(err, TenantWriteError::DuplicateOperationId),
+            "resend with the same declared order as the pre-normalization entry must be \
+             treated as a duplicate (23505), not a content mismatch (22023): {err:?}"
+        );
+
+        // 対照: 同一 `operation_id` だが内容が異なる再送は引き続き内容不一致に
+        // なる（legacy_hash とのフォールバック照合が `22023` 契約を弱めていない
+        // ことの確認）。
+        let mismatched_assignments = [
+            (2, crate::row_codec::Value::Text("different".to_string())),
+            (1, crate::row_codec::Value::Text("note2.txt".to_string())),
+        ];
+        let err_mismatch = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &a,
+            1,
+            &mismatched_assignments,
+            LedgerWrite::Record(&legacy_op),
+            None,
+        )
+        .expect_err("content-mismatched resend must still be rejected");
+        assert!(
+            matches!(err_mismatch, TenantWriteError::OperationIdContentMismatch),
+            "unexpected error shape for mismatched resend: {err_mismatch:?}"
         );
     }
 
