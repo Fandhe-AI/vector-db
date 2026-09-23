@@ -446,6 +446,13 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         // 型タグ・`param` の往復は ColumnType::catalog_fields に集約する
         // （Issue #880 D2。型を追加する際にここを個別に触らずに済む）。
         let (type_name, param_field) = column.ty.catalog_fields();
+        // catalog_fields が返す param はここまで型定義側の自己申告であり、
+        // decode 側（validate_catalog_param・from_catalog_fields）が要求する
+        // 文字集合・`:` 非混入を encode 側でも検証してから連結する（TABLE-6・
+        // codex-review 指摘 PR #999。将来 catalog_fields が区切り文字や空文字を
+        // 返す型を追加しても、ここで検知して fail-closed に拒否し、デコード不能な
+        // カタログ値を永続化しない）。
+        validate_catalog_param(&param_field)?;
         let nullable_field = if column.nullable { "1" } else { "0" };
         out.push_str(&format!(
             "{}:{}:{}:{}\n",
