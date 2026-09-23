@@ -5,8 +5,8 @@
   `DELETE ... WHERE` の許可リスト・束縛。`docs/design/predicate-dml-where.md`・
   `docs/design/delete-predicate-form.md`）
 - 関連 ADR: `docs/design/multi-row-dml-operation-id.md`（Issue #868・RECOVER-11。
-  **ステータス Proposed・オーナー承認待ち**。本実装は自動運転モードのため承認待ちを
-  待たず、この ADR を現時点の最有力案＝作業前提として実行結線した）
+  本実装は自動運転モードのため承認を待たずこの ADR を作業前提として実行結線し、
+  PR #993 のレビューでオーナー承認〔2026-09-23・ADR ステータス Accepted〕を得た）
 - 関連ポインタ: `docs/spec/05-tasks.md` TASK-192・`docs/spec/04-behavior/sql-surface.md`
   SQL-19・`docs/spec/04-behavior/recovery.md` RECOVER-11（検討中）・RECOVER-9・
   RECOVER-10・`docs/spec/04-behavior/rls.md` RLS-7・RLS-9・RLS-10・TABLE-12。
@@ -187,7 +187,7 @@ limit)`、`UPDATE` 側は `MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows(cou
 
 - NoSQL `update`／`delete` op の束縛・結線（#876）・SQL/NoSQL パリティ（#877）。
 - 上限 API（§6）の統合・既定値の確定（オーナー判断）。
-- ADR #868 の承認・spec 側 RECOVER-11 の確定化（オーナー作業）。
+- spec 側 RECOVER-11 の確定化（spec リポへ申し送り。ADR #868 は 2026-09-23 承認済み）。
 - `WasmUdfBackend` への安定な定義識別子の追加（wasmtime 接続時）。
 - スカラー列二次索引（`sql::scalar_index`）による候補削減の適用（本 Issue は write
   txn 内の全走査で正しさを優先。性能改善は後続）。
