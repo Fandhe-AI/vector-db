@@ -1,4 +1,4 @@
-//! 簡易クエリプロトコル（'Q'）1 文の実行と応答整形を担う（TASK-73・WIRE-1）。
+//! 簡易クエリプロトコル（'Q'）本文の実行と応答整形を担う（TASK-73・WIRE-1）。
 //!
 //! 呼び出し文脈: `handshake::post_auth_loop` が UTF-8 検証済みの `'Q'` 本文を
 //! 受け取った直後にここへ委譲する。責務境界は
@@ -7,6 +7,28 @@
 //! [`crate::result_encoder`] に委譲）、(3) 接続単位 `SessionState` の
 //! 受け渡しのみ。SQL の構文解釈・許可リスト判定・RLS 適用はすべて engine 側
 //! （`engine::sql::allowlist::validate_sql`）に委ねる。
+//!
+//! **セミコロン区切りの複数文実行（WIRE-16・TASK-219・Issue #938）**: 1 つの
+//! `'Q'` 本文にセミコロン区切りで複数の SQL 文が含まれる場合、
+//! [`engine::sql::statement_splitter::split_statements`] へ分割を委譲する
+//! （wire 層は SQL の字句知識を一切持たない）。各文は `RowDescription`／
+//! `DataRow`*／`CommandComplete` を順に送出し、最後の文の応答にのみ
+//! `ReadyForQuery` を付ける（[`run_statement`] の `finish` 引数）。途中の文が
+//! エラーになった場合はそこで打ち切り、ErrorResponse＋`ReadyForQuery` を返して
+//! 残りの文は実行しない。
+//!
+//! 明示 `BEGIN`（SQL-31・RECOVER-12）を持つ複数文トランザクション機構は
+//! 未実装のため、書き込み系文（`INSERT`／`UPDATE`／`DELETE`／`TRUNCATE`。
+//! `engine::sql::statement_splitter::StatementEffect::Write`）は複数文
+//! メッセージの最後の 1 文にのみ許可する（`check_write_placement`。違反は
+//! `0A000` で 1 文も実行せずに拒否）。この制約下では、先行文がエラーになれば
+//! 書き込み文はまだ実行されておらず、最後の書き込み文自身がエラーになれば
+//! その文の redb トランザクションが単独で原子的に失敗するため、追加の
+//! 分散トランザクション機構なしに WIRE-16 の原子性要件が構造的に成立する
+//! （詳細・緩和条件は `docs/design/wire-multi-statement.md` 参照）。
+//! 途中でエラーになった場合はセッション状態（`SET`／`CREATE FUNCTION` 等）も
+//! メッセージ受信前の値へ巻き戻す（`SessionState` の `clone` を保持し、
+//! 失敗時に復元する）。
 //!
 //! `INSERT` は wire 経由で受理する（TASK-82・SQL-10。`EngineCore::
 //! execute_sql_in_session` が先頭トークンを見て `execute_insert_sql`（TASK-80）
@@ -57,9 +79,40 @@ fn respond_error_and_ready(
     crate::handshake::write_ready_for_query_io(stream)
 }
 
-/// 簡易クエリ 1 文を実行し、成功／失敗いずれの場合も応答（`ReadyForQuery` 込み）を
+/// [`execute_and_respond`]・[`run_statement`] が使う「この応答の後に
+/// `ReadyForQuery` を送出するか」の指定（WIRE-16）。複数文メッセージでは
+/// 最後の文の応答にのみ [`Finish::ReadyForQuery`] を渡し、途中の文は
+/// [`Finish::Continue`]（`ReadyForQuery` を送らず次の文へ進む）にする。
+/// エラー応答（`respond_error_and_ready`）は `finish` に関係なく常に
+/// `ReadyForQuery` を送る（途中エラーで打ち切るため、その時点で確定する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Finish {
+    ReadyForQuery,
+    Continue,
+}
+
+/// [`run_statement`] の結果。複数文オーケストレーション（[`execute_and_respond`]）
+/// が「次の文へ進むか、打ち切ってセッション状態を巻き戻すか」を判定するために使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementStatus {
+    /// 応答（`RowDescription`/`DataRow`*/`CommandComplete`、`finish` に応じた
+    /// `ReadyForQuery`）を書き終えた。
+    Completed,
+    /// ErrorResponse＋`ReadyForQuery` を書き終えた（`respond_error_and_ready`・
+    /// エンコード失敗時のフォールバックのいずれか）。呼び出し元は以降の文を
+    /// 実行せず、セッション状態を巻き戻す。
+    Failed,
+}
+
+/// 簡易クエリ本文を実行し、成功／失敗いずれの場合も応答（`ReadyForQuery` 込み）を
 /// 書き切る。呼び出し元は UTF-8 検証済みの `sql` のみを渡すこと（バイト列のまま
 /// 渡さない。UTF-8 検証は `handshake::post_auth_loop` の責務）。
+///
+/// セミコロン区切りの複数文（WIRE-16・TASK-219）は
+/// [`engine::sql::statement_splitter::split_statements`] へ分割を委譲し、
+/// 単一文（[`engine::sql::statement_splitter::SplitOutcome::Single`]）は元の
+/// SQL テキストを無加工のまま [`run_statement`] へ渡す ―― これにより単一文の
+/// 既存挙動（応答バイト列・エラーコード・メッセージ）は構造的に不変のまま保たれる。
 ///
 /// SQL 本文・テナント ID はログへ出さない（security.md P0）。
 pub(crate) fn execute_and_respond(
@@ -78,6 +131,9 @@ pub(crate) fn execute_and_respond(
     // （wire-server は接続 1 本につきスレッド 1 つが直列にクエリを処理する
     // thread-per-connection モデルのため、スレッドローカルでの受け渡しが成立する。
     // `engine::recovery::commit_boundary` モジュールドキュメント参照）。
+    // WIRE-16: 複数文メッセージでも本ガードは `'Q'` 本文 1 通全体を覆ったまま
+    // 変更しない（1 メッセージにつき commit は高々 1 回――書き込み文を最後の
+    // 1 文に限る制約〔モジュールドキュメント「原子性」節〕により保証される）。
     // 注意: `_response_boundary` を `let _ = ...`（無名束縛）に書き換えると即座に
     // drop され、この保護区間全体が無効化される（`ResponseBoundaryGuard` は
     // `#[must_use]`。関数末尾まで生存させるため必ずこの名前付き束縛のまま保つ）。
@@ -88,63 +144,88 @@ pub(crate) fn execute_and_respond(
         return crate::handshake::write_ready_for_query_io(stream);
     }
 
-    // TASK-97（対象ビヘイビア: RECOVER-6・ERR-1、codex-review Medium 指摘対応・
-    // PR #90）: 登録はブロックスコープで「outcome を決定する区間」だけを覆う
-    // ―― ブロック終端（`engine.execute_sql_in_session` の呼び出し直後）で
-    // レキシカルに drop され、以降の応答書き込み（`match outcome { .. }` 側）
-    // には一切及ばない。これは構造的な安全境界であり、外してはならない ――
-    // 将来 commit を伴う書き込み経路が接続された場合、応答書き込みの途中
-    // （例: `respond_query_result` が行を書き出している最中）で panic すると、
-    // その時点で commit は既に pending 済みのため、もし登録がまだ有効なら
-    // 緊急応答バイト列が「書きかけの通常応答フレームの上に」追記されてしまう
-    // （[`EmergencyResponseRegistration`] のドキュメントが警告する
-    // 「フレーム途中への緊急応答混入・二重応答」そのもの）。`must_use` の
-    // 束縛忘れ検出を利用し、`let _ =` に書き換えて即座に drop してしまう事故を
-    // 防ぐため、束縛名を `_emergency_registration` とし、`drop()` の明示呼び出し
-    // には頼らずブロックの終わりに任せる（呼び出し忘れの手動 `drop` はその後に
-    // コードが追加されると孤立しうるが、ブロックスコープはコードの追加位置に
-    // 関わらず構造的に保たれる）。
-    //
-    // 以前は登録を `engine.execute_sql_in_session` の呼び出し 1 行だけに
-    // 限定していたが、この区間全体（＝「outcome を決定する区間」）をブロックで
-    // 括ることで、将来この区間内に書き込み系 SQL の分岐が追加されても
-    // 登録位置を移設せずにそのまま活かせる設計だった（codex-review Medium
-    // 指摘対応）。TASK-82（SQL-10）で実際にその書き込み系分岐（`Insert`）が
-    // 加わった: `EngineCore::execute_sql_in_session` は現在 `SetSearchMode`・
-    // `CreateFunction`・`Select`・`Aggregate`・`Explain`（TASK-78・SQL-6。検索
-    // 本体を実行しない LLM 展開のみの読み取り専用経路）の読み取り専用 5 分岐に
-    // 加え、`Insert`（`execute_insert_sql` 経由。モジュール冒頭コメント参照）の
-    // commit を伴う 1 分岐を持つ。`execute_insert_sql` は
-    // `storage.rs`／`recovery::commit_boundary::commit` へ到達する既存の書き込み
-    // 経路（`EngineCore::insert_row` と同じ commit 境界機構。
-    // `engine/tests/recover6_panic_hook.rs` が `insert_row` 経由で
-    // commit 成功境界を跨いだ panic → 緊急応答の同期送出 → abort を検証済み）を
-    // 通るため、この登録がここで初めて書き込み経路に触れるわけではない。
-    // 区間内で commit 成功後に panic した場合、`engine::recovery::panic_hook`
-    // のフックがこの登録済みバイト列を同期的に送出してから abort する（登録が
-    // 無い・`try_clone` が失敗した場合は登録せず、既存の接続断側〔RECOVER-5 の
-    // abort バックストップ〕へ fail-closed に倒す）。
-    //
-    // 登録（eager）と送出（emergency_send_decision による commit 成功フラグの
-    // 世代一致判定）は別軸である ―― ここでの登録はブロック内で panic が
-    // 起きたら常に送られることを意味しない。詳細は
-    // [`build_emergency_response_bytes`] のドキュメント参照。
-    //
-    // 応答バイト列の内容は `WireError::internal()` の固定文言と
-    // `crate::error_response::MAY_BE_COMMITTED_DETAIL`（ERR-5）のみに依存し
-    // クエリごとに変化しないため、初回呼び出し時に一度だけ構築してキャッシュ
-    // する（[`cached_emergency_response_bytes`] 参照。毎クエリの
-    // `WireError::internal()` 構築・エンコード・アロケーションを避ける
-    // ―― codex-review Medium 指摘対応）。write timeout も登録時に固定ソケット
-    // へ設定せず、`EMERGENCY_RESPONSE_WRITE_TIMEOUT` の値を `register` へ
-    // そのまま渡し、panic フック内で緊急応答を書き込む直前にのみ設定する
-    // （`panic_hook` モジュールドキュメント参照）。これにより、登録スコープを
-    // 抜けた後に `limits::READ_TIMEOUT` へ明示的に復元する処理も不要になった
-    // （以前は登録中だけ短いタイムアウトを即時設定していたため必要だった）。
-    //
-    // `INSERT` の分岐先決定は engine 側（`EngineCore::execute_sql_in_session`。
-    // TASK-82・SQL-10）に一元化する。wire 層はここで構文種別ごとに分岐しない
-    // （モジュール冒頭コメント参照）。
+    match engine::sql::statement_splitter::split_statements(sql) {
+        Err(e) => respond_error_and_ready(stream, e.error_class(), &e.client_message()),
+        Ok(engine::sql::statement_splitter::SplitOutcome::Single) => {
+            run_statement(stream, engine, ctx, session, sql, Finish::ReadyForQuery).map(|_| ())
+        }
+        Ok(engine::sql::statement_splitter::SplitOutcome::Empty) => {
+            write_all(stream, &result_encoder::encode_empty_query_response())?;
+            crate::handshake::write_ready_for_query_io(stream)
+        }
+        Ok(engine::sql::statement_splitter::SplitOutcome::Statements(stmts)) => {
+            // 書き込み系文（`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`）は最後の 1 文に
+            // 限る（モジュールドキュメント「原子性」節）。違反時は 1 文も実行せず
+            // `0A000` で拒否する。
+            if let Err(e) = engine::sql::statement_splitter::check_write_placement(&stmts) {
+                return respond_error_and_ready(stream, e.error_class(), &e.client_message());
+            }
+            // 途中の文がエラーになった場合にメッセージ受信前の状態へ巻き戻す
+            // ためのスナップショット（`SET`／`CREATE FUNCTION` の暗黙ロールバック）。
+            // 単一文経路（`Single`）はこの clone を行わないため、既存の単一文
+            // レイテンシ・コストは不変。
+            let snapshot = session.clone();
+            let last_index = stmts.len().saturating_sub(1);
+            for (i, stmt) in stmts.iter().enumerate() {
+                let finish = if i == last_index {
+                    Finish::ReadyForQuery
+                } else {
+                    Finish::Continue
+                };
+                match run_statement(stream, engine, ctx, session, stmt, finish)? {
+                    StatementStatus::Completed => {}
+                    StatementStatus::Failed => {
+                        // ErrorResponse＋ReadyForQuery は run_statement 内で
+                        // 送出済み。残りの文は実行せず、セッション状態を復元する。
+                        *session = snapshot;
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 複数文実行の 1 文を実行し、応答（`finish` に応じた `ReadyForQuery` の有無）を
+/// 書き切る。[`execute_and_respond`] の「outcome を決定する区間」（TASK-97・
+/// RECOVER-6・ERR-1）をここへ抽出したもの ―― 単一文経路（`SplitOutcome::Single`）
+/// でも複数文経路でも 1 文につき 1 回呼ばれ、緊急応答の登録・panic 注入点の
+/// 位置関係は移設前と同一のまま保たれる。
+///
+/// TASK-97（対象ビヘイビア: RECOVER-6・ERR-1、codex-review Medium 指摘対応・
+/// PR #90）: 登録はブロックスコープで「outcome を決定する区間」だけを覆う
+/// ―― ブロック終端（`engine.execute_sql_in_session` の呼び出し直後）で
+/// レキシカルに drop され、以降の応答書き込み（`match outcome { .. }` 側）
+/// には一切及ばない。これは構造的な安全境界であり、外してはならない ――
+/// 将来 commit を伴う書き込み経路が接続された場合、応答書き込みの途中
+/// （例: `respond_query_result` が行を書き出している最中）で panic すると、
+/// その時点で commit は既に pending 済みのため、もし登録がまだ有効なら
+/// 緊急応答バイト列が「書きかけの通常応答フレームの上に」追記されてしまう
+/// （[`EmergencyResponseRegistration`] のドキュメントが警告する
+/// 「フレーム途中への緊急応答混入・二重応答」そのもの）。`must_use` の
+/// 束縛忘れ検出を利用し、`let _ =` に書き換えて即座に drop してしまう事故を
+/// 防ぐため、束縛名を `_emergency_registration` とし、`drop()` の明示呼び出し
+/// には頼らずブロックの終わりに任せる（呼び出し忘れの手動 `drop` はその後に
+/// コードが追加されると孤立しうるが、ブロックスコープはコードの追加位置に
+/// 関わらず構造的に保たれる）。
+///
+/// 登録（eager）と送出（emergency_send_decision による commit 成功フラグの
+/// 世代一致判定）は別軸である ―― ここでの登録はブロック内で panic が
+/// 起きたら常に送られることを意味しない。詳細は
+/// [`build_emergency_response_bytes`] のドキュメント参照。
+///
+/// `INSERT` 等の分岐先決定は engine 側（`EngineCore::execute_sql_in_session`。
+/// TASK-82・SQL-10）に一元化する。wire 層はここで構文種別ごとに分岐しない
+/// （モジュール冒頭コメント参照）。
+fn run_statement(
+    stream: &mut TcpStream,
+    engine: &EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    stmt_sql: &str,
+    finish: Finish,
+) -> io::Result<StatementStatus> {
     let outcome = {
         let _emergency_registration =
             cached_emergency_response_bytes().and_then(|response_bytes| {
@@ -157,7 +238,7 @@ pub(crate) fn execute_and_respond(
                     ),
                 )
             });
-        let outcome = engine.execute_sql_in_session(ctx, session, sql);
+        let outcome = engine.execute_sql_in_session(ctx, session, stmt_sql);
         // Issue #705（テスト専用・feature `fault-injection` 限定）: 直前行の
         // `outcome` を「登録ブロック」の終端（`_emergency_registration` が
         // drop される直前）でだけ検査し、commit 後 panic を注入できる唯一の
@@ -172,37 +253,17 @@ pub(crate) fn execute_and_respond(
     };
 
     match outcome {
-        Ok(SqlOutcome::Query(result)) => respond_query_result(stream, &result, "SELECT"),
+        Ok(SqlOutcome::Query(result)) => respond_query_result(stream, &result, "SELECT", finish),
         // TASK-78（SQL-6）: `EXPLAIN` は検索本体を実行しない別応答だが、行の
         // 形（`QUERY PLAN` 単一列・複数 `Cell::Text` 行）は通常の検索 SELECT と
         // 同じ `RowDescription`/`DataRow` エンコードを再利用できる（`ColumnMeta`/
         // `ResultRow` の汎用性による）。CommandComplete タグのみ pg 互換の
         // `EXPLAIN` に差し替える（`respond_query_result` のタグ引数化。SELECT
         // との違いはこのタグと呼び出し元の分岐のみ）。
-        Ok(SqlOutcome::Explain(result)) => respond_query_result(stream, &result, "EXPLAIN"),
-        Ok(SqlOutcome::SetSearchMode(_)) => match result_encoder::encode_command_complete("SET") {
-            Ok(msg) => {
-                write_all(stream, &msg)?;
-                crate::handshake::write_ready_for_query_io(stream)
-            }
-            Err(_) => respond_error_and_ready(
-                stream,
-                ErrorClass::InternalError,
-                "failed to encode command complete response",
-            ),
-        },
+        Ok(SqlOutcome::Explain(result)) => respond_query_result(stream, &result, "EXPLAIN", finish),
+        Ok(SqlOutcome::SetSearchMode(_)) => respond_command_complete(stream, "SET", finish),
         Ok(SqlOutcome::CreateFunction { .. }) => {
-            match result_encoder::encode_command_complete("CREATE FUNCTION") {
-                Ok(msg) => {
-                    write_all(stream, &msg)?;
-                    crate::handshake::write_ready_for_query_io(stream)
-                }
-                Err(_) => respond_error_and_ready(
-                    stream,
-                    ErrorClass::InternalError,
-                    "failed to encode command complete response",
-                ),
-            }
+            respond_command_complete(stream, "CREATE FUNCTION", finish)
         }
         // TASK-82（SQL-10）: `INSERT`（行形・ファイル形いずれも
         // `exec::InsertOutcome::rows_affected` に書き込み件数を保持する。
@@ -210,57 +271,25 @@ pub(crate) fn execute_and_respond(
         // タグ `INSERT <oid> <rows>` へ整形する。OID 機構は本実装に無いため
         // 固定で `0` を使う（pg プロトコルの規範。他の書き込み系 wire 応答も
         // 同様の固定値を使う契約はまだ無いためここでのみ導入する）。
-        Ok(SqlOutcome::Insert(outcome)) => match result_encoder::encode_command_complete(&format!(
-            "INSERT 0 {}",
-            outcome.rows_affected
-        )) {
-            Ok(msg) => {
-                write_all(stream, &msg)?;
-                crate::handshake::write_ready_for_query_io(stream)
-            }
-            Err(_) => respond_error_and_ready(
-                stream,
-                ErrorClass::InternalError,
-                "failed to encode command complete response",
-            ),
-        },
+        Ok(SqlOutcome::Insert(outcome)) => respond_command_complete(
+            stream,
+            &format!("INSERT 0 {}", outcome.rows_affected),
+            finish,
+        ),
         // TASK-195（SQL-22）: `TRUNCATE TABLE`（`exec::TruncateOutcome`。削除件数を
         // 一切返さない契約。`sql/exec.rs` ドキュメント参照）の応答を pg 互換の
         // `CommandComplete` タグ `TRUNCATE TABLE`（PostgreSQL の `TRUNCATE` タグに
         // 準拠。件数を持たない固定タグ）へ整形する。`SetSearchMode`（`SET`）と
         // 同型で、行データを返さない書き込み系操作の応答形。
-        Ok(SqlOutcome::Truncate(_)) => {
-            match result_encoder::encode_command_complete("TRUNCATE TABLE") {
-                Ok(msg) => {
-                    write_all(stream, &msg)?;
-                    crate::handshake::write_ready_for_query_io(stream)
-                }
-                Err(_) => respond_error_and_ready(
-                    stream,
-                    ErrorClass::InternalError,
-                    "failed to encode command complete response",
-                ),
-            }
-        }
+        Ok(SqlOutcome::Truncate(_)) => respond_command_complete(stream, "TRUNCATE TABLE", finish),
         // SQL-18（TASK-191・#867）: `DELETE`（単一行・`id` 等価指定形。
         // `exec::DeleteOutcome::rows_affected` は自テナント削除件数
         // `0`／`1` のみを保持する。`sql/exec.rs` ドキュメント参照）の応答を
         // pg 互換の `CommandComplete` タグ `DELETE <rows>`（PostgreSQL の
         // `DELETE` タグに準拠）へ整形する。`INSERT 0 <rows>` と同じ設計。
-        Ok(SqlOutcome::Delete(outcome)) => match result_encoder::encode_command_complete(&format!(
-            "DELETE {}",
-            outcome.rows_affected
-        )) {
-            Ok(msg) => {
-                write_all(stream, &msg)?;
-                crate::handshake::write_ready_for_query_io(stream)
-            }
-            Err(_) => respond_error_and_ready(
-                stream,
-                ErrorClass::InternalError,
-                "failed to encode command complete response",
-            ),
-        },
+        Ok(SqlOutcome::Delete(outcome)) => {
+            respond_command_complete(stream, &format!("DELETE {}", outcome.rows_affected), finish)
+        }
         // Issue #873（SQL-21）: `RETURNING` 句付き `INSERT`／`DELETE` の応答。
         // `RowDescription`／`DataRow`* は通常の検索 SELECT・`EXPLAIN` と同じ
         // `respond_rows_with_tag`（`respond_query_result` から切り出した共通
@@ -282,7 +311,7 @@ pub(crate) fn execute_and_respond(
                     format!("DELETE {}", outcome.rows_affected)
                 }
             };
-            respond_rows_with_tag(stream, &outcome.result, &tag)
+            respond_rows_with_tag(stream, &outcome.result, &tag, finish)
         }
         // `UPDATE`（単一行・id 指定形。SQL-17・TASK-191、Issue #865。述語形。
         // SQL-19・TASK-192、Issue #871。`exec::UpdateOutcome::rows_affected` は
@@ -291,21 +320,41 @@ pub(crate) fn execute_and_respond(
         // タグ `UPDATE <rows>`（PostgreSQL の `UPDATE` タグに準拠。`INSERT` の
         // `<oid> <rows>` と異なり OID フィールドを持たない）へ整形する。
         // `DELETE <rows>` と同じ設計。
-        Ok(SqlOutcome::Update(outcome)) => match result_encoder::encode_command_complete(&format!(
-            "UPDATE {}",
-            outcome.rows_affected
-        )) {
-            Ok(msg) => {
-                write_all(stream, &msg)?;
-                crate::handshake::write_ready_for_query_io(stream)
+        Ok(SqlOutcome::Update(outcome)) => {
+            respond_command_complete(stream, &format!("UPDATE {}", outcome.rows_affected), finish)
+        }
+        Err(e) => {
+            respond_error_and_ready(stream, e.error_class(), &e.client_message())?;
+            Ok(StatementStatus::Failed)
+        }
+    }
+}
+
+/// 行を返さない `CommandComplete` 単独応答（`SET`／`CREATE FUNCTION`／
+/// `INSERT`／`TRUNCATE TABLE`／`DELETE`／`UPDATE`）の共通本体。`finish` が
+/// [`Finish::Continue`] のときは `ReadyForQuery` を送らず、複数文の次の文へ
+/// 制御を返す。
+fn respond_command_complete(
+    stream: &mut TcpStream,
+    tag: &str,
+    finish: Finish,
+) -> io::Result<StatementStatus> {
+    match result_encoder::encode_command_complete(tag) {
+        Ok(msg) => {
+            write_all(stream, &msg)?;
+            if finish == Finish::ReadyForQuery {
+                crate::handshake::write_ready_for_query_io(stream)?;
             }
-            Err(_) => respond_error_and_ready(
+            Ok(StatementStatus::Completed)
+        }
+        Err(_) => {
+            respond_error_and_ready(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode command complete response",
-            ),
-        },
-        Err(e) => respond_error_and_ready(stream, e.error_class(), &e.client_message()),
+            )?;
+            Ok(StatementStatus::Failed)
+        }
     }
 }
 
@@ -413,45 +462,54 @@ pub fn emergency_response_bytes() -> Option<&'static [u8]> {
 /// ためのフラッシュ閾値）。
 ///
 /// `_response_boundary`（RECOVER-5 (3)）・`_emergency_registration`
-/// （RECOVER-6）との関係: 本関数はいずれも `execute_and_respond` が
+/// （RECOVER-6）との関係: 本関数はいずれも `run_statement` が
 /// 「outcome を決定する区間」を抜けた後（`_emergency_registration` の
 /// スコープ外）に呼ばれ、`_response_boundary` の生存区間内で完結する。
 /// バッファ組み立て自体はメモリ上の操作でしかなく、commit 成功境界・
 /// 応答一意性の契約（`_response_boundary`）には影響しない。
+///
+/// WIRE-16: `finish` が [`Finish::Continue`] のときは `ReadyForQuery` を送らず
+/// 次の文へ制御を返す（[`StatementStatus::Completed`]）。エラーに切り替わる
+/// 経路は `finish` に関係なく常に ErrorResponse＋`ReadyForQuery` を送り
+/// [`StatementStatus::Failed`] を返す（途中エラーで打ち切るため、その時点で
+/// 応答を確定する）。
 fn respond_query_result(
     stream: &mut TcpStream,
     result: &engine::sql::exec::QueryResult,
     command_tag: &str,
-) -> io::Result<()> {
+    finish: Finish,
+) -> io::Result<StatementStatus> {
     let tag = if command_tag == "EXPLAIN" {
         command_tag.to_string()
     } else {
         format!("{command_tag} {}", result.rows.len())
     };
-    respond_rows_with_tag(stream, result, &tag)
+    respond_rows_with_tag(stream, result, &tag, finish)
 }
 
 /// `RowDescription`／`DataRow`* の組み立てとフレーム送出を担う共通本体
 /// （Issue #873・SQL-21 で [`respond_query_result`] から切り出した）。`tag` は
 /// 呼び出し元が完成済みで渡す `CommandComplete` の中身（`SELECT`／`EXPLAIN` は
 /// `respond_query_result` が `result.rows.len()` から組み立て、`RETURNING` は
-/// `outcome.rows_affected` から組み立てる。`simple_query::handle` の
+/// `outcome.rows_affected` から組み立てる。`run_statement` の
 /// `SqlOutcome::Returning` 分岐参照）。バイト列の組み立て自体（`ResponseBuffer`
 /// によるバッファリング・上限超過時のフレーム境界分割送出）は本切り出しの
-/// 前後で完全に同一。
+/// 前後で完全に同一。`finish`／戻り値の意味は [`respond_query_result`] 参照。
 fn respond_rows_with_tag(
     stream: &mut TcpStream,
     result: &engine::sql::exec::QueryResult,
     tag: &str,
-) -> io::Result<()> {
+    finish: Finish,
+) -> io::Result<StatementStatus> {
     let row_desc = match result_encoder::encode_row_description(&result.columns) {
         Ok(msg) => msg,
         Err(_) => {
-            return respond_error_and_ready(
+            respond_error_and_ready(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode row description",
-            )
+            )?;
+            return Ok(StatementStatus::Failed);
         }
     };
 
@@ -481,11 +539,12 @@ fn respond_rows_with_tag(
                 // ErrorResponse へ切り替える（部分フレームを絶対に残さない）。
                 buffer.truncate_to(start);
                 buffer.flush(stream)?;
-                return respond_error_and_ready(
+                respond_error_and_ready(
                     stream,
                     ErrorClass::InternalError,
                     "failed to encode data row",
-                );
+                )?;
+                return Ok(StatementStatus::Failed);
             }
         }
         if buffer.len() >= crate::limits::MAX_RESPONSE_BUFFER_BYTES {
@@ -496,8 +555,11 @@ fn respond_rows_with_tag(
     match result_encoder::encode_command_complete(tag) {
         Ok(msg) => {
             buffer.push_frame(stream, &msg)?;
-            buffer.push_frame(stream, &result_encoder::encode_ready_for_query())?;
-            buffer.flush(stream)
+            if finish == Finish::ReadyForQuery {
+                buffer.push_frame(stream, &result_encoder::encode_ready_for_query())?;
+            }
+            buffer.flush(stream)?;
+            Ok(StatementStatus::Completed)
         }
         Err(_) => {
             buffer.flush(stream)?;
@@ -505,7 +567,8 @@ fn respond_rows_with_tag(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode command complete response",
-            )
+            )?;
+            Ok(StatementStatus::Failed)
         }
     }
 }
@@ -574,7 +637,8 @@ mod tests {
         let (mut server, mut client) = loopback_pair();
         let expected_len = expected.len();
         let reader = std::thread::spawn(move || read_exact_owned(&mut client, expected_len));
-        respond_query_result(&mut server, &result, "SELECT").expect("respond");
+        respond_query_result(&mut server, &result, "SELECT", Finish::ReadyForQuery)
+            .expect("respond");
         let received = reader.join().expect("reader thread");
 
         assert_eq!(received, expected);
@@ -616,7 +680,8 @@ mod tests {
             client.read_to_end(&mut buf).expect("read_to_end");
             buf
         });
-        respond_query_result(&mut server, &result, "SELECT").expect("respond");
+        respond_query_result(&mut server, &result, "SELECT", Finish::ReadyForQuery)
+            .expect("respond");
         drop(server);
         let received = reader.join().expect("reader thread");
 
