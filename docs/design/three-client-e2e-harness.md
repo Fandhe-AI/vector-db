@@ -493,6 +493,89 @@ own Private 行（alice の id=11・bob の id=12）は密側でクエリベク�
 production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
 無変更（テスト・docs 専任）。
 
+### DML パリティ（Issue #877）
+
+**目的**: SQL 経路パリティ（#779）は読み取り専用の 3 シナリオに限られて
+おり、`UPDATE`／`DELETE`（単一行 `id` 完全一致形。SQL-17・SQL-18・
+SQL-19）が SQL 表層と NoSQL 表層で同一の実行結果（影響行数・エラー
+`wire_code`・操作後の状態）を返すことは検証していなかった。層 A
+（`nosql12_update_delete.rs`）は同一プロセス内の 2 core 比較に留まる
+ため、実バイナリ `wire-server`・無改造クライアント（psql／curl／
+urllib／fetch）経由での検証を `run_sql_nosql_dml_parity_scenario` として
+追加した（curl／urllib／fetch の 3 テストが共有）。
+
+**起動方式（複数 DB・順次プロセス）**: DML は状態を変えるうえ、0 行の
+`UPDATE`／`DELETE` も台帳に記録される
+（`docs/design/sql-delete-single-row.md`「0 行成功への写像と台帳記録」節）。
+同一 `operation_id` を「他テナント行向け」と「未存在 id 向け」の両方に
+同一 DB 内で使うと 2 回目が `23505`／`22023` になり応答比較にならないため、
+RLS-9 の応答同一性検証だけは他テナント行を含む DB（DB-F）と含まない
+DB（DB-M）を分けて用意する。それ以外のケース（成功・`operation_id`
+必須化・台帳照合・複数列 `SET` の宣言順）は、同一内容で複製した 2 つの
+DB（DB-S を SQL 表層で、DB-N を NoSQL 表層で）へ同じ手順を順に適用して
+比較する。
+
+**書き込み後の SIGKILL について**: SQL 経路パリティ（#779）の「読み取り
+専用のため無害」という理由づけは DML には当てはまらない。本節では DML
+の応答を受信し終えてから `stop_and_drain` を呼び、durability は起動時
+引数を渡さず既定（`immediate`）のままとし、commit 成功応答が返った時点で
+永続化が保証される契約（`docs/spec/04-behavior/recovery.md` RECOVER-5
+ポインタ）に依拠する。
+
+**DML の採取方法（生 wire）**: SQL 側の `UPDATE`／`DELETE` は psql では
+なく生 wire（`run_sql_dml`）で送る。psql は拡張クエリプロトコル未対応で
+`CommandComplete` タグ・`ErrorResponse` の SQLSTATE／message を安定に
+取り出せないため、`sql_column_types_via_raw_wire`（#779）と同じ方針を
+踏襲する。読み取り専用の状態確認（操作後の最終状態）は引き続き psql
+（`run_psql_with_header`）で行う——`ORDER BY` は距離関数（`<=>`／
+`HYBRID(...)`）専用の構文でスカラー列には使えないため、SQL-15 の広域
+取得（順序保証なし。`SELECT id, lang FROM docs LIMIT 100`）を使い呼び出し
+元でソートしてから NoSQL 側の `op: scan` 結果と比較する。
+
+**ケース集合（`DML_STEPS`）**: alice（tenant-a）が順に実行する 14
+ステップ（成功〔own 行・own Private 行〕・RLS-9 対照〔他テナント可視
+Public 行・他テナント Private 行・未存在 id〕・台帳照合〔同一内容再送
+`23505`・内容不一致再送 `22023`〕・複数列 `SET` の宣言順パリティ・
+`operation_id` 必須化 `23502`・未存在テーブル `42P01`）と、bob
+（tenant-b）が実行する 1 ステップ（alice 所有の Private 行 id=11 への
+`DELETE` が 0 行成功になることの RLS-9・RLS-11 対照）で構成する。
+SQL 側・NoSQL 側それぞれに同じ手順を適用し、各ステップの影響行数
+（`CommandComplete` タグの数値部分・`{"updated"/"deleted":n}` の `n`）
+または `wire_code` が一致することを確認したうえで、両表層の最終状態
+（`id`,`lang` の多重集合）が一致し、かつ手計算した固定オラクルとも
+一致することを確認する（両表層が同じ誤りを返すケースの排除）。
+
+**台帳のプロセス・表層横断永続**: DB-S での SQL 実行後にプロセスを
+SIGKILL し、同じ DB ファイルで NoSQL 表層を起動して同一 `operation_id`
+（`dml-u1`）を再送すると `23505`（同一内容）／`22023`（内容不一致）に
+なること、逆方向（DB-N を NoSQL 表層で記録 → SIGKILL → 同じ DB ファイルで
+SQL 表層を起動 → 再送）でも `23505` になることを確認した。台帳が
+プロセス再起動・表層切替をまたいで永続することの非 vacuous な証跡になる
+（層 A は同一プロセス内の 2 core 比較に留まるため、この永続性は本節が
+固有に検証する）。
+
+**RLS-9 応答同一性**: 他テナント（tenant-b）所有の Public 行 id=100 のみを
+含む DB-F と、空の `docs` テーブルのみを持つ DB-M を用意し、同一
+`operation_id` で id=100（DB-F）／id=999（DB-M）へ `UPDATE` を送ると、
+SQL 側は `CommandComplete` タグが一致（`"UPDATE 0"`）、NoSQL 側は
+ステータス・本文が完全一致することを確認した。
+
+**実測結果**: 3 クライアント（curl／urllib／fetch）すべてで 14 ステップ・
+bob ステップ・台帳の表層横断永続・RLS-9 応答同一性・最終状態一致の
+いずれも green（本開発環境。`make e2e-three-client-http` の
+`[e2e-record] dml-parity/<client>: ...` 行を参照）。実測で発見した意味差
+は無かった。
+
+**スコープ外**: 述語つき `UPDATE ... WHERE`／`DELETE ... WHERE`
+（NoSQL `filter` は `0A000`／501 のまま未接続）・`RETURNING`・
+UPSERT・複数行 `INSERT` は NoSQL 表層が公開していないためパリティが
+成立せず対象外。ヘッダを含む HTTP 応答全体のバイト同一性は層 A
+（`nosql12_update_delete.rs::strip_date` 比較）の担当で、本節はステータス・
+本文までの一致に留める。
+
+production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
+無変更（テスト・docs 専任）。
+
 ### Issue #878: wire セッションの可視性非対称と DML の相互作用（判断記録）
 
 Phase 0（#972）の最終 Issue として、旧「スコープ外」項の可視性非対称を

@@ -98,6 +98,56 @@
 //! 両表層の応答に一致して含む（`ParityCase::expected_rows_{alice,bob}` の
 //! テナント別固定オラクル）。3 テナントいずれも**他テナント**の Private
 //! 行 id が両表層のどの応答にも現れないことをあわせて検証する。
+//!
+//! ## DML パリティ（Issue #877）
+//!
+//! 上記 2 シナリオ（読み取り専用）とは異なり、`UPDATE`／`DELETE`（SQL-17・
+//! SQL-18・SQL-19。単一行 `id` 完全一致形のみ。述語形 `filter` は NoSQL 側
+//! 未接続のため対象外）が SQL 表層と NoSQL 表層で同一の実行結果（影響行数・
+//! エラー `wire_code`・操作後の状態）を返すことを `run_sql_nosql_dml_parity_scenario`
+//! で固定する（curl／urllib／fetch の 3 テストが共有）。エラー時の `message`
+//! はケースごとに束縛段階が表層間で異なりうるため比較対象に含めない
+//! （`DmlExpectation::Error`・`DmlOutcomeSummary` のコメントを参照）。
+//!
+//! **起動方式（複数 DB・順次プロセス）**: DML は状態を変えるうえ、0 行の
+//! `UPDATE`／`DELETE` も台帳に記録される（`docs/design/sql-delete-single-row.md`
+//! 「0 行成功への写像と台帳記録」節）。同一 `operation_id` を「他テナント
+//! 行向け」と「未存在 id 向け」の両方に同一 DB 内で使うと 2 回目が
+//! `23505`／`22023` になり応答比較にならないため、RLS-9 の応答同一性検証
+//! だけは他テナント行を含む DB（DB-F）と含まない DB（DB-M）を分けて用意
+//! する。それ以外のケース（成功・`operation_id` 必須化・台帳照合・複数列
+//! `SET` の宣言順）は、同一内容で複製した 2 つの DB（DB-S を SQL 表層で、
+//! DB-N を NoSQL 表層で）へ同じ手順を順に適用して比較する。
+//!
+//! **書き込み後の SIGKILL について**: `stop_and_drain` は SIGKILL だが、
+//! DML の応答を受信し終えてから呼ぶため無害である。durability は起動時
+//! 引数を渡さず既定（`immediate`）のままとし、commit 成功応答が返った
+//! 時点で永続化が保証される契約（`docs/spec/04-behavior/recovery.md`
+//! RECOVER-5 ポインタ）に依拠する。上記の 2 つの読み取り専用シナリオが
+//! 述べる「読み取り専用のため無害」という理由づけは本節には当てはまらず、
+//! 根拠を durability 契約に差し替える。
+//!
+//! **DML の採取方法（生 wire）**: SQL 側の `UPDATE`／`DELETE` は psql
+//! ではなく生 wire（`run_sql_dml`）で送る。psql は拡張クエリプロトコル
+//! 未対応で `CommandComplete` タグ・`ErrorResponse` の SQLSTATE／message を
+//! 安定に取り出せないため、このファイル既存の型採取ヘルパー
+//! （`sql_column_types_via_raw_wire`）と同じ方針を踏襲する。読み取り専用の
+//! 状態確認（操作後の最終状態）は引き続き psql（`run_psql_with_header`）で
+//! 行う。
+//!
+//! **台帳のプロセス・表層横断永続**: DB-S での SQL 実行後にプロセスを
+//! SIGKILL し、同じ DB ファイルで NoSQL 表層を起動して同一 `operation_id`
+//! を再送すると `23505`／`22023` になること（逆方向も同様）を確認し、台帳が
+//! プロセス再起動・表層切替をまたいで永続することの非 vacuous な証跡とする
+//! （層 A の `nosql12_update_delete.rs` は同一プロセス内の 2 core 比較に
+//! 留まるため、この永続性は本ファイルが固有に検証する）。
+//!
+//! **スコープ外**: 述語つき `UPDATE ... WHERE`／`DELETE ... WHERE`
+//! （NoSQL `filter` は `0A000`／501 のまま未接続）・`RETURNING`・
+//! UPSERT・複数行 `INSERT` は NoSQL 表層が公開していないためパリティが
+//! 成立せず対象外。ヘッダを含む HTTP 応答全体のバイト同一性は層 A
+//! （`nosql12_update_delete.rs::strip_date` 比較）の担当で、本ファイルは
+//! ステータス・本文までの一致に留める。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -1602,4 +1652,1018 @@ fn urllib_matches_psql_on_search_scan_aggregate() {
 #[ignore = "requires psql and node (>= 18); run via `make e2e-three-client-http`"]
 fn fetch_matches_psql_on_search_scan_aggregate() {
     run_sql_nosql_parity_scenario(HttpClient::Fetch);
+}
+
+// ---------------------------------------------------------------------------
+// DML パリティ（Issue #877）。モジュールドキュメント「DML パリティ」節参照。
+// ---------------------------------------------------------------------------
+
+/// `seed_parity_db` と同一内容（`docs` テーブル・3 テナント Public 各 1 件・
+/// tenant-a/tenant-b の Private 各 1 件）の一時 DB を、DML シナリオ専用の
+/// ラベル付きファイル名で複製する（Issue #877。DB-S／DB-N の 2 つを独立した
+/// ファイルとして用意し、同じ手順を SQL 表層・NoSQL 表層それぞれへ適用して
+/// 比較できるようにする）。
+fn seed_dml_parity_db(label: &str) -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path(&format!("three-client-http-e2e-dml-{label}"));
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let public_rows: [(&str, u64, [f32; 2], &str, &str); 3] = [
+        ("tenant-a", 1, [1.0, 0.0], "ja", "vector database intro"),
+        ("tenant-b", 2, [0.0, 1.0], "en", "query planning notes"),
+        ("tenant-c", 3, [-1.0, 0.0], "ja", "unrelated topic"),
+    ];
+    for (tenant, id, dir, lang, body) in public_rows {
+        let ctx = PolicyContext::new(tenant).expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(dir.to_vec()),
+                Value::Text(lang.to_string()),
+                Value::Text(body.to_string()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse("dml-seed-public")
+                .expect("valid operation_id"),
+        )
+        .expect("insert public row");
+    }
+    let private_rows: [(&str, u64, [f32; 2], &str); 2] = [
+        ("tenant-a", 11, [1.0, 0.0], "xx"),
+        ("tenant-b", 12, [0.0, 1.0], "ja"),
+    ];
+    for (tenant, id, dir, lang) in private_rows {
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Private,
+            &[
+                Value::Vector(dir.to_vec()),
+                Value::Text(lang.to_string()),
+                Value::Text("private body".to_string()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse("dml-seed-private")
+                .expect("valid operation_id"),
+        )
+        .expect("insert private row");
+    }
+    (path, guard)
+}
+
+/// 1 行だけを含む最小 `docs` DB を用意する（RLS-9 応答同一性検証の
+/// 「未存在 id」対照用。Issue #877）。`owner` が所有する `id`（Public）が
+/// 唯一の行になる。
+fn seed_single_row_db(label: &str, owner: &str, id: u64) -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path(&format!("three-client-http-e2e-dml-{label}"));
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let ctx = PolicyContext::new(owner).expect("valid tenant");
+    engine::tenant::insert_typed_row(
+        &storage,
+        "docs",
+        &ctx,
+        id,
+        Visibility::Public,
+        &[
+            Value::Vector(vec![0.0, 1.0]),
+            Value::Text("en".to_string()),
+            Value::Text("owner body".to_string()),
+        ],
+        &engine::recovery::required_op_id::OperationId::parse("dml-rls9-seed")
+            .expect("valid operation_id"),
+    )
+    .expect("insert owner row");
+    (path, guard)
+}
+
+/// 空の `docs` テーブルだけを持つ DB を用意する（RLS-9 応答同一性検証の
+/// 「未存在 id」対照用。行が 1 件もないため対象 id は常に未存在になる）。
+fn seed_empty_docs_db(label: &str) -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path(&format!("three-client-http-e2e-dml-{label}"));
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    (path, guard)
+}
+
+/// SQL 表層への `UPDATE`／`DELETE` 1 文の生 wire 経由の結果（Issue #877。
+/// psql は拡張クエリ・SQLSTATE 抽出に不向きなため、`sql_column_types_via_raw_wire`
+/// と同じ方針で生 wire を直接読む）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SqlDmlOutcome {
+    /// `CommandComplete` タグ（例: `"UPDATE 1"`）。
+    Success { tag: String },
+    /// `ErrorResponse` の SQLSTATE・message。
+    Error { sqlstate: String, message: String },
+}
+
+/// `ErrorResponse`（'E'）の本文（`'S'`／`'C'`／`'M'` 等の 1 バイトタグ +
+/// nul 終端文字列の繰り返し、終端は 0 バイト 1 個）から SQLSTATE（`'C'`）と
+/// message（`'M'`）を取り出す。`common::expect_error_response_with_sqlstate_and_message`
+/// は期待値との一致検査に特化しており実際の値を返さないため、このファイル
+/// 専用の抽出版を用意する（`crates/wire-server/src/error_response.rs` が
+/// 唯一の送出経路であるため、フィールドレイアウトの解釈はそれと一致する）。
+fn parse_error_fields(body: &[u8]) -> (String, String) {
+    let mut sqlstate: Option<String> = None;
+    let mut message: Option<String> = None;
+    let mut pos = 0usize;
+    while pos < body.len() && body[pos] != 0 {
+        let field_type = body[pos];
+        pos += 1;
+        let nul = body[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .expect("nul-terminated error field value");
+        let value = std::str::from_utf8(&body[pos..pos + nul])
+            .expect("utf8 error field value")
+            .to_string();
+        pos += nul + 1;
+        match field_type {
+            b'C' => sqlstate = Some(value),
+            b'M' => message = Some(value),
+            _ => {}
+        }
+    }
+    (
+        sqlstate.unwrap_or_else(|| panic!("ErrorResponse missing SQLSTATE field")),
+        message.unwrap_or_else(|| panic!("ErrorResponse missing message field")),
+    )
+}
+
+/// 簡易クエリ送出直後の応答（`CommandComplete` または `ErrorResponse`）を
+/// 判別して読み取り、`ReadyForQuery` まで読み切ってから返す（呼び出し元が
+/// 同一接続で追加のクエリを送れるようにする）。長さフィールドは
+/// `read_row_description_with_oids` と同じ基準で確保前に検証する
+/// （coding-rust.md「untrusted 入力の扱い」参照。応答は実バイナリ由来だが
+/// 検証コストは軽微なため一貫して適用する）。
+fn read_sql_dml_response(stream: &mut TcpStream) -> SqlDmlOutcome {
+    let mut kind = [0u8; 1];
+    stream.read_exact(&mut kind).expect("read message type");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read len");
+    let len_i32 = i32::from_be_bytes(len_buf);
+    assert!(
+        (4..=(1 << 20)).contains(&len_i32),
+        "invalid message length {len_i32}"
+    );
+    let len = len_i32 as usize;
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).expect("read body");
+    let outcome = match kind[0] {
+        b'C' => {
+            let end = body.len().saturating_sub(1);
+            SqlDmlOutcome::Success {
+                tag: String::from_utf8_lossy(&body[..end]).to_string(),
+            }
+        }
+        b'E' => {
+            let (sqlstate, message) = parse_error_fields(&body);
+            SqlDmlOutcome::Error { sqlstate, message }
+        }
+        other => panic!("expected CommandComplete or ErrorResponse, got {other:?}"),
+    };
+    common::read_ready_for_query(stream);
+    outcome
+}
+
+/// 新規接続を張り 1 文の `UPDATE`／`DELETE` を送って結果を読む
+/// （`sql_column_types_via_raw_wire` と同じ接続作法。使い切った
+/// `TcpStream` は drop でクローズされる）。
+fn run_sql_dml(port: u16, user: &str, password: &str, sql: &str) -> SqlDmlOutcome {
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .expect("valid loopback addr");
+    let mut stream = common::authenticate_to_ready_for_query(addr, user, password);
+    common::send_simple_query(&mut stream, sql);
+    read_sql_dml_response(&mut stream)
+}
+
+/// psql 接続で `docs` の可視行（`id`,`lang`）を読み戻す（DML パリティの
+/// 最終状態比較用）。`ORDER BY` は距離関数（`<=>`／`HYBRID(...)`）専用の
+/// 構文でありスカラー列には使えないため（`sql::allowlist`）、SQL-15 の
+/// 広域取得（順序保証なし）を使い、呼び出し元でソートしてから比較する
+/// （`nosql_read_back_id_lang` の `scan` と同じ方針）。
+fn psql_read_back_id_lang(port: u16, user: &str, password: &str) -> Vec<(String, String)> {
+    let (_header, rows) =
+        run_psql_with_header(port, user, password, "SELECT id, lang FROM docs LIMIT 100");
+    rows.into_iter()
+        .map(|row| {
+            assert_eq!(row.len(), 2, "expected 2 cells, got {row:?}");
+            (row[0].clone(), row[1].clone())
+        })
+        .collect()
+}
+
+/// NoSQL 表層の `op: scan` で `docs` の可視行（`id`,`lang`）を読み戻す
+/// （DML パリティの最終状態比較用。`scan` は順序保証を持たない契約
+/// （SQL-15）のため呼び出し元でソートしてから比較する）。
+fn nosql_read_back_id_lang(
+    client: &HttpClient,
+    port: u16,
+    token: &str,
+    out_dir: &std::path::Path,
+    seq: &mut u32,
+) -> Vec<(String, String)> {
+    *seq += 1;
+    let (status, body) = client.post(
+        port,
+        "/v1/query",
+        Some(token),
+        r#"{"op":"scan","table":"docs","limit":100,"columns":["id","lang"]}"#,
+        out_dir,
+        *seq,
+    );
+    assert_eq!(status, 200, "scan read-back failed: {body}");
+    let result_obj = json_object(&body);
+    let rows_json = match result_obj.get("rows") {
+        Some(JsonValue::Array(rows)) => rows.clone(),
+        other => panic!("expected array rows field, got {other:?}"),
+    };
+    rows_json
+        .iter()
+        .map(|row| match row {
+            JsonValue::Array(cells) => {
+                assert_eq!(cells.len(), 2, "expected 2 cells, got {cells:?}");
+                (
+                    json_cell_to_pg_text(&cells[0], NULL_SENTINEL),
+                    json_cell_to_pg_text(&cells[1], NULL_SENTINEL),
+                )
+            }
+            other => panic!("expected array row, got {other:?}"),
+        })
+        .collect()
+}
+
+/// DML パリティ 1 ステップの期待結果（Issue #877）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DmlExpectation {
+    /// `CommandComplete` タグの数値部分・`{"updated"/"deleted":n}` の `n`。
+    Affected(u64),
+    /// SQLSTATE（`wire_code`）。message はケースごとに束縛段階が異なり
+    /// うるため比較対象に含めない（モジュールドキュメント「クエリ集合」節
+    /// の方針を踏襲）。
+    Error(&'static str),
+}
+
+/// SQL 表層（生 wire）・NoSQL 表層（`client`）が共有する 1 DML 操作の期待値
+/// （Issue #877。モジュールドキュメント「DML パリティ」節の表に対応）。
+/// `sql`／`json_body` はリテラル定数（クライアント応答由来の文字列を
+/// SQL／JSON へ連結しない）。
+struct DmlStep {
+    label: &'static str,
+    sql: &'static str,
+    json_body: &'static str,
+    expect: DmlExpectation,
+}
+
+/// alice（tenant-a）が順に実行する DML 手順（Issue #877）。`docs` の初期状態
+/// は `seed_dml_parity_db` と同一。各ステップは前のステップが変更した状態を
+/// 前提にする（例: `u-resend-same` は `u-own` が記録した `operation_id`
+/// `dml-u1` を同一内容で再送する）。
+const DML_STEPS: &[DmlStep] = &[
+    DmlStep {
+        label: "u-own",
+        sql: "UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'dml-u1'",
+        json_body: r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1},"operation_id":"dml-u1"}"#,
+        expect: DmlExpectation::Affected(1),
+    },
+    DmlStep {
+        label: "u-own-private",
+        sql: "UPDATE docs SET lang = 'en' WHERE id = 11 USING OPERATION_ID 'dml-u11'",
+        json_body: r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":11},"operation_id":"dml-u11"}"#,
+        expect: DmlExpectation::Affected(1),
+    },
+    DmlStep {
+        label: "u-foreign-visible",
+        sql: "UPDATE docs SET lang = 'en' WHERE id = 2 USING OPERATION_ID 'dml-u2'",
+        json_body: r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":2},"operation_id":"dml-u2"}"#,
+        expect: DmlExpectation::Affected(0),
+    },
+    DmlStep {
+        label: "u-foreign-private",
+        sql: "UPDATE docs SET lang = 'en' WHERE id = 12 USING OPERATION_ID 'dml-u12'",
+        json_body: r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":12},"operation_id":"dml-u12"}"#,
+        expect: DmlExpectation::Affected(0),
+    },
+    DmlStep {
+        label: "u-missing",
+        sql: "UPDATE docs SET lang = 'en' WHERE id = 999 USING OPERATION_ID 'dml-u999'",
+        json_body: r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":999},"operation_id":"dml-u999"}"#,
+        expect: DmlExpectation::Affected(0),
+    },
+    DmlStep {
+        label: "u-resend-same",
+        sql: "UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'dml-u1'",
+        json_body: r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1},"operation_id":"dml-u1"}"#,
+        expect: DmlExpectation::Error("23505"),
+    },
+    DmlStep {
+        label: "u-resend-diff",
+        sql: "UPDATE docs SET lang = 'fr' WHERE id = 1 USING OPERATION_ID 'dml-u1'",
+        json_body: r#"{"op":"update","table":"docs","set":{"lang":"fr"},"where":{"id":1},"operation_id":"dml-u1"}"#,
+        expect: DmlExpectation::Error("22023"),
+    },
+    DmlStep {
+        // SQL は宣言順 `lang, embedding`、JSON は常にアルファベット順
+        // `embedding, lang` へ正規化される（`nosql12_update_delete.rs` の
+        // J 節と同種の観点）。両者は値・意味が同一のため、`content_hash`
+        // 正規化が宣言順に依存しないことも本ステップの成功で確認できる。
+        label: "u-multi-col",
+        sql: "UPDATE docs SET lang = 'ja', embedding = '[0.4,0.5]' WHERE id = 1 USING OPERATION_ID 'dml-multi'",
+        json_body: r#"{"op":"update","table":"docs","set":{"embedding":[0.4,0.5],"lang":"ja"},"where":{"id":1},"operation_id":"dml-multi"}"#,
+        expect: DmlExpectation::Affected(1),
+    },
+    DmlStep {
+        label: "d-own",
+        sql: "DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'dml-d1'",
+        json_body: r#"{"op":"delete","table":"docs","where":{"id":1},"operation_id":"dml-d1"}"#,
+        expect: DmlExpectation::Affected(1),
+    },
+    DmlStep {
+        label: "d-foreign",
+        sql: "DELETE FROM docs WHERE id = 3 USING OPERATION_ID 'dml-d3'",
+        json_body: r#"{"op":"delete","table":"docs","where":{"id":3},"operation_id":"dml-d3"}"#,
+        expect: DmlExpectation::Affected(0),
+    },
+    DmlStep {
+        label: "d-missing",
+        sql: "DELETE FROM docs WHERE id = 999 USING OPERATION_ID 'dml-d999'",
+        json_body: r#"{"op":"delete","table":"docs","where":{"id":999},"operation_id":"dml-d999"}"#,
+        expect: DmlExpectation::Affected(0),
+    },
+    DmlStep {
+        label: "d-resend",
+        sql: "DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'dml-d1'",
+        json_body: r#"{"op":"delete","table":"docs","where":{"id":1},"operation_id":"dml-d1"}"#,
+        expect: DmlExpectation::Error("23505"),
+    },
+    DmlStep {
+        // `operation_id` 省略。SQL 側は `USING OPERATION_ID` 句そのものを
+        // 省く（単一行 `UPDATE` 構文は本節句を必須とするため許可リストが
+        // `42601` を返す想定にはならず、`bind_update` の必須化ガードで
+        // `23502` になる契約——`docs/design/update-single-row.md` 参照）。
+        label: "e-no-opid",
+        sql: "UPDATE docs SET lang = 'en' WHERE id = 2",
+        json_body: r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":2}}"#,
+        expect: DmlExpectation::Error("23502"),
+    },
+    DmlStep {
+        label: "e-undefined-table",
+        sql: "UPDATE docs_missing SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'dml-e2'",
+        json_body: r#"{"op":"update","table":"docs_missing","set":{"lang":"en"},"where":{"id":1},"operation_id":"dml-e2"}"#,
+        expect: DmlExpectation::Error("42P01"),
+    },
+];
+
+/// bob（tenant-b）が実行する 1 ステップ（Issue #877。alice 所有の Private
+/// 行 id=11 は bob には不可視のため `DELETE` は 0 行成功になる。RLS-9・
+/// RLS-11 の対照）。
+const BOB_STEP: DmlStep = DmlStep {
+    label: "b-delete-foreign-private",
+    sql: "DELETE FROM docs WHERE id = 11 USING OPERATION_ID 'dml-b1'",
+    json_body: r#"{"op":"delete","table":"docs","where":{"id":11},"operation_id":"dml-b1"}"#,
+    expect: DmlExpectation::Affected(0),
+};
+
+/// `CommandComplete` タグ（`"UPDATE 1"`／`"DELETE 0"` 等）から影響行数を
+/// 取り出す。タグ形状が想定と異なる場合は untrusted な実バイナリ応答を
+/// fail-closed に扱い `panic!` する。
+fn affected_count_from_tag(tag: &str) -> u64 {
+    let n = tag
+        .rsplit(' ')
+        .next()
+        .unwrap_or_else(|| panic!("empty CommandComplete tag"));
+    n.parse()
+        .unwrap_or_else(|e| panic!("CommandComplete tag {tag:?} has no numeric suffix: {e}"))
+}
+
+/// NoSQL 応答本文から `updated`／`deleted` の影響行数を取り出す。
+fn affected_count_from_nosql_body(body: &str) -> u64 {
+    let obj = json_object(body);
+    match obj.get("updated").or_else(|| obj.get("deleted")) {
+        Some(JsonValue::Number(JsonNumber::PosInt(n))) => *n,
+        other => panic!("expected updated/deleted field, got {other:?} (body={body:?})"),
+    }
+}
+
+/// NoSQL エラー応答本文（`{"error":{"wire_code":...,"code":...,"message":...}}`。
+/// `http_common::wire_code_of` と同じネスト形状。このファイルは HTTP
+/// クライアント（curl／urllib／fetch）の生本文しか持たないため専用の抽出版
+/// を用意する）から `wire_code` を取り出す。
+fn nosql_wire_code_of(body: &str) -> String {
+    let obj = json_object(body);
+    match obj.get("error") {
+        Some(JsonValue::Object(err)) => match err.get("wire_code") {
+            Some(JsonValue::String(s)) => s.clone(),
+            other => panic!("expected string wire_code field, got {other:?} (body={body:?})"),
+        },
+        other => panic!("expected object error field, got {other:?} (body={body:?})"),
+    }
+}
+
+/// `DML_STEPS`／`BOB_STEP` 1 件を SQL 表層（生 wire）へ適用し、`expect` と
+/// 一致することを確認する。
+fn apply_sql_dml_step(port: u16, user: &str, password: &str, step: &DmlStep) -> SqlDmlOutcome {
+    let outcome = run_sql_dml(port, user, password, step.sql);
+    match (&step.expect, &outcome) {
+        (DmlExpectation::Affected(n), SqlDmlOutcome::Success { tag }) => {
+            assert_eq!(
+                affected_count_from_tag(tag),
+                *n,
+                "step={} sql tag={tag:?}",
+                step.label
+            );
+        }
+        (DmlExpectation::Error(code), SqlDmlOutcome::Error { sqlstate, message }) => {
+            assert_eq!(
+                sqlstate, code,
+                "step={} sql message={message:?}",
+                step.label
+            );
+        }
+        (expect, outcome) => panic!(
+            "step={}: sql outcome {outcome:?} does not match expectation {expect:?}",
+            step.label
+        ),
+    }
+    outcome
+}
+
+/// `SqlDmlOutcome`／NoSQL 応答本文の双方を「影響行数」または「`wire_code`」
+/// へ正規化した比較用の値（Issue #877・codex-review 指摘。`message` は
+/// `DmlExpectation::Error` のコメントで既述のとおり束縛段階が表層間で
+/// 異なりうるため対象外のまま、`wire_code`／影響行数は両表層の実際の
+/// 応答同士を直接比較する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DmlOutcomeSummary {
+    Affected(u64),
+    Error(String),
+}
+
+impl From<&SqlDmlOutcome> for DmlOutcomeSummary {
+    fn from(outcome: &SqlDmlOutcome) -> Self {
+        match outcome {
+            SqlDmlOutcome::Success { tag } => {
+                DmlOutcomeSummary::Affected(affected_count_from_tag(tag))
+            }
+            SqlDmlOutcome::Error { sqlstate, .. } => DmlOutcomeSummary::Error(sqlstate.clone()),
+        }
+    }
+}
+
+/// `DML_STEPS`／`BOB_STEP` 1 件を NoSQL 表層（`client`）へ適用し、同じ
+/// `expect` との一致に加え、`sql_outcome`（同じステップを SQL 表層へ適用
+/// した実際の結果）と NoSQL 応答を `DmlOutcomeSummary` として直接比較する
+/// （codex-review 指摘・PR #994: 従来は両表層を固定 `expect` へ別々に
+/// 照合するのみで表層間の応答を直接突き合わせていなかった）。
+fn apply_nosql_dml_step(
+    client: &HttpClient,
+    port: u16,
+    token: &str,
+    out_dir: &std::path::Path,
+    seq: &mut u32,
+    step: &DmlStep,
+    sql_outcome: &SqlDmlOutcome,
+) {
+    *seq += 1;
+    let (status, body) = client.post(
+        port,
+        "/v1/query",
+        Some(token),
+        step.json_body,
+        out_dir,
+        *seq,
+    );
+    let nosql_summary = match &step.expect {
+        DmlExpectation::Affected(n) => {
+            assert_eq!(status, 200, "step={} nosql body={body}", step.label);
+            let affected = affected_count_from_nosql_body(&body);
+            assert_eq!(affected, *n, "step={} nosql body={body}", step.label);
+            DmlOutcomeSummary::Affected(affected)
+        }
+        DmlExpectation::Error(code) => {
+            assert_ne!(status, 200, "step={} nosql body={body}", step.label);
+            let wire_code = nosql_wire_code_of(&body);
+            assert_eq!(wire_code, *code, "step={} nosql body={body}", step.label);
+            DmlOutcomeSummary::Error(wire_code)
+        }
+    };
+    let sql_summary = DmlOutcomeSummary::from(sql_outcome);
+    assert_eq!(
+        nosql_summary, sql_summary,
+        "step={}: sql/nosql outcome mismatch (sql={sql_outcome:?} nosql status={status} \
+         body={body})",
+        step.label
+    );
+}
+
+/// `run_sql_nosql_dml_parity_scenario` の実行記録・各サーバー stderr に
+/// 機密値（トークン・ユーザー名・パスワード・テナント id）を混ぜないことを
+/// 確認する共通アサーション。`[e2e-record]` 行だけでなく、4 回の
+/// `stop_and_drain`（`sql_seen`／`nosql_seen`／`db_s_nosql_seen`／
+/// `db_n_sql_seen`）が返す生 stderr にもそれぞれ適用する
+/// （codex-review 指摘・PR #994）。
+fn assert_dml_scenario_no_leak(source: &str, haystack: &str, tokens: &[&str]) {
+    // 検査対象の生文字列（`haystack`）には実セッショントークン・実パスワード
+    // が含まれ得るため、失敗時のパニックメッセージへは検査対象そのものを
+    // 埋め込まない。`source`（呼び出し元が識別する非機密なラベル。例:
+    // "sql_seen"）だけを出力し、CI ログへ秘密値が再出力されるのを防ぐ
+    // （codex-review P0 指摘・PR #994）。
+    for secret in ["alice", "bob", "pw-alice", "pw-bob", "tenant-a", "tenant-b"] {
+        assert!(
+            !haystack.contains(secret),
+            "must not leak a credential/tenant identifier in {source} (value redacted)"
+        );
+    }
+    for token in tokens {
+        assert!(
+            !haystack.contains(token),
+            "must not leak a session token in {source} (value redacted)"
+        );
+    }
+}
+
+/// 無改造の外部 HTTP クライアント（`client` で切替）で、`UPDATE`／`DELETE`
+/// （単一行 `id` 完全一致形）が SQL 表層（実 `wire-server`・生 wire）と
+/// NoSQL 表層（実 `wire-server --surface nosql`・`client`）で同一の実行
+/// 結果（影響行数・エラー `wire_code`・操作後の状態）を返すことを固定する
+/// シナリオ（Issue #877。curl／urllib／fetch の 3 テストが本関数へ委譲する）。
+/// モジュールドキュメント「DML パリティ」節の起動方式・スコープに従う。
+fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
+    let client_version = client.version();
+    let psql_version = psql_version();
+
+    let users_path = common::write_user_store_file(&[
+        ("alice", "tenant-a", "pw-alice"),
+        ("bob", "tenant-b", "pw-bob"),
+    ]);
+    let users_path_str = users_path.to_str().expect("utf-8 users path").to_string();
+
+    let out_dir = std::env::temp_dir().join(format!(
+        "wire-server-three-client-http-e2e-dml-{}-out-{}-{}",
+        client.label(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&out_dir).expect("create client output dir");
+    let _out_dir_guard = CurlOutDirGuard(out_dir.clone());
+    let mut seq: u32 = 0;
+
+    // --- Phase 1: DB-S を SQL 表層で駆動し、全ステップを生 wire で適用する。
+    let (db_s_path, _db_s_guard) = seed_dml_parity_db("db-s");
+    let db_s_path_str = db_s_path.to_str().expect("utf-8 db path").to_string();
+    let (sql_server, sql_port) = spawn_sql_server(&users_path_str, &db_s_path_str);
+    let mut sql_outcomes: Vec<SqlDmlOutcome> = Vec::with_capacity(DML_STEPS.len());
+    for step in DML_STEPS {
+        sql_outcomes.push(apply_sql_dml_step(sql_port, "alice", "pw-alice", step));
+    }
+    let bob_sql_outcome = apply_sql_dml_step(sql_port, "bob", "pw-bob", &BOB_STEP);
+    let sql_final_alice = psql_read_back_id_lang(sql_port, "alice", "pw-alice");
+    let sql_final_bob = psql_read_back_id_lang(sql_port, "bob", "pw-bob");
+    let sql_seen = sql_server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        !sql_seen.iter().any(|line| line.contains("surface nosql")),
+        "SQL surface must not print the nosql surface banner: {sql_seen:?}"
+    );
+    // codex-review 指摘（PR #994）: `[e2e-record]` だけでなく各 stop_and_drain
+    // が返す生 stderr にも機密値の非漏えい検査を適用する。この時点ではまだ
+    // セッショントークンを発行していないため tokens は空。
+    assert_dml_scenario_no_leak("sql_seen", &sql_seen.join("\n"), &[]);
+
+    // --- Phase 2: 同一内容で複製した DB-N を NoSQL 表層で駆動し、同じ手順を
+    //     `client` で適用する。
+    let (db_n_path, _db_n_guard) = seed_dml_parity_db("db-n");
+    let db_n_path_str = db_n_path.to_str().expect("utf-8 db path").to_string();
+    let (nosql_server, nosql_port) = spawn_nosql_server(&users_path_str, &db_n_path_str);
+
+    seq += 1;
+    let (status, body) = client.post(
+        nosql_port,
+        "/v1/session",
+        None,
+        r#"{"user":"alice","password":"pw-alice"}"#,
+        &out_dir,
+        seq,
+    );
+    assert_eq!(status, 200, "alice session issue failed: {body}");
+    let alice_token = match json_object(&body).get("token") {
+        Some(JsonValue::String(s)) => s.clone(),
+        other => panic!("expected string token field, got {other:?}"),
+    };
+    assert_valid_session_token(&alice_token);
+
+    for (step, sql_outcome) in DML_STEPS.iter().zip(sql_outcomes.iter()) {
+        apply_nosql_dml_step(
+            &client,
+            nosql_port,
+            &alice_token,
+            &out_dir,
+            &mut seq,
+            step,
+            sql_outcome,
+        );
+    }
+    let nosql_final_alice =
+        nosql_read_back_id_lang(&client, nosql_port, &alice_token, &out_dir, &mut seq);
+
+    seq += 1;
+    let (status, body) = client.post(
+        nosql_port,
+        "/v1/session",
+        None,
+        r#"{"user":"bob","password":"pw-bob"}"#,
+        &out_dir,
+        seq,
+    );
+    assert_eq!(status, 200, "bob session issue failed: {body}");
+    let bob_token = match json_object(&body).get("token") {
+        Some(JsonValue::String(s)) => s.clone(),
+        other => panic!("expected string token field, got {other:?}"),
+    };
+    assert_valid_session_token(&bob_token);
+    apply_nosql_dml_step(
+        &client,
+        nosql_port,
+        &bob_token,
+        &out_dir,
+        &mut seq,
+        &BOB_STEP,
+        &bob_sql_outcome,
+    );
+    let nosql_final_bob =
+        nosql_read_back_id_lang(&client, nosql_port, &bob_token, &out_dir, &mut seq);
+
+    // 最終状態の一致（両表層が同じ誤りを返すケースの排除も兼ねる固定
+    // オラクル）。alice 視点: id=1 は d-own で削除済み、id=11 は
+    // u-own-private で 'en' のまま、id=2/3 は他テナント所有のため不変。
+    let expected_alice: Vec<(String, String)> = vec![
+        ("2".into(), "en".into()),
+        ("3".into(), "ja".into()),
+        ("11".into(), "en".into()),
+    ];
+    let mut sql_final_alice_sorted = sql_final_alice.clone();
+    sql_final_alice_sorted.sort();
+    let mut nosql_final_alice_sorted = nosql_final_alice.clone();
+    nosql_final_alice_sorted.sort();
+    let mut expected_alice_sorted = expected_alice.clone();
+    expected_alice_sorted.sort();
+    assert_eq!(
+        sql_final_alice_sorted, nosql_final_alice_sorted,
+        "final state (alice) mismatch between SQL and NoSQL surfaces"
+    );
+    assert_eq!(
+        sql_final_alice_sorted, expected_alice_sorted,
+        "final state (alice) does not match fixed oracle"
+    );
+
+    // bob 視点: id=11（alice の Private 行）は不可視のまま。id=2 は
+    // e-no-opid が `23502` で拒否され副作用なしのため 'en' へ書き換わって
+    // いない（元の seed 値 'en' のまま——tenant-b 所有の Public 行は元々
+    // lang='en' のため見た目の変化はないが、u-foreign-visible の
+    // `23502`／拒否経路で書き換わっていないことをこの一致で確認する）。
+    let expected_bob: Vec<(String, String)> = vec![
+        ("2".into(), "en".into()),
+        ("3".into(), "ja".into()),
+        ("12".into(), "ja".into()),
+    ];
+    let mut sql_final_bob_sorted = sql_final_bob.clone();
+    sql_final_bob_sorted.sort();
+    let mut nosql_final_bob_sorted = nosql_final_bob.clone();
+    nosql_final_bob_sorted.sort();
+    let mut expected_bob_sorted = expected_bob.clone();
+    expected_bob_sorted.sort();
+    assert_eq!(
+        sql_final_bob_sorted, nosql_final_bob_sorted,
+        "final state (bob) mismatch between SQL and NoSQL surfaces"
+    );
+    assert_eq!(
+        sql_final_bob_sorted, expected_bob_sorted,
+        "final state (bob) does not match fixed oracle"
+    );
+
+    // DB-N を後続フェーズ（SQL 表層での再オープン）に備えていったん停止する
+    // （redb は単一ライターのため、同一ファイルを別プロセスで開く前に
+    // 確実に終了させる）。
+    let nosql_seen = nosql_server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        nosql_seen.iter().any(|line| line.contains("surface nosql")),
+        "expected nosql surface banner in stderr, got: {nosql_seen:?}"
+    );
+    assert_dml_scenario_no_leak(
+        "nosql_seen",
+        &nosql_seen.join("\n"),
+        &[alice_token.as_str(), bob_token.as_str()],
+    );
+
+    // --- Phase 3: 台帳のプロセス・表層横断永続。DB-S（SQL 表層で
+    //     `dml-u1`＝`lang='en'` を記録済み）を NoSQL 表層で開き直し、
+    //     同一内容の再送は `23505`、異なる内容は `22023` になることを
+    //     確認する。
+    let (db_s_nosql_server, db_s_nosql_port) = spawn_nosql_server(&users_path_str, &db_s_path_str);
+    seq += 1;
+    let (status, body) = client.post(
+        db_s_nosql_port,
+        "/v1/session",
+        None,
+        r#"{"user":"alice","password":"pw-alice"}"#,
+        &out_dir,
+        seq,
+    );
+    assert_eq!(status, 200, "alice session (DB-S/nosql) failed: {body}");
+    let db_s_alice_token = match json_object(&body).get("token") {
+        Some(JsonValue::String(s)) => s.clone(),
+        other => panic!("expected string token field, got {other:?}"),
+    };
+    seq += 1;
+    let (status, body) = client.post(
+        db_s_nosql_port,
+        "/v1/query",
+        Some(&db_s_alice_token),
+        r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1},"operation_id":"dml-u1"}"#,
+        &out_dir,
+        seq,
+    );
+    assert_eq!(status, 409, "cross-surface same-content resend: {body}");
+    assert_eq!(
+        nosql_wire_code_of(&body),
+        "23505",
+        "cross-surface same-content resend: {body}"
+    );
+    seq += 1;
+    let (status, body) = client.post(
+        db_s_nosql_port,
+        "/v1/query",
+        Some(&db_s_alice_token),
+        r#"{"op":"update","table":"docs","set":{"lang":"zz"},"where":{"id":1},"operation_id":"dml-u1"}"#,
+        &out_dir,
+        seq,
+    );
+    assert_eq!(status, 400, "cross-surface diff-content resend: {body}");
+    assert_eq!(
+        nosql_wire_code_of(&body),
+        "22023",
+        "cross-surface diff-content resend: {body}"
+    );
+    let db_s_nosql_seen = db_s_nosql_server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        db_s_nosql_seen
+            .iter()
+            .any(|line| line.contains("surface nosql")),
+        "expected nosql surface banner in stderr, got: {db_s_nosql_seen:?}"
+    );
+    assert_dml_scenario_no_leak(
+        "db_s_nosql_seen",
+        &db_s_nosql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+        ],
+    );
+
+    // 逆方向: DB-N（NoSQL 表層で `dml-u1` を記録済み）を SQL 表層で開き直し、
+    // 同一内容の再送が `23505` になることを確認する。
+    let (db_n_sql_server, db_n_sql_port) = spawn_sql_server(&users_path_str, &db_n_path_str);
+    let outcome = run_sql_dml(
+        db_n_sql_port,
+        "alice",
+        "pw-alice",
+        "UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'dml-u1'",
+    );
+    match outcome {
+        SqlDmlOutcome::Error { sqlstate, .. } => {
+            assert_eq!(sqlstate, "23505", "cross-surface resend (nosql→sql)")
+        }
+        other => panic!("expected 23505 error, got {other:?}"),
+    }
+    let db_n_sql_seen = db_n_sql_server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        !db_n_sql_seen
+            .iter()
+            .any(|line| line.contains("surface nosql")),
+        "SQL surface must not print the nosql surface banner: {db_n_sql_seen:?}"
+    );
+    assert_dml_scenario_no_leak(
+        "db_n_sql_seen",
+        &db_n_sql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+        ],
+    );
+
+    // --- Phase 4: RLS-9 応答同一性。他テナント行を持つ DB-F・空の DB-M を
+    //     用意し、同一 `operation_id` を他テナント所有 id／未存在 id へ
+    //     それぞれ送って応答（タグ・NoSQL ステータス＋本文）が一致する
+    //     ことを確認する。
+    let (db_f_path, _db_f_guard) = seed_single_row_db("db-f", "tenant-b", 100);
+    let db_f_path_str = db_f_path.to_str().expect("utf-8 db path").to_string();
+    let (db_m_path, _db_m_guard) = seed_empty_docs_db("db-m");
+    let db_m_path_str = db_m_path.to_str().expect("utf-8 db path").to_string();
+
+    let (db_f_sql, db_f_sql_port) = spawn_sql_server(&users_path_str, &db_f_path_str);
+    let outcome_f = run_sql_dml(
+        db_f_sql_port,
+        "alice",
+        "pw-alice",
+        "UPDATE docs SET lang = 'en' WHERE id = 100 USING OPERATION_ID 'dml-rls9-a'",
+    );
+    let db_f_sql_seen = db_f_sql.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    let (db_m_sql, db_m_sql_port) = spawn_sql_server(&users_path_str, &db_m_path_str);
+    let outcome_m = run_sql_dml(
+        db_m_sql_port,
+        "alice",
+        "pw-alice",
+        "UPDATE docs SET lang = 'en' WHERE id = 999 USING OPERATION_ID 'dml-rls9-a'",
+    );
+    let db_m_sql_seen = db_m_sql.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    // codex-review 指摘（PR #994）: Phase 4 の 4 サーバー（DB-F/DB-M/DB-F2/
+    // DB-M2）は従来 stderr を破棄しており非漏えい検査から漏れていた。
+    // DB-F／DB-M（SQL 表層）はセッショントークンを発行しないため、この
+    // 時点までに発行済みの NoSQL トークンのみを対象に検査する。
+    assert_dml_scenario_no_leak(
+        "db_f_sql_seen",
+        &db_f_sql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+        ],
+    );
+    assert_dml_scenario_no_leak(
+        "db_m_sql_seen",
+        &db_m_sql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+        ],
+    );
+    assert_eq!(
+        outcome_f, outcome_m,
+        "RLS-9: foreign-tenant-row and missing-id responses (SQL) must be identical"
+    );
+    match &outcome_f {
+        SqlDmlOutcome::Success { tag } => assert_eq!(affected_count_from_tag(tag), 0),
+        other => panic!("expected 0-row success, got {other:?}"),
+    }
+
+    let (db_f2_path, _db_f2_guard) = seed_single_row_db("db-f2", "tenant-b", 100);
+    let db_f2_path_str = db_f2_path.to_str().expect("utf-8 db path").to_string();
+    let (db_m2_path, _db_m2_guard) = seed_empty_docs_db("db-m2");
+    let db_m2_path_str = db_m2_path.to_str().expect("utf-8 db path").to_string();
+
+    let (db_f2_nosql, db_f2_port) = spawn_nosql_server(&users_path_str, &db_f2_path_str);
+    seq += 1;
+    let (status, body) = client.post(
+        db_f2_port,
+        "/v1/session",
+        None,
+        r#"{"user":"alice","password":"pw-alice"}"#,
+        &out_dir,
+        seq,
+    );
+    assert_eq!(status, 200, "alice session (DB-F2) failed: {body}");
+    let db_f2_token = match json_object(&body).get("token") {
+        Some(JsonValue::String(s)) => s.clone(),
+        other => panic!("expected string token field, got {other:?}"),
+    };
+    seq += 1;
+    let (status_f, body_f) = client.post(
+        db_f2_port,
+        "/v1/query",
+        Some(&db_f2_token),
+        r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":100},"operation_id":"dml-rls9-b"}"#,
+        &out_dir,
+        seq,
+    );
+    let db_f2_nosql_seen = db_f2_nosql.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert_dml_scenario_no_leak(
+        "db_f2_nosql_seen",
+        &db_f2_nosql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+            db_f2_token.as_str(),
+        ],
+    );
+
+    let (db_m2_nosql, db_m2_port) = spawn_nosql_server(&users_path_str, &db_m2_path_str);
+    seq += 1;
+    let (status, body) = client.post(
+        db_m2_port,
+        "/v1/session",
+        None,
+        r#"{"user":"alice","password":"pw-alice"}"#,
+        &out_dir,
+        seq,
+    );
+    assert_eq!(status, 200, "alice session (DB-M2) failed: {body}");
+    let db_m2_token = match json_object(&body).get("token") {
+        Some(JsonValue::String(s)) => s.clone(),
+        other => panic!("expected string token field, got {other:?}"),
+    };
+    seq += 1;
+    let (status_m, body_m) = client.post(
+        db_m2_port,
+        "/v1/query",
+        Some(&db_m2_token),
+        r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":999},"operation_id":"dml-rls9-b"}"#,
+        &out_dir,
+        seq,
+    );
+    let db_m2_nosql_seen = db_m2_nosql.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert_dml_scenario_no_leak(
+        "db_m2_nosql_seen",
+        &db_m2_nosql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+            db_f2_token.as_str(),
+            db_m2_token.as_str(),
+        ],
+    );
+
+    assert_eq!(status_f, status_m, "RLS-9 (NoSQL): status must match");
+    assert_eq!(body_f, body_m, "RLS-9 (NoSQL): body must match");
+    assert_eq!(status_f, 200, "resp={body_f}");
+    assert_eq!(affected_count_from_nosql_body(&body_f), 0);
+
+    let issued_tokens = [
+        alice_token.as_str(),
+        bob_token.as_str(),
+        db_s_alice_token.as_str(),
+        db_f2_token.as_str(),
+        db_m2_token.as_str(),
+    ];
+    let record = format!(
+        "[e2e-record] dml-parity/{label}: psql_version={psql_version:?} \
+         client_version={client_version:?} steps={n} second_tenant_step=ok \
+         cross_surface_resend(sql_to_nosql=23505/22023,nosql_to_sql=23505) \
+         rls9(sql_match=true,nosql_match=true) final_state_match=true",
+        label = client.label(),
+        n = DML_STEPS.len(),
+    );
+    assert_dml_scenario_no_leak("record", &record, &issued_tokens);
+    eprintln!("{record}");
+}
+
+#[test]
+#[ignore = "requires psql and curl; run via `make e2e-three-client-http`"]
+fn curl_matches_psql_on_update_delete_and_rls_boundary() {
+    run_sql_nosql_dml_parity_scenario(HttpClient::Curl);
+}
+
+#[test]
+#[ignore = "requires psql and python3; run via `make e2e-three-client-http`"]
+fn urllib_matches_psql_on_update_delete_and_rls_boundary() {
+    run_sql_nosql_dml_parity_scenario(HttpClient::Urllib);
+}
+
+#[test]
+#[ignore = "requires psql and node (>= 18); run via `make e2e-three-client-http`"]
+fn fetch_matches_psql_on_update_delete_and_rls_boundary() {
+    run_sql_nosql_dml_parity_scenario(HttpClient::Fetch);
 }
