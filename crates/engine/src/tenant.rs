@@ -2372,26 +2372,37 @@ pub(crate) struct DmlCandidate<'a> {
 }
 
 /// [`delete_rows_where_unchecked`]／[`update_rows_where_unchecked`] が共有する
-/// 候補行列挙本体。対象スコープはテナント**所有**（`(tenant, 0)..=(tenant,
-/// u64::MAX)` のキー名前空間＋`is_owner` の二重防御。RLS 可視性フィルタでは
-/// なくテナント**所有**スコープである点は単一行 DELETE・TRUNCATE と同じ——
-/// `docs/design/predicate-dml-exec.md`「削除・更新スコープ」参照）だが、
-/// `execute_scan`／`execute_aggregate` と同型の実装上の理由（redb の複合キー
-/// `(&str, u64)` の部分範囲指定を避ける）により、実際の走査はテーブル全体を
-/// `.iter()` で行い、`is_owner` 判定は各行のヘッダデコード後に行う（他テナ
-/// ント行もヘッダ・スカラー列はデコードされたうえで除外される。走査・デコー
-/// ドの回避自体はスコープ外）。`predicate` が真を返した行の `id` を
-/// `limit + 1` 件に達するまで `Vec` へ蓄積する（早期終了。行データそのもの
-/// は複製せず `id` のみを保持する）。
+/// 候補行列挙本体。対象スコープはテナント**所有**（RLS 可視性フィルタではな
+/// く、単一行 DELETE・TRUNCATE と同じテナント所有スコープ——
+/// `docs/design/predicate-dml-exec.md`「削除・更新スコープ」参照）。
 ///
-/// テナント名前空間内の走査は [`visible_rows`] と同じ総走査行数上限
-/// （[`MAX_SCANNED_ROWS`]。可視・不可視・他テナント所有を問わず 1 行デコード
-/// するたびに加算する）を適用する（codex-review P1 指摘・Issue #871）。`limit`
-/// （一致行数上限）は述語に一致した行にしか効かないため、一致しない述語では
-/// `limit` に到達しないまま任意規模の全表走査を繰り返せてしまう経路を、この
-/// 独立した総走査上限で塞ぐ。超過時は [`TenantWriteError::TooManyRowsScanned`]
-/// で部分結果を返さず fail-closed に拒否し、呼び出し元が `write_txn` を
-/// commit せず破棄することで副作用ゼロを保つ。
+/// 物理キーは `(tenant_id, id)`（TABLE-12）であり、redb のタプル `Key` 実装
+/// は第 1 要素（`tenant_id`）を主キーとして辞書順比較するため、同一テナント
+/// の行は物理キー空間上で連続領域を成す（`catalog.rs::scan_table_page` の
+/// カーソルが `(tenant_id, id)` 順で全テナントを跨いで前進できることと同じ
+/// 事実）。この性質を利用し、走査は `row_table.range` で対象テナントの
+/// 先頭 `(tenant, 0)` から開始し、キーのテナントが変わった時点（＝対象テナ
+/// ントの連続領域を抜けた時点）で打ち切る（他テナント領域には触れない。
+/// codex-review P0 指摘・Issue #871: 総走査上限のカウンタを `is_owner` 判定
+/// より前に加算していたため、同一物理テーブルに他テナントの行が大量に存在
+/// すると対象テナントの行が少なくても上限超過で拒否され、他テナントの行数
+/// を応答から推測できてしまっていた）。`ctx.is_owner` は物理走査を離れて
+/// 他テナント領域まで読み進めることがなくなった後も、`verify_row_key_tenant`
+/// が保証するキー↔ヘッダ整合の帰結として常に真になる不変条件を defense-in-
+/// depth として明示検査する（TABLE-12・security.md）。`predicate` が真を
+/// 返した行の `id` を `limit + 1` 件に達するまで `Vec` へ蓄積する（早期終了。
+/// 行データそのものは複製せず `id` のみを保持する）。
+///
+/// 総走査行数上限（[`MAX_SCANNED_ROWS`]。対象テナント所有行のみを 1 行デコ
+/// ードするたびに加算する）は [`visible_rows`] と同じ計算量 DoS 対策
+/// （codex-review P1 指摘・Issue #871）。`limit`（一致行数上限）は述語に
+/// 一致した行にしか効かないため、一致しない述語では上限に到達しないまま
+/// 任意規模の走査を繰り返せてしまう経路を、この独立した総走査上限で塞ぐ。
+/// 走査が対象テナントの名前空間内に限定された結果、この上限は他テナントの
+/// データ量に一切依存しない（テナント境界越しの情報漏えいを構造的に排除）。
+/// 超過時は [`TenantWriteError::TooManyRowsScanned`] で部分結果を返さず
+/// fail-closed に拒否し、呼び出し元が `write_txn` を commit せず破棄する
+/// ことで副作用ゼロを保つ。
 ///
 /// `predicate` が `Err(e)` を返した場合はその時点で呼び出し元へ伝播する
 /// （呼び出し元が `write_txn` を破棄することで副作用ゼロを保つ）。
@@ -2404,21 +2415,31 @@ fn enumerate_dml_candidates<E>(
 ) -> Result<Vec<u64>, PredicateDmlError<E>> {
     let mut candidate_ids: Vec<u64> = Vec::new();
     let mut embedding_scratch: Vec<f32> = Vec::new();
-    // 総走査行数（可視・不可視・他テナント所有を問わない）。`visible_rows` の
+    // 総走査行数（対象テナント所有行のみを対象に加算する）。`visible_rows` の
     // `MAX_SCANNED_ROWS` と同じ計算量 DoS 対策（codex-review P1 指摘・Issue #871）:
     // 一致行数の上限（`limit`）は述語に一致した行にしか効かないため、一致しない
-    // 述語では上限に到達しないまま任意規模の全表走査を繰り返せてしまう。
+    // 述語では上限に到達しないまま任意規模の走査を繰り返せてしまう。
     let mut scanned: usize = 0;
 
-    // `execute_scan`／`execute_aggregate` と同じくテーブル全体を `.iter()` で
-    // 走査し、テナント**所有**スコープの判定は物理走査中の `ctx.is_owner`
-    // 判定に委ねる（redb の `Table::range` はキー参照の借用型を要求し、
-    // `(&str, u64)` 複合キーの部分範囲指定は型が煩雑になるため、既存の
-    // 走査系実装と同じ「全走査＋所有権判定」に統一する。TABLE-12・security.md）。
+    let tenant = ctx.tenant_id();
+    // 対象テナントの先頭 `(tenant, 0)` から走査を開始する。物理キーは
+    // `(tenant_id, id)` の辞書順であり `u64::MIN == 0` のため、この境界は
+    // 対象テナントの行のうち最小の `id` を持つ行（存在すれば）を含む。
+    let range_start = std::ops::Bound::Included((tenant, 0u64));
     for entry in row_table
-        .iter()
+        .range::<(&str, u64)>((range_start, std::ops::Bound::Unbounded))
         .map_err(|e| dml_write_err(CatalogError::from(e)))?
     {
+        let (k, v) = entry.map_err(|e| dml_write_err(CatalogError::from(e)))?;
+        let (key_tenant, id) = k.value();
+        if key_tenant != tenant {
+            // 物理キーは `(tenant_id, id)` 昇順（タプル `Key` 比較は第 1 要素
+            // 優先）なので、対象テナントの行は連続領域として現れる。テナント
+            // 境界を跨いだ時点で走査終了（他テナント領域のキー・値のいずれも
+            // これ以上読み進めない）。
+            break;
+        }
+
         scanned = scanned.saturating_add(1);
         if scanned > MAX_SCANNED_ROWS {
             // 部分結果を返さず fail-closed に拒否する（`visible_rows` と同じ判断）。
@@ -2427,16 +2448,16 @@ fn enumerate_dml_candidates<E>(
             // 痕跡が残らない。
             return Err(dml_write_err(TenantWriteError::TooManyRowsScanned));
         }
-        let (k, v) = entry.map_err(|e| dml_write_err(CatalogError::from(e)))?;
-        let (key_tenant, id) = k.value();
         let buf = v.value();
 
         let (row_tenant, _visibility, offset) =
             crate::storage::decode_row_header(buf).map_err(|e| dml_write_err(e))?;
         crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
             .map_err(|e| dml_write_err(e))?;
-        // テナント**所有**スコープ（RLS 可視性フィルタではない。TRUNCATE・
-        // 単一行 DELETE と同じ判断。`docs/design/predicate-dml-exec.md` 参照）。
+        // `range` の走査範囲を対象テナントの物理キー領域に限定した結果として
+        // 常に真になる不変条件を defense-in-depth で明示検査する（テナント
+        // **所有**スコープ。RLS 可視性フィルタではない。TRUNCATE・単一行
+        // DELETE と同じ判断。`docs/design/predicate-dml-exec.md` 参照）。
         if !ctx.is_owner(row_tenant) {
             continue;
         }

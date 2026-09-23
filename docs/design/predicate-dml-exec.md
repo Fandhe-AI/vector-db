@@ -90,26 +90,27 @@ execute_scan` の走査ループと同一の意味論（`declarative_filter::mat
   （`SELECT` では見えるが述語つき `UPDATE`／`DELETE` の対象外）。
 - engine 直呼び出しの既定 ctx（`Public` のみ）でも自テナント `Private` 行は候補に
   なる（単一行 DELETE と同じ）。
-- `enumerate_dml_candidates` は `execute_scan`／`execute_aggregate` と同型の
-  「テーブル全体を `.iter()` で全走査し、`ctx.is_owner` 判定は行ヘッダの
-  デコード後に行う」実装である（redb の複合キー `(&str, u64)` の部分範囲
-  指定を避けるための既存踏襲。TABLE-12・security.md）。他テナント行も
-  `decode_row_header`／`decode_row_dim_and_metadata_borrowed`（または
-  `needs_embedding` 時は `decode_row_body_into`）でデコードされたうえで
-  `is_owner` 判定により除外される——「キー範囲の外にあるためデコードすら
-  行わない」わけではない。不可視行の内容（embedding・metadata・述語評価
-  結果）が呼び出し元・応答へ一切露出しない、という秘匿性の受け入れ条件は
-  `is_owner` 判定による除外で満たされるが、走査・デコードそのものの回避は
-  性能上の最適化課題であり本 Issue のスコープ外（§9「スカラー列二次索引
-  による候補削減の適用」参照）。
-- `enumerate_dml_candidates` は総走査行数（可視・不可視・他テナント所有を
-  問わない）に独立した上限（`tenant::MAX_SCANNED_ROWS`。`visible_rows` と
-  共有する同一値）を適用する（codex-review P1 指摘）。影響行数上限
-  （`MAX_DML_AFFECTED_ROWS`）は述語に一致した行にしか作用しないため、
-  一致行が 0 件のまま推移する述語では認証済みテナントが単一 writer を
-  占有したまま任意規模の全表走査を繰り返せてしまう経路があり、この総走査
-  上限で塞ぐ。超過時は `TenantWriteError::TooManyRowsScanned`（`54000`）で
-  副作用ゼロ（`write_txn` を commit せず破棄）のまま終端する。
+- `enumerate_dml_candidates` は物理キー `(tenant_id, id)`（TABLE-12）が redb の
+  タプル `Key` 比較で第 1 要素（`tenant_id`）を主キーとする辞書順になる性質
+  （`catalog.rs::scan_table_page` のカーソルが同じ前提に依拠）を利用し、
+  `row_table.range` で対象テナントの先頭 `(tenant, 0)` から走査を開始して
+  キーのテナントが変わった時点で打ち切る（他テナントの行はキー・値のいずれ
+  も読み進めない。デコードもされない）。他テナント行を全走査してから
+  `is_owner` 判定で除外する実装ではない（codex-review P0 指摘・Issue #871:
+  以前の全走査実装は総走査上限のカウンタを `is_owner` 判定より前に加算して
+  いたため、他テナントの行数が閾値を超えると対象テナントの行が少なくても
+  `54000` になり、応答から他テナントのデータ量を推測できてしまっていた）。
+  `ctx.is_owner` は `verify_row_key_tenant` が保証するキー↔ヘッダ整合の
+  帰結として走査範囲内では常に真になる不変条件を、defense-in-depth として
+  明示検査するのみ。
+- `enumerate_dml_candidates` は対象テナント所有行のみに対する総走査行数上限
+  （`tenant::MAX_SCANNED_ROWS`。`visible_rows` と共有する同一値）を適用する
+  （codex-review P1 指摘）。影響行数上限（`MAX_DML_AFFECTED_ROWS`）は述語に
+  一致した行にしか作用しないため、一致行が 0 件のまま推移する述語では認証
+  済みテナントが単一 writer を占有したまま自テナントの行を任意規模で走査
+  し続けられる経路があり、この総走査上限で塞ぐ（他テナントのデータ量には
+  一切依存しない）。超過時は `TenantWriteError::TooManyRowsScanned`
+  （`54000`）で副作用ゼロ（`write_txn` を commit せず破棄）のまま終端する。
 
 `WHERE visible() のみ` の述語つき DELETE は #870 の既存決定（自テナント全行を候補
 にする。歯止めは影響行数上限のみ）をそのまま継承し、本 Issue で再決定していない

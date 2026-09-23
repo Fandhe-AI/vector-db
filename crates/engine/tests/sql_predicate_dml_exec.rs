@@ -646,7 +646,12 @@ fn new_core_with_bulk_seeded_table(
                 id,
                 RowInput {
                     tenant_id: ctx.tenant_id(),
-                    visibility: Visibility::Public,
+                    // `Private` にする: `Public` だと他テナントの `SELECT`
+                    // からも可視になり、`count_star` が「対象テナント自身の
+                    // 行数」ではなく「visibility 縮約後の可視件数」を返して
+                    // しまい、他テナントの行数超過をテナント越しに観測できて
+                    // しまう（本テストが固定したい契約と矛盾する）。
+                    visibility: Visibility::Private,
                     embedding: &embedding,
                     metadata: &metadata,
                 },
@@ -735,4 +740,95 @@ fn predicate_update_over_scan_limit_is_rejected_with_no_side_effects() {
     )
     .expect_err("resend of an unrecorded operation_id must be the same over-scan-limit rejection");
     assert_eq!(err_again.wire_code(), "54000");
+}
+
+/// codex-review P0 対応（Issue #871）: [`enumerate_dml_candidates`] の総走査
+/// 行数上限は対象テナントの物理キー名前空間内でのみ計数される。他テナント
+/// （bob）が [`tenant::MAX_SCANNED_ROWS`] を超える行を保持していても、対象
+/// テナント（alice）自身の行数が少なければ述語つき `DELETE ... WHERE` は
+/// `54000` にならず成功し、bob の行は一切変化しない（bob の行数超過の有無を
+/// alice への応答から推測できないことの回帰固定。修正前は他テナントの行も
+/// `is_owner` 判定前に総走査カウンタへ加算していたため、この呼び出しは誤って
+/// `54000` になっていた）。
+#[test]
+fn predicate_delete_succeeds_when_only_other_tenant_exceeds_scan_limit() {
+    let bob = ctx_for("bob", true);
+    let alice = ctx_for("alice", true);
+    let other_tenant_rows: u64 = 1_000_001;
+    let (core, path) = new_core_with_bulk_seeded_table(&bob, TABLE, other_tenant_rows);
+    let _guard = CleanupGuard(path);
+    assert_eq!(count_star(&core, &bob, TABLE), other_tenant_rows);
+
+    // alice 自身の行は少数（総走査上限を踏まない）。
+    insert_row(&core, &alice, TABLE, 1, "ja", "doc-1", "a1");
+    insert_row(&core, &alice, TABLE, 2, "ja", "doc-2", "a2");
+    insert_row(&core, &alice, TABLE, 3, "fr", "doc-3", "a3");
+
+    let outcome = execute(
+        &core,
+        &alice,
+        &format!(
+            "DELETE FROM {TABLE} WHERE lang = 'ja' USING OPERATION_ID 'op-del-other-tenant-excess'"
+        ),
+    )
+    .expect(
+        "predicate DELETE scoped to alice's small row set must succeed \
+         regardless of bob's row count",
+    );
+    match outcome {
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 2),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), 1);
+    assert_eq!(
+        count_star(&core, &bob, TABLE),
+        other_tenant_rows,
+        "bob's rows must remain untouched"
+    );
+}
+
+/// 上記 DELETE 版と同じ回帰固定を `UPDATE ... WHERE` 側でも行う
+/// （[`enumerate_dml_candidates`] を共有するため）。
+#[test]
+fn predicate_update_succeeds_when_only_other_tenant_exceeds_scan_limit() {
+    let bob = ctx_for("bob", true);
+    let alice = ctx_for("alice", true);
+    let other_tenant_rows: u64 = 1_000_001;
+    let (core, path) = new_core_with_bulk_seeded_table(&bob, TABLE, other_tenant_rows);
+    let _guard = CleanupGuard(path);
+    assert_eq!(count_star(&core, &bob, TABLE), other_tenant_rows);
+
+    insert_row(&core, &alice, TABLE, 1, "ja", "doc-1", "a1");
+    insert_row(&core, &alice, TABLE, 2, "ja", "doc-2", "a2");
+    insert_row(&core, &alice, TABLE, 3, "fr", "doc-3", "a3");
+
+    let outcome = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-upd-other-tenant-excess'"
+        ),
+    )
+    .expect(
+        "predicate UPDATE scoped to alice's small row set must succeed \
+         regardless of bob's row count",
+    );
+    match outcome {
+        SqlOutcome::Update(o) => assert_eq!(o.rows_affected, 2),
+        other => panic!("expected SqlOutcome::Update, got {other:?}"),
+    }
+    let mut remaining_langs: Vec<String> = scan_lang_rows(&core, &alice, TABLE)
+        .into_iter()
+        .map(|(_, lang)| lang)
+        .collect();
+    remaining_langs.sort();
+    assert_eq!(
+        remaining_langs,
+        vec!["en".to_string(), "en".to_string(), "fr".to_string()]
+    );
+    assert_eq!(
+        count_star(&core, &bob, TABLE),
+        other_tenant_rows,
+        "bob's rows must remain untouched"
+    );
 }
