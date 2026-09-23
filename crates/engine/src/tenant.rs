@@ -321,6 +321,19 @@ pub enum TenantWriteError {
     /// 丸めてしまい、クライアントに誤った再試行判断を誘発する）。専用 variant として
     /// 分離し `XX000`（内部事象）へ固定する。
     CapturedRowDecodeFailed(String),
+    /// 述語つき `UPDATE`／`DELETE ... WHERE`（[`enumerate_dml_candidates`]）の
+    /// 候補列挙が、対象テナントの物理キー領域（`(tenant, 0)` からの `range`
+    /// 走査。テナント境界を跨いだ時点で打ち切り、他テナント領域には触れない）
+    /// を走査した総行数（対象テナント所有行のみを計数。可視・不可視は問わない）
+    /// で [`MAX_SCANNED_ROWS`] を超えた（codex-review P1 指摘・PR #993 系・
+    /// Issue #871。一致行数の上限（[`PredicateDmlOutcome::LimitExceeded`]）とは
+    /// 独立: 一致しない述語では一致件数上限に到達しないまま対象テナント名前空間
+    /// 内で任意規模の走査が繰り返せてしまう経路を塞ぐ。[`visible_rows`] の
+    /// `TooManyRowsScanned` と同じ「部分結果を返さず fail-closed に拒否する」
+    /// 判断。この上限は他テナントのデータ量に一切依存しない。`write_txn` は
+    /// commit せず破棄する（行・台帳とも痕跡ゼロ）ため `54000`
+    /// （`PayloadTooLarge`）へ写像する。
+    TooManyRowsScanned,
 }
 
 impl TenantWriteError {
@@ -353,6 +366,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::ReturningProjectionFailed(_) => ErrorClass::InternalError,
             TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,
             TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
+            TenantWriteError::TooManyRowsScanned => ErrorClass::PayloadTooLarge,
         }
     }
 
@@ -396,6 +410,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::CapturedRowDecodeFailed(_) => {
                 write!(f, "tenant write captured row decode failed")
             }
+            TenantWriteError::TooManyRowsScanned => {
+                write!(f, "too many rows scanned: limit={MAX_SCANNED_ROWS}")
+            }
         }
     }
 }
@@ -426,6 +443,7 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::CapturedRowDecodeFailed(_) => {
                 f.write_str("CapturedRowDecodeFailed(<redacted>)")
             }
+            TenantWriteError::TooManyRowsScanned => f.write_str("TooManyRowsScanned"),
         }
     }
 }
@@ -1604,6 +1622,78 @@ pub(crate) fn update_row_unchecked(
 /// codex-review P1 指摘・PR #989）。
 ///
 /// 戻り値は更新行数（`0` または `1`）。呼び出し元は `sql::exec::execute_update`。
+/// SET 句の値をスキーマに対して検証する（列 index 境界・型一致・`VECTOR` 次元・
+/// `TEXT` 列単体長・`TEXT` 列の累計フレームサイズ）。[`update_row_columns_unchecked`]
+/// （単一行・id 指定形）・[`update_rows_where_unchecked`]（述語形。SQL-19・TASK-192・
+/// Issue #871）が共有する。
+///
+/// 呼び出し元は必ず**対象行の探索より前**（かつ台帳記録より前）にこの検証を行うこと。
+/// 対象行の存在・可視性を一切参照せずスキーマのみから判定できるため、対象の有無に
+/// 関わらず常に同一の拒否（またはいずれも合格）になる fail-closed 契約を保てる
+/// （`update_row_columns_unchecked` の同種コメント参照）。述語形でこの順序を守らない
+/// 場合、候補行が 0 件（＝一致行なし）だと検証が一切実行されないまま `UPDATE 0` の
+/// 成功として `operation_id` が消費されてしまう（codex-review P1 指摘・PR #993 系・
+/// Issue #871）。
+fn validate_set_assignments(
+    schema: &crate::catalog::TableSchema,
+    assignments: &[(usize, crate::row_codec::Value)],
+) -> Result<(), TenantWriteError> {
+    let mut set_text_payload_total: u32 = 0;
+    for (idx, value) in assignments {
+        let column = schema.columns.get(*idx).ok_or_else(|| {
+            TenantWriteError::Catalog(CatalogError::Invalid(
+                "SET column index out of range for the current table schema".to_string(),
+            ))
+        })?;
+        match (&column.ty, value) {
+            (crate::catalog::ColumnType::Vector(_), crate::row_codec::Value::Vector(v)) => {
+                // SET 値の妥当性（次元）は対象行の有無に関わらず常に同じ拒否を
+                // 返す（呼び出し元の対象行探索より前に弾く）。
+                schema
+                    .validate_embedding_dim(v.len())
+                    .map_err(TenantWriteError::Catalog)?;
+            }
+            (crate::catalog::ColumnType::Text, crate::row_codec::Value::Text(t)) => {
+                // SET 値の TEXT 長上限検証（対象行の探索より前に行う）。
+                let text_len = u32::try_from(t.len()).map_err(|_| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "text field too long: {} bytes",
+                        t.len()
+                    )))
+                })?;
+                if text_len > crate::row_codec::MAX_TEXT_FIELD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "text field length {text_len} exceeds limit {}",
+                        crate::row_codec::MAX_TEXT_FIELD_LEN
+                    ))));
+                }
+                let entry_len = crate::row_codec::scalar_text_entry_len(text_len)
+                    .map_err(|e| TenantWriteError::Catalog(CatalogError::Invalid(e.to_string())))?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            _ => {
+                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                    "SET column type does not match the current table schema".to_string(),
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn update_row_columns_unchecked(
     storage: &Storage,
     table: &str,
@@ -1631,76 +1721,24 @@ pub(crate) fn update_row_columns_unchecked(
         // を禁止」）。`bind_update` は束縛時点のスキーマで検証済みだが、write
         // トランザクション内で再取得したスキーマと不一致がありうる場合に備え、
         // `get()` で境界外アクセスを構造的に防ぐ（`insert_typed_row_unchecked` の
-        // `expected_schema` 比較と多層防御）。
+        // `expected_schema` 比較と多層防御）。検証本体は [`validate_set_assignments`]
+        // （述語形 [`update_rows_where_unchecked`] と共有。codex-review P1 指摘・
+        // PR #993 系・Issue #871）。
+        validate_set_assignments(&schema, assignments)?;
+
         // `(スキーマ列 index, 列名, 値)` の順で構築し、ハッシュ計算前に列
-        // index でソートして宣言順非依存にする（下記コメント参照）。
+        // index でソートして宣言順非依存にする（下記コメント参照）。列 index の
+        // 境界・型は上記 `validate_set_assignments` で検証済みのため、ここでの
+        // `get()` は理論上失敗しないが、添字アクセスを避けるため引き続き
+        // `ok_or_else` で明示的に処理する（coding-rust.md）。
         let mut named_columns: Vec<(usize, &str, &crate::row_codec::Value)> =
             Vec::with_capacity(assignments.len());
-        // SET 対象の TEXT 列だけを対象にした累計フレームサイズ（presence(1)+
-        // 長さ(4)+本文）。対象行の実データ（探索前は不明）を含めず、リクエスト
-        // 自身が持つ SET 値のみから決定的に計算できる下限を先に検証すること
-        // で、「SET 値単体が `encode_scalar_columns` のフレーミングオーバー
-        // ヘッド込みで `MAX_SCALAR_PAYLOAD_LEN` を超える」ケース（列ごとの
-        // `MAX_TEXT_FIELD_LEN` 検査だけでは通過してしまう）を対象行の有無に
-        // 関わらず同一の拒否にする（Cursor Bugbot Medium 指摘・PR #989。
-        // security.md「テナント境界」）。未変更列を含む本当の累計上限超過は
-        // 対象行データに依存するため `encode_scalar_columns` 側の検証に委ねる
-        // （既知の残存差異。`docs/design/update-single-row.md` 判断 D 参照）。
-        let mut set_text_payload_total: u32 = 0;
         for (idx, value) in assignments {
             let column = schema.columns.get(*idx).ok_or_else(|| {
                 TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column index out of range for the current table schema".to_string(),
                 ))
             })?;
-            match (&column.ty, value) {
-                (crate::catalog::ColumnType::Vector(_), crate::row_codec::Value::Vector(v)) => {
-                    // SET 値の妥当性（次元）は対象行の有無に関わらず常に同じ拒否を
-                    // 返す（後述の一括検証と同じ理由。ここで先に弾くことで
-                    // `named_columns` 構築中に判明した不正値も後段まで遅延させない）。
-                    schema
-                        .validate_embedding_dim(v.len())
-                        .map_err(TenantWriteError::Catalog)?;
-                }
-                (crate::catalog::ColumnType::Text, crate::row_codec::Value::Text(t)) => {
-                    // SET 値の TEXT 長上限検証（対象行の探索より前に行う。詳細は
-                    // 下記コメント参照）。
-                    let text_len = u32::try_from(t.len()).map_err(|_| {
-                        TenantWriteError::Catalog(CatalogError::Invalid(format!(
-                            "text field too long: {} bytes",
-                            t.len()
-                        )))
-                    })?;
-                    if text_len > crate::row_codec::MAX_TEXT_FIELD_LEN {
-                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
-                            "text field length {text_len} exceeds limit {}",
-                            crate::row_codec::MAX_TEXT_FIELD_LEN
-                        ))));
-                    }
-                    let entry_len =
-                        crate::row_codec::scalar_text_entry_len(text_len).map_err(|e| {
-                            TenantWriteError::Catalog(CatalogError::Invalid(e.to_string()))
-                        })?;
-                    set_text_payload_total = set_text_payload_total
-                        .checked_add(entry_len)
-                        .ok_or_else(|| {
-                            TenantWriteError::Catalog(CatalogError::Invalid(
-                                "scalar payload length overflow".to_string(),
-                            ))
-                        })?;
-                    if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
-                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
-                            "scalar payload length {set_text_payload_total} exceeds limit {}",
-                            crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
-                        ))));
-                    }
-                }
-                _ => {
-                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                        "SET column type does not match the current table schema".to_string(),
-                    )))
-                }
-            }
             named_columns.push((*idx, column.name.as_str(), value));
         }
         // 台帳の内容照合ハッシュ（`content_hash::for_update_columns`）へ渡す前に
@@ -2312,6 +2350,444 @@ pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
 ///   commit される）ため、常にテーブル世代を進める（`insert_rows` の空バッチ
 ///   ショートカットとは意図的に非対称。0 件 TRUNCATE の再送冪等性を台帳側だけで
 ///   保証し、コード分岐の非対称性によるバグを避ける）。
+///
+/// 述語つき `UPDATE`／`DELETE ... WHERE`（SQL-19・TASK-192、Issue #871・対象
+/// ビヘイビア: RECOVER-11）の実行結果。呼び出し元（`sql::exec::
+/// execute_predicate_delete`／`execute_predicate_update`）はこの enum を
+/// `wire_code` へ写像する（`Applied` は `DELETE n`／`UPDATE n`、
+/// `LimitExceeded` は `54000`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PredicateDmlOutcome {
+    /// 影響行数（`0` を含む）。write トランザクションは commit 済み
+    /// （台帳エントリも commit されている）。
+    Applied { rows_affected: usize },
+    /// 一致行数が上限を超えた（`limit + 1` 件目で列挙を打ち切った時点の件数を
+    /// そのまま運ぶ。呼び出し元が `check_dml_affected_rows`／
+    /// `check_affected_row_count` へ渡す）。write トランザクションは commit
+    /// されず、行・台帳エントリのいずれにも痕跡が残らない。
+    LimitExceeded { count: usize },
+}
+
+/// [`delete_rows_where_unchecked`]／[`update_rows_where_unchecked`] のエラー。
+/// テナント境界・台帳照合由来のエラー（[`TenantWriteError`]）と、呼び出し元が
+/// 注入する述語クロージャ由来のエラー（`E`）を型で区別する。本モジュールは
+/// `sql` 型（`SqlSurfaceError` 等）に依存しないため、`E` はジェネリックのまま
+/// 運ぶ（`sql::exec` 側が `SqlSurfaceError` として具体化する）。
+#[derive(Debug)]
+pub(crate) enum PredicateDmlError<E> {
+    Write(TenantWriteError),
+    Predicate(E),
+}
+
+fn dml_write_err<E>(e: impl Into<TenantWriteError>) -> PredicateDmlError<E> {
+    PredicateDmlError::Write(e.into())
+}
+
+/// 候補行 1 件分の借用ビュー（述語クロージャへ渡す入力。行データを複製しない）。
+/// `embedding` は呼び出し元が `needs_embedding = false` を渡した場合は常に空
+/// スライス（`WHERE` が embedding を参照しない場合、デコードコストを避ける。
+/// `sql/scan.rs` の `DecodeTier` と同じ判断）。
+pub(crate) struct DmlCandidate<'a> {
+    pub id: u64,
+    pub dim: u32,
+    pub embedding: &'a [f32],
+    pub metadata: &'a [u8],
+}
+
+/// [`delete_rows_where_unchecked`]／[`update_rows_where_unchecked`] が共有する
+/// 候補行列挙本体。対象スコープはテナント**所有**（RLS 可視性フィルタではな
+/// く、単一行 DELETE・TRUNCATE と同じテナント所有スコープ——
+/// `docs/design/predicate-dml-exec.md`「削除・更新スコープ」参照）。
+///
+/// 物理キーは `(tenant_id, id)`（TABLE-12）であり、redb のタプル `Key` 実装
+/// は第 1 要素（`tenant_id`）を主キーとして辞書順比較するため、同一テナント
+/// の行は物理キー空間上で連続領域を成す（`catalog.rs::scan_table_page` の
+/// カーソルが `(tenant_id, id)` 順で全テナントを跨いで前進できることと同じ
+/// 事実）。この性質を利用し、走査は `row_table.range` で対象テナントの
+/// 先頭 `(tenant, 0)` から開始し、キーのテナントが変わった時点（＝対象テナ
+/// ントの連続領域を抜けた時点）で打ち切る（他テナント領域には触れない。
+/// codex-review P0 指摘・Issue #871: 総走査上限のカウンタを `is_owner` 判定
+/// より前に加算していたため、同一物理テーブルに他テナントの行が大量に存在
+/// すると対象テナントの行が少なくても上限超過で拒否され、他テナントの行数
+/// を応答から推測できてしまっていた）。`ctx.is_owner` は物理走査を離れて
+/// 他テナント領域まで読み進めることがなくなった後も、`verify_row_key_tenant`
+/// が保証するキー↔ヘッダ整合の帰結として常に真になる不変条件を defense-in-
+/// depth として明示検査する（TABLE-12・security.md）。`predicate` が真を
+/// 返した行の `id` を `limit + 1` 件に達するまで `Vec` へ蓄積する（早期終了。
+/// 行データそのものは複製せず `id` のみを保持する）。
+///
+/// 総走査行数上限（[`MAX_SCANNED_ROWS`]。対象テナント所有行のみを 1 行デコ
+/// ードするたびに加算する）は [`visible_rows`] と同じ計算量 DoS 対策
+/// （codex-review P1 指摘・Issue #871）。`limit`（一致行数上限）は述語に
+/// 一致した行にしか効かないため、一致しない述語では上限に到達しないまま
+/// 任意規模の走査を繰り返せてしまう経路を、この独立した総走査上限で塞ぐ。
+/// 走査が対象テナントの名前空間内に限定された結果、この上限は他テナントの
+/// データ量に一切依存しない（テナント境界越しの情報漏えいを構造的に排除）。
+/// 超過時は [`TenantWriteError::TooManyRowsScanned`] で部分結果を返さず
+/// fail-closed に拒否し、呼び出し元が `write_txn` を commit せず破棄する
+/// ことで副作用ゼロを保つ。
+///
+/// `predicate` が `Err(e)` を返した場合はその時点で呼び出し元へ伝播する
+/// （呼び出し元が `write_txn` を破棄することで副作用ゼロを保つ）。
+fn enumerate_dml_candidates<E>(
+    row_table: &redb::Table<'_, (&'static str, u64), &'static [u8]>,
+    ctx: &PolicyContext,
+    needs_embedding: bool,
+    limit: usize,
+    predicate: &mut impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+) -> Result<Vec<u64>, PredicateDmlError<E>> {
+    let mut candidate_ids: Vec<u64> = Vec::new();
+    let mut embedding_scratch: Vec<f32> = Vec::new();
+    // 総走査行数（対象テナント所有行のみを対象に加算する）。`visible_rows` の
+    // `MAX_SCANNED_ROWS` と同じ計算量 DoS 対策（codex-review P1 指摘・Issue #871）:
+    // 一致行数の上限（`limit`）は述語に一致した行にしか効かないため、一致しない
+    // 述語では上限に到達しないまま任意規模の走査を繰り返せてしまう。
+    let mut scanned: usize = 0;
+
+    let tenant = ctx.tenant_id();
+    // 対象テナントの名前空間 `(tenant, 0)..=(tenant, u64::MAX)` に走査を閉じる
+    // （codex-review P0 指摘・Issue #871）。物理キーは `(tenant_id, id)` の
+    // 辞書順であり `u64::MIN == 0`／`u64::MAX` が対象テナントの id 空間の
+    // 両端を覆うため、この閉区間は対象テナント所有行のみを列挙し他テナント
+    // 領域のキー・値には一切触れない（`Bound::Unbounded` 終端だと対象テナント
+    // に行が 0 件の場合に限り最初の反復で辞書順で後続する別テナントの先頭
+    // エントリを取得してしまい、下記の break 前に他テナント領域を読んでいた）。
+    // `replace_rows_for_reingest`（2938 行目付近）と同型の閉区間。
+    let range_start = std::ops::Bound::Included((tenant, 0u64));
+    let range_end = std::ops::Bound::Included((tenant, u64::MAX));
+    for entry in row_table
+        .range::<(&str, u64)>((range_start, range_end))
+        .map_err(|e| dml_write_err(CatalogError::from(e)))?
+    {
+        let (k, v) = entry.map_err(|e| dml_write_err(CatalogError::from(e)))?;
+        let (key_tenant, id) = k.value();
+        if key_tenant != tenant {
+            // 閉区間により理論上到達しないが、defense-in-depth として維持する
+            // （物理キー比較の実装詳細に依存しない不変条件の二重化）。
+            break;
+        }
+
+        scanned = scanned.saturating_add(1);
+        if scanned > MAX_SCANNED_ROWS {
+            // 部分結果を返さず fail-closed に拒否する（`visible_rows` と同じ判断）。
+            // 呼び出し元（`delete_rows_where_unchecked`／`update_rows_where_unchecked`）
+            // は `write_txn` を commit せず破棄するため、行・台帳のいずれにも
+            // 痕跡が残らない。
+            return Err(dml_write_err(TenantWriteError::TooManyRowsScanned));
+        }
+        let buf = v.value();
+
+        let (row_tenant, _visibility, offset) =
+            crate::storage::decode_row_header(buf).map_err(|e| dml_write_err(e))?;
+        crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
+            .map_err(|e| dml_write_err(e))?;
+        // `range` の走査範囲を対象テナントの物理キー領域に限定した結果として
+        // 常に真になる不変条件を defense-in-depth で明示検査する（テナント
+        // **所有**スコープ。RLS 可視性フィルタではない。TRUNCATE・単一行
+        // DELETE と同じ判断。`docs/design/predicate-dml-exec.md` 参照）。
+        if !ctx.is_owner(row_tenant) {
+            continue;
+        }
+
+        let (dim, metadata): (u32, &[u8]) = if needs_embedding {
+            crate::storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
+                .map_err(|e| dml_write_err(e))?
+        } else {
+            crate::storage::decode_row_dim_and_metadata_borrowed(buf)
+                .map_err(|e| dml_write_err(e))?
+        };
+        let embedding: &[f32] = if needs_embedding {
+            embedding_scratch.as_slice()
+        } else {
+            &[]
+        };
+
+        let candidate = DmlCandidate {
+            id,
+            dim,
+            embedding,
+            metadata,
+        };
+        if predicate(&candidate).map_err(PredicateDmlError::Predicate)? {
+            candidate_ids.push(id);
+            // `limit + 1` 件に達した時点で打ち切る（副作用ゼロで `54000` を
+            // 返すために、呼び出し元が超過を判定できる最小限の 1 件超過分だけ
+            // 余分に蓄積する。ADR `docs/design/multi-row-dml-operation-id.md`
+            // §6「3.」）。
+            if candidate_ids.len() > limit {
+                break;
+            }
+        }
+    }
+    Ok(candidate_ids)
+}
+
+/// 述語つき `DELETE FROM <table> WHERE ... USING OPERATION_ID '<id>'`
+/// （SQL-19・TASK-192、Issue #871）の実体。唯一の到達経路は
+/// `sql::exec::execute_predicate_delete`。
+///
+/// 処理順序（ADR `docs/design/multi-row-dml-operation-id.md` §6）:
+/// 1. `begin_write_txn` → スキーマ取得（`expected_schema` があれば束縛時点の
+///    スキーマと一致するか照合し、並行 `ALTER TABLE` を検知する。
+///    `upsert_typed_rows_unchecked` と同じ判断）。
+/// 2. `ledger::record_in_txn`（候補列挙より**先**。使用済み `operation_id` は
+///    可視集合を一切走査せず `23505`／`22023` へ短絡する）。
+/// 3. [`enumerate_dml_candidates`] で候補 `id` を確定する。
+/// 4. `limit` を超えていれば `write_txn` を drop し
+///    [`PredicateDmlOutcome::LimitExceeded`] を返す（行・台帳とも痕跡ゼロ）。
+/// 5. 候補 `id` をすべて `remove`。
+/// 6. 影響行数が 1 件以上のときのみ `bump_table_generation_in_txn`。
+/// 7. `commit_boundary::commit`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn delete_rows_where_unchecked<E>(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash_value: &content_hash::ContentHash,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    needs_embedding: bool,
+    limit: usize,
+    mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
+    validate_identifier(table).map_err(dml_write_err)?;
+    let write_txn = storage
+        .begin_write_txn()
+        .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+
+    let candidate_ids = {
+        let schema = require_table_schema_write(&write_txn, table).map_err(dml_write_err)?;
+        if let Some(expected) = expected_schema {
+            if expected != &schema {
+                return Err(dml_write_err(CatalogError::Invalid(
+                    "table schema changed after the statement was bound".to_string(),
+                )));
+            }
+        }
+
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            content_hash_value,
+        )
+        .map_err(dml_write_err)?;
+
+        let row_table_name = user_rows_table_name(table);
+        let row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+        enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?
+    };
+
+    if candidate_ids.len() > limit {
+        // `write_txn` をここで drop する（commit しない）。台帳の tentative
+        // 追記・行変更のいずれも痕跡が残らない（ADR §6「4.」）。
+        return Ok(PredicateDmlOutcome::LimitExceeded {
+            count: candidate_ids.len(),
+        });
+    }
+
+    {
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+        for id in &candidate_ids {
+            let key = (ctx.tenant_id(), *id);
+            row_table
+                .remove(&key)
+                .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+        }
+    }
+
+    let rows_affected = candidate_ids.len();
+    if rows_affected > 0 {
+        crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(dml_write_err)?;
+    }
+    crate::recovery::commit_boundary::commit(write_txn).map_err(dml_write_err)?;
+    Ok(PredicateDmlOutcome::Applied { rows_affected })
+}
+
+/// 述語つき `UPDATE <table> SET ... WHERE ... USING OPERATION_ID '<id>'`
+/// （SQL-19・TASK-192、Issue #871）の実体。唯一の到達経路は
+/// `sql::exec::execute_predicate_update`。
+///
+/// 処理順序は [`delete_rows_where_unchecked`] と同一（ADR §6）。適用段のみが
+/// 異なり、候補 `id` ごとに既存行を read-merge-write する
+/// （`upsert_typed_rows_unchecked` の `DoUpdate` 腕と同じ組み立て。`assignments`
+/// は束縛済みの `(列インデックス, 値)` 対応——`VECTOR` 列を対象とする割当は
+/// embedding を差し替え、それ以外は `merged_values` の対応スロットを上書きする。
+/// SET で触れない列・embedding・可視性は既存行の値を保持する）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_rows_where_unchecked<E>(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash_value: &content_hash::ContentHash,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    assignments: &[(usize, crate::row_codec::Value)],
+    needs_embedding: bool,
+    limit: usize,
+    mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
+    validate_identifier(table).map_err(dml_write_err)?;
+    let write_txn = storage
+        .begin_write_txn()
+        .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+
+    let (candidate_ids, schema) = {
+        let schema = require_table_schema_write(&write_txn, table).map_err(dml_write_err)?;
+        if let Some(expected) = expected_schema {
+            if expected != &schema {
+                return Err(dml_write_err(CatalogError::Invalid(
+                    "table schema changed after the statement was bound".to_string(),
+                )));
+            }
+        }
+
+        // SET 値をスキーマに対して検証する（[`validate_set_assignments`] を単一行
+        // [`update_row_columns_unchecked`] と共有）。候補行列挙・台帳記録より
+        // **前**に行うことで、一致行が 0 件の場合でも不正な SET 値（`MAX_TEXT_
+        // FIELD_LEN` 超過・累計 payload 上限超過・`VECTOR` 次元不一致・列型不一致
+        // 等）は必ず拒否され、台帳へ記録される前に `write_txn` を破棄できる
+        // （codex-review P1 指摘・PR #993 系・Issue #871: この検証が候補行の
+        // 適用ループ内にしか無いと、一致行 0 件のまま台帳記録・`UPDATE 0` 成功が
+        // 通ってしまい、同じ `operation_id` が正当な後続再送に使えなくなる）。
+        validate_set_assignments(&schema, assignments).map_err(dml_write_err)?;
+
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            content_hash_value,
+        )
+        .map_err(dml_write_err)?;
+
+        let row_table_name = user_rows_table_name(table);
+        let row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+        let candidate_ids =
+            enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?;
+        (candidate_ids, schema)
+    };
+
+    if candidate_ids.len() > limit {
+        return Ok(PredicateDmlOutcome::LimitExceeded {
+            count: candidate_ids.len(),
+        });
+    }
+
+    let vector_idx = schema
+        .columns
+        .iter()
+        .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)));
+
+    {
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+        for id in &candidate_ids {
+            let key = (ctx.tenant_id(), *id);
+            let existing = match row_table
+                .get(&key)
+                .map_err(|e| dml_write_err(CatalogError::from(e)))?
+            {
+                Some(guard) => {
+                    crate::storage::decode_row_for_key(ctx.tenant_id(), *id, guard.value())
+                        .map_err(dml_write_err)?
+                }
+                None => {
+                    // 列挙後・適用前の並行削除（同一トランザクション内で候補行は
+                    // 列挙時に読み取り済みのため、redb の単一ライター制約下では
+                    // 通常到達しないが、fail-closed に内部エラーとして拒否する
+                    // （`unwrap`/添字禁止・coding-rust.md）。
+                    return Err(dml_write_err(CatalogError::Invalid(
+                        "internal: candidate row disappeared before apply".to_string(),
+                    )));
+                }
+            };
+
+            // `existing.metadata` は今回の SET 句ではなく、既に永続化済みの行
+            // データである。ここでのデコード失敗はクライアント入力の不正では
+            // なく、ストレージ側の破損・実装不整合を示す。`CatalogError::Invalid`
+            // （ユーザー入力の検証失敗。`22000`）へ丸めると、単一行版
+            // `update_row_columns_unchecked` の同種デコード（格納済み行の
+            // `scan_scalar_columns` 失敗を `CorruptSchema`／`XX000` に固定する
+            // 契約）と矛盾し、内部事象をクライアント入力エラーへ誤分類して
+            // しまう（codex-review P1 指摘・PR #993 系・Issue #871）。
+            let mut merged_values =
+                crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
+                    .map_err(|e| CatalogError::CorruptSchema(e.to_string()))
+                    .map_err(dml_write_err)?;
+            let mut embedding_value: Vec<f32> = existing.embedding.clone();
+            let mut vector_assigned = false;
+
+            for (col_idx, value) in assignments {
+                if Some(*col_idx) == vector_idx {
+                    match value {
+                        crate::row_codec::Value::Vector(v) => {
+                            embedding_value = v.clone();
+                            vector_assigned = true;
+                        }
+                        _ => {
+                            return Err(dml_write_err(CatalogError::Invalid(
+                                "VECTOR column SET value must be a vector".to_string(),
+                            )))
+                        }
+                    }
+                } else {
+                    let slot = merged_values.get_mut(*col_idx).ok_or_else(|| {
+                        CatalogError::Invalid(
+                            "internal: SET target column index out of range".to_string(),
+                        )
+                    });
+                    let slot = slot.map_err(dml_write_err)?;
+                    *slot = value.clone();
+                }
+            }
+
+            // VECTOR 列の SET があった場合に限り次元検証する（単一行版
+            // `update_row_columns_unchecked` と同じ契約。`validate_embedding_dim`
+            // は VECTOR 列を持たないスキーマで常に `Err` を返すため、無条件に
+            // 呼ぶと TEXT 列のみのテーブルへの正当な述語つき UPDATE が一致行を
+            // 持つだけで失敗してしまう。codex-review P1 指摘・PR #993 系・
+            // Issue #871）。
+            if vector_assigned {
+                schema
+                    .validate_embedding_dim(embedding_value.len())
+                    .map_err(dml_write_err)?;
+            }
+            let metadata = crate::row_codec::encode_scalar_columns(&schema, &merged_values)
+                .map_err(|e| CatalogError::Invalid(e.to_string()))
+                .map_err(dml_write_err)?;
+            let row = RowInput {
+                tenant_id: ctx.tenant_id(),
+                // 既存行の可視性を保持する（SET で触れない列と同じ扱い）。
+                visibility: existing.visibility,
+                embedding: &embedding_value,
+                metadata: &metadata,
+            };
+            let encoded = encode_row(&row).map_err(dml_write_err)?;
+            row_table
+                .insert(key, encoded.as_slice())
+                .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+        }
+    }
+
+    let rows_affected = candidate_ids.len();
+    if rows_affected > 0 {
+        crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(dml_write_err)?;
+    }
+    crate::recovery::commit_boundary::commit(write_txn).map_err(dml_write_err)?;
+    Ok(PredicateDmlOutcome::Applied { rows_affected })
+}
+
 pub(crate) fn truncate_table_unchecked(
     storage: &Storage,
     table: &str,
@@ -3559,6 +4035,258 @@ mod tests {
             crate::row_codec::Value::Text("v1".to_string()),
             "row must be unchanged when the SET value is rejected before the write"
         );
+    }
+
+    // codex-review P1 指摘（PR #993 系・Issue #871）: 述語つき `UPDATE ... WHERE`
+    // （[`update_rows_where_unchecked`]）の SET 値検証（[`validate_set_assignments`]。
+    // `update_row_columns_unchecked` と共有）が、一致行の適用ループ内にしか無いと、
+    // 一致行が 0 件のまま台帳へ記録され `UPDATE 0` の成功として `operation_id` が
+    // 消費されてしまう。候補列挙・台帳記録より**前**に検証することで、一致行の
+    // 有無に関わらず同一の拒否（不正な SET 値は台帳に一切痕跡を残さない）になる
+    // ことを固定する。
+    #[test]
+    fn update_rows_where_unchecked_rejects_oversized_set_value_even_with_zero_matching_candidates()
+    {
+        let path = unique_db_path("predicate-update-max-text-len-zero-candidates");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        // テーブルは空のまま（＝どんな述語でも一致行は 0 件）。
+        let max_len_text = "x".repeat(4 * 1024 * 1024);
+        let assignments = [(2, crate::row_codec::Value::Text(max_len_text))];
+        let content_hash_value =
+            content_hash::ContentHash::for_test(b"predicate-update-oversized-set");
+        let never_matches =
+            |_c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(false) };
+
+        let op_id =
+            OperationId::parse("op-pred-maxlen-zero-candidates").expect("valid operation_id");
+        let err = update_rows_where_unchecked(
+            &storage,
+            "docs",
+            &a,
+            LedgerWrite::Record(&op_id),
+            &content_hash_value,
+            None,
+            &assignments,
+            false,
+            100,
+            never_matches,
+        )
+        .expect_err("oversized SET value must be rejected even when zero rows would match");
+        match err {
+            PredicateDmlError::Write(TenantWriteError::Catalog(CatalogError::Invalid(msg))) => {
+                assert!(
+                    msg.contains("scalar payload length"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!(
+                "expected TenantWriteError::Catalog(Invalid(..)) (client input error), got {other:?}"
+            ),
+        }
+
+        // 台帳には一切記録されていないはず: 同じ `operation_id` を正当な SET 値で
+        // 再送すると成功する（記録済みなら `DuplicateOperationId`／
+        // `OperationIdContentMismatch` になるはず）。
+        let ok_assignments = [(2, crate::row_codec::Value::Text("ok".to_string()))];
+        let outcome = update_rows_where_unchecked(
+            &storage,
+            "docs",
+            &a,
+            LedgerWrite::Record(&op_id),
+            &content_hash_value,
+            None,
+            &ok_assignments,
+            false,
+            100,
+            never_matches,
+        )
+        .expect(
+            "operation_id must remain reusable because the rejected attempt left no ledger trace",
+        );
+        assert_eq!(outcome, PredicateDmlOutcome::Applied { rows_affected: 0 });
+    }
+
+    // codex-review P1 指摘（PR #993 系・Issue #871）: 述語つき `UPDATE` の適用段
+    // （一致した既存行の `metadata` デコード）が失敗した場合、単一行版
+    // `update_row_columns_unchecked`（`sql_update_single_row.rs`
+    // `update_against_row_with_corrupt_stored_metadata_is_rejected_with_xx000`）と
+    // 同じく `CatalogError::CorruptSchema`（サーバー内部事象・`XX000`）へ分類し、
+    // `CatalogError::Invalid`（クライアント入力エラー・`22000`）に丸めないことを
+    // 固定する。`sql::exec::execute_predicate_update` が実際に注入する述語
+    // クロージャは候補判定時に必ず `row_codec::scan_scalar_columns` を実行するため
+    // 本番経路ではこの適用段の破損検出には到達しないが（`decode_scalar_columns`
+    // は内部で同じ `scan_scalar_columns` を呼ぶため先に失敗する）、既存行の
+    // metadata を参照しない述語（本テストの `match_all`）を注入する呼び出し元にも
+    // 同じ分類契約を保証する API 契約として固定する。
+    #[test]
+    fn update_rows_where_unchecked_classifies_corrupt_stored_metadata_as_internal_error() {
+        let path = unique_db_path("predicate-update-corrupt-metadata");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let seed_op = OperationId::parse("seed-pred-corrupt").expect("valid operation_id");
+        insert_row(
+            &storage,
+            "docs",
+            &a,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Private,
+                embedding: &[0.1, 0.2],
+                metadata: b"\xff\xff not a valid scalar column encoding \xff\xff",
+            },
+            &seed_op,
+        )
+        .expect("seed row with corrupt stored metadata");
+
+        let assignments = [(2, crate::row_codec::Value::Text("en".to_string()))];
+        let content_hash_value =
+            content_hash::ContentHash::for_test(b"predicate-update-corrupt-metadata");
+        let match_all =
+            |_c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(true) };
+        let op_id = OperationId::parse("op-pred-corrupt").expect("valid operation_id");
+
+        let err = update_rows_where_unchecked(
+            &storage,
+            "docs",
+            &a,
+            LedgerWrite::Record(&op_id),
+            &content_hash_value,
+            None,
+            &assignments,
+            false,
+            100,
+            match_all,
+        )
+        .expect_err("decode failure on stored data must not succeed");
+        match err {
+            PredicateDmlError::Write(TenantWriteError::Catalog(CatalogError::CorruptSchema(_))) => {
+            }
+            other => panic!(
+                "expected TenantWriteError::Catalog(CorruptSchema(..)) (internal error), \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    // codex-review P1 指摘（Issue #871）: `update_rows_where_unchecked` が
+    // 一致行ごとに `schema.validate_embedding_dim(embedding_value.len())` を
+    // `VECTOR` 列への SET 有無にかかわらず無条件で呼んでいたため、
+    // `validate_embedding_dim` が `VECTOR` 列を持たないスキーマで常に `Err` を
+    // 返す契約と衝突し、正当な `TEXT` 列のみの述語つき `UPDATE` が一致行を
+    // 持つだけで失敗していた。単一行版 `update_row_columns_unchecked` は
+    // `VECTOR` 列への SET があった場合のみ次元検証しており、本テストは述語形を
+    // 同じ契約に揃えたことを固定する。
+    //
+    // 現行の全 INSERT 系公開・準公開 API（`insert_row`/`insert_typed_row`/
+    // `insert_typed_row_unchecked`/`Storage::insert_row_into_table` 等）は
+    // いずれも `schema.validate_embedding_dim` を無条件で呼ぶため、`VECTOR`
+    // 列を持たないテーブルへは現状経由できない（本 Issue のスコープ外）。
+    // そのため本テストは `redb` への直接書き込みでスキーマ検証を迂回し、
+    // `update_rows_where_unchecked`（適用対象の関数そのもの）だけを検証する。
+    #[test]
+    fn update_rows_where_unchecked_applies_text_assignments_on_table_without_vector_column() {
+        let path = unique_db_path("predicate-update-no-vector-column");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "notes",
+            vec![
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        );
+        storage
+            .create_table(&schema)
+            .expect("create table without a VECTOR column");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let write_txn = storage.begin_write_txn().expect("begin seed write txn");
+        {
+            let row_table_name = user_rows_table_name("notes");
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .expect("open row table for seeding");
+            for (id, lang, body) in [(1u64, "ja", "a"), (2u64, "en", "b"), (3u64, "ja", "c")] {
+                let metadata = crate::row_codec::encode_scalar_columns(
+                    &schema,
+                    &[
+                        crate::row_codec::Value::Text(lang.to_string()),
+                        crate::row_codec::Value::Text(body.to_string()),
+                    ],
+                )
+                .expect("encode scalar columns");
+                let row = RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Private,
+                    embedding: &[],
+                    metadata: &metadata,
+                };
+                let encoded = encode_row(&row).expect("encode seeded row");
+                row_table
+                    .insert(("tenant-a", id), encoded.as_slice())
+                    .expect("seed row without a VECTOR column");
+            }
+        }
+        crate::catalog::bump_table_generation_in_txn(&write_txn, "notes")
+            .expect("bump table generation for seeded rows");
+        crate::recovery::commit_boundary::commit(write_txn).expect("commit seed txn");
+
+        // SET 対象は `lang`（宣言順インデックス 0）。`body`（インデックス 1）は
+        // 対象外のまま残ることも下で確認する。
+        let assignments = [(0usize, crate::row_codec::Value::Text("fr".to_string()))];
+        let content_hash_value =
+            content_hash::ContentHash::for_test(b"predicate-update-no-vector-column");
+        let match_lang_ja = |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> {
+            let existing = crate::row_codec::scan_scalar_columns(&schema, c.metadata)
+                .expect("decode seeded metadata");
+            Ok(matches!(existing.first(), Some(Some(s)) if *s == "ja"))
+        };
+        let op_id = OperationId::parse("op-pred-no-vector-column").expect("valid operation_id");
+
+        let outcome = update_rows_where_unchecked(
+            &storage,
+            "notes",
+            &ctx,
+            LedgerWrite::Record(&op_id),
+            &content_hash_value,
+            None,
+            &assignments,
+            false,
+            100,
+            match_lang_ja,
+        )
+        .expect("predicate UPDATE on a table without a VECTOR column should succeed");
+        assert_eq!(outcome, PredicateDmlOutcome::Applied { rows_affected: 2 });
+
+        for (id, expected_lang, expected_body) in
+            [(1u64, "fr", "a"), (2u64, "en", "b"), (3u64, "fr", "c")]
+        {
+            let row = storage
+                .get_row_from_table("notes", "tenant-a", id)
+                .expect("read back row");
+            let values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                .expect("decode updated metadata");
+            assert_eq!(
+                values,
+                vec![
+                    crate::row_codec::Value::Text(expected_lang.to_string()),
+                    crate::row_codec::Value::Text(expected_body.to_string()),
+                ],
+                "row {id} must reflect the expected lang/body after the predicate UPDATE"
+            );
+        }
     }
 
     // PR #992 レビュー指摘（Issue #876）: `named_columns` をハッシュ計算前に

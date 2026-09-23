@@ -97,6 +97,15 @@ enum OpTag {
     /// [`for_typed_upsert`] ドキュメント参照。
     Upsert = 7,
     UpdateColumns = 8,
+    /// 述語つき `UPDATE ... WHERE`（SQL-19・TASK-192、Issue #871・RECOVER-11）用。
+    /// 単一行 `id` 完全一致形（[`OpTag::Update`]）とは別ドメインに分離する
+    /// （ADR `docs/design/multi-row-dml-operation-id.md` §4.1）。[`for_update_where`]
+    /// ドキュメント参照。
+    UpdateWhere = 9,
+    /// 述語つき `DELETE ... WHERE`（SQL-19・TASK-192、Issue #871・RECOVER-11）用。
+    /// 単一行 `id` 完全一致形（[`OpTag::Delete`]）とは別ドメインに分離する
+    /// （ADR 同上）。[`for_delete_where`] ドキュメント参照。
+    DeleteWhere = 10,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -645,6 +654,304 @@ pub(crate) fn for_replace_by_text_key(
     b.push_bytes(body.as_bytes())?;
     push_named_scalar_columns(&mut b, template_columns)?;
     Ok(b.finish())
+}
+
+/// フィールド長超過（`push_bytes`／件数プレフィクスの `u32` 上限超過）を
+/// `wire_code` `54000` へ写像する（[`for_update_where`]／[`for_delete_where`]
+/// 系の共通ヘルパー。実際には上流の既存上限〔`MAX_METADATA_FILTERS`・
+/// `MAX_EXPR_NODES`・`MAX_UDF_PARAMS`・`MAX_SESSION_UDFS`〕により事実上到達
+/// しないが、`push_bytes` 自体の fail-closed 契約を崩さないよう明示的に
+/// 写像する）。
+fn dml_hash_field_too_large() -> crate::sql::allowlist::SqlSurfaceError {
+    crate::sql::allowlist::SqlSurfaceError::payload_too_large("content hash field too large")
+}
+
+/// 述語つき `UPDATE ... WHERE`（SQL-19・TASK-192、Issue #871・対象ビヘイビア:
+/// RECOVER-11）の内容照合ハッシュ。ADR `docs/design/multi-row-dml-operation-id.md`
+/// （Issue #868）§4 のレイアウトをそのまま実装する。
+///
+/// 他の `for_*` と異なり、本関数（および [`for_delete_where`]）は
+/// `sql::allowlist::WherePredicate`・`sql::udf_call::UdfRegistry` を直接受け取る
+/// （ADR §4.2 が提案するシグネチャをそのまま採用）。`WHERE` の構文形（束縛前）を
+/// ハッシュ源にする契約（ADR §4.4「構文段 AST を直接ハッシュする理由」）上、
+/// `recovery` モジュールが `sql` モジュールへ依存する形になるが、`sql` は既に
+/// `recovery`（`content_hash`・`ledger`・`required_op_id`）へ依存しているため、
+/// 同一クレート内のモジュール参照としてはどちらの向きも許容される（Rust が
+/// 禁止するのはクレート単位の循環のみ）。
+///
+/// 入力: `table`（テーブル名）・`assignments`（`SET` 句の宣言順 `(列名, リテラル)`
+/// 対応。`ValidatedPredicateUpdate::assignments()` が保持する順序そのまま）・
+/// `where_predicates`（`WHERE` 句の宣言順。同じく並べ替えない）・`udf_registry`
+/// （呼び出し元セッションの `UdfRegistry`。`WHERE` 式中の `Call` を解決するために
+/// 使う。ADR §4.4.1）。
+///
+/// **計算位置（ADR §5.1 からの意図的な変更）**: ADR は `bind_update_form`／
+/// `bind_predicate_delete` の内部で計算し束縛済み型（`BoundPredicateUpdate`／
+/// `BoundPredicateDelete`）へ保持させることを推奨するが、これらの型の
+/// コンストラクタ（`pub fn new`／`pub(crate) fn new`）は既に固定された引数
+/// （束縛済み `MetadataFilter`／`BoundExpr`）を取り、生の `WherePredicate`／
+/// `UdfRegistry` を経由しない別入口（NoSQL 表層直接構築、Issue #876）を将来
+/// 持つ設計であるため、これらの型へ `content_hash` フィールドを追加すると
+/// `new` の契約が割れる。本実装は `core.rs::EngineCore`（`Validated*` 形と
+/// `session.udfs()` の両方を持つ唯一の呼び出し元）が束縛の直前に 1 回だけ
+/// 呼び出し、`sql::exec::execute_predicate_update`／`execute_predicate_delete`
+/// へ `&ContentHash` として渡す（詳細は `docs/design/predicate-dml-exec.md`
+/// 参照）。
+///
+/// **エラー型（ADR §4.2 からの意図的な変更）**: ADR は `StorageError` を返す
+/// シグネチャを示すが、本実装は `sql::allowlist::SqlSurfaceError` を直接返す。
+/// WASM UDF 呼び出しの拒否（ADR §4.4.1「WASM UDF は本節の対象外」）は
+/// `wire_code` を伴う SQL 表層のエラーであり、`StorageError` には対応する
+/// variant が存在しない。ADR は ERR-2 分類として `0A000` を挙げているが、
+/// `sql::allowlist::SqlSurfaceError` には `0A000` を返す variant が存在しない
+/// （`grep -n '"0A000"' crates/engine/src/sql/allowlist.rs` で不在を確認済み。
+/// `0A000` は NoSQL 表層の op 許可リスト専用）ため、本実装は
+/// `SqlSurfaceError::unsupported`（許可形状外・`42601`）へ写像する。
+pub(crate) fn for_update_where(
+    table: &str,
+    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    where_predicates: &[crate::sql::allowlist::WherePredicate],
+    udf_registry: &crate::sql::udf_call::UdfRegistry,
+) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
+    let mut b = HashInputBuilder::new(OpTag::UpdateWhere);
+    b.push_bytes(table.as_bytes())
+        .map_err(|_| dml_hash_field_too_large())?;
+    push_dml_assignments(&mut b, assignments)?;
+    push_dml_where_predicates(&mut b, where_predicates, udf_registry)?;
+    Ok(b.finish())
+}
+
+/// 述語つき `DELETE ... WHERE`（SQL-19・TASK-192、Issue #871・対象ビヘイビア:
+/// RECOVER-11）の内容照合ハッシュ。[`for_update_where`] と同じ `WHERE` 直列化
+/// （[`push_dml_where_predicates`]）を共有し、`SET` 割当を持たない点のみが
+/// 異なる（ADR §4.3「2. `SET` 割当（`UPDATE` のみ。`DELETE` には無い）」）。
+/// タグは [`OpTag::DeleteWhere`]（[`OpTag::UpdateWhere`] とは別ドメイン）。
+pub(crate) fn for_delete_where(
+    table: &str,
+    where_predicates: &[crate::sql::allowlist::WherePredicate],
+    udf_registry: &crate::sql::udf_call::UdfRegistry,
+) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
+    let mut b = HashInputBuilder::new(OpTag::DeleteWhere);
+    b.push_bytes(table.as_bytes())
+        .map_err(|_| dml_hash_field_too_large())?;
+    push_dml_where_predicates(&mut b, where_predicates, udf_registry)?;
+    Ok(b.finish())
+}
+
+/// `SET` 割当（宣言順）を連結する（ADR §4.3 の 2 番）。件数プレフィクス（u32 LE）
+/// → 各要素につき `push_bytes(列名)`・リテラル種別タグ（`String`＝1・`Number`＝2）・
+/// `push_bytes(リテラル生文字列)`。列名は宣言どおりの大文字小文字のまま連結する
+/// （`bind_set_assignments` の厳密一致と揃える）。`push_named_scalar_columns`
+/// （`Value::Null` を除外する実装）は再利用しない——将来 `SET col = NULL` が
+/// 追加されたときに黙って脱落させない前方ガード（ADR §4.3 参照）。
+fn push_dml_assignments(
+    b: &mut HashInputBuilder,
+    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    use crate::sql::allowlist::InsertLiteral;
+
+    let count = u32::try_from(assignments.len()).map_err(|_| dml_hash_field_too_large())?;
+    b.push_raw(&count.to_le_bytes());
+    for (name, literal) in assignments {
+        b.push_bytes(name.as_bytes())
+            .map_err(|_| dml_hash_field_too_large())?;
+        match literal {
+            InsertLiteral::String(s) => {
+                b.push_u8(1);
+                b.push_bytes(s.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
+            InsertLiteral::Number(s) => {
+                b.push_u8(2);
+                b.push_bytes(s.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `WHERE` 述語列（宣言順）を連結する（ADR §4.3 の 3 番）。`for_update_where`・
+/// `for_delete_where` が共有する。件数プレフィクス（u32 LE）に続けて各
+/// `WherePredicate` を種別タグ＋フィールドで直列化し、`Expression` 述語が
+/// 参照する UDF の推移閉包（ADR §4.4.1）を集めて末尾に追記する。
+fn push_dml_where_predicates(
+    b: &mut HashInputBuilder,
+    predicates: &[crate::sql::allowlist::WherePredicate],
+    udf_registry: &crate::sql::udf_call::UdfRegistry,
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    use crate::sql::allowlist::WherePredicate;
+
+    let count = u32::try_from(predicates.len()).map_err(|_| dml_hash_field_too_large())?;
+    b.push_raw(&count.to_le_bytes());
+
+    // 参照 UDF 集合（名前の辞書順。ADR §4.4.1「5. 決定的な順序」）。
+    let mut referenced: std::collections::BTreeMap<String, crate::sql::udf_call::UdfDefinition> =
+        std::collections::BTreeMap::new();
+
+    for pred in predicates {
+        match pred {
+            WherePredicate::Equality { column, value } => {
+                b.push_u8(1);
+                b.push_bytes(column.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+                b.push_bytes(value.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
+            WherePredicate::Prefix { column, pattern } => {
+                b.push_u8(2);
+                b.push_bytes(column.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+                b.push_bytes(pattern.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
+            WherePredicate::PredicateCall { name } => {
+                b.push_u8(3);
+                b.push_bytes(name.to_ascii_lowercase().as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
+            WherePredicate::Expression(expr) => {
+                b.push_u8(4);
+                push_dml_expr(b, expr, None)?;
+                collect_referenced_udfs(expr, udf_registry, &mut referenced)?;
+            }
+        }
+    }
+
+    // 参照 UDF 定義セクション（ADR §4.4.1「6.」）。参照 UDF が無ければ件数
+    // プレフィクスの 0 すら書かない（UDF を呼ばない文は本節導入前とビット同一の
+    // ハッシュになる互換性を保つ）。
+    if !referenced.is_empty() {
+        let udf_count = u32::try_from(referenced.len()).map_err(|_| dml_hash_field_too_large())?;
+        b.push_raw(&udf_count.to_le_bytes());
+        for (name, def) in referenced.iter() {
+            b.push_bytes(name.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            let param_count =
+                u32::try_from(def.params.len()).map_err(|_| dml_hash_field_too_large())?;
+            b.push_raw(&param_count.to_le_bytes());
+            // パラメータ名は小文字化してから連結する（`push_dml_expr` の `Ident`
+            // 側パラメータ参照・`bind_expr_in` の呼び出し引数解決と同じ大文字小文字
+            // 非区別契約に揃える。ここを原文のまま連結すると `x`／`X` のように
+            // 意味的に同一なパラメータ宣言が異なる content_hash を生み、同一
+            // `operation_id` の正当な再送を内容不一致〔`22023`〕として誤拒否する）。
+            for p in &def.params {
+                b.push_bytes(p.to_ascii_lowercase().as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
+            push_dml_expr(b, &def.body, Some(&def.params))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// `Call` の呼び出し先を解決し、宣言的 UDF なら参照 UDF 集合（`out`）へ追加して
+/// 本体を再帰的に走査する（推移閉包。ADR §4.4.1「4.」）。WASM UDF に解決される
+/// 呼び出しは許可形状外として拒否する（`get_wasm` → `get` の順で必ず判定する。
+/// ADR §4.4.1「2.」の順序を維持しないと WASM UDF の名前が誤って「組み込み関数」
+/// 側へ分類されてしまう）。`UdfRegistry` は追記専用（自身より前に登録済みの
+/// UDF のみを呼べる）ため巡回はなく、この再帰は必ず停止する。
+fn collect_referenced_udfs(
+    expr: &crate::sql::udf_call::Expr,
+    udf_registry: &crate::sql::udf_call::UdfRegistry,
+    out: &mut std::collections::BTreeMap<String, crate::sql::udf_call::UdfDefinition>,
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    use crate::sql::udf_call::Expr;
+
+    match expr {
+        Expr::Number(_) | Expr::Ident(_) => Ok(()),
+        Expr::Call { name, args } => {
+            if udf_registry.get_wasm(name).is_some() {
+                return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "WASM UDF calls are not supported in predicate-form UPDATE/DELETE WHERE clauses",
+                ));
+            }
+            if let Some(def) = udf_registry.get(name) {
+                let lower = name.to_ascii_lowercase();
+                if let std::collections::btree_map::Entry::Vacant(entry) = out.entry(lower) {
+                    entry.insert(def.clone());
+                    collect_referenced_udfs(&def.body, udf_registry, out)?;
+                }
+            }
+            for arg in args {
+                collect_referenced_udfs(arg, udf_registry, out)?;
+            }
+            Ok(())
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_referenced_udfs(lhs, udf_registry, out)?;
+            collect_referenced_udfs(rhs, udf_registry, out)
+        }
+    }
+}
+
+/// `Expr` をタグ付き前置順で直列化する（ADR §4.4）。`params` が `Some` の場合、
+/// `Ident` が参照 UDF 自身のパラメータ（大文字小文字を区別せず照合）を指すときに
+/// 限り小文字化して連結する（ADR §4.4.1「6.」。`bind_expr_in` のパラメータ解決が
+/// 大文字小文字を無視するため、同じ UDF の異なる大文字小文字綴りが異なるハッシュに
+/// ならないようにする）。`WHERE` 直下（`params == None`）の `Ident`（列参照）は
+/// 大文字小文字を区別したまま連結する（ADR §4.4 既定規則）。
+fn push_dml_expr(
+    b: &mut HashInputBuilder,
+    expr: &crate::sql::udf_call::Expr,
+    params: Option<&[String]>,
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    use crate::sql::udf_call::Expr;
+
+    match expr {
+        Expr::Number(raw) => {
+            b.push_u8(1);
+            let v = crate::sql::udf_call::parse_number_literal(raw)?;
+            b.push_raw(&v.to_bits().to_le_bytes());
+        }
+        Expr::Ident(name) => {
+            b.push_u8(2);
+            let is_param = params
+                .map(|ps| ps.iter().any(|p| p.eq_ignore_ascii_case(name)))
+                .unwrap_or(false);
+            if is_param {
+                b.push_bytes(name.to_ascii_lowercase().as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            } else {
+                b.push_bytes(name.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
+        }
+        Expr::Call { name, args } => {
+            b.push_u8(3);
+            b.push_bytes(name.to_ascii_lowercase().as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            let count = u32::try_from(args.len()).map_err(|_| dml_hash_field_too_large())?;
+            b.push_raw(&count.to_le_bytes());
+            for arg in args {
+                push_dml_expr(b, arg, params)?;
+            }
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            b.push_u8(4);
+            b.push_u8(dml_binop_tag(*op));
+            push_dml_expr(b, lhs, params)?;
+            push_dml_expr(b, rhs, params)?;
+        }
+    }
+    Ok(())
+}
+
+/// `BinOp` を 1 バイトへ写像する（ADR §4.4）。
+fn dml_binop_tag(op: crate::sql::udf_call::BinOp) -> u8 {
+    use crate::sql::udf_call::BinOp;
+    match op {
+        BinOp::Add => 1,
+        BinOp::Sub => 2,
+        BinOp::Mul => 3,
+        BinOp::Div => 4,
+        BinOp::Gt => 5,
+        BinOp::Lt => 6,
+        BinOp::Ge => 7,
+        BinOp::Le => 8,
+        BinOp::Eq => 9,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1666,5 +1973,242 @@ mod tests {
         let h_reversed =
             for_typed_upsert(&UpsertHashAction::DoNothing, &rows_reversed).expect("hash");
         assert_ne!(h_forward, h_reversed);
+    }
+
+    // --- for_update_where / for_delete_where（Issue #871・SQL-19・TASK-192） --------
+
+    /// [`crate::wasm_udf::WasmUdfBackend`] のテスト専用モック実装。呼び出されたら
+    /// 即座に成功を返す（`collect_referenced_udfs` の拒否判定は呼び出し前の
+    /// レジストリ照会段で完結するため、本体の計算内容はテストの関心事ではない）。
+    #[derive(Debug)]
+    struct StubWasmBackend;
+
+    impl crate::wasm_udf::WasmUdfBackend for StubWasmBackend {
+        fn call_vector_scalar(
+            &self,
+            _v: &[f32],
+            scalar: f64,
+        ) -> Result<f64, crate::wasm_udf::WasmUdfError> {
+            Ok(scalar)
+        }
+    }
+
+    /// `id > 0`（[`WherePredicate::Expression`] の許可形状：比較演算子を頂点に持つ
+    /// 木）を土台に、左辺だけを差し替えた式述語を組み立てるテストヘルパー。
+    fn where_predicate_id_gt_zero(
+        lhs: crate::sql::udf_call::Expr,
+    ) -> crate::sql::allowlist::WherePredicate {
+        use crate::sql::udf_call::{BinOp, Expr};
+        crate::sql::allowlist::WherePredicate::Expression(Expr::Binary {
+            op: BinOp::Gt,
+            lhs: Box::new(lhs),
+            rhs: Box::new(Expr::Number("0".to_string())),
+        })
+    }
+
+    /// ADR §4.4.1「WASM UDF は本節の対象外」の拒否判定（`collect_referenced_udfs` の
+    /// `get_wasm` → `get` の順序）を固定する。`for_delete_where`・`for_update_where`
+    /// いずれも `WHERE` 直列化を共有するため、WASM UDF 拒否は両者で同じ経路を通る。
+    #[test]
+    fn for_delete_where_rejects_where_referencing_wasm_udf() {
+        use crate::sql::udf_call::{define_wasm_function, Expr, UdfRegistry};
+        use std::sync::Arc;
+
+        let mut registry = UdfRegistry::default();
+        define_wasm_function(&mut registry, "wasm_fn", Arc::new(StubWasmBackend))
+            .expect("register wasm udf");
+
+        let predicate = where_predicate_id_gt_zero(Expr::Call {
+            name: "wasm_fn".to_string(),
+            args: vec![Expr::Ident("id".to_string())],
+        });
+
+        let err = for_delete_where("t", &[predicate], &registry)
+            .expect_err("WASM UDF calls must be rejected in predicate-form WHERE clauses");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn for_update_where_rejects_where_referencing_wasm_udf() {
+        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::udf_call::{define_wasm_function, Expr, UdfRegistry};
+        use std::sync::Arc;
+
+        let mut registry = UdfRegistry::default();
+        define_wasm_function(&mut registry, "wasm_fn", Arc::new(StubWasmBackend))
+            .expect("register wasm udf");
+
+        let predicate = where_predicate_id_gt_zero(Expr::Call {
+            name: "wasm_fn".to_string(),
+            args: vec![Expr::Ident("id".to_string())],
+        });
+        let value = InsertLiteral::String("ja".to_string());
+        let assignments: [(&str, &InsertLiteral); 1] = [("lang", &value)];
+
+        let err = for_update_where("t", &assignments, &[predicate], &registry)
+            .expect_err("WASM UDF calls must be rejected in predicate-form WHERE clauses");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// 宣言的 UDF を 2 段（`outer` が `inner` を呼ぶ）で登録したレジストリを
+    /// 組み立てるテストヘルパー。`param_case` はパラメータ宣言の綴りを変えるために
+    /// 使い、大文字小文字畳み込み（ADR §4.4.1「6.」）の検証に使う。
+    fn registry_with_two_layer_udf(
+        param_case: fn(&str) -> String,
+        inner_op: crate::sql::udf_call::BinOp,
+    ) -> crate::sql::udf_call::UdfRegistry {
+        use crate::sql::udf_call::{define_function, BinOp, Expr, UdfRegistry};
+
+        let mut registry = UdfRegistry::default();
+        let inner_param = param_case("x");
+        define_function(
+            &mut registry,
+            "inner",
+            std::slice::from_ref(&inner_param),
+            &Expr::Binary {
+                op: inner_op,
+                lhs: Box::new(Expr::Ident(inner_param.clone())),
+                rhs: Box::new(Expr::Number("1".to_string())),
+            },
+        )
+        .expect("define inner");
+
+        let outer_param = param_case("y");
+        define_function(
+            &mut registry,
+            "outer",
+            std::slice::from_ref(&outer_param),
+            &Expr::Binary {
+                op: BinOp::Mul,
+                lhs: Box::new(Expr::Call {
+                    name: "inner".to_string(),
+                    args: vec![Expr::Ident(outer_param.clone())],
+                }),
+                rhs: Box::new(Expr::Number("2".to_string())),
+            },
+        )
+        .expect("define outer");
+        registry
+    }
+
+    /// ADR §4.4.1「4. 推移閉包」「6. 決定的な順序・大文字小文字畳み込み」の
+    /// ピン留め：`inner`/`outer` の意味が同一なら、パラメータ宣言の大文字小文字が
+    /// 異なっていてもハッシュは一致する。
+    #[test]
+    fn for_delete_where_transitive_udf_closure_is_case_insensitive_on_params() {
+        use crate::sql::udf_call::{BinOp, Expr};
+
+        let lower = registry_with_two_layer_udf(|s| s.to_string(), BinOp::Add);
+        let upper = registry_with_two_layer_udf(|s| s.to_uppercase(), BinOp::Add);
+
+        let predicate = where_predicate_id_gt_zero(Expr::Call {
+            name: "outer".to_string(),
+            args: vec![Expr::Ident("id".to_string())],
+        });
+
+        let h_lower =
+            for_delete_where("t", std::slice::from_ref(&predicate), &lower).expect("hash");
+        let h_upper = for_delete_where("t", &[predicate], &upper).expect("hash");
+        assert_eq!(
+            h_lower, h_upper,
+            "same UDF closure must hash identically regardless of declared parameter case"
+        );
+    }
+
+    /// 上のテストは `define_function`（production の唯一の登録経路）がパラメータ名を
+    /// 定義時点で必ず小文字へ正規化する（`sql::udf_call::define_function` の
+    /// `normalized_params`）ため、`push_dml_where_predicates` の UDF 定義
+    /// セクション自体が大文字小文字を畳み込む必要性を検証できていなかった
+    /// （codex-review P1 指摘。`define_function` を経由しない場合でも定義
+    /// セクションの直列化自体が大文字小文字を畳み込む契約であることを、正規化を
+    /// 経由しない [`crate::sql::udf_call::insert_raw_definition_for_test`] で
+    /// 直接ピン留めする）。
+    #[test]
+    fn for_delete_where_udf_definition_section_folds_param_case_independent_of_define_function() {
+        use crate::sql::udf_call::{
+            insert_raw_definition_for_test, Expr, UdfDefinition, UdfRegistry,
+        };
+
+        let mut lower = UdfRegistry::default();
+        insert_raw_definition_for_test(
+            &mut lower,
+            "raw_fn",
+            UdfDefinition {
+                params: vec!["x".to_string()],
+                body: Expr::Ident("x".to_string()),
+            },
+        );
+
+        let mut upper = UdfRegistry::default();
+        insert_raw_definition_for_test(
+            &mut upper,
+            "raw_fn",
+            UdfDefinition {
+                params: vec!["X".to_string()],
+                body: Expr::Ident("X".to_string()),
+            },
+        );
+
+        let predicate = where_predicate_id_gt_zero(Expr::Call {
+            name: "raw_fn".to_string(),
+            args: vec![Expr::Ident("id".to_string())],
+        });
+
+        let h_lower =
+            for_delete_where("t", std::slice::from_ref(&predicate), &lower).expect("hash");
+        let h_upper = for_delete_where("t", &[predicate], &upper).expect("hash");
+        assert_eq!(
+            h_lower, h_upper,
+            "definition-section serialization itself must fold parameter name case, \
+             independent of any upstream normalization by define_function"
+        );
+    }
+
+    /// 同じ形（`outer` が `inner` を呼ぶ）でも `inner` の本体演算子が異なれば
+    /// （推移閉包の中身が変われば）ハッシュが変わることを固定する。
+    #[test]
+    fn for_delete_where_transitive_udf_closure_differs_when_inner_body_changes() {
+        use crate::sql::udf_call::{BinOp, Expr};
+
+        let add_registry = registry_with_two_layer_udf(|s| s.to_string(), BinOp::Add);
+        let sub_registry = registry_with_two_layer_udf(|s| s.to_string(), BinOp::Sub);
+
+        let predicate = where_predicate_id_gt_zero(Expr::Call {
+            name: "outer".to_string(),
+            args: vec![Expr::Ident("id".to_string())],
+        });
+
+        let h_add =
+            for_delete_where("t", std::slice::from_ref(&predicate), &add_registry).expect("hash");
+        let h_sub = for_delete_where("t", &[predicate], &sub_registry).expect("hash");
+        assert_ne!(
+            h_add, h_sub,
+            "differing UDF closures (inner body operator) must not collapse to the same hash"
+        );
+    }
+
+    /// ADR §4.4.1「参照 UDF が無ければ件数プレフィクスの 0 すら書かない」契約の
+    /// ピン留め：`WHERE` が UDF を一切呼ばない場合、セッションに UDF が登録済みか
+    /// どうか（登録の有無・登録内容）に関わらずハッシュは完全に一致する。
+    #[test]
+    fn for_delete_where_hash_is_unaffected_by_unreferenced_udf_registrations() {
+        use crate::sql::allowlist::WherePredicate;
+        use crate::sql::udf_call::{BinOp, UdfRegistry};
+
+        let predicate = WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: "ja".to_string(),
+        };
+
+        let empty_registry = UdfRegistry::default();
+        let populated_registry = registry_with_two_layer_udf(|s| s.to_string(), BinOp::Add);
+
+        let h_empty =
+            for_delete_where("t", std::slice::from_ref(&predicate), &empty_registry).expect("hash");
+        let h_populated = for_delete_where("t", &[predicate], &populated_registry).expect("hash");
+        assert_eq!(
+            h_empty, h_populated,
+            "UDF section must be omitted entirely when no UDF is referenced by WHERE"
+        );
     }
 }

@@ -232,11 +232,20 @@ pub enum SqlOutcome {
     /// に委譲しており、本 variant はその [`exec::ReturningOutcome`] をそのまま
     /// 運ぶ薄いラッパー（`Insert`・`Delete` と同じ設計）。
     Returning(exec::ReturningOutcome),
-    /// `UPDATE <table> SET <col> = <lit>[, ...] WHERE id = <n>
-    /// USING OPERATION_ID '<id>'`（Issue #865・SQL-17・TASK-191）がセッション経由の
-    /// 実行経路で成功したことを示す応答。検証・実行本体は
-    /// [`crate::core::EngineCore::execute_update_sql`] に委譲しており、本 variant
-    /// はその [`exec::UpdateOutcome`] をそのまま運ぶ薄いラッパー（`Insert`・
-    /// `Truncate` と同じ設計）。
+    /// `UPDATE` がセッション経由の実行経路で成功したことを示す応答。単一行・
+    /// `id` 完全一致形（`UPDATE <table> SET <col> = <lit>[, ...] WHERE id = <n>
+    /// USING OPERATION_ID '<id>'`。SQL-17・TASK-191、Issue #865）は
+    /// [`crate::core::EngineCore::execute_update_sql`] に、述語形
+    /// （`UPDATE <table> SET ... WHERE ... USING OPERATION_ID '<id>'`。
+    /// SQL-19・TASK-192、Issue #871）は
+    /// [`crate::core::EngineCore::execute_sql_in_session`] の `UPDATE` 分岐に
+    /// それぞれ委譲しており、本 variant はいずれの場合もその
+    /// [`exec::UpdateOutcome`] をそのまま運ぶ薄いラッパー（`Insert`・
+    /// `Truncate`・`Delete` と同じ設計）。
+    ///
+    /// **BREAKING CHANGE**（Issue #865）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コード（`crate::core::EngineCore`・
+    /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
+    /// を網羅的にマッチするコードがあれば追随が必要。
     Update(exec::UpdateOutcome),
 }

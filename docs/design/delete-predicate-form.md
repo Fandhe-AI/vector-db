@@ -7,13 +7,17 @@ EXT-3（前方一致）・SQL-9（式述語）。
 spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠）。本ドキュメントは
 本リポ側の実装判断・設計記録のみを扱う。
 
+> **実行結線は実装済み**（Issue #871）。詳細は `docs/design/predicate-dml-exec.md`
+> 参照。以下「実行結線は Issue #871 の担当」等の記述は本 Issue（#870）着手時点の
+> 申し送りとして残置する。
+
 ## スコープ
 
 本 Issue は述語つき `DELETE ... WHERE` の**許可リスト検証と束縛**のみを実装する
 （`sql::allowlist::validate_delete_statement`・`sql::parser::bind_predicate_delete`）。
 実行結線（可視行列挙・1 トランザクション一括適用・`DELETE <n>` 応答・影響行数上限の
-実測判定・世代カウンタ／各索引キャッシュ失効・台帳照合）は Issue #871 の担当。
-`core.rs`・`sql/exec.rs` の実行経路は本 Issue では一切変更しない。
+実測判定・世代カウンタ／各索引キャッシュ失効・台帳照合）は Issue #871（実装済み）
+の担当。`core.rs`・`sql/exec.rs` の実行経路は本 Issue では一切変更しない。
 
 ## 構文
 

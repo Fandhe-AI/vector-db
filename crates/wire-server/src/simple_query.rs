@@ -284,11 +284,13 @@ pub(crate) fn execute_and_respond(
             };
             respond_rows_with_tag(stream, &outcome.result, &tag)
         }
-        // Issue #865（SQL-17・TASK-191）: `UPDATE`（単一行・id 指定。
-        // `exec::UpdateOutcome::rows_affected` に更新件数を保持する。
+        // `UPDATE`（単一行・id 指定形。SQL-17・TASK-191、Issue #865。述語形。
+        // SQL-19・TASK-192、Issue #871。`exec::UpdateOutcome::rows_affected` は
+        // いずれの形式でも自テナント所有・一致行の更新件数を保持する。
         // `sql/exec.rs` ドキュメント参照）の応答を pg 互換の `CommandComplete`
-        // タグ `UPDATE <rows>` へ整形する（`INSERT` の `<oid> <rows>` と異なり
-        // OID フィールドを持たない pg の `UPDATE` タグ規範に準拠）。
+        // タグ `UPDATE <rows>`（PostgreSQL の `UPDATE` タグに準拠。`INSERT` の
+        // `<oid> <rows>` と異なり OID フィールドを持たない）へ整形する。
+        // `DELETE <rows>` と同じ設計。
         Ok(SqlOutcome::Update(outcome)) => match result_encoder::encode_command_complete(&format!(
             "UPDATE {}",
             outcome.rows_affected

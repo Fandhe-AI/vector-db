@@ -185,7 +185,8 @@ fn new_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
-/// 42601（unsupported_sql_syntax）: `UPDATE` は Issue #865（SQL-17・TASK-191）で
+/// 42601（unsupported_sql_syntax）: `UPDATE` は Issue #865（SQL-17・TASK-191。
+/// 単一行・`id` 完全一致形）・Issue #871（SQL-19・TASK-192。述語形）で
 /// 実行結線されたため、構造として正しい `UPDATE` 文（`USING OPERATION_ID` 付き）
 /// は許可リスト外の statement 種別としては拒否されなくなった（この点は本ケースが
 /// 元々検証していた「許可リストに存在しない statement 種別」の対象から外れた）。
@@ -201,6 +202,13 @@ fn err1_update_returns_42601_fields() {
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
+    // `operation_id` 必須化ガード（TASK-92・RECOVER-1・`23502`）より先に
+    // このケースが検証したい `42601`（`SET id = ...` の構造拒否）へ到達させる
+    // ため `USING OPERATION_ID` を付与する。単一行・述語形いずれの
+    // `ValidatedUpdateForm` 経由でも `sql::parser::bind_update` の疑似列拒否は
+    // 変わらない（Issue #871 で `EngineCore::execute_predicate_update_form` の
+    // `Single` 腕が実行結線に切り替わった後も本ケースの `42601` は
+    // `bind_update` 由来のまま）。
     send_simple_query(
         &mut stream,
         "UPDATE docs SET id = 2 WHERE id = 1 USING OPERATION_ID 'err1-update-set-id'",

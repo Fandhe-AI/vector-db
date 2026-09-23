@@ -7,12 +7,17 @@ RLS-7・RLS-10（RLS 暗黙適用）・RECOVER-1（`operation_id` 必須化）�
 spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠）。本ドキュメントは
 本リポ側の実装判断・設計記録のみを扱う。
 
+> **実行結線は実装済み**（Issue #871）。詳細は `docs/design/predicate-dml-exec.md`
+> 参照。以下「実行結線は別 Issue（#871）の担当」等の記述は本 Issue（#869）着手時点
+> の申し送りとして残置する。
+
 ## スコープ
 
 本 Issue は述語つき `UPDATE ... WHERE` の **許可リスト構造検証・束縛** のみを
 対象とする。実行結線（候補行の列挙・可視集合との突き合わせ・一括適用・原子性・
-`operation_id` 内容照合）は別 Issue（#871）の担当。述語つき `DELETE ... WHERE` は
-別 Issue（#870）が本 Issue の型・振り分け規則をそのまま再利用する想定。
+`operation_id` 内容照合）は別 Issue（#871。実装済み）の担当。述語つき
+`DELETE ... WHERE` は別 Issue（#870）が本 Issue の型・振り分け規則をそのまま
+再利用する想定。
 
 ## 構文
 

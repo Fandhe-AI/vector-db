@@ -2210,54 +2210,77 @@ impl EngineCore {
                 return Ok(crate::sql::SqlOutcome::Truncate(outcome));
             }
 
-            // SQL-18（TASK-191・#867）: `INSERT`／`TRUNCATE` と同じ設計で `DELETE`
-            // を覗き見判定する。`EXPLAIN DELETE ...`・`WHERE` を伴わない `DELETE`
-            // は先頭トークンが `DELETE` であっても許可リスト外の形状のため、
-            // `sql::allowlist::validate_delete_tokens`（`Parser::parse_delete`）が
-            // `42601` で拒否する（`INSERT`・`TRUNCATE` の既存コメントと同じ経路。
-            // `EXPLAIN DELETE ...` は先頭トークンが `DELETE` ではなく `EXPLAIN` に
-            // なるためここでは捕捉されず、後続の `validate_sql` の `EXPLAIN`
+            // SQL-18（TASK-191・#867）・SQL-19（TASK-192、Issue #870・#871）:
+            // `INSERT`／`TRUNCATE` と同じ設計で `DELETE` を覗き見判定する。
+            // `EXPLAIN DELETE ...` は先頭トークンが `DELETE` ではなく `EXPLAIN`
+            // になるためここでは捕捉されず、後続の `validate_sql` の `EXPLAIN`
             // 分岐〔次のトークンが `SELECT` であることを要求〕へ流れて `42601`
-            // で拒否される）。
+            // で拒否される（`INSERT`・`TRUNCATE` の既存コメントと同じ経路）。
+            //
+            // 単一行・`id` 完全一致形（[`crate::sql::allowlist::validate_delete_tokens`]
+            // 専用の入口。既存 [`Self::execute_delete_sql`] が使う）ではなく、
+            // 述語形も受理する [`crate::sql::allowlist::validate_delete_statement_tokens`]
+            // （Issue #870）へ切り替え、[`crate::sql::allowlist::DeleteStatement`]
+            // の variant で実行本体を振り分ける（Issue #871。単一行形は既存
+            // `execute_delete_form` へ委譲し挙動不変、述語形は新設
+            // [`Self::execute_predicate_delete_form`] へ委譲する）。
             let is_delete_statement = matches!(
                 tokens.first(),
                 Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DELETE")
             );
             if is_delete_statement {
-                let stmt = crate::sql::allowlist::validate_delete_tokens(
+                let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
                     &tokens,
                     &self.storage,
                     self.ledger_mode,
                 )?;
-                // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路
-                // 専用（`execute_delete_sql` は検証直後に `42601` で拒否する。
-                // `Self` モジュールドキュメント参照）。
-                if stmt.returning.is_some() {
-                    let outcome = self.execute_delete_returning_form(ctx, &stmt)?;
-                    return Ok(crate::sql::SqlOutcome::Returning(outcome));
+                // 単一行形（[`crate::sql::allowlist::ValidatedDelete`]）は
+                // `RETURNING`（Issue #873・SQL-21）を保持しうるためここで
+                // 分岐する（`execute_delete_sql` は検証直後に `42601` で拒否
+                // する非セッション経路。`Self` モジュールドキュメント参照）。
+                // 述語形（[`crate::sql::allowlist::ValidatedPredicateDelete`]）
+                // は構造検証段（`validate_delete_statement_tokens`）で
+                // `RETURNING` 併用を既に `42601` 拒否済みのため常に
+                // `execute_predicate_delete_form` へ委譲する（Issue #871）。
+                match stmt {
+                    crate::sql::allowlist::DeleteStatement::SingleRow(v) => {
+                        if v.returning.is_some() {
+                            let outcome = self.execute_delete_returning_form(ctx, &v)?;
+                            return Ok(crate::sql::SqlOutcome::Returning(outcome));
+                        }
+                        let outcome = self.execute_delete_form(ctx, &v)?;
+                        return Ok(crate::sql::SqlOutcome::Delete(outcome));
+                    }
+                    crate::sql::allowlist::DeleteStatement::Predicate(v) => {
+                        let outcome = self.execute_predicate_delete_form(ctx, session, &v)?;
+                        return Ok(crate::sql::SqlOutcome::Delete(outcome));
+                    }
                 }
-                let outcome = self.execute_delete_form(ctx, &stmt)?;
-                return Ok(crate::sql::SqlOutcome::Delete(outcome));
             }
 
-            // Issue #865（SQL-17・TASK-191）: `INSERT`・`TRUNCATE` と同じ設計で
-            // `UPDATE` を覗き見判定する。`EXPLAIN UPDATE ...` は先頭トークンが
-            // `UPDATE` ではなく `EXPLAIN` になるため、ここでは捕捉されず後続の
-            // `validate_sql` の `EXPLAIN` 分岐（次のトークンが `SELECT` であることを
-            // 要求）へ流れて `42601` で拒否される（`INSERT`・`TRUNCATE` の既存
-            // コメントと同じ経路）。
+            // SQL-17（Issue #865・TASK-191。単一行・id 完全一致形）・SQL-19
+            // （TASK-192、Issue #869・#871。述語形 `UPDATE ... WHERE`）:
+            // `INSERT`・`TRUNCATE`・`DELETE` と同じ設計で `UPDATE` を覗き見判定
+            // する。単一行・述語形の両方を構造的に受理する
+            // `validate_update_form_tokens` へ一本化し、
+            // [`crate::sql::allowlist::ValidatedUpdateForm`] の variant で実行
+            // 本体を [`Self::execute_predicate_update_form`] 内で振り分ける
+            // （`Single` 腕は Issue #865 の単一行実行結線・`Predicate` 腕は
+            // Issue #871 の述語形実行結線。`docs/design/predicate-dml-exec.md`
+            // 「PR #989 との整合ルール」参照）。`EXPLAIN UPDATE ...` は先頭
+            // トークンが `UPDATE` ではなく `EXPLAIN` になるためここでは捕捉
+            // されず、`DELETE`・`TRUNCATE` と同じ経路で `42601` へ流れる。
             let is_update_statement = matches!(
                 tokens.first(),
                 Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("UPDATE")
             );
             if is_update_statement {
-                let lookup = InsertSchemaLookup::new(&self.storage);
-                let stmt = crate::sql::allowlist::validate_update_tokens(
+                let stmt = crate::sql::allowlist::validate_update_form_tokens(
                     &tokens,
-                    &lookup,
+                    &self.storage,
                     self.ledger_mode,
                 )?;
-                let outcome = self.execute_update_form(ctx, &stmt, &lookup)?;
+                let outcome = self.execute_predicate_update_form(ctx, session, &stmt)?;
                 return Ok(crate::sql::SqlOutcome::Update(outcome));
             }
         }
@@ -4201,6 +4224,54 @@ impl EngineCore {
         crate::sql::exec::execute_delete(&self.storage, ctx, &bound, self.ledger_mode)
     }
 
+    /// [`Self::execute_sql_in_session`] の `DELETE`（述語形。SQL-19・TASK-192、
+    /// Issue #871）分岐が呼ぶ実行本体。テーブルスキーマを取得したうえで
+    /// [`crate::sql::parser::bind_predicate_delete`] で束縛し、内容照合ハッシュ
+    /// （[`crate::recovery::content_hash::for_delete_where`]。RECOVER-11）を
+    /// 束縛済み構文形〔`stmt.where_predicates()`〕から計算してから
+    /// [`crate::sql::exec::execute_predicate_delete`] へ委譲する。
+    ///
+    /// エラー優先順位（`docs/design/predicate-dml-exec.md` 参照）: 構造検証・
+    /// `operation_id` 必須化・カタログ存在確認は `validate_delete_statement_tokens`
+    /// （`sql::allowlist`）が呼び出し元で既に適用済み。本メソッドは
+    /// スキーマ取得（`42P01`。並行 `DROP TABLE` の防御的経路） → 束縛
+    /// （`22000`。`sql/scan.rs` と同じ失敗点） → 内容照合ハッシュ計算
+    /// （WASM UDF 呼び出しの拒否・`42601`。ADR
+    /// `docs/design/multi-row-dml-operation-id.md` §4.4.1） → 実行本体（台帳照合
+    /// `23505`／`22023`・上限超過 `54000`）の順で失敗しうる。
+    fn execute_predicate_delete_form(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let schema = self
+            .storage
+            .get_table_schema(stmt.table_name())
+            .map_err(|e| match e {
+                CatalogError::TableNotFound(name) => {
+                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                }
+                _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "failed to load table schema".to_string(),
+                },
+            })?;
+        let bound = crate::sql::parser::bind_predicate_delete(stmt, &schema, session.udfs())?;
+        let content_hash_value = crate::recovery::content_hash::for_delete_where(
+            stmt.table_name(),
+            stmt.where_predicates(),
+            session.udfs(),
+        )?;
+        crate::sql::exec::execute_predicate_delete(
+            &self.storage,
+            ctx,
+            &bound,
+            self.ledger_mode,
+            &schema,
+            &content_hash_value,
+        )
+    }
+
     /// [`Self::execute_sql_in_session`] の `RETURNING` 付き単一行 `DELETE`
     /// （Issue #873・SQL-21）分岐が呼ぶ実行本体。DELETE は元々スキーマ非依存
     /// （`id` 疑似列以外を参照しない。`execute_delete_form` ドキュメント参照）
@@ -4247,6 +4318,12 @@ impl EngineCore {
     /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
     /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
     /// RECOVER-1）→ [`Self::execute_update_form`]（束縛・実行本体）の順に呼ぶ。
+    ///
+    /// このエントリポイントは単一行・`id` 完全一致形専用のまま残す
+    /// （`sql::allowlist::validate_update`・[`crate::sql::allowlist::ValidatedUpdate`]
+    /// を経由）。述語形（SQL-19）を含む両形式のディスパッチは
+    /// [`Self::execute_sql_in_session`] の `UPDATE` 分岐・
+    /// [`Self::execute_predicate_update_form`] が担う。
     pub fn execute_update_sql(
         &self,
         ctx: &PolicyContext,
@@ -4260,13 +4337,19 @@ impl EngineCore {
         self.execute_update_form(ctx, &stmt, &lookup)
     }
 
-    /// [`Self::execute_update_sql`]・[`Self::execute_sql_in_session`] の UPDATE
-    /// 分岐が共有する束縛〜実行本体（`execute_insert_form` と同じ設計）。
-    /// `validate_update`／`validate_update_tokens` が返した `stmt` と、その検証時に
-    /// 使った `lookup`（`table_exists` 呼び出しでスキーマをキャッシュ済み）を受け取り、
+    /// [`Self::execute_update_sql`] の単一行 UPDATE 分岐が使う束縛〜実行本体
+    /// （`execute_insert_form` と同じ設計）。`validate_update`／
+    /// `validate_update_tokens` が返した `stmt` と、その検証時に使った `lookup`
+    /// （`table_exists` 呼び出しでスキーマをキャッシュ済み）を受け取り、
     /// [`InsertSchemaLookup::take_schema`] でスキーマを再取得できればそれを使い、
     /// できなければ `get_table_schema` 単独呼び出しへ fail-closed にフォール
     /// バックする。
+    ///
+    /// [`Self::execute_sql_in_session`] 経由（`validate_update_form_tokens` が
+    /// 単一行・述語形の双方を受理する）の単一行 UPDATE は、スキーマを
+    /// `InsertSchemaLookup` ではなく [`Self::execute_predicate_update_form`] が
+    /// 直接取得するため本メソッドを経由しない
+    /// （`crate::sql::exec::execute_update_with_schema` を直接呼ぶ）。
     fn execute_update_form(
         &self,
         ctx: &PolicyContext,
@@ -4294,6 +4377,83 @@ impl EngineCore {
             &bound,
             self.ledger_mode,
             Some(&schema),
+        )
+    }
+
+    /// [`Self::execute_sql_in_session`] の `UPDATE` 分岐が呼ぶ実行本体
+    /// （SQL-17・TASK-191、Issue #865 の単一行 `id` 完全一致形と、SQL-19・
+    /// TASK-192、Issue #871 の述語形の両方を扱う）。
+    /// `sql::allowlist::validate_update_form` 自体は単一行・述語形の双方を
+    /// 構造的に受理するため、本メソッドが [`crate::sql::parser::BoundUpdateForm`]
+    /// の variant で実行本体を振り分ける（`Single` 腕は
+    /// [`crate::sql::exec::execute_update_with_schema`]（PR #989 の単一行実行
+    /// 結線と同一の実行本体。`docs/design/predicate-dml-exec.md`「PR #989 との
+    /// 整合ルール」参照）、`Predicate` 腕は本メソッド内で内容照合ハッシュ
+    /// （RECOVER-11）を計算したうえで [`crate::sql::exec::execute_predicate_update`]
+    /// へ委譲する。[`Self::execute_predicate_delete_form`] と同じ手順
+    /// （スキーマ取得 → 束縛 → （述語形のみ）内容照合ハッシュ計算 → 実行本体）
+    /// で実行する。
+    fn execute_predicate_update_form(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedUpdateForm,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::ValidatedUpdateForm;
+
+        let table_name = match stmt {
+            ValidatedUpdateForm::Single(v) => v.table_name.as_str(),
+            ValidatedUpdateForm::Predicate(v) => v.table_name(),
+        };
+        let schema = self
+            .storage
+            .get_table_schema(table_name)
+            .map_err(|e| match e {
+                CatalogError::TableNotFound(name) => {
+                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                }
+                _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "failed to load table schema".to_string(),
+                },
+            })?;
+        let bound_form = crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?;
+        let predicate = match bound_form {
+            crate::sql::parser::BoundUpdateForm::Single(bound) => {
+                return crate::sql::exec::execute_update_with_schema(
+                    &self.storage,
+                    ctx,
+                    &bound,
+                    self.ledger_mode,
+                    Some(&schema),
+                );
+            }
+            crate::sql::parser::BoundUpdateForm::Predicate(bound) => bound,
+        };
+
+        let ValidatedUpdateForm::Predicate(validated) = stmt else {
+            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "internal: bound predicate UPDATE from a non-predicate statement"
+                    .to_string(),
+            });
+        };
+        let assignment_refs: Vec<(&str, &crate::sql::allowlist::InsertLiteral)> = validated
+            .assignments()
+            .iter()
+            .map(|(name, literal)| (name.as_str(), literal))
+            .collect();
+        let content_hash_value = crate::recovery::content_hash::for_update_where(
+            validated.table_name(),
+            &assignment_refs,
+            validated.where_predicates(),
+            session.udfs(),
+        )?;
+        crate::sql::exec::execute_predicate_update(
+            &self.storage,
+            ctx,
+            &predicate,
+            self.ledger_mode,
+            &schema,
+            &content_hash_value,
         )
     }
 
