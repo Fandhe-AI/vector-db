@@ -325,6 +325,12 @@ pub fn execute(
                 assignments,
                 id_literal: id.to_string(),
                 operation_id: Some(operation_id.clone()),
+                // NoSQL 表層 `op: update` は `RETURNING` を公開しない
+                // （Issue #876 のスコープ外。SQL 表層の `RETURNING`
+                // 実行結線は Issue #873・SQL-21 が別途担当し、
+                // `ValidatedUpdate::returning` を `Some` にする経路は
+                // ここには無い）。
+                returning: None,
             };
             bind_update(&stmt, schema)
         },

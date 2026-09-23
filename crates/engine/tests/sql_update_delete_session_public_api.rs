@@ -86,6 +86,7 @@ fn execute_bound_update_in_session_is_reachable_and_updates_the_targeted_row() {
                 assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
                 id_literal: "1".to_string(),
                 operation_id: Some(operation_id.clone()),
+                returning: None,
             };
             bind_update(&validated, schema)
         })
@@ -114,6 +115,7 @@ fn execute_bound_update_in_session_requires_operation_id_before_schema_lookup() 
                 assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
                 id_literal: "1".to_string(),
                 operation_id: None,
+                returning: None,
             };
             bind_update(&validated, schema)
         })
@@ -133,6 +135,7 @@ fn execute_bound_update_in_session_rejects_undefined_table_with_42p01() {
                 assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
                 id_literal: "1".to_string(),
                 operation_id: Some(operation_id.clone()),
+                returning: None,
             };
             bind_update(&validated, schema)
         })
@@ -157,6 +160,7 @@ fn execute_bound_update_in_session_rejects_bound_plan_operation_id_mismatch() {
                 assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
                 id_literal: "1".to_string(),
                 operation_id: Some(inner),
+                returning: None,
             };
             bind_update(&validated, schema)
         })
@@ -188,6 +192,7 @@ fn execute_bound_update_in_session_matches_sql_ledger_key_space_for_resend_detec
                 assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
                 id_literal: "1".to_string(),
                 operation_id: Some(shared.clone()),
+                returning: None,
             };
             bind_update(&validated, schema)
         })
@@ -216,6 +221,7 @@ fn execute_bound_update_in_session_matches_sql_ledger_key_space_for_content_mism
                 assignments: vec![("lang".to_string(), engine_insert_literal_string("fr"))],
                 id_literal: "1".to_string(),
                 operation_id: Some(shared.clone()),
+                returning: None,
             };
             bind_update(&validated, schema)
         })
@@ -238,6 +244,7 @@ fn execute_bound_update_in_session_returns_zero_rows_for_other_tenant_row() {
                 assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
                 id_literal: "1".to_string(),
                 operation_id: Some(operation_id.clone()),
+                returning: None,
             };
             bind_update(&validated, schema)
         })
