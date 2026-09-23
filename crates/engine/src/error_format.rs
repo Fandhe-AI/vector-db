@@ -115,8 +115,10 @@ define_error_classes! {
     /// に対応する分類（engine 側に発生経路はなく、写像の集約のみ）。
     ConnectionLimitExceeded => ("53300", "CONNECTION_LIMIT_EXCEEDED"),
     /// 未対応のプロトコル機能（`0A000`）。wire-server の
-    /// `handshake::SQLSTATE_FEATURE_NOT_SUPPORTED`・`protocol_dispatch` に対応する分類
-    /// （engine 側に発生経路はなく、写像の集約のみ）。
+    /// `handshake::SQLSTATE_FEATURE_NOT_SUPPORTED`・`protocol_dispatch` に対応する分類。
+    /// engine 側では [`crate::sql::statement_splitter::MultiStatementError::
+    /// WriteNotLast`]（WIRE-16・TASK-219。書き込み系文が複数文メッセージの最後
+    /// 以外にある場合の拒否）が唯一の発生経路。
     FeatureNotSupported => ("0A000", "FEATURE_NOT_SUPPORTED"),
     /// 受理範囲外の SQL 構文（構文解析失敗・AST 許可リスト外。`42601`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::UnsupportedSyntax`] の写像。
