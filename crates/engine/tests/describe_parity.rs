@@ -174,6 +174,62 @@ fn describe_explain_reports_fixed_query_plan_column() {
     );
 }
 
+/// `EXPLAIN` で包まない素の `SELECT ... USING PLAN(...)` の Describe が
+/// プランナー／再埋め込み I/O（`plan_query`・`Embedder::embed_batch`）を
+/// 一切実行しないことを固定する（Issue #933 レビュー指摘対応。LLM コスト
+/// 増幅 DoS 経路にしない契約の中核証拠。`describe_explain_reports_fixed_
+/// query_plan_column` は `EXPLAIN` で包んだケースのみを検証しており、
+/// 素の `SELECT ... USING PLAN(...)` を Describe する経路は本テスト以前は
+/// 未カバーだった）。
+///
+/// `core` にはプランナーを一切注入していないため（`EngineCore::
+/// with_query_planner` 未呼び出し）、もし `describe_parsed_in_session` が
+/// 誤って `plan_query`（`Self::expand_query`）へ到達する形へリファクタされた
+/// 場合、`CoreError::QueryPlannerUnavailable` で `describe` 自体が失敗する。
+/// 本テストが `describe` の成功を固定していることで、そのようなリファクタを
+/// 検知できる。
+#[test]
+fn describe_using_plan_without_explain_does_not_require_planner() {
+    let path = unique_db_path("describe-using-plan-no-explain");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let session = SessionState::default();
+    let sql = "SELECT id, body FROM documents USING PLAN('test query') LIMIT 5";
+
+    let parsed = core.parse_sql(sql).expect("parse should succeed");
+    let described = core.describe_parsed_in_session(&session, &parsed).expect(
+        "describe of a bare USING PLAN select must not require planner I/O \
+             (no query planner is configured on this core; reaching plan_query \
+             would fail with QueryPlannerUnavailable)",
+    );
+
+    // 同一 SQL の実行（`execute_sql_in_session`）はプランナー未接続のため
+    // `plan_using_plan_expansion`（`plan_query`）到達時に必ず失敗することを
+    // あわせて固定する。これにより上の `describe` 成功が「そもそも実行も
+    // プランナーを要さない」という別の理由での偶然の一致ではなく、
+    // 「Describe だけがプラン展開 I/O を回避している」ことの対比になる。
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut exec_session = SessionState::default();
+    let exec_result = core.execute_sql_in_session(&ctx, &mut exec_session, sql);
+    assert!(
+        exec_result.is_err(),
+        "execute of the same USING PLAN select must fail without a configured \
+         query planner (QueryPlannerUnavailable), proving Describe's success is \
+         due to skipping planner I/O rather than the statement being planner-free"
+    );
+
+    assert_eq!(
+        described,
+        Some(vec![
+            engine::sql::exec::ColumnMeta::Id,
+            engine::sql::exec::ColumnMeta::Scalar {
+                name: "body".to_string(),
+                ty: engine::catalog::ColumnType::Text,
+            },
+        ])
+    );
+}
+
 #[test]
 fn describe_insert_returning_matches_execute() {
     let path = unique_db_path("describe-insert-returning");
