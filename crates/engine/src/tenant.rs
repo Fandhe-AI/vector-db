@@ -4239,6 +4239,8 @@ mod tests {
                     .expect("seed row without a VECTOR column");
             }
         }
+        crate::catalog::bump_table_generation_in_txn(&write_txn, "notes")
+            .expect("bump table generation for seeded rows");
         crate::recovery::commit_boundary::commit(write_txn).expect("commit seed txn");
 
         // SET 対象は `lang`（宣言順インデックス 0）。`body`（インデックス 1）は
