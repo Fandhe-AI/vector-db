@@ -2164,9 +2164,12 @@ fn apply_nosql_dml_step(
     }
 }
 
-/// `run_sql_nosql_dml_parity_scenario` の実行記録に混ぜないための機密値
-/// （トークン・ユーザー名・パスワード・テナント id）の非漏えいを確認する
-/// （`[e2e-record]` 行・stderr の双方に対して行う共通アサーション）。
+/// `run_sql_nosql_dml_parity_scenario` の実行記録・各サーバー stderr に
+/// 機密値（トークン・ユーザー名・パスワード・テナント id）を混ぜないことを
+/// 確認する共通アサーション。`[e2e-record]` 行だけでなく、4 回の
+/// `stop_and_drain`（`sql_seen`／`nosql_seen`／`db_s_nosql_seen`／
+/// `db_n_sql_seen`）が返す生 stderr にもそれぞれ適用する
+/// （codex-review 指摘・PR #994）。
 fn assert_dml_scenario_no_leak(haystack: &str, tokens: &[&str]) {
     for secret in ["alice", "bob", "pw-alice", "pw-bob", "tenant-a", "tenant-b"] {
         assert!(
@@ -2226,6 +2229,10 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
         !sql_seen.iter().any(|line| line.contains("surface nosql")),
         "SQL surface must not print the nosql surface banner: {sql_seen:?}"
     );
+    // codex-review 指摘（PR #994）: `[e2e-record]` だけでなく各 stop_and_drain
+    // が返す生 stderr にも機密値の非漏えい検査を適用する。この時点ではまだ
+    // セッショントークンを発行していないため tokens は空。
+    assert_dml_scenario_no_leak(&sql_seen.join("\n"), &[]);
 
     // --- Phase 2: 同一内容で複製した DB-N を NoSQL 表層で駆動し、同じ手順を
     //     `client` で適用する。
@@ -2332,6 +2339,10 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
         nosql_seen.iter().any(|line| line.contains("surface nosql")),
         "expected nosql surface banner in stderr, got: {nosql_seen:?}"
     );
+    assert_dml_scenario_no_leak(
+        &nosql_seen.join("\n"),
+        &[alice_token.as_str(), bob_token.as_str()],
+    );
 
     // --- Phase 3: 台帳のプロセス・表層横断永続。DB-S（SQL 表層で
     //     `dml-u1`＝`lang='en'` を記録済み）を NoSQL 表層で開き直し、
@@ -2389,6 +2400,14 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
             .any(|line| line.contains("surface nosql")),
         "expected nosql surface banner in stderr, got: {db_s_nosql_seen:?}"
     );
+    assert_dml_scenario_no_leak(
+        &db_s_nosql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+        ],
+    );
 
     // 逆方向: DB-N（NoSQL 表層で `dml-u1` を記録済み）を SQL 表層で開き直し、
     // 同一内容の再送が `23505` になることを確認する。
@@ -2411,6 +2430,14 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
             .iter()
             .any(|line| line.contains("surface nosql")),
         "SQL surface must not print the nosql surface banner: {db_n_sql_seen:?}"
+    );
+    assert_dml_scenario_no_leak(
+        &db_n_sql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+        ],
     );
 
     // --- Phase 4: RLS-9 応答同一性。他テナント行を持つ DB-F・空の DB-M を
