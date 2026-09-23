@@ -464,13 +464,16 @@ fn table6_decode_rejects_hand_crafted_invalid_catalog_bytes() {
     // `Err` になることを検証する（欠落フィールド・未知型名・未知バージョン・
     // 不正 UTF-8・不正次元・切り詰め）。
     let cases: Vec<(&str, Vec<u8>)> = vec![
-        ("missing-cols-line", b"v1\n".to_vec()),
+        ("missing-cols-line", b"v2\n".to_vec()),
         ("unknown-version", b"v99\ncols:0\n".to_vec()),
-        ("unknown-type", b"v1\ncols:1\nfoo:blob:-:0\n".to_vec()),
-        ("bad-dimension", b"v1\ncols:1\nfoo:vector:0:0\n".to_vec()),
-        ("truncated-columns", b"v1\ncols:2\nfoo:text:-:0\n".to_vec()),
+        // カタログ v1（Issue #880 で v2 へ更新される前の正当な形式）はマイグレー
+        // ションを提供せず fail-closed に拒否する（D6）。
+        ("legacy-v1", b"v1\ncols:1\nfoo:text:-:0\n".to_vec()),
+        ("unknown-type", b"v2\ncols:1\nfoo:blob:-:0\n".to_vec()),
+        ("bad-dimension", b"v2\ncols:1\nfoo:vector:0:0\n".to_vec()),
+        ("truncated-columns", b"v2\ncols:2\nfoo:text:-:0\n".to_vec()),
         ("invalid-utf8", vec![0xff, 0xfe, 0xfd]),
-        ("missing-field", b"v1\ncols:1\nfoo:text:-\n".to_vec()),
+        ("missing-field", b"v2\ncols:1\nfoo:text:-\n".to_vec()),
     ];
 
     // catalog.rs 内部と同一のテーブル定義（キー・値の型とテーブル名 "catalog"）を
