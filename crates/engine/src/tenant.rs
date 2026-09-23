@@ -1619,6 +1619,78 @@ pub(crate) fn update_row_unchecked(
 /// codex-review P1 指摘・PR #989）。
 ///
 /// 戻り値は更新行数（`0` または `1`）。呼び出し元は `sql::exec::execute_update`。
+/// SET 句の値をスキーマに対して検証する（列 index 境界・型一致・`VECTOR` 次元・
+/// `TEXT` 列単体長・`TEXT` 列の累計フレームサイズ）。[`update_row_columns_unchecked`]
+/// （単一行・id 指定形）・[`update_rows_where_unchecked`]（述語形。SQL-19・TASK-192・
+/// Issue #871）が共有する。
+///
+/// 呼び出し元は必ず**対象行の探索より前**（かつ台帳記録より前）にこの検証を行うこと。
+/// 対象行の存在・可視性を一切参照せずスキーマのみから判定できるため、対象の有無に
+/// 関わらず常に同一の拒否（またはいずれも合格）になる fail-closed 契約を保てる
+/// （`update_row_columns_unchecked` の同種コメント参照）。述語形でこの順序を守らない
+/// 場合、候補行が 0 件（＝一致行なし）だと検証が一切実行されないまま `UPDATE 0` の
+/// 成功として `operation_id` が消費されてしまう（codex-review P1 指摘・PR #993 系・
+/// Issue #871）。
+fn validate_set_assignments(
+    schema: &crate::catalog::TableSchema,
+    assignments: &[(usize, crate::row_codec::Value)],
+) -> Result<(), TenantWriteError> {
+    let mut set_text_payload_total: u32 = 0;
+    for (idx, value) in assignments {
+        let column = schema.columns.get(*idx).ok_or_else(|| {
+            TenantWriteError::Catalog(CatalogError::Invalid(
+                "SET column index out of range for the current table schema".to_string(),
+            ))
+        })?;
+        match (&column.ty, value) {
+            (crate::catalog::ColumnType::Vector(_), crate::row_codec::Value::Vector(v)) => {
+                // SET 値の妥当性（次元）は対象行の有無に関わらず常に同じ拒否を
+                // 返す（呼び出し元の対象行探索より前に弾く）。
+                schema
+                    .validate_embedding_dim(v.len())
+                    .map_err(TenantWriteError::Catalog)?;
+            }
+            (crate::catalog::ColumnType::Text, crate::row_codec::Value::Text(t)) => {
+                // SET 値の TEXT 長上限検証（対象行の探索より前に行う）。
+                let text_len = u32::try_from(t.len()).map_err(|_| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "text field too long: {} bytes",
+                        t.len()
+                    )))
+                })?;
+                if text_len > crate::row_codec::MAX_TEXT_FIELD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "text field length {text_len} exceeds limit {}",
+                        crate::row_codec::MAX_TEXT_FIELD_LEN
+                    ))));
+                }
+                let entry_len = crate::row_codec::scalar_text_entry_len(text_len)
+                    .map_err(|e| TenantWriteError::Catalog(CatalogError::Invalid(e.to_string())))?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            _ => {
+                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                    "SET column type does not match the current table schema".to_string(),
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn update_row_columns_unchecked(
     storage: &Storage,
     table: &str,
@@ -1646,76 +1718,24 @@ pub(crate) fn update_row_columns_unchecked(
         // を禁止」）。`bind_update` は束縛時点のスキーマで検証済みだが、write
         // トランザクション内で再取得したスキーマと不一致がありうる場合に備え、
         // `get()` で境界外アクセスを構造的に防ぐ（`insert_typed_row_unchecked` の
-        // `expected_schema` 比較と多層防御）。
+        // `expected_schema` 比較と多層防御）。検証本体は [`validate_set_assignments`]
+        // （述語形 [`update_rows_where_unchecked`] と共有。codex-review P1 指摘・
+        // PR #993 系・Issue #871）。
+        validate_set_assignments(&schema, assignments)?;
+
         // `(スキーマ列 index, 列名, 値)` の順で構築し、ハッシュ計算前に列
-        // index でソートして宣言順非依存にする（下記コメント参照）。
+        // index でソートして宣言順非依存にする（下記コメント参照）。列 index の
+        // 境界・型は上記 `validate_set_assignments` で検証済みのため、ここでの
+        // `get()` は理論上失敗しないが、添字アクセスを避けるため引き続き
+        // `ok_or_else` で明示的に処理する（coding-rust.md）。
         let mut named_columns: Vec<(usize, &str, &crate::row_codec::Value)> =
             Vec::with_capacity(assignments.len());
-        // SET 対象の TEXT 列だけを対象にした累計フレームサイズ（presence(1)+
-        // 長さ(4)+本文）。対象行の実データ（探索前は不明）を含めず、リクエスト
-        // 自身が持つ SET 値のみから決定的に計算できる下限を先に検証すること
-        // で、「SET 値単体が `encode_scalar_columns` のフレーミングオーバー
-        // ヘッド込みで `MAX_SCALAR_PAYLOAD_LEN` を超える」ケース（列ごとの
-        // `MAX_TEXT_FIELD_LEN` 検査だけでは通過してしまう）を対象行の有無に
-        // 関わらず同一の拒否にする（Cursor Bugbot Medium 指摘・PR #989。
-        // security.md「テナント境界」）。未変更列を含む本当の累計上限超過は
-        // 対象行データに依存するため `encode_scalar_columns` 側の検証に委ねる
-        // （既知の残存差異。`docs/design/update-single-row.md` 判断 D 参照）。
-        let mut set_text_payload_total: u32 = 0;
         for (idx, value) in assignments {
             let column = schema.columns.get(*idx).ok_or_else(|| {
                 TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column index out of range for the current table schema".to_string(),
                 ))
             })?;
-            match (&column.ty, value) {
-                (crate::catalog::ColumnType::Vector(_), crate::row_codec::Value::Vector(v)) => {
-                    // SET 値の妥当性（次元）は対象行の有無に関わらず常に同じ拒否を
-                    // 返す（後述の一括検証と同じ理由。ここで先に弾くことで
-                    // `named_columns` 構築中に判明した不正値も後段まで遅延させない）。
-                    schema
-                        .validate_embedding_dim(v.len())
-                        .map_err(TenantWriteError::Catalog)?;
-                }
-                (crate::catalog::ColumnType::Text, crate::row_codec::Value::Text(t)) => {
-                    // SET 値の TEXT 長上限検証（対象行の探索より前に行う。詳細は
-                    // 下記コメント参照）。
-                    let text_len = u32::try_from(t.len()).map_err(|_| {
-                        TenantWriteError::Catalog(CatalogError::Invalid(format!(
-                            "text field too long: {} bytes",
-                            t.len()
-                        )))
-                    })?;
-                    if text_len > crate::row_codec::MAX_TEXT_FIELD_LEN {
-                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
-                            "text field length {text_len} exceeds limit {}",
-                            crate::row_codec::MAX_TEXT_FIELD_LEN
-                        ))));
-                    }
-                    let entry_len =
-                        crate::row_codec::scalar_text_entry_len(text_len).map_err(|e| {
-                            TenantWriteError::Catalog(CatalogError::Invalid(e.to_string()))
-                        })?;
-                    set_text_payload_total = set_text_payload_total
-                        .checked_add(entry_len)
-                        .ok_or_else(|| {
-                            TenantWriteError::Catalog(CatalogError::Invalid(
-                                "scalar payload length overflow".to_string(),
-                            ))
-                        })?;
-                    if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
-                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
-                            "scalar payload length {set_text_payload_total} exceeds limit {}",
-                            crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
-                        ))));
-                    }
-                }
-                _ => {
-                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                        "SET column type does not match the current table schema".to_string(),
-                    )))
-                }
-            }
             named_columns.push((*idx, column.name.as_str(), value));
         }
         // 台帳の内容照合ハッシュ（`content_hash::for_update_columns`）へ渡す前に
@@ -2621,6 +2641,16 @@ pub(crate) fn update_rows_where_unchecked<E>(
             }
         }
 
+        // SET 値をスキーマに対して検証する（[`validate_set_assignments`] を単一行
+        // [`update_row_columns_unchecked`] と共有）。候補行列挙・台帳記録より
+        // **前**に行うことで、一致行が 0 件の場合でも不正な SET 値（`MAX_TEXT_
+        // FIELD_LEN` 超過・累計 payload 上限超過・`VECTOR` 次元不一致・列型不一致
+        // 等）は必ず拒否され、台帳へ記録される前に `write_txn` を破棄できる
+        // （codex-review P1 指摘・PR #993 系・Issue #871: この検証が候補行の
+        // 適用ループ内にしか無いと、一致行 0 件のまま台帳記録・`UPDATE 0` 成功が
+        // 通ってしまい、同じ `operation_id` が正当な後続再送に使えなくなる）。
+        validate_set_assignments(&schema, assignments).map_err(dml_write_err)?;
+
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),
@@ -2676,9 +2706,17 @@ pub(crate) fn update_rows_where_unchecked<E>(
                 }
             };
 
+            // `existing.metadata` は今回の SET 句ではなく、既に永続化済みの行
+            // データである。ここでのデコード失敗はクライアント入力の不正では
+            // なく、ストレージ側の破損・実装不整合を示す。`CatalogError::Invalid`
+            // （ユーザー入力の検証失敗。`22000`）へ丸めると、単一行版
+            // `update_row_columns_unchecked` の同種デコード（格納済み行の
+            // `scan_scalar_columns` 失敗を `CorruptSchema`／`XX000` に固定する
+            // 契約）と矛盾し、内部事象をクライアント入力エラーへ誤分類して
+            // しまう（codex-review P1 指摘・PR #993 系・Issue #871）。
             let mut merged_values =
                 crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
-                    .map_err(|e| CatalogError::Invalid(e.to_string()))
+                    .map_err(|e| CatalogError::CorruptSchema(e.to_string()))
                     .map_err(dml_write_err)?;
             let mut embedding_value: Vec<f32> = existing.embedding.clone();
 
@@ -3978,6 +4016,149 @@ mod tests {
             crate::row_codec::Value::Text("v1".to_string()),
             "row must be unchanged when the SET value is rejected before the write"
         );
+    }
+
+    // codex-review P1 指摘（PR #993 系・Issue #871）: 述語つき `UPDATE ... WHERE`
+    // （[`update_rows_where_unchecked`]）の SET 値検証（[`validate_set_assignments`]。
+    // `update_row_columns_unchecked` と共有）が、一致行の適用ループ内にしか無いと、
+    // 一致行が 0 件のまま台帳へ記録され `UPDATE 0` の成功として `operation_id` が
+    // 消費されてしまう。候補列挙・台帳記録より**前**に検証することで、一致行の
+    // 有無に関わらず同一の拒否（不正な SET 値は台帳に一切痕跡を残さない）になる
+    // ことを固定する。
+    #[test]
+    fn update_rows_where_unchecked_rejects_oversized_set_value_even_with_zero_matching_candidates()
+    {
+        let path = unique_db_path("predicate-update-max-text-len-zero-candidates");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        // テーブルは空のまま（＝どんな述語でも一致行は 0 件）。
+        let max_len_text = "x".repeat(4 * 1024 * 1024);
+        let assignments = [(2, crate::row_codec::Value::Text(max_len_text))];
+        let content_hash_value =
+            content_hash::ContentHash::for_test(b"predicate-update-oversized-set");
+        let never_matches =
+            |_c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(false) };
+
+        let op_id =
+            OperationId::parse("op-pred-maxlen-zero-candidates").expect("valid operation_id");
+        let err = update_rows_where_unchecked(
+            &storage,
+            "docs",
+            &a,
+            LedgerWrite::Record(&op_id),
+            &content_hash_value,
+            None,
+            &assignments,
+            false,
+            100,
+            never_matches,
+        )
+        .expect_err("oversized SET value must be rejected even when zero rows would match");
+        match err {
+            PredicateDmlError::Write(TenantWriteError::Catalog(CatalogError::Invalid(msg))) => {
+                assert!(
+                    msg.contains("scalar payload length"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!(
+                "expected TenantWriteError::Catalog(Invalid(..)) (client input error), got {other:?}"
+            ),
+        }
+
+        // 台帳には一切記録されていないはず: 同じ `operation_id` を正当な SET 値で
+        // 再送すると成功する（記録済みなら `DuplicateOperationId`／
+        // `OperationIdContentMismatch` になるはず）。
+        let ok_assignments = [(2, crate::row_codec::Value::Text("ok".to_string()))];
+        let outcome = update_rows_where_unchecked(
+            &storage,
+            "docs",
+            &a,
+            LedgerWrite::Record(&op_id),
+            &content_hash_value,
+            None,
+            &ok_assignments,
+            false,
+            100,
+            never_matches,
+        )
+        .expect(
+            "operation_id must remain reusable because the rejected attempt left no ledger trace",
+        );
+        assert_eq!(outcome, PredicateDmlOutcome::Applied { rows_affected: 0 });
+    }
+
+    // codex-review P1 指摘（PR #993 系・Issue #871）: 述語つき `UPDATE` の適用段
+    // （一致した既存行の `metadata` デコード）が失敗した場合、単一行版
+    // `update_row_columns_unchecked`（`sql_update_single_row.rs`
+    // `update_against_row_with_corrupt_stored_metadata_is_rejected_with_xx000`）と
+    // 同じく `CatalogError::CorruptSchema`（サーバー内部事象・`XX000`）へ分類し、
+    // `CatalogError::Invalid`（クライアント入力エラー・`22000`）に丸めないことを
+    // 固定する。`sql::exec::execute_predicate_update` が実際に注入する述語
+    // クロージャは候補判定時に必ず `row_codec::scan_scalar_columns` を実行するため
+    // 本番経路ではこの適用段の破損検出には到達しないが（`decode_scalar_columns`
+    // は内部で同じ `scan_scalar_columns` を呼ぶため先に失敗する）、既存行の
+    // metadata を参照しない述語（本テストの `match_all`）を注入する呼び出し元にも
+    // 同じ分類契約を保証する API 契約として固定する。
+    #[test]
+    fn update_rows_where_unchecked_classifies_corrupt_stored_metadata_as_internal_error() {
+        let path = unique_db_path("predicate-update-corrupt-metadata");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let seed_op = OperationId::parse("seed-pred-corrupt").expect("valid operation_id");
+        insert_row(
+            &storage,
+            "docs",
+            &a,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Private,
+                embedding: &[0.1, 0.2],
+                metadata: b"\xff\xff not a valid scalar column encoding \xff\xff",
+            },
+            &seed_op,
+        )
+        .expect("seed row with corrupt stored metadata");
+
+        let assignments = [(2, crate::row_codec::Value::Text("en".to_string()))];
+        let content_hash_value =
+            content_hash::ContentHash::for_test(b"predicate-update-corrupt-metadata");
+        let match_all =
+            |_c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(true) };
+        let op_id = OperationId::parse("op-pred-corrupt").expect("valid operation_id");
+
+        let err = update_rows_where_unchecked(
+            &storage,
+            "docs",
+            &a,
+            LedgerWrite::Record(&op_id),
+            &content_hash_value,
+            None,
+            &assignments,
+            false,
+            100,
+            match_all,
+        )
+        .expect_err("decode failure on stored data must not succeed");
+        match err {
+            PredicateDmlError::Write(TenantWriteError::Catalog(CatalogError::CorruptSchema(_))) => {
+            }
+            other => panic!(
+                "expected TenantWriteError::Catalog(CorruptSchema(..)) (internal error), \
+                 got {other:?}"
+            ),
+        }
     }
 
     // PR #992 レビュー指摘（Issue #876）: `named_columns` をハッシュ計算前に
