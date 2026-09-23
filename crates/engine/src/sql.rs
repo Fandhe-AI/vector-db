@@ -58,6 +58,9 @@
 //!   `VECTOR` 列を持たないテーブルでも動作する。`bind_scan`／`execute_scan`／
 //!   `BoundScan` は TASK-186（NOSQL-3）で公開 API へ昇格しており、SQL テキストを
 //!   経由しない直接束縛の入口として engine クレート外からも呼べる
+//! - [`statement_splitter`][]: 簡易クエリプロトコル 1 メッセージに含まれる
+//!   セミコロン区切りの複数 SQL 文の分割・文種別分類（WIRE-16・TASK-219）。
+//!   `wire-server::simple_query` から呼ばれる唯一の公開経路
 //!
 //! TASK-166（対象ビヘイビア: SQL-13）: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のみを結果列
 //! とする単一テーブル SELECT（C6a）を追加した。構文は [`allowlist`]（`Statement::Aggregate`）、
@@ -135,6 +138,7 @@ pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
 pub mod scan;
 pub(crate) mod sparse_cache;
+pub mod statement_splitter;
 pub mod udf_call;
 pub(crate) mod visible_cache;
 
