@@ -4,13 +4,13 @@
 //! 責務境界: 本モジュールは純関数のみを持ち、I/O を一切行わない
 //! （`Vec<u8>` を返すのみ）。呼び出し元の [`crate::simple_query`] が
 //! `TcpStream` への書き込みを担当する。`engine::sql::exec::{ColumnMeta, Cell,
-//! ResultRow}` から wire v3 の text フォーマットへの写像がここに閉じる
-//! （TASK-73・WIRE-1）。
+//! ResultRow}` から wire v3 の text/binary フォーマットへの写像がここに閉じる
+//! （TASK-73・WIRE-1・WIRE-14）。
 //!
-//! 型写像（すべて format code 0 = text）。単一情報源は [`WireType`]（本モジュール
-//! `pub(crate)`）で、`crate::http::query::response`（NoSQL 表層の JSON 応答
-//! スキーマ `columns[].type`。Issue #762・NOSQL-11）もこの enum を経由して
-//! 同じ写像を参照する（2 箇所に写像表を持たない）:
+//! 型写像。単一情報源は [`WireType`]（本モジュール `pub(crate)`）で、
+//! `crate::http::query::response`（NoSQL 表層の JSON 応答スキーマ
+//! `columns[].type`。Issue #762・NOSQL-11）もこの enum を経由して同じ写像を
+//! 参照する（2 箇所に写像表を持たない）:
 //! - `ColumnMeta::Id` → `numeric`（OID 1700, typlen -1）。engine の行 ID は
 //!   `u64` 全域（`u64::MAX` を含む）を有効値とするため、符号付き 64bit の
 //!   `int8`（OID 20）では `i64::MAX` を超える正当な ID を表現できない
@@ -21,11 +21,28 @@
 //! - `ColumnMeta::Scalar{ty: Vector(_)}` → `text`（OID 25。値は `[v1,v2,...]` 形式）
 //! - `ColumnMeta::Computed{..}` → `text`（OID 25。実行時型のため text 固定）
 //!
+//! バイナリ形式（format code 1・WIRE-14・TASK-218・Issue #936）: 列ごとに
+//! テキスト／バイナリを要求できる（PostgreSQL の Bind 規則。[`ResultFormats`]）。
+//! 対応型は `WireType::Text`（UTF-8 生バイト）のみで、`Id`（`numeric`）・
+//! `Vector`（text 表現だが値はベクトル）・`Computed`（実行時型で静的に決まらない）
+//! はいずれもバイナリ非対応として事前検査（[`validate_binary_formats`]）で
+//! `0A000` に拒否する（spec の WIRE-14 が定める対応範囲。`VECTOR` 列の独自
+//! バイナリ表現は定義しない）。8 型のレイアウト関数（[`binary`]）は
+//! `WireType` 側の対応拡大（#895・NOSQL-13 ポインタ）に備えた部品として先行
+//! 提供するが、本モジュールが実際に結線するのは `Text` のみ。
+//!
+//! **本モジュール単独では wire 経由でバイナリ形式を要求する経路が無い**
+//! （拡張クエリプロトコルの Bind／Describe は #933・#934 が未実装。
+//! `protocol_dispatch::classify` が `'B'` を `0A000` で拒否する）。本 Issue の
+//! 範囲は結果側エンコーダの提供までで、Bind の結果形式コードから本 API への
+//! 結線・同期回復（`0A000` 後の接続維持）は #934 の担当。
+//!
 //! サイズ安全: フレーム長は `i32::try_from`/`checked_add` で算出し、超過は
 //! `Err(EncodeError::FrameTooLarge)` とする（`.claude/rules/coding-rust.md`
 //! 「untrusted 入力の扱い」。応答側だが同じ規律を踏襲し `as i32` によるオーバー
 //! フローを避ける）。
 
+use engine::error_format::ErrorClass;
 use engine::sql::exec::{Cell, ColumnMeta, ResultRow};
 
 /// 応答メッセージ組み立て時のフレーム長超過エラー。呼び出し元
@@ -33,6 +50,163 @@ use engine::sql::exec::{Cell, ColumnMeta, ResultRow};
 /// させない。
 #[derive(Debug)]
 pub struct EncodeError;
+
+/// 結果列 1 個の応答形式（PostgreSQL Bind の format code。WIRE-14）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatCode {
+    Text,
+    Binary,
+}
+
+/// バイナリ形式（WIRE-14）の解決・事前検査で生じる分類済みエラー。
+/// `error_class()` で `engine::error_format::ErrorClass` へ写像し、呼び出し元
+/// （`crate::simple_query`／Bind 結線先の #934）が `wire_code` を一意に決定
+/// できるようにする。メッセージには要求者自身の列番号までしか含めない
+/// （テーブル名・他テナントの存在情報を含めない。`.claude/rules/security.md`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryFormatError {
+    /// 形式コードの個数が列数と一致しない（0 個・1 個・列数と同数のいずれでもない）。
+    FormatCountMismatch,
+    /// 形式コードの値が {0, 1} 以外。
+    InvalidFormatCode,
+    /// 指定列がバイナリ形式に非対応（[`column_binary_support`] が `false`）。
+    UnsupportedType { column_index: usize },
+}
+
+impl BinaryFormatError {
+    /// `wire_code` 分類。個数不一致・不正値は untrusted な Bind 入力の構文
+    /// 違反として `08P01`（`ProtocolViolation`）、非対応型は fail-closed の
+    /// 意図的な拒否として `0A000`（`FeatureNotSupported`）に写像する。
+    ///
+    /// PostgreSQL 本体は不正な format code 値を `22023` で返すが、本リポの
+    /// `ErrorClass::OperationIdContentMismatch` は `22023` を専有しており
+    /// 意味が異なるため、`ErrorClass` を増やさず本モジュールの fail-closed
+    /// 方針（構文違反は `08P01`）に寄せる（設計判断の詳細は
+    /// `docs/design/wire-binary-format.md` 参照）。
+    pub const fn error_class(self) -> ErrorClass {
+        match self {
+            BinaryFormatError::FormatCountMismatch => ErrorClass::ProtocolViolation,
+            BinaryFormatError::InvalidFormatCode => ErrorClass::ProtocolViolation,
+            BinaryFormatError::UnsupportedType { .. } => ErrorClass::FeatureNotSupported,
+        }
+    }
+}
+
+/// Bind が送る結果形式コード列（PostgreSQL の規約。WIRE-14）。列ごとへの解決
+/// （[`ResultFormats::resolve`]）までを本型に閉じ、解決結果 `Vec<FormatCode>`
+/// の長さは列数（`i16` で有界）に比例するのみで、`codes` スライス自体の長さ
+/// 上限検証は untrusted な Bind 本文を解析する側（#934）の責務とする
+/// （本型は受け取ったスライス長に比例した確保を行わない）。
+#[derive(Debug, Clone, Copy)]
+pub struct ResultFormats<'a> {
+    codes: &'a [i16],
+}
+
+impl<'a> ResultFormats<'a> {
+    /// Bind から受け取った形式コード列をそのまま保持する。
+    pub const fn new(codes: &'a [i16]) -> Self {
+        ResultFormats { codes }
+    }
+
+    /// 列ごとの [`FormatCode`] へ解決する（PostgreSQL の Bind 規則）。
+    /// - 0 個 → 全列 [`FormatCode::Text`]
+    /// - 1 個 → 全列に同じ値を適用
+    /// - 列数と同数 → 列ごとに適用
+    /// - それ以外の個数 → [`BinaryFormatError::FormatCountMismatch`]
+    /// - 値が {0, 1} 以外 → [`BinaryFormatError::InvalidFormatCode`]
+    pub fn resolve(&self, column_count: usize) -> Result<Vec<FormatCode>, BinaryFormatError> {
+        let to_format = |raw: i16| -> Result<FormatCode, BinaryFormatError> {
+            match raw {
+                0 => Ok(FormatCode::Text),
+                1 => Ok(FormatCode::Binary),
+                _ => Err(BinaryFormatError::InvalidFormatCode),
+            }
+        };
+        match self.codes.len() {
+            0 => Ok(vec![FormatCode::Text; column_count]),
+            1 => {
+                // `get(0)` で明示的に取得する（untrusted 由来スライスへの `[]` 直接
+                // アクセスを避ける規律。`.claude/rules/coding-rust.md`）。
+                let raw = *self
+                    .codes
+                    .first()
+                    .ok_or(BinaryFormatError::FormatCountMismatch)?;
+                let format = to_format(raw)?;
+                Ok(vec![format; column_count])
+            }
+            n if n == column_count => self.codes.iter().copied().map(to_format).collect(),
+            _ => Err(BinaryFormatError::FormatCountMismatch),
+        }
+    }
+}
+
+/// バイナリ形式を要求された列がすべて対応型であることを、`RowDescription` を
+/// 送出する前に検査する（WIRE-14）。1 バイトも送る前に判定することで、応答
+/// 列の一部を送ってからエラーにする（フレーム崩壊）事態を避ける。
+///
+/// 判定は公告型（[`ColumnMeta`]／[`WireType`]）で静的に行い、実行時の
+/// `Cell` は参照しない（型公告と実値の不一致を防ぐ）。
+pub fn validate_binary_formats(
+    columns: &[ColumnMeta],
+    formats: &[FormatCode],
+) -> Result<(), BinaryFormatError> {
+    for (index, (meta, format)) in columns.iter().zip(formats.iter()).enumerate() {
+        if matches!(format, FormatCode::Binary) && !column_binary_support(meta) {
+            return Err(BinaryFormatError::UnsupportedType {
+                column_index: index,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// PostgreSQL の send 関数と同じレイアウトで型ごとのバイナリ表現を組み立てる
+/// 純関数群（WIRE-14）。本 Issue で `WireType` 側に結線されるのは `text`
+/// （[`text`]）のみで、他の型は `WireType`／`Cell` 拡張（#895・NOSQL-13
+/// ポインタ）が使う部品として先行提供する。
+pub mod binary {
+    /// `int4` のバイナリ表現（4 バイト・ビッグエンディアン 2 の補数）。
+    pub fn int4(v: i32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+
+    /// `int8` のバイナリ表現（8 バイト・ビッグエンディアン 2 の補数）。
+    pub fn int8(v: i64) -> [u8; 8] {
+        v.to_be_bytes()
+    }
+
+    /// `float4` のバイナリ表現（IEEE 754 単精度のビット列をそのままビッグ
+    /// エンディアンで送る。NaN／±Inf もビット列のまま送出する）。
+    pub fn float4(v: f32) -> [u8; 4] {
+        v.to_bits().to_be_bytes()
+    }
+
+    /// `float8` のバイナリ表現（IEEE 754 倍精度のビット列。float4 と同じ方針）。
+    pub fn float8(v: f64) -> [u8; 8] {
+        v.to_bits().to_be_bytes()
+    }
+
+    /// `bool` のバイナリ表現（1 バイト。`true` → `0x01`、`false` → `0x00`）。
+    pub fn bool_(v: bool) -> [u8; 1] {
+        [if v { 1 } else { 0 }]
+    }
+
+    /// `bytea` のバイナリ表現（生バイトをそのまま返す。長さ付与は呼び出し元）。
+    pub fn bytea(v: &[u8]) -> &[u8] {
+        v
+    }
+
+    /// `uuid` のバイナリ表現（16 バイトをそのまま返す）。
+    pub fn uuid(v: [u8; 16]) -> [u8; 16] {
+        v
+    }
+
+    /// `text` のバイナリ表現（UTF-8 生バイト。PostgreSQL の text send と同一。
+    /// [`super::encode_data_row_into_with_formats`] が結線する唯一の型）。
+    pub fn text(v: &str) -> &[u8] {
+        v.as_bytes()
+    }
+}
 
 /// `RowDescription` が公告する PostgreSQL 型（型写像表の単一情報源。
 /// Issue #762・NOSQL-11）。`crate::http::query::response`（NoSQL 表層の JSON
@@ -87,6 +261,54 @@ impl WireType {
             _ => None,
         }
     }
+
+    /// この型がバイナリ形式（format code 1）に対応するか（WIRE-14）。
+    /// 網羅 `match`（`#[deny(clippy::wildcard_enum_match_arm)]`）にし、
+    /// `WireType` に variant が増えたとき（#895・NOSQL-13 ポインタ）に
+    /// バイナリ可否の決定漏れをコンパイルエラーで検出する。
+    #[deny(clippy::wildcard_enum_match_arm)]
+    pub(crate) const fn supports_binary(self) -> bool {
+        match self {
+            // `id` は `numeric` として公告しており、WIRE-14 は `NUMERIC` を
+            // 非対応型としている（#895 で `int8` へ変わったら見直す）。
+            WireType::Numeric => false,
+            // `text` は UTF-8 生バイトがそのままバイナリ表現（PostgreSQL の
+            // text send と同じ）。ただし `ColumnMeta::Scalar{ty: Vector(_)}`・
+            // `Computed` は公告が text でも本来の値がベクトル／実行時型で
+            // あるため、型そのものの対応可否とは別に列種別で判定する
+            // （[`column_binary_support`] 参照）。
+            WireType::Text => true,
+        }
+    }
+}
+
+/// `ColumnMeta` 1 個がバイナリ形式に対応するか（WIRE-14）。`Id`・
+/// `Scalar{ty: Text}` は [`column_wire_type`] が公告する [`WireType`] の
+/// [`WireType::supports_binary`] へそのまま委譲できるが、
+/// `Scalar{ty: Vector(_)}`・`Computed` は公告 OID が `text` でも本来の値が
+/// ベクトル／実行時型であるため、`WireType` だけでは判定できず列種別を
+/// 直接判定する必要がある（[`column_wire_type`] と同じ「網羅 `match` で
+/// variant 増加をコンパイルエラーにする」方針を踏襲）。
+#[deny(clippy::wildcard_enum_match_arm)]
+pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
+    match meta {
+        ColumnMeta::Id => column_wire_type(meta).supports_binary(),
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Text,
+            ..
+        } => column_wire_type(meta).supports_binary(),
+        // `VECTOR` 列はバイナリ非対応として `0A000` で拒否する（spec の
+        // WIRE-14 決定。独自のバイナリ表現は定義しない）。公告 OID
+        // （`WireType::Text`）は `supports_binary() == true` だが、値の実体が
+        // ベクトルであるため `WireType` の判定を上書きして拒否する。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Vector(_),
+            ..
+        } => false,
+        // 実行時型（Float/Bool/Vector）が静的に決まらないため fail-closed
+        // で非対応とする（#895 で型情報が付いたら見直す）。
+        ColumnMeta::Computed { .. } => false,
+    }
 }
 
 /// `ColumnMeta` 1 個が公告する [`WireType`]（本モジュール先頭の型写像表を参照）。
@@ -115,13 +337,32 @@ pub(crate) fn frame_len(body_len: usize) -> Result<i32, EncodeError> {
     i32::try_from(total).map_err(|_| EncodeError)
 }
 
-/// `RowDescription`（'T'）を組み立てる。フィールド数は `i16` に収まる必要がある
-/// （カタログの列数上限で有界だが、念のため `try_from` で検証する）。
+/// `RowDescription`（'T'）を組み立てる。全列テキスト形式（format code 0）の
+/// 薄いラッパーで、[`encode_row_description_with_formats`] を呼ぶ
+/// （既存呼び出し元・テストとの互換のため残す。生成バイト列は完全に同一。
+/// WIRE-14・Issue #936）。
 pub fn encode_row_description(columns: &[ColumnMeta]) -> Result<Vec<u8>, EncodeError> {
+    let formats = vec![FormatCode::Text; columns.len()];
+    encode_row_description_with_formats(columns, &formats)
+}
+
+/// `RowDescription`（'T'）を列ごとの [`FormatCode`] を反映して組み立てる
+/// （WIRE-14）。フィールド数は `i16` に収まる必要がある（カタログの列数上限で
+/// 有界だが、念のため `try_from` で検証する）。`formats.len() != columns.len()`
+/// は呼び出し元の内部不整合として `EncodeError`（`XX000`）とする
+/// （untrusted 入力由来のバイナリ形式検査は [`validate_binary_formats`] が
+/// 別途 `RowDescription` 送出前に済ませている前提）。
+pub fn encode_row_description_with_formats(
+    columns: &[ColumnMeta],
+    formats: &[FormatCode],
+) -> Result<Vec<u8>, EncodeError> {
+    if columns.len() != formats.len() {
+        return Err(EncodeError);
+    }
     let field_count = i16::try_from(columns.len()).map_err(|_| EncodeError)?;
     let mut body = Vec::new();
     body.extend_from_slice(&field_count.to_be_bytes());
-    for meta in columns {
+    for (meta, format) in columns.iter().zip(formats.iter()) {
         let name = column_name(meta);
         body.extend_from_slice(name.as_bytes());
         body.push(0);
@@ -131,7 +372,11 @@ pub fn encode_row_description(columns: &[ColumnMeta]) -> Result<Vec<u8>, EncodeE
         body.extend_from_slice(&wire_type.oid().to_be_bytes());
         body.extend_from_slice(&wire_type.typlen().to_be_bytes());
         body.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
-        body.extend_from_slice(&0i16.to_be_bytes()); // format code (text)
+        let format_code: i16 = match format {
+            FormatCode::Text => 0,
+            FormatCode::Binary => 1,
+        };
+        body.extend_from_slice(&format_code.to_be_bytes());
     }
     let total_len = frame_len(body.len())?;
     let mut msg = Vec::with_capacity(1 + body.len() + 4);
@@ -184,8 +429,36 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
 /// **失敗時は `out` を呼び出し前の長さへ必ず `truncate` してから返す**
 /// （呼び出し元が完成済みフレームだけを送出できるようにするための契約。
 /// 部分フレームを絶対に残さない）。
+///
+/// 全列テキスト形式（format code 0）の薄いラッパーで、
+/// [`encode_data_row_into_with_formats`] を呼ぶ（既存呼び出し元・テストとの
+/// 互換のため残す。生成バイト列は完全に同一。WIRE-14・Issue #936）。
 pub fn encode_data_row_into(row: &ResultRow, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    let formats = vec![FormatCode::Text; row.cells.len()];
+    encode_data_row_into_with_formats(row, &formats, out)
+}
+
+/// `DataRow`（'D'）を列ごとの [`FormatCode`] を反映して `out` の末尾へ追記する
+/// （WIRE-14）。`formats.len() != row.cells.len()` は呼び出し元の内部不整合
+/// として `EncodeError`（`XX000`）とする（untrusted 入力由来のバイナリ形式
+/// 検査は [`validate_binary_formats`] が別途 `RowDescription` 送出前に
+/// 済ませている前提）。
+///
+/// [`Null`](Cell::Null) セルは形式コードにかかわらず長さ `-1` を書く
+/// （PostgreSQL の規約）。テキスト列のバイナリ表現は [`cell_to_text`] と
+/// 同じ UTF-8 バイトをそのまま長さ付きで書く（[`binary::text`]）。
+///
+/// **失敗時は `out` を呼び出し前の長さへ必ず `truncate` してから返す**
+/// （[`encode_data_row_into`] と同じ契約。部分フレームを絶対に残さない）。
+pub fn encode_data_row_into_with_formats(
+    row: &ResultRow,
+    formats: &[FormatCode],
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
     let start = out.len();
+    if row.cells.len() != formats.len() {
+        return Err(EncodeError);
+    }
     let field_count = match i16::try_from(row.cells.len()) {
         Ok(n) => n,
         Err(_) => {
@@ -200,15 +473,36 @@ pub fn encode_data_row_into(row: &ResultRow, out: &mut Vec<u8>) -> Result<(), En
         out.extend_from_slice(&0i32.to_be_bytes());
         let body_start = out.len();
         out.extend_from_slice(&field_count.to_be_bytes());
-        for cell in &row.cells {
-            match cell_to_text(cell)? {
-                None => out.extend_from_slice(&(-1i32).to_be_bytes()),
-                Some(text) => {
-                    let bytes = text.as_bytes();
-                    let len = i32::try_from(bytes.len()).map_err(|_| EncodeError)?;
-                    out.extend_from_slice(&len.to_be_bytes());
-                    out.extend_from_slice(bytes);
-                }
+        for (cell, format) in row.cells.iter().zip(formats.iter()) {
+            match format {
+                FormatCode::Text => match cell_to_text(cell)? {
+                    None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+                    Some(text) => {
+                        let bytes = text.as_bytes();
+                        let len = i32::try_from(bytes.len()).map_err(|_| EncodeError)?;
+                        out.extend_from_slice(&len.to_be_bytes());
+                        out.extend_from_slice(bytes);
+                    }
+                },
+                FormatCode::Binary => match cell {
+                    Cell::Null => out.extend_from_slice(&(-1i32).to_be_bytes()),
+                    // `validate_binary_formats` が事前検査を通した経路のみが
+                    // ここへ到達する契約であり、バイナリ対応列は
+                    // `Cell::Text`（`WireType::Text` かつ `ColumnMeta::Scalar
+                    // {ty: Text}`）に限られる（`column_binary_support`
+                    // 参照）。それ以外の `Cell` variant が来た場合は
+                    // 呼び出し元の契約違反として fail-closed に拒否する
+                    // （黙って text/他表現へフォールバックしない）。
+                    Cell::Text(s) => {
+                        let bytes = binary::text(s);
+                        let len = i32::try_from(bytes.len()).map_err(|_| EncodeError)?;
+                        out.extend_from_slice(&len.to_be_bytes());
+                        out.extend_from_slice(bytes);
+                    }
+                    Cell::Integer(_) | Cell::Vector(_) | Cell::Float(_) | Cell::Bool(_) => {
+                        return Err(EncodeError);
+                    }
+                },
             }
         }
         let body_len = out.len().checked_sub(body_start).ok_or(EncodeError)?;
@@ -561,5 +855,286 @@ mod tests {
             msg.len() - 1,
             "length field excludes only the leading 'E' type byte"
         );
+    }
+
+    // --- ResultFormats::resolve（WIRE-14・Issue #936）---
+
+    #[test]
+    fn result_formats_resolve_zero_codes_defaults_all_text() {
+        let formats = ResultFormats::new(&[]).resolve(3).expect("resolve");
+        assert_eq!(formats, vec![FormatCode::Text; 3]);
+    }
+
+    #[test]
+    fn result_formats_resolve_single_code_applies_to_all_columns() {
+        let formats = ResultFormats::new(&[1]).resolve(3).expect("resolve");
+        assert_eq!(formats, vec![FormatCode::Binary; 3]);
+    }
+
+    #[test]
+    fn result_formats_resolve_per_column_codes() {
+        let formats = ResultFormats::new(&[0, 1, 0]).resolve(3).expect("resolve");
+        assert_eq!(
+            formats,
+            vec![FormatCode::Text, FormatCode::Binary, FormatCode::Text]
+        );
+    }
+
+    #[test]
+    fn result_formats_resolve_count_mismatch_is_rejected() {
+        let err = ResultFormats::new(&[0, 1]).resolve(3).unwrap_err();
+        assert_eq!(err, BinaryFormatError::FormatCountMismatch);
+        assert_eq!(err.error_class(), ErrorClass::ProtocolViolation);
+    }
+
+    #[test]
+    fn result_formats_resolve_invalid_value_is_rejected() {
+        let err = ResultFormats::new(&[2]).resolve(1).unwrap_err();
+        assert_eq!(err, BinaryFormatError::InvalidFormatCode);
+        assert_eq!(err.error_class(), ErrorClass::ProtocolViolation);
+    }
+
+    // --- validate_binary_formats（WIRE-14）---
+
+    #[test]
+    fn validate_binary_formats_accepts_text_column_as_binary() {
+        let columns = vec![ColumnMeta::Scalar {
+            name: "lang".to_string(),
+            ty: engine::catalog::ColumnType::Text,
+        }];
+        let formats = vec![FormatCode::Binary];
+        assert!(validate_binary_formats(&columns, &formats).is_ok());
+    }
+
+    #[test]
+    fn validate_binary_formats_rejects_id_column_as_binary() {
+        let columns = vec![ColumnMeta::Id];
+        let formats = vec![FormatCode::Binary];
+        let err = validate_binary_formats(&columns, &formats).unwrap_err();
+        assert_eq!(err, BinaryFormatError::UnsupportedType { column_index: 0 });
+        assert_eq!(err.error_class(), ErrorClass::FeatureNotSupported);
+    }
+
+    #[test]
+    fn validate_binary_formats_rejects_vector_column_as_binary() {
+        let columns = vec![ColumnMeta::Scalar {
+            name: "embedding".to_string(),
+            ty: engine::catalog::ColumnType::Vector(3),
+        }];
+        let formats = vec![FormatCode::Binary];
+        let err = validate_binary_formats(&columns, &formats).unwrap_err();
+        assert_eq!(err, BinaryFormatError::UnsupportedType { column_index: 0 });
+        assert_eq!(err.error_class(), ErrorClass::FeatureNotSupported);
+    }
+
+    #[test]
+    fn validate_binary_formats_rejects_computed_column_as_binary() {
+        let columns = vec![ColumnMeta::Computed {
+            name: "expr".to_string(),
+        }];
+        let formats = vec![FormatCode::Binary];
+        let err = validate_binary_formats(&columns, &formats).unwrap_err();
+        assert_eq!(err, BinaryFormatError::UnsupportedType { column_index: 0 });
+        assert_eq!(err.error_class(), ErrorClass::FeatureNotSupported);
+    }
+
+    #[test]
+    fn validate_binary_formats_accepts_all_text_columns_unconditionally() {
+        // バイナリを一切要求しない場合は非対応型が混在していても通る
+        // （検査対象は「バイナリを要求された列」のみ）。
+        let columns = vec![
+            ColumnMeta::Id,
+            ColumnMeta::Scalar {
+                name: "embedding".to_string(),
+                ty: engine::catalog::ColumnType::Vector(3),
+            },
+            ColumnMeta::Computed {
+                name: "expr".to_string(),
+            },
+        ];
+        let formats = vec![FormatCode::Text; 3];
+        assert!(validate_binary_formats(&columns, &formats).is_ok());
+    }
+
+    // --- binary モジュール（golden バイト列。WIRE-14）---
+
+    #[test]
+    fn binary_int4_golden_bytes() {
+        assert_eq!(binary::int4(1), [0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(binary::int4(-1), [0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn binary_int8_golden_bytes() {
+        assert_eq!(
+            binary::int8(-1),
+            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+        );
+        assert_eq!(
+            binary::int8(1),
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
+        );
+    }
+
+    #[test]
+    fn binary_float8_golden_bytes() {
+        // IEEE 754 倍精度で 1.0 は指数部 1023（バイアス済み）・仮数部 0。
+        assert_eq!(
+            binary::float8(1.0),
+            [0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn binary_float4_golden_bytes() {
+        assert_eq!(binary::float4(1.0), [0x3f, 0x80, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn binary_bool_golden_bytes() {
+        assert_eq!(binary::bool_(true), [0x01]);
+        assert_eq!(binary::bool_(false), [0x00]);
+    }
+
+    #[test]
+    fn binary_uuid_round_trips() {
+        let uuid_bytes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        assert_eq!(binary::uuid(uuid_bytes), uuid_bytes);
+    }
+
+    #[test]
+    fn binary_text_is_utf8_bytes() {
+        // マルチバイト文字（'é' は UTF-8 で 2 バイト）でも生バイトをそのまま返す。
+        assert_eq!(binary::text("é"), "é".as_bytes());
+        assert_eq!(binary::text("é").len(), 2);
+    }
+
+    #[test]
+    fn binary_bytea_is_identity() {
+        let data = [1u8, 2, 3];
+        assert_eq!(binary::bytea(&data), &data);
+    }
+
+    // --- encode_row_description_with_formats / encode_data_row_into_with_formats
+    // の全テキスト不変性（受け入れ条件 4・WIRE-14）---
+
+    #[test]
+    fn row_description_with_all_text_formats_matches_legacy_encoder() {
+        let columns = vec![
+            ColumnMeta::Id,
+            ColumnMeta::Scalar {
+                name: "lang".to_string(),
+                ty: engine::catalog::ColumnType::Text,
+            },
+            ColumnMeta::Scalar {
+                name: "embedding".to_string(),
+                ty: engine::catalog::ColumnType::Vector(3),
+            },
+            ColumnMeta::Computed {
+                name: "expr".to_string(),
+            },
+        ];
+        let legacy = encode_row_description(&columns).expect("legacy encode");
+        let formats = vec![FormatCode::Text; columns.len()];
+        let via_formats =
+            encode_row_description_with_formats(&columns, &formats).expect("formats encode");
+        assert_eq!(legacy, via_formats);
+    }
+
+    #[test]
+    fn data_row_with_all_text_formats_matches_legacy_encoder() {
+        let row = ResultRow {
+            id: 7,
+            score: 0.0,
+            cells: vec![
+                Cell::Integer(7),
+                Cell::Text("lang".to_string()),
+                Cell::Null,
+                Cell::Vector(vec![1.0, 2.5]),
+                Cell::Bool(true),
+                Cell::Float(1.5),
+            ],
+        };
+        let legacy = encode_data_row(&row).expect("legacy encode");
+        let formats = vec![FormatCode::Text; row.cells.len()];
+        let mut via_formats = Vec::new();
+        encode_data_row_into_with_formats(&row, &formats, &mut via_formats)
+            .expect("formats encode");
+        assert_eq!(legacy, via_formats);
+    }
+
+    #[test]
+    fn data_row_into_with_formats_rejects_count_mismatch() {
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Integer(1)],
+        };
+        let mut out = b"KEEP".to_vec();
+        let result = encode_data_row_into_with_formats(&row, &[], &mut out);
+        assert!(result.is_err());
+        assert_eq!(out, b"KEEP", "mismatch must not leave partial bytes");
+    }
+
+    // --- encode_data_row_into_with_formats の実バイナリ経路（WIRE-14）---
+
+    #[test]
+    fn data_row_binary_text_cell_uses_raw_utf8_bytes() {
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Text("lang".to_string())],
+        };
+        let mut out = Vec::new();
+        encode_data_row_into_with_formats(&row, &[FormatCode::Binary], &mut out).expect("encode");
+        // 'D' + length(4) + field_count(2) = idx 7 から cell length(4)。
+        let cell_len = i32_at(&out, 7) as usize;
+        assert_eq!(cell_len, 4);
+        assert_eq!(slice_at(&out, 11, cell_len), b"lang");
+    }
+
+    #[test]
+    fn data_row_binary_null_cell_has_length_negative_one_regardless_of_format() {
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Null],
+        };
+        let mut out = Vec::new();
+        encode_data_row_into_with_formats(&row, &[FormatCode::Binary], &mut out).expect("encode");
+        assert_eq!(i32_at(&out, 7), -1);
+    }
+
+    #[test]
+    fn data_row_binary_non_text_cell_is_rejected() {
+        // `validate_binary_formats` を経由しない直接呼び出しでの契約違反
+        // （バイナリ非対応列の実値セル）を fail-closed に拒否する。
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Integer(1)],
+        };
+        let mut out = b"KEEP".to_vec();
+        let result = encode_data_row_into_with_formats(&row, &[FormatCode::Binary], &mut out);
+        assert!(result.is_err());
+        assert_eq!(out, b"KEEP", "failed encode must not leave partial bytes");
+    }
+
+    // --- column_binary_support（WIRE-14）---
+
+    #[test]
+    fn column_binary_support_matrix() {
+        assert!(!column_binary_support(&ColumnMeta::Id));
+        assert!(column_binary_support(&ColumnMeta::Scalar {
+            name: "lang".to_string(),
+            ty: engine::catalog::ColumnType::Text,
+        }));
+        assert!(!column_binary_support(&ColumnMeta::Scalar {
+            name: "embedding".to_string(),
+            ty: engine::catalog::ColumnType::Vector(3),
+        }));
+        assert!(!column_binary_support(&ColumnMeta::Computed {
+            name: "expr".to_string(),
+        }));
     }
 }
