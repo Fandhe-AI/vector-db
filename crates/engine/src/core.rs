@@ -3336,6 +3336,103 @@ impl EngineCore {
         )
     }
 
+    /// NoSQL 表層 `update` op（束縛済み計画経由。TASK-186・NOSQL-12。Issue #876・
+    /// 対象ビヘイビア NOSQL-6・SQL-17・RECOVER-1／10）を SQL 表層
+    /// `UPDATE ... USING OPERATION_ID`（SQL-17・TASK-191）と**同一の実行器**
+    /// （[`crate::sql::exec::execute_update_with_schema`]）へ、SQL テキストを
+    /// 組み立てずに到達させるセッション入口（第 2 の実行器を作らない設計。
+    /// [`Self::execute_bound_insert_in_session`] と同型）。呼び出し元
+    /// （`wire-server::http::query::update`）は `bind` closure の内側で JSON
+    /// `set` を [`crate::sql::allowlist::ValidatedUpdate`] へ写像したうえで
+    /// [`crate::sql::parser::bind_update`] を呼び、禁止列・重複列・未知列・
+    /// 型不一致の検査を engine 側の既存契約へ委譲する。
+    ///
+    /// 判定順序（fail-closed。契約の一部）:
+    /// 1. `operation_id` 必須化ガード（TASK-92・RECOVER-1）: `self.ledger_mode`
+    ///    が要求する構成で `operation_id` が `None` なら
+    ///    [`crate::sql::allowlist::SqlSurfaceError::MissingOperationId`]
+    ///    （`23502`）。スキーマ取得より前に判定する
+    ///    （[`Self::execute_bound_insert_in_session`] 判定 1 と同じ理由）。
+    /// 2. [`Self::read_txn_with_schema`] で `table` のスキーマを取得する
+    ///    （`bind` はまだ呼ばない）。テーブル不存在は `UndefinedTable`
+    ///    （`42P01`）。
+    /// 3. `bind(&schema)` で束縛済み `BoundUpdate` を得る（`read_txn` が開いて
+    ///    いる間に呼ぶ）。戻り値の `table`／`operation_id` が引数と一致する
+    ///    ことを検証する（不一致は `22000`）。これは
+    ///    [`Self::execute_bound_insert_in_session`] 判定 5 と同じ多層防御で、
+    ///    判定 1 の早期ガードと判定 4 の実書き込みが異なる `operation_id` を
+    ///    使う fail-closed でない経路を閉じる（PR #823 Bugbot 指摘と同種）。
+    /// 4. `read_txn` を drop してから
+    ///    [`crate::sql::exec::execute_update_with_schema`]（独自の write
+    ///    トランザクション。束縛時点のスキーマ `Some(&schema)` を渡し、実行時の
+    ///    再定義競合を fail-closed に検出する。`execute_update_form` と同じ
+    ///    設計）を呼ぶ。
+    pub fn execute_bound_update_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        bind: F,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            crate::sql::parser::BoundUpdate,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
+        self.ledger_mode
+            .resolve(operation_id)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+
+        // 判定 2・3: スキーマ取得 → 束縛（同一 read_txn 下）。
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let bound = bind(&schema)?;
+        if bound.table != table || bound.operation_id.as_ref() != operation_id {
+            // `bound.operation_id` は判定 1 の早期ガードと独立に `bind` closure
+            // （呼び出し元）が構築するため、一致検証なしでは判定 1 が通過させた
+            // 値と実書き込み（判定 4）が異なる `operation_id` を使い得る
+            // （`execute_bound_insert_in_session` 判定 5 と同じ理由）。
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "bound update plan does not match the requested table or operation_id",
+            ));
+        }
+        drop(read_txn);
+
+        // 判定 4: 実書き込み（独自の write トランザクション）。
+        crate::sql::exec::execute_update_with_schema(
+            &self.storage,
+            ctx,
+            &bound,
+            self.ledger_mode,
+            Some(&schema),
+        )
+    }
+
+    /// NoSQL 表層 `delete` op（束縛済み計画経由。TASK-186・NOSQL-12。Issue #876・
+    /// 対象ビヘイビア NOSQL-6・SQL-18・RECOVER-1／10）を SQL 表層
+    /// `DELETE ... USING OPERATION_ID`（SQL-18・TASK-191）と**同一の実行器**
+    /// （[`crate::sql::exec::execute_delete`]）へ薄く委譲するセッション入口
+    /// （第 2 の実行器を作らない設計）。`DELETE` は `id` 疑似列以外の列を参照
+    /// しないため、`insert`／`update` のようなスキーマ突き合わせを伴う `bind`
+    /// closure は不要で、呼び出し元（`wire-server::http::query::delete`）が
+    /// JSON から直接構築した [`crate::sql::parser::BoundDelete`] をそのまま
+    /// 受け取る（[`Self::execute_delete_form`] と同じ設計）。
+    ///
+    /// `operation_id` 必須化ガード（TASK-92・RECOVER-1）は
+    /// [`crate::sql::exec::execute_delete`] 自身が先頭で行う（`23502`）。
+    /// テーブル不存在は [`crate::tenant::delete_row_ledgered_unchecked`] →
+    /// `map_write_error` 経由で `UndefinedTable`（`42P01`）へ写像される。
+    pub fn execute_bound_delete_in_session(
+        &self,
+        ctx: &PolicyContext,
+        bound: &crate::sql::parser::BoundDelete,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::exec::execute_delete(&self.storage, ctx, bound, self.ledger_mode)
+    }
+
     /// SQL 表層の複数行 `VALUES`（①行数上限＋②③④バイト量・チャンク総量）
     /// 上限検証本体。`execute_insert_form`・`execute_insert_returning_form`
     /// （`RETURNING` 付き。Issue #873・SQL-21）の `RowBatch` 分岐がいずれも

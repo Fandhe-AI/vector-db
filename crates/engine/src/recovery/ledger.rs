@@ -261,6 +261,29 @@ pub(crate) fn record_in_txn(
     ledger: LedgerWrite<'_>,
     content_hash: &ContentHash,
 ) -> Result<RecordOutcome, LedgerRecordError> {
+    record_in_txn_accepting(write_txn, tenant_id, table, ledger, content_hash, &[])
+}
+
+/// [`record_in_txn`] の一般化版（Issue #876 レビュー指摘の是正）。
+///
+/// ハッシュ入力の正規化方式を変更した操作（例: `for_update_columns` の列順を
+/// 宣言順からスキーマ列順へ変更した `tenant::update_row_columns_unchecked`）は、
+/// 変更前のコードが記録した台帳エントリのハッシュと、変更後のコードが計算する
+/// 正規ハッシュが食い違いうる。`legacy_hashes` にはそうした「正規化方式の変更前に
+/// 実際に記録されえたハッシュ」の候補を渡す。既存エントリが `content_hash`
+/// （新方式・以降の記録にも使う正準ハッシュ）と一致しなくても `legacy_hashes` の
+/// いずれかと一致すれば同一内容の再送（`Duplicate`）とみなす。`legacy_hashes` は
+/// 判定にのみ使い、新規記録・上書きには常に `content_hash`（正準ハッシュ）を使う
+/// （keep-first 契約は変えない。「新方式のハッシュを計算できる場合は必ずそれを
+/// 保存する」という不変条件を保ち、正規化方式の変遷を後続の呼び出しへ持ち越さない）。
+pub(crate) fn record_in_txn_accepting(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    table: &str,
+    ledger: LedgerWrite<'_>,
+    content_hash: &ContentHash,
+    legacy_hashes: &[ContentHash],
+) -> Result<RecordOutcome, LedgerRecordError> {
     let op_id = match ledger {
         LedgerWrite::Record(op_id) => op_id,
         LedgerWrite::Disabled => return Ok(RecordOutcome::Skipped),
@@ -276,7 +299,10 @@ pub(crate) fn record_in_txn(
         return match stored {
             StoredEntry::V1 => Err(LedgerRecordError::ContentMismatch),
             StoredEntry::V2 { hash } => {
-                if content_hash.matches(&hash) {
+                let matches_current = content_hash.matches(&hash);
+                let matches_legacy =
+                    !matches_current && legacy_hashes.iter().any(|legacy| legacy.matches(&hash));
+                if matches_current || matches_legacy {
                     Err(LedgerRecordError::Duplicate)
                 } else {
                     Err(LedgerRecordError::ContentMismatch)
