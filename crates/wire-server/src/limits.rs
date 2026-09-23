@@ -151,6 +151,16 @@ impl RejectWorkerLimiter {
 /// 有界化し、[`MAX_CONNECTIONS`] 全体でも合計常駐メモリを有界に保つ。
 pub const MAX_RESPONSE_BUFFER_BYTES: usize = 1024 * 1024;
 
+/// COPY サブプロトコル（Issue #939・WIRE-17）が構文・上限違反等でエラー応答を
+/// 返した後、クライアントが送り続ける可能性のある残り CopyData／CopyDone／
+/// CopyFail を黙って読み捨てる「読み捨て状態」の総バイト数上限。PostgreSQL の
+/// 実際のプロトコル契約（COPY IN 中のエラーは即座に ErrorResponse を返しつつ、
+/// 相手が既に送信済みの残りデータは読み捨てて `ReadyForQuery` へ進む）を
+/// 踏襲しつつ、この読み捨てが接続スロットを無期限に占有する DoS 経路になるのを
+/// 防ぐ（`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
+/// （DoS）」対応）。超過時は読み捨てず `08P01` で切断する（fail-closed）。
+pub const COPY_DISCARD_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// SQLSTATE `53300`（too_many_connections）。ポインタ:
 /// `docs/spec/04-behavior/error-format.md`。値は `engine::error_format::
 /// ErrorClass`（SSOT。TASK-152・ERR-2）由来（TASK-153・ERR-1 の分散定数 SSOT 化）。

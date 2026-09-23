@@ -85,6 +85,7 @@
 
 pub mod auth;
 pub mod bind_guard;
+pub(crate) mod copy;
 pub mod durability_opt;
 pub mod error_response;
 #[cfg(feature = "fault-injection")]

@@ -1,0 +1,517 @@
+//! COPY プロトコル（`COPY ... FROM STDIN`／`COPY (...) TO STDOUT`）のメッセージ層
+//! （Issue #939・WIRE-17・TASK-220）。
+//!
+//! 責務境界: 本モジュールは CopyIn／CopyOut サブプロトコルのフレーミング・
+//! 状態遷移のみを担う。行のレコード分割・フィールドデコード・束縛・INDEX-4
+//! 上限判定・commit はすべて `engine::sql::copy`（`EngineCore::begin_copy`／
+//! `commit_copy_in`）へ委譲する（第 2 の書き込み経路を作らない設計）。
+//!
+//! 呼び出し文脈: `handshake::post_auth_loop` の 'Q' 分岐が、UTF-8 検証済みの
+//! クエリテキストへ `engine::sql::copy::is_copy_statement` を適用して真なら
+//! ここへ委譲する。本モジュールは COPY サブプロトコルの開始（CopyInResponse／
+//! CopyOutResponse）から終了（`CommandComplete`＋`ReadyForQuery`）までを
+//! 1 回の呼び出しで完結させる（`simple_query::execute_and_respond` と同じ
+//! 「1 回の呼び出しで応答を書き切る」契約）。
+//!
+//! **PostgreSQL 本家との既知の相違点**（`docs/design/wire-copy-protocol.md`
+//! 参照）: protocol v3 の COPY は CopyDone（'c'）で終端を表現するため、
+//! protocol v2 由来の `\.` 終端行は受理・要求しない。COPY FROM STDIN の途中で
+//! エラーが起きた場合、本実装は CopyDone／CopyFail を受信し終えるまで
+//! ErrorResponse／ReadyForQuery の送出を遅らせる（PostgreSQL 本家は
+//! ErrorResponse を即座に送るが、その後もクライアントが CopyDone／CopyFail を
+//! 送ってくることを許容し続ける必要があり、次の 'Q' が先に届く可能性のある
+//! 接続レベルの「読み捨て状態」を要求する。本実装は COPY サブプロトコルの
+//! 開始から終了までを 1 回の関数呼び出しで完結させる単純化のため、
+//! ErrorResponse は CopyDone／CopyFail 受信後にまとめて送る）。
+
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+
+use engine::core::{CopyPlan, EngineCore};
+use engine::error_format::{ClassifiedError, ErrorClass};
+use engine::policy::PolicyContext;
+use engine::sql::allowlist::{CopyFormat, SqlSurfaceError};
+use engine::sql::copy::CopyInSession;
+use engine::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+use engine::sql::mode::SessionState;
+
+use crate::framing::{self, FrameError};
+use crate::result_encoder;
+
+/// [`FrameError`] を `io::Result` の失敗へ変換する。`Truncated`（相手が既に
+/// 切断）は「応答なしで終了してよい」を表すため `UnexpectedEof` へ、それ以外
+/// （`TooLarge`／`Malformed`／`Io`）は接続を終了させる `io::Error` へ写像する。
+/// `handshake::HandshakeError` は本モジュールでは使わない（`crate::copy::run`
+/// は `simple_query::execute_and_respond` と同じ `io::Result<()>` 契約で
+/// 完結させるため）。
+fn frame_err_to_io(e: FrameError) -> io::Error {
+    match e {
+        FrameError::Truncated => io::Error::new(io::ErrorKind::UnexpectedEof, "truncated frame"),
+        FrameError::Io(io_err) => io_err,
+        other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+    }
+}
+
+/// ErrorResponse を書いてから ReadyForQuery を書く
+/// （`simple_query::respond_error_and_ready` と同じ契約。COPY サブプロトコル
+/// のエラーも接続を維持する簡易クエリの一部であり、切断はしない）。
+fn respond_error_and_ready(
+    stream: &mut TcpStream,
+    class: ErrorClass,
+    message: &str,
+) -> io::Result<()> {
+    crate::handshake::write_error_response_io(stream, class, message)?;
+    crate::handshake::write_ready_for_query_io(stream)
+}
+
+fn respond_sql_error(stream: &mut TcpStream, e: &SqlSurfaceError) -> io::Result<()> {
+    respond_error_and_ready(stream, e.error_class(), &e.client_message())
+}
+
+/// `CopyInResponse`（'G'）／`CopyOutResponse`（'H'）を組み立てる。いずれも
+/// `Int8 format=0`（text。CSV でも overall format は 0 のまま）・
+/// `Int16 num_columns`・`Int16[num_columns]`（各列 format=0）という同一構造
+/// （PostgreSQL wire v3 の規範）。
+fn encode_copy_response(kind: u8, column_count: usize) -> Result<Vec<u8>, ()> {
+    let n = i16::try_from(column_count).map_err(|_| ())?;
+    let mut body = Vec::new();
+    body.push(0u8);
+    body.extend_from_slice(&n.to_be_bytes());
+    for _ in 0..column_count {
+        body.extend_from_slice(&0i16.to_be_bytes());
+    }
+    let total_len = body
+        .len()
+        .checked_add(4)
+        .and_then(|v| i32::try_from(v).ok())
+        .ok_or(())?;
+    let mut msg = Vec::with_capacity(1 + body.len() + 4);
+    msg.push(kind);
+    msg.extend_from_slice(&total_len.to_be_bytes());
+    msg.extend_from_slice(&body);
+    Ok(msg)
+}
+
+/// `CopyDone`（'c'）。body を持たない固定 5 バイト。
+fn encode_copy_done() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b'c';
+    msg[1..5].copy_from_slice(&4i32.to_be_bytes());
+    msg
+}
+
+/// `Cell` を COPY の値表現（text／CSV）へエンコードする。`result_encoder::
+/// cell_to_text`（通常の SELECT 応答と同じ値表現）を土台にすることで、
+/// `COPY (...) TO STDOUT` の出力を同じテーブルへ `COPY ... FROM STDIN` で
+/// 再投入した際に値が往復する（`sql::copy::decode_text_field`／
+/// `decode_csv_record` と対称なエスケープ規則）。
+fn cell_to_copy_value(
+    format: CopyFormat,
+    cell: &Cell,
+) -> Result<Option<String>, result_encoder::EncodeError> {
+    let text = result_encoder::cell_to_text(cell)?;
+    Ok(text.map(|t| match format {
+        CopyFormat::Text => escape_copy_text(&t),
+        CopyFormat::Csv => escape_copy_csv(&t),
+    }))
+}
+
+fn escape_copy_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{C}' => out.push_str("\\f"),
+            '\u{B}' => out.push_str("\\v"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn escape_copy_csv(s: &str) -> String {
+    let needs_quoting = s.is_empty() || s.contains([',', '"', '\n', '\r']);
+    if !needs_quoting {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' {
+            out.push('"');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// `ResultRow` を `CopyData`（'d'）1 個へエンコードし `out` の末尾へ追記する
+/// （`result_encoder::encode_data_row_into` と同じ in-place 追記契約。失敗時は
+/// 呼び出し前の長さへ `truncate` してから返す）。COPY の値区切りは text 形式
+/// タブ・CSV 形式カンマの固定（クライアント指定の区切り文字は許可リスト外。
+/// `sql::allowlist::validate_copy` の `FORMAT` 以外のオプション拒否と対応）。
+fn encode_copy_data_row_into(
+    format: CopyFormat,
+    row: &ResultRow,
+    out: &mut Vec<u8>,
+) -> Result<(), result_encoder::EncodeError> {
+    let start = out.len();
+    let mut fields: Vec<Option<String>> = Vec::with_capacity(row.cells.len());
+    for cell in &row.cells {
+        match cell_to_copy_value(format, cell) {
+            Ok(v) => fields.push(v),
+            Err(e) => {
+                out.truncate(start);
+                return Err(e);
+            }
+        }
+    }
+    let sep = match format {
+        CopyFormat::Text => '\t',
+        CopyFormat::Csv => ',',
+    };
+    let mut line = String::new();
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            line.push(sep);
+        }
+        match field {
+            None => line.push_str("\\N"),
+            Some(s) => line.push_str(s),
+        }
+    }
+    line.push('\n');
+    let bytes = line.as_bytes();
+    let len = match i32::try_from(bytes.len().saturating_add(4)) {
+        Ok(v) => v,
+        Err(_) => {
+            out.truncate(start);
+            return Err(result_encoder::EncodeError);
+        }
+    };
+    out.push(b'd');
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// `COPY (...) TO STDOUT`: CopyOutResponse → 各行 CopyData → CopyDone →
+/// `CommandComplete "COPY n"` → `ReadyForQuery`。実行本体
+/// （`EngineCore::begin_copy` の `CopyPlan::To` 分岐。広域取得と同じ RLS
+/// 暗黙適用・`LIMIT` 有界の走査）はこの関数の呼び出し前に完了済みであり、
+/// 本関数はエンコードと送出のみを担う（実行エラーは `CopyOutResponse` より
+/// 前に確定しているため、この経路には到達しない）。
+fn run_copy_to(stream: &mut TcpStream, format: CopyFormat, result: &QueryResult) -> io::Result<()> {
+    let response = match encode_copy_response(b'H', result.columns.len()) {
+        Ok(b) => b,
+        Err(()) => {
+            return respond_error_and_ready(
+                stream,
+                ErrorClass::InternalError,
+                "failed to encode CopyOutResponse",
+            )
+        }
+    };
+
+    let hint = response
+        .len()
+        .saturating_add(result.rows.len().saturating_mul(64));
+    let mut buffer = crate::response_buffer::ResponseBuffer::with_capacity_hint(
+        crate::limits::MAX_RESPONSE_BUFFER_BYTES,
+        hint,
+    );
+    buffer.push_frame(stream, &response)?;
+
+    for row in &result.rows {
+        let start = buffer.frame_start();
+        if encode_copy_data_row_into(format, row, buffer.as_mut_vec()).is_err() {
+            buffer.truncate_to(start);
+            buffer.flush(stream)?;
+            return respond_error_and_ready(
+                stream,
+                ErrorClass::InternalError,
+                "failed to encode CopyData",
+            );
+        }
+        if buffer.len() >= crate::limits::MAX_RESPONSE_BUFFER_BYTES {
+            buffer.flush(stream)?;
+        }
+    }
+
+    buffer.push_frame(stream, &encode_copy_done())?;
+    let tag = format!("COPY {}", result.rows.len());
+    match result_encoder::encode_command_complete(&tag) {
+        Ok(msg) => {
+            buffer.push_frame(stream, &msg)?;
+            buffer.push_frame(stream, &result_encoder::encode_ready_for_query())?;
+            buffer.flush(stream)
+        }
+        Err(_) => {
+            buffer.flush(stream)?;
+            respond_error_and_ready(
+                stream,
+                ErrorClass::InternalError,
+                "failed to encode command complete response",
+            )
+        }
+    }
+}
+
+/// `body_len` バイトを `stream` から読み捨てる（読み捨て状態専用。
+/// `limits::COPY_DISCARD_MAX_BYTES` の総量チェックは呼び出し元が行う）。
+fn discard_bytes(stream: &mut TcpStream, mut remaining: usize) -> io::Result<()> {
+    let mut buf = [0u8; 8192];
+    while remaining > 0 {
+        let want = remaining.min(buf.len());
+        let dst = match buf.get_mut(..want) {
+            Some(d) => d,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "discard buffer bound",
+                ))
+            }
+        };
+        stream.read_exact(dst)?;
+        remaining -= want;
+    }
+    Ok(())
+}
+
+/// `COPY <table> (<cols>) FROM STDIN`: CopyInResponse → CopyData*／CopyDone／
+/// CopyFail のサブプロトコルを 1 回の呼び出しで完結させる。行のデコード・
+/// 束縛・INDEX-4 逐次判定は [`CopyInSession::feed`] が担う（`sql::copy`
+/// モジュールドキュメント参照）。
+///
+/// エラー処理は本モジュールドキュメントに記載の簡略化方針に従う: `feed` が
+/// 失敗した時点では応答を送らず「以降の CopyData を読み捨てる」状態へ移り、
+/// CopyDone／CopyFail を受信してからまとめて ErrorResponse＋ReadyForQuery を
+/// 送る（副作用は一切残さない——commit は CopyDone 到達かつエラー無しの場合
+/// のみ行う）。
+fn run_copy_from(
+    stream: &mut TcpStream,
+    engine: &EngineCore,
+    ctx: &PolicyContext,
+    mut session: CopyInSession,
+) -> io::Result<()> {
+    let response = match encode_copy_response(b'G', session.column_count()) {
+        Ok(b) => b,
+        Err(()) => {
+            return respond_error_and_ready(
+                stream,
+                ErrorClass::InternalError,
+                "failed to encode CopyInResponse",
+            )
+        }
+    };
+    stream.write_all(&response)?;
+
+    let mut errored: Option<SqlSurfaceError> = None;
+    let mut discarded_bytes: usize = 0;
+
+    loop {
+        let type_byte = match framing::read_typed_frame_header(stream) {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(frame_err_to_io(e)),
+        };
+        match type_byte {
+            b'd' => {
+                let body = framing::read_length_prefixed_body(stream, 4, framing::MAX_MESSAGE_LEN)
+                    .map_err(frame_err_to_io)?;
+                if errored.is_none() {
+                    if let Err(e) = session.feed(&body) {
+                        errored = Some(e);
+                    }
+                } else {
+                    discarded_bytes = discarded_bytes.saturating_add(body.len());
+                    if discarded_bytes > crate::limits::COPY_DISCARD_MAX_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "COPY discard budget exceeded",
+                        ));
+                    }
+                }
+            }
+            b'c' => {
+                framing::read_length_prefixed_body(stream, 4, 4).map_err(frame_err_to_io)?;
+                return finish_copy_from(stream, engine, ctx, session, errored);
+            }
+            b'f' => {
+                let len = framing::validate_typed_message_length_prefix(
+                    stream,
+                    framing::MIN_TYPED_MESSAGE_LEN,
+                    framing::MAX_MESSAGE_LEN,
+                )
+                .map_err(frame_err_to_io)?;
+                let body_len = len.saturating_sub(4);
+                // CopyFail の理由文字列はクライアントの自由記述であり、応答にも
+                // ログにも一切エコーしない（security.md「エラー・ログ経由で
+                // 他テナントのデータ・存在情報を漏らさない」。文字列の内容自体を
+                // 一切解釈せず読み捨てるだけに留める）。
+                discard_bytes(stream, body_len)?;
+                return respond_error_and_ready(
+                    stream,
+                    ErrorClass::InvalidInput,
+                    "COPY failed on the client side",
+                );
+            }
+            b'H' | b'S' => {
+                // Flush('H')／Sync('S') は簡易クエリ・COPY いずれも無視する
+                // （PostgreSQL 互換。長さのみ検証する）。
+                framing::validate_typed_message_length_prefix(
+                    stream,
+                    framing::MIN_TYPED_MESSAGE_LEN,
+                    framing::MAX_MESSAGE_LEN,
+                )
+                .map_err(frame_err_to_io)?;
+            }
+            b'X' => return Ok(()),
+            _ => {
+                let _ = framing::validate_typed_message_length_prefix(
+                    stream,
+                    framing::MIN_TYPED_MESSAGE_LEN,
+                    framing::MAX_MESSAGE_LEN,
+                );
+                let _ = crate::handshake::write_error_response_io(
+                    stream,
+                    ErrorClass::ProtocolViolation,
+                    "unexpected message type during COPY FROM STDIN",
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "protocol violation during COPY FROM STDIN",
+                ));
+            }
+        }
+    }
+}
+
+/// CopyDone 到達後（`errored` が `None` の場合のみ）、[`CopyInSession::finish`]
+/// で末尾レコードを確定させてから [`EngineCore::commit_copy_in`] を呼ぶ。
+/// commit 前後の RECOVER-5 (3)／RECOVER-6 の保護区間は
+/// `simple_query::execute_and_respond` と同じ設計（`ResponseBoundaryGuard` は
+/// 呼び出し元 [`run`] が関数全体を覆い、`EmergencyResponseRegistration` は
+/// commit 呼び出しだけをブロックスコープで覆う）。
+fn finish_copy_from(
+    stream: &mut TcpStream,
+    engine: &EngineCore,
+    ctx: &PolicyContext,
+    session: CopyInSession,
+    errored: Option<SqlSurfaceError>,
+) -> io::Result<()> {
+    if let Some(e) = errored {
+        return respond_sql_error(stream, &e);
+    }
+
+    let batch = match session.finish() {
+        Ok(b) => b,
+        Err(e) => return respond_sql_error(stream, &e),
+    };
+
+    let outcome = {
+        let _emergency_registration =
+            crate::simple_query::emergency_response_bytes().and_then(|bytes| {
+                let clone = stream.try_clone().ok()?;
+                Some(
+                    engine::recovery::panic_hook::EmergencyResponseRegistration::register(
+                        bytes.to_vec(),
+                        clone,
+                        crate::limits::EMERGENCY_RESPONSE_WRITE_TIMEOUT,
+                    ),
+                )
+            });
+        engine.commit_copy_in(ctx, batch)
+    };
+
+    match outcome {
+        Ok(insert_outcome) => {
+            match result_encoder::encode_command_complete(&format!(
+                "COPY {}",
+                insert_outcome.rows_affected
+            )) {
+                Ok(msg) => {
+                    stream.write_all(&msg)?;
+                    crate::handshake::write_ready_for_query_io(stream)
+                }
+                Err(_) => respond_error_and_ready(
+                    stream,
+                    ErrorClass::InternalError,
+                    "failed to encode command complete response",
+                ),
+            }
+        }
+        Err(e) => respond_sql_error(stream, &e),
+    }
+}
+
+/// `handshake::post_auth_loop` の 'Q' 分岐から、`engine::sql::copy::
+/// is_copy_statement(text)` が真の場合にのみ呼ばれる唯一の入口。
+/// `EngineCore::begin_copy` の構造検証・`operation_id` 必須化ガード・
+/// テーブル解決がここで失敗した場合は CopyIn／CopyOutResponse を一切送らずに
+/// 通常の ErrorResponse＋ReadyForQuery を返す（PostgreSQL 互換: CopyIn/Out
+/// サブプロトコルへ入ってしまってからの構文エラーは無い）。
+pub(crate) fn run(
+    stream: &mut TcpStream,
+    engine: &EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    sql: &str,
+) -> io::Result<()> {
+    // commit 成功から本関数が応答を書き終えるまでの区間全体を覆う RAII ガード
+    // （RECOVER-5 (3)。`simple_query::execute_and_respond` と同じ設計）。
+    let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
+
+    match engine.begin_copy(ctx, session, sql) {
+        Ok(CopyPlan::To(format, result)) => run_copy_to(stream, format, &result),
+        Ok(CopyPlan::From(copy_session)) => run_copy_from(stream, engine, ctx, copy_session),
+        Err(e) => respond_sql_error(stream, &e),
+    }
+}
+
+/// [`ColumnMeta`] を参照する箇所が本モジュールに存在することを型検査するための
+/// マーカー（`result_encoder::cell_to_text` は `Cell` のみを取るため、
+/// `ColumnMeta` は `QueryResult::columns` 経由でのみ使う。未使用 import 警告を
+/// 避けるための明示的な no-op）。
+#[allow(dead_code)]
+fn _assert_column_meta_type(_c: &ColumnMeta) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_copy_text_escapes_control_characters() {
+        assert_eq!(escape_copy_text("a\tb\nc\\d"), "a\\tb\\nc\\\\d");
+    }
+
+    #[test]
+    fn escape_copy_csv_quotes_when_needed() {
+        assert_eq!(escape_copy_csv("plain"), "plain");
+        assert_eq!(escape_copy_csv(""), "\"\"");
+        assert_eq!(escape_copy_csv("a,b"), "\"a,b\"");
+        assert_eq!(escape_copy_csv("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn encode_copy_response_has_expected_layout_for_two_columns() {
+        let msg = encode_copy_response(b'G', 2).expect("encode");
+        assert_eq!(msg[0], b'G');
+        let len = i32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]) as usize;
+        assert_eq!(len, msg.len() - 1);
+        assert_eq!(msg[5], 0); // overall format
+        let ncols = i16::from_be_bytes([msg[6], msg[7]]);
+        assert_eq!(ncols, 2);
+    }
+
+    #[test]
+    fn encode_copy_done_is_exactly_five_bytes() {
+        let msg = encode_copy_done();
+        assert_eq!(msg, [b'c', 0, 0, 0, 4]);
+    }
+}

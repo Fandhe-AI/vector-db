@@ -122,6 +122,7 @@
 pub mod aggregate;
 pub mod allowlist;
 pub(crate) mod arena_cache;
+pub mod copy;
 pub mod exec;
 pub mod explain;
 pub(crate) mod expr_program;

@@ -149,7 +149,13 @@ pub fn encode_row_description(columns: &[ColumnMeta]) -> Result<Vec<u8>, EncodeE
 /// ような signed 64bit 制約が無い）ため、`i64` への変換は行わず値域制限なく
 /// `to_string()` する（PR #210 レビュー指摘: 旧実装は `i64::try_from` で
 /// `i64::MAX` 超の正当な ID を `EncodeError`/`XX000` にしていた）。
-fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
+///
+/// `pub(crate)`: `crate::copy`（Issue #939・WIRE-17）の `COPY (...) TO STDOUT`
+/// 行エンコーダが、通常の `SELECT` 応答（`DataRow`）と同じ値表現を再利用する
+/// ために公開する（COPY TO の出力と SELECT の text 出力が同一の cell 表現を
+/// 共有することで、`COPY (...) TO STDOUT` の出力を同じテーブルへ
+/// `COPY ... FROM STDIN` で再投入した際に値の往復が保たれる）。
+pub(crate) fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
     match cell {
         Cell::Null => Ok(None),
         Cell::Integer(v) => Ok(Some(v.to_string())),

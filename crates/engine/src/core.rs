@@ -1190,6 +1190,19 @@ fn dictionary_required_columns(
 /// フォールバックする）。カタログ照会自体が失敗した場合のエラー写像は
 /// `catalog::table_lookup_error`（`impl TableLookup for Storage` と共有）
 /// を使い、`table_exists` 単体と文言・`wire_code` を一致させる。
+/// [`EngineCore::begin_copy`]（Issue #939・WIRE-17）の戻り値。`FROM STDIN` 形は
+/// ストリーミング取り込みセッション（[`crate::sql::copy::CopyInSession`]）を、
+/// `TO STDOUT` 形は即座に実行済みの結果集合（広域取得と同じ実行本体。
+/// `EngineCore::run_scan_plan` 参照）を保持する。
+#[derive(Debug)]
+pub enum CopyPlan {
+    From(crate::sql::copy::CopyInSession),
+    To(
+        crate::sql::allowlist::CopyFormat,
+        crate::sql::exec::QueryResult,
+    ),
+}
+
 struct InsertSchemaLookup<'a> {
     storage: &'a Storage,
     cached: std::cell::RefCell<Option<(String, TableSchema)>>,
@@ -3356,6 +3369,86 @@ impl EngineCore {
             &bounds,
             self.ledger_mode,
             Some(&schema),
+        )
+    }
+
+    /// `COPY` 文（Issue #939・WIRE-17・TASK-220）を構造検証し、`FROM STDIN` 形は
+    /// ストリーミング取り込みセッション（[`crate::sql::copy::CopyInSession`]）を、
+    /// `TO STDOUT` 形は広域取得と同じ実行本体（[`Self::run_scan_plan`]。RLS
+    /// 暗黙適用・`WHERE`／`LIMIT` を含む）を即座に走らせた結果集合を返す
+    /// （`wire-server::copy` から呼ばれる唯一の入口）。`FROM STDIN` 形はこの
+    /// 時点では副作用を一切持たない（実際の commit は [`Self::commit_copy_in`]
+    /// が CopyDone 到達後に行う）。
+    ///
+    /// `FROM STDIN` 形のスキーマ取得は [`Self::read_txn_with_schema`]（他の
+    /// 書き込み系 SQL 文と同じ経路）を使うが、`read_txn` はスキーマのスナップ
+    /// ショットを取るためだけに開き、CopyData の受信中（wire I/O 待ち）には
+    /// 保持しない（`USING PLAN` 経路が LLM I/O の間 `read_txn` を保持しないの
+    /// と同じ理由。`Self` モジュールドキュメント参照）。CopyData 受信中に
+    /// テーブルが再定義された場合は [`Self::commit_copy_in`] が commit 直前に
+    /// 検出し fail-closed に拒否する。
+    pub fn begin_copy(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        sql: &str,
+    ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
+        let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)?;
+        match stmt {
+            crate::sql::allowlist::CopyStatement::From(v) => {
+                let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
+                Ok(CopyPlan::From(crate::sql::copy::CopyInSession::new(
+                    v.table_name,
+                    v.columns,
+                    v.format,
+                    v.operation_id,
+                    schema,
+                    self.batch_limits,
+                )))
+            }
+            crate::sql::allowlist::CopyStatement::To(v) => {
+                let (read_txn, schema) = self.read_txn_with_schema(v.inner.table_name())?;
+                let bound = crate::sql::parser::bind_scan(&v.inner, &schema, session.udfs())?;
+                let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
+                Ok(CopyPlan::To(v.format, result))
+            }
+        }
+    }
+
+    /// [`Self::begin_copy`] が返した `CopyPlan::From` セッションへ、CopyDone
+    /// 到達後に確定したバッチを渡し、SQL-16 の複数行 `INSERT` と同一の実行器
+    /// （[`Self::execute_bound_insert_in_session`]）へ委譲して commit する
+    /// （第 2 の書き込み経路を作らない設計。`operation_id` 台帳のハッシュ空間・
+    /// INDEX-4 ①③④ の最終判定・RLS-9・TABLE-12 の契約はすべてそこから
+    /// 継承する）。`bind` closure は束縛時点（[`Self::begin_copy`]）に取得した
+    /// スキーマが commit 時点のスキーマと一致することを検証してから
+    /// （不一致は fail-closed `22000`。CopyData 受信中の DDL によるスキーマ
+    /// 食い違いを防ぐ）束縛済み行をそのまま返す。
+    pub fn commit_copy_in(
+        &self,
+        ctx: &PolicyContext,
+        batch: crate::sql::copy::CopyInBatch,
+    ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let crate::sql::copy::CopyInBatch {
+            table,
+            row_count,
+            operation_id,
+            bounds,
+            schema: bound_schema,
+        } = batch;
+        self.execute_bound_insert_in_session(
+            ctx,
+            &table,
+            row_count,
+            operation_id.as_ref(),
+            |schema| {
+                if schema != &bound_schema {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                        "table schema changed while COPY data was being received",
+                    ));
+                }
+                Ok(bounds)
+            },
         )
     }
 

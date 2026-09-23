@@ -389,9 +389,20 @@ fn post_auth_loop(
 
                 match engine {
                     Some(engine) => {
-                        crate::simple_query::execute_and_respond(
-                            stream, engine, ctx, session, text,
-                        )?;
+                        // Issue #939（WIRE-17・TASK-220）: `COPY ... FROM STDIN`／
+                        // `COPY (...) TO STDOUT` は簡易クエリの通常の 1 往復応答
+                        // ではなく CopyIn／CopyOut サブプロトコルを要するため、
+                        // `is_copy_statement` の安価な覗き見だけで
+                        // `crate::copy::run` へ委譲する（`validate_sql` の許可
+                        // 形状には含めない。見逃した場合は通常経路が `42601` で
+                        // 拒否する fail-closed。モジュールドキュメント参照）。
+                        if engine::sql::copy::is_copy_statement(text) {
+                            crate::copy::run(stream, engine, ctx, session, text)?;
+                        } else {
+                            crate::simple_query::execute_and_respond(
+                                stream, engine, ctx, session, text,
+                            )?;
+                        }
                     }
                     None => {
                         write_error_response(

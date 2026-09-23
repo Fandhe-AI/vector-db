@@ -343,6 +343,65 @@ pub(crate) fn validate_raw_sql_len(
     Ok(new_total)
 }
 
+/// ①（バッチあたり最大ファイル数。COPY では「行数」と読み替える）を、CopyDone
+/// を待たず 1 行ずつ逐次判定する（Issue #939・WIRE-17。[`validate_batch_shape`]
+/// が一括判定するのに対し、COPY はストリーミングであるため超過を CopyData
+/// 受信中に検出する必要がある。判定内容自体は同一）。
+pub(crate) fn check_row_count(count: usize, limits: &BatchLimits) -> Result<(), BatchLimitsError> {
+    if count > limits.max_files_per_batch {
+        return Err(BatchLimitsError::TooManyFiles {
+            count,
+            max: limits.max_files_per_batch,
+        });
+    }
+    Ok(())
+}
+
+/// ②（1 ファイルあたり最大本文サイズ。COPY では「1 行あたりのデコード後
+/// バイト量」と読み替える）を、CopyDone を待たず 1 行ずつ逐次判定する
+/// （[`check_row_count`] と同じ理由）。
+pub(crate) fn check_row_body_len(
+    index: usize,
+    len: usize,
+    limits: &BatchLimits,
+) -> Result<(), BatchLimitsError> {
+    if len > limits.max_file_body_bytes {
+        return Err(BatchLimitsError::FileBodyTooLarge {
+            index,
+            len,
+            max: limits.max_file_body_bytes,
+        });
+    }
+    Ok(())
+}
+
+/// ③（バッチ合計最大サイズ）を、CopyDone を待たず CopyData 受信ごとに逐次
+/// 判定する（[`check_row_count`] と同じ理由。COPY の場合は生 CopyData
+/// バイト量そのものを累算する——[`validate_batch_shape`] のようにデコード後の
+/// `path.len() + body.len()` ではなく、デコード前のバイト量を上限判定の対象と
+/// することで、レコード分割・エスケープ解決・`Vec<BoundInsert>` への確保より
+/// 前にメモリ確保自体を有界に保つ）。戻り値は新しい累計（呼び出し元は次回
+/// 呼び出しへそのまま渡す。`validate_raw_sql_len` と同じ設計）。
+pub(crate) fn check_running_total(
+    running: usize,
+    add: usize,
+    limits: &BatchLimits,
+) -> Result<usize, BatchLimitsError> {
+    let new_total = running
+        .checked_add(add)
+        .ok_or(BatchLimitsError::BatchTotalTooLarge {
+            total: usize::MAX,
+            max: limits.max_batch_total_bytes,
+        })?;
+    if new_total > limits.max_batch_total_bytes {
+        return Err(BatchLimitsError::BatchTotalTooLarge {
+            total: new_total,
+            max: limits.max_batch_total_bytes,
+        });
+    }
+    Ok(new_total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
