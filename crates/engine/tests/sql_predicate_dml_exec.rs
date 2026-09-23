@@ -832,3 +832,85 @@ fn predicate_update_succeeds_when_only_other_tenant_exceeds_scan_limit() {
         "bob's rows must remain untouched"
     );
 }
+
+/// codex-review P0 対応（Issue #871・[`enumerate_dml_candidates`] の range 終端を
+/// `Bound::Unbounded` から対象テナントの閉区間へ限定した修正の回帰固定）:
+/// 対象テナント（alice）が `TABLE` に行を 1 件も持たず、かつ物理キー順で
+/// alice より後ろに位置するテナント（bob。文字列比較で `"alice" < "bob"`）が
+/// [`tenant::MAX_SCANNED_ROWS`] を超える行を保持している場合でも、述語つき
+/// `DELETE ... WHERE` は alice の空の名前空間だけを走査して `54000` にならず
+/// 成功し（0 件一致）、bob の行は一切変化しない。修正前は `range` の終端が
+/// `Unbounded` だったため、alice の名前空間走査が 0 件のまま尽きた直後の
+/// 反復で辞書順で後続する bob の先頭エントリを取得してしまい、`key_tenant
+/// != tenant` の break 判定に至る前に bob 領域のキー・値へ触れていた
+/// （「他テナント領域のキー・値に一切触れない」契約への抵触）。
+#[test]
+fn predicate_delete_succeeds_when_target_tenant_has_no_rows_and_following_tenant_exceeds_scan_limit(
+) {
+    let bob = ctx_for("bob", true);
+    let alice = ctx_for("alice", true);
+    let other_tenant_rows: u64 = 1_000_001;
+    let (core, path) = new_core_with_bulk_seeded_table(&bob, TABLE, other_tenant_rows);
+    let _guard = CleanupGuard(path);
+    assert_eq!(count_star(&core, &bob, TABLE), other_tenant_rows);
+    // alice は `TABLE` に行を 1 件も持たない。
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
+
+    let outcome = execute(
+        &core,
+        &alice,
+        &format!(
+            "DELETE FROM {TABLE} WHERE lang = 'ja' USING OPERATION_ID 'op-del-empty-target-tenant'"
+        ),
+    )
+    .expect(
+        "predicate DELETE over alice's empty namespace must succeed with zero \
+         matches regardless of bob's row count",
+    );
+    match outcome {
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 0),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
+    assert_eq!(
+        count_star(&core, &bob, TABLE),
+        other_tenant_rows,
+        "bob's rows must remain untouched"
+    );
+}
+
+/// 上記 DELETE 版と同じ回帰固定を `UPDATE ... WHERE` 側でも行う
+/// （[`enumerate_dml_candidates`] を共有するため）。
+#[test]
+fn predicate_update_succeeds_when_target_tenant_has_no_rows_and_following_tenant_exceeds_scan_limit(
+) {
+    let bob = ctx_for("bob", true);
+    let alice = ctx_for("alice", true);
+    let other_tenant_rows: u64 = 1_000_001;
+    let (core, path) = new_core_with_bulk_seeded_table(&bob, TABLE, other_tenant_rows);
+    let _guard = CleanupGuard(path);
+    assert_eq!(count_star(&core, &bob, TABLE), other_tenant_rows);
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
+
+    let outcome = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-upd-empty-target-tenant'"
+        ),
+    )
+    .expect(
+        "predicate UPDATE over alice's empty namespace must succeed with zero \
+         matches regardless of bob's row count",
+    );
+    match outcome {
+        SqlOutcome::Update(o) => assert_eq!(o.rows_affected, 0),
+        other => panic!("expected SqlOutcome::Update, got {other:?}"),
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
+    assert_eq!(
+        count_star(&core, &bob, TABLE),
+        other_tenant_rows,
+        "bob's rows must remain untouched"
+    );
+}

@@ -2445,21 +2445,25 @@ fn enumerate_dml_candidates<E>(
     let mut scanned: usize = 0;
 
     let tenant = ctx.tenant_id();
-    // 対象テナントの先頭 `(tenant, 0)` から走査を開始する。物理キーは
-    // `(tenant_id, id)` の辞書順であり `u64::MIN == 0` のため、この境界は
-    // 対象テナントの行のうち最小の `id` を持つ行（存在すれば）を含む。
+    // 対象テナントの名前空間 `(tenant, 0)..=(tenant, u64::MAX)` に走査を閉じる
+    // （codex-review P0 指摘・Issue #871）。物理キーは `(tenant_id, id)` の
+    // 辞書順であり `u64::MIN == 0`／`u64::MAX` が対象テナントの id 空間の
+    // 両端を覆うため、この閉区間は対象テナント所有行のみを列挙し他テナント
+    // 領域のキー・値には一切触れない（`Bound::Unbounded` 終端だと対象テナント
+    // に行が 0 件の場合に限り最初の反復で辞書順で後続する別テナントの先頭
+    // エントリを取得してしまい、下記の break 前に他テナント領域を読んでいた）。
+    // `replace_rows_for_reingest`（2938 行目付近）と同型の閉区間。
     let range_start = std::ops::Bound::Included((tenant, 0u64));
+    let range_end = std::ops::Bound::Included((tenant, u64::MAX));
     for entry in row_table
-        .range::<(&str, u64)>((range_start, std::ops::Bound::Unbounded))
+        .range::<(&str, u64)>((range_start, range_end))
         .map_err(|e| dml_write_err(CatalogError::from(e)))?
     {
         let (k, v) = entry.map_err(|e| dml_write_err(CatalogError::from(e)))?;
         let (key_tenant, id) = k.value();
         if key_tenant != tenant {
-            // 物理キーは `(tenant_id, id)` 昇順（タプル `Key` 比較は第 1 要素
-            // 優先）なので、対象テナントの行は連続領域として現れる。テナント
-            // 境界を跨いだ時点で走査終了（他テナント領域のキー・値のいずれも
-            // これ以上読み進めない）。
+            // 閉区間により理論上到達しないが、defense-in-depth として維持する
+            // （物理キー比較の実装詳細に依存しない不変条件の二重化）。
             break;
         }
 
