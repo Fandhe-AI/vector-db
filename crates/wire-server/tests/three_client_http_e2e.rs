@@ -2098,7 +2098,7 @@ fn nosql_wire_code_of(body: &str) -> String {
 
 /// `DML_STEPS`／`BOB_STEP` 1 件を SQL 表層（生 wire）へ適用し、`expect` と
 /// 一致することを確認する。
-fn apply_sql_dml_step(port: u16, user: &str, password: &str, step: &DmlStep) {
+fn apply_sql_dml_step(port: u16, user: &str, password: &str, step: &DmlStep) -> SqlDmlOutcome {
     let outcome = run_sql_dml(port, user, password, step.sql);
     match (&step.expect, &outcome) {
         (DmlExpectation::Affected(n), SqlDmlOutcome::Success { tag }) => {
@@ -2121,10 +2121,36 @@ fn apply_sql_dml_step(port: u16, user: &str, password: &str, step: &DmlStep) {
             step.label
         ),
     }
+    outcome
 }
 
-/// `DML_STEPS`／`BOB_STEP` 1 件を NoSQL 表層（`client`）へ適用し、SQL 側と
-/// 同じ `expect` と一致することを確認する。
+/// `SqlDmlOutcome`／NoSQL 応答本文の双方を「影響行数」または「`wire_code`」
+/// へ正規化した比較用の値（Issue #877・codex-review 指摘。`message` は
+/// `DmlExpectation::Error` のコメントで既述のとおり束縛段階が表層間で
+/// 異なりうるため対象外のまま、`wire_code`／影響行数は両表層の実際の
+/// 応答同士を直接比較する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DmlOutcomeSummary {
+    Affected(u64),
+    Error(String),
+}
+
+impl From<&SqlDmlOutcome> for DmlOutcomeSummary {
+    fn from(outcome: &SqlDmlOutcome) -> Self {
+        match outcome {
+            SqlDmlOutcome::Success { tag } => {
+                DmlOutcomeSummary::Affected(affected_count_from_tag(tag))
+            }
+            SqlDmlOutcome::Error { sqlstate, .. } => DmlOutcomeSummary::Error(sqlstate.clone()),
+        }
+    }
+}
+
+/// `DML_STEPS`／`BOB_STEP` 1 件を NoSQL 表層（`client`）へ適用し、同じ
+/// `expect` との一致に加え、`sql_outcome`（同じステップを SQL 表層へ適用
+/// した実際の結果）と NoSQL 応答を `DmlOutcomeSummary` として直接比較する
+/// （codex-review 指摘・PR #994: 従来は両表層を固定 `expect` へ別々に
+/// 照合するのみで表層間の応答を直接突き合わせていなかった）。
 fn apply_nosql_dml_step(
     client: &HttpClient,
     port: u16,
@@ -2132,6 +2158,7 @@ fn apply_nosql_dml_step(
     out_dir: &std::path::Path,
     seq: &mut u32,
     step: &DmlStep,
+    sql_outcome: &SqlDmlOutcome,
 ) {
     *seq += 1;
     let (status, body) = client.post(
@@ -2142,26 +2169,27 @@ fn apply_nosql_dml_step(
         out_dir,
         *seq,
     );
-    match &step.expect {
+    let nosql_summary = match &step.expect {
         DmlExpectation::Affected(n) => {
             assert_eq!(status, 200, "step={} nosql body={body}", step.label);
-            assert_eq!(
-                affected_count_from_nosql_body(&body),
-                *n,
-                "step={} nosql body={body}",
-                step.label
-            );
+            let affected = affected_count_from_nosql_body(&body);
+            assert_eq!(affected, *n, "step={} nosql body={body}", step.label);
+            DmlOutcomeSummary::Affected(affected)
         }
         DmlExpectation::Error(code) => {
             assert_ne!(status, 200, "step={} nosql body={body}", step.label);
-            assert_eq!(
-                nosql_wire_code_of(&body),
-                *code,
-                "step={} nosql body={body}",
-                step.label
-            );
+            let wire_code = nosql_wire_code_of(&body);
+            assert_eq!(wire_code, *code, "step={} nosql body={body}", step.label);
+            DmlOutcomeSummary::Error(wire_code)
         }
-    }
+    };
+    let sql_summary = DmlOutcomeSummary::from(sql_outcome);
+    assert_eq!(
+        nosql_summary, sql_summary,
+        "step={}: sql/nosql outcome mismatch (sql={sql_outcome:?} nosql status={status} \
+         body={body})",
+        step.label
+    );
 }
 
 /// `run_sql_nosql_dml_parity_scenario` の実行記録・各サーバー stderr に
@@ -2218,10 +2246,11 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
     let (db_s_path, _db_s_guard) = seed_dml_parity_db("db-s");
     let db_s_path_str = db_s_path.to_str().expect("utf-8 db path").to_string();
     let (sql_server, sql_port) = spawn_sql_server(&users_path_str, &db_s_path_str);
+    let mut sql_outcomes: Vec<SqlDmlOutcome> = Vec::with_capacity(DML_STEPS.len());
     for step in DML_STEPS {
-        apply_sql_dml_step(sql_port, "alice", "pw-alice", step);
+        sql_outcomes.push(apply_sql_dml_step(sql_port, "alice", "pw-alice", step));
     }
-    apply_sql_dml_step(sql_port, "bob", "pw-bob", &BOB_STEP);
+    let bob_sql_outcome = apply_sql_dml_step(sql_port, "bob", "pw-bob", &BOB_STEP);
     let sql_final_alice = psql_read_back_id_lang(sql_port, "alice", "pw-alice");
     let sql_final_bob = psql_read_back_id_lang(sql_port, "bob", "pw-bob");
     let sql_seen = sql_server.stop_and_drain(Instant::now() + Duration::from_secs(5));
@@ -2256,8 +2285,16 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
     };
     assert_valid_session_token(&alice_token);
 
-    for step in DML_STEPS {
-        apply_nosql_dml_step(&client, nosql_port, &alice_token, &out_dir, &mut seq, step);
+    for (step, sql_outcome) in DML_STEPS.iter().zip(sql_outcomes.iter()) {
+        apply_nosql_dml_step(
+            &client,
+            nosql_port,
+            &alice_token,
+            &out_dir,
+            &mut seq,
+            step,
+            sql_outcome,
+        );
     }
     let nosql_final_alice =
         nosql_read_back_id_lang(&client, nosql_port, &alice_token, &out_dir, &mut seq);
@@ -2278,7 +2315,13 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
     };
     assert_valid_session_token(&bob_token);
     apply_nosql_dml_step(
-        &client, nosql_port, &bob_token, &out_dir, &mut seq, &BOB_STEP,
+        &client,
+        nosql_port,
+        &bob_token,
+        &out_dir,
+        &mut seq,
+        &BOB_STEP,
+        &bob_sql_outcome,
     );
     let nosql_final_bob =
         nosql_read_back_id_lang(&client, nosql_port, &bob_token, &out_dir, &mut seq);
@@ -2456,7 +2499,7 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
         "pw-alice",
         "UPDATE docs SET lang = 'en' WHERE id = 100 USING OPERATION_ID 'dml-rls9-a'",
     );
-    let _ = db_f_sql.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    let db_f_sql_seen = db_f_sql.stop_and_drain(Instant::now() + Duration::from_secs(5));
     let (db_m_sql, db_m_sql_port) = spawn_sql_server(&users_path_str, &db_m_path_str);
     let outcome_m = run_sql_dml(
         db_m_sql_port,
@@ -2464,7 +2507,27 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
         "pw-alice",
         "UPDATE docs SET lang = 'en' WHERE id = 999 USING OPERATION_ID 'dml-rls9-a'",
     );
-    let _ = db_m_sql.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    let db_m_sql_seen = db_m_sql.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    // codex-review 指摘（PR #994）: Phase 4 の 4 サーバー（DB-F/DB-M/DB-F2/
+    // DB-M2）は従来 stderr を破棄しており非漏えい検査から漏れていた。
+    // DB-F／DB-M（SQL 表層）はセッショントークンを発行しないため、この
+    // 時点までに発行済みの NoSQL トークンのみを対象に検査する。
+    assert_dml_scenario_no_leak(
+        &db_f_sql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+        ],
+    );
+    assert_dml_scenario_no_leak(
+        &db_m_sql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+        ],
+    );
     assert_eq!(
         outcome_f, outcome_m,
         "RLS-9: foreign-tenant-row and missing-id responses (SQL) must be identical"
@@ -2503,7 +2566,16 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
         &out_dir,
         seq,
     );
-    let _ = db_f2_nosql.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    let db_f2_nosql_seen = db_f2_nosql.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert_dml_scenario_no_leak(
+        &db_f2_nosql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+            db_f2_token.as_str(),
+        ],
+    );
 
     let (db_m2_nosql, db_m2_port) = spawn_nosql_server(&users_path_str, &db_m2_path_str);
     seq += 1;
@@ -2529,7 +2601,17 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
         &out_dir,
         seq,
     );
-    let _ = db_m2_nosql.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    let db_m2_nosql_seen = db_m2_nosql.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert_dml_scenario_no_leak(
+        &db_m2_nosql_seen.join("\n"),
+        &[
+            alice_token.as_str(),
+            bob_token.as_str(),
+            db_s_alice_token.as_str(),
+            db_f2_token.as_str(),
+            db_m2_token.as_str(),
+        ],
+    );
 
     assert_eq!(status_f, status_m, "RLS-9 (NoSQL): status must match");
     assert_eq!(body_f, body_m, "RLS-9 (NoSQL): body must match");
