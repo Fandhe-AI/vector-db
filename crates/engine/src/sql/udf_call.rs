@@ -437,6 +437,22 @@ pub fn define_function(
     Ok(())
 }
 
+/// テスト専用: `define_function` のパラメータ名正規化（小文字化）を経由せず、
+/// 呼び出し側が指定した綴りのまま `UdfDefinition` をレジストリへ直接登録する。
+/// `recovery::content_hash` の直列化（`push_dml_where_predicates` の UDF 定義
+/// セクション）が、`define_function` による正規化に依存せずそれ自体で大文字
+/// 小文字を畳み込む契約を検証するための入口（`defs` フィールドが private のため
+/// 同一モジュール内に置く）。production 経路（`define_function` 一択）はこの
+/// ヘルパーを経由しない。
+#[cfg(test)]
+pub(crate) fn insert_raw_definition_for_test(
+    registry: &mut UdfRegistry,
+    name: &str,
+    def: UdfDefinition,
+) {
+    registry.defs.insert(name.to_ascii_lowercase(), def);
+}
+
 /// 検証済みの `Arc<dyn WasmUdfBackend>` をセッションのレジストリへ登録する
 /// （TASK-149、対象ビヘイビア: EXT-5, EXT-6。`sql::mode::SessionState::register_wasm_udf`
 /// から呼ばれる）。名前空間・上限は宣言的 UDF（[`define_function`]）と共有し、

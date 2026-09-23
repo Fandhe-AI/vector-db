@@ -830,8 +830,13 @@ fn push_dml_where_predicates(
             let param_count =
                 u32::try_from(def.params.len()).map_err(|_| dml_hash_field_too_large())?;
             b.push_raw(&param_count.to_le_bytes());
+            // パラメータ名は小文字化してから連結する（`push_dml_expr` の `Ident`
+            // 側パラメータ参照・`bind_expr_in` の呼び出し引数解決と同じ大文字小文字
+            // 非区別契約に揃える。ここを原文のまま連結すると `x`／`X` のように
+            // 意味的に同一なパラメータ宣言が異なる content_hash を生み、同一
+            // `operation_id` の正当な再送を内容不一致〔`22023`〕として誤拒否する）。
             for p in &def.params {
-                b.push_bytes(p.as_bytes())
+                b.push_bytes(p.to_ascii_lowercase().as_bytes())
                     .map_err(|_| dml_hash_field_too_large())?;
             }
             push_dml_expr(b, &def.body, Some(&def.params))?;
@@ -2107,6 +2112,55 @@ mod tests {
         assert_eq!(
             h_lower, h_upper,
             "same UDF closure must hash identically regardless of declared parameter case"
+        );
+    }
+
+    /// 上のテストは `define_function`（production の唯一の登録経路）がパラメータ名を
+    /// 定義時点で必ず小文字へ正規化する（`sql::udf_call::define_function` の
+    /// `normalized_params`）ため、`push_dml_where_predicates` の UDF 定義
+    /// セクション自体が大文字小文字を畳み込む必要性を検証できていなかった
+    /// （codex-review P1 指摘。`define_function` を経由しない場合でも定義
+    /// セクションの直列化自体が大文字小文字を畳み込む契約であることを、正規化を
+    /// 経由しない [`crate::sql::udf_call::insert_raw_definition_for_test`] で
+    /// 直接ピン留めする）。
+    #[test]
+    fn for_delete_where_udf_definition_section_folds_param_case_independent_of_define_function() {
+        use crate::sql::udf_call::{
+            insert_raw_definition_for_test, Expr, UdfDefinition, UdfRegistry,
+        };
+
+        let mut lower = UdfRegistry::default();
+        insert_raw_definition_for_test(
+            &mut lower,
+            "raw_fn",
+            UdfDefinition {
+                params: vec!["x".to_string()],
+                body: Expr::Ident("x".to_string()),
+            },
+        );
+
+        let mut upper = UdfRegistry::default();
+        insert_raw_definition_for_test(
+            &mut upper,
+            "raw_fn",
+            UdfDefinition {
+                params: vec!["X".to_string()],
+                body: Expr::Ident("X".to_string()),
+            },
+        );
+
+        let predicate = where_predicate_id_gt_zero(Expr::Call {
+            name: "raw_fn".to_string(),
+            args: vec![Expr::Ident("id".to_string())],
+        });
+
+        let h_lower =
+            for_delete_where("t", std::slice::from_ref(&predicate), &lower).expect("hash");
+        let h_upper = for_delete_where("t", &[predicate], &upper).expect("hash");
+        assert_eq!(
+            h_lower, h_upper,
+            "definition-section serialization itself must fold parameter name case, \
+             independent of any upstream normalization by define_function"
         );
     }
 
