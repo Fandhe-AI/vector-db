@@ -180,9 +180,17 @@ fn encode_copy_data_row_into(
         if i > 0 {
             line.push(sep);
         }
-        match field {
-            None => line.push_str("\\N"),
-            Some(s) => line.push_str(s),
+        match (format, field) {
+            // text 形式の NULL 表現はリテラル `\N`（`sql::copy::decode_text_field`
+            // がフィールド全体一致で NULL 扱いする対称）。CSV 形式は
+            // `sql::copy::decode_csv_record`／`finish_csv_field` が「引用符なしの
+            // 空フィールド」を NULL、`""` を空文字列として区別する契約のため、
+            // ここで `\N` を出力すると再投入時に文字列 "\N" として読まれてしまい
+            // 往復が壊れる（Issue #939 レビュー指摘）。CSV の NULL は引用符なしの
+            // 空文字列で表現する。
+            (CopyFormat::Text, None) => line.push_str("\\N"),
+            (CopyFormat::Csv, None) => {}
+            (_, Some(s)) => line.push_str(s),
         }
     }
     line.push('\n');
@@ -363,15 +371,31 @@ fn run_copy_from(
             }
             b'H' | b'S' => {
                 // Flush('H')／Sync('S') は簡易クエリ・COPY いずれも無視する
-                // （PostgreSQL 互換。長さのみ検証する）。
-                framing::validate_typed_message_length_prefix(
+                // （PostgreSQL 互換）。`validate_typed_message_length_prefix` は
+                // 長さフィールドの検証のみを行い本文は読まないため、宣言長が
+                // 4 バイトを超える場合は残りの本文を明示的に読み捨てないと
+                // 未読バイトがストリームに残り、後続の `read_typed_frame_header`
+                // がそれを次のメッセージ種別として誤読しデシンクする
+                // （Issue #939 レビュー指摘。`f`（CopyFail）分岐の `discard_bytes`
+                // と対称にする）。
+                let len = framing::validate_typed_message_length_prefix(
                     stream,
                     framing::MIN_TYPED_MESSAGE_LEN,
                     framing::MAX_MESSAGE_LEN,
                 )
                 .map_err(frame_err_to_io)?;
+                discard_bytes(stream, len.saturating_sub(4))?;
             }
-            b'X' => return Ok(()),
+            b'X' => {
+                // Terminate は `handshake::post_auth_loop` の通常の 'X' 分岐
+                // （`read_length_prefixed_body(stream, 4, 4)`）と対称に、長さ
+                // フィールド（body 厳密に空・4 バイト固定）を確実に消費してから
+                // 抜ける。読み捨てないと `post_auth_loop` がこの 4 バイトを
+                // 次のメッセージ種別バイトとして誤読する（Issue #939 レビュー
+                // 指摘）。
+                framing::read_length_prefixed_body(stream, 4, 4).map_err(frame_err_to_io)?;
+                return Ok(());
+            }
             _ => {
                 let _ = framing::validate_typed_message_length_prefix(
                     stream,

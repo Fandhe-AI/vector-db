@@ -40,6 +40,26 @@ fn new_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
+/// `note` を nullable `TEXT` 列として持つテーブル（CSV 形式の NULL 往復検証用。
+/// `new_core_with_docs_table` は全列 non-nullable のため NULL を表現できない）。
+fn new_core_with_nullable_note_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire17-copy-nullable");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("note", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
 fn spawn_with_alice(core: Arc<EngineCore>) -> std::net::TcpStream {
     let users_path = write_user_store_file(&[
         ("alice", "tenant-a", "pw-alice"),
@@ -368,5 +388,122 @@ fn wire17_copy_to_stdout_output_round_trips_through_copy_from_stdin() {
     send_copy_done(&mut stream);
     let tag = read_command_complete(&mut stream);
     assert_eq!(tag, "COPY 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// CSV 形式の `COPY (...) TO STDOUT` が NULL 列を出力し、その出力を同じ
+/// テーブルへ CSV 形式 `COPY ... FROM STDIN` で再投入すると NULL のまま戻る
+/// こと（レビュー指摘: text 形式の `\N` をそのまま CSV へ流用すると、CSV 側の
+/// NULL 表現（引用符なし空フィールド）と食い違い "\N" という文字列に化けて
+/// 往復が壊れていた。`crates/wire-server/src/copy.rs::encode_copy_data_row_into`
+/// の CSV 分岐固定）。
+#[test]
+fn wire17_copy_csv_null_round_trips_through_copy_from_stdin() {
+    let (core, _guard) = new_core_with_nullable_note_table();
+    let mut stream = spawn_with_alice(core);
+
+    // `note` を列リストから省略すると nullable 列は NULL のまま挿入される
+    // （`INSERT` の許可形状は `VALUES` 内の `NULL` キーワードを受理しないため、
+    // 明示的な NULL 値はこの形で作る。`sql::parser::bind_insert_row` 参照）。
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (1, '[1.0,0.0]', 'ja') USING OPERATION_ID 'csv-null-op-1'",
+    );
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "COPY (SELECT id, lang, note FROM docs LIMIT 10) TO STDOUT WITH (FORMAT csv)",
+    );
+    let _ = read_copy_out_response(&mut stream);
+    let row = read_copy_data(&mut stream);
+    read_copy_done(&mut stream);
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    // `id,lang,note\n` の CSV 出力で `note` が NULL の場合は引用符なし空
+    // フィールド（`\N` ではない）として出力されていること。
+    let text = String::from_utf8(row).expect("utf8 copy output");
+    let line = text.trim_end_matches('\n');
+    assert_eq!(line, "1,ja,", "CSV NULL must be an unquoted empty field");
+
+    // その出力を CSV 形式で再投入すると note は NULL のまま戻る（"\\N" という
+    // 文字列として読み込まれてはいけない）。
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang, note) FROM STDIN WITH (FORMAT csv) USING OPERATION_ID 'csv-null-op-2'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"2,\"[0.0,1.0]\",ja,\n");
+    send_copy_done(&mut stream);
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "COPY 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT note FROM docs WHERE id = 2 LIMIT 1");
+    let _cols = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row, vec![None], "note must round-trip as NULL, not \"\\N\"");
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+}
+
+/// COPY FROM STDIN の途中で Terminate（'X'）が届いた場合、CopyDone の 4 バイト
+/// 長さフィールドと対称に自身の長さフィールド（4 バイト固定・body 厳密に空）を
+/// 確実に消費すること（レビュー指摘: 消費しないと `post_auth_loop` がその
+/// 4 バイトを次のメッセージ種別バイトとして誤読しデシンクする）。本実装は
+/// Terminate 後も接続を維持したまま通常のクエリループへ戻る設計のため、
+/// Terminate 直後に送った通常クエリが正しく処理できることで消費を確認する。
+#[test]
+fn wire17_copy_from_stdin_terminate_mid_copy_consumes_length_prefix() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'terminate-mid-copy'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"1\t[1.0,0.0]\tja\n");
+    send_length_prefixed_message(&mut stream, b'X', b"");
+
+    // デシンクしていれば以降のメッセージが `08P01`／接続断・ハングのいずれかへ
+    // 化けるはずだが、正しく消費できていれば通常のクエリとして処理される。
+    send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
+    let _cols = read_row_description(&mut stream);
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(
+        tag, "SELECT 0",
+        "COPY was abandoned by Terminate, no row committed"
+    );
+    read_ready_for_query(&mut stream);
+}
+
+/// COPY FROM STDIN の途中で本文長 4 バイトを超える Flush（'H'）／Sync（'S'）が
+/// 届いた場合、宣言長ぶんの本文を読み捨てて消費すること（レビュー指摘:
+/// `validate_typed_message_length_prefix` は長さフィールドのみを検証し本文を
+/// 読まないため、`f`（CopyFail）分岐の `discard_bytes` と対称に読み捨てないと
+/// 未読バイトが残り後続メッセージを誤読する）。
+#[test]
+fn wire17_copy_from_stdin_flush_sync_with_body_are_fully_consumed() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'flush-sync-body'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"1\t[1.0,0.0]\tja\n");
+    // 通常の Flush／Sync は body 空だが、許容範囲（MIN_TYPED_MESSAGE_LEN..=
+    // MAX_MESSAGE_LEN）内で本文付きのものを送り、読み捨てを確認する。
+    send_length_prefixed_message(&mut stream, b'H', b"padding-body");
+    send_length_prefixed_message(&mut stream, b'S', b"padding-body");
+    send_copy_data(&mut stream, b"2\t[0.0,1.0]\tja\n");
+    send_copy_done(&mut stream);
+
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "COPY 2");
     read_ready_for_query(&mut stream);
 }
