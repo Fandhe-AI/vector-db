@@ -417,6 +417,10 @@ execute_delete`）・同一の台帳キー空間を共有する。`filter`（述
 `crates/wire-server/tests/nosql9_op_allowlist.rs`・`nosql1_op_vocabulary.rs`・
 `nosql12_update_delete.rs`・
 `crates/engine/tests/sql_update_delete_session_public_api.rs`。
+実バイナリ・無改造クライアント（psql・curl・urllib・fetch）経由での
+SQL 表層とのパリティ・RLS-9 応答同一性・台帳のプロセス・表層横断永続は
+層 B `three_client_http_e2e.rs::run_sql_nosql_dml_parity_scenario`
+（Issue #877）が検証する。
 
 ## `filter` 配列
 
