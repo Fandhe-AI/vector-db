@@ -35,8 +35,10 @@ Bind／Execute（Issue #934）・Parse／Describe（Issue #933）はいずれも
   Rust クライアント）でのバイナリ受信 e2e。psql は拡張クエリプロトコル
   未対応かつバイナリ結果を要求できないため層 B の対象クライアントから外れる。
 
-受け入れ条件 1（「バイナリを要求された列で返せる」）は、本 Issue では
-「エンコーダ層として返せる」までを達成範囲とする。
+本 Issue の実装範囲は WIRE-14 のうちエンコーダ層（バイナリ形式で応答を
+組み立てる部分）に限定し、wire 経由で実際にバイナリ形式を要求して値を
+受け取るところまでは対象外とする（詳細は spec のビヘイビア定義 WIRE-14
+参照）。
 
 ## 形式コードの列ごとの解決（`ResultFormats::resolve`）
 
@@ -71,14 +73,14 @@ PostgreSQL 本体は不正な format code 値を `22023` で返すが、本リ�
 
 | 列 | 公告 OID | バイナリ可否 | 根拠 |
 | --- | --- | --- | --- |
-| `ColumnMeta::Id` | numeric（1700） | **非対応 → `0A000`** | WIRE-14 は `NUMERIC` を非対応型としている。#895 で `int8` に変わったら対応する |
+| `ColumnMeta::Id` | numeric（1700） | **非対応 → `0A000`** | 実装上の判断（詳細は WIRE-14 参照）。#895 で `int8` に変わったら対応する |
 | `Scalar{ty: Text}` | text（25） | 対応（UTF-8 生バイト） | PostgreSQL の text send と同じ |
-| `Scalar{ty: Vector(_)}` | text（25） | **非対応 → `0A000`** | WIRE-14 は `VECTOR(N)` を非対応型としている。公告が text だからといって `[1,2.5]` の文字列をそのまま送らない |
-| `ColumnMeta::Computed` | text（25） | **非対応 → `0A000`（fail-closed）** | 実行時の型（Float／Bool／Vector）が静的に決まらず、事前検査で `VECTOR` を除外できない。#895 で型が付いたら見直す |
+| `Scalar{ty: Vector(_)}` | text（25） | **非対応 → `0A000`** | 実装上の判断（詳細は WIRE-14 参照）。公告が text だからといって `[1,2.5]` の文字列をそのまま送らない |
+| `ColumnMeta::Computed` | text（25） | **非対応 → `0A000`（fail-closed）** | 実行時の型（Float／Bool／Vector）が静的に決まらず、事前検査で `VECTOR` を除外できないための fail-closed 判断。#895 で型が付いたら見直す |
 
-**`VECTOR` 列のバイナリ表現（受け入れ条件 3）**: spec（SSOT）の WIRE-14 に
-従い「バイナリ非対応として `0A000` で拒否する」を決定とする。独自のバイナリ
-表現（float4 配列など）は定義しない。
+**`VECTOR` 列のバイナリ表現**: 本実装ではバイナリ非対応として `0A000` で
+拒否する（独自のバイナリ表現〔float4 配列など〕は定義しない。詳細は
+spec のビヘイビア定義 WIRE-14 参照）。
 
 `WireType::supports_binary`（`Id`／`Text` の型そのものの対応可否）と
 `column_binary_support`（列種別を見た最終判定。`Vector`／`Computed` の
@@ -107,7 +109,7 @@ PostgreSQL の send 関数と同じレイアウトで 8 型のバイナリ表現
 `encode_data_row` は「全列テキスト」でこれらを呼ぶ薄いラッパーへ変更した。
 生成バイト列は完全に同一であることを不変性テスト（`row_description_with_
 all_text_formats_matches_legacy_encoder`・`data_row_with_all_text_formats_
-matches_legacy_encoder`）で固定している（受け入れ条件 4）。シグネチャは
+matches_legacy_encoder`）で固定している。シグネチャは
 変えていないため破壊的変更ではない。
 
 `formats.len()` が列数／セル数と一致しない場合は呼び出し元の内部不整合と
