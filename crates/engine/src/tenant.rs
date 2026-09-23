@@ -321,6 +321,16 @@ pub enum TenantWriteError {
     /// 丸めてしまい、クライアントに誤った再試行判断を誘発する）。専用 variant として
     /// 分離し `XX000`（内部事象）へ固定する。
     CapturedRowDecodeFailed(String),
+    /// 述語つき `UPDATE`／`DELETE ... WHERE`（[`enumerate_dml_candidates`]）の
+    /// 候補列挙が、テーブル全体を `.iter()` で走査する構造上 [`MAX_SCANNED_ROWS`]
+    /// を超える総走査行数（可視・不可視・他テナント所有を問わない）に達した
+    /// （codex-review P1 指摘・PR #993 系・Issue #871。一致行数の上限
+    /// （[`PredicateDmlOutcome::LimitExceeded`]）とは独立: 一致しない述語では
+    /// 一致件数上限に到達しないまま任意規模の全表走査が繰り返せてしまう経路を
+    /// 塞ぐ。[`visible_rows`] の `TooManyRowsScanned` と同じ「部分結果を返さず
+    /// fail-closed に拒否する」判断。`write_txn` は commit せず破棄する（行・
+    /// 台帳とも痕跡ゼロ）ため `54000`（`PayloadTooLarge`）へ写像する。
+    TooManyRowsScanned,
 }
 
 impl TenantWriteError {
@@ -353,6 +363,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::ReturningProjectionFailed(_) => ErrorClass::InternalError,
             TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,
             TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
+            TenantWriteError::TooManyRowsScanned => ErrorClass::PayloadTooLarge,
         }
     }
 
@@ -396,6 +407,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::CapturedRowDecodeFailed(_) => {
                 write!(f, "tenant write captured row decode failed")
             }
+            TenantWriteError::TooManyRowsScanned => {
+                write!(f, "too many rows scanned: limit={MAX_SCANNED_ROWS}")
+            }
         }
     }
 }
@@ -426,6 +440,7 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::CapturedRowDecodeFailed(_) => {
                 f.write_str("CapturedRowDecodeFailed(<redacted>)")
             }
+            TenantWriteError::TooManyRowsScanned => f.write_str("TooManyRowsScanned"),
         }
     }
 }
@@ -2369,6 +2384,15 @@ pub(crate) struct DmlCandidate<'a> {
 /// `limit + 1` 件に達するまで `Vec` へ蓄積する（早期終了。行データそのもの
 /// は複製せず `id` のみを保持する）。
 ///
+/// テナント名前空間内の走査は [`visible_rows`] と同じ総走査行数上限
+/// （[`MAX_SCANNED_ROWS`]。可視・不可視・他テナント所有を問わず 1 行デコード
+/// するたびに加算する）を適用する（codex-review P1 指摘・Issue #871）。`limit`
+/// （一致行数上限）は述語に一致した行にしか効かないため、一致しない述語では
+/// `limit` に到達しないまま任意規模の全表走査を繰り返せてしまう経路を、この
+/// 独立した総走査上限で塞ぐ。超過時は [`TenantWriteError::TooManyRowsScanned`]
+/// で部分結果を返さず fail-closed に拒否し、呼び出し元が `write_txn` を
+/// commit せず破棄することで副作用ゼロを保つ。
+///
 /// `predicate` が `Err(e)` を返した場合はその時点で呼び出し元へ伝播する
 /// （呼び出し元が `write_txn` を破棄することで副作用ゼロを保つ）。
 fn enumerate_dml_candidates<E>(
@@ -2380,6 +2404,11 @@ fn enumerate_dml_candidates<E>(
 ) -> Result<Vec<u64>, PredicateDmlError<E>> {
     let mut candidate_ids: Vec<u64> = Vec::new();
     let mut embedding_scratch: Vec<f32> = Vec::new();
+    // 総走査行数（可視・不可視・他テナント所有を問わない）。`visible_rows` の
+    // `MAX_SCANNED_ROWS` と同じ計算量 DoS 対策（codex-review P1 指摘・Issue #871）:
+    // 一致行数の上限（`limit`）は述語に一致した行にしか効かないため、一致しない
+    // 述語では上限に到達しないまま任意規模の全表走査を繰り返せてしまう。
+    let mut scanned: usize = 0;
 
     // `execute_scan`／`execute_aggregate` と同じくテーブル全体を `.iter()` で
     // 走査し、テナント**所有**スコープの判定は物理走査中の `ctx.is_owner`
@@ -2390,6 +2419,14 @@ fn enumerate_dml_candidates<E>(
         .iter()
         .map_err(|e| dml_write_err(CatalogError::from(e)))?
     {
+        scanned = scanned.saturating_add(1);
+        if scanned > MAX_SCANNED_ROWS {
+            // 部分結果を返さず fail-closed に拒否する（`visible_rows` と同じ判断）。
+            // 呼び出し元（`delete_rows_where_unchecked`／`update_rows_where_unchecked`）
+            // は `write_txn` を commit せず破棄するため、行・台帳のいずれにも
+            // 痕跡が残らない。
+            return Err(dml_write_err(TenantWriteError::TooManyRowsScanned));
+        }
         let (k, v) = entry.map_err(|e| dml_write_err(CatalogError::from(e)))?;
         let (key_tenant, id) = k.value();
         let buf = v.value();

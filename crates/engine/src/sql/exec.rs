@@ -2855,6 +2855,14 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
         TenantWriteError::ReturningProjectionTooLarge(_) => {
             SqlSurfaceError::payload_too_large("RETURNING result exceeds capacity")
         }
+        // 述語つき UPDATE/DELETE の候補列挙（`tenant::enumerate_dml_candidates`）が
+        // 総走査行数上限（`tenant::MAX_SCANNED_ROWS`）に達した（codex-review P1
+        // 指摘・Issue #871）。`_` 節（`XX000`）へ丸めると、一致件数上限超過
+        // （`PredicateDmlOutcome::LimitExceeded` 由来の `54000`）と別コードに
+        // なってしまい、クライアントが同種の「上限超過」を判別できなくなる。
+        TenantWriteError::TooManyRowsScanned => {
+            SqlSurfaceError::payload_too_large("too many rows scanned")
+        }
         // 同じく commit 前 abort の内部事象版（型不整合等。untrusted 入力起因では
         // ないため `XX000`。`_` 節と同じ分類だが意図を明示する）。
         TenantWriteError::ReturningProjectionFailed(_) => SqlSurfaceError::Internal {

@@ -15,10 +15,13 @@ use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::recovery::required_op_id::OperationId;
+use engine::row_codec::{encode_scalar_columns, Value};
 use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
 use engine::sql::SqlOutcome;
-use engine::storage::{Storage, Visibility};
+use engine::storage::{RowInput, Storage, Visibility};
+use engine::tenant;
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
@@ -596,5 +599,140 @@ fn predicate_update_over_limit_is_rejected_with_no_side_effects() {
         ),
     )
     .expect_err("resend of an unrecorded operation_id must be the same over-limit rejection");
+    assert_eq!(err_again.wire_code(), "54000");
+}
+
+/// [`enumerate_dml_candidates`]（`UPDATE`／`DELETE` 両経路が共有する候補列挙本体。
+/// `crate::tenant`）の総走査行数上限（`tenant::MAX_SCANNED_ROWS`＝1,000,000。
+/// `visible_rows` と同じ値・同じ判断）が独立して効くことを固定する
+/// （codex-review P1 指摘・Issue #871）。一致件数上限（`MAX_DML_AFFECTED_ROWS`）は
+/// 述語に一致した行にしか作用しないため、一致行が 0 件のままだと `limit` には
+/// 到達しない。この総走査上限が無いと、他テナントを含む任意規模の全表走査を
+/// 単一 writer を占有したまま繰り返せてしまう。
+///
+/// 走査対象の投入は `crate::tenant::insert_rows` の単一バッチ呼び出しで行う
+/// （SQL `INSERT` を 1,000,001 回ループさせると本テストが極端に重くなるため。
+/// `insert_row` ヘルパーとは異なる bulk 経路だが、書き込み認可
+/// （`PolicyContext::is_owner`）・`operation_id` 必須化ガードは同一）。
+/// `tenant::insert_rows` は `&Storage` を取るため、`EngineCore::from_storage`
+/// （所有権を奪う）へ渡す**前**に呼び出す必要がある（`scan_stage_profile_accept.rs`
+/// の `seed_storage` と同じ順序）。
+fn new_core_with_bulk_seeded_table(
+    ctx: &PolicyContext,
+    table: &str,
+    n: u64,
+) -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path("sql-predicate-dml-exec-scan-limit");
+    let storage = Storage::open(&path).expect("open storage");
+    let table_schema = schema(table);
+    storage.create_table(&table_schema).expect("create table");
+
+    let embedding = vec![1.0f32, 0.0f32];
+    // `WHERE lang = 'zzz-nomatch'` に一致しない固定値。全走査中ずっと述語が
+    // 偽のまま推移し、`MAX_DML_AFFECTED_ROWS`（一致件数上限）ではなく
+    // `MAX_SCANNED_ROWS`（総走査行数上限）を先に踏むことを保証する。
+    let metadata = encode_scalar_columns(
+        &table_schema,
+        &[
+            Value::Vector(embedding.clone()),
+            Value::Text("never-matches".to_string()),
+            Value::Text("body".to_string()),
+        ],
+    )
+    .expect("encode_scalar_columns");
+    let rows: Vec<(u64, RowInput<'_>)> = (1..=n)
+        .map(|id| {
+            (
+                id,
+                RowInput {
+                    tenant_id: ctx.tenant_id(),
+                    visibility: Visibility::Public,
+                    embedding: &embedding,
+                    metadata: &metadata,
+                },
+            )
+        })
+        .collect();
+    let op_id = OperationId::parse("seed-bulk-scan-limit").expect("valid operation_id");
+    tenant::insert_rows(&storage, table, ctx, &rows, &op_id).expect("bulk seed rows");
+
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        path,
+    )
+}
+
+/// 総走査行数上限超過時、`DELETE ... WHERE` は `54000` で拒否され副作用ゼロ
+/// （行不変・台帳未記録＝再送しても再び `54000`）のまま終端する。
+#[test]
+fn predicate_delete_over_scan_limit_is_rejected_with_no_side_effects() {
+    let alice = ctx_for("alice", true);
+    // `tenant::MAX_SCANNED_ROWS`（1,000,000）を 1 件超える総走査行数。
+    let total_rows: u64 = 1_000_001;
+    let (core, path) = new_core_with_bulk_seeded_table(&alice, TABLE, total_rows);
+    let _guard = CleanupGuard(path);
+    assert_eq!(count_star(&core, &alice, TABLE), total_rows);
+
+    let err = execute(
+        &core,
+        &alice,
+        &format!(
+            "DELETE FROM {TABLE} WHERE lang = 'zzz-nomatch' USING OPERATION_ID 'op-scan-limit-del'"
+        ),
+    )
+    .expect_err("over-scan-limit predicate DELETE must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+    // 副作用ゼロ: 行数不変・台帳未記録（同一 operation_id を再送しても再び
+    // 54000 になる。23505/22023 にはならない＝台帳に痕跡が残っていない）。
+    assert_eq!(count_star(&core, &alice, TABLE), total_rows);
+    let err_again = execute(
+        &core,
+        &alice,
+        &format!(
+            "DELETE FROM {TABLE} WHERE lang = 'zzz-nomatch' USING OPERATION_ID 'op-scan-limit-del'"
+        ),
+    )
+    .expect_err("resend of an unrecorded operation_id must be the same over-scan-limit rejection");
+    assert_eq!(err_again.wire_code(), "54000");
+}
+
+/// 総走査行数上限超過時、`UPDATE ... WHERE` も [`enumerate_dml_candidates`]
+/// を共有するため同じ契約（`54000`・副作用ゼロ・台帳未記録）となる。
+#[test]
+fn predicate_update_over_scan_limit_is_rejected_with_no_side_effects() {
+    let alice = ctx_for("alice", true);
+    let total_rows: u64 = 1_000_001;
+    let (core, path) = new_core_with_bulk_seeded_table(&alice, TABLE, total_rows);
+    let _guard = CleanupGuard(path);
+    assert_eq!(count_star(&core, &alice, TABLE), total_rows);
+
+    let err = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET lang = 'fr' WHERE lang = 'zzz-nomatch' USING OPERATION_ID 'op-scan-limit-upd'"
+        ),
+    )
+    .expect_err("over-scan-limit predicate UPDATE must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(count_star(&core, &alice, TABLE), total_rows);
+    let unchanged = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT COUNT(*) FROM {TABLE} WHERE lang = 'fr'"),
+        )
+        .expect("count(*) should succeed");
+    match &unchanged.rows[0].cells[0] {
+        Cell::Integer(v) => assert_eq!(*v, 0, "no row should have been updated to lang = 'fr'"),
+        other => panic!("expected Cell::Integer, got {other:?}"),
+    }
+    let err_again = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET lang = 'fr' WHERE lang = 'zzz-nomatch' USING OPERATION_ID 'op-scan-limit-upd'"
+        ),
+    )
+    .expect_err("resend of an unrecorded operation_id must be the same over-scan-limit rejection");
     assert_eq!(err_again.wire_code(), "54000");
 }

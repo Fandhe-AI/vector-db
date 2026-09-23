@@ -102,6 +102,14 @@ execute_scan` の走査ループと同一の意味論（`declarative_filter::mat
   `is_owner` 判定による除外で満たされるが、走査・デコードそのものの回避は
   性能上の最適化課題であり本 Issue のスコープ外（§9「スカラー列二次索引
   による候補削減の適用」参照）。
+- `enumerate_dml_candidates` は総走査行数（可視・不可視・他テナント所有を
+  問わない）に独立した上限（`tenant::MAX_SCANNED_ROWS`。`visible_rows` と
+  共有する同一値）を適用する（codex-review P1 指摘）。影響行数上限
+  （`MAX_DML_AFFECTED_ROWS`）は述語に一致した行にしか作用しないため、
+  一致行が 0 件のまま推移する述語では認証済みテナントが単一 writer を
+  占有したまま任意規模の全表走査を繰り返せてしまう経路があり、この総走査
+  上限で塞ぐ。超過時は `TenantWriteError::TooManyRowsScanned`（`54000`）で
+  副作用ゼロ（`write_txn` を commit せず破棄）のまま終端する。
 
 `WHERE visible() のみ` の述語つき DELETE は #870 の既存決定（自テナント全行を候補
 にする。歯止めは影響行数上限のみ）をそのまま継承し、本 Issue で再決定していない
