@@ -4361,7 +4361,6 @@ impl EngineCore {
     }
 
     /// SQL 表層のバッチ INSERT 実行エントリポイント（TASK-122、対象ビヘイビア:
-    /// SQL 表層のバッチ INSERT 実行エントリポイント（TASK-122、対象ビヘイビア:
     /// INDEX-4）。[`Self::execute_insert_sql`] の複数ファイル版で、複数ファイルを
     /// 1 バッチとして受け取る engine ローカル API の入口（1 文 = 1 ファイルの
     /// 検証済み `INSERT` 文の列（`sqls`）を 1 バッチとして受け取る。行形の

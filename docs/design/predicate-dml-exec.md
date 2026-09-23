@@ -48,7 +48,7 @@ ADR §4 のレイアウトをそのまま `crates/engine/src/recovery/content_ha
    許可リスト専用。`grep -n '"0A000"' crates/engine/src/sql/allowlist.rs` で不在を
    確認済み）。
 
-その他のレイアウト（`OpTag::UpdateWhere = 8`／`DeleteWhere = 9`・`SET` 割当の宣言順
+その他のレイアウト（`OpTag::UpdateWhere = 9`／`DeleteWhere = 10`・`SET` 割当の宣言順
 直列化・`WHERE` 述語の種別タグ付き直列化・`Expr` のタグ付き前置順直列化・参照 UDF
 定義セクションの推移閉包・WASM UDF 呼び出しの拒否判定順序）は ADR §4.3／§4.4／
 §4.4.1 のとおり実装した。
