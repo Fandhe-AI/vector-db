@@ -14,9 +14,6 @@ mod common;
 #[path = "http_common/mod.rs"]
 mod http_common;
 
-#[path = "../../engine/src/test_util/temp_db.rs"]
-mod temp_db;
-
 use std::sync::Arc;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -25,6 +22,9 @@ use engine::kernel::CpuScalarProvider;
 use engine::storage::Storage;
 
 use common::*;
+// `temp_db` は `http_common` が `pub mod temp_db;` として再エクスポートする
+// ため、ここでは独自に `mod temp_db;` を宣言しない（clippy::duplicate_mod 回避）。
+use http_common::temp_db;
 
 fn new_core_with_metrics_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("wire-float-columns-metrics");
