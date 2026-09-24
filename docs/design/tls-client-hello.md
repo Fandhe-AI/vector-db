@@ -25,10 +25,12 @@ HelloRetryRequest（HRR）の組み立てを担う純粋関数層
 - #964（transcript hash）: HRR 時の `message_hash` 置換
 - #955（X25519）: 共有秘密の計算・全ゼロ検出。本モジュールは client
   公開鍵 32 バイトを取り出して渡すだけ
-- #959／#965（0-RTT）: `early_data` を無視した場合の早期
-  application_data レコードの破棄。本モジュールは PSK／0-RTT を受理せず、
-  `pre_shared_key`・`psk_key_exchange_modes` は RFC 8446 §4.2.11・§4.2.9
-  の MUST（位置・併存）だけを検査し中身は解釈しない
+- #959／#965（0-RTT）: PSK を受理しない結果としての早期 application_data
+  レコードの破棄。本モジュールは PSK／0-RTT を受理しないが、これは
+  `pre_shared_key`・`psk_key_exchange_modes`・`early_data` の中身の
+  「意味」を解釈しない（PSK を選択しない・ticket を検証しない）という
+  意味であり、構造検証はすべて行う（「無視する拡張・受理しないもの」節
+  参照）
 - 通常の（HRR でない）`ServerHello` の組み立て（サーバー鍵を含む）は
   #965 が #955 の鍵生成と組み合わせて行う
 
@@ -109,9 +111,37 @@ RFC 8446 §4.1.2 に従い次を検証する:
 
 ## 無視する拡張・受理しないもの
 
-- 未知の拡張（GREASE 値・`early_data` を含む）は中身を見ずに無視する
-- PSK／0-RTT は受理しない（`pre_shared_key`・`psk_key_exchange_modes` の
-  構造制約のみ検査し、値は解釈しない）
+- **未知の拡張**（対象 5 拡張・`pre_shared_key`・`psk_key_exchange_modes`・
+  `early_data` のいずれでもない拡張。GREASE 値を含む）は
+  `extension_type`／`extension_data` の中身を一切見ずに無視する
+  （`parse_extensions` の `_ =>` 分岐）
+- `early_data` は未知の拡張ではなく、`parse_extensions` が構造まで検証する
+  **既知の拡張**である（下記）
+- PSK／0-RTT そのものは受理しない（受理判定に使わない・0-RTT データを
+  送出しない）。ただし「受理しない」は「構造を見ない」という意味ではない
+  （codex-review PR #1022 P0・P2 指摘。以下は `parse_extensions` が
+  `pre_shared_key`／`psk_key_exchange_modes`／`early_data` それぞれについて
+  行う構造検証。値の意味解釈（PSK の選択・ticket の検証）はいずれも
+  行わない）:
+  - `pre_shared_key`（RFC 8446 §4.2.11）: `identities<7..2^16-1>`・
+    `binders<33..2^16-1>` の 2 ベクタを最後まで読み進め、各エントリの
+    境界（`identity<1..2^16-1>`・`obfuscated_ticket_age` 4 バイト・
+    `binder<32..255>`）・`identities` と `binders` の件数一致・拡張全体の
+    終端（余剰バイト無し）を検証する（`parse_pre_shared_key`）。加えて
+    最後の拡張であること（§4.2.11 の MUST）・`psk_key_exchange_modes` の
+    併存（§4.2.9 の MUST）も検査する
+  - `psk_key_exchange_modes`（RFC 8446 §4.2.9）: `ke_modes<1..255>` の
+    ベクタ境界・終端を検証する（`validate_psk_key_exchange_modes`）。
+    個々の `PskKeyExchangeMode` 値は解釈しない（拡張可能な列挙のため）
+  - `early_data`（RFC 8446 §4.2.10）: ClientHello 内の本体は `Empty` 型
+    （0 バイト）でなければならないことを検証する
+    （`validate_client_hello_early_data`）。加えて `pre_shared_key` との
+    併存（§4.2.10 の MUST）も検査する
+- `server_name` の `host_name`（name_type=0）は RFC 6066 §3 の DNS
+  ホスト名構文（ASCII・全長 1..=253 バイト・末尾ドット禁止・IPv4/IPv6
+  literal 禁止・各ラベル 1..=63 バイト・空ラベル禁止・英数字とハイフンの
+  みで先頭/末尾ハイフン禁止）まで検証してから
+  `NegotiatedClientHello::server_name` へ渡す（`validate_host_name`）
 
 ## HelloRetryRequest の組み立て
 
