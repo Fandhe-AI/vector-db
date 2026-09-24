@@ -19,6 +19,11 @@ use wire_server::auth::{argon2id, base64_std, scram, UserStore};
 
 const TEST_PARAMS: argon2id::Params = argon2id::RECOMMENDED_PARAMS;
 
+/// テスト専用のモック鍵秘密（Issue #940 PR #1006・P0 是正）。実運用の
+/// `--scram-mock-key-file` に相当し、ユーザーストアの内容から独立している
+/// ことのみが契約なので値そのものに意味はない（32 バイト以上）。
+const TEST_SCRAM_MOCK_KEY_SECRET: &[u8] = b"wire-scram-auth-test-mock-key-secret!!";
+
 static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// `wire_auth.rs::write_user_store_file` と同じ設計（ユニークな一時ディレクトリ・
@@ -70,7 +75,7 @@ fn write_scram_user_store_file(records: &[(&str, &str, Option<&[u8]>)]) -> std::
 fn spawn_scram_server_accepting_one(users_path: &std::path::Path) -> std::net::SocketAddr {
     let store = UserStore::load_from_file(users_path)
         .expect("valid user store")
-        .require_scram()
+        .require_scram(TEST_SCRAM_MOCK_KEY_SECRET)
         .expect("all records must carry scram verifiers");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
@@ -642,7 +647,7 @@ fn wire_scram_unknown_user_mock_salt_is_stable_across_connections() {
         write_scram_user_store_file(&[("alice", "tenant-a", Some(password.as_slice()))]);
     let store = UserStore::load_from_file(&users_path)
         .expect("valid user store")
-        .require_scram()
+        .require_scram(TEST_SCRAM_MOCK_KEY_SECRET)
         .expect("all records must carry scram verifiers");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");

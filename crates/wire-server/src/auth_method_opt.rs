@@ -16,6 +16,20 @@ use crate::auth::AuthMethod;
 /// `--auth-method` の CLI フラグ名。
 pub const FLAG: &str = "--auth-method";
 
+/// `--scram-mock-key-file` の CLI フラグ名（Issue #940 PR #1006・P0 是正）。
+/// `--auth-method scram-sha-256` を選んだときのみ必須の opt-in。値は
+/// ファイルパスで、その生バイト列（32 バイト以上）を
+/// [`crate::auth::UserStore::require_scram`] のモック鍵導出用秘密として渡す。
+/// ユーザーストアの内容（ServerKey・行順）から独立した秘密であることが
+/// 唯一の契約であり、`--auth-method cleartext`（既定）との組合せ・値欠落・
+/// 短すぎるファイル・2 回目以降の指定はいずれも fail-closed（`main.rs` 側で
+/// 検証する。本モジュールはフラグ名の単一情報源のみを持つ）。
+pub const SCRAM_MOCK_KEY_FILE_FLAG: &str = "--scram-mock-key-file";
+
+/// [`SCRAM_MOCK_KEY_FILE_FLAG`] が受理するファイル内容の最小バイト数
+/// （`scram::KEY_LEN` と同値。十分なエントロピーを要求する）。
+pub const SCRAM_MOCK_KEY_FILE_MIN_LEN: usize = crate::auth::scram::KEY_LEN;
+
 /// `--auth-method` が受理する語彙（順序はエラーメッセージの一覧順・
 /// README 記載順の単一情報源）。
 pub const TOKENS: [&str; 2] = ["cleartext", "scram-sha-256"];

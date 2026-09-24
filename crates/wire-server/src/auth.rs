@@ -89,14 +89,20 @@ pub struct UserStore {
     users: HashMap<String, UserRecord>,
     auth_method: AuthMethod,
     /// 未知ユーザー向けモック検証子（[`scram::mock_verifier`]）の鍵。
-    /// ロード済み全レコードの ServerKey を連結してドメインタグ付きで
-    /// ハッシュした値（再起動しても安定。ファイル行順に依存するため
-    /// ユーザーストアの変更前後でモック salt が変わり得る点は既知の制約
-    /// として README に記録する）。SCRAM 検証子を 1 つも持たないストアでも
-    /// 決定的な値を持つ（`ScramSha256` モードでは `require_scram` が
-    /// 全レコードへの検証子付与を強制するため、実運用でこの分岐に頼るのは
-    /// 検証子が 1 つも無い特殊なストアのみ）。
-    scram_mock_key: [u8; scram::KEY_LEN],
+    ///
+    /// P0 review 指摘（Issue #940 PR #1006）: 以前はロード済み全レコードの
+    /// ServerKey をファイル行順に連結して導出していたが、ユーザーストアの
+    /// 追加・削除・並べ替えや検証子更新の前後でこの値が変化してしまい、
+    /// 更新前後の `server-first` の salt を観測できるクライアントに
+    /// 未知ユーザーの登録有無を推測させる存在オラクルになっていた
+    /// （テナント境界: エラー時の存在情報漏えい違反）。修正後は
+    /// `UserStore::require_scram` の呼び出し元（`main.rs` の
+    /// `--scram-mock-key-file`）が渡す、ユーザーレコード集合から独立した
+    /// 外部秘密（プロセス再起動・ストア更新をまたいで運用者が同じ値を
+    /// 与え続ける限り不変）からのみ導出する。`Cleartext` モードでは
+    /// `None`（このフィールドを参照する `authenticate_scram` は
+    /// `ScramSha256` のときにしか呼ばれない）。
+    scram_mock_key: Option<[u8; scram::KEY_LEN]>,
 }
 
 /// [`UserStore::load_from_file`] のロード時検証エラー（fail-closed。起動を中断する）。
@@ -204,9 +210,6 @@ impl UserStore {
     pub fn load_from_file(path: &Path) -> Result<Self, LoadError> {
         let content = std::fs::read_to_string(path)?;
         let mut users = HashMap::new();
-        // モック鍵導出（`scram::mock_verifier`）の入力。ファイル行順に集める
-        // （HashMap の反復順に依存しない決定的な順序にするため）。
-        let mut server_keys_for_mock: Vec<[u8; scram::KEY_LEN]> = Vec::new();
 
         for (idx, raw_line) in content.lines().enumerate() {
             let line_no = idx + 1;
@@ -292,7 +295,6 @@ impl UserStore {
                     {
                         return Err(LoadError::InvalidScramVerifier { line: line_no });
                     }
-                    server_keys_for_mock.push(verifier.server_key);
                     Some(verifier)
                 }
             };
@@ -312,11 +314,10 @@ impl UserStore {
             }
         }
 
-        let scram_mock_key = derive_scram_mock_key(&server_keys_for_mock);
         Ok(Self {
             users,
             auth_method: AuthMethod::default(),
-            scram_mock_key,
+            scram_mock_key: None,
         })
     }
 
@@ -326,7 +327,14 @@ impl UserStore {
     /// Argon2id の PHC を一切照合に使わないため、検証子を欠くレコードは
     /// 恒久的にログイン不能になる、というだけでなく、そのレコードだけ
     /// モック相当の扱いになりタイミング対称性が崩れるのを未然に防ぐ）。
-    pub fn require_scram(mut self) -> Result<Self, LoadError> {
+    ///
+    /// `mock_key_secret`（P0 review 指摘・Issue #940 PR #1006）: 未知
+    /// ユーザー向けモック検証子の鍵をここから導出する外部秘密。ユーザー
+    /// レコード集合から独立しており、`--scram-mock-key-file`（`main.rs`）が
+    /// 読んだファイルの生バイト列をそのまま渡す契約。運用者が同じ秘密
+    /// ファイルを使い続ける限り、ユーザーストアの追加・削除・並べ替えや
+    /// 検証子更新の前後でモック salt は変化しない（存在オラクル対策）。
+    pub fn require_scram(mut self, mock_key_secret: &[u8]) -> Result<Self, LoadError> {
         let mut usernames: Vec<&String> = self.users.keys().collect();
         usernames.sort();
         for username in usernames {
@@ -342,6 +350,7 @@ impl UserStore {
             }
         }
         self.auth_method = AuthMethod::ScramSha256;
+        self.scram_mock_key = Some(derive_scram_mock_key(mock_key_secret));
         Ok(self)
     }
 
@@ -351,9 +360,11 @@ impl UserStore {
         self.auth_method
     }
 
-    /// モック検証子の鍵（[`scram::mock_verifier`] へ渡す）。
-    pub fn scram_mock_key(&self) -> &[u8; scram::KEY_LEN] {
-        &self.scram_mock_key
+    /// モック検証子の鍵（[`scram::mock_verifier`] へ渡す）。`Cleartext`
+    /// モードや（構造的に到達しないはずだが）`require_scram` 未経由の
+    /// `ScramSha256` では `None`。
+    pub fn scram_mock_key(&self) -> Option<&[u8; scram::KEY_LEN]> {
+        self.scram_mock_key.as_ref()
     }
 
     /// SCRAM 認証向けの照合情報を返す。ユーザーが存在しない、または
@@ -392,20 +403,20 @@ impl UserStore {
         Self {
             users,
             auth_method: AuthMethod::default(),
-            scram_mock_key: derive_scram_mock_key(&[]),
+            scram_mock_key: None,
         }
     }
 }
 
-/// [`UserStore::scram_mock_key`] の導出（ロード済み全 ServerKey をファイル行順に
-/// 連結し、ドメインタグ付きで SHA-256 する）。ServerKey が 1 つも無い場合
-/// （SCRAM 検証子を含まないストア）でもドメインタグのみから決定的な値を返す。
-fn derive_scram_mock_key(server_keys: &[[u8; scram::KEY_LEN]]) -> [u8; scram::KEY_LEN] {
-    let mut input = Vec::with_capacity(32 + server_keys.len() * scram::KEY_LEN);
-    input.extend_from_slice(b"vector-db/scram/mock-key/v1");
-    for key in server_keys {
-        input.extend_from_slice(key);
-    }
+/// [`UserStore::scram_mock_key`] の導出（P0 review 指摘・Issue #940 PR #1006 で
+/// 再設計）。ユーザーレコード集合から独立した外部秘密（`--scram-mock-key-file`
+/// の生バイト列）にドメインタグを付けて SHA-256 するのみで、ユーザーストアの
+/// 内容（ServerKey・行順）を一切参照しない。同じ秘密ファイルを使い続ける限り
+/// ストア更新・プロセス再起動をまたいで安定する（存在オラクル対策）。
+fn derive_scram_mock_key(secret: &[u8]) -> [u8; scram::KEY_LEN] {
+    let mut input = Vec::with_capacity(32 + secret.len());
+    input.extend_from_slice(b"vector-db/scram/mock-key/v2");
+    input.extend_from_slice(secret);
     engine::crypto::sha256::digest(&input)
 }
 
@@ -1016,7 +1027,7 @@ mod tests {
             &format!("alice:tenant-a:{}\n", dummy_phc()),
         );
         let store = UserStore::load_from_file(&path).expect("load");
-        let result = store.require_scram();
+        let result = store.require_scram(b"test-secret-at-least-32-bytes!!");
         assert!(matches!(
             result,
             Err(LoadError::MissingScramVerifier { username }) if username == "alice"
@@ -1029,21 +1040,73 @@ mod tests {
         let line = sample_scram_line("alice", "tenant-a", b"correct-horse");
         let path = write_users_file_with_content("all-verified", &format!("{line}\n"));
         let store = UserStore::load_from_file(&path).expect("load");
-        let store = store.require_scram().expect("all records have verifiers");
+        let store = store
+            .require_scram(b"test-secret-at-least-32-bytes!!")
+            .expect("all records have verifiers");
         assert_eq!(store.auth_method(), AuthMethod::ScramSha256);
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 未知ユーザー向けモック鍵から導出する salt は、同一ユーザー名なら
-    /// 同一ファイルの再ロードをまたいでも安定する（RFC 5802 の salt が
-    /// 再接続で変わらない性質と対称）。
+    /// 未知ユーザー向けモック鍵から導出する salt は、同一ファイルの
+    /// 再ロードをまたいでも安定する（RFC 5802 の salt が再接続で変わらない
+    /// 性質と対称）。
     #[test]
     fn scram_mock_key_is_stable_across_reloads_of_same_file() {
         let line = sample_scram_line("alice", "tenant-a", b"correct-horse");
         let path = write_users_file_with_content("mock-stable", &format!("{line}\n"));
-        let store1 = UserStore::load_from_file(&path).expect("load 1");
-        let store2 = UserStore::load_from_file(&path).expect("load 2");
+        let secret = b"test-secret-at-least-32-bytes!!";
+        let store1 = UserStore::load_from_file(&path)
+            .expect("load 1")
+            .require_scram(secret)
+            .expect("require_scram 1");
+        let store2 = UserStore::load_from_file(&path)
+            .expect("load 2")
+            .require_scram(secret)
+            .expect("require_scram 2");
         assert_eq!(store1.scram_mock_key(), store2.scram_mock_key());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// P0 review 指摘の再発防止（Issue #940 PR #1006）: モック鍵はユーザー
+    /// レコード集合から独立しているため、同じ秘密ファイルを使う限り
+    /// ユーザーストアの内容（行の追加・削除・並べ替え・検証子の更新）が
+    /// 変わってもモック鍵は不変であること。
+    #[test]
+    fn scram_mock_key_is_independent_of_user_store_contents() {
+        let secret = b"test-secret-at-least-32-bytes!!";
+
+        let line_a = sample_scram_line("alice", "tenant-a", b"correct-horse");
+        let path_a = write_users_file_with_content("mock-indep-a", &format!("{line_a}\n"));
+        let store_a = UserStore::load_from_file(&path_a)
+            .expect("load a")
+            .require_scram(secret)
+            .expect("require_scram a");
+
+        // 別のユーザー（レコード数・ServerKey・行順いずれも異なる）を持つ
+        // 別ファイルでも、同じ `mock_key_secret` を渡せば同じモック鍵になる。
+        let line_b1 = sample_scram_line("alice", "tenant-a", b"correct-horse");
+        let line_b2 = sample_scram_line("bob", "tenant-b", b"another-password");
+        let path_b =
+            write_users_file_with_content("mock-indep-b", &format!("{line_b1}\n{line_b2}\n"));
+        let store_b = UserStore::load_from_file(&path_b)
+            .expect("load b")
+            .require_scram(secret)
+            .expect("require_scram b");
+
+        assert_eq!(store_a.scram_mock_key(), store_b.scram_mock_key());
+
+        // 秘密が異なれば当然モック鍵も異なる（弁別可能でなければ列挙耐性の
+        // 検証自体ができない）。
+        let store_a_other_secret = UserStore::load_from_file(&path_a)
+            .expect("load a (reload)")
+            .require_scram(b"different-secret-at-least-32-b!")
+            .expect("require_scram a (other secret)");
+        assert_ne!(
+            store_a.scram_mock_key(),
+            store_a_other_secret.scram_mock_key()
+        );
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
     }
 }

@@ -70,7 +70,8 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
   [--hnsw-acorn-max-visible-ratio <num>/<den>] \
   [--hnsw-sparse-visited-max <N>] \
   [--durability immediate|none] \
-  [--auth-method cleartext|scram-sha-256]
+  [--auth-method cleartext|scram-sha-256] \
+  [--scram-mock-key-file <path>]
 ```
 
 `--users`・`--db` はいずれも必須です（省略時は匿名ログイン・匿名 DB を暗黙生成せず
@@ -235,6 +236,17 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
 - TLS（TASK-72・WIRE-9）は未実装のため、channel binding
   （`SCRAM-SHA-256-PLUS`・`p=` フラグ）は提示・受理せず `08P01` で拒否します
   （詳細は Issue #941 参照）。
+- **`--scram-mock-key-file <path>` が必須です**（`scram-sha-256` 選択時のみ。
+  未指定・`cleartext` との組合せ・32 バイト未満のファイルはいずれも
+  fail-closed で起動拒否）。未知ユーザー向けモック検証子（列挙攻撃対策）の
+  salt を導出する秘密で、**ユーザーストアの内容から独立**させる必要が
+  あります（P0 review 是正・Issue #940 PR #1006）。運用者は
+  `head -c 32 /dev/urandom > <path>` 等で 1 度だけ生成し、以後の再起動・
+  ユーザーストア更新をまたいで同じファイルを使い続けてください（毎回
+  生成し直す・ユーザーストアと同じ内容から導出する、といった運用は
+  未知ユーザーの存在を推測させる情報漏えいに繋がるため避けてください）。
+
+
 
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 

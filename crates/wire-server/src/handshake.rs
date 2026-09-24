@@ -745,14 +745,26 @@ fn authenticate_scram(
         }
     };
 
-    // 未知ユーザーも同一の往復・同一の計算経路を通す（列挙攻撃対策。
+    // P0 review 指摘（Issue #940 PR #1006）: モック検証子の生成コストが
+    // 既知/未知ユーザー間で非対称だと、`AuthenticationSASLContinue` 到着まで
+    // の時間差でユーザー存在を列挙されうる（既知ユーザーは保存済み検証子の
+    // `clone` のみ、未知ユーザーは `mock_verifier` が HMAC-SHA256 を 3 回
+    // 実行してから決まる）。`scram_lookup` の分岐に関わらず必ず
+    // `mock_verifier` を計算してから分岐することで、既知/未知いずれの経路も
+    // 同じ計算量（`mock_verifier` 相当のコスト＋高々 1 回の `clone`）を
+    // `server-first` 送出前に必ず消費させる（列挙攻撃対策。
     // ポインタ: WIRE-2, WIRE-3）。
+    let Some(mock_key) = store.scram_mock_key() else {
+        // 構造的に到達しないはずの分岐（`ScramSha256` は `UserStore::require_scram`
+        // 経由でのみ選ばれ、その関数は必ずモック鍵を設定する）だが、
+        // fail-closed に認証失敗として扱う（`unwrap`/`expect` でパニックさせない）。
+        write_error_response(stream, ErrorClass::AuthInvalid, auth::AuthFailure::MESSAGE)?;
+        return Ok(AuthOutcome::Failure);
+    };
+    let mock = scram::mock_verifier(mock_key, username, scram::SCRAM_ITERATIONS);
     let (tenant_id, verifier) = match store.scram_lookup(username) {
         Some((tenant, v)) => (Some(tenant.to_string()), v.clone()),
-        None => (
-            None,
-            scram::mock_verifier(store.scram_mock_key(), username, scram::SCRAM_ITERATIONS),
-        ),
+        None => (None, mock),
     };
 
     let server_nonce_raw = auth::read_urandom(18)?;
@@ -830,7 +842,26 @@ fn handle_connection_inner(
 
     let outcome = match authenticate(&mut stream, store, &username) {
         Ok(o) => o,
-        Err(e) => return respond_and_close(&mut stream, e, "invalid message frame"),
+        Err(e) => {
+            // Cursor Bugbot 指摘（Issue #940 PR #1006）: `authenticate` の
+            // `HandshakeError::Protocol` は `respond_and_close` の
+            // `fallback_message` をそのまま ErrorResponse の M フィールドへ
+            // 使う（`Frame` エラーは `frame_err.client_message()` を優先する
+            // ため本分岐の対象外）。cleartext フローの
+            // `read_password_message` が返す `Protocol` エラー（不正な
+            // PasswordMessage）は本 Issue 以前 `"invalid password message"`
+            // だったが、cleartext/SCRAM 共通の `authenticate()` へ統合した際に
+            // 単一の `"invalid message frame"` へ潰れ既定 cleartext 経路の
+            // ErrorResponse がビット同一でなくなっていた。認証方式ごとに
+            // fallback を分けて既定 cleartext 経路の応答を復元する
+            // （SCRAM 経路は本 Issue で新設のため従来メッセージを持たず
+            // `"invalid message frame"` のまま）。
+            let fallback = match store.auth_method() {
+                AuthMethod::Cleartext => "invalid password message",
+                AuthMethod::ScramSha256 => "invalid message frame",
+            };
+            return respond_and_close(&mut stream, e, fallback);
+        }
     };
     let ctx = match outcome {
         AuthOutcome::Failure => return Ok(()),

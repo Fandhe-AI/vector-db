@@ -12,6 +12,7 @@
 //! [--hnsw-full-scan-ratio <num>/<den>]
 //! [--hnsw-acorn-max-visible-ratio <num>/<den>]
 //! [--hnsw-sparse-visited-max <N>]
+//! [--auth-method cleartext|scram-sha-256] [--scram-mock-key-file <path>]
 //! [--fault-inject post-commit-panic]`
 //! （既定 bind: `127.0.0.1:5432`）。`--db` は必須（省略時は fail-closed で
 //! 非 0 終了。匿名・揮発 DB の暗黙生成はしない。TASK-73・WIRE-1）。
@@ -176,6 +177,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut sparse_visited_max_raw: Option<String> = None;
     let mut durability_raw: Option<String> = None;
     let mut auth_method_raw: Option<String> = None;
+    let mut scram_mock_key_file_raw: Option<PathBuf> = None;
     // Issue #705（テスト専用・feature `fault-injection` 限定）。feature 無効
     // ビルドではこの変数自体が存在せず、`--fault-inject` は下記 `other =>`
     // 分岐で未知引数として拒否される。
@@ -375,6 +377,27 @@ fn run_server(args: &[String]) -> ExitCode {
                 auth_method_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires a path argument",
+                        wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #940 P0 是正: 起動後に変更できない構成値のため、他の
+                // 閉じた語彙フラグと同じ理由で 2 回目以降の指定を fail-closed
+                // に拒否する（last-wins にしない）。
+                if scram_mock_key_file_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                scram_mock_key_file_raw = Some(PathBuf::from(v));
+                i += 2;
+            }
             // Issue #705（テスト専用・feature `fault-injection` 限定）。feature
             // 無効ビルドではこのアームごとコンパイルされず、`--fault-inject`
             // は下の `other =>` で未知引数として拒否される（fail-closed）。
@@ -538,6 +561,34 @@ fn run_server(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Issue #940 P0 是正: `--scram-mock-key-file` は `scram-sha-256` 選択時
+    // のみ意味を持つ注入点であり、他フラグ（`--hnsw-*` が `--search-engine`
+    // を要求するのと同じ設計）と同様に組合せ不正を fail-closed で拒否する。
+    match (
+        auth_method == wire_server::auth::AuthMethod::ScramSha256,
+        scram_mock_key_file_raw.is_some(),
+    ) {
+        (true, false) => {
+            eprintln!(
+                "wire-server: {} <path> is required when {} scram-sha-256 is selected \
+                 (fail-closed: a user-store-independent secret prevents the mock salt for \
+                 unknown users from acting as a user-existence oracle across store updates)",
+                wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG,
+                wire_server::auth_method_opt::FLAG
+            );
+            return ExitCode::FAILURE;
+        }
+        (false, true) => {
+            eprintln!(
+                "wire-server: {} requires {} scram-sha-256",
+                wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG,
+                wire_server::auth_method_opt::FLAG
+            );
+            return ExitCode::FAILURE;
+        }
+        _ => {}
+    }
+
     let Some(users_path) = users_path else {
         eprintln!("wire-server: --users <path> is required (fail-closed: no anonymous login)");
         return ExitCode::FAILURE;
@@ -572,8 +623,40 @@ fn run_server(args: &[String]) -> ExitCode {
     // ことを起動時に要求する（fail-closed。検証子を欠くレコードは Argon2id
     // 照合が使えず恒久的にログイン不能になるだけでなく、モック相当の扱いに
     // なりタイミング対称性が崩れるのを未然に防ぐ）。
+    //
+    // Issue #940 P0 是正: モック鍵導出用の秘密は `--scram-mock-key-file` から
+    // 読む（ユーザーストアの内容から独立させるため。上の組合せ検証により
+    // `ScramSha256` のときは必ず `Some` が入っている）。ファイルが短すぎる
+    // 場合はエントロピー不足として fail-closed に拒否する。
     let store = if auth_method == wire_server::auth::AuthMethod::ScramSha256 {
-        match store.require_scram() {
+        let Some(mock_key_path) = scram_mock_key_file_raw.as_deref() else {
+            eprintln!(
+                "wire-server: {} <path> is required when {} scram-sha-256 is selected",
+                wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG,
+                wire_server::auth_method_opt::FLAG
+            );
+            return ExitCode::FAILURE;
+        };
+        let mock_key_secret = match std::fs::read(mock_key_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "wire-server: failed to read {} {mock_key_path:?}: {e}",
+                    wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        if mock_key_secret.len() < wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_MIN_LEN {
+            eprintln!(
+                "wire-server: {} must contain at least {} bytes of secret material (got {})",
+                wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG,
+                wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_MIN_LEN,
+                mock_key_secret.len()
+            );
+            return ExitCode::FAILURE;
+        }
+        match store.require_scram(&mock_key_secret) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("wire-server: {e}");
