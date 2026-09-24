@@ -861,6 +861,12 @@ pub fn encode_row(
                         column.name
                     )));
                 }
+                if !crate::datetime::validate_date_days(*days) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: date value out of range: {days}",
+                        column.name
+                    )));
+                }
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&days.to_le_bytes());
             }
@@ -868,6 +874,12 @@ pub fn encode_row(
                 if !matches!(column.ty, ColumnType::Timestamp) {
                     return Err(RowCodecError::Invalid(format!(
                         "column {:?} expects a non-Timestamp value, got Timestamp",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_timestamp_micros(*micros) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: timestamp value out of range: {micros}",
                         column.name
                     )));
                 }
@@ -1493,6 +1505,12 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                         column.name
                     )));
                 }
+                if !crate::datetime::validate_date_days(*days) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: date value out of range: {days}",
+                        column.name
+                    )));
+                }
                 reserve(&mut buf, SCALAR_DATE_ENTRY_LEN)?;
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&days.to_le_bytes());
@@ -1501,6 +1519,12 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 if !matches!(column.ty, ColumnType::Timestamp) {
                     return Err(RowCodecError::Invalid(format!(
                         "column {:?} expects a non-Timestamp value, got Timestamp",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_timestamp_micros(*micros) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: timestamp value out of range: {micros}",
                         column.name
                     )));
                 }
@@ -1820,6 +1844,12 @@ pub(crate) fn merge_encode_scalar_columns(
                             column.name
                         )));
                     }
+                    if !crate::datetime::validate_date_days(*days) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: date value out of range: {days}",
+                            column.name
+                        )));
+                    }
                     reserve(&mut buf, SCALAR_DATE_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     buf.extend_from_slice(&days.to_le_bytes());
@@ -1828,6 +1858,12 @@ pub(crate) fn merge_encode_scalar_columns(
                     if !matches!(column.ty, ColumnType::Timestamp) {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Timestamp value, got Timestamp",
+                            column.name
+                        )));
+                    }
+                    if !crate::datetime::validate_timestamp_micros(*micros) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: timestamp value out of range: {micros}",
                             column.name
                         )));
                     }
@@ -3274,6 +3310,118 @@ mod tests {
                 .values,
             vec![Value::Bytes(Vec::new())]
         );
+    }
+
+    // --- DATE/TIMESTAMP encode 時の範囲検証（codex-review／Cursor Bugbot 指摘。
+    // decode 側（decode_row・scan_scalar_columns）は範囲外値を拒否するのに対し
+    // encode 側が検証していないと、公開 enum Value::Date/Timestamp を直接
+    // 構築する呼び出し元（SQL パーサーを経由しない Rust API 経路を含む）から
+    // 範囲外値を書き込み成功させてしまい、書き込んだ本人がその行を二度と
+    // 読めなくなる非対称な永続化バグになる。encode_row・encode_scalar_columns・
+    // merge_encode_scalar_columns の 3 箇所すべてで拒否されることを固定する） ---
+
+    fn date_timestamp_schema() -> TableSchema {
+        TableSchema::new(
+            "events",
+            vec![
+                ColumnDef::new("d", ColumnType::Date, true),
+                ColumnDef::new("t", ColumnType::Timestamp, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn encode_row_rejects_out_of_range_date_and_timestamp() {
+        let schema = date_timestamp_schema();
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Date(crate::datetime::DATE_MAX_DAYS + 1), Value::Null],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[
+                Value::Null,
+                Value::Timestamp(crate::datetime::TIMESTAMP_MAX_MICROS + 1),
+            ],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Date(crate::datetime::DATE_MIN_DAYS - 1), Value::Null],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[
+                Value::Null,
+                Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS - 1),
+            ],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        // 範囲内の値は従来どおり成功し decode で読み戻せる（非対称でないことの確認）。
+        let ok = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[
+                Value::Date(crate::datetime::DATE_MAX_DAYS),
+                Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS),
+            ],
+        )
+        .expect("encode in-range date/timestamp");
+        let decoded = decode_row(&schema, &ok).expect("decode in-range date/timestamp");
+        assert_eq!(
+            decoded.values,
+            vec![
+                Value::Date(crate::datetime::DATE_MAX_DAYS),
+                Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS),
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_scalar_columns_rejects_out_of_range_date_and_timestamp() {
+        let schema = date_timestamp_schema();
+        let result = encode_scalar_columns(
+            &schema,
+            &[Value::Date(crate::datetime::DATE_MAX_DAYS + 1), Value::Null],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_scalar_columns(
+            &schema,
+            &[
+                Value::Null,
+                Value::Timestamp(crate::datetime::TIMESTAMP_MAX_MICROS + 1),
+            ],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn merge_encode_scalar_columns_rejects_out_of_range_date_and_timestamp() {
+        let schema = date_timestamp_schema();
+        let out_of_range_date = Value::Date(crate::datetime::DATE_MAX_DAYS + 1);
+        let result =
+            merge_encode_scalar_columns(&schema, &[None, None], &[(0, &out_of_range_date)]);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let out_of_range_ts = Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS - 1);
+        let result = merge_encode_scalar_columns(&schema, &[None, None], &[(1, &out_of_range_ts)]);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
     }
 
     // --- merge_encode_scalar_columns（Issue #996: 述語つき UPDATE の適用段を
