@@ -491,7 +491,17 @@ pub fn negotiate(
 ) -> Result<ClientHelloDecision, ClientHelloError> {
     let ext = parse_extensions(&ch.extensions)?;
 
-    // 1. legacy_version（RFC 8446 §4.1.2 の MUST。TLS 1.3 クライアントは
+    // 1. HRR 後の 2 回目 ClientHello は、鍵交換に関わる差分を除き 1 回目と
+    //    同一でなければならない（RFC 8446 §4.1.2）。他のどの意味検査より
+    //    先に実行する。後段の検査（missing_extension・handshake_failure
+    //    等）を先に走らせると、同一性違反があるにもかかわらず別の alert
+    //    種別で応答してしまい、RFC が要求する illegal_parameter を返せない
+    //    ため（本関数はこの優先順位も含めて単一情報源とする）。
+    if let Some(first) = after_hrr {
+        check_hrr_consistency(first, ch)?;
+    }
+
+    // 2. legacy_version（RFC 8446 §4.1.2 の MUST。TLS 1.3 クライアントは
     //    0x0303 固定で送らなければならない）。TLS 1.0/1.1 の
     //    legacy_version（0x0301/0x0302）を送る旧クライアントもここで
     //    protocol_version として拒否されるが、そうしたクライアントは
@@ -502,7 +512,7 @@ pub fn negotiate(
         return Err(ClientHelloError::UnsupportedVersion);
     }
 
-    // 2. バージョン（暗号スイート・署名より先に判定する。TLS 1.2 以前の
+    // 3. バージョン（暗号スイート・署名より先に判定する。TLS 1.2 以前の
     //    クライアントには handshake_failure ではなく protocol_version を
     //    返すため）。
     let has_tls13 = match ext.supported_versions {
@@ -513,17 +523,17 @@ pub fn negotiate(
         return Err(ClientHelloError::UnsupportedVersion);
     }
 
-    // 3. compression。
+    // 4. compression。
     check_compression(&ch.legacy_compression_methods)?;
 
-    // 4. 暗号スイート。
+    // 5. 暗号スイート。
     if !ch.cipher_suites.contains(&TLS_AES_128_GCM_SHA256) {
         return Err(ClientHelloError::HandshakeFailure(
             "cipher_suites does not offer TLS_AES_128_GCM_SHA256",
         ));
     }
 
-    // 5. 署名アルゴリズム。
+    // 6. 署名アルゴリズム。
     let signature_algorithms =
         ext.signature_algorithms
             .ok_or(ClientHelloError::MissingExtension(
@@ -535,7 +545,7 @@ pub fn negotiate(
         ));
     }
 
-    // 6. server_name の構造検証。HRR で戻る（Accept に到達しない）経路
+    // 7. server_name の構造検証。HRR で戻る（Accept に到達しない）経路
     //    でも必ず実行する（不正な server_name を含む ClientHello に対して
     //    RetryRequestX25519 を返してしまわないため）。
     let server_name = match ext.server_name {
@@ -543,7 +553,7 @@ pub fn negotiate(
         None => None,
     };
 
-    // 7. グループ／鍵共有。
+    // 8. グループ／鍵共有。
     let (supported_groups, key_share) = match (ext.supported_groups, ext.key_share) {
         (Some(sg), Some(ks)) => (sg, ks),
         _ => {
@@ -554,12 +564,6 @@ pub fn negotiate(
     };
     let x25519_share = find_x25519_key_share(key_share, after_hrr.is_some())?;
     let has_x25519_group = contains_x25519_group(supported_groups)?;
-
-    // 8. HRR 後の 2 回目 ClientHello は、鍵交換に関わる差分を除き 1 回目と
-    //    同一でなければならない（RFC 8446 §4.1.2）。
-    if let Some(first) = after_hrr {
-        check_hrr_consistency(first, ch)?;
-    }
 
     let client_x25519_public = match x25519_share {
         Some(key) => {
@@ -577,7 +581,12 @@ pub fn negotiate(
                 ));
             }
             if after_hrr.is_some() {
-                return Err(ClientHelloError::HandshakeFailure(
+                // RFC 8446 §4.2.8: HRR で要求したグループの key_share を
+                // 2 回目の ClientHello に含めないのは、鍵交換の合意に
+                // 失敗した（handshake_failure）のではなく、クライアントが
+                // サーバーの要求に従わなかったプロトコル違反であるため
+                // illegal_parameter。
+                return Err(ClientHelloError::IllegalParameter(
                     "client did not include x25519 key_share after HelloRetryRequest",
                 ));
             }
@@ -780,17 +789,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_key_share_after_hrr_is_handshake_failure() {
+    fn empty_key_share_after_hrr_is_illegal_parameter() {
         // 1 回目の ClientHello（`first`）は key_share 以外が 2 回目と一致
         // していなければならない（RFC 8446 §4.1.2。key_share 自体は比較
-        // 対象外のため、1 回目の内容は無関係）。
+        // 対象外のため、1 回目の内容は無関係）。HRR で要求したグループの
+        // key_share を欠くのは鍵交換の不合意（handshake_failure）ではなく
+        // クライアントのプロトコル違反のため illegal_parameter
+        // （RFC 8446 §4.2.8）。
         let first = with_ed25519_sig_alg(rfc8448_client_hello());
         let ch = replace_extension_data(first.clone(), EXT_KEY_SHARE, empty_key_share_data());
         let result = negotiate(&ch, Some(&first));
-        assert!(matches!(result, Err(ClientHelloError::HandshakeFailure(_))));
+        assert!(matches!(result, Err(ClientHelloError::IllegalParameter(_))));
         assert_eq!(
             result.unwrap_err().alert_description(),
-            AlertDescription::HandshakeFailure
+            AlertDescription::IllegalParameter
         );
     }
 
@@ -921,6 +933,25 @@ mod tests {
             negotiate(&ch, Some(&first)),
             Err(ClientHelloError::IllegalParameter(_))
         ));
+    }
+
+    #[test]
+    fn hrr_consistency_check_takes_priority_over_later_semantic_checks() {
+        // 同一性違反（cipher_suites の変更）に加えて、通常なら別の alert
+        // （missing_extension）を先に引き当てる意味検査違反（signature_
+        // algorithms 拡張の欠落）も同時に含む 2 回目の ClientHello。
+        // check_hrr_consistency は他のどの意味検査よりも先に実行される
+        // ため、missing_extension ではなく illegal_parameter を返す
+        // （検査順序の入れ替えを固定する回帰テスト）。
+        let first = with_ed25519_sig_alg(rfc8448_client_hello());
+        let mut ch = remove_extension(first.clone(), EXT_SIGNATURE_ALGORITHMS);
+        ch.cipher_suites = vec![0x1302, TLS_AES_128_GCM_SHA256];
+        let result = negotiate(&ch, Some(&first));
+        assert!(matches!(result, Err(ClientHelloError::IllegalParameter(_))));
+        assert_eq!(
+            result.unwrap_err().alert_description(),
+            AlertDescription::IllegalParameter
+        );
     }
 
     #[test]

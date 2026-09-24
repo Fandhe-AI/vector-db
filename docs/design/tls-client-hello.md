@@ -40,30 +40,38 @@ HelloRetryRequest（HRR）の組み立てを担う純粋関数層
 1. 拡張ブロック全体の走査（重複拡張の検出・`pre_shared_key` の位置検査・
    対象 5 拡張の構造解析。違反はそれぞれ `illegal_parameter`／
    `missing_extension`／`decode_error`）
-2. `legacy_version`（0x0303 固定でなければ `protocol_version`。RFC 8446
+2. HRR 後の 2 回目 `ClientHello` の同一性検証（`after_hrr` が `Some` の
+   ときのみ。[`check_hrr_consistency`](../../crates/wire-server/src/tls/client_hello.rs)。
+   違反は `illegal_parameter`）。他のどの意味検査よりも先に行う。後段の
+   検査を先に走らせると、同一性違反があっても別の alert 種別（`missing_
+   extension`・`handshake_failure` 等）で応答してしまい、RFC 8446 §4.1.2
+   が要求する `illegal_parameter` を返せなくなるため
+3. `legacy_version`（0x0303 固定でなければ `protocol_version`。RFC 8446
    §4.1.2 の MUST。TLS 1.0/1.1 の legacy_version（0x0301/0x0302）を送る
    旧クライアントもここで `protocol_version` になるが、そうした
    クライアントは `supported_versions` 自体も欠くため、この判定が無くても
    次のバージョン判定で同じ `protocol_version` に到達する（分類結果は
    変わらない））
-3. バージョン（`supported_versions` に TLS 1.3 が無ければ
+4. バージョン（`supported_versions` に TLS 1.3 が無ければ
    `protocol_version`。暗号スイート・署名より先に判定し、TLS 1.2 以前の
    クライアントに `handshake_failure` を返さないため）
-4. compression（`legacy_compression_methods != [0x00]` は
+5. compression（`legacy_compression_methods != [0x00]` は
    `illegal_parameter`）
-5. 暗号スイート（`TLS_AES_128_GCM_SHA256` が無ければ `handshake_failure`）
-6. 署名アルゴリズム（`signature_algorithms` 欠落は `missing_extension`、
+6. 暗号スイート（`TLS_AES_128_GCM_SHA256` が無ければ `handshake_failure`）
+7. 署名アルゴリズム（`signature_algorithms` 欠落は `missing_extension`、
    ed25519 非提示は `handshake_failure`）
-7. `server_name` の構造検証（HRR で戻る経路でも必ず実行する。Accept
+8. `server_name` の構造検証（HRR で戻る経路でも必ず実行する。Accept
    到達後まで遅延させると、不正な `server_name` を含む `ClientHello` に
    対して誤って `RetryRequestX25519` を返しうるため）
-8. グループ／鍵共有（`supported_groups`・`key_share` の片方欠落は
+9. グループ／鍵共有（`supported_groups`・`key_share` の片方欠落は
    `missing_extension`）
-9. HRR 後の 2 回目 `ClientHello` の同一性検証（`after_hrr` が `Some` の
-   ときのみ。[`check_hrr_consistency`](../../crates/wire-server/src/tls/client_hello.rs)。
-   違反は `illegal_parameter`）
 10. x25519 が無く `supported_groups` にはある場合は `after_hrr` に応じて
-    HRR 要求／`handshake_failure` を切り替える
+    分岐する。1 回目（`after_hrr` が `None`）なら HRR 要求
+    （`RetryRequestX25519`）。1 回目に x25519 自体を誰も提示していない
+    （鍵交換グループの不合意）なら `handshake_failure`。HRR 後（`after_hrr`
+    が `Some`）に要求したグループの key_share を含めなかった場合は、鍵交換
+    の不合意ではなくクライアントのプロトコル違反であるため
+    `illegal_parameter`（RFC 8446 §4.2.8）
 
 ## 重複拡張検出のデータ構造
 
