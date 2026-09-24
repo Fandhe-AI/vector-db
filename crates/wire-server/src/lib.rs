@@ -72,6 +72,10 @@
 //!   文字列から到達する唯一の入口。`main.rs::run_server` がこの選択に応じて
 //!   `server::accept_loop_with_engine`／`http::listener::accept_loop_with_limiter`
 //!   のいずれか 1 本だけを呼ぶ（Issue #735・#743）
+//! - [`tls`]: 自作 TLS 1.3 サーバー側実装の入口（TASK-228・WIRE-9・HTTP-10。
+//!   親 Issue #941 の 2 時間単位 sub-issue 群の 1 つ。`tls::record`
+//!   （レコード層。RFC 8446 §5.1。Issue #952）を提供する。現時点では
+//!   接続経路（`handshake.rs`・`server.rs`）へは未接続のまま維持する
 //! - `fault_injection`（feature `fault-injection` 限定・テスト専用。
 //!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
 //!   語彙パーサと、`simple_query::execute_and_respond` の登録ブロック内から
@@ -101,3 +105,4 @@ pub mod search_engine_opt;
 pub mod server;
 pub mod simple_query;
 pub mod surface;
+pub mod tls;
