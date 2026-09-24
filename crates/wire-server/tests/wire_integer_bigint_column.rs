@@ -14,9 +14,6 @@ mod common;
 #[path = "http_common/mod.rs"]
 mod http_common;
 
-#[path = "../../engine/src/test_util/temp_db.rs"]
-mod temp_db;
-
 use std::sync::Arc;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -25,6 +22,7 @@ use engine::kernel::CpuScalarProvider;
 use engine::storage::Storage;
 
 use common::*;
+use http_common::temp_db;
 use http_common::{AfterWrite, HttpResponse};
 use wire_server::http::session::store::SessionStore;
 
