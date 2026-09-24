@@ -52,6 +52,28 @@ fn frame_err_to_io(e: FrameError) -> io::Error {
     }
 }
 
+/// `CopyData`（'d'）フレームの読み取りが `FrameError::TooLarge`／`Malformed`
+/// で失敗した場合、通常の簡易クエリ 'Q' 経路（`handshake::respond_and_close`
+/// の `HandshakeError::Frame` 分岐）と同じ `wire_code` 付き ErrorResponse を
+/// 送ってから接続を終了する（Issue #939 レビュー指摘: 素通しで
+/// [`frame_err_to_io`] へ渡すと `HandshakeError::Io` へ写像され、
+/// `respond_and_close` の `Io(e) => Err(e)` 分岐が応答を一切送らずに切断して
+/// いた）。フレーミングが破綻した時点でストリーム上の残りバイト数は不明で
+/// 安全に読み進められないため、`respond_error_and_ready`（CopyFail 等）とは
+/// 異なり ReadyForQuery は送らず接続そのものを終了する契約にする
+/// （`TooLarge` は長さフィールドのみ読み終え本文は未読のまま、`Malformed` も
+/// 相手が今後どれだけ送るか分からない点は同じ）。ErrorResponse の送信自体が
+/// 失敗しても（相手が既に切断済み等）無視して `frame_err_to_io` の結果を返す
+/// （fail-closed に接続を終える）。`Truncated`／`Io` は応答を送る意味がない
+/// （前者は相手が既に切断済み、後者はサーバー側 I/O 異常）ため従来どおり
+/// 無応答で終了する。
+fn respond_frame_error_and_terminate(stream: &mut TcpStream, e: FrameError) -> io::Error {
+    if let Some(class) = e.error_class() {
+        let _ = crate::handshake::write_error_response_io(stream, class, e.client_message());
+    }
+    frame_err_to_io(e)
+}
+
 /// ErrorResponse を書いてから ReadyForQuery を書く
 /// （`simple_query::respond_error_and_ready` と同じ契約。COPY サブプロトコル
 /// のエラーも接続を維持する簡易クエリの一部であり、切断はしない）。
@@ -331,7 +353,7 @@ fn run_copy_from(
         match type_byte {
             b'd' => {
                 let body = framing::read_length_prefixed_body(stream, 4, framing::MAX_MESSAGE_LEN)
-                    .map_err(frame_err_to_io)?;
+                    .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
                 if errored.is_none() {
                     if let Err(e) = session.feed(&body) {
                         errored = Some(e);

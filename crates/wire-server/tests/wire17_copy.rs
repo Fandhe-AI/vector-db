@@ -13,13 +13,14 @@ mod common;
 #[path = "../../engine/src/test_util/temp_db.rs"]
 mod temp_db;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::storage::Storage;
+use wire_server::framing;
 
 use common::*;
 
@@ -298,6 +299,35 @@ fn wire17_copy_from_stdin_rejects_unexpected_message_type_and_closes() {
     send_length_prefixed_message(&mut stream, b'P', b"\0select 1\0\0\0");
 
     expect_error_response_with_sqlstate(&mut stream, "08P01");
+    expect_connection_closed(&mut stream);
+}
+
+/// CopyData（'d'）の宣言長が `framing::MAX_MESSAGE_LEN` を超過した場合、通常の
+/// 簡易クエリ 'Q' 経路（フレーミング違反は `wire_code` 付き ErrorResponse を
+/// 送ってから接続終了）と同じ診断契約になること（Issue #939 レビュー指摘:
+/// 修正前は `copy.rs::frame_err_to_io` が `FrameError::TooLarge` を汎用
+/// `io::Error` へ潰し、`ErrorResponse` を一切送らずに切断していた）。
+#[test]
+fn wire17_copy_from_stdin_oversized_copy_data_frame_gets_error_response_before_close() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'wire-copy-oversized'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+
+    // `TooLarge` は長さフィールドのみで判定されるため、実際に巨大な本文を
+    // 送る必要はない（`framing::read_length_prefixed_body` は本文を読む前に
+    // 宣言長を検証して打ち切る）。
+    let declared_len = (framing::MAX_MESSAGE_LEN + 1) as i32;
+    let mut header = Vec::new();
+    header.push(b'd');
+    header.extend_from_slice(&declared_len.to_be_bytes());
+    stream.write_all(&header).expect("send oversized header");
+
+    expect_error_response_with_sqlstate(&mut stream, "54000");
     expect_connection_closed(&mut stream);
 }
 
