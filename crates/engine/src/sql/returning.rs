@@ -176,7 +176,7 @@ pub(crate) fn column_meta(
                 let ty = schema
                     .columns
                     .get(*index)
-                    .map(|c| c.ty)
+                    .map(|c| c.ty.clone())
                     .ok_or_else(|| returning_bug("projected column index out of range"))?;
                 Ok(ColumnMeta::Scalar {
                     name: name.clone(),
@@ -235,6 +235,13 @@ pub(crate) fn project_row(
                 )?),
                 Some(Value::Json(s)) => Cell::Json(try_alloc_text_for_budget(
                     s,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
+                // ENUM 列は既存の `Cell::Text` へ写像する（Issue #890 D7。
+                // `sql::exec` の投影と同じ扱い）。
+                Some(Value::Enum(label)) => Cell::Text(try_alloc_text_for_budget(
+                    label,
                     budget,
                     MAX_RETURNING_RESULT_BYTES,
                 )?),

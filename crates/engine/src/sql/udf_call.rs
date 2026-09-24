@@ -681,7 +681,7 @@ fn bind_expr_in(
                 .enumerate()
                 .find(|(_, c)| &c.name == name)
             {
-                return match column.ty {
+                return match &column.ty {
                     ColumnType::Vector(_) => {
                         // `BoundExpr::VectorRef` は「1 テーブルにつき `VECTOR` 列は
                         // 高々 1 本」（TABLE-1、`catalog::encode_schema` が
@@ -722,6 +722,9 @@ fn bind_expr_in(
                             "column {name:?} cannot be used in an expression (JSON columns are not supported)"
                         )))
                     }
+                    ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (ENUM columns are not supported)"
+                    ))),
                 };
             }
             if name == "id" {

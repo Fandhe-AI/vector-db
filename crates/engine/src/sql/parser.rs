@@ -492,14 +492,15 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .columns
         .iter()
         .enumerate()
-        .find_map(|(idx, c)| match c.ty {
-            ColumnType::Vector(dim) => Some((idx, dim)),
+        .find_map(|(idx, c)| match &c.ty {
+            ColumnType::Vector(dim) => Some((idx, *dim)),
             ColumnType::Text
             | ColumnType::Boolean
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
-            | ColumnType::Jsonb => None,
+            | ColumnType::Jsonb
+            | ColumnType::Enum(_) => None,
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
@@ -533,14 +534,15 @@ pub(crate) fn text_column_index(
                 .columns
                 .get(idx)
                 .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-            match column.ty {
+            match &column.ty {
                 ColumnType::Text => Ok(idx),
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
-                | ColumnType::Jsonb => Err(SqlSurfaceError::invalid_input(format!(
+                | ColumnType::Jsonb
+                | ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} is not a TEXT column"
                 ))),
             }
@@ -1280,9 +1282,9 @@ fn bind_insert_row(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-        let value = match (column.ty, literal) {
+        let value = match (&column.ty, literal) {
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+                crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
             }
             (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -1304,7 +1306,7 @@ fn bind_insert_row(
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Array(parse_array_literal(s, array_ty)?)
+                crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
             }
             (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -1318,7 +1320,7 @@ fn bind_insert_row(
                 )))
             }
             (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
-                bind_json_literal(s, column.ty, name)?
+                bind_json_literal(s, &column.ty, name)?
             }
             (
                 ColumnType::Json | ColumnType::Jsonb,
@@ -1326,6 +1328,12 @@ fn bind_insert_row(
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a JSON text literal"
+                )))
+            }
+            (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
+            (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a text literal for its enum type"
                 )))
             }
             // `InsertLiteral::Null`（Issue #889 レビュー指摘）は SQL テキストの
@@ -1400,7 +1408,7 @@ fn bind_bytea_literal(
 /// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
 fn bind_json_literal(
     s: &str,
-    column_ty: ColumnType,
+    column_ty: &ColumnType,
     column_name: &str,
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {
     let text = match column_ty {
@@ -1415,7 +1423,8 @@ fn bind_json_literal(
         | ColumnType::Vector(_)
         | ColumnType::Boolean
         | ColumnType::Array(_)
-        | ColumnType::Bytea => {
+        | ColumnType::Bytea
+        | ColumnType::Enum(_) => {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "column {column_name:?} is not a JSON column"
             )));
@@ -1435,6 +1444,27 @@ fn json_column_error(e: crate::json::JsonColumnError, _s: &str) -> SqlSurfaceErr
         crate::json::JsonColumnError::Invalid => {
             SqlSurfaceError::unsupported("invalid JSON literal")
         }
+    }
+}
+
+/// `ENUM` 列向けの文字列リテラルを [`crate::row_codec::Value::Enum`] へ束縛する
+/// 共通ヘルパー（TABLE-14・TASK-198、Issue #890）。INSERT・UPDATE（単一行 SET・
+/// 述語形）・UPSERT の各束縛箇所が同じ検証・エラー分類を共有する
+/// （[`bind_bytea_literal`] と同じ設計）。語彙外のラベルは書き込みトランザクション
+/// 開始前に `22P02`（[`SqlSurfaceError::invalid_text_representation`]）で拒否する。
+/// エラーメッセージには語彙の一覧を含めない（型名とクライアント自身の入力値のみ。
+/// security.md P0「情報漏えい」対応）。
+fn bind_enum_literal(
+    def: &crate::catalog::EnumTypeDef,
+    s: &str,
+    column_name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    match def.validate_label(s) {
+        Ok(()) => Ok(crate::row_codec::Value::Enum(s.to_string())),
+        Err(_) => Err(SqlSurfaceError::invalid_text_representation(format!(
+            "column {column_name:?} (enum {:?}) does not accept label {s:?}",
+            def.name()
+        ))),
     }
 }
 
@@ -1542,9 +1572,9 @@ fn bind_set_assignments(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-        let value = match (column.ty, literal) {
+        let value = match (&column.ty, literal) {
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+                crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
             }
             (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -1574,7 +1604,7 @@ fn bind_set_assignments(
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Array(parse_array_literal(s, array_ty)?)
+                crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
             }
             (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -1588,7 +1618,7 @@ fn bind_set_assignments(
                 )))
             }
             (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
-                bind_json_literal(s, column.ty, name)?
+                bind_json_literal(s, &column.ty, name)?
             }
             (
                 ColumnType::Json | ColumnType::Jsonb,
@@ -1596,6 +1626,12 @@ fn bind_set_assignments(
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a JSON text literal"
+                )))
+            }
+            (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
+            (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a text literal for its enum type"
                 )))
             }
             // 明示的な SQL `NULL`（`ColumnType::Vector` を除く。Issue #889
@@ -2112,9 +2148,9 @@ fn bind_upsert_assignments(
                 BoundUpsertValue::Excluded(src_idx)
             }
             UpsertValue::Literal(literal) => {
-                let v = match (column.ty, literal) {
+                let v = match (&column.ty, literal) {
                     (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
-                        crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+                        crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
                     }
                     (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
@@ -2138,7 +2174,7 @@ fn bind_upsert_assignments(
                         )))
                     }
                     (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
-                        crate::row_codec::Value::Array(parse_array_literal(s, array_ty)?)
+                        crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
                     }
                     (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
@@ -2152,7 +2188,7 @@ fn bind_upsert_assignments(
                         )))
                     }
                     (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
-                        bind_json_literal(s, column.ty, name)?
+                        bind_json_literal(s, &column.ty, name)?
                     }
                     (
                         ColumnType::Json | ColumnType::Jsonb,
@@ -2160,6 +2196,14 @@ fn bind_upsert_assignments(
                     ) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a JSON text literal"
+                        )))
+                    }
+                    (ColumnType::Enum(def), InsertLiteral::String(s)) => {
+                        bind_enum_literal(def, s, name)?
+                    }
+                    (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a text literal for its enum type"
                         )))
                     }
                     // `InsertLiteral::Null`（Issue #889 レビュー指摘）は
@@ -2247,7 +2291,7 @@ fn bind_file_insert(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-        let value = match (column.ty, literal) {
+        let value = match (&column.ty, literal) {
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
@@ -2295,6 +2339,12 @@ fn bind_file_insert(
             (ColumnType::Json | ColumnType::Jsonb, _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: JSON column is not supported for file-form INSERT"
+                )))
+            }
+            // ENUM 列も同じ理由で対象外とする（Issue #890）。
+            (ColumnType::Enum(_), _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: ENUM column is not supported for file-form INSERT"
                 )))
             }
         };
@@ -2396,6 +2446,12 @@ pub(crate) enum AggregateInput {
     /// は `ByteaColumn` と同じパターンで [`resolve_aggregate_input`] が型不整合
     /// として拒否する。
     JsonColumn(usize),
+    /// `ENUM` 列の裸の列参照（`COUNT` 限定。TABLE-14・TASK-198、Issue #890）。
+    /// `SUM`/`AVG`/`MIN`/`MAX` は `BooleanColumn`／`ByteaColumn` と同じパターンで
+    /// [`resolve_aggregate_input`] が型不整合として拒否する（PostgreSQL の enum は
+    /// 宣言順で `MIN`/`MAX` 比較できるが、辞書順で代用すると意味論が食い違うため
+    /// 意図的に受理しない。Issue #890 D7）。
+    EnumColumn(usize),
     /// 上記以外の `Scalar` 型に束縛された式（列参照 `id` 単体を除く。`vec_norm(...)`
     /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`program`（束縛時に
     /// ステップ列コンパイル済み、Issue #353）を行ループで評価する。`source` は
@@ -2798,7 +2854,7 @@ fn resolve_aggregate_input(
                 .enumerate()
                 .find(|(_, c)| &c.name == name)
             {
-                return match (column.ty, func) {
+                return match (&column.ty, func) {
                     (ColumnType::Text, AggregateFunc::Sum | AggregateFunc::Avg) => {
                         Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} is TEXT and cannot be used with SUM/AVG"
@@ -2837,6 +2893,12 @@ fn resolve_aggregate_input(
                             "column {name:?} is JSON and cannot be used with SUM/AVG/MIN/MAX"
                         )))
                     }
+                    (ColumnType::Enum(_), AggregateFunc::Count) => {
+                        Ok(AggregateInput::EnumColumn(index))
+                    }
+                    (ColumnType::Enum(_), _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is ENUM and cannot be used with SUM/AVG/MIN/MAX"
+                    ))),
                 };
             }
             if name == "id" {
@@ -3107,7 +3169,7 @@ fn resolve_group_by_column(schema: &TableSchema, column: &str) -> Result<usize, 
         .position(|c| c.name == column)
         .filter(|&idx| {
             matches!(
-                schema.columns.get(idx).map(|c| c.ty),
+                schema.columns.get(idx).map(|c| c.ty.clone()),
                 Some(ColumnType::Text)
             )
         })
@@ -3786,7 +3848,7 @@ mod tests {
     #[test]
     fn bind_json_literal_rejects_body_one_byte_over_max_json_field_len() {
         let oversized = "1".repeat(crate::json::MAX_JSON_FIELD_LEN + 1);
-        let err = bind_json_literal(&oversized, ColumnType::Json, "doc").unwrap_err();
+        let err = bind_json_literal(&oversized, &ColumnType::Json, "doc").unwrap_err();
         assert_eq!(err.wire_code(), "54000");
     }
 
@@ -3822,7 +3884,7 @@ mod tests {
         assert_eq!(doc.len(), target);
 
         let value =
-            bind_json_literal(&doc, ColumnType::Json, "doc").expect("must bind at exact limit");
+            bind_json_literal(&doc, &ColumnType::Json, "doc").expect("must bind at exact limit");
 
         let schema = TableSchema::new(
             "docs",

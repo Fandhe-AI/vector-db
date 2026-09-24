@@ -133,7 +133,8 @@ impl ReferencedColumns {
                 | AggregateInput::BooleanColumn(index)
                 | AggregateInput::ArrayColumn(index)
                 | AggregateInput::ByteaColumn(index)
-                | AggregateInput::JsonColumn(index) => {
+                | AggregateInput::JsonColumn(index)
+                | AggregateInput::EnumColumn(index) => {
                     has_scalar_reference = true;
                     if let Some(slot) = scalar_mask.get_mut(*index) {
                         *slot = true;
@@ -357,6 +358,16 @@ impl Accumulator {
             // （`resolve_aggregate_input` が SUM/AVG/MIN/MAX を型不整合として
             // 拒否済み。TABLE-14・Issue #889）。
             AggregateInput::JsonColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
+            // ENUM 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
+            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。TABLE-14・TASK-198、
+            // Issue #890）。
+            AggregateInput::EnumColumn(index) => {
                 if scanned.get(*index).copied().flatten().is_some() {
                     self.observe_present()
                 } else {

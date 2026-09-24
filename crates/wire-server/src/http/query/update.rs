@@ -254,8 +254,18 @@ fn map_set_assignments(
             assignments.push((key.clone(), InsertLiteral::String(String::new())));
             continue;
         };
-        let literal = match (column.ty, raw) {
+        let literal = match (&column.ty, raw) {
             (ColumnType::Text, JsonValue::String(s)) => InsertLiteral::String(s.clone()),
+            // ENUM 列は TEXT と同じ JSON string 表現を使い、語彙検証は
+            // `engine::sql::parser::bind_update`（`bind_enum_literal`）へ委譲する
+            // （Issue #890。列名だけで完結しない値検証は engine 側の単一
+            // 情報源に保つ設計。`bind_update` の再検査で多層防御が保たれる）。
+            (ColumnType::Enum(_), JsonValue::String(s)) => InsertLiteral::String(s.clone()),
+            (ColumnType::Enum(_), _) => {
+                return Err(UpdateError::Set(
+                    "SET ENUM column value must be a JSON string",
+                ))
+            }
             (ColumnType::Vector(_), JsonValue::Array(items)) => {
                 InsertLiteral::String(vector_literal_text(items)?)
             }

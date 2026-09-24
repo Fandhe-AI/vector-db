@@ -1804,6 +1804,40 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (crate::catalog::ColumnType::Enum(def), crate::row_codec::Value::Enum(label)) => {
+                // SET 値の語彙検証（対象行の探索より前に行う。多層防御。
+                // 束縛層〔`sql::parser::bind_enum_literal`〕で既に検査済みだが、
+                // Rust API から直接渡された `Value::Enum` もここで拒否する。
+                // Issue #890。
+                if def.validate_label(label).is_err() {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "SET value {label:?} is not a member of enum type {:?}",
+                        def.name()
+                    ))));
+                }
+                let text_len = u32::try_from(label.len()).map_err(|_| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "enum label too long: {} bytes",
+                        label.len()
+                    )))
+                })?;
+                let entry_len = crate::row_codec::scalar_text_entry_len(text_len)
+                    .map_err(|e| TenantWriteError::Catalog(CatalogError::Invalid(e.to_string())))?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             // 明示的な SQL `NULL`（`bind_set_assignments`〔SQL-17・SQL-19〕が
             // nullable 列向けに構築する。PR #1014 レビュー指摘対応・Issue #889。
             // `VECTOR` 列は nullable の値に関わらず常に必須として扱うため対象外
@@ -1817,7 +1851,8 @@ fn validate_set_assignments(
                 | crate::catalog::ColumnType::Array(_)
                 | crate::catalog::ColumnType::Bytea
                 | crate::catalog::ColumnType::Json
-                | crate::catalog::ColumnType::Jsonb,
+                | crate::catalog::ColumnType::Jsonb
+                | crate::catalog::ColumnType::Enum(_),
                 crate::row_codec::Value::Null,
             ) if column.nullable => {}
             (crate::catalog::ColumnType::Vector(_), _)
@@ -1826,7 +1861,8 @@ fn validate_set_assignments(
             | (crate::catalog::ColumnType::Array(_), _)
             | (crate::catalog::ColumnType::Bytea, _)
             | (crate::catalog::ColumnType::Json, _)
-            | (crate::catalog::ColumnType::Jsonb, _) => {
+            | (crate::catalog::ColumnType::Jsonb, _)
+            | (crate::catalog::ColumnType::Enum(_), _) => {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column type does not match the current table schema".to_string(),
                 )))

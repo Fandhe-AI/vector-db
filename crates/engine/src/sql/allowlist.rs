@@ -245,6 +245,11 @@ pub enum SqlSurfaceError {
     /// （`docs/spec/04-behavior/error-format.md`）の表に未掲載のコードであり、
     /// SQL-13 が ERR-2 の拡張規則に基づいて独自定義する。
     NumericOutOfRange { detail: String },
+    /// 構文上受理された値が、宣言済み型の表現として不正（TABLE-14・TASK-198、
+    /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）が
+    /// 現時点で唯一の発生経路。ERR-2 拡張: `22P02`
+    /// （[`crate::error_format::ErrorClass::InvalidTextRepresentation`]）。
+    InvalidTextRepresentation { detail: String },
 }
 
 impl SqlSurfaceError {
@@ -315,6 +320,15 @@ impl SqlSurfaceError {
             detail: truncate_for_error(&detail.into()),
         }
     }
+
+    /// `pub(crate)`: `sql::parser::bind_enum_literal`（Issue #890）が ENUM 列の
+    /// 語彙外ラベルを報告するために使う。エラーメッセージには語彙の一覧を
+    /// 含めない（型名とクライアント自身の入力値のみ。security.md P0）。
+    pub(crate) fn invalid_text_representation(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::InvalidTextRepresentation {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
 }
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
@@ -334,6 +348,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateOperationId => ErrorClass::UniqueViolation,
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
+            SqlSurfaceError::InvalidTextRepresentation { .. } => {
+                ErrorClass::InvalidTextRepresentation
+            }
         }
     }
 
@@ -378,6 +395,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::OperationIdContentMismatch => {
                 write!(f, "operation_id already recorded with different content")
+            }
+            SqlSurfaceError::InvalidTextRepresentation { detail } => {
+                write!(f, "invalid text representation: {detail}")
             }
         }
     }

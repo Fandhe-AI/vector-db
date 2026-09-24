@@ -110,6 +110,10 @@ pub enum InsertError {
     /// `JSON`／`JSONB` 列の値が正規化後 [`engine::json::MAX_JSON_FIELD_LEN`] を
     /// 超える（`54000`）。
     JsonTooLarge,
+    /// `ENUM` 列の値が語彙外のラベル（`22P02`。TABLE-14・TASK-198、Issue #890。
+    /// SQL 表層の `sql::parser::bind_enum_literal` と同じ分類を NoSQL 表層でも
+    /// 共有する）。エラー文言には語彙の一覧を含めない（security.md P0）。
+    InvalidEnumLabel(String),
 }
 
 impl From<SchemaError> for InsertError {
@@ -134,6 +138,7 @@ impl ClassifiedError for InsertError {
             InsertError::ByteaTooLarge => ErrorClass::PayloadTooLarge,
             InsertError::InvalidJson(_) => ErrorClass::UnsupportedSqlSyntax,
             InsertError::JsonTooLarge => ErrorClass::PayloadTooLarge,
+            InsertError::InvalidEnumLabel(_) => ErrorClass::InvalidTextRepresentation,
         }
     }
 
@@ -146,6 +151,7 @@ impl ClassifiedError for InsertError {
             InsertError::ByteaTooLarge => "BYTEA value exceeds the length limit".to_string(),
             InsertError::InvalidJson(detail) => detail.to_string(),
             InsertError::JsonTooLarge => "JSON value exceeds the length limit".to_string(),
+            InsertError::InvalidEnumLabel(detail) => detail.clone(),
         }
     }
 }
@@ -214,11 +220,30 @@ fn bind_row(item: &JsonValue, schema: &TableSchema) -> Result<(u64, Vec<Value>),
             )));
         };
         let column = &schema.columns[col_idx];
-        let value = match (column.ty, raw) {
+        let value = match (&column.ty, raw) {
             (ColumnType::Text, JsonValue::String(s)) => Value::Text(s.clone()),
             (ColumnType::Text, JsonValue::Null) if column.nullable => Value::Null,
+            // ENUM 列は base64 ではなく生のラベル文字列を JSON string として
+            // 受け取る（Issue #890。BYTEA が base64 を採用しているのとは異なる
+            // 表現——ラベルは人間可読な識別子であり、SQL 表層の文字列リテラルと
+            // 同じ表示形にするため）。語彙外は `22P02`、非文字列は `42601`。
+            (ColumnType::Enum(def), JsonValue::String(s)) => {
+                if def.validate_label(s).is_err() {
+                    return Err(InsertError::InvalidEnumLabel(format!(
+                        "INSERT row enum column value {s:?} is not a member of enum type {:?}",
+                        def.name()
+                    )));
+                }
+                Value::Enum(s.clone())
+            }
+            (ColumnType::Enum(_), JsonValue::Null) if column.nullable => Value::Null,
+            (ColumnType::Enum(_), _) => {
+                return Err(InsertError::Bind(SqlSurfaceError::UnsupportedSyntax {
+                    detail: "INSERT row ENUM column value must be a JSON string".to_string(),
+                }))
+            }
             (ColumnType::Vector(dim), JsonValue::Array(items)) => {
-                if items.len() != dim as usize {
+                if items.len() != *dim as usize {
                     return Err(InsertError::Bind(invalid_input_error(
                         "INSERT row VECTOR column length does not match the table dimension",
                     )));
@@ -451,6 +476,13 @@ pub fn execute(
                     InsertError::JsonTooLarge => SqlSurfaceError::PayloadTooLarge {
                         detail: "JSON value exceeds the length limit".to_string(),
                     },
+                    // ENUM 語彙外ラベル（`22P02`）の分類を `SqlSurfaceError` へ
+                    // 写像しても維持する（Issue #890。`invalid_text_representation`
+                    // コンストラクタは engine クレート内 `pub(crate)` のため、
+                    // 他の variant と同じくフィールド直接構築で写像する）。
+                    InsertError::InvalidEnumLabel(detail) => {
+                        SqlSurfaceError::InvalidTextRepresentation { detail }
+                    }
                 })
             },
         )
