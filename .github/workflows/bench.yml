@@ -262,7 +262,7 @@ jobs:
 
   # bench-tier（TASK-116 PLAN-4/6/7 のティア別レイテンシ受け入れ基準）は本
   # workflow に置かない。GitHub ホステッド runner には常駐 Ollama がなく、
-  # self-hosted runner の使用は codex-review の codex ジョブに限る組織承認済み
+  # self-hosted runner の使用は ai-review の codex / review ジョブに限る組織承認済み
   # 例外の範囲外（過去の同種指摘により self-hosted 経路は撤去済み。AGENTS.md
   # 「CI・ワークフローの改変（P1）」）であるため、`BENCH_TIER` を opt-in しても
   # 常に Ollama 接続に失敗し、どの設定でも受け入れ基準を実測して成功させる CI
