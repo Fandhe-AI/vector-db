@@ -164,6 +164,9 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         }
         Cell::Float(f) => Ok(Some(f.to_string())),
         Cell::Bool(b) => Ok(Some(if *b { "t".to_string() } else { "f".to_string() })),
+        // `INTEGER`／`BIGINT` 列の投影結果（Issue #881・TABLE-13・TASK-196）。
+        // `RowDescription` の OID 写像は既存どおり `text`（25）のまま（Issue #895）。
+        Cell::SignedInteger(v) => Ok(Some(v.to_string())),
     }
 }
 

@@ -433,6 +433,7 @@ fn observe_group_slots(
             metadata,
             Some(referenced.scalar_mask()),
         )?;
+        let scanned_text = row_codec::scalar_refs_as_text(&scanned);
         let vector = RowVector {
             dim: arena.dim(),
             values: if referenced.needs_embedding() {
@@ -450,7 +451,7 @@ fn observe_group_slots(
             &bound.items,
             id,
             &vector,
-            &scanned,
+            &scanned_text,
             total_text_accumulator_bytes,
             &mut expr_scratch,
         )?;
@@ -543,6 +544,10 @@ fn observe_candidate_slots_grouped_inner(
         let scanned =
             row_codec::scan_scalar_columns_masked(schema, metadata, Some(referenced.scalar_mask()))
                 .map_err(SqlSurfaceError::from)?;
+        // `GROUP BY` キー列・`matches_all` はいずれも束縛段で TEXT 列のみに
+        // 制限されているため（`bind_group_by_clause`）、`ScalarRef` を TEXT
+        // 専用の借用へ変換して以降の処理をそのまま再利用する（Issue #881 D3）。
+        let scanned = row_codec::scalar_refs_as_text(&scanned);
 
         if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
             continue;
@@ -697,8 +702,10 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         },
         // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT 型の集計結果を
         // HAVING の対象として拒否済みのため到達しない。fail-closed に「不一致」
-        // として扱う。
-        Cell::Null | Cell::Text(_) | Cell::Vector(_) | Cell::Bool(_) => false,
+        // として扱う。`SignedInteger`（Issue #881・#892 まで集計対象外）も同様。
+        Cell::Null | Cell::Text(_) | Cell::Vector(_) | Cell::Bool(_) | Cell::SignedInteger(_) => {
+            false
+        }
     }
 }
 
@@ -1011,11 +1018,12 @@ pub(crate) fn execute_grouped_aggregate(
                 // （`row_codec::scan_scalar_columns_masked`）。`GROUP BY` キー列は
                 // `ReferencedColumns::derive` の `extra_scalar_index` で常にマスクへ
                 // 含まれるため、`any_scalar_column_referenced()` は常に真。
-                let scanned: Vec<Option<&str>> = row_codec::scan_scalar_columns_masked(
+                let scanned = row_codec::scan_scalar_columns_masked(
                     schema,
                     metadata,
                     Some(referenced.scalar_mask()),
                 )?;
+                let scanned: Vec<Option<&str>> = row_codec::scalar_refs_as_text(&scanned);
 
                 // SCALAR 段（WHERE）。
                 if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {

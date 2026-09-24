@@ -159,7 +159,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                 if let Some(column) = schema.columns.get(*index) {
                     match column.ty {
                         ColumnType::Vector(_) => needs_embedding = true,
-                        ColumnType::Text => {
+                        ColumnType::Text | ColumnType::Integer | ColumnType::BigInt => {
                             has_scalar_reference = true;
                             if let Some(slot) = scalar_mask.get_mut(*index) {
                                 *slot = true;
@@ -333,7 +333,7 @@ pub fn execute_scan(
                 }
             }
 
-            let scanned: Vec<Option<&str>> = match tier {
+            let scanned: Vec<Option<row_codec::ScalarRef<'_>>> = match tier {
                 DecodeTier::Fast => {
                     row_codec::validate_scalar_columns(schema, metadata)?;
                     Vec::new()
@@ -343,8 +343,11 @@ pub fn execute_scan(
                 }
             };
 
-            // SCALAR 段（WHERE）。
-            if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
+            // SCALAR 段（WHERE）。`matches_all` は束縛段で TEXT 列のみに制限された
+            // 述語しか受理しないため、TEXT 以外の列は（未参照のまま）`None` へ
+            // 落として渡す（Issue #881 D3・`row_codec::scalar_refs_as_text`）。
+            let scanned_text = row_codec::scalar_refs_as_text(&scanned);
+            if !declarative_filter::matches_all(&bound.metadata_filters, &scanned_text) {
                 continue;
             }
             for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
@@ -438,11 +441,43 @@ pub fn execute_scan(
                                 }
                             }
                             ColumnType::Text => match scanned.get(*index) {
-                                Some(Some(t)) => cells.push(Cell::Text(try_alloc_text_for_budget(
-                                    t,
-                                    &mut byte_budget,
-                                    MAX_SCAN_RESULT_BYTES,
-                                )?)),
+                                Some(Some(row_codec::ScalarRef::Text(t))) => {
+                                    cells.push(Cell::Text(try_alloc_text_for_budget(
+                                        t,
+                                        &mut byte_budget,
+                                        MAX_SCAN_RESULT_BYTES,
+                                    )?))
+                                }
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scanned scalar type mismatch for TEXT column"
+                                            .to_string(),
+                                    })
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Integer => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Integer(v))) => {
+                                    cells.push(Cell::SignedInteger(i64::from(*v)))
+                                }
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scanned scalar type mismatch for INTEGER column"
+                                            .to_string(),
+                                    })
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::BigInt => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::BigInt(v))) => {
+                                    cells.push(Cell::SignedInteger(*v))
+                                }
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scanned scalar type mismatch for BIGINT column"
+                                            .to_string(),
+                                    })
+                                }
                                 Some(None) | None => cells.push(Cell::Null),
                             },
                         }

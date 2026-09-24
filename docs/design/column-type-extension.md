@@ -75,6 +75,7 @@ match にもワイルドカード腕（`_ =>`）を入れない。variant を追
   `tenant::validate_set_assignments` と共有済みであり（先行 Issue で実装済み）、
   本 Issue で新たに壊す理由が薄いと判断した。#881 で `INTEGER` を追加する時点で
   実際に破壊が必要になった場合、その Issue で `!` を付けて対応する。
+  **→ ScalarRef 化済み（#881）**。`docs/design/column-type-integer.md` D3 参照。
 - `sql/parser.rs` の `(ColumnType, InsertLiteral)` 束縛 3 重複の
   `bind_literal_for_column` への集約。挙動不変のリファクタリングだが、
   #880 のスコープ（カタログ v2・型タグ往復の集約）から独立して行える

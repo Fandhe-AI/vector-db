@@ -916,11 +916,12 @@ pub(crate) fn execute_aggregate_with_cache(
                     Vec::new()
                 }
                 DecodeTier::DimAndScalar | DecodeTier::Embedding => {
-                    row_codec::scan_scalar_columns_masked(
+                    let scanned = row_codec::scan_scalar_columns_masked(
                         schema,
                         metadata,
                         Some(referenced.scalar_mask()),
-                    )?
+                    )?;
+                    row_codec::scalar_refs_as_text(&scanned)
                 }
             };
 
@@ -1303,6 +1304,10 @@ pub(crate) fn observe_candidate_slots(
             metadata,
             Some(referenced.scalar_mask()),
         )?;
+        // 集計対象列・`matches_all` はいずれも束縛段で TEXT 列のみに制限されて
+        // いるため（`resolve_aggregate_input`）、TEXT 専用の借用へ変換する
+        // （Issue #881 D3）。
+        let scanned = row_codec::scalar_refs_as_text(&scanned);
 
         if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
             continue;

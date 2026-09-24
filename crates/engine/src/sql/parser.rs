@@ -316,6 +316,60 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
     Ok(values)
 }
 
+/// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）向けの数値リテラル
+/// 束縛。`literal` は `InsertLiteral::Number`（`allowlist::expect_literal` が
+/// 単項マイナスを正規化済み）のみを受理し、`InsertLiteral::String` は
+/// `22000`（PG 互換の暗黙変換は行わない設計判断）で拒否する。範囲外
+/// （`i32::MIN..=i32::MAX`／`i64::MIN..=i64::MAX`）は `22003`
+/// （[`SqlSurfaceError::numeric_out_of_range`]）、小数点・16 進数等の非整数形式は
+/// `22000` で拒否する。エラーメッセージには列名のみを含め、リテラル本文は含めない
+/// （長大な数字列の反射防止）。
+fn bind_integer_literal(
+    name: &str,
+    ty: ColumnType,
+    literal: &InsertLiteral,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    let raw = match literal {
+        InsertLiteral::Number(s) => s,
+        InsertLiteral::String(_) => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {name:?} expects an integer literal, got a string"
+            )))
+        }
+    };
+    match ty {
+        ColumnType::Integer => match raw.parse::<i32>() {
+            Ok(v) => Ok(crate::row_codec::Value::Integer(v)),
+            Err(e) => match e.kind() {
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                    Err(SqlSurfaceError::numeric_out_of_range(format!(
+                        "value out of range for INTEGER column {name:?}"
+                    )))
+                }
+                _ => Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects an integer literal"
+                ))),
+            },
+        },
+        ColumnType::BigInt => match raw.parse::<i64>() {
+            Ok(v) => Ok(crate::row_codec::Value::BigInt(v)),
+            Err(e) => match e.kind() {
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                    Err(SqlSurfaceError::numeric_out_of_range(format!(
+                        "value out of range for BIGINT column {name:?}"
+                    )))
+                }
+                _ => Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects an integer literal"
+                ))),
+            },
+        },
+        ColumnType::Text | ColumnType::Vector(_) => Err(SqlSurfaceError::Internal {
+            detail: "bind_integer_literal called for a non-integer column".to_string(),
+        }),
+    }
+}
+
 /// スキーマの唯一の `VECTOR` 列（インデックス・宣言次元）を返す。`VECTOR` 列を
 /// 持たないテーブルは束縛不能（`catalog.rs::validate_schema` が「`VECTOR` 列は
 /// 高々 1 つ」を DDL 時点で強制済みのため、複数該当は構造上起こらない）。
@@ -328,7 +382,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .enumerate()
         .find_map(|(idx, c)| match c.ty {
             ColumnType::Vector(dim) => Some((idx, dim)),
-            ColumnType::Text => None,
+            ColumnType::Text | ColumnType::Integer | ColumnType::BigInt => None,
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
@@ -364,9 +418,9 @@ pub(crate) fn text_column_index(
                 .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
             match column.ty {
                 ColumnType::Text => Ok(idx),
-                ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} is not a TEXT column"
-                ))),
+                ColumnType::Vector(_) | ColumnType::Integer | ColumnType::BigInt => Err(
+                    SqlSurfaceError::invalid_input(format!("column {name:?} is not a TEXT column")),
+                ),
             }
         })
 }
@@ -1115,6 +1169,9 @@ fn bind_insert_row(
                     "column {name:?} expects a text literal, got a number"
                 )))
             }
+            (ColumnType::Integer | ColumnType::BigInt, _) => {
+                bind_integer_literal(name, column.ty, literal)?
+            }
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
             *slot = value;
@@ -1262,6 +1319,9 @@ fn bind_set_assignments(
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a number"
                 )))
+            }
+            (ColumnType::Integer | ColumnType::BigInt, _) => {
+                bind_integer_literal(name, column.ty, literal)?
             }
         };
         bound.push((col_idx, value));
@@ -1775,6 +1835,9 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a text literal, got a number"
                         )))
                     }
+                    (ColumnType::Integer | ColumnType::BigInt, _) => {
+                        bind_integer_literal(name, column.ty, literal)?
+                    }
                 };
                 BoundUpsertValue::Literal(v)
             }
@@ -1867,6 +1930,9 @@ fn bind_file_insert(
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: VECTOR column must not be provided for file-form INSERT"
                 )))
+            }
+            (ColumnType::Integer | ColumnType::BigInt, _) => {
+                bind_integer_literal(name, column.ty, literal)?
             }
         };
         if col_idx == path_column_index {
@@ -2362,6 +2428,14 @@ fn resolve_aggregate_input(
                     (ColumnType::Vector(_), _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
+                    // `INTEGER`／`BIGINT` 列の集計対応は Issue #892 の担当。
+                    // 本 Issue（#881）では既存の TEXT/VECTOR 以外の列参照と同じ
+                    // fail-closed 拒否に倒す。
+                    (ColumnType::Integer | ColumnType::BigInt, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} cannot be used in aggregate functions yet"
+                        )))
+                    }
                 };
             }
             if name == "id" {

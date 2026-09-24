@@ -294,8 +294,9 @@ pub fn scan_scalar_columns<'a>(
     schema: &engine::catalog::TableSchema,
     metadata: &'a [u8],
 ) -> Result<Vec<Option<&'a str>>, ScanStageError> {
-    row_codec::scan_scalar_columns(schema, metadata)
-        .map_err(|e| ScanStageError::Codec(e.to_string()))
+    let scanned = row_codec::scan_scalar_columns(schema, metadata)
+        .map_err(|e| ScanStageError::Codec(e.to_string()))?;
+    Ok(row_codec::scalar_refs_as_text(&scanned))
 }
 
 /// [`PolicyContext::is_visible`] の薄いラッパー（A3 段の可読性のため）。

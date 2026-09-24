@@ -93,6 +93,12 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             let _ = write!(out, "{v}");
             Ok(())
         }
+        // `INTEGER`／`BIGINT` 列の投影結果（Issue #881・TABLE-13・TASK-196）。
+        // JSON 数値としてそのまま出力する（`Cell::Integer` と同じ infallible 方針）。
+        Cell::SignedInteger(v) => {
+            let _ = write!(out, "{v}");
+            Ok(())
+        }
         Cell::Float(f) => write_finite_f64(out, *f),
         Cell::Bool(b) => {
             out.push_str(if *b { "true" } else { "false" });

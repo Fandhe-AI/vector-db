@@ -168,6 +168,10 @@ pub enum Cell {
     Float(f64),
     /// 式項目（TASK-79・SQL-9）の `Bool` 型評価結果。
     Bool(bool),
+    /// `INTEGER`／`BIGINT` 列の投影結果（Issue #881・TABLE-13・TASK-196）。
+    /// 既存の `Integer(u64)`（疑似列 `id`・`COUNT` 用）とは意味が異なるため
+    /// 別 variant とする。`INTEGER` 列は `i64::from` で無損失に格上げして格納する。
+    SignedInteger(i64),
 }
 
 /// 投影結果の列メタデータ。`Id` は疑似列（`ColumnType` を持たない）。
@@ -729,7 +733,11 @@ pub(crate) fn execute_statement_with_cache(
         // 可視行を無条件に通過させ、DISTANCE 段の後で `apply_scalar_postfilter` が
         // 事後適用する（§モジュールドキュメント参照）。
         if plan.scalar_prefilter {
-            if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
+            // `matches_all` は束縛段で TEXT 列のみに制限された述語しか受理しない
+            // ため、TEXT 以外の列は（未参照のまま）`None` へ落として渡す
+            // （Issue #881 D3・`row_codec::scalar_refs_as_text`）。
+            let scanned_text = row_codec::scalar_refs_as_text(&scanned);
+            if !declarative_filter::matches_all(&bound.metadata_filters, &scanned_text) {
                 return Ok(false);
             }
             // TASK-79（SQL-9）: `WHERE` の式述語（宣言的 UDF・組み込み関数呼び出し）を
@@ -761,7 +769,7 @@ pub(crate) fn execute_statement_with_cache(
         // メント参照）。
         if is_hybrid && !skip_sparse_accumulation {
             if let Some(idx) = text_column_index {
-                if let Some(Some(t)) = scanned.get(idx) {
+                if let Some(Some(row_codec::ScalarRef::Text(t))) = scanned.get(idx) {
                     if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
                         return Err(ArenaError::CapacityExceeded);
                     }
@@ -820,7 +828,7 @@ pub(crate) fn execute_statement_with_cache(
                 }
                 match slot {
                     None => kept.push(Value::Null),
-                    Some(t) => {
+                    Some(row_codec::ScalarRef::Text(t)) => {
                         let owned = try_alloc_text_for_budget(
                             t,
                             &mut candidate_scalar_bytes,
@@ -828,6 +836,8 @@ pub(crate) fn execute_statement_with_cache(
                         )?;
                         kept.push(Value::Text(owned));
                     }
+                    Some(row_codec::ScalarRef::Integer(v)) => kept.push(Value::Integer(v)),
+                    Some(row_codec::ScalarRef::BigInt(v)) => kept.push(Value::BigInt(v)),
                 }
             }
             kept
@@ -1804,7 +1814,7 @@ pub(crate) fn execute_statement_with_cache(
                 .iter()
                 .map(|v| match v {
                     Value::Text(t) => Some(t.as_str()),
-                    Value::Null | Value::Vector(_) => None,
+                    Value::Null | Value::Vector(_) | Value::Integer(_) | Value::BigInt(_) => None,
                 })
                 .collect();
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
@@ -2126,7 +2136,7 @@ fn decode_deferred_scalars(
         }
         match slot {
             None => out.push(Value::Null),
-            Some(t) => {
+            Some(row_codec::ScalarRef::Text(t)) => {
                 let owned = try_alloc_text_for_budget(t, budget, MAX_CANDIDATE_SCALAR_BYTES)
                     .map_err(|_| {
                         SqlSurfaceError::payload_too_large(
@@ -2135,6 +2145,8 @@ fn decode_deferred_scalars(
                     })?;
                 out.push(Value::Text(owned));
             }
+            Some(row_codec::ScalarRef::Integer(v)) => out.push(Value::Integer(v)),
+            Some(row_codec::ScalarRef::BigInt(v)) => out.push(Value::BigInt(v)),
         }
     }
     Ok(out)
@@ -2359,7 +2371,33 @@ fn project_rows(
                         ColumnType::Text => match decoded.get(*index) {
                             Some(Value::Text(t)) => cells.push(Cell::Text(try_clone_text(t)?)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_)) => {
+                            Some(Value::Vector(_))
+                            | Some(Value::Integer(_))
+                            | Some(Value::BigInt(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Integer => match decoded.get(*index) {
+                            Some(Value::Integer(v)) => {
+                                cells.push(Cell::SignedInteger(i64::from(*v)))
+                            }
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::BigInt(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::BigInt => match decoded.get(*index) {
+                            Some(Value::BigInt(v)) => cells.push(Cell::SignedInteger(*v)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Integer(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2936,7 +2974,8 @@ pub(crate) fn execute_predicate_delete(
 
     let predicate = |candidate: &crate::tenant::DmlCandidate<'_>| -> Result<bool, SqlSurfaceError> {
         let scanned = row_codec::scan_scalar_columns(schema, candidate.metadata)?;
-        if !declarative_filter::matches_all(metadata_filters, &scanned) {
+        let scanned_text = row_codec::scalar_refs_as_text(&scanned);
+        if !declarative_filter::matches_all(metadata_filters, &scanned_text) {
             return Ok(false);
         }
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {
@@ -3020,7 +3059,8 @@ pub(crate) fn execute_predicate_update(
 
     let predicate = |candidate: &crate::tenant::DmlCandidate<'_>| -> Result<bool, SqlSurfaceError> {
         let scanned = row_codec::scan_scalar_columns(schema, candidate.metadata)?;
-        if !declarative_filter::matches_all(metadata_filters, &scanned) {
+        let scanned_text = row_codec::scalar_refs_as_text(&scanned);
+        if !declarative_filter::matches_all(metadata_filters, &scanned_text) {
             return Ok(false);
         }
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {

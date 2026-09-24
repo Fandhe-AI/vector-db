@@ -80,6 +80,15 @@ pub(crate) fn scalar_text_entry_len(text_len: u32) -> Result<u32> {
         .ok_or_else(|| RowCodecError::Invalid("scalar payload entry length overflow".to_string()))
 }
 
+/// `INTEGER` 列 1 個分のフレーム込みバイト数（presence(1) + 本体(4)。固定幅・
+/// 長さプレフィックスなし。Issue #881 D2）。`tenant::validate_set_assignments` の
+/// 事前検証と実エンコードが同じ計算式を共有するため公開する（[`SCALAR_TEXT_ENTRY_OVERHEAD`]
+/// と同じ理由）。
+pub(crate) const SCALAR_INT4_ENTRY_LEN: u32 = 5;
+
+/// `BIGINT` 列 1 個分のフレーム込みバイト数（presence(1) + 本体(8)。Issue #881 D2）。
+pub(crate) const SCALAR_INT8_ENTRY_LEN: u32 = 9;
+
 /// 列値の有無を示すタグバイト。未知の値は fail-closed に拒否する（presence の
 /// 黙殺フォールバックは NULL/値ありの取り違えに直結するため許容しない）。
 const PRESENCE_NULL: u8 = 0x00;
@@ -110,11 +119,30 @@ impl std::error::Error for RowCodecError {}
 pub type Result<T> = std::result::Result<T, RowCodecError>;
 
 /// 1 列分の値。[`ColumnType`] に対応する（`Null` は nullable 列にのみ許容される）。
+/// `Integer`／`BigInt`（Issue #881・TABLE-13・TASK-196）は幅ごとに variant を
+/// 分けることで、encode 時に `ColumnType` との型一致検査だけで値域の再検査なしに
+/// 取り違えを防げる設計にした（D1）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
     Text(String),
     Vector(Vec<f32>),
+    /// 符号付き 32 ビット整数（`ColumnType::Integer`）。
+    Integer(i32),
+    /// 符号付き 64 ビット整数（`ColumnType::BigInt`）。
+    BigInt(i64),
+}
+
+/// [`scan_scalar_columns`]／[`scan_scalar_columns_masked`] が返す借用スカラー値
+/// （Issue #881 D3。ADR `docs/design/column-type-extension.md` の申し送り事項）。
+/// `TEXT` 列は複製せず `&str` を借用したまま返し、`INTEGER`／`BIGINT` は固定幅の
+/// ため複製コストが無く値そのものを返す。`#[non_exhaustive]` は付けない
+/// （Issue #880 D1 と同じ方針。型追加時にコンパイラが全呼び出し元を列挙する）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScalarRef<'a> {
+    Text(&'a str),
+    Integer(i32),
+    BigInt(i64),
 }
 
 /// デコード結果。行レベルの RLS フィールド（`tenant_id`・`visibility`）と、
@@ -213,7 +241,7 @@ pub fn encode_row(
             Value::Vector(vector) => {
                 let expected_dim = match column.ty {
                     ColumnType::Vector(dim) => dim,
-                    ColumnType::Text => {
+                    ColumnType::Text | ColumnType::Integer | ColumnType::BigInt => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Vector value, got Vector",
                             column.name
@@ -239,6 +267,26 @@ pub fn encode_row(
                 for v in vector {
                     buf.extend_from_slice(&v.to_le_bytes());
                 }
+            }
+            Value::Integer(v) => {
+                if !matches!(column.ty, ColumnType::Integer) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Integer value, got Integer",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::BigInt(v) => {
+                if !matches!(column.ty, ColumnType::BigInt) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-BigInt value, got BigInt",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&v.to_le_bytes());
             }
         }
     }
@@ -416,6 +464,32 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     offset = vector_end;
                     values.push(Value::Vector(vector));
                 }
+                ColumnType::Integer => {
+                    let field_end = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after integer field".to_string())
+                    })?;
+                    let field_bytes = buf.get(offset..field_end).ok_or_else(|| {
+                        RowCodecError::Invalid("row buffer truncated at integer field".to_string())
+                    })?;
+                    let arr: [u8; 4] = field_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("integer field is not 4 bytes".to_string())
+                    })?;
+                    offset = field_end;
+                    values.push(Value::Integer(i32::from_le_bytes(arr)));
+                }
+                ColumnType::BigInt => {
+                    let field_end = offset.checked_add(8).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after bigint field".to_string())
+                    })?;
+                    let field_bytes = buf.get(offset..field_end).ok_or_else(|| {
+                        RowCodecError::Invalid("row buffer truncated at bigint field".to_string())
+                    })?;
+                    let arr: [u8; 8] = field_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("bigint field is not 8 bytes".to_string())
+                    })?;
+                    offset = field_end;
+                    values.push(Value::BigInt(i64::from_le_bytes(arr)));
+                }
             },
             other => {
                 return Err(RowCodecError::Invalid(format!(
@@ -533,6 +607,28 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     column.name
                 )))
             }
+            Value::Integer(v) => {
+                if !matches!(column.ty, ColumnType::Integer) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Integer value, got Integer",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_INT4_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::BigInt(v) => {
+                if !matches!(column.ty, ColumnType::BigInt) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-BigInt value, got BigInt",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_INT8_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
         }
     }
 
@@ -559,7 +655,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
 /// 由来する不変条件のため、念のため上限超過は同じ `Err` で fail-closed に拒否する。
 pub(crate) fn merge_encode_scalar_columns(
     schema: &TableSchema,
-    existing: &[Option<&str>],
+    existing: &[Option<ScalarRef<'_>>],
     overrides: &[(usize, &Value)],
 ) -> Result<Vec<u8>> {
     if existing.len() > schema.columns.len() {
@@ -641,13 +737,36 @@ pub(crate) fn merge_encode_scalar_columns(
                         column.name
                     )))
                 }
+                Value::Integer(v) => {
+                    if !matches!(column.ty, ColumnType::Integer) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Integer value, got Integer",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_INT4_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                Value::BigInt(v) => {
+                    if !matches!(column.ty, ColumnType::BigInt) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-BigInt value, got BigInt",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_INT8_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
             }
         } else {
-            // SET 対象でない列は既存の借用 `&str`（またはNULL）をそのまま書き込む。
+            // SET 対象でない列は既存の借用値（またはNULL）をそのまま書き込む。
             // `existing` は `scan_scalar_columns` の契約により non-nullable 列で
             // `None` になり得ないが（構造検証済み）、untrusted な格納済みデータに
             // 由来する不変条件のため呼び出し元契約が破れた場合も fail-closed に
-            // 拒否する。
+            // 拒否する。`ScalarRef` の型が列型と一致しない場合（呼び出し元契約が
+            // 破れた場合）も同様に fail-closed に拒否する（Issue #881 D3）。
             match existing.get(idx).copied().flatten() {
                 None => {
                     if !column.nullable {
@@ -659,8 +778,36 @@ pub(crate) fn merge_encode_scalar_columns(
                     reserve(&mut buf, 1)?;
                     buf.push(PRESENCE_NULL);
                 }
-                Some(text) => {
+                Some(ScalarRef::Text(text)) => {
+                    if !matches!(column.ty, ColumnType::Text) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Text existing value, got Text",
+                            column.name
+                        )));
+                    }
                     write_text(&mut buf, &mut reserve, text.as_bytes())?;
+                }
+                Some(ScalarRef::Integer(v)) => {
+                    if !matches!(column.ty, ColumnType::Integer) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Integer existing value, got Integer",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_INT4_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                Some(ScalarRef::BigInt(v)) => {
+                    if !matches!(column.ty, ColumnType::BigInt) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-BigInt existing value, got BigInt",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_INT8_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&v.to_le_bytes());
                 }
             }
         }
@@ -689,7 +836,7 @@ pub(crate) fn merge_encode_scalar_columns(
 pub fn scan_scalar_columns<'a>(
     schema: &TableSchema,
     buf: &'a [u8],
-) -> Result<Vec<Option<&'a str>>> {
+) -> Result<Vec<Option<ScalarRef<'a>>>> {
     scan_scalar_columns_masked(schema, buf, None)
 }
 
@@ -708,8 +855,8 @@ pub fn scan_scalar_columns_masked<'a>(
     schema: &TableSchema,
     buf: &'a [u8],
     mask: Option<&[bool]>,
-) -> Result<Vec<Option<&'a str>>> {
-    let mut values: Vec<Option<&'a str>> = Vec::new();
+) -> Result<Vec<Option<ScalarRef<'a>>>> {
+    let mut values: Vec<Option<ScalarRef<'a>>> = Vec::new();
     values
         .try_reserve_exact(schema.columns.len())
         .map_err(|_| RowCodecError::Invalid("failed to reserve scalar scan output".to_string()))?;
@@ -745,7 +892,7 @@ fn scan_scalar_columns_validated<'a>(
     schema: &TableSchema,
     buf: &'a [u8],
     mask: Option<&[bool]>,
-    mut sink: impl FnMut(usize, Option<&'a str>) -> Result<()>,
+    mut sink: impl FnMut(usize, Option<ScalarRef<'a>>) -> Result<()>,
 ) -> Result<()> {
     if let Some(m) = mask {
         if m.len() != schema.columns.len() {
@@ -789,55 +936,108 @@ fn scan_scalar_columns_validated<'a>(
                 }
                 sink(col_index, None)?;
             }
-            PRESENCE_VALUE => {
-                let len_bytes = buf
-                    .get(
-                        offset..offset.checked_add(4).ok_or_else(|| {
+            PRESENCE_VALUE => match column.ty {
+                ColumnType::Text => {
+                    let len_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before text length field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
                             RowCodecError::Invalid(
-                                "offset overflow before text length field".to_string(),
+                                "scalar payload truncated at text length field".to_string(),
                             )
-                        })?,
-                    )
-                    .ok_or_else(|| {
+                        })?;
+                    let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("text length field is not 4 bytes".to_string())
+                    })?;
+                    let text_len = u32::from_le_bytes(len_arr);
+                    if text_len > MAX_TEXT_FIELD_LEN {
+                        return Err(RowCodecError::Invalid(format!(
+                            "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
                         RowCodecError::Invalid(
-                            "scalar payload truncated at text length field".to_string(),
+                            "offset overflow after text length field".to_string(),
                         )
                     })?;
-                let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
-                    RowCodecError::Invalid("text length field is not 4 bytes".to_string())
-                })?;
-                let text_len = u32::from_le_bytes(len_arr);
-                if text_len > MAX_TEXT_FIELD_LEN {
-                    return Err(RowCodecError::Invalid(format!(
-                        "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
-                    )));
+                    let text_end = offset.checked_add(text_len as usize).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after text field".to_string())
+                    })?;
+                    let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
+                        RowCodecError::Invalid("scalar payload truncated at text field".to_string())
+                    })?;
+                    offset = text_end;
+                    // UTF-8 妥当性検証は要求列・非要求列を問わず常に行う（codex-review
+                    // P1 指摘・PR #369: 未参照列でも不正 UTF-8 を含む永続行を fail-closed
+                    // で拒否する既存のエラー契約（`XX000`）を維持する必要があるため）。
+                    // マスクで要求されなかった列（`validate_scalar_columns` 経由は常に
+                    // 全列非要求）は、検証済みの `&str` を破棄して `None` を渡すことで
+                    // `&str` 生成・保持コストのみを省略する（Issue #350: 必要列限定
+                    // デコード）。
+                    let text = std::str::from_utf8(text_bytes).map_err(|_| {
+                        RowCodecError::Invalid("text field is not valid UTF-8".to_string())
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Text(text)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
                 }
-                offset = offset.checked_add(4).ok_or_else(|| {
-                    RowCodecError::Invalid("offset overflow after text length field".to_string())
-                })?;
-                let text_end = offset.checked_add(text_len as usize).ok_or_else(|| {
-                    RowCodecError::Invalid("offset overflow after text field".to_string())
-                })?;
-                let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
-                    RowCodecError::Invalid("scalar payload truncated at text field".to_string())
-                })?;
-                offset = text_end;
-                // UTF-8 妥当性検証は要求列・非要求列を問わず常に行う（codex-review
-                // P1 指摘・PR #369: 未参照列でも不正 UTF-8 を含む永続行を fail-closed
-                // で拒否する既存のエラー契約（`XX000`）を維持する必要があるため）。
-                // マスクで要求されなかった列（`validate_scalar_columns` 経由は常に
-                // 全列非要求）は、検証済みの `&str` を破棄して `None` を渡すことで
-                // `&str` 生成・保持コストのみを省略する（Issue #350: 必要列限定
-                // デコード）。
-                let text = std::str::from_utf8(text_bytes).map_err(|_| {
-                    RowCodecError::Invalid("text field is not valid UTF-8".to_string())
-                })?;
-                if wanted {
-                    sink(col_index, Some(text))?;
-                } else {
-                    sink(col_index, None)?;
+                ColumnType::Integer => {
+                    let field_end = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after integer field".to_string())
+                    })?;
+                    let field_bytes = buf.get(offset..field_end).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "scalar payload truncated at integer field".to_string(),
+                        )
+                    })?;
+                    let arr: [u8; 4] = field_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("integer field is not 4 bytes".to_string())
+                    })?;
+                    offset = field_end;
+                    let v = i32::from_le_bytes(arr);
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Integer(v)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
                 }
-            }
+                ColumnType::BigInt => {
+                    let field_end = offset.checked_add(8).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after bigint field".to_string())
+                    })?;
+                    let field_bytes = buf.get(offset..field_end).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "scalar payload truncated at bigint field".to_string(),
+                        )
+                    })?;
+                    let arr: [u8; 8] = field_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("bigint field is not 8 bytes".to_string())
+                    })?;
+                    offset = field_end;
+                    let v = i64::from_le_bytes(arr);
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::BigInt(v)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+                // `VECTOR` 列は上の `continue` で常にスキップされるため構造的に
+                // 到達しないが、engine コードは panic させない方針
+                // （.claude/rules/coding-rust.md）のため `unreachable!` ではなく
+                // fail-closed な `Err` で扱う。
+                ColumnType::Vector(_) => {
+                    return Err(RowCodecError::Invalid(
+                        "VECTOR column reached scalar payload decoder".to_string(),
+                    ))
+                }
+            },
             other => {
                 return Err(RowCodecError::Invalid(format!(
                     "unknown presence byte: {other}"
@@ -853,6 +1053,29 @@ fn scan_scalar_columns_validated<'a>(
     }
 
     Ok(())
+}
+
+/// [`ScalarRef`] の走査結果から `TEXT` 値のみを取り出す（Issue #881 D3）。
+/// `declarative_filter::matches_all`／集計・`GROUP BY` の列参照はいずれも
+/// 束縛段（`sql/parser.rs`）で `TEXT` 列のみを受理する契約（`INTEGER`／`BIGINT`
+/// 列参照は `22000` で拒否済み）のため、実際に参照されるインデックスは常に
+/// `ScalarRef::Text` になる。本関数は未参照のまま残る `INTEGER`／`BIGINT` 列を
+/// （`VECTOR` 列と同じく）`None` へ落とし、既存の `&[Option<&str>]` 呼び出し規約
+/// （`matches_all`・`accumulate_row`・投影の本文列複製）をそのまま再利用できるように
+/// する。**この安全性は「束縛段が非 TEXT 列の参照を拒否する」という契約に依存する
+/// fail-closed 設計**であり、本関数自体は呼び出し元が渡すインデックスの型を検証
+/// しない。`INTEGER`／`BIGINT` 列参照の解禁（Issue #892 の集計・#891 の式評価）が
+/// 実装される際は、束縛段の拒否を外す前にこの関数の呼び出し元（あるいは本関数
+/// 自体）を見直すこと（黙って `None` に落とすと、値が存在するのに一致しない
+/// fail-open へ変わりかねない）。
+pub fn scalar_refs_as_text<'a>(scanned: &[Option<ScalarRef<'a>>]) -> Vec<Option<&'a str>> {
+    scanned
+        .iter()
+        .map(|slot| match slot {
+            Some(ScalarRef::Text(t)) => Some(*t),
+            Some(ScalarRef::Integer(_)) | Some(ScalarRef::BigInt(_)) | None => None,
+        })
+        .collect()
 }
 
 /// [`encode_scalar_columns`] の逆変換。戻り値は `schema.columns` と同じ長さ・順序を
@@ -875,7 +1098,7 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
     for slot in scanned {
         match slot {
             None => values.push(Value::Null),
-            Some(text) => {
+            Some(ScalarRef::Text(text)) => {
                 let mut owned = String::new();
                 owned.try_reserve_exact(text.len()).map_err(|_| {
                     RowCodecError::Invalid("failed to reserve text field".to_string())
@@ -883,6 +1106,8 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
                 owned.push_str(text);
                 values.push(Value::Text(owned));
             }
+            Some(ScalarRef::Integer(v)) => values.push(Value::Integer(v)),
+            Some(ScalarRef::BigInt(v)) => values.push(Value::BigInt(v)),
         }
     }
     Ok(values)
@@ -1271,15 +1496,20 @@ mod tests {
         assert_eq!(scanned[0], None); // VECTOR 列は常に None
         let buf_range = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
         for slot in scanned.iter().skip(1) {
-            let s = slot.expect("text column must be Some");
+            let ScalarRef::Text(s) = slot.expect("text column must be Some") else {
+                panic!("text column must decode as ScalarRef::Text");
+            };
             let ptr = s.as_ptr() as usize;
             assert!(
                 buf_range.contains(&ptr),
                 "scanned &str must borrow from buf, not allocate a copy"
             );
         }
-        assert_eq!(scanned[1], Some("body-text".repeat(1000).as_str()));
-        assert_eq!(scanned[2], Some("tag-value"));
+        assert_eq!(
+            scanned[1],
+            Some(ScalarRef::Text("body-text".repeat(1000).as_str()))
+        );
+        assert_eq!(scanned[2], Some(ScalarRef::Text("tag-value")));
     }
 
     #[test]
@@ -1316,7 +1546,7 @@ mod tests {
         for (slot, value) in scanned.iter().zip(decoded.iter()) {
             match (slot, value) {
                 (None, Value::Null) => {}
-                (Some(s), Value::Text(t)) => assert_eq!(*s, t.as_str()),
+                (Some(ScalarRef::Text(s)), Value::Text(t)) => assert_eq!(*s, t.as_str()),
                 other => panic!("scan/decode mismatch: {other:?}"),
             }
         }
@@ -1354,7 +1584,7 @@ mod tests {
         let scanned = scan_scalar_columns_masked(&schema, &buf, Some(&mask)).expect("scan masked");
         assert_eq!(scanned[0], None); // VECTOR 列は常に None
         assert_eq!(scanned[1], None); // マスク対象外
-        assert_eq!(scanned[2], Some("wanted"));
+        assert_eq!(scanned[2], Some(ScalarRef::Text("wanted")));
     }
 
     #[test]
@@ -1442,5 +1672,144 @@ mod tests {
             validate_scalar_columns(&schema, &buf),
             Err(RowCodecError::Invalid(_))
         ));
+    }
+
+    // --- INTEGER / BIGINT（Issue #881・TABLE-13・TASK-196） -----------------
+
+    fn integer_bigint_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("n", ColumnType::Integer, false),
+                ColumnDef::new("b", ColumnType::BigInt, false),
+                ColumnDef::new("nn", ColumnType::Integer, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_preserves_integer_and_bigint_boundary_values() {
+        let schema = integer_bigint_schema();
+        let values = vec![
+            Value::Integer(i32::MIN),
+            Value::BigInt(i64::MAX),
+            Value::Null,
+        ];
+        let encoded = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        let decoded = decode_row(&schema, &encoded).expect("decode");
+        assert_eq!(decoded.values, values);
+
+        let values2 = vec![
+            Value::Integer(i32::MAX),
+            Value::BigInt(i64::MIN),
+            Value::Integer(0),
+        ];
+        let encoded2 =
+            encode_row(&schema, "tenant-a", Visibility::Public, &values2).expect("encode");
+        let decoded2 = decode_row(&schema, &encoded2).expect("decode");
+        assert_eq!(decoded2.values, values2);
+    }
+
+    #[test]
+    fn encode_rejects_integer_value_for_bigint_column_and_vice_versa() {
+        let schema = integer_bigint_schema();
+        let values = vec![Value::BigInt(1), Value::BigInt(2), Value::Null];
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &values),
+            Err(RowCodecError::Invalid(_))
+        ));
+        let values2 = vec![Value::Integer(1), Value::Integer(2), Value::Null];
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &values2),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_buffer_at_integer_and_bigint_field_boundaries() {
+        let schema = integer_bigint_schema();
+        let values = vec![Value::Integer(42), Value::BigInt(-7), Value::Null];
+        let encoded = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        // 末尾（nullable 列の NULL 1 バイト）を除く全ての切断点で Err になる。
+        for cut in 1..encoded.len() - 1 {
+            let truncated = &encoded[..cut];
+            assert!(
+                decode_row(&schema, truncated).is_err(),
+                "expected Err when truncated at byte {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_payload_roundtrip_preserves_integer_and_bigint_and_leaves_text_only_bytes_unchanged()
+    {
+        let schema = integer_bigint_schema();
+        let values = vec![Value::Integer(7), Value::BigInt(-9), Value::Integer(0)];
+        let encoded = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        let decoded = decode_scalar_columns(&schema, &encoded).expect("decode scalar");
+        assert_eq!(decoded, values);
+
+        // TEXT/VECTOR のみの既存スキーマでは、スカラーペイロードのバイト列が
+        // 本 Issue の前後で完全に不変であることを固定する（golden）。
+        let text_schema = text_vector_schema();
+        let text_values = vec![
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::Text("hello".to_string()),
+            Value::Null,
+        ];
+        let text_encoded = encode_scalar_columns(&text_schema, &text_values).expect("encode");
+        // presence(1) + len(4) + "hello"(5) = 10、続いて NULL の presence(1)。
+        assert_eq!(
+            text_encoded,
+            vec![
+                PRESENCE_VALUE,
+                5,
+                0,
+                0,
+                0,
+                b'h',
+                b'e',
+                b'l',
+                b'l',
+                b'o',
+                PRESENCE_NULL,
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_encode_scalar_columns_rewrites_existing_integer_and_bigint_values() {
+        let schema = integer_bigint_schema();
+        let existing = [
+            Some(ScalarRef::Integer(1)),
+            Some(ScalarRef::BigInt(2)),
+            None,
+        ];
+        // SET 対象は列 1（BigInt）のみ。列 0・2 は既存値をそのまま書き戻す。
+        let new_bigint = Value::BigInt(999);
+        let overrides: Vec<(usize, &Value)> = vec![(1, &new_bigint)];
+        let merged =
+            merge_encode_scalar_columns(&schema, &existing, &overrides).expect("merge encode");
+        let decoded = decode_scalar_columns(&schema, &merged).expect("decode merged");
+        assert_eq!(
+            decoded,
+            vec![Value::Integer(1), Value::BigInt(999), Value::Null]
+        );
+    }
+
+    #[test]
+    fn scan_scalar_columns_returns_integer_and_bigint_as_scalar_ref() {
+        let schema = integer_bigint_schema();
+        let values = vec![Value::Integer(5), Value::BigInt(-5), Value::Null];
+        let buf = encode_scalar_columns(&schema, &values).expect("encode");
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan");
+        assert_eq!(
+            scanned,
+            vec![
+                Some(ScalarRef::Integer(5)),
+                Some(ScalarRef::BigInt(-5)),
+                None,
+            ]
+        );
     }
 }

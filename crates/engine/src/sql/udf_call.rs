@@ -708,6 +708,13 @@ fn bind_expr_in(
                     ColumnType::Text => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (TEXT columns are not supported)"
                     ))),
+                    // `INTEGER`／`BIGINT` 列の式参照対応は Issue #891 の担当。
+                    // 本 Issue（#881）では TEXT 列と同じ fail-closed 拒否に倒す。
+                    ColumnType::Integer | ColumnType::BigInt => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} cannot be used in an expression yet"
+                        )))
+                    }
                 };
             }
             if name == "id" {

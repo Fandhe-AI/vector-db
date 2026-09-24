@@ -1684,6 +1684,39 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (crate::catalog::ColumnType::Integer, crate::row_codec::Value::Integer(_)) => {
+                // 固定幅（presence(1) + 本体(4)）のため、事前検証は累計バイト
+                // 予算への計上だけでよい（値域は束縛段
+                // `sql::parser::bind_integer_literal` が既に検証済み）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_INT4_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::BigInt, crate::row_codec::Value::BigInt(_)) => {
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_INT8_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             _ => {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column type does not match the current table schema".to_string(),
@@ -2976,6 +3009,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 max_id = Some(max_id.map_or(id, |m: u64| m.max(id)));
                 let scanned = crate::row_codec::scan_scalar_columns(&schema, metadata)
                     .map_err(|e| TenantWriteError::Storage(StorageError::Codec(e.to_string())))?;
+                let scanned = crate::row_codec::scalar_refs_as_text(&scanned);
                 if scanned.get(key_idx).copied().flatten() == Some(key_value) {
                     to_remove.push(id);
                     if to_remove.len() > MAX_VISIBLE_ROWS {
@@ -3453,7 +3487,10 @@ mod tests {
                 let scanned =
                     crate::row_codec::scan_scalar_columns(&file_schema("docs"), &r.metadata)
                         .expect("scan scalar columns");
-                scanned.get(2).copied().flatten().unwrap_or("")
+                match scanned.get(2).copied().flatten() {
+                    Some(crate::row_codec::ScalarRef::Text(t)) => t,
+                    _ => "",
+                }
             })
             .collect();
         assert_eq!(rows.len(), 3);
@@ -4251,7 +4288,10 @@ mod tests {
         let match_lang_ja = |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> {
             let existing = crate::row_codec::scan_scalar_columns(&schema, c.metadata)
                 .expect("decode seeded metadata");
-            Ok(matches!(existing.first(), Some(Some(s)) if *s == "ja"))
+            Ok(matches!(
+                existing.first(),
+                Some(Some(crate::row_codec::ScalarRef::Text(s))) if *s == "ja"
+            ))
         };
         let op_id = OperationId::parse("op-pred-no-vector-column").expect("valid operation_id");
 

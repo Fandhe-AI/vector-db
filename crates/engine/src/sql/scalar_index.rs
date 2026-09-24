@@ -65,7 +65,7 @@ use redb::ReadableDatabase;
 use crate::catalog::{ColumnType, TableSchema};
 use crate::declarative_filter::{FilterOp, MetadataFilter};
 use crate::policy::PolicyContext;
-use crate::row_codec::scan_scalar_columns;
+use crate::row_codec::{self, scan_scalar_columns};
 use crate::sql::arena_cache::SqlArenaSnapshot;
 use crate::storage::Storage;
 
@@ -542,7 +542,11 @@ impl ScalarIndex {
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     per_column.push(Some(acc));
                 }
-                ColumnType::Vector(_) => per_column.push(None),
+                // `INTEGER`／`BIGINT` 列の索引対応は Issue #893 の担当。本 Issue
+                // （#881）では `Vector` 列と同じく未索引のまま扱う。
+                ColumnType::Vector(_) | ColumnType::Integer | ColumnType::BigInt => {
+                    per_column.push(None)
+                }
             }
         }
 
@@ -564,6 +568,15 @@ impl ScalarIndex {
                 if !is_indexed_column {
                     continue;
                 }
+                // 索引対象（`per_column[col_index] == Some(_)`）は `TEXT` 列
+                // 構築時にのみ `Some` を積む契約（上の初期化ループ参照）ため、
+                // ここへ到達する値は常に `ScalarRef::Text`。`INTEGER`／`BIGINT`
+                // は未索引のまま（`per_column` が `None`）のため、
+                // `is_indexed_column` チェックで既に弾かれている。
+                let v: &str = match v {
+                    row_codec::ScalarRef::Text(t) => t,
+                    row_codec::ScalarRef::Integer(_) | row_codec::ScalarRef::BigInt(_) => continue,
+                };
                 let v_len = v.len();
                 let (Some(&running), Some(&nonnull)) = (
                     col_running_bytes.get(col_index),
@@ -2308,6 +2321,7 @@ mod tests {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let scanned = scan_scalar_columns(schema, metadata).expect("decode row");
+            let scanned = row_codec::scalar_refs_as_text(&scanned);
             let value = scanned.get(filter.column_index()).copied().flatten();
             if filter.matches(value) {
                 out.push(slot as u32);

@@ -1815,7 +1815,22 @@ impl<'a> Parser<'a> {
 
     /// VALUES リストの 1 要素（文字列リテラルまたは数値リテラルのみ。関数呼び出し・
     /// 括弧・`NULL` キーワード等は許可リスト外）。
+    /// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）の負数リテラルを
+    /// 受理するため、`-` の直後に `Number` トークンが続く形（`parse_having` の
+    /// 単項マイナス処理と同じ規範。空白を挟む形も許容）だけを単項マイナスとして
+    /// 認め、`InsertLiteral::Number("-<digits>")` へ正規化する。`- -1`・`-'x'`・
+    /// `+1` はいずれも従来どおり構造的に受理しない（`42601`）。実際の値域検証・
+    /// パースは束縛段（`sql::parser::bind_integer_literal`）が行う。
     fn expect_literal(&mut self) -> Result<InsertLiteral, SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct('-'))) {
+            self.advance();
+            return match self.advance() {
+                Some(Token::Number(n)) => Ok(InsertLiteral::Number(format!("-{n}"))),
+                other => Err(SqlSurfaceError::unsupported(format!(
+                    "expected numeric literal after unary minus, got {other:?}"
+                ))),
+            };
+        }
         match self.advance() {
             Some(Token::StringLiteral(s)) => Ok(InsertLiteral::String(s.clone())),
             Some(Token::Number(n)) => Ok(InsertLiteral::Number(n.clone())),
@@ -3976,6 +3991,78 @@ mod tests {
             stmt.operation_id.as_ref().map(OperationId::as_str),
             Some("op-0001")
         );
+    }
+
+    // --- 単項マイナス（Issue #881・TABLE-13・TASK-196） ---
+
+    /// `-` の直後に数値トークンが続く形は単項マイナスとして受理し、
+    /// `InsertLiteral::Number("-<digits>")` へ正規化する（`INTEGER`／`BIGINT`
+    /// 列の負数リテラルを許可リストの構造段で通すための変更。値域検証・
+    /// パースは束縛段（`sql::parser::bind_integer_literal`）が行う）。
+    #[test]
+    fn accepts_negative_number_literal_in_values() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', -5) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("negative number literal should be accepted");
+        assert_eq!(
+            stmt.rows,
+            vec![vec![
+                InsertLiteral::Number("1".to_string()),
+                InsertLiteral::String("[0.1,0.2]".to_string()),
+                InsertLiteral::Number("-5".to_string()),
+            ]]
+        );
+    }
+
+    /// 空白を挟んだ単項マイナス（`- 5`）も同じ形として受理する。
+    #[test]
+    fn accepts_negative_number_literal_with_whitespace_between_minus_and_digits() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', - 5) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("negative number literal with whitespace should be accepted");
+        assert_eq!(stmt.rows[0][2], InsertLiteral::Number("-5".to_string()));
+    }
+
+    /// `- -1`（二重マイナス）・`+1`（単項プラス）は構造的に受理しない（`42601`）。
+    #[test]
+    fn rejects_double_minus_and_unary_plus_number_literals() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', - -1) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+
+        let err2 = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', +1) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err2.wire_code(), "42601");
+    }
+
+    /// `-'x'`（マイナスの直後に文字列リテラル）は構造的に受理しない（`42601`）。
+    #[test]
+    fn rejects_minus_followed_by_string_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', -'x') USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     // --- RETURNING（Issue #873・SQL-21） ---
