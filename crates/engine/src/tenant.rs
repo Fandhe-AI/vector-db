@@ -1684,17 +1684,32 @@ fn validate_set_assignments(
                     ))));
                 }
             }
-            // F3（Issue #882 計画）: REAL/DOUBLE の SET 値は固定長ペイロード
-            // （`SCALAR_REAL_ENTRY_LEN`／`SCALAR_DOUBLE_ENTRY_LEN`）のため累計上限
-            // には計上せず、非有限値のみ対象行の探索より前に拒否する（TEXT と
-            // 異なり長さ自体が固定のため、`MAX_SCALAR_PAYLOAD_LEN` を跨ぐには
-            // 列数が極端に必要で、列数自体は `catalog::MAX_COLUMN_COUNT` で
-            // 別途頭打ちにされている）。
+            // REAL/DOUBLE の SET 値は固定長ペイロード（`SCALAR_REAL_ENTRY_LEN`／
+            // `SCALAR_DOUBLE_ENTRY_LEN`）だが、BOOLEAN と同様に累計へ加算し
+            // 対象行の探索より前に上限判定を完了させる（codex-review P0 指摘・
+            // PR #1007。累計へ計上しないと、TEXT 列と REAL/DOUBLE 列を多数
+            // 同時に SET した場合に事前検証は通過するが対象行が実在するときのみ
+            // `merge_encode_scalar_columns` が `MAX_SCALAR_PAYLOAD_LEN` 超過で
+            // 失敗し、未存在／他テナント所有では `UPDATE 0` の成功へ分岐して
+            // 対象行の存在情報が漏れる）。
             (crate::catalog::ColumnType::Real, crate::row_codec::Value::Real(v)) => {
                 if !v.is_finite() {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                         "REAL value must be finite".to_string(),
                     )));
+                }
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_REAL_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
                 }
             }
             (crate::catalog::ColumnType::Double, crate::row_codec::Value::Double(v)) => {
@@ -1702,6 +1717,19 @@ fn validate_set_assignments(
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                         "DOUBLE PRECISION value must be finite".to_string(),
                     )));
+                }
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_DOUBLE_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
                 }
             }
             (crate::catalog::ColumnType::Boolean, crate::row_codec::Value::Bool(_)) => {
@@ -4083,6 +4111,113 @@ mod tests {
             values[2],
             crate::row_codec::Value::Text("v1".to_string()),
             "row must be unchanged when the SET value is rejected before the write"
+        );
+    }
+
+    // codex-review P0 指摘（PR #1007・Issue #882）: `validate_set_assignments` は
+    // `TEXT`／`BOOLEAN` の SET 値を累計スカラーペイロード上限
+    // （`MAX_SCALAR_PAYLOAD_LEN`）へ加算する一方、`REAL`／`DOUBLE PRECISION` の
+    // 固定長エントリ（`SCALAR_REAL_ENTRY_LEN`／`SCALAR_DOUBLE_ENTRY_LEN`）を
+    // 加算していなかった。TEXT 単体では上限を跨がないが REAL/DOUBLE を加えると
+    // 跨ぐ長さの SET を構成すると、対象行が実在する場合のみ
+    // `merge_encode_scalar_columns` が実データ構築時に上限超過で失敗し、
+    // 未存在／他テナント所有の場合は対象行の探索前チェックを素通りしたまま
+    // `UPDATE 0` の成功へ分岐してしまう（対象行の存在情報が漏れる）。本テストは
+    // REAL/DOUBLE の固定長エントリも累計へ加算し、対象行の有無に関わらず
+    // 対象行探索より前の同一チェックで同一の拒否になることを固定する
+    // （上記 `update_row_columns_set_text_at_max_field_len_rejects_identically_
+    // regardless_of_row_existence` と同じ流儀。SQL 経由の統合テストでは
+    // `sql::lexer::MAX_INPUT_LEN`（1 MiB）により 4 MiB 級の SET リテラルを
+    // 構成できないため、本テストのように `update_row_columns_unchecked` を
+    // 直接呼ぶ必要がある）。
+    #[test]
+    fn update_row_columns_set_real_and_double_are_counted_toward_the_scalar_payload_cap() {
+        let path = unique_db_path("update-columns-real-double-payload-cap");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("note", ColumnType::Text, false),
+                ColumnDef::new("score", ColumnType::Real, false),
+                ColumnDef::new("weight", ColumnType::Double, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        insert_typed_row(
+            &storage,
+            "docs",
+            &a,
+            1,
+            Visibility::Private,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text("v1".to_string()),
+                crate::row_codec::Value::Real(1.0),
+                crate::row_codec::Value::Double(1.0),
+            ],
+            &OperationId::parse("seed-real-double-payload-cap").expect("valid operation_id"),
+        )
+        .expect("seed row");
+
+        // `note` 単体では `MAX_SCALAR_PAYLOAD_LEN`（4 * 1024 * 1024 バイト）を
+        // 跨がないが、`score`（REAL）・`weight`（DOUBLE）の固定長エントリを
+        // 加算すると跨ぐ長さに調整する。
+        let big_text = "x".repeat(4 * 1024 * 1024 - 10);
+        let assignments = [
+            (1, crate::row_codec::Value::Text(big_text)),
+            (2, crate::row_codec::Value::Real(1.0)),
+            (3, crate::row_codec::Value::Double(1.0)),
+        ];
+
+        // ケース (a): 対象行が存在する（id=1）。
+        let op_existing =
+            OperationId::parse("op-real-double-cap-existing").expect("valid operation_id");
+        let err_existing = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &a,
+            1,
+            &assignments,
+            LedgerWrite::Record(&op_existing),
+            None,
+        )
+        .expect_err(
+            "SET value combining TEXT with REAL/DOUBLE must overflow the scalar payload cap",
+        );
+
+        // ケース (b): 対象行が存在しない（id=999）。REAL/DOUBLE を累計へ
+        // 加算していない場合、この呼び出しは対象行不在のまま `Ok(0)` を返して
+        // しまい、上のケース (a) とは異なる応答（存在情報の漏えい）になる。
+        let op_missing =
+            OperationId::parse("op-real-double-cap-missing").expect("valid operation_id");
+        let err_missing = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &a,
+            999,
+            &assignments,
+            LedgerWrite::Record(&op_missing),
+            None,
+        )
+        .expect_err(
+            "SET value combining TEXT with REAL/DOUBLE must overflow identically for a \
+             nonexistent row",
+        );
+
+        // 対象行の有無に関わらず同一のエラー文言（= 対象行探索より前の同一
+        // チェックで拒否されたこと）を固定する。
+        assert_eq!(format!("{err_existing:?}"), format!("{err_missing:?}"));
+        assert!(
+            matches!(
+                &err_existing,
+                TenantWriteError::Catalog(CatalogError::Invalid(msg))
+                    if msg.contains("scalar payload length")
+            ),
+            "unexpected error shape: {err_existing:?}"
         );
     }
 
