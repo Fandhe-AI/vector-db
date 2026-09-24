@@ -204,6 +204,11 @@ impl From<HandshakeError> for ClientHelloError {
 
 /// 拡張列から重複を検出しつつ、対象 5 拡張の `extension_data` への
 /// 参照を集める。未知の拡張は中身を見ずに無視する（RFC 8446 §4.2・§4.1.2）。
+/// PSK を採用しない場合でも、受理判定に使う `pre_shared_key`・
+/// `psk_key_exchange_modes`・`early_data` はここで完全に構造解析する
+/// （codex-review PR #1022 P0 指摘。値だけを見て構造を検証しないまま
+/// 受理すると、binder 欠落・切断・余剰データを含む不正な拡張を
+/// 通してしまう）。
 struct ParsedExtensions<'a> {
     supported_versions: Option<&'a [u8]>,
     key_share: Option<&'a [u8]>,
@@ -290,9 +295,21 @@ fn parse_extensions(
             EXT_PRE_SHARED_KEY => {
                 out.has_pre_shared_key = true;
                 out.pre_shared_key_is_last = last_index == Some(idx);
+                // PSK を採用しない場合でも identities/binders の対応関係
+                // （件数一致・各 binder 長 32..=255・余剰データ無し）を
+                // ここで構造解析して確定させる（RFC 8446 §4.2.11）。
+                // 結果（identities）は本関数では使わず捨てるが、構造検証
+                // 自体が目的（codex-review PR #1022 P0 指摘）。
+                parse_pre_shared_key(&ext.extension_data)?;
             }
-            EXT_PSK_KEY_EXCHANGE_MODES => out.has_psk_key_exchange_modes = true,
-            EXT_EARLY_DATA => out.has_early_data = true,
+            EXT_PSK_KEY_EXCHANGE_MODES => {
+                out.has_psk_key_exchange_modes = true;
+                validate_psk_key_exchange_modes(&ext.extension_data)?;
+            }
+            EXT_EARLY_DATA => {
+                out.has_early_data = true;
+                validate_client_hello_early_data(&ext.extension_data)?;
+            }
             _ => {
                 // その他の未知の拡張は中身を見ずに無視する。早期
                 // application_data レコードの破棄は #959／#965 が担う。
@@ -325,6 +342,30 @@ fn parse_extensions(
         ));
     }
     Ok(out)
+}
+
+/// `psk_key_exchange_modes`（ClientHello 形。RFC 8446 §4.2.9。
+/// `PskKeyExchangeMode ke_modes<1..255>`）の構造のみを検証する。本モジュール
+/// は PSK を採用しないため個々の `PskKeyExchangeMode` 値は解釈しない
+/// （未知の値も拒否しない。拡張可能な列挙のため）。
+fn validate_psk_key_exchange_modes(data: &[u8]) -> Result<(), ClientHelloError> {
+    let mut r = Reader::new(data);
+    let _ke_modes = r.vec_u8_len(1, 255)?;
+    r.expect_end()?;
+    Ok(())
+}
+
+/// ClientHello 内の `early_data`（RFC 8446 §4.2.10）は本体を持たない
+/// （`Empty` 型）ため、`extension_data` が空バイト列であることのみを
+/// 検証する。
+fn validate_client_hello_early_data(data: &[u8]) -> Result<(), ClientHelloError> {
+    if data.is_empty() {
+        Ok(())
+    } else {
+        Err(ClientHelloError::Decode(
+            "early_data extension body must be empty in ClientHello",
+        ))
+    }
 }
 
 /// `supported_versions`（ClientHello 形。`ProtocolVersion versions<2..254>`）
@@ -569,35 +610,76 @@ fn check_hrr_consistency(
     Ok(())
 }
 
-/// `pre_shared_key`（ClientHello 形。RFC 8446 §4.2.11）の `identities` 部
-/// （`PskIdentity identities<7..2^16-1>`。各エントリは
-/// `opaque identity<1..2^16-1>; uint32 obfuscated_ticket_age;`）の identity
-/// 値だけを構造解析し、エントリを順序どおりに返す。`obfuscated_ticket_age`
-/// はここで読み進めて構造を検証するが、値そのものは戻り値に含めない
-/// （HRR 後の 2 回目 ClientHello では、ticket 発行からの経過時間が変化する
-/// ため、クライアントは同一 PSK に対しても age を再計算してよい。RFC 8446
-/// §4.1.2。[`check_hrr_psk_identities`] の同一性比較は identity 値のみで
-/// 行い、age の一致は要求しない。Cursor Bugbot 指摘・PR #1022）。`binders`
-/// 部も同様に比較対象にしない（binder の再計算が許可されているため）ので
-/// 読み進めず無視する。
-fn parse_psk_identities(data: &[u8]) -> Result<Vec<Vec<u8>>, ClientHelloError> {
+/// [`parse_pre_shared_key`] の戻り値。`identities` は比較・再送検証に
+/// 使う値のみを保持し（`obfuscated_ticket_age` は捨てる。理由は関数
+/// ドキュメント参照）、`binders` は件数対応の検証にのみ使い内容は解釈しない
+/// （binder の再計算が許可されているため。RFC 8446 §4.1.2）。
+struct PreSharedKey {
+    identities: Vec<Vec<u8>>,
+}
+
+/// `pre_shared_key`（ClientHello 形。RFC 8446 §4.2.11）を完全に構造解析する。
+///
+/// ```text
+/// struct {
+///     PskIdentity identities<7..2^16-1>;
+///     PskBinderEntry binders<33..2^16-1>;
+/// } PreSharedKeyExtension;
+/// PskIdentity: opaque identity<1..2^16-1>; uint32 obfuscated_ticket_age;
+/// PskBinderEntry: opaque binder<32..255>;
+/// ```
+///
+/// PSK を採用しない場合でも、以下をすべて検証してから `identities` を
+/// 返す（未検証のまま受理すると binder 欠落・切断・余剰データを含む
+/// 不正な `pre_shared_key` を通してしまう。codex-review PR #1022 P0 指摘）:
+/// - `identities`・`binders` それぞれのベクタ長・各エントリの境界
+///   （`vec_u16_len`／`vec_u8_len` の範囲検査が担う）
+/// - 拡張全体の終端（`identities` と `binders` の 2 ベクタ以外の余剰
+///   バイトが無いこと。`r.expect_end()`）
+/// - `identities` と `binders` の件数が一致すること（RFC 8446 §4.2.11
+///   「total number of identities and binders MUST be equal」）
+///
+/// `obfuscated_ticket_age` はここで読み進めて構造を検証するが、値そのものは
+/// 戻り値に含めない（HRR 後の 2 回目 ClientHello では、ticket 発行からの
+/// 経過時間が変化するため、クライアントは同一 PSK に対しても age を
+/// 再計算してよい。RFC 8446 §4.1.2。[`check_hrr_psk_identities`] の同一性
+/// 比較は identity 値のみで行い、age の一致は要求しない。Cursor Bugbot
+/// 指摘・PR #1022）。`binders` の中身（バイト列そのもの）も同様に比較対象に
+/// しない（binder の再計算が許可されているため）ので読み進めるだけで
+/// 保持しない。
+fn parse_pre_shared_key(data: &[u8]) -> Result<PreSharedKey, ClientHelloError> {
     let mut r = Reader::new(data);
-    let identities = r.vec_u16_len(7, 0xFFFF)?;
-    let mut lr = Reader::new(identities);
-    let mut out = Vec::new();
-    while lr.remaining() > 0 {
-        let identity = lr.vec_u16_len(1, 0xFFFF)?;
-        let _obfuscated_ticket_age = lr.array::<4>()?;
-        out.push(identity.to_vec());
+    let identities_data = r.vec_u16_len(7, 0xFFFF)?;
+    let mut ir = Reader::new(identities_data);
+    let mut identities = Vec::new();
+    while ir.remaining() > 0 {
+        let identity = ir.vec_u16_len(1, 0xFFFF)?;
+        let _obfuscated_ticket_age = ir.array::<4>()?;
+        identities.push(identity.to_vec());
     }
-    Ok(out)
+    let binders_data = r.vec_u16_len(33, 0xFFFF)?;
+    r.expect_end()?;
+    let mut br = Reader::new(binders_data);
+    let mut binder_count = 0usize;
+    while br.remaining() > 0 {
+        let _binder = br.vec_u8_len(32, 255)?;
+        binder_count = binder_count.checked_add(1).ok_or(ClientHelloError::Decode(
+            "pre_shared_key binders count overflow",
+        ))?;
+    }
+    if identities.len() != binder_count {
+        return Err(ClientHelloError::Decode(
+            "pre_shared_key identities and binders count must match",
+        ));
+    }
+    Ok(PreSharedKey { identities })
 }
 
 /// `second` が `first` の順序保存部分列であるかを判定する（RFC 8446
 /// §4.1.2「クライアントは（更新された）2 回目の `ClientHello` のパラメータ
 /// と非互換になった PSK identity を削除してよい」の反映）。削除のみが
 /// 許可されるため、`first` に存在しない identity（値の完全一致で比較。
-/// `obfuscated_ticket_age` は比較対象に含めない。[`parse_psk_identities`]
+/// `obfuscated_ticket_age` は比較対象に含めない。[`parse_pre_shared_key`]
 /// のドキュメントコメント参照）の新規追加・並べ替えは部分列とはみなさず
 /// `false` を返す。
 fn is_ordered_subsequence(first: &[Vec<u8>], second: &[Vec<u8>]) -> bool {
@@ -640,8 +722,8 @@ fn check_hrr_psk_identities(
              that was absent from the first ClientHello",
         )),
         (Some(first_data), Some(second_data)) => {
-            let first_identities = parse_psk_identities(first_data)?;
-            let second_identities = parse_psk_identities(second_data)?;
+            let first_identities = parse_pre_shared_key(first_data)?.identities;
+            let second_identities = parse_pre_shared_key(second_data)?.identities;
             if !is_ordered_subsequence(&first_identities, &second_identities) {
                 return Err(ClientHelloError::IllegalParameter(
                     "second ClientHello's pre_shared_key identities must be an \
@@ -1065,10 +1147,13 @@ mod tests {
         // psk_key_exchange_modes は RFC 8446 §4.1.2 が列挙する「変更可能な
         // 拡張」の一覧に含まれない（key_share／early_data／pre_shared_key／
         // padding のみが対象）ため、値の変更は illegal_parameter。
+        // pre_shared_key は構造上有効な値にする（`ch` 自身の
+        // `negotiate` 呼び出しが冒頭で構造検証するため。
+        // codex-review PR #1022 P0 指摘）。
         let first = push_extension(
             with_ed25519_sig_alg(rfc8448_client_hello()),
             EXT_PRE_SHARED_KEY,
-            vec![0x00, 0x00, 0x00, 0x00],
+            psk_extension_data(&[(b"a", 0)]),
         );
         let ch =
             replace_extension_data(first.clone(), EXT_PSK_KEY_EXCHANGE_MODES, vec![0x01, 0x02]);
@@ -1411,7 +1496,12 @@ mod tests {
     fn pre_shared_key_not_last_is_illegal_parameter() {
         let base = with_ed25519_sig_alg(rfc8448_client_hello());
         // pre_shared_key を追加した後にもう 1 拡張を追加し、最後でなくする。
-        let ch = push_extension(base, EXT_PRE_SHARED_KEY, vec![0x00, 0x00, 0x00, 0x00]);
+        // 位置検査（末尾でなければならない）を単独で検証するため、
+        // pre_shared_key 自体は構造上有効な値にする（binder 件数一致・
+        // 各エントリ長 32..=255 等の構造検証を満たさないと、この検査に
+        // 到達する前に decode_error になってしまうため。
+        // codex-review PR #1022 P0 指摘）。
+        let ch = push_extension(base, EXT_PRE_SHARED_KEY, psk_extension_data(&[(b"a", 0)]));
         let ch = push_extension(ch, EXT_PSK_KEY_EXCHANGE_MODES, vec![0x01, 0x01]);
         assert_rejected(&ch, AlertDescription::IllegalParameter);
     }
@@ -1419,12 +1509,169 @@ mod tests {
     #[test]
     fn pre_shared_key_last_without_modes_is_missing_extension() {
         // psk_key_exchange_modes(002d) を削除し、末尾に pre_shared_key を追加。
+        // pre_shared_key 自体は構造上有効な値にする（理由は上記テスト参照）。
         let base = remove_extension(
             with_ed25519_sig_alg(rfc8448_client_hello()),
             EXT_PSK_KEY_EXCHANGE_MODES,
         );
-        let ch = push_extension(base, EXT_PRE_SHARED_KEY, vec![0x00, 0x00, 0x00, 0x00]);
+        let ch = push_extension(base, EXT_PRE_SHARED_KEY, psk_extension_data(&[(b"a", 0)]));
         assert_rejected(&ch, AlertDescription::MissingExtension);
+    }
+
+    /// `identities`／`binders` の件数・各 binder の長さを個別に指定できる
+    /// `pre_shared_key` 生データビルダー（テスト専用。構造検証の境界値・
+    /// 不正値を作るための下位ヘルパー。[`psk_extension_data`] は
+    /// `identities` と 1 対 1 対応する妥当な `binders` を組み立てる薄い
+    /// ラッパーとして本関数を使う）。
+    fn build_psk_data(identities: &[(&[u8], u32)], binder_lens: &[usize]) -> Vec<u8> {
+        let mut ids = Vec::new();
+        for (identity, age) in identities {
+            ids.extend_from_slice(&(identity.len() as u16).to_be_bytes());
+            ids.extend_from_slice(identity);
+            ids.extend_from_slice(&age.to_be_bytes());
+        }
+        let mut binders = Vec::new();
+        for len in binder_lens {
+            binders.push(*len as u8);
+            binders.extend_from_slice(&vec![0u8; *len]);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+        out.extend_from_slice(&ids);
+        out.extend_from_slice(&(binders.len() as u16).to_be_bytes());
+        out.extend_from_slice(&binders);
+        out
+    }
+
+    // ---- codex-review PR #1022 P0 指摘の回帰テスト
+    //      （pre_shared_key の binders・psk_key_exchange_modes・
+    //      early_data の完全な構造検証） ----
+
+    #[test]
+    fn pre_shared_key_binder_count_fewer_than_identities_is_decode_error() {
+        // RFC 8446 §4.2.11: 「the total number of identities and binders
+        // MUST be equal」。identities 2 件に対し binders 1 件しか無い場合、
+        // binder 欠落を検出せずに受理してはならない。
+        let data = build_psk_data(&[(b"alice", 100), (b"bob", 200)], &[32]);
+        let ch = with_ed25519_sig_alg(push_extension(
+            rfc8448_client_hello(),
+            EXT_PRE_SHARED_KEY,
+            data,
+        ));
+        assert_rejected(&ch, AlertDescription::DecodeError);
+    }
+
+    #[test]
+    fn pre_shared_key_binder_count_more_than_identities_is_decode_error() {
+        // 逆に binders が identities より多い場合も同じ MUST 違反。
+        let data = build_psk_data(&[(b"alice", 100)], &[32, 32]);
+        let ch = with_ed25519_sig_alg(push_extension(
+            rfc8448_client_hello(),
+            EXT_PRE_SHARED_KEY,
+            data,
+        ));
+        assert_rejected(&ch, AlertDescription::DecodeError);
+    }
+
+    #[test]
+    fn pre_shared_key_binder_too_short_is_decode_error() {
+        // `opaque binder<32..255>` の下限未満（10 バイト）は decode_error。
+        let data = build_psk_data(&[(b"alice", 100)], &[10]);
+        let ch = with_ed25519_sig_alg(push_extension(
+            rfc8448_client_hello(),
+            EXT_PRE_SHARED_KEY,
+            data,
+        ));
+        assert_rejected(&ch, AlertDescription::DecodeError);
+    }
+
+    #[test]
+    fn pre_shared_key_trailing_bytes_after_binders_is_decode_error() {
+        // identities・binders の 2 ベクタを読み終えた後に余剰バイトが
+        // あってはならない（`r.expect_end()`）。
+        let mut data = psk_extension_data(&[(b"alice", 100)]);
+        data.push(0xff);
+        let ch = with_ed25519_sig_alg(push_extension(
+            rfc8448_client_hello(),
+            EXT_PRE_SHARED_KEY,
+            data,
+        ));
+        assert_rejected(&ch, AlertDescription::DecodeError);
+    }
+
+    #[test]
+    fn pre_shared_key_truncated_missing_binders_is_decode_error() {
+        // binders ベクタを丸ごと欠いた（identities だけの）
+        // `pre_shared_key` は構造違反として decode_error になる
+        // （本 finding の直接の再現。修正前は identities の直後で読み取りを
+        // 終えて受理していた）。
+        let mut ids = Vec::new();
+        let identity: &[u8] = b"alice";
+        ids.extend_from_slice(&(identity.len() as u16).to_be_bytes());
+        ids.extend_from_slice(identity);
+        ids.extend_from_slice(&100u32.to_be_bytes());
+        let mut data = Vec::new();
+        data.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+        data.extend_from_slice(&ids);
+        // binders ベクタを書かずに切り詰める。
+        let ch = with_ed25519_sig_alg(push_extension(
+            rfc8448_client_hello(),
+            EXT_PRE_SHARED_KEY,
+            data,
+        ));
+        assert_rejected(&ch, AlertDescription::DecodeError);
+    }
+
+    #[test]
+    fn psk_key_exchange_modes_empty_vector_is_decode_error() {
+        // `PskKeyExchangeMode ke_modes<1..255>` は最低 1 件必要。
+        let ch = with_ed25519_sig_alg(replace_extension_data(
+            rfc8448_client_hello(),
+            EXT_PSK_KEY_EXCHANGE_MODES,
+            vec![0x00],
+        ));
+        assert_rejected(&ch, AlertDescription::DecodeError);
+    }
+
+    #[test]
+    fn psk_key_exchange_modes_trailing_bytes_is_decode_error() {
+        // 長さ接頭辞どおりに読み終えた後に余剰バイトがあってはならない。
+        let ch = with_ed25519_sig_alg(replace_extension_data(
+            rfc8448_client_hello(),
+            EXT_PSK_KEY_EXCHANGE_MODES,
+            vec![0x01, 0x01, 0xff],
+        ));
+        assert_rejected(&ch, AlertDescription::DecodeError);
+    }
+
+    #[test]
+    fn early_data_non_empty_body_in_client_hello_is_decode_error() {
+        // ClientHello 内の early_data は `Empty` 型（本体を持たない）。
+        // pre_shared_key を伴わせずとも、構造検証（本体は空でなければ
+        // ならない）が missing_extension より先に働くことを確認する。
+        let ch = with_ed25519_sig_alg(push_extension(
+            rfc8448_client_hello(),
+            EXT_EARLY_DATA,
+            vec![0x01],
+        ));
+        assert_rejected(&ch, AlertDescription::DecodeError);
+    }
+
+    #[test]
+    fn pre_shared_key_must_be_last_extension_even_when_well_formed() {
+        // pre_shared_key の構造自体は完全に妥当でも、位置制約
+        // （RFC 8446 §4.2.11: 最後の拡張でなければならない）は独立して
+        // 検査される（`pre_shared_key_not_last_is_illegal_parameter` の
+        // 拡張版。psk_key_exchange_modes 以外の拡張を後続させても同じ
+        // 判定になることを確認する）。
+        let base = with_ed25519_sig_alg(rfc8448_client_hello());
+        let ch = push_extension(
+            base,
+            EXT_PRE_SHARED_KEY,
+            psk_extension_data(&[(b"alice", 100)]),
+        );
+        let ch = push_extension(ch, 0xfeed, vec![0x00]);
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
     }
 
     #[test]
@@ -1668,9 +1915,11 @@ mod tests {
         assert_rejected(&ch, AlertDescription::IllegalParameter);
     }
 
-    /// `pre_shared_key`（ClientHello 形）の `identities` 部を構築する
-    /// テスト専用ヘルパー。`binders` 部は本実装が解釈しないため省略する
-    /// （構造上は必須だが、比較対象にしないテストの範囲では無視してよい）。
+    /// `pre_shared_key`（ClientHello 形）の完全な構造（`identities`・
+    /// `binders`）を構築するテスト専用ヘルパー。`binders` の中身
+    /// （バイト列そのもの）は本実装が比較対象にしないため全て 0 で埋める
+    /// が、件数は `identities` と一致させ・各エントリは最小長 32 バイトと
+    /// する（構造検証〔codex-review PR #1022 P0 指摘〕を満たすため）。
     fn psk_extension_data(identities: &[(&[u8], u32)]) -> Vec<u8> {
         let mut ids = Vec::new();
         for (identity, age) in identities {
@@ -1678,9 +1927,16 @@ mod tests {
             ids.extend_from_slice(identity);
             ids.extend_from_slice(&age.to_be_bytes());
         }
+        let mut binders = Vec::new();
+        for _ in identities {
+            binders.push(32u8); // opaque binder<32..255> の長さ接頭辞（最小長 32）。
+            binders.extend_from_slice(&[0u8; 32]);
+        }
         let mut out = Vec::new();
         out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
         out.extend_from_slice(&ids);
+        out.extend_from_slice(&(binders.len() as u16).to_be_bytes());
+        out.extend_from_slice(&binders);
         out
     }
 
