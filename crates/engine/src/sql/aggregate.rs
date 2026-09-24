@@ -129,7 +129,7 @@ impl ReferencedColumns {
 
         for item in items {
             match &item.input {
-                AggregateInput::TextColumn(index) => {
+                AggregateInput::TextColumn(index) | AggregateInput::BooleanColumn(index) => {
                     has_scalar_reference = true;
                     if let Some(slot) = scalar_mask.get_mut(*index) {
                         *slot = true;
@@ -319,6 +319,16 @@ impl Accumulator {
                     .flatten()
                     .and_then(|v| v.as_text());
                 self.observe_text(value)
+            }
+            // BOOLEAN 列の裸参照は COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
+            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。Issue #883）。値の真偽は
+            // 問わず「NULL でない」ことだけを数える。
+            AggregateInput::BooleanColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
             }
             AggregateInput::ScalarExpr { source, program } => {
                 // 式木が実際に embedding へ到達する場合のみ `vector.values` を

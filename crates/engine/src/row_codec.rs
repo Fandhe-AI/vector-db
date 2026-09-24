@@ -131,29 +131,54 @@ pub enum Value {
     Vector(Vec<f32>),
     Real(f32),
     Double(f64),
+    /// 真偽値列の値（TABLE-13・TASK-196、Issue #883）。NULL とはバイト列上も
+    /// 別物になる（[`PRESENCE_NULL`] とは別に 1 バイトの値本体を持つ）。
+    Bool(bool),
 }
 
-/// [`scan_scalar_columns`] 系が返す借用済みスカラー値。`Text` は行バッファを
-/// 借用した `&str`（複製を避ける。Issue #56 の設計を踏襲）、`Real`／`Double` は
-/// 固定長ペイロードなので値そのものを複製コストなしに保持できる。
+/// スカラー列走査（[`scan_scalar_columns`] 系）の借用結果。TEXT・REAL・
+/// DOUBLE PRECISION・BOOLEAN の全てを返せるよう `Option<&str>` から型付き化した
+/// （Issue #883・D-b。`Real`／`Double` は固定長ペイロードなので値そのものを
+/// 複製コストなしに保持できる）。`VECTOR` 列・実際の NULL 列は走査結果として
+/// `None` になる。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarRef<'a> {
     Text(&'a str),
     Real(f32),
     Double(f64),
+    Bool(bool),
 }
 
 impl<'a> ScalarRef<'a> {
     /// `Text` 列だけを参照したい呼び出し元（既存の `TEXT` 専用経路）向けの
-    /// 後方互換ヘルパー。`Real`／`Double` は `None`（F10: 対応外経路は
-    /// 「TEXT 列でない」と同じ扱いで拒否する）。
+    /// 後方互換ヘルパー。`Real`／`Double`／`Bool` は `None`（fail-closed。
+    /// 対応外の型は「TEXT 列でない」と同じ扱いで拒否する）。
     pub fn as_text(&self) -> Option<&'a str> {
         match self {
             ScalarRef::Text(text) => Some(*text),
-            ScalarRef::Real(_) | ScalarRef::Double(_) => None,
+            ScalarRef::Real(_) | ScalarRef::Double(_) | ScalarRef::Bool(_) => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            ScalarRef::Bool(b) => Some(*b),
+            ScalarRef::Text(_) | ScalarRef::Real(_) | ScalarRef::Double(_) => None,
         }
     }
 }
+
+/// BOOLEAN 値のバイト表現（presence タグに続く 1 バイト）。`0x00`/`0x01`
+/// 以外は decode 側で fail-closed に拒否する（既定値へのフォールバックはしない。
+/// TABLE-7）。
+const BOOL_FALSE_BYTE: u8 = 0x00;
+const BOOL_TRUE_BYTE: u8 = 0x01;
+
+/// BOOLEAN 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + 値(1)）。[`encode_scalar_columns`] の実エンコードと
+/// `tenant::validate_set_assignments` の事前累計検証が同じ値を共有する
+/// （TEXT の [`SCALAR_TEXT_ENTRY_OVERHEAD`] と同じ理由）。
+pub(crate) const SCALAR_BOOL_ENTRY_LEN: u32 = 2;
 
 /// デコード結果。行レベルの RLS フィールド（`tenant_id`・`visibility`）と、
 /// スキーマの列順に対応する値列を保持する。
@@ -283,7 +308,10 @@ pub fn encode_row(
             Value::Vector(vector) => {
                 let expected_dim = match column.ty {
                     ColumnType::Vector(dim) => dim,
-                    ColumnType::Text | ColumnType::Real | ColumnType::Double => {
+                    ColumnType::Text
+                    | ColumnType::Real
+                    | ColumnType::Double
+                    | ColumnType::Boolean => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Vector value, got Vector",
                             column.name
@@ -309,6 +337,16 @@ pub fn encode_row(
                 for v in vector {
                     buf.extend_from_slice(&v.to_le_bytes());
                 }
+            }
+            Value::Bool(b) => {
+                if !matches!(column.ty, ColumnType::Boolean) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Boolean value, got Boolean",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
             }
         }
     }
@@ -542,6 +580,28 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     offset = vector_end;
                     values.push(Value::Vector(vector));
                 }
+                ColumnType::Boolean => {
+                    let byte = *buf.get(offset).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "row buffer truncated at boolean value field".to_string(),
+                        )
+                    })?;
+                    let b = match byte {
+                        BOOL_FALSE_BYTE => false,
+                        BOOL_TRUE_BYTE => true,
+                        other => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "unknown boolean value byte: {other}"
+                            )))
+                        }
+                    };
+                    offset = offset.checked_add(1).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after boolean value field".to_string(),
+                        )
+                    })?;
+                    values.push(Value::Bool(b));
+                }
             },
             other => {
                 return Err(RowCodecError::Invalid(format!(
@@ -699,6 +759,17 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     column.name
                 )))
             }
+            Value::Bool(b) => {
+                if !matches!(column.ty, ColumnType::Boolean) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Boolean value, got Boolean",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
+            }
         }
     }
 
@@ -847,6 +918,17 @@ pub(crate) fn merge_encode_scalar_columns(
                         column.name
                     )))
                 }
+                Value::Bool(b) => {
+                    if !matches!(column.ty, ColumnType::Boolean) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Boolean value, got Boolean",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
+                }
             }
         } else {
             // SET 対象でない列は既存の借用値（またはNULL）をそのまま書き込む。
@@ -892,6 +974,11 @@ pub(crate) fn merge_encode_scalar_columns(
                     reserve(&mut buf, SCALAR_DOUBLE_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     buf.extend_from_slice(&v.to_le_bytes());
+                }
+                Some(ScalarRef::Bool(b)) => {
+                    reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.push(if b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
                 }
             }
         }
@@ -1020,119 +1107,153 @@ fn scan_scalar_columns_validated<'a>(
                 }
                 sink(col_index, None)?;
             }
-            PRESENCE_VALUE if matches!(column.ty, ColumnType::Real) => {
-                let bytes = buf
-                    .get(
-                        offset..offset.checked_add(4).ok_or_else(|| {
-                            RowCodecError::Invalid("offset overflow before real field".to_string())
-                        })?,
-                    )
-                    .ok_or_else(|| {
-                        RowCodecError::Invalid("scalar payload truncated at real field".to_string())
-                    })?;
-                let arr: [u8; 4] = bytes
-                    .try_into()
-                    .map_err(|_| RowCodecError::Invalid("real field is not 4 bytes".to_string()))?;
-                let v = f32::from_le_bytes(arr);
-                if !v.is_finite() {
-                    return Err(RowCodecError::Invalid(format!(
-                        "column {:?}: persisted REAL value is not finite",
-                        column.name
-                    )));
-                }
-                offset = offset.checked_add(4).ok_or_else(|| {
-                    RowCodecError::Invalid("offset overflow after real field".to_string())
-                })?;
-                let v = crate::scalar_float::canonicalize_real(v);
-                if wanted {
-                    sink(col_index, Some(ScalarRef::Real(v)))?;
-                } else {
-                    sink(col_index, None)?;
-                }
-            }
-            PRESENCE_VALUE if matches!(column.ty, ColumnType::Double) => {
-                let bytes = buf
-                    .get(
-                        offset..offset.checked_add(8).ok_or_else(|| {
+            PRESENCE_VALUE => match column.ty {
+                ColumnType::Real => {
+                    let bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before real field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
                             RowCodecError::Invalid(
-                                "offset overflow before double field".to_string(),
+                                "scalar payload truncated at real field".to_string(),
                             )
-                        })?,
-                    )
-                    .ok_or_else(|| {
+                        })?;
+                    let arr: [u8; 4] = bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("real field is not 4 bytes".to_string())
+                    })?;
+                    let v = f32::from_le_bytes(arr);
+                    if !v.is_finite() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: persisted REAL value is not finite",
+                            column.name
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after real field".to_string())
+                    })?;
+                    let v = crate::scalar_float::canonicalize_real(v);
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Real(v)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+                ColumnType::Double => {
+                    let bytes = buf
+                        .get(
+                            offset..offset.checked_add(8).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before double field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at double field".to_string(),
+                            )
+                        })?;
+                    let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("double field is not 8 bytes".to_string())
+                    })?;
+                    let v = f64::from_le_bytes(arr);
+                    if !v.is_finite() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: persisted DOUBLE PRECISION value is not finite",
+                            column.name
+                        )));
+                    }
+                    offset = offset.checked_add(8).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after double field".to_string())
+                    })?;
+                    let v = crate::scalar_float::canonicalize_double(v);
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Double(v)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+                ColumnType::Boolean => {
+                    let byte = *buf.get(offset).ok_or_else(|| {
                         RowCodecError::Invalid(
-                            "scalar payload truncated at double field".to_string(),
+                            "scalar payload truncated at boolean value field".to_string(),
                         )
                     })?;
-                let arr: [u8; 8] = bytes.try_into().map_err(|_| {
-                    RowCodecError::Invalid("double field is not 8 bytes".to_string())
-                })?;
-                let v = f64::from_le_bytes(arr);
-                if !v.is_finite() {
-                    return Err(RowCodecError::Invalid(format!(
-                        "column {:?}: persisted DOUBLE PRECISION value is not finite",
-                        column.name
-                    )));
-                }
-                offset = offset.checked_add(8).ok_or_else(|| {
-                    RowCodecError::Invalid("offset overflow after double field".to_string())
-                })?;
-                let v = crate::scalar_float::canonicalize_double(v);
-                if wanted {
-                    sink(col_index, Some(ScalarRef::Double(v)))?;
-                } else {
-                    sink(col_index, None)?;
-                }
-            }
-            PRESENCE_VALUE => {
-                let len_bytes = buf
-                    .get(
-                        offset..offset.checked_add(4).ok_or_else(|| {
-                            RowCodecError::Invalid(
-                                "offset overflow before text length field".to_string(),
-                            )
-                        })?,
-                    )
-                    .ok_or_else(|| {
+                    let b = match byte {
+                        BOOL_FALSE_BYTE => false,
+                        BOOL_TRUE_BYTE => true,
+                        other => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "unknown boolean value byte: {other}"
+                            )))
+                        }
+                    };
+                    offset = offset.checked_add(1).ok_or_else(|| {
                         RowCodecError::Invalid(
-                            "scalar payload truncated at text length field".to_string(),
+                            "offset overflow after boolean value field".to_string(),
                         )
                     })?;
-                let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
-                    RowCodecError::Invalid("text length field is not 4 bytes".to_string())
-                })?;
-                let text_len = u32::from_le_bytes(len_arr);
-                if text_len > MAX_TEXT_FIELD_LEN {
-                    return Err(RowCodecError::Invalid(format!(
-                        "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
-                    )));
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Bool(b)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
                 }
-                offset = offset.checked_add(4).ok_or_else(|| {
-                    RowCodecError::Invalid("offset overflow after text length field".to_string())
-                })?;
-                let text_end = offset.checked_add(text_len as usize).ok_or_else(|| {
-                    RowCodecError::Invalid("offset overflow after text field".to_string())
-                })?;
-                let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
-                    RowCodecError::Invalid("scalar payload truncated at text field".to_string())
-                })?;
-                offset = text_end;
-                // UTF-8 妥当性検証は要求列・非要求列を問わず常に行う（codex-review
-                // P1 指摘・PR #369: 未参照列でも不正 UTF-8 を含む永続行を fail-closed
-                // で拒否する既存のエラー契約（`XX000`）を維持する必要があるため）。
-                // マスクで要求されなかった列（`validate_scalar_columns` 経由は常に
-                // 全列非要求）は、検証済みの `&str` を破棄して `None` を渡すことで
-                // `&str` 生成・保持コストのみを省略する（Issue #350: 必要列限定
-                // デコード）。
-                let text = std::str::from_utf8(text_bytes).map_err(|_| {
-                    RowCodecError::Invalid("text field is not valid UTF-8".to_string())
-                })?;
-                if wanted {
-                    sink(col_index, Some(ScalarRef::Text(text)))?;
-                } else {
-                    sink(col_index, None)?;
+                ColumnType::Text | ColumnType::Vector(_) => {
+                    let len_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before text length field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at text length field".to_string(),
+                            )
+                        })?;
+                    let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("text length field is not 4 bytes".to_string())
+                    })?;
+                    let text_len = u32::from_le_bytes(len_arr);
+                    if text_len > MAX_TEXT_FIELD_LEN {
+                        return Err(RowCodecError::Invalid(format!(
+                            "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after text length field".to_string(),
+                        )
+                    })?;
+                    let text_end = offset.checked_add(text_len as usize).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after text field".to_string())
+                    })?;
+                    let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
+                        RowCodecError::Invalid("scalar payload truncated at text field".to_string())
+                    })?;
+                    offset = text_end;
+                    // UTF-8 妥当性検証は要求列・非要求列を問わず常に行う（codex-review
+                    // P1 指摘・PR #369: 未参照列でも不正 UTF-8 を含む永続行を fail-closed
+                    // で拒否する既存のエラー契約（`XX000`）を維持する必要があるため）。
+                    // マスクで要求されなかった列（`validate_scalar_columns` 経由は常に
+                    // 全列非要求）は、検証済みの `&str` を破棄して `None` を渡すことで
+                    // `&str` 生成・保持コストのみを省略する（Issue #350: 必要列限定
+                    // デコード）。
+                    let text = std::str::from_utf8(text_bytes).map_err(|_| {
+                        RowCodecError::Invalid("text field is not valid UTF-8".to_string())
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Text(text)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
                 }
-            }
+            },
             other => {
                 return Err(RowCodecError::Invalid(format!(
                     "unknown presence byte: {other}"
@@ -1180,6 +1301,7 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
             }
             Some(ScalarRef::Real(v)) => values.push(Value::Real(v)),
             Some(ScalarRef::Double(v)) => values.push(Value::Double(v)),
+            Some(ScalarRef::Bool(b)) => values.push(Value::Bool(b)),
         }
     }
     Ok(values)

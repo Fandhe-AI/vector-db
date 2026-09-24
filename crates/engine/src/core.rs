@@ -3663,6 +3663,8 @@ impl EngineCore {
                     // SCALAR_REAL_ENTRY_LEN/SCALAR_DOUBLE_ENTRY_LEN と同じ本体幅）。
                     crate::row_codec::Value::Real(_) => std::mem::size_of::<f32>(),
                     crate::row_codec::Value::Double(_) => std::mem::size_of::<f64>(),
+                    // BOOLEAN 値は行コーデック上 1 バイト固定（Issue #883・D-a）。
+                    crate::row_codec::Value::Bool(_) => 1,
                 };
                 row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
                     crate::sql::allowlist::SqlSurfaceError::payload_too_large(

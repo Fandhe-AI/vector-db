@@ -159,7 +159,10 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                 if let Some(column) = schema.columns.get(*index) {
                     match column.ty {
                         ColumnType::Vector(_) => needs_embedding = true,
-                        ColumnType::Text | ColumnType::Real | ColumnType::Double => {
+                        ColumnType::Text
+                        | ColumnType::Real
+                        | ColumnType::Double
+                        | ColumnType::Boolean => {
                             has_scalar_reference = true;
                             if let Some(slot) = scalar_mask.get_mut(*index) {
                                 *slot = true;
@@ -468,6 +471,17 @@ pub fn execute_scan(
                             ColumnType::Double => match scanned.get(*index) {
                                 Some(Some(row_codec::ScalarRef::Double(v))) => {
                                     cells.push(Cell::Float(*v))
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
+                            },
+                            ColumnType::Boolean => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Bool(b))) => {
+                                    cells.push(Cell::Bool(*b))
                                 }
                                 Some(None) | None => cells.push(Cell::Null),
                                 Some(Some(_)) => {

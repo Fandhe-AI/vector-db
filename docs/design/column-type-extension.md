@@ -130,3 +130,48 @@ match にもワイルドカード腕（`_ =>`）を入れない。variant を追
   Vector=2）
 - カタログ `v2` の列行バイト列（`name:tag:param:nullable`）は `v1` と同一。
   変わるのは 1 行目のバージョン識別子のみ（`encode_schema_golden_v2_layout`）
+
+## #883 追記: BOOLEAN 列型
+
+TABLE-13・TASK-196（Issue #883）で `ColumnType::Boolean` を追加した。上記
+チェックリストに沿った実装内容は以下のとおり。
+
+- カタログ型タグは `"boolean"`（`param` は `"-"` 固定。TEXT と同型）。
+- 行バイト表現: presence タグに続く 1 バイト（`0x00`=false／`0x01`=true）。
+  NULL（presence `0x00`）とは常に別のバイト列になる（受け入れ条件「NULL と
+  false を区別する」の根拠）。`SCALAR_BOOL_ENTRY_LEN = 2`。
+- `row_codec::scan_scalar_columns` 系の戻り値を `Option<&str>` から
+  `Option<ScalarRef<'a>>`（`Text`／`Bool` の 2 variant）へ型付き化した
+  （上記チェックリストが「#881 以降で必要になれば」と申し送っていた対応。
+  `ScalarRef::as_text()`/`as_bool()` で TEXT 専用消費側の型不一致を
+  fail-closed に扱う）。
+- `content_hash::push_value` のタグは `Bool = 7`（Null=0／Text=1／
+  Vector=2 は不変。3〜6 は他型向けに予約）。述語 DML のハッシュ
+  （`push_dml_assignments`／`push_dml_where_predicates`）にも
+  `InsertLiteral::Bool`＝タグ 3、`WherePredicate::BoolEquality`＝タグ 5、
+  `WherePredicate::BoolColumn`＝タグ 6 を追加（`BoolColumn` と
+  `BoolEquality{value:true}` は評価結果が同じでも構文が異なるため別ハッシュ
+  とする安全側の判断）。
+- `WHERE` 述語は宣言的フィルタ経路（`declarative_filter::FilterOp::BoolEquals`）
+  でのみ評価する（式評価器はスカラー列を参照できないため）。字句解析器は
+  `true`/`false` を `Token::Ident` として出すため、`sql::allowlist::Parser::
+  parse_where` が `<col> = true|false` と裸の `WHERE flag`（直後が `AND`・
+  `ORDER`・`LIMIT`・文末・`USING`／`HINT`／`RETURNING`／`GROUP`／`HAVING` の
+  いずれかの場合に限る）を文脈照合で受理する。`NOT`／`IS [NOT] NULL`／
+  `IS TRUE`／`<>`／式中の bool 列参照は対象外（既存の拒否のまま）。
+- `sql::scalar_index::ScalarIndex` は BOOLEAN 列を索引化しない
+  （`per_column.push(None)`）。`sql::scalar_plan::classify_scalar_plan` は
+  `FilterOp::BoolEquals` を含む述語（単独・複合いずれも）を常に `PlainScan`
+  に分類する単一情報源とし、Issue #843/#844 の索引被覆多層防御
+  （`mask_trusted_defer`／`count_star_only`／`observe_group_count_only`）が
+  BOOLEAN 述語を誤って「索引で完全被覆済み」と信頼しないことを保証する。
+- 集計: `COUNT(<BOOLEAN 列>)`（非 NULL 行数）のみ受理し、`SUM`/`AVG`/`MIN`/
+  `MAX` は `22000` で拒否する（`AggregateInput::BooleanColumn`）。
+  `GROUP BY` キー列は引き続き TEXT 限定のまま。
+- wire-server: NoSQL `update` op（`http/query/update.rs`）は JSON 真偽値の
+  `SET` を受理する。`insert.rs`・RowDescription の OID 拡張・NoSQL `insert`
+  op での JSON 真偽値受理は対象外（#895・#896 の担当）。
+- 対象外（申し送り）: RowDescription の OID 16 公告（#895）、NoSQL JSON
+  束縛の完全対応（#896）、`22P02` の新設、`NOT`/`IS [NOT] NULL`/`IS TRUE`/
+  `<>`/式中の bool 列参照、SQL `CREATE TABLE` 構文での `BOOLEAN` 宣言
+  （SQL-23 は未実装）、BOOLEAN 列のスカラー二次索引化。

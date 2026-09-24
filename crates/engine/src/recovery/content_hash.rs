@@ -215,6 +215,8 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
         }
         // タグ 3・4（Integer・BigInt）は Issue #881 の予約割り当て。TABLE-13・
         // Issue #882 計画 F9: Real=5・Double=6（正規化後の LE ビット列）。
+        // BOOLEAN は TABLE-13 の宣言順で 7 とする（Issue #883。他の型と衝突しない
+        // 新規タグ）。
         Value::Real(v) => {
             b.push_u8(5);
             b.push_raw(&v.to_le_bytes());
@@ -222,6 +224,10 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
         Value::Double(v) => {
             b.push_u8(6);
             b.push_raw(&v.to_le_bytes());
+        }
+        Value::Bool(b_val) => {
+            b.push_u8(7);
+            b.push_u8(u8::from(*b_val));
         }
     }
     Ok(())
@@ -776,6 +782,10 @@ fn push_dml_assignments(
                 b.push_bytes(s.as_bytes())
                     .map_err(|_| dml_hash_field_too_large())?;
             }
+            InsertLiteral::Bool(v) => {
+                b.push_u8(3);
+                b.push_u8(u8::from(*v));
+            }
         }
     }
     Ok(())
@@ -824,6 +834,20 @@ fn push_dml_where_predicates(
                 b.push_u8(4);
                 push_dml_expr(b, expr, None)?;
                 collect_referenced_udfs(expr, udf_registry, &mut referenced)?;
+            }
+            // `BoolColumn`（`WHERE flag`）と `BoolEquality { value: true }`
+            // （`WHERE flag = true`）は評価結果としては同一だが、構文が異なる
+            // ため安全側に倒し別タグ・別ハッシュとする（Issue #883）。
+            WherePredicate::BoolEquality { column, value } => {
+                b.push_u8(5);
+                b.push_bytes(column.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+                b.push_u8(u8::from(*value));
+            }
+            WherePredicate::BoolColumn { column } => {
+                b.push_u8(6);
+                b.push_bytes(column.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
             }
         }
     }

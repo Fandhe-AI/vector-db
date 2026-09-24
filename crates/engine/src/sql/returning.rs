@@ -163,6 +163,7 @@ pub(crate) fn project_row(
                 // そのまま `Cell::Float` へ投影する。
                 Some(Value::Real(v)) => Cell::Float(f64::from(*v)),
                 Some(Value::Double(v)) => Cell::Float(*v),
+                Some(Value::Bool(b)) => Cell::Bool(*b),
                 None => return Err(returning_bug("value index out of range")),
             },
             ProjectedColumn::Computed { .. } => {

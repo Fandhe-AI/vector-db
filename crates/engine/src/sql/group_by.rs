@@ -566,9 +566,10 @@ fn observe_candidate_slots_grouped_inner(
             }
         }
 
-        // GROUP BY 列は束縛時に TEXT 列限定で検証済み（`bind_group_by_clause`）
-        // のため、`as_text()` は常に `Some`（値あり）か `None`（NULL）のどちらか
-        // になる。
+        // GROUP BY キー列は束縛段（`sql::parser::bind_group_by_clause`）で TEXT
+        // 列に限定済み（BOOLEAN 列は `22000` で拒否）のため常に `Text` のはずだが、
+        // untrusted な格納済みデータに由来する不変条件のため念のため
+        // fail-closed に扱う（`as_text()` が `None` を返す＝NULL 相当として扱う）。
         let key_value = scanned
             .get(group_by.column_index)
             .copied()
@@ -1066,9 +1067,10 @@ pub(crate) fn execute_grouped_aggregate(
                 // 一切現れない＝RLS-7・RLS-8 の `GROUP BY` 版）。借用キー（`&str`）で
                 // まず既存グループを 1 回だけ探索し、ヒットした行では所有 `String` を
                 // 一切確保しない（Issue #351）。
-                // GROUP BY 列は束縛時に TEXT 列限定で検証済み（`bind_group_by_clause`）
-                // のため、`as_text()` は常に `Some`（値あり）か `None`（NULL）のどちらか
-                // になる。
+                // GROUP BY キー列は束縛段（`sql::parser::bind_group_by_clause`）で TEXT
+                // 列に限定済み（BOOLEAN 列は `22000` で拒否）のため常に `Text` のはずだが、
+                // untrusted な格納済みデータに由来する不変条件のため念のため
+                // fail-closed に扱う（`as_text()` が `None` を返す＝NULL 相当として扱う）。
                 let key_value = scanned
                     .get(group_by.column_index)
                     .copied()

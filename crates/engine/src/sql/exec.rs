@@ -837,6 +837,9 @@ pub(crate) fn execute_statement_with_cache(
                     // 要しない（`Value::Real`/`Value::Double` はスタック上の値）。
                     Some(row_codec::ScalarRef::Real(v)) => kept.push(Value::Real(v)),
                     Some(row_codec::ScalarRef::Double(v)) => kept.push(Value::Double(v)),
+                    Some(row_codec::ScalarRef::Bool(b)) => {
+                        kept.push(Value::Bool(b));
+                    }
                 }
             }
             kept
@@ -1815,6 +1818,7 @@ pub(crate) fn execute_statement_with_cache(
                     Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
                     Value::Real(r) => Some(row_codec::ScalarRef::Real(*r)),
                     Value::Double(d) => Some(row_codec::ScalarRef::Double(*d)),
+                    Value::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
                     Value::Null | Value::Vector(_) => None,
                 })
                 .collect();
@@ -2148,6 +2152,7 @@ fn decode_deferred_scalars(
             }
             Some(row_codec::ScalarRef::Real(v)) => out.push(Value::Real(v)),
             Some(row_codec::ScalarRef::Double(v)) => out.push(Value::Double(v)),
+            Some(row_codec::ScalarRef::Bool(b)) => out.push(Value::Bool(b)),
         }
     }
     Ok(out)
@@ -2374,7 +2379,8 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Real(_))
-                            | Some(Value::Double(_)) => {
+                            | Some(Value::Double(_))
+                            | Some(Value::Bool(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2395,6 +2401,15 @@ fn project_rows(
                         },
                         ColumnType::Double => match decoded.get(*index) {
                             Some(Value::Double(v)) => cells.push(Cell::Float(*v)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            _ => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Boolean => match decoded.get(*index) {
+                            Some(Value::Bool(b)) => cells.push(Cell::Bool(*b)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             _ => {
                                 return Err(SqlSurfaceError::Internal {

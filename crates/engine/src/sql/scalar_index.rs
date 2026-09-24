@@ -544,9 +544,13 @@ impl ScalarIndex {
                 }
                 // F10（Issue #882 計画）: REAL/DOUBLE 列の索引化は #893 の担当。
                 // 現時点では VECTOR 列と同じく索引非対象（`None`）として扱う。
-                ColumnType::Vector(_) | ColumnType::Real | ColumnType::Double => {
-                    per_column.push(None)
-                }
+                // `BOOLEAN` 列も索引対象外（Issue #883・D-e。値域が 2 値のため
+                // 索引化コストに見合わず、対応述語 `BoolEquals` は常に
+                // plain scan——`scalar_plan.rs` 参照——のまま据え置く）。
+                ColumnType::Vector(_)
+                | ColumnType::Real
+                | ColumnType::Double
+                | ColumnType::Boolean => per_column.push(None),
             }
         }
 
@@ -572,6 +576,8 @@ impl ScalarIndex {
                 // 参照。REAL/DOUBLE は索引非対象として `None` に統一済み）ため、
                 // ここに到達する `v` は常に `ScalarRef::Text`。それ以外は
                 // スキーマ・索引状態の不整合として fail-closed にスキップする。
+                // 索引対象列は常に `TEXT`（上記の列単位除外により `BOOLEAN`／
+                // `VECTOR` は `per_column[col_index] == None` のまま到達しない）。
                 let Some(v) = v.as_text() else { continue };
                 let v_len = v.len();
                 let (Some(&running), Some(&nonnull)) = (
@@ -798,6 +804,10 @@ impl ScalarIndex {
                 .map(|s| s.to_vec())
                 .unwrap_or_default(),
             FilterOp::StartsWith(prefix) => column.prefix_slots(prefix),
+            // BOOLEAN 列は索引化しない（`per_column` が常に `None`。上の
+            // `?` で既にここへ到達しない）ため構造的に到達しないが、
+            // 網羅性のため fail-closed に `None` を返す。
+            FilterOp::BoolEquals(_) => return None,
         };
         result.sort_unstable();
         Some(result)
@@ -2317,11 +2327,7 @@ mod tests {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let scanned = scan_scalar_columns(schema, metadata).expect("decode row");
-            let value = scanned
-                .get(filter.column_index())
-                .copied()
-                .flatten()
-                .and_then(|v| v.as_text());
+            let value = scanned.get(filter.column_index()).copied().flatten();
             if filter.matches(value) {
                 out.push(slot as u32);
             }

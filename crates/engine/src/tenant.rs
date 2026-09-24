@@ -1704,6 +1704,24 @@ fn validate_set_assignments(
                     )));
                 }
             }
+            (crate::catalog::ColumnType::Boolean, crate::row_codec::Value::Bool(_)) => {
+                // BOOLEAN 値は行コーデック上 1 バイト固定
+                // （`row_codec::SCALAR_BOOL_ENTRY_LEN`）のため、TEXT のような
+                // 長さ検証は不要（Issue #883・D-a）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_BOOL_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             _ => {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column type does not match the current table schema".to_string(),
