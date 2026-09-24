@@ -711,6 +711,9 @@ fn bind_expr_in(
                     ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BOOLEAN columns are not supported)"
                     ))),
+                    ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (ARRAY columns are not supported)"
+                    ))),
                 };
             }
             if name == "id" {

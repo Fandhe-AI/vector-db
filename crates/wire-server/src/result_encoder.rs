@@ -164,7 +164,46 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         }
         Cell::Float(f) => Ok(Some(f.to_string())),
         Cell::Bool(b) => Ok(Some(if *b { "t".to_string() } else { "f".to_string() })),
+        Cell::Array(array_value) => Ok(Some(pg_array_text(array_value))),
     }
+}
+
+/// 配列列（TABLE-14・TASK-198、Issue #888・D-A4）を PostgreSQL 配列テキスト形式
+/// （`{a,b}`）へ描画する。空配列は `{}`、`BOOLEAN` 要素は `t`/`f`。`TEXT` 要素の
+/// うち、空文字列・`,{}"\` や空白を含むもの・大小無視で `NULL` に一致するものは
+/// `"..."` で囲み `"`・`\` をバックスラッシュでエスケープする（`RowDescription`
+/// の OID は他の非 VECTOR スカラー列と同じ text（25）のまま変更しない。WIRE-13）。
+fn pg_array_text(array_value: &engine::row_codec::ArrayValue) -> String {
+    use engine::row_codec::ArrayValue;
+    let elements: Vec<String> = match array_value {
+        ArrayValue::Text(items) => items.iter().map(|s| quote_pg_array_text_elem(s)).collect(),
+        ArrayValue::Bool(items) => items
+            .iter()
+            .map(|b| if *b { "t".to_string() } else { "f".to_string() })
+            .collect(),
+    };
+    format!("{{{}}}", elements.join(","))
+}
+
+/// [`pg_array_text`] の TEXT 要素 1 個の引用要否判定・エスケープ処理。
+fn quote_pg_array_text_elem(s: &str) -> String {
+    let needs_quote = s.is_empty()
+        || s.eq_ignore_ascii_case("null")
+        || s.chars()
+            .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace());
+    if !needs_quote {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 /// `DataRow`（'D'）を `out` の末尾へ追記する（Issue #481。行ごとに新規
@@ -477,6 +516,54 @@ mod tests {
         let first_len = i32_at(&msg, 7) as usize;
         assert_eq!(first_len, 1);
         assert_eq!(slice_at(&msg, 11, first_len), b"t");
+    }
+
+    #[test]
+    fn data_row_array_text_cell_encodes_pg_array_text_with_quoting() {
+        use engine::row_codec::ArrayValue;
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Array(ArrayValue::Text(vec![
+                "a".to_string(),
+                "b c".to_string(),
+                "".to_string(),
+                "d\"e".to_string(),
+                "NULL".to_string(),
+            ]))],
+        };
+        let msg = encode_data_row(&row).expect("encode");
+        let cell_len = i32_at(&msg, 7) as usize;
+        let text = std::str::from_utf8(slice_at(&msg, 11, cell_len)).expect("utf8");
+        assert_eq!(text, r#"{a,"b c","","d\"e","NULL"}"#);
+    }
+
+    #[test]
+    fn data_row_array_bool_cell_encodes_t_f() {
+        use engine::row_codec::ArrayValue;
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Array(ArrayValue::Bool(vec![true, false]))],
+        };
+        let msg = encode_data_row(&row).expect("encode");
+        let cell_len = i32_at(&msg, 7) as usize;
+        let text = std::str::from_utf8(slice_at(&msg, 11, cell_len)).expect("utf8");
+        assert_eq!(text, "{t,f}");
+    }
+
+    #[test]
+    fn data_row_array_empty_cell_encodes_braces_only() {
+        use engine::row_codec::ArrayValue;
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Array(ArrayValue::Text(vec![]))],
+        };
+        let msg = encode_data_row(&row).expect("encode");
+        let cell_len = i32_at(&msg, 7) as usize;
+        let text = std::str::from_utf8(slice_at(&msg, 11, cell_len)).expect("utf8");
+        assert_eq!(text, "{}");
     }
 
     #[test]

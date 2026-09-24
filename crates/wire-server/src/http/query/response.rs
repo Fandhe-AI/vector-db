@@ -115,6 +115,32 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push(']');
             Ok(())
         }
+        Cell::Array(array_value) => {
+            use engine::row_codec::ArrayValue;
+            out.push('[');
+            match array_value {
+                ArrayValue::Text(items) => {
+                    for (i, s) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push('"');
+                        escape_json_string_into(out, s);
+                        out.push('"');
+                    }
+                }
+                ArrayValue::Bool(items) => {
+                    for (i, b) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(if *b { "true" } else { "false" });
+                    }
+                }
+            }
+            out.push(']');
+            Ok(())
+        }
     }
 }
 

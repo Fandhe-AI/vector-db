@@ -130,6 +130,29 @@ fn try_alloc_text_for_budget(
     Ok(owned)
 }
 
+/// [`try_alloc_text_for_budget`] の配列列版（Issue #888）。要素本文の合計バイト数
+/// （TEXT 要素は文字列長・BOOLEAN 要素は 1 バイト／個）を確保前に予算計上してから
+/// [`row_codec::ArrayRef::to_value`] で複製する。`ArrayRef` はすでに走査時
+/// （[`row_codec::scan_scalar_columns`]）で構造・UTF-8 を検証済みのため、ここでの
+/// 複製自体が失敗するのはメモリ不足時のみ。
+fn try_alloc_array_for_budget(
+    array_ref: row_codec::ArrayRef<'_>,
+    budget: &mut usize,
+    cap: usize,
+) -> Result<Value, ArenaError> {
+    // 要素本文（`payload_bytes`。TEXT 要素の実体を含む）に加え、`Vec<String>`
+    // の構造体分（`String` 1 個あたり）も計上する（Issue #888 レビュー指摘:
+    // 要素数のみでは可変長 TEXT 要素の実バイト量を捉えられない）。
+    let approx_bytes = array_ref
+        .payload_bytes()
+        .saturating_add((array_ref.count() as usize).saturating_mul(std::mem::size_of::<String>()));
+    *budget = try_accumulate_budget(*budget, approx_bytes, cap)?;
+    let array_value = array_ref
+        .to_value()
+        .map_err(|e| ArenaError::AllocationFailed(format!("failed to decode array field: {e}")))?;
+    Ok(Value::Array(array_value))
+}
+
 // `pool_depth = bound.limit.max(DEFAULT_HYBRID_POOL_DEPTH)` が常に
 // `hybrid::RrfConfig::new` の検証（`1..=hybrid::MAX_POOL_DEPTH`）を通過するのは、
 // `bound.limit` の上限（`core::MAX_SEARCH_K`。`sql::parser::bind` が検証済み）が
@@ -168,6 +191,8 @@ pub enum Cell {
     Float(f64),
     /// 式項目（TASK-79・SQL-9）の `Bool` 型評価結果。
     Bool(bool),
+    /// 配列列（TABLE-14・TASK-198、Issue #888）の投影結果。
+    Array(row_codec::ArrayValue),
 }
 
 /// 投影結果の列メタデータ。`Id` は疑似列（`ColumnType` を持たない）。
@@ -833,6 +858,14 @@ pub(crate) fn execute_statement_with_cache(
                     }
                     Some(row_codec::ScalarRef::Bool(b)) => {
                         kept.push(Value::Bool(b));
+                    }
+                    Some(row_codec::ScalarRef::Array(array_ref)) => {
+                        let value = try_alloc_array_for_budget(
+                            array_ref,
+                            &mut candidate_scalar_bytes,
+                            MAX_CANDIDATE_SCALAR_BYTES,
+                        )?;
+                        kept.push(value);
                     }
                 }
             }
@@ -1811,7 +1844,9 @@ pub(crate) fn execute_statement_with_cache(
                 .map(|v| match v {
                     Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
                     Value::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
-                    Value::Null | Value::Vector(_) => None,
+                    // 配列列は宣言的フィルタ（TEXT 前提）の対象外。`Vector` と
+                    // 同じく型不一致として `None` へ倒す（D-A8）。
+                    Value::Null | Value::Vector(_) | Value::Array(_) => None,
                 })
                 .collect();
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
@@ -2143,6 +2178,16 @@ fn decode_deferred_scalars(
                 out.push(Value::Text(owned));
             }
             Some(row_codec::ScalarRef::Bool(b)) => out.push(Value::Bool(b)),
+            Some(row_codec::ScalarRef::Array(array_ref)) => {
+                let value =
+                    try_alloc_array_for_budget(array_ref, budget, MAX_CANDIDATE_SCALAR_BYTES)
+                        .map_err(|_| {
+                            SqlSurfaceError::payload_too_large(
+                                "deferred scalar projection exceeds candidate budget",
+                            )
+                        })?;
+                out.push(value);
+            }
         }
     }
     Ok(out)
@@ -2367,7 +2412,9 @@ fn project_rows(
                         ColumnType::Text => match decoded.get(*index) {
                             Some(Value::Text(t)) => cells.push(Cell::Text(try_clone_text(t)?)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_)) | Some(Value::Bool(_)) => {
+                            Some(Value::Vector(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Array(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2376,7 +2423,22 @@ fn project_rows(
                         ColumnType::Boolean => match decoded.get(*index) {
                             Some(Value::Bool(b)) => cells.push(Cell::Bool(*b)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_)) | Some(Value::Text(_)) => {
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Array(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Array(_) => match decoded.get(*index) {
+                            Some(Value::Array(array_value)) => {
+                                cells.push(Cell::Array(array_value.clone()))
+                            }
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Bool(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -3491,6 +3553,41 @@ mod tests {
     #[test]
     fn try_accumulate_budget_accepts_up_to_cap_exactly() {
         assert_eq!(try_accumulate_budget(90, 10, 100).unwrap(), 100);
+    }
+
+    /// [`try_alloc_array_for_budget`] は要素数だけでなく TEXT 要素の実体
+    /// バイト量（`ArrayRef::payload_bytes`）を予算に計上する（Issue #888
+    /// レビュー指摘対応: `count * size_of::<String>()` のみでは大きな TEXT
+    /// 要素を持つ配列の実バイト量を過小評価し、予算検証を迂回できてしまう）。
+    #[test]
+    fn try_alloc_array_for_budget_counts_text_element_payload_bytes() {
+        let schema = crate::catalog::TableSchema::new(
+            "docs",
+            vec![crate::catalog::ColumnDef::new(
+                "tags",
+                ColumnType::Array(
+                    crate::catalog::ArrayType::new(crate::catalog::ArrayElemType::Text, 4)
+                        .expect("array ty"),
+                ),
+                true,
+            )],
+        );
+        // 1 要素だが本文は 10,000 バイト。`count * size_of::<String>()`
+        // （24 バイト程度）だけでは検出できない大きさにする。
+        let big_text = "x".repeat(10_000);
+        let values = vec![Value::Array(row_codec::ArrayValue::Text(vec![big_text]))];
+        let encoded = row_codec::encode_scalar_columns(&schema, &values).expect("encode scalar");
+        let scanned = row_codec::scan_scalar_columns(&schema, &encoded).expect("scan");
+        let array_ref = match scanned[0] {
+            Some(row_codec::ScalarRef::Array(array_ref)) => array_ref,
+            _ => panic!("expected ScalarRef::Array"),
+        };
+        let mut budget = 0usize;
+        let result = try_alloc_array_for_budget(array_ref, &mut budget, 100);
+        assert!(
+            matches!(result, Err(ArenaError::CapacityExceeded)),
+            "large TEXT array element must trip the budget cap"
+        );
     }
 
     #[test]

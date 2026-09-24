@@ -3661,6 +3661,16 @@ impl EngineCore {
                     }
                     // BOOLEAN 値は行コーデック上 1 バイト固定（Issue #883・D-a）。
                     crate::row_codec::Value::Bool(_) => 1,
+                    // 配列値（Issue #888）は要素本文の合計バイト数で近似する
+                    // （TEXT 要素は文字列長、BOOLEAN 要素は 1 バイト／個。
+                    // フレームヘッダ分は他列と比べ僅少なため上限判定への
+                    // 影響は無視できる範囲として含めない）。
+                    crate::row_codec::Value::Array(array_value) => match array_value {
+                        crate::row_codec::ArrayValue::Text(items) => {
+                            items.iter().map(|s| s.len()).sum()
+                        }
+                        crate::row_codec::ArrayValue::Bool(items) => items.len(),
+                    },
                 };
                 row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
                     crate::sql::allowlist::SqlSurfaceError::payload_too_large(

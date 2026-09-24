@@ -88,6 +88,43 @@ fn try_clone_vector_for_budget(
     Ok(owned)
 }
 
+/// 配列セルの選択的複製（累計バイト量を確保前に検証。上記テキスト・ベクトル版と
+/// 同方針。Issue #888）。
+fn try_clone_array_for_budget(
+    array_value: &crate::row_codec::ArrayValue,
+    budget: &mut usize,
+    cap: usize,
+) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
+    use crate::row_codec::ArrayValue;
+    match array_value {
+        ArrayValue::Text(items) => {
+            let approx: usize = items.iter().map(|s| s.len()).sum();
+            *budget = try_accumulate_budget(*budget, approx, cap)?;
+            let mut owned: Vec<String> = Vec::new();
+            owned
+                .try_reserve_exact(items.len())
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve RETURNING array field: {e}"),
+                })?;
+            for item in items {
+                owned.push(item.clone());
+            }
+            Ok(ArrayValue::Text(owned))
+        }
+        ArrayValue::Bool(items) => {
+            *budget = try_accumulate_budget(*budget, items.len(), cap)?;
+            let mut owned: Vec<bool> = Vec::new();
+            owned
+                .try_reserve_exact(items.len())
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve RETURNING array field: {e}"),
+                })?;
+            owned.extend_from_slice(items);
+            Ok(ArrayValue::Bool(owned))
+        }
+    }
+}
+
 /// 型不整合・実装バグの検出用（untrusted 入力起因ではないため `wire_code` は
 /// `XX000`。`sql::scan::scan_bug` と同方針）。`RETURNING` の投影は
 /// `sql::parser::bind_returning` が `Computed`（式項目）を構造的に排除した
@@ -160,6 +197,11 @@ pub(crate) fn project_row(
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
                 Some(Value::Bool(b)) => Cell::Bool(*b),
+                Some(Value::Array(array_value)) => Cell::Array(try_clone_array_for_budget(
+                    array_value,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
                 None => return Err(returning_bug("value index out of range")),
             },
             ProjectedColumn::Computed { .. } => {

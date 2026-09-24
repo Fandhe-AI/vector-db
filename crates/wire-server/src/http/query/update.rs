@@ -255,6 +255,14 @@ fn map_set_assignments(
                     "SET BOOLEAN column value must be a JSON boolean",
                 ))
             }
+            // 配列列（TABLE-14・Issue #888）の JSON 配列束縛は本 Issue の対象外
+            // （NoSQL 表層の JSON 配列束縛は #896・NOSQL-17 の担当）。BOOLEAN と
+            // 同じく明示的に拒否する。
+            (ColumnType::Array(_), _) => {
+                return Err(UpdateError::Set(
+                    "SET ARRAY column is not supported via the NoSQL surface",
+                ))
+            }
         };
         assignments.push((key.clone(), literal));
     }
