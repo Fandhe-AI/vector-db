@@ -1085,6 +1085,8 @@ pub fn encode_row(
                         scale
                     }
                     ColumnType::Text
+                    | ColumnType::Integer
+                    | ColumnType::BigInt
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
                     | ColumnType::Date
@@ -1912,6 +1914,8 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 let (precision, scale) = match column.ty {
                     ColumnType::Numeric { precision, scale } => (precision, scale),
                     ColumnType::Text
+                    | ColumnType::Integer
+                    | ColumnType::BigInt
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
                     | ColumnType::Date
@@ -2289,6 +2293,8 @@ pub(crate) fn merge_encode_scalar_columns(
                     let (precision, scale) = match column.ty {
                         ColumnType::Numeric { precision, scale } => (precision, scale),
                         ColumnType::Text
+                        | ColumnType::Integer
+                        | ColumnType::BigInt
                         | ColumnType::Vector(_)
                         | ColumnType::Boolean
                         | ColumnType::Date
@@ -2980,10 +2986,14 @@ pub fn scalar_refs_as_text<'a>(scanned: &[Option<ScalarRef<'a>>]) -> Vec<Option<
             Some(ScalarRef::Integer(_))
             | Some(ScalarRef::BigInt(_))
             | Some(ScalarRef::Bool(_))
+            | Some(ScalarRef::Date(_))
+            | Some(ScalarRef::Timestamp(_))
             | Some(ScalarRef::Array(_))
             | Some(ScalarRef::Bytes(_))
             | Some(ScalarRef::Json(_))
             | Some(ScalarRef::Enum(_))
+            | Some(ScalarRef::Numeric(_))
+            | Some(ScalarRef::Uuid(_))
             | None => None,
         })
         .collect()

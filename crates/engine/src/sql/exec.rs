@@ -2539,10 +2539,14 @@ fn project_rows(
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
                             | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
-                            | Some(Value::Enum(_)) => {
+                            | Some(Value::Enum(_))
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2557,10 +2561,14 @@ fn project_rows(
                             | Some(Value::Text(_))
                             | Some(Value::Vector(_))
                             | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
-                            | Some(Value::Enum(_)) => {
+                            | Some(Value::Enum(_))
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2634,7 +2642,9 @@ fn project_rows(
                         ColumnType::Date => match decoded.get(*index) {
                             Some(Value::Date(d)) => cells.push(Cell::Date(*d)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Timestamp(_))
@@ -2652,7 +2662,9 @@ fn project_rows(
                         ColumnType::Timestamp => match decoded.get(*index) {
                             Some(Value::Timestamp(t)) => cells.push(Cell::Timestamp(*t)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2742,7 +2754,9 @@ fn project_rows(
                         ColumnType::Numeric { .. } => match decoded.get(*index) {
                             Some(Value::Numeric(d)) => cells.push(Cell::Numeric(*d)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2760,7 +2774,9 @@ fn project_rows(
                         ColumnType::Uuid => match decoded.get(*index) {
                             Some(Value::Uuid(u)) => cells.push(Cell::Uuid(*u)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))

@@ -4172,9 +4172,10 @@ mod tests {
         assert_eq!(stmt.rows[0][2], InsertLiteral::Number("-5".to_string()));
     }
 
-    /// `- -1`（二重マイナス）・`+1`（単項プラス）は構造的に受理しない（`42601`）。
+    /// `- -1`（二重マイナス）は構造的に受理しない（`42601`）。単項マイナスの
+    /// 直後は数値トークンのみを許すため、2 個目の `-` はそこで構文エラーになる。
     #[test]
-    fn rejects_double_minus_and_unary_plus_number_literals() {
+    fn rejects_double_minus_number_literal() {
         let lookup = catalog_with(&["documents"]);
         let err = validate_insert(
             "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', - -1) USING OPERATION_ID 'op-0001'",
@@ -4183,14 +4184,24 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "42601");
+    }
 
-        let err2 = validate_insert(
+    /// `+1`（単項プラス）は `NUMERIC` 列の符号付きリテラル（Issue #885・D6・
+    /// PR #1020 codex-review 指摘対応）を許可リストの構造段で通すために現在は
+    /// 受理し、`InsertLiteral::Number("+1")` へ正規化する（本テストでの
+    /// `catalog_with` は列型を持たないため、非 NUMERIC 列に対する拒否
+    /// （束縛段の型不一致・不正値 `22000`）はここでは検証しない。詳細は
+    /// `expect_literal` のドキュメンテーションコメント参照）。
+    #[test]
+    fn accepts_unary_plus_number_literal_structurally() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
             "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', +1) USING OPERATION_ID 'op-0001'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .unwrap_err();
-        assert_eq!(err2.wire_code(), "42601");
+        .expect("unary plus number literal should be accepted structurally");
+        assert_eq!(stmt.rows[0][2], InsertLiteral::Number("+1".to_string()));
     }
 
     /// `-'x'`（マイナスの直後に文字列リテラル）は構造的に受理しない（`42601`）。
