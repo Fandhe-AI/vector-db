@@ -80,15 +80,24 @@ fn bind_body(portal: &str, statement: &str) -> Vec<u8> {
 }
 
 fn bind_body_with_binary_result_format(portal: &str, statement: &str) -> Vec<u8> {
+    bind_body_with_result_formats(portal, statement, &[1])
+}
+
+/// [`bind_body`] の結果 format code 部分だけを差し替える（WIRE-14）。
+/// `codes` はそのまま「結果 format code 件数＋列」として送出する
+/// （0/1/対象数のいずれでもない件数を意図的に送るテストにも使う）。
+fn bind_body_with_result_formats(portal: &str, statement: &str, codes: &[i16]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(portal.as_bytes());
     body.push(0);
     body.extend_from_slice(statement.as_bytes());
     body.push(0);
-    body.extend_from_slice(&0i16.to_be_bytes());
-    body.extend_from_slice(&0i16.to_be_bytes());
-    body.extend_from_slice(&1i16.to_be_bytes()); // result format code count = 1
-    body.extend_from_slice(&1i16.to_be_bytes()); // binary
+    body.extend_from_slice(&0i16.to_be_bytes()); // param format code count
+    body.extend_from_slice(&0i16.to_be_bytes()); // param count
+    body.extend_from_slice(&(codes.len() as i16).to_be_bytes());
+    for code in codes {
+        body.extend_from_slice(&code.to_be_bytes());
+    }
     body
 }
 
@@ -624,10 +633,11 @@ fn describe_portal_returns_row_description_or_no_data_without_parameter_descript
     assert_eq!(kind, b'n', "expected NoData");
 }
 
-/// 受け入れ条件 10: binary 形式コード（#998 未マージの間）は `0A000` で
-/// 回復可能。
+/// 受け入れ条件 10（WIRE-14 結線）: `id` 列（`numeric`）への binary 形式
+/// 指定は非対応型として `0A000` で回復可能（[`result_encoder::
+/// column_binary_support`] が `Id` を非対応とする）。
 #[test]
-fn binary_result_format_is_rejected_with_feature_not_supported() {
+fn binary_result_format_on_unsupported_column_is_rejected_with_feature_not_supported() {
     let (core, _guard) = new_core_with_documents_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
@@ -646,6 +656,110 @@ fn binary_result_format_is_rejected_with_feature_not_supported() {
         &bind_body_with_binary_result_format("p1", "s1"),
     );
     assert_error_then_recovers(&mut stream, "0A000");
+}
+
+/// 受け入れ条件 10（WIRE-14 結線）: `TEXT` 列は binary 形式に対応する
+/// （[`result_encoder::column_binary_support`]）。Bind が成功し、
+/// Describe(Portal) の `RowDescription` が format code 1 を公告し、
+/// Execute の `DataRow` は UTF-8 生バイト（text 表現とビット同一）を返す。
+#[test]
+fn binary_result_format_on_text_column_succeeds_and_reflects_in_row_description_and_data_row() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 1);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("s1", "SELECT body FROM documents LIMIT 1", 0),
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'1', "expected ParseComplete");
+    send_length_prefixed_message(
+        &mut stream,
+        b'B',
+        &bind_body_with_result_formats("p1", "s1", &[1]),
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'2', "expected BindComplete");
+
+    send_length_prefixed_message(&mut stream, b'D', &describe_body(b'P', "p1"));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b'T', "expected RowDescription");
+    // RowDescription 本体: field_count(i16) + [name cstr, table_oid(i32),
+    // column_attnum(i16), type_oid(i32), typlen(i16), type_modifier(i32),
+    // format_code(i16)] の末尾 2 バイトが format code。
+    let format_code = i16::from_be_bytes([body[body.len() - 2], body[body.len() - 1]]);
+    assert_eq!(
+        format_code, 1,
+        "RowDescription must advertise binary format"
+    );
+
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 0));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b'D', "expected DataRow");
+    // DataRow 本体: field_count(i16) + [len(i32), bytes] の 1 列。
+    let value_len = i32::from_be_bytes([body[2], body[3], body[4], body[5]]) as usize;
+    let value_bytes = &body[6..6 + value_len];
+    assert_eq!(
+        value_bytes, b"row-1",
+        "binary text representation must be the same UTF-8 bytes as the text representation"
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'C', "expected CommandComplete");
+
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
+}
+
+/// 受け入れ条件 10（WIRE-14 結線）: 結果 format code の値が 0/1 以外は
+/// `08P01`（body の構文違反）で回復可能。
+#[test]
+fn binary_result_format_invalid_code_value_is_rejected_with_protocol_violation() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("s1", "SELECT body FROM documents LIMIT 1", 0),
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'1');
+    send_length_prefixed_message(
+        &mut stream,
+        b'B',
+        &bind_body_with_result_formats("p1", "s1", &[2]),
+    );
+    assert_error_then_recovers(&mut stream, "08P01");
+}
+
+/// 受け入れ条件 10（WIRE-14 結線）: 結果 format code の個数が
+/// 0・1・列数のいずれでもない場合は `08P01` で回復可能。
+#[test]
+fn binary_result_format_count_mismatch_is_rejected_with_protocol_violation() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("s1", "SELECT id, body FROM documents LIMIT 1", 0),
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'1');
+    send_length_prefixed_message(
+        &mut stream,
+        b'B',
+        &bind_body_with_result_formats("p1", "s1", &[0, 0, 0]),
+    );
+    assert_error_then_recovers(&mut stream, "08P01");
 }
 
 /// 受け入れ条件 11: テナント境界。他テナントの Private 行に関わる INSERT 衝突

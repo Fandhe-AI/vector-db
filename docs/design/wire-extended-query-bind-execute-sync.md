@@ -3,9 +3,10 @@
 ## ステータス
 
 Implemented（本 Issue の範囲。`$n` パラメータ束縛・型 OID 推論は WIRE-12・
-#935、バイナリ形式の実エンコードは #936（PR #998）、暗黙トランザクション
-ブロックは #942・RECOVER-12・SQL-31、ReadyForQuery の状態バイトは #943・
-WIRE-19 の担当のまま）。
+#935、暗黙トランザクションブロックは #942・RECOVER-12・SQL-31、
+ReadyForQuery の状態バイトは #943・WIRE-19 の担当のまま）。結果 format
+code のバイナリエンコード（WIRE-14・#936・PR #998）は本 Issue でマージ後に
+結線済み——「対象ファイル」「スコープ外・申し送り」節参照。
 
 ## 背景
 
@@ -24,7 +25,7 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
 
 | メッセージ | 挙動 |
 | --- | --- |
-| Bind（'B'） | 対象 statement を `describe_parsed_in_session` で確定し portal を保持する。パラメータ数不一致・format code 不正・binary 指定は `08P01`／`0A000` |
+| Bind（'B'） | 対象 statement を `describe_parsed_in_session` で確定し portal を保持する。結果 format code を [`result_encoder::ResultFormats::resolve`]／[`validate_binary_formats`] で列ごとに解決・事前検査する（WIRE-14）。パラメータ数不一致・format code 個数不正は `08P01`、パラメータ側の binary 指定・結果側の非対応型指定は `0A000` |
 | Describe（'D' 種別 P） | portal の `RowDescription`／`NoData`（`ParameterDescription` は返さない） |
 | Execute（'E'） | portal を実行し、`max_rows` に応じて分割送出する（`PortalSuspended`／`CommandComplete`） |
 | Sync（'S'） | エラー後の同期回復モードを解除し、無名 portal を破棄して `ReadyForQuery` を返す |
@@ -125,7 +126,8 @@ Sync バッチ内で後続のメッセージが失敗しても、先に commit �
 | --- | --- |
 | 未定義 statement／portal への参照・名前付き statement／portal の重複作成 | `08P01`（`ProtocolViolation`） |
 | Bind のパラメータ数不一致・format code 個数不正 | `08P01` |
-| Bind／Describe(Portal) の binary 形式指定（#936 未マージの間は一律） | `0A000`（`FeatureNotSupported`） |
+| 結果 format code の個数不正・値不正（0/1 以外） | `08P01`（`ResultFormats::resolve`） |
+| Bind のパラメータ format code が binary 指定（`$n` 束縛未実装のため一律拒否）・結果 format code が非対応型の列を binary 指定（WIRE-14。`id`／`VECTOR`／`Computed`。TABLE-13・Issue #886 の `BOOLEAN`／`BYTEA` も同様） | `0A000`（`FeatureNotSupported`） |
 | Execute の結果列不整合（cached plan must not change result type 相当） | `0A000` |
 | 件数・名前長・保持バイト上限超過 | `54000`（`PayloadTooLarge`） |
 | body の構造不正（NUL 終端欠落・余剰バイト・負の件数・非 UTF-8・種別バイト不正） | `08P01` |
@@ -148,7 +150,9 @@ Sync バッチ内で後続のメッセージが失敗しても、先に commit �
 
 - `crates/wire-server/src/extended_query.rs`: `ExtendedQueryState`
   （`statements`／`portals`／`ignore_till_sync`）・`PortalStore`／`Portal`
-  を新設し、Bind／Execute／Close の body デコーダ、`handle_bind`／
+  （`result_formats: Vec<result_encoder::FormatCode>` を含む——Bind が確定
+  した結果 format code を Describe(Portal)／Execute の双方が参照する）を
+  新設し、Bind／Execute／Close の body デコーダ、`handle_bind`／
   `handle_execute`／`handle_sync`／`handle_close`／`handle_flush`、
   Describe の portal 対象対応を追加。`respond_error_and_close`（フレーム
   違反用）と `respond_error_and_await_sync`（同期回復用）を分離。
@@ -161,7 +165,11 @@ Sync バッチ内で後続のメッセージが失敗しても、先に commit �
   `TagShape` を `pub(crate)` で切り出し（挙動・バイト列は不変）。
 - `crates/wire-server/src/result_encoder.rs`: `encode_bind_complete`（'2'）・
   `encode_close_complete`（'3'）・`encode_portal_suspended`（'s'）を追加
-  （いずれも固定 5 バイト）。
+  （いずれも固定 5 バイト）。結果 format code のエンコード基盤
+  （`FormatCode`／`ResultFormats`／`validate_binary_formats`／
+  `encode_row_description_with_formats`／
+  `encode_data_row_into_with_formats`。WIRE-14・#936・PR #998）は本 Issue
+  では変更せず、`handle_bind`／Describe(Portal)／Execute から呼ぶだけ。
 - `crates/wire-server/src/framing.rs`: `discard_body`（有界な読み捨て）を
   追加。
 - `crates/wire-server/src/limits.rs`: `MAX_PORTALS_PER_SESSION`（64）・
@@ -181,9 +189,11 @@ Sync バッチ内で後続のメッセージが失敗しても、先に commit �
   SQL・未存在テーブル・未定義 statement／portal・実行時エラー）・エラー後
   Sync 前の 'Q' 破棄・portal のライフサイクル（無名／名前付き／Close／
   派生 portal 一括 Close／未存在名の Close）・Flush の無応答性と非空
-  body の Sync／Flush の切断・portal 件数／名前長上限・binary 形式拒否・
-  テナント境界（RLS-7）・`engine: None` 経路の後方互換・簡易クエリ応答の
-  不変性を固定。
+  body の Sync／Flush の切断・portal 件数／名前長上限・結果 format code
+  の解決／事前検査（`TEXT` 列への binary 指定は成功し `RowDescription`／
+  `DataRow` に反映される・非対応型〔`id` 等〕への binary 指定は `0A000`・
+  個数／値不正は `08P01`）・テナント境界（RLS-7）・`engine: None` 経路の
+  後方互換・簡易クエリ応答の不変性を固定。
 - `crates/wire-server/tests/wire11_parse_describe.rs`: Parse／Describe の
   エラー系テストを `_and_closes` から `_and_recovers`（Sync で同期回復し
   簡易クエリが通ることを確認）へ更新。portal 対象の Describe は本 Issue で
@@ -199,9 +209,9 @@ Sync バッチ内で後続のメッセージが失敗しても、先に commit �
 - `$n` の束縛と `ParameterDescription` の型 OID 推論（#935・WIRE-12）。
   現状パラメータ数は常に 0（Parse が `num_param_types > 0` を拒否するため）
   であり、Bind の実パラメータ数も 0 でなければ `08P01`。
-- バイナリ形式の実エンコード（#936・PR #998）。マージ後は
-  `result_encoder::ResultFormats::resolve`／`validate_binary_formats` へ
-  結線し、`0A000` 一律拒否を置き換える。
+- パラメータ側の binary 入力（Bind が受け取る `$n` 値そのもののバイナリ
+  表現）。`$n` 束縛自体が WIRE-12・#935 未実装のため対象外のまま
+  （パラメータ format code は 0 以外を一律 `0A000` で拒否し続ける）。
 - 暗黙トランザクションブロック（Sync までの複数 Execute を 1 トランザクショ
   ンにまとめる挙動。#942・RECOVER-12・SQL-31）。
 - ReadyForQuery の状態バイト（#943・WIRE-19）。

@@ -50,9 +50,14 @@
 //! - 未定義ステートメント名／portal 名への参照・名前付きステートメント／
 //!   portal の重複作成・Bind のパラメータ数不一致・format code の個数不正
 //!   → `08P01`（`ProtocolViolation`）
-//! - Bind／Describe(Portal) の binary 形式指定・Describe(Portal) 対象の受理
-//!   不能・実行結果列の不整合（`0A000` の「未対応機能」区分を fail-closed な
-//!   ガードとして流用） → `0A000`（`FeatureNotSupported`）
+//! - Bind のパラメータ format code が binary（1）を指定（`$n` 束縛が
+//!   WIRE-12・#935 未実装のため一律拒否）・結果 format code が非対応型の列を
+//!   binary 指定（WIRE-14・[`result_encoder::column_binary_support`]）・
+//!   Describe(Portal) 対象の受理不能・実行結果列の不整合（いずれも `0A000`
+//!   の「未対応機能」区分を fail-closed なガードとして流用）
+//!   → `0A000`（`FeatureNotSupported`）
+//! - 結果 format code の個数不正・値不正（0/1 以外） → `08P01`
+//!   （`ProtocolViolation`。[`result_encoder::BinaryFormatError`]）
 //! - 件数・名前長・保持バイト上限超過 →
 //!   `54000`（`PayloadTooLarge`。[`crate::limits`] の各定数）
 //! - body の構造不正（NUL 終端欠落・余剰バイト・負の件数・非 UTF-8・種別バイト
@@ -497,6 +502,13 @@ struct Portal {
     /// 求めた結果列（`PortalBody::Empty` は常に `None`）。Describe(Portal) の
     /// 応答と、Execute の結果列整合ガードの両方に使う。
     columns: Option<Vec<ColumnMeta>>,
+    /// Bind の結果 format code を `columns` の列数へ解決した値（WIRE-14・
+    /// `result_encoder::ResultFormats::resolve`）。`columns` が `None`
+    /// （結果列なしの statement）の場合は常に空。Describe(Portal) の
+    /// `RowDescription` と Execute の `DataRow` 双方が同じ値を参照し、
+    /// 「Bind 時点で確定した形式を Execute まで一貫させる」契約を保つ
+    /// （PostgreSQL の Bind 規則と同じ）。
+    result_formats: Vec<result_encoder::FormatCode>,
     state: PortalState,
 }
 
@@ -604,11 +616,17 @@ enum HandlerError {
     /// Bind のパラメータ数が対象ステートメントの要求数と一致しない
     /// （`$n` 未対応のため現状の要求数は常に 0）。
     ParamCountMismatch,
-    /// パラメータ／結果 format code の個数が 0・1・対象数のいずれでもない。
+    /// パラメータ format code の個数が 0・1・対象数のいずれでもない
+    /// （結果 format code の同種エラーは [`HandlerError::BinaryFormat`] 経由）。
     FormatCodeCountMismatch,
-    /// format code が binary（1）を指定している（#936・PR #998 未マージの間は
-    /// 一律拒否）。
+    /// パラメータ format code が binary（1）を指定している。`$n` 束縛は
+    /// WIRE-12・#935 の担当で現状 `num_params` は常に 0 のため、パラメータ側の
+    /// 実バイナリ対応は本 Issue の対象外のまま一律拒否する（結果側は
+    /// [`HandlerError::BinaryFormat`]・WIRE-14 が実対応する）。
     BinaryFormatUnsupported,
+    /// 結果 format code の解決・事前検査で生じたエラー（WIRE-14。
+    /// `result_encoder::BinaryFormatError` をそのまま分類し直したもの）。
+    BinaryFormat(result_encoder::BinaryFormatError),
     /// Execute の実行結果列が Bind 時点で確定した結果列と一致しない
     /// （「cached plan must not change result type」相当の fail-closed ガード）。
     ResultTypeChanged,
@@ -639,6 +657,7 @@ impl HandlerError {
             HandlerError::ParamCountMismatch => ErrorClass::ProtocolViolation,
             HandlerError::FormatCodeCountMismatch => ErrorClass::ProtocolViolation,
             HandlerError::BinaryFormatUnsupported => ErrorClass::FeatureNotSupported,
+            HandlerError::BinaryFormat(e) => e.error_class(),
             HandlerError::ResultTypeChanged => ErrorClass::FeatureNotSupported,
             HandlerError::SuspendedBytesExceeded => ErrorClass::PayloadTooLarge,
             HandlerError::Internal(_) => ErrorClass::InternalError,
@@ -684,7 +703,20 @@ impl HandlerError {
                 "format code count does not match the parameter or result count".to_string()
             }
             HandlerError::BinaryFormatUnsupported => {
-                "binary format is not supported on this connection".to_string()
+                "binary parameter format is not supported on this connection".to_string()
+            }
+            HandlerError::BinaryFormat(result_encoder::BinaryFormatError::FormatCountMismatch) => {
+                "format code count does not match the parameter or result count".to_string()
+            }
+            HandlerError::BinaryFormat(result_encoder::BinaryFormatError::InvalidFormatCode) => {
+                "format code must be 0 (text) or 1 (binary)".to_string()
+            }
+            // 列番号のみを含め、テーブル名・値そのものは含めない
+            // （`.claude/rules/security.md`。他テナントの存在情報を漏らさない）。
+            HandlerError::BinaryFormat(result_encoder::BinaryFormatError::UnsupportedType {
+                column_index,
+            }) => {
+                format!("column {column_index} does not support binary format")
             }
             HandlerError::ResultTypeChanged => {
                 "cached plan must not change result type".to_string()
@@ -830,7 +862,11 @@ fn handle_parse_body(
 
 enum DescribeResult {
     Statement(Option<Vec<ColumnMeta>>),
-    Portal(Option<Vec<ColumnMeta>>),
+    /// portal 対象。`Bind` が確定した結果 format code（WIRE-14）を
+    /// `RowDescription` の各列の format code フィールドへそのまま反映する
+    /// （Execute の `DataRow` と同じ値を参照——Bind 時点で確定した形式を
+    /// Execute まで一貫させる契約）。
+    Portal(Option<Vec<ColumnMeta>>, Vec<result_encoder::FormatCode>),
 }
 
 /// Describe（'D'）を処理する（`engine` が接続済みの場合のみ呼ばれる）。
@@ -863,8 +899,8 @@ pub(crate) fn handle_describe(
             write_describe_response(stream, true, columns)?;
             Ok(LoopSignal::Continue)
         }
-        Ok(DescribeResult::Portal(columns)) => {
-            write_describe_response(stream, false, columns)?;
+        Ok(DescribeResult::Portal(columns, formats)) => {
+            write_describe_response_portal(stream, columns, &formats)?;
             Ok(LoopSignal::Continue)
         }
         Err(err) => {
@@ -907,6 +943,35 @@ fn write_describe_response(
     stream.flush()
 }
 
+/// Describe(Portal) 応答（WIRE-14）。portal 対象は `ParameterDescription` を
+/// 返さず（[`write_describe_response`] と異なり常に `false` 相当）、
+/// `RowDescription` の format code は Bind 時点で確定した `formats`
+/// （[`Portal::result_formats`]）をそのまま反映する。
+fn write_describe_response_portal(
+    stream: &mut TcpStream,
+    columns: Option<Vec<ColumnMeta>>,
+    formats: &[result_encoder::FormatCode],
+) -> io::Result<()> {
+    match columns {
+        Some(columns) => {
+            let row_description = result_encoder::encode_row_description_with_formats(
+                &columns, formats,
+            )
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "failed to encode RowDescription",
+                )
+            })?;
+            stream.write_all(&row_description)?;
+        }
+        None => {
+            stream.write_all(&result_encoder::encode_no_data())?;
+        }
+    }
+    stream.flush()
+}
+
 fn handle_describe_body(
     engine: &EngineCore,
     session: &SessionState,
@@ -933,7 +998,10 @@ fn handle_describe_body(
                 .portals
                 .get(&msg.name)
                 .ok_or(HandlerError::UnknownPortal)?;
-            Ok(DescribeResult::Portal(portal.columns.clone()))
+            Ok(DescribeResult::Portal(
+                portal.columns.clone(),
+                portal.result_formats.clone(),
+            ))
         }
     }
 }
@@ -942,11 +1010,13 @@ fn handle_describe_body(
 // Bind（'B'）
 // ---------------------------------------------------------------------------
 
-/// パラメータ／結果いずれの format code 列も同じ規約（PostgreSQL）: 件数は
+/// Bind のパラメータ format code 列を検証する（PostgreSQL の規約: 件数は
 /// 0（すべて既定＝text）・1（すべてこの 1 個の値に従う）・対象数と同数の
-/// いずれかでなければならない。値は 0（text）のみ許可し、1（binary）は
-/// #936（PR #998）未マージの間 `0A000` で一律拒否する
-/// （`docs/design/wire-extended-query-bind-execute-sync.md` 参照）。
+/// いずれかでなければならない）。`$n` 束縛は WIRE-12・#935 の担当で現状
+/// `num_params` は常に 0 のため、値は 0（text）のみ許可し 1（binary）は
+/// 一律拒否する（結果 format code は WIRE-14・[`result_encoder::
+/// ResultFormats::resolve`]／[`result_encoder::validate_binary_formats`] が
+/// 別途扱う。`docs/design/wire-extended-query-bind-execute-sync.md` 参照）。
 fn validate_format_codes(codes: &[i16], target_count: usize) -> Result<(), HandlerError> {
     if !codes.is_empty() && codes.len() != 1 && codes.len() != target_count {
         return Err(HandlerError::FormatCodeCountMismatch);
@@ -1028,13 +1098,27 @@ fn handle_bind_body(
         }
     };
 
+    // 結果 format code の解決・事前検査（WIRE-14）。列ごとの
+    // `FormatCode`（`Text`／`Binary`）へ解決したうえで、binary 指定列が
+    // すべて対応型（`TEXT`）であることを `RowDescription` 送出前に確定する
+    // （`result_encoder` モジュールドキュメント参照）。結果列なしの
+    // statement（`columns` が `None`。`expected_cols == 0`）では
+    // `validate_binary_formats` を呼ばない——列が 0 なので形式指定は常に
+    // 無害（PostgreSQL も同様に無視する）。
     let expected_cols = columns.as_ref().map(Vec::len).unwrap_or(0);
-    validate_format_codes(&msg.result_format_codes, expected_cols)?;
+    let result_formats = result_encoder::ResultFormats::new(&msg.result_format_codes)
+        .resolve(expected_cols)
+        .map_err(HandlerError::BinaryFormat)?;
+    if let Some(cols) = columns.as_ref() {
+        result_encoder::validate_binary_formats(cols, &result_formats)
+            .map_err(HandlerError::BinaryFormat)?;
+    }
 
     let portal = Portal {
         source_statement: msg.statement_name,
         body: portal_body,
         columns,
+        result_formats,
         state: PortalState::Ready,
     };
 
@@ -1146,7 +1230,7 @@ fn execute_portal(
     );
 
     if needs_execution {
-        let (parsed, expected_columns) = {
+        let (parsed, expected_columns, result_formats) = {
             let portal = state
                 .portals
                 .get(portal_name)
@@ -1164,7 +1248,11 @@ fn execute_portal(
                     ))
                 }
             };
-            (parsed, portal.columns.clone())
+            (
+                parsed,
+                portal.columns.clone(),
+                portal.result_formats.clone(),
+            )
         };
 
         let outcome = crate::simple_query::execute_with_emergency_registration(stream, || {
@@ -1180,8 +1268,19 @@ fn execute_portal(
                 }
                 let mut frames = std::collections::VecDeque::with_capacity(result.rows.len());
                 for row in &result.rows {
-                    let frame = result_encoder::encode_data_row(row)
-                        .map_err(|_| internal_error("failed to encode data row"))?;
+                    // Bind 時点で確定した結果 format code（WIRE-14。
+                    // `Portal::result_formats`）を反映する。`validate_binary_
+                    // formats` が Bind で事前検査済みのため、ここでの
+                    // `EncodeError` は呼び出し元（本モジュール）内部の不整合
+                    // のみを意味する（`XX000` 相当。`result_encoder`
+                    // モジュールドキュメント参照）。
+                    let mut frame = Vec::new();
+                    result_encoder::encode_data_row_into_with_formats(
+                        row,
+                        &result_formats,
+                        &mut frame,
+                    )
+                    .map_err(|_| internal_error("failed to encode data row"))?;
                     frames.push_back(frame);
                 }
                 PortalState::Suspended(PortalRows { frames, shape })
@@ -1750,6 +1849,7 @@ mod tests {
                         source_statement: String::new(),
                         body: PortalBody::Empty,
                         columns: None,
+                        result_formats: Vec::new(),
                         state: PortalState::Ready,
                     },
                 )
@@ -1761,6 +1861,7 @@ mod tests {
                 source_statement: String::new(),
                 body: PortalBody::Empty,
                 columns: None,
+                result_formats: Vec::new(),
                 state: PortalState::Ready,
             },
         );
@@ -1777,6 +1878,7 @@ mod tests {
                     source_statement: String::new(),
                     body: PortalBody::Empty,
                     columns: None,
+                    result_formats: Vec::new(),
                     state: PortalState::Ready,
                 },
             )
@@ -1788,6 +1890,7 @@ mod tests {
                     source_statement: String::new(),
                     body: PortalBody::Empty,
                     columns: None,
+                    result_formats: Vec::new(),
                     state: PortalState::Ready,
                 },
             )
@@ -1808,6 +1911,7 @@ mod tests {
                     source_statement: "stmt1".to_string(),
                     body: PortalBody::Empty,
                     columns: None,
+                    result_formats: Vec::new(),
                     state: PortalState::Ready,
                 },
             )
@@ -1819,6 +1923,7 @@ mod tests {
                     source_statement: "stmt2".to_string(),
                     body: PortalBody::Empty,
                     columns: None,
+                    result_formats: Vec::new(),
                     state: PortalState::Ready,
                 },
             )

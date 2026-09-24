@@ -31,11 +31,13 @@
 //! `WireType` 側の対応拡大（#895・NOSQL-13 ポインタ）に備えた部品として先行
 //! 提供するが、本モジュールが実際に結線するのは `Text` のみ。
 //!
-//! **本モジュール単独では wire 経由でバイナリ形式を要求する経路が無い**
-//! （拡張クエリプロトコルの Bind／Describe は #933・#934 が未実装。
-//! `protocol_dispatch::classify` が `'B'` を `0A000` で拒否する）。本 Issue の
-//! 範囲は結果側エンコーダの提供までで、Bind の結果形式コードから本 API への
-//! 結線・同期回復（`0A000` 後の接続維持）は #934 の担当。
+//! Bind の結果形式コードから本 API への結線は
+//! [`crate::extended_query::handle_bind`]（[`ResultFormats::resolve`]／
+//! [`validate_binary_formats`] を呼ぶ）・Describe(Portal) の
+//! `RowDescription`（[`encode_row_description_with_formats`]）・Execute の
+//! `DataRow`（[`encode_data_row_into_with_formats`]）が担う（#934・WIRE-11・
+//! WIRE-14）。パラメータ側（Bind が受け取る `$n` の binary 入力）は
+//! `$n` 束縛そのものが WIRE-12・#935 未実装のため対象外のまま。
 //!
 //! サイズ安全: フレーム長は `i32::try_from`/`checked_add` で算出し、超過は
 //! `Err(EncodeError::FrameTooLarge)` とする（`.claude/rules/coding-rust.md`
