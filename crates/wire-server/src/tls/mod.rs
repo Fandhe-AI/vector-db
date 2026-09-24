@@ -6,6 +6,8 @@
 //!
 //! - `handshake.rs` の `SSLRequest` 応答（`'N'` を返す既存挙動）はビット単位で
 //!   不変。TLS の実接続組み込みは #966・#968 が担当する
+//! - [`aes`]: AES-128 ブロック暗号（暗号化方向のみ・定数時間。Issue #957）。
+//!   GCM（#958）が CTR 鍵ストリーム生成・`H = E_K(0^128)` の計算に使う
 //! - [`field25519`]（`pub(crate)`）: GF(2^255-19) 上の定数時間フィールド
 //!   算術。X25519 と後続の Ed25519（Issue #961）で共有する内部基盤
 //! - [`x25519`]: X25519 鍵交換（RFC 7748・定数時間。Issue #955）。TLS 1.3
@@ -30,6 +32,7 @@
 //! コンフリクトを避けるため、後続 sub-issue は `pub mod` を 1 行ずつ
 //! 追加していく想定。
 
+pub mod aes;
 pub(crate) mod field25519;
 pub mod handshake;
 pub mod hkdf;
