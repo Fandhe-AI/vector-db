@@ -93,6 +93,8 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
         ColumnType::Text => Ok(idx),
         ColumnType::Vector(_)
         | ColumnType::Boolean
+        | ColumnType::Date
+        | ColumnType::Timestamp
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json

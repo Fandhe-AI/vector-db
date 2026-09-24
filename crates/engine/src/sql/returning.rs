@@ -223,6 +223,8 @@ pub(crate) fn project_row(
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
                 Some(Value::Bool(b)) => Cell::Bool(*b),
+                Some(Value::Date(d)) => Cell::Date(*d),
+                Some(Value::Timestamp(t)) => Cell::Timestamp(*t),
                 Some(Value::Array(array_value)) => Cell::Array(try_clone_array_for_budget(
                     array_value,
                     budget,
