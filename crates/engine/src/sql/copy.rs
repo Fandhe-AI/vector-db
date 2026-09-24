@@ -263,6 +263,17 @@ impl CsvRecordScanner {
         if self.state == CsvFieldState::Start && self.fields.is_empty() {
             return Ok(None);
         }
+        // 引用符なしフィールドが CRLF ではなく生の `\r` 1 文字だけで
+        // CopyDone を迎えた場合（`value\r` のまま `\n` が来ない）、
+        // `push_byte` の `Unquoted` × `\n` 分岐が行う「直前の `\r` を
+        // 行終端の一部として除去する」処理と同じ扱いをここでも行う。
+        // 除去しないと `value\r\n` と `value\r` とで格納値が異なってしまう
+        // （Cursor Bugbot 指摘）。引用符付きフィールド中の未終端 CRLF は
+        // 上の `AfterQuoteCr`／`Quoted` 検査で既に fail-closed に拒否済み
+        // のため、ここでは `Unquoted` 状態のみを対象にする。
+        if self.state == CsvFieldState::Unquoted && self.field.last() == Some(&b'\r') {
+            self.field.pop();
+        }
         self.push_field()?;
         Ok(Some(self.take_record()))
     }
@@ -330,10 +341,17 @@ impl RecordSplitter {
     /// 場合）のフィールド列を返す。
     fn finish(self) -> Result<Option<Vec<Option<String>>>, SqlSurfaceError> {
         match self {
-            RecordSplitter::Text { pending } => {
+            RecordSplitter::Text { mut pending } => {
                 if pending.is_empty() {
                     Ok(None)
                 } else {
+                    // `feed` の LF 分岐と同じく、末尾レコードが CRLF ではなく
+                    // 生の `\r` だけで CopyDone を迎えた場合も行終端の一部
+                    // として除去する（Cursor Bugbot 指摘: 除去しないと
+                    // `value\r\n` と `value\r` とで格納値が異なってしまう）。
+                    if pending.last() == Some(&b'\r') {
+                        pending.pop();
+                    }
                     Ok(Some(decode_text_record(&pending)?))
                 }
             }
