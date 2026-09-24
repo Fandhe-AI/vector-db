@@ -1702,6 +1702,70 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (
+                crate::catalog::ColumnType::Numeric { precision, scale },
+                crate::row_codec::Value::Numeric(d),
+            ) => {
+                // NUMERIC 値は行コーデック上 presence(1) + i128(16) の固定長
+                // （`row_codec::SCALAR_NUMERIC_ENTRY_LEN`）のため、TEXT のような
+                // 長さ検証は不要だが、列の scale・precision との整合は
+                // ここで先取り検証する（TABLE-13〔検討中〕・TASK-197、
+                // Issue #885）。
+                if d.scale() != *scale || !d.fits_precision(*precision) {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "SET NUMERIC value does not match the column precision/scale".to_string(),
+                    )));
+                }
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_NUMERIC_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::Date, crate::row_codec::Value::Date(_)) => {
+                // DATE 値は行コーデック上 4 バイト固定
+                // （`row_codec::SCALAR_DATE_ENTRY_LEN`）のため、TEXT のような
+                // 長さ検証は不要（TABLE-13・TASK-197、Issue #884・D-3）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_DATE_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::Timestamp, crate::row_codec::Value::Timestamp(_)) => {
+                // TIMESTAMP 値は行コーデック上 8 バイト固定
+                // （`row_codec::SCALAR_TIMESTAMP_ENTRY_LEN`）のため、同上の理由で
+                // 長さ検証は不要（Issue #884・D-3）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_TIMESTAMP_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             (crate::catalog::ColumnType::Array(array_ty), crate::row_codec::Value::Array(av)) => {
                 // 配列 SET 値のフレーム長検証（対象行の探索より前に行う。
                 // Issue #888・D-A3。`row_codec::scalar_array_entry_len` を
@@ -1767,6 +1831,43 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (
+                crate::catalog::ColumnType::Json | crate::catalog::ColumnType::Jsonb,
+                crate::row_codec::Value::Json(t),
+            ) => {
+                // SET 値の JSON／JSONB 長上限検証（対象行の探索より前に行う）。
+                // フレーミングは TEXT と同一のため `scalar_text_entry_len` を
+                // 共有する（Issue #889）。構文検証・JSONB 正規化の一致検証は
+                // `row_codec` の encode チョークポイント（多層防御）で行う。
+                let text_len = u32::try_from(t.len()).map_err(|_| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "json field too long: {} bytes",
+                        t.len()
+                    )))
+                })?;
+                if text_len > crate::row_codec::MAX_TEXT_FIELD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "json field length {text_len} exceeds limit {}",
+                        crate::row_codec::MAX_TEXT_FIELD_LEN
+                    ))));
+                }
+                let entry_len = crate::row_codec::scalar_text_entry_len(text_len)
+                    .map_err(|e| TenantWriteError::Catalog(CatalogError::Invalid(e.to_string())))?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             (crate::catalog::ColumnType::Enum(def), crate::row_codec::Value::Enum(label)) => {
                 // SET 値の語彙検証（対象行の探索より前に行う。多層防御。
                 // 束縛層〔`sql::parser::bind_enum_literal`〕で既に検査済みだが、
@@ -1801,12 +1902,57 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            // 明示的な SQL `NULL`（`bind_set_assignments`〔SQL-17・SQL-19〕が
+            // nullable 列向けに構築する。PR #1014 レビュー指摘対応・Issue #889。
+            // `VECTOR` 列は nullable の値に関わらず常に必須として扱うため対象外
+            // ——下の catch-all で従来どおり拒否する）。呼び出し元
+            // （`bind_set_assignments`）は既に `column.nullable` を検査済みだが、
+            // write トランザクション内で再取得したスキーマとの多層防御として
+            // ここでも再検査する（`schema.columns` の型検証と同じ設計）。
+            (
+                crate::catalog::ColumnType::Text
+                | crate::catalog::ColumnType::Boolean
+                | crate::catalog::ColumnType::Date
+                | crate::catalog::ColumnType::Timestamp
+                | crate::catalog::ColumnType::Array(_)
+                | crate::catalog::ColumnType::Bytea
+                | crate::catalog::ColumnType::Json
+                | crate::catalog::ColumnType::Jsonb
+                | crate::catalog::ColumnType::Enum(_)
+                | crate::catalog::ColumnType::Numeric { .. }
+                | crate::catalog::ColumnType::Uuid,
+                crate::row_codec::Value::Null,
+            ) if column.nullable => {}
+            (crate::catalog::ColumnType::Uuid, crate::row_codec::Value::Uuid(_)) => {
+                // UUID 値は行コーデック上 presence(1) + 16 バイト固定
+                // （`row_codec::SCALAR_UUID_ENTRY_LEN`）のため、TEXT のような
+                // 長さ検証は不要（TABLE-13〔検討中〕・TASK-197、Issue #887）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_UUID_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             (crate::catalog::ColumnType::Vector(_), _)
             | (crate::catalog::ColumnType::Text, _)
             | (crate::catalog::ColumnType::Boolean, _)
+            | (crate::catalog::ColumnType::Date, _)
+            | (crate::catalog::ColumnType::Timestamp, _)
             | (crate::catalog::ColumnType::Array(_), _)
             | (crate::catalog::ColumnType::Bytea, _)
-            | (crate::catalog::ColumnType::Enum(_), _) => {
+            | (crate::catalog::ColumnType::Json, _)
+            | (crate::catalog::ColumnType::Jsonb, _)
+            | (crate::catalog::ColumnType::Enum(_), _)
+            | (crate::catalog::ColumnType::Numeric { .. }, _)
+            | (crate::catalog::ColumnType::Uuid, _) => {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column type does not match the current table schema".to_string(),
                 )))

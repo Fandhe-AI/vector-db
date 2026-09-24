@@ -19,6 +19,10 @@
 //!   そのまま送出できる
 //! - `ColumnMeta::Scalar{ty: Text}` → `text`（OID 25, typlen -1）
 //! - `ColumnMeta::Scalar{ty: Vector(_)}` → `text`（OID 25。値は `[v1,v2,...]` 形式）
+//! - `ColumnMeta::Scalar{ty: Numeric{..}}` → `numeric`（OID 1700, typlen -1。
+//!   値は `Cell::Numeric`（`Decimal` の正規テキスト）のテキスト表現。
+//!   バイナリ形式は `supports_binary` が別途 fail-closed に非対応とする
+//!   〔TASK-197・Issue #885・#895 ポインタ〕）
 //! - `ColumnMeta::Computed{..}` → `text`（OID 25。実行時型のため text 固定）
 //!
 //! バイナリ形式（format code 1・WIRE-14・TASK-218・Issue #936）: 列ごとに
@@ -232,7 +236,9 @@ pub mod binary {
 pub(crate) enum WireType {
     /// `ColumnMeta::Id`。engine の行 ID は `u64` 全域（`u64::MAX` を含む）を
     /// 有効値とするため、符号付き 64bit の `int8`（OID 20）では表現できない
-    /// 値が生じる（PR #210 レビュー指摘）。
+    /// 値が生じる（PR #210 レビュー指摘）。`ColumnMeta::Scalar{ty:
+    /// Numeric{..}}`（TASK-197・Issue #885）も同じ OID 1700 を公告する
+    /// （値の実体は別途 `Cell::Numeric` の正規テキスト表現）。
     Numeric,
     /// `ColumnMeta::Scalar{ty: Text}`／`Scalar{ty: Vector(_)}`／`Computed{..}`。
     Text,
@@ -354,6 +360,42 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
             ty: engine::catalog::ColumnType::Array(_),
             ..
         } => false,
+        // `JSON`／`JSONB` 列（TABLE-14・Issue #889）も同じ理由で fail-closed に
+        // 非対応とする（値の実体が `Cell::Json` の格納テキストであり `Text` の
+        // 単純な UTF-8 生バイト表現と意味論が異なるため。RowDescription への
+        // 専用 OID 公告は Issue #895 の担当）。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Json | engine::catalog::ColumnType::Jsonb,
+            ..
+        } => false,
+        // `NUMERIC` 列（TABLE-13〔検討中〕・TASK-197、Issue #885）も本 Issue
+        // （#936・WIRE-14）の策定時点では未存在の型のため、バイナリ表現は
+        // spec 側で未決定。値の実体が `Cell::Numeric`（`Decimal` の正規テキスト）
+        // であり `Text` の単純な UTF-8 生バイト表現とは異なるため、他の後発型と
+        // 同様に fail-closed で非対応とする（RowDescription・HTTP 応答への
+        // OID 1700／`"numeric"` 公告は `column_wire_type` が既に担う。ここで
+        // 非対応とするのはバイナリ表現のみ。#895 に残るのはバイナリ表現の
+        // 対応拡大）。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Numeric { .. },
+            ..
+        } => false,
+        // `DATE`／`TIMESTAMP` 列（TABLE-13・TASK-197、Issue #884）も本 Issue
+        // （#936・WIRE-14）の策定時点では未存在の型のため、バイナリ表現は
+        // spec 側で未決定。`VECTOR`・`BOOLEAN` 等と同様に fail-closed で
+        // 非対応とする。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Date | engine::catalog::ColumnType::Timestamp,
+            ..
+        } => false,
+        // `UUID` 列（TABLE-13〔検討中〕・TASK-197、Issue #887）も本 Issue
+        // （#936・WIRE-14）の策定時点では未存在の型のため、バイナリ表現は
+        // spec 側で未決定。他の後発型と同様に fail-closed で非対応とする
+        // （U10。RowDescription への専用 OID 公告は #895 の担当のまま）。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Uuid,
+            ..
+        } => false,
         // 実行時型（Float/Bool/Vector）が静的に決まらないため fail-closed
         // で非対応とする（#895 で型情報が付いたら見直す）。
         ColumnMeta::Computed { .. } => false,
@@ -365,6 +407,17 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
 pub(crate) fn column_wire_type(meta: &ColumnMeta) -> WireType {
     match meta {
         ColumnMeta::Id => WireType::Numeric, // u64 全域を表現するため int8 ではなく numeric
+        // `NUMERIC` 列（TABLE-13〔検討中〕・TASK-197、Issue #885）は値の実体が
+        // `Cell::Numeric`（`Decimal` の正規テキスト）であり、`supports_binary`
+        // が fail-closed に非対応とするのはバイナリ表現のみ（Issue #895 まで
+        // 未決定）。RowDescription／HTTP 応答の型メタデータ（OID 1700・
+        // `"numeric"`）自体はテキスト形式でも正しく公告できるため、他の
+        // `Scalar` 列（`text` 固定）より先にこの分岐で判定する（PR #1020
+        // codex-review 指摘）。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Numeric { .. },
+            ..
+        } => WireType::Numeric,
         ColumnMeta::Scalar { .. } => WireType::Text, // Vector も text 表現で返す
         ColumnMeta::Computed { .. } => WireType::Text,
     }
@@ -458,10 +511,26 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         }
         Cell::Float(f) => Ok(Some(f.to_string())),
         Cell::Bool(b) => Ok(Some(if *b { "t".to_string() } else { "f".to_string() })),
+        // ISO テキストへ整形する（`engine::datetime` が単一情報源。TABLE-13・
+        // TASK-197、Issue #884。RowDescription の OID は #895 まで既存どおり
+        // `25`（TEXT 相当）のまま不変）。
+        Cell::Date(days) => Ok(Some(engine::datetime::format_date(*days))),
+        Cell::Timestamp(micros) => Ok(Some(engine::datetime::format_timestamp(*micros))),
         Cell::Array(array_value) => Ok(Some(pg_array_text(array_value))),
         // `BYTEA` のテキスト表現は PostgreSQL 既定の `bytea_output=hex`（`\x` ＋
         // 小文字 16 進）と同形にする（B5・Issue #886）。
         Cell::Bytes(b) => Ok(Some(engine::bytea::format_hex_text(b))),
+        // `JSON`／`JSONB` の text 表現は格納テキストをそのまま出力する
+        // （TABLE-14・Issue #889。`JSON` は入力テキスト保持・`JSONB` は正規化
+        // 済みテキストのため、いずれもここで再シリアライズしない）。
+        Cell::Json(s) => Ok(Some(s.clone())),
+        // NUMERIC 列の text フォーマット表現は正規テキスト（`Decimal::Display`）
+        // をそのまま送る（TABLE-13〔検討中〕・TASK-197、Issue #885）。
+        Cell::Numeric(d) => Ok(Some(d.to_string())),
+        // UUID 列の text フォーマット表現は正規テキスト（小文字
+        // `8-4-4-4-12`）をそのまま送る（TABLE-13〔検討中〕・TASK-197、
+        // Issue #887・U4）。
+        Cell::Uuid(u) => Ok(Some(u.to_string())),
     }
 }
 
@@ -623,8 +692,13 @@ where
                     | Cell::Vector(_)
                     | Cell::Float(_)
                     | Cell::Bool(_)
+                    | Cell::Date(_)
+                    | Cell::Timestamp(_)
                     | Cell::Array(_)
-                    | Cell::Bytes(_) => {
+                    | Cell::Bytes(_)
+                    | Cell::Json(_)
+                    | Cell::Numeric(_)
+                    | Cell::Uuid(_) => {
                         return Err(EncodeError);
                     }
                 },
@@ -1414,5 +1488,33 @@ mod tests {
         assert!(!column_binary_support(&ColumnMeta::Computed {
             name: "expr".to_string(),
         }));
+        // UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887・U10）もバイナリ
+        // 非対応のまま（RowDescription への専用 OID 公告は #895 の担当）。
+        assert!(!column_binary_support(&ColumnMeta::Scalar {
+            name: "external_id".to_string(),
+            ty: engine::catalog::ColumnType::Uuid,
+        }));
+    }
+
+    /// `NUMERIC` 列（TABLE-13〔検討中〕・TASK-197、Issue #885）は値の実体が
+    /// `Cell::Numeric` であり、他の `Scalar` 列（`text` 固定）とは異なる
+    /// `WireType::Numeric`（OID 1700・`"numeric"`）を公告しなければならない
+    /// （PR #1020 codex-review 指摘。RowDescription の OID・
+    /// `pg_type_name()` の双方を固定する。バイナリ非対応は
+    /// `column_binary_support_matrix` 相当で別途保証されるためここでは
+    /// 対象外）。
+    #[test]
+    fn numeric_scalar_column_wire_type_is_numeric_oid_1700_not_text() {
+        let meta = ColumnMeta::Scalar {
+            name: "price".to_string(),
+            ty: engine::catalog::ColumnType::Numeric {
+                precision: 5,
+                scale: 2,
+            },
+        };
+        let wire_type = column_wire_type(&meta);
+        assert_eq!(wire_type.oid(), 1700);
+        assert_eq!(wire_type.pg_type_name(), "numeric");
+        assert_ne!(wire_type.oid(), WireType::Text.oid());
     }
 }

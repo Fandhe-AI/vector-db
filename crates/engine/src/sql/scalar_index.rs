@@ -547,13 +547,30 @@ impl ScalarIndex {
                 // `VECTOR` 列・`BOOLEAN` 列はいずれも索引対象外（BOOLEAN は
                 // Issue #883・D-e。値域が 2 値のため索引化コストに見合わず、
                 // 対応述語 `BoolEquals` は常に plain scan——`scalar_plan.rs`
-                // 参照——のまま据え置く）。`ARRAY` 列（TABLE-14・Issue #888）・
-                // `BYTEA` 列（Issue #886）もいずれも等価・前方一致述語を
-                // 持たないため同じく非索引化。
+                // 参照——のまま据え置く）。`DATE`／`TIMESTAMP` 列も同じ理由で
+                // 索引対象外（TABLE-13・TASK-197、Issue #884。等価・範囲述語
+                // 自体が未実装〔Issue #891〕のため索引化する対応述語がまだ無い）。
+                // `NUMERIC` 列も同じく索引対象外（本索引が TEXT 列の等価・
+                // 前方一致向け辞書索引のみを対象とする設計であり、WHERE 述語
+                // 自体が束縛時点で NUMERIC 列を拒否済み〔TABLE-13〔検討中〕・
+                // TASK-197、Issue #885〕のため到達しない）。`ARRAY` 列
+                // （TABLE-14・Issue #888）・`BYTEA` 列（Issue #886）・
+                // `JSON`／`JSONB` 列（TABLE-14・Issue #889。拡張は Issue #893 へ
+                // 申し送り）もいずれも等価・前方一致述語を持たないため同じく
+                // 非索引化。
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
+                | ColumnType::Date
+                | ColumnType::Timestamp
                 | ColumnType::Array(_)
-                | ColumnType::Bytea => per_column.push(None),
+                | ColumnType::Bytea
+                | ColumnType::Json
+                | ColumnType::Jsonb
+                | ColumnType::Numeric { .. }
+                // `UUID` 列も同じ理由で索引対象外（等価述語自体が束縛時点で
+                // UUID 列を拒否済み〔TABLE-13〔検討中〕・TASK-197、Issue #887・
+                // U9〕のため到達しない。二次索引化は #893 へ申し送り）。
+                | ColumnType::Uuid => per_column.push(None),
             }
         }
 

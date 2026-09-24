@@ -131,9 +131,13 @@ impl ReferencedColumns {
             match &item.input {
                 AggregateInput::TextColumn(index)
                 | AggregateInput::BooleanColumn(index)
+                | AggregateInput::DatetimeColumn(index)
                 | AggregateInput::ArrayColumn(index)
                 | AggregateInput::ByteaColumn(index)
-                | AggregateInput::EnumColumn(index) => {
+                | AggregateInput::JsonColumn(index)
+                | AggregateInput::EnumColumn(index)
+                | AggregateInput::NumericColumn(index)
+                | AggregateInput::UuidColumn(index) => {
                     has_scalar_reference = true;
                     if let Some(slot) = scalar_mask.get_mut(*index) {
                         *slot = true;
@@ -334,6 +338,17 @@ impl Accumulator {
                     Ok(())
                 }
             }
+            // `DATE`／`TIMESTAMP` 列の裸参照も COUNT（非 NULL 行数）専用
+            // （`resolve_aggregate_input` が SUM/AVG/MIN/MAX を型不整合として
+            // 拒否済み。TABLE-13・TASK-197、Issue #884）。`BooleanColumn` と
+            // 同じく値そのものは問わず「NULL でない」ことだけを数える。
+            AggregateInput::DatetimeColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
             // ARRAY 列の裸参照も BOOLEAN と同じく COUNT（非 NULL 行数）専用
             // （TABLE-14・Issue #888・D-A8）。要素の中身は問わず、列自体が
             // NULL でないことだけを数える。
@@ -353,10 +368,40 @@ impl Accumulator {
                     Ok(())
                 }
             }
+            // JSON／JSONB 列の裸参照も COUNT（非 NULL 行数）専用
+            // （`resolve_aggregate_input` が SUM/AVG/MIN/MAX を型不整合として
+            // 拒否済み。TABLE-14・Issue #889）。
+            AggregateInput::JsonColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
             // ENUM 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
             // が SUM/AVG/MIN/MAX を型不整合として拒否済み。TABLE-14・TASK-198、
             // Issue #890）。
             AggregateInput::EnumColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
+            // NUMERIC 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
+            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。TABLE-13〔検討中〕・
+            // TASK-197、Issue #885。`SUM`/`AVG`/`MIN`/`MAX` は別 Issue #892 の担当）。
+            AggregateInput::NumericColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
+            // UUID 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
+            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。TABLE-13〔検討中〕・
+            // TASK-197、Issue #887）。
+            AggregateInput::UuidColumn(index) => {
                 if scanned.get(*index).copied().flatten().is_some() {
                     self.observe_present()
                 } else {

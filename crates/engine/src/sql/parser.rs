@@ -261,6 +261,52 @@ pub struct BoundDelete {
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::mode::{self, SearchMode};
 
+/// `NUMERIC(precision, scale)` 列向けリテラル（[`InsertLiteral::Number`]・
+/// [`InsertLiteral::String`] の両方を受理。TABLE-13〔検討中〕・TASK-197、
+/// Issue #885・D5）を [`crate::row_codec::Value::Numeric`] へ束縛する。
+/// `crate::numeric::parse_for_column` の [`crate::numeric::NumericError`] を
+/// `wire_code` へ写像する（`Malformed` → `22000`・`OutOfRange` →
+/// `22003`）。`InsertLiteral::Bool` は型不一致として `22000` で拒否する。
+/// INSERT（`bind_insert_row`）・UPDATE（`bind_set_assignments`）・UPSERT
+/// （`bind_upsert_assignments`）の 3 箇所が共有する（第 2 のパーサーを作らない）。
+fn bind_numeric_literal(
+    literal: &InsertLiteral,
+    name: &str,
+    precision: u8,
+    scale: u8,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    let text = match literal {
+        InsertLiteral::Number(s) | InsertLiteral::String(s) => s.as_str(),
+        InsertLiteral::Bool(_) => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {name:?} expects a NUMERIC literal, got a boolean literal"
+            )))
+        }
+        // 呼び出し元（`bind_insert`／`bind_set_assignments`／
+        // `bind_upsert_assignments`）はいずれも `InsertLiteral::Null` を
+        // 本関数へ渡すより前に nullable 判定込みで独自に処理するため実際には
+        // 到達しないが、`InsertLiteral` は 4 variant の列挙であり本 match の
+        // 網羅性のためだけに存在する（Issue #889 レビュー指摘・PR #1014 で
+        // `Null` variant が追加された後の到達性を fail-closed に保つ）。
+        InsertLiteral::Null => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {name:?} does not accept an explicit NULL literal here"
+            )))
+        }
+    };
+    match crate::numeric::parse_for_column(text, precision, scale) {
+        Ok(d) => Ok(crate::row_codec::Value::Numeric(d)),
+        Err(crate::numeric::NumericError::Malformed(detail)) => Err(
+            SqlSurfaceError::invalid_input(format!("column {name:?}: {detail}")),
+        ),
+        Err(crate::numeric::NumericError::OutOfRange) => {
+            Err(SqlSurfaceError::numeric_out_of_range(format!(
+                "column {name:?} numeric value out of range for NUMERIC({precision},{scale})"
+            )))
+        }
+    }
+}
+
 /// `[f1,f2,...]` 形式のベクトルリテラルを解析する（SQL-1）。
 ///
 /// 検証順序: (1) 生バイト長が [`MAX_VECTOR_LITERAL_BYTES`] を超えないこと
@@ -320,6 +366,61 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
     }
 
     Ok(values)
+}
+
+/// `DATE`／`TIMESTAMP` 列（TABLE-13・TASK-197、Issue #884）向けの文字列リテラル
+/// 束縛。INSERT／UPDATE SET／UPSERT の 3 経路（[`bind_insert_row`]・
+/// [`bind_set_assignments`]・[`bind_upsert_assignments`]）が共有する単一情報源。
+/// 文法違反（[`crate::datetime::DateTimeLiteralError::Format`]）は既存の
+/// `InvalidInput`（`22000`）へ、範囲外・暦上不正
+/// （[`crate::datetime::DateTimeLiteralError::Overflow`]）は
+/// [`SqlSurfaceError::DatetimeFieldOverflow`]（`22008`）へ写像する（D-1。
+/// `docs/design/datetime-column.md` 参照）。
+fn bind_datetime_literal(
+    column_name: &str,
+    ty: ColumnType,
+    literal: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    match ty {
+        ColumnType::Date => match crate::datetime::parse_date(literal) {
+            Ok(days) => Ok(crate::row_codec::Value::Date(days)),
+            Err(crate::datetime::DateTimeLiteralError::Format(detail)) => Err(
+                SqlSurfaceError::invalid_input(format!("column {column_name:?}: {detail}")),
+            ),
+            Err(crate::datetime::DateTimeLiteralError::Overflow(detail)) => {
+                Err(SqlSurfaceError::datetime_field_overflow(format!(
+                    "column {column_name:?}: {detail}"
+                )))
+            }
+        },
+        ColumnType::Timestamp => match crate::datetime::parse_timestamp(literal) {
+            Ok(micros) => Ok(crate::row_codec::Value::Timestamp(micros)),
+            Err(crate::datetime::DateTimeLiteralError::Format(detail)) => Err(
+                SqlSurfaceError::invalid_input(format!("column {column_name:?}: {detail}")),
+            ),
+            Err(crate::datetime::DateTimeLiteralError::Overflow(detail)) => {
+                Err(SqlSurfaceError::datetime_field_overflow(format!(
+                    "column {column_name:?}: {detail}"
+                )))
+            }
+        },
+        ColumnType::Text
+        | ColumnType::Vector(_)
+        | ColumnType::Boolean
+        | ColumnType::Array(_)
+        | ColumnType::Bytea
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Numeric { .. }
+        | ColumnType::Enum(_)
+        | ColumnType::Uuid => {
+            // 呼び出し元（3 経路の `match (column.ty, literal)`）は Date/Timestamp
+            // の腕でのみこの関数を呼ぶ契約のため到達しない（fail-closed の保険腕）。
+            Err(SqlSurfaceError::invalid_input(format!(
+                "column {column_name:?} is not a DATE/TIMESTAMP column"
+            )))
+        }
+    }
 }
 
 /// `{v1,v2,...}` 形式の配列リテラルを解析する（TABLE-14・TASK-198、Issue #888・
@@ -496,9 +597,15 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             ColumnType::Vector(dim) => Some((idx, *dim)),
             ColumnType::Text
             | ColumnType::Boolean
+            | ColumnType::Date
+            | ColumnType::Timestamp
             | ColumnType::Array(_)
             | ColumnType::Bytea
-            | ColumnType::Enum(_) => None,
+            | ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Enum(_)
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid => None,
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
@@ -536,9 +643,15 @@ pub(crate) fn text_column_index(
                 ColumnType::Text => Ok(idx),
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
+                | ColumnType::Date
+                | ColumnType::Timestamp
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
-                | ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
+                | ColumnType::Json
+                | ColumnType::Jsonb
+                | ColumnType::Enum(_)
+                | ColumnType::Numeric { .. }
+                | ColumnType::Uuid => Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} is not a TEXT column"
                 ))),
             }
@@ -1250,7 +1363,7 @@ fn bind_insert_row(
         InsertLiteral::Number(n) => n
             .parse()
             .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed id value: {n}")))?,
-        InsertLiteral::String(_) | InsertLiteral::Bool(_) => {
+        InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Null => {
             return Err(SqlSurfaceError::invalid_input(
                 "id pseudo-column value must be a number",
             ))
@@ -1301,6 +1414,22 @@ fn bind_insert_row(
                     "column {name:?} expects a boolean literal (true/false)"
                 )))
             }
+            (ColumnType::Date, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Date, s)?
+            }
+            (ColumnType::Date, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a DATE literal (YYYY-MM-DD)"
+                )))
+            }
+            (ColumnType::Timestamp, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Timestamp, s)?
+            }
+            (ColumnType::Timestamp, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
+                )))
+            }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
             }
@@ -1315,11 +1444,43 @@ fn bind_insert_row(
                     "column {name:?} expects a bytea hex literal"
                 )))
             }
+            (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                bind_json_literal(s, &column.ty, name)?
+            }
+            (
+                ColumnType::Json | ColumnType::Jsonb,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a JSON text literal"
+                )))
+            }
             (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
             (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal for its enum type"
                 )))
+            }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘）は SQL テキストの
+            // `INSERT ... VALUES` 構文からは構築されない到達不能パス
+            // （`sql::allowlist` の VALUES リテラルパーサーは `NULL` トークンを
+            // 生成しない）。この分岐は match の網羅性のためだけに存在し、
+            // 到達した場合も fail-closed に拒否する（列を省略すれば
+            // nullable 列は `Value::Null` で埋まる既存契約と役割が重複するため、
+            // `INSERT` に明示 `NULL` リテラルを追加で受理する必要はない）。
+            (_, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} does not accept an explicit NULL literal in INSERT"
+                )))
+            }
+            (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
+            (ColumnType::Uuid, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a UUID text literal"
+                )))
+            }
+            (ColumnType::Numeric { precision, scale }, lit) => {
+                bind_numeric_literal(lit, name, *precision, *scale)?
             }
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
@@ -1369,6 +1530,61 @@ fn bind_bytea_literal(
     }
 }
 
+/// `JSON`／`JSONB` 列向けの文字列リテラルを [`crate::row_codec::Value::Json`] へ
+/// 束縛する共通ヘルパー（Issue #889 D6。`bind_bytea_literal` と同型）。INSERT・
+/// UPDATE・UPSERT リテラル・UPSERT `ON CONFLICT` リテラルの 4 束縛箇所が共有する。
+/// SQL の文字列リテラルは JSON テキストとして解釈する（トップレベルのスカラー
+/// JSON も有効な JSON として受理。`'null'` は JSON の `null` であり SQL `NULL`
+/// とは別物）。`JSON` 列は検証のみ（入力テキスト保持）、`JSONB` 列は正規化する。
+///
+/// - 構文不正・深さ/要素数超過は `42601`（[`SqlSurfaceError::UnsupportedSyntax`]。
+///   NOSQL-8 と同一分類）。
+/// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
+fn bind_json_literal(
+    s: &str,
+    column_ty: &ColumnType,
+    column_name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    let text = match column_ty {
+        ColumnType::Json => {
+            crate::json::validate_json_column_text(s).map_err(|e| json_column_error(e, s))?;
+            s.to_string()
+        }
+        ColumnType::Jsonb => {
+            crate::json::canonicalize_jsonb_text(s).map_err(|e| json_column_error(e, s))?
+        }
+        ColumnType::Text
+        | ColumnType::Vector(_)
+        | ColumnType::Boolean
+        | ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::Array(_)
+        | ColumnType::Bytea
+        | ColumnType::Enum(_)
+        | ColumnType::Numeric { .. }
+        | ColumnType::Uuid => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {column_name:?} is not a JSON column"
+            )));
+        }
+    };
+    Ok(crate::row_codec::Value::Json(text))
+}
+
+/// [`crate::json::JsonColumnError`] を SQL 表層の分類（`SqlSurfaceError`）へ写像する
+/// （Issue #889 D1）。`s` 自体（内容）はエラーメッセージへ含めない
+/// （security.md「テナント境界」: エラー経由の情報漏えい防止）。
+fn json_column_error(e: crate::json::JsonColumnError, _s: &str) -> SqlSurfaceError {
+    match e {
+        crate::json::JsonColumnError::TooLong => {
+            SqlSurfaceError::payload_too_large("JSON literal exceeds maximum length")
+        }
+        crate::json::JsonColumnError::Invalid => {
+            SqlSurfaceError::unsupported("invalid JSON literal")
+        }
+    }
+}
+
 /// `ENUM` 列向けの文字列リテラルを [`crate::row_codec::Value::Enum`] へ束縛する
 /// 共通ヘルパー（TABLE-14・TASK-198、Issue #890）。INSERT・UPDATE（単一行 SET・
 /// 述語形）・UPSERT の各束縛箇所が同じ検証・エラー分類を共有する
@@ -1386,6 +1602,26 @@ fn bind_enum_literal(
         Err(_) => Err(SqlSurfaceError::invalid_text_representation(format!(
             "column {column_name:?} (enum {:?}) does not accept label {s:?}",
             def.name()
+        ))),
+    }
+}
+
+/// `UUID` 列向けの文字列リテラルを [`crate::row_codec::Value::Uuid`] へ束縛する
+/// 共通ヘルパー（TABLE-13〔検討中〕・TASK-197、Issue #887）。INSERT・UPDATE
+/// （単一行 SET・述語形）・UPSERT の各束縛箇所が同じ検証・エラー分類を共有する
+/// （[`bind_enum_literal`] と同じ設計）。厳密文法（[`crate::uuid::parse_uuid_text`]）に
+/// 反する入力は書き込みトランザクション開始前に `22P02`
+/// （[`SqlSurfaceError::invalid_text_representation`]）で拒否する（U3・U7）。
+/// エラーメッセージには列名とクライアント自身の入力値のみを含める
+/// （security.md P0「情報漏えい」対応）。
+fn bind_uuid_literal(
+    s: &str,
+    column_name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    match crate::uuid::parse_uuid_text(s) {
+        Ok(u) => Ok(crate::row_codec::Value::Uuid(u)),
+        Err(_) => Err(SqlSurfaceError::invalid_text_representation(format!(
+            "column {column_name:?} does not accept {s:?} as a UUID literal"
         ))),
     }
 }
@@ -1503,6 +1739,14 @@ fn bind_set_assignments(
                     "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
+            // `VECTOR` 列は `nullable` の値に関わらず常に必須として扱う
+            // （`wire-server::http::query::insert::bind_row` の既存契約と同じ
+            // 判断。Issue #889 レビュー指摘対応・PR #1014）。
+            (ColumnType::Vector(_), InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is a VECTOR column and cannot be set to NULL"
+                )))
+            }
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
@@ -1515,6 +1759,22 @@ fn bind_set_assignments(
             (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a boolean literal (true/false)"
+                )))
+            }
+            (ColumnType::Date, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Date, s)?
+            }
+            (ColumnType::Date, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a DATE literal (YYYY-MM-DD)"
+                )))
+            }
+            (ColumnType::Timestamp, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Timestamp, s)?
+            }
+            (ColumnType::Timestamp, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -1531,11 +1791,44 @@ fn bind_set_assignments(
                     "column {name:?} expects a bytea hex literal"
                 )))
             }
+            (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                bind_json_literal(s, &column.ty, name)?
+            }
+            (
+                ColumnType::Json | ColumnType::Jsonb,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a JSON text literal"
+                )))
+            }
             (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
             (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal for its enum type"
                 )))
+            }
+            // 明示的な SQL `NULL`（`ColumnType::Vector` を除く。Issue #889
+            // レビュー指摘・PR #1014）。`column.nullable` を確認したうえで
+            // `Value::Null` へ写像し、非 nullable 列は fail-closed に拒否する。
+            // NoSQL 表層 `update` op（`wire-server::http::query::update::
+            // map_set_assignments`）の JSON 列 `null` 分岐が現状唯一の
+            // 構築元だが、SQL 表層 `UPDATE ... SET` 経由（将来 `NULL`
+            // リテラルの字句規則が追加された場合）でも同じ扱いを共有する。
+            (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
+            (_, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is not nullable"
+                )))
+            }
+            (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
+            (ColumnType::Uuid, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a UUID text literal"
+                )))
+            }
+            (ColumnType::Numeric { precision, scale }, lit) => {
+                bind_numeric_literal(lit, name, *precision, *scale)?
             }
         };
         bound.push((col_idx, value));
@@ -2063,6 +2356,22 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a boolean literal (true/false)"
                         )))
                     }
+                    (ColumnType::Date, InsertLiteral::String(s)) => {
+                        bind_datetime_literal(name, ColumnType::Date, s)?
+                    }
+                    (ColumnType::Date, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a DATE literal (YYYY-MM-DD)"
+                        )))
+                    }
+                    (ColumnType::Timestamp, InsertLiteral::String(s)) => {
+                        bind_datetime_literal(name, ColumnType::Timestamp, s)?
+                    }
+                    (ColumnType::Timestamp, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
+                        )))
+                    }
                     (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
                     }
@@ -2077,6 +2386,17 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a bytea hex literal"
                         )))
                     }
+                    (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                        bind_json_literal(s, &column.ty, name)?
+                    }
+                    (
+                        ColumnType::Json | ColumnType::Jsonb,
+                        InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+                    ) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a JSON text literal"
+                        )))
+                    }
                     (ColumnType::Enum(def), InsertLiteral::String(s)) => {
                         bind_enum_literal(def, s, name)?
                     }
@@ -2084,6 +2404,24 @@ fn bind_upsert_assignments(
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a text literal for its enum type"
                         )))
+                    }
+                    // `InsertLiteral::Null`（Issue #889 レビュー指摘）は
+                    // `ON CONFLICT ... DO UPDATE SET` の SQL 構文からは構築
+                    // されない到達不能パス（match の網羅性のためだけの分岐。
+                    // `bind_set_assignments` のドキュメント参照）。
+                    (_, InsertLiteral::Null) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} does not accept an explicit NULL literal in ON CONFLICT DO UPDATE SET"
+                        )))
+                    }
+                    (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
+                    (ColumnType::Uuid, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a UUID text literal"
+                        )))
+                    }
+                    (ColumnType::Numeric { precision, scale }, lit) => {
+                        bind_numeric_literal(lit, name, *precision, *scale)?
                     }
                 };
                 BoundUpsertValue::Literal(v)
@@ -2170,6 +2508,14 @@ fn bind_file_insert(
                     "column {name:?} expects a text literal, got a non-text literal"
                 )))
             }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘）はファイル形
+            // `INSERT` の VALUES 構文からは構築されない到達不能パス（match の
+            // 網羅性のためだけの分岐。`bind_set_assignments` のドキュメント参照）。
+            (ColumnType::Text, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} does not accept an explicit NULL literal in file-form INSERT"
+                )))
+            }
             // `bind_insert_form` の判別規則により VECTOR 列名は列リストに含まれない
             // 前提だが、防御的に拒否する（各チャンクのベクトルはサーバー側が
             // `incremental.rs` で埋め込み結果から設定し、クライアント入力を使わない）。
@@ -2185,6 +2531,13 @@ fn bind_file_insert(
                     "column {name:?}: BOOLEAN column is not supported for file-form INSERT"
                 )))
             }
+            // DATE／TIMESTAMP 列も同じ理由で対象外（TABLE-13・TASK-197、
+            // Issue #884）。
+            (ColumnType::Date | ColumnType::Timestamp, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: DATE/TIMESTAMP column is not supported for file-form INSERT"
+                )))
+            }
             // 配列列（TABLE-14・Issue #888）も BOOLEAN と同じく対象外として拒否する。
             (ColumnType::Array(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -2197,10 +2550,30 @@ fn bind_file_insert(
                     "column {name:?}: BYTEA column is not supported for file-form INSERT"
                 )))
             }
+            // JSON／JSONB 列も同じ理由で対象外とする（Issue #889 D6）。
+            (ColumnType::Json | ColumnType::Jsonb, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: JSON column is not supported for file-form INSERT"
+                )))
+            }
             // ENUM 列も同じ理由で対象外とする（Issue #890）。
             (ColumnType::Enum(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: ENUM column is not supported for file-form INSERT"
+                )))
+            }
+            // NUMERIC 列も同じ理由で対象外（TABLE-13〔検討中〕・TASK-197、
+            // Issue #885）。
+            (ColumnType::Numeric { .. }, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: NUMERIC column is not supported for file-form INSERT"
+                )))
+            }
+            // UUID 列も同じ理由で対象外（TABLE-13〔検討中〕・TASK-197、
+            // Issue #887・U9）。
+            (ColumnType::Uuid, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: UUID column is not supported for file-form INSERT"
                 )))
             }
         };
@@ -2287,6 +2660,11 @@ pub(crate) enum AggregateInput {
     /// `MAX` は `TextColumn` と同じパターンで [`resolve_aggregate_input`] が
     /// 型不整合として拒否する。
     BooleanColumn(usize),
+    /// `DATE`／`TIMESTAMP` 列の裸の列参照（`schema.columns` の添字）。`COUNT`
+    /// （非 NULL 行数）でのみ使う（TABLE-13・TASK-197、Issue #884）。`SUM`/`AVG`/
+    /// `MIN`/`MAX` は `BooleanColumn` と同じパターンで [`resolve_aggregate_input`]
+    /// が型不整合として拒否する（`MIN`/`MAX` 対応は Issue #892 へ申し送り）。
+    DatetimeColumn(usize),
     /// `ARRAY` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL 行数）
     /// でのみ使う（TABLE-14・TASK-198、Issue #888・D-A8）。`SUM`/`AVG`/`MIN`/
     /// `MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
@@ -2297,12 +2675,28 @@ pub(crate) enum AggregateInput {
     /// `MAX` は `BooleanColumn` と同じパターンで [`resolve_aggregate_input`] が
     /// 型不整合として拒否する。
     ByteaColumn(usize),
+    /// `JSON`／`JSONB` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-14・TASK-198、Issue #889）。`SUM`/`AVG`/`MIN`/`MAX`
+    /// は `ByteaColumn` と同じパターンで [`resolve_aggregate_input`] が型不整合
+    /// として拒否する。
+    JsonColumn(usize),
     /// `ENUM` 列の裸の列参照（`COUNT` 限定。TABLE-14・TASK-198、Issue #890）。
     /// `SUM`/`AVG`/`MIN`/`MAX` は `BooleanColumn`／`ByteaColumn` と同じパターンで
     /// [`resolve_aggregate_input`] が型不整合として拒否する（PostgreSQL の enum は
     /// 宣言順で `MIN`/`MAX` 比較できるが、辞書順で代用すると意味論が食い違うため
     /// 意図的に受理しない。Issue #890 D7）。
     EnumColumn(usize),
+    /// `NUMERIC` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-13〔検討中〕・TASK-197、Issue #885）。`SUM`/
+    /// `AVG`/`MIN`/`MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
+    /// [`resolve_aggregate_input`] が型不整合として拒否する（別 Issue #892 の
+    /// 担当）。
+    NumericColumn(usize),
+    /// `UUID` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-13〔検討中〕・TASK-197、Issue #887）。`SUM`/
+    /// `AVG`/`MIN`/`MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
+    /// [`resolve_aggregate_input`] が型不整合として拒否する。
+    UuidColumn(usize),
     /// 上記以外の `Scalar` 型に束縛された式（列参照 `id` 単体を除く。`vec_norm(...)`
     /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`program`（束縛時に
     /// ステップ列コンパイル済み、Issue #353）を行ループで評価する。`source` は
@@ -2724,6 +3118,14 @@ fn resolve_aggregate_input(
                     (ColumnType::Boolean, _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is BOOLEAN and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
+                    (ColumnType::Date | ColumnType::Timestamp, AggregateFunc::Count) => {
+                        Ok(AggregateInput::DatetimeColumn(index))
+                    }
+                    (ColumnType::Date | ColumnType::Timestamp, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is DATE/TIMESTAMP and cannot be used with SUM/AVG/MIN/MAX"
+                        )))
+                    }
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
                     }
@@ -2736,11 +3138,33 @@ fn resolve_aggregate_input(
                     (ColumnType::Bytea, _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is BYTEA and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
+                    (ColumnType::Json | ColumnType::Jsonb, AggregateFunc::Count) => {
+                        Ok(AggregateInput::JsonColumn(index))
+                    }
+                    (ColumnType::Json | ColumnType::Jsonb, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is JSON and cannot be used with SUM/AVG/MIN/MAX"
+                        )))
+                    }
                     (ColumnType::Enum(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::EnumColumn(index))
                     }
                     (ColumnType::Enum(_), _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is ENUM and cannot be used with SUM/AVG/MIN/MAX"
+                    ))),
+                    (ColumnType::Numeric { .. }, AggregateFunc::Count) => {
+                        Ok(AggregateInput::NumericColumn(index))
+                    }
+                    (ColumnType::Numeric { .. }, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is NUMERIC and cannot be used with SUM/AVG/MIN/MAX"
+                        )))
+                    }
+                    (ColumnType::Uuid, AggregateFunc::Count) => {
+                        Ok(AggregateInput::UuidColumn(index))
+                    }
+                    (ColumnType::Uuid, _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is UUID and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
                 };
             }
@@ -3683,6 +4107,62 @@ mod tests {
                 crate::row_codec::Value::Text("ja".to_string()),
             ]
         );
+    }
+
+    /// `bind_json_literal`（`sql::parser::bind_insert_row` から呼ばれる束縛層の
+    /// 単一チョークポイント）は `MAX_JSON_FIELD_LEN` を 1 バイトでも超える入力を
+    /// `54000`（`PayloadTooLarge`）で拒否する（PR #1014 レビュー指摘対応）。
+    #[test]
+    fn bind_json_literal_rejects_body_one_byte_over_max_json_field_len() {
+        let oversized = "1".repeat(crate::json::MAX_JSON_FIELD_LEN + 1);
+        let err = bind_json_literal(&oversized, &ColumnType::Json, "doc").unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// `MAX_JSON_FIELD_LEN` ちょうどの有効な JSON は束縛層を通過し、かつその
+    /// 束縛結果（`Value::Json`）が実際の `row_codec::encode_scalar_columns`
+    /// （presence(1) + 長さ(4) バイトのフレーミングを付与する行コーデック）でも
+    /// 単独で `MAX_SCALAR_PAYLOAD_LEN` へ収まることを固定する。旧
+    /// `MAX_JSON_FIELD_LEN` 定義（`MAX_TEXT_FIELD_LEN` と同値）では、この境界値が
+    /// 束縛層を通過した**後**にフレーミング分だけ `encode_scalar_columns` 側で
+    /// 拒否され得た（codex-review P1 指摘・PR #1014）。
+    #[test]
+    fn bind_json_literal_at_exact_max_json_field_len_fits_scalar_payload_after_encode() {
+        // 単一の文字列リテラルは `MAX_JSON_STRING_CHARS`（1 MiB）に抵触するため、
+        // `json.rs` の境界値テストと同じ方式（複数要素の配列）で目標バイト数を
+        // ちょうど組み立てる: `[` + 5 要素（`"`×2 + 本体） + 4 個の `,` + `]`。
+        let target = crate::json::MAX_JSON_FIELD_LEN;
+        let overhead = 1 + 1 + 4 + 5 * 2;
+        let content_total = target - overhead;
+        let base = content_total / 5;
+        let remainder = content_total % 5;
+        let lens = [base, base, base, base, base + remainder];
+        let mut doc = String::new();
+        doc.push('[');
+        for (i, len) in lens.iter().enumerate() {
+            if i > 0 {
+                doc.push(',');
+            }
+            doc.push('"');
+            doc.push_str(&"a".repeat(*len));
+            doc.push('"');
+        }
+        doc.push(']');
+        assert_eq!(doc.len(), target);
+
+        let value =
+            bind_json_literal(&doc, &ColumnType::Json, "doc").expect("must bind at exact limit");
+
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                crate::catalog::ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                crate::catalog::ColumnDef::new("doc", ColumnType::Json, true),
+            ],
+        );
+        let values = vec![crate::row_codec::Value::Vector(vec![0.1, 0.2]), value];
+        crate::row_codec::encode_scalar_columns(&schema, &values)
+            .expect("bind_json_literal output must always fit the scalar payload budget");
     }
 
     #[test]

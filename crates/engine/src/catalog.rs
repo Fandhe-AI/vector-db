@@ -144,6 +144,10 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "real",
     "double",
     "numeric",
+    // `DECIMAL` は `NUMERIC` の別名（TABLE-13〔検討中〕・TASK-197、Issue #885。
+    // カタログの型タグは `numeric` の 1 つに固定するが、SQL-23 の型名解決での
+    // 曖昧さを避けるため別名も予約する）。
+    "decimal",
     "date",
     "timestamp",
     "uuid",
@@ -292,6 +296,13 @@ pub enum ColumnType {
     /// 真偽値列（TABLE-13・TASK-196、Issue #883）。NULL と false は行バイト列・
     /// 投影・述語評価のいずれでも区別する（[`crate::row_codec::Value::Bool`] 参照）。
     Boolean,
+    /// 日付列（TABLE-13・TASK-197、Issue #884）。内部表現は 1970-01-01 起点の
+    /// 日数（`i32`）。値の解析・整形は [`crate::datetime`] へ委譲する。
+    Date,
+    /// 日時列（TABLE-13・TASK-197、Issue #884）。タイムゾーンを持たない
+    /// （naive）値で、内部表現は 1970-01-01 00:00:00 起点のマイクロ秒（`i64`）。
+    /// 値の解析・整形は [`crate::datetime`] へ委譲する。
+    Timestamp,
     /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
     /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・
     /// 二次索引・`EXPLAIN`）からは一貫して非対象として除外する（`VECTOR` 列との
@@ -300,6 +311,15 @@ pub enum ColumnType {
     /// 可変長バイナリ列（TABLE-13・TASK-197、Issue #886）。NULL と空バイト列は
     /// 行バイト列上も区別する（[`crate::row_codec::Value::Bytes`] 参照）。
     Bytea,
+    /// JSON テキスト列（TABLE-14・TASK-198、Issue #889）。格納時に共有パーサー
+    /// [`crate::json::parse_json`] で検証するが、入力テキスト（空白・キー順を含む）を
+    /// そのまま保持する（[`crate::row_codec::Value::Json`] 参照）。JSONB との違いは
+    /// 正規化の有無のみで、値表現は共有する。
+    Json,
+    /// JSONB 列（TABLE-14・TASK-198、Issue #889）。格納時に正規化再シリアライズ
+    /// した文字列を保持する（キー順は辞書順・空白なし。詳細は
+    /// `docs/design/column-type-extension.md`「#889 追記」節参照）。
+    Jsonb,
     /// 名前付き ENUM 型を参照する列（TABLE-14・TASK-198、Issue #890）。
     /// カタログには型名のみを保持し（[`ColumnType::catalog_fields`]）、
     /// デコード時に [`ENUM_TYPES_TABLE`] から語彙を解決した [`EnumTypeDef`] を
@@ -307,6 +327,15 @@ pub enum ColumnType {
     /// Value::Enum`]）で格納し、語彙外の値は書き込み前に拒否する
     /// （fail-closed。`ALTER TYPE ... ADD VALUE` による末尾追記のみ許可）。
     Enum(Arc<EnumTypeDef>),
+    /// 十進固定小数列 `NUMERIC(precision, scale)`（TABLE-13〔検討中〕・
+    /// TASK-197、Issue #885）。値の内部表現・丸め規則は
+    /// [`crate::numeric::Decimal`] 参照。`1 <= precision <= 38`・
+    /// `0 <= scale <= precision` を encode・decode 両側で検証する。
+    Numeric { precision: u8, scale: u8 },
+    /// 128bit 識別子列 `UUID`（TABLE-13〔検討中〕・TASK-197、Issue #887）。
+    /// 値の内部表現・テキスト規範形は [`crate::uuid::Uuid`] 参照。version／
+    /// variant ビットは検証しない（nil・全 1 も有効値）。
+    Uuid,
 }
 
 impl ColumnType {
@@ -325,12 +354,18 @@ impl ColumnType {
             ColumnType::Text => ("text", "-".to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
             ColumnType::Boolean => ("boolean", "-".to_string()),
+            ColumnType::Date => ("date", "-".to_string()),
+            ColumnType::Timestamp => ("timestamp", "-".to_string()),
             ColumnType::Array(array_ty) => (
                 "array",
                 format!("{},{}", array_ty.elem().catalog_tag(), array_ty.max_len()),
             ),
             ColumnType::Bytea => ("bytea", "-".to_string()),
+            ColumnType::Json => ("json", "-".to_string()),
+            ColumnType::Jsonb => ("jsonb", "-".to_string()),
             ColumnType::Enum(def) => ("enum", def.name.clone()),
+            ColumnType::Numeric { precision, scale } => ("numeric", format!("{precision},{scale}")),
+            ColumnType::Uuid => ("uuid", "-".to_string()),
         }
     }
 
@@ -377,6 +412,22 @@ impl ColumnType {
                 }
                 Ok(ColumnType::Boolean)
             }
+            "date" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "date column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Date)
+            }
+            "timestamp" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "timestamp column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Timestamp)
+            }
             "array" => {
                 // `<elem_tag>,<max_len>` のちょうど 2 要素（Issue #888 D-A2）。
                 // カンマの数が違う場合は要素・上限のいずれかが欠落・過多であり
@@ -414,10 +465,38 @@ impl ColumnType {
                 }
                 Ok(ColumnType::Bytea)
             }
+            "json" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "json column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Json)
+            }
+            "jsonb" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "jsonb column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Jsonb)
+            }
             "enum" => {
                 validate_identifier(param)?;
                 let def = resolve_enum(param)?;
                 Ok(ColumnType::Enum(def))
+            }
+            "numeric" => {
+                let (precision, scale) = parse_numeric_param(param)?;
+                Ok(ColumnType::Numeric { precision, scale })
+            }
+            "uuid" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "uuid column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Uuid)
             }
             other => Err(CatalogError::Invalid(format!(
                 "unknown column type: {other:?}"
@@ -798,9 +877,15 @@ impl TableSchema {
             ColumnType::Vector(dim) => Some(*dim),
             ColumnType::Text
             | ColumnType::Boolean
+            | ColumnType::Date
+            | ColumnType::Timestamp
             | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
             | ColumnType::Enum(_)
-            | ColumnType::Array(_) => None,
+            | ColumnType::Array(_)
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid => None,
         })
     }
 
@@ -873,10 +958,67 @@ fn validate_vector_dim(dim: u32) -> Result<()> {
     Ok(())
 }
 
+/// `NUMERIC(precision, scale)` の宣言制約検証（TABLE-13〔検討中〕・TASK-197、
+/// Issue #885・D1）。`1 <= precision <= MAX_PRECISION`・`0 <= scale <= precision`
+/// を満たさない宣言は encode・decode 両側で fail-closed に拒否する。
+fn validate_numeric_precision_scale(precision: u8, scale: u8) -> Result<()> {
+    if precision == 0 || precision > crate::numeric::MAX_PRECISION {
+        return Err(CatalogError::Invalid(format!(
+            "NUMERIC precision must be between 1 and {}: {precision}",
+            crate::numeric::MAX_PRECISION
+        )));
+    }
+    if scale > precision {
+        return Err(CatalogError::Invalid(format!(
+            "NUMERIC scale must not exceed precision: scale={scale} precision={precision}"
+        )));
+    }
+    Ok(())
+}
+
+/// カタログ `param` フィールド（`"p,s"`）を `(precision, scale)` へ厳格パースする
+/// （Issue #885・D1）。カンマはちょうど 1 個、各要素は ASCII 数字のみからなる
+/// `u8`、範囲は [`validate_numeric_precision_scale`] で検証する。再 encode
+/// した結果が入力と一致しない非正規形（先頭ゼロ等。例: `"010,2"`）も
+/// fail-closed に拒否する。
+fn parse_numeric_param(param: &str) -> Result<(u8, u8)> {
+    let mut parts = param.split(',');
+    let precision_str = parts
+        .next()
+        .ok_or_else(|| CatalogError::Invalid(format!("malformed NUMERIC parameter: {param:?}")))?;
+    let scale_str = parts
+        .next()
+        .ok_or_else(|| CatalogError::Invalid(format!("malformed NUMERIC parameter: {param:?}")))?;
+    if parts.next().is_some() {
+        return Err(CatalogError::Invalid(format!(
+            "malformed NUMERIC parameter: {param:?}"
+        )));
+    }
+    let precision: u8 = precision_str.parse().map_err(|_| {
+        CatalogError::Invalid(format!("malformed NUMERIC precision: {precision_str:?}"))
+    })?;
+    let scale: u8 = scale_str
+        .parse()
+        .map_err(|_| CatalogError::Invalid(format!("malformed NUMERIC scale: {scale_str:?}")))?;
+    // 非正規形（先頭ゼロ等）の拒否: 再 encode した文字列が入力と一致するかで
+    // 判定する（`u8::to_string()` は正規形しか生成しないため、`"010"` の
+    // ような入力は不一致になる）。
+    if precision.to_string() != precision_str || scale.to_string() != scale_str {
+        return Err(CatalogError::Invalid(format!(
+            "non-canonical NUMERIC parameter: {param:?}"
+        )));
+    }
+    validate_numeric_precision_scale(precision, scale)?;
+    Ok((precision, scale))
+}
+
 fn validate_column(column: &ColumnDef) -> Result<()> {
     validate_identifier(&column.name)?;
     if let ColumnType::Vector(dim) = &column.ty {
         validate_vector_dim(*dim)?;
+    }
+    if let ColumnType::Numeric { precision, scale } = column.ty {
+        validate_numeric_precision_scale(precision, scale)?;
     }
     Ok(())
 }
@@ -2243,6 +2385,51 @@ mod tests {
         let ty = ArrayType::new(ArrayElemType::Bool, 10).expect("array ty");
         assert_eq!(ty.max_len(), 10);
         assert_eq!(ty.elem(), ArrayElemType::Bool);
+    }
+
+    /// `NUMERIC(p, s)` 列のカタログ往復（TABLE-13〔検討中〕・TASK-197、
+    /// Issue #885・D1）。`catalog_fields` の `param` が `"p,s"` 形式であり、
+    /// decode 後も往復することを固定する。
+    #[test]
+    fn numeric_column_roundtrips_through_catalog() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new(
+                    "price",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+            ],
+        );
+        assert_eq!(
+            schema.columns[1].ty.catalog_fields(),
+            ("numeric", "10,2".to_string())
+        );
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
+        assert_eq!(decoded, schema);
+    }
+
+    /// 不正な `NUMERIC` param（区切り不正・非正規形・範囲外）は encode・decode
+    /// いずれの経路でも fail-closed に拒否する。
+    #[test]
+    fn numeric_param_rejects_malformed_and_out_of_range_forms() {
+        for bad in [
+            "10", "10,", ",2", "39,0", "0,0", "3,4", "010,2", "10,2,3", "a,2", "10,a",
+        ] {
+            assert!(
+                parse_numeric_param(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        assert!(parse_numeric_param("10,2").is_ok());
+        assert!(parse_numeric_param("38,38").is_ok());
+        assert!(parse_numeric_param("1,0").is_ok());
     }
 
     #[test]

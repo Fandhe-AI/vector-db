@@ -21,7 +21,9 @@
 use std::fmt;
 
 use crate::catalog::{ArrayElemType, ArrayType, ColumnType, TableSchema, MAX_ARRAY_ELEMENTS};
+use crate::numeric::Decimal;
 use crate::storage::Visibility;
+use crate::uuid::Uuid;
 
 /// 行フォーマットの先頭バイト。値の追加・変更は破壊的変更として扱い、この値を
 /// 更新する。未知バージョンは fail-closed に拒否する（`storage.rs::ROW_FORMAT_VERSION`
@@ -62,6 +64,25 @@ pub(crate) const MAX_SCALAR_PAYLOAD_LEN: u32 = 4 * 1024 * 1024;
 const _: () = assert!(
     MAX_SCALAR_PAYLOAD_LEN == crate::storage::MAX_METADATA_LEN,
     "row_codec::MAX_SCALAR_PAYLOAD_LEN must stay in sync with storage::MAX_METADATA_LEN"
+);
+
+// `JSON`／`JSONB` 列（Issue #889）は TEXT と同じ presence(1) + `u32 LE` 長(4) +
+// 本体の枠を共有する。`json::MAX_JSON_FIELD_LEN` は「この列 1 個だけが対象行の
+// スカラーペイロードを占める場合、フレーミング込みでも `MAX_SCALAR_PAYLOAD_LEN`
+// に収まる」性質（PR #1014 レビュー指摘対応。`json.rs::MAX_JSON_FIELD_LEN` の
+// ドキュメント参照）を持たせる必要があり、`MAX_TEXT_FIELD_LEN` と同値にすると
+// フレーミング分だけ超過してしまうため意図的に一致させない。片方だけの変更で
+// この性質が崩れるのを防ぐため、下記 2 条件をコンパイル時に強制する。
+const _: () = assert!(
+    crate::json::MAX_JSON_FIELD_LEN as u128 + SCALAR_TEXT_ENTRY_OVERHEAD as u128
+        <= MAX_SCALAR_PAYLOAD_LEN as u128,
+    "json::MAX_JSON_FIELD_LEN + SCALAR_TEXT_ENTRY_OVERHEAD must fit within \
+     row_codec::MAX_SCALAR_PAYLOAD_LEN"
+);
+
+const _: () = assert!(
+    crate::json::MAX_JSON_FIELD_LEN <= MAX_TEXT_FIELD_LEN as usize,
+    "json::MAX_JSON_FIELD_LEN must not exceed row_codec::MAX_TEXT_FIELD_LEN"
 );
 
 /// `TEXT` 列 1 個分のフレーミングオーバーヘッド（presence タグ 1 バイト＋長さ
@@ -118,6 +139,13 @@ pub enum Value {
     /// 真偽値列の値（TABLE-13・TASK-196、Issue #883）。NULL とはバイト列上も
     /// 別物になる（[`PRESENCE_NULL`] とは別に 1 バイトの値本体を持つ）。
     Bool(bool),
+    /// 日付列の値（TABLE-13・TASK-197、Issue #884）。1970-01-01 起点の日数
+    /// （`i32`）。範囲・暦妥当性は [`crate::datetime`] が検証済みであることを
+    /// 前提とする。
+    Date(i32),
+    /// 日時列の値（TABLE-13・TASK-197、Issue #884）。1970-01-01 00:00:00
+    /// 起点のマイクロ秒（`i64`、タイムゾーンなし）。
+    Timestamp(i64),
     /// 配列列の値（TABLE-14・TASK-198、Issue #888）。要素型ごとに variant を
     /// 分けることで、同一列の要素がすべて同じ型であることを型で保証する
     /// （`ColumnType::Array` の `ArrayElemType` と対応させる）。
@@ -127,12 +155,25 @@ pub enum Value {
     /// [`Value::Text`] と異なり、行バイト表現（presence + `u32` LE 長 + 本体）は
     /// 共有する。
     Bytes(Vec<u8>),
+    /// `JSON`／`JSONB` 列共通の値表現（TABLE-14・TASK-198、Issue #889）。行バイト
+    /// 表現は [`Value::Text`] と同じ枠（presence + `u32` LE 長 + UTF-8 本体）を
+    /// 共有する。`JSON` 列は検証済みの入力テキストをそのまま、`JSONB` 列は
+    /// 正規化再シリアライズ済みのテキストを保持する契約とし、区別は
+    /// `ColumnType::Json`／`ColumnType::Jsonb` にのみ持たせる（値表現は共有）。
+    Json(String),
     /// ENUM 列の値（TABLE-14・TASK-198、Issue #890）。ラベル文字列を TEXT と
     /// 同じフレームで格納する（序数格納は採らない。`ColumnType::Enum` の
     /// ドキュメント参照）。語彙検証は encode 時（[`encode_row`]）に行い、decode
     /// 時は検査しない（Issue #890 D3。`ALTER TYPE ... ADD VALUE` 前に書いた行を
     /// 将来にわたって読める契約を維持するため）。
     Enum(String),
+    /// 十進固定小数列の値（TABLE-13〔検討中〕・TASK-197、Issue #885）。行には
+    /// `unscaled`（`i128` LE 16 バイト）のみを持ち `scale` は持たない
+    /// （カタログの列型 `ColumnType::Numeric { scale, .. }` が唯一の正）。
+    Numeric(Decimal),
+    /// 128bit 識別子列の値（TABLE-13〔検討中〕・TASK-197、Issue #887）。
+    /// 内部表現・正規テキストは [`crate::uuid::Uuid`] 参照。
+    Uuid(Uuid),
 }
 
 /// 配列列 1 個分の値（Issue #888）。NULL 要素は本版では受理しない（D-A6。
@@ -170,6 +211,11 @@ impl ArrayValue {
 pub enum ScalarRef<'a> {
     Text(&'a str),
     Bool(bool),
+    /// 日付列（TABLE-13・TASK-197、Issue #884）。1970-01-01 起点の日数。
+    Date(i32),
+    /// 日時列（TABLE-13・TASK-197、Issue #884）。1970-01-01 00:00:00 起点の
+    /// マイクロ秒（タイムゾーンなし）。
+    Timestamp(i64),
     /// 配列列の借用結果（Issue #888）。構造・UTF-8・要素上限はすべて走査時に
     /// 検証済みで、[`ArrayRef::to_value`] は追加のエラー処理なしに複製できる。
     Array(ArrayRef<'a>),
@@ -178,6 +224,13 @@ pub enum ScalarRef<'a> {
     ///
     /// [`as_text`]: ScalarRef::as_text
     Bytes(&'a [u8]),
+    /// `JSON`／`JSONB` 列の借用結果（Issue #889）。TEXT 前提の消費側
+    /// （[`as_text`]。等価/前方一致フィルタ・二次索引・hybrid 本文・GROUP BY
+    /// キー等）へは流入させない（fail-closed。TABLE-14 は WHERE 等価・GROUP BY
+    /// キーを JSON 列の対象外とする）。
+    ///
+    /// [`as_text`]: ScalarRef::as_text
+    Json(&'a str),
     /// `ENUM` 列の借用結果（Issue #890）。TEXT と行バイト表現を共有するが、
     /// TEXT 前提の消費側（[`as_text`]）へは流入させない（`Bytea` と同じ方針）。
     /// 等価比較・二次索引の辞書化は [`as_dictionary_text`] を経由する。
@@ -185,40 +238,137 @@ pub enum ScalarRef<'a> {
     /// [`as_text`]: ScalarRef::as_text
     /// [`as_dictionary_text`]: ScalarRef::as_dictionary_text
     Enum(&'a str),
+    /// `NUMERIC` 列の借用結果（TABLE-13〔検討中〕・TASK-197、Issue #885）。
+    Numeric(Decimal),
+    /// `UUID` 列の借用結果（TABLE-13〔検討中〕・TASK-197、Issue #887）。
+    Uuid(Uuid),
 }
 
 impl<'a> ScalarRef<'a> {
     /// TEXT 前提の既存消費側（等価/前方一致フィルタ・二次索引・hybrid 本文・
-    /// GROUP BY キー等）が `Bool`／`Array`／`Bytes`／`Enum` を取り違えて TEXT
-    /// として扱わないよう、`Text` 以外は `None` を返す（fail-closed。呼び出し元は
-    /// スキーマ型で事前に対象外の列を除外するか、`None` を型不一致として拒否する）。
+    /// GROUP BY キー等）が `Bool`／`Date`／`Timestamp`／`Array`／`Bytes`／`Json`／
+    /// `Enum` を取り違えて TEXT として扱わないよう、`Text` 以外は `None` を返す
+    /// （fail-closed。呼び出し元はスキーマ型で事前に対象外の列を除外するか、
+    /// `None` を型不一致として拒否する）。
     pub fn as_text(&self) -> Option<&'a str> {
         match self {
             ScalarRef::Text(s) => Some(s),
-            ScalarRef::Bool(_) | ScalarRef::Array(_) | ScalarRef::Bytes(_) | ScalarRef::Enum(_) => {
-                None
-            }
+            ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
         }
     }
 
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             ScalarRef::Bool(b) => Some(*b),
-            ScalarRef::Text(_) | ScalarRef::Array(_) | ScalarRef::Bytes(_) | ScalarRef::Enum(_) => {
-                None
-            }
+            ScalarRef::Text(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
+        }
+    }
+
+    /// `DATE` 列の内部表現（1970-01-01 起点の日数）。`Date` 以外は `None`
+    /// （[`Self::as_text`] と同じ fail-closed 方針。Issue #884）。
+    pub fn as_date(&self) -> Option<i32> {
+        match self {
+            ScalarRef::Date(d) => Some(*d),
+            ScalarRef::Text(_)
+            | ScalarRef::Bool(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
+        }
+    }
+
+    /// `TIMESTAMP` 列の内部表現（1970-01-01 00:00:00 起点のマイクロ秒）。
+    /// `Timestamp` 以外は `None`（同上、Issue #884）。
+    pub fn as_timestamp(&self) -> Option<i64> {
+        match self {
+            ScalarRef::Timestamp(t) => Some(*t),
+            ScalarRef::Text(_)
+            | ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
+        }
+    }
+
+    /// NUMERIC 前提の消費側（TABLE-13〔検討中〕・TASK-197、Issue #885）が
+    /// `Text`/`Bool`/`Array`/`Bytes`/`Json`/`Enum` を取り違えないよう、
+    /// `Numeric` 以外は `None` を返す（fail-closed。[`as_text`]/[`as_bool`]
+    /// と同方針）。
+    pub fn as_numeric(&self) -> Option<Decimal> {
+        match self {
+            ScalarRef::Numeric(d) => Some(*d),
+            ScalarRef::Text(_)
+            | ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_)
+            | ScalarRef::Uuid(_) => None,
+        }
+    }
+
+    /// UUID 前提の消費側（TABLE-13〔検討中〕・TASK-197、Issue #887）が
+    /// `Text`/`Bool`/`Array`/`Bytes`/`Json`/`Enum`/`Numeric` を取り違えないよう、
+    /// `Uuid` 以外は `None` を返す（fail-closed。[`as_numeric`] と同方針）。
+    ///
+    /// [`as_numeric`]: ScalarRef::as_numeric
+    pub fn as_uuid(&self) -> Option<crate::uuid::Uuid> {
+        match self {
+            ScalarRef::Uuid(u) => Some(*u),
+            ScalarRef::Text(_)
+            | ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_) => None,
         }
     }
 
     /// `Text`／`Enum` のみを許す辞書化アクセサ（Issue #890。スカラー列二次索引
     /// 〔`sql::scalar_index::ScalarIndex`〕・`declarative_filter` の等価比較が
     /// ENUM 列を TEXT 列と同じ辞書表現で扱えるようにするための限定共有。
-    /// `Bool`／`Array`／`Bytes` は対象外のまま `None`（TABLE-14 が定める述語の
-    /// 範囲を超えて ENUM を露出しない）。
+    /// `Bool`／`Array`／`Bytes`／`Json` は対象外のまま `None`（TABLE-14 が定める
+    /// 述語の範囲を超えて ENUM／JSON を露出しない）。
     pub fn as_dictionary_text(&self) -> Option<&'a str> {
         match self {
             ScalarRef::Text(s) | ScalarRef::Enum(s) => Some(s),
-            ScalarRef::Bool(_) | ScalarRef::Array(_) | ScalarRef::Bytes(_) => None,
+            ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
         }
     }
 }
@@ -269,6 +419,14 @@ const BOOL_TRUE_BYTE: u8 = 0x01;
 /// `tenant::validate_set_assignments` の事前累計検証が同じ値を共有する
 /// （TEXT の [`SCALAR_TEXT_ENTRY_OVERHEAD`] と同じ理由）。
 pub(crate) const SCALAR_BOOL_ENTRY_LEN: u32 = 2;
+
+/// `DATE` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + 値(4, LE i32)。Issue #884）。
+pub(crate) const SCALAR_DATE_ENTRY_LEN: u32 = 5;
+
+/// `TIMESTAMP` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込み
+/// バイト数（presence(1) + 値(8, LE i64)。Issue #884）。
+pub(crate) const SCALAR_TIMESTAMP_ENTRY_LEN: u32 = 9;
 
 /// 配列列のフレーム flags バイト。本版は `0x00` 固定（NULL 要素非対応。D-A6）。
 /// 将来 NULL 要素ビットマップ等を追加する際の予約領域として、`0x00` 以外は
@@ -577,6 +735,19 @@ fn parse_array_frame<'a>(
     ))
 }
 
+/// NUMERIC 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + `unscaled`（`i128` LE 16 バイト）。TABLE-13〔検討中〕・
+/// TASK-197、Issue #885・D3）。scale は行に持たないため列型に依存しない
+/// 固定長。[`SCALAR_BOOL_ENTRY_LEN`] と同じ理由で
+/// `tenant::validate_set_assignments` の事前累計検証と共有する。
+pub(crate) const SCALAR_NUMERIC_ENTRY_LEN: u32 = 17;
+
+/// UUID 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + 16 バイト生値。TABLE-13〔検討中〕・TASK-197、Issue #887）。
+/// [`SCALAR_NUMERIC_ENTRY_LEN`] と同じ理由で `tenant::validate_set_assignments`
+/// の事前累計検証と共有する。
+pub(crate) const SCALAR_UUID_ENTRY_LEN: u32 = 17;
+
 /// デコード結果。行レベルの RLS フィールド（`tenant_id`・`visibility`）と、
 /// スキーマの列順に対応する値列を保持する。
 #[derive(Debug, Clone, PartialEq)]
@@ -680,8 +851,14 @@ pub fn encode_row(
                     ColumnType::Text
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
                     | ColumnType::Array(_)
-                    | ColumnType::Bytea => {
+                    | ColumnType::Bytea
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Uuid => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Enum value, got Enum",
                             column.name
@@ -711,9 +888,15 @@ pub fn encode_row(
                     ColumnType::Vector(dim) => *dim,
                     ColumnType::Text
                     | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
-                    | ColumnType::Enum(_) => {
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
+                    | ColumnType::Enum(_)
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Uuid => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Vector value, got Vector",
                             column.name
@@ -750,14 +933,52 @@ pub fn encode_row(
                 buf.push(PRESENCE_VALUE);
                 buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
             }
+            Value::Date(days) => {
+                if !matches!(column.ty, ColumnType::Date) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Date value, got Date",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_date_days(*days) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: date value out of range: {days}",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&days.to_le_bytes());
+            }
+            Value::Timestamp(micros) => {
+                if !matches!(column.ty, ColumnType::Timestamp) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Timestamp value, got Timestamp",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_timestamp_micros(*micros) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: timestamp value out of range: {micros}",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&micros.to_le_bytes());
+            }
             Value::Array(array_value) => {
-                let array_ty = match column.ty {
-                    ColumnType::Array(array_ty) => array_ty,
+                let array_ty = match &column.ty {
+                    ColumnType::Array(array_ty) => *array_ty,
                     ColumnType::Text
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
                     | ColumnType::Bytea
-                    | ColumnType::Enum(_) => {
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
+                    | ColumnType::Enum(_)
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Uuid => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Array value, got Array",
                             column.name
@@ -787,10 +1008,91 @@ pub fn encode_row(
                 buf.extend_from_slice(&byte_len.to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
+            Value::Json(text) => {
+                encode_json_value(&mut buf, column, text)?;
+            }
+            Value::Numeric(d) => {
+                let scale = match column.ty {
+                    ColumnType::Numeric { precision, scale } => {
+                        if !d.fits_precision(precision) {
+                            return Err(RowCodecError::Invalid(format!(
+                                "column {:?} numeric value out of range for precision {precision}",
+                                column.name
+                            )));
+                        }
+                        scale
+                    }
+                    ColumnType::Text
+                    | ColumnType::Vector(_)
+                    | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
+                    | ColumnType::Array(_)
+                    | ColumnType::Bytea
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
+                    | ColumnType::Enum(_)
+                    | ColumnType::Uuid => {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Numeric value, got Numeric",
+                            column.name
+                        )))
+                    }
+                };
+                if d.scale() != scale {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects numeric scale {scale}, got {}",
+                        column.name,
+                        d.scale()
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&d.unscaled().to_le_bytes());
+            }
+            Value::Uuid(u) => {
+                if !matches!(column.ty, ColumnType::Uuid) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Uuid value, got Uuid",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(u.as_bytes());
+            }
         }
     }
 
     Ok(buf)
+}
+
+/// `JSON`／`JSONB` 列 1 個分を `buf` へ書き込む（[`encode_row`]・
+/// [`encode_scalar_columns`]・[`merge_encode_scalar_columns`] が共有する唯一の
+/// エンコード実装）。Issue #889 D2「格納時検証の単一チョークポイント」に従い、
+/// `JSON` 列は [`crate::json::validate_json_column_text`] で構文検証のみ行い
+/// 入力テキストをそのまま格納し、`JSONB` 列は [`crate::json::canonicalize_jsonb_text`]
+/// で得た正規化形と入力テキストが一致することを検証する（束縛層は常に正規化済みの
+/// テキストを渡す契約であり、不一致は API 誤用として拒否する）。これにより
+/// Rust API（`tenant::insert_typed_row` 等）経由でも未検証・未正規化の JSON が
+/// 格納されない（TEXT と同じ presence + `u32` LE 長 + UTF-8 本体の枠を共有する）。
+fn encode_json_value(
+    buf: &mut Vec<u8>,
+    column: &crate::catalog::ColumnDef,
+    text: &str,
+) -> Result<()> {
+    validate_json_column_value(column, text)?;
+    let text_bytes = text.as_bytes();
+    let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
+        RowCodecError::Invalid(format!("json field too long: {} bytes", text_bytes.len()))
+    })?;
+    if text_len > MAX_TEXT_FIELD_LEN {
+        return Err(RowCodecError::Invalid(format!(
+            "json field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+        )));
+    }
+    buf.push(PRESENCE_VALUE);
+    buf.extend_from_slice(&text_len.to_le_bytes());
+    buf.extend_from_slice(text_bytes);
+    Ok(())
 }
 
 /// [`encode_row`] の逆変換。欠落・不正値・切り詰め・未知タグをすべて `Err` で拒否する
@@ -1005,6 +1307,64 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     })?;
                     values.push(Value::Bool(b));
                 }
+                ColumnType::Date => {
+                    let days_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before date value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at date value field".to_string(),
+                            )
+                        })?;
+                    let days_arr: [u8; 4] = days_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("date value field is not 4 bytes".to_string())
+                    })?;
+                    let days = i32::from_le_bytes(days_arr);
+                    if !crate::datetime::validate_date_days(days) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "date value {days} is out of the representable range"
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after date value field".to_string())
+                    })?;
+                    values.push(Value::Date(days));
+                }
+                ColumnType::Timestamp => {
+                    let micros_bytes = buf
+                        .get(
+                            offset..offset.checked_add(8).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before timestamp value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at timestamp value field".to_string(),
+                            )
+                        })?;
+                    let micros_arr: [u8; 8] = micros_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("timestamp value field is not 8 bytes".to_string())
+                    })?;
+                    let micros = i64::from_le_bytes(micros_arr);
+                    if !crate::datetime::validate_timestamp_micros(micros) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "timestamp value {micros} is out of the representable range"
+                        )));
+                    }
+                    offset = offset.checked_add(8).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after timestamp value field".to_string(),
+                        )
+                    })?;
+                    values.push(Value::Timestamp(micros));
+                }
                 ColumnType::Array(array_ty) => {
                     let (array_ref, new_offset) =
                         parse_array_frame(buf, offset, array_ty.elem(), array_ty.max_len())?;
@@ -1048,6 +1408,112 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     })?;
                     offset = bytea_end;
                     values.push(Value::Bytes(bytea_bytes.to_vec()));
+                }
+                ColumnType::Json | ColumnType::Jsonb => {
+                    // presence + `u32` LE 長 + UTF-8 本体は `Text` と同一の枠を
+                    // 共有する（Issue #889 D2）。書き込み経路（`encode_row` 系）が
+                    // 検証・正規化済みの契約であるため、decode 側は TEXT と同じく
+                    // 長さ上限・UTF-8 妥当性のみを検証し再パースしない。
+                    let len_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before json length field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at json length field".to_string(),
+                            )
+                        })?;
+                    let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("json length field is not 4 bytes".to_string())
+                    })?;
+                    let text_len = u32::from_le_bytes(len_arr);
+                    if text_len > MAX_TEXT_FIELD_LEN {
+                        return Err(RowCodecError::Invalid(format!(
+                            "json field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after json length field".to_string(),
+                        )
+                    })?;
+                    let text_end = offset.checked_add(text_len as usize).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after json field".to_string())
+                    })?;
+                    let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
+                        RowCodecError::Invalid("row buffer truncated at json field".to_string())
+                    })?;
+                    let text = std::str::from_utf8(text_bytes)
+                        .map_err(|_| {
+                            RowCodecError::Invalid("json field is not valid UTF-8".to_string())
+                        })?
+                        .to_string();
+                    offset = text_end;
+                    values.push(Value::Json(text));
+                }
+                ColumnType::Numeric { precision, scale } => {
+                    let unscaled_bytes = buf
+                        .get(
+                            offset..offset.checked_add(16).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before numeric value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at numeric value field".to_string(),
+                            )
+                        })?;
+                    let unscaled_arr: [u8; 16] = unscaled_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("numeric value field is not 16 bytes".to_string())
+                    })?;
+                    let unscaled = i128::from_le_bytes(unscaled_arr);
+                    let decimal = Decimal::from_parts(unscaled, *scale).map_err(|_| {
+                        RowCodecError::Invalid(format!(
+                            "column {:?} numeric scale out of range",
+                            column.name
+                        ))
+                    })?;
+                    if !decimal.fits_precision(*precision) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} numeric value out of range for precision {precision}",
+                            column.name
+                        )));
+                    }
+                    offset = offset.checked_add(16).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after numeric value field".to_string(),
+                        )
+                    })?;
+                    values.push(Value::Numeric(decimal));
+                }
+                ColumnType::Uuid => {
+                    let uuid_bytes: [u8; 16] = buf
+                        .get(
+                            offset..offset.checked_add(16).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before uuid value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at uuid value field".to_string(),
+                            )
+                        })?
+                        .try_into()
+                        .map_err(|_| {
+                            RowCodecError::Invalid("uuid value field is not 16 bytes".to_string())
+                        })?;
+                    offset = offset.checked_add(16).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after uuid value field".to_string())
+                    })?;
+                    values.push(Value::Uuid(Uuid::from_bytes(uuid_bytes)));
                 }
             },
             other => {
@@ -1172,8 +1638,14 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     ColumnType::Text
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
                     | ColumnType::Array(_)
-                    | ColumnType::Bytea => {
+                    | ColumnType::Bytea
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Uuid => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Enum value, got Enum",
                             column.name
@@ -1217,14 +1689,54 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_VALUE);
                 buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
             }
+            Value::Date(days) => {
+                if !matches!(column.ty, ColumnType::Date) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Date value, got Date",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_date_days(*days) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: date value out of range: {days}",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_DATE_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&days.to_le_bytes());
+            }
+            Value::Timestamp(micros) => {
+                if !matches!(column.ty, ColumnType::Timestamp) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Timestamp value, got Timestamp",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_timestamp_micros(*micros) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: timestamp value out of range: {micros}",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_TIMESTAMP_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&micros.to_le_bytes());
+            }
             Value::Array(array_value) => {
-                let array_ty = match column.ty {
-                    ColumnType::Array(array_ty) => array_ty,
+                let array_ty = match &column.ty {
+                    ColumnType::Array(array_ty) => *array_ty,
                     ColumnType::Text
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
                     | ColumnType::Bytea
-                    | ColumnType::Enum(_) => {
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
+                    | ColumnType::Enum(_)
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Uuid => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Array value, got Array",
                             column.name
@@ -1260,10 +1772,113 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.extend_from_slice(&byte_len.to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
+            Value::Json(text) => {
+                validate_json_column_value(column, text)?;
+                let text_bytes = text.as_bytes();
+                let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid(format!(
+                        "json field too long: {} bytes",
+                        text_bytes.len()
+                    ))
+                })?;
+                if text_len > MAX_TEXT_FIELD_LEN {
+                    return Err(RowCodecError::Invalid(format!(
+                        "json field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+                    )));
+                }
+                // フレーミング（presence(1) + 長さ(4)）は TEXT と同一のため
+                // `scalar_text_entry_len` を共有する。
+                let entry_len = scalar_text_entry_len(text_len)?;
+                reserve(&mut buf, entry_len)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&text_len.to_le_bytes());
+                buf.extend_from_slice(text_bytes);
+            }
+            Value::Numeric(d) => {
+                let (precision, scale) = match column.ty {
+                    ColumnType::Numeric { precision, scale } => (precision, scale),
+                    ColumnType::Text
+                    | ColumnType::Vector(_)
+                    | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
+                    | ColumnType::Array(_)
+                    | ColumnType::Bytea
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
+                    | ColumnType::Enum(_)
+                    | ColumnType::Uuid => {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Numeric value, got Numeric",
+                            column.name
+                        )))
+                    }
+                };
+                if d.scale() != scale || !d.fits_precision(precision) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} numeric value does not match column NUMERIC({precision},{scale})",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_NUMERIC_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&d.unscaled().to_le_bytes());
+            }
+            Value::Uuid(u) => {
+                if !matches!(column.ty, ColumnType::Uuid) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Uuid value, got Uuid",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_UUID_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(u.as_bytes());
+            }
         }
     }
 
     Ok(buf)
+}
+
+/// `JSON`／`JSONB` 列の値検証（列型に応じた [`crate::json::validate_json_column_text`]／
+/// [`crate::json::canonicalize_jsonb_text`] の呼び分け）を [`encode_json_value`]・
+/// [`encode_scalar_columns`]・[`merge_encode_scalar_columns`] の 3 箇所で共有する。
+fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) -> Result<()> {
+    match &column.ty {
+        ColumnType::Json => {
+            crate::json::validate_json_column_text(text).map_err(|_| {
+                RowCodecError::Invalid(format!("column {:?} expects valid JSON text", column.name))
+            })?;
+        }
+        ColumnType::Jsonb => {
+            let canonical = crate::json::canonicalize_jsonb_text(text).map_err(|_| {
+                RowCodecError::Invalid(format!("column {:?} expects valid JSON text", column.name))
+            })?;
+            if canonical != text {
+                return Err(RowCodecError::Invalid(format!(
+                    "column {:?} expects pre-canonicalized JSONB text",
+                    column.name
+                )));
+            }
+        }
+        ColumnType::Text
+        | ColumnType::Vector(_)
+        | ColumnType::Boolean
+        | ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::Array(_)
+        | ColumnType::Bytea
+        | ColumnType::Enum(_)
+        | ColumnType::Numeric { .. }
+        | ColumnType::Uuid => {
+            return Err(RowCodecError::Invalid(format!(
+                "column {:?} expects a non-JSON value, got JSON",
+                column.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// UPDATE の列指定マージ（`crate::tenant::update_row_columns_unchecked`）専用の
@@ -1374,6 +1989,17 @@ pub(crate) fn merge_encode_scalar_columns(
         Ok(())
     };
 
+    // JSON／JSONB 用の長さプレフィックス書き込み。フレーミングは `write_text` と
+    // 完全に同一で、列型に応じた検証（`validate_json_column_value`）のみ異なる。
+    let write_json = |buf: &mut Vec<u8>,
+                      reserve: &mut dyn FnMut(&mut Vec<u8>, u32) -> Result<()>,
+                      column: &crate::catalog::ColumnDef,
+                      text: &str|
+     -> Result<()> {
+        validate_json_column_value(column, text)?;
+        write_text(buf, reserve, text.as_bytes())
+    };
+
     for (idx, column) in schema.columns.iter().enumerate() {
         if matches!(column.ty, ColumnType::Vector(_)) {
             // VECTOR 列は encode_scalar_columns と同じくスキップ（embedding は
@@ -1409,8 +2035,14 @@ pub(crate) fn merge_encode_scalar_columns(
                         ColumnType::Text
                         | ColumnType::Vector(_)
                         | ColumnType::Boolean
+                        | ColumnType::Date
+                        | ColumnType::Timestamp
                         | ColumnType::Array(_)
-                        | ColumnType::Bytea => {
+                        | ColumnType::Bytea
+                        | ColumnType::Json
+                        | ColumnType::Jsonb
+                        | ColumnType::Numeric { .. }
+                        | ColumnType::Uuid => {
                             return Err(RowCodecError::Invalid(format!(
                                 "column {:?} expects a non-Enum value, got Enum",
                                 column.name
@@ -1443,14 +2075,54 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_VALUE);
                     buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
                 }
+                Value::Date(days) => {
+                    if !matches!(column.ty, ColumnType::Date) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Date value, got Date",
+                            column.name
+                        )));
+                    }
+                    if !crate::datetime::validate_date_days(*days) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: date value out of range: {days}",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_DATE_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&days.to_le_bytes());
+                }
+                Value::Timestamp(micros) => {
+                    if !matches!(column.ty, ColumnType::Timestamp) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Timestamp value, got Timestamp",
+                            column.name
+                        )));
+                    }
+                    if !crate::datetime::validate_timestamp_micros(*micros) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: timestamp value out of range: {micros}",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_TIMESTAMP_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&micros.to_le_bytes());
+                }
                 Value::Array(array_value) => {
-                    let array_ty = match column.ty {
-                        ColumnType::Array(array_ty) => array_ty,
+                    let array_ty = match &column.ty {
+                        ColumnType::Array(array_ty) => *array_ty,
                         ColumnType::Text
                         | ColumnType::Vector(_)
                         | ColumnType::Boolean
+                        | ColumnType::Date
+                        | ColumnType::Timestamp
                         | ColumnType::Bytea
-                        | ColumnType::Enum(_) => {
+                        | ColumnType::Json
+                        | ColumnType::Jsonb
+                        | ColumnType::Enum(_)
+                        | ColumnType::Numeric { .. }
+                        | ColumnType::Uuid => {
                             return Err(RowCodecError::Invalid(format!(
                                 "column {:?} expects a non-Array value, got Array",
                                 column.name
@@ -1467,6 +2139,50 @@ pub(crate) fn merge_encode_scalar_columns(
                         )));
                     }
                     write_bytes(&mut buf, &mut reserve, bytes)?;
+                }
+                Value::Json(text) => {
+                    write_json(&mut buf, &mut reserve, column, text)?;
+                }
+                Value::Numeric(d) => {
+                    let (precision, scale) = match column.ty {
+                        ColumnType::Numeric { precision, scale } => (precision, scale),
+                        ColumnType::Text
+                        | ColumnType::Vector(_)
+                        | ColumnType::Boolean
+                        | ColumnType::Date
+                        | ColumnType::Timestamp
+                        | ColumnType::Array(_)
+                        | ColumnType::Bytea
+                        | ColumnType::Json
+                        | ColumnType::Jsonb
+                        | ColumnType::Enum(_)
+                        | ColumnType::Uuid => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "column {:?} expects a non-Numeric value, got Numeric",
+                                column.name
+                            )))
+                        }
+                    };
+                    if d.scale() != scale || !d.fits_precision(precision) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} numeric value does not match column NUMERIC({precision},{scale})",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_NUMERIC_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&d.unscaled().to_le_bytes());
+                }
+                Value::Uuid(u) => {
+                    if !matches!(column.ty, ColumnType::Uuid) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Uuid value, got Uuid",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_UUID_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(u.as_bytes());
                 }
             }
         } else {
@@ -1501,6 +2217,16 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_VALUE);
                     buf.push(if b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
                 }
+                Some(ScalarRef::Date(days)) => {
+                    reserve(&mut buf, SCALAR_DATE_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&days.to_le_bytes());
+                }
+                Some(ScalarRef::Timestamp(micros)) => {
+                    reserve(&mut buf, SCALAR_TIMESTAMP_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&micros.to_le_bytes());
+                }
                 Some(ScalarRef::Array(array_ref)) => {
                     let payload_len = u32::try_from(array_ref.bytes.len()).map_err(|_| {
                         RowCodecError::Invalid("array payload length overflow".to_string())
@@ -1515,6 +2241,25 @@ pub(crate) fn merge_encode_scalar_columns(
                 }
                 Some(ScalarRef::Bytes(bytes)) => {
                     write_bytes(&mut buf, &mut reserve, bytes)?;
+                }
+                Some(ScalarRef::Json(text)) => {
+                    // 既存値は encode 済みで格納契約（構文検証・JSONB は正規化）を
+                    // 満たしている前提のため、TEXT／BYTEA の既存値と同じく
+                    // 再パース・再検証はしない（decode 契約「書き込み経路の保証に
+                    // 依拠」に揃える。Issue #889 D2。`write_canonical` の出力形式
+                    // が将来変わっても、SET 対象でない既存 JSONB 行が
+                    // `XX000` で更新不能になるフォワード互換の結合を避ける）。
+                    write_text(&mut buf, &mut reserve, text.as_bytes())?;
+                }
+                Some(ScalarRef::Numeric(d)) => {
+                    reserve(&mut buf, SCALAR_NUMERIC_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&d.unscaled().to_le_bytes());
+                }
+                Some(ScalarRef::Uuid(u)) => {
+                    reserve(&mut buf, SCALAR_UUID_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(u.as_bytes());
                 }
             }
         }
@@ -1670,6 +2415,77 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
+                ColumnType::Numeric { precision, scale } => {
+                    let unscaled_bytes = buf
+                        .get(
+                            offset..offset.checked_add(16).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before numeric value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at numeric value field".to_string(),
+                            )
+                        })?;
+                    let unscaled_arr: [u8; 16] = unscaled_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("numeric value field is not 16 bytes".to_string())
+                    })?;
+                    let unscaled = i128::from_le_bytes(unscaled_arr);
+                    let decimal = Decimal::from_parts(unscaled, *scale).map_err(|_| {
+                        RowCodecError::Invalid(format!(
+                            "column {:?} numeric scale out of range",
+                            column.name
+                        ))
+                    })?;
+                    if !decimal.fits_precision(*precision) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} numeric value out of range for precision {precision}",
+                            column.name
+                        )));
+                    }
+                    offset = offset.checked_add(16).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after numeric value field".to_string(),
+                        )
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Numeric(decimal)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+                ColumnType::Uuid => {
+                    let uuid_bytes: [u8; 16] = buf
+                        .get(
+                            offset..offset.checked_add(16).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before uuid value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at uuid value field".to_string(),
+                            )
+                        })?
+                        .try_into()
+                        .map_err(|_| {
+                            RowCodecError::Invalid("uuid value field is not 16 bytes".to_string())
+                        })?;
+                    offset = offset.checked_add(16).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after uuid value field".to_string())
+                    })?;
+                    if wanted {
+                        sink(
+                            col_index,
+                            Some(ScalarRef::Uuid(Uuid::from_bytes(uuid_bytes))),
+                        )?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
                 ColumnType::Text | ColumnType::Vector(_) | ColumnType::Enum(_) => {
                     let len_bytes = buf
                         .get(
@@ -1795,6 +2611,119 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
+                ColumnType::Date => {
+                    let days_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before date value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at date value field".to_string(),
+                            )
+                        })?;
+                    let days_arr: [u8; 4] = days_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("date value field is not 4 bytes".to_string())
+                    })?;
+                    let days = i32::from_le_bytes(days_arr);
+                    if !crate::datetime::validate_date_days(days) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "date value {days} is out of the representable range"
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after date value field".to_string())
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Date(days)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+                ColumnType::Timestamp => {
+                    let micros_bytes = buf
+                        .get(
+                            offset..offset.checked_add(8).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before timestamp value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at timestamp value field".to_string(),
+                            )
+                        })?;
+                    let micros_arr: [u8; 8] = micros_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("timestamp value field is not 8 bytes".to_string())
+                    })?;
+                    let micros = i64::from_le_bytes(micros_arr);
+                    if !crate::datetime::validate_timestamp_micros(micros) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "timestamp value {micros} is out of the representable range"
+                        )));
+                    }
+                    offset = offset.checked_add(8).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after timestamp value field".to_string(),
+                        )
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Timestamp(micros)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+                ColumnType::Json | ColumnType::Jsonb => {
+                    // フレーミング・UTF-8 検証は TEXT と共有する（Issue #889 D2）。
+                    // 格納時（encode 経路）に構文検証・正規化済みのため、ここでは
+                    // 再パースしない（TEXT と同じ契約）。
+                    let len_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before json length field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at json length field".to_string(),
+                            )
+                        })?;
+                    let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("json length field is not 4 bytes".to_string())
+                    })?;
+                    let text_len = u32::from_le_bytes(len_arr);
+                    if text_len > MAX_TEXT_FIELD_LEN {
+                        return Err(RowCodecError::Invalid(format!(
+                            "json field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after json length field".to_string(),
+                        )
+                    })?;
+                    let text_end = offset.checked_add(text_len as usize).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after json field".to_string())
+                    })?;
+                    let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
+                        RowCodecError::Invalid("scalar payload truncated at json field".to_string())
+                    })?;
+                    offset = text_end;
+                    let text = std::str::from_utf8(text_bytes).map_err(|_| {
+                        RowCodecError::Invalid("json field is not valid UTF-8".to_string())
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Json(text)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
             },
             other => {
                 return Err(RowCodecError::Invalid(format!(
@@ -1850,6 +2779,8 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
                 values.push(Value::Enum(owned));
             }
             Some(ScalarRef::Bool(b)) => values.push(Value::Bool(b)),
+            Some(ScalarRef::Date(days)) => values.push(Value::Date(days)),
+            Some(ScalarRef::Timestamp(micros)) => values.push(Value::Timestamp(micros)),
             Some(ScalarRef::Array(array_ref)) => {
                 values.push(Value::Array(array_ref.to_value()?));
             }
@@ -1861,6 +2792,16 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
                 owned.extend_from_slice(bytes);
                 values.push(Value::Bytes(owned));
             }
+            Some(ScalarRef::Json(text)) => {
+                let mut owned = String::new();
+                owned.try_reserve_exact(text.len()).map_err(|_| {
+                    RowCodecError::Invalid("failed to reserve json field".to_string())
+                })?;
+                owned.push_str(text);
+                values.push(Value::Json(owned));
+            }
+            Some(ScalarRef::Numeric(d)) => values.push(Value::Numeric(d)),
+            Some(ScalarRef::Uuid(u)) => values.push(Value::Uuid(u)),
         }
     }
     Ok(values)
@@ -1951,6 +2892,53 @@ mod tests {
             matches!(result, Err(RowCodecError::Invalid(_))),
             "cumulative scalar payload length must be rejected before allocation"
         );
+    }
+
+    /// `JSON` 列 1 個だけが対象行のスカラーペイロードを占める場合、
+    /// `json::MAX_JSON_FIELD_LEN`（フレーミング込みでちょうど
+    /// `MAX_SCALAR_PAYLOAD_LEN` に収まるよう定義済み）ちょうどの本文が
+    /// `encode_scalar_columns` を成功させることを固定する（PR #1014 レビュー
+    /// 指摘対応。旧定義〔`MAX_TEXT_FIELD_LEN` と同値〕では、束縛層
+    /// （`sql::parser::bind_json_literal`）が受理したこの境界値の入力が、
+    /// presence(1) + 長さ(4) バイトのフレーミング分だけ `MAX_SCALAR_PAYLOAD_LEN`
+    /// を超過し、`encode_scalar_columns` 側で拒否され得た）。
+    #[test]
+    fn encode_scalar_columns_accepts_json_column_at_exact_field_length_limit() {
+        let target = crate::json::MAX_JSON_FIELD_LEN;
+        // 単一の文字列リテラルは `MAX_JSON_STRING_CHARS`（1 MiB）に抵触するため、
+        // `json.rs` の境界値テストと同じ方式（複数要素の配列）で目標バイト数を
+        // ちょうど組み立てる: `[` + 5 要素（`"`×2 + 本体） + 4 個の `,` + `]`。
+        let overhead = 1 + 1 + 4 + 5 * 2;
+        let content_total = target - overhead;
+        let base = content_total / 5;
+        let remainder = content_total % 5;
+        let lens = [base, base, base, base, base + remainder];
+        assert!(lens.iter().all(|&l| l < crate::json::MAX_JSON_STRING_CHARS));
+        let mut doc = String::new();
+        doc.push('[');
+        for (i, len) in lens.iter().enumerate() {
+            if i > 0 {
+                doc.push(',');
+            }
+            doc.push('"');
+            doc.push_str(&"a".repeat(*len));
+            doc.push('"');
+        }
+        doc.push(']');
+        assert_eq!(doc.len(), target);
+        crate::json::validate_json_column_text(&doc).expect("valid json at exact limit");
+
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("doc", ColumnType::Json, true),
+            ],
+        );
+        let values = vec![Value::Vector(vec![0.1, 0.2]), Value::Json(doc)];
+        let encoded = encode_scalar_columns(&schema, &values)
+            .expect("a single MAX_JSON_FIELD_LEN column must fit MAX_SCALAR_PAYLOAD_LEN");
+        assert_eq!(encoded.len() as u32, MAX_SCALAR_PAYLOAD_LEN);
     }
 
     #[test]
@@ -2686,6 +3674,118 @@ mod tests {
                 .values,
             vec![Value::Bytes(Vec::new())]
         );
+    }
+
+    // --- DATE/TIMESTAMP encode 時の範囲検証（codex-review／Cursor Bugbot 指摘。
+    // decode 側（decode_row・scan_scalar_columns）は範囲外値を拒否するのに対し
+    // encode 側が検証していないと、公開 enum Value::Date/Timestamp を直接
+    // 構築する呼び出し元（SQL パーサーを経由しない Rust API 経路を含む）から
+    // 範囲外値を書き込み成功させてしまい、書き込んだ本人がその行を二度と
+    // 読めなくなる非対称な永続化バグになる。encode_row・encode_scalar_columns・
+    // merge_encode_scalar_columns の 3 箇所すべてで拒否されることを固定する） ---
+
+    fn date_timestamp_schema() -> TableSchema {
+        TableSchema::new(
+            "events",
+            vec![
+                ColumnDef::new("d", ColumnType::Date, true),
+                ColumnDef::new("t", ColumnType::Timestamp, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn encode_row_rejects_out_of_range_date_and_timestamp() {
+        let schema = date_timestamp_schema();
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Date(crate::datetime::DATE_MAX_DAYS + 1), Value::Null],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[
+                Value::Null,
+                Value::Timestamp(crate::datetime::TIMESTAMP_MAX_MICROS + 1),
+            ],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Date(crate::datetime::DATE_MIN_DAYS - 1), Value::Null],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[
+                Value::Null,
+                Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS - 1),
+            ],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        // 範囲内の値は従来どおり成功し decode で読み戻せる（非対称でないことの確認）。
+        let ok = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[
+                Value::Date(crate::datetime::DATE_MAX_DAYS),
+                Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS),
+            ],
+        )
+        .expect("encode in-range date/timestamp");
+        let decoded = decode_row(&schema, &ok).expect("decode in-range date/timestamp");
+        assert_eq!(
+            decoded.values,
+            vec![
+                Value::Date(crate::datetime::DATE_MAX_DAYS),
+                Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS),
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_scalar_columns_rejects_out_of_range_date_and_timestamp() {
+        let schema = date_timestamp_schema();
+        let result = encode_scalar_columns(
+            &schema,
+            &[Value::Date(crate::datetime::DATE_MAX_DAYS + 1), Value::Null],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_scalar_columns(
+            &schema,
+            &[
+                Value::Null,
+                Value::Timestamp(crate::datetime::TIMESTAMP_MAX_MICROS + 1),
+            ],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn merge_encode_scalar_columns_rejects_out_of_range_date_and_timestamp() {
+        let schema = date_timestamp_schema();
+        let out_of_range_date = Value::Date(crate::datetime::DATE_MAX_DAYS + 1);
+        let result =
+            merge_encode_scalar_columns(&schema, &[None, None], &[(0, &out_of_range_date)]);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let out_of_range_ts = Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS - 1);
+        let result = merge_encode_scalar_columns(&schema, &[None, None], &[(1, &out_of_range_ts)]);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
     }
 
     // --- merge_encode_scalar_columns（Issue #996: 述語つき UPDATE の適用段を
