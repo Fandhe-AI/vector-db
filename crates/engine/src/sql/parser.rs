@@ -1031,23 +1031,29 @@ pub fn bind_in_session(
 
 /// Describe（拡張クエリプロトコルの 'D' 種別 S。値未確定でも呼べる契約。
 /// `core.rs::EngineCore::describe_parsed_in_session`）専用: [`bind_in_session`]
-/// と同じ検証（`USING MODE` リテラル・投影列・`WHERE` 式）を行いつつ、
-/// `ORDER BY` のランキング対象は列参照の構造検証のみに留め、ベクトル
-/// リテラル文字列の実パースを省略して結果列（[`ProjectedColumn`]）だけを
-/// 返す。結果列は投影列にのみ依存しランキングの実値には依存しないため、
-/// この省略は Describe が返す列を変えない。
+/// と同じ検証（`USING MODE` リテラル・投影列・`WHERE` 式）を行いつつ、結果列
+/// （[`ProjectedColumn`]）だけを返す。結果列は投影列にのみ依存しランキング
+/// の実値には依存しないため、`ORDER BY` のベクトルリテラルの実パース有無は
+/// Describe が返す列を変えない。
 ///
-/// 対象ビヘイビア: Issue #935・WIRE-12・TASK-217。PR #1012 Cursor Bugbot 指摘
-/// 対応: `EngineCore::parse_sql_prepared` は Parse 時点（値未確定）の構造検証
-/// のため全 `$n` を固定ダミー値（`sql::params::substitute_dummy`）へ置換する。
-/// `ORDER BY <vec列> <=> $n` を含む文はこのダミー値がベクトルとして不正な
-/// ため、[`bind_in_session`] をそのまま呼ぶと Describe（Bind 前）が常に
-/// `22000` で失敗していた——通常の実行系（[`bind_in_session`]）はこの省略を
-/// 行わず常に実値を検証するため、実行時の意味論は変えない。
+/// `validate_vector_literal` が `true`（実リテラルを持つ通常の Describe
+/// 呼び出し）の場合は [`bind_in_session`] と同じくベクトルリテラル文字列の
+/// 実パース（[`parse_vector_literal`] による形式・次元・非有限値・64 KiB
+/// 上限検証）を行う。`false`（`EngineCore::describe_prepared_in_session` 専用。
+/// 対象ビヘイビア: Issue #935・WIRE-12・TASK-217）の場合に限り、対象列が
+/// テーブルの `VECTOR` 列であることの構造検証のみに留めこの実パースを省略
+/// する——`EngineCore::parse_sql_prepared` は Parse 時点（値未確定）の構造
+/// 検証のため全 `$n` を固定ダミー値（`sql::params::substitute_dummy`）へ
+/// 置換しており、`ORDER BY <vec列> <=> $n` を含む文はこのダミー値がベクトル
+/// として不正なため実パースを省略しなければ Describe（Bind 前）が常に
+/// `22000` で失敗する（PR #1012 レビュー指摘対応: 実リテラルを持つ通常の
+/// 呼び出しではこの省略を行わず常に実値を検証し、Execute まで検証が遅延して
+/// 既存のエラー契約が壊れるのを防ぐ）。
 pub(crate) fn bind_projection_for_describe(
     stmt: &ValidatedStatement,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
+    validate_vector_literal: bool,
 ) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
     if let Some(literal) = &stmt.search_mode {
         SearchMode::parse_literal(literal)?;
@@ -1059,7 +1065,7 @@ pub(crate) fn bind_projection_for_describe(
     let (_metadata_filters, _expr_filters, _rls_predicate_present) =
         bind_where_predicates(&stmt.where_predicates, schema, udfs, &mut node_budget)?;
 
-    let _ranking = bind_ranking(&stmt.order_by, schema, false)?;
+    let _ranking = bind_ranking(&stmt.order_by, schema, validate_vector_literal)?;
     let _limit = validate_search_limit(stmt.limit)?;
 
     Ok(projection)

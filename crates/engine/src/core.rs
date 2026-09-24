@@ -2350,7 +2350,16 @@ impl EngineCore {
         prepared: &PreparedSql,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
-        self.describe_parsed_in_session(session, &prepared.dummy_parsed)
+        // `prepared.dummy_parsed` は Parse 時点（値未確定）の構造検証のため
+        // 全 `$n` を固定ダミー値へ置換した `ParsedSql` であり、ダミー値は
+        // ベクトルリテラルとして不正でありうる。実パラメータを持たないこの
+        // 専用経路に限り `describe_parsed_in_session_impl` の
+        // `skip_vector_literal_validation` を `true` にして値検証を省略する
+        // （PR #1012 レビュー指摘対応: 実リテラルを持つ通常の
+        // `describe_parsed_in_session` 呼び出しでは常に `false` を渡し、
+        // 従来どおり `parse_vector_literal` による形式・次元・非有限値・
+        // 64 KiB 上限検証を Describe 時に行う契約を維持する）。
+        self.describe_parsed_in_session_impl(session, &prepared.dummy_parsed, true)
     }
 
     /// [`Self::parse_sql`] が返した [`ParsedSql`] を実行する（Issue #933・
@@ -2452,6 +2461,26 @@ impl EngineCore {
         parsed: &ParsedSql,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
+        // 実リテラルを持つ通常の呼び出し（wire-server の Describe・単体テスト
+        // 等）は常に値検証を行う（`skip_vector_literal_validation = false`）。
+        // ダミー値専用の縮退は `describe_prepared_in_session` のみが使う
+        // （PR #1012 レビュー指摘対応。詳細は同メソッドのコメント参照）。
+        self.describe_parsed_in_session_impl(session, parsed, false)
+    }
+
+    /// [`Self::describe_parsed_in_session`]／[`Self::describe_prepared_in_session`]
+    /// が共有する実装本体。`skip_vector_literal_validation` が `true` のときのみ
+    /// `ORDER BY` のベクトルリテラルの実パース（`parse_vector_literal` による
+    /// 形式・次元・非有限値・64 KiB 上限検証）を省略する——`prepared.dummy_parsed`
+    /// のような実パラメータを持たない構造検証専用の `ParsedSql` を Describe する
+    /// 場合に限る（Issue #935・WIRE-12・TASK-217。PR #1012 レビュー指摘対応）。
+    fn describe_parsed_in_session_impl(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        parsed: &ParsedSql,
+        skip_vector_literal_validation: bool,
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
+    {
         use crate::sql::allowlist::{DeleteStatement, Statement, ValidatedUpdateForm};
 
         match parsed {
@@ -2540,14 +2569,19 @@ impl EngineCore {
                     // `USING MODE` の解決（クエリ句 > セッション変数）は結果列に
                     // 影響しないため Describe では不要——ただし `bind_in_session`
                     // が行うリテラル形式検証はここでは行わない代わりに
-                    // `bind_projection_for_describe` が同じ検証を担う。`ORDER BY`
-                    // のベクトルリテラルだけは構造検証に留め実パースを省略する
-                    // （PR #1012 Cursor Bugbot 指摘対応。詳細は
-                    // `sql::parser::bind_projection_for_describe` 参照）。
+                    // `bind_projection_for_describe` が同じ検証を担う。
+                    // `skip_vector_literal_validation` が `true`（ダミー値専用の
+                    // `describe_prepared_in_session` 経由）の場合に限り、`ORDER BY`
+                    // のベクトルリテラルは構造検証に留め実パースを省略する。
+                    // 実リテラルを持つ通常の Describe（`skip_vector_literal_validation
+                    // == false`）は従来どおり `parse_vector_literal` による形式・
+                    // 次元・非有限値・64 KiB 上限検証を行う（PR #1012 レビュー指摘
+                    // 対応。詳細は `sql::parser::bind_projection_for_describe` 参照）。
                     let projection = crate::sql::parser::bind_projection_for_describe(
                         validated,
                         &schema,
                         session.udfs(),
+                        !skip_vector_literal_validation,
                     )?;
                     Ok(Some(crate::sql::describe::projected_columns(
                         &projection,

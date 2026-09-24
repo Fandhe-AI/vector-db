@@ -305,14 +305,33 @@ pub fn decode_bind_values(
     // 複製より前に借用済みスライスの長さだけを見て checked 演算で確定
     // させる。未参照の $n（`tokens` に一切現れない番号）の値はここでも
     // 一切参照されないため、集計・複製いずれのコストにも計上されない。
+    //
+    // codex-review P2（Issue #935 PR #1012 指摘）: `$n` 以外のトークン
+    // （識別子・既存の文字列リテラル・数値リテラル等）が置換後のトークン列に
+    // 残す分のバイト長もここで加算する。これを含めないと、`total`（束縛値の
+    // 長さのみ）は `MAX_INPUT_LEN` 以内でも、置換後のトークン列全体（元の
+    // SQL テキストに由来する非 `Param` 部分＋束縛値）が実質的にこの上限を
+    // 超えうる（`tokenize_with_params` が検証する「元の SQL テキストの長さ」
+    // と「置換後のトークン列が表す総バイト長」は別物であるため）。
     let mut total: usize = 0;
     for token in tokens {
-        let Token::Param(n) = token else { continue };
-        let idx = usize::from(*n).checked_sub(1);
-        let len = idx
-            .and_then(|i| borrowed.get(i))
-            .map(|s| s.len())
-            .unwrap_or(0);
+        let len = match token {
+            Token::Param(n) => {
+                let idx = usize::from(*n).checked_sub(1);
+                idx.and_then(|i| borrowed.get(i))
+                    .map(|s| s.len())
+                    .unwrap_or(0)
+            }
+            Token::Ident(s) | Token::StringLiteral(s) | Token::Number(s) => s.len(),
+            Token::QualifiedIdent { qualifier, name } => {
+                qualifier.len().checked_add(name.len()).ok_or_else(|| {
+                    SqlSurfaceError::payload_too_large(
+                        "substituted parameter payload size overflowed",
+                    )
+                })?
+            }
+            Token::Keyword(_) | Token::Punct(_) | Token::DistanceOp | Token::Le | Token::Ge => 0,
+        };
         total = total.checked_add(len).ok_or_else(|| {
             SqlSurfaceError::payload_too_large("substituted parameter payload size overflowed")
         })?;
@@ -650,5 +669,27 @@ mod tests {
         let tokens = tokenize_with_params("WHERE lang = $2").expect("tokenize should succeed");
         let err = decode_bind_values(&tokens, &[None, Some(b"ja".to_vec())]).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn decode_bind_values_counts_non_param_token_bytes_toward_the_limit() {
+        // codex-review P2（Issue #935 PR #1012 指摘）の回帰: 置換後総バイト長の
+        // 判定が束縛値（`$n`）の長さのみを合計し、元トークン列に残る非
+        // `Param` 部分（ここでは巨大な既存文字列リテラル）を含めないままだと、
+        // この文字列リテラルだけで `lexer::MAX_INPUT_LEN` 近くまで達していても
+        // 小さな束縛値を足すだけの拒否漏れが起きる（`total` が値の長さのみを
+        // 数えていた旧実装ではこのテストは失敗していた）。
+        let big_literal_len = lexer::MAX_INPUT_LEN - 64;
+        let sql = format!("'{}' AND lang = $1", "x".repeat(big_literal_len));
+        assert!(
+            sql.len() <= lexer::MAX_INPUT_LEN,
+            "test setup must keep the original SQL text within tokenize_with_params's own limit"
+        );
+        let tokens = tokenize_with_params(&sql).expect("tokenize should succeed");
+        // 束縛値自体は小さいが、既存の巨大な文字列リテラルと合算すると
+        // `MAX_INPUT_LEN` を超える。
+        let small_value = "y".repeat(128);
+        let err = decode_bind_values(&tokens, &[Some(small_value.into_bytes())]).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 }
