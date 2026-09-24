@@ -246,8 +246,6 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
   生成し直す・ユーザーストアと同じ内容から導出する、といった運用は
   未知ユーザーの存在を推測させる情報漏えいに繋がるため避けてください）。
 
-
-
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 
 secret ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md`
