@@ -94,6 +94,7 @@
 //! TASK-153（対象ビヘイビア ERR-1: ErrorResponse 正式写像）。
 
 pub mod auth;
+pub mod auth_method_opt;
 pub mod bind_guard;
 pub mod durability_opt;
 pub mod error_response;
