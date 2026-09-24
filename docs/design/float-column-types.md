@@ -150,6 +150,32 @@ Issue #891〜#896 の担当範囲は、本 Issue では振る舞いを追加せ�
 - 文字列リテラルからの暗黙変換と `22P02` の新設
 - `ALTER COLUMN TYPE` による REAL→DOUBLE の拡大変換（TABLE-19・#901）
 
+## SET 事前検証とテナント境界（codex-review 指摘・PR #1007）
+
+`tenant.rs::validate_set_assignments`（対象行探索より前の SET 値検証）は
+REAL／DOUBLE PRECISION の固定長エントリ（presence 込みで REAL 5 bytes・
+DOUBLE 9 bytes）を累計スカラーペイロード上限へ加算する（Issue #882 レビュー
+指摘）。一方、nullable な REAL／DOUBLE 列の `NULL`→値ありという presence
+バイト数の増分（REAL: 1→5 bytes・DOUBLE: 1→9 bytes）自体は、対象行に
+**既に格納されている未変更列**の payload と組み合わさって初めて上限を
+超えるケースであり、これは単一行 UPDATE の「未変更 TEXT 列との組み合わせで
+上限超過（判断 D 再改訂・`docs/design/update-single-row.md`）」と同じ内容
+依存クラスに属する。既存の受け入れ済み契約どおり、内容依存の処理
+（`merge_encode_scalar_columns` を含む）は `is_owner && is_visible` を満たす
+行にのみ実行され、それ以外（RLS 不可視・未存在・他テナント所有）は内容に
+触れず `UPDATE 0` と区別できない。述語 UPDATE（`update_rows_where_unchecked`）
+の候補列挙スコープはテナント所有のみ（RLS 可視性フィルタではない）ため、
+他テナント行はそもそも候補にならない。回帰は
+`tenant.rs::update_row_columns_nullable_real_null_to_value_transition_
+overflow_matches_visibility_parity`・
+`update_rows_where_unchecked_nullable_real_null_to_value_transition_overflow`
+参照。
+
+ファイル形 `INSERT`（`path`／`body` の TEXT 列専用チャンク化・埋め込み経路）
+は他の追加スカラー型（BOOLEAN・DATE・ARRAY・BYTEA・JSON・ENUM・NUMERIC）と
+同様に REAL／DOUBLE PRECISION 列も対象外として拒否する
+（`sql::parser::bind_file_insert`）。
+
 ## 破壊的変更
 
 `row_codec::scan_scalar_columns`／`scan_scalar_columns_masked` の戻り値型が
