@@ -251,6 +251,9 @@ pub mod rls;
 pub mod row_codec;
 pub mod scoring_boost;
 pub mod search_engine;
+/// 自作 SHA-256（Issue #956 で `recovery::content_hash` から切り出し公開化。
+/// wire-server の TLS 1.3 鍵スケジュール〔HKDF〕が下敷きとして利用する）。
+pub mod sha256;
 pub mod sparse;
 pub(crate) mod sq8;
 pub mod sql;
