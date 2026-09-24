@@ -676,6 +676,11 @@ fn encode_message(
     body_fn(&mut body)?;
     let len =
         u32::try_from(body.len()).map_err(|_| HandshakeError::Encode("body length overflow"))?;
+    // 長さ検証を `out` への書き込み前に行う（all-or-nothing 契約。#953 指摘）。
+    // `put_u24` の失敗時に type バイトだけが `out` に残ることを防ぐ。
+    if len > MAX_HANDSHAKE_WIRE_BODY_LEN {
+        return Err(HandshakeError::Encode("24-bit length field overflow"));
+    }
     out.push(msg_type.as_u8());
     put_u24(out, len)?;
     out.extend_from_slice(&body);
@@ -696,6 +701,10 @@ impl RawHandshake {
     pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), HandshakeError> {
         let len = u32::try_from(self.body.len())
             .map_err(|_| HandshakeError::Encode("body length overflow"))?;
+        // encode_message と同じ all-or-nothing 契約: 検証を書き込み前に行う（#953 指摘）。
+        if len > MAX_HANDSHAKE_WIRE_BODY_LEN {
+            return Err(HandshakeError::Encode("24-bit length field overflow"));
+        }
         out.push(self.msg_type.as_u8());
         put_u24(out, len)?;
         out.extend_from_slice(&self.body);
@@ -1359,6 +1368,33 @@ mod tests {
             .expect_err("must reject oversized session id");
         assert!(matches!(err, HandshakeError::Encode(_)));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn certificate_encode_rejects_body_exceeding_24bit_length_without_partial_write() {
+        // #953 レビュー指摘: `encode_message` が `MAX_HANDSHAKE_WIRE_BODY_LEN` 超過を
+        // 検出する前に type バイトを `out` へ書き込んでいたため、失敗時に `out` が
+        // 部分的に変更される（all-or-nothing 契約違反）不変条件破りがあった。
+        // `certificate_request_context`（255 バイト）＋各種長さ接頭辞を足すと
+        // 本体全体が `MAX_HANDSHAKE_WIRE_BODY_LEN` をわずかに超えるように
+        // `cert_data` を構成し、`out` が失敗前後で完全に無変更のままであることを固定する。
+        let cert_data = vec![0u8; MAX_HANDSHAKE_WIRE_BODY_LEN as usize];
+        let certificate = Certificate {
+            certificate_request_context: vec![0u8; 255],
+            certificate_list: vec![CertificateEntry {
+                cert_data,
+                extensions: Vec::new(),
+            }],
+        };
+        let mut out = Vec::new();
+        let err = certificate
+            .encode_into(&mut out)
+            .expect_err("must reject body exceeding 24-bit length field");
+        assert!(matches!(err, HandshakeError::Encode(_)));
+        assert!(
+            out.is_empty(),
+            "encode failure must not leave partial output"
+        );
     }
 
     // ---- 5.3 再組み立て ----
