@@ -93,6 +93,7 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
         ColumnType::Text => Ok(idx),
         ColumnType::Vector(_)
         | ColumnType::Boolean
+        | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
         | ColumnType::Jsonb => Err(SqlSurfaceError::invalid_input(format!(

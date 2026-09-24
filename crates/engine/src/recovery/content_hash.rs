@@ -221,9 +221,33 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(7);
             b.push_u8(u8::from(*b_val));
         }
-        // タグ 8〜10 は DATE/TIMESTAMP/NUMERIC（並行実装中の別 Issue）向けに予約し、
-        // BYTEA は TABLE-13 の宣言順で 11 とする（Issue #886。長さ前置は Text と
-        // 同じ方式で、型タグの違いだけでハッシュを区別する）。
+        // タグ 8・9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約し、配列列
+        // （TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
+        // 積むことで、`{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが
+        // 衝突しない単射なハッシュ入力にする。
+        Value::Array(array_value) => {
+            b.push_u8(10);
+            match array_value {
+                crate::row_codec::ArrayValue::Text(items) => {
+                    b.push_u8(0); // 要素型タグ: TEXT
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        b.push_bytes(item.as_bytes())?;
+                    }
+                }
+                crate::row_codec::ArrayValue::Bool(items) => {
+                    b.push_u8(1); // 要素型タグ: BOOLEAN
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        b.push_u8(u8::from(*item));
+                    }
+                }
+            }
+        }
+        // タグ 8・9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約し、10 は
+        // ARRAY（Issue #888）が使用済みのため、BYTEA は TABLE-13 の宣言順で
+        // 11 とする（Issue #886。長さ前置は Text と同じ方式で、型タグの
+        // 違いだけでハッシュを区別する）。
         Value::Bytes(bytes) => {
             b.push_u8(11);
             b.push_bytes(bytes)?;
@@ -1273,6 +1297,38 @@ mod tests {
         let h_public = for_typed_insert(7, Visibility::Public, &embedding, &cols).expect("hash");
         let h_private = for_typed_insert(7, Visibility::Private, &embedding, &cols).expect("hash");
         assert_ne!(h_public, h_private);
+    }
+
+    /// 配列列（TABLE-14・Issue #888・D-A9）のハッシュ入力が単射であること。
+    /// `{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが衝突しないこと、
+    /// 同一内容は同一ハッシュになることを固定する。
+    #[test]
+    fn for_typed_insert_array_value_is_injective_and_deterministic() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let one_elem = Value::Array(crate::row_codec::ArrayValue::Text(vec!["ab".to_string()]));
+        let two_elems = Value::Array(crate::row_codec::ArrayValue::Text(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]));
+        let cols_one: [(&str, &Value); 1] = [("tags", &one_elem)];
+        let cols_two: [(&str, &Value); 1] = [("tags", &two_elems)];
+        let h_one = for_typed_insert(7, Visibility::Public, &embedding, &cols_one).expect("hash");
+        let h_two = for_typed_insert(7, Visibility::Public, &embedding, &cols_two).expect("hash");
+        assert_ne!(
+            h_one, h_two,
+            "{{ab}} (1 element) and {{a,b}} (2 elements) must not collide"
+        );
+
+        // 同一内容の再送は同一ハッシュ（決定性）。
+        let h_one_again =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_one).expect("hash");
+        assert_eq!(h_one, h_one_again);
+
+        // 要素型が異なれば（同じ見た目の値でも）別ハッシュになること。
+        let bool_elems = Value::Array(crate::row_codec::ArrayValue::Bool(vec![true, false]));
+        let cols_bool: [(&str, &Value); 1] = [("tags", &bool_elems)];
+        let h_bool = for_typed_insert(7, Visibility::Public, &embedding, &cols_bool).expect("hash");
+        assert_ne!(h_two, h_bool);
     }
 
     // Issue #771: `for_typed_insert_batch` は要求記載順を入力に含めるため、

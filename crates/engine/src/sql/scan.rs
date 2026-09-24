@@ -126,6 +126,25 @@ fn try_clone_embedding_for_budget(
     Ok(owned)
 }
 
+/// 配列セルの選択的複製（累計バイト量を確保前に検証。上記テキスト・ベクトル版と
+/// 同方針。Issue #888）。
+fn try_alloc_array_for_budget(
+    array_ref: row_codec::ArrayRef<'_>,
+    budget: &mut usize,
+    cap: usize,
+) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
+    // 要素本文（`payload_bytes`。TEXT 要素の実体を含む）に加え、`Vec<String>`
+    // の構造体分（`String` 1 個あたり）も計上する（`sql::exec` の同名ヘルパーと
+    // 同じ理由。Issue #888 レビュー指摘対応）。
+    let approx_bytes = array_ref
+        .payload_bytes()
+        .saturating_add((array_ref.count() as usize).saturating_mul(std::mem::size_of::<String>()));
+    *budget = try_accumulate_budget(*budget, approx_bytes, cap)?;
+    array_ref.to_value().map_err(|e| SqlSurfaceError::Internal {
+        detail: format!("failed to decode array field: {e}"),
+    })
+}
+
 /// BYTEA セルの選択的複製（累計バイト量を確保前に検証。上記テキスト版と同方針。
 /// UTF-8 検証を行わない点のみ異なる。Issue #886）。
 fn try_alloc_bytes_for_budget(
@@ -179,6 +198,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         ColumnType::Vector(_) => needs_embedding = true,
                         ColumnType::Text
                         | ColumnType::Boolean
+                        | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
                         | ColumnType::Jsonb => {
@@ -483,6 +503,22 @@ pub fn execute_scan(
                                         "BOOLEAN column scan yielded a non-Boolean scalar value",
                                     )),
                                 },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Array(_) => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Array(array_ref))) => {
+                                    let value = try_alloc_array_for_budget(
+                                        *array_ref,
+                                        &mut byte_budget,
+                                        MAX_SCAN_RESULT_BYTES,
+                                    )?;
+                                    cells.push(Cell::Array(value));
+                                }
+                                Some(Some(_)) => {
+                                    return Err(scan_bug(
+                                        "ARRAY column scan yielded a non-Array scalar value",
+                                    ))
+                                }
                                 Some(None) | None => cells.push(Cell::Null),
                             },
                             ColumnType::Bytea => match scanned.get(*index) {
