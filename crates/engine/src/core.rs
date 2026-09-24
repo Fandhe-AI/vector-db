@@ -1218,6 +1218,34 @@ pub enum ParsedSql {
     Update(crate::sql::allowlist::ValidatedUpdateForm),
 }
 
+/// [`EngineCore::parse_sql_prepared`] の結果（Issue #935・WIRE-12・TASK-217）。
+/// 拡張クエリプロトコルの Parse が `$n` を含む SQL テキストを値未確定のまま
+/// 構造検証した「束縛前テンプレート」を運ぶ。行・台帳・世代のいずれにも触れて
+/// いない。[`EngineCore::bind_prepared`]（Bind。実値を束縛して [`ParsedSql`] を
+/// 得る）・[`EngineCore::describe_prepared_in_session`]（Describe。値未確定の
+/// ままダミー値束縛済みの結果を再利用する）の入力になる。
+///
+/// フィールドは非公開（構築は [`EngineCore::parse_sql_prepared`] のみ）。値は
+/// 常に `tokens` 内の [`crate::sql::lexer::Token::StringLiteral`]（Bind 時に
+/// 置換されるまでは `Token::Param`）としてのみ保持され、SQL テキストへは
+/// 一度も戻らない（インジェクション経路を作らない設計。`sql::params`
+/// モジュールドキュメント参照）。
+#[derive(Debug, Clone)]
+pub struct PreparedSql {
+    tokens: Vec<crate::sql::lexer::Token>,
+    param_count: u16,
+    dummy_parsed: ParsedSql,
+}
+
+impl PreparedSql {
+    /// 文が要求するパラメータ数（`$n` の最大番号。1 始まり。`$n` を含まない
+    /// 文は 0）。[`EngineCore::bind_prepared`] に渡す `values` の個数と一致する
+    /// 必要がある。
+    pub fn param_count(&self) -> u16 {
+        self.param_count
+    }
+}
+
 struct InsertSchemaLookup<'a> {
     storage: &'a Storage,
     cached: std::cell::RefCell<Option<(String, TableSchema)>>,
@@ -2179,63 +2207,150 @@ impl EngineCore {
         &self,
         sql: &str,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
-        if let Ok(tokens) = crate::sql::lexer::tokenize(sql) {
-            let is_insert_statement = matches!(
-                tokens.first(),
-                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("INSERT")
-            );
-            if is_insert_statement {
-                let lookup = InsertSchemaLookup::new(&self.storage);
-                let stmt = crate::sql::allowlist::validate_insert_tokens(
-                    &tokens,
-                    &lookup,
-                    self.ledger_mode,
-                )?;
-                return Ok(ParsedSql::Insert(stmt));
-            }
+        let tokens = crate::sql::lexer::tokenize(sql)?;
+        self.parse_tokens(tokens)
+    }
 
-            let is_truncate_statement = matches!(
-                tokens.first(),
-                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("TRUNCATE")
-            );
-            if is_truncate_statement {
-                let stmt = crate::sql::allowlist::validate_truncate_tokens(
-                    &tokens,
-                    &self.storage,
-                    self.ledger_mode,
-                )?;
-                return Ok(ParsedSql::Truncate(stmt));
-            }
-
-            let is_delete_statement = matches!(
-                tokens.first(),
-                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DELETE")
-            );
-            if is_delete_statement {
-                let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
-                    &tokens,
-                    &self.storage,
-                    self.ledger_mode,
-                )?;
-                return Ok(ParsedSql::Delete(stmt));
-            }
-
-            let is_update_statement = matches!(
-                tokens.first(),
-                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("UPDATE")
-            );
-            if is_update_statement {
-                let stmt = crate::sql::allowlist::validate_update_form_tokens(
-                    &tokens,
-                    &self.storage,
-                    self.ledger_mode,
-                )?;
-                return Ok(ParsedSql::Update(stmt));
-            }
+    /// [`Self::parse_sql`] の字句解析済みトークン列版（Issue #935・WIRE-12。
+    /// `sql::allowlist::validate_sql`/`validate_sql_tokens` の分割と同じ理由）。
+    /// [`Self::parse_sql_prepared`]・[`Self::bind_prepared`] が、拡張クエリ
+    /// プロトコルの `$n` を実値の `Token::StringLiteral` へ置換したトークン列を
+    /// SQL テキストへ戻さずここへ直接渡すための入口（第 2 の実行器を作らない
+    /// 設計）。判定順序・エラー分類は [`Self::parse_sql`] と完全に同一
+    /// （[`Self::parse_sql`] は字句解析した上でここへ委譲するだけの薄い
+    /// ラッパーになった）。
+    fn parse_tokens(
+        &self,
+        tokens: Vec<crate::sql::lexer::Token>,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let is_insert_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("INSERT")
+        );
+        if is_insert_statement {
+            let lookup = InsertSchemaLookup::new(&self.storage);
+            let stmt =
+                crate::sql::allowlist::validate_insert_tokens(&tokens, &lookup, self.ledger_mode)?;
+            return Ok(ParsedSql::Insert(stmt));
         }
 
-        let stmt = crate::sql::allowlist::validate_sql(sql, &self.storage)?;
+        let is_truncate_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("TRUNCATE")
+        );
+        if is_truncate_statement {
+            let stmt = crate::sql::allowlist::validate_truncate_tokens(
+                &tokens,
+                &self.storage,
+                self.ledger_mode,
+            )?;
+            return Ok(ParsedSql::Truncate(stmt));
+        }
+
+        let is_delete_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DELETE")
+        );
+        if is_delete_statement {
+            let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
+                &tokens,
+                &self.storage,
+                self.ledger_mode,
+            )?;
+            return Ok(ParsedSql::Delete(stmt));
+        }
+
+        let is_update_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("UPDATE")
+        );
+        if is_update_statement {
+            let stmt = crate::sql::allowlist::validate_update_form_tokens(
+                &tokens,
+                &self.storage,
+                self.ledger_mode,
+            )?;
+            return Ok(ParsedSql::Update(stmt));
+        }
+
+        let stmt = crate::sql::allowlist::validate_sql_tokens(tokens, &self.storage)?;
         Ok(ParsedSql::Statement(stmt))
+    }
+
+    /// Parse（拡張クエリプロトコルの 'P' 種別。Issue #935・WIRE-12・TASK-217）:
+    /// `$n` を含みうる SQL テキストを構造検証だけ行い、実行（行・台帳・世代への
+    /// 到達）は一切行わない。値はまだ受け取っていないため、各 `$n` は位置に
+    /// 依存しない固定ダミー値へ一時的に置換したうえで構造検証を通す
+    /// （`sql::params` モジュールドキュメント参照。ダミー置換後の `Statement` は
+    /// 破棄せず [`PreparedSql::dummy_parsed`] として Describe 専用に保持する——
+    /// 実行には決して使わない）。
+    ///
+    /// `$n` が [`crate::sql::params`] の許可位置以外に現れる場合・パラメータ番号が
+    /// 上限を超える場合のエラーは通常の構造検証エラーと同じ分類
+    /// （`42601`／`54000`）で返る。`$n` を含まない SQL は
+    /// [`Self::parse_sql`] と完全に同一の結果を `param_count() == 0` として包む。
+    pub fn parse_sql_prepared(
+        &self,
+        sql: &str,
+    ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
+        let param_count = crate::sql::params::validate_param_positions(&tokens)?;
+        let dummy_tokens = crate::sql::params::substitute_dummy(&tokens);
+        let dummy_parsed = self.parse_tokens(dummy_tokens)?;
+        Ok(PreparedSql {
+            tokens,
+            param_count,
+            dummy_parsed,
+        })
+    }
+
+    /// Bind（拡張クエリプロトコルの 'B' 種別。Issue #935・WIRE-12・TASK-217）:
+    /// [`Self::parse_sql_prepared`] が返したテンプレートへ、実値（テキスト形式。
+    /// バイナリ形式パラメータは wire 層が `0A000` で拒否済みの前提）を束縛し、
+    /// [`Self::parse_sql`] が SQL テキストから直接返すのと**完全に同一**の
+    /// [`ParsedSql`] を返す（第 2 の実行器を作らない設計。実行・Describe は
+    /// 以降すべて既存の [`Self::execute_parsed_in_session`]／
+    /// [`Self::describe_parsed_in_session`] を通る）。
+    ///
+    /// `values` は `$1` から順に対応する実値（NULL は `None`。本バージョンでは
+    /// スコープ外として `22000` で拒否する。詳細は `sql::params` モジュール
+    /// ドキュメント参照）。個数が [`PreparedSql::param_count`] と一致しない場合は
+    /// `22000`（wire 層は Bind メッセージ自体の値件数検証で `08P01` を先に返す
+    /// 契約のため、ここでの不一致検出は防御的な保険）。
+    pub fn bind_prepared(
+        &self,
+        prepared: &PreparedSql,
+        values: &[Option<Vec<u8>>],
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        if values.len() != prepared.param_count as usize {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                format!(
+                    "expected {} bind value(s), got {}",
+                    prepared.param_count,
+                    values.len()
+                ),
+            ));
+        }
+        let decoded = crate::sql::params::decode_bind_values(&prepared.tokens, values)?;
+        let substituted = crate::sql::params::substitute_values(&prepared.tokens, &decoded)?;
+        self.parse_tokens(substituted)
+    }
+
+    /// Describe(statement)（拡張クエリプロトコルの 'D' 種別 S。Issue #935・
+    /// WIRE-12・TASK-217）: [`Self::parse_sql_prepared`] が Parse 時点で構築した
+    /// ダミー値束縛済みの [`ParsedSql`] をそのまま
+    /// [`Self::describe_parsed_in_session`] へ渡す。値が未確定な段階（Bind 前）
+    /// でも呼べる契約を維持するため、実際のパラメータ値は一切参照しない
+    /// （投影列の形はどの `$n` 値を束縛しても変わらない——列名・型は列挙型
+    /// `Statement`/`ValidatedInsert` 等の構造にのみ依存し、リテラル値には
+    /// 依存しないため、ダミー値での導出結果は実値束縛後と常に一致する）。
+    pub fn describe_prepared_in_session(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        prepared: &PreparedSql,
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        self.describe_parsed_in_session(session, &prepared.dummy_parsed)
     }
 
     /// [`Self::parse_sql`] が返した [`ParsedSql`] を実行する（Issue #933・

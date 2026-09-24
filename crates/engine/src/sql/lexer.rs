@@ -56,6 +56,15 @@ pub enum Token {
         qualifier: String,
         name: String,
     },
+    /// 拡張クエリプロトコルのパラメータプレースホルダ `$n`（1 始まり。
+    /// Issue #935・WIRE-12・TASK-217）。既定の [`tokenize`] は本トークンを一切
+    /// 生成せず、`$` を引き続き「未対応文字」として拒否する
+    /// （[`tests::rejects_dollar_parameter_placeholder`] で固定）。生成するのは
+    /// [`tokenize_with_params`] のみで、生成した `Param` を消費するのは
+    /// `sql::params`（Bind 時に実値の [`Token::StringLiteral`] へ置換する）に
+    /// 限られる。`sql::allowlist::Parser`（許可リスト構造検証）はこの variant を
+    /// 一切知らない設計（置換後のトークン列のみを見る）。
+    Param(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,8 +118,26 @@ pub const MAX_INPUT_LEN: usize = 1_048_576;
 pub const MAX_TOKEN_COUNT: usize = 20_000;
 
 /// SQL テキストをトークン列へ変換する。`unwrap`/`expect`/添字アクセスを使わず、
-/// `chars()` イテレータの先読み（`Peekable`）のみで走査する。
+/// `chars()` イテレータの先読み（`Peekable`）のみで走査する。`$n` プレースホルダ
+/// （Issue #935・WIRE-12）は常に「未対応文字」として拒否する（[`tokenize_with_params`]
+/// のみが受理する。両者は [`tokenize_impl`] を共有し、この関数の既存の受理・拒否
+/// 契約は一切変えない）。
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
+    tokenize_impl(input, false)
+}
+
+/// [`tokenize`] の `$n` プレースホルダ対応版（Issue #935・WIRE-12・TASK-217）。
+/// 拡張クエリプロトコルの Parse（`sql::params`）だけがこの関数を呼ぶ。簡易クエリ
+/// プロトコル・許可リスト構造検証（`sql::allowlist`）は引き続き [`tokenize`]
+/// （`$` を拒否する既定の字句解析）を使う。
+pub fn tokenize_with_params(input: &str) -> Result<Vec<Token>, LexError> {
+    tokenize_impl(input, true)
+}
+
+/// [`tokenize`]／[`tokenize_with_params`] が共有する走査本体。`allow_params` が
+/// `false` の場合の受理・拒否契約は本分割の前と完全に同一（`$` は下の「未対応
+/// 文字」へフォールスルーする）。
+fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError> {
     if input.len() > MAX_INPUT_LEN {
         return Err(LexError {
             message: format!("input too large: {} bytes", input.len()),
@@ -233,6 +260,16 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
         if c.is_ascii_digit() {
             let (number, next_offset) = lex_number(input, offset);
             tokens.push(Token::Number(number));
+            advance_to(&mut chars, next_offset);
+            continue;
+        }
+
+        // `$n`（Issue #935・WIRE-12）: `allow_params` が `false` のとき（既定の
+        // `tokenize`）は何もせずこの if を素通りし、下の「未対応文字」へ
+        // フォールスルーする（既存契約を変えない）。
+        if c == '$' && allow_params {
+            let (index, next_offset) = lex_param(input, offset)?;
+            tokens.push(Token::Param(index));
             advance_to(&mut chars, next_offset);
             continue;
         }
@@ -374,6 +411,77 @@ fn lex_number(input: &str, start: usize) -> (String, usize) {
     }
     let word = rest.get(..end).unwrap_or_default().to_string();
     (word, start + end)
+}
+
+/// `$<digits>`（Issue #935・WIRE-12）を読み取り、1 始まりのパラメータ番号を返す。
+/// 呼び出し元は `$` の位置（`start`）を確認済み。`sql::allowlist::Parser` は
+/// この形状を一切知らず、`sql::params` が Bind 時に置換するトークンとしてのみ
+/// 消費する。
+///
+/// - 数字が 1 桁も続かない（`$`・`$a`・`$$`）／先頭ゼロ（`$01`）／`$0` 自体は
+///   いずれも `LexError`（呼び出し元 `sql::allowlist` 経由で `42601`）。
+/// - 数字の直後に識別子継続文字（英数字・`_`）が続く形（`$1a`）も曖昧な形として
+///   `LexError` にする（1 文字先読みで確定させる。`lex_word` の `.` 先読みと同じ
+///   設計）。
+/// - 桁数字が `u16::MAX` を超える場合は `u16::MAX` へ飽和させる（未定義動作にせず
+///   `sql::params::MAX_PARAMS`（64）超過は呼び出し元が別途 `54000` で拒否するため、
+///   ここでの飽和は安全側に倒すだけでよい）。
+fn lex_param(input: &str, start: usize) -> Result<(u16, usize), LexError> {
+    let Some(rest) = input.get(start + 1..) else {
+        return Err(LexError {
+            message: "malformed parameter placeholder".to_string(),
+            byte_offset: start,
+        });
+    };
+    let mut chars = rest.char_indices().peekable();
+    let mut digits_end = 0usize;
+    while let Some(&(_, c)) = chars.peek() {
+        if c.is_ascii_digit() {
+            digits_end += c.len_utf8();
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if digits_end == 0 {
+        return Err(LexError {
+            message: "expected digits after $".to_string(),
+            byte_offset: start,
+        });
+    }
+    let digits = rest.get(..digits_end).unwrap_or_default();
+    if digits.len() > 1 && digits.starts_with('0') {
+        return Err(LexError {
+            message: "parameter placeholder must not have a leading zero".to_string(),
+            byte_offset: start,
+        });
+    }
+    if let Some(&(_, c)) = chars.peek() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            return Err(LexError {
+                message: "malformed parameter placeholder".to_string(),
+                byte_offset: start,
+            });
+        }
+    }
+    let mut value: u32 = 0;
+    for b in digits.bytes() {
+        // `digits` は上のループで ASCII 数字のみを集めたバイト列のため
+        // `b - b'0'` は必ず 0..=9 に収まる。
+        let d = u32::from(b.saturating_sub(b'0'));
+        value = value.saturating_mul(10).saturating_add(d);
+        if value > u32::from(u16::MAX) {
+            value = u32::from(u16::MAX);
+        }
+    }
+    if value == 0 {
+        return Err(LexError {
+            message: "$0 is not a valid parameter placeholder".to_string(),
+            byte_offset: start,
+        });
+    }
+    let end = start + 1 + digits_end;
+    Ok((value as u16, end))
 }
 
 fn lex_word(input: &str, start: usize) -> (String, usize) {
@@ -596,6 +704,62 @@ mod tests {
     #[test]
     fn rejects_dollar_parameter_placeholder() {
         assert!(tokenize("embedding <=> $1").is_err());
+    }
+
+    // --- tokenize_with_params（Issue #935・WIRE-12）---------------------------
+
+    #[test]
+    fn tokenize_with_params_accepts_placeholder() {
+        let tokens =
+            tokenize_with_params("embedding <=> $1").expect("tokenize_with_params should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("embedding".to_string()),
+                Token::DistanceOp,
+                Token::Param(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_with_params_parses_max_and_saturates_beyond_u16_max() {
+        let tokens = tokenize_with_params("$64").expect("tokenize should succeed");
+        assert_eq!(tokens, vec![Token::Param(64)]);
+
+        let tokens = tokenize_with_params("$65").expect("tokenize should succeed");
+        assert_eq!(tokens, vec![Token::Param(65)]);
+
+        // 桁数字が u16::MAX を超える巨大な入力でも panic せず飽和する
+        // （オーバーフローを未定義動作にしない。coding-rust.md）。
+        let huge = format!("${}", "9".repeat(30));
+        let tokens = tokenize_with_params(&huge).expect("tokenize should saturate, not panic");
+        assert_eq!(tokens, vec![Token::Param(u16::MAX)]);
+    }
+
+    #[test]
+    fn tokenize_with_params_rejects_malformed_placeholders() {
+        assert!(tokenize_with_params("$").is_err());
+        assert!(tokenize_with_params("$$").is_err());
+        assert!(tokenize_with_params("$a").is_err());
+        assert!(tokenize_with_params("$0").is_err());
+        assert!(tokenize_with_params("$01").is_err());
+        assert!(tokenize_with_params("$1a").is_err());
+    }
+
+    #[test]
+    fn tokenize_with_params_treats_dollar_digit_inside_string_literal_as_literal_text() {
+        let tokens =
+            tokenize_with_params("'$1'").expect("string literal content is not a placeholder");
+        assert_eq!(tokens, vec![Token::StringLiteral("$1".to_string())]);
+    }
+
+    #[test]
+    fn tokenize_without_params_still_rejects_dollar_even_via_shared_impl() {
+        // `tokenize`（`allow_params = false`）は `tokenize_impl` 分割の前後で
+        // 挙動が完全に不変であることを固定する（既存
+        // `rejects_dollar_parameter_placeholder` の重複確認）。
+        assert!(tokenize("$1").is_err());
     }
 
     #[test]

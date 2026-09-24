@@ -2633,6 +2633,19 @@ fn parse_create_function(tokens: &[Token]) -> Result<(String, Vec<String>, Expr)
 ///    （不存在は [`SqlSurfaceError::UndefinedTable`]）
 pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, SqlSurfaceError> {
     let tokens = lexer::tokenize(sql)?;
+    validate_sql_tokens(tokens, lookup)
+}
+
+/// [`validate_sql`] の字句解析済みトークン列版（Issue #935・WIRE-12）。
+/// `sql::params`（拡張クエリプロトコルの `$n` 束縛。Bind 時に `Token::Param` を
+/// 実値の `Token::StringLiteral` へ置換したトークン列を、SQL テキストを経由せず
+/// 直接この関数へ渡す入口）が、SQL テキスト経由の [`validate_sql`] と完全に同一の
+/// 判定順序・エラー分類を再利用するための分割（挙動は不変。[`validate_sql`] は
+/// 字句解析した上でここへ委譲するだけの薄いラッパーになった）。
+pub(crate) fn validate_sql_tokens(
+    tokens: Vec<Token>,
+    lookup: &impl TableLookup,
+) -> Result<Statement, SqlSurfaceError> {
     // `SET`・`CREATE` は字句解析段階のキーワードではなく `Ident` のため
     // （TASK-161・SQL-12 修正と同方針）、statement 先頭という文脈でのみ大文字小文字を
     // 区別せず判定する。
