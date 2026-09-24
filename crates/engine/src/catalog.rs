@@ -149,6 +149,11 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "uuid",
     "json",
     "jsonb",
+    // Cursor Bugbot 指摘（PR #1015）: 将来 SQL-23 の `CREATE TABLE` 型名解決で
+    // `ENUM`／`ARRAY` は列型構文のキーワードとして扱われる想定であり、
+    // ユーザー定義 ENUM 型名との曖昧さを避けるため予約する。
+    "enum",
+    "array",
 ];
 
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
@@ -1990,29 +1995,67 @@ fn list_tables_in_txn(read_txn: &redb::ReadTransaction) -> Result<Vec<String>> {
 /// 参照する列を含むかどうかを、完全デコード（[`decode_schema_with_resolver`]）
 /// を経由せずテキスト走査だけで判定する。`dependent_tables_in_txn` が
 /// `DROP TYPE`／`ALTER TYPE ... ADD VALUE`（テーブル世代の保守的な同時進行）の
-/// 双方から使う軽量な判定であり、完全なスキーマ復元・語彙解決は不要。
-/// 破損したカタログ値（UTF-8 でない等）は依存なしとして扱う
-/// （decode 側の通常経路が別途 `CorruptSchema` で拒否するため、ここで二重に
-/// エラーを送出する必要はない）。
-fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> bool {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return false;
-    };
-    for line in text.split('\n') {
+/// 双方から使う軽量な判定であり、完全なスキーマ復元・語彙解決は不要（`param`
+/// の識別子形式検証・`nullable` フィールドの値検証までは行わない）。
+/// ヘッダ行（フォーマットバージョン・列数）の形は [`decode_schema_body`] と
+/// 同じ想定で読み飛ばし、宣言列数ぶんの列行のみを検査する。
+/// 破損したカタログ値（UTF-8 でない・ヘッダ不正・列行のフィールド数不整合・
+/// 宣言列数に満たない等）は fail-closed で `Err(CatalogError::CorruptSchema)`
+/// として伝播する（codex-review P1 指摘・Issue #890: 破損を「依存なし」に
+/// 丸めると `drop_enum_type` が実際には参照されている ENUM 型を削除できて
+/// しまう。`decode_schema_body` と同じ fail-closed 方針をここでも徹底する）。
+fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<bool> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| CatalogError::CorruptSchema("catalog value is not valid UTF-8".to_string()))?;
+    let mut lines = text.split('\n');
+
+    let version_line = lines
+        .next()
+        .ok_or_else(|| CatalogError::CorruptSchema("catalog value is empty".to_string()))?;
+    if version_line != CATALOG_FORMAT_VERSION_LINE {
+        return Err(CatalogError::CorruptSchema(format!(
+            "unknown catalog format version: {version_line:?}"
+        )));
+    }
+
+    let cols_line = lines.next().ok_or_else(|| {
+        CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
+    })?;
+    let count_str = cols_line.strip_prefix("cols:").ok_or_else(|| {
+        CatalogError::CorruptSchema(format!("malformed cols line: {cols_line:?}"))
+    })?;
+    let col_count: usize = count_str.parse().map_err(|_| {
+        CatalogError::CorruptSchema(format!("malformed column count: {count_str:?}"))
+    })?;
+    if col_count > MAX_COLUMN_COUNT {
+        return Err(CatalogError::CorruptSchema(format!(
+            "too many columns: {col_count}"
+        )));
+    }
+
+    let mut found = false;
+    for _ in 0..col_count {
+        let line = lines.next().ok_or_else(|| {
+            CatalogError::CorruptSchema("catalog value truncated: missing column line".to_string())
+        })?;
         let mut fields = line.split(':');
         let (Some(_name), Some(tag), Some(param), Some(_nullable)) =
             (fields.next(), fields.next(), fields.next(), fields.next())
         else {
-            continue;
+            return Err(CatalogError::CorruptSchema(format!(
+                "malformed column line: {line:?}"
+            )));
         };
         if fields.next().is_some() {
-            continue;
+            return Err(CatalogError::CorruptSchema(format!(
+                "malformed column line: {line:?}"
+            )));
         }
         if tag == "enum" && param == type_name {
-            return true;
+            found = true;
         }
     }
-    false
+    Ok(found)
 }
 
 /// ENUM 型 `type_name` を参照する列を持つテーブル名の一覧を列挙する
@@ -2035,7 +2078,7 @@ fn dependent_tables_in_txn(
                 "too many tables: exceeds {MAX_LIST_TABLES}"
             )));
         }
-        if catalog_value_references_enum_type(value.value(), type_name) {
+        if catalog_value_references_enum_type(value.value(), type_name)? {
             dependents.push(key.value().to_string());
         }
     }

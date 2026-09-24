@@ -912,11 +912,22 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         })?
                         .to_string();
                     offset = text_end;
-                    // ENUM 列のデコードは語彙を検査しない（Issue #890 D3。
-                    // `ALTER TYPE ... ADD VALUE` 前に書いた行、または将来
-                    // ラベルが削除されない契約〔本実装は削除 API を持たない〕
-                    // により、常に格納済みの値をそのまま読める）。
-                    if matches!(column.ty, ColumnType::Enum(_)) {
+                    // ENUM 列は decode 時に現行語彙（`ALTER TYPE ... ADD VALUE`
+                    // で単調増加する `EnumTypeDef::labels`）との照合を行う
+                    // （codex-review P1 指摘・Issue #890: 破損行〔手書き・
+                    // バグ由来〕が持つ語彙外ラベルを `Value::Enum` として
+                    // 通すと、投影・等価フィルタ・二次索引へ任意文字列が
+                    // 流出しうるため）。ラベルは削除されない契約のため、
+                    // 過去に正当だった値は将来にわたって有効であり続ける
+                    // （this 検査は「現行スキーマの語彙に含まれるか」であり
+                    // 「書込み時点で有効だったか」を後退させるものではない）。
+                    if let ColumnType::Enum(def) = &column.ty {
+                        if !def.contains(&text) {
+                            return Err(RowCodecError::Invalid(format!(
+                                "enum value {text:?} is not a valid label of type {:?}",
+                                def.name()
+                            )));
+                        }
                         values.push(Value::Enum(text));
                     } else {
                         values.push(Value::Text(text));
@@ -1700,17 +1711,27 @@ fn scan_scalar_columns_validated<'a>(
                     // マスクで要求されなかった列（`validate_scalar_columns` 経由は常に
                     // 全列非要求）は、検証済みの `&str` を破棄して `None` を渡すことで
                     // `&str` 生成・保持コストのみを省略する（Issue #350: 必要列限定
-                    // デコード）。ENUM 列は decode 時に語彙検査しない（Issue #890 D3）。
+                    // デコード）。ENUM 列は要求・非要求を問わず現行語彙との照合を行う
+                    // （codex-review P1 指摘・Issue #890。`decode_row` の検査と同一
+                    // 契約。破損行の語彙外ラベルが投影・等価フィルタ・二次索引へ
+                    // 流出するのを構造検証のみのマスク非要求経路でも防ぐ）。
                     let text = std::str::from_utf8(text_bytes).map_err(|_| {
                         RowCodecError::Invalid("text field is not valid UTF-8".to_string())
                     })?;
-                    let is_enum = matches!(column.ty, ColumnType::Enum(_));
-                    if wanted {
-                        if is_enum {
+                    if let ColumnType::Enum(def) = &column.ty {
+                        if !def.contains(text) {
+                            return Err(RowCodecError::Invalid(format!(
+                                "enum value {text:?} is not a valid label of type {:?}",
+                                def.name()
+                            )));
+                        }
+                        if wanted {
                             sink(col_index, Some(ScalarRef::Enum(text)))?;
                         } else {
-                            sink(col_index, Some(ScalarRef::Text(text)))?;
+                            sink(col_index, None)?;
                         }
+                    } else if wanted {
+                        sink(col_index, Some(ScalarRef::Text(text)))?;
                     } else {
                         sink(col_index, None)?;
                     }

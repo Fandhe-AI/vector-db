@@ -83,13 +83,14 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // ない）ため、影響を受けるテーブルが構造的に存在せずバンプ対象がない。
     // Issue #890 実装後の base（main）マージ取り込み（ARRAY 列型・Issue #888）で
     // `catalog.rs` に行が追加され、以下 2 件の行番号がさらに移動したための追随
-    // （旧: 1403／1482）。
-    ("catalog.rs", 1506),
+    // （旧: 1403／1482）。PR #1015 レビュー対応（`RESERVED_TYPE_NAMES` へ
+    // `enum`／`array` を追加）でさらに 5 行増え、再度追随（旧: 1506／1585）。
+    ("catalog.rs", 1511),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない。
-    ("catalog.rs", 1585),
+    ("catalog.rs", 1590),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
