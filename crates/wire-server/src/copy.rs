@@ -24,7 +24,7 @@
 //! 開始から終了までを 1 回の関数呼び出しで完結させる単純化のため、
 //! ErrorResponse は CopyDone／CopyFail 受信後にまとめて送る）。
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::TcpStream;
 
 use engine::core::{CopyPlan, EngineCore};
@@ -336,27 +336,6 @@ fn run_copy_to(stream: &mut TcpStream, format: CopyFormat, result: &QueryResult)
     }
 }
 
-/// `body_len` バイトを `stream` から読み捨てる（読み捨て状態専用。
-/// `limits::COPY_DISCARD_MAX_BYTES` の総量チェックは呼び出し元が行う）。
-fn discard_bytes(stream: &mut TcpStream, mut remaining: usize) -> io::Result<()> {
-    let mut buf = [0u8; 8192];
-    while remaining > 0 {
-        let want = remaining.min(buf.len());
-        let dst = match buf.get_mut(..want) {
-            Some(d) => d,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "discard buffer bound",
-                ))
-            }
-        };
-        stream.read_exact(dst)?;
-        remaining -= want;
-    }
-    Ok(())
-}
-
 /// `COPY <table> (<cols>) FROM STDIN`: CopyInResponse → CopyData*／CopyDone／
 /// CopyFail のサブプロトコルを 1 回の呼び出しで完結させる。行のデコード・
 /// 束縛・INDEX-4 逐次判定は [`CopyInSession::feed`] が担う（`sql::copy`
@@ -408,11 +387,7 @@ fn run_copy_from(
             b'd' => {
                 let body = framing::read_length_prefixed_body(stream, 4, framing::MAX_MESSAGE_LEN)
                     .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                if errored.is_none() {
-                    if let Err(e) = session.feed(&body) {
-                        errored = Some(e);
-                    }
-                } else {
+                if errored.is_some() {
                     // body が空（宣言長 4）の CopyData を連送しても予算を
                     // 消費できてしまわないよう、フレームヘッダー分の固定
                     // オーバーヘッドも必ず加算する（codex-review 指摘・
@@ -422,6 +397,27 @@ fn run_copy_from(
                         .saturating_add(crate::limits::COPY_DISCARD_FRAME_OVERHEAD_BYTES);
                     discarded_messages = discarded_messages.saturating_add(1);
                     enforce_discard_budget(stream, discarded_bytes, discarded_messages)?;
+                } else if body.is_empty() {
+                    // codex-review P0 指摘（PRRT_kwDOUAKASM6luiS5）: `errored`
+                    // が `None` の間（＝まだ正常に取り込み処理中）は
+                    // `session.feed` が実際の進捗（`running_bytes` の増加・
+                    // 行確定）を伴わない限りどの上限も加算しないため、body が
+                    // 空（宣言長 4）の CopyData を連送すると `feed` を無限に
+                    // 呼び続けても `COPY_DISCARD_MAX_BYTES`／
+                    // `COPY_DISCARD_MAX_MESSAGES` のいずれも消費できず接続
+                    // スロットを無期限に占有できてしまう。`feed` へ渡しても
+                    // 意味のある処理（0 バイト分の `check_running_total` は
+                    // 何も変えない）が起きないことは判明しているため、
+                    // エラー後の読み捨てと同じ discard 予算へこの空フレーム
+                    // 自体を数え、進捗ゼロの空フレーム連送を有界化する
+                    // （`feed` は呼ばない——空 body を渡しても no-op のため
+                    // 呼んでも呼ばなくても取り込み結果は変わらない）。
+                    discarded_bytes = discarded_bytes
+                        .saturating_add(crate::limits::COPY_DISCARD_FRAME_OVERHEAD_BYTES);
+                    discarded_messages = discarded_messages.saturating_add(1);
+                    enforce_discard_budget(stream, discarded_bytes, discarded_messages)?;
+                } else if let Err(e) = session.feed(&body) {
+                    errored = Some(e);
                 }
             }
             b'c' => {
@@ -431,18 +427,40 @@ fn run_copy_from(
                     .map(|()| crate::extended_query::LoopSignal::Continue);
             }
             b'f' => {
-                let len = framing::validate_typed_message_length_prefix(
+                let body = framing::read_length_prefixed_body(
                     stream,
                     framing::MIN_TYPED_MESSAGE_LEN,
                     framing::MAX_MESSAGE_LEN,
                 )
                 .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                let body_len = len.saturating_sub(4);
-                // CopyFail の理由文字列はクライアントの自由記述であり、応答にも
-                // ログにも一切エコーしない（security.md「エラー・ログ経由で
-                // 他テナントのデータ・存在情報を漏らさない」。文字列の内容自体を
-                // 一切解釈せず読み捨てるだけに留める）。
-                discard_bytes(stream, body_len)?;
+                // CopyFail の理由文字列は PostgreSQL wire v3 の `String` 型
+                // （末尾 NUL 終端・埋め込み NUL 不可の C 文字列）として送られる
+                // 契約である。旧実装は宣言長のみ検証し本文を無条件に読み捨てて
+                // いたため、長さ 4（本文なし）や NUL 終端を欠く本文も正常な
+                // CopyFail として受理し接続を維持していた（codex-review 指摘・
+                // PRRT_kwDOUAKASM6lugH7）。ここでは構造（末尾が単一の NUL で
+                // 終わり、それより前に NUL を含まない）だけを検査し、違反時は
+                // 他の frame エラー経路と同じ `08P01`
+                // （[`respond_frame_error_and_terminate`] と同型の応答）で
+                // 拒否して接続を終了する（fail-closed。宣言長の時点で本文が
+                // 空の可能性を許していた WIRE-10 の固定形状メッセージ判定とは
+                // 別に、`String` 型の中身の形状はここでしか検査できない）。
+                // 文字列の中身自体は依然として応答・ログへ一切エコーしない
+                // （security.md「エラー・ログ経由で他テナントのデータ・存在
+                // 情報を漏らさない」。解釈するのは NUL 終端という構造のみ）。
+                let is_valid_c_string =
+                    matches!(body.split_last(), Some((0, rest)) if !rest.contains(&0));
+                if !is_valid_c_string {
+                    let _ = crate::handshake::write_error_response_io(
+                        stream,
+                        ErrorClass::ProtocolViolation,
+                        "malformed CopyFail message",
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed CopyFail message",
+                    ));
+                }
                 return respond_error_and_ready(
                     stream,
                     ErrorClass::InvalidInput,

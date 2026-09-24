@@ -170,8 +170,13 @@ fn send_copy_done(stream: &mut std::net::TcpStream) {
     send_length_prefixed_message(stream, b'c', b"");
 }
 
+/// PostgreSQL wire v3 の `String` 型（NUL 終端の C 文字列）契約に沿って理由
+/// 文字列へ末尾 NUL を付与して送る（`crates/wire-server/src/copy.rs`
+/// の CopyFail 検証。codex-review 指摘・PRRT_kwDOUAKASM6lugH7）。
 fn send_copy_fail(stream: &mut std::net::TcpStream, reason: &str) {
-    send_length_prefixed_message(stream, b'f', reason.as_bytes());
+    let mut body = reason.as_bytes().to_vec();
+    body.push(0);
+    send_length_prefixed_message(stream, b'f', &body);
 }
 
 // ---------------------------------------------------------------------
@@ -834,6 +839,96 @@ fn wire17_copy_from_stdin_discard_budget_exceeded_after_row_error_gets_error_res
     for _ in 0..16 {
         send_copy_data(&mut stream, &body);
     }
+
+    expect_error_response_with_sqlstate(&mut stream, "08P01");
+    expect_connection_closed(&mut stream);
+}
+
+/// codex-review P0 指摘（PRRT_kwDOUAKASM6luiS5）: `errored` が `None`（＝
+/// まだ正常に取り込み処理中）の間、body が空（宣言長 4）の `CopyData` を
+/// 連送しても `session.feed` は進捗（`running_bytes` の増加・行確定）を
+/// 一切伴わないため、旧実装ではどの上限（`COPY_DISCARD_MAX_BYTES`／
+/// `COPY_DISCARD_MAX_MESSAGES`）も消費されず接続スロットを無期限に占有
+/// できた。エラー未発生の状態でも空 `CopyData` の連送が同じ discard 予算へ
+/// 数えられ、上限超過時に `08P01` で fail-closed に切断されることを確認する。
+#[test]
+fn wire17_copy_from_stdin_empty_copy_data_spam_before_any_error_counts_toward_discard_budget() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'empty-copy-data-spam'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+
+    // 行エラーを一切起こさないまま、本文が空の CopyData をメッセージ件数
+    // 上限を超えるまで送り続ける。
+    for _ in 0..=wire_server::limits::COPY_DISCARD_MAX_MESSAGES {
+        send_copy_data(&mut stream, b"");
+    }
+
+    expect_error_response_with_sqlstate(&mut stream, "08P01");
+    expect_connection_closed(&mut stream);
+}
+
+/// codex-review P1 指摘（PRRT_kwDOUAKASM6lugH7）: `CopyFail` の理由文字列は
+/// PostgreSQL wire v3 の `String` 型（NUL 終端の C 文字列）契約に従う必要が
+/// あり、旧実装は宣言長のみを検証し本文を無条件に読み捨てていたため NUL
+/// 終端を欠く本文も正常な `CopyFail` として受理していた。末尾 NUL を持たない
+/// 本文は `08P01` で fail-closed に拒否され、接続が終了することを確認する。
+#[test]
+fn wire17_copy_from_stdin_copy_fail_without_nul_terminator_is_rejected() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'copy-fail-no-nul'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"1\t[1.0,0.0]\tja\n");
+    // NUL 終端を付けない生の理由文字列（`send_copy_fail` は正しく NUL を
+    // 付与するため、ここでは直接メッセージを組み立てる）。
+    send_length_prefixed_message(&mut stream, b'f', b"no terminator here");
+
+    expect_error_response_with_sqlstate(&mut stream, "08P01");
+    expect_connection_closed(&mut stream);
+}
+
+/// 本文が空（宣言長 4）の `CopyFail` も `String` 型として不正（NUL 終端が
+/// 存在しない）であり同じく `08P01` で拒否されることを確認する。
+#[test]
+fn wire17_copy_from_stdin_copy_fail_with_empty_body_is_rejected() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'copy-fail-empty-body'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"1\t[1.0,0.0]\tja\n");
+    send_length_prefixed_message(&mut stream, b'f', b"");
+
+    expect_error_response_with_sqlstate(&mut stream, "08P01");
+    expect_connection_closed(&mut stream);
+}
+
+/// 埋め込み NUL（末尾以外の位置に NUL を含む）本文も `String` 型として不正
+/// であり `08P01` で拒否されることを確認する。
+#[test]
+fn wire17_copy_from_stdin_copy_fail_with_embedded_nul_is_rejected() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'copy-fail-embedded-nul'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"1\t[1.0,0.0]\tja\n");
+    send_length_prefixed_message(&mut stream, b'f', b"bad\0reason\0");
 
     expect_error_response_with_sqlstate(&mut stream, "08P01");
     expect_connection_closed(&mut stream);
