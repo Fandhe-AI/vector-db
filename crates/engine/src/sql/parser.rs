@@ -1885,10 +1885,16 @@ fn bind_upsert_form(
                     let BoundUpsertValue::Excluded(src_idx) = value else {
                         continue;
                     };
-                    let is_null = !matches!(
+                    // `EXCLUDED.<col>` が実際に NULL かどうかは `Value::Null`
+                    // そのもの（`src_idx` が範囲外の場合も fail-closed に NULL
+                    // 扱い）でのみ判定する。以前は `Vector`／`Text` 以外を
+                    // すべて NULL とみなしていたため、`Value::Array`（Issue
+                    // #888）を持つ NOT NULL な配列列に対する
+                    // `ON CONFLICT DO UPDATE SET <array> = EXCLUDED.<array>`
+                    // が常に拒否されていた（Cursor Bugbot 指摘・PR #1011）。
+                    let is_null = matches!(
                         row.values.get(*src_idx),
-                        Some(crate::row_codec::Value::Vector(_))
-                            | Some(crate::row_codec::Value::Text(_))
+                        None | Some(crate::row_codec::Value::Null)
                     );
                     let target_nullable = schema
                         .columns
@@ -4757,5 +4763,47 @@ mod tests {
         );
         let err = bind_body_text_column(&schema).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // 対象指摘: Cursor Bugbot Medium（PR #1011）。`bind_upsert_form` の NULL 判定が
+    // `Value::Vector`／`Value::Text` 以外をすべて NULL 扱いしていたため、
+    // `Value::Array`（Issue #888）を持つ NOT NULL 配列列に対する
+    // `ON CONFLICT (id) DO UPDATE SET tags = EXCLUDED.tags` が、実際には
+    // 配列値が存在するにもかかわらず「NULL を NOT NULL 列へ代入しようとした」
+    // として常に拒否されていた。NOT NULL な配列列を対象にした UPSERT が
+    // 受理されることを固定する。
+    #[test]
+    fn bind_upsert_form_accepts_excluded_array_value_for_not_null_array_column() {
+        let schema = TableSchema::new(
+            "documents",
+            vec![ColumnDef::new(
+                "tags",
+                ColumnType::Array(text_array_ty(8)),
+                false,
+            )],
+        );
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_insert(
+            "INSERT INTO documents (id, tags) VALUES (1, '{a,b}') \
+             ON CONFLICT (id) DO UPDATE SET tags = EXCLUDED.tags \
+             USING OPERATION_ID 'op-upsert-array'",
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+
+        let bound =
+            bind_insert_form(&stmt, &schema).expect("array EXCLUDED value must not be NULL");
+        match bound {
+            BoundInsertForm::Upsert(upsert) => {
+                assert_eq!(
+                    upsert.action,
+                    BoundConflictAction::DoUpdate(vec![(0, BoundUpsertValue::Excluded(0))])
+                );
+            }
+            other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+        }
     }
 }
