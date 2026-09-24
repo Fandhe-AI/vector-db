@@ -24,6 +24,7 @@ pub mod incremental;
 pub mod isa;
 pub mod json;
 pub mod kernel;
+pub mod numeric;
 pub mod parallel_search;
 pub mod policy;
 pub mod precision;
@@ -40,6 +41,7 @@ pub mod storage;
 pub mod tenant;
 pub mod tiering;
 pub mod txn;
+pub mod uuid;
 pub mod wasm_udf;
 
 # source: crates/engine/src/core.rs :: VectorCore

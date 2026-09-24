@@ -21,7 +21,9 @@
 use std::fmt;
 
 use crate::catalog::{ArrayElemType, ArrayType, ColumnType, TableSchema, MAX_ARRAY_ELEMENTS};
+use crate::numeric::Decimal;
 use crate::storage::Visibility;
+use crate::uuid::Uuid;
 
 /// 行フォーマットの先頭バイト。値の追加・変更は破壊的変更として扱い、この値を
 /// 更新する。未知バージョンは fail-closed に拒否する（`storage.rs::ROW_FORMAT_VERSION`
@@ -165,6 +167,13 @@ pub enum Value {
     /// 時は検査しない（Issue #890 D3。`ALTER TYPE ... ADD VALUE` 前に書いた行を
     /// 将来にわたって読める契約を維持するため）。
     Enum(String),
+    /// 十進固定小数列の値（TABLE-13〔検討中〕・TASK-197、Issue #885）。行には
+    /// `unscaled`（`i128` LE 16 バイト）のみを持ち `scale` は持たない
+    /// （カタログの列型 `ColumnType::Numeric { scale, .. }` が唯一の正）。
+    Numeric(Decimal),
+    /// 128bit 識別子列の値（TABLE-13〔検討中〕・TASK-197、Issue #887）。
+    /// 内部表現・正規テキストは [`crate::uuid::Uuid`] 参照。
+    Uuid(Uuid),
 }
 
 /// 配列列 1 個分の値（Issue #888）。NULL 要素は本版では受理しない（D-A6。
@@ -229,6 +238,10 @@ pub enum ScalarRef<'a> {
     /// [`as_text`]: ScalarRef::as_text
     /// [`as_dictionary_text`]: ScalarRef::as_dictionary_text
     Enum(&'a str),
+    /// `NUMERIC` 列の借用結果（TABLE-13〔検討中〕・TASK-197、Issue #885）。
+    Numeric(Decimal),
+    /// `UUID` 列の借用結果（TABLE-13〔検討中〕・TASK-197、Issue #887）。
+    Uuid(Uuid),
 }
 
 impl<'a> ScalarRef<'a> {
@@ -246,7 +259,9 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
-            | ScalarRef::Enum(_) => None,
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
         }
     }
 
@@ -259,7 +274,9 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
-            | ScalarRef::Enum(_) => None,
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
         }
     }
 
@@ -274,7 +291,9 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
-            | ScalarRef::Enum(_) => None,
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
         }
     }
 
@@ -289,7 +308,48 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
-            | ScalarRef::Enum(_) => None,
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
+        }
+    }
+
+    /// NUMERIC 前提の消費側（TABLE-13〔検討中〕・TASK-197、Issue #885）が
+    /// `Text`/`Bool`/`Array`/`Bytes`/`Json`/`Enum` を取り違えないよう、
+    /// `Numeric` 以外は `None` を返す（fail-closed。[`as_text`]/[`as_bool`]
+    /// と同方針）。
+    pub fn as_numeric(&self) -> Option<Decimal> {
+        match self {
+            ScalarRef::Numeric(d) => Some(*d),
+            ScalarRef::Text(_)
+            | ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_)
+            | ScalarRef::Uuid(_) => None,
+        }
+    }
+
+    /// UUID 前提の消費側（TABLE-13〔検討中〕・TASK-197、Issue #887）が
+    /// `Text`/`Bool`/`Array`/`Bytes`/`Json`/`Enum`/`Numeric` を取り違えないよう、
+    /// `Uuid` 以外は `None` を返す（fail-closed。[`as_numeric`] と同方針）。
+    ///
+    /// [`as_numeric`]: ScalarRef::as_numeric
+    pub fn as_uuid(&self) -> Option<crate::uuid::Uuid> {
+        match self {
+            ScalarRef::Uuid(u) => Some(*u),
+            ScalarRef::Text(_)
+            | ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_) => None,
         }
     }
 
@@ -306,7 +366,9 @@ impl<'a> ScalarRef<'a> {
             | ScalarRef::Timestamp(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
-            | ScalarRef::Json(_) => None,
+            | ScalarRef::Json(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
         }
     }
 }
@@ -673,6 +735,19 @@ fn parse_array_frame<'a>(
     ))
 }
 
+/// NUMERIC 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + `unscaled`（`i128` LE 16 バイト）。TABLE-13〔検討中〕・
+/// TASK-197、Issue #885・D3）。scale は行に持たないため列型に依存しない
+/// 固定長。[`SCALAR_BOOL_ENTRY_LEN`] と同じ理由で
+/// `tenant::validate_set_assignments` の事前累計検証と共有する。
+pub(crate) const SCALAR_NUMERIC_ENTRY_LEN: u32 = 17;
+
+/// UUID 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + 16 バイト生値。TABLE-13〔検討中〕・TASK-197、Issue #887）。
+/// [`SCALAR_NUMERIC_ENTRY_LEN`] と同じ理由で `tenant::validate_set_assignments`
+/// の事前累計検証と共有する。
+pub(crate) const SCALAR_UUID_ENTRY_LEN: u32 = 17;
+
 /// デコード結果。行レベルの RLS フィールド（`tenant_id`・`visibility`）と、
 /// スキーマの列順に対応する値列を保持する。
 #[derive(Debug, Clone, PartialEq)]
@@ -781,7 +856,9 @@ pub fn encode_row(
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
-                    | ColumnType::Jsonb => {
+                    | ColumnType::Jsonb
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Uuid => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Enum value, got Enum",
                             column.name
@@ -817,7 +894,9 @@ pub fn encode_row(
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
-                    | ColumnType::Enum(_) => {
+                    | ColumnType::Enum(_)
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Uuid => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Vector value, got Vector",
                             column.name
@@ -897,7 +976,9 @@ pub fn encode_row(
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
-                    | ColumnType::Enum(_) => {
+                    | ColumnType::Enum(_)
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Uuid => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Array value, got Array",
                             column.name
@@ -929,6 +1010,54 @@ pub fn encode_row(
             }
             Value::Json(text) => {
                 encode_json_value(&mut buf, column, text)?;
+            }
+            Value::Numeric(d) => {
+                let scale = match column.ty {
+                    ColumnType::Numeric { precision, scale } => {
+                        if !d.fits_precision(precision) {
+                            return Err(RowCodecError::Invalid(format!(
+                                "column {:?} numeric value out of range for precision {precision}",
+                                column.name
+                            )));
+                        }
+                        scale
+                    }
+                    ColumnType::Text
+                    | ColumnType::Vector(_)
+                    | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
+                    | ColumnType::Array(_)
+                    | ColumnType::Bytea
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
+                    | ColumnType::Enum(_)
+                    | ColumnType::Uuid => {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Numeric value, got Numeric",
+                            column.name
+                        )))
+                    }
+                };
+                if d.scale() != scale {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects numeric scale {scale}, got {}",
+                        column.name,
+                        d.scale()
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&d.unscaled().to_le_bytes());
+            }
+            Value::Uuid(u) => {
+                if !matches!(column.ty, ColumnType::Uuid) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Uuid value, got Uuid",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(u.as_bytes());
             }
         }
     }
@@ -1326,6 +1455,66 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     offset = text_end;
                     values.push(Value::Json(text));
                 }
+                ColumnType::Numeric { precision, scale } => {
+                    let unscaled_bytes = buf
+                        .get(
+                            offset..offset.checked_add(16).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before numeric value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at numeric value field".to_string(),
+                            )
+                        })?;
+                    let unscaled_arr: [u8; 16] = unscaled_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("numeric value field is not 16 bytes".to_string())
+                    })?;
+                    let unscaled = i128::from_le_bytes(unscaled_arr);
+                    let decimal = Decimal::from_parts(unscaled, *scale).map_err(|_| {
+                        RowCodecError::Invalid(format!(
+                            "column {:?} numeric scale out of range",
+                            column.name
+                        ))
+                    })?;
+                    if !decimal.fits_precision(*precision) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} numeric value out of range for precision {precision}",
+                            column.name
+                        )));
+                    }
+                    offset = offset.checked_add(16).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after numeric value field".to_string(),
+                        )
+                    })?;
+                    values.push(Value::Numeric(decimal));
+                }
+                ColumnType::Uuid => {
+                    let uuid_bytes: [u8; 16] = buf
+                        .get(
+                            offset..offset.checked_add(16).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before uuid value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at uuid value field".to_string(),
+                            )
+                        })?
+                        .try_into()
+                        .map_err(|_| {
+                            RowCodecError::Invalid("uuid value field is not 16 bytes".to_string())
+                        })?;
+                    offset = offset.checked_add(16).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after uuid value field".to_string())
+                    })?;
+                    values.push(Value::Uuid(Uuid::from_bytes(uuid_bytes)));
+                }
             },
             other => {
                 return Err(RowCodecError::Invalid(format!(
@@ -1454,7 +1643,9 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
-                    | ColumnType::Jsonb => {
+                    | ColumnType::Jsonb
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Uuid => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Enum value, got Enum",
                             column.name
@@ -1543,7 +1734,9 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
-                    | ColumnType::Enum(_) => {
+                    | ColumnType::Enum(_)
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Uuid => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Array value, got Array",
                             column.name
@@ -1601,6 +1794,47 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.extend_from_slice(&text_len.to_le_bytes());
                 buf.extend_from_slice(text_bytes);
             }
+            Value::Numeric(d) => {
+                let (precision, scale) = match column.ty {
+                    ColumnType::Numeric { precision, scale } => (precision, scale),
+                    ColumnType::Text
+                    | ColumnType::Vector(_)
+                    | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
+                    | ColumnType::Array(_)
+                    | ColumnType::Bytea
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
+                    | ColumnType::Enum(_)
+                    | ColumnType::Uuid => {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Numeric value, got Numeric",
+                            column.name
+                        )))
+                    }
+                };
+                if d.scale() != scale || !d.fits_precision(precision) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} numeric value does not match column NUMERIC({precision},{scale})",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_NUMERIC_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&d.unscaled().to_le_bytes());
+            }
+            Value::Uuid(u) => {
+                if !matches!(column.ty, ColumnType::Uuid) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Uuid value, got Uuid",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_UUID_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(u.as_bytes());
+            }
         }
     }
 
@@ -1635,7 +1869,9 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
         | ColumnType::Timestamp
         | ColumnType::Array(_)
         | ColumnType::Bytea
-        | ColumnType::Enum(_) => {
+        | ColumnType::Enum(_)
+        | ColumnType::Numeric { .. }
+        | ColumnType::Uuid => {
             return Err(RowCodecError::Invalid(format!(
                 "column {:?} expects a non-JSON value, got JSON",
                 column.name
@@ -1804,7 +2040,9 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
-                        | ColumnType::Jsonb => {
+                        | ColumnType::Jsonb
+                        | ColumnType::Numeric { .. }
+                        | ColumnType::Uuid => {
                             return Err(RowCodecError::Invalid(format!(
                                 "column {:?} expects a non-Enum value, got Enum",
                                 column.name
@@ -1882,7 +2120,9 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Bytea
                         | ColumnType::Json
                         | ColumnType::Jsonb
-                        | ColumnType::Enum(_) => {
+                        | ColumnType::Enum(_)
+                        | ColumnType::Numeric { .. }
+                        | ColumnType::Uuid => {
                             return Err(RowCodecError::Invalid(format!(
                                 "column {:?} expects a non-Array value, got Array",
                                 column.name
@@ -1902,6 +2142,47 @@ pub(crate) fn merge_encode_scalar_columns(
                 }
                 Value::Json(text) => {
                     write_json(&mut buf, &mut reserve, column, text)?;
+                }
+                Value::Numeric(d) => {
+                    let (precision, scale) = match column.ty {
+                        ColumnType::Numeric { precision, scale } => (precision, scale),
+                        ColumnType::Text
+                        | ColumnType::Vector(_)
+                        | ColumnType::Boolean
+                        | ColumnType::Date
+                        | ColumnType::Timestamp
+                        | ColumnType::Array(_)
+                        | ColumnType::Bytea
+                        | ColumnType::Json
+                        | ColumnType::Jsonb
+                        | ColumnType::Enum(_)
+                        | ColumnType::Uuid => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "column {:?} expects a non-Numeric value, got Numeric",
+                                column.name
+                            )))
+                        }
+                    };
+                    if d.scale() != scale || !d.fits_precision(precision) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} numeric value does not match column NUMERIC({precision},{scale})",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_NUMERIC_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&d.unscaled().to_le_bytes());
+                }
+                Value::Uuid(u) => {
+                    if !matches!(column.ty, ColumnType::Uuid) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Uuid value, got Uuid",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_UUID_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(u.as_bytes());
                 }
             }
         } else {
@@ -1969,6 +2250,16 @@ pub(crate) fn merge_encode_scalar_columns(
                     // が将来変わっても、SET 対象でない既存 JSONB 行が
                     // `XX000` で更新不能になるフォワード互換の結合を避ける）。
                     write_text(&mut buf, &mut reserve, text.as_bytes())?;
+                }
+                Some(ScalarRef::Numeric(d)) => {
+                    reserve(&mut buf, SCALAR_NUMERIC_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&d.unscaled().to_le_bytes());
+                }
+                Some(ScalarRef::Uuid(u)) => {
+                    reserve(&mut buf, SCALAR_UUID_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(u.as_bytes());
                 }
             }
         }
@@ -2120,6 +2411,77 @@ fn scan_scalar_columns_validated<'a>(
                     })?;
                     if wanted {
                         sink(col_index, Some(ScalarRef::Bool(b)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+                ColumnType::Numeric { precision, scale } => {
+                    let unscaled_bytes = buf
+                        .get(
+                            offset..offset.checked_add(16).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before numeric value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at numeric value field".to_string(),
+                            )
+                        })?;
+                    let unscaled_arr: [u8; 16] = unscaled_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("numeric value field is not 16 bytes".to_string())
+                    })?;
+                    let unscaled = i128::from_le_bytes(unscaled_arr);
+                    let decimal = Decimal::from_parts(unscaled, *scale).map_err(|_| {
+                        RowCodecError::Invalid(format!(
+                            "column {:?} numeric scale out of range",
+                            column.name
+                        ))
+                    })?;
+                    if !decimal.fits_precision(*precision) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} numeric value out of range for precision {precision}",
+                            column.name
+                        )));
+                    }
+                    offset = offset.checked_add(16).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after numeric value field".to_string(),
+                        )
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Numeric(decimal)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+                ColumnType::Uuid => {
+                    let uuid_bytes: [u8; 16] = buf
+                        .get(
+                            offset..offset.checked_add(16).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before uuid value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at uuid value field".to_string(),
+                            )
+                        })?
+                        .try_into()
+                        .map_err(|_| {
+                            RowCodecError::Invalid("uuid value field is not 16 bytes".to_string())
+                        })?;
+                    offset = offset.checked_add(16).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after uuid value field".to_string())
+                    })?;
+                    if wanted {
+                        sink(
+                            col_index,
+                            Some(ScalarRef::Uuid(Uuid::from_bytes(uuid_bytes))),
+                        )?;
                     } else {
                         sink(col_index, None)?;
                     }
@@ -2438,6 +2800,8 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
                 owned.push_str(text);
                 values.push(Value::Json(owned));
             }
+            Some(ScalarRef::Numeric(d)) => values.push(Value::Numeric(d)),
+            Some(ScalarRef::Uuid(u)) => values.push(Value::Uuid(u)),
         }
     }
     Ok(values)

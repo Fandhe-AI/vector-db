@@ -247,6 +247,8 @@ pub(crate) fn project_row(
                     budget,
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
+                Some(Value::Numeric(d)) => Cell::Numeric(*d),
+                Some(Value::Uuid(u)) => Cell::Uuid(*u),
                 None => return Err(returning_bug("value index out of range")),
             },
             ProjectedColumn::Computed { .. } => {

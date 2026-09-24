@@ -181,6 +181,21 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             engine::json::write_canonical(&value, out);
             Ok(())
         }
+        Cell::Numeric(d) => {
+            // 正規テキスト表現（`Decimal::Display`。先頭ゼロ・指数表記・
+            // `-0` を持たない）をそのまま JSON number として書く（D8。
+            // TABLE-13〔検討中〕・TASK-197、Issue #885）。精度は失わない。
+            let _ = write!(out, "{d}");
+            Ok(())
+        }
+        Cell::Uuid(u) => {
+            // 正規テキスト表現（小文字 `8-4-4-4-12`）を JSON string として書く
+            // （U4。TABLE-13〔検討中〕・TASK-197、Issue #887）。
+            out.push('"');
+            escape_json_string_into(out, &u.to_string());
+            out.push('"');
+            Ok(())
+        }
     }
 }
 
@@ -533,6 +548,62 @@ mod tests {
             body,
             "{\"columns\":[{\"name\":\"id\",\"type\":\"numeric\"},\
 {\"name\":\"lang\",\"type\":\"text\"}],\"rows\":[[1,\"ja\"]],\"row_count\":1}"
+        );
+    }
+
+    /// NUMERIC 列（TABLE-13〔検討中〕・TASK-197、Issue #885）の JSON 出力は
+    /// 正規テキスト表現（`Decimal::Display`）を bare な JSON number として書く
+    /// （D8）。先頭ゼロ・指数表記・`-0` を持たないため JSON 文法として妥当。
+    #[test]
+    fn numeric_cell_encodes_as_bare_json_number() {
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "price".to_string(),
+                ty: ColumnType::Numeric {
+                    precision: 5,
+                    scale: 2,
+                },
+            }],
+            rows: vec![
+                row(vec![Cell::Numeric(
+                    engine::numeric::Decimal::from_parts(150, 2).expect("valid scale"),
+                )]),
+                row(vec![Cell::Numeric(
+                    engine::numeric::Decimal::from_parts(-150, 2).expect("valid scale"),
+                )]),
+                row(vec![Cell::Null]),
+            ],
+        };
+        let body = encode(&result).expect("encode");
+        assert_eq!(
+            body,
+            "{\"columns\":[{\"name\":\"price\",\"type\":\"numeric\"}],\
+\"rows\":[[1.50],[-1.50],[null]],\"row_count\":3}"
+        );
+    }
+
+    /// UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の JSON 出力は
+    /// 正規テキスト表現（小文字 `8-4-4-4-12`）を JSON string として書く（U4）。
+    #[test]
+    fn uuid_cell_encodes_as_json_string() {
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "ext_id".to_string(),
+                ty: ColumnType::Uuid,
+            }],
+            rows: vec![
+                row(vec![Cell::Uuid(
+                    engine::uuid::parse_uuid_text("12345678-9abc-def0-1234-56789abcdef0")
+                        .expect("valid uuid literal"),
+                )]),
+                row(vec![Cell::Null]),
+            ],
+        };
+        let body = encode(&result).expect("encode");
+        assert_eq!(
+            body,
+            "{\"columns\":[{\"name\":\"ext_id\",\"type\":\"text\"}],\
+\"rows\":[[\"12345678-9abc-def0-1234-56789abcdef0\"],[null]],\"row_count\":2}"
         );
     }
 

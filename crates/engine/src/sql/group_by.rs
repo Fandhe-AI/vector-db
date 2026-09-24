@@ -703,9 +703,10 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
             // 比較演算子として構造上生成しないため到達しない。
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
         },
-        // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT/ARRAY/BYTEA/JSON 型の
-        // 集計結果を HAVING の対象として拒否済みのため到達しない。fail-closed に
-        // 「不一致」として扱う。
+        // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT/ARRAY/BYTEA/JSON/
+        // NUMERIC 型の集計結果を HAVING の対象として拒否済みのため到達しない
+        // （NUMERIC 列の集計自体が TASK-197・Issue #885 の対象外。`SUM`/`AVG`/
+        // `MIN`/`MAX` は別 Issue #892 の担当）。fail-closed に「不一致」として扱う。
         Cell::Null
         | Cell::Text(_)
         | Cell::Vector(_)
@@ -714,7 +715,9 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         | Cell::Timestamp(_)
         | Cell::Array(_)
         | Cell::Bytes(_)
-        | Cell::Json(_) => false,
+        | Cell::Json(_)
+        | Cell::Numeric(_)
+        | Cell::Uuid(_) => false,
     }
 }
 

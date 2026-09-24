@@ -253,9 +253,10 @@ pub enum SqlSurfaceError {
     /// （`DATETIME_FIELD_OVERFLOW`）へ写像する新規分類。
     DatetimeFieldOverflow { detail: String },
     /// 構文上受理された値が、宣言済み型の表現として不正（TABLE-14・TASK-198、
-    /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）が
-    /// 現時点で唯一の発生経路。ERR-2 拡張: `22P02`
-    /// （[`crate::error_format::ErrorClass::InvalidTextRepresentation`]）。
+    /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）に
+    /// 加え、UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の厳密文法違反
+    /// （`sql::parser::bind_uuid_literal`）も同じ発生経路を共有する。ERR-2 拡張:
+    /// `22P02`（[`crate::error_format::ErrorClass::InvalidTextRepresentation`]）。
     InvalidTextRepresentation { detail: String },
 }
 
@@ -1943,6 +1944,22 @@ impl<'a> Parser<'a> {
             Some(Token::Ident(s)) if s.eq_ignore_ascii_case("false") => {
                 Ok(InsertLiteral::Bool(false))
             }
+            // 符号付き数値リテラル（`-1.5`・`+1.5` 等。TABLE-13〔検討中〕・TASK-197、
+            // Issue #885・D6、および PR #1020 codex-review 指摘対応で `+` も追加）。
+            // 字句解析器は `-`/`+` を独立した `Punct` として出すため、直後に
+            // `Number` が続く場合のみ 1 つの符号付き数値リテラルとして受理する
+            // （`InsertLiteral` の variant は増やさず `Number` へ符号を連結する。
+            // `+` は `NUMERIC` の解析側〔`numeric::parse_for_column`〕がそのまま
+            // 受理する表記のため符号文字を保持したまま連結する）。
+            // 非 NUMERIC 列（`id`・TEXT・VECTOR・BOOLEAN）へ与えた場合、従来は
+            // ここで構文エラー（`42601`）だったが、以降は束縛時の型不一致・
+            // 不正値（`22000`）で拒否される（拒否されること自体は変わらない）。
+            Some(&Token::Punct(sign @ ('-' | '+'))) => match self.advance() {
+                Some(Token::Number(n)) => Ok(InsertLiteral::Number(format!("{sign}{n}"))),
+                other => Err(SqlSurfaceError::unsupported(format!(
+                    "expected literal value, got {other:?}"
+                ))),
+            },
             other => Err(SqlSurfaceError::unsupported(format!(
                 "expected literal value, got {other:?}"
             ))),
