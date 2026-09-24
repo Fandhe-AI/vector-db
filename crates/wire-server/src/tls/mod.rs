@@ -29,6 +29,9 @@
 //! - [`key_schedule`]: TLS 1.3 鍵スケジュール本体（RFC 8446 §7.1。Issue #956）。
 //!   Early → Handshake → Master の secret 遷移と各段の traffic secret／
 //!   key／iv 導出を型状態で提供する
+//! - [`sha512`]: SHA-512（FIPS 180-4）。Ed25519 署名生成・検証（Issue #961）の
+//!   秘密鍵展開・署名計算が使う（Issue #960）。トランスクリプトハッシュ・
+//!   HKDF は引き続き SHA-256（[`hkdf`]）のまま
 //!
 //! key_share 拡張の解析（#954）・alert 型やハンドシェイク状態機械（#965）・
 //! レコード保護／暗号化（#959）・接続への結線（#966 以降）はいずれも
@@ -43,4 +46,5 @@ pub mod handshake;
 pub mod hkdf;
 pub mod key_schedule;
 pub mod record;
+pub mod sha512;
 pub mod x25519;
