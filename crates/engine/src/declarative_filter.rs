@@ -18,7 +18,7 @@
 //! 「untrusted 入力の扱い」）。
 
 use crate::catalog::{ColumnType, TableSchema};
-use crate::row_codec::MAX_TEXT_FIELD_LEN;
+use crate::row_codec::{ScalarRef, MAX_TEXT_FIELD_LEN};
 use crate::sql::allowlist::SqlSurfaceError;
 
 /// 1 文（`SELECT`）が持てるメタデータフィルタ件数の上限。無制限 `Vec` 確保を避ける
@@ -35,6 +35,10 @@ pub const MAX_METADATA_FILTERS: usize = 256;
 pub enum FilterOp {
     Equals(String),
     StartsWith(String),
+    /// BOOLEAN 列の等価条件（TABLE-13・TASK-196、Issue #883・D-c）。`Equals`/
+    /// `StartsWith` は TEXT 列限定のまま据え置き、文字列比較（`flag = 'true'`）は
+    /// 受理しない（fail-closed。`bind` が列型で振り分ける）。
+    BoolEquals(bool),
 }
 
 /// 未束縛の宣言的フィルタ（列名指定）。SQL 経由（`sql::parser::bind_in_session`）・
@@ -64,8 +68,17 @@ impl DeclarativeFilter {
         }
     }
 
-    /// `schema` と照合して [`MetadataFilter`] へ束縛する。列名解決・`TEXT` 列限定
-    /// （`VECTOR` 列は `22000`）・リテラル長上限（[`MAX_TEXT_FIELD_LEN`] 超は
+    /// BOOLEAN 列の等価フィルタを宣言する（Issue #883・D-c）。
+    pub fn bool_equals(column: impl Into<String>, value: bool) -> Self {
+        Self {
+            column: column.into(),
+            op: FilterOp::BoolEquals(value),
+        }
+    }
+
+    /// `schema` と照合して [`MetadataFilter`] へ束縛する。列名解決・列型検査
+    /// （`Equals`/`StartsWith` は `TEXT` 列限定・`BoolEquals` は `BOOLEAN` 列限定。
+    /// いずれも不一致は `22000`）・リテラル長上限（[`MAX_TEXT_FIELD_LEN`] 超は
     /// `54000`）・空 prefix 拒否（`22000`）を検証する。
     pub fn bind(&self, schema: &TableSchema) -> Result<MetadataFilter, SqlSurfaceError> {
         let column_index = schema
@@ -78,21 +91,24 @@ impl DeclarativeFilter {
         let column = schema.columns.get(column_index).ok_or_else(|| {
             SqlSurfaceError::invalid_input(format!("unknown column: {}", self.column))
         })?;
-        match column.ty {
-            ColumnType::Text => {}
-            ColumnType::Vector(_) | ColumnType::Integer | ColumnType::BigInt => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {:?} is not a TEXT column",
-                    self.column
-                )));
-            }
-        }
         let op = match &self.op {
             FilterOp::Equals(value) => {
+                if !matches!(column.ty, ColumnType::Text) {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "column {:?} is not a TEXT column",
+                        self.column
+                    )));
+                }
                 check_literal_len(value)?;
                 FilterOp::Equals(value.clone())
             }
             FilterOp::StartsWith(prefix) => {
+                if !matches!(column.ty, ColumnType::Text) {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "column {:?} is not a TEXT column",
+                        self.column
+                    )));
+                }
                 if prefix.is_empty() {
                     return Err(SqlSurfaceError::invalid_input(
                         "LIKE prefix must not be empty",
@@ -100,6 +116,15 @@ impl DeclarativeFilter {
                 }
                 check_literal_len(prefix)?;
                 FilterOp::StartsWith(prefix.clone())
+            }
+            FilterOp::BoolEquals(value) => {
+                if !matches!(column.ty, ColumnType::Boolean) {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "column {:?} is not a BOOLEAN column",
+                        self.column
+                    )));
+                }
+                FilterOp::BoolEquals(*value)
             }
         };
         Ok(MetadataFilter { column_index, op })
@@ -166,15 +191,21 @@ impl MetadataFilter {
     }
 
     /// `value`（対象列の値。`None` は NULL）がこのフィルタに一致するか判定する。
-    /// NULL は等価・前方一致のいずれでも常に不一致（fail-closed。PG の NULL 比較の
-    /// 既定挙動に倣う）。
-    pub fn matches(&self, value: Option<&str>) -> bool {
+    /// NULL は等価・前方一致・BOOLEAN 等価のいずれでも常に不一致（fail-closed。
+    /// PG の三値論理での NULL 比較の既定挙動に倣う）。型不一致（`TEXT` フィルタに
+    /// `Bool` 値、`BoolEquals` に `Text` 値）も `bind` が列型で事前に排除している
+    /// 契約だが、念のため不一致として扱う。
+    pub fn matches(&self, value: Option<ScalarRef<'_>>) -> bool {
         let Some(v) = value else {
             return false;
         };
         match &self.op {
-            FilterOp::Equals(expected) => v == expected,
-            FilterOp::StartsWith(prefix) => v.starts_with(prefix.as_str()),
+            FilterOp::Equals(expected) => v.as_text() == Some(expected.as_str()),
+            FilterOp::StartsWith(prefix) => v
+                .as_text()
+                .map(|s| s.starts_with(prefix.as_str()))
+                .unwrap_or(false),
+            FilterOp::BoolEquals(expected) => v.as_bool() == Some(*expected),
         }
     }
 }
@@ -216,7 +247,7 @@ pub fn bind_all(
 /// （fail-closed。`scanned` は投影・フィルタが必要とする列だけを保持する構造の
 /// ため、束縛時に検証済みの列インデックスでも呼び出し元の保持方針次第では
 /// 範囲外になり得る）。
-pub fn matches_all(filters: &[MetadataFilter], scanned: &[Option<&str>]) -> bool {
+pub fn matches_all(filters: &[MetadataFilter], scanned: &[Option<ScalarRef<'_>>]) -> bool {
     filters.iter().all(|f| {
         let value = scanned.get(f.column_index).copied().flatten();
         f.matches(value)
@@ -245,8 +276,8 @@ mod tests {
         let f = DeclarativeFilter::equals("kind", "code")
             .bind(&schema())
             .unwrap();
-        assert!(f.matches(Some("code")));
-        assert!(!f.matches(Some("docs")));
+        assert!(f.matches(Some(ScalarRef::Text("code"))));
+        assert!(!f.matches(Some(ScalarRef::Text("docs"))));
     }
 
     #[test]
@@ -254,8 +285,8 @@ mod tests {
         let f = DeclarativeFilter::starts_with("path", "src/")
             .bind(&schema())
             .unwrap();
-        assert!(f.matches(Some("src/lib.rs")));
-        assert!(!f.matches(Some("lib.rs")));
+        assert!(f.matches(Some(ScalarRef::Text("src/lib.rs"))));
+        assert!(!f.matches(Some(ScalarRef::Text("lib.rs"))));
     }
 
     #[test]
@@ -369,8 +400,8 @@ mod tests {
         let f = DeclarativeFilter::starts_with("path", "日本語/")
             .bind(&schema())
             .unwrap();
-        assert!(f.matches(Some("日本語/doc.md")));
-        assert!(!f.matches(Some("語/doc.md")));
+        assert!(f.matches(Some(ScalarRef::Text("日本語/doc.md"))));
+        assert!(!f.matches(Some(ScalarRef::Text("語/doc.md"))));
     }
 
     #[test]

@@ -131,19 +131,56 @@ pub enum Value {
     Integer(i32),
     /// 符号付き 64 ビット整数（`ColumnType::BigInt`）。
     BigInt(i64),
+    /// 真偽値列の値（TABLE-13・TASK-196、Issue #883）。NULL とはバイト列上も
+    /// 別物になる（[`PRESENCE_NULL`] とは別に 1 バイトの値本体を持つ）。
+    Bool(bool),
 }
 
-/// [`scan_scalar_columns`]／[`scan_scalar_columns_masked`] が返す借用スカラー値
-/// （Issue #881 D3。ADR `docs/design/column-type-extension.md` の申し送り事項）。
-/// `TEXT` 列は複製せず `&str` を借用したまま返し、`INTEGER`／`BIGINT` は固定幅の
-/// ため複製コストが無く値そのものを返す。`#[non_exhaustive]` は付けない
-/// （Issue #880 D1 と同じ方針。型追加時にコンパイラが全呼び出し元を列挙する）。
+/// スカラー列走査（[`scan_scalar_columns`] 系）の借用結果。TEXT・BOOLEAN の
+/// 両方を返せるよう `Option<&str>` から型付き化し（Issue #883・D-b）、
+/// `INTEGER`／`BIGINT`（Issue #881 D3）は固定幅のため複製コストが無く値
+/// そのものを返す。`VECTOR` 列・実際の NULL 列は走査結果として `None` になる。
+/// `#[non_exhaustive]` は付けない（Issue #880 D1 と同じ方針。型追加時に
+/// コンパイラが全呼び出し元を列挙する）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarRef<'a> {
     Text(&'a str),
     Integer(i32),
     BigInt(i64),
+    Bool(bool),
 }
+
+impl<'a> ScalarRef<'a> {
+    /// TEXT 前提の既存消費側（等価/前方一致フィルタ・二次索引・hybrid 本文・
+    /// GROUP BY キー等）が `Integer`／`BigInt`／`Bool` を取り違えて TEXT として
+    /// 扱わないよう、`Text` 以外は `None` を返す（fail-closed。呼び出し元は
+    /// スキーマ型で事前に対象外の列を除外するか、`None` を型不一致として拒否する）。
+    pub fn as_text(&self) -> Option<&'a str> {
+        match self {
+            ScalarRef::Text(s) => Some(s),
+            ScalarRef::Integer(_) | ScalarRef::BigInt(_) | ScalarRef::Bool(_) => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            ScalarRef::Bool(b) => Some(*b),
+            ScalarRef::Text(_) | ScalarRef::Integer(_) | ScalarRef::BigInt(_) => None,
+        }
+    }
+}
+
+/// BOOLEAN 値のバイト表現（presence タグに続く 1 バイト）。`0x00`/`0x01`
+/// 以外は decode 側で fail-closed に拒否する（既定値へのフォールバックはしない。
+/// TABLE-7）。
+const BOOL_FALSE_BYTE: u8 = 0x00;
+const BOOL_TRUE_BYTE: u8 = 0x01;
+
+/// BOOLEAN 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + 値(1)）。[`encode_scalar_columns`] の実エンコードと
+/// `tenant::validate_set_assignments` の事前累計検証が同じ値を共有する
+/// （TEXT の [`SCALAR_TEXT_ENTRY_OVERHEAD`] と同じ理由）。
+pub(crate) const SCALAR_BOOL_ENTRY_LEN: u32 = 2;
 
 /// デコード結果。行レベルの RLS フィールド（`tenant_id`・`visibility`）と、
 /// スキーマの列順に対応する値列を保持する。
@@ -241,7 +278,10 @@ pub fn encode_row(
             Value::Vector(vector) => {
                 let expected_dim = match column.ty {
                     ColumnType::Vector(dim) => dim,
-                    ColumnType::Text | ColumnType::Integer | ColumnType::BigInt => {
+                    ColumnType::Text
+                    | ColumnType::Integer
+                    | ColumnType::BigInt
+                    | ColumnType::Boolean => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Vector value, got Vector",
                             column.name
@@ -287,6 +327,16 @@ pub fn encode_row(
                 }
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::Bool(b) => {
+                if !matches!(column.ty, ColumnType::Boolean) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Boolean value, got Boolean",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
             }
         }
     }
@@ -490,6 +540,28 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     offset = field_end;
                     values.push(Value::BigInt(i64::from_le_bytes(arr)));
                 }
+                ColumnType::Boolean => {
+                    let byte = *buf.get(offset).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "row buffer truncated at boolean value field".to_string(),
+                        )
+                    })?;
+                    let b = match byte {
+                        BOOL_FALSE_BYTE => false,
+                        BOOL_TRUE_BYTE => true,
+                        other => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "unknown boolean value byte: {other}"
+                            )))
+                        }
+                    };
+                    offset = offset.checked_add(1).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after boolean value field".to_string(),
+                        )
+                    })?;
+                    values.push(Value::Bool(b));
+                }
             },
             other => {
                 return Err(RowCodecError::Invalid(format!(
@@ -582,6 +654,12 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_NULL);
             }
             Value::Text(text) => {
+                if !matches!(column.ty, ColumnType::Text) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Text value, got Text",
+                        column.name
+                    )));
+                }
                 let text_bytes = text.as_bytes();
                 let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
                     RowCodecError::Invalid(format!(
@@ -628,6 +706,17 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 reserve(&mut buf, SCALAR_INT8_ENTRY_LEN)?;
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::Bool(b) => {
+                if !matches!(column.ty, ColumnType::Boolean) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Boolean value, got Boolean",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
             }
         }
     }
@@ -729,6 +818,12 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_NULL);
                 }
                 Value::Text(text) => {
+                    if !matches!(column.ty, ColumnType::Text) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Text value, got Text",
+                            column.name
+                        )));
+                    }
                     write_text(&mut buf, &mut reserve, text.as_bytes())?;
                 }
                 Value::Vector(_) => {
@@ -758,6 +853,17 @@ pub(crate) fn merge_encode_scalar_columns(
                     reserve(&mut buf, SCALAR_INT8_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     buf.extend_from_slice(&v.to_le_bytes());
+                }
+                Value::Bool(b) => {
+                    if !matches!(column.ty, ColumnType::Boolean) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Boolean value, got Boolean",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
                 }
             }
         } else {
@@ -808,6 +914,17 @@ pub(crate) fn merge_encode_scalar_columns(
                     reserve(&mut buf, SCALAR_INT8_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     buf.extend_from_slice(&v.to_le_bytes());
+                }
+                Some(ScalarRef::Bool(b)) => {
+                    if !matches!(column.ty, ColumnType::Boolean) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Boolean existing value, got Boolean",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.push(if b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
                 }
             }
         }
@@ -1028,6 +1145,32 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
+                ColumnType::Boolean => {
+                    let byte = *buf.get(offset).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "scalar payload truncated at boolean value field".to_string(),
+                        )
+                    })?;
+                    let b = match byte {
+                        BOOL_FALSE_BYTE => false,
+                        BOOL_TRUE_BYTE => true,
+                        other => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "unknown boolean value byte: {other}"
+                            )))
+                        }
+                    };
+                    offset = offset.checked_add(1).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after boolean value field".to_string(),
+                        )
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Bool(b)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
                 // `VECTOR` 列は上の `continue` で常にスキップされるため構造的に
                 // 到達しないが、engine コードは panic させない方針
                 // （.claude/rules/coding-rust.md）のため `unreachable!` ではなく
@@ -1073,7 +1216,10 @@ pub fn scalar_refs_as_text<'a>(scanned: &[Option<ScalarRef<'a>>]) -> Vec<Option<
         .iter()
         .map(|slot| match slot {
             Some(ScalarRef::Text(t)) => Some(*t),
-            Some(ScalarRef::Integer(_)) | Some(ScalarRef::BigInt(_)) | None => None,
+            Some(ScalarRef::Integer(_))
+            | Some(ScalarRef::BigInt(_))
+            | Some(ScalarRef::Bool(_))
+            | None => None,
         })
         .collect()
 }
@@ -1108,6 +1254,7 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
             }
             Some(ScalarRef::Integer(v)) => values.push(Value::Integer(v)),
             Some(ScalarRef::BigInt(v)) => values.push(Value::BigInt(v)),
+            Some(ScalarRef::Bool(b)) => values.push(Value::Bool(b)),
         }
     }
     Ok(values)
@@ -1496,19 +1643,17 @@ mod tests {
         assert_eq!(scanned[0], None); // VECTOR 列は常に None
         let buf_range = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
         for slot in scanned.iter().skip(1) {
-            let ScalarRef::Text(s) = slot.expect("text column must be Some") else {
-                panic!("text column must decode as ScalarRef::Text");
-            };
+            let s = slot
+                .expect("text column must be Some")
+                .as_text()
+                .expect("text column must be ScalarRef::Text");
             let ptr = s.as_ptr() as usize;
             assert!(
                 buf_range.contains(&ptr),
                 "scanned &str must borrow from buf, not allocate a copy"
             );
         }
-        assert_eq!(
-            scanned[1],
-            Some(ScalarRef::Text("body-text".repeat(1000).as_str()))
-        );
+        assert_eq!(scanned[1], Some(ScalarRef::Text(&"body-text".repeat(1000))));
         assert_eq!(scanned[2], Some(ScalarRef::Text("tag-value")));
     }
 
@@ -1546,7 +1691,7 @@ mod tests {
         for (slot, value) in scanned.iter().zip(decoded.iter()) {
             match (slot, value) {
                 (None, Value::Null) => {}
-                (Some(ScalarRef::Text(s)), Value::Text(t)) => assert_eq!(*s, t.as_str()),
+                (Some(s), Value::Text(t)) => assert_eq!(*s, ScalarRef::Text(t.as_str())),
                 other => panic!("scan/decode mismatch: {other:?}"),
             }
         }

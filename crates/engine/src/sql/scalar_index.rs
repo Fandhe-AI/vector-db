@@ -65,7 +65,7 @@ use redb::ReadableDatabase;
 use crate::catalog::{ColumnType, TableSchema};
 use crate::declarative_filter::{FilterOp, MetadataFilter};
 use crate::policy::PolicyContext;
-use crate::row_codec::{self, scan_scalar_columns};
+use crate::row_codec::scan_scalar_columns;
 use crate::sql::arena_cache::SqlArenaSnapshot;
 use crate::storage::Storage;
 
@@ -543,10 +543,14 @@ impl ScalarIndex {
                     per_column.push(Some(acc));
                 }
                 // `INTEGER`／`BIGINT` 列の索引対応は Issue #893 の担当。本 Issue
-                // （#881）では `Vector` 列と同じく未索引のまま扱う。
-                ColumnType::Vector(_) | ColumnType::Integer | ColumnType::BigInt => {
-                    per_column.push(None)
-                }
+                // （#881）では `Vector` 列と同じく未索引のまま扱う。`BOOLEAN` 列も
+                // 索引対象外（Issue #883・D-e。値域が 2 値のため索引化コストに
+                // 見合わず、対応述語 `BoolEquals` は常に plain scan——
+                // `scalar_plan.rs` 参照——のまま据え置く）。
+                ColumnType::Vector(_)
+                | ColumnType::Integer
+                | ColumnType::BigInt
+                | ColumnType::Boolean => per_column.push(None),
             }
         }
 
@@ -570,13 +574,10 @@ impl ScalarIndex {
                 }
                 // 索引対象（`per_column[col_index] == Some(_)`）は `TEXT` 列
                 // 構築時にのみ `Some` を積む契約（上の初期化ループ参照）ため、
-                // ここへ到達する値は常に `ScalarRef::Text`。`INTEGER`／`BIGINT`
-                // は未索引のまま（`per_column` が `None`）のため、
+                // ここへ到達する値は常に `ScalarRef::Text`。`INTEGER`／`BIGINT`／
+                // `BOOLEAN` は未索引のまま（`per_column` が `None`）のため、
                 // `is_indexed_column` チェックで既に弾かれている。
-                let v: &str = match v {
-                    row_codec::ScalarRef::Text(t) => t,
-                    row_codec::ScalarRef::Integer(_) | row_codec::ScalarRef::BigInt(_) => continue,
-                };
+                let Some(v) = v.as_text() else { continue };
                 let v_len = v.len();
                 let (Some(&running), Some(&nonnull)) = (
                     col_running_bytes.get(col_index),
@@ -802,6 +803,10 @@ impl ScalarIndex {
                 .map(|s| s.to_vec())
                 .unwrap_or_default(),
             FilterOp::StartsWith(prefix) => column.prefix_slots(prefix),
+            // BOOLEAN 列は索引化しない（`per_column` が常に `None`。上の
+            // `?` で既にここへ到達しない）ため構造的に到達しないが、
+            // 網羅性のため fail-closed に `None` を返す。
+            FilterOp::BoolEquals(_) => return None,
         };
         result.sort_unstable();
         Some(result)
@@ -2321,7 +2326,6 @@ mod tests {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let scanned = scan_scalar_columns(schema, metadata).expect("decode row");
-            let scanned = row_codec::scalar_refs_as_text(&scanned);
             let value = scanned.get(filter.column_index()).copied().flatten();
             if filter.matches(value) {
                 out.push(slot as u32);

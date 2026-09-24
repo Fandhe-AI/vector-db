@@ -733,11 +733,7 @@ pub(crate) fn execute_statement_with_cache(
         // 可視行を無条件に通過させ、DISTANCE 段の後で `apply_scalar_postfilter` が
         // 事後適用する（§モジュールドキュメント参照）。
         if plan.scalar_prefilter {
-            // `matches_all` は束縛段で TEXT 列のみに制限された述語しか受理しない
-            // ため、TEXT 以外の列は（未参照のまま）`None` へ落として渡す
-            // （Issue #881 D3・`row_codec::scalar_refs_as_text`）。
-            let scanned_text = row_codec::scalar_refs_as_text(&scanned);
-            if !declarative_filter::matches_all(&bound.metadata_filters, &scanned_text) {
+            if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 return Ok(false);
             }
             // TASK-79（SQL-9）: `WHERE` の式述語（宣言的 UDF・組み込み関数呼び出し）を
@@ -769,7 +765,10 @@ pub(crate) fn execute_statement_with_cache(
         // メント参照）。
         if is_hybrid && !skip_sparse_accumulation {
             if let Some(idx) = text_column_index {
-                if let Some(Some(row_codec::ScalarRef::Text(t))) = scanned.get(idx) {
+                if let Some(Some(t)) = scanned
+                    .get(idx)
+                    .map(|v| v.as_ref().and_then(|v| v.as_text()))
+                {
                     if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
                         return Err(ArenaError::CapacityExceeded);
                     }
@@ -838,6 +837,9 @@ pub(crate) fn execute_statement_with_cache(
                     }
                     Some(row_codec::ScalarRef::Integer(v)) => kept.push(Value::Integer(v)),
                     Some(row_codec::ScalarRef::BigInt(v)) => kept.push(Value::BigInt(v)),
+                    Some(row_codec::ScalarRef::Bool(b)) => {
+                        kept.push(Value::Bool(b));
+                    }
                 }
             }
             kept
@@ -1810,10 +1812,11 @@ pub(crate) fn execute_statement_with_cache(
             let Some(columns) = candidate_columns.get(slot) else {
                 continue;
             };
-            let scanned: Vec<Option<&str>> = columns
+            let scanned: Vec<Option<row_codec::ScalarRef<'_>>> = columns
                 .iter()
                 .map(|v| match v {
-                    Value::Text(t) => Some(t.as_str()),
+                    Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
+                    Value::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
                     Value::Null | Value::Vector(_) | Value::Integer(_) | Value::BigInt(_) => None,
                 })
                 .collect();
@@ -2147,6 +2150,7 @@ fn decode_deferred_scalars(
             }
             Some(row_codec::ScalarRef::Integer(v)) => out.push(Value::Integer(v)),
             Some(row_codec::ScalarRef::BigInt(v)) => out.push(Value::BigInt(v)),
+            Some(row_codec::ScalarRef::Bool(b)) => out.push(Value::Bool(b)),
         }
     }
     Ok(out)
@@ -2373,7 +2377,8 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Integer(_))
-                            | Some(Value::BigInt(_)) => {
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Bool(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2386,7 +2391,8 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
-                            | Some(Value::BigInt(_)) => {
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Bool(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2397,7 +2403,20 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
-                            | Some(Value::Integer(_)) => {
+                            | Some(Value::Integer(_))
+                            | Some(Value::Bool(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Boolean => match decoded.get(*index) {
+                            Some(Value::Bool(b)) => cells.push(Cell::Bool(*b)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Integer(_))
+                            | Some(Value::BigInt(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2974,8 +2993,7 @@ pub(crate) fn execute_predicate_delete(
 
     let predicate = |candidate: &crate::tenant::DmlCandidate<'_>| -> Result<bool, SqlSurfaceError> {
         let scanned = row_codec::scan_scalar_columns(schema, candidate.metadata)?;
-        let scanned_text = row_codec::scalar_refs_as_text(&scanned);
-        if !declarative_filter::matches_all(metadata_filters, &scanned_text) {
+        if !declarative_filter::matches_all(metadata_filters, &scanned) {
             return Ok(false);
         }
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {
@@ -3059,8 +3077,7 @@ pub(crate) fn execute_predicate_update(
 
     let predicate = |candidate: &crate::tenant::DmlCandidate<'_>| -> Result<bool, SqlSurfaceError> {
         let scanned = row_codec::scan_scalar_columns(schema, candidate.metadata)?;
-        let scanned_text = row_codec::scalar_refs_as_text(&scanned);
-        if !declarative_filter::matches_all(metadata_filters, &scanned_text) {
+        if !declarative_filter::matches_all(metadata_filters, &scanned) {
             return Ok(false);
         }
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {

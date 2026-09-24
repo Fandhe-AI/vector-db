@@ -224,6 +224,9 @@ pub enum ColumnType {
     Integer,
     /// 符号付き 64 ビット整数列（`BIGINT`、TABLE-13・TASK-196。Issue #881）。
     BigInt,
+    /// 真偽値列（TABLE-13・TASK-196、Issue #883）。NULL と false は行バイト列・
+    /// 投影・述語評価のいずれでも区別する（[`crate::row_codec::Value::Bool`] 参照）。
+    Boolean,
 }
 
 impl ColumnType {
@@ -242,6 +245,7 @@ impl ColumnType {
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
             ColumnType::Integer => ("integer", "-".to_string()),
             ColumnType::BigInt => ("bigint", "-".to_string()),
+            ColumnType::Boolean => ("boolean", "-".to_string()),
         }
     }
 
@@ -281,6 +285,14 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::BigInt)
+            }
+            "boolean" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "boolean column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Boolean)
             }
             other => Err(CatalogError::Invalid(format!(
                 "unknown column type: {other:?}"
@@ -330,7 +342,9 @@ impl TableSchema {
     pub fn vector_dim(&self) -> Option<u32> {
         self.columns.iter().find_map(|c| match c.ty {
             ColumnType::Vector(dim) => Some(dim),
-            ColumnType::Text | ColumnType::Integer | ColumnType::BigInt => None,
+            ColumnType::Text | ColumnType::Integer | ColumnType::BigInt | ColumnType::Boolean => {
+                None
+            }
         })
     }
 

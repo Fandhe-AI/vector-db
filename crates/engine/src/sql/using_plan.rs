@@ -91,7 +91,7 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
     })?;
     match column.ty {
         ColumnType::Text => Ok(idx),
-        ColumnType::Vector(_) | ColumnType::Integer | ColumnType::BigInt => {
+        ColumnType::Vector(_) | ColumnType::Integer | ColumnType::BigInt | ColumnType::Boolean => {
             Err(SqlSurfaceError::invalid_input(format!(
                 "column {BODY_COLUMN_NAME:?} is not a TEXT column"
             )))

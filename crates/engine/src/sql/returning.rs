@@ -161,6 +161,7 @@ pub(crate) fn project_row(
                 )?),
                 Some(Value::Integer(v)) => Cell::SignedInteger(i64::from(*v)),
                 Some(Value::BigInt(v)) => Cell::SignedInteger(*v),
+                Some(Value::Bool(b)) => Cell::Bool(*b),
                 None => return Err(returning_bug("value index out of range")),
             },
             ProjectedColumn::Computed { .. } => {

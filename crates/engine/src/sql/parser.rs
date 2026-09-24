@@ -331,9 +331,9 @@ fn bind_integer_literal(
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {
     let raw = match literal {
         InsertLiteral::Number(s) => s,
-        InsertLiteral::String(_) => {
+        InsertLiteral::String(_) | InsertLiteral::Bool(_) => {
             return Err(SqlSurfaceError::invalid_input(format!(
-                "column {name:?} expects an integer literal, got a string"
+                "column {name:?} expects an integer literal, got a non-integer literal"
             )))
         }
     };
@@ -364,9 +364,11 @@ fn bind_integer_literal(
                 ))),
             },
         },
-        ColumnType::Text | ColumnType::Vector(_) => Err(SqlSurfaceError::Internal {
-            detail: "bind_integer_literal called for a non-integer column".to_string(),
-        }),
+        ColumnType::Text | ColumnType::Vector(_) | ColumnType::Boolean => {
+            Err(SqlSurfaceError::Internal {
+                detail: "bind_integer_literal called for a non-integer column".to_string(),
+            })
+        }
     }
 }
 
@@ -382,7 +384,9 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .enumerate()
         .find_map(|(idx, c)| match c.ty {
             ColumnType::Vector(dim) => Some((idx, dim)),
-            ColumnType::Text | ColumnType::Integer | ColumnType::BigInt => None,
+            ColumnType::Text | ColumnType::Integer | ColumnType::BigInt | ColumnType::Boolean => {
+                None
+            }
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
@@ -418,9 +422,12 @@ pub(crate) fn text_column_index(
                 .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
             match column.ty {
                 ColumnType::Text => Ok(idx),
-                ColumnType::Vector(_) | ColumnType::Integer | ColumnType::BigInt => Err(
-                    SqlSurfaceError::invalid_input(format!("column {name:?} is not a TEXT column")),
-                ),
+                ColumnType::Vector(_)
+                | ColumnType::Integer
+                | ColumnType::BigInt
+                | ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is not a TEXT column"
+                ))),
             }
         })
 }
@@ -753,6 +760,12 @@ pub(crate) fn bind_where_predicates(
                 // （`is_allowed_where_predicate_name`）。名前の再検証はしない
                 // （許可リスト層の責務。ここでは可観測性のためのフラグのみ立てる）。
                 rls_predicate_present = true;
+            }
+            WherePredicate::BoolEquality { column, value } => {
+                declarative_filters.push(DeclarativeFilter::bool_equals(column.clone(), *value));
+            }
+            WherePredicate::BoolColumn { column } => {
+                declarative_filters.push(DeclarativeFilter::bool_equals(column.clone(), true));
             }
             WherePredicate::Expression(expr) => {
                 let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
@@ -1124,7 +1137,7 @@ fn bind_insert_row(
         InsertLiteral::Number(n) => n
             .parse()
             .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed id value: {n}")))?,
-        InsertLiteral::String(_) => {
+        InsertLiteral::String(_) | InsertLiteral::Bool(_) => {
             return Err(SqlSurfaceError::invalid_input(
                 "id pseudo-column value must be a number",
             ))
@@ -1156,17 +1169,23 @@ fn bind_insert_row(
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
             }
-            (ColumnType::Vector(_), InsertLiteral::Number(_)) => {
+            (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a vector literal, got a number"
+                    "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
-            (ColumnType::Text, InsertLiteral::Number(_)) => {
+            (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a text literal, got a number"
+                    "column {name:?} expects a text literal, got a non-text literal"
+                )))
+            }
+            (ColumnType::Boolean, InsertLiteral::Bool(b)) => crate::row_codec::Value::Bool(*b),
+            (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a boolean literal (true/false)"
                 )))
             }
             (ColumnType::Integer | ColumnType::BigInt, _) => {
@@ -1307,17 +1326,23 @@ fn bind_set_assignments(
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
             }
-            (ColumnType::Vector(_), InsertLiteral::Number(_)) => {
+            (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a vector literal, got a number"
+                    "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
-            (ColumnType::Text, InsertLiteral::Number(_)) => {
+            (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a text literal, got a number"
+                    "column {name:?} expects a text literal, got a non-text literal"
+                )))
+            }
+            (ColumnType::Boolean, InsertLiteral::Bool(b)) => crate::row_codec::Value::Bool(*b),
+            (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a boolean literal (true/false)"
                 )))
             }
             (ColumnType::Integer | ColumnType::BigInt, _) => {
@@ -1822,17 +1847,25 @@ fn bind_upsert_assignments(
                     (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
                     }
-                    (ColumnType::Vector(_), InsertLiteral::Number(_)) => {
+                    (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
-                            "column {name:?} expects a vector literal, got a number"
+                            "column {name:?} expects a vector literal, got a non-vector literal"
                         )))
                     }
                     (ColumnType::Text, InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Text(s.clone())
                     }
-                    (ColumnType::Text, InsertLiteral::Number(_)) => {
+                    (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
-                            "column {name:?} expects a text literal, got a number"
+                            "column {name:?} expects a text literal, got a non-text literal"
+                        )))
+                    }
+                    (ColumnType::Boolean, InsertLiteral::Bool(b)) => {
+                        crate::row_codec::Value::Bool(*b)
+                    }
+                    (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a boolean literal (true/false)"
                         )))
                     }
                     (ColumnType::Integer | ColumnType::BigInt, _) => {
@@ -1918,9 +1951,9 @@ fn bind_file_insert(
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
-            (ColumnType::Text, InsertLiteral::Number(_)) => {
+            (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a text literal, got a number"
+                    "column {name:?} expects a text literal, got a non-text literal"
                 )))
             }
             // `bind_insert_form` の判別規則により VECTOR 列名は列リストに含まれない
@@ -1933,6 +1966,13 @@ fn bind_file_insert(
             }
             (ColumnType::Integer | ColumnType::BigInt, _) => {
                 bind_integer_literal(name, column.ty, literal)?
+            }
+            // ファイル形 INSERT は `path`/`body` の TEXT 列規約専用（本モジュール
+            // ドキュメント参照）。BOOLEAN 列は対象外として拒否する（Issue #883）。
+            (ColumnType::Boolean, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: BOOLEAN column is not supported for file-form INSERT"
+                )))
             }
         };
         if col_idx == path_column_index {
@@ -2013,6 +2053,11 @@ pub(crate) enum AggregateInput {
     /// `MIN`/`MAX`（バイト順・NULL 無視）でのみ使う（`SUM`/`AVG` は
     /// [`resolve_aggregate_input`] が型不整合として拒否済み）。
     TextColumn(usize),
+    /// `BOOLEAN` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-13・TASK-196、Issue #883）。`SUM`/`AVG`/`MIN`/
+    /// `MAX` は `TextColumn` と同じパターンで [`resolve_aggregate_input`] が
+    /// 型不整合として拒否する。
+    BooleanColumn(usize),
     /// 上記以外の `Scalar` 型に束縛された式（列参照 `id` 単体を除く。`vec_norm(...)`
     /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`program`（束縛時に
     /// ステップ列コンパイル済み、Issue #353）を行ループで評価する。`source` は
@@ -2436,6 +2481,12 @@ fn resolve_aggregate_input(
                             "column {name:?} cannot be used in aggregate functions yet"
                         )))
                     }
+                    (ColumnType::Boolean, AggregateFunc::Count) => {
+                        Ok(AggregateInput::BooleanColumn(index))
+                    }
+                    (ColumnType::Boolean, _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is BOOLEAN and cannot be used with SUM/AVG/MIN/MAX"
+                    ))),
                 };
             }
             if name == "id" {
