@@ -421,12 +421,12 @@ fn wire1_numeric_column_is_canonical_text_encoded_and_overflow_is_22003() {
         (
             1u64,
             [1.0, 0.0],
-            Value::Numeric(engine::numeric::Decimal::from_parts(150, 2)),
+            Value::Numeric(engine::numeric::Decimal::from_parts(150, 2).expect("valid scale")),
         ),
         (
             2,
             [0.0, 1.0],
-            Value::Numeric(engine::numeric::Decimal::from_parts(-150, 2)),
+            Value::Numeric(engine::numeric::Decimal::from_parts(-150, 2).expect("valid scale")),
         ),
         (3, [0.5, 0.5], Value::Null),
     ] {

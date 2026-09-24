@@ -2093,7 +2093,7 @@ mod tests {
         let mut b1 = HashInputBuilder::new(OpTag::Insert);
         push_value(
             &mut b1,
-            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 2)),
+            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 2).expect("valid scale")),
         )
         .expect("push numeric");
         let h1 = b1.finish();
@@ -2105,7 +2105,7 @@ mod tests {
         let mut b2 = HashInputBuilder::new(OpTag::Insert);
         push_value(
             &mut b2,
-            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 2)),
+            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 2).expect("valid scale")),
         )
         .expect("push numeric");
         let h2 = b2.finish();
@@ -2114,7 +2114,7 @@ mod tests {
         let mut b3 = HashInputBuilder::new(OpTag::Insert);
         push_value(
             &mut b3,
-            &Value::Numeric(crate::numeric::Decimal::from_parts(200, 2)),
+            &Value::Numeric(crate::numeric::Decimal::from_parts(200, 2).expect("valid scale")),
         )
         .expect("push numeric");
         let h3 = b3.finish();
@@ -2123,7 +2123,7 @@ mod tests {
         let mut b4 = HashInputBuilder::new(OpTag::Insert);
         push_value(
             &mut b4,
-            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 3)),
+            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 3).expect("valid scale")),
         )
         .expect("push numeric");
         let h4 = b4.finish();

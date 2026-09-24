@@ -1421,7 +1421,12 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         RowCodecError::Invalid("numeric value field is not 16 bytes".to_string())
                     })?;
                     let unscaled = i128::from_le_bytes(unscaled_arr);
-                    let decimal = Decimal::from_parts(unscaled, *scale);
+                    let decimal = Decimal::from_parts(unscaled, *scale).map_err(|_| {
+                        RowCodecError::Invalid(format!(
+                            "column {:?} numeric scale out of range",
+                            column.name
+                        ))
+                    })?;
                     if !decimal.fits_precision(*precision) {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} numeric value out of range for precision {precision}",
@@ -2319,7 +2324,12 @@ fn scan_scalar_columns_validated<'a>(
                         RowCodecError::Invalid("numeric value field is not 16 bytes".to_string())
                     })?;
                     let unscaled = i128::from_le_bytes(unscaled_arr);
-                    let decimal = Decimal::from_parts(unscaled, *scale);
+                    let decimal = Decimal::from_parts(unscaled, *scale).map_err(|_| {
+                        RowCodecError::Invalid(format!(
+                            "column {:?} numeric scale out of range",
+                            column.name
+                        ))
+                    })?;
                     if !decimal.fits_precision(*precision) {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} numeric value out of range for precision {precision}",

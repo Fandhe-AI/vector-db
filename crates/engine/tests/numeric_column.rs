@@ -96,7 +96,7 @@ fn expect_returning(outcome: SqlOutcome) -> engine::sql::exec::ReturningOutcome 
 }
 
 fn d(unscaled: i128, scale: u8) -> Decimal {
-    Decimal::from_parts(unscaled, scale)
+    Decimal::from_parts(unscaled, scale).expect("test scale must be within MAX_PRECISION")
 }
 
 // --- 受け入れ条件 1: 宣言 → INSERT → 再オープン → SELECT で値・型が往復する ---

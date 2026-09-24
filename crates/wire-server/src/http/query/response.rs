@@ -557,12 +557,12 @@ mod tests {
                 },
             }],
             rows: vec![
-                row(vec![Cell::Numeric(engine::numeric::Decimal::from_parts(
-                    150, 2,
-                ))]),
-                row(vec![Cell::Numeric(engine::numeric::Decimal::from_parts(
-                    -150, 2,
-                ))]),
+                row(vec![Cell::Numeric(
+                    engine::numeric::Decimal::from_parts(150, 2).expect("valid scale"),
+                )]),
+                row(vec![Cell::Numeric(
+                    engine::numeric::Decimal::from_parts(-150, 2).expect("valid scale"),
+                )]),
                 row(vec![Cell::Null]),
             ],
         };

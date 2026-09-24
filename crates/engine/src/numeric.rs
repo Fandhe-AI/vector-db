@@ -108,22 +108,27 @@ pub struct Decimal {
 }
 
 impl Decimal {
-    /// `unscaled`・`scale` から直接構築する（呼び出し元は列の `scale` と一致
-    /// していることを保証する契約。`-0` は正規化（`unscaled == 0` のとき符号は
-    /// 常に非負）する）。
+    /// `unscaled`・`scale` から検証付きで構築する（呼び出し元は列の `scale`
+    /// と一致していることを保証する契約だが、この契約は本コンストラクタが
+    /// 公開 API（`row_codec`・wire-server・テストから到達）であるため型
+    /// レベルでは強制できない）。`-0` は正規化（`unscaled == 0` のとき符号は
+    /// 常に非負）する。
     ///
-    /// `scale` が `MAX_PRECISION` を超える値は本来この契約違反だが、この
-    /// コンストラクタは公開 API（`row_codec`・wire-server・テストから到達）
-    /// であり呼び出し元の検証だけには頼れない。`pow10` と同じ fail-closed
-    /// 方針に揃え、範囲外の `scale` は `MAX_PRECISION` へ丸めることで
-    /// `Display`（[`fmt::Display`] 実装）の `pow10` 参照が必ず成功し、
-    /// 桁位置を欠いた値の誤表示（小数点なしの整数表示への意図しない縮退）が
-    /// 発生しないようにする。
-    pub fn from_parts(unscaled: i128, scale: u8) -> Self {
-        Decimal {
-            unscaled: if unscaled == 0 { 0 } else { unscaled },
-            scale: scale.min(MAX_PRECISION),
+    /// `scale > MAX_PRECISION` は `NumericError::OutOfRange` を返す
+    /// （fail-closed）。以前の実装は範囲外 `scale` を `MAX_PRECISION` へ
+    /// 暗黙に丸めていたが、`from_parts(1, 39)` が本来表す `10^-39` の値を
+    /// 検証なしに `10^-38` という別の数値へ変えてしまい、以後の `Display`・
+    /// ハッシュ・格納判定のすべてが誤った値を正として扱う結果になっていた
+    /// （P1 指摘対応）。呼び出し元が範囲外を渡し得る限り、丸めではなく
+    /// 明示的な拒否で不変条件を守る。
+    pub fn from_parts(unscaled: i128, scale: u8) -> Result<Self, NumericError> {
+        if scale > MAX_PRECISION {
+            return Err(NumericError::OutOfRange);
         }
+        Ok(Decimal {
+            unscaled: if unscaled == 0 { 0 } else { unscaled },
+            scale,
+        })
     }
 
     pub fn unscaled(&self) -> i128 {
@@ -324,7 +329,10 @@ pub fn parse_for_column(text: &str, precision: u8, scale: u8) -> Result<Decimal,
         unscaled = -unscaled;
     }
 
-    let value = Decimal::from_parts(unscaled, scale);
+    // `scale` は呼び出し元（カタログ経由の列定義）で `0..=MAX_PRECISION` に
+    // 検証済みのはずだが、`from_parts` の fail-closed 契約に合わせ `?` で
+    // 伝播する（本関数はもともと `Result` を返すため追加コストはない）。
+    let value = Decimal::from_parts(unscaled, scale)?;
     // 丸め後の繰り上がりで桁あふれし得るため、最終値で改めて検査する
     // （D4: `999.995` → 丸め後 `1000.00` は `22003`）。
     if !value.fits_precision(precision) {
@@ -338,7 +346,7 @@ mod tests {
     use super::*;
 
     fn d(unscaled: i128, scale: u8) -> Decimal {
-        Decimal::from_parts(unscaled, scale)
+        Decimal::from_parts(unscaled, scale).expect("test scale must be within MAX_PRECISION")
     }
 
     #[test]
@@ -467,19 +475,18 @@ mod tests {
     }
 
     #[test]
-    fn from_parts_clamps_out_of_range_scale() {
+    fn from_parts_rejects_out_of_range_scale() {
         // 呼び出し元がカタログ検証（`0..=MAX_PRECISION`）を経由せず
-        // `MAX_PRECISION` 超過の `scale` を渡しても、`pow10` 参照が失敗して
-        // 小数点位置を欠いた値へ誤表示（Display の fail-closed 縮退）する
-        // ことがないよう `MAX_PRECISION` へ丸めて格納する（P2 指摘対応）。
-        let clamped = Decimal::from_parts(1, 39);
-        assert_eq!(clamped.scale(), MAX_PRECISION);
+        // `MAX_PRECISION` 超過の `scale` を渡した場合、以前の実装は
+        // `MAX_PRECISION` へ暗黙に丸めていたが、これは `from_parts(1, 39)`
+        // が本来表す `10^-39` を検証なしに別の数値（`10^-38`）へ変えてしまう
+        // 問題があった（P1 指摘対応）。丸めず明示的に拒否することを固定する。
+        assert_eq!(Decimal::from_parts(1, 39), Err(NumericError::OutOfRange));
         assert_eq!(
-            clamped.to_string(),
-            "0.00000000000000000000000000000000000001"
+            Decimal::from_parts(5, u8::MAX),
+            Err(NumericError::OutOfRange)
         );
-
-        let clamped_u8_max = Decimal::from_parts(5, u8::MAX);
-        assert_eq!(clamped_u8_max.scale(), MAX_PRECISION);
+        // 境界値（`MAX_PRECISION` ちょうど）は受理される。
+        assert!(Decimal::from_parts(1, MAX_PRECISION).is_ok());
     }
 }
