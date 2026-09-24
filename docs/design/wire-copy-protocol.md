@@ -111,8 +111,13 @@
    送る。psql `\copy`・libpq は COPY サブプロトコルを開始したら必ず
    CopyDone／CopyFail のいずれかで終端させる（次のクエリへ先に進まない）ため、
    実用上の互換性は保たれる。読み捨てる総バイト数は
-   `limits::COPY_DISCARD_MAX_BYTES`（16 MiB）で有界化し、超過時は `08P01` で
-   切断する（DoS 対策）。
+   `limits::COPY_DISCARD_MAX_BYTES`（16 MiB。フレームヘッダー分の固定
+   オーバーヘッド `COPY_DISCARD_FRAME_OVERHEAD_BYTES` も含む）と、読み捨て
+   フレーム件数の上限 `limits::COPY_DISCARD_MAX_MESSAGES` の両方で有界化し、
+   いずれかを超過時は `08P01` で切断する（DoS 対策。body が空のフレームを
+   連送してもバイト予算だけでは非現実的な件数が必要になるため、件数上限を
+   独立に設けている）。`d`（CopyData）に加え、`H`（Flush）／`S`（Sync）も
+   この読み捨て予算を共有する（後述）。
 3. **`CopyFail` の `wire_code`**: PostgreSQL は `57014`
    （query_canceled）を返すが、ERR-6 の管轄表に `57014` が無く表外の新設は
    禁じられているため、既存の分類（`InvalidInput`／`22000`）へ写像した。
@@ -122,7 +127,14 @@
 5. **既定の①（`max_files_per_batch`）が 64 行**: 既定設定では 65 行以上の
    COPY は `54000` になる。契約どおりの挙動だが、既知の運用上の制約
    （環境変数 `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）として記録する。
-6. **複数文メッセージ（WIRE-16・TASK-219）との関係**: `COPY` は 1 つの
+6. **Flush（'H'）／Sync（'S'）の受理形状**: PostgreSQL wire v3 上この 2 種類は
+   length=4（body 厳密に空）以外の形状を持たない。COPY サブプロトコル中に
+   届いた場合は本文なしの no-op として無視するが、本文付き（宣言長が
+   4 バイトを超える）ものは `c`（CopyDone）／`X`（Terminate）と同じ
+   `read_length_prefixed_body(stream, 4, 4)` で検証し `08P01` として
+   fail-closed に拒否する（CopyDone・Terminate に既に課していた形状検査を
+   本 2 種類にも揃えた）。
+7. **複数文メッセージ（WIRE-16・TASK-219）との関係**: `COPY` は 1 つの
    `'Q'` メッセージ中で単独文でなければならない（`handshake::
    post_auth_loop` が `is_copy_statement` をメッセージ全文へ適用してから
    分岐するため）。末尾セミコロン 1 個は単一文と同じく許容されるが、
@@ -146,7 +158,7 @@
 | `crates/wire-server/src/copy.rs`（新設） | CopyIn／CopyOut サブプロトコル・行エンコーダ |
 | `crates/wire-server/src/handshake.rs` | 'Q' 分岐での COPY 委譲（`is_copy_statement` の覗き見） |
 | `crates/wire-server/src/result_encoder.rs` | `cell_to_text` の `pub(crate)` 化（COPY TO の行エンコーダが共有） |
-| `crates/wire-server/src/limits.rs` | `COPY_DISCARD_MAX_BYTES` |
+| `crates/wire-server/src/limits.rs` | `COPY_DISCARD_MAX_BYTES`・`COPY_DISCARD_FRAME_OVERHEAD_BYTES`・`COPY_DISCARD_MAX_MESSAGES` |
 | `crates/wire-server/src/lib.rs` | `pub(crate) mod copy;` |
 
 ## セキュリティ考慮（OWASP Top 10・AGENTS.md P0）
@@ -158,7 +170,11 @@
   `Visibility::Private` に固定（既存の書き込み経路をそのまま使う）。
   `COPY TO STDOUT` は広域取得の RLS 暗黙適用をそのまま経由する。
 - **DoS**: 生 CopyData バイト量（③）はバッファへ追加する前に判定する。
-  読み捨て総量は `COPY_DISCARD_MAX_BYTES` で有界化する。
+  読み捨て状態のバイト総量は `COPY_DISCARD_MAX_BYTES`、フレーム件数は
+  `COPY_DISCARD_MAX_MESSAGES` でそれぞれ独立に有界化する（`d`／`H`／`S` の
+  いずれも本文が空でもフレームヘッダー分のオーバーヘッドとして予算を
+  消費するため、極小フレームの連送で予算を無限に回避できない）。
+  Flush／Sync は本文付きを受理しない（本文付きは `08P01`）。
 - **fail-closed**: 曖昧なものはすべて拒否する（未対応のエスケープ・
   オプション・想定外のメッセージ、スキーマの競合）。commit は CopyDone の
   後に 1 回だけ行い、それより前のどの失敗でも副作用はゼロ。
