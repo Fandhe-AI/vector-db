@@ -219,11 +219,17 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
         // 新規タグ）。
         Value::Real(v) => {
             b.push_u8(5);
-            b.push_raw(&v.to_le_bytes());
+            // F4: エンコード時に `-0.0` を `+0.0` へ正規化する契約
+            // （row_codec.rs のエンコード経路と同じ理由）。ここでハッシュ入力を
+            // 正規化前の生ビット列のままにすると、論理的に同一な値の
+            // `operation_id` 再送が重複応答（23505）ではなく内容不一致
+            // （22023）として扱われてしまう。
+            b.push_raw(&crate::scalar_float::canonicalize_real(*v).to_le_bytes());
         }
         Value::Double(v) => {
             b.push_u8(6);
-            b.push_raw(&v.to_le_bytes());
+            // F4: canonicalize_real と同じ理由。
+            b.push_raw(&crate::scalar_float::canonicalize_double(*v).to_le_bytes());
         }
         Value::Bool(b_val) => {
             b.push_u8(7);
@@ -1551,6 +1557,36 @@ mod tests {
         let h_real_again =
             for_typed_insert(7, Visibility::Public, &embedding, &cols_real).expect("hash");
         assert_eq!(h_real, h_real_again);
+    }
+
+    #[test]
+    fn for_typed_insert_real_and_double_signed_zero_normalizes_to_positive_zero() {
+        // F4: `-0.0` と `+0.0` は論理的に同一値であり、`operation_id` の
+        // 再送判定（同一内容なら 23505・不一致なら 22023）はハッシュ一致で
+        // 決まる。エンコード経路（row_codec.rs）だけでなくハッシュ入力の
+        // 生成でも正規化しないと、再送時に符号ビットの偶然の違いで
+        // 誤って内容不一致（22023）と判定されてしまう。
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let real_pos = Value::Real(0.0_f32);
+        let real_neg = Value::Real(-0.0_f32);
+        let double_pos = Value::Double(0.0_f64);
+        let double_neg = Value::Double(-0.0_f64);
+        let cols_real_pos: [(&str, &Value); 1] = [("v", &real_pos)];
+        let cols_real_neg: [(&str, &Value); 1] = [("v", &real_neg)];
+        let cols_double_pos: [(&str, &Value); 1] = [("v", &double_pos)];
+        let cols_double_neg: [(&str, &Value); 1] = [("v", &double_neg)];
+
+        let h_real_pos =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_real_pos).expect("hash");
+        let h_real_neg =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_real_neg).expect("hash");
+        let h_double_pos =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_double_pos).expect("hash");
+        let h_double_neg =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_double_neg).expect("hash");
+
+        assert_eq!(h_real_pos, h_real_neg);
+        assert_eq!(h_double_pos, h_double_neg);
     }
 
     #[test]

@@ -128,7 +128,7 @@ Issue #891〜#896 の担当範囲は、本 Issue では振る舞いを追加せ�
 追加する。
 
 | 経路 | 拒否コード | 対応 Issue |
-|------|-----------|-----------|
+| --- | --- | --- |
 | `WHERE`・フィルタ列の解決（`declarative_filter.rs`・`sql::udf_call`・`sql::using_plan`・`sql::scoring_boost`） | `22000`（既存の TEXT 列限定チェックへ合流） | #891 |
 | 集計の束縛（`sql::parser::resolve_aggregate_input`） | `22000`（`COUNT` を含む全関数） | #892 |
 | `sql::scalar_index`（列単位索引構築） | 索引化しない（`per_column.push(None)`。VECTOR 列と同じ扱い） | #893 |

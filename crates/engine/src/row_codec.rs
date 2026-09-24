@@ -286,6 +286,10 @@ pub fn encode_row(
                         column.name
                     )));
                 }
+                // F4: 公開 API（typed insert 等）経由で SQL リテラルの
+                // 解析（scalar_float::parse_real）を経ずに `-0.0` が渡り得るため、
+                // 永続化バイト列を確定させる直前に正規化する。
+                let v = crate::scalar_float::canonicalize_real(*v);
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&v.to_le_bytes());
             }
@@ -302,6 +306,8 @@ pub fn encode_row(
                         column.name
                     )));
                 }
+                // F4: canonicalize_real と同じ理由（-0.0 正規化）。
+                let v = crate::scalar_float::canonicalize_double(*v);
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&v.to_le_bytes());
             }
@@ -732,6 +738,8 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                         column.name
                     )));
                 }
+                // F4: -0.0 正規化（他エンコード経路と同じ理由。row_codec.rs 冒頭参照）。
+                let v = crate::scalar_float::canonicalize_real(*v);
                 reserve(&mut buf, SCALAR_REAL_ENTRY_LEN)?;
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&v.to_le_bytes());
@@ -749,6 +757,8 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                         column.name
                     )));
                 }
+                // F4: -0.0 正規化。
+                let v = crate::scalar_float::canonicalize_double(*v);
                 reserve(&mut buf, SCALAR_DOUBLE_ENTRY_LEN)?;
                 buf.push(PRESENCE_VALUE);
                 buf.extend_from_slice(&v.to_le_bytes());
@@ -891,6 +901,8 @@ pub(crate) fn merge_encode_scalar_columns(
                             column.name
                         )));
                     }
+                    // F4: -0.0 正規化。
+                    let v = crate::scalar_float::canonicalize_real(*v);
                     reserve(&mut buf, SCALAR_REAL_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     buf.extend_from_slice(&v.to_le_bytes());
@@ -908,6 +920,8 @@ pub(crate) fn merge_encode_scalar_columns(
                             column.name
                         )));
                     }
+                    // F4: -0.0 正規化。
+                    let v = crate::scalar_float::canonicalize_double(*v);
                     reserve(&mut buf, SCALAR_DOUBLE_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     buf.extend_from_slice(&v.to_le_bytes());
@@ -1380,6 +1394,24 @@ mod tests {
                 other => panic!("expected Double, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn encode_row_normalizes_signed_zero_to_positive_zero_in_stored_bytes() {
+        // F4: `-0.0` はエンコード時点で `+0.0` へ正規化される契約。decode 側の
+        // 正規化（encode_decode_roundtrip_preserves_real_and_double_boundary_values）
+        // だけに頼ると、保存バイト列そのものは符号付きゼロのまま残り、
+        // `content_hash`（台帳の 23505／22023 判定）の入力が読み出し結果と
+        // 食い違う。ここでは encode_row が返す生バイト列を直接比較し、
+        // `-0.0`／`+0.0` が同一バイト列に写ることを固定する。
+        let schema = float_schema();
+        let values_pos = vec![Value::Real(0.0), Value::Double(0.0)];
+        let values_neg = vec![Value::Real(-0.0), Value::Double(-0.0)];
+        let encoded_pos =
+            encode_row(&schema, "tenant-a", Visibility::Public, &values_pos).expect("encode");
+        let encoded_neg =
+            encode_row(&schema, "tenant-a", Visibility::Public, &values_neg).expect("encode");
+        assert_eq!(encoded_pos, encoded_neg);
     }
 
     #[test]
