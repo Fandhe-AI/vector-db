@@ -545,8 +545,11 @@ impl ScalarIndex {
                 // `VECTOR` 列・`BOOLEAN` 列はいずれも索引対象外（BOOLEAN は
                 // Issue #883・D-e。値域が 2 値のため索引化コストに見合わず、
                 // 対応述語 `BoolEquals` は常に plain scan——`scalar_plan.rs`
-                // 参照——のまま据え置く）。
-                ColumnType::Vector(_) | ColumnType::Boolean => per_column.push(None),
+                // 参照——のまま据え置く）。`BYTEA` 列も等価/前方一致述語を
+                // 持たないため索引対象外（Issue #886）。
+                ColumnType::Vector(_) | ColumnType::Boolean | ColumnType::Bytea => {
+                    per_column.push(None)
+                }
             }
         }
 

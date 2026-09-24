@@ -325,6 +325,17 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
             ty: engine::catalog::ColumnType::Boolean,
             ..
         } => false,
+        // `BYTEA` 列（Issue #886）は本 Issue（#936・WIRE-14）の策定時点では
+        // 未存在の型のため、バイナリ表現は spec 側で未決定。公告 OID
+        // （`WireType::Text`）は `supports_binary() == true` だが、値の実体は
+        // 生バイト列の hex テキスト表現（`Cell::Bytes`）であり `Text` の
+        // UTF-8 生バイト表現とは異なるため、`VECTOR`・`BOOLEAN` と同様に
+        // fail-closed で非対応とする（RowDescription への専用 OID 公告は
+        // Issue #895 の担当）。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Bytea,
+            ..
+        } => false,
         // 実行時型（Float/Bool/Vector）が静的に決まらないため fail-closed
         // で非対応とする（#895 で型情報が付いたら見直す）。
         ColumnMeta::Computed { .. } => false,
@@ -429,6 +440,9 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         }
         Cell::Float(f) => Ok(Some(f.to_string())),
         Cell::Bool(b) => Ok(Some(if *b { "t".to_string() } else { "f".to_string() })),
+        // `BYTEA` のテキスト表現は PostgreSQL 既定の `bytea_output=hex`（`\x` ＋
+        // 小文字 16 進）と同形にする（B5・Issue #886）。
+        Cell::Bytes(b) => Ok(Some(engine::bytea::format_hex_text(b))),
     }
 }
 
@@ -548,7 +562,11 @@ where
                         out.extend_from_slice(&len.to_be_bytes());
                         out.extend_from_slice(bytes);
                     }
-                    Cell::Integer(_) | Cell::Vector(_) | Cell::Float(_) | Cell::Bool(_) => {
+                    Cell::Integer(_)
+                    | Cell::Vector(_)
+                    | Cell::Float(_)
+                    | Cell::Bool(_)
+                    | Cell::Bytes(_) => {
                         return Err(EncodeError);
                     }
                 },

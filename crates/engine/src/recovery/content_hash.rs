@@ -221,6 +221,13 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(7);
             b.push_u8(u8::from(*b_val));
         }
+        // タグ 8〜10 は DATE/TIMESTAMP/NUMERIC（並行実装中の別 Issue）向けに予約し、
+        // BYTEA は TABLE-13 の宣言順で 11 とする（Issue #886。長さ前置は Text と
+        // 同じ方式で、型タグの違いだけでハッシュを区別する）。
+        Value::Bytes(bytes) => {
+            b.push_u8(11);
+            b.push_bytes(bytes)?;
+        }
     }
     Ok(())
 }
@@ -997,6 +1004,38 @@ mod tests {
         let update_hash = update_b.finish();
 
         assert_ne!(insert_hash, update_hash);
+    }
+
+    // BYTEA（タグ 11）と TEXT（タグ 1）は本体バイト列が偶然一致していても
+    // 型タグの違いだけで別ハッシュになる（Issue #886。golden な区別の固定）。
+    #[test]
+    fn bytea_and_text_values_produce_different_hashes_even_with_matching_bytes() {
+        let bytes_value = Value::Bytes(vec![0xde, 0xad]);
+        let text_value = Value::Text("\\xdead".to_string());
+        let bytes_hash = for_typed_insert(1, Visibility::Public, &[], &[("blob", &bytes_value)])
+            .expect("hash bytes");
+        let text_hash = for_typed_insert(1, Visibility::Public, &[], &[("blob", &text_value)])
+            .expect("hash text");
+        assert_ne!(bytes_hash, text_hash);
+    }
+
+    // 同一の BYTEA 値からは同じハッシュが再現する（再送判定の前提）。
+    #[test]
+    fn bytea_hash_is_reproducible_for_identical_content() {
+        let value = Value::Bytes(vec![0x01, 0x02, 0x03]);
+        let h1 = for_typed_insert(1, Visibility::Public, &[], &[("blob", &value)]).expect("hash 1");
+        let h2 = for_typed_insert(1, Visibility::Public, &[], &[("blob", &value)]).expect("hash 2");
+        assert_eq!(h1, h2);
+    }
+
+    // バイト列が異なれば BYTEA のハッシュも異なる（内容不一致検出の前提）。
+    #[test]
+    fn different_bytea_values_produce_different_hashes() {
+        let a = Value::Bytes(vec![0xde, 0xad]);
+        let b = Value::Bytes(vec![0xbe, 0xef]);
+        let hash_a = for_typed_insert(1, Visibility::Public, &[], &[("blob", &a)]).expect("hash a");
+        let hash_b = for_typed_insert(1, Visibility::Public, &[], &[("blob", &b)]).expect("hash b");
+        assert_ne!(hash_a, hash_b);
     }
 
     // 長さプレフィクスにより "ab"+"c" と "a"+"bc" が同一ハッシュにならない

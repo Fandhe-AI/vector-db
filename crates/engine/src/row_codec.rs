@@ -118,6 +118,11 @@ pub enum Value {
     /// 真偽値列の値（TABLE-13・TASK-196、Issue #883）。NULL とはバイト列上も
     /// 別物になる（[`PRESENCE_NULL`] とは別に 1 バイトの値本体を持つ）。
     Bool(bool),
+    /// 可変長バイナリ列の値（TABLE-13・TASK-197、Issue #886）。NULL・空バイト列
+    /// （`Vec::new()`）はバイト列上も区別する。UTF-8 検証を行わない点のみ
+    /// [`Value::Text`] と異なり、行バイト表現（presence + `u32` LE 長 + 本体）は
+    /// 共有する。
+    Bytes(Vec<u8>),
 }
 
 /// スカラー列走査（[`scan_scalar_columns`] 系）の借用結果。TEXT・BOOLEAN の
@@ -127,24 +132,29 @@ pub enum Value {
 pub enum ScalarRef<'a> {
     Text(&'a str),
     Bool(bool),
+    /// `BYTEA` 列の借用結果（Issue #886）。TEXT 前提の消費側（[`as_text`]）へは
+    /// 流入させない（fail-closed）。
+    ///
+    /// [`as_text`]: ScalarRef::as_text
+    Bytes(&'a [u8]),
 }
 
 impl<'a> ScalarRef<'a> {
     /// TEXT 前提の既存消費側（等価/前方一致フィルタ・二次索引・hybrid 本文・
-    /// GROUP BY キー等）が `Bool` を取り違えて TEXT として扱わないよう、
+    /// GROUP BY キー等）が `Bool`／`Bytes` を取り違えて TEXT として扱わないよう、
     /// `Text` 以外は `None` を返す（fail-closed。呼び出し元はスキーマ型で
-    /// 事前に `Boolean` 列を除外するか、`None` を型不一致として拒否する）。
+    /// 事前に対象外の列を除外するか、`None` を型不一致として拒否する）。
     pub fn as_text(&self) -> Option<&'a str> {
         match self {
             ScalarRef::Text(s) => Some(s),
-            ScalarRef::Bool(_) => None,
+            ScalarRef::Bool(_) | ScalarRef::Bytes(_) => None,
         }
     }
 
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             ScalarRef::Bool(b) => Some(*b),
-            ScalarRef::Text(_) => None,
+            ScalarRef::Text(_) | ScalarRef::Bytes(_) => None,
         }
     }
 }
@@ -257,7 +267,7 @@ pub fn encode_row(
             Value::Vector(vector) => {
                 let expected_dim = match column.ty {
                     ColumnType::Vector(dim) => dim,
-                    ColumnType::Text | ColumnType::Boolean => {
+                    ColumnType::Text | ColumnType::Boolean | ColumnType::Bytea => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Vector value, got Vector",
                             column.name
@@ -293,6 +303,26 @@ pub fn encode_row(
                 }
                 buf.push(PRESENCE_VALUE);
                 buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
+            }
+            Value::Bytes(bytes) => {
+                if !matches!(column.ty, ColumnType::Bytea) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Bytea value, got Bytea",
+                        column.name
+                    )));
+                }
+                let byte_len = u32::try_from(bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid(format!("bytea field too long: {} bytes", bytes.len()))
+                })?;
+                if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+                    return Err(RowCodecError::Invalid(format!(
+                        "bytea field length {byte_len} exceeds limit {}",
+                        crate::bytea::MAX_BYTEA_FIELD_LEN
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&byte_len.to_le_bytes());
+                buf.extend_from_slice(bytes);
             }
         }
     }
@@ -492,6 +522,44 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     })?;
                     values.push(Value::Bool(b));
                 }
+                ColumnType::Bytea => {
+                    let len_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before bytea length field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at bytea length field".to_string(),
+                            )
+                        })?;
+                    let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("bytea length field is not 4 bytes".to_string())
+                    })?;
+                    let byte_len = u32::from_le_bytes(len_arr);
+                    if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+                        return Err(RowCodecError::Invalid(format!(
+                            "bytea field length {byte_len} exceeds limit {}",
+                            crate::bytea::MAX_BYTEA_FIELD_LEN
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after bytea length field".to_string(),
+                        )
+                    })?;
+                    let bytea_end = offset.checked_add(byte_len as usize).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after bytea field".to_string())
+                    })?;
+                    let bytea_bytes = buf.get(offset..bytea_end).ok_or_else(|| {
+                        RowCodecError::Invalid("row buffer truncated at bytea field".to_string())
+                    })?;
+                    offset = bytea_end;
+                    values.push(Value::Bytes(bytea_bytes.to_vec()));
+                }
             },
             other => {
                 return Err(RowCodecError::Invalid(format!(
@@ -626,6 +694,30 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_VALUE);
                 buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
             }
+            Value::Bytes(bytes) => {
+                if !matches!(column.ty, ColumnType::Bytea) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Bytea value, got Bytea",
+                        column.name
+                    )));
+                }
+                let byte_len = u32::try_from(bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid(format!("bytea field too long: {} bytes", bytes.len()))
+                })?;
+                if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+                    return Err(RowCodecError::Invalid(format!(
+                        "bytea field length {byte_len} exceeds limit {}",
+                        crate::bytea::MAX_BYTEA_FIELD_LEN
+                    )));
+                }
+                // フレーミング（presence(1) + 長さ(4)）は TEXT と同一のため
+                // `scalar_text_entry_len` を共有する（B3）。
+                let entry_len = scalar_text_entry_len(byte_len)?;
+                reserve(&mut buf, entry_len)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&byte_len.to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
         }
     }
 
@@ -705,6 +797,30 @@ pub(crate) fn merge_encode_scalar_columns(
         Ok(())
     };
 
+    // BYTEA 用の長さプレフィックス書き込み。フレーミングは `write_text` と
+    // 完全に同一（presence(1) + 長さ(4) + 本体）だが、UTF-8 検証を行わず
+    // 上限を `MAX_BYTEA_FIELD_LEN` で検証する点のみ異なる（B3）。
+    let write_bytes = |buf: &mut Vec<u8>,
+                       reserve: &mut dyn FnMut(&mut Vec<u8>, u32) -> Result<()>,
+                       bytes: &[u8]|
+     -> Result<()> {
+        let byte_len = u32::try_from(bytes.len()).map_err(|_| {
+            RowCodecError::Invalid(format!("bytea field too long: {} bytes", bytes.len()))
+        })?;
+        if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+            return Err(RowCodecError::Invalid(format!(
+                "bytea field length {byte_len} exceeds limit {}",
+                crate::bytea::MAX_BYTEA_FIELD_LEN
+            )));
+        }
+        let entry_len = scalar_text_entry_len(byte_len)?;
+        reserve(buf, entry_len)?;
+        buf.push(PRESENCE_VALUE);
+        buf.extend_from_slice(&byte_len.to_le_bytes());
+        buf.extend_from_slice(bytes);
+        Ok(())
+    };
+
     for (idx, column) in schema.columns.iter().enumerate() {
         if matches!(column.ty, ColumnType::Vector(_)) {
             // VECTOR 列は encode_scalar_columns と同じくスキップ（embedding は
@@ -751,6 +867,15 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_VALUE);
                     buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
                 }
+                Value::Bytes(bytes) => {
+                    if !matches!(column.ty, ColumnType::Bytea) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Bytea value, got Bytea",
+                            column.name
+                        )));
+                    }
+                    write_bytes(&mut buf, &mut reserve, bytes)?;
+                }
             }
         } else {
             // SET 対象でない列は既存の借用値（またはNULL）をそのまま書き込む。
@@ -776,6 +901,9 @@ pub(crate) fn merge_encode_scalar_columns(
                     reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     buf.push(if b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
+                }
+                Some(ScalarRef::Bytes(bytes)) => {
+                    write_bytes(&mut buf, &mut reserve, bytes)?;
                 }
             }
         }
@@ -982,6 +1110,52 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
+                ColumnType::Bytea => {
+                    let len_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before bytea length field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at bytea length field".to_string(),
+                            )
+                        })?;
+                    let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("bytea length field is not 4 bytes".to_string())
+                    })?;
+                    let byte_len = u32::from_le_bytes(len_arr);
+                    if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+                        return Err(RowCodecError::Invalid(format!(
+                            "bytea field length {byte_len} exceeds limit {}",
+                            crate::bytea::MAX_BYTEA_FIELD_LEN
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after bytea length field".to_string(),
+                        )
+                    })?;
+                    let bytea_end = offset.checked_add(byte_len as usize).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after bytea field".to_string())
+                    })?;
+                    let bytea_bytes = buf.get(offset..bytea_end).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "scalar payload truncated at bytea field".to_string(),
+                        )
+                    })?;
+                    offset = bytea_end;
+                    // BYTEA は UTF-8 検証を行わない点のみ TEXT と異なる
+                    // （presence タグ・宣言長上限・バッファ境界の構造検証は共有）。
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Bytes(bytea_bytes)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
             },
             other => {
                 return Err(RowCodecError::Invalid(format!(
@@ -1029,6 +1203,14 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
                 values.push(Value::Text(owned));
             }
             Some(ScalarRef::Bool(b)) => values.push(Value::Bool(b)),
+            Some(ScalarRef::Bytes(bytes)) => {
+                let mut owned: Vec<u8> = Vec::new();
+                owned.try_reserve_exact(bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid("failed to reserve bytea field".to_string())
+                })?;
+                owned.extend_from_slice(bytes);
+                values.push(Value::Bytes(owned));
+            }
         }
     }
     Ok(values)
@@ -1591,5 +1773,102 @@ mod tests {
             validate_scalar_columns(&schema, &buf),
             Err(RowCodecError::Invalid(_))
         ));
+    }
+
+    // --- BYTEA 列（Issue #886）の decode-side DoS ガード ------------------------
+
+    fn bytea_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("blob", ColumnType::Bytea, true)],
+        )
+    }
+
+    #[test]
+    fn decode_row_rejects_bytea_declared_length_over_limit_before_body_read() {
+        let schema = bytea_schema();
+        let mut buf = Vec::new();
+        buf.push(ROW_CODEC_FORMAT_VERSION);
+        buf.push(Visibility::Public.to_byte());
+        let tenant_bytes = b"tenant-a";
+        buf.push(tenant_bytes.len() as u8);
+        buf.extend_from_slice(tenant_bytes);
+        buf.push(PRESENCE_VALUE);
+        // 宣言長は上限超過（MAX + 1）。本体は短いままにする——長さ検査が
+        // 本体バッファの実サイズによらず先に効くことを固定する（B3）。
+        buf.extend_from_slice(&(crate::bytea::MAX_BYTEA_FIELD_LEN + 1).to_le_bytes());
+        buf.extend_from_slice(b"short");
+        let result = decode_row(&schema, &buf);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn decode_row_rejects_truncated_bytea_body() {
+        let schema = bytea_schema();
+        let mut buf = Vec::new();
+        buf.push(ROW_CODEC_FORMAT_VERSION);
+        buf.push(Visibility::Public.to_byte());
+        let tenant_bytes = b"tenant-a";
+        buf.push(tenant_bytes.len() as u8);
+        buf.extend_from_slice(tenant_bytes);
+        buf.push(PRESENCE_VALUE);
+        // 宣言長は 10 バイトだが本体は 3 バイトしかない。
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(b"abc");
+        let result = decode_row(&schema, &buf);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn encode_row_rejects_bytes_value_for_text_column() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        );
+        let values = vec![Value::Bytes(vec![0xde, 0xad])];
+        let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn encode_row_rejects_text_value_for_bytea_column() {
+        let schema = bytea_schema();
+        let values = vec![Value::Text("hello".to_string())];
+        let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn bytea_round_trips_through_encode_decode_row() {
+        let schema = bytea_schema();
+        let values = vec![Value::Bytes(vec![0x00, 0xff, 0xde, 0xad])];
+        let buf = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        let decoded = decode_row(&schema, &buf).expect("decode");
+        assert_eq!(decoded.values, values);
+    }
+
+    #[test]
+    fn bytea_null_and_empty_are_distinct_after_round_trip() {
+        let schema = bytea_schema();
+        let null_buf = encode_row(&schema, "tenant-a", Visibility::Public, &[Value::Null])
+            .expect("encode null");
+        let empty_buf = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Bytes(Vec::new())],
+        )
+        .expect("encode empty");
+        assert_ne!(null_buf, empty_buf);
+        assert_eq!(
+            decode_row(&schema, &null_buf).expect("decode null").values,
+            vec![Value::Null]
+        );
+        assert_eq!(
+            decode_row(&schema, &empty_buf)
+                .expect("decode empty")
+                .values,
+            vec![Value::Bytes(Vec::new())]
+        );
     }
 }

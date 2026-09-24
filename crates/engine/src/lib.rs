@@ -223,6 +223,7 @@ pub mod batch_fallback;
 pub mod batch_limits;
 pub mod batch_search;
 pub mod buffer_pool;
+pub mod bytea;
 pub mod catalog;
 pub mod chunking;
 pub mod core;

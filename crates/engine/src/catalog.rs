@@ -223,6 +223,9 @@ pub enum ColumnType {
     /// 真偽値列（TABLE-13・TASK-196、Issue #883）。NULL と false は行バイト列・
     /// 投影・述語評価のいずれでも区別する（[`crate::row_codec::Value::Bool`] 参照）。
     Boolean,
+    /// 可変長バイナリ列（TABLE-13・TASK-197、Issue #886）。NULL と空バイト列は
+    /// 行バイト列上も区別する（[`crate::row_codec::Value::Bytes`] 参照）。
+    Bytea,
 }
 
 impl ColumnType {
@@ -240,6 +243,7 @@ impl ColumnType {
             ColumnType::Text => ("text", "-".to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
             ColumnType::Boolean => ("boolean", "-".to_string()),
+            ColumnType::Bytea => ("bytea", "-".to_string()),
         }
     }
 
@@ -271,6 +275,14 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::Boolean)
+            }
+            "bytea" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "bytea column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Bytea)
             }
             other => Err(CatalogError::Invalid(format!(
                 "unknown column type: {other:?}"
@@ -320,7 +332,7 @@ impl TableSchema {
     pub fn vector_dim(&self) -> Option<u32> {
         self.columns.iter().find_map(|c| match c.ty {
             ColumnType::Vector(dim) => Some(dim),
-            ColumnType::Text | ColumnType::Boolean => None,
+            ColumnType::Text | ColumnType::Boolean | ColumnType::Bytea => None,
         })
     }
 
