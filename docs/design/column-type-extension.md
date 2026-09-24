@@ -165,6 +165,43 @@ TABLE-13・TASK-196（Issue #883）で `ColumnType::Boolean` を追加した。�
   `<>`/式中の bool 列参照、SQL `CREATE TABLE` 構文での `BOOLEAN` 宣言
   （SQL-23 は未実装）、BOOLEAN 列のスカラー二次索引化。
 
+## #888 追記: ARRAY 列型（複合型のうち配列部分）
+
+TABLE-14・TASK-198（Issue #888）で `ColumnType::Array(ArrayType)` を追加した。
+着手時点で origin/main には TEXT・BOOLEAN のみがマージ済み（INTEGER/BIGINT/
+REAL/DOUBLE・DATE/TIMESTAMP は未マージ）だったため、要素型は `ArrayElemType`
+（`Text`／`Bool` の 2 値）に限定した。詳細な設計判断・バイトレイアウトは
+`docs/design/array-column-type.md` を参照。上記チェックリストとの対応は以下の
+とおり。
+
+- カタログ型タグは `"array"`、`param` は `"<elem_tag>,<max_len>"`（例:
+  `text,64`）。要素数上限の実装既定値は `MAX_ARRAY_ELEMENTS = 1024`。
+- 行バイト表現: presence タグに続き flags(1・`0x00` 固定)＋要素数(`u32 LE`)＋
+  ペイロード長(`u32 LE`)＋要素列（TEXT は `u32 LE` 長＋UTF-8、BOOL は 1
+  バイト）。TEXT/VECTOR/BOOLEAN の既存バイト表現は不変。
+- `row_codec::ScalarRef::Array(ArrayRef<'a>)`・`Value::Array(ArrayValue)` を
+  追加。`ArrayRef` は走査時に構造・UTF-8・要素数上限を検証済みの借用結果。
+- `recovery::content_hash::push_value` のタグは `Array = 10`（3〜9 は他型
+  向けに予約）。
+- `sql::parser::parse_array_literal` が `'{v1,v2,...}'` リテラルを状態機械で
+  解析する（字句解析器は変更しない）。NULL 要素（引用なしの `NULL`）は
+  D-A6 により本版では受理せず `22000`。
+- `WHERE`（等価・`IS NULL` を含む）・要素/パス演算子（`tags[1]`・`@>`）は
+  対象外のまま `22000`／`42601` で拒否（申し送り）。
+- `sql::scalar_index::ScalarIndex` は ARRAY 列を索引化しない
+  （`per_column.push(None)`）。
+- 集計: `COUNT(<ARRAY 列>)`（非 NULL 行数）のみ受理し、`SUM`/`AVG`/`MIN`/
+  `MAX` は `22000` で拒否する（`AggregateInput::ArrayColumn`）。
+- wire-server: `result_encoder.rs` は PostgreSQL 配列テキスト形式（`{a,b}`。
+  引用・エスケープ規則込み）で描画し、NoSQL `http/query/response.rs` は
+  ネイティブ JSON 配列で描画する。NoSQL `insert`／`update` op は ARRAY 列への
+  JSON 値を明示的に拒否する（`22000`。JSON 配列束縛は #896・NOSQL-17 へ
+  申し送り）。
+- 対象外（申し送り）: 配列列への等価（`=`／`IN`）・`IS NULL` 述語、要素/パス
+  演算子、NoSQL の JSON 配列束縛（#896）、`22P02` の新設、SQL `CREATE TABLE`
+  構文での `<型>[]` 宣言（#899）、数値・日時要素型（兄弟 PR マージ後）、NULL
+  要素対応、配列列のスカラー二次索引化。
+
 ## #886 追記: BYTEA 列型
 
 TABLE-13・TASK-197（Issue #886。関連: WIRE-13・NOSQL-17）で `ColumnType::Bytea`

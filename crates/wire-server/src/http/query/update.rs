@@ -276,6 +276,14 @@ fn map_set_assignments(
                     "SET BOOLEAN column value must be a JSON boolean",
                 ))
             }
+            // 配列列（TABLE-14・Issue #888）の JSON 配列束縛は本 Issue の対象外
+            // （NoSQL 表層の JSON 配列束縛は #896・NOSQL-17 の担当）。BOOLEAN と
+            // 同じく明示的に拒否する。
+            (ColumnType::Array(_), _) => {
+                return Err(UpdateError::Set(
+                    "SET ARRAY column is not supported via the NoSQL surface",
+                ))
+            }
             // `BYTEA` 列は base64 の JSON string のみ受理し、復号したバイト列を
             // 正準形（`\x` ＋ 小文字 hex）の `InsertLiteral::String` へ再エンコード
             // する（B9・Issue #886）。engine 側の束縛経路を hex 解析の 1 本に

@@ -287,6 +287,11 @@ pub enum ColumnType {
     /// 真偽値列（TABLE-13・TASK-196、Issue #883）。NULL と false は行バイト列・
     /// 投影・述語評価のいずれでも区別する（[`crate::row_codec::Value::Bool`] 参照）。
     Boolean,
+    /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
+    /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・
+    /// 二次索引・`EXPLAIN`）からは一貫して非対象として除外する（`VECTOR` 列との
+    /// 責務境界。`docs/design/array-column-type.md` 参照）。
+    Array(ArrayType),
     /// 可変長バイナリ列（TABLE-13・TASK-197、Issue #886）。NULL と空バイト列は
     /// 行バイト列上も区別する（[`crate::row_codec::Value::Bytes`] 参照）。
     Bytea,
@@ -315,6 +320,10 @@ impl ColumnType {
             ColumnType::Text => ("text", "-".to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
             ColumnType::Boolean => ("boolean", "-".to_string()),
+            ColumnType::Array(array_ty) => (
+                "array",
+                format!("{},{}", array_ty.elem().catalog_tag(), array_ty.max_len()),
+            ),
             ColumnType::Bytea => ("bytea", "-".to_string()),
             ColumnType::Enum(def) => ("enum", def.name.clone()),
         }
@@ -362,6 +371,35 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::Boolean)
+            }
+            "array" => {
+                // `<elem_tag>,<max_len>` のちょうど 2 要素（Issue #888 D-A2）。
+                // カンマの数が違う場合は要素・上限のいずれかが欠落・過多であり
+                // fail-closed に拒否する。
+                let mut parts = param.splitn(3, ',');
+                let elem_tag = parts
+                    .next()
+                    .ok_or_else(|| CatalogError::Invalid("array param is empty".to_string()))?;
+                let max_len_field = parts.next().ok_or_else(|| {
+                    CatalogError::Invalid(format!("array param missing max_len: {param:?}"))
+                })?;
+                if parts.next().is_some() {
+                    return Err(CatalogError::Invalid(format!(
+                        "array param has too many fields: {param:?}"
+                    )));
+                }
+                let elem = ArrayElemType::from_catalog_tag(elem_tag)?;
+                // 先頭ゼロ等の非正準表現を拒否する（`s != n.to_string()` 比較）。
+                let max_len: u32 = max_len_field.parse().map_err(|_| {
+                    CatalogError::Invalid(format!("malformed array max_len: {max_len_field:?}"))
+                })?;
+                if max_len.to_string() != max_len_field {
+                    return Err(CatalogError::Invalid(format!(
+                        "array max_len is not in canonical form: {max_len_field:?}"
+                    )));
+                }
+                let array_ty = ArrayType::new(elem, max_len)?;
+                Ok(ColumnType::Array(array_ty))
             }
             "bytea" => {
                 if param != "-" {
@@ -649,6 +687,69 @@ fn decode_enum_type_def_body(name: &str, bytes: &[u8]) -> Result<EnumTypeDef> {
     })
 }
 
+/// 配列列（`ColumnType::Array`）の要素型（TABLE-14・Issue #888）。`VECTOR`・`ARRAY`
+/// （入れ子・多次元配列）を構造的に除外し、`VECTOR` 列との責務境界を型で保証する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayElemType {
+    Text,
+    Bool,
+}
+
+impl ArrayElemType {
+    /// カタログ v2 の `param` フィールド内で使う要素型タグ（Issue #888 D-A2）。
+    fn catalog_tag(&self) -> &'static str {
+        match self {
+            ArrayElemType::Text => "text",
+            ArrayElemType::Bool => "boolean",
+        }
+    }
+
+    /// [`ArrayElemType::catalog_tag`] の逆変換。`vector`・`array`・未知タグは
+    /// fail-closed に拒否する（配列の入れ子・`VECTOR` 要素は非対応。TABLE-14）。
+    fn from_catalog_tag(tag: &str) -> Result<ArrayElemType> {
+        match tag {
+            "text" => Ok(ArrayElemType::Text),
+            "boolean" => Ok(ArrayElemType::Bool),
+            other => Err(CatalogError::Invalid(format!(
+                "unsupported array element type: {other:?}"
+            ))),
+        }
+    }
+}
+
+/// 配列列 1 個の宣言（要素型＋要素数上限。TABLE-14・TASK-198、Issue #888）。
+/// フィールドを private にし [`ArrayType::new`] のみを構築経路とすることで、
+/// 上限の範囲検証（`1..=MAX_ARRAY_ELEMENTS`）を経ない値を作れないようにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArrayType {
+    elem: ArrayElemType,
+    max_len: u32,
+}
+
+/// 配列列 1 個が宣言できる要素数の実装上限（本リポの実装既定値。TASK-198）。
+/// [`crate::row_codec`] の decode 側もこの値を要素数の上限検証に用いる。
+pub const MAX_ARRAY_ELEMENTS: u32 = 1_024;
+
+impl ArrayType {
+    /// `max_len` が `1..=MAX_ARRAY_ELEMENTS` の範囲外なら `Err`（TABLE-14）。
+    pub fn new(elem: ArrayElemType, max_len: u32) -> Result<Self> {
+        if max_len == 0 || max_len > MAX_ARRAY_ELEMENTS {
+            return Err(CatalogError::Invalid(format!(
+                "array max_len must be within 1..={MAX_ARRAY_ELEMENTS}, got {max_len}"
+            )));
+        }
+        Ok(Self { elem, max_len })
+    }
+
+    pub fn elem(&self) -> ArrayElemType {
+        self.elem
+    }
+
+    pub fn max_len(&self) -> u32 {
+        self.max_len
+    }
+}
+
 /// テーブル定義中の 1 列。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -690,9 +791,11 @@ impl TableSchema {
     pub fn vector_dim(&self) -> Option<u32> {
         self.columns.iter().find_map(|c| match &c.ty {
             ColumnType::Vector(dim) => Some(*dim),
-            ColumnType::Text | ColumnType::Boolean | ColumnType::Bytea | ColumnType::Enum(_) => {
-                None
-            }
+            ColumnType::Text
+            | ColumnType::Boolean
+            | ColumnType::Bytea
+            | ColumnType::Enum(_)
+            | ColumnType::Array(_) => None,
         })
     }
 
@@ -2003,6 +2106,79 @@ mod tests {
         let encoded = encode_schema(&schema).expect("encode should succeed");
         let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
         assert_eq!(decoded, schema);
+    }
+
+    /// 配列列（TABLE-14・TASK-198、Issue #888）のカタログ往復。TEXT/BOOLEAN
+    /// 双方の要素型・複数の `max_len` で確認する。
+    #[test]
+    fn encode_decode_roundtrip_preserves_array_column() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new(
+                    "tags",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::Text, 64).expect("array ty")),
+                    false,
+                ),
+                ColumnDef::new(
+                    "flags",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Bool, MAX_ARRAY_ELEMENTS).expect("array ty"),
+                    ),
+                    true,
+                ),
+            ],
+        );
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
+        assert_eq!(decoded, schema);
+    }
+
+    #[test]
+    fn array_column_rejects_malformed_param() {
+        // param が 2 要素ちょうどでない（要素・上限のいずれかが欠落／過多）。
+        let bytes = b"v2\ncols:1\ntags:array:text:0\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
+    #[test]
+    fn array_column_rejects_non_canonical_max_len() {
+        // 先頭ゼロは正準形でないため拒否する（D-A2）。
+        let bytes = b"v2\ncols:1\ntags:array:text,008:0\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
+    #[test]
+    fn array_column_rejects_max_len_exceeding_limit() {
+        let bytes =
+            format!("v2\ncols:1\ntags:array:text,{}:0\n", MAX_ARRAY_ELEMENTS + 1).into_bytes();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
+    #[test]
+    fn array_column_rejects_nested_array_element_type() {
+        // 配列要素として vector/array は構造的に非対応（TABLE-14）。
+        let bytes = b"v2\ncols:1\ntags:array:vector,4:0\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
+    #[test]
+    fn array_type_max_len_accessor_matches_construction() {
+        let ty = ArrayType::new(ArrayElemType::Bool, 10).expect("array ty");
+        assert_eq!(ty.max_len(), 10);
+        assert_eq!(ty.elem(), ArrayElemType::Bool);
     }
 
     #[test]

@@ -91,11 +91,13 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
     })?;
     match &column.ty {
         ColumnType::Text => Ok(idx),
-        ColumnType::Vector(_) | ColumnType::Boolean | ColumnType::Bytea | ColumnType::Enum(_) => {
-            Err(SqlSurfaceError::invalid_input(format!(
-                "column {BODY_COLUMN_NAME:?} is not a TEXT column"
-            )))
-        }
+        ColumnType::Vector(_)
+        | ColumnType::Boolean
+        | ColumnType::Array(_)
+        | ColumnType::Bytea
+        | ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
+            "column {BODY_COLUMN_NAME:?} is not a TEXT column"
+        ))),
     }
 }
 

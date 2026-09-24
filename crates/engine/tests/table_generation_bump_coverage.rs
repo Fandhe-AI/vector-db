@@ -81,12 +81,15 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `CATALOG_TABLE`／`user_rows/{table_name}` のいずれにも触れない。新規
     // 型は定義時点で参照列を 1 つも持ち得ない（型が存在しない列は宣言でき
     // ない）ため、影響を受けるテーブルが構造的に存在せずバンプ対象がない。
-    ("catalog.rs", 1403),
+    // Issue #890 実装後の base（main）マージ取り込み（ARRAY 列型・Issue #888）で
+    // `catalog.rs` に行が追加され、以下 2 件の行番号がさらに移動したための追随
+    // （旧: 1403／1482）。
+    ("catalog.rs", 1506),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない。
-    ("catalog.rs", 1482),
+    ("catalog.rs", 1585),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
