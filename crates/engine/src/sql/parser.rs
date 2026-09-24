@@ -2569,30 +2569,12 @@ fn bind_file_insert(
                     "column {name:?}: VECTOR column must not be provided for file-form INSERT"
                 )))
             }
-            (ColumnType::Real, InsertLiteral::Number(n)) => {
-                crate::row_codec::Value::Real(bind_real_literal(n)?)
-            }
-            (ColumnType::Real, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+            // REAL／DOUBLE PRECISION 列も他のスカラー型（BOOLEAN 等）と同じ理由で
+            // ファイル形 INSERT の対象外とする（Issue #882 レビュー指摘。typed
+            // INSERT/UPDATE 向けの束縛処理をファイル形へ露出させない）。
+            (ColumnType::Real | ColumnType::Double, _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a REAL literal, got a non-numeric literal"
-                )))
-            }
-            (ColumnType::Real, InsertLiteral::Null) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} does not accept an explicit NULL literal in file-form INSERT"
-                )))
-            }
-            (ColumnType::Double, InsertLiteral::Number(n)) => {
-                crate::row_codec::Value::Double(bind_double_literal(n)?)
-            }
-            (ColumnType::Double, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a DOUBLE PRECISION literal, got a non-numeric literal"
-                )))
-            }
-            (ColumnType::Double, InsertLiteral::Null) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} does not accept an explicit NULL literal in file-form INSERT"
+                    "column {name:?}: REAL/DOUBLE PRECISION column is not supported for file-form INSERT"
                 )))
             }
             // ファイル形 INSERT は `path`/`body` の TEXT 列規約専用（本モジュール
@@ -5000,6 +4982,38 @@ mod tests {
             }
             other => panic!("expected file form, got {other:?}"),
         }
+    }
+
+    #[test]
+    // codex-review P1 指摘（PR #1007・Issue #882・`crates/engine/src/sql/
+    // parser.rs:2572` 指摘）: `bind_file_insert` は `path`／`body` の TEXT 列
+    // 専用のチャンク化・埋め込み経路であり、他の追加スカラー型
+    // （BOOLEAN・DATE・ARRAY・BYTEA・JSON・ENUM・NUMERIC）は一律 `not supported
+    // for file-form INSERT` として拒否している。REAL／DOUBLE PRECISION も同じ
+    // 理由で対象外であることを固定する（typed INSERT/UPDATE 向けの数値束縛を
+    // ファイル形 INSERT へ誤って露出させない）。
+    fn bind_insert_form_file_form_rejects_real_and_double_columns() {
+        let mut schema = file_docs_schema();
+        schema
+            .columns
+            .push(ColumnDef::new("score", ColumnType::Real, true));
+        schema
+            .columns
+            .push(ColumnDef::new("weight", ColumnType::Double, true));
+
+        let err_real = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body, score) VALUES ('a.txt', 'hello', 1.5) USING OPERATION_ID 'op-file-real'",
+            &schema,
+        )
+        .expect_err("REAL column must be rejected for file-form INSERT");
+        assert_eq!(err_real.wire_code(), "22000");
+
+        let err_double = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body, weight) VALUES ('a.txt', 'hello', 1.5) USING OPERATION_ID 'op-file-double'",
+            &schema,
+        )
+        .expect_err("DOUBLE PRECISION column must be rejected for file-form INSERT");
+        assert_eq!(err_double.wire_code(), "22000");
     }
 
     #[test]
