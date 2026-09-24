@@ -89,8 +89,22 @@ fn respond_frame_error_and_terminate(stream: &mut TcpStream, e: FrameError) -> i
 /// の生 `io::Error` を返していた（codex-review P1 指摘・discussion_
 /// r4096720869）ため、他の frame エラー経路（[`respond_frame_error_and_
 /// terminate`]）と同じく ErrorResponse を送ってから切断する契約へ揃える。
-fn enforce_discard_budget(stream: &mut TcpStream, discarded_bytes: usize) -> io::Result<()> {
-    if discarded_bytes > crate::limits::COPY_DISCARD_MAX_BYTES {
+///
+/// `discarded_messages`（読み捨てたフレーム件数）も独立に判定する
+/// （codex-review 指摘・PRRT_kwDOUAKASM6ltyY2: body が空（宣言長 4）の
+/// `CopyData`／`Flush`／`Sync` だけを連送された場合、バイト予算
+/// （[`crate::limits::COPY_DISCARD_MAX_BYTES`]）を使い切るまでに要する件数が
+/// 非現実的に大きく実効的な上限として機能しない。件数上限
+/// [`crate::limits::COPY_DISCARD_MAX_MESSAGES`] をバイト予算とは別に設けることで、
+/// フレームサイズに関わらず読み捨て件数そのものを有界化する）。
+fn enforce_discard_budget(
+    stream: &mut TcpStream,
+    discarded_bytes: usize,
+    discarded_messages: usize,
+) -> io::Result<()> {
+    if discarded_bytes > crate::limits::COPY_DISCARD_MAX_BYTES
+        || discarded_messages > crate::limits::COPY_DISCARD_MAX_MESSAGES
+    {
         let _ = crate::handshake::write_error_response_io(
             stream,
             ErrorClass::ProtocolViolation,
@@ -382,6 +396,7 @@ fn run_copy_from(
 
     let mut errored: Option<SqlSurfaceError> = None;
     let mut discarded_bytes: usize = 0;
+    let mut discarded_messages: usize = 0;
 
     loop {
         let type_byte = match framing::read_typed_frame_header(stream) {
@@ -398,8 +413,15 @@ fn run_copy_from(
                         errored = Some(e);
                     }
                 } else {
-                    discarded_bytes = discarded_bytes.saturating_add(body.len());
-                    enforce_discard_budget(stream, discarded_bytes)?;
+                    // body が空（宣言長 4）の CopyData を連送しても予算を
+                    // 消費できてしまわないよう、フレームヘッダー分の固定
+                    // オーバーヘッドも必ず加算する（codex-review 指摘・
+                    // `limits::COPY_DISCARD_FRAME_OVERHEAD_BYTES` 参照）。
+                    discarded_bytes = discarded_bytes
+                        .saturating_add(body.len())
+                        .saturating_add(crate::limits::COPY_DISCARD_FRAME_OVERHEAD_BYTES);
+                    discarded_messages = discarded_messages.saturating_add(1);
+                    enforce_discard_budget(stream, discarded_bytes, discarded_messages)?;
                 }
             }
             b'c' => {
@@ -429,27 +451,30 @@ fn run_copy_from(
                 .map(|()| crate::extended_query::LoopSignal::Continue);
             }
             b'H' | b'S' => {
-                // Flush('H')／Sync('S') は簡易クエリ・COPY いずれも無視する
-                // （PostgreSQL 互換）。`validate_typed_message_length_prefix` は
-                // 長さフィールドの検証のみを行い本文は読まないため、宣言長が
-                // 4 バイトを超える場合は残りの本文を明示的に読み捨てないと
-                // 未読バイトがストリームに残り、後続の `read_typed_frame_header`
-                // がそれを次のメッセージ種別として誤読しデシンクする
-                // （Issue #939 レビュー指摘。`f`（CopyFail）分岐の `discard_bytes`
-                // と対称にする）。読み捨てたバイト数は `d` の読み捨てと同じ
-                // `discarded_bytes` 予算へ加算する（Cursor Bugbot 指摘。以前は
-                // ここだけ予算に数えず、巨大な no-op フレームを送り続けることで
-                // DoS 上限を無制限に回避できた）。
-                let len = framing::validate_typed_message_length_prefix(
-                    stream,
-                    framing::MIN_TYPED_MESSAGE_LEN,
-                    framing::MAX_MESSAGE_LEN,
-                )
-                .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                let body_len = len.saturating_sub(4);
-                discard_bytes(stream, body_len)?;
-                discarded_bytes = discarded_bytes.saturating_add(body_len);
-                enforce_discard_budget(stream, discarded_bytes)?;
+                // Flush('H')／Sync('S') は PostgreSQL wire v3 上 length=4
+                // （body 厳密に空）以外を持たない固定形状のメッセージである。
+                // 旧実装は `validate_typed_message_length_prefix` で最大長
+                // のみを検証し、宣言長が 4 バイトを超える場合は任意の本文を
+                // 読み捨てて正常受理していたため、`framing.rs`（WIRE-10）が
+                // 他の固定形状メッセージ（CopyDone・Terminate）に課している
+                // 「本文付きは `08P01` で fail-closed に拒否」という契約から
+                // この 2 種類だけ逸脱していた（codex-review 指摘・
+                // discussion PRRT_kwDOUAKASM6ltrHb）。`c`／`X` 分岐と同じ
+                // `read_length_prefixed_body(stream, 4, 4)` を使い、本文付き
+                // メッセージは `respond_frame_error_and_terminate` により
+                // `Malformed`（`08P01`）として拒否し接続を終了する。
+                framing::read_length_prefixed_body(stream, 4, 4)
+                    .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
+                // 上記検証を通過した時点で body は必ず空だが、フレーム
+                // ヘッダー分の固定オーバーヘッドは `d` の読み捨てと同じ
+                // `discarded_bytes` 予算へ加算する（Cursor Bugbot 指摘。
+                // 以前は本文長のみを数えていたため、body が空のフレームを
+                // 連送すると予算を一切消費できず DoS 上限を無制限に回避
+                // できた。`limits::COPY_DISCARD_FRAME_OVERHEAD_BYTES` 参照）。
+                discarded_bytes = discarded_bytes
+                    .saturating_add(crate::limits::COPY_DISCARD_FRAME_OVERHEAD_BYTES);
+                discarded_messages = discarded_messages.saturating_add(1);
+                enforce_discard_budget(stream, discarded_bytes, discarded_messages)?;
             }
             b'X' => {
                 // Terminate は `handshake::post_auth_loop` の通常の 'X' 分岐

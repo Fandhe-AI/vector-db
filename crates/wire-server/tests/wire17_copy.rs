@@ -727,26 +727,21 @@ fn wire17_copy_from_stdin_terminate_mid_copy_commits_no_row() {
     read_ready_for_query(&mut stream2);
 }
 
-/// COPY FROM STDIN の途中で本文長 4 バイトを超える Flush（'H'）／Sync（'S'）が
-/// 届いた場合、宣言長ぶんの本文を読み捨てて消費すること（レビュー指摘:
-/// `validate_typed_message_length_prefix` は長さフィールドのみを検証し本文を
-/// 読まないため、`f`（CopyFail）分岐の `discard_bytes` と対称に読み捨てないと
-/// 未読バイトが残り後続メッセージを誤読する）。
+/// COPY FROM STDIN の途中で本文が空（宣言長ちょうど 4）の Flush（'H'）／
+/// Sync（'S'）が届いた場合は通常どおり無視して COPY を継続できること。
 #[test]
-fn wire17_copy_from_stdin_flush_sync_with_body_are_fully_consumed() {
+fn wire17_copy_from_stdin_flush_sync_without_body_are_ignored() {
     let (core, _guard) = new_core_with_docs_table();
     let mut stream = spawn_with_alice(core);
 
     send_simple_query(
         &mut stream,
-        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'flush-sync-body'",
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'flush-sync-noop'",
     );
     let _ = read_copy_in_response(&mut stream);
     send_copy_data(&mut stream, b"1\t[1.0,0.0]\tja\n");
-    // 通常の Flush／Sync は body 空だが、許容範囲（MIN_TYPED_MESSAGE_LEN..=
-    // MAX_MESSAGE_LEN）内で本文付きのものを送り、読み捨てを確認する。
-    send_length_prefixed_message(&mut stream, b'H', b"padding-body");
-    send_length_prefixed_message(&mut stream, b'S', b"padding-body");
+    send_length_prefixed_message(&mut stream, b'H', b"");
+    send_length_prefixed_message(&mut stream, b'S', b"");
     send_copy_data(&mut stream, b"2\t[0.0,1.0]\tja\n");
     send_copy_done(&mut stream);
 
@@ -755,30 +750,54 @@ fn wire17_copy_from_stdin_flush_sync_with_body_are_fully_consumed() {
     read_ready_for_query(&mut stream);
 }
 
-/// Flush（'H'）／Sync（'S'）の読み捨てバイト数が `limits::
-/// COPY_DISCARD_MAX_BYTES` へ加算され、超過時は `08P01` の ErrorResponse を
-/// 送ってから接続を終了すること（Cursor Bugbot 指摘・discussion_
-/// r4096754224: 以前は `CopyData`（'d'）のバイト量しかこの上限に数えず、
-/// Flush／Sync のボディは無制限に読み捨てていたため、クライアントが巨大な
-/// no-op フレームを送り続けることで DoS 上限を回避し接続スロットを占有し
-/// 続けられた）。1 メッセージの上限（`framing::MAX_MESSAGE_LEN`）ぶんの
-/// body を持つ Flush を、予算（16 MiB）を超えるまで繰り返し送る。
+/// COPY FROM STDIN の途中で本文付き（宣言長が 4 バイトを超える）Flush
+/// （'H'）／Sync（'S'）が届いた場合、PostgreSQL wire v3 上この 2 種類は
+/// length=4（body 厳密に空）以外の形状を持たないため `08P01` で fail-closed
+/// に拒否し接続を終了すること（codex-review 指摘・
+/// discussion PRRT_kwDOUAKASM6ltrHb: 旧実装は最大長のみを検証し任意の本文を
+/// 読み捨てて正常受理していた）。'H'／'S' いずれも同じ検証経路を通ることを
+/// 確認する。
 #[test]
-fn wire17_copy_from_stdin_flush_sync_body_counts_toward_discard_budget() {
+fn wire17_copy_from_stdin_flush_sync_with_body_is_rejected() {
+    for type_byte in *b"HS" {
+        let (core, _guard) = new_core_with_docs_table();
+        let mut stream = spawn_with_alice(core);
+
+        send_simple_query(
+            &mut stream,
+            "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'flush-sync-body-reject'",
+        );
+        let _ = read_copy_in_response(&mut stream);
+        send_copy_data(&mut stream, b"1\t[1.0,0.0]\tja\n");
+        send_length_prefixed_message(&mut stream, type_byte, b"unexpected-body");
+
+        expect_error_response_with_sqlstate(&mut stream, "08P01");
+        expect_connection_closed(&mut stream);
+    }
+}
+
+/// 本文が空の Flush（'H'）を連送しても、フレームヘッダー分の固定
+/// オーバーヘッド（`limits::COPY_DISCARD_FRAME_OVERHEAD_BYTES`）とメッセージ
+/// 件数上限（`limits::COPY_DISCARD_MAX_MESSAGES`）により最終的に `08P01` の
+/// ErrorResponse を送ってから接続を終了すること（codex-review 指摘・
+/// PRRT_kwDOUAKASM6ltyY2: 旧実装は `CopyData`（'d'）のバイト量・本文付き
+/// Flush／Sync のバイト量しかこの上限に数えず、body が空のフレームを連送
+/// すると予算を一切消費できず、クライアントが極小フレームを送り続けることで
+/// DoS 上限を無制限に回避し接続スロットを占有し続けられた）。
+#[test]
+fn wire17_copy_from_stdin_empty_flush_sync_spam_counts_toward_discard_budget() {
     let (core, _guard) = new_core_with_docs_table();
     let mut stream = spawn_with_alice(core);
 
     send_simple_query(
         &mut stream,
-        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'flush-discard-budget'",
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'flush-spam-discard-budget'",
     );
     let _ = read_copy_in_response(&mut stream);
 
-    let body = vec![0u8; framing::MAX_MESSAGE_LEN - 4];
-    // `framing::MAX_MESSAGE_LEN - 4`（body 長）× 17 > `limits::
-    // COPY_DISCARD_MAX_BYTES`（16 MiB）。16 回まではまだ予算内。
-    for _ in 0..17 {
-        send_length_prefixed_message(&mut stream, b'H', &body);
+    // メッセージ件数上限を超えるまで本文が空の Flush を送り続ける。
+    for _ in 0..=wire_server::limits::COPY_DISCARD_MAX_MESSAGES {
+        send_length_prefixed_message(&mut stream, b'H', b"");
     }
 
     expect_error_response_with_sqlstate(&mut stream, "08P01");
@@ -806,9 +825,13 @@ fn wire17_copy_from_stdin_discard_budget_exceeded_after_row_error_gets_error_res
     send_copy_data(&mut stream, b"1\t[1.0,0.0,0.0]\tja\n");
 
     // 読み捨てモード中の `CopyData` も `limits::COPY_DISCARD_MAX_BYTES`
-    // （16 MiB）の対象。
+    // （16 MiB）の対象。1 メッセージあたりの消費量はフレームヘッダー分の
+    // 固定オーバーヘッド（`limits::COPY_DISCARD_FRAME_OVERHEAD_BYTES`）も
+    // 含むため、`framing::MAX_MESSAGE_LEN - 4` バイトの body では 16 回で
+    // 予算を超える（各回サーバーは本文を全て読み終えてから予算判定するため、
+    // 最後の 1 回まではクライアント側の書き込みが必ず成功する）。
     let body = vec![b'x'; framing::MAX_MESSAGE_LEN - 4];
-    for _ in 0..17 {
+    for _ in 0..16 {
         send_copy_data(&mut stream, &body);
     }
 

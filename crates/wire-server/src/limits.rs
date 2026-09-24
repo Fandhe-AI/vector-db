@@ -161,6 +161,26 @@ pub const MAX_RESPONSE_BUFFER_BYTES: usize = 1024 * 1024;
 /// （DoS）」対応）。超過時は読み捨てず `08P01` で切断する（fail-closed）。
 pub const COPY_DISCARD_MAX_BYTES: usize = 16 * 1024 * 1024;
 
+/// [`COPY_DISCARD_MAX_BYTES`] へ各フレームの読み捨てごとに加算するヘッダー
+/// 分の固定オーバーヘッド（型バイト 1 + 長さフィールド 4）。codex-review
+/// 指摘（PRRT_kwDOUAKASM6ltyY2）: 旧実装は CopyData／Flush／Sync の *body* 長
+/// のみを予算へ加算しており、body が空（宣言長 4）のフレームを連送しても
+/// 予算を一切消費しなかったため、クライアントが極小フレームを送り続けて
+/// 接続スロットを無期限に占有できた。フレームヘッダー自体の消費バイト量も
+/// 必ず予算へ含めることで、body 長に関わらず読み捨てフレーム数に比例して
+/// 予算が減っていくことを保証する。
+pub const COPY_DISCARD_FRAME_OVERHEAD_BYTES: usize = 5;
+
+/// 読み捨て状態（[`COPY_DISCARD_MAX_BYTES`] 参照）で許容するフレーム件数の
+/// 上限。バイト予算とは独立に判定する（codex-review 指摘・
+/// PRRT_kwDOUAKASM6ltyY2）。[`COPY_DISCARD_FRAME_OVERHEAD_BYTES`] によるバイト
+/// 予算への加算だけでは、バイト予算を使い切るまでに要するフレーム数
+/// （16 MiB ÷ 5 バイト ≈ 335 万件）が非現実的に大きく、実効的な上限として
+/// 機能しない。本値は 1 個の COPY セッションで正当なクライアントが送る
+/// Flush／Sync／空 CopyData の件数を大きく超え、かつ攻撃者が極小フレームを
+/// 連送して接続スロットを無期限に占有する経路を有限時間で遮断する。
+pub const COPY_DISCARD_MAX_MESSAGES: usize = 4096;
+
 /// SQLSTATE `53300`（too_many_connections）。ポインタ:
 /// `docs/spec/04-behavior/error-format.md`。値は `engine::error_format::
 /// ErrorClass`（SSOT。TASK-152・ERR-2）由来（TASK-153・ERR-1 の分散定数 SSOT 化）。
