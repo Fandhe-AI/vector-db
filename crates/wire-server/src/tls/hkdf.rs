@@ -14,8 +14,9 @@
 //! - ラウンド数・ブロック数・出力長はすべて呼び出し時点で確定する公開値
 //!   （鍵長・データ長・`L`）であり、秘密値のビットに依存する分岐・ループ回数は
 //!   持たない。
-//! - 秘密値どうしの比較（Finished の verify_data 検証等）はここでは行わない
-//!   （#964 の担当。定数時間比較はそこで別途用意する）。
+//! - 秘密値どうしの比較は [`ct_eq`] に集約する。GCM のタグ検証（#958）と
+//!   Finished の verify_data 検証（#964）の双方がこの関数を共有し、
+//!   モジュールごとに独立した定数時間比較を持たない。
 //! - 秘密値の保持型 [`Secret32`] は Drop 時に best-effort でゼロ化するが、
 //!   `unsafe`（`write_volatile` 等）を使わないため最適化により消去が省略され
 //!   ない保証はない（[`super::x25519::SharedSecret`] と同じ限界）。
@@ -39,6 +40,21 @@ pub(crate) fn zeroize(buf: &mut [u8]) {
         *b = 0;
     }
     std::hint::black_box(&*buf);
+}
+
+/// 秘密値どうしの定数時間比較（GCM タグ検証（#958）・Finished 検証（#964）で
+/// 共有する）。長さが異なる場合は即座に `false` を返す（長さは公開値のため
+/// 早期 return してよい）。長さが等しい場合は全バイトを OR 畳み込みで比較し、
+/// 一致した時点で打ち切る分岐を持たない。
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
 }
 
 /// HKDF・鍵スケジュールが受け渡す 32 バイトの秘密値（PRK・各段の secret）。
@@ -517,5 +533,26 @@ mod tests {
         let secret = Secret32::from_bytes([0xabu8; 32]);
         let rendered = format!("{secret:?}");
         assert!(!rendered.contains("ab"));
+    }
+
+    // ct_eq: 一致・1 バイト差・長さ違い・空列の各ケース。
+    #[test]
+    fn ct_eq_matches_identical_slices() {
+        assert!(ct_eq(b"identical bytes", b"identical bytes"));
+    }
+
+    #[test]
+    fn ct_eq_rejects_single_byte_difference() {
+        assert!(!ct_eq(b"aaaaaaaa", b"aaaaaaab"));
+    }
+
+    #[test]
+    fn ct_eq_rejects_different_lengths() {
+        assert!(!ct_eq(b"short", b"shorter than this"));
+    }
+
+    #[test]
+    fn ct_eq_accepts_empty_slices() {
+        assert!(ct_eq(&[], &[]));
     }
 }
