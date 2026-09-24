@@ -282,6 +282,65 @@ fn nosql_update_set_jsonb_matches_sql_read_back() {
     common::read_ready_for_query(&mut sql);
 }
 
+/// nullable な `JSON`／`JSONB` 列は NoSQL `update` op から JSON `null` で
+/// SQL `NULL` へ更新できる（PR #1014 レビュー指摘対応。INSERT 経路
+/// （`nosql_insert_native_json_round_trips_through_scan` 等）・design doc
+/// `docs/design/column-type-extension.md`「#889 追記」節「JSON `null` は
+/// nullable 列なら `NULL`」と表層間・操作間で契約を揃える）。
+#[test]
+fn nosql_update_set_json_null_on_nullable_column_clears_to_sql_null() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core);
+
+    let insert_body = br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2,0.3],"doc":{"a":1},"docb":{"a":1}}],"operation_id":"op-seed-null"}"#;
+    let resp = query(&both, insert_body);
+    assert_eq!(resp.status, 200, "seed insert must succeed: {resp:?}");
+
+    let update_body = br#"{"op":"update","table":"docs","where":{"id":1},"set":{"doc":null,"docb":null},"operation_id":"op-nosql-update-null"}"#;
+    let resp = query(&both, update_body);
+    assert_eq!(resp.status, 200, "update to NULL must succeed: {resp:?}");
+
+    common::send_simple_query(&mut sql, "SELECT doc, docb FROM docs WHERE id = 1 LIMIT 1");
+    common::read_row_description(&mut sql);
+    let row = common::read_data_row(&mut sql);
+    assert_eq!(row, vec![None, None]);
+    common::read_command_complete(&mut sql);
+    common::read_ready_for_query(&mut sql);
+}
+
+/// 非 nullable な `JSON`／`JSONB` 列への `null` は従来どおり `42601` で拒否する
+/// （fail-closed。nullable 列向けの緩和が非 nullable 列まで広げないことを固定）。
+#[test]
+fn nosql_update_set_json_null_on_non_nullable_column_is_rejected_with_42601() {
+    let path = temp_db::unique_db_path("wire-json-column-non-nullable");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let non_nullable_schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(3), false),
+            ColumnDef::new("doc", ColumnType::Json, false),
+        ],
+    );
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&non_nullable_schema)
+        .expect("create table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let (both, _sql) = spawn_both(core);
+    let _guard = guard;
+
+    let insert_body = br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2,0.3],"doc":{"a":1}}],"operation_id":"op-seed-non-nullable"}"#;
+    let resp = query(&both, insert_body);
+    assert_eq!(resp.status, 200, "seed insert must succeed: {resp:?}");
+
+    let update_body = br#"{"op":"update","table":"docs","where":{"id":1},"set":{"doc":null},"operation_id":"op-nosql-update-reject-null"}"#;
+    let resp = query(&both, update_body);
+    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp: {resp:?}");
+}
+
 #[test]
 fn nosql_insert_rejects_scalar_json_and_malformed_object_with_42601() {
     let (core, _guard) = new_core();

@@ -320,6 +320,17 @@ fn map_set_assignments(
                 }
                 InsertLiteral::String(canonical)
             }
+            // JSON `null` かつ nullable 列は SQL `NULL` として扱う
+            // （`insert.rs::bind_row` の同型分岐・design doc
+            // `docs/design/column-type-extension.md`「#889 追記」節「JSON
+            // `null` は nullable 列なら `NULL`」と同じ契約。Issue #889
+            // レビュー指摘・PR #1014）。非 nullable 列は次の catch-all 分岐で
+            // 従来どおり `42601` へ倒れる（`bind_set_assignments` 側でも
+            // `column.nullable` を再検査するが、ここで先に拒否することで
+            // engine 側のエラー文言に依存せず wire-server 側の分類を保つ）。
+            (ColumnType::Json | ColumnType::Jsonb, JsonValue::Null) if column.nullable => {
+                InsertLiteral::Null
+            }
             (ColumnType::Json | ColumnType::Jsonb, _) => {
                 return Err(UpdateError::InvalidJson(
                     "SET JSON column value must be a JSON object or array",
@@ -634,5 +645,46 @@ mod tests {
         let err = map_set_assignments(&set, &bytea_schema()).expect_err("must reject");
         assert!(matches!(err, UpdateError::InvalidBytea(_)));
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    // --- JSON／JSONB 列（Issue #889）の null 分岐（PR #1014 レビュー指摘対応） ---
+
+    fn json_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("doc", ColumnType::Json, true),
+                ColumnDef::new("docb", ColumnType::Jsonb, false),
+            ],
+        )
+    }
+
+    #[test]
+    fn map_set_assignments_maps_json_null_on_nullable_column_to_insert_literal_null() {
+        let set = set_map(r#"{"doc":null}"#);
+        let bound = map_set_assignments(&set, &json_schema()).expect("ok");
+        assert_eq!(bound, vec![("doc".to_string(), InsertLiteral::Null)]);
+    }
+
+    #[test]
+    fn map_set_assignments_rejects_json_null_on_non_nullable_column() {
+        let set = set_map(r#"{"docb":null}"#);
+        let err = map_set_assignments(&set, &json_schema()).expect_err("must reject");
+        assert!(matches!(err, UpdateError::InvalidJson(_)));
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn map_set_assignments_maps_json_object_column() {
+        let set = set_map(r#"{"doc":{"a":1}}"#);
+        let bound = map_set_assignments(&set, &json_schema()).expect("ok");
+        assert_eq!(
+            bound,
+            vec![(
+                "doc".to_string(),
+                InsertLiteral::String(r#"{"a":1}"#.to_string())
+            )]
+        );
     }
 }

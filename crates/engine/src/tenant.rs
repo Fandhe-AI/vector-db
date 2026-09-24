@@ -1804,6 +1804,22 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            // 明示的な SQL `NULL`（`bind_set_assignments`〔SQL-17・SQL-19〕が
+            // nullable 列向けに構築する。PR #1014 レビュー指摘対応・Issue #889。
+            // `VECTOR` 列は nullable の値に関わらず常に必須として扱うため対象外
+            // ——下の catch-all で従来どおり拒否する）。呼び出し元
+            // （`bind_set_assignments`）は既に `column.nullable` を検査済みだが、
+            // write トランザクション内で再取得したスキーマとの多層防御として
+            // ここでも再検査する（`schema.columns` の型検証と同じ設計）。
+            (
+                crate::catalog::ColumnType::Text
+                | crate::catalog::ColumnType::Boolean
+                | crate::catalog::ColumnType::Array(_)
+                | crate::catalog::ColumnType::Bytea
+                | crate::catalog::ColumnType::Json
+                | crate::catalog::ColumnType::Jsonb,
+                crate::row_codec::Value::Null,
+            ) if column.nullable => {}
             (crate::catalog::ColumnType::Vector(_), _)
             | (crate::catalog::ColumnType::Text, _)
             | (crate::catalog::ColumnType::Boolean, _)

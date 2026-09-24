@@ -817,6 +817,15 @@ fn push_dml_assignments(
                 b.push_u8(3);
                 b.push_u8(u8::from(*v));
             }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘・PR #1014。
+            // `bind_set_assignments` が nullable 列向けに追加した SQL `NULL`
+            // 表現）。述語つき `UPDATE ... WHERE`（本関数の呼び出し元）は
+            // 現状 NoSQL 表層から到達しない（`filter` 形は Issue #871 実行結線
+            // 対象だが NULL 対応は本 Issue のスコープ外）ため実質未到達だが、
+            // 上部コメントが予告する前方ガードとしてタグ 4 を割り当てる。
+            InsertLiteral::Null => {
+                b.push_u8(4);
+            }
         }
     }
     Ok(())

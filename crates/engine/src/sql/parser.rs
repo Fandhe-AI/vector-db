@@ -1252,7 +1252,7 @@ fn bind_insert_row(
         InsertLiteral::Number(n) => n
             .parse()
             .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed id value: {n}")))?,
-        InsertLiteral::String(_) | InsertLiteral::Bool(_) => {
+        InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Null => {
             return Err(SqlSurfaceError::invalid_input(
                 "id pseudo-column value must be a number",
             ))
@@ -1326,6 +1326,18 @@ fn bind_insert_row(
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a JSON text literal"
+                )))
+            }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘）は SQL テキストの
+            // `INSERT ... VALUES` 構文からは構築されない到達不能パス
+            // （`sql::allowlist` の VALUES リテラルパーサーは `NULL` トークンを
+            // 生成しない）。この分岐は match の網羅性のためだけに存在し、
+            // 到達した場合も fail-closed に拒否する（列を省略すれば
+            // nullable 列は `Value::Null` で埋まる既存契約と役割が重複するため、
+            // `INSERT` に明示 `NULL` リテラルを追加で受理する必要はない）。
+            (_, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} does not accept an explicit NULL literal in INSERT"
                 )))
             }
         };
@@ -1539,6 +1551,14 @@ fn bind_set_assignments(
                     "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
+            // `VECTOR` 列は `nullable` の値に関わらず常に必須として扱う
+            // （`wire-server::http::query::insert::bind_row` の既存契約と同じ
+            // 判断。Issue #889 レビュー指摘対応・PR #1014）。
+            (ColumnType::Vector(_), InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is a VECTOR column and cannot be set to NULL"
+                )))
+            }
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
@@ -1576,6 +1596,19 @@ fn bind_set_assignments(
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a JSON text literal"
+                )))
+            }
+            // 明示的な SQL `NULL`（`ColumnType::Vector` を除く。Issue #889
+            // レビュー指摘・PR #1014）。`column.nullable` を確認したうえで
+            // `Value::Null` へ写像し、非 nullable 列は fail-closed に拒否する。
+            // NoSQL 表層 `update` op（`wire-server::http::query::update::
+            // map_set_assignments`）の JSON 列 `null` 分岐が現状唯一の
+            // 構築元だが、SQL 表層 `UPDATE ... SET` 経由（将来 `NULL`
+            // リテラルの字句規則が追加された場合）でも同じ扱いを共有する。
+            (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
+            (_, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is not nullable"
                 )))
             }
         };
@@ -2129,6 +2162,15 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a JSON text literal"
                         )))
                     }
+                    // `InsertLiteral::Null`（Issue #889 レビュー指摘）は
+                    // `ON CONFLICT ... DO UPDATE SET` の SQL 構文からは構築
+                    // されない到達不能パス（match の網羅性のためだけの分岐。
+                    // `bind_set_assignments` のドキュメント参照）。
+                    (_, InsertLiteral::Null) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} does not accept an explicit NULL literal in ON CONFLICT DO UPDATE SET"
+                        )))
+                    }
                 };
                 BoundUpsertValue::Literal(v)
             }
@@ -2212,6 +2254,14 @@ fn bind_file_insert(
             (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a non-text literal"
+                )))
+            }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘）はファイル形
+            // `INSERT` の VALUES 構文からは構築されない到達不能パス（match の
+            // 網羅性のためだけの分岐。`bind_set_assignments` のドキュメント参照）。
+            (ColumnType::Text, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} does not accept an explicit NULL literal in file-form INSERT"
                 )))
             }
             // `bind_insert_form` の判別規則により VECTOR 列名は列リストに含まれない
