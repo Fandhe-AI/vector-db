@@ -431,6 +431,28 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
     Ok(())
 }
 
+/// 1 列ぶんのカタログ行（`name:tag:param:nullable\n`）を組み立てる。`param` は
+/// [`validate_catalog_param`] を通してから連結する（encode 側の fail-closed。
+/// TABLE-6・codex-review 指摘 PR #999。`catalog_fields` はここまで型定義側の
+/// 自己申告であり、decode 側（`validate_catalog_param`・`from_catalog_fields`）が
+/// 要求する文字集合・`:` 非混入を encode 側でも検証してから連結する。将来
+/// `catalog_fields` が区切り文字や空文字を返す型を追加しても、ここで検知して
+/// fail-closed に拒否し、デコード不能なカタログ値を永続化しない）。
+/// [`encode_schema`] のループ本体であり、不正な `param` を直接与えて encode 側の
+/// 拒否を固定する単体テストの seam も兼ねる。
+fn encode_column_line(
+    name: &str,
+    type_name: &str,
+    param_field: &str,
+    nullable: bool,
+) -> Result<String> {
+    validate_catalog_param(param_field)?;
+    let nullable_field = if nullable { "1" } else { "0" };
+    Ok(format!(
+        "{name}:{type_name}:{param_field}:{nullable_field}\n"
+    ))
+}
+
 /// [`TableSchema`] をカタログのテキスト形式へエンコードする。1 行目に
 /// フォーマットバージョン、2 行目に列数、以降 1 行 1 列（`name:type:dim:nullable`
 /// の 4 フィールドを `:` 区切り。識別子は `validate_identifier` により `:` を
@@ -446,18 +468,12 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         // 型タグ・`param` の往復は ColumnType::catalog_fields に集約する
         // （Issue #880 D2。型を追加する際にここを個別に触らずに済む）。
         let (type_name, param_field) = column.ty.catalog_fields();
-        // catalog_fields が返す param はここまで型定義側の自己申告であり、
-        // decode 側（validate_catalog_param・from_catalog_fields）が要求する
-        // 文字集合・`:` 非混入を encode 側でも検証してから連結する（TABLE-6・
-        // codex-review 指摘 PR #999。将来 catalog_fields が区切り文字や空文字を
-        // 返す型を追加しても、ここで検知して fail-closed に拒否し、デコード不能な
-        // カタログ値を永続化しない）。
-        validate_catalog_param(&param_field)?;
-        let nullable_field = if column.nullable { "1" } else { "0" };
-        out.push_str(&format!(
-            "{}:{}:{}:{}\n",
-            column.name, type_name, param_field, nullable_field
-        ));
+        out.push_str(&encode_column_line(
+            &column.name,
+            type_name,
+            &param_field,
+            column.nullable,
+        )?);
     }
     if out.len() > MAX_CATALOG_VALUE_LEN {
         return Err(CatalogError::Invalid(format!(
@@ -1454,6 +1470,40 @@ mod tests {
                 "must reject: {bytes:?}"
             );
         }
+    }
+
+    /// `encode_schema`（実体は [`encode_column_line`]）が `param` フィールドの
+    /// 文字集合違反を decode 側（[`decode_rejects_invalid_param_charset`]）と
+    /// 対称に fail-closed 拒否することを固定する（TABLE-6・Issue #880 D5・
+    /// codex-review 指摘 PR #999）。`ColumnType` は現状 `Text`/`Vector` のみで
+    /// `catalog_fields` が不正な `param` を返すことはないため、将来型追加時の
+    /// 回帰を検知できるよう encode の実処理関数を直接不正 `param` で呼ぶ。
+    #[test]
+    fn encode_column_line_rejects_invalid_param_charset() {
+        for invalid_param in ["", "1:2", "a\nb", "あ"] {
+            assert!(
+                matches!(
+                    encode_column_line("foo", "text", invalid_param, false),
+                    Err(CatalogError::Invalid(_))
+                ),
+                "must reject: {invalid_param:?}"
+            );
+        }
+    }
+
+    /// `encode_column_line` は `param` が許容文字集合内であれば
+    /// `encode_schema_golden_v2_layout` と同じ行文字列を組み立てる（非退行）。
+    #[test]
+    fn encode_column_line_accepts_valid_param_charset() {
+        assert_eq!(
+            encode_column_line("tag", "text", "-", true).expect("valid param must be accepted"),
+            "tag:text:-:1\n"
+        );
+        assert_eq!(
+            encode_column_line("embedding", "vector", "384", false)
+                .expect("valid param must be accepted"),
+            "embedding:vector:384:0\n"
+        );
     }
 
     /// 宣言列数 (`cols:`) を超える余剰行（トレーリング空行 1 行を除く）を
