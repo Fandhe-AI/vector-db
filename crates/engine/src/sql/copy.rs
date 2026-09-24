@@ -26,9 +26,9 @@ use crate::recovery::required_op_id::OperationId;
 use crate::row_codec::Value;
 use crate::sql::allowlist::{CopyFormat, InsertLiteral, SqlSurfaceError};
 use crate::sql::parser::{
-    bind_bytea_literal, bind_datetime_literal, bind_enum_literal, bind_json_literal,
-    bind_numeric_literal, bind_uuid_literal, parse_array_literal, parse_vector_literal,
-    BoundInsert,
+    bind_bytea_literal, bind_datetime_literal, bind_double_literal, bind_enum_literal,
+    bind_json_literal, bind_numeric_literal, bind_real_literal, bind_uuid_literal,
+    parse_array_literal, parse_vector_literal, BoundInsert,
 };
 
 /// wire 層のホットパスで `lexer::tokenize` を増やさないための安価な覗き見
@@ -495,6 +495,14 @@ fn bind_copy_record(
                     *precision,
                     *scale,
                 )?,
+                // `REAL`／`DOUBLE PRECISION`（Issue #882）も INSERT／UPDATE／
+                // UPSERT と同じ `bind_real_literal`／`bind_double_literal`
+                // （`scalar_float.rs` の閉じた文法。非有限化・非ゼロ
+                // アンダーフローは `22003`）を共有する（main マージ時点で
+                // COPY 側の網羅 match が追随しておらずビルド不能だった分の
+                // 追加）。
+                ColumnType::Real => Value::Real(bind_real_literal(s)?),
+                ColumnType::Double => Value::Double(bind_double_literal(s)?),
             },
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
@@ -573,6 +581,11 @@ fn bound_insert_byte_len(bound: &BoundInsert) -> Result<usize, SqlSurfaceError> 
             // 同一の判定対象量定義。Issue #885・#887）。
             Value::Numeric(_) => 16,
             Value::Uuid(_) => 16,
+            // REAL／DOUBLE PRECISION は `core.rs::validate_insert_batch_
+            // byte_and_chunk_limits` と同一の判定対象量定義（f32／f64 の
+            // ネイティブ幅。Issue #882）。
+            Value::Real(_) => std::mem::size_of::<f32>(),
+            Value::Double(_) => std::mem::size_of::<f64>(),
         };
         total = total
             .checked_add(value_len)

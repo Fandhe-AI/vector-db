@@ -98,6 +98,12 @@ fn extended_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> Ta
                 true,
             ),
             ColumnDef::new("uid", ColumnType::Uuid, true),
+            // `REAL`／`DOUBLE PRECISION` 列（Issue #1022 コーディネータ指摘:
+            // main で追加された REAL/DOUBLE（Issue #882）へ `bind_copy_record`・
+            // `bound_insert_byte_len` の網羅 match が追随しておらず `E0004`
+            // でビルド不能だった。本テーブルで COPY 経由の束縛を固定する）。
+            ColumnDef::new("score", ColumnType::Real, true),
+            ColumnDef::new("weight", ColumnType::Double, true),
         ],
     )
 }
@@ -707,6 +713,56 @@ fn copy_from_stdin_rejects_numeric_overflow_and_malformed_uuid() {
     let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tnot-a-uuid\n"])
         .expect_err("malformed UUID literal must be rejected");
     assert_eq!(err.wire_code(), "22P02");
+}
+
+/// `REAL`／`DOUBLE PRECISION` 列を COPY FROM STDIN で束縛できることを固定
+/// する（Issue #1022 コーディネータ指摘対応時に発覚した main マージ由来の
+/// `bind_copy_record`／`bound_insert_byte_len` 網羅漏れの回帰テスト。
+/// TABLE-13・TASK-196・Issue #882）。両列とも投影は `Cell::Float` へ
+/// 写像される契約（INSERT／`RETURNING` と共通・`sql/exec.rs`）。
+#[test]
+fn copy_from_stdin_text_format_binds_real_and_double_columns() {
+    let (core, path) = open_engine_ext("copy-from-ext-real-double");
+    let _guard = CleanupGuard(path);
+
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, score, weight) FROM STDIN USING OPERATION_ID 'ext-op-real-double-1'"
+    );
+    let outcome = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\t1.5\t2.25\n"])
+        .expect("COPY FROM STDIN succeeds");
+    assert_eq!(outcome.rows_affected, 1);
+
+    let cells = select_ext_cells(&core, "acme", 1, "score, weight");
+    assert_eq!(cells, vec![Cell::Float(1.5), Cell::Float(2.25)]);
+}
+
+/// `REAL` 列のオーバーフロー（`22003`）・`DOUBLE PRECISION` 列への文字列
+/// リテラル相当の不正値（`22000`）が INSERT と同じ `wire_code` 分類で
+/// 拒否されることを固定する。
+#[test]
+fn copy_from_stdin_rejects_out_of_range_real_and_malformed_double() {
+    let (core, path) = open_engine_ext("copy-from-ext-bad-real-double");
+    let _guard = CleanupGuard(path);
+
+    let huge = "4".to_string() + &"0".repeat(39);
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, score) FROM STDIN USING OPERATION_ID 'ext-op-real-2'"
+    );
+    let err = run_copy_from(
+        &core,
+        "acme",
+        &sql,
+        &[format!("1\t[1.0,0.0]\t{huge}\n").as_bytes()],
+    )
+    .expect_err("oversized REAL literal must be rejected");
+    assert_eq!(err.wire_code(), "22003");
+
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, weight) FROM STDIN USING OPERATION_ID 'ext-op-double-2'"
+    );
+    let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tnot-a-number\n"])
+        .expect_err("malformed DOUBLE PRECISION literal must be rejected");
+    assert_eq!(err.wire_code(), "22000");
 }
 
 #[test]
