@@ -18,6 +18,7 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
+use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
@@ -572,4 +573,104 @@ fn resending_the_same_operation_id_with_different_integer_value_is_22023() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "22023");
     assert_eq!(count_rows(&core, &ctx), 1);
+}
+
+// --- 成功経路（UPDATE SET・UPSERT DO UPDATE） -------------------------------
+
+/// `UPDATE ... SET n = ..., b = ...`（境界値・負数を含む）の成功経路。
+/// `validate_set_assignments`（`tenant.rs`）の `Integer`／`BigInt` 分岐が
+/// 正しく機能していること（既定の型不一致腕に落ちて `22000`／`XX000` に
+/// ならないこと）を read-back で確認する。
+#[test]
+fn update_set_integer_and_bigint_succeeds_and_reads_back() {
+    let path = unique_db_path("column-type-integer-update-success");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = ctx_for("tenant-a");
+    let mut session = SessionState::default();
+
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, n, b) VALUES (1, '[0.1,0.2]', 1, 1) \
+             USING OPERATION_ID 'op-seed'"
+        ),
+    )
+    .expect("seed insert should succeed");
+
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET n = -5, b = {} WHERE id = 1 USING OPERATION_ID 'op-update'",
+                i64::MAX
+            ),
+        )
+        .expect("update should succeed");
+    match outcome {
+        SqlOutcome::Update(o) => assert_eq!(o.rows_affected, 1),
+        other => panic!("expected SqlOutcome::Update, got {other:?}"),
+    }
+
+    let after = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT n, b FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .expect("select after update should succeed");
+    assert_eq!(
+        after.rows[0].cells,
+        vec![Cell::SignedInteger(-5), Cell::SignedInteger(i64::MAX)]
+    );
+}
+
+/// `UPSERT ... ON CONFLICT (id) DO UPDATE SET n = ...` の成功経路。
+#[test]
+fn upsert_do_update_set_integer_succeeds_and_reads_back() {
+    let path = unique_db_path("column-type-integer-upsert-success");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = ctx_for("tenant-a");
+    let mut session = SessionState::default();
+
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, n, b) VALUES (1, '[0.1,0.2]', 1, 1) \
+             USING OPERATION_ID 'op-seed'"
+        ),
+    )
+    .expect("seed insert should succeed");
+
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, n, b) VALUES (1, '[0.1,0.2]', 2, 2) \
+             ON CONFLICT (id) DO UPDATE SET n = 42 \
+             USING OPERATION_ID 'op-upsert'"
+        ),
+    )
+    .expect("upsert do update should succeed");
+
+    let after = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT n, b FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .expect("select after upsert should succeed");
+    // n は DO UPDATE SET で 42 に上書きされ、SET 対象でない b（既存値 1）は
+    // read-merge-write の `merge_encode_scalar_columns` 経路（`ScalarRef`
+    // 既存値の書き戻し）でそのまま保持される。
+    assert_eq!(
+        after.rows[0].cells,
+        vec![Cell::SignedInteger(42), Cell::SignedInteger(1)]
+    );
 }
