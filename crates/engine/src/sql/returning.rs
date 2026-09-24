@@ -183,6 +183,11 @@ pub(crate) fn project_row(
                     budget,
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
+                Some(Value::Json(s)) => Cell::Json(try_alloc_text_for_budget(
+                    s,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
                 None => return Err(returning_bug("value index out of range")),
             },
             ProjectedColumn::Computed { .. } => {

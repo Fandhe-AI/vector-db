@@ -232,3 +232,126 @@ TABLE-13・TASK-197（Issue #886。関連: WIRE-13・NOSQL-17）で `ColumnType:
   `22P02` の新設（#897・TASK-227）、`WHERE` 述語・二次索引への `BYTEA` 対応
   （#891・#893）、SQL `CREATE TABLE` 構文での `BYTEA` 宣言（SQL-23 は未実装。
   宣言は Rust API の `TableSchema` 経由）。
+
+## #889 追記: JSON / JSONB 列型
+
+TABLE-14・TASK-198（Issue #889。関連: NOSQL-8・NOSQL-17）で `ColumnType::Json`・
+`ColumnType::Jsonb` を追加した。上記チェックリストに沿った実装内容・逸脱の
+決定は以下のとおり。
+
+- カタログ型タグは `"json"`／`"jsonb"`（`param` は `"-"` 固定。既存型と同型）。
+- 値表現は両列型で `row_codec::Value::Json(String)`／`ScalarRef::Json(&str)`
+  の単一 variant を共有する。区別は `ColumnType::Json`／`ColumnType::Jsonb`
+  にのみ持たせ、`JSON` 列は検証済みの入力テキスト（空白・キー順を含む）を
+  そのまま、`JSONB` 列は正規化再シリアライズ済みのテキストを保持する。
+- JSON テキストの構文検証は共有パーサー `engine::json::parse_json`（TASK-172・
+  NOSQL-8。第 2 のパーサーは作らない）を経由する。`json.rs` に追加した
+  `MAX_JSON_FIELD_LEN`（4 MiB。`row_codec::MAX_TEXT_FIELD_LEN` と同値。`const`
+  アサーションで固定）・`validate_json_column_text`（`JSON` 列向け。総バイト
+  長を `parse_json` を呼ぶ**前**に判定してから構文検証）・
+  `canonicalize_jsonb_text`（`JSONB` 列向け。検証後 `write_canonical` で
+  正規化し、正規化後の長さも再判定）・`write_canonical`（唯一の正規化
+  シリアライザ。オブジェクトのキーは `JsonValue::Object` が `BTreeMap` の
+  ため既にキー文字列の昇順で走査される。数値は `JsonNumber::Float` の生
+  リテラル文字列をそのまま出力し `f64` を経由した再フォーマットによる
+  往復ずれを避ける）を追加した。
+- 格納時検証の単一チョークポイントは `row_codec` の encode 系
+  （`encode_row`／`encode_scalar_columns`／`merge_encode_scalar_columns`）に
+  集約した（`validate_json_column_value` が列型で分岐）。これにより Rust
+  API（`tenant::insert_typed_row` 等）経由でも未検証・未正規化の JSON が
+  格納されない。束縛層（`sql::parser::bind_json_literal`／NoSQL 表層の
+  insert/update）でのユーザー向け分類が先に働くため、encode 層の拒否は
+  API 誤用時の内部エラー（`XX000`）として扱う設計判断とした。この単一
+  チョークポイントの検証は SET 対象列（クライアントからの新規入力）にのみ
+  適用し、`UPDATE` の SET 対象でない既存列（`merge_encode_scalar_columns`
+  の `existing` 分岐）は TEXT／BYTEA と同じく再パース・再検証しない
+  （decode 契約「書き込み経路の保証に依拠」に揃える。既存値を毎回
+  再検証すると SET 対象でない `UPDATE` でも文書サイズに比例した
+  再パース・再シリアライズ・文字列比較のコストが掛かるうえ、
+  `write_canonical` の出力形式が将来変わった場合に既存の全 `JSONB` 行が
+  `XX000` で更新不能になるフォワード互換の結合が生じるため）。
+- 行バイト表現は TEXT と同じ枠（presence + `u32 LE` 長 + UTF-8 本体）を
+  共有し、フレーム長計算は `scalar_text_entry_len` を共有する。decode 側は
+  TEXT と同じく長さ上限・UTF-8 検証のみを行い、再パースしない（書き込み
+  経路の保証に依拠。再検証が必要な消費側〔NoSQL 応答〕は自前で行う）。
+- `content_hash::push_value` のタグは `Json = 12`（Null=0／Text=1／
+  Vector=2／Bool=7／Bytes=11 は不変。3〜6・8〜10 は他型向けに予約）。
+- **決定 D1（Issue 本文からの逸脱）**: Issue 本文は「`22032` 相当」の新規
+  `wire_code` を想定していたが、spec（SSOT）は ERR-4 の閉じた分類集合を維持し
+  新規 `wire_code` の追加を求めていない。よって JSON 受理規則違反は既存分類
+  のみで写像する: 構文不正・重複キー・非 RFC 8259 数値・深さ/要素数超過は
+  `42601`（`SqlSurfaceError::UnsupportedSyntax`／NoSQL は `InsertError::
+  InvalidJson`／`UpdateError::InvalidJson`。NOSQL-8 と同一分類）、総バイト長
+  超過は `54000`（`SqlSurfaceError::PayloadTooLarge`／`InsertError::
+  JsonTooLarge`／`UpdateError::JsonTooLarge`）、数値・真偽値リテラルの型
+  不一致は `22000`（SQL 表層。既存の型不一致パターン）。`22P02` 新設は
+  #897・TASK-227 の担当のまま。
+  - 注記: SQL 表層の総バイト長超過（`54000`）は、`sql::lexer::MAX_INPUT_LEN`
+    （SQL テキスト全体の入力長上限。1 MiB）が `json::MAX_JSON_FIELD_LEN`
+    （4 MiB）より小さいため、SQL リテラル経由では構造的に到達できない
+    （1 MiB 超の SQL テキストは常に字句解析段で `42601` になる）。総バイト長
+    判定が構文検証より前に働くこと自体は `json.rs` の単体テスト
+    （`validate_json_column_text_checks_length_before_parsing`／
+    `canonicalize_jsonb_text_checks_length_before_parsing`）で固定し、SQL
+    テキストを経由しない Rust API（`tenant::insert_typed_row`）経由の到達性は
+    `json_column.rs::typed_row_insert_rejects_total_byte_length_over_limit_before_parsing`
+    で固定する。また 1 つの文字列リテラル自体には別上限
+    `json::MAX_JSON_STRING_CHARS`（1 MiB）が掛かるため、`MAX_JSON_FIELD_LEN`
+    ちょうどの JSON を構成する単体テストは複数要素の配列を使う
+    （`validate_json_column_text_accepts_at_exact_length_limit`）。
+- `sql::parser` の 4 つの束縛箇所（INSERT・UPDATE の SET・UPSERT のリテラル・
+  UPSERT の `ON CONFLICT` リテラル）が共通ヘルパー `bind_json_literal` を
+  経由する。SQL の文字列リテラルは JSON テキストとして解釈し、トップレベルの
+  スカラー JSON（`'1'`・`'"s"'`・`'null'`）も有効な JSON として受理する
+  （`'null'` は JSON の `null` であり SQL `NULL` とは別物）。ファイル形
+  `INSERT`（`path`/`body` 列規約専用）は BOOLEAN／BYTEA と同じ理由で `JSON`
+  列も対象外として拒否する。
+- 集計: `COUNT(<JSON/JSONB 列>)`（非 NULL 行数）のみ受理し、`SUM`/`AVG`/
+  `MIN`/`MAX` は `22000` で拒否する（`AggregateInput::JsonColumn`。
+  `ByteaColumn` と同じパターン）。`GROUP BY` キー列は引き続き TEXT 限定の
+  まま。
+- `WHERE` 述語・スカラー二次索引・UDF/式評価・hybrid 本文列・`USING PLAN`・
+  scoring_boost・バイナリ結果形式（WIRE-14）への `JSON`/`JSONB` 列の露出は
+  すべて BYTEA と同じ既存拒否パターンを踏襲し `22000`／`0A000` で拒否する
+  （索引は `per_column.push(None)`。二次索引拡張は #893 へ申し送り）。
+- **決定 D5（パス参照の範囲。Issue 本文からの逸脱）**: spec TABLE-14 は
+  JSON パス演算子（`->`／`->>`／`@>` 等）による述語を対象外（`42601`）と
+  している。式評価器（`sql::udf_call`）は TEXT 列参照すら `22000` で拒否し
+  `ExprType` に文字列型が無いため、SQL 関数形の追加も式評価拡張（#891）の
+  領域となる。よって本 Issue では `json.rs` に engine の Rust API 限定の
+  最小パス参照 API（`JsonPathStep`／`JsonPath`／`extract_path`／
+  `extract_path_text`。ステップ数上限は `MAX_JSON_DEPTH` と同値）のみを
+  追加し、SQL・NoSQL 表層への構文露出は行わない（`doc -> 'a'` は引き続き
+  `42601`）。露出は spec ID 付与後の別 Issue へ申し送る。
+- wire-server: SQL 表層のテキスト表現は格納テキストをそのまま出力する
+  （`JSON` は入力テキスト保持・`JSONB` は正規化済みテキストのため、いずれも
+  再シリアライズしない）。NoSQL 表層（`insert.rs`／`update.rs`）は JSON
+  オブジェクト／配列を受理し `write_canonical` で正規化テキスト化した
+  うえで `Value::Json`（insert）／`InsertLiteral::String`（update。BYTEA の
+  B9 判断と同じく束縛経路を 1 本に保つ）へ写像する。JSON `null` は
+  nullable 列なら `NULL`。スカラー JSON（文字列・数値・真偽値）は
+  NOSQL-17 の束縛表に無いため曖昧さを避けて `42601` で拒否する。
+  `response.rs`（`scan`／`search`／`aggregate` の JSON 応答）は `Cell::Json`
+  を **native JSON 値**として出力する。格納テキストを共有パーサーで再パース
+  し `write_canonical` で再シリアライズしてから埋め込む（格納バイト列を
+  生のまま応答本文へ連結しない安全側の設計。再パース失敗は内部エラー
+  〔`XX000`〕）。`columns[].type` の型名整備は #896 へ申し送り（現行の一律
+  `"text"` のまま）。
+- **決定 D4（表層横断の非対称）**: `JSONB` は SQL・NoSQL とも正規化形を
+  格納・ハッシュするため表層横断の再送判定（`23505`／`22023`）が一致する。
+  一方 `JSON`（非 B）は SQL 表層が入力テキストをそのまま格納・ハッシュする
+  のに対し、NoSQL 表層は常に正規化形を格納・ハッシュするため、非正規な
+  空白を含む SQL 書き込みを NoSQL から同一 `operation_id` で再送すると
+  `22023`（内容不一致）になりうる。これは「`JSON` 型は入力テキスト保持」を
+  優先した既知の非対称であり、`JSON` 型の正規化は PostgreSQL `json` の
+  意味論から外れるため採らない（層 B テスト
+  `wire_json_column.rs::json_operation_id_resend_via_nosql_after_sql_seed_is_content_mismatch_when_whitespace_differs`
+  で契約を固定）。
+- 対象外（申し送り）: RowDescription の OID 拡張（`json` 114／`jsonb` 3802。
+  既存の `WireType::Text`〔OID 25〕のまま。#895）、NoSQL の既存型統一・
+  `columns[].type`（#896）、`22P02` の新設（#897・TASK-227）、`WHERE` 述語
+  （等価・`IS NULL`）・二次索引への `JSON`/`JSONB` 対応（#891・#893）、SQL
+  `CREATE TABLE` 構文での `JSON`/`JSONB` 宣言（SQL-23 は未実装。宣言は
+  Rust API の `TableSchema` 経由）、パス参照 API の SQL/NoSQL 表層への構文
+  露出（spec ID 付与後の別 Issue）、`JSONB` の真のバイナリ格納表現
+  （現状は正規化テキスト表現を実装既定値とする）。

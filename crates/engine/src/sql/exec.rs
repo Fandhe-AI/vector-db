@@ -186,6 +186,10 @@ pub enum Cell {
     Bool(bool),
     /// `BYTEA` 列の投影結果（Issue #886）。
     Bytes(Vec<u8>),
+    /// `JSON`／`JSONB` 列の投影結果（TABLE-14・TASK-198、Issue #889）。格納テキスト
+    /// をそのまま保持する（`JSON` 列は入力テキスト・`JSONB` 列は正規化済みテキスト。
+    /// wire のテキスト表現はこれをそのまま出力する）。
+    Json(String),
 }
 
 /// 投影結果の列メタデータ。`Id` は疑似列（`ColumnType` を持たない）。
@@ -859,6 +863,14 @@ pub(crate) fn execute_statement_with_cache(
                             MAX_CANDIDATE_SCALAR_BYTES,
                         )?;
                         kept.push(Value::Bytes(owned));
+                    }
+                    Some(row_codec::ScalarRef::Json(t)) => {
+                        let owned = try_alloc_text_for_budget(
+                            t,
+                            &mut candidate_scalar_bytes,
+                            MAX_CANDIDATE_SCALAR_BYTES,
+                        )?;
+                        kept.push(Value::Json(owned));
                     }
                 }
             }
@@ -1838,6 +1850,7 @@ pub(crate) fn execute_statement_with_cache(
                     Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
                     Value::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
                     Value::Bytes(b) => Some(row_codec::ScalarRef::Bytes(b.as_slice())),
+                    Value::Json(t) => Some(row_codec::ScalarRef::Json(t.as_str())),
                     Value::Null | Value::Vector(_) => None,
                 })
                 .collect();
@@ -2179,6 +2192,15 @@ fn decode_deferred_scalars(
                 })?;
                 out.push(Value::Bytes(owned));
             }
+            Some(row_codec::ScalarRef::Json(t)) => {
+                let owned = try_alloc_text_for_budget(t, budget, MAX_CANDIDATE_SCALAR_BYTES)
+                    .map_err(|_| {
+                        SqlSurfaceError::payload_too_large(
+                            "deferred scalar projection exceeds candidate budget",
+                        )
+                    })?;
+                out.push(Value::Json(owned));
+            }
         }
     }
     Ok(out)
@@ -2405,7 +2427,8 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Bool(_))
-                            | Some(Value::Bytes(_)) => {
+                            | Some(Value::Bytes(_))
+                            | Some(Value::Json(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2416,7 +2439,8 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
-                            | Some(Value::Bytes(_)) => {
+                            | Some(Value::Bytes(_))
+                            | Some(Value::Json(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2437,7 +2461,20 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
-                            | Some(Value::Bool(_)) => {
+                            | Some(Value::Bool(_))
+                            | Some(Value::Json(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Json | ColumnType::Jsonb => match decoded.get(*index) {
+                            Some(Value::Json(t)) => cells.push(Cell::Json(try_clone_text(t)?)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Bytes(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })

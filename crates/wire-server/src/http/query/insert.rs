@@ -101,6 +101,15 @@ pub enum InsertError {
     /// `BYTEA` 列の base64 値が復号後 [`engine::bytea::MAX_BYTEA_FIELD_LEN`] を
     /// 超える（`54000`）。
     ByteaTooLarge,
+    /// `JSON`／`JSONB` 列の値が JSON オブジェクト／配列の型として不整合、または
+    /// 構文不正（`42601`。Issue #889 D6。SQL 表層の型不一致〔`22000`〕とは
+    /// 意図的に異なる分類——BYTEA の `InvalidBytea` と同じ判断）。スカラー JSON
+    /// （文字列・数値・真偽値）は NOSQL-17 の束縛表に無いため曖昧さを避けて
+    /// 同じ分類で拒否する。
+    InvalidJson(&'static str),
+    /// `JSON`／`JSONB` 列の値が正規化後 [`engine::json::MAX_JSON_FIELD_LEN`] を
+    /// 超える（`54000`）。
+    JsonTooLarge,
 }
 
 impl From<SchemaError> for InsertError {
@@ -123,6 +132,8 @@ impl ClassifiedError for InsertError {
             InsertError::Bind(err) | InsertError::Exec(err) => err.error_class(),
             InsertError::InvalidBytea(_) => ErrorClass::UnsupportedSqlSyntax,
             InsertError::ByteaTooLarge => ErrorClass::PayloadTooLarge,
+            InsertError::InvalidJson(_) => ErrorClass::UnsupportedSqlSyntax,
+            InsertError::JsonTooLarge => ErrorClass::PayloadTooLarge,
         }
     }
 
@@ -133,6 +144,8 @@ impl ClassifiedError for InsertError {
             InsertError::Bind(err) | InsertError::Exec(err) => err.client_message(),
             InsertError::InvalidBytea(detail) => detail.to_string(),
             InsertError::ByteaTooLarge => "BYTEA value exceeds the length limit".to_string(),
+            InsertError::InvalidJson(detail) => detail.to_string(),
+            InsertError::JsonTooLarge => "JSON value exceeds the length limit".to_string(),
         }
     }
 }
@@ -251,6 +264,28 @@ fn bind_row(item: &JsonValue, schema: &TableSchema) -> Result<(u64, Vec<Value>),
             (ColumnType::Bytea, _) => {
                 return Err(InsertError::InvalidBytea(
                     "INSERT row BYTEA column value must be a base64 JSON string",
+                ))
+            }
+            // `JSON`／`JSONB` 列はネストした JSON オブジェクト／配列を受理し、
+            // 正規化テキストへ写像する（Issue #889 D6。`JSON` 列も含め NoSQL
+            // 経由の値は常に正規化形で格納する設計判断——row_codec の encode
+            // チョークポイントは「有効な JSON か」のみを検証するため矛盾しない）。
+            // スカラー JSON（文字列・数値・真偽値）は NOSQL-17 の束縛表に無い
+            // ため曖昧さを避けて `42601` で拒否する。
+            (ColumnType::Json | ColumnType::Jsonb, JsonValue::Object(_) | JsonValue::Array(_)) => {
+                let mut canonical = String::new();
+                engine::json::write_canonical(raw, &mut canonical);
+                if canonical.len() > engine::json::MAX_JSON_FIELD_LEN {
+                    return Err(InsertError::JsonTooLarge);
+                }
+                Value::Json(canonical)
+            }
+            (ColumnType::Json | ColumnType::Jsonb, JsonValue::Null) if column.nullable => {
+                Value::Null
+            }
+            (ColumnType::Json | ColumnType::Jsonb, _) => {
+                return Err(InsertError::InvalidJson(
+                    "INSERT row JSON column value must be a JSON object or array",
                 ))
             }
             _ => {
@@ -407,6 +442,14 @@ pub fn execute(
                     },
                     InsertError::ByteaTooLarge => SqlSurfaceError::PayloadTooLarge {
                         detail: "BYTEA value exceeds the length limit".to_string(),
+                    },
+                    // `InvalidJson`（`42601`）／`JsonTooLarge`（`54000`）の分類を
+                    // `SqlSurfaceError` へ写像しても維持する（Issue #889 D6）。
+                    InsertError::InvalidJson(detail) => SqlSurfaceError::UnsupportedSyntax {
+                        detail: detail.to_string(),
+                    },
+                    InsertError::JsonTooLarge => SqlSurfaceError::PayloadTooLarge {
+                        detail: "JSON value exceeds the length limit".to_string(),
                     },
                 })
             },

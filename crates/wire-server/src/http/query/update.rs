@@ -121,6 +121,13 @@ pub enum UpdateError {
     /// `BYTEA` 列の base64 値が復号後 [`engine::bytea::MAX_BYTEA_FIELD_LEN`] を
     /// 超える（`54000`）。
     ByteaTooLarge,
+    /// `JSON`／`JSONB` 列の SET 値が JSON オブジェクト／配列でない、または
+    /// 構文不正（`42601`。Issue #889 D6。`insert.rs::InsertError::InvalidJson`
+    /// と同じ分類判断）。
+    InvalidJson(&'static str),
+    /// `JSON`／`JSONB` 列の SET 値が正規化後
+    /// [`engine::json::MAX_JSON_FIELD_LEN`] を超える（`54000`）。
+    JsonTooLarge,
 }
 
 impl From<SchemaError> for UpdateError {
@@ -162,6 +169,8 @@ impl ClassifiedError for UpdateError {
             UpdateError::Engine(err) => err.error_class(),
             UpdateError::InvalidBytea(_) => ErrorClass::UnsupportedSqlSyntax,
             UpdateError::ByteaTooLarge => ErrorClass::PayloadTooLarge,
+            UpdateError::InvalidJson(_) => ErrorClass::UnsupportedSqlSyntax,
+            UpdateError::JsonTooLarge => ErrorClass::PayloadTooLarge,
         }
     }
 
@@ -173,6 +182,8 @@ impl ClassifiedError for UpdateError {
             UpdateError::EmptySet => "SET clause must specify at least one column".to_string(),
             UpdateError::InvalidBytea(detail) => detail.to_string(),
             UpdateError::ByteaTooLarge => "BYTEA value exceeds the length limit".to_string(),
+            UpdateError::InvalidJson(detail) => detail.to_string(),
+            UpdateError::JsonTooLarge => "JSON value exceeds the length limit".to_string(),
             UpdateError::Set(detail) => detail.to_string(),
             UpdateError::Engine(err) => err.client_message(),
         }
@@ -289,6 +300,23 @@ fn map_set_assignments(
                     "SET BYTEA column value must be a base64 JSON string",
                 ))
             }
+            // `JSON`／`JSONB` 列は `insert.rs::bind_row` と同じ規則で JSON
+            // オブジェクト／配列を正規化テキストへ写像し、`InsertLiteral::String`
+            // として engine の SQL 束縛経路（`bind_json_literal`）へ渡す
+            // （B9・Issue #889 D6。BYTEA と同型の判断で束縛経路を 1 本に保つ）。
+            (ColumnType::Json | ColumnType::Jsonb, JsonValue::Object(_) | JsonValue::Array(_)) => {
+                let mut canonical = String::new();
+                engine::json::write_canonical(raw, &mut canonical);
+                if canonical.len() > engine::json::MAX_JSON_FIELD_LEN {
+                    return Err(UpdateError::JsonTooLarge);
+                }
+                InsertLiteral::String(canonical)
+            }
+            (ColumnType::Json | ColumnType::Jsonb, _) => {
+                return Err(UpdateError::InvalidJson(
+                    "SET JSON column value must be a JSON object or array",
+                ))
+            }
         };
         assignments.push((key.clone(), literal));
     }
@@ -368,6 +396,14 @@ pub fn execute(
                 },
                 UpdateError::ByteaTooLarge => SqlSurfaceError::PayloadTooLarge {
                     detail: "BYTEA value exceeds the length limit".to_string(),
+                },
+                // `InvalidJson`（`42601`）／`JsonTooLarge`（`54000`）の分類を
+                // `SqlSurfaceError` へ写像しても維持する（Issue #889 D6）。
+                UpdateError::InvalidJson(detail) => SqlSurfaceError::UnsupportedSyntax {
+                    detail: detail.to_string(),
+                },
+                UpdateError::JsonTooLarge => SqlSurfaceError::PayloadTooLarge {
+                    detail: "JSON value exceeds the length limit".to_string(),
                 },
             })?;
             let stmt = ValidatedUpdate {

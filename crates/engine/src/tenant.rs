@@ -1734,10 +1734,49 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (
+                crate::catalog::ColumnType::Json | crate::catalog::ColumnType::Jsonb,
+                crate::row_codec::Value::Json(t),
+            ) => {
+                // SET 値の JSON／JSONB 長上限検証（対象行の探索より前に行う）。
+                // フレーミングは TEXT と同一のため `scalar_text_entry_len` を
+                // 共有する（Issue #889）。構文検証・JSONB 正規化の一致検証は
+                // `row_codec` の encode チョークポイント（多層防御）で行う。
+                let text_len = u32::try_from(t.len()).map_err(|_| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "json field too long: {} bytes",
+                        t.len()
+                    )))
+                })?;
+                if text_len > crate::row_codec::MAX_TEXT_FIELD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "json field length {text_len} exceeds limit {}",
+                        crate::row_codec::MAX_TEXT_FIELD_LEN
+                    ))));
+                }
+                let entry_len = crate::row_codec::scalar_text_entry_len(text_len)
+                    .map_err(|e| TenantWriteError::Catalog(CatalogError::Invalid(e.to_string())))?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             (crate::catalog::ColumnType::Vector(_), _)
             | (crate::catalog::ColumnType::Text, _)
             | (crate::catalog::ColumnType::Boolean, _)
-            | (crate::catalog::ColumnType::Bytea, _) => {
+            | (crate::catalog::ColumnType::Bytea, _)
+            | (crate::catalog::ColumnType::Json, _)
+            | (crate::catalog::ColumnType::Jsonb, _) => {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column type does not match the current table schema".to_string(),
                 )))

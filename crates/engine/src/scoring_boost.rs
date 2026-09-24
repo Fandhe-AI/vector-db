@@ -99,7 +99,11 @@ impl ScoringBoost {
             })?;
         match column.ty {
             ColumnType::Text => {}
-            ColumnType::Vector(_) | ColumnType::Boolean | ColumnType::Bytea => {
+            ColumnType::Vector(_)
+            | ColumnType::Boolean
+            | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {:?} is not a TEXT column",
                     self.column

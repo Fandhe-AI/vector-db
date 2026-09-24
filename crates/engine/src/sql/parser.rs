@@ -328,7 +328,11 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .enumerate()
         .find_map(|(idx, c)| match c.ty {
             ColumnType::Vector(dim) => Some((idx, dim)),
-            ColumnType::Text | ColumnType::Boolean | ColumnType::Bytea => None,
+            ColumnType::Text
+            | ColumnType::Boolean
+            | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb => None,
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
@@ -364,9 +368,13 @@ pub(crate) fn text_column_index(
                 .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
             match column.ty {
                 ColumnType::Text => Ok(idx),
-                ColumnType::Vector(_) | ColumnType::Boolean | ColumnType::Bytea => Err(
-                    SqlSurfaceError::invalid_input(format!("column {name:?} is not a TEXT column")),
-                ),
+                ColumnType::Vector(_)
+                | ColumnType::Boolean
+                | ColumnType::Bytea
+                | ColumnType::Json
+                | ColumnType::Jsonb => Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is not a TEXT column"
+                ))),
             }
         })
 }
@@ -1133,6 +1141,17 @@ fn bind_insert_row(
                     "column {name:?} expects a bytea hex literal"
                 )))
             }
+            (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                bind_json_literal(s, column.ty, name)?
+            }
+            (
+                ColumnType::Json | ColumnType::Jsonb,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a JSON text literal"
+                )))
+            }
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
             *slot = value;
@@ -1178,6 +1197,52 @@ fn bind_bytea_literal(
         Err(_) => Err(SqlSurfaceError::invalid_input(format!(
             "column {column_name:?} expects a valid bytea hex literal (\\x...)"
         ))),
+    }
+}
+
+/// `JSON`／`JSONB` 列向けの文字列リテラルを [`crate::row_codec::Value::Json`] へ
+/// 束縛する共通ヘルパー（Issue #889 D6。`bind_bytea_literal` と同型）。INSERT・
+/// UPDATE・UPSERT リテラル・UPSERT `ON CONFLICT` リテラルの 4 束縛箇所が共有する。
+/// SQL の文字列リテラルは JSON テキストとして解釈する（トップレベルのスカラー
+/// JSON も有効な JSON として受理。`'null'` は JSON の `null` であり SQL `NULL`
+/// とは別物）。`JSON` 列は検証のみ（入力テキスト保持）、`JSONB` 列は正規化する。
+///
+/// - 構文不正・深さ/要素数超過は `42601`（[`SqlSurfaceError::UnsupportedSyntax`]。
+///   NOSQL-8 と同一分類）。
+/// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
+fn bind_json_literal(
+    s: &str,
+    column_ty: ColumnType,
+    column_name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    let text = match column_ty {
+        ColumnType::Json => {
+            crate::json::validate_json_column_text(s).map_err(|e| json_column_error(e, s))?;
+            s.to_string()
+        }
+        ColumnType::Jsonb => {
+            crate::json::canonicalize_jsonb_text(s).map_err(|e| json_column_error(e, s))?
+        }
+        ColumnType::Text | ColumnType::Vector(_) | ColumnType::Boolean | ColumnType::Bytea => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {column_name:?} is not a JSON column"
+            )));
+        }
+    };
+    Ok(crate::row_codec::Value::Json(text))
+}
+
+/// [`crate::json::JsonColumnError`] を SQL 表層の分類（`SqlSurfaceError`）へ写像する
+/// （Issue #889 D1）。`s` 自体（内容）はエラーメッセージへ含めない
+/// （security.md「テナント境界」: エラー経由の情報漏えい防止）。
+fn json_column_error(e: crate::json::JsonColumnError, _s: &str) -> SqlSurfaceError {
+    match e {
+        crate::json::JsonColumnError::TooLong => {
+            SqlSurfaceError::payload_too_large("JSON literal exceeds maximum length")
+        }
+        crate::json::JsonColumnError::Invalid => {
+            SqlSurfaceError::unsupported("invalid JSON literal")
+        }
     }
 }
 
@@ -1312,6 +1377,17 @@ fn bind_set_assignments(
             (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a bytea hex literal"
+                )))
+            }
+            (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                bind_json_literal(s, column.ty, name)?
+            }
+            (
+                ColumnType::Json | ColumnType::Jsonb,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a JSON text literal"
                 )))
             }
         };
@@ -1840,6 +1916,17 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a bytea hex literal"
                         )))
                     }
+                    (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                        bind_json_literal(s, column.ty, name)?
+                    }
+                    (
+                        ColumnType::Json | ColumnType::Jsonb,
+                        InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+                    ) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a JSON text literal"
+                        )))
+                    }
                 };
                 BoundUpsertValue::Literal(v)
             }
@@ -1946,6 +2033,12 @@ fn bind_file_insert(
                     "column {name:?}: BYTEA column is not supported for file-form INSERT"
                 )))
             }
+            // JSON／JSONB 列も同じ理由で対象外とする（Issue #889 D6）。
+            (ColumnType::Json | ColumnType::Jsonb, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: JSON column is not supported for file-form INSERT"
+                )))
+            }
         };
         if col_idx == path_column_index {
             if let crate::row_codec::Value::Text(ref s) = value {
@@ -2035,6 +2128,11 @@ pub(crate) enum AggregateInput {
     /// `MAX` は `BooleanColumn` と同じパターンで [`resolve_aggregate_input`] が
     /// 型不整合として拒否する。
     ByteaColumn(usize),
+    /// `JSON`／`JSONB` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-14・TASK-198、Issue #889）。`SUM`/`AVG`/`MIN`/`MAX`
+    /// は `ByteaColumn` と同じパターンで [`resolve_aggregate_input`] が型不整合
+    /// として拒否する。
+    JsonColumn(usize),
     /// 上記以外の `Scalar` 型に束縛された式（列参照 `id` 単体を除く。`vec_norm(...)`
     /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`program`（束縛時に
     /// ステップ列コンパイル済み、Issue #353）を行ループで評価する。`source` は
@@ -2462,6 +2560,14 @@ fn resolve_aggregate_input(
                     (ColumnType::Bytea, _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is BYTEA and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
+                    (ColumnType::Json | ColumnType::Jsonb, AggregateFunc::Count) => {
+                        Ok(AggregateInput::JsonColumn(index))
+                    }
+                    (ColumnType::Json | ColumnType::Jsonb, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is JSON and cannot be used with SUM/AVG/MIN/MAX"
+                        )))
+                    }
                 };
             }
             if name == "id" {

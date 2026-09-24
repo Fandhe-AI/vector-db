@@ -336,6 +336,14 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
             ty: engine::catalog::ColumnType::Bytea,
             ..
         } => false,
+        // `JSON`／`JSONB` 列（TABLE-14・Issue #889）も同じ理由で fail-closed に
+        // 非対応とする（値の実体が `Cell::Json` の格納テキストであり `Text` の
+        // 単純な UTF-8 生バイト表現と意味論が異なるため。RowDescription への
+        // 専用 OID 公告は Issue #895 の担当）。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Json | engine::catalog::ColumnType::Jsonb,
+            ..
+        } => false,
         // 実行時型（Float/Bool/Vector）が静的に決まらないため fail-closed
         // で非対応とする（#895 で型情報が付いたら見直す）。
         ColumnMeta::Computed { .. } => false,
@@ -443,6 +451,10 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         // `BYTEA` のテキスト表現は PostgreSQL 既定の `bytea_output=hex`（`\x` ＋
         // 小文字 16 進）と同形にする（B5・Issue #886）。
         Cell::Bytes(b) => Ok(Some(engine::bytea::format_hex_text(b))),
+        // `JSON`／`JSONB` の text 表現は格納テキストをそのまま出力する
+        // （TABLE-14・Issue #889。`JSON` は入力テキスト保持・`JSONB` は正規化
+        // 済みテキストのため、いずれもここで再シリアライズしない）。
+        Cell::Json(s) => Ok(Some(s.clone())),
     }
 }
 
@@ -566,7 +578,8 @@ where
                     | Cell::Vector(_)
                     | Cell::Float(_)
                     | Cell::Bool(_)
-                    | Cell::Bytes(_) => {
+                    | Cell::Bytes(_)
+                    | Cell::Json(_) => {
                         return Err(EncodeError);
                     }
                 },

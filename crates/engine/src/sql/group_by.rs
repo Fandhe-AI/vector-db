@@ -703,10 +703,15 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
             // 比較演算子として構造上生成しないため到達しない。
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
         },
-        // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT/BYTEA 型の集計結果を
-        // HAVING の対象として拒否済みのため到達しない。fail-closed に「不一致」
-        // として扱う。
-        Cell::Null | Cell::Text(_) | Cell::Vector(_) | Cell::Bool(_) | Cell::Bytes(_) => false,
+        // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT/BYTEA/JSON 型の集計
+        // 結果を HAVING の対象として拒否済みのため到達しない。fail-closed に
+        // 「不一致」として扱う。
+        Cell::Null
+        | Cell::Text(_)
+        | Cell::Vector(_)
+        | Cell::Bool(_)
+        | Cell::Bytes(_)
+        | Cell::Json(_) => false,
     }
 }
 

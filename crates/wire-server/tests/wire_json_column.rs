@@ -1,0 +1,329 @@
+//! `JSON`／`JSONB` 列型（TABLE-14・TASK-198、Issue #889）の wire・NoSQL 結合
+//! テスト。ポインタ: `docs/spec/05-tasks.md` TASK-198・`docs/spec/04-behavior/
+//! nosql.md` NOSQL-8・NOSQL-17。
+//!
+//! `crates/engine/tests/json_column.rs`（engine API 直接）とは独立に、
+//! **wire フレーミング越し**の観測に徹する（`wire_bytea_column.rs` と同じ
+//! 役割分担）:
+//! - SQL 表層（生バイトクライアント）: テキスト表現の往復一致・バイナリ
+//!   形式指定時の非対応拒否（`0A000`）
+//! - NoSQL 表層（HTTP）: native JSON 表現での insert/update・SQL/NoSQL 間
+//!   パリティ（JSONB は正規化のため一致・JSON は非対称）・拒否経路
+
+#[path = "common/mod.rs"]
+mod common;
+#[path = "http_common/mod.rs"]
+mod http_common;
+
+use std::sync::Arc;
+
+use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::core::EngineCore;
+use engine::json::{parse_json, JsonValue};
+use engine::kernel::CpuScalarProvider;
+use engine::storage::Storage;
+
+use http_common::temp_db;
+use http_common::{AfterWrite, HttpResponse};
+use wire_server::http::session::store::SessionStore;
+
+const TABLE: &str = "docs";
+
+fn schema() -> TableSchema {
+    TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(3), false),
+            ColumnDef::new("doc", ColumnType::Json, true),
+            ColumnDef::new("docb", ColumnType::Jsonb, true),
+        ],
+    )
+}
+
+fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire-json-column");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    (
+        Arc::new(EngineCore::from_storage(
+            storage,
+            Box::new(CpuScalarProvider),
+        )),
+        guard,
+    )
+}
+
+// --- SQL 表層: テキスト表現の往復 ----------------------------------------------
+
+#[test]
+fn wire_text_select_returns_stored_text_and_round_trips() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    common::send_simple_query(
+        &mut alice,
+        r#"INSERT INTO docs (id, embedding, doc, docb) VALUES (1, '[0.1,0.2,0.3]', '{"b":2,"a":1}', '{"b":2,"a":1}') USING OPERATION_ID 'op-insert-1'"#,
+    );
+    assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT doc, docb FROM docs WHERE id = 1 LIMIT 1",
+    );
+    common::read_row_description(&mut alice);
+    let row = common::read_data_row(&mut alice);
+    // `doc`（JSON）は入力テキストをそのまま保持、`docb`（JSONB）はキー順が
+    // 辞書順へ正規化される。
+    assert_eq!(
+        row,
+        vec![
+            Some(r#"{"b":2,"a":1}"#.to_string()),
+            Some(r#"{"a":1,"b":2}"#.to_string()),
+        ]
+    );
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+
+    // 読み出したテキストをそのまま再度 INSERT すると、同じ格納テキストになる
+    // （wire テキスト表現の往復一致）。
+    common::send_simple_query(
+        &mut alice,
+        r#"INSERT INTO docs (id, embedding, doc, docb) VALUES (2, '[0.1,0.2,0.3]', '{"b":2,"a":1}', '{"a":1,"b":2}') USING OPERATION_ID 'op-insert-2'"#,
+    );
+    assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT doc, docb FROM docs WHERE id = 2 LIMIT 1",
+    );
+    common::read_row_description(&mut alice);
+    let row2 = common::read_data_row(&mut alice);
+    assert_eq!(row2, row);
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+}
+
+#[test]
+fn wire_text_null_and_json_null_literal_are_distinguishable() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    common::send_simple_query(
+        &mut alice,
+        "INSERT INTO docs (id, embedding, doc) VALUES (1, '[0.1,0.2,0.3]', 'null') \
+         USING OPERATION_ID 'op-json-null'",
+    );
+    assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(
+        &mut alice,
+        "INSERT INTO docs (id, embedding) VALUES (2, '[0.1,0.2,0.3]') \
+         USING OPERATION_ID 'op-sql-null'",
+    );
+    assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+    common::read_ready_for_query(&mut alice);
+
+    common::send_simple_query(&mut alice, "SELECT id, doc FROM docs LIMIT 100");
+    common::read_row_description(&mut alice);
+    let mut rows = Vec::new();
+    for _ in 0..2 {
+        rows.push(common::read_data_row(&mut alice));
+    }
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+
+    // JSON の `null` は非 NULL の値（テキスト "null"）、SQL NULL は `None`
+    // （-1 長）として区別される。
+    let by_id: std::collections::BTreeMap<String, Option<String>> = rows
+        .into_iter()
+        .map(|r| {
+            let id = r[0].clone().expect("id must not be NULL");
+            (id, r[1].clone())
+        })
+        .collect();
+    assert_eq!(by_id.get("1"), Some(&Some("null".to_string())));
+    assert_eq!(by_id.get("2"), Some(&None));
+}
+
+// バイナリ結果形式指定時の非対応拒否（`0A000`。WIRE-14。BYTEA と同区分）は
+// `wire14_binary_format.rs::json_column_binary_request_is_rejected_as_feature_not_supported`
+// が `validate_binary_formats` を直接呼ぶ形で固定する（拡張クエリプロトコルの
+// 生バイト構築ヘルパーがこのテストファイル群に無いため、同テストファイルの
+// 既存パターン〔BYTEA・VECTOR・Computed 列と同型〕に揃えた）。
+
+// --- NoSQL 表層: native JSON 表現の insert/update・SQL とのパリティ・拒否経路 ---
+
+struct Both {
+    http_addr: std::net::SocketAddr,
+    token: String,
+}
+
+fn spawn_both(core: Arc<EngineCore>) -> (Both, std::net::TcpStream) {
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let http_addr = http_common::spawn_router_listener_with_engine(
+        &users_path,
+        SessionStore::new(),
+        core.clone(),
+    );
+    let login_body = br#"{"user":"alice","password":"pw-alice"}"#;
+    let request = http_common::build_request(
+        "/v1/session",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", &login_body.len().to_string()),
+        ],
+        login_body,
+    );
+    let resp = http_common::parse_single_response(&http_common::send_raw(
+        http_addr,
+        &request,
+        AfterWrite::HalfClose,
+    ));
+    assert_eq!(resp.status, 200, "login must succeed: {resp:?}");
+    let text = String::from_utf8_lossy(&resp.body).into_owned();
+    let token = match parse_json(&text).expect("login body must be valid json") {
+        JsonValue::Object(mut obj) => match obj.remove("token") {
+            Some(JsonValue::String(s)) => s,
+            other => panic!("expected string token field, got {other:?}"),
+        },
+        other => panic!("expected json object body, got {other:?}"),
+    };
+
+    let sql_addr = common::spawn_server_with_engine(&users_path, core);
+    let sql_stream = common::authenticate_to_ready_for_query(sql_addr, "alice", "pw-alice");
+
+    (Both { http_addr, token }, sql_stream)
+}
+
+fn query(both: &Both, body: &[u8]) -> HttpResponse {
+    let request = http_common::build_request(
+        "/v1/query",
+        &[
+            ("Authorization", &format!("Bearer {}", both.token)),
+            ("Content-Type", "application/json"),
+            ("Content-Length", &body.len().to_string()),
+        ],
+        body,
+    );
+    http_common::parse_single_response(&http_common::send_raw(
+        both.http_addr,
+        &request,
+        AfterWrite::HalfClose,
+    ))
+}
+
+fn json_body(resp: &HttpResponse) -> JsonValue {
+    let text = String::from_utf8_lossy(&resp.body).into_owned();
+    parse_json(&text).expect("response body must be valid json")
+}
+
+#[test]
+fn nosql_insert_native_json_round_trips_through_scan() {
+    let (core, _guard) = new_core();
+    let (both, _sql) = spawn_both(core);
+
+    let insert_body = br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2,0.3],"doc":{"a":1,"b":[1,2,3]}}],"operation_id":"op-nosql-insert-1"}"#;
+    let resp = query(&both, insert_body);
+    assert_eq!(resp.status, 200, "insert must succeed: {resp:?}");
+
+    let scan_body = br#"{"op":"scan","table":"docs","columns":["doc"],"limit":100}"#;
+    let resp = query(&both, scan_body);
+    assert_eq!(resp.status, 200, "scan must succeed: {resp:?}");
+    let JsonValue::Object(obj) = json_body(&resp) else {
+        panic!("expected object body");
+    };
+    let JsonValue::Array(rows) = obj.get("rows").expect("rows field").clone() else {
+        panic!("expected rows array");
+    };
+    assert_eq!(rows.len(), 1);
+    let JsonValue::Array(row0) = &rows[0] else {
+        panic!("expected row array");
+    };
+    // native JSON 値として返る（base64 化されない）。
+    match &row0[0] {
+        JsonValue::Object(m) => {
+            assert_eq!(
+                m.get("a"),
+                Some(&JsonValue::Number(engine::json::JsonNumber::PosInt(1)))
+            );
+        }
+        other => panic!("expected JSON object, got {other:?}"),
+    }
+}
+
+#[test]
+fn nosql_update_set_jsonb_matches_sql_read_back() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core);
+
+    let insert_body = br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2,0.3]}],"operation_id":"op-seed"}"#;
+    let resp = query(&both, insert_body);
+    assert_eq!(resp.status, 200, "seed insert must succeed: {resp:?}");
+
+    let update_body = br#"{"op":"update","table":"docs","where":{"id":1},"set":{"docb":{"b":2,"a":1}},"operation_id":"op-nosql-update-1"}"#;
+    let resp = query(&both, update_body);
+    assert_eq!(resp.status, 200, "update must succeed: {resp:?}");
+
+    common::send_simple_query(&mut sql, "SELECT docb FROM docs WHERE id = 1 LIMIT 1");
+    common::read_row_description(&mut sql);
+    let row = common::read_data_row(&mut sql);
+    // JSONB は正規化されるため、NoSQL のキー順（b,a）に関わらず辞書順で
+    // SQL 表層から読み出せる。
+    assert_eq!(row, vec![Some(r#"{"a":1,"b":2}"#.to_string())]);
+    common::read_command_complete(&mut sql);
+    common::read_ready_for_query(&mut sql);
+}
+
+#[test]
+fn nosql_insert_rejects_scalar_json_and_malformed_object_with_42601() {
+    let (core, _guard) = new_core();
+    let (both, _sql) = spawn_both(core);
+
+    for (label, doc_json) in [
+        ("number", "123"),
+        ("string", "\"hello\""),
+        ("boolean", "true"),
+    ] {
+        let body = format!(
+            r#"{{"op":"insert","table":"docs","rows":[{{"id":1,"embedding":[0.1,0.2,0.3],"doc":{doc_json}}}],"operation_id":"op-reject-{label}"}}"#
+        );
+        let resp = query(&both, body.as_bytes());
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "42601",
+            "case: {label}, resp: {resp:?}"
+        );
+    }
+}
+
+// --- SQL⇄NoSQL 表層横断の operation_id パリティ（JSONB 正規化・JSON 非対称） ---
+
+#[test]
+fn json_operation_id_resend_via_nosql_after_sql_seed_is_content_mismatch_when_whitespace_differs() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core);
+
+    // SQL 経由で非正規の空白を含む JSON テキストを書き込む。
+    common::send_simple_query(
+        &mut sql,
+        r#"INSERT INTO docs (id, embedding, doc) VALUES (1, '[0.1,0.2,0.3]', '{"a":1}') USING OPERATION_ID 'op-cross'"#,
+    );
+    assert_eq!(common::read_command_complete(&mut sql), "INSERT 0 1");
+    common::read_ready_for_query(&mut sql);
+
+    // NoSQL 経由で同一 operation_id を再送する。NoSQL 側は常に正規化テキスト
+    // （空白なし）を格納するため、SQL 側が書いた同じ意味内容でも
+    // テキスト表現としては一致し内容一致（`23505`）になる（JSON 列は SQL 表層が
+    // 書いた入力テキストがすでに正規形〔空白なし〕だったケース）。
+    let insert_body = br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2,0.3],"doc":{"a":1}}],"operation_id":"op-cross"}"#;
+    let resp = query(&both, insert_body);
+    assert_eq!(http_common::wire_code_of(&resp), "23505", "resp: {resp:?}");
+}

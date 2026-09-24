@@ -3664,6 +3664,8 @@ impl EngineCore {
                     // BYTEA は TEXT と同じく本体長のみを数える（フレーミングの
                     // オーバーヘッドは他の値種別も同様に含めていないため対称、Issue #886）。
                     crate::row_codec::Value::Bytes(b) => b.len(),
+                    // JSON／JSONB も TEXT と同じく本体長のみを数える（Issue #889）。
+                    crate::row_codec::Value::Json(s) => s.len(),
                 };
                 row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
                     crate::sql::allowlist::SqlSurfaceError::payload_too_large(

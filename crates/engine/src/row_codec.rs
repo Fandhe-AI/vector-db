@@ -64,6 +64,14 @@ const _: () = assert!(
     "row_codec::MAX_SCALAR_PAYLOAD_LEN must stay in sync with storage::MAX_METADATA_LEN"
 );
 
+// `JSON`／`JSONB` 列（Issue #889）は TEXT と同じ presence + `u32 LE` 長 + 本体の
+// 枠を共有するため、`json::MAX_JSON_FIELD_LEN` と `MAX_TEXT_FIELD_LEN` の値を
+// 一致させる（片方だけの変更を防ぐ）。
+const _: () = assert!(
+    crate::json::MAX_JSON_FIELD_LEN == MAX_TEXT_FIELD_LEN as usize,
+    "json::MAX_JSON_FIELD_LEN must stay in sync with row_codec::MAX_TEXT_FIELD_LEN"
+);
+
 /// `TEXT` 列 1 個分のフレーミングオーバーヘッド（presence タグ 1 バイト＋長さ
 /// プレフィックス 4 バイト）。[`encode_scalar_columns`] の実エンコードと
 /// [`tenant::update_row_columns_unchecked`]（UPDATE の SET 値の対象行探索より
@@ -123,6 +131,12 @@ pub enum Value {
     /// [`Value::Text`] と異なり、行バイト表現（presence + `u32` LE 長 + 本体）は
     /// 共有する。
     Bytes(Vec<u8>),
+    /// `JSON`／`JSONB` 列共通の値表現（TABLE-14・TASK-198、Issue #889）。行バイト
+    /// 表現は [`Value::Text`] と同じ枠（presence + `u32` LE 長 + UTF-8 本体）を
+    /// 共有する。`JSON` 列は検証済みの入力テキストをそのまま、`JSONB` 列は
+    /// 正規化再シリアライズ済みのテキストを保持する契約とし、区別は
+    /// `ColumnType::Json`／`ColumnType::Jsonb` にのみ持たせる（値表現は共有）。
+    Json(String),
 }
 
 /// スカラー列走査（[`scan_scalar_columns`] 系）の借用結果。TEXT・BOOLEAN の
@@ -137,24 +151,31 @@ pub enum ScalarRef<'a> {
     ///
     /// [`as_text`]: ScalarRef::as_text
     Bytes(&'a [u8]),
+    /// `JSON`／`JSONB` 列の借用結果（Issue #889）。TEXT 前提の消費側
+    /// （[`as_text`]。等価/前方一致フィルタ・二次索引・hybrid 本文・GROUP BY
+    /// キー等）へは流入させない（fail-closed。TABLE-14 は WHERE 等価・GROUP BY
+    /// キーを JSON 列の対象外とする）。
+    ///
+    /// [`as_text`]: ScalarRef::as_text
+    Json(&'a str),
 }
 
 impl<'a> ScalarRef<'a> {
     /// TEXT 前提の既存消費側（等価/前方一致フィルタ・二次索引・hybrid 本文・
-    /// GROUP BY キー等）が `Bool`／`Bytes` を取り違えて TEXT として扱わないよう、
-    /// `Text` 以外は `None` を返す（fail-closed。呼び出し元はスキーマ型で
-    /// 事前に対象外の列を除外するか、`None` を型不一致として拒否する）。
+    /// GROUP BY キー等）が `Bool`／`Bytes`／`Json` を取り違えて TEXT として
+    /// 扱わないよう、`Text` 以外は `None` を返す（fail-closed。呼び出し元は
+    /// スキーマ型で事前に対象外の列を除外するか、`None` を型不一致として拒否する）。
     pub fn as_text(&self) -> Option<&'a str> {
         match self {
             ScalarRef::Text(s) => Some(s),
-            ScalarRef::Bool(_) | ScalarRef::Bytes(_) => None,
+            ScalarRef::Bool(_) | ScalarRef::Bytes(_) | ScalarRef::Json(_) => None,
         }
     }
 
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             ScalarRef::Bool(b) => Some(*b),
-            ScalarRef::Text(_) | ScalarRef::Bytes(_) => None,
+            ScalarRef::Text(_) | ScalarRef::Bytes(_) | ScalarRef::Json(_) => None,
         }
     }
 }
@@ -267,7 +288,11 @@ pub fn encode_row(
             Value::Vector(vector) => {
                 let expected_dim = match column.ty {
                     ColumnType::Vector(dim) => dim,
-                    ColumnType::Text | ColumnType::Boolean | ColumnType::Bytea => {
+                    ColumnType::Text
+                    | ColumnType::Boolean
+                    | ColumnType::Bytea
+                    | ColumnType::Json
+                    | ColumnType::Jsonb => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Vector value, got Vector",
                             column.name
@@ -324,10 +349,43 @@ pub fn encode_row(
                 buf.extend_from_slice(&byte_len.to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
+            Value::Json(text) => {
+                encode_json_value(&mut buf, column, text)?;
+            }
         }
     }
 
     Ok(buf)
+}
+
+/// `JSON`／`JSONB` 列 1 個分を `buf` へ書き込む（[`encode_row`]・
+/// [`encode_scalar_columns`]・[`merge_encode_scalar_columns`] が共有する唯一の
+/// エンコード実装）。Issue #889 D2「格納時検証の単一チョークポイント」に従い、
+/// `JSON` 列は [`crate::json::validate_json_column_text`] で構文検証のみ行い
+/// 入力テキストをそのまま格納し、`JSONB` 列は [`crate::json::canonicalize_jsonb_text`]
+/// で得た正規化形と入力テキストが一致することを検証する（束縛層は常に正規化済みの
+/// テキストを渡す契約であり、不一致は API 誤用として拒否する）。これにより
+/// Rust API（`tenant::insert_typed_row` 等）経由でも未検証・未正規化の JSON が
+/// 格納されない（TEXT と同じ presence + `u32` LE 長 + UTF-8 本体の枠を共有する）。
+fn encode_json_value(
+    buf: &mut Vec<u8>,
+    column: &crate::catalog::ColumnDef,
+    text: &str,
+) -> Result<()> {
+    validate_json_column_value(column, text)?;
+    let text_bytes = text.as_bytes();
+    let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
+        RowCodecError::Invalid(format!("json field too long: {} bytes", text_bytes.len()))
+    })?;
+    if text_len > MAX_TEXT_FIELD_LEN {
+        return Err(RowCodecError::Invalid(format!(
+            "json field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+        )));
+    }
+    buf.push(PRESENCE_VALUE);
+    buf.extend_from_slice(&text_len.to_le_bytes());
+    buf.extend_from_slice(text_bytes);
+    Ok(())
 }
 
 /// [`encode_row`] の逆変換。欠落・不正値・切り詰め・未知タグをすべて `Err` で拒否する
@@ -560,6 +618,52 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     offset = bytea_end;
                     values.push(Value::Bytes(bytea_bytes.to_vec()));
                 }
+                ColumnType::Json | ColumnType::Jsonb => {
+                    // presence + `u32` LE 長 + UTF-8 本体は `Text` と同一の枠を
+                    // 共有する（Issue #889 D2）。書き込み経路（`encode_row` 系）が
+                    // 検証・正規化済みの契約であるため、decode 側は TEXT と同じく
+                    // 長さ上限・UTF-8 妥当性のみを検証し再パースしない。
+                    let len_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before json length field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at json length field".to_string(),
+                            )
+                        })?;
+                    let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("json length field is not 4 bytes".to_string())
+                    })?;
+                    let text_len = u32::from_le_bytes(len_arr);
+                    if text_len > MAX_TEXT_FIELD_LEN {
+                        return Err(RowCodecError::Invalid(format!(
+                            "json field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after json length field".to_string(),
+                        )
+                    })?;
+                    let text_end = offset.checked_add(text_len as usize).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after json field".to_string())
+                    })?;
+                    let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
+                        RowCodecError::Invalid("row buffer truncated at json field".to_string())
+                    })?;
+                    let text = std::str::from_utf8(text_bytes)
+                        .map_err(|_| {
+                            RowCodecError::Invalid("json field is not valid UTF-8".to_string())
+                        })?
+                        .to_string();
+                    offset = text_end;
+                    values.push(Value::Json(text));
+                }
             },
             other => {
                 return Err(RowCodecError::Invalid(format!(
@@ -718,10 +822,63 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.extend_from_slice(&byte_len.to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
+            Value::Json(text) => {
+                validate_json_column_value(column, text)?;
+                let text_bytes = text.as_bytes();
+                let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid(format!(
+                        "json field too long: {} bytes",
+                        text_bytes.len()
+                    ))
+                })?;
+                if text_len > MAX_TEXT_FIELD_LEN {
+                    return Err(RowCodecError::Invalid(format!(
+                        "json field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+                    )));
+                }
+                // フレーミング（presence(1) + 長さ(4)）は TEXT と同一のため
+                // `scalar_text_entry_len` を共有する。
+                let entry_len = scalar_text_entry_len(text_len)?;
+                reserve(&mut buf, entry_len)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&text_len.to_le_bytes());
+                buf.extend_from_slice(text_bytes);
+            }
         }
     }
 
     Ok(buf)
+}
+
+/// `JSON`／`JSONB` 列の値検証（列型に応じた [`crate::json::validate_json_column_text`]／
+/// [`crate::json::canonicalize_jsonb_text`] の呼び分け）を [`encode_json_value`]・
+/// [`encode_scalar_columns`]・[`merge_encode_scalar_columns`] の 3 箇所で共有する。
+fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) -> Result<()> {
+    match column.ty {
+        ColumnType::Json => {
+            crate::json::validate_json_column_text(text).map_err(|_| {
+                RowCodecError::Invalid(format!("column {:?} expects valid JSON text", column.name))
+            })?;
+        }
+        ColumnType::Jsonb => {
+            let canonical = crate::json::canonicalize_jsonb_text(text).map_err(|_| {
+                RowCodecError::Invalid(format!("column {:?} expects valid JSON text", column.name))
+            })?;
+            if canonical != text {
+                return Err(RowCodecError::Invalid(format!(
+                    "column {:?} expects pre-canonicalized JSONB text",
+                    column.name
+                )));
+            }
+        }
+        ColumnType::Text | ColumnType::Vector(_) | ColumnType::Boolean | ColumnType::Bytea => {
+            return Err(RowCodecError::Invalid(format!(
+                "column {:?} expects a non-JSON value, got JSON",
+                column.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// UPDATE の列指定マージ（`crate::tenant::update_row_columns_unchecked`）専用の
@@ -821,6 +978,17 @@ pub(crate) fn merge_encode_scalar_columns(
         Ok(())
     };
 
+    // JSON／JSONB 用の長さプレフィックス書き込み。フレーミングは `write_text` と
+    // 完全に同一で、列型に応じた検証（`validate_json_column_value`）のみ異なる。
+    let write_json = |buf: &mut Vec<u8>,
+                      reserve: &mut dyn FnMut(&mut Vec<u8>, u32) -> Result<()>,
+                      column: &crate::catalog::ColumnDef,
+                      text: &str|
+     -> Result<()> {
+        validate_json_column_value(column, text)?;
+        write_text(buf, reserve, text.as_bytes())
+    };
+
     for (idx, column) in schema.columns.iter().enumerate() {
         if matches!(column.ty, ColumnType::Vector(_)) {
             // VECTOR 列は encode_scalar_columns と同じくスキップ（embedding は
@@ -876,6 +1044,9 @@ pub(crate) fn merge_encode_scalar_columns(
                     }
                     write_bytes(&mut buf, &mut reserve, bytes)?;
                 }
+                Value::Json(text) => {
+                    write_json(&mut buf, &mut reserve, column, text)?;
+                }
             }
         } else {
             // SET 対象でない列は既存の借用値（またはNULL）をそのまま書き込む。
@@ -904,6 +1075,15 @@ pub(crate) fn merge_encode_scalar_columns(
                 }
                 Some(ScalarRef::Bytes(bytes)) => {
                     write_bytes(&mut buf, &mut reserve, bytes)?;
+                }
+                Some(ScalarRef::Json(text)) => {
+                    // 既存値は encode 済みで格納契約（構文検証・JSONB は正規化）を
+                    // 満たしている前提のため、TEXT／BYTEA の既存値と同じく
+                    // 再パース・再検証はしない（decode 契約「書き込み経路の保証に
+                    // 依拠」に揃える。Issue #889 D2。`write_canonical` の出力形式
+                    // が将来変わっても、SET 対象でない既存 JSONB 行が
+                    // `XX000` で更新不能になるフォワード互換の結合を避ける）。
+                    write_text(&mut buf, &mut reserve, text.as_bytes())?;
                 }
             }
         }
@@ -1156,6 +1336,53 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
+                ColumnType::Json | ColumnType::Jsonb => {
+                    // フレーミング・UTF-8 検証は TEXT と共有する（Issue #889 D2）。
+                    // 格納時（encode 経路）に構文検証・正規化済みのため、ここでは
+                    // 再パースしない（TEXT と同じ契約）。
+                    let len_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before json length field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at json length field".to_string(),
+                            )
+                        })?;
+                    let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("json length field is not 4 bytes".to_string())
+                    })?;
+                    let text_len = u32::from_le_bytes(len_arr);
+                    if text_len > MAX_TEXT_FIELD_LEN {
+                        return Err(RowCodecError::Invalid(format!(
+                            "json field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after json length field".to_string(),
+                        )
+                    })?;
+                    let text_end = offset.checked_add(text_len as usize).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after json field".to_string())
+                    })?;
+                    let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
+                        RowCodecError::Invalid("scalar payload truncated at json field".to_string())
+                    })?;
+                    offset = text_end;
+                    let text = std::str::from_utf8(text_bytes).map_err(|_| {
+                        RowCodecError::Invalid("json field is not valid UTF-8".to_string())
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Json(text)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
             },
             other => {
                 return Err(RowCodecError::Invalid(format!(
@@ -1210,6 +1437,14 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
                 })?;
                 owned.extend_from_slice(bytes);
                 values.push(Value::Bytes(owned));
+            }
+            Some(ScalarRef::Json(text)) => {
+                let mut owned = String::new();
+                owned.try_reserve_exact(text.len()).map_err(|_| {
+                    RowCodecError::Invalid("failed to reserve json field".to_string())
+                })?;
+                owned.push_str(text);
+                values.push(Value::Json(owned));
             }
         }
     }

@@ -174,6 +174,29 @@ fn computed_column_binary_request_is_rejected_as_feature_not_supported() {
 }
 
 #[test]
+fn json_column_binary_request_is_rejected_as_feature_not_supported() {
+    // `JSON`／`JSONB` 列（TABLE-14・Issue #889）は BYTEA と同じ理由（値の実体が
+    // `Cell::Json` の格納テキストで `Text` の単純な UTF-8 生バイト表現とは
+    // 意味論が異なる）で fail-closed に非対応とする。
+    for ty in [ColumnType::Json, ColumnType::Jsonb] {
+        let columns = vec![ColumnMeta::Scalar {
+            name: "doc".to_string(),
+            ty,
+        }];
+        let formats = ResultFormats::new(&[1])
+            .resolve(columns.len())
+            .expect("resolve");
+        let err = validate_binary_formats(&columns, &formats).unwrap_err();
+        assert_eq!(
+            err,
+            BinaryFormatError::UnsupportedType { column_index: 0 },
+            "ty={ty:?}"
+        );
+        assert_eq!(err.error_class().wire_code(), "0A000", "ty={ty:?}");
+    }
+}
+
+#[test]
 fn format_count_mismatch_is_protocol_violation() {
     let err = ResultFormats::new(&[0, 1]).resolve(3).unwrap_err();
     assert_eq!(err, BinaryFormatError::FormatCountMismatch);
