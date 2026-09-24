@@ -268,8 +268,10 @@ use crate::sql::mode::{self, SearchMode};
 /// `wire_code` へ写像する（`Malformed` → `22000`・`OutOfRange` →
 /// `22003`）。`InsertLiteral::Bool` は型不一致として `22000` で拒否する。
 /// INSERT（`bind_insert_row`）・UPDATE（`bind_set_assignments`）・UPSERT
-/// （`bind_upsert_assignments`）の 3 箇所が共有する（第 2 のパーサーを作らない）。
-fn bind_numeric_literal(
+/// （`bind_upsert_assignments`）・COPY（`sql::copy::bind_copy_record`。Issue
+/// #939 のマージで追加された `Numeric` 列への対応漏れの修正）の各箇所が
+/// 共有する（第 2 のパーサーを作らない）。
+pub(crate) fn bind_numeric_literal(
     literal: &InsertLiteral,
     name: &str,
     precision: u8,
@@ -1613,8 +1615,10 @@ pub(crate) fn bind_enum_literal(
 /// 反する入力は書き込みトランザクション開始前に `22P02`
 /// （[`SqlSurfaceError::invalid_text_representation`]）で拒否する（U3・U7）。
 /// エラーメッセージには列名とクライアント自身の入力値のみを含める
-/// （security.md P0「情報漏えい」対応）。
-fn bind_uuid_literal(
+/// （security.md P0「情報漏えい」対応）。COPY（`sql::copy::bind_copy_record`。
+/// Issue #939 のマージで追加された `Uuid` 列への対応漏れの修正）も本関数を
+/// 共有する。
+pub(crate) fn bind_uuid_literal(
     s: &str,
     column_name: &str,
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {

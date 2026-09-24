@@ -84,6 +84,20 @@ fn extended_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> Ta
             // COPY 経由の束縛を固定する）。
             ColumnDef::new("doc", ColumnType::Json, true),
             ColumnDef::new("docb", ColumnType::Jsonb, true),
+            // `NUMERIC`／`UUID` 列（PR #1018 レビュー指摘対応時に発覚: origin/main
+            // で追加された NUMERIC（Issue #885）・UUID（Issue #887）へ
+            // `bind_copy_record`・`bound_insert_byte_len` の網羅 match が追随
+            // しておらず `E0004`（non-exhaustive patterns）でビルド不能だった。
+            // 本テーブルで COPY 経由の束縛を固定する）。
+            ColumnDef::new(
+                "price",
+                ColumnType::Numeric {
+                    precision: 10,
+                    scale: 2,
+                },
+                true,
+            ),
+            ColumnDef::new("uid", ColumnType::Uuid, true),
         ],
     )
 }
@@ -577,6 +591,63 @@ fn copy_from_stdin_text_format_binds_json_and_jsonb_columns() {
             Cell::Json("{\"a\":2,\"b\":1}".to_string()),
         ]
     );
+}
+
+/// `NUMERIC`／`UUID` 列を COPY FROM STDIN で束縛できることを固定する
+/// （PR #1018 レビュー指摘対応時に発覚した origin/main マージ由来の
+/// `bind_copy_record`／`bound_insert_byte_len` 網羅漏れの回帰テスト。
+/// TABLE-13〔検討中〕・TASK-197・Issue #885・#887）。
+#[test]
+fn copy_from_stdin_text_format_binds_numeric_and_uuid_columns() {
+    let (core, path) = open_engine_ext("copy-from-ext-numeric-uuid");
+    let _guard = CleanupGuard(path);
+
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, price, uid) FROM STDIN USING OPERATION_ID 'ext-op-numeric-uuid-1'"
+    );
+    let outcome = run_copy_from(
+        &core,
+        "acme",
+        &sql,
+        &[b"1\t[1.0,0.0]\t123.45\t550e8400-e29b-41d4-a716-446655440000\n"],
+    )
+    .expect("COPY FROM STDIN succeeds");
+    assert_eq!(outcome.rows_affected, 1);
+
+    let cells = select_ext_cells(&core, "acme", 1, "price, uid");
+    let Cell::Numeric(decimal) = &cells[0] else {
+        panic!("expected Cell::Numeric, got {:?}", cells[0]);
+    };
+    assert_eq!(decimal.to_string(), "123.45");
+    assert_eq!(
+        cells[1],
+        Cell::Uuid(
+            engine::uuid::parse_uuid_text("550e8400-e29b-41d4-a716-446655440000")
+                .expect("valid uuid")
+        )
+    );
+}
+
+/// `NUMERIC`（桁あふれ）・`UUID`（不正文法）列の COPY 束縛エラーが、
+/// INSERT／UPDATE と同じ `wire_code` 分類で拒否されることを固定する。
+#[test]
+fn copy_from_stdin_rejects_numeric_overflow_and_malformed_uuid() {
+    let (core, path) = open_engine_ext("copy-from-ext-bad-numeric-uuid");
+    let _guard = CleanupGuard(path);
+
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, price) FROM STDIN USING OPERATION_ID 'ext-op-numeric-2'"
+    );
+    let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\t99999999999.99\n"])
+        .expect_err("NUMERIC(10,2) integer-part overflow must be rejected");
+    assert_eq!(err.wire_code(), "22003");
+
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, uid) FROM STDIN USING OPERATION_ID 'ext-op-uuid-2'"
+    );
+    let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tnot-a-uuid\n"])
+        .expect_err("malformed UUID literal must be rejected");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 #[test]
