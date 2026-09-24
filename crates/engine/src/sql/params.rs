@@ -238,17 +238,29 @@ pub fn substitute_values(
 /// （[`crate::sql::lexer::MAX_INPUT_LEN`]）を行い、`Token::StringLiteral` へ
 /// 格納できる文字列へ変換する。`tokens` は `$n` の出現回数を数えるために使う
 /// （同一 `$n` を大量に参照させて 1 回の値から巨大な置換結果を作らせる
-/// メモリ増幅を、値の複製（[`substitute_values`]）より前に防ぐ）。
+/// メモリ増幅を、値の複製（[`String::to_string`]）より前に防ぐ）。
+///
+/// P0（codex-review・Issue #935 PR #1012 指摘）: `values` は
+/// [`validate_param_positions`] が返す `param_count`（文中で参照される
+/// 最大の `$n` 番号）と同数だけ渡ってくる契約のため、文が実際に参照して
+/// いない `$n`（例: `$64` だけを使う文に対する `$1`〜`$63`）に巨大な値が
+/// 含まれ得る。この関数はまず UTF-8／NUL 検証を借用 `&str` のまま行い
+/// （複製しない）、置換後総バイト数（参照回数込み）を checked 演算で
+/// 確定させたうえで、実際に参照されている位置の値だけを複製する。未参照の
+/// 値は（検証は受けるが）一切複製されないため、その内容量はメモリ増幅
+/// 攻撃の入力にならない。
 ///
 /// - `NULL`（`values` の要素が `None`）は本バージョンのスコープ外として
-///   [`SqlSurfaceError::invalid_input`]（`22000`）で拒否する。
+///   [`SqlSurfaceError::invalid_input`]（`22000`）で拒否する（未参照の
+///   位置も含め、渡された全値に対して検証する）。
 /// - 非 UTF-8・NUL 文字混入も同じ `22000`。
 /// - 置換後総バイト数超過は [`SqlSurfaceError::payload_too_large`]（`54000`）。
 pub fn decode_bind_values(
     tokens: &[Token],
     values: &[Option<Vec<u8>>],
 ) -> Result<Vec<String>, SqlSurfaceError> {
-    let mut decoded = Vec::with_capacity(values.len());
+    // 借用のまま UTF-8 検証・NUL 拒否を行う（値の複製より前）。
+    let mut borrowed: Vec<&str> = Vec::with_capacity(values.len());
     for raw in values {
         let bytes = raw.as_ref().ok_or_else(|| {
             SqlSurfaceError::invalid_input("NULL parameter values are not supported".to_string())
@@ -260,17 +272,19 @@ pub fn decode_bind_values(
                 "parameter value must not contain a NUL byte",
             ));
         }
-        decoded.push(text.to_string());
+        borrowed.push(text);
     }
 
-    // 総置換バイト数（$n の出現回数 × 対応する値の長さ、の総和）を値の複製
-    // （`substitute_values`）より前に checked 演算で確定させる。
+    // 総置換バイト数（$n の出現回数 × 対応する値の長さ、の総和）を、値の
+    // 複製より前に借用済みスライスの長さだけを見て checked 演算で確定
+    // させる。未参照の $n（`tokens` に一切現れない番号）の値はここでも
+    // 一切参照されないため、集計・複製いずれのコストにも計上されない。
     let mut total: usize = 0;
     for token in tokens {
         let Token::Param(n) = token else { continue };
         let idx = usize::from(*n).checked_sub(1);
         let len = idx
-            .and_then(|i| decoded.get(i))
+            .and_then(|i| borrowed.get(i))
             .map(|s| s.len())
             .unwrap_or(0);
         total = total.checked_add(len).ok_or_else(|| {
@@ -282,6 +296,25 @@ pub fn decode_bind_values(
             "substituted parameter payload ({total} bytes) exceeds the allowed limit ({} bytes)",
             lexer::MAX_INPUT_LEN
         )));
+    }
+
+    // サイズ検証を通過した後、実際に参照されている位置の値だけを複製する。
+    // 未参照の位置は空文字列のまま残す（`substitute_values` は `tokens` の
+    // `Token::Param` からしか添字アクセスしないため参照されず、複製コストも
+    // メモリ上の保持コストも発生しない）。
+    let mut decoded: Vec<String> = vec![String::new(); values.len()];
+    for token in tokens {
+        let Token::Param(n) = token else { continue };
+        let Some(idx) = usize::from(*n).checked_sub(1) else {
+            continue;
+        };
+        if let Some(slot) = decoded.get_mut(idx) {
+            if slot.is_empty() {
+                if let Some(text) = borrowed.get(idx) {
+                    *slot = (*text).to_string();
+                }
+            }
+        }
     }
 
     Ok(decoded)
@@ -533,5 +566,35 @@ mod tests {
         let big_value = "x".repeat(300);
         let err = decode_bind_values(&tokens, &[Some(big_value.into_bytes())]).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn decode_bind_values_ignores_unreferenced_values_in_size_and_content() {
+        // P0（codex-review・Issue #935 PR #1012 指摘）の回帰: 文が `$2` しか
+        // 参照しない場合、`$1` に渡された巨大な値はサイズ集計にも複製にも
+        // 一切影響しない（複製前の借用スライスの長さだけで検証するため）。
+        // 修正前は全 `values` を検証前に無条件で `to_string()` 複製していた
+        // ため、この巨大な未参照値がメモリ増幅攻撃の入力になり得た。
+        let tokens = tokenize_with_params("WHERE lang = $2").expect("tokenize should succeed");
+        let huge_unreferenced = "x".repeat(lexer::MAX_INPUT_LEN * 4);
+        let decoded = decode_bind_values(
+            &tokens,
+            &[Some(huge_unreferenced.into_bytes()), Some(b"ja".to_vec())],
+        )
+        .expect("unreferenced oversized value must not affect size validation");
+
+        // 参照されている `$2` の値は正しく複製される。
+        assert_eq!(decoded[1], "ja");
+        // 参照されていない `$1` の値は複製されない（プレースホルダのまま）。
+        assert_eq!(decoded[0], "");
+    }
+
+    #[test]
+    fn decode_bind_values_still_rejects_null_at_unreferenced_position() {
+        // 未参照の位置であっても NULL・非 UTF-8・NUL 混入の検証は全値に対して
+        // 行う（fail-closed。参照有無で入力検証の強度を変えない）。
+        let tokens = tokenize_with_params("WHERE lang = $2").expect("tokenize should succeed");
+        let err = decode_bind_values(&tokens, &[None, Some(b"ja".to_vec())]).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
     }
 }

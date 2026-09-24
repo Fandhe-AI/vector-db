@@ -490,7 +490,23 @@ pub fn bind_body_text_column(schema: &TableSchema) -> Result<usize, SqlSurfaceEr
 }
 
 /// `ORDER BY` 式（[`OrderByForm`]）を [`Ranking`] へ束縛する。
-fn bind_ranking(order_by: &OrderByForm, schema: &TableSchema) -> Result<Ranking, SqlSurfaceError> {
+///
+/// `validate_literal` が `false` の場合、ベクトルリテラル文字列の実パース
+/// （[`parse_vector_literal`]）を省略し、対象列がテーブルの `VECTOR` 列で
+/// あることの構造検証のみ行う（返る `Ranking` の `query` は空——実行には
+/// 使わない呼び出し元専用）。Describe（Bind 前の結果列導出。
+/// [`bind_projection_for_describe`]）専用の縮退経路であり、通常の実行系
+/// （[`bind_in_session`]）は常に `true` を渡す（対象ビヘイビア: Issue #935・
+/// WIRE-12・TASK-217。PR #1012 Cursor Bugbot 指摘: `parse_sql_prepared` が
+/// `$n` を構造検証専用の固定ダミー値〔`substitute_dummy`〕へ置換するため、
+/// `ORDER BY <vec列> <=> $n` を含む文の Describe はダミー値がベクトルとして
+/// 不正でも結果列だけは導出できる必要がある——結果列は投影列にのみ依存し
+/// ランキングの実値には依存しないため、この省略は安全）。
+fn bind_ranking(
+    order_by: &OrderByForm,
+    schema: &TableSchema,
+    validate_literal: bool,
+) -> Result<Ranking, SqlSurfaceError> {
     let (vec_idx, vec_dim) = vector_column(schema)?;
     match order_by {
         OrderByForm::Distance { column, literal } => {
@@ -506,7 +522,11 @@ fn bind_ranking(order_by: &OrderByForm, schema: &TableSchema) -> Result<Ranking,
                     "column {column:?} is not the table's VECTOR column"
                 )));
             }
-            let query = parse_vector_literal(literal, vec_dim)?;
+            let query = if validate_literal {
+                parse_vector_literal(literal, vec_dim)?
+            } else {
+                Vec::new()
+            };
             Ok(Ranking::Distance { query })
         }
         OrderByForm::FunctionCall { args, .. } => {
@@ -542,7 +562,11 @@ fn bind_ranking(order_by: &OrderByForm, schema: &TableSchema) -> Result<Ranking,
                     "column {vec_col:?} is not the table's VECTOR column"
                 )));
             }
-            let query = parse_vector_literal(vec_literal, vec_dim)?;
+            let query = if validate_literal {
+                parse_vector_literal(vec_literal, vec_dim)?
+            } else {
+                Vec::new()
+            };
             let text_column_index = text_column_index(schema, text_col)?;
             Ok(Ranking::Hybrid {
                 query,
@@ -808,7 +832,7 @@ pub fn bind_in_session(
     let (metadata_filters, expr_filters, rls_predicate_present) =
         bind_where_predicates(&stmt.where_predicates, schema, udfs, &mut node_budget)?;
 
-    let ranking = bind_ranking(&stmt.order_by, schema)?;
+    let ranking = bind_ranking(&stmt.order_by, schema, true)?;
 
     let limit = validate_search_limit(stmt.limit)?;
 
@@ -832,6 +856,42 @@ pub fn bind_in_session(
         mode: resolved_mode,
         evaluation_order: stmt.evaluation_order,
     })
+}
+
+/// Describe（拡張クエリプロトコルの 'D' 種別 S。値未確定でも呼べる契約。
+/// `core.rs::EngineCore::describe_parsed_in_session`）専用: [`bind_in_session`]
+/// と同じ検証（`USING MODE` リテラル・投影列・`WHERE` 式）を行いつつ、
+/// `ORDER BY` のランキング対象は列参照の構造検証のみに留め、ベクトル
+/// リテラル文字列の実パースを省略して結果列（[`ProjectedColumn`]）だけを
+/// 返す。結果列は投影列にのみ依存しランキングの実値には依存しないため、
+/// この省略は Describe が返す列を変えない。
+///
+/// 対象ビヘイビア: Issue #935・WIRE-12・TASK-217。PR #1012 Cursor Bugbot 指摘
+/// 対応: `EngineCore::parse_sql_prepared` は Parse 時点（値未確定）の構造検証
+/// のため全 `$n` を固定ダミー値（`sql::params::substitute_dummy`）へ置換する。
+/// `ORDER BY <vec列> <=> $n` を含む文はこのダミー値がベクトルとして不正な
+/// ため、[`bind_in_session`] をそのまま呼ぶと Describe（Bind 前）が常に
+/// `22000` で失敗していた——通常の実行系（[`bind_in_session`]）はこの省略を
+/// 行わず常に実値を検証するため、実行時の意味論は変えない。
+pub(crate) fn bind_projection_for_describe(
+    stmt: &ValidatedStatement,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
+    if let Some(literal) = &stmt.search_mode {
+        SearchMode::parse_literal(literal)?;
+    }
+
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
+
+    let (_metadata_filters, _expr_filters, _rls_predicate_present) =
+        bind_where_predicates(&stmt.where_predicates, schema, udfs, &mut node_budget)?;
+
+    let _ranking = bind_ranking(&stmt.order_by, schema, false)?;
+    let _limit = validate_search_limit(stmt.limit)?;
+
+    Ok(projection)
 }
 
 /// [`ValidatedDelete`] を意味論的に束縛する（SQL-18・TASK-191 の公開 API）。

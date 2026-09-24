@@ -484,6 +484,37 @@ fn describe_prepared_matches_literal_form_describe() {
     assert_eq!(described, literal_described);
 }
 
+// PR #1012 Cursor Bugbot 指摘の回帰: `ORDER BY <vec列> <=> $n` を含む文の
+// Describe（Bind 前・値未確定）は、`parse_sql_prepared` が構造検証専用の
+// 固定ダミー値へ全 `$n` を置換するため、ダミー値がベクトルとして不正でも
+// 結果列だけは導出できなければならない（`sql::parser::
+// bind_projection_for_describe` がランキングのリテラル実パースを省略する
+// ことで実現）。結果列は投影列にのみ依存するため、実リテラルで Describe
+// した場合と完全に一致する契約を固定する。
+#[test]
+fn describe_prepared_vector_distance_order_by_succeeds_before_bind() {
+    let path = unique_db_path("prepared-describe-vector-distance");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let session = SessionState::default();
+
+    let prepared = core
+        .parse_sql_prepared("SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 5")
+        .expect("parse_sql_prepared should succeed");
+    let described = core
+        .describe_prepared_in_session(&session, &prepared)
+        .expect("describe_prepared_in_session should succeed for vector distance ORDER BY");
+
+    let literal = core
+        .parse_sql("SELECT id FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5")
+        .expect("parse_sql should succeed");
+    let literal_described = core
+        .describe_parsed_in_session(&session, &literal)
+        .expect("describe_parsed_in_session should succeed");
+
+    assert_eq!(described, literal_described);
+}
+
 // --- 副作用ゼロ（Parse／Describe は行・台帳・世代に触れない） -----------------
 
 #[test]

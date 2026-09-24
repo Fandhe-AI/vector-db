@@ -2537,14 +2537,20 @@ impl EngineCore {
                         &schema,
                     )))
                 } else {
-                    let bound = crate::sql::parser::bind_in_session(
+                    // `USING MODE` の解決（クエリ句 > セッション変数）は結果列に
+                    // 影響しないため Describe では不要——ただし `bind_in_session`
+                    // が行うリテラル形式検証はここでは行わない代わりに
+                    // `bind_projection_for_describe` が同じ検証を担う。`ORDER BY`
+                    // のベクトルリテラルだけは構造検証に留め実パースを省略する
+                    // （PR #1012 Cursor Bugbot 指摘対応。詳細は
+                    // `sql::parser::bind_projection_for_describe` 参照）。
+                    let projection = crate::sql::parser::bind_projection_for_describe(
                         validated,
                         &schema,
-                        session.search_mode(),
                         session.udfs(),
                     )?;
                     Ok(Some(crate::sql::describe::projected_columns(
-                        bound.projection(),
+                        &projection,
                         &schema,
                     )))
                 }
