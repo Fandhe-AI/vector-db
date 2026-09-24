@@ -550,7 +550,11 @@ impl ScalarIndex {
                 // 参照——のまま据え置く）。`DATE`／`TIMESTAMP` 列も同じ理由で
                 // 索引対象外（TABLE-13・TASK-197、Issue #884。等価・範囲述語
                 // 自体が未実装〔Issue #891〕のため索引化する対応述語がまだ無い）。
-                // `ARRAY` 列（TABLE-14・Issue #888）・`BYTEA` 列（Issue #886）・
+                // `NUMERIC` 列も同じく索引対象外（本索引が TEXT 列の等価・
+                // 前方一致向け辞書索引のみを対象とする設計であり、WHERE 述語
+                // 自体が束縛時点で NUMERIC 列を拒否済み〔TABLE-13〔検討中〕・
+                // TASK-197、Issue #885〕のため到達しない）。`ARRAY` 列
+                // （TABLE-14・Issue #888）・`BYTEA` 列（Issue #886）・
                 // `JSON`／`JSONB` 列（TABLE-14・Issue #889。拡張は Issue #893 へ
                 // 申し送り）もいずれも等価・前方一致述語を持たないため同じく
                 // 非索引化。
@@ -561,7 +565,8 @@ impl ScalarIndex {
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
-                | ColumnType::Jsonb => per_column.push(None),
+                | ColumnType::Jsonb
+                | ColumnType::Numeric { .. } => per_column.push(None),
             }
         }
 

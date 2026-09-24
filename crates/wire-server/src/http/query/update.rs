@@ -361,6 +361,13 @@ fn map_set_assignments(
                     "SET JSON column value must be a JSON object or array",
                 ))
             }
+            // NUMERIC 列の NoSQL JSON SET 束縛は対象外（TABLE-13〔検討中〕・
+            // TASK-197、Issue #885。別 Issue #896 の担当）。fail-closed に拒否。
+            (ColumnType::Numeric { .. }, _) => {
+                return Err(UpdateError::Set(
+                    "SET NUMERIC column is not supported via the NoSQL surface",
+                ))
+            }
         };
         assignments.push((key.clone(), literal));
     }

@@ -116,7 +116,8 @@ impl DeclarativeFilter {
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
-                    | ColumnType::Jsonb => {
+                    | ColumnType::Jsonb
+                    | ColumnType::Numeric { .. } => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {:?} is not a TEXT column",
                             self.column
