@@ -28,6 +28,12 @@ use crate::sql::using_operation_id::OperationId;
 /// カンマ分割）に入る前にこの長さで拒否する。
 const MAX_VECTOR_LITERAL_BYTES: usize = 64 * 1024;
 
+/// 配列リテラルの生バイト長上限（TABLE-14・TASK-198、Issue #888・D-A5）。
+/// 列 1 個分のペイロード上限（`row_codec::MAX_TEXT_FIELD_LEN` と同値の
+/// 実装既定値）と揃え、走査（`Vec<String>` の確保・要素切り出し）に入る前に
+/// この長さで拒否する。
+const MAX_ARRAY_LITERAL_BYTES: usize = 4 * 1024 * 1024;
+
 /// 投影対象の 1 列。`Id` は疑似列（[`crate::storage::Row::id`] 由来。スキーマの列では
 /// ないため `column_index` を持たない）。`Column` の `index` は `TableSchema::columns`
 /// の列順インデックス（[`crate::row_codec::decode_scalar_columns`] が返す `Vec` の
@@ -316,6 +322,166 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
     Ok(values)
 }
 
+/// `{v1,v2,...}` 形式の配列リテラルを解析する（TABLE-14・TASK-198、Issue #888・
+/// D-A5）。字句解析器（`Token`）は変更せず、`VECTOR` と同じく文字列リテラル
+/// `'{...}'` を束縛時に解釈する専用パーサー。
+///
+/// 検証順序: (1) 生バイト長が [`MAX_ARRAY_LITERAL_BYTES`] を超えないこと（超過は
+/// [`SqlSurfaceError::PayloadTooLarge`]。走査より前に行う）。(2) `{`〜`}` で
+/// 囲まれていること。(3) 1 パスの状態機械で要素を切り出し、要素数が
+/// `array_ty.max_len()` を超えた時点で打ち切る（超過は `PayloadTooLarge`）。
+/// (4) 要素型ごとに変換する（`BOOLEAN` は `t|f|true|false` を大小無視で受理）。
+/// (2)〜(4) の形式違反（入れ子の `{`、閉じていない引用、末尾カンマ、`BOOLEAN` の
+/// 不正語）はすべて [`SqlSurfaceError::InvalidInput`]。NULL 要素（引用なしの
+/// `NULL`。大小無視）は D-A6 により本版では受理せず `InvalidInput`。引用つきの
+/// `"NULL"` は TEXT 要素の文字列 `NULL` として扱う。
+pub fn parse_array_literal(
+    literal: &str,
+    array_ty: crate::catalog::ArrayType,
+) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
+    if literal.len() > MAX_ARRAY_LITERAL_BYTES {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "array literal length {} exceeds limit {MAX_ARRAY_LITERAL_BYTES}",
+            literal.len()
+        )));
+    }
+
+    let trimmed = literal.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .ok_or_else(|| {
+            SqlSurfaceError::invalid_input("array literal must be of the form {v1,v2,...}")
+        })?;
+
+    // `[]` 添字ではなく `Peekable<Chars>` を使う（coding-rust.md「untrusted
+    // 入力の扱い」: 受信データ経路では添字アクセスを禁止）。`Vec<char>` への
+    // 事前 collect（リテラル長の最大 4 倍のスクラッチ確保）も避け、`inner` を
+    // 1 パスで走査する。
+    let mut raw_elements: Vec<String> = Vec::new();
+    if !inner.trim().is_empty() {
+        let mut chars = inner.chars().peekable();
+        loop {
+            // 要素先頭の空白を読み飛ばす。
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            let Some(&first) = chars.peek() else {
+                return Err(SqlSurfaceError::invalid_input(
+                    "array literal has a trailing comma or is empty after a comma",
+                ));
+            };
+            let element = if first == '"' {
+                // 引用要素: バックスラッシュエスケープ（`\"`・`\\`）を解釈し、
+                // 閉じていない引用は拒否する。
+                chars.next();
+                let mut s = String::new();
+                let mut closed = false;
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        let escaped = chars.next().ok_or_else(|| {
+                            SqlSurfaceError::invalid_input(
+                                "array literal has an unterminated escape sequence",
+                            )
+                        })?;
+                        s.push(escaped);
+                    } else if c == '"' {
+                        closed = true;
+                        break;
+                    } else {
+                        s.push(c);
+                    }
+                }
+                if !closed {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "array literal has an unterminated quoted element",
+                    ));
+                }
+                s
+            } else {
+                // 引用なし要素: 次のカンマ（またはリテラル末尾）までを前後の
+                // 空白を除いて要素とする。入れ子の `{`/`}` は非対応。
+                let mut raw = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == ',' {
+                        break;
+                    }
+                    if c == '{' || c == '}' {
+                        return Err(SqlSurfaceError::invalid_input(
+                            "array literal must not contain nested braces",
+                        ));
+                    }
+                    raw.push(c);
+                    chars.next();
+                }
+                let trimmed_raw = raw.trim();
+                if trimmed_raw.eq_ignore_ascii_case("null") {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "array literal does not support NULL elements",
+                    ));
+                }
+                if trimmed_raw.is_empty() {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "array literal has an empty unquoted element (use \"\" for an empty string)",
+                    ));
+                }
+                trimmed_raw.to_string()
+            };
+
+            // 要素数上限は確保（`push`）の**前**に検査する（無制限な `Vec`
+            // 成長を避ける。D-A5）。
+            if raw_elements.len() as u64 >= array_ty.max_len() as u64 {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "array literal element count exceeds limit {}",
+                    array_ty.max_len()
+                )));
+            }
+            raw_elements.push(element);
+
+            // 要素の直後は空白を挟んでカンマか閉じ（走査終端）のいずれか。
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            match chars.peek() {
+                None => break,
+                Some(',') => {
+                    chars.next();
+                }
+                Some(_) => {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "array literal element is not properly delimited by a comma",
+                    ))
+                }
+            }
+        }
+    }
+
+    match array_ty.elem() {
+        crate::catalog::ArrayElemType::Text => Ok(crate::row_codec::ArrayValue::Text(raw_elements)),
+        crate::catalog::ArrayElemType::Bool => {
+            let mut items: Vec<bool> = Vec::new();
+            items
+                .try_reserve_exact(raw_elements.len())
+                .map_err(|_| SqlSurfaceError::Internal {
+                    detail: "failed to reserve array literal elements".to_string(),
+                })?;
+            for raw in &raw_elements {
+                let b = if raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("t") {
+                    true
+                } else if raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("f") {
+                    false
+                } else {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "array literal boolean element is not true/false: {raw:?}"
+                    )));
+                };
+                items.push(b);
+            }
+            Ok(crate::row_codec::ArrayValue::Bool(items))
+        }
+    }
+}
+
 /// スキーマの唯一の `VECTOR` 列（インデックス・宣言次元）を返す。`VECTOR` 列を
 /// 持たないテーブルは束縛不能（`catalog.rs::validate_schema` が「`VECTOR` 列は
 /// 高々 1 つ」を DDL 時点で強制済みのため、複数該当は構造上起こらない）。
@@ -326,9 +492,15 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .columns
         .iter()
         .enumerate()
-        .find_map(|(idx, c)| match c.ty {
-            ColumnType::Vector(dim) => Some((idx, dim)),
-            ColumnType::Text => None,
+        .find_map(|(idx, c)| match &c.ty {
+            ColumnType::Vector(dim) => Some((idx, *dim)),
+            ColumnType::Text
+            | ColumnType::Boolean
+            | ColumnType::Array(_)
+            | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Enum(_) => None,
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
@@ -362,9 +534,15 @@ pub(crate) fn text_column_index(
                 .columns
                 .get(idx)
                 .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-            match column.ty {
+            match &column.ty {
                 ColumnType::Text => Ok(idx),
-                ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
+                ColumnType::Vector(_)
+                | ColumnType::Boolean
+                | ColumnType::Array(_)
+                | ColumnType::Bytea
+                | ColumnType::Json
+                | ColumnType::Jsonb
+                | ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} is not a TEXT column"
                 ))),
             }
@@ -699,6 +877,12 @@ pub(crate) fn bind_where_predicates(
                 // （`is_allowed_where_predicate_name`）。名前の再検証はしない
                 // （許可リスト層の責務。ここでは可観測性のためのフラグのみ立てる）。
                 rls_predicate_present = true;
+            }
+            WherePredicate::BoolEquality { column, value } => {
+                declarative_filters.push(DeclarativeFilter::bool_equals(column.clone(), *value));
+            }
+            WherePredicate::BoolColumn { column } => {
+                declarative_filters.push(DeclarativeFilter::bool_equals(column.clone(), true));
             }
             WherePredicate::Expression(expr) => {
                 let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
@@ -1070,7 +1254,7 @@ fn bind_insert_row(
         InsertLiteral::Number(n) => n
             .parse()
             .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed id value: {n}")))?,
-        InsertLiteral::String(_) => {
+        InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Null => {
             return Err(SqlSurfaceError::invalid_input(
                 "id pseudo-column value must be a number",
             ))
@@ -1098,21 +1282,70 @@ fn bind_insert_row(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-        let value = match (column.ty, literal) {
+        let value = match (&column.ty, literal) {
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+                crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
             }
-            (ColumnType::Vector(_), InsertLiteral::Number(_)) => {
+            (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a vector literal, got a number"
+                    "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
-            (ColumnType::Text, InsertLiteral::Number(_)) => {
+            (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a text literal, got a number"
+                    "column {name:?} expects a text literal, got a non-text literal"
+                )))
+            }
+            (ColumnType::Boolean, InsertLiteral::Bool(b)) => crate::row_codec::Value::Bool(*b),
+            (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a boolean literal (true/false)"
+                )))
+            }
+            (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
+                crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
+            }
+            (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects an array literal, got a non-array literal"
+                )))
+            }
+            (ColumnType::Bytea, InsertLiteral::String(s)) => bind_bytea_literal(s, name)?,
+            (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a bytea hex literal"
+                )))
+            }
+            (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                bind_json_literal(s, &column.ty, name)?
+            }
+            (
+                ColumnType::Json | ColumnType::Jsonb,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a JSON text literal"
+                )))
+            }
+            (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
+            (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a text literal for its enum type"
+                )))
+            }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘）は SQL テキストの
+            // `INSERT ... VALUES` 構文からは構築されない到達不能パス
+            // （`sql::allowlist` の VALUES リテラルパーサーは `NULL` トークンを
+            // 生成しない）。この分岐は match の網羅性のためだけに存在し、
+            // 到達した場合も fail-closed に拒否する（列を省略すれば
+            // nullable 列は `Value::Null` で埋まる既存契約と役割が重複するため、
+            // `INSERT` に明示 `NULL` リテラルを追加で受理する必要はない）。
+            (_, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} does not accept an explicit NULL literal in INSERT"
                 )))
             }
         };
@@ -1140,6 +1373,99 @@ fn bind_insert_row(
         values: bound_values,
         operation_id: operation_id.clone(),
     })
+}
+
+/// `BYTEA` 列向けの文字列リテラル（`'\xDEADBEEF'` 形。B4）を
+/// [`crate::row_codec::Value::Bytes`] へ束縛する共通ヘルパー。INSERT・UPDATE・
+/// UPSERT の 4 束縛箇所が同じ検証・エラー分類を共有する。
+///
+/// - 形式不正（接頭辞なし・奇数桁・非 16 進）は `22000`（[`SqlSurfaceError::invalid_input`]）。
+/// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
+fn bind_bytea_literal(
+    s: &str,
+    column_name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    match crate::bytea::parse_hex_text(s) {
+        Ok(bytes) => Ok(crate::row_codec::Value::Bytes(bytes)),
+        Err(crate::bytea::ByteaTextError::TooLong) => Err(SqlSurfaceError::payload_too_large(
+            format!("column {column_name:?} bytea literal exceeds length limit"),
+        )),
+        Err(_) => Err(SqlSurfaceError::invalid_input(format!(
+            "column {column_name:?} expects a valid bytea hex literal (\\x...)"
+        ))),
+    }
+}
+
+/// `JSON`／`JSONB` 列向けの文字列リテラルを [`crate::row_codec::Value::Json`] へ
+/// 束縛する共通ヘルパー（Issue #889 D6。`bind_bytea_literal` と同型）。INSERT・
+/// UPDATE・UPSERT リテラル・UPSERT `ON CONFLICT` リテラルの 4 束縛箇所が共有する。
+/// SQL の文字列リテラルは JSON テキストとして解釈する（トップレベルのスカラー
+/// JSON も有効な JSON として受理。`'null'` は JSON の `null` であり SQL `NULL`
+/// とは別物）。`JSON` 列は検証のみ（入力テキスト保持）、`JSONB` 列は正規化する。
+///
+/// - 構文不正・深さ/要素数超過は `42601`（[`SqlSurfaceError::UnsupportedSyntax`]。
+///   NOSQL-8 と同一分類）。
+/// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
+fn bind_json_literal(
+    s: &str,
+    column_ty: &ColumnType,
+    column_name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    let text = match column_ty {
+        ColumnType::Json => {
+            crate::json::validate_json_column_text(s).map_err(|e| json_column_error(e, s))?;
+            s.to_string()
+        }
+        ColumnType::Jsonb => {
+            crate::json::canonicalize_jsonb_text(s).map_err(|e| json_column_error(e, s))?
+        }
+        ColumnType::Text
+        | ColumnType::Vector(_)
+        | ColumnType::Boolean
+        | ColumnType::Array(_)
+        | ColumnType::Bytea
+        | ColumnType::Enum(_) => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {column_name:?} is not a JSON column"
+            )));
+        }
+    };
+    Ok(crate::row_codec::Value::Json(text))
+}
+
+/// [`crate::json::JsonColumnError`] を SQL 表層の分類（`SqlSurfaceError`）へ写像する
+/// （Issue #889 D1）。`s` 自体（内容）はエラーメッセージへ含めない
+/// （security.md「テナント境界」: エラー経由の情報漏えい防止）。
+fn json_column_error(e: crate::json::JsonColumnError, _s: &str) -> SqlSurfaceError {
+    match e {
+        crate::json::JsonColumnError::TooLong => {
+            SqlSurfaceError::payload_too_large("JSON literal exceeds maximum length")
+        }
+        crate::json::JsonColumnError::Invalid => {
+            SqlSurfaceError::unsupported("invalid JSON literal")
+        }
+    }
+}
+
+/// `ENUM` 列向けの文字列リテラルを [`crate::row_codec::Value::Enum`] へ束縛する
+/// 共通ヘルパー（TABLE-14・TASK-198、Issue #890）。INSERT・UPDATE（単一行 SET・
+/// 述語形）・UPSERT の各束縛箇所が同じ検証・エラー分類を共有する
+/// （[`bind_bytea_literal`] と同じ設計）。語彙外のラベルは書き込みトランザクション
+/// 開始前に `22P02`（[`SqlSurfaceError::invalid_text_representation`]）で拒否する。
+/// エラーメッセージには語彙の一覧を含めない（型名とクライアント自身の入力値のみ。
+/// security.md P0「情報漏えい」対応）。
+fn bind_enum_literal(
+    def: &crate::catalog::EnumTypeDef,
+    s: &str,
+    column_name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    match def.validate_label(s) {
+        Ok(()) => Ok(crate::row_codec::Value::Enum(s.to_string())),
+        Err(_) => Err(SqlSurfaceError::invalid_text_representation(format!(
+            "column {column_name:?} (enum {:?}) does not accept label {s:?}",
+            def.name()
+        ))),
+    }
 }
 
 /// 束縛済みの UPDATE 文（SQL-17、TASK-191。実行結線は #865 の担当）。
@@ -1246,21 +1572,79 @@ fn bind_set_assignments(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-        let value = match (column.ty, literal) {
+        let value = match (&column.ty, literal) {
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+                crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
             }
-            (ColumnType::Vector(_), InsertLiteral::Number(_)) => {
+            (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a vector literal, got a number"
+                    "column {name:?} expects a vector literal, got a non-vector literal"
+                )))
+            }
+            // `VECTOR` 列は `nullable` の値に関わらず常に必須として扱う
+            // （`wire-server::http::query::insert::bind_row` の既存契約と同じ
+            // 判断。Issue #889 レビュー指摘対応・PR #1014）。
+            (ColumnType::Vector(_), InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is a VECTOR column and cannot be set to NULL"
                 )))
             }
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
-            (ColumnType::Text, InsertLiteral::Number(_)) => {
+            (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a text literal, got a number"
+                    "column {name:?} expects a text literal, got a non-text literal"
+                )))
+            }
+            (ColumnType::Boolean, InsertLiteral::Bool(b)) => crate::row_codec::Value::Bool(*b),
+            (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a boolean literal (true/false)"
+                )))
+            }
+            (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
+                crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
+            }
+            (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects an array literal, got a non-array literal"
+                )))
+            }
+            (ColumnType::Bytea, InsertLiteral::String(s)) => bind_bytea_literal(s, name)?,
+            (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a bytea hex literal"
+                )))
+            }
+            (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                bind_json_literal(s, &column.ty, name)?
+            }
+            (
+                ColumnType::Json | ColumnType::Jsonb,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a JSON text literal"
+                )))
+            }
+            (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
+            (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a text literal for its enum type"
+                )))
+            }
+            // 明示的な SQL `NULL`（`ColumnType::Vector` を除く。Issue #889
+            // レビュー指摘・PR #1014）。`column.nullable` を確認したうえで
+            // `Value::Null` へ写像し、非 nullable 列は fail-closed に拒否する。
+            // NoSQL 表層 `update` op（`wire-server::http::query::update::
+            // map_set_assignments`）の JSON 列 `null` 分岐が現状唯一の
+            // 構築元だが、SQL 表層 `UPDATE ... SET` 経由（将来 `NULL`
+            // リテラルの字句規則が追加された場合）でも同じ扱いを共有する。
+            (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
+            (_, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is not nullable"
                 )))
             }
         };
@@ -1647,10 +2031,16 @@ fn bind_upsert_form(
                     let BoundUpsertValue::Excluded(src_idx) = value else {
                         continue;
                     };
-                    let is_null = !matches!(
+                    // `EXCLUDED.<col>` が実際に NULL かどうかは `Value::Null`
+                    // そのもの（`src_idx` が範囲外の場合も fail-closed に NULL
+                    // 扱い）でのみ判定する。以前は `Vector`／`Text` 以外を
+                    // すべて NULL とみなしていたため、`Value::Array`（Issue
+                    // #888）を持つ NOT NULL な配列列に対する
+                    // `ON CONFLICT DO UPDATE SET <array> = EXCLUDED.<array>`
+                    // が常に拒否されていた（Cursor Bugbot 指摘・PR #1011）。
+                    let is_null = matches!(
                         row.values.get(*src_idx),
-                        Some(crate::row_codec::Value::Vector(_))
-                            | Some(crate::row_codec::Value::Text(_))
+                        None | Some(crate::row_codec::Value::Null)
                     );
                     let target_nullable = schema
                         .columns
@@ -1758,21 +2148,71 @@ fn bind_upsert_assignments(
                 BoundUpsertValue::Excluded(src_idx)
             }
             UpsertValue::Literal(literal) => {
-                let v = match (column.ty, literal) {
+                let v = match (&column.ty, literal) {
                     (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
-                        crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+                        crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
                     }
-                    (ColumnType::Vector(_), InsertLiteral::Number(_)) => {
+                    (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
-                            "column {name:?} expects a vector literal, got a number"
+                            "column {name:?} expects a vector literal, got a non-vector literal"
                         )))
                     }
                     (ColumnType::Text, InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Text(s.clone())
                     }
-                    (ColumnType::Text, InsertLiteral::Number(_)) => {
+                    (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
-                            "column {name:?} expects a text literal, got a number"
+                            "column {name:?} expects a text literal, got a non-text literal"
+                        )))
+                    }
+                    (ColumnType::Boolean, InsertLiteral::Bool(b)) => {
+                        crate::row_codec::Value::Bool(*b)
+                    }
+                    (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a boolean literal (true/false)"
+                        )))
+                    }
+                    (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
+                        crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
+                    }
+                    (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects an array literal, got a non-array literal"
+                        )))
+                    }
+                    (ColumnType::Bytea, InsertLiteral::String(s)) => bind_bytea_literal(s, name)?,
+                    (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a bytea hex literal"
+                        )))
+                    }
+                    (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                        bind_json_literal(s, &column.ty, name)?
+                    }
+                    (
+                        ColumnType::Json | ColumnType::Jsonb,
+                        InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+                    ) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a JSON text literal"
+                        )))
+                    }
+                    (ColumnType::Enum(def), InsertLiteral::String(s)) => {
+                        bind_enum_literal(def, s, name)?
+                    }
+                    (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a text literal for its enum type"
+                        )))
+                    }
+                    // `InsertLiteral::Null`（Issue #889 レビュー指摘）は
+                    // `ON CONFLICT ... DO UPDATE SET` の SQL 構文からは構築
+                    // されない到達不能パス（match の網羅性のためだけの分岐。
+                    // `bind_set_assignments` のドキュメント参照）。
+                    (_, InsertLiteral::Null) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} does not accept an explicit NULL literal in ON CONFLICT DO UPDATE SET"
                         )))
                     }
                 };
@@ -1851,13 +2291,21 @@ fn bind_file_insert(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-        let value = match (column.ty, literal) {
+        let value = match (&column.ty, literal) {
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
-            (ColumnType::Text, InsertLiteral::Number(_)) => {
+            (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects a text literal, got a number"
+                    "column {name:?} expects a text literal, got a non-text literal"
+                )))
+            }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘）はファイル形
+            // `INSERT` の VALUES 構文からは構築されない到達不能パス（match の
+            // 網羅性のためだけの分岐。`bind_set_assignments` のドキュメント参照）。
+            (ColumnType::Text, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} does not accept an explicit NULL literal in file-form INSERT"
                 )))
             }
             // `bind_insert_form` の判別規則により VECTOR 列名は列リストに含まれない
@@ -1866,6 +2314,37 @@ fn bind_file_insert(
             (ColumnType::Vector(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: VECTOR column must not be provided for file-form INSERT"
+                )))
+            }
+            // ファイル形 INSERT は `path`/`body` の TEXT 列規約専用（本モジュール
+            // ドキュメント参照）。BOOLEAN 列は対象外として拒否する（Issue #883）。
+            (ColumnType::Boolean, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: BOOLEAN column is not supported for file-form INSERT"
+                )))
+            }
+            // 配列列（TABLE-14・Issue #888）も BOOLEAN と同じく対象外として拒否する。
+            (ColumnType::Array(_), _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: ARRAY column is not supported for file-form INSERT"
+                )))
+            }
+            // BYTEA 列も同じ理由で対象外とする（Issue #886）。
+            (ColumnType::Bytea, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: BYTEA column is not supported for file-form INSERT"
+                )))
+            }
+            // JSON／JSONB 列も同じ理由で対象外とする（Issue #889 D6）。
+            (ColumnType::Json | ColumnType::Jsonb, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: JSON column is not supported for file-form INSERT"
+                )))
+            }
+            // ENUM 列も同じ理由で対象外とする（Issue #890）。
+            (ColumnType::Enum(_), _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: ENUM column is not supported for file-form INSERT"
                 )))
             }
         };
@@ -1947,6 +2426,32 @@ pub(crate) enum AggregateInput {
     /// `MIN`/`MAX`（バイト順・NULL 無視）でのみ使う（`SUM`/`AVG` は
     /// [`resolve_aggregate_input`] が型不整合として拒否済み）。
     TextColumn(usize),
+    /// `BOOLEAN` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-13・TASK-196、Issue #883）。`SUM`/`AVG`/`MIN`/
+    /// `MAX` は `TextColumn` と同じパターンで [`resolve_aggregate_input`] が
+    /// 型不整合として拒否する。
+    BooleanColumn(usize),
+    /// `ARRAY` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL 行数）
+    /// でのみ使う（TABLE-14・TASK-198、Issue #888・D-A8）。`SUM`/`AVG`/`MIN`/
+    /// `MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
+    /// [`resolve_aggregate_input`] が型不整合として拒否する。
+    ArrayColumn(usize),
+    /// `BYTEA` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-13・TASK-197、Issue #886）。`SUM`/`AVG`/`MIN`/
+    /// `MAX` は `BooleanColumn` と同じパターンで [`resolve_aggregate_input`] が
+    /// 型不整合として拒否する。
+    ByteaColumn(usize),
+    /// `JSON`／`JSONB` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-14・TASK-198、Issue #889）。`SUM`/`AVG`/`MIN`/`MAX`
+    /// は `ByteaColumn` と同じパターンで [`resolve_aggregate_input`] が型不整合
+    /// として拒否する。
+    JsonColumn(usize),
+    /// `ENUM` 列の裸の列参照（`COUNT` 限定。TABLE-14・TASK-198、Issue #890）。
+    /// `SUM`/`AVG`/`MIN`/`MAX` は `BooleanColumn`／`ByteaColumn` と同じパターンで
+    /// [`resolve_aggregate_input`] が型不整合として拒否する（PostgreSQL の enum は
+    /// 宣言順で `MIN`/`MAX` 比較できるが、辞書順で代用すると意味論が食い違うため
+    /// 意図的に受理しない。Issue #890 D7）。
+    EnumColumn(usize),
     /// 上記以外の `Scalar` 型に束縛された式（列参照 `id` 単体を除く。`vec_norm(...)`
     /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`program`（束縛時に
     /// ステップ列コンパイル済み、Issue #353）を行ループで評価する。`source` は
@@ -2349,7 +2854,7 @@ fn resolve_aggregate_input(
                 .enumerate()
                 .find(|(_, c)| &c.name == name)
             {
-                return match (column.ty, func) {
+                return match (&column.ty, func) {
                     (ColumnType::Text, AggregateFunc::Sum | AggregateFunc::Avg) => {
                         Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} is TEXT and cannot be used with SUM/AVG"
@@ -2361,6 +2866,38 @@ fn resolve_aggregate_input(
                     }
                     (ColumnType::Vector(_), _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with SUM/AVG/MIN/MAX"
+                    ))),
+                    (ColumnType::Boolean, AggregateFunc::Count) => {
+                        Ok(AggregateInput::BooleanColumn(index))
+                    }
+                    (ColumnType::Boolean, _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is BOOLEAN and cannot be used with SUM/AVG/MIN/MAX"
+                    ))),
+                    (ColumnType::Array(_), AggregateFunc::Count) => {
+                        Ok(AggregateInput::ArrayColumn(index))
+                    }
+                    (ColumnType::Array(_), _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is ARRAY and cannot be used with SUM/AVG/MIN/MAX"
+                    ))),
+                    (ColumnType::Bytea, AggregateFunc::Count) => {
+                        Ok(AggregateInput::ByteaColumn(index))
+                    }
+                    (ColumnType::Bytea, _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is BYTEA and cannot be used with SUM/AVG/MIN/MAX"
+                    ))),
+                    (ColumnType::Json | ColumnType::Jsonb, AggregateFunc::Count) => {
+                        Ok(AggregateInput::JsonColumn(index))
+                    }
+                    (ColumnType::Json | ColumnType::Jsonb, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is JSON and cannot be used with SUM/AVG/MIN/MAX"
+                        )))
+                    }
+                    (ColumnType::Enum(_), AggregateFunc::Count) => {
+                        Ok(AggregateInput::EnumColumn(index))
+                    }
+                    (ColumnType::Enum(_), _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is ENUM and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
                 };
             }
@@ -2632,7 +3169,7 @@ fn resolve_group_by_column(schema: &TableSchema, column: &str) -> Result<usize, 
         .position(|c| c.name == column)
         .filter(|&idx| {
             matches!(
-                schema.columns.get(idx).map(|c| c.ty),
+                schema.columns.get(idx).map(|c| c.ty.clone()),
                 Some(ColumnType::Text)
             )
         })
@@ -2901,6 +3438,132 @@ mod tests {
         let literal = format!("[{padding}"); // 閉じ括弧なしで意図的に不正形状にする
         assert_eq!(literal.len(), MAX_VECTOR_LITERAL_BYTES - 1);
         let err = parse_vector_literal(&literal, 1).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- parse_array_literal（TABLE-14・TASK-198、Issue #888） ------------------
+
+    fn text_array_ty(max_len: u32) -> crate::catalog::ArrayType {
+        crate::catalog::ArrayType::new(crate::catalog::ArrayElemType::Text, max_len)
+            .expect("array ty")
+    }
+
+    fn bool_array_ty(max_len: u32) -> crate::catalog::ArrayType {
+        crate::catalog::ArrayType::new(crate::catalog::ArrayElemType::Bool, max_len)
+            .expect("array ty")
+    }
+
+    #[test]
+    fn parse_array_literal_accepts_empty_array() {
+        let v = parse_array_literal("{}", text_array_ty(4)).expect("valid literal");
+        assert_eq!(v, crate::row_codec::ArrayValue::Text(vec![]));
+    }
+
+    #[test]
+    fn parse_array_literal_accepts_unquoted_text_elements() {
+        let v = parse_array_literal("{a,b,c}", text_array_ty(4)).expect("valid literal");
+        assert_eq!(
+            v,
+            crate::row_codec::ArrayValue::Text(vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_array_literal_accepts_quoted_elements_with_escapes() {
+        let v = parse_array_literal(r#"{"a,b","c\"d","",  spaced }"#, text_array_ty(4))
+            .expect("valid literal");
+        assert_eq!(
+            v,
+            crate::row_codec::ArrayValue::Text(vec![
+                "a,b".to_string(),
+                "c\"d".to_string(),
+                "".to_string(),
+                "spaced".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_array_literal_quoted_null_is_literal_string() {
+        let v = parse_array_literal(r#"{"NULL"}"#, text_array_ty(4)).expect("valid literal");
+        assert_eq!(
+            v,
+            crate::row_codec::ArrayValue::Text(vec!["NULL".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_array_literal_rejects_unquoted_null_element() {
+        let err = parse_array_literal("{a,null,b}", text_array_ty(4)).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+        let err = parse_array_literal("{NULL}", text_array_ty(4)).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn parse_array_literal_rejects_malformed_brackets() {
+        assert_eq!(
+            parse_array_literal("a,b,c", text_array_ty(4))
+                .unwrap_err()
+                .wire_code(),
+            "22000"
+        );
+        assert_eq!(
+            parse_array_literal("{a,b,c", text_array_ty(4))
+                .unwrap_err()
+                .wire_code(),
+            "22000"
+        );
+    }
+
+    #[test]
+    fn parse_array_literal_rejects_unterminated_quote() {
+        let err = parse_array_literal(r#"{"a}"#, text_array_ty(4)).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn parse_array_literal_rejects_trailing_comma() {
+        let err = parse_array_literal("{a,b,}", text_array_ty(4)).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn parse_array_literal_rejects_nested_braces() {
+        let err = parse_array_literal("{a,{b,c}}", text_array_ty(4)).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn parse_array_literal_rejects_element_count_exceeding_max_len() {
+        let err = parse_array_literal("{a,b,c}", text_array_ty(2)).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn parse_array_literal_rejects_oversized_payload() {
+        let huge = format!("{{{}}}", "a,".repeat(2_000_000));
+        let err = parse_array_literal(&huge, text_array_ty(crate::catalog::MAX_ARRAY_ELEMENTS))
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn parse_array_literal_accepts_bool_elements_case_insensitive() {
+        let v = parse_array_literal("{t,F,true,FALSE}", bool_array_ty(8)).expect("valid literal");
+        assert_eq!(
+            v,
+            crate::row_codec::ArrayValue::Bool(vec![true, false, true, false])
+        );
+    }
+
+    #[test]
+    fn parse_array_literal_rejects_invalid_bool_word() {
+        let err = parse_array_literal("{t,maybe}", bool_array_ty(8)).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
     }
 
@@ -3177,6 +3840,62 @@ mod tests {
                 crate::row_codec::Value::Text("ja".to_string()),
             ]
         );
+    }
+
+    /// `bind_json_literal`（`sql::parser::bind_insert_row` から呼ばれる束縛層の
+    /// 単一チョークポイント）は `MAX_JSON_FIELD_LEN` を 1 バイトでも超える入力を
+    /// `54000`（`PayloadTooLarge`）で拒否する（PR #1014 レビュー指摘対応）。
+    #[test]
+    fn bind_json_literal_rejects_body_one_byte_over_max_json_field_len() {
+        let oversized = "1".repeat(crate::json::MAX_JSON_FIELD_LEN + 1);
+        let err = bind_json_literal(&oversized, &ColumnType::Json, "doc").unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// `MAX_JSON_FIELD_LEN` ちょうどの有効な JSON は束縛層を通過し、かつその
+    /// 束縛結果（`Value::Json`）が実際の `row_codec::encode_scalar_columns`
+    /// （presence(1) + 長さ(4) バイトのフレーミングを付与する行コーデック）でも
+    /// 単独で `MAX_SCALAR_PAYLOAD_LEN` へ収まることを固定する。旧
+    /// `MAX_JSON_FIELD_LEN` 定義（`MAX_TEXT_FIELD_LEN` と同値）では、この境界値が
+    /// 束縛層を通過した**後**にフレーミング分だけ `encode_scalar_columns` 側で
+    /// 拒否され得た（codex-review P1 指摘・PR #1014）。
+    #[test]
+    fn bind_json_literal_at_exact_max_json_field_len_fits_scalar_payload_after_encode() {
+        // 単一の文字列リテラルは `MAX_JSON_STRING_CHARS`（1 MiB）に抵触するため、
+        // `json.rs` の境界値テストと同じ方式（複数要素の配列）で目標バイト数を
+        // ちょうど組み立てる: `[` + 5 要素（`"`×2 + 本体） + 4 個の `,` + `]`。
+        let target = crate::json::MAX_JSON_FIELD_LEN;
+        let overhead = 1 + 1 + 4 + 5 * 2;
+        let content_total = target - overhead;
+        let base = content_total / 5;
+        let remainder = content_total % 5;
+        let lens = [base, base, base, base, base + remainder];
+        let mut doc = String::new();
+        doc.push('[');
+        for (i, len) in lens.iter().enumerate() {
+            if i > 0 {
+                doc.push(',');
+            }
+            doc.push('"');
+            doc.push_str(&"a".repeat(*len));
+            doc.push('"');
+        }
+        doc.push(']');
+        assert_eq!(doc.len(), target);
+
+        let value =
+            bind_json_literal(&doc, &ColumnType::Json, "doc").expect("must bind at exact limit");
+
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                crate::catalog::ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                crate::catalog::ColumnDef::new("doc", ColumnType::Json, true),
+            ],
+        );
+        let values = vec![crate::row_codec::Value::Vector(vec![0.1, 0.2]), value];
+        crate::row_codec::encode_scalar_columns(&schema, &values)
+            .expect("bind_json_literal output must always fit the scalar payload budget");
     }
 
     #[test]
@@ -4319,5 +5038,47 @@ mod tests {
         );
         let err = bind_body_text_column(&schema).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // 対象指摘: Cursor Bugbot Medium（PR #1011）。`bind_upsert_form` の NULL 判定が
+    // `Value::Vector`／`Value::Text` 以外をすべて NULL 扱いしていたため、
+    // `Value::Array`（Issue #888）を持つ NOT NULL 配列列に対する
+    // `ON CONFLICT (id) DO UPDATE SET tags = EXCLUDED.tags` が、実際には
+    // 配列値が存在するにもかかわらず「NULL を NOT NULL 列へ代入しようとした」
+    // として常に拒否されていた。NOT NULL な配列列を対象にした UPSERT が
+    // 受理されることを固定する。
+    #[test]
+    fn bind_upsert_form_accepts_excluded_array_value_for_not_null_array_column() {
+        let schema = TableSchema::new(
+            "documents",
+            vec![ColumnDef::new(
+                "tags",
+                ColumnType::Array(text_array_ty(8)),
+                false,
+            )],
+        );
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_insert(
+            "INSERT INTO documents (id, tags) VALUES (1, '{a,b}') \
+             ON CONFLICT (id) DO UPDATE SET tags = EXCLUDED.tags \
+             USING OPERATION_ID 'op-upsert-array'",
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+
+        let bound =
+            bind_insert_form(&stmt, &schema).expect("array EXCLUDED value must not be NULL");
+        match bound {
+            BoundInsertForm::Upsert(upsert) => {
+                assert_eq!(
+                    upsert.action,
+                    BoundConflictAction::DoUpdate(vec![(0, BoundUpsertValue::Excluded(0))])
+                );
+            }
+            other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+        }
     }
 }

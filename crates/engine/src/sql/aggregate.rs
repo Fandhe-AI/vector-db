@@ -129,7 +129,12 @@ impl ReferencedColumns {
 
         for item in items {
             match &item.input {
-                AggregateInput::TextColumn(index) => {
+                AggregateInput::TextColumn(index)
+                | AggregateInput::BooleanColumn(index)
+                | AggregateInput::ArrayColumn(index)
+                | AggregateInput::ByteaColumn(index)
+                | AggregateInput::JsonColumn(index)
+                | AggregateInput::EnumColumn(index) => {
                     has_scalar_reference = true;
                     if let Some(slot) = scalar_mask.get_mut(*index) {
                         *slot = true;
@@ -293,7 +298,7 @@ impl Accumulator {
         input: &AggregateInput,
         id: u64,
         vector: &RowVector<'_>,
-        scanned: &[Option<&str>],
+        scanned: &[Option<row_codec::ScalarRef<'_>>],
         scratch: &mut Vec<StackValue>,
     ) -> Result<(), SqlSurfaceError> {
         match input {
@@ -313,8 +318,61 @@ impl Accumulator {
             }
             AggregateInput::IdU64 => self.observe_id(id),
             AggregateInput::TextColumn(index) => {
-                let value = scanned.get(*index).copied().flatten();
+                let value = scanned
+                    .get(*index)
+                    .copied()
+                    .flatten()
+                    .and_then(|v| v.as_text());
                 self.observe_text(value)
+            }
+            // BOOLEAN 列の裸参照は COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
+            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。Issue #883）。値の真偽は
+            // 問わず「NULL でない」ことだけを数える。
+            AggregateInput::BooleanColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
+            // ARRAY 列の裸参照も BOOLEAN と同じく COUNT（非 NULL 行数）専用
+            // （TABLE-14・Issue #888・D-A8）。要素の中身は問わず、列自体が
+            // NULL でないことだけを数える。
+            AggregateInput::ArrayColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
+            // BYTEA 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
+            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。Issue #886）。
+            AggregateInput::ByteaColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
+            // JSON／JSONB 列の裸参照も COUNT（非 NULL 行数）専用
+            // （`resolve_aggregate_input` が SUM/AVG/MIN/MAX を型不整合として
+            // 拒否済み。TABLE-14・Issue #889）。
+            AggregateInput::JsonColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
+            // ENUM 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
+            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。TABLE-14・TASK-198、
+            // Issue #890）。
+            AggregateInput::EnumColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
             }
             AggregateInput::ScalarExpr { source, program } => {
                 // 式木が実際に embedding へ到達する場合のみ `vector.values` を
@@ -910,7 +968,7 @@ pub(crate) fn execute_aggregate_with_cache(
             // `metadata_filters`・`expr_filters` が空（tier 決定条件）であるため、
             // 空スライスで安全に代用できる（`matches_all` は無条件で真、
             // `Accumulator::observe` の `TextColumn` はこの tier では出現しない）。
-            let scanned: Vec<Option<&str>> = match tier {
+            let scanned: Vec<Option<row_codec::ScalarRef<'_>>> = match tier {
                 DecodeTier::Fast => {
                     row_codec::validate_scalar_columns(schema, metadata)?;
                     Vec::new()

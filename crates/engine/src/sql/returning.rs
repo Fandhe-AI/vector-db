@@ -88,6 +88,69 @@ fn try_clone_vector_for_budget(
     Ok(owned)
 }
 
+/// 配列セルの選択的複製（累計バイト量を確保前に検証。上記テキスト・ベクトル版と
+/// 同方針。Issue #888）。
+fn try_clone_array_for_budget(
+    array_value: &crate::row_codec::ArrayValue,
+    budget: &mut usize,
+    cap: usize,
+) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
+    use crate::row_codec::ArrayValue;
+    match array_value {
+        ArrayValue::Text(items) => {
+            // 要素本文（文字列長の合計）に加え、`Vec<String>` の構造体分
+            // （`String` 1 個あたり `size_of::<String>()`）も計上する。本文長のみ
+            // では空文字列を大量に含む配列で予算消費がほぼ 0 のまま `String` の
+            // 管理領域（ヒープ確保）を無制限に積み上げられてしまう
+            // （`sql::exec::try_alloc_array_for_budget`・`sql::scan` と同方針。
+            // Issue #888 レビュー指摘・PR #1011）。
+            let payload_bytes: usize = items.iter().map(|s| s.len()).sum();
+            let approx = payload_bytes
+                .saturating_add(items.len().saturating_mul(std::mem::size_of::<String>()));
+            *budget = try_accumulate_budget(*budget, approx, cap)?;
+            let mut owned: Vec<String> = Vec::new();
+            owned
+                .try_reserve_exact(items.len())
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve RETURNING array field: {e}"),
+                })?;
+            for item in items {
+                owned.push(item.clone());
+            }
+            Ok(ArrayValue::Text(owned))
+        }
+        ArrayValue::Bool(items) => {
+            *budget = try_accumulate_budget(*budget, items.len(), cap)?;
+            let mut owned: Vec<bool> = Vec::new();
+            owned
+                .try_reserve_exact(items.len())
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve RETURNING array field: {e}"),
+                })?;
+            owned.extend_from_slice(items);
+            Ok(ArrayValue::Bool(owned))
+        }
+    }
+}
+
+/// BYTEA セルの選択的複製（累計バイト量を確保前に検証。上記テキスト版と同方針。
+/// UTF-8 検証を行わない点のみ異なる。Issue #886）。
+fn try_alloc_bytes_for_budget(
+    bytes: &[u8],
+    budget: &mut usize,
+    cap: usize,
+) -> Result<Vec<u8>, SqlSurfaceError> {
+    *budget = try_accumulate_budget(*budget, bytes.len(), cap)?;
+    let mut owned: Vec<u8> = Vec::new();
+    owned
+        .try_reserve_exact(bytes.len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve RETURNING bytea field: {e}"),
+        })?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
+}
+
 /// 型不整合・実装バグの検出用（untrusted 入力起因ではないため `wire_code` は
 /// `XX000`。`sql::scan::scan_bug` と同方針）。`RETURNING` の投影は
 /// `sql::parser::bind_returning` が `Computed`（式項目）を構造的に排除した
@@ -113,7 +176,7 @@ pub(crate) fn column_meta(
                 let ty = schema
                     .columns
                     .get(*index)
-                    .map(|c| c.ty)
+                    .map(|c| c.ty.clone())
                     .ok_or_else(|| returning_bug("projected column index out of range"))?;
                 Ok(ColumnMeta::Scalar {
                     name: name.clone(),
@@ -159,6 +222,29 @@ pub(crate) fn project_row(
                     budget,
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
+                Some(Value::Bool(b)) => Cell::Bool(*b),
+                Some(Value::Array(array_value)) => Cell::Array(try_clone_array_for_budget(
+                    array_value,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
+                Some(Value::Bytes(b)) => Cell::Bytes(try_alloc_bytes_for_budget(
+                    b,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
+                Some(Value::Json(s)) => Cell::Json(try_alloc_text_for_budget(
+                    s,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
+                // ENUM 列は既存の `Cell::Text` へ写像する（Issue #890 D7。
+                // `sql::exec` の投影と同じ扱い）。
+                Some(Value::Enum(label)) => Cell::Text(try_alloc_text_for_budget(
+                    label,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
                 None => return Err(returning_bug("value index out of range")),
             },
             ProjectedColumn::Computed { .. } => {
@@ -193,5 +279,39 @@ mod tests {
         let cap = 100usize;
         let next = try_accumulate_budget(0, cap, cap).expect("must fit exactly at cap");
         assert_eq!(next, cap);
+    }
+
+    /// [`try_clone_array_for_budget`] は TEXT 要素の本文長だけでなく
+    /// `Vec<String>` の構造体分（`String` 1 個あたり `size_of::<String>()`）も
+    /// 予算に計上する（PR #1011 codex レビュー P1 指摘対応）。空文字列を大量に
+    /// 含む配列は本文長の合計がほぼ 0 になるため、要素数を無視すると予算検証を
+    /// 迂回して `String` の管理領域を無制限に確保できてしまう。
+    #[test]
+    fn try_clone_array_for_budget_counts_text_element_struct_overhead_for_empty_strings() {
+        use crate::row_codec::ArrayValue;
+
+        // 1,024 個の空文字列。本文バイト量は 0 だが、`size_of::<String>()`
+        // （24 バイト程度）× 1,024 個分の構造体オーバーヘッドは無視できない。
+        let items: Vec<String> = std::iter::repeat_n(String::new(), 1024).collect();
+        let array_value = ArrayValue::Text(items);
+        let expected_overhead = 1024usize.saturating_mul(std::mem::size_of::<String>());
+
+        let mut budget = 0usize;
+        // cap をオーバーヘッド未満に設定すると、本文長のみを計上する実装では
+        // 誤って受理してしまう境界。
+        let cap = expected_overhead - 1;
+        let err = try_clone_array_for_budget(&array_value, &mut budget, cap)
+            .expect_err("struct overhead of many empty strings must trip the budget cap");
+        assert_eq!(err.wire_code(), "54000");
+
+        // 十分な cap を与えれば受理され、budget にオーバーヘッド分が反映される。
+        let mut budget = 0usize;
+        let cloned = try_clone_array_for_budget(&array_value, &mut budget, expected_overhead)
+            .expect("must fit when cap covers struct overhead");
+        assert_eq!(budget, expected_overhead);
+        match cloned {
+            ArrayValue::Text(items) => assert_eq!(items.len(), 1024),
+            ArrayValue::Bool(_) => panic!("expected ArrayValue::Text"),
+        }
     }
 }

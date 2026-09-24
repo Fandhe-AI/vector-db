@@ -57,6 +57,7 @@
 //! （Issue #765・TASK-186・NOSQL-10。`vector` 指定・`plan` 未指定は `42601`）。
 
 pub mod aggregate;
+pub mod base64_std;
 pub mod delete;
 pub mod dml_target;
 pub mod explain;

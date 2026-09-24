@@ -94,6 +94,26 @@ pub enum InsertError {
     /// `EngineCore::execute_bound_insert_in_session` 側のエラー（`operation_id`
     /// 必須化・台帳照合・INDEX-4 上限・テーブル不存在等）をそのまま透過する。
     Exec(SqlSurfaceError),
+    /// `BYTEA` 列の値が base64 の JSON string でない、または不正な base64
+    /// （`42601`。B10・Issue #886。SQL 表層の型不一致〔`22000`〕とは意図的に
+    /// 異なる分類——受け入れ基準 4・NOSQL-17 の「型不一致は `42601`」に従う）。
+    InvalidBytea(&'static str),
+    /// `BYTEA` 列の base64 値が復号後 [`engine::bytea::MAX_BYTEA_FIELD_LEN`] を
+    /// 超える（`54000`）。
+    ByteaTooLarge,
+    /// `JSON`／`JSONB` 列の値が JSON オブジェクト／配列の型として不整合、または
+    /// 構文不正（`42601`。Issue #889 D6。SQL 表層の型不一致〔`22000`〕とは
+    /// 意図的に異なる分類——BYTEA の `InvalidBytea` と同じ判断）。スカラー JSON
+    /// （文字列・数値・真偽値）は NOSQL-17 の束縛表に無いため曖昧さを避けて
+    /// 同じ分類で拒否する。
+    InvalidJson(&'static str),
+    /// `JSON`／`JSONB` 列の値が正規化後 [`engine::json::MAX_JSON_FIELD_LEN`] を
+    /// 超える（`54000`）。
+    JsonTooLarge,
+    /// `ENUM` 列の値が語彙外のラベル（`22P02`。TABLE-14・TASK-198、Issue #890。
+    /// SQL 表層の `sql::parser::bind_enum_literal` と同じ分類を NoSQL 表層でも
+    /// 共有する）。エラー文言には語彙の一覧を含めない（security.md P0）。
+    InvalidEnumLabel(String),
 }
 
 impl From<SchemaError> for InsertError {
@@ -114,6 +134,11 @@ impl ClassifiedError for InsertError {
             InsertError::Shape(err) => err.error_class(),
             InsertError::InvalidIdentifier => ErrorClass::UnsupportedSqlSyntax,
             InsertError::Bind(err) | InsertError::Exec(err) => err.error_class(),
+            InsertError::InvalidBytea(_) => ErrorClass::UnsupportedSqlSyntax,
+            InsertError::ByteaTooLarge => ErrorClass::PayloadTooLarge,
+            InsertError::InvalidJson(_) => ErrorClass::UnsupportedSqlSyntax,
+            InsertError::JsonTooLarge => ErrorClass::PayloadTooLarge,
+            InsertError::InvalidEnumLabel(_) => ErrorClass::InvalidTextRepresentation,
         }
     }
 
@@ -122,6 +147,11 @@ impl ClassifiedError for InsertError {
             InsertError::Shape(err) => err.client_message(),
             InsertError::InvalidIdentifier => "invalid identifier".to_string(),
             InsertError::Bind(err) | InsertError::Exec(err) => err.client_message(),
+            InsertError::InvalidBytea(detail) => detail.to_string(),
+            InsertError::ByteaTooLarge => "BYTEA value exceeds the length limit".to_string(),
+            InsertError::InvalidJson(detail) => detail.to_string(),
+            InsertError::JsonTooLarge => "JSON value exceeds the length limit".to_string(),
+            InsertError::InvalidEnumLabel(detail) => detail.clone(),
         }
     }
 }
@@ -190,11 +220,30 @@ fn bind_row(item: &JsonValue, schema: &TableSchema) -> Result<(u64, Vec<Value>),
             )));
         };
         let column = &schema.columns[col_idx];
-        let value = match (column.ty, raw) {
+        let value = match (&column.ty, raw) {
             (ColumnType::Text, JsonValue::String(s)) => Value::Text(s.clone()),
             (ColumnType::Text, JsonValue::Null) if column.nullable => Value::Null,
+            // ENUM 列は base64 ではなく生のラベル文字列を JSON string として
+            // 受け取る（Issue #890。BYTEA が base64 を採用しているのとは異なる
+            // 表現——ラベルは人間可読な識別子であり、SQL 表層の文字列リテラルと
+            // 同じ表示形にするため）。語彙外は `22P02`、非文字列は `42601`。
+            (ColumnType::Enum(def), JsonValue::String(s)) => {
+                if def.validate_label(s).is_err() {
+                    return Err(InsertError::InvalidEnumLabel(format!(
+                        "INSERT row enum column value {s:?} is not a member of enum type {:?}",
+                        def.name()
+                    )));
+                }
+                Value::Enum(s.clone())
+            }
+            (ColumnType::Enum(_), JsonValue::Null) if column.nullable => Value::Null,
+            (ColumnType::Enum(_), _) => {
+                return Err(InsertError::Bind(SqlSurfaceError::UnsupportedSyntax {
+                    detail: "INSERT row ENUM column value must be a JSON string".to_string(),
+                }))
+            }
             (ColumnType::Vector(dim), JsonValue::Array(items)) => {
-                if items.len() != dim as usize {
+                if items.len() != *dim as usize {
                     return Err(InsertError::Bind(invalid_input_error(
                         "INSERT row VECTOR column length does not match the table dimension",
                     )));
@@ -222,6 +271,47 @@ fn bind_row(item: &JsonValue, schema: &TableSchema) -> Result<(u64, Vec<Value>),
                     vec_values.push(f);
                 }
                 Value::Vector(vec_values)
+            }
+            (ColumnType::Bytea, JsonValue::String(s)) => {
+                let decoded =
+                    super::base64_std::decode_base64_std(s, engine::bytea::MAX_BYTEA_FIELD_LEN)
+                        .map_err(|e| match e {
+                            super::base64_std::Base64StdError::TooLong => {
+                                InsertError::ByteaTooLarge
+                            }
+                            _ => InsertError::InvalidBytea(
+                                "INSERT row BYTEA column value must be valid base64",
+                            ),
+                        })?;
+                Value::Bytes(decoded)
+            }
+            (ColumnType::Bytea, JsonValue::Null) if column.nullable => Value::Null,
+            (ColumnType::Bytea, _) => {
+                return Err(InsertError::InvalidBytea(
+                    "INSERT row BYTEA column value must be a base64 JSON string",
+                ))
+            }
+            // `JSON`／`JSONB` 列はネストした JSON オブジェクト／配列を受理し、
+            // 正規化テキストへ写像する（Issue #889 D6。`JSON` 列も含め NoSQL
+            // 経由の値は常に正規化形で格納する設計判断——row_codec の encode
+            // チョークポイントは「有効な JSON か」のみを検証するため矛盾しない）。
+            // スカラー JSON（文字列・数値・真偽値）は NOSQL-17 の束縛表に無い
+            // ため曖昧さを避けて `42601` で拒否する。
+            (ColumnType::Json | ColumnType::Jsonb, JsonValue::Object(_) | JsonValue::Array(_)) => {
+                let mut canonical = String::new();
+                engine::json::write_canonical(raw, &mut canonical);
+                if canonical.len() > engine::json::MAX_JSON_FIELD_LEN {
+                    return Err(InsertError::JsonTooLarge);
+                }
+                Value::Json(canonical)
+            }
+            (ColumnType::Json | ColumnType::Jsonb, JsonValue::Null) if column.nullable => {
+                Value::Null
+            }
+            (ColumnType::Json | ColumnType::Jsonb, _) => {
+                return Err(InsertError::InvalidJson(
+                    "INSERT row JSON column value must be a JSON object or array",
+                ))
             }
             _ => {
                 return Err(InsertError::Bind(invalid_input_error(
@@ -369,6 +459,29 @@ pub fn execute(
                         SqlSurfaceError::Internal {
                             detail: "unexpected shape error during INSERT row binding".to_string(),
                         }
+                    }
+                    // `InvalidBytea`（`42601`）／`ByteaTooLarge`（`54000`）の分類を
+                    // `SqlSurfaceError` へ写像しても維持する（B10・Issue #886）。
+                    InsertError::InvalidBytea(detail) => SqlSurfaceError::UnsupportedSyntax {
+                        detail: detail.to_string(),
+                    },
+                    InsertError::ByteaTooLarge => SqlSurfaceError::PayloadTooLarge {
+                        detail: "BYTEA value exceeds the length limit".to_string(),
+                    },
+                    // `InvalidJson`（`42601`）／`JsonTooLarge`（`54000`）の分類を
+                    // `SqlSurfaceError` へ写像しても維持する（Issue #889 D6）。
+                    InsertError::InvalidJson(detail) => SqlSurfaceError::UnsupportedSyntax {
+                        detail: detail.to_string(),
+                    },
+                    InsertError::JsonTooLarge => SqlSurfaceError::PayloadTooLarge {
+                        detail: "JSON value exceeds the length limit".to_string(),
+                    },
+                    // ENUM 語彙外ラベル（`22P02`）の分類を `SqlSurfaceError` へ
+                    // 写像しても維持する（Issue #890。`invalid_text_representation`
+                    // コンストラクタは engine クレート内 `pub(crate)` のため、
+                    // 他の variant と同じくフィールド直接構築で写像する）。
+                    InsertError::InvalidEnumLabel(detail) => {
+                        SqlSurfaceError::InvalidTextRepresentation { detail }
                     }
                 })
             },
@@ -931,5 +1044,58 @@ mod tests {
             "NoSQL insert followed by identical SQL resend must be recognized as same-content"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- BYTEA 列（Issue #886）の base64 束縛 ---------------------------------
+
+    fn bytea_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("blob", ColumnType::Bytea, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn bind_rows_decodes_base64_bytea_column() {
+        // "3q2+7w==" は [0xde, 0xad, 0xbe, 0xef] の標準 base64 表現。
+        let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"blob":"3q2+7w=="}]"#);
+        let bounds = bind_rows(&items, "docs", None, &bytea_schema()).expect("bind ok");
+        assert_eq!(
+            bounds[0].values,
+            vec![
+                Value::Vector(vec![1.0, 0.0, 0.0, 0.0]),
+                Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
+            ]
+        );
+    }
+
+    #[test]
+    fn bind_rows_rejects_non_string_bytea_column() {
+        let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"blob":123}]"#);
+        let err = bind_rows(&items, "docs", None, &bytea_schema()).expect_err("must reject");
+        assert!(matches!(err, InsertError::InvalidBytea(_)));
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_rows_rejects_malformed_base64_bytea_column() {
+        for bad in ["3q2+7w=", "3q2+7w=a", "!!!!"] {
+            let items = rows_from(&format!(
+                r#"[{{"id":1,"embedding":[1,0,0,0],"blob":"{bad}"}}]"#
+            ));
+            let err = bind_rows(&items, "docs", None, &bytea_schema()).expect_err("must reject");
+            assert!(matches!(err, InsertError::InvalidBytea(_)), "input: {bad}");
+            assert_eq!(err.wire_code(), "42601", "input: {bad}");
+        }
+    }
+
+    #[test]
+    fn bind_rows_accepts_null_bytea_column() {
+        let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"blob":null}]"#);
+        let bounds = bind_rows(&items, "docs", None, &bytea_schema()).expect("bind ok");
+        assert_eq!(bounds[0].values[1], Value::Null);
     }
 }
