@@ -22,11 +22,12 @@
 //!   は関与しない
 //! - #955（X25519）: 共有秘密の計算・全ゼロ検出を担う。本モジュールは
 //!   client 公開鍵 32 バイトを取り出して渡すだけ
-//! - #959／#965（0-RTT）: `early_data` を無視した場合の早期 application_data
-//!   レコードの破棄を担う。本モジュールは PSK／0-RTT を受理せず、
+//! - #959／#965（0-RTT）: 0-RTT を受理した場合の早期 application_data
+//!   レコードの処理を担う。本モジュールは PSK／0-RTT を受理せず、
 //!   `pre_shared_key`・`psk_key_exchange_modes` は RFC 8446 §4.2.11・§4.2.9
-//!   の MUST（位置・併存）だけを検査し中身は解釈しない。`early_data` は
-//!   未知拡張として無視する
+//!   の MUST（位置・併存）を、`early_data` は RFC 8446 §4.2.10 の MUST
+//!   （`pre_shared_key` との併存）を検査するのみで中身は解釈しない
+//!   （0-RTT データの送出自体は行わない）
 //! - 通常の（HRR でない）`ServerHello` の組み立て（サーバー鍵を含む）は
 //!   #965 が #955 の鍵生成と組み合わせて行う。本モジュールでは作らない
 //!
@@ -212,6 +213,7 @@ struct ParsedExtensions<'a> {
     has_pre_shared_key: bool,
     pre_shared_key_is_last: bool,
     has_psk_key_exchange_modes: bool,
+    has_early_data: bool,
 }
 
 /// u16 値集合の重複検出に使うビットマップ（65536 bit・8 KiB）。
@@ -244,6 +246,19 @@ impl SeenU16Set {
         *word |= mask;
         was_set
     }
+
+    /// `ty` を記録済みなら `true`（`mark_and_check_duplicate` と異なり状態を
+    /// 変更しない読み取り専用の判定）。`key_share` の各グループが
+    /// `supported_groups` に含まれるかの判定（RFC 8446 §4.2.8）に使う。
+    fn contains(&self, ty: u16) -> bool {
+        let idx = usize::from(ty) / 64;
+        let bit = usize::from(ty) % 64;
+        let mask = 1u64 << bit;
+        // idx は必ず 0..1024 に収まる（u16 の最大値 65535 / 64 = 1023）ため
+        // 到達しないが、添字アクセスを避けるため fail-closed（未記録扱い）
+        // に倒す。
+        self.bits.get(idx).is_some_and(|word| (*word & mask) != 0)
+    }
 }
 
 fn parse_extensions(
@@ -259,6 +274,7 @@ fn parse_extensions(
         has_pre_shared_key: false,
         pre_shared_key_is_last: false,
         has_psk_key_exchange_modes: false,
+        has_early_data: false,
     };
     let last_index = extensions.len().checked_sub(1);
     for (idx, ext) in extensions.iter().enumerate() {
@@ -276,9 +292,10 @@ fn parse_extensions(
                 out.pre_shared_key_is_last = last_index == Some(idx);
             }
             EXT_PSK_KEY_EXCHANGE_MODES => out.has_psk_key_exchange_modes = true,
+            EXT_EARLY_DATA => out.has_early_data = true,
             _ => {
-                // 未知の拡張（`early_data` を含む）は中身を見ずに無視する。
-                // 早期 application_data レコードの破棄は #959／#965 が担う。
+                // その他の未知の拡張は中身を見ずに無視する。早期
+                // application_data レコードの破棄は #959／#965 が担う。
             }
         }
     }
@@ -292,6 +309,16 @@ fn parse_extensions(
     if out.has_pre_shared_key && !out.has_psk_key_exchange_modes {
         return Err(ClientHelloError::MissingExtension(
             "psk_key_exchange_modes required when pre_shared_key is present",
+        ));
+    }
+    // RFC 8446 §4.2.10: early_data は PSK（0-RTT）と併せてのみ提示できる。
+    // 本モジュールは PSK／0-RTT を受理しないため中身は解釈しないが、
+    // pre_shared_key を伴わない early_data はそれ自体がプロトコル違反
+    // （0-RTT の前提となる PSK が無いのに 0-RTT を提示している）ため
+    // illegal_parameter で拒否する。
+    if out.has_early_data && !out.has_pre_shared_key {
+        return Err(ClientHelloError::IllegalParameter(
+            "early_data extension requires a pre_shared_key extension to be present",
         ));
     }
     Ok(out)
@@ -318,9 +345,21 @@ fn contains_tls13(data: &[u8]) -> Result<bool, ClientHelloError> {
     Ok(found)
 }
 
-/// `supported_groups`（`NamedGroup named_group_list<2..2^16-1>`）を検証し、
-/// x25519(0x001d) を含むか判定する。
-fn contains_x25519_group(data: &[u8]) -> Result<bool, ClientHelloError> {
+/// [`parse_supported_groups`] の結果。`membership` は `key_share` の各
+/// エントリが提示されたグループ集合に含まれるかの判定（RFC 8446 §4.2.8）
+/// に使う。
+struct SupportedGroups {
+    has_x25519: bool,
+    membership: SeenU16Set,
+}
+
+/// `supported_groups`（`NamedGroup named_group_list<2..2^16-1>`）を検証する。
+/// x25519(0x001d) を含むかの判定に加え、同一 `NamedGroup` が重複して列挙
+/// されていないかも検査する（RFC 8446 §4.2.7 はクライアントが対応する
+/// グループを列挙するリストであり、同一グループの重複列挙は
+/// `key_share` の重複エントリ検査（[`find_x25519_key_share`]）と同様に
+/// 構造上意味を持たないため `IllegalParameter` とする）。
+fn parse_supported_groups(data: &[u8]) -> Result<SupportedGroups, ClientHelloError> {
     let mut r = Reader::new(data);
     let list = r.vec_u16_len(2, 0xFFFF)?;
     r.expect_end()?;
@@ -330,13 +369,23 @@ fn contains_x25519_group(data: &[u8]) -> Result<bool, ClientHelloError> {
         ));
     }
     let mut lr = Reader::new(list);
-    let mut found = false;
+    let mut membership = SeenU16Set::new();
+    let mut has_x25519 = false;
     while lr.remaining() > 0 {
-        if lr.u16()? == GROUP_X25519 {
-            found = true;
+        let group = lr.u16()?;
+        if membership.mark_and_check_duplicate(group) {
+            return Err(ClientHelloError::IllegalParameter(
+                "supported_groups contains a duplicate NamedGroup",
+            ));
+        }
+        if group == GROUP_X25519 {
+            has_x25519 = true;
         }
     }
-    Ok(found)
+    Ok(SupportedGroups {
+        has_x25519,
+        membership,
+    })
 }
 
 /// `signature_algorithms`（`SignatureScheme
@@ -372,9 +421,16 @@ fn contains_ed25519_sig(data: &[u8]) -> Result<bool, ClientHelloError> {
 /// `ClientHello`）のときは x25519 以外のグループのエントリが 1 件でも
 /// あれば `IllegalParameter`（RFC 8446 §4.1.2: 2 回目の `key_share` は
 /// HRR が要求した唯一のグループのみを含まなければならない）。
+///
+/// `supported_groups`: 同時に受信した `supported_groups` 拡張の会員判定
+/// （[`parse_supported_groups`]）。x25519 に限らずすべてのエントリについて
+/// `group` がここに含まれることを検証する（RFC 8446 §4.2.8「`key_share`
+/// が提示するグループはいずれも `supported_groups` に含まれていなければ
+/// ならない」）。
 fn find_x25519_key_share(
     data: &[u8],
     reject_non_x25519: bool,
+    supported_groups: &SeenU16Set,
 ) -> Result<Option<[u8; 32]>, ClientHelloError> {
     let mut r = Reader::new(data);
     let list = r.vec_u16_len(0, 0xFFFF)?;
@@ -388,6 +444,11 @@ fn find_x25519_key_share(
         if seen_groups.mark_and_check_duplicate(group) {
             return Err(ClientHelloError::IllegalParameter(
                 "key_share contains more than one entry for the same group",
+            ));
+        }
+        if !supported_groups.contains(group) {
+            return Err(ClientHelloError::IllegalParameter(
+                "key_share entry offers a group not present in supported_groups",
             ));
         }
         if group == GROUP_X25519 {
@@ -501,7 +562,87 @@ fn check_hrr_consistency(
              that must remain identical",
         ));
     }
+    check_hrr_psk_identities(first, second)?;
     Ok(())
+}
+
+/// `pre_shared_key`（ClientHello 形。RFC 8446 §4.2.11）の `identities` 部
+/// （`PskIdentity identities<7..2^16-1>`。各エントリは
+/// `opaque identity<1..2^16-1>; uint32 obfuscated_ticket_age;`）だけを構造
+/// 解析し、エントリを順序どおりに返す。`binders` 部は
+/// [`check_hrr_psk_identities`] の比較対象にしない（HRR 後は再計算が許可
+/// されているため）ので、ここでは読み進めず無視する。
+fn parse_psk_identities(data: &[u8]) -> Result<Vec<(Vec<u8>, u32)>, ClientHelloError> {
+    let mut r = Reader::new(data);
+    let identities = r.vec_u16_len(7, 0xFFFF)?;
+    let mut lr = Reader::new(identities);
+    let mut out = Vec::new();
+    while lr.remaining() > 0 {
+        let identity = lr.vec_u16_len(1, 0xFFFF)?;
+        let age = u32::from_be_bytes(lr.array::<4>()?);
+        out.push((identity.to_vec(), age));
+    }
+    Ok(out)
+}
+
+/// `second` が `first` の順序保存部分列であるかを判定する（RFC 8446
+/// §4.1.2「クライアントは（更新された）2 回目の `ClientHello` のパラメータ
+/// と非互換になった PSK identity を削除してよい」の反映）。削除のみが
+/// 許可されるため、`first` に存在しない identity（値・
+/// `obfuscated_ticket_age` の完全一致で比較）の新規追加・並べ替えは
+/// 部分列とはみなさず `false` を返す。
+fn is_ordered_subsequence(first: &[(Vec<u8>, u32)], second: &[(Vec<u8>, u32)]) -> bool {
+    let mut first_iter = first.iter();
+    for entry in second {
+        let matched = first_iter.by_ref().any(|candidate| candidate == entry);
+        if !matched {
+            return false;
+        }
+    }
+    true
+}
+
+/// HRR 後の 2 回目 `ClientHello` の `pre_shared_key` が、RFC 8446 §4.1.2 の
+/// 許可された更新（binder の再計算・非互換 PSK の削除。全削除を含む）の
+/// 範囲に収まっていることを検証する。`pre_shared_key` は
+/// [`HRR_MUTABLE_EXTENSIONS`] により型・値の完全一致比較（本関数の呼び
+/// 出し元）からは除外されているが、「比較除外＝何を送ってもよい」ではない
+/// 非対称な拡張であることは `early_data` と同様（本関数のドキュメント
+/// コメント上部を参照）。
+/// - 1 回目に無かった `pre_shared_key` を 2 回目で新規追加するのは許可
+///   されない（RFC 8446 は「更新」としてのみ言及しており新規提示は
+///   想定していない）
+/// - 両方にある場合、2 回目の `identities` は 1 回目の順序保存部分列
+///   でなければならない（新規 identity の追加・並べ替えは不可）。
+///   `binders` は内容を検証しない（再計算が許可されているため）
+fn check_hrr_psk_identities(
+    first: &handshake::ClientHello,
+    second: &handshake::ClientHello,
+) -> Result<(), ClientHelloError> {
+    fn find_psk(exts: &[handshake::Extension]) -> Option<&[u8]> {
+        exts.iter()
+            .find(|e| e.extension_type == EXT_PRE_SHARED_KEY)
+            .map(|e| e.extension_data.as_slice())
+    }
+    match (find_psk(&first.extensions), find_psk(&second.extensions)) {
+        (None, None) | (Some(_), None) => Ok(()),
+        (None, Some(_)) => Err(ClientHelloError::IllegalParameter(
+            "second ClientHello must not add a pre_shared_key extension \
+             that was absent from the first ClientHello",
+        )),
+        (Some(first_data), Some(second_data)) => {
+            let first_identities = parse_psk_identities(first_data)?;
+            let second_identities = parse_psk_identities(second_data)?;
+            if !is_ordered_subsequence(&first_identities, &second_identities) {
+                return Err(ClientHelloError::IllegalParameter(
+                    "second ClientHello's pre_shared_key identities must be an \
+                     order-preserving subsequence of the first ClientHello's \
+                     (only removing incompatible PSKs is permitted)",
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// `ClientHello` を受理条件（TLS 1.3・`TLS_AES_128_GCM_SHA256`・X25519・
@@ -591,18 +732,18 @@ pub fn negotiate(
             ));
         }
     };
-    let x25519_share = find_x25519_key_share(key_share, after_hrr.is_some())?;
-    let has_x25519_group = contains_x25519_group(supported_groups)?;
+    // supported_groups を先に解析し、その会員判定を key_share の各エントリ
+    // （x25519 に限らずすべて）の検証へ渡す（RFC 8446 §4.2.8）。
+    let groups = parse_supported_groups(supported_groups)?;
+    let x25519_share = find_x25519_key_share(key_share, after_hrr.is_some(), &groups.membership)?;
+    let has_x25519_group = groups.has_x25519;
 
     let client_x25519_public = match x25519_share {
-        Some(key) => {
-            if !has_x25519_group {
-                return Err(ClientHelloError::IllegalParameter(
-                    "key_share offers x25519 but supported_groups does not",
-                ));
-            }
-            key
-        }
+        // x25519 エントリが見つかった時点で、その group（x25519）が
+        // supported_groups に含まれることは find_x25519_key_share の会員
+        // チェックで既に保証されている（`has_x25519_group` との重複検査は
+        // 行わない）。
+        Some(key) => key,
         None => {
             if !has_x25519_group {
                 return Err(ClientHelloError::HandshakeFailure(
@@ -1430,6 +1571,163 @@ mod tests {
         assert!(matches!(
             result,
             Ok(ClientHelloDecision::Accept(_)) | Err(_)
+        ));
+    }
+
+    // ---- codex-review 指摘の回帰テスト（PR #1022） ----
+
+    #[test]
+    fn early_data_without_pre_shared_key_is_illegal_parameter() {
+        // finding #2: early_data は pre_shared_key を伴わずに提示できない
+        // （RFC 8446 §4.2.10）。HRR を経ない通常の 1 回目 ClientHello でも
+        // 検査する。
+        let ch = with_ed25519_sig_alg(push_extension(
+            rfc8448_client_hello(),
+            EXT_EARLY_DATA,
+            vec![],
+        ));
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn supported_groups_duplicate_named_group_is_illegal_parameter() {
+        // finding #3: supported_groups 内の同一 NamedGroup の重複列挙は
+        // key_share と同様に illegal_parameter（RFC 8446 §4.2.7）。
+        let data = {
+            let mut list = Vec::new();
+            list.extend_from_slice(&GROUP_X25519.to_be_bytes());
+            list.extend_from_slice(&GROUP_X25519.to_be_bytes());
+            let mut out = Vec::new();
+            out.extend_from_slice(&(list.len() as u16).to_be_bytes());
+            out.extend_from_slice(&list);
+            out
+        };
+        let ch = with_ed25519_sig_alg(replace_extension_data(
+            rfc8448_client_hello(),
+            EXT_SUPPORTED_GROUPS,
+            data,
+        ));
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    fn key_share_group_absent_from_supported_groups_data() -> Vec<u8> {
+        // group=0x0015（RFC 8448 §3 の supported_groups 既定リストに含まれ
+        // ない値）・key_exchange 長 1 バイトの構造上有効な非 x25519 エントリ。
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&0x0015u16.to_be_bytes());
+        entry.extend_from_slice(&1u16.to_be_bytes());
+        entry.push(0u8);
+        let mut out = Vec::new();
+        out.extend_from_slice(&(entry.len() as u16).to_be_bytes());
+        out.extend_from_slice(&entry);
+        out
+    }
+
+    #[test]
+    fn key_share_entry_group_absent_from_supported_groups_is_illegal_parameter() {
+        // finding #4: x25519 に限らずすべての KeyShareEntry のグループが
+        // supported_groups に含まれていなければならない（RFC 8446
+        // §4.2.8）。x25519 限定だった旧実装の穴。
+        let ch = with_ed25519_sig_alg(replace_extension_data(
+            rfc8448_client_hello(),
+            EXT_KEY_SHARE,
+            key_share_group_absent_from_supported_groups_data(),
+        ));
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    /// `pre_shared_key`（ClientHello 形）の `identities` 部を構築する
+    /// テスト専用ヘルパー。`binders` 部は本実装が解釈しないため省略する
+    /// （構造上は必須だが、比較対象にしないテストの範囲では無視してよい）。
+    fn psk_extension_data(identities: &[(&[u8], u32)]) -> Vec<u8> {
+        let mut ids = Vec::new();
+        for (identity, age) in identities {
+            ids.extend_from_slice(&(identity.len() as u16).to_be_bytes());
+            ids.extend_from_slice(identity);
+            ids.extend_from_slice(&age.to_be_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+        out.extend_from_slice(&ids);
+        out
+    }
+
+    /// ed25519 signature_algorithms・`psk_key_exchange_modes`・末尾
+    /// `pre_shared_key`（指定した identities）を持つ `ClientHello` を組み立
+    /// てる（RFC 8446 §4.2.11 の位置・併存の MUST を満たす）。
+    fn client_hello_with_psk(identities: &[(&[u8], u32)]) -> handshake::ClientHello {
+        // RFC 8448 §3 のベクタは既に psk_key_exchange_modes(002d) を含む
+        // ため、追加で push すると重複拡張エラーになる。ここでは
+        // pre_shared_key を末尾へ追加するだけでよい。
+        push_extension(
+            with_ed25519_sig_alg(rfc8448_client_hello()),
+            EXT_PRE_SHARED_KEY,
+            psk_extension_data(identities),
+        )
+    }
+
+    #[test]
+    fn hrr_second_hello_psk_identity_added_is_illegal_parameter() {
+        // finding #1: HRR 後に許可されるのは非互換 PSK の削除のみであり、
+        // 1 回目に無かった identity を新規追加するのは illegal_parameter。
+        let first = client_hello_with_psk(&[(b"alice", 100)]);
+        let second = client_hello_with_psk(&[(b"alice", 100), (b"bob", 200)]);
+        assert!(matches!(
+            negotiate(&second, Some(&first)),
+            Err(ClientHelloError::IllegalParameter(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_psk_identity_reordered_is_illegal_parameter() {
+        // finding #1: 削除のみが許可され、並べ替えは許可されない
+        // （順序保存部分列でなければならない）。
+        let first = client_hello_with_psk(&[(b"alice", 100), (b"bob", 200)]);
+        let second = client_hello_with_psk(&[(b"bob", 200), (b"alice", 100)]);
+        assert!(matches!(
+            negotiate(&second, Some(&first)),
+            Err(ClientHelloError::IllegalParameter(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_psk_identity_removed_is_accepted() {
+        // finding #1: 非互換になった PSK identity の削除（部分列を維持した
+        // まま先頭以外を削る）は RFC 8446 §4.1.2 が明示的に許可する差分。
+        let first = client_hello_with_psk(&[(b"alice", 100), (b"bob", 200)]);
+        let second = client_hello_with_psk(&[(b"bob", 200)]);
+        assert!(matches!(
+            negotiate(&second, Some(&first)),
+            Ok(ClientHelloDecision::Accept(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_removing_pre_shared_key_entirely_is_accepted() {
+        // pre_shared_key の全削除は明示的に許可される（binders 再計算・
+        // 非互換 PSK 削除と同じ「更新」の一形態）。
+        let first = client_hello_with_psk(&[(b"alice", 100)]);
+        let second = remove_extension(first.clone(), EXT_PRE_SHARED_KEY);
+        assert!(matches!(
+            negotiate(&second, Some(&first)),
+            Ok(ClientHelloDecision::Accept(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_adding_pre_shared_key_absent_from_first_is_illegal_parameter() {
+        // finding #1 関連: 1 回目に無かった pre_shared_key を 2 回目で
+        // 新規追加するのは「更新」ではなく新規提示であり許可されない。
+        // RFC 8448 §3 のベクタは既に psk_key_exchange_modes(002d) を含む。
+        let first = with_ed25519_sig_alg(rfc8448_client_hello());
+        let second = push_extension(
+            first.clone(),
+            EXT_PRE_SHARED_KEY,
+            psk_extension_data(&[(b"alice", 100)]),
+        );
+        assert!(matches!(
+            negotiate(&second, Some(&first)),
+            Err(ClientHelloError::IllegalParameter(_))
         ));
     }
 }
