@@ -2511,4 +2511,153 @@ mod tests {
             vec![Value::Bytes(Vec::new())]
         );
     }
+
+    // --- merge_encode_scalar_columns（Issue #996: 述語つき UPDATE の適用段を
+    // 単一行 UPDATE と共有する経路へ統一する前提のバイト同一性検証） -------------
+
+    /// `decode_scalar_columns`（全列複製）→ スロット上書き → `encode_scalar_columns`
+    /// という旧・述語つき UPDATE 実装の経路を再現する参照オラクル。
+    fn apply_overrides_via_decode_then_encode(
+        schema: &TableSchema,
+        buf: &[u8],
+        overrides: &[(usize, &Value)],
+    ) -> Vec<u8> {
+        let mut merged_values = decode_scalar_columns(schema, buf).expect("decode scalar");
+        for (idx, value) in overrides {
+            let slot = merged_values
+                .get_mut(*idx)
+                .expect("override index must be in range");
+            *slot = (*value).clone();
+        }
+        encode_scalar_columns(schema, &merged_values).expect("encode scalar")
+    }
+
+    /// `scan_scalar_columns`（借用のみ）→ `merge_encode_scalar_columns` という
+    /// 単一行 UPDATE・統一後の述語つき UPDATE が共有する経路。
+    fn apply_overrides_via_scan_then_merge(
+        schema: &TableSchema,
+        buf: &[u8],
+        overrides: &[(usize, &Value)],
+    ) -> Vec<u8> {
+        let scanned = scan_scalar_columns(schema, buf).expect("scan scalar");
+        merge_encode_scalar_columns(schema, &scanned, overrides).expect("merge encode scalar")
+    }
+
+    fn text_only_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("tag", ColumnType::Text, true),
+            ],
+        )
+    }
+
+    /// VECTOR 列が先頭でなく中間 index にあるスキーマ（`text_vector_schema` は
+    /// embedding が index 0 に固定されているため、途中の index にある場合も
+    /// 同じ経路を通ることを別途確認する）。
+    fn text_vector_text_schema_vector_in_middle() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("tag", ColumnType::Text, true),
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        )
+    }
+
+    /// [`merge_encode_scalar_columns`]（借用版 `scan_scalar_columns` 経由）と
+    /// [`decode_scalar_columns`]＋`encode_scalar_columns`（旧・述語つき UPDATE
+    /// 実装が使っていた経路）が、同じ overrides に対して常にバイト同一の出力を
+    /// 生成することを固定する（Issue #996）。`crates/engine/src/tenant.rs` の
+    /// 述語つき UPDATE 適用段（`update_rows_where_unchecked`）を本関数へ統一する
+    /// 前提となる等価性テスト。
+    #[test]
+    fn merge_encode_scalar_columns_matches_decode_then_encode_scalar_columns() {
+        let schema = text_vector_schema();
+
+        // nullable 列（tag）が NULL のまま（SET なし）。
+        let buf = encode_scalar_columns(
+            &schema,
+            &[
+                Value::Vector(vec![1.0, 2.0, 3.0]),
+                Value::Text("body-text".to_string()),
+                Value::Null,
+            ],
+        )
+        .expect("encode scalar");
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&schema, &buf, &[]),
+            apply_overrides_via_decode_then_encode(&schema, &buf, &[])
+        );
+
+        // 既存値 NULL → SET text（マルチバイト UTF-8 を含む）。
+        let set_text = Value::Text("こんにちは".to_string());
+        let overrides = [(2usize, &set_text)];
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&schema, &buf, &overrides),
+            apply_overrides_via_decode_then_encode(&schema, &buf, &overrides)
+        );
+
+        // 既存値 text → SET NULL。
+        let buf_with_tag = encode_scalar_columns(
+            &schema,
+            &[
+                Value::Vector(vec![1.0, 2.0, 3.0]),
+                Value::Text("body-text".to_string()),
+                Value::Text("existing-tag".to_string()),
+            ],
+        )
+        .expect("encode scalar");
+        let set_null = Value::Null;
+        let overrides = [(2usize, &set_null)];
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&schema, &buf_with_tag, &overrides),
+            apply_overrides_via_decode_then_encode(&schema, &buf_with_tag, &overrides)
+        );
+
+        // 空文字列も含む複数 TEXT 列の一部だけを SET（non-nullable な body は
+        // SET しない＝借用のまま連結される経路を通す）。
+        let set_empty = Value::Text(String::new());
+        let overrides = [(2usize, &set_empty)];
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&schema, &buf_with_tag, &overrides),
+            apply_overrides_via_decode_then_encode(&schema, &buf_with_tag, &overrides)
+        );
+
+        // VECTOR 列を持たないスキーマ（`overrides` が空でも通ることを含む）。
+        let text_only = text_only_schema();
+        let buf_text_only =
+            encode_scalar_columns(&text_only, &[Value::Text("body".to_string()), Value::Null])
+                .expect("encode scalar");
+        let set_tag = Value::Text("filled".to_string());
+        let overrides = [(1usize, &set_tag)];
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&text_only, &buf_text_only, &overrides),
+            apply_overrides_via_decode_then_encode(&text_only, &buf_text_only, &overrides)
+        );
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&text_only, &buf_text_only, &[]),
+            apply_overrides_via_decode_then_encode(&text_only, &buf_text_only, &[])
+        );
+
+        // VECTOR 列が途中の index にあるスキーマ。
+        let mid_vector = text_vector_text_schema_vector_in_middle();
+        let buf_mid_vector = encode_scalar_columns(
+            &mid_vector,
+            &[
+                Value::Text("existing-tag".to_string()),
+                Value::Vector(vec![4.0, 5.0]),
+                Value::Text("body-text".to_string()),
+            ],
+        )
+        .expect("encode scalar");
+        let set_tag2 = Value::Null;
+        let overrides = [(0usize, &set_tag2)];
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&mid_vector, &buf_mid_vector, &overrides),
+            apply_overrides_via_decode_then_encode(&mid_vector, &buf_mid_vector, &overrides)
+        );
+    }
 }
