@@ -17,8 +17,11 @@ HelloRetryRequest（HRR）の組み立てを担う純粋関数層
 - 本 Issue: **状態を持たない**判定関数（`negotiate`）と HRR の構築
   （`build_hello_retry_request`）のみ
 - #965（状態機械・alert 送出）: 「HRR を送ったか」の状態保持と alert の
-  実送出・切断。「HRR は 1 回のみ」の判定は本モジュールが単一情報源として
-  持ち、`after_hrr: bool` を引数で受け取るだけで #965 側は再実装しない
+  実送出・切断。本モジュールは 1 回目の `ClientHello`（`Option`。HRR
+  未送出なら `None`）を引数で受け取るだけで状態は持たない。「HRR は
+  1 回のみ」の判定・2 回目 `ClientHello` が 1 回目と（許可された差分を
+  除き）同一であることの検証（RFC 8446 §4.1.2）はいずれも本モジュールが
+  単一情報源として持ち、#965 側は再実装しない
 - #964（transcript hash）: HRR 時の `message_hash` 置換
 - #955（X25519）: 共有秘密の計算・全ゼロ検出。本モジュールは client
   公開鍵 32 バイトを取り出して渡すだけ
@@ -37,30 +40,60 @@ HelloRetryRequest（HRR）の組み立てを担う純粋関数層
 1. 拡張ブロック全体の走査（重複拡張の検出・`pre_shared_key` の位置検査・
    対象 5 拡張の構造解析。違反はそれぞれ `illegal_parameter`／
    `missing_extension`／`decode_error`）
-2. バージョン（`supported_versions` に TLS 1.3 が無ければ
+2. `legacy_version`（0x0303 固定でなければ `protocol_version`。RFC 8446
+   §4.1.2 の MUST。実際の TLS 1.0〜1.2 クライアントも legacy_version は
+   0x0303 を送るため、旧バージョンクライアントを誤って別のアラートへ
+   分類することはない）
+3. バージョン（`supported_versions` に TLS 1.3 が無ければ
    `protocol_version`。暗号スイート・署名より先に判定し、TLS 1.2 以前の
    クライアントに `handshake_failure` を返さないため）
-3. compression（`legacy_compression_methods != [0x00]` は
+4. compression（`legacy_compression_methods != [0x00]` は
    `illegal_parameter`）
-4. 暗号スイート（`TLS_AES_128_GCM_SHA256` が無ければ `handshake_failure`）
-5. 署名アルゴリズム（`signature_algorithms` 欠落は `missing_extension`、
+5. 暗号スイート（`TLS_AES_128_GCM_SHA256` が無ければ `handshake_failure`）
+6. 署名アルゴリズム（`signature_algorithms` 欠落は `missing_extension`、
    ed25519 非提示は `handshake_failure`）
-6. グループ／鍵共有（`supported_groups`・`key_share` の片方欠落は
-   `missing_extension`、x25519 が無く `supported_groups` にはある場合は
-   `after_hrr` に応じて HRR 要求／`handshake_failure` を切り替える）
+7. `server_name` の構造検証（HRR で戻る経路でも必ず実行する。Accept
+   到達後まで遅延させると、不正な `server_name` を含む `ClientHello` に
+   対して誤って `RetryRequestX25519` を返しうるため）
+8. グループ／鍵共有（`supported_groups`・`key_share` の片方欠落は
+   `missing_extension`）
+9. HRR 後の 2 回目 `ClientHello` の同一性検証（`after_hrr` が `Some` の
+   ときのみ。[`check_hrr_consistency`](../../crates/wire-server/src/tls/client_hello.rs)。
+   違反は `illegal_parameter`）
+10. x25519 が無く `supported_groups` にはある場合は `after_hrr` に応じて
+    HRR 要求／`handshake_failure` を切り替える
 
 ## 重複拡張検出のデータ構造
 
 `extension_type`（u16）ごとに 1 bit を持つ `[u64; 1024]`（65536 bit・
-8 KiB）のビットマップで重複を検出する。拡張数が多くても O(n) で判定でき、
-未知の type を大量に並べた入力に対する O(n²) 走査（DoS 耐性）を避ける。
+8 KiB）のビットマップ（`SeenU16Set`）で重複を検出する。拡張数が多くても
+O(n) で判定でき、未知の type を大量に並べた入力に対する O(n²) 走査
+（DoS 耐性）を避ける。`key_share` 内の `NamedGroup` の重複（x25519 に
+限らず全グループ対象）・`server_name` 内の `name_type` の重複
+（`host_name` に限らず全 name_type 対象）も同じデータ構造で検出する。
+
+## HelloRetryRequest 後の 2 回目 ClientHello の検証
+
+`negotiate` は `after_hrr: Option<&handshake::ClientHello>` で 1 回目の
+`ClientHello` を受け取る（`None` は 1 回目・`Some` は 2 回目。呼び出し元
+の #965 が「HRR を送ったか」の状態と共に 1 回目を保持し、2 回目の呼び出し
+へそのまま渡す。本モジュール自体は状態を持たない）。`Some` のときは
+RFC 8446 §4.1.2 に従い次を検証する:
+
+- `legacy_version`・`legacy_session_id`・`cipher_suites`・
+  `legacy_compression_methods` が 1 回目と完全一致
+- `key_share`・`early_data`・`pre_shared_key`・`psk_key_exchange_modes`・
+  `padding` を除く拡張が、型・値ともに 1 回目と完全一致
+- `key_share` は HRR が要求したグループ（x25519）のみを含み、他のグループ
+  のエントリが 1 件でもあれば `illegal_parameter`
+
+いずれの違反も `illegal_parameter` として拒否する。
 
 ## 無視する拡張・受理しないもの
 
 - 未知の拡張（GREASE 値・`early_data` を含む）は中身を見ずに無視する
 - PSK／0-RTT は受理しない（`pre_shared_key`・`psk_key_exchange_modes` の
   構造制約のみ検査し、値は解釈しない）
-- `legacy_version` は RFC 8446 §4.2.1 に従い交渉に使わず検査もしない
 
 ## HelloRetryRequest の組み立て
 

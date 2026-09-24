@@ -11,9 +11,13 @@
 //! 本モジュールは**状態を持たない**判定関数と HelloRetryRequest（HRR）の
 //! 構築のみを担う。
 //! - #965（状態機械・alert 送出）: 「HRR を送ったか」の状態保持と alert の
-//!   実送出・切断を担う。本モジュールは `after_hrr: bool` を引数で受け取る
-//!   だけで状態は一切持たない。「HRR は 1 回のみ」の判定ロジックは
-//!   本モジュールが単一情報源として持ち、#965 側で再実装しない
+//!   実送出・切断を担う。本モジュールは 1 回目の `ClientHello`（`Option`。
+//!   HRR 未送出なら `None`）を引数で受け取るだけで状態は一切持たない
+//!   （#965 が「HRR を送ったか」と共に 1 回目の `ClientHello` を保持し、
+//!   2 回目の呼び出しへそのまま渡す）。「HRR は 1 回のみ」の判定・2 回目
+//!   `ClientHello` が 1 回目と（許可された差分を除き）同一であることの
+//!   検証（RFC 8446 §4.1.2）はいずれも本モジュールが単一情報源として持ち、
+//!   #965 側で再実装しない
 //! - #964（transcript hash）: HRR 時の `message_hash` 置換を担う。本モジュール
 //!   は関与しない
 //! - #955（X25519）: 共有秘密の計算・全ゼロ検出を担う。本モジュールは
@@ -52,10 +56,24 @@ pub const SIG_ED25519: u16 = 0x0807;
 const EXT_SERVER_NAME: u16 = 0;
 const EXT_SUPPORTED_GROUPS: u16 = 10;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
+const EXT_PADDING: u16 = 21;
+const EXT_EARLY_DATA: u16 = 42;
 const EXT_PRE_SHARED_KEY: u16 = 41;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
 const EXT_KEY_SHARE: u16 = 51;
+
+/// HelloRetryRequest 後の 2 回目 `ClientHello` で追加・削除・変更が
+/// 許可される拡張（RFC 8446 §4.1.2）。これら以外の拡張は 1 回目の
+/// `ClientHello` と型・値ともに同一でなければならない
+/// （[`check_hrr_consistency`]）。
+const HRR_MUTABLE_EXTENSIONS: [u16; 5] = [
+    EXT_KEY_SHARE,
+    EXT_PADDING,
+    EXT_EARLY_DATA,
+    EXT_PRE_SHARED_KEY,
+    EXT_PSK_KEY_EXCHANGE_MODES,
+];
 
 /// HelloRetryRequest の `random`（RFC 8446 §4.1.3）。
 /// SHA-256("HelloRetryRequest") の固定値。
@@ -180,14 +198,17 @@ struct ParsedExtensions<'a> {
     has_psk_key_exchange_modes: bool,
 }
 
-/// 拡張の重複検出に使うビットマップ（65536 bit・8 KiB）。`extension_type`
-/// は u16 のため、拡張数が多くても O(n) で判定できる（O(n^2) の総当たり
-/// 走査を避ける設計。DoS 耐性の観点）。
-struct SeenExtensionTypes {
+/// u16 値集合の重複検出に使うビットマップ（65536 bit・8 KiB）。
+/// `extension_type`（拡張の重複検出）・`NamedGroup`（`key_share` 内の
+/// グループ重複検出）・`name_type`（`server_name` 内の重複検出。u8 を
+/// そのまま u16 として渡す）のいずれも同じ表現で扱える。値の種類数が
+/// 多くても O(n) で判定できる（O(n^2) の総当たり走査を避ける設計。
+/// DoS 耐性の観点）。
+struct SeenU16Set {
     bits: [u64; 1024],
 }
 
-impl SeenExtensionTypes {
+impl SeenU16Set {
     fn new() -> Self {
         Self { bits: [0u64; 1024] }
     }
@@ -212,7 +233,7 @@ impl SeenExtensionTypes {
 fn parse_extensions(
     extensions: &[handshake::Extension],
 ) -> Result<ParsedExtensions<'_>, ClientHelloError> {
-    let mut seen = SeenExtensionTypes::new();
+    let mut seen = SeenU16Set::new();
     let mut out = ParsedExtensions {
         supported_versions: None,
         key_share: None,
@@ -327,28 +348,43 @@ fn contains_ed25519_sig(data: &[u8]) -> Result<bool, ClientHelloError> {
 /// `key_share`（ClientHello 形。`KeyShareEntry client_shares<0..2^16-1>`、
 /// 各エントリは `NamedGroup group; opaque key_exchange<1..2^16-1>`）を
 /// 検証し、x25519 エントリの `key_exchange` を返す（無ければ `None`）。
-/// x25519 エントリが 2 件以上あれば `IllegalParameter`（RFC 8446 §4.2.8）。
-fn find_x25519_key_share(data: &[u8]) -> Result<Option<[u8; 32]>, ClientHelloError> {
+/// 同一 `NamedGroup`（x25519 に限らず）のエントリが 2 件以上あれば
+/// `IllegalParameter`（RFC 8446 §4.2.8「クライアントは同一グループに
+/// つき高々 1 個の `KeyShareEntry` を送ってよい」）。
+///
+/// `reject_non_x25519`: `true`（HelloRetryRequest 後の 2 回目
+/// `ClientHello`）のときは x25519 以外のグループのエントリが 1 件でも
+/// あれば `IllegalParameter`（RFC 8446 §4.1.2: 2 回目の `key_share` は
+/// HRR が要求した唯一のグループのみを含まなければならない）。
+fn find_x25519_key_share(
+    data: &[u8],
+    reject_non_x25519: bool,
+) -> Result<Option<[u8; 32]>, ClientHelloError> {
     let mut r = Reader::new(data);
     let list = r.vec_u16_len(0, 0xFFFF)?;
     r.expect_end()?;
     let mut lr = Reader::new(list);
+    let mut seen_groups = SeenU16Set::new();
     let mut found: Option<[u8; 32]> = None;
     while lr.remaining() > 0 {
         let group = lr.u16()?;
         let key_exchange = lr.vec_u16_len(1, 0xFFFF)?;
+        if seen_groups.mark_and_check_duplicate(group) {
+            return Err(ClientHelloError::IllegalParameter(
+                "key_share contains more than one entry for the same group",
+            ));
+        }
         if group == GROUP_X25519 {
-            if found.is_some() {
-                return Err(ClientHelloError::IllegalParameter(
-                    "key_share contains more than one x25519 entry",
-                ));
-            }
             let arr: [u8; 32] = key_exchange.try_into().map_err(|_| {
                 ClientHelloError::IllegalParameter(
                     "key_share x25519 entry key_exchange must be 32 bytes",
                 )
             })?;
             found = Some(arr);
+        } else if reject_non_x25519 {
+            return Err(ClientHelloError::IllegalParameter(
+                "key_share after HelloRetryRequest must only offer the requested group",
+            ));
         }
     }
     Ok(found)
@@ -356,8 +392,9 @@ fn find_x25519_key_share(data: &[u8]) -> Result<Option<[u8; 32]>, ClientHelloErr
 
 /// `server_name`（RFC 6066 §3. `ServerName server_name_list<1..2^16-1>`）を
 /// 検証し、`host_name`（name_type=0）を返す（無ければ `None`）。
-/// `host_name` が重複していれば `IllegalParameter`（RFC 6066「同一
-/// name_type は 1 つまで」）。未知の name_type は不透明データとして
+/// 同一 `name_type`（`host_name` に限らずいずれの型でも）が重複していれば
+/// `IllegalParameter`（RFC 6066 §3「同一 name_type は 1 つまで」は
+/// `host_name` 限定の制約ではない）。未知の name_type は不透明データとして
 /// 読み飛ばす。
 fn parse_server_name(data: &[u8]) -> Result<Option<Vec<u8>>, ClientHelloError> {
     let mut r = Reader::new(data);
@@ -365,15 +402,16 @@ fn parse_server_name(data: &[u8]) -> Result<Option<Vec<u8>>, ClientHelloError> {
     r.expect_end()?;
     let mut lr = Reader::new(list);
     let mut host_name: Option<Vec<u8>> = None;
+    let mut seen_name_types = SeenU16Set::new();
     while lr.remaining() > 0 {
         let name_type = lr.u8()?;
         let name = lr.vec_u16_len(1, 0xFFFF)?;
+        if seen_name_types.mark_and_check_duplicate(u16::from(name_type)) {
+            return Err(ClientHelloError::IllegalParameter(
+                "server_name contains more than one entry for the same name_type",
+            ));
+        }
         if name_type == 0 {
-            if host_name.is_some() {
-                return Err(ClientHelloError::IllegalParameter(
-                    "server_name contains more than one host_name entry",
-                ));
-            }
             host_name = Some(name.to_vec());
         }
     }
@@ -392,21 +430,71 @@ fn check_compression(methods: &[u8]) -> Result<(), ClientHelloError> {
     }
 }
 
+/// HelloRetryRequest 後の 2 回目 `ClientHello` が、1 回目の `ClientHello`
+/// と（許可された差分を除き）同一であることを検証する（RFC 8446
+/// §4.1.2「クライアントは HelloRetryRequest への応答として、以下を除いて
+/// 変更を加えていない `ClientHello` を送らなければならない」）。
+/// [`HRR_MUTABLE_EXTENSIONS`] に列挙した拡張（`key_share`・`early_data`・
+/// `pre_shared_key`・`psk_key_exchange_modes`・`padding`）は追加・削除・
+/// 変更してよく、それ以外の拡張は型・値ともに完全一致でなければ
+/// `IllegalParameter`。`legacy_version`・`legacy_session_id`・
+/// `cipher_suites`・`legacy_compression_methods` も同一でなければならない。
+fn check_hrr_consistency(
+    first: &handshake::ClientHello,
+    second: &handshake::ClientHello,
+) -> Result<(), ClientHelloError> {
+    if first.legacy_version != second.legacy_version
+        || first.legacy_session_id != second.legacy_session_id
+        || first.cipher_suites != second.cipher_suites
+        || first.legacy_compression_methods != second.legacy_compression_methods
+    {
+        return Err(ClientHelloError::IllegalParameter(
+            "second ClientHello after HelloRetryRequest must repeat the first \
+             ClientHello's version/session id/cipher suites/compression",
+        ));
+    }
+    fn immutable(exts: &[handshake::Extension]) -> Vec<&handshake::Extension> {
+        exts.iter()
+            .filter(|e| !HRR_MUTABLE_EXTENSIONS.contains(&e.extension_type))
+            .collect()
+    }
+    let a = immutable(&first.extensions);
+    let b = immutable(&second.extensions);
+    if a.len() != b.len() || a.iter().zip(b.iter()).any(|(x, y)| *x != *y) {
+        return Err(ClientHelloError::IllegalParameter(
+            "second ClientHello after HelloRetryRequest changed an extension \
+             that must remain identical",
+        ));
+    }
+    Ok(())
+}
+
 /// `ClientHello` を受理条件（TLS 1.3・`TLS_AES_128_GCM_SHA256`・X25519・
 /// Ed25519 のみ）で判定する。判定順序はこの関数が単一情報源であり、
 /// `docs/design/tls-client-hello.md` の記述もこれに従う。
 ///
-/// `after_hrr`: 直前にこの接続へ HRR を送っていれば `true`。`true` の
-/// ときは `RetryRequestX25519` を決して返さない（HRR は 1 回のみという
-/// 契約を本関数が保証する。#965 は本関数の戻り値をそのまま使うだけで
-/// この判定を再実装しない）。
+/// `after_hrr`: 直前にこの接続へ HRR を送っていれば、その原因となった
+/// 1 回目の `ClientHello` を `Some` で渡す（未送出なら `None`）。`Some`
+/// のときは [`check_hrr_consistency`] による同一性検証を行った上で
+/// `RetryRequestX25519` を決して返さない（HRR は 1 回のみという契約を
+/// 本関数が保証する。#965 は 1 回目の `ClientHello` を保持して本関数の
+/// 戻り値をそのまま使うだけで、この判定を再実装しない）。
 pub fn negotiate(
     ch: &handshake::ClientHello,
-    after_hrr: bool,
+    after_hrr: Option<&handshake::ClientHello>,
 ) -> Result<ClientHelloDecision, ClientHelloError> {
     let ext = parse_extensions(&ch.extensions)?;
 
-    // 1. バージョン（暗号スイート・署名より先に判定する。TLS 1.2 以前の
+    // 1. legacy_version（RFC 8446 §4.1.2 の MUST。TLS 1.3 クライアントは
+    //    0x0303 固定で送らなければならない）。実際の TLS 1.0〜1.2
+    //    クライアントも legacy_version=0x0303 を送るため、この判定だけで
+    //    旧バージョンクライアントを protocol_version 以外へ誤分類する
+    //    ことはない（旧バージョン検出は次の supported_versions 判定が担う）。
+    if ch.legacy_version != 0x0303 {
+        return Err(ClientHelloError::UnsupportedVersion);
+    }
+
+    // 2. バージョン（暗号スイート・署名より先に判定する。TLS 1.2 以前の
     //    クライアントには handshake_failure ではなく protocol_version を
     //    返すため）。
     let has_tls13 = match ext.supported_versions {
@@ -417,17 +505,17 @@ pub fn negotiate(
         return Err(ClientHelloError::UnsupportedVersion);
     }
 
-    // 2. compression。
+    // 3. compression。
     check_compression(&ch.legacy_compression_methods)?;
 
-    // 3. 暗号スイート。
+    // 4. 暗号スイート。
     if !ch.cipher_suites.contains(&TLS_AES_128_GCM_SHA256) {
         return Err(ClientHelloError::HandshakeFailure(
             "cipher_suites does not offer TLS_AES_128_GCM_SHA256",
         ));
     }
 
-    // 4. 署名アルゴリズム。
+    // 5. 署名アルゴリズム。
     let signature_algorithms =
         ext.signature_algorithms
             .ok_or(ClientHelloError::MissingExtension(
@@ -439,7 +527,15 @@ pub fn negotiate(
         ));
     }
 
-    // 5. グループ／鍵共有。
+    // 6. server_name の構造検証。HRR で戻る（Accept に到達しない）経路
+    //    でも必ず実行する（不正な server_name を含む ClientHello に対して
+    //    RetryRequestX25519 を返してしまわないため）。
+    let server_name = match ext.server_name {
+        Some(data) => parse_server_name(data)?,
+        None => None,
+    };
+
+    // 7. グループ／鍵共有。
     let (supported_groups, key_share) = match (ext.supported_groups, ext.key_share) {
         (Some(sg), Some(ks)) => (sg, ks),
         _ => {
@@ -448,8 +544,14 @@ pub fn negotiate(
             ));
         }
     };
-    let x25519_share = find_x25519_key_share(key_share)?;
+    let x25519_share = find_x25519_key_share(key_share, after_hrr.is_some())?;
     let has_x25519_group = contains_x25519_group(supported_groups)?;
+
+    // 8. HRR 後の 2 回目 ClientHello は、鍵交換に関わる差分を除き 1 回目と
+    //    同一でなければならない（RFC 8446 §4.1.2）。
+    if let Some(first) = after_hrr {
+        check_hrr_consistency(first, ch)?;
+    }
 
     let client_x25519_public = match x25519_share {
         Some(key) => {
@@ -466,18 +568,13 @@ pub fn negotiate(
                     "no common key exchange group (x25519 not offered)",
                 ));
             }
-            if after_hrr {
+            if after_hrr.is_some() {
                 return Err(ClientHelloError::HandshakeFailure(
                     "client did not include x25519 key_share after HelloRetryRequest",
                 ));
             }
             return Ok(ClientHelloDecision::RetryRequestX25519);
         }
-    };
-
-    let server_name = match ext.server_name {
-        Some(data) => parse_server_name(data)?,
-        None => None,
     };
 
     Ok(ClientHelloDecision::Accept(NegotiatedClientHello {
@@ -635,7 +732,7 @@ mod tests {
     #[test]
     fn accepts_rfc8448_derived_client_hello() {
         let ch = with_ed25519_sig_alg(rfc8448_client_hello());
-        let decision = negotiate(&ch, false).expect("must accept");
+        let decision = negotiate(&ch, None).expect("must accept");
         let ClientHelloDecision::Accept(negotiated) = decision else {
             panic!("must be Accept");
         };
@@ -656,7 +753,7 @@ mod tests {
         let ch = with_ed25519_sig_alg(rfc8448_client_hello());
         assert!(ch.extensions.iter().any(|e| e.extension_type == 0xff01));
         assert!(matches!(
-            negotiate(&ch, false),
+            negotiate(&ch, None),
             Ok(ClientHelloDecision::Accept(_))
         ));
     }
@@ -669,19 +766,19 @@ mod tests {
             empty_key_share_data(),
         ));
         assert_eq!(
-            negotiate(&ch, false),
+            negotiate(&ch, None),
             Ok(ClientHelloDecision::RetryRequestX25519)
         );
     }
 
     #[test]
     fn empty_key_share_after_hrr_is_handshake_failure() {
-        let ch = with_ed25519_sig_alg(replace_extension_data(
-            rfc8448_client_hello(),
-            EXT_KEY_SHARE,
-            empty_key_share_data(),
-        ));
-        let result = negotiate(&ch, true);
+        // 1 回目の ClientHello（`first`）は key_share 以外が 2 回目と一致
+        // していなければならない（RFC 8446 §4.1.2。key_share 自体は比較
+        // 対象外のため、1 回目の内容は無関係）。
+        let first = with_ed25519_sig_alg(rfc8448_client_hello());
+        let ch = replace_extension_data(first.clone(), EXT_KEY_SHARE, empty_key_share_data());
+        let result = negotiate(&ch, Some(&first));
         assert!(matches!(result, Err(ClientHelloError::HandshakeFailure(_))));
         assert_eq!(
             result.unwrap_err().alert_description(),
@@ -697,38 +794,155 @@ mod tests {
             non_x25519_key_share_data(),
         ));
         assert_eq!(
-            negotiate(&ch, false),
+            negotiate(&ch, None),
             Ok(ClientHelloDecision::RetryRequestX25519)
         );
     }
 
     #[test]
-    fn non_x25519_key_share_after_hrr_is_handshake_failure() {
-        let ch = with_ed25519_sig_alg(replace_extension_data(
-            rfc8448_client_hello(),
-            EXT_KEY_SHARE,
-            non_x25519_key_share_data(),
-        ));
+    fn non_x25519_key_share_after_hrr_is_illegal_parameter() {
+        // HRR 後の key_share は要求した唯一のグループ（x25519）のみを
+        // 含まなければならない（RFC 8446 §4.1.2）。secp256r1 のみを
+        // 提示するのは illegal_parameter（x25519 が無いだけの
+        // handshake_failure ではない）。
+        let first = with_ed25519_sig_alg(rfc8448_client_hello());
+        let ch = replace_extension_data(first.clone(), EXT_KEY_SHARE, non_x25519_key_share_data());
         assert!(matches!(
-            negotiate(&ch, true),
-            Err(ClientHelloError::HandshakeFailure(_))
+            negotiate(&ch, Some(&first)),
+            Err(ClientHelloError::IllegalParameter(_))
         ));
     }
 
     #[test]
     fn after_hrr_never_returns_retry_request() {
-        // after_hrr=true のとき、いかなる条件でも RetryRequestX25519 を
+        // after_hrr=Some のとき、いかなる条件でも RetryRequestX25519 を
         // 返さない契約を固定する。
-        let ch = with_ed25519_sig_alg(replace_extension_data(
-            rfc8448_client_hello(),
-            EXT_KEY_SHARE,
-            empty_key_share_data(),
-        ));
-        let result = negotiate(&ch, true);
+        let first = with_ed25519_sig_alg(rfc8448_client_hello());
+        let ch = replace_extension_data(first.clone(), EXT_KEY_SHARE, empty_key_share_data());
+        let result = negotiate(&ch, Some(&first));
         assert!(!matches!(
             result,
             Ok(ClientHelloDecision::RetryRequestX25519)
         ));
+    }
+
+    #[test]
+    fn legacy_version_mismatch_is_protocol_version() {
+        // RFC 8446 §4.1.2: legacy_version は 0x0303 固定でなければ
+        // ならない。supported_versions に TLS 1.3 があっても拒否する。
+        let mut ch = with_ed25519_sig_alg(rfc8448_client_hello());
+        ch.legacy_version = 0x0301;
+        assert_rejected(&ch, AlertDescription::ProtocolVersion);
+    }
+
+    #[test]
+    fn hrr_second_hello_changing_cipher_suites_is_illegal_parameter() {
+        // 2 回目の ClientHello は key_share 等の許可された差分を除き
+        // 1 回目と同一でなければならない（RFC 8446 §4.1.2）。
+        let first = with_ed25519_sig_alg(rfc8448_client_hello());
+        let mut ch = first.clone();
+        ch.cipher_suites = vec![0x1302, TLS_AES_128_GCM_SHA256];
+        assert!(matches!(
+            negotiate(&ch, Some(&first)),
+            Err(ClientHelloError::IllegalParameter(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_adding_unrelated_extension_is_illegal_parameter() {
+        // key_share／early_data／pre_shared_key／psk_key_exchange_modes／
+        // padding 以外の拡張を 2 回目で追加するのは許されない。
+        let first = with_ed25519_sig_alg(rfc8448_client_hello());
+        let ch = push_extension(first.clone(), 0xfeed, vec![0x00]);
+        assert!(matches!(
+            negotiate(&ch, Some(&first)),
+            Err(ClientHelloError::IllegalParameter(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_offering_extra_group_alongside_x25519_is_illegal_parameter() {
+        // x25519 に加えて別グループも提示する 2 回目の key_share は
+        // 「要求した唯一のグループのみ」の制約に反する（finding #2 後半）。
+        let first = with_ed25519_sig_alg(rfc8448_client_hello());
+        let mut entry_x25519 = Vec::new();
+        entry_x25519.extend_from_slice(&GROUP_X25519.to_be_bytes());
+        entry_x25519.extend_from_slice(&32u16.to_be_bytes());
+        entry_x25519.extend_from_slice(&[0u8; 32]);
+        let mut entry_other = Vec::new();
+        entry_other.extend_from_slice(&0x0017u16.to_be_bytes());
+        entry_other.extend_from_slice(&65u16.to_be_bytes());
+        entry_other.extend_from_slice(&[0u8; 65]);
+        let mut data = Vec::new();
+        data.extend_from_slice(&((entry_x25519.len() + entry_other.len()) as u16).to_be_bytes());
+        data.extend_from_slice(&entry_x25519);
+        data.extend_from_slice(&entry_other);
+        let ch = replace_extension_data(first.clone(), EXT_KEY_SHARE, data);
+        assert!(matches!(
+            negotiate(&ch, Some(&first)),
+            Err(ClientHelloError::IllegalParameter(_))
+        ));
+    }
+
+    #[test]
+    fn key_share_two_non_x25519_entries_same_group_is_illegal_parameter() {
+        // x25519 以外のグループでも同一グループの重複エントリは
+        // illegal_parameter（finding #3。x25519 限定だった旧実装の穴）。
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&0x0017u16.to_be_bytes());
+        entry.extend_from_slice(&65u16.to_be_bytes());
+        entry.extend_from_slice(&[0u8; 65]);
+        let mut data = Vec::new();
+        data.extend_from_slice(&((entry.len() * 2) as u16).to_be_bytes());
+        data.extend_from_slice(&entry);
+        data.extend_from_slice(&entry);
+        let ch = with_ed25519_sig_alg(replace_extension_data(
+            rfc8448_client_hello(),
+            EXT_KEY_SHARE,
+            data,
+        ));
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn server_name_duplicate_unknown_name_type_is_illegal_parameter() {
+        // name_type=0（host_name）限定だった旧実装の穴（finding #4）。
+        // 未知の name_type（0x07）が重複していても illegal_parameter。
+        let data = {
+            let mut entry = Vec::new();
+            entry.push(0x07); // 未知の name_type
+            entry.extend_from_slice(&1u16.to_be_bytes());
+            entry.push(b'a');
+            let mut data = Vec::new();
+            data.extend_from_slice(&((entry.len() * 2) as u16).to_be_bytes());
+            data.extend_from_slice(&entry);
+            data.extend_from_slice(&entry);
+            data
+        };
+        let ch = with_ed25519_sig_alg(replace_extension_data(
+            rfc8448_client_hello(),
+            EXT_SERVER_NAME,
+            data,
+        ));
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn malformed_server_name_is_rejected_even_when_retry_would_otherwise_apply() {
+        // finding #5（cursor）: server_name の構造検証は Accept 経路の後で
+        // 遅延実行してはならない。key_share が空（本来なら
+        // RetryRequestX25519 になる状況）でも、server_name が不正なら
+        // decode_error で拒否し、RetryRequestX25519 を返してはならない。
+        let ch = with_ed25519_sig_alg(replace_extension_data(
+            replace_extension_data(
+                rfc8448_client_hello(),
+                EXT_KEY_SHARE,
+                empty_key_share_data(),
+            ),
+            EXT_SERVER_NAME,
+            vec![0x00, 0x00], // server_name_list 長 0（最小 1 未満。decode_error）。
+        ));
+        assert_rejected(&ch, AlertDescription::DecodeError);
     }
 
     #[test]
@@ -776,7 +990,7 @@ mod tests {
     // ---- 拒否系 ----
 
     fn assert_rejected(ch: &handshake::ClientHello, expected: AlertDescription) {
-        let result = negotiate(ch, false);
+        let result = negotiate(ch, None);
         let err = result.expect_err("must be rejected");
         assert_eq!(
             err.alert_description(),
@@ -1048,7 +1262,7 @@ mod tests {
                 .clone();
             for len in 0..=original.len() {
                 let ch = replace_extension_data(base.clone(), ty, original[..len].to_vec());
-                let _ = negotiate(&ch, false);
+                let _ = negotiate(&ch, None);
             }
         }
     }
@@ -1064,7 +1278,7 @@ mod tests {
                 extension_data: Vec::new(),
             });
         }
-        let result = negotiate(&ch, false);
+        let result = negotiate(&ch, None);
         assert!(matches!(
             result,
             Ok(ClientHelloDecision::Accept(_)) | Err(_)
