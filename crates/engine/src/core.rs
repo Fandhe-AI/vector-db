@@ -3693,6 +3693,9 @@ impl EngineCore {
                     // ENUM 値はラベル文字列の本体長のみを数える（TEXT と同じ
                     // フレーミング。Issue #890）。
                     crate::row_codec::Value::Enum(s) => s.len(),
+                    // NUMERIC 値は presence を除く `unscaled`（i128 LE）分の
+                    // 16 バイト固定（TABLE-13〔検討中〕・TASK-197、Issue #885）。
+                    crate::row_codec::Value::Numeric(_) => 16,
                 };
                 row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
                     crate::sql::allowlist::SqlSurfaceError::payload_too_large(

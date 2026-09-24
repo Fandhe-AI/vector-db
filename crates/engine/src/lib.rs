@@ -241,6 +241,7 @@ pub mod incremental;
 pub mod isa;
 pub mod json;
 pub mod kernel;
+pub mod numeric;
 pub mod parallel_search;
 pub mod policy;
 pub mod precision;

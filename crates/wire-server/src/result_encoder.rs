@@ -472,6 +472,9 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         // （TABLE-14・Issue #889。`JSON` は入力テキスト保持・`JSONB` は正規化
         // 済みテキストのため、いずれもここで再シリアライズしない）。
         Cell::Json(s) => Ok(Some(s.clone())),
+        // NUMERIC 列の text フォーマット表現は正規テキスト（`Decimal::Display`）
+        // をそのまま送る（TABLE-13〔検討中〕・TASK-197、Issue #885）。
+        Cell::Numeric(d) => Ok(Some(d.to_string())),
     }
 }
 

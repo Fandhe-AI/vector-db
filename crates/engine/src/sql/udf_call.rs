@@ -725,6 +725,11 @@ fn bind_expr_in(
                     ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ENUM columns are not supported)"
                     ))),
+                    // 式中の NUMERIC 列参照は対象外（TABLE-13〔検討中〕・
+                    // TASK-197、Issue #885。別 Issue #891 の担当）。
+                    ColumnType::Numeric { .. } => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (NUMERIC columns are not supported)"
+                    ))),
                 };
             }
             if name == "id" {

@@ -544,19 +544,23 @@ impl ScalarIndex {
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     per_column.push(Some(acc));
                 }
-                // `VECTOR` 列・`BOOLEAN` 列はいずれも索引対象外（BOOLEAN は
-                // Issue #883・D-e。値域が 2 値のため索引化コストに見合わず、
-                // 対応述語 `BoolEquals` は常に plain scan——`scalar_plan.rs`
-                // 参照——のまま据え置く）。`ARRAY` 列（TABLE-14・Issue #888）・
-                // `BYTEA` 列（Issue #886）・`JSON`／`JSONB` 列（TABLE-14・Issue #889。
-                // 拡張は Issue #893 へ申し送り）もいずれも等価・前方一致述語を
-                // 持たないため同じく非索引化。
+                // `VECTOR` 列・`BOOLEAN` 列・`NUMERIC` 列はいずれも索引対象外
+                // （BOOLEAN は Issue #883・D-e。値域が 2 値のため索引化コストに
+                // 見合わず、対応述語 `BoolEquals` は常に plain scan——
+                // `scalar_plan.rs` 参照——のまま据え置く）。`ARRAY` 列（TABLE-14・
+                // Issue #888）・`BYTEA` 列（Issue #886）・`JSON`／`JSONB` 列
+                // （TABLE-14・Issue #889。拡張は Issue #893 へ申し送り）もいずれも
+                // 等価・前方一致述語を持たないため同じく非索引化。NUMERIC は
+                // 本索引が TEXT 列の等価・前方一致向け辞書索引のみを対象とする
+                // 設計であり、WHERE 述語自体が束縛時点で NUMERIC 列を拒否済み
+                // 〔TABLE-13〔検討中〕・TASK-197、Issue #885〕のため到達しない。
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
-                | ColumnType::Jsonb => per_column.push(None),
+                | ColumnType::Jsonb
+                | ColumnType::Numeric { .. } => per_column.push(None),
             }
         }
 
