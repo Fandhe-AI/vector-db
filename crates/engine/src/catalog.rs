@@ -296,6 +296,13 @@ pub enum ColumnType {
     /// 真偽値列（TABLE-13・TASK-196、Issue #883）。NULL と false は行バイト列・
     /// 投影・述語評価のいずれでも区別する（[`crate::row_codec::Value::Bool`] 参照）。
     Boolean,
+    /// 日付列（TABLE-13・TASK-197、Issue #884）。内部表現は 1970-01-01 起点の
+    /// 日数（`i32`）。値の解析・整形は [`crate::datetime`] へ委譲する。
+    Date,
+    /// 日時列（TABLE-13・TASK-197、Issue #884）。タイムゾーンを持たない
+    /// （naive）値で、内部表現は 1970-01-01 00:00:00 起点のマイクロ秒（`i64`）。
+    /// 値の解析・整形は [`crate::datetime`] へ委譲する。
+    Timestamp,
     /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
     /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・
     /// 二次索引・`EXPLAIN`）からは一貫して非対象として除外する（`VECTOR` 列との
@@ -340,6 +347,8 @@ impl ColumnType {
             ColumnType::Real => ("real", "-".to_string()),
             ColumnType::Double => ("double", "-".to_string()),
             ColumnType::Boolean => ("boolean", "-".to_string()),
+            ColumnType::Date => ("date", "-".to_string()),
+            ColumnType::Timestamp => ("timestamp", "-".to_string()),
             ColumnType::Array(array_ty) => (
                 "array",
                 format!("{},{}", array_ty.elem().catalog_tag(), array_ty.max_len()),
@@ -409,6 +418,22 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::Boolean)
+            }
+            "date" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "date column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Date)
+            }
+            "timestamp" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "timestamp column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Timestamp)
             }
             "array" => {
                 // `<elem_tag>,<max_len>` のちょうど 2 要素（Issue #888 D-A2）。
@@ -849,6 +874,8 @@ impl TableSchema {
             | ColumnType::Real
             | ColumnType::Double
             | ColumnType::Boolean
+            | ColumnType::Date
+            | ColumnType::Timestamp
             | ColumnType::Bytea
             | ColumnType::Json
             | ColumnType::Jsonb

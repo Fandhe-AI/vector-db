@@ -227,6 +227,8 @@ pub(crate) fn project_row(
                 Some(Value::Real(v)) => Cell::Float(f64::from(*v)),
                 Some(Value::Double(v)) => Cell::Float(*v),
                 Some(Value::Bool(b)) => Cell::Bool(*b),
+                Some(Value::Date(d)) => Cell::Date(*d),
+                Some(Value::Timestamp(t)) => Cell::Timestamp(*t),
                 Some(Value::Array(array_value)) => Cell::Array(try_clone_array_for_budget(
                     array_value,
                     budget,

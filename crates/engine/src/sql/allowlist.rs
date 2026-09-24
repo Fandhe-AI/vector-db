@@ -245,6 +245,13 @@ pub enum SqlSurfaceError {
     /// （`docs/spec/04-behavior/error-format.md`）の表に未掲載のコードであり、
     /// SQL-13 が ERR-2 の拡張規則に基づいて独自定義する。
     NumericOutOfRange { detail: String },
+    /// `DATE`／`TIMESTAMP` リテラルが文法上は解析できたが、値が受理範囲外、
+    /// または暦上不正（月 13・2 月 30 日・非閏年の 2/29・時 24・分 60・秒 60・
+    /// 年 0000・年 10000 以上等。TABLE-13・TASK-197、Issue #884・D-1）。
+    /// 文法違反（区切り文字違い・TZ 接尾辞・桁数不足等）は既存の `InvalidInput`
+    /// （`22000`）のまま変えない。ERR-6 の管轄表にある `22008`
+    /// （`DATETIME_FIELD_OVERFLOW`）へ写像する新規分類。
+    DatetimeFieldOverflow { detail: String },
     /// 構文上受理された値が、宣言済み型の表現として不正（TABLE-14・TASK-198、
     /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）が
     /// 現時点で唯一の発生経路。ERR-2 拡張: `22P02`
@@ -321,6 +328,15 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `sql::parser::bind_datetime_literal`（TABLE-13・TASK-197、
+    /// Issue #884）が `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正を報告する
+    /// ために使う。
+    pub(crate) fn datetime_field_overflow(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::DatetimeFieldOverflow {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::parser::bind_enum_literal`（Issue #890）が ENUM 列の
     /// 語彙外ラベルを報告するために使う。エラーメッセージには語彙の一覧を
     /// 含めない（型名とクライアント自身の入力値のみ。security.md P0）。
@@ -348,6 +364,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateOperationId => ErrorClass::UniqueViolation,
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
+            SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
                 ErrorClass::InvalidTextRepresentation
             }
@@ -395,6 +412,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::OperationIdContentMismatch => {
                 write!(f, "operation_id already recorded with different content")
+            }
+            SqlSurfaceError::DatetimeFieldOverflow { detail } => {
+                write!(f, "datetime field overflow: {detail}")
             }
             SqlSurfaceError::InvalidTextRepresentation { detail } => {
                 write!(f, "invalid text representation: {detail}")

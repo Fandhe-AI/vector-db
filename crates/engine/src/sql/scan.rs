@@ -200,6 +200,8 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Real
                         | ColumnType::Double
                         | ColumnType::Boolean
+                        | ColumnType::Date
+                        | ColumnType::Timestamp
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -531,6 +533,28 @@ pub fn execute_scan(
                                         detail: "scalar payload type mismatch".to_string(),
                                     })
                                 }
+                            },
+                            ColumnType::Date => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_date() {
+                                    Some(d) => cells.push(Cell::Date(d)),
+                                    None => {
+                                        return Err(scan_bug(
+                                            "DATE column scan yielded a non-Date scalar value",
+                                        ))
+                                    }
+                                },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Timestamp => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_timestamp() {
+                                    Some(t) => cells.push(Cell::Timestamp(t)),
+                                    None => {
+                                        return Err(scan_bug(
+                                            "TIMESTAMP column scan yielded a non-Timestamp scalar value",
+                                        ))
+                                    }
+                                },
+                                Some(None) | None => cells.push(Cell::Null),
                             },
                             ColumnType::Array(_) => match scanned.get(*index) {
                                 Some(Some(row_codec::ScalarRef::Array(array_ref))) => {
