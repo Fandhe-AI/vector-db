@@ -314,10 +314,13 @@ fn parse_extensions(
     // RFC 8446 §4.2.10: early_data は PSK（0-RTT）と併せてのみ提示できる。
     // 本モジュールは PSK／0-RTT を受理しないため中身は解釈しないが、
     // pre_shared_key を伴わない early_data はそれ自体がプロトコル違反
-    // （0-RTT の前提となる PSK が無いのに 0-RTT を提示している）ため
-    // illegal_parameter で拒否する。
+    // （0-RTT の前提となる PSK が無いのに 0-RTT を提示している）である。
+    // psk_key_exchange_modes が pre_shared_key に対して必須拡張として
+    // 扱われている（上記 §4.2.9 の分岐）のと同型の「拡張 A の提示が
+    // 拡張 B の必須化を意味する」依存関係のため、同じ missing_extension
+    // （RFC 8446 §9.2）として扱う（codex-review PR #1022 指摘）。
     if out.has_early_data && !out.has_pre_shared_key {
-        return Err(ClientHelloError::IllegalParameter(
+        return Err(ClientHelloError::MissingExtension(
             "early_data extension requires a pre_shared_key extension to be present",
         ));
     }
@@ -568,19 +571,24 @@ fn check_hrr_consistency(
 
 /// `pre_shared_key`（ClientHello 形。RFC 8446 §4.2.11）の `identities` 部
 /// （`PskIdentity identities<7..2^16-1>`。各エントリは
-/// `opaque identity<1..2^16-1>; uint32 obfuscated_ticket_age;`）だけを構造
-/// 解析し、エントリを順序どおりに返す。`binders` 部は
-/// [`check_hrr_psk_identities`] の比較対象にしない（HRR 後は再計算が許可
-/// されているため）ので、ここでは読み進めず無視する。
-fn parse_psk_identities(data: &[u8]) -> Result<Vec<(Vec<u8>, u32)>, ClientHelloError> {
+/// `opaque identity<1..2^16-1>; uint32 obfuscated_ticket_age;`）の identity
+/// 値だけを構造解析し、エントリを順序どおりに返す。`obfuscated_ticket_age`
+/// はここで読み進めて構造を検証するが、値そのものは戻り値に含めない
+/// （HRR 後の 2 回目 ClientHello では、ticket 発行からの経過時間が変化する
+/// ため、クライアントは同一 PSK に対しても age を再計算してよい。RFC 8446
+/// §4.1.2。[`check_hrr_psk_identities`] の同一性比較は identity 値のみで
+/// 行い、age の一致は要求しない。Cursor Bugbot 指摘・PR #1022）。`binders`
+/// 部も同様に比較対象にしない（binder の再計算が許可されているため）ので
+/// 読み進めず無視する。
+fn parse_psk_identities(data: &[u8]) -> Result<Vec<Vec<u8>>, ClientHelloError> {
     let mut r = Reader::new(data);
     let identities = r.vec_u16_len(7, 0xFFFF)?;
     let mut lr = Reader::new(identities);
     let mut out = Vec::new();
     while lr.remaining() > 0 {
         let identity = lr.vec_u16_len(1, 0xFFFF)?;
-        let age = u32::from_be_bytes(lr.array::<4>()?);
-        out.push((identity.to_vec(), age));
+        let _obfuscated_ticket_age = lr.array::<4>()?;
+        out.push(identity.to_vec());
     }
     Ok(out)
 }
@@ -588,10 +596,11 @@ fn parse_psk_identities(data: &[u8]) -> Result<Vec<(Vec<u8>, u32)>, ClientHelloE
 /// `second` が `first` の順序保存部分列であるかを判定する（RFC 8446
 /// §4.1.2「クライアントは（更新された）2 回目の `ClientHello` のパラメータ
 /// と非互換になった PSK identity を削除してよい」の反映）。削除のみが
-/// 許可されるため、`first` に存在しない identity（値・
-/// `obfuscated_ticket_age` の完全一致で比較）の新規追加・並べ替えは
-/// 部分列とはみなさず `false` を返す。
-fn is_ordered_subsequence(first: &[(Vec<u8>, u32)], second: &[(Vec<u8>, u32)]) -> bool {
+/// 許可されるため、`first` に存在しない identity（値の完全一致で比較。
+/// `obfuscated_ticket_age` は比較対象に含めない。[`parse_psk_identities`]
+/// のドキュメントコメント参照）の新規追加・並べ替えは部分列とはみなさず
+/// `false` を返す。
+fn is_ordered_subsequence(first: &[Vec<u8>], second: &[Vec<u8>]) -> bool {
     let mut first_iter = first.iter();
     for entry in second {
         let matched = first_iter.by_ref().any(|candidate| candidate == entry);
@@ -1087,9 +1096,22 @@ mod tests {
         // 1 回目に無かった early_data を 2 回目で新たに加えるのは、
         // 0-RTT が HRR 後に許可されないという RFC 8446 §4.1.2 の制約に
         // 反するため illegal_parameter（finding #3 の一部。key_share 等と
-        // 同列に一律除外していた旧実装の穴）。
-        let first = with_ed25519_sig_alg(rfc8448_client_hello());
-        let ch = push_extension(first.clone(), EXT_EARLY_DATA, vec![]);
+        // 同列に一律除外していた旧実装の穴）。early_data は
+        // pre_shared_key を伴わないとそれ自体が missing_extension（PR
+        // #1022 追指摘）になり本 HRR 固有の検査に到達できないため、この
+        // HRR 固有の規則を単独で検証できるよう pre_shared_key を伴わせる
+        // （pre_shared_key は末尾でなければならないため、early_data は
+        // その手前へ挿入する）。
+        let first = client_hello_with_psk(&[(b"alice", 100)]);
+        let mut ch = first.clone();
+        let psk_index = ch.extensions.len() - 1;
+        ch.extensions.insert(
+            psk_index,
+            handshake::Extension {
+                extension_type: EXT_EARLY_DATA,
+                extension_data: vec![],
+            },
+        );
         assert!(matches!(
             negotiate(&ch, Some(&first)),
             Err(ClientHelloError::IllegalParameter(_))
@@ -1100,12 +1122,20 @@ mod tests {
     fn hrr_second_hello_retaining_early_data_is_illegal_parameter() {
         // 1 回目に early_data が存在した場合でも、2 回目にそのまま残す
         // （削除しない）のは許されない。RFC 8446 §4.1.2 は「削除」のみを
-        // 許可された差分として列挙しており、維持は対象外。
-        let first = push_extension(
-            with_ed25519_sig_alg(rfc8448_client_hello()),
-            EXT_EARLY_DATA,
-            vec![],
-        );
+        // 許可された差分として列挙しており、維持は対象外。early_data は
+        // pre_shared_key を伴わせて構築する（理由は上記テスト参照）。
+        let first = {
+            let mut ch = client_hello_with_psk(&[(b"alice", 100)]);
+            let psk_index = ch.extensions.len() - 1;
+            ch.extensions.insert(
+                psk_index,
+                handshake::Extension {
+                    extension_type: EXT_EARLY_DATA,
+                    extension_data: vec![],
+                },
+            );
+            ch
+        };
         let ch = first.clone();
         assert!(matches!(
             negotiate(&ch, Some(&first)),
@@ -1577,16 +1607,18 @@ mod tests {
     // ---- codex-review 指摘の回帰テスト（PR #1022） ----
 
     #[test]
-    fn early_data_without_pre_shared_key_is_illegal_parameter() {
-        // finding #2: early_data は pre_shared_key を伴わずに提示できない
-        // （RFC 8446 §4.2.10）。HRR を経ない通常の 1 回目 ClientHello でも
-        // 検査する。
+    fn early_data_without_pre_shared_key_is_missing_extension() {
+        // finding #2 (PR #1022 追指摘): early_data は pre_shared_key を
+        // 伴わずに提示できない（RFC 8446 §4.2.10）。psk_key_exchange_modes
+        // が pre_shared_key に対して必須拡張として扱われるのと同型の
+        // 依存関係のため missing_extension（RFC 8446 §9.2）で拒否する。
+        // HRR を経ない通常の 1 回目 ClientHello でも検査する。
         let ch = with_ed25519_sig_alg(push_extension(
             rfc8448_client_hello(),
             EXT_EARLY_DATA,
             vec![],
         ));
-        assert_rejected(&ch, AlertDescription::IllegalParameter);
+        assert_rejected(&ch, AlertDescription::MissingExtension);
     }
 
     #[test]
@@ -1696,6 +1728,21 @@ mod tests {
         // まま先頭以外を削る）は RFC 8446 §4.1.2 が明示的に許可する差分。
         let first = client_hello_with_psk(&[(b"alice", 100), (b"bob", 200)]);
         let second = client_hello_with_psk(&[(b"bob", 200)]);
+        assert!(matches!(
+            negotiate(&second, Some(&first)),
+            Ok(ClientHelloDecision::Accept(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_psk_identity_with_updated_age_is_accepted() {
+        // Cursor Bugbot 指摘（PR #1022）: RFC 8446 §4.1.2 により、クライアン
+        // トは HRR 後の 2 回目 ClientHello で obfuscated_ticket_age を
+        // 再計算してよい（ticket 発行からの経過時間が変化するため）。
+        // identity 値が同一であれば age が変化していても illegal_parameter
+        // にしてはならない。
+        let first = client_hello_with_psk(&[(b"alice", 100), (b"bob", 200)]);
+        let second = client_hello_with_psk(&[(b"alice", 150), (b"bob", 250)]);
         assert!(matches!(
             negotiate(&second, Some(&first)),
             Ok(ClientHelloDecision::Accept(_))
