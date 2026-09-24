@@ -126,6 +126,24 @@ fn try_clone_embedding_for_budget(
     Ok(owned)
 }
 
+/// BYTEA セルの選択的複製（累計バイト量を確保前に検証。上記テキスト版と同方針。
+/// UTF-8 検証を行わない点のみ異なる。Issue #886）。
+fn try_alloc_bytes_for_budget(
+    bytes: &[u8],
+    budget: &mut usize,
+    cap: usize,
+) -> Result<Vec<u8>, SqlSurfaceError> {
+    *budget = try_accumulate_budget(*budget, bytes.len(), cap)?;
+    let mut owned: Vec<u8> = Vec::new();
+    owned
+        .try_reserve_exact(bytes.len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve scalar bytea field: {e}"),
+        })?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
+}
+
 /// 可視行 1 件のデコード段階（[`crate::sql::aggregate::DecodeTier`] と同じ意図・
 /// 同じ規約を広域取得向けに再定義したもの。集計項目ではなく投影列・`WHERE` から
 /// 参照列集合を導出する点のみ異なるため、型を共有せず本モジュール専用に持つ）。
@@ -159,7 +177,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                 if let Some(column) = schema.columns.get(*index) {
                     match column.ty {
                         ColumnType::Vector(_) => needs_embedding = true,
-                        ColumnType::Text | ColumnType::Boolean => {
+                        ColumnType::Text | ColumnType::Boolean | ColumnType::Bytea => {
                             has_scalar_reference = true;
                             if let Some(slot) = scalar_mask.get_mut(*index) {
                                 *slot = true;
@@ -461,6 +479,21 @@ pub fn execute_scan(
                                         "BOOLEAN column scan yielded a non-Boolean scalar value",
                                     )),
                                 },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Bytea => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Bytes(b))) => {
+                                    cells.push(Cell::Bytes(try_alloc_bytes_for_budget(
+                                        b,
+                                        &mut byte_budget,
+                                        MAX_SCAN_RESULT_BYTES,
+                                    )?));
+                                }
+                                Some(Some(_)) => {
+                                    return Err(scan_bug(
+                                        "BYTEA column scan yielded a non-Bytea scalar value",
+                                    ))
+                                }
                                 Some(None) | None => cells.push(Cell::Null),
                             },
                         }

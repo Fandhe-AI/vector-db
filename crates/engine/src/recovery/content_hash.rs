@@ -220,6 +220,13 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(7);
             b.push_u8(u8::from(*b_val));
         }
+        // タグ 8〜10 は DATE/TIMESTAMP/NUMERIC（並行実装中の別 Issue）向けに予約し、
+        // BYTEA は TABLE-13 の宣言順で 11 とする（Issue #886。長さ前置は Text と
+        // 同じ方式で、型タグの違いだけでハッシュを区別する）。
+        Value::Bytes(bytes) => {
+            b.push_u8(11);
+            b.push_bytes(bytes)?;
+        }
     }
     Ok(())
 }

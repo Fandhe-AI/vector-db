@@ -164,6 +164,9 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         }
         Cell::Float(f) => Ok(Some(f.to_string())),
         Cell::Bool(b) => Ok(Some(if *b { "t".to_string() } else { "f".to_string() })),
+        // `BYTEA` のテキスト表現は PostgreSQL 既定の `bytea_output=hex`（`\x` ＋
+        // 小文字 16 進）と同形にする（B5・Issue #886）。
+        Cell::Bytes(b) => Ok(Some(engine::bytea::format_hex_text(b))),
     }
 }
 

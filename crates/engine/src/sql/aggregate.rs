@@ -129,7 +129,9 @@ impl ReferencedColumns {
 
         for item in items {
             match &item.input {
-                AggregateInput::TextColumn(index) | AggregateInput::BooleanColumn(index) => {
+                AggregateInput::TextColumn(index)
+                | AggregateInput::BooleanColumn(index)
+                | AggregateInput::ByteaColumn(index) => {
                     has_scalar_reference = true;
                     if let Some(slot) = scalar_mask.get_mut(*index) {
                         *slot = true;
@@ -324,6 +326,15 @@ impl Accumulator {
             // が SUM/AVG/MIN/MAX を型不整合として拒否済み。Issue #883）。値の真偽は
             // 問わず「NULL でない」ことだけを数える。
             AggregateInput::BooleanColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
+            // BYTEA 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
+            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。Issue #886）。
+            AggregateInput::ByteaColumn(index) => {
                 if scanned.get(*index).copied().flatten().is_some() {
                     self.observe_present()
                 } else {
