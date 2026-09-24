@@ -114,6 +114,20 @@ pub enum UpdateError {
     /// `EngineCore::execute_bound_update_in_session`（`operation_id` 必須化・
     /// 台帳照合・テーブル不存在）のエラーをそのまま透過する。
     Engine(SqlSurfaceError),
+    /// `BYTEA` 列の SET 値が base64 の JSON string でない、または不正な
+    /// base64（`42601`。B10・Issue #886。`insert.rs::InsertError::InvalidBytea`
+    /// と同じ分類判断）。
+    InvalidBytea(&'static str),
+    /// `BYTEA` 列の base64 値が復号後 [`engine::bytea::MAX_BYTEA_FIELD_LEN`] を
+    /// 超える（`54000`）。
+    ByteaTooLarge,
+    /// `JSON`／`JSONB` 列の SET 値が JSON オブジェクト／配列でない、または
+    /// 構文不正（`42601`。Issue #889 D6。`insert.rs::InsertError::InvalidJson`
+    /// と同じ分類判断）。
+    InvalidJson(&'static str),
+    /// `JSON`／`JSONB` 列の SET 値が正規化後
+    /// [`engine::json::MAX_JSON_FIELD_LEN`] を超える（`54000`）。
+    JsonTooLarge,
 }
 
 impl From<SchemaError> for UpdateError {
@@ -153,6 +167,10 @@ impl ClassifiedError for UpdateError {
             // アーム側で分類される（`42601`／`22000`）。
             UpdateError::Set(_) => ErrorClass::InvalidInput,
             UpdateError::Engine(err) => err.error_class(),
+            UpdateError::InvalidBytea(_) => ErrorClass::UnsupportedSqlSyntax,
+            UpdateError::ByteaTooLarge => ErrorClass::PayloadTooLarge,
+            UpdateError::InvalidJson(_) => ErrorClass::UnsupportedSqlSyntax,
+            UpdateError::JsonTooLarge => ErrorClass::PayloadTooLarge,
         }
     }
 
@@ -162,6 +180,10 @@ impl ClassifiedError for UpdateError {
             UpdateError::InvalidIdentifier => "invalid identifier".to_string(),
             UpdateError::Target(err) => err.client_message(),
             UpdateError::EmptySet => "SET clause must specify at least one column".to_string(),
+            UpdateError::InvalidBytea(detail) => detail.to_string(),
+            UpdateError::ByteaTooLarge => "BYTEA value exceeds the length limit".to_string(),
+            UpdateError::InvalidJson(detail) => detail.to_string(),
+            UpdateError::JsonTooLarge => "JSON value exceeds the length limit".to_string(),
             UpdateError::Set(detail) => detail.to_string(),
             UpdateError::Engine(err) => err.client_message(),
         }
@@ -232,8 +254,18 @@ fn map_set_assignments(
             assignments.push((key.clone(), InsertLiteral::String(String::new())));
             continue;
         };
-        let literal = match (column.ty, raw) {
+        let literal = match (&column.ty, raw) {
             (ColumnType::Text, JsonValue::String(s)) => InsertLiteral::String(s.clone()),
+            // ENUM 列は TEXT と同じ JSON string 表現を使い、語彙検証は
+            // `engine::sql::parser::bind_update`（`bind_enum_literal`）へ委譲する
+            // （Issue #890。列名だけで完結しない値検証は engine 側の単一
+            // 情報源に保つ設計。`bind_update` の再検査で多層防御が保たれる）。
+            (ColumnType::Enum(_), JsonValue::String(s)) => InsertLiteral::String(s.clone()),
+            (ColumnType::Enum(_), _) => {
+                return Err(UpdateError::Set(
+                    "SET ENUM column value must be a JSON string",
+                ))
+            }
             (ColumnType::Vector(_), JsonValue::Array(items)) => {
                 InsertLiteral::String(vector_literal_text(items)?)
             }
@@ -268,6 +300,65 @@ fn map_set_assignments(
             (ColumnType::Timestamp, _) => {
                 return Err(UpdateError::Set(
                     "SET TIMESTAMP column value must be a JSON string",
+                ))
+            }
+            // 配列列（TABLE-14・Issue #888）の JSON 配列束縛は本 Issue の対象外
+            // （NoSQL 表層の JSON 配列束縛は #896・NOSQL-17 の担当）。BOOLEAN と
+            // 同じく明示的に拒否する。
+            (ColumnType::Array(_), _) => {
+                return Err(UpdateError::Set(
+                    "SET ARRAY column is not supported via the NoSQL surface",
+                ))
+            }
+            // `BYTEA` 列は base64 の JSON string のみ受理し、復号したバイト列を
+            // 正準形（`\x` ＋ 小文字 hex）の `InsertLiteral::String` へ再エンコード
+            // する（B9・Issue #886）。engine 側の束縛経路を hex 解析の 1 本に
+            // 保つ設計判断（`insert.rs::bind_row` とは異なり `InsertLiteral::Bytes`
+            // variant を新設しない）。
+            (ColumnType::Bytea, JsonValue::String(s)) => {
+                let decoded =
+                    super::base64_std::decode_base64_std(s, engine::bytea::MAX_BYTEA_FIELD_LEN)
+                        .map_err(|e| match e {
+                            super::base64_std::Base64StdError::TooLong => {
+                                UpdateError::ByteaTooLarge
+                            }
+                            _ => UpdateError::InvalidBytea(
+                                "SET BYTEA column value must be valid base64",
+                            ),
+                        })?;
+                InsertLiteral::String(engine::bytea::format_hex_text(&decoded))
+            }
+            (ColumnType::Bytea, _) => {
+                return Err(UpdateError::InvalidBytea(
+                    "SET BYTEA column value must be a base64 JSON string",
+                ))
+            }
+            // `JSON`／`JSONB` 列は `insert.rs::bind_row` と同じ規則で JSON
+            // オブジェクト／配列を正規化テキストへ写像し、`InsertLiteral::String`
+            // として engine の SQL 束縛経路（`bind_json_literal`）へ渡す
+            // （B9・Issue #889 D6。BYTEA と同型の判断で束縛経路を 1 本に保つ）。
+            (ColumnType::Json | ColumnType::Jsonb, JsonValue::Object(_) | JsonValue::Array(_)) => {
+                let mut canonical = String::new();
+                engine::json::write_canonical(raw, &mut canonical);
+                if canonical.len() > engine::json::MAX_JSON_FIELD_LEN {
+                    return Err(UpdateError::JsonTooLarge);
+                }
+                InsertLiteral::String(canonical)
+            }
+            // JSON `null` かつ nullable 列は SQL `NULL` として扱う
+            // （`insert.rs::bind_row` の同型分岐・design doc
+            // `docs/design/column-type-extension.md`「#889 追記」節「JSON
+            // `null` は nullable 列なら `NULL`」と同じ契約。Issue #889
+            // レビュー指摘・PR #1014）。非 nullable 列は次の catch-all 分岐で
+            // 従来どおり `42601` へ倒れる（`bind_set_assignments` 側でも
+            // `column.nullable` を再検査するが、ここで先に拒否することで
+            // engine 側のエラー文言に依存せず wire-server 側の分類を保つ）。
+            (ColumnType::Json | ColumnType::Jsonb, JsonValue::Null) if column.nullable => {
+                InsertLiteral::Null
+            }
+            (ColumnType::Json | ColumnType::Jsonb, _) => {
+                return Err(UpdateError::InvalidJson(
+                    "SET JSON column value must be a JSON object or array",
                 ))
             }
         };
@@ -342,6 +433,22 @@ pub fn execute(
                         detail: "unexpected error during UPDATE SET binding".to_string(),
                     }
                 }
+                // `InvalidBytea`（`42601`）／`ByteaTooLarge`（`54000`）の分類を
+                // `SqlSurfaceError` へ写像しても維持する（B10・Issue #886）。
+                UpdateError::InvalidBytea(detail) => SqlSurfaceError::UnsupportedSyntax {
+                    detail: detail.to_string(),
+                },
+                UpdateError::ByteaTooLarge => SqlSurfaceError::PayloadTooLarge {
+                    detail: "BYTEA value exceeds the length limit".to_string(),
+                },
+                // `InvalidJson`（`42601`）／`JsonTooLarge`（`54000`）の分類を
+                // `SqlSurfaceError` へ写像しても維持する（Issue #889 D6）。
+                UpdateError::InvalidJson(detail) => SqlSurfaceError::UnsupportedSyntax {
+                    detail: detail.to_string(),
+                },
+                UpdateError::JsonTooLarge => SqlSurfaceError::PayloadTooLarge {
+                    detail: "JSON value exceeds the length limit".to_string(),
+                },
             })?;
             let stmt = ValidatedUpdate {
                 table_name: table.to_string(),
@@ -519,5 +626,90 @@ mod tests {
         assert_eq!(UpdateError::InvalidIdentifier.wire_code(), "42601");
         assert_eq!(UpdateError::EmptySet.wire_code(), "42601");
         assert_eq!(UpdateError::Set("x").wire_code(), "22000");
+        assert_eq!(UpdateError::InvalidBytea("x").wire_code(), "42601");
+        assert_eq!(UpdateError::ByteaTooLarge.wire_code(), "54000");
+    }
+
+    // --- BYTEA 列（Issue #886）の base64 → 正準 hex 再エンコード ---------------
+
+    fn bytea_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("blob", ColumnType::Bytea, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn map_set_assignments_reencodes_base64_bytea_to_canonical_hex() {
+        // "3q2+7w==" は [0xde, 0xad, 0xbe, 0xef] の標準 base64 表現。
+        let set = set_map(r#"{"blob":"3q2+7w=="}"#);
+        let bound = map_set_assignments(&set, &bytea_schema()).expect("ok");
+        assert_eq!(
+            bound,
+            vec![(
+                "blob".to_string(),
+                InsertLiteral::String("\\xdeadbeef".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn map_set_assignments_rejects_non_string_bytea() {
+        let set = set_map(r#"{"blob":true}"#);
+        let err = map_set_assignments(&set, &bytea_schema()).expect_err("must reject");
+        assert!(matches!(err, UpdateError::InvalidBytea(_)));
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn map_set_assignments_rejects_malformed_base64_bytea() {
+        let set = set_map(r#"{"blob":"3q2+7w=a"}"#);
+        let err = map_set_assignments(&set, &bytea_schema()).expect_err("must reject");
+        assert!(matches!(err, UpdateError::InvalidBytea(_)));
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    // --- JSON／JSONB 列（Issue #889）の null 分岐（PR #1014 レビュー指摘対応） ---
+
+    fn json_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("doc", ColumnType::Json, true),
+                ColumnDef::new("docb", ColumnType::Jsonb, false),
+            ],
+        )
+    }
+
+    #[test]
+    fn map_set_assignments_maps_json_null_on_nullable_column_to_insert_literal_null() {
+        let set = set_map(r#"{"doc":null}"#);
+        let bound = map_set_assignments(&set, &json_schema()).expect("ok");
+        assert_eq!(bound, vec![("doc".to_string(), InsertLiteral::Null)]);
+    }
+
+    #[test]
+    fn map_set_assignments_rejects_json_null_on_non_nullable_column() {
+        let set = set_map(r#"{"docb":null}"#);
+        let err = map_set_assignments(&set, &json_schema()).expect_err("must reject");
+        assert!(matches!(err, UpdateError::InvalidJson(_)));
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn map_set_assignments_maps_json_object_column() {
+        let set = set_map(r#"{"doc":{"a":1}}"#);
+        let bound = map_set_assignments(&set, &json_schema()).expect("ok");
+        assert_eq!(
+            bound,
+            vec![(
+                "doc".to_string(),
+                InsertLiteral::String(r#"{"a":1}"#.to_string())
+            )]
+        );
     }
 }

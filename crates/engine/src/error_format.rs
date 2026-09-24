@@ -73,7 +73,7 @@ macro_rules! define_error_classes {
 }
 
 define_error_classes! {
-    count = 17;
+    count = 18;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -150,6 +150,13 @@ define_error_classes! {
     /// 追加。文法違反は `InvalidInput`（`22000`）のまま。
     /// [`crate::sql::allowlist::SqlSurfaceError::DatetimeFieldOverflow`] の写像。
     DatetimeFieldOverflow => ("22008", "DATETIME_FIELD_OVERFLOW"),
+    /// 構文上受理された値が、宣言済み型の表現として不正（`22P02`）。ENUM 列
+    /// （TABLE-14・TASK-198）の語彙外ラベルが最初の送出経路（[`crate::catalog::
+    /// EnumLabelError`]・`sql::allowlist::SqlSurfaceError::InvalidTextRepresentation`）。
+    /// `InvalidInput`（`22000`）が「値の種類・形式自体が列型と噛み合わない」を表すのに
+    /// 対し、本分類は「値は文字列として妥当だが、宣言済み型が定める表現の集合に
+    /// 属さない」ことを表す（PostgreSQL の `invalid_text_representation` と同じ区別）。
+    InvalidTextRepresentation => ("22P02", "INVALID_TEXT_REPRESENTATION"),
 }
 
 impl ErrorClass {

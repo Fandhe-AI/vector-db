@@ -252,6 +252,11 @@ pub enum SqlSurfaceError {
     /// （`22000`）のまま変えない。ERR-6 の管轄表にある `22008`
     /// （`DATETIME_FIELD_OVERFLOW`）へ写像する新規分類。
     DatetimeFieldOverflow { detail: String },
+    /// 構文上受理された値が、宣言済み型の表現として不正（TABLE-14・TASK-198、
+    /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）が
+    /// 現時点で唯一の発生経路。ERR-2 拡張: `22P02`
+    /// （[`crate::error_format::ErrorClass::InvalidTextRepresentation`]）。
+    InvalidTextRepresentation { detail: String },
 }
 
 impl SqlSurfaceError {
@@ -331,6 +336,15 @@ impl SqlSurfaceError {
             detail: truncate_for_error(&detail.into()),
         }
     }
+
+    /// `pub(crate)`: `sql::parser::bind_enum_literal`（Issue #890）が ENUM 列の
+    /// 語彙外ラベルを報告するために使う。エラーメッセージには語彙の一覧を
+    /// 含めない（型名とクライアント自身の入力値のみ。security.md P0）。
+    pub(crate) fn invalid_text_representation(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::InvalidTextRepresentation {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
 }
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
@@ -351,6 +365,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
+            SqlSurfaceError::InvalidTextRepresentation { .. } => {
+                ErrorClass::InvalidTextRepresentation
+            }
         }
     }
 
@@ -398,6 +415,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::DatetimeFieldOverflow { detail } => {
                 write!(f, "datetime field overflow: {detail}")
+            }
+            SqlSurfaceError::InvalidTextRepresentation { detail } => {
+                write!(f, "invalid text representation: {detail}")
             }
         }
     }
@@ -924,6 +944,18 @@ pub enum InsertLiteral {
     Number(String),
     /// BOOLEAN 列向けの `true`/`false` リテラル（TABLE-13・TASK-196、Issue #883）。
     Bool(bool),
+    /// SQL `NULL`（nullable 列への明示的な NULL 設定。Issue #889 レビュー指摘・
+    /// PR #1014。SQL の `UPDATE ... SET` 構文には現状 `NULL` リテラルの字句・
+    /// 構文規則が無く（`sql::allowlist` の `SET` 句パーサーは `NULL` トークンを
+    /// 生成しない）、本 variant は NoSQL 表層 `update` op
+    /// （`wire-server::http::query::update::map_set_assignments`）が JSON
+    /// `null` かつ nullable 列の場合にのみ構築する。`bind_set_assignments`
+    /// （SQL-17・SQL-19 の UPDATE SET 束縛）はこの variant を
+    /// `column.nullable` に応じて `Value::Null`／エラーへ写像し、
+    /// `bind_insert`／`bind_upsert_assignments`／`bind_file_insert`
+    /// （INSERT・UPSERT。SQL テキストからもファイル形からも `Null` は
+    /// 構築されない到達不能パス）は fail-closed に一律拒否する。
+    Null,
 }
 
 /// `ON CONFLICT (id) DO UPDATE SET <col> = <value>` の SET 右辺（SQL-20・

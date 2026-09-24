@@ -49,6 +49,10 @@
 //! - `Cell::Vector(Vec<f32>)` → JSON array of number（要素は `f32::to_string()`。
 //!   `crate::result_encoder::cell_to_text` の `[1,2.5]` 表現と要素の数値表記が
 //!   一致する）。要素の非有限も同様に `Err`
+//! - `Cell::Bytes(Vec<u8>)` → JSON string（標準 base64・パディングあり。
+//!   `crate::http::query::base64_std::encode_base64_std`。wire 側の `\x` 16 進
+//!   テキスト表現とは異なる——値表現は表層ごとの規約〔B7〕であり、`BYTEA` に
+//!   限り型名の wire 側同一性より JSON との親和性を優先する。Issue #886）
 //!
 //! 出力不変条件: [`crate::http::error_body::encode`] と同じくキー順固定
 //! （`columns` → `rows` → `row_count`）・空白なし・0x20 未満のバイトを含まない
@@ -128,6 +132,53 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
                 write_finite_f32(out, *v)?;
             }
             out.push(']');
+            Ok(())
+        }
+        Cell::Array(array_value) => {
+            use engine::row_codec::ArrayValue;
+            out.push('[');
+            match array_value {
+                ArrayValue::Text(items) => {
+                    for (i, s) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push('"');
+                        escape_json_string_into(out, s);
+                        out.push('"');
+                    }
+                }
+                ArrayValue::Bool(items) => {
+                    for (i, b) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(if *b { "true" } else { "false" });
+                    }
+                }
+            }
+            out.push(']');
+            Ok(())
+        }
+        Cell::Bytes(bytes) => {
+            // `BYTEA` の JSON 表現は標準 base64（RFC 4648 §4・パディングあり。
+            // B7・Issue #886）。base64 のアルファベットは JSON エスケープ不要。
+            out.push('"');
+            out.push_str(&crate::http::query::base64_std::encode_base64_std(bytes));
+            out.push('"');
+            Ok(())
+        }
+        Cell::Json(text) => {
+            // `JSON`／`JSONB` は native JSON 値として出力する（Issue #889 D6）。
+            // 格納テキストを共有パーサー（`engine::json::parse_json`）で再パース
+            // し `write_canonical` で再シリアライズしてから埋め込む——格納バイト
+            // 列を生のまま応答本文へ連結しない安全側の設計（security.md
+            // 「不安全な設計」対応。連結は非構造化テキストの injection 相当に
+            // なりうる）。再パース失敗は格納契約違反（`row_codec` の encode
+            // チョークポイントが常に検証済みテキストのみを格納する契約に反する）
+            // であり内部エラー（`XX000`）として fail-closed に扱う。
+            let value = engine::json::parse_json(text).map_err(|_| ResponseEncodeError)?;
+            engine::json::write_canonical(&value, out);
             Ok(())
         }
     }

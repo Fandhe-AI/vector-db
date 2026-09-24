@@ -46,6 +46,7 @@
 //! `encode_row` する旧形（`for_insert`／`for_insert_batch`／`for_update`）は
 //! `#[cfg(test)]` の参照実装として残し、`for_*_encoded` との等価性テストにのみ使う。
 
+use crate::crypto::sha256::Sha256;
 use crate::row_codec::Value;
 #[cfg(test)]
 use crate::storage::{encode_row, RowInput};
@@ -74,7 +75,7 @@ impl ContentHash {
     /// 検証したいケース向け）。本番経路（`for_insert` 等）は使わない。
     #[cfg(test)]
     pub(crate) fn for_test(seed: &[u8]) -> Self {
-        ContentHash(sha256(seed))
+        ContentHash(crate::crypto::sha256::digest(seed))
     }
 }
 
@@ -195,7 +196,7 @@ impl HashInputBuilderReference {
     }
 
     fn finish(self) -> ContentHash {
-        ContentHash(sha256_reference(&self.0))
+        ContentHash(crate::crypto::sha256::digest_reference(&self.0))
     }
 }
 
@@ -231,6 +232,52 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
         Value::Timestamp(micros) => {
             b.push_u8(9);
             b.push_u64(*micros as u64);
+        }
+        // 配列列（TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
+        // 積むことで、`{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが
+        // 衝突しない単射なハッシュ入力にする。
+        Value::Array(array_value) => {
+            b.push_u8(10);
+            match array_value {
+                crate::row_codec::ArrayValue::Text(items) => {
+                    b.push_u8(0); // 要素型タグ: TEXT
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        b.push_bytes(item.as_bytes())?;
+                    }
+                }
+                crate::row_codec::ArrayValue::Bool(items) => {
+                    b.push_u8(1); // 要素型タグ: BOOLEAN
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        b.push_u8(u8::from(*item));
+                    }
+                }
+            }
+        }
+        // タグ 8・9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約し、10 は
+        // ARRAY（Issue #888）が使用済みのため、BYTEA は TABLE-13 の宣言順で
+        // 11 とする（Issue #886。長さ前置は Text と同じ方式で、型タグの
+        // 違いだけでハッシュを区別する）。
+        Value::Bytes(bytes) => {
+            b.push_u8(11);
+            b.push_bytes(bytes)?;
+        }
+        // JSON／JSONB は共通の Value::Json 表現を持つため（Issue #889 D2）、
+        // 表層横断で同一の再送判定（`23505`／`22023`）を得るためにはハッシュ入力も
+        // 同じタグ・同じテキストで揃う必要がある。タグ 12 は未使用のため確保する
+        // （TABLE-13/14 の宣言順に沿った次点）。
+        Value::Json(text) => {
+            b.push_u8(12);
+            b.push_bytes(text.as_bytes())?;
+        }
+        // ENUM 値は TABLE-14 の宣言順で JSON／JSONB（タグ 12）の次点となる
+        // タグ 13 とする（Issue #890。base の想定タグ 12 は本マージで JSON と
+        // 衝突するため採番し直した）。TEXT と同じ長さ前置方式だが、型タグの
+        // 違いだけで TEXT・JSON とハッシュを区別する。
+        Value::Enum(label) => {
+            b.push_u8(13);
+            b.push_bytes(label.as_bytes())?;
         }
     }
     Ok(())
@@ -789,6 +836,15 @@ fn push_dml_assignments(
                 b.push_u8(3);
                 b.push_u8(u8::from(*v));
             }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘・PR #1014。
+            // `bind_set_assignments` が nullable 列向けに追加した SQL `NULL`
+            // 表現）。述語つき `UPDATE ... WHERE`（本関数の呼び出し元）は
+            // 現状 NoSQL 表層から到達しない（`filter` 形は Issue #871 実行結線
+            // 対象だが NULL 対応は本 Issue のスコープ外）ため実質未到達だが、
+            // 上部コメントが予告する前方ガードとしてタグ 4 を割り当てる。
+            InsertLiteral::Null => {
+                b.push_u8(4);
+            }
         }
     }
     Ok(())
@@ -991,352 +1047,9 @@ fn dml_binop_tag(op: crate::sql::udf_call::BinOp) -> u8 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SHA-256（FIPS 180-4）自作実装。
-//
-// 依存追加が承認制のため（`.claude/rules/dependency-policy.md`）、本タスクの
-// 自動運転下では既存の依存最小方針を維持する側に倒し、標準ライブラリのみで
-// 実装する。`unsafe` は使わず、固定サイズ配列・`wrapping_*` 演算（FIPS 180-4 が
-// 定める mod 2^32 加算そのもの。未定義動作にはならない）で構成する。
-//
-// Issue #399: バッチ全体（数百 KB 規模）を `Vec<u8>` へ一度連結してからパディング
-// のためにさらに複製する旧実装（2 回の全量コピー）を、[`Sha256`] の
-// ブロック単位ストリーミング更新へ再構成した。呼び出し側（[`HashInputBuilder`]）は
-// 中間 `Vec` を持たず各フィールドを直接 `update` する。メッセージスケジュールも
-// 64 語配列ではなく 16 語ローリング配列（`w[t & 15]`）にして固定サイズの境界
-// チェックだけで済むようにした。出力（ダイジェスト）は下部 `sha256_reference`
-// （旧実装をそのまま残した参照実装）と完全に等価であることを `tests` モジュールの
-// FIPS ベクタ・境界長網羅・分割 `update` 等価性テストで機械検証する。
-// ---------------------------------------------------------------------------
-
-const H0: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-];
-
-const K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
-
-/// 1 ブロック（64 バイト）ぶんの圧縮関数（FIPS 180-4 6.2.2 節）。メッセージ
-/// スケジュールは 64 語配列ではなく 16 語のローリングバッファ（`w[t & 15]`）で
-/// 保持する。`t >= 16` のラウンドでは、更新前の `w[t & 15]` が
-/// （16 引くごとに同じスロットへ戻ってくるため）ちょうど `w[t - 16]` を保持して
-/// いることを利用し、そのスロットへ新しい `w[t]` を上書きしてから同じラウンドの
-/// 圧縮に使う（Issue #399）。
-fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
-    let mut w = [0u32; 16];
-    for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
-        // `as_chunks::<4>()` は固定長 4 バイト配列を返すため `from_be_bytes` は
-        // 失敗しない。添字直接アクセスの代わりに `get_mut` で明示的に処理する
-        // （coding-rust.md「untrusted 入力の扱い」と同じ規律を内部処理にも適用する）。
-        if let Some(slot) = w.get_mut(i) {
-            *slot = u32::from_be_bytes(*word);
-        }
-    }
-
-    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *state;
-
-    for t in 0..64usize {
-        let idx = t & 15;
-        if t >= 16 {
-            let w15 = w[(t - 15) & 15];
-            let w2 = w[(t - 2) & 15];
-            let s0 = w15.rotate_right(7) ^ w15.rotate_right(18) ^ (w15 >> 3);
-            let s1 = w2.rotate_right(17) ^ w2.rotate_right(19) ^ (w2 >> 10);
-            // 上書き前の w[idx] は w[t - 16]（ローリングバッファでは同一スロット
-            // を 16 ラウンドごとに再利用する）。
-            let prev16 = w[idx];
-            w[idx] = prev16
-                .wrapping_add(s0)
-                .wrapping_add(w[(t - 7) & 15])
-                .wrapping_add(s1);
-        }
-
-        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-        let ch = (e & f) ^ ((!e) & g);
-        let k = K.get(t).copied().unwrap_or(0);
-        let temp1 = hh
-            .wrapping_add(s1)
-            .wrapping_add(ch)
-            .wrapping_add(k)
-            .wrapping_add(w[idx]);
-        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
-        let temp2 = s0.wrapping_add(maj);
-
-        hh = g;
-        g = f;
-        f = e;
-        e = d.wrapping_add(temp1);
-        d = c;
-        c = b;
-        b = a;
-        a = temp1.wrapping_add(temp2);
-    }
-
-    state[0] = state[0].wrapping_add(a);
-    state[1] = state[1].wrapping_add(b);
-    state[2] = state[2].wrapping_add(c);
-    state[3] = state[3].wrapping_add(d);
-    state[4] = state[4].wrapping_add(e);
-    state[5] = state[5].wrapping_add(f);
-    state[6] = state[6].wrapping_add(g);
-    state[7] = state[7].wrapping_add(hh);
-}
-
-/// ストリーミング更新型の SHA-256 状態（Issue #399）。[`HashInputBuilder`] の
-/// 各 `push_*` から `update` を直接呼ぶことで、旧実装が行っていた
-/// 「バッチ全体を `Vec` へ連結 → パディングのため再度複製」という 2 回の
-/// 全量コピーを排除する。固定長スタックバッファ（64 バイト）のみを使い、
-/// 入力長に比例したヒープ確保は行わない。
-struct Sha256 {
-    state: [u32; 8],
-    /// 64 バイト未満の未処理端数（`buffered` バイトぶんのみ有効）。
-    buffer: [u8; 64],
-    buffered: usize,
-    /// 入力バイト総数。`finalize` でビット長（`wrapping_mul(8)`）へ変換する
-    /// （既存の `pad()` と同じ契約。エンジン内部のハッシュ対象が実運用上
-    /// `u64::MAX / 8` バイトへ到達することはない）。
-    total_len: u64,
-}
-
-impl Sha256 {
-    fn new() -> Self {
-        Sha256 {
-            state: H0,
-            buffer: [0u8; 64],
-            buffered: 0,
-            total_len: 0,
-        }
-    }
-
-    /// `total_len` を増やさずにバイト列をブロックバッファへ吸収する（`update` と
-    /// `finalize` のパディング処理が共有する内部処理）。
-    fn absorb(&mut self, mut data: &[u8]) {
-        if self.buffered > 0 {
-            let need = 64 - self.buffered;
-            let take = need.min(data.len());
-            if let Some(slot) = self.buffer.get_mut(self.buffered..self.buffered + take) {
-                slot.copy_from_slice(&data[..take]);
-            }
-            self.buffered += take;
-            data = &data[take..];
-            if self.buffered == 64 {
-                let block = self.buffer;
-                compress(&mut self.state, &block);
-                self.buffered = 0;
-            }
-        }
-
-        let (chunks, remainder) = data.as_chunks::<64>();
-        for chunk in chunks {
-            compress(&mut self.state, chunk);
-        }
-
-        if !remainder.is_empty() {
-            if let Some(slot) = self.buffer.get_mut(..remainder.len()) {
-                slot.copy_from_slice(remainder);
-            }
-            self.buffered = remainder.len();
-        }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        self.total_len = self.total_len.wrapping_add(data.len() as u64);
-        self.absorb(data);
-    }
-
-    /// FIPS 180-4 5.1.1 節のパディング（`0x80` 1 バイト → 零埋め → 8 バイト BE
-    /// ビット長）をブロックバッファ経由で適用してからダイジェストを取り出す。
-    fn finalize(mut self) -> [u8; 32] {
-        let bit_len = self.total_len.wrapping_mul(8);
-        self.absorb(&[0x80]);
-
-        const ZEROS: [u8; 64] = [0u8; 64];
-        let zero_pad = if self.buffered <= 56 {
-            56 - self.buffered
-        } else {
-            56 + 64 - self.buffered
-        };
-        if let Some(zeros) = ZEROS.get(..zero_pad) {
-            self.absorb(zeros);
-        }
-        self.absorb(&bit_len.to_be_bytes());
-
-        let mut out = [0u8; 32];
-        for (i, word) in self.state.iter().enumerate() {
-            let bytes = word.to_be_bytes();
-            let start = i * 4;
-            if let Some(slot) = out.get_mut(start..start + 4) {
-                slot.copy_from_slice(&bytes);
-            }
-        }
-        out
-    }
-}
-
-/// [`Sha256`] の参照実装（Issue #399 以前の一括処理版。バッチ全体を `Vec` へ
-/// 連結してからパディングする旧実装をそのまま残す）。production からは
-/// 呼ばれず、ストリーミング版との等価性テストにのみ使うため `#[cfg(test)]`。
-#[cfg(test)]
-fn sha256_reference(input: &[u8]) -> [u8; 32] {
-    fn pad(input: &[u8]) -> Vec<u8> {
-        let bit_len = (input.len() as u64).wrapping_mul(8);
-        let mut msg = input.to_vec();
-        msg.push(0x80);
-        while msg.len() % 64 != 56 {
-            msg.push(0x00);
-        }
-        msg.extend_from_slice(&bit_len.to_be_bytes());
-        msg
-    }
-
-    let padded = pad(input);
-    let mut state = H0;
-    for chunk in padded.as_chunks::<64>().0 {
-        compress(&mut state, chunk);
-    }
-
-    let mut out = [0u8; 32];
-    for (i, word) in state.iter().enumerate() {
-        let bytes = word.to_be_bytes();
-        let start = i * 4;
-        if let Some(slot) = out.get_mut(start..start + 4) {
-            slot.copy_from_slice(&bytes);
-        }
-    }
-    out
-}
-
-/// 一括ハッシュのヘルパー（テスト専用。production は [`HashInputBuilder`] が
-/// [`Sha256::update`] をフィールドごとに直接呼ぶため、この一括版は経由しない。
-/// テストヘルパー [`ContentHash::for_test`] と `tests` モジュールの NIST/FIPS
-/// 既知ダイジェスト検証・境界長網羅・分割 `update` 等価性テストで使う）。
-#[cfg(test)]
-fn sha256(input: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(input);
-    hasher.finalize()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    // FIPS 180-4 附属の公開テストベクタ（SHA-256("abc")）。
-    #[test]
-    fn sha256_matches_fips_test_vector_abc() {
-        let digest = sha256(b"abc");
-        assert_eq!(
-            hex(&digest),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    // 空文字列の既知ダイジェスト（NIST 公開値）。
-    #[test]
-    fn sha256_matches_known_digest_for_empty_input() {
-        let digest = sha256(b"");
-        assert_eq!(
-            hex(&digest),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
-
-    // FIPS 180-4 の複数ブロックにまたがるテストベクタ
-    // （"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"）。
-    #[test]
-    fn sha256_matches_fips_test_vector_two_blocks() {
-        let input = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
-        let digest = sha256(input);
-        assert_eq!(
-            hex(&digest),
-            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
-        );
-    }
-
-    // Issue #399 追加: FIPS 180-4 附属の 896 bit（4 ブロックにまたがる）テストベクタ。
-    #[test]
-    fn sha256_matches_fips_test_vector_four_blocks() {
-        let input = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
-        let digest = sha256(input);
-        assert_eq!(
-            hex(&digest),
-            "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"
-        );
-    }
-
-    // Issue #399 追加: NIST 公開の 1,000,000 × 'a' 反復テストベクタ。ストリーミング
-    // 版の分割 `update`（`absorb` のブロック境界処理）を長大入力で検証する。
-    #[test]
-    fn sha256_matches_nist_million_a_vector() {
-        let input = vec![b'a'; 1_000_000];
-        let digest = sha256(&input);
-        assert_eq!(
-            hex(&digest),
-            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
-        );
-    }
-
-    // Issue #399: ストリーミング版と参照実装（一括処理版）が境界長 0..=200 バイト
-    // で完全一致することを機械検証する（55/56/63/64/65/119/120 バイト等の
-    // パディング分岐を網羅する）。決定的 LCG で生成した入力を使う。
-    #[test]
-    fn sha256_streaming_matches_reference_for_boundary_lengths() {
-        let mut state: u64 = 0x2545F4914F6CDD1D;
-        let mut next_byte = || {
-            // xorshift* 相当の決定的 LCG（暗号強度は不要。境界長網羅の入力生成専用）。
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state & 0xff) as u8
-        };
-        for len in 0..=200usize {
-            let input: Vec<u8> = (0..len).map(|_| next_byte()).collect();
-            assert_eq!(
-                sha256(&input),
-                sha256_reference(&input),
-                "mismatch at len={len}"
-            );
-        }
-        for &len in &[4096usize, 65_537] {
-            let input: Vec<u8> = (0..len).map(|_| next_byte()).collect();
-            assert_eq!(
-                sha256(&input),
-                sha256_reference(&input),
-                "mismatch at len={len}"
-            );
-        }
-    }
-
-    // Issue #399: 同一入力を異なる粒度（1・3・63・64・65・100 バイト刻み）で
-    // 分割 `update` した結果が、一括 `update` と一致することを検証する
-    // （`Sha256::absorb` のバッファ境界処理のピン留め）。
-    #[test]
-    fn sha256_streaming_split_update_matches_one_shot_for_various_chunk_sizes() {
-        let input: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
-        let expected = sha256_reference(&input);
-
-        for chunk_size in [1usize, 3, 63, 64, 65, 100] {
-            let mut hasher = Sha256::new();
-            for chunk in input.chunks(chunk_size) {
-                hasher.update(chunk);
-            }
-            let digest = hasher.finalize();
-            assert_eq!(digest, expected, "mismatch at chunk_size={chunk_size}");
-        }
-    }
 
     // 操作種別が違えば同じフィールド列でも異なるハッシュになる（連結曖昧性排除の
     // ピン留め）。
@@ -1351,6 +1064,84 @@ mod tests {
         let update_hash = update_b.finish();
 
         assert_ne!(insert_hash, update_hash);
+    }
+
+    // BYTEA（タグ 11）と TEXT（タグ 1）は本体バイト列が偶然一致していても
+    // 型タグの違いだけで別ハッシュになる（Issue #886。golden な区別の固定）。
+    #[test]
+    fn bytea_and_text_values_produce_different_hashes_even_with_matching_bytes() {
+        let bytes_value = Value::Bytes(vec![0xde, 0xad]);
+        let text_value = Value::Text("\\xdead".to_string());
+        let bytes_hash = for_typed_insert(1, Visibility::Public, &[], &[("blob", &bytes_value)])
+            .expect("hash bytes");
+        let text_hash = for_typed_insert(1, Visibility::Public, &[], &[("blob", &text_value)])
+            .expect("hash text");
+        assert_ne!(bytes_hash, text_hash);
+    }
+
+    // ENUM（タグ 13）と TEXT（タグ 1）は本体バイト列が完全一致していても
+    // 型タグの違いだけで別ハッシュになる（Issue #890。golden な区別の固定）。
+    #[test]
+    fn enum_and_text_values_produce_different_hashes_even_with_matching_bytes() {
+        let enum_value = Value::Enum("happy".to_string());
+        let text_value = Value::Text("happy".to_string());
+        let enum_hash = for_typed_insert(1, Visibility::Public, &[], &[("mood", &enum_value)])
+            .expect("hash enum");
+        let text_hash = for_typed_insert(1, Visibility::Public, &[], &[("mood", &text_value)])
+            .expect("hash text");
+        assert_ne!(enum_hash, text_hash);
+    }
+
+    // 同一の BYTEA 値からは同じハッシュが再現する（再送判定の前提）。
+    #[test]
+    fn bytea_hash_is_reproducible_for_identical_content() {
+        let value = Value::Bytes(vec![0x01, 0x02, 0x03]);
+        let h1 = for_typed_insert(1, Visibility::Public, &[], &[("blob", &value)]).expect("hash 1");
+        let h2 = for_typed_insert(1, Visibility::Public, &[], &[("blob", &value)]).expect("hash 2");
+        assert_eq!(h1, h2);
+    }
+
+    // バイト列が異なれば BYTEA のハッシュも異なる（内容不一致検出の前提）。
+    #[test]
+    fn different_bytea_values_produce_different_hashes() {
+        let a = Value::Bytes(vec![0xde, 0xad]);
+        let b = Value::Bytes(vec![0xbe, 0xef]);
+        let hash_a = for_typed_insert(1, Visibility::Public, &[], &[("blob", &a)]).expect("hash a");
+        let hash_b = for_typed_insert(1, Visibility::Public, &[], &[("blob", &b)]).expect("hash b");
+        assert_ne!(hash_a, hash_b);
+    }
+
+    // JSON（タグ 12）と TEXT（タグ 1）は本体バイト列が偶然一致していても
+    // 型タグの違いだけで別ハッシュになる（Issue #889。golden な区別の固定）。
+    #[test]
+    fn json_and_text_values_produce_different_hashes_even_with_matching_bytes() {
+        let json_value = Value::Json("{}".to_string());
+        let text_value = Value::Text("{}".to_string());
+        let json_hash = for_typed_insert(1, Visibility::Public, &[], &[("doc", &json_value)])
+            .expect("hash json");
+        let text_hash = for_typed_insert(1, Visibility::Public, &[], &[("doc", &text_value)])
+            .expect("hash text");
+        assert_ne!(json_hash, text_hash);
+    }
+
+    // 同一の JSON テキストからは同じハッシュが再現する（再送判定の前提）。
+    #[test]
+    fn json_hash_is_reproducible_for_identical_content() {
+        let value = Value::Json(r#"{"a":1}"#.to_string());
+        let h1 = for_typed_insert(1, Visibility::Public, &[], &[("doc", &value)]).expect("hash 1");
+        let h2 = for_typed_insert(1, Visibility::Public, &[], &[("doc", &value)]).expect("hash 2");
+        assert_eq!(h1, h2);
+    }
+
+    // JSON テキストが異なれば（空白のみの差であっても）ハッシュも異なる
+    // （JSON 列は入力テキストを保持する契約のため。内容不一致検出の前提）。
+    #[test]
+    fn different_json_values_produce_different_hashes() {
+        let a = Value::Json(r#"{"a":1}"#.to_string());
+        let b = Value::Json(r#"{"a": 1}"#.to_string());
+        let hash_a = for_typed_insert(1, Visibility::Public, &[], &[("doc", &a)]).expect("hash a");
+        let hash_b = for_typed_insert(1, Visibility::Public, &[], &[("doc", &b)]).expect("hash b");
+        assert_ne!(hash_a, hash_b);
     }
 
     // 長さプレフィクスにより "ab"+"c" と "a"+"bc" が同一ハッシュにならない
@@ -1547,6 +1338,38 @@ mod tests {
         let h_public = for_typed_insert(7, Visibility::Public, &embedding, &cols).expect("hash");
         let h_private = for_typed_insert(7, Visibility::Private, &embedding, &cols).expect("hash");
         assert_ne!(h_public, h_private);
+    }
+
+    /// 配列列（TABLE-14・Issue #888・D-A9）のハッシュ入力が単射であること。
+    /// `{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが衝突しないこと、
+    /// 同一内容は同一ハッシュになることを固定する。
+    #[test]
+    fn for_typed_insert_array_value_is_injective_and_deterministic() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let one_elem = Value::Array(crate::row_codec::ArrayValue::Text(vec!["ab".to_string()]));
+        let two_elems = Value::Array(crate::row_codec::ArrayValue::Text(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]));
+        let cols_one: [(&str, &Value); 1] = [("tags", &one_elem)];
+        let cols_two: [(&str, &Value); 1] = [("tags", &two_elems)];
+        let h_one = for_typed_insert(7, Visibility::Public, &embedding, &cols_one).expect("hash");
+        let h_two = for_typed_insert(7, Visibility::Public, &embedding, &cols_two).expect("hash");
+        assert_ne!(
+            h_one, h_two,
+            "{{ab}} (1 element) and {{a,b}} (2 elements) must not collide"
+        );
+
+        // 同一内容の再送は同一ハッシュ（決定性）。
+        let h_one_again =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_one).expect("hash");
+        assert_eq!(h_one, h_one_again);
+
+        // 要素型が異なれば（同じ見た目の値でも）別ハッシュになること。
+        let bool_elems = Value::Array(crate::row_codec::ArrayValue::Bool(vec![true, false]));
+        let cols_bool: [(&str, &Value); 1] = [("tags", &bool_elems)];
+        let h_bool = for_typed_insert(7, Visibility::Public, &embedding, &cols_bool).expect("hash");
+        assert_ne!(h_two, h_bool);
     }
 
     // Issue #771: `for_typed_insert_batch` は要求記載順を入力に含めるため、
