@@ -52,15 +52,31 @@ const MAX_EXACT_F64_INT: u64 = 1u64 << 53;
 /// 数値リテラルの生文字列（符号なし。`-` は呼び出し元が別トークンとして処理する）を
 /// `f64` へ束縛する（TASK-79・SQL-9 の `Expr::Number` 束縛から TASK-167・SQL-14
 /// （`sql::group_by` の HAVING/LIMIT リテラル束縛）が共有できるよう切り出した）。
-/// 整数リテラル（`.` を含まない。字句層はここでのみ整数/小数の 2 形を生成する）は
-/// `f64::from_str` が黙って最近接値へ丸めうる（`raw.parse::<f64>()` はエラーに
-/// ならない）。`2^53` を超える整数は `f64` で正確に表現できないという境界を、丸め
-/// 変換の *前* に整数として検査することで、大きな整数リテラルが精度欠落によって
-/// 別の値と黙って同一視されるのを防ぐ（fail-closed。security.md「不安全な設計」対応）。
+/// 整数リテラル（桁のみ、または `NUMERIC` 列の受理文法に合わせた末尾ドット付き
+/// 整数〔`1.` 形〕。いずれも数学的には整数）は `f64::from_str` が黙って最近接値へ
+/// 丸めうる（`raw.parse::<f64>()` はエラーにならない）。`2^53` を超える整数は
+/// `f64` で正確に表現できないという境界を、丸め変換の *前* に整数として検査する
+/// ことで、大きな整数リテラルが精度欠落によって別の値と黙って同一視されるのを
+/// 防ぐ（fail-closed。security.md「不安全な設計」対応）。
 pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
-    let is_integer_literal = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
-    if is_integer_literal {
-        let as_int: u64 = raw.parse().map_err(|_| {
+    // `sql::lexer::lex_number`（Issue #885・D5）は `NUMERIC` 列の受理文法に
+    // 合わせ、末尾ドット付き整数（`1.` 形。小数部が空）も 1 トークンとして
+    // 生成するようになった。この形は数学的には整数だが、桁だけを見る
+    // `bytes().all(is_ascii_digit)` 判定はドットの分だけ弾いてしまい、
+    // 2^53 を超える値（`9007199254740993.` 等）が exactness ガードを
+    // 素通りして下の `raw.parse::<f64>()` で無音に丸められる（Cursor Bugbot
+    // 指摘・PR #1020）。末尾ドットを取り除いた残りが 1 桁以上の数字のみで
+    // あれば、同じ整数として exactness 判定の対象に含める。
+    let integer_digits: Option<&str> = if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit())
+    {
+        Some(raw)
+    } else if let Some(stripped) = raw.strip_suffix('.') {
+        (!stripped.is_empty() && stripped.bytes().all(|b| b.is_ascii_digit())).then_some(stripped)
+    } else {
+        None
+    };
+    if let Some(digits) = integer_digits {
+        let as_int: u64 = digits.parse().map_err(|_| {
             // 桁数が多すぎて `u64` にも収まらない（`u64::MAX` 超）場合も、
             // `f64` で正確に表現できないことに変わりはない。
             SqlSurfaceError::invalid_input(
@@ -730,6 +746,11 @@ fn bind_expr_in(
                     }
                     ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ENUM columns are not supported)"
+                    ))),
+                    // 式中の NUMERIC 列参照は対象外（TABLE-13〔検討中〕・
+                    // TASK-197、Issue #885。別 Issue #891 の担当）。
+                    ColumnType::Numeric { .. } => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (NUMERIC columns are not supported)"
                     ))),
                 };
             }
@@ -1479,6 +1500,25 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.wire_code(), "22000");
         assert_eq!(registry.len(), 1, "h should not have been registered");
+    }
+
+    #[test]
+    fn trailing_dot_integer_beyond_f64_exact_range_is_rejected_not_silently_rounded() {
+        // Cursor Bugbot 指摘（PR #1020）: `sql::lexer::lex_number`（Issue #885・D5）
+        // が生成する末尾ドット付き整数トークン（`1.` 形）は、桁だけを見る旧判定
+        // （`bytes().all(is_ascii_digit)`）だと非整数扱いになり exactness ガードを
+        // 素通りしていた。`9007199254740993.`（2^53 超）が `22000` で拒否される
+        // ことを固定する。
+        let err = parse_number_literal("9007199254740993.").unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn trailing_dot_integer_within_f64_exact_range_still_parses() {
+        // `1.` のような、小数部が空の末尾ドット付き整数は正確表現域内であれば
+        // 引き続き受理される（拒否対象は exactness を失う場合のみ）。
+        let value = parse_number_literal("42.").expect("should parse");
+        assert_eq!(value, 42.0);
     }
 
     #[test]

@@ -216,7 +216,19 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
         }
         // タグ 3〜6 は INTEGER/BIGINT/REAL/DOUBLE（別 Issue の作業）向けに予約し、
         // BOOLEAN は TABLE-13 の宣言順で 7 とする（Issue #883。他の型と衝突しない
-        // 新規タグ）。
+        // 新規タグ）。8〜9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約する。
+        // NUMERIC は当初宣言順の 10 を想定していたが、base（main）マージ取り込みで
+        // ARRAY（Issue #888）がタグ 10 を先に使用していたため、Issue #885 の
+        // origin/main への rebase 時点（NUMERIC の content_hash はまだ一度も
+        // 永続化されていないため後方互換の懸念なし）で衝突しない未使用タグ 14 へ
+        // 採番し直した（ENUM のタグ 13 の次点）。ハッシュ対象は束縛後の正規値
+        // （`scale` + `unscaled`）のため、同一列へ再送された `1.10` と `1.1` は
+        // 同一ハッシュ（`23505`）に収束する。
+        Value::Numeric(d) => {
+            b.push_u8(14);
+            b.push_u8(d.scale());
+            b.push_bytes(&d.unscaled().to_le_bytes())?;
+        }
         Value::Bool(b_val) => {
             b.push_u8(7);
             b.push_u8(u8::from(*b_val));
@@ -2070,5 +2082,51 @@ mod tests {
             h_empty, h_populated,
             "UDF section must be omitted entirely when no UDF is referenced by WHERE"
         );
+    }
+
+    /// NUMERIC 値（TABLE-13〔検討中〕・TASK-197、Issue #885・D7）のハッシュは、
+    /// 正規化後の値（scale + unscaled）だけで決まる。表記が異なっても
+    /// 正規値が一致すれば同一ハッシュ、正規値が異なれば別ハッシュになる
+    /// （`operation_id` 再送判定の `23505`／`22023` 分岐の土台）。
+    #[test]
+    fn push_value_numeric_hash_depends_only_on_normalized_value() {
+        let mut b1 = HashInputBuilder::new(OpTag::Insert);
+        push_value(
+            &mut b1,
+            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 2).expect("valid scale")),
+        )
+        .expect("push numeric");
+        let h1 = b1.finish();
+
+        // 同じ正規値（1.50）を異なる unscaled/scale の組み合わせで表現しても、
+        // 実際にはスキーマの scale が固定されているため通常は起こらないが、
+        // ハッシュ自体は入力バイト列に忠実であることを確認する（scale が異なれば
+        // 別ハッシュ）。
+        let mut b2 = HashInputBuilder::new(OpTag::Insert);
+        push_value(
+            &mut b2,
+            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 2).expect("valid scale")),
+        )
+        .expect("push numeric");
+        let h2 = b2.finish();
+        assert_eq!(h1, h2, "identical normalized value must hash identically");
+
+        let mut b3 = HashInputBuilder::new(OpTag::Insert);
+        push_value(
+            &mut b3,
+            &Value::Numeric(crate::numeric::Decimal::from_parts(200, 2).expect("valid scale")),
+        )
+        .expect("push numeric");
+        let h3 = b3.finish();
+        assert_ne!(h1, h3, "differing normalized value must not collapse");
+
+        let mut b4 = HashInputBuilder::new(OpTag::Insert);
+        push_value(
+            &mut b4,
+            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 3).expect("valid scale")),
+        )
+        .expect("push numeric");
+        let h4 = b4.finish();
+        assert_ne!(h1, h4, "differing scale must not collapse to the same hash");
     }
 }

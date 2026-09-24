@@ -181,6 +181,13 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             engine::json::write_canonical(&value, out);
             Ok(())
         }
+        Cell::Numeric(d) => {
+            // 正規テキスト表現（`Decimal::Display`。先頭ゼロ・指数表記・
+            // `-0` を持たない）をそのまま JSON number として書く（D8。
+            // TABLE-13〔検討中〕・TASK-197、Issue #885）。精度は失わない。
+            let _ = write!(out, "{d}");
+            Ok(())
+        }
     }
 }
 
@@ -533,6 +540,37 @@ mod tests {
             body,
             "{\"columns\":[{\"name\":\"id\",\"type\":\"numeric\"},\
 {\"name\":\"lang\",\"type\":\"text\"}],\"rows\":[[1,\"ja\"]],\"row_count\":1}"
+        );
+    }
+
+    /// NUMERIC 列（TABLE-13〔検討中〕・TASK-197、Issue #885）の JSON 出力は
+    /// 正規テキスト表現（`Decimal::Display`）を bare な JSON number として書く
+    /// （D8）。先頭ゼロ・指数表記・`-0` を持たないため JSON 文法として妥当。
+    #[test]
+    fn numeric_cell_encodes_as_bare_json_number() {
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "price".to_string(),
+                ty: ColumnType::Numeric {
+                    precision: 5,
+                    scale: 2,
+                },
+            }],
+            rows: vec![
+                row(vec![Cell::Numeric(
+                    engine::numeric::Decimal::from_parts(150, 2).expect("valid scale"),
+                )]),
+                row(vec![Cell::Numeric(
+                    engine::numeric::Decimal::from_parts(-150, 2).expect("valid scale"),
+                )]),
+                row(vec![Cell::Null]),
+            ],
+        };
+        let body = encode(&result).expect("encode");
+        assert_eq!(
+            body,
+            "{\"columns\":[{\"name\":\"price\",\"type\":\"numeric\"}],\
+\"rows\":[[1.50],[-1.50],[null]],\"row_count\":3}"
         );
     }
 
