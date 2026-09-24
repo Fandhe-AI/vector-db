@@ -153,6 +153,8 @@ define_error_classes! {
     /// 構文上受理された値が、宣言済み型の表現として不正（`22P02`）。ENUM 列
     /// （TABLE-14・TASK-198）の語彙外ラベルが最初の送出経路（[`crate::catalog::
     /// EnumLabelError`]・`sql::allowlist::SqlSurfaceError::InvalidTextRepresentation`）。
+    /// UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の厳密文法違反
+    /// （[`crate::uuid::UuidTextError`]）も同じ分類・同じ経路を共有する。
     /// `InvalidInput`（`22000`）が「値の種類・形式自体が列型と噛み合わない」を表すのに
     /// 対し、本分類は「値は文字列として妥当だが、宣言済み型が定める表現の集合に
     /// 属さない」ことを表す（PostgreSQL の `invalid_text_representation` と同じ区別）。
