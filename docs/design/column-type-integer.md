@@ -70,8 +70,12 @@
 （`BIGINT`）の腕を追加した。wire-server は `Cell` を網羅 match しているため
 `result_encoder::cell_to_text`（text 形式）・
 `http/query/response.rs::write_cell`（JSON 数値）に腕を追加するだけで済んだ。
-`RowDescription` の OID 写像は `ColumnMeta::Scalar` のまま不変（`text`。
-Issue #895 の担当）。
+`RowDescription` の OID 写像は当初 `ColumnMeta::Scalar` のまま `text` 固定と
+していたが、PR レビュー指摘（psql・ドライバ・ORM・JSON クライアントが整数列を
+文字列として扱ってしまう）を受け、`result_encoder.rs::column_wire_type` を
+`ColumnType` ごとに分岐させ `INTEGER`→`int4`（OID 23）／`BIGINT`→`int8`
+（OID 20）へ是正した（Issue #895 のうち整数型分を実装。`ColumnType::Boolean`
+は引き続き `text`（OID 25）のまま Issue #895 の残課題とする）。
 
 ### D6: 後続 Issue 担当の機能を fail-closed に拒否する箇所
 
@@ -113,7 +117,8 @@ Issue #895 の担当）。
 - `WHERE` 述語・式評価での整数列参照 → #891
 - 集計（`SUM`/`AVG`/`MIN`/`MAX`/`GROUP BY`）の整数列対応 → #892
 - スカラー列二次索引の整数列対応 → #893。3 段階デコード tier の最適化 → #894
-- `RowDescription` の型 OID 写像（`int4`/`int8`）→ #895
+- `RowDescription` の型 OID 写像は `INTEGER`/`BIGINT` 分を実装済み（本節
+  「D5」参照）。`BOOLEAN` 列の OID 写像は引き続き #895 の担当
 - NoSQL の JSON 束縛（JSON 数値 → 整数列）→ #896
 - `22P02`（形式不正）の新設 → TASK-227／#897（本 Issue では `22000` で暫定拒否）
 - SQL の DDL（`CREATE TABLE` 文）→ Phase 3（SQL-23）

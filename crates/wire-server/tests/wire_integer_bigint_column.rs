@@ -50,8 +50,11 @@ fn spawn_with_alice(core: Arc<EngineCore>) -> std::net::TcpStream {
     authenticate_to_ready_for_query(addr, "alice", "pw-alice")
 }
 
-/// `DataRow` は `INTEGER`／`BIGINT` 列を 10 進テキストとしてそのまま送出する
-/// （`RowDescription` の OID 写像は既存どおり `text` のまま。Issue #895）。
+/// `DataRow` は `INTEGER`／`BIGINT` 列を 10 進テキストとしてそのまま送出し、
+/// `RowDescription` はそれぞれ `int4`（OID 23）／`int8`（OID 20）として公告する
+/// （Issue #903 レビュー指摘: 一律 `text`（OID 25）で公告すると psql・ドライバ・
+/// ORM が整数列を文字列として扱ってしまうため是正。`result_encoder.rs::
+/// column_wire_type` が単一情報源）。
 #[test]
 fn wire_select_returns_integer_and_bigint_as_decimal_text() {
     let (core, _guard) = new_core_with_integer_table();
@@ -71,7 +74,12 @@ fn wire_select_returns_integer_and_bigint_as_decimal_text() {
     read_ready_for_query(&mut stream);
 
     send_simple_query(&mut stream, "SELECT n, b FROM docs WHERE id = 1 LIMIT 10");
-    let _columns = read_row_description(&mut stream);
+    let columns = read_row_description_with_oids(&mut stream);
+    assert_eq!(
+        columns,
+        vec![("n".to_string(), 23), ("b".to_string(), 20)],
+        "INTEGER must announce OID 23 (int4), BIGINT must announce OID 20 (int8)"
+    );
     let row = read_data_row(&mut stream);
     assert_eq!(
         row,
