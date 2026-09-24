@@ -2,15 +2,15 @@
 
 ## ステータス
 
-Implemented（本 Issue の範囲。`$n` パラメータ束縛・型 OID 推論は WIRE-12・
-#935、暗黙トランザクションブロックは #942・RECOVER-12・SQL-31、
+Implemented（本 Issue の範囲。`$n` パラメータ束縛・型 OID 推論は
+WIRE-12・#935、暗黙トランザクションブロックは #942・RECOVER-12・SQL-31、
 ReadyForQuery の状態バイトは #943・WIRE-19 の担当のまま）。結果 format
 code のバイナリエンコード（WIRE-14・#936・PR #998）は本 Issue でマージ後に
 結線済み——「対象ファイル」「スコープ外・申し送り」節参照。
 
 ## 背景
 
-#933 で Parse（'P'）・Describe（'D' の statement 対象）を受理できるように
+先行の #933 で Parse（'P'）・Describe（'D' の statement 対象）を受理できるように
 なった一方、Bind（'B'）・Execute（'E'）・Sync（'S'）・Close（'C'）・
 Flush（'H'）と、Describe の portal 対象（種別 'P'）は `0A000`＋切断のまま
 だった（`docs/design/wire-extended-query-parse-describe.md` 参照）。
@@ -139,7 +139,7 @@ Sync バッチ内で後続のメッセージが失敗しても、先に commit �
 
 ## write-through の理由（RECOVER-5）
 
-#933 と同じくメッセージごとに即時書き出す write-through 方式を採る
+先行の #933 と同じくメッセージごとに即時書き出す write-through 方式を採る
 （PostgreSQL プロトコル上バックエンドは任意時点で応答してよい）。Execute は
 `ResponseBoundaryGuard`（RECOVER-5 (3)）・緊急応答登録（RECOVER-6）を、
 簡易クエリと同じ「commit から応答送出完了までの区間をメッセージ内に閉じる」

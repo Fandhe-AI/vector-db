@@ -18,9 +18,11 @@ lingering close で拒否していた。libpq／psycopg 3／node pg・JDBC 等�
 vector-db-spec 側の改訂（2026-09-22）で WIRE-11（拡張クエリプロトコル実装
 契約）が新設され、#933／#934 を直接の実装 Issue として参照した。
 
-## 受理範囲（本 Issue。#934 以降は portal も構築されるようになり、Describe
-（'D' 種別 P）・Bind／Execute／Sync／Close／Flush はすべて受理される。詳細は
-`docs/design/wire-extended-query-bind-execute-sync.md` 参照）
+## 受理範囲（本 Issue）
+
+本 Issue（#934）以降は portal も構築されるようになり、Describe（'D' 種別
+P）・Bind／Execute／Sync／Close／Flush はすべて受理される。詳細は
+`docs/design/wire-extended-query-bind-execute-sync.md` 参照。
 
 | メッセージ | 挙動（#933 時点） |
 | --- | --- |

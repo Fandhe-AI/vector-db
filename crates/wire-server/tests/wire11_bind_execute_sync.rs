@@ -320,6 +320,69 @@ fn max_rows_splits_result_without_reexecuting() {
     assert_eq!(count, 5);
 }
 
+/// PR #1013 レビュー指摘（P0）: 中断保持する未送出行の合計バイト数上限
+/// （`MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION`＝16 MiB）は portal 単体ではなく
+/// 接続（セッション）全体で合算して適用される契約を固定する。1 個の
+/// 名前付き portal が上限未満（約 10 MiB）の分だけ中断保持している状態で、
+/// 別の名前付き portal が同じ接続上でさらに約 10 MiB を中断保持しようと
+/// すると、合計が上限を超えるため 2 個目の Execute は `54000` で拒否される
+/// （portal 単体判定のままなら両方とも上限未満として通ってしまう）。
+///
+/// 1 文の SQL テキスト長には別途上限（`sql::lexer::MAX_INPUT_LEN`＝1 MiB）が
+/// あるため、1 行あたり約 1 MiB の `body` を持つ行を複数（11 行）挿入し、
+/// 1 行だけ送出（`max_rows=1`）して残り 10 行（約 10 MiB）を中断保持させる
+/// ことで境界を作る。
+#[test]
+fn suspended_portal_bytes_are_accounted_across_the_whole_session_not_per_portal() {
+    const ROW_BODY_LEN: usize = 1_000_000;
+    const ROW_COUNT: u64 = 11;
+
+    let (core, _guard) = new_core_with_documents_table();
+    let big_body = "x".repeat(ROW_BODY_LEN);
+    for id in 1..=ROW_COUNT {
+        let sql = format!(
+            "INSERT INTO documents (id, embedding, body) VALUES ({id}, '[0.1,0.2,0.3]', '{big_body}') USING OPERATION_ID 'seed-big-{id}'"
+        );
+        let mut session = engine::sql::mode::SessionState::default();
+        core.execute_sql_in_session(&owner_ctx(), &mut session, &sql)
+            .expect("seed big-body insert succeeds");
+    }
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    let sql = "SELECT id, body FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 11";
+
+    // 1 個目の portal: 11 行中 1 行だけ送出し、残り 10 行（約 10 MiB）を
+    // 中断保持する。単体では上限（16 MiB）未満のため成功する。
+    parse_and_bind(&mut stream, "s1", "p1", sql);
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 1));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'D');
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b's', "expected PortalSuspended for p1");
+
+    // 2 個目の portal（別名。同一接続）: こちらも残り 10 行（約 10 MiB）を
+    // 中断保持しようとするが、p1 の中断保持分と合算すると接続全体で
+    // 約 20 MiB となり上限（16 MiB）を超えるため 54000 で拒否される。
+    parse_and_bind(&mut stream, "s2", "p2", sql);
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p2", 1));
+    assert_error_then_recovers(&mut stream, "54000");
+
+    // p1 は影響を受けず、残り 10 行を通常どおり送出できる（セッション上限
+    // 超過の拒否が既存の中断状態を破壊しない）。
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 0));
+    for _ in 0..10 {
+        let (kind, _) = read_message(&mut stream);
+        assert_eq!(kind, b'D');
+    }
+    let (kind, tag) = read_message(&mut stream);
+    assert_eq!(kind, b'C');
+    // `CommandComplete` のタグは累計ではなく直近 Execute で送出した行数
+    // （既存の `max_rows_splits_result_without_reexecuting` と同じ仕様）。
+    assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "SELECT 10");
+}
+
 /// 受け入れ条件 3: `INSERT ... USING OPERATION_ID` を拡張経路で実行すると
 /// `INSERT 0 1` が返り、後続の SELECT から見える。同じ operation_id の再送は
 /// `23505`、内容を変えた再送は `22023`（いずれも同期回復する）。

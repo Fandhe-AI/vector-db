@@ -39,9 +39,15 @@
 //! 破棄される（PostgreSQL と同じ挙動）。Close(Statement) はその statement
 //! から作られた portal もまとめて閉じる。
 //!
-//! 中断中の portal が保持するバイト数（[`crate::limits::
-//! MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION`]）は本モジュールの実装上、portal
-//! 単体への上限として運用する（同定数のドキュメント参照）。
+//! 中断中の全 portal が保持するバイト数の合計（[`crate::limits::
+//! MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION`]）は接続（セッション）全体の
+//! 上限として運用する（[`PortalStore::total_suspended_bytes_excluding`]。
+//! 名前付き portal は最大 [`MAX_PORTALS_PER_SESSION`] 個まで同時に中断され
+//! うるため、portal 単体への上限にすると接続全体では約
+//! `MAX_PORTALS_PER_SESSION` 倍相当まで保持できてしまう。PR #1013 レビュー
+//! 指摘・P0）。判定は Execute が実行結果を行単位でエンコードする最中に
+//! 逐次行い、超過が判明した時点で残りの行のエンコードを打ち切る（超過判明
+//! 前に結果セット全体をメモリへ確保しない。PR #1013 レビュー指摘・P0）。
 //!
 //! # SQLSTATE 写像（spec に専用コードが無い箇所は既存の閉じた 16 分類
 //! [`engine::error_format::ErrorClass`] へ倒す。詳細は各エラー variant の
@@ -491,6 +497,12 @@ enum PortalState {
     /// 完了済み（副作用は再実行しない。再 Execute には保持済みの `tag`
     /// （実装既定値として件数 0 のタグ）を返す契約）。
     Done { tag: String },
+    /// `engine::execute_parsed_in_session` による実行（副作用を含みうる）
+    /// 自体は成功したが、その後の後処理（結果列整合検査・行エンコード・
+    /// 中断バイト上限判定）で失敗した終端状態。実行は既に確定しているため、
+    /// 以降の再 Execute で `engine::execute_parsed_in_session` を再実行して
+    /// 副作用を重複させることを防ぐ（PR #1013 レビュー指摘・P1）。
+    Failed,
 }
 
 struct Portal {
@@ -575,6 +587,32 @@ impl PortalStore {
     fn remove_all_for_statement(&mut self, statement_name: &str) {
         self.portals
             .retain(|_, p| p.source_statement != statement_name);
+    }
+
+    /// `exclude` 以外の全 portal が `Suspended` 状態で保持している未送出
+    /// `DataRow` フレームの合計バイト数を求める（`Ready`／`Done`／`Failed`
+    /// の portal は 0 として扱う）。名前付き portal は最大
+    /// [`MAX_PORTALS_PER_SESSION`] 個まで同時に中断されうるため、
+    /// [`crate::limits::MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION`]
+    /// をセッション全体（接続全体）で守るには 1 portal 単体の保持量ではなく
+    /// この合計値に対して上限を適用する必要がある（PR #1013 レビュー
+    /// 指摘・P0: portal 単体判定のままだと最大 64 個の portal を上限直下まで
+    /// 中断させ、接続全体では上限の約 64 倍相当を保持できてしまう）。
+    /// `exclude` は呼び出し元（今まさに実行結果をエンコードしている portal）
+    /// を除くためで、その portal 自身の新規分は呼び出し元が別途加算する。
+    fn total_suspended_bytes_excluding(&self, exclude: &str) -> usize {
+        self.portals
+            .iter()
+            .filter(|(name, _)| name.as_str() != exclude)
+            .map(|(_, portal)| match &portal.state {
+                PortalState::Suspended(rows) => rows
+                    .frames
+                    .iter()
+                    .map(Vec::len)
+                    .fold(0usize, |acc, len| acc.saturating_add(len)),
+                PortalState::Ready | PortalState::Done { .. } | PortalState::Failed => 0,
+            })
+            .fold(0usize, |acc, n| acc.saturating_add(n))
     }
 }
 
@@ -1260,14 +1298,50 @@ fn execute_portal(
         })
         .map_err(HandlerError::Sql)?;
 
+        // `outcome` の時点で実行（副作用を含みうる）自体はすでに確定している。
+        // これ以降（結果列整合検査・行エンコード・中断バイト上限判定）の
+        // 失敗はすべて「実行成功後の後処理失敗」であり、portal を `Ready`
+        // のまま残すと次の Execute で `engine::execute_parsed_in_session` が
+        // 再実行され副作用が重複しうる（PR #1013 レビュー指摘・P1）。
+        // 後続処理の成否によらず再実行を防ぐため、先に `Failed`（終端状態）へ
+        // 倒しておき、後処理が成功した場合のみ末尾で正しい状態へ上書きする。
+        {
+            let portal = state
+                .portals
+                .get_mut(portal_name)
+                .ok_or(HandlerError::UnknownPortal)?;
+            portal.state = PortalState::Failed;
+        }
+
         let new_state = match crate::simple_query::map_outcome(outcome) {
             crate::simple_query::OutcomeResponse::Command { tag } => PortalState::Done { tag },
             crate::simple_query::OutcomeResponse::Rows { result, shape } => {
                 if Some(&result.columns) != expected_columns.as_ref() {
                     return Err(HandlerError::ResultTypeChanged);
                 }
-                let mut frames = std::collections::VecDeque::with_capacity(result.rows.len());
-                for row in &result.rows {
+                // `max_rows` が指定する送出予定行数（`take`）は行を実際に
+                // エンコードせずとも `result.rows.len()` から先に求まる。
+                // 中断保持へ回る行（`take` 以降）だけを対象に、1 行
+                // エンコードするたびに合計バイト数をセッション全体
+                // （他の全 portal の中断保持分を含む。PR #1013 レビュー
+                // 指摘・P0: portal 単体判定だと名前付き portal 最大 64 個で
+                // 接続全体では上限の約 64 倍相当を保持できてしまう）で
+                // 判定し、超過が判明した時点で残りの行を一切エンコードせず
+                // 即座に拒否する（超過判明前に結果セット全体を確保する
+                // P0: 小さい `max_rows` を指定しても外部 wire 入力由来の
+                // 大きな結果セット全体が先にメモリへ確保されてしまう、を
+                // 回避する）。
+                let total = result.rows.len();
+                let take = if max_rows <= 0 {
+                    total
+                } else {
+                    (max_rows as usize).min(total)
+                };
+                let other_suspended_bytes =
+                    state.portals.total_suspended_bytes_excluding(portal_name);
+                let mut remaining_bytes: usize = 0;
+                let mut frames = std::collections::VecDeque::with_capacity(total);
+                for (idx, row) in result.rows.iter().enumerate() {
                     // Bind 時点で確定した結果 format code（WIRE-14。
                     // `Portal::result_formats`）を反映する。`validate_binary_
                     // formats` が Bind で事前検査済みのため、ここでの
@@ -1281,6 +1355,13 @@ fn execute_portal(
                         &mut frame,
                     )
                     .map_err(|_| internal_error("failed to encode data row"))?;
+                    if idx >= take {
+                        remaining_bytes = remaining_bytes.saturating_add(frame.len());
+                        let session_total = other_suspended_bytes.saturating_add(remaining_bytes);
+                        if session_total > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION {
+                            return Err(HandlerError::SuspendedBytesExceeded);
+                        }
+                    }
                     frames.push_back(frame);
                 }
                 PortalState::Suspended(PortalRows { frames, shape })
@@ -1308,10 +1389,14 @@ fn execute_portal(
         let rows = match &mut portal.state {
             PortalState::Suspended(rows) => rows,
             // `Ready` はここに至る前に実行済みへ遷移し、`Done` は直前で
-            // 早期 return 済みのはず。内部状態機械の不変条件が将来の変更で
-            // 崩れた場合に備えて panic ではなく fail-closed な内部エラーへ
-            // 倒す（wire 入力経路で panic を避ける方針）。
-            PortalState::Ready | PortalState::Done { .. } => {
+            // 早期 return 済みのはず。`Failed` は実行成功後の後処理
+            // （結果列整合検査・行エンコード・中断バイト上限判定）が失敗した
+            // 終端状態で、再実行を許さず fail-closed に内部エラーを返す
+            // （PR #1013 レビュー指摘・P1）。内部状態機械の不変条件が将来の
+            // 変更で崩れた場合に備え、それ以外の到達もここでは panic ではなく
+            // fail-closed な内部エラーへ倒す（wire 入力経路で panic を
+            // 避ける方針）。
+            PortalState::Ready | PortalState::Done { .. } | PortalState::Failed => {
                 return Err(internal_error(
                     "portal state machine invariant violated: expected Suspended state",
                 ))
@@ -1324,16 +1409,6 @@ fn execute_portal(
         } else {
             (max_rows as usize).min(total)
         };
-
-        if take < total {
-            // 中断保持へ入る前に、保持し続ける残り分の合計バイト数を判定する
-            // （1 行も送る前に判定。`crate::limits::
-            // MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION` 参照）。
-            let remaining_bytes: usize = rows.frames.iter().skip(take).map(Vec::len).sum();
-            if remaining_bytes > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION {
-                return Err(HandlerError::SuspendedBytesExceeded);
-            }
-        }
 
         let hint: usize = rows.frames.iter().take(take).map(Vec::len).sum();
         let mut buffer = crate::response_buffer::ResponseBuffer::with_capacity_hint(
