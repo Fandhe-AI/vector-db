@@ -3661,6 +3661,30 @@ impl EngineCore {
                     }
                     // BOOLEAN 値は行コーデック上 1 バイト固定（Issue #883・D-a）。
                     crate::row_codec::Value::Bool(_) => 1,
+                    // 配列値（Issue #888）は実際の行コーデック（`row_codec::
+                    // scalar_array_entry_len`）が書き込むフレーム込みの全
+                    // エンコード長をそのまま使う（presence(1)・flags(1)・
+                    // count(4)・payload_len(4) のフレームヘッダ＋各要素の
+                    // フレーミング。TEXT 要素は 4 バイトの長さプレフィックス
+                    // を含む）。要素本文のみを積算すると、例えば空文字列
+                    // 1,024 個の配列がここでは 0 バイトとして扱われる一方、
+                    // 実エンコードでは要素長フィールドだけで 4 KiB 超を消費し
+                    // INDEX-4 の行別・バッチ合計バイト上限を迂回できてしまう
+                    // （codex-review P1 指摘・PR #1011）。
+                    crate::row_codec::Value::Array(array_value) => {
+                        let entry_len = crate::row_codec::scalar_array_entry_len(
+                            array_value.elem(),
+                            array_value,
+                        )
+                        .map_err(|e| {
+                            crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string())
+                        })?;
+                        usize::try_from(entry_len).map_err(|_| {
+                            crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                                "INSERT batch array entry length overflow",
+                            )
+                        })?
+                    }
                     // BYTEA は TEXT と同じく本体長のみを数える（フレーミングの
                     // オーバーヘッドは他の値種別も同様に含めていないため対称、Issue #886）。
                     crate::row_codec::Value::Bytes(b) => b.len(),
@@ -7029,5 +7053,44 @@ mod tests {
             from_storage_hnsw_core.search_engine_kind(),
             Some(crate::search_engine::SearchEngineKind::Hnsw(_))
         ));
+    }
+
+    // 対象指摘: codex-review P1（PR #1011）。`validate_insert_batch_byte_and_chunk_limits`
+    // が配列値のフレーミング（presence(1)・flags(1)・count(4)・payload_len(4)・
+    // 要素ごとの長さプレフィックス(4)）を積算せず要素本文のみを数えていたため、
+    // 空文字列を大量に持つ配列で INDEX-4 の行別バイト上限（②）を迂回できた。
+    // 空文字列 1,024 個の配列は要素本文としては 0 バイトだが、実エンコード
+    // （`row_codec::scalar_array_entry_len`）ではフレームだけで 10 + 1,024*4 =
+    // 4,106 バイトを消費する。②を「フレーム込みで 100 バイト」まで絞った
+    // `BatchLimits` の下でこの行が拒否されることを固定する。
+    #[test]
+    fn insert_batch_array_byte_limit_counts_full_frame_not_just_element_payload() {
+        let dir = tempdir();
+        let mut core = new_core(dir.path());
+        core.batch_limits = crate::batch_limits::BatchLimits {
+            max_files_per_batch: 64,
+            max_file_body_bytes: 100,
+            max_batch_total_bytes: 1_000_000,
+            max_batch_chunks: 1_000_000,
+        };
+
+        let empty_strings: Vec<String> = std::iter::repeat_with(String::new).take(1024).collect();
+        let bound = crate::sql::parser::BoundInsert {
+            table: "docs".to_string(),
+            id: 1,
+            values: vec![crate::row_codec::Value::Array(
+                crate::row_codec::ArrayValue::Text(empty_strings),
+            )],
+            operation_id: Some(
+                crate::sql::using_operation_id::OperationId::parse("op-array-batch-limit")
+                    .expect("valid operation id"),
+            ),
+        };
+
+        let result = core.validate_insert_row_batch_limits(std::slice::from_ref(&bound));
+        assert!(
+            result.is_err(),
+            "array framing overhead must count toward the per-row byte limit (INDEX-4 ②)"
+        );
     }
 }
