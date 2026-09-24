@@ -1684,7 +1684,129 @@ fn validate_set_assignments(
                     ))));
                 }
             }
-            _ => {
+            (crate::catalog::ColumnType::Boolean, crate::row_codec::Value::Bool(_)) => {
+                // BOOLEAN 値は行コーデック上 1 バイト固定
+                // （`row_codec::SCALAR_BOOL_ENTRY_LEN`）のため、TEXT のような
+                // 長さ検証は不要（Issue #883・D-a）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_BOOL_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::Array(array_ty), crate::row_codec::Value::Array(av)) => {
+                // 配列 SET 値のフレーム長検証（対象行の探索より前に行う。
+                // Issue #888・D-A3。`row_codec::scalar_array_entry_len` を
+                // 実エンコード（`encode_scalar_columns`）と共有し、事前検証と
+                // 実エンコードの乖離によるテナント境界漏えいを防ぐ）。
+                if av.elem() != array_ty.elem() {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "SET column type does not match the current table schema".to_string(),
+                    )));
+                }
+                if av.len() as u64 > array_ty.max_len() as u64 {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "array element count exceeds limit {}",
+                        array_ty.max_len()
+                    ))));
+                }
+                let entry_len = crate::row_codec::scalar_array_entry_len(array_ty.elem(), av)
+                    .map_err(|e| TenantWriteError::Catalog(CatalogError::Invalid(e.to_string())))?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::Bytea, crate::row_codec::Value::Bytes(b)) => {
+                // SET 値の BYTEA 長上限検証（対象行の探索より前に行う）。フレーミングは
+                // TEXT と同一のため `scalar_text_entry_len` を共有する（Issue #886）。
+                let byte_len = u32::try_from(b.len()).map_err(|_| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "bytea field too long: {} bytes",
+                        b.len()
+                    )))
+                })?;
+                if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "bytea field length {byte_len} exceeds limit {}",
+                        crate::bytea::MAX_BYTEA_FIELD_LEN
+                    ))));
+                }
+                let entry_len = crate::row_codec::scalar_text_entry_len(byte_len)
+                    .map_err(|e| TenantWriteError::Catalog(CatalogError::Invalid(e.to_string())))?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::Enum(def), crate::row_codec::Value::Enum(label)) => {
+                // SET 値の語彙検証（対象行の探索より前に行う。多層防御。
+                // 束縛層〔`sql::parser::bind_enum_literal`〕で既に検査済みだが、
+                // Rust API から直接渡された `Value::Enum` もここで拒否する。
+                // Issue #890。
+                if def.validate_label(label).is_err() {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "SET value {label:?} is not a member of enum type {:?}",
+                        def.name()
+                    ))));
+                }
+                let text_len = u32::try_from(label.len()).map_err(|_| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "enum label too long: {} bytes",
+                        label.len()
+                    )))
+                })?;
+                let entry_len = crate::row_codec::scalar_text_entry_len(text_len)
+                    .map_err(|e| TenantWriteError::Catalog(CatalogError::Invalid(e.to_string())))?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::Vector(_), _)
+            | (crate::catalog::ColumnType::Text, _)
+            | (crate::catalog::ColumnType::Boolean, _)
+            | (crate::catalog::ColumnType::Array(_), _)
+            | (crate::catalog::ColumnType::Bytea, _)
+            | (crate::catalog::ColumnType::Enum(_), _) => {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column type does not match the current table schema".to_string(),
                 )))
@@ -1692,6 +1814,75 @@ fn validate_set_assignments(
         }
     }
     Ok(())
+}
+
+/// 単一行 UPDATE（[`update_row_columns_unchecked`]）・述語つき UPDATE
+/// （[`update_rows_where_unchecked`]）が共有する read-merge-write 本体
+/// （Issue #996・SQL-19・TASK-192・RECOVER-11 ポインタ）。呼び出し元が
+/// 「所有・可視」と確定済みの既存行 `existing` を受け取り、
+/// [`validate_set_assignments`] 済みの `assignments` を適用した
+/// embedding・metadata（再エンコード済みバイト列）を組み立てて返す。
+///
+/// `existing.metadata` は今回の UPDATE 要求ではなく、過去に書き込まれ済みの
+/// 行データである。ここでのデコード失敗（[`crate::row_codec::scan_scalar_columns`]
+/// が返すエラー）はクライアント入力の不正ではなく、ストレージ側の破損・実装
+/// 不整合を示すため [`CatalogError::CorruptSchema`] へ丸める
+/// （`sql/exec.rs::map_write_error` の `_` 節経由で `XX000`／
+/// `SqlSurfaceError::Internal` へ写像され、detail はクライアントへ渡らない。
+/// `CatalogError::Invalid` へ丸めると `22000`「UPDATE の入力が不正」という
+/// 誤ったクライアントエラーになってしまう。codex-review P1 指摘・PR #989）。
+/// 一方、再エンコード自体の失敗（[`crate::row_codec::merge_encode_scalar_columns`]
+/// の累計上限超過等。クライアント入力である SET 値に起因し得る）は
+/// [`CatalogError::Invalid`] へ丸める。
+///
+/// [`crate::row_codec::decode_scalar_columns`]（全 `TEXT`／`BYTEA` 列を複製）
+/// ではなく借用版 [`crate::row_codec::scan_scalar_columns`] を使う
+/// （codex-review P1 指摘・PR #989: 部分 UPDATE 1 回あたり「対象行の全列を
+/// 複製する decode バッファ」＋「同程度を確保する encode バッファ」という
+/// 2 重のピーク確保を避ける）。SET 対象でない列は
+/// [`crate::row_codec::merge_encode_scalar_columns`] が借用のまま直接
+/// 書き込むため、複製されるのは SET 句の値（クライアント入力）のみに抑え
+/// られる。
+///
+/// VECTOR 列の SET があった場合に限り次元検証する（`validate_embedding_dim`
+/// は VECTOR 列を持たないテーブルで常に `Err` を返すため、TEXT 列等のみの
+/// UPDATE では既存 embedding を無検証のまま維持し、VECTOR 列なしテーブルを
+/// 壊さない。Issue #454 の VECTOR 列なしテーブルと同じ前提）。
+///
+/// SET 列が重複指定された場合（[`validate_set_assignments`] より前段の
+/// 束縛（`sql::parser`／NoSQL JSON 束縛）で拒否済みのため、表層からは到達
+/// しない）は [`crate::row_codec::merge_encode_scalar_columns`] の仕様どおり
+/// 先勝ち（`overrides` の宣言順走査で最初に一致した SET 値を採用）になる。
+/// 旧・述語つき UPDATE 実装は独自ループで後勝ちだったが、本関数への統一
+/// （Issue #996）により単一行 UPDATE と同じ意味論に揃った。
+fn merge_row_for_update(
+    schema: &crate::catalog::TableSchema,
+    existing: crate::storage::Row,
+    assignments: &[(usize, crate::row_codec::Value)],
+) -> Result<(Vec<f32>, Vec<u8>), CatalogError> {
+    let scanned = crate::row_codec::scan_scalar_columns(schema, &existing.metadata)
+        .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+    let mut embedding = existing.embedding;
+    let mut vector_assigned = false;
+    let mut overrides: Vec<(usize, &crate::row_codec::Value)> =
+        Vec::with_capacity(assignments.len());
+    for (idx, value) in assignments {
+        match value {
+            crate::row_codec::Value::Vector(v) => {
+                embedding = v.clone();
+                vector_assigned = true;
+            }
+            other => {
+                overrides.push((*idx, other));
+            }
+        }
+    }
+    if vector_assigned {
+        schema.validate_embedding_dim(embedding.len())?;
+    }
+    let metadata = crate::row_codec::merge_encode_scalar_columns(schema, &scanned, &overrides)
+        .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+    Ok((embedding, metadata))
 }
 
 pub(crate) fn update_row_columns_unchecked(
@@ -1880,62 +2071,19 @@ pub(crate) fn update_row_columns_unchecked(
         // `docs/design/update-single-row.md`「判断 D」参照。
         rows_affected = match visible_row {
             Some(row) => {
-                // `row.metadata` は今回の UPDATE 要求ではなく、過去に書き込まれ
-                // 済みの行データである。ここでのデコード失敗はクライアント入力の
-                // 不正ではなく、ストレージ側の破損・実装不整合を示す。`CatalogError::
-                // Invalid`（ユーザー入力の検証失敗）へ丸めると `map_write_error`
-                // （`sql/exec.rs`）が `22000` へ写像し「UPDATE の入力が不正」という
-                // 誤ったクライアントエラーになってしまう（同じ `sql/exec.rs` の
-                // `From<RowCodecError> for SqlSurfaceError` が格納済みペイロードの
-                // デコード失敗を fail-closed に `XX000` へ丸める契約と整合しない。
-                // codex-review P1 指摘・PR #989）。`CatalogError::CorruptSchema`
-                // （格納済みデータのデコード失敗を表す既存 variant。`map_write_error`
-                // の `_` 節経由で `XX000`／`SqlSurfaceError::Internal` へ丸まり、
-                // detail はクライアントへ渡らない）を使い、正しくサーバー内部事象
-                // として分類する。
+                // read-merge-write 本体は述語つき UPDATE
+                // （`update_rows_where_unchecked`）と共有する [`merge_row_for_update`]
+                // へ委譲済み（Issue #996。エラー分類・借用版デコードによる
+                // ピーク確保回避などの設計判断は同関数のドキュメント参照）。
                 //
-                // `decode_scalar_columns`（全 `TEXT` 列を `Value::Text` へ複製）
-                // ではなく借用版 `scan_scalar_columns` を使う（codex-review P1
-                // 指摘・PR #989 再指摘: 部分 UPDATE 1 回あたり「対象行の全 `TEXT`
-                // 列を複製する decode バッファ」＋「同程度を確保する encode
-                // バッファ」という 2 重のピーク確保が発生していた）。SET 対象で
-                // ない列は `merge_encode_scalar_columns` が借用 `&str` のまま
-                // 直接書き込むため、複製されるのは SET 句の値（クライアント入力）
-                // のみに抑えられる。
-                let existing = crate::row_codec::scan_scalar_columns(&schema, &row.metadata)
-                    .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
-                let mut embedding = row.embedding;
-                let mut vector_assigned = false;
-                let mut overrides: Vec<(usize, &crate::row_codec::Value)> =
-                    Vec::with_capacity(assignments.len());
-                for (idx, value) in assignments {
-                    match value {
-                        crate::row_codec::Value::Vector(v) => {
-                            embedding = v.clone();
-                            vector_assigned = true;
-                        }
-                        other => {
-                            overrides.push((*idx, other));
-                        }
-                    }
-                }
-                // VECTOR 列の SET があった場合に限り次元検証する
-                // （`validate_embedding_dim` は VECTOR 列を持たないテーブルで
-                // `Err` を返すため、TEXT 列のみの UPDATE では既存 embedding を
-                // 無検証のまま維持し、VECTOR 列なしテーブルを壊さない。Issue #454
-                // の VECTOR 列なしテーブルと同じ前提）。
-                if vector_assigned {
-                    schema.validate_embedding_dim(embedding.len())?;
-                }
-                let metadata =
-                    crate::row_codec::merge_encode_scalar_columns(&schema, &existing, &overrides)
-                        .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                // クライアントは `visibility` を SET 対象にできない
+                // （`sql::parser::bind_update` が `42601` で拒否済み。判断 D）。
+                // 既存値をそのまま維持する。
+                let visibility = row.visibility;
+                let (embedding, metadata) = merge_row_for_update(&schema, row, assignments)?;
                 let row_input = RowInput {
                     tenant_id: ctx.tenant_id(),
-                    // クライアントは `visibility` を SET 対象にできない
-                    // （`sql::parser::bind_update` が `42601` で拒否済み。判断 D）。
-                    // 既存値をそのまま維持する。
-                    visibility: row.visibility,
+                    visibility,
                     embedding: &embedding,
                     metadata: &metadata,
                 };
@@ -2616,10 +2764,12 @@ pub(crate) fn delete_rows_where_unchecked<E>(
 ///
 /// 処理順序は [`delete_rows_where_unchecked`] と同一（ADR §6）。適用段のみが
 /// 異なり、候補 `id` ごとに既存行を read-merge-write する
-/// （`upsert_typed_rows_unchecked` の `DoUpdate` 腕と同じ組み立て。`assignments`
-/// は束縛済みの `(列インデックス, 値)` 対応——`VECTOR` 列を対象とする割当は
-/// embedding を差し替え、それ以外は `merged_values` の対応スロットを上書きする。
-/// SET で触れない列・embedding・可視性は既存行の値を保持する）。
+/// （単一行 UPDATE と共有する [`merge_row_for_update`] 経由。Issue #996。
+/// `assignments` は束縛済みの `(列インデックス, 値)` 対応——`VECTOR` 列を
+/// 対象とする割当は embedding を差し替え、それ以外は既存の scalar 列群の
+/// 対応スロットを上書きする。SET で触れない列・embedding・可視性は既存行の
+/// 値を保持する。SET 列が重複指定された場合は先勝ち——束縛段で拒否済みの
+/// ため表層からは到達しない）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_rows_where_unchecked<E>(
     storage: &Storage,
@@ -2682,11 +2832,6 @@ pub(crate) fn update_rows_where_unchecked<E>(
         });
     }
 
-    let vector_idx = schema
-        .columns
-        .iter()
-        .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)));
-
     {
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
@@ -2712,64 +2857,19 @@ pub(crate) fn update_rows_where_unchecked<E>(
                     )));
                 }
             };
+            let visibility = existing.visibility;
 
-            // `existing.metadata` は今回の SET 句ではなく、既に永続化済みの行
-            // データである。ここでのデコード失敗はクライアント入力の不正では
-            // なく、ストレージ側の破損・実装不整合を示す。`CatalogError::Invalid`
-            // （ユーザー入力の検証失敗。`22000`）へ丸めると、単一行版
-            // `update_row_columns_unchecked` の同種デコード（格納済み行の
-            // `scan_scalar_columns` 失敗を `CorruptSchema`／`XX000` に固定する
-            // 契約）と矛盾し、内部事象をクライアント入力エラーへ誤分類して
-            // しまう（codex-review P1 指摘・PR #993 系・Issue #871）。
-            let mut merged_values =
-                crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
-                    .map_err(|e| CatalogError::CorruptSchema(e.to_string()))
-                    .map_err(dml_write_err)?;
-            let mut embedding_value: Vec<f32> = existing.embedding.clone();
-            let mut vector_assigned = false;
-
-            for (col_idx, value) in assignments {
-                if Some(*col_idx) == vector_idx {
-                    match value {
-                        crate::row_codec::Value::Vector(v) => {
-                            embedding_value = v.clone();
-                            vector_assigned = true;
-                        }
-                        _ => {
-                            return Err(dml_write_err(CatalogError::Invalid(
-                                "VECTOR column SET value must be a vector".to_string(),
-                            )))
-                        }
-                    }
-                } else {
-                    let slot = merged_values.get_mut(*col_idx).ok_or_else(|| {
-                        CatalogError::Invalid(
-                            "internal: SET target column index out of range".to_string(),
-                        )
-                    });
-                    let slot = slot.map_err(dml_write_err)?;
-                    *slot = value.clone();
-                }
-            }
-
-            // VECTOR 列の SET があった場合に限り次元検証する（単一行版
-            // `update_row_columns_unchecked` と同じ契約。`validate_embedding_dim`
-            // は VECTOR 列を持たないスキーマで常に `Err` を返すため、無条件に
-            // 呼ぶと TEXT 列のみのテーブルへの正当な述語つき UPDATE が一致行を
-            // 持つだけで失敗してしまう。codex-review P1 指摘・PR #993 系・
-            // Issue #871）。
-            if vector_assigned {
-                schema
-                    .validate_embedding_dim(embedding_value.len())
-                    .map_err(dml_write_err)?;
-            }
-            let metadata = crate::row_codec::encode_scalar_columns(&schema, &merged_values)
-                .map_err(|e| CatalogError::Invalid(e.to_string()))
-                .map_err(dml_write_err)?;
+            // read-merge-write 本体は単一行 UPDATE
+            // （`update_row_columns_unchecked`）と共有する
+            // [`merge_row_for_update`] へ委譲済み（Issue #996。エラー分類・
+            // 借用版デコードによるピーク確保回避・SET 列重複時の意味論
+            // （先勝ち）などの設計判断は同関数のドキュメント参照）。
+            let (embedding_value, metadata) =
+                merge_row_for_update(&schema, existing, assignments).map_err(dml_write_err)?;
             let row = RowInput {
                 tenant_id: ctx.tenant_id(),
                 // 既存行の可視性を保持する（SET で触れない列と同じ扱い）。
-                visibility: existing.visibility,
+                visibility,
                 embedding: &embedding_value,
                 metadata: &metadata,
             };
@@ -2976,7 +3076,13 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 max_id = Some(max_id.map_or(id, |m: u64| m.max(id)));
                 let scanned = crate::row_codec::scan_scalar_columns(&schema, metadata)
                     .map_err(|e| TenantWriteError::Storage(StorageError::Codec(e.to_string())))?;
-                if scanned.get(key_idx).copied().flatten() == Some(key_value) {
+                if scanned
+                    .get(key_idx)
+                    .copied()
+                    .flatten()
+                    .and_then(|v| v.as_text())
+                    == Some(key_value)
+                {
                     to_remove.push(id);
                     if to_remove.len() > MAX_VISIBLE_ROWS {
                         return Err(TenantWriteError::Storage(StorageError::Codec(format!(
@@ -3453,7 +3559,12 @@ mod tests {
                 let scanned =
                     crate::row_codec::scan_scalar_columns(&file_schema("docs"), &r.metadata)
                         .expect("scan scalar columns");
-                scanned.get(2).copied().flatten().unwrap_or("")
+                scanned
+                    .get(2)
+                    .copied()
+                    .flatten()
+                    .and_then(|v| v.as_text())
+                    .unwrap_or("")
             })
             .collect();
         assert_eq!(rows.len(), 3);
@@ -4120,8 +4231,9 @@ mod tests {
     // `CatalogError::Invalid`（クライアント入力エラー・`22000`）に丸めないことを
     // 固定する。`sql::exec::execute_predicate_update` が実際に注入する述語
     // クロージャは候補判定時に必ず `row_codec::scan_scalar_columns` を実行するため
-    // 本番経路ではこの適用段の破損検出には到達しないが（`decode_scalar_columns`
-    // は内部で同じ `scan_scalar_columns` を呼ぶため先に失敗する）、既存行の
+    // 本番経路ではこの適用段の破損検出には到達しないが（適用段の
+    // `merge_row_for_update`〔Issue #996〕も内部で同じ `scan_scalar_columns` を
+    // 呼ぶため候補判定時点で先に失敗する）、既存行の
     // metadata を参照しない述語（本テストの `match_all`）を注入する呼び出し元にも
     // 同じ分類契約を保証する API 契約として固定する。
     #[test]
@@ -4251,7 +4363,9 @@ mod tests {
         let match_lang_ja = |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> {
             let existing = crate::row_codec::scan_scalar_columns(&schema, c.metadata)
                 .expect("decode seeded metadata");
-            Ok(matches!(existing.first(), Some(Some(s)) if *s == "ja"))
+            Ok(
+                matches!(existing.first(), Some(Some(s)) if *s == crate::row_codec::ScalarRef::Text("ja")),
+            )
         };
         let op_id = OperationId::parse("op-pred-no-vector-column").expect("valid operation_id");
 
@@ -4287,6 +4401,229 @@ mod tests {
                 "row {id} must reflect the expected lang/body after the predicate UPDATE"
             );
         }
+    }
+
+    /// [`update_rows_where_unchecked`] の raw 読み出し（`user_rows/{table}` の
+    /// 生バイト列）を取得する（Issue #996 のバイト同一性テスト専用ヘルパー。
+    /// `storage.get_row_from_table` はデコード済み [`crate::storage::Row`] しか
+    /// 返さないため、生バイトの比較にはこちらを使う）。
+    fn raw_row_bytes(storage: &Storage, table: &str, tenant: &str, id: u64) -> Vec<u8> {
+        let read_txn = storage.db().begin_read().expect("begin read txn");
+        let row_table_name = user_rows_table_name(table);
+        let row_table = read_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .expect("open row table for raw read");
+        row_table
+            .get(&(tenant, id))
+            .expect("get row")
+            .expect("row must exist")
+            .value()
+            .to_vec()
+    }
+
+    /// 述語つき UPDATE を `merge_row_for_update` へ統一する（Issue #996）前の
+    /// 旧実装アルゴリズムを再現する参照オラクル（`crates/engine/src/row_codec.rs`
+    /// の `apply_overrides_via_decode_then_encode` と対になる、embedding も
+    /// 含めた行全体版）。
+    fn legacy_predicate_update_reencode(
+        schema: &TableSchema,
+        existing_metadata: &[u8],
+        existing_embedding: &[f32],
+        assignments: &[(usize, crate::row_codec::Value)],
+    ) -> (Vec<f32>, Vec<u8>) {
+        let vector_idx = schema
+            .columns
+            .iter()
+            .position(|c| matches!(c.ty, ColumnType::Vector(_)));
+        let mut merged_values = crate::row_codec::decode_scalar_columns(schema, existing_metadata)
+            .expect("decode scalar columns (legacy oracle)");
+        let mut embedding_value: Vec<f32> = existing_embedding.to_vec();
+        for (col_idx, value) in assignments {
+            if Some(*col_idx) == vector_idx {
+                match value {
+                    crate::row_codec::Value::Vector(v) => embedding_value = v.clone(),
+                    _ => panic!("VECTOR column SET value must be a vector (legacy oracle)"),
+                }
+            } else {
+                let slot = merged_values
+                    .get_mut(*col_idx)
+                    .expect("SET target column index out of range (legacy oracle)");
+                *slot = value.clone();
+            }
+        }
+        let metadata = crate::row_codec::encode_scalar_columns(schema, &merged_values)
+            .expect("encode scalar columns (legacy oracle)");
+        (embedding_value, metadata)
+    }
+
+    /// Issue #996: 述語つき UPDATE の適用段（`update_rows_where_unchecked`）を
+    /// 単一行 UPDATE（`update_row_columns_unchecked`）と共有する
+    /// `merge_row_for_update` へ統一した後も、書き込まれる行の生バイト列が
+    /// 旧実装（[`legacy_predicate_update_reencode`]）と完全に同一であることを
+    /// 固定する。TEXT のみ SET・既存 NULL 列を値へ SET・VECTOR のみ SET・
+    /// VECTOR と TEXT を同時に SET の 4 ケースを、各ケース専用の行 id へ
+    /// 適用して検証する（`Value::Null` を SET 対象値とする経路は `bind_update`
+    /// の `InsertLiteral` に `NULL` 相当の variant が無く SQL 表層から到達
+    /// しないため、`validate_set_assignments` の既存の型検証〔本 Issue の
+    /// スコープ外〕がそのまま拒否する。「既存 NULL → SET NULL」の同型経路は
+    /// `row_codec::tests::merge_encode_scalar_columns_matches_decode_then_
+    /// encode_scalar_columns` が `validate_set_assignments` を経由せず直接
+    /// 固定済み）。非一致行（述語に一致しない行）の生バイトが適用前と同一の
+    /// ままであることもあわせて確認する。
+    #[test]
+    fn update_rows_where_unchecked_writes_byte_identical_rows_to_legacy_reencode_algorithm() {
+        // clippy::type_complexity 対応（`(u64, Value, Vec<(usize, Value)>)` を
+        // 直接配列要素型に書くとネストが深く可読性を損なうため、この
+        // テストローカルな型エイリアスへ分解する）。
+        type UpdateScenario = (
+            u64,
+            crate::row_codec::Value,
+            Vec<(usize, crate::row_codec::Value)>,
+        );
+
+        let path = unique_db_path("predicate-update-byte-identical");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("tag", ColumnType::Text, true),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        // (schema 列 index): embedding=0, path=1, tag=2。各シナリオは専用の
+        // id・既存 tag 値を持つ行に対して単独で適用する。
+        let scenarios: [UpdateScenario; 4] = [
+            (
+                10,
+                crate::row_codec::Value::Text("orig-10".to_string()),
+                vec![(2, crate::row_codec::Value::Text("updated-10".to_string()))],
+            ),
+            (
+                11,
+                crate::row_codec::Value::Null,
+                vec![(2, crate::row_codec::Value::Text("filled-11".to_string()))],
+            ),
+            (
+                12,
+                crate::row_codec::Value::Text("orig-12".to_string()),
+                vec![(0, crate::row_codec::Value::Vector(vec![9.0, 9.5]))],
+            ),
+            (
+                13,
+                crate::row_codec::Value::Text("orig-13".to_string()),
+                vec![
+                    (0, crate::row_codec::Value::Vector(vec![1.5, 2.5])),
+                    (2, crate::row_codec::Value::Text("both-13".to_string())),
+                ],
+            ),
+        ];
+
+        for (id, tag, _) in &scenarios {
+            insert_typed_row(
+                &storage,
+                "docs",
+                &ctx,
+                *id,
+                Visibility::Private,
+                &[
+                    crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                    crate::row_codec::Value::Text(format!("path-{id}")),
+                    tag.clone(),
+                ],
+                &OperationId::parse(&format!("seed-byte-identical-{id}"))
+                    .expect("valid operation_id"),
+            )
+            .unwrap_or_else(|e| panic!("seed row {id} must succeed: {e:?}"));
+        }
+
+        // 述語に一切一致させない対照行（非改変の確認用）。
+        insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            99,
+            Visibility::Private,
+            &[
+                crate::row_codec::Value::Vector(vec![0.5, 0.6]),
+                crate::row_codec::Value::Text("path-99".to_string()),
+                crate::row_codec::Value::Text("untouched".to_string()),
+            ],
+            &OperationId::parse("seed-byte-identical-99").expect("valid operation_id"),
+        )
+        .expect("seed control row");
+        let control_before = raw_row_bytes(&storage, "docs", "tenant-a", 99);
+
+        for (id, _, assignments) in scenarios {
+            // 適用前の生バイトを読み、参照オラクルで期待値を計算してから
+            // 実装を実行し、書き込まれた生バイトと突き合わせる。
+            let before = raw_row_bytes(&storage, "docs", "tenant-a", id);
+            let existing = crate::storage::decode_row(id, &before).expect("decode seeded row");
+            let (expected_embedding, expected_metadata) = legacy_predicate_update_reencode(
+                &schema,
+                &existing.metadata,
+                &existing.embedding,
+                &assignments,
+            );
+            let expected_row = RowInput {
+                tenant_id: "tenant-a",
+                visibility: existing.visibility,
+                embedding: &expected_embedding,
+                metadata: &expected_metadata,
+            };
+            let expected_bytes = encode_row(&expected_row).expect("encode expected row");
+
+            let match_only_target_id =
+                |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(c.id == id) };
+            let content_hash_value =
+                content_hash::ContentHash::for_test(format!("byte-identical-{id}").as_bytes());
+            let op_id =
+                OperationId::parse(&format!("op-byte-identical-{id}")).expect("valid operation_id");
+
+            let outcome = update_rows_where_unchecked(
+                &storage,
+                "docs",
+                &ctx,
+                LedgerWrite::Record(&op_id),
+                &content_hash_value,
+                None,
+                &assignments,
+                assignments.iter().any(|(idx, _)| *idx == 0),
+                100,
+                match_only_target_id,
+            )
+            .unwrap_or_else(|e| match e {
+                PredicateDmlError::Write(w) => {
+                    panic!("scenario id={id} must succeed (write error): {w}")
+                }
+                PredicateDmlError::Predicate(_) => {
+                    panic!("scenario id={id} must succeed (predicate error)")
+                }
+            });
+            assert_eq!(
+                outcome,
+                PredicateDmlOutcome::Applied { rows_affected: 1 },
+                "scenario id={id} must match exactly its own row"
+            );
+
+            let actual_bytes = raw_row_bytes(&storage, "docs", "tenant-a", id);
+            assert_eq!(
+                actual_bytes, expected_bytes,
+                "scenario id={id}: row bytes written by update_rows_where_unchecked must be \
+                 byte-identical to the legacy re-encode algorithm"
+            );
+        }
+
+        // 一度も述語に一致しなかった対照行は生バイトが完全に不変。
+        let control_after = raw_row_bytes(&storage, "docs", "tenant-a", 99);
+        assert_eq!(
+            control_after, control_before,
+            "a row that never matched the predicate must remain byte-identical"
+        );
     }
 
     // PR #992 レビュー指摘（Issue #876）: `named_columns` をハッシュ計算前に

@@ -65,6 +65,31 @@ pub fn is_allowed_where_predicate_name(name: &str) -> bool {
     matches!(name.to_ascii_uppercase().as_str(), "VISIBLE")
 }
 
+/// `WHERE flag`（BOOLEAN 列の裸参照。Issue #883・D-c）を受理してよい直後の
+/// トークンかどうかを判定する。`WHERE` 句を持つ 4 箇所（SELECT／集計／広域取得
+/// scan・UPDATE・DELETE）のいずれでも、`WHERE` 句の直後に続き得る構文
+/// （`AND`・`ORDER BY`・`LIMIT`・文末・`;`・`USING`／`RETURNING`／`GROUP`／
+/// `HAVING` の各文脈キーワード）の開始位置に限って裸識別子を BOOLEAN 述語と
+/// みなす。受理範囲をこの集合に限定することで、`flag + 1` のような式の一部を
+/// 誤って BOOLEAN 述語と解釈しない（既存の式フォールバックへそのまま委譲する）。
+fn is_where_predicate_boundary_token(token: Option<&Token>) -> bool {
+    match token {
+        None => true,
+        Some(Token::Punct(';')) => true,
+        Some(Token::Keyword(Keyword::And)) => true,
+        Some(Token::Keyword(Keyword::Order)) => true,
+        Some(Token::Keyword(Keyword::Limit)) => true,
+        Some(Token::Ident(w)) => {
+            w.eq_ignore_ascii_case("USING")
+                || w.eq_ignore_ascii_case("HINT")
+                || w.eq_ignore_ascii_case("RETURNING")
+                || w.eq_ignore_ascii_case("GROUP")
+                || w.eq_ignore_ascii_case("HAVING")
+        }
+        _ => false,
+    }
+}
+
 /// 集計関数（TASK-166・SQL-13）で許可する関数名を照合する（大文字小文字を区別
 /// しない）。未知の名前は fail-closed に拒否する（[`is_allowed_where_predicate_name`]
 /// と同方針）。`sql::udf_call::is_reserved_function_name` から名前空間一本化の
@@ -220,6 +245,11 @@ pub enum SqlSurfaceError {
     /// （`docs/spec/04-behavior/error-format.md`）の表に未掲載のコードであり、
     /// SQL-13 が ERR-2 の拡張規則に基づいて独自定義する。
     NumericOutOfRange { detail: String },
+    /// 構文上受理された値が、宣言済み型の表現として不正（TABLE-14・TASK-198、
+    /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）が
+    /// 現時点で唯一の発生経路。ERR-2 拡張: `22P02`
+    /// （[`crate::error_format::ErrorClass::InvalidTextRepresentation`]）。
+    InvalidTextRepresentation { detail: String },
 }
 
 impl SqlSurfaceError {
@@ -290,6 +320,15 @@ impl SqlSurfaceError {
             detail: truncate_for_error(&detail.into()),
         }
     }
+
+    /// `pub(crate)`: `sql::parser::bind_enum_literal`（Issue #890）が ENUM 列の
+    /// 語彙外ラベルを報告するために使う。エラーメッセージには語彙の一覧を
+    /// 含めない（型名とクライアント自身の入力値のみ。security.md P0）。
+    pub(crate) fn invalid_text_representation(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::InvalidTextRepresentation {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
 }
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
@@ -309,6 +348,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateOperationId => ErrorClass::UniqueViolation,
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
+            SqlSurfaceError::InvalidTextRepresentation { .. } => {
+                ErrorClass::InvalidTextRepresentation
+            }
         }
     }
 
@@ -353,6 +395,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::OperationIdContentMismatch => {
                 write!(f, "operation_id already recorded with different content")
+            }
+            SqlSurfaceError::InvalidTextRepresentation { detail } => {
+                write!(f, "invalid text representation: {detail}")
             }
         }
     }
@@ -446,6 +491,11 @@ pub enum WherePredicate {
     /// 式の比較述語（TASK-79・SQL-9）。`Expr::Binary` の比較演算子（`> < >= <= =`）
     /// を頂点に持つ木のみを許可する（`parse_where` が構造的に保証する）。
     Expression(Expr),
+    /// BOOLEAN 列の明示等価条件（`<col> = true|false`。TABLE-13・TASK-196、
+    /// Issue #883・D-c）。
+    BoolEquality { column: String, value: bool },
+    /// BOOLEAN 列の裸参照（`WHERE flag`。`value = true` と同義。同 Issue）。
+    BoolColumn { column: String },
 }
 
 /// SELECT リストの 1 項目（TASK-79・SQL-9 で式項目を追加する際の共通表現）。
@@ -872,6 +922,8 @@ impl ValidatedScan {
 pub enum InsertLiteral {
     String(String),
     Number(String),
+    /// BOOLEAN 列向けの `true`/`false` リテラル（TABLE-13・TASK-196、Issue #883）。
+    Bool(bool),
 }
 
 /// `ON CONFLICT (id) DO UPDATE SET <col> = <value>` の SET 右辺（SQL-20・
@@ -1461,6 +1513,37 @@ impl<'a> Parser<'a> {
                     self.advance();
                     predicates.push(WherePredicate::PredicateCall { name });
                     matched_legacy = true;
+                } else if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
+                    && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false"))
+                {
+                    // BOOLEAN 列の明示等価条件（`<col> = true|false`。Issue #883・
+                    // D-c）。大小無視は expect_literal の bool リテラルと同じ方針。
+                    self.advance();
+                    self.advance();
+                    let value = match self.advance() {
+                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("true") => true,
+                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("false") => false,
+                        // 上の peek 済み条件と同じ判定のため到達しない。
+                        other => {
+                            return Err(SqlSurfaceError::unsupported(format!(
+                                "expected true/false literal, got {other:?}"
+                            )))
+                        }
+                    };
+                    predicates.push(WherePredicate::BoolEquality {
+                        column: name,
+                        value,
+                    });
+                    matched_legacy = true;
+                } else if is_where_predicate_boundary_token(self.tokens.get(self.pos + 1)) {
+                    // BOOLEAN 列の裸参照（`WHERE flag`）。直後のトークンが
+                    // WHERE 句の終端（`AND`・`ORDER`・`LIMIT`・`;`・EOF・後続構文
+                    // キーワード）である場合に限り受理する。受理範囲の拡大を
+                    // 最小限にとどめ、それ以外（`flag + 1` 等）は式フォールバックへ
+                    // 回す（Issue #883・D-c）。
+                    self.advance();
+                    predicates.push(WherePredicate::BoolColumn { column: name });
+                    matched_legacy = true;
                 }
             }
             if !matched_legacy {
@@ -1819,6 +1902,15 @@ impl<'a> Parser<'a> {
         match self.advance() {
             Some(Token::StringLiteral(s)) => Ok(InsertLiteral::String(s.clone())),
             Some(Token::Number(n)) => Ok(InsertLiteral::Number(n.clone())),
+            // BOOLEAN 列向けの `true`/`false` リテラル（大小無視、Issue #883・D-d）。
+            // 従来 `Token::Ident` はここで一律拒否されていたため、この 2 語のみを
+            // 追加で受理しても既存の受理範囲は変わらない（純粋な追加）。
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case("true") => {
+                Ok(InsertLiteral::Bool(true))
+            }
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case("false") => {
+                Ok(InsertLiteral::Bool(false))
+            }
             other => Err(SqlSurfaceError::unsupported(format!(
                 "expected literal value, got {other:?}"
             ))),

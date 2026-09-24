@@ -114,6 +114,13 @@ pub enum UpdateError {
     /// `EngineCore::execute_bound_update_in_session`（`operation_id` 必須化・
     /// 台帳照合・テーブル不存在）のエラーをそのまま透過する。
     Engine(SqlSurfaceError),
+    /// `BYTEA` 列の SET 値が base64 の JSON string でない、または不正な
+    /// base64（`42601`。B10・Issue #886。`insert.rs::InsertError::InvalidBytea`
+    /// と同じ分類判断）。
+    InvalidBytea(&'static str),
+    /// `BYTEA` 列の base64 値が復号後 [`engine::bytea::MAX_BYTEA_FIELD_LEN`] を
+    /// 超える（`54000`）。
+    ByteaTooLarge,
 }
 
 impl From<SchemaError> for UpdateError {
@@ -153,6 +160,8 @@ impl ClassifiedError for UpdateError {
             // アーム側で分類される（`42601`／`22000`）。
             UpdateError::Set(_) => ErrorClass::InvalidInput,
             UpdateError::Engine(err) => err.error_class(),
+            UpdateError::InvalidBytea(_) => ErrorClass::UnsupportedSqlSyntax,
+            UpdateError::ByteaTooLarge => ErrorClass::PayloadTooLarge,
         }
     }
 
@@ -162,6 +171,8 @@ impl ClassifiedError for UpdateError {
             UpdateError::InvalidIdentifier => "invalid identifier".to_string(),
             UpdateError::Target(err) => err.client_message(),
             UpdateError::EmptySet => "SET clause must specify at least one column".to_string(),
+            UpdateError::InvalidBytea(detail) => detail.to_string(),
+            UpdateError::ByteaTooLarge => "BYTEA value exceeds the length limit".to_string(),
             UpdateError::Set(detail) => detail.to_string(),
             UpdateError::Engine(err) => err.client_message(),
         }
@@ -232,8 +243,18 @@ fn map_set_assignments(
             assignments.push((key.clone(), InsertLiteral::String(String::new())));
             continue;
         };
-        let literal = match (column.ty, raw) {
+        let literal = match (&column.ty, raw) {
             (ColumnType::Text, JsonValue::String(s)) => InsertLiteral::String(s.clone()),
+            // ENUM 列は TEXT と同じ JSON string 表現を使い、語彙検証は
+            // `engine::sql::parser::bind_update`（`bind_enum_literal`）へ委譲する
+            // （Issue #890。列名だけで完結しない値検証は engine 側の単一
+            // 情報源に保つ設計。`bind_update` の再検査で多層防御が保たれる）。
+            (ColumnType::Enum(_), JsonValue::String(s)) => InsertLiteral::String(s.clone()),
+            (ColumnType::Enum(_), _) => {
+                return Err(UpdateError::Set(
+                    "SET ENUM column value must be a JSON string",
+                ))
+            }
             (ColumnType::Vector(_), JsonValue::Array(items)) => {
                 InsertLiteral::String(vector_literal_text(items)?)
             }
@@ -245,6 +266,45 @@ fn map_set_assignments(
             (ColumnType::Vector(_), _) => {
                 return Err(UpdateError::Set(
                     "SET VECTOR column value must be a JSON array of numbers",
+                ))
+            }
+            // BOOLEAN 列は JSON 真偽値のみ受理する（NOSQL-17 と同じ規則。
+            // Issue #883）。
+            (ColumnType::Boolean, JsonValue::Bool(b)) => InsertLiteral::Bool(*b),
+            (ColumnType::Boolean, _) => {
+                return Err(UpdateError::Set(
+                    "SET BOOLEAN column value must be a JSON boolean",
+                ))
+            }
+            // 配列列（TABLE-14・Issue #888）の JSON 配列束縛は本 Issue の対象外
+            // （NoSQL 表層の JSON 配列束縛は #896・NOSQL-17 の担当）。BOOLEAN と
+            // 同じく明示的に拒否する。
+            (ColumnType::Array(_), _) => {
+                return Err(UpdateError::Set(
+                    "SET ARRAY column is not supported via the NoSQL surface",
+                ))
+            }
+            // `BYTEA` 列は base64 の JSON string のみ受理し、復号したバイト列を
+            // 正準形（`\x` ＋ 小文字 hex）の `InsertLiteral::String` へ再エンコード
+            // する（B9・Issue #886）。engine 側の束縛経路を hex 解析の 1 本に
+            // 保つ設計判断（`insert.rs::bind_row` とは異なり `InsertLiteral::Bytes`
+            // variant を新設しない）。
+            (ColumnType::Bytea, JsonValue::String(s)) => {
+                let decoded =
+                    super::base64_std::decode_base64_std(s, engine::bytea::MAX_BYTEA_FIELD_LEN)
+                        .map_err(|e| match e {
+                            super::base64_std::Base64StdError::TooLong => {
+                                UpdateError::ByteaTooLarge
+                            }
+                            _ => UpdateError::InvalidBytea(
+                                "SET BYTEA column value must be valid base64",
+                            ),
+                        })?;
+                InsertLiteral::String(engine::bytea::format_hex_text(&decoded))
+            }
+            (ColumnType::Bytea, _) => {
+                return Err(UpdateError::InvalidBytea(
+                    "SET BYTEA column value must be a base64 JSON string",
                 ))
             }
         };
@@ -319,6 +379,14 @@ pub fn execute(
                         detail: "unexpected error during UPDATE SET binding".to_string(),
                     }
                 }
+                // `InvalidBytea`（`42601`）／`ByteaTooLarge`（`54000`）の分類を
+                // `SqlSurfaceError` へ写像しても維持する（B10・Issue #886）。
+                UpdateError::InvalidBytea(detail) => SqlSurfaceError::UnsupportedSyntax {
+                    detail: detail.to_string(),
+                },
+                UpdateError::ByteaTooLarge => SqlSurfaceError::PayloadTooLarge {
+                    detail: "BYTEA value exceeds the length limit".to_string(),
+                },
             })?;
             let stmt = ValidatedUpdate {
                 table_name: table.to_string(),
@@ -496,5 +564,49 @@ mod tests {
         assert_eq!(UpdateError::InvalidIdentifier.wire_code(), "42601");
         assert_eq!(UpdateError::EmptySet.wire_code(), "42601");
         assert_eq!(UpdateError::Set("x").wire_code(), "22000");
+        assert_eq!(UpdateError::InvalidBytea("x").wire_code(), "42601");
+        assert_eq!(UpdateError::ByteaTooLarge.wire_code(), "54000");
+    }
+
+    // --- BYTEA 列（Issue #886）の base64 → 正準 hex 再エンコード ---------------
+
+    fn bytea_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("blob", ColumnType::Bytea, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn map_set_assignments_reencodes_base64_bytea_to_canonical_hex() {
+        // "3q2+7w==" は [0xde, 0xad, 0xbe, 0xef] の標準 base64 表現。
+        let set = set_map(r#"{"blob":"3q2+7w=="}"#);
+        let bound = map_set_assignments(&set, &bytea_schema()).expect("ok");
+        assert_eq!(
+            bound,
+            vec![(
+                "blob".to_string(),
+                InsertLiteral::String("\\xdeadbeef".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn map_set_assignments_rejects_non_string_bytea() {
+        let set = set_map(r#"{"blob":true}"#);
+        let err = map_set_assignments(&set, &bytea_schema()).expect_err("must reject");
+        assert!(matches!(err, UpdateError::InvalidBytea(_)));
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn map_set_assignments_rejects_malformed_base64_bytea() {
+        let set = set_map(r#"{"blob":"3q2+7w=a"}"#);
+        let err = map_set_assignments(&set, &bytea_schema()).expect_err("must reject");
+        assert!(matches!(err, UpdateError::InvalidBytea(_)));
+        assert_eq!(err.wire_code(), "42601");
     }
 }

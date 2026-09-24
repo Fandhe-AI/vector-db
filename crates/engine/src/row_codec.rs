@@ -20,7 +20,7 @@
 
 use std::fmt;
 
-use crate::catalog::{ColumnType, TableSchema};
+use crate::catalog::{ArrayElemType, ArrayType, ColumnType, TableSchema, MAX_ARRAY_ELEMENTS};
 use crate::storage::Visibility;
 
 /// 行フォーマットの先頭バイト。値の追加・変更は破壊的変更として扱い、この値を
@@ -115,6 +115,466 @@ pub enum Value {
     Null,
     Text(String),
     Vector(Vec<f32>),
+    /// 真偽値列の値（TABLE-13・TASK-196、Issue #883）。NULL とはバイト列上も
+    /// 別物になる（[`PRESENCE_NULL`] とは別に 1 バイトの値本体を持つ）。
+    Bool(bool),
+    /// 配列列の値（TABLE-14・TASK-198、Issue #888）。要素型ごとに variant を
+    /// 分けることで、同一列の要素がすべて同じ型であることを型で保証する
+    /// （`ColumnType::Array` の `ArrayElemType` と対応させる）。
+    Array(ArrayValue),
+    /// 可変長バイナリ列の値（TABLE-13・TASK-197、Issue #886）。NULL・空バイト列
+    /// （`Vec::new()`）はバイト列上も区別する。UTF-8 検証を行わない点のみ
+    /// [`Value::Text`] と異なり、行バイト表現（presence + `u32` LE 長 + 本体）は
+    /// 共有する。
+    Bytes(Vec<u8>),
+    /// ENUM 列の値（TABLE-14・TASK-198、Issue #890）。ラベル文字列を TEXT と
+    /// 同じフレームで格納する（序数格納は採らない。`ColumnType::Enum` の
+    /// ドキュメント参照）。語彙検証は encode 時（[`encode_row`]）に行い、decode
+    /// 時は検査しない（Issue #890 D3。`ALTER TYPE ... ADD VALUE` 前に書いた行を
+    /// 将来にわたって読める契約を維持するため）。
+    Enum(String),
+}
+
+/// 配列列 1 個分の値（Issue #888）。NULL 要素は本版では受理しない（D-A6。
+/// 列自体の NULL は [`Value::Null`] と区別する）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArrayValue {
+    Text(Vec<String>),
+    Bool(Vec<bool>),
+}
+
+impl ArrayValue {
+    /// この値の要素型（`ColumnType::Array` の `ArrayType::elem()` と突合する
+    /// ために使う。`pub(crate)`: `tenant::validate_set_assignments` が UPDATE
+    /// SET 値の事前検証で参照する）。
+    pub(crate) fn elem(&self) -> ArrayElemType {
+        match self {
+            ArrayValue::Text(_) => ArrayElemType::Text,
+            ArrayValue::Bool(_) => ArrayElemType::Bool,
+        }
+    }
+
+    /// 要素数（`pub(crate)`: 用途は [`Self::elem`] と同じ）。
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            ArrayValue::Text(v) => v.len(),
+            ArrayValue::Bool(v) => v.len(),
+        }
+    }
+}
+
+/// スカラー列走査（[`scan_scalar_columns`] 系）の借用結果。TEXT・BOOLEAN・ARRAY の
+/// いずれも返せるよう `Option<&str>` から型付き化した（Issue #883・D-b、Issue #888）。
+/// `VECTOR` 列・実際の NULL 列は走査結果として `None` になる。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScalarRef<'a> {
+    Text(&'a str),
+    Bool(bool),
+    /// 配列列の借用結果（Issue #888）。構造・UTF-8・要素上限はすべて走査時に
+    /// 検証済みで、[`ArrayRef::to_value`] は追加のエラー処理なしに複製できる。
+    Array(ArrayRef<'a>),
+    /// `BYTEA` 列の借用結果（Issue #886）。TEXT 前提の消費側（[`as_text`]）へは
+    /// 流入させない（fail-closed）。
+    ///
+    /// [`as_text`]: ScalarRef::as_text
+    Bytes(&'a [u8]),
+    /// `ENUM` 列の借用結果（Issue #890）。TEXT と行バイト表現を共有するが、
+    /// TEXT 前提の消費側（[`as_text`]）へは流入させない（`Bytea` と同じ方針）。
+    /// 等価比較・二次索引の辞書化は [`as_dictionary_text`] を経由する。
+    ///
+    /// [`as_text`]: ScalarRef::as_text
+    /// [`as_dictionary_text`]: ScalarRef::as_dictionary_text
+    Enum(&'a str),
+}
+
+impl<'a> ScalarRef<'a> {
+    /// TEXT 前提の既存消費側（等価/前方一致フィルタ・二次索引・hybrid 本文・
+    /// GROUP BY キー等）が `Bool`／`Array`／`Bytes`／`Enum` を取り違えて TEXT
+    /// として扱わないよう、`Text` 以外は `None` を返す（fail-closed。呼び出し元は
+    /// スキーマ型で事前に対象外の列を除外するか、`None` を型不一致として拒否する）。
+    pub fn as_text(&self) -> Option<&'a str> {
+        match self {
+            ScalarRef::Text(s) => Some(s),
+            ScalarRef::Bool(_) | ScalarRef::Array(_) | ScalarRef::Bytes(_) | ScalarRef::Enum(_) => {
+                None
+            }
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            ScalarRef::Bool(b) => Some(*b),
+            ScalarRef::Text(_) | ScalarRef::Array(_) | ScalarRef::Bytes(_) | ScalarRef::Enum(_) => {
+                None
+            }
+        }
+    }
+
+    /// `Text`／`Enum` のみを許す辞書化アクセサ（Issue #890。スカラー列二次索引
+    /// 〔`sql::scalar_index::ScalarIndex`〕・`declarative_filter` の等価比較が
+    /// ENUM 列を TEXT 列と同じ辞書表現で扱えるようにするための限定共有。
+    /// `Bool`／`Array`／`Bytes` は対象外のまま `None`（TABLE-14 が定める述語の
+    /// 範囲を超えて ENUM を露出しない）。
+    pub fn as_dictionary_text(&self) -> Option<&'a str> {
+        match self {
+            ScalarRef::Text(s) | ScalarRef::Enum(s) => Some(s),
+            ScalarRef::Bool(_) | ScalarRef::Array(_) | ScalarRef::Bytes(_) => None,
+        }
+    }
+}
+
+/// [`ScalarRef::Array`] の借用結果（Issue #888）。走査（[`scan_scalar_columns_validated`]）
+/// 時点で構造・UTF-8・要素数上限を検証済みの `bytes`（要素列のみ。フレームヘッダは
+/// 含まない）を保持し、`to_value` はそれを信頼して再デコードする（デコード失敗時も
+/// `Err` を返す設計を維持し、`unwrap` 等で無条件成功を仮定しない）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArrayRef<'a> {
+    elem: ArrayElemType,
+    count: u32,
+    bytes: &'a [u8],
+}
+
+impl<'a> ArrayRef<'a> {
+    pub fn elem(&self) -> ArrayElemType {
+        self.elem
+    }
+
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// 要素列本文（フレームヘッダを含まない）のバイト長。呼び出し元が
+    /// 複製予算を見積もる際、`count()`（要素数）だけでは TEXT 要素の実体
+    /// バイト数（可変長）を捉えられないため、こちらを主に使う
+    /// （`sql::exec::try_alloc_array_for_budget`／`sql::scan::try_alloc_array_for_budget`
+    /// 参照。Issue #888 レビュー指摘対応）。
+    pub fn payload_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// 借用結果を所有値へ複製する（[`decode_scalar_columns`] 等が使う）。
+    pub fn to_value(&self) -> Result<ArrayValue> {
+        decode_array_elements(self.elem, self.bytes, self.count)
+    }
+}
+
+/// BOOLEAN 値のバイト表現（presence タグに続く 1 バイト）。`0x00`/`0x01`
+/// 以外は decode 側で fail-closed に拒否する（既定値へのフォールバックはしない。
+/// TABLE-7）。
+const BOOL_FALSE_BYTE: u8 = 0x00;
+const BOOL_TRUE_BYTE: u8 = 0x01;
+
+/// BOOLEAN 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + 値(1)）。[`encode_scalar_columns`] の実エンコードと
+/// `tenant::validate_set_assignments` の事前累計検証が同じ値を共有する
+/// （TEXT の [`SCALAR_TEXT_ENTRY_OVERHEAD`] と同じ理由）。
+pub(crate) const SCALAR_BOOL_ENTRY_LEN: u32 = 2;
+
+/// 配列列のフレーム flags バイト。本版は `0x00` 固定（NULL 要素非対応。D-A6）。
+/// 将来 NULL 要素ビットマップ等を追加する際の予約領域として、`0x00` 以外は
+/// decode 側で fail-closed に拒否する。
+const ARRAY_FLAGS_RESERVED: u8 = 0x00;
+
+/// 配列要素 1 個の BOOL 値バイト表現（スカラー BOOLEAN 列と同じ規約を再利用）。
+const ARRAY_BOOL_FALSE_BYTE: u8 = BOOL_FALSE_BYTE;
+const ARRAY_BOOL_TRUE_BYTE: u8 = BOOL_TRUE_BYTE;
+
+/// 配列列 1 個分の要素列（フレームヘッダを含まない本文のみ）のバイト長上限
+/// （D-A3）。列ごとの [`MAX_TEXT_FIELD_LEN`] と同値を採用し、`TEXT` 列 1 個分の
+/// 上限と揃える。
+const MAX_ARRAY_PAYLOAD_LEN: u32 = MAX_TEXT_FIELD_LEN;
+
+/// 配列要素列（フレームヘッダを含まない本文）のバイト長を計算する。オーバー
+/// フロー時は `Err`（[`scalar_text_entry_len`] と同じ方針）。
+fn array_elements_byte_len(elem: ArrayElemType, value: &ArrayValue) -> Result<u32> {
+    match (elem, value) {
+        (ArrayElemType::Text, ArrayValue::Text(items)) => {
+            let mut total: u32 = 0;
+            for item in items {
+                let item_len = u32::try_from(item.len()).map_err(|_| {
+                    RowCodecError::Invalid("array text element too long".to_string())
+                })?;
+                // 長さプレフィックス(4) + 本文。
+                let entry = 4u32.checked_add(item_len).ok_or_else(|| {
+                    RowCodecError::Invalid("array element length overflow".to_string())
+                })?;
+                total = total.checked_add(entry).ok_or_else(|| {
+                    RowCodecError::Invalid("array payload length overflow".to_string())
+                })?;
+            }
+            Ok(total)
+        }
+        (ArrayElemType::Bool, ArrayValue::Bool(items)) => u32::try_from(items.len())
+            .map_err(|_| RowCodecError::Invalid("array element count too large".to_string())),
+        (ArrayElemType::Text, ArrayValue::Bool(_)) | (ArrayElemType::Bool, ArrayValue::Text(_)) => {
+            Err(RowCodecError::Invalid(
+                "array value element type does not match column element type".to_string(),
+            ))
+        }
+    }
+}
+
+/// 配列列 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + flags(1) + 要素数(4) + ペイロード長(4) + 要素列）。事前検証
+/// （[`crate::tenant::validate_set_assignments`]）と実エンコードが同じ計算式を
+/// 共有するために公開する（[`scalar_text_entry_len`] と同じ理由）。
+pub(crate) fn scalar_array_entry_len(elem: ArrayElemType, value: &ArrayValue) -> Result<u32> {
+    let payload_len = array_elements_byte_len(elem, value)?;
+    if payload_len > MAX_ARRAY_PAYLOAD_LEN {
+        return Err(RowCodecError::Invalid(format!(
+            "array payload length {payload_len} exceeds limit {MAX_ARRAY_PAYLOAD_LEN}"
+        )));
+    }
+    // presence(1) + flags(1) + count(4) + payload_len(4)。
+    10u32
+        .checked_add(payload_len)
+        .ok_or_else(|| RowCodecError::Invalid("array entry length overflow".to_string()))
+}
+
+/// [`Value::Array`] 1 個をバッファへ書き込む（presence タグは呼び出し元が別途
+/// 積む）。`array_ty` の `elem`/`max_len` との不一致（要素型違い・要素数超過）は
+/// `Err`（TABLE-14）。
+fn write_array_value(buf: &mut Vec<u8>, array_ty: ArrayType, value: &ArrayValue) -> Result<()> {
+    if value.elem() != array_ty.elem() {
+        return Err(RowCodecError::Invalid(
+            "array value element type does not match column definition".to_string(),
+        ));
+    }
+    let count = u32::try_from(value.len())
+        .map_err(|_| RowCodecError::Invalid("array element count too large".to_string()))?;
+    if count > array_ty.max_len() || count > MAX_ARRAY_ELEMENTS {
+        return Err(RowCodecError::Invalid(format!(
+            "array element count {count} exceeds limit {}",
+            array_ty.max_len().min(MAX_ARRAY_ELEMENTS)
+        )));
+    }
+    let payload_len = array_elements_byte_len(array_ty.elem(), value)?;
+    if payload_len > MAX_ARRAY_PAYLOAD_LEN {
+        return Err(RowCodecError::Invalid(format!(
+            "array payload length {payload_len} exceeds limit {MAX_ARRAY_PAYLOAD_LEN}"
+        )));
+    }
+    buf.push(ARRAY_FLAGS_RESERVED);
+    buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    match value {
+        ArrayValue::Text(items) => {
+            for item in items {
+                let item_bytes = item.as_bytes();
+                // array_elements_byte_len ですでに u32 化に成功しているため
+                // ここでの try_from は失敗しない想定だが、untrusted 経路の多層
+                // 防御として改めて検証する。
+                let item_len = u32::try_from(item_bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid("array text element too long".to_string())
+                })?;
+                buf.extend_from_slice(&item_len.to_le_bytes());
+                buf.extend_from_slice(item_bytes);
+            }
+        }
+        ArrayValue::Bool(items) => {
+            for b in items {
+                buf.push(if *b {
+                    ARRAY_BOOL_TRUE_BYTE
+                } else {
+                    ARRAY_BOOL_FALSE_BYTE
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 走査済みの [`ArrayRef`]（構造検証済み）をそのままフレームとして書き出す
+/// （presence タグは呼び出し元が別途積む）。[`merge_encode_scalar_columns`] の
+/// SET 対象でない列（既存値の再エンコード）が使う。`write_array_value` と違い
+/// `ArrayType` との突合は行わない（`existing` はすでに検証済みの borrow のため）。
+fn write_array_ref(buf: &mut Vec<u8>, array_ref: &ArrayRef) -> Result<()> {
+    let payload_len = u32::try_from(array_ref.bytes.len())
+        .map_err(|_| RowCodecError::Invalid("array payload length overflow".to_string()))?;
+    buf.push(ARRAY_FLAGS_RESERVED);
+    buf.extend_from_slice(&array_ref.count.to_le_bytes());
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.extend_from_slice(array_ref.bytes);
+    Ok(())
+}
+
+/// 配列要素列（フレームヘッダを含まない本文）を、宣言された `count` 個の要素へ
+/// 構造検証しながらデコードする。要素列の実バイト長が `count` 個をちょうど消費
+/// しない場合（不足・余剰いずれも）は `Err`。TEXT 要素は UTF-8 を検証する。
+/// [`scan_scalar_columns_validated`]（構造検証のみ・結果を捨てる用途にも使う）と
+/// [`ArrayRef::to_value`]（値を複製して返す用途）の両方から呼ばれる。
+fn decode_array_elements(elem: ArrayElemType, bytes: &[u8], count: u32) -> Result<ArrayValue> {
+    let mut offset = 0usize;
+    match elem {
+        ArrayElemType::Text => {
+            let mut items: Vec<String> = Vec::new();
+            items.try_reserve_exact(count as usize).map_err(|_| {
+                RowCodecError::Invalid("failed to reserve array text elements".to_string())
+            })?;
+            for _ in 0..count {
+                let len_bytes = bytes
+                    .get(
+                        offset..offset.checked_add(4).ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "offset overflow before array text element length".to_string(),
+                            )
+                        })?,
+                    )
+                    .ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "array payload truncated at element length field".to_string(),
+                        )
+                    })?;
+                let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                    RowCodecError::Invalid("array element length field is not 4 bytes".to_string())
+                })?;
+                let item_len = u32::from_le_bytes(len_arr);
+                offset = offset.checked_add(4).ok_or_else(|| {
+                    RowCodecError::Invalid(
+                        "offset overflow after array text element length".to_string(),
+                    )
+                })?;
+                let item_end = offset.checked_add(item_len as usize).ok_or_else(|| {
+                    RowCodecError::Invalid("offset overflow after array text element".to_string())
+                })?;
+                let item_bytes = bytes.get(offset..item_end).ok_or_else(|| {
+                    RowCodecError::Invalid(
+                        "array payload truncated at text element field".to_string(),
+                    )
+                })?;
+                let item = std::str::from_utf8(item_bytes)
+                    .map_err(|_| {
+                        RowCodecError::Invalid("array text element is not valid UTF-8".to_string())
+                    })?
+                    .to_string();
+                offset = item_end;
+                items.push(item);
+            }
+            if offset != bytes.len() {
+                return Err(RowCodecError::Invalid(
+                    "array payload has trailing bytes beyond declared elements".to_string(),
+                ));
+            }
+            Ok(ArrayValue::Text(items))
+        }
+        ArrayElemType::Bool => {
+            if bytes.len() != count as usize {
+                return Err(RowCodecError::Invalid(
+                    "array payload length does not match declared bool element count".to_string(),
+                ));
+            }
+            let mut items: Vec<bool> = Vec::new();
+            items.try_reserve_exact(count as usize).map_err(|_| {
+                RowCodecError::Invalid("failed to reserve array bool elements".to_string())
+            })?;
+            for &byte in bytes {
+                let b = match byte {
+                    ARRAY_BOOL_FALSE_BYTE => false,
+                    ARRAY_BOOL_TRUE_BYTE => true,
+                    other => {
+                        return Err(RowCodecError::Invalid(format!(
+                            "unknown array bool element byte: {other}"
+                        )))
+                    }
+                };
+                items.push(b);
+            }
+            Ok(ArrayValue::Bool(items))
+        }
+    }
+}
+
+/// 配列列 1 個分のフレーム（presence の直後から）をバッファから読み取る。
+/// `max_len_allowed` は宣言スキーマの `max_len`（[`ArrayType::max_len`]）。
+/// 戻り値は検証済みの [`ArrayRef`] と、フレームを読み終えた後のオフセット。
+fn parse_array_frame<'a>(
+    buf: &'a [u8],
+    offset: usize,
+    elem: ArrayElemType,
+    max_len_allowed: u32,
+) -> Result<(ArrayRef<'a>, usize)> {
+    let flags = *buf.get(offset).ok_or_else(|| {
+        RowCodecError::Invalid("row buffer truncated at array flags field".to_string())
+    })?;
+    if flags != ARRAY_FLAGS_RESERVED {
+        return Err(RowCodecError::Invalid(format!(
+            "unknown array flags byte: {flags}"
+        )));
+    }
+    let mut offset = offset.checked_add(1).ok_or_else(|| {
+        RowCodecError::Invalid("offset overflow after array flags field".to_string())
+    })?;
+
+    let count_bytes = buf
+        .get(
+            offset..offset.checked_add(4).ok_or_else(|| {
+                RowCodecError::Invalid(
+                    "offset overflow before array element count field".to_string(),
+                )
+            })?,
+        )
+        .ok_or_else(|| {
+            RowCodecError::Invalid("row buffer truncated at array element count field".to_string())
+        })?;
+    let count_arr: [u8; 4] = count_bytes.try_into().map_err(|_| {
+        RowCodecError::Invalid("array element count field is not 4 bytes".to_string())
+    })?;
+    let count = u32::from_le_bytes(count_arr);
+    if count > max_len_allowed || count > MAX_ARRAY_ELEMENTS {
+        return Err(RowCodecError::Invalid(format!(
+            "array element count {count} exceeds limit {}",
+            max_len_allowed.min(MAX_ARRAY_ELEMENTS)
+        )));
+    }
+    offset = offset.checked_add(4).ok_or_else(|| {
+        RowCodecError::Invalid("offset overflow after array element count field".to_string())
+    })?;
+
+    let payload_len_bytes = buf
+        .get(
+            offset..offset.checked_add(4).ok_or_else(|| {
+                RowCodecError::Invalid(
+                    "offset overflow before array payload length field".to_string(),
+                )
+            })?,
+        )
+        .ok_or_else(|| {
+            RowCodecError::Invalid("row buffer truncated at array payload length field".to_string())
+        })?;
+    let payload_len_arr: [u8; 4] = payload_len_bytes.try_into().map_err(|_| {
+        RowCodecError::Invalid("array payload length field is not 4 bytes".to_string())
+    })?;
+    let payload_len = u32::from_le_bytes(payload_len_arr);
+    if payload_len > MAX_ARRAY_PAYLOAD_LEN {
+        return Err(RowCodecError::Invalid(format!(
+            "array payload length {payload_len} exceeds limit {MAX_ARRAY_PAYLOAD_LEN}"
+        )));
+    }
+    offset = offset.checked_add(4).ok_or_else(|| {
+        RowCodecError::Invalid("offset overflow after array payload length field".to_string())
+    })?;
+
+    let payload_end = offset.checked_add(payload_len as usize).ok_or_else(|| {
+        RowCodecError::Invalid("offset overflow after array payload field".to_string())
+    })?;
+    let payload_bytes = buf.get(offset..payload_end).ok_or_else(|| {
+        RowCodecError::Invalid("row buffer truncated at array payload field".to_string())
+    })?;
+
+    // 構造・UTF-8・要素数の全検証をここで行う（未参照列でも弱めない。Issue #350 と
+    // 同じ方針）。検証済みの `payload_bytes` を `ArrayRef` へそのまま渡すため、
+    // 呼び出し元・`ArrayRef::to_value` の再デコードは同じ検証を再実行するだけで
+    // 追加のエラー分岐を要さない。
+    decode_array_elements(elem, payload_bytes, count)?;
+
+    Ok((
+        ArrayRef {
+            elem,
+            count,
+            bytes: payload_bytes,
+        },
+        payload_end,
+    ))
 }
 
 /// デコード結果。行レベルの RLS フィールド（`tenant_id`・`visibility`）と、
@@ -210,10 +670,50 @@ pub fn encode_row(
                 buf.extend_from_slice(&text_len.to_le_bytes());
                 buf.extend_from_slice(text_bytes);
             }
+            // ENUM 列の値（Issue #890 D3）。行バイト表現は TEXT と同一フレーム
+            // （presence + `u32` LE 長 + UTF-8 本体）を共有するが、書き込み前に
+            // 語彙を検査する多層防御を持つ（束縛層〔`sql::parser::bind_enum_literal`〕
+            // に加え、Rust API から直接渡された `Value::Enum` もここで拒否する）。
+            Value::Enum(label) => {
+                let def = match &column.ty {
+                    ColumnType::Enum(def) => def,
+                    ColumnType::Text
+                    | ColumnType::Vector(_)
+                    | ColumnType::Boolean
+                    | ColumnType::Array(_)
+                    | ColumnType::Bytea => {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Enum value, got Enum",
+                            column.name
+                        )))
+                    }
+                };
+                if def.validate_label(label).is_err() {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} does not accept label {label:?} for enum type {:?}",
+                        column.name,
+                        def.name()
+                    )));
+                }
+                let text_bytes = label.as_bytes();
+                let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid(format!(
+                        "enum label too long: {} bytes",
+                        text_bytes.len()
+                    ))
+                })?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&text_len.to_le_bytes());
+                buf.extend_from_slice(text_bytes);
+            }
             Value::Vector(vector) => {
-                let expected_dim = match column.ty {
-                    ColumnType::Vector(dim) => dim,
-                    ColumnType::Text => {
+                let expected_dim = match &column.ty {
+                    ColumnType::Vector(dim) => *dim,
+                    ColumnType::Text
+                    | ColumnType::Boolean
+                    | ColumnType::Array(_)
+                    | ColumnType::Bytea
+                    | ColumnType::Enum(_) => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Vector value, got Vector",
                             column.name
@@ -239,6 +739,53 @@ pub fn encode_row(
                 for v in vector {
                     buf.extend_from_slice(&v.to_le_bytes());
                 }
+            }
+            Value::Bool(b) => {
+                if !matches!(column.ty, ColumnType::Boolean) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Boolean value, got Boolean",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
+            }
+            Value::Array(array_value) => {
+                let array_ty = match column.ty {
+                    ColumnType::Array(array_ty) => array_ty,
+                    ColumnType::Text
+                    | ColumnType::Vector(_)
+                    | ColumnType::Boolean
+                    | ColumnType::Bytea
+                    | ColumnType::Enum(_) => {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Array value, got Array",
+                            column.name
+                        )))
+                    }
+                };
+                buf.push(PRESENCE_VALUE);
+                write_array_value(&mut buf, array_ty, array_value)?;
+            }
+            Value::Bytes(bytes) => {
+                if !matches!(column.ty, ColumnType::Bytea) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Bytea value, got Bytea",
+                        column.name
+                    )));
+                }
+                let byte_len = u32::try_from(bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid(format!("bytea field too long: {} bytes", bytes.len()))
+                })?;
+                if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+                    return Err(RowCodecError::Invalid(format!(
+                        "bytea field length {byte_len} exceeds limit {}",
+                        crate::bytea::MAX_BYTEA_FIELD_LEN
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&byte_len.to_le_bytes());
+                buf.extend_from_slice(bytes);
             }
         }
     }
@@ -324,8 +871,8 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                 }
                 values.push(Value::Null);
             }
-            PRESENCE_VALUE => match column.ty {
-                ColumnType::Text => {
+            PRESENCE_VALUE => match &column.ty {
+                ColumnType::Text | ColumnType::Enum(_) => {
                     let len_bytes = buf
                         .get(
                             offset..offset.checked_add(4).ok_or_else(|| {
@@ -365,9 +912,29 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         })?
                         .to_string();
                     offset = text_end;
-                    values.push(Value::Text(text));
+                    // ENUM 列は decode 時に現行語彙（`ALTER TYPE ... ADD VALUE`
+                    // で単調増加する `EnumTypeDef::labels`）との照合を行う
+                    // （codex-review P1 指摘・Issue #890: 破損行〔手書き・
+                    // バグ由来〕が持つ語彙外ラベルを `Value::Enum` として
+                    // 通すと、投影・等価フィルタ・二次索引へ任意文字列が
+                    // 流出しうるため）。ラベルは削除されない契約のため、
+                    // 過去に正当だった値は将来にわたって有効であり続ける
+                    // （this 検査は「現行スキーマの語彙に含まれるか」であり
+                    // 「書込み時点で有効だったか」を後退させるものではない）。
+                    if let ColumnType::Enum(def) = &column.ty {
+                        if !def.contains(&text) {
+                            return Err(RowCodecError::Invalid(format!(
+                                "enum value {text:?} is not a valid label of type {:?}",
+                                def.name()
+                            )));
+                        }
+                        values.push(Value::Enum(text));
+                    } else {
+                        values.push(Value::Text(text));
+                    }
                 }
                 ColumnType::Vector(expected_dim) => {
+                    let expected_dim = *expected_dim;
                     let dim_bytes = buf
                         .get(
                             offset..offset.checked_add(4).ok_or_else(|| {
@@ -415,6 +982,72 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     }
                     offset = vector_end;
                     values.push(Value::Vector(vector));
+                }
+                ColumnType::Boolean => {
+                    let byte = *buf.get(offset).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "row buffer truncated at boolean value field".to_string(),
+                        )
+                    })?;
+                    let b = match byte {
+                        BOOL_FALSE_BYTE => false,
+                        BOOL_TRUE_BYTE => true,
+                        other => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "unknown boolean value byte: {other}"
+                            )))
+                        }
+                    };
+                    offset = offset.checked_add(1).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after boolean value field".to_string(),
+                        )
+                    })?;
+                    values.push(Value::Bool(b));
+                }
+                ColumnType::Array(array_ty) => {
+                    let (array_ref, new_offset) =
+                        parse_array_frame(buf, offset, array_ty.elem(), array_ty.max_len())?;
+                    offset = new_offset;
+                    values.push(Value::Array(array_ref.to_value()?));
+                }
+                ColumnType::Bytea => {
+                    let len_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before bytea length field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at bytea length field".to_string(),
+                            )
+                        })?;
+                    let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("bytea length field is not 4 bytes".to_string())
+                    })?;
+                    let byte_len = u32::from_le_bytes(len_arr);
+                    if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+                        return Err(RowCodecError::Invalid(format!(
+                            "bytea field length {byte_len} exceeds limit {}",
+                            crate::bytea::MAX_BYTEA_FIELD_LEN
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after bytea length field".to_string(),
+                        )
+                    })?;
+                    let bytea_end = offset.checked_add(byte_len as usize).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after bytea field".to_string())
+                    })?;
+                    let bytea_bytes = buf.get(offset..bytea_end).ok_or_else(|| {
+                        RowCodecError::Invalid("row buffer truncated at bytea field".to_string())
+                    })?;
+                    offset = bytea_end;
+                    values.push(Value::Bytes(bytea_bytes.to_vec()));
                 }
             },
             other => {
@@ -508,6 +1141,12 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_NULL);
             }
             Value::Text(text) => {
+                if !matches!(column.ty, ColumnType::Text) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Text value, got Text",
+                        column.name
+                    )));
+                }
                 let text_bytes = text.as_bytes();
                 let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
                     RowCodecError::Invalid(format!(
@@ -527,11 +1166,99 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.extend_from_slice(&text_len.to_le_bytes());
                 buf.extend_from_slice(text_bytes);
             }
+            Value::Enum(label) => {
+                let def = match &column.ty {
+                    ColumnType::Enum(def) => def,
+                    ColumnType::Text
+                    | ColumnType::Vector(_)
+                    | ColumnType::Boolean
+                    | ColumnType::Array(_)
+                    | ColumnType::Bytea => {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Enum value, got Enum",
+                            column.name
+                        )))
+                    }
+                };
+                if def.validate_label(label).is_err() {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} does not accept label {label:?} for enum type {:?}",
+                        column.name,
+                        def.name()
+                    )));
+                }
+                let text_bytes = label.as_bytes();
+                let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid(format!(
+                        "enum label too long: {} bytes",
+                        text_bytes.len()
+                    ))
+                })?;
+                let entry_len = scalar_text_entry_len(text_len)?;
+                reserve(&mut buf, entry_len)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&text_len.to_le_bytes());
+                buf.extend_from_slice(text_bytes);
+            }
             Value::Vector(_) => {
                 return Err(RowCodecError::Invalid(format!(
                     "column {:?} expects a non-Vector value, got Vector",
                     column.name
                 )))
+            }
+            Value::Bool(b) => {
+                if !matches!(column.ty, ColumnType::Boolean) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Boolean value, got Boolean",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
+            }
+            Value::Array(array_value) => {
+                let array_ty = match column.ty {
+                    ColumnType::Array(array_ty) => array_ty,
+                    ColumnType::Text
+                    | ColumnType::Vector(_)
+                    | ColumnType::Boolean
+                    | ColumnType::Bytea
+                    | ColumnType::Enum(_) => {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Array value, got Array",
+                            column.name
+                        )))
+                    }
+                };
+                let entry_len = scalar_array_entry_len(array_ty.elem(), array_value)?;
+                reserve(&mut buf, entry_len)?;
+                buf.push(PRESENCE_VALUE);
+                write_array_value(&mut buf, array_ty, array_value)?;
+            }
+            Value::Bytes(bytes) => {
+                if !matches!(column.ty, ColumnType::Bytea) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Bytea value, got Bytea",
+                        column.name
+                    )));
+                }
+                let byte_len = u32::try_from(bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid(format!("bytea field too long: {} bytes", bytes.len()))
+                })?;
+                if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+                    return Err(RowCodecError::Invalid(format!(
+                        "bytea field length {byte_len} exceeds limit {}",
+                        crate::bytea::MAX_BYTEA_FIELD_LEN
+                    )));
+                }
+                // フレーミング（presence(1) + 長さ(4)）は TEXT と同一のため
+                // `scalar_text_entry_len` を共有する（B3）。
+                let entry_len = scalar_text_entry_len(byte_len)?;
+                reserve(&mut buf, entry_len)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&byte_len.to_le_bytes());
+                buf.extend_from_slice(bytes);
             }
         }
     }
@@ -559,7 +1286,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
 /// 由来する不変条件のため、念のため上限超過は同じ `Err` で fail-closed に拒否する。
 pub(crate) fn merge_encode_scalar_columns(
     schema: &TableSchema,
-    existing: &[Option<&str>],
+    existing: &[Option<ScalarRef>],
     overrides: &[(usize, &Value)],
 ) -> Result<Vec<u8>> {
     if existing.len() > schema.columns.len() {
@@ -612,6 +1339,41 @@ pub(crate) fn merge_encode_scalar_columns(
         Ok(())
     };
 
+    let write_array = |buf: &mut Vec<u8>,
+                       reserve: &mut dyn FnMut(&mut Vec<u8>, u32) -> Result<()>,
+                       array_ty: ArrayType,
+                       array_value: &ArrayValue|
+     -> Result<()> {
+        let entry_len = scalar_array_entry_len(array_ty.elem(), array_value)?;
+        reserve(buf, entry_len)?;
+        buf.push(PRESENCE_VALUE);
+        write_array_value(buf, array_ty, array_value)
+    };
+
+    // BYTEA 用の長さプレフィックス書き込み。フレーミングは `write_text` と
+    // 完全に同一（presence(1) + 長さ(4) + 本体）だが、UTF-8 検証を行わず
+    // 上限を `MAX_BYTEA_FIELD_LEN` で検証する点のみ異なる（B3）。
+    let write_bytes = |buf: &mut Vec<u8>,
+                       reserve: &mut dyn FnMut(&mut Vec<u8>, u32) -> Result<()>,
+                       bytes: &[u8]|
+     -> Result<()> {
+        let byte_len = u32::try_from(bytes.len()).map_err(|_| {
+            RowCodecError::Invalid(format!("bytea field too long: {} bytes", bytes.len()))
+        })?;
+        if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+            return Err(RowCodecError::Invalid(format!(
+                "bytea field length {byte_len} exceeds limit {}",
+                crate::bytea::MAX_BYTEA_FIELD_LEN
+            )));
+        }
+        let entry_len = scalar_text_entry_len(byte_len)?;
+        reserve(buf, entry_len)?;
+        buf.push(PRESENCE_VALUE);
+        buf.extend_from_slice(&byte_len.to_le_bytes());
+        buf.extend_from_slice(bytes);
+        Ok(())
+    };
+
     for (idx, column) in schema.columns.iter().enumerate() {
         if matches!(column.ty, ColumnType::Vector(_)) {
             // VECTOR 列は encode_scalar_columns と同じくスキップ（embedding は
@@ -633,7 +1395,36 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_NULL);
                 }
                 Value::Text(text) => {
+                    if !matches!(column.ty, ColumnType::Text) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Text value, got Text",
+                            column.name
+                        )));
+                    }
                     write_text(&mut buf, &mut reserve, text.as_bytes())?;
+                }
+                Value::Enum(label) => {
+                    let def = match &column.ty {
+                        ColumnType::Enum(def) => def,
+                        ColumnType::Text
+                        | ColumnType::Vector(_)
+                        | ColumnType::Boolean
+                        | ColumnType::Array(_)
+                        | ColumnType::Bytea => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "column {:?} expects a non-Enum value, got Enum",
+                                column.name
+                            )))
+                        }
+                    };
+                    if def.validate_label(label).is_err() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} does not accept label {label:?} for enum type {:?}",
+                            column.name,
+                            def.name()
+                        )));
+                    }
+                    write_text(&mut buf, &mut reserve, label.as_bytes())?;
                 }
                 Value::Vector(_) => {
                     return Err(RowCodecError::Invalid(format!(
@@ -641,9 +1432,45 @@ pub(crate) fn merge_encode_scalar_columns(
                         column.name
                     )))
                 }
+                Value::Bool(b) => {
+                    if !matches!(column.ty, ColumnType::Boolean) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Boolean value, got Boolean",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
+                }
+                Value::Array(array_value) => {
+                    let array_ty = match column.ty {
+                        ColumnType::Array(array_ty) => array_ty,
+                        ColumnType::Text
+                        | ColumnType::Vector(_)
+                        | ColumnType::Boolean
+                        | ColumnType::Bytea
+                        | ColumnType::Enum(_) => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "column {:?} expects a non-Array value, got Array",
+                                column.name
+                            )))
+                        }
+                    };
+                    write_array(&mut buf, &mut reserve, array_ty, array_value)?;
+                }
+                Value::Bytes(bytes) => {
+                    if !matches!(column.ty, ColumnType::Bytea) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Bytea value, got Bytea",
+                            column.name
+                        )));
+                    }
+                    write_bytes(&mut buf, &mut reserve, bytes)?;
+                }
             }
         } else {
-            // SET 対象でない列は既存の借用 `&str`（またはNULL）をそのまま書き込む。
+            // SET 対象でない列は既存の借用値（またはNULL）をそのまま書き込む。
             // `existing` は `scan_scalar_columns` の契約により non-nullable 列で
             // `None` になり得ないが（構造検証済み）、untrusted な格納済みデータに
             // 由来する不変条件のため呼び出し元契約が破れた場合も fail-closed に
@@ -659,8 +1486,35 @@ pub(crate) fn merge_encode_scalar_columns(
                     reserve(&mut buf, 1)?;
                     buf.push(PRESENCE_NULL);
                 }
-                Some(text) => {
+                Some(ScalarRef::Text(text)) => {
                     write_text(&mut buf, &mut reserve, text.as_bytes())?;
+                }
+                // 既存の ENUM 値をそのまま再書き込みする（SET 対象でない列）。
+                // 既に格納済みの値であり、語彙は書き込み時（encode_row 系）に
+                // 一度検査済みのため、ここで再検査する必要はない（Issue #890 D3。
+                // decode 側は語彙を検査しない契約と対称）。
+                Some(ScalarRef::Enum(label)) => {
+                    write_text(&mut buf, &mut reserve, label.as_bytes())?;
+                }
+                Some(ScalarRef::Bool(b)) => {
+                    reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.push(if b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
+                }
+                Some(ScalarRef::Array(array_ref)) => {
+                    let payload_len = u32::try_from(array_ref.bytes.len()).map_err(|_| {
+                        RowCodecError::Invalid("array payload length overflow".to_string())
+                    })?;
+                    // presence(1) + flags(1) + count(4) + payload_len(4) + 本文。
+                    let entry_len = 10u32.checked_add(payload_len).ok_or_else(|| {
+                        RowCodecError::Invalid("array entry length overflow".to_string())
+                    })?;
+                    reserve(&mut buf, entry_len)?;
+                    buf.push(PRESENCE_VALUE);
+                    write_array_ref(&mut buf, &array_ref)?;
+                }
+                Some(ScalarRef::Bytes(bytes)) => {
+                    write_bytes(&mut buf, &mut reserve, bytes)?;
                 }
             }
         }
@@ -689,7 +1543,7 @@ pub(crate) fn merge_encode_scalar_columns(
 pub fn scan_scalar_columns<'a>(
     schema: &TableSchema,
     buf: &'a [u8],
-) -> Result<Vec<Option<&'a str>>> {
+) -> Result<Vec<Option<ScalarRef<'a>>>> {
     scan_scalar_columns_masked(schema, buf, None)
 }
 
@@ -708,8 +1562,8 @@ pub fn scan_scalar_columns_masked<'a>(
     schema: &TableSchema,
     buf: &'a [u8],
     mask: Option<&[bool]>,
-) -> Result<Vec<Option<&'a str>>> {
-    let mut values: Vec<Option<&'a str>> = Vec::new();
+) -> Result<Vec<Option<ScalarRef<'a>>>> {
+    let mut values: Vec<Option<ScalarRef<'a>>> = Vec::new();
     values
         .try_reserve_exact(schema.columns.len())
         .map_err(|_| RowCodecError::Invalid("failed to reserve scalar scan output".to_string()))?;
@@ -745,7 +1599,7 @@ fn scan_scalar_columns_validated<'a>(
     schema: &TableSchema,
     buf: &'a [u8],
     mask: Option<&[bool]>,
-    mut sink: impl FnMut(usize, Option<&'a str>) -> Result<()>,
+    mut sink: impl FnMut(usize, Option<ScalarRef<'a>>) -> Result<()>,
 ) -> Result<()> {
     if let Some(m) = mask {
         if m.len() != schema.columns.len() {
@@ -789,55 +1643,159 @@ fn scan_scalar_columns_validated<'a>(
                 }
                 sink(col_index, None)?;
             }
-            PRESENCE_VALUE => {
-                let len_bytes = buf
-                    .get(
-                        offset..offset.checked_add(4).ok_or_else(|| {
-                            RowCodecError::Invalid(
-                                "offset overflow before text length field".to_string(),
-                            )
-                        })?,
-                    )
-                    .ok_or_else(|| {
+            PRESENCE_VALUE => match &column.ty {
+                ColumnType::Boolean => {
+                    let byte = *buf.get(offset).ok_or_else(|| {
                         RowCodecError::Invalid(
-                            "scalar payload truncated at text length field".to_string(),
+                            "scalar payload truncated at boolean value field".to_string(),
                         )
                     })?;
-                let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
-                    RowCodecError::Invalid("text length field is not 4 bytes".to_string())
-                })?;
-                let text_len = u32::from_le_bytes(len_arr);
-                if text_len > MAX_TEXT_FIELD_LEN {
-                    return Err(RowCodecError::Invalid(format!(
-                        "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
-                    )));
+                    let b = match byte {
+                        BOOL_FALSE_BYTE => false,
+                        BOOL_TRUE_BYTE => true,
+                        other => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "unknown boolean value byte: {other}"
+                            )))
+                        }
+                    };
+                    offset = offset.checked_add(1).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after boolean value field".to_string(),
+                        )
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Bool(b)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
                 }
-                offset = offset.checked_add(4).ok_or_else(|| {
-                    RowCodecError::Invalid("offset overflow after text length field".to_string())
-                })?;
-                let text_end = offset.checked_add(text_len as usize).ok_or_else(|| {
-                    RowCodecError::Invalid("offset overflow after text field".to_string())
-                })?;
-                let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
-                    RowCodecError::Invalid("scalar payload truncated at text field".to_string())
-                })?;
-                offset = text_end;
-                // UTF-8 妥当性検証は要求列・非要求列を問わず常に行う（codex-review
-                // P1 指摘・PR #369: 未参照列でも不正 UTF-8 を含む永続行を fail-closed
-                // で拒否する既存のエラー契約（`XX000`）を維持する必要があるため）。
-                // マスクで要求されなかった列（`validate_scalar_columns` 経由は常に
-                // 全列非要求）は、検証済みの `&str` を破棄して `None` を渡すことで
-                // `&str` 生成・保持コストのみを省略する（Issue #350: 必要列限定
-                // デコード）。
-                let text = std::str::from_utf8(text_bytes).map_err(|_| {
-                    RowCodecError::Invalid("text field is not valid UTF-8".to_string())
-                })?;
-                if wanted {
-                    sink(col_index, Some(text))?;
-                } else {
-                    sink(col_index, None)?;
+                ColumnType::Text | ColumnType::Vector(_) | ColumnType::Enum(_) => {
+                    let len_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before text length field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at text length field".to_string(),
+                            )
+                        })?;
+                    let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("text length field is not 4 bytes".to_string())
+                    })?;
+                    let text_len = u32::from_le_bytes(len_arr);
+                    if text_len > MAX_TEXT_FIELD_LEN {
+                        return Err(RowCodecError::Invalid(format!(
+                            "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after text length field".to_string(),
+                        )
+                    })?;
+                    let text_end = offset.checked_add(text_len as usize).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after text field".to_string())
+                    })?;
+                    let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
+                        RowCodecError::Invalid("scalar payload truncated at text field".to_string())
+                    })?;
+                    offset = text_end;
+                    // UTF-8 妥当性検証は要求列・非要求列を問わず常に行う（codex-review
+                    // P1 指摘・PR #369: 未参照列でも不正 UTF-8 を含む永続行を fail-closed
+                    // で拒否する既存のエラー契約（`XX000`）を維持する必要があるため）。
+                    // マスクで要求されなかった列（`validate_scalar_columns` 経由は常に
+                    // 全列非要求）は、検証済みの `&str` を破棄して `None` を渡すことで
+                    // `&str` 生成・保持コストのみを省略する（Issue #350: 必要列限定
+                    // デコード）。ENUM 列は要求・非要求を問わず現行語彙との照合を行う
+                    // （codex-review P1 指摘・Issue #890。`decode_row` の検査と同一
+                    // 契約。破損行の語彙外ラベルが投影・等価フィルタ・二次索引へ
+                    // 流出するのを構造検証のみのマスク非要求経路でも防ぐ）。
+                    let text = std::str::from_utf8(text_bytes).map_err(|_| {
+                        RowCodecError::Invalid("text field is not valid UTF-8".to_string())
+                    })?;
+                    if let ColumnType::Enum(def) = &column.ty {
+                        if !def.contains(text) {
+                            return Err(RowCodecError::Invalid(format!(
+                                "enum value {text:?} is not a valid label of type {:?}",
+                                def.name()
+                            )));
+                        }
+                        if wanted {
+                            sink(col_index, Some(ScalarRef::Enum(text)))?;
+                        } else {
+                            sink(col_index, None)?;
+                        }
+                    } else if wanted {
+                        sink(col_index, Some(ScalarRef::Text(text)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
                 }
-            }
+                ColumnType::Array(array_ty) => {
+                    // 構造・UTF-8・要素上限の検証は要求列・非要求列を問わず
+                    // 常に行う（Text 列と同じ方針。`parse_array_frame` が全検証を
+                    // 内包する）。
+                    let (array_ref, new_offset) =
+                        parse_array_frame(buf, offset, array_ty.elem(), array_ty.max_len())?;
+                    offset = new_offset;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Array(array_ref)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+                ColumnType::Bytea => {
+                    let len_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before bytea length field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at bytea length field".to_string(),
+                            )
+                        })?;
+                    let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("bytea length field is not 4 bytes".to_string())
+                    })?;
+                    let byte_len = u32::from_le_bytes(len_arr);
+                    if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+                        return Err(RowCodecError::Invalid(format!(
+                            "bytea field length {byte_len} exceeds limit {}",
+                            crate::bytea::MAX_BYTEA_FIELD_LEN
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after bytea length field".to_string(),
+                        )
+                    })?;
+                    let bytea_end = offset.checked_add(byte_len as usize).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after bytea field".to_string())
+                    })?;
+                    let bytea_bytes = buf.get(offset..bytea_end).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "scalar payload truncated at bytea field".to_string(),
+                        )
+                    })?;
+                    offset = bytea_end;
+                    // BYTEA は UTF-8 検証を行わない点のみ TEXT と異なる
+                    // （presence タグ・宣言長上限・バッファ境界の構造検証は共有）。
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Bytes(bytea_bytes)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+            },
             other => {
                 return Err(RowCodecError::Invalid(format!(
                     "unknown presence byte: {other}"
@@ -875,13 +1833,33 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
     for slot in scanned {
         match slot {
             None => values.push(Value::Null),
-            Some(text) => {
+            Some(ScalarRef::Text(text)) => {
                 let mut owned = String::new();
                 owned.try_reserve_exact(text.len()).map_err(|_| {
                     RowCodecError::Invalid("failed to reserve text field".to_string())
                 })?;
                 owned.push_str(text);
                 values.push(Value::Text(owned));
+            }
+            Some(ScalarRef::Enum(label)) => {
+                let mut owned = String::new();
+                owned.try_reserve_exact(label.len()).map_err(|_| {
+                    RowCodecError::Invalid("failed to reserve enum field".to_string())
+                })?;
+                owned.push_str(label);
+                values.push(Value::Enum(owned));
+            }
+            Some(ScalarRef::Bool(b)) => values.push(Value::Bool(b)),
+            Some(ScalarRef::Array(array_ref)) => {
+                values.push(Value::Array(array_ref.to_value()?));
+            }
+            Some(ScalarRef::Bytes(bytes)) => {
+                let mut owned: Vec<u8> = Vec::new();
+                owned.try_reserve_exact(bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid("failed to reserve bytea field".to_string())
+                })?;
+                owned.extend_from_slice(bytes);
+                values.push(Value::Bytes(owned));
             }
         }
     }
@@ -1271,15 +2249,18 @@ mod tests {
         assert_eq!(scanned[0], None); // VECTOR 列は常に None
         let buf_range = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
         for slot in scanned.iter().skip(1) {
-            let s = slot.expect("text column must be Some");
+            let s = slot
+                .expect("text column must be Some")
+                .as_text()
+                .expect("text column must be ScalarRef::Text");
             let ptr = s.as_ptr() as usize;
             assert!(
                 buf_range.contains(&ptr),
                 "scanned &str must borrow from buf, not allocate a copy"
             );
         }
-        assert_eq!(scanned[1], Some("body-text".repeat(1000).as_str()));
-        assert_eq!(scanned[2], Some("tag-value"));
+        assert_eq!(scanned[1], Some(ScalarRef::Text(&"body-text".repeat(1000))));
+        assert_eq!(scanned[2], Some(ScalarRef::Text("tag-value")));
     }
 
     #[test]
@@ -1316,7 +2297,7 @@ mod tests {
         for (slot, value) in scanned.iter().zip(decoded.iter()) {
             match (slot, value) {
                 (None, Value::Null) => {}
-                (Some(s), Value::Text(t)) => assert_eq!(*s, t.as_str()),
+                (Some(s), Value::Text(t)) => assert_eq!(*s, ScalarRef::Text(t.as_str())),
                 other => panic!("scan/decode mismatch: {other:?}"),
             }
         }
@@ -1354,7 +2335,7 @@ mod tests {
         let scanned = scan_scalar_columns_masked(&schema, &buf, Some(&mask)).expect("scan masked");
         assert_eq!(scanned[0], None); // VECTOR 列は常に None
         assert_eq!(scanned[1], None); // マスク対象外
-        assert_eq!(scanned[2], Some("wanted"));
+        assert_eq!(scanned[2], Some(ScalarRef::Text("wanted")));
     }
 
     #[test]
@@ -1442,5 +2423,417 @@ mod tests {
             validate_scalar_columns(&schema, &buf),
             Err(RowCodecError::Invalid(_))
         ));
+    }
+
+    fn array_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new(
+                    "tags",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::Text, 8).expect("array ty")),
+                    false,
+                ),
+                ColumnDef::new(
+                    "flags",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::Bool, 4).expect("array ty")),
+                    true,
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn array_encode_decode_roundtrip_text_and_bool() {
+        let schema = array_schema();
+        let values = vec![
+            Value::Array(ArrayValue::Text(vec![
+                "a".to_string(),
+                "b b".to_string(),
+                String::new(),
+            ])),
+            Value::Array(ArrayValue::Bool(vec![true, false, true])),
+        ];
+        let encoded = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        let decoded = decode_row(&schema, &encoded).expect("decode");
+        assert_eq!(decoded.values, values);
+    }
+
+    #[test]
+    fn array_encode_decode_roundtrip_empty_array() {
+        let schema = array_schema();
+        let values = vec![
+            Value::Array(ArrayValue::Text(vec![])),
+            Value::Array(ArrayValue::Bool(vec![])),
+        ];
+        let encoded = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        let decoded = decode_row(&schema, &encoded).expect("decode");
+        assert_eq!(decoded.values, values);
+    }
+
+    #[test]
+    fn array_null_column_and_empty_array_are_distinct() {
+        let schema = array_schema();
+        let values = vec![Value::Array(ArrayValue::Text(vec![])), Value::Null];
+        let encoded = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        let decoded = decode_row(&schema, &encoded).expect("decode");
+        assert_eq!(decoded.values[1], Value::Null);
+        assert_eq!(decoded.values[0], Value::Array(ArrayValue::Text(vec![])));
+    }
+
+    #[test]
+    fn array_encode_rejects_element_count_exceeding_max_len() {
+        let schema = array_schema();
+        let too_many = vec!["x".to_string(); 9]; // max_len = 8
+        let values = vec![Value::Array(ArrayValue::Text(too_many)), Value::Null];
+        let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn array_encode_rejects_element_type_mismatch() {
+        let schema = array_schema();
+        let values = vec![
+            Value::Array(ArrayValue::Bool(vec![true])), // tags is Text
+            Value::Null,
+        ];
+        let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn array_decode_rejects_flags_byte_nonzero() {
+        let schema = array_schema();
+        let values = vec![Value::Array(ArrayValue::Text(vec![])), Value::Null];
+        let mut encoded =
+            encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        // ヘッダ(3) + tenant_id("tenant-a"=8) + presence(1) の直後が flags バイト。
+        let flags_offset = 3 + "tenant-a".len() + 1;
+        encoded[flags_offset] = 0x01;
+        assert!(matches!(
+            decode_row(&schema, &encoded),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn array_decode_rejects_invalid_utf8_text_element() {
+        let schema = array_schema();
+        // 1 要素・長さ 1 の TEXT 要素バイトを不正 UTF-8 に差し替える。
+        let values = vec![
+            Value::Array(ArrayValue::Text(vec!["a".to_string()])),
+            Value::Null,
+        ];
+        let mut encoded =
+            encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        let elem_byte_offset = encoded.len() - 1;
+        encoded[elem_byte_offset] = 0xff;
+        assert!(matches!(
+            decode_row(&schema, &encoded),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn array_decode_rejects_unknown_bool_element_byte() {
+        let schema = array_schema();
+        let values = vec![
+            Value::Array(ArrayValue::Text(vec![])),
+            Value::Array(ArrayValue::Bool(vec![true])),
+        ];
+        let mut encoded =
+            encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        let elem_byte_offset = encoded.len() - 1;
+        encoded[elem_byte_offset] = 0x02;
+        assert!(matches!(
+            decode_row(&schema, &encoded),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn array_scalar_columns_scan_and_merge_roundtrip() {
+        let schema = array_schema();
+        let values = vec![
+            Value::Array(ArrayValue::Text(vec!["x".to_string(), "y".to_string()])),
+            Value::Array(ArrayValue::Bool(vec![true])),
+        ];
+        let encoded = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        let scanned = scan_scalar_columns(&schema, &encoded).expect("scan");
+        assert_eq!(scanned.len(), 2);
+        match scanned[0] {
+            Some(ScalarRef::Array(array_ref)) => {
+                assert_eq!(array_ref.elem(), ArrayElemType::Text);
+                assert_eq!(array_ref.count(), 2);
+                assert_eq!(
+                    array_ref.to_value().expect("to_value"),
+                    ArrayValue::Text(vec!["x".to_string(), "y".to_string()])
+                );
+            }
+            _ => panic!("expected ScalarRef::Array for tags column"),
+        }
+
+        // merge_encode_scalar_columns: SET 対象でない列（既存の Array 借用値）を
+        // そのまま書き込めること。
+        let overrides: Vec<(usize, &Value)> = vec![];
+        let merged =
+            merge_encode_scalar_columns(&schema, &scanned, &overrides).expect("merge encode");
+        assert_eq!(merged, encoded);
+
+        let decoded = decode_scalar_columns(&schema, &encoded).expect("decode scalar");
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn array_type_rejects_max_len_out_of_range() {
+        assert!(ArrayType::new(ArrayElemType::Text, 0).is_err());
+        assert!(ArrayType::new(ArrayElemType::Text, MAX_ARRAY_ELEMENTS + 1).is_err());
+        assert!(ArrayType::new(ArrayElemType::Text, MAX_ARRAY_ELEMENTS).is_ok());
+    }
+
+    // --- BYTEA 列（Issue #886）の decode-side DoS ガード ------------------------
+
+    fn bytea_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("blob", ColumnType::Bytea, true)],
+        )
+    }
+
+    #[test]
+    fn decode_row_rejects_bytea_declared_length_over_limit_before_body_read() {
+        let schema = bytea_schema();
+        let mut buf = Vec::new();
+        buf.push(ROW_CODEC_FORMAT_VERSION);
+        buf.push(Visibility::Public.to_byte());
+        let tenant_bytes = b"tenant-a";
+        buf.push(tenant_bytes.len() as u8);
+        buf.extend_from_slice(tenant_bytes);
+        buf.push(PRESENCE_VALUE);
+        // 宣言長は上限超過（MAX + 1）。本体は短いままにする——長さ検査が
+        // 本体バッファの実サイズによらず先に効くことを固定する（B3）。
+        buf.extend_from_slice(&(crate::bytea::MAX_BYTEA_FIELD_LEN + 1).to_le_bytes());
+        buf.extend_from_slice(b"short");
+        let result = decode_row(&schema, &buf);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn decode_row_rejects_truncated_bytea_body() {
+        let schema = bytea_schema();
+        let mut buf = Vec::new();
+        buf.push(ROW_CODEC_FORMAT_VERSION);
+        buf.push(Visibility::Public.to_byte());
+        let tenant_bytes = b"tenant-a";
+        buf.push(tenant_bytes.len() as u8);
+        buf.extend_from_slice(tenant_bytes);
+        buf.push(PRESENCE_VALUE);
+        // 宣言長は 10 バイトだが本体は 3 バイトしかない。
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(b"abc");
+        let result = decode_row(&schema, &buf);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn encode_row_rejects_bytes_value_for_text_column() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        );
+        let values = vec![Value::Bytes(vec![0xde, 0xad])];
+        let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn encode_row_rejects_text_value_for_bytea_column() {
+        let schema = bytea_schema();
+        let values = vec![Value::Text("hello".to_string())];
+        let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn bytea_round_trips_through_encode_decode_row() {
+        let schema = bytea_schema();
+        let values = vec![Value::Bytes(vec![0x00, 0xff, 0xde, 0xad])];
+        let buf = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        let decoded = decode_row(&schema, &buf).expect("decode");
+        assert_eq!(decoded.values, values);
+    }
+
+    #[test]
+    fn bytea_null_and_empty_are_distinct_after_round_trip() {
+        let schema = bytea_schema();
+        let null_buf = encode_row(&schema, "tenant-a", Visibility::Public, &[Value::Null])
+            .expect("encode null");
+        let empty_buf = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Bytes(Vec::new())],
+        )
+        .expect("encode empty");
+        assert_ne!(null_buf, empty_buf);
+        assert_eq!(
+            decode_row(&schema, &null_buf).expect("decode null").values,
+            vec![Value::Null]
+        );
+        assert_eq!(
+            decode_row(&schema, &empty_buf)
+                .expect("decode empty")
+                .values,
+            vec![Value::Bytes(Vec::new())]
+        );
+    }
+
+    // --- merge_encode_scalar_columns（Issue #996: 述語つき UPDATE の適用段を
+    // 単一行 UPDATE と共有する経路へ統一する前提のバイト同一性検証） -------------
+
+    /// `decode_scalar_columns`（全列複製）→ スロット上書き → `encode_scalar_columns`
+    /// という旧・述語つき UPDATE 実装の経路を再現する参照オラクル。
+    fn apply_overrides_via_decode_then_encode(
+        schema: &TableSchema,
+        buf: &[u8],
+        overrides: &[(usize, &Value)],
+    ) -> Vec<u8> {
+        let mut merged_values = decode_scalar_columns(schema, buf).expect("decode scalar");
+        for (idx, value) in overrides {
+            let slot = merged_values
+                .get_mut(*idx)
+                .expect("override index must be in range");
+            *slot = (*value).clone();
+        }
+        encode_scalar_columns(schema, &merged_values).expect("encode scalar")
+    }
+
+    /// `scan_scalar_columns`（借用のみ）→ `merge_encode_scalar_columns` という
+    /// 単一行 UPDATE・統一後の述語つき UPDATE が共有する経路。
+    fn apply_overrides_via_scan_then_merge(
+        schema: &TableSchema,
+        buf: &[u8],
+        overrides: &[(usize, &Value)],
+    ) -> Vec<u8> {
+        let scanned = scan_scalar_columns(schema, buf).expect("scan scalar");
+        merge_encode_scalar_columns(schema, &scanned, overrides).expect("merge encode scalar")
+    }
+
+    fn text_only_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("tag", ColumnType::Text, true),
+            ],
+        )
+    }
+
+    /// VECTOR 列が先頭でなく中間 index にあるスキーマ（`text_vector_schema` は
+    /// embedding が index 0 に固定されているため、途中の index にある場合も
+    /// 同じ経路を通ることを別途確認する）。
+    fn text_vector_text_schema_vector_in_middle() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("tag", ColumnType::Text, true),
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        )
+    }
+
+    /// [`merge_encode_scalar_columns`]（借用版 `scan_scalar_columns` 経由）と
+    /// [`decode_scalar_columns`]＋`encode_scalar_columns`（旧・述語つき UPDATE
+    /// 実装が使っていた経路）が、同じ overrides に対して常にバイト同一の出力を
+    /// 生成することを固定する（Issue #996）。`crates/engine/src/tenant.rs` の
+    /// 述語つき UPDATE 適用段（`update_rows_where_unchecked`）を本関数へ統一する
+    /// 前提となる等価性テスト。
+    #[test]
+    fn merge_encode_scalar_columns_matches_decode_then_encode_scalar_columns() {
+        let schema = text_vector_schema();
+
+        // nullable 列（tag）が NULL のまま（SET なし）。
+        let buf = encode_scalar_columns(
+            &schema,
+            &[
+                Value::Vector(vec![1.0, 2.0, 3.0]),
+                Value::Text("body-text".to_string()),
+                Value::Null,
+            ],
+        )
+        .expect("encode scalar");
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&schema, &buf, &[]),
+            apply_overrides_via_decode_then_encode(&schema, &buf, &[])
+        );
+
+        // 既存値 NULL → SET text（マルチバイト UTF-8 を含む）。
+        let set_text = Value::Text("こんにちは".to_string());
+        let overrides = [(2usize, &set_text)];
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&schema, &buf, &overrides),
+            apply_overrides_via_decode_then_encode(&schema, &buf, &overrides)
+        );
+
+        // 既存値 text → SET NULL。
+        let buf_with_tag = encode_scalar_columns(
+            &schema,
+            &[
+                Value::Vector(vec![1.0, 2.0, 3.0]),
+                Value::Text("body-text".to_string()),
+                Value::Text("existing-tag".to_string()),
+            ],
+        )
+        .expect("encode scalar");
+        let set_null = Value::Null;
+        let overrides = [(2usize, &set_null)];
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&schema, &buf_with_tag, &overrides),
+            apply_overrides_via_decode_then_encode(&schema, &buf_with_tag, &overrides)
+        );
+
+        // 空文字列も含む複数 TEXT 列の一部だけを SET（non-nullable な body は
+        // SET しない＝借用のまま連結される経路を通す）。
+        let set_empty = Value::Text(String::new());
+        let overrides = [(2usize, &set_empty)];
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&schema, &buf_with_tag, &overrides),
+            apply_overrides_via_decode_then_encode(&schema, &buf_with_tag, &overrides)
+        );
+
+        // VECTOR 列を持たないスキーマ（`overrides` が空でも通ることを含む）。
+        let text_only = text_only_schema();
+        let buf_text_only =
+            encode_scalar_columns(&text_only, &[Value::Text("body".to_string()), Value::Null])
+                .expect("encode scalar");
+        let set_tag = Value::Text("filled".to_string());
+        let overrides = [(1usize, &set_tag)];
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&text_only, &buf_text_only, &overrides),
+            apply_overrides_via_decode_then_encode(&text_only, &buf_text_only, &overrides)
+        );
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&text_only, &buf_text_only, &[]),
+            apply_overrides_via_decode_then_encode(&text_only, &buf_text_only, &[])
+        );
+
+        // VECTOR 列が途中の index にあるスキーマ。
+        let mid_vector = text_vector_text_schema_vector_in_middle();
+        let buf_mid_vector = encode_scalar_columns(
+            &mid_vector,
+            &[
+                Value::Text("existing-tag".to_string()),
+                Value::Vector(vec![4.0, 5.0]),
+                Value::Text("body-text".to_string()),
+            ],
+        )
+        .expect("encode scalar");
+        let set_tag2 = Value::Null;
+        let overrides = [(0usize, &set_tag2)];
+        assert_eq!(
+            apply_overrides_via_scan_then_merge(&mid_vector, &buf_mid_vector, &overrides),
+            apply_overrides_via_decode_then_encode(&mid_vector, &buf_mid_vector, &overrides)
+        );
     }
 }

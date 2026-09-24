@@ -32,7 +32,7 @@ use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
-use engine::row_codec::{encode_scalar_columns, Value};
+use engine::row_codec::{encode_scalar_columns, ScalarRef, Value};
 use engine::storage::{RowInput, Storage, Visibility};
 use engine::tenant;
 
@@ -276,8 +276,8 @@ fn scan_scalar_columns_and_lang_filter_roundtrip() {
 
     let scanned = scan_scalar_columns(&schema, &metadata).expect("scan_scalar_columns");
     assert_eq!(scanned.len(), schema.columns.len());
-    assert_eq!(scanned[1], Some("ja"));
-    assert_eq!(scanned[2], Some("topic-00"));
+    assert_eq!(scanned[1], Some(ScalarRef::Text("ja")));
+    assert_eq!(scanned[2], Some(ScalarRef::Text("topic-00")));
 
     let filters = vec![build_lang_filter(&schema, "lang", "ja").expect("build_lang_filter")];
     assert!(matches_lang_filter(&filters, &scanned));

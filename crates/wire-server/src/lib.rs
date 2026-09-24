@@ -58,7 +58,14 @@
 //! - [`simple_query`][]: 簡易クエリ（'Q'）1 文の `engine::core::EngineCore` への
 //!   委譲・成功/失敗応答の組み立て（TASK-73・WIRE-1）
 //! - [`result_encoder`][]: `RowDescription`/`DataRow`/`CommandComplete`/
-//!   `EmptyQueryResponse` のバイト列生成（純関数。TASK-73・WIRE-1）
+//!   `EmptyQueryResponse` のバイト列生成（純関数。TASK-73・WIRE-1）。
+//!   バイナリ形式（format code 1）の結果エンコーディング（WIRE-14・
+//!   TASK-218・Issue #936。`ResultFormats::resolve`・
+//!   `validate_binary_formats`・`encode_row_description_with_formats`・
+//!   `encode_data_row_into_with_formats`）も本モジュールが提供するが、
+//!   拡張クエリプロトコルの Bind／Describe（#933・#934）が未実装のため
+//!   wire 経由でバイナリ形式を要求する経路は本 crate にまだ無い（Phase A。
+//!   結線は #934 の担当）
 //! - [`error_response`][]: `engine::error_format::ErrorClass` → `ErrorResponse`
 //!   （'E'）バイト列への横断写像（TASK-153・ERR-1・`RECOVER-5` (3) ポインタ）
 //! - `response_buffer`（crate 内限定）: 簡易クエリ応答の `DataRow` 群を上限付き
@@ -76,6 +83,9 @@
 //!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
 //!   語彙パーサと、`simple_query::execute_and_respond` の登録ブロック内から
 //!   呼ばれる commit 後 panic 注入。default features には含まれない
+//! - [`tls`]: 親 Issue #941（TLS 1.3 サーバー側自作実装。TASK-228・WIRE-9・
+//!   HTTP-10 ポインタ）の構成要素。現時点では X25519 鍵交換（RFC 7748・
+//!   定数時間。Issue #955）まで実装済み。接続への結線は #966 以降
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）、
 //! TASK-68（対象ビヘイビア WIRE-4, WIRE-10）、TASK-69（対象ビヘイビア WIRE-5, WIRE-6）、
@@ -84,6 +94,7 @@
 //! TASK-153（対象ビヘイビア ERR-1: ErrorResponse 正式写像）。
 
 pub mod auth;
+pub mod auth_method_opt;
 pub mod bind_guard;
 pub(crate) mod copy;
 pub mod durability_opt;
@@ -102,3 +113,4 @@ pub mod search_engine_opt;
 pub mod server;
 pub mod simple_query;
 pub mod surface;
+pub mod tls;

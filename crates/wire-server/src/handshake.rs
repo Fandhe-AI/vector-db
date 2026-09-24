@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use engine::error_format::ErrorClass;
 
-use crate::auth::{self, UserStore};
+use crate::auth::{self, base64_std, scram, AuthMethod, UserStore};
 use crate::framing::{self, FrameError};
 
 /// StartupMessage が名乗るべきプロトコルバージョン（3.0 = major 3, minor 0）。
@@ -136,6 +136,111 @@ fn write_authentication_ok(stream: &mut TcpStream) -> Result<()> {
     msg.extend_from_slice(&8i32.to_be_bytes());
     msg.extend_from_slice(&0i32.to_be_bytes());
     write_all(stream, &msg)
+}
+
+/// SASL メッセージ 1 個あたりの上限（Issue #940・WIRE-18・TASK-222）。
+/// 妥当な SCRAM メッセージ（機構名・nonce・salt・proof を含む）は数百バイト
+/// 以内に収まるため、余裕を持った固定上限とする。超過は `54000`
+/// （[`FrameError::TooLarge`] と同じ分類）へ写像する。
+const MAX_SASL_MESSAGE_LEN: usize = 2048;
+
+/// `AuthenticationSASL`（'R'/10）: 提示する機構は [`scram::MECHANISM_NAME`]
+/// の 1 つのみ（`-PLUS` は TLS 未実装のため提示しない。Issue #941・TASK-228 へ
+/// 引き継ぐ）。
+fn write_authentication_sasl(stream: &mut TcpStream) -> Result<()> {
+    let mut body = Vec::new();
+    body.extend_from_slice(scram::MECHANISM_NAME.as_bytes());
+    body.push(0);
+    body.push(0); // 機構リストの終端（空文字列）。
+    let total_len = (8 + body.len()) as i32;
+    let mut msg = Vec::with_capacity(5 + body.len());
+    msg.push(b'R');
+    msg.extend_from_slice(&total_len.to_be_bytes());
+    msg.extend_from_slice(&10i32.to_be_bytes());
+    msg.extend_from_slice(&body);
+    write_all(stream, &msg)
+}
+
+/// `AuthenticationSASLContinue`（'R'/11）: server-first-message を運ぶ。
+fn write_authentication_sasl_continue(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+    let total_len = (8 + data.len()) as i32;
+    let mut msg = Vec::with_capacity(5 + data.len());
+    msg.push(b'R');
+    msg.extend_from_slice(&total_len.to_be_bytes());
+    msg.extend_from_slice(&11i32.to_be_bytes());
+    msg.extend_from_slice(data);
+    write_all(stream, &msg)
+}
+
+/// `AuthenticationSASLFinal`（'R'/12）: server-final-message（`v=...`）を運ぶ。
+/// proof の検証に成功した場合にのみ送出し、これを送った直後は必ず
+/// `AuthenticationOk` 以降の既存シーケンスへ進む（`v=` を送ってからエラーに
+/// する経路は作らない）。
+fn write_authentication_sasl_final(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+    let total_len = (8 + data.len()) as i32;
+    let mut msg = Vec::with_capacity(5 + data.len());
+    msg.push(b'R');
+    msg.extend_from_slice(&total_len.to_be_bytes());
+    msg.extend_from_slice(&12i32.to_be_bytes());
+    msg.extend_from_slice(data);
+    write_all(stream, &msg)
+}
+
+/// `SASLInitialResponse`（型 'p'）を読む。本文は「機構名（C 文字列）」
+/// 「int32 の長さ（`-1` は不可）」「client-first-message 本体」の順。
+/// PasswordMessage と型バイトは同じだが本文形状が異なるため
+/// `read_password_message` は流用しない。
+fn read_sasl_initial_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let type_byte = match framing::read_typed_frame_header(stream)? {
+        Some(b) => b,
+        None => return Err(HandshakeError::Protocol("expected SASLInitialResponse")),
+    };
+    if type_byte != b'p' {
+        return Err(HandshakeError::Protocol("expected SASLInitialResponse"));
+    }
+    let body = framing::read_length_prefixed_body(
+        stream,
+        framing::MIN_TYPED_MESSAGE_LEN,
+        MAX_SASL_MESSAGE_LEN,
+    )?;
+
+    let mut pos = 0usize;
+    let mechanism = read_c_string(&body, &mut pos)?;
+    if mechanism != scram::MECHANISM_NAME {
+        return Err(HandshakeError::Protocol("unsupported SASL mechanism"));
+    }
+    let len_bytes: [u8; 4] = body
+        .get(pos..pos + 4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(HandshakeError::Protocol("truncated SASL message length"))?;
+    let declared_len = i32::from_be_bytes(len_bytes);
+    pos += 4;
+    if declared_len < 0 {
+        return Err(HandshakeError::Protocol("negative SASL message length"));
+    }
+    let rest = body
+        .get(pos..)
+        .ok_or(HandshakeError::Protocol("truncated SASL message body"))?;
+    if rest.len() != declared_len as usize {
+        return Err(HandshakeError::Protocol(
+            "SASL message length does not match declared value",
+        ));
+    }
+    Ok(rest.to_vec())
+}
+
+/// `SASLResponse`（型 'p'）を読む。本文は raw bytes（PasswordMessage と異なり
+/// NUL 終端ではない）。
+fn read_sasl_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let type_byte = match framing::read_typed_frame_header(stream)? {
+        Some(b) => b,
+        None => return Err(HandshakeError::Protocol("expected SASLResponse")),
+    };
+    if type_byte != b'p' {
+        return Err(HandshakeError::Protocol("expected SASLResponse"));
+    }
+    framing::read_length_prefixed_body(stream, framing::MIN_TYPED_MESSAGE_LEN, MAX_SASL_MESSAGE_LEN)
+        .map_err(HandshakeError::from)
 }
 
 /// BackendKeyData（'K'）: pid・secret key を通知する。CancelRequest 経路は本タスクの
@@ -582,6 +687,160 @@ pub fn handle_connection_with_engine(
     handle_connection_inner(stream, store, Some(engine))
 }
 
+/// 認証の結果（成功時の `PolicyContext`、または失敗〔`ErrorResponse` は
+/// [`authenticate`] 内で既に送出済みで、呼び出し元は接続を閉じるだけでよい〕）。
+enum AuthOutcome {
+    Success(engine::policy::PolicyContext),
+    Failure,
+}
+
+/// `store.auth_method()` に応じて cleartext／SCRAM-SHA-256 のいずれかの認証
+/// フローを実行する（Issue #940・WIRE-18・TASK-222。サーバー全体で 1 方式に
+/// 固定し、ユーザーごとには切り替えない設計）。`AuthenticationOk` 以降の
+/// 共通シーケンスは呼び出し元（[`handle_connection_inner`]）が担う。
+fn authenticate(stream: &mut TcpStream, store: &UserStore, username: &str) -> Result<AuthOutcome> {
+    match store.auth_method() {
+        AuthMethod::Cleartext => authenticate_cleartext(stream, store, username),
+        AuthMethod::ScramSha256 => authenticate_scram(stream, store, username),
+    }
+}
+
+/// ポインタ: TASK-67・WIRE-3。既存の cleartext password フロー。
+fn authenticate_cleartext(
+    stream: &mut TcpStream,
+    store: &UserStore,
+    username: &str,
+) -> Result<AuthOutcome> {
+    write_authentication_cleartext_password(stream)?;
+    let password = read_password_message(stream)?;
+    match auth::verify(store, username, &password) {
+        Err(_failure) => {
+            write_error_response(stream, ErrorClass::AuthInvalid, auth::AuthFailure::MESSAGE)?;
+            Ok(AuthOutcome::Failure)
+        }
+        Ok(ctx) => Ok(AuthOutcome::Success(ctx)),
+    }
+}
+
+/// SCRAM-SHA-256（RFC 5802／RFC 7677）の SASL 往復（Issue #940・WIRE-18・
+/// TASK-222）。未知ユーザーはモック検証子（`scram::mock_verifier`）で
+/// 同一手順を最後まで実行し、固定遅延（`client-final` 検証開始時点から
+/// [`auth::AUTH_FAILURE_DELAY`]）・同一のエラー応答で列挙攻撃を防ぐ。
+/// TLS 未実装のためチャネルバインディング（`-PLUS`／`p=<cb-name>`）は
+/// 提示・受理しない（`08P01`。Issue #941・TASK-228 へ引き継ぐ）。
+fn authenticate_scram(
+    stream: &mut TcpStream,
+    store: &UserStore,
+    username: &str,
+) -> Result<AuthOutcome> {
+    write_authentication_sasl(stream)?;
+
+    let client_first_body = read_sasl_initial_response(stream)?;
+    let client_first = match scram::parse_client_first(&client_first_body) {
+        Ok(c) => c,
+        Err(scram::ScramError::ChannelBindingRequested) => {
+            write_error_response(
+                stream,
+                ErrorClass::ProtocolViolation,
+                "channel binding is not supported on this connection",
+            )?;
+            return Ok(AuthOutcome::Failure);
+        }
+        Err(_) => {
+            write_error_response(
+                stream,
+                ErrorClass::ProtocolViolation,
+                "malformed SASL message",
+            )?;
+            return Ok(AuthOutcome::Failure);
+        }
+    };
+
+    // P0 review 指摘（Issue #940 PR #1006）: モック検証子の生成コストが
+    // 既知/未知ユーザー間で非対称だと、`AuthenticationSASLContinue` 到着まで
+    // の時間差でユーザー存在を列挙されうる（既知ユーザーは保存済み検証子の
+    // `clone` のみ、未知ユーザーは `mock_verifier` が HMAC-SHA256 を 3 回
+    // 実行してから決まる）。`scram_lookup` の分岐に関わらず必ず
+    // `mock_verifier` を計算してから分岐することで、既知/未知いずれの経路も
+    // 同じ計算量（`mock_verifier` 相当のコスト＋高々 1 回の `clone`）を
+    // `server-first` 送出前に必ず消費させる（列挙攻撃対策。
+    // ポインタ: WIRE-2, WIRE-3）。
+    let Some(mock_key) = store.scram_mock_key() else {
+        // 構造的に到達しないはずの分岐（`ScramSha256` は `UserStore::require_scram`
+        // 経由でのみ選ばれ、その関数は必ずモック鍵を設定する）だが、
+        // fail-closed に認証失敗として扱う（`unwrap`/`expect` でパニックさせない）。
+        write_error_response(stream, ErrorClass::AuthInvalid, auth::AuthFailure::MESSAGE)?;
+        return Ok(AuthOutcome::Failure);
+    };
+    let mock = scram::mock_verifier(mock_key, username, scram::SCRAM_ITERATIONS);
+    let (tenant_id, verifier) = match store.scram_lookup(username) {
+        Some((tenant, v)) => (Some(tenant.to_string()), v.clone()),
+        None => (None, mock),
+    };
+
+    let server_nonce_raw = auth::read_urandom(18)?;
+    let server_nonce_b64 = base64_std::encode(&server_nonce_raw);
+    let combined_nonce = format!("{}{server_nonce_b64}", client_first.client_nonce);
+
+    let server_first =
+        scram::build_server_first(&combined_nonce, &verifier.salt, verifier.iterations);
+    write_authentication_sasl_continue(stream, &server_first)?;
+
+    let client_final_body = read_sasl_response(stream)?;
+    let client_final = match scram::parse_client_final(&client_final_body) {
+        Ok(c) => c,
+        Err(_) => {
+            write_error_response(
+                stream,
+                ErrorClass::ProtocolViolation,
+                "malformed SASL message",
+            )?;
+            return Ok(AuthOutcome::Failure);
+        }
+    };
+
+    // 固定遅延の起点は client-final の検証開始時点（構文違反〔上記〕は
+    // 遅延の対象外。意味上の不一致〔以下〕はすべて同一の失敗応答・遅延へ
+    // 収束させる）。
+    let verify_start = std::time::Instant::now();
+
+    let expected_channel_binding_b64 = base64_std::encode(&client_first.gs2_header);
+    let nonce_and_binding_match = client_final.channel_binding_b64 == expected_channel_binding_b64
+        && client_final.nonce == combined_nonce;
+
+    let client_final_no_proof =
+        scram::client_final_without_proof(&client_first.gs2_header, &combined_nonce);
+    let auth_message = scram::compute_auth_message(
+        &client_first.client_first_bare,
+        &server_first,
+        &client_final_no_proof,
+    );
+    let verification = scram::verify_client_final(&verifier, &auth_message, &client_final.proof);
+
+    let success = nonce_and_binding_match && verification.ok && tenant_id.is_some();
+
+    let elapsed = verify_start.elapsed();
+    if !success && elapsed < auth::AUTH_FAILURE_DELAY {
+        std::thread::sleep(auth::AUTH_FAILURE_DELAY - elapsed);
+    }
+
+    if !success {
+        write_error_response(stream, ErrorClass::AuthInvalid, auth::AuthFailure::MESSAGE)?;
+        return Ok(AuthOutcome::Failure);
+    }
+
+    write_authentication_sasl_final(
+        stream,
+        &scram::build_server_final_success(&verification.server_signature),
+    )?;
+
+    // `success` が真の時点で `tenant_id` は必ず `Some`（上の `&&` 条件）。
+    let tenant_id = tenant_id.ok_or(HandshakeError::Protocol("unreachable: missing tenant_id"))?;
+    let ctx = auth::session_policy_context(&tenant_id)
+        .map_err(|_| HandshakeError::Protocol("policy context rejected tenant_id"))?;
+    Ok(AuthOutcome::Success(ctx))
+}
+
 fn handle_connection_inner(
     mut stream: TcpStream,
     store: &UserStore,
@@ -592,55 +851,63 @@ fn handle_connection_inner(
         Err(e) => return respond_and_close(&mut stream, e, "invalid startup packet"),
     };
 
-    write_authentication_cleartext_password(&mut stream)?;
-
-    let password = match read_password_message(&mut stream) {
-        Ok(p) => p,
-        Err(e) => return respond_and_close(&mut stream, e, "invalid password message"),
+    let outcome = match authenticate(&mut stream, store, &username) {
+        Ok(o) => o,
+        Err(e) => {
+            // Cursor Bugbot 指摘（Issue #940 PR #1006）: `authenticate` の
+            // `HandshakeError::Protocol` は `respond_and_close` の
+            // `fallback_message` をそのまま ErrorResponse の M フィールドへ
+            // 使う（`Frame` エラーは `frame_err.client_message()` を優先する
+            // ため本分岐の対象外）。cleartext フローの
+            // `read_password_message` が返す `Protocol` エラー（不正な
+            // PasswordMessage）は本 Issue 以前 `"invalid password message"`
+            // だったが、cleartext/SCRAM 共通の `authenticate()` へ統合した際に
+            // 単一の `"invalid message frame"` へ潰れ既定 cleartext 経路の
+            // ErrorResponse がビット同一でなくなっていた。認証方式ごとに
+            // fallback を分けて既定 cleartext 経路の応答を復元する
+            // （SCRAM 経路は本 Issue で新設のため従来メッセージを持たず
+            // `"invalid message frame"` のまま）。
+            let fallback = match store.auth_method() {
+                AuthMethod::Cleartext => "invalid password message",
+                AuthMethod::ScramSha256 => "invalid message frame",
+            };
+            return respond_and_close(&mut stream, e, fallback);
+        }
+    };
+    let ctx = match outcome {
+        AuthOutcome::Failure => return Ok(()),
+        AuthOutcome::Success(ctx) => ctx,
     };
 
-    // ポインタ: TASK-67・WIRE-3。
-    match auth::verify(store, &username, &password) {
-        Err(_failure) => {
-            write_error_response(
-                &mut stream,
-                ErrorClass::AuthInvalid,
-                auth::AuthFailure::MESSAGE,
-            )?;
-            Ok(())
-        }
-        Ok(ctx) => {
-            // 読み取りタイムアウトは `server::accept_loop_with_limiter` が接続全体に
-            // 一度だけ設定済み（WIRE-5）であり、ここで切り替えない。
-            write_authentication_ok(&mut stream)?;
-            // BackendKeyData の値そのものはキャンセル要求の照合以外に使わないため、
-            // 暗号学的な強さは要求しない。プロセス ID とプロセス内カウンタで十分。
-            let pid = std::process::id() as i32;
-            let secret = connection_counter();
-            write_backend_key_data(&mut stream, pid, secret)?;
-            write_parameter_status(&mut stream, "server_version", "14.0")?;
-            write_parameter_status(&mut stream, "client_encoding", "UTF8")?;
-            write_ready_for_query(&mut stream)?;
+    // 読み取りタイムアウトは `server::accept_loop_with_limiter` が接続全体に
+    // 一度だけ設定済み（WIRE-5）であり、ここで切り替えない。
+    write_authentication_ok(&mut stream)?;
+    // BackendKeyData の値そのものはキャンセル要求の照合以外に使わないため、
+    // 暗号学的な強さは要求しない。プロセス ID とプロセス内カウンタで十分。
+    let pid = std::process::id() as i32;
+    let secret = connection_counter();
+    write_backend_key_data(&mut stream, pid, secret)?;
+    write_parameter_status(&mut stream, "server_version", "14.0")?;
+    write_parameter_status(&mut stream, "client_encoding", "UTF8")?;
+    write_ready_for_query(&mut stream)?;
 
-            // 接続単位のセッション状態（取得モード・宣言的 UDF レジストリ）。
-            // `EngineCore` 自体は保持しない（`sql::mode` モジュールドキュメント参照）。
-            let mut session = engine::sql::mode::SessionState::default();
-            // 接続単位の Parse 済みステートメント保持（Issue #933・TASK-71・
-            // WIRE-11）。`session` と同じく接続終了で破棄し、接続間・テナント間で
-            // 共有しない（`extended_query` モジュールドキュメント参照）。
-            let mut prepared_statements = crate::extended_query::PreparedStatementStore::new();
+    // 接続単位のセッション状態（取得モード・宣言的 UDF レジストリ）。
+    // `EngineCore` 自体は保持しない（`sql::mode` モジュールドキュメント参照）。
+    let mut session = engine::sql::mode::SessionState::default();
+    // 接続単位の Parse 済みステートメント保持（Issue #933・TASK-71・
+    // WIRE-11）。`session` と同じく接続終了で破棄し、接続間・テナント間で
+    // 共有しない（`extended_query` モジュールドキュメント参照）。
+    let mut prepared_statements = crate::extended_query::PreparedStatementStore::new();
 
-            match post_auth_loop(
-                &mut stream,
-                &ctx,
-                engine,
-                &mut session,
-                &mut prepared_statements,
-            ) {
-                Ok(()) => Ok(()),
-                Err(e) => respond_and_close(&mut stream, e, "invalid message frame"),
-            }
-        }
+    match post_auth_loop(
+        &mut stream,
+        &ctx,
+        engine,
+        &mut session,
+        &mut prepared_statements,
+    ) {
+        Ok(()) => Ok(()),
+        Err(e) => respond_and_close(&mut stream, e, "invalid message frame"),
     }
 }
 
