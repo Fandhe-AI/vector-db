@@ -1025,6 +1025,19 @@ mod tests {
         assert_ne!(bytes_hash, text_hash);
     }
 
+    // ENUM（タグ 12）と TEXT（タグ 1）は本体バイト列が完全一致していても
+    // 型タグの違いだけで別ハッシュになる（Issue #890。golden な区別の固定）。
+    #[test]
+    fn enum_and_text_values_produce_different_hashes_even_with_matching_bytes() {
+        let enum_value = Value::Enum("happy".to_string());
+        let text_value = Value::Text("happy".to_string());
+        let enum_hash = for_typed_insert(1, Visibility::Public, &[], &[("mood", &enum_value)])
+            .expect("hash enum");
+        let text_hash = for_typed_insert(1, Visibility::Public, &[], &[("mood", &text_value)])
+            .expect("hash text");
+        assert_ne!(enum_hash, text_hash);
+    }
+
     // 同一の BYTEA 値からは同じハッシュが再現する（再送判定の前提）。
     #[test]
     fn bytea_hash_is_reproducible_for_identical_content() {

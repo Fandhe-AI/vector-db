@@ -326,11 +326,14 @@ impl ColumnType {
     /// 検証（[`validate_catalog_param`]）は呼び出し元が先に行う契約とする。
     ///
     /// `resolve_enum`: `enum` タグの型名解決コールバック。呼び出し元
-    /// （[`decode_schema`]）が現在の write/read トランザクションから
-    /// [`ENUM_TYPES_TABLE`] を引く実装を渡す。未登録の型名は
-    /// `CatalogError::Invalid` を返す契約とする（[`decode_schema`] が
-    /// `CorruptSchema` へ読み替える。ENUM 列を持たないテーブルのデコードでは
-    /// 一度も呼ばれない）。
+    /// （[`decode_schema_with_resolver`]）が現在の write/read トランザクション
+    /// から [`ENUM_TYPES_TABLE`] を引く実装（[`get_enum_type_in_read_txn`]／
+    /// [`get_enum_type_in_write_txn`]）を渡す。未登録の型名は
+    /// `CatalogError::TypeNotFound` を返す（`decode_schema_with_resolver` は
+    /// `Invalid` 以外はそのまま透過するため `CorruptSchema` へは読み替わらない
+    /// が、`table_lookup_error` で `Invalid`／`TypeNotFound` いずれも
+    /// `SqlSurfaceError::Internal` へ同じく丸まる。ENUM 列を持たないテーブルの
+    /// デコードでは一度も呼ばれない）。
     fn from_catalog_fields(
         tag: &str,
         param: &str,

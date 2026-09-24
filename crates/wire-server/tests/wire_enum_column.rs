@@ -296,3 +296,40 @@ fn nosql_insert_rejects_non_string_mood_with_42601() {
         );
     }
 }
+
+// --- NoSQL 表層: `search` op の `filter`（宣言的フィルタ API）経由の ENUM 等価 ---
+
+#[test]
+fn nosql_search_filter_on_enum_column_matches_and_rejects_out_of_vocabulary() {
+    let (core, _guard) = new_core();
+    let (both, _sql) = spawn_both(core);
+
+    let insert_body = br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2,0.3],"mood":"happy"},{"id":2,"embedding":[0.4,0.5,0.6],"mood":"sad"}],"operation_id":"op-seed-filter"}"#;
+    let resp = query(&both, insert_body);
+    assert_eq!(resp.status, 200, "seed insert must succeed: {resp:?}");
+
+    // 有効なラベルでの等価フィルタは、宣言的フィルタ API（`DeclarativeFilter::
+    // equals`）を経由して TEXT 列と同じ束縛経路へ流れる。ENUM 型を型分岐で
+    // 特別扱いしていないため（`filter.rs` は列型を見ずに `DeclarativeFilter::
+    // equals(column, value)` を組み立てるだけ）、この経路が ENUM 列でも動作する
+    // ことを固定する。
+    let search_body = br#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3],"limit":10,"columns":["id"],"filter":[{"column":"mood","op":"eq","value":"happy"}]}"#;
+    let resp = query(&both, search_body);
+    assert_eq!(
+        resp.status, 200,
+        "search with valid filter must succeed: {resp:?}"
+    );
+    let JsonValue::Object(obj) = json_body(&resp) else {
+        panic!("expected object body");
+    };
+    let JsonValue::Array(rows) = obj.get("rows").expect("rows field").clone() else {
+        panic!("expected rows array");
+    };
+    assert_eq!(rows.len(), 1, "only id=1 has mood='happy': {rows:?}");
+
+    // 語彙外のラベルでの等価フィルタは `22P02` で拒否される
+    // （`DeclarativeFilter::bind` の ENUM 分岐。Issue #890 D7）。
+    let bad_filter_body = br#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3],"limit":10,"columns":["id"],"filter":[{"column":"mood","op":"eq","value":"furious"}]}"#;
+    let resp = query(&both, bad_filter_body);
+    assert_eq!(http_common::wire_code_of(&resp), "22P02", "resp: {resp:?}");
+}
