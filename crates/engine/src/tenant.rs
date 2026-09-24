@@ -4437,6 +4437,15 @@ mod tests {
     /// ままであることもあわせて確認する。
     #[test]
     fn update_rows_where_unchecked_writes_byte_identical_rows_to_legacy_reencode_algorithm() {
+        // clippy::type_complexity 対応（`(u64, Value, Vec<(usize, Value)>)` を
+        // 直接配列要素型に書くとネストが深く可読性を損なうため、この
+        // テストローカルな型エイリアスへ分解する）。
+        type UpdateScenario = (
+            u64,
+            crate::row_codec::Value,
+            Vec<(usize, crate::row_codec::Value)>,
+        );
+
         let path = unique_db_path("predicate-update-byte-identical");
         let _cleanup = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
@@ -4453,11 +4462,7 @@ mod tests {
 
         // (schema 列 index): embedding=0, path=1, tag=2。各シナリオは専用の
         // id・既存 tag 値を持つ行に対して単独で適用する。
-        let scenarios: [(
-            u64,
-            crate::row_codec::Value,
-            Vec<(usize, crate::row_codec::Value)>,
-        ); 4] = [
+        let scenarios: [UpdateScenario; 4] = [
             (
                 10,
                 crate::row_codec::Value::Text("orig-10".to_string()),
