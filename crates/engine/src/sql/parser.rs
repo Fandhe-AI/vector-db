@@ -412,7 +412,8 @@ fn bind_datetime_literal(
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Numeric { .. }
-        | ColumnType::Enum(_) => {
+        | ColumnType::Enum(_)
+        | ColumnType::Uuid => {
             // 呼び出し元（3 経路の `match (column.ty, literal)`）は Date/Timestamp
             // の腕でのみこの関数を呼ぶ契約のため到達しない（fail-closed の保険腕）。
             Err(SqlSurfaceError::invalid_input(format!(
@@ -603,7 +604,8 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::Json
             | ColumnType::Jsonb
             | ColumnType::Enum(_)
-            | ColumnType::Numeric { .. } => None,
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid => None,
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
@@ -648,7 +650,8 @@ pub(crate) fn text_column_index(
                 | ColumnType::Json
                 | ColumnType::Jsonb
                 | ColumnType::Enum(_)
-                | ColumnType::Numeric { .. } => Err(SqlSurfaceError::invalid_input(format!(
+                | ColumnType::Numeric { .. }
+                | ColumnType::Uuid => Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} is not a TEXT column"
                 ))),
             }
@@ -1470,6 +1473,12 @@ fn bind_insert_row(
                     "column {name:?} does not accept an explicit NULL literal in INSERT"
                 )))
             }
+            (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
+            (ColumnType::Uuid, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a UUID text literal"
+                )))
+            }
             (ColumnType::Numeric { precision, scale }, lit) => {
                 bind_numeric_literal(lit, name, *precision, *scale)?
             }
@@ -1552,7 +1561,8 @@ fn bind_json_literal(
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
-        | ColumnType::Numeric { .. } => {
+        | ColumnType::Numeric { .. }
+        | ColumnType::Uuid => {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "column {column_name:?} is not a JSON column"
             )));
@@ -1592,6 +1602,26 @@ fn bind_enum_literal(
         Err(_) => Err(SqlSurfaceError::invalid_text_representation(format!(
             "column {column_name:?} (enum {:?}) does not accept label {s:?}",
             def.name()
+        ))),
+    }
+}
+
+/// `UUID` 列向けの文字列リテラルを [`crate::row_codec::Value::Uuid`] へ束縛する
+/// 共通ヘルパー（TABLE-13〔検討中〕・TASK-197、Issue #887）。INSERT・UPDATE
+/// （単一行 SET・述語形）・UPSERT の各束縛箇所が同じ検証・エラー分類を共有する
+/// （[`bind_enum_literal`] と同じ設計）。厳密文法（[`crate::uuid::parse_uuid_text`]）に
+/// 反する入力は書き込みトランザクション開始前に `22P02`
+/// （[`SqlSurfaceError::invalid_text_representation`]）で拒否する（U3・U7）。
+/// エラーメッセージには列名とクライアント自身の入力値のみを含める
+/// （security.md P0「情報漏えい」対応）。
+fn bind_uuid_literal(
+    s: &str,
+    column_name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    match crate::uuid::parse_uuid_text(s) {
+        Ok(u) => Ok(crate::row_codec::Value::Uuid(u)),
+        Err(_) => Err(SqlSurfaceError::invalid_text_representation(format!(
+            "column {column_name:?} does not accept {s:?} as a UUID literal"
         ))),
     }
 }
@@ -1789,6 +1819,12 @@ fn bind_set_assignments(
             (_, InsertLiteral::Null) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} is not nullable"
+                )))
+            }
+            (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
+            (ColumnType::Uuid, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a UUID text literal"
                 )))
             }
             (ColumnType::Numeric { precision, scale }, lit) => {
@@ -2378,6 +2414,12 @@ fn bind_upsert_assignments(
                             "column {name:?} does not accept an explicit NULL literal in ON CONFLICT DO UPDATE SET"
                         )))
                     }
+                    (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
+                    (ColumnType::Uuid, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a UUID text literal"
+                        )))
+                    }
                     (ColumnType::Numeric { precision, scale }, lit) => {
                         bind_numeric_literal(lit, name, *precision, *scale)?
                     }
@@ -2527,6 +2569,13 @@ fn bind_file_insert(
                     "column {name:?}: NUMERIC column is not supported for file-form INSERT"
                 )))
             }
+            // UUID 列も同じ理由で対象外（TABLE-13〔検討中〕・TASK-197、
+            // Issue #887・U9）。
+            (ColumnType::Uuid, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: UUID column is not supported for file-form INSERT"
+                )))
+            }
         };
         if col_idx == path_column_index {
             if let crate::row_codec::Value::Text(ref s) = value {
@@ -2643,6 +2692,11 @@ pub(crate) enum AggregateInput {
     /// [`resolve_aggregate_input`] が型不整合として拒否する（別 Issue #892 の
     /// 担当）。
     NumericColumn(usize),
+    /// `UUID` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-13〔検討中〕・TASK-197、Issue #887）。`SUM`/
+    /// `AVG`/`MIN`/`MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
+    /// [`resolve_aggregate_input`] が型不整合として拒否する。
+    UuidColumn(usize),
     /// 上記以外の `Scalar` 型に束縛された式（列参照 `id` 単体を除く。`vec_norm(...)`
     /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`program`（束縛時に
     /// ステップ列コンパイル済み、Issue #353）を行ループで評価する。`source` は
@@ -3106,6 +3160,12 @@ fn resolve_aggregate_input(
                             "column {name:?} is NUMERIC and cannot be used with SUM/AVG/MIN/MAX"
                         )))
                     }
+                    (ColumnType::Uuid, AggregateFunc::Count) => {
+                        Ok(AggregateInput::UuidColumn(index))
+                    }
+                    (ColumnType::Uuid, _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is UUID and cannot be used with SUM/AVG/MIN/MAX"
+                    ))),
                 };
             }
             if name == "id" {

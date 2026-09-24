@@ -226,6 +226,9 @@ pub enum Cell {
     /// `NUMERIC` 列の投影結果（TABLE-13〔検討中〕・TASK-197、Issue #885）。
     /// 正規テキスト表現は [`crate::numeric::Decimal`] の `Display` を参照。
     Numeric(crate::numeric::Decimal),
+    /// `UUID` 列の投影結果（TABLE-13〔検討中〕・TASK-197、Issue #887）。
+    /// 正規テキスト表現は [`crate::uuid::Uuid`] の `Display` を参照。
+    Uuid(crate::uuid::Uuid),
 }
 
 /// 投影結果の列メタデータ。`Id` は疑似列（`ColumnType` を持たない）。
@@ -932,6 +935,9 @@ pub(crate) fn execute_statement_with_cache(
                     }
                     Some(row_codec::ScalarRef::Numeric(d)) => {
                         kept.push(Value::Numeric(d));
+                    }
+                    Some(row_codec::ScalarRef::Uuid(u)) => {
+                        kept.push(Value::Uuid(u));
                     }
                 }
             }
@@ -1914,6 +1920,7 @@ pub(crate) fn execute_statement_with_cache(
                     Value::Bytes(b) => Some(row_codec::ScalarRef::Bytes(b.as_slice())),
                     Value::Json(t) => Some(row_codec::ScalarRef::Json(t.as_str())),
                     Value::Numeric(d) => Some(row_codec::ScalarRef::Numeric(*d)),
+                    Value::Uuid(u) => Some(row_codec::ScalarRef::Uuid(*u)),
                     Value::Date(d) => Some(row_codec::ScalarRef::Date(*d)),
                     Value::Timestamp(t) => Some(row_codec::ScalarRef::Timestamp(*t)),
                     // 配列列は宣言的フィルタ（TEXT 前提）の対象外。`Vector` と
@@ -2290,6 +2297,7 @@ fn decode_deferred_scalars(
                 out.push(Value::Json(owned));
             }
             Some(row_codec::ScalarRef::Numeric(d)) => out.push(Value::Numeric(d)),
+            Some(row_codec::ScalarRef::Uuid(u)) => out.push(Value::Uuid(u)),
         }
     }
     Ok(out)
@@ -2522,7 +2530,8 @@ fn project_rows(
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
-                            | Some(Value::Numeric(_)) => {
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2544,7 +2553,8 @@ fn project_rows(
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
                             | Some(Value::Text(_))
-                            | Some(Value::Numeric(_)) => {
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2561,7 +2571,8 @@ fn project_rows(
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
-                            | Some(Value::Numeric(_)) => {
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2578,7 +2589,8 @@ fn project_rows(
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
-                            | Some(Value::Numeric(_)) => {
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2595,7 +2607,8 @@ fn project_rows(
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
-                            | Some(Value::Numeric(_)) => {
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2614,7 +2627,8 @@ fn project_rows(
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
-                            | Some(Value::Numeric(_)) => {
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2641,7 +2655,8 @@ fn project_rows(
                             | Some(Value::Array(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_))
-                            | Some(Value::Numeric(_)) => {
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2658,7 +2673,8 @@ fn project_rows(
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Enum(_))
-                            | Some(Value::Numeric(_)) => {
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2675,7 +2691,26 @@ fn project_rows(
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
-                            | Some(Value::Enum(_)) => {
+                            | Some(Value::Enum(_))
+                            | Some(Value::Uuid(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Uuid => match decoded.get(*index) {
+                            Some(Value::Uuid(u)) => cells.push(Cell::Uuid(*u)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
+                            | Some(Value::Array(_))
+                            | Some(Value::Bytes(_))
+                            | Some(Value::Json(_))
+                            | Some(Value::Enum(_))
+                            | Some(Value::Numeric(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })

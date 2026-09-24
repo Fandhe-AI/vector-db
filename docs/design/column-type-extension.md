@@ -614,3 +614,73 @@ scale }` を追加した。`DECIMAL` は別名として扱うだけで、カタ�
   拡大（#901）、SQL `CREATE TABLE` 構文での `NUMERIC`/`DECIMAL` 列宣言
   （SQL-23 は未実装）、ファイル形 `INSERT`（`path`/`body` 列規約専用のため
   NUMERIC 列は明示的に拒否）。
+
+## #887 追記: UUID 列型
+
+TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bit 識別子
+列）を追加した。外部クレートは使わず自作実装（オーナー判断・dependency-policy）。
+
+- **内部表現**（`crates/engine/src/uuid.rs::Uuid`）: `[u8; 16]` を RFC 4122
+  ネットワークバイトオーダー（正規テキストの先頭 16 進 2 桁が先頭バイト）で
+  保持する。version／variant ビットは検証しない（nil
+  `00000000-0000-0000-0000-000000000000`・全 1
+  `ffffffff-ffff-ffff-ffff-ffffffffffff` も有効値として受理する）。
+- **順序規約**: derive した `Ord` はバイト列の辞書順（`memcmp` 相当）になり、
+  これは符号なし 128bit big-endian の大小・正規テキストの辞書順のどちらとも
+  一致することを単体テストで機械的に固定した（`uuid.rs::tests::
+  byte_order_matches_canonical_text_order`）。WHERE 比較・二次索引・
+  ORDER BY がこの順序を共有する唯一の定義とするが、本 Issue ではいずれへも
+  未結線（#891・#893 へ申し送り）。
+- **カタログ**: 型タグ `"uuid"`・`param` は常に `"-"`（他のパラメータなし
+  スカラー型と同じ）。
+- **行バイト表現**: presence タグに続く 16 バイト生値固定
+  （`SCALAR_UUID_ENTRY_LEN = 17`）。16 バイトのどの値も有効なため decode 側の
+  値域検証は不要（長さ不足のみ fail-closed に拒否）。
+- **入力文法**（U3）: ちょうど 36 バイトの `8-4-4-4-12` 形（ハイフンは位置
+  8・13・18・23）のみを受理する。16 進数字は大文字・小文字混在可。波括弧
+  （`{...}`）・`urn:uuid:` 接頭辞・ハイフンなし 32 桁・ハイフン位置違い・
+  前後の空白・非 ASCII はすべて拒否する。長さは解析前に検査する（DoS
+  防止）。
+- **出力表現**（U4）: 小文字 16 進の `8-4-4-4-12` 正規テキストへ整形する。
+  wire の DataRow テキスト・HTTP JSON 文字列（`Cell::Uuid` を JSON string
+  として出力）はこの 1 つの正規テキストを共有する。
+- **リテラル束縛**（`sql::parser::bind_uuid_literal`）: INSERT・UPDATE（単一
+  行 SET）・UPSERT リテラル・UPSERT `ON CONFLICT` リテラルの 4 束縛箇所が
+  共有する。文字列リテラルのみ受理し、数値・真偽値リテラルは `22000`
+  （型不一致）。文字列だが厳密文法に反する形式は `22P02`
+  （`SqlSurfaceError::invalid_text_representation`。ENUM 列の語彙外ラベル
+  〔Issue #890〕と同じ発生経路・同じ分類を共有する）で、書き込みトランザクション
+  開始前に拒否する。ファイル形 `INSERT` は `path`/`body` 列規約専用のため
+  UUID 列を明示的に拒否する。
+- **content_hash**（タグ 15）: `push_value` の既存タグ（Null=0／Text=1／
+  Vector=2／3〜6 は INTEGER/BIGINT/REAL/DOUBLE 予約／Bool=7／Date=8／
+  Timestamp=9／Array=10／Bytes=11／Json=12／Enum=13／Numeric=14）に続く
+  未使用タグ `Uuid = 15` を確保した。入力は 16 バイト生値をそのまま連結する
+  （束縛後の正規値でハッシュするため、大文字・小文字だけが違う同一 UUID の
+  再送は同一内容〔`23505`〕に収束する）。
+- **集計**: `COUNT(<UUID 列>)`（非 NULL 行数）のみ受理し、`SUM`/`AVG`/`MIN`/
+  `MAX` は `22000` で拒否する（`AggregateInput::UuidColumn`）。`GROUP BY`
+  キー列は既存のとおり TEXT 限定のため UUID 列は構造的に拒否される
+  （変更不要）。
+- **WHERE・式・二次索引**: `declarative_filter::MetadataFilter::bind`・
+  `scoring_boost`・式中の列参照（`sql::udf_call`）・`sql::scalar_index`
+  （索引対象外）・`sql::using_plan`（本文列規約）はいずれも明示的な拒否腕を
+  追加した（網羅性はコンパイラが強制。ワイルドカード腕は使わない）。
+  `sql::scan`（DecodeTier 分類・投影）は UUID 列を他のスカラー型と同じ
+  `DimAndScalar` tier で扱う。
+- **wire-server**: `result_encoder.rs::cell_to_text`・`http/query/response.rs`
+  の JSON 出力に `Cell::Uuid` を追加。`column_wire_type` は他の非 VECTOR
+  スカラー列と同じ `WireType::Text`（OID 25）のまま据え置き、OID 専用公告は
+  #895 の担当のまま（U10）。`column_binary_support` は `false`（バイナリ
+  指定は `0A000`）。NoSQL `update` op の JSON `SET` 束縛（`http/query/
+  update.rs`）は UUID 列の JSON 文字列を `InsertLiteral::String` として
+  engine の同じ束縛関数（`bind_uuid_literal`）へ渡す（BYTEA・DATE と同型の
+  判断で束縛経路を engine 側の 1 本に保つ。`null`（nullable 列）は
+  `InsertLiteral::Null`）。`insert` op は既存のワイルドカードによる拒否の
+  まま（#896 へ申し送り。insert/update の非対称は BOOLEAN／DATE と同じ
+  既知の制約）。
+- 対象外（申し送り）: WHERE 述語・式評価での UUID 列参照の受理（#891）、
+  `SUM`/`AVG`/`MIN`/`MAX`（#892）、スカラー二次索引化（#893）、`DecodeTier`
+  の精査（#894）、UUID 列のバイナリ形式・OID 2950 対応（#895）、NoSQL
+  `insert` op での JSON 束縛（#896）、SQL `CREATE TABLE` 構文での `UUID`
+  列宣言（SQL-23 は未実装）。

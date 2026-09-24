@@ -3700,6 +3700,9 @@ impl EngineCore {
                     // NUMERIC 値は presence を除く `unscaled`（i128 LE）分の
                     // 16 バイト固定（TABLE-13〔検討中〕・TASK-197、Issue #885）。
                     crate::row_codec::Value::Numeric(_) => 16,
+                    // UUID 値は presence を除く 16 バイト固定生値
+                    // （TABLE-13〔検討中〕・TASK-197、Issue #887）。
+                    crate::row_codec::Value::Uuid(_) => 16,
                 };
                 row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
                     crate::sql::allowlist::SqlSurfaceError::payload_too_large(

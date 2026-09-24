@@ -188,6 +188,14 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             let _ = write!(out, "{d}");
             Ok(())
         }
+        Cell::Uuid(u) => {
+            // 正規テキスト表現（小文字 `8-4-4-4-12`）を JSON string として書く
+            // （U4。TABLE-13〔検討中〕・TASK-197、Issue #887）。
+            out.push('"');
+            escape_json_string_into(out, &u.to_string());
+            out.push('"');
+            Ok(())
+        }
     }
 }
 
@@ -571,6 +579,31 @@ mod tests {
             body,
             "{\"columns\":[{\"name\":\"price\",\"type\":\"numeric\"}],\
 \"rows\":[[1.50],[-1.50],[null]],\"row_count\":3}"
+        );
+    }
+
+    /// UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の JSON 出力は
+    /// 正規テキスト表現（小文字 `8-4-4-4-12`）を JSON string として書く（U4）。
+    #[test]
+    fn uuid_cell_encodes_as_json_string() {
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "ext_id".to_string(),
+                ty: ColumnType::Uuid,
+            }],
+            rows: vec![
+                row(vec![Cell::Uuid(
+                    engine::uuid::parse_uuid_text("12345678-9abc-def0-1234-56789abcdef0")
+                        .expect("valid uuid literal"),
+                )]),
+                row(vec![Cell::Null]),
+            ],
+        };
+        let body = encode(&result).expect("encode");
+        assert_eq!(
+            body,
+            "{\"columns\":[{\"name\":\"ext_id\",\"type\":\"text\"}],\
+\"rows\":[[\"12345678-9abc-def0-1234-56789abcdef0\"],[null]],\"row_count\":2}"
         );
     }
 
