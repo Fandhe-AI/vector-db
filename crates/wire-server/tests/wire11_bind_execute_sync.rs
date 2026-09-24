@@ -595,6 +595,62 @@ fn portal_lifecycle_anonymous_named_and_close() {
     assert_eq!(kind, b'3');
 }
 
+/// PR #1013 レビュー指摘（Cursor Bugbot Medium）の回帰防止: PostgreSQL は
+/// simple Query（'Q'）の処理を無名 statement／無名 portal への暗黙の
+/// Parse／Bind／Execute と同一視し、その処理時に無名 statement・無名 portal を
+/// 破棄する。拡張クエリプロトコルで確立した無名 portal を Sync せずに残した
+/// まま simple Query を発行すると、後続の `Execute("")` は simple Query 実行
+/// 前の古い portal スナップショットを誤って再開・再実行してはならず、
+/// `34000`（`no such portal`。`ProtocolViolation`＝`08P01`）で拒否される
+/// べきである。
+#[test]
+fn simple_query_discards_unnamed_statement_and_portal() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 3);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    let sql = "SELECT id FROM documents LIMIT 1";
+
+    // 無名 statement／無名 portal を Sync せずに確立する（PostgreSQL は
+    // Sync 前でも無名 portal を保持し続ける仕様のため、この時点ではまだ
+    // 生きている）。
+    parse_and_bind(&mut stream, "", "", sql);
+
+    // simple Query を発行する。これが無名 statement／portal を破棄する
+    // （本テストの検証対象）。
+    send_simple_query(&mut stream, sql);
+    let (kind, _) = read_message(&mut stream); // RowDescription
+    assert_eq!(kind, b'T');
+    let (kind, _) = read_message(&mut stream); // DataRow
+    assert_eq!(kind, b'D');
+    let (kind, _) = read_message(&mut stream); // CommandComplete
+    assert_eq!(kind, b'C');
+    assert_ready_for_query(&mut stream);
+
+    // simple Query 実行前に確立した無名 portal への Execute は、もはや
+    // 存在しない portal への参照として拒否される（simple Query 実行前の
+    // 古いスナップショットが誤って再開・再実行されてはならない）。
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("", 0));
+    assert_error_then_recovers(&mut stream, "08P01");
+
+    // 無名 statement への再 Bind も同様に拒否される（統一的に破棄されている
+    // ことの確認）。
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("", ""));
+    assert_error_then_recovers(&mut stream, "08P01");
+
+    // 接続は生きたままであり、新しい Parse/Bind/Execute は問題なく通る。
+    parse_and_bind(&mut stream, "", "", sql);
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("", 0));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'D');
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'C');
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
+}
+
 /// 受け入れ条件 7: Flush は '1' を受け取れ 'Z' は来ない。body が空でない
 /// Sync/Flush は `08P01` で切断される。
 #[test]

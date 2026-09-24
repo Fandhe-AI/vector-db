@@ -374,10 +374,19 @@ struct ExecuteMessage {
 }
 
 /// Execute（'E'）の body（portal 名 cstr・max_rows i32）を復号する。
+///
+/// `max_rows` は untrusted なワイヤ入力であり、PostgreSQL プロトコルでは
+/// `0` のみが「無制限取得」を意味する（PR #1013 レビュー指摘・P0）。負値は
+/// `take = (max_rows as usize).min(total)` へそのまま渡すと `as usize` の
+/// キャストで巨大値化し「全行送出」と等価になってしまう`0` 専用の意味を
+/// 負値が僭称しないよう、ここで fail-closed に拒否して `08P01` へ写像する。
 fn parse_execute_body(body: &[u8]) -> Result<ExecuteMessage, BodyError> {
     let mut pos = 0usize;
     let portal_name = read_cstring(body, &mut pos)?;
     let max_rows = read_i32(body, &mut pos)?;
+    if max_rows < 0 {
+        return Err(BodyError::NegativeCount);
+    }
     if pos != body.len() {
         return Err(BodyError::TrailingOrTruncatedBytes);
     }
@@ -666,6 +675,21 @@ impl ExtendedQueryState {
             portals: PortalStore::new(),
             ignore_till_sync: false,
         }
+    }
+
+    /// 簡易クエリ（`'Q'`）処理の直前に呼ぶ。PostgreSQL は simple Query の
+    /// 実行を無名 statement／無名 portal への暗黙の Parse／Bind／Execute と
+    /// 同一視し、その処理時に無名 statement・無名 portal を破棄する（Cursor
+    /// Bugbot Medium 指摘・PR #1013）。これを怠ると、拡張クエリプロトコルで
+    /// 確立した無名 portal を挟んで simple Query を発行した直後に
+    /// `Execute("")` を送るクライアントが、本来 `34000`
+    /// （`HandlerError::UnknownPortal`）になるべき再実行を、simple Query
+    /// 実行前の古い portal スナップショットに対して再開・再実行してしまう
+    /// （commit 済み書き込みの二重実行や既に消費済みの中断行の誤配信に
+    /// つながる）。名前付き statement／portal は PostgreSQL 同様に維持する。
+    pub(crate) fn discard_unnamed_for_simple_query(&mut self) {
+        self.statements.remove("");
+        self.portals.remove_anonymous();
     }
 }
 
@@ -1912,6 +1936,29 @@ mod tests {
         let msg = parse_execute_body(&body).expect("valid Execute body");
         assert_eq!(msg.portal_name, "portal1");
         assert_eq!(msg.max_rows, 5);
+    }
+
+    #[test]
+    fn parse_execute_body_accepts_zero_max_rows_as_unbounded() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"portal1\0");
+        body.extend_from_slice(&0i32.to_be_bytes());
+        let msg = parse_execute_body(&body).expect("max_rows=0 means unbounded fetch");
+        assert_eq!(msg.max_rows, 0);
+    }
+
+    #[test]
+    fn parse_execute_body_rejects_negative_max_rows() {
+        // untrusted wire 入力の負値 `max_rows` を `as usize` へキャストすると
+        // 巨大値化し「無制限取得（0 専用の意味）」を僭称してしまうため、
+        // fail-closed に拒否することを固定する（PR #1013 レビュー指摘・P0）。
+        let mut body = Vec::new();
+        body.extend_from_slice(b"portal1\0");
+        body.extend_from_slice(&(-1i32).to_be_bytes());
+        assert!(matches!(
+            parse_execute_body(&body),
+            Err(BodyError::NegativeCount)
+        ));
     }
 
     #[test]

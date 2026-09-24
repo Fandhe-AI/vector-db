@@ -544,6 +544,15 @@ fn post_auth_loop(
                 let text = std::str::from_utf8(text)
                     .map_err(|_| HandshakeError::Protocol("query text is not valid UTF-8"))?;
 
+                // PostgreSQL は simple Query の処理を無名 statement／無名 portal
+                // への暗黙の Parse／Bind／Execute と同一視し、その処理時に両方を
+                // 破棄する。拡張クエリプロトコルで確立した無名 portal を残した
+                // まま simple Query を発行すると、後続の `Execute("")` が
+                // simple Query 実行前の古い portal を誤って再開してしまう
+                // （Cursor Bugbot Medium 指摘・PR #1013）。名前付き
+                // statement／portal は維持する（PostgreSQL と同じ挙動）。
+                extended.discard_unnamed_for_simple_query();
+
                 match engine {
                     Some(engine) => {
                         crate::simple_query::execute_and_respond(
