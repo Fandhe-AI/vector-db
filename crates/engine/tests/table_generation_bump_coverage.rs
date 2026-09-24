@@ -87,12 +87,14 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `enum`／`array` を追加）でさらに 5 行増え、再度追随（旧: 1506／1585）。
     // Issue #889（JSON／JSONB 列型）マージ取り込みで `catalog.rs` にさらに行が
     // 追加され、再度追随（旧: 1511／1590）。
-    ("catalog.rs", 1540),
+    // Issue #885（NUMERIC / DECIMAL 列型）マージ取り込みで `catalog.rs` に
+    // さらに行が追加され、再度追随（旧: 1540／1619）。
+    ("catalog.rs", 1608),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない。
-    ("catalog.rs", 1619),
+    ("catalog.rs", 1687),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

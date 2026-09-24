@@ -360,6 +360,16 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
             ty: engine::catalog::ColumnType::Json | engine::catalog::ColumnType::Jsonb,
             ..
         } => false,
+        // `NUMERIC` 列（TABLE-13〔検討中〕・TASK-197、Issue #885）も本 Issue
+        // （#936・WIRE-14）の策定時点では未存在の型のため、バイナリ表現は
+        // spec 側で未決定。値の実体が `Cell::Numeric`（`Decimal` の正規テキスト）
+        // であり `Text` の単純な UTF-8 生バイト表現とは異なるため、他の後発型と
+        // 同様に fail-closed で非対応とする（RowDescription への専用 OID
+        // 〔OID 1700〕公告は Issue #895 の担当）。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Numeric { .. },
+            ..
+        } => false,
         // 実行時型（Float/Bool/Vector）が静的に決まらないため fail-closed
         // で非対応とする（#895 で型情報が付いたら見直す）。
         ColumnMeta::Computed { .. } => false,
@@ -638,7 +648,8 @@ where
                     | Cell::Bool(_)
                     | Cell::Array(_)
                     | Cell::Bytes(_)
-                    | Cell::Json(_) => {
+                    | Cell::Json(_)
+                    | Cell::Numeric(_) => {
                         return Err(EncodeError);
                     }
                 },

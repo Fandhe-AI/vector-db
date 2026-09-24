@@ -280,9 +280,11 @@ impl<'a> ScalarRef<'a> {
     pub fn as_dictionary_text(&self) -> Option<&'a str> {
         match self {
             ScalarRef::Text(s) | ScalarRef::Enum(s) => Some(s),
-            ScalarRef::Bool(_) | ScalarRef::Array(_) | ScalarRef::Bytes(_) | ScalarRef::Json(_) => {
-                None
-            }
+            ScalarRef::Bool(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Numeric(_) => None,
         }
     }
 }
@@ -754,7 +756,8 @@ pub fn encode_row(
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
-                    | ColumnType::Jsonb => {
+                    | ColumnType::Jsonb
+                    | ColumnType::Numeric { .. } => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Enum value, got Enum",
                             column.name
@@ -1260,8 +1263,8 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         RowCodecError::Invalid("numeric value field is not 16 bytes".to_string())
                     })?;
                     let unscaled = i128::from_le_bytes(unscaled_arr);
-                    let decimal = Decimal::from_parts(unscaled, scale);
-                    if !decimal.fits_precision(precision) {
+                    let decimal = Decimal::from_parts(unscaled, *scale);
+                    if !decimal.fits_precision(*precision) {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} numeric value out of range for precision {precision}",
                             column.name
@@ -1400,7 +1403,8 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
-                    | ColumnType::Jsonb => {
+                    | ColumnType::Jsonb
+                    | ColumnType::Numeric { .. } => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Enum value, got Enum",
                             column.name
@@ -1571,7 +1575,8 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
         | ColumnType::Boolean
         | ColumnType::Array(_)
         | ColumnType::Bytea
-        | ColumnType::Enum(_) => {
+        | ColumnType::Enum(_)
+        | ColumnType::Numeric { .. } => {
             return Err(RowCodecError::Invalid(format!(
                 "column {:?} expects a non-JSON value, got JSON",
                 column.name
@@ -1738,7 +1743,8 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
-                        | ColumnType::Jsonb => {
+                        | ColumnType::Jsonb
+                        | ColumnType::Numeric { .. } => {
                             return Err(RowCodecError::Invalid(format!(
                                 "column {:?} expects a non-Enum value, got Enum",
                                 column.name
@@ -2063,8 +2069,8 @@ fn scan_scalar_columns_validated<'a>(
                         RowCodecError::Invalid("numeric value field is not 16 bytes".to_string())
                     })?;
                     let unscaled = i128::from_le_bytes(unscaled_arr);
-                    let decimal = Decimal::from_parts(unscaled, scale);
-                    if !decimal.fits_precision(precision) {
+                    let decimal = Decimal::from_parts(unscaled, *scale);
+                    if !decimal.fits_precision(*precision) {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} numeric value out of range for precision {precision}",
                             column.name

@@ -1397,7 +1397,7 @@ fn bind_insert_row(
                 )))
             }
             (ColumnType::Numeric { precision, scale }, lit) => {
-                bind_numeric_literal(lit, name, precision, scale)?
+                bind_numeric_literal(lit, name, *precision, *scale)?
             }
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
@@ -1475,7 +1475,8 @@ fn bind_json_literal(
         | ColumnType::Boolean
         | ColumnType::Array(_)
         | ColumnType::Bytea
-        | ColumnType::Enum(_) => {
+        | ColumnType::Enum(_)
+        | ColumnType::Numeric { .. } => {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "column {column_name:?} is not a JSON column"
             )));
@@ -1699,7 +1700,7 @@ fn bind_set_assignments(
                 )))
             }
             (ColumnType::Numeric { precision, scale }, lit) => {
-                bind_numeric_literal(lit, name, precision, scale)?
+                bind_numeric_literal(lit, name, *precision, *scale)?
             }
         };
         bound.push((col_idx, value));
@@ -2270,7 +2271,7 @@ fn bind_upsert_assignments(
                         )))
                     }
                     (ColumnType::Numeric { precision, scale }, lit) => {
-                        bind_numeric_literal(lit, name, precision, scale)?
+                        bind_numeric_literal(lit, name, *precision, *scale)?
                     }
                 };
                 BoundUpsertValue::Literal(v)
