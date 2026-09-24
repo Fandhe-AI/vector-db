@@ -19,12 +19,15 @@ transcript hash の蓄積・Finished の verify_data 計算（#964）、
 
 自作 SHA-256 は元々 `engine::recovery::content_hash` が台帳の内容
 照合ハッシュ専用に非公開実装していた（TASK-101・RECOVER-10。
-Issue #399 でストリーミング化）。本 Issue で `crates/engine/src/sha256.rs`
-として切り出し `pub mod sha256;` で公開し、wire-server から
-`engine::crypto::sha256::{Sha256, digest}`（`DIGEST_LEN`/`BLOCK_LEN` は crypto::sha256 が公開定数を持たないため tls::hkdf 側で定義） を利用する
-（外部クレート追加なし・ハッシュ入力バイト列のレイアウト・既存
-content_hash 値は不変）。wire-server 側に SHA-256 を再実装すると
-「再利用」の要件に反しコードも重複するため、この切り出しを採る。
+Issue #399 でストリーミング化）。その後 Issue #940（SCRAM 認証）で
+`engine::crypto::sha256` として既に公開済みのため、本 Issue では
+新たな切り出しは行わず wire-server から
+`engine::crypto::sha256::{Sha256, digest}` をそのまま利用する
+（`DIGEST_LEN`/`BLOCK_LEN` 相当の定数は `crypto::sha256` が公開して
+いないため `tls::hkdf` 側で定義する）。外部クレート追加なし・
+ハッシュ入力バイト列のレイアウト・既存 content_hash 値は不変。
+wire-server 側に SHA-256 を再実装すると「再利用」の要件に反し
+コードも重複するため、既存の公開実装をそのまま参照する。
 
 ## HKDF 層（`tls/hkdf.rs`）
 
