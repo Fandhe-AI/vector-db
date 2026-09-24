@@ -85,17 +85,20 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `catalog.rs` に行が追加され、以下 2 件の行番号がさらに移動したための追随
     // （旧: 1403／1482）。PR #1015 レビュー対応（`RESERVED_TYPE_NAMES` へ
     // `enum`／`array` を追加）でさらに 5 行増え、再度追随（旧: 1506／1585）。
-    // Issue #889（JSON／JSONB 列型）マージ取り込みで `catalog.rs` にさらに行が
-    // 追加され、再度追随（旧: 1511／1590）。
-    // Issue #881（INTEGER／BIGINT 列型）マージ取り込みで `catalog.rs` に
-    // `ColumnType::Integer`／`BigInt` 関連の行が追加され、再度追随
-    // （旧: 1540／1619）。
-    ("catalog.rs", 1564),
+    // 追加され、再度追随（旧: 1511／1590）。Issue #884（DATE／TIMESTAMP 列型）の
+    // base（main）取り込みマージで `catalog.rs` 冒頭側にさらに行が追加され、
+    // 再度追随（旧: 1540／1619）。Issue #885（NUMERIC / DECIMAL 列型）マージ
+    // 取り込みで `catalog.rs` にさらに行が追加され、再度追随（旧: 1567）。
+    // Issue #887（UUID 列型）で `catalog.rs` にさらに行が追加され、再度追随
+    // （旧: 1639）。Issue #881（INTEGER／BIGINT 列型）マージ取り込みで
+    // `catalog.rs` に `ColumnType::Integer`／`BigInt` 関連の行が追加され、
+    // 再度追随（旧: 1653）。
+    ("catalog.rs", 1677),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない。
-    ("catalog.rs", 1643),
+    ("catalog.rs", 1756),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

@@ -200,11 +200,15 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Integer
                         | ColumnType::BigInt
                         | ColumnType::Boolean
+                        | ColumnType::Date
+                        | ColumnType::Timestamp
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
                         | ColumnType::Jsonb
-                        | ColumnType::Enum(_) => {
+                        | ColumnType::Enum(_)
+                        | ColumnType::Numeric { .. }
+                        | ColumnType::Uuid => {
                             has_scalar_reference = true;
                             if let Some(slot) = scalar_mask.get_mut(*index) {
                                 *slot = true;
@@ -532,6 +536,28 @@ pub fn execute_scan(
                                 },
                                 Some(None) | None => cells.push(Cell::Null),
                             },
+                            ColumnType::Date => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_date() {
+                                    Some(d) => cells.push(Cell::Date(d)),
+                                    None => {
+                                        return Err(scan_bug(
+                                            "DATE column scan yielded a non-Date scalar value",
+                                        ))
+                                    }
+                                },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Timestamp => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_timestamp() {
+                                    Some(t) => cells.push(Cell::Timestamp(t)),
+                                    None => {
+                                        return Err(scan_bug(
+                                            "TIMESTAMP column scan yielded a non-Timestamp scalar value",
+                                        ))
+                                    }
+                                },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
                             ColumnType::Array(_) => match scanned.get(*index) {
                                 Some(Some(row_codec::ScalarRef::Array(array_ref))) => {
                                     let value = try_alloc_array_for_budget(
@@ -594,6 +620,24 @@ pub fn execute_scan(
                                             "ENUM column scan yielded a non-Enum scalar value",
                                         ))
                                     }
+                                },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Numeric { .. } => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_numeric() {
+                                    Some(d) => cells.push(Cell::Numeric(d)),
+                                    None => return Err(scan_bug(
+                                        "NUMERIC column scan yielded a non-Numeric scalar value",
+                                    )),
+                                },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Uuid => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_uuid() {
+                                    Some(u) => cells.push(Cell::Uuid(u)),
+                                    None => return Err(scan_bug(
+                                        "UUID column scan yielded a non-Uuid scalar value",
+                                    )),
                                 },
                                 Some(None) | None => cells.push(Cell::Null),
                             },

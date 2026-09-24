@@ -95,11 +95,15 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Boolean
+        | ColumnType::Date
+        | ColumnType::Timestamp
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Json
         | ColumnType::Jsonb
-        | ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
+        | ColumnType::Enum(_)
+        | ColumnType::Numeric { .. }
+        | ColumnType::Uuid => Err(SqlSurfaceError::invalid_input(format!(
             "column {BODY_COLUMN_NAME:?} is not a TEXT column"
         ))),
     }

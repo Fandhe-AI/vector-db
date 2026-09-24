@@ -619,6 +619,7 @@ Date: <IMF-fixdate>
 | `08P01` | `PROTOCOL_VIOLATION` | 400 | Bad Request | 要求行・ヘッダ形状違反、未知ターゲットへのアクセス |
 | `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |
 | `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー |
+| `22008` | `DATETIME_FIELD_OVERFLOW` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（`update` の `set` 経由） |
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | ENUM 列の語彙外ラベル（`insert`／`update`／`filter`） |
 | `23502` | `MISSING_OPERATION_ID` | 400 | Bad Request | `insert` の `operation_id` 欠落 |

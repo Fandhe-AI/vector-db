@@ -41,6 +41,9 @@
 //!   ではないため）。engine は評価時に非有限を `22000` で拒否する契約だが、
 //!   本モジュールは多層防御として同じ制約を持つ
 //! - `Cell::Bool(bool)` → `true`／`false`（native JSON 真偽値）
+//! - `Cell::Date(i32)`／`Cell::Timestamp(i64)` → JSON string（ISO テキスト。
+//!   `engine::datetime::format_date`／`format_timestamp` へ委譲。TABLE-13・
+//!   TASK-197、Issue #884）
 //! - `Cell::Text(String)` → JSON string。[`crate::http::error_body::
 //!   escape_json_string_into`] を列名と共通で再利用する
 //! - `Cell::Vector(Vec<f32>)` → JSON array of number（要素は `f32::to_string()`。
@@ -108,6 +111,18 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push_str(if *b { "true" } else { "false" });
             Ok(())
         }
+        Cell::Date(days) => {
+            out.push('"');
+            escape_json_string_into(out, &engine::datetime::format_date(*days));
+            out.push('"');
+            Ok(())
+        }
+        Cell::Timestamp(micros) => {
+            out.push('"');
+            escape_json_string_into(out, &engine::datetime::format_timestamp(*micros));
+            out.push('"');
+            Ok(())
+        }
         Cell::Text(s) => {
             out.push('"');
             escape_json_string_into(out, s);
@@ -170,6 +185,21 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             // であり内部エラー（`XX000`）として fail-closed に扱う。
             let value = engine::json::parse_json(text).map_err(|_| ResponseEncodeError)?;
             engine::json::write_canonical(&value, out);
+            Ok(())
+        }
+        Cell::Numeric(d) => {
+            // 正規テキスト表現（`Decimal::Display`。先頭ゼロ・指数表記・
+            // `-0` を持たない）をそのまま JSON number として書く（D8。
+            // TABLE-13〔検討中〕・TASK-197、Issue #885）。精度は失わない。
+            let _ = write!(out, "{d}");
+            Ok(())
+        }
+        Cell::Uuid(u) => {
+            // 正規テキスト表現（小文字 `8-4-4-4-12`）を JSON string として書く
+            // （U4。TABLE-13〔検討中〕・TASK-197、Issue #887）。
+            out.push('"');
+            escape_json_string_into(out, &u.to_string());
+            out.push('"');
             Ok(())
         }
     }
@@ -584,6 +614,62 @@ mod tests {
             body,
             "{\"columns\":[{\"name\":\"id\",\"type\":\"numeric\"},\
 {\"name\":\"lang\",\"type\":\"text\"}],\"rows\":[[1,\"ja\"]],\"row_count\":1}"
+        );
+    }
+
+    /// NUMERIC 列（TABLE-13〔検討中〕・TASK-197、Issue #885）の JSON 出力は
+    /// 正規テキスト表現（`Decimal::Display`）を bare な JSON number として書く
+    /// （D8）。先頭ゼロ・指数表記・`-0` を持たないため JSON 文法として妥当。
+    #[test]
+    fn numeric_cell_encodes_as_bare_json_number() {
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "price".to_string(),
+                ty: ColumnType::Numeric {
+                    precision: 5,
+                    scale: 2,
+                },
+            }],
+            rows: vec![
+                row(vec![Cell::Numeric(
+                    engine::numeric::Decimal::from_parts(150, 2).expect("valid scale"),
+                )]),
+                row(vec![Cell::Numeric(
+                    engine::numeric::Decimal::from_parts(-150, 2).expect("valid scale"),
+                )]),
+                row(vec![Cell::Null]),
+            ],
+        };
+        let body = encode(&result).expect("encode");
+        assert_eq!(
+            body,
+            "{\"columns\":[{\"name\":\"price\",\"type\":\"numeric\"}],\
+\"rows\":[[1.50],[-1.50],[null]],\"row_count\":3}"
+        );
+    }
+
+    /// UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の JSON 出力は
+    /// 正規テキスト表現（小文字 `8-4-4-4-12`）を JSON string として書く（U4）。
+    #[test]
+    fn uuid_cell_encodes_as_json_string() {
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "ext_id".to_string(),
+                ty: ColumnType::Uuid,
+            }],
+            rows: vec![
+                row(vec![Cell::Uuid(
+                    engine::uuid::parse_uuid_text("12345678-9abc-def0-1234-56789abcdef0")
+                        .expect("valid uuid literal"),
+                )]),
+                row(vec![Cell::Null]),
+            ],
+        };
+        let body = encode(&result).expect("encode");
+        assert_eq!(
+            body,
+            "{\"columns\":[{\"name\":\"ext_id\",\"type\":\"text\"}],\
+\"rows\":[[\"12345678-9abc-def0-1234-56789abcdef0\"],[null]],\"row_count\":2}"
         );
     }
 

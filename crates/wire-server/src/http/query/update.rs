@@ -294,6 +294,21 @@ fn map_set_assignments(
                     "SET BOOLEAN column value must be a JSON boolean",
                 ))
             }
+            // DATE／TIMESTAMP 列は JSON 文字列（ISO テキスト）のみ受理する
+            // （TABLE-13・TASK-197、Issue #884。パース自体は `engine::sql::
+            // parser::bind_update` が `bind_datetime_literal` へ委譲する）。
+            (ColumnType::Date, JsonValue::String(s))
+            | (ColumnType::Timestamp, JsonValue::String(s)) => InsertLiteral::String(s.clone()),
+            (ColumnType::Date, _) => {
+                return Err(UpdateError::Set(
+                    "SET DATE column value must be a JSON string",
+                ))
+            }
+            (ColumnType::Timestamp, _) => {
+                return Err(UpdateError::Set(
+                    "SET TIMESTAMP column value must be a JSON string",
+                ))
+            }
             // 配列列（TABLE-14・Issue #888）の JSON 配列束縛は本 Issue の対象外
             // （NoSQL 表層の JSON 配列束縛は #896・NOSQL-17 の担当）。BOOLEAN と
             // 同じく明示的に拒否する。
@@ -351,6 +366,26 @@ fn map_set_assignments(
             (ColumnType::Json | ColumnType::Jsonb, _) => {
                 return Err(UpdateError::InvalidJson(
                     "SET JSON column value must be a JSON object or array",
+                ))
+            }
+            // NUMERIC 列の NoSQL JSON SET 束縛は対象外（TABLE-13〔検討中〕・
+            // TASK-197、Issue #885。別 Issue #896 の担当）。fail-closed に拒否。
+            (ColumnType::Numeric { .. }, _) => {
+                return Err(UpdateError::Set(
+                    "SET NUMERIC column is not supported via the NoSQL surface",
+                ))
+            }
+            // `UUID` 列は JSON string（正規テキストは engine 側
+            // `bind_uuid_literal` が厳密検証する）を受理する（U11。
+            // TABLE-13〔検討中〕・TASK-197、Issue #887。BYTEA・DATE と同型の
+            // 判断で束縛経路を engine 側の 1 本に保つ）。
+            (ColumnType::Uuid, JsonValue::String(s)) => InsertLiteral::String(s.clone()),
+            // JSON `null` かつ nullable 列は SQL `NULL` として扱う
+            // （JSON／JSONB の同型分岐と同じ契約）。
+            (ColumnType::Uuid, JsonValue::Null) if column.nullable => InsertLiteral::Null,
+            (ColumnType::Uuid, _) => {
+                return Err(UpdateError::Set(
+                    "SET UUID column value must be a JSON string",
                 ))
             }
         };
