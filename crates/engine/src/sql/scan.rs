@@ -159,7 +159,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                 if let Some(column) = schema.columns.get(*index) {
                     match column.ty {
                         ColumnType::Vector(_) => needs_embedding = true,
-                        ColumnType::Text => {
+                        ColumnType::Text | ColumnType::Boolean => {
                             has_scalar_reference = true;
                             if let Some(slot) = scalar_mask.get_mut(*index) {
                                 *slot = true;
@@ -333,7 +333,7 @@ pub fn execute_scan(
                 }
             }
 
-            let scanned: Vec<Option<&str>> = match tier {
+            let scanned: Vec<Option<row_codec::ScalarRef<'_>>> = match tier {
                 DecodeTier::Fast => {
                     row_codec::validate_scalar_columns(schema, metadata)?;
                     Vec::new()
@@ -438,11 +438,29 @@ pub fn execute_scan(
                                 }
                             }
                             ColumnType::Text => match scanned.get(*index) {
-                                Some(Some(t)) => cells.push(Cell::Text(try_alloc_text_for_budget(
-                                    t,
-                                    &mut byte_budget,
-                                    MAX_SCAN_RESULT_BYTES,
-                                )?)),
+                                Some(Some(v)) => match v.as_text() {
+                                    Some(t) => {
+                                        cells.push(Cell::Text(try_alloc_text_for_budget(
+                                            t,
+                                            &mut byte_budget,
+                                            MAX_SCAN_RESULT_BYTES,
+                                        )?));
+                                    }
+                                    None => {
+                                        return Err(scan_bug(
+                                            "TEXT column scan yielded a non-Text scalar value",
+                                        ))
+                                    }
+                                },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Boolean => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_bool() {
+                                    Some(b) => cells.push(Cell::Bool(b)),
+                                    None => return Err(scan_bug(
+                                        "BOOLEAN column scan yielded a non-Boolean scalar value",
+                                    )),
+                                },
                                 Some(None) | None => cells.push(Cell::Null),
                             },
                         }

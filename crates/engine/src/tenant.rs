@@ -1684,6 +1684,24 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (crate::catalog::ColumnType::Boolean, crate::row_codec::Value::Bool(_)) => {
+                // BOOLEAN 値は行コーデック上 1 バイト固定
+                // （`row_codec::SCALAR_BOOL_ENTRY_LEN`）のため、TEXT のような
+                // 長さ検証は不要（Issue #883・D-a）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_BOOL_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             _ => {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column type does not match the current table schema".to_string(),
@@ -2976,7 +2994,13 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 max_id = Some(max_id.map_or(id, |m: u64| m.max(id)));
                 let scanned = crate::row_codec::scan_scalar_columns(&schema, metadata)
                     .map_err(|e| TenantWriteError::Storage(StorageError::Codec(e.to_string())))?;
-                if scanned.get(key_idx).copied().flatten() == Some(key_value) {
+                if scanned
+                    .get(key_idx)
+                    .copied()
+                    .flatten()
+                    .and_then(|v| v.as_text())
+                    == Some(key_value)
+                {
                     to_remove.push(id);
                     if to_remove.len() > MAX_VISIBLE_ROWS {
                         return Err(TenantWriteError::Storage(StorageError::Codec(format!(
@@ -3453,7 +3477,12 @@ mod tests {
                 let scanned =
                     crate::row_codec::scan_scalar_columns(&file_schema("docs"), &r.metadata)
                         .expect("scan scalar columns");
-                scanned.get(2).copied().flatten().unwrap_or("")
+                scanned
+                    .get(2)
+                    .copied()
+                    .flatten()
+                    .and_then(|v| v.as_text())
+                    .unwrap_or("")
             })
             .collect();
         assert_eq!(rows.len(), 3);
@@ -4251,7 +4280,9 @@ mod tests {
         let match_lang_ja = |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> {
             let existing = crate::row_codec::scan_scalar_columns(&schema, c.metadata)
                 .expect("decode seeded metadata");
-            Ok(matches!(existing.first(), Some(Some(s)) if *s == "ja"))
+            Ok(
+                matches!(existing.first(), Some(Some(s)) if *s == crate::row_codec::ScalarRef::Text("ja")),
+            )
         };
         let op_id = OperationId::parse("op-pred-no-vector-column").expect("valid operation_id");
 

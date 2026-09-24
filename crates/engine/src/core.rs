@@ -3659,6 +3659,8 @@ impl EngineCore {
                     crate::row_codec::Value::Vector(v) => {
                         v.len().saturating_mul(std::mem::size_of::<f32>())
                     }
+                    // BOOLEAN 値は行コーデック上 1 バイト固定（Issue #883・D-a）。
+                    crate::row_codec::Value::Bool(_) => 1,
                 };
                 row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
                     crate::sql::allowlist::SqlSurfaceError::payload_too_large(
