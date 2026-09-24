@@ -1354,7 +1354,7 @@ fn bind_insert_row(
 ///
 /// - 形式不正（接頭辞なし・奇数桁・非 16 進）は `22000`（[`SqlSurfaceError::invalid_input`]）。
 /// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
-fn bind_bytea_literal(
+pub(crate) fn bind_bytea_literal(
     s: &str,
     column_name: &str,
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {
@@ -1376,7 +1376,7 @@ fn bind_bytea_literal(
 /// 開始前に `22P02`（[`SqlSurfaceError::invalid_text_representation`]）で拒否する。
 /// エラーメッセージには語彙の一覧を含めない（型名とクライアント自身の入力値のみ。
 /// security.md P0「情報漏えい」対応）。
-fn bind_enum_literal(
+pub(crate) fn bind_enum_literal(
     def: &crate::catalog::EnumTypeDef,
     s: &str,
     column_name: &str,

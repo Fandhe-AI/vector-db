@@ -25,7 +25,9 @@ use crate::catalog::{ColumnType, TableSchema};
 use crate::recovery::required_op_id::OperationId;
 use crate::row_codec::Value;
 use crate::sql::allowlist::{CopyFormat, SqlSurfaceError};
-use crate::sql::parser::{parse_vector_literal, BoundInsert};
+use crate::sql::parser::{
+    bind_bytea_literal, bind_enum_literal, parse_array_literal, parse_vector_literal, BoundInsert,
+};
 
 /// wire 層のホットパスで `lexer::tokenize` を増やさないための安価な覗き見
 /// （`core.rs::execute_sql_in_session` の `INSERT`／`TRUNCATE`／`DELETE`／
@@ -280,9 +282,13 @@ fn bind_copy_record(
                 }
                 Value::Null
             }
-            Some(s) => match column.ty {
-                ColumnType::Vector(dim) => Value::Vector(parse_vector_literal(s, dim)?),
+            Some(s) => match &column.ty {
+                ColumnType::Vector(dim) => Value::Vector(parse_vector_literal(s, *dim)?),
                 ColumnType::Text => Value::Text(s.clone()),
+                ColumnType::Boolean => Value::Bool(parse_copy_boolean(s, name)?),
+                ColumnType::Array(array_ty) => Value::Array(parse_array_literal(s, *array_ty)?),
+                ColumnType::Bytea => bind_bytea_literal(s, name)?,
+                ColumnType::Enum(def) => bind_enum_literal(def, s, name)?,
             },
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
@@ -311,19 +317,51 @@ fn bind_copy_record(
     })
 }
 
-/// `Σ Text.len() + Vector.len() × size_of::<f32>()`（既存の
-/// `EngineCore::validate_insert_batch_byte_and_chunk_limits` と同一の②③判定
-/// 対象量。SQL 表層の複数行 `INSERT` と同じ定義を COPY 側でも使う）。
-fn bound_insert_byte_len(bound: &BoundInsert) -> usize {
-    bound
-        .values
-        .iter()
-        .map(|v| match v {
+/// COPY テキスト／CSV 形式の `BOOLEAN` フィールドを解釈する。配列リテラルの
+/// 要素解釈（`parse_array_literal` 内、`t|f|true|false` を大小無視で受理）と
+/// 同じ語彙に揃え、`INSERT ... VALUES` のブール識別子（`sql::allowlist` の
+/// 字句判定）とは別経路のまま維持する（COPY のフィールドは常に文字列であり
+/// SQL 識別子ではないため）。
+fn parse_copy_boolean(raw: &str, column_name: &str) -> Result<bool, SqlSurfaceError> {
+    if raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("t") {
+        Ok(true)
+    } else if raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("f") {
+        Ok(false)
+    } else {
+        Err(SqlSurfaceError::invalid_input(format!(
+            "column {column_name:?} expects a boolean value (t/f/true/false)"
+        )))
+    }
+}
+
+/// `Σ` 各値のバイト長（既存の `EngineCore::validate_insert_batch_byte_and_
+/// chunk_limits`・`core.rs` の複数行 `INSERT` バッチ判定と同一の②③判定対象量
+/// 定義を COPY 側でも使う。`BOOLEAN`/`ARRAY`/`BYTEA`/`ENUM` の各定義は
+/// Issue #883・#888・#886・#890 の判断をそのまま踏襲する）。
+fn bound_insert_byte_len(bound: &BoundInsert) -> Result<usize, SqlSurfaceError> {
+    let mut total: usize = 0;
+    for v in &bound.values {
+        let value_len = match v {
             Value::Null => 0,
             Value::Text(s) => s.len(),
             Value::Vector(vec) => vec.len().saturating_mul(std::mem::size_of::<f32>()),
-        })
-        .fold(0usize, |acc, x| acc.saturating_add(x))
+            Value::Bool(_) => 1,
+            Value::Array(array_value) => {
+                let entry_len =
+                    crate::row_codec::scalar_array_entry_len(array_value.elem(), array_value)
+                        .map_err(|e| SqlSurfaceError::payload_too_large(e.to_string()))?;
+                usize::try_from(entry_len).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("COPY row array entry length overflow")
+                })?
+            }
+            Value::Bytes(b) => b.len(),
+            Value::Enum(s) => s.len(),
+        };
+        total = total
+            .checked_add(value_len)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("COPY row byte size overflow"))?;
+    }
+    Ok(total)
 }
 
 /// `COPY <table> (<cols>) FROM STDIN` の逐次取り込み状態（Issue #939・
@@ -413,7 +451,7 @@ impl CopyInSession {
             batch_limits::check_row_count(next_count, &limits).map_err(map_batch_err)?;
             batch_limits::validate_chunk_total(next_count, &limits).map_err(map_batch_err)?;
             let bound = bind_copy_record(&table, &columns, &fields, &operation_id, schema)?;
-            let row_bytes = bound_insert_byte_len(&bound);
+            let row_bytes = bound_insert_byte_len(&bound)?;
             batch_limits::check_row_body_len(bounds.len(), row_bytes, &limits)
                 .map_err(map_batch_err)?;
             bounds.push(bound);
@@ -445,7 +483,7 @@ impl CopyInSession {
                 &self.operation_id,
                 &self.schema,
             )?;
-            let row_bytes = bound_insert_byte_len(&bound);
+            let row_bytes = bound_insert_byte_len(&bound)?;
             batch_limits::check_row_body_len(self.bounds.len(), row_bytes, &self.limits)
                 .map_err(map_batch_err)?;
             self.bounds.push(bound);
