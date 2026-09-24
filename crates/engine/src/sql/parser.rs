@@ -368,6 +368,35 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
     Ok(values)
 }
 
+/// `REAL`／`DOUBLE PRECISION` 列（TABLE-13・TASK-196）のリテラル束縛を 1 箇所へ
+/// 集約するヘルパー（F7・Issue #882 計画）。`raw`（`InsertLiteral::Number` の
+/// 生テキスト。負号は `expect_literal` が既に前置済み）を
+/// [`crate::scalar_float`] の閉じた文法で解析し、`Malformed` は `22000`
+/// （既存の型不一致と同じ `InvalidInput`）、`OutOfRange`（非有限化・非ゼロ
+/// アンダーフロー）は `22003`（`NumericOutOfRange`）へ写像する。
+pub(crate) fn bind_real_literal(raw: &str) -> Result<f32, SqlSurfaceError> {
+    crate::scalar_float::parse_real(raw).map_err(|e| match e {
+        crate::scalar_float::ParseFloatError::Malformed => {
+            SqlSurfaceError::invalid_input(format!("malformed REAL literal: {raw:?}"))
+        }
+        crate::scalar_float::ParseFloatError::OutOfRange => {
+            SqlSurfaceError::numeric_out_of_range(format!("REAL literal out of range: {raw:?}"))
+        }
+    })
+}
+
+/// [`bind_real_literal`] の `DOUBLE PRECISION` 版。
+pub(crate) fn bind_double_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
+    crate::scalar_float::parse_double(raw).map_err(|e| match e {
+        crate::scalar_float::ParseFloatError::Malformed => {
+            SqlSurfaceError::invalid_input(format!("malformed DOUBLE PRECISION literal: {raw:?}"))
+        }
+        crate::scalar_float::ParseFloatError::OutOfRange => SqlSurfaceError::numeric_out_of_range(
+            format!("DOUBLE PRECISION literal out of range: {raw:?}"),
+        ),
+    })
+}
+
 /// `DATE`／`TIMESTAMP` 列（TABLE-13・TASK-197、Issue #884）向けの文字列リテラル
 /// 束縛。INSERT／UPDATE SET／UPSERT の 3 経路（[`bind_insert_row`]・
 /// [`bind_set_assignments`]・[`bind_upsert_assignments`]）が共有する単一情報源。
@@ -405,6 +434,8 @@ fn bind_datetime_literal(
             }
         },
         ColumnType::Text
+        | ColumnType::Real
+        | ColumnType::Double
         | ColumnType::Vector(_)
         | ColumnType::Boolean
         | ColumnType::Array(_)
@@ -596,6 +627,8 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .find_map(|(idx, c)| match &c.ty {
             ColumnType::Vector(dim) => Some((idx, *dim)),
             ColumnType::Text
+            | ColumnType::Real
+            | ColumnType::Double
             | ColumnType::Boolean
             | ColumnType::Date
             | ColumnType::Timestamp
@@ -642,6 +675,8 @@ pub(crate) fn text_column_index(
             match &column.ty {
                 ColumnType::Text => Ok(idx),
                 ColumnType::Vector(_)
+                | ColumnType::Real
+                | ColumnType::Double
                 | ColumnType::Boolean
                 | ColumnType::Date
                 | ColumnType::Timestamp
@@ -1414,6 +1449,24 @@ fn bind_insert_row(
                     "column {name:?} expects a boolean literal (true/false)"
                 )))
             }
+            // F7（Issue #882 計画）: REAL/DOUBLE は数値リテラルのみ受理する
+            // （文字列からの暗黙変換は行わない。#896 へ申し送り）。
+            (ColumnType::Real, InsertLiteral::Number(n)) => {
+                crate::row_codec::Value::Real(bind_real_literal(n)?)
+            }
+            (ColumnType::Real, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a REAL literal, got a non-numeric literal"
+                )))
+            }
+            (ColumnType::Double, InsertLiteral::Number(n)) => {
+                crate::row_codec::Value::Double(bind_double_literal(n)?)
+            }
+            (ColumnType::Double, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a DOUBLE PRECISION literal, got a non-numeric literal"
+                )))
+            }
             (ColumnType::Date, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Date, s)?
             }
@@ -1555,6 +1608,8 @@ fn bind_json_literal(
         }
         ColumnType::Text
         | ColumnType::Vector(_)
+        | ColumnType::Real
+        | ColumnType::Double
         | ColumnType::Boolean
         | ColumnType::Date
         | ColumnType::Timestamp
@@ -1759,6 +1814,22 @@ fn bind_set_assignments(
             (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a boolean literal (true/false)"
+                )))
+            }
+            (ColumnType::Real, InsertLiteral::Number(n)) => {
+                crate::row_codec::Value::Real(bind_real_literal(n)?)
+            }
+            (ColumnType::Real, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a REAL literal, got a non-numeric literal"
+                )))
+            }
+            (ColumnType::Double, InsertLiteral::Number(n)) => {
+                crate::row_codec::Value::Double(bind_double_literal(n)?)
+            }
+            (ColumnType::Double, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a DOUBLE PRECISION literal, got a non-numeric literal"
                 )))
             }
             (ColumnType::Date, InsertLiteral::String(s)) => {
@@ -2356,6 +2427,22 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a boolean literal (true/false)"
                         )))
                     }
+                    (ColumnType::Real, InsertLiteral::Number(n)) => {
+                        crate::row_codec::Value::Real(bind_real_literal(n)?)
+                    }
+                    (ColumnType::Real, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a REAL literal, got a non-numeric literal"
+                        )))
+                    }
+                    (ColumnType::Double, InsertLiteral::Number(n)) => {
+                        crate::row_codec::Value::Double(bind_double_literal(n)?)
+                    }
+                    (ColumnType::Double, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a DOUBLE PRECISION literal, got a non-numeric literal"
+                        )))
+                    }
                     (ColumnType::Date, InsertLiteral::String(s)) => {
                         bind_datetime_literal(name, ColumnType::Date, s)?
                     }
@@ -2522,6 +2609,14 @@ fn bind_file_insert(
             (ColumnType::Vector(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: VECTOR column must not be provided for file-form INSERT"
+                )))
+            }
+            // REAL／DOUBLE PRECISION 列も他のスカラー型（BOOLEAN 等）と同じ理由で
+            // ファイル形 INSERT の対象外とする（Issue #882 レビュー指摘。typed
+            // INSERT/UPDATE 向けの束縛処理をファイル形へ露出させない）。
+            (ColumnType::Real | ColumnType::Double, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: REAL/DOUBLE PRECISION column is not supported for file-form INSERT"
                 )))
             }
             // ファイル形 INSERT は `path`/`body` の TEXT 列規約専用（本モジュール
@@ -3112,6 +3207,13 @@ fn resolve_aggregate_input(
                     (ColumnType::Vector(_), _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
+                    // F10（Issue #882 計画）: REAL/DOUBLE の集計対応は #892 の
+                    // 担当。現時点ではすべての集計関数（COUNT を含む）で拒否する。
+                    (ColumnType::Real | ColumnType::Double, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is REAL/DOUBLE and cannot be used in an aggregate"
+                        )))
+                    }
                     (ColumnType::Boolean, AggregateFunc::Count) => {
                         Ok(AggregateInput::BooleanColumn(index))
                     }
@@ -4940,6 +5042,38 @@ mod tests {
             }
             other => panic!("expected file form, got {other:?}"),
         }
+    }
+
+    #[test]
+    // codex-review P1 指摘（PR #1007・Issue #882・`crates/engine/src/sql/
+    // parser.rs:2572` 指摘）: `bind_file_insert` は `path`／`body` の TEXT 列
+    // 専用のチャンク化・埋め込み経路であり、他の追加スカラー型
+    // （BOOLEAN・DATE・ARRAY・BYTEA・JSON・ENUM・NUMERIC）は一律 `not supported
+    // for file-form INSERT` として拒否している。REAL／DOUBLE PRECISION も同じ
+    // 理由で対象外であることを固定する（typed INSERT/UPDATE 向けの数値束縛を
+    // ファイル形 INSERT へ誤って露出させない）。
+    fn bind_insert_form_file_form_rejects_real_and_double_columns() {
+        let mut schema = file_docs_schema();
+        schema
+            .columns
+            .push(ColumnDef::new("score", ColumnType::Real, true));
+        schema
+            .columns
+            .push(ColumnDef::new("weight", ColumnType::Double, true));
+
+        let err_real = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body, score) VALUES ('a.txt', 'hello', 1.5) USING OPERATION_ID 'op-file-real'",
+            &schema,
+        )
+        .expect_err("REAL column must be rejected for file-form INSERT");
+        assert_eq!(err_real.wire_code(), "22000");
+
+        let err_double = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body, weight) VALUES ('a.txt', 'hello', 1.5) USING OPERATION_ID 'op-file-double'",
+            &schema,
+        )
+        .expect_err("DOUBLE PRECISION column must be rejected for file-form INSERT");
+        assert_eq!(err_double.wire_code(), "22000");
     }
 
     #[test]

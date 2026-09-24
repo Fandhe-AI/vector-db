@@ -109,7 +109,11 @@ impl DeclarativeFilter {
                             )));
                         }
                     }
+                    // F10（Issue #882 計画）: REAL/DOUBLE 列は VECTOR 列と同じ
+                    // 「TEXT 列でない」拒否腕へ合流させる（対応は #891 へ申し送り）。
                     ColumnType::Vector(_)
+                    | ColumnType::Real
+                    | ColumnType::Double
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
@@ -277,6 +281,11 @@ pub fn bind_all(
 /// 範囲外になり得る）。
 pub fn matches_all(filters: &[MetadataFilter], scanned: &[Option<ScalarRef<'_>>]) -> bool {
     filters.iter().all(|f| {
+        // 型不一致（`TEXT` フィルタに `Bool`／`Real`／`Double` 値、`BoolEquals` に
+        // `Text` 値等）は `bind` が列型で事前に排除している契約だが、
+        // `MetadataFilter::matches` 側で防御的に不一致（fail-closed）へ落とす
+        // （F10: TEXT 系フィルタに対する REAL/DOUBLE も同様に「値なし」と同じ
+        // 扱いになる）。
         let value = scanned.get(f.column_index).copied().flatten();
         f.matches(value)
     })
