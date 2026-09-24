@@ -391,7 +391,10 @@ fn wire1_boolean_column_is_t_f_null_text_encoded() {
 /// NUMERIC 列（TABLE-13〔検討中〕・TASK-197、Issue #885）が簡易クエリ経由で
 /// 正規テキスト表現（`Decimal::Display`。ゼロ埋め・符号付き・NULL 区別）へ
 /// 写像されることと、桁あふれが `22003` の `ErrorResponse` になることを固定
-/// する。RowDescription の OID 公告（Issue #895）は対象外。
+/// する。RowDescription の OID 1700（`numeric`）公告自体は
+/// `result_encoder::numeric_scalar_column_wire_type_is_numeric_oid_1700_not_text`
+/// で固定済みのためここでは対象外（本テストの `read_row_description` は
+/// 列名のみ取得し OID を検証しない）。
 #[test]
 fn wire1_numeric_column_is_canonical_text_encoded_and_overflow_is_22003() {
     let path = temp_db::unique_db_path("wire1-numeric");

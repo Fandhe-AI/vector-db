@@ -569,7 +569,7 @@ mod tests {
         let body = encode(&result).expect("encode");
         assert_eq!(
             body,
-            "{\"columns\":[{\"name\":\"price\",\"type\":\"text\"}],\
+            "{\"columns\":[{\"name\":\"price\",\"type\":\"numeric\"}],\
 \"rows\":[[1.50],[-1.50],[null]],\"row_count\":3}"
         );
     }

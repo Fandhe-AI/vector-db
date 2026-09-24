@@ -597,11 +597,20 @@ scale }` を追加した。`DECIMAL` は別名として扱うだけで、カタ�
   束縛（`http/query/update.rs`）は NUMERIC 列を対象外として明示的に拒否し
   （`insert.rs` の既存ワイルドカード腕による拒否と対称。#883 が残した
   insert/update の非対称を増やさない）、両表層とも fail-closed。
+- **RowDescription・HTTP 応答の型メタデータ**（PR #1020 codex-review 指摘）:
+  `result_encoder.rs::column_wire_type` が `ColumnMeta::Scalar{ty:
+  Numeric{..}}` を他の `Scalar` 列（`text` 固定）より先に判定し、`id` と同じ
+  `WireType::Numeric`（OID 1700・`"numeric"`）を公告する（`id` は別経路
+  〔`ColumnMeta::Id`〕のため OID 1700 の流用先が衝突することはない）。
+  値の実体（`Cell::Numeric` の正規テキスト）とテキスト形式での型公告は
+  この時点で一致する。バイナリ形式（format code 1）は引き続き
+  `column_binary_support` が fail-closed に非対応とし、対応拡大は #895 の
+  担当のまま。
 - 対象外（申し送り）: `22P02` の新設、WHERE 述語・式評価での NUMERIC 列
   参照の受理（#891）、`SUM`/`AVG`/`MIN`/`MAX`（#892）、スカラー二次索引化
-  （#893）、`DecodeTier` の精査（#894）、RowDescription の OID 1700 公告
-  （#895。`id` の OID と衝突するため流用しない）、NoSQL `insert`/`update`
-  op での JSON 数値の完全な束縛対応（#896）、回帰テストの集約（#897）、
-  `ALTER COLUMN TYPE` による `p` の拡大（#901）、SQL `CREATE TABLE` 構文
-  での `NUMERIC`/`DECIMAL` 列宣言（SQL-23 は未実装）、ファイル形 `INSERT`
-  （`path`/`body` 列規約専用のため NUMERIC 列は明示的に拒否）。
+  （#893）、`DecodeTier` の精査（#894）、NUMERIC 列のバイナリ形式対応
+  （#895）、NoSQL `insert`/`update` op での JSON 数値の完全な束縛対応
+  （#896）、回帰テストの集約（#897）、`ALTER COLUMN TYPE` による `p` の
+  拡大（#901）、SQL `CREATE TABLE` 構文での `NUMERIC`/`DECIMAL` 列宣言
+  （SQL-23 は未実装）、ファイル形 `INSERT`（`path`/`body` 列規約専用のため
+  NUMERIC 列は明示的に拒否）。
