@@ -503,7 +503,18 @@ fn post_auth_loop(
                         // 形状には含めない。見逃した場合は通常経路が `42601` で
                         // 拒否する fail-closed。モジュールドキュメント参照）。
                         if engine::sql::copy::is_copy_statement(text) {
-                            crate::copy::run(stream, engine, ctx, session, text)?;
+                            // Issue #939 レビュー指摘（discussion_r4096720859）:
+                            // COPY サブプロトコル中に Terminate（'X'）を受信した
+                            // 場合、`crate::copy::run` はそれを消費するだけで
+                            // なく `LoopSignal::Closed` を返す。ここで判定せず
+                            // 単に `?` で捨てて通常ループへ戻すと、クライアント
+                            // は既に切断済みのつもりで応答を待たなくなる一方
+                            // サーバー側は接続スロットを保持し続けてしまう
+                            // （`P`／`D` 分岐と同じ判定作法）。
+                            match crate::copy::run(stream, engine, ctx, session, text)? {
+                                crate::extended_query::LoopSignal::Continue => {}
+                                crate::extended_query::LoopSignal::Closed => return Ok(()),
+                            }
                         } else {
                             crate::simple_query::execute_and_respond(
                                 stream, engine, ctx, session, text,

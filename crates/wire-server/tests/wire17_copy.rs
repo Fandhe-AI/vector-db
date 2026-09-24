@@ -671,11 +671,17 @@ fn wire17_copy_csv_null_round_trips_through_copy_from_stdin() {
 /// COPY FROM STDIN の途中で Terminate（'X'）が届いた場合、CopyDone の 4 バイト
 /// 長さフィールドと対称に自身の長さフィールド（4 バイト固定・body 厳密に空）を
 /// 確実に消費すること（レビュー指摘: 消費しないと `post_auth_loop` がその
-/// 4 バイトを次のメッセージ種別バイトとして誤読しデシンクする）。本実装は
-/// Terminate 後も接続を維持したまま通常のクエリループへ戻る設計のため、
-/// Terminate 直後に送った通常クエリが正しく処理できることで消費を確認する。
+/// 4 バイトを次のメッセージ種別バイトとして誤読しデシンクする）。
+///
+/// Terminate は通常の簡易クエリループと同じく接続そのものを終了させる
+/// 契約（PostgreSQL 本家の Terminate 契約と同じ。codex-review P1 指摘・
+/// discussion_r4096720859: 以前は COPY 中の Terminate を消費するだけで
+/// 通常のクエリループへ戻ってしまい、クライアントが自発的にソケットを
+/// 閉じない限り接続スロットを保持し続けていた）ため、Terminate 後は
+/// サーバー側が能動的に接続を閉じる（追加の読み取りが EOF になる）ことを
+/// 確認する。
 #[test]
-fn wire17_copy_from_stdin_terminate_mid_copy_consumes_length_prefix() {
+fn wire17_copy_from_stdin_terminate_mid_copy_closes_connection() {
     let (core, _guard) = new_core_with_docs_table();
     let mut stream = spawn_with_alice(core);
 
@@ -687,16 +693,38 @@ fn wire17_copy_from_stdin_terminate_mid_copy_consumes_length_prefix() {
     send_copy_data(&mut stream, b"1\t[1.0,0.0]\tja\n");
     send_length_prefixed_message(&mut stream, b'X', b"");
 
-    // デシンクしていれば以降のメッセージが `08P01`／接続断・ハングのいずれかへ
-    // 化けるはずだが、正しく消費できていれば通常のクエリとして処理される。
-    send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
-    let _cols = read_row_description(&mut stream);
-    let tag = read_command_complete(&mut stream);
+    // サーバーが接続を能動的に閉じていれば、これ以上何を送っても応答は
+    // 来ず、読み取りは EOF（`Ok(0)`）になる（デシンクしていれば代わりに
+    // 何らかの応答バイト列が返り、`expect_connection_closed` が検出する）。
+    expect_connection_closed(&mut stream);
+}
+
+/// `wire17_copy_from_stdin_terminate_mid_copy_closes_connection` が確認できない
+/// 「COPY は Terminate によって中断され行が commit されない」契約を、
+/// 同一 engine を使う別接続から確認する。
+#[test]
+fn wire17_copy_from_stdin_terminate_mid_copy_commits_no_row() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(Arc::clone(&core));
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'terminate-mid-copy-2'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"1\t[1.0,0.0]\tja\n");
+    send_length_prefixed_message(&mut stream, b'X', b"");
+    drop(stream);
+
+    let mut stream2 = spawn_with_alice(core);
+    send_simple_query(&mut stream2, "SELECT id FROM docs LIMIT 10");
+    let _cols = read_row_description(&mut stream2);
+    let tag = read_command_complete(&mut stream2);
     assert_eq!(
         tag, "SELECT 0",
         "COPY was abandoned by Terminate, no row committed"
     );
-    read_ready_for_query(&mut stream);
+    read_ready_for_query(&mut stream2);
 }
 
 /// COPY FROM STDIN の途中で本文長 4 バイトを超える Flush（'H'）／Sync（'S'）が
@@ -725,6 +753,67 @@ fn wire17_copy_from_stdin_flush_sync_with_body_are_fully_consumed() {
     let tag = read_command_complete(&mut stream);
     assert_eq!(tag, "COPY 2");
     read_ready_for_query(&mut stream);
+}
+
+/// Flush（'H'）／Sync（'S'）の読み捨てバイト数が `limits::
+/// COPY_DISCARD_MAX_BYTES` へ加算され、超過時は `08P01` の ErrorResponse を
+/// 送ってから接続を終了すること（Cursor Bugbot 指摘・discussion_
+/// r4096754224: 以前は `CopyData`（'d'）のバイト量しかこの上限に数えず、
+/// Flush／Sync のボディは無制限に読み捨てていたため、クライアントが巨大な
+/// no-op フレームを送り続けることで DoS 上限を回避し接続スロットを占有し
+/// 続けられた）。1 メッセージの上限（`framing::MAX_MESSAGE_LEN`）ぶんの
+/// body を持つ Flush を、予算（16 MiB）を超えるまで繰り返し送る。
+#[test]
+fn wire17_copy_from_stdin_flush_sync_body_counts_toward_discard_budget() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'flush-discard-budget'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+
+    let body = vec![0u8; framing::MAX_MESSAGE_LEN - 4];
+    // `framing::MAX_MESSAGE_LEN - 4`（body 長）× 17 > `limits::
+    // COPY_DISCARD_MAX_BYTES`（16 MiB）。16 回まではまだ予算内。
+    for _ in 0..17 {
+        send_length_prefixed_message(&mut stream, b'H', &body);
+    }
+
+    expect_error_response_with_sqlstate(&mut stream, "08P01");
+    expect_connection_closed(&mut stream);
+}
+
+/// 行デコードエラー（`session.feed` 失敗）後の読み捨てモード中に
+/// `limits::COPY_DISCARD_MAX_BYTES` を超えた場合、旧実装は応答なしの生
+/// `io::Error` で切断していた（codex-review P1 指摘・discussion_
+/// r4096720869）。他の frame エラー経路と同じく `08P01` の ErrorResponse を
+/// 送ってから接続を終了する契約であることを確認する。
+#[test]
+fn wire17_copy_from_stdin_discard_budget_exceeded_after_row_error_gets_error_response_before_close()
+{
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'copy-discard-after-error'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    // 1 行目の embedding 次元が宣言（2）と不一致のため、直後に読み捨て
+    // モードへ入る。
+    send_copy_data(&mut stream, b"1\t[1.0,0.0,0.0]\tja\n");
+
+    // 読み捨てモード中の `CopyData` も `limits::COPY_DISCARD_MAX_BYTES`
+    // （16 MiB）の対象。
+    let body = vec![b'x'; framing::MAX_MESSAGE_LEN - 4];
+    for _ in 0..17 {
+        send_copy_data(&mut stream, &body);
+    }
+
+    expect_error_response_with_sqlstate(&mut stream, "08P01");
+    expect_connection_closed(&mut stream);
 }
 
 // ---------------------------------------------------------------------

@@ -77,6 +77,33 @@ fn respond_frame_error_and_terminate(stream: &mut TcpStream, e: FrameError) -> i
     frame_err_to_io(e)
 }
 
+/// 読み捨てたバイト数を `discarded_bytes` へ加算したうえで
+/// `limits::COPY_DISCARD_MAX_BYTES` の総量チェックを行い、超過していれば
+/// `08P01`（`ProtocolViolation`）の ErrorResponse を送ってから接続を終了する
+/// エラーを返す（Cursor Bugbot 指摘・Issue #939 レビュー対応:
+/// エラー後の read-discard ループが `CopyData`（'d'）のバイト量しかこの
+/// 上限へ数えず、Flush('H')／Sync('S') のボディは無制限に読み捨てていた
+/// ため、クライアントが巨大な no-op フレームを送り続けることで DoS 上限を
+/// 回避し接続スロットを占有し続けられた——'d'／'H'／'S' いずれの読み捨ても
+/// この単一の関数を通して同じ予算を共有させる）。旧実装は超過時に応答なし
+/// の生 `io::Error` を返していた（codex-review P1 指摘・discussion_
+/// r4096720869）ため、他の frame エラー経路（[`respond_frame_error_and_
+/// terminate`]）と同じく ErrorResponse を送ってから切断する契約へ揃える。
+fn enforce_discard_budget(stream: &mut TcpStream, discarded_bytes: usize) -> io::Result<()> {
+    if discarded_bytes > crate::limits::COPY_DISCARD_MAX_BYTES {
+        let _ = crate::handshake::write_error_response_io(
+            stream,
+            ErrorClass::ProtocolViolation,
+            "COPY discard budget exceeded",
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "COPY discard budget exceeded",
+        ));
+    }
+    Ok(())
+}
+
 /// ErrorResponse を書いてから ReadyForQuery を書く
 /// （`simple_query::respond_error_and_ready` と同じ契約。COPY サブプロトコル
 /// のエラーも接続を維持する簡易クエリの一部であり、切断はしない）。
@@ -326,12 +353,20 @@ fn discard_bytes(stream: &mut TcpStream, mut remaining: usize) -> io::Result<()>
 /// CopyDone／CopyFail を受信してからまとめて ErrorResponse＋ReadyForQuery を
 /// 送る（副作用は一切残さない——commit は CopyDone 到達かつエラー無しの場合
 /// のみ行う）。
+///
+/// 戻り値は `handshake::post_auth_loop` へそのまま返す
+/// [`crate::extended_query::LoopSignal`]（Issue #939 レビュー指摘・
+/// discussion_r4096720859: 以前は常に `Ok(())` を返しており、COPY 中に
+/// Terminate（'X'）を受信した事実が呼び出し元へ伝播せず、`post_auth_loop`
+/// が通常のクエリループへ戻ってクライアントが実際にソケットを閉じるまで
+/// 接続スロットを保持し続けていた。`Closed` はループを終了させるべき
+/// 場合——Terminate 受信・ストリーム側の早期 EOF——にのみ返す）。
 fn run_copy_from(
     stream: &mut TcpStream,
     engine: &EngineCore,
     ctx: &PolicyContext,
     mut session: CopyInSession,
-) -> io::Result<()> {
+) -> io::Result<crate::extended_query::LoopSignal> {
     let response = match encode_copy_response(b'G', session.column_count()) {
         Ok(b) => b,
         Err(()) => {
@@ -340,6 +375,7 @@ fn run_copy_from(
                 ErrorClass::InternalError,
                 "failed to encode CopyInResponse",
             )
+            .map(|()| crate::extended_query::LoopSignal::Continue)
         }
     };
     stream.write_all(&response)?;
@@ -350,7 +386,7 @@ fn run_copy_from(
     loop {
         let type_byte = match framing::read_typed_frame_header(stream) {
             Ok(Some(b)) => b,
-            Ok(None) => return Ok(()),
+            Ok(None) => return Ok(crate::extended_query::LoopSignal::Closed),
             Err(e) => return Err(respond_frame_error_and_terminate(stream, e)),
         };
         match type_byte {
@@ -363,18 +399,14 @@ fn run_copy_from(
                     }
                 } else {
                     discarded_bytes = discarded_bytes.saturating_add(body.len());
-                    if discarded_bytes > crate::limits::COPY_DISCARD_MAX_BYTES {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "COPY discard budget exceeded",
-                        ));
-                    }
+                    enforce_discard_budget(stream, discarded_bytes)?;
                 }
             }
             b'c' => {
                 framing::read_length_prefixed_body(stream, 4, 4)
                     .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                return finish_copy_from(stream, engine, ctx, session, errored);
+                return finish_copy_from(stream, engine, ctx, session, errored)
+                    .map(|()| crate::extended_query::LoopSignal::Continue);
             }
             b'f' => {
                 let len = framing::validate_typed_message_length_prefix(
@@ -393,7 +425,8 @@ fn run_copy_from(
                     stream,
                     ErrorClass::InvalidInput,
                     "COPY failed on the client side",
-                );
+                )
+                .map(|()| crate::extended_query::LoopSignal::Continue);
             }
             b'H' | b'S' => {
                 // Flush('H')／Sync('S') は簡易クエリ・COPY いずれも無視する
@@ -403,14 +436,20 @@ fn run_copy_from(
                 // 未読バイトがストリームに残り、後続の `read_typed_frame_header`
                 // がそれを次のメッセージ種別として誤読しデシンクする
                 // （Issue #939 レビュー指摘。`f`（CopyFail）分岐の `discard_bytes`
-                // と対称にする）。
+                // と対称にする）。読み捨てたバイト数は `d` の読み捨てと同じ
+                // `discarded_bytes` 予算へ加算する（Cursor Bugbot 指摘。以前は
+                // ここだけ予算に数えず、巨大な no-op フレームを送り続けることで
+                // DoS 上限を無制限に回避できた）。
                 let len = framing::validate_typed_message_length_prefix(
                     stream,
                     framing::MIN_TYPED_MESSAGE_LEN,
                     framing::MAX_MESSAGE_LEN,
                 )
                 .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                discard_bytes(stream, len.saturating_sub(4))?;
+                let body_len = len.saturating_sub(4);
+                discard_bytes(stream, body_len)?;
+                discarded_bytes = discarded_bytes.saturating_add(body_len);
+                enforce_discard_budget(stream, discarded_bytes)?;
             }
             b'X' => {
                 // Terminate は `handshake::post_auth_loop` の通常の 'X' 分岐
@@ -418,10 +457,11 @@ fn run_copy_from(
                 // フィールド（body 厳密に空・4 バイト固定）を確実に消費してから
                 // 抜ける。読み捨てないと `post_auth_loop` がこの 4 バイトを
                 // 次のメッセージ種別バイトとして誤読する（Issue #939 レビュー
-                // 指摘）。
+                // 指摘）。`Closed` を返し、接続を終了すべきことを呼び出し元へ
+                // 伝播する（上記関数ドキュメント参照）。
                 framing::read_length_prefixed_body(stream, 4, 4)
                     .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                return Ok(());
+                return Ok(crate::extended_query::LoopSignal::Closed);
             }
             _ => {
                 let _ = framing::validate_typed_message_length_prefix(
@@ -507,21 +547,30 @@ fn finish_copy_from(
 /// テーブル解決がここで失敗した場合は CopyIn／CopyOutResponse を一切送らずに
 /// 通常の ErrorResponse＋ReadyForQuery を返す（PostgreSQL 互換: CopyIn/Out
 /// サブプロトコルへ入ってしまってからの構文エラーは無い）。
+///
+/// 戻り値は `handshake::post_auth_loop` の 'Q' 分岐が Parse／Describe
+/// （'P'／'D'）と同じ作法で判定する [`crate::extended_query::LoopSignal`]。
+/// `run_copy_from` が Terminate（'X'）受信を `Closed` として返してきた場合、
+/// 呼び出し元はここで新たに応答を送らずそのまま伝播し、接続ループを
+/// 終了させる（[`run_copy_from`] のドキュメント参照）。
 pub(crate) fn run(
     stream: &mut TcpStream,
     engine: &EngineCore,
     ctx: &PolicyContext,
     session: &mut SessionState,
     sql: &str,
-) -> io::Result<()> {
+) -> io::Result<crate::extended_query::LoopSignal> {
     // commit 成功から本関数が応答を書き終えるまでの区間全体を覆う RAII ガード
     // （RECOVER-5 (3)。`simple_query::execute_and_respond` と同じ設計）。
     let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
 
     match engine.begin_copy(ctx, session, sql) {
-        Ok(CopyPlan::To(format, result)) => run_copy_to(stream, format, &result),
+        Ok(CopyPlan::To(format, result)) => run_copy_to(stream, format, &result)
+            .map(|()| crate::extended_query::LoopSignal::Continue),
         Ok(CopyPlan::From(copy_session)) => run_copy_from(stream, engine, ctx, copy_session),
-        Err(e) => respond_sql_error(stream, &e),
+        Err(e) => {
+            respond_sql_error(stream, &e).map(|()| crate::extended_query::LoopSignal::Continue)
+        }
     }
 }
 
