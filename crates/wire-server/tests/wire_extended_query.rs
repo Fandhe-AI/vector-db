@@ -1,13 +1,17 @@
-//! wire-server の結合テスト（TASK-71・対象ビヘイビア WIRE-8）。
+//! wire-server の結合テスト（TASK-71・WIRE-8。Bind/Execute/Sync/Close/Flush の
+//! 一律拒否）と、Issue #933・TASK-71・WIRE-11（Parse・Describe の受理）の結合
+//! テストをあわせて持つ。
 //!
-//! 認証成功後のセッションが拡張クエリプロトコル系メッセージ（Parse/Bind/
-//! Describe/Execute/Sync/Close/Flush）を受信した場合に、SQLSTATE `0A000` の
+//! WIRE-8: 認証成功後のセッションが拡張クエリプロトコル系メッセージ
+//! （Bind/Execute/Sync/Close/Flush）を受信した場合に、SQLSTATE `0A000` の
 //! ErrorResponse を返したうえで接続を閉じること（黙って無視しない・
 //! ReadyForQuery を返さない・エラー後に接続を維持しない）を確認する。
+//! Parse（'P'）・Describe（'D' 種別 S）は WIRE-11 で本モジュールの対象から
+//! 外れ、`crate::extended_query` が受理する経路へ切り替わった
+//! （下部の `#933`／WIRE-11 セクション参照）。
 
 mod common;
 
-use std::io::Write;
 use std::net::Shutdown;
 use std::time::Duration;
 
@@ -17,38 +21,35 @@ use common::{
     spawn_server_accepting_one, spawn_server_with_accept_loop, write_user_store_file,
 };
 
-/// ポインタ: TASK-71・WIRE-8。Parse+Bind+Describe+Execute+Sync をパイプライン
-/// 送信しても、最初の 1 通に対してのみ `0A000` が返り、以降は ReadyForQuery も
-/// 2 通目の ErrorResponse も来ず EOF になること（同期回復を実装しない MVP の
-/// 契約: エラー後は即クローズ）。
+/// `engine: None`（`handle_connection_bounded` 経由の後方互換パス）では
+/// Parse・Describe も SQL 表層に到達しようがないため、従来どおり `0A000` +
+/// 切断のまま（`crate::extended_query` へは到達しない）。engine 接続時の
+/// Parse／Describe の受理は `tests/wire11_parse_describe.rs` が担う
+/// （Issue #933・TASK-71・WIRE-11）。
 #[test]
-fn wire8_parse_bind_execute_sync_pipeline_gets_0a000_then_eof() {
+fn wire11_parse_and_describe_without_engine_are_still_rejected_and_closed() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
-    let addr = spawn_server_accepting_one(&users_path);
-    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
-    // Parse('P') + Bind('B') + Describe('D') + Execute('E') + Sync('S') を
-    // 1 回の write_all でまとめて送る（クライアントのパイプライン送信を模す）。
-    let mut pipeline = Vec::new();
-    for type_byte in *b"PBDES" {
-        let total_len = 4i32; // 空 body
-        pipeline.push(type_byte);
-        pipeline.extend_from_slice(&total_len.to_be_bytes());
+    for type_byte in *b"PD" {
+        let addr = spawn_server_accepting_one(&users_path);
+        let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+        send_length_prefixed_message(&mut stream, type_byte, b"");
+        stream.shutdown(Shutdown::Write).ok();
+
+        expect_error_response_with_sqlstate(&mut stream, "0A000");
+        expect_connection_closed(&mut stream);
     }
-    stream.write_all(&pipeline).expect("send pipeline");
-    stream.shutdown(Shutdown::Write).ok();
-
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
-    expect_connection_closed(&mut stream);
 }
 
-/// ポインタ: TASK-71・WIRE-8。拡張クエリプロトコル系の型それぞれを単独送信しても
-/// 同様に `0A000` + 切断となること。
+/// ポインタ: TASK-71・WIRE-8。拡張クエリプロトコル系の型（Bind/Execute/Sync/
+/// Close/Flush）それぞれを単独送信しても `0A000` + 切断となること（Parse・
+/// Describe は WIRE-11 セクションの別テストへ切り出し済み）。
 #[test]
 fn wire8_each_extended_message_alone_is_rejected_and_closed() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
 
-    for type_byte in *b"PBDESCH" {
+    for type_byte in *b"BESCH" {
         let addr = spawn_server_accepting_one(&users_path);
         let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
@@ -144,7 +145,7 @@ fn wire8_rejection_releases_connection_slot() {
     let addr = spawn_server_with_accept_loop(&users_path, 1, Duration::from_secs(5));
 
     let mut rejected = common::authenticate_to_ready_for_query(addr, "alice", "correct-horse");
-    send_length_prefixed_message(&mut rejected, b'P', b"");
+    send_length_prefixed_message(&mut rejected, b'B', b"");
     rejected.shutdown(Shutdown::Write).ok();
     expect_error_response_with_sqlstate(&mut rejected, "0A000");
     expect_connection_closed(&mut rejected);

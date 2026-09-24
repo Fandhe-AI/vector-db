@@ -279,6 +279,46 @@ pub fn encode_empty_query_response() -> Vec<u8> {
     msg
 }
 
+/// `ParseComplete`（'1'）。拡張クエリプロトコルの Parse（Issue #933・TASK-71・
+/// WIRE-11）が成功したことを示す固定応答。body なし・長さ固定（4）。
+pub fn encode_parse_complete() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b'1';
+    let len_bytes = 4i32.to_be_bytes();
+    msg[1..5].copy_from_slice(&len_bytes);
+    msg
+}
+
+/// `ParameterDescription`（'t'）。Describe（'D' 種別 S。Issue #933）が返す
+/// パラメータ型 OID 一覧。`$n` 束縛（WIRE-12・#935）は本 Issue の対象外のため
+/// `param_oids` は常に空スライスで呼ばれる契約だが、将来の非空呼び出しにも
+/// 対応できる汎用実装としておく。件数は `i16` に収まる必要がある。
+pub fn encode_parameter_description(param_oids: &[i32]) -> Result<Vec<u8>, EncodeError> {
+    let count = i16::try_from(param_oids.len()).map_err(|_| EncodeError)?;
+    let mut body = Vec::with_capacity(2 + param_oids.len() * 4);
+    body.extend_from_slice(&count.to_be_bytes());
+    for oid in param_oids {
+        body.extend_from_slice(&oid.to_be_bytes());
+    }
+    let total_len = frame_len(body.len())?;
+    let mut msg = Vec::with_capacity(1 + body.len() + 4);
+    msg.push(b't');
+    msg.extend_from_slice(&total_len.to_be_bytes());
+    msg.extend_from_slice(&body);
+    Ok(msg)
+}
+
+/// `NoData`（'n'）。Describe（'D' 種別 S。Issue #933）の対象文が結果列を持たない
+/// （`RETURNING` の無い DML・`SET`・`CREATE FUNCTION`・`TRUNCATE`）ことを示す
+/// 固定応答。body なし・長さ固定（4）。
+pub fn encode_no_data() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b'n';
+    let len_bytes = 4i32.to_be_bytes();
+    msg[1..5].copy_from_slice(&len_bytes);
+    msg
+}
+
 /// `ErrorResponse`（'E'）body の `S`（severity）/`C`（sqlstate）/`M`（message）の
 /// 3 フィールドを `body` へ書き込む。フィールド終端（末尾の NUL）・フレーム化
 /// （`E` タグ・長さ）は呼び出し元が行う。
