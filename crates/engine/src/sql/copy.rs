@@ -81,9 +81,18 @@ enum CsvFieldState {
     /// 引用符付きフィールドの内部。
     Quoted,
     /// 引用符付きフィールドの閉じ引用符直後。次にもう 1 個 `"` が来れば
-    /// エスケープされた引用符としてフィールドへ戻り、`,`／`\r`／`\n` なら
-    /// フィールド／レコードの区切り、それ以外はすべて不正配置。
+    /// エスケープされた引用符としてフィールドへ戻り、`,`／`\n` なら
+    /// フィールド／レコードの区切り、`\r` は [`Self::AfterQuoteCr`] へ移行して
+    /// 次バイトを待つ、それ以外はすべて不正配置。
     AfterQuote,
+    /// 閉じ引用符直後の `\r` を受けた直後（`AfterQuote` から遷移）。CRLF
+    /// レコード終端の一部としてのみ許容し、次バイトが `\n` でなければ不正配置
+    /// として拒否する（codex-review 指摘・discussion PRRT_kwDOUAKASM6ltrHX,
+    /// PRRT_kwDOUAKASM6ltyY9: 旧実装は `AfterQuote` で `\r` を無条件に捨てて
+    /// `AfterQuote` のまま処理を続けていたため、`"a"\r,b\n`（CR の後に区切り
+    /// が続く）や `"a"\r`（改行なしで終端する単独 CR）といった、CR の後に
+    /// `\n` が続かない不正な CSV も正常データとして受理してしまっていた）。
+    AfterQuoteCr,
 }
 
 #[derive(Debug)]
@@ -187,14 +196,30 @@ impl CsvRecordScanner {
                     self.push_field()?;
                     Ok(true)
                 }
-                // `\r\n` レコード終端の `\r` 側。後続 `\n` を待つだけで
-                // フィールドへは積まない（Start／Unquoted 側の `\n` 処理と
-                // 同じく、末尾の `\r` はレコード終端の一部として捨てる）。
-                b'\r' => Ok(false),
+                // `\r\n` レコード終端の `\r` 側。まだ `\n` が続くかどうかが
+                // 確定していないため `AfterQuoteCr` へ移行し、次バイトで
+                // 判定する（フィールドへは積まない）。
+                b'\r' => {
+                    self.state = CsvFieldState::AfterQuoteCr;
+                    Ok(false)
+                }
                 // 閉じ引用符の直後に区切り・レコード終端・エスケープ以外の
                 // バイトが来るのは不正配置（`"ab"junk,x` 相当）。
                 _ => Err(SqlSurfaceError::invalid_input(
                     "unexpected byte after closing double quote in COPY CSV field",
+                )),
+            },
+            CsvFieldState::AfterQuoteCr => match b {
+                // `\r\n` が揃った。レコード終端として確定する。
+                b'\n' => {
+                    self.push_field()?;
+                    Ok(true)
+                }
+                // CR の直後に LF が続かない不正配置（`"a"\r,x` 相当）。単独の
+                // `\r` を無条件に読み飛ばす旧実装の fail-open を修正する。
+                _ => Err(SqlSurfaceError::invalid_input(
+                    "lone carriage return after closing double quote in COPY CSV field \
+                     (CRLF record terminator requires a following line feed)",
                 )),
             },
         }
@@ -211,6 +236,17 @@ impl CsvRecordScanner {
         if self.state == CsvFieldState::Quoted {
             return Err(SqlSurfaceError::invalid_input(
                 "unterminated quoted CSV field in COPY record",
+            ));
+        }
+        // CopyDone に到達した時点で「閉じ引用符直後の CR」が確定しないまま
+        // 残っている（後続バイトが無いままストリームが終わった）場合も、
+        // CRLF が完成しない不正配置として拒否する（codex-review 指摘:
+        // `push_byte` 側の検査だけでは、レコードが CR で終わってそのまま
+        // CopyDone を迎える経路が検査対象から漏れていた）。
+        if self.state == CsvFieldState::AfterQuoteCr {
+            return Err(SqlSurfaceError::invalid_input(
+                "COPY stream ended with a lone carriage return after closing double quote \
+                 (CRLF record terminator requires a following line feed)",
             ));
         }
         // 「新規レコードとして何も消費していない」を判定する条件は
@@ -926,6 +962,42 @@ mod tests {
         }
         let err = err.expect("data right after closing quote must be rejected");
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // codex-review 指摘（PRRT_kwDOUAKASM6ltrHX・PRRT_kwDOUAKASM6ltyY9）:
+    // 閉じ引用符直後の CR は CRLF の一部としてのみ許容し、直後に区切り文字が
+    // 続く（LF が続かない）場合は不正配置として `22000` で拒否する回帰防止。
+    #[test]
+    fn csv_record_scanner_rejects_cr_followed_by_comma_after_closing_quote() {
+        let mut scanner = CsvRecordScanner::new();
+        let mut err = None;
+        for &b in b"\"a\"\r,b\n" {
+            if let Err(e) = scanner.push_byte(b) {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = err.expect("lone CR before comma must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // 同上: 改行なしで単独 CR のまま CopyDone（`finish`）へ到達した場合も、
+    // CRLF が完成しない不正配置として拒否する回帰防止。
+    #[test]
+    fn csv_record_scanner_rejects_lone_trailing_cr_at_finish() {
+        let mut scanner = CsvRecordScanner::new();
+        for &b in b"\"a\"\r" {
+            assert!(!scanner.push_byte(b).unwrap());
+        }
+        let err = scanner.finish().unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // 正常系: `\r\n` が揃った場合は従来どおりレコード終端として受理される。
+    #[test]
+    fn csv_record_scanner_accepts_proper_crlf_after_closing_quote() {
+        let fields = scan_csv_record(b"\"a\"\r\n").unwrap();
+        assert_eq!(fields, vec![Some("a".to_string())]);
     }
 
     #[test]
