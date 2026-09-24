@@ -320,12 +320,18 @@ wire-server が語彙検証を委譲する単一情報源）。`ColumnType` か�
 （`sql::scalar_index::ScalarIndex`）・`declarative_filter` の等価比較が
 TEXT と同じ辞書表現を共有する（二重実装にしない。受け入れ基準 3）。
 
-語彙検査は 2 段の多層防御を持つ: (1) 束縛時（`sql::parser::bind_enum_literal`。
+語彙検査は 3 段の多層防御を持つ: (1) 束縛時（`sql::parser::bind_enum_literal`。
 書き込みトランザクション開始前に `22P02`）、(2) `row_codec` の encode 時
 （`encode_row`／`encode_scalar_columns`／`merge_encode_scalar_columns`。
-Rust API から直接渡された `Value::Enum` もここで拒否する）。decode 時は
-語彙を検査しない（`ALTER TYPE ... ADD VALUE` 前に書いた行を将来にわたって
-読める契約を維持するため）。
+Rust API から直接渡された `Value::Enum` もここで拒否する）、(3) `row_codec`
+の decode 時（`decode_row`／`scan_scalar_columns_validated`。PR #1015
+レビュー指摘・codex-review P1: 破損行〔手書き・バグ由来〕が持つ語彙外
+ラベルを検査せず通すと、投影・等価フィルタ・二次索引へ任意文字列が
+流出しうるため、現行スキーマの `EnumTypeDef::labels`〔書き込み時点の
+語彙ではなく decode 時点で解決される最新の語彙〕に含まれないラベルは
+`RowCodecError::Invalid` で fail-closed に拒否する）。ラベルは削除されない
+契約（D4）のため、この検査は「書込み時点で有効だったか」を後退させる
+ものではなく、過去に正当だった値は将来にわたって decode 可能であり続ける。
 
 ### D4: ALTER TYPE は「可。ただし末尾への追記（ADD VALUE）のみ」
 

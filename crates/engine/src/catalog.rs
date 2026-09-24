@@ -2005,6 +2005,12 @@ fn list_tables_in_txn(read_txn: &redb::ReadTransaction) -> Result<Vec<String>> {
 /// 丸めると `drop_enum_type` が実際には参照されている ENUM 型を削除できて
 /// しまう。`decode_schema_body` と同じ fail-closed 方針をここでも徹底する）。
 fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<bool> {
+    if bytes.len() > MAX_CATALOG_VALUE_LEN {
+        return Err(CatalogError::CorruptSchema(format!(
+            "catalog value too large: {} bytes",
+            bytes.len()
+        )));
+    }
     let text = std::str::from_utf8(bytes)
         .map_err(|_| CatalogError::CorruptSchema("catalog value is not valid UTF-8".to_string()))?;
     let mut lines = text.split('\n');
@@ -2054,6 +2060,21 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         if tag == "enum" && param == type_name {
             found = true;
         }
+    }
+    // 宣言列数を超える残り行は、`decode_schema_body` と同じく「末尾の空行
+    // （トレーリング改行）1 行のみ」を許容しそれ以外は余剰行として拒否する。
+    // ここを緩めると、宣言列数を過小に偽装した破損値（例: `cols:1` の後に
+    // 実在の ENUM 参照列をもう 1 行追加する）が「依存なし」に丸められ、
+    // `decode_schema_body` が `CorruptSchema` で拒否する同じバイト列に対して
+    // `drop_enum_type` だけが削除を許してしまう fail-open 経路になる。
+    let mut trailing_seen = false;
+    for line in lines {
+        if trailing_seen || !line.is_empty() {
+            return Err(CatalogError::CorruptSchema(format!(
+                "catalog value line count mismatch: expected {col_count} columns, got more than {col_count} lines"
+            )));
+        }
+        trailing_seen = true;
     }
     Ok(found)
 }
@@ -2367,6 +2388,54 @@ mod tests {
             decode_schema("t", &bytes),
             Err(CatalogError::CorruptSchema(_))
         ));
+    }
+
+    /// `drop_enum_type` は破損カタログ値を「依存なし」に丸めず `CorruptSchema`
+    /// として拒否する（PR #1015 レビュー指摘・codex-review P1。Issue #890）。
+    /// `decode_rejects_invalid_utf8` と同じ破損データ（不正 UTF-8）を、実際に
+    /// 依存判定が走る `CATALOG_TABLE` エントリへ直接書き込み、それを検証する。
+    /// 破損に丸めて削除を通してしまう fail-open 経路だと、実際には参照されて
+    /// いる ENUM 型が消えてしまう（本テストは削除が起きないことも確認する）。
+    #[test]
+    fn drop_enum_type_rejects_corrupt_catalog_value_instead_of_treating_it_as_no_dependents() {
+        let path = unique_db_path("catalog-drop-enum-corrupt");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        // 依存判定（`dependent_tables_in_txn`）は `CATALOG_TABLE` の全エントリを
+        // 走査するため、実在テーブルを経由せず不正 UTF-8 の値を直接書き込む
+        // （`decode_rejects_invalid_utf8` と同じ破損データ）。
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", [0xff_u8, 0xfe, 0xfd].as_slice())
+                .expect("insert corrupt catalog value");
+        }
+        // テスト専用のセットアップ書き込みのため `commit_boundary` を経由せず
+        // 直接 `redb::WriteTransaction::commit` を呼ぶ（既存テスト
+        // `catalog.rs` 内の他のセットアップ commit と同じ流儀。
+        // `table_generation_bump_coverage.rs` の悉皆走査は
+        // `commit_boundary::commit*` 呼び出しのみを対象とするため、これを
+        // 経由すると本テスト自身がアローリスト追記を要求されてしまう）。
+        write_txn.commit().expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on corrupt catalog values, got: {err:?}"
+        );
+
+        // 型は削除されず残っていること（fail-open だとここが消えてしまう）。
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
     }
 
     #[test]

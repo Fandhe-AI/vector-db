@@ -673,3 +673,92 @@ fn row_codec_encode_row_rejects_out_of_vocabulary_enum_value_directly() {
     )
     .expect("in-vocabulary label should encode successfully");
 }
+
+// --- row_codec の多層防御: decode 時の語彙外ラベル拒否（PR #1015 レビュー指摘・
+// codex-review P1。encode 時点で有効だったラベルでも、decode 時に渡すスキーマの
+// `EnumTypeDef` に含まれなければ拒否する。テーブル定義の型解決結果が decode 時点
+// で変わりうる状況〔ここでは同一プロセス内で別インスタンスの `EnumTypeDef` を
+// 意図的に渡すことで模す〕でも、語彙外ラベルが `Value::Enum`／`ScalarRef::Enum`
+// として下流へ流出しないことを固定する） -------------------------------------
+
+/// `EnumTypeDef` はフィールド private のためテスト側で直接組み立てられない。
+/// `Storage::create_enum_type` を経由して構築する（同名・別語彙の 2 定義を
+/// 独立した一時 DB からそれぞれ得ることで、テーブル内で同一型名の重複登録を
+/// 禁止する既存契約と衝突せずに用意する）。
+fn enum_def_via_storage(label_prefix: &str, labels: Vec<String>) -> Arc<EnumTypeDef> {
+    let path = unique_db_path(&format!("enum-row-codec-defense-{label_prefix}"));
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_enum_type(ENUM_TYPE, labels)
+        .expect("create enum type")
+}
+
+#[test]
+fn row_codec_decode_row_rejects_label_absent_from_the_schemas_current_vocabulary() {
+    use engine::row_codec::{decode_row, encode_row, Value};
+    use engine::storage::Visibility;
+
+    // encode 時点の語彙は "furious" を含む（正当に encode できる）。
+    let encode_def =
+        enum_def_via_storage("encode", vec!["happy".to_string(), "furious".to_string()]);
+    let encode_schema = schema_with(encode_def);
+    let buf = encode_row(
+        &encode_schema,
+        "alice",
+        Visibility::Public,
+        &[
+            Value::Vector(vec![0.1, 0.2]),
+            Value::Text("ja".to_string()),
+            Value::Enum("furious".to_string()),
+        ],
+    )
+    .expect("encode with in-vocabulary label must succeed");
+
+    // decode 時に渡すスキーマの現行語彙には "furious" が無い。破損行・
+    // decode 時点で解決される語彙が encode 時点と食い違うケースを模す。
+    let decode_def = enum_def_via_storage("decode", default_labels());
+    let decode_schema = schema_with(decode_def);
+    let err = decode_row(&decode_schema, &buf).unwrap_err();
+    assert!(
+        format!("{err}").contains("is not a valid label"),
+        "decode must reject out-of-vocabulary enum label: {err}"
+    );
+}
+
+#[test]
+fn row_codec_scan_scalar_columns_masked_rejects_out_of_vocabulary_enum_label_even_when_unwanted() {
+    use engine::row_codec::{encode_scalar_columns, scan_scalar_columns_masked, Value};
+
+    let encode_def = enum_def_via_storage(
+        "encode-masked",
+        vec!["happy".to_string(), "furious".to_string()],
+    );
+    let encode_schema = schema_with(encode_def);
+    // `scan_scalar_columns_masked` はスカラー専用バッファ（`encode_scalar_columns`）
+    // を前提とする（`encode_row` の VECTOR 列込みフルバッファとは形が異なる。
+    // 既存テスト `scan_scalar_columns_masked_mask_length_mismatch_is_rejected`
+    // と同じ準備方法）。
+    let buf = encode_scalar_columns(
+        &encode_schema,
+        &[
+            Value::Vector(vec![0.1, 0.2]),
+            Value::Text("ja".to_string()),
+            Value::Enum("furious".to_string()),
+        ],
+    )
+    .expect("encode with in-vocabulary label must succeed");
+
+    let decode_def = enum_def_via_storage("decode-masked", default_labels());
+    let decode_schema = schema_with(decode_def);
+
+    // ENUM 列（インデックス 2）をマスクで非要求にしても、構造検証（UTF-8・
+    // 語彙照合）は要求・非要求を問わず一律に行われる（Issue #350 の必要列限定
+    // デコードが安全性検証を弱めないことの固定。Text 列の UTF-8 検証と同じ方針）。
+    let mask = vec![false, false, false];
+    let err = scan_scalar_columns_masked(&decode_schema, &buf, Some(&mask)).unwrap_err();
+    assert!(
+        format!("{err}").contains("is not a valid label"),
+        "masked-unwanted decode must still reject out-of-vocabulary enum label: {err}"
+    );
+}
