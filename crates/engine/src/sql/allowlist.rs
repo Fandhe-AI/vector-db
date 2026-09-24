@@ -253,9 +253,10 @@ pub enum SqlSurfaceError {
     /// （`DATETIME_FIELD_OVERFLOW`）へ写像する新規分類。
     DatetimeFieldOverflow { detail: String },
     /// 構文上受理された値が、宣言済み型の表現として不正（TABLE-14・TASK-198、
-    /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）が
-    /// 現時点で唯一の発生経路。ERR-2 拡張: `22P02`
-    /// （[`crate::error_format::ErrorClass::InvalidTextRepresentation`]）。
+    /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）に
+    /// 加え、UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の厳密文法違反
+    /// （`sql::parser::bind_uuid_literal`）も同じ発生経路を共有する。ERR-2 拡張:
+    /// `22P02`（[`crate::error_format::ErrorClass::InvalidTextRepresentation`]）。
     InvalidTextRepresentation { detail: String },
 }
 

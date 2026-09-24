@@ -376,6 +376,19 @@ fn map_set_assignments(
                     "SET NUMERIC column is not supported via the NoSQL surface",
                 ))
             }
+            // `UUID` 列は JSON string（正規テキストは engine 側
+            // `bind_uuid_literal` が厳密検証する）を受理する（U11。
+            // TABLE-13〔検討中〕・TASK-197、Issue #887。BYTEA・DATE と同型の
+            // 判断で束縛経路を engine 側の 1 本に保つ）。
+            (ColumnType::Uuid, JsonValue::String(s)) => InsertLiteral::String(s.clone()),
+            // JSON `null` かつ nullable 列は SQL `NULL` として扱う
+            // （JSON／JSONB の同型分岐と同じ契約）。
+            (ColumnType::Uuid, JsonValue::Null) if column.nullable => InsertLiteral::Null,
+            (ColumnType::Uuid, _) => {
+                return Err(UpdateError::Set(
+                    "SET UUID column value must be a JSON string",
+                ))
+            }
         };
         assignments.push((key.clone(), literal));
     }
