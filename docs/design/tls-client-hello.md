@@ -41,9 +41,11 @@ HelloRetryRequest（HRR）の組み立てを担う純粋関数層
    対象 5 拡張の構造解析。違反はそれぞれ `illegal_parameter`／
    `missing_extension`／`decode_error`）
 2. `legacy_version`（0x0303 固定でなければ `protocol_version`。RFC 8446
-   §4.1.2 の MUST。実際の TLS 1.0〜1.2 クライアントも legacy_version は
-   0x0303 を送るため、旧バージョンクライアントを誤って別のアラートへ
-   分類することはない）
+   §4.1.2 の MUST。TLS 1.0/1.1 の legacy_version（0x0301/0x0302）を送る
+   旧クライアントもここで `protocol_version` になるが、そうした
+   クライアントは `supported_versions` 自体も欠くため、この判定が無くても
+   次のバージョン判定で同じ `protocol_version` に到達する（分類結果は
+   変わらない））
 3. バージョン（`supported_versions` に TLS 1.3 が無ければ
    `protocol_version`。暗号スイート・署名より先に判定し、TLS 1.2 以前の
    クライアントに `handshake_failure` を返さないため）
@@ -80,10 +82,14 @@ O(n) で判定でき、未知の type を大量に並べた入力に対する O(
 へそのまま渡す。本モジュール自体は状態を持たない）。`Some` のときは
 RFC 8446 §4.1.2 に従い次を検証する:
 
-- `legacy_version`・`legacy_session_id`・`cipher_suites`・
+- `legacy_version`・`random`・`legacy_session_id`・`cipher_suites`・
   `legacy_compression_methods` が 1 回目と完全一致
-- `key_share`・`early_data`・`pre_shared_key`・`psk_key_exchange_modes`・
-  `padding` を除く拡張が、型・値ともに 1 回目と完全一致
+- `key_share`・`early_data`・`pre_shared_key`・`padding`（RFC 8446 §4.1.2
+  が列挙する例外の 4 種）を除く拡張が、型・値ともに 1 回目と完全一致。
+  `psk_key_exchange_modes` はこの例外一覧に含まれないため対象外（値の
+  更新は許可されていない）。`cookie` も「HRR が提供していた場合にのみ
+  追加してよい」対象だが、本サーバーの HRR は `cookie` を送出しないため
+  実質的に到達しない
 - `key_share` は HRR が要求したグループ（x25519）のみを含み、他のグループ
   のエントリが 1 件でもあれば `illegal_parameter`
 

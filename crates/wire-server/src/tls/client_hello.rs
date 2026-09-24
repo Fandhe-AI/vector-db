@@ -64,15 +64,20 @@ const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
 const EXT_KEY_SHARE: u16 = 51;
 
 /// HelloRetryRequest 後の 2 回目 `ClientHello` で追加・削除・変更が
-/// 許可される拡張（RFC 8446 §4.1.2）。これら以外の拡張は 1 回目の
-/// `ClientHello` と型・値ともに同一でなければならない
-/// （[`check_hrr_consistency`]）。
-const HRR_MUTABLE_EXTENSIONS: [u16; 5] = [
+/// 許可される拡張（RFC 8446 §4.1.2 が列挙する 4 種）。これら以外の拡張は
+/// 1 回目の `ClientHello` と型・値ともに同一でなければならない
+/// （[`check_hrr_consistency`]）。`cookie`（44）は「HRR が `cookie` を
+/// 提供していた場合にのみ追加してよい」対象だが、本モジュールの
+/// `build_hello_retry_request` は `cookie` を送出しないため、2 回目に
+/// `cookie` が現れることは許可された差分ではなく `IllegalParameter` の
+/// まま拒否する（fail-closed）。`psk_key_exchange_modes` は RFC の
+/// 例外一覧に含まれない（`pre_shared_key` と併存する側の拡張であり、
+/// 値の更新は許可されていない）ため対象外。
+const HRR_MUTABLE_EXTENSIONS: [u16; 4] = [
     EXT_KEY_SHARE,
     EXT_PADDING,
     EXT_EARLY_DATA,
     EXT_PRE_SHARED_KEY,
-    EXT_PSK_KEY_EXCHANGE_MODES,
 ];
 
 /// HelloRetryRequest の `random`（RFC 8446 §4.1.3）。
@@ -435,22 +440,23 @@ fn check_compression(methods: &[u8]) -> Result<(), ClientHelloError> {
 /// §4.1.2「クライアントは HelloRetryRequest への応答として、以下を除いて
 /// 変更を加えていない `ClientHello` を送らなければならない」）。
 /// [`HRR_MUTABLE_EXTENSIONS`] に列挙した拡張（`key_share`・`early_data`・
-/// `pre_shared_key`・`psk_key_exchange_modes`・`padding`）は追加・削除・
-/// 変更してよく、それ以外の拡張は型・値ともに完全一致でなければ
-/// `IllegalParameter`。`legacy_version`・`legacy_session_id`・
-/// `cipher_suites`・`legacy_compression_methods` も同一でなければならない。
+/// `pre_shared_key`・`padding`）は追加・削除・変更してよく、それ以外の
+/// 拡張は型・値ともに完全一致でなければ `IllegalParameter`。
+/// `legacy_version`・`random`・`legacy_session_id`・`cipher_suites`・
+/// `legacy_compression_methods` も同一でなければならない。
 fn check_hrr_consistency(
     first: &handshake::ClientHello,
     second: &handshake::ClientHello,
 ) -> Result<(), ClientHelloError> {
     if first.legacy_version != second.legacy_version
+        || first.random != second.random
         || first.legacy_session_id != second.legacy_session_id
         || first.cipher_suites != second.cipher_suites
         || first.legacy_compression_methods != second.legacy_compression_methods
     {
         return Err(ClientHelloError::IllegalParameter(
             "second ClientHello after HelloRetryRequest must repeat the first \
-             ClientHello's version/session id/cipher suites/compression",
+             ClientHello's version/random/session id/cipher suites/compression",
         ));
     }
     fn immutable(exts: &[handshake::Extension]) -> Vec<&handshake::Extension> {
@@ -486,10 +492,12 @@ pub fn negotiate(
     let ext = parse_extensions(&ch.extensions)?;
 
     // 1. legacy_version（RFC 8446 §4.1.2 の MUST。TLS 1.3 クライアントは
-    //    0x0303 固定で送らなければならない）。実際の TLS 1.0〜1.2
-    //    クライアントも legacy_version=0x0303 を送るため、この判定だけで
-    //    旧バージョンクライアントを protocol_version 以外へ誤分類する
-    //    ことはない（旧バージョン検出は次の supported_versions 判定が担う）。
+    //    0x0303 固定で送らなければならない）。TLS 1.0/1.1 の
+    //    legacy_version（0x0301/0x0302）を送る旧クライアントもここで
+    //    protocol_version として拒否されるが、そうしたクライアントは
+    //    supported_versions 自体も欠くため、この判定が無くても次の
+    //    supported_versions 判定で同じ protocol_version に到達する
+    //    （分類結果は変わらない）。
     if ch.legacy_version != 0x0303 {
         return Err(ClientHelloError::UnsupportedVersion);
     }
@@ -842,6 +850,37 @@ mod tests {
         let first = with_ed25519_sig_alg(rfc8448_client_hello());
         let mut ch = first.clone();
         ch.cipher_suites = vec![0x1302, TLS_AES_128_GCM_SHA256];
+        assert!(matches!(
+            negotiate(&ch, Some(&first)),
+            Err(ClientHelloError::IllegalParameter(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_changing_random_is_illegal_parameter() {
+        // 「変更を加えていない ClientHello」の対象は random も含む
+        // （RFC 8446 §4.1.2 は random を許可された例外に挙げていない）。
+        let first = with_ed25519_sig_alg(rfc8448_client_hello());
+        let mut ch = first.clone();
+        ch.random = [0xab; 32];
+        assert!(matches!(
+            negotiate(&ch, Some(&first)),
+            Err(ClientHelloError::IllegalParameter(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_changing_psk_key_exchange_modes_is_illegal_parameter() {
+        // psk_key_exchange_modes は RFC 8446 §4.1.2 が列挙する「変更可能な
+        // 拡張」の一覧に含まれない（key_share／early_data／pre_shared_key／
+        // padding のみが対象）ため、値の変更は illegal_parameter。
+        let first = push_extension(
+            with_ed25519_sig_alg(rfc8448_client_hello()),
+            EXT_PRE_SHARED_KEY,
+            vec![0x00, 0x00, 0x00, 0x00],
+        );
+        let ch =
+            replace_extension_data(first.clone(), EXT_PSK_KEY_EXCHANGE_MODES, vec![0x01, 0x02]);
         assert!(matches!(
             negotiate(&ch, Some(&first)),
             Err(ClientHelloError::IllegalParameter(_))
