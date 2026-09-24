@@ -228,6 +228,9 @@ pub enum ColumnType {
     /// 二次索引・`EXPLAIN`）からは一貫して非対象として除外する（`VECTOR` 列との
     /// 責務境界。`docs/design/array-column-type.md` 参照）。
     Array(ArrayType),
+    /// 可変長バイナリ列（TABLE-13・TASK-197、Issue #886）。NULL と空バイト列は
+    /// 行バイト列上も区別する（[`crate::row_codec::Value::Bytes`] 参照）。
+    Bytea,
 }
 
 impl ColumnType {
@@ -249,6 +252,7 @@ impl ColumnType {
                 "array",
                 format!("{},{}", array_ty.elem().catalog_tag(), array_ty.max_len()),
             ),
+            ColumnType::Bytea => ("bytea", "-".to_string()),
         }
     }
 
@@ -309,6 +313,14 @@ impl ColumnType {
                 }
                 let array_ty = ArrayType::new(elem, max_len)?;
                 Ok(ColumnType::Array(array_ty))
+            }
+            "bytea" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "bytea column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Bytea)
             }
             other => Err(CatalogError::Invalid(format!(
                 "unknown column type: {other:?}"
@@ -421,7 +433,9 @@ impl TableSchema {
     pub fn vector_dim(&self) -> Option<u32> {
         self.columns.iter().find_map(|c| match c.ty {
             ColumnType::Vector(dim) => Some(dim),
-            ColumnType::Text | ColumnType::Boolean | ColumnType::Array(_) => None,
+            ColumnType::Text | ColumnType::Boolean | ColumnType::Array(_) | ColumnType::Bytea => {
+                None
+            }
         })
     }
 

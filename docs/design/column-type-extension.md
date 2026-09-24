@@ -201,3 +201,71 @@ REAL/DOUBLE・DATE/TIMESTAMP は未マージ）だったため、要素型は `A
   演算子、NoSQL の JSON 配列束縛（#896）、`22P02` の新設、SQL `CREATE TABLE`
   構文での `<型>[]` 宣言（#899）、数値・日時要素型（兄弟 PR マージ後）、NULL
   要素対応、配列列のスカラー二次索引化。
+
+## #886 追記: BYTEA 列型
+
+TABLE-13・TASK-197（Issue #886。関連: WIRE-13・NOSQL-17）で `ColumnType::Bytea`
+を追加した。上記チェックリストに沿った実装内容は以下のとおり。
+
+- カタログ型タグは `"bytea"`（`param` は `"-"` 固定。TEXT／BOOLEAN と同型）。
+- 行バイト表現は TEXT と完全に同じ枠（presence タグ + `u32 LE` 長 + 本体）
+  だが UTF-8 検証を行わない点のみ異なる。長さ上限は新設の
+  `bytea::MAX_BYTEA_FIELD_LEN`（`row_codec::MAX_TEXT_FIELD_LEN` と同値。
+  `const` アサーションで固定）。フレーム長計算は `scalar_text_entry_len`／
+  `SCALAR_TEXT_ENTRY_OVERHEAD` を共有する。
+- hex テキスト表現（SQL リテラル・wire のテキスト出力）は新設モジュール
+  `engine::bytea`（`parse_hex_text`／`format_hex_text`）に集約し、engine と
+  wire-server の双方から共有する。受理する形式は PostgreSQL `\x` 接頭辞形式
+  の最小部分集合（`\x`／`\X` ＋ 偶数個の 16 進数字。大小文字混在可・`\x` 単体
+  は空バイト列）に限り、接頭辞省略・奇数桁・非 16 進文字・PostgreSQL の
+  escape 形式（`\x` 接頭辞なしの `\ooo`）はいずれも拒否する（曖昧さを避ける
+  fail-closed な実装既定値）。出力は `\x` ＋ 小文字 16 進（PostgreSQL の
+  `bytea_output=hex` 既定と同じ）。
+- `content_hash::push_value` のタグは `Bytes = 11`（Null=0／Text=1／
+  Vector=2／Bool=7 は不変。3〜6・8〜10 は他型〔INTEGER/BIGINT/REAL/DOUBLE・
+  DATE/TIMESTAMP/NUMERIC。並行実装中の別 Issue〕向けに予約）。
+- `sql::parser` の 4 つの束縛箇所（INSERT・UPDATE の SET・UPSERT の
+  リテラル・UPSERT の `ON CONFLICT` リテラル）が共通ヘルパー
+  `bind_bytea_literal` を経由し、`\x` hex リテラルのみを受理する。ファイル形
+  `INSERT`（`path`/`body` 列規約専用）は BOOLEAN と同じ理由で `BYTEA` 列も
+  対象外として拒否する。
+- 集計: `COUNT(<BYTEA 列>)`（非 NULL 行数）のみ受理し、`SUM`/`AVG`/`MIN`/
+  `MAX` は `22000` で拒否する（`AggregateInput::ByteaColumn`。`BooleanColumn`
+  と同じパターン）。`GROUP BY` キー列は引き続き TEXT 限定のまま。
+- `WHERE` 述語・スカラー二次索引・UDF/式評価・hybrid 本文列・`USING PLAN`・
+  scoring_boost への `BYTEA` 列の露出はすべて `22000` で拒否する（`declarative_
+  filter`・`sql::scalar_index`・`sql::udf_call`・`sql::using_plan`・
+  `scoring_boost` の既存拒否パターンを踏襲。索引は `per_column.push(None)`）。
+- wire-server: NoSQL 表層の JSON 表現は **標準 base64**（RFC 4648 §4・`=`
+  パディング必須・正準形のみ）を採用し、新設 `wire-server::http::query::
+  base64_std`（`encode_base64_std`／`decode_base64_std`）に厳格な codec を
+  実装した。既存の `http::session::token`（base64url・パディングなし）・
+  `auth::argon2id`（standard・パディングなし）はいずれも本仕様と一致しない
+  ため流用しなかった。`decode_base64_std` は復号後の長さを入力長・パディング
+  数から確保前に算出し、`MAX_BYTEA_FIELD_LEN` 超過を `TooLong` として拒否
+  する。
+  - `insert.rs`: `blob` フィールドに base64 文字列を受理し、復号結果を
+    そのまま `Value::Bytes` として束縛する（`InsertLiteral` へ迂回しない）。
+  - `update.rs`: 復号したバイト列を正準形（`\x` ＋ 小文字 hex）の
+    `InsertLiteral::String` へ再エンコードしてから既存の hex 解析経路へ渡す
+    （B9 判断。`vector_literal_text` が JSON 配列を文字列リテラルへ再エンコード
+    する既存パターンと同型。engine 側の束縛経路を hex 解析の 1 本に保ち、
+    NoSQL と SQL の小文字 hex リテラルのハッシュを一致させるための設計）。
+    `InsertLiteral::Bytes` variant は新設しない（表層をまたぐハッシュが常に
+    不一致になる・BREAKING となる enum variant が増えるため不採用）。
+  - `response.rs`（`scan`／`search`／`aggregate` の JSON 応答）: `Cell::Bytes`
+    を標準 base64 の JSON string として出力する。wire 側の `\x` 16 進テキスト
+    表現とは意図的に異なる値表現（型名は wire 側との同一性を、値表現は
+    JSON との親和性をそれぞれ優先する既存の非対称方針をそのまま踏襲）。
+  - エラー分類（NOSQL-17 と一部異なる暫定判断。`22P02` 未実装〔#897・
+    TASK-227〕のための申し送り）: `BYTEA` 列への非文字列 JSON（型不一致）・
+    不正な base64（アルファベット外・パディング不正・非正準・長さ不正）は
+    いずれも `42601`（`InsertError::InvalidBytea`／`UpdateError::
+    InvalidBytea`）。SQL 表層の同種の不一致は `22000` のままであり、意図的に
+    異なる（受け入れ基準 4・NOSQL-17 の「型不一致は `42601`」を優先し、
+    `22P02` 導入時に再分類する）。長さ超過は表層を問わず `54000`。
+- 対象外（申し送り）: RowDescription の OID 拡張（既存の `WireType::Text`
+  〔OID 25〕のまま。#895）、NoSQL の既存型統一・`columns[].type`（#896）、
+  `22P02` の新設（#897・TASK-227）、`WHERE` 述語・二次索引への `BYTEA` 対応
+  （#891・#893）、SQL `CREATE TABLE` 構文での `BYTEA` 宣言（SQL-23 は未実装。
+  宣言は Rust API の `TableSchema` 経由）。

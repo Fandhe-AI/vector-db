@@ -46,6 +46,10 @@
 //! - `Cell::Vector(Vec<f32>)` → JSON array of number（要素は `f32::to_string()`。
 //!   `crate::result_encoder::cell_to_text` の `[1,2.5]` 表現と要素の数値表記が
 //!   一致する）。要素の非有限も同様に `Err`
+//! - `Cell::Bytes(Vec<u8>)` → JSON string（標準 base64・パディングあり。
+//!   `crate::http::query::base64_std::encode_base64_std`。wire 側の `\x` 16 進
+//!   テキスト表現とは異なる——値表現は表層ごとの規約〔B7〕であり、`BYTEA` に
+//!   限り型名の wire 側同一性より JSON との親和性を優先する。Issue #886）
 //!
 //! 出力不変条件: [`crate::http::error_body::encode`] と同じくキー順固定
 //! （`columns` → `rows` → `row_count`）・空白なし・0x20 未満のバイトを含まない
@@ -139,6 +143,14 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
                 }
             }
             out.push(']');
+            Ok(())
+        }
+        Cell::Bytes(bytes) => {
+            // `BYTEA` の JSON 表現は標準 base64（RFC 4648 §4・パディングあり。
+            // B7・Issue #886）。base64 のアルファベットは JSON エスケープ不要。
+            out.push('"');
+            out.push_str(&crate::http::query::base64_std::encode_base64_std(bytes));
+            out.push('"');
             Ok(())
         }
     }

@@ -3671,6 +3671,9 @@ impl EngineCore {
                         }
                         crate::row_codec::ArrayValue::Bool(items) => items.len(),
                     },
+                    // BYTEA は TEXT と同じく本体長のみを数える（フレーミングの
+                    // オーバーヘッドは他の値種別も同様に含めていないため対称、Issue #886）。
+                    crate::row_codec::Value::Bytes(b) => b.len(),
                 };
                 row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
                     crate::sql::allowlist::SqlSurfaceError::payload_too_large(

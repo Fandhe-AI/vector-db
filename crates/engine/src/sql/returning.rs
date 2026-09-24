@@ -125,6 +125,24 @@ fn try_clone_array_for_budget(
     }
 }
 
+/// BYTEA セルの選択的複製（累計バイト量を確保前に検証。上記テキスト版と同方針。
+/// UTF-8 検証を行わない点のみ異なる。Issue #886）。
+fn try_alloc_bytes_for_budget(
+    bytes: &[u8],
+    budget: &mut usize,
+    cap: usize,
+) -> Result<Vec<u8>, SqlSurfaceError> {
+    *budget = try_accumulate_budget(*budget, bytes.len(), cap)?;
+    let mut owned: Vec<u8> = Vec::new();
+    owned
+        .try_reserve_exact(bytes.len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve RETURNING bytea field: {e}"),
+        })?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
+}
+
 /// 型不整合・実装バグの検出用（untrusted 入力起因ではないため `wire_code` は
 /// `XX000`。`sql::scan::scan_bug` と同方針）。`RETURNING` の投影は
 /// `sql::parser::bind_returning` が `Computed`（式項目）を構造的に排除した
@@ -199,6 +217,11 @@ pub(crate) fn project_row(
                 Some(Value::Bool(b)) => Cell::Bool(*b),
                 Some(Value::Array(array_value)) => Cell::Array(try_clone_array_for_budget(
                     array_value,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
+                Some(Value::Bytes(b)) => Cell::Bytes(try_alloc_bytes_for_budget(
+                    b,
                     budget,
                     MAX_RETURNING_RESULT_BYTES,
                 )?),

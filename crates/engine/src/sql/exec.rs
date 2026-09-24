@@ -153,6 +153,22 @@ fn try_alloc_array_for_budget(
     Ok(Value::Array(array_value))
 }
 
+/// [`try_alloc_text_for_budget`] の `BYTEA` 版（Issue #886）。UTF-8 検証が
+/// 無い点のみ異なり、累計バイト量の予算管理・確保失敗時の扱いは共有する。
+fn try_alloc_bytes_for_budget(
+    bytes: &[u8],
+    budget: &mut usize,
+    cap: usize,
+) -> Result<Vec<u8>, ArenaError> {
+    *budget = try_accumulate_budget(*budget, bytes.len(), cap)?;
+    let mut owned: Vec<u8> = Vec::new();
+    owned.try_reserve_exact(bytes.len()).map_err(|e| {
+        ArenaError::AllocationFailed(format!("failed to reserve scalar bytea field: {e}"))
+    })?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
+}
+
 // `pool_depth = bound.limit.max(DEFAULT_HYBRID_POOL_DEPTH)` が常に
 // `hybrid::RrfConfig::new` の検証（`1..=hybrid::MAX_POOL_DEPTH`）を通過するのは、
 // `bound.limit` の上限（`core::MAX_SEARCH_K`。`sql::parser::bind` が検証済み）が
@@ -193,6 +209,8 @@ pub enum Cell {
     Bool(bool),
     /// 配列列（TABLE-14・TASK-198、Issue #888）の投影結果。
     Array(row_codec::ArrayValue),
+    /// `BYTEA` 列の投影結果（Issue #886）。
+    Bytes(Vec<u8>),
 }
 
 /// 投影結果の列メタデータ。`Id` は疑似列（`ColumnType` を持たない）。
@@ -866,6 +884,14 @@ pub(crate) fn execute_statement_with_cache(
                             MAX_CANDIDATE_SCALAR_BYTES,
                         )?;
                         kept.push(value);
+                    }
+                    Some(row_codec::ScalarRef::Bytes(bytes)) => {
+                        let owned = try_alloc_bytes_for_budget(
+                            bytes,
+                            &mut candidate_scalar_bytes,
+                            MAX_CANDIDATE_SCALAR_BYTES,
+                        )?;
+                        kept.push(Value::Bytes(owned));
                     }
                 }
             }
@@ -1847,6 +1873,7 @@ pub(crate) fn execute_statement_with_cache(
                     // 配列列は宣言的フィルタ（TEXT 前提）の対象外。`Vector` と
                     // 同じく型不一致として `None` へ倒す（D-A8）。
                     Value::Null | Value::Vector(_) | Value::Array(_) => None,
+                    Value::Bytes(b) => Some(row_codec::ScalarRef::Bytes(b.as_slice())),
                 })
                 .collect();
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
@@ -2188,6 +2215,15 @@ fn decode_deferred_scalars(
                         })?;
                 out.push(value);
             }
+            Some(row_codec::ScalarRef::Bytes(bytes)) => {
+                let owned = try_alloc_bytes_for_budget(bytes, budget, MAX_CANDIDATE_SCALAR_BYTES)
+                    .map_err(|_| {
+                    SqlSurfaceError::payload_too_large(
+                        "deferred scalar projection exceeds candidate budget",
+                    )
+                })?;
+                out.push(Value::Bytes(owned));
+            }
         }
     }
     Ok(out)
@@ -2414,7 +2450,8 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Bool(_))
-                            | Some(Value::Array(_)) => {
+                            | Some(Value::Array(_))
+                            | Some(Value::Bytes(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2425,7 +2462,8 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
-                            | Some(Value::Array(_)) => {
+                            | Some(Value::Array(_))
+                            | Some(Value::Bytes(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2438,7 +2476,30 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
-                            | Some(Value::Bool(_)) => {
+                            | Some(Value::Bool(_))
+                            | Some(Value::Bytes(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Bytea => match decoded.get(*index) {
+                            Some(Value::Bytes(b)) => {
+                                let mut owned: Vec<u8> = Vec::new();
+                                owned.try_reserve_exact(b.len()).map_err(|_| {
+                                    SqlSurfaceError::Internal {
+                                        detail: "failed to reserve bytea projection cell"
+                                            .to_string(),
+                                    }
+                                })?;
+                                owned.extend_from_slice(b);
+                                cells.push(Cell::Bytes(owned));
+                            }
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Array(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })

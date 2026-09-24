@@ -494,7 +494,9 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .enumerate()
         .find_map(|(idx, c)| match c.ty {
             ColumnType::Vector(dim) => Some((idx, dim)),
-            ColumnType::Text | ColumnType::Boolean | ColumnType::Array(_) => None,
+            ColumnType::Text | ColumnType::Boolean | ColumnType::Array(_) | ColumnType::Bytea => {
+                None
+            }
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
@@ -530,9 +532,12 @@ pub(crate) fn text_column_index(
                 .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
             match column.ty {
                 ColumnType::Text => Ok(idx),
-                ColumnType::Vector(_) | ColumnType::Boolean | ColumnType::Array(_) => Err(
-                    SqlSurfaceError::invalid_input(format!("column {name:?} is not a TEXT column")),
-                ),
+                ColumnType::Vector(_)
+                | ColumnType::Boolean
+                | ColumnType::Array(_)
+                | ColumnType::Bytea => Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is not a TEXT column"
+                ))),
             }
         })
 }
@@ -1301,6 +1306,12 @@ fn bind_insert_row(
                     "column {name:?} expects an array literal, got a non-array literal"
                 )))
             }
+            (ColumnType::Bytea, InsertLiteral::String(s)) => bind_bytea_literal(s, name)?,
+            (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a bytea hex literal"
+                )))
+            }
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
             *slot = value;
@@ -1326,6 +1337,27 @@ fn bind_insert_row(
         values: bound_values,
         operation_id: operation_id.clone(),
     })
+}
+
+/// `BYTEA` 列向けの文字列リテラル（`'\xDEADBEEF'` 形。B4）を
+/// [`crate::row_codec::Value::Bytes`] へ束縛する共通ヘルパー。INSERT・UPDATE・
+/// UPSERT の 4 束縛箇所が同じ検証・エラー分類を共有する。
+///
+/// - 形式不正（接頭辞なし・奇数桁・非 16 進）は `22000`（[`SqlSurfaceError::invalid_input`]）。
+/// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
+fn bind_bytea_literal(
+    s: &str,
+    column_name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    match crate::bytea::parse_hex_text(s) {
+        Ok(bytes) => Ok(crate::row_codec::Value::Bytes(bytes)),
+        Err(crate::bytea::ByteaTextError::TooLong) => Err(SqlSurfaceError::payload_too_large(
+            format!("column {column_name:?} bytea literal exceeds length limit"),
+        )),
+        Err(_) => Err(SqlSurfaceError::invalid_input(format!(
+            "column {column_name:?} expects a valid bytea hex literal (\\x...)"
+        ))),
+    }
 }
 
 /// 束縛済みの UPDATE 文（SQL-17、TASK-191。実行結線は #865 の担当）。
@@ -1461,6 +1493,12 @@ fn bind_set_assignments(
             (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects an array literal, got a non-array literal"
+                )))
+            }
+            (ColumnType::Bytea, InsertLiteral::String(s)) => bind_bytea_literal(s, name)?,
+            (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a bytea hex literal"
                 )))
             }
         };
@@ -1991,6 +2029,12 @@ fn bind_upsert_assignments(
                             "column {name:?} expects an array literal, got a non-array literal"
                         )))
                     }
+                    (ColumnType::Bytea, InsertLiteral::String(s)) => bind_bytea_literal(s, name)?,
+                    (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a bytea hex literal"
+                        )))
+                    }
                 };
                 BoundUpsertValue::Literal(v)
             }
@@ -2097,6 +2141,12 @@ fn bind_file_insert(
                     "column {name:?}: ARRAY column is not supported for file-form INSERT"
                 )))
             }
+            // BYTEA 列も同じ理由で対象外とする（Issue #886）。
+            (ColumnType::Bytea, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: BYTEA column is not supported for file-form INSERT"
+                )))
+            }
         };
         if col_idx == path_column_index {
             if let crate::row_codec::Value::Text(ref s) = value {
@@ -2186,6 +2236,11 @@ pub(crate) enum AggregateInput {
     /// `MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
     /// [`resolve_aggregate_input`] が型不整合として拒否する。
     ArrayColumn(usize),
+    /// `BYTEA` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-13・TASK-197、Issue #886）。`SUM`/`AVG`/`MIN`/
+    /// `MAX` は `BooleanColumn` と同じパターンで [`resolve_aggregate_input`] が
+    /// 型不整合として拒否する。
+    ByteaColumn(usize),
     /// 上記以外の `Scalar` 型に束縛された式（列参照 `id` 単体を除く。`vec_norm(...)`
     /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`program`（束縛時に
     /// ステップ列コンパイル済み、Issue #353）を行ループで評価する。`source` は
@@ -2612,6 +2667,12 @@ fn resolve_aggregate_input(
                     }
                     (ColumnType::Array(_), _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is ARRAY and cannot be used with SUM/AVG/MIN/MAX"
+                    ))),
+                    (ColumnType::Bytea, AggregateFunc::Count) => {
+                        Ok(AggregateInput::ByteaColumn(index))
+                    }
+                    (ColumnType::Bytea, _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is BYTEA and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
                 };
             }

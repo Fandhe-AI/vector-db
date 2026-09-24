@@ -94,6 +94,13 @@ pub enum InsertError {
     /// `EngineCore::execute_bound_insert_in_session` 側のエラー（`operation_id`
     /// 必須化・台帳照合・INDEX-4 上限・テーブル不存在等）をそのまま透過する。
     Exec(SqlSurfaceError),
+    /// `BYTEA` 列の値が base64 の JSON string でない、または不正な base64
+    /// （`42601`。B10・Issue #886。SQL 表層の型不一致〔`22000`〕とは意図的に
+    /// 異なる分類——受け入れ基準 4・NOSQL-17 の「型不一致は `42601`」に従う）。
+    InvalidBytea(&'static str),
+    /// `BYTEA` 列の base64 値が復号後 [`engine::bytea::MAX_BYTEA_FIELD_LEN`] を
+    /// 超える（`54000`）。
+    ByteaTooLarge,
 }
 
 impl From<SchemaError> for InsertError {
@@ -114,6 +121,8 @@ impl ClassifiedError for InsertError {
             InsertError::Shape(err) => err.error_class(),
             InsertError::InvalidIdentifier => ErrorClass::UnsupportedSqlSyntax,
             InsertError::Bind(err) | InsertError::Exec(err) => err.error_class(),
+            InsertError::InvalidBytea(_) => ErrorClass::UnsupportedSqlSyntax,
+            InsertError::ByteaTooLarge => ErrorClass::PayloadTooLarge,
         }
     }
 
@@ -122,6 +131,8 @@ impl ClassifiedError for InsertError {
             InsertError::Shape(err) => err.client_message(),
             InsertError::InvalidIdentifier => "invalid identifier".to_string(),
             InsertError::Bind(err) | InsertError::Exec(err) => err.client_message(),
+            InsertError::InvalidBytea(detail) => detail.to_string(),
+            InsertError::ByteaTooLarge => "BYTEA value exceeds the length limit".to_string(),
         }
     }
 }
@@ -222,6 +233,25 @@ fn bind_row(item: &JsonValue, schema: &TableSchema) -> Result<(u64, Vec<Value>),
                     vec_values.push(f);
                 }
                 Value::Vector(vec_values)
+            }
+            (ColumnType::Bytea, JsonValue::String(s)) => {
+                let decoded =
+                    super::base64_std::decode_base64_std(s, engine::bytea::MAX_BYTEA_FIELD_LEN)
+                        .map_err(|e| match e {
+                            super::base64_std::Base64StdError::TooLong => {
+                                InsertError::ByteaTooLarge
+                            }
+                            _ => InsertError::InvalidBytea(
+                                "INSERT row BYTEA column value must be valid base64",
+                            ),
+                        })?;
+                Value::Bytes(decoded)
+            }
+            (ColumnType::Bytea, JsonValue::Null) if column.nullable => Value::Null,
+            (ColumnType::Bytea, _) => {
+                return Err(InsertError::InvalidBytea(
+                    "INSERT row BYTEA column value must be a base64 JSON string",
+                ))
             }
             _ => {
                 return Err(InsertError::Bind(invalid_input_error(
@@ -370,6 +400,14 @@ pub fn execute(
                             detail: "unexpected shape error during INSERT row binding".to_string(),
                         }
                     }
+                    // `InvalidBytea`（`42601`）／`ByteaTooLarge`（`54000`）の分類を
+                    // `SqlSurfaceError` へ写像しても維持する（B10・Issue #886）。
+                    InsertError::InvalidBytea(detail) => SqlSurfaceError::UnsupportedSyntax {
+                        detail: detail.to_string(),
+                    },
+                    InsertError::ByteaTooLarge => SqlSurfaceError::PayloadTooLarge {
+                        detail: "BYTEA value exceeds the length limit".to_string(),
+                    },
                 })
             },
         )
@@ -931,5 +969,58 @@ mod tests {
             "NoSQL insert followed by identical SQL resend must be recognized as same-content"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- BYTEA 列（Issue #886）の base64 束縛 ---------------------------------
+
+    fn bytea_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("blob", ColumnType::Bytea, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn bind_rows_decodes_base64_bytea_column() {
+        // "3q2+7w==" は [0xde, 0xad, 0xbe, 0xef] の標準 base64 表現。
+        let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"blob":"3q2+7w=="}]"#);
+        let bounds = bind_rows(&items, "docs", None, &bytea_schema()).expect("bind ok");
+        assert_eq!(
+            bounds[0].values,
+            vec![
+                Value::Vector(vec![1.0, 0.0, 0.0, 0.0]),
+                Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
+            ]
+        );
+    }
+
+    #[test]
+    fn bind_rows_rejects_non_string_bytea_column() {
+        let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"blob":123}]"#);
+        let err = bind_rows(&items, "docs", None, &bytea_schema()).expect_err("must reject");
+        assert!(matches!(err, InsertError::InvalidBytea(_)));
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_rows_rejects_malformed_base64_bytea_column() {
+        for bad in ["3q2+7w=", "3q2+7w=a", "!!!!"] {
+            let items = rows_from(&format!(
+                r#"[{{"id":1,"embedding":[1,0,0,0],"blob":"{bad}"}}]"#
+            ));
+            let err = bind_rows(&items, "docs", None, &bytea_schema()).expect_err("must reject");
+            assert!(matches!(err, InsertError::InvalidBytea(_)), "input: {bad}");
+            assert_eq!(err.wire_code(), "42601", "input: {bad}");
+        }
+    }
+
+    #[test]
+    fn bind_rows_accepts_null_bytea_column() {
+        let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"blob":null}]"#);
+        let bounds = bind_rows(&items, "docs", None, &bytea_schema()).expect("bind ok");
+        assert_eq!(bounds[0].values[1], Value::Null);
     }
 }

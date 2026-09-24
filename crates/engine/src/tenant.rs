@@ -1735,7 +1735,43 @@ fn validate_set_assignments(
                     ))));
                 }
             }
-            _ => {
+            (crate::catalog::ColumnType::Bytea, crate::row_codec::Value::Bytes(b)) => {
+                // SET 値の BYTEA 長上限検証（対象行の探索より前に行う）。フレーミングは
+                // TEXT と同一のため `scalar_text_entry_len` を共有する（Issue #886）。
+                let byte_len = u32::try_from(b.len()).map_err(|_| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "bytea field too long: {} bytes",
+                        b.len()
+                    )))
+                })?;
+                if byte_len > crate::bytea::MAX_BYTEA_FIELD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "bytea field length {byte_len} exceeds limit {}",
+                        crate::bytea::MAX_BYTEA_FIELD_LEN
+                    ))));
+                }
+                let entry_len = crate::row_codec::scalar_text_entry_len(byte_len)
+                    .map_err(|e| TenantWriteError::Catalog(CatalogError::Invalid(e.to_string())))?;
+                set_text_payload_total =
+                    set_text_payload_total
+                        .checked_add(entry_len)
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "scalar payload length overflow".to_string(),
+                            ))
+                        })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::Vector(_), _)
+            | (crate::catalog::ColumnType::Text, _)
+            | (crate::catalog::ColumnType::Boolean, _)
+            | (crate::catalog::ColumnType::Array(_), _)
+            | (crate::catalog::ColumnType::Bytea, _) => {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column type does not match the current table schema".to_string(),
                 )))
