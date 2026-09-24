@@ -111,10 +111,18 @@ impl Decimal {
     /// `unscaled`・`scale` から直接構築する（呼び出し元は列の `scale` と一致
     /// していることを保証する契約。`-0` は正規化（`unscaled == 0` のとき符号は
     /// 常に非負）する）。
+    ///
+    /// `scale` が `MAX_PRECISION` を超える値は本来この契約違反だが、この
+    /// コンストラクタは公開 API（`row_codec`・wire-server・テストから到達）
+    /// であり呼び出し元の検証だけには頼れない。`pow10` と同じ fail-closed
+    /// 方針に揃え、範囲外の `scale` は `MAX_PRECISION` へ丸めることで
+    /// `Display`（[`fmt::Display`] 実装）の `pow10` 参照が必ず成功し、
+    /// 桁位置を欠いた値の誤表示（小数点なしの整数表示への意図しない縮退）が
+    /// 発生しないようにする。
     pub fn from_parts(unscaled: i128, scale: u8) -> Self {
         Decimal {
             unscaled: if unscaled == 0 { 0 } else { unscaled },
-            scale,
+            scale: scale.min(MAX_PRECISION),
         }
     }
 
@@ -456,5 +464,22 @@ mod tests {
         assert!(d(99, 0).fits_precision(2));
         assert!(!d(100, 0).fits_precision(2));
         assert!(!d(-100, 0).fits_precision(2));
+    }
+
+    #[test]
+    fn from_parts_clamps_out_of_range_scale() {
+        // 呼び出し元がカタログ検証（`0..=MAX_PRECISION`）を経由せず
+        // `MAX_PRECISION` 超過の `scale` を渡しても、`pow10` 参照が失敗して
+        // 小数点位置を欠いた値へ誤表示（Display の fail-closed 縮退）する
+        // ことがないよう `MAX_PRECISION` へ丸めて格納する（P2 指摘対応）。
+        let clamped = Decimal::from_parts(1, 39);
+        assert_eq!(clamped.scale(), MAX_PRECISION);
+        assert_eq!(
+            clamped.to_string(),
+            "0.00000000000000000000000000000000000001"
+        );
+
+        let clamped_u8_max = Decimal::from_parts(5, u8::MAX);
+        assert_eq!(clamped_u8_max.scale(), MAX_PRECISION);
     }
 }
