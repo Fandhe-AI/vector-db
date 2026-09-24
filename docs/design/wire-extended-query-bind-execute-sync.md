@@ -49,6 +49,11 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
   ＋`io::sink()`）で全量を確保しない。COPY・FunctionCall・未知の型バイトは
   破棄対象にせず、従来どおり `protocol_dispatch::reject_and_close`（fail-
   closed。フレームの意味を持たない可能性がある入力を安全側で拒否する）。
+  `'X'`（Terminate）も通常分岐と同じく length=4・body 厳密に空であることを
+  検証してから終了する（PR #1013 レビュー指摘・codex P1: 検証を素通りする
+  経路があると、長さフィールド欠落・不正長・余剰 body を持つ malformed
+  Terminate が「エラー後」という条件だけで正規の Terminate として受理されて
+  しまう）。
 - Sync 到達で `ignore_till_sync` を解除し、無名 portal を破棄してから
   `ReadyForQuery`（状態バイトは当面 `'I'` 固定。#943 で置換）を返す。
 
@@ -60,7 +65,29 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
   変わらない——PostgreSQL の「bind snapshots the plan」と同じ）・`columns`
   （Bind 時点で `describe_parsed_in_session` から求めた結果列。portal の
   Describe と Execute の結果列整合ガードの双方に使う）・`state`
-  （`Ready`／`Suspended`／`Done`）を持つ。
+  （`Ready`／`Suspended`／`Done`／`Failed`）を持つ。
+- `Failed` は「この portal への Execute 実行を試みたが失敗した」終端状態で、
+  `engine::execute_parsed_in_session` を呼ぶ**前**に立て、成功した場合のみ
+  `Done`／`Suspended` へ上書きする。実行呼び出し自体が失敗する経路・
+  呼び出し成功後の後処理（結果列整合検査・行エンコード・中断バイト上限
+  判定・応答フレーム送出）が失敗する経路のいずれも、以降の再 Execute で
+  実行を再試行して副作用を重複させることを防ぐ（PR #1013 レビュー指摘・
+  Cursor Bugbot Medium「Failed Execute leaves portal runnable」。以前は
+  実行呼び出し成功後にのみ `Failed` へ倒していたため、呼び出し自体が
+  失敗した場合は portal が `Ready` のまま残っていた）。`Failed` への
+  再 Execute は `08P01`（`ProtocolViolation`）で拒否し、実行し直すには
+  新しい Bind で portal を作り直す必要がある。
+- 書き込み系文（`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` 等）の Execute で、
+  `engine::execute_parsed_in_session` が `Ok` を返した（＝`RECOVER-5`
+  「commit 成功境界」契約により commit が既に成功している）後に発生した
+  失敗（結果列整合検査・`DataRow` エンコード・中断バイト上限判定・応答
+  フレーム送出のいずれか）は、通常の失敗と区別するため `ErrorResponse` に
+  ERR-5・`RECOVER-5` (3) の `state=may_be_committed` `D`（detail）フィールド
+  を付ける（PR #1013 レビュー指摘・codex P1。既存の
+  `error_response::encode_with_detail`／`MAY_BE_COMMITTED_DETAIL`——panic
+  経由の緊急応答〔TASK-97・RECOVER-6〕専用だった——を通常の `Err` 経路にも
+  拡張適用したもの。新規 SQLSTATE は追加しない。中断保持継続（2 回目以降の
+  Execute）でも `PortalRows::committed` にこの区別を引き継ぐ）。
 - 名前付き portal は `MAX_PORTALS_PER_SESSION`（64。実装既定値）まで、無名
   （`""`）は件数にカウントせず黙って置換する（`PreparedStatementStore` と
   同型の設計）。名前の重複は `08P01`、長すぎる名前・件数超過は `54000`。
@@ -130,7 +157,7 @@ Sync バッチ内で後続のメッセージが失敗しても、先に commit �
 
 | 事象 | wire_code |
 | --- | --- |
-| 未定義 statement／portal への参照・名前付き statement／portal の重複作成 | `08P01`（`ProtocolViolation`） |
+| 未定義 statement／portal への参照・名前付き statement／portal の重複作成・`Failed` 状態の portal への再 Execute | `08P01`（`ProtocolViolation`） |
 | Bind のパラメータ数不一致・format code 個数不正 | `08P01` |
 | 結果 format code の個数不正・値不正（0/1 以外） | `08P01`（`ResultFormats::resolve`） |
 | Bind のパラメータ format code が binary 指定（`$n` 束縛未実装のため一律拒否）・結果 format code が非対応型の列を binary 指定（WIRE-14。`id`／`VECTOR`／`Computed`。TABLE-13・Issue #886 の `BOOLEAN`／`BYTEA` も同様） | `0A000`（`FeatureNotSupported`） |
@@ -203,7 +230,15 @@ panic すると緊急応答〔TASK-97・RECOVER-6〕が発火しない fail-open
   の解決／事前検査（`TEXT` 列への binary 指定は成功し `RowDescription`／
   `DataRow` に反映される・非対応型〔`id` 等〕への binary 指定は `0A000`・
   個数／値不正は `08P01`）・テナント境界（RLS-7）・`engine: None` 経路の
-  後方互換・簡易クエリ応答の不変性を固定。
+  後方互換・簡易クエリ応答の不変性を固定。PR #1013 レビュー指摘対応で
+  `malformed_terminate_during_ignore_till_sync_is_rejected_not_silently_closed`
+  （`ignore_till_sync` 中の malformed Terminate が `08P01` で拒否されること）・
+  `failed_execute_marks_named_portal_failed_and_rejects_reexecute`
+  （実行呼び出し自体が失敗した named portal への再 Execute が `PortalFailed`
+  で拒否されること）・
+  `post_commit_suspended_bytes_overflow_carries_may_be_committed_detail`
+  （commit 成功後の中断バイト上限超過が `state=may_be_committed` detail 付き
+  で返り、行は実際にコミット済みであること）を追加。
 - `crates/wire-server/tests/wire11_parse_describe.rs`: Parse／Describe の
   エラー系テストを `_and_closes` から `_and_recovers`（Sync で同期回復し
   簡易クエリが通ることを確認）へ更新。portal 対象の Describe は本 Issue で

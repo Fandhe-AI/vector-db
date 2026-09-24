@@ -12,7 +12,7 @@ mod common;
 #[path = "../../engine/src/test_util/temp_db.rs"]
 mod temp_db;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -991,4 +991,190 @@ fn simple_query_response_is_unchanged_across_extended_sequences() {
         first, second,
         "simple query response must be byte-identical"
     );
+}
+
+/// PR #1013 レビュー指摘（codex P1）の回帰防止: `ignore_till_sync`（拡張クエリ
+/// プロトコルのエラー後の同期回復モード）中に受け取る `'X'`（Terminate）も、
+/// 通常分岐と同じく length=4・body 厳密に空であることを検証してから終了する。
+/// 検証をすり抜けて即座に `Ok(())` を返す実装では、長さフィールド不正な
+/// malformed Terminate が「エラー後」という条件だけで正規の Terminate として
+/// 受理されてしまう（フレーミング検証契約の回避）。修正後は他の malformed
+/// frame と同じ `08P01`（invalid message frame）の `ErrorResponse` を受け取って
+/// から接続が閉じる。
+#[test]
+fn malformed_terminate_during_ignore_till_sync_is_rejected_not_silently_closed() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    // 許可リスト外 SQL の Parse でエラー後の同期回復モードへ入る。
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("", "SELECT id FROM documents WHERE id = $1", 0),
+    );
+    assert_error_response(&mut stream, "42601");
+
+    // length=5（body 1 バイト）の malformed Terminate。正規の Terminate は
+    // length=4・body 厳密に空。ここでは長さフィールド自体を短く宣言する
+    // （length=3 は最小許容値 4 未満）。長さ検証は body を読む前に働くため、
+    // 本テストでは body バイトを一切送らない（送出済みバイトが未読のまま
+    // 残ると TCP の RST 経由で `ConnectionReset` になり、正常系の
+    // クリーンな EOF と区別が付かなくなるため）。
+    let mut msg = Vec::new();
+    msg.push(b'X');
+    msg.extend_from_slice(&3i32.to_be_bytes());
+    stream.write_all(&msg).expect("send malformed terminate");
+
+    // 修正前は body を一切読まず即座に `Ok(())` で正常終了していたため、
+    // クライアントは ErrorResponse を受け取らずそのまま EOF になっていた。
+    // 修正後は他の malformed frame と同じ経路（`handshake::respond_and_close`）
+    // で 08P01 の ErrorResponse を受け取ってから接続が閉じる。
+    assert_error_response(&mut stream, "08P01");
+
+    // 接続はこの後閉じる（クリーンな EOF、または OS 依存で
+    // `ConnectionReset` になることを許容する。いずれも「malformed
+    // Terminate が正規の Terminate として静かに受理されたわけではない」
+    // ことの確認が目的で、切断の正確な種別までは固定しない）。
+    let mut buf = [0u8; 1];
+    match stream.read(&mut buf) {
+        Ok(n) => assert_eq!(n, 0, "connection must close after the malformed Terminate"),
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset,
+            "unexpected read error after malformed Terminate: {e:?}"
+        ),
+    }
+}
+
+/// PR #1013 レビュー指摘（Cursor Bugbot Medium）の回帰防止: 実行を試みて
+/// 失敗した portal（`operation_id` 重複により `execute_parsed_in_session`
+/// 自体がエラーを返すケース）は Sync を越えても `Ready` へ戻らず、次の
+/// Execute は再実行されずに拒否される。以前は `PortalState::Failed` を
+/// `execute_parsed_in_session` の成功後にしか立てていなかったため、呼び出し
+/// 自体が失敗する経路ではこの保護が効かず、同じ named portal への再 Execute
+/// が文を再実行しうる状態だった（named portal は Sync で破棄されないため
+/// unnamed portal と異なりこの経路が回復を生き延びる）。
+#[test]
+fn failed_execute_marks_named_portal_failed_and_rejects_reexecute() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 1);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    // `seed_rows` が既に `operation_id = 'seed-1'` で id=1 を投入済みのため、
+    // 同じ `operation_id` の再送は許可リスト検証（Parse）を通過するが、
+    // `execute_parsed_in_session` の実行時（台帳照合）に `23505` で失敗する
+    // ――「実行呼び出し自体が Err を返す」経路を再現する。
+    let dup_sql = "INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', 'row-1') USING OPERATION_ID 'seed-1'";
+    parse_and_bind(&mut stream, "sF", "pF", dup_sql);
+
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pF", 0));
+    assert_error_then_recovers(&mut stream, "23505");
+
+    // named portal は Sync を越えて残るため、同じ portal へ再度 Execute する。
+    // 修正前は `Ready` のままだったため再実行を試み同じ `23505` が返っていた
+    // （＝実行が繰り返されていた）のに対し、修正後は `PortalFailed` として
+    // `08P01` を返し、実行し直すには新しい Bind が必要になる。
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pF", 0));
+    assert_error_then_recovers(&mut stream, "08P01");
+}
+
+/// PR #1013 レビュー指摘（codex P1）の回帰防止: 書き込み系文（`RETURNING`
+/// 付き `INSERT`）の commit 成功後、中断バイト上限超過により後処理が失敗した
+/// 場合、`ErrorResponse` に `state=may_be_committed` の `D`（detail）フィールドが
+/// 付き、通常の（commit 前の）失敗とは区別できる（`RECOVER-5` (3)・ERR-5 の
+/// 既存 detail 契約を、panic 経由の緊急応答だけでなく通常の Err 経路にも
+/// 拡張適用したことの確認）。
+#[test]
+fn post_commit_suspended_bytes_overflow_carries_may_be_committed_detail() {
+    // `MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION`（16 MiB）に対し、フィラー portal
+    // 単体では収まるが、`INSERT ... RETURNING` の結果行を加えると上限を
+    // 超える組み合わせを作る（`suspended_portal_bytes_are_accounted_across_
+    // the_whole_session_not_per_portal` と同じ手法）。
+    const ROW_BODY_LEN: usize = 820_000;
+    const ROW_COUNT: u64 = 21; // 1 行即時送出 + 20 行中断保持 ≈ 16,400,000 バイト
+    const RETURNING_BODY_LEN: usize = 500_000; // ≈16,900,000 バイトへ押し上げる
+
+    let (core, _guard) = new_core_with_documents_table();
+    let big_body = "x".repeat(ROW_BODY_LEN);
+    for id in 1..=ROW_COUNT {
+        let sql = format!(
+            "INSERT INTO documents (id, embedding, body) VALUES ({id}, '[0.1,0.2,0.3]', '{big_body}') USING OPERATION_ID 'seed-big-{id}'"
+        );
+        let mut session = engine::sql::mode::SessionState::default();
+        core.execute_sql_in_session(&owner_ctx(), &mut session, &sql)
+            .expect("seed big-body insert succeeds");
+    }
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    // 他の named portal を中断状態のまま保持させ、中断保持バイト上限
+    // （セッション全体で判定）にほぼ（だが超えない量まで）達させる。
+    let filler_sql = format!(
+        "SELECT id, body FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT {ROW_COUNT}"
+    );
+    parse_and_bind(&mut stream, "sFiller", "pFiller", &filler_sql);
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pFiller", 1));
+    let (kind, _) = read_message(&mut stream); // 1 行分の DataRow（即時送出）
+    assert_eq!(kind, b'D');
+    let (kind, _) = read_message(&mut stream); // PortalSuspended（残り 20 行）
+    assert_eq!(
+        kind, b's',
+        "filler portal must stay under the session limit on its own"
+    );
+
+    // `INSERT ... RETURNING` は commit 成功後に結果行をエンコードする。
+    // 中断保持バイト上限の判定は「送出予定（`take`）に入らない行」だけを
+    // 対象にするため（`execute_portal` の中断バイト上限判定コメント参照）、
+    // ここでは 2 行分の `VALUES` を持つ複数行 `INSERT ... RETURNING`
+    // （1 行目は極小、2 行目に大きな `body`）を `max_rows=1` で実行し、
+    // 2 行目を中断保持対象にする。フィラー portal が既に保持している
+    // バイト数と 2 行目の中断保持見込みバイト数を合算すると上限
+    // （16 MiB）を超えるため、この Execute の後処理（中断バイト上限判定）が
+    // 必ず失敗する（単一行 `RETURNING` は常に `take == total` となり
+    // この判定ループへ到達しないため、複数行形が必要）。
+    let returning_body = "y".repeat(RETURNING_BODY_LEN);
+    let insert_sql = format!(
+        "INSERT INTO documents (id, embedding, body) VALUES (99998, '[0.1,0.2,0.3]', 'small'), (99999, '[0.1,0.2,0.3]', '{returning_body}') RETURNING body USING OPERATION_ID 'op-returning-overflow'"
+    );
+    parse_and_bind(&mut stream, "sIns", "pIns", &insert_sql);
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pIns", 1));
+
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(
+        kind, b'E',
+        "expected the suspended-bytes limit to be exceeded"
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("54000"),
+        "expected 54000 (suspended bytes exceeded), got {text:?}"
+    );
+    assert!(
+        text.contains("state=may_be_committed"),
+        "post-commit failure must carry the may_be_committed detail: {text:?}"
+    );
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
+
+    // commit は実際に成功しているため、行は見える（後処理失敗であって書き込み
+    // 失敗ではないことの確認）。
+    send_simple_query(
+        &mut stream,
+        "SELECT id FROM documents WHERE id = 99999 LIMIT 1",
+    );
+    let (kind, dbg_body) = read_message(&mut stream);
+    assert_eq!(
+        kind,
+        b'T',
+        "expected RowDescription, got {kind} body={:?}",
+        String::from_utf8_lossy(&dbg_body)
+    );
+    let _row = read_data_row(&mut stream);
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
 }

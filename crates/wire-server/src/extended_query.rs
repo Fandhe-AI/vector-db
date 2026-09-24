@@ -94,6 +94,7 @@ use engine::recovery::commit_boundary::ResponseBoundaryGuard;
 use engine::sql::exec::ColumnMeta;
 use engine::sql::mode::SessionState;
 
+use crate::error_response;
 use crate::framing::{self, FrameError};
 use crate::limits::{
     MAX_PORTALS_PER_SESSION, MAX_PREPARED_SQL_BYTES_PER_SESSION,
@@ -501,6 +502,15 @@ struct PortalRows {
     /// 取得すると完了タグは `SELECT 5` であるべきだが、直近バッチの件数
     /// だけを使うと `SELECT 1` になってしまう）。
     sent_so_far: usize,
+    /// この portal の実行が書き込み系文（`INSERT`/`UPDATE`/`DELETE`/
+    /// `TRUNCATE` 等の `RETURNING` 込み）を commit 済みかどうか（PR #1013
+    /// レビュー指摘・codex P1）。`true` の場合、この中断保持分の続きを送出する
+    /// 際のエンコード・IO 失敗は「commit は既に成功している後処理の失敗」で
+    /// あり、[`HandlerError::PostCommit`] として `state=may_be_committed`
+    /// detail 付きの ErrorResponse へ写像する（`RECOVER-5` (3)・ERR-5 の
+    /// 既存 detail 契約を、panic 経由の緊急応答だけでなく通常の Err 経路にも
+    /// 拡張適用する）。
+    committed: bool,
 }
 
 /// portal の実行状態。
@@ -512,11 +522,17 @@ enum PortalState {
     /// 完了済み（副作用は再実行しない。再 Execute には保持済みの `tag`
     /// （実装既定値として件数 0 のタグ）を返す契約）。
     Done { tag: String },
-    /// `engine::execute_parsed_in_session` による実行（副作用を含みうる）
-    /// 自体は成功したが、その後の後処理（結果列整合検査・行エンコード・
-    /// 中断バイト上限判定）で失敗した終端状態。実行は既に確定しているため、
-    /// 以降の再 Execute で `engine::execute_parsed_in_session` を再実行して
-    /// 副作用を重複させることを防ぐ（PR #1013 レビュー指摘・P1）。
+    /// この portal への Execute 実行を試みたが失敗した終端状態。
+    /// `engine::execute_parsed_in_session` を呼ぶ**前**に立て、成功した
+    /// 場合のみ末尾で `Done`／`Suspended` へ上書きする（`execute_portal`
+    /// 参照）。こうすることで、実行本体の呼び出し自体が失敗した場合・
+    /// 呼び出し成功後の後処理（結果列整合検査・行エンコード・中断バイト
+    /// 上限判定・応答フレーム送出）が失敗した場合のいずれも、以降の
+    /// 再 Execute で `engine::execute_parsed_in_session` を再実行して副作用を
+    /// 重複させることを防ぐ（PR #1013 レビュー指摘・P1・Cursor Bugbot
+    /// Medium「Failed Execute leaves portal runnable」。再 Execute は
+    /// `HandlerError::PortalFailed` で拒否し、実行し直すには新しい Bind で
+    /// portal を作り直す必要がある）。
     Failed,
 }
 
@@ -690,6 +706,23 @@ enum HandlerError {
     /// 応答送出も試みるが、壊れたストリームへの追加の書き込み失敗は
     /// `post_auth_loop` まで伝播し、最終的に接続が閉じられるだけで無害）。
     Internal(String),
+    /// 書き込み系文（`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` 等）の commit が
+    /// 既に成功した後で発生したエラー（結果列整合検査・`DataRow` エンコード・
+    /// 中断バイト上限判定・応答フレーム送出のいずれか。PR #1013 レビュー
+    /// 指摘・codex P1）。分類・メッセージは内側の `HandlerError` をそのまま
+    /// 使うが、応答には ERR-5・`RECOVER-5` (3) の `state=may_be_committed`
+    /// detail（[`crate::error_response::MAY_BE_COMMITTED_DETAIL`]）を追加し、
+    /// クライアントに「このエラー応答は書き込みの失敗を意味しない」ことを
+    /// 伝える（`respond_error_and_await_sync`／`respond_error_and_close` 参照）。
+    PostCommit(Box<HandlerError>),
+    /// 直前の Execute 試行が失敗し `PortalState::Failed`（終端状態）へ倒れた
+    /// portal への再 Execute（PR #1013 レビュー指摘・Cursor Bugbot Medium。
+    /// 「Failed Execute leaves portal runnable」の是正——実行を試みたが
+    /// 失敗した portal は Sync を越えても `Ready` へは戻らず、再実行するには
+    /// 新しい Bind で portal を作り直す必要がある。PostgreSQL の「エラー後は
+    /// トランザクションを中断し、次の有効な操作まで拒否する」契約に相当する
+    /// portal 単位版）。
+    PortalFailed,
 }
 
 impl HandlerError {
@@ -714,6 +747,12 @@ impl HandlerError {
             HandlerError::ResultTypeChanged => ErrorClass::FeatureNotSupported,
             HandlerError::SuspendedBytesExceeded => ErrorClass::PayloadTooLarge,
             HandlerError::Internal(_) => ErrorClass::InternalError,
+            HandlerError::PostCommit(inner) => inner.error_class(),
+            // 未定義 statement／portal 参照と同種の「portal をこの状態で
+            // 使うことはできない」というプロトコル使用エラー
+            // （`UnknownPortal` と同じ分類を再利用し、新規 SQLSTATE は
+            // 追加しない）。
+            HandlerError::PortalFailed => ErrorClass::ProtocolViolation,
         }
     }
 
@@ -778,6 +817,11 @@ impl HandlerError {
                 "suspended portal row buffer exceeds the per-connection limit".to_string()
             }
             HandlerError::Internal(detail) => detail.clone(),
+            HandlerError::PostCommit(inner) => inner.message(),
+            HandlerError::PortalFailed => {
+                "portal is in a failed state after a prior execution error; re-bind before executing again"
+                    .to_string()
+            }
         }
     }
 }
@@ -796,6 +840,23 @@ fn io_to_handler(e: io::Error) -> HandlerError {
     internal_error(&format!("stream I/O error: {e}"))
 }
 
+/// `err` から `ErrorResponse`（'E'）フレームを組み立てる。`err` が
+/// [`HandlerError::PostCommit`] を再帰的に含む場合、ERR-5・`RECOVER-5` (3)
+/// の `state=may_be_committed` detail を付ける（[`error_response::
+/// encode_with_detail`]・既存の panic 緊急応答経路が使う定数・関数をそのまま
+/// 再利用し、新規 SQLSTATE を追加しない）。それ以外は通常応答
+/// （`result_encoder::encode_error_response`。本モジュールの既存経路）。
+fn build_error_response_body(err: &HandlerError) -> Result<Vec<u8>, result_encoder::EncodeError> {
+    if let HandlerError::PostCommit(inner) = err {
+        return error_response::encode_with_detail(
+            inner.error_class(),
+            &inner.message(),
+            error_response::MAY_BE_COMMITTED_DETAIL,
+        );
+    }
+    result_encoder::encode_error_response(err.error_class().wire_code(), &err.message())
+}
+
 /// ErrorResponse を送出し、フレーム自体が壊れており同期を回復できない
 /// （モジュールドキュメント「エラー後の同期回復」節）場合に、有界
 /// lingering close で接続を終える。
@@ -804,11 +865,9 @@ fn respond_error_and_close(stream: &mut TcpStream, err: &HandlerError) -> io::Re
         "wire-server: extended query rejecting message ({})",
         err.error_class().wire_code()
     );
-    let class = err.error_class();
-    let body =
-        result_encoder::encode_error_response(class.wire_code(), &err.message()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "failed to encode ErrorResponse")
-        })?;
+    let body = build_error_response_body(err).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "failed to encode ErrorResponse")
+    })?;
     stream.write_all(&body)?;
     stream.flush()?;
     crate::protocol_dispatch::drain_and_close(
@@ -830,11 +889,9 @@ fn respond_error_and_await_sync(
         "wire-server: extended query error, awaiting Sync ({})",
         err.error_class().wire_code()
     );
-    let class = err.error_class();
-    let body =
-        result_encoder::encode_error_response(class.wire_code(), &err.message()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "failed to encode ErrorResponse")
-        })?;
+    let body = build_error_response_body(err).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "failed to encode ErrorResponse")
+    })?;
     stream.write_all(&body)?;
     stream.flush()?;
     state.ignore_till_sync = true;
@@ -1318,18 +1375,28 @@ fn execute_portal(
             )
         };
 
-        let outcome = crate::simple_query::execute_with_emergency_registration(stream, || {
-            engine.execute_parsed_in_session(ctx, session, &parsed)
-        })
-        .map_err(HandlerError::Sql)?;
+        // `engine::sql::allowlist::Statement`（`ParsedSql::Statement`）は
+        // `SELECT`／`SET search_mode`／`CREATE FUNCTION`／`EXPLAIN` のみで、
+        // いずれも redb への書き込み commit を伴わない（`CREATE FUNCTION`・
+        // `SET` はセッションローカルな状態変更のみ）。それ以外の
+        // `ParsedSql`（`Insert`/`Truncate`/`Delete`/`Update`）は
+        // `execute_parsed_in_session` が `Ok` を返した時点で commit 成功が
+        // 確定している（`RECOVER-5`「commit 成功境界」契約——`Err` を返す
+        // 経路は commit 未到達のまま失敗する設計のため、`Ok` は必ず commit
+        // 成功を意味する）。この判定は Execute 呼び出しをまたいで使うため
+        // （`PortalRows::committed` 経由で中断保持継続時にも引き継ぐ）、
+        // ここで一度だけ確定する。
+        let is_write_statement = !matches!(parsed, ParsedSql::Statement(_));
 
-        // `outcome` の時点で実行（副作用を含みうる）自体はすでに確定している。
-        // これ以降（結果列整合検査・行エンコード・中断バイト上限判定）の
-        // 失敗はすべて「実行成功後の後処理失敗」であり、portal を `Ready`
-        // のまま残すと次の Execute で `engine::execute_parsed_in_session` が
-        // 再実行され副作用が重複しうる（PR #1013 レビュー指摘・P1）。
-        // 後続処理の成否によらず再実行を防ぐため、先に `Failed`（終端状態）へ
-        // 倒しておき、後処理が成功した場合のみ末尾で正しい状態へ上書きする。
+        // 実行を試みる時点で portal を `Failed`（終端状態）へ倒しておく
+        // （成功時のみ末尾で正しい状態へ上書きする）。`execute_parsed_in_session`
+        // 自体がエラーを返す経路も含め、実行を試みた portal は Sync を越えても
+        // `Ready` に留まらず、再実行するには新しい Bind で portal を作り直す
+        // 必要がある——PostgreSQL の「エラー後はトランザクションを中断する」
+        // 契約に相当する portal 単位版（PR #1013 レビュー指摘・Cursor Bugbot
+        // Medium「Failed Execute leaves portal runnable」の是正。以前は
+        // `execute_parsed_in_session` 成功後にのみ `Failed` へ倒していたため、
+        // その呼び出し自体が失敗した場合は portal が `Ready` のまま残っていた）。
         {
             let portal = state
                 .portals
@@ -1338,6 +1405,27 @@ fn execute_portal(
             portal.state = PortalState::Failed;
         }
 
+        let outcome = crate::simple_query::execute_with_emergency_registration(stream, || {
+            engine.execute_parsed_in_session(ctx, session, &parsed)
+        })
+        .map_err(HandlerError::Sql)?;
+
+        // ここに到達した時点で `is_write_statement` なら commit は既に成功
+        // している（上のコメント参照）。これ以降（結果列整合検査・行
+        // エンコード・中断バイト上限判定・応答フレーム送出）で発生する失敗は
+        // すべて「commit 成功後の後処理失敗」であり、`state=may_be_committed`
+        // detail 付きの `HandlerError::PostCommit` へ包んでクライアントへ
+        // 誤解を与えない（PR #1013 レビュー指摘・codex P1。ERR-5・
+        // `RECOVER-5` (3) の既存 detail 契約を、panic 経由の緊急応答だけで
+        // なく通常の Err 経路にも拡張適用する）。
+        let commit_wrap = |e: HandlerError| -> HandlerError {
+            if is_write_statement {
+                HandlerError::PostCommit(Box::new(e))
+            } else {
+                e
+            }
+        };
+
         match crate::simple_query::map_outcome(outcome) {
             crate::simple_query::OutcomeResponse::Command { tag } => {
                 let portal = state
@@ -1345,11 +1433,11 @@ fn execute_portal(
                     .get_mut(portal_name)
                     .ok_or(HandlerError::UnknownPortal)?;
                 portal.state = PortalState::Done { tag: tag.clone() };
-                return write_command_complete(stream, &tag);
+                return write_command_complete(stream, &tag).map_err(commit_wrap);
             }
             crate::simple_query::OutcomeResponse::Rows { result, shape } => {
                 if Some(&result.columns) != expected_columns.as_ref() {
-                    return Err(HandlerError::ResultTypeChanged);
+                    return Err(commit_wrap(HandlerError::ResultTypeChanged));
                 }
                 let total = result.rows.len();
                 let take = if max_rows <= 0 {
@@ -1387,11 +1475,11 @@ fn execute_portal(
                         &result_formats,
                         &mut frame,
                     )
-                    .map_err(|_| internal_error("failed to encode data row"))?;
+                    .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
                     remaining_bytes = remaining_bytes.saturating_add(frame.len());
                     let session_total = other_suspended_bytes.saturating_add(remaining_bytes);
                     if session_total > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION {
-                        return Err(HandlerError::SuspendedBytesExceeded);
+                        return Err(commit_wrap(HandlerError::SuspendedBytesExceeded));
                     }
                     frames.push_back(frame);
                 }
@@ -1415,10 +1503,14 @@ fn execute_portal(
                         &result_formats,
                         &mut frame,
                     )
-                    .map_err(|_| internal_error("failed to encode data row"))?;
-                    buffer.push_frame(stream, &frame).map_err(io_to_handler)?;
+                    .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
+                    buffer
+                        .push_frame(stream, &frame)
+                        .map_err(|e| commit_wrap(io_to_handler(e)))?;
                     if buffer.len() >= MAX_RESPONSE_BUFFER_BYTES {
-                        buffer.flush(stream).map_err(io_to_handler)?;
+                        buffer
+                            .flush(stream)
+                            .map_err(|e| commit_wrap(io_to_handler(e)))?;
                     }
                 }
 
@@ -1427,10 +1519,15 @@ fn execute_portal(
                     // タグは portal 全体の累計送出行数（この場合は `take`
                     // そのもの）から組み立てる（PR #1013 レビュー指摘・P1）。
                     let tag = shape.render(take);
-                    let msg = result_encoder::encode_command_complete(&tag)
-                        .map_err(|_| internal_error("failed to encode command complete"))?;
-                    buffer.push_frame(stream, &msg).map_err(io_to_handler)?;
-                    buffer.flush(stream).map_err(io_to_handler)?;
+                    let msg = result_encoder::encode_command_complete(&tag).map_err(|_| {
+                        commit_wrap(internal_error("failed to encode command complete"))
+                    })?;
+                    buffer
+                        .push_frame(stream, &msg)
+                        .map_err(|e| commit_wrap(io_to_handler(e)))?;
+                    buffer
+                        .flush(stream)
+                        .map_err(|e| commit_wrap(io_to_handler(e)))?;
 
                     let portal = state
                         .portals
@@ -1442,8 +1539,10 @@ fn execute_portal(
 
                 buffer
                     .push_frame(stream, &result_encoder::encode_portal_suspended())
-                    .map_err(io_to_handler)?;
-                buffer.flush(stream).map_err(io_to_handler)?;
+                    .map_err(|e| commit_wrap(io_to_handler(e)))?;
+                buffer
+                    .flush(stream)
+                    .map_err(|e| commit_wrap(io_to_handler(e)))?;
 
                 let portal = state
                     .portals
@@ -1453,6 +1552,7 @@ fn execute_portal(
                     frames,
                     shape,
                     sent_so_far: take,
+                    committed: is_write_statement,
                 });
                 return Ok(());
             }
@@ -1473,17 +1573,35 @@ fn execute_portal(
         let rows = match &mut portal.state {
             PortalState::Suspended(rows) => rows,
             // `Ready` はここに至る前に実行済みへ遷移し、`Done` は直前で
-            // 早期 return 済みのはず。`Failed` は実行成功後の後処理
-            // （結果列整合検査・行エンコード・中断バイト上限判定）が失敗した
-            // 終端状態で、再実行を許さず fail-closed に内部エラーを返す
-            // （PR #1013 レビュー指摘・P1）。内部状態機械の不変条件が将来の
-            // 変更で崩れた場合に備え、それ以外の到達もここでは panic ではなく
-            // fail-closed な内部エラーへ倒す（wire 入力経路で panic を
-            // 避ける方針）。
-            PortalState::Ready | PortalState::Done { .. } | PortalState::Failed => {
+            // 早期 return 済みのはず。`Failed` は実行を試みたが（実行自体・
+            // その後処理いずれかの理由で）失敗した終端状態で、再実行を許さず
+            // `HandlerError::PortalFailed` を返す（PR #1013 レビュー指摘・
+            // Cursor Bugbot Medium。この分岐は正常なクライアント操作
+            // （失敗した portal への再 Execute）として到達しうるため、
+            // 「内部エラー」ではなくクライアントに意味の伝わるエラーへ写像
+            // する）。内部状態機械の不変条件が将来の変更で崩れた場合に備え、
+            // それ以外の到達（到達しないはずの `Ready`/`Done`）はここでは
+            // panic ではなく fail-closed な内部エラーへ倒す（wire 入力経路で
+            // panic を避ける方針）。
+            PortalState::Failed => return Err(HandlerError::PortalFailed),
+            PortalState::Ready | PortalState::Done { .. } => {
                 return Err(internal_error(
                     "portal state machine invariant violated: expected Suspended state",
                 ))
+            }
+        };
+
+        // この中断保持分の送出継続が、先行する Execute で既に commit 済みの
+        // 書き込み系文の結果を運んでいるか（`PortalRows::committed`。
+        // `PortalRows` を構築した Execute 呼び出し内で確定済みの値をそのまま
+        // 引き継ぐ）。以降のエンコード・IO 失敗はこの値に応じて
+        // `HandlerError::PostCommit` へ包む。
+        let committed = rows.committed;
+        let commit_wrap = |e: HandlerError| -> HandlerError {
+            if committed {
+                HandlerError::PostCommit(Box::new(e))
+            } else {
+                e
             }
         };
 
@@ -1501,10 +1619,14 @@ fn execute_portal(
         );
         for _ in 0..take {
             if let Some(frame) = rows.frames.pop_front() {
-                buffer.push_frame(stream, &frame).map_err(io_to_handler)?;
+                buffer
+                    .push_frame(stream, &frame)
+                    .map_err(|e| commit_wrap(io_to_handler(e)))?;
             }
             if buffer.len() >= MAX_RESPONSE_BUFFER_BYTES {
-                buffer.flush(stream).map_err(io_to_handler)?;
+                buffer
+                    .flush(stream)
+                    .map_err(|e| commit_wrap(io_to_handler(e)))?;
             }
         }
         rows.sent_so_far = rows.sent_so_far.saturating_add(take);
@@ -1518,15 +1640,21 @@ fn execute_portal(
             // `SELECT 5` であるべきで、直近バッチの `1` 件だけではない）。
             let tag = rows.shape.render(rows.sent_so_far);
             let msg = result_encoder::encode_command_complete(&tag)
-                .map_err(|_| internal_error("failed to encode command complete"))?;
-            buffer.push_frame(stream, &msg).map_err(io_to_handler)?;
-            buffer.flush(stream).map_err(io_to_handler)?;
+                .map_err(|_| commit_wrap(internal_error("failed to encode command complete")))?;
+            buffer
+                .push_frame(stream, &msg)
+                .map_err(|e| commit_wrap(io_to_handler(e)))?;
+            buffer
+                .flush(stream)
+                .map_err(|e| commit_wrap(io_to_handler(e)))?;
             Some(tag)
         } else {
             buffer
                 .push_frame(stream, &result_encoder::encode_portal_suspended())
-                .map_err(io_to_handler)?;
-            buffer.flush(stream).map_err(io_to_handler)?;
+                .map_err(|e| commit_wrap(io_to_handler(e)))?;
+            buffer
+                .flush(stream)
+                .map_err(|e| commit_wrap(io_to_handler(e)))?;
             None
         }
     };

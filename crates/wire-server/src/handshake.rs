@@ -473,12 +473,20 @@ fn post_auth_loop(
         // Sync（'S'）まで後続メッセージを破棄する「同期回復」モードに入る
         // （`extended_query` モジュールドキュメント「エラー後の同期回復」節）。
         // 'S' はここでは処理せず下の通常分岐へフォールスルーさせてフラグを
-        // 解除する。'X' は通常どおり終了する。COPY・FunctionCall・未知の型
-        // バイトは破棄対象にせず fail-closed に `reject_and_close`（既存の
-        // WIRE-8 契約のまま）。それ以外（'Q'/'P'/'D'/'B'/'E'/'C'/'H'）は
-        // 長さフィールドのみ検証して本文を読み捨て、応答を一切送らない。
+        // 解除する。'X' は通常の分岐（559 行目付近）と同じく length=4・body
+        // 厳密に空であることを検証してから終了する（PR #1013 レビュー指摘・
+        // codex P1: 検証を素通りする経路があると、長さフィールド欠落・不正長・
+        // 余剰 body を持つ malformed Terminate が「エラー後」という条件だけで
+        // 正規の Terminate として受理されてしまい、フレーミング検証契約が
+        // ignore_till_sync モードでだけ回避可能になる）。長さ検証自体が失敗
+        // した場合は通常の `X` 分岐と同じく `?` で fail-closed に伝播する。
+        // COPY・FunctionCall・未知の型バイトは破棄対象にせず fail-closed に
+        // `reject_and_close`（既存の WIRE-8 契約のまま）。それ以外
+        // （'Q'/'P'/'D'/'B'/'E'/'C'/'H'）は長さフィールドのみ検証して本文を
+        // 読み捨て、応答を一切送らない。
         if extended.ignore_till_sync && type_byte != b'S' {
             if type_byte == b'X' {
+                let _body = framing::read_length_prefixed_body(stream, 4, 4)?;
                 return Ok(());
             }
             let kind = crate::protocol_dispatch::classify(type_byte);
