@@ -3,9 +3,9 @@
 ## 文書の位置づけ
 
 本リポジトリで作業するすべての AI エージェント・人間レビュアーが共通で用いるレビュー観点集。
-Codex による PR 自動レビュー（`.github/workflows/codex-review.yml`。Fandhe-AI/actions の
-reusable workflow を `@latest` で呼び出す wrapper）は、**PR の base コミットの本ファイル**を
-レビュー基準として読む（本書の変更はマージ後の次の PR から実効）。
+ai-review（provider: codex）による PR 自動レビュー（`.github/workflows/ai-review.yml`。
+Fandhe-AI/actions の reusable workflow を `@latest` で呼び出す wrapper）は、**PR の base
+コミットの本ファイル**をレビュー基準として読む（本書の変更はマージ後の次の PR から実効）。
 
 本リポジトリは Rust 製ローカルファースト vector 特化クエリ DB の**実装リポジトリ（public）**
 である。仕様・ビヘイビア定義の唯一の正（SSOT）は private リポジトリ
@@ -78,7 +78,7 @@ reusable workflow を `@latest` で呼び出す wrapper）は、**PR の base �
   **`Fandhe-AI/actions`（組織内の上流リポジトリ）への参照は例外で、可変タグ `@latest` を
   使う**（組織方針。`@latest` への統一・SHA pin の除去を指摘しない）。
   public リポジトリのため runner は GitHub ホステッドを既定とし、self-hosted の使用は
-  codex-review の codex ジョブ（組織承認済み例外）に限る
+  ai-review の codex / review ジョブ（組織承認済み例外）に限る
 - **危険操作の混入（P1）**: `--no-verify`・force push・フック回避を促す/前提とする
   手順・スクリプトの追加
 
