@@ -88,6 +88,7 @@ pub mod bind_guard;
 pub(crate) mod copy;
 pub mod durability_opt;
 pub mod error_response;
+pub mod extended_query;
 #[cfg(feature = "fault-injection")]
 pub mod fault_injection;
 pub mod framing;

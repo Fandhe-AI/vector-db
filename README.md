@@ -316,7 +316,7 @@ perf 系 ADR・Issue が個別に定めてきた計測規約（交互実行・�
 `make bench-tier`（`crates/engine/benches/tier_latency_bench.rs`）は TASK-116（対象ビヘイビア: `docs/spec/04-behavior/query-planning.md` PLAN-4・PLAN-6・PLAN-7。判定内容・測定段階・数値基準は spec 側が SSOT であり本リポジトリには記載しません）の受け入れ基準を実測します。常駐 Ollama への実接続が前提です。
 
 > [!IMPORTANT]
-> `.github/workflows/bench.yml` に `bench-tier` ジョブは**置きません**。GitHub ホステッド runner には常駐 Ollama が無く、self-hosted runner の使用は codex-review の codex ジョブに限る組織承認済み例外の範囲外（AGENTS.md「CI・ワークフローの改変（P1）」。self-hosted 経路は過去の指摘により撤去済み）のため、CI 上のどの設定（opt-in の有無）でも実測を成功させる経路が存在しません（PR #269 Codex 指摘）。実測は本節の手順により GitHub Actions 外の承認済み計測環境で運用者が直接実行してください。これが TASK-116 受け入れ基準実測の正式な入口です。
+> `.github/workflows/bench.yml` に `bench-tier` ジョブは**置きません**。GitHub ホステッド runner には常駐 Ollama が無く、self-hosted runner の使用は ai-review の codex / review ジョブに限る組織承認済み例外の範囲外（AGENTS.md「CI・ワークフローの改変（P1）」。self-hosted 経路は過去の指摘により撤去済み）のため、CI 上のどの設定（opt-in の有無）でも実測を成功させる経路が存在しません（PR #269 Codex 指摘）。実測は本節の手順により GitHub Actions 外の承認済み計測環境で運用者が直接実行してください。これが TASK-116 受け入れ基準実測の正式な入口です。
 
 常駐 Ollama を持つ環境で `make bench-tier` を実行してください。必要な opt-in・接続・閾値 env の一覧（変数名と用途のみ。値は含みません）は `cargo bench --bench tier_latency_bench -p fandhe-vector-db-engine -- --help` で表示されます。未設定・不正値のまま opt-in（`BENCH_TIER` 設定）した場合は fail-closed で不足している env 名を含む明示エラーとして表示されます。値そのもの・p95 上限は spec 由来のため本リポジトリには記載しません。
 

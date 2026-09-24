@@ -333,6 +333,23 @@ pub fn reject_too_many_connections(mut stream: TcpStream, max: usize) {
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
+/// 接続単位の名前付き／無名ステートメント保持数の上限（Issue #933・TASK-71・
+/// WIRE-11。拡張クエリプロトコルの Parse。`extended_query::PreparedStatementStore`
+/// が超過を [`engine::error_format::ErrorClass::PayloadTooLarge`]（`54000`）で
+/// 拒否する。本リポの実装既定値（spec は数値までは定めない）。
+pub const MAX_PREPARED_STATEMENTS_PER_SESSION: usize = 64;
+
+/// ステートメント名の最大バイト長（Issue #933）。PostgreSQL の `NAMEDATALEN`
+/// （64。末尾 NUL 込み）と揃え、識別子として通用する実用上の長さに抑える。
+pub const MAX_STATEMENT_NAME_LEN: usize = 63;
+
+/// 接続単位で保持する Parse 済み SQL テキストの累計バイト数上限（Issue #933）。
+/// [`MAX_PREPARED_STATEMENTS_PER_SESSION`] 件 × 1 メッセージ上限
+/// （`framing::MAX_MESSAGE_LEN`）まで許すと 1 接続あたり数十 MiB を常駐しうるため、
+/// 個々のメッセージ長とは独立に接続単位の総量へ別途歯止めをかける
+/// （本リポの実装既定値）。
+pub const MAX_PREPARED_SQL_BYTES_PER_SESSION: usize = 4 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;

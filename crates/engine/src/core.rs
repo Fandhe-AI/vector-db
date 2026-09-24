@@ -1203,6 +1203,34 @@ pub enum CopyPlan {
     ),
 }
 
+/// [`EngineCore::parse_sql`] の結果（Issue #933・TASK-71・WIRE-11）。SQL テキストの
+/// 許可リスト検証（`sql::allowlist` の各 `validate_*`）を通過した束縛前の構文形を
+/// 一意に運ぶ。行・台帳・世代のいずれにも触れておらず、
+/// [`EngineCore::execute_parsed_in_session`]（実行）・
+/// [`EngineCore::describe_parsed_in_session`]（結果列メタデータの導出）の
+/// いずれの入力にもなる（拡張クエリプロトコルの Parse が構築し、Describe・
+/// Execute の双方が同じ値を再利用できるようにするための型。#934 の Execute が
+/// 実際にこの再利用を行う）。
+///
+/// `#[non_exhaustive]`: 将来の許可形状追加（新しい DML・DDL 相当の文種別）で
+/// variant を増やしても、クレート外の網羅 `match` を破壊的変更にしないため。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ParsedSql {
+    /// `SELECT`／`SET search_mode`／`CREATE FUNCTION`／`EXPLAIN`（許可リスト
+    /// 検証は `sql::allowlist::validate_sql` が担う）。
+    Statement(crate::sql::allowlist::Statement),
+    /// `INSERT`（単一行・複数行 `VALUES`・`ON CONFLICT`・`RETURNING` を含む。
+    /// SQL-10・SQL-16・SQL-20・SQL-21）。
+    Insert(crate::sql::allowlist::ValidatedInsert),
+    /// `TRUNCATE TABLE ... USING OPERATION_ID '<id>'`（SQL-22）。
+    Truncate(crate::sql::allowlist::ValidatedTruncate),
+    /// `DELETE`（単一行・`id` 完全一致形／述語形。SQL-18・SQL-19）。
+    Delete(crate::sql::allowlist::DeleteStatement),
+    /// `UPDATE`（単一行・`id` 完全一致形／述語形。SQL-17・SQL-19）。
+    Update(crate::sql::allowlist::ValidatedUpdateForm),
+}
+
 struct InsertSchemaLookup<'a> {
     storage: &'a Storage,
     cached: std::cell::RefCell<Option<(String, TableSchema)>>,
@@ -2148,38 +2176,22 @@ impl EngineCore {
         Ok((read_txn, schema))
     }
 
-    pub fn execute_sql_in_session(
+    /// SQL テキストを許可リスト検証だけ行い、実行（行・台帳・世代への到達）は
+    /// 一切行わない入口（Issue #933・TASK-71・WIRE-11。拡張クエリプロトコルの
+    /// Parse／Describe が Execute から分離して呼べるようにするための分割）。
+    /// [`Self::execute_sql_in_session`] はこの結果をそのまま
+    /// [`Self::execute_parsed_in_session`] へ渡すだけの合成になっており、
+    /// 検証の判定順序・エラー分類は本メソッド分割の前後で一切変わらない。
+    ///
+    /// `INSERT`／`TRUNCATE`／`DELETE`／`UPDATE` は `sql::allowlist::validate_sql`
+    /// の許可形状に含まれないため、先頭トークンだけを覗いて専用の
+    /// `validate_*_tokens` 系関数へ振り分ける（`execute_sql_in_session` が従来
+    /// 行っていた分岐をそのまま移設。各分岐のコメント・Issue ポインタは移設元と
+    /// 同一）。
+    pub fn parse_sql(
         &self,
-        ctx: &PolicyContext,
-        session: &mut crate::sql::mode::SessionState,
         sql: &str,
-    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        // TASK-82（SQL-10）: セッション経由の SQL 実行経路へ `INSERT` を接続する。
-        // `sql::allowlist::validate_sql` は SELECT／SET／CREATE FUNCTION／EXPLAIN
-        // のみを受理し `INSERT` を許可形状に含めない（`INSERT` は
-        // `sql::allowlist::validate_insert`（TASK-80）が独立した専用検証経路を
-        // 持つため。`validate_insert` のドキュメント参照）。ここでは
-        // `validate_sql` を呼ぶ前に先頭トークンだけを覗いて `INSERT` を検出し、
-        // 検出した場合は本メソッドの残りをスキップして既存の
-        // [`Self::execute_insert_sql`]（`validate_insert` → `bind_insert_form` →
-        // 行形/ファイル形実行。`self.ledger_mode` を尊重）へそのまま委譲する
-        // （検証・実行本体の二重実装を避ける）。`EXPLAIN` の前置（`EXPLAIN
-        // INSERT ...`）は先頭トークンが `INSERT` ではなく `EXPLAIN` になるため
-        // ここでは捕捉されず、後続の `validate_sql` の `EXPLAIN` 分岐（次の
-        // トークンが `SELECT` であることを要求）へ流れて `42601` で拒否される
-        // （挙動は本変更の前後で不変）。検索モード句（`USING MODE` 等）は
-        // `INSERT` の許可形状に存在しないため `validate_insert` 側の構文検証で
-        // 同じく拒否される。
-        //
-        // Issue #485: 覗き見トークナイズの結果（`tokens`）を捨てずに保持し、
-        // `INSERT` と判定した場合は `validate_insert_tokens` へそのまま渡す
-        // ことで、1 文あたり `tokenize` を 1 回に減らす（以前は本判定用と
-        // `execute_insert_sql`（`validate_insert`）内の 2 回呼んでいた）。
-        // トークナイズ自体が失敗した場合（`tokens` が `Err`）は分岐せず
-        // `validate_sql` へフォールスルーし、同一入力に対して同じ構文エラーを
-        // 返す（fail-closed。この経路では `tokenize` が結局 2 回目走るが、
-        // 構文エラーとなる入力は稀であり untrusted 入力の長さは wire 層で
-        // 既に上限検証済みのため許容する）。
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         if let Ok(tokens) = crate::sql::lexer::tokenize(sql) {
             let is_insert_statement = matches!(
                 tokens.first(),
@@ -2192,23 +2204,9 @@ impl EngineCore {
                     &lookup,
                     self.ledger_mode,
                 )?;
-                // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路
-                // 専用（`execute_insert_sql`／`execute_insert_sql_batch` は
-                // 検証直後に `42601` で拒否する。`Self` モジュールドキュメント
-                // 参照）。
-                if stmt.returning.is_some() {
-                    let outcome = self.execute_insert_returning_form(ctx, &stmt, &lookup)?;
-                    return Ok(crate::sql::SqlOutcome::Returning(outcome));
-                }
-                let outcome = self.execute_insert_form(ctx, &stmt, &lookup)?;
-                return Ok(crate::sql::SqlOutcome::Insert(outcome));
+                return Ok(ParsedSql::Insert(stmt));
             }
 
-            // TASK-195（SQL-22）: `INSERT` と同じ設計で `TRUNCATE` を覗き見判定する。
-            // `EXPLAIN TRUNCATE ...` は先頭トークンが `TRUNCATE` ではなく `EXPLAIN` に
-            // なるため、ここでは捕捉されず後続の `validate_sql` の `EXPLAIN` 分岐
-            // （次のトークンが `SELECT` であることを要求）へ流れて `42601` で拒否
-            // される（`INSERT` の既存コメント「Issue #485」節と同じ経路）。
             let is_truncate_statement = matches!(
                 tokens.first(),
                 Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("TRUNCATE")
@@ -2219,24 +2217,9 @@ impl EngineCore {
                     &self.storage,
                     self.ledger_mode,
                 )?;
-                let outcome = self.execute_truncate_form(ctx, &stmt)?;
-                return Ok(crate::sql::SqlOutcome::Truncate(outcome));
+                return Ok(ParsedSql::Truncate(stmt));
             }
 
-            // SQL-18（TASK-191・#867）・SQL-19（TASK-192、Issue #870・#871）:
-            // `INSERT`／`TRUNCATE` と同じ設計で `DELETE` を覗き見判定する。
-            // `EXPLAIN DELETE ...` は先頭トークンが `DELETE` ではなく `EXPLAIN`
-            // になるためここでは捕捉されず、後続の `validate_sql` の `EXPLAIN`
-            // 分岐〔次のトークンが `SELECT` であることを要求〕へ流れて `42601`
-            // で拒否される（`INSERT`・`TRUNCATE` の既存コメントと同じ経路）。
-            //
-            // 単一行・`id` 完全一致形（[`crate::sql::allowlist::validate_delete_tokens`]
-            // 専用の入口。既存 [`Self::execute_delete_sql`] が使う）ではなく、
-            // 述語形も受理する [`crate::sql::allowlist::validate_delete_statement_tokens`]
-            // （Issue #870）へ切り替え、[`crate::sql::allowlist::DeleteStatement`]
-            // の variant で実行本体を振り分ける（Issue #871。単一行形は既存
-            // `execute_delete_form` へ委譲し挙動不変、述語形は新設
-            // [`Self::execute_predicate_delete_form`] へ委譲する）。
             let is_delete_statement = matches!(
                 tokens.first(),
                 Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DELETE")
@@ -2247,42 +2230,9 @@ impl EngineCore {
                     &self.storage,
                     self.ledger_mode,
                 )?;
-                // 単一行形（[`crate::sql::allowlist::ValidatedDelete`]）は
-                // `RETURNING`（Issue #873・SQL-21）を保持しうるためここで
-                // 分岐する（`execute_delete_sql` は検証直後に `42601` で拒否
-                // する非セッション経路。`Self` モジュールドキュメント参照）。
-                // 述語形（[`crate::sql::allowlist::ValidatedPredicateDelete`]）
-                // は構造検証段（`validate_delete_statement_tokens`）で
-                // `RETURNING` 併用を既に `42601` 拒否済みのため常に
-                // `execute_predicate_delete_form` へ委譲する（Issue #871）。
-                match stmt {
-                    crate::sql::allowlist::DeleteStatement::SingleRow(v) => {
-                        if v.returning.is_some() {
-                            let outcome = self.execute_delete_returning_form(ctx, &v)?;
-                            return Ok(crate::sql::SqlOutcome::Returning(outcome));
-                        }
-                        let outcome = self.execute_delete_form(ctx, &v)?;
-                        return Ok(crate::sql::SqlOutcome::Delete(outcome));
-                    }
-                    crate::sql::allowlist::DeleteStatement::Predicate(v) => {
-                        let outcome = self.execute_predicate_delete_form(ctx, session, &v)?;
-                        return Ok(crate::sql::SqlOutcome::Delete(outcome));
-                    }
-                }
+                return Ok(ParsedSql::Delete(stmt));
             }
 
-            // SQL-17（Issue #865・TASK-191。単一行・id 完全一致形）・SQL-19
-            // （TASK-192、Issue #869・#871。述語形 `UPDATE ... WHERE`）:
-            // `INSERT`・`TRUNCATE`・`DELETE` と同じ設計で `UPDATE` を覗き見判定
-            // する。単一行・述語形の両方を構造的に受理する
-            // `validate_update_form_tokens` へ一本化し、
-            // [`crate::sql::allowlist::ValidatedUpdateForm`] の variant で実行
-            // 本体を [`Self::execute_predicate_update_form`] 内で振り分ける
-            // （`Single` 腕は Issue #865 の単一行実行結線・`Predicate` 腕は
-            // Issue #871 の述語形実行結線。`docs/design/predicate-dml-exec.md`
-            // 「PR #989 との整合ルール」参照）。`EXPLAIN UPDATE ...` は先頭
-            // トークンが `UPDATE` ではなく `EXPLAIN` になるためここでは捕捉
-            // されず、`DELETE`・`TRUNCATE` と同じ経路で `42601` へ流れる。
             let is_update_statement = matches!(
                 tokens.first(),
                 Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("UPDATE")
@@ -2293,13 +2243,211 @@ impl EngineCore {
                     &self.storage,
                     self.ledger_mode,
                 )?;
-                let outcome = self.execute_predicate_update_form(ctx, session, &stmt)?;
-                return Ok(crate::sql::SqlOutcome::Update(outcome));
+                return Ok(ParsedSql::Update(stmt));
             }
         }
 
         let stmt = crate::sql::allowlist::validate_sql(sql, &self.storage)?;
-        self.execute_validated_in_session(ctx, session, stmt)
+        Ok(ParsedSql::Statement(stmt))
+    }
+
+    /// [`Self::parse_sql`] が返した [`ParsedSql`] を実行する（Issue #933・
+    /// TASK-71・WIRE-11。拡張クエリプロトコルの Execute（#934）がそのまま使う
+    /// 単一の実行入口——SQL テキスト経由・束縛済み計画経由で第 2 の実行器を
+    /// 作らない設計を踏襲する）。各分岐は [`Self::execute_sql_in_session`] が
+    /// 従来インライン実行していた本体をそのまま移設したもので、実行順序・
+    /// エラー契約は不変。
+    pub fn execute_parsed_in_session(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        parsed: &ParsedSql,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        match parsed {
+            ParsedSql::Insert(stmt) => {
+                // Issue #933: Parse 時点のスキーマキャッシュ（`InsertSchemaLookup`）
+                // は Execute まで持ち越さない——Parse／Execute が時間的に分離しうる
+                // 拡張クエリプロトコル（#934 の Execute）では、Execute 時点の
+                // 最新スキーマを使う契約に揃える（`execute_sql_in_session` の
+                // 単発合成でも実質的に同じタイミングで新規構築するため挙動は不変）。
+                let lookup = InsertSchemaLookup::new(&self.storage);
+                // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路
+                // 専用（`execute_insert_sql`／`execute_insert_sql_batch` は
+                // 検証直後に `42601` で拒否する。`Self` モジュールドキュメント
+                // 参照）。
+                if stmt.returning.is_some() {
+                    let outcome = self.execute_insert_returning_form(ctx, stmt, &lookup)?;
+                    return Ok(crate::sql::SqlOutcome::Returning(outcome));
+                }
+                let outcome = self.execute_insert_form(ctx, stmt, &lookup)?;
+                Ok(crate::sql::SqlOutcome::Insert(outcome))
+            }
+            ParsedSql::Truncate(stmt) => {
+                let outcome = self.execute_truncate_form(ctx, stmt)?;
+                Ok(crate::sql::SqlOutcome::Truncate(outcome))
+            }
+            ParsedSql::Delete(stmt) => match stmt {
+                // 単一行形（[`crate::sql::allowlist::ValidatedDelete`]）は
+                // `RETURNING`（Issue #873・SQL-21）を保持しうるためここで
+                // 分岐する（`execute_delete_sql` は検証直後に `42601` で拒否
+                // する非セッション経路。`Self` モジュールドキュメント参照）。
+                // 述語形（[`crate::sql::allowlist::ValidatedPredicateDelete`]）
+                // は構造検証段（`validate_delete_statement_tokens`）で
+                // `RETURNING` 併用を既に `42601` 拒否済みのため常に
+                // `execute_predicate_delete_form` へ委譲する（Issue #871）。
+                crate::sql::allowlist::DeleteStatement::SingleRow(v) => {
+                    if v.returning.is_some() {
+                        let outcome = self.execute_delete_returning_form(ctx, v)?;
+                        return Ok(crate::sql::SqlOutcome::Returning(outcome));
+                    }
+                    let outcome = self.execute_delete_form(ctx, v)?;
+                    Ok(crate::sql::SqlOutcome::Delete(outcome))
+                }
+                crate::sql::allowlist::DeleteStatement::Predicate(v) => {
+                    let outcome = self.execute_predicate_delete_form(ctx, session, v)?;
+                    Ok(crate::sql::SqlOutcome::Delete(outcome))
+                }
+            },
+            ParsedSql::Update(stmt) => {
+                let outcome = self.execute_predicate_update_form(ctx, session, stmt)?;
+                Ok(crate::sql::SqlOutcome::Update(outcome))
+            }
+            ParsedSql::Statement(stmt) => {
+                self.execute_validated_in_session(ctx, session, stmt.clone())
+            }
+        }
+    }
+
+    /// SQL テキストを検証・束縛・実行まで単発で行う従来の入口（TASK-73・WIRE-1。
+    /// 簡易クエリプロトコルから呼ばれる）。[`Self::parse_sql`]（検証のみ）と
+    /// [`Self::execute_parsed_in_session`]（実行のみ）の合成であり、Issue #933
+    /// による分割の前後でこの関数自体の判定順序・エラー契約・実行結果は不変
+    /// （両メソッドの移設元コメント参照）。
+    pub fn execute_sql_in_session(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        sql: &str,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let parsed = self.parse_sql(sql)?;
+        self.execute_parsed_in_session(ctx, session, &parsed)
+    }
+
+    /// Describe（拡張クエリプロトコルの 'D' 種別 S。Issue #933・TASK-71・
+    /// WIRE-11）が返す結果列メタデータを、[`Self::parse_sql`] の結果から検索・
+    /// 集計・広域取得の本体を一切実行せずに導出する。`None` は「結果列を持たない
+    /// 文」（`CommandComplete` のみを返す DML・`SET`・`CREATE FUNCTION`）を表し、
+    /// wire 層はこれを `NoData` へ写像する契約。
+    ///
+    /// 行・台帳・世代のいずれにも触れない（`INSERT`／`UPDATE`／`DELETE`／
+    /// `TRUNCATE` は `RETURNING` の投影束縛のみを行い、実際の書き込みは行わない）。
+    /// `USING PLAN` 経由の `SELECT` は投影列の束縛のみを行い、`plan_query`・
+    /// `Embedder::embed_batch` 等の LLM／埋め込み I/O は一切呼ばない
+    /// （Describe を LLM コスト増幅の DoS 経路にしないための契約）。
+    pub fn describe_parsed_in_session(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        parsed: &ParsedSql,
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        use crate::sql::allowlist::{DeleteStatement, Statement, ValidatedUpdateForm};
+
+        match parsed {
+            ParsedSql::Insert(stmt) => {
+                let (_read_txn, schema) = self.read_txn_with_schema(&stmt.table_name)?;
+                match crate::sql::parser::bind_returning(stmt.returning.as_ref(), &schema)? {
+                    Some(projection) => Ok(Some(crate::sql::returning::column_meta(
+                        &projection,
+                        &schema,
+                    )?)),
+                    None => Ok(None),
+                }
+            }
+            ParsedSql::Truncate(_) => Ok(None),
+            ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
+                let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
+                match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {
+                    Some(projection) => Ok(Some(crate::sql::returning::column_meta(
+                        &projection,
+                        &schema,
+                    )?)),
+                    None => Ok(None),
+                }
+            }
+            // 述語形 `DELETE ... WHERE` は構造検証段で `RETURNING` 併用を常に
+            // `42601` 拒否済みのため（`ValidatedPredicateDelete` は `returning`
+            // フィールド自体を持たない）、結果列は常に持たない。
+            ParsedSql::Delete(DeleteStatement::Predicate(_)) => Ok(None),
+            // `UPDATE` は `RETURNING` の実行結線が未着手のため、構造検証段
+            // （`validate_update_form_tokens`）が単一行・述語形のいずれでも
+            // `RETURNING` 併用を常に `42601` 拒否する（`ValidatedUpdate::
+            // returning` ドキュメント参照）。結果列は常に持たない。
+            ParsedSql::Update(ValidatedUpdateForm::Single(_))
+            | ParsedSql::Update(ValidatedUpdateForm::Predicate(_)) => Ok(None),
+            ParsedSql::Statement(Statement::SetSearchMode { .. }) => Ok(None),
+            ParsedSql::Statement(Statement::CreateFunction { .. }) => Ok(None),
+            // `EXPLAIN` は常に単一の `Computed` 列（`QUERY PLAN`）を返す
+            // （`sql::explain::build_explain_result` と同一の列。中身の生成には
+            // 検索本体の実行が必要だが、列自体は入力文の内容によらず固定のため
+            // Describe はプラン実行を一切行わずに列だけを返せる）。
+            ParsedSql::Statement(Statement::Explain(_)) => {
+                Ok(Some(vec![crate::sql::exec::ColumnMeta::Computed {
+                    name: crate::sql::explain::QUERY_PLAN_COLUMN.to_string(),
+                }]))
+            }
+            ParsedSql::Statement(Statement::Aggregate(validated)) => {
+                let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+                let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
+                Ok(Some(crate::sql::describe::aggregate_columns(
+                    &bound.projection,
+                )))
+            }
+            ParsedSql::Statement(Statement::Scan(validated)) => {
+                let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+                let bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
+                Ok(Some(crate::sql::describe::projected_columns(
+                    bound.projection(),
+                    &schema,
+                )))
+            }
+            ParsedSql::Statement(Statement::Select(validated)) => {
+                let (_read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+                if validated.using_plan().is_some() {
+                    // `USING PLAN`: LLM 展開・再埋め込み（`plan_query`・
+                    // `Embedder::embed_batch`）は行わず、投影列の束縛のみを行う
+                    // （`sql::using_plan::pre_check_bindable` が I/O 前に行う
+                    // 検証の一部——`bind_projection` 呼び出し——と同じ経路。
+                    // 投影列自体は LLM 展開結果に依存しないため、この検証だけで
+                    // Describe の結果列を確定できる）。
+                    if let Some(literal) = validated.search_mode() {
+                        crate::sql::mode::SearchMode::parse_literal(literal)?;
+                    }
+                    crate::sql::parser::vector_column(&schema)?;
+                    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+                    let projection = crate::sql::parser::bind_projection(
+                        validated.projection(),
+                        &schema,
+                        session.udfs(),
+                        &mut node_budget,
+                    )?;
+                    Ok(Some(crate::sql::describe::projected_columns(
+                        &projection,
+                        &schema,
+                    )))
+                } else {
+                    let bound = crate::sql::parser::bind_in_session(
+                        validated,
+                        &schema,
+                        session.search_mode(),
+                        session.udfs(),
+                    )?;
+                    Ok(Some(crate::sql::describe::projected_columns(
+                        bound.projection(),
+                        &schema,
+                    )))
+                }
+            }
+        }
     }
 
     /// [`Self::execute_sql_in_session`] の実行本体。`validate_sql` 済みの

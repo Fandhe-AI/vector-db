@@ -47,7 +47,11 @@ use crate::sql::scalar_plan::{classify_scalar_plan, ScalarPlan, ScalarShapeInput
 use crate::sql::udf_call::BoundExpr;
 
 /// `EXPLAIN` 応答の列名（安定契約。一度出したら変えない）。
-const QUERY_PLAN_COLUMN: &str = "QUERY PLAN";
+/// `EXPLAIN` の唯一の結果列名。`core.rs::EngineCore::describe_parsed_in_session`
+/// （Issue #933・TASK-71・WIRE-11）が Describe（'D' 種別 S）の応答をプラン本体を
+/// 実行せずに組み立てるため `pub(crate)` へ昇格した（実行結果に依存しない固定値
+/// のため、Describe 側は本定数を直接参照するだけで済む）。
+pub(crate) const QUERY_PLAN_COLUMN: &str = "QUERY PLAN";
 
 /// ソフトヒント未指定時の固定表記（安定契約）。
 const NONE_LABEL: &str = "(none)";
