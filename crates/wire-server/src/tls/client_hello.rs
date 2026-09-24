@@ -516,7 +516,9 @@ fn find_x25519_key_share(
 /// 同一 `name_type`（`host_name` に限らずいずれの型でも）が重複していれば
 /// `IllegalParameter`（RFC 6066 §3「同一 name_type は 1 つまで」は
 /// `host_name` 限定の制約ではない）。未知の name_type は不透明データとして
-/// 読み飛ばす。
+/// 読み飛ばす。`host_name` は [`validate_host_name`] で構文検証してから
+/// 返す（受理したまま未検証のバイト列を上位へ渡さない。codex-review
+/// PR #1022 P1 指摘）。
 fn parse_server_name(data: &[u8]) -> Result<Option<Vec<u8>>, ClientHelloError> {
     let mut r = Reader::new(data);
     let list = r.vec_u16_len(1, 0xFFFF)?;
@@ -533,10 +535,85 @@ fn parse_server_name(data: &[u8]) -> Result<Option<Vec<u8>>, ClientHelloError> {
             ));
         }
         if name_type == 0 {
+            validate_host_name(name)?;
             host_name = Some(name.to_vec());
         }
     }
     Ok(host_name)
+}
+
+/// `host_name`（RFC 6066 §3. DNS ホスト名。RFC 1034 準拠）の構文を検証する。
+/// RFC 6066 §3 は「literal IPv4 and IPv6 addresses are not permitted in
+/// "HostName"」と明記しており、DNS ホスト名として無効な値（IP リテラル・
+/// 空ラベル・ラベル内の許可されない文字・全長超過等）は fail-closed に
+/// `IllegalParameter` として拒否する（codex-review PR #1022 P1 指摘。
+/// 未検証のバイト列を選択・ログ出力に使わない設計自体は不変。
+/// [`NegotiatedClientHello::server_name`] のドキュメントコメント参照）。
+fn validate_host_name(name: &[u8]) -> Result<(), ClientHelloError> {
+    if name.is_empty() || name.len() > 253 {
+        return Err(ClientHelloError::IllegalParameter(
+            "server_name host_name length must be 1..=253 bytes",
+        ));
+    }
+    if !name.is_ascii() {
+        return Err(ClientHelloError::IllegalParameter(
+            "server_name host_name must consist of ASCII bytes",
+        ));
+    }
+    if name.ends_with(b".") {
+        return Err(ClientHelloError::IllegalParameter(
+            "server_name host_name must not end with a trailing dot",
+        ));
+    }
+    if is_ip_literal(name) {
+        return Err(ClientHelloError::IllegalParameter(
+            "server_name host_name must not be an IPv4/IPv6 literal",
+        ));
+    }
+    for label in name.split(|&b| b == b'.') {
+        if label.is_empty() {
+            return Err(ClientHelloError::IllegalParameter(
+                "server_name host_name must not contain an empty label",
+            ));
+        }
+        if label.len() > 63 {
+            return Err(ClientHelloError::IllegalParameter(
+                "server_name host_name label must be 1..=63 bytes",
+            ));
+        }
+        if label.first() == Some(&b'-') || label.last() == Some(&b'-') {
+            return Err(ClientHelloError::IllegalParameter(
+                "server_name host_name label must not start or end with a hyphen",
+            ));
+        }
+        if !label
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(ClientHelloError::IllegalParameter(
+                "server_name host_name label must contain only ASCII alphanumerics and hyphens",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `name` が IPv4／IPv6 の literal アドレス表記であるかを判定する
+/// （RFC 6066 §3 は `HostName` に IP リテラルを許可しない）。IPv6 は
+/// `:` を含むことで判定し（DNS ホスト名のラベルは `:` を許可しない）、
+/// IPv4 はドット区切り 4 要素すべてが数字のみのラベルであることで判定
+/// する（`999.999.999.999` のような桁数・値域違反も、DNS ホスト名としての
+/// 妥当性検査ではなく「数字のみの 4 ラベル」という形自体を IP リテラルの
+/// 試みとみなして拒否する。数値域の妥当性まで見る必要はない）。
+fn is_ip_literal(name: &[u8]) -> bool {
+    if name.contains(&b':') {
+        return true;
+    }
+    let labels: Vec<&[u8]> = name.split(|&b| b == b'.').collect();
+    labels.len() == 4
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.iter().all(u8::is_ascii_digit))
 }
 
 /// `legacy_compression_methods` が `[0x00]` ちょうどであることを検証する
@@ -1329,6 +1406,124 @@ mod tests {
             data,
         ));
         assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    /// `server_name`（ClientHello 形）の `host_name` エントリ 1 件だけを
+    /// 持つ拡張データを構築するテスト専用ヘルパー。
+    fn host_name_data(name: &[u8]) -> Vec<u8> {
+        let mut entry = Vec::new();
+        entry.push(0); // name_type = host_name
+        entry.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        entry.extend_from_slice(name);
+        let mut data = Vec::new();
+        data.extend_from_slice(&(entry.len() as u16).to_be_bytes());
+        data.extend_from_slice(&entry);
+        data
+    }
+
+    fn with_host_name(name: &[u8]) -> handshake::ClientHello {
+        with_ed25519_sig_alg(replace_extension_data(
+            rfc8448_client_hello(),
+            EXT_SERVER_NAME,
+            host_name_data(name),
+        ))
+    }
+
+    // ---- codex-review PR #1022 P1 指摘の回帰テスト
+    //      （server_name host_name の RFC 6066 §3 構文検証） ----
+
+    #[test]
+    fn host_name_ipv4_literal_is_illegal_parameter() {
+        // RFC 6066 §3: literal IPv4 addresses are not permitted in
+        // "HostName"。
+        let ch = with_host_name(b"192.168.0.1");
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn host_name_ipv6_literal_is_illegal_parameter() {
+        // RFC 6066 §3: literal IPv6 addresses are not permitted either。
+        // ':' を含む DNS ホスト名は存在しないため IPv6 リテラルとみなす。
+        let ch = with_host_name(b"::1");
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn host_name_trailing_dot_is_illegal_parameter() {
+        let ch = with_host_name(b"example.com.");
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn host_name_empty_label_is_illegal_parameter() {
+        let ch = with_host_name(b"example..com");
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn host_name_label_starting_with_hyphen_is_illegal_parameter() {
+        let ch = with_host_name(b"-example.com");
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn host_name_label_ending_with_hyphen_is_illegal_parameter() {
+        let ch = with_host_name(b"example-.com");
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn host_name_label_too_long_is_illegal_parameter() {
+        // ラベルは 1..=63 バイト（RFC 1034）。64 バイトは超過。
+        let label = vec![b'a'; 64];
+        let name = [label.as_slice(), b".com"].concat();
+        let ch = with_host_name(&name);
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn host_name_non_ascii_is_illegal_parameter() {
+        let ch = with_host_name(&[b'a', 0x80, b'b']);
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn host_name_total_length_over_253_is_illegal_parameter() {
+        // 全長は 1..=253 バイト（RFC 1034）。63 バイトラベルを 4 つ・区切り
+        // ドットを挟むと 63*4+3=255 バイトとなり上限超過。
+        let label = vec![b'a'; 63];
+        let name = [
+            label.as_slice(),
+            b".",
+            label.as_slice(),
+            b".",
+            label.as_slice(),
+            b".",
+            label.as_slice(),
+        ]
+        .concat();
+        assert!(name.len() > 253);
+        let ch = with_host_name(&name);
+        assert_rejected(&ch, AlertDescription::IllegalParameter);
+    }
+
+    #[test]
+    fn host_name_valid_dns_names_are_accepted() {
+        // 通常の DNS ホスト名（サブドメイン・ハイフンを含むラベル・単一
+        // ラベル）は引き続き受理される。
+        for name in [
+            b"example.com".as_slice(),
+            b"www.example.co.jp".as_slice(),
+            b"my-host.example.com".as_slice(),
+            b"localhost".as_slice(),
+        ] {
+            let ch = with_host_name(name);
+            let decision = negotiate(&ch, None).expect("valid host_name must be accepted");
+            let ClientHelloDecision::Accept(negotiated) = decision else {
+                panic!("must be Accept");
+            };
+            assert_eq!(negotiated.server_name, Some(name.to_vec()));
+        }
     }
 
     #[test]
