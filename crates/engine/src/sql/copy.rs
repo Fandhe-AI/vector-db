@@ -213,7 +213,17 @@ impl CsvRecordScanner {
                 "unterminated quoted CSV field in COPY record",
             ));
         }
-        if self.field.is_empty() && self.fields.is_empty() {
+        // 「新規レコードとして何も消費していない」を判定する条件は
+        // `Start` 状態（かつ既に確定済みフィールドが無い）ことであって、
+        // `field` が空であることではない。`""`（引用符で囲まれた空文字列）
+        // が改行なしで終わった場合、閉じ引用符の直後（`AfterQuote` 状態）で
+        // は `field` が空のまま・`fields` も空のままだが、これはレコードが
+        // 存在する（`Some("")` になるべき）ケースであり、旧
+        // `field.is_empty() && fields.is_empty()` 判定では誤って「レコード
+        // なし」（`None`）に落ち、行が無言で消失していた（advisor 指摘。
+        // 旧 `decode_csv_record(b"\"\"")` は `[Some("")]` を返していたため、
+        // これは本モジュール導入時の回帰だった）。
+        if self.state == CsvFieldState::Start && self.fields.is_empty() {
             return Ok(None);
         }
         self.push_field()?;
@@ -842,6 +852,36 @@ mod tests {
     fn csv_record_scanner_unescapes_doubled_quotes() {
         let fields = scan_csv_record(b"\"a\"\"b\"\n").unwrap();
         assert_eq!(fields, vec![Some("a\"b".to_string())]);
+    }
+
+    // advisor 指摘の回帰防止: 改行なしで終わった末尾レコードが `""`
+    // （引用符で囲まれた空文字列）だけの場合、`finish` の「新規レコードを
+    // 何も消費していない」判定が誤って `field.is_empty()` を見ていたため、
+    // `AfterQuote` 状態で `field` が空のまま行が無言で消失していた。
+    #[test]
+    fn csv_record_scanner_finish_without_trailing_newline_keeps_quoted_empty_string() {
+        let mut scanner = CsvRecordScanner::new();
+        for &b in b"\"\"" {
+            assert!(!scanner.push_byte(b).unwrap());
+        }
+        let fields = scanner
+            .finish()
+            .unwrap()
+            .expect("record must not be dropped");
+        assert_eq!(fields, vec![Some(String::new())]);
+    }
+
+    #[test]
+    fn csv_record_scanner_finish_without_trailing_newline_keeps_trailing_quoted_empty_field() {
+        let mut scanner = CsvRecordScanner::new();
+        for &b in b"a,\"\"" {
+            assert!(!scanner.push_byte(b).unwrap());
+        }
+        let fields = scanner
+            .finish()
+            .unwrap()
+            .expect("record must not be dropped");
+        assert_eq!(fields, vec![Some("a".to_string()), Some(String::new())]);
     }
 
     #[test]
