@@ -14,15 +14,10 @@ wire-server の `RowDescription`／`DataRow` は format code フィールドが 
 ／バイナリ形式を要求できるが、その要求は拡張クエリプロトコルの **Bind**
 メッセージでのみ行われる。
 
-## スコープを 2 フェーズへ分けた理由
+## スコープ（Phase A / Phase B）
 
-Bind／Execute（Issue #934）・Parse／Describe（Issue #933）はいずれも本 Issue
-時点で未実装であり、`protocol_dispatch::classify` は `'B'` を拡張クエリ
-プロトコルとして分類し `0A000` で接続を閉じる（WIRE-8）。型 OID の拡張
-（`id` → `int8` 等。Issue #895・WIRE-13）も別 Issue の担当。
-
-このため、実際に wire 経由でバイナリ形式を要求して値を受け取るところまでは
-本 Issue 単独では到達できない。範囲を次の 2 つに分けた。
+Bind／Execute（Issue #934）・Parse／Describe（Issue #933）・型 OID の拡張
+（Issue #895・WIRE-13）はいずれも本 Issue 時点では別 Issue の担当（未実装）。
 
 - **Phase A（本 Issue）**: `result_encoder.rs` に置く純関数のエンコーダ層
   （形式コードの解決・対応型の事前検査・型ごとのバイナリレイアウト・
@@ -52,10 +47,8 @@ PostgreSQL の Bind 規則に従う。
 | それ以外 | `BinaryFormatError::FormatCountMismatch`（`08P01`） |
 | 値が {0, 1} 以外 | `BinaryFormatError::InvalidFormatCode`（`08P01`） |
 
-PostgreSQL 本体は不正な format code 値を `22023` で返すが、本リポの
-`ErrorClass::OperationIdContentMismatch` が `22023` を専有しており意味が
-異なるため、`ErrorClass` を増やさず本モジュールの fail-closed 方針（構文
-違反は `08P01`）に寄せた。
+不正な format code 値は本リポの既存エラー分類との整合上 `08P01` へ寄せた
+（詳細は WIRE-14 参照）。
 
 解決結果 `Vec<FormatCode>` の長さは列数（`i16` で有界）にのみ比例する。
 `codes` スライス自体の長さ上限検証は、untrusted な Bind 本文を解析する側
@@ -71,16 +64,12 @@ PostgreSQL 本体は不正な format code 値を `22023` で返すが、本リ�
 判定は公告型（`ColumnMeta`／`WireType`）で静的に行い、実行時の `Cell` では
 判定しない。
 
-| 列 | 公告 OID | バイナリ可否 | 根拠 |
-| --- | --- | --- | --- |
-| `ColumnMeta::Id` | numeric（1700） | **非対応 → `0A000`** | 実装上の判断（詳細は WIRE-14 参照）。#895 で `int8` に変わったら対応する |
-| `Scalar{ty: Text}` | text（25） | 対応（UTF-8 生バイト） | PostgreSQL の text send と同じ |
-| `Scalar{ty: Vector(_)}` | text（25） | **非対応 → `0A000`** | 実装上の判断（詳細は WIRE-14 参照）。公告が text だからといって `[1,2.5]` の文字列をそのまま送らない |
-| `ColumnMeta::Computed` | text（25） | **非対応 → `0A000`（fail-closed）** | 実行時の型（Float／Bool／Vector）が静的に決まらず、事前検査で `VECTOR` を除外できないための fail-closed 判断。#895 で型が付いたら見直す |
-
-**`VECTOR` 列のバイナリ表現**: 本実装ではバイナリ非対応として `0A000` で
-拒否する（独自のバイナリ表現〔float4 配列など〕は定義しない。詳細は
-spec のビヘイビア定義 WIRE-14 参照）。
+| 列 | 公告 OID | バイナリ可否 |
+| --- | --- | --- |
+| `ColumnMeta::Id` | numeric（1700） | **非対応 → `0A000`**（詳細は WIRE-14 参照） |
+| `Scalar{ty: Text}` | text（25） | 対応（UTF-8 生バイト） |
+| `Scalar{ty: Vector(_)}` | text（25） | **非対応 → `0A000`**（詳細は WIRE-14 参照） |
+| `ColumnMeta::Computed` | text（25） | **非対応 → `0A000`**（fail-closed。詳細は WIRE-14 参照） |
 
 `WireType::supports_binary`（`Id`／`Text` の型そのものの対応可否）と
 `column_binary_support`（列種別を見た最終判定。`Vector`／`Computed` の
@@ -98,9 +87,7 @@ PostgreSQL の send 関数と同じレイアウトで 8 型のバイナリ表現
 （例: `int4(1)` → `00 00 00 01`、`int8(-1)` → `ff` × 8、`float8(1.0)` →
 `3f f0 00 …`、`bool_(true)` → `01`）。
 
-`#895` への申し送り: `id` を `int8` にした場合、`u64 > i64::MAX` の値を
-バイナリでどう扱うかは #895 の論点となる。本 Issue では `Id` をバイナリ
-非対応にしているため、この問題はまだ発生しない。
+`id` のバイナリ対応拡大は #895 の担当（詳細は WIRE-13 参照）。
 
 ## 形式コードを受け取るエンコーダと既存出力の不変性
 
