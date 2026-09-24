@@ -212,6 +212,31 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
     Ok(max_index)
 }
 
+/// `tokens`（`$n` 置換前の元トークン列）に `ORDER BY <vec列> <=> $n`
+/// （[`validate_param_positions`] パターン 1）の `$n` が含まれるかどうかを
+/// 判定する。[`crate::core::EngineCore::parse_sql_prepared`] が
+/// [`crate::core::PreparedSql`] へ結果を持たせ、`describe_prepared_in_session`
+/// が「ダミー値へ置換された distance 位置に限りベクトルリテラルの実パースを
+/// 省略してよい」ことを機械的に判定するために使う（PR #1012 レビュー指摘
+/// 対応: `$n` を含まない文——`ORDER BY` のベクトルリテラルが元の SQL テキスト
+/// に書かれた実リテラルである文——では、`substitute_dummy` は当該位置を一切
+/// 変更しないため `dummy_parsed` にもその実リテラルがそのまま残る。この場合に
+/// まで検証を省略すると、通常の Describe（`skip_vector_literal_validation ==
+/// false`）なら `22000` で弾かれるはずの不正なベクトルリテラルが Prepared
+/// Describe だけ素通りし、エラーが Execute まで遅延してしまう）。
+///
+/// パターン 1 は `HYBRID_RRF(...)` 等の 4 引数 `ORDER BY` 関数呼び出し形
+/// （[`crate::sql::allowlist::OrderByForm::FunctionCall`]）のベクトルリテラルを
+/// 対象にしない（`sql::params` モジュールドキュメント: hybrid 関数引数への
+/// `$n` はスコープ外として `42601` で拒否するため、この形のベクトルリテラルは
+/// 常に元の SQL テキストの実リテラルのまま——本関数の対象外で構わない）。
+pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
+    tokens.iter().enumerate().any(|(i, token)| {
+        matches!(token, Token::Param(_))
+            && matches!(tokens.get(i.wrapping_sub(1)), Some(Token::DistanceOp))
+    })
+}
+
 /// [`Token::Param`] をすべて `value_for` が返す文字列の [`Token::StringLiteral`]
 /// へ置換したトークン列を返す。`value_for` は 1 始まりのパラメータ番号を受け取る。
 fn substitute_with<E>(
@@ -381,6 +406,45 @@ mod tests {
             positions("SELECT * FROM documents ORDER BY embedding <=> $1 LIMIT 5").unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn order_by_distance_literal_is_param_detects_dollar_param() {
+        let tokens =
+            tokenize_with_params("SELECT * FROM documents ORDER BY embedding <=> $1 LIMIT 5")
+                .expect("tokenize_with_params should succeed");
+        assert!(order_by_distance_literal_is_param(&tokens));
+    }
+
+    #[test]
+    fn order_by_distance_literal_is_param_false_for_real_literal() {
+        let tokens = tokenize_with_params(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
+        )
+        .expect("tokenize_with_params should succeed");
+        assert!(!order_by_distance_literal_is_param(&tokens));
+    }
+
+    #[test]
+    fn order_by_distance_literal_is_param_false_when_dollar_param_is_unrelated() {
+        let tokens = tokenize_with_params(
+            "SELECT * FROM documents WHERE lang = $1 ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
+        )
+        .expect("tokenize_with_params should succeed");
+        assert!(!order_by_distance_literal_is_param(&tokens));
+    }
+
+    #[test]
+    fn order_by_distance_literal_is_param_false_for_hybrid_function_argument() {
+        // hybrid 関数引数への `$n` はそもそも `validate_param_positions` が
+        // `42601` で拒否するスコープ外だが、`order_by_distance_literal_is_param`
+        // 単体はトークン列の形だけを見るため、このパターン（`DistanceOp` を
+        // 伴わない）を誤って `true` としないことも確認する。
+        let tokens = tokenize_with_params(
+            "SELECT * FROM documents ORDER BY HYBRID_RRF(embedding, '[0.1,0.2,0.3]', body, 'q') LIMIT 5",
+        )
+        .expect("tokenize_with_params should succeed");
+        assert!(!order_by_distance_literal_is_param(&tokens));
     }
 
     #[test]

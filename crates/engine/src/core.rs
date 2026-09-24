@@ -1235,6 +1235,14 @@ pub struct PreparedSql {
     tokens: Vec<crate::sql::lexer::Token>,
     param_count: u16,
     dummy_parsed: ParsedSql,
+    /// `dummy_parsed` の `ORDER BY` ベクトルリテラル（`Distance` 形。
+    /// [`crate::sql::allowlist::OrderByForm::Distance`]）が、元の SQL テキストの
+    /// `$n`（[`crate::sql::params::order_by_distance_literal_is_param`]）に由来する
+    /// ダミー値かどうか。`true` の場合に限り `describe_prepared_in_session` は
+    /// このリテラルの実パースを省略してよい（PR #1012 レビュー指摘対応:
+    /// `$n` を含まない文では `false` のままとなり、`dummy_parsed` に残る実
+    /// リテラルは通常の Describe と同じく必ず検証される）。
+    order_by_distance_literal_is_param: bool,
 }
 
 impl PreparedSql {
@@ -2295,12 +2303,17 @@ impl EngineCore {
     ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
         let param_count = crate::sql::params::validate_param_positions(&tokens)?;
+        // ダミー置換前の元トークン列から判定する（置換後は `$n` 自体が
+        // 消えるため、置換後トークン列からは判定できない）。
+        let order_by_distance_literal_is_param =
+            crate::sql::params::order_by_distance_literal_is_param(&tokens);
         let dummy_tokens = crate::sql::params::substitute_dummy(&tokens);
         let dummy_parsed = self.parse_tokens(dummy_tokens)?;
         Ok(PreparedSql {
             tokens,
             param_count,
             dummy_parsed,
+            order_by_distance_literal_is_param,
         })
     }
 
@@ -2351,15 +2364,21 @@ impl EngineCore {
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
         // `prepared.dummy_parsed` は Parse 時点（値未確定）の構造検証のため
-        // 全 `$n` を固定ダミー値へ置換した `ParsedSql` であり、ダミー値は
-        // ベクトルリテラルとして不正でありうる。実パラメータを持たないこの
-        // 専用経路に限り `describe_parsed_in_session_impl` の
-        // `skip_vector_literal_validation` を `true` にして値検証を省略する
-        // （PR #1012 レビュー指摘対応: 実リテラルを持つ通常の
-        // `describe_parsed_in_session` 呼び出しでは常に `false` を渡し、
-        // 従来どおり `parse_vector_literal` による形式・次元・非有限値・
-        // 64 KiB 上限検証を Describe 時に行う契約を維持する）。
-        self.describe_parsed_in_session_impl(session, &prepared.dummy_parsed, true)
+        // 全 `$n` を固定ダミー値へ置換した `ParsedSql` である。`ORDER BY`
+        // ベクトルリテラルの実パースを省略してよいのは、そのリテラルが
+        // 実際に `$n` に由来するダミー値である場合（`prepared.
+        // order_by_distance_literal_is_param == true`）に限る。`$n` を含まない
+        // 文では `substitute_dummy` が当該位置を変更しないため `dummy_parsed`
+        // にも元の実リテラルがそのまま残っており、この場合は通常の
+        // `describe_parsed_in_session` と同じく必ず検証する（PR #1012
+        // レビュー指摘対応: 以前は文中の `$n` の位置に関係なく常に検証を
+        // 省略していたため、パラメータ化されていない実ベクトルリテラルの
+        // 不正値まで Describe をすり抜けて Execute まで遅延していた）。
+        self.describe_parsed_in_session_impl(
+            session,
+            &prepared.dummy_parsed,
+            prepared.order_by_distance_literal_is_param,
+        )
     }
 
     /// [`Self::parse_sql`] が返した [`ParsedSql`] を実行する（Issue #933・

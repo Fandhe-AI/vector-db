@@ -515,6 +515,69 @@ fn describe_prepared_vector_distance_order_by_succeeds_before_bind() {
     assert_eq!(described, literal_described);
 }
 
+// PR #1012 codex/Cursor Bugbot 指摘の回帰: `describe_prepared_in_session` は
+// 文中の `$n` の位置に関係なく検証省略していたわけではなく、`ORDER BY` の
+// ベクトルリテラルが実際に `$n` に由来するダミー値の場合に限って実パースを
+// 省略しなければならない。`$n` を含まない `ORDER BY` の不正な実ベクトル
+// リテラル（次元不一致）は、通常の `describe_parsed_in_session` と同じく
+// Describe 時点（Bind 前）で `22000` として検出されなければならない
+// （以前は `skip_vector_literal_validation` が常に `true` だったため、この
+// 不正値の検出が Execute まで遅延していた）。
+#[test]
+fn describe_prepared_rejects_real_invalid_vector_literal_without_dollar_param() {
+    let path = unique_db_path("prepared-describe-real-invalid-vector-literal");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let session = SessionState::default();
+
+    // `$n` を一切含まない文（`documents.embedding` の次元と一致しない不正な
+    // 実リテラル）。
+    let prepared = core
+        .parse_sql_prepared("SELECT id FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 5")
+        .expect("parse_sql_prepared should succeed (structural validation only)");
+
+    let err = core
+        .describe_prepared_in_session(&session, &prepared)
+        .expect_err(
+            "describe_prepared_in_session must reject an invalid real vector literal, \
+             not defer detection to Execute",
+        );
+    assert_eq!(err.wire_code(), "22000");
+
+    // 通常の Describe（SQL テキスト直接）と同一のエラーになることを固定する。
+    let literal = core
+        .parse_sql("SELECT id FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 5")
+        .expect("parse_sql should succeed");
+    let literal_err = core
+        .describe_parsed_in_session(&session, &literal)
+        .expect_err("describe_parsed_in_session should reject the same invalid literal");
+    assert_eq!(err.wire_code(), literal_err.wire_code());
+}
+
+// 同上（PR #1012 指摘の複合形）: `WHERE` 節の `$n` と `ORDER BY` の不正な
+// 実ベクトルリテラルが同一文に共存する場合でも、`$n` の存在自体が Describe
+// 全体の検証を無効化してはならない。
+#[test]
+fn describe_prepared_rejects_real_invalid_vector_literal_alongside_unrelated_dollar_param() {
+    let path = unique_db_path("prepared-describe-mixed-param-and-invalid-literal");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let session = SessionState::default();
+
+    let prepared = core
+        .parse_sql_prepared(
+            "SELECT id FROM documents WHERE lang = $1 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 5",
+        )
+        .expect("parse_sql_prepared should succeed (structural validation only)");
+
+    let err = core
+        .describe_prepared_in_session(&session, &prepared)
+        .expect_err(
+            "an unrelated $n in WHERE must not suppress ORDER BY vector literal validation",
+        );
+    assert_eq!(err.wire_code(), "22000");
+}
+
 // --- 副作用ゼロ（Parse／Describe は行・台帳・世代に触れない） -----------------
 
 #[test]
