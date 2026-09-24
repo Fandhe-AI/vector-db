@@ -233,6 +233,11 @@ pub(crate) fn project_row(
                     budget,
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
+                Some(Value::Json(s)) => Cell::Json(try_alloc_text_for_budget(
+                    s,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
                 // ENUM 列は既存の `Cell::Text` へ写像する（Issue #890 D7。
                 // `sql::exec` の投影と同じ扱い）。
                 Some(Value::Enum(label)) => Cell::Text(try_alloc_text_for_budget(

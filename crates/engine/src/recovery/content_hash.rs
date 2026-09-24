@@ -252,10 +252,20 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(11);
             b.push_bytes(bytes)?;
         }
-        // ENUM 値は TABLE-13 の宣言順で 12 とする（Issue #890）。TEXT と同じ
-        // 長さ前置方式だが、型タグの違いだけで TEXT とハッシュを区別する。
-        Value::Enum(label) => {
+        // JSON／JSONB は共通の Value::Json 表現を持つため（Issue #889 D2）、
+        // 表層横断で同一の再送判定（`23505`／`22023`）を得るためにはハッシュ入力も
+        // 同じタグ・同じテキストで揃う必要がある。タグ 12 は未使用のため確保する
+        // （TABLE-13/14 の宣言順に沿った次点）。
+        Value::Json(text) => {
             b.push_u8(12);
+            b.push_bytes(text.as_bytes())?;
+        }
+        // ENUM 値は TABLE-14 の宣言順で JSON／JSONB（タグ 12）の次点となる
+        // タグ 13 とする（Issue #890。base の想定タグ 12 は本マージで JSON と
+        // 衝突するため採番し直した）。TEXT と同じ長さ前置方式だが、型タグの
+        // 違いだけで TEXT・JSON とハッシュを区別する。
+        Value::Enum(label) => {
+            b.push_u8(13);
             b.push_bytes(label.as_bytes())?;
         }
     }
@@ -815,6 +825,15 @@ fn push_dml_assignments(
                 b.push_u8(3);
                 b.push_u8(u8::from(*v));
             }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘・PR #1014。
+            // `bind_set_assignments` が nullable 列向けに追加した SQL `NULL`
+            // 表現）。述語つき `UPDATE ... WHERE`（本関数の呼び出し元）は
+            // 現状 NoSQL 表層から到達しない（`filter` 形は Issue #871 実行結線
+            // 対象だが NULL 対応は本 Issue のスコープ外）ため実質未到達だが、
+            // 上部コメントが予告する前方ガードとしてタグ 4 を割り当てる。
+            InsertLiteral::Null => {
+                b.push_u8(4);
+            }
         }
     }
     Ok(())
@@ -1049,7 +1068,7 @@ mod tests {
         assert_ne!(bytes_hash, text_hash);
     }
 
-    // ENUM（タグ 12）と TEXT（タグ 1）は本体バイト列が完全一致していても
+    // ENUM（タグ 13）と TEXT（タグ 1）は本体バイト列が完全一致していても
     // 型タグの違いだけで別ハッシュになる（Issue #890。golden な区別の固定）。
     #[test]
     fn enum_and_text_values_produce_different_hashes_even_with_matching_bytes() {
@@ -1078,6 +1097,39 @@ mod tests {
         let b = Value::Bytes(vec![0xbe, 0xef]);
         let hash_a = for_typed_insert(1, Visibility::Public, &[], &[("blob", &a)]).expect("hash a");
         let hash_b = for_typed_insert(1, Visibility::Public, &[], &[("blob", &b)]).expect("hash b");
+        assert_ne!(hash_a, hash_b);
+    }
+
+    // JSON（タグ 12）と TEXT（タグ 1）は本体バイト列が偶然一致していても
+    // 型タグの違いだけで別ハッシュになる（Issue #889。golden な区別の固定）。
+    #[test]
+    fn json_and_text_values_produce_different_hashes_even_with_matching_bytes() {
+        let json_value = Value::Json("{}".to_string());
+        let text_value = Value::Text("{}".to_string());
+        let json_hash = for_typed_insert(1, Visibility::Public, &[], &[("doc", &json_value)])
+            .expect("hash json");
+        let text_hash = for_typed_insert(1, Visibility::Public, &[], &[("doc", &text_value)])
+            .expect("hash text");
+        assert_ne!(json_hash, text_hash);
+    }
+
+    // 同一の JSON テキストからは同じハッシュが再現する（再送判定の前提）。
+    #[test]
+    fn json_hash_is_reproducible_for_identical_content() {
+        let value = Value::Json(r#"{"a":1}"#.to_string());
+        let h1 = for_typed_insert(1, Visibility::Public, &[], &[("doc", &value)]).expect("hash 1");
+        let h2 = for_typed_insert(1, Visibility::Public, &[], &[("doc", &value)]).expect("hash 2");
+        assert_eq!(h1, h2);
+    }
+
+    // JSON テキストが異なれば（空白のみの差であっても）ハッシュも異なる
+    // （JSON 列は入力テキストを保持する契約のため。内容不一致検出の前提）。
+    #[test]
+    fn different_json_values_produce_different_hashes() {
+        let a = Value::Json(r#"{"a":1}"#.to_string());
+        let b = Value::Json(r#"{"a": 1}"#.to_string());
+        let hash_a = for_typed_insert(1, Visibility::Public, &[], &[("doc", &a)]).expect("hash a");
+        let hash_b = for_typed_insert(1, Visibility::Public, &[], &[("doc", &b)]).expect("hash b");
         assert_ne!(hash_a, hash_b);
     }
 

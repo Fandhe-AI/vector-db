@@ -3781,6 +3781,8 @@ impl EngineCore {
                     // BYTEA は TEXT と同じく本体長のみを数える（フレーミングの
                     // オーバーヘッドは他の値種別も同様に含めていないため対称、Issue #886）。
                     crate::row_codec::Value::Bytes(b) => b.len(),
+                    // JSON／JSONB も TEXT と同じく本体長のみを数える（Issue #889）。
+                    crate::row_codec::Value::Json(s) => s.len(),
                     // ENUM 値はラベル文字列の本体長のみを数える（TEXT と同じ
                     // フレーミング。Issue #890）。
                     crate::row_codec::Value::Enum(s) => s.len(),

@@ -103,6 +103,8 @@ impl ScoringBoost {
             | ColumnType::Boolean
             | ColumnType::Array(_)
             | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
             | ColumnType::Enum(_) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {:?} is not a TEXT column",

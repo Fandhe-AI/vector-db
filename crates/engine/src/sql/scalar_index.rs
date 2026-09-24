@@ -548,12 +548,15 @@ impl ScalarIndex {
                 // Issue #883・D-e。値域が 2 値のため索引化コストに見合わず、
                 // 対応述語 `BoolEquals` は常に plain scan——`scalar_plan.rs`
                 // 参照——のまま据え置く）。`ARRAY` 列（TABLE-14・Issue #888）・
-                // `BYTEA` 列（Issue #886）もいずれも等価・前方一致述語を
+                // `BYTEA` 列（Issue #886）・`JSON`／`JSONB` 列（TABLE-14・Issue #889。
+                // 拡張は Issue #893 へ申し送り）もいずれも等価・前方一致述語を
                 // 持たないため同じく非索引化。
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
-                | ColumnType::Bytea => per_column.push(None),
+                | ColumnType::Bytea
+                | ColumnType::Json
+                | ColumnType::Jsonb => per_column.push(None),
             }
         }
 
