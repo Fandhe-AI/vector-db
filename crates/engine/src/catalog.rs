@@ -45,7 +45,41 @@ const CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("catalo
 /// 破壊的変更として扱い、この値を更新する。旧バージョンの読み出しは
 /// マイグレーションを提供せず fail-closed に拒否する
 /// （`storage.rs` の `ROW_FORMAT_VERSION` と同じ方針）。
-const CATALOG_FORMAT_VERSION_LINE: &str = "v1";
+///
+/// `v2`（Issue #880）: 列の 4 フィールド構文（`name:tag:param:nullable`）自体は
+/// `v1` と同一のまま、`param` フィールドの意味を「パラメータなし型は `-`、
+/// それ以外は型ごとの文法」へ汎用化した。`TEXT`/`VECTOR` の列行バイト列は
+/// `v1` と完全に同一で、変わるのは 1 行目のバージョン識別子のみ。`v1` の
+/// カタログ値はマイグレーションを提供せず fail-closed に拒否する
+/// （`docs/design/column-type-extension.md` 参照）。
+const CATALOG_FORMAT_VERSION_LINE: &str = "v2";
+
+/// カタログ v2 の `param` フィールドに許容する文字集合（TABLE-6・Issue #880）。
+/// パラメータなし型を表す `-` は本集合の外だが、[`validate_catalog_param`] で
+/// 別途特別扱いする。`:`・改行を含まないため、encode 側の `:` 区切りと
+/// 衝突しない（区切り文字注入の防止）。
+fn is_valid_catalog_param_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == ','
+}
+
+/// `param` フィールドの文字集合検証（TABLE-6）。空文字列・許容外文字（`:`・改行・
+/// 非 ASCII 等）を fail-closed に拒否する。`-`（パラメータなし型）はここで許容する。
+fn validate_catalog_param(param: &str) -> Result<()> {
+    if param.is_empty() {
+        return Err(CatalogError::Invalid(
+            "catalog param field must not be empty".to_string(),
+        ));
+    }
+    if param == "-" {
+        return Ok(());
+    }
+    if !param.chars().all(is_valid_catalog_param_char) {
+        return Err(CatalogError::Invalid(format!(
+            "catalog param field contains invalid character: {param:?}"
+        )));
+    }
+    Ok(())
+}
 
 /// 識別子（テーブル名・列名）のバイト長上限。PostgreSQL の識別子長慣習に整合させた
 /// 実装ローカルな値（対象ビヘイビア: TABLE-6）。
@@ -175,6 +209,10 @@ pub type Result<T> = std::result::Result<T, CatalogError>;
 
 /// 列のデータ型（閉じた集合）。デコード時に未知の型名を検出した場合は
 /// 既知の型へ黙殺フォールバックせず `CatalogError::Invalid` で拒否する（TABLE-6）。
+///
+/// variant を追加する際は `#[non_exhaustive]`・ワイルドカード腕（`_ =>`）を
+/// 導入しない（Issue #880 D1）。コンパイラに全ディスパッチ地点を列挙させることで、
+/// 新型が既存分岐へ黙って流れる fail-open を構造的に防ぐ設計とする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
     /// 可変長テキスト列。
@@ -182,6 +220,51 @@ pub enum ColumnType {
     /// 固定次元の埋め込み列（`VECTOR(N)`、TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は
     /// encode・decode 両側で拒否する。
     Vector(u32),
+}
+
+impl ColumnType {
+    /// `VECTOR` 列かどうか（`matches!(ty, ColumnType::Vector(_))` の言い換え。
+    /// Issue #880 D9）。
+    pub fn is_vector(&self) -> bool {
+        matches!(self, ColumnType::Vector(_))
+    }
+
+    /// カタログのテキスト形式（v2）における型タグと `param` フィールドを返す
+    /// （Issue #880 D2）。[`encode_schema`] はこの 1 対だけを呼び、型を 1 つ
+    /// 追加する際にカタログ側で触る箇所をここへ集約する。
+    fn catalog_fields(&self) -> (&'static str, String) {
+        match self {
+            ColumnType::Text => ("text", "-".to_string()),
+            ColumnType::Vector(dim) => ("vector", dim.to_string()),
+        }
+    }
+
+    /// [`ColumnType::catalog_fields`] の逆変換。未知の型タグ・`param` の型別文法
+    /// 違反はすべて `CatalogError::Invalid` で拒否する（TABLE-6。呼び出し元の
+    /// [`decode_schema_body`] が `CorruptSchema` へ読み替える）。`param` の文字集合
+    /// 検証（[`validate_catalog_param`]）は呼び出し元が先に行う契約とする。
+    fn from_catalog_fields(tag: &str, param: &str) -> Result<ColumnType> {
+        match tag {
+            "text" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "text column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Text)
+            }
+            "vector" => {
+                let dim: u32 = param.parse().map_err(|_| {
+                    CatalogError::Invalid(format!("malformed vector dimension: {param:?}"))
+                })?;
+                validate_vector_dim(dim)?;
+                Ok(ColumnType::Vector(dim))
+            }
+            other => Err(CatalogError::Invalid(format!(
+                "unknown column type: {other:?}"
+            ))),
+        }
+    }
 }
 
 /// テーブル定義中の 1 列。
@@ -336,7 +419,7 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
             )));
         }
         seen.push(column.name.as_str());
-        if matches!(column.ty, ColumnType::Vector(_)) {
+        if column.ty.is_vector() {
             vector_column_count += 1;
         }
     }
@@ -346,6 +429,28 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// 1 列ぶんのカタログ行（`name:tag:param:nullable\n`）を組み立てる。`param` は
+/// [`validate_catalog_param`] を通してから連結する（encode 側の fail-closed。
+/// TABLE-6・codex-review 指摘 PR #999。`catalog_fields` はここまで型定義側の
+/// 自己申告であり、decode 側（`validate_catalog_param`・`from_catalog_fields`）が
+/// 要求する文字集合・`:` 非混入を encode 側でも検証してから連結する。将来
+/// `catalog_fields` が区切り文字や空文字を返す型を追加しても、ここで検知して
+/// fail-closed に拒否し、デコード不能なカタログ値を永続化しない）。
+/// [`encode_schema`] のループ本体であり、不正な `param` を直接与えて encode 側の
+/// 拒否を固定する単体テストの seam も兼ねる。
+fn encode_column_line(
+    name: &str,
+    type_name: &str,
+    param_field: &str,
+    nullable: bool,
+) -> Result<String> {
+    validate_catalog_param(param_field)?;
+    let nullable_field = if nullable { "1" } else { "0" };
+    Ok(format!(
+        "{name}:{type_name}:{param_field}:{nullable_field}\n"
+    ))
 }
 
 /// [`TableSchema`] をカタログのテキスト形式へエンコードする。1 行目に
@@ -360,15 +465,15 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     out.push('\n');
     out.push_str(&format!("cols:{}\n", schema.columns.len()));
     for column in &schema.columns {
-        let (type_name, dim_field) = match column.ty {
-            ColumnType::Text => ("text", "-".to_string()),
-            ColumnType::Vector(dim) => ("vector", dim.to_string()),
-        };
-        let nullable_field = if column.nullable { "1" } else { "0" };
-        out.push_str(&format!(
-            "{}:{}:{}:{}\n",
-            column.name, type_name, dim_field, nullable_field
-        ));
+        // 型タグ・`param` の往復は ColumnType::catalog_fields に集約する
+        // （Issue #880 D2。型を追加する際にここを個別に触らずに済む）。
+        let (type_name, param_field) = column.ty.catalog_fields();
+        out.push_str(&encode_column_line(
+            &column.name,
+            type_name,
+            &param_field,
+            column.nullable,
+        )?);
     }
     if out.len() > MAX_CATALOG_VALUE_LEN {
         return Err(CatalogError::Invalid(format!(
@@ -433,54 +538,53 @@ fn decode_schema_body(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
         )));
     }
 
-    // 残り行を集める。末尾の空行（トレーリング改行）を許容しつつ、
-    // 宣言された列数と実際の行数が一致しない場合は切り詰め・余剰として拒否する。
-    let remaining: Vec<&str> = lines.collect();
-    let remaining = match remaining.last() {
-        Some(&"") => &remaining[..remaining.len() - 1],
-        _ => &remaining[..],
-    };
-    if remaining.len() != col_count {
-        return Err(CatalogError::Invalid(format!(
-            "catalog value line count mismatch: expected {col_count} columns, got {} lines",
-            remaining.len()
-        )));
-    }
-
+    // 残り行を、宣言列数（col_count。上で MAX_COLUMN_COUNT 以下と検証済み）を
+    // 超えない範囲でのみ `ColumnDef`（内部で `String` を確保する）を構築する。
+    // 旧実装の `lines.collect()` は残り行数が宣言列数と無関係に無制限へ膨らむ
+    // 攻撃入力（大量の短い行）に対して行数比例のアロケーションを先に行って
+    // いたが（.claude/rules/coding-rust.md「untrusted 入力の扱い」）、本実装は
+    // `col_count` 件目までしか `ColumnDef` を構築しない単一走査へ変更し、
+    // 未知の型タグ・不正な `param` はその列を構築する前に拒否する（Issue #880 D7）。
+    // `col_count` を超える行は「末尾の空行（トレーリング改行）1 行のみ」を
+    // 許容し、それ以外は余剰行として拒否する。
     let mut columns = Vec::with_capacity(col_count);
-    for line in remaining {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() != 4 {
+    let mut trailing_seen = false;
+    for (line_index, line) in lines.enumerate() {
+        if line_index >= col_count {
+            if trailing_seen || !line.is_empty() {
+                return Err(CatalogError::Invalid(format!(
+                    "catalog value line count mismatch: expected {col_count} columns, got more than {col_count} lines"
+                )));
+            }
+            trailing_seen = true;
+            continue;
+        }
+
+        let mut fields = line.split(':');
+        let name = fields
+            .next()
+            .ok_or_else(|| CatalogError::Invalid(format!("malformed column line: {line:?}")))?;
+        let type_name = fields
+            .next()
+            .ok_or_else(|| CatalogError::Invalid(format!("malformed column line: {line:?}")))?;
+        let param_field = fields
+            .next()
+            .ok_or_else(|| CatalogError::Invalid(format!("malformed column line: {line:?}")))?;
+        let nullable_field = fields
+            .next()
+            .ok_or_else(|| CatalogError::Invalid(format!("malformed column line: {line:?}")))?;
+        if fields.next().is_some() {
             return Err(CatalogError::Invalid(format!(
                 "malformed column line: {line:?}"
             )));
         }
-        let (name, type_name, dim_field, nullable_field) =
-            (fields[0], fields[1], fields[2], fields[3]);
-        validate_identifier(name)?;
 
-        let ty = match type_name {
-            "text" => {
-                if dim_field != "-" {
-                    return Err(CatalogError::Invalid(format!(
-                        "text column must not declare a dimension: {line:?}"
-                    )));
-                }
-                ColumnType::Text
-            }
-            "vector" => {
-                let dim: u32 = dim_field.parse().map_err(|_| {
-                    CatalogError::Invalid(format!("malformed vector dimension: {line:?}"))
-                })?;
-                validate_vector_dim(dim)?;
-                ColumnType::Vector(dim)
-            }
-            other => {
-                return Err(CatalogError::Invalid(format!(
-                    "unknown column type: {other:?}"
-                )))
-            }
-        };
+        validate_identifier(name)?;
+        validate_catalog_param(param_field)?;
+        // 未知の型タグ・型別の `param` 文法違反は、ここで `ColumnDef`（`name` の
+        // 所有 `String` を確保する）を構築する前に拒否する（アロケーション前拒否。
+        // Issue #880 D7）。
+        let ty = ColumnType::from_catalog_fields(type_name, param_field)?;
 
         let nullable = match nullable_field {
             "0" => false,
@@ -493,6 +597,12 @@ fn decode_schema_body(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
         };
 
         columns.push(ColumnDef::new(name, ty, nullable));
+    }
+    if columns.len() != col_count {
+        return Err(CatalogError::Invalid(format!(
+            "catalog value line count mismatch: expected {col_count} columns, got {} lines",
+            columns.len()
+        )));
     }
 
     let schema = TableSchema::new(table_name, columns);
@@ -999,7 +1109,7 @@ impl Storage {
             let vector_idx = schema
                 .columns
                 .iter()
-                .position(|c| matches!(c.ty, ColumnType::Vector(_)))
+                .position(|c| c.ty.is_vector())
                 .ok_or_else(|| CatalogError::Invalid("table has no VECTOR column".to_string()))?;
             let embedding = match values.get(vector_idx) {
                 Some(RowCodecValue::Vector(v)) => v.clone(),
@@ -1313,9 +1423,104 @@ mod tests {
         ));
     }
 
+    /// カタログ v1（Issue #880 で v2 へ更新される前の正当な形式）は、
+    /// マイグレーションを提供せず fail-closed に拒否する（D6）。
+    #[test]
+    fn decode_rejects_legacy_v1_format() {
+        let bytes = b"v1\ncols:1\nfoo:text:-:0\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
+    /// `encode_schema` が出力する v2 の 1 行目がバージョン識別子であることを
+    /// バイト列で固定する（golden。Issue #880 のカタログ v1→v2 移行で変わるのは
+    /// この 1 行目のみで、列行のバイト表現は不変であることの根拠とする）。
+    #[test]
+    fn encode_schema_golden_v2_layout() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("tag", ColumnType::Text, true),
+            ],
+        );
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        assert_eq!(
+            encoded,
+            b"v2\ncols:3\nembedding:vector:3:0\nbody:text:-:0\ntag:text:-:1\n".to_vec()
+        );
+    }
+
+    /// `param` フィールドの文字集合違反（`:`・改行相当の区切り注入、非 ASCII）を
+    /// fail-closed に拒否する（TABLE-6・Issue #880 D5）。
+    #[test]
+    fn decode_rejects_invalid_param_charset() {
+        for bytes in [
+            b"v2\ncols:1\nfoo:vector:1:2:0\n".to_vec(), // ':' 混入で param が余剰フィールドを生む
+            "v2\ncols:1\nfoo:text:あ:0\n".as_bytes().to_vec(), // 非 ASCII
+        ] {
+            assert!(
+                matches!(
+                    decode_schema("t", &bytes),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "must reject: {bytes:?}"
+            );
+        }
+    }
+
+    /// `encode_schema`（実体は [`encode_column_line`]）が `param` フィールドの
+    /// 文字集合違反を decode 側（[`decode_rejects_invalid_param_charset`]）と
+    /// 対称に fail-closed 拒否することを固定する（TABLE-6・Issue #880 D5・
+    /// codex-review 指摘 PR #999）。`ColumnType` は現状 `Text`/`Vector` のみで
+    /// `catalog_fields` が不正な `param` を返すことはないため、将来型追加時の
+    /// 回帰を検知できるよう encode の実処理関数を直接不正 `param` で呼ぶ。
+    #[test]
+    fn encode_column_line_rejects_invalid_param_charset() {
+        for invalid_param in ["", "1:2", "a\nb", "あ"] {
+            assert!(
+                matches!(
+                    encode_column_line("foo", "text", invalid_param, false),
+                    Err(CatalogError::Invalid(_))
+                ),
+                "must reject: {invalid_param:?}"
+            );
+        }
+    }
+
+    /// `encode_column_line` は `param` が許容文字集合内であれば
+    /// `encode_schema_golden_v2_layout` と同じ行文字列を組み立てる（非退行）。
+    #[test]
+    fn encode_column_line_accepts_valid_param_charset() {
+        assert_eq!(
+            encode_column_line("tag", "text", "-", true).expect("valid param must be accepted"),
+            "tag:text:-:1\n"
+        );
+        assert_eq!(
+            encode_column_line("embedding", "vector", "384", false)
+                .expect("valid param must be accepted"),
+            "embedding:vector:384:0\n"
+        );
+    }
+
+    /// 宣言列数 (`cols:`) を超える余剰行（トレーリング空行 1 行を除く）を
+    /// 拒否する。未知の型タグを含む余剰行であっても、宣言列数を超えた時点で
+    /// 拒否され、余剰分の `ColumnDef` は構築されない（Issue #880 D7）。
+    #[test]
+    fn decode_rejects_excess_lines_beyond_declared_column_count() {
+        let bytes = b"v2\ncols:1\nfoo:text:-:0\nbar:unknowntype:-:0\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
     #[test]
     fn decode_rejects_truncated_column_lines() {
-        let bytes = b"v1\ncols:2\nfoo:text:-:0\n".to_vec();
+        let bytes = b"v2\ncols:2\nfoo:text:-:0\n".to_vec();
         assert!(matches!(
             decode_schema("t", &bytes),
             Err(CatalogError::CorruptSchema(_))
@@ -1324,7 +1529,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_unknown_type() {
-        let bytes = b"v1\ncols:1\nfoo:blob:-:0\n".to_vec();
+        let bytes = b"v2\ncols:1\nfoo:blob:-:0\n".to_vec();
         assert!(matches!(
             decode_schema("t", &bytes),
             Err(CatalogError::CorruptSchema(_))
@@ -1333,12 +1538,12 @@ mod tests {
 
     #[test]
     fn decode_rejects_bad_dimension() {
-        let bytes = b"v1\ncols:1\nfoo:vector:0:0\n".to_vec();
+        let bytes = b"v2\ncols:1\nfoo:vector:0:0\n".to_vec();
         assert!(matches!(
             decode_schema("t", &bytes),
             Err(CatalogError::CorruptSchema(_))
         ));
-        let bytes = b"v1\ncols:1\nfoo:vector:not-a-number:0\n".to_vec();
+        let bytes = b"v2\ncols:1\nfoo:vector:not-a-number:0\n".to_vec();
         assert!(matches!(
             decode_schema("t", &bytes),
             Err(CatalogError::CorruptSchema(_))
