@@ -122,6 +122,17 @@
 5. **既定の①（`max_files_per_batch`）が 64 行**: 既定設定では 65 行以上の
    COPY は `54000` になる。契約どおりの挙動だが、既知の運用上の制約
    （環境変数 `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）として記録する。
+6. **複数文メッセージ（WIRE-16・TASK-219）との関係**: `COPY` は 1 つの
+   `'Q'` メッセージ中で単独文でなければならない（`handshake::
+   post_auth_loop` が `is_copy_statement` をメッセージ全文へ適用してから
+   分岐するため）。末尾セミコロン 1 個は単一文と同じく許容されるが、
+   `COPY ...; <他の文>` は `validate_copy` の `expect_end_of_statement` が
+   余剰トークンとして検出し `42601` で拒否し（CopyIn／CopyOut サブ
+   プロトコルへは入らない）、`<他の文>; COPY ...` はメッセージ全文が
+   `COPY` で始まらないため `sql::statement_splitter` の複数文経路へ流れ、
+   `COPY` が `validate_sql` の許可形状に無いことから 2 文目の実行時に
+   `42601` で打ち切られる。いずれの形でも接続はデシンクしない
+   （`crates/wire-server/tests/wire17_copy.rs` の複数文相互作用テスト参照）。
 
 ## 対象ファイル
 

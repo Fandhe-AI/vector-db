@@ -507,3 +507,114 @@ fn wire17_copy_from_stdin_flush_sync_with_body_are_fully_consumed() {
     assert_eq!(tag, "COPY 2");
     read_ready_for_query(&mut stream);
 }
+
+// ---------------------------------------------------------------------
+// 複数文メッセージとの相互作用（WIRE-16・TASK-219・Issue #938 との整合）。
+//
+// `handshake::post_auth_loop` の `'Q'` 分岐は `is_copy_statement` を
+// メッセージ全文へ適用してから分岐するため（`crate::copy` モジュール
+// ドキュメント参照）、以下の 3 形を固定する:
+//   (1) 単一の `COPY` 文に許容される末尾セミコロン 1 個は受理される
+//       （`sql::allowlist::Parser::expect_end_of_statement` が単一文と同じく
+//       許容する）。
+//   (2) `COPY ...; <他の文>` は `is_copy_statement` が真になり
+//       `crate::copy::run` へ委譲されるが、`expect_end_of_statement` が
+//       余剰トークンを検出して `42601` へ落ちる（CopyInResponse は一度も
+//       送出されない）。
+//   (3) `<他の文>; COPY ...` は `is_copy_statement` が偽（先頭が `COPY` で
+//       ない）になり `simple_query::execute_and_respond` の複数文経路へ流れる。
+//       `COPY` は `sql::allowlist::validate_sql` の許可形状に含まれないため
+//       （`sql::copy` モジュールドキュメント参照）、2 文目の実行時に `42601`
+//       で拒否される。
+// いずれの形でも `post_auth_loop` の後続メッセージ読み取りがデシンクしない
+// （後続の通常クエリが正しく処理される）ことをあわせて確認する。
+// ---------------------------------------------------------------------
+
+/// (1) 単一 `COPY` 文の末尾に許容セミコロンが 1 個だけ付いた形は通常どおり
+/// 受理される（`SELECT ...;` と同じ既存契約。Issue #938 の分割器はこの形を
+/// `SplitOutcome::Single` として素通しし、`is_copy_statement` はそもそも
+/// `sql::statement_splitter` を経由しないため影響を受けない）。
+#[test]
+fn wire17_copy_from_stdin_with_trailing_semicolon_is_accepted() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'trailing-semi';",
+    );
+    let ncols = read_copy_in_response(&mut stream);
+    assert_eq!(ncols, 3);
+    send_copy_data(&mut stream, b"1\t[1.0,0.0]\tja\n");
+    send_copy_done(&mut stream);
+
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "COPY 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// (2) `COPY ... FROM STDIN ...; SELECT 1` は `is_copy_statement` が真になり
+/// `crate::copy::run` へ委譲されるが、`validate_copy` の
+/// `expect_end_of_statement` が `; SELECT 1` を余剰トークンとして検出し
+/// `42601` で拒否する（`CopyInResponse` は一度も送出されない＝CopyIn
+/// サブプロトコルへ入らない）。エラー後も接続はデシンクせず、後続の通常
+/// クエリを正しく処理できることを確認する。
+#[test]
+fn wire17_copy_from_stdin_followed_by_another_statement_is_rejected_without_entering_copy_in() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'trailing-stmt'; SELECT 1",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+
+    // デシンクしていなければ後続クエリは通常どおり処理される。
+    send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
+    let _cols = read_row_description(&mut stream);
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(
+        tag, "SELECT 0",
+        "rejected COPY must not have inserted any row"
+    );
+    read_ready_for_query(&mut stream);
+}
+
+/// (3) `SELECT 1; COPY ... FROM STDIN ...` はメッセージ全文が `COPY` で
+/// 始まらないため `is_copy_statement` が偽になり、
+/// `simple_query::execute_and_respond` の複数文経路
+/// （`statement_splitter::split_statements`）へ流れる。1 文目の `SELECT 1` は
+/// 通常どおり応答されるが、2 文目の `COPY ...` は `sql::allowlist::
+/// validate_sql` の許可形状に含まれないため `42601` で打ち切られる
+/// （CopyIn サブプロトコルへは一切入らない）。エラー後も接続はデシンクしない
+/// ことを確認する。
+#[test]
+fn wire17_copy_as_non_first_statement_in_multi_statement_message_is_rejected_with_42601() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT id FROM docs LIMIT 1; COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'non-first'",
+    );
+    // 1 文目（`SELECT id FROM docs LIMIT 1`）は通常どおり応答される
+    // （`docs` は空テーブルのため 0 行）。
+    let _cols = read_row_description(&mut stream);
+    let tag1 = read_command_complete(&mut stream);
+    assert_eq!(tag1, "SELECT 0");
+    // 2 文目（`COPY ...`）が `42601` で打ち切られ、`ReadyForQuery` が続く。
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+
+    // デシンクしていなければ後続クエリは通常どおり処理される。
+    send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
+    let _cols = read_row_description(&mut stream);
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(
+        tag, "SELECT 0",
+        "rejected COPY must not have inserted any row"
+    );
+    read_ready_for_query(&mut stream);
+}
