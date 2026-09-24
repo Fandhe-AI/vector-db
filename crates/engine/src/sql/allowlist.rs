@@ -3250,12 +3250,24 @@ fn split_parenthesized(tokens: &[Token]) -> Result<(&[Token], &[Token]), SqlSurf
 }
 
 /// `[WITH] (FORMAT text|csv)` を受理する（省略時は [`CopyFormat::Text`]）。
+/// `WITH` を書いた場合は直後の `(FORMAT ...)` を必須とし、無ければ `42601` で
+/// 拒否する（値を伴わない `WITH` 句を既定 `Text` として誤受理しない）。
 /// `COPY ... FROM STDIN`・`COPY (...) TO STDOUT` の両方から共有する（Issue #939）。
 fn parse_optional_copy_format(p: &mut Parser) -> Result<CopyFormat, SqlSurfaceError> {
-    if p.peek_contextual_keyword("WITH") {
+    // `WITH` を消費したら `(FORMAT ...)` の丸括弧を必須とする。`WITH` の直後に
+    // `(` が続かない場合（値を伴わない不正な `WITH` 句）は許可リスト外として
+    // `42601` で拒否する（WIRE-17 の許可形状〔`FORMAT text|csv` のみ〕・
+    // fail-closed 規約。Issue #939 codex-review 指摘の是正）。
+    let with_seen = p.peek_contextual_keyword("WITH");
+    if with_seen {
         p.advance();
     }
     if !matches!(p.peek(), Some(Token::Punct('('))) {
+        if with_seen {
+            return Err(SqlSurfaceError::unsupported(
+                "COPY WITH clause must be followed by (FORMAT ...)",
+            ));
+        }
         return Ok(CopyFormat::Text);
     }
     p.advance();

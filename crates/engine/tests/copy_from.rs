@@ -439,6 +439,42 @@ fn copy_to_stdout_rejects_table_form() {
 }
 
 // ---------------------------------------------------------------------
+// `WITH` 句の丸括弧必須化（Issue #939 codex-review 指摘の是正）:
+// `WITH` を消費した直後に `(FORMAT ...)` が続かない場合、既定 `Text` として
+// 誤受理せず `42601` で拒否することを固定する。
+// ---------------------------------------------------------------------
+
+#[test]
+fn copy_to_stdout_rejects_with_clause_without_parens() {
+    let (core, path) = open_engine("copy-to-stdout-with-no-parens");
+    let _guard = CleanupGuard(path);
+
+    let policy = ctx("acme");
+    let session = SessionState::default();
+    let sql = format!("COPY (SELECT id FROM {TABLE} LIMIT 10) TO STDOUT WITH");
+    let err = core
+        .begin_copy(&policy, &session, &sql)
+        .expect_err("COPY ... TO STDOUT WITH（括弧なし）must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+#[test]
+fn copy_from_stdin_rejects_with_clause_without_parens() {
+    let (core, path) = open_engine("copy-from-stdin-with-no-parens");
+    let _guard = CleanupGuard(path);
+
+    let policy = ctx("acme");
+    let session = SessionState::default();
+    let sql = format!(
+        "COPY {TABLE} (id, embedding, lang, note) FROM STDIN WITH USING OPERATION_ID 'copy-with-no-parens'"
+    );
+    let err = core
+        .begin_copy(&policy, &session, &sql)
+        .expect_err("COPY ... FROM STDIN WITH（括弧なし）must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+// ---------------------------------------------------------------------
 // FROM STDIN: BOOLEAN／ARRAY／BYTEA／ENUM 列の束縛
 // （Issue #939 レビュー指摘: cc232e6 で `bind_copy_record` へ追加した該当
 // match アームがどのテストからもカバーされていなかったため追加）
