@@ -3552,7 +3552,7 @@ impl EngineCore {
                     v.operation_id,
                     schema,
                     self.batch_limits,
-                )))
+                )?))
             }
             crate::sql::allowlist::CopyStatement::To(v) => {
                 let (read_txn, schema) = self.read_txn_with_schema(v.inner.table_name())?;

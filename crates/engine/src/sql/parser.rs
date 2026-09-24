@@ -1406,7 +1406,7 @@ pub(crate) fn bind_bytea_literal(
 /// - 構文不正・深さ/要素数超過は `42601`（[`SqlSurfaceError::UnsupportedSyntax`]。
 ///   NOSQL-8 と同一分類）。
 /// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
-fn bind_json_literal(
+pub(crate) fn bind_json_literal(
     s: &str,
     column_ty: &ColumnType,
     column_name: &str,

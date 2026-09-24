@@ -246,6 +246,52 @@ fn wire17_copy_from_stdin_missing_operation_id_is_rejected_before_copy_in_respon
     read_ready_for_query(&mut stream);
 }
 
+/// 列名の typo（列リストにスキーマ実在しない列名）は `CopyInResponse`
+/// （`G`）を送出する前に拒否されなければならない（codex-review 指摘・
+/// Issue #939 レビュー対応。修正前は各行のデコード時にしか検出できず、
+/// クライアントは既に copy mode へ入ってからデータ送信を開始してしまって
+/// いた）。`missing_operation_id` テストと同じ「`CopyInResponse` を送出して
+/// いないので接続状態は壊れていない」ことの確認まで含める。
+#[test]
+fn wire17_copy_from_stdin_unknown_column_is_rejected_before_copy_in_response() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, alng) FROM STDIN USING OPERATION_ID 'wire-copy-unknown-col'",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "22000");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
+    let _cols = read_row_description(&mut stream);
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "SELECT 0", "no row must have been committed");
+    read_ready_for_query(&mut stream);
+}
+
+/// 非 nullable 列（`lang`）が列リストから欠落している場合も、
+/// `CopyInResponse` を送出する前に拒否されなければならない（同上）。
+#[test]
+fn wire17_copy_from_stdin_missing_non_nullable_column_is_rejected_before_copy_in_response() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding) FROM STDIN USING OPERATION_ID 'wire-copy-missing-col'",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "22000");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
+    let _cols = read_row_description(&mut stream);
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "SELECT 0", "no row must have been committed");
+    read_ready_for_query(&mut stream);
+}
+
 #[test]
 fn wire17_copy_from_stdin_invalid_row_is_rejected_with_zero_side_effects() {
     let (core, _guard) = new_core_with_docs_table();

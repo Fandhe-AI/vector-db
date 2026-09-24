@@ -77,6 +77,13 @@ fn extended_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> Ta
             ),
             ColumnDef::new("blob", ColumnType::Bytea, true),
             ColumnDef::new("mood", ColumnType::Enum(enum_def), true),
+            // `JSON`／`JSONB` 列（Issue #939 レビュー指摘: `bind_copy_record`・
+            // `bound_insert_byte_len` の `Value`／`ColumnType` 網羅 match が
+            // origin/main の JSON/JSONB 追加（Issue #889）に追随しておらず
+            // `E0004`（non-exhaustive patterns）でビルド不能だった。本テーブルで
+            // COPY 経由の束縛を固定する）。
+            ColumnDef::new("doc", ColumnType::Json, true),
+            ColumnDef::new("docb", ColumnType::Jsonb, true),
         ],
     )
 }
@@ -497,6 +504,41 @@ fn copy_from_stdin_csv_format_binds_boolean_array_bytea_enum_columns() {
             ])),
             Cell::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
             Cell::Text("sad".to_string()),
+        ]
+    );
+}
+
+/// `JSON`／`JSONB` 列を COPY FROM STDIN で束縛できることを固定する
+/// （Issue #939 レビュー指摘。`docs/spec` の JSON 列ビヘイビア ID は
+/// TABLE-14・TASK-198・Issue #889 を参照）。`JSON` は入力テキストを
+/// そのまま保持し、`JSONB` はキー順を辞書順へ正規化・空白を除去して
+/// 保持する契約（`crate::json::canonicalize_jsonb_text`）を COPY 経路でも
+/// 維持することを確認する。
+#[test]
+fn copy_from_stdin_text_format_binds_json_and_jsonb_columns() {
+    let (core, path) = open_engine_ext("copy-from-ext-json");
+    let _guard = CleanupGuard(path);
+
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, doc, docb) FROM STDIN USING OPERATION_ID 'ext-op-json-1'"
+    );
+    // `doc`（JSON）は入力テキストをそのまま保持、`docb`（JSONB）はキー順が
+    // 入れ替わって正規化されることを確認する（`{"b":1,"a":2}` → `{"a":2,"b":1}`）。
+    let outcome = run_copy_from(
+        &core,
+        "acme",
+        &sql,
+        &[b"1\t[1.0,0.0]\t{ \"b\": 1, \"a\": 2 }\t{\"b\":1,\"a\":2}\n"],
+    )
+    .expect("COPY FROM STDIN succeeds");
+    assert_eq!(outcome.rows_affected, 1);
+
+    let cells = select_ext_cells(&core, "acme", 1, "doc, docb");
+    assert_eq!(
+        cells,
+        vec![
+            Cell::Json("{ \"b\": 1, \"a\": 2 }".to_string()),
+            Cell::Json("{\"a\":2,\"b\":1}".to_string()),
         ]
     );
 }

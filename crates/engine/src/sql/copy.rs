@@ -26,7 +26,8 @@ use crate::recovery::required_op_id::OperationId;
 use crate::row_codec::Value;
 use crate::sql::allowlist::{CopyFormat, SqlSurfaceError};
 use crate::sql::parser::{
-    bind_bytea_literal, bind_enum_literal, parse_array_literal, parse_vector_literal, BoundInsert,
+    bind_bytea_literal, bind_enum_literal, bind_json_literal, parse_array_literal,
+    parse_vector_literal, BoundInsert,
 };
 
 /// wire 層のホットパスで `lexer::tokenize` を増やさないための安価な覗き見
@@ -289,6 +290,7 @@ fn bind_copy_record(
                 ColumnType::Array(array_ty) => Value::Array(parse_array_literal(s, *array_ty)?),
                 ColumnType::Bytea => bind_bytea_literal(s, name)?,
                 ColumnType::Enum(def) => bind_enum_literal(def, s, name)?,
+                ColumnType::Json | ColumnType::Jsonb => bind_json_literal(s, &column.ty, name)?,
             },
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
@@ -356,6 +358,7 @@ fn bound_insert_byte_len(bound: &BoundInsert) -> Result<usize, SqlSurfaceError> 
             }
             Value::Bytes(b) => b.len(),
             Value::Enum(s) => s.len(),
+            Value::Json(s) => s.len(),
         };
         total = total
             .checked_add(value_len)
@@ -384,6 +387,42 @@ pub struct CopyInSession {
 }
 
 impl CopyInSession {
+    /// `columns`（`id` 疑似列を含む列リスト）が `schema` に対して構文的に
+    /// 自明な誤りを持たないかを、`CopyInResponse`（`G`）送出前に検証する
+    /// （codex-review 指摘・Issue #939 レビュー対応）。列名の typo や
+    /// 非 nullable 列の欠落は、修正前は各行のデコード時（1 行目の CopyData
+    /// 受信後）に初めて [`bind_copy_record`] が検出していたため、クライアントは
+    /// 既に copy mode（`CopyInResponse` 受領後）に入ってからデータ送信を
+    /// 開始してしまい、PostgreSQL 本家の「copy mode へ入る前に列リストを
+    /// テーブル定義と照合して拒否する」契約と乖離していた。本関数はその
+    /// 列リストの網羅性（列名の実在性・非 nullable 列の被覆）だけを検証し、
+    /// 個々の値の型・NULL 可否は引き続き [`bind_copy_record`] が行単位で担う
+    /// （第 2 の検証経路を増やさず、責務を「文レベル」と「行レベル」で分ける）。
+    fn validate_columns_against_schema(
+        columns: &[String],
+        schema: &TableSchema,
+    ) -> Result<(), SqlSurfaceError> {
+        for name in columns {
+            if name == "id" {
+                continue;
+            }
+            if !schema.columns.iter().any(|c| &c.name == name) {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "unknown column: {name}"
+                )));
+            }
+        }
+        for column in &schema.columns {
+            if !column.nullable && !columns.iter().any(|c| c == &column.name) {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "missing value for non-nullable column: {}",
+                    column.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         table: String,
         columns: Vec<String>,
@@ -391,8 +430,9 @@ impl CopyInSession {
         operation_id: Option<OperationId>,
         schema: TableSchema,
         limits: BatchLimits,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, SqlSurfaceError> {
+        Self::validate_columns_against_schema(&columns, &schema)?;
+        Ok(Self {
             table,
             columns,
             splitter: RecordSplitter::new(format),
@@ -402,7 +442,7 @@ impl CopyInSession {
             limits,
             bounds: Vec::new(),
             running_bytes: 0,
-        }
+        })
     }
 
     /// FROM 対象テーブル名（wire-server の CopyInResponse 送出前の分岐でも
