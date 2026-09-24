@@ -210,6 +210,18 @@ pub fn validate_typed_message_length_prefix<R: Read>(
     Ok(total_len)
 }
 
+/// 指定バイト数だけ読み捨てる（アロケーションせず `io::copy` で `io::sink()` へ
+/// 流す）。拡張クエリプロトコルのエラー後の同期回復（Issue #934・WIRE-11。
+/// `handshake::post_auth_loop` の `ignore_till_sync` モード）が、後続メッセージの
+/// 本文を解釈せず読み飛ばすために使う。`len` は呼び出し元が
+/// [`validate_typed_message_length_prefix`] 等で `MAX_MESSAGE_LEN` 以内と
+/// 確認済みの値であること（本関数自身は上限を検証しない）。
+pub fn discard_body<R: Read>(reader: &mut R, len: usize) -> Result<(), FrameError> {
+    let mut limited = reader.take(len as u64);
+    io::copy(&mut limited, &mut io::sink())?;
+    Ok(())
+}
+
 /// StartupMessage（SSLRequest/GSSENCRequest/CancelRequest を含む、認証前の最初の
 /// パケット）を読み取る。`MIN_STARTUP_LEN..=MAX_STARTUP_LEN` の範囲外は
 /// `Malformed`（`08P01`）に写像する（WIRE-10。`MAX_MESSAGE_LEN` 超過であっても

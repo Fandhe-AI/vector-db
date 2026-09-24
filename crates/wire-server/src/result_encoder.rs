@@ -680,6 +680,35 @@ pub fn encode_no_data() -> [u8; 5] {
     msg
 }
 
+/// `BindComplete`（'2'）。拡張クエリプロトコルの Bind（Issue #934・TASK-71・
+/// WIRE-11）が成功したことを示す固定応答。body なし・長さ固定（4）。
+pub fn encode_bind_complete() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b'2';
+    msg[1..5].copy_from_slice(&4i32.to_be_bytes());
+    msg
+}
+
+/// `CloseComplete`（'3'）。拡張クエリプロトコルの Close（Issue #934）が
+/// statement／portal いずれかを解放したことを示す固定応答（対象が未存在でも
+/// 同じ応答を返す。PostgreSQL と同じ挙動）。body なし・長さ固定（4）。
+pub fn encode_close_complete() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b'3';
+    msg[1..5].copy_from_slice(&4i32.to_be_bytes());
+    msg
+}
+
+/// `PortalSuspended`（'s'）。拡張クエリプロトコルの Execute（Issue #934）が
+/// `max_rows` 制限により行の送出を打ち切り、続きを次の Execute へ持ち越す
+/// ことを示す固定応答。body なし・長さ固定（4）。
+pub fn encode_portal_suspended() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b's';
+    msg[1..5].copy_from_slice(&4i32.to_be_bytes());
+    msg
+}
+
 /// `ErrorResponse`（'E'）body の `S`（severity）/`C`（sqlstate）/`M`（message）の
 /// 3 フィールドを `body` へ書き込む。フィールド終端（末尾の NUL）・フレーム化
 /// （`E` タグ・長さ）は呼び出し元が行う。

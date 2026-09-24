@@ -340,6 +340,22 @@ pub const MAX_STATEMENT_NAME_LEN: usize = 63;
 /// （本リポの実装既定値）。
 pub const MAX_PREPARED_SQL_BYTES_PER_SESSION: usize = 4 * 1024 * 1024;
 
+/// 接続単位で保持する名前付き portal 数の上限（Issue #934・TASK-71・WIRE-11。
+/// 拡張クエリプロトコルの Bind）。[`MAX_PREPARED_STATEMENTS_PER_SESSION`] と
+/// 同じ設計（無名 `""` は件数にカウントせず黙って置換する）。本リポの実装
+/// 既定値（spec は数値までは定めない）。
+pub const MAX_PORTALS_PER_SESSION: usize = 64;
+
+/// 1 個の portal が中断（`PortalSuspended`）中に保持できる、エンコード済み
+/// `DataRow` の合計バイト数上限（Issue #934）。`max_rows` による分割送出で
+/// 残り行をメモリ上に保持し続ける間の上限であり、`extended_query::Portal` が
+/// `Suspended` 状態へ遷移する直前（1 行も送出する前）に判定する。超過は
+/// `54000`（`PayloadTooLarge`）。本リポの実装既定値であり、`MAX_PORTALS_
+/// PER_SESSION` 個の portal が同時にこの上限いっぱいまで中断されうるため、
+/// セッション全体の上限ではなく portal 単体への上限として運用する
+/// （`docs/design/wire-extended-query-bind-execute-sync.md` 参照）。
+pub const MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION: usize = 16 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
