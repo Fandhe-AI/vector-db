@@ -522,8 +522,10 @@ impl ScalarIndex {
         col_nonnull_count.resize(column_count, 0);
 
         for (col_index, column) in schema.columns.iter().enumerate() {
-            match column.ty {
-                ColumnType::Text => {
+            match &column.ty {
+                // ENUM 列は TEXT と同じ辞書表現を共有する（Issue #890 D3。
+                // ラベルは短いため平均値長ゲートで除外されることは実質ない）。
+                ColumnType::Text | ColumnType::Enum(_) => {
                     // `acc` は 1 行につき列あたり高々 1 値しか追加されないため
                     // `row_count` が確保上限になる。倍増などの成長戦略による
                     // 余剰確保を避けるため、行走査を始める前に必要量ちょうどを
@@ -571,9 +573,13 @@ impl ScalarIndex {
                 if !is_indexed_column {
                     continue;
                 }
-                // 索引対象列は常に `TEXT`（上記の列単位除外により `BOOLEAN`／
-                // `VECTOR` は `per_column[col_index] == None` のまま到達しない）。
-                let Some(v) = v.as_text() else { continue };
+                // 索引対象列は常に `TEXT`／`ENUM`（上記の列単位除外により
+                // `BOOLEAN`／`VECTOR`／`BYTEA` は `per_column[col_index] == None`
+                // のまま到達しない）。`as_dictionary_text` で両者を同じ辞書
+                // 表現として扱う（Issue #890 D3）。
+                let Some(v) = v.as_dictionary_text() else {
+                    continue;
+                };
                 let v_len = v.len();
                 let (Some(&running), Some(&nonnull)) = (
                     col_running_bytes.get(col_index),

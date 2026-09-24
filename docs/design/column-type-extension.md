@@ -232,3 +232,120 @@ TABLE-13・TASK-197（Issue #886。関連: WIRE-13・NOSQL-17）で `ColumnType:
   `22P02` の新設（#897・TASK-227）、`WHERE` 述語・二次索引への `BYTEA` 対応
   （#891・#893）、SQL `CREATE TABLE` 構文での `BYTEA` 宣言（SQL-23 は未実装。
   宣言は Rust API の `TableSchema` 経由）。
+
+## #890 追記: ENUM 列型
+
+- 対象ビヘイビア（ポインタ表記のみ）: TABLE-14・TASK-198（関連: TABLE-6,
+  TABLE-7, TABLE-13, WIRE-13, WIRE-14, NOSQL-17, ERR-2, ERR-4, ERR-6,
+  TASK-227）。
+
+### D1: 名前付き型としてカタログに登録する（列ごとのインライン語彙は採らない）
+
+列ごとに語彙をインラインで持つ方式では型削除（`DROP TYPE`）を表現できない
+ため、名前付き型を新設テーブル `enum_types`（キー: 型名、値: バージョン付き
+blob）へ登録する方式を採用した。DDL は SQL-23（`CREATE TYPE ... AS ENUM`）
+が未実装のため Rust API 専用（`Storage::{create,get,alter_enum_type_add_value,
+drop}_enum_type`）。
+
+制約: ラベル数 1〜256（`MAX_ENUM_LABELS`）・ラベル長 1〜63 バイト
+（`MAX_ENUM_LABEL_LEN`）・制御文字禁止・重複禁止・宣言順保持。型名は識別子
+検証に加え組み込み型名（`text`/`vector`/`boolean`/`bytea`/`integer` 等。
+大文字小文字を区別しない）との衝突を拒否する（将来 SQL-23 の型名解決での
+曖昧さを先に塞ぐ）。登録可能な型数の上限は `MAX_LIST_TABLES` と同値。
+
+blob 形式: `u8` バージョン・`u16` ラベル数（LE）・各ラベル `u8` 長さ＋UTF-8
+本体。宣言数の上限をアロケーション前に検証してからデコードする。
+
+`catalog::decode_schema`（列定義のデコード）は ENUM 列の型名解決に txn
+経由のリゾルバを要求するため、`decode_schema_with_resolver` へ一般化した。
+production の呼び出し口は `get_table_schema_in_txn`（read txn）・
+`require_table_schema_write`（write txn）・`Storage::alter_table_add_column`
+の 3 箇所のみで、いずれも既に txn を保持しているためリゾルバの追加コストは
+小さい。`create_table`／`alter_table_add_column` は、呼び出し元が渡した
+`ColumnType::Enum` の `Arc<EnumTypeDef>` を信頼せず、この write txn から
+見えるカタログ登録済みの定義の実在のみを検証する（渡された語彙の中身は
+使わず、カタログは型名のみを永続化するため）。
+
+### D2: `ColumnType::Enum(Arc<EnumTypeDef>)` とし `Copy` を除去する
+
+`EnumTypeDef { name, labels }` はフィールドを private にし `name()`／
+`labels()`／`contains()`／`validate_label()` のみを公開する（engine・
+wire-server が語彙検証を委譲する単一情報源）。`ColumnType` から `Copy` を
+除去し、既存の呼び出し元は `&column.ty` での参照マッチ／`.clone()` へ移行
+した（`!=` 比較・`matches!` は参照を暗黙に取るため無変更で動作する）。
+
+### D3: 行にはラベル文字列を TEXT と同じフレームで格納する（序数は使わない）
+
+行バイト表現は presence タグ＋`u32` LE 長＋UTF-8 本体で、TEXT と完全に
+同じ枠（`scalar_text_entry_len`）を共有する。`row_codec::Value::Enum(String)`・
+`ScalarRef::Enum(&str)` を新設し、`ScalarRef::as_dictionary_text()`
+（`Text`／`Enum` のみ `Some`）を経由してスカラー列二次索引
+（`sql::scalar_index::ScalarIndex`）・`declarative_filter` の等価比較が
+TEXT と同じ辞書表現を共有する（二重実装にしない。受け入れ基準 3）。
+
+語彙検査は 2 段の多層防御を持つ: (1) 束縛時（`sql::parser::bind_enum_literal`。
+書き込みトランザクション開始前に `22P02`）、(2) `row_codec` の encode 時
+（`encode_row`／`encode_scalar_columns`／`merge_encode_scalar_columns`。
+Rust API から直接渡された `Value::Enum` もここで拒否する）。decode 時は
+語彙を検査しない（`ALTER TYPE ... ADD VALUE` 前に書いた行を将来にわたって
+読める契約を維持するため）。
+
+### D4: ALTER TYPE は「可。ただし末尾への追記（ADD VALUE）のみ」
+
+`BEFORE`/`AFTER` 指定・`RENAME VALUE`・削除・並べ替えはいずれも提供しない。
+行はラベル文字列を直接格納するため既存行は不変であり、語彙は単調に増える
+だけなので、古いスナップショットで有効だった値は書き込み時点でも常に有効
+（削除がないため）。追記は依存テーブルすべての世代を同一 write txn 内で
+進行させる（`dependent_tables_in_txn` によるテキスト走査。多層防御）。
+
+### D5: DROP TYPE
+
+依存列（当該型を参照する `ColumnType::Enum` 列）が 1 つでも残っていれば
+`CatalogError::DependentObjectsStillExist` で拒否する。SQL-23 結線時は
+`2BP01` へ写像する想定だが、本 variant は Rust API 専用で wire への送出
+経路を持たないため `ErrorClass` には追加しない。
+
+### D6: エラーコード `22P02` の新設
+
+`ErrorClass::InvalidTextRepresentation`（`22P02`。HTTP 400）を新設した
+（count 16→17）。SQL の INSERT/UPDATE（単一行 SET・述語形）/UPSERT と
+NoSQL の insert/update/filter に送出経路を持つ。エラーメッセージに語彙の
+一覧は含めない（型名とクライアント自身の入力値のみ）。`CatalogError` に
+`TypeNotFound`／`TypeAlreadyExists`／`DependentObjectsStillExist` を追加し
+（非 `non_exhaustive` な公開 enum への破壊的変更）、SQL 経路では既存の
+`Internal` へ丸める（DDL の SQL 表層結線が無いため）。型不一致（数値・真偽値
+リテラルを ENUM 列へ）は BYTEA の前例に倣い SQL `22000`・NoSQL `42601` の
+まま（BOOLEAN／BYTEA の既存分類の再分類はスコープ外・#897・TASK-227）。
+
+### D7: 述語・集計・投影の露出範囲
+
+- `WHERE <enum列> = '<label>'`: `Text` と同じ等価述語を受理し、語彙外は
+  `22P02`（PostgreSQL の enum 入力と同じ挙動）。索引の完全被覆を信頼する
+  経路（Issue #843/#844）は TEXT と同じ辞書・同じ等価意味論のため無変更で
+  安全。`LIKE`（前方一致）は TEXT 限定のまま `22000` で拒否。
+- 集計: `COUNT(<enum列>)`（非 NULL 行数）のみ受理し `AggregateInput::
+  EnumColumn` を新設。`SUM`/`AVG`/`MIN`/`MAX` は `22000`（PostgreSQL の enum
+  は宣言順で `MIN`/`MAX` 比較できるが、辞書順で代用すると意味論が食い違う
+  ため意図的に受理しない）。`GROUP BY` キー列は TEXT 限定のまま対象外。
+- UDF／式評価・hybrid 本文列・`USING PLAN`・scoring_boost への ENUM 列の
+  露出は BYTEA と同じく `22000` で拒否する。
+- 投影・`RETURNING`: `Value::Enum`／`ScalarRef::Enum` は既存の `Cell::Text`
+  へ写像する（表示が TEXT と同一のため wire 側の追加変更を抑える。BYTEA は
+  hex 表示が異なるため `Cell::Bytes` が必要だったが ENUM は不要）。
+- wire: RowDescription の OID は 25（既存の `WireType::Text` 経由。#895 の
+  OID 拡張対象外）。バイナリ形式指定は `BinaryFormatError::UnsupportedType`
+  （`0A000`）で拒否する。
+- NoSQL 表層: `insert`／`update` の JSON 表現はラベルの生文字列（BYTEA の
+  base64 とは異なり、ラベルは人間可読な識別子のため）。語彙外は `22P02`、
+  非文字列は `42601`（NOSQL-17 と同じ「型不一致は `42601`」方針）。
+- `content_hash::push_value` のタグは `Enum = 12`（Bytes=11 まで使用済み。
+  他型と衝突しない新規タグ）。
+
+### 対象外（申し送り）
+
+SQL の `CREATE TYPE ... AS ENUM`／`ALTER TYPE`／`DROP TYPE` 構文と
+`CREATE TABLE` での ENUM 列宣言（SQL-23・DDL 権限ゲート前提）、`2BP01` の
+`ErrorClass` 化（DROP TYPE の SQL 結線時）、NoSQL の `columns[].type` の
+型名整備（#896）、ENUM の宣言順比較・`ORDER BY`・`IN`・`IS [NOT] NULL`・
+`GROUP BY` キー、BOOLEAN／BYTEA の型不一致を `22P02` へ再分類する件
+（#897・TASK-227）、ENUM 配列（ARRAY #888 との組み合わせ）。

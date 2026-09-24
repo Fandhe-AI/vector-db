@@ -93,11 +93,28 @@ impl DeclarativeFilter {
         })?;
         let op = match &self.op {
             FilterOp::Equals(value) => {
-                if !matches!(column.ty, ColumnType::Text) {
-                    return Err(SqlSurfaceError::invalid_input(format!(
-                        "column {:?} is not a TEXT column",
-                        self.column
-                    )));
+                // ENUM 列は TEXT と同じ等価述語を受理する（Issue #890 D7。
+                // PostgreSQL の enum 入力と同様、語彙外のラベルは書き込み時と
+                // 同じ `22P02` で拒否する。二次索引〔`sql::scalar_index`〕は
+                // TEXT と同じ辞書を共有するため、この等価意味論のまま
+                // 索引経由の候補削減を信頼できる）。
+                match &column.ty {
+                    ColumnType::Text => {}
+                    ColumnType::Enum(def) => {
+                        if def.validate_label(value).is_err() {
+                            return Err(SqlSurfaceError::invalid_text_representation(format!(
+                                "column {:?} (enum {:?}) does not accept label {value:?}",
+                                self.column,
+                                def.name()
+                            )));
+                        }
+                    }
+                    ColumnType::Vector(_) | ColumnType::Boolean | ColumnType::Bytea => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {:?} is not a TEXT column",
+                            self.column
+                        )));
+                    }
                 }
                 check_literal_len(value)?;
                 FilterOp::Equals(value.clone())
@@ -200,7 +217,9 @@ impl MetadataFilter {
             return false;
         };
         match &self.op {
-            FilterOp::Equals(expected) => v.as_text() == Some(expected.as_str()),
+            // `as_dictionary_text` で TEXT／ENUM の両方を等価比較する
+            // （Issue #890 D7。二次索引〔`sql::scalar_index`〕と同じ辞書表現）。
+            FilterOp::Equals(expected) => v.as_dictionary_text() == Some(expected.as_str()),
             FilterOp::StartsWith(prefix) => v
                 .as_text()
                 .map(|s| s.starts_with(prefix.as_str()))

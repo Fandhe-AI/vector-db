@@ -123,6 +123,12 @@ pub enum Value {
     /// [`Value::Text`] と異なり、行バイト表現（presence + `u32` LE 長 + 本体）は
     /// 共有する。
     Bytes(Vec<u8>),
+    /// ENUM 列の値（TABLE-14・TASK-198、Issue #890）。ラベル文字列を TEXT と
+    /// 同じフレームで格納する（序数格納は採らない。`ColumnType::Enum` の
+    /// ドキュメント参照）。語彙検証は encode 時（[`encode_row`]）に行い、decode
+    /// 時は検査しない（Issue #890 D3。`ALTER TYPE ... ADD VALUE` 前に書いた行を
+    /// 将来にわたって読める契約を維持するため）。
+    Enum(String),
 }
 
 /// スカラー列走査（[`scan_scalar_columns`] 系）の借用結果。TEXT・BOOLEAN の
@@ -137,24 +143,43 @@ pub enum ScalarRef<'a> {
     ///
     /// [`as_text`]: ScalarRef::as_text
     Bytes(&'a [u8]),
+    /// `ENUM` 列の借用結果（Issue #890）。TEXT と行バイト表現を共有するが、
+    /// TEXT 前提の消費側（[`as_text`]）へは流入させない（`Bytea` と同じ方針）。
+    /// 等価比較・二次索引の辞書化は [`as_dictionary_text`] を経由する。
+    ///
+    /// [`as_text`]: ScalarRef::as_text
+    /// [`as_dictionary_text`]: ScalarRef::as_dictionary_text
+    Enum(&'a str),
 }
 
 impl<'a> ScalarRef<'a> {
     /// TEXT 前提の既存消費側（等価/前方一致フィルタ・二次索引・hybrid 本文・
-    /// GROUP BY キー等）が `Bool`／`Bytes` を取り違えて TEXT として扱わないよう、
+    /// GROUP BY キー等）が `Bool`／`Bytes`／`Enum` を取り違えて TEXT として扱わないよう、
     /// `Text` 以外は `None` を返す（fail-closed。呼び出し元はスキーマ型で
     /// 事前に対象外の列を除外するか、`None` を型不一致として拒否する）。
     pub fn as_text(&self) -> Option<&'a str> {
         match self {
             ScalarRef::Text(s) => Some(s),
-            ScalarRef::Bool(_) | ScalarRef::Bytes(_) => None,
+            ScalarRef::Bool(_) | ScalarRef::Bytes(_) | ScalarRef::Enum(_) => None,
         }
     }
 
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             ScalarRef::Bool(b) => Some(*b),
-            ScalarRef::Text(_) | ScalarRef::Bytes(_) => None,
+            ScalarRef::Text(_) | ScalarRef::Bytes(_) | ScalarRef::Enum(_) => None,
+        }
+    }
+
+    /// `Text`／`Enum` のみを許す辞書化アクセサ（Issue #890。スカラー列二次索引
+    /// 〔`sql::scalar_index::ScalarIndex`〕・`declarative_filter` の等価比較が
+    /// ENUM 列を TEXT 列と同じ辞書表現で扱えるようにするための限定共有。
+    /// `Bool`／`Bytes` は対象外のまま `None`（TABLE-14 が定める述語の範囲を
+    /// 超えて ENUM を露出しない）。
+    pub fn as_dictionary_text(&self) -> Option<&'a str> {
+        match self {
+            ScalarRef::Text(s) | ScalarRef::Enum(s) => Some(s),
+            ScalarRef::Bool(_) | ScalarRef::Bytes(_) => None,
         }
     }
 }
@@ -264,10 +289,48 @@ pub fn encode_row(
                 buf.extend_from_slice(&text_len.to_le_bytes());
                 buf.extend_from_slice(text_bytes);
             }
+            // ENUM 列の値（Issue #890 D3）。行バイト表現は TEXT と同一フレーム
+            // （presence + `u32` LE 長 + UTF-8 本体）を共有するが、書き込み前に
+            // 語彙を検査する多層防御を持つ（束縛層〔`sql::parser::bind_enum_literal`〕
+            // に加え、Rust API から直接渡された `Value::Enum` もここで拒否する）。
+            Value::Enum(label) => {
+                let def = match &column.ty {
+                    ColumnType::Enum(def) => def,
+                    ColumnType::Text
+                    | ColumnType::Vector(_)
+                    | ColumnType::Boolean
+                    | ColumnType::Bytea => {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Enum value, got Enum",
+                            column.name
+                        )))
+                    }
+                };
+                if def.validate_label(label).is_err() {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} does not accept label {label:?} for enum type {:?}",
+                        column.name,
+                        def.name()
+                    )));
+                }
+                let text_bytes = label.as_bytes();
+                let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid(format!(
+                        "enum label too long: {} bytes",
+                        text_bytes.len()
+                    ))
+                })?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&text_len.to_le_bytes());
+                buf.extend_from_slice(text_bytes);
+            }
             Value::Vector(vector) => {
-                let expected_dim = match column.ty {
-                    ColumnType::Vector(dim) => dim,
-                    ColumnType::Text | ColumnType::Boolean | ColumnType::Bytea => {
+                let expected_dim = match &column.ty {
+                    ColumnType::Vector(dim) => *dim,
+                    ColumnType::Text
+                    | ColumnType::Boolean
+                    | ColumnType::Bytea
+                    | ColumnType::Enum(_) => {
                         return Err(RowCodecError::Invalid(format!(
                             "column {:?} expects a non-Vector value, got Vector",
                             column.name
@@ -408,8 +471,8 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                 }
                 values.push(Value::Null);
             }
-            PRESENCE_VALUE => match column.ty {
-                ColumnType::Text => {
+            PRESENCE_VALUE => match &column.ty {
+                ColumnType::Text | ColumnType::Enum(_) => {
                     let len_bytes = buf
                         .get(
                             offset..offset.checked_add(4).ok_or_else(|| {
@@ -449,9 +512,18 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         })?
                         .to_string();
                     offset = text_end;
-                    values.push(Value::Text(text));
+                    // ENUM 列のデコードは語彙を検査しない（Issue #890 D3。
+                    // `ALTER TYPE ... ADD VALUE` 前に書いた行、または将来
+                    // ラベルが削除されない契約〔本実装は削除 API を持たない〕
+                    // により、常に格納済みの値をそのまま読める）。
+                    if matches!(column.ty, ColumnType::Enum(_)) {
+                        values.push(Value::Enum(text));
+                    } else {
+                        values.push(Value::Text(text));
+                    }
                 }
                 ColumnType::Vector(expected_dim) => {
+                    let expected_dim = *expected_dim;
                     let dim_bytes = buf
                         .get(
                             offset..offset.checked_add(4).ok_or_else(|| {
@@ -677,6 +749,39 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.extend_from_slice(&text_len.to_le_bytes());
                 buf.extend_from_slice(text_bytes);
             }
+            Value::Enum(label) => {
+                let def = match &column.ty {
+                    ColumnType::Enum(def) => def,
+                    ColumnType::Text
+                    | ColumnType::Vector(_)
+                    | ColumnType::Boolean
+                    | ColumnType::Bytea => {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Enum value, got Enum",
+                            column.name
+                        )))
+                    }
+                };
+                if def.validate_label(label).is_err() {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} does not accept label {label:?} for enum type {:?}",
+                        column.name,
+                        def.name()
+                    )));
+                }
+                let text_bytes = label.as_bytes();
+                let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid(format!(
+                        "enum label too long: {} bytes",
+                        text_bytes.len()
+                    ))
+                })?;
+                let entry_len = scalar_text_entry_len(text_len)?;
+                reserve(&mut buf, entry_len)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&text_len.to_le_bytes());
+                buf.extend_from_slice(text_bytes);
+            }
             Value::Vector(_) => {
                 return Err(RowCodecError::Invalid(format!(
                     "column {:?} expects a non-Vector value, got Vector",
@@ -850,6 +955,28 @@ pub(crate) fn merge_encode_scalar_columns(
                     }
                     write_text(&mut buf, &mut reserve, text.as_bytes())?;
                 }
+                Value::Enum(label) => {
+                    let def = match &column.ty {
+                        ColumnType::Enum(def) => def,
+                        ColumnType::Text
+                        | ColumnType::Vector(_)
+                        | ColumnType::Boolean
+                        | ColumnType::Bytea => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "column {:?} expects a non-Enum value, got Enum",
+                                column.name
+                            )))
+                        }
+                    };
+                    if def.validate_label(label).is_err() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} does not accept label {label:?} for enum type {:?}",
+                            column.name,
+                            def.name()
+                        )));
+                    }
+                    write_text(&mut buf, &mut reserve, label.as_bytes())?;
+                }
                 Value::Vector(_) => {
                     return Err(RowCodecError::Invalid(format!(
                         "column {:?} expects a non-Vector value, got Vector",
@@ -896,6 +1023,13 @@ pub(crate) fn merge_encode_scalar_columns(
                 }
                 Some(ScalarRef::Text(text)) => {
                     write_text(&mut buf, &mut reserve, text.as_bytes())?;
+                }
+                // 既存の ENUM 値をそのまま再書き込みする（SET 対象でない列）。
+                // 既に格納済みの値であり、語彙は書き込み時（encode_row 系）に
+                // 一度検査済みのため、ここで再検査する必要はない（Issue #890 D3。
+                // decode 側は語彙を検査しない契約と対称）。
+                Some(ScalarRef::Enum(label)) => {
+                    write_text(&mut buf, &mut reserve, label.as_bytes())?;
                 }
                 Some(ScalarRef::Bool(b)) => {
                     reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
@@ -1032,7 +1166,7 @@ fn scan_scalar_columns_validated<'a>(
                 }
                 sink(col_index, None)?;
             }
-            PRESENCE_VALUE => match column.ty {
+            PRESENCE_VALUE => match &column.ty {
                 ColumnType::Boolean => {
                     let byte = *buf.get(offset).ok_or_else(|| {
                         RowCodecError::Invalid(
@@ -1059,7 +1193,7 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
-                ColumnType::Text | ColumnType::Vector(_) => {
+                ColumnType::Text | ColumnType::Vector(_) | ColumnType::Enum(_) => {
                     let len_bytes = buf
                         .get(
                             offset..offset.checked_add(4).ok_or_else(|| {
@@ -1100,12 +1234,17 @@ fn scan_scalar_columns_validated<'a>(
                     // マスクで要求されなかった列（`validate_scalar_columns` 経由は常に
                     // 全列非要求）は、検証済みの `&str` を破棄して `None` を渡すことで
                     // `&str` 生成・保持コストのみを省略する（Issue #350: 必要列限定
-                    // デコード）。
+                    // デコード）。ENUM 列は decode 時に語彙検査しない（Issue #890 D3）。
                     let text = std::str::from_utf8(text_bytes).map_err(|_| {
                         RowCodecError::Invalid("text field is not valid UTF-8".to_string())
                     })?;
+                    let is_enum = matches!(column.ty, ColumnType::Enum(_));
                     if wanted {
-                        sink(col_index, Some(ScalarRef::Text(text)))?;
+                        if is_enum {
+                            sink(col_index, Some(ScalarRef::Enum(text)))?;
+                        } else {
+                            sink(col_index, Some(ScalarRef::Text(text)))?;
+                        }
                     } else {
                         sink(col_index, None)?;
                     }
@@ -1201,6 +1340,14 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
                 })?;
                 owned.push_str(text);
                 values.push(Value::Text(owned));
+            }
+            Some(ScalarRef::Enum(label)) => {
+                let mut owned = String::new();
+                owned.try_reserve_exact(label.len()).map_err(|_| {
+                    RowCodecError::Invalid("failed to reserve enum field".to_string())
+                })?;
+                owned.push_str(label);
+                values.push(Value::Enum(owned));
             }
             Some(ScalarRef::Bool(b)) => values.push(Value::Bool(b)),
             Some(ScalarRef::Bytes(bytes)) => {

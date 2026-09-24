@@ -849,6 +849,14 @@ pub(crate) fn execute_statement_with_cache(
                         )?;
                         kept.push(Value::Text(owned));
                     }
+                    Some(row_codec::ScalarRef::Enum(label)) => {
+                        let owned = try_alloc_text_for_budget(
+                            label,
+                            &mut candidate_scalar_bytes,
+                            MAX_CANDIDATE_SCALAR_BYTES,
+                        )?;
+                        kept.push(Value::Enum(owned));
+                    }
                     Some(row_codec::ScalarRef::Bool(b)) => {
                         kept.push(Value::Bool(b));
                     }
@@ -1836,6 +1844,7 @@ pub(crate) fn execute_statement_with_cache(
                 .iter()
                 .map(|v| match v {
                     Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
+                    Value::Enum(label) => Some(row_codec::ScalarRef::Enum(label.as_str())),
                     Value::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
                     Value::Bytes(b) => Some(row_codec::ScalarRef::Bytes(b.as_slice())),
                     Value::Null | Value::Vector(_) => None,
@@ -2031,7 +2040,7 @@ pub(crate) fn execute_statement_with_cache(
                 ty: schema
                     .columns
                     .get(*index)
-                    .map(|c| c.ty)
+                    .map(|c| c.ty.clone())
                     .unwrap_or(ColumnType::Text),
             },
             ProjectedColumn::Computed { name, .. } => ColumnMeta::Computed { name: name.clone() },
@@ -2168,6 +2177,15 @@ fn decode_deferred_scalars(
                         )
                     })?;
                 out.push(Value::Text(owned));
+            }
+            Some(row_codec::ScalarRef::Enum(label)) => {
+                let owned = try_alloc_text_for_budget(label, budget, MAX_CANDIDATE_SCALAR_BYTES)
+                    .map_err(|_| {
+                        SqlSurfaceError::payload_too_large(
+                            "deferred scalar projection exceeds candidate budget",
+                        )
+                    })?;
+                out.push(Value::Enum(owned));
             }
             Some(row_codec::ScalarRef::Bool(b)) => out.push(Value::Bool(b)),
             Some(row_codec::ScalarRef::Bytes(bytes)) => {
@@ -2396,7 +2414,7 @@ fn project_rows(
                             .ok_or_else(|| SqlSurfaceError::Internal {
                                 detail: "projected column index out of range".to_string(),
                             })?;
-                    match column.ty {
+                    match &column.ty {
                         ColumnType::Vector(_) => {
                             cells.push(Cell::Vector(try_clone_embedding(embedding)?))
                         }
@@ -2405,7 +2423,25 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Bool(_))
-                            | Some(Value::Bytes(_)) => {
+                            | Some(Value::Bytes(_))
+                            | Some(Value::Enum(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        // ENUM 列の投影は既存の `Cell::Text` に写像する（Issue #890
+                        // D7。表示形式が TEXT と同一のため wire 側の追加変更を
+                        // 抑えられる。`RETURNING`／NoSQL 応答も同じ写像を共有する）。
+                        ColumnType::Enum(_) => match decoded.get(*index) {
+                            Some(Value::Enum(label)) => {
+                                cells.push(Cell::Text(try_clone_text(label)?))
+                            }
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Bytes(_))
+                            | Some(Value::Text(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2416,7 +2452,8 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
-                            | Some(Value::Bytes(_)) => {
+                            | Some(Value::Bytes(_))
+                            | Some(Value::Enum(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2437,7 +2474,8 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
-                            | Some(Value::Bool(_)) => {
+                            | Some(Value::Bool(_))
+                            | Some(Value::Enum(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })

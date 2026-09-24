@@ -228,6 +228,12 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(11);
             b.push_bytes(bytes)?;
         }
+        // ENUM 値は TABLE-13 の宣言順で 12 とする（Issue #890）。TEXT と同じ
+        // 長さ前置方式だが、型タグの違いだけで TEXT とハッシュを区別する。
+        Value::Enum(label) => {
+            b.push_u8(12);
+            b.push_bytes(label.as_bytes())?;
+        }
     }
     Ok(())
 }

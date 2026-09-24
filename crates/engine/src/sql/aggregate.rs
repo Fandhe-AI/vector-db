@@ -131,7 +131,8 @@ impl ReferencedColumns {
             match &item.input {
                 AggregateInput::TextColumn(index)
                 | AggregateInput::BooleanColumn(index)
-                | AggregateInput::ByteaColumn(index) => {
+                | AggregateInput::ByteaColumn(index)
+                | AggregateInput::EnumColumn(index) => {
                     has_scalar_reference = true;
                     if let Some(slot) = scalar_mask.get_mut(*index) {
                         *slot = true;
@@ -335,6 +336,16 @@ impl Accumulator {
             // BYTEA 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
             // が SUM/AVG/MIN/MAX を型不整合として拒否済み。Issue #886）。
             AggregateInput::ByteaColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
+            // ENUM 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
+            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。TABLE-14・TASK-198、
+            // Issue #890）。
+            AggregateInput::EnumColumn(index) => {
                 if scanned.get(*index).copied().flatten().is_some() {
                     self.observe_present()
                 } else {

@@ -326,9 +326,11 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .columns
         .iter()
         .enumerate()
-        .find_map(|(idx, c)| match c.ty {
-            ColumnType::Vector(dim) => Some((idx, dim)),
-            ColumnType::Text | ColumnType::Boolean | ColumnType::Bytea => None,
+        .find_map(|(idx, c)| match &c.ty {
+            ColumnType::Vector(dim) => Some((idx, *dim)),
+            ColumnType::Text | ColumnType::Boolean | ColumnType::Bytea | ColumnType::Enum(_) => {
+                None
+            }
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
@@ -362,11 +364,14 @@ pub(crate) fn text_column_index(
                 .columns
                 .get(idx)
                 .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-            match column.ty {
+            match &column.ty {
                 ColumnType::Text => Ok(idx),
-                ColumnType::Vector(_) | ColumnType::Boolean | ColumnType::Bytea => Err(
-                    SqlSurfaceError::invalid_input(format!("column {name:?} is not a TEXT column")),
-                ),
+                ColumnType::Vector(_)
+                | ColumnType::Boolean
+                | ColumnType::Bytea
+                | ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is not a TEXT column"
+                ))),
             }
         })
 }
@@ -1104,9 +1109,9 @@ fn bind_insert_row(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-        let value = match (column.ty, literal) {
+        let value = match (&column.ty, literal) {
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+                crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
             }
             (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -1131,6 +1136,12 @@ fn bind_insert_row(
             (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a bytea hex literal"
+                )))
+            }
+            (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
+            (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a text literal for its enum type"
                 )))
             }
         };
@@ -1177,6 +1188,27 @@ fn bind_bytea_literal(
         )),
         Err(_) => Err(SqlSurfaceError::invalid_input(format!(
             "column {column_name:?} expects a valid bytea hex literal (\\x...)"
+        ))),
+    }
+}
+
+/// `ENUM` 列向けの文字列リテラルを [`crate::row_codec::Value::Enum`] へ束縛する
+/// 共通ヘルパー（TABLE-14・TASK-198、Issue #890）。INSERT・UPDATE（単一行 SET・
+/// 述語形）・UPSERT の各束縛箇所が同じ検証・エラー分類を共有する
+/// （[`bind_bytea_literal`] と同じ設計）。語彙外のラベルは書き込みトランザクション
+/// 開始前に `22P02`（[`SqlSurfaceError::invalid_text_representation`]）で拒否する。
+/// エラーメッセージには語彙の一覧を含めない（型名とクライアント自身の入力値のみ。
+/// security.md P0「情報漏えい」対応）。
+fn bind_enum_literal(
+    def: &crate::catalog::EnumTypeDef,
+    s: &str,
+    column_name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    match def.validate_label(s) {
+        Ok(()) => Ok(crate::row_codec::Value::Enum(s.to_string())),
+        Err(_) => Err(SqlSurfaceError::invalid_text_representation(format!(
+            "column {column_name:?} (enum {:?}) does not accept label {s:?}",
+            def.name()
         ))),
     }
 }
@@ -1285,9 +1317,9 @@ fn bind_set_assignments(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-        let value = match (column.ty, literal) {
+        let value = match (&column.ty, literal) {
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+                crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
             }
             (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -1312,6 +1344,12 @@ fn bind_set_assignments(
             (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a bytea hex literal"
+                )))
+            }
+            (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
+            (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a text literal for its enum type"
                 )))
             }
         };
@@ -1809,9 +1847,9 @@ fn bind_upsert_assignments(
                 BoundUpsertValue::Excluded(src_idx)
             }
             UpsertValue::Literal(literal) => {
-                let v = match (column.ty, literal) {
+                let v = match (&column.ty, literal) {
                     (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
-                        crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+                        crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
                     }
                     (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
@@ -1838,6 +1876,14 @@ fn bind_upsert_assignments(
                     (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a bytea hex literal"
+                        )))
+                    }
+                    (ColumnType::Enum(def), InsertLiteral::String(s)) => {
+                        bind_enum_literal(def, s, name)?
+                    }
+                    (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a text literal for its enum type"
                         )))
                     }
                 };
@@ -1916,7 +1962,7 @@ fn bind_file_insert(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-        let value = match (column.ty, literal) {
+        let value = match (&column.ty, literal) {
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
@@ -1944,6 +1990,12 @@ fn bind_file_insert(
             (ColumnType::Bytea, _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: BYTEA column is not supported for file-form INSERT"
+                )))
+            }
+            // ENUM 列も同じ理由で対象外とする（Issue #890）。
+            (ColumnType::Enum(_), _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: ENUM column is not supported for file-form INSERT"
                 )))
             }
         };
@@ -2035,6 +2087,12 @@ pub(crate) enum AggregateInput {
     /// `MAX` は `BooleanColumn` と同じパターンで [`resolve_aggregate_input`] が
     /// 型不整合として拒否する。
     ByteaColumn(usize),
+    /// `ENUM` 列の裸の列参照（`COUNT` 限定。TABLE-14・TASK-198、Issue #890）。
+    /// `SUM`/`AVG`/`MIN`/`MAX` は `BooleanColumn`／`ByteaColumn` と同じパターンで
+    /// [`resolve_aggregate_input`] が型不整合として拒否する（PostgreSQL の enum は
+    /// 宣言順で `MIN`/`MAX` 比較できるが、辞書順で代用すると意味論が食い違うため
+    /// 意図的に受理しない。Issue #890 D7）。
+    EnumColumn(usize),
     /// 上記以外の `Scalar` 型に束縛された式（列参照 `id` 単体を除く。`vec_norm(...)`
     /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`program`（束縛時に
     /// ステップ列コンパイル済み、Issue #353）を行ループで評価する。`source` は
@@ -2437,7 +2495,7 @@ fn resolve_aggregate_input(
                 .enumerate()
                 .find(|(_, c)| &c.name == name)
             {
-                return match (column.ty, func) {
+                return match (&column.ty, func) {
                     (ColumnType::Text, AggregateFunc::Sum | AggregateFunc::Avg) => {
                         Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} is TEXT and cannot be used with SUM/AVG"
@@ -2461,6 +2519,12 @@ fn resolve_aggregate_input(
                     }
                     (ColumnType::Bytea, _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is BYTEA and cannot be used with SUM/AVG/MIN/MAX"
+                    ))),
+                    (ColumnType::Enum(_), AggregateFunc::Count) => {
+                        Ok(AggregateInput::EnumColumn(index))
+                    }
+                    (ColumnType::Enum(_), _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is ENUM and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
                 };
             }
@@ -2732,7 +2796,7 @@ fn resolve_group_by_column(schema: &TableSchema, column: &str) -> Result<usize, 
         .position(|c| c.name == column)
         .filter(|&idx| {
             matches!(
-                schema.columns.get(idx).map(|c| c.ty),
+                schema.columns.get(idx).map(|c| c.ty.clone()),
                 Some(ColumnType::Text)
             )
         })

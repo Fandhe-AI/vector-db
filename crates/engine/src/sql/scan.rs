@@ -175,9 +175,12 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
         match col {
             ProjectedColumn::Column { index, .. } => {
                 if let Some(column) = schema.columns.get(*index) {
-                    match column.ty {
+                    match &column.ty {
                         ColumnType::Vector(_) => needs_embedding = true,
-                        ColumnType::Text | ColumnType::Boolean | ColumnType::Bytea => {
+                        ColumnType::Text
+                        | ColumnType::Boolean
+                        | ColumnType::Bytea
+                        | ColumnType::Enum(_) => {
                             has_scalar_reference = true;
                             if let Some(slot) = scalar_mask.get_mut(*index) {
                                 *slot = true;
@@ -250,7 +253,7 @@ pub fn execute_scan(
                         })?;
                 ColumnMeta::Scalar {
                     name: name.clone(),
-                    ty: column.ty,
+                    ty: column.ty.clone(),
                 }
             }
             ProjectedColumn::Computed { name, .. } => ColumnMeta::Computed { name: name.clone() },
@@ -432,7 +435,7 @@ pub fn execute_scan(
                                 detail: "projected column index out of range".to_string(),
                             }
                         })?;
-                        match column.ty {
+                        match &column.ty {
                             ColumnType::Vector(_) => {
                                 // `dim == 0` は `VECTOR` 列が未設定（NULL。TABLE-5 の
                                 // 追加列を含む）という `storage::Row` の既存契約
@@ -494,6 +497,25 @@ pub fn execute_scan(
                                         "BYTEA column scan yielded a non-Bytea scalar value",
                                     ))
                                 }
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            // ENUM 列は既存の `Cell::Text` へ写像する（Issue #890 D7。
+                            // `sql::exec` の投影と同じ扱い）。
+                            ColumnType::Enum(_) => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_dictionary_text() {
+                                    Some(t) => {
+                                        cells.push(Cell::Text(try_alloc_text_for_budget(
+                                            t,
+                                            &mut byte_budget,
+                                            MAX_SCAN_RESULT_BYTES,
+                                        )?));
+                                    }
+                                    None => {
+                                        return Err(scan_bug(
+                                            "ENUM column scan yielded a non-Enum scalar value",
+                                        ))
+                                    }
+                                },
                                 Some(None) | None => cells.push(Cell::Null),
                             },
                         }
