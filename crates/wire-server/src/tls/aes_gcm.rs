@@ -231,7 +231,14 @@ impl Aes128Gcm {
     /// `H` を強制的にゼロ化する（`Drop` から呼ぶ本体。テストから直接
     /// 呼んでゼロ化を確認する）。
     fn wipe(&mut self) {
-        self.h = (0, 0);
+        // `H` をバイト列へ写してから `zeroize`（black_box ヒント付き）で
+        // ゼロ化し、その結果を書き戻す。`self.h = (0, 0)` という素朴な代入は
+        // オプティマイザに dead store として除去されうるため避ける
+        // （module doc「ゼロ化の限界」参照。それでも最適化により消去が
+        // 省略されない保証はない）。
+        let mut bytes = pair_to_block(self.h);
+        zeroize(&mut bytes);
+        self.h = block_to_pair(&bytes);
     }
 }
 
