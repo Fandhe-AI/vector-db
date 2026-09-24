@@ -3688,6 +3688,9 @@ impl EngineCore {
                     // BYTEA は TEXT と同じく本体長のみを数える（フレーミングの
                     // オーバーヘッドは他の値種別も同様に含めていないため対称、Issue #886）。
                     crate::row_codec::Value::Bytes(b) => b.len(),
+                    // ENUM 値はラベル文字列の本体長のみを数える（TEXT と同じ
+                    // フレーミング。Issue #890）。
+                    crate::row_codec::Value::Enum(s) => s.len(),
                 };
                 row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
                     crate::sql::allowlist::SqlSurfaceError::payload_too_large(

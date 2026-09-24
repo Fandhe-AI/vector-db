@@ -252,6 +252,12 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(11);
             b.push_bytes(bytes)?;
         }
+        // ENUM 値は TABLE-13 の宣言順で 12 とする（Issue #890）。TEXT と同じ
+        // 長さ前置方式だが、型タグの違いだけで TEXT とハッシュを区別する。
+        Value::Enum(label) => {
+            b.push_u8(12);
+            b.push_bytes(label.as_bytes())?;
+        }
     }
     Ok(())
 }
@@ -1041,6 +1047,19 @@ mod tests {
         let text_hash = for_typed_insert(1, Visibility::Public, &[], &[("blob", &text_value)])
             .expect("hash text");
         assert_ne!(bytes_hash, text_hash);
+    }
+
+    // ENUM（タグ 12）と TEXT（タグ 1）は本体バイト列が完全一致していても
+    // 型タグの違いだけで別ハッシュになる（Issue #890。golden な区別の固定）。
+    #[test]
+    fn enum_and_text_values_produce_different_hashes_even_with_matching_bytes() {
+        let enum_value = Value::Enum("happy".to_string());
+        let text_value = Value::Text("happy".to_string());
+        let enum_hash = for_typed_insert(1, Visibility::Public, &[], &[("mood", &enum_value)])
+            .expect("hash enum");
+        let text_hash = for_typed_insert(1, Visibility::Public, &[], &[("mood", &text_value)])
+            .expect("hash text");
+        assert_ne!(enum_hash, text_hash);
     }
 
     // 同一の BYTEA 値からは同じハッシュが再現する（再送判定の前提）。
