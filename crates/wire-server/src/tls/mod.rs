@@ -13,6 +13,10 @@
 //! - [`record`]: レコード層（RFC 8446 §5.1。#952）。ヘッダ検証・
 //!   parse/serialize・受信バッファの組み立てを担い、鍵・暗号・状態を
 //!   一切持たない（`record` のドキュメンテーションコメントを参照）
+//! - [`handshake`]: ハンドシェイクメッセージ層（RFC 8446 §4。#953）。
+//!   最小集合 6 種の parse/serialize と、レコード境界をまたぐ再組み立てを
+//!   担う。拡張の意味解釈・状態機械・暗号は持たない（`handshake` の
+//!   ドキュメンテーションコメントを参照）
 //! - [`hkdf`]: HMAC-SHA-256（RFC 2104）・HKDF-Extract/Expand（RFC 5869）・
 //!   `HKDF-Expand-Label`／`Derive-Secret`（RFC 8446 §7.1）の原始操作
 //!   （Issue #956）。ハッシュ本体は `engine::crypto::sha256`（SCRAM-SHA-256 認証・Issue #940 が切り出し済み）を再利用する
@@ -27,6 +31,7 @@
 //! 追加していく想定。
 
 pub(crate) mod field25519;
+pub mod handshake;
 pub mod hkdf;
 pub mod key_schedule;
 pub mod record;

@@ -101,6 +101,8 @@ impl ScoringBoost {
             ColumnType::Text => {}
             ColumnType::Vector(_)
             | ColumnType::Boolean
+            | ColumnType::Date
+            | ColumnType::Timestamp
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json

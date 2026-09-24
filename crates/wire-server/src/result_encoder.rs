@@ -360,6 +360,14 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
             ty: engine::catalog::ColumnType::Json | engine::catalog::ColumnType::Jsonb,
             ..
         } => false,
+        // `DATE`／`TIMESTAMP` 列（TABLE-13・TASK-197、Issue #884）も本 Issue
+        // （#936・WIRE-14）の策定時点では未存在の型のため、バイナリ表現は
+        // spec 側で未決定。`VECTOR`・`BOOLEAN` 等と同様に fail-closed で
+        // 非対応とする。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Date | engine::catalog::ColumnType::Timestamp,
+            ..
+        } => false,
         // 実行時型（Float/Bool/Vector）が静的に決まらないため fail-closed
         // で非対応とする（#895 で型情報が付いたら見直す）。
         ColumnMeta::Computed { .. } => false,
@@ -464,6 +472,11 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         }
         Cell::Float(f) => Ok(Some(f.to_string())),
         Cell::Bool(b) => Ok(Some(if *b { "t".to_string() } else { "f".to_string() })),
+        // ISO テキストへ整形する（`engine::datetime` が単一情報源。TABLE-13・
+        // TASK-197、Issue #884。RowDescription の OID は #895 まで既存どおり
+        // `25`（TEXT 相当）のまま不変）。
+        Cell::Date(days) => Ok(Some(engine::datetime::format_date(*days))),
+        Cell::Timestamp(micros) => Ok(Some(engine::datetime::format_timestamp(*micros))),
         Cell::Array(array_value) => Ok(Some(pg_array_text(array_value))),
         // `BYTEA` のテキスト表現は PostgreSQL 既定の `bytea_output=hex`（`\x` ＋
         // 小文字 16 進）と同形にする（B5・Issue #886）。
@@ -633,6 +646,8 @@ where
                     | Cell::Vector(_)
                     | Cell::Float(_)
                     | Cell::Bool(_)
+                    | Cell::Date(_)
+                    | Cell::Timestamp(_)
                     | Cell::Array(_)
                     | Cell::Bytes(_)
                     | Cell::Json(_) => {

@@ -3661,6 +3661,10 @@ impl EngineCore {
                     }
                     // BOOLEAN 値は行コーデック上 1 バイト固定（Issue #883・D-a）。
                     crate::row_codec::Value::Bool(_) => 1,
+                    // DATE／TIMESTAMP 値は行コーデック上それぞれ 4／8 バイト固定
+                    // （Issue #884・D-3）。
+                    crate::row_codec::Value::Date(_) => 4,
+                    crate::row_codec::Value::Timestamp(_) => 8,
                     // 配列値（Issue #888）は実際の行コーデック（`row_codec::
                     // scalar_array_entry_len`）が書き込むフレーム込みの全
                     // エンコード長をそのまま使う（presence(1)・flags(1)・

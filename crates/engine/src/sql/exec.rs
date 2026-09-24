@@ -205,8 +205,16 @@ pub enum Cell {
     Vector(Vec<f32>),
     /// 式項目（TASK-79・SQL-9）の `Scalar` 型評価結果。
     Float(f64),
-    /// 式項目（TASK-79・SQL-9）の `Bool` 型評価結果。
+    /// 式項目（TASK-79・SQL-9）の `Bool` 型評価結果。BOOLEAN 列（TABLE-13・
+    /// TASK-196、Issue #883）の投影結果もこの variant を共有する。
     Bool(bool),
+    /// `DATE` 列の投影結果（TABLE-13・TASK-197、Issue #884）。1970-01-01 起点の
+    /// 日数。テキスト整形は [`crate::datetime::format_date`] に委譲する。
+    Date(i32),
+    /// `TIMESTAMP` 列の投影結果（TABLE-13・TASK-197、Issue #884）。1970-01-01
+    /// 00:00:00 起点のマイクロ秒（タイムゾーンなし）。テキスト整形は
+    /// [`crate::datetime::format_timestamp`] に委譲する。
+    Timestamp(i64),
     /// 配列列（TABLE-14・TASK-198、Issue #888）の投影結果。
     Array(row_codec::ArrayValue),
     /// `BYTEA` 列の投影結果（Issue #886）。
@@ -888,6 +896,12 @@ pub(crate) fn execute_statement_with_cache(
                     }
                     Some(row_codec::ScalarRef::Bool(b)) => {
                         kept.push(Value::Bool(b));
+                    }
+                    Some(row_codec::ScalarRef::Date(d)) => {
+                        kept.push(Value::Date(d));
+                    }
+                    Some(row_codec::ScalarRef::Timestamp(t)) => {
+                        kept.push(Value::Timestamp(t));
                     }
                     Some(row_codec::ScalarRef::Array(array_ref)) => {
                         let value = try_alloc_array_for_budget(
@@ -1891,6 +1905,8 @@ pub(crate) fn execute_statement_with_cache(
                     Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
                     Value::Enum(label) => Some(row_codec::ScalarRef::Enum(label.as_str())),
                     Value::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
+                    Value::Date(d) => Some(row_codec::ScalarRef::Date(*d)),
+                    Value::Timestamp(t) => Some(row_codec::ScalarRef::Timestamp(*t)),
                     // 配列列は宣言的フィルタ（TEXT 前提）の対象外。`Vector` と
                     // 同じく型不一致として `None` へ倒す（D-A8）。
                     Value::Null | Value::Vector(_) | Value::Array(_) => None,
@@ -2236,6 +2252,8 @@ fn decode_deferred_scalars(
                 out.push(Value::Enum(owned));
             }
             Some(row_codec::ScalarRef::Bool(b)) => out.push(Value::Bool(b)),
+            Some(row_codec::ScalarRef::Date(d)) => out.push(Value::Date(d)),
+            Some(row_codec::ScalarRef::Timestamp(t)) => out.push(Value::Timestamp(t)),
             Some(row_codec::ScalarRef::Array(array_ref)) => {
                 let value =
                     try_alloc_array_for_budget(array_ref, budget, MAX_CANDIDATE_SCALAR_BYTES)
@@ -2490,6 +2508,8 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -2509,6 +2529,8 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -2523,6 +2545,40 @@ fn project_rows(
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
+                            | Some(Value::Array(_))
+                            | Some(Value::Bytes(_))
+                            | Some(Value::Json(_))
+                            | Some(Value::Enum(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Date => match decoded.get(*index) {
+                            Some(Value::Date(d)) => cells.push(Cell::Date(*d)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Timestamp(_))
+                            | Some(Value::Array(_))
+                            | Some(Value::Bytes(_))
+                            | Some(Value::Json(_))
+                            | Some(Value::Enum(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Timestamp => match decoded.get(*index) {
+                            Some(Value::Timestamp(t)) => cells.push(Cell::Timestamp(*t)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
@@ -2540,6 +2596,8 @@ fn project_rows(
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_)) => {
@@ -2564,6 +2622,8 @@ fn project_rows(
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
                             | Some(Value::Array(_))
                             | Some(Value::Json(_))
                             | Some(Value::Enum(_)) => {
@@ -2578,6 +2638,8 @@ fn project_rows(
                             Some(Value::Vector(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
                             | Some(Value::Array(_))
                             | Some(Value::Bytes(_))
                             | Some(Value::Enum(_)) => {
