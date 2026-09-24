@@ -90,12 +90,14 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // base（main）取り込みマージで `catalog.rs` 冒頭側にさらに行が追加され、
     // 再度追随（旧: 1540／1619）。Issue #885（NUMERIC / DECIMAL 列型）マージ
     // 取り込みで `catalog.rs` にさらに行が追加され、再度追随（旧: 1567）。
-    ("catalog.rs", 1639),
+    // Issue #887（UUID 列型）で `catalog.rs` にさらに行が追加され、再度追随
+    // （旧: 1639）。
+    ("catalog.rs", 1653),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない。
-    ("catalog.rs", 1718),
+    ("catalog.rs", 1732),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

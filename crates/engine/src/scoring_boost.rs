@@ -108,7 +108,8 @@ impl ScoringBoost {
             | ColumnType::Json
             | ColumnType::Jsonb
             | ColumnType::Enum(_)
-            | ColumnType::Numeric { .. } => {
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {:?} is not a TEXT column",
                     self.column

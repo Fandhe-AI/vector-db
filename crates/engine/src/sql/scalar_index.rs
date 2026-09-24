@@ -566,7 +566,11 @@ impl ScalarIndex {
                 | ColumnType::Bytea
                 | ColumnType::Json
                 | ColumnType::Jsonb
-                | ColumnType::Numeric { .. } => per_column.push(None),
+                | ColumnType::Numeric { .. }
+                // `UUID` 列も同じ理由で索引対象外（等価述語自体が束縛時点で
+                // UUID 列を拒否済み〔TABLE-13〔検討中〕・TASK-197、Issue #887・
+                // U9〕のため到達しない。二次索引化は #893 へ申し送り）。
+                | ColumnType::Uuid => per_column.push(None),
             }
         }
 

@@ -291,6 +291,15 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(13);
             b.push_bytes(label.as_bytes())?;
         }
+        // UUID 値は TABLE-13〔検討中〕・TASK-197、Issue #887。タグ 14 は
+        // NUMERIC（Issue #885）が使用済みのため、次点の未使用タグ 15 を
+        // 確保する。ハッシュ対象は束縛後の正規値（16 バイト生値）のため、
+        // 同一列への大文字・小文字違いの同一値再送は同一ハッシュ（`23505`）に
+        // 収束する。
+        Value::Uuid(u) => {
+            b.push_u8(15);
+            b.push_raw(u.as_bytes());
+        }
     }
     Ok(())
 }

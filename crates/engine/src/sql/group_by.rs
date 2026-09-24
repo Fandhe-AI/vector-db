@@ -716,7 +716,8 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         | Cell::Array(_)
         | Cell::Bytes(_)
         | Cell::Json(_)
-        | Cell::Numeric(_) => false,
+        | Cell::Numeric(_)
+        | Cell::Uuid(_) => false,
     }
 }
 
