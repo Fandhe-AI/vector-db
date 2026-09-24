@@ -1943,15 +1943,18 @@ impl<'a> Parser<'a> {
             Some(Token::Ident(s)) if s.eq_ignore_ascii_case("false") => {
                 Ok(InsertLiteral::Bool(false))
             }
-            // 負数リテラル（`-1.5` 等。TABLE-13〔検討中〕・TASK-197、Issue #885・
-            // D6）。字句解析器は `-` を独立した `Punct('-')` として出すため、
-            // 直後に `Number` が続く場合のみ 1 つの負数リテラルとして受理する
-            // （`InsertLiteral` の variant は増やさず `Number` へ符号を連結する）。
+            // 符号付き数値リテラル（`-1.5`・`+1.5` 等。TABLE-13〔検討中〕・TASK-197、
+            // Issue #885・D6、および PR #1020 codex-review 指摘対応で `+` も追加）。
+            // 字句解析器は `-`/`+` を独立した `Punct` として出すため、直後に
+            // `Number` が続く場合のみ 1 つの符号付き数値リテラルとして受理する
+            // （`InsertLiteral` の variant は増やさず `Number` へ符号を連結する。
+            // `+` は `NUMERIC` の解析側〔`numeric::parse_for_column`〕がそのまま
+            // 受理する表記のため符号文字を保持したまま連結する）。
             // 非 NUMERIC 列（`id`・TEXT・VECTOR・BOOLEAN）へ与えた場合、従来は
             // ここで構文エラー（`42601`）だったが、以降は束縛時の型不一致・
             // 不正値（`22000`）で拒否される（拒否されること自体は変わらない）。
-            Some(Token::Punct('-')) => match self.advance() {
-                Some(Token::Number(n)) => Ok(InsertLiteral::Number(format!("-{n}"))),
+            Some(&Token::Punct(sign @ ('-' | '+'))) => match self.advance() {
+                Some(Token::Number(n)) => Ok(InsertLiteral::Number(format!("{sign}{n}"))),
                 other => Err(SqlSurfaceError::unsupported(format!(
                     "expected literal value, got {other:?}"
                 ))),

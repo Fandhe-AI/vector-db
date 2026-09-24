@@ -762,6 +762,48 @@ fn negative_number_and_string_literal_bind_to_same_value() {
     assert_eq!(by_id.get(&2), Some(&Cell::Numeric(d(-150, 2))));
 }
 
+/// PR #1020 codex-review 指摘対応: 設計 doc（`docs/design/column-type-extension.md`
+/// 「#885 追記」節）が受理すると明記した数値リテラル文法
+/// `[+-]?(digits)?(\.digits?)?` のうち、字句解析器（`sql::sql::lexer`）が整数から
+/// しか開始できず・符号は `sql::allowlist::Parser::expect_literal` が `-` しか
+/// 連結しなかったため `+1.5`・`.5`・`5.`（および符号付きの同形）が SQL 経路では
+/// `42601`（構文エラー）で拒否されていた不整合を固定する（数値トークンとしての
+/// 受理。文字列リテラル形は元々 `numeric::parse_for_column` が直接受理していた）。
+#[test]
+fn numeric_literal_grammar_accepts_leading_trailing_dot_and_plus_sign() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let cases: &[(u64, &str, i128)] = &[
+        (1, "+1.5", 150),
+        (2, ".5", 50),
+        (3, "5.", 500),
+        (4, "-.5", -50),
+        (5, "-5.", -500),
+        (6, "+.5", 50),
+        (7, "+5.", 500),
+    ];
+    for (id, literal, expected_unscaled) in cases {
+        core.execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &insert_sql(*id, "ja", literal, *id),
+        )
+        .unwrap_or_else(|err| panic!("literal {literal:?} should be accepted: {err:?}"));
+        let result = core
+            .execute_sql(
+                &alice,
+                &format!("SELECT id, price FROM {TABLE} WHERE id = {id} LIMIT 1"),
+            )
+            .expect("select should succeed");
+        assert_eq!(
+            result.rows[0].cells[1],
+            Cell::Numeric(d(*expected_unscaled, 2)),
+            "literal {literal:?} should bind to unscaled {expected_unscaled}"
+        );
+    }
+}
+
 /// 負数リテラル `-5` を非 NUMERIC 列（TEXT）へ与えた場合、従来の構文エラー
 /// （`42601`）から束縛時の型不一致（`22000`）へ変わる（D6・#881 と同じ意図の
 /// 差分。拒否されること自体は変わらない）。
