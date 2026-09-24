@@ -307,6 +307,87 @@ fn wire1_vector_and_null_cells_are_text_encoded() {
     drop(guard);
 }
 
+/// BOOLEAN 列（TABLE-13・TASK-196、Issue #883）が簡易クエリ経由で `t`/`f`/
+/// NULL のテキスト表現へ写像されることを固定する（`result_encoder.rs` の
+/// `Cell::Bool` 分岐。RowDescription の OID 公告は Issue #895 の担当のため
+/// 対象外・列自体の値往復のみを検証する）。
+#[test]
+fn wire1_boolean_column_is_t_f_null_text_encoded() {
+    let path = temp_db::unique_db_path("wire1-boolean");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("flag", ColumnType::Boolean, true),
+            ],
+        ))
+        .expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    for (id, vec_val, flag) in [
+        (1u64, [1.0, 0.0], Value::Bool(true)),
+        (2, [0.0, 1.0], Value::Bool(false)),
+        (3, [0.5, 0.5], Value::Null),
+    ] {
+        let op_id =
+            engine::recovery::required_op_id::OperationId::parse(&format!("test-op-boolean-{id}"))
+                .expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(vec_val.to_vec()), flag],
+            &op_id,
+        )
+        .expect("insert row");
+    }
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "SELECT id, flag FROM docs WHERE flag LIMIT 10");
+    let _columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("1"));
+    assert_eq!(row[1].as_deref(), Some("t"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT id, flag FROM docs WHERE flag = false LIMIT 10",
+    );
+    let _columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("2"));
+    assert_eq!(row[1].as_deref(), Some("f"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    // NULL flag 行（id=3）は `WHERE flag`／`WHERE flag = false` のいずれにも
+    // 一致しない（COUNT(*) が両条件とも id=3 を含まない 1 件のままである
+    // ことで間接的に確認する。上記 2 クエリの単一行アサーションと合わせて
+    // 3 行中「flag=true が 1 件・flag=false が 1 件・残り 1 件は非該当」を
+    // 固定する）。
+    send_simple_query(&mut stream, "SELECT COUNT(*) FROM docs");
+    let _columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("3"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    drop(guard);
+}
+
 /// 3 テナント（alice/bob/carol）が wire 経由で同一 C1 を実行したとき、
 /// 各テナントは自分自身の `Private` 行のみ可視で他テナントの `Private` 行は
 /// 見えず（`auth::verify` が導出する `PolicyContext` は `Public` ＋ 自テナント

@@ -761,7 +761,10 @@ pub(crate) fn execute_statement_with_cache(
         // メント参照）。
         if is_hybrid && !skip_sparse_accumulation {
             if let Some(idx) = text_column_index {
-                if let Some(Some(t)) = scanned.get(idx) {
+                if let Some(Some(t)) = scanned
+                    .get(idx)
+                    .map(|v| v.as_ref().and_then(|v| v.as_text()))
+                {
                     if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
                         return Err(ArenaError::CapacityExceeded);
                     }
@@ -820,13 +823,16 @@ pub(crate) fn execute_statement_with_cache(
                 }
                 match slot {
                     None => kept.push(Value::Null),
-                    Some(t) => {
+                    Some(row_codec::ScalarRef::Text(t)) => {
                         let owned = try_alloc_text_for_budget(
                             t,
                             &mut candidate_scalar_bytes,
                             MAX_CANDIDATE_SCALAR_BYTES,
                         )?;
                         kept.push(Value::Text(owned));
+                    }
+                    Some(row_codec::ScalarRef::Bool(b)) => {
+                        kept.push(Value::Bool(b));
                     }
                 }
             }
@@ -1800,10 +1806,11 @@ pub(crate) fn execute_statement_with_cache(
             let Some(columns) = candidate_columns.get(slot) else {
                 continue;
             };
-            let scanned: Vec<Option<&str>> = columns
+            let scanned: Vec<Option<row_codec::ScalarRef<'_>>> = columns
                 .iter()
                 .map(|v| match v {
-                    Value::Text(t) => Some(t.as_str()),
+                    Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
+                    Value::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
                     Value::Null | Value::Vector(_) => None,
                 })
                 .collect();
@@ -2126,7 +2133,7 @@ fn decode_deferred_scalars(
         }
         match slot {
             None => out.push(Value::Null),
-            Some(t) => {
+            Some(row_codec::ScalarRef::Text(t)) => {
                 let owned = try_alloc_text_for_budget(t, budget, MAX_CANDIDATE_SCALAR_BYTES)
                     .map_err(|_| {
                         SqlSurfaceError::payload_too_large(
@@ -2135,6 +2142,7 @@ fn decode_deferred_scalars(
                     })?;
                 out.push(Value::Text(owned));
             }
+            Some(row_codec::ScalarRef::Bool(b)) => out.push(Value::Bool(b)),
         }
     }
     Ok(out)
@@ -2359,7 +2367,16 @@ fn project_rows(
                         ColumnType::Text => match decoded.get(*index) {
                             Some(Value::Text(t)) => cells.push(Cell::Text(try_clone_text(t)?)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_)) => {
+                            Some(Value::Vector(_)) | Some(Value::Bool(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Boolean => match decoded.get(*index) {
+                            Some(Value::Bool(b)) => cells.push(Cell::Bool(*b)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_)) | Some(Value::Text(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })

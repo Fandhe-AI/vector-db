@@ -542,7 +542,11 @@ impl ScalarIndex {
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     per_column.push(Some(acc));
                 }
-                ColumnType::Vector(_) => per_column.push(None),
+                // `VECTOR` 列・`BOOLEAN` 列はいずれも索引対象外（BOOLEAN は
+                // Issue #883・D-e。値域が 2 値のため索引化コストに見合わず、
+                // 対応述語 `BoolEquals` は常に plain scan——`scalar_plan.rs`
+                // 参照——のまま据え置く）。
+                ColumnType::Vector(_) | ColumnType::Boolean => per_column.push(None),
             }
         }
 
@@ -564,6 +568,9 @@ impl ScalarIndex {
                 if !is_indexed_column {
                     continue;
                 }
+                // 索引対象列は常に `TEXT`（上記の列単位除外により `BOOLEAN`／
+                // `VECTOR` は `per_column[col_index] == None` のまま到達しない）。
+                let Some(v) = v.as_text() else { continue };
                 let v_len = v.len();
                 let (Some(&running), Some(&nonnull)) = (
                     col_running_bytes.get(col_index),
@@ -789,6 +796,10 @@ impl ScalarIndex {
                 .map(|s| s.to_vec())
                 .unwrap_or_default(),
             FilterOp::StartsWith(prefix) => column.prefix_slots(prefix),
+            // BOOLEAN 列は索引化しない（`per_column` が常に `None`。上の
+            // `?` で既にここへ到達しない）ため構造的に到達しないが、
+            // 網羅性のため fail-closed に `None` を返す。
+            FilterOp::BoolEquals(_) => return None,
         };
         result.sort_unstable();
         Some(result)
