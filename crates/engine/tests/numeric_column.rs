@@ -496,6 +496,42 @@ fn update_single_row_set_numeric_column() {
     assert_eq!(result.rows[0].cells[0], Cell::Numeric(d(250, 2)));
 }
 
+/// 述語つき UPDATE（SQL-19。#871・#1016 で単一行 UPDATE と
+/// `merge_encode_scalar_columns` を共有する経路）が SET 対象でない
+/// NUMERIC 列を再エンコードしても値を保つことを固定する（Issue #885 の
+/// origin/main 取り込み後に追加された `merge_encode_scalar_columns` の
+/// `Some(ScalarRef::Numeric(d))` 分岐の到達性検証）。
+#[test]
+fn predicate_update_on_other_column_preserves_numeric_value() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &insert_sql(1, "ja", "3.14", 1),
+    )
+    .expect("insert should succeed");
+
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &format!(
+            "UPDATE {TABLE} SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-predicate-lang'"
+        ),
+    )
+    .expect("predicate UPDATE on lang should succeed");
+    let result = core
+        .execute_sql(&alice, &format!("SELECT lang, price FROM {TABLE} LIMIT 1"))
+        .expect("select should succeed");
+    assert_eq!(result.rows[0].cells[0], Cell::Text("en".to_string()));
+    assert_eq!(
+        result.rows[0].cells[1],
+        Cell::Numeric(d(314, 2)),
+        "NUMERIC column not targeted by SET must survive re-encode via the predicate UPDATE path"
+    );
+}
+
 #[test]
 fn upsert_do_update_set_excluded_numeric_column() {
     let (core, path) = new_core();

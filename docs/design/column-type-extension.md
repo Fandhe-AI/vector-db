@@ -560,9 +560,13 @@ scale }` を追加した。`DECIMAL` は別名として扱うだけで、カタ�
   非 NUMERIC 列（`id`・TEXT・VECTOR・BOOLEAN）へ `-5` を与えた場合の
   `wire_code` を `42601`（構文エラー）から `22000`（束縛時の型不一致）へ
   変える（拒否されること自体は変わらない。#881 と同じ意図の差分）。
-- **content_hash**（D7）: `push_value` のタグは `Numeric = 10`（Null=0／
-  Text=1／Vector=2／Bool=7 は不変。3〜6 は INTEGER/BIGINT/REAL/DOUBLE、8〜9
-  は DATE/TIMESTAMP 向けに予約）。入力は `scale`（1 バイト）+ `unscaled`
+- **content_hash**（D7）: `push_value` のタグは当初宣言順の `Numeric = 10`
+  を想定していたが、origin/main への rebase 取り込みで ARRAY（Issue #888）が
+  タグ 10 を先に使用していたため、衝突しない未使用タグ `Numeric = 14`
+  （Null=0／Text=1／Vector=2／Bool=7／Array=10／Bytes=11／Json=12／Enum=13 は
+  不変。3〜6 は INTEGER/BIGINT/REAL/DOUBLE、8〜9 は DATE/TIMESTAMP 向けに予約）
+  へ採番し直した（NUMERIC の content_hash はこの時点まで一度も永続化されて
+  いないため後方互換の懸念なし）。入力は `scale`（1 バイト）+ `unscaled`
   （`i128` LE 16 バイト）で、束縛後の正規値に対してハッシュを取るため、
   同一列への `1.10` と `1.1` の再送は同一内容（`23505`）に収束する。
 - **出力表現**（D8）: 正規テキストは「符号、整数部、（`scale > 0` のときのみ）
@@ -574,9 +578,12 @@ scale }` を追加した。`DECIMAL` は別名として扱うだけで、カタ�
   `MIN`/`MAX` は `22000` で拒否する（`AggregateInput::NumericColumn`）。
   `GROUP BY` キー列は既存のとおり TEXT 限定のため NUMERIC 列は構造的に
   拒否される（変更不要）。
-- **WHERE・式・二次索引**: `declarative_filter::MetadataFilter::bind` の
-  既存の `!matches!(column.ty, ColumnType::Text)`／`Boolean` 判定が NUMERIC
-  列も構造的に拒否するため変更不要。式中の列参照（`sql::udf_call`）・
+- **WHERE・式・二次索引**: `declarative_filter::MetadataFilter::bind` は
+  当初 `!matches!(column.ty, ColumnType::Text)`／`Boolean` の否定判定により
+  NUMERIC 列も構造的に拒否できる想定だったが、origin/main への rebase 取り込み
+  （ARRAY・JSON/JSONB 列型）で当該判定が許可型を列挙する明示的な `match` へ
+  変わっていたため、`ColumnType::Numeric { .. }` の明示的な拒否腕を追加した
+  （網羅性はコンパイラが強制）。式中の列参照（`sql::udf_call`）・
   `sql::scalar_index`（索引対象外）・`sql::scan`（DecodeTier 分類）・
   `sql::using_plan`（本文列規約）はいずれも明示的な拒否・除外腕を追加した。
 - **wire-server**: `result_encoder.rs::cell_to_text`・`http/query/response.rs`

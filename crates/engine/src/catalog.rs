@@ -144,6 +144,10 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "real",
     "double",
     "numeric",
+    // `DECIMAL` は `NUMERIC` の別名（TABLE-13〔検討中〕・TASK-197、Issue #885。
+    // カタログの型タグは `numeric` の 1 つに固定するが、SQL-23 の型名解決での
+    // 曖昧さを避けるため別名も予約する）。
+    "decimal",
     "date",
     "timestamp",
     "uuid",

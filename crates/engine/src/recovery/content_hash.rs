@@ -216,13 +216,16 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
         }
         // タグ 3〜6 は INTEGER/BIGINT/REAL/DOUBLE（別 Issue の作業）向けに予約し、
         // BOOLEAN は TABLE-13 の宣言順で 7 とする（Issue #883。他の型と衝突しない
-        // 新規タグ）。8〜9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約し、
-        // NUMERIC は宣言順で 10 とする（TABLE-13〔検討中〕・TASK-197、
-        // Issue #885）。ハッシュ対象は束縛後の正規値（`scale` + `unscaled`）
-        // のため、同一列へ再送された `1.10` と `1.1` は同一ハッシュ（`23505`）に
-        // 収束する。
+        // 新規タグ）。8〜9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約する。
+        // NUMERIC は当初宣言順の 10 を想定していたが、base（main）マージ取り込みで
+        // ARRAY（Issue #888）がタグ 10 を先に使用していたため、Issue #885 の
+        // origin/main への rebase 時点（NUMERIC の content_hash はまだ一度も
+        // 永続化されていないため後方互換の懸念なし）で衝突しない未使用タグ 14 へ
+        // 採番し直した（ENUM のタグ 13 の次点）。ハッシュ対象は束縛後の正規値
+        // （`scale` + `unscaled`）のため、同一列へ再送された `1.10` と `1.1` は
+        // 同一ハッシュ（`23505`）に収束する。
         Value::Numeric(d) => {
-            b.push_u8(10);
+            b.push_u8(14);
             b.push_u8(d.scale());
             b.push_bytes(&d.unscaled().to_le_bytes())?;
         }
