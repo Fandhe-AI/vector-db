@@ -64,12 +64,23 @@ const _: () = assert!(
     "row_codec::MAX_SCALAR_PAYLOAD_LEN must stay in sync with storage::MAX_METADATA_LEN"
 );
 
-// `JSON`／`JSONB` 列（Issue #889）は TEXT と同じ presence + `u32 LE` 長 + 本体の
-// 枠を共有するため、`json::MAX_JSON_FIELD_LEN` と `MAX_TEXT_FIELD_LEN` の値を
-// 一致させる（片方だけの変更を防ぐ）。
+// `JSON`／`JSONB` 列（Issue #889）は TEXT と同じ presence(1) + `u32 LE` 長(4) +
+// 本体の枠を共有する。`json::MAX_JSON_FIELD_LEN` は「この列 1 個だけが対象行の
+// スカラーペイロードを占める場合、フレーミング込みでも `MAX_SCALAR_PAYLOAD_LEN`
+// に収まる」性質（PR #1014 レビュー指摘対応。`json.rs::MAX_JSON_FIELD_LEN` の
+// ドキュメント参照）を持たせる必要があり、`MAX_TEXT_FIELD_LEN` と同値にすると
+// フレーミング分だけ超過してしまうため意図的に一致させない。片方だけの変更で
+// この性質が崩れるのを防ぐため、下記 2 条件をコンパイル時に強制する。
 const _: () = assert!(
-    crate::json::MAX_JSON_FIELD_LEN == MAX_TEXT_FIELD_LEN as usize,
-    "json::MAX_JSON_FIELD_LEN must stay in sync with row_codec::MAX_TEXT_FIELD_LEN"
+    crate::json::MAX_JSON_FIELD_LEN as u128 + SCALAR_TEXT_ENTRY_OVERHEAD as u128
+        <= MAX_SCALAR_PAYLOAD_LEN as u128,
+    "json::MAX_JSON_FIELD_LEN + SCALAR_TEXT_ENTRY_OVERHEAD must fit within \
+     row_codec::MAX_SCALAR_PAYLOAD_LEN"
+);
+
+const _: () = assert!(
+    crate::json::MAX_JSON_FIELD_LEN <= MAX_TEXT_FIELD_LEN as usize,
+    "json::MAX_JSON_FIELD_LEN must not exceed row_codec::MAX_TEXT_FIELD_LEN"
 );
 
 /// `TEXT` 列 1 個分のフレーミングオーバーヘッド（presence タグ 1 バイト＋長さ
@@ -2022,6 +2033,53 @@ mod tests {
             matches!(result, Err(RowCodecError::Invalid(_))),
             "cumulative scalar payload length must be rejected before allocation"
         );
+    }
+
+    /// `JSON` 列 1 個だけが対象行のスカラーペイロードを占める場合、
+    /// `json::MAX_JSON_FIELD_LEN`（フレーミング込みでちょうど
+    /// `MAX_SCALAR_PAYLOAD_LEN` に収まるよう定義済み）ちょうどの本文が
+    /// `encode_scalar_columns` を成功させることを固定する（PR #1014 レビュー
+    /// 指摘対応。旧定義〔`MAX_TEXT_FIELD_LEN` と同値〕では、束縛層
+    /// （`sql::parser::bind_json_literal`）が受理したこの境界値の入力が、
+    /// presence(1) + 長さ(4) バイトのフレーミング分だけ `MAX_SCALAR_PAYLOAD_LEN`
+    /// を超過し、`encode_scalar_columns` 側で拒否され得た）。
+    #[test]
+    fn encode_scalar_columns_accepts_json_column_at_exact_field_length_limit() {
+        let target = crate::json::MAX_JSON_FIELD_LEN;
+        // 単一の文字列リテラルは `MAX_JSON_STRING_CHARS`（1 MiB）に抵触するため、
+        // `json.rs` の境界値テストと同じ方式（複数要素の配列）で目標バイト数を
+        // ちょうど組み立てる: `[` + 5 要素（`"`×2 + 本体） + 4 個の `,` + `]`。
+        let overhead = 1 + 1 + 4 + 5 * 2;
+        let content_total = target - overhead;
+        let base = content_total / 5;
+        let remainder = content_total % 5;
+        let lens = [base, base, base, base, base + remainder];
+        assert!(lens.iter().all(|&l| l < crate::json::MAX_JSON_STRING_CHARS));
+        let mut doc = String::new();
+        doc.push('[');
+        for (i, len) in lens.iter().enumerate() {
+            if i > 0 {
+                doc.push(',');
+            }
+            doc.push('"');
+            doc.push_str(&"a".repeat(*len));
+            doc.push('"');
+        }
+        doc.push(']');
+        assert_eq!(doc.len(), target);
+        crate::json::validate_json_column_text(&doc).expect("valid json at exact limit");
+
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("doc", ColumnType::Json, true),
+            ],
+        );
+        let values = vec![Value::Vector(vec![0.1, 0.2]), Value::Json(doc)];
+        let encoded = encode_scalar_columns(&schema, &values)
+            .expect("a single MAX_JSON_FIELD_LEN column must fit MAX_SCALAR_PAYLOAD_LEN");
+        assert_eq!(encoded.len() as u32, MAX_SCALAR_PAYLOAD_LEN);
     }
 
     #[test]

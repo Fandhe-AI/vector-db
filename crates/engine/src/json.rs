@@ -549,10 +549,20 @@ pub fn parse_json(s: &str) -> Result<JsonValue, JsonError> {
 }
 
 /// `JSON`／`JSONB` 列（TABLE-14・TASK-198、Issue #889）1 件あたりの最大バイト長。
-/// `row_codec::MAX_TEXT_FIELD_LEN`（4 MiB）と同値とし、TEXT 列と同じ枠（presence +
-/// `u32 LE` 長 + UTF-8 本体）で行バイト列へ格納できることを保証する
-/// （`row_codec.rs` の `const` アサーションで一致を機械検証）。
-pub const MAX_JSON_FIELD_LEN: usize = 4 * 1024 * 1024;
+/// `row_codec::encode_scalar_columns` は TEXT 列と同じ枠（presence 1 バイト +
+/// `u32 LE` 長 4 バイト + UTF-8 本体）でこの値をスカラーペイロードへ書き込むため、
+/// 本定数はそのフレーミング分（`row_codec::SCALAR_TEXT_ENTRY_OVERHEAD`）を差し引いた
+/// `row_codec::MAX_SCALAR_PAYLOAD_LEN` 以下に定義する（`row_codec.rs` の `const`
+/// アサーションで機械検証）。これにより、この列 1 個だけが対象行のスカラー
+/// ペイロードを占める場合、[`validate_json_column_text`]／[`canonicalize_jsonb_text`]
+/// を通過した入力は `encode_scalar_columns` で確実に格納できる（PR #1014 レビュー
+/// 指摘対応。旧定義は `row_codec::MAX_TEXT_FIELD_LEN` と同値だったため、ちょうど
+/// 上限の入力がフレーミング分だけ `MAX_SCALAR_PAYLOAD_LEN` を超え、束縛層
+/// （`sql::parser::bind_json_literal`）を通過した後に `encode_scalar_columns` 側で
+/// 拒否され得た）。同一行に他のスカラー列がある場合の累計超過は `encode_scalar_columns`
+/// が持つ TEXT 列と共通の契約であり、本定数は単一列分の収容のみを保証する。
+pub const MAX_JSON_FIELD_LEN: usize = (crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+    - crate::row_codec::SCALAR_TEXT_ENTRY_OVERHEAD) as usize;
 
 /// [`validate_json_column_text`]／[`canonicalize_jsonb_text`] の失敗を表す分類済み
 /// エラー（Issue #889 D1）。private spec（TABLE-14・TASK-198）の受理規則違反は

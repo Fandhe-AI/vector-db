@@ -3780,6 +3780,62 @@ mod tests {
         );
     }
 
+    /// `bind_json_literal`（`sql::parser::bind_insert_row` から呼ばれる束縛層の
+    /// 単一チョークポイント）は `MAX_JSON_FIELD_LEN` を 1 バイトでも超える入力を
+    /// `54000`（`PayloadTooLarge`）で拒否する（PR #1014 レビュー指摘対応）。
+    #[test]
+    fn bind_json_literal_rejects_body_one_byte_over_max_json_field_len() {
+        let oversized = "1".repeat(crate::json::MAX_JSON_FIELD_LEN + 1);
+        let err = bind_json_literal(&oversized, ColumnType::Json, "doc").unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// `MAX_JSON_FIELD_LEN` ちょうどの有効な JSON は束縛層を通過し、かつその
+    /// 束縛結果（`Value::Json`）が実際の `row_codec::encode_scalar_columns`
+    /// （presence(1) + 長さ(4) バイトのフレーミングを付与する行コーデック）でも
+    /// 単独で `MAX_SCALAR_PAYLOAD_LEN` へ収まることを固定する。旧
+    /// `MAX_JSON_FIELD_LEN` 定義（`MAX_TEXT_FIELD_LEN` と同値）では、この境界値が
+    /// 束縛層を通過した**後**にフレーミング分だけ `encode_scalar_columns` 側で
+    /// 拒否され得た（codex-review P1 指摘・PR #1014）。
+    #[test]
+    fn bind_json_literal_at_exact_max_json_field_len_fits_scalar_payload_after_encode() {
+        // 単一の文字列リテラルは `MAX_JSON_STRING_CHARS`（1 MiB）に抵触するため、
+        // `json.rs` の境界値テストと同じ方式（複数要素の配列）で目標バイト数を
+        // ちょうど組み立てる: `[` + 5 要素（`"`×2 + 本体） + 4 個の `,` + `]`。
+        let target = crate::json::MAX_JSON_FIELD_LEN;
+        let overhead = 1 + 1 + 4 + 5 * 2;
+        let content_total = target - overhead;
+        let base = content_total / 5;
+        let remainder = content_total % 5;
+        let lens = [base, base, base, base, base + remainder];
+        let mut doc = String::new();
+        doc.push('[');
+        for (i, len) in lens.iter().enumerate() {
+            if i > 0 {
+                doc.push(',');
+            }
+            doc.push('"');
+            doc.push_str(&"a".repeat(*len));
+            doc.push('"');
+        }
+        doc.push(']');
+        assert_eq!(doc.len(), target);
+
+        let value =
+            bind_json_literal(&doc, ColumnType::Json, "doc").expect("must bind at exact limit");
+
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                crate::catalog::ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                crate::catalog::ColumnDef::new("doc", ColumnType::Json, true),
+            ],
+        );
+        let values = vec![crate::row_codec::Value::Vector(vec![0.1, 0.2]), value];
+        crate::row_codec::encode_scalar_columns(&schema, &values)
+            .expect("bind_json_literal output must always fit the scalar payload budget");
+    }
+
     #[test]
     fn binds_insert_leaving_nullable_column_null_when_omitted() {
         let bound = bind_insert_sql(
