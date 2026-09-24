@@ -29,6 +29,14 @@
 //! - [`key_schedule`]: TLS 1.3 鍵スケジュール本体（RFC 8446 §7.1。Issue #956）。
 //!   Early → Handshake → Master の secret 遷移と各段の traffic secret／
 //!   key／iv 導出を型状態で提供する
+//! - [`pem`]: PEM（RFC 7468）ブロックのデコードと、鍵・証明書ファイルの
+//!   上限付き読み込み（Issue #962）。定数時間 base64 デコーダを持ち、
+//!   秘密鍵ブロックはちょうど 1 個・証明書チェーンは複数ブロックを順序
+//!   どおりに受け付ける
+//! - [`pkcs8`]: PKCS#8 v1・Ed25519（RFC 8410 §7）の最小 DER パース
+//!   （Issue #962）。[`pem`] が返す DER から 32 バイトの seed を取り出し、
+//!   RSA・ECDSA・v2（OneAsymmetricKey）等は起動時に明示的に拒否する。
+//!   鍵導出・署名は #961 の担当
 //!
 //! key_share 拡張の解析（#954）・alert 型やハンドシェイク状態機械（#965）・
 //! レコード保護／暗号化（#959）・接続への結線（#966 以降）はいずれも
@@ -42,5 +50,7 @@ pub(crate) mod field25519;
 pub mod handshake;
 pub mod hkdf;
 pub mod key_schedule;
+pub mod pem;
+pub mod pkcs8;
 pub mod record;
 pub mod x25519;
