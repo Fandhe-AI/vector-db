@@ -365,6 +365,35 @@ fn wire17_copy_from_stdin_oversized_copy_data_frame_gets_error_response_before_c
     expect_connection_closed(&mut stream);
 }
 
+/// CopyDone（'c'）の宣言長が固定 4 バイトと異なる（`FrameError::Malformed`）
+/// 場合も、oversized `CopyData` と同じく `wire_code`（`08P01`）付き
+/// ErrorResponse を送ってから接続を終了すること（Issue #939 レビュー指摘の
+/// 再発防止: 修正は `'d'` 分岐だけでなく `run_copy_from` ループ内の全フレーム
+/// 読み取りへ及ぶべきことの確認）。
+#[test]
+fn wire17_copy_from_stdin_malformed_copy_done_frame_gets_error_response_before_close() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'wire-copy-malformed-done'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+
+    // CopyDone は body を持たない固定 5 バイト（type + length=4）のはずだが、
+    // 宣言長 3（`read_length_prefixed_body(stream, 4, 4)` の最小値未満）を送る。
+    let mut header = Vec::new();
+    header.push(b'c');
+    header.extend_from_slice(&3i32.to_be_bytes());
+    stream
+        .write_all(&header)
+        .expect("send malformed CopyDone header");
+
+    expect_error_response_with_sqlstate(&mut stream, "08P01");
+    expect_connection_closed(&mut stream);
+}
+
 // ---------------------------------------------------------------------
 // COPY (...) TO STDOUT
 // ---------------------------------------------------------------------

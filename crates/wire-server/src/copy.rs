@@ -52,21 +52,24 @@ fn frame_err_to_io(e: FrameError) -> io::Error {
     }
 }
 
-/// `CopyData`（'d'）フレームの読み取りが `FrameError::TooLarge`／`Malformed`
-/// で失敗した場合、通常の簡易クエリ 'Q' 経路（`handshake::respond_and_close`
-/// の `HandshakeError::Frame` 分岐）と同じ `wire_code` 付き ErrorResponse を
-/// 送ってから接続を終了する（Issue #939 レビュー指摘: 素通しで
-/// [`frame_err_to_io`] へ渡すと `HandshakeError::Io` へ写像され、
-/// `respond_and_close` の `Io(e) => Err(e)` 分岐が応答を一切送らずに切断して
-/// いた）。フレーミングが破綻した時点でストリーム上の残りバイト数は不明で
-/// 安全に読み進められないため、`respond_error_and_ready`（CopyFail 等）とは
-/// 異なり ReadyForQuery は送らず接続そのものを終了する契約にする
-/// （`TooLarge` は長さフィールドのみ読み終え本文は未読のまま、`Malformed` も
-/// 相手が今後どれだけ送るか分からない点は同じ）。ErrorResponse の送信自体が
-/// 失敗しても（相手が既に切断済み等）無視して `frame_err_to_io` の結果を返す
-/// （fail-closed に接続を終える）。`Truncated`／`Io` は応答を送る意味がない
-/// （前者は相手が既に切断済み、後者はサーバー側 I/O 異常）ため従来どおり
-/// 無応答で終了する。
+/// [`run_copy_from`] のフレーム読み取り（'d'／'c'／'f'／'H'／'S'／'X' の
+/// いずれの分岐が読む長さフィールド・本文も含む）が `FrameError::TooLarge`／
+/// `Malformed` で失敗した場合、通常の簡易クエリ 'Q' 経路（`handshake::
+/// respond_and_close` の `HandshakeError::Frame` 分岐）と同じ `wire_code` 付き
+/// ErrorResponse を送ってから接続を終了する（Issue #939 レビュー指摘: 当初は
+/// 'd' 分岐のみこの経路を通し、他の分岐は素通しで [`frame_err_to_io`] へ渡して
+/// いたため `HandshakeError::Io` へ写像され、`respond_and_close` の
+/// `Io(e) => Err(e)` 分岐が応答を一切送らずに切断していた——同型の後退が
+/// 'c'／'f'／'H'／'S'／'X' でも起こり得たため、ループ内の全フレーム読み取りを
+/// この関数へ統一した）。フレーミングが破綻した時点でストリーム上の残り
+/// バイト数は不明で安全に読み進められないため、`respond_error_and_ready`
+/// （CopyFail 等）とは異なり ReadyForQuery は送らず接続そのものを終了する
+/// 契約にする（`TooLarge` は長さフィールドのみ読み終え本文は未読のまま、
+/// `Malformed` も相手が今後どれだけ送るか分からない点は同じ）。ErrorResponse
+/// の送信自体が失敗しても（相手が既に切断済み等）無視して `frame_err_to_io`
+/// の結果を返す（fail-closed に接続を終える）。`Truncated`／`Io` は応答を
+/// 送る意味がない（前者は相手が既に切断済み、後者はサーバー側 I/O 異常）ため
+/// 従来どおり無応答で終了する。
 fn respond_frame_error_and_terminate(stream: &mut TcpStream, e: FrameError) -> io::Error {
     if let Some(class) = e.error_class() {
         let _ = crate::handshake::write_error_response_io(stream, class, e.client_message());
@@ -348,7 +351,7 @@ fn run_copy_from(
         let type_byte = match framing::read_typed_frame_header(stream) {
             Ok(Some(b)) => b,
             Ok(None) => return Ok(()),
-            Err(e) => return Err(frame_err_to_io(e)),
+            Err(e) => return Err(respond_frame_error_and_terminate(stream, e)),
         };
         match type_byte {
             b'd' => {
@@ -369,7 +372,8 @@ fn run_copy_from(
                 }
             }
             b'c' => {
-                framing::read_length_prefixed_body(stream, 4, 4).map_err(frame_err_to_io)?;
+                framing::read_length_prefixed_body(stream, 4, 4)
+                    .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
                 return finish_copy_from(stream, engine, ctx, session, errored);
             }
             b'f' => {
@@ -378,7 +382,7 @@ fn run_copy_from(
                     framing::MIN_TYPED_MESSAGE_LEN,
                     framing::MAX_MESSAGE_LEN,
                 )
-                .map_err(frame_err_to_io)?;
+                .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
                 let body_len = len.saturating_sub(4);
                 // CopyFail の理由文字列はクライアントの自由記述であり、応答にも
                 // ログにも一切エコーしない（security.md「エラー・ログ経由で
@@ -405,7 +409,7 @@ fn run_copy_from(
                     framing::MIN_TYPED_MESSAGE_LEN,
                     framing::MAX_MESSAGE_LEN,
                 )
-                .map_err(frame_err_to_io)?;
+                .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
                 discard_bytes(stream, len.saturating_sub(4))?;
             }
             b'X' => {
@@ -415,7 +419,8 @@ fn run_copy_from(
                 // 抜ける。読み捨てないと `post_auth_loop` がこの 4 バイトを
                 // 次のメッセージ種別バイトとして誤読する（Issue #939 レビュー
                 // 指摘）。
-                framing::read_length_prefixed_body(stream, 4, 4).map_err(frame_err_to_io)?;
+                framing::read_length_prefixed_body(stream, 4, 4)
+                    .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
                 return Ok(());
             }
             _ => {
