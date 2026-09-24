@@ -30,6 +30,15 @@ pub const SCRAM_MOCK_KEY_FILE_FLAG: &str = "--scram-mock-key-file";
 /// （`scram::KEY_LEN` と同値。十分なエントロピーを要求する）。
 pub const SCRAM_MOCK_KEY_FILE_MIN_LEN: usize = crate::auth::scram::KEY_LEN;
 
+/// [`SCRAM_MOCK_KEY_FILE_FLAG`] が読み込むファイル内容の最大バイト数
+/// （PR #1006 P1 是正）。鍵導出には [`SCRAM_MOCK_KEY_FILE_MIN_LEN`]
+/// 以上あれば十分であり、上限を設けないまま `std::fs::read` で全量
+/// 読み込むと、巨大ファイルや `/dev/zero` のような終端しない特殊
+/// ファイルを指定されて listen 前にメモリを枯渇させられる（DoS）。
+/// `main.rs` 側でこの上限＋1 バイトまでだけ `Read::take` で読み、
+/// 超過を fail-closed に拒否する（十分すぎる余裕を見た固定上限）。
+pub const SCRAM_MOCK_KEY_FILE_MAX_LEN: usize = 1024 * 1024;
+
 /// `--auth-method` が受理する語彙（順序はエラーメッセージの一覧順・
 /// README 記載順の単一情報源）。
 pub const TOKENS: [&str; 2] = ["cleartext", "scram-sha-256"];

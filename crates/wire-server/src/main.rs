@@ -122,6 +122,7 @@
 //! TLS 導入（TASK-72・WIRE-9）時は [`wire_server::bind_guard::TransportSecurity`]
 //! に variant を追加し、ここで渡す値を実行時の TLS 設定有無に応じて切り替える。
 
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -637,8 +638,53 @@ fn run_server(args: &[String]) -> ExitCode {
             );
             return ExitCode::FAILURE;
         };
-        let mock_key_secret = match std::fs::read(mock_key_path) {
-            Ok(bytes) => bytes,
+        // PR #1006 P1 是正: ファイルサイズを検証してから読む（fail-closed）。
+        // メタデータで通常ファイルであることを確認したうえで、
+        // `Read::take` により `SCRAM_MOCK_KEY_FILE_MAX_LEN + 1` バイトまで
+        // しか読まない。メタデータの `len()` は `/dev/zero` のような
+        // 特殊ファイルでは信用できないため、事前チェックに加えて
+        // 読み込み自体も固定上限で打ち切る二重の防御とする。
+        let mock_key_secret = match std::fs::metadata(mock_key_path) {
+            Ok(meta) if !meta.is_file() => {
+                eprintln!(
+                    "wire-server: {} {mock_key_path:?} is not a regular file",
+                    wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
+                );
+                return ExitCode::FAILURE;
+            }
+            Ok(_) => match std::fs::File::open(mock_key_path) {
+                Ok(file) => {
+                    let max_len = wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_MAX_LEN;
+                    let mut buf = Vec::new();
+                    match file
+                        .take((max_len as u64).saturating_add(1))
+                        .read_to_end(&mut buf)
+                    {
+                        Ok(_) if buf.len() > max_len => {
+                            eprintln!(
+                                "wire-server: {} {mock_key_path:?} exceeds the maximum allowed size ({max_len} bytes)",
+                                wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                        Ok(_) => buf,
+                        Err(e) => {
+                            eprintln!(
+                                "wire-server: failed to read {} {mock_key_path:?}: {e}",
+                                wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "wire-server: failed to read {} {mock_key_path:?}: {e}",
+                        wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+            },
             Err(e) => {
                 eprintln!(
                     "wire-server: failed to read {} {mock_key_path:?}: {e}",
