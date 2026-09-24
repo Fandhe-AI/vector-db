@@ -1932,6 +1932,19 @@ impl<'a> Parser<'a> {
     /// VALUES リストの 1 要素（文字列リテラルまたは数値リテラルのみ。関数呼び出し・
     /// 括弧・`NULL` キーワード等は許可リスト外）。
     fn expect_literal(&mut self) -> Result<InsertLiteral, SqlSurfaceError> {
+        // F7（Issue #882 計画）: `REAL`/`DOUBLE PRECISION` の負リテラル
+        // （`-1.5` 等）を受理するため、`HAVING` 述語（約 L1359）と同じ
+        // `['-'] <Number>` の文法を先読みで判定する。`Number` 以外（文字列・
+        // ベクトルリテラル）の直前の `-` は許可リスト外のまま拒否する。
+        if matches!(self.peek(), Some(Token::Punct('-'))) {
+            self.advance();
+            return match self.advance() {
+                Some(Token::Number(n)) => Ok(InsertLiteral::Number(format!("-{n}"))),
+                other => Err(SqlSurfaceError::unsupported(format!(
+                    "expected numeric literal after '-', got {other:?}"
+                ))),
+            };
+        }
         match self.advance() {
             Some(Token::StringLiteral(s)) => Ok(InsertLiteral::String(s.clone())),
             Some(Token::Number(n)) => Ok(InsertLiteral::Number(n.clone())),
