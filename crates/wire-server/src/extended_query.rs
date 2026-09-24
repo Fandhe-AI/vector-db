@@ -236,7 +236,11 @@ impl PreparedStatementStore {
             if self.statements.contains_key(&name) {
                 return Err(StoreError::DuplicateName);
             }
-            if self.statements.len() >= MAX_PREPARED_STATEMENTS_PER_SESSION {
+            // 無名（""）エントリは件数上限にカウントしない契約（構造体コメント
+            // 参照）。`statements.len()` には無名分も含まれるため、名前付き
+            // （非空キー）のみを数え上げて判定する（Issue #933 codex-review 指摘）。
+            let named_count = self.statements.keys().filter(|k| !k.is_empty()).count();
+            if named_count >= MAX_PREPARED_STATEMENTS_PER_SESSION {
                 return Err(StoreError::TooManyStatements);
             }
         }
@@ -652,6 +656,29 @@ mod tests {
             store
                 .insert(format!("stmt{i}"), 10, PreparedStatement::Empty)
                 .expect("insert within limit succeeds");
+        }
+        let result = store.insert(
+            format!("stmt{MAX_PREPARED_STATEMENTS_PER_SESSION}"),
+            10,
+            PreparedStatement::Empty,
+        );
+        assert!(matches!(result, Err(StoreError::TooManyStatements)));
+    }
+
+    /// 無名 statement が先に存在していても、名前付き statement は規定の
+    /// `MAX_PREPARED_STATEMENTS_PER_SESSION` 件をすべて保持できる（codex-review
+    /// ・Cursor Bugbot 指摘・Issue #933: 無名エントリを件数上限へ誤って算入する
+    /// 境界バグの回帰）。
+    #[test]
+    fn store_allows_full_named_quota_alongside_anonymous_statement() {
+        let mut store = PreparedStatementStore::new();
+        store
+            .insert(String::new(), 10, PreparedStatement::Empty)
+            .expect("anonymous insert succeeds");
+        for i in 0..MAX_PREPARED_STATEMENTS_PER_SESSION {
+            store
+                .insert(format!("stmt{i}"), 10, PreparedStatement::Empty)
+                .expect("named insert within limit succeeds despite anonymous entry present");
         }
         let result = store.insert(
             format!("stmt{MAX_PREPARED_STATEMENTS_PER_SESSION}"),
