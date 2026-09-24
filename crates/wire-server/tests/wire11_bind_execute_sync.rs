@@ -371,18 +371,28 @@ fn suspended_portal_bytes_are_accounted_across_the_whole_session_not_per_portal(
     send_length_prefixed_message(&mut stream, b'E', &execute_body("p2", 1));
     assert_error_then_recovers(&mut stream, "54000");
 
-    // p1 は影響を受けず、残り 10 行を通常どおり送出できる（セッション上限
-    // 超過の拒否が既存の中断状態を破壊しない）。
+    // `assert_error_then_recovers` が送った Sync は、codex P1 是正
+    // （PR #1013）により p1・p2 を問わず全 portal を破棄する（本サーバーに
+    // 明示トランザクションが無く各 Sync サイクルが暗黙トランザクションに
+    // 相当するため）。したがって p1 も Sync 後は portal 不在（08P01）になる
+    // ——「p2 の拒否が p1 の中断状態を破壊しない」という従来の P1 保証は、
+    // 「Sync 自体が意図的に両方を破棄する」という、より安全な契約に置き換
+    // わった。
     send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 0));
-    for _ in 0..10 {
+    assert_error_then_recovers(&mut stream, "08P01");
+
+    // 新しい Sync サイクルで p1 を再 Bind すれば、11 行すべてを通常どおり
+    // 取得できる（statement s1 は Sync を越えて残っている）。
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("p1", "s1"));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'2', "expected BindComplete");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 0));
+    for _ in 0..11 {
         let (kind, _) = read_message(&mut stream);
         assert_eq!(kind, b'D');
     }
     let (kind, tag) = read_message(&mut stream);
     assert_eq!(kind, b'C');
-    // `CommandComplete` のタグは portal 全体の累計送出行数（1 回目の
-    // Execute で送った 1 行 + 今回送った 10 行 = 11）から組み立てる
-    // （PostgreSQL の契約。PR #1013 レビュー指摘・P1）。
     assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "SELECT 11");
 }
 
@@ -537,9 +547,13 @@ fn queries_sent_before_sync_after_an_error_are_discarded() {
 }
 
 /// 受け入れ条件 6: portal のライフサイクル。無名 portal は Sync で破棄され、
-/// 名前付き portal は Sync を越えて残る。Close は '3' を返し、閉じた後の
-/// Execute/Bind はエラーになる。statement の Close は派生 portal も閉じる。
-/// 未存在名の Close も '3' を返す。
+/// 本サーバーには明示トランザクション（`BEGIN`/`COMMIT`）が無く各 Sync
+/// サイクルが暗黙トランザクションに相当するため、名前付き・無名を問わず
+/// 全 portal が Sync で破棄される（codex P1 指摘・PR #1013。PostgreSQL の
+/// トランザクション終了時 portal 破棄契約を Sync 境界へ適用）。名前付き
+/// prepared statement は Sync を越えて残る（PostgreSQL と同じ挙動）。
+/// Close は '3' を返し、閉じた後の Execute/Bind はエラーになる。statement
+/// の Close は派生 portal も閉じる。未存在名の Close も '3' を返す。
 #[test]
 fn portal_lifecycle_anonymous_named_and_close() {
     let (core, _guard) = new_core_with_documents_table();
@@ -557,17 +571,24 @@ fn portal_lifecycle_anonymous_named_and_close() {
     send_length_prefixed_message(&mut stream, b'E', &execute_body("", 0));
     assert_error_then_recovers(&mut stream, "08P01");
 
-    // 名前付き portal は Sync を越えて残る。
+    // 名前付き statement は Sync を越えて残るが、名前付き portal は Sync で
+    // 破棄される（暗黙トランザクション境界。本テストの主眼）。
     parse_and_bind(&mut stream, "sN", "pN", sql);
     send_sync(&mut stream);
     assert_ready_for_query(&mut stream);
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pN", 0));
+    assert_error_then_recovers(&mut stream, "08P01");
+
+    // 同一 Sync サイクル内（Bind してから Sync を挟まず Execute）では、
+    // 名前付き portal も従来どおり実行できる。
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("pN", "sN"));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'2', "expected BindComplete");
     send_length_prefixed_message(&mut stream, b'E', &execute_body("pN", 0));
     let (kind, _) = read_message(&mut stream);
     assert_eq!(kind, b'D');
     let (kind, _) = read_message(&mut stream);
     assert_eq!(kind, b'C');
-    send_sync(&mut stream);
-    assert_ready_for_query(&mut stream);
 
     // Close(Portal) は '3' を返し、以後の Execute はエラー。
     send_length_prefixed_message(&mut stream, b'C', &close_body(b'P', "pN"));
@@ -593,6 +614,47 @@ fn portal_lifecycle_anonymous_named_and_close() {
     send_length_prefixed_message(&mut stream, b'C', &close_body(b'P', "no-such-portal"));
     let (kind, _) = read_message(&mut stream);
     assert_eq!(kind, b'3');
+}
+
+/// codex P1 指摘（PR #1013）の回帰防止: Sync が名前付き portal も破棄する
+/// ことを、[`portal_lifecycle_anonymous_named_and_close`] とは独立に固定
+/// する。Sync 後の名前付き portal への Execute／Describe(Portal) はいずれも
+/// portal 不在エラーになり、名前付き statement は Sync を越えて再 Bind
+/// 可能なまま残る。
+#[test]
+fn sync_discards_named_portals_but_keeps_named_statements() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 1);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    let sql = "SELECT id FROM documents LIMIT 1";
+
+    parse_and_bind(&mut stream, "sN", "pN", sql);
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
+
+    // Sync を越えた名前付き portal への Execute は portal 不在（08P01）。
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pN", 0));
+    assert_error_then_recovers(&mut stream, "08P01");
+
+    // Sync を越えた名前付き portal への Describe(Portal) も同様に 08P01。
+    send_length_prefixed_message(&mut stream, b'D', &describe_body(b'P', "pN"));
+    assert_error_then_recovers(&mut stream, "08P01");
+
+    // 名前付き statement（sN）は Sync を越えて残っており、同名の再 Bind で
+    // 新しい portal を作り直せば問題なく実行できる。
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("pN", "sN"));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'2', "expected BindComplete");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pN", 0));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'D');
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'C');
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
 }
 
 /// PR #1013 レビュー指摘（Cursor Bugbot Medium）の回帰防止: PostgreSQL は
@@ -692,6 +754,11 @@ fn flush_does_not_send_ready_for_query_and_nonempty_sync_flush_close_connection(
 
 /// 受け入れ条件 8: 上限。名前付き portal の 65 個目は `54000`。portal 名が
 /// 長すぎる場合は `54000`。名前付き portal の重複は `08P01`。
+///
+/// `assert_error_then_recovers` はエラー確認後に Sync を送るが、Sync は
+/// codex P1 是正（PR #1013）により名前付き portal も破棄するため、各チェック
+/// 間で portal 保持数は 0 へ戻る。重複名チェックは Sync を挟まず同一メッセージ
+/// 系列内（Bind→Bind）で検証する。
 #[test]
 fn portal_limits_are_enforced() {
     let (core, _guard) = new_core_with_documents_table();
@@ -715,13 +782,16 @@ fn portal_limits_are_enforced() {
     send_length_prefixed_message(&mut stream, b'B', &bind_body("port64", "shared"));
     assert_error_then_recovers(&mut stream, "54000");
 
-    // portal 名が長すぎる。
+    // portal 名が長すぎる（Sync により直前の 64 個は既に破棄済み）。
     let long_name = "a".repeat(64);
     send_length_prefixed_message(&mut stream, b'B', &bind_body(&long_name, "shared"));
     assert_error_then_recovers(&mut stream, "54000");
 
-    // 名前付き portal の重複は 08P01。
-    send_length_prefixed_message(&mut stream, b'B', &bind_body("port0", "shared"));
+    // 名前付き portal の重複は 08P01（Sync を挟まず同一 portal 名で連続 Bind）。
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("dup0", "shared"));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'2', "first bind of dup0 should be accepted");
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("dup0", "shared"));
     assert_error_then_recovers(&mut stream, "08P01");
 }
 

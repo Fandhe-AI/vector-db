@@ -28,7 +28,7 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
 | Bind（'B'） | 対象 statement を `describe_parsed_in_session` で確定し portal を保持する。結果 format code を [`result_encoder::ResultFormats::resolve`]／[`validate_binary_formats`] で列ごとに解決・事前検査する（WIRE-14）。パラメータ数不一致・format code 個数不正は `08P01`、パラメータ側の binary 指定・結果側の非対応型指定は `0A000` |
 | Describe（'D' 種別 P） | portal の `RowDescription`／`NoData`（`ParameterDescription` は返さない） |
 | Execute（'E'） | portal を実行し、`max_rows` に応じて分割送出する（`PortalSuspended`／`CommandComplete`） |
-| Sync（'S'） | エラー後の同期回復モードを解除し、無名 portal を破棄して `ReadyForQuery` を返す |
+| Sync（'S'） | エラー後の同期回復モードを解除し、名前付き・無名を問わず全 portal を破棄して `ReadyForQuery` を返す（PR #1013 レビュー指摘・codex P1。本サーバーには明示トランザクションが無く各 Sync サイクルが暗黙トランザクションに相当する） |
 | Close（'C'） | statement／portal を解放（未存在名も成功）。statement の Close は派生 portal も閉じる |
 | Flush（'H'） | 出力を flush するのみ（`ReadyForQuery` は送らない） |
 
@@ -54,8 +54,9 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
   経路があると、長さフィールド欠落・不正長・余剰 body を持つ malformed
   Terminate が「エラー後」という条件だけで正規の Terminate として受理されて
   しまう）。
-- Sync 到達で `ignore_till_sync` を解除し、無名 portal を破棄してから
-  `ReadyForQuery`（状態バイトは当面 `'I'` 固定。#943 で置換）を返す。
+- Sync 到達で `ignore_till_sync` を解除し、名前付き・無名を問わず全 portal
+  を破棄してから `ReadyForQuery`（状態バイトは当面 `'I'` 固定。#943 で
+  置換）を返す。
 
 ## portal のライフサイクル
 
@@ -112,10 +113,13 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
   PR #1013 レビュー指摘・P0）。分割送出時の `CommandComplete` の件数は
   「portal 全体の累計送出行数」（PostgreSQL の `PortalRun` と同じ契約。
   PR #1013 レビュー指摘・P1: 直近 Execute の件数だけでは過小になる）。
-- Sync は無名 portal のみ破棄する（名前付き portal は Sync を越えて残る。
-  PostgreSQL がトランザクション終了時に名前付き portal も破棄する挙動までは
-  持たない——WIRE-11 に従い、本実装は暗黙トランザクションブロック
-  〔#942〕を実装していないため）。
+- Sync は名前付き・無名を問わず全 portal を破棄する（PR #1013 レビュー
+  指摘・codex P1。本サーバーには明示トランザクション〔`BEGIN`/`COMMIT`〕が
+  無く各 Sync サイクルが暗黙トランザクションに相当するため、PostgreSQL の
+  「トランザクション終了時に portal を閉じる」契約〔PostgreSQL 34.4
+  「Bind」〕を Sync 境界へ適用する。名前付き prepared statement
+  〔`PreparedStatementStore`〕は Sync を越えて残る——PostgreSQL と同じ
+  挙動）。
 
 ## Execute と応答整形の共有（第 2 の実行器を作らない）
 
@@ -261,8 +265,6 @@ panic すると緊急応答〔TASK-97・RECOVER-6〕が発火しない fail-open
   ンにまとめる挙動。#942・RECOVER-12・SQL-31）。
 - ReadyForQuery の状態バイト（#943・WIRE-19）。
 - CancelRequest。
-- 名前付き portal を Sync（トランザクション終了）時に破棄する PostgreSQL
-  の挙動（WIRE-11 に従い、Sync では無名 portal だけを破棄する）。
 - パラメータ付きクエリを含む実クライアント（psycopg 3／node pg／psql）での
   拡張プロトコル層 B 検証は #935 以降。パラメータなしのシナリオは本 Issue
   の任意範囲だが、層 A（`wire11_bind_execute_sync.rs`）で十分に受理範囲を

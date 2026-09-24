@@ -21,8 +21,12 @@
 //! `handshake::post_auth_loop` が次に届く Sync（'S'）まで後続メッセージを
 //! 読み捨てる（'X' は通常どおり終了、COPY・FunctionCall・未知の型バイトは
 //! 破棄対象にせず fail-closed に切断する。詳細は `post_auth_loop` 参照）。
-//! Sync 到達時にフラグを解除し、無名 portal を破棄してから `ReadyForQuery`
-//! を返し、同期を回復する。
+//! Sync 到達時にフラグを解除し、全 portal（名前付き・無名を問わない）を
+//! 破棄してから `ReadyForQuery` を返し、同期を回復する（本サーバーは明示
+//! トランザクション〔`BEGIN`/`COMMIT`〕を持たず各 Sync サイクルが暗黙
+//! トランザクションに相当するため、PostgreSQL がトランザクション終了時に
+//! portal を閉じる契約〔PostgreSQL 34.4「Bind」〕をそのまま Sync 境界へ
+//! 適用する。名前付き prepared statement は PostgreSQL と同様に保持する）。
 //!
 //! 一方、`read_length_prefixed_body` 自体が失敗した場合（メッセージの境界を
 //! 確定できない・宣言長が上限を超える等）は [`respond_error_and_close`] が
@@ -35,9 +39,12 @@
 //! ——後から statement が再 Parse されても portal の実行対象は変わらない）、
 //! Execute が実行・行送出（`max_rows` による分割送出。[`PortalState::
 //! Suspended`]）・完了（[`PortalState::Done`]。副作用は再実行しない）を管理
-//! する。名前付き portal は Sync を越えて残り、無名 portal は Sync のたびに
-//! 破棄される（PostgreSQL と同じ挙動）。Close(Statement) はその statement
-//! から作られた portal もまとめて閉じる。
+//! する。名前付き・無名を問わず全 portal は Sync のたびに破棄される（本
+//! サーバーには明示トランザクションが無く各 Sync サイクルが暗黙
+//! トランザクションに相当するため。PostgreSQL のトランザクション終了時の
+//! portal 破棄契約に相当。名前付き prepared statement は Sync を越えて
+//! 残る）。Close(Statement) はその statement から作られた portal もまとめて
+//! 閉じる。
 //!
 //! 中断中の全 portal が保持するバイト数の合計（[`crate::limits::
 //! MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION`]）は接続（セッション）全体の
@@ -615,11 +622,24 @@ impl PortalStore {
         self.portals.remove(name);
     }
 
-    /// Sync（'S'）が無名 portal を破棄する（PostgreSQL と同じ契約。名前付き
-    /// portal は Sync を越えて残る。WIRE-11 に従い、本実装は名前付き portal を
-    /// トランザクション終了時に破棄する PostgreSQL の挙動までは持たない）。
+    /// 簡易クエリ（`'Q'`）処理の直前に無名 portal のみを破棄する
+    /// （[`ExtendedQueryState::discard_unnamed_for_simple_query`] が呼ぶ。
+    /// PostgreSQL が simple Query の暗黙 Bind と同一視する契約）。
     fn remove_anonymous(&mut self) {
         self.portals.remove("");
+    }
+
+    /// Sync（'S'）が名前付き・無名を問わず全 portal を破棄する（[`handle_sync`]
+    /// が呼ぶ）。本サーバーには明示トランザクション（`BEGIN`/`COMMIT`）が無く
+    /// 各 Sync サイクルが暗黙トランザクションに相当するため、PostgreSQL の
+    /// 「トランザクション終了時に portal を閉じる」契約〔PostgreSQL 34.4
+    /// 「Bind」〕を Sync 境界へ適用する（codex P1 指摘・PR #1013。従来は
+    /// 無名 portal のみ破棄しており、名前付き portal が Sync を越えて次回
+    /// サイクルへ誤って持ち越されていた）。名前付き prepared statement
+    /// （[`PreparedStatementStore`]）はこの対象外——PostgreSQL 同様、
+    /// Close(Statement) または接続終了まで保持される。
+    fn clear_all(&mut self) {
+        self.portals.clear();
     }
 
     /// Close(Statement) が対象 statement から作った portal をまとめて閉じる
@@ -1695,9 +1715,13 @@ fn execute_portal(
 
 /// Sync（'S'）を処理する。body は厳密に空（length=4）以外を fail-closed で
 /// 拒否する（フレーム違反であり回復しない。`'X'` と同じ扱い）。
-/// [`ExtendedQueryState::ignore_till_sync`] を解除し、無名 portal を破棄した
-/// うえで `ReadyForQuery` を返す（モジュールドキュメント「エラー後の同期
-/// 回復」節・「portal のライフサイクル」節参照）。
+/// [`ExtendedQueryState::ignore_till_sync`] を解除し、名前付き・無名を問わず
+/// 全 portal を破棄したうえで `ReadyForQuery` を返す（モジュールドキュメント
+/// 「エラー後の同期回復」節・「portal のライフサイクル」節参照。本サーバーに
+/// 明示トランザクションが無く各 Sync サイクルが暗黙トランザクションに
+/// 相当することの契約は [`PortalStore::clear_all`] 参照。codex P1 指摘・
+/// PR #1013——名前付き prepared statement〔[`PreparedStatementStore`]〕は
+/// この対象外のまま Sync を越えて残る）。
 pub(crate) fn handle_sync(
     stream: &mut TcpStream,
     state: &mut ExtendedQueryState,
@@ -1713,7 +1737,7 @@ pub(crate) fn handle_sync(
     };
 
     state.ignore_till_sync = false;
-    state.portals.remove_anonymous();
+    state.portals.clear_all();
     stream.write_all(&result_encoder::encode_ready_for_query())?;
     stream.flush()?;
     Ok(LoopSignal::Continue)
