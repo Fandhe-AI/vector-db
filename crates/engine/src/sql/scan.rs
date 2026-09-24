@@ -200,6 +200,8 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Boolean
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
+                        | ColumnType::Json
+                        | ColumnType::Jsonb
                         | ColumnType::Enum(_) => {
                             has_scalar_reference = true;
                             if let Some(slot) = scalar_mask.get_mut(*index) {
@@ -531,6 +533,21 @@ pub fn execute_scan(
                                 Some(Some(_)) => {
                                     return Err(scan_bug(
                                         "BYTEA column scan yielded a non-Bytea scalar value",
+                                    ))
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Json | ColumnType::Jsonb => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Json(t))) => {
+                                    cells.push(Cell::Json(try_alloc_text_for_budget(
+                                        t,
+                                        &mut byte_budget,
+                                        MAX_SCAN_RESULT_BYTES,
+                                    )?));
+                                }
+                                Some(Some(_)) => {
+                                    return Err(scan_bug(
+                                        "JSON column scan yielded a non-Json scalar value",
                                     ))
                                 }
                                 Some(None) | None => cells.push(Cell::Null),

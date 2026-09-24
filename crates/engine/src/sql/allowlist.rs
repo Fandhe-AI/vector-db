@@ -924,6 +924,18 @@ pub enum InsertLiteral {
     Number(String),
     /// BOOLEAN 列向けの `true`/`false` リテラル（TABLE-13・TASK-196、Issue #883）。
     Bool(bool),
+    /// SQL `NULL`（nullable 列への明示的な NULL 設定。Issue #889 レビュー指摘・
+    /// PR #1014。SQL の `UPDATE ... SET` 構文には現状 `NULL` リテラルの字句・
+    /// 構文規則が無く（`sql::allowlist` の `SET` 句パーサーは `NULL` トークンを
+    /// 生成しない）、本 variant は NoSQL 表層 `update` op
+    /// （`wire-server::http::query::update::map_set_assignments`）が JSON
+    /// `null` かつ nullable 列の場合にのみ構築する。`bind_set_assignments`
+    /// （SQL-17・SQL-19 の UPDATE SET 束縛）はこの variant を
+    /// `column.nullable` に応じて `Value::Null`／エラーへ写像し、
+    /// `bind_insert`／`bind_upsert_assignments`／`bind_file_insert`
+    /// （INSERT・UPSERT。SQL テキストからもファイル形からも `Null` は
+    /// 構築されない到達不能パス）は fail-closed に一律拒否する。
+    Null,
 }
 
 /// `ON CONFLICT (id) DO UPDATE SET <col> = <value>` の SET 右辺（SQL-20・

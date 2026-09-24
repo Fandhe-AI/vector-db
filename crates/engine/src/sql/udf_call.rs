@@ -717,6 +717,11 @@ fn bind_expr_in(
                     ColumnType::Bytea => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BYTEA columns are not supported)"
                     ))),
+                    ColumnType::Json | ColumnType::Jsonb => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} cannot be used in an expression (JSON columns are not supported)"
+                        )))
+                    }
                     ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ENUM columns are not supported)"
                     ))),

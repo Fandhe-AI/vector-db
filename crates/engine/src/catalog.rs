@@ -300,6 +300,15 @@ pub enum ColumnType {
     /// 可変長バイナリ列（TABLE-13・TASK-197、Issue #886）。NULL と空バイト列は
     /// 行バイト列上も区別する（[`crate::row_codec::Value::Bytes`] 参照）。
     Bytea,
+    /// JSON テキスト列（TABLE-14・TASK-198、Issue #889）。格納時に共有パーサー
+    /// [`crate::json::parse_json`] で検証するが、入力テキスト（空白・キー順を含む）を
+    /// そのまま保持する（[`crate::row_codec::Value::Json`] 参照）。JSONB との違いは
+    /// 正規化の有無のみで、値表現は共有する。
+    Json,
+    /// JSONB 列（TABLE-14・TASK-198、Issue #889）。格納時に正規化再シリアライズ
+    /// した文字列を保持する（キー順は辞書順・空白なし。詳細は
+    /// `docs/design/column-type-extension.md`「#889 追記」節参照）。
+    Jsonb,
     /// 名前付き ENUM 型を参照する列（TABLE-14・TASK-198、Issue #890）。
     /// カタログには型名のみを保持し（[`ColumnType::catalog_fields`]）、
     /// デコード時に [`ENUM_TYPES_TABLE`] から語彙を解決した [`EnumTypeDef`] を
@@ -330,6 +339,8 @@ impl ColumnType {
                 format!("{},{}", array_ty.elem().catalog_tag(), array_ty.max_len()),
             ),
             ColumnType::Bytea => ("bytea", "-".to_string()),
+            ColumnType::Json => ("json", "-".to_string()),
+            ColumnType::Jsonb => ("jsonb", "-".to_string()),
             ColumnType::Enum(def) => ("enum", def.name.clone()),
         }
     }
@@ -413,6 +424,22 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::Bytea)
+            }
+            "json" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "json column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Json)
+            }
+            "jsonb" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "jsonb column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Jsonb)
             }
             "enum" => {
                 validate_identifier(param)?;
@@ -799,6 +826,8 @@ impl TableSchema {
             ColumnType::Text
             | ColumnType::Boolean
             | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
             | ColumnType::Enum(_)
             | ColumnType::Array(_) => None,
         })

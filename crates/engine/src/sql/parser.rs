@@ -498,6 +498,8 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::Boolean
             | ColumnType::Array(_)
             | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
             | ColumnType::Enum(_) => None,
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
@@ -538,6 +540,8 @@ pub(crate) fn text_column_index(
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
+                | ColumnType::Json
+                | ColumnType::Jsonb
                 | ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} is not a TEXT column"
                 ))),
@@ -1250,7 +1254,7 @@ fn bind_insert_row(
         InsertLiteral::Number(n) => n
             .parse()
             .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed id value: {n}")))?,
-        InsertLiteral::String(_) | InsertLiteral::Bool(_) => {
+        InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Null => {
             return Err(SqlSurfaceError::invalid_input(
                 "id pseudo-column value must be a number",
             ))
@@ -1315,10 +1319,33 @@ fn bind_insert_row(
                     "column {name:?} expects a bytea hex literal"
                 )))
             }
+            (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                bind_json_literal(s, &column.ty, name)?
+            }
+            (
+                ColumnType::Json | ColumnType::Jsonb,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a JSON text literal"
+                )))
+            }
             (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
             (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal for its enum type"
+                )))
+            }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘）は SQL テキストの
+            // `INSERT ... VALUES` 構文からは構築されない到達不能パス
+            // （`sql::allowlist` の VALUES リテラルパーサーは `NULL` トークンを
+            // 生成しない）。この分岐は match の網羅性のためだけに存在し、
+            // 到達した場合も fail-closed に拒否する（列を省略すれば
+            // nullable 列は `Value::Null` で埋まる既存契約と役割が重複するため、
+            // `INSERT` に明示 `NULL` リテラルを追加で受理する必要はない）。
+            (_, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} does not accept an explicit NULL literal in INSERT"
                 )))
             }
         };
@@ -1366,6 +1393,57 @@ fn bind_bytea_literal(
         Err(_) => Err(SqlSurfaceError::invalid_input(format!(
             "column {column_name:?} expects a valid bytea hex literal (\\x...)"
         ))),
+    }
+}
+
+/// `JSON`／`JSONB` 列向けの文字列リテラルを [`crate::row_codec::Value::Json`] へ
+/// 束縛する共通ヘルパー（Issue #889 D6。`bind_bytea_literal` と同型）。INSERT・
+/// UPDATE・UPSERT リテラル・UPSERT `ON CONFLICT` リテラルの 4 束縛箇所が共有する。
+/// SQL の文字列リテラルは JSON テキストとして解釈する（トップレベルのスカラー
+/// JSON も有効な JSON として受理。`'null'` は JSON の `null` であり SQL `NULL`
+/// とは別物）。`JSON` 列は検証のみ（入力テキスト保持）、`JSONB` 列は正規化する。
+///
+/// - 構文不正・深さ/要素数超過は `42601`（[`SqlSurfaceError::UnsupportedSyntax`]。
+///   NOSQL-8 と同一分類）。
+/// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
+fn bind_json_literal(
+    s: &str,
+    column_ty: &ColumnType,
+    column_name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    let text = match column_ty {
+        ColumnType::Json => {
+            crate::json::validate_json_column_text(s).map_err(|e| json_column_error(e, s))?;
+            s.to_string()
+        }
+        ColumnType::Jsonb => {
+            crate::json::canonicalize_jsonb_text(s).map_err(|e| json_column_error(e, s))?
+        }
+        ColumnType::Text
+        | ColumnType::Vector(_)
+        | ColumnType::Boolean
+        | ColumnType::Array(_)
+        | ColumnType::Bytea
+        | ColumnType::Enum(_) => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {column_name:?} is not a JSON column"
+            )));
+        }
+    };
+    Ok(crate::row_codec::Value::Json(text))
+}
+
+/// [`crate::json::JsonColumnError`] を SQL 表層の分類（`SqlSurfaceError`）へ写像する
+/// （Issue #889 D1）。`s` 自体（内容）はエラーメッセージへ含めない
+/// （security.md「テナント境界」: エラー経由の情報漏えい防止）。
+fn json_column_error(e: crate::json::JsonColumnError, _s: &str) -> SqlSurfaceError {
+    match e {
+        crate::json::JsonColumnError::TooLong => {
+            SqlSurfaceError::payload_too_large("JSON literal exceeds maximum length")
+        }
+        crate::json::JsonColumnError::Invalid => {
+            SqlSurfaceError::unsupported("invalid JSON literal")
+        }
     }
 }
 
@@ -1503,6 +1581,14 @@ fn bind_set_assignments(
                     "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
+            // `VECTOR` 列は `nullable` の値に関わらず常に必須として扱う
+            // （`wire-server::http::query::insert::bind_row` の既存契約と同じ
+            // 判断。Issue #889 レビュー指摘対応・PR #1014）。
+            (ColumnType::Vector(_), InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is a VECTOR column and cannot be set to NULL"
+                )))
+            }
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
@@ -1531,10 +1617,34 @@ fn bind_set_assignments(
                     "column {name:?} expects a bytea hex literal"
                 )))
             }
+            (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                bind_json_literal(s, &column.ty, name)?
+            }
+            (
+                ColumnType::Json | ColumnType::Jsonb,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+            ) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a JSON text literal"
+                )))
+            }
             (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
             (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal for its enum type"
+                )))
+            }
+            // 明示的な SQL `NULL`（`ColumnType::Vector` を除く。Issue #889
+            // レビュー指摘・PR #1014）。`column.nullable` を確認したうえで
+            // `Value::Null` へ写像し、非 nullable 列は fail-closed に拒否する。
+            // NoSQL 表層 `update` op（`wire-server::http::query::update::
+            // map_set_assignments`）の JSON 列 `null` 分岐が現状唯一の
+            // 構築元だが、SQL 表層 `UPDATE ... SET` 経由（将来 `NULL`
+            // リテラルの字句規則が追加された場合）でも同じ扱いを共有する。
+            (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
+            (_, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is not nullable"
                 )))
             }
         };
@@ -2077,12 +2187,32 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a bytea hex literal"
                         )))
                     }
+                    (ColumnType::Json | ColumnType::Jsonb, InsertLiteral::String(s)) => {
+                        bind_json_literal(s, &column.ty, name)?
+                    }
+                    (
+                        ColumnType::Json | ColumnType::Jsonb,
+                        InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+                    ) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a JSON text literal"
+                        )))
+                    }
                     (ColumnType::Enum(def), InsertLiteral::String(s)) => {
                         bind_enum_literal(def, s, name)?
                     }
                     (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a text literal for its enum type"
+                        )))
+                    }
+                    // `InsertLiteral::Null`（Issue #889 レビュー指摘）は
+                    // `ON CONFLICT ... DO UPDATE SET` の SQL 構文からは構築
+                    // されない到達不能パス（match の網羅性のためだけの分岐。
+                    // `bind_set_assignments` のドキュメント参照）。
+                    (_, InsertLiteral::Null) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} does not accept an explicit NULL literal in ON CONFLICT DO UPDATE SET"
                         )))
                     }
                 };
@@ -2170,6 +2300,14 @@ fn bind_file_insert(
                     "column {name:?} expects a text literal, got a non-text literal"
                 )))
             }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘）はファイル形
+            // `INSERT` の VALUES 構文からは構築されない到達不能パス（match の
+            // 網羅性のためだけの分岐。`bind_set_assignments` のドキュメント参照）。
+            (ColumnType::Text, InsertLiteral::Null) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} does not accept an explicit NULL literal in file-form INSERT"
+                )))
+            }
             // `bind_insert_form` の判別規則により VECTOR 列名は列リストに含まれない
             // 前提だが、防御的に拒否する（各チャンクのベクトルはサーバー側が
             // `incremental.rs` で埋め込み結果から設定し、クライアント入力を使わない）。
@@ -2195,6 +2333,12 @@ fn bind_file_insert(
             (ColumnType::Bytea, _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: BYTEA column is not supported for file-form INSERT"
+                )))
+            }
+            // JSON／JSONB 列も同じ理由で対象外とする（Issue #889 D6）。
+            (ColumnType::Json | ColumnType::Jsonb, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: JSON column is not supported for file-form INSERT"
                 )))
             }
             // ENUM 列も同じ理由で対象外とする（Issue #890）。
@@ -2297,6 +2441,11 @@ pub(crate) enum AggregateInput {
     /// `MAX` は `BooleanColumn` と同じパターンで [`resolve_aggregate_input`] が
     /// 型不整合として拒否する。
     ByteaColumn(usize),
+    /// `JSON`／`JSONB` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-14・TASK-198、Issue #889）。`SUM`/`AVG`/`MIN`/`MAX`
+    /// は `ByteaColumn` と同じパターンで [`resolve_aggregate_input`] が型不整合
+    /// として拒否する。
+    JsonColumn(usize),
     /// `ENUM` 列の裸の列参照（`COUNT` 限定。TABLE-14・TASK-198、Issue #890）。
     /// `SUM`/`AVG`/`MIN`/`MAX` は `BooleanColumn`／`ByteaColumn` と同じパターンで
     /// [`resolve_aggregate_input`] が型不整合として拒否する（PostgreSQL の enum は
@@ -2736,6 +2885,14 @@ fn resolve_aggregate_input(
                     (ColumnType::Bytea, _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is BYTEA and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
+                    (ColumnType::Json | ColumnType::Jsonb, AggregateFunc::Count) => {
+                        Ok(AggregateInput::JsonColumn(index))
+                    }
+                    (ColumnType::Json | ColumnType::Jsonb, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is JSON and cannot be used with SUM/AVG/MIN/MAX"
+                        )))
+                    }
                     (ColumnType::Enum(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::EnumColumn(index))
                     }
@@ -3683,6 +3840,62 @@ mod tests {
                 crate::row_codec::Value::Text("ja".to_string()),
             ]
         );
+    }
+
+    /// `bind_json_literal`（`sql::parser::bind_insert_row` から呼ばれる束縛層の
+    /// 単一チョークポイント）は `MAX_JSON_FIELD_LEN` を 1 バイトでも超える入力を
+    /// `54000`（`PayloadTooLarge`）で拒否する（PR #1014 レビュー指摘対応）。
+    #[test]
+    fn bind_json_literal_rejects_body_one_byte_over_max_json_field_len() {
+        let oversized = "1".repeat(crate::json::MAX_JSON_FIELD_LEN + 1);
+        let err = bind_json_literal(&oversized, &ColumnType::Json, "doc").unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// `MAX_JSON_FIELD_LEN` ちょうどの有効な JSON は束縛層を通過し、かつその
+    /// 束縛結果（`Value::Json`）が実際の `row_codec::encode_scalar_columns`
+    /// （presence(1) + 長さ(4) バイトのフレーミングを付与する行コーデック）でも
+    /// 単独で `MAX_SCALAR_PAYLOAD_LEN` へ収まることを固定する。旧
+    /// `MAX_JSON_FIELD_LEN` 定義（`MAX_TEXT_FIELD_LEN` と同値）では、この境界値が
+    /// 束縛層を通過した**後**にフレーミング分だけ `encode_scalar_columns` 側で
+    /// 拒否され得た（codex-review P1 指摘・PR #1014）。
+    #[test]
+    fn bind_json_literal_at_exact_max_json_field_len_fits_scalar_payload_after_encode() {
+        // 単一の文字列リテラルは `MAX_JSON_STRING_CHARS`（1 MiB）に抵触するため、
+        // `json.rs` の境界値テストと同じ方式（複数要素の配列）で目標バイト数を
+        // ちょうど組み立てる: `[` + 5 要素（`"`×2 + 本体） + 4 個の `,` + `]`。
+        let target = crate::json::MAX_JSON_FIELD_LEN;
+        let overhead = 1 + 1 + 4 + 5 * 2;
+        let content_total = target - overhead;
+        let base = content_total / 5;
+        let remainder = content_total % 5;
+        let lens = [base, base, base, base, base + remainder];
+        let mut doc = String::new();
+        doc.push('[');
+        for (i, len) in lens.iter().enumerate() {
+            if i > 0 {
+                doc.push(',');
+            }
+            doc.push('"');
+            doc.push_str(&"a".repeat(*len));
+            doc.push('"');
+        }
+        doc.push(']');
+        assert_eq!(doc.len(), target);
+
+        let value =
+            bind_json_literal(&doc, &ColumnType::Json, "doc").expect("must bind at exact limit");
+
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                crate::catalog::ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                crate::catalog::ColumnDef::new("doc", ColumnType::Json, true),
+            ],
+        );
+        let values = vec![crate::row_codec::Value::Vector(vec![0.1, 0.2]), value];
+        crate::row_codec::encode_scalar_columns(&schema, &values)
+            .expect("bind_json_literal output must always fit the scalar payload budget");
     }
 
     #[test]

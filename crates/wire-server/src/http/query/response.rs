@@ -153,6 +153,19 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push('"');
             Ok(())
         }
+        Cell::Json(text) => {
+            // `JSON`／`JSONB` は native JSON 値として出力する（Issue #889 D6）。
+            // 格納テキストを共有パーサー（`engine::json::parse_json`）で再パース
+            // し `write_canonical` で再シリアライズしてから埋め込む——格納バイト
+            // 列を生のまま応答本文へ連結しない安全側の設計（security.md
+            // 「不安全な設計」対応。連結は非構造化テキストの injection 相当に
+            // なりうる）。再パース失敗は格納契約違反（`row_codec` の encode
+            // チョークポイントが常に検証済みテキストのみを格納する契約に反する）
+            // であり内部エラー（`XX000`）として fail-closed に扱う。
+            let value = engine::json::parse_json(text).map_err(|_| ResponseEncodeError)?;
+            engine::json::write_canonical(&value, out);
+            Ok(())
+        }
     }
 }
 
