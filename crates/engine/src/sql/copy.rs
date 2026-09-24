@@ -59,65 +59,239 @@ fn map_batch_err(e: BatchLimitsError) -> SqlSurfaceError {
     SqlSurfaceError::payload_too_large(e.to_string())
 }
 
-/// レコード（1 行分の CopyData バイト列）をチャンク境界をまたいで切り出す
-/// 状態機械。text／CSV いずれも生の LF（`\n`）が行区切りである点は共通だが
-/// （PostgreSQL の COPY テキストプロトコルは埋め込み改行を `\n`（2 文字の
-/// エスケープ）としてしか表現できず、生の LF バイトは常に行終端である。
-/// text 形式のバックスラッシュエスケープ自体はフィールドデコード側
-/// （[`decode_text_field`]）の責務でありレコード分割には影響しない）、CSV は
-/// 引用符で囲まれたフィールド内に生の改行を含み得るため、`"` の出現回数の
-/// 偶奇（`in_quotes`）で「引用符の外側」を判定してから LF を区切りとみなす
-/// （`""` によるエスケープされた引用符は 2 回連続でトグルするため、
-/// 状態機械としては元の状態へ戻り正しく動作する）。
+/// CSV 形式（RFC4180 風）の 1 バイトずつの状態機械。フィールド先頭でのみ
+/// 引用符開始を許可し、閉じ引用符の直後はエスケープ（もう 1 個の `"`）・
+/// フィールド区切り（`,`）・レコード終端（`\r`／`\n`）以外を受理しない
+/// （Issue #939 レビュー指摘: 旧実装は分割用 `RecordSplitter` が `"` の出現
+/// 回数の偶奇だけで引用状態を判定し、デコード用 `decode_csv_record` も
+/// フィールド先頭以外での引用符開始・閉じ引用符直後の非区切り文字を検査
+/// していなかったため、`ab"cd",x`（フィールド途中の生引用符）や
+/// `"ab"junk,x`（閉じ引用符直後に区切り以外の文字）を正常データとして
+/// 受理してしまっていた。レコード分割とフィールドデコードを同じ状態機械で
+/// 1 回の走査として行うことで、この種の不正な引用符配置を wire 由来の
+/// untrusted 入力として `22000` で一貫して拒否する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CsvFieldState {
+    /// フィールドの先頭（レコード先頭・直前がカンマ・直前のフィールドの
+    /// 閉じ引用符確定後のいずれか）。ここでのみ `"` が引用符開始として
+    /// 受理される。
+    Start,
+    /// 引用符なしフィールドの内部。ここで生の `"` が現れるのは不正配置。
+    Unquoted,
+    /// 引用符付きフィールドの内部。
+    Quoted,
+    /// 引用符付きフィールドの閉じ引用符直後。次にもう 1 個 `"` が来れば
+    /// エスケープされた引用符としてフィールドへ戻り、`,`／`\r`／`\n` なら
+    /// フィールド／レコードの区切り、それ以外はすべて不正配置。
+    AfterQuote,
+}
+
 #[derive(Debug)]
-struct RecordSplitter {
-    format: CopyFormat,
-    pending: Vec<u8>,
-    in_quotes: bool,
+struct CsvRecordScanner {
+    state: CsvFieldState,
+    quoted: bool,
+    field: Vec<u8>,
+    fields: Vec<Option<String>>,
+}
+
+impl CsvRecordScanner {
+    fn new() -> Self {
+        Self {
+            state: CsvFieldState::Start,
+            quoted: false,
+            field: Vec::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    fn push_field(&mut self) -> Result<(), SqlSurfaceError> {
+        let bytes = std::mem::take(&mut self.field);
+        let quoted = std::mem::replace(&mut self.quoted, false);
+        self.fields.push(finish_csv_field(bytes, quoted)?);
+        self.state = CsvFieldState::Start;
+        Ok(())
+    }
+
+    /// 1 バイトを処理する。レコード終端（`\n`）に到達し `fields` が確定した
+    /// 場合のみ `true` を返す（呼び出し元は直後に [`Self::take_record`] で
+    /// 取り出す）。
+    fn push_byte(&mut self, b: u8) -> Result<bool, SqlSurfaceError> {
+        match self.state {
+            CsvFieldState::Start => match b {
+                b'"' => {
+                    self.state = CsvFieldState::Quoted;
+                    self.quoted = true;
+                    Ok(false)
+                }
+                b',' => {
+                    self.push_field()?;
+                    Ok(false)
+                }
+                b'\n' => {
+                    self.push_field()?;
+                    Ok(true)
+                }
+                _ => {
+                    self.state = CsvFieldState::Unquoted;
+                    self.field.push(b);
+                    Ok(false)
+                }
+            },
+            CsvFieldState::Unquoted => match b {
+                // フィールド先頭以外での生引用符は不正配置（`ab"cd",x` 相当）。
+                b'"' => Err(SqlSurfaceError::invalid_input(
+                    "misplaced double quote in COPY CSV field (quote allowed only at field start)",
+                )),
+                b',' => {
+                    self.push_field()?;
+                    Ok(false)
+                }
+                b'\n' => {
+                    if self.field.last() == Some(&b'\r') {
+                        self.field.pop();
+                    }
+                    self.push_field()?;
+                    Ok(true)
+                }
+                _ => {
+                    self.field.push(b);
+                    Ok(false)
+                }
+            },
+            CsvFieldState::Quoted => match b {
+                // ここではエスケープ（直後にもう 1 個 `"`）か閉じ引用符かが
+                // まだ確定できないため `AfterQuote` へ移行し、次バイトで
+                // 判定する。
+                b'"' => {
+                    self.state = CsvFieldState::AfterQuote;
+                    Ok(false)
+                }
+                // 引用符内の生改行はデータ（埋め込み改行）。
+                _ => {
+                    self.field.push(b);
+                    Ok(false)
+                }
+            },
+            CsvFieldState::AfterQuote => match b {
+                b'"' => {
+                    // 直前の `"` と合わせてエスケープされた引用符。
+                    self.field.push(b'"');
+                    self.state = CsvFieldState::Quoted;
+                    Ok(false)
+                }
+                b',' => {
+                    self.push_field()?;
+                    Ok(false)
+                }
+                b'\n' => {
+                    self.push_field()?;
+                    Ok(true)
+                }
+                // `\r\n` レコード終端の `\r` 側。後続 `\n` を待つだけで
+                // フィールドへは積まない（Start／Unquoted 側の `\n` 処理と
+                // 同じく、末尾の `\r` はレコード終端の一部として捨てる）。
+                b'\r' => Ok(false),
+                // 閉じ引用符の直後に区切り・レコード終端・エスケープ以外の
+                // バイトが来るのは不正配置（`"ab"junk,x` 相当）。
+                _ => Err(SqlSurfaceError::invalid_input(
+                    "unexpected byte after closing double quote in COPY CSV field",
+                )),
+            },
+        }
+    }
+
+    fn take_record(&mut self) -> Vec<Option<String>> {
+        std::mem::take(&mut self.fields)
+    }
+
+    /// CopyDone 到達時に呼ぶ。改行なしで終わった末尾レコード（存在する
+    /// 場合）のフィールド列を返す。引用符が閉じられないまま終わった場合は
+    /// `22000` で拒否する（旧 `decode_csv_record` の未終端引用符検査を踏襲）。
+    fn finish(mut self) -> Result<Option<Vec<Option<String>>>, SqlSurfaceError> {
+        if self.state == CsvFieldState::Quoted {
+            return Err(SqlSurfaceError::invalid_input(
+                "unterminated quoted CSV field in COPY record",
+            ));
+        }
+        if self.field.is_empty() && self.fields.is_empty() {
+            return Ok(None);
+        }
+        self.push_field()?;
+        Ok(Some(self.take_record()))
+    }
+}
+
+/// レコード（1 行分）をチャンク境界をまたいで切り出し、フィールドへ
+/// デコードするまでを 1 つの状態機械で行う（[`CsvRecordScanner`] の
+/// モジュールドキュメント参照）。text 形式は埋め込み改行を `\n`（2 文字の
+/// エスケープ）としてしか表現できず引用符機構を持たないため、生の LF を
+/// 単純に行区切りとして扱う（バックスラッシュエスケープの解決自体は
+/// [`decode_text_field`] の責務）。`pending`／`CsvRecordScanner` 双方の
+/// 総容量は呼び出し元（[`CopyInSession::feed`]）が CopyData の生バイト量
+/// そのものを③（`max_batch_total_bytes`）で先に上限判定しているため、
+/// 本型自体は追加の容量上限を持たない（すでに有界な入力を受け取る契約）。
+#[derive(Debug)]
+enum RecordSplitter {
+    Text { pending: Vec<u8> },
+    Csv(CsvRecordScanner),
 }
 
 impl RecordSplitter {
     fn new(format: CopyFormat) -> Self {
-        Self {
-            format,
-            pending: Vec::new(),
-            in_quotes: false,
+        match format {
+            CopyFormat::Text => RecordSplitter::Text {
+                pending: Vec::new(),
+            },
+            CopyFormat::Csv => RecordSplitter::Csv(CsvRecordScanner::new()),
         }
     }
 
-    /// `chunk`（1 個の CopyData メッセージ本文）を末尾未確定分（`pending`）と
-    /// 連結しながら走査し、完了したレコードごとに `on_record` を呼ぶ。
-    /// `pending` の総量は呼び出し元（[`CopyInSession::feed`]）が CopyData の
-    /// 生バイト量そのものを③（`max_batch_total_bytes`）で先に上限判定して
-    /// いるため、本関数自体は追加の容量上限を持たない（すでに有界な入力を
-    /// 受け取る契約）。
+    /// `chunk`（1 個の CopyData メッセージ本文）を走査し、完了したレコード
+    /// （デコード済みフィールド列）ごとに `on_record` を呼ぶ。
     fn feed(
         &mut self,
         chunk: &[u8],
-        mut on_record: impl FnMut(&[u8]) -> Result<(), SqlSurfaceError>,
+        mut on_record: impl FnMut(Vec<Option<String>>) -> Result<(), SqlSurfaceError>,
     ) -> Result<(), SqlSurfaceError> {
-        for &b in chunk {
-            if self.format == CopyFormat::Csv && b == b'"' {
-                self.in_quotes = !self.in_quotes;
-                self.pending.push(b);
-                continue;
-            }
-            if b == b'\n' && !self.in_quotes {
-                let mut record = std::mem::take(&mut self.pending);
-                if record.last() == Some(&b'\r') {
-                    record.pop();
+        match self {
+            RecordSplitter::Text { pending } => {
+                for &b in chunk {
+                    if b == b'\n' {
+                        let mut record = std::mem::take(pending);
+                        if record.last() == Some(&b'\r') {
+                            record.pop();
+                        }
+                        on_record(decode_text_record(&record)?)?;
+                    } else {
+                        pending.push(b);
+                    }
                 }
-                on_record(&record)?;
-                continue;
+                Ok(())
             }
-            self.pending.push(b);
+            RecordSplitter::Csv(scanner) => {
+                for &b in chunk {
+                    if scanner.push_byte(b)? {
+                        on_record(scanner.take_record())?;
+                    }
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
-    /// CopyDone 到達時に呼ぶ。改行なしで終わった末尾分（存在する場合）を返す。
-    fn finish(self) -> Vec<u8> {
-        self.pending
+    /// CopyDone 到達時に呼ぶ。改行なしで終わった末尾レコード（存在する
+    /// 場合）のフィールド列を返す。
+    fn finish(self) -> Result<Option<Vec<Option<String>>>, SqlSurfaceError> {
+        match self {
+            RecordSplitter::Text { pending } => {
+                if pending.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(decode_text_record(&pending)?))
+                }
+            }
+            RecordSplitter::Csv(scanner) => scanner.finish(),
+        }
     }
 }
 
@@ -169,50 +343,10 @@ fn decode_text_record(record: &[u8]) -> Result<Vec<Option<String>>, SqlSurfaceEr
         .collect()
 }
 
-/// CSV 形式の 1 レコードをカンマ区切り・二重引用符エスケープでフィールドへ
-/// 分割する（RFC4180 風）。引用符で囲まれていない空フィールドは NULL、
-/// 引用符で囲まれた空フィールド（`""`）は空文字列として区別する。
-fn decode_csv_record(record: &[u8]) -> Result<Vec<Option<String>>, SqlSurfaceError> {
-    let mut fields: Vec<Option<String>> = Vec::new();
-    let mut current: Vec<u8> = Vec::new();
-    let mut in_quotes = false;
-    let mut quoted = false;
-    let mut iter = record.iter().copied().peekable();
-    while let Some(b) = iter.next() {
-        if in_quotes {
-            if b == b'"' {
-                if iter.peek() == Some(&b'"') {
-                    iter.next();
-                    current.push(b'"');
-                } else {
-                    in_quotes = false;
-                }
-            } else {
-                current.push(b);
-            }
-            continue;
-        }
-        match b {
-            b'"' => {
-                in_quotes = true;
-                quoted = true;
-            }
-            b',' => {
-                fields.push(finish_csv_field(std::mem::take(&mut current), quoted)?);
-                quoted = false;
-            }
-            _ => current.push(b),
-        }
-    }
-    if in_quotes {
-        return Err(SqlSurfaceError::invalid_input(
-            "unterminated quoted CSV field in COPY record",
-        ));
-    }
-    fields.push(finish_csv_field(current, quoted)?);
-    Ok(fields)
-}
-
+/// [`CsvRecordScanner::push_field`] が使う、1 フィールド分の生バイト列を
+/// NULL／空文字列／通常値へ写像する共通処理（引用符で囲まれていない空
+/// フィールドは NULL、引用符で囲まれた空フィールド（`""`）は空文字列として
+/// 区別する）。
 fn finish_csv_field(bytes: Vec<u8>, quoted: bool) -> Result<Option<String>, SqlSurfaceError> {
     if bytes.is_empty() && !quoted {
         return Ok(None);
@@ -220,16 +354,6 @@ fn finish_csv_field(bytes: Vec<u8>, quoted: bool) -> Result<Option<String>, SqlS
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| SqlSurfaceError::invalid_input("COPY CSV field is not valid UTF-8"))
-}
-
-fn decode_record(
-    format: CopyFormat,
-    record: &[u8],
-) -> Result<Vec<Option<String>>, SqlSurfaceError> {
-    match format {
-        CopyFormat::Text => decode_text_record(record),
-        CopyFormat::Csv => decode_csv_record(record),
-    }
 }
 
 /// デコード済み 1 行分のフィールド（`None` = NULL）を [`BoundInsert`] へ束縛
@@ -377,7 +501,6 @@ fn bound_insert_byte_len(bound: &BoundInsert) -> Result<usize, SqlSurfaceError> 
 pub struct CopyInSession {
     table: String,
     columns: Vec<String>,
-    format: CopyFormat,
     operation_id: Option<OperationId>,
     schema: TableSchema,
     limits: BatchLimits,
@@ -436,7 +559,6 @@ impl CopyInSession {
             table,
             columns,
             splitter: RecordSplitter::new(format),
-            format,
             operation_id,
             schema,
             limits,
@@ -469,7 +591,6 @@ impl CopyInSession {
             batch_limits::check_running_total(self.running_bytes, chunk.len(), &self.limits)
                 .map_err(map_batch_err)?;
 
-        let format = self.format;
         let table = self.table.clone();
         let columns = self.columns.clone();
         let operation_id = self.operation_id.clone();
@@ -478,8 +599,7 @@ impl CopyInSession {
         let bounds = &mut self.bounds;
         let splitter = &mut self.splitter;
 
-        splitter.feed(chunk, |record| {
-            let fields = decode_record(format, record)?;
+        splitter.feed(chunk, |fields| {
             if fields.len() != columns.len() {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "COPY record field count {} does not match column count {}",
@@ -503,9 +623,8 @@ impl CopyInSession {
     /// 確定させたうえで、0 行のままなら拒否する（既存の複数行 `INSERT` バッチと
     /// 同じ「空バッチ拒否」契約）。
     pub fn finish(mut self) -> Result<CopyInBatch, SqlSurfaceError> {
-        let tail = self.splitter.finish();
-        if !tail.is_empty() {
-            let fields = decode_record(self.format, &tail)?;
+        let tail = self.splitter.finish()?;
+        if let Some(fields) = tail {
             if fields.len() != self.columns.len() {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "COPY record field count {} does not match column count {}",
@@ -601,62 +720,95 @@ mod tests {
         assert!(!is_copy_statement("SELECT 1"));
     }
 
+    /// CSV レコードを丸ごと最後まで供給し、確定したフィールド列（複数
+    /// レコードにまたがる場合は最後のレコードのみ）を返すテスト用ヘルパー。
+    fn scan_csv_record(input: &[u8]) -> Result<Vec<Option<String>>, SqlSurfaceError> {
+        let mut scanner = CsvRecordScanner::new();
+        let mut last: Option<Vec<Option<String>>> = None;
+        for &b in input {
+            if scanner.push_byte(b)? {
+                last = Some(scanner.take_record());
+            }
+        }
+        if let Some(fields) = last {
+            return Ok(fields);
+        }
+        scanner
+            .finish()?
+            .ok_or_else(|| SqlSurfaceError::invalid_input("no CSV record produced"))
+    }
+
     #[test]
     fn record_splitter_splits_on_raw_newline_and_strips_cr() {
         let mut splitter = RecordSplitter::new(CopyFormat::Text);
-        let mut records: Vec<Vec<u8>> = Vec::new();
+        let mut records: Vec<Vec<Option<String>>> = Vec::new();
         splitter
             .feed(b"a\tb\r\nc\td\n", |r| {
-                records.push(r.to_vec());
+                records.push(r);
                 Ok(())
             })
             .unwrap();
-        assert_eq!(records, vec![b"a\tb".to_vec(), b"c\td".to_vec()]);
+        assert_eq!(
+            records,
+            vec![
+                vec![Some("a".to_string()), Some("b".to_string())],
+                vec![Some("c".to_string()), Some("d".to_string())],
+            ]
+        );
     }
 
     #[test]
     fn record_splitter_resumes_across_chunk_boundaries() {
         let mut splitter = RecordSplitter::new(CopyFormat::Text);
-        let mut records: Vec<Vec<u8>> = Vec::new();
+        let mut records: Vec<Vec<Option<String>>> = Vec::new();
         for i in 0..b"a\tbc\n".len() {
             let byte = b"a\tbc\n"[i..=i].to_vec();
             splitter
                 .feed(&byte, |r| {
-                    records.push(r.to_vec());
+                    records.push(r);
                     Ok(())
                 })
                 .unwrap();
         }
-        assert_eq!(records, vec![b"a\tbc".to_vec()]);
+        assert_eq!(
+            records,
+            vec![vec![Some("a".to_string()), Some("bc".to_string())]]
+        );
     }
 
     #[test]
     fn record_splitter_keeps_newline_inside_csv_quotes() {
         let mut splitter = RecordSplitter::new(CopyFormat::Csv);
-        let mut records: Vec<Vec<u8>> = Vec::new();
+        let mut records: Vec<Vec<Option<String>>> = Vec::new();
         splitter
             .feed(b"1,\"a\nb\"\n2,c\n", |r| {
-                records.push(r.to_vec());
+                records.push(r);
                 Ok(())
             })
             .unwrap();
-        assert_eq!(records, vec![b"1,\"a\nb\"".to_vec(), b"2,c".to_vec()]);
+        assert_eq!(
+            records,
+            vec![
+                vec![Some("1".to_string()), Some("a\nb".to_string())],
+                vec![Some("2".to_string()), Some("c".to_string())],
+            ]
+        );
     }
 
     #[test]
     fn record_splitter_handles_escaped_quote_pair_without_ending_quoted_region() {
         let mut splitter = RecordSplitter::new(CopyFormat::Csv);
-        let mut records: Vec<Vec<u8>> = Vec::new();
+        let mut records: Vec<Vec<Option<String>>> = Vec::new();
         // `"a""b\nc"` は 1 個の引用符フィールド内に `""`（エスケープされた
         // 引用符）と改行を含む。エスケープ後もまだ引用符内であることを
         // 状態機械が正しく維持できるかを確認する。
         splitter
             .feed(b"\"a\"\"b\nc\"\n", |r| {
-                records.push(r.to_vec());
+                records.push(r);
                 Ok(())
             })
             .unwrap();
-        assert_eq!(records, vec![b"\"a\"\"b\nc\"".to_vec()]);
+        assert_eq!(records, vec![vec![Some("a\"b\nc".to_string())]]);
     }
 
     #[test]
@@ -678,8 +830,8 @@ mod tests {
     }
 
     #[test]
-    fn decode_csv_record_distinguishes_null_and_empty_string() {
-        let fields = decode_csv_record(b",\"\",value").unwrap();
+    fn csv_record_scanner_distinguishes_null_and_empty_string() {
+        let fields = scan_csv_record(b",\"\",value\n").unwrap();
         assert_eq!(
             fields,
             vec![None, Some(String::new()), Some("value".to_string())]
@@ -687,14 +839,53 @@ mod tests {
     }
 
     #[test]
-    fn decode_csv_record_unescapes_doubled_quotes() {
-        let fields = decode_csv_record(b"\"a\"\"b\"").unwrap();
+    fn csv_record_scanner_unescapes_doubled_quotes() {
+        let fields = scan_csv_record(b"\"a\"\"b\"\n").unwrap();
         assert_eq!(fields, vec![Some("a\"b".to_string())]);
     }
 
     #[test]
-    fn decode_csv_record_rejects_unterminated_quote() {
-        assert!(decode_csv_record(b"\"abc").is_err());
+    fn csv_record_scanner_rejects_unterminated_quote() {
+        let mut scanner = CsvRecordScanner::new();
+        for &b in b"\"abc" {
+            scanner.push_byte(b).unwrap();
+        }
+        let err = scanner.finish().unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // Issue #939 codex-review 指摘（discussion_r4096720883）: フィールド先頭
+    // 以外で生の `"` が現れる不正配置（`ab"cd",x`）を正常データとして受理して
+    // いた回帰の防止。
+    #[test]
+    fn csv_record_scanner_rejects_quote_mid_unquoted_field() {
+        let mut scanner = CsvRecordScanner::new();
+        let mut err = None;
+        for &b in b"ab\"cd\",x\n" {
+            if let Err(e) = scanner.push_byte(b) {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = err.expect("misplaced quote must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // 同上（discussion_r4096720883）: 閉じ引用符の直後に区切り・レコード
+    // 終端・エスケープ以外の文字が続く不正配置（`"ab"junk,x`）を正常データ
+    // として受理していた回帰の防止。
+    #[test]
+    fn csv_record_scanner_rejects_data_immediately_after_closing_quote() {
+        let mut scanner = CsvRecordScanner::new();
+        let mut err = None;
+        for &b in b"\"ab\"junk,x\n" {
+            if let Err(e) = scanner.push_byte(b) {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = err.expect("data right after closing quote must be rejected");
+        assert_eq!(err.wire_code(), "22000");
     }
 
     #[test]
