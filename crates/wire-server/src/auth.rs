@@ -7,7 +7,10 @@
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-2, WIRE-3）。
 
 pub mod argon2id;
+pub mod base64_std;
 pub mod blake2b;
+pub mod hmac_sha256;
+pub mod scram;
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -32,7 +35,7 @@ use engine::storage::Visibility;
 ///
 /// engine 側 `crate::policy::PolicyContext::new`（既定 = `Public` のみ）は
 /// 変更しない。可視性の拡張はこの wire 認証導出点に閉じる。
-fn session_policy_context(
+pub(crate) fn session_policy_context(
     tenant_id: &str,
 ) -> Result<engine::policy::PolicyContext, engine::policy::PolicyError> {
     engine::policy::PolicyContext::with_visibilities(
@@ -57,17 +60,43 @@ pub const AUTH_FAILURE_DELAY: Duration = Duration::from_millis(200);
 pub const SQLSTATE_INVALID_PASSWORD: &str =
     engine::error_format::ErrorClass::AuthInvalid.wire_code();
 
-/// ユーザーストア 1 行分のレコード（`username:tenant_id:phc` 形式）。
+/// サーバー全体で一意に選ぶ認証方式（Issue #940・WIRE-18・TASK-222）。
+/// ユーザーごとに切り替えない（`Authentication*` の種類自体からユーザーの
+/// 存在・方式が判別できてしまうのを避けるため）。`--auth-method` CLI
+/// （`auth_method_opt.rs`）が唯一の入口。未指定時は `Cleartext` で、これは
+/// 本 Issue 以前の挙動とビット同一のまま不変。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthMethod {
+    #[default]
+    Cleartext,
+    ScramSha256,
+}
+
+/// ユーザーストア 1 行分のレコード（`username:tenant_id:phc[:scram_verifier]` 形式）。
 struct UserRecord {
     tenant_id: String,
     phc: String,
+    scram_verifier: Option<scram::ScramVerifier>,
 }
 
 /// サーバー起動時に `--users` で読み込むユーザーストア。認証主体からテナントを
 /// 一意に導出できる唯一の情報源であり、全レコードが必ず `tenant_id` を持つ
 /// （テナント無所属の特権ログイン主体を構造的に作らない。WIRE-2）。
+///
+/// `auth_method`（既定 [`AuthMethod::Cleartext`]）は [`UserStore::require_scram`]
+/// による opt-in でのみ [`AuthMethod::ScramSha256`] へ切り替わる。
 pub struct UserStore {
     users: HashMap<String, UserRecord>,
+    auth_method: AuthMethod,
+    /// 未知ユーザー向けモック検証子（[`scram::mock_verifier`]）の鍵。
+    /// ロード済み全レコードの ServerKey を連結してドメインタグ付きで
+    /// ハッシュした値（再起動しても安定。ファイル行順に依存するため
+    /// ユーザーストアの変更前後でモック salt が変わり得る点は既知の制約
+    /// として README に記録する）。SCRAM 検証子を 1 つも持たないストアでも
+    /// 決定的な値を持つ（`ScramSha256` モードでは `require_scram` が
+    /// 全レコードへの検証子付与を強制するため、実運用でこの分岐に頼るのは
+    /// 検証子が 1 つも無い特殊なストアのみ）。
+    scram_mock_key: [u8; scram::KEY_LEN],
 }
 
 /// [`UserStore::load_from_file`] のロード時検証エラー（fail-closed。起動を中断する）。
@@ -95,6 +124,18 @@ pub enum LoadError {
     /// 満たさない。
     InvalidTenantId {
         line: usize,
+    },
+    /// 4 番目のフィールド（SCRAM 検証子）が構文的に不正、または
+    /// [`scram::SCRAM_ITERATIONS`]／[`scram::SALT_LEN`] への完全一致を満たさない
+    /// （タイミング側チャネル対策。PHC の `RECOMMENDED_PARAMS` 完全一致検証と
+    /// 同じ設計判断）。
+    InvalidScramVerifier {
+        line: usize,
+    },
+    /// [`UserStore::require_scram`] が検証子を持たないレコードを検出した
+    /// （`ScramSha256` モードでは全レコードが検証子を持つ必要がある）。
+    MissingScramVerifier {
+        username: String,
     },
 }
 
@@ -126,6 +167,15 @@ impl std::fmt::Display for LoadError {
                     "user store: tenant_id rejected by policy context at line {line}"
                 )
             }
+            LoadError::InvalidScramVerifier { line } => {
+                write!(f, "user store: invalid SCRAM verifier at line {line}")
+            }
+            LoadError::MissingScramVerifier { username } => {
+                write!(
+                    f,
+                    "user store: user '{username}' has no SCRAM verifier (required in scram-sha-256 auth mode)"
+                )
+            }
         }
     }
 }
@@ -154,6 +204,9 @@ impl UserStore {
     pub fn load_from_file(path: &Path) -> Result<Self, LoadError> {
         let content = std::fs::read_to_string(path)?;
         let mut users = HashMap::new();
+        // モック鍵導出（`scram::mock_verifier`）の入力。ファイル行順に集める
+        // （HashMap の反復順に依存しない決定的な順序にするため）。
+        let mut server_keys_for_mock: Vec<[u8; scram::KEY_LEN]> = Vec::new();
 
         for (idx, raw_line) in content.lines().enumerate() {
             let line_no = idx + 1;
@@ -161,14 +214,40 @@ impl UserStore {
             if line.is_empty() {
                 continue;
             }
-            // `:` をちょうど 2 個含む行のみ受理する。username・tenant_id に `:` が
-            // 混入した行は 4 要素以上になり自動的に拒否される（余分なロジックなしで
-            // 「username への `:` 混入を起動時に拒否」を満たす）。
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() != 3 {
+            // 4 番目のフィールド（SCRAM 検証子。`splitn` により内部の `:` は
+            // 保持される）は opt-in。3 フィールドの行は従来どおり読み込める。
+            // username・tenant_id に `:` が混入した行は 4 要素以上になり、かつ
+            // 4 番目のフィールドが `SCRAM-SHA-256$` で始まらないため
+            // `MalformedLine` として自動的に拒否される（余分なロジックなしで
+            // 既存契約を維持する）。
+            let parts: Vec<&str> = line.splitn(4, ':').collect();
+            if parts.len() != 3 && parts.len() != 4 {
                 return Err(LoadError::MalformedLine { line: line_no });
             }
-            let (username, tenant_id, phc) = (parts[0], parts[1], parts[2]);
+            let username = parts
+                .first()
+                .copied()
+                .ok_or(LoadError::MalformedLine { line: line_no })?;
+            let tenant_id = parts
+                .get(1)
+                .copied()
+                .ok_or(LoadError::MalformedLine { line: line_no })?;
+            let phc = parts
+                .get(2)
+                .copied()
+                .ok_or(LoadError::MalformedLine { line: line_no })?;
+            let scram_field = parts.get(3).copied();
+            // 4 番目のフィールドがあるのに SCRAM 検証子の接頭辞で始まらない
+            // 行は、そもそも username・tenant_id に `:` が混入した 3 フィールド
+            // 行の誤解釈である可能性が高いため `MalformedLine` として拒否する
+            // （review 指摘の再現ケース: `ali:ce:tenant-a:{phc}` のような行を
+            // 「tenant_id=ce, phc=tenant-a, scram_verifier=不正な検証子」と
+            // 誤って受理しないための既存契約〔`:` 混入行の拒否〕を維持する）。
+            if let Some(field) = scram_field {
+                if !field.starts_with("SCRAM-SHA-256$") {
+                    return Err(LoadError::MalformedLine { line: line_no });
+                }
+            }
 
             if username.is_empty() {
                 return Err(LoadError::EmptyUsername { line: line_no });
@@ -199,12 +278,32 @@ impl UserStore {
             session_policy_context(tenant_id)
                 .map_err(|_| LoadError::InvalidTenantId { line: line_no })?;
 
+            let scram_verifier = match scram_field {
+                None => None,
+                Some(field) => {
+                    let verifier = scram::ScramVerifier::parse(field)
+                        .map_err(|_| LoadError::InvalidScramVerifier { line: line_no })?;
+                    // 反復回数・salt 長はレコードごとに異ならせない（タイミング
+                    // 側チャネル対策。PHC の `RECOMMENDED_PARAMS` 完全一致検証と
+                    // 同じ設計判断。鍵長は `ScramVerifier::parse` が型
+                    // （`[u8; KEY_LEN]`）で既に保証する）。
+                    if verifier.iterations != scram::SCRAM_ITERATIONS
+                        || verifier.salt.len() != scram::SALT_LEN
+                    {
+                        return Err(LoadError::InvalidScramVerifier { line: line_no });
+                    }
+                    server_keys_for_mock.push(verifier.server_key);
+                    Some(verifier)
+                }
+            };
+
             if users
                 .insert(
                     username.to_string(),
                     UserRecord {
                         tenant_id: tenant_id.to_string(),
                         phc: phc.to_string(),
+                        scram_verifier,
                     },
                 )
                 .is_some()
@@ -213,7 +312,57 @@ impl UserStore {
             }
         }
 
-        Ok(Self { users })
+        let scram_mock_key = derive_scram_mock_key(&server_keys_for_mock);
+        Ok(Self {
+            users,
+            auth_method: AuthMethod::default(),
+            scram_mock_key,
+        })
+    }
+
+    /// 認証方式を [`AuthMethod::ScramSha256`] へ切り替える opt-in（`--auth-method
+    /// scram-sha-256` からのみ呼ばれる）。全レコードが SCRAM 検証子を持つことを
+    /// 要求し、欠けていれば起動失敗とする（fail-closed。SCRAM モードでは
+    /// Argon2id の PHC を一切照合に使わないため、検証子を欠くレコードは
+    /// 恒久的にログイン不能になる、というだけでなく、そのレコードだけ
+    /// モック相当の扱いになりタイミング対称性が崩れるのを未然に防ぐ）。
+    pub fn require_scram(mut self) -> Result<Self, LoadError> {
+        let mut usernames: Vec<&String> = self.users.keys().collect();
+        usernames.sort();
+        for username in usernames {
+            let has_verifier = self
+                .users
+                .get(username)
+                .map(|r| r.scram_verifier.is_some())
+                .unwrap_or(false);
+            if !has_verifier {
+                return Err(LoadError::MissingScramVerifier {
+                    username: username.clone(),
+                });
+            }
+        }
+        self.auth_method = AuthMethod::ScramSha256;
+        Ok(self)
+    }
+
+    /// このストアが選択している認証方式。`handshake.rs` が `Authentication*`
+    /// の種類を分岐する唯一の情報源。
+    pub fn auth_method(&self) -> AuthMethod {
+        self.auth_method
+    }
+
+    /// モック検証子の鍵（[`scram::mock_verifier`] へ渡す）。
+    pub fn scram_mock_key(&self) -> &[u8; scram::KEY_LEN] {
+        &self.scram_mock_key
+    }
+
+    /// SCRAM 認証向けの照合情報を返す。ユーザーが存在しない、または
+    /// （通常到達しないはずだが）検証子を欠く場合は `None`（呼び出し元の
+    /// `handshake.rs` がモック検証子へフォールバックする）。
+    pub fn scram_lookup(&self, username: &str) -> Option<(&str, &scram::ScramVerifier)> {
+        let record = self.users.get(username)?;
+        let verifier = record.scram_verifier.as_ref()?;
+        Some((record.tenant_id.as_str(), verifier))
     }
 
     /// ロード済みレコード数。ユーザー名・テナント ID 等の存在情報は含まない
@@ -236,11 +385,28 @@ impl UserStore {
                 UserRecord {
                     tenant_id: tenant_id.to_string(),
                     phc: phc.to_string(),
+                    scram_verifier: None,
                 },
             );
         }
-        Self { users }
+        Self {
+            users,
+            auth_method: AuthMethod::default(),
+            scram_mock_key: derive_scram_mock_key(&[]),
+        }
     }
+}
+
+/// [`UserStore::scram_mock_key`] の導出（ロード済み全 ServerKey をファイル行順に
+/// 連結し、ドメインタグ付きで SHA-256 する）。ServerKey が 1 つも無い場合
+/// （SCRAM 検証子を含まないストア）でもドメインタグのみから決定的な値を返す。
+fn derive_scram_mock_key(server_keys: &[[u8; scram::KEY_LEN]]) -> [u8; scram::KEY_LEN] {
+    let mut input = Vec::with_capacity(32 + server_keys.len() * scram::KEY_LEN);
+    input.extend_from_slice(b"vector-db/scram/mock-key/v1");
+    for key in server_keys {
+        input.extend_from_slice(key);
+    }
+    engine::crypto::sha256::digest(&input)
 }
 
 /// cleartext password 認証の失敗を表す（ポインタ: TASK-67・WIRE-3）。
@@ -777,6 +943,107 @@ mod tests {
              cost variance that could leak user existence via timing)"
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn write_users_file_with_content(name_hint: &str, content: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wire-server-test-scram-{}-{}-{}",
+            std::process::id(),
+            name_hint,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users.txt");
+        std::fs::write(&path, content).expect("write fixture");
+        path
+    }
+
+    fn sample_scram_line(username: &str, tenant_id: &str, password: &[u8]) -> String {
+        let salt = [3u8; scram::SALT_LEN];
+        let verifier =
+            scram::generate_verifier(password, &salt, scram::SCRAM_ITERATIONS).expect("verifier");
+        format!(
+            "{username}:{tenant_id}:{}:{}",
+            dummy_phc(),
+            verifier.to_verifier_string()
+        )
+    }
+
+    /// 3 フィールドの既存行と 4 フィールド（SCRAM 検証子付き）の行が同じ
+    /// ファイル内で共存でき、それぞれ正しくロードされること。
+    #[test]
+    fn load_from_file_accepts_mixed_three_and_four_field_lines() {
+        let cleartext_line = format!("bob:tenant-b:{}\n", dummy_phc());
+        let scram_line = sample_scram_line("alice", "tenant-a", b"correct-horse");
+        let path =
+            write_users_file_with_content("mixed", &format!("{cleartext_line}{scram_line}\n"));
+
+        let store = UserStore::load_from_file(&path).expect("mixed file must load");
+        assert_eq!(store.len(), 2);
+        assert!(store.scram_lookup("bob").is_none());
+        let (tenant, _verifier) = store.scram_lookup("alice").expect("alice has verifier");
+        assert_eq!(tenant, "tenant-a");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_from_file_rejects_scram_verifier_with_wrong_iterations() {
+        let salt = [3u8; scram::SALT_LEN];
+        let verifier = scram::generate_verifier(b"pw", &salt, 1).expect("verifier");
+        let line = format!(
+            "alice:tenant-a:{}:{}\n",
+            dummy_phc(),
+            verifier.to_verifier_string()
+        );
+        let path = write_users_file_with_content("bad-iter", &line);
+        let result = UserStore::load_from_file(&path);
+        assert!(matches!(
+            result,
+            Err(LoadError::InvalidScramVerifier { line: 1 })
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn require_scram_rejects_store_with_missing_verifier() {
+        let path = write_users_file_with_content(
+            "missing-verifier",
+            &format!("alice:tenant-a:{}\n", dummy_phc()),
+        );
+        let store = UserStore::load_from_file(&path).expect("load");
+        let result = store.require_scram();
+        assert!(matches!(
+            result,
+            Err(LoadError::MissingScramVerifier { username }) if username == "alice"
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn require_scram_accepts_store_where_all_records_have_verifiers() {
+        let line = sample_scram_line("alice", "tenant-a", b"correct-horse");
+        let path = write_users_file_with_content("all-verified", &format!("{line}\n"));
+        let store = UserStore::load_from_file(&path).expect("load");
+        let store = store.require_scram().expect("all records have verifiers");
+        assert_eq!(store.auth_method(), AuthMethod::ScramSha256);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 未知ユーザー向けモック鍵から導出する salt は、同一ユーザー名なら
+    /// 同一ファイルの再ロードをまたいでも安定する（RFC 5802 の salt が
+    /// 再接続で変わらない性質と対称）。
+    #[test]
+    fn scram_mock_key_is_stable_across_reloads_of_same_file() {
+        let line = sample_scram_line("alice", "tenant-a", b"correct-horse");
+        let path = write_users_file_with_content("mock-stable", &format!("{line}\n"));
+        let store1 = UserStore::load_from_file(&path).expect("load 1");
+        let store2 = UserStore::load_from_file(&path).expect("load 2");
+        assert_eq!(store1.scram_mock_key(), store2.scram_mock_key());
         let _ = std::fs::remove_file(&path);
     }
 }
