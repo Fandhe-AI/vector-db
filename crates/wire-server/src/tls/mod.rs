@@ -17,14 +17,22 @@
 //!   最小集合 6 種の parse/serialize と、レコード境界をまたぐ再組み立てを
 //!   担う。拡張の意味解釈・状態機械・暗号は持たない（`handshake` の
 //!   ドキュメンテーションコメントを参照）
+//! - [`hkdf`]: HMAC-SHA-256（RFC 2104）・HKDF-Extract/Expand（RFC 5869）・
+//!   `HKDF-Expand-Label`／`Derive-Secret`（RFC 8446 §7.1）の原始操作
+//!   （Issue #956）。ハッシュ本体は `engine::crypto::sha256`（SCRAM-SHA-256 認証・Issue #940 が切り出し済み）を再利用する
+//! - [`key_schedule`]: TLS 1.3 鍵スケジュール本体（RFC 8446 §7.1。Issue #956）。
+//!   Early → Handshake → Master の secret 遷移と各段の traffic secret／
+//!   key／iv 導出を型状態で提供する
 //!
-//! key_share 拡張の解析（#954）・HKDF／鍵スケジュール（#956）・alert 型や
-//! ハンドシェイク状態機械（#965）・レコード保護／暗号化（#959）・
-//! 接続への結線（#966 以降）はいずれも後続 sub-issue の担当であり、
-//! 本モジュールは対象外のまま。並列開発時のコンフリクトを避けるため、
-//! 後続 sub-issue は `pub mod` を 1 行ずつ追加していく想定。
+//! key_share 拡張の解析（#954）・alert 型やハンドシェイク状態機械（#965）・
+//! レコード保護／暗号化（#959）・接続への結線（#966 以降）はいずれも
+//! 後続 sub-issue の担当であり、本モジュールは対象外のまま。並列開発時の
+//! コンフリクトを避けるため、後続 sub-issue は `pub mod` を 1 行ずつ
+//! 追加していく想定。
 
 pub(crate) mod field25519;
 pub mod handshake;
+pub mod hkdf;
+pub mod key_schedule;
 pub mod record;
 pub mod x25519;
