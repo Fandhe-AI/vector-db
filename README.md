@@ -69,7 +69,8 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
   [--hnsw-full-scan-ratio <num>/<den>] \
   [--hnsw-acorn-max-visible-ratio <num>/<den>] \
   [--hnsw-sparse-visited-max <N>] \
-  [--durability immediate|none]
+  [--durability immediate|none] \
+  [--auth-method cleartext|scram-sha-256]
 ```
 
 `--users`・`--db` はいずれも必須です（省略時は匿名ログイン・匿名 DB を暗黙生成せず
@@ -202,6 +203,38 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 含意を運用者が見落とさないよう、`none` を選んだ場合に限り起動ログへ英語の
 `WARNING` 行を 1 行出します（`immediate`・未指定では出力されません）。
 `EXPLAIN` への durability 設定の露出は対象外です。
+
+`--auth-method`（Issue #940・WIRE-18・TASK-222）は SQL 表層の SASL 認証方式を
+選ぶ opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス
+起動時にのみ明示指定する注入点」で、未指定（または `cleartext`）は現行どおり
+cleartext password 認証のまま不変です。`scram-sha-256` を指定すると
+[RFC 7677](https://www.rfc-editor.org/rfc/rfc7677)（`SCRAM-SHA-256`）による
+チャレンジ・レスポンス認証へ切り替わり、平文パスワードが wire 上を流れなく
+なります。不正な値・値欠落・2 回目以降の重複指定はいずれも fail-closed で
+起動エラーとなり、既定へ黙って読み替わることはありません。認証方式は
+サーバー全体で 1 つに固定され、ユーザーごとには切り替えられません。
+
+`scram-sha-256` を選択する場合の制約:
+
+- **全ユーザーが SCRAM 検証子を持っている必要があります**（起動時に
+  fail-closed で検証。検証子を欠くレコードが 1 件でもあると起動を拒否します）。
+  ユーザーストアへ登録する SCRAM 検証子は `wire-server hash-password
+  --with-scram-sha-256` で生成します（stdin からパスワードを 1 行読み、
+  `<PHC 文字列>:<SCRAM 検証子文字列>` を標準出力へ出します。既定
+  `--with-scram-sha-256` 省略時は従来どおり PHC 文字列のみを出力します）。
+- **パスワードは印字可能 ASCII（0x20〜0x7e）に限定されます**。SASLprep
+  （[RFC 4013](https://www.rfc-editor.org/rfc/rfc4013)。NFKC 正規化を含む）は
+  自作せず、印字可能 ASCII の範囲では SASLprep が恒等変換になることを
+  利用してこの制約に置き換えています。範囲外の文字を含むパスワードは
+  `hash-password --with-scram-sha-256` の時点で拒否されます（libpq・
+  node-postgres 等の一般的なクライアント実装と結果が一致することを保証する
+  ための設計判断です）。
+- **NoSQL 表層（`--surface nosql`）とは併用できません**（起動時 fail-closed で
+  拒否）。`POST /v1/session` は Argon2id 照合を直接呼ぶ別経路であり SASL の
+  ような往復を持たないためです（HTTP-10）。
+- TLS（TASK-72・WIRE-9）は未実装のため、channel binding
+  （`SCRAM-SHA-256-PLUS`・`p=` フラグ）は提示・受理せず `08P01` で拒否します
+  （詳細は Issue #941 参照）。
 
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 
