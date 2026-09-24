@@ -386,6 +386,14 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
             ty: engine::catalog::ColumnType::Date | engine::catalog::ColumnType::Timestamp,
             ..
         } => false,
+        // `UUID` 列（TABLE-13〔検討中〕・TASK-197、Issue #887）も本 Issue
+        // （#936・WIRE-14）の策定時点では未存在の型のため、バイナリ表現は
+        // spec 側で未決定。他の後発型と同様に fail-closed で非対応とする
+        // （U10。RowDescription への専用 OID 公告は #895 の担当のまま）。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Uuid,
+            ..
+        } => false,
         // 実行時型（Float/Bool/Vector）が静的に決まらないため fail-closed
         // で非対応とする（#895 で型情報が付いたら見直す）。
         ColumnMeta::Computed { .. } => false,
@@ -517,6 +525,10 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         // NUMERIC 列の text フォーマット表現は正規テキスト（`Decimal::Display`）
         // をそのまま送る（TABLE-13〔検討中〕・TASK-197、Issue #885）。
         Cell::Numeric(d) => Ok(Some(d.to_string())),
+        // UUID 列の text フォーマット表現は正規テキスト（小文字
+        // `8-4-4-4-12`）をそのまま送る（TABLE-13〔検討中〕・TASK-197、
+        // Issue #887・U4）。
+        Cell::Uuid(u) => Ok(Some(u.to_string())),
     }
 }
 
@@ -683,7 +695,8 @@ where
                     | Cell::Array(_)
                     | Cell::Bytes(_)
                     | Cell::Json(_)
-                    | Cell::Numeric(_) => {
+                    | Cell::Numeric(_)
+                    | Cell::Uuid(_) => {
                         return Err(EncodeError);
                     }
                 },
@@ -1443,6 +1456,12 @@ mod tests {
         }));
         assert!(!column_binary_support(&ColumnMeta::Computed {
             name: "expr".to_string(),
+        }));
+        // UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887・U10）もバイナリ
+        // 非対応のまま（RowDescription への専用 OID 公告は #895 の担当）。
+        assert!(!column_binary_support(&ColumnMeta::Scalar {
+            name: "external_id".to_string(),
+            ty: engine::catalog::ColumnType::Uuid,
         }));
     }
 

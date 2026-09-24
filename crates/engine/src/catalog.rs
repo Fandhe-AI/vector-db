@@ -332,6 +332,10 @@ pub enum ColumnType {
     /// [`crate::numeric::Decimal`] 参照。`1 <= precision <= 38`・
     /// `0 <= scale <= precision` を encode・decode 両側で検証する。
     Numeric { precision: u8, scale: u8 },
+    /// 128bit 識別子列 `UUID`（TABLE-13〔検討中〕・TASK-197、Issue #887）。
+    /// 値の内部表現・テキスト規範形は [`crate::uuid::Uuid`] 参照。version／
+    /// variant ビットは検証しない（nil・全 1 も有効値）。
+    Uuid,
 }
 
 impl ColumnType {
@@ -361,6 +365,7 @@ impl ColumnType {
             ColumnType::Jsonb => ("jsonb", "-".to_string()),
             ColumnType::Enum(def) => ("enum", def.name.clone()),
             ColumnType::Numeric { precision, scale } => ("numeric", format!("{precision},{scale}")),
+            ColumnType::Uuid => ("uuid", "-".to_string()),
         }
     }
 
@@ -484,6 +489,14 @@ impl ColumnType {
             "numeric" => {
                 let (precision, scale) = parse_numeric_param(param)?;
                 Ok(ColumnType::Numeric { precision, scale })
+            }
+            "uuid" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "uuid column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Uuid)
             }
             other => Err(CatalogError::Invalid(format!(
                 "unknown column type: {other:?}"
@@ -871,7 +884,8 @@ impl TableSchema {
             | ColumnType::Jsonb
             | ColumnType::Enum(_)
             | ColumnType::Array(_)
-            | ColumnType::Numeric { .. } => None,
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid => None,
         })
     }
 

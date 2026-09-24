@@ -41,6 +41,7 @@ pub mod storage;
 pub mod tenant;
 pub mod tiering;
 pub mod txn;
+pub mod uuid;
 pub mod wasm_udf;
 
 # source: crates/engine/src/core.rs :: VectorCore

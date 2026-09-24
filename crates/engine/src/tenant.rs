@@ -1919,9 +1919,28 @@ fn validate_set_assignments(
                 | crate::catalog::ColumnType::Json
                 | crate::catalog::ColumnType::Jsonb
                 | crate::catalog::ColumnType::Enum(_)
-                | crate::catalog::ColumnType::Numeric { .. },
+                | crate::catalog::ColumnType::Numeric { .. }
+                | crate::catalog::ColumnType::Uuid,
                 crate::row_codec::Value::Null,
             ) if column.nullable => {}
+            (crate::catalog::ColumnType::Uuid, crate::row_codec::Value::Uuid(_)) => {
+                // UUID 値は行コーデック上 presence(1) + 16 バイト固定
+                // （`row_codec::SCALAR_UUID_ENTRY_LEN`）のため、TEXT のような
+                // 長さ検証は不要（TABLE-13〔検討中〕・TASK-197、Issue #887）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_UUID_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             (crate::catalog::ColumnType::Vector(_), _)
             | (crate::catalog::ColumnType::Text, _)
             | (crate::catalog::ColumnType::Boolean, _)
@@ -1932,7 +1951,8 @@ fn validate_set_assignments(
             | (crate::catalog::ColumnType::Json, _)
             | (crate::catalog::ColumnType::Jsonb, _)
             | (crate::catalog::ColumnType::Enum(_), _)
-            | (crate::catalog::ColumnType::Numeric { .. }, _) => {
+            | (crate::catalog::ColumnType::Numeric { .. }, _)
+            | (crate::catalog::ColumnType::Uuid, _) => {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column type does not match the current table schema".to_string(),
                 )))
