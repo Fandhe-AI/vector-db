@@ -368,6 +368,60 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
     Ok(values)
 }
 
+/// `DATE`／`TIMESTAMP` 列（TABLE-13・TASK-197、Issue #884）向けの文字列リテラル
+/// 束縛。INSERT／UPDATE SET／UPSERT の 3 経路（[`bind_insert_row`]・
+/// [`bind_set_assignments`]・[`bind_upsert_assignments`]）が共有する単一情報源。
+/// 文法違反（[`crate::datetime::DateTimeLiteralError::Format`]）は既存の
+/// `InvalidInput`（`22000`）へ、範囲外・暦上不正
+/// （[`crate::datetime::DateTimeLiteralError::Overflow`]）は
+/// [`SqlSurfaceError::DatetimeFieldOverflow`]（`22008`）へ写像する（D-1。
+/// `docs/design/datetime-column.md` 参照）。
+fn bind_datetime_literal(
+    column_name: &str,
+    ty: ColumnType,
+    literal: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    match ty {
+        ColumnType::Date => match crate::datetime::parse_date(literal) {
+            Ok(days) => Ok(crate::row_codec::Value::Date(days)),
+            Err(crate::datetime::DateTimeLiteralError::Format(detail)) => Err(
+                SqlSurfaceError::invalid_input(format!("column {column_name:?}: {detail}")),
+            ),
+            Err(crate::datetime::DateTimeLiteralError::Overflow(detail)) => {
+                Err(SqlSurfaceError::datetime_field_overflow(format!(
+                    "column {column_name:?}: {detail}"
+                )))
+            }
+        },
+        ColumnType::Timestamp => match crate::datetime::parse_timestamp(literal) {
+            Ok(micros) => Ok(crate::row_codec::Value::Timestamp(micros)),
+            Err(crate::datetime::DateTimeLiteralError::Format(detail)) => Err(
+                SqlSurfaceError::invalid_input(format!("column {column_name:?}: {detail}")),
+            ),
+            Err(crate::datetime::DateTimeLiteralError::Overflow(detail)) => {
+                Err(SqlSurfaceError::datetime_field_overflow(format!(
+                    "column {column_name:?}: {detail}"
+                )))
+            }
+        },
+        ColumnType::Text
+        | ColumnType::Vector(_)
+        | ColumnType::Boolean
+        | ColumnType::Array(_)
+        | ColumnType::Bytea
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Numeric { .. }
+        | ColumnType::Enum(_) => {
+            // 呼び出し元（3 経路の `match (column.ty, literal)`）は Date/Timestamp
+            // の腕でのみこの関数を呼ぶ契約のため到達しない（fail-closed の保険腕）。
+            Err(SqlSurfaceError::invalid_input(format!(
+                "column {column_name:?} is not a DATE/TIMESTAMP column"
+            )))
+        }
+    }
+}
+
 /// `{v1,v2,...}` 形式の配列リテラルを解析する（TABLE-14・TASK-198、Issue #888・
 /// D-A5）。字句解析器（`Token`）は変更せず、`VECTOR` と同じく文字列リテラル
 /// `'{...}'` を束縛時に解釈する専用パーサー。
@@ -542,6 +596,8 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             ColumnType::Vector(dim) => Some((idx, *dim)),
             ColumnType::Text
             | ColumnType::Boolean
+            | ColumnType::Date
+            | ColumnType::Timestamp
             | ColumnType::Array(_)
             | ColumnType::Bytea
             | ColumnType::Json
@@ -585,6 +641,8 @@ pub(crate) fn text_column_index(
                 ColumnType::Text => Ok(idx),
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
+                | ColumnType::Date
+                | ColumnType::Timestamp
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
@@ -1353,6 +1411,22 @@ fn bind_insert_row(
                     "column {name:?} expects a boolean literal (true/false)"
                 )))
             }
+            (ColumnType::Date, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Date, s)?
+            }
+            (ColumnType::Date, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a DATE literal (YYYY-MM-DD)"
+                )))
+            }
+            (ColumnType::Timestamp, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Timestamp, s)?
+            }
+            (ColumnType::Timestamp, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
+                )))
+            }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
             }
@@ -1473,6 +1547,8 @@ fn bind_json_literal(
         ColumnType::Text
         | ColumnType::Vector(_)
         | ColumnType::Boolean
+        | ColumnType::Date
+        | ColumnType::Timestamp
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_)
@@ -1653,6 +1729,22 @@ fn bind_set_assignments(
             (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a boolean literal (true/false)"
+                )))
+            }
+            (ColumnType::Date, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Date, s)?
+            }
+            (ColumnType::Date, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a DATE literal (YYYY-MM-DD)"
+                )))
+            }
+            (ColumnType::Timestamp, InsertLiteral::String(s)) => {
+                bind_datetime_literal(name, ColumnType::Timestamp, s)?
+            }
+            (ColumnType::Timestamp, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
@@ -2228,6 +2320,22 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a boolean literal (true/false)"
                         )))
                     }
+                    (ColumnType::Date, InsertLiteral::String(s)) => {
+                        bind_datetime_literal(name, ColumnType::Date, s)?
+                    }
+                    (ColumnType::Date, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a DATE literal (YYYY-MM-DD)"
+                        )))
+                    }
+                    (ColumnType::Timestamp, InsertLiteral::String(s)) => {
+                        bind_datetime_literal(name, ColumnType::Timestamp, s)?
+                    }
+                    (ColumnType::Timestamp, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
+                        )))
+                    }
                     (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
                     }
@@ -2381,6 +2489,13 @@ fn bind_file_insert(
                     "column {name:?}: BOOLEAN column is not supported for file-form INSERT"
                 )))
             }
+            // DATE／TIMESTAMP 列も同じ理由で対象外（TABLE-13・TASK-197、
+            // Issue #884）。
+            (ColumnType::Date | ColumnType::Timestamp, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: DATE/TIMESTAMP column is not supported for file-form INSERT"
+                )))
+            }
             // 配列列（TABLE-14・Issue #888）も BOOLEAN と同じく対象外として拒否する。
             (ColumnType::Array(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -2496,6 +2611,11 @@ pub(crate) enum AggregateInput {
     /// `MAX` は `TextColumn` と同じパターンで [`resolve_aggregate_input`] が
     /// 型不整合として拒否する。
     BooleanColumn(usize),
+    /// `DATE`／`TIMESTAMP` 列の裸の列参照（`schema.columns` の添字）。`COUNT`
+    /// （非 NULL 行数）でのみ使う（TABLE-13・TASK-197、Issue #884）。`SUM`/`AVG`/
+    /// `MIN`/`MAX` は `BooleanColumn` と同じパターンで [`resolve_aggregate_input`]
+    /// が型不整合として拒否する（`MIN`/`MAX` 対応は Issue #892 へ申し送り）。
+    DatetimeColumn(usize),
     /// `ARRAY` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL 行数）
     /// でのみ使う（TABLE-14・TASK-198、Issue #888・D-A8）。`SUM`/`AVG`/`MIN`/
     /// `MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
@@ -2944,6 +3064,14 @@ fn resolve_aggregate_input(
                     (ColumnType::Boolean, _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is BOOLEAN and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
+                    (ColumnType::Date | ColumnType::Timestamp, AggregateFunc::Count) => {
+                        Ok(AggregateInput::DatetimeColumn(index))
+                    }
+                    (ColumnType::Date | ColumnType::Timestamp, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is DATE/TIMESTAMP and cannot be used with SUM/AVG/MIN/MAX"
+                        )))
+                    }
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
                     }

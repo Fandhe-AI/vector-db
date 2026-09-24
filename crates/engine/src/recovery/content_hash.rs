@@ -233,8 +233,19 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(7);
             b.push_u8(u8::from(*b_val));
         }
-        // タグ 8・9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約し、配列列
-        // （TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
+        // DATE は宣言順で 8、TIMESTAMP は 9 とする（Issue #884・D-3。TABLE-13 の
+        // 宣言順規則を踏襲し、他の型タグと衝突しない新規タグ）。負値も含め
+        // ビット列をそのまま連結するため、`i32`/`i64` を符号保存のまま `u64` へ
+        // 変換して既存の `push_u64` を再利用する。
+        Value::Date(days) => {
+            b.push_u8(8);
+            b.push_u64(i64::from(*days) as u64);
+        }
+        Value::Timestamp(micros) => {
+            b.push_u8(9);
+            b.push_u64(*micros as u64);
+        }
+        // 配列列（TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
         // 積むことで、`{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが
         // 衝突しない単射なハッシュ入力にする。
         Value::Array(array_value) => {

@@ -1730,6 +1730,42 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (crate::catalog::ColumnType::Date, crate::row_codec::Value::Date(_)) => {
+                // DATE 値は行コーデック上 4 バイト固定
+                // （`row_codec::SCALAR_DATE_ENTRY_LEN`）のため、TEXT のような
+                // 長さ検証は不要（TABLE-13・TASK-197、Issue #884・D-3）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_DATE_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::Timestamp, crate::row_codec::Value::Timestamp(_)) => {
+                // TIMESTAMP 値は行コーデック上 8 バイト固定
+                // （`row_codec::SCALAR_TIMESTAMP_ENTRY_LEN`）のため、同上の理由で
+                // 長さ検証は不要（Issue #884・D-3）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_TIMESTAMP_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             (crate::catalog::ColumnType::Array(array_ty), crate::row_codec::Value::Array(av)) => {
                 // 配列 SET 値のフレーム長検証（対象行の探索より前に行う。
                 // Issue #888・D-A3。`row_codec::scalar_array_entry_len` を
@@ -1876,6 +1912,8 @@ fn validate_set_assignments(
             (
                 crate::catalog::ColumnType::Text
                 | crate::catalog::ColumnType::Boolean
+                | crate::catalog::ColumnType::Date
+                | crate::catalog::ColumnType::Timestamp
                 | crate::catalog::ColumnType::Array(_)
                 | crate::catalog::ColumnType::Bytea
                 | crate::catalog::ColumnType::Json
@@ -1887,6 +1925,8 @@ fn validate_set_assignments(
             (crate::catalog::ColumnType::Vector(_), _)
             | (crate::catalog::ColumnType::Text, _)
             | (crate::catalog::ColumnType::Boolean, _)
+            | (crate::catalog::ColumnType::Date, _)
+            | (crate::catalog::ColumnType::Timestamp, _)
             | (crate::catalog::ColumnType::Array(_), _)
             | (crate::catalog::ColumnType::Bytea, _)
             | (crate::catalog::ColumnType::Json, _)

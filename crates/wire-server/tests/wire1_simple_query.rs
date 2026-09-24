@@ -481,6 +481,80 @@ fn wire1_numeric_column_is_canonical_text_encoded_and_overflow_is_22003() {
     drop(guard);
 }
 
+/// `DATE`／`TIMESTAMP` 列（TABLE-13・TASK-197、Issue #884）が簡易クエリ経由で
+/// ISO テキスト表現（`engine::datetime::format_date`／`format_timestamp`）で
+/// 往復することを固定する（`wire1_boolean_column_is_t_f_null_text_encoded` と
+/// 同じ流儀）。
+#[test]
+fn wire1_datetime_columns_are_iso_text_encoded() {
+    let path = temp_db::unique_db_path("wire1-datetime");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "events",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("day", ColumnType::Date, true),
+                ColumnDef::new("at", ColumnType::Timestamp, true),
+            ],
+        ))
+        .expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    for (id, vec_val, day, at) in [
+        (1u64, [1.0, 0.0], Value::Date(0), Value::Timestamp(0)),
+        (2, [0.0, 1.0], Value::Null, Value::Null),
+    ] {
+        let op_id =
+            engine::recovery::required_op_id::OperationId::parse(&format!("test-op-datetime-{id}"))
+                .expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "events",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(vec_val.to_vec()), day, at],
+            &op_id,
+        )
+        .expect("insert row");
+    }
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut stream,
+        "SELECT id, day, at FROM events WHERE id = 1 LIMIT 10",
+    );
+    let _columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("1"));
+    assert_eq!(row[1].as_deref(), Some("1970-01-01"));
+    assert_eq!(row[2].as_deref(), Some("1970-01-01 00:00:00"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT id, day, at FROM events WHERE id = 2 LIMIT 10",
+    );
+    let _columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("2"));
+    assert_eq!(row[1].as_deref(), None);
+    assert_eq!(row[2].as_deref(), None);
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    drop(guard);
+}
+
 /// 3 テナント（alice/bob/carol）が wire 経由で同一 C1 を実行したとき、
 /// 各テナントは自分自身の `Private` 行のみ可視で他テナントの `Private` 行は
 /// 見えず（`auth::verify` が導出する `PolicyContext` は `Public` ＋ 自テナント
