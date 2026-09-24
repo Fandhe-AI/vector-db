@@ -3661,6 +3661,10 @@ impl EngineCore {
                     }
                     // BOOLEAN 値は行コーデック上 1 バイト固定（Issue #883・D-a）。
                     crate::row_codec::Value::Bool(_) => 1,
+                    // DATE／TIMESTAMP 値は行コーデック上それぞれ 4／8 バイト固定
+                    // （Issue #884・D-3）。
+                    crate::row_codec::Value::Date(_) => 4,
+                    crate::row_codec::Value::Timestamp(_) => 8,
                 };
                 row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
                     crate::sql::allowlist::SqlSurfaceError::payload_too_large(

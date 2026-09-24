@@ -159,7 +159,10 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                 if let Some(column) = schema.columns.get(*index) {
                     match column.ty {
                         ColumnType::Vector(_) => needs_embedding = true,
-                        ColumnType::Text | ColumnType::Boolean => {
+                        ColumnType::Text
+                        | ColumnType::Boolean
+                        | ColumnType::Date
+                        | ColumnType::Timestamp => {
                             has_scalar_reference = true;
                             if let Some(slot) = scalar_mask.get_mut(*index) {
                                 *slot = true;
@@ -460,6 +463,28 @@ pub fn execute_scan(
                                     None => return Err(scan_bug(
                                         "BOOLEAN column scan yielded a non-Boolean scalar value",
                                     )),
+                                },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Date => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_date() {
+                                    Some(d) => cells.push(Cell::Date(d)),
+                                    None => {
+                                        return Err(scan_bug(
+                                            "DATE column scan yielded a non-Date scalar value",
+                                        ))
+                                    }
+                                },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Timestamp => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_timestamp() {
+                                    Some(t) => cells.push(Cell::Timestamp(t)),
+                                    None => {
+                                        return Err(scan_bug(
+                                            "TIMESTAMP column scan yielded a non-Timestamp scalar value",
+                                        ))
+                                    }
                                 },
                                 Some(None) | None => cells.push(Cell::Null),
                             },

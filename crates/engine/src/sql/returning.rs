@@ -160,6 +160,8 @@ pub(crate) fn project_row(
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
                 Some(Value::Bool(b)) => Cell::Bool(*b),
+                Some(Value::Date(d)) => Cell::Date(*d),
+                Some(Value::Timestamp(t)) => Cell::Timestamp(*t),
                 None => return Err(returning_bug("value index out of range")),
             },
             ProjectedColumn::Computed { .. } => {

@@ -166,8 +166,16 @@ pub enum Cell {
     Vector(Vec<f32>),
     /// 式項目（TASK-79・SQL-9）の `Scalar` 型評価結果。
     Float(f64),
-    /// 式項目（TASK-79・SQL-9）の `Bool` 型評価結果。
+    /// 式項目（TASK-79・SQL-9）の `Bool` 型評価結果。BOOLEAN 列（TABLE-13・
+    /// TASK-196、Issue #883）の投影結果もこの variant を共有する。
     Bool(bool),
+    /// `DATE` 列の投影結果（TABLE-13・TASK-197、Issue #884）。1970-01-01 起点の
+    /// 日数。テキスト整形は [`crate::datetime::format_date`] に委譲する。
+    Date(i32),
+    /// `TIMESTAMP` 列の投影結果（TABLE-13・TASK-197、Issue #884）。1970-01-01
+    /// 00:00:00 起点のマイクロ秒（タイムゾーンなし）。テキスト整形は
+    /// [`crate::datetime::format_timestamp`] に委譲する。
+    Timestamp(i64),
 }
 
 /// 投影結果の列メタデータ。`Id` は疑似列（`ColumnType` を持たない）。
@@ -833,6 +841,12 @@ pub(crate) fn execute_statement_with_cache(
                     }
                     Some(row_codec::ScalarRef::Bool(b)) => {
                         kept.push(Value::Bool(b));
+                    }
+                    Some(row_codec::ScalarRef::Date(d)) => {
+                        kept.push(Value::Date(d));
+                    }
+                    Some(row_codec::ScalarRef::Timestamp(t)) => {
+                        kept.push(Value::Timestamp(t));
                     }
                 }
             }
@@ -1811,6 +1825,8 @@ pub(crate) fn execute_statement_with_cache(
                 .map(|v| match v {
                     Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
                     Value::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
+                    Value::Date(d) => Some(row_codec::ScalarRef::Date(*d)),
+                    Value::Timestamp(t) => Some(row_codec::ScalarRef::Timestamp(*t)),
                     Value::Null | Value::Vector(_) => None,
                 })
                 .collect();
@@ -2143,6 +2159,8 @@ fn decode_deferred_scalars(
                 out.push(Value::Text(owned));
             }
             Some(row_codec::ScalarRef::Bool(b)) => out.push(Value::Bool(b)),
+            Some(row_codec::ScalarRef::Date(d)) => out.push(Value::Date(d)),
+            Some(row_codec::ScalarRef::Timestamp(t)) => out.push(Value::Timestamp(t)),
         }
     }
     Ok(out)
@@ -2367,7 +2385,10 @@ fn project_rows(
                         ColumnType::Text => match decoded.get(*index) {
                             Some(Value::Text(t)) => cells.push(Cell::Text(try_clone_text(t)?)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_)) | Some(Value::Bool(_)) => {
+                            Some(Value::Vector(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2376,7 +2397,34 @@ fn project_rows(
                         ColumnType::Boolean => match decoded.get(*index) {
                             Some(Value::Bool(b)) => cells.push(Cell::Bool(*b)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_)) | Some(Value::Text(_)) => {
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Date => match decoded.get(*index) {
+                            Some(Value::Date(d)) => cells.push(Cell::Date(*d)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Timestamp(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Timestamp => match decoded.get(*index) {
+                            Some(Value::Timestamp(t)) => cells.push(Cell::Timestamp(*t)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Vector(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Date(_)) => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })

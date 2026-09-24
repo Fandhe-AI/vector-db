@@ -164,6 +164,11 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         }
         Cell::Float(f) => Ok(Some(f.to_string())),
         Cell::Bool(b) => Ok(Some(if *b { "t".to_string() } else { "f".to_string() })),
+        // ISO テキストへ整形する（`engine::datetime` が単一情報源。TABLE-13・
+        // TASK-197、Issue #884。RowDescription の OID は #895 まで既存どおり
+        // `25`（TEXT 相当）のまま不変）。
+        Cell::Date(days) => Ok(Some(engine::datetime::format_date(*days))),
+        Cell::Timestamp(micros) => Ok(Some(engine::datetime::format_timestamp(*micros))),
     }
 }
 

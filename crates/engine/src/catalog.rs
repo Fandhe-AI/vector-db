@@ -223,6 +223,13 @@ pub enum ColumnType {
     /// 真偽値列（TABLE-13・TASK-196、Issue #883）。NULL と false は行バイト列・
     /// 投影・述語評価のいずれでも区別する（[`crate::row_codec::Value::Bool`] 参照）。
     Boolean,
+    /// 日付列（TABLE-13・TASK-197、Issue #884）。内部表現は 1970-01-01 起点の
+    /// 日数（`i32`）。値の解析・整形は [`crate::datetime`] へ委譲する。
+    Date,
+    /// 日時列（TABLE-13・TASK-197、Issue #884）。タイムゾーンを持たない
+    /// （naive）値で、内部表現は 1970-01-01 00:00:00 起点のマイクロ秒（`i64`）。
+    /// 値の解析・整形は [`crate::datetime`] へ委譲する。
+    Timestamp,
 }
 
 impl ColumnType {
@@ -240,6 +247,8 @@ impl ColumnType {
             ColumnType::Text => ("text", "-".to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
             ColumnType::Boolean => ("boolean", "-".to_string()),
+            ColumnType::Date => ("date", "-".to_string()),
+            ColumnType::Timestamp => ("timestamp", "-".to_string()),
         }
     }
 
@@ -271,6 +280,22 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::Boolean)
+            }
+            "date" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "date column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Date)
+            }
+            "timestamp" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "timestamp column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Timestamp)
             }
             other => Err(CatalogError::Invalid(format!(
                 "unknown column type: {other:?}"
@@ -320,7 +345,9 @@ impl TableSchema {
     pub fn vector_dim(&self) -> Option<u32> {
         self.columns.iter().find_map(|c| match c.ty {
             ColumnType::Vector(dim) => Some(dim),
-            ColumnType::Text | ColumnType::Boolean => None,
+            ColumnType::Text | ColumnType::Boolean | ColumnType::Date | ColumnType::Timestamp => {
+                None
+            }
         })
     }
 

@@ -41,6 +41,9 @@
 //!   ではないため）。engine は評価時に非有限を `22000` で拒否する契約だが、
 //!   本モジュールは多層防御として同じ制約を持つ
 //! - `Cell::Bool(bool)` → `true`／`false`（native JSON 真偽値）
+//! - `Cell::Date(i32)`／`Cell::Timestamp(i64)` → JSON string（ISO テキスト。
+//!   `engine::datetime::format_date`／`format_timestamp` へ委譲。TABLE-13・
+//!   TASK-197、Issue #884）
 //! - `Cell::Text(String)` → JSON string。[`crate::http::error_body::
 //!   escape_json_string_into`] を列名と共通で再利用する
 //! - `Cell::Vector(Vec<f32>)` → JSON array of number（要素は `f32::to_string()`。
@@ -96,6 +99,18 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
         Cell::Float(f) => write_finite_f64(out, *f),
         Cell::Bool(b) => {
             out.push_str(if *b { "true" } else { "false" });
+            Ok(())
+        }
+        Cell::Date(days) => {
+            out.push('"');
+            escape_json_string_into(out, &engine::datetime::format_date(*days));
+            out.push('"');
+            Ok(())
+        }
+        Cell::Timestamp(micros) => {
+            out.push('"');
+            escape_json_string_into(out, &engine::datetime::format_timestamp(*micros));
+            out.push('"');
             Ok(())
         }
         Cell::Text(s) => {

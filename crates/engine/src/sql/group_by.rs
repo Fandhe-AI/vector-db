@@ -706,7 +706,12 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT 型の集計結果を
         // HAVING の対象として拒否済みのため到達しない。fail-closed に「不一致」
         // として扱う。
-        Cell::Null | Cell::Text(_) | Cell::Vector(_) | Cell::Bool(_) => false,
+        Cell::Null
+        | Cell::Text(_)
+        | Cell::Vector(_)
+        | Cell::Bool(_)
+        | Cell::Date(_)
+        | Cell::Timestamp(_) => false,
     }
 }
 

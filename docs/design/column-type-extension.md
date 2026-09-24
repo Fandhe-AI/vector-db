@@ -164,3 +164,9 @@ TABLE-13・TASK-196（Issue #883）で `ColumnType::Boolean` を追加した。�
   束縛の完全対応（#896）、`22P02` の新設、`NOT`/`IS [NOT] NULL`/`IS TRUE`/
   `<>`/式中の bool 列参照、SQL `CREATE TABLE` 構文での `BOOLEAN` 宣言
   （SQL-23 は未実装）、BOOLEAN 列のスカラー二次索引化。
+
+## #884 追記: DATE／TIMESTAMP
+
+`DATE`／`TIMESTAMP` 列型（TABLE-13・TASK-197）の設計判断・内部表現・リテラル
+文法・移行方針は `docs/design/datetime-column.md` を参照（本ファイルへの
+転記はしない）。

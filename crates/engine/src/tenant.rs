@@ -1702,6 +1702,42 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (crate::catalog::ColumnType::Date, crate::row_codec::Value::Date(_)) => {
+                // DATE 値は行コーデック上 4 バイト固定
+                // （`row_codec::SCALAR_DATE_ENTRY_LEN`）のため、TEXT のような
+                // 長さ検証は不要（TABLE-13・TASK-197、Issue #884・D-3）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_DATE_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::Timestamp, crate::row_codec::Value::Timestamp(_)) => {
+                // TIMESTAMP 値は行コーデック上 8 バイト固定
+                // （`row_codec::SCALAR_TIMESTAMP_ENTRY_LEN`）のため、同上の理由で
+                // 長さ検証は不要（Issue #884・D-3）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_TIMESTAMP_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             _ => {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                     "SET column type does not match the current table schema".to_string(),

@@ -711,6 +711,12 @@ fn bind_expr_in(
                     ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BOOLEAN columns are not supported)"
                     ))),
+                    ColumnType::Date => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (DATE columns are not supported)"
+                    ))),
+                    ColumnType::Timestamp => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (TIMESTAMP columns are not supported)"
+                    ))),
                 };
             }
             if name == "id" {

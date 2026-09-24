@@ -545,8 +545,13 @@ impl ScalarIndex {
                 // `VECTOR` 列・`BOOLEAN` 列はいずれも索引対象外（BOOLEAN は
                 // Issue #883・D-e。値域が 2 値のため索引化コストに見合わず、
                 // 対応述語 `BoolEquals` は常に plain scan——`scalar_plan.rs`
-                // 参照——のまま据え置く）。
-                ColumnType::Vector(_) | ColumnType::Boolean => per_column.push(None),
+                // 参照——のまま据え置く）。`DATE`／`TIMESTAMP` 列も同じ理由で
+                // 索引対象外（TABLE-13・TASK-197、Issue #884。等価・範囲述語
+                // 自体が未実装〔Issue #891〕のため索引化する対応述語がまだ無い）。
+                ColumnType::Vector(_)
+                | ColumnType::Boolean
+                | ColumnType::Date
+                | ColumnType::Timestamp => per_column.push(None),
             }
         }
 

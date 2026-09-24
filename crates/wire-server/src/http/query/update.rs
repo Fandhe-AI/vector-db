@@ -255,6 +255,21 @@ fn map_set_assignments(
                     "SET BOOLEAN column value must be a JSON boolean",
                 ))
             }
+            // DATE／TIMESTAMP 列は JSON 文字列（ISO テキスト）のみ受理する
+            // （TABLE-13・TASK-197、Issue #884。パース自体は `engine::sql::
+            // parser::bind_update` が `bind_datetime_literal` へ委譲する）。
+            (ColumnType::Date, JsonValue::String(s))
+            | (ColumnType::Timestamp, JsonValue::String(s)) => InsertLiteral::String(s.clone()),
+            (ColumnType::Date, _) => {
+                return Err(UpdateError::Set(
+                    "SET DATE column value must be a JSON string",
+                ))
+            }
+            (ColumnType::Timestamp, _) => {
+                return Err(UpdateError::Set(
+                    "SET TIMESTAMP column value must be a JSON string",
+                ))
+            }
         };
         assignments.push((key.clone(), literal));
     }

@@ -226,6 +226,7 @@ pub mod buffer_pool;
 pub mod catalog;
 pub mod chunking;
 pub mod core;
+pub mod datetime;
 pub mod declarative_filter;
 pub mod dictionary;
 pub mod dispatch;
