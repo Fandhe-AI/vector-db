@@ -629,13 +629,16 @@ impl Opener {
             },
             Epoch::Handshake(cipher) => open_protected(cipher, record),
             Epoch::Application(cipher) => {
-                let inner = open_protected(cipher, record)?;
+                let mut inner = open_protected(cipher, record)?;
                 // KeyUpdate・post-handshake の Handshake メッセージは
                 // application epoch で受理しない（`tls::handshake` が
                 // type 24 を閉じた語彙の外として拒否済みであることと
                 // あわせ、KeyUpdate を受信したら接続を終了する契約を
-                // ここで確実に満たす）。
+                // ここで確実に満たす）。復号済みの平文はこの拒否経路でも
+                // 他のエラー経路と同様に zeroize してから破棄する
+                // （鍵素材ではないが、モジュールの衛生方針との一貫性のため）。
                 if inner.content_type == ContentType::Handshake {
+                    zeroize(&mut inner.content);
                     return Err(ProtectionError::ForbiddenInnerType(
                         ContentType::Handshake.as_u8(),
                     ));
@@ -1159,6 +1162,101 @@ mod tests {
         // 先に弾かれるため、advance 単体の checked_add 保護も直接確認する。
         assert!(cipher.seq >= MAX_RECORDS_PER_KEY);
         assert_eq!(cipher.advance(), Err(ProtectionError::SequenceExhausted));
+    }
+
+    // ---- 受信側 InnerOverflow（Issue #959 レビュー指摘 1） ----
+
+    /// `Sealer` は送信前に `MAX_INNER_PLAINTEXT_LEN` 超過を弾くため、この
+    /// 受信側分岐（`decode_inner_plaintext` の長さ検査）を経由できない。
+    /// ここでは `Aes128Gcm::seal` を直接使い、`Sealer` を経由せず
+    /// `MAX_INNER_PLAINTEXT_LEN` を 1 バイト超える平文を暗号化した
+    /// レコードを組み立てて `Opener::open` に渡し、AEAD 認証には成功する
+    /// が `record_overflow`（[`ProtectionError::InnerOverflow`]）で拒否
+    /// されることを固定する。
+    #[test]
+    fn open_rejects_inner_plaintext_longer_than_limit_after_successful_aead_auth() {
+        let keys = dummy_keys(47, 48);
+        let cipher = Aes128Gcm::new(keys.key());
+
+        let plaintext = vec![7u8; MAX_INNER_PLAINTEXT_LEN + 1];
+        let ciphertext_and_tag_len = plaintext.len() + TAG_LEN;
+        assert!(ciphertext_and_tag_len <= record::MAX_CIPHERTEXT_LEN);
+        let aad = seal_aad(ciphertext_and_tag_len).expect("aad within u16 range");
+        let sealed = cipher
+            .seal(keys.iv(), &aad, &plaintext)
+            .expect("seal oversized inner plaintext directly");
+
+        let record = Record {
+            content_type: ContentType::ApplicationData,
+            legacy_version: record::LEGACY_RECORD_VERSION,
+            fragment: sealed,
+        };
+
+        let mut opener = Opener::new();
+        opener.install_handshake_keys(&keys).expect("install");
+        assert_eq!(opener.open(&record), Err(ProtectionError::InnerOverflow));
+    }
+
+    // ---- Plaintext epoch の Sealer/Opener（Issue #959 レビュー指摘 2） ----
+
+    #[test]
+    fn plaintext_epoch_seal_then_open_roundtrips_handshake_and_alert() {
+        for ct in [ContentType::Handshake, ContentType::Alert] {
+            let mut sealer = Sealer::new();
+            let mut opener = Opener::new();
+            let record = sealer.seal(ct, b"clienthello-ish", 0).expect("seal");
+            assert_eq!(record.content_type, ct);
+            let inner = opener.open(&record).expect("open");
+            assert_eq!(inner.content_type, ct);
+            assert_eq!(inner.content, b"clienthello-ish");
+        }
+    }
+
+    #[test]
+    fn plaintext_epoch_seal_rejects_application_data_and_change_cipher_spec() {
+        let mut sealer = Sealer::new();
+        assert_eq!(
+            sealer.seal(ContentType::ApplicationData, b"x", 0),
+            Err(ProtectionError::SendContractViolation)
+        );
+        assert_eq!(
+            sealer.seal(ContentType::ChangeCipherSpec, b"x", 0),
+            Err(ProtectionError::SendContractViolation)
+        );
+    }
+
+    #[test]
+    fn plaintext_epoch_seal_rejects_nonzero_padding() {
+        let mut sealer = Sealer::new();
+        assert_eq!(
+            sealer.seal(ContentType::Handshake, b"x", 1),
+            Err(ProtectionError::SendContractViolation)
+        );
+    }
+
+    #[test]
+    fn plaintext_epoch_seal_rejects_empty_content() {
+        let mut sealer = Sealer::new();
+        assert_eq!(
+            sealer.seal(ContentType::Handshake, b"", 0),
+            Err(ProtectionError::EmptyContent)
+        );
+    }
+
+    #[test]
+    fn plaintext_epoch_open_rejects_application_data_and_change_cipher_spec() {
+        let mut opener = Opener::new();
+        for ct in [ContentType::ApplicationData, ContentType::ChangeCipherSpec] {
+            let record = Record {
+                content_type: ct,
+                legacy_version: record::LEGACY_RECORD_VERSION,
+                fragment: vec![1u8],
+            };
+            assert_eq!(
+                opener.open(&record),
+                Err(ProtectionError::UnexpectedOuterType)
+            );
+        }
     }
 
     // ---- Debug 秘匿 ----
