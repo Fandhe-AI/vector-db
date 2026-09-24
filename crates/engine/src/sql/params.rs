@@ -57,6 +57,27 @@ fn ident_eq_ignore_case(token: Option<&Token>, word: &str) -> bool {
     matches!(token, Some(Token::Ident(name)) if name.eq_ignore_ascii_case(word))
 }
 
+/// `token` が比較演算子（`=`／`>`／`<`／`<=`／`>=`／`<=>`）かどうか。
+///
+/// `GROUP`/`HAVING`/`RETURNING`/`USING`/`ON`/`USING`（`VALUES` 節側の `ON`）は
+/// `sql::lexer::keyword_from_str` が意図的にキーワード化していない語であり
+/// （`catalog::validate_identifier` がこれらを正当な列名として許可しているため）、
+/// `WHERE col = $n` の `col` にこれらの語がそのまま使われた場合、直後の演算子を
+/// 見ずに文字列一致だけで句境界と誤判定すると `WHERE using = $1` のような
+/// 正当なクエリを構造的に拒否してしまう（PR #1012 Bugbot 指摘）。実際の
+/// `GROUP BY`／`HAVING <cond>`／`RETURNING <cols>`／`USING OPERATION_ID|PLAN`／
+/// `ON CONFLICT` はいずれも比較演算子を直後に伴わないため、直後が比較演算子の
+/// ときに限り「列名としての出現」とみなして境界判定から除外する。
+fn is_comparison_operator(token: Option<&Token>) -> bool {
+    matches!(
+        token,
+        Some(Token::Punct('=') | Token::Punct('>') | Token::Punct('<'))
+            | Some(Token::Le)
+            | Some(Token::Ge)
+            | Some(Token::DistanceOp)
+    )
+}
+
 /// `tokens` 中の `Token::Param` がすべて許可位置に収まっていることを検証し、
 /// 文が要求するパラメータ数（最大の `$n` 番号。1 始まり。`$n` が 1 つも
 /// 無ければ 0）を返す。
@@ -87,7 +108,9 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
                 Token::Ident(name)
                     if VALUES_CLAUSE_BOUNDARY_IDENTS
                         .iter()
-                        .any(|b| name.eq_ignore_ascii_case(b)) =>
+                        .any(|b| name.eq_ignore_ascii_case(b))
+                        // 列名としての出現（直後が比較演算子）は境界とみなさない。
+                        && !is_comparison_operator(tokens.get(idx + 1)) =>
                 {
                     Some(idx)
                 }
@@ -114,7 +137,10 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
                 Token::Ident(name)
                     if WHERE_CLAUSE_BOUNDARY_IDENTS
                         .iter()
-                        .any(|b| name.eq_ignore_ascii_case(b)) =>
+                        .any(|b| name.eq_ignore_ascii_case(b))
+                        // 列名としての出現（直後が比較演算子。例: `WHERE using = $1`）は
+                        // 境界とみなさない（PR #1012 Bugbot 指摘）。
+                        && !is_comparison_operator(tokens.get(idx + 1)) =>
                 {
                     Some(idx)
                 }
@@ -446,6 +472,34 @@ mod tests {
     #[test]
     fn rejects_non_equality_where_comparison_position() {
         assert!(positions("SELECT * FROM documents WHERE id > $1 LIMIT 5").is_err());
+    }
+
+    // PR #1012 Bugbot 指摘: `GROUP`/`HAVING`/`RETURNING`/`USING`/`ON` は
+    // キーワード化されておらず正当な列名としても使えるため、`WHERE <col> = $n`
+    // の `col` がこれらの語と一致する場合でも句境界と誤認せず等価条件として
+    // 受理しなければならない。
+    #[test]
+    fn accepts_where_equality_when_column_name_matches_boundary_word() {
+        for word in ["using", "group", "having", "returning", "on"] {
+            let sql = format!("SELECT * FROM documents WHERE {word} = $1 LIMIT 5");
+            assert_eq!(
+                positions(&sql).unwrap_or_else(|e| panic!("{word} should be accepted: {e:?}")),
+                1,
+                "column named `{word}` should not be treated as a clause boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_where_equality_when_column_name_matches_boundary_word_with_trailing_clause() {
+        // 境界語が列名として使われたあとに、本物の句境界（`ORDER BY`）が
+        // 続く場合でも WHERE 領域が正しく閉じられ、当該 `ORDER BY` の
+        // ベクトル距離パラメータは通常どおり受理されることを確認する。
+        assert_eq!(
+            positions("SELECT * FROM documents WHERE using = $1 ORDER BY embedding <=> $2 LIMIT 5")
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
