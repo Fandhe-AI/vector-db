@@ -68,6 +68,12 @@ fn ident_eq_ignore_case(token: Option<&Token>, word: &str) -> bool {
 /// `GROUP BY`／`HAVING <cond>`／`RETURNING <cols>`／`USING OPERATION_ID|PLAN`／
 /// `ON CONFLICT` はいずれも比較演算子を直後に伴わないため、直後が比較演算子の
 /// ときに限り「列名としての出現」とみなして境界判定から除外する。
+///
+/// この判定だけでは UDF 呼び出しの関数名として使われた場合（直後が `(`）を
+/// 見逃す（PR #1012 codex 指摘）。UDF 呼び出しの直後は比較演算子でも `(` を
+/// 伴わない列参照でもないため、`is_where_clause_boundary`／`values_region_end`
+/// 側で句ごとの具体的な字句形（[`is_where_clause_boundary`] 参照）を追加検査し、
+/// `(` が続く出現を関数呼び出しとして境界から除外する。
 fn is_comparison_operator(token: Option<&Token>) -> bool {
     matches!(
         token,
@@ -76,6 +82,57 @@ fn is_comparison_operator(token: Option<&Token>) -> bool {
             | Some(Token::Ge)
             | Some(Token::DistanceOp)
     )
+}
+
+/// `tokens[idx]`（[`WHERE_CLAUSE_BOUNDARY_IDENTS`] のいずれかに一致する
+/// `Ident`）が、実際に `sql::allowlist::Parser` の受理する句形を開始している
+/// かどうかを判定する（PR #1012 codex 指摘対応）。
+///
+/// `is_comparison_operator` による「直後が比較演算子でなければ境界」という
+/// 判定だけでは、これらの語を関数名とする UDF 呼び出し（`sql::udf_call`・
+/// `catalog::validate_identifier` がこれらを正当な UDF 名としても許可して
+/// いる）を区別できない。UDF 呼び出しは直後が `(` になり比較演算子ではない
+/// ため、例えば `WHERE using(body) = 'x' AND lang = $1` の `using` が
+/// `WHERE` 領域を誤って終端し、本来許可される `lang = $1` まで `42601` で
+/// 拒否されてしまう。
+///
+/// ここでは各句を実際に受理する `Parser` の構造（`parse_group_by_clause`・
+/// `parse_having`・`parse_returning_clause`・`parse_operation_id_clause`・
+/// `parse_on_conflict_clause` 各コメント参照）に対応する最小限の字句形のみを
+/// 「本物の句」として認め、それ以外（UDF 呼び出し・比較演算子を伴う列参照）は
+/// 境界とみなさない。安全側に倒す設計のため、この判定を追加しても許可されて
+/// いなかった位置の `$n` が新たに通ることはない（既存の `is_where_equality`
+/// 等の受理条件は無変更）。
+fn is_where_clause_boundary(tokens: &[Token], idx: usize) -> bool {
+    let next1 = tokens.get(idx + 1);
+    let next2 = tokens.get(idx + 2);
+    let Some(Token::Ident(name)) = tokens.get(idx) else {
+        return false;
+    };
+    match name.to_ascii_uppercase().as_str() {
+        // `GROUP BY <column>`（`Parser::parse_group_by_clause`）。UDF 呼び出し
+        // `group(...)` は直後が `(` になり `BY` に一致しない。
+        "GROUP" => ident_eq_ignore_case(next1, "BY"),
+        // `HAVING <ident> <cmp> ...`（`Parser::parse_having`）。UDF 呼び出し
+        // `having(...)` は直後が `(` になり `Ident` に一致しない。
+        "HAVING" => matches!(next1, Some(Token::Ident(_))) && is_comparison_operator(next2),
+        // `RETURNING <投影>`（`Parser::parse_returning_clause`。`*` または
+        // 列名の列挙のみを受理し関数呼び出し項目は拒否する）。UDF 呼び出し
+        // `returning(...)` は直後が `(` になり、列名としての比較
+        // `returning = $1` は直後が `=` になるため、いずれも一致しない。
+        "RETURNING" => matches!(next1, Some(Token::Ident(_) | Token::Punct('*'))),
+        // `USING OPERATION_ID $n` / `USING PLAN(...)`（`Parser` がこの 2 語の
+        // みを文脈的キーワードとして照合する）。UDF 呼び出し `using(...)` は
+        // 直後が `(` になり `OPERATION_ID`／`PLAN` に一致しない。
+        "USING" => {
+            ident_eq_ignore_case(next1, "OPERATION_ID") || ident_eq_ignore_case(next1, "PLAN")
+        }
+        // `ON CONFLICT ...`（INSERT 専用。`WHERE` を持つ文には現れないが、
+        // 定数配列を [`VALUES_CLAUSE_BOUNDARY_IDENTS`] と共有する構成に
+        // 合わせ安全側の判定を残す）。
+        "ON" => ident_eq_ignore_case(next1, "CONFLICT"),
+        _ => false,
+    }
 }
 
 /// `tokens` 中の `Token::Param` がすべて許可位置に収まっていることを検証し、
@@ -138,9 +195,14 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
                     if WHERE_CLAUSE_BOUNDARY_IDENTS
                         .iter()
                         .any(|b| name.eq_ignore_ascii_case(b))
-                        // 列名としての出現（直後が比較演算子。例: `WHERE using = $1`）は
-                        // 境界とみなさない（PR #1012 Bugbot 指摘）。
-                        && !is_comparison_operator(tokens.get(idx + 1)) =>
+                        // 列名としての出現（例: `WHERE using = $1`）・UDF 呼び出しの
+                        // 関数名としての出現（例: `WHERE using(body) = 'x'`）はいずれも
+                        // 境界とみなさない。実際に対応する句を開始している場合
+                        // （`GROUP BY`・`HAVING <ident> <cmp>`・`RETURNING <col|*>`・
+                        // `USING OPERATION_ID|PLAN`・`ON CONFLICT`）に限り境界とする
+                        // （PR #1012 Bugbot・codex 指摘。詳細は
+                        // [`is_where_clause_boundary`] 参照）。
+                        && is_where_clause_boundary(tokens, idx) =>
                 {
                     Some(idx)
                 }
@@ -583,6 +645,48 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    // PR #1012 codex 指摘の回帰: `GROUP`/`HAVING`/`RETURNING`/`USING`/`ON` を
+    // 関数名とする UDF 呼び出し（直後が `(`）は、比較演算子を直後に伴わない
+    // ため旧実装では無条件に句境界と誤認され、その後に続く本来許可される
+    // `$n`（`lang = $n`）まで `42601` で拒否されていた。UDF 呼び出しの直後に
+    // `WHERE` 等価条件の `$n` が続く場合、正しく受理されなければならない
+    // （安全側の判定は崩さない——境界語が UDF 呼び出し以外の形で現れる場合の
+    // 挙動は他のテストが固定するとおり無変更）。
+    #[test]
+    fn accepts_where_equality_after_udf_call_named_like_boundary_word() {
+        for word in ["using", "group", "having", "returning", "on"] {
+            let sql =
+                format!("SELECT * FROM documents WHERE {word}(body) = 'x' AND lang = $1 LIMIT 5");
+            assert_eq!(
+                positions(&sql).unwrap_or_else(|e| panic!(
+                    "UDF call named `{word}` should not close the WHERE region: {e:?}"
+                )),
+                1,
+                "UDF call named `{word}` must not be treated as a clause boundary"
+            );
+        }
+    }
+
+    // 同上の裏返し: 本物の句境界（`GROUP BY`・`USING OPERATION_ID`）はこの変更
+    // 後も引き続き `WHERE` 領域を正しく終端し、句境界より後ろに現れる
+    // `$n`（許可形状外の位置）は従来どおり `42601` のまま拒否されなければ
+    // ならない（fail-closed の維持）。
+    #[test]
+    fn rejects_dollar_param_placed_after_real_group_by_boundary() {
+        let sql = "SELECT COUNT(*) FROM documents WHERE lang = 'ja' GROUP BY lang HAVING $1 = 1";
+        let err = positions(sql).unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn accepts_real_using_operation_id_boundary_after_where_predicate() {
+        // 本物の `USING OPERATION_ID` 句（直後が `OPERATION_ID`）は、UDF 呼び出し
+        // （直後が `(`）と区別され、引き続き `WHERE` 領域を正しく終端したうえで
+        // パターン 3 として許可されることを固定する。
+        let sql = "UPDATE documents SET lang = 'en' WHERE id_tag = 'x' USING OPERATION_ID $1";
+        assert_eq!(positions(sql).unwrap(), 1);
     }
 
     #[test]
