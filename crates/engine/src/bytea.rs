@@ -72,18 +72,20 @@ fn hex_digit(c: u8) -> Option<u8> {
 pub fn parse_hex_text(s: &str) -> Result<Vec<u8>, ByteaTextError> {
     // 復号後の長さは高々 `(s.len() - 2) / 2` であり、`s.len()` の上限判定だけで
     // 確保前に MAX_BYTEA_FIELD_LEN 超過を検出できる（`2 * MAX + 2` 超なら
-    // 復号後も必ず MAX を超える）。
+    // 復号後も必ず MAX を超える）。`checked_*` がオーバーフローした場合も
+    // fail-closed に拒否する（黙って上限検査を素通りさせない）。
     let max_input_len = (MAX_BYTEA_FIELD_LEN as usize)
         .checked_mul(2)
-        .and_then(|v| v.checked_add(2));
-    if let Some(limit) = max_input_len {
-        if s.len() > limit {
-            return Err(ByteaTextError::TooLong);
-        }
+        .and_then(|v| v.checked_add(2))
+        .ok_or(ByteaTextError::TooLong)?;
+    if s.len() > max_input_len {
+        return Err(ByteaTextError::TooLong);
     }
 
+    // 添字アクセス（`[]`）を使わず `get()` とスライスパターンのみで判定する
+    // （受信データ経路。`.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。
     let bytes = s.as_bytes();
-    let prefix_ok = bytes.len() >= 2 && (bytes[0] == b'\\') && matches!(bytes[1], b'x' | b'X');
+    let prefix_ok = matches!(bytes.get(..2), Some([b'\\', b'x' | b'X']));
     if !prefix_ok {
         return Err(ByteaTextError::MissingPrefix);
     }
@@ -96,12 +98,12 @@ pub fn parse_hex_text(s: &str) -> Result<Vec<u8>, ByteaTextError> {
     let mut out = Vec::new();
     out.try_reserve_exact(out_len)
         .map_err(|_| ByteaTextError::TooLong)?;
-    let mut i = 0usize;
-    while i < hex_body.len() {
-        let hi = hex_digit(hex_body[i]).ok_or(ByteaTextError::InvalidDigit)?;
-        let lo = hex_digit(hex_body[i + 1]).ok_or(ByteaTextError::InvalidDigit)?;
+    // `as_chunks::<2>().0`（`row_codec.rs` の f32 デコードと同じ書き方）は
+    // 固定長配列パターンで境界を静的に保証し、添字アクセスを使わない。
+    for [hi_byte, lo_byte] in hex_body.as_chunks::<2>().0 {
+        let hi = hex_digit(*hi_byte).ok_or(ByteaTextError::InvalidDigit)?;
+        let lo = hex_digit(*lo_byte).ok_or(ByteaTextError::InvalidDigit)?;
         out.push((hi << 4) | lo);
-        i += 2;
     }
     Ok(out)
 }

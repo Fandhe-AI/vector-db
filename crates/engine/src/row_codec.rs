@@ -1774,4 +1774,101 @@ mod tests {
             Err(RowCodecError::Invalid(_))
         ));
     }
+
+    // --- BYTEA 列（Issue #886）の decode-side DoS ガード ------------------------
+
+    fn bytea_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("blob", ColumnType::Bytea, true)],
+        )
+    }
+
+    #[test]
+    fn decode_row_rejects_bytea_declared_length_over_limit_before_body_read() {
+        let schema = bytea_schema();
+        let mut buf = Vec::new();
+        buf.push(ROW_CODEC_FORMAT_VERSION);
+        buf.push(Visibility::Public.to_byte());
+        let tenant_bytes = b"tenant-a";
+        buf.push(tenant_bytes.len() as u8);
+        buf.extend_from_slice(tenant_bytes);
+        buf.push(PRESENCE_VALUE);
+        // 宣言長は上限超過（MAX + 1）。本体は短いままにする——長さ検査が
+        // 本体バッファの実サイズによらず先に効くことを固定する（B3）。
+        buf.extend_from_slice(&(crate::bytea::MAX_BYTEA_FIELD_LEN + 1).to_le_bytes());
+        buf.extend_from_slice(b"short");
+        let result = decode_row(&schema, &buf);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn decode_row_rejects_truncated_bytea_body() {
+        let schema = bytea_schema();
+        let mut buf = Vec::new();
+        buf.push(ROW_CODEC_FORMAT_VERSION);
+        buf.push(Visibility::Public.to_byte());
+        let tenant_bytes = b"tenant-a";
+        buf.push(tenant_bytes.len() as u8);
+        buf.extend_from_slice(tenant_bytes);
+        buf.push(PRESENCE_VALUE);
+        // 宣言長は 10 バイトだが本体は 3 バイトしかない。
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(b"abc");
+        let result = decode_row(&schema, &buf);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn encode_row_rejects_bytes_value_for_text_column() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        );
+        let values = vec![Value::Bytes(vec![0xde, 0xad])];
+        let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn encode_row_rejects_text_value_for_bytea_column() {
+        let schema = bytea_schema();
+        let values = vec![Value::Text("hello".to_string())];
+        let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn bytea_round_trips_through_encode_decode_row() {
+        let schema = bytea_schema();
+        let values = vec![Value::Bytes(vec![0x00, 0xff, 0xde, 0xad])];
+        let buf = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        let decoded = decode_row(&schema, &buf).expect("decode");
+        assert_eq!(decoded.values, values);
+    }
+
+    #[test]
+    fn bytea_null_and_empty_are_distinct_after_round_trip() {
+        let schema = bytea_schema();
+        let null_buf = encode_row(&schema, "tenant-a", Visibility::Public, &[Value::Null])
+            .expect("encode null");
+        let empty_buf = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Bytes(Vec::new())],
+        )
+        .expect("encode empty");
+        assert_ne!(null_buf, empty_buf);
+        assert_eq!(
+            decode_row(&schema, &null_buf).expect("decode null").values,
+            vec![Value::Null]
+        );
+        assert_eq!(
+            decode_row(&schema, &empty_buf)
+                .expect("decode empty")
+                .values,
+            vec![Value::Bytes(Vec::new())]
+        );
+    }
 }
