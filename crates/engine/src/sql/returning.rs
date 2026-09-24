@@ -176,7 +176,7 @@ pub(crate) fn column_meta(
                 let ty = schema
                     .columns
                     .get(*index)
-                    .map(|c| c.ty)
+                    .map(|c| c.ty.clone())
                     .ok_or_else(|| returning_bug("projected column index out of range"))?;
                 Ok(ColumnMeta::Scalar {
                     name: name.clone(),
@@ -223,6 +223,8 @@ pub(crate) fn project_row(
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
                 Some(Value::Bool(b)) => Cell::Bool(*b),
+                Some(Value::Date(d)) => Cell::Date(*d),
+                Some(Value::Timestamp(t)) => Cell::Timestamp(*t),
                 Some(Value::Array(array_value)) => Cell::Array(try_clone_array_for_budget(
                     array_value,
                     budget,
@@ -233,6 +235,20 @@ pub(crate) fn project_row(
                     budget,
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
+                Some(Value::Json(s)) => Cell::Json(try_alloc_text_for_budget(
+                    s,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
+                // ENUM 列は既存の `Cell::Text` へ写像する（Issue #890 D7。
+                // `sql::exec` の投影と同じ扱い）。
+                Some(Value::Enum(label)) => Cell::Text(try_alloc_text_for_budget(
+                    label,
+                    budget,
+                    MAX_RETURNING_RESULT_BYTES,
+                )?),
+                Some(Value::Numeric(d)) => Cell::Numeric(*d),
+                Some(Value::Uuid(u)) => Cell::Uuid(*u),
                 None => return Err(returning_bug("value index out of range")),
             },
             ProjectedColumn::Computed { .. } => {

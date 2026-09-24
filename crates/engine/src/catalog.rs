@@ -29,8 +29,9 @@
 //! Storage`（本ファイル下部）が SQL 表層の FROM テーブル存在確認を橋渡しする。
 
 use std::fmt;
+use std::sync::Arc;
 
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::row_codec::{self, Value as RowCodecValue};
 use crate::sql::allowlist::{SqlSurfaceError, TableLookup};
@@ -40,6 +41,12 @@ use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError, Visibil
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、
 /// カタログの読み書き（TABLE-4/TABLE-5）が行データに触れないようにする。
 const CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("catalog");
+
+/// ENUM 型定義（TABLE-14・TASK-198、Issue #890）を格納するテーブル。キーは
+/// 型名（`validate_identifier` で検証済み）、値は [`encode_enum_type_def`] で
+/// エンコードした語彙 blob。`CATALOG_TABLE`（列定義）とは独立したライフサイクルを
+/// 持つ名前空間で、列は型名の参照（[`ColumnType::Enum`]）のみを保持する。
+const ENUM_TYPES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("enum_types");
 
 /// カタログのテキスト形式フォーマットバージョン識別子。値の追加・変更は
 /// 破壊的変更として扱い、この値を更新する。旧バージョンの読み出しは
@@ -109,6 +116,50 @@ const MAX_CATALOG_VALUE_LEN: usize = 1024 * 1024;
 /// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
 const MAX_LIST_TABLES: usize = 10_000;
 
+/// ENUM 型（TABLE-14・TASK-198）1 個が持てるラベル数の上限。デコード・DDL
+/// いずれもアロケーション前にこの上限で拒否する。
+pub const MAX_ENUM_LABELS: usize = 256;
+
+/// ENUM ラベル 1 個の UTF-8 バイト長上限。
+pub const MAX_ENUM_LABEL_LEN: usize = 63;
+
+/// 登録可能な ENUM 型の総数上限（[`MAX_LIST_TABLES`] と同じ既定値）。
+const MAX_ENUM_TYPES: usize = 10_000;
+
+/// ENUM 型定義 blob（[`encode_enum_type_def`]）のバイト長上限。
+const MAX_ENUM_TYPE_VALUE_LEN: usize = 64 * 1024;
+
+/// 組み込み型名との衝突防止（Issue #890 D1）。将来 SQL-23 で `CREATE TABLE`
+/// の型名解決を実装した際に、ENUM 型名が組み込み型と曖昧になることを防ぐ。
+/// 大文字小文字を区別しない。
+const RESERVED_TYPE_NAMES: &[&str] = &[
+    "text",
+    "vector",
+    "boolean",
+    "bool",
+    "bytea",
+    "integer",
+    "int",
+    "bigint",
+    "real",
+    "double",
+    "numeric",
+    // `DECIMAL` は `NUMERIC` の別名（TABLE-13〔検討中〕・TASK-197、Issue #885。
+    // カタログの型タグは `numeric` の 1 つに固定するが、SQL-23 の型名解決での
+    // 曖昧さを避けるため別名も予約する）。
+    "decimal",
+    "date",
+    "timestamp",
+    "uuid",
+    "json",
+    "jsonb",
+    // Cursor Bugbot 指摘（PR #1015）: 将来 SQL-23 の `CREATE TABLE` 型名解決で
+    // `ENUM`／`ARRAY` は列型構文のキーワードとして扱われる想定であり、
+    // ユーザー定義 ENUM 型名との曖昧さを避けるため予約する。
+    "enum",
+    "array",
+];
+
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
 /// それ以外はすべて fail-closed な明示的な拒否理由を持つ。
 ///
@@ -154,6 +205,15 @@ pub enum CatalogError {
     /// 上限に達した。現実的には到達しないが、`checked_add` の網羅性のため扱う
     /// （`storage.rs::StorageError::GenerationCounterOverflow` と同じ方針）。
     TableGenerationCounterOverflow,
+    /// ENUM 型（TABLE-14・TASK-198）DDL が参照した型名がカタログに存在しない。
+    TypeNotFound(String),
+    /// ENUM 型の `CREATE TYPE` 相当 API で同名の型が既に存在する（上書きしない）。
+    TypeAlreadyExists(String),
+    /// `DROP TYPE` 相当 API で、依存列（当該型を使う `ColumnType::Enum` 列）が
+    /// 1 つ以上残っているため削除を拒否する（SQL-23 結線時は `2BP01` へ写像する
+    /// 想定だが、本 variant は Rust API 専用であり wire への送出経路を持たない
+    /// ため `ErrorClass` には追加しない）。
+    DependentObjectsStillExist(String),
 }
 
 impl fmt::Display for CatalogError {
@@ -174,6 +234,11 @@ impl fmt::Display for CatalogError {
             CatalogError::TableGenerationCounterOverflow => {
                 write!(f, "table generation counter overflow")
             }
+            CatalogError::TypeNotFound(name) => write!(f, "type not found: {name}"),
+            CatalogError::TypeAlreadyExists(name) => write!(f, "type already exists: {name}"),
+            CatalogError::DependentObjectsStillExist(name) => {
+                write!(f, "dependent objects still exist for type: {name}")
+            }
         }
     }
 }
@@ -189,7 +254,10 @@ impl std::error::Error for CatalogError {
             | CatalogError::ColumnAlreadyExists(_)
             | CatalogError::RowNotFound(_)
             | CatalogError::IncompatibleRowKeyFormat
-            | CatalogError::TableGenerationCounterOverflow => None,
+            | CatalogError::TableGenerationCounterOverflow
+            | CatalogError::TypeNotFound(_)
+            | CatalogError::TypeAlreadyExists(_)
+            | CatalogError::DependentObjectsStillExist(_) => None,
         }
     }
 }
@@ -213,7 +281,12 @@ pub type Result<T> = std::result::Result<T, CatalogError>;
 /// variant を追加する際は `#[non_exhaustive]`・ワイルドカード腕（`_ =>`）を
 /// 導入しない（Issue #880 D1）。コンパイラに全ディスパッチ地点を列挙させることで、
 /// 新型が既存分岐へ黙って流れる fail-open を構造的に防ぐ設計とする。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Copy` は付けない（Issue #890）: [`ColumnType::Enum`] が型定義（[`EnumTypeDef`]）
+/// を指す `Arc` を保持するため、`Vector(u32)` までは可能だった値コピーは表現できない。
+/// 呼び出し元は `column.ty.clone()` または `&column.ty` を使う（`!=`／`matches!` は
+/// 参照を暗黙に取るため無変更で動く）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnType {
     /// 可変長テキスト列。
     Text,
@@ -223,6 +296,13 @@ pub enum ColumnType {
     /// 真偽値列（TABLE-13・TASK-196、Issue #883）。NULL と false は行バイト列・
     /// 投影・述語評価のいずれでも区別する（[`crate::row_codec::Value::Bool`] 参照）。
     Boolean,
+    /// 日付列（TABLE-13・TASK-197、Issue #884）。内部表現は 1970-01-01 起点の
+    /// 日数（`i32`）。値の解析・整形は [`crate::datetime`] へ委譲する。
+    Date,
+    /// 日時列（TABLE-13・TASK-197、Issue #884）。タイムゾーンを持たない
+    /// （naive）値で、内部表現は 1970-01-01 00:00:00 起点のマイクロ秒（`i64`）。
+    /// 値の解析・整形は [`crate::datetime`] へ委譲する。
+    Timestamp,
     /// 可変長の同型スカラー配列列（`<スカラー型>[]`、TABLE-14・TASK-198、Issue #888）。
     /// 要素型・要素数上限は [`ArrayType`] が保持する。検索経路（KNN・hybrid・ANN・
     /// 二次索引・`EXPLAIN`）からは一貫して非対象として除外する（`VECTOR` 列との
@@ -231,6 +311,31 @@ pub enum ColumnType {
     /// 可変長バイナリ列（TABLE-13・TASK-197、Issue #886）。NULL と空バイト列は
     /// 行バイト列上も区別する（[`crate::row_codec::Value::Bytes`] 参照）。
     Bytea,
+    /// JSON テキスト列（TABLE-14・TASK-198、Issue #889）。格納時に共有パーサー
+    /// [`crate::json::parse_json`] で検証するが、入力テキスト（空白・キー順を含む）を
+    /// そのまま保持する（[`crate::row_codec::Value::Json`] 参照）。JSONB との違いは
+    /// 正規化の有無のみで、値表現は共有する。
+    Json,
+    /// JSONB 列（TABLE-14・TASK-198、Issue #889）。格納時に正規化再シリアライズ
+    /// した文字列を保持する（キー順は辞書順・空白なし。詳細は
+    /// `docs/design/column-type-extension.md`「#889 追記」節参照）。
+    Jsonb,
+    /// 名前付き ENUM 型を参照する列（TABLE-14・TASK-198、Issue #890）。
+    /// カタログには型名のみを保持し（[`ColumnType::catalog_fields`]）、
+    /// デコード時に [`ENUM_TYPES_TABLE`] から語彙を解決した [`EnumTypeDef`] を
+    /// `Arc` で持ち回る。値は行バイト列上 TEXT と同じフレーム（[`crate::row_codec::
+    /// Value::Enum`]）で格納し、語彙外の値は書き込み前に拒否する
+    /// （fail-closed。`ALTER TYPE ... ADD VALUE` による末尾追記のみ許可）。
+    Enum(Arc<EnumTypeDef>),
+    /// 十進固定小数列 `NUMERIC(precision, scale)`（TABLE-13〔検討中〕・
+    /// TASK-197、Issue #885）。値の内部表現・丸め規則は
+    /// [`crate::numeric::Decimal`] 参照。`1 <= precision <= 38`・
+    /// `0 <= scale <= precision` を encode・decode 両側で検証する。
+    Numeric { precision: u8, scale: u8 },
+    /// 128bit 識別子列 `UUID`（TABLE-13〔検討中〕・TASK-197、Issue #887）。
+    /// 値の内部表現・テキスト規範形は [`crate::uuid::Uuid`] 参照。version／
+    /// variant ビットは検証しない（nil・全 1 も有効値）。
+    Uuid,
 }
 
 impl ColumnType {
@@ -242,17 +347,25 @@ impl ColumnType {
 
     /// カタログのテキスト形式（v2）における型タグと `param` フィールドを返す
     /// （Issue #880 D2）。[`encode_schema`] はこの 1 対だけを呼び、型を 1 つ
-    /// 追加する際にカタログ側で触る箇所をここへ集約する。
+    /// 追加する際にカタログ側で触る箇所をここへ集約する。ENUM 列の `param` は
+    /// 型名そのもの（語彙は含めない。語彙は [`ENUM_TYPES_TABLE`] 側の SSOT）。
     fn catalog_fields(&self) -> (&'static str, String) {
         match self {
             ColumnType::Text => ("text", "-".to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
             ColumnType::Boolean => ("boolean", "-".to_string()),
+            ColumnType::Date => ("date", "-".to_string()),
+            ColumnType::Timestamp => ("timestamp", "-".to_string()),
             ColumnType::Array(array_ty) => (
                 "array",
                 format!("{},{}", array_ty.elem().catalog_tag(), array_ty.max_len()),
             ),
             ColumnType::Bytea => ("bytea", "-".to_string()),
+            ColumnType::Json => ("json", "-".to_string()),
+            ColumnType::Jsonb => ("jsonb", "-".to_string()),
+            ColumnType::Enum(def) => ("enum", def.name.clone()),
+            ColumnType::Numeric { precision, scale } => ("numeric", format!("{precision},{scale}")),
+            ColumnType::Uuid => ("uuid", "-".to_string()),
         }
     }
 
@@ -260,7 +373,21 @@ impl ColumnType {
     /// 違反はすべて `CatalogError::Invalid` で拒否する（TABLE-6。呼び出し元の
     /// [`decode_schema_body`] が `CorruptSchema` へ読み替える）。`param` の文字集合
     /// 検証（[`validate_catalog_param`]）は呼び出し元が先に行う契約とする。
-    fn from_catalog_fields(tag: &str, param: &str) -> Result<ColumnType> {
+    ///
+    /// `resolve_enum`: `enum` タグの型名解決コールバック。呼び出し元
+    /// （[`decode_schema_with_resolver`]）が現在の write/read トランザクション
+    /// から [`ENUM_TYPES_TABLE`] を引く実装（[`get_enum_type_in_read_txn`]／
+    /// [`get_enum_type_in_write_txn`]）を渡す。未登録の型名は
+    /// `CatalogError::TypeNotFound` を返す（`decode_schema_with_resolver` は
+    /// `Invalid` 以外はそのまま透過するため `CorruptSchema` へは読み替わらない
+    /// が、`table_lookup_error` で `Invalid`／`TypeNotFound` いずれも
+    /// `SqlSurfaceError::Internal` へ同じく丸まる。ENUM 列を持たないテーブルの
+    /// デコードでは一度も呼ばれない）。
+    fn from_catalog_fields(
+        tag: &str,
+        param: &str,
+        resolve_enum: &mut dyn FnMut(&str) -> Result<Arc<EnumTypeDef>>,
+    ) -> Result<ColumnType> {
         match tag {
             "text" => {
                 if param != "-" {
@@ -284,6 +411,22 @@ impl ColumnType {
                     )));
                 }
                 Ok(ColumnType::Boolean)
+            }
+            "date" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "date column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Date)
+            }
+            "timestamp" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "timestamp column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Timestamp)
             }
             "array" => {
                 // `<elem_tag>,<max_len>` のちょうど 2 要素（Issue #888 D-A2）。
@@ -322,11 +465,310 @@ impl ColumnType {
                 }
                 Ok(ColumnType::Bytea)
             }
+            "json" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "json column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Json)
+            }
+            "jsonb" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "jsonb column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Jsonb)
+            }
+            "enum" => {
+                validate_identifier(param)?;
+                let def = resolve_enum(param)?;
+                Ok(ColumnType::Enum(def))
+            }
+            "numeric" => {
+                let (precision, scale) = parse_numeric_param(param)?;
+                Ok(ColumnType::Numeric { precision, scale })
+            }
+            "uuid" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "uuid column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Uuid)
+            }
             other => Err(CatalogError::Invalid(format!(
                 "unknown column type: {other:?}"
             ))),
         }
     }
+}
+
+/// [`ENUM_TYPES_TABLE`] を read トランザクションから引く（[`decode_schema_with_resolver`]
+/// のリゾルバ実装。[`get_table_schema_in_txn`] から使う）。
+fn get_enum_type_in_read_txn(
+    read_txn: &redb::ReadTransaction,
+    name: &str,
+) -> Result<Arc<EnumTypeDef>> {
+    let table = match read_txn.open_table(ENUM_TYPES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(CatalogError::TypeNotFound(name.to_string()))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let guard = table
+        .get(name)?
+        .ok_or_else(|| CatalogError::TypeNotFound(name.to_string()))?;
+    Ok(Arc::new(decode_enum_type_def(name, guard.value())?))
+}
+
+/// [`ENUM_TYPES_TABLE`] を write トランザクションから引く（同上。DDL 系 API・
+/// [`require_table_schema_write`]・[`Storage::alter_table_add_column`] から使う）。
+fn get_enum_type_in_write_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<Arc<EnumTypeDef>> {
+    let table = match write_txn.open_table(ENUM_TYPES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(CatalogError::TypeNotFound(name.to_string()))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let guard = table
+        .get(name)?
+        .ok_or_else(|| CatalogError::TypeNotFound(name.to_string()))?;
+    Ok(Arc::new(decode_enum_type_def(name, guard.value())?))
+}
+
+/// 常に未解決を返す [`ColumnType::from_catalog_fields`] 用リゾルバ。txn を
+/// 持たない文脈（単体テスト・列挙ヘルパの一部）で ENUM 列を含まないと分かって
+/// いる場合にのみ使う。ENUM 列に遭遇した場合は fail-closed に拒否する。
+/// production 経路は [`get_table_schema_in_txn`]・[`require_table_schema_write`]
+/// が txn 由来のリゾルバを個別に渡すため、本関数を経由しない（`#[cfg(test)]`
+/// の [`decode_schema`] 経由でのみ使う）。
+#[cfg(test)]
+fn no_enum_resolver(name: &str) -> Result<Arc<EnumTypeDef>> {
+    Err(CatalogError::Invalid(format!(
+        "enum type resolution is not available in this context: {name:?}"
+    )))
+}
+
+/// ENUM 型の語彙違反（TABLE-14・TASK-198、Issue #890）。`sql::allowlist::
+/// SqlSurfaceError::InvalidTextRepresentation`（`22P02`）へ写像される。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnumLabelError {
+    /// 語彙に存在しないラベル。
+    NotInVocabulary,
+}
+
+impl fmt::Display for EnumLabelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EnumLabelError::NotInVocabulary => write!(f, "label is not a member of the enum type"),
+        }
+    }
+}
+
+/// 名前付き ENUM 型の定義（TABLE-14・TASK-198、Issue #890）。宣言順を保持した
+/// ラベル列を持つ。フィールドは private とし、`name()`／`labels()`／`contains()`／
+/// `validate_label()` の 4 メソッドのみを公開する（engine・wire-server の双方が
+/// 語彙検証をこの実装 1 つに委譲する単一情報源とするため）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumTypeDef {
+    name: String,
+    labels: Vec<String>,
+}
+
+impl EnumTypeDef {
+    /// 型名。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 宣言順のラベル列。
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// `label` が語彙に含まれるか（バイト単位の完全一致）。
+    pub fn contains(&self, label: &str) -> bool {
+        self.labels.iter().any(|l| l == label)
+    }
+
+    /// `label` を語彙に対して検証する。engine・wire-server が共有する唯一の
+    /// 検証実装（[`crate::sql::parser::bind_enum_literal`]・NoSQL 表層の
+    /// insert/update/filter 経路がいずれもこれを呼ぶ）。
+    pub fn validate_label(&self, label: &str) -> std::result::Result<(), EnumLabelError> {
+        if self.contains(label) {
+            Ok(())
+        } else {
+            Err(EnumLabelError::NotInVocabulary)
+        }
+    }
+}
+
+/// ラベル 1 個の制約検証（DDL・ADD VALUE 共通）。空文字・[`MAX_ENUM_LABEL_LEN`]
+/// 超過・制御文字（NUL 含む）を拒否する。
+fn validate_enum_label(label: &str) -> Result<()> {
+    if label.is_empty() {
+        return Err(CatalogError::Invalid(
+            "enum label must not be empty".to_string(),
+        ));
+    }
+    if label.len() > MAX_ENUM_LABEL_LEN {
+        return Err(CatalogError::Invalid(format!(
+            "enum label too long: {} bytes",
+            label.len()
+        )));
+    }
+    if label.chars().any(|c| c.is_control()) {
+        return Err(CatalogError::Invalid(
+            "enum label must not contain control characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// ラベル列全体の制約検証（個数上限・重複・各ラベルの形式）。
+fn validate_enum_labels(labels: &[String]) -> Result<()> {
+    if labels.is_empty() {
+        return Err(CatalogError::Invalid(
+            "enum type must declare at least one label".to_string(),
+        ));
+    }
+    if labels.len() > MAX_ENUM_LABELS {
+        return Err(CatalogError::Invalid(format!(
+            "too many enum labels: {}",
+            labels.len()
+        )));
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(labels.len());
+    for label in labels {
+        validate_enum_label(label)?;
+        if seen.contains(&label.as_str()) {
+            return Err(CatalogError::Invalid(format!(
+                "duplicate enum label: {label:?}"
+            )));
+        }
+        seen.push(label.as_str());
+    }
+    Ok(())
+}
+
+/// ENUM 型名の検証。識別子形式（[`validate_identifier`]）に加え、組み込み型名
+/// （[`RESERVED_TYPE_NAMES`]。大文字小文字を区別しない）との衝突を拒否する
+/// （Issue #890 D1。将来 SQL-23 の `CREATE TABLE` 型名解決での曖昧さを防ぐ）。
+fn validate_enum_type_name(name: &str) -> Result<()> {
+    validate_identifier(name)?;
+    let lower = name.to_ascii_lowercase();
+    if RESERVED_TYPE_NAMES.contains(&lower.as_str()) {
+        return Err(CatalogError::Invalid(format!(
+            "enum type name collides with a built-in type name: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// [`EnumTypeDef`] のバイト表現（TABLE-14）。`u8` バージョン・`u16` ラベル数
+/// （LE）・各ラベルは `u8` 長さ＋UTF-8 本体。宣言数の上限（[`MAX_ENUM_LABELS`]）は
+/// デコード側がアロケーション前に検証する（.claude/rules/coding-rust.md
+/// 「untrusted 入力の扱い」。ただし本 blob は untrusted クライアント入力の
+/// 直接デコード対象ではなく、格納済みカタログ値のデコードであり、破損は
+/// `CorruptSchema` として扱う）。
+fn encode_enum_type_def(name: &str, labels: &[String]) -> Result<Vec<u8>> {
+    validate_enum_type_name(name)?;
+    validate_enum_labels(labels)?;
+    let mut out = Vec::new();
+    out.push(1u8); // バージョン
+    let count = u16::try_from(labels.len())
+        .map_err(|_| CatalogError::Invalid("too many enum labels to encode".to_string()))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for label in labels {
+        let len = u8::try_from(label.len())
+            .map_err(|_| CatalogError::Invalid("enum label too long to encode".to_string()))?;
+        out.push(len);
+        out.extend_from_slice(label.as_bytes());
+    }
+    if out.len() > MAX_ENUM_TYPE_VALUE_LEN {
+        return Err(CatalogError::Invalid(
+            "encoded enum type value too large".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// [`encode_enum_type_def`] の逆変換。バージョン不一致・宣言数超過・余剰バイト・
+/// 不正 UTF-8 はすべて `CatalogError::CorruptSchema` として拒否する（格納済み
+/// データの破損。ユーザー入力の構文エラーとは区別する。Issue #55 の既存方針を
+/// 踏襲）。
+fn decode_enum_type_def(name: &str, bytes: &[u8]) -> Result<EnumTypeDef> {
+    decode_enum_type_def_body(name, bytes).map_err(|e| match e {
+        CatalogError::Invalid(msg) => CatalogError::CorruptSchema(msg),
+        other => other,
+    })
+}
+
+fn decode_enum_type_def_body(name: &str, bytes: &[u8]) -> Result<EnumTypeDef> {
+    if bytes.len() > MAX_ENUM_TYPE_VALUE_LEN {
+        return Err(CatalogError::Invalid(
+            "enum type value too large".to_string(),
+        ));
+    }
+    let version = *bytes
+        .first()
+        .ok_or_else(|| CatalogError::Invalid("enum type value is empty".to_string()))?;
+    if version != 1 {
+        return Err(CatalogError::Invalid(format!(
+            "unknown enum type format version: {version}"
+        )));
+    }
+    let count_bytes: [u8; 2] = bytes
+        .get(1..3)
+        .ok_or_else(|| CatalogError::Invalid("enum type value truncated".to_string()))?
+        .try_into()
+        .map_err(|_| CatalogError::Invalid("enum type value truncated".to_string()))?;
+    let count = u16::from_le_bytes(count_bytes) as usize;
+    // 宣言数の上限をアロケーション（`Vec::with_capacity`）の前に検証する
+    // （Issue #880 D7 と同じ方針）。
+    if count == 0 || count > MAX_ENUM_LABELS {
+        return Err(CatalogError::Invalid(format!(
+            "enum type declares an invalid label count: {count}"
+        )));
+    }
+    let mut labels = Vec::with_capacity(count);
+    let mut offset = 3usize;
+    for _ in 0..count {
+        let len = *bytes.get(offset).ok_or_else(|| {
+            CatalogError::Invalid("enum type value truncated at label length".to_string())
+        })? as usize;
+        offset = offset
+            .checked_add(1)
+            .ok_or_else(|| CatalogError::Invalid("enum type value offset overflow".to_string()))?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| CatalogError::Invalid("enum type value offset overflow".to_string()))?;
+        let label_bytes = bytes.get(offset..end).ok_or_else(|| {
+            CatalogError::Invalid("enum type value truncated at label body".to_string())
+        })?;
+        let label = std::str::from_utf8(label_bytes)
+            .map_err(|_| CatalogError::Invalid("enum label is not valid UTF-8".to_string()))?
+            .to_string();
+        labels.push(label);
+        offset = end;
+    }
+    if offset != bytes.len() {
+        return Err(CatalogError::Invalid(
+            "enum type value has trailing bytes".to_string(),
+        ));
+    }
+    validate_enum_labels(&labels)?;
+    Ok(EnumTypeDef {
+        name: name.to_string(),
+        labels,
+    })
 }
 
 /// 配列列（`ColumnType::Array`）の要素型（TABLE-14・Issue #888）。`VECTOR`・`ARRAY`
@@ -431,11 +873,19 @@ impl TableSchema {
 
     /// 宣言済みの埋め込み次元（`VECTOR(N)` 列のうち最初に見つかったもの、TABLE-1）。
     pub fn vector_dim(&self) -> Option<u32> {
-        self.columns.iter().find_map(|c| match c.ty {
-            ColumnType::Vector(dim) => Some(dim),
-            ColumnType::Text | ColumnType::Boolean | ColumnType::Array(_) | ColumnType::Bytea => {
-                None
-            }
+        self.columns.iter().find_map(|c| match &c.ty {
+            ColumnType::Vector(dim) => Some(*dim),
+            ColumnType::Text
+            | ColumnType::Boolean
+            | ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Enum(_)
+            | ColumnType::Array(_)
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid => None,
         })
     }
 
@@ -508,10 +958,67 @@ fn validate_vector_dim(dim: u32) -> Result<()> {
     Ok(())
 }
 
+/// `NUMERIC(precision, scale)` の宣言制約検証（TABLE-13〔検討中〕・TASK-197、
+/// Issue #885・D1）。`1 <= precision <= MAX_PRECISION`・`0 <= scale <= precision`
+/// を満たさない宣言は encode・decode 両側で fail-closed に拒否する。
+fn validate_numeric_precision_scale(precision: u8, scale: u8) -> Result<()> {
+    if precision == 0 || precision > crate::numeric::MAX_PRECISION {
+        return Err(CatalogError::Invalid(format!(
+            "NUMERIC precision must be between 1 and {}: {precision}",
+            crate::numeric::MAX_PRECISION
+        )));
+    }
+    if scale > precision {
+        return Err(CatalogError::Invalid(format!(
+            "NUMERIC scale must not exceed precision: scale={scale} precision={precision}"
+        )));
+    }
+    Ok(())
+}
+
+/// カタログ `param` フィールド（`"p,s"`）を `(precision, scale)` へ厳格パースする
+/// （Issue #885・D1）。カンマはちょうど 1 個、各要素は ASCII 数字のみからなる
+/// `u8`、範囲は [`validate_numeric_precision_scale`] で検証する。再 encode
+/// した結果が入力と一致しない非正規形（先頭ゼロ等。例: `"010,2"`）も
+/// fail-closed に拒否する。
+fn parse_numeric_param(param: &str) -> Result<(u8, u8)> {
+    let mut parts = param.split(',');
+    let precision_str = parts
+        .next()
+        .ok_or_else(|| CatalogError::Invalid(format!("malformed NUMERIC parameter: {param:?}")))?;
+    let scale_str = parts
+        .next()
+        .ok_or_else(|| CatalogError::Invalid(format!("malformed NUMERIC parameter: {param:?}")))?;
+    if parts.next().is_some() {
+        return Err(CatalogError::Invalid(format!(
+            "malformed NUMERIC parameter: {param:?}"
+        )));
+    }
+    let precision: u8 = precision_str.parse().map_err(|_| {
+        CatalogError::Invalid(format!("malformed NUMERIC precision: {precision_str:?}"))
+    })?;
+    let scale: u8 = scale_str
+        .parse()
+        .map_err(|_| CatalogError::Invalid(format!("malformed NUMERIC scale: {scale_str:?}")))?;
+    // 非正規形（先頭ゼロ等）の拒否: 再 encode した文字列が入力と一致するかで
+    // 判定する（`u8::to_string()` は正規形しか生成しないため、`"010"` の
+    // ような入力は不一致になる）。
+    if precision.to_string() != precision_str || scale.to_string() != scale_str {
+        return Err(CatalogError::Invalid(format!(
+            "non-canonical NUMERIC parameter: {param:?}"
+        )));
+    }
+    validate_numeric_precision_scale(precision, scale)?;
+    Ok((precision, scale))
+}
+
 fn validate_column(column: &ColumnDef) -> Result<()> {
     validate_identifier(&column.name)?;
-    if let ColumnType::Vector(dim) = column.ty {
-        validate_vector_dim(dim)?;
+    if let ColumnType::Vector(dim) = &column.ty {
+        validate_vector_dim(*dim)?;
+    }
+    if let ColumnType::Numeric { precision, scale } = column.ty {
+        validate_numeric_precision_scale(precision, scale)?;
     }
     Ok(())
 }
@@ -621,15 +1128,38 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
 /// 汎用の `CatalogError::Invalid` を返すため、ここで格納済みデータのデコード失敗
 /// として明示的に読み替える）。呼び出し元（[`TableLookup for Storage`](Storage)）は
 /// この変換を前提に `Invalid`（ユーザー入力の識別子形式不正）と区別して wire_code を
-/// 割り当てる（Issue #55 レビュー指摘）。
+/// 割り当てる（Issue #55 レビュー指摘）。ENUM 列を含まないカタログ値専用の
+/// 簡易ラッパー（[`no_enum_resolver`]）であり、単体テスト（`#[cfg(test)]`）
+/// 専用。production 経路は [`decode_schema_with_resolver`] を txn 由来の
+/// リゾルバ付きで直接呼ぶ。
+#[cfg(test)]
 fn decode_schema(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
-    decode_schema_body(table_name, bytes).map_err(|e| match e {
+    decode_schema_with_resolver(table_name, bytes, &mut no_enum_resolver)
+}
+
+/// [`decode_schema`] の一般化版。ENUM 列（[`ColumnType::Enum`]）を含むテーブルは、
+/// カタログに型名しか持たないため、デコード時に `resolve_enum` を通じて
+/// [`ENUM_TYPES_TABLE`] から語彙を解決する必要がある。production の 2 呼び出し口
+/// （[`get_table_schema_in_txn`]・[`Storage::alter_table_add_column`]）はいずれも
+/// 既に read/write トランザクションを保持しているため、そこから
+/// [`ENUM_TYPES_TABLE`] を開くクロージャを渡す。ENUM 列を持たないテーブルの
+/// デコードでは `resolve_enum` は一度も呼ばれない。
+fn decode_schema_with_resolver(
+    table_name: &str,
+    bytes: &[u8],
+    resolve_enum: &mut dyn FnMut(&str) -> Result<Arc<EnumTypeDef>>,
+) -> Result<TableSchema> {
+    decode_schema_body(table_name, bytes, resolve_enum).map_err(|e| match e {
         CatalogError::Invalid(msg) => CatalogError::CorruptSchema(msg),
         other => other,
     })
 }
 
-fn decode_schema_body(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
+fn decode_schema_body(
+    table_name: &str,
+    bytes: &[u8],
+    resolve_enum: &mut dyn FnMut(&str) -> Result<Arc<EnumTypeDef>>,
+) -> Result<TableSchema> {
     if bytes.len() > MAX_CATALOG_VALUE_LEN {
         return Err(CatalogError::Invalid(format!(
             "catalog value too large: {} bytes",
@@ -711,7 +1241,7 @@ fn decode_schema_body(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
         // 未知の型タグ・型別の `param` 文法違反は、ここで `ColumnDef`（`name` の
         // 所有 `String` を確保する）を構築する前に拒否する（アロケーション前拒否。
         // Issue #880 D7）。
-        let ty = ColumnType::from_catalog_fields(type_name, param_field)?;
+        let ty = ColumnType::from_catalog_fields(type_name, param_field, resolve_enum)?;
 
         let nullable = match nullable_field {
             "0" => false,
@@ -886,7 +1416,10 @@ pub(crate) fn require_table_schema_write(
     let guard = catalog_table
         .get(table_name)?
         .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
-    decode_schema(table_name, guard.value())
+    let bytes = guard.value().to_vec();
+    drop(guard);
+    let mut resolve = |name: &str| get_enum_type_in_write_txn(write_txn, name);
+    decode_schema_with_resolver(table_name, &bytes, &mut resolve)
 }
 
 /// read トランザクション内でカタログテーブルに `table_name` が定義済みかを確認する
@@ -979,6 +1512,17 @@ impl Storage {
         let encoded = encode_schema(schema)?;
         let write_txn = self.begin_write_txn()?;
         {
+            // ENUM 列（[`ColumnType::Enum`]）が参照する型は、この write txn の
+            // 時点でカタログに登録済みであることを検証する（Issue #890 D2。
+            // `encoded` は型名のみを持つため、ここで未登録の型名を通すと
+            // 存在しない型を参照する列が作成されてしまう）。カタログ側は
+            // 型名だけを永続化するため、呼び出し元が渡した `Arc<EnumTypeDef>`
+            // の中身（語彙）自体は検証結果として使わず捨てる。
+            for column in &schema.columns {
+                if let ColumnType::Enum(def) = &column.ty {
+                    get_enum_type_in_write_txn(&write_txn, def.name())?;
+                }
+            }
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             if table.get(schema.name.as_str())?.is_some() {
                 return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
@@ -1045,7 +1589,7 @@ impl Storage {
     /// 保持され、既存行のバイト列には一切触れない（`ROWS_TABLE` 非アクセス）。
     /// `column.nullable == false` は fail-closed に拒否する
     /// （security.md「不安全な設計」）。対象テーブル不存在・列名重複も `Err`。
-    pub fn alter_table_add_column(&self, table_name: &str, column: ColumnDef) -> Result<()> {
+    pub fn alter_table_add_column(&self, table_name: &str, mut column: ColumnDef) -> Result<()> {
         validate_identifier(table_name)?;
         validate_column(&column)?;
         if !column.nullable {
@@ -1055,6 +1599,12 @@ impl Storage {
         }
         let write_txn = self.begin_write_txn()?;
         {
+            // 呼び出し元が渡した `ColumnType::Enum` の `Arc<EnumTypeDef>` は信頼せず、
+            // この write txn から見えるカタログ登録済みの定義で必ず置き換える
+            // （未登録の語彙を呼び出し元が持ち込めないようにする。Issue #890 D2）。
+            if let ColumnType::Enum(def) = &column.ty {
+                column.ty = ColumnType::Enum(get_enum_type_in_write_txn(&write_txn, def.name())?);
+            }
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             let existing: Vec<u8> = {
                 let guard = table
@@ -1062,7 +1612,8 @@ impl Storage {
                     .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
                 guard.value().to_vec()
             };
-            let mut schema = decode_schema(table_name, &existing)?;
+            let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
+            let mut schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
             if schema.columns.iter().any(|c| c.name == column.name) {
                 return Err(CatalogError::ColumnAlreadyExists(column.name.clone()));
             }
@@ -1077,6 +1628,107 @@ impl Storage {
             table.insert(table_name, encoded.as_slice())?;
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// 新規 ENUM 型を定義する（TABLE-14・TASK-198、Issue #890）。SQL-23（`CREATE
+    /// TYPE ... AS ENUM`）未実装のため Rust API 専用の DDL。同名の型が既に
+    /// 存在する場合は上書きせず `Err(CatalogError::TypeAlreadyExists)`。
+    pub fn create_enum_type(&self, name: &str, labels: Vec<String>) -> Result<Arc<EnumTypeDef>> {
+        let encoded = encode_enum_type_def(name, &labels)?;
+        let write_txn = self.begin_write_txn()?;
+        {
+            let mut table = write_txn.open_table(ENUM_TYPES_TABLE)?;
+            if table.get(name)?.is_some() {
+                return Err(CatalogError::TypeAlreadyExists(name.to_string()));
+            }
+            let count = table.len()?;
+            if count >= MAX_ENUM_TYPES as u64 {
+                return Err(CatalogError::Invalid(format!(
+                    "too many enum types registered: {count}"
+                )));
+            }
+            table.insert(name, encoded.as_slice())?;
+        }
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(Arc::new(EnumTypeDef {
+            name: name.to_string(),
+            labels,
+        }))
+    }
+
+    /// 定義済みの ENUM 型をスナップショット読み取りで取得する。
+    pub fn get_enum_type(&self, name: &str) -> Result<Arc<EnumTypeDef>> {
+        validate_identifier(name)?;
+        let read_txn = self.db().begin_read()?;
+        let table = match read_txn.open_table(ENUM_TYPES_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(CatalogError::TypeNotFound(name.to_string()))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let guard = table
+            .get(name)?
+            .ok_or_else(|| CatalogError::TypeNotFound(name.to_string()))?;
+        Ok(Arc::new(decode_enum_type_def(name, guard.value())?))
+    }
+
+    /// `ALTER TYPE <name> ADD VALUE '<label>'` 相当（TABLE-14・TASK-198）。既存
+    /// ラベルの末尾へ 1 個だけ追記する。並べ替え・`BEFORE`/`AFTER` 指定・
+    /// 削除・改名はいずれも提供しない（Issue #890 D4。既存行はラベル文字列を
+    /// そのまま格納するため、語彙の単調増加さえ守れば古いスナップショットで
+    /// 有効だった値は将来にわたって有効であり続ける契約を維持できる）。
+    /// 依存テーブルが存在する場合、この write txn 内で該当テーブルすべての
+    /// 世代を進行させる（多層防御。同一クエリ内でスキーマが再取得されない
+    /// キャッシュ経路が新ラベルを見落とす可能性を保守的に潰す）。
+    pub fn alter_enum_type_add_value(&self, name: &str, label: String) -> Result<Arc<EnumTypeDef>> {
+        validate_identifier(name)?;
+        validate_enum_label(&label)?;
+        let write_txn = self.begin_write_txn()?;
+        let updated = {
+            let mut table = write_txn.open_table(ENUM_TYPES_TABLE)?;
+            let existing = table
+                .get(name)?
+                .ok_or_else(|| CatalogError::TypeNotFound(name.to_string()))?
+                .value()
+                .to_vec();
+            let mut def = decode_enum_type_def(name, &existing)?;
+            if def.labels.iter().any(|l| l == &label) {
+                return Err(CatalogError::Invalid(format!(
+                    "enum label already exists: {label:?}"
+                )));
+            }
+            def.labels.push(label);
+            validate_enum_labels(&def.labels)?;
+            let encoded = encode_enum_type_def(name, &def.labels)?;
+            table.insert(name, encoded.as_slice())?;
+            def
+        };
+        for table_name in dependent_tables_in_txn(&write_txn, name)? {
+            bump_table_generation_in_txn(&write_txn, &table_name)?;
+        }
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(Arc::new(updated))
+    }
+
+    /// `DROP TYPE <name>` 相当。依存列（[`ColumnType::Enum`] でこの型を参照する
+    /// 列）が 1 つでも残っている場合は
+    /// `Err(CatalogError::DependentObjectsStillExist)` で拒否する（SQL-23 結線時は
+    /// `2BP01` へ写像する想定。Issue #890 D5）。
+    pub fn drop_enum_type(&self, name: &str) -> Result<()> {
+        validate_identifier(name)?;
+        let write_txn = self.begin_write_txn()?;
+        {
+            let dependents = dependent_tables_in_txn(&write_txn, name)?;
+            if !dependents.is_empty() {
+                return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
+            }
+            let mut table = write_txn.open_table(ENUM_TYPES_TABLE)?;
+            if table.remove(name)?.is_none() {
+                return Err(CatalogError::TypeNotFound(name.to_string()));
+            }
+        }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -1416,7 +2068,10 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ColumnAlreadyExists(_)
         | CatalogError::RowNotFound(_)
         | CatalogError::IncompatibleRowKeyFormat
-        | CatalogError::TableGenerationCounterOverflow => SqlSurfaceError::Internal {
+        | CatalogError::TableGenerationCounterOverflow
+        | CatalogError::TypeNotFound(_)
+        | CatalogError::TypeAlreadyExists(_)
+        | CatalogError::DependentObjectsStillExist(_) => SqlSurfaceError::Internal {
             detail: "catalog lookup failed".to_string(),
         },
     }
@@ -1446,7 +2101,10 @@ pub(crate) fn get_table_schema_in_txn(
     let guard = table
         .get(table_name)?
         .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
-    decode_schema(table_name, guard.value())
+    let bytes = guard.value().to_vec();
+    drop(guard);
+    let mut resolve = |name: &str| get_enum_type_in_read_txn(read_txn, name);
+    decode_schema_with_resolver(table_name, &bytes, &mut resolve)
 }
 
 /// [`Storage::list_tables`] が共有するトランザクションスコープの実装本体。
@@ -1473,6 +2131,121 @@ fn list_tables_in_txn(read_txn: &redb::ReadTransaction) -> Result<Vec<String>> {
         names.push(name.to_string());
     }
     Ok(names)
+}
+
+/// カタログ値（1 テーブル分のエンコード済みバイト列）が ENUM 型 `type_name` を
+/// 参照する列を含むかどうかを、完全デコード（[`decode_schema_with_resolver`]）
+/// を経由せずテキスト走査だけで判定する。`dependent_tables_in_txn` が
+/// `DROP TYPE`／`ALTER TYPE ... ADD VALUE`（テーブル世代の保守的な同時進行）の
+/// 双方から使う軽量な判定であり、完全なスキーマ復元・語彙解決は不要（`param`
+/// の識別子形式検証・`nullable` フィールドの値検証までは行わない）。
+/// ヘッダ行（フォーマットバージョン・列数）の形は [`decode_schema_body`] と
+/// 同じ想定で読み飛ばし、宣言列数ぶんの列行のみを検査する。
+/// 破損したカタログ値（UTF-8 でない・ヘッダ不正・列行のフィールド数不整合・
+/// 宣言列数に満たない等）は fail-closed で `Err(CatalogError::CorruptSchema)`
+/// として伝播する（codex-review P1 指摘・Issue #890: 破損を「依存なし」に
+/// 丸めると `drop_enum_type` が実際には参照されている ENUM 型を削除できて
+/// しまう。`decode_schema_body` と同じ fail-closed 方針をここでも徹底する）。
+fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<bool> {
+    if bytes.len() > MAX_CATALOG_VALUE_LEN {
+        return Err(CatalogError::CorruptSchema(format!(
+            "catalog value too large: {} bytes",
+            bytes.len()
+        )));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| CatalogError::CorruptSchema("catalog value is not valid UTF-8".to_string()))?;
+    let mut lines = text.split('\n');
+
+    let version_line = lines
+        .next()
+        .ok_or_else(|| CatalogError::CorruptSchema("catalog value is empty".to_string()))?;
+    if version_line != CATALOG_FORMAT_VERSION_LINE {
+        return Err(CatalogError::CorruptSchema(format!(
+            "unknown catalog format version: {version_line:?}"
+        )));
+    }
+
+    let cols_line = lines.next().ok_or_else(|| {
+        CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
+    })?;
+    let count_str = cols_line.strip_prefix("cols:").ok_or_else(|| {
+        CatalogError::CorruptSchema(format!("malformed cols line: {cols_line:?}"))
+    })?;
+    let col_count: usize = count_str.parse().map_err(|_| {
+        CatalogError::CorruptSchema(format!("malformed column count: {count_str:?}"))
+    })?;
+    if col_count > MAX_COLUMN_COUNT {
+        return Err(CatalogError::CorruptSchema(format!(
+            "too many columns: {col_count}"
+        )));
+    }
+
+    let mut found = false;
+    for _ in 0..col_count {
+        let line = lines.next().ok_or_else(|| {
+            CatalogError::CorruptSchema("catalog value truncated: missing column line".to_string())
+        })?;
+        let mut fields = line.split(':');
+        let (Some(_name), Some(tag), Some(param), Some(_nullable)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(CatalogError::CorruptSchema(format!(
+                "malformed column line: {line:?}"
+            )));
+        };
+        if fields.next().is_some() {
+            return Err(CatalogError::CorruptSchema(format!(
+                "malformed column line: {line:?}"
+            )));
+        }
+        if tag == "enum" && param == type_name {
+            found = true;
+        }
+    }
+    // 宣言列数を超える残り行は、`decode_schema_body` と同じく「末尾の空行
+    // （トレーリング改行）1 行のみ」を許容しそれ以外は余剰行として拒否する。
+    // ここを緩めると、宣言列数を過小に偽装した破損値（例: `cols:1` の後に
+    // 実在の ENUM 参照列をもう 1 行追加する）が「依存なし」に丸められ、
+    // `decode_schema_body` が `CorruptSchema` で拒否する同じバイト列に対して
+    // `drop_enum_type` だけが削除を許してしまう fail-open 経路になる。
+    let mut trailing_seen = false;
+    for line in lines {
+        if trailing_seen || !line.is_empty() {
+            return Err(CatalogError::CorruptSchema(format!(
+                "catalog value line count mismatch: expected {col_count} columns, got more than {col_count} lines"
+            )));
+        }
+        trailing_seen = true;
+    }
+    Ok(found)
+}
+
+/// ENUM 型 `type_name` を参照する列を持つテーブル名の一覧を列挙する
+/// （`DROP TYPE`・`ALTER TYPE ... ADD VALUE` が共有する。Issue #890 D4/D5）。
+/// [`MAX_LIST_TABLES`] を超える場合は無制限 `Vec` 確保を避けて `Err`。
+fn dependent_tables_in_txn(
+    write_txn: &redb::WriteTransaction,
+    type_name: &str,
+) -> Result<Vec<String>> {
+    let table = match write_txn.open_table(CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut dependents = Vec::new();
+    for entry in table.iter()? {
+        let (key, value) = entry?;
+        if dependents.len() >= MAX_LIST_TABLES {
+            return Err(CatalogError::Invalid(format!(
+                "too many tables: exceeds {MAX_LIST_TABLES}"
+            )));
+        }
+        if catalog_value_references_enum_type(value.value(), type_name)? {
+            dependents.push(key.value().to_string());
+        }
+    }
+    Ok(dependents)
 }
 
 #[cfg(test)]
@@ -1612,6 +2385,51 @@ mod tests {
         let ty = ArrayType::new(ArrayElemType::Bool, 10).expect("array ty");
         assert_eq!(ty.max_len(), 10);
         assert_eq!(ty.elem(), ArrayElemType::Bool);
+    }
+
+    /// `NUMERIC(p, s)` 列のカタログ往復（TABLE-13〔検討中〕・TASK-197、
+    /// Issue #885・D1）。`catalog_fields` の `param` が `"p,s"` 形式であり、
+    /// decode 後も往復することを固定する。
+    #[test]
+    fn numeric_column_roundtrips_through_catalog() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new(
+                    "price",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+            ],
+        );
+        assert_eq!(
+            schema.columns[1].ty.catalog_fields(),
+            ("numeric", "10,2".to_string())
+        );
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
+        assert_eq!(decoded, schema);
+    }
+
+    /// 不正な `NUMERIC` param（区切り不正・非正規形・範囲外）は encode・decode
+    /// いずれの経路でも fail-closed に拒否する。
+    #[test]
+    fn numeric_param_rejects_malformed_and_out_of_range_forms() {
+        for bad in [
+            "10", "10,", ",2", "39,0", "0,0", "3,4", "010,2", "10,2,3", "a,2", "10,a",
+        ] {
+            assert!(
+                parse_numeric_param(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        assert!(parse_numeric_param("10,2").is_ok());
+        assert!(parse_numeric_param("38,38").is_ok());
+        assert!(parse_numeric_param("1,0").is_ok());
     }
 
     #[test]
@@ -1757,6 +2575,54 @@ mod tests {
             decode_schema("t", &bytes),
             Err(CatalogError::CorruptSchema(_))
         ));
+    }
+
+    /// `drop_enum_type` は破損カタログ値を「依存なし」に丸めず `CorruptSchema`
+    /// として拒否する（PR #1015 レビュー指摘・codex-review P1。Issue #890）。
+    /// `decode_rejects_invalid_utf8` と同じ破損データ（不正 UTF-8）を、実際に
+    /// 依存判定が走る `CATALOG_TABLE` エントリへ直接書き込み、それを検証する。
+    /// 破損に丸めて削除を通してしまう fail-open 経路だと、実際には参照されて
+    /// いる ENUM 型が消えてしまう（本テストは削除が起きないことも確認する）。
+    #[test]
+    fn drop_enum_type_rejects_corrupt_catalog_value_instead_of_treating_it_as_no_dependents() {
+        let path = unique_db_path("catalog-drop-enum-corrupt");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        // 依存判定（`dependent_tables_in_txn`）は `CATALOG_TABLE` の全エントリを
+        // 走査するため、実在テーブルを経由せず不正 UTF-8 の値を直接書き込む
+        // （`decode_rejects_invalid_utf8` と同じ破損データ）。
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", [0xff_u8, 0xfe, 0xfd].as_slice())
+                .expect("insert corrupt catalog value");
+        }
+        // テスト専用のセットアップ書き込みのため `commit_boundary` を経由せず
+        // 直接 `redb::WriteTransaction::commit` を呼ぶ（既存テスト
+        // `catalog.rs` 内の他のセットアップ commit と同じ流儀。
+        // `table_generation_bump_coverage.rs` の悉皆走査は
+        // `commit_boundary::commit*` 呼び出しのみを対象とするため、これを
+        // 経由すると本テスト自身がアローリスト追記を要求されてしまう）。
+        write_txn.commit().expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on corrupt catalog values, got: {err:?}"
+        );
+
+        // 型は削除されず残っていること（fail-open だとここが消えてしまう）。
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
     }
 
     #[test]

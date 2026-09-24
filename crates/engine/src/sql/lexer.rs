@@ -274,6 +274,25 @@ fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError
             continue;
         }
 
+        // 先頭 `.` の小数リテラル（`.5` 等。TABLE-13〔検討中〕・TASK-197、Issue #885・
+        // D5。`NUMERIC` 列の受理文法 `[+-]?(digits)?(\.digits?)?` が「整数部 0 桁」を
+        // 許すため、字句解析でも `.` の直後に数字が続く場合は数値トークンの開始として
+        // 扱う。数字が続かない孤立した `.`（`a.b` の `QualifiedIdent` 判定対象外の
+        // 位置に現れたもの等）は従来どおり許可リスト外の文字として拒否する）。
+        if c == '.' {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, d)) if d.is_ascii_digit()) {
+                let (number, next_offset) = lex_number(input, offset);
+                tokens.push(Token::Number(number));
+                advance_to(&mut chars, next_offset);
+                continue;
+            }
+            return Err(LexError {
+                message: format!("unsupported character: {c:?}"),
+                byte_offset: offset,
+            });
+        }
         if c.is_ascii_alphabetic() || c == '_' {
             let (word, next_offset) = lex_word(input, offset);
             // `Token::QualifiedIdent`（Issue #872・SQL-20）: 予約語（`Keyword`）は
@@ -374,9 +393,13 @@ fn lex_string_literal(input: &str, start: usize) -> Result<(String, usize), LexE
 /// 通常あり得ないが、untrusted 入力経路では添字直接アクセス（`input[start..]`）を
 /// 使わず `get()` で明示的に処理する（coding-rust.md）。
 /// TASK-79・SQL-9: 整数に加え `<digits>.<digits>` の小数リテラルを 1 トークンとして
-/// 認識する。先頭 `.`（`.5`）・末尾 `.`（`1.`）・2 個目以降の `.`（`1..2`）は本関数の
-/// 対象外（呼び出し元のメインループは整数部までしか消費しないため、残った `.` は
-/// 「未対応文字」として `tokenize` が fail-closed に拒否する）。指数表記は非対応。
+/// 認識する。TABLE-13〔検討中〕・TASK-197、Issue #885・D5 で `NUMERIC` 列の受理文法
+/// `[+-]?(digits)?(\.digits?)?` に合わせ、先頭 `.`（`.5`。呼び出し元のメインループが
+/// `.` の直後に数字が続く場合にこの関数を呼ぶ）・末尾 `.`（`1.`。整数部を 1 桁以上
+/// 消費済みなら小数部が空でも `.` を消費する）も 1 トークンとして受理するよう拡張した。
+/// 2 個目以降の `.`（`1..2`）は本関数が最初の `.` を消費した時点で走査を止めるため
+/// 対象外のまま（残った `.` は新たな数値トークンの開始、または「未対応文字」として
+/// `tokenize` のメインループが扱う）。指数表記は非対応。
 fn lex_number(input: &str, start: usize) -> (String, usize) {
     let Some(rest) = input.get(start..) else {
         return (String::new(), start);
@@ -391,12 +414,15 @@ fn lex_number(input: &str, start: usize) -> (String, usize) {
             break;
         }
     }
-    // 小数部は「`.` の直後に少なくとも 1 桁の数字が続く」場合のみ消費する
-    // （1 文字先読みで確定させ、`1.` のような末尾 `.` を誤って飲み込まない）。
+    // 小数点は「直前に整数部の桁を 1 桁以上消費済み（`1.` 形）」または
+    // 「直後に少なくとも 1 桁の数字が続く（`1.5`／`.5` 形）」場合のみ消費する
+    // （1 文字先読みで確定させ、孤立した `.`〔`1..2` の 2 個目〕を誤って
+    // 飲み込まない）。
     if let Some(&(_, '.')) = chars.peek() {
         let mut lookahead = chars.clone();
         lookahead.next();
-        if matches!(lookahead.peek(), Some(&(_, d)) if d.is_ascii_digit()) {
+        let next_is_digit = matches!(lookahead.peek(), Some(&(_, d)) if d.is_ascii_digit());
+        if end > 0 || next_is_digit {
             end += '.'.len_utf8();
             chars.next();
             while let Some(&(_, c)) = chars.peek() {
@@ -545,18 +571,30 @@ mod tests {
 
     #[test]
     fn qualified_ident_rejects_malformed_dot_forms() {
-        // `.5`（数値側の既存拒否。`rejects_leading_dot_number_literal` と重複
-        // 確認）・`1.`（数値側。`rejects_trailing_dot_number_literal` と重複
-        // 確認）・`1..2`（数値側）はいずれも既存契約のまま。識別子側の新規
-        // 拒否形状: `a.`（末尾 `.`）・`a. b`（空白を挟む）・`a.b.c`（3 段）・
-        // `a.5`（`.` の直後が数字）。
-        assert!(tokenize(".5").is_err());
-        assert!(tokenize("1.").is_err());
-        assert!(tokenize("1..2").is_err());
+        // 識別子側の拒否形状: `a.`（末尾 `.`）・`a. b`（空白を挟む）・
+        // `a.b.c`（3 段。`a.b` を `QualifiedIdent` 化した直後に孤立した `.c` が
+        // 残り「未対応文字」として拒否される）はいずれも既存契約のまま。
         assert!(tokenize("a.").is_err());
         assert!(tokenize("a. b").is_err());
         assert!(tokenize("a.b.c").is_err());
-        assert!(tokenize("a.5").is_err());
+    }
+
+    #[test]
+    fn dot_digit_after_ident_lexes_as_separate_number_token() {
+        // `a.5`（Issue #885・D5 での数値側拡張の副作用）: `.` の直後が数字の
+        // ため `QualifiedIdent` の条件（`.` の直後が英字・`_`）には合致せず、
+        // `a` は独立した `Ident` になる。続く `.5` は本 Issue で新たに受理する
+        // 先頭 `.` の数値リテラルとして字句解析されるため、`tokenize` 自体は
+        // エラーにならない（`Ident` の直後に `Number` が続く並びを許可リストの
+        // 文法が受理するかどうかは `sql::allowlist::Parser` 側の管轄）。
+        let tokens = tokenize("a.5").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("a".to_string()),
+                Token::Number(".5".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -817,21 +855,39 @@ mod tests {
     }
 
     #[test]
-    fn rejects_trailing_dot_number_literal() {
-        // `1.` は整数部 `1` のみを 1 トークンとして消費し、残った `.` が
-        // 「未対応文字」として拒否される（小数部は「`.` の直後に数字」の場合のみ
-        // 消費するため）。
-        assert!(tokenize("1. ").is_err());
+    fn accepts_trailing_dot_number_literal() {
+        // TABLE-13〔検討中〕・TASK-197、Issue #885・D5（PR #1020 codex-review
+        // 指摘対応）: `NUMERIC` 列の受理文法 `[+-]?(digits)?(\.digits?)?` に
+        // 合わせ、`1.` は整数部 `1` と小数部 0 桁の 1 トークン `Number("1.")`
+        // として受理する（従来は残った `.` が「未対応文字」として拒否されていた）。
+        let tokens = tokenize("1. ").expect("tokenize should succeed");
+        assert_eq!(tokens, vec![Token::Number("1.".to_string())]);
     }
 
     #[test]
-    fn rejects_leading_dot_number_literal() {
-        assert!(tokenize(".5").is_err());
+    fn accepts_leading_dot_number_literal() {
+        // 同上（D5）: `.5` は整数部 0 桁・小数部 `5` の 1 トークン
+        // `Number(".5")` として受理する。
+        let tokens = tokenize(".5").expect("tokenize should succeed");
+        assert_eq!(tokens, vec![Token::Number(".5".to_string())]);
     }
 
     #[test]
-    fn rejects_double_dot_number_literal() {
-        assert!(tokenize("1..2").is_err());
+    fn double_dot_number_literal_splits_into_two_number_tokens() {
+        // `1..2` は字句解析エラーにはならない（`lex_number` は最初の `.` を
+        // 消費した時点で走査を止めるため）。`Number("1.")` と `Number(".2")` の
+        // 2 トークンに分かれ、複数の `.` を持つ単一の数値リテラルとしては
+        // 構造的に組み立たない。VALUES リストの 1 要素は 1 リテラルのみを
+        // 期待するため、この 2 トークン形は許可リスト（`sql::allowlist::Parser`）
+        // 側で構文エラーとして拒否される（字句解析層の担当外）。
+        let tokens = tokenize("1..2").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Number("1.".to_string()),
+                Token::Number(".2".to_string())
+            ]
+        );
     }
 
     #[test]

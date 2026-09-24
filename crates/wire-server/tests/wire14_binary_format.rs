@@ -161,6 +161,38 @@ fn vector_column_binary_request_is_rejected_as_feature_not_supported() {
 }
 
 #[test]
+fn enum_column_binary_request_is_rejected_as_feature_not_supported() {
+    // `EnumTypeDef` はフィールドが private で `Storage::create_enum_type` 経由
+    // でしか構築できないため（Issue #890）、テスト専用の使い捨て DB を開いて
+    // 型登録だけ行う（`ColumnMeta::Scalar { ty }` の判定は型定義の中身
+    // 〔語彙〕を一切参照しないため、これで十分）。
+    let path = std::env::temp_dir().join(format!(
+        "wire14-binary-format-enum-{}-{}.redb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    let storage = engine::storage::Storage::open(&path).expect("open throwaway storage");
+    let def = storage
+        .create_enum_type("mood", vec!["happy".to_string()])
+        .expect("create enum type");
+    let columns = vec![ColumnMeta::Scalar {
+        name: "mood".to_string(),
+        ty: ColumnType::Enum(def),
+    }];
+    let formats = ResultFormats::new(&[1])
+        .resolve(columns.len())
+        .expect("resolve");
+    let err = validate_binary_formats(&columns, &formats).unwrap_err();
+    assert_eq!(err, BinaryFormatError::UnsupportedType { column_index: 0 });
+    assert_eq!(err.error_class().wire_code(), "0A000");
+    drop(storage);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn computed_column_binary_request_is_rejected_as_feature_not_supported() {
     let columns = vec![ColumnMeta::Computed {
         name: "expr".to_string(),
@@ -171,6 +203,29 @@ fn computed_column_binary_request_is_rejected_as_feature_not_supported() {
     let err = validate_binary_formats(&columns, &formats).unwrap_err();
     assert_eq!(err, BinaryFormatError::UnsupportedType { column_index: 0 });
     assert_eq!(err.error_class().wire_code(), "0A000");
+}
+
+#[test]
+fn json_column_binary_request_is_rejected_as_feature_not_supported() {
+    // `JSON`／`JSONB` 列（TABLE-14・Issue #889）は BYTEA と同じ理由（値の実体が
+    // `Cell::Json` の格納テキストで `Text` の単純な UTF-8 生バイト表現とは
+    // 意味論が異なる）で fail-closed に非対応とする。
+    for ty in [ColumnType::Json, ColumnType::Jsonb] {
+        let columns = vec![ColumnMeta::Scalar {
+            name: "doc".to_string(),
+            ty: ty.clone(),
+        }];
+        let formats = ResultFormats::new(&[1])
+            .resolve(columns.len())
+            .expect("resolve");
+        let err = validate_binary_formats(&columns, &formats).unwrap_err();
+        assert_eq!(
+            err,
+            BinaryFormatError::UnsupportedType { column_index: 0 },
+            "ty={ty:?}"
+        );
+        assert_eq!(err.error_class().wire_code(), "0A000", "ty={ty:?}");
+    }
 }
 
 #[test]

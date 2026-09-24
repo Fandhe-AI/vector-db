@@ -216,13 +216,36 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
         }
         // タグ 3〜6 は INTEGER/BIGINT/REAL/DOUBLE（別 Issue の作業）向けに予約し、
         // BOOLEAN は TABLE-13 の宣言順で 7 とする（Issue #883。他の型と衝突しない
-        // 新規タグ）。
+        // 新規タグ）。8〜9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約する。
+        // NUMERIC は当初宣言順の 10 を想定していたが、base（main）マージ取り込みで
+        // ARRAY（Issue #888）がタグ 10 を先に使用していたため、Issue #885 の
+        // origin/main への rebase 時点（NUMERIC の content_hash はまだ一度も
+        // 永続化されていないため後方互換の懸念なし）で衝突しない未使用タグ 14 へ
+        // 採番し直した（ENUM のタグ 13 の次点）。ハッシュ対象は束縛後の正規値
+        // （`scale` + `unscaled`）のため、同一列へ再送された `1.10` と `1.1` は
+        // 同一ハッシュ（`23505`）に収束する。
+        Value::Numeric(d) => {
+            b.push_u8(14);
+            b.push_u8(d.scale());
+            b.push_bytes(&d.unscaled().to_le_bytes())?;
+        }
         Value::Bool(b_val) => {
             b.push_u8(7);
             b.push_u8(u8::from(*b_val));
         }
-        // タグ 8・9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約し、配列列
-        // （TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
+        // DATE は宣言順で 8、TIMESTAMP は 9 とする（Issue #884・D-3。TABLE-13 の
+        // 宣言順規則を踏襲し、他の型タグと衝突しない新規タグ）。負値も含め
+        // ビット列をそのまま連結するため、`i32`/`i64` を符号保存のまま `u64` へ
+        // 変換して既存の `push_u64` を再利用する。
+        Value::Date(days) => {
+            b.push_u8(8);
+            b.push_u64(i64::from(*days) as u64);
+        }
+        Value::Timestamp(micros) => {
+            b.push_u8(9);
+            b.push_u64(*micros as u64);
+        }
+        // 配列列（TABLE-14・Issue #888）は 10 とする。要素型タグ・要素数・各要素を
         // 積むことで、`{ab}`（1 要素）と `{a,b}`（2 要素）のような表記ゆれが
         // 衝突しない単射なハッシュ入力にする。
         Value::Array(array_value) => {
@@ -251,6 +274,31 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
         Value::Bytes(bytes) => {
             b.push_u8(11);
             b.push_bytes(bytes)?;
+        }
+        // JSON／JSONB は共通の Value::Json 表現を持つため（Issue #889 D2）、
+        // 表層横断で同一の再送判定（`23505`／`22023`）を得るためにはハッシュ入力も
+        // 同じタグ・同じテキストで揃う必要がある。タグ 12 は未使用のため確保する
+        // （TABLE-13/14 の宣言順に沿った次点）。
+        Value::Json(text) => {
+            b.push_u8(12);
+            b.push_bytes(text.as_bytes())?;
+        }
+        // ENUM 値は TABLE-14 の宣言順で JSON／JSONB（タグ 12）の次点となる
+        // タグ 13 とする（Issue #890。base の想定タグ 12 は本マージで JSON と
+        // 衝突するため採番し直した）。TEXT と同じ長さ前置方式だが、型タグの
+        // 違いだけで TEXT・JSON とハッシュを区別する。
+        Value::Enum(label) => {
+            b.push_u8(13);
+            b.push_bytes(label.as_bytes())?;
+        }
+        // UUID 値は TABLE-13〔検討中〕・TASK-197、Issue #887。タグ 14 は
+        // NUMERIC（Issue #885）が使用済みのため、次点の未使用タグ 15 を
+        // 確保する。ハッシュ対象は束縛後の正規値（16 バイト生値）のため、
+        // 同一列への大文字・小文字違いの同一値再送は同一ハッシュ（`23505`）に
+        // 収束する。
+        Value::Uuid(u) => {
+            b.push_u8(15);
+            b.push_raw(u.as_bytes());
         }
     }
     Ok(())
@@ -809,6 +857,15 @@ fn push_dml_assignments(
                 b.push_u8(3);
                 b.push_u8(u8::from(*v));
             }
+            // `InsertLiteral::Null`（Issue #889 レビュー指摘・PR #1014。
+            // `bind_set_assignments` が nullable 列向けに追加した SQL `NULL`
+            // 表現）。述語つき `UPDATE ... WHERE`（本関数の呼び出し元）は
+            // 現状 NoSQL 表層から到達しない（`filter` 形は Issue #871 実行結線
+            // 対象だが NULL 対応は本 Issue のスコープ外）ため実質未到達だが、
+            // 上部コメントが予告する前方ガードとしてタグ 4 を割り当てる。
+            InsertLiteral::Null => {
+                b.push_u8(4);
+            }
         }
     }
     Ok(())
@@ -1043,6 +1100,19 @@ mod tests {
         assert_ne!(bytes_hash, text_hash);
     }
 
+    // ENUM（タグ 13）と TEXT（タグ 1）は本体バイト列が完全一致していても
+    // 型タグの違いだけで別ハッシュになる（Issue #890。golden な区別の固定）。
+    #[test]
+    fn enum_and_text_values_produce_different_hashes_even_with_matching_bytes() {
+        let enum_value = Value::Enum("happy".to_string());
+        let text_value = Value::Text("happy".to_string());
+        let enum_hash = for_typed_insert(1, Visibility::Public, &[], &[("mood", &enum_value)])
+            .expect("hash enum");
+        let text_hash = for_typed_insert(1, Visibility::Public, &[], &[("mood", &text_value)])
+            .expect("hash text");
+        assert_ne!(enum_hash, text_hash);
+    }
+
     // 同一の BYTEA 値からは同じハッシュが再現する（再送判定の前提）。
     #[test]
     fn bytea_hash_is_reproducible_for_identical_content() {
@@ -1059,6 +1129,39 @@ mod tests {
         let b = Value::Bytes(vec![0xbe, 0xef]);
         let hash_a = for_typed_insert(1, Visibility::Public, &[], &[("blob", &a)]).expect("hash a");
         let hash_b = for_typed_insert(1, Visibility::Public, &[], &[("blob", &b)]).expect("hash b");
+        assert_ne!(hash_a, hash_b);
+    }
+
+    // JSON（タグ 12）と TEXT（タグ 1）は本体バイト列が偶然一致していても
+    // 型タグの違いだけで別ハッシュになる（Issue #889。golden な区別の固定）。
+    #[test]
+    fn json_and_text_values_produce_different_hashes_even_with_matching_bytes() {
+        let json_value = Value::Json("{}".to_string());
+        let text_value = Value::Text("{}".to_string());
+        let json_hash = for_typed_insert(1, Visibility::Public, &[], &[("doc", &json_value)])
+            .expect("hash json");
+        let text_hash = for_typed_insert(1, Visibility::Public, &[], &[("doc", &text_value)])
+            .expect("hash text");
+        assert_ne!(json_hash, text_hash);
+    }
+
+    // 同一の JSON テキストからは同じハッシュが再現する（再送判定の前提）。
+    #[test]
+    fn json_hash_is_reproducible_for_identical_content() {
+        let value = Value::Json(r#"{"a":1}"#.to_string());
+        let h1 = for_typed_insert(1, Visibility::Public, &[], &[("doc", &value)]).expect("hash 1");
+        let h2 = for_typed_insert(1, Visibility::Public, &[], &[("doc", &value)]).expect("hash 2");
+        assert_eq!(h1, h2);
+    }
+
+    // JSON テキストが異なれば（空白のみの差であっても）ハッシュも異なる
+    // （JSON 列は入力テキストを保持する契約のため。内容不一致検出の前提）。
+    #[test]
+    fn different_json_values_produce_different_hashes() {
+        let a = Value::Json(r#"{"a":1}"#.to_string());
+        let b = Value::Json(r#"{"a": 1}"#.to_string());
+        let hash_a = for_typed_insert(1, Visibility::Public, &[], &[("doc", &a)]).expect("hash a");
+        let hash_b = for_typed_insert(1, Visibility::Public, &[], &[("doc", &b)]).expect("hash b");
         assert_ne!(hash_a, hash_b);
     }
 
@@ -1988,5 +2091,51 @@ mod tests {
             h_empty, h_populated,
             "UDF section must be omitted entirely when no UDF is referenced by WHERE"
         );
+    }
+
+    /// NUMERIC 値（TABLE-13〔検討中〕・TASK-197、Issue #885・D7）のハッシュは、
+    /// 正規化後の値（scale + unscaled）だけで決まる。表記が異なっても
+    /// 正規値が一致すれば同一ハッシュ、正規値が異なれば別ハッシュになる
+    /// （`operation_id` 再送判定の `23505`／`22023` 分岐の土台）。
+    #[test]
+    fn push_value_numeric_hash_depends_only_on_normalized_value() {
+        let mut b1 = HashInputBuilder::new(OpTag::Insert);
+        push_value(
+            &mut b1,
+            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 2).expect("valid scale")),
+        )
+        .expect("push numeric");
+        let h1 = b1.finish();
+
+        // 同じ正規値（1.50）を異なる unscaled/scale の組み合わせで表現しても、
+        // 実際にはスキーマの scale が固定されているため通常は起こらないが、
+        // ハッシュ自体は入力バイト列に忠実であることを確認する（scale が異なれば
+        // 別ハッシュ）。
+        let mut b2 = HashInputBuilder::new(OpTag::Insert);
+        push_value(
+            &mut b2,
+            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 2).expect("valid scale")),
+        )
+        .expect("push numeric");
+        let h2 = b2.finish();
+        assert_eq!(h1, h2, "identical normalized value must hash identically");
+
+        let mut b3 = HashInputBuilder::new(OpTag::Insert);
+        push_value(
+            &mut b3,
+            &Value::Numeric(crate::numeric::Decimal::from_parts(200, 2).expect("valid scale")),
+        )
+        .expect("push numeric");
+        let h3 = b3.finish();
+        assert_ne!(h1, h3, "differing normalized value must not collapse");
+
+        let mut b4 = HashInputBuilder::new(OpTag::Insert);
+        push_value(
+            &mut b4,
+            &Value::Numeric(crate::numeric::Decimal::from_parts(150, 3).expect("valid scale")),
+        )
+        .expect("push numeric");
+        let h4 = b4.finish();
+        assert_ne!(h1, h4, "differing scale must not collapse to the same hash");
     }
 }

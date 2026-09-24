@@ -193,7 +193,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 16] = [
+const EXPECTED_STATUS: [(&str, u16); 18] = [
     ("22000", 400),
     ("28P01", 401),
     ("28000", 401),
@@ -210,6 +210,8 @@ const EXPECTED_STATUS: [(&str, u16); 16] = [
     ("XX000", 500),
     ("22003", 400),
     ("22023", 400),
+    ("22008", 400),
+    ("22P02", 400),
 ];
 
 /// (a)〜(f) 全類型の共通アサーション: `wire_code` が逆引き可能・射影ステータス
@@ -268,7 +270,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 16);
+const _: () = assert!(ErrorClass::ALL.len() == 18);
 
 #[test]
 fn err4_projection_table_is_closed_over_all_error_classes() {

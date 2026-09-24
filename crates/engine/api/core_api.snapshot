@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod chunking;
 pub mod core;
 pub mod crypto;
+pub mod datetime;
 pub mod declarative_filter;
 pub mod dictionary;
 pub mod dispatch;
@@ -23,6 +24,7 @@ pub mod incremental;
 pub mod isa;
 pub mod json;
 pub mod kernel;
+pub mod numeric;
 pub mod parallel_search;
 pub mod policy;
 pub mod precision;
@@ -39,6 +41,7 @@ pub mod storage;
 pub mod tenant;
 pub mod tiering;
 pub mod txn;
+pub mod uuid;
 pub mod wasm_udf;
 
 # source: crates/engine/src/core.rs :: VectorCore
@@ -257,6 +260,9 @@ pub enum CatalogError {
     RowNotFound(u64),
     IncompatibleRowKeyFormat,
     TableGenerationCounterOverflow,
+    TypeNotFound(String),
+    TypeAlreadyExists(String),
+    DependentObjectsStillExist(String),
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError

@@ -3835,6 +3835,10 @@ impl EngineCore {
                     }
                     // BOOLEAN 値は行コーデック上 1 バイト固定（Issue #883・D-a）。
                     crate::row_codec::Value::Bool(_) => 1,
+                    // DATE／TIMESTAMP 値は行コーデック上それぞれ 4／8 バイト固定
+                    // （Issue #884・D-3）。
+                    crate::row_codec::Value::Date(_) => 4,
+                    crate::row_codec::Value::Timestamp(_) => 8,
                     // 配列値（Issue #888）は実際の行コーデック（`row_codec::
                     // scalar_array_entry_len`）が書き込むフレーム込みの全
                     // エンコード長をそのまま使う（presence(1)・flags(1)・
@@ -3862,6 +3866,17 @@ impl EngineCore {
                     // BYTEA は TEXT と同じく本体長のみを数える（フレーミングの
                     // オーバーヘッドは他の値種別も同様に含めていないため対称、Issue #886）。
                     crate::row_codec::Value::Bytes(b) => b.len(),
+                    // JSON／JSONB も TEXT と同じく本体長のみを数える（Issue #889）。
+                    crate::row_codec::Value::Json(s) => s.len(),
+                    // ENUM 値はラベル文字列の本体長のみを数える（TEXT と同じ
+                    // フレーミング。Issue #890）。
+                    crate::row_codec::Value::Enum(s) => s.len(),
+                    // NUMERIC 値は presence を除く `unscaled`（i128 LE）分の
+                    // 16 バイト固定（TABLE-13〔検討中〕・TASK-197、Issue #885）。
+                    crate::row_codec::Value::Numeric(_) => 16,
+                    // UUID 値は presence を除く 16 バイト固定生値
+                    // （TABLE-13〔検討中〕・TASK-197、Issue #887）。
+                    crate::row_codec::Value::Uuid(_) => 16,
                 };
                 row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
                     crate::sql::allowlist::SqlSurfaceError::payload_too_large(

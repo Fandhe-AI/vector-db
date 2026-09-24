@@ -522,8 +522,10 @@ impl ScalarIndex {
         col_nonnull_count.resize(column_count, 0);
 
         for (col_index, column) in schema.columns.iter().enumerate() {
-            match column.ty {
-                ColumnType::Text => {
+            match &column.ty {
+                // ENUM 列は TEXT と同じ辞書表現を共有する（Issue #890 D3。
+                // ラベルは短いため平均値長ゲートで除外されることは実質ない）。
+                ColumnType::Text | ColumnType::Enum(_) => {
                     // `acc` は 1 行につき列あたり高々 1 値しか追加されないため
                     // `row_count` が確保上限になる。倍増などの成長戦略による
                     // 余剰確保を避けるため、行走査を始める前に必要量ちょうどを
@@ -545,13 +547,30 @@ impl ScalarIndex {
                 // `VECTOR` 列・`BOOLEAN` 列はいずれも索引対象外（BOOLEAN は
                 // Issue #883・D-e。値域が 2 値のため索引化コストに見合わず、
                 // 対応述語 `BoolEquals` は常に plain scan——`scalar_plan.rs`
-                // 参照——のまま据え置く）。`ARRAY` 列（TABLE-14・Issue #888）・
-                // `BYTEA` 列（Issue #886）もいずれも等価・前方一致述語を
-                // 持たないため同じく非索引化。
+                // 参照——のまま据え置く）。`DATE`／`TIMESTAMP` 列も同じ理由で
+                // 索引対象外（TABLE-13・TASK-197、Issue #884。等価・範囲述語
+                // 自体が未実装〔Issue #891〕のため索引化する対応述語がまだ無い）。
+                // `NUMERIC` 列も同じく索引対象外（本索引が TEXT 列の等価・
+                // 前方一致向け辞書索引のみを対象とする設計であり、WHERE 述語
+                // 自体が束縛時点で NUMERIC 列を拒否済み〔TABLE-13〔検討中〕・
+                // TASK-197、Issue #885〕のため到達しない）。`ARRAY` 列
+                // （TABLE-14・Issue #888）・`BYTEA` 列（Issue #886）・
+                // `JSON`／`JSONB` 列（TABLE-14・Issue #889。拡張は Issue #893 へ
+                // 申し送り）もいずれも等価・前方一致述語を持たないため同じく
+                // 非索引化。
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
+                | ColumnType::Date
+                | ColumnType::Timestamp
                 | ColumnType::Array(_)
-                | ColumnType::Bytea => per_column.push(None),
+                | ColumnType::Bytea
+                | ColumnType::Json
+                | ColumnType::Jsonb
+                | ColumnType::Numeric { .. }
+                // `UUID` 列も同じ理由で索引対象外（等価述語自体が束縛時点で
+                // UUID 列を拒否済み〔TABLE-13〔検討中〕・TASK-197、Issue #887・
+                // U9〕のため到達しない。二次索引化は #893 へ申し送り）。
+                | ColumnType::Uuid => per_column.push(None),
             }
         }
 
@@ -573,9 +592,13 @@ impl ScalarIndex {
                 if !is_indexed_column {
                     continue;
                 }
-                // 索引対象列は常に `TEXT`（上記の列単位除外により `BOOLEAN`／
-                // `VECTOR` は `per_column[col_index] == None` のまま到達しない）。
-                let Some(v) = v.as_text() else { continue };
+                // 索引対象列は常に `TEXT`／`ENUM`（上記の列単位除外により
+                // `BOOLEAN`／`VECTOR`／`BYTEA` は `per_column[col_index] == None`
+                // のまま到達しない）。`as_dictionary_text` で両者を同じ辞書
+                // 表現として扱う（Issue #890 D3）。
+                let Some(v) = v.as_dictionary_text() else {
+                    continue;
+                };
                 let v_len = v.len();
                 let (Some(&running), Some(&nonnull)) = (
                     col_running_bytes.get(col_index),
