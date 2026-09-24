@@ -9,10 +9,10 @@
 //! `ledger::record_in_txn` が「同一 `operation_id`・同一内容の再送（`23505`）」と
 //! 「同一 `operation_id`・内容不一致の誤用（`22023`）」を区別できるようにする。
 //!
-//! SHA-256 の実体は [`crate::sha256`]（Issue #956 で切り出し・公開化。以前は
-//! 本モジュールが `unsafe` 不使用の自作実装を非公開で抱えていた）を利用する。
-//! ハッシュ入力バイト列のレイアウト・出力値は切り出しの前後で完全に不変
-//! （移設した FIPS 180-4／NIST テストベクタは `crate::sha256` 側で機械検証する）。
+//! 依存追加なし: 本タスクは自動運転で実行されユーザー承認を得られないため、
+//! 依存追加（`.claude/rules/dependency-policy.md`）を避ける安全側の判断として
+//! SHA-256 をこのモジュール内で安全 Rust により自作実装する（`unsafe` 不使用）。
+//! FIPS 180-4 の公開テストベクタで正当性を機械検証する（下部 `tests` モジュール）。
 //!
 //! ## 正規化（canonical 化）の方針
 //!
@@ -48,11 +48,6 @@
 
 use crate::crypto::sha256::Sha256;
 use crate::row_codec::Value;
-#[cfg(test)]
-use crate::sha256::digest as sha256;
-#[cfg(test)]
-use crate::sha256::reference_digest as sha256_reference;
-use crate::sha256::Sha256;
 #[cfg(test)]
 use crate::storage::{encode_row, RowInput};
 use crate::storage::{StorageError, Visibility};

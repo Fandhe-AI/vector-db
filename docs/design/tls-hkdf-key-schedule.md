@@ -21,7 +21,7 @@ transcript hash の蓄積・Finished の verify_data 計算（#964）、
 照合ハッシュ専用に非公開実装していた（TASK-101・RECOVER-10。
 Issue #399 でストリーミング化）。本 Issue で `crates/engine/src/sha256.rs`
 として切り出し `pub mod sha256;` で公開し、wire-server から
-`engine::sha256::{Sha256, digest, DIGEST_LEN, BLOCK_LEN}` を利用する
+`engine::crypto::sha256::{Sha256, digest}`（`DIGEST_LEN`/`BLOCK_LEN` は crypto::sha256 が公開定数を持たないため tls::hkdf 側で定義） を利用する
 （外部クレート追加なし・ハッシュ入力バイト列のレイアウト・既存
 content_hash 値は不変）。wire-server 側に SHA-256 を再実装すると
 「再利用」の要件に反しコードも重複するため、この切り出しを採る。
@@ -89,7 +89,7 @@ TrafficSecret::finished_key() -> Secret32
   データ長・`L` といった呼び出し時点で確定する公開値にのみ依存し、
   秘密値のビットに依存する分岐・ループ回数は持たない。
 - 秘密値を添字にしたテーブル参照は行わない（HMAC のラウンド定数
-  参照は `engine::sha256` 側でラウンド番号 `t` という公開値のみを
+  参照は `engine::crypto::sha256` 側でラウンド番号 `t` という公開値のみを
   添字にする。`tls/x25519.rs` と同じ設計方針）。
 - 秘密値どうしの比較（Finished 検証等）は本 Issue では実装しない。
   定数時間比較は #964 が別途用意する。
@@ -111,8 +111,8 @@ RFC の公開テキストから正確に転記した値で機械検証した（�
 - `crates/wire-server/tests/tls_key_schedule_rfc8448.rs`（公開 API の
   みを使った結合テスト）: X25519 鍵交換 → 鍵スケジュール一連の呼び出し
   列に加え、ClientHello‖ServerHello（RFC 8448 記載バイト列）の
-  `engine::sha256::digest` が記載の transcript hash と一致すること
-  （ブロック境界をまたぐ実データでの `engine::sha256` 公開 API 検証を
+  `engine::crypto::sha256::digest` が記載の transcript hash と一致すること
+  （ブロック境界をまたぐ実データでの `engine::crypto::sha256` 公開 API 検証を
   兼ねる）
 
 ## 残余リスク・申し送り（#971 監査への申し送り）

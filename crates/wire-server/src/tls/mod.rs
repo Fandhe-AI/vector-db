@@ -15,7 +15,7 @@
 //!   一切持たない（`record` のドキュメンテーションコメントを参照）
 //! - [`hkdf`]: HMAC-SHA-256（RFC 2104）・HKDF-Extract/Expand（RFC 5869）・
 //!   `HKDF-Expand-Label`／`Derive-Secret`（RFC 8446 §7.1）の原始操作
-//!   （Issue #956）。ハッシュ本体は `engine::sha256` を再利用する
+//!   （Issue #956）。ハッシュ本体は `engine::crypto::sha256`（SCRAM-SHA-256 認証・Issue #940 が切り出し済み）を再利用する
 //! - [`key_schedule`]: TLS 1.3 鍵スケジュール本体（RFC 8446 §7.1。Issue #956）。
 //!   Early → Handshake → Master の secret 遷移と各段の traffic secret／
 //!   key／iv 導出を型状態で提供する

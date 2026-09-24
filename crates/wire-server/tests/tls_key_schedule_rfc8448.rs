@@ -9,7 +9,7 @@
 //! 一連の流れを 1 本の呼び出し列として固定する。あわせて、
 //! ClientHello‖ServerHello（RFC 8448 記載バイト列）の SHA-256 が
 //! トレース記載の transcript hash と一致することも確認し、
-//! `engine::sha256` の公開 API がブロック境界をまたぐ実データでも
+//! `engine::crypto::sha256` の公開 API がブロック境界をまたぐ実データでも
 //! 正しく動作することを固定する。
 
 use wire_server::tls::hkdf::HASH_LEN;
@@ -76,7 +76,7 @@ fn rfc8448_simple_1rtt_handshake_key_schedule_matches_trace() {
     );
     let mut transcript = client_hello;
     transcript.extend_from_slice(&server_hello);
-    let th_ch_sh = engine::sha256::digest(&transcript);
+    let th_ch_sh = engine::crypto::sha256::digest(&transcript);
     assert_eq!(
         hex(&th_ch_sh),
         "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"

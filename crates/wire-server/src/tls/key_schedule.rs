@@ -53,7 +53,7 @@ impl EarlySecret {
     /// `self` を消費するため、同じ Early secret から二度 handshake secret を
     /// 導出することはできない（型状態による誤用防止）。
     pub fn into_handshake(self, ecdhe: &SharedSecret) -> Result<HandshakeSecret, HkdfError> {
-        let empty_hash = engine::sha256::digest(b"");
+        let empty_hash = engine::crypto::sha256::digest(b"");
         let derived = derive_secret(self.0.as_bytes(), b"derived", &empty_hash)?;
         let hs = super::hkdf::hkdf_extract(derived.as_bytes(), ecdhe.as_bytes());
         Ok(HandshakeSecret(hs))
@@ -91,7 +91,7 @@ impl HandshakeSecret {
     /// `Extract(derived, 0)` を計算し、Master secret へ遷移する。`self` を
     /// 消費するため、Handshake secret はこの遷移後に再利用できない。
     pub fn into_master(self) -> Result<MasterSecret, HkdfError> {
-        let empty_hash = engine::sha256::digest(b"");
+        let empty_hash = engine::crypto::sha256::digest(b"");
         let derived = derive_secret(self.0.as_bytes(), b"derived", &empty_hash)?;
         let zero_ikm = [0u8; HASH_LEN];
         let master = super::hkdf::hkdf_extract(derived.as_bytes(), &zero_ikm);

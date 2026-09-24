@@ -3,10 +3,12 @@
 //! （TASK-228・WIRE-9・HTTP-10 ポインタ。Issue #956・親 #941）。
 //!
 //! 対象暗号スイートは `TLS_AES_128_GCM_SHA256` のみ（親 Issue #941 の方針）の
-//! ため、ハッシュ関数は SHA-256（[`engine::sha256`]）に固定する。ここでは
-//! 原始操作のみを置き、TLS 1.3 の鍵スケジュール本体（Early/Handshake/Master
-//! secret の遷移・traffic secret／key／iv の導出）は [`super::key_schedule`]
-//! が担う。
+//! ため、ハッシュ関数は SHA-256（[`engine::crypto::sha256`]）に固定する。
+//! SHA-256 の実体は SCRAM-SHA-256 認証（Issue #940・WIRE-18）が engine の
+//! 公開 API へ切り出し済みのものをそのまま再利用し、本モジュールが独自の
+//! SHA-256 実装を持つことはない。ここでは原始操作のみを置き、TLS 1.3 の
+//! 鍵スケジュール本体（Early/Handshake/Master secret の遷移・traffic
+//! secret／key／iv の導出）は [`super::key_schedule`] が担う。
 //!
 //! 定数時間性の設計:
 //! - ラウンド数・ブロック数・出力長はすべて呼び出し時点で確定する公開値
@@ -18,12 +20,16 @@
 //!   `unsafe`（`write_volatile` 等）を使わないため最適化により消去が省略され
 //!   ない保証はない（[`super::x25519::SharedSecret`] と同じ限界）。
 
-use engine::sha256::{Sha256, BLOCK_LEN, DIGEST_LEN};
+use engine::crypto::sha256::{digest, Sha256};
 use std::fmt;
 
-/// HKDF/HMAC が対象とするハッシュの出力長。SHA-256 固定のため
-/// [`engine::sha256::DIGEST_LEN`] と常に一致する。
-pub const HASH_LEN: usize = DIGEST_LEN;
+/// HKDF/HMAC が対象とするハッシュの出力長。SHA-256 固定のため常に 32。
+pub const HASH_LEN: usize = 32;
+
+/// SHA-256 の処理ブロック長（バイト）。HMAC の鍵パディング計算で
+/// ブロック境界を意識する必要があるためここで固定する
+/// （[`engine::crypto::sha256`] は公開定数を持たないため本モジュールで定義する）。
+const BLOCK_LEN: usize = 64;
 
 /// バイト列を Drop 時に best-effort でゼロ化する（`unsafe` なしのため最適化で
 /// 消去が省略されない保証はない旨は呼び出し元のドキュメントに委ねる）。
@@ -67,14 +73,14 @@ impl Drop for Secret32 {
 /// 連結用のヒープ確保をせずに複数フィールドを渡せるようにする
 /// （[`super::key_schedule`] の `HkdfLabel` 組み立てがこの形を使う）。
 ///
-/// 鍵が [`engine::sha256::BLOCK_LEN`]（64 バイト）を超える場合は先に SHA-256 で
-/// 縮める（RFC 2104 の規定どおり。鍵長は呼び出し時点で分かる公開値のため、
+/// 鍵がブロック長（64 バイト）を超える場合は先に SHA-256 で縮める
+/// （RFC 2104 の規定どおり。鍵長は呼び出し時点で分かる公開値のため、
 /// この分岐は秘密値に依存しない）。ipad/opad 用の鍵ブロック（スタック上の
 /// 固定長配列）は使い終わったら [`zeroize`] する。
 pub fn hmac_sha256(key: &[u8], data: &[&[u8]]) -> [u8; HASH_LEN] {
     let mut key_block = [0u8; BLOCK_LEN];
     if key.len() > BLOCK_LEN {
-        let hashed = engine::sha256::digest(key);
+        let hashed = digest(key);
         if let Some(slot) = key_block.get_mut(..hashed.len()) {
             slot.copy_from_slice(&hashed);
         }
