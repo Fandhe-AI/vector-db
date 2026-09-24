@@ -451,11 +451,18 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
 /// 部分フレームを絶対に残さない）。
 ///
 /// 全列テキスト形式（format code 0）の薄いラッパーで、
-/// [`encode_data_row_into_with_formats`] を呼ぶ（既存呼び出し元・テストとの
-/// 互換のため残す。生成バイト列は完全に同一。WIRE-14・Issue #936）。
+/// [`encode_data_row_body`] を「全列テキスト」の形式解決関数付きで呼ぶ
+/// （既存呼び出し元・テストとの互換のため残す。生成バイト列は完全に同一。
+/// WIRE-14・Issue #936）。
+///
+/// 呼び出しのたびに `formats` 用の `Vec<FormatCode>` を新規確保していた
+/// 旧実装（[`encode_data_row_into_with_formats`] 経由）は、結果行数に
+/// 比例したヒープ確保を発生させ「行ごとの `Vec<u8>` 確保を避ける」
+/// （Issue #481）の最適化を損なっていたため、形式コードを列インデックスから
+/// 直接解決する [`encode_data_row_body`] を共有する形へ変更した
+/// （codex-review 指摘・PR #998）。
 pub fn encode_data_row_into(row: &ResultRow, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-    let formats = vec![FormatCode::Text; row.cells.len()];
-    encode_data_row_into_with_formats(row, &formats, out)
+    encode_data_row_body(row, out, |_| FormatCode::Text)
 }
 
 /// `DataRow`（'D'）を列ごとの [`FormatCode`] を反映して `out` の末尾へ追記する
@@ -475,10 +482,32 @@ pub fn encode_data_row_into_with_formats(
     formats: &[FormatCode],
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
-    let start = out.len();
     if row.cells.len() != formats.len() {
         return Err(EncodeError);
     }
+    // `formats` は呼び出し元内部で長さ一致を確認済みだが、添字アクセス
+    // （`[]`）は使わず `get` で明示的に処理する（coding-rust 規約）。
+    encode_data_row_body(row, out, |i| {
+        formats.get(i).copied().unwrap_or(FormatCode::Text)
+    })
+}
+
+/// [`encode_data_row_into`]／[`encode_data_row_into_with_formats`] が共有する
+/// フレーム組み立て本体。`format_at(i)` は `row.cells` の列インデックス `i`
+/// に対する形式コードを返す（全列テキストの呼び出し元は割り当てなしの
+/// 定数クロージャを渡せる）。
+///
+/// **失敗時は `out` を呼び出し前の長さへ必ず `truncate` してから返す**
+/// （部分フレームを絶対に残さない）。
+fn encode_data_row_body<F>(
+    row: &ResultRow,
+    out: &mut Vec<u8>,
+    format_at: F,
+) -> Result<(), EncodeError>
+where
+    F: Fn(usize) -> FormatCode,
+{
+    let start = out.len();
     let field_count = match i16::try_from(row.cells.len()) {
         Ok(n) => n,
         Err(_) => {
@@ -493,8 +522,8 @@ pub fn encode_data_row_into_with_formats(
         out.extend_from_slice(&0i32.to_be_bytes());
         let body_start = out.len();
         out.extend_from_slice(&field_count.to_be_bytes());
-        for (cell, format) in row.cells.iter().zip(formats.iter()) {
-            match format {
+        for (i, cell) in row.cells.iter().enumerate() {
+            match format_at(i) {
                 FormatCode::Text => match cell_to_text(cell)? {
                     None => out.extend_from_slice(&(-1i32).to_be_bytes()),
                     Some(text) => {
