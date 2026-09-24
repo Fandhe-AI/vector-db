@@ -521,3 +521,96 @@ SQL の `CREATE TYPE ... AS ENUM`／`ALTER TYPE`／`DROP TYPE` 構文と
 型名整備（#896）、ENUM の宣言順比較・`ORDER BY`・`IN`・`IS [NOT] NULL`・
 `GROUP BY` キー、BOOLEAN／BYTEA の型不一致を `22P02` へ再分類する件
 （#897・TASK-227）、ENUM 配列（ARRAY #888 との組み合わせ）。
+
+## #885 追記: NUMERIC / DECIMAL 列型
+
+TABLE-13〔検討中〕・TASK-197（Issue #885）で `ColumnType::Numeric { precision,
+scale }` を追加した。`DECIMAL` は別名として扱うだけで、カタログの型タグは
+`"numeric"` の 1 つに固定する（第 2 のタグは作らない）。外部クレートは使わず
+自作実装（オーナー判断・dependency-policy）。
+
+- **内部表現**（`crates/engine/src/numeric.rs::Decimal`）: `unscaled: i128`・
+  `scale: u8` の対で `unscaled × 10^-scale` を表す。`10^38 − 1 < i128::MAX`
+  をコンパイル時 `assert!` で固定し、`POW10` 参照表を持つ。`unscaled == 0`
+  は常に非負へ正規化する（`-0.00` を持たない）。
+- **カタログ**: 型タグ `"numeric"`・`param` は `"p,s"`（例: `"10,2"`）。
+  `1 <= precision <= 38`・`0 <= scale <= precision` を encode・decode 両側で
+  検証する（`validate_numeric_precision_scale`）。decode 側は `parse_numeric_param`
+  がカンマ 1 個・両要素とも ASCII 数字のみの `u8`・再 encode 一致（先頭ゼロ等
+  の非正規形を拒否）まで厳格に検証する。
+- **行バイト表現**: presence タグに続く `unscaled` の `i128` LE 16 バイト固定
+  （`SCALAR_NUMERIC_ENTRY_LEN = 17`）。`scale` は行に持たずカタログの列型のみ
+  を正とする（BOOLEAN の 1 バイト固定と同じ設計方針の延長）。この設計の帰結
+  として、将来 `p` だけを拡大する `ALTER COLUMN TYPE`（#901）は行の書き換え
+  なしで実現できるが、`scale` を変える変換は行の書き換えを要する。
+- **丸め規則**: 束縛時に列の `scale` へ half away from zero で丸める
+  （PostgreSQL numeric と互換。`1.005` → `1.01`、`-1.005` → `-1.01`）。丸め後
+  の整数部が `precision - scale` 桁を超えたら `22003`（`999.995` →
+  丸め後 `1000.00` は `NUMERIC(5,2)` では桁あふれ）。整数部の先頭ゼロは
+  有効桁に数えない（`NUMERIC(38,38)` へ `0.999...9`〔38 桁〕を通すために
+  必要）。
+- **リテラル文法**: `InsertLiteral::Number`（数値トークン）・
+  `InsertLiteral::String`（文字列リテラル）の両方を受理する
+  （`crates/engine/src/sql/parser.rs::bind_numeric_literal`。INSERT・UPDATE
+  ・UPSERT の 3 束縛経路が共有し、第 2 のパーサーを作らない）。文法は
+  `[+-]?(digits)?(\.digits?)?`（整数部・小数部の少なくとも一方に 1 桁以上。
+  `.5`・`5.` はいずれも受理）。空白・指数表記・`NaN`/`Infinity`・複数の `.`
+  は拒否する。入力長上限（`MAX_LITERAL_LEN = 1024` バイト）を解析前に検査
+  する（DoS 防止）。形式不正は `22000`（PostgreSQL の `22P02` 相当だが、
+  兄弟 Issue #881/#882 に新設の前例が無かったため既存の `22000` で代替。
+  #883 と同じ判断）。
+- **負数リテラル**（D6）: 字句解析器は `-1.5` を `Punct('-')` と
+  `Number("1.5")` に分けて出すため、`sql::allowlist::Parser::expect_literal`
+  へ「`-` の直後に `Number` が来たら符号を連結した `InsertLiteral::Number`」
+  の分岐を追加した（`InsertLiteral` の variant は増やさない）。この変更は
+  非 NUMERIC 列（`id`・TEXT・VECTOR・BOOLEAN）へ `-5` を与えた場合の
+  `wire_code` を `42601`（構文エラー）から `22000`（束縛時の型不一致）へ
+  変える（拒否されること自体は変わらない。#881 と同じ意図の差分）。
+- **content_hash**（D7）: `push_value` のタグは当初宣言順の `Numeric = 10`
+  を想定していたが、origin/main への rebase 取り込みで ARRAY（Issue #888）が
+  タグ 10 を先に使用していたため、衝突しない未使用タグ `Numeric = 14`
+  （Null=0／Text=1／Vector=2／Bool=7／Array=10／Bytes=11／Json=12／Enum=13 は
+  不変。3〜6 は INTEGER/BIGINT/REAL/DOUBLE、8〜9 は DATE/TIMESTAMP 向けに予約）
+  へ採番し直した（NUMERIC の content_hash はこの時点まで一度も永続化されて
+  いないため後方互換の懸念なし）。入力は `scale`（1 バイト）+ `unscaled`
+  （`i128` LE 16 バイト）で、束縛後の正規値に対してハッシュを取るため、
+  同一列への `1.10` と `1.1` の再送は同一内容（`23505`）に収束する。
+- **出力表現**（D8）: 正規テキストは「符号、整数部、（`scale > 0` のときのみ）
+  `.` とちょうど `scale` 桁にゼロ埋めした小数部」（`Decimal` の `Display`）。
+  `-0.50`・`-0.01`・`-1.00` 等の負数境界も含めて先頭ゼロ・指数表記・
+  trailing `-0` を持たない。wire の DataRow テキスト・HTTP JSON number
+  （bare number としてそのまま出力）の両方がこの正規テキストを共有する。
+- **集計**: `COUNT(<NUMERIC 列>)`（非 NULL 行数）のみ受理し、`SUM`/`AVG`/
+  `MIN`/`MAX` は `22000` で拒否する（`AggregateInput::NumericColumn`）。
+  `GROUP BY` キー列は既存のとおり TEXT 限定のため NUMERIC 列は構造的に
+  拒否される（変更不要）。
+- **WHERE・式・二次索引**: `declarative_filter::MetadataFilter::bind` は
+  当初 `!matches!(column.ty, ColumnType::Text)`／`Boolean` の否定判定により
+  NUMERIC 列も構造的に拒否できる想定だったが、origin/main への rebase 取り込み
+  （ARRAY・JSON/JSONB 列型）で当該判定が許可型を列挙する明示的な `match` へ
+  変わっていたため、`ColumnType::Numeric { .. }` の明示的な拒否腕を追加した
+  （網羅性はコンパイラが強制）。式中の列参照（`sql::udf_call`）・
+  `sql::scalar_index`（索引対象外）・`sql::scan`（DecodeTier 分類）・
+  `sql::using_plan`（本文列規約）はいずれも明示的な拒否・除外腕を追加した。
+- **wire-server**: `result_encoder.rs::cell_to_text`・`http/query/response.rs`
+  の JSON 出力に `Cell::Numeric` を追加。NoSQL `update` op の JSON `SET`
+  束縛（`http/query/update.rs`）は NUMERIC 列を対象外として明示的に拒否し
+  （`insert.rs` の既存ワイルドカード腕による拒否と対称。#883 が残した
+  insert/update の非対称を増やさない）、両表層とも fail-closed。
+- **RowDescription・HTTP 応答の型メタデータ**（PR #1020 codex-review 指摘）:
+  `result_encoder.rs::column_wire_type` が `ColumnMeta::Scalar{ty:
+  Numeric{..}}` を他の `Scalar` 列（`text` 固定）より先に判定し、`id` と同じ
+  `WireType::Numeric`（OID 1700・`"numeric"`）を公告する（`id` は別経路
+  〔`ColumnMeta::Id`〕のため OID 1700 の流用先が衝突することはない）。
+  値の実体（`Cell::Numeric` の正規テキスト）とテキスト形式での型公告は
+  この時点で一致する。バイナリ形式（format code 1）は引き続き
+  `column_binary_support` が fail-closed に非対応とし、対応拡大は #895 の
+  担当のまま。
+- 対象外（申し送り）: `22P02` の新設、WHERE 述語・式評価での NUMERIC 列
+  参照の受理（#891）、`SUM`/`AVG`/`MIN`/`MAX`（#892）、スカラー二次索引化
+  （#893）、`DecodeTier` の精査（#894）、NUMERIC 列のバイナリ形式対応
+  （#895）、NoSQL `insert`/`update` op での JSON 数値の完全な束縛対応
+  （#896）、回帰テストの集約（#897）、`ALTER COLUMN TYPE` による `p` の
+  拡大（#901）、SQL `CREATE TABLE` 構文での `NUMERIC`/`DECIMAL` 列宣言
+  （SQL-23 は未実装）、ファイル形 `INSERT`（`path`/`body` 列規約専用のため
+  NUMERIC 列は明示的に拒否）。
