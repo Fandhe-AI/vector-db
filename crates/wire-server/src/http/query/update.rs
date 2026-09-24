@@ -247,6 +247,14 @@ fn map_set_assignments(
                     "SET VECTOR column value must be a JSON array of numbers",
                 ))
             }
+            // BOOLEAN 列は JSON 真偽値のみ受理する（NOSQL-17 と同じ規則。
+            // Issue #883）。
+            (ColumnType::Boolean, JsonValue::Bool(b)) => InsertLiteral::Bool(*b),
+            (ColumnType::Boolean, _) => {
+                return Err(UpdateError::Set(
+                    "SET BOOLEAN column value must be a JSON boolean",
+                ))
+            }
         };
         assignments.push((key.clone(), literal));
     }

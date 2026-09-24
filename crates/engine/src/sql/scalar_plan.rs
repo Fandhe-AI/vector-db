@@ -128,6 +128,17 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
     if input.metadata_filters.is_empty() && input.expr_filters.is_empty() {
         return ScalarPlan::PlainScan;
     }
+    // BOOLEAN 列の等価述語が 1 つでも含まれる場合は索引経路へ進まない
+    // （`ScalarIndex::build` が BOOLEAN 列を索引対象から除外するため。
+    // `IndexConjunction` の複合述語に紛れ込んで誤って索引被覆済みと
+    // 判定されるのを防ぐ単一情報源。Issue #883・D-e）。
+    if input
+        .metadata_filters
+        .iter()
+        .any(|f| matches!(f.op(), crate::declarative_filter::FilterOp::BoolEquals(_)))
+    {
+        return ScalarPlan::PlainScan;
+    }
     let mut id_predicate_count = 0usize;
     for expr in input.expr_filters {
         if id_predicate_from_expr(expr).is_none() {
@@ -149,6 +160,12 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
         match input.metadata_filters[0].op() {
             crate::declarative_filter::FilterOp::Equals(_) => ScalarPlan::IndexEquality,
             crate::declarative_filter::FilterOp::StartsWith(_) => ScalarPlan::IndexPrefix,
+            // BOOLEAN 列の等価述語は索引化しない（`ScalarIndex::build` が
+            // BOOLEAN 列を索引対象から除外する。Issue #883・D-e）ため、常に
+            // plain scan へ倒す。`mask_trusted_defer`／`count_star_only`／
+            // `observe_group_count_only` が BOOLEAN 述語を「索引で完全被覆
+            // 済み」と誤って信頼しないための単一情報源での保証。
+            crate::declarative_filter::FilterOp::BoolEquals(_) => ScalarPlan::PlainScan,
         }
     }
 }
@@ -262,6 +279,7 @@ mod tests {
                 ColumnDef::new("embedding", ColumnType::Vector(2), false),
                 ColumnDef::new("c0", ColumnType::Text, true),
                 ColumnDef::new("c1", ColumnType::Text, true),
+                ColumnDef::new("flag", ColumnType::Boolean, true),
             ],
         )
     }
@@ -277,6 +295,48 @@ mod tests {
         )
         .expect("bind equals filter");
         bound.into_iter().next().expect("one filter")
+    }
+
+    fn bool_filter(column_index: usize, value: bool) -> MetadataFilter {
+        let schema = test_schema();
+        let bound = crate::declarative_filter::bind_all(
+            &[DeclarativeFilter::bool_equals(
+                schema.columns[column_index].name.clone(),
+                value,
+            )],
+            &schema,
+        )
+        .expect("bind bool_equals filter");
+        bound.into_iter().next().expect("one filter")
+    }
+
+    /// Issue #883・D-e: BOOLEAN 述語は単独でも複合述語の一部でも常に
+    /// `PlainScan` に分類される（`ScalarIndex::build` が BOOLEAN 列を索引化
+    /// しないため。`mask_trusted_defer`／`count_star_only`／
+    /// `observe_group_count_only` が BOOLEAN 述語を「索引で完全被覆済み」と
+    /// 誤って信頼しないことの単一情報源での固定）。
+    #[test]
+    fn plain_scan_for_single_bool_predicate() {
+        let filters = vec![bool_filter(3, true)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+    }
+
+    #[test]
+    fn plain_scan_when_bool_predicate_mixed_with_text_equality() {
+        // 複合述語（total >= 2）でも BOOLEAN 述語が 1 つでも含まれれば
+        // IndexConjunction へ進まない。
+        let filters = vec![eq_filter(1), bool_filter(3, false)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
 
     #[test]

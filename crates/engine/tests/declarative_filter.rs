@@ -13,7 +13,7 @@ use engine::core::EngineCore;
 use engine::declarative_filter::DeclarativeFilter;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
-use engine::row_codec::Value;
+use engine::row_codec::{ScalarRef, Value};
 use engine::sql::exec::QueryResult;
 use engine::storage::{Storage, Visibility};
 
@@ -461,13 +461,13 @@ fn ext3_rust_api_bind_and_match_directly() {
     let filter = DeclarativeFilter::starts_with("path", "src/")
         .bind(&schema)
         .expect("bind should succeed for a TEXT column");
-    assert!(filter.matches(Some("src/lib.rs")));
-    assert!(!filter.matches(Some("lib.rs")));
+    assert!(filter.matches(Some(ScalarRef::Text("src/lib.rs"))));
+    assert!(!filter.matches(Some(ScalarRef::Text("lib.rs"))));
     assert!(!filter.matches(None));
 
     let eq = DeclarativeFilter::equals("kind", "code")
         .bind(&schema)
         .expect("bind should succeed for a TEXT column");
-    assert!(eq.matches(Some("code")));
-    assert!(!eq.matches(Some("doc")));
+    assert!(eq.matches(Some(ScalarRef::Text("code"))));
+    assert!(!eq.matches(Some(ScalarRef::Text("doc"))));
 }

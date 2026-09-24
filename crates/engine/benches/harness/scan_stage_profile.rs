@@ -284,7 +284,10 @@ pub fn build_lang_filter(
 /// W2 段本体: `scan_scalar_columns` 済みの値へ `filters` を適用する薄いラッパー
 /// （`declarative_filter::matches_all` そのもの。呼び出し側の可読性のため
 /// 名前だけ用意する）。
-pub fn matches_lang_filter(filters: &[MetadataFilter], scanned: &[Option<&str>]) -> bool {
+pub fn matches_lang_filter(
+    filters: &[MetadataFilter],
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+) -> bool {
     declarative_filter::matches_all(filters, scanned)
 }
 
@@ -293,7 +296,7 @@ pub fn matches_lang_filter(filters: &[MetadataFilter], scanned: &[Option<&str>])
 pub fn scan_scalar_columns<'a>(
     schema: &engine::catalog::TableSchema,
     metadata: &'a [u8],
-) -> Result<Vec<Option<&'a str>>, ScanStageError> {
+) -> Result<Vec<Option<row_codec::ScalarRef<'a>>>, ScanStageError> {
     row_codec::scan_scalar_columns(schema, metadata)
         .map_err(|e| ScanStageError::Codec(e.to_string()))
 }

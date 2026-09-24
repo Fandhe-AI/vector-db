@@ -220,6 +220,9 @@ pub enum ColumnType {
     /// 固定次元の埋め込み列（`VECTOR(N)`、TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は
     /// encode・decode 両側で拒否する。
     Vector(u32),
+    /// 真偽値列（TABLE-13・TASK-196、Issue #883）。NULL と false は行バイト列・
+    /// 投影・述語評価のいずれでも区別する（[`crate::row_codec::Value::Bool`] 参照）。
+    Boolean,
 }
 
 impl ColumnType {
@@ -236,6 +239,7 @@ impl ColumnType {
         match self {
             ColumnType::Text => ("text", "-".to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
+            ColumnType::Boolean => ("boolean", "-".to_string()),
         }
     }
 
@@ -259,6 +263,14 @@ impl ColumnType {
                 })?;
                 validate_vector_dim(dim)?;
                 Ok(ColumnType::Vector(dim))
+            }
+            "boolean" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "boolean column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Boolean)
             }
             other => Err(CatalogError::Invalid(format!(
                 "unknown column type: {other:?}"
@@ -308,7 +320,7 @@ impl TableSchema {
     pub fn vector_dim(&self) -> Option<u32> {
         self.columns.iter().find_map(|c| match c.ty {
             ColumnType::Vector(dim) => Some(dim),
-            ColumnType::Text => None,
+            ColumnType::Text | ColumnType::Boolean => None,
         })
     }
 

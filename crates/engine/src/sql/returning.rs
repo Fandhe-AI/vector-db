@@ -159,6 +159,7 @@ pub(crate) fn project_row(
                     budget,
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
+                Some(Value::Bool(b)) => Cell::Bool(*b),
                 None => return Err(returning_bug("value index out of range")),
             },
             ProjectedColumn::Computed { .. } => {
