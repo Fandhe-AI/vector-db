@@ -287,14 +287,16 @@ fn max_rows_splits_result_without_reexecuting() {
     let (kind, _) = read_message(&mut stream);
     assert_eq!(kind, b's');
 
-    // 3 回目: 残り 1 行 + CommandComplete（再実行なし）
+    // 3 回目: 残り 1 行 + CommandComplete（再実行なし）。タグは今回バッチの
+    // 件数（1）ではなく portal 全体の累計送出行数（2+2+1=5）から組み立てる
+    // （PostgreSQL の契約。PR #1013 レビュー指摘・P1）。
     send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 2));
     let (kind, body) = read_message(&mut stream);
     assert_eq!(kind, b'D');
     all_ids.push(body);
     let (kind, tag) = read_message(&mut stream);
     assert_eq!(kind, b'C');
-    assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "SELECT 1");
+    assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "SELECT 5");
 
     assert_eq!(all_ids.len(), 5, "no duplicate or missing rows");
     let mut dedup = all_ids.clone();
@@ -378,9 +380,10 @@ fn suspended_portal_bytes_are_accounted_across_the_whole_session_not_per_portal(
     }
     let (kind, tag) = read_message(&mut stream);
     assert_eq!(kind, b'C');
-    // `CommandComplete` のタグは累計ではなく直近 Execute で送出した行数
-    // （既存の `max_rows_splits_result_without_reexecuting` と同じ仕様）。
-    assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "SELECT 10");
+    // `CommandComplete` のタグは portal 全体の累計送出行数（1 回目の
+    // Execute で送った 1 行 + 今回送った 10 行 = 11）から組み立てる
+    // （PostgreSQL の契約。PR #1013 レビュー指摘・P1）。
+    assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "SELECT 11");
 }
 
 /// 受け入れ条件 3: `INSERT ... USING OPERATION_ID` を拡張経路で実行すると

@@ -76,9 +76,15 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
 - `max_rows <= 0` は全行を返す（PostgreSQL と同じ）。`max_rows > 0` は先頭
   `max_rows` 行を送出し、残りがあれば `PortalSuspended`（'s'）を返す前に、
   保持し続ける残り行の合計バイト数を判定する（`MAX_SUSPENDED_PORTAL_BYTES_
-  PER_SESSION`。1 行も送る前に判定し、超過は `54000`）。分割送出時の
-  `CommandComplete` の件数は「その Execute で実際に送った行数」（PostgreSQL
-  の `PortalRun` と同じ）。
+  PER_SESSION`。1 行も送る前に判定し、超過は `54000`。この上限は portal
+  単体ではなくセッション（接続）全体で合算して適用する——[`PortalStore::
+  total_suspended_bytes_excluding`]。PR #1013 レビュー指摘・P0）。
+  送出予定分は結果セット全体を先にメモリへエンコードして保持するのではなく
+  1 行ずつエンコード→送出する（`max_rows<=0`／非常に大きい `max_rows` でも
+  送出予定分のメモリ使用量が結果セット規模に応じて無制限に膨らまない。
+  PR #1013 レビュー指摘・P0）。分割送出時の `CommandComplete` の件数は
+  「portal 全体の累計送出行数」（PostgreSQL の `PortalRun` と同じ契約。
+  PR #1013 レビュー指摘・P1: 直近 Execute の件数だけでは過小になる）。
 - Sync は無名 portal のみ破棄する（名前付き portal は Sync を越えて残る。
   PostgreSQL がトランザクション終了時に名前付き portal も破棄する挙動までは
   持たない——WIRE-11 に従い、本実装は暗黙トランザクションブロック
@@ -143,8 +149,12 @@ Sync バッチ内で後続のメッセージが失敗しても、先に commit �
 （PostgreSQL プロトコル上バックエンドは任意時点で応答してよい）。Execute は
 `ResponseBoundaryGuard`（RECOVER-5 (3)）・緊急応答登録（RECOVER-6）を、
 簡易クエリと同じ「commit から応答送出完了までの区間をメッセージ内に閉じる」
-位置関係で適用する。Sync までまとめて応答をバッファリングする最適化は、
-この境界を曖昧にしうるため見送り、将来 Issue の候補として記録するに留める。
+位置関係で適用する（`ResponseBoundaryGuard` は `handle_execute` が Execute
+（'E'）メッセージ 1 通の処理全体を覆う形で保持する。PR #1013 レビュー
+指摘・cursor High: 当初の実装ではこのガードが欠落しており、commit 成功後に
+panic すると緊急応答〔TASK-97・RECOVER-6〕が発火しない fail-open な穴が
+あった）。Sync までまとめて応答をバッファリングする最適化は、この境界を
+曖昧にしうるため見送り、将来 Issue の候補として記録するに留める。
 
 ## 対象ファイル
 
