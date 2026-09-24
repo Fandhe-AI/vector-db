@@ -5,10 +5,11 @@
 //! wire-server が呼ぶのと同じ形（`feed` を CopyData 相当のチャンクへ分けて
 //! 呼び、`finish` → `commit_copy_in` の順）で駆動する。
 
-use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::catalog::{ArrayElemType, ArrayType, ColumnDef, ColumnType, TableSchema};
 use engine::core::{CopyPlan, EngineCore};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
@@ -54,6 +55,63 @@ fn read_back_ids(core: &EngineCore, tenant: &str) -> Vec<u64> {
         panic!("expected Query outcome, got {outcome:?}");
     };
     result.rows.iter().map(|row| row.id).collect()
+}
+
+const EXT_TABLE: &str = "docs_ext";
+const EXT_ENUM_TYPE: &str = "mood";
+
+/// `BOOLEAN`／`ARRAY`／`BYTEA`／`ENUM` 列を持つテーブル（Issue #939 レビュー
+/// 指摘: `bind_copy_record` の該当 match アームがどのテスト（`copy_from.rs`・
+/// `wire17_copy.rs`・`sql/copy.rs` 内 unit test）からもカバーされていなかった
+/// ため追加。`tests/{boolean,array,bytea,enum}_column.rs` と同じ列定義流儀）。
+fn extended_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> TableSchema {
+    TableSchema::new(
+        EXT_TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("flag", ColumnType::Boolean, true),
+            ColumnDef::new(
+                "tags",
+                ColumnType::Array(ArrayType::new(ArrayElemType::Text, 4).expect("array ty")),
+                true,
+            ),
+            ColumnDef::new("blob", ColumnType::Bytea, true),
+            ColumnDef::new("mood", ColumnType::Enum(enum_def), true),
+        ],
+    )
+}
+
+fn open_engine_ext(name: &str) -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path(name);
+    let storage = Storage::open(&path).expect("open storage");
+    let enum_def = storage
+        .create_enum_type(EXT_ENUM_TYPE, vec!["happy".to_string(), "sad".to_string()])
+        .expect("create enum type");
+    storage
+        .create_table(&extended_schema(enum_def))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (core, path)
+}
+
+/// `id = 1` の行を投影して `Cell` 列で返す（`BOOLEAN`／`ARRAY`／`BYTEA`／`ENUM`
+/// の束縛結果を engine API 層で確定オラクルとして検証するため）。
+fn select_ext_cells(core: &EngineCore, tenant: &str, id: u64, columns: &str) -> Vec<Cell> {
+    let policy = ctx(tenant);
+    let mut session = SessionState::default();
+    let sql = format!("SELECT {columns} FROM {EXT_TABLE} WHERE id = {id} LIMIT 1");
+    let outcome = core
+        .execute_sql_in_session(&policy, &mut session, &sql)
+        .expect("select ok");
+    let SqlOutcome::Query(result) = outcome else {
+        panic!("expected Query outcome, got {outcome:?}");
+    };
+    result
+        .rows
+        .into_iter()
+        .next()
+        .expect("row must exist")
+        .cells
 }
 
 /// wire-server の CopyIn サブプロトコルを模した駆動ヘルパー: `chunks` を順に
@@ -371,4 +429,159 @@ fn copy_to_stdout_rejects_table_form() {
         .begin_copy(&policy, &session, &sql)
         .expect_err("table-form COPY TO STDOUT must be rejected");
     assert_eq!(err.wire_code(), "42601");
+}
+
+// ---------------------------------------------------------------------
+// FROM STDIN: BOOLEAN／ARRAY／BYTEA／ENUM 列の束縛
+// （Issue #939 レビュー指摘: cc232e6 で `bind_copy_record` へ追加した該当
+// match アームがどのテストからもカバーされていなかったため追加）
+// ---------------------------------------------------------------------
+
+#[test]
+fn copy_from_stdin_text_format_binds_boolean_array_bytea_enum_columns() {
+    let (core, path) = open_engine_ext("copy-from-ext-text");
+    let _guard = CleanupGuard(path);
+
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, flag, tags, blob, mood) FROM STDIN USING OPERATION_ID 'ext-op-1'"
+    );
+    let outcome = run_copy_from(
+        &core,
+        "acme",
+        &sql,
+        &[b"1\t[1.0,0.0]\tt\t{ja,en}\t\\\\xdeadbeef\thappy\n"],
+    )
+    .expect("COPY FROM STDIN succeeds");
+    assert_eq!(outcome.rows_affected, 1);
+
+    let cells = select_ext_cells(&core, "acme", 1, "flag, tags, blob, mood");
+    assert_eq!(
+        cells,
+        vec![
+            Cell::Bool(true),
+            Cell::Array(engine::row_codec::ArrayValue::Text(vec![
+                "ja".to_string(),
+                "en".to_string()
+            ])),
+            Cell::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
+            Cell::Text("happy".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn copy_from_stdin_csv_format_binds_boolean_array_bytea_enum_columns() {
+    let (core, path) = open_engine_ext("copy-from-ext-csv");
+    let _guard = CleanupGuard(path);
+
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, flag, tags, blob, mood) FROM STDIN WITH (FORMAT csv) USING OPERATION_ID 'ext-op-2'"
+    );
+    let outcome = run_copy_from(
+        &core,
+        "acme",
+        &sql,
+        &[b"1,\"[1.0,0.0]\",false,\"{ja,en}\",\\xdeadbeef,sad\n"],
+    )
+    .expect("COPY FROM STDIN succeeds");
+    assert_eq!(outcome.rows_affected, 1);
+
+    let cells = select_ext_cells(&core, "acme", 1, "flag, tags, blob, mood");
+    assert_eq!(
+        cells,
+        vec![
+            Cell::Bool(false),
+            Cell::Array(engine::row_codec::ArrayValue::Text(vec![
+                "ja".to_string(),
+                "en".to_string()
+            ])),
+            Cell::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
+            Cell::Text("sad".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn copy_from_stdin_rejects_invalid_boolean_word() {
+    let (core, path) = open_engine_ext("copy-from-ext-bad-bool");
+    let _guard = CleanupGuard(path);
+
+    let sql =
+        format!("COPY {EXT_TABLE} (id, embedding, flag) FROM STDIN USING OPERATION_ID 'ext-op-3'");
+    let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tmaybe\n"])
+        .expect_err("invalid boolean word must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+#[test]
+fn copy_from_stdin_rejects_enum_label_outside_vocabulary() {
+    let (core, path) = open_engine_ext("copy-from-ext-bad-enum");
+    let _guard = CleanupGuard(path);
+
+    let sql =
+        format!("COPY {EXT_TABLE} (id, embedding, mood) FROM STDIN USING OPERATION_ID 'ext-op-4'");
+    let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tangry\n"])
+        .expect_err("label outside enum vocabulary must be rejected");
+    assert_eq!(err.wire_code(), "22P02");
+}
+
+#[test]
+fn copy_from_stdin_rejects_malformed_bytea_hex() {
+    let (core, path) = open_engine_ext("copy-from-ext-bad-bytea");
+    let _guard = CleanupGuard(path);
+
+    let sql =
+        format!("COPY {EXT_TABLE} (id, embedding, blob) FROM STDIN USING OPERATION_ID 'ext-op-5'");
+    let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tnothex\n"])
+        .expect_err("malformed bytea hex literal must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+// ---------------------------------------------------------------------
+// TO STDOUT: BOOLEAN／ARRAY／BYTEA／ENUM 列の投影（`Cell` 表現の確認。
+// text 表現へのエンコード・往復は wire-server 側の
+// `wire17_copy_to_stdout_output_round_trips_extended_column_types` が担う）
+// ---------------------------------------------------------------------
+
+#[test]
+fn copy_to_stdout_projects_boolean_array_bytea_enum_columns() {
+    let (core, path) = open_engine_ext("copy-to-stdout-ext");
+    let _guard = CleanupGuard(path);
+
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, flag, tags, blob, mood) FROM STDIN USING OPERATION_ID 'ext-op-6'"
+    );
+    run_copy_from(
+        &core,
+        "acme",
+        &sql,
+        &[b"1\t[1.0,0.0]\tt\t{ja,en}\t\\\\xdeadbeef\thappy\n"],
+    )
+    .expect("COPY FROM STDIN succeeds");
+
+    let policy = ctx("acme");
+    let session = SessionState::default();
+    let sql =
+        format!("COPY (SELECT id, flag, tags, blob, mood FROM {EXT_TABLE} LIMIT 10) TO STDOUT");
+    let plan = core
+        .begin_copy(&policy, &session, &sql)
+        .expect("begin_copy succeeds");
+    let (_, result) = match plan {
+        CopyPlan::To(f, r) => (f, r),
+        CopyPlan::From(_) => panic!("expected TO plan"),
+    };
+    let row = result.rows.into_iter().next().expect("row exists");
+    assert_eq!(
+        row.cells,
+        vec![
+            Cell::Integer(1),
+            Cell::Bool(true),
+            Cell::Array(engine::row_codec::ArrayValue::Text(vec![
+                "ja".to_string(),
+                "en".to_string()
+            ])),
+            Cell::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
+            Cell::Text("happy".to_string()),
+        ]
+    );
 }
