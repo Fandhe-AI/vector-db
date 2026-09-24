@@ -131,6 +131,7 @@ impl ReferencedColumns {
             match &item.input {
                 AggregateInput::TextColumn(index)
                 | AggregateInput::BooleanColumn(index)
+                | AggregateInput::DatetimeColumn(index)
                 | AggregateInput::ArrayColumn(index)
                 | AggregateInput::ByteaColumn(index)
                 | AggregateInput::JsonColumn(index)
@@ -329,6 +330,17 @@ impl Accumulator {
             // が SUM/AVG/MIN/MAX を型不整合として拒否済み。Issue #883）。値の真偽は
             // 問わず「NULL でない」ことだけを数える。
             AggregateInput::BooleanColumn(index) => {
+                if scanned.get(*index).copied().flatten().is_some() {
+                    self.observe_present()
+                } else {
+                    Ok(())
+                }
+            }
+            // `DATE`／`TIMESTAMP` 列の裸参照も COUNT（非 NULL 行数）専用
+            // （`resolve_aggregate_input` が SUM/AVG/MIN/MAX を型不整合として
+            // 拒否済み。TABLE-13・TASK-197、Issue #884）。`BooleanColumn` と
+            // 同じく値そのものは問わず「NULL でない」ことだけを数える。
+            AggregateInput::DatetimeColumn(index) => {
                 if scanned.get(*index).copied().flatten().is_some() {
                     self.observe_present()
                 } else {

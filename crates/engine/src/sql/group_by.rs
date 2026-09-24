@@ -710,6 +710,8 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         | Cell::Text(_)
         | Cell::Vector(_)
         | Cell::Bool(_)
+        | Cell::Date(_)
+        | Cell::Timestamp(_)
         | Cell::Array(_)
         | Cell::Bytes(_)
         | Cell::Json(_) => false,

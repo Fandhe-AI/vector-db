@@ -137,6 +137,13 @@ pub enum Value {
     /// 真偽値列の値（TABLE-13・TASK-196、Issue #883）。NULL とはバイト列上も
     /// 別物になる（[`PRESENCE_NULL`] とは別に 1 バイトの値本体を持つ）。
     Bool(bool),
+    /// 日付列の値（TABLE-13・TASK-197、Issue #884）。1970-01-01 起点の日数
+    /// （`i32`）。範囲・暦妥当性は [`crate::datetime`] が検証済みであることを
+    /// 前提とする。
+    Date(i32),
+    /// 日時列の値（TABLE-13・TASK-197、Issue #884）。1970-01-01 00:00:00
+    /// 起点のマイクロ秒（`i64`、タイムゾーンなし）。
+    Timestamp(i64),
     /// 配列列の値（TABLE-14・TASK-198、Issue #888）。要素型ごとに variant を
     /// 分けることで、同一列の要素がすべて同じ型であることを型で保証する
     /// （`ColumnType::Array` の `ArrayElemType` と対応させる）。
@@ -195,6 +202,11 @@ impl ArrayValue {
 pub enum ScalarRef<'a> {
     Text(&'a str),
     Bool(bool),
+    /// 日付列（TABLE-13・TASK-197、Issue #884）。1970-01-01 起点の日数。
+    Date(i32),
+    /// 日時列（TABLE-13・TASK-197、Issue #884）。1970-01-01 00:00:00 起点の
+    /// マイクロ秒（タイムゾーンなし）。
+    Timestamp(i64),
     /// 配列列の借用結果（Issue #888）。構造・UTF-8・要素上限はすべて走査時に
     /// 検証済みで、[`ArrayRef::to_value`] は追加のエラー処理なしに複製できる。
     Array(ArrayRef<'a>),
@@ -221,14 +233,16 @@ pub enum ScalarRef<'a> {
 
 impl<'a> ScalarRef<'a> {
     /// TEXT 前提の既存消費側（等価/前方一致フィルタ・二次索引・hybrid 本文・
-    /// GROUP BY キー等）が `Bool`／`Array`／`Bytes`／`Json`／`Enum` を取り違えて
-    /// TEXT として扱わないよう、`Text` 以外は `None` を返す（fail-closed。
-    /// 呼び出し元はスキーマ型で事前に対象外の列を除外するか、`None` を型不一致
-    /// として拒否する）。
+    /// GROUP BY キー等）が `Bool`／`Date`／`Timestamp`／`Array`／`Bytes`／`Json`／
+    /// `Enum` を取り違えて TEXT として扱わないよう、`Text` 以外は `None` を返す
+    /// （fail-closed。呼び出し元はスキーマ型で事前に対象外の列を除外するか、
+    /// `None` を型不一致として拒否する）。
     pub fn as_text(&self) -> Option<&'a str> {
         match self {
             ScalarRef::Text(s) => Some(s),
             ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -240,6 +254,38 @@ impl<'a> ScalarRef<'a> {
         match self {
             ScalarRef::Bool(b) => Some(*b),
             ScalarRef::Text(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_) => None,
+        }
+    }
+
+    /// `DATE` 列の内部表現（1970-01-01 起点の日数）。`Date` 以外は `None`
+    /// （[`Self::as_text`] と同じ fail-closed 方針。Issue #884）。
+    pub fn as_date(&self) -> Option<i32> {
+        match self {
+            ScalarRef::Date(d) => Some(*d),
+            ScalarRef::Text(_)
+            | ScalarRef::Bool(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_) => None,
+        }
+    }
+
+    /// `TIMESTAMP` 列の内部表現（1970-01-01 00:00:00 起点のマイクロ秒）。
+    /// `Timestamp` 以外は `None`（同上、Issue #884）。
+    pub fn as_timestamp(&self) -> Option<i64> {
+        match self {
+            ScalarRef::Timestamp(t) => Some(*t),
+            ScalarRef::Text(_)
+            | ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
             | ScalarRef::Array(_)
             | ScalarRef::Bytes(_)
             | ScalarRef::Json(_)
@@ -255,9 +301,12 @@ impl<'a> ScalarRef<'a> {
     pub fn as_dictionary_text(&self) -> Option<&'a str> {
         match self {
             ScalarRef::Text(s) | ScalarRef::Enum(s) => Some(s),
-            ScalarRef::Bool(_) | ScalarRef::Array(_) | ScalarRef::Bytes(_) | ScalarRef::Json(_) => {
-                None
-            }
+            ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Bytes(_)
+            | ScalarRef::Json(_) => None,
         }
     }
 }
@@ -308,6 +357,14 @@ const BOOL_TRUE_BYTE: u8 = 0x01;
 /// `tenant::validate_set_assignments` の事前累計検証が同じ値を共有する
 /// （TEXT の [`SCALAR_TEXT_ENTRY_OVERHEAD`] と同じ理由）。
 pub(crate) const SCALAR_BOOL_ENTRY_LEN: u32 = 2;
+
+/// `DATE` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
+/// （presence(1) + 値(4, LE i32)。Issue #884）。
+pub(crate) const SCALAR_DATE_ENTRY_LEN: u32 = 5;
+
+/// `TIMESTAMP` 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込み
+/// バイト数（presence(1) + 値(8, LE i64)。Issue #884）。
+pub(crate) const SCALAR_TIMESTAMP_ENTRY_LEN: u32 = 9;
 
 /// 配列列のフレーム flags バイト。本版は `0x00` 固定（NULL 要素非対応。D-A6）。
 /// 将来 NULL 要素ビットマップ等を追加する際の予約領域として、`0x00` 以外は
@@ -719,6 +776,8 @@ pub fn encode_row(
                     ColumnType::Text
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -752,6 +811,8 @@ pub fn encode_row(
                     ColumnType::Vector(dim) => *dim,
                     ColumnType::Text
                     | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -793,12 +854,46 @@ pub fn encode_row(
                 buf.push(PRESENCE_VALUE);
                 buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
             }
+            Value::Date(days) => {
+                if !matches!(column.ty, ColumnType::Date) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Date value, got Date",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_date_days(*days) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: date value out of range: {days}",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&days.to_le_bytes());
+            }
+            Value::Timestamp(micros) => {
+                if !matches!(column.ty, ColumnType::Timestamp) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Timestamp value, got Timestamp",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_timestamp_micros(*micros) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: timestamp value out of range: {micros}",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&micros.to_le_bytes());
+            }
             Value::Array(array_value) => {
-                let array_ty = match column.ty {
-                    ColumnType::Array(array_ty) => array_ty,
+                let array_ty = match &column.ty {
+                    ColumnType::Array(array_ty) => *array_ty,
                     ColumnType::Text
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -1083,6 +1178,64 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     })?;
                     values.push(Value::Bool(b));
                 }
+                ColumnType::Date => {
+                    let days_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before date value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at date value field".to_string(),
+                            )
+                        })?;
+                    let days_arr: [u8; 4] = days_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("date value field is not 4 bytes".to_string())
+                    })?;
+                    let days = i32::from_le_bytes(days_arr);
+                    if !crate::datetime::validate_date_days(days) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "date value {days} is out of the representable range"
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after date value field".to_string())
+                    })?;
+                    values.push(Value::Date(days));
+                }
+                ColumnType::Timestamp => {
+                    let micros_bytes = buf
+                        .get(
+                            offset..offset.checked_add(8).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before timestamp value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at timestamp value field".to_string(),
+                            )
+                        })?;
+                    let micros_arr: [u8; 8] = micros_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("timestamp value field is not 8 bytes".to_string())
+                    })?;
+                    let micros = i64::from_le_bytes(micros_arr);
+                    if !crate::datetime::validate_timestamp_micros(micros) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "timestamp value {micros} is out of the representable range"
+                        )));
+                    }
+                    offset = offset.checked_add(8).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after timestamp value field".to_string(),
+                        )
+                    })?;
+                    values.push(Value::Timestamp(micros));
+                }
                 ColumnType::Array(array_ty) => {
                     let (array_ref, new_offset) =
                         parse_array_frame(buf, offset, array_ty.elem(), array_ty.max_len())?;
@@ -1296,6 +1449,8 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     ColumnType::Text
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
                     | ColumnType::Array(_)
                     | ColumnType::Bytea
                     | ColumnType::Json
@@ -1343,12 +1498,48 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.push(PRESENCE_VALUE);
                 buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
             }
+            Value::Date(days) => {
+                if !matches!(column.ty, ColumnType::Date) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Date value, got Date",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_date_days(*days) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: date value out of range: {days}",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_DATE_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&days.to_le_bytes());
+            }
+            Value::Timestamp(micros) => {
+                if !matches!(column.ty, ColumnType::Timestamp) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Timestamp value, got Timestamp",
+                        column.name
+                    )));
+                }
+                if !crate::datetime::validate_timestamp_micros(*micros) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: timestamp value out of range: {micros}",
+                        column.name
+                    )));
+                }
+                reserve(&mut buf, SCALAR_TIMESTAMP_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&micros.to_le_bytes());
+            }
             Value::Array(array_value) => {
-                let array_ty = match column.ty {
-                    ColumnType::Array(array_ty) => array_ty,
+                let array_ty = match &column.ty {
+                    ColumnType::Array(array_ty) => *array_ty,
                     ColumnType::Text
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
                     | ColumnType::Bytea
                     | ColumnType::Json
                     | ColumnType::Jsonb
@@ -1420,7 +1611,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
 /// [`crate::json::canonicalize_jsonb_text`] の呼び分け）を [`encode_json_value`]・
 /// [`encode_scalar_columns`]・[`merge_encode_scalar_columns`] の 3 箇所で共有する。
 fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) -> Result<()> {
-    match column.ty {
+    match &column.ty {
         ColumnType::Json => {
             crate::json::validate_json_column_text(text).map_err(|_| {
                 RowCodecError::Invalid(format!("column {:?} expects valid JSON text", column.name))
@@ -1440,6 +1631,8 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
         ColumnType::Text
         | ColumnType::Vector(_)
         | ColumnType::Boolean
+        | ColumnType::Date
+        | ColumnType::Timestamp
         | ColumnType::Array(_)
         | ColumnType::Bytea
         | ColumnType::Enum(_) => {
@@ -1606,6 +1799,8 @@ pub(crate) fn merge_encode_scalar_columns(
                         ColumnType::Text
                         | ColumnType::Vector(_)
                         | ColumnType::Boolean
+                        | ColumnType::Date
+                        | ColumnType::Timestamp
                         | ColumnType::Array(_)
                         | ColumnType::Bytea
                         | ColumnType::Json
@@ -1642,12 +1837,48 @@ pub(crate) fn merge_encode_scalar_columns(
                     buf.push(PRESENCE_VALUE);
                     buf.push(if *b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
                 }
+                Value::Date(days) => {
+                    if !matches!(column.ty, ColumnType::Date) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Date value, got Date",
+                            column.name
+                        )));
+                    }
+                    if !crate::datetime::validate_date_days(*days) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: date value out of range: {days}",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_DATE_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&days.to_le_bytes());
+                }
+                Value::Timestamp(micros) => {
+                    if !matches!(column.ty, ColumnType::Timestamp) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Timestamp value, got Timestamp",
+                            column.name
+                        )));
+                    }
+                    if !crate::datetime::validate_timestamp_micros(*micros) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: timestamp value out of range: {micros}",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_TIMESTAMP_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&micros.to_le_bytes());
+                }
                 Value::Array(array_value) => {
-                    let array_ty = match column.ty {
-                        ColumnType::Array(array_ty) => array_ty,
+                    let array_ty = match &column.ty {
+                        ColumnType::Array(array_ty) => *array_ty,
                         ColumnType::Text
                         | ColumnType::Vector(_)
                         | ColumnType::Boolean
+                        | ColumnType::Date
+                        | ColumnType::Timestamp
                         | ColumnType::Bytea
                         | ColumnType::Json
                         | ColumnType::Jsonb
@@ -1704,6 +1935,16 @@ pub(crate) fn merge_encode_scalar_columns(
                     reserve(&mut buf, SCALAR_BOOL_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     buf.push(if b { BOOL_TRUE_BYTE } else { BOOL_FALSE_BYTE });
+                }
+                Some(ScalarRef::Date(days)) => {
+                    reserve(&mut buf, SCALAR_DATE_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&days.to_le_bytes());
+                }
+                Some(ScalarRef::Timestamp(micros)) => {
+                    reserve(&mut buf, SCALAR_TIMESTAMP_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&micros.to_le_bytes());
                 }
                 Some(ScalarRef::Array(array_ref)) => {
                     let payload_len = u32::try_from(array_ref.bytes.len()).map_err(|_| {
@@ -2008,6 +2249,72 @@ fn scan_scalar_columns_validated<'a>(
                         sink(col_index, None)?;
                     }
                 }
+                ColumnType::Date => {
+                    let days_bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before date value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at date value field".to_string(),
+                            )
+                        })?;
+                    let days_arr: [u8; 4] = days_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("date value field is not 4 bytes".to_string())
+                    })?;
+                    let days = i32::from_le_bytes(days_arr);
+                    if !crate::datetime::validate_date_days(days) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "date value {days} is out of the representable range"
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after date value field".to_string())
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Date(days)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+                ColumnType::Timestamp => {
+                    let micros_bytes = buf
+                        .get(
+                            offset..offset.checked_add(8).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before timestamp value field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at timestamp value field".to_string(),
+                            )
+                        })?;
+                    let micros_arr: [u8; 8] = micros_bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("timestamp value field is not 8 bytes".to_string())
+                    })?;
+                    let micros = i64::from_le_bytes(micros_arr);
+                    if !crate::datetime::validate_timestamp_micros(micros) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "timestamp value {micros} is out of the representable range"
+                        )));
+                    }
+                    offset = offset.checked_add(8).ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "offset overflow after timestamp value field".to_string(),
+                        )
+                    })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Timestamp(micros)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
                 ColumnType::Json | ColumnType::Jsonb => {
                     // フレーミング・UTF-8 検証は TEXT と共有する（Issue #889 D2）。
                     // 格納時（encode 経路）に構文検証・正規化済みのため、ここでは
@@ -2110,6 +2417,8 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
                 values.push(Value::Enum(owned));
             }
             Some(ScalarRef::Bool(b)) => values.push(Value::Bool(b)),
+            Some(ScalarRef::Date(days)) => values.push(Value::Date(days)),
+            Some(ScalarRef::Timestamp(micros)) => values.push(Value::Timestamp(micros)),
             Some(ScalarRef::Array(array_ref)) => {
                 values.push(Value::Array(array_ref.to_value()?));
             }
@@ -3001,6 +3310,118 @@ mod tests {
                 .values,
             vec![Value::Bytes(Vec::new())]
         );
+    }
+
+    // --- DATE/TIMESTAMP encode 時の範囲検証（codex-review／Cursor Bugbot 指摘。
+    // decode 側（decode_row・scan_scalar_columns）は範囲外値を拒否するのに対し
+    // encode 側が検証していないと、公開 enum Value::Date/Timestamp を直接
+    // 構築する呼び出し元（SQL パーサーを経由しない Rust API 経路を含む）から
+    // 範囲外値を書き込み成功させてしまい、書き込んだ本人がその行を二度と
+    // 読めなくなる非対称な永続化バグになる。encode_row・encode_scalar_columns・
+    // merge_encode_scalar_columns の 3 箇所すべてで拒否されることを固定する） ---
+
+    fn date_timestamp_schema() -> TableSchema {
+        TableSchema::new(
+            "events",
+            vec![
+                ColumnDef::new("d", ColumnType::Date, true),
+                ColumnDef::new("t", ColumnType::Timestamp, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn encode_row_rejects_out_of_range_date_and_timestamp() {
+        let schema = date_timestamp_schema();
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Date(crate::datetime::DATE_MAX_DAYS + 1), Value::Null],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[
+                Value::Null,
+                Value::Timestamp(crate::datetime::TIMESTAMP_MAX_MICROS + 1),
+            ],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Date(crate::datetime::DATE_MIN_DAYS - 1), Value::Null],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[
+                Value::Null,
+                Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS - 1),
+            ],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        // 範囲内の値は従来どおり成功し decode で読み戻せる（非対称でないことの確認）。
+        let ok = encode_row(
+            &schema,
+            "tenant-a",
+            Visibility::Public,
+            &[
+                Value::Date(crate::datetime::DATE_MAX_DAYS),
+                Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS),
+            ],
+        )
+        .expect("encode in-range date/timestamp");
+        let decoded = decode_row(&schema, &ok).expect("decode in-range date/timestamp");
+        assert_eq!(
+            decoded.values,
+            vec![
+                Value::Date(crate::datetime::DATE_MAX_DAYS),
+                Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS),
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_scalar_columns_rejects_out_of_range_date_and_timestamp() {
+        let schema = date_timestamp_schema();
+        let result = encode_scalar_columns(
+            &schema,
+            &[Value::Date(crate::datetime::DATE_MAX_DAYS + 1), Value::Null],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let result = encode_scalar_columns(
+            &schema,
+            &[
+                Value::Null,
+                Value::Timestamp(crate::datetime::TIMESTAMP_MAX_MICROS + 1),
+            ],
+        );
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn merge_encode_scalar_columns_rejects_out_of_range_date_and_timestamp() {
+        let schema = date_timestamp_schema();
+        let out_of_range_date = Value::Date(crate::datetime::DATE_MAX_DAYS + 1);
+        let result =
+            merge_encode_scalar_columns(&schema, &[None, None], &[(0, &out_of_range_date)]);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+
+        let out_of_range_ts = Value::Timestamp(crate::datetime::TIMESTAMP_MIN_MICROS - 1);
+        let result = merge_encode_scalar_columns(&schema, &[None, None], &[(1, &out_of_range_ts)]);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
     }
 
     // --- merge_encode_scalar_columns（Issue #996: 述語つき UPDATE の適用段を
