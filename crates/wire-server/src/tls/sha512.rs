@@ -224,6 +224,7 @@ pub struct Sha512 {
 }
 
 impl Sha512 {
+    /// 初期ハッシュ値（`H0`）で状態を初期化した空のハッシャーを作る。
     pub fn new() -> Self {
         Sha512 {
             state: H0,
@@ -265,6 +266,7 @@ impl Sha512 {
         }
     }
 
+    /// 任意長のバイト列をハッシュ計算へ順次取り込む（複数回呼び出し可）。
     pub fn update(&mut self, data: &[u8]) {
         self.total_len = self.total_len.wrapping_add(data.len() as u128);
         self.absorb(data);
