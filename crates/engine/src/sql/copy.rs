@@ -26,8 +26,8 @@ use crate::recovery::required_op_id::OperationId;
 use crate::row_codec::Value;
 use crate::sql::allowlist::{CopyFormat, SqlSurfaceError};
 use crate::sql::parser::{
-    bind_bytea_literal, bind_enum_literal, bind_json_literal, parse_array_literal,
-    parse_vector_literal, BoundInsert,
+    bind_bytea_literal, bind_datetime_literal, bind_enum_literal, bind_json_literal,
+    parse_array_literal, parse_vector_literal, BoundInsert,
 };
 
 /// wire 層のホットパスで `lexer::tokenize` を増やさないための安価な覗き見
@@ -461,6 +461,9 @@ fn bind_copy_record(
                 ColumnType::Bytea => bind_bytea_literal(s, name)?,
                 ColumnType::Enum(def) => bind_enum_literal(def, s, name)?,
                 ColumnType::Json | ColumnType::Jsonb => bind_json_literal(s, &column.ty, name)?,
+                ColumnType::Date | ColumnType::Timestamp => {
+                    bind_datetime_literal(name, column.ty.clone(), s)?
+                }
             },
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
@@ -529,6 +532,11 @@ fn bound_insert_byte_len(bound: &BoundInsert) -> Result<usize, SqlSurfaceError> 
             Value::Bytes(b) => b.len(),
             Value::Enum(s) => s.len(),
             Value::Json(s) => s.len(),
+            // DATE／TIMESTAMP 値は行コーデック上それぞれ 4／8 バイト固定
+            // （Issue #884・D-3。`core.rs::validate_insert_batch_byte_and_
+            // chunk_limits` と同一の判定対象量定義）。
+            Value::Date(_) => 4,
+            Value::Timestamp(_) => 8,
         };
         total = total
             .checked_add(value_len)

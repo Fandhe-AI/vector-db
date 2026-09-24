@@ -330,7 +330,7 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
 /// （[`crate::datetime::DateTimeLiteralError::Overflow`]）は
 /// [`SqlSurfaceError::DatetimeFieldOverflow`]（`22008`）へ写像する（D-1。
 /// `docs/design/datetime-column.md` 参照）。
-fn bind_datetime_literal(
+pub(crate) fn bind_datetime_literal(
     column_name: &str,
     ty: ColumnType,
     literal: &str,
