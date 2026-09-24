@@ -97,12 +97,17 @@ impl ScoringBoost {
             .ok_or_else(|| {
                 SqlSurfaceError::invalid_input(format!("unknown column: {}", self.column))
             })?;
-        match column.ty {
+        match &column.ty {
             ColumnType::Text => {}
             ColumnType::Vector(_)
             | ColumnType::Integer
             | ColumnType::BigInt
-            | ColumnType::Boolean => {
+            | ColumnType::Boolean
+            | ColumnType::Array(_)
+            | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Enum(_) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {:?} is not a TEXT column",
                     self.column

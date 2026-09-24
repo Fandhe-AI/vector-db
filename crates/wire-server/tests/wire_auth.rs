@@ -324,6 +324,55 @@ fn wire3_wrong_password_returns_28p01_without_ready_for_query() {
     );
 }
 
+/// Cursor Bugbot 指摘の再発防止（Issue #940 PR #1006）: cleartext フローの
+/// 不正な PasswordMessage（終端 NUL 無し）は、cleartext/SCRAM 共通の
+/// `authenticate()` へ統合される前と同じ `"invalid password message"`
+/// （`HandshakeError::Protocol` の fallback_message）を返し続けること。
+/// 統合直後は `respond_and_close` の呼び出し元が認証方式を区別しない単一の
+/// `"invalid message frame"` を渡していたため、既定 cleartext 経路の
+/// ErrorResponse がビット同一でなくなっていた。
+#[test]
+fn wire3_malformed_password_message_returns_original_fallback_message() {
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_accepting_one(&users_path);
+    let mut stream = TcpStream::connect(addr).expect("connect");
+
+    send_ssl_request_and_startup(&mut stream, "alice", "db");
+    let _ = read_auth_request_type(&mut stream);
+
+    // 終端 NUL の無い不正な PasswordMessage（`read_password_message` が
+    // `HandshakeError::Protocol("password message not null-terminated")` を
+    // 返す形状）。
+    let body = b"not-null-terminated";
+    let total_len = (4 + body.len()) as i32;
+    let mut msg = Vec::new();
+    msg.push(b'p');
+    msg.extend_from_slice(&total_len.to_be_bytes());
+    msg.extend_from_slice(body);
+    stream
+        .write_all(&msg)
+        .expect("send malformed PasswordMessage");
+
+    let mut header = [0u8; 1];
+    stream.read_exact(&mut header).expect("read response type");
+    assert_eq!(
+        header[0], b'E',
+        "expected ErrorResponse on malformed PasswordMessage"
+    );
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read len");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut resp_body = vec![0u8; len - 4];
+    stream.read_exact(&mut resp_body).expect("read body");
+    let body_str = String::from_utf8_lossy(&resp_body);
+    assert!(
+        body_str.contains("invalid password message"),
+        "cleartext malformed PasswordMessage must keep the pre-SCRAM fallback \
+         message, got: {body_str:?}"
+    );
+}
+
 /// ポインタ: TASK-67・WIRE-3。未知ユーザーが既知ユーザーの誤パスワードと外形上
 /// 区別できないこと（列挙対策）。
 #[test]

@@ -702,12 +702,17 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
             // 比較演算子として構造上生成しないため到達しない。
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
         },
-        // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT 型の集計結果を
-        // HAVING の対象として拒否済みのため到達しない。fail-closed に「不一致」
-        // として扱う。`SignedInteger`（Issue #881・#892 まで集計対象外）も同様。
-        Cell::Null | Cell::Text(_) | Cell::Vector(_) | Cell::Bool(_) | Cell::SignedInteger(_) => {
-            false
-        }
+        // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT/ARRAY/BYTEA/JSON 型の
+        // 集計結果を HAVING の対象として拒否済みのため到達しない。fail-closed に
+        // 「不一致」として扱う。`SignedInteger`（Issue #881・#892 まで集計対象外）も同様。
+        Cell::Null
+        | Cell::Text(_)
+        | Cell::Vector(_)
+        | Cell::Bool(_)
+        | Cell::Array(_)
+        | Cell::Bytes(_)
+        | Cell::Json(_)
+        | Cell::SignedInteger(_) => false,
     }
 }
 

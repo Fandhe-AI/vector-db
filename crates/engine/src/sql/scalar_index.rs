@@ -522,8 +522,10 @@ impl ScalarIndex {
         col_nonnull_count.resize(column_count, 0);
 
         for (col_index, column) in schema.columns.iter().enumerate() {
-            match column.ty {
-                ColumnType::Text => {
+            match &column.ty {
+                // ENUM 列は TEXT と同じ辞書表現を共有する（Issue #890 D3。
+                // ラベルは短いため平均値長ゲートで除外されることは実質ない）。
+                ColumnType::Text | ColumnType::Enum(_) => {
                     // `acc` は 1 行につき列あたり高々 1 値しか追加されないため
                     // `row_count` が確保上限になる。倍増などの成長戦略による
                     // 余剰確保を避けるため、行走査を始める前に必要量ちょうどを
@@ -546,11 +548,18 @@ impl ScalarIndex {
                 // （#881）では `Vector` 列と同じく未索引のまま扱う。`BOOLEAN` 列も
                 // 索引対象外（Issue #883・D-e。値域が 2 値のため索引化コストに
                 // 見合わず、対応述語 `BoolEquals` は常に plain scan——
-                // `scalar_plan.rs` 参照——のまま据え置く）。
+                // `scalar_plan.rs` 参照——のまま据え置く）。`ARRAY` 列（TABLE-14・
+                // Issue #888）・`BYTEA` 列（Issue #886）・`JSON`／`JSONB` 列
+                // （TABLE-14・Issue #889。拡張は Issue #893 へ申し送り）もいずれも
+                // 等価・前方一致述語を持たないため同じく非索引化。
                 ColumnType::Vector(_)
                 | ColumnType::Integer
                 | ColumnType::BigInt
-                | ColumnType::Boolean => per_column.push(None),
+                | ColumnType::Boolean
+                | ColumnType::Array(_)
+                | ColumnType::Bytea
+                | ColumnType::Json
+                | ColumnType::Jsonb => per_column.push(None),
             }
         }
 
@@ -572,12 +581,14 @@ impl ScalarIndex {
                 if !is_indexed_column {
                     continue;
                 }
-                // 索引対象（`per_column[col_index] == Some(_)`）は `TEXT` 列
-                // 構築時にのみ `Some` を積む契約（上の初期化ループ参照）ため、
-                // ここへ到達する値は常に `ScalarRef::Text`。`INTEGER`／`BIGINT`／
-                // `BOOLEAN` は未索引のまま（`per_column` が `None`）のため、
-                // `is_indexed_column` チェックで既に弾かれている。
-                let Some(v) = v.as_text() else { continue };
+                // 索引対象列は常に `TEXT`／`ENUM`（上記の列単位除外により
+                // `INTEGER`／`BIGINT`／`BOOLEAN`／`VECTOR`／`BYTEA` は
+                // `per_column[col_index] == None` のまま到達しない）。
+                // `as_dictionary_text` で両者を同じ辞書表現として扱う
+                // （Issue #890 D3）。
+                let Some(v) = v.as_dictionary_text() else {
+                    continue;
+                };
                 let v_len = v.len();
                 let (Some(&running), Some(&nonnull)) = (
                     col_running_bytes.get(col_index),

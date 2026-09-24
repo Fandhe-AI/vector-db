@@ -548,6 +548,230 @@ pub fn parse_json(s: &str) -> Result<JsonValue, JsonError> {
     Ok(value)
 }
 
+/// `JSON`／`JSONB` 列（TABLE-14・TASK-198、Issue #889）1 件あたりの最大バイト長。
+/// `row_codec::encode_scalar_columns` は TEXT 列と同じ枠（presence 1 バイト +
+/// `u32 LE` 長 4 バイト + UTF-8 本体）でこの値をスカラーペイロードへ書き込むため、
+/// 本定数はそのフレーミング分（`row_codec::SCALAR_TEXT_ENTRY_OVERHEAD`）を差し引いた
+/// `row_codec::MAX_SCALAR_PAYLOAD_LEN` 以下に定義する（`row_codec.rs` の `const`
+/// アサーションで機械検証）。これにより、この列 1 個だけが対象行のスカラー
+/// ペイロードを占める場合、[`validate_json_column_text`]／[`canonicalize_jsonb_text`]
+/// を通過した入力は `encode_scalar_columns` で確実に格納できる（PR #1014 レビュー
+/// 指摘対応。旧定義は `row_codec::MAX_TEXT_FIELD_LEN` と同値だったため、ちょうど
+/// 上限の入力がフレーミング分だけ `MAX_SCALAR_PAYLOAD_LEN` を超え、束縛層
+/// （`sql::parser::bind_json_literal`）を通過した後に `encode_scalar_columns` 側で
+/// 拒否され得た）。同一行に他のスカラー列がある場合の累計超過は `encode_scalar_columns`
+/// が持つ TEXT 列と共通の契約であり、本定数は単一列分の収容のみを保証する。
+pub const MAX_JSON_FIELD_LEN: usize = (crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+    - crate::row_codec::SCALAR_TEXT_ENTRY_OVERHEAD) as usize;
+
+/// [`validate_json_column_text`]／[`canonicalize_jsonb_text`] の失敗を表す分類済み
+/// エラー（Issue #889 D1）。private spec（TABLE-14・TASK-198）の受理規則違反は
+/// 新規 `wire_code` を追加せず既存分類（`42601`／`54000`）へ写像する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonColumnError {
+    /// [`MAX_JSON_FIELD_LEN`] 超過（`parse_json` を呼ぶ**前**にバイト長で判定する）。
+    TooLong,
+    /// 構文不正・重複キー・非 RFC 8259 数値・深さ/要素数超過（[`JsonError`] を包む）。
+    Invalid,
+}
+
+impl ClassifiedError for JsonColumnError {
+    fn error_class(&self) -> ErrorClass {
+        match self {
+            JsonColumnError::TooLong => ErrorClass::PayloadTooLarge,
+            JsonColumnError::Invalid => ErrorClass::UnsupportedSqlSyntax,
+        }
+    }
+
+    fn client_message(&self) -> String {
+        match self {
+            JsonColumnError::TooLong => "JSON value exceeds maximum length".to_string(),
+            JsonColumnError::Invalid => "invalid JSON".to_string(),
+        }
+    }
+}
+
+impl JsonColumnError {
+    /// SQLSTATE 風 `wire_code`（[`ClassifiedError`] へ委譲。実装型ごとに再定義しない）。
+    pub fn wire_code(&self) -> &'static str {
+        ClassifiedError::wire_code(self)
+    }
+}
+
+/// `JSON` 列（正規化しない）向けの検証: 総バイト長を [`parse_json`] を呼ぶ**前**に
+/// 判定してから構文検証する。呼び出し元（`row_codec` の encode チョークポイント・
+/// SQL/NoSQL 表層の束縛層）はこれを通過した `s` をそのまま格納する契約とする
+/// （Issue #889 D2「格納時検証の単一チョークポイント」）。
+pub fn validate_json_column_text(s: &str) -> Result<(), JsonColumnError> {
+    if s.len() > MAX_JSON_FIELD_LEN {
+        return Err(JsonColumnError::TooLong);
+    }
+    parse_json(s).map_err(|_| JsonColumnError::Invalid)?;
+    Ok(())
+}
+
+/// `JSONB` 列向けの正規化: 検証後に [`write_canonical`] で再シリアライズした文字列を
+/// 返す（キーはキー文字列の昇順・空白なし。数値は [`JsonNumber`] の表現をそのまま
+/// 経由するため往復ずれが生じない）。エスケープ展開で正規化後に伸びうるため、
+/// 正規化後の長さも再判定する。
+pub fn canonicalize_jsonb_text(s: &str) -> Result<String, JsonColumnError> {
+    if s.len() > MAX_JSON_FIELD_LEN {
+        return Err(JsonColumnError::TooLong);
+    }
+    let value = parse_json(s).map_err(|_| JsonColumnError::Invalid)?;
+    let mut out = String::new();
+    write_canonical(&value, &mut out);
+    if out.len() > MAX_JSON_FIELD_LEN {
+        return Err(JsonColumnError::TooLong);
+    }
+    Ok(out)
+}
+
+/// `v` を正規化 JSON テキストとして `out` へ追記する（唯一の正規化シリアライザ。
+/// `JSONB` 列格納時の正規化・NoSQL 応答の再シリアライズがこれを共有する）。
+/// オブジェクトのキーは [`JsonValue::Object`] が `BTreeMap` であるため既にキー
+/// 文字列の昇順で走査され、要素間・キーと値の間に空白を挟まない。
+pub fn write_canonical(v: &JsonValue, out: &mut String) {
+    match v {
+        JsonValue::Null => out.push_str("null"),
+        JsonValue::Bool(true) => out.push_str("true"),
+        JsonValue::Bool(false) => out.push_str("false"),
+        JsonValue::Number(n) => write_canonical_number(n, out),
+        JsonValue::String(s) => write_canonical_string(s, out),
+        JsonValue::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        JsonValue::Object(map) => {
+            out.push('{');
+            for (i, (k, v)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_string(k, out);
+                out.push(':');
+                write_canonical(v, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// [`JsonNumber`] を正規化テキストへ書き出す。整数 variant は 10 進整数として、
+/// `Float` variant はパース時点の生リテラル文字列（`text`）をそのまま出力する
+/// （`f64` を経由した再フォーマットは往復ずれ・表層横断 `content_hash` の不一致を
+/// 招くため避ける。`JsonNumber::Float` のドキュメンテーションコメント参照）。
+fn write_canonical_number(n: &JsonNumber, out: &mut String) {
+    match n {
+        JsonNumber::PosInt(v) => out.push_str(&v.to_string()),
+        JsonNumber::NegInt(v) => out.push_str(&v.to_string()),
+        JsonNumber::Float { text, .. } => out.push_str(text),
+    }
+}
+
+/// RFC 8259 準拠の最小エスケーパ（自作。wire-server の `error_body` エスケーパへは
+/// engine から依存できないため独立実装とする）。`"`・`\`・U+0000〜U+001F を
+/// エスケープし、それ以外（非 ASCII の生 UTF-8 を含む）はそのまま出力する。
+fn write_canonical_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// JSON パス参照（Issue #889 D5）の 1 段。SQL/NoSQL 表層への構文露出は行わず、
+/// engine の Rust API に限定した最小形（キー参照・配列添字参照）とする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonPathStep {
+    Key(String),
+    Index(usize),
+}
+
+/// パス参照 API の失敗（ステップ数上限超過）を表すマーカー型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JsonPathError;
+
+impl JsonPathError {
+    pub fn wire_code(&self) -> &'static str {
+        ClassifiedError::wire_code(self)
+    }
+}
+
+impl ClassifiedError for JsonPathError {
+    fn error_class(&self) -> ErrorClass {
+        ErrorClass::UnsupportedSqlSyntax
+    }
+
+    fn client_message(&self) -> String {
+        "invalid JSON path".to_string()
+    }
+}
+
+/// 検証済みの JSON パス（ステップ数は [`MAX_JSON_DEPTH`] 以下。値のネスト深さ上限と
+/// 揃え、パス自体が DoS の温床にならないようにする）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonPath {
+    steps: Vec<JsonPathStep>,
+}
+
+impl JsonPath {
+    pub fn new(steps: Vec<JsonPathStep>) -> Result<Self, JsonPathError> {
+        if steps.len() > MAX_JSON_DEPTH {
+            return Err(JsonPathError);
+        }
+        Ok(Self { steps })
+    }
+
+    pub fn steps(&self) -> &[JsonPathStep] {
+        &self.steps
+    }
+}
+
+/// `v` から `path` が指す部分値への参照を返す（キー不在・型不一致・範囲外は
+/// `None`。untrusted 入力経路のため添字アクセスではなく `get()` を使う）。
+pub fn extract_path<'a>(v: &'a JsonValue, path: &JsonPath) -> Option<&'a JsonValue> {
+    let mut cur = v;
+    for step in path.steps() {
+        cur = match (cur, step) {
+            (JsonValue::Object(map), JsonPathStep::Key(k)) => map.get(k)?,
+            (JsonValue::Array(items), JsonPathStep::Index(i)) => items.get(*i)?,
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+/// 格納テキスト `stored`（`JSON`／`JSONB` 列の値）をパースし、`path` が指す部分値を
+/// 正規化テキストで返す（`None` はキー不在・型不一致・範囲外。パース失敗は格納
+/// 契約違反のため呼び出し元の内部エラーとして扱う）。
+pub fn extract_path_text(stored: &str, path: &JsonPath) -> Result<Option<String>, JsonColumnError> {
+    let value = parse_json(stored).map_err(|_| JsonColumnError::Invalid)?;
+    Ok(extract_path(&value, path).map(|v| {
+        let mut out = String::new();
+        write_canonical(v, &mut out);
+        out
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,5 +1034,183 @@ mod tests {
                 "mismatch for {text:?}"
             );
         }
+    }
+
+    // --- Issue #889（TABLE-14・TASK-198）: JSON/JSONB 列向けヘルパーの単体テスト ---
+
+    #[test]
+    fn validate_json_column_text_accepts_valid_json() {
+        assert!(validate_json_column_text(r#"{"a":1}"#).is_ok());
+        assert!(validate_json_column_text("[1,2,3]").is_ok());
+        assert!(validate_json_column_text("null").is_ok());
+        assert!(validate_json_column_text("42").is_ok());
+        assert!(validate_json_column_text(r#""s""#).is_ok());
+    }
+
+    #[test]
+    fn validate_json_column_text_rejects_invalid_syntax() {
+        let err = validate_json_column_text("not json").unwrap_err();
+        assert_eq!(err, JsonColumnError::Invalid);
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    // 総バイト長の判定が `parse_json` を呼ぶ**前**に行われることを固定する
+    // （Issue #889 D2）。上限+1 バイトの、構文としても不正な入力
+    // （閉じ括弧を欠く）を渡し、`Invalid`（構文エラー）ではなく `TooLong`
+    // （長さエラー）が返ることで判定順序を検証する。
+    #[test]
+    fn validate_json_column_text_checks_length_before_parsing() {
+        let oversized = format!("[{}", "1".repeat(MAX_JSON_FIELD_LEN));
+        assert!(oversized.len() > MAX_JSON_FIELD_LEN);
+        let err = validate_json_column_text(&oversized).unwrap_err();
+        assert_eq!(err, JsonColumnError::TooLong);
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn validate_json_column_text_accepts_at_exact_length_limit() {
+        // ちょうど上限バイト数の有効な JSON は受理される（off-by-one 検査）。
+        // 単一の文字列リテラルは `MAX_JSON_STRING_CHARS`（別の上限。1 MiB）に
+        // 抵触するため、5 要素の配列（各要素は上限未満の文字列）で目標
+        // バイト数をちょうど組み立てる: `[` + 5 要素（`"`×2 + 本体） + 4 個の
+        // `,` + `]`。
+        let target = MAX_JSON_FIELD_LEN;
+        let overhead = 1 + 1 + 4 + 5 * 2; // "[" + "]" + 4 commas + 5 pairs of quotes
+        let content_total = target - overhead;
+        let base = content_total / 5;
+        let remainder = content_total % 5;
+        let lens = [
+            base,
+            base,
+            base,
+            base,
+            base + remainder, // 端数は最後の要素へ寄せる
+        ];
+        assert!(lens.iter().all(|&l| l < MAX_JSON_STRING_CHARS));
+        let mut s = String::new();
+        s.push('[');
+        for (i, len) in lens.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push('"');
+            s.push_str(&"a".repeat(*len));
+            s.push('"');
+        }
+        s.push(']');
+        assert_eq!(s.len(), target, "constructed JSON length mismatch");
+        assert!(validate_json_column_text(&s).is_ok(), "len={}", s.len());
+    }
+
+    #[test]
+    fn canonicalize_jsonb_text_sorts_keys_and_strips_whitespace() {
+        let canonical = canonicalize_jsonb_text(r#"{ "b": 2, "a": 1 }"#).expect("valid JSON");
+        assert_eq!(canonical, r#"{"a":1,"b":2}"#);
+    }
+
+    #[test]
+    fn canonicalize_jsonb_text_is_idempotent() {
+        let once = canonicalize_jsonb_text(r#"{"b":2,"a":1}"#).expect("valid JSON");
+        let twice = canonicalize_jsonb_text(&once).expect("valid JSON");
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn canonicalize_jsonb_text_preserves_float_literal_text() {
+        // 浮動小数はパース時点の生リテラル文字列をそのまま出力する
+        // （`f64` を経由した再フォーマットによる往復ずれを避ける）。
+        let canonical = canonicalize_jsonb_text("1.5000").expect("valid JSON");
+        assert_eq!(canonical, "1.5000");
+    }
+
+    #[test]
+    fn canonicalize_jsonb_text_checks_length_before_parsing() {
+        let oversized = format!("[{}", "1".repeat(MAX_JSON_FIELD_LEN));
+        let err = canonicalize_jsonb_text(&oversized).unwrap_err();
+        assert_eq!(err, JsonColumnError::TooLong);
+    }
+
+    #[test]
+    fn canonicalize_jsonb_text_rejects_invalid_syntax() {
+        let err = canonicalize_jsonb_text("not json").unwrap_err();
+        assert_eq!(err, JsonColumnError::Invalid);
+    }
+
+    #[test]
+    fn write_canonical_escapes_control_characters_and_quotes() {
+        let value = parse_json("\"a\\\"b\\nc\"").expect("valid JSON");
+        let mut out = String::new();
+        write_canonical(&value, &mut out);
+        assert_eq!(out, "\"a\\\"b\\nc\"");
+    }
+
+    #[test]
+    fn write_canonical_preserves_non_ascii_utf8() {
+        let value = parse_json("\"\u{3042}\"").expect("valid JSON");
+        let mut out = String::new();
+        write_canonical(&value, &mut out);
+        assert_eq!(out, "\"\u{3042}\"");
+    }
+
+    #[test]
+    fn extract_path_resolves_nested_key_and_index() {
+        let value = parse_json(r#"{"a":{"b":[10,20,30]}}"#).expect("valid JSON");
+        let path = JsonPath::new(vec![
+            JsonPathStep::Key("a".to_string()),
+            JsonPathStep::Key("b".to_string()),
+            JsonPathStep::Index(1),
+        ])
+        .expect("valid path");
+        let found = extract_path(&value, &path).expect("path should resolve");
+        assert_eq!(found, &JsonValue::Number(JsonNumber::PosInt(20)));
+    }
+
+    #[test]
+    fn extract_path_returns_none_for_missing_key_or_type_mismatch_or_out_of_range() {
+        let value = parse_json(r#"{"a":[1,2]}"#).expect("valid JSON");
+        // キー不在。
+        let missing_key = JsonPath::new(vec![JsonPathStep::Key("z".to_string())]).unwrap();
+        assert_eq!(extract_path(&value, &missing_key), None);
+        // 型不一致（オブジェクトへ Index、配列へ Key）。
+        let type_mismatch = JsonPath::new(vec![
+            JsonPathStep::Key("a".to_string()),
+            JsonPathStep::Key("z".to_string()),
+        ])
+        .unwrap();
+        assert_eq!(extract_path(&value, &type_mismatch), None);
+        // 範囲外の添字。
+        let out_of_range = JsonPath::new(vec![
+            JsonPathStep::Key("a".to_string()),
+            JsonPathStep::Index(99),
+        ])
+        .unwrap();
+        assert_eq!(extract_path(&value, &out_of_range), None);
+    }
+
+    #[test]
+    fn json_path_new_rejects_excess_step_count() {
+        let steps = (0..=MAX_JSON_DEPTH)
+            .map(|i| JsonPathStep::Key(i.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(steps.len(), MAX_JSON_DEPTH + 1);
+        assert!(JsonPath::new(steps).is_err());
+    }
+
+    #[test]
+    fn extract_path_text_returns_canonical_text_of_resolved_value() {
+        let stored = r#"{"a":{"b":1}}"#;
+        let path = JsonPath::new(vec![JsonPathStep::Key("a".to_string())]).unwrap();
+        let text = extract_path_text(stored, &path)
+            .expect("valid stored JSON")
+            .expect("path should resolve");
+        assert_eq!(text, r#"{"b":1}"#);
+    }
+
+    #[test]
+    fn extract_path_text_returns_none_for_unresolved_path() {
+        let stored = r#"{"a":1}"#;
+        let path = JsonPath::new(vec![JsonPathStep::Key("z".to_string())]).unwrap();
+        let result = extract_path_text(stored, &path).expect("valid stored JSON");
+        assert_eq!(result, None);
     }
 }
