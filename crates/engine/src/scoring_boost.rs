@@ -99,7 +99,7 @@ impl ScoringBoost {
             })?;
         match column.ty {
             ColumnType::Text => {}
-            ColumnType::Vector(_) => {
+            ColumnType::Vector(_) | ColumnType::Boolean => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {:?} is not a TEXT column",
                     self.column

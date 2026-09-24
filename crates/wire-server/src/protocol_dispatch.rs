@@ -1,13 +1,21 @@
-//! 認証後に届くフロントエンドメッセージの型バイト分類と、拡張クエリプロトコル
-//! 系メッセージ（未対応）に対する fail-closed な拒否応答＋切断を担う。
+//! 認証後に届くフロントエンドメッセージの型バイト分類と、未対応の拡張クエリ
+//! プロトコル系メッセージに対する fail-closed な拒否応答＋切断を担う。
 //!
 //! `handshake::post_auth_loop` から呼ばれる。フレーミング（長さ検証）は
 //! `handshake` モジュール（TASK-68 の管轄）、接続数・タイムアウトは `server`
 //! モジュール（TASK-69 の管轄）のままで、本モジュールはどちらにも触れない。
 //!
-//! 対応: TASK-71（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-8）。
-//! SQLSTATE `0A000` の応答契約は `docs/spec/04-behavior/error-format.md` を参照
-//! （spec 本文は転記しない）。
+//! 対応: TASK-71（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-8）で
+//! 拡張クエリプロトコル全系列（Parse/Bind/Describe/Execute/Sync/Close/Flush）を
+//! 一律拒否する契約を確立した。WIRE-11（Issue #933）で Parse（'P'）・
+//! Describe（'D' 種別 S）を [`crate::extended_query`] が受理する経路へ切り替え、
+//! 本モジュールの `ExtendedQuery` 分類は Bind/Execute/Sync/Close/Flush
+//! （'B'/'E'/'S'/'C'/'H'）に縮小した——Parse/Describe は
+//! [`FrontendMessageKind::Parse`]／[`FrontendMessageKind::Describe`] として
+//! 別分類になり、`handshake::post_auth_loop` から本モジュールの
+//! `reject_and_close` へは到達しない（`extended_query` モジュールドキュメント
+//! 参照）。SQLSTATE `0A000` の応答契約は `docs/spec/04-behavior/error-format.md`
+//! を参照（spec 本文は転記しない）。
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -23,8 +31,18 @@ pub(crate) enum FrontendMessageKind {
     /// Terminate（'X'）。分類のみ担い、実処理は `handshake::post_auth_loop` の
     /// 既存分岐（変更なし）に委ねる。
     Terminate,
-    /// 拡張クエリプロトコル系（Parse/Bind/Describe/Execute/Sync/Close/Flush）。
-    /// WIRE-8 の主対象。中に元の型バイトを保持する（ログ用途のみ）。
+    /// Parse（'P'）。WIRE-11（Issue #933）で `crate::extended_query::handle_parse`
+    /// が受理する経路へ切り替わったため、本モジュールの `reject_and_close` には
+    /// 到達しない（`classify` の全域性を保つために分類のみ残す）。
+    Parse,
+    /// Describe（'D'）。種別バイト（'S'/'P'）は body 側にあるため本分類では
+    /// 判別しない。`crate::extended_query::handle_describe` が本文を読んで
+    /// 種別ごとに振り分ける（statement は受理、portal は WIRE-8 のまま
+    /// `0A000` + 切断）。
+    Describe,
+    /// 拡張クエリプロトコル系（Bind/Execute/Sync/Close/Flush）。WIRE-8 の
+    /// 主対象のまま残る（Parse/Describe は上記へ切り出し済み）。中に元の
+    /// 型バイトを保持する（ログ用途のみ）。
     ExtendedQuery(u8),
     /// COPY・関数呼び出し系（FunctionCall/CopyData/CopyDone/CopyFail）。
     /// 拡張クエリと同様に未対応のため同じ応答契約（0A000 + 切断）に倒す。
@@ -40,9 +58,9 @@ pub(crate) fn classify(type_byte: u8) -> FrontendMessageKind {
     match type_byte {
         b'Q' => FrontendMessageKind::SimpleQuery,
         b'X' => FrontendMessageKind::Terminate,
-        b'P' | b'B' | b'D' | b'E' | b'S' | b'C' | b'H' => {
-            FrontendMessageKind::ExtendedQuery(type_byte)
-        }
+        b'P' => FrontendMessageKind::Parse,
+        b'D' => FrontendMessageKind::Describe,
+        b'B' | b'E' | b'S' | b'C' | b'H' => FrontendMessageKind::ExtendedQuery(type_byte),
         b'F' | b'd' | b'c' | b'f' => FrontendMessageKind::UnsupportedFeature(type_byte),
         other => FrontendMessageKind::Unknown(other),
     }
@@ -112,10 +130,14 @@ fn response_message(kind: FrontendMessageKind) -> &'static str {
         FrontendMessageKind::Unknown(_) => {
             "this frontend message type is not supported on this connection"
         }
-        // SimpleQuery / Terminate は `handshake::post_auth_loop` の既存分岐で
-        // 処理され本関数には到達しない契約だが、`classify` の全域性を保つために
-        // 網羅しておく。
-        FrontendMessageKind::SimpleQuery | FrontendMessageKind::Terminate => {
+        // SimpleQuery / Terminate / Parse / Describe は `handshake::post_auth_loop`
+        // の既存分岐（Parse/Describe は `crate::extended_query` 経由。WIRE-11・
+        // Issue #933）で処理され本関数には到達しない契約だが、`classify` の
+        // 全域性を保つために網羅しておく。
+        FrontendMessageKind::SimpleQuery
+        | FrontendMessageKind::Terminate
+        | FrontendMessageKind::Parse
+        | FrontendMessageKind::Describe => {
             "this frontend message type is not supported on this connection"
         }
     }
@@ -125,6 +147,8 @@ fn describe_kind(kind: FrontendMessageKind) -> String {
     match kind {
         FrontendMessageKind::SimpleQuery => "SimpleQuery".to_string(),
         FrontendMessageKind::Terminate => "Terminate".to_string(),
+        FrontendMessageKind::Parse => "Parse".to_string(),
+        FrontendMessageKind::Describe => "Describe".to_string(),
         FrontendMessageKind::ExtendedQuery(b) => format!("ExtendedQuery({})", b as char),
         FrontendMessageKind::UnsupportedFeature(b) => format!("UnsupportedFeature({})", b as char),
         FrontendMessageKind::Unknown(b) => format!("Unknown(0x{b:02x})"),
@@ -197,7 +221,7 @@ mod tests {
         // ExtendedQuery / UnsupportedFeature / Unknown で文言を分け、
         // 「拡張クエリプロトコル」という事実と異なる文言を UnsupportedFeature・
         // Unknown に流用しないことを保証する（レビュー指摘の回帰防止）。
-        let extended = response_message(FrontendMessageKind::ExtendedQuery(b'P'));
+        let extended = response_message(FrontendMessageKind::ExtendedQuery(b'B'));
         let unsupported = response_message(FrontendMessageKind::UnsupportedFeature(b'F'));
         let unknown = response_message(FrontendMessageKind::Unknown(b'?'));
 
@@ -216,7 +240,9 @@ mod tests {
             match byte {
                 b'Q' => assert_eq!(kind, FrontendMessageKind::SimpleQuery),
                 b'X' => assert_eq!(kind, FrontendMessageKind::Terminate),
-                b'P' | b'B' | b'D' | b'E' | b'S' | b'C' | b'H' => {
+                b'P' => assert_eq!(kind, FrontendMessageKind::Parse),
+                b'D' => assert_eq!(kind, FrontendMessageKind::Describe),
+                b'B' | b'E' | b'S' | b'C' | b'H' => {
                     assert_eq!(kind, FrontendMessageKind::ExtendedQuery(byte))
                 }
                 b'F' | b'd' | b'c' | b'f' => {
@@ -265,7 +291,7 @@ mod tests {
 
         reject_and_close(
             &mut server,
-            FrontendMessageKind::ExtendedQuery(b'P'),
+            FrontendMessageKind::ExtendedQuery(b'B'),
             fake_write_error_response,
         )
         .expect("reject_and_close succeeds");

@@ -83,6 +83,9 @@
 //!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
 //!   語彙パーサと、`simple_query::execute_and_respond` の登録ブロック内から
 //!   呼ばれる commit 後 panic 注入。default features には含まれない
+//! - [`tls`]: 親 Issue #941（TLS 1.3 サーバー側自作実装。TASK-228・WIRE-9・
+//!   HTTP-10 ポインタ）の構成要素。現時点では X25519 鍵交換（RFC 7748・
+//!   定数時間。Issue #955）まで実装済み。接続への結線は #966 以降
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）、
 //! TASK-68（対象ビヘイビア WIRE-4, WIRE-10）、TASK-69（対象ビヘイビア WIRE-5, WIRE-6）、
@@ -94,6 +97,7 @@ pub mod auth;
 pub mod bind_guard;
 pub mod durability_opt;
 pub mod error_response;
+pub mod extended_query;
 #[cfg(feature = "fault-injection")]
 pub mod fault_injection;
 pub mod framing;
@@ -107,3 +111,4 @@ pub mod search_engine_opt;
 pub mod server;
 pub mod simple_query;
 pub mod surface;
+pub mod tls;
