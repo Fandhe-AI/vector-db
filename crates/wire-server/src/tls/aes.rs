@@ -333,11 +333,16 @@ fn expand_key(key: &[u8; KEY_LEN]) -> [[u8; 16]; NR + 1] {
             sbox_apply_bytes(&mut temp);
             temp[0] ^= RCON[i / NK - 1];
         }
-        let prev = w[i - NK];
+        let mut prev = w[i - NK];
         for j in 0..4 {
             temp[j] ^= prev[j];
         }
         w[i] = temp;
+        // 鍵由来の一時値（w[i-1]・w[i-NK] のコピー）はここで用済みになる。
+        // 次の反復でスタック上のバッファが再利用される前に best-effort で
+        // ゼロ化し、残存コピーの生存期間を縮める（PR #1023 codex-review 指摘）。
+        zeroize(&mut temp);
+        zeroize(&mut prev);
     }
 
     let mut round_keys = [[0u8; 16]; NR + 1];
@@ -345,6 +350,14 @@ fn expand_key(key: &[u8; KEY_LEN]) -> [[u8; 16]; NR + 1] {
         for c in 0..4 {
             rk[4 * c..4 * c + 4].copy_from_slice(&w[r * 4 + c]);
         }
+    }
+    // `w` は元鍵（w[0..NK]）を含む全鍵展開ワード列であり、round_keys へ
+    // コピーした後もスタック上に値が残り得る。Aes128::Drop が round_keys を
+    // ゼロ化しても w 自体は別バッファのため対象外だった（PR #1023
+    // codex-review 指摘）。呼び出し元へ返す前に全ワードを best-effort で
+    // ゼロ化する。
+    for word in w.iter_mut() {
+        zeroize(word);
     }
     round_keys
 }
