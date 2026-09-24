@@ -761,7 +761,12 @@ pub(crate) fn execute_statement_with_cache(
         // メント参照）。
         if is_hybrid && !skip_sparse_accumulation {
             if let Some(idx) = text_column_index {
-                if let Some(Some(t)) = scanned.get(idx) {
+                if let Some(t) = scanned
+                    .get(idx)
+                    .copied()
+                    .flatten()
+                    .and_then(|v| v.as_text())
+                {
                     if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
                         return Err(ArenaError::CapacityExceeded);
                     }
@@ -820,7 +825,7 @@ pub(crate) fn execute_statement_with_cache(
                 }
                 match slot {
                     None => kept.push(Value::Null),
-                    Some(t) => {
+                    Some(row_codec::ScalarRef::Text(t)) => {
                         let owned = try_alloc_text_for_budget(
                             t,
                             &mut candidate_scalar_bytes,
@@ -828,6 +833,10 @@ pub(crate) fn execute_statement_with_cache(
                         )?;
                         kept.push(Value::Text(owned));
                     }
+                    // REAL/DOUBLE は固定長のためヒープ確保・バイト予算計上を
+                    // 要しない（`Value::Real`/`Value::Double` はスタック上の値）。
+                    Some(row_codec::ScalarRef::Real(v)) => kept.push(Value::Real(v)),
+                    Some(row_codec::ScalarRef::Double(v)) => kept.push(Value::Double(v)),
                 }
             }
             kept
@@ -1800,10 +1809,12 @@ pub(crate) fn execute_statement_with_cache(
             let Some(columns) = candidate_columns.get(slot) else {
                 continue;
             };
-            let scanned: Vec<Option<&str>> = columns
+            let scanned: Vec<Option<row_codec::ScalarRef<'_>>> = columns
                 .iter()
                 .map(|v| match v {
-                    Value::Text(t) => Some(t.as_str()),
+                    Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
+                    Value::Real(r) => Some(row_codec::ScalarRef::Real(*r)),
+                    Value::Double(d) => Some(row_codec::ScalarRef::Double(*d)),
                     Value::Null | Value::Vector(_) => None,
                 })
                 .collect();
@@ -2126,7 +2137,7 @@ fn decode_deferred_scalars(
         }
         match slot {
             None => out.push(Value::Null),
-            Some(t) => {
+            Some(row_codec::ScalarRef::Text(t)) => {
                 let owned = try_alloc_text_for_budget(t, budget, MAX_CANDIDATE_SCALAR_BYTES)
                     .map_err(|_| {
                         SqlSurfaceError::payload_too_large(
@@ -2135,6 +2146,8 @@ fn decode_deferred_scalars(
                     })?;
                 out.push(Value::Text(owned));
             }
+            Some(row_codec::ScalarRef::Real(v)) => out.push(Value::Real(v)),
+            Some(row_codec::ScalarRef::Double(v)) => out.push(Value::Double(v)),
         }
     }
     Ok(out)
@@ -2359,7 +2372,31 @@ fn project_rows(
                         ColumnType::Text => match decoded.get(*index) {
                             Some(Value::Text(t)) => cells.push(Cell::Text(try_clone_text(t)?)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_)) => {
+                            Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        // F8（Issue #882 計画）: REAL は f64 への無損失拡大、DOUBLE
+                        // はそのまま `Cell::Float` へ投影する（`Cell` enum への
+                        // variant 追加は #882 計画で見送り、既存の Float 経路を
+                        // 共有する設計判断）。
+                        ColumnType::Real => match decoded.get(*index) {
+                            Some(Value::Real(v)) => cells.push(Cell::Float(f64::from(*v))),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            _ => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Double => match decoded.get(*index) {
+                            Some(Value::Double(v)) => cells.push(Cell::Float(*v)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            _ => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })

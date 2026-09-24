@@ -316,6 +316,35 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
     Ok(values)
 }
 
+/// `REAL`／`DOUBLE PRECISION` 列（TABLE-13・TASK-196）のリテラル束縛を 1 箇所へ
+/// 集約するヘルパー（F7・Issue #882 計画）。`raw`（`InsertLiteral::Number` の
+/// 生テキスト。負号は `expect_literal` が既に前置済み）を
+/// [`crate::scalar_float`] の閉じた文法で解析し、`Malformed` は `22000`
+/// （既存の型不一致と同じ `InvalidInput`）、`OutOfRange`（非有限化・非ゼロ
+/// アンダーフロー）は `22003`（`NumericOutOfRange`）へ写像する。
+pub(crate) fn bind_real_literal(raw: &str) -> Result<f32, SqlSurfaceError> {
+    crate::scalar_float::parse_real(raw).map_err(|e| match e {
+        crate::scalar_float::ParseFloatError::Malformed => {
+            SqlSurfaceError::invalid_input(format!("malformed REAL literal: {raw:?}"))
+        }
+        crate::scalar_float::ParseFloatError::OutOfRange => {
+            SqlSurfaceError::numeric_out_of_range(format!("REAL literal out of range: {raw:?}"))
+        }
+    })
+}
+
+/// [`bind_real_literal`] の `DOUBLE PRECISION` 版。
+pub(crate) fn bind_double_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
+    crate::scalar_float::parse_double(raw).map_err(|e| match e {
+        crate::scalar_float::ParseFloatError::Malformed => {
+            SqlSurfaceError::invalid_input(format!("malformed DOUBLE PRECISION literal: {raw:?}"))
+        }
+        crate::scalar_float::ParseFloatError::OutOfRange => SqlSurfaceError::numeric_out_of_range(
+            format!("DOUBLE PRECISION literal out of range: {raw:?}"),
+        ),
+    })
+}
+
 /// スキーマの唯一の `VECTOR` 列（インデックス・宣言次元）を返す。`VECTOR` 列を
 /// 持たないテーブルは束縛不能（`catalog.rs::validate_schema` が「`VECTOR` 列は
 /// 高々 1 つ」を DDL 時点で強制済みのため、複数該当は構造上起こらない）。
@@ -328,7 +357,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .enumerate()
         .find_map(|(idx, c)| match c.ty {
             ColumnType::Vector(dim) => Some((idx, dim)),
-            ColumnType::Text => None,
+            ColumnType::Text | ColumnType::Real | ColumnType::Double => None,
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
@@ -364,9 +393,9 @@ pub(crate) fn text_column_index(
                 .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
             match column.ty {
                 ColumnType::Text => Ok(idx),
-                ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} is not a TEXT column"
-                ))),
+                ColumnType::Vector(_) | ColumnType::Real | ColumnType::Double => Err(
+                    SqlSurfaceError::invalid_input(format!("column {name:?} is not a TEXT column")),
+                ),
             }
         })
 }
@@ -1115,6 +1144,24 @@ fn bind_insert_row(
                     "column {name:?} expects a text literal, got a number"
                 )))
             }
+            // F7（Issue #882 計画）: REAL/DOUBLE は数値リテラルのみ受理する
+            // （文字列からの暗黙変換は行わない。#896 へ申し送り）。
+            (ColumnType::Real, InsertLiteral::Number(n)) => {
+                crate::row_codec::Value::Real(bind_real_literal(n)?)
+            }
+            (ColumnType::Real, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a REAL literal, got a string"
+                )))
+            }
+            (ColumnType::Double, InsertLiteral::Number(n)) => {
+                crate::row_codec::Value::Double(bind_double_literal(n)?)
+            }
+            (ColumnType::Double, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a DOUBLE PRECISION literal, got a string"
+                )))
+            }
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
             *slot = value;
@@ -1261,6 +1308,22 @@ fn bind_set_assignments(
             (ColumnType::Text, InsertLiteral::Number(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a number"
+                )))
+            }
+            (ColumnType::Real, InsertLiteral::Number(n)) => {
+                crate::row_codec::Value::Real(bind_real_literal(n)?)
+            }
+            (ColumnType::Real, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a REAL literal, got a string"
+                )))
+            }
+            (ColumnType::Double, InsertLiteral::Number(n)) => {
+                crate::row_codec::Value::Double(bind_double_literal(n)?)
+            }
+            (ColumnType::Double, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a DOUBLE PRECISION literal, got a string"
                 )))
             }
         };
@@ -1775,6 +1838,22 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a text literal, got a number"
                         )))
                     }
+                    (ColumnType::Real, InsertLiteral::Number(n)) => {
+                        crate::row_codec::Value::Real(bind_real_literal(n)?)
+                    }
+                    (ColumnType::Real, InsertLiteral::String(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a REAL literal, got a string"
+                        )))
+                    }
+                    (ColumnType::Double, InsertLiteral::Number(n)) => {
+                        crate::row_codec::Value::Double(bind_double_literal(n)?)
+                    }
+                    (ColumnType::Double, InsertLiteral::String(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} expects a DOUBLE PRECISION literal, got a string"
+                        )))
+                    }
                 };
                 BoundUpsertValue::Literal(v)
             }
@@ -1866,6 +1945,22 @@ fn bind_file_insert(
             (ColumnType::Vector(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: VECTOR column must not be provided for file-form INSERT"
+                )))
+            }
+            (ColumnType::Real, InsertLiteral::Number(n)) => {
+                crate::row_codec::Value::Real(bind_real_literal(n)?)
+            }
+            (ColumnType::Real, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a REAL literal, got a string"
+                )))
+            }
+            (ColumnType::Double, InsertLiteral::Number(n)) => {
+                crate::row_codec::Value::Double(bind_double_literal(n)?)
+            }
+            (ColumnType::Double, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a DOUBLE PRECISION literal, got a string"
                 )))
             }
         };
@@ -2362,6 +2457,13 @@ fn resolve_aggregate_input(
                     (ColumnType::Vector(_), _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
+                    // F10（Issue #882 計画）: REAL/DOUBLE の集計対応は #892 の
+                    // 担当。現時点ではすべての集計関数（COUNT を含む）で拒否する。
+                    (ColumnType::Real | ColumnType::Double, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is REAL/DOUBLE and cannot be used in an aggregate"
+                        )))
+                    }
                 };
             }
             if name == "id" {

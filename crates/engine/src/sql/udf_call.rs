@@ -708,6 +708,14 @@ fn bind_expr_in(
                     ColumnType::Text => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (TEXT columns are not supported)"
                     ))),
+                    // F10（Issue #882 計画）: REAL/DOUBLE 列の式評価対応は #891 の
+                    // 担当。現時点では TEXT 列と同じ「式内で参照できない」拒否へ
+                    // 合流させる。
+                    ColumnType::Real | ColumnType::Double => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} cannot be used in an expression (REAL/DOUBLE columns are not supported)"
+                        )))
+                    }
                 };
             }
             if name == "id" {

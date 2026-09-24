@@ -220,6 +220,10 @@ pub enum ColumnType {
     /// 固定次元の埋め込み列（`VECTOR(N)`、TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は
     /// encode・decode 両側で拒否する。
     Vector(u32),
+    /// 単精度浮動小数点列（`REAL`、TABLE-13・TASK-196）。
+    Real,
+    /// 倍精度浮動小数点列（`DOUBLE PRECISION`、TABLE-13・TASK-196）。
+    Double,
 }
 
 impl ColumnType {
@@ -236,6 +240,8 @@ impl ColumnType {
         match self {
             ColumnType::Text => ("text", "-".to_string()),
             ColumnType::Vector(dim) => ("vector", dim.to_string()),
+            ColumnType::Real => ("real", "-".to_string()),
+            ColumnType::Double => ("double", "-".to_string()),
         }
     }
 
@@ -259,6 +265,22 @@ impl ColumnType {
                 })?;
                 validate_vector_dim(dim)?;
                 Ok(ColumnType::Vector(dim))
+            }
+            "real" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "real column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Real)
+            }
+            "double" => {
+                if param != "-" {
+                    return Err(CatalogError::Invalid(format!(
+                        "double column must not declare a parameter: {param:?}"
+                    )));
+                }
+                Ok(ColumnType::Double)
             }
             other => Err(CatalogError::Invalid(format!(
                 "unknown column type: {other:?}"
@@ -308,7 +330,7 @@ impl TableSchema {
     pub fn vector_dim(&self) -> Option<u32> {
         self.columns.iter().find_map(|c| match c.ty {
             ColumnType::Vector(dim) => Some(dim),
-            ColumnType::Text => None,
+            ColumnType::Text | ColumnType::Real | ColumnType::Double => None,
         })
     }
 
@@ -1452,6 +1474,45 @@ mod tests {
             encoded,
             b"v2\ncols:3\nembedding:vector:3:0\nbody:text:-:0\ntag:text:-:1\n".to_vec()
         );
+    }
+
+    /// `REAL`／`DOUBLE PRECISION` 列（TABLE-13・TASK-196）のカタログ v2 往復を
+    /// 固定する golden テスト。`param` は他のパラメータなし型（`Text`）と同じ
+    /// `-` 固定であることを含む。
+    #[test]
+    fn encode_decode_roundtrips_real_and_double_columns() {
+        let schema = TableSchema::new(
+            "metrics",
+            vec![
+                ColumnDef::new("score", ColumnType::Real, false),
+                ColumnDef::new("weight", ColumnType::Double, true),
+            ],
+        );
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        assert_eq!(
+            encoded,
+            b"v2\ncols:2\nscore:real:-:0\nweight:double:-:1\n".to_vec()
+        );
+        let decoded = decode_schema("metrics", &encoded).expect("decode should succeed");
+        assert_eq!(decoded, schema);
+    }
+
+    /// `real`／`double` タグに `-` 以外の `param` を付けた場合は拒否する
+    /// （`Text` と同じ「パラメータなし型」の契約。TABLE-13）。
+    #[test]
+    fn decode_rejects_real_and_double_with_non_dash_param() {
+        for bytes in [
+            b"v2\ncols:1\nscore:real:1:0\n".to_vec(),
+            b"v2\ncols:1\nweight:double:1:0\n".to_vec(),
+        ] {
+            assert!(
+                matches!(
+                    decode_schema("t", &bytes),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "must reject: {bytes:?}"
+            );
+        }
     }
 
     /// `param` フィールドの文字集合違反（`:`・改行相当の区切り注入、非 ASCII）を

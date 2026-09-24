@@ -159,6 +159,10 @@ pub(crate) fn project_row(
                     budget,
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
+                // F8（Issue #882 計画）: REAL は f64 への無損失拡大、DOUBLE は
+                // そのまま `Cell::Float` へ投影する。
+                Some(Value::Real(v)) => Cell::Float(f64::from(*v)),
+                Some(Value::Double(v)) => Cell::Float(*v),
                 None => return Err(returning_bug("value index out of range")),
             },
             ProjectedColumn::Computed { .. } => {

@@ -247,6 +247,14 @@ fn map_set_assignments(
                     "SET VECTOR column value must be a JSON array of numbers",
                 ))
             }
+            // F10（Issue #882 計画）: REAL/DOUBLE 列の JSON 束縛は #896 の担当。
+            // 現時点では非対応列として一律拒否する（`22000`。既存の型不一致と
+            // 同じ応答形へ合流させる）。
+            (ColumnType::Real | ColumnType::Double, _) => {
+                return Err(UpdateError::Set(
+                    "SET REAL/DOUBLE PRECISION columns are not supported yet",
+                ))
+            }
         };
         assignments.push((key.clone(), literal));
     }

@@ -213,6 +213,16 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(2);
             push_vector(b, vector)?;
         }
+        // タグ 3・4（Integer・BigInt）は Issue #881 の予約割り当て。TABLE-13・
+        // Issue #882 計画 F9: Real=5・Double=6（正規化後の LE ビット列）。
+        Value::Real(v) => {
+            b.push_u8(5);
+            b.push_raw(&v.to_le_bytes());
+        }
+        Value::Double(v) => {
+            b.push_u8(6);
+            b.push_raw(&v.to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -1487,6 +1497,38 @@ mod tests {
 
     // 一方、実際に異なる値が入れば当然ハッシュも変わる（区別できないほど鈍化
     // していないことの確認）。
+    // TABLE-13・Issue #882 計画 F9: Real=5／Double=6 のタグ割り当てを固定する
+    // golden テスト。既存タグ（Null=0／Text=1／Vector=2）と衝突せず、かつ
+    // 同じビットパターンを持つ異なる型（`Real(1.0)` と `Double(1.0)`）を
+    // 区別できることを固定する。
+    #[test]
+    fn for_typed_insert_real_and_double_tags_are_stable_and_distinct() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let real_col = Value::Real(1.0);
+        let double_col = Value::Double(1.0);
+        let text_col = Value::Text("1".to_string());
+        let cols_real: [(&str, &Value); 1] = [("v", &real_col)];
+        let cols_double: [(&str, &Value); 1] = [("v", &double_col)];
+        let cols_text: [(&str, &Value); 1] = [("v", &text_col)];
+
+        let h_real = for_typed_insert(7, Visibility::Public, &embedding, &cols_real).expect("hash");
+        let h_double =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_double).expect("hash");
+        let h_text = for_typed_insert(7, Visibility::Public, &embedding, &cols_text).expect("hash");
+
+        // 同じ論理値（1.0）でも型タグが異なれば別ハッシュになる（タグが
+        // ハッシュ入力に混ざっている証拠）。
+        assert_ne!(h_real, h_double);
+        assert_ne!(h_real, h_text);
+        assert_ne!(h_double, h_text);
+
+        // 再現性: 同一入力から同一ハッシュが得られる（タグ値が偶然の実行時
+        // 揺れでない）。
+        let h_real_again =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_real).expect("hash");
+        assert_eq!(h_real, h_real_again);
+    }
+
     #[test]
     fn for_typed_insert_differs_by_column_value() {
         let embedding = [1.0_f32, 2.0, 3.0];

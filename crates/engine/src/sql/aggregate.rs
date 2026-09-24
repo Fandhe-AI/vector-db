@@ -293,7 +293,7 @@ impl Accumulator {
         input: &AggregateInput,
         id: u64,
         vector: &RowVector<'_>,
-        scanned: &[Option<&str>],
+        scanned: &[Option<row_codec::ScalarRef<'_>>],
         scratch: &mut Vec<StackValue>,
     ) -> Result<(), SqlSurfaceError> {
         match input {
@@ -313,7 +313,11 @@ impl Accumulator {
             }
             AggregateInput::IdU64 => self.observe_id(id),
             AggregateInput::TextColumn(index) => {
-                let value = scanned.get(*index).copied().flatten();
+                let value = scanned
+                    .get(*index)
+                    .copied()
+                    .flatten()
+                    .and_then(|v| v.as_text());
                 self.observe_text(value)
             }
             AggregateInput::ScalarExpr { source, program } => {
@@ -910,7 +914,7 @@ pub(crate) fn execute_aggregate_with_cache(
             // `metadata_filters`・`expr_filters` が空（tier 決定条件）であるため、
             // 空スライスで安全に代用できる（`matches_all` は無条件で真、
             // `Accumulator::observe` の `TextColumn` はこの tier では出現しない）。
-            let scanned: Vec<Option<&str>> = match tier {
+            let scanned: Vec<Option<row_codec::ScalarRef<'_>>> = match tier {
                 DecodeTier::Fast => {
                     row_codec::validate_scalar_columns(schema, metadata)?;
                     Vec::new()

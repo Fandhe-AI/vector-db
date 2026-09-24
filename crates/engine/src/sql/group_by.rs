@@ -223,7 +223,7 @@ fn accumulate_row(
     items: &[crate::sql::parser::BoundAggregateItem],
     id: u64,
     vector: &RowVector<'_>,
-    scanned: &[Option<&str>],
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
     total_text_accumulator_bytes: &mut usize,
     expr_scratch: &mut Vec<StackValue>,
 ) -> Result<(), SqlSurfaceError> {
@@ -566,7 +566,14 @@ fn observe_candidate_slots_grouped_inner(
             }
         }
 
-        let key_value = scanned.get(group_by.column_index).copied().flatten();
+        // GROUP BY 列は束縛時に TEXT 列限定で検証済み（`bind_group_by_clause`）
+        // のため、`as_text()` は常に `Some`（値あり）か `None`（NULL）のどちらか
+        // になる。
+        let key_value = scanned
+            .get(group_by.column_index)
+            .copied()
+            .flatten()
+            .and_then(|v| v.as_text());
         let vector = RowVector {
             dim: arena.dim(),
             values: if referenced.needs_embedding() {
@@ -1011,11 +1018,12 @@ pub(crate) fn execute_grouped_aggregate(
                 // （`row_codec::scan_scalar_columns_masked`）。`GROUP BY` キー列は
                 // `ReferencedColumns::derive` の `extra_scalar_index` で常にマスクへ
                 // 含まれるため、`any_scalar_column_referenced()` は常に真。
-                let scanned: Vec<Option<&str>> = row_codec::scan_scalar_columns_masked(
-                    schema,
-                    metadata,
-                    Some(referenced.scalar_mask()),
-                )?;
+                let scanned: Vec<Option<row_codec::ScalarRef<'_>>> =
+                    row_codec::scan_scalar_columns_masked(
+                        schema,
+                        metadata,
+                        Some(referenced.scalar_mask()),
+                    )?;
 
                 // SCALAR 段（WHERE）。
                 if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
@@ -1058,7 +1066,14 @@ pub(crate) fn execute_grouped_aggregate(
                 // 一切現れない＝RLS-7・RLS-8 の `GROUP BY` 版）。借用キー（`&str`）で
                 // まず既存グループを 1 回だけ探索し、ヒットした行では所有 `String` を
                 // 一切確保しない（Issue #351）。
-                let key_value = scanned.get(group_by.column_index).copied().flatten();
+                // GROUP BY 列は束縛時に TEXT 列限定で検証済み（`bind_group_by_clause`）
+                // のため、`as_text()` は常に `Some`（値あり）か `None`（NULL）のどちらか
+                // になる。
+                let key_value = scanned
+                    .get(group_by.column_index)
+                    .copied()
+                    .flatten()
+                    .and_then(|v| v.as_text());
                 let total_group_count = string_groups.len() + usize::from(null_group.is_some());
 
                 // 行 1 件分の `VECTOR` 列ビュー（Issue #350）。`tier` が

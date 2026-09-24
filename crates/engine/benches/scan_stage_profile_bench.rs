@@ -929,7 +929,10 @@ fn main() {
         std::collections::HashMap::new();
     for (idx, metadata) in captured_metadata.iter().enumerate() {
         let scanned = scan_scalar_columns(&schema, metadata).expect("scan_scalar_columns");
-        if let Some(Some(value)) = scanned.get(lang_col_index) {
+        if let Some(Some(value)) = scanned
+            .get(lang_col_index)
+            .map(|v| v.and_then(|v| v.as_text()))
+        {
             let slot = u32::try_from(idx).expect("captured row index fits in u32");
             lang_candidates.entry(value).or_default().push(slot);
         }

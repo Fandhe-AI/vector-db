@@ -159,7 +159,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                 if let Some(column) = schema.columns.get(*index) {
                     match column.ty {
                         ColumnType::Vector(_) => needs_embedding = true,
-                        ColumnType::Text => {
+                        ColumnType::Text | ColumnType::Real | ColumnType::Double => {
                             has_scalar_reference = true;
                             if let Some(slot) = scalar_mask.get_mut(*index) {
                                 *slot = true;
@@ -333,7 +333,7 @@ pub fn execute_scan(
                 }
             }
 
-            let scanned: Vec<Option<&str>> = match tier {
+            let scanned: Vec<Option<row_codec::ScalarRef<'_>>> = match tier {
                 DecodeTier::Fast => {
                     row_codec::validate_scalar_columns(schema, metadata)?;
                     Vec::new()
@@ -438,12 +438,43 @@ pub fn execute_scan(
                                 }
                             }
                             ColumnType::Text => match scanned.get(*index) {
-                                Some(Some(t)) => cells.push(Cell::Text(try_alloc_text_for_budget(
-                                    t,
-                                    &mut byte_budget,
-                                    MAX_SCAN_RESULT_BYTES,
-                                )?)),
+                                Some(Some(row_codec::ScalarRef::Text(t))) => {
+                                    cells.push(Cell::Text(try_alloc_text_for_budget(
+                                        t,
+                                        &mut byte_budget,
+                                        MAX_SCAN_RESULT_BYTES,
+                                    )?))
+                                }
                                 Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
+                            },
+                            // F8（Issue #882 計画）: REAL/DOUBLE は `Cell::Float`
+                            // （REAL は f64 への無損失拡大）へ投影する。
+                            ColumnType::Real => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Real(v))) => {
+                                    cells.push(Cell::Float(f64::from(*v)))
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
+                            },
+                            ColumnType::Double => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Double(v))) => {
+                                    cells.push(Cell::Float(*v))
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
                             },
                         }
                     }

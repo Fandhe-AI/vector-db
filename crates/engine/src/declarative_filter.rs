@@ -80,7 +80,10 @@ impl DeclarativeFilter {
         })?;
         match column.ty {
             ColumnType::Text => {}
-            ColumnType::Vector(_) => {
+            ColumnType::Vector(_) | ColumnType::Real | ColumnType::Double => {
+                // F10（Issue #882 計画）: REAL/DOUBLE 列への宣言的フィルタは、
+                // VECTOR 列と同じ「TEXT 列でない」拒否腕へ合流させる（対象外・
+                // 対応は #891 へ申し送り）。
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {:?} is not a TEXT column",
                     self.column
@@ -216,9 +219,20 @@ pub fn bind_all(
 /// （fail-closed。`scanned` は投影・フィルタが必要とする列だけを保持する構造の
 /// ため、束縛時に検証済みの列インデックスでも呼び出し元の保持方針次第では
 /// 範囲外になり得る）。
-pub fn matches_all(filters: &[MetadataFilter], scanned: &[Option<&str>]) -> bool {
+pub fn matches_all(
+    filters: &[MetadataFilter],
+    scanned: &[Option<crate::row_codec::ScalarRef<'_>>],
+) -> bool {
     filters.iter().all(|f| {
-        let value = scanned.get(f.column_index).copied().flatten();
+        // `bind` は TEXT 列のみを受理するため、束縛済みフィルタの
+        // `column_index` が指す値は常に `ScalarRef::Text`（または NULL）の
+        // はずだが、`as_text()` は REAL/DOUBLE を防御的に `None`（不一致）へ
+        // 落とす（F10: 対応外の型は「値なし」と同じ fail-closed 扱い）。
+        let value = scanned
+            .get(f.column_index)
+            .copied()
+            .flatten()
+            .and_then(|v| v.as_text());
         f.matches(value)
     })
 }

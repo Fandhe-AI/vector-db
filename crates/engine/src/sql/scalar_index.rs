@@ -542,7 +542,11 @@ impl ScalarIndex {
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     per_column.push(Some(acc));
                 }
-                ColumnType::Vector(_) => per_column.push(None),
+                // F10（Issue #882 計画）: REAL/DOUBLE 列の索引化は #893 の担当。
+                // 現時点では VECTOR 列と同じく索引非対象（`None`）として扱う。
+                ColumnType::Vector(_) | ColumnType::Real | ColumnType::Double => {
+                    per_column.push(None)
+                }
             }
         }
 
@@ -564,6 +568,11 @@ impl ScalarIndex {
                 if !is_indexed_column {
                     continue;
                 }
+                // `per_column` が `Some` になるのは TEXT 列のみ（上の構築ループ
+                // 参照。REAL/DOUBLE は索引非対象として `None` に統一済み）ため、
+                // ここに到達する `v` は常に `ScalarRef::Text`。それ以外は
+                // スキーマ・索引状態の不整合として fail-closed にスキップする。
+                let Some(v) = v.as_text() else { continue };
                 let v_len = v.len();
                 let (Some(&running), Some(&nonnull)) = (
                     col_running_bytes.get(col_index),
@@ -2308,7 +2317,11 @@ mod tests {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let scanned = scan_scalar_columns(schema, metadata).expect("decode row");
-            let value = scanned.get(filter.column_index()).copied().flatten();
+            let value = scanned
+                .get(filter.column_index())
+                .copied()
+                .flatten()
+                .and_then(|v| v.as_text());
             if filter.matches(value) {
                 out.push(slot as u32);
             }

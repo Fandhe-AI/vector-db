@@ -3659,6 +3659,10 @@ impl EngineCore {
                     crate::row_codec::Value::Vector(v) => {
                         v.len().saturating_mul(std::mem::size_of::<f32>())
                     }
+                    // REAL/DOUBLE は固定長ペイロード（row_codec の
+                    // SCALAR_REAL_ENTRY_LEN/SCALAR_DOUBLE_ENTRY_LEN と同じ本体幅）。
+                    crate::row_codec::Value::Real(_) => std::mem::size_of::<f32>(),
+                    crate::row_codec::Value::Double(_) => std::mem::size_of::<f64>(),
                 };
                 row_bytes = row_bytes.checked_add(value_len).ok_or_else(|| {
                     crate::sql::allowlist::SqlSurfaceError::payload_too_large(

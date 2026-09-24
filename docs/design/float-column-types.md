@@ -1,0 +1,159 @@
+# `REAL`／`DOUBLE PRECISION` 列型（Issue #882）
+
+- ステータス: Accepted
+- 対象ビヘイビア（ポインタ表記のみ。spec 本文は転記しない）: TABLE-13・
+  TASK-196（関連ポインタ: TABLE-1, TABLE-5, TABLE-6, TABLE-7）
+
+## 背景・目的
+
+`catalog::ColumnType` は Issue #880 で `Text`／`Vector(u32)` の 2 値からカタログ
+v2 の基盤（型タグ↔`ColumnType` の往復集約・`#[non_exhaustive]` 不使用）を得た。
+本 Issue はその上に `REAL`（f32）・`DOUBLE PRECISION`（f64）の 2 型を追加し、
+値・型ともにカタログ・行エンコーダー・SQL 表層で往復させる。列として宣言・
+保存できる浮動小数はこれが初めてで、式評価の中間値 `Cell::Float(f64)` とは
+独立した永続表現になる。
+
+## 決定
+
+### F1: 型とタグ
+
+`ColumnType::Real`・`ColumnType::Double` を追加する。カタログ v2 のタグは
+`real`・`double`、`param` は `Text` と同じ「パラメータなし型」規約に従い
+`-` 固定（それ以外は `CatalogError::Invalid`）。`#[non_exhaustive]` や
+ワイルドカード腕は入れない（Issue #880 D1 を踏襲）。
+
+### F2: 行ペイロード
+
+`Value::Real(f32)`・`Value::Double(f64)` を追加する。スカラーペイロードは
+presence(1) の後に固定長 LE ビット列（Real は 4 バイト、Double は 8 バイト）を
+置き、長さプレフィクスは持たない（列の型自体が固定長を決めるため）。フレーム長
+の定数 `SCALAR_REAL_ENTRY_LEN = 5`・`SCALAR_DOUBLE_ENTRY_LEN = 9` を
+`row_codec.rs` に `pub(crate)` で定義し、`tenant::validate_set_assignments`
+（SET 値の事前検証。対象行の探索より前に呼ばれる）と共有する（`TEXT` の
+`SCALAR_TEXT_ENTRY_OVERHEAD` と同じ理由。事前検証と実エンコードが乖離すると、
+行の存在有無で異なる応答を返す既存のテナント境界漏えいが再発するため）。
+`ROW_CODEC_FORMAT_VERSION` は据え置く。既存 `TEXT`／`VECTOR` のバイト列は不変。
+
+`scan_scalar_columns` 系の戻り値は `Vec<Option<&'a str>>` から
+`Vec<Option<row_codec::ScalarRef<'a>>>` へ変更した（**BREAKING CHANGE**）。
+`ScalarRef<'a>`（`Text(&'a str)`／`Real(f32)`／`Double(f64)`）は、`TEXT` 列を
+借用のまま扱う既存の設計（Issue #56）を保ちつつ、`Real`／`Double` は固定長
+ペイロードのため複製コストなしに値そのものを保持できる。`TEXT` 専用の既存
+呼び出し元（宣言的フィルタ・スコアリングブースト・集計の `GROUP BY` キー等）は
+`ScalarRef::as_text()`（`Real`／`Double` は `None`）で後方互換に扱う。
+
+### F3: 非有限値
+
+受け付けない（fail-closed）。
+
+- SQL リテラル束縛: `scalar_float::parse_real`／`parse_double` の結果が
+  非有限なら `22003`（`NumericOutOfRange`）で、書き込みトランザクション開始前に
+  拒否する。
+- `encode_row`／`encode_scalar_columns`／`merge_encode_scalar_columns`・
+  `tenant::validate_set_assignments`: `Value::Real`／`Value::Double` が非有限
+  なら `Err`（対象行の探索より前）。
+- `decode_row`／`scan_scalar_columns_validated`: 永続バイトが非有限のビット列
+  なら `Err`（TABLE-7 と同じく永続データを untrusted とみなす方針。未参照列・
+  マスク外の列でも検証を弱めない）。
+
+### F4: ゼロの扱い
+
+`-0.0` はリテラル束縛時・エンコード時に `+0.0` へ正規化する
+（`scalar_float::canonicalize_real`／`canonicalize_double`）。符号付きゼロは
+保持しない。将来の索引キー（#891・#893）が見るゼロを 1 つに揃えるための判断。
+
+### F5: 順序規約
+
+`scalar_float::cmp_real`／`cmp_double` を唯一の情報源とする。`a == b`
+（`-0.0 == +0.0` を含む IEEE 754 の等価性）を優先し、そうでなければ
+`f32::total_cmp`／`f64::total_cmp` で決定的な全順序をつける。防御的に NaN が
+来ても `total_cmp` の位置に置かれるため、どの入力でも全順序かつ決定的になる。
+`NULL` の並び位置は呼び出し側の責務（本関数は非 NULL 値のみを扱う）。ソートは
+安定ソートとの組み合わせを前提にし `sort_unstable*` は使わない
+（`check_sort_determinism.sh` の方針に従う）。
+
+### F6: テキスト表現
+
+正準のテキスト表現は各型固有幅の `Display`（最短往復表記・指数表記なし）とし、
+`scalar_float::format_real`／`format_double` として提供する。`f32` は必ず
+`f32::from_str` で直接解析する（`f64` を経由すると二重丸めになるため）。
+指数表記を出さないため、既存の字句解析器（`lex_number`）でそのまま再入力できる
+（PostgreSQL 既定出力・float4 の短縮表記・指数表記リテラルの受理は WIRE-13
+（#895）へ申し送り）。
+
+`Cell::Float` への投影は、REAL は f64 への無損失拡大（`f64::from(v: f32)`）、
+DOUBLE はそのまま。REAL の wire テキストは拡大後の f64 の最短表記（例:
+`0.1f32` は `"0.10000000149011612"`）になるが、`f32::from_str` で元のビットに
+戻るため往復は無損失（短くはない）。float4 用の整形（OID 700/701 の RowDescription
+含む）は #895 へ申し送る。
+
+### F7: リテラル文法
+
+INSERT・UPDATE・UPSERT のリテラル位置で `['-'] <Number>` を受け付ける
+（`sql::allowlist::Parser::expect_literal` を拡張。既存の `HAVING` 述語の負号
+処理と同じ形）。`scalar_float::parse_real`／`parse_double` は、`f32::from_str`
+／`f64::from_str` を呼ぶ前に自前の文法（`^-?[0-9]+(\.[0-9]+)?$`）で検証する
+（`from_str` は `inf`／`nan`／`infinity`／指数表記も受け付けてしまうため、
+それを閉じる）。
+
+- 範囲外（非有限化）は `22003`。
+- 非ゼロ入力が 0 へアンダーフローした場合も `22003`（PostgreSQL と整合し、
+  黙った桁落ちを防ぐ）。
+- 文字列リテラル（`'1.5'`・`'NaN'`）は、既存の型不一致と同じ `22000`
+  （`InvalidInput`）で拒否する（文字列からの暗黙変換はしない）。
+
+`id` 疑似列への負リテラルは既存の応答コードを変えない（`allowlist.rs` の
+`id = -1` 等の既存テストは無変更のまま green）。
+
+### F8: `Cell` / wire
+
+`sql::exec::Cell` は変更しない（公開 enum の追加を避け、兄弟型追加 Issue との
+衝突面を減らす）。REAL 列は `Cell::Float(f64::from(v))`、DOUBLE 列は
+`Cell::Float(v)` として投影する（`sql/exec.rs`・`sql/scan.rs`・
+`sql/returning.rs` で同一の写像）。
+
+### F9: content_hash タグ
+
+`recovery/content_hash.rs::push_value` のタグを、TABLE-13 の列挙順で予約
+割り当てする: Integer=3、BigInt=4、**Real=5、Double=6**、Boolean=7（本 Issue で
+実装するのは 5・6 のみ）。ハッシュ入力は「タグ＋正規化後の LE ビット列」。
+既存タグ（Null=0／Text=1／Vector=2）とは衝突しない。タグは台帳の `23505`／
+`22023` 判定に使われ、着地後に番号を振り直せないため golden バイトテスト
+（`content_hash::tests::for_typed_insert_real_and_double_tags_are_stable_and_distinct`）
+で固定する。
+
+### F10: 暫定拒否（fail-closed）
+
+Issue #891〜#896 の担当範囲は、本 Issue では振る舞いを追加せず、拒否する腕だけを
+追加する。
+
+| 経路 | 拒否コード | 対応 Issue |
+|------|-----------|-----------|
+| `WHERE`・フィルタ列の解決（`declarative_filter.rs`・`sql::udf_call`・`sql::using_plan`・`sql::scoring_boost`） | `22000`（既存の TEXT 列限定チェックへ合流） | #891 |
+| 集計の束縛（`sql::parser::resolve_aggregate_input`） | `22000`（`COUNT` を含む全関数） | #892 |
+| `sql::scalar_index`（列単位索引構築） | 索引化しない（`per_column.push(None)`。VECTOR 列と同じ扱い） | #893 |
+| NoSQL `insert`（`http/query/insert.rs`） | `22000`（既存の型不一致腕 `_ =>` へ合流。表層固有の新設腕なし） | #896 |
+| NoSQL `update`（`http/query/update.rs`） | `22000`（`UpdateError::Set`。既存の TEXT/VECTOR 型不一致と同じ応答形） | #896 |
+
+## 対象外（申し送り）
+
+以下は本 Issue では実装しない。
+
+- PostgreSQL 既定出力の再現（`1e+20` 形式、float4 の短縮表記）、指数表記
+  リテラルの受理、RowDescription OID 700/701 → #895
+- 新型の `WHERE` 述語・式評価 → #891
+- 集計 `SUM`/`AVG`/`MIN`/`MAX`/`COUNT` → #892
+- スカラー索引 → #893
+- `DecodeTier` の最適化 → #894
+- NoSQL JSON 束縛（`columns[].type` を含む）→ #896
+- 回帰の統合（`scalar_types_roundtrip.rs` への集約）→ #897
+- 文字列リテラルからの暗黙変換と `22P02` の新設
+- `ALTER COLUMN TYPE` による REAL→DOUBLE の拡大変換（TABLE-19・#901）
+
+## 破壊的変更
+
+`row_codec::scan_scalar_columns`／`scan_scalar_columns_masked` の戻り値型が
+`Vec<Option<&str>>` から `Vec<Option<ScalarRef<'_>>>` へ変わった
+（`row_codec::ScalarRef` 新設）。`Value`（`row_codec::Value`）へ `Real`／
+`Double` variant を追加した。いずれも公開 API の破壊的変更として
+`feat(engine)!:` コミットへ記録する。
