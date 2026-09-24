@@ -80,16 +80,14 @@
 //!   `server::accept_loop_with_engine`／`http::listener::accept_loop_with_limiter`
 //!   のいずれか 1 本だけを呼ぶ（Issue #735・#743）
 //! - [`tls`]: 自作 TLS 1.3 サーバー側実装の入口（TASK-228・WIRE-9・HTTP-10。
-//!   親 Issue #941 の 2 時間単位 sub-issue 群の 1 つ。`tls::record`
-//!   （レコード層。RFC 8446 §5.1。Issue #952）を提供する。現時点では
-//!   接続経路（`handshake.rs`・`server.rs`）へは未接続のまま維持する
+//!   親 Issue #941 の 2 時間単位 sub-issue 群の 1 つ）。X25519 鍵交換
+//!   （RFC 7748・定数時間。Issue #955）・`tls::record`（レコード層。
+//!   RFC 8446 §5.1。Issue #952）まで実装済み。接続経路（`handshake.rs`・
+//!   `server.rs`）への結線は #966 以降
 //! - `fault_injection`（feature `fault-injection` 限定・テスト専用。
 //!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
 //!   語彙パーサと、`simple_query::execute_and_respond` の登録ブロック内から
 //!   呼ばれる commit 後 panic 注入。default features には含まれない
-//! - [`tls`]: 親 Issue #941（TLS 1.3 サーバー側自作実装。TASK-228・WIRE-9・
-//!   HTTP-10 ポインタ）の構成要素。現時点では X25519 鍵交換（RFC 7748・
-//!   定数時間。Issue #955）まで実装済み。接続への結線は #966 以降
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）、
 //! TASK-68（対象ビヘイビア WIRE-4, WIRE-10）、TASK-69（対象ビヘイビア WIRE-5, WIRE-6）、
