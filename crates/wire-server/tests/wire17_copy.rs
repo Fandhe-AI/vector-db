@@ -61,6 +61,40 @@ fn new_core_with_nullable_note_table() -> (Arc<EngineCore>, temp_db::CleanupGuar
     (Arc::new(core), guard)
 }
 
+/// `BOOLEAN`／`ARRAY`／`BYTEA`／`ENUM` 列を持つテーブル（Issue #939 レビュー
+/// 指摘: cc232e6 で `bind_copy_record`／`cell_to_copy_value` へ追加した該当
+/// 型がどのテストからも COPY 経路でカバーされていなかったため追加。
+/// engine 側の束縛オラクルは `crates/engine/tests/copy_from.rs` が担い、本
+/// テストは wire フレーミング越しの text 表現往復（COPY TO STDOUT の出力を
+/// そのまま同じテーブルへ COPY FROM STDIN で再投入）に集中する）。
+fn new_core_with_extended_types_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    use engine::catalog::{ArrayElemType, ArrayType, ColumnType as CT};
+    let path = temp_db::unique_db_path("wire17-copy-ext");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let enum_def = storage
+        .create_enum_type("mood", vec!["happy".to_string(), "sad".to_string()])
+        .expect("create enum type");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("flag", CT::Boolean, true),
+                ColumnDef::new(
+                    "tags",
+                    CT::Array(ArrayType::new(ArrayElemType::Text, 4).expect("array ty")),
+                    true,
+                ),
+                ColumnDef::new("blob", CT::Bytea, true),
+                ColumnDef::new("mood", CT::Enum(enum_def), true),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
 fn spawn_with_alice(core: Arc<EngineCore>) -> std::net::TcpStream {
     let users_path = write_user_store_file(&[
         ("alice", "tenant-a", "pw-alice"),
@@ -418,6 +452,86 @@ fn wire17_copy_to_stdout_output_round_trips_through_copy_from_stdin() {
     send_copy_done(&mut stream);
     let tag = read_command_complete(&mut stream);
     assert_eq!(tag, "COPY 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// `BOOLEAN`／`ARRAY`／`BYTEA`／`ENUM` 列を含む `COPY (...) TO STDOUT` の
+/// text 表現出力を、そのまま同じテーブルへ `COPY ... FROM STDIN` で別 id へ
+/// 再投入すると値が往復すること（Issue #939 レビュー指摘: cc232e6 で追加した
+/// 4 型の COPY 束縛・エンコードがいずれのテストからもカバーされていなかった
+/// ため追加。`wire17_copy_to_stdout_output_round_trips_through_copy_from_stdin`
+/// と同じ検証形）。
+#[test]
+fn wire17_copy_to_stdout_output_round_trips_extended_column_types() {
+    let (core, _guard) = new_core_with_extended_types_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, flag, tags, blob, mood) FROM STDIN USING OPERATION_ID 'ext-rt-op-1'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    // text 形式の生入力: BYTEA リテラルの `\x` はバックスラッシュエスケープ
+    // 越しに表現するため `\\x` と 2 個書く（`decode_text_field` が `\\` を
+    // 単一のバックスラッシュへ解決してから `\xdeadbeef` として束縛される）。
+    send_copy_data(
+        &mut stream,
+        b"1\t[1.0,0.0]\tt\t{ja,en}\t\\\\xdeadbeef\thappy\n",
+    );
+    send_copy_done(&mut stream);
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "COPY 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "COPY (SELECT id, flag, tags, blob, mood FROM docs LIMIT 10) TO STDOUT",
+    );
+    let _ = read_copy_out_response(&mut stream);
+    let row = read_copy_data(&mut stream);
+    read_copy_done(&mut stream);
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    let text = String::from_utf8(row).expect("utf8 copy output");
+    let line = text.trim_end_matches('\n');
+    assert_eq!(
+        line, "1\tt\t{ja,en}\t\\\\xdeadbeef\thappy",
+        "text表現は BOOLEAN=t/f・ARRAY={{...}}・BYTEA=\\x エスケープ・ENUM=素の label",
+    );
+
+    // その出力（id 列を除く）をそのまま別 id へ再投入すると値が往復する。
+    let mut parts = line.splitn(2, '\t');
+    let _id = parts.next().expect("id field");
+    let rest = parts.next().expect("remaining fields");
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, flag, tags, blob, mood) FROM STDIN USING OPERATION_ID 'ext-rt-op-2'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, format!("2\t[0.0,1.0]\t{rest}\n").as_bytes());
+    send_copy_done(&mut stream);
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "COPY 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT flag, tags, blob, mood FROM docs WHERE id = 2 LIMIT 1",
+    );
+    let _cols = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(
+        row,
+        vec![
+            Some("t".to_string()),
+            Some("{ja,en}".to_string()),
+            Some("\\xdeadbeef".to_string()),
+            Some("happy".to_string()),
+        ]
+    );
+    let _tag = read_command_complete(&mut stream);
     read_ready_for_query(&mut stream);
 }
 
