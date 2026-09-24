@@ -372,6 +372,8 @@ impl<'a> ScalarRef<'a> {
         match self {
             ScalarRef::Uuid(u) => Some(*u),
             ScalarRef::Text(_)
+            | ScalarRef::Real(_)
+            | ScalarRef::Double(_)
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)

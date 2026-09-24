@@ -2752,6 +2752,8 @@ fn project_rows(
                             Some(Value::Uuid(u)) => cells.push(Cell::Uuid(*u)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
