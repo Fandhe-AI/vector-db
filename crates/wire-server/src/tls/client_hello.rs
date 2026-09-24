@@ -63,16 +63,27 @@ const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
 const EXT_KEY_SHARE: u16 = 51;
 
-/// HelloRetryRequest 後の 2 回目 `ClientHello` で追加・削除・変更が
-/// 許可される拡張（RFC 8446 §4.1.2 が列挙する 4 種）。これら以外の拡張は
-/// 1 回目の `ClientHello` と型・値ともに同一でなければならない
-/// （[`check_hrr_consistency`]）。`cookie`（44）は「HRR が `cookie` を
-/// 提供していた場合にのみ追加してよい」対象だが、本モジュールの
-/// `build_hello_retry_request` は `cookie` を送出しないため、2 回目に
-/// `cookie` が現れることは許可された差分ではなく `IllegalParameter` の
-/// まま拒否する（fail-closed）。`psk_key_exchange_modes` は RFC の
-/// 例外一覧に含まれない（`pre_shared_key` と併存する側の拡張であり、
-/// 値の更新は許可されていない）ため対象外。
+/// HelloRetryRequest 後の 2 回目 `ClientHello` で、他拡張との型・値の
+/// 完全一致比較（[`check_hrr_consistency`]）から除外する拡張（RFC 8446
+/// §4.1.2 が列挙する 4 種）。ただし「比較から除外」＝「何でも許可」では
+/// ない非対称な拡張が含まれる点に注意（各拡張の実際の制約は
+/// [`check_hrr_consistency`] 側の追加検査を参照）:
+/// - `key_share`: 要求したグループ 1 件のみへの**置き換え**が必須
+///   （[`find_x25519_key_share`] が担う）
+/// - `early_data`: HRR 後の 0-RTT は禁止のため、1 回目にあったかどうかに
+///   関わらず 2 回目には**含まれてはならない**（削除のみ許可・追加や
+///   維持は許可されない。[`check_hrr_consistency`] が明示的に拒否する）
+/// - `pre_shared_key`: binder の再計算・非互換 PSK の削除（全削除を含む）
+///   のみ許可。本モジュールは PSK／0-RTT を受理しないため内容は解釈せず
+///   位置検査（RFC 8446 §4.2.11）のみ行う
+/// - `padding`: 追加・削除・長さ変更いずれも自由
+///
+/// `cookie`（44）は「HRR が `cookie` を提供していた場合にのみ追加して
+/// よい」対象だが、本モジュールの `build_hello_retry_request` は
+/// `cookie` を送出しないため、2 回目に `cookie` が現れることは許可された
+/// 差分ではなく `IllegalParameter` のまま拒否する（fail-closed）。
+/// `psk_key_exchange_modes` は RFC の例外一覧に含まれない（`pre_shared_key`
+/// と併存する側の拡張であり、値の更新は許可されていない）ため対象外。
 const HRR_MUTABLE_EXTENSIONS: [u16; 4] = [
     EXT_KEY_SHARE,
     EXT_PADDING,
@@ -440,9 +451,14 @@ fn check_compression(methods: &[u8]) -> Result<(), ClientHelloError> {
 /// §4.1.2「クライアントは HelloRetryRequest への応答として、以下を除いて
 /// 変更を加えていない `ClientHello` を送らなければならない」）。
 /// [`HRR_MUTABLE_EXTENSIONS`] に列挙した拡張（`key_share`・`early_data`・
-/// `pre_shared_key`・`padding`）は追加・削除・変更してよく、それ以外の
-/// 拡張は型・値ともに完全一致でなければ `IllegalParameter`。
-/// `legacy_version`・`random`・`legacy_session_id`・`cipher_suites`・
+/// `pre_shared_key`・`padding`）は型・値の完全一致比較の対象外とするが、
+/// `early_data` は追加・維持を許可する趣旨ではなく削除のみが許可される
+/// 非対称な拡張のため、比較除外とは別に 2 回目の `ClientHello` に
+/// 含まれていないことを明示的に検査する（0-RTT は HRR 後には許可されない。
+/// RFC 8446 §4.1.2「Removing the "early_data" extension ... Early data is
+/// not permitted after a HelloRetryRequest」）。それ以外の拡張は型・値
+/// ともに完全一致でなければ `IllegalParameter`。`legacy_version`・
+/// `random`・`legacy_session_id`・`cipher_suites`・
 /// `legacy_compression_methods` も同一でなければならない。
 fn check_hrr_consistency(
     first: &handshake::ClientHello,
@@ -457,6 +473,19 @@ fn check_hrr_consistency(
         return Err(ClientHelloError::IllegalParameter(
             "second ClientHello after HelloRetryRequest must repeat the first \
              ClientHello's version/random/session id/cipher suites/compression",
+        ));
+    }
+    if second
+        .extensions
+        .iter()
+        .any(|e| e.extension_type == EXT_EARLY_DATA)
+    {
+        // early_data は「比較除外＝何を送ってもよい」対象ではなく、削除
+        // のみが許可された非対称な拡張。1 回目の有無に関わらず 2 回目に
+        // 存在すること自体が違反（0-RTT は HRR 後には許可されないため）。
+        return Err(ClientHelloError::IllegalParameter(
+            "early_data extension must not be present in the second ClientHello \
+             after HelloRetryRequest",
         ));
     }
     fn immutable(exts: &[handshake::Extension]) -> Vec<&handshake::Extension> {
@@ -908,6 +937,55 @@ mod tests {
         assert!(matches!(
             negotiate(&ch, Some(&first)),
             Err(ClientHelloError::IllegalParameter(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_adding_early_data_is_illegal_parameter() {
+        // early_data は「比較除外＝自由に追加してよい」対象ではない。
+        // 1 回目に無かった early_data を 2 回目で新たに加えるのは、
+        // 0-RTT が HRR 後に許可されないという RFC 8446 §4.1.2 の制約に
+        // 反するため illegal_parameter（finding #3 の一部。key_share 等と
+        // 同列に一律除外していた旧実装の穴）。
+        let first = with_ed25519_sig_alg(rfc8448_client_hello());
+        let ch = push_extension(first.clone(), EXT_EARLY_DATA, vec![]);
+        assert!(matches!(
+            negotiate(&ch, Some(&first)),
+            Err(ClientHelloError::IllegalParameter(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_retaining_early_data_is_illegal_parameter() {
+        // 1 回目に early_data が存在した場合でも、2 回目にそのまま残す
+        // （削除しない）のは許されない。RFC 8446 §4.1.2 は「削除」のみを
+        // 許可された差分として列挙しており、維持は対象外。
+        let first = push_extension(
+            with_ed25519_sig_alg(rfc8448_client_hello()),
+            EXT_EARLY_DATA,
+            vec![],
+        );
+        let ch = first.clone();
+        assert!(matches!(
+            negotiate(&ch, Some(&first)),
+            Err(ClientHelloError::IllegalParameter(_))
+        ));
+    }
+
+    #[test]
+    fn hrr_second_hello_removing_early_data_is_accepted() {
+        // 1 回目にあった early_data を 2 回目で削除するのは RFC 8446
+        // §4.1.2 が明示的に許可する差分であり、他が一致していれば
+        // 受理される（Accept まで到達する）。
+        let first = push_extension(
+            with_ed25519_sig_alg(rfc8448_client_hello()),
+            EXT_EARLY_DATA,
+            vec![],
+        );
+        let ch = remove_extension(first.clone(), EXT_EARLY_DATA);
+        assert!(matches!(
+            negotiate(&ch, Some(&first)),
+            Ok(ClientHelloDecision::Accept(_))
         ));
     }
 
