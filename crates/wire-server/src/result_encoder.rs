@@ -338,6 +338,15 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
             ty: engine::catalog::ColumnType::Bytea,
             ..
         } => false,
+        // `ENUM` 列（TABLE-14・TASK-198、Issue #890）も同様の理由で
+        // fail-closed に非対応とする。値は `Cell::Text`（TEXT と同一表示形）に
+        // 写像されるが、`ColumnMeta::Scalar` としては別 variant であるため
+        // `Text` 分岐へは流れ込まない（多層防御。バイナリ指定は
+        // `BinaryFormatError::UnsupportedType`（`0A000`）で拒否する）。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Enum(_),
+            ..
+        } => false,
         // `ARRAY` 列（TABLE-14・Issue #888）も本 Issue（#936・WIRE-14）の
         // 策定時点では未存在の型のため、バイナリ表現は spec 側で未決定。
         // `VECTOR`・`BOOLEAN`・`BYTEA` と同様に fail-closed で非対応とする。
