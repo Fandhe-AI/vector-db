@@ -97,9 +97,17 @@ impl ScoringBoost {
             .ok_or_else(|| {
                 SqlSurfaceError::invalid_input(format!("unknown column: {}", self.column))
             })?;
-        match column.ty {
+        match &column.ty {
             ColumnType::Text => {}
-            ColumnType::Vector(_) | ColumnType::Real | ColumnType::Double | ColumnType::Boolean => {
+            ColumnType::Vector(_)
+            | ColumnType::Real
+            | ColumnType::Double
+            | ColumnType::Boolean
+            | ColumnType::Array(_)
+            | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Enum(_) => {
                 // F10（Issue #882 計画）: REAL/DOUBLE 列は VECTOR 列と同じ
                 // 「TEXT 列でない」拒否腕へ合流させる（対応は #891 へ申し送り）。
                 return Err(SqlSurfaceError::invalid_input(format!(

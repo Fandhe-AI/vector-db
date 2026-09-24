@@ -39,7 +39,7 @@ pub(crate) fn projected_columns(
                 ty: schema
                     .columns
                     .get(*index)
-                    .map(|c| c.ty)
+                    .map(|c| c.ty.clone())
                     .unwrap_or(ColumnType::Text),
             },
             ProjectedColumn::Computed { name, .. } => ColumnMeta::Computed { name: name.clone() },

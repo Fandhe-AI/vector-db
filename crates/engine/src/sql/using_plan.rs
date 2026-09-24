@@ -89,16 +89,22 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
             "USING PLAN requires a {BODY_COLUMN_NAME:?} TEXT column"
         ))
     })?;
-    match column.ty {
+    match &column.ty {
         ColumnType::Text => Ok(idx),
         // F10（Issue #882 計画）: `body` 列に REAL/DOUBLE が宣言されるのは
         // 通常あり得ないが、VECTOR 列と同じ「TEXT 列でない」拒否へ合流させる
         // （BOOLEAN も同様。Issue #883）。
-        ColumnType::Vector(_) | ColumnType::Real | ColumnType::Double | ColumnType::Boolean => {
-            Err(SqlSurfaceError::invalid_input(format!(
-                "column {BODY_COLUMN_NAME:?} is not a TEXT column"
-            )))
-        }
+        ColumnType::Vector(_)
+        | ColumnType::Real
+        | ColumnType::Double
+        | ColumnType::Boolean
+        | ColumnType::Array(_)
+        | ColumnType::Bytea
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
+            "column {BODY_COLUMN_NAME:?} is not a TEXT column"
+        ))),
     }
 }
 

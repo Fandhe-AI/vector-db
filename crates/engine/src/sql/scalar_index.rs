@@ -522,8 +522,10 @@ impl ScalarIndex {
         col_nonnull_count.resize(column_count, 0);
 
         for (col_index, column) in schema.columns.iter().enumerate() {
-            match column.ty {
-                ColumnType::Text => {
+            match &column.ty {
+                // ENUM 列は TEXT と同じ辞書表現を共有する（Issue #890 D3。
+                // ラベルは短いため平均値長ゲートで除外されることは実質ない）。
+                ColumnType::Text | ColumnType::Enum(_) => {
                     // `acc` は 1 行につき列あたり高々 1 値しか追加されないため
                     // `row_count` が確保上限になる。倍増などの成長戦略による
                     // 余剰確保を避けるため、行走査を始める前に必要量ちょうどを
@@ -542,15 +544,22 @@ impl ScalarIndex {
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     per_column.push(Some(acc));
                 }
-                // F10（Issue #882 計画）: REAL/DOUBLE 列の索引化は #893 の担当。
-                // 現時点では VECTOR 列と同じく索引非対象（`None`）として扱う。
-                // `BOOLEAN` 列も索引対象外（Issue #883・D-e。値域が 2 値のため
-                // 索引化コストに見合わず、対応述語 `BoolEquals` は常に
-                // plain scan——`scalar_plan.rs` 参照——のまま据え置く）。
+                // `VECTOR` 列・`BOOLEAN` 列はいずれも索引対象外（BOOLEAN は
+                // Issue #883・D-e。値域が 2 値のため索引化コストに見合わず、
+                // 対応述語 `BoolEquals` は常に plain scan——`scalar_plan.rs`
+                // 参照——のまま据え置く）。`ARRAY` 列（TABLE-14・Issue #888）・
+                // `BYTEA` 列（Issue #886）・`JSON`／`JSONB` 列（TABLE-14・Issue #889。
+                // 拡張は Issue #893 へ申し送り）もいずれも等価・前方一致述語を
+                // 持たないため同じく非索引化。REAL/DOUBLE 列の索引化は #893 の
+                // 担当（F10・Issue #882 計画）。
                 ColumnType::Vector(_)
                 | ColumnType::Real
                 | ColumnType::Double
-                | ColumnType::Boolean => per_column.push(None),
+                | ColumnType::Boolean
+                | ColumnType::Array(_)
+                | ColumnType::Bytea
+                | ColumnType::Json
+                | ColumnType::Jsonb => per_column.push(None),
             }
         }
 
@@ -572,13 +581,14 @@ impl ScalarIndex {
                 if !is_indexed_column {
                     continue;
                 }
-                // `per_column` が `Some` になるのは TEXT 列のみ（上の構築ループ
-                // 参照。REAL/DOUBLE は索引非対象として `None` に統一済み）ため、
-                // ここに到達する `v` は常に `ScalarRef::Text`。それ以外は
-                // スキーマ・索引状態の不整合として fail-closed にスキップする。
-                // 索引対象列は常に `TEXT`（上記の列単位除外により `BOOLEAN`／
-                // `VECTOR` は `per_column[col_index] == None` のまま到達しない）。
-                let Some(v) = v.as_text() else { continue };
+                // 索引対象列は常に `TEXT`／`ENUM`（上記の列単位除外により
+                // `BOOLEAN`／`VECTOR`／`REAL`／`DOUBLE`／`BYTEA` は
+                // `per_column[col_index] == None` のまま到達しない）。
+                // `as_dictionary_text` で両者を同じ辞書表現として扱う
+                // （Issue #890 D3）。
+                let Some(v) = v.as_dictionary_text() else {
+                    continue;
+                };
                 let v_len = v.len();
                 let (Some(&running), Some(&nonnull)) = (
                     col_running_bytes.get(col_index),

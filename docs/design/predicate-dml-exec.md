@@ -68,7 +68,7 @@ ADR §4 のレイアウトをそのまま `crates/engine/src/recovery/content_ha
 4. `limit` 超過なら `write_txn` を drop し `LimitExceeded` を返す（行・台帳とも
    痕跡ゼロ）。
 5. 候補 `id` をすべて適用（DELETE は `remove`、UPDATE は read-merge-write。
-   `tenant::upsert_typed_rows_unchecked` の `DoUpdate` 腕と同型の組み立て）。
+   単一行 UPDATE と共有する `merge_row_for_update` 経由。Issue #996）。
 6. 影響行数が 1 件以上のときのみ `bump_table_generation_in_txn`。
 7. `commit_boundary::commit`。
 
@@ -200,9 +200,19 @@ limit)`、`UPDATE` 側は `MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows(cou
 - スカラー列二次索引（`sql::scalar_index`）による候補削減の適用（本 Issue は write
   txn 内の全走査で正しさを優先。性能改善は後続）。
 - `EXPLAIN UPDATE/DELETE`・`OR`／括弧付き述語・層 B の 3 クライアント e2e への追加。
-- `merge_row_assignments` の `tenant::upsert_typed_rows_unchecked` との共通化
-  （本 Issue は predicate UPDATE 専用の read-merge-write をインライン実装した。
-  重複コードの抽出は後続の任意リファクタ）。
 - `tenant.rs` 内部の `#[cfg(test)]` 失敗注入シーム（`arena.rs` の先例と同型）は
   本 Issue の時間的スコープでは追加せず、公開 API 経由の式評価エラー注入のみで
   atomicity を検証した（§8 参照）。
+- Issue #996 で述語つき UPDATE の read-merge-write（本 Issue が predicate UPDATE
+  専用にインライン実装していた部分）を単一行 UPDATE（`update_row_columns_
+  unchecked`）と共有する `tenant::merge_row_for_update` へ統一済み。`decode_
+  scalar_columns`（全列複製）ではなく借用版 `scan_scalar_columns` 経由の
+  `merge_encode_scalar_columns` を通るため、部分 UPDATE 1 回あたりの確保量が
+  単一行 UPDATE 側（PR #989）と同水準になった。`tenant::upsert_typed_rows_
+  unchecked`（`DoUpdate` 腕）との共通化は引き続き別スコープ。書き込まれる
+  バイト列・エラー分類・台帳契約はいずれも不変であることを回帰テストで固定
+  （`crates/engine/src/row_codec.rs::merge_encode_scalar_columns_matches_
+  decode_then_encode_scalar_columns`・`crates/engine/src/tenant.rs::update_
+  rows_where_unchecked_writes_byte_identical_rows_to_legacy_reencode_
+  algorithm`）。SET 列が重複指定された場合の意味論が後勝ちから先勝ちへ変わる
+  （束縛段で拒否済みのため表層からは到達しない）。
