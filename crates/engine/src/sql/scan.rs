@@ -206,7 +206,8 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Bytea
                         | ColumnType::Json
                         | ColumnType::Jsonb
-                        | ColumnType::Enum(_) => {
+                        | ColumnType::Enum(_)
+                        | ColumnType::Numeric { .. } => {
                             has_scalar_reference = true;
                             if let Some(slot) = scalar_mask.get_mut(*index) {
                                 *slot = true;
@@ -618,6 +619,15 @@ pub fn execute_scan(
                                             "ENUM column scan yielded a non-Enum scalar value",
                                         ))
                                     }
+                                },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Numeric { .. } => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_numeric() {
+                                    Some(d) => cells.push(Cell::Numeric(d)),
+                                    None => return Err(scan_bug(
+                                        "NUMERIC column scan yielded a non-Numeric scalar value",
+                                    )),
                                 },
                                 Some(None) | None => cells.push(Cell::Null),
                             },

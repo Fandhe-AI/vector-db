@@ -388,6 +388,102 @@ fn wire1_boolean_column_is_t_f_null_text_encoded() {
     drop(guard);
 }
 
+/// NUMERIC 列（TABLE-13〔検討中〕・TASK-197、Issue #885）が簡易クエリ経由で
+/// 正規テキスト表現（`Decimal::Display`。ゼロ埋め・符号付き・NULL 区別）へ
+/// 写像されることと、桁あふれが `22003` の `ErrorResponse` になることを固定
+/// する。RowDescription の OID 1700（`numeric`）公告自体は
+/// `result_encoder::numeric_scalar_column_wire_type_is_numeric_oid_1700_not_text`
+/// で固定済みのためここでは対象外（本テストの `read_row_description` は
+/// 列名のみ取得し OID を検証しない）。
+#[test]
+fn wire1_numeric_column_is_canonical_text_encoded_and_overflow_is_22003() {
+    let path = temp_db::unique_db_path("wire1-numeric");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new(
+                    "price",
+                    ColumnType::Numeric {
+                        precision: 5,
+                        scale: 2,
+                    },
+                    true,
+                ),
+            ],
+        ))
+        .expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    for (id, vec_val, price) in [
+        (
+            1u64,
+            [1.0, 0.0],
+            Value::Numeric(engine::numeric::Decimal::from_parts(150, 2).expect("valid scale")),
+        ),
+        (
+            2,
+            [0.0, 1.0],
+            Value::Numeric(engine::numeric::Decimal::from_parts(-150, 2).expect("valid scale")),
+        ),
+        (3, [0.5, 0.5], Value::Null),
+    ] {
+        let op_id =
+            engine::recovery::required_op_id::OperationId::parse(&format!("test-op-numeric-{id}"))
+                .expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(vec_val.to_vec()), price],
+            &op_id,
+        )
+        .expect("insert row");
+    }
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "SELECT id, price FROM docs LIMIT 10");
+    let _columns = read_row_description(&mut stream);
+    let mut by_id = std::collections::BTreeMap::new();
+    for _ in 0..3 {
+        let row = read_data_row(&mut stream);
+        by_id.insert(row[0].clone(), row[1].clone());
+    }
+    assert_eq!(
+        by_id.get(&Some("1".to_string())),
+        Some(&Some("1.50".to_string()))
+    );
+    assert_eq!(
+        by_id.get(&Some("2".to_string())),
+        Some(&Some("-1.50".to_string()))
+    );
+    assert_eq!(by_id.get(&Some("3".to_string())), Some(&None));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    // 桁あふれ（丸め後 1000.00 は NUMERIC(5,2) の上限を超える）は 22003。
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, price) VALUES (4, '[0.1,0.2]', 999.995) \
+         USING OPERATION_ID 'op-overflow'",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "22003");
+    read_ready_for_query(&mut stream);
+
+    drop(guard);
+}
+
 /// `DATE`／`TIMESTAMP` 列（TABLE-13・TASK-197、Issue #884）が簡易クエリ経由で
 /// ISO テキスト表現（`engine::datetime::format_date`／`format_timestamp`）で
 /// 往復することを固定する（`wire1_boolean_column_is_t_f_null_text_encoded` と

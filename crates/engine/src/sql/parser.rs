@@ -261,6 +261,52 @@ pub struct BoundDelete {
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::mode::{self, SearchMode};
 
+/// `NUMERIC(precision, scale)` 列向けリテラル（[`InsertLiteral::Number`]・
+/// [`InsertLiteral::String`] の両方を受理。TABLE-13〔検討中〕・TASK-197、
+/// Issue #885・D5）を [`crate::row_codec::Value::Numeric`] へ束縛する。
+/// `crate::numeric::parse_for_column` の [`crate::numeric::NumericError`] を
+/// `wire_code` へ写像する（`Malformed` → `22000`・`OutOfRange` →
+/// `22003`）。`InsertLiteral::Bool` は型不一致として `22000` で拒否する。
+/// INSERT（`bind_insert_row`）・UPDATE（`bind_set_assignments`）・UPSERT
+/// （`bind_upsert_assignments`）の 3 箇所が共有する（第 2 のパーサーを作らない）。
+fn bind_numeric_literal(
+    literal: &InsertLiteral,
+    name: &str,
+    precision: u8,
+    scale: u8,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    let text = match literal {
+        InsertLiteral::Number(s) | InsertLiteral::String(s) => s.as_str(),
+        InsertLiteral::Bool(_) => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {name:?} expects a NUMERIC literal, got a boolean literal"
+            )))
+        }
+        // 呼び出し元（`bind_insert`／`bind_set_assignments`／
+        // `bind_upsert_assignments`）はいずれも `InsertLiteral::Null` を
+        // 本関数へ渡すより前に nullable 判定込みで独自に処理するため実際には
+        // 到達しないが、`InsertLiteral` は 4 variant の列挙であり本 match の
+        // 網羅性のためだけに存在する（Issue #889 レビュー指摘・PR #1014 で
+        // `Null` variant が追加された後の到達性を fail-closed に保つ）。
+        InsertLiteral::Null => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {name:?} does not accept an explicit NULL literal here"
+            )))
+        }
+    };
+    match crate::numeric::parse_for_column(text, precision, scale) {
+        Ok(d) => Ok(crate::row_codec::Value::Numeric(d)),
+        Err(crate::numeric::NumericError::Malformed(detail)) => Err(
+            SqlSurfaceError::invalid_input(format!("column {name:?}: {detail}")),
+        ),
+        Err(crate::numeric::NumericError::OutOfRange) => {
+            Err(SqlSurfaceError::numeric_out_of_range(format!(
+                "column {name:?} numeric value out of range for NUMERIC({precision},{scale})"
+            )))
+        }
+    }
+}
+
 /// `[f1,f2,...]` 形式のベクトルリテラルを解析する（SQL-1）。
 ///
 /// 検証順序: (1) 生バイト長が [`MAX_VECTOR_LITERAL_BYTES`] を超えないこと
@@ -396,6 +442,7 @@ fn bind_datetime_literal(
         | ColumnType::Bytea
         | ColumnType::Json
         | ColumnType::Jsonb
+        | ColumnType::Numeric { .. }
         | ColumnType::Enum(_) => {
             // 呼び出し元（3 経路の `match (column.ty, literal)`）は Date/Timestamp
             // の腕でのみこの関数を呼ぶ契約のため到達しない（fail-closed の保険腕）。
@@ -588,7 +635,8 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
             | ColumnType::Bytea
             | ColumnType::Json
             | ColumnType::Jsonb
-            | ColumnType::Enum(_) => None,
+            | ColumnType::Enum(_)
+            | ColumnType::Numeric { .. } => None,
         })
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))
 }
@@ -634,7 +682,8 @@ pub(crate) fn text_column_index(
                 | ColumnType::Bytea
                 | ColumnType::Json
                 | ColumnType::Jsonb
-                | ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
+                | ColumnType::Enum(_)
+                | ColumnType::Numeric { .. } => Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} is not a TEXT column"
                 ))),
             }
@@ -1474,6 +1523,9 @@ fn bind_insert_row(
                     "column {name:?} does not accept an explicit NULL literal in INSERT"
                 )))
             }
+            (ColumnType::Numeric { precision, scale }, lit) => {
+                bind_numeric_literal(lit, name, *precision, *scale)?
+            }
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
             *slot = value;
@@ -1554,7 +1606,8 @@ fn bind_json_literal(
         | ColumnType::Timestamp
         | ColumnType::Array(_)
         | ColumnType::Bytea
-        | ColumnType::Enum(_) => {
+        | ColumnType::Enum(_)
+        | ColumnType::Numeric { .. } => {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "column {column_name:?} is not a JSON column"
             )));
@@ -1808,6 +1861,9 @@ fn bind_set_assignments(
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} is not nullable"
                 )))
+            }
+            (ColumnType::Numeric { precision, scale }, lit) => {
+                bind_numeric_literal(lit, name, *precision, *scale)?
             }
         };
         bound.push((col_idx, value));
@@ -2409,6 +2465,9 @@ fn bind_upsert_assignments(
                             "column {name:?} does not accept an explicit NULL literal in ON CONFLICT DO UPDATE SET"
                         )))
                     }
+                    (ColumnType::Numeric { precision, scale }, lit) => {
+                        bind_numeric_literal(lit, name, *precision, *scale)?
+                    }
                 };
                 BoundUpsertValue::Literal(v)
             }
@@ -2574,6 +2633,13 @@ fn bind_file_insert(
                     "column {name:?}: ENUM column is not supported for file-form INSERT"
                 )))
             }
+            // NUMERIC 列も同じ理由で対象外（TABLE-13〔検討中〕・TASK-197、
+            // Issue #885）。
+            (ColumnType::Numeric { .. }, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: NUMERIC column is not supported for file-form INSERT"
+                )))
+            }
         };
         if col_idx == path_column_index {
             if let crate::row_codec::Value::Text(ref s) = value {
@@ -2684,6 +2750,12 @@ pub(crate) enum AggregateInput {
     /// 宣言順で `MIN`/`MAX` 比較できるが、辞書順で代用すると意味論が食い違うため
     /// 意図的に受理しない。Issue #890 D7）。
     EnumColumn(usize),
+    /// `NUMERIC` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）でのみ使う（TABLE-13〔検討中〕・TASK-197、Issue #885）。`SUM`/
+    /// `AVG`/`MIN`/`MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
+    /// [`resolve_aggregate_input`] が型不整合として拒否する（別 Issue #892 の
+    /// 担当）。
+    NumericColumn(usize),
     /// 上記以外の `Scalar` 型に束縛された式（列参照 `id` 単体を除く。`vec_norm(...)`
     /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`program`（束縛時に
     /// ステップ列コンパイル済み、Issue #353）を行ループで評価する。`source` は
@@ -3146,6 +3218,14 @@ fn resolve_aggregate_input(
                     (ColumnType::Enum(_), _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is ENUM and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
+                    (ColumnType::Numeric { .. }, AggregateFunc::Count) => {
+                        Ok(AggregateInput::NumericColumn(index))
+                    }
+                    (ColumnType::Numeric { .. }, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is NUMERIC and cannot be used with SUM/AVG/MIN/MAX"
+                        )))
+                    }
                 };
             }
             if name == "id" {
