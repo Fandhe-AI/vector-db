@@ -72,6 +72,7 @@ use super::pkcs8::KeyAlgorithm;
 pub const MAX_CERTIFICATE_DER_LEN: usize = 64 * 1024;
 
 const TAG_SEQUENCE: u8 = 0x30;
+const TAG_SET: u8 = 0x31;
 const TAG_INTEGER: u8 = 0x02;
 const TAG_BIT_STRING: u8 = 0x03;
 const TAG_OID: u8 = 0x06;
@@ -333,6 +334,107 @@ fn validate_oid_content(oid: &[u8]) -> Result<(), X509Error> {
     Ok(())
 }
 
+/// `Name ::= CHOICE { rdnSequence RDNSequence }`・
+/// `RDNSequence ::= SEQUENCE OF RelativeDistinguishedName`・
+/// `RelativeDistinguishedName ::= SET SIZE (1..MAX) OF AttributeTypeAndValue`・
+/// `AttributeTypeAndValue ::= SEQUENCE { type OBJECT IDENTIFIER, value ANY }`
+/// という RFC 5280 §4.1.2.4 の構文を検査する。`validate_structure`
+/// （[`super::der`]）は universal 型の primitive/constructed 制約は
+/// 全階層で検査するが、「この階層に現れるべきタグは SET か」「SET の
+/// 中身は OID+ANY の SEQUENCE か」というタグ固有の構造までは検査しない
+/// ため、RDN を表す SET を別の型に、AttributeTypeAndValue を型無しの
+/// 値だけに置き換えた不正 DER が issuer/subject Name として受理されて
+/// しまっていた（PR #1036 codex-review P1 指摘）。値（`value ANY`）の
+/// 意味・文字列型としての妥当性は解釈しない（モジュール doc
+/// 「スコープ外」参照）。RDNSequence が 0 個の RelativeDistinguishedName
+/// を持つこと（空の Name。本モジュールのテストフィクスチャが使う形）は
+/// RFC 5280 上も許容されるため受理する。
+fn validate_name_structure(name_value: &[u8]) -> Result<(), X509Error> {
+    let mut rdn_sequence = DerReader::new(name_value);
+    while !rdn_sequence.is_empty() {
+        let rdn_value = rdn_sequence
+            .read_expected(TAG_SET)
+            .map_err(|_| X509Error::Malformed)?;
+        let mut rdn_reader = DerReader::new(rdn_value);
+        let mut has_attribute = false;
+        while !rdn_reader.is_empty() {
+            let atv_value = rdn_reader
+                .read_expected(TAG_SEQUENCE)
+                .map_err(|_| X509Error::Malformed)?;
+            let mut atv_reader = DerReader::new(atv_value);
+            let attribute_oid = atv_reader
+                .read_expected(TAG_OID)
+                .map_err(|_| X509Error::Malformed)?;
+            validate_oid_content(attribute_oid)?;
+            // value ANY: 中身の意味は解釈しないが、1 個の TLV として
+            // 整形式であり、それ以外の余剰要素が無いことだけを要求する。
+            atv_reader.read_any().map_err(|_| X509Error::Malformed)?;
+            atv_reader.expect_end().map_err(|_| X509Error::Malformed)?;
+            has_attribute = true;
+        }
+        // RelativeDistinguishedName は SET SIZE (1..MAX)。0 個の
+        // AttributeTypeAndValue は構文上不正。
+        if !has_attribute {
+            return Err(X509Error::Malformed);
+        }
+    }
+    Ok(())
+}
+
+/// `BIT STRING` の値部分（先頭 1 バイトが未使用ビット数、残りが内容）が
+/// DER として整形式であることを検査する（未使用ビット数は 0〜7・非ゼロ
+/// なら最終オクテットの下位未使用ビットがすべて 0）。`signatureValue`・
+/// SPKI の公開鍵ビット列で既に使っているのと同じ形状検査を、
+/// `issuerUniqueID`／`subjectUniqueID`（`BIT STRING` の IMPLICIT タグ）
+/// にも適用するために切り出した。未使用ビット数が 0 の場合は内容が
+/// 空（0 ビットの BIT STRING）でも構文上は正当なため許容する。
+fn validate_bit_string_shape(value: &[u8]) -> Result<(), X509Error> {
+    let (&unused_bits, content) = value.split_first().ok_or(X509Error::Malformed)?;
+    if unused_bits > 7 {
+        return Err(X509Error::Malformed);
+    }
+    if unused_bits > 0 {
+        let last_byte = content.last().ok_or(X509Error::Malformed)?;
+        let unused_mask = (1u8 << unused_bits) - 1;
+        if last_byte & unused_mask != 0 {
+            return Err(X509Error::Malformed);
+        }
+    }
+    Ok(())
+}
+
+/// `extensions [3] EXPLICIT Extensions`・`Extensions ::= SEQUENCE SIZE
+/// (1..MAX) OF Extension` の外形（意味は解釈しない）を検査する。
+/// `[3] EXPLICIT` は元の型（`SEQUENCE`）のタグをそのまま内側に持つため、
+/// wrapper の値部分は「ちょうど 1 個の `SEQUENCE` で後続データが無い」
+/// ことを要求し、さらにその `SEQUENCE`（`Extensions`）が 1 個以上の
+/// `Extension`（各要素も `SEQUENCE`）から成ることを検査する。各
+/// `Extension` の中身（`extnID`／`critical`／`extnValue` の意味解釈）は
+/// 本モジュールの対象外のまま変えない（モジュール doc「スコープ外」
+/// 参照。PR #1036 codex-review P1 指摘）。
+fn validate_extensions_wrapper(wrapper_value: &[u8]) -> Result<(), X509Error> {
+    let mut wrapper_reader = DerReader::new(wrapper_value);
+    let extensions_value = wrapper_reader
+        .read_expected(TAG_SEQUENCE)
+        .map_err(|_| X509Error::Malformed)?;
+    wrapper_reader
+        .expect_end()
+        .map_err(|_| X509Error::Malformed)?;
+
+    let mut extensions_reader = DerReader::new(extensions_value);
+    if extensions_reader.is_empty() {
+        // Extensions は SEQUENCE SIZE (1..MAX)。0 個は構文上不正
+        // （extensions フィールド自体を省略すべきケース）。
+        return Err(X509Error::Malformed);
+    }
+    while !extensions_reader.is_empty() {
+        extensions_reader
+            .read_expected(TAG_SEQUENCE)
+            .map_err(|_| X509Error::Malformed)?;
+    }
+    Ok(())
+}
+
 /// パース手順（モジュール doc 参照）に従い 1 個の証明書 DER を検査する。
 fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     if der_bytes.len() > MAX_CERTIFICATE_DER_LEN {
@@ -396,9 +498,12 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
         return Err(X509Error::Malformed);
     }
 
-    // issuer Name（中身は解釈しない）。
-    tbs.read_expected(TAG_SEQUENCE)
+    // issuer Name（中身は解釈しないが RDNSequence/AttributeTypeAndValue の
+    // 外形は検査する）。
+    let issuer_value = tbs
+        .read_expected(TAG_SEQUENCE)
         .map_err(|_| X509Error::Malformed)?;
+    validate_name_structure(issuer_value)?;
 
     // validity SEQUENCE { notBefore Time, notAfter Time }。
     let validity_body = tbs
@@ -414,9 +519,12 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
         return Err(X509Error::InvalidValidityRange);
     }
 
-    // subject Name（中身は解釈しない）。
-    tbs.read_expected(TAG_SEQUENCE)
+    // subject Name（中身は解釈しないが RDNSequence/AttributeTypeAndValue の
+    // 外形は検査する）。
+    let subject_value = tbs
+        .read_expected(TAG_SEQUENCE)
         .map_err(|_| X509Error::Malformed)?;
+    validate_name_structure(subject_value)?;
 
     // subjectPublicKeyInfo SEQUENCE { AlgorithmIdentifier, BIT STRING }。
     let spki_body = tbs
@@ -446,10 +554,18 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     spki_reader.expect_end().map_err(|_| X509Error::Malformed)?;
 
     // 任意の issuerUniqueID [1]／subjectUniqueID [2]／extensions [3]。
-    // 存在すれば読み飛ばすのみで、意味は解釈しない。
-    let _ = tbs.read_optional(TAG_ISSUER_UNIQUE_ID_IMPLICIT);
-    let _ = tbs.read_optional(TAG_SUBJECT_UNIQUE_ID_IMPLICIT);
-    let _ = tbs.read_optional(TAG_EXTENSIONS_EXPLICIT);
+    // 意味は解釈しないが、存在すれば BIT STRING の形状（unique ID）・
+    // 単一 SEQUENCE で後続データが無いこと（extensions wrapper）という
+    // ASN.1 の外形は検査する（PR #1036 codex-review P1 指摘）。
+    if let Some(issuer_unique_id) = tbs.read_optional(TAG_ISSUER_UNIQUE_ID_IMPLICIT) {
+        validate_bit_string_shape(issuer_unique_id)?;
+    }
+    if let Some(subject_unique_id) = tbs.read_optional(TAG_SUBJECT_UNIQUE_ID_IMPLICIT) {
+        validate_bit_string_shape(subject_unique_id)?;
+    }
+    if let Some(extensions_wrapper) = tbs.read_optional(TAG_EXTENSIONS_EXPLICIT) {
+        validate_extensions_wrapper(extensions_wrapper)?;
+    }
     tbs.expect_end().map_err(|_| X509Error::Malformed)?;
 
     // tbsCertificate.signature と外側 signatureAlgorithm がいずれも
@@ -1022,6 +1138,178 @@ mod tests {
             CertificateChainError::ChainTooLong {
                 max: pem::MAX_CERTIFICATE_CHAIN_LEN
             }
+        );
+    }
+
+    #[test]
+    fn validate_name_structure_accepts_empty_rdn_sequence() {
+        // 0 個の RelativeDistinguishedName（本モジュールのテスト
+        // フィクスチャが issuer/subject に使う形）は RFC 5280 上も許容する。
+        assert!(validate_name_structure(&[]).is_ok());
+    }
+
+    #[test]
+    fn validate_name_structure_accepts_single_attribute() {
+        // CN=IETF（UTF8String）1 個の AttributeTypeAndValue を持つ RDN。
+        let atv = [
+            0x30, 0x0a, // SEQUENCE (AttributeTypeAndValue)
+            0x06, 0x03, 0x55, 0x04, 0x03, // OID: commonName (2.5.4.3)
+            0x0c, 0x03, b'I', b'E', b'T', // UTF8String "IET"
+        ];
+        let mut rdn = vec![0x31, atv.len() as u8]; // SET
+        rdn.extend_from_slice(&atv);
+        assert!(validate_name_structure(&rdn).is_ok());
+    }
+
+    #[test]
+    fn validate_name_structure_rejects_rdn_not_encoded_as_set() {
+        // RDN を表すべき箇所が SET（0x31）ではなく SEQUENCE（0x30）。
+        let atv = [0x30, 0x05, 0x06, 0x03, 0x55, 0x04, 0x03];
+        let mut rdn = vec![0x30, atv.len() as u8];
+        rdn.extend_from_slice(&atv);
+        assert_eq!(
+            validate_name_structure(&rdn).unwrap_err(),
+            X509Error::Malformed
+        );
+    }
+
+    #[test]
+    fn validate_name_structure_rejects_empty_rdn() {
+        // SET SIZE (1..MAX) のはずの RDN が 0 個の AttributeTypeAndValue。
+        let rdn = [0x31, 0x00];
+        assert_eq!(
+            validate_name_structure(&rdn).unwrap_err(),
+            X509Error::Malformed
+        );
+    }
+
+    #[test]
+    fn validate_name_structure_rejects_attribute_without_oid() {
+        // AttributeTypeAndValue の先頭が OID ではなく INTEGER。
+        let atv = [0x30, 0x03, 0x02, 0x01, 0x00];
+        let mut rdn = vec![0x31, atv.len() as u8];
+        rdn.extend_from_slice(&atv);
+        assert_eq!(
+            validate_name_structure(&rdn).unwrap_err(),
+            X509Error::Malformed
+        );
+    }
+
+    #[test]
+    fn validate_name_structure_rejects_attribute_with_trailing_element() {
+        // AttributeTypeAndValue が OID + value に加えて余剰要素を持つ。
+        let atv = [
+            0x30, 0x09, 0x06, 0x03, 0x55, 0x04, 0x03, 0x05, 0x00, 0x05, 0x00,
+        ];
+        let mut rdn = vec![0x31, atv.len() as u8];
+        rdn.extend_from_slice(&atv);
+        assert_eq!(
+            validate_name_structure(&rdn).unwrap_err(),
+            X509Error::Malformed
+        );
+    }
+
+    #[test]
+    fn validate_bit_string_shape_accepts_zero_unused_bits() {
+        assert!(validate_bit_string_shape(&[0x00, 0xff]).is_ok());
+        // 未使用ビット数 0・内容が空（0 ビットの BIT STRING）も正当。
+        assert!(validate_bit_string_shape(&[0x00]).is_ok());
+    }
+
+    #[test]
+    fn validate_bit_string_shape_rejects_unused_bits_out_of_range() {
+        assert_eq!(
+            validate_bit_string_shape(&[0x08, 0x00]).unwrap_err(),
+            X509Error::Malformed
+        );
+    }
+
+    #[test]
+    fn validate_bit_string_shape_rejects_nonzero_padding() {
+        // 未使用ビット数 4 なのに最終バイトの下位 4 ビットが非ゼロ。
+        assert_eq!(
+            validate_bit_string_shape(&[0x04, 0xff]).unwrap_err(),
+            X509Error::Malformed
+        );
+    }
+
+    #[test]
+    fn validate_bit_string_shape_rejects_missing_content_with_unused_bits() {
+        // 未使用ビット数が非ゼロなのに内容バイトが無い。
+        assert_eq!(
+            validate_bit_string_shape(&[0x04]).unwrap_err(),
+            X509Error::Malformed
+        );
+    }
+
+    #[test]
+    fn validate_bit_string_shape_rejects_empty_value() {
+        assert_eq!(
+            validate_bit_string_shape(&[]).unwrap_err(),
+            X509Error::Malformed
+        );
+    }
+
+    fn sample_extension() -> Vec<u8> {
+        // Extension ::= SEQUENCE { extnID OID, extnValue OCTET STRING }
+        // （critical は省略。本ヘルパーは外形検査のテスト専用）。
+        vec![
+            0x30, 0x08, // SEQUENCE
+            0x06, 0x03, 0x55, 0x1d, 0x0f, // OID: keyUsage (2.5.29.15)
+            0x04, 0x01, 0x00, // OCTET STRING
+        ]
+    }
+
+    #[test]
+    fn validate_extensions_wrapper_accepts_single_extension() {
+        let extension = sample_extension();
+        let mut extensions_seq = vec![0x30, extension.len() as u8];
+        extensions_seq.extend_from_slice(&extension);
+        assert!(validate_extensions_wrapper(&extensions_seq).is_ok());
+    }
+
+    #[test]
+    fn validate_extensions_wrapper_rejects_trailing_data_after_sequence() {
+        let extension = sample_extension();
+        let mut extensions_seq = vec![0x30, extension.len() as u8];
+        extensions_seq.extend_from_slice(&extension);
+        // [3] EXPLICIT の中身が SEQUENCE 1 個の後に余剰バイトを持つ。
+        let mut wrapper_value = extensions_seq.clone();
+        wrapper_value.push(0x05);
+        wrapper_value.push(0x00);
+        assert_eq!(
+            validate_extensions_wrapper(&wrapper_value).unwrap_err(),
+            X509Error::Malformed
+        );
+    }
+
+    #[test]
+    fn validate_extensions_wrapper_rejects_non_sequence_wrapper_content() {
+        // [3] EXPLICIT の中身が SEQUENCE ではなく INTEGER。
+        let wrapper_value = [0x02, 0x01, 0x00];
+        assert_eq!(
+            validate_extensions_wrapper(&wrapper_value).unwrap_err(),
+            X509Error::Malformed
+        );
+    }
+
+    #[test]
+    fn validate_extensions_wrapper_rejects_empty_extensions_sequence() {
+        // Extensions は SEQUENCE SIZE (1..MAX)。0 個の Extension は不正。
+        let wrapper_value = [0x30, 0x00];
+        assert_eq!(
+            validate_extensions_wrapper(&wrapper_value).unwrap_err(),
+            X509Error::Malformed
+        );
+    }
+
+    #[test]
+    fn validate_extensions_wrapper_rejects_extension_not_encoded_as_sequence() {
+        // Extensions の要素が SEQUENCE ではなく INTEGER。
+        let wrapper_value = [0x30, 0x03, 0x02, 0x01, 0x00];
+        assert_eq!(
+            validate_extensions_wrapper(&wrapper_value).unwrap_err(),
+            X509Error::Malformed
         );
     }
 }

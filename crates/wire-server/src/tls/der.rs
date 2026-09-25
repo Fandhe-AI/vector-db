@@ -54,6 +54,10 @@ pub(crate) enum DerError {
     /// DER の正規形に反する（`NULL` に値がある・`BOOLEAN` が 1 バイトかつ
     /// `0x00`／`0xFF` のいずれでもない、等）。
     InvalidPrimitiveEncoding,
+    /// `SEQUENCE`（0x10）・`SET`（0x11）が primitive（constructed ビット
+    /// 無し）で符号化されている（DER はこれらを常に constructed で
+    /// 符号化することを要求する。X.690 §8.9.1／§8.11.1）。
+    PrimitiveSequenceOrSet,
 }
 
 impl fmt::Display for DerError {
@@ -71,6 +75,9 @@ impl fmt::Display for DerError {
                 "DER universal type is not allowed to be constructed"
             }
             DerError::InvalidPrimitiveEncoding => "DER primitive value is not in canonical form",
+            DerError::PrimitiveSequenceOrSet => {
+                "DER SEQUENCE or SET must not be encoded as primitive"
+            }
         };
         write!(f, "{msg}")
     }
@@ -272,6 +279,15 @@ fn validate_tlv_contents(
                 return Err(DerError::ConstructedUniversalType);
             }
         } else {
+            // 逆方向の制約: SEQUENCE（0x10）・SET（0x11）は常に constructed
+            // でなければならない。`universal_type_allows_constructed` が
+            // true を返すのはこの 2 種類のみなので、ここで primitive の
+            // まま現れていれば DER 違反として拒否する（例えば issuer/subject
+            // の RDN を表す SET を primitive の 0x11 に置き換えた不正 DER。
+            // PR #1036 codex-review P1 指摘）。
+            if universal_type_allows_constructed(tag_number) {
+                return Err(DerError::PrimitiveSequenceOrSet);
+            }
             match tag_number {
                 // NULL（0x05）: 値は常に空でなければならない。
                 0x05 if !value.is_empty() => return Err(DerError::InvalidPrimitiveEncoding),
@@ -518,6 +534,25 @@ mod tests {
         let der_wrong_len = [0x30, 0x04, 0x01, 0x02, 0x00, 0x00];
         let err = validate_structure(&der_wrong_len, MAX_DER_NESTING_DEPTH).unwrap_err();
         assert_eq!(err, DerError::InvalidPrimitiveEncoding);
+    }
+
+    #[test]
+    fn validate_structure_rejects_primitive_sequence() {
+        // SEQUENCE（0x30）を primitive（0x10。constructed ビット無し）で
+        // 符号化した不正 DER。
+        let der = [0x30, 0x02, 0x10, 0x00];
+        let err = validate_structure(&der, MAX_DER_NESTING_DEPTH).unwrap_err();
+        assert_eq!(err, DerError::PrimitiveSequenceOrSet);
+    }
+
+    #[test]
+    fn validate_structure_rejects_primitive_set() {
+        // SET（0x31）を primitive（0x11）で符号化した不正 DER
+        // （issuer/subject 内 RDN の SET を primitive に置き換える攻撃を
+        // 想定。PR #1036 codex-review P1 指摘）。
+        let der = [0x30, 0x02, 0x11, 0x00];
+        let err = validate_structure(&der, MAX_DER_NESTING_DEPTH).unwrap_err();
+        assert_eq!(err, DerError::PrimitiveSequenceOrSet);
     }
 
     #[test]

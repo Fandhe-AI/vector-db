@@ -1199,6 +1199,142 @@ fn intermediate_spki_algorithm_identifier_with_truncated_oid_is_rejected() {
 }
 
 #[test]
+fn issuer_name_with_primitive_set_is_rejected() {
+    // issuer Name 内の RDN を表す SET（0x31）を primitive の 0x11 へ
+    // 置き換えた不正 DER（PR #1036 codex-review P1 指摘その 1）。
+    // DER は SEQUENCE／SET を常に constructed で符号化することを要求する。
+    let issuer_with_primitive_set = sequence(&[&tlv(0x11, &[])]);
+
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &issuer_with_primitive_set,
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::Malformed);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn subject_name_with_rdn_encoded_as_sequence_instead_of_set_is_rejected() {
+    // RDNSequence の要素（RelativeDistinguishedName）が SET（0x31）ではなく
+    // SEQUENCE（0x30）で符号化された不正な subject Name
+    // （PR #1036 codex-review P1 指摘その 2。generic な DER 構造検証だけでは
+    // universal 型の primitive/constructed 制約しか見ないため、この
+    // タグ固有の構造違反は見逃されていた）。
+    let attribute_type_and_value = sequence(&[&tlv(0x06, &OID_ED25519_BYTES), &tlv(0x05, &[])]);
+    let subject_with_rdn_as_sequence = sequence(&[&attribute_type_and_value]);
+
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &subject_with_rdn_as_sequence,
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::Malformed);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn extensions_wrapper_with_trailing_data_is_rejected() {
+    // extensions [3] EXPLICIT の中身が Extensions（SEQUENCE）1 個の後に
+    // 余剰バイトを持つ不正 DER（PR #1036 codex-review P1 指摘その 2）。
+    let extension = sequence(&[&tlv(0x06, &[0x55, 0x1d, 0x0f]), &tlv(0x04, &[0x00])]);
+    let extensions_seq = sequence(&[&extension]);
+    let mut extensions_wrapper_value = extensions_seq.clone();
+    extensions_wrapper_value.extend_from_slice(&tlv(0x05, &[]));
+    let extensions_field = tlv(0xa3, &extensions_wrapper_value);
+
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+        &extensions_field,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::Malformed);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn current_unix_secs_returns_a_plausible_recent_value() {
     // このリポジトリが書かれた時点（2020 年以降）より新しい値であることの
     // ゆるい健全性チェック。厳密な現在時刻検証はできないため、明らかに
