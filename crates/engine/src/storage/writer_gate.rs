@@ -5,16 +5,20 @@
 //! 得られない。明示トランザクションが `BEGIN` から `COMMIT`/`ROLLBACK` まで
 //! ライタを占有すると、autocommit 書き込みが無期限に止まってしまう。本モジュールは
 //! 「ライタを握る前に必ずこのゲートを通す」という choke point を追加し、
-//! - autocommit（[`crate::storage::Storage::begin_write_txn`]）はゲートを
-//!   待機上限つきで取得し、`redb` のライタを得た直後にゲートを手放す
-//!   （占有時間は redb 呼び出し 1 回分のみ）。
-//! - 明示トランザクション（[`crate::storage::Storage::begin_explicit_write_txn`]）は
-//!   ゲートを取得したまま [`WriterPermit`] として保持し、トランザクション終了まで
-//!   手放さない。
+//! autocommit（[`crate::storage::Storage::begin_write_txn`]）・明示トランザクション
+//! （[`crate::storage::Storage::begin_explicit_write_txn`]）のどちらも、ゲートを
+//! 待機上限つきで取得したうえで、`redb` の書き込みトランザクションが commit／abort
+//! されるまで [`WriterPermit`] を保持する（[`crate::storage::GatedWriteTxn`] が
+//! 両者を同じ寿命で束ねる）。
 //!
-//! という非対称な保持方針で、待機の循環（デッドロック）を構造的に作らない
-//! （ゲートは 1 段しかなく、redb 自身のロックへ待機付きで到達できるのは
-//! ゲートを取得できたスレッドだけ）。
+//! 以前は autocommit が `redb` のライタを得た直後にゲートを手放していたため、
+//! autocommit の書き込みがライタを持っている間に別セッションがゲートを取得すると、
+//! `redb::Database::begin_write` の中で待機上限なしに止まっていた（PR #1041
+//! レビュー指摘）。現在は「ゲートを保持していること」と「`redb` のライタを
+//! 保持していること」が常に一致するため、ライタ待ちはすべてゲートの待機上限
+//! （`55P03`）で打ち切られる。ゲートは 1 段しかなく `redb` のライタへの経路は
+//! ゲート経由だけなので、待機の循環（デッドロック）は生じない。同一スレッドからの
+//! 再取得は待たずに [`GateError::HeldByCurrentThread`] で拒否する。
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -52,19 +56,9 @@ impl WriterGate {
         })
     }
 
-    /// autocommit 経路用: ゲートを取得したらすぐに解放するクロージャ実行の形。
-    /// `redb::Database::begin_write` 呼び出しをゲートで挟む用途に使う。
-    pub fn with_permit_timeout<T>(
-        self: &Arc<Self>,
-        timeout: Duration,
-        f: impl FnOnce() -> T,
-    ) -> Result<T, GateError> {
-        let _permit = self.acquire(timeout)?;
-        Ok(f())
-        // `_permit` はここで drop され、直ちに解放・通知される。
-    }
-
-    /// 明示トランザクション経路用: ゲートを保持したまま `WriterPermit` を返す。
+    /// ゲートを待機上限つきで取得し、保持の証跡 [`WriterPermit`] を返す
+    /// （autocommit・明示トランザクション共通。permit は `redb` の書き込み
+    /// トランザクションと同じ寿命で [`crate::storage::GatedWriteTxn`] が保持する）。
     pub fn acquire(self: &Arc<Self>, timeout: Duration) -> Result<WriterPermit, GateError> {
         let current = std::thread::current().id();
         let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -178,17 +172,5 @@ mod tests {
         drop(permit);
         handle.join().unwrap();
         assert!(acquired.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn with_permit_timeout_releases_after_closure() {
-        let gate = WriterGate::new();
-        let result = gate
-            .with_permit_timeout(Duration::from_secs(1), || 42)
-            .expect("closure runs");
-        assert_eq!(result, 42);
-        // 直後に再取得できること（closure 終了後に解放されている）。
-        let permit = gate.acquire(Duration::from_millis(50)).expect("reacquire");
-        drop(permit);
     }
 }

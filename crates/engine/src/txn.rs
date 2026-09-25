@@ -155,7 +155,7 @@ impl ReadSnapshot {
 /// [`Storage::begin_batch_write`] が返す）を使うこと（型分離の理由は
 /// [`BatchWriteTxn`] のドキュメントコメント参照）。
 pub struct WriteTxn {
-    txn: redb::WriteTransaction,
+    txn: crate::storage::GatedWriteTxn,
     /// このハンドルを通じて redb の [`ROWS_TABLE`] に触れる操作（[`Self::put`]）を
     /// 1 回でも行ったか（Issue #175・TASK-133 P2 対応）。`commit` 時にこれが
     /// `false` なら世代カウンタを進めない判断根拠になる。**redb テーブルに触れる
@@ -236,7 +236,7 @@ impl WriteTxn {
 /// - `batch_seq` は重複しないこと（[`StorageError::DuplicateBatchSeq`]）
 /// - 同一 ID への 2 回目以降の `put`（upsert による上書き）は行数としてカウントしない
 pub struct BatchWriteTxn {
-    txn: redb::WriteTransaction,
+    txn: crate::storage::GatedWriteTxn,
     /// 直近の [`BatchWriteTxn::log_batch`] 呼び出し以降（または `BatchWriteTxn`
     /// 生成以降）に [`BatchWriteTxn::put`] で**新規挿入**した件数（既存 ID への
     /// 上書きは含まない）。呼び出し元から任意の行数を申告させず自身が実書き込みを

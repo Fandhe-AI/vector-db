@@ -2622,7 +2622,6 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        use crate::sql::allowlist::SqlSurfaceError;
         use crate::sql::transaction::{TransactionStatus, TxnControl};
 
         if let ParsedSql::Transaction(ctrl) = parsed {
@@ -2632,7 +2631,7 @@ impl EngineCore {
                     Ok(crate::sql::SqlOutcome::Begin)
                 }
                 TxnControl::Commit => {
-                    txn.commit()?;
+                    txn.commit(session)?;
                     Ok(crate::sql::SqlOutcome::Commit)
                 }
                 TxnControl::Rollback => {
@@ -2644,7 +2643,7 @@ impl EngineCore {
 
         match txn.status() {
             TransactionStatus::Idle => self.execute_parsed_in_session(ctx, session, parsed),
-            TransactionStatus::Failed => Err(SqlSurfaceError::InFailedSqlTransaction),
+            TransactionStatus::Failed => Err(txn.take_failed_error()),
             TransactionStatus::InTransaction => {
                 txn.check_and_register_statement(parsed_operation_id(parsed))?;
                 let result = self.execute_in_active_txn(ctx, session, txn, parsed);

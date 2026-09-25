@@ -74,8 +74,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #942（SQL-31・TASK-221。`writer_gate` choke point 追加）で
     // `Storage::put`/`Storage::put_batch` の行番号がさらに移動したための追随
     // （旧: 652／683）。
-    ("storage.rs", 730),
-    ("storage.rs", 761),
+    ("storage.rs", 804),
+    ("storage.rs", 835),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 191),
     ("txn.rs", 362),
@@ -112,7 +112,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （`sql/exec.rs::execute_insert_with_schema_in`／`execute_truncate_in` →
     // `tenant.rs` 各関数のドキュメント参照）。本呼び出し箇所自体は複数文を
     // まとめて確定させるだけで、新たな `user_rows/{table}` 書き込みを行わない。
-    ("sql/transaction.rs", 209),
+    ("sql/transaction.rs", 235),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
     // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を

@@ -446,6 +446,112 @@ fn statement_count_limit_fails_the_transaction() {
     assert_eq!(txn.status(), TransactionStatus::Failed);
 }
 
+fn visible_row_count(engine: &EngineCore, caller: &PolicyContext) -> usize {
+    let outcome = engine
+        .execute_sql_in_session(
+            caller,
+            &mut SessionState::default(),
+            &format!("SELECT id FROM {TABLE} ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 10"),
+        )
+        .expect("select");
+    match outcome {
+        SqlOutcome::Query(result) => result.rows.len(),
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+/// 持続時間の上限を過ぎてから `COMMIT` しても確定させず、`54000` で `Failed` へ
+/// 遷移させる（PR #1041 レビュー指摘。以前は後続の文でしか検査しておらず、期限後の
+/// `COMMIT` がそのまま書き込みを永続化していた）。
+#[test]
+fn commit_after_max_duration_is_rejected_and_not_persisted() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let max_duration = std::time::Duration::from_millis(200);
+    let engine = engine.with_transaction_limits(TransactionLimits {
+        max_duration,
+        max_statements: 1_000,
+    });
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(40, "op-40"))
+        .expect("insert within the limit");
+    std::thread::sleep(max_duration * 2);
+
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
+        .expect_err("commit after max_duration is rejected");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    assert_eq!(visible_row_count(&engine, &caller), 0);
+
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+    assert_eq!(visible_row_count(&engine, &caller), 0);
+}
+
+/// 期限切れ後の次の要求（`release_if_expired`。wire 層が要求を受け取るたびに
+/// 呼ぶ）でライタが解放され、別セッションの書き込みが通ること。遷移後の最初の
+/// `COMMIT` には `54000` を 1 回だけ返し、以降は `25P02`（PR #1041 レビュー指摘）。
+#[test]
+fn release_if_expired_frees_the_writer_and_reports_the_limit_once() {
+    let (engine, path) = new_core_with_short_write_lock_wait();
+    let _cleanup = CleanupGuard(path);
+    let max_duration = std::time::Duration::from_millis(200);
+    let engine = engine.with_transaction_limits(TransactionLimits {
+        max_duration,
+        max_statements: 1_000,
+    });
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(41, "op-41"))
+        .expect("insert within the limit");
+    assert!(!txn.release_if_expired(), "not expired yet");
+    std::thread::sleep(max_duration * 2);
+
+    assert!(txn.release_if_expired(), "expired transaction is released");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    assert!(!txn.release_if_expired(), "release is idempotent");
+
+    // ライタが解放されているため、別セッションの autocommit 書き込みが通る。
+    engine
+        .execute_sql_in_session(
+            &caller,
+            &mut SessionState::default(),
+            &insert_sql(42, "op-42"),
+        )
+        .expect("autocommit write after release");
+
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
+        .expect_err("commit after expiry is rejected");
+    assert_eq!(err.wire_code(), "54000", "the expiry is reported once");
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
+        .expect_err("commit is rejected while failed");
+    assert_eq!(err.wire_code(), "25P02");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+
+    // id=41（期限切れトランザクション内）は破棄され、id=42 だけが残る。
+    assert_eq!(visible_row_count(&engine, &caller), 1);
+}
+
 #[test]
 fn truncate_inside_transaction_is_committed_atomically_with_inserts() {
     let (engine, path) = new_core();

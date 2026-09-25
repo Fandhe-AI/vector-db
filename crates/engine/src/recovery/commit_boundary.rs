@@ -286,10 +286,13 @@ pub(crate) fn current_response_boundary_generation() -> Option<u64> {
 /// [`commit_and_finish_with`] 経由）。この 2 段階に分けている理由・保護契約の
 /// 詳細は [`commit_and_finish_with`] のドキュメント参照。
 pub(crate) fn commit_and_finish<T>(
-    write_txn: redb::WriteTransaction,
+    write_txn: impl storage::CommitTxn,
     value: T,
     post_commit: impl FnOnce(&T) -> PostCommitResult,
 ) -> StorageResult<(T, PostCommitResult)> {
+    // 書き込みゲートの permit（`storage::GatedWriteTxn`）は commit 完了まで保持する
+    // （SQL-31・TASK-221。`_` で受けると即座に解放されるため名前付き束縛にする）。
+    let (write_txn, _permit) = write_txn.split_for_commit();
     commit_and_finish_with(
         write_txn,
         value,
@@ -371,7 +374,7 @@ fn commit_and_finish_with<T>(
 /// [`commit_and_finish`] の薄いラッパ。`crate::tenant` の各 `*_unchecked`
 /// 関数（commit 後の派生状態反映を持たない）から呼ばれる想定で、
 /// `post_commit` は常に [`PostCommitResult::Ok`] を返す no-op とする。
-pub(crate) fn commit(write_txn: redb::WriteTransaction) -> StorageResult<()> {
+pub(crate) fn commit(write_txn: impl storage::CommitTxn) -> StorageResult<()> {
     commit_and_finish(write_txn, (), |()| PostCommitResult::Ok).map(|((), _)| ())
 }
 
@@ -383,7 +386,7 @@ pub(crate) fn commit(write_txn: redb::WriteTransaction) -> StorageResult<()> {
 /// ガードを arm する必要がない。`has_writes == true` の場合のみ
 /// [`commit`] 経由でガード区間に載せる。
 pub(crate) fn commit_write_txn_guarded(
-    write_txn: redb::WriteTransaction,
+    write_txn: impl storage::CommitTxn,
     has_writes: bool,
 ) -> StorageResult<()> {
     if has_writes {

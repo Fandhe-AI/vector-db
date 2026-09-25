@@ -5112,7 +5112,9 @@ mod tests {
             &legacy_hash,
         )
         .expect("seed legacy ledger entry");
-        write_txn.commit().expect("commit legacy ledger entry");
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit legacy ledger entry");
 
         // 同一 `operation_id`・同一内容（宣言順 body, path）を現行コード経由で
         // 再送する。現行コードはハッシュ計算前にスキーマ列順（path, body）へ

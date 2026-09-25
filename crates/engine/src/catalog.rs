@@ -2756,7 +2756,9 @@ mod tests {
         // `table_generation_bump_coverage.rs` の悉皆走査は
         // `commit_boundary::commit*` 呼び出しのみを対象とするため、これを
         // 経由すると本テスト自身がアローリスト追記を要求されてしまう）。
-        write_txn.commit().expect("commit corrupt catalog value");
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
 
         let err = storage.drop_enum_type(type_name).unwrap_err();
         assert!(

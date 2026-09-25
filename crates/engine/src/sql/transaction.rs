@@ -91,12 +91,10 @@ pub enum TransactionStatus {
 }
 
 /// 明示トランザクション中に開いている共有書き込みトランザクションと、その
-/// 付随状態（[`crate::storage::writer_gate::WriterPermit`] を含む。`write_txn`
-/// を先に宣言し、drop 時に abort が permit の解放より先に走るようにする）。
+/// 付随状態。`write_txn`（[`crate::storage::GatedWriteTxn`]）は書き込みゲートの
+/// permit を内包し、drop 時は abort してから permit を解放する。
 struct ActiveTxn<'e> {
-    write_txn: redb::WriteTransaction,
-    #[allow(dead_code)]
-    permit: crate::storage::writer_gate::WriterPermit,
+    write_txn: crate::storage::GatedWriteTxn,
     started_at: Instant,
     statements: u32,
     seen_operation_ids: HashSet<String>,
@@ -109,8 +107,16 @@ struct ActiveTxn<'e> {
 enum TxnState<'e> {
     Idle,
     Active(Box<ActiveTxn<'e>>),
-    Failed { session_at_begin: SessionState },
+    /// `expired` は、持続時間の上限超過（[`SessionTransaction::release_if_expired`]）
+    /// で `Failed` へ遷移し、まだ `54000` をクライアントへ報告していないことを表す。
+    Failed {
+        session_at_begin: SessionState,
+        expired: bool,
+    },
 }
+
+/// 持続時間・文数の上限超過時のエラー文言（`54000`）。
+const LIMIT_EXCEEDED_MESSAGE: &str = "transaction exceeded duration or statement limit";
 
 /// トランザクションの持続時間・文数の上限（実装既定値。spec 由来の数値ではない。
 /// `docs/design/explicit-transaction.md` 参照）。
@@ -168,12 +174,11 @@ impl<'e> SessionTransaction<'e> {
     ) -> Result<(), SqlSurfaceError> {
         match &self.state {
             TxnState::Idle => {
-                let (write_txn, permit) = storage
+                let write_txn = storage
                     .begin_explicit_write_txn()
                     .map_err(map_write_lock_err)?;
                 self.state = TxnState::Active(Box::new(ActiveTxn {
                     write_txn,
-                    permit,
                     started_at: Instant::now(),
                     statements: 0,
                     seen_operation_ids: HashSet::new(),
@@ -191,42 +196,70 @@ impl<'e> SessionTransaction<'e> {
                 self.fail();
                 Err(SqlSurfaceError::ActiveSqlTransaction)
             }
-            TxnState::Failed { .. } => Err(SqlSurfaceError::InFailedSqlTransaction),
+            TxnState::Failed { .. } => Err(self.take_failed_error()),
         }
     }
 
     /// `COMMIT`。`Active` なら書き込みの有無に応じて commit／abort し `Idle` へ
     /// 遷移する。`Idle`／`Failed` はそれぞれ `25P01`／`25P02` を返す（`Failed`
     /// のままにし、`ROLLBACK` のみを受理し続ける）。
-    pub fn commit(&mut self) -> Result<(), SqlSurfaceError> {
+    ///
+    /// - 持続時間の上限を超えている場合は確定させず、abort して `Failed` へ遷移し
+    ///   `54000` を返す（文実行時の上限超過と同じ契約。PR #1041 レビュー指摘）。
+    /// - commit 自体が失敗した場合は、PostgreSQL と同じくロールバック扱いとし、
+    ///   `session` を `BEGIN` 時点の状態へ復元してから `Idle` へ戻る。
+    pub fn commit(&mut self, session: &mut SessionState) -> Result<(), SqlSurfaceError> {
         match std::mem::replace(&mut self.state, TxnState::Idle) {
             TxnState::Idle => {
                 self.state = TxnState::Idle;
                 Err(SqlSurfaceError::NoActiveSqlTransaction)
             }
             TxnState::Active(active) => {
-                let result = if active.has_writes {
-                    crate::recovery::commit_boundary::commit(active.write_txn).map_err(|_| {
-                        SqlSurfaceError::Internal {
-                            detail: "internal error".to_string(),
-                        }
-                    })
+                let ActiveTxn {
+                    write_txn,
+                    started_at,
+                    has_writes,
+                    session_at_begin,
+                    ..
+                } = *active;
+                if started_at.elapsed() > self.limits.max_duration {
+                    // `write_txn` を drop（abort）し、内包する permit を解放する。
+                    drop(write_txn);
+                    self.state = TxnState::Failed {
+                        session_at_begin,
+                        expired: false,
+                    };
+                    return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
+                }
+                let result = if has_writes {
+                    crate::recovery::commit_boundary::commit(write_txn)
                 } else {
-                    drop(active.write_txn);
+                    drop(write_txn);
                     Ok(())
                 };
-                // `permit`（drop 済みの `active.write_txn`／自身が move 済み）は
-                // ここまでに drop され解放されている。
                 self.state = TxnState::Idle;
-                result
+                result.map_err(|_| {
+                    // commit 失敗はロールバック扱い（`write_txn` は消費済みで、
+                    // permit も解放されている）。
+                    *session = session_at_begin;
+                    SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }
+                })
             }
-            TxnState::Failed { session_at_begin } => {
+            TxnState::Failed {
+                session_at_begin,
+                expired,
+            } => {
                 // `Failed` のまま据え置く。`BEGIN` 時点の `SessionState` は後続の
                 // `ROLLBACK` が復元に使うため、取り出したものをそのまま戻す
                 // （既定値で上書きすると `SET search_mode`・`CREATE FUNCTION` 等の
                 // BEGIN 前のセッション状態が失われる）。
-                self.state = TxnState::Failed { session_at_begin };
-                Err(SqlSurfaceError::InFailedSqlTransaction)
+                self.state = TxnState::Failed {
+                    session_at_begin,
+                    expired,
+                };
+                Err(self.take_failed_error())
             }
         }
     }
@@ -248,7 +281,9 @@ impl<'e> SessionTransaction<'e> {
                 self.state = TxnState::Idle;
                 Ok(())
             }
-            TxnState::Failed { session_at_begin } => {
+            TxnState::Failed {
+                session_at_begin, ..
+            } => {
                 *session = session_at_begin;
                 self.state = TxnState::Idle;
                 Ok(())
@@ -271,9 +306,7 @@ impl<'e> SessionTransaction<'e> {
             || active.statements >= self.limits.max_statements
         {
             self.fail();
-            return Err(SqlSurfaceError::payload_too_large(
-                "transaction exceeded duration or statement limit",
-            ));
+            return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
         }
         if let Some(id) = operation_id {
             if !active.seen_operation_ids.insert(id.to_string()) {
@@ -307,7 +340,7 @@ impl<'e> SessionTransaction<'e> {
     /// を構築するために使う。
     pub(crate) fn write_txn(&self) -> Option<&redb::WriteTransaction> {
         match &self.state {
-            TxnState::Active(active) => Some(&active.write_txn),
+            TxnState::Active(active) => Some(&*active.write_txn),
             _ => None,
         }
     }
@@ -326,8 +359,45 @@ impl<'e> SessionTransaction<'e> {
             // `write_txn` は drop（abort）され、`permit` はその後に解放される。
             self.state = TxnState::Failed {
                 session_at_begin: active.session_at_begin,
+                expired: false,
             };
         }
+    }
+
+    /// 持続時間の上限を過ぎた `Active` なトランザクションを `Failed` へ遷移させ、
+    /// 共有書き込みトランザクションを abort してライタを解放する（遷移したら
+    /// `true`）。wire 層が要求を受け取るたびに文の種類を問わず呼ぶ（Sync・Flush 等
+    /// SQL を伴わない要求だけを送り続けてライタを保持し続けることを防ぐ。PR #1041
+    /// レビュー指摘）。遷移後の最初の文／`COMMIT` には、文実行時の上限超過と同じ
+    /// `54000` を返す（[`Self::take_failed_error`]）。
+    pub fn release_if_expired(&mut self) -> bool {
+        let expired = match &self.state {
+            TxnState::Active(active) => active.started_at.elapsed() > self.limits.max_duration,
+            _ => false,
+        };
+        if !expired {
+            return false;
+        }
+        if let TxnState::Active(active) = std::mem::replace(&mut self.state, TxnState::Idle) {
+            self.state = TxnState::Failed {
+                session_at_begin: active.session_at_begin,
+                expired: true,
+            };
+        }
+        true
+    }
+
+    /// `Failed` 中に `ROLLBACK` 以外の文を受け取ったときに返すエラー。
+    /// [`Self::release_if_expired`] による遷移をまだ報告していなければ `54000`
+    /// （上限超過）を 1 回だけ返し、それ以外は `25P02` を返す。
+    pub fn take_failed_error(&mut self) -> SqlSurfaceError {
+        if let TxnState::Failed { expired, .. } = &mut self.state {
+            if *expired {
+                *expired = false;
+                return SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE);
+            }
+        }
+        SqlSurfaceError::InFailedSqlTransaction
     }
 }
 
@@ -394,6 +464,93 @@ mod tests {
             let err = validate_transaction_control_tokens(&tokens_of(sql)).unwrap_err();
             assert_eq!(err.wire_code(), "42601");
         }
+    }
+
+    /// `COMMIT` の commit 自体が失敗した場合は PostgreSQL と同じくロールバック
+    /// 扱いとし、`BEGIN` 時点の `SessionState` を復元してから `Idle` へ戻る
+    /// （PR #1041 レビュー指摘）。全体世代カウンタを上限値にしておき、commit 直前の
+    /// 世代加算（`storage::prepare_generation_bump`）をオーバーフローで失敗させる。
+    #[test]
+    fn commit_failure_restores_session_state_at_begin_and_returns_to_idle() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::sql::mode::SearchMode;
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+        let path = unique_db_path("sql31-commit-failure");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = crate::storage::Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "documents",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+        {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let mut table = write_txn
+                    .open_table(crate::storage::GENERATION_TABLE)
+                    .expect("open generation table");
+                table
+                    .insert("generation", u64::MAX)
+                    .expect("set generation");
+            }
+            write_txn.commit().expect("commit generation");
+        }
+        let engine = crate::core::EngineCore::from_storage(
+            storage,
+            Box::new(crate::kernel::CpuScalarProvider),
+        );
+        let caller = crate::policy::PolicyContext::with_visibilities(
+            "tenant-a",
+            [
+                crate::storage::Visibility::Public,
+                crate::storage::Visibility::Private,
+            ],
+        )
+        .expect("valid tenant");
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+
+        engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                "SET search_mode = 'precision'",
+            )
+            .expect("set search_mode before begin");
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                "SET search_mode = 'recall'",
+            )
+            .expect("set search_mode inside transaction");
+        engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                "INSERT INTO documents (id, embedding) VALUES (1, '[1.0, 0.0]') \
+                 USING OPERATION_ID 'op-commit-failure'",
+            )
+            .expect("insert");
+        assert_eq!(session.search_mode(), Some(SearchMode::Recall));
+
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
+            .expect_err("commit fails on generation overflow");
+        assert_eq!(txn.status(), TransactionStatus::Idle);
+        assert_eq!(
+            session.search_mode(),
+            Some(SearchMode::Precision),
+            "a failed COMMIT must behave as ROLLBACK and restore the session state"
+        );
     }
 
     #[test]
