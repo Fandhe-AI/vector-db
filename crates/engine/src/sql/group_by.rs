@@ -78,6 +78,18 @@ const TEXT_BUDGET_EXCEEDED_DETAIL: &str =
 /// 明示的に扱うための防御）側の detail 文言。
 const TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL: &str =
     "GROUP BY TEXT aggregate size accounting overflowed";
+/// PR #1049 レビュー指摘 P0 対応: [`accumulate_row`] がグループキー累計バイト数
+/// （[`MAX_GROUP_KEY_TOTAL_BYTES`]）と TEXT 集計状態累計バイト数
+/// （[`MAX_TEXT_ACCUMULATOR_TOTAL_BYTES`]）の合算を、呼び出し元が指定する結果
+/// バイト予算（`execute_grouped_aggregate` の `max_result_bytes`。通常は大きな
+/// 既定値、`sql::cursor::CursorStatement::Declare` の内側実行だけが
+/// `sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`＝16 MiB）で頭打ちにする際の
+/// detail 文言。両者はそれぞれ独立に最大 16 MiB まで許容されるため、合計は
+/// 最大 32 MiB に達しうる——`CursorRegistry::declare` が想定する 16 MiB の
+/// カーソル容量制限にはならない。[`TEXT_BUDGET_EXCEEDED_DETAIL`] と同じく
+/// `MIN`/`MAX(TEXT)` の縮小方向更新を含むため走査順に依存する一時的な超過が
+/// ありうる（[`is_text_accumulator_budget_error`] のドキュメント参照）。
+const RESULT_BUDGET_EXCEEDED_DETAIL: &str = "GROUP BY result exceeds capacity";
 
 /// PR #603 codex-review P1 指摘対応: `err` が [`accumulate_row`] の TEXT 集計
 /// 容量超過（[`TEXT_BUDGET_EXCEEDED_DETAIL`]／[`TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL`]）
@@ -105,6 +117,7 @@ fn is_text_accumulator_budget_error(err: &SqlSurfaceError) -> bool {
         SqlSurfaceError::PayloadTooLarge { detail }
             if detail == TEXT_BUDGET_EXCEEDED_DETAIL
                 || detail == TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL
+                || detail == RESULT_BUDGET_EXCEEDED_DETAIL
     )
 }
 
@@ -218,6 +231,7 @@ fn new_accumulators(
 /// `ExprProgram::eval` を呼ぶ際の明示スタック（Issue #353。行に依存する借用を
 /// 保持しないため、呼び出し元が行ループの外で 1 回だけ確保したバッファを
 /// 使い回せる。`aggregate.rs::execute_aggregate` と同じ方針）。
+#[allow(clippy::too_many_arguments)]
 fn accumulate_row(
     accs: &mut [Accumulator],
     items: &[crate::sql::parser::BoundAggregateItem],
@@ -225,6 +239,14 @@ fn accumulate_row(
     vector: &RowVector<'_>,
     scanned: &[Option<row_codec::ScalarRef<'_>>],
     total_text_accumulator_bytes: &mut usize,
+    // PR #1049 レビュー指摘 P0 対応: 呼び出し時点のグループキー累計バイト数
+    // （読み取り専用。本関数はキーを追加しないため `&mut` で渡す必要はない）。
+    // `total_text_accumulator_bytes` との合算を `max_result_bytes` で検査する
+    // ために使う。
+    total_key_bytes: usize,
+    // PR #1049 レビュー指摘 P0 対応: 呼び出し元が指定する結果バイト予算
+    // （[`RESULT_BUDGET_EXCEEDED_DETAIL`] ドキュメント参照）。
+    max_result_bytes: usize,
     expr_scratch: &mut Vec<StackValue>,
 ) -> Result<(), SqlSurfaceError> {
     for (accumulator, item) in accs.iter_mut().zip(items) {
@@ -246,6 +268,24 @@ fn accumulate_row(
             if *total_text_accumulator_bytes > MAX_TEXT_ACCUMULATOR_TOTAL_BYTES {
                 return Err(SqlSurfaceError::payload_too_large(
                     TEXT_BUDGET_EXCEEDED_DETAIL,
+                ));
+            }
+            // PR #1049 レビュー指摘 P0 対応: グループキー累計・TEXT 集計状態
+            // 累計はそれぞれ独立に [`MAX_GROUP_KEY_TOTAL_BYTES`]・
+            // [`MAX_TEXT_ACCUMULATOR_TOTAL_BYTES`]（各 16 MiB）で頭打ちに
+            // なるのみで、合計は最大 32 MiB に達しうる。完成した
+            // [`crate::sql::exec::QueryResult`] 全体の容量を呼び出し元が指定
+            // する `max_result_bytes` で追加検査し、`sql::cursor::
+            // CursorStatement::Declare` の内側実行では `CursorRegistry::
+            // declare` の 16 MiB 判定へ到達する前に生成中の段階で打ち切る。
+            let combined = total_key_bytes
+                .checked_add(*total_text_accumulator_bytes)
+                .ok_or_else(|| {
+                    SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
+                })?;
+            if combined > max_result_bytes {
+                return Err(SqlSurfaceError::payload_too_large(
+                    RESULT_BUDGET_EXCEEDED_DETAIL,
                 ));
             }
         } else if after < before {
@@ -292,6 +332,7 @@ fn observe_group_enumeration(
     null_group: &mut Option<Vec<Accumulator>>,
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
+    max_result_bytes: usize,
 ) -> Result<bool, SqlSurfaceError> {
     let Some(groups) = index.column_groups(group_by.column_index) else {
         return Ok(false);
@@ -335,6 +376,8 @@ fn observe_group_enumeration(
             referenced,
             &mut accs,
             total_text_accumulator_bytes,
+            *total_key_bytes,
+            max_result_bytes,
         ) {
             Ok(()) => {}
             Err(err) if is_text_accumulator_budget_error(&err) => {
@@ -369,6 +412,8 @@ fn observe_group_enumeration(
             referenced,
             &mut accs,
             total_text_accumulator_bytes,
+            *total_key_bytes,
+            max_result_bytes,
         ) {
             Ok(()) => {}
             Err(err) if is_text_accumulator_budget_error(&err) => {
@@ -405,6 +450,7 @@ fn observe_group_count_only(
 /// 出し元で確定済み）を走査し、`accs`（1 グループ分のアキュムレータ列）へ
 /// 累積する。`WHERE` が無い列挙形専用のため候補の再検証は行わない
 /// （[`observe_group_enumeration`] のドキュメント参照）。
+#[allow(clippy::too_many_arguments)]
 fn observe_group_slots(
     snapshot: &crate::sql::arena_cache::SqlArenaSnapshot,
     slots: &[u32],
@@ -413,6 +459,8 @@ fn observe_group_slots(
     referenced: &ReferencedColumns,
     accs: &mut [Accumulator],
     total_text_accumulator_bytes: &mut usize,
+    total_key_bytes: usize,
+    max_result_bytes: usize,
 ) -> Result<(), SqlSurfaceError> {
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
@@ -452,6 +500,8 @@ fn observe_group_slots(
             &vector,
             &scanned,
             total_text_accumulator_bytes,
+            total_key_bytes,
+            max_result_bytes,
             &mut expr_scratch,
         )?;
     }
@@ -486,6 +536,7 @@ fn observe_candidate_slots_grouped(
     null_group: &mut Option<Vec<Accumulator>>,
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
+    max_result_bytes: usize,
 ) -> Result<bool, SqlSurfaceError> {
     match observe_candidate_slots_grouped_inner(
         snapshot,
@@ -498,6 +549,7 @@ fn observe_candidate_slots_grouped(
         null_group,
         total_key_bytes,
         total_text_accumulator_bytes,
+        max_result_bytes,
     ) {
         Ok(()) => Ok(true),
         Err(GroupAccumulateError::TextBudgetExceeded) => {
@@ -525,6 +577,7 @@ fn observe_candidate_slots_grouped_inner(
     null_group: &mut Option<Vec<Accumulator>>,
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
+    max_result_bytes: usize,
 ) -> Result<(), GroupAccumulateError> {
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
@@ -597,6 +650,8 @@ fn observe_candidate_slots_grouped_inner(
                         &vector,
                         &scanned,
                         total_text_accumulator_bytes,
+                        *total_key_bytes,
+                        max_result_bytes,
                         &mut expr_scratch,
                     )?;
                 } else {
@@ -609,6 +664,8 @@ fn observe_candidate_slots_grouped_inner(
                         &vector,
                         &scanned,
                         total_text_accumulator_bytes,
+                        *total_key_bytes,
+                        max_result_bytes,
                         &mut expr_scratch,
                     )?;
                     string_groups.insert(try_clone_str(key_str)?, accs);
@@ -629,6 +686,8 @@ fn observe_candidate_slots_grouped_inner(
                     &vector,
                     &scanned,
                     total_text_accumulator_bytes,
+                    *total_key_bytes,
+                    max_result_bytes,
                     &mut expr_scratch,
                 )?;
             }
@@ -856,6 +915,14 @@ pub(crate) fn execute_grouped_aggregate(
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundAggregate,
+    // PR #1049 レビュー指摘 P0 対応: グループキー累計・TEXT 集計状態累計の
+    // 合算に対する結果バイト予算（[`RESULT_BUDGET_EXCEEDED_DETAIL`]・
+    // `aggregate.rs::execute_aggregate_with_cache` ドキュメント参照）。通常の
+    // （カーソル非経由の）呼び出し元は [`crate::sql::aggregate::
+    // MAX_AGGREGATE_RESULT_BYTES`] を渡し、`sql::cursor::CursorStatement::
+    // Declare` の内側実行だけがより小さい [`crate::sql::cursor::
+    // MAX_CURSOR_BYTES_PER_SESSION`] を渡す。
+    max_result_bytes: usize,
     // Issue #475: `sql::scalar_index::ScalarIndex` 経由の候補削減・キー列挙。
     // `WHERE` なしの `GROUP BY`（列挙形）・索引対応述語のみの `WHERE` を持つ
     // `GROUP BY`（候補走査形）に限り消費する（`aggregate.rs::
@@ -974,6 +1041,7 @@ pub(crate) fn execute_grouped_aggregate(
                             &mut null_group,
                             &mut total_key_bytes,
                             &mut total_text_accumulator_bytes,
+                            max_result_bytes,
                         )?;
                     } else {
                         let id_preds: Vec<crate::sql::scalar_plan::IdPredicate> = bound
@@ -1000,6 +1068,7 @@ pub(crate) fn execute_grouped_aggregate(
                                 &mut null_group,
                                 &mut total_key_bytes,
                                 &mut total_text_accumulator_bytes,
+                                max_result_bytes,
                             )?;
                         }
                     }
@@ -1175,6 +1244,8 @@ pub(crate) fn execute_grouped_aggregate(
                                 &vector,
                                 &scanned,
                                 &mut total_text_accumulator_bytes,
+                                total_key_bytes,
+                                max_result_bytes,
                                 &mut expr_scratch,
                             )?;
                         } else {
@@ -1194,6 +1265,8 @@ pub(crate) fn execute_grouped_aggregate(
                                 &vector,
                                 &scanned,
                                 &mut total_text_accumulator_bytes,
+                                total_key_bytes,
+                                max_result_bytes,
                                 &mut expr_scratch,
                             )?;
                             string_groups.insert(try_clone_str(key_str)?, accs);
@@ -1214,6 +1287,8 @@ pub(crate) fn execute_grouped_aggregate(
                             &vector,
                             &scanned,
                             &mut total_text_accumulator_bytes,
+                            total_key_bytes,
+                            max_result_bytes,
                             &mut expr_scratch,
                         )?;
                     }
@@ -1447,9 +1522,131 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound = bound_count_star_grouped_by_lang();
-        let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, None, None)
-            .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        let err = execute_grouped_aggregate(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+        )
+        .expect_err("key/header tenant mismatch must be rejected fail-closed");
         assert_eq!(err.wire_code(), "XX000");
+    }
+
+    /// [`bound_count_star_grouped_by_lang`] と同じスキーマ・グループ列だが、
+    /// `MIN`/`MAX(lang)` を集計項目に持つ `BoundAggregate`（PR #1049 レビュー
+    /// 指摘 P0 対応の回帰テスト用）。グループキー累計バイト数（`lang` 自身）と
+    /// `TEXT` 集計状態累計バイト数（同じく `lang`）の両方が同時に発生する形。
+    fn bound_min_max_grouped_by_lang() -> BoundAggregate {
+        BoundAggregate {
+            table: "docs".to_string(),
+            items: vec![
+                BoundAggregateItem {
+                    func: AggregateFunc::Min,
+                    input: AggregateInput::TextColumn(1),
+                    name: "result_min".to_string(),
+                },
+                BoundAggregateItem {
+                    func: AggregateFunc::Max,
+                    input: AggregateInput::TextColumn(1),
+                    name: "result_max".to_string(),
+                },
+            ],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            rls_predicate_present: false,
+            projection: vec![
+                crate::sql::parser::ProjectionColumn::GroupKey {
+                    name: "lang".to_string(),
+                },
+                crate::sql::parser::ProjectionColumn::Aggregate {
+                    item_index: 0,
+                    name: "result_min".to_string(),
+                },
+                crate::sql::parser::ProjectionColumn::Aggregate {
+                    item_index: 1,
+                    name: "result_max".to_string(),
+                },
+            ],
+            group_by: Some(BoundGroupBy {
+                column_index: 1,
+                having: Vec::new(),
+                order_by: None,
+                limit: None,
+            }),
+        }
+    }
+
+    /// PR #1049 レビュー指摘 P0 対応の回帰テスト: `GROUP BY` ありの集計は
+    /// グループキー累計・`TEXT` 集計状態累計をそれぞれ独立に
+    /// [`MAX_GROUP_KEY_TOTAL_BYTES`]・[`MAX_TEXT_ACCUMULATOR_TOTAL_BYTES`]
+    /// （各 16 MiB）で頭打ちにするだけでは、両者の合計が呼び出し元の指定する
+    /// 結果バイト予算（`sql::cursor::MAX_CURSOR_BYTES_PER_SESSION` 相当の小さい
+    /// 値を模した `1`）を超えうる。[`accumulate_row`] の合算検査がこれを行生成
+    /// 中に打ち切ることを固定する（[`crate::sql::scan::execute_scan_with_
+    /// budget_honors_caller_supplied_cap`] と同じ検証形）。
+    #[test]
+    fn execute_grouped_aggregate_honors_caller_supplied_result_byte_budget() {
+        let path = unique_db_path("group-by-result-budget-cap");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text_group_column();
+        storage.create_table(&schema).expect("create table");
+
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("docs"),
+                ))
+                .expect("open row table");
+            let metadata = crate::row_codec::encode_scalar_columns(
+                &schema,
+                &[
+                    crate::row_codec::Value::Null,
+                    crate::row_codec::Value::Text("ja".to_string()),
+                ],
+            )
+            .expect("encode scalar columns");
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 2.0, 3.0],
+                metadata: &metadata,
+            })
+            .expect("encode row");
+            table
+                .insert(("tenant-a", 1u64), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound = bound_min_max_grouped_by_lang();
+        // 既定予算（`sql::aggregate::MAX_AGGREGATE_RESULT_BYTES`）では成功する。
+        execute_grouped_aggregate(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+        )
+        .expect("default budget should succeed");
+
+        // 同じデータ・同じクエリでも、呼び出し元が極端に小さい予算を渡せば
+        // 行生成中に打ち切られる（`sql::cursor::CursorStatement::Declare` の
+        // 内側実行が `MAX_CURSOR_BYTES_PER_SESSION` を渡す経路の回帰）。
+        let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, 1, None, None)
+            .expect_err("tiny caller-supplied budget must reject before default cap");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     // --- cmp_signed_to_literal（Issue #892・D8） --------------------------
@@ -1598,8 +1795,16 @@ mod tests {
             "COUNT(<UUID column>) grouped by TEXT must not require embedding decode"
         );
 
-        let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, None, None)
-            .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        let err = execute_grouped_aggregate(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+        )
+        .expect_err("key/header tenant mismatch must be rejected fail-closed");
         assert_eq!(err.wire_code(), "XX000");
     }
 
@@ -1665,8 +1870,16 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound = bound_count_uuid_grouped_by_lang();
-        let result = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, None, None)
-            .expect("grouped COUNT(<UUID column>) should succeed");
+        let result = execute_grouped_aggregate(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+        )
+        .expect("grouped COUNT(<UUID column>) should succeed");
 
         let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
         for row in &result.rows {

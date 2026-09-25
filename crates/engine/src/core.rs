@@ -2929,20 +2929,31 @@ impl EngineCore {
     /// `Statement::Aggregate`／`Statement::Scan` のいずれかであることが構造
     /// 検証段で保証済み）専用の実行入口（PR #1049 レビュー指摘 P1 対応）。
     ///
-    /// `Statement::Scan` のみ、[`crate::sql::scan::execute_scan_with_budget`] を
-    /// [`crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`]（16 MiB）で直接呼び、
-    /// 行生成中の累積判定を [`Self::execute_validated_in_session`] 経由の既定
-    /// 予算（`sql::scan::MAX_SCAN_RESULT_BYTES`＝1 GiB）より遥かに手前で打ち
-    /// 切る——`CursorRegistry::declare` のバイト上限判定（16 MiB）は本来
-    /// カーソルが保持できる上限を表すにも関わらず、既定予算のまま実行すると
-    /// その判定に到達する前に最大 1 GiB もの結果をメモリ上に確定させてしまう
+    /// `Statement::Scan` は [`crate::sql::scan::execute_scan_with_budget`] を、
+    /// `Statement::Aggregate` は [`Self::run_aggregate_plan`] を、いずれも
+    /// [`crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`]（16 MiB）の結果
+    /// バイト予算で直接呼び、行生成中の累積判定を [`Self::
+    /// execute_validated_in_session`] 経由の既定予算（`Statement::Scan` の
+    /// `sql::scan::MAX_SCAN_RESULT_BYTES`＝1 GiB、`Statement::Aggregate` の
+    /// [`crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES`]＝1 GiB）より遥かに
+    /// 手前で打ち切る——`CursorRegistry::declare` のバイト上限判定（16 MiB）は
+    /// 本来カーソルが保持できる上限を表すにも関わらず、既定予算のまま実行する
+    /// とその判定に到達する前に大きな結果をメモリ上に確定させてしまう
     /// （ネットワーク入力によるメモリ確保量の増幅。security.md「不安全な
-    /// 設計」対応）。`Statement::Aggregate` は `GROUP BY` のグループキー累計
-    /// バイト数上限（`sql::group_by::MAX_GROUP_KEY_TOTAL_BYTES`＝16 MiB）が
-    /// 既に同程度の予算で頭打ちになっているため、通常の
-    /// [`Self::execute_validated_in_session`] へそのまま委譲する（それ以外の
-    /// `Statement` 種別への到達は構造検証段の保証により起き得ないが、
-    /// 防御的に同じ経路へ委譲する）。
+    /// 設計」対応。PR #1049 レビュー指摘 P0 対応: `Statement::Aggregate` は
+    /// `GROUP BY` のグループキー累計バイト数上限（`sql::group_by::
+    /// MAX_GROUP_KEY_TOTAL_BYTES`）・`TEXT` 集計状態の累計バイト数上限が
+    /// それぞれ独立に 16 MiB で頭打ちになるのみで、両者の合計や `GROUP BY`
+    /// なしの単一行経路の `MIN`/`MAX(<TEXT 列>)` 累計（最大
+    /// [`crate::sql::allowlist::MAX_AGGREGATE_ITEMS`] 項目分）を完成した
+    /// [`crate::sql::exec::QueryResult`] 全体の容量として制限していなかった
+    /// ため、既定予算のまま `run_aggregate_plan` へ委譲すると `declare` の
+    /// 16 MiB 判定に到達する前に遥かに大きな結果を確定させてしまう。`run_aggregate_plan`
+    /// 自体に `max_result_bytes` を明示的に渡すことで、`sql::aggregate::
+    /// execute_aggregate_with_cache`／`sql::group_by::execute_grouped_aggregate`
+    /// の行生成ループが 16 MiB 予算を生成中に検査するようにする）。それ以外の
+    /// `Statement` 種別への到達は構造検証段の保証により起き得ないが、防御的に
+    /// 通常の [`Self::execute_validated_in_session`] へ委譲する。
     fn execute_cursor_inner_query(
         &self,
         ctx: &PolicyContext,
@@ -2953,6 +2964,18 @@ impl EngineCore {
             let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
             let bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
             let result = crate::sql::scan::execute_scan_with_budget(
+                &read_txn,
+                ctx,
+                &schema,
+                &bound,
+                crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION,
+            )?;
+            return Ok(crate::sql::SqlOutcome::Query(result));
+        }
+        if let crate::sql::allowlist::Statement::Aggregate(validated) = inner {
+            let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+            let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
+            let result = self.run_aggregate_plan(
                 &read_txn,
                 ctx,
                 &schema,
@@ -3430,7 +3453,13 @@ impl EngineCore {
                 let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
                 let bound =
                     crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
-                let result = self.run_aggregate_plan(&read_txn, ctx, &schema, &bound)?;
+                let result = self.run_aggregate_plan(
+                    &read_txn,
+                    ctx,
+                    &schema,
+                    &bound,
+                    crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+                )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             // Issue #454: 広域取得（ソートなしのフィルタ取得）は `Statement::Aggregate`
@@ -3879,18 +3908,27 @@ impl EngineCore {
     /// （[`Self::execute_bound_aggregate_in_session`]）も SQL テキスト経由と
     /// 同一のキャッシュ最適化を受ける（`sql::aggregate::execute_aggregate`
     /// 〔公開ラッパー・キャッシュ非経由〕とは意図的に差別化する）。
+    ///
+    /// `max_result_bytes`（PR #1049 レビュー指摘 P0 対応）: 通常の（カーソル
+    /// 非経由の）呼び出し元は [`crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES`]
+    /// （既存挙動を変えない大きな既定値）を渡す。[`Self::execute_cursor_inner_query`]
+    /// だけが `DECLARE` の内側実行専用により小さい
+    /// [`crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`] を渡す
+    /// （[`crate::sql::scan::execute_scan_with_budget`] と同じ設計判断）。
     fn run_aggregate_plan(
         &self,
         read_txn: &redb::ReadTransaction,
         ctx: &PolicyContext,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundAggregate,
+        max_result_bytes: usize,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
         crate::sql::aggregate::execute_aggregate_with_cache(
             read_txn,
             ctx,
             schema,
             bound,
+            max_result_bytes,
             Some(crate::sql::visible_cache::VisibleCacheAccess {
                 storage: &self.storage,
                 cache: &self.visible_bitmap_cache,
@@ -4218,7 +4256,13 @@ impl EngineCore {
                 "bound aggregate plan targets a different table than requested",
             ));
         }
-        self.run_aggregate_plan(&read_txn, ctx, &schema, &bound)
+        self.run_aggregate_plan(
+            &read_txn,
+            ctx,
+            &schema,
+            &bound,
+            crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+        )
     }
 
     /// 束縛済み複数行 `INSERT` 計画（[`crate::sql::parser::BoundInsert`] の列）を
