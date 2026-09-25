@@ -28,7 +28,9 @@
 //! （詳細・緩和条件は `docs/design/wire-multi-statement.md` 参照）。
 //! 途中でエラーになった場合はセッション状態（`SET`／`CREATE FUNCTION` 等）も
 //! メッセージ受信前の値へ巻き戻す（`SessionState` の `clone` を保持し、
-//! 失敗時に復元する）。
+//! 失敗時に復元する）。ただしメッセージ内で明示トランザクションの境界
+//! （`BEGIN`/`COMMIT`/`ROLLBACK`）を跨いだ場合、巻き戻し先はその境界の時点の
+//! 状態へ更新する（SQL-31・TASK-221。`MessageSnapshot` 参照）。
 //!
 //! `INSERT` は wire 経由で受理する（TASK-82・SQL-10。`EngineCore::
 //! execute_sql_in_session` が先頭トークンを見て `execute_insert_sql`（TASK-80）
@@ -179,14 +181,16 @@ pub(crate) fn execute_and_respond<'e>(
             {
                 return respond_splitter_error(stream, txn, &e);
             }
-            // 途中の文がエラーになった場合にメッセージ受信前の状態へ巻き戻す
-            // ためのスナップショット（`SET`／`CREATE FUNCTION` の暗黙ロールバック）。
-            // 単一文経路（`Single`）はこの clone を行わないため、既存の単一文
-            // レイテンシ・コストは不変。トランザクション状態自体（`txn`）は
-            // 巻き戻さない ―― `BEGIN` 済みのトランザクションは、途中の文が
-            // エラーになれば `Failed` へ遷移したまま残り、次の `ROLLBACK` で
-            // 閉じる契約（`sql::transaction` モジュールドキュメント参照）。
-            let snapshot = session.clone();
+            // 途中の文がエラーになった場合に巻き戻すためのスナップショット
+            // （`SET`／`CREATE FUNCTION` の暗黙ロールバック）。単一文経路
+            // （`Single`）はこの clone を行わないため、既存の単一文レイテンシ・
+            // コストは不変。トランザクション状態自体（`txn`）は巻き戻さない ――
+            // `BEGIN` 済みのトランザクションは、途中の文がエラーになれば `Failed`
+            // へ遷移したまま残り、次の `ROLLBACK` で閉じる契約
+            // （`sql::transaction` モジュールドキュメント参照）。巻き戻し先は
+            // メッセージ内の直近のトランザクション境界へ更新する
+            // （[`MessageSnapshot`] 参照。PR #1041 レビュー指摘）。
+            let mut snapshot = MessageSnapshot::new(session);
             let last_index = stmts.len().saturating_sub(1);
             for (i, stmt) in stmts.iter().enumerate() {
                 let finish = if i == last_index {
@@ -194,18 +198,73 @@ pub(crate) fn execute_and_respond<'e>(
                 } else {
                     Finish::Continue
                 };
+                let before = txn.status();
                 match run_statement(stream, engine, ctx, session, txn, stmt, finish)? {
-                    StatementStatus::Completed => {}
+                    StatementStatus::Completed => {
+                        snapshot.after_completed(before, txn.status(), session);
+                    }
                     StatementStatus::Failed => {
                         // ErrorResponse＋ReadyForQuery は run_statement 内で
                         // 送出済み。残りの文は実行せず、セッション状態を復元する。
-                        *session = snapshot;
+                        snapshot.restore_after_failure(before, txn.status(), session);
                         return Ok(());
                     }
                 }
             }
             Ok(())
         }
+    }
+}
+
+/// 複数文メッセージ（WIRE-16）の途中エラー時に巻き戻すセッション状態の
+/// スナップショット（SQL-31・TASK-221。PR #1041 レビュー指摘）。
+///
+/// メッセージ受信前の状態を無条件に復元すると、同じメッセージ内の `ROLLBACK`
+/// （または失敗した `COMMIT`）が `BEGIN` 時点の状態へ戻した後に後続文が失敗した
+/// 場合、トランザクション中の `SET`／`CREATE FUNCTION` が `Idle` のセッションに
+/// 復活してしまう。PostgreSQL の暗黙トランザクションと同じく、巻き戻しの範囲は
+/// 「メッセージ内の直近のトランザクション境界（`BEGIN`/`COMMIT`/`ROLLBACK`）以降」
+/// に限る。
+struct MessageSnapshot {
+    session: SessionState,
+}
+
+impl MessageSnapshot {
+    fn new(session: &SessionState) -> Self {
+        Self {
+            session: session.clone(),
+        }
+    }
+
+    /// 文が成功した直後に呼ぶ。トランザクション状態が変わった（＝文がトランザ
+    /// クション境界を跨いだ）場合に限り、巻き戻し先をその時点の状態へ更新する
+    /// （状態が変わらない文では clone しない）。
+    fn after_completed(
+        &mut self,
+        before: engine::sql::transaction::TransactionStatus,
+        after: engine::sql::transaction::TransactionStatus,
+        session: &SessionState,
+    ) {
+        if before != after {
+            self.session = session.clone();
+        }
+    }
+
+    /// 文が失敗した直後に呼ぶ。失敗した文自身がトランザクションを閉じた場合
+    /// （`Active`/`Failed` → `Idle`。失敗した `COMMIT` は `BEGIN` 時点の状態を
+    /// 既に復元している）は、その復元結果を上書きしない。それ以外は直近の境界の
+    /// 状態へ巻き戻す。
+    fn restore_after_failure(
+        self,
+        before: engine::sql::transaction::TransactionStatus,
+        after: engine::sql::transaction::TransactionStatus,
+        session: &mut SessionState,
+    ) {
+        use engine::sql::transaction::TransactionStatus;
+        if before != TransactionStatus::Idle && after == TransactionStatus::Idle {
+            return;
+        }
+        *session = self.session;
     }
 }
 
@@ -1076,6 +1135,144 @@ mod tests {
         );
         assert_eq!(received.first().copied(), Some(b'C'));
         assert_eq!(received.last().copied(), Some(b'T'));
+    }
+
+    /// 複数文メッセージのテスト用に、応答を読み捨てるループバック対と engine を
+    /// 用意して `execute_and_respond` を順に実行する。
+    fn run_messages(
+        engine: &EngineCore,
+        session: &mut SessionState,
+        messages: &[&str],
+    ) -> engine::sql::transaction::TransactionStatus {
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant id");
+        let mut txn = engine.new_session_transaction();
+        let (mut server, mut client) = loopback_pair();
+        let reader = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).expect("read_to_end");
+            buf
+        });
+        for sql in messages {
+            execute_and_respond(&mut server, engine, &ctx, session, &mut txn, sql)
+                .expect("execute_and_respond");
+        }
+        let status = txn.status();
+        drop(txn);
+        drop(server);
+        let _ = reader.join().expect("reader thread");
+        status
+    }
+
+    fn new_engine(label: &str) -> (EngineCore, temp_db::CleanupGuard) {
+        let path = temp_db::unique_db_path(label);
+        let guard = temp_db::CleanupGuard(path.clone());
+        let storage = engine::storage::Storage::open(&path).expect("open storage");
+        (
+            EngineCore::from_storage(storage, Box::new(engine::kernel::CpuScalarProvider)),
+            guard,
+        )
+    }
+
+    /// SQL-31・TASK-221（PR #1041 レビュー指摘）: 同じメッセージ内の `ROLLBACK`
+    /// が `BEGIN` 時点の状態へ戻した後に後続文が失敗しても、メッセージ受信前
+    /// （トランザクション中）の `SET` を復活させないこと。
+    #[test]
+    fn failure_after_rollback_in_same_message_keeps_rolled_back_session_state() {
+        use engine::sql::mode::SearchMode;
+        let (engine, _guard) = new_engine("simple-query-rollback-then-failure");
+        let mut session = SessionState::default();
+        let status = run_messages(
+            &engine,
+            &mut session,
+            &[
+                "SET search_mode = 'precision'",
+                "BEGIN",
+                "SET search_mode = 'recall'",
+                "ROLLBACK; SELEC 1",
+            ],
+        );
+        assert_eq!(status, engine::sql::transaction::TransactionStatus::Idle);
+        assert_eq!(
+            session.search_mode(),
+            Some(SearchMode::Precision),
+            "a failure after ROLLBACK must not resurrect the in-transaction SET"
+        );
+    }
+
+    /// 同じメッセージ内で `BEGIN` した後の文が失敗した場合、巻き戻し先は `BEGIN`
+    /// の時点（＝`ROLLBACK` が復元する状態と同じ）であること。
+    #[test]
+    fn failure_after_begin_in_same_message_restores_to_begin_boundary() {
+        use engine::sql::mode::SearchMode;
+        let (engine, _guard) = new_engine("simple-query-begin-then-failure");
+        let mut session = SessionState::default();
+        let status = run_messages(
+            &engine,
+            &mut session,
+            &["SET search_mode = 'precision'; BEGIN; SET search_mode = 'recall'; SELEC 1"],
+        );
+        assert_eq!(status, engine::sql::transaction::TransactionStatus::Failed);
+        assert_eq!(session.search_mode(), Some(SearchMode::Precision));
+
+        let status = run_messages(&engine, &mut session, &["ROLLBACK"]);
+        assert_eq!(status, engine::sql::transaction::TransactionStatus::Idle);
+        assert_eq!(session.search_mode(), Some(SearchMode::Precision));
+    }
+
+    /// 対照: トランザクション境界を跨がない複数文メッセージの途中失敗は、従来
+    /// どおりメッセージ受信前の状態へ巻き戻すこと。
+    #[test]
+    fn failure_without_transaction_boundary_restores_pre_message_state() {
+        use engine::sql::mode::SearchMode;
+        let (engine, _guard) = new_engine("simple-query-plain-failure");
+        let mut session = SessionState::default();
+        run_messages(
+            &engine,
+            &mut session,
+            &[
+                "SET search_mode = 'precision'",
+                "SET search_mode = 'recall'; SELEC 1",
+            ],
+        );
+        assert_eq!(session.search_mode(), Some(SearchMode::Precision));
+    }
+
+    /// 失敗した `COMMIT`（`Active` → `Idle`。`BEGIN` 時点の状態を復元済み）の後は、
+    /// メッセージ内スナップショットでその復元結果を上書きしないこと（commit 自体の
+    /// 失敗は wire 層から注入できないため、判定部分を直接検証する。engine 側の
+    /// 復元は `sql::transaction` の `commit_failure_restores_session_state_at_begin_
+    /// and_returns_to_idle` が固定する）。
+    #[test]
+    fn message_snapshot_does_not_overwrite_failed_commit_restore() {
+        use engine::sql::mode::SearchMode;
+        use engine::sql::transaction::TransactionStatus;
+        let (engine, _guard) = new_engine("simple-query-snapshot-failed-commit");
+        let mut in_txn = SessionState::default();
+        run_messages(&engine, &mut in_txn, &["SET search_mode = 'recall'"]);
+        let mut at_begin = SessionState::default();
+        run_messages(&engine, &mut at_begin, &["SET search_mode = 'precision'"]);
+
+        // メッセージ受信時点（トランザクション中）の状態を保持したスナップショット。
+        let snapshot = MessageSnapshot::new(&in_txn);
+        // 失敗した COMMIT が `session` を BEGIN 時点へ復元済みの状態。
+        let mut session = at_begin.clone();
+        snapshot.restore_after_failure(
+            TransactionStatus::InTransaction,
+            TransactionStatus::Idle,
+            &mut session,
+        );
+        assert_eq!(session.search_mode(), Some(SearchMode::Precision));
+
+        // 対照: トランザクションを閉じない失敗（Active → Failed）は巻き戻す。
+        let snapshot = MessageSnapshot::new(&in_txn);
+        let mut session = at_begin;
+        snapshot.restore_after_failure(
+            TransactionStatus::InTransaction,
+            TransactionStatus::Failed,
+            &mut session,
+        );
+        assert_eq!(session.search_mode(), Some(SearchMode::Recall));
     }
 
     /// ERR-5: [`emergency_response_bytes`] が返すバイト列（`crates/wire-server/
