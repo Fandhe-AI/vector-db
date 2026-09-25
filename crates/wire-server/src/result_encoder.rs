@@ -246,89 +246,116 @@ pub mod binary {
     }
 }
 
-/// `RowDescription` が公告する PostgreSQL 型（型写像表の単一情報源。
-/// Issue #762・NOSQL-11）。`crate::http::query::response`（NoSQL 表層の JSON
-/// 応答スキーマ `columns[].type`）も本 enum を経由して同じ写像を参照し、
-/// wire 側 `RowDescription` と JSON `columns` の型名が乖離しない構造にする
-/// （2 箇所に写像表を持たない）。`#[deny(clippy::wildcard_enum_match_arm)]`
-/// を付けた網羅 `match`（`http/status.rs` と同方針）で
-/// [`ColumnMeta`] に variant が増えたら両表層が同時にコンパイルエラーになる。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WireType {
-    /// `ColumnMeta::Id`。engine の行 ID は `u64` 全域（`u64::MAX` を含む）を
-    /// 有効値とするため、符号付き 64bit の `int8`（OID 20）では表現できない
-    /// 値が生じる（PR #210 レビュー指摘）。`ColumnMeta::Scalar{ty:
-    /// Numeric{..}}`（TASK-197・Issue #885）も同じ OID 1700 を公告する
-    /// （値の実体は別途 `Cell::Numeric` の正規テキスト表現）。`id` を `int8`
-    /// へ変更しない据え置き判断は WIRE-13・TASK-200・Issue #895 参照。
-    Numeric,
-    /// `ColumnMeta::Scalar{ty: Text}`／`Scalar{ty: Vector(_)}`／
-    /// `Scalar{ty: Array(_)}`／`Scalar{ty: Enum(_)}`／`Computed{..}`。
-    /// 専用 OID を持たない型はすべてここへ写像する（WIRE-13・TASK-200・
-    /// Issue #895 の据え置き判断）。
-    Text,
-    /// `ColumnMeta::Scalar{ty: Integer}`（`INTEGER`。TABLE-13・TASK-196・
-    /// Issue #881・#903 レビュー指摘）。`i32` 全域を表現する。
-    Int4,
-    /// `ColumnMeta::Scalar{ty: BigInt}`（`BIGINT`。同上）。`i64` 全域を表現する。
-    Int8,
-    /// `ColumnMeta::Scalar{ty: Boolean}`（`BOOLEAN`。TABLE-13・TASK-196・
-    /// Issue #883・WIRE-13・TASK-200・Issue #895）。`Cell::Bool` が送出する
-    /// `t`/`f` は `bool` の text 表現とそのまま一致する。
-    Bool,
-    /// `ColumnMeta::Scalar{ty: Real}`（`REAL`。TABLE-13・TASK-196・Issue #882・
-    /// WIRE-13・TASK-200・Issue #895）。単精度浮動小数点。
-    Float4,
-    /// `ColumnMeta::Scalar{ty: Double}`（`DOUBLE PRECISION`。同上）。倍精度。
-    Float8,
-    /// `ColumnMeta::Scalar{ty: Date}`（TABLE-13・TASK-197・Issue #884・
-    /// WIRE-13・TASK-200・Issue #895）。テキスト表現は `engine::datetime` の
-    /// ISO 表記（`YYYY-MM-DD`）。
-    Date,
-    /// `ColumnMeta::Scalar{ty: Timestamp}`（同上）。テキスト表現は
-    /// `engine::datetime` の ISO 表記（`YYYY-MM-DD HH:MM:SS[.ffffff]`）。
-    Timestamp,
-    /// `ColumnMeta::Scalar{ty: Bytea}`（TABLE-13・TASK-197・Issue #886・
-    /// WIRE-13・TASK-200・Issue #895）。テキスト表現は `\x` + 小文字 16 進
-    /// （`engine::bytea::format_hex_text`。PostgreSQL 既定の `bytea_output=hex`
-    /// と同形）。
-    Bytea,
-    /// `ColumnMeta::Scalar{ty: Uuid}`（TABLE-13〔検討中〕・TASK-197・
-    /// Issue #887・WIRE-13・TASK-200・Issue #895）。テキスト表現は小文字
-    /// `8-4-4-4-12`。
-    Uuid,
-    /// `ColumnMeta::Scalar{ty: Json}`（TABLE-14・TASK-198・Issue #889・
-    /// WIRE-13・TASK-200・Issue #895）。テキスト表現は格納テキストそのまま。
-    Json,
-    /// `ColumnMeta::Scalar{ty: Jsonb}`（同上）。テキスト表現は正規化済み
-    /// テキスト。
-    Jsonb,
+/// [`WireType`] の enum 定義と [`WireType::ALL`]（全 variant 列挙）を単一の
+/// variant トークン列から同時生成するマクロ。手動保守の配列に variant を
+/// 追加し忘れる余地を構造的に無くす（PR #1037 codex-review 指摘の是正。
+/// 旧実装は `ALL: [WireType; 13]` という配列サイズの明示一致だけに頼って
+/// おり、「variant を追加したのに `ALL` への追加を怠る」ケースでも配列長
+/// リテラル `13` を書き換えなければコンパイル・[`wire_type_all_is_exhaustive`]
+/// の双方を素通りしてしまっていた（`docs/design/wire-type-oid-mapping.md`
+/// の同種の誤った保証の記載も本 Issue で修正済み）。`ALL` の要素は enum
+/// 定義に渡した variant トークン列からそのまま生成されるため、enum へ
+/// variant を追加すれば `ALL` にも必ず反映される。
+macro_rules! wire_type_enum {
+    (
+        $(#[$enum_meta:meta])*
+        enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )+
+        }
+
+        impl $name {
+            /// 全 variant の列挙（型写像表の単一情報源）。[`wire_type_enum!`]
+            /// が enum 定義と同一の variant トークン列から生成するため、
+            /// `ALL` だけを更新し忘れる状態が構造的に発生し得ない。
+            /// [`from_oid`]・単体テストの網羅性検査はここから導出する。
+            /// 単体テスト専用のため非テストビルドでは未使用となり
+            /// `#[cfg(test)]` で dead_code を回避する。
+            #[cfg(test)]
+            pub(crate) const ALL: [$name; wire_type_enum!(@count $($variant)+)] =
+                [$($name::$variant),+];
+        }
+    };
+    (@count $($variant:tt)+) => {
+        0usize $(+ wire_type_enum!(@one $variant))+
+    };
+    (@one $variant:tt) => {
+        1usize
+    };
+}
+
+wire_type_enum! {
+    /// `RowDescription` が公告する PostgreSQL 型（型写像表の単一情報源。
+    /// Issue #762・NOSQL-11）。`crate::http::query::response`（NoSQL 表層の JSON
+    /// 応答スキーマ `columns[].type`）も本 enum を経由して同じ写像を参照し、
+    /// wire 側 `RowDescription` と JSON `columns` の型名が乖離しない構造にする
+    /// （2 箇所に写像表を持たない）。`#[deny(clippy::wildcard_enum_match_arm)]`
+    /// を付けた網羅 `match`（`http/status.rs` と同方針）で
+    /// [`ColumnMeta`] に variant が増えたら両表層が同時にコンパイルエラーになる。
+    enum WireType {
+        /// `ColumnMeta::Id`。engine の行 ID は `u64` 全域（`u64::MAX` を含む）を
+        /// 有効値とするため、符号付き 64bit の `int8`（OID 20）では表現できない
+        /// 値が生じる（PR #210 レビュー指摘）。`ColumnMeta::Scalar{ty:
+        /// Numeric{..}}`（TASK-197・Issue #885）も同じ OID 1700 を公告する
+        /// （値の実体は別途 `Cell::Numeric` の正規テキスト表現）。`id` を `int8`
+        /// へ変更しない据え置き判断は WIRE-13・TASK-200・Issue #895 参照。
+        Numeric,
+        /// `ColumnMeta::Scalar{ty: Text}`／`Scalar{ty: Vector(_)}`／
+        /// `Scalar{ty: Array(_)}`／`Scalar{ty: Enum(_)}`／`Computed{..}`。
+        /// 専用 OID を持たない型はすべてここへ写像する（WIRE-13・TASK-200・
+        /// Issue #895 の据え置き判断）。
+        Text,
+        /// `ColumnMeta::Scalar{ty: Integer}`（`INTEGER`。TABLE-13・TASK-196・
+        /// Issue #881・#903 レビュー指摘）。`i32` 全域を表現する。
+        Int4,
+        /// `ColumnMeta::Scalar{ty: BigInt}`（`BIGINT`。同上）。`i64` 全域を表現する。
+        Int8,
+        /// `ColumnMeta::Scalar{ty: Boolean}`（`BOOLEAN`。TABLE-13・TASK-196・
+        /// Issue #883・WIRE-13・TASK-200・Issue #895）。`Cell::Bool` が送出する
+        /// `t`/`f` は `bool` の text 表現とそのまま一致する。
+        Bool,
+        /// `ColumnMeta::Scalar{ty: Real}`（`REAL`。TABLE-13・TASK-196・Issue #882・
+        /// WIRE-13・TASK-200・Issue #895）。単精度浮動小数点。
+        Float4,
+        /// `ColumnMeta::Scalar{ty: Double}`（`DOUBLE PRECISION`。同上）。倍精度。
+        Float8,
+        /// `ColumnMeta::Scalar{ty: Date}`（TABLE-13・TASK-197・Issue #884・
+        /// WIRE-13・TASK-200・Issue #895）。テキスト表現は `engine::datetime` の
+        /// ISO 表記（`YYYY-MM-DD`）。
+        Date,
+        /// `ColumnMeta::Scalar{ty: Timestamp}`（同上）。テキスト表現は
+        /// `engine::datetime` の ISO 表記（`YYYY-MM-DD HH:MM:SS[.ffffff]`）。
+        Timestamp,
+        /// `ColumnMeta::Scalar{ty: Bytea}`（TABLE-13・TASK-197・Issue #886・
+        /// WIRE-13・TASK-200・Issue #895）。テキスト表現は `\x` + 小文字 16 進
+        /// （`engine::bytea::format_hex_text`。PostgreSQL 既定の `bytea_output=hex`
+        /// と同形）。
+        Bytea,
+        /// `ColumnMeta::Scalar{ty: Uuid}`（TABLE-13〔検討中〕・TASK-197・
+        /// Issue #887・WIRE-13・TASK-200・Issue #895）。テキスト表現は小文字
+        /// `8-4-4-4-12`。
+        Uuid,
+        /// `ColumnMeta::Scalar{ty: Json}`（TABLE-14・TASK-198・Issue #889・
+        /// WIRE-13・TASK-200・Issue #895）。テキスト表現は格納テキストそのまま。
+        Json,
+        /// `ColumnMeta::Scalar{ty: Jsonb}`（同上）。テキスト表現は正規化済み
+        /// テキスト。
+        Jsonb,
+    }
 }
 
 impl WireType {
-    /// 全 variant の列挙（型写像表の単一情報源。[`from_oid`]・単体テストの
-    /// 網羅性検査がここから導出する。配列サイズを variant 数と明示一致
-    /// させているため、`WireType` へ variant を追加してここへの追加を
-    /// 怠るとコンパイルエラー（配列長不一致）になる）。[`from_oid`] と同じく
-    /// 単体テスト専用のため非テストビルドでは未使用となり `#[cfg(test)]` で
-    /// dead_code を回避する。
-    #[cfg(test)]
-    pub(crate) const ALL: [WireType; 13] = [
-        WireType::Numeric,
-        WireType::Text,
-        WireType::Int4,
-        WireType::Int8,
-        WireType::Bool,
-        WireType::Float4,
-        WireType::Float8,
-        WireType::Date,
-        WireType::Timestamp,
-        WireType::Bytea,
-        WireType::Uuid,
-        WireType::Json,
-        WireType::Jsonb,
-    ];
-
     /// PostgreSQL 型 OID（`pg_type.oid`）。網羅 `match`（ワイルドカード腕
     /// なし）のため `WireType` に variant が増えると本関数はコンパイル
     /// エラーで検出する。
@@ -1797,10 +1824,12 @@ mod tests {
     }
 
     /// `WireType::ALL` の要素数が [`WireType`] の variant 数（13）と一致する
-    /// ことを固定する（`ALL` は単なる配列リテラルで、`WireType` へ variant を
-    /// 追加してもコンパイラは自動検出しない。配列サイズ注釈
-    /// `[WireType; 13]` により追加漏れは既にコンパイルエラーになるが、
-    /// この定数自体が意図どおり保守されていることをテストでも固定する）。
+    /// ことを固定する（実測値の回帰検知が目的。`ALL` 自体は
+    /// [`wire_type_enum!`] マクロが enum 定義と同一の variant トークン列から
+    /// 生成するため、`ALL` への追加漏れは PR #1037 codex-review 指摘の是正で
+    /// 構造的に発生し得なくなった。このテストは「13 個という現在の想定数」
+    /// が変わったことを検知する回帰テストであり、`ALL` の網羅性そのものの
+    /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
         assert_eq!(WireType::ALL.len(), 13);

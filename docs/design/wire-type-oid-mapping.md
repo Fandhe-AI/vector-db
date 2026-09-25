@@ -46,11 +46,15 @@ variant 名・型名は既存 `Int4`/`Int8` に倣い PostgreSQL の `typname` �
 
 ## 単一情報源の設計
 
-`WireType::ALL`（全 variant を列挙する固定長配列。variant 数と配列サイズ
-注釈を一致させているため、`WireType` へ variant を追加してここへの追加を
-怠るとコンパイルエラーになる）を単一の起点とし、`from_oid`（逆引き。単体
-テスト専用）は `ALL` を線形走査するだけで、逆引き専用の第 2 の写像表を
-持たない。正引き（`oid()`／`typlen()`／`pg_type_name()`）はいずれも
+`WireType::ALL`（全 variant を列挙する固定長配列）を単一の起点とし、
+`from_oid`（逆引き。単体テスト専用）は `ALL` を線形走査するだけで、逆引き
+専用の第 2 の写像表を持たない。`ALL` は手動保守の配列ではなく、
+`wire_type_enum!` マクロ（`result_encoder.rs`）が `WireType` の enum 定義と
+同一の variant トークン列から自動生成する。配列サイズ注釈だけで
+「`WireType` へ variant を追加すれば `ALL` への追加漏れがコンパイルエラーに
+なる」と保証できるわけではない（variant 追加と配列長リテラルの据え置きは
+両立してしまうため。PR #1037 codex-review 指摘）ことを踏まえ、マクロによる
+単一トークン列からの同時生成でこの構造的な抜け道自体を無くしている。正引き（`oid()`／`typlen()`／`pg_type_name()`）はいずれも
 `#[deny(clippy::wildcard_enum_match_arm)]` を付けた網羅 `match` のままとし、
 `WireType`／`ColumnMeta` に variant が増えたときの決定漏れをコンパイル
 エラーで検出する契約（`docs/design/wire-binary-format.md` から踏襲）を維持
