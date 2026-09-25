@@ -560,3 +560,117 @@ fn rls_isolates_typed_compare_predicate_results_across_tenants() {
     // bob の視点でも同様（他テナント行は見えない）。
     assert_eq!(select_ids(&core, &bob, "day >= '2024-01-01'"), vec![101]);
 }
+
+// --- operation_id 内容照合ハッシュ（Compare 用新規タグ）の再送判定 -----------
+//
+// `WherePredicate::Compare`（typed compare。`recovery::content_hash` の新規
+// タグ）を経由した述語つき UPDATE/DELETE でも、既存の Equality 経由の
+// 台帳照合（TASK-101・RECOVER-10 の重複拒否契約を包含する RECOVER-11）と
+// 同じく「同一内容の再送は 23505」「内容不一致は 22023」に収束することを
+// 固定する（Issue #891 レビュー指摘。`sql_predicate_dml_exec.rs` の
+// Equality 版テストと同じ流儀）。
+
+#[test]
+fn predicate_update_typed_compare_resend_same_content_is_duplicate() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_two_rows(&core, &alice);
+
+    let sql = format!(
+        "UPDATE {TABLE} SET lang = 'fr' WHERE day > '2024-01-01' \
+         USING OPERATION_ID 'op-upd-compare-resend'"
+    );
+    core.execute_sql_in_session(&alice, &mut SessionState::default(), &sql)
+        .expect("first predicate UPDATE should succeed");
+
+    let err = core
+        .execute_sql_in_session(&alice, &mut SessionState::default(), &sql)
+        .expect_err("resend of the same operation_id and predicate must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+    // 再送は台帳照合で拒否され、行は 1 回目の適用のまま変化しない。
+    assert_eq!(select_ids(&core, &alice, "lang = 'fr'"), vec![2]);
+}
+
+#[test]
+fn predicate_update_typed_compare_resend_different_literal_is_content_mismatch() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_two_rows(&core, &alice);
+
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &format!(
+            "UPDATE {TABLE} SET lang = 'fr' WHERE day > '2024-01-01' \
+             USING OPERATION_ID 'op-upd-compare-mismatch'"
+        ),
+    )
+    .expect("first predicate UPDATE should succeed");
+
+    // 同一 operation_id・同一列だが比較演算子の相手リテラルが異なる
+    // （境界値を跨いで一致行集合も変わる）ため内容不一致。
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "UPDATE {TABLE} SET lang = 'fr' WHERE day > '2024-06-01' \
+                 USING OPERATION_ID 'op-upd-compare-mismatch'"
+            ),
+        )
+        .expect_err("resend with a different compare literal must be a content mismatch");
+    assert_eq!(err.wire_code(), "22023");
+}
+
+#[test]
+fn predicate_delete_typed_compare_resend_same_content_is_duplicate() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_two_rows(&core, &alice);
+
+    let sql = format!(
+        "DELETE FROM {TABLE} WHERE price >= '2.00' USING OPERATION_ID 'op-del-compare-resend'"
+    );
+    core.execute_sql_in_session(&alice, &mut SessionState::default(), &sql)
+        .expect("first predicate DELETE should succeed");
+
+    let err = core
+        .execute_sql_in_session(&alice, &mut SessionState::default(), &sql)
+        .expect_err("resend of the same operation_id and predicate must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+    // 台帳照合による拒否のため、対象行は既に削除済みのまま変化しない。
+    assert_eq!(select_ids(&core, &alice, "lang = 'en'"), Vec::<u64>::new());
+}
+
+#[test]
+fn predicate_delete_typed_compare_resend_different_operator_is_content_mismatch() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_two_rows(&core, &alice);
+
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &format!(
+            "DELETE FROM {TABLE} WHERE price >= '2.00' USING OPERATION_ID 'op-del-compare-op'"
+        ),
+    )
+    .expect("first predicate DELETE should succeed");
+
+    // 同一 operation_id・同一列・同一リテラルだが演算子（>= → >）が異なる
+    // ため内容不一致（削除対象は既に無いが台帳照合が列挙より先に働く）。
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "DELETE FROM {TABLE} WHERE price > '2.00' USING OPERATION_ID 'op-del-compare-op'"
+            ),
+        )
+        .expect_err("resend with a different compare operator must be a content mismatch");
+    assert_eq!(err.wire_code(), "22023");
+}
