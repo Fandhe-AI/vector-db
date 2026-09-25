@@ -84,7 +84,11 @@ pub enum CompareOp {
 
 impl CompareOp {
     /// `ordering`（値どうしの比較結果）がこの演算子を満たすかを判定する。
-    fn accepts(self, ordering: std::cmp::Ordering) -> bool {
+    /// `sql::scalar_index::ScalarIndex::candidates_for`（Issue #893。`NUMERIC`
+    /// 以外の `TypedCompare` 列——`Date`/`Timestamp`/`Uuid`——の整数境界導出が
+    /// 同じ演算子判定を共有するため `pub(crate)`）・`numeric::tests` の
+    /// brute-force オラクルからも参照する。
+    pub(crate) fn accepts(self, ordering: std::cmp::Ordering) -> bool {
         use std::cmp::Ordering::*;
         match self {
             CompareOp::Eq => ordering == Equal,

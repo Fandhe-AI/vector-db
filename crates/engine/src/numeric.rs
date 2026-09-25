@@ -184,6 +184,108 @@ pub fn cmp_exact(a: &Decimal, b: &Decimal) -> std::cmp::Ordering {
     a_frac_scaled.cmp(&b_frac_scaled)
 }
 
+/// `literal`（`parse_literal_exact` が返す任意の `scale` を持つ `NUMERIC`
+/// 比較リテラル）を、列固定の `col_scale` における `unscaled`（`i128`）の
+/// 範囲境界へ正規化する（`sql::scalar_index::ScalarIndex::candidates_for` の
+/// `NUMERIC` 列 `TypedCompare` 述語専用。TABLE-13・TASK-199、Issue #893）。
+///
+/// 列の値は常に `col_scale` ちょうどで格納される（`row_codec` が列型の
+/// `scale` に固定してデコードする契約）ため、`unscaled` 同士の大小比較が
+/// そのまま実数比較になる。`literal` 側は任意の `scale` を持ちうるため、
+/// [`cmp_exact`] と同じ「丸めない」比較意味論を保ったまま `col_scale` 側の
+/// 整数境界へ変換する。
+///
+/// `literal` を `col_scale` へ厳密に表現できない（`literal` の方が細かい
+/// 桁を持つ）場合は、床（`div_euclid`/`rem_euclid`。[`cmp_exact`] と同じ
+/// 負数でも余りが常に `[0, divisor)` になる方向）で位置を求め、余りの有無で
+/// `Gt`/`Ge`/`Lt`/`Le`/`Eq` の境界を導出する（`sql::scalar_plan::id_bounds`
+/// の非整数リテラル処理と同型のパターン）。桁合わせの乗除がオーバーフロー
+/// する場合は `None`（呼び出し元は索引未対応として全走査へ縮退する契機に
+/// する。fail-closed）。
+pub(crate) fn rescale_bounds_for_column(
+    literal: &Decimal,
+    col_scale: u8,
+    op: crate::declarative_filter::CompareOp,
+) -> Option<(std::ops::Bound<i128>, std::ops::Bound<i128>)> {
+    use crate::declarative_filter::CompareOp;
+    use std::ops::Bound;
+
+    // 呼び出し元が「一致 0 件」を明確に区別できるよう、キー値と無関係に
+    // 常に空集合になる正準表現（`Included(0)..Excluded(0)` は常に
+    // `start == end`。`sql::scalar_plan::id_bounds` の `EMPTY` と同じ手法）。
+    const EMPTY: (std::ops::Bound<i128>, std::ops::Bound<i128>) =
+        (Bound::Included(0), Bound::Excluded(0));
+
+    let lit_scale = literal.scale();
+    let lit_unscaled = literal.unscaled();
+
+    if lit_scale <= col_scale {
+        // 列の方が精度が高い（または同じ）: 桁上げは常に厳密（丸めなし）。
+        let up = pow10(col_scale - lit_scale)?;
+        let exact = lit_unscaled.checked_mul(up)?;
+        return Some(match op {
+            CompareOp::Eq => (Bound::Included(exact), Bound::Included(exact)),
+            CompareOp::Gt => match exact.checked_add(1) {
+                Some(l) => (Bound::Included(l), Bound::Unbounded),
+                None => EMPTY,
+            },
+            CompareOp::Ge => (Bound::Included(exact), Bound::Unbounded),
+            CompareOp::Lt => match exact.checked_sub(1) {
+                Some(u) => (Bound::Unbounded, Bound::Included(u)),
+                None => EMPTY,
+            },
+            CompareOp::Le => (Bound::Unbounded, Bound::Included(exact)),
+        });
+    }
+
+    // 列の方が精度が低い: `literal` を `col_scale` の格子へ切り捨て、余りの
+    // 有無で境界を調整する。
+    let divisor = pow10(lit_scale - col_scale)?;
+    let floor_int = lit_unscaled.div_euclid(divisor);
+    let has_remainder = lit_unscaled.rem_euclid(divisor) != 0;
+
+    Some(match op {
+        CompareOp::Eq => {
+            if has_remainder {
+                EMPTY
+            } else {
+                (Bound::Included(floor_int), Bound::Included(floor_int))
+            }
+        }
+        // `r > l`: `l` の小数部（`has_remainder`）の有無によらず、常に
+        // `floor_int + 1` 以上（`l` が整数の場合は `floor_int` 自身も除外、
+        // 小数を持つ場合も次の整数格子点から一致するため同じ式になる）。
+        CompareOp::Gt => match floor_int.checked_add(1) {
+            Some(l) => (Bound::Included(l), Bound::Unbounded),
+            None => EMPTY,
+        },
+        CompareOp::Ge => {
+            if has_remainder {
+                match floor_int.checked_add(1) {
+                    Some(l) => (Bound::Included(l), Bound::Unbounded),
+                    None => EMPTY,
+                }
+            } else {
+                (Bound::Included(floor_int), Bound::Unbounded)
+            }
+        }
+        CompareOp::Lt => {
+            if has_remainder {
+                (Bound::Unbounded, Bound::Included(floor_int))
+            } else {
+                match floor_int.checked_sub(1) {
+                    Some(u) => (Bound::Unbounded, Bound::Included(u)),
+                    None => EMPTY,
+                }
+            }
+        }
+        // `r <= l`: `has_remainder` の有無によらず常に `floor_int` 以下
+        // （`l` が整数のときはそのまま、小数を持つときも `r` は整数のため
+        // `r <= floor_int + frac(0<frac<1)` は `r <= floor_int` と同値）。
+        CompareOp::Le => (Bound::Unbounded, Bound::Included(floor_int)),
+    })
+}
+
 impl fmt::Display for Decimal {
     /// 正規テキスト表現（D8）。符号・整数部・（`scale > 0` のときのみ）`.` と
     /// ちょうど `scale` 桁にゼロ埋めした小数部。先頭ゼロ・指数表記・trailing
@@ -717,6 +819,88 @@ mod tests {
         assert_eq!(
             avg_unscaled(near_max, 1, 0, 30),
             Err(NumericError::OutOfRange)
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #893: `rescale_bounds_for_column`（`NUMERIC` 列の二次索引境界）
+    // ------------------------------------------------------------------
+
+    fn bound_contains_i128(
+        bounds: (std::ops::Bound<i128>, std::ops::Bound<i128>),
+        v: i128,
+    ) -> bool {
+        use std::ops::Bound;
+        let lower_ok = match bounds.0 {
+            Bound::Included(l) => v >= l,
+            Bound::Excluded(l) => v > l,
+            Bound::Unbounded => true,
+        };
+        let upper_ok = match bounds.1 {
+            Bound::Included(u) => v <= u,
+            Bound::Excluded(u) => v < u,
+            Bound::Unbounded => true,
+        };
+        lower_ok && upper_ok
+    }
+
+    /// [`rescale_bounds_for_column`] が返す境界が、列側の候補 `unscaled` 値
+    /// （`col_scale` 固定）を [`cmp_exact`] による brute-force オラクルと
+    /// 完全一致でふるい分けることを、列スケール・リテラルスケールの
+    /// 大小関係の両方（リテラルの方が精度が高い／低い）・全比較演算子を
+    /// 網羅して固定する。
+    #[test]
+    fn rescale_bounds_for_column_matches_cmp_exact_oracle() {
+        use crate::declarative_filter::CompareOp;
+
+        let col_scale = 2u8;
+        let candidates: Vec<i128> = (-1000..=1000).collect();
+        // リテラルの方が精度が低い（`lit_scale <= col_scale`）ケースと、
+        // 精度が高い（`lit_scale > col_scale`。列の格子に乗らない値を含む）
+        // ケースの双方を混在させる。
+        let literals: Vec<Decimal> = vec![
+            d(0, 0),
+            d(5, 0),
+            d(-5, 0),
+            d(150, 2),
+            d(-150, 2),
+            d(1505, 3),  // 1.505: col_scale=2 の格子に乗らない
+            d(-1505, 3), // -1.505: 同上
+            d(1500, 3),  // 1.500: 格子に乗る（余り 0）
+        ];
+        let ops = [
+            CompareOp::Eq,
+            CompareOp::Gt,
+            CompareOp::Ge,
+            CompareOp::Lt,
+            CompareOp::Le,
+        ];
+        for literal in &literals {
+            for op in ops {
+                let bounds = rescale_bounds_for_column(literal, col_scale, op)
+                    .expect("finite literal within precision must not overflow");
+                for &v in &candidates {
+                    let col_value = d(v, col_scale);
+                    let expected = op.accepts(cmp_exact(&col_value, literal));
+                    let actual = bound_contains_i128(bounds, v);
+                    assert_eq!(
+                        actual, expected,
+                        "op={op:?} literal={literal:?} col_scale={col_scale} v={v}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rescale_bounds_for_column_overflow_is_fail_closed() {
+        use crate::declarative_filter::CompareOp;
+        // 列側の精度が非常に高く、リテラルの桁上げが i128 を超える場合は
+        // `None`（呼び出し元は索引未対応として全走査へ縮退する）。
+        let huge_literal = d(99_999_999_999_999_999_999_999_999_999_999i128, 0);
+        assert_eq!(
+            rescale_bounds_for_column(&huge_literal, MAX_PRECISION, CompareOp::Eq),
+            None
         );
     }
 }

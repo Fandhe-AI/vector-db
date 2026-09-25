@@ -981,6 +981,11 @@ pub(crate) fn execute_grouped_aggregate(
                             .iter()
                             .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
                             .collect();
+                        // 数値・日時・`NUMERIC`・`UUID` 列の範囲述語
+                        // （`FilterOp::TypedCompare`。Issue #891・TASK-199 で
+                        // production 結線済み）は `bound.metadata_filters` に
+                        // 混在したまま渡り、`ScalarIndex::candidates_for` が
+                        // 内部で振り分ける（Issue #893 production 接続）。
                         if let crate::sql::scalar_index::CandidateResolution::Use(slots) =
                             index.resolve_candidates(&bound.metadata_filters, &id_preds)
                         {
