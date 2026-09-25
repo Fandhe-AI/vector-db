@@ -278,6 +278,25 @@ pub enum SqlSurfaceError {
     /// （`sql::parser::bind_uuid_literal`）も同じ発生経路を共有する。ERR-2 拡張:
     /// `22P02`（[`crate::error_format::ErrorClass::InvalidTextRepresentation`]）。
     InvalidTextRepresentation { detail: String },
+    /// 明示トランザクション（SQL-31・TASK-221）内で発生した一般的な状態不整合
+    /// （同一トランザクション内での `operation_id` の再利用等）。`25000`。
+    InvalidTransactionState,
+    /// `Active` なトランザクション中に再度 `BEGIN` を送った（`25001`）。
+    ActiveSqlTransaction,
+    /// `Idle`（トランザクション外）で `COMMIT`／`ROLLBACK` を送った（`25P01`）。
+    NoActiveSqlTransaction,
+    /// `Failed` なトランザクション中に `ROLLBACK` 以外の文を送った（`25P02`）。
+    InFailedSqlTransaction,
+    /// 明示トランザクションの単一ライタ占有により、書き込みトランザクションの
+    /// 取得（[`crate::storage::Storage::begin_write_txn`]）がロック待ちの上限を
+    /// 超過した（`55P03`）。
+    LockNotAvailable,
+    /// 明示トランザクション（SQL-31・TASK-221）内で構文としては受理されるものの、
+    /// 本実装がトランザクション文脈での実行に未対応な文（複数行/ファイル形/
+    /// `ON CONFLICT` の `INSERT`・`UPDATE`・`DELETE`・`UPSERT`・COPY・既に書き込んだ
+    /// テーブルへの読み取り等）を拒否する（`0A000`。`42601`
+    /// ［`UnsupportedSyntax`。構文自体が許可リスト外］とは区別する）。
+    TransactionFeatureNotSupported { detail: String },
     /// 構文・入力としては正しいが、この表層ではまだ実装されていない機能
     /// （NoSQL `filter` の `eq` を `INTEGER`／`BIGINT`／`REAL`／
     /// `DOUBLE PRECISION` 列へ適用する等。式レーンの入口が無いための対象外。
@@ -352,6 +371,15 @@ impl SqlSurfaceError {
     /// を `42601` へ写像する際にも、同じ切り詰め規約を経由させるために公開する。
     pub(crate) fn unsupported(detail: impl Into<String>) -> Self {
         SqlSurfaceError::UnsupportedSyntax {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
+    /// `pub(crate)`: `core.rs::EngineCore::execute_in_active_txn`／
+    /// `read_only_in_active_txn`（SQL-31・TASK-221）が、明示トランザクション内で
+    /// 未対応の文を `0A000` で拒否するために使う。
+    pub(crate) fn transaction_feature_not_supported(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::TransactionFeatureNotSupported {
             detail: truncate_for_error(&detail.into()),
         }
     }
@@ -448,6 +476,14 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
                 ErrorClass::InvalidTextRepresentation
             }
+            SqlSurfaceError::InvalidTransactionState => ErrorClass::InvalidTransactionState,
+            SqlSurfaceError::ActiveSqlTransaction => ErrorClass::ActiveSqlTransaction,
+            SqlSurfaceError::NoActiveSqlTransaction => ErrorClass::NoActiveSqlTransaction,
+            SqlSurfaceError::InFailedSqlTransaction => ErrorClass::InFailedSqlTransaction,
+            SqlSurfaceError::LockNotAvailable => ErrorClass::LockNotAvailable,
+            SqlSurfaceError::TransactionFeatureNotSupported { .. } => {
+                ErrorClass::FeatureNotSupported
+            }
             SqlSurfaceError::FeatureNotSupported { .. } => ErrorClass::FeatureNotSupported,
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
@@ -506,6 +542,27 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::InvalidTextRepresentation { detail } => {
                 write!(f, "invalid text representation: {detail}")
+            }
+            SqlSurfaceError::InvalidTransactionState => {
+                write!(f, "invalid transaction state")
+            }
+            SqlSurfaceError::ActiveSqlTransaction => {
+                write!(f, "transaction already in progress")
+            }
+            SqlSurfaceError::NoActiveSqlTransaction => {
+                write!(f, "no transaction in progress")
+            }
+            SqlSurfaceError::InFailedSqlTransaction => {
+                write!(
+                    f,
+                    "current transaction is aborted, commands ignored until end of transaction block"
+                )
+            }
+            SqlSurfaceError::LockNotAvailable => {
+                write!(f, "write lock not available: timed out waiting for writer")
+            }
+            SqlSurfaceError::TransactionFeatureNotSupported { detail } => {
+                write!(f, "not supported inside an explicit transaction: {detail}")
             }
             SqlSurfaceError::FeatureNotSupported { detail } => {
                 write!(f, "feature not supported: {detail}")

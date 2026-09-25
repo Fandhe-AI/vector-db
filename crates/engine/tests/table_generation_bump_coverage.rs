@@ -71,8 +71,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #865（PR #989 マージ）で `MAX_METADATA_LEN` のドキュメンテーション
     // コメントが `pub(crate)` 化に伴い増量し、行番号がさらに移動したための追随
     // （旧: 648／679）。
-    ("storage.rs", 652),
-    ("storage.rs", 683),
+    // Issue #942（SQL-31・TASK-221。`writer_gate` choke point 追加）で
+    // `Storage::put`/`Storage::put_batch` の行番号がさらに移動したための追随
+    // （旧: 652／683）。
+    ("storage.rs", 804),
+    ("storage.rs", 835),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 191),
     ("txn.rs", 362),
@@ -107,13 +110,15 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `insert_typed_row` のドキュメンテーションコメントが計 33 行増え、以下
     // 2 件の行番号がさらに移動したための追随（旧: 2184／2263）。PR #1044
     // レビュー対応（`DROP TABLE` 配線済み記述への訂正コメント）で `catalog.rs`
-    // 冒頭側にさらに 2 行増え、再度追随（旧: 2217／2296）。TABLE-18・SQL-23・
-    // TASK-205（Issue #909。`VIEWS_TABLE`・`Storage::create_view`／`drop_view`
-    // 追加）との base（main）取り込みマージ統合・PR #1048 レビュー対応
-    // （`Storage::create_view` の `body_sql`／`base_relation` 自己検証追加、
-    // codex-review 指摘）で `catalog.rs` 冒頭側にさらに行が追加され、
-    // 再度追随。
-    ("catalog.rs", 2530),
+    // 冒頭側にさらに 2 行増え、再度追随（旧: 2217／2296）。
+    // Issue #942（SQL-31・TASK-221。`convert_storage_error` ドキュメント拡充）の
+    // 取り込みで行番号がさらに移動したための追随（旧: 2225）。TABLE-18・
+    // SQL-23・TASK-205（Issue #909。`VIEWS_TABLE`・`Storage::create_view`／
+    // `drop_view` 追加）と Issue #942 系変更の base（main）取り込みマージ統合・
+    // PR #1048 レビュー対応（`Storage::create_view` の `body_sql`／
+    // `base_relation` 自己検証追加、codex-review 指摘）で `catalog.rs` 冒頭側に
+    // さらに行が追加され、再度追随。
+    ("catalog.rs", 2543),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -126,19 +131,41 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // TABLE-18・SQL-23・TASK-205（Issue #909）の行追加で さらに追随
     // （旧: 2304）。本 PR（#909）の base（main）取り込みマージ（Issue #901
     // 系変更との統合）で再度追随（旧: 2566）。PR #1048 レビュー
-    // 対応（同上）で再度追随。
-    ("catalog.rs", 2609),
+    // 対応（同上）で再度追随（旧: 2609）。Issue #942（SQL-31・TASK-221）系
+    // 変更との base（main）取り込みマージ統合で再度追随。
+    ("catalog.rs", 2622),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
     // テーブルが存在せずバンプ対象がない）。PR #1048 レビュー対応（同上）で
-    // 再度追随（旧: 2627）。
-    ("catalog.rs", 2686),
+    // 再度追随（旧: 2627）。Issue #942 系変更との base（main）取り込みマージ
+    // 統合で再度追随（旧: 2686）。
+    ("catalog.rs", 2699),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
-    // 再度追随（旧: 2655）。
-    ("catalog.rs", 2714),
+    // 再度追随（旧: 2655）。Issue #942 系変更との base（main）取り込みマージ
+    // 統合で再度追随（旧: 2714）。
+    ("catalog.rs", 2727),
+    // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
+    // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
+    // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_
+    // unchecked`／`truncate_table_unchecked` の `WriteTarget::InTxn` 経路）が
+    // 既に同一 `write_txn` 内で `bump_table_generation_in_txn` を呼び終えている
+    // （`sql/exec.rs::execute_insert_with_schema_in`／`execute_truncate_in` →
+    // `tenant.rs` 各関数のドキュメント参照）。本呼び出し箇所自体は複数文を
+    // まとめて確定させるだけで、新たな `user_rows/{table}` 書き込みを行わない。
+    ("sql/transaction.rs", 248),
+    // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
+    // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
+    // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を
+    // 共有するための choke point）: この汎用ヘルパー自身は `f`（呼び出し元が
+    // 渡すクロージャ）を実行してから commit するだけで、`user_rows/{table}` へ
+    // 直接触れない。近傍走査（テキスト上の近さ）では検出できないが、`f` を渡す
+    // 4 呼び出し元はいずれも自分のクロージャの最後で
+    // `bump_table_generation_in_txn` を呼んでから `Ok(())` を返すことを目視で
+    // 確認済み（各関数のドキュメントコメント参照）。
+    ("tenant.rs", 397),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

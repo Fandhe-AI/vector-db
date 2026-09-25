@@ -247,6 +247,8 @@ pub enum StorageError {
     EmptyBatch,
     GenerationCounterOverflow,
     IncompatibleRowKeyFormat,
+    WriteLockTimeout,
+    WriteTxnHeldByCurrentSession,
 }
 
 # source: crates/engine/src/catalog.rs :: CatalogError
@@ -268,6 +270,7 @@ pub enum CatalogError {
     WrongObjectKind(String),
     DependentViewsExist(String),
     ViewLimitExceeded(String),
+    WriteLockTimeout,
     ColumnNotFound(String),
     ProtectedColumn(String),
     IncompatibleTypeChange {

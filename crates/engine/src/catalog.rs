@@ -279,6 +279,10 @@ pub enum CatalogError {
     /// TABLE-18・SQL-23・TASK-205、Issue #909。ERR-6: `54000`）。`detail` は
     /// 固定文言のみ（テナント・行内容を含まない）。
     ViewLimitExceeded(String),
+    /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
+    /// トランザクションの取得がロック待ちの上限を超過した（`storage::StorageError`
+    /// から写像。[`convert_storage_error`] 参照）。
+    WriteLockTimeout,
     /// `ALTER TABLE ... DROP COLUMN`／`ALTER COLUMN ... TYPE` が参照した列名が
     /// 対象テーブルに存在しない（TABLE-19・TASK-203、Issue #901）。
     ColumnNotFound(String),
@@ -328,6 +332,9 @@ impl fmt::Display for CatalogError {
             CatalogError::ViewLimitExceeded(detail) => {
                 write!(f, "view limit exceeded: {detail}")
             }
+            CatalogError::WriteLockTimeout => {
+                write!(f, "write lock not available: timed out waiting for writer")
+            }
             CatalogError::ColumnNotFound(name) => write!(f, "column not found: {name}"),
             CatalogError::ProtectedColumn(name) => {
                 write!(
@@ -364,7 +371,8 @@ impl std::error::Error for CatalogError {
             | CatalogError::ViewLimitExceeded(_)
             | CatalogError::ColumnNotFound(_)
             | CatalogError::ProtectedColumn(_)
-            | CatalogError::IncompatibleTypeChange { .. } => None,
+            | CatalogError::IncompatibleTypeChange { .. }
+            | CatalogError::WriteLockTimeout => None,
         }
     }
 }
@@ -2024,7 +2032,7 @@ pub(crate) fn map_row_table_error(e: redb::TableError) -> CatalogError {
 /// `redb::Error` への blanket `From` 実装を持つため（`storage.rs` の設計メモと同じ
 /// coherence 制約）、`redb::Error` そのものではない複合エラー型 `StorageError` からの
 /// 変換はここで個別に定義する。
-fn convert_storage_error(e: StorageError) -> CatalogError {
+pub(crate) fn convert_storage_error(e: StorageError) -> CatalogError {
     match e {
         StorageError::Backend(err) => CatalogError::Backend(err),
         StorageError::Codec(msg) => CatalogError::Invalid(msg),
@@ -2074,6 +2082,11 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
         // `CatalogError::IncompatibleRowKeyFormat` と完全に同一の文言を持つため、
         // 単純な写像で挙動が揃う（Issue #206）。
         StorageError::IncompatibleRowKeyFormat => CatalogError::IncompatibleRowKeyFormat,
+        // 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有による
+        // `Storage::begin_write_txn` のロック待ち上限超過（`55P03`）。
+        StorageError::WriteLockTimeout | StorageError::WriteTxnHeldByCurrentSession => {
+            CatalogError::WriteLockTimeout
+        }
     }
 }
 
@@ -2194,7 +2207,7 @@ impl Storage {
         // スキーマ検証は `encode_schema` 内の `validate_schema` に集約する（write txn を
         // 開く前に fail-closed に拒否される。ここで別途 `validate_schema` を呼ぶ必要はない）。
         let encoded = encode_schema(schema)?;
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             // ENUM 列（[`ColumnType::Enum`]）が参照する型は、この write txn の
             // 時点でカタログに登録済みであることを検証する（Issue #890 D2。
@@ -2260,7 +2273,7 @@ impl Storage {
     /// エントリが引き継がれ、正当な書き込みを誤って重複拒否する事故を防ぐ）。
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
         validate_identifier(table_name)?;
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             // ビュー名前空間との判別・依存検査（TABLE-18・SQL-23・TASK-205、
             // Issue #909）。テーブル削除より前の同一 write txn 内で判定する
@@ -2318,7 +2331,7 @@ impl Storage {
                 "column added via ALTER TABLE ADD COLUMN must be nullable".to_string(),
             ));
         }
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             // 呼び出し元が渡した `ColumnType::Enum` の `Arc<EnumTypeDef>` は信頼せず、
             // この write txn から見えるカタログ登録済みの定義で必ず置き換える
@@ -2380,7 +2393,7 @@ impl Storage {
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()));
         }
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             let existing: Vec<u8> = {
@@ -2461,7 +2474,7 @@ impl Storage {
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()));
         }
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             let existing: Vec<u8> = {
@@ -2513,7 +2526,7 @@ impl Storage {
     /// 存在する場合は上書きせず `Err(CatalogError::TypeAlreadyExists)`。
     pub fn create_enum_type(&self, name: &str, labels: Vec<String>) -> Result<Arc<EnumTypeDef>> {
         let encoded = encode_enum_type_def(name, &labels)?;
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let mut table = write_txn.open_table(ENUM_TYPES_TABLE)?;
             if table.get(name)?.is_some() {
@@ -2562,7 +2575,7 @@ impl Storage {
     pub fn alter_enum_type_add_value(&self, name: &str, label: String) -> Result<Arc<EnumTypeDef>> {
         validate_identifier(name)?;
         validate_enum_label(&label)?;
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let updated = {
             let mut table = write_txn.open_table(ENUM_TYPES_TABLE)?;
             let existing = table
@@ -2595,7 +2608,7 @@ impl Storage {
     /// `2BP01` へ写像する想定。Issue #890 D5）。
     pub fn drop_enum_type(&self, name: &str) -> Result<()> {
         validate_identifier(name)?;
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let dependents = dependent_tables_in_txn(&write_txn, name)?;
             if !dependents.is_empty() {
@@ -2653,7 +2666,7 @@ impl Storage {
             base_relation: base_relation.to_string(),
             body_sql: body_sql.to_string(),
         })?;
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             if catalog_table.get(name)?.is_some() {
@@ -2694,7 +2707,7 @@ impl Storage {
     /// テーブル単位の世代 bump は行わない。
     pub fn drop_view(&self, name: &str) -> Result<()> {
         validate_identifier(name)?;
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             if catalog_table.get(name)?.is_some() {
@@ -2786,7 +2799,7 @@ impl Storage {
         row: &RowInput<'_>,
     ) -> Result<()> {
         validate_identifier(table_name)?;
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
             schema.validate_row_embedding_dim(row.embedding.len())?;
@@ -2826,7 +2839,7 @@ impl Storage {
         rows: &[(u64, RowInput<'_>)],
     ) -> Result<()> {
         validate_identifier(table_name)?;
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
             if rows.is_empty() {
@@ -2885,7 +2898,7 @@ impl Storage {
         values: &[RowCodecValue],
     ) -> Result<()> {
         validate_identifier(table_name)?;
-        let write_txn = self.begin_write_txn()?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
             let vector_idx = schema.columns.iter().position(|c| c.ty.is_vector());
@@ -3097,6 +3110,10 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IncompatibleTypeChange { .. } => SqlSurfaceError::Internal {
             detail: "catalog lookup failed".to_string(),
         },
+        // 読み取り専用の存在確認（`table_exists`）は書き込みトランザクションを
+        // 取得しないため通常は到達しないが、`CatalogError` の網羅性のためここでも
+        // 扱う（SQL-31・TASK-221）。
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
     }
 }
 
@@ -3744,7 +3761,9 @@ mod tests {
         // `table_generation_bump_coverage.rs` の悉皆走査は
         // `commit_boundary::commit*` 呼び出しのみを対象とするため、これを
         // 経由すると本テスト自身がアローリスト追記を要求されてしまう）。
-        write_txn.commit().expect("commit corrupt catalog value");
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
 
         let err = storage.drop_enum_type(type_name).unwrap_err();
         assert!(
@@ -3790,7 +3809,9 @@ mod tests {
                 .insert("docs", corrupt_value.as_bytes())
                 .expect("insert corrupt catalog value");
         }
-        write_txn.commit().expect("commit corrupt catalog value");
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
 
         let err = storage.drop_enum_type(type_name).unwrap_err();
         assert!(
