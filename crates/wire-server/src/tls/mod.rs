@@ -39,6 +39,14 @@
 //!   シーケンス番号・`TLSInnerPlaintext`（内容型・パディング）・AAD の構成・
 //!   handshake 鍵 → application 鍵の方向別切替（[`record_protection::
 //!   Sealer`]／[`record_protection::Opener`]）を提供する
+//! - [`transcript`]: transcript hash（RFC 8446 §4.4.1。Issue #964）。
+//!   ハンドシェイクメッセージ列の累積 SHA-256 を、更新順序の単一情報源
+//!   （[`transcript::Transcript::expected_next`]）とともに提供し、
+//!   HelloRetryRequest 時の `message_hash` 置換もここで扱う
+//! - [`finished`]: Finished（RFC 8446 §4.4.4。Issue #964）。
+//!   `verify_data` の計算（送信側）・定数時間検証（受信側）を提供し、
+//!   [`key_schedule::TrafficSecret::finished_key`]・[`transcript`] の
+//!   チェックポイントをつなぐ
 //!
 //! alert の実送出やハンドシェイク状態機械（#965）・接続への結線
 //! （#966 以降）はいずれも後続 sub-issue の担当であり、本モジュールは
@@ -49,9 +57,11 @@ pub mod aes;
 pub mod aes_gcm;
 pub mod client_hello;
 pub(crate) mod field25519;
+pub mod finished;
 pub mod handshake;
 pub mod hkdf;
 pub mod key_schedule;
 pub mod record;
 pub mod record_protection;
+pub mod transcript;
 pub mod x25519;
