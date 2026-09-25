@@ -405,6 +405,13 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::Update(outcome) => OutcomeResponse::Command {
             tag: format!("UPDATE {}", outcome.rows_affected),
         },
+        // SQL-23・TASK-85・TASK-202（Issue #899）: `CREATE TABLE`
+        // （`exec::ddl::CreateTableOutcome`。行数・件数を一切持たない契約）の
+        // 応答を pg 互換の `CommandComplete` タグ `CREATE TABLE`（件数を持たない
+        // 固定タグ。`TRUNCATE TABLE` と同じ設計）へ整形する。
+        SqlOutcome::CreateTable(_) => OutcomeResponse::Command {
+            tag: "CREATE TABLE".to_string(),
+        },
     }
 }
 

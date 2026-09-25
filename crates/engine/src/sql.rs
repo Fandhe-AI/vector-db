@@ -123,6 +123,7 @@ pub mod aggregate;
 pub mod allowlist;
 pub(crate) mod arena_cache;
 pub mod copy;
+pub mod ddl;
 pub(crate) mod describe;
 pub mod exec;
 pub mod explain;
@@ -255,4 +256,17 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     Update(exec::UpdateOutcome),
+    /// `CREATE TABLE <table> (<col> <type>[, ...]) [;]`（SQL-23・TASK-85・
+    /// TASK-202、Issue #899）がセッション経由の実行経路
+    /// （[`crate::core::EngineCore::execute_sql_in_session`]）で成功したことを
+    /// 示す応答。実行権限の判定・実行本体は [`ddl::require_ddl_privilege`]・
+    /// [`ddl::execute_create_table`] に委譲しており、本 variant はその
+    /// [`ddl::CreateTableOutcome`] をそのまま運ぶ薄いラッパー（`Insert`・
+    /// `Truncate`・`Delete`・`Update` と同じ設計）。
+    ///
+    /// **BREAKING CHANGE**（Issue #899）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コード（`crate::core::EngineCore`・
+    /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
+    /// を網羅的にマッチするコードがあれば追随が必要。
+    CreateTable(ddl::CreateTableOutcome),
 }

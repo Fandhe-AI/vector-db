@@ -12,7 +12,7 @@ pub mod blake2b;
 pub mod hmac_sha256;
 pub mod scram;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -103,6 +103,12 @@ pub struct UserStore {
     /// `None`（このフィールドを参照する `authenticate_scram` は
     /// `ScramSha256` のときにしか呼ばれない）。
     scram_mock_key: Option<[u8; scram::KEY_LEN]>,
+    /// DDL（`CREATE TABLE` 等）実行権限を持つユーザー名の集合（SQL-23・
+    /// TASK-202、Issue #899）。`--ddl-principals`（[`crate::ddl_permission_opt`]）
+    /// による opt-in のみで populate される。既定は空集合（fail-closed。
+    /// 未指定のサーバーでは全 DDL が `42501` になる。[`Self::
+    /// with_ddl_principals`] ドキュメント参照）。
+    ddl_principals: HashSet<String>,
 }
 
 /// [`UserStore::load_from_file`] のロード時検証エラー（fail-closed。起動を中断する）。
@@ -318,6 +324,7 @@ impl UserStore {
             users,
             auth_method: AuthMethod::default(),
             scram_mock_key: None,
+            ddl_principals: HashSet::new(),
         })
     }
 
@@ -376,6 +383,33 @@ impl UserStore {
         Some((record.tenant_id.as_str(), verifier))
     }
 
+    /// DDL（`CREATE TABLE` 等）実行権限を持つユーザー名の集合を設定する
+    /// opt-in（SQL-23・TASK-202、Issue #899。`--ddl-principals`〔`main.rs`〕から
+    /// のみ呼ばれる）。`names` に含まれるユーザー名がロード済みユーザーストアに
+    /// 1 件でも存在しなければ起動失敗として拒否する（fail-closed。存在しない
+    /// ユーザーへ権限を「付与したつもり」の設定ミスを未然に防ぐ）。
+    /// `require_scram` と同じ「消費して返す」ビルダー形。
+    pub fn with_ddl_principals(mut self, names: &[String]) -> Result<Self, String> {
+        for name in names {
+            if !self.users.contains_key(name) {
+                return Err(format!(
+                    "{} references unknown user {name:?} (not present in --users store)",
+                    crate::ddl_permission_opt::FLAG
+                ));
+            }
+        }
+        self.ddl_principals = names.iter().cloned().collect();
+        Ok(self)
+    }
+
+    /// `username` が DDL 実行権限を付与された主体か（SQL-23・TASK-202、
+    /// Issue #899）。`handshake.rs` が認証成功後にのみ参照し、
+    /// `engine::sql::mode::SessionState::grant_ddl` を呼ぶかどうかの唯一の
+    /// 判定点とする（`--ddl-principals` 未指定なら常に `false`）。
+    pub fn is_ddl_principal(&self, username: &str) -> bool {
+        self.ddl_principals.contains(username)
+    }
+
     /// ロード済みレコード数。ユーザー名・テナント ID 等の存在情報は含まない
     /// （wire 経路からは呼ばない。テストのフィクスチャ診断専用。Issue #172）。
     pub fn len(&self) -> usize {
@@ -404,6 +438,7 @@ impl UserStore {
             users,
             auth_method: AuthMethod::default(),
             scram_mock_key: None,
+            ddl_principals: HashSet::new(),
         }
     }
 }

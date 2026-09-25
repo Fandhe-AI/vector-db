@@ -191,6 +191,12 @@ pub fn resolve_mode_with_planner(
 #[derive(Debug, Clone, Default)]
 pub struct SessionState {
     search_mode: Option<SearchMode>,
+    /// DDL（`CREATE TABLE` 等）実行権限（SQL-23・TASK-202、Issue #899）。既定は
+    /// `false`（fail-closed。未許可のまま接続されたセッション・NoSQL 表層・
+    /// 既存テストが使う `SessionState::default()` は構造上 DDL を実行できない）。
+    /// 付与は wire-server の認証成功後に一度きり行う（[`Self::grant_ddl`]
+    /// ドキュメント参照）。`sql::ddl::require_ddl_privilege` が唯一の判定点。
+    ddl_allowed: bool,
     /// TASK-79（SQL-9）: `CREATE FUNCTION` で登録した宣言的 UDF のセッション単位
     /// レジストリ。`SessionState` 自体が接続（＝認証済みテナント）単位の値型であるため、
     /// UDF 定義が他接続・他テナントへ漏れる経路は構造上存在しない。永続化しない
@@ -237,6 +243,21 @@ impl SessionState {
     /// （部分更新＝黙った既定化と同種の fail-open を防ぐ。security.md 準拠）。
     pub fn set_search_mode(&mut self, mode: SearchMode) {
         self.search_mode = Some(mode);
+    }
+
+    /// このセッションが DDL 実行権限を持つか（SQL-23・TASK-202、Issue #899）。
+    /// `sql::ddl::require_ddl_privilege` の唯一の判定点。
+    pub fn ddl_allowed(&self) -> bool {
+        self.ddl_allowed
+    }
+
+    /// DDL 実行権限を付与する（Issue #899）。呼び出し元は wire-server の
+    /// `handshake.rs`（`auth::verify` 成功後、`--ddl-principals` の許可集合に
+    /// 含まれるユーザー名の接続に限る）のみを想定する——検証済みの認可判定の
+    /// 結果を反映するだけの薄いセッタであり、本メソッド自体は認可判定を行わない
+    /// （`UserStore::is_ddl_principal` が唯一の許可判定点。二重実装しない）。
+    pub fn grant_ddl(&mut self) {
+        self.ddl_allowed = true;
     }
 }
 

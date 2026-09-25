@@ -177,6 +177,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut acorn_max_visible_ratio_raw: Option<String> = None;
     let mut sparse_visited_max_raw: Option<String> = None;
     let mut durability_raw: Option<String> = None;
+    let mut ddl_principals_raw: Option<String> = None;
     let mut auth_method_raw: Option<String> = None;
     let mut scram_mock_key_file_raw: Option<PathBuf> = None;
     // Issue #705（テスト専用・feature `fault-injection` 限定）。feature 無効
@@ -356,6 +357,27 @@ fn run_server(args: &[String]) -> ExitCode {
                 durability_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::ddl_permission_opt::FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires a comma-separated username list",
+                        wire_server::ddl_permission_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #899: 起動後に変更できない構成値のため、
+                // `--search-engine`（D6）と同じ理由で 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if ddl_principals_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::ddl_permission_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                ddl_principals_raw = Some(v.clone());
+                i += 2;
+            }
             wire_server::auth_method_opt::FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     eprintln!(
@@ -496,6 +518,22 @@ fn run_server(args: &[String]) -> ExitCode {
             eprintln!(
                 "wire-server: invalid {}: {e}",
                 wire_server::durability_opt::FLAG
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #899: `--search-engine`／`--durability` と同じく bind・ユーザー
+    // ストア読込より前に構文だけを決着させる（fail-closed）。個々のユーザー名が
+    // ユーザーストアに実在するかは、ストア読込後に `UserStore::
+    // with_ddl_principals` で検証する（このストアが読み込まれる前には判定
+    // できないため）。
+    let ddl_principals = match resolve_ddl_principals(ddl_principals_raw.as_deref()) {
+        Ok(names) => names,
+        Err(e) => {
+            eprintln!(
+                "wire-server: invalid {}: {e}",
+                wire_server::ddl_permission_opt::FLAG
             );
             return ExitCode::FAILURE;
         }
@@ -711,6 +749,19 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     } else {
         store
+    };
+    // Issue #899: `--ddl-principals` に列挙されたユーザー名がロード済みユーザー
+    // ストアに実在することをここで確定させる（fail-closed。未知ユーザーへの
+    // 誤設定を起動時に検出する）。未指定（既定）なら許可主体なしのまま不変。
+    let store = match ddl_principals {
+        None => store,
+        Some(names) => match store.with_ddl_principals(&names) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("wire-server: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
     };
     let store = Arc::new(store);
 
@@ -986,6 +1037,17 @@ fn resolve_durability(raw: Option<&str>) -> Result<engine::storage::WriteDurabil
     match raw {
         None => Ok(engine::storage::WriteDurability::default()),
         Some(raw) => wire_server::durability_opt::parse(raw),
+    }
+}
+
+/// `--ddl-principals`（Issue #899）の値（未指定は `None`＝許可主体なし）から
+/// ユーザー名の一覧を解決する。構文検証のみ（`wire_server::ddl_permission_opt::
+/// parse`）で、ユーザーストアに対する実在確認は呼び出し元（`run_server`）が
+/// `UserStore::with_ddl_principals` で行う。
+fn resolve_ddl_principals(raw: Option<&str>) -> Result<Option<Vec<String>>, String> {
+    match raw {
+        None => Ok(None),
+        Some(raw) => wire_server::ddl_permission_opt::parse(raw).map(Some),
     }
 }
 

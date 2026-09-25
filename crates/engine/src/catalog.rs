@@ -10,8 +10,13 @@
 //! 同一トランザクションで削除するが、これは DDL のライフサイクル管理としての
 //! 削除であり、行の中身（値）を読み書きするものではない。
 //! 行エンコーダーの列対応・NULL 解決（TASK-86）・
-//! アリーナデコード（TASK-87）・テナント境界統合（TASK-89）・SQL surface からの
-//! DDL 受理は本モジュールの責務外で、後続タスクが本モジュールの API に依存する。
+//! アリーナデコード（TASK-87）・テナント境界統合（TASK-89）は本モジュールの
+//! 責務外で、後続タスクが本モジュールの API に依存する。SQL 表層からの `CREATE
+//! TABLE` 受理は SQL-23・TASK-202（Issue #899）で `sql::ddl`（DDL 実行権限
+//! ゲート・`SqlOutcome` への写像）から配線済み（本モジュールは実行本体
+//! [`Storage::create_table`] を提供するのみで、権限判定・SQL 構文の許可リスト
+//! 判定は担わない）。`ALTER TABLE`／`DROP TABLE`（[`Storage::drop_table`]）は
+//! 引き続き未配線のまま（`drop_table` のドキュメント参照）。
 //!
 //! `storage.rs` との関係: `Storage::db()`（`pub(crate)`）を経由して同一
 //! `redb::Database` ハンドルを共有し、カタログ専用のテーブル（[`CATALOG_TABLE`]）に
@@ -1593,8 +1598,11 @@ impl Storage {
     ///
     /// 安全性: `create_table`／`alter_table_add_column` と同じく
     /// [`crate::policy::PolicyContext`] を取らない生の DDL であり、全テナントの行を
-    /// 不可逆に削除する。DDL 認可の設計を経ないまま untrusted 経路（SQL 表層・
-    /// wire-server）へ配線しない（`DROP TABLE` 文は引き続き許可リスト外で `42601`）。
+    /// 不可逆に削除する。`CREATE TABLE` は SQL-23・TASK-202（Issue #899）で DDL
+    /// 実行権限ゲート（`sql::ddl::require_ddl_privilege`・`--ddl-principals`）を
+    /// 経て untrusted 経路（SQL 表層・wire-server）へ配線済みだが、本メソッド
+    /// （`DROP TABLE` 相当）はそのゲートを再利用する形でもまだ配線していない
+    /// （`DROP TABLE` 文は引き続き許可リスト外で `42601`。配線は別 Issue の担当）。
     ///
     /// 存在しないテーブル名は `Err(CatalogError::TableNotFound)`、識別子として不正な
     /// 名前は `Err(CatalogError::Invalid)`（fail-closed。冪等に `Ok` へ丸めない）。

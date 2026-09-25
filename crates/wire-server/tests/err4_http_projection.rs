@@ -193,7 +193,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 18] = [
+const EXPECTED_STATUS: [(&str, u16); 20] = [
     ("22000", 400),
     ("28P01", 401),
     ("28000", 401),
@@ -212,6 +212,8 @@ const EXPECTED_STATUS: [(&str, u16); 18] = [
     ("22023", 400),
     ("22008", 400),
     ("22P02", 400),
+    ("42P07", 409),
+    ("42701", 400),
 ];
 
 /// (a)〜(f) 全類型の共通アサーション: `wire_code` が逆引き可能・射影ステータス
@@ -270,7 +272,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 18);
+const _: () = assert!(ErrorClass::ALL.len() == 20);
 
 #[test]
 fn err4_projection_table_is_closed_over_all_error_classes() {
@@ -649,7 +651,16 @@ fn err4_f_internal_error_projects_xx000_to_500() {
 /// パーサで解析し、射影のみを検証する。
 #[test]
 fn err4_f_unreachable_classes_project_via_production_encoder() {
-    for class in [ErrorClass::ForbiddenTenantMismatch, ErrorClass::RowNotFound] {
+    // `DuplicateTable`（`42P07`）・`DuplicateColumn`（`42701`。SQL-23・TASK-85、
+    // Issue #899）は SQL 表層専用の `CREATE TABLE` 分類であり、NoSQL 表層の
+    // `op` 許可リストに `create_table` 相当が存在しないため実要求からは
+    // 構造的に到達不能（`ForbiddenTenantMismatch`・`RowNotFound` と同じ理由）。
+    for class in [
+        ErrorClass::ForbiddenTenantMismatch,
+        ErrorClass::RowNotFound,
+        ErrorClass::DuplicateTable,
+        ErrorClass::DuplicateColumn,
+    ] {
         let raw =
             wire_server::http::response::encode_error(class, "test message", SystemTime::now());
         let resp = http_common::parse_single_response(&raw);

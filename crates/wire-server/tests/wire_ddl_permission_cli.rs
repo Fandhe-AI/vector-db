@@ -1,0 +1,212 @@
+//! `--ddl-principals` opt-in（SQL-23・TASK-202、Issue #899）をバイナリ子プロセス
+//! として起動し、CLI 引数の受理・拒否（fail-closed）を外形的に検証する結合
+//! テスト。`wire_durability_cli.rs`・`wire_search_engine_cli.rs` と同じ流儀
+//! （実バイナリを `Command::new(env!("CARGO_BIN_EXE_wire-server"))` で起動し、
+//! stderr の `listening on` 行または非 0 終了・エラーメッセージを外形的に
+//! 確認する）。
+//!
+//! - R1: 未知ユーザーを指す `--ddl-principals` は非 0 終了・stderr にフラグ名を
+//!   含むこと（fail-closed。設定ミスを起動時に検出する）
+//! - R2: 値の欠落は非 0 終了・stderr にフラグ名を含むこと
+//! - R3: 重複指定は非 0 終了・stderr に "specified more than once" を含むこと
+//! - R4: ユーザーストアに実在するユーザーを指す `--ddl-principals` は
+//!   `listening on` に到達すること（起動を妨げない）
+//!
+//! wire フレーミング越しの実際の権限ゲート挙動（`CommandComplete`／
+//! `42501`）は `wire_create_table.rs` の担当（本ファイルは CLI 解析の外形
+//! 確認に徹する）。
+
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+struct TempFixtureDir {
+    dir: std::path::PathBuf,
+}
+
+impl TempFixtureDir {
+    fn new(label: &str) -> Self {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "wire-server-ddl-permission-cli-{label}-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos(),
+            seq
+        ));
+        std::fs::create_dir(&dir).expect("create unique fixture dir");
+        Self { dir }
+    }
+
+    fn users_path_str(&self) -> String {
+        self.dir
+            .join("users.txt")
+            .to_str()
+            .expect("utf-8 path")
+            .to_string()
+    }
+
+    fn db_path_str(&self) -> String {
+        self.dir
+            .join("db.redb")
+            .to_str()
+            .expect("utf-8 path")
+            .to_string()
+    }
+}
+
+impl Drop for TempFixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn write_empty_user_store(path: &str) {
+    std::fs::write(path, "").expect("write empty user store");
+}
+
+/// `alice:tenant-a:<phc>` の 1 行を持つユーザーストア
+/// （`wire_durability_cli.rs::write_user_store_with_alice` と同型）。
+fn write_user_store_with_alice(path: &str) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+        .arg("hash-password")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn hash-password");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(b"pw-alice\n")
+        .expect("write password to stdin");
+    let output = child.wait_with_output().expect("wait hash-password");
+    assert!(output.status.success(), "hash-password must succeed");
+    let phc = String::from_utf8(output.stdout)
+        .expect("utf-8 phc")
+        .trim()
+        .to_string();
+    std::fs::write(path, format!("alice:tenant-a:{phc}\n")).expect("write user store");
+}
+
+/// 子プロセスの stderr を専用スレッドで読み、`listening on` を待つ
+/// （`wire_durability_cli.rs::wait_for_listening` と同型）。
+fn wait_for_listening(child: &mut Child) -> bool {
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).unwrap_or(0);
+            if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(line) if line.contains("listening on") => return true,
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// 非 0 終了・stderr にフラグ名を含む拒否系（R1〜R3）を検証する共通ヘルパー。
+fn assert_startup_rejected(extra_args: &[&str], expect_substr: &str) {
+    let fixture = TempFixtureDir::new("reject");
+    let users_path = fixture.users_path_str();
+    write_empty_user_store(&users_path);
+    let db_path = fixture.db_path_str();
+
+    let mut args = vec![
+        "--users".to_string(),
+        users_path,
+        "--db".to_string(),
+        db_path,
+        "--bind".to_string(),
+        "127.0.0.1:0".to_string(),
+    ];
+    args.extend(extra_args.iter().map(|s| s.to_string()));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+        .args(&args)
+        .output()
+        .expect("spawn wire-server");
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for args {extra_args:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(expect_substr),
+        "expected stderr to contain {expect_substr:?}, got: {stderr}"
+    );
+}
+
+#[test]
+fn ddl_principals_rejects_unknown_user() {
+    assert_startup_rejected(&["--ddl-principals", "carol"], "--ddl-principals");
+}
+
+#[test]
+fn ddl_principals_rejects_missing_value() {
+    assert_startup_rejected(&["--ddl-principals"], "--ddl-principals");
+}
+
+#[test]
+fn ddl_principals_rejects_duplicate_flag() {
+    assert_startup_rejected(
+        &["--ddl-principals", "alice", "--ddl-principals", "alice"],
+        "specified more than once",
+    );
+}
+
+#[test]
+fn ddl_principals_rejects_empty_element() {
+    assert_startup_rejected(&["--ddl-principals", "alice,,bob"], "--ddl-principals");
+}
+
+#[test]
+fn ddl_principals_accepts_known_user_and_reaches_listening() {
+    let fixture = TempFixtureDir::new("accept");
+    let users_path = fixture.users_path_str();
+    write_user_store_with_alice(&users_path);
+    let db_path = fixture.db_path_str();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+        .args([
+            "--users",
+            &users_path,
+            "--db",
+            &db_path,
+            "--bind",
+            "127.0.0.1:0",
+            "--ddl-principals",
+            "alice",
+        ])
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wire-server");
+
+    assert!(
+        wait_for_listening(&mut child),
+        "expected listening on with valid --ddl-principals"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}

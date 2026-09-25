@@ -70,6 +70,7 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
   [--hnsw-acorn-max-visible-ratio <num>/<den>] \
   [--hnsw-sparse-visited-max <N>] \
   [--durability immediate|none] \
+  [--ddl-principals <user[,user...]>] \
   [--auth-method cleartext|scram-sha-256] \
   [--scram-mock-key-file <path>]
 ```
@@ -204,6 +205,18 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 含意を運用者が見落とさないよう、`none` を選んだ場合に限り起動ログへ英語の
 `WARNING` 行を 1 行出します（`immediate`・未指定では出力されません）。
 `EXPLAIN` への durability 設定の露出は対象外です。
+
+`--ddl-principals`（SQL-23・TASK-202、Issue #899）は `CREATE TABLE` 等の DDL
+実行権限を持つユーザー名（`--users` ユーザーストアの username）をカンマ区切りで
+列挙する opt-in CLI 引数です。未指定（既定）では許可主体が存在せず、**全ユーザーの
+`CREATE TABLE` が `42501`（permission denied）で拒否されます**（fail-closed。
+DDL は全テナント共有のカタログを変更するため既定で無効化されています）。値の
+構文（空要素・空白・重複の禁止）はここで検証し、列挙したユーザー名が `--users`
+ユーザーストアに実在しない場合は起動時に拒否されます（設定ミスを起動時に検出する
+ため）。2 回目以降の重複指定も fail-closed で起動エラーになります（他の opt-in
+CLI 引数と同方針）。許可された主体は、認証済みの接続内で `CREATE TABLE
+<table> (<col> TEXT|VECTOR(<N>)[, ...])` を実行できます（詳細な構文・権限判定
+順序は `docs/design/sql-create-table.md` 参照）。
 
 `--auth-method`（Issue #940・WIRE-18・TASK-222）は SQL 表層の SASL 認証方式を
 選ぶ opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス

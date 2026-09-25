@@ -2095,7 +2095,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Truncate(_)
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
-                    | crate::sql::SqlOutcome::Update(_) => {
+                    | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::CreateTable(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -2122,7 +2123,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Truncate(_)
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
-                    | crate::sql::SqlOutcome::Update(_) => {
+                    | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::CreateTable(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -2146,7 +2148,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Truncate(_)
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
-                    | crate::sql::SqlOutcome::Update(_) => {
+                    | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::CreateTable(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -2485,13 +2488,33 @@ impl EngineCore {
     /// [`Self::execute_parsed_in_session`]（実行のみ）の合成であり、Issue #933
     /// による分割の前後でこの関数自体の判定順序・エラー契約・実行結果は不変
     /// （両メソッドの移設元コメント参照）。
+    ///
+    /// **`CREATE TABLE`（SQL-23・TASK-85・TASK-202、Issue #899）は本メソッド
+    /// でのみ受理する**（拡張クエリプロトコルの Parse・[`Self::parse_sql`]・
+    /// [`ParsedSql`] は対象外のまま——DDL 実行権限ゲートはセッション状態を要する
+    /// のに対し、`parse_sql`／`ParsedSql` は接続横断で共有する構造検証のみを
+    /// 担う設計〔セッション非依存〕であり、両者を混ぜない）。先頭 2 トークンが
+    /// `CREATE`／`TABLE`（[`crate::sql::allowlist::is_create_table_statement`]）
+    /// と判定された場合に限り、字句解析の直後・**構造検証よりも前**に
+    /// [`crate::sql::ddl::require_ddl_privilege`] で権限ゲートを適用する
+    /// （fail-closed。未許可の主体は構文が正しいか・テーブルが存在するかに
+    /// 関わらず常に `DdlNotPermitted`〔`42501`〕のみを受け取り、それらの情報を
+    /// 一切観測できない。`sql::ddl` モジュールドキュメント参照）。それ以外の
+    /// 文（`CREATE FUNCTION` を含む）は従来どおり [`Self::parse_tokens`] へ渡す。
     pub fn execute_sql_in_session(
         &self,
         ctx: &PolicyContext,
         session: &mut crate::sql::mode::SessionState,
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let parsed = self.parse_sql(sql)?;
+        let tokens = crate::sql::lexer::tokenize(sql)?;
+        if crate::sql::allowlist::is_create_table_statement(&tokens) {
+            crate::sql::ddl::require_ddl_privilege(session)?;
+            let validated = crate::sql::allowlist::validate_create_table_tokens(&tokens)?;
+            let outcome = crate::sql::ddl::execute_create_table(&self.storage, &validated)?;
+            return Ok(crate::sql::SqlOutcome::CreateTable(outcome));
+        }
+        let parsed = self.parse_tokens(tokens)?;
         self.execute_parsed_in_session(ctx, session, &parsed)
     }
 

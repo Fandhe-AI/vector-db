@@ -66,7 +66,8 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::Insert(_)
         | SqlOutcome::Truncate(_)
         | SqlOutcome::Delete(_)
-        | SqlOutcome::Update(_) => None,
+        | SqlOutcome::Update(_)
+        | SqlOutcome::CreateTable(_) => None,
     };
 
     assert_eq!(
