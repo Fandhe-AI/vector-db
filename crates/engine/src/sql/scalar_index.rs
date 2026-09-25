@@ -666,9 +666,45 @@ impl ScalarIndex {
     /// untrusted な行 metadata のデコード検証は [`scan_scalar_columns`] が
     /// 一切弱めずに行う（`.claude/rules/coding-rust.md`「untrusted 入力の
     /// 扱い」）。
+    ///
+    /// 数値・日時・`NUMERIC`・`UUID` 列の順序索引（Issue #893）は、
+    /// `sql::exec`／`sql::aggregate`／`sql::group_by` が `resolve_candidates` へ
+    /// 常に空の `typed_preds` しか渡さない（`TypedRangePredicate` の本線
+    /// 配線が未接続。#891 待ち）production 経路からは一度も照会されない一方、
+    /// 構築だけは既存の `TEXT`／`ENUM` 索引と同じ `row_count` 件分のメモリ
+    /// 確保・全行走査・ソートを常に伴うため、`MAX_SCALAR_INDEX_BYTES`
+    /// 超過時には未接続の typed 索引だけが原因で既存の `TEXT`／`ENUM` 索引
+    /// まで巻き添えで `TooLarge`（plain scan 縮退）になり得る（codex-review
+    /// P2 指摘・PR #1032）。本経路（production から到達する
+    /// [`Self::build`]）は typed 列の構築を遅延させ `BOOLEAN` 等と同じ
+    /// 非索引化 (`None`) 扱いとし、typed 索引の構築自体を検証するテストは
+    /// [`Self::build_including_unwired_typed_range_columns`]（`#[cfg(test)]`）
+    /// を使う。
     pub(crate) fn build(
         schema: &TableSchema,
         snapshot: &SqlArenaSnapshot,
+    ) -> Result<Self, ScalarIndexBuildError> {
+        Self::build_internal(schema, snapshot, false)
+    }
+
+    /// [`Self::build`] のうち、数値・日時・`NUMERIC`・`UUID` 列の順序索引
+    /// （Issue #893）の構築ロジックそのものを検証するテスト専用の入口。
+    /// production 経路（`sql::exec`／`sql::aggregate`／`sql::group_by`）は
+    /// typed 述語を配線していないため [`Self::build`] を使い、この入口は
+    /// 呼ばない（codex-review P2 指摘・PR #1032。本線配線後は #891 で
+    /// [`Self::build`] 側に置き換える想定）。
+    #[cfg(test)]
+    fn build_including_unwired_typed_range_columns(
+        schema: &TableSchema,
+        snapshot: &SqlArenaSnapshot,
+    ) -> Result<Self, ScalarIndexBuildError> {
+        Self::build_internal(schema, snapshot, true)
+    }
+
+    fn build_internal(
+        schema: &TableSchema,
+        snapshot: &SqlArenaSnapshot,
+        include_typed_range_columns: bool,
     ) -> Result<Self, ScalarIndexBuildError> {
         let row_count = snapshot.arena().len();
         let column_count = schema.columns.len();
@@ -761,6 +797,13 @@ impl ScalarIndex {
                 | ColumnType::Date
                 | ColumnType::Timestamp => {
                     per_column.push(None);
+                    if !include_typed_range_columns {
+                        // production 経路は typed 述語を配線していないため
+                        // 構築自体を遅延させる（`Self::build` ドキュメント
+                        // 「typed 列の構築遅延」参照。codex-review P2・PR #1032）。
+                        per_column_typed.push(None);
+                        continue;
+                    }
                     let entry_size = std::mem::size_of::<(i64, u32)>();
                     let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
                     check_scalar_index_budget(approx_bytes, reservation_bytes)?;
@@ -779,6 +822,10 @@ impl ScalarIndex {
                 // するが、崩れていた場合は防御的に列単位で `None` へ縮退する。
                 ColumnType::Real | ColumnType::Double => {
                     per_column.push(None);
+                    if !include_typed_range_columns {
+                        per_column_typed.push(None);
+                        continue;
+                    }
                     let entry_size = std::mem::size_of::<(u64, u32)>();
                     let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
                     check_scalar_index_budget(approx_bytes, reservation_bytes)?;
@@ -796,6 +843,10 @@ impl ScalarIndex {
                 // そのままキーとする（`OrderedColumnIndex::I128`）。
                 ColumnType::Numeric { .. } => {
                     per_column.push(None);
+                    if !include_typed_range_columns {
+                        per_column_typed.push(None);
+                        continue;
+                    }
                     let entry_size = std::mem::size_of::<(i128, u32)>();
                     let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
                     check_scalar_index_budget(approx_bytes, reservation_bytes)?;
@@ -813,6 +864,10 @@ impl ScalarIndex {
                 // バイト列辞書順——と同じ大小関係になる。`OrderedColumnIndex::U128`）。
                 ColumnType::Uuid => {
                     per_column.push(None);
+                    if !include_typed_range_columns {
+                        per_column_typed.push(None);
+                        continue;
+                    }
                     let entry_size = std::mem::size_of::<(u128, u32)>();
                     let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
                     check_scalar_index_budget(approx_bytes, reservation_bytes)?;
@@ -3494,7 +3549,8 @@ mod tests {
         }
 
         let (snapshot, schema) = typed_snapshot_from(&storage, &c);
-        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
 
         // 列ごとに全行を brute force でスキャンし、`>=` 境界（各列の中央値
         // 相当）で候補を求めるオラクルと索引の結果を突き合わせる。
@@ -3708,6 +3764,47 @@ mod tests {
         assert_eq!(actual, expected, "UUID >= nil");
     }
 
+    /// production 経路が実際に呼ぶ [`ScalarIndex::build`]（typed 述語の本線
+    /// 配線が未接続の間の既定入口）は、数値・日時・`NUMERIC`・`UUID` 列の
+    /// 順序索引を一切構築しない（`BOOLEAN` 等と同じ非索引化）ことを固定する。
+    /// 未接続の typed 列構築が既存の `TEXT` 索引の予算・可用性を巻き添えに
+    /// しない（codex-review P2 指摘・PR #1032）ことも、同じスキーマに
+    /// 混在する参照は無いため typed 列側の非構築のみで示す。
+    #[test]
+    fn build_does_not_construct_unwired_typed_range_columns() {
+        let db_path = unique_db_path("scalar-index-typed-unwired-default");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        insert_typed(
+            &storage,
+            &c,
+            1,
+            Some(1),
+            Some(1),
+            Some(1.0),
+            Some(1.0),
+            Some(1),
+            Some(1),
+            Some(100),
+            Some([0u8; 16]),
+            Some(true),
+            Visibility::Public,
+        );
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        // production 経路と同じ既定入口。
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        for name in ["n", "big", "r", "d", "dt", "ts", "num", "uid"] {
+            let col = typed_col(&schema, name);
+            assert!(
+                !index.typed_column_is_indexed(col),
+                "column {name} must stay unindexed via the default build() entry \
+                 until TypedRangePredicate is wired to production (Issue #891)"
+            );
+        }
+    }
+
     /// `NULL` はいずれの typed 列索引にもエントリを作らない
     /// （`TextColumnIndex` と同じ契約。モジュールドキュメント参照）。
     #[test]
@@ -3748,7 +3845,8 @@ mod tests {
             Visibility::Public,
         );
         let (snapshot, schema) = typed_snapshot_from(&storage, &c);
-        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
         let n_col = typed_col(&schema, "n");
         let all = index
             .candidates_typed_range(n_col, Bound::Unbounded, Bound::Unbounded)
@@ -3799,7 +3897,8 @@ mod tests {
             Visibility::Private,
         );
         let (snapshot, schema) = typed_snapshot_from(&storage, &tenant_a);
-        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
         let n_col = typed_col(&schema, "n");
         let all = index
             .candidates_typed_range(n_col, Bound::Unbounded, Bound::Unbounded)
@@ -3836,7 +3935,8 @@ mod tests {
             Visibility::Public,
         );
         let (snapshot, schema) = typed_snapshot_from(&storage, &c);
-        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
         let flag_col = typed_col(&schema, "flag");
         let embedding_col = typed_col(&schema, "embedding");
         assert!(!index.typed_column_is_indexed(flag_col));
@@ -3894,7 +3994,8 @@ mod tests {
             Visibility::Public,
         );
         let (snapshot, schema) = typed_snapshot_from(&storage, &c);
-        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
         let n_col = typed_col(&schema, "n");
         let big_col = typed_col(&schema, "big");
         let ts_col = typed_col(&schema, "ts");
@@ -3954,7 +4055,8 @@ mod tests {
             Visibility::Public,
         );
         let (snapshot, schema) = typed_snapshot_from(&storage, &c);
-        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
         let big_col = typed_col(&schema, "big");
         assert!(
             index.typed_column_is_indexed(big_col),
@@ -4055,7 +4157,8 @@ mod tests {
             c.clone(),
             table_generation,
         );
-        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
         let kind_col = typed_col(&schema, "kind");
         let n_col = typed_col(&schema, "n");
 

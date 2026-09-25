@@ -302,3 +302,24 @@ fail-closed に縮退する（`INTEGER`・`DATE` は値域が構造的にこの�
 依存追加なし・`unsafe` なし・spec 本文転記なし。既存クエリの挙動・`EXPLAIN`
 出力・Recall ゲートはいずれも本 Issue の前後で完全に不変（typed 述語が実際に
 発生する経路が無いため）。
+
+### レビュー対応: 未接続 typed 索引の構築遅延（PR #1032 codex-review 指摘）
+
+`resolve_candidates` の `typed_preds` 引数が `sql::exec`／`sql::aggregate`／
+`sql::group_by` から常に空スライスでしか渡されない（上記「`#891` 依存による
+スコープ限定」）にもかかわらず、`ScalarIndex::build`（production が呼ぶ既定
+入口）はこれら未接続の typed 列（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`／
+`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`）についても `row_count` 件分のメモリ
+確保・全行キー生成・ソートを常に行っていた。これにより、既存の `TEXT`／
+`ENUM` 索引だけなら `MAX_SCALAR_INDEX_BYTES` に収まっていたはずのテーブルで、
+一度も照会されない typed 索引の分だけ予算を消費し `TooLarge`（plain scan
+縮退）へ巻き添えになり得る退行リスクがあった。
+
+`TypedRangePredicate` の本線配線（`#891` 接続後の別 Issue）を待たずに解消
+するため、`ScalarIndex::build`（production 経路の既定入口）は typed 列の
+構築を `BOOLEAN` 等と同じ非索引化（`None`）へ遅延させた。typed 索引の構築
+ロジックそのもの（`OrderedColumnIndex`・`candidates_typed_range`・`2^53`
+ゲート等）を検証する単体テストは、テスト専用の
+`ScalarIndex::build_including_unwired_typed_range_columns`（`#[cfg(test)]`）
+経由に切り替えて維持した。`#891` 配線後は `ScalarIndex::build` 側に
+本ロジックを戻す想定（上記「`#891` 接続後の残作業」に合流）。
