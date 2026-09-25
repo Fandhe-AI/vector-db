@@ -164,7 +164,7 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 
 ## D4. エラー契約
 
-- `ErrorClass::CheckViolation`（`23514`。main 統合後の分類数 28 → 29）。
+- `ErrorClass::CheckViolation`（`23514`。main〔#908 の索引 DDL を含む〕統合後の分類数 30 → 31）。
 - `TenantWriteError::CheckViolation { constraint }` → `23514`。
   `TenantWriteError::CheckEvaluationFailed`（式評価自体の失敗。0 除算等） →
   `XX000`（内部事象。値・詳細はクライアントへ渡さない）。

@@ -74,7 +74,13 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // `NotNullViolation`（`23502`。TABLE-16・TASK-204、Issue #904）は
         // `wire_code` を共有する `MissingOperationId` と同じくクライアント側の
         // 入力不備であり 400 とする。
-        | ErrorClass::NotNullViolation => 400,
+        | ErrorClass::NotNullViolation
+        // TASK-206・INDEX-7・SQL-23（Issue #908）: 索引 DDL の対象不在（`42704`）・
+        // 参照列不在（`42703`）。ERR-4 の射影規則（ERR-6 新設行は 400）に従う。
+        // NoSQL 表層の `op` 語彙に索引 DDL が無く構造的に到達しないが、
+        // `ErrorClass` の網羅性のため射影を定める。
+        | ErrorClass::UndefinedObject
+        | ErrorClass::UndefinedColumn => 400,
     }
 }
 
@@ -84,7 +90,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 29] = [
+    const EXPECTED: [(ErrorClass, u16); 31] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -113,6 +119,8 @@ mod tests {
         (ErrorClass::DependentObjectsStillExist, 400),
         (ErrorClass::WrongObjectType, 400),
         (ErrorClass::NotNullViolation, 400),
+        (ErrorClass::UndefinedObject, 400),
+        (ErrorClass::UndefinedColumn, 400),
         (ErrorClass::CheckViolation, 409),
     ];
 
