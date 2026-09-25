@@ -248,6 +248,31 @@ struct ParsedCertificate {
     spki_key_bits: Vec<u8>,
 }
 
+/// `AlgorithmIdentifier ::= SEQUENCE { algorithm OBJECT IDENTIFIER,
+/// parameters ANY DEFINED BY algorithm OPTIONAL }`（RFC 5280 §4.1.1.2）の
+/// 構造を検査する。`tbsCertificate.signature`・外側 `signatureAlgorithm`
+/// はいずれもこの形を満たさなければならないが、両者は `read_any` で
+/// タグが `SEQUENCE` であることしか確認していなかったため、algorithm OID
+/// を持たない空 SEQUENCE 同士でも DER バイト列一致検査（手順 5）を
+/// すり抜けて受理されてしまっていた。ここで「先頭に OID が 1 個存在し、
+/// 続く要素は任意の parameters 高々 1 個までで、それ以外の余剰要素が
+/// 無い」ことを検査し、手順 5 の一致検査より前に必ず通す。
+fn validate_algorithm_identifier_structure(tlv_value: &[u8]) -> Result<(), X509Error> {
+    let mut reader = DerReader::new(tlv_value);
+    let oid = reader
+        .read_expected(TAG_OID)
+        .map_err(|_| X509Error::Malformed)?;
+    if oid.is_empty() {
+        return Err(X509Error::Malformed);
+    }
+    if !reader.is_empty() {
+        // parameters ANY: 中身の意味は解釈しないが、1 個の TLV として
+        // 整形式であることだけは要求する。
+        reader.read_any().map_err(|_| X509Error::Malformed)?;
+    }
+    reader.expect_end().map_err(|_| X509Error::Malformed)
+}
+
 /// パース手順（モジュール doc 参照）に従い 1 個の証明書 DER を検査する。
 fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     if der_bytes.len() > MAX_CERTIFICATE_DER_LEN {
@@ -360,16 +385,33 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     let _ = tbs.read_optional(TAG_EXTENSIONS_EXPLICIT);
     tbs.expect_end().map_err(|_| X509Error::Malformed)?;
 
-    // tbsCertificate.signature と外側 signatureAlgorithm の DER バイト列
-    // 一致（手順 5。RFC 5280 §4.1.1.2）。
+    // tbsCertificate.signature と外側 signatureAlgorithm がいずれも
+    // 有効な AlgorithmIdentifier（algorithm OID を持つこと・許容外の
+    // 余剰要素が無いこと）であることを、DER バイト列一致（手順 5。
+    // RFC 5280 §4.1.1.2）より先に検査する。両者は raw バイト列一致を
+    // 要求するため、一方を検証すれば他方も同じ構造であることが保証される。
+    validate_algorithm_identifier_structure(tbs_sig_alg_tlv.value)?;
     if tbs_sig_alg_tlv.raw != sig_alg_tlv.raw {
         return Err(X509Error::SignatureAlgorithmMismatch);
     }
 
-    // signatureValue BIT STRING の形状検査（手順 6）。
-    let (unused_bits, _) = signature_value.split_first().ok_or(X509Error::Malformed)?;
+    // signatureValue BIT STRING の形状検査（手順 6）。unused-bits
+    // オクテットが 0〜7 の範囲であることに加え、(a) その直後に署名データが
+    // 1 バイト以上存在すること（実体のない signatureValue を拒否）、
+    // (b) unused-bits が非ゼロの場合、最終オクテットの下位 unused-bits
+    // ビットがすべて 0 であること（DER の正規化要件。非正規表現を拒否）
+    // を検査する。
+    let (unused_bits, signature_bytes) =
+        signature_value.split_first().ok_or(X509Error::Malformed)?;
     if *unused_bits > 7 {
         return Err(X509Error::Malformed);
+    }
+    let last_byte = signature_bytes.last().ok_or(X509Error::Malformed)?;
+    if *unused_bits > 0 {
+        let unused_mask = (1u8 << *unused_bits) - 1;
+        if last_byte & unused_mask != 0 {
+            return Err(X509Error::Malformed);
+        }
     }
 
     Ok(ParsedCertificate {

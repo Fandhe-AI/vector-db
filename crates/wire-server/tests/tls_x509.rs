@@ -556,6 +556,177 @@ fn tbs_signature_mismatch_with_outer_signature_algorithm_is_rejected() {
 }
 
 #[test]
+fn empty_algorithm_identifier_matching_on_both_sides_is_rejected() {
+    // tbsCertificate.signature と外側 signatureAlgorithm を、いずれも
+    // algorithm OID を持たない空 SEQUENCE（raw バイト列としては完全一致）
+    // にした場合の拒否を固定する。DER バイト列一致検査（手順 5）だけでは
+    // 両者が「等しく空」であることを見逃すため、AlgorithmIdentifier
+    // としての構造検査（algorithm OID の存在）が別途必要になる。
+    let empty_algorithm_identifier = sequence(&[]);
+
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &empty_algorithm_identifier,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let der = sequence(&[
+        &tbs_certificate,
+        &empty_algorithm_identifier,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::Malformed);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn algorithm_identifier_with_trailing_excess_element_is_rejected() {
+    // OID の後ろに parameters を超える 2 個目の要素を続けた
+    // AlgorithmIdentifier（tbs・外側とも同一バイト列で raw 一致はするが、
+    // 許容外の余剰要素を含むため構造検査で拒否されるべきケース）。
+    let algorithm_identifier_with_excess = sequence(&[
+        &tlv(0x06, &OID_ED25519_BYTES),
+        &tlv(0x05, &[]), // parameters（NULL）
+        &tlv(0x05, &[]), // 余剰の 2 個目の要素
+    ]);
+
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &algorithm_identifier_with_excess,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let der = sequence(&[
+        &tbs_certificate,
+        &algorithm_identifier_with_excess,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::Malformed);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn signature_value_with_no_signature_data_after_unused_bits_octet_is_rejected() {
+    // unused-bits オクテットのみで署名データが 1 バイトも無い
+    // signatureValue（実体の無い BIT STRING）を拒否する。
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    // unused-bits オクテットのみ（0x00）で後続の署名バイト列が無い。
+    let signature_bits = vec![0x00u8];
+    let der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::Malformed);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn signature_value_with_nonzero_unused_bits_and_nonzero_padding_is_rejected() {
+    // unused-bits が非ゼロ（4）なのに最終オクテットの下位 4 ビットが
+    // ゼロでない、非正規（non-canonical）な DER エンコーディングを拒否する。
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x04u8]; // unused bits = 4
+    signature_bits.extend_from_slice(&[0u8; 63]);
+    signature_bits.push(0xffu8); // 最終オクテットの下位 4 ビットが非ゼロ
+    let der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::Malformed);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn spki_with_parameters_is_rejected() {
     let signature_algorithm = ed25519_algorithm_identifier();
     // Ed25519 の OID の後ろに NULL parameters を付けた不正な SPKI。
