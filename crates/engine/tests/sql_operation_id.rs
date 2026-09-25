@@ -407,5 +407,7 @@ fn insert_missing_non_nullable_column_is_rejected() {
             "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2,0.3]') USING OPERATION_ID 'op-0001'",
         )
         .expect_err("missing non-nullable column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    // TABLE-16・TASK-204、Issue #904: NOT NULL 違反は `23502`
+    // （`NotNullViolation`）へ写像する（旧 `22000` から契約変更）。
+    assert_eq!(err.wire_code(), "23502");
 }

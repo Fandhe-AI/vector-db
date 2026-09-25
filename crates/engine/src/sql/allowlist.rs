@@ -10,7 +10,7 @@
 //! 後続タスクが [`ValidatedStatement`] を土台に実装する。本モジュールは
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
-use crate::catalog::{ColumnDef, ColumnType};
+use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, MAX_COLUMN_DEFAULT_LEN};
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
@@ -37,6 +37,12 @@ const MAX_INSERT_COLUMNS: usize = 256;
 /// 「無制限 `Vec` 確保を避ける」設計方針。列を `Vec` へ push する**前**に判定し、
 /// アロケーション前の上限検証（`.claude/rules/security.md`）を満たす）。
 const MAX_CREATE_TABLE_COLUMNS: usize = 256;
+
+/// `PRIMARY KEY (<col>[, <col>]*)` に宣言できる列数の上限（TABLE-16・
+/// TASK-204、Issue #903）。`catalog::validate_schema` が同じ上限
+/// （[`crate::catalog::MAX_PRIMARY_KEY_COLUMNS`]）で再検証するため、単一の
+/// 定数を共有しドリフトを防ぐ。
+use crate::catalog::MAX_PRIMARY_KEY_COLUMNS;
 
 /// 複数行 `VALUES (...), (...), ...`（SQL-16、TASK-190）が 1 文に持てる行数の上限。
 /// `sql/group_by.rs::MAX_GROUPS` と同じ「本リポ独自の実装既定値・無制限 `Vec`
@@ -306,7 +312,10 @@ pub enum SqlSurfaceError {
     /// （Issue #896 レビュー指摘）を避けるために独立させた。
     FeatureNotSupported { detail: String },
     /// `CREATE TABLE`（SQL-23・TASK-85、Issue #899）が指定したテーブル名が既に
-    /// カタログに存在する。既存スキーマは変更しない（TABLE-4）。ERR-6: `42P07`。
+    /// カタログに存在する。既存スキーマは変更しない（TABLE-4）。`CREATE VIEW`
+    /// （TABLE-18・SQL-23・TASK-205、Issue #909）が既存のテーブル名・ビュー名と
+    /// 衝突した場合も同じ分類を共有する（ビューはテーブルと名前空間を共有する）。
+    /// ERR-6: `42P07`。
     DuplicateTable { name: String },
     /// `CREATE TABLE` の列リストに同名の列が複数回宣言された（TABLE-6、
     /// Issue #899）。ERR-6: `42701`。
@@ -325,6 +334,29 @@ pub enum SqlSurfaceError {
     /// 存在情報を漏らさない」対応）。固定文言のみを保持し、テーブル名・
     /// ユーザー名を含めない。
     InsufficientPrivilege,
+    /// `DROP TABLE`／`DROP VIEW` の対象を、それを参照するビューが 1 つ以上
+    /// 残っているため削除できない（TABLE-18・SQL-23・TASK-205、Issue #909。
+    /// ERR-6: `2BP01`）。依存元の名前一覧はエラー文言に含めない
+    /// （security.md P0）。
+    DependentObjectsStillExist { name: String },
+    /// 名前は存在するが、要求された操作が期待するオブジェクト種別と一致
+    /// しない（`DROP TABLE` にビュー名、`DROP VIEW` にテーブル名、ビューへの
+    /// 書き込み系文。TABLE-18・SQL-23・TASK-205、Issue #909。ERR-6: `42809`）。
+    WrongObjectType { name: String },
+    /// 列に `NOT NULL` 制約が宣言されているにもかかわらず、値が省略された、
+    /// または明示的に `NULL` として書き込まれた（TABLE-16・TASK-204、
+    /// Issue #904）。`DEFAULT` 句を持つ列は省略時に既定値が補われるため
+    /// 本 variant にならない（明示 `NULL` は `DEFAULT` を適用せずこちらへ
+    /// 倒す。TABLE-16 の確定契約）。ERR-6: `23502`
+    /// （[`crate::error_format::ErrorClass::NotNullViolation`]。`wire_code` は
+    /// [`SqlSurfaceError::MissingOperationId`] と共有し `code` ラベルでのみ
+    /// 区別する）。
+    NotNullViolation { column: String },
+    /// `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約に
+    /// 違反した（[`crate::tenant::TenantWriteError::UniqueViolation`] の写像。
+    /// ERR-6: `23505`）。行キー衝突（[`SqlSurfaceError::IdConflict`]。物理キー
+    /// `(tenant_id, id)` の衝突）とは別の固定文言を返す。
+    UniqueViolation,
 }
 
 impl SqlSurfaceError {
@@ -374,8 +406,10 @@ impl SqlSurfaceError {
 
     /// FROM に指定されたテーブルがカタログ未存在（ERR-2: `42P01`）。テーブル名は
     /// untrusted な字句解析結果のため、`UnsupportedSyntax` と同様に長さを切り詰めて
-    /// エラーへ含める（security.md「情報漏えい」対応）。
-    fn undefined_table(name: impl Into<String>) -> Self {
+    /// エラーへ含める（security.md「情報漏えい」対応）。`pub(crate)`:
+    /// `sql::view::resolve_from`（TABLE-18・SQL-23・TASK-205、Issue #909）も
+    /// FROM 解決失敗を同じ形へ写像するために使う。
+    pub(crate) fn undefined_table(name: impl Into<String>) -> Self {
         SqlSurfaceError::UndefinedTable {
             name: truncate_for_error(&name.into()),
         }
@@ -439,6 +473,23 @@ impl SqlSurfaceError {
             detail: truncate_for_error(&detail.into()),
         }
     }
+
+    /// `pub(crate)`: `sql::parser`（`bind_literal_for_column`・`fill_omitted_columns`
+    /// 等）が NOT NULL 制約違反（列の省略・明示 NULL）を報告するために使う
+    /// （TABLE-16・TASK-204、Issue #904）。他テナントの情報・値そのものは
+    /// 含めず列名のみを保持する（security.md P0）。
+    pub(crate) fn not_null_violation(column: impl Into<String>) -> Self {
+        SqlSurfaceError::NotNullViolation {
+            column: truncate_for_error(&column.into()),
+        }
+    }
+
+    /// `pub(crate)`: `sql::exec::map_write_error` が
+    /// [`crate::tenant::TenantWriteError::UniqueViolation`] を写像するために使う
+    /// （`PRIMARY KEY`〔Issue #903〕・UNIQUE 制約〔Issue #905〕。TABLE-16・TASK-204）。
+    pub(crate) fn unique_violation() -> Self {
+        SqlSurfaceError::UniqueViolation
+    }
 }
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
@@ -474,6 +525,12 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InsufficientPrivilege => ErrorClass::ForbiddenTenantMismatch,
+            SqlSurfaceError::DependentObjectsStillExist { .. } => {
+                ErrorClass::DependentObjectsStillExist
+            }
+            SqlSurfaceError::WrongObjectType { .. } => ErrorClass::WrongObjectType,
+            SqlSurfaceError::NotNullViolation { .. } => ErrorClass::NotNullViolation,
+            SqlSurfaceError::UniqueViolation => ErrorClass::UniqueViolation,
         }
     }
 
@@ -549,8 +606,12 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::FeatureNotSupported { detail } => {
                 write!(f, "feature not supported: {detail}")
             }
+            // 名前はクライアント自身が指定した識別子であり秘匿情報ではない
+            // （既存の `UndefinedTable`／`WrongObjectType` と同じ扱い）。
+            // `CREATE TABLE`（TASK-85）・`CREATE VIEW`（TASK-205、Issue #909）
+            // 双方の名前衝突を共有する分類のため "relation" と汎称する。
             SqlSurfaceError::DuplicateTable { name } => {
-                write!(f, "table already exists: {name}")
+                write!(f, "relation already exists: {name}")
             }
             SqlSurfaceError::DuplicateColumn { name } => {
                 write!(f, "duplicate column name: {name}")
@@ -560,6 +621,24 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::InsufficientPrivilege => {
                 write!(f, "permission denied for DDL statement")
             }
+            // 依存元の名前一覧は含めない固定文言（security.md P0）。
+            SqlSurfaceError::DependentObjectsStillExist { name } => {
+                write!(f, "cannot drop {name} because other objects depend on it")
+            }
+            SqlSurfaceError::WrongObjectType { name } => {
+                write!(f, "wrong object type: {name}")
+            }
+            // 値そのもの・他テナントの情報を含めない固定形式（security.md P0）。
+            SqlSurfaceError::NotNullViolation { column } => {
+                write!(
+                    f,
+                    "null value in column {column:?} violates not-null constraint"
+                )
+            }
+            // 行キー衝突（`IdConflict`）とは別の固定文言（`TenantWriteError::
+            // UniqueViolation` の `Display` と同じ考え方）。キー値・行 id・
+            // テナント名は含めない（security.md P0）。
+            SqlSurfaceError::UniqueViolation => write!(f, "unique constraint violation"),
         }
     }
 }
@@ -580,6 +659,21 @@ pub trait TableLookup {
     /// カタログ照会自体が失敗した場合（redb I/O 等）は `Err` とし、
     /// 存在するとも存在しないとも判定しない（fail-closed）。
     fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError>;
+
+    /// `name` が定義済みビュー（`CREATE VIEW`。TABLE-18・SQL-23・TASK-205、
+    /// Issue #909）なら `Ok(Some(_))`、テーブル・ビューいずれでもなければ
+    /// `Ok(None)`。既定実装は常に `Ok(None)` を返すため、ビュー機能を持たない
+    /// 既存の `TableLookup` 実装（テスト用モック等）は無変更のままコンパイル
+    /// できる（`catalog.rs::impl TableLookup for Storage` のみが実データを
+    /// 返す）。カタログ照会自体が失敗した場合（redb I/O・カタログ破損等）は
+    /// `Err`（fail-closed。[`crate::sql::view::resolve_from`] 参照）。
+    fn view_definition(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::catalog::ViewDef>, SqlSurfaceError> {
+        let _ = name;
+        Ok(None)
+    }
 }
 
 /// ORDER BY 関数呼び出し形（`FunctionCall`, TASK-75）の 1 引数。本モジュールは
@@ -1096,6 +1190,25 @@ impl ValidatedScan {
     }
 }
 
+/// `CREATE TABLE` の列制約（`NOT NULL`／`DEFAULT <literal>`〔Issue #904〕・
+/// `UNIQUE`〔Issue #905〕。TABLE-16・TASK-204）の構文木。列型ごとの適用可否
+/// （`DEFAULT` の型整合・`VECTOR` への `DEFAULT`／`UNIQUE` 禁止等）は呼び出し元
+/// （`Parser::parse_create_table_column`）が判定する。
+struct ColumnConstraints {
+    not_null: bool,
+    default: Option<InsertLiteral>,
+    unique: bool,
+}
+
+/// `CREATE TABLE` の列 1 個ぶんの構文解析結果（[`Parser::parse_create_table_column`]
+/// の戻り値）。列制約 `PRIMARY KEY`・`UNIQUE` の有無は列定義本体と分けて返し、
+/// 呼び出し元（[`Parser::parse_create_table`]）が表制約と同じ集約経路へ流す。
+struct ParsedCreateTableColumn {
+    column: ColumnDef,
+    primary_key: bool,
+    unique: bool,
+}
+
 /// INSERT の VALUES リストの 1 リテラル（SQL-10、TASK-80）。トークン種別
 /// （文字列リテラル／数値）のみを構造として保持し、列型との照合・意味論的解釈は
 /// `sql::parser::bind_insert` の責務とする。UPDATE の SET 句のリテラル値表現としても
@@ -1106,17 +1219,22 @@ pub enum InsertLiteral {
     Number(String),
     /// BOOLEAN 列向けの `true`/`false` リテラル（TABLE-13・TASK-196、Issue #883）。
     Bool(bool),
-    /// SQL `NULL`（nullable 列への明示的な NULL 設定。Issue #889 レビュー指摘・
-    /// PR #1014。SQL の `UPDATE ... SET` 構文には現状 `NULL` リテラルの字句・
-    /// 構文規則が無く（`sql::allowlist` の `SET` 句パーサーは `NULL` トークンを
-    /// 生成しない）、本 variant は NoSQL 表層 `update` op
-    /// （`wire-server::http::query::update::map_set_assignments`）が JSON
-    /// `null` かつ nullable 列の場合にのみ構築する。`bind_set_assignments`
-    /// （SQL-17・SQL-19 の UPDATE SET 束縛）はこの variant を
-    /// `column.nullable` に応じて `Value::Null`／エラーへ写像し、
-    /// `bind_insert`／`bind_upsert_assignments`／`bind_file_insert`
-    /// （INSERT・UPSERT。SQL テキストからもファイル形からも `Null` は
-    /// 構築されない到達不能パス）は fail-closed に一律拒否する。
+    /// SQL `NULL`（明示的な NULL 指定。Issue #889 レビュー指摘・PR #1014）。
+    /// SQL の `UPDATE ... SET` 構文には現状 `NULL` リテラルの字句・構文規則が
+    /// 無く（`sql::allowlist` の `SET` 句パーサーは `NULL` トークンを生成
+    /// しない）、SQL テキストの `INSERT ... VALUES` 構文からも構築されない
+    /// （VALUES 要素パーサーが `NULL` トークンを受理しない）。本 variant は
+    /// NoSQL 表層 `update`／`insert` op（`wire-server::http::query::update::
+    /// map_set_assignments`・`insert::bind_row`。TABLE-16・TASK-204、
+    /// Issue #904 D5）が JSON `null` から構築する。
+    ///
+    /// 明示的な `NULL` には `DEFAULT` を適用しない契約（TABLE-16）のため、
+    /// 「省略」（`DEFAULT` 適用対象。`sql::parser::fill_omitted_columns`）とは
+    /// 独立の経路として扱う。`bind_insert_row`・`bind_set_assignments`
+    /// （UPDATE）・`bind_upsert_assignments`（UPSERT `DO UPDATE SET`）・
+    /// `bind_file_insert` はいずれも `column.nullable` に応じて
+    /// `Value::Null`（nullable）／`SqlSurfaceError::NotNullViolation`
+    /// （非 nullable。`23502`）へ写像する（列型を問わない一律拒否ではない）。
     Null,
     /// `VECTOR` 列向けの、既に要素ごとに検証済みの `f32` 列（NoSQL 表層
     /// `insert`／`update` op が JSON 配列から直接構築する。Issue #896
@@ -1295,16 +1413,115 @@ pub enum DeleteStatement {
 /// 避けるため行わない。`sql::ddl` モジュールドキュメント参照）。
 ///
 /// 受理する形は `CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]` の
-/// みで、`<type>` は `TEXT`／`VECTOR ( <N> )` のみ（`IF NOT EXISTS`・列制約・
-/// 表制約・`USING OPERATION_ID` の付与はいずれも許可リスト外。TABLE-13/14 の
-/// 追加型は別 Issue の管轄）。
+/// みで、`<type>` は `TEXT`／`VECTOR ( <N> )` のみ（`IF NOT EXISTS`・
+/// `CONSTRAINT <name>`・`CHECK`／`REFERENCES`・`USING OPERATION_ID` の付与は
+/// いずれも許可リスト外）。列制約 `NOT NULL`／`DEFAULT <literal>`（Issue #904）・
+/// `UNIQUE`（Issue #905）・`PRIMARY KEY`（Issue #903）と、表制約
+/// `PRIMARY KEY (<col>[, <col>]*)`・`UNIQUE (<col>[, <col>]*)`（複合キーを含む）
+/// を許可形状として追加受理する（TABLE-16・TASK-204。詳細は
+/// `docs/design/sql-primary-key.md`・`docs/design/unique-constraint.md` 参照）。
+/// TABLE-13/14 の追加型は別 Issue の管轄。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedCreateTable {
     /// カタログ存在確認前のテーブル名（識別子形式のみ検証済み）。
     pub table_name: String,
     /// 宣言順を保持した列定義（1 件以上）。`VECTOR` 列は `nullable = false`・
     /// `TEXT` 列は `nullable = true`（PostgreSQL の既定に倣う。TABLE-1）。
+    /// 主キー構成列（[`Self::primary_key`] が `Some` の場合）は列制約・表制約の
+    /// いずれで宣言されても `nullable = false` へ書き換え済み。
     pub columns: Vec<ColumnDef>,
+    /// `PRIMARY KEY` 宣言列名（宣言順。TABLE-16・TASK-204、Issue #903）。
+    /// 未宣言（`id` 暗黙主キーのまま）は `None`。`PRIMARY KEY (id)`（`id` 単独）
+    /// は暗黙主キーの明示宣言として受理したうえで `None` へ正規化する
+    /// （`docs/design/sql-primary-key.md`「id 暗黙主キーとの共存規約」参照）。
+    pub primary_key: Option<Vec<String>>,
+    /// 列制約（`<col> TEXT UNIQUE`）・表制約（`UNIQUE (<col>[, <col>]*)`）の
+    /// いずれかで宣言された UNIQUE 制約（宣言順。TABLE-16・TASK-204、
+    /// Issue #905）。参照列の実在・型適格性は構造検証段階
+    /// （[`finalize_unique_constraints`]）で判定済み。
+    pub unique_constraints: Vec<crate::catalog::UniqueConstraint>,
+}
+
+/// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
+/// UNIQUE 制約の参照解決（TABLE-16・TASK-204、Issue #905）。表制約は宣言順に
+/// 関わらず任意位置の列を参照できるため、全列が出揃った後にまとめて行う。
+/// 未宣言列（`id` 疑似列を含む。`id` は元からテナント内一意の行識別子のため
+/// UNIQUE の対象にしない）・一意キー許可型
+/// （[`crate::catalog::ColumnType::is_primary_key_allowed`]。主キーと共有する
+/// 単一の許可リスト）外の列の参照は `42601`。同一列リストの制約重複等の残る
+/// 不変条件は `catalog::validate_schema` が再検証する。
+fn finalize_unique_constraints(
+    unique_constraints: Vec<Vec<String>>,
+    columns: &[ColumnDef],
+) -> Result<Vec<crate::catalog::UniqueConstraint>, SqlSurfaceError> {
+    for cols in &unique_constraints {
+        for name in cols {
+            let column = columns.iter().find(|c| &c.name == name).ok_or_else(|| {
+                SqlSurfaceError::unsupported(format!(
+                    "UNIQUE constraint references unknown column: {name}"
+                ))
+            })?;
+            if !column.ty.is_primary_key_allowed() {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "column {name} has a type that cannot be used in a UNIQUE constraint"
+                )));
+            }
+        }
+    }
+    Ok(unique_constraints
+        .into_iter()
+        .map(crate::catalog::UniqueConstraint::new)
+        .collect())
+}
+
+/// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
+/// `PRIMARY KEY` 宣言の最終判定・正規化（TABLE-16・TASK-204、Issue #903）。
+///
+/// - `None`（未宣言）はそのまま `Ok(None)`。
+/// - `id` 単独宣言（`PRIMARY KEY (id)`）は暗黙主キーの明示宣言として `Ok(None)`
+///   （何も永続化しない。`docs/design/sql-primary-key.md` 参照）。
+/// - `id` と他列の混在は曖昧さを避けるため `42601` で拒否する。
+/// - それ以外の各列名は `columns`（生存列のみ。表制約は宣言順に関わらず任意
+///   位置の列を参照できる）に存在しなければならず、存在すれば
+///   `nullable = false` へ書き換える（列制約・表制約いずれの宣言経路でも
+///   同じ最終状態にする）。列型自体の許可判定
+///   （[`crate::catalog::ColumnType::is_primary_key_allowed`]）はここでは行わず
+///   `catalog::validate_schema`（`sql::ddl::execute_create_table` が書き込み
+///   トランザクション内で通す）に委ねる（同じ `42601` 分類のため二重実装
+///   しない）。
+fn finalize_primary_key(
+    primary_key: Option<Vec<String>>,
+    columns: &mut [ColumnDef],
+) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+    let Some(pk_cols) = primary_key else {
+        return Ok(None);
+    };
+    if pk_cols.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "PRIMARY KEY must declare at least one column",
+        ));
+    }
+    let contains_id = pk_cols.iter().any(|name| name.eq_ignore_ascii_case("id"));
+    if contains_id {
+        if pk_cols.len() > 1 {
+            return Err(SqlSurfaceError::unsupported(
+                "PRIMARY KEY must not combine the implicit id column with other columns",
+            ));
+        }
+        return Ok(None);
+    }
+    for name in &pk_cols {
+        let column = columns
+            .iter_mut()
+            .find(|c| &c.name == name)
+            .ok_or_else(|| {
+                SqlSurfaceError::unsupported(format!(
+                    "PRIMARY KEY references unknown column: {name}"
+                ))
+            })?;
+        column.nullable = false;
+    }
+    Ok(Some(pk_cols))
 }
 
 /// 許可形状の構造判定を通過した TRUNCATE 文（SQL-22、TASK-195）。テーブル定義
@@ -1324,6 +1541,28 @@ pub struct ValidatedTruncate {
     /// 書き込みトランザクション開始前に `23502` で拒否するため、この構成では
     /// 常に `Some` になる。
     pub operation_id: Option<OperationId>,
+}
+
+/// 許可形状の構造判定を通過した `ALTER TABLE ... ADD COLUMN ...` 文
+/// （TASK-202・SQL-23。Issue #900）。DDL（テーブル定義の変更）であり、
+/// `USING OPERATION_ID` 句は取らない（`ValidatedTruncate`／`ValidatedInsert`
+/// とは異なり `operation_id` を保持しない。SQL-23 の DDL は台帳〔TASK-93〕の
+/// 対象外）。
+///
+/// 受理する形は `ALTER TABLE <table> ADD COLUMN <column> <type> [;]` のみ
+/// （`IF NOT EXISTS`・複数 `ADD`・列制約〔`NOT NULL`／`DEFAULT`／`PRIMARY KEY`
+/// 等〕・`DROP COLUMN`／`ALTER COLUMN`・`RETURNING`・`USING OPERATION_ID` の
+/// 併用はいずれも許可リスト外。構造検証段階ではカタログ照会を一切行わない
+/// （テーブル・列の存在確認は `sql::ddl::execute_alter_table_add_column` が
+/// DDL 権限ゲート通過後に行う——権限の無い主体への存在オラクル化を防ぐ
+/// ため）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAddColumn {
+    pub table_name: String,
+    pub column_name: String,
+    /// 型名の構文木。意味づけ（ENUM 型名の存在確認・`ColumnType` への変換）は
+    /// `sql::ddl::execute_alter_table_add_column` の責務。
+    pub column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
 }
 
 /// 許可形状の構造判定を通過した UPDATE 文（SQL-17、TASK-191）。`ValidatedInsert` と
@@ -1487,6 +1726,18 @@ impl<'a> Parser<'a> {
     /// `using`・`set` を従来どおり通常の識別子として扱える。
     fn peek_ident_matches(&self, word: &str) -> bool {
         matches!(self.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case(word))
+    }
+
+    /// [`Self::peek_ident_matches`] の 2 トークン先読み版。`CREATE TABLE` の表
+    /// 制約 `PRIMARY KEY (...)`（TABLE-16・TASK-204、Issue #903）を、列名
+    /// `primary`（`Ident("PRIMARY")` を消費せず単独の列名として使うケース）と
+    /// 曖昧さなく判定するために使う——`offset` 個先のトークンが `KEY` である
+    /// 場合にのみ表制約として扱う。
+    fn peek_ident_matches_at(&self, offset: usize, word: &str) -> bool {
+        matches!(
+            self.tokens.get(self.pos.saturating_add(offset)),
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case(word)
+        )
     }
 
     /// 現在位置が `Token::Ident` かつ大文字小文字を区別せず `word` と一致する場合のみ
@@ -2642,17 +2893,63 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `ALTER TABLE <table> ADD COLUMN <column> <type> [;]` の単一列追加形の
+    /// みを受理する（TASK-202・SQL-23。Issue #900）。`ALTER`／`TABLE`／`ADD`／
+    /// `COLUMN` は `lexer::Keyword` へ含めない設計方針（`lexer.rs` の
+    /// モジュールドキュメント参照）のため、いずれも `expect_contextual_keyword`
+    /// で文脈的に照合する。`IF NOT EXISTS`・複数 `ADD`・列制約・`DROP COLUMN`／
+    /// `ALTER COLUMN`・`USING OPERATION_ID` はいずれも構造的に受理しない
+    /// （`expect_end_of_statement` が余剰トークンとして `42601` で拒否するか、
+    /// `ADD` の直後に `COLUMN` 以外が続いた時点で `expect_contextual_keyword`
+    /// が拒否する）。
+    fn parse_alter_table_add_column(
+        &mut self,
+    ) -> Result<ParsedAlterTableAddColumnShape, SqlSurfaceError> {
+        self.expect_contextual_keyword("ALTER")?;
+        self.expect_contextual_keyword("TABLE")?;
+        let table_name = self.expect_ident()?;
+        self.expect_contextual_keyword("ADD")?;
+        self.expect_contextual_keyword("COLUMN")?;
+        let column_name = self.expect_ident()?;
+        // 予約列名（`id`／`tenant_id`／`visibility`。ASCII の大文字小文字を無視）は
+        // `parse_create_table_column` と同じく構造検証段階で拒否する（`sql::parser`
+        // がこれら 3 語を疑似列・RLS 内部列として扱う契約と整合させ、DDL で
+        // これらを隠蔽する列を作らせない。fail-closed。security.md「アクセス
+        // 制御の不備」対応）。カタログを参照しない判定のため権限ゲートより
+        // 前に置いても存在オラクルにならない。
+        if column_name.eq_ignore_ascii_case("id")
+            || column_name.eq_ignore_ascii_case("tenant_id")
+            || column_name.eq_ignore_ascii_case("visibility")
+        {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "column name {column_name:?} is reserved"
+            )));
+        }
+        // `sql::allowlist::Parser` の内部状態（`tokens`／`pos`）を共有する
+        // 独立実装（`sql::ddl_column_type` モジュールドキュメント参照）。
+        let column_type =
+            crate::sql::ddl_column_type::parse_column_type_name(self.tokens, &mut self.pos)?;
+
+        Ok(ParsedAlterTableAddColumnShape {
+            table_name,
+            column_name,
+            column_type,
+        })
+    }
+
     /// `CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]`（SQL-23・
     /// TASK-85、Issue #899）の許可形状。カタログ照会は行わない（`sql::ddl`
     /// モジュールドキュメント・[`ValidatedCreateTable`] 参照）。列数の上限判定
-    /// （`MAX_CREATE_TABLE_COLUMNS`）は、次の列を実際にパースする直前
-    /// （カンマを消費した直後）にのみ行う。ちょうど上限数の列で閉じ括弧
-    /// `)` に到達する場合はこの判定を経由せず正しく受理される（次の列を
-    /// 一切パースしない＝アロケーションもしない前に上限超過を拒否する
-    /// 設計は維持。`.claude/rules/security.md`「不安全な設計｜無制限
-    /// リソース確保（DoS）」対応。PR #1044 レビュー時の境界値誤検知
-    /// （ちょうど上限数の列を誤って拒否する off-by-one 懸念）の指摘を受け、
-    /// 誤検知の再発を防ぐためにこの位置へ判定を固定した）。
+    /// （`MAX_CREATE_TABLE_COLUMNS`）は、列定義 1 個を実際にパースする直前に
+    /// 「既に確定した列数」だけで行う。表制約（`PRIMARY KEY (...)`・
+    /// `UNIQUE (...)`）は列を追加しないため判定の対象外で、制約が列リスト中の
+    /// どこ（先頭・中間・末尾）にあっても判定結果が変わらない（位置非依存）。
+    /// ちょうど上限数の列は受理し、上限を超える列はパース・アロケーションの
+    /// 前に `54000` で拒否する（`.claude/rules/security.md`「不安全な設計｜
+    /// 無制限リソース確保（DoS）」対応。PR #1044 レビューの off-by-one 是正と、
+    /// 表制約の直後の列が上限判定をすり抜けていた不具合〔Issue #905 レビュー
+    /// 指摘〕の是正を兼ねる。カンマ直後の先読みで表制約を除外する旧判定は
+    /// 表制約の後ろに続く列を数え漏らしていたため撤去した）。
     fn parse_create_table(&mut self) -> Result<ValidatedCreateTable, SqlSurfaceError> {
         self.expect_contextual_keyword("CREATE")?;
         self.expect_contextual_keyword("TABLE")?;
@@ -2662,44 +2959,109 @@ impl<'a> Parser<'a> {
 
         self.expect_punct('(')?;
         let mut columns: Vec<ColumnDef> = Vec::new();
+        // `PRIMARY KEY` 宣言（列制約・表制約のいずれか一方のみ。TABLE-16・
+        // TASK-204、Issue #903）。列名の存在検証・`id` 混在検査・nullable の
+        // 強制は列リスト全体の構文判定を終えた後（このループを抜けた後）に
+        // まとめて行う（表制約は宣言順に関わらず任意位置の列を参照できる
+        // ため）。
+        let mut primary_key: Option<Vec<String>> = None;
+        // UNIQUE 制約（列制約・表制約。TABLE-16・TASK-204、Issue #905）。参照列の
+        // 解決は `finalize_unique_constraints` が列リスト全体の構文判定後に行う。
+        let mut unique_constraints: Vec<Vec<String>> = Vec::new();
         loop {
-            let column = self.parse_create_table_column(&columns)?;
-            columns.push(column);
-            if matches!(self.peek(), Some(Token::Punct(','))) {
-                self.advance();
+            // 表制約 `PRIMARY KEY (<col>[, <col>]*)` は要素先頭が文脈的識別子
+            // `PRIMARY` かつ次のトークンが `KEY` の場合にのみ判定する
+            // （`KEY` は列型キーワードではないため、列名 `primary` との構文上の
+            // 曖昧さは生じない）。
+            if self.peek_ident_matches("PRIMARY") && self.peek_ident_matches_at(1, "KEY") {
+                if primary_key.is_some() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "CREATE TABLE must declare at most one PRIMARY KEY",
+                    ));
+                }
+                primary_key = Some(self.parse_primary_key_table_constraint()?);
+            } else if self.peek_ident_matches("UNIQUE")
+                && matches!(
+                    self.tokens.get(self.pos.saturating_add(1)),
+                    Some(Token::Punct('('))
+                )
+            {
+                // 表制約 `UNIQUE (<col>[, <col>]*)`。要素先頭が文脈的識別子
+                // `UNIQUE` かつ次のトークンが `(` の場合にのみ判定する（列名
+                // `unique` の列定義は次が列型キーワードになるため曖昧さはない）。
+                if unique_constraints.len() >= crate::catalog::MAX_UNIQUE_CONSTRAINTS {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many UNIQUE constraints in CREATE TABLE",
+                    ));
+                }
+                unique_constraints.push(self.parse_unique_table_constraint()?);
+            } else {
+                // 列定義を 1 つ確定させる前に、確定済みの列数だけで上限を判定する
+                // （位置非依存。`parse_create_table` のドキュメント参照）。
                 if columns.len() >= MAX_CREATE_TABLE_COLUMNS {
                     return Err(SqlSurfaceError::payload_too_large(
                         "too many columns in CREATE TABLE",
                     ));
                 }
+                let parsed = self.parse_create_table_column(&columns)?;
+                if parsed.primary_key {
+                    if primary_key.is_some() {
+                        return Err(SqlSurfaceError::unsupported(
+                            "CREATE TABLE must declare at most one PRIMARY KEY",
+                        ));
+                    }
+                    primary_key = Some(vec![parsed.column.name.clone()]);
+                }
+                if parsed.unique {
+                    if unique_constraints.len() >= crate::catalog::MAX_UNIQUE_CONSTRAINTS {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "too many UNIQUE constraints in CREATE TABLE",
+                        ));
+                    }
+                    unique_constraints.push(vec![parsed.column.name.clone()]);
+                }
+                columns.push(parsed.column);
+            }
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
                 continue;
             }
             break;
         }
         self.expect_punct(')')?;
 
+        let primary_key = finalize_primary_key(primary_key, &mut columns)?;
+        let unique_constraints = finalize_unique_constraints(unique_constraints, &columns)?;
+
         Ok(ValidatedCreateTable {
             table_name,
             columns,
+            primary_key,
+            unique_constraints,
         })
     }
 
-    /// `CREATE TABLE` の列 1 個ぶんの許可形状: `<col> (TEXT | VECTOR '(' <N> ')')`
-    /// （Issue #899）。`TEXT`／`VECTOR` は `lexer::Keyword` へ含めない（`SET`・
-    /// `CREATE` と同方針。statement 中のこの位置でのみ文脈的キーワードとして
-    /// 照合する）。予約列名（`id`／`tenant_id`／`visibility`。ASCII の大文字小文字を
-    /// 無視して照合）・同一文内の列名重複はここで拒否する（`sql::parser` が
-    /// これら 3 語を疑似列・RLS 内部列として扱う契約と整合させ、SQL 表層の DDL で
-    /// これらを隠蔽する列を作らせない。fail-closed。`.claude/rules/security.md`
+    /// `CREATE TABLE` の列 1 個ぶんの許可形状: `<col> (TEXT | VECTOR '(' <N> ')')
+    /// [PRIMARY KEY]`（Issue #899・#903）。`TEXT`／`VECTOR`／`PRIMARY`／`KEY` は
+    /// `lexer::Keyword` へ含めない（`SET`・`CREATE` と同方針。statement 中の
+    /// この位置でのみ文脈的キーワードとして照合する）。予約列名（`id`／
+    /// `tenant_id`／`visibility`。ASCII の大文字小文字を無視して照合）・
+    /// 同一文内の列名重複はここで拒否する（`sql::parser` がこれら 3 語を
+    /// 疑似列・RLS 内部列として扱う契約と整合させ、SQL 表層の DDL でこれらを
+    /// 隠蔽する列を作らせない。fail-closed。`.claude/rules/security.md`
     /// 「アクセス制御の不備」対応）。`VECTOR` の次元は `Token::Number` を `u32` へ
     /// checked に parse する（先頭 `-`・小数点・オーバーフローはいずれも
     /// `UnsupportedSyntax` へ落ちる。範囲（`1..=MAX_VECTOR_DIM`）検証自体は
     /// `catalog::validate_schema`（`sql::ddl::execute_create_table` が書き込み
     /// トランザクション内で通す）に委ねる——同じ `42601` 分類のため二重実装しない）。
+    /// 戻り値は列定義と、列制約 `PRIMARY KEY`・`UNIQUE`（Issue #905）が付与
+    /// されたかどうか（`finalize_primary_key` 呼び出し前の nullable 書き換えは
+    /// 行わない）。`UNIQUE` は `VECTOR` 列には付与できない（一意キー許可型外。
+    /// 構文段階で `42601`）。
     fn parse_create_table_column(
         &mut self,
         existing: &[ColumnDef],
-    ) -> Result<ColumnDef, SqlSurfaceError> {
+    ) -> Result<ParsedCreateTableColumn, SqlSurfaceError> {
         let name = self.expect_ident()?;
         crate::catalog::validate_identifier(&name)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid column name: {e}")))?;
@@ -2715,11 +3077,33 @@ impl<'a> Parser<'a> {
             return Err(SqlSurfaceError::duplicate_column(name));
         }
 
-        if self.peek_ident_matches("TEXT") {
+        let mut unique = false;
+        let column = if self.peek_ident_matches("TEXT") {
             self.advance();
-            return Ok(ColumnDef::new(name, ColumnType::Text, true));
-        }
-        if self.peek_ident_matches("VECTOR") {
+            let constraints = self.parse_column_constraints()?;
+            unique = constraints.unique;
+            let default = match constraints.default {
+                None => None,
+                Some(InsertLiteral::String(s)) => {
+                    if s.len() > MAX_COLUMN_DEFAULT_LEN {
+                        return Err(SqlSurfaceError::payload_too_large(format!(
+                            "column {name:?} DEFAULT literal exceeds length limit"
+                        )));
+                    }
+                    Some(ColumnDefault::Text(s))
+                }
+                Some(_) => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "column {name:?} DEFAULT expects a text literal"
+                    )))
+                }
+            };
+            let mut column = ColumnDef::new(name, ColumnType::Text, !constraints.not_null);
+            if let Some(default) = default {
+                column = column.with_default(default);
+            }
+            column
+        } else if self.peek_ident_matches("VECTOR") {
             self.advance();
             self.expect_punct('(')?;
             let raw_dim = self.expect_number()?;
@@ -2727,11 +3111,170 @@ impl<'a> Parser<'a> {
                 SqlSurfaceError::unsupported(format!("invalid VECTOR dimension: {raw_dim:?}"))
             })?;
             self.expect_punct(')')?;
-            return Ok(ColumnDef::new(name, ColumnType::Vector(dim), false));
+            let constraints = self.parse_column_constraints()?;
+            if constraints.default.is_some() {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "column {name:?}: VECTOR columns do not support DEFAULT"
+                )));
+            }
+            if constraints.unique {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "column {name:?}: VECTOR columns do not support UNIQUE"
+                )));
+            }
+            // VECTOR は常に非 nullable。`NOT NULL` の明示指定は冗長だが受理する
+            // （`constraints.not_null` の値に関わらず `nullable = false` のまま）。
+            ColumnDef::new(name, ColumnType::Vector(dim), false)
+        } else {
+            return Err(SqlSurfaceError::unsupported(
+                "expected column type TEXT or VECTOR(<dim>)",
+            ));
+        };
+
+        // 列制約 `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`CONSTRAINT
+        // <name> PRIMARY KEY` 形・`REFERENCES`／`CHECK` はいずれも許可リスト外の
+        // まま（受理しない）。`NOT NULL`／`DEFAULT`（Issue #904）・`UNIQUE`
+        // （Issue #905）は列型キーワードの直後（`parse_column_constraints` 内）で
+        // 先に受理済みで、`PRIMARY KEY` は
+        // その後段の独立した列制約として構文上共存できる（`finalize_primary_key`
+        // が主キー列の `nullable` を最終的に `false` へ強制する）。
+        let is_pk = if self.peek_ident_matches("PRIMARY") && self.peek_ident_matches_at(1, "KEY") {
+            self.advance();
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        Ok(ParsedCreateTableColumn {
+            column,
+            primary_key: is_pk,
+            unique,
+        })
+    }
+
+    /// 表制約 `UNIQUE (<col>[, <col>]*)`（TABLE-16・TASK-204、Issue #905）の
+    /// 許可形状。列名の存在検証・型適格性は `finalize_unique_constraints` へ
+    /// 委譲する（表制約は宣言順に関わらず任意位置の列を参照できるため）。
+    /// 同一制約内の列名重複は `42701`（`parse_primary_key_table_constraint` と
+    /// 同じ分類）、空リストは `42601`、列数上限
+    /// （[`crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS`]）超過は `Vec` へ積む
+    /// 前に `54000`。
+    fn parse_unique_table_constraint(&mut self) -> Result<Vec<String>, SqlSurfaceError> {
+        self.expect_contextual_keyword("UNIQUE")?;
+        self.expect_punct('(')?;
+        let mut cols: Vec<String> = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            crate::catalog::validate_identifier(&name).map_err(|e| {
+                SqlSurfaceError::unsupported(format!("invalid UNIQUE column name: {e}"))
+            })?;
+            if cols.contains(&name) {
+                return Err(SqlSurfaceError::duplicate_column(name));
+            }
+            if cols.len() >= crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many columns in UNIQUE constraint",
+                ));
+            }
+            cols.push(name);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
         }
-        Err(SqlSurfaceError::unsupported(
-            "expected column type TEXT or VECTOR(<dim>)",
-        ))
+        self.expect_punct(')')?;
+        Ok(cols)
+    }
+
+    /// 表制約 `PRIMARY KEY (<col>[, <col>]*)`（TABLE-16・TASK-204、Issue #903）の
+    /// 許可形状。`PRIMARY`・`KEY` の消費のみを行い、列名の存在検証は
+    /// `finalize_primary_key` へ委譲する（表制約は列リスト中の宣言順に
+    /// 関わらず任意位置の列を参照できるため）。同一主キー内の列名重複は
+    /// ここで拒否する（`42701`。列リスト全体の重複列名検査
+    /// `parse_create_table_column` と同じ分類）。
+    fn parse_primary_key_table_constraint(&mut self) -> Result<Vec<String>, SqlSurfaceError> {
+        self.expect_contextual_keyword("PRIMARY")?;
+        self.expect_contextual_keyword("KEY")?;
+        self.expect_punct('(')?;
+        let mut cols: Vec<String> = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            crate::catalog::validate_identifier(&name).map_err(|e| {
+                SqlSurfaceError::unsupported(format!("invalid primary key column name: {e}"))
+            })?;
+            if cols.contains(&name) {
+                return Err(SqlSurfaceError::duplicate_column(name));
+            }
+            cols.push(name);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                if cols.len() >= MAX_PRIMARY_KEY_COLUMNS {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many columns in PRIMARY KEY",
+                    ));
+                }
+                continue;
+            }
+            break;
+        }
+        self.expect_punct(')')?;
+        if cols.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "PRIMARY KEY must declare at least one column",
+            ));
+        }
+        Ok(cols)
+    }
+
+    /// `CREATE TABLE` の列定義に続く列制約（`NOT NULL`／`DEFAULT <literal>`
+    /// 〔Issue #904〕・`UNIQUE`〔Issue #905〕。TABLE-16・TASK-204）を、順序自由・
+    /// 各々最大 1 回まで受理する。
+    /// それぞれの重複指定は `42601`。列型ごとの適用可否（`VECTOR` への
+    /// `DEFAULT` 禁止等）は呼び出し元（[`Parser::parse_create_table_column`]）が
+    /// 判定する。`DEFAULT NULL` は `expect_literal` が `NULL` トークンを
+    /// リテラルとして受理しないため、構造的に `42601` で拒否される
+    /// （TABLE-16: 明示 `NULL` は `DEFAULT` の対象外）。
+    fn parse_column_constraints(&mut self) -> Result<ColumnConstraints, SqlSurfaceError> {
+        let mut not_null = false;
+        let mut default: Option<InsertLiteral> = None;
+        let mut unique = false;
+        loop {
+            if self.peek_ident_matches("UNIQUE") {
+                self.advance();
+                if unique {
+                    return Err(SqlSurfaceError::unsupported("duplicate UNIQUE constraint"));
+                }
+                unique = true;
+                continue;
+            }
+            if self.peek_ident_matches("NOT") {
+                self.advance();
+                self.expect_contextual_keyword("NULL")?;
+                if not_null {
+                    return Err(SqlSurfaceError::unsupported(
+                        "duplicate NOT NULL constraint",
+                    ));
+                }
+                not_null = true;
+                continue;
+            }
+            if self.peek_ident_matches("DEFAULT") {
+                self.advance();
+                if default.is_some() {
+                    return Err(SqlSurfaceError::unsupported("duplicate DEFAULT constraint"));
+                }
+                default = Some(self.expect_literal()?);
+                continue;
+            }
+            break;
+        }
+        Ok(ColumnConstraints {
+            not_null,
+            default,
+            unique,
+        })
     }
 
     /// `DROP TABLE <table> [;]` の単一テーブル形のみを受理する（SQL-23、
@@ -2743,6 +3286,234 @@ impl<'a> Parser<'a> {
         self.expect_contextual_keyword("TABLE")?;
         self.expect_ident()
     }
+
+    /// 現在位置から末尾までの未消費トークン列（TABLE-18・SQL-23・TASK-205、
+    /// Issue #909）。`CREATE VIEW <name> AS <body>` の `<body>` 部分を
+    /// [`parse_view_body`] へ独立した文として渡すために使う。
+    fn remaining(&self) -> &'a [Token] {
+        match self.tokens.get(self.pos..) {
+            Some(rest) => rest,
+            None => &[],
+        }
+    }
+
+    /// `CREATE VIEW <name> AS <body> [;]`（TABLE-18・SQL-23・TASK-205、
+    /// Issue #909）。`CREATE OR REPLACE`・`IF NOT EXISTS`・`TEMP`／
+    /// `MATERIALIZED`・列別名リスト `v (a, b)` はいずれも構造的に受理しない。
+    fn parse_create_view(&mut self) -> Result<(String, ParsedViewBody), SqlSurfaceError> {
+        self.expect_ident_matching("CREATE")?;
+        self.expect_ident_matching("VIEW")?;
+        let name = self.expect_ident()?;
+        self.expect_ident_matching("AS")?;
+        let body = parse_view_body(self.remaining())?;
+        // `parse_view_body` が本文トークン列（`self.remaining()`）の終端まで
+        // 消費し尽くしたことを既に検証済みのため（`expect_end_of_statement`
+        // 呼び出し）、この Parser 側で追加のトークンを消費する必要はない。
+        Ok((name, body))
+    }
+
+    /// `DROP VIEW <name> [;]`（TABLE-18・SQL-23・TASK-205、Issue #909）。
+    /// `IF EXISTS`・`CASCADE`／`RESTRICT`・複数ビュー列挙は構造的に受理しない。
+    fn parse_drop_view(&mut self) -> Result<String, SqlSurfaceError> {
+        self.expect_ident_matching("DROP")?;
+        self.expect_ident_matching("VIEW")?;
+        self.expect_ident()
+    }
+}
+
+/// `CREATE VIEW ... AS` 本文の許可形状（TABLE-18・SQL-23・TASK-205、
+/// Issue #909）。`SELECT <* | 列名リスト> FROM <table | view> [WHERE
+/// <単純述語> [AND ...]]` のみを受理する（`LIMIT`・`ORDER BY`・`USING PLAN`・
+/// 集計・式項目〔`Projection::Items`〕・UDF 呼び出し述語
+/// 〔`WherePredicate::PredicateCall`／`Expression`〕はいずれも許可リスト外。
+/// §2.1「本リポの実装既定値」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedViewBody {
+    pub(crate) table_name: String,
+    pub(crate) projection: Projection,
+    pub(crate) where_predicates: Vec<WherePredicate>,
+}
+
+/// [`ParsedViewBody`] の構造検証本体。`CREATE VIEW` の本文パース
+/// （[`Parser::parse_create_view`]）と、格納済みビュー定義の再検証
+/// （`sql::view::resolve_from` が [`crate::catalog::ViewDef::body_sql`] を
+/// 再トークン化して渡す。第 2 の SQL パーサーを作らない設計）の双方が共有する
+/// 唯一の実装。
+pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_keyword(Keyword::Select)?;
+    let projection = p.parse_select_list()?;
+    if let Projection::Items(_) = projection {
+        return Err(SqlSurfaceError::unsupported(
+            "view body does not support expression projection items",
+        ));
+    }
+    p.expect_keyword(Keyword::From)?;
+    let table_name = p.expect_ident()?;
+    let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
+        p.advance();
+        p.parse_where()?
+    } else {
+        Vec::new()
+    };
+    for pred in &where_predicates {
+        match pred {
+            WherePredicate::Equality { .. }
+            | WherePredicate::Prefix { .. }
+            | WherePredicate::BoolEquality { .. }
+            | WherePredicate::BoolColumn { .. }
+            | WherePredicate::Compare { .. } => {}
+            WherePredicate::PredicateCall { .. } | WherePredicate::Expression(_) => {
+                return Err(SqlSurfaceError::unsupported(
+                    "view body WHERE predicate form is not supported",
+                ));
+            }
+        }
+    }
+    p.expect_end_of_statement()?;
+    Ok(ParsedViewBody {
+        table_name,
+        projection,
+        where_predicates,
+    })
+}
+
+/// [`ParsedViewBody`] を再パース可能な正規化 SQL テキストへ描画する
+/// （TABLE-18・SQL-23・TASK-205、Issue #909）。「描画 → 再トークン化 →
+/// [`parse_view_body`]」が元と等価な AST を復元することを
+/// `sql::view` の round-trip テストで固定する（[`crate::catalog::Storage::
+/// create_view`] が保存する `body_sql` はこの関数の出力のみ）。文字列
+/// リテラルは `'` を `''` へ二重化してエスケープする（[`crate::sql::lexer`]
+/// の読み取り側〔`''` → `'`〕と対称）。
+pub(crate) fn render_view_body(body: &ParsedViewBody) -> String {
+    let mut out = String::from("SELECT ");
+    match &body.projection {
+        Projection::All => out.push('*'),
+        Projection::Columns(cols) => out.push_str(&cols.join(", ")),
+        // `parse_view_body` が構造的に拒否するため到達しない。
+        Projection::Items(_) => out.push('*'),
+    }
+    out.push_str(" FROM ");
+    out.push_str(&body.table_name);
+    if !body.where_predicates.is_empty() {
+        out.push_str(" WHERE ");
+        let rendered: Vec<String> = body
+            .where_predicates
+            .iter()
+            .map(render_where_predicate)
+            .collect();
+        out.push_str(&rendered.join(" AND "));
+    }
+    out
+}
+
+/// 文字列リテラルを `'` の二重化でエスケープする（[`render_view_body`] 参照）。
+fn escape_string_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// [`WherePredicate`] のうち [`parse_view_body`] が受理する形状のみを描画する
+/// （`PredicateCall`／`Expression` は到達しない）。
+fn render_where_predicate(pred: &WherePredicate) -> String {
+    match pred {
+        WherePredicate::Equality { column, value } => {
+            format!("{column} = '{}'", escape_string_literal(value))
+        }
+        // `pattern` は末尾の `%` を含む文字列リテラルの生値をそのまま保持する
+        // （`Parser::parse_where` の LIKE 分岐参照。呼び出し元が既に `%` 込みで
+        // 検証済みのため、ここで追加の `%` を付与しない）。
+        WherePredicate::Prefix { column, pattern } => {
+            format!("{column} LIKE '{}'", escape_string_literal(pattern))
+        }
+        WherePredicate::BoolEquality { column, value } => {
+            format!("{column} = {}", if *value { "true" } else { "false" })
+        }
+        WherePredicate::BoolColumn { column } => column.clone(),
+        WherePredicate::Compare { column, op, value } => {
+            let op_str = match op {
+                CompareOp::Lt => "<",
+                CompareOp::Le => "<=",
+                CompareOp::Gt => ">",
+                CompareOp::Ge => ">=",
+            };
+            format!("{column} {op_str} '{}'", escape_string_literal(value))
+        }
+        // `parse_view_body` が構造的に拒否するため到達しない
+        // （`render_view_body` は常に [`parse_view_body`] の出力のみを描画する）。
+        WherePredicate::PredicateCall { name } => format!("{name}()"),
+        WherePredicate::Expression(_) => String::new(),
+    }
+}
+
+/// `CREATE VIEW <name> AS <body>` の許可形状構造検証結果（TABLE-18・SQL-23・
+/// TASK-205、Issue #909）。カタログ照会は一切行わない（構文検証段はカタログを
+/// 照会しない契約。DDL 実行権限ゲート・参照先の存在確認・ネスト深さ判定は
+/// いずれも `crate::sql::ddl::execute_create_view` が担う）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCreateView {
+    pub(crate) name: String,
+    /// `body` の直接の参照先（テーブルまたは別のビュー。連鎖の畳み込みは
+    /// 参照時の [`crate::sql::view::resolve_from`] が担う）。
+    pub(crate) base_relation: String,
+    /// [`render_view_body`] で描画した正規化 SQL（永続化される値そのもの）。
+    pub(crate) body_sql: String,
+}
+
+impl ValidatedCreateView {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn base_relation(&self) -> &str {
+        &self.base_relation
+    }
+
+    pub fn body_sql(&self) -> &str {
+        &self.body_sql
+    }
+}
+
+/// `DROP VIEW <name>` の許可形状構造検証結果（TABLE-18・SQL-23・TASK-205、
+/// Issue #909）。[`ValidatedDropTable`] と同じくカタログ照会を一切行わない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDropView {
+    pub(crate) name: String,
+}
+
+impl ValidatedDropView {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// [`ValidatedCreateView`] の構造検証本体（[`sql::ddl::execute_create_view`]
+/// から呼ばれる。TABLE-18・SQL-23・TASK-205、Issue #909）。
+pub(crate) fn validate_create_view_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedCreateView, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let (name, body) = p.parse_create_view()?;
+    let body_sql = render_view_body(&body);
+    if body_sql.len() > crate::catalog::MAX_VIEW_BODY_BYTES {
+        return Err(SqlSurfaceError::payload_too_large(
+            "view body exceeds the allowed size",
+        ));
+    }
+    Ok(ValidatedCreateView {
+        name,
+        base_relation: body.table_name,
+        body_sql,
+    })
+}
+
+/// [`ValidatedDropView`] の構造検証本体。
+pub(crate) fn validate_drop_view_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedDropView, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let name = p.parse_drop_view()?;
+    p.expect_end_of_statement()?;
+    Ok(ValidatedDropView { name })
 }
 
 /// 構文木（[`ValidatedTruncate`] の元）。カタログ存在確認前の中間結果
@@ -2750,6 +3521,14 @@ impl<'a> Parser<'a> {
 struct ParsedTruncateShape {
     table_name: String,
     operation_id: Option<OperationId>,
+}
+
+/// 構文木（[`ValidatedAlterTableAddColumn`] の元）。カタログ存在確認前の
+/// 中間結果（TASK-202・SQL-23。Issue #900）。
+struct ParsedAlterTableAddColumnShape {
+    table_name: String,
+    column_name: String,
+    column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
 }
 
 /// 構文木（[`ValidatedStatement`] の元）。カタログ存在確認前の中間結果。
@@ -3144,18 +3923,44 @@ pub(crate) fn validate_sql_tokens(
                 }))
             }
             // Issue #454: `ORDER BY`・`USING PLAN` のいずれも伴わない
-            // `SELECT ... [WHERE ...] LIMIT n`（広域取得）。
+            // `SELECT ... [WHERE ...] LIMIT n`（広域取得）。TABLE-18・SQL-23・
+            // TASK-205（Issue #909）: FROM がビュー（`CREATE VIEW`）を指す場合、
+            // `sql::view::resolve_from` が連鎖を畳み込んで基底テーブル名＋
+            // 合成済み `WHERE` 述語へ書き換える。書き換え後は通常のテーブル
+            // 参照と完全に同じ `ValidatedScan` になり、束縛・実行・RLS 適用は
+            // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
             ParsedSelect::Scan(shape) => {
-                let exists = lookup.table_exists(&shape.table_name)?;
-                if !exists {
-                    return Err(SqlSurfaceError::undefined_table(shape.table_name));
+                match super::view::resolve_from(lookup, &shape.table_name)? {
+                    super::view::Resolved::Table => Ok(Statement::Scan(ValidatedScan {
+                        table_name: shape.table_name,
+                        projection: shape.projection,
+                        where_predicates: shape.where_predicates,
+                        limit: shape.limit,
+                    })),
+                    super::view::Resolved::View {
+                        base_table,
+                        view_predicates,
+                        view_columns,
+                    } => {
+                        super::view::check_columns_within_view(
+                            view_columns.as_deref(),
+                            &shape.projection,
+                            &shape.where_predicates,
+                        )?;
+                        let projection = match (&shape.projection, &view_columns) {
+                            (Projection::All, Some(cols)) => Projection::Columns(cols.clone()),
+                            (other, _) => other.clone(),
+                        };
+                        let mut where_predicates = view_predicates;
+                        where_predicates.extend(shape.where_predicates);
+                        Ok(Statement::Scan(ValidatedScan {
+                            table_name: base_table,
+                            projection,
+                            where_predicates,
+                            limit: shape.limit,
+                        }))
+                    }
                 }
-                Ok(Statement::Scan(ValidatedScan {
-                    table_name: shape.table_name,
-                    projection: shape.projection,
-                    where_predicates: shape.where_predicates,
-                    limit: shape.limit,
-                }))
             }
         },
         _ if is_set_statement => {
@@ -3580,6 +4385,37 @@ pub(crate) fn validate_truncate_tokens(
     Ok(ValidatedTruncate {
         table_name: shape.table_name,
         operation_id: shape.operation_id,
+    })
+}
+
+/// `ALTER TABLE ADD COLUMN` 文をトークン化し、許可リスト形式で構造検証する
+/// （TASK-202・SQL-23。Issue #900 の公開 API）。`validate_truncate` とは異なり
+/// **カタログ照会（`TableLookup::table_exists`）を一切行わない**——DDL 権限
+/// ゲート（`sql::ddl::require_ddl_permission`）より先にテーブルの存在有無を
+/// 返すと、権限の無い主体に対する存在オラクルになるため（`ValidatedAlterTableAddColumn`
+/// のドキュメント参照）。テーブル・列の存在確認、型名解決（ENUM 型名の存在確認・
+/// `VECTOR` 列の `0A000` 拒否を含む）は権限ゲート通過後の実行段
+/// （`sql::ddl::execute_alter_table_add_column`）が担う。
+pub fn validate_alter_table(sql: &str) -> Result<ValidatedAlterTableAddColumn, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_alter_table_tokens(&tokens)
+}
+
+/// [`validate_alter_table`] の本体。トークン列を受け取ることで、呼び出し元
+/// （`core.rs::EngineCore::parse_tokens`）が既に先頭トークン判定のために
+/// `tokenize` 済みの場合、同一 SQL 文字列の再トークナイズを避けられる
+/// （`validate_truncate_tokens` と同じ設計）。
+pub(crate) fn validate_alter_table_tokens(
+    tokens: &[lexer::Token],
+) -> Result<ValidatedAlterTableAddColumn, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let shape = p.parse_alter_table_add_column()?;
+    p.expect_end_of_statement()?;
+
+    Ok(ValidatedAlterTableAddColumn {
+        table_name: shape.table_name,
+        column_name: shape.column_name,
+        column_type: shape.column_type,
     })
 }
 
@@ -7663,6 +8499,162 @@ mod tests {
         match result {
             Err(SqlSurfaceError::PayloadTooLarge { .. }) => {}
             other => panic!("expected PayloadTooLarge, got: {other:?}"),
+        }
+    }
+
+    /// Cursor Bugbot 指摘（PR #1050）に対する回帰テスト: ちょうど上限数の
+    /// 列を宣言したテーブルへ末尾で表制約 `PRIMARY KEY (...)` を付けても、
+    /// 表制約は `columns` を消費しないため受理される（先頭・中間に置いた
+    /// 場合と対称な挙動になることを固定する）。
+    #[test]
+    fn create_table_accepts_trailing_primary_key_constraint_at_max_columns() {
+        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS)
+            .map(|i| format!("c{i} TEXT"))
+            .collect();
+        let sql = format!("CREATE TABLE t ({}, PRIMARY KEY (c0))", cols.join(", "));
+        let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+        let result = validate_create_table_tokens(&tokens);
+        match &result {
+            Ok(v) => {
+                assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
+                assert_eq!(v.primary_key, Some(vec!["c0".to_string()]));
+            }
+            Err(e) => panic!(
+                "expected ok for exactly {MAX_CREATE_TABLE_COLUMNS} columns with trailing PRIMARY KEY, got err: {e:?}"
+            ),
+        }
+    }
+
+    /// `c0..cN` の `N` 列ぶんの `TEXT` 列定義を返す（列数上限テスト用）。
+    fn text_columns(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|i| format!("c{i} TEXT")).collect()
+    }
+
+    /// ちょうど上限数の列に表制約 `UNIQUE (...)` を先頭・中間・末尾のいずれに
+    /// 置いても受理される（表制約は列を追加しないため列数判定の対象外。
+    /// TABLE-16・TASK-204、Issue #905）。
+    #[test]
+    fn create_table_accepts_max_columns_with_unique_table_constraint_anywhere() {
+        let head = text_columns(0..MAX_CREATE_TABLE_COLUMNS / 2).join(", ");
+        let tail = text_columns(MAX_CREATE_TABLE_COLUMNS / 2..MAX_CREATE_TABLE_COLUMNS).join(", ");
+        for sql in [
+            format!("CREATE TABLE t (UNIQUE (c0), {head}, {tail})"),
+            format!("CREATE TABLE t ({head}, UNIQUE (c0, c1), {tail})"),
+            format!("CREATE TABLE t ({head}, {tail}, UNIQUE (c0))"),
+            format!("CREATE TABLE t ({head}, {tail}, UNIQUE (c0), PRIMARY KEY (c1))"),
+        ] {
+            let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+            let v = validate_create_table_tokens(&tokens)
+                .unwrap_or_else(|e| panic!("expected ok for max columns + UNIQUE, got: {e:?}"));
+            assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
+            assert!(!v.unique_constraints.is_empty());
+        }
+    }
+
+    /// 上限を 1 列超える列定義は、表制約 `UNIQUE (...)`／`PRIMARY KEY (...)` の
+    /// 前・間・後ろのどこに超過列があっても `54000` で拒否される（Issue #905
+    /// レビュー指摘の回帰: 表制約の直後に続く最後の超過列が、カンマ直後の
+    /// 先読みに依存した旧判定をすり抜けて 257 列を受理していた）。
+    #[test]
+    fn create_table_rejects_excess_column_regardless_of_unique_constraint_position() {
+        let max = MAX_CREATE_TABLE_COLUMNS;
+        let all = text_columns(0..max).join(", ");
+        let head = text_columns(0..max / 2).join(", ");
+        let tail = text_columns(max / 2..max).join(", ");
+        let extra = format!("c{max} TEXT");
+        for sql in [
+            // 超過列が UNIQUE の前。
+            format!("CREATE TABLE t ({all}, {extra}, UNIQUE (c0))"),
+            // 超過列が UNIQUE の後ろ（かつ最後の列）。レビュー指摘の再現形。
+            format!("CREATE TABLE t ({all}, UNIQUE (c0), {extra})"),
+            // 超過列が 2 つの表制約の間。
+            format!("CREATE TABLE t ({all}, UNIQUE (c0), {extra}, UNIQUE (c1))"),
+            // 表制約が列の途中にあり、超過列が末尾。
+            format!("CREATE TABLE t ({head}, UNIQUE (c0), {tail}, {extra})"),
+            // 主キー表制約の直後に続く最後の超過列（同じ判定を共有する）。
+            format!("CREATE TABLE t ({all}, PRIMARY KEY (c0), {extra})"),
+        ] {
+            let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+            match validate_create_table_tokens(&tokens) {
+                Err(SqlSurfaceError::PayloadTooLarge { .. }) => {}
+                other => panic!("expected PayloadTooLarge, got: {other:?}"),
+            }
+        }
+    }
+
+    /// 列制約・表制約の `UNIQUE` 構文の受理形と拒否形（TABLE-16・TASK-204、
+    /// Issue #905）。
+    #[test]
+    fn create_table_unique_syntax_accept_and_reject_forms() {
+        let ok = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_table_tokens(&tokens)
+                .unwrap_or_else(|e| panic!("expected {sql:?} to be accepted, got: {e:?}"))
+        };
+        let v =
+            ok("CREATE TABLE t (a TEXT UNIQUE, b TEXT NOT NULL UNIQUE DEFAULT 'x', UNIQUE (a, b))");
+        let lists: Vec<Vec<String>> = v
+            .unique_constraints
+            .iter()
+            .map(|u| u.columns().to_vec())
+            .collect();
+        assert_eq!(
+            lists,
+            vec![
+                vec!["a".to_string()],
+                vec!["b".to_string()],
+                vec!["a".to_string(), "b".to_string()],
+            ]
+        );
+        // 列名 `unique` は列定義として解釈される（表制約とは `(` の有無で区別）。
+        let v = ok("CREATE TABLE t (unique TEXT)");
+        assert!(v.unique_constraints.is_empty());
+
+        for (sql, code) in [
+            ("CREATE TABLE t (a TEXT, UNIQUE (z))", "42601"),
+            ("CREATE TABLE t (a TEXT, UNIQUE (id))", "42601"),
+            ("CREATE TABLE t (e VECTOR(4) UNIQUE)", "42601"),
+            ("CREATE TABLE t (e VECTOR(4), UNIQUE (e))", "42601"),
+            ("CREATE TABLE t (a TEXT UNIQUE UNIQUE)", "42601"),
+            ("CREATE TABLE t (a TEXT, UNIQUE ())", "42601"),
+            ("CREATE TABLE t (a TEXT, UNIQUE (a, a))", "42701"),
+        ] {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            let err = validate_create_table_tokens(&tokens)
+                .expect_err("expected UNIQUE form to be rejected");
+            assert_eq!(
+                crate::error_format::ClassifiedError::wire_code(&err),
+                code,
+                "{sql:?}: {err:?}"
+            );
+        }
+    }
+
+    /// 制約数・制約あたり列数の上限超過は `Vec` へ積む前に `54000` で拒否される。
+    #[test]
+    fn create_table_rejects_unique_limits_exceeded() {
+        let cols = text_columns(0..crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS + 1);
+        let names: Vec<String> = (0..=crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS)
+            .map(|i| format!("c{i}"))
+            .collect();
+        let too_wide = format!(
+            "CREATE TABLE t ({}, UNIQUE ({}))",
+            cols.join(", "),
+            names.join(", ")
+        );
+        let too_many = format!(
+            "CREATE TABLE t (a TEXT, {})",
+            (0..=crate::catalog::MAX_UNIQUE_CONSTRAINTS)
+                .map(|_| "UNIQUE (a)")
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for sql in [too_wide, too_many] {
+            let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+            match validate_create_table_tokens(&tokens) {
+                Err(SqlSurfaceError::PayloadTooLarge { .. }) => {}
+                other => panic!("expected PayloadTooLarge, got: {other:?}"),
+            }
         }
     }
 }

@@ -1,0 +1,735 @@
+//! `ALTER TABLE <table> ADD COLUMN <column> <type>`（TASK-202、対象ビヘイビア:
+//! SQL-23）の結合テスト。ポインタ: `docs/spec/05-tasks.md` TASK-202・
+//! `docs/spec/04-behavior/sql-surface.md` SQL-23・TABLE-5（O(1) 列追加・
+//! 既存行のバイト列不変）。関連ポインタ: RLS-7（暗黙のテナント境界適用）・
+//! RLS-9（他テナント存在情報の非漏えい）・ERR-2/ERR-4/ERR-6。
+//!
+//! `EngineCore::execute_sql_in_session`（先頭トークン `ALTER` の覗き見判定 →
+//! `sql::allowlist::validate_alter_table_tokens` → `sql::ddl::
+//! require_ddl_permission` → `sql::ddl::execute_alter_table_add_column`）を
+//! production 経路として検証する（`truncate_table.rs`・`sql_update_single_row.rs`
+//! と同じ流儀。実 `Storage` ＋ `CpuScalarProvider`、`unique_db_path`／
+//! `CleanupGuard`）。
+//!
+//! `EngineCore::from_storage` は `Storage` の所有権を奪うため（テスト用の
+//! アクセサは存在しない）、列追加の成否は `catalog::Storage::get_table_schema`
+//! による直接検査ではなく、SQL 経由の観測可能な効果（列参照の成否・値の
+//! 往復・「未知の列」エラー〔`22000`〕の有無）で検証する。
+
+use engine::catalog::{ColumnDef, ColumnType};
+use engine::core::EngineCore;
+use engine::kernel::CpuScalarProvider;
+use engine::policy::PolicyContext;
+use engine::recovery::required_op_id::OperationId;
+use engine::sql::allowlist::SqlSurfaceError;
+use engine::sql::exec::Cell;
+use engine::sql::mode::SessionState;
+use engine::sql::SqlOutcome;
+use engine::storage::{RowInput, Storage, Visibility};
+
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
+
+const TABLE: &str = "docs";
+
+fn schema(name: &str) -> engine::catalog::TableSchema {
+    engine::catalog::TableSchema::new(
+        name,
+        vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+    )
+}
+
+fn new_core_with_table() -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path("sql-ddl-add-column");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create table");
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        path,
+    )
+}
+
+/// `create_enum_type` は `Storage::open` 直後（`EngineCore::from_storage` へ
+/// 所有権を渡す前）にしか呼べない（モジュールドキュメント参照）。
+fn new_core_with_table_and_enum(
+    type_name: &str,
+    labels: Vec<String>,
+) -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path("sql-ddl-add-column-enum");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create table");
+    storage
+        .create_enum_type(type_name, labels)
+        .expect("create_enum_type");
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        path,
+    )
+}
+
+fn ctx(tenant: &str) -> PolicyContext {
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+fn op_id(label: &str) -> OperationId {
+    OperationId::parse(label).expect("valid operation id")
+}
+
+fn insert_row(core: &EngineCore, ctx: &PolicyContext, id: u64, seq: u64) {
+    core.insert_row(
+        ctx,
+        TABLE,
+        id,
+        &RowInput {
+            tenant_id: ctx.tenant_id(),
+            visibility: Visibility::Public,
+            embedding: &[0.1f32, 0.2f32],
+            metadata: &[],
+        },
+        Some(&op_id(&format!("seed-{id}-{seq}"))),
+    )
+    .expect("insert row");
+}
+
+/// DDL 権限を持つセッション（`sql::ddl::require_ddl_permission` が `Ok` を返す
+/// 唯一の作り方。`CREATE TABLE`／`DROP TABLE` と共有する wire-server の
+/// `--ddl-allowed-users` 相当〔認証成功後の `SessionState::allow_ddl`〕を engine
+/// 層 API から直接シミュレートする）。
+fn ddl_session() -> SessionState {
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    session
+}
+
+fn alter_table(
+    core: &EngineCore,
+    session: &mut SessionState,
+    sql: &str,
+) -> Result<SqlOutcome, SqlSurfaceError> {
+    core.execute_sql_in_session(&ctx("owner"), session, sql)
+}
+
+fn count_star(core: &EngineCore, ctx: &PolicyContext, table: &str) -> u64 {
+    let result = core
+        .execute_sql(ctx, &format!("SELECT COUNT(*) FROM {table}"))
+        .expect("count(*) should succeed");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0].cells[0] {
+        Cell::Integer(v) => *v,
+        other => panic!("expected Cell::Integer, got {other:?}"),
+    }
+}
+
+/// `column` が現在のスキーマに存在するかを、SQL 経由の「未知の列」エラー
+/// （`22000`）の有無で判定する（直接のスキーマ検査 API はテストから使えない
+/// ため。モジュールドキュメント参照）。
+fn column_exists(core: &EngineCore, ctx: &PolicyContext, table: &str, column: &str) -> bool {
+    match core.execute_sql(ctx, &format!("SELECT {column} FROM {table} LIMIT 1")) {
+        Ok(_) => true,
+        Err(e) if e.wire_code() == "22000" => false,
+        Err(e) => panic!("unexpected error while probing column {column:?}: {e}"),
+    }
+}
+
+// --- 成功系: 各スカラー型 ------------------------------------------------
+
+#[test]
+fn accepts_all_scalar_types_and_columns_become_queryable() {
+    for (i, (name, sql_type)) in [
+        ("c_text", "TEXT"),
+        ("c_int", "INTEGER"),
+        ("c_bigint", "BIGINT"),
+        ("c_real", "REAL"),
+        ("c_double", "DOUBLE PRECISION"),
+        ("c_bool", "BOOLEAN"),
+        ("c_date", "DATE"),
+        ("c_ts", "TIMESTAMP"),
+        ("c_bytea", "BYTEA"),
+        ("c_json", "JSON"),
+        ("c_jsonb", "JSONB"),
+        ("c_uuid", "UUID"),
+        ("c_numeric", "NUMERIC(5,2)"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (core, path) = new_core_with_table();
+        let _guard = CleanupGuard(path);
+        let owner = ctx("owner");
+        assert!(
+            !column_exists(&core, &owner, TABLE, name),
+            "case {i}: column {name} must not exist before ALTER TABLE"
+        );
+
+        let mut session = ddl_session();
+        let outcome = alter_table(
+            &core,
+            &mut session,
+            &format!("ALTER TABLE {TABLE} ADD COLUMN {name} {sql_type}"),
+        )
+        .unwrap_or_else(|e| panic!("case {i} ({sql_type}) rejected: {e}"));
+        assert!(matches!(outcome, SqlOutcome::AlterTable(_)));
+
+        assert!(
+            column_exists(&core, &owner, TABLE, name),
+            "case {i}: column {name} must exist after ALTER TABLE"
+        );
+    }
+}
+
+#[test]
+fn accepts_enum_column_registered_before_alter() {
+    let (core, path) =
+        new_core_with_table_and_enum("mood", vec!["happy".to_string(), "sad".to_string()]);
+    let _guard = CleanupGuard(path);
+
+    let mut session = ddl_session();
+    let outcome = alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN feeling mood"),
+    )
+    .expect("ALTER TABLE with ENUM type should succeed");
+    assert!(matches!(outcome, SqlOutcome::AlterTable(_)));
+    assert!(column_exists(&core, &ctx("owner"), TABLE, "feeling"));
+}
+
+// --- 既存行が NULL として読める -----------------------------------------
+
+#[test]
+fn existing_rows_read_added_column_as_null_across_read_paths() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+
+    let mut session = ddl_session();
+    alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT"),
+    )
+    .expect("ALTER TABLE should succeed");
+
+    // SELECT（KNN 経路）: 追加列は NULL のまま。
+    let result = core
+        .execute_sql(
+            &owner,
+            &format!("SELECT note FROM {TABLE} ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"),
+        )
+        .expect("select should succeed");
+    assert_eq!(result.rows.len(), 1);
+    assert!(matches!(result.rows[0].cells[0], Cell::Null));
+
+    // WHERE note = '...' は 0 件。
+    let result = core
+        .execute_sql(
+            &owner,
+            &format!("SELECT id FROM {TABLE} WHERE note = 'x' LIMIT 10"),
+        )
+        .expect("select where should succeed");
+    assert_eq!(result.rows.len(), 0);
+
+    // COUNT(note) は NULL を数えないため 0。
+    let result = core
+        .execute_sql(&owner, &format!("SELECT COUNT(note) FROM {TABLE}"))
+        .expect("count(note) should succeed");
+    match &result.rows[0].cells[0] {
+        Cell::Integer(v) => assert_eq!(*v, 0),
+        other => panic!("expected Cell::Integer, got {other:?}"),
+    }
+}
+
+#[test]
+fn newly_inserted_rows_can_populate_the_added_column_alongside_existing_rows() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+
+    let mut session = ddl_session();
+    alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT"),
+    )
+    .expect("ALTER TABLE should succeed");
+
+    core.execute_sql_in_session(
+        &owner,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, note) VALUES (2, '[0.3,0.4]', 'hello') USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("insert with new column should succeed");
+
+    assert_eq!(count_star(&core, &owner, TABLE), 2);
+    let result = core
+        .execute_sql(
+            &owner,
+            &format!("SELECT id FROM {TABLE} WHERE note = 'hello' LIMIT 10"),
+        )
+        .expect("select where should succeed");
+    assert_eq!(result.rows.len(), 1);
+}
+
+// --- 世代進行・キャッシュ失効 --------------------------------------------
+
+#[test]
+fn added_column_is_visible_after_cache_was_warmed_by_prior_queries() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+
+    // クエリを 2 回実行してアリーナ／可視ビットマップキャッシュ等を温める。
+    for _ in 0..2 {
+        core.execute_sql(
+            &owner,
+            &format!("SELECT id FROM {TABLE} ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"),
+        )
+        .expect("warm-up select");
+        count_star(&core, &owner, TABLE);
+    }
+
+    let mut session = ddl_session();
+    alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT"),
+    )
+    .expect("ALTER TABLE should succeed");
+
+    // 同じクエリを再実行しても新しい列が見える（古いスキーマへ固着していない）。
+    let result = core
+        .execute_sql(
+            &owner,
+            &format!("SELECT note FROM {TABLE} ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"),
+        )
+        .expect("select after ALTER should succeed");
+    assert_eq!(result.rows.len(), 1);
+    assert!(matches!(result.rows[0].cells[0], Cell::Null));
+}
+
+// --- 権限 ------------------------------------------------------------------
+
+#[test]
+fn default_session_without_ddl_privilege_is_rejected_with_42501() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = SessionState::default();
+    let err = alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT"),
+    )
+    .expect_err("must be rejected without DDL privilege");
+    assert_eq!(err.wire_code(), "42501");
+    assert!(matches!(err, SqlSurfaceError::InsufficientPrivilege));
+}
+
+/// 権限ゲートはカタログ照会（テーブル・列の存在確認）より必ず先に判定する
+/// ——権限の無い主体へ「テーブルが存在しない」「列が重複している」等の
+/// 存在情報を一切返さない（security.md P0）。
+#[test]
+fn permission_denial_precedes_any_catalog_lookup() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = SessionState::default();
+
+    for sql in [
+        "ALTER TABLE nonexistent_table ADD COLUMN note TEXT".to_string(),
+        format!("ALTER TABLE {TABLE} ADD COLUMN embedding TEXT"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN v VECTOR(4)"),
+    ] {
+        let err = alter_table(&core, &mut session, &sql)
+            .expect_err("must be rejected without DDL privilege regardless of target validity");
+        assert_eq!(
+            err.wire_code(),
+            "42501",
+            "expected permission denial to take precedence for {sql:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn permission_denial_leaves_target_column_unadded() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = SessionState::default();
+    let owner = ctx("owner");
+
+    let _ = alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT"),
+    );
+
+    assert!(
+        !column_exists(&core, &owner, TABLE, "note"),
+        "rejected ALTER TABLE must not add the column"
+    );
+}
+
+// --- エラー契約 --------------------------------------------------------
+
+#[test]
+fn undefined_table_is_rejected_with_42p01() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    let err = alter_table(
+        &core,
+        &mut session,
+        "ALTER TABLE nonexistent_table ADD COLUMN note TEXT",
+    )
+    .expect_err("must reject undefined table");
+    assert_eq!(err.wire_code(), "42P01");
+}
+
+#[test]
+fn duplicate_column_is_rejected_with_42701() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    let err = alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN embedding TEXT"),
+    )
+    .expect_err("must reject duplicate column name");
+    assert_eq!(err.wire_code(), "42701");
+}
+
+#[test]
+fn column_count_limit_is_rejected_with_54000_and_has_no_side_effect() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    let owner = ctx("owner");
+
+    // 既存 1 列（embedding）に 255 列を足して上限（256）ちょうどにする。
+    for i in 0..255 {
+        alter_table(
+            &core,
+            &mut session,
+            &format!("ALTER TABLE {TABLE} ADD COLUMN c{i} TEXT"),
+        )
+        .unwrap_or_else(|e| panic!("column {i} unexpectedly rejected: {e}"));
+    }
+
+    let err = alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN one_too_many TEXT"),
+    )
+    .expect_err("257th column must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+
+    assert!(
+        !column_exists(&core, &owner, TABLE, "one_too_many"),
+        "rejected ALTER TABLE must not add the column"
+    );
+}
+
+#[test]
+fn vector_column_is_rejected_with_0a000() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    let err = alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN v VECTOR(4)"),
+    )
+    .expect_err("VECTOR column must be rejected");
+    assert_eq!(err.wire_code(), "0A000");
+}
+
+#[test]
+fn malformed_syntax_variants_are_rejected_with_42601() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+
+    for sql in [
+        format!("ALTER TABLE {TABLE} ADD note TEXT"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS note TEXT"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT, ADD COLUMN note2 TEXT"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT NOT NULL"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT DEFAULT 'x'"),
+        format!("ALTER TABLE {TABLE} DROP COLUMN embedding"),
+        format!("ALTER TABLE {TABLE} ALTER COLUMN embedding TYPE TEXT"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT USING OPERATION_ID 'op-1'"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT RETURNING id"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note NUMERIC(0,0)"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note NUMERIC(39,0)"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note NUMERIC(5,6)"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note DOUBLE"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note VECTOR()"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT; SELECT 1"),
+    ] {
+        let err = alter_table(&core, &mut session, &sql)
+            .expect_err(&format!("expected {sql:?} to be rejected"));
+        assert_eq!(
+            err.wire_code(),
+            "42601",
+            "unexpected wire_code for {sql:?}: {err:?}"
+        );
+    }
+}
+
+/// 予約列名（`id`／`tenant_id`／`visibility`。大文字小文字を問わない）は
+/// `CREATE TABLE` と同じく構造検証段階で `42601` 拒否する（疑似列・RLS 内部列を
+/// 隠蔽する列を DDL で作らせない。fail-closed）。
+#[test]
+fn reserved_column_names_are_rejected_with_42601() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+
+    for name in [
+        "id",
+        "tenant_id",
+        "visibility",
+        "ID",
+        "Tenant_Id",
+        "VISIBILITY",
+    ] {
+        let sql = format!("ALTER TABLE {TABLE} ADD COLUMN {name} TEXT");
+        let err = alter_table(&core, &mut session, &sql)
+            .expect_err(&format!("expected {sql:?} to be rejected"));
+        assert_eq!(
+            err.wire_code(),
+            "42601",
+            "unexpected wire_code for {sql:?}: {err:?}"
+        );
+    }
+    // 予約列名の拒否は後続の正当な列追加を妨げない（セッション状態を汚さない）。
+    assert!(matches!(
+        alter_table(
+            &core,
+            &mut session,
+            &format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT")
+        ),
+        Ok(SqlOutcome::AlterTable(_))
+    ));
+}
+
+/// 対象テーブルの存在確認は型名解決より先に行う（PR #1052 codex P1 指摘の
+/// 回帰テスト）。存在しないテーブルへの要求は、型名が未登録 ENUM・`VECTOR`・
+/// 構文上は妥当なスカラー型のいずれであっても一律 `42P01` になる。
+#[test]
+fn undefined_table_takes_precedence_over_type_name_resolution() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+
+    for sql in [
+        "ALTER TABLE nonexistent_table ADD COLUMN feeling unregistered_mood",
+        "ALTER TABLE nonexistent_table ADD COLUMN v VECTOR(4)",
+        "ALTER TABLE nonexistent_table ADD COLUMN note NUMERIC(39,0)",
+        "ALTER TABLE nonexistent_table ADD COLUMN note TEXT",
+    ] {
+        let err = alter_table(&core, &mut session, sql)
+            .expect_err(&format!("expected {sql:?} to be rejected"));
+        assert_eq!(
+            err.wire_code(),
+            "42P01",
+            "unexpected wire_code for {sql:?}: {err:?}"
+        );
+    }
+}
+
+/// 対象がビュー（Issue #909）の場合は `CREATE VIEW` の書き込み系方針と同じく
+/// `42809`（型名の正誤・`VECTOR` 指定に関わらず）。ビューもベーステーブルも
+/// 変更されない。
+#[test]
+fn alter_table_on_a_view_is_rejected_with_42809() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    core.execute_sql_in_session(
+        &ctx("owner"),
+        &mut session,
+        &format!("CREATE VIEW v_docs AS SELECT * FROM {TABLE}"),
+    )
+    .expect("create view");
+
+    for sql in [
+        "ALTER TABLE v_docs ADD COLUMN note TEXT",
+        "ALTER TABLE v_docs ADD COLUMN feeling unregistered_mood",
+        "ALTER TABLE v_docs ADD COLUMN v VECTOR(4)",
+    ] {
+        let err = alter_table(&core, &mut session, sql)
+            .expect_err(&format!("expected {sql:?} to be rejected"));
+        assert_eq!(
+            err.wire_code(),
+            "42809",
+            "unexpected wire_code for {sql:?}: {err:?}"
+        );
+    }
+    assert!(
+        !column_exists(&core, &ctx("owner"), TABLE, "note"),
+        "ALTER TABLE on a view must not alter its base table"
+    );
+}
+
+/// DDL 権限の無いセッションでは、ビュー名を指定しても `42501` のみ（ビューの
+/// 存在も権限ゲートより前には観測できない）。
+#[test]
+fn permission_denial_precedes_view_detection() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut admin = ddl_session();
+    core.execute_sql_in_session(
+        &ctx("owner"),
+        &mut admin,
+        &format!("CREATE VIEW v_docs AS SELECT * FROM {TABLE}"),
+    )
+    .expect("create view");
+
+    let mut session = SessionState::default();
+    let err = alter_table(
+        &core,
+        &mut session,
+        "ALTER TABLE v_docs ADD COLUMN note TEXT",
+    )
+    .expect_err("unprivileged ALTER TABLE must be rejected");
+    assert_eq!(err.wire_code(), "42501");
+}
+
+#[test]
+fn unregistered_enum_type_name_is_rejected_with_42601() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    let err = alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN feeling unregistered_mood"),
+    )
+    .expect_err("unregistered ENUM type name must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+// --- EXPLAIN との相互排他 -------------------------------------------------
+
+#[test]
+fn explain_prefix_before_alter_table_is_rejected_with_42601() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    let err = alter_table(
+        &core,
+        &mut session,
+        &format!("EXPLAIN ALTER TABLE {TABLE} ADD COLUMN note TEXT"),
+    )
+    .expect_err("EXPLAIN + ALTER TABLE must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+// --- extended query: $n パラメータは構造上どこにも許可されない -------------
+
+#[test]
+fn dollar_parameter_anywhere_in_alter_table_is_rejected_at_parse() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let err = core
+        .parse_sql_prepared(&format!("ALTER TABLE {TABLE} ADD COLUMN note $1"))
+        .expect_err("$n in ALTER TABLE must be rejected at Parse");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+// --- 明示トランザクション内の DDL（SQL-31・TASK-221 の既存方針を継承） -----
+
+/// 明示トランザクション内の `ALTER TABLE ADD COLUMN` は、`CREATE TABLE`／
+/// `DROP TABLE` と同じく DDL 権限の有無に関わらず `0A000` で拒否され、
+/// トランザクションは `Failed` へ遷移し、列は追加されない。
+#[test]
+fn alter_table_inside_explicit_transaction_is_rejected_with_0a000() {
+    use engine::sql::transaction::TransactionStatus;
+
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let caller = ctx("owner");
+    let mut session = ddl_session();
+    let mut txn = core.new_session_transaction();
+
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            &format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT"),
+        )
+        .expect_err("ALTER TABLE inside an explicit transaction must be rejected");
+    assert_eq!(err.wire_code(), "0A000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+
+    assert_eq!(
+        core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback"),
+        SqlOutcome::Rollback
+    );
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+    assert!(
+        !column_exists(&core, &caller, TABLE, "note"),
+        "a rejected in-transaction ALTER TABLE must not add the column"
+    );
+}
+
+// --- RLS: DDL はテナント境界・行可視性に影響しない -------------------------
+
+#[test]
+fn alter_table_by_one_tenant_does_not_change_other_tenants_row_visibility() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    insert_row(&core, &alice, 1, 1);
+    insert_row(&core, &bob, 2, 2);
+
+    let mut session = ddl_session();
+    alter_table(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT"),
+    )
+    .expect("ALTER TABLE should succeed");
+
+    // bob からは自分の 1 行 + alice の Public 行が見える（クロステナント Public
+    // 可視の既存契約）。DDL 自体が可視性を変えていないことのみを確認する。
+    assert_eq!(count_star(&core, &bob, TABLE), 2);
+    assert_eq!(count_star(&core, &alice, TABLE), 2);
+
+    let result = core
+        .execute_sql(
+            &bob,
+            &format!("SELECT note FROM {TABLE} WHERE id = 2 LIMIT 10"),
+        )
+        .expect("select should succeed");
+    assert_eq!(result.rows.len(), 1);
+    assert!(matches!(result.rows[0].cells[0], Cell::Null));
+}
+
+// --- Describe（拡張クエリプロトコル） ---------------------------------------
+
+#[test]
+fn describe_alter_table_returns_no_result_columns() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let session = SessionState::default();
+    let parsed = core
+        .parse_sql(&format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT"))
+        .expect("parse should succeed regardless of DDL privilege");
+    let described = core
+        .describe_parsed_in_session(&session, &parsed)
+        .expect("describe should succeed");
+    assert!(described.is_none());
+}

@@ -15,8 +15,14 @@ CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
 ```
 
 - `<type>` は `TEXT` または `VECTOR ( <N> )` のみ（TABLE-13／14 の追加型は別 Issue の
-  管轄。制約構文・`IF NOT EXISTS`・`USING OPERATION_ID` の付与はいずれも許可リスト外
-  （構造的に受理しない・`42601`）。
+  管轄。`IF NOT EXISTS`・`CONSTRAINT <name>`・`CHECK`／`REFERENCES`・
+  `USING OPERATION_ID` の付与はいずれも許可リスト外（構造的に受理しない・
+  `42601`）。列制約 `PRIMARY KEY`・表制約 `PRIMARY KEY (<col>[, ...])`（複合キーを
+  含む。TABLE-16・TASK-204、Issue #903。`docs/design/sql-primary-key.md`）と、
+  列制約 `UNIQUE`・表制約 `UNIQUE (<col>[, ...])`（Issue #905。
+  `docs/design/unique-constraint.md`）を制約構文として追加受理する。
+  列数の上限（256）は列定義 1 個をパースする直前に確定済みの列数だけで判定し、
+  表制約の位置（先頭・中間・末尾）に依存しない。
 - `TEXT`／`VECTOR` は `lexer::Keyword` へ追加しない（`SET`・`CREATE`・`TRUNCATE`・
   `TABLE` と同方針。statement 中の所定位置でのみ文脈的キーワードとして照合し、
   同名の列名・テーブル名として使う既存 SQL を壊さない）。
@@ -160,13 +166,19 @@ PostgreSQL 互換の `CREATE TABLE`（件数なし）。
   信頼された運用者を想定するため優先度は低いが、起票候補として記録する
   （out-of-scope-tracking）。
 
+## 列制約（`NOT NULL`／`DEFAULT`。TABLE-16・TASK-204、Issue #904）
+
+`<type>` の直後に、順序自由・各々最大 1 回まで `NOT NULL`／`DEFAULT <literal>` を
+受理する。詳細な設計判断は `docs/design/not-null-default.md` 参照。
+
 ## スコープ外・後続 Issue
 
 - `ALTER TABLE ADD COLUMN`／DROP／MODIFY COLUMN・各種制約
-  （`NOT NULL`／`DEFAULT`／`PRIMARY KEY`／`UNIQUE`／`CHECK`／`REFERENCES`）・
+  （`CHECK`／`REFERENCES`。`PRIMARY KEY`・`UNIQUE` は Issue #903・#905 で実装済み）・
   `CREATE INDEX`・`VIEW`・NoSQL 表層の DDL op はいずれも別 Issue の担当（本 Issue の
   権限ゲート（`require_ddl_permission`・`--ddl-allowed-users`）・
   `DuplicateColumn` 分類の再利用を前提とする）。`DROP TABLE` は Issue #902 で
   同じ権限ゲートを共有する形で実装済み（`docs/design/drop-table.md` 参照）。
+  `NOT NULL`／`DEFAULT` は Issue #904 で実装済み（上記節参照）。
 - `EXPLAIN CREATE TABLE`・`CREATE TABLE` への `USING OPERATION_ID` 付与はいずれも
   許可形状に存在しないため構造的に `42601`。

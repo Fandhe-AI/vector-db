@@ -41,7 +41,7 @@ use std::sync::Arc;
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::row_codec::{self, Value as RowCodecValue};
-use crate::sql::allowlist::{SqlSurfaceError, TableLookup};
+use crate::sql::allowlist::{parse_view_body, SqlSurfaceError, TableLookup};
 use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError, Visibility};
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
@@ -54,6 +54,36 @@ const CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("catalo
 /// エンコードした語彙 blob。`CATALOG_TABLE`（列定義）とは独立したライフサイクルを
 /// 持つ名前空間で、列は型名の参照（[`ColumnType::Enum`]）のみを保持する。
 const ENUM_TYPES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("enum_types");
+
+/// 非マテリアライズド `VIEW` 定義（TABLE-18・SQL-23・TASK-205、Issue #909）を
+/// 格納するテーブル。キーはビュー名（テーブルと名前空間を共有する。
+/// [`Storage::create_view`]／[`Storage::create_table`] のいずれも [`CATALOG_TABLE`]・
+/// 本テーブルの双方を同一 write txn で確認する）。値は [`encode_view_def`] で
+/// エンコードした「直接参照するリレーション名＋正規化 body SQL」の blob。
+/// 参照時の展開（`sql::view::resolve_from`）は本テーブルから取得した定義を
+/// 許可リストパーサー（`sql::allowlist::parse_view_body`）で再検証してから使う
+/// （第 2 の SQL パーサー・実行器を作らない設計。spec-confidentiality に配慮し
+/// 本コメントには TABLE-18・SQL-23 のポインタのみを記す）。
+pub(crate) const VIEWS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("views");
+
+/// 登録可能なビューの総数上限（[`MAX_LIST_TABLES`] と同じ既定値。本リポの
+/// 実装既定値であり DoS 対策）。
+const MAX_VIEWS: usize = MAX_LIST_TABLES;
+
+/// ビュー本文（正規化 SQL テキスト）1 件あたりのバイト数上限（本リポの実装
+/// 既定値）。untrusted 入力から無制限 `String`／redb 値を確保しないための
+/// アロケーション前の上限（security.md「無制限リソース確保（DoS）」対応）。
+pub(crate) const MAX_VIEW_BODY_BYTES: usize = 64 * 1024;
+
+/// ビューのネスト深さ上限（本リポの実装既定値。テーブル自身を深さ 0 とし、
+/// それを直接参照するビューを深さ 1、以降 1 段ごとに +1 する）。
+pub(crate) const MAX_VIEW_NESTING_DEPTH: u32 = 4;
+
+/// カタログ破損時の連鎖走査を打ち切る安全上限（[`MAX_VIEWS`] と同じ値。
+/// 正常経路では循環を構造的に構築できない（[`Storage::create_view`] が
+/// 参照先の存在を作成前に要求するため）が、破損したカタログ値に対しても
+/// 無限ループにならないことを保証する防御的上限）。
+const MAX_VIEW_CHAIN_WALK: usize = MAX_VIEWS;
 
 /// カタログのテキスト形式フォーマットバージョン識別子。値の追加・変更は
 /// 破壊的変更として扱い、この値を更新する。旧バージョンの読み出しは
@@ -77,6 +107,50 @@ const CATALOG_FORMAT_VERSION_LINE: &str = "v2";
 /// 5 フィールドで、物理スロット順（[`TableSchema::physical_slots`]）に並ぶ。
 const CATALOG_FORMAT_VERSION_V3: &str = "v3";
 
+/// カタログ v4（TABLE-16・TASK-204、Issue #903）: `PRIMARY KEY` を宣言した
+/// スキーマ専用のフォーマット。`cols:` 行の直後に `pk:<col>[,<col>]*` 行を
+/// 1 行追加する点のみが v3 と異なり、列行の形（5 フィールド・`state`）は
+/// v3 と共有する（[`TableSchema::dropped_slots`] が空でも v4 で書ける）。
+/// 主キーを宣言しないスキーマは（墓標の有無に関わらず）従来どおり v2／v3 で
+/// 書き、v4 は「主キーを持つが DEFAULT は持たない」スキーマにのみ使う
+/// （既存のゴールデンテストに影響しない）。
+const CATALOG_FORMAT_VERSION_V4: &str = "v4";
+
+/// カタログ v5（TABLE-16・TASK-204、Issue #904）: `DEFAULT` 句を 1 つ以上持つ
+/// スキーマ専用のフォーマット。`DEFAULT` を持たないスキーマは引き続き
+/// v2／v3／v4（墓標・主キーの有無で選択）のいずれかで書き、バイト列を
+/// 変えない（既存ゴールデンテストへ影響しない）。v5 は v4 の上位集合で、
+/// `cols:` 行の直後に `pk:` 行を必ず 1 行持つ（主キー宣言が無ければ
+/// `pk:` の後を空のまま書き、`decode_schema_body` は空を「主キーなし」と
+/// 解釈する。v4 の `pk:` 行は非空必須のまま変えない）。列行は墓標の有無に
+/// かかわらず必ず `name:tag:param:nullable:state:default` の 6 フィールド
+/// （`state` は v3／v4 と同じ `L`／`D`。墓標行の `default` は常に `-`）で
+/// 書く。`default` フィールドの符号化は [`ColumnDefault::
+/// encode_catalog_field`] 参照。
+const CATALOG_FORMAT_VERSION_V5: &str = "v5";
+
+/// カタログ v6（TABLE-16・TASK-204、Issue #905）: UNIQUE 制約
+/// （[`UniqueConstraint`]）を 1 つ以上持つスキーマ専用のフォーマット。v5 の
+/// 上位集合で、`cols:` 行の直後に `pk:` 行（主キー宣言が無ければ空）を必ず
+/// 1 行持ち、列行は墓標・`DEFAULT` の有無に関わらず 6 フィールド
+/// （`name:tag:param:nullable:state:default`）で書く。列行の直後に
+/// `uniq:<n>` 行（`n >= 1`）と `n` 個の `U:<col>[,<col>]*` 行を追記する。
+/// UNIQUE 制約を 1 つでも持つスキーマは（主キー・`DEFAULT`・墓標の有無に
+/// 関わらず）必ず v6 で書き、持たないスキーマは従来どおり v2〜v5 のまま
+/// バイト列を変えない（既存ゴールデンテストへ影響しない。v2〜v6 は互いに
+/// 排他な正規形）。
+const CATALOG_FORMAT_VERSION_V6: &str = "v6";
+
+/// 1 テーブルが宣言できる UNIQUE 制約数の上限（TABLE-16・TASK-204、
+/// Issue #905）。本リポの実装既定値。デコード時、この値を超える宣言数は
+/// アロケーション前に拒否する（.claude/rules/coding-rust.md「untrusted 入力の
+/// 扱い」）。
+pub(crate) const MAX_UNIQUE_CONSTRAINTS: usize = 32;
+
+/// UNIQUE 制約 1 個が参照できる列数の上限（TABLE-16・TASK-204、Issue #905）。
+/// [`MAX_PRIMARY_KEY_COLUMNS`] と同じ PostgreSQL の索引キー列数慣習（32）に
+/// 合わせた実装既定値。
+pub(crate) const MAX_UNIQUE_CONSTRAINT_COLUMNS: usize = 32;
 /// カタログ v2 の `param` フィールドに許容する文字集合（TABLE-6・Issue #880）。
 /// パラメータなし型を表す `-` は本集合の外だが、[`validate_catalog_param`] で
 /// 別途特別扱いする。`:`・改行を含まないため、encode 側の `:` 区切りと
@@ -123,6 +197,12 @@ const _: () = assert!(
 /// 1 テーブルが持てる列数の上限。カタログ値のデコード時、この値を超える宣言列数は
 /// アロケーション前に拒否する（.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
 const MAX_COLUMN_COUNT: usize = 256;
+
+/// `PRIMARY KEY` に宣言できる列数の上限（TABLE-16・TASK-204、Issue #903）。
+/// PostgreSQL の索引キー列数慣習（32）に合わせた本リポの実装既定値。デコード時、
+/// この値を超える宣言列数は `Vec` を確保する前に拒否する
+/// （.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
+pub(crate) const MAX_PRIMARY_KEY_COLUMNS: usize = 32;
 
 /// カタログ値（エンコード済みバイト列）のバイト長上限。デコード前に検証し、
 /// 無制限な文字列アロケーションを防ぐ。
@@ -230,6 +310,25 @@ pub enum CatalogError {
     /// 想定だが、本 variant は Rust API 専用であり wire への送出経路を持たない
     /// ため `ErrorClass` には追加しない）。
     DependentObjectsStillExist(String),
+    /// `DROP VIEW` の対象名がカタログ・ビュー双方のいずれにも存在しない
+    /// （TABLE-18・SQL-23・TASK-205、Issue #909）。テーブルの `TableNotFound` とは
+    /// 別 variant とし、SQL 表層側で同じ `42P01` へ写像しつつ「ビュー専用の
+    /// 検索だった」ことを型で残す。
+    ViewNotFound(String),
+    /// 名前は存在するが、要求された操作が期待するオブジェクト種別
+    /// （テーブル／ビュー）と一致しない（`DROP TABLE` にビュー名、`DROP VIEW` に
+    /// テーブル名、ビューへの書き込み系文。TABLE-18・SQL-23・TASK-205、
+    /// Issue #909。ERR-6: `42809`）。
+    WrongObjectKind(String),
+    /// `DROP TABLE`／`DROP VIEW` の対象を参照するビューが 1 つ以上残っている
+    /// （TABLE-18・SQL-23・TASK-205、Issue #909。ERR-6: `2BP01`）。ENUM 型専用の
+    /// [`CatalogError::DependentObjectsStillExist`] とは独立させ、依存元・
+    /// 依存先の意味論が混ざらないようにする。
+    DependentViewsExist(String),
+    /// ビュー関連の DoS 対策上限超過（ビュー総数・本文バイト数・ネスト深さ。
+    /// TABLE-18・SQL-23・TASK-205、Issue #909。ERR-6: `54000`）。`detail` は
+    /// 固定文言のみ（テナント・行内容を含まない）。
+    ViewLimitExceeded(String),
     /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
     /// トランザクションの取得がロック待ちの上限を超過した（`storage::StorageError`
     /// から写像。[`convert_storage_error`] 参照）。
@@ -248,6 +347,19 @@ pub enum CatalogError {
         from: String,
         to: String,
     },
+    /// `ALTER TABLE ADD COLUMN`（TABLE-5）で列を追加すると `MAX_COLUMN_COUNT`
+    /// を超える（Issue #900・SQL-23）。`count` は追加後の物理スロット数（生存列＋
+    /// 削除済み列の墓標。TABLE-19 D1。上限超過後の値）。
+    /// `sql::ddl::execute_alter_table_add_column` はこの分類のみ `54000`
+    /// （`SqlSurfaceError::PayloadTooLarge`）へ写像し、他の `Invalid` 系
+    /// （識別子・型不正）とは区別する。
+    TooManyColumns { count: usize },
+    /// [`Storage::alter_table_add_unique_constraint`]（Rust API。TABLE-16・
+    /// TASK-204、Issue #905）が、既存行の中にテナント内で重複する値の組を
+    /// 検出したため制約追加を拒否した。文言・variant 自体にテナント名・値を
+    /// 含めない（security.md P0。`TenantWriteError::UniqueViolation` と同じ
+    /// 秘匿方針）。
+    UniqueConstraintViolation,
 }
 
 impl fmt::Display for CatalogError {
@@ -268,10 +380,23 @@ impl fmt::Display for CatalogError {
             CatalogError::TableGenerationCounterOverflow => {
                 write!(f, "table generation counter overflow")
             }
+            CatalogError::UniqueConstraintViolation => {
+                write!(f, "duplicate key value violates unique constraint")
+            }
             CatalogError::TypeNotFound(name) => write!(f, "type not found: {name}"),
             CatalogError::TypeAlreadyExists(name) => write!(f, "type already exists: {name}"),
             CatalogError::DependentObjectsStillExist(name) => {
                 write!(f, "dependent objects still exist for type: {name}")
+            }
+            CatalogError::ViewNotFound(name) => write!(f, "view not found: {name}"),
+            CatalogError::WrongObjectKind(name) => {
+                write!(f, "wrong object kind for: {name}")
+            }
+            CatalogError::DependentViewsExist(name) => {
+                write!(f, "dependent views still exist for: {name}")
+            }
+            CatalogError::ViewLimitExceeded(detail) => {
+                write!(f, "view limit exceeded: {detail}")
             }
             CatalogError::WriteLockTimeout => {
                 write!(f, "write lock not available: timed out waiting for writer")
@@ -287,6 +412,9 @@ impl fmt::Display for CatalogError {
                 f,
                 "incompatible type change for column {column:?}: {from} -> {to}"
             ),
+            CatalogError::TooManyColumns { count } => {
+                write!(f, "too many columns: {count}")
+            }
         }
     }
 }
@@ -306,10 +434,16 @@ impl std::error::Error for CatalogError {
             | CatalogError::TypeNotFound(_)
             | CatalogError::TypeAlreadyExists(_)
             | CatalogError::DependentObjectsStillExist(_)
+            | CatalogError::ViewNotFound(_)
+            | CatalogError::WrongObjectKind(_)
+            | CatalogError::DependentViewsExist(_)
+            | CatalogError::ViewLimitExceeded(_)
             | CatalogError::ColumnNotFound(_)
             | CatalogError::ProtectedColumn(_)
             | CatalogError::IncompatibleTypeChange { .. }
-            | CatalogError::WriteLockTimeout => None,
+            | CatalogError::UniqueConstraintViolation
+            | CatalogError::WriteLockTimeout
+            | CatalogError::TooManyColumns { .. } => None,
         }
     }
 }
@@ -403,6 +537,66 @@ impl ColumnType {
     /// Issue #880 D9）。
     pub fn is_vector(&self) -> bool {
         matches!(self, ColumnType::Vector(_))
+    }
+
+    /// `PRIMARY KEY`（Issue #903）の構成列・UNIQUE 制約（Issue #905）の参照列
+    /// として宣言できる型かどうか（TABLE-16・TASK-204。両者で共有する単一の
+    /// 一意キー許可リストであり、第 2 の許可リストは作らない）。行バイト列上の
+    /// 値表現がバイト単位で一意に決まる型のみを許可する fail-closed な許可
+    /// リストであり、`constraint::enforce_unique_keys_in_txn`
+    /// が構築する正準キーバイト列の一意性が値の一意性と一致することの前提になる。
+    /// `VECTOR`（検索対象・等価比較の対象外）・`REAL`／`DOUBLE`（`-0.0` 正規化はある
+    /// ものの浮動小数の等価性は一般に不安定）・`NUMERIC`（スケール違いの表現差が
+    /// 未検証）・`JSON`／`JSONB`（正規化の有無で表現が割れる）・`ARRAY`（要素単位の
+    /// 順序等価性が未検証）は対象外とする。`sql::allowlist::validate_create_table_tokens`
+    /// が SQL 表層の構造検証段階でも同じ判定を行う（第 2 の許可リストを作らず、
+    /// ここへ委譲する）。
+    pub(crate) fn is_primary_key_allowed(&self) -> bool {
+        matches!(
+            self,
+            ColumnType::Text
+                | ColumnType::Integer
+                | ColumnType::BigInt
+                | ColumnType::Boolean
+                | ColumnType::Date
+                | ColumnType::Timestamp
+                | ColumnType::Uuid
+                | ColumnType::Bytea
+                | ColumnType::Enum(_)
+        )
+    }
+
+    /// [`crate::constraint::enforce_unique_keys_in_txn`] が正準キーバイト列を
+    /// 組み立てる際に使う、一意キー許可型ごとの固定タグ（TABLE-16・TASK-204、
+    /// Issue #903）。[`Self::is_primary_key_allowed`] が `true` を返す型にのみ
+    /// 呼び出す契約（呼び出し元は非許可型ではこのメソッドを呼ばない）。値は
+    /// 永続化されない（`constraint.rs` の判定用スクラッチにのみ使う）ため、
+    /// カタログの `catalog_fields` タグとは独立に採番してよい。
+    pub(crate) fn primary_key_tag(&self) -> u8 {
+        match self {
+            ColumnType::Text => 1,
+            ColumnType::Integer => 2,
+            ColumnType::BigInt => 3,
+            ColumnType::Boolean => 4,
+            ColumnType::Date => 5,
+            ColumnType::Timestamp => 6,
+            ColumnType::Bytea => 7,
+            ColumnType::Uuid => 8,
+            ColumnType::Enum(_) => 9,
+            ColumnType::Vector(_)
+            | ColumnType::Real
+            | ColumnType::Double
+            | ColumnType::Array(_)
+            | ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Numeric { .. } => {
+                // 呼び出し元が `is_primary_key_allowed` の契約を破っている
+                // （非許可型からタグを取得しようとした）。永続化しない内部
+                // スクラッチ用の値のため panic ではなく判別可能な番兵を返し、
+                // 呼び出し元（`constraint.rs`）が別途 fail-closed に拒否する。
+                0
+            }
+        }
     }
 
     /// カタログのテキスト形式（v2）における型タグと `param` フィールドを返す
@@ -867,6 +1061,216 @@ fn decode_enum_type_def_body(name: &str, bytes: &[u8]) -> Result<EnumTypeDef> {
     })
 }
 
+/// 永続化済み `VIEW` 定義（TABLE-18・SQL-23・TASK-205、Issue #909）。`sql::view`
+/// モジュールが `body_sql` を許可リストパーサーで再検証・再展開する（本モジュールは
+/// 「直接参照するリレーション名」と「正規化 body SQL」を運ぶだけで、SQL の意味論
+/// には一切踏み込まない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewDef {
+    /// `CREATE VIEW ... AS SELECT ... FROM <base_relation> ...` の
+    /// `<base_relation>`（テーブルまたは別のビューの名前。存在確認・
+    /// ネスト深さの計算は本モジュールが担い、値そのものはカタログ照会前の
+    /// 識別子として保持する）。
+    pub base_relation: String,
+    /// [`crate::sql::allowlist::validate_create_view_tokens`] が構築した、
+    /// 再パース可能な正規化 SQL（`SELECT ... FROM ... [WHERE ...]`。`sql::view`
+    /// の round-trip テストが「描画 → 再トークン化 → 再パース」で元の AST と
+    /// 一致することを固定する）。
+    pub body_sql: String,
+}
+
+/// [`ViewDef`] のバイト表現（`u8` バージョン・`base_relation`／`body_sql` それぞれ
+/// `u32`（LE）長 + UTF-8 本体）。[`encode_enum_type_def`] と同じく untrusted
+/// クライアント入力の直接デコード対象ではなく、格納済みカタログ値のデコード
+/// （破損は `CorruptSchema`）。
+fn encode_view_def(def: &ViewDef) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.push(1u8); // バージョン
+    for part in [def.base_relation.as_str(), def.body_sql.as_str()] {
+        let len = u32::try_from(part.len()).map_err(|_| {
+            CatalogError::Invalid("view definition part too long to encode".to_string())
+        })?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(part.as_bytes());
+    }
+    if out.len() > MAX_VIEW_BODY_BYTES.saturating_add(64) {
+        return Err(CatalogError::ViewLimitExceeded(
+            "view body too large".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// [`encode_view_def`] の逆変換。バージョン不一致・長さ不整合・不正 UTF-8・
+/// 余剰バイトはすべて `CatalogError::CorruptSchema` として拒否する（格納済み
+/// データの破損。呼び出し元〔`sql::view::resolve_from`〕はこれを固定文言
+/// `XX000` へ丸め、body のリテラル値をエラーへ含めない。security.md P0）。
+fn decode_view_def(bytes: &[u8]) -> Result<ViewDef> {
+    decode_view_def_body(bytes).map_err(|e| match e {
+        CatalogError::Invalid(msg) => CatalogError::CorruptSchema(msg),
+        other => other,
+    })
+}
+
+fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
+    let version = *bytes
+        .first()
+        .ok_or_else(|| CatalogError::Invalid("view definition value is empty".to_string()))?;
+    if version != 1 {
+        return Err(CatalogError::Invalid(format!(
+            "unknown view definition format version: {version}"
+        )));
+    }
+    let mut offset = 1usize;
+    let mut parts: Vec<String> = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let len_bytes: [u8; 4] = bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| CatalogError::Invalid("view definition value truncated".to_string()))?
+            .try_into()
+            .map_err(|_| CatalogError::Invalid("view definition value truncated".to_string()))?;
+        offset = offset
+            .checked_add(4)
+            .ok_or_else(|| CatalogError::Invalid("view definition offset overflow".to_string()))?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        if len > MAX_VIEW_BODY_BYTES {
+            return Err(CatalogError::Invalid(
+                "view definition part too large".to_string(),
+            ));
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| CatalogError::Invalid("view definition offset overflow".to_string()))?;
+        let part_bytes = bytes.get(offset..end).ok_or_else(|| {
+            CatalogError::Invalid("view definition value truncated at part body".to_string())
+        })?;
+        let part = std::str::from_utf8(part_bytes)
+            .map_err(|_| {
+                CatalogError::Invalid("view definition part is not valid UTF-8".to_string())
+            })?
+            .to_string();
+        parts.push(part);
+        offset = end;
+    }
+    if offset != bytes.len() {
+        return Err(CatalogError::Invalid(
+            "view definition value has trailing bytes".to_string(),
+        ));
+    }
+    // `parts` はループで必ず 2 要素を push 済みだが、`expect` による panic 経路を
+    // 作らず（coding-rust.md: engine ライブラリコードで panic させない）
+    // スライスパターンで直接分解する。要素数不一致は構造的に到達不能なため
+    // `CorruptSchema` 経由の防御的フォールバックとして扱う。
+    let [base_relation, body_sql] = <[String; 2]>::try_from(parts).map_err(|_| {
+        CatalogError::Invalid("view definition value has unexpected part count".to_string())
+    })?;
+    Ok(ViewDef {
+        base_relation,
+        body_sql,
+    })
+}
+
+/// [`Storage::create_view`] が保存前に行う `body_sql` の自己検証（codex-review
+/// 指摘・PR #1048）。`sql::allowlist::parse_view_body`（`CREATE VIEW` 構文検証・
+/// `sql::view::resolve_from` の格納値再検証と同一実装。第 2 のパーサーを
+/// 作らない）で `body_sql` を再トークン化・再パースし、(1) 許可リスト形状
+/// （`SELECT <* | 列名> FROM <relation> [WHERE <単純述語>]`。式項目・UDF 述語は
+/// `42601` 相当として拒否）を満たすこと、(2) パース結果が示す `FROM` の参照先が
+/// 呼び出し元の主張する `base_relation` と一致することを検証する。
+///
+/// `sql::allowlist::validate_create_view_tokens` を経由する正規の SQL 表層経路
+/// では `body_sql` は常に `render_view_body(parsed)`（`parsed.table_name ==
+/// base_relation`）として構築されるためこの検証は常に通るが、それ以外の
+/// `pub fn create_view` 呼び出し元（本メソッドは engine の公開 Rust API）が
+/// 独自に組み立てた `body_sql`／`base_relation` の組を渡した場合、両者が
+/// 食い違う定義や許可リスト外の形状が永続化されてしまうと、参照時
+/// （`sql::view::resolve_from`）の列スコープ検査
+/// （`sql::view::check_columns_within_view`）が「`body_sql` の投影は
+/// `base_relation` に対して検証済み」という前提の上に成り立たなくなる
+/// （テナント境界そのものは崩さないが、ビューが宣言する列公開契約が破れる）。
+fn validate_view_body_matches_base_relation(body_sql: &str, base_relation: &str) -> Result<()> {
+    let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| {
+        CatalogError::Invalid("view body is not valid SQL for a view definition".to_string())
+    })?;
+    let parsed = parse_view_body(&tokens).map_err(|_| {
+        CatalogError::Invalid(
+            "view body does not match the allowed view definition shape".to_string(),
+        )
+    })?;
+    if parsed.table_name != base_relation {
+        return Err(CatalogError::Invalid(
+            "view body FROM target does not match base_relation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `start` から始めてテーブルへ到達するまでの参照段数（テーブル自身が深さ 0、
+/// それを直接参照するビューが深さ 1）を計算する（[`Storage::create_view`] が
+/// 新規ビューのネスト深さ判定に使う。同一 write txn 内で完結させ TOCTOU を
+/// 避ける）。`start` がテーブル・ビューのいずれにも存在しない場合は
+/// `CatalogError::TableNotFound`。循環・異常に長い連鎖はカタログ破損として
+/// `CorruptSchema`（正常経路では発生しない。[`Storage::create_view`] が新規
+/// ビュー名の被参照を作成前に拒否するため自己参照は構造的に作れない）。
+fn resolve_reference_depth_in_txn(
+    catalog_table: &redb::Table<'_, &str, &[u8]>,
+    views_table: &redb::Table<'_, &str, &[u8]>,
+    start: &str,
+) -> Result<u32> {
+    let mut current = start.to_string();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut depth = 0u32;
+    loop {
+        if !visited.insert(current.clone()) {
+            return Err(CatalogError::CorruptSchema(
+                "view reference cycle detected".to_string(),
+            ));
+        }
+        if visited.len() > MAX_VIEW_CHAIN_WALK {
+            return Err(CatalogError::CorruptSchema(
+                "view reference chain too long".to_string(),
+            ));
+        }
+        if catalog_table.get(current.as_str())?.is_some() {
+            return Ok(depth);
+        }
+        match views_table.get(current.as_str())? {
+            Some(guard) => {
+                let def = decode_view_def(guard.value())?;
+                depth = depth.checked_add(1).ok_or_else(|| {
+                    CatalogError::CorruptSchema("view nesting depth overflow".to_string())
+                })?;
+                current = def.base_relation;
+            }
+            None => return Err(CatalogError::TableNotFound(start.to_string())),
+        }
+    }
+}
+
+/// `target`（テーブルまたはビュー名）を直接参照している既存ビュー名の一覧
+/// （[`Storage::drop_table`]／[`Storage::drop_view`] の依存検査が使う。
+/// [`dependent_tables_in_txn`] と同じ「上限超過は無制限 `Vec` 確保を避けて
+/// `Err`」方針）。
+fn views_depending_on_in_txn(
+    views_table: &redb::Table<'_, &str, &[u8]>,
+    target: &str,
+) -> Result<Vec<String>> {
+    let mut dependents = Vec::new();
+    for entry in views_table.iter()? {
+        let (key, value) = entry?;
+        if dependents.len() >= MAX_VIEWS {
+            return Err(CatalogError::ViewLimitExceeded(
+                "too many views".to_string(),
+            ));
+        }
+        let def = decode_view_def(value.value())?;
+        if def.base_relation == target {
+            dependents.push(key.value().to_string());
+        }
+    }
+    Ok(dependents)
+}
+
 /// 配列列（`ColumnType::Array`）の要素型（TABLE-14・Issue #888）。`VECTOR`・`ARRAY`
 /// （入れ子・多次元配列）を構造的に除外し、`VECTOR` 列との責務境界を型で保証する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -930,6 +1334,183 @@ impl ArrayType {
     }
 }
 
+/// `DEFAULT <literal>` 句（TABLE-16・TASK-204、Issue #904）が宣言する既定値。
+/// [`crate::sql::allowlist::InsertLiteral`] の対応する 3 variant
+/// （`String`／`Number`／`Bool`。`Vector`・`Null` は `DEFAULT` の文法上
+/// 構造的に構築されない）を写した軽量表現で、`row_codec::Value` を直接
+/// 持たない（`Value` は `Real`／`Double` に `f64`/`f32` を持ち `Eq` を
+/// 実装できないため、`ColumnDef` の `Eq` 導出を維持できなくなる）。
+///
+/// `sql::parser::bind_literal_for_column`（省略列への補完・`INSERT`／
+/// `UPDATE`／`UPSERT`・COPY が共有する単一の束縛点）がこの値を実際の列型へ
+/// 束縛する際の型不一致・数値範囲外は通常の `INSERT` リテラルと同じ
+/// エラー分類（`22000`/`22003` 等）で拒否する。カタログ層（本モジュール）は
+/// [`column_default_compatible`] で列型の大分類（テキスト系／数値系／真偽値）
+/// との整合のみを検証し、`sql` 層に依存しない自己完結の防御として持つ
+/// （decode 時・Rust API 直接構築時にも効く多層防御）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnDefault {
+    Text(String),
+    Number(String),
+    Bool(bool),
+}
+
+/// [`ColumnDefault`] 1 個ぶんのカタログテキスト表現（未加工の値本体）の
+/// バイト長上限。カタログ decode 時・CREATE TABLE 構文検証時の両方で、
+/// 16 進符号化・アロケーションの前に検証する
+/// （`.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。
+pub const MAX_COLUMN_DEFAULT_LEN: usize = 1024;
+
+// `MAX_COLUMN_DEFAULT_LEN` を 16 進符号化（最大 2 倍）したうえで
+// `MAX_COLUMN_COUNT` 列ぶん連結しても、カタログ値全体の上限
+// （`MAX_CATALOG_VALUE_LEN`）に十分収まることをコンパイル時に固定する
+// （プレフィックス 1 バイト・区切り文字・列名等の余地として 500,000 バイトの
+// 余裕を残す）。
+const _: () = assert!(
+    MAX_COLUMN_DEFAULT_LEN * 2 * MAX_COLUMN_COUNT + 500_000 <= MAX_CATALOG_VALUE_LEN,
+    "MAX_COLUMN_DEFAULT_LEN * 2 * MAX_COLUMN_COUNT must leave slack under MAX_CATALOG_VALUE_LEN"
+);
+
+impl ColumnDefault {
+    /// この既定値が列型の大分類と整合するか（TABLE-16 D2）。`VECTOR` は
+    /// 常に不可（DEFAULT 自体が禁止）。ここでは型の大分類のみを見る粗い
+    /// フィルタで、数値の桁数・範囲・ENUM 語彙といった細かな整合性は
+    /// `sql::parser::bind_literal_for_column` が実際の束縛時に検証する。
+    fn compatible_with(&self, ty: &ColumnType) -> bool {
+        matches!(
+            (self, ty),
+            (ColumnDefault::Text(_), ColumnType::Text)
+                | (
+                    ColumnDefault::Number(_),
+                    ColumnType::Integer
+                        | ColumnType::BigInt
+                        | ColumnType::Real
+                        | ColumnType::Double
+                        | ColumnType::Numeric { .. },
+                )
+                | (ColumnDefault::Bool(_), ColumnType::Boolean)
+        )
+    }
+
+    /// カタログテキスト形式（v5）の `default` フィールドへ符号化する。
+    /// `-`（なし）は [`encode_column_line_v5`] 側が扱うため本関数は
+    /// `Some` の場合のみ呼ばれる。値本体を 16 進化するのは、`TEXT` 既定値が
+    /// `:`・改行等のカタログの区切り文字を含み得るため（区切り文字注入の
+    /// 防止。TABLE-6 と同じ設計判断）。
+    fn encode_catalog_field(&self) -> Result<String> {
+        let (tag, raw): (char, String) = match self {
+            ColumnDefault::Text(s) => ('s', s.clone()),
+            ColumnDefault::Number(s) => ('n', s.clone()),
+            ColumnDefault::Bool(b) => {
+                return Ok(if *b { "t".to_string() } else { "f".to_string() })
+            }
+        };
+        if raw.len() > MAX_COLUMN_DEFAULT_LEN {
+            return Err(CatalogError::Invalid(format!(
+                "column default literal exceeds length limit: {} bytes",
+                raw.len()
+            )));
+        }
+        let mut out = String::with_capacity(1 + raw.len() * 2);
+        out.push(tag);
+        for byte in raw.as_bytes() {
+            out.push_str(&hex_encode_byte(*byte));
+        }
+        Ok(out)
+    }
+
+    /// [`ColumnDefault::encode_catalog_field`] の逆変換。未知タグ・不正 16 進・
+    /// 不正 UTF-8・長さ上限超過はいずれも `Err`（fail-closed。TABLE-6 と同じ
+    /// 「デコード不能なカタログ値を許さない」方針）。
+    fn decode_catalog_field(field: &str) -> Result<Option<ColumnDefault>> {
+        if field == "-" {
+            return Ok(None);
+        }
+        if field == "t" {
+            return Ok(Some(ColumnDefault::Bool(true)));
+        }
+        if field == "f" {
+            return Ok(Some(ColumnDefault::Bool(false)));
+        }
+        let mut chars = field.chars();
+        let tag = chars
+            .next()
+            .ok_or_else(|| CatalogError::Invalid("empty column default field".to_string()))?;
+        let hex_body = chars.as_str();
+        // 16 進復号前に長さ上限を検証する（1 バイトは 16 進 2 文字。奇数長は
+        // 復号側で拒否されるが、上限判定はアロケーション前に済ませる）。
+        if hex_body.len() > MAX_COLUMN_DEFAULT_LEN * 2 {
+            return Err(CatalogError::Invalid(
+                "column default field exceeds length limit".to_string(),
+            ));
+        }
+        let bytes = hex_decode(hex_body)?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            CatalogError::Invalid("column default field is not valid UTF-8".to_string())
+        })?;
+        match tag {
+            's' => Ok(Some(ColumnDefault::Text(text))),
+            'n' => Ok(Some(ColumnDefault::Number(text))),
+            other => Err(CatalogError::Invalid(format!(
+                "unknown column default tag: {other:?}"
+            ))),
+        }
+    }
+}
+
+/// 1 バイトを小文字 16 進 2 文字へ変換する（依存追加なしの自作。
+/// dependency-policy.md 準拠）。
+fn hex_encode_byte(b: u8) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hi = HEX[(b >> 4) as usize] as char;
+    let lo = HEX[(b & 0x0f) as usize] as char;
+    let mut s = String::with_capacity(2);
+    s.push(hi);
+    s.push(lo);
+    s
+}
+
+/// 小文字 16 進文字列をバイト列へ復号する。奇数長・非 16 進文字は `Err`
+/// （fail-closed。untrusted なカタログ値を復号する経路のため添字直接
+/// アクセスを避け `get`／`from_digit` 相当の明示判定を使う）。
+fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err(CatalogError::Invalid(
+            "column default hex field has odd length".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    // 上のコメントが述べる「添字直接アクセスを避け明示判定を使う」方針を、
+    // 実際に `[]` を書かない形で徹底する（Issue #904 レビュー指摘）。
+    // 直前の `is_multiple_of(2)` 検査により `i + 1 < bytes.len()` の間は
+    // `get(i)`／`get(i + 1)` が必ず `Some` になるが、`get` を使うことで
+    // この不変条件が崩れても panic ではなく `Err` へ倒れる（fail-closed）。
+    while i + 1 < bytes.len() {
+        let (Some(&hi_byte), Some(&lo_byte)) = (bytes.get(i), bytes.get(i + 1)) else {
+            return Err(CatalogError::Invalid(
+                "column default hex field has odd length".to_string(),
+            ));
+        };
+        let hi = hex_nibble(hi_byte)?;
+        let lo = hex_nibble(lo_byte)?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        _ => Err(CatalogError::Invalid(
+            "column default field contains invalid hex digit".to_string(),
+        )),
+    }
+}
+
 /// テーブル定義中の 1 列。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -939,6 +1520,11 @@ pub struct ColumnDef {
     /// 実際の行デコード時の NULL 解決は行エンコーダー（TASK-86）の責務であり、
     /// 本モジュールはこのフラグを保持・往復させるのみ。
     pub nullable: bool,
+    /// `DEFAULT <literal>` 句（TABLE-16・TASK-204、Issue #904）。`INSERT` で
+    /// この列が省略された場合に補われる値。明示的な `NULL` には適用しない
+    /// （TABLE-16。`sql::parser::bind_literal_for_column`／
+    /// `fill_omitted_columns` が唯一の適用点）。
+    pub default: Option<ColumnDefault>,
 }
 
 impl ColumnDef {
@@ -947,7 +1533,16 @@ impl ColumnDef {
             name: name.into(),
             ty,
             nullable,
+            default: None,
         }
+    }
+
+    /// [`ColumnDef::new`] に `DEFAULT` を追加した版（TABLE-16・TASK-204、
+    /// Issue #904）。`ColumnDef::new` の呼び出し元（約 1,200 箇所）を変えずに
+    /// 済むよう、既定値の付与だけを別メソッドへ切り出す。
+    pub fn with_default(mut self, default: ColumnDefault) -> Self {
+        self.default = Some(default);
+        self
     }
 }
 
@@ -1035,6 +1630,35 @@ impl<'a> Iterator for PhysicalSlots<'a> {
     }
 }
 
+/// UNIQUE 制約（単一列・複数列）の宣言（TABLE-16・TASK-204、Issue #905）。
+/// 一意性のスコープはテナント内に閉じる（[`crate::constraint`] の単一検査点が
+/// テナント所有の全行——`Public`／`Private` を問わない——を母集合として
+/// 検査する。RLS 可視集合ではない）。列は宣言順を保持する。
+///
+/// `columns()` が返す各列名は、この制約を保持する [`TableSchema`] の**生存列**
+/// （`schema.columns`）に存在し、かつ [`ColumnType::is_primary_key_allowed`]
+/// （主キーと共有する一意キー許可型の単一の許可リスト）を満たす型であることを
+/// [`validate_schema`] が保証する契約とする（構築時点では検証しない。
+/// [`ColumnDef::new`] と同じ「検証は呼び出し元が別途通す」設計）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniqueConstraint {
+    columns: Vec<String>,
+}
+
+impl UniqueConstraint {
+    /// `pub(crate)`: 構築元は `sql::allowlist`（`CREATE TABLE` の列制約・表制約）・
+    /// [`decode_schema_body`]（v6 カタログ値の復元）・
+    /// [`Storage::alter_table_add_unique_constraint`]（Rust API）に限る。
+    pub(crate) fn new(columns: Vec<String>) -> Self {
+        Self { columns }
+    }
+
+    /// 制約が参照する列名（宣言順）。
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+}
+
 /// テーブル定義。列の宣言順を保持する（`ALTER TABLE ADD COLUMN` は末尾追記のみを
 /// 許可する。TABLE-5）。`columns` は常に**論理列（生存列のみ）**を宣言順で持つ。
 /// `SELECT *`・投影・`WHERE` 解決・`RowDescription` など、行の物理配置を
@@ -1057,6 +1681,16 @@ pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     dropped: Vec<DroppedSlot>,
+    /// `PRIMARY KEY` 宣言（TABLE-16・TASK-204、Issue #903）。`id` 暗黙主キーの
+    /// テーブルは `None`（既存挙動・カタログバイト列とも完全不変。
+    /// `docs/design/sql-primary-key.md` 参照）。`Some` のときは列**名**の宣言順
+    /// 列挙（列の物理位置がずれても安全なように名前で持つ。`DROP COLUMN` は
+    /// 主キー構成列を拒否するため、主キー宣言後にここへ現れる名前は常に生存列を
+    /// 指す）。空 `Vec` は許さない（[`validate_schema`] が拒否する）。
+    primary_key: Option<Vec<String>>,
+    /// UNIQUE 制約（TABLE-16・TASK-204、Issue #905）。空が既定（カタログ
+    /// v2〜v5 のバイト列不変）。1 件以上持つスキーマは v6 で永続化される。
+    unique_constraints: Vec<UniqueConstraint>,
 }
 
 impl TableSchema {
@@ -1065,23 +1699,62 @@ impl TableSchema {
             name: name.into(),
             columns,
             dropped: Vec::new(),
+            primary_key: None,
+            unique_constraints: Vec::new(),
         }
     }
 
-    /// [`TableSchema::new`] の削除済み列（墓標）付き版。呼び出し元（本モジュールの
-    /// カタログ decode・[`Storage::alter_table_drop_column`]）は `dropped` を
-    /// `physical_index` 昇順で渡す契約とする（[`PhysicalSlots`] の前提）。
-    /// バリデーションは行わない（呼び出し元が [`validate_schema`] を別途通す）。
+    /// [`TableSchema::new`] の削除済み列（墓標）・主キー付き版。呼び出し元
+    /// （本モジュールのカタログ decode）は `dropped` を `physical_index` 昇順で
+    /// 渡す契約とする（[`PhysicalSlots`] の前提）。バリデーションは行わない
+    /// （呼び出し元が [`validate_schema`] を別途通す）。
     pub(crate) fn from_parts(
         name: impl Into<String>,
         columns: Vec<ColumnDef>,
         dropped: Vec<DroppedSlot>,
+        primary_key: Option<Vec<String>>,
+        unique_constraints: Vec<UniqueConstraint>,
     ) -> Self {
         Self {
             name: name.into(),
             columns,
             dropped,
+            primary_key,
+            unique_constraints,
         }
+    }
+
+    /// `PRIMARY KEY` 宣言列名（宣言順）。未宣言（`id` 暗黙主キー）は `None`
+    /// （TABLE-16・TASK-204、Issue #903）。
+    pub fn primary_key(&self) -> Option<&[String]> {
+        self.primary_key.as_deref()
+    }
+
+    /// [`Self::primary_key`] を設定したコピーを返すビルダー（Rust API 用。
+    /// SQL 表層は [`Self::from_parts`] を経由するカタログ decode のみが
+    /// `primary_key` を持つ `TableSchema` を組み立てる）。バリデーションは
+    /// 行わない（呼び出し元が [`Storage::create_table`] を通し `validate_schema`
+    /// で検証させる契約とする）。
+    pub fn with_primary_key(mut self, columns: Vec<String>) -> Self {
+        self.primary_key = Some(columns);
+        self
+    }
+
+    /// UNIQUE 制約（TABLE-16・TASK-204、Issue #905）を設定したコピーを返す
+    /// ビルダー。`sql::ddl::execute_create_table`・
+    /// [`Storage::alter_table_add_unique_constraint`] が使う。バリデーションは
+    /// 行わない（[`encode_schema`] 内の [`validate_schema`] が別途通す）。
+    pub(crate) fn with_unique_constraints(
+        mut self,
+        unique_constraints: Vec<UniqueConstraint>,
+    ) -> Self {
+        self.unique_constraints = unique_constraints;
+        self
+    }
+
+    /// 宣言済み UNIQUE 制約の一覧（宣言順。TABLE-16・TASK-204、Issue #905）。
+    pub fn unique_constraints(&self) -> &[UniqueConstraint] {
+        &self.unique_constraints
     }
 
     /// 削除済み列（墓標）の一覧。`physical_index` 昇順。
@@ -1330,6 +2003,18 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
         if column.ty.is_vector() {
             vector_column_count += 1;
         }
+        // `DEFAULT`（TABLE-16・TASK-204、Issue #904）は列型の大分類と整合する
+        // ものだけを許可する（`VECTOR` は常に不可）。SQL 表層の構文検証
+        // （`sql::allowlist::parse_create_table_column`）をすり抜けた場合も、
+        // Rust API 直接構築の場合も、ここで fail-closed に拒否する。
+        if let Some(default) = &column.default {
+            if !default.compatible_with(&column.ty) {
+                return Err(CatalogError::Invalid(format!(
+                    "column {:?} has a DEFAULT that is not compatible with its type",
+                    column.name
+                )));
+            }
+        }
     }
     if vector_column_count > 1 {
         return Err(CatalogError::Invalid(format!(
@@ -1373,6 +2058,134 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
             ));
         }
     }
+    if let Some(pk_cols) = &schema.primary_key {
+        validate_primary_key(schema, pk_cols)?;
+    }
+    validate_unique_constraints(schema)?;
+    Ok(())
+}
+
+/// UNIQUE 制約（[`UniqueConstraint`]。TABLE-16・TASK-204、Issue #905）の
+/// 不変条件検査。`create_table`・`alter_table_add_unique_constraint`（追加後の
+/// スキーマ）・カタログ decode（v6）のいずれからも `validate_schema` 経由で
+/// 呼ばれる。
+///
+/// 検査項目（いずれも fail-closed・`CatalogError::Invalid`。主キーの
+/// [`validate_primary_key`] と同じ分類）:
+/// - 制約数が [`MAX_UNIQUE_CONSTRAINTS`] 以下
+/// - 各制約が非空・[`MAX_UNIQUE_CONSTRAINT_COLUMNS`] 以下・制約内の列名重複なし
+/// - 各列名が**生存列**に存在し、[`ColumnType::is_primary_key_allowed`]
+///   （主キーと共有する単一の一意キー許可型リスト。第 2 の許可リストを
+///   作らない）を満たす型
+/// - 同一列リスト（宣言順そのままの比較）の制約が重複しない
+///
+/// 主キーと異なり NULL 許容列を参照できる（NULLS DISTINCT。
+/// [`crate::constraint`] が NULL を含む行を当該制約の検査対象外とする）。
+fn validate_unique_constraints(schema: &TableSchema) -> Result<()> {
+    if schema.unique_constraints.len() > MAX_UNIQUE_CONSTRAINTS {
+        return Err(CatalogError::Invalid(format!(
+            "too many unique constraints: {}",
+            schema.unique_constraints.len()
+        )));
+    }
+    let mut seen_lists: Vec<&[String]> = Vec::with_capacity(schema.unique_constraints.len());
+    for constraint in &schema.unique_constraints {
+        let columns = constraint.columns();
+        if columns.is_empty() {
+            return Err(CatalogError::Invalid(
+                "unique constraint must reference at least one column".to_string(),
+            ));
+        }
+        if columns.len() > MAX_UNIQUE_CONSTRAINT_COLUMNS {
+            return Err(CatalogError::Invalid(format!(
+                "unique constraint references too many columns: {}",
+                columns.len()
+            )));
+        }
+        let mut seen: Vec<&str> = Vec::with_capacity(columns.len());
+        for name in columns {
+            if seen.contains(&name.as_str()) {
+                return Err(CatalogError::Invalid(format!(
+                    "unique constraint references column {name} more than once"
+                )));
+            }
+            seen.push(name.as_str());
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| &c.name == name)
+                .ok_or_else(|| {
+                    CatalogError::Invalid(format!(
+                        "unique constraint references unknown column: {name}"
+                    ))
+                })?;
+            if !column.ty.is_primary_key_allowed() {
+                return Err(CatalogError::Invalid(format!(
+                    "column {name} has a type that cannot be used in a unique constraint"
+                )));
+            }
+        }
+        if seen_lists.contains(&columns) {
+            return Err(CatalogError::Invalid(
+                "duplicate unique constraint over the same column list".to_string(),
+            ));
+        }
+        seen_lists.push(columns);
+    }
+    Ok(())
+}
+
+/// `PRIMARY KEY` 宣言（TABLE-16・TASK-204、Issue #903）の不変条件検査。
+/// `create_table`・カタログ decode（[`decode_schema_body`]）の両方から
+/// `validate_schema` 経由で呼ばれる。
+///
+/// 検査項目（いずれも fail-closed）:
+/// - 非空・[`MAX_PRIMARY_KEY_COLUMNS`] 以下
+/// - 列名の重複なし
+/// - 各列名が**生存列**（`schema.columns`）に存在する（削除済み列・`id` 疑似列は
+///   対象外。`id` は SQL 表層が `PRIMARY KEY (id)` を構文段階で正規化して除去する
+///   ため、ここへ到達する `"id"` は常に「存在しない列」として拒否される）
+/// - 各列が [`ColumnType::is_primary_key_allowed`] を満たす型
+/// - 各列が `nullable == false`（呼び出し元が事前に `false` へ設定する契約。
+///   本関数は黙って書き換えない）
+fn validate_primary_key(schema: &TableSchema, pk_cols: &[String]) -> Result<()> {
+    if pk_cols.is_empty() {
+        return Err(CatalogError::Invalid(
+            "PRIMARY KEY must declare at least one column".to_string(),
+        ));
+    }
+    if pk_cols.len() > MAX_PRIMARY_KEY_COLUMNS {
+        return Err(CatalogError::Invalid(format!(
+            "too many primary key columns: {}",
+            pk_cols.len()
+        )));
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(pk_cols.len());
+    for name in pk_cols {
+        if seen.contains(&name.as_str()) {
+            return Err(CatalogError::Invalid(format!(
+                "duplicate primary key column: {name}"
+            )));
+        }
+        seen.push(name.as_str());
+        let column = schema
+            .columns
+            .iter()
+            .find(|c| &c.name == name)
+            .ok_or_else(|| {
+                CatalogError::Invalid(format!("primary key references unknown column: {name}"))
+            })?;
+        if !column.ty.is_primary_key_allowed() {
+            return Err(CatalogError::Invalid(format!(
+                "column {name} has a type that cannot be a primary key column"
+            )));
+        }
+        if column.nullable {
+            return Err(CatalogError::Invalid(format!(
+                "primary key column {name} must be declared non-nullable"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1414,17 +2227,142 @@ fn encode_column_line_v3(
     ))
 }
 
+/// [`encode_column_line_v3`] の v4 版（6 フィールド。末尾に `default`。
+/// TABLE-16・TASK-204、Issue #904）。`default` は `None` を `-` として書く
+/// （墓標行・`DEFAULT` 未宣言の生存列の両方がこの経路を通る）。
+fn encode_column_line_v5(
+    name: &str,
+    type_name: &str,
+    param_field: &str,
+    nullable: bool,
+    state: char,
+    default: Option<&ColumnDefault>,
+) -> Result<String> {
+    validate_catalog_param(param_field)?;
+    let nullable_field = if nullable { "1" } else { "0" };
+    let default_field = match default {
+        None => "-".to_string(),
+        Some(d) => d.encode_catalog_field()?,
+    };
+    Ok(format!(
+        "{name}:{type_name}:{param_field}:{nullable_field}:{state}:{default_field}\n"
+    ))
+}
+
 /// [`TableSchema`] をカタログのテキスト形式へエンコードする。1 行目に
 /// フォーマットバージョン、2 行目に列数、以降 1 行 1 列（`name:type:dim:nullable`
 /// の 4 フィールドを `:` 区切り。識別子は `validate_identifier` により `:` を
 /// 含み得ないため、区切り文字との衝突は起きない）。エンコード時にも
 /// `validate_schema` を通し、不正なスキーマを永続化しない（fail-closed）。
+///
+/// バージョン選択: UNIQUE 制約を 1 つでも持つスキーマは（`PRIMARY KEY`・
+/// `DEFAULT`・墓標の有無を問わず）v6 で書く（TABLE-16・TASK-204、Issue #905）。
+/// それ以外で `DEFAULT` を 1 つでも持つスキーマは（`PRIMARY KEY`・墓標の
+/// 有無を問わず）v5 で書く（TABLE-16・TASK-204、Issue #904）。`DEFAULT` を
+/// 持たず `PRIMARY KEY` を持つスキーマは（墓標の有無を問わず）v4 で書く
+/// （TABLE-16・TASK-204、Issue #903）。どちらも持たないスキーマは従来どおり
+/// v2／v3（墓標の有無で選択）のまま、バイト列を変えない（既存ゴールデン
+/// テストへ影響しない）。
 fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     validate_schema(schema)?;
+    let has_default = schema.columns.iter().any(|c| c.default.is_some());
+    let has_unique = !schema.unique_constraints.is_empty();
     let mut out = String::new();
-    if schema.dropped_slots().is_empty() {
-        // 墓標を持たないスキーマは常に v2 で書く（バイト列不変。既存のゴールデン
-        // テストに影響しない。TABLE-19・Issue #901）。
+    if has_default || has_unique {
+        // UNIQUE 制約を持つスキーマは v6、それ以外で `DEFAULT` を持つスキーマは
+        // v5 で書く（`PRIMARY KEY` の有無に関わらず）。v6 は v5 と同じ本体
+        // （`pk:` 行・6 フィールドの列行）の後ろに `uniq:` セクションを追記
+        // するだけの上位集合（TABLE-16・TASK-204、Issue #905）。`pk:` 行は `cols:` 行の直後、列行より前に置き、主キー
+        // 宣言が無ければ空のまま書く（`decode_schema_body` はこれを「主キー
+        // なし」と解釈する。v4 の `pk:` 行は非空必須のまま変えない）。
+        // 識別子は `validate_identifier`（`validate_schema` が経由済み）により
+        // `,` を含み得ないため、`,` 区切りとの衝突は起きない。
+        out.push_str(if has_unique {
+            CATALOG_FORMAT_VERSION_V6
+        } else {
+            CATALOG_FORMAT_VERSION_V5
+        });
+        out.push('\n');
+        out.push_str(&format!("cols:{}\n", schema.physical_slot_count()));
+        let pk_field = schema
+            .primary_key
+            .as_ref()
+            .map(|cols| cols.join(","))
+            .unwrap_or_default();
+        out.push_str(&format!("pk:{pk_field}\n"));
+        for slot in schema.physical_slots() {
+            match slot {
+                PhysicalSlot::Live(_, column) => {
+                    let (type_name, param_field) = column.ty.catalog_fields();
+                    out.push_str(&encode_column_line_v5(
+                        &column.name,
+                        type_name,
+                        &param_field,
+                        column.nullable,
+                        'L',
+                        column.default.as_ref(),
+                    )?);
+                }
+                PhysicalSlot::Dropped(dropped) => {
+                    let (type_name, param_field) = dropped.ty().catalog_fields();
+                    out.push_str(&encode_column_line_v5(
+                        dropped.name(),
+                        type_name,
+                        &param_field,
+                        true,
+                        'D',
+                        None,
+                    )?);
+                }
+            }
+        }
+        if has_unique {
+            // 識別子は `validate_identifier`（列名は `validate_schema` 経由で
+            // 生存列名と一致することを検証済み）により `,`／`:`／改行を含み
+            // 得ないため、カンマ区切りで連結しても区切り文字と衝突しない。
+            out.push_str(&format!("uniq:{}\n", schema.unique_constraints.len()));
+            for constraint in &schema.unique_constraints {
+                out.push_str("U:");
+                out.push_str(&constraint.columns().join(","));
+                out.push('\n');
+            }
+        }
+    } else if let Some(pk_cols) = &schema.primary_key {
+        // 主キーを宣言したが DEFAULT は持たないスキーマは（墓標の有無に
+        // 関わらず）常に v4 で書く（TABLE-16・TASK-204、Issue #903）。`pk:`
+        // 行は `cols:` 行の直後、列行より前に置く。
+        out.push_str(CATALOG_FORMAT_VERSION_V4);
+        out.push('\n');
+        out.push_str(&format!("cols:{}\n", schema.physical_slot_count()));
+        out.push_str(&format!("pk:{}\n", pk_cols.join(",")));
+        for slot in schema.physical_slots() {
+            match slot {
+                PhysicalSlot::Live(_, column) => {
+                    let (type_name, param_field) = column.ty.catalog_fields();
+                    out.push_str(&encode_column_line_v3(
+                        &column.name,
+                        type_name,
+                        &param_field,
+                        column.nullable,
+                        'L',
+                    )?);
+                }
+                PhysicalSlot::Dropped(dropped) => {
+                    let (type_name, param_field) = dropped.ty().catalog_fields();
+                    out.push_str(&encode_column_line_v3(
+                        dropped.name(),
+                        type_name,
+                        &param_field,
+                        true,
+                        'D',
+                    )?);
+                }
+            }
+        }
+    } else if schema.dropped_slots().is_empty() {
+        // 主キー・DEFAULT・墓標のいずれも持たないスキーマは常に v2 で書く
+        // （バイト列不変。既存のゴールデンテストに影響しない。TABLE-19・
+        // Issue #901）。
         out.push_str(CATALOG_FORMAT_VERSION_LINE);
         out.push('\n');
         out.push_str(&format!("cols:{}\n", schema.columns.len()));
@@ -1440,8 +2378,9 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
             )?);
         }
     } else {
-        // 墓標が 1 つでもあるスキーマは v3 で書く。物理位置の昇順
-        // （[`TableSchema::physical_slots`]）で生存列・墓標を交互に列挙する。
+        // 墓標が 1 つでもあるが DEFAULT を持たないスキーマは v3 で書く。
+        // 物理位置の昇順（[`TableSchema::physical_slots`]）で生存列・墓標を
+        // 交互に列挙する。
         out.push_str(CATALOG_FORMAT_VERSION_V3);
         out.push('\n');
         out.push_str(&format!("cols:{}\n", schema.physical_slot_count()));
@@ -1536,17 +2475,42 @@ fn decode_schema_body(
         .next()
         .ok_or_else(|| CatalogError::Invalid("catalog value is empty".to_string()))?;
     // v3（TABLE-19・Issue #901）は 1 行あたり 5 フィールド（末尾に `state`
-    // `L`／`D`）を持つ以外は v2 と同じ枠組みを共有する。`cols:` は物理スロット
-    // 総数（v2 では常に生存列数と一致）を表す。
-    let is_v3 = match version_line {
-        CATALOG_FORMAT_VERSION_LINE => false,
-        CATALOG_FORMAT_VERSION_V3 => true,
+    // `L`／`D`）を持つ以外は v2 と同じ枠組みを共有する。v4（TABLE-16・
+    // TASK-204、Issue #903）はさらに `cols:` 行の直後に `pk:` 行を 1 行持つ
+    // （非空必須）。v5（TABLE-16・TASK-204、Issue #904）は v4 の上位集合で、
+    // `pk:` 行は主キー宣言が無ければ空を許し（`pk:` のみの行で「主キー
+    // なし」を表す）、列行は 6 番目に `default` フィールドを必須で持つ。
+    // `cols:` は物理スロット総数（v2 では常に生存列数と一致）を表す。
+    // v6（TABLE-16・TASK-204、Issue #905）は v5 と同じ本体の後ろ（列行の
+    // 直後）に `uniq:` セクションを持つ。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FormatVersion {
+        V2,
+        V3,
+        V4,
+        V5,
+        V6,
+    }
+    let format_version = match version_line {
+        CATALOG_FORMAT_VERSION_LINE => FormatVersion::V2,
+        CATALOG_FORMAT_VERSION_V3 => FormatVersion::V3,
+        CATALOG_FORMAT_VERSION_V4 => FormatVersion::V4,
+        CATALOG_FORMAT_VERSION_V5 => FormatVersion::V5,
+        CATALOG_FORMAT_VERSION_V6 => FormatVersion::V6,
         other => {
             return Err(CatalogError::Invalid(format!(
                 "unknown catalog format version: {other:?}"
             )))
         }
     };
+    let has_state_field = format_version != FormatVersion::V2;
+    let has_default_field =
+        format_version == FormatVersion::V5 || format_version == FormatVersion::V6;
+    // `pk:` 行を持つのは v4／v5／v6（v4 は非空必須、v5／v6 は空を「主キー
+    // なし」として許容する）。
+    let has_pk_line = format_version == FormatVersion::V4
+        || format_version == FormatVersion::V5
+        || format_version == FormatVersion::V6;
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::Invalid("catalog value truncated: missing cols line".to_string())
@@ -1563,6 +2527,48 @@ fn decode_schema_body(
         )));
     }
 
+    // v4／v5 専用: `pk:` 行を `cols:` 行の直後・列行より前に置く（TABLE-16・
+    // TASK-204、Issue #903／#904）。要素数は `Vec` を確保する前に
+    // `MAX_PRIMARY_KEY_COLUMNS` で上限検証する（untrusted 入力の扱い）。v4 は
+    // 非空必須（`primary_key.is_some()` 自体が v4 か v2/v3 かを分ける唯一の
+    // 判断材料）、v5 は空を「主キーなし」として許容する（DEFAULT の有無が
+    // v5 選択の判断材料であり、主キーの有無とは独立なため）。
+    let primary_key: Option<Vec<String>> = if has_pk_line {
+        let pk_line = lines.next().ok_or_else(|| {
+            CatalogError::Invalid("catalog value truncated: missing pk line".to_string())
+        })?;
+        let pk_body = pk_line
+            .strip_prefix("pk:")
+            .ok_or_else(|| CatalogError::Invalid(format!("malformed pk line: {pk_line:?}")))?;
+        if pk_body.is_empty() {
+            if format_version == FormatVersion::V4 {
+                return Err(CatalogError::Invalid(
+                    "v4 catalog format requires at least one primary key column".to_string(),
+                ));
+            }
+            None
+        } else {
+            let mut cols: Vec<String> = Vec::new();
+            for (i, name) in pk_body.split(',').enumerate() {
+                if i >= MAX_PRIMARY_KEY_COLUMNS {
+                    return Err(CatalogError::Invalid(format!(
+                        "too many primary key columns: exceeds {MAX_PRIMARY_KEY_COLUMNS}"
+                    )));
+                }
+                if name.is_empty() {
+                    return Err(CatalogError::Invalid(format!(
+                        "malformed pk line: {pk_line:?}"
+                    )));
+                }
+                validate_identifier(name)?;
+                cols.push(name.to_string());
+            }
+            Some(cols)
+        }
+    } else {
+        None
+    };
+
     // 残り行を、宣言スロット数（slot_count。上で MAX_COLUMN_COUNT 以下と検証済み）を
     // 超えない範囲でのみ構築する。旧実装の `lines.collect()` は残り行数が
     // 宣言列数と無関係に無制限へ膨らむ攻撃入力（大量の短い行）に対して行数比例の
@@ -1571,19 +2577,17 @@ fn decode_schema_body(
     // 未知の型タグ・不正な `param` はその列を構築する前に拒否する（Issue #880 D7）。
     // `slot_count` を超える行は「末尾の空行（トレーリング改行）1 行のみ」を
     // 許容し、それ以外は余剰行として拒否する。
+    //
+    // 列行はちょうど `slot_count` 行だけ読む（v6 はその直後に `uniq:`
+    // セクションが続くため、残り行の扱いは列行・`uniq:` セクションを読み
+    // 終えた後で一括して判定する。TABLE-16・TASK-204、Issue #905）。行が
+    // 不足した場合は後続の件数照合で拒否する。
     let mut columns = Vec::with_capacity(slot_count);
     let mut dropped: Vec<DroppedSlot> = Vec::new();
-    let mut trailing_seen = false;
-    for (line_index, line) in lines.enumerate() {
-        if line_index >= slot_count {
-            if trailing_seen || !line.is_empty() {
-                return Err(CatalogError::Invalid(format!(
-                    "catalog value line count mismatch: expected {slot_count} columns, got more than {slot_count} lines"
-                )));
-            }
-            trailing_seen = true;
-            continue;
-        }
+    for line_index in 0..slot_count {
+        let Some(line) = lines.next() else {
+            break;
+        };
 
         let mut fields = line.split(':');
         let name = fields
@@ -1598,10 +2602,19 @@ fn decode_schema_body(
         let nullable_field = fields
             .next()
             .ok_or_else(|| CatalogError::Invalid(format!("malformed column line: {line:?}")))?;
-        // v2 は 4 フィールド固定（state 相当は常に「生存」）。v3 は 5 番目に
-        // `state` フィールドを必須で持つ。
+        // v2 は 4 フィールド固定（state 相当は常に「生存」）。v3／v4 は
+        // 5 番目に `state` フィールドを必須で持ち、v5 はさらに 6 番目に
+        // `default` を必須で持つ。
         let state_field =
-            if is_v3 {
+            if has_state_field {
+                Some(fields.next().ok_or_else(|| {
+                    CatalogError::Invalid(format!("malformed column line: {line:?}"))
+                })?)
+            } else {
+                None
+            };
+        let default_field =
+            if has_default_field {
                 Some(fields.next().ok_or_else(|| {
                     CatalogError::Invalid(format!("malformed column line: {line:?}"))
                 })?)
@@ -1633,9 +2646,25 @@ fn decode_schema_body(
 
         match state_field {
             None | Some("L") => {
-                columns.push(ColumnDef::new(name, ty, nullable));
+                let mut column = ColumnDef::new(name, ty, nullable);
+                if let Some(field) = default_field {
+                    // decode 側は「fail-closed（不正な default はスキーマ自体を
+                    // 読み込み不能にする）」方針。`ColumnDefault::compatible_with`
+                    // による型整合は後続の `validate_schema` が担う。
+                    column.default = ColumnDefault::decode_catalog_field(field)?;
+                }
+                columns.push(column);
             }
             Some("D") => {
+                // 墓標は default を持たない（encode 側は常に `-` を書く。
+                // 手書きの不正データによる持ち込みも fail-closed に拒否する）。
+                if let Some(field) = default_field {
+                    if field != "-" {
+                        return Err(CatalogError::Invalid(format!(
+                            "dropped column {name:?} must not declare a DEFAULT"
+                        )));
+                    }
+                }
                 // 墓標の型は必ずフレーム等価型（TABLE-19 D1・D2）でなければ
                 // ならない。手書きの不正データが `VECTOR`／`ENUM`／`JSON`／
                 // `JSONB` を削除済み状態で持ち込むのを拒否する。
@@ -1672,20 +2701,133 @@ fn decode_schema_body(
             columns.len() + dropped.len()
         )));
     }
-    // v3 なのに墓標 0 件は形式の一意性に反する（同一スキーマが 2 通りに
-    // エンコードされ得る状態を許さない。TABLE-19 D2）。
-    if is_v3 && dropped.is_empty() {
+    // v3（墓標を持つが主キー・DEFAULT を持たない）なのに墓標 0 件は形式の
+    // 一意性に反する（同一スキーマが 2 通りにエンコードされ得る状態を
+    // 許さない。TABLE-19 D2）。v4／v5（主キー・DEFAULT のいずれかを持つ）は
+    // 墓標が 0 件でも一意な唯一のエンコードであるため、この不変条件の対象外と
+    // する（`format_version` 自体が v4/v5 か v2/v3 かを分ける唯一の判断材料
+    // であり、`pk:` 行の必須非空〔v4〕・DEFAULT 0 件拒否〔v5、下記〕は
+    // それぞれ別途検証済み）。
+    if format_version == FormatVersion::V3 && dropped.is_empty() {
         return Err(CatalogError::Invalid(
             "v3 catalog format requires at least one dropped column".to_string(),
         ));
     }
+    // v5 なのに DEFAULT 0 件は形式の一意性に反する（同一スキーマが v2／v3／v4
+    // と v5 の 2 通りにエンコードされ得る状態を許さない。TABLE-16・TASK-204、
+    // Issue #904。TABLE-19 D2 と同じ設計判断）。
+    if format_version == FormatVersion::V5 && !columns.iter().any(|c| c.default.is_some()) {
+        return Err(CatalogError::Invalid(
+            "v5 catalog format requires at least one column with a DEFAULT".to_string(),
+        ));
+    }
 
-    let schema = TableSchema::from_parts(table_name, columns, dropped);
+    // v6 専用の `uniq:` セクション（TABLE-16・TASK-204、Issue #905）。構造
+    // （件数・`U:` 行・識別子形状・制約内重複・同一列リスト重複）は共有
+    // パーサー [`parse_unique_section`] が検証し、参照列の実在・型適格性は
+    // 後続の `validate_schema`（[`validate_unique_constraints`]）が担う。
+    let unique_constraints: Vec<UniqueConstraint> = if format_version == FormatVersion::V6 {
+        parse_unique_section(&mut lines)
+            .map_err(CatalogError::Invalid)?
+            .into_iter()
+            .map(UniqueConstraint::new)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // 宣言スロット数（v6 は `uniq:` セクションも）を超える残り行は、「末尾の
+    // 空行（トレーリング改行）1 行のみ」を許容し、それ以外は余剰行として
+    // 拒否する。
+    let mut trailing_seen = false;
+    for line in lines {
+        if trailing_seen || !line.is_empty() {
+            return Err(CatalogError::Invalid(format!(
+                "catalog value line count mismatch: expected {slot_count} columns, got more than {slot_count} lines"
+            )));
+        }
+        trailing_seen = true;
+    }
+
+    let schema = TableSchema::from_parts(
+        table_name,
+        columns,
+        dropped,
+        primary_key,
+        unique_constraints,
+    );
     // デコード結果を再度検証する（列数上限・列名重複・識別子・墓標の不変条件）。
     // 手書きの不正データがフィールドごとの検証をすり抜けても、スキーマ全体の
     // 不変条件はここで担保する。
     validate_schema(&schema)?;
     Ok(schema)
+}
+
+/// カタログ v6 の `uniq:` セクション（`uniq:<n>` 行と `n` 個の
+/// `U:<col>[,<col>]*` 行。TABLE-16・TASK-204、Issue #905）を構造検証しつつ
+/// 読み取る共有パーサー。[`decode_schema_body`] と軽量パーサー
+/// [`catalog_value_references_enum_type`] の両方が使い、両者の fail-closed
+/// 判定を 1 か所に揃える（片方だけが緩いと、`decode_schema_body` が拒否する
+/// 壊れた値を `DROP TYPE` の依存判定だけが「依存なし」に丸めてしまう）。
+///
+/// 検証項目: `uniq:` 行の存在・件数の数値形式・`1..=MAX_UNIQUE_CONSTRAINTS`
+/// （0 件は「UNIQUE 制約を持たないスキーマは v2〜v5 で書く」形式の一意性
+/// 契約に反する）・各 `U:` 行の接頭辞・空要素なし・要素数
+/// `MAX_UNIQUE_CONSTRAINT_COLUMNS` 以下（`Vec` へ積む前に判定）・識別子形状・
+/// 制約内の列名重複なし・同一列リストの制約重複なし。参照列の実在・型適格性は
+/// 呼び出し元が判定する（列行の集合が必要なため）。エラーは呼び出し元が自身の
+/// 分類（`Invalid`／`CorruptSchema`）へ包む文言のみを返す。
+fn parse_unique_section<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+) -> std::result::Result<Vec<Vec<String>>, String> {
+    let uniq_line = lines
+        .next()
+        .ok_or_else(|| "catalog value truncated: missing uniq line".to_string())?;
+    let count_str = uniq_line
+        .strip_prefix("uniq:")
+        .ok_or_else(|| format!("malformed uniq line: {uniq_line:?}"))?;
+    let count: usize = count_str
+        .parse()
+        .map_err(|_| format!("malformed unique constraint count: {count_str:?}"))?;
+    if count == 0 {
+        return Err("v6 catalog format requires at least one unique constraint".to_string());
+    }
+    if count > MAX_UNIQUE_CONSTRAINTS {
+        return Err(format!("too many unique constraints: {count}"));
+    }
+    let mut constraints: Vec<Vec<String>> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let line = lines
+            .next()
+            .ok_or_else(|| "catalog value truncated: missing unique constraint line".to_string())?;
+        let body = line
+            .strip_prefix("U:")
+            .ok_or_else(|| format!("malformed unique constraint line: {line:?}"))?;
+        let mut names: Vec<String> = Vec::new();
+        for (i, name) in body.split(',').enumerate() {
+            if i >= MAX_UNIQUE_CONSTRAINT_COLUMNS {
+                return Err(format!(
+                    "unique constraint references too many columns: exceeds {MAX_UNIQUE_CONSTRAINT_COLUMNS}"
+                ));
+            }
+            if name.is_empty() {
+                return Err(format!("malformed unique constraint line: {line:?}"));
+            }
+            validate_identifier(name)
+                .map_err(|_| format!("malformed unique constraint line: {line:?}"))?;
+            if names.iter().any(|n| n == name) {
+                return Err(format!(
+                    "unique constraint references column {name:?} more than once"
+                ));
+            }
+            names.push(name.to_string());
+        }
+        if constraints.contains(&names) {
+            return Err("duplicate unique constraint over the same column list".to_string());
+        }
+        constraints.push(names);
+    }
+    Ok(constraints)
 }
 
 /// ユーザーテーブル `table_name` に対応する行ストア用の動的 redb テーブル名を組み立てる
@@ -1951,6 +3093,18 @@ impl Storage {
             if table.get(schema.name.as_str())?.is_some() {
                 return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
             }
+            // ビューとテーブルは名前空間を共有する（TABLE-18・SQL-23・TASK-205、
+            // Issue #909）。`VIEWS_TABLE` 側の衝突も同じ `TableAlreadyExists` へ
+            // 写像する。
+            match write_txn.open_table(VIEWS_TABLE) {
+                Ok(views_table) => {
+                    if views_table.get(schema.name.as_str())?.is_some() {
+                        return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(CatalogError::from(e)),
+            }
             table.insert(schema.name.as_str(), encoded.as_slice())?;
         }
         bump_table_generation_in_txn(&write_txn, &schema.name)?;
@@ -1990,6 +3144,26 @@ impl Storage {
         validate_identifier(table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
+            // ビュー名前空間との判別・依存検査（TABLE-18・SQL-23・TASK-205、
+            // Issue #909）。テーブル削除より前の同一 write txn 内で判定する
+            // （TOCTOU 回避）。`name` がビューなら `WrongObjectKind`（`42809`）、
+            // このテーブルを参照するビューが 1 つでも残っていれば
+            // `DependentViewsExist`（`2BP01`）。
+            match write_txn.open_table(VIEWS_TABLE) {
+                Ok(views_table) => {
+                    if views_table.get(table_name)?.is_some() {
+                        return Err(CatalogError::WrongObjectKind(table_name.to_string()));
+                    }
+                    let dependents = views_depending_on_in_txn(&views_table, table_name)?;
+                    if !dependents.is_empty() {
+                        return Err(CatalogError::DependentViewsExist(table_name.to_string()));
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(CatalogError::from(e)),
+            }
+        }
+        {
             let mut table = match write_txn.open_table(CATALOG_TABLE) {
                 Ok(table) => table,
                 Err(redb::TableError::TableDoesNotExist(_)) => {
@@ -2026,7 +3200,18 @@ impl Storage {
                 "column added via ALTER TABLE ADD COLUMN must be nullable".to_string(),
             ));
         }
+        // `DEFAULT` を伴う ADD COLUMN は未対応（TABLE-16・TASK-204、Issue #904
+        // D7）。既存行に対する読み出し時の DEFAULT 補完（PostgreSQL の
+        // `ALTER TABLE ... ADD COLUMN ... DEFAULT ...` 相当）を実装していない
+        // ため、受理すると既存行が常に NULL で読める一方、新規行だけ既定値を
+        // 持つという意味論の食い違いが生じる。fail-closed に拒否する。
+        if column.default.is_some() {
+            return Err(CatalogError::Invalid(
+                "column added via ALTER TABLE ADD COLUMN must not declare a DEFAULT".to_string(),
+            ));
+        }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+
         {
             // 呼び出し元が渡した `ColumnType::Enum` の `Arc<EnumTypeDef>` は信頼せず、
             // この write txn から見えるカタログ登録済みの定義で必ず置き換える
@@ -2049,11 +3234,12 @@ impl Storage {
             // 列数上限は物理スロット総数（生存列 + 墓標）に適用する（TABLE-19 D1・
             // Issue #901。墓標も物理容量を消費するため、ADD 前に既存の墓標数も
             // 合算して判定する）。
+            // 上限超過は `Invalid` と区別した `TooManyColumns` で返す（Issue #900。
+            // SQL 表層 `ALTER TABLE ADD COLUMN` が `54000` へ写像するため）。
             if schema.physical_slot_count() >= MAX_COLUMN_COUNT {
-                return Err(CatalogError::Invalid(format!(
-                    "too many columns: {}",
-                    schema.physical_slot_count() + 1
-                )));
+                return Err(CatalogError::TooManyColumns {
+                    count: schema.physical_slot_count().saturating_add(1),
+                });
             }
             schema.columns.push(column);
             let encoded = encode_schema(&schema)?;
@@ -2117,6 +3303,31 @@ impl Storage {
             if ty.is_vector() {
                 return Err(CatalogError::ProtectedColumn(column_name.to_string()));
             }
+            // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）の構成列は
+            // `constraint::enforce_unique_keys_in_txn` がテナント全行を走査する
+            // 前提として生存し続けなければならない。ここで拒否せず
+            // `schema.columns.remove` へ進むと、`validate_schema` の
+            // 「主キー列が生存列に存在すること」検査に引っかかり
+            // `CatalogError::Invalid`（意味論的エラー）として現れてしまい、
+            // `ALTER TABLE DROP COLUMN` の依存オブジェクト検査として一貫しない
+            // 分類になる（`drop_enum_type` の `DependentObjectsStillExist` と
+            // 同じ分類へ揃える）。
+            //
+            // UNIQUE 制約（TABLE-16・TASK-204、Issue #905）が参照する列も同様に
+            // 暗黙 cascade で制約ごと消さず、明示的に拒否する。
+            if schema
+                .primary_key
+                .as_ref()
+                .is_some_and(|pk| pk.iter().any(|c| c == column_name))
+                || schema
+                    .unique_constraints
+                    .iter()
+                    .any(|u| u.columns().iter().any(|c| c == column_name))
+            {
+                return Err(CatalogError::DependentObjectsStillExist(
+                    column_name.to_string(),
+                ));
+            }
             let physical_index = u16::try_from(physical_index).map_err(|_| {
                 CatalogError::Invalid("dropped column physical index overflow".to_string())
             })?;
@@ -2135,6 +3346,63 @@ impl Storage {
             // を含む全ての不変条件を検証する。ここでの追加検証は不要。
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// 既存テーブルへ UNIQUE 制約を追加する（Rust API 専用。TABLE-16・TASK-204、
+    /// Issue #905）。SQL 表層の `ALTER TABLE ... ADD UNIQUE` は対象外。
+    ///
+    /// 追加後のスキーマとして [`validate_schema`] を先に通し（未宣言列・対象外型・
+    /// 上限超過・同一列リストの制約重複は `CatalogError::Invalid`）、その後
+    /// 対象テーブルの**全行**（`Public`／`Private` を問わない。DDL は
+    /// `PolicyContext` を取らないテーブル単位の共有資源操作であるため）を
+    /// テナントごとに独立して走査し、いずれかのテナント内で新しい制約列の値の
+    /// 組が重複する行が 1 件でもあれば `Err(CatalogError::UniqueConstraintViolation)`
+    /// で拒否する（副作用ゼロ。write トランザクションを commit せず破棄する）。
+    /// テナントを跨いだ同値は許容する。判定は書き込み時の検査点と同じ正準キーで
+    /// 行う（[`crate::constraint::table_has_duplicate_unique_key`]）。
+    ///
+    /// `sql::scalar_index` 等の `(table, PolicyContext)` 可視スナップショット
+    /// 由来の索引は一切流用しない（可視集合はテナント内の部分集合に過ぎず、
+    /// 不可視行の重複を見逃す fail-open になるため）。
+    pub fn alter_table_add_unique_constraint(
+        &self,
+        table_name: &str,
+        columns: &[&str],
+    ) -> Result<()> {
+        validate_identifier(table_name)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        {
+            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let new_columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+            let mut constraints = schema.unique_constraints.clone();
+            constraints.push(UniqueConstraint::new(new_columns.clone()));
+            let updated = schema.clone().with_unique_constraints(constraints);
+            // 既存行の走査より前に、追加後のスキーマとして検証する。
+            validate_schema(&updated)?;
+
+            let row_table_name = user_rows_table_name(table_name);
+            match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+                Ok(row_table) => {
+                    if crate::constraint::table_has_duplicate_unique_key(
+                        &row_table,
+                        &updated,
+                        &new_columns,
+                    )? {
+                        return Err(CatalogError::UniqueConstraintViolation);
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    // 初回挿入前で行ストアが物理的に未作成（既存行 0 件）。
+                }
+                Err(e) => return Err(map_row_table_error(e)),
+            }
+
+            let encoded = encode_schema(&updated)?;
+            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            catalog_table.insert(table_name, encoded.as_slice())?;
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
@@ -2315,6 +3583,129 @@ impl Storage {
             }
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、Issue #909）の
+    /// 永続化。呼び出し元（`sql::ddl::execute_create_view`）は許可リスト検証
+    /// （`sql::allowlist::validate_create_view_tokens`）を通過した `name`・
+    /// `base_relation`・`body_sql` を渡す（カタログ照会自体はここで初めて行う。
+    /// 構文検証段はカタログを一切照会しない契約）。
+    ///
+    /// `body_sql` はこのメソッド自身も [`parse_view_body`]（`CREATE VIEW` 構文
+    /// 検証・`sql::view::resolve_from` の再検証と同一実装）で再検証し、`FROM`
+    /// が指す名前が `base_relation` と一致することを保存前に確認する
+    /// （codex-review 指摘・PR #1048: 本メソッドは `pub fn` の Rust API であり、
+    /// SQL 表層の `validate_create_view_tokens`〔`body_sql` を必ず
+    /// `render_view_body(parsed)` として `base_relation` と対応づけて生成する〕
+    /// を経由しない呼び出し元が、`body_sql` の実際の `FROM` と食い違う
+    /// `base_relation`・許可リスト外の形状〔式項目・UDF 述語〕を持つ定義を
+    /// そのまま永続化できてしまっていた。`sql::view::resolve_from` は列公開
+    /// 判定を `body_sql` の投影から、連鎖の探索先を `base_relation` から
+    /// それぞれ独立に読むため、この食い違いは「`body_sql` が宣言する列は
+    /// 実際には別の関係に対して検証されたものではない」という列スコープ契約
+    /// 〔`sql::view::check_columns_within_view`〕の前提を静かに破る）。
+    ///
+    /// 判定順序（同一 write txn 内。TOCTOU 回避）: `body_sql` の構文・
+    /// 参照先一致検証（`Err(Invalid)`）→ 名前空間の衝突
+    /// （[`CATALOG_TABLE`]／[`VIEWS_TABLE`] のいずれか。`Err(TableAlreadyExists)`）
+    /// → 参照先の存在・ネスト深さ（[`resolve_reference_depth_in_txn`]。参照先
+    /// 不存在は `Err(TableNotFound)`、深さ超過は `Err(ViewLimitExceeded)`）→
+    /// 登録件数上限（`Err(ViewLimitExceeded)`）→ 保存。
+    ///
+    /// 自己参照（`CREATE VIEW v AS ... FROM v`）は `base_relation == name` が
+    /// [`CATALOG_TABLE`]・[`VIEWS_TABLE`] のいずれにも存在しない（`name` は
+    /// この時点でまだ登録されていない）ことから構造的に `TableNotFound` へ
+    /// 落ち、何も永続化されない。行ストア・世代カウンタは持たないため
+    /// [`bump_table_generation_in_txn`] は呼ばない。
+    pub fn create_view(&self, name: &str, base_relation: &str, body_sql: &str) -> Result<()> {
+        validate_identifier(name)?;
+        if body_sql.len() > MAX_VIEW_BODY_BYTES {
+            return Err(CatalogError::ViewLimitExceeded(
+                "view body too large".to_string(),
+            ));
+        }
+        validate_view_body_matches_base_relation(body_sql, base_relation)?;
+        let encoded = encode_view_def(&ViewDef {
+            base_relation: base_relation.to_string(),
+            body_sql: body_sql.to_string(),
+        })?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        {
+            let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            if catalog_table.get(name)?.is_some() {
+                return Err(CatalogError::TableAlreadyExists(name.to_string()));
+            }
+            let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+            if views_table.get(name)?.is_some() {
+                return Err(CatalogError::TableAlreadyExists(name.to_string()));
+            }
+            let depth =
+                resolve_reference_depth_in_txn(&catalog_table, &views_table, base_relation)?;
+            // テーブル自身が深さ 0 のため、それを直接参照する新規ビューの深さは
+            // `depth`（参照先の深さ）+ 1。
+            let new_depth = depth.checked_add(1).ok_or_else(|| {
+                CatalogError::ViewLimitExceeded("view nesting depth overflow".to_string())
+            })?;
+            if new_depth > MAX_VIEW_NESTING_DEPTH {
+                return Err(CatalogError::ViewLimitExceeded(
+                    "view nesting depth exceeds limit".to_string(),
+                ));
+            }
+            let count = views_table.len()?;
+            if count >= MAX_VIEWS as u64 {
+                return Err(CatalogError::ViewLimitExceeded(
+                    "too many views".to_string(),
+                ));
+            }
+            views_table.insert(name, encoded.as_slice())?;
+        }
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）。他のビューが
+    /// `name` を参照している場合は `Err(DependentViewsExist)`（作り直しによる
+    /// 循環構築を阻止する）。`name` がテーブルとして存在する場合は
+    /// `Err(WrongObjectKind)`。いずれの名前空間にも存在しない場合は
+    /// `Err(ViewNotFound)`。行ストア・世代カウンタは持たないため
+    /// テーブル単位の世代 bump は行わない。
+    pub fn drop_view(&self, name: &str) -> Result<()> {
+        validate_identifier(name)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        {
+            let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            if catalog_table.get(name)?.is_some() {
+                return Err(CatalogError::WrongObjectKind(name.to_string()));
+            }
+        }
+        {
+            let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+            let dependents = views_depending_on_in_txn(&views_table, name)?;
+            if !dependents.is_empty() {
+                return Err(CatalogError::DependentViewsExist(name.to_string()));
+            }
+            if views_table.remove(name)?.is_none() {
+                return Err(CatalogError::ViewNotFound(name.to_string()));
+            }
+        }
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// ビュー定義をスナップショット読み取りで取得する（[`TableLookup::
+    /// view_definition`] のバックエンド実装。存在しない場合は `Ok(None)`——
+    /// テーブル名かどうかを問わず「ビューとしては見つからない」ことだけを表す
+    /// fail-closed な戻り値で、呼び出し元〔`sql::view::resolve_from`〕が
+    /// テーブルとしての存在確認を別途行う）。
+    pub fn view_definition(&self, name: &str) -> Result<Option<ViewDef>> {
+        let read_txn = self.db().begin_read()?;
+        let table = match read_txn.open_table(VIEWS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        match table.get(name)? {
+            Some(guard) => Ok(Some(decode_view_def(guard.value())?)),
+            None => Ok(None),
+        }
     }
 
     /// テーブル定義を読み出す（スナップショット読み取り）。存在しない場合は
@@ -2635,6 +4026,13 @@ impl TableLookup for Storage {
             Err(other) => Err(table_lookup_error(other)),
         }
     }
+
+    /// [`Storage::view_definition`]（本ファイル上部の inherent メソッド）へ
+    /// 委譲し、`CatalogError` は [`table_lookup_error`] で SQL 表層の契約へ
+    /// 写像する（TABLE-18・SQL-23・TASK-205、Issue #909）。
+    fn view_definition(&self, name: &str) -> std::result::Result<Option<ViewDef>, SqlSurfaceError> {
+        Storage::view_definition(self, name).map_err(table_lookup_error)
+    }
 }
 
 /// [`TableLookup::table_exists`]（`impl TableLookup for Storage`）と
@@ -2662,9 +4060,19 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::TypeNotFound(_)
         | CatalogError::TypeAlreadyExists(_)
         | CatalogError::DependentObjectsStillExist(_)
+        // ビュー関連の variant は `table_exists`（テーブルカタログのみを引く）
+        // からは構造的に到達しない（`view_definition` 経由のみで発生する）が、
+        // `CatalogError` の網羅 `match` を保つため他の未接続 variant と同じ
+        // `Internal` へ丸める（security.md「不安全な設計」対応）。
+        | CatalogError::ViewNotFound(_)
+        | CatalogError::WrongObjectKind(_)
+        | CatalogError::DependentViewsExist(_)
+        | CatalogError::ViewLimitExceeded(_)
         | CatalogError::ColumnNotFound(_)
         | CatalogError::ProtectedColumn(_)
-        | CatalogError::IncompatibleTypeChange { .. } => SqlSurfaceError::Internal {
+        | CatalogError::IncompatibleTypeChange { .. }
+        | CatalogError::UniqueConstraintViolation
+        | CatalogError::TooManyColumns { .. } => SqlSurfaceError::Internal {
             detail: "catalog lookup failed".to_string(),
         },
         // 読み取り専用の存在確認（`table_exists`）は書き込みトランザクションを
@@ -2757,20 +4165,35 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     let version_line = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema("catalog value is empty".to_string()))?;
-    // v3（TABLE-19・Issue #901）は列行が 5 フィールド（末尾に `state`）になる
-    // 以外は同じ枠組み。生存・削除済みいずれの行も保守的に依存判定の対象に
-    // 含める（`decode_schema_body` は削除済み列の型を必ず TEXT へ正規化するが、
-    // ここは decode の完全な検証を経由しない軽量パーサーであり、fail-closed に
-    // 倒して依存を見落とさない）。
-    let is_v3 = match version_line {
-        CATALOG_FORMAT_VERSION_LINE => false,
-        CATALOG_FORMAT_VERSION_V3 => true,
+    // v3（TABLE-19・Issue #901）・v4（TABLE-16・TASK-204、Issue #903）・v5
+    // （TABLE-16・TASK-204、Issue #904）は列行が 5 フィールド（末尾に
+    // `state`。v5 はさらに 6 番目の `default` を持つ）になる以外は同じ枠組み。
+    // 生存・削除済みいずれの行も保守的に依存判定の対象に含める
+    // （`decode_schema_body` は削除済み列の型を必ず TEXT へ正規化するが、
+    // ここは decode の完全な検証を経由しない軽量パーサーであり、fail-closed
+    // に倒して依存を見落とさない）。v4／v5 は `cols:` 行の直後に `pk:` 行を
+    // 追加で持つため、列行を読み始める前に 1 行読み飛ばす（内容の検証は
+    // `decode_schema_body` に委ね、ここでは行の存在のみを要求する。
+    // 存在しなければ他のフィールド数不整合と同じく `CorruptSchema` で
+    // 拒否する）。
+    let (has_state_field, has_default_field) = match version_line {
+        CATALOG_FORMAT_VERSION_LINE => (false, false),
+        CATALOG_FORMAT_VERSION_V3 => (true, false),
+        CATALOG_FORMAT_VERSION_V4 => (true, false),
+        CATALOG_FORMAT_VERSION_V5 => (true, true),
+        // v6（TABLE-16・TASK-204、Issue #905）は v5 と同じ列行の後ろに
+        // `uniq:` セクションを持つ（下記で検証する）。
+        CATALOG_FORMAT_VERSION_V6 => (true, true),
         other => {
             return Err(CatalogError::CorruptSchema(format!(
                 "unknown catalog format version: {other:?}"
             )))
         }
     };
+    let is_v4 = version_line == CATALOG_FORMAT_VERSION_V4;
+    let is_v5 = version_line == CATALOG_FORMAT_VERSION_V5;
+    let is_v6 = version_line == CATALOG_FORMAT_VERSION_V6;
+    let has_pk_line = is_v4 || is_v5 || is_v6;
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
@@ -2786,21 +4209,85 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
             "too many columns: {col_count}"
         )));
     }
+    // v4／v5 の pk 行は `decode_schema_body`（構造検証）→ `validate_primary_key`
+    // （重複列・未知列の検証。`validate_schema` 経由）の 2 段で検証される。
+    // この軽量パーサーは列行を読む前に pk 行の構造だけを検証し（要素数上限・
+    // 各要素の非空・識別子妥当性）、重複列・未知列の判定は列行を読み終えて
+    // 実在する列名の集合が判明してから行う（codex-review P1 指摘・PR #1050:
+    // 接頭辞と非空だけの軽量チェックでは、重複列・未知列・空要素等を含み
+    // `decode_schema_body`／`validate_schema` なら `CorruptSchema` で拒否する
+    // はずの壊れた v4 カタログでも、ENUM 参照列が無ければ「依存なし」に
+    // 丸められ `drop_enum_type` の fail-closed 依存関係検査をすり抜けてしまう）。
+    // v4 は非空必須、v5 は空を「主キーなし」として許容する
+    // （`decode_schema_body` と同じ契約。TABLE-16・TASK-204、Issue #904）。
+    let pk_cols: Option<Vec<String>> = if has_pk_line {
+        let pk_line = lines.next().ok_or_else(|| {
+            CatalogError::CorruptSchema("catalog value truncated: missing pk line".to_string())
+        })?;
+        let pk_body = pk_line.strip_prefix("pk:").ok_or_else(|| {
+            CatalogError::CorruptSchema(format!("malformed pk line: {pk_line:?}"))
+        })?;
+        if pk_body.is_empty() {
+            if is_v4 {
+                return Err(CatalogError::CorruptSchema(
+                    "v4 catalog format requires at least one primary key column".to_string(),
+                ));
+            }
+            None
+        } else {
+            let mut cols: Vec<String> = Vec::new();
+            for (i, name) in pk_body.split(',').enumerate() {
+                if i >= MAX_PRIMARY_KEY_COLUMNS {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "too many primary key columns: exceeds {MAX_PRIMARY_KEY_COLUMNS}"
+                    )));
+                }
+                if name.is_empty() {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "malformed pk line: {pk_line:?}"
+                    )));
+                }
+                validate_identifier(name).map_err(|_| {
+                    CatalogError::CorruptSchema(format!("malformed pk line: {pk_line:?}"))
+                })?;
+                cols.push(name.to_string());
+            }
+            Some(cols)
+        }
+    } else {
+        None
+    };
 
     let mut found = false;
+    // v5 の「DEFAULT 0 件のカタログを拒否する」不変条件（`decode_schema_body`
+    // 側。TABLE-16・TASK-204、Issue #904）をこの軽量パーサーでも敷く
+    // （codex-review P1 指摘・Issue #904・PR #1051: v5 分岐が `default`
+    // フィールドの存在確認のみで内容を検証しないと、DEFAULT を 1 件も
+    // 持たない・不正なタグ／16 進文字列／型不一致の default を持つ壊れた
+    // v5 カタログでも ENUM 参照だけを見て「依存なし」に丸められ、
+    // `decode_schema_body` が `CorruptSchema` で拒否するはずの値に対して
+    // `DROP TYPE`／`ALTER TYPE` の fail-closed 依存関係検査だけがすり抜けて
+    // しまう）。
+    let mut seen_default = false;
+    let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for _ in 0..col_count {
         let line = lines.next().ok_or_else(|| {
             CatalogError::CorruptSchema("catalog value truncated: missing column line".to_string())
         })?;
         let mut fields = line.split(':');
-        let (Some(_name), Some(tag), Some(param), Some(_nullable)) =
+        let (Some(name), Some(tag), Some(param), Some(_nullable)) =
             (fields.next(), fields.next(), fields.next(), fields.next())
         else {
             return Err(CatalogError::CorruptSchema(format!(
                 "malformed column line: {line:?}"
             )));
         };
-        if is_v3 {
+        // state（v2 は常に生存扱い）を先に確定させてから重複検査を行う。
+        // `validate_schema` の一意性検査は生存列同士のみが対象で墓標は対象外
+        // （TABLE-19: 削除→再作成で同名列が墓標と生存列に共存しうる）ため、
+        // ここでも生存列名だけを `seen_names` へ積む（対象を広げると正当な
+        // v3/v4 カタログを誤って壊れた値扱いしてしまう）。
+        let is_live = if has_state_field {
             // v3 の 5 番目フィールドは `state`（"L"＝生存／"D"＝削除済み）。
             // `decode_schema_body` の state 検証（"L"／"D" 以外は拒否）と同じ
             // 契約をここでも徹底する（codex-review P1 指摘・PR #1045: フィールドの
@@ -2808,7 +4295,8 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
             // 「依存なし」に丸められ `drop_enum_type` が破損カタログを残したまま
             // ENUM 型を削除できてしまう）。
             match fields.next() {
-                Some("L") | Some("D") => {}
+                Some("L") => true,
+                Some("D") => false,
                 Some(other) => {
                     return Err(CatalogError::CorruptSchema(format!(
                         "malformed column state field: {other:?}"
@@ -2820,16 +4308,68 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
                     )))
                 }
             }
+        } else {
+            true
+        };
+        // v5 の 6 番目フィールドは `default`。この軽量パーサーは依存判定に
+        // 値を直接使わないが、`decode_schema_body` と同じ fail-closed 方針を
+        // 徹底するため内容も検証する（codex-review P1 指摘・Issue #904・
+        // PR #1051）: 墓標（`is_live == false`）は必ず `-`、生存列は
+        // `ColumnDefault::decode_catalog_field`（未知タグ・不正 16 進・不正
+        // UTF-8 を拒否する既存デコーダ）でデコードしたうえ、列の型タグと
+        // 大分類が整合すること（`ColumnDefault::compatible_with` の判定基準を
+        // タグ文字列ベースで再現）を確認する。
+        if has_default_field {
+            let default_field = fields.next().ok_or_else(|| {
+                CatalogError::CorruptSchema(format!("malformed column line: {line:?}"))
+            })?;
+            if is_live {
+                let decoded = ColumnDefault::decode_catalog_field(default_field)
+                    .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+                if let Some(default) = decoded {
+                    if !column_default_compatible_with_tag(&default, tag) {
+                        return Err(CatalogError::CorruptSchema(format!(
+                            "column {name:?} has a DEFAULT that is not compatible with its type"
+                        )));
+                    }
+                    seen_default = true;
+                }
+            } else if default_field != "-" {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "dropped column {name:?} must not declare a DEFAULT"
+                )));
+            }
         }
         if fields.next().is_some() {
             return Err(CatalogError::CorruptSchema(format!(
                 "malformed column line: {line:?}"
             )));
         }
+        // 列名の重複は `validate_schema`（生存列同士のみを対象とする一意性
+        // 検証）が拒否する不変条件であり、この軽量パーサーでも同じ契約を
+        // 敷いておかないと、ENUM 未参照列を重複させただけの壊れた v4/v3
+        // カタログが「依存なし」に丸められうる（同種の fail-closed 徹底。
+        // codex-review P1 指摘・PR #1050）。
+        if is_live && !seen_names.insert(name) {
+            return Err(CatalogError::CorruptSchema(format!(
+                "duplicate column name: {name:?}"
+            )));
+        }
         if tag == "enum" && param == type_name {
             found = true;
         }
     }
+    // v6 の `uniq:` セクション（TABLE-16・TASK-204、Issue #905）。
+    // `decode_schema_body` と同じ共有パーサー [`parse_unique_section`] で
+    // 構造を検証し（行数だけを読み飛ばすと、壊れた `uniq:` セクションを持つ
+    // カタログが本関数だけ「依存なし」に丸められる）、参照列の実在は列行を
+    // 読み終えた後に `pk:` 行と同じ手順で検証する。
+    let unique_constraints: Vec<Vec<String>> = if is_v6 {
+        parse_unique_section(&mut lines).map_err(CatalogError::CorruptSchema)?
+    } else {
+        Vec::new()
+    };
+
     // 宣言列数を超える残り行は、`decode_schema_body` と同じく「末尾の空行
     // （トレーリング改行）1 行のみ」を許容しそれ以外は余剰行として拒否する。
     // ここを緩めると、宣言列数を過小に偽装した破損値（例: `cols:1` の後に
@@ -2845,7 +4385,70 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         }
         trailing_seen = true;
     }
+
+    // pk 行の参照整合性は生存列名の集合が確定した後でしか判定できないため、
+    // 列行を読み終えた後にまとめて検証する（`validate_primary_key` の
+    // 「重複なし・生存列に存在する」契約と同じ。codex-review P1 指摘・
+    // PR #1050）。
+    if let Some(pk_cols) = pk_cols {
+        let mut pk_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for name in &pk_cols {
+            if !pk_seen.insert(name.as_str()) {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "duplicate primary key column: {name:?}"
+                )));
+            }
+            if !seen_names.contains(name.as_str()) {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "primary key references unknown column: {name:?}"
+                )));
+            }
+        }
+    }
+
+    // v5 なのに DEFAULT 0 件は形式の一意性に反する（`decode_schema_body` と
+    // 同じ不変条件。TABLE-16・TASK-204、Issue #904）。ここで拒否しないと、
+    // この不変条件に違反する壊れた v5 カタログが本関数だけ「依存なし」を
+    // 返し続ける（codex-review P1 指摘・Issue #904・PR #1051）。
+    // v6 は UNIQUE 制約の有無で選ばれる形式であり DEFAULT 0 件でも正当なため、
+    // この不変条件は v5 に限る（`decode_schema_body` と同じ）。
+    if is_v5 && !seen_default {
+        return Err(CatalogError::CorruptSchema(
+            "v5 catalog format requires at least one column with a DEFAULT".to_string(),
+        ));
+    }
+
+    // UNIQUE 制約の参照整合性（`validate_unique_constraints` の「生存列に
+    // 存在する」契約と同じ）。構造（件数・重複）は `parse_unique_section` で
+    // 検証済み。
+    for constraint in &unique_constraints {
+        for name in constraint {
+            if !seen_names.contains(name.as_str()) {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "unique constraint references unknown column: {name:?}"
+                )));
+            }
+        }
+    }
+
     Ok(found)
+}
+
+/// [`catalog_value_references_enum_type`] が `default` フィールドの内容検証に
+/// 使う軽量な型整合判定。`ColumnDefault::compatible_with` と同じ大分類の
+/// 組み合わせを、完全な `ColumnType` を構築せず列タグ文字列（`catalog_fields`
+/// が生成する型タグ。TABLE-16 D2）だけで再現する（ENUM 解決・数値パラメータの
+/// パースを要しない軽量パーサーとしての設計を維持するため）。
+fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> bool {
+    matches!(
+        (default, tag),
+        (ColumnDefault::Text(_), "text")
+            | (
+                ColumnDefault::Number(_),
+                "integer" | "bigint" | "real" | "double" | "numeric"
+            )
+            | (ColumnDefault::Bool(_), "boolean")
+    )
 }
 
 /// ENUM 型 `type_name` を参照する列を持つテーブル名の一覧を列挙する
@@ -2939,6 +4542,178 @@ mod tests {
         let encoded = encode_schema(&schema).expect("encode should succeed");
         let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
         assert_eq!(decoded, schema);
+    }
+
+    /// `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）を持つスキーマは v4 で
+    /// 往復する。主キーを持たないスキーマのゴールデンバイト列
+    /// （`encode_schema_golden_v2_layout`）には一切影響しない。
+    #[test]
+    fn encode_decode_roundtrip_preserves_primary_key_v4() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("code", ColumnType::Text, false),
+                ColumnDef::new("region", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, true),
+            ],
+        )
+        .with_primary_key(vec!["code".to_string(), "region".to_string()]);
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        assert!(text.starts_with("v4\n"));
+        assert!(text.contains("pk:code,region\n"));
+        let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
+        assert_eq!(decoded, schema);
+        assert_eq!(
+            decoded.primary_key(),
+            Some(&["code".to_string(), "region".to_string()][..])
+        );
+    }
+
+    /// `PRIMARY KEY`（Issue #903・v4）と `DEFAULT`（Issue #904・v5）の両方を
+    /// 持つスキーマは v5 で書かれ、`pk:` 行（非空）・`default` フィールドの
+    /// 両方が往復すること（base 取り込みマージで両フォーマットを統合した際の
+    /// 回帰。`encode_decode_roundtrip_preserves_primary_key_v4`〔PK のみ〕・
+    /// `sql_not_null_default.rs::catalog_v5_roundtrips_default_value_across_reopen`
+    /// 〔DEFAULT のみ〕とは異なる、両方を同時に持つ組み合わせを固定する）。
+    #[test]
+    fn encode_decode_roundtrip_preserves_primary_key_and_default_v5() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("code", ColumnType::Text, false),
+                ColumnDef::new("lang", ColumnType::Text, false)
+                    .with_default(ColumnDefault::Text("ja".to_string())),
+            ],
+        )
+        .with_primary_key(vec!["code".to_string()]);
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        assert!(text.starts_with("v5\n"));
+        assert!(text.contains("pk:code\n"));
+        let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
+        assert_eq!(decoded, schema);
+        assert_eq!(decoded.primary_key(), Some(&["code".to_string()][..]));
+        let lang = decoded
+            .columns
+            .iter()
+            .find(|c| c.name == "lang")
+            .expect("lang column present");
+        assert_eq!(lang.default, Some(ColumnDefault::Text("ja".to_string())));
+    }
+
+    /// 主キー宣言なしのスキーマはこれまでどおり v2 のまま（`PRIMARY KEY` 追加が
+    /// 既存カタログ値のバイト列に一切影響しないことの回帰）。
+    #[test]
+    fn schema_without_primary_key_still_encodes_as_v2() {
+        let schema = TableSchema::new("docs", vec![ColumnDef::new("body", ColumnType::Text, true)]);
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        assert!(text.starts_with("v2\n"));
+        assert!(schema.primary_key().is_none());
+    }
+
+    /// 主キー未宣言を表す `Invalid` 各種の拒否理由を固定する。
+    #[test]
+    fn validate_primary_key_rejects_invalid_declarations() {
+        let base = || {
+            TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                    ColumnDef::new("code", ColumnType::Text, false),
+                ],
+            )
+        };
+
+        // 空リスト。
+        let empty = base().with_primary_key(vec![]);
+        assert!(matches!(
+            encode_schema(&empty),
+            Err(CatalogError::Invalid(_))
+        ));
+
+        // 未知列。
+        let unknown = base().with_primary_key(vec!["missing".to_string()]);
+        assert!(matches!(
+            encode_schema(&unknown),
+            Err(CatalogError::Invalid(_))
+        ));
+
+        // `VECTOR` 列は主キー対象外。
+        let vector_pk = base().with_primary_key(vec!["embedding".to_string()]);
+        assert!(matches!(
+            encode_schema(&vector_pk),
+            Err(CatalogError::Invalid(_))
+        ));
+
+        // nullable な列は主キー対象外。
+        let nullable =
+            TableSchema::new("docs", vec![ColumnDef::new("code", ColumnType::Text, true)])
+                .with_primary_key(vec!["code".to_string()]);
+        assert!(matches!(
+            encode_schema(&nullable),
+            Err(CatalogError::Invalid(_))
+        ));
+
+        // 列名重複。
+        let dup = base().with_primary_key(vec!["code".to_string(), "code".to_string()]);
+        assert!(matches!(encode_schema(&dup), Err(CatalogError::Invalid(_))));
+
+        // 上限超過。
+        let too_many = TableSchema::new(
+            "docs",
+            (0..MAX_PRIMARY_KEY_COLUMNS + 1)
+                .map(|i| ColumnDef::new(format!("c{i}"), ColumnType::Text, false))
+                .collect(),
+        )
+        .with_primary_key(
+            (0..MAX_PRIMARY_KEY_COLUMNS + 1)
+                .map(|i| format!("c{i}"))
+                .collect(),
+        );
+        assert!(matches!(
+            encode_schema(&too_many),
+            Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// `id` を主キー列として渡す（Rust API 経由）と「未知列」として拒否される
+    /// （`id` はカタログ上の疑似列であり `schema.columns` には現れないため。
+    /// TABLE-16・TASK-204、Issue #903）。
+    #[test]
+    fn validate_primary_key_rejects_id_pseudo_column() {
+        let schema = TableSchema::new("docs", vec![ColumnDef::new("body", ColumnType::Text, true)])
+            .with_primary_key(vec!["id".to_string()]);
+        assert!(matches!(
+            encode_schema(&schema),
+            Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// 主キー構成列は `ALTER TABLE ... DROP COLUMN` で拒否される
+    /// （`DependentObjectsStillExist`。TABLE-16・TASK-204、Issue #903）。
+    #[test]
+    fn alter_table_drop_column_rejects_primary_key_column() {
+        let path = unique_db_path("drop-pk-column");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("code", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, true),
+            ],
+        )
+        .with_primary_key(vec!["code".to_string()]);
+        storage.create_table(&schema).expect("create table");
+        let err = storage
+            .alter_table_drop_column("docs", "code")
+            .expect_err("dropping a primary key column must be rejected");
+        assert!(matches!(err, CatalogError::DependentObjectsStillExist(name) if name == "code"));
     }
 
     /// 配列列（TABLE-14・TASK-198、Issue #888）のカタログ往復。TEXT/BOOLEAN
@@ -3380,6 +5155,402 @@ mod tests {
         storage
             .get_enum_type(type_name)
             .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// `catalog_value_references_enum_type` は v4 カタログの `pk:` 行が
+    /// 実在しない列を参照している場合も `decode_schema_body`／
+    /// `validate_schema`（`validate_primary_key`）と同じく拒否しなければ
+    /// ならない（codex-review P1 指摘・PR #1050）。この値は ENUM 参照列を
+    /// 一切持たないため、pk 行を接頭辞と非空だけで検証する軽量チェックだと
+    /// 「依存なし」に丸められ、実際には `decode_schema_body` なら拒否する
+    /// 壊れたカタログを残したまま `drop_enum_type` が進んでしまう。
+    #[test]
+    fn drop_enum_type_rejects_v4_catalog_value_with_unknown_primary_key_column() {
+        let path = unique_db_path("catalog-drop-enum-v4-unknown-pk");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        // v4 形式で `pk:` 行が宣言列に存在しない `missing` を参照する。ENUM
+        // 参照列は含まない。
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V4}\ncols:1\npk:missing\ncode:text:-:0:L\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on a v4 pk line referencing an unknown column, got: {err:?}"
+        );
+
+        // 型は削除されず残っていること（fail-open だとここが消えてしまう）。
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// 上記と対の検証: `pk:` 行が同一列を重複して参照する壊れた v4 カタログも
+    /// 同じく `CorruptSchema` で拒否される（`validate_primary_key` の
+    /// 「主キー列の重複なし」契約と同じ。codex-review P1 指摘・PR #1050）。
+    #[test]
+    fn drop_enum_type_rejects_v4_catalog_value_with_duplicate_primary_key_column() {
+        let path = unique_db_path("catalog-drop-enum-v4-dup-pk");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V4}\ncols:1\npk:code,code\ncode:text:-:0:L\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on a v4 pk line with a duplicate column, got: {err:?}"
+        );
+
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// `catalog_value_references_enum_type` は v5 カタログの `default`
+    /// フィールドが「フィールドの存在」だけでなく内容（未知タグ）も検証しな
+    /// ければならない（codex-review P1 指摘・Issue #904・PR #1051）。値検証を
+    /// 欠くと、`decode_schema_body`（`ColumnDefault::decode_catalog_field`）
+    /// なら拒否する未知タグの破損 default を「依存なし」に丸めてしまう
+    /// （このテーブルは対象 ENUM 型を参照しないため、値検証が無いと素通り
+    /// してしまう点が v3/v4 の既存回帰テストと同じ構図）。
+    #[test]
+    fn drop_enum_type_rejects_v5_catalog_value_with_unknown_default_tag() {
+        let path = unique_db_path("catalog-drop-enum-v5-bad-default-tag");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        // v5 形式。ENUM 参照列は持たず、`default` フィールドに
+        // `ColumnDefault::decode_catalog_field` が拒否する未知タグ `z` を置く。
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V5}\ncols:1\npk:\ncode:text:-:0:L:zff\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on an unknown v5 DEFAULT tag, got: {err:?}"
+        );
+
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// 上と対の検証: `default` フィールドのデコード自体は成功しても、列の型
+    /// タグと大分類が一致しない（`integer` 列に `TEXT` の DEFAULT）場合も
+    /// `validate_schema`（`ColumnDefault::compatible_with`）と同じく拒否する
+    /// （codex-review P1 指摘・Issue #904・PR #1051）。
+    #[test]
+    fn drop_enum_type_rejects_v5_catalog_value_with_type_incompatible_default() {
+        let path = unique_db_path("catalog-drop-enum-v5-bad-default-type");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        // `s6a61` は `ColumnDefault::Text("ja")` に正しくデコードできるが、
+        // 列の型タグは `integer`（数値のみ許容）のため型不一致となる。
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V5}\ncols:1\npk:\ncount:integer:-:0:L:s6a61\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on a type-incompatible v5 DEFAULT, got: {err:?}"
+        );
+
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// 上と対の検証: v5 カタログなのに `DEFAULT` を宣言する列が 1 つも無い
+    /// （全列 `default` が `-`）場合も、`decode_schema_body` の「v5 は
+    /// DEFAULT 0 件を許容しない」不変条件と同じく拒否する（codex-review P1
+    /// 指摘・Issue #904・PR #1051）。
+    #[test]
+    fn drop_enum_type_rejects_v5_catalog_value_with_zero_defaults() {
+        let path = unique_db_path("catalog-drop-enum-v5-zero-default");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V5}\ncols:1\npk:\ncode:text:-:0:L:-\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on a v5 catalog value with zero DEFAULTs, got: {err:?}"
+        );
+
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    // --- カタログ v6（UNIQUE 制約。TABLE-16・TASK-204、Issue #905） ---------
+
+    /// UNIQUE 制約のみを持つスキーマは v6 で往復し、`pk:` 行は空・列行は
+    /// 6 フィールド（`default` は `-`）になる。
+    #[test]
+    fn encode_decode_roundtrip_preserves_unique_constraints_v6() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("a", ColumnType::Text, true),
+                ColumnDef::new("b", ColumnType::Text, true),
+            ],
+        )
+        .with_unique_constraints(vec![
+            UniqueConstraint::new(vec!["a".to_string()]),
+            UniqueConstraint::new(vec!["b".to_string(), "a".to_string()]),
+        ]);
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        assert_eq!(
+            text,
+            "v6\ncols:3\npk:\nembedding:vector:4:0:L:-\na:text:-:1:L:-\nb:text:-:1:L:-\nuniq:2\nU:a\nU:b,a\n"
+        );
+        let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
+        assert_eq!(decoded, schema);
+    }
+
+    /// 主キー・`DEFAULT`・墓標・UNIQUE 制約をすべて持つスキーマも v6 で往復する
+    /// （v4／v5／v3 の各要素が v6 の中で失われないことの回帰）。
+    #[test]
+    fn encode_decode_roundtrip_v6_with_primary_key_default_and_dropped_slot() {
+        let schema = TableSchema::from_parts(
+            "docs",
+            vec![
+                ColumnDef::new("code", ColumnType::Text, false),
+                ColumnDef::new("lang", ColumnType::Text, true)
+                    .with_default(ColumnDefault::Text("ja".to_string())),
+            ],
+            vec![DroppedSlot {
+                physical_index: 1,
+                name: "old".to_string(),
+                ty: ColumnType::Text,
+            }],
+            Some(vec!["code".to_string()]),
+            vec![UniqueConstraint::new(vec!["lang".to_string()])],
+        );
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        assert!(text.starts_with("v6\ncols:3\npk:code\n"), "{text}");
+        assert!(text.ends_with("uniq:1\nU:lang\n"), "{text}");
+        let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
+        assert_eq!(decoded, schema);
+    }
+
+    /// UNIQUE 制約を持たないスキーマのバイト列は v2〜v5 のまま不変（v6 導入が
+    /// 既存カタログ値へ影響しないことの回帰）。
+    #[test]
+    fn schema_without_unique_constraints_keeps_previous_versions() {
+        let v2 = TableSchema::new("docs", vec![ColumnDef::new("body", ColumnType::Text, true)]);
+        assert!(std::str::from_utf8(&encode_schema(&v2).expect("encode"))
+            .expect("utf8")
+            .starts_with("v2\n"));
+        let v5 = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("body", ColumnType::Text, true)
+                .with_default(ColumnDefault::Text("x".to_string()))],
+        );
+        assert!(std::str::from_utf8(&encode_schema(&v5).expect("encode"))
+            .expect("utf8")
+            .starts_with("v5\n"));
+    }
+
+    /// `validate_unique_constraints` の拒否理由（未知列・対象外型・制約内重複・
+    /// 同一列リストの制約重複・空リスト・上限超過）を固定する。
+    #[test]
+    fn validate_unique_constraints_rejects_invalid_declarations() {
+        let base = || {
+            TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                    ColumnDef::new("a", ColumnType::Text, true),
+                    ColumnDef::new("r", ColumnType::Real, true),
+                ],
+            )
+        };
+        let cases: Vec<Vec<Vec<&str>>> = vec![
+            vec![vec!["missing"]],
+            vec![vec!["embedding"]],
+            vec![vec!["r"]],
+            vec![vec!["a", "a"]],
+            vec![vec!["a"], vec!["a"]],
+            vec![vec![]],
+        ];
+        for case in cases {
+            let schema = base().with_unique_constraints(
+                case.iter()
+                    .map(|cols| UniqueConstraint::new(cols.iter().map(|c| c.to_string()).collect()))
+                    .collect(),
+            );
+            assert!(
+                matches!(validate_schema(&schema), Err(CatalogError::Invalid(_))),
+                "expected {case:?} to be rejected"
+            );
+        }
+        let too_many = base().with_unique_constraints(
+            (0..=MAX_UNIQUE_CONSTRAINTS)
+                .map(|_| UniqueConstraint::new(vec!["a".to_string()]))
+                .collect(),
+        );
+        assert!(matches!(
+            validate_schema(&too_many),
+            Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// v6 の `uniq:` セクションの破損値デコードを `CorruptSchema` で拒否する
+    /// （`uniq:` 行の欠落・不正件数・0 件・上限超過・`U:` 行の空要素／接頭辞
+    /// 欠落・件数不足・末尾余剰行・未知列参照・制約内重複・制約重複）。
+    #[test]
+    fn decode_v6_rejects_corrupt_unique_section() {
+        let head = "v6\ncols:1\npk:\na:text:-:1:L:-\n";
+        let over = MAX_UNIQUE_CONSTRAINTS + 1;
+        let corrupt: Vec<String> = vec![
+            String::new(),
+            "uniq:x\n".to_string(),
+            "U:a\n".to_string(),
+            "uniq:0\n".to_string(),
+            format!("uniq:{over}\n"),
+            "uniq:1\nU:\n".to_string(),
+            "uniq:1\nU:a,,a\n".to_string(),
+            "uniq:1\nU:,a\n".to_string(),
+            "uniq:1\nU:a,\n".to_string(),
+            "uniq:1\na\n".to_string(),
+            "uniq:2\nU:a\n".to_string(),
+            "uniq:1\nU:a\nsurplus\n".to_string(),
+            "uniq:1\nU:missing\n".to_string(),
+            "uniq:1\nU:a,a\n".to_string(),
+            "uniq:2\nU:a\nU:a\n".to_string(),
+        ];
+        for tail in corrupt {
+            let bytes = format!("{head}{tail}").into_bytes();
+            assert!(
+                matches!(
+                    decode_schema("t", &bytes),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "expected tail {tail:?} to be rejected"
+            );
+        }
+        // 対照: 有効な v6 値は受理される。
+        let valid = format!("{head}uniq:1\nU:a\n").into_bytes();
+        let schema = decode_schema("t", &valid).expect("valid v6 value must decode");
+        assert_eq!(schema.unique_constraints()[0].columns(), &["a".to_string()]);
+    }
+
+    /// `catalog_value_references_enum_type`（`DROP TYPE` の依存判定）も v6 の
+    /// `uniq:` セクションを `decode_schema_body` と同じ基準で検証する。有効な
+    /// v6 値は ENUM 参照を正しく検出し、`U:` 行が未知列を参照する等の壊れた値は
+    /// 「依存なし」に丸めず `CorruptSchema` で拒否する。
+    #[test]
+    fn catalog_value_references_enum_type_validates_v6_unique_section() {
+        let valid =
+            "v6\ncols:2\npk:\nmood_col:enum:mood:1:L:-\na:text:-:1:L:-\nuniq:1\nU:mood_col,a\n";
+        assert!(catalog_value_references_enum_type(valid.as_bytes(), "mood").expect("valid v6"));
+        assert!(!catalog_value_references_enum_type(valid.as_bytes(), "other").expect("valid v6"));
+        for corrupt in [
+            "v6\ncols:1\npk:\na:text:-:1:L:-\nuniq:1\nU:missing\n",
+            "v6\ncols:1\npk:\na:text:-:1:L:-\nuniq:0\n",
+            "v6\ncols:1\npk:\na:text:-:1:L:-\n",
+            "v6\ncols:1\npk:\na:text:-:1:L:-\nuniq:1\nU:a,a\n",
+            "v6\ncols:1\npk:\na:text:-:1:L:-\nuniq:1\nU:a\nsurplus\n",
+        ] {
+            assert!(
+                matches!(
+                    catalog_value_references_enum_type(corrupt.as_bytes(), "mood"),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "expected {corrupt:?} to be rejected"
+            );
+        }
     }
 
     #[test]
@@ -4508,6 +6679,68 @@ mod tests {
                 scale: 2
             },
             "rejected ALTER COLUMN TYPE must not mutate the catalog"
+        );
+    }
+
+    /// [`Storage::create_view`] は `pub fn` の Rust API であり、SQL 表層の
+    /// `validate_create_view_tokens`（`body_sql` を必ず `base_relation` と
+    /// 対応づけて生成する）を経由しない呼び出し元も存在しうる（codex-review
+    /// 指摘・PR #1048）。`body_sql` の `FROM` が主張する参照先と `base_relation`
+    /// 引数が食い違う場合は `CatalogError::Invalid` で拒否し、何も永続化しない。
+    #[test]
+    fn create_view_rejects_body_sql_from_target_mismatching_base_relation() {
+        let path = unique_db_path("create-view-mismatched-base-relation");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table docs");
+        storage
+            .create_table(&TableSchema::new(
+                "other",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table other");
+
+        // `base_relation` は "docs" だが、`body_sql` 自身の FROM は "other" を
+        // 指す。SQL 表層経由（`render_view_body`）では構造的に発生しない食い違い。
+        let err = storage
+            .create_view("v", "docs", "SELECT id FROM other")
+            .expect_err("body_sql FROM target must match base_relation");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert!(
+            storage.view_definition("v").expect("view lookup").is_none(),
+            "mismatched view definition must not be persisted"
+        );
+    }
+
+    /// [`Storage::create_view`] は `body_sql` が許可リスト形状（式項目・UDF
+    /// 述語を含まない `SELECT <* | 列名> FROM <relation> [WHERE <単純述語>]`）
+    /// を満たさない場合も `CatalogError::Invalid` で拒否する（同上。`sql::view::
+    /// resolve_from` が再パースする際に想定していない構文が紛れ込むのを
+    /// 保存前に防ぐ）。
+    #[test]
+    fn create_view_rejects_body_sql_outside_allowed_shape() {
+        let path = unique_db_path("create-view-disallowed-shape");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table docs");
+
+        let err = storage
+            .create_view("v", "docs", "SELECT vec_norm(embedding) FROM docs")
+            .expect_err("expression projection items are outside the allowed view body shape");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert!(
+            storage.view_definition("v").expect("view lookup").is_none(),
+            "invalid view definition must not be persisted"
         );
     }
 }
