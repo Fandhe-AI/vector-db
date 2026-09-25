@@ -438,6 +438,52 @@ pub fn read_row_description_with_oids(stream: &mut TcpStream) -> Vec<(String, i3
     columns
 }
 
+/// `RowDescription`（'T'）を読み、列名・型 OID・型長（`pg_type.typlen`）の
+/// 3 つ組のリストを返す（`read_row_description_with_oids` の型長付き版。
+/// WIRE-13・TASK-200・Issue #895 の新規スカラー型 OID を wire 越しに検証する
+/// 用途）。
+pub fn read_row_description_with_types(stream: &mut TcpStream) -> Vec<(String, i32, i16)> {
+    let mut header = [0u8; 1];
+    stream.read_exact(&mut header).expect("read type");
+    assert_eq!(header[0], b'T', "expected RowDescription");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read len");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).expect("read body");
+
+    let field_count = i16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut pos = 2usize;
+    let mut columns = Vec::with_capacity(field_count);
+    for _ in 0..field_count {
+        let nul = body[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .expect("nul-terminated column name");
+        let name = std::str::from_utf8(&body[pos..pos + nul])
+            .expect("utf8 column name")
+            .to_string();
+        pos += nul + 1;
+        pos += 4 + 2; // table oid, attnum
+        let oid_bytes: [u8; 4] = body
+            .get(pos..pos + 4)
+            .expect("type oid bytes")
+            .try_into()
+            .expect("slice is exactly 4 bytes");
+        let oid = i32::from_be_bytes(oid_bytes);
+        pos += 4; // type oid（読み取り済み）
+        let typlen_bytes: [u8; 2] = body
+            .get(pos..pos + 2)
+            .expect("typlen bytes")
+            .try_into()
+            .expect("slice is exactly 2 bytes");
+        let typlen = i16::from_be_bytes(typlen_bytes);
+        pos += 2 + 4 + 2; // typlen（読み取り済み）, typmod, format
+        columns.push((name, oid, typlen));
+    }
+    columns
+}
+
 /// `DataRow`（'D'）を 1 行読み、各セルを `Option<String>`（`NULL` は `None`）として
 /// 返す。
 pub fn read_data_row(stream: &mut TcpStream) -> Vec<Option<String>> {

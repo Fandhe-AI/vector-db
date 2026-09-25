@@ -508,7 +508,22 @@ fn pg_type_name_of_oid(oid: i32) -> &'static str {
     match oid {
         1700 => "numeric",
         25 => "text",
-        other => panic!("unexpected type OID {other} (fixed table: 1700=numeric, 25=text)"),
+        23 => "int4",
+        20 => "int8",
+        // WIRE-13・TASK-200・Issue #895 で追加された型。この固定表は
+        // `result_encoder::WireType` とは独立に持つ契約（単一情報源からの
+        // 逆引きの妥当性検証）のため、新型を使う fixture が増えたら本表も
+        // 更新する。
+        16 => "bool",
+        700 => "float4",
+        701 => "float8",
+        1082 => "date",
+        1114 => "timestamp",
+        17 => "bytea",
+        2950 => "uuid",
+        114 => "json",
+        3802 => "jsonb",
+        other => panic!("unexpected type OID {other} (fixed table incomplete)"),
     }
 }
 

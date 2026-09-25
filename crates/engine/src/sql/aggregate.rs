@@ -1737,6 +1737,10 @@ fn try_scalar_index_aggregate(
         .iter()
         .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
         .collect();
+    // 数値・日時・`NUMERIC`・`UUID` 列の範囲述語（`FilterOp::TypedCompare`。
+    // Issue #891・TASK-199 で production 結線済み）は `bound.metadata_filters`
+    // に混在したまま渡り、`ScalarIndex::candidates_for` が内部で振り分ける
+    // （Issue #893 production 接続）。
     let slots = match index.resolve_candidates(&bound.metadata_filters, &id_preds) {
         crate::sql::scalar_index::CandidateResolution::Use(slots) => slots,
         crate::sql::scalar_index::CandidateResolution::FallbackNoIndex
