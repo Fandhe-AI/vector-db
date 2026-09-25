@@ -826,9 +826,11 @@ pub(crate) fn execute_statement_with_cache(
         // メント参照）。
         if is_hybrid && !skip_sparse_accumulation {
             if let Some(idx) = text_column_index {
-                if let Some(Some(t)) = scanned
+                if let Some(t) = scanned
                     .get(idx)
-                    .map(|v| v.as_ref().and_then(|v| v.as_text()))
+                    .copied()
+                    .flatten()
+                    .and_then(|v| v.as_text())
                 {
                     if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
                         return Err(ArenaError::CapacityExceeded);
@@ -898,6 +900,10 @@ pub(crate) fn execute_statement_with_cache(
                     }
                     Some(row_codec::ScalarRef::Integer(v)) => kept.push(Value::Integer(v)),
                     Some(row_codec::ScalarRef::BigInt(v)) => kept.push(Value::BigInt(v)),
+                    // REAL/DOUBLE は固定長のためヒープ確保・バイト予算計上を
+                    // 要しない（`Value::Real`/`Value::Double` はスタック上の値）。
+                    Some(row_codec::ScalarRef::Real(v)) => kept.push(Value::Real(v)),
+                    Some(row_codec::ScalarRef::Double(v)) => kept.push(Value::Double(v)),
                     Some(row_codec::ScalarRef::Enum(label)) => {
                         let owned = try_alloc_text_for_budget(
                             label,
@@ -1921,6 +1927,8 @@ pub(crate) fn execute_statement_with_cache(
                 .iter()
                 .map(|v| match v {
                     Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
+                    Value::Real(r) => Some(row_codec::ScalarRef::Real(*r)),
+                    Value::Double(d) => Some(row_codec::ScalarRef::Double(*d)),
                     Value::Enum(label) => Some(row_codec::ScalarRef::Enum(label.as_str())),
                     Value::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
                     Value::Bytes(b) => Some(row_codec::ScalarRef::Bytes(b.as_slice())),
@@ -2269,6 +2277,8 @@ fn decode_deferred_scalars(
             }
             Some(row_codec::ScalarRef::Integer(v)) => out.push(Value::Integer(v)),
             Some(row_codec::ScalarRef::BigInt(v)) => out.push(Value::BigInt(v)),
+            Some(row_codec::ScalarRef::Real(v)) => out.push(Value::Real(v)),
+            Some(row_codec::ScalarRef::Double(v)) => out.push(Value::Double(v)),
             Some(row_codec::ScalarRef::Enum(label)) => {
                 let owned = try_alloc_text_for_budget(label, budget, MAX_CANDIDATE_SCALAR_BYTES)
                     .map_err(|_| {
@@ -2538,6 +2548,8 @@ fn project_rows(
                             Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
                             | Some(Value::Timestamp(_))
@@ -2560,6 +2572,8 @@ fn project_rows(
                             Some(Value::BigInt(_))
                             | Some(Value::Text(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
                             | Some(Value::Timestamp(_))
@@ -2580,6 +2594,8 @@ fn project_rows(
                             Some(Value::Integer(_))
                             | Some(Value::Text(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
                             | Some(Value::Timestamp(_))
@@ -2589,6 +2605,28 @@ fn project_rows(
                             | Some(Value::Enum(_))
                             | Some(Value::Numeric(_))
                             | Some(Value::Uuid(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        // F8（Issue #882 計画）: REAL は f64 への無損失拡大、DOUBLE
+                        // はそのまま `Cell::Float` へ投影する（`Cell` enum への
+                        // variant 追加は #882 計画で見送り、既存の Float 経路を
+                        // 共有する設計判断）。
+                        ColumnType::Real => match decoded.get(*index) {
+                            Some(Value::Real(v)) => cells.push(Cell::Float(f64::from(*v))),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            _ => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Double => match decoded.get(*index) {
+                            Some(Value::Double(v)) => cells.push(Cell::Float(*v)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            _ => {
                                 return Err(SqlSurfaceError::Internal {
                                     detail: "scalar payload type mismatch".to_string(),
                                 })
@@ -2605,6 +2643,8 @@ fn project_rows(
                             Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
                             | Some(Value::Timestamp(_))
@@ -2625,6 +2665,8 @@ fn project_rows(
                             Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Date(_))
                             | Some(Value::Timestamp(_))
@@ -2645,6 +2687,8 @@ fn project_rows(
                             Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Timestamp(_))
@@ -2665,6 +2709,8 @@ fn project_rows(
                             Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2687,6 +2733,8 @@ fn project_rows(
                             Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2717,6 +2765,8 @@ fn project_rows(
                             Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2737,6 +2787,8 @@ fn project_rows(
                             Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2757,6 +2809,8 @@ fn project_rows(
                             Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2777,6 +2831,8 @@ fn project_rows(
                             Some(Value::Integer(_))
                             | Some(Value::BigInt(_))
                             | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))

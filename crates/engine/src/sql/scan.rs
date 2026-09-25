@@ -199,6 +199,8 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         ColumnType::Text
                         | ColumnType::Integer
                         | ColumnType::BigInt
+                        | ColumnType::Real
+                        | ColumnType::Double
                         | ColumnType::Boolean
                         | ColumnType::Date
                         | ColumnType::Timestamp
@@ -487,21 +489,43 @@ pub fn execute_scan(
                                 }
                             }
                             ColumnType::Text => match scanned.get(*index) {
-                                Some(Some(v)) => match v.as_text() {
-                                    Some(t) => {
-                                        cells.push(Cell::Text(try_alloc_text_for_budget(
-                                            t,
-                                            &mut byte_budget,
-                                            MAX_SCAN_RESULT_BYTES,
-                                        )?));
-                                    }
-                                    None => {
-                                        return Err(scan_bug(
-                                            "TEXT column scan yielded a non-Text scalar value",
-                                        ))
-                                    }
-                                },
+                                Some(Some(row_codec::ScalarRef::Text(t))) => {
+                                    cells.push(Cell::Text(try_alloc_text_for_budget(
+                                        t,
+                                        &mut byte_budget,
+                                        MAX_SCAN_RESULT_BYTES,
+                                    )?))
+                                }
                                 Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
+                            },
+                            // F8（Issue #882 計画）: REAL/DOUBLE は `Cell::Float`
+                            // （REAL は f64 への無損失拡大）へ投影する。
+                            ColumnType::Real => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Real(v))) => {
+                                    cells.push(Cell::Float(f64::from(*v)))
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
+                            },
+                            ColumnType::Double => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Double(v))) => {
+                                    cells.push(Cell::Float(*v))
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
                             },
                             ColumnType::Integer => match scanned.get(*index) {
                                 Some(Some(row_codec::ScalarRef::Integer(v))) => {
@@ -528,13 +552,15 @@ pub fn execute_scan(
                                 Some(None) | None => cells.push(Cell::Null),
                             },
                             ColumnType::Boolean => match scanned.get(*index) {
-                                Some(Some(v)) => match v.as_bool() {
-                                    Some(b) => cells.push(Cell::Bool(b)),
-                                    None => return Err(scan_bug(
-                                        "BOOLEAN column scan yielded a non-Boolean scalar value",
-                                    )),
-                                },
+                                Some(Some(row_codec::ScalarRef::Bool(b))) => {
+                                    cells.push(Cell::Bool(*b))
+                                }
                                 Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
                             },
                             ColumnType::Date => match scanned.get(*index) {
                                 Some(Some(v)) => match v.as_date() {

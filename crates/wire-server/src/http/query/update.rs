@@ -286,6 +286,14 @@ fn map_set_assignments(
                     "SET integer column is not supported on the NoSQL surface yet",
                 ))
             }
+            // F10（Issue #882 計画）: REAL/DOUBLE 列の JSON 束縛は #896 の担当。
+            // 現時点では非対応列として一律拒否する（`22000`。既存の型不一致と
+            // 同じ応答形へ合流させる）。
+            (ColumnType::Real | ColumnType::Double, _) => {
+                return Err(UpdateError::Set(
+                    "SET REAL/DOUBLE PRECISION columns are not supported yet",
+                ))
+            }
             // BOOLEAN 列は JSON 真偽値のみ受理する（NOSQL-17 と同じ規則。
             // Issue #883）。
             (ColumnType::Boolean, JsonValue::Bool(b)) => InsertLiteral::Bool(*b),

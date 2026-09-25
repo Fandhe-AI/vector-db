@@ -364,6 +364,16 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
             ty: engine::catalog::ColumnType::Boolean,
             ..
         } => false,
+        // `REAL`／`DOUBLE PRECISION` 列（TABLE-13・TASK-196・Issue #882）は本
+        // Issue（#936・WIRE-14）の策定時点では未存在の型のため、バイナリ表現は
+        // spec 側で未決定。公告 OID（`WireType::Text`）は `supports_binary()
+        // == true` だが、値の実体は `Cell::Float` の生成テキスト表現であり
+        // `Text` の UTF-8 生バイト表現とは異なるため、`VECTOR`・`BOOLEAN` と
+        // 同様に fail-closed で非対応とする。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Real | engine::catalog::ColumnType::Double,
+            ..
+        } => false,
         // `BYTEA` 列（Issue #886）は本 Issue（#936・WIRE-14）の策定時点では
         // 未存在の型のため、バイナリ表現は spec 側で未決定。公告 OID
         // （`WireType::Text`）は `supports_binary() == true` だが、値の実体は
@@ -461,11 +471,12 @@ pub(crate) fn column_wire_type(meta: &ColumnMeta) -> WireType {
             engine::catalog::ColumnType::Integer => WireType::Int4,
             engine::catalog::ColumnType::BigInt => WireType::Int8,
             // `ARRAY`（Issue #888）・`BYTEA`（Issue #886）・`JSON`／`JSONB`
-            // （Issue #889）・`ENUM`（Issue #890）はいずれも Issue #895 の担当
-            // までは専用 OID を持たず、text（`RowDescription`）で公告する
-            // （main 側の既存方針 `ColumnMeta::Scalar { .. } => WireType::Text`
-            // を踏襲）。`NUMERIC` は本 match の外側（`Id` 直後の専用分岐）で
-            // 先に判定されるため、この `match ty` には到達しない。
+            // （Issue #889）・`ENUM`（Issue #890）・`REAL`／`DOUBLE PRECISION`
+            // （Issue #882）はいずれも Issue #895 の担当までは専用 OID を持たず、
+            // text（`RowDescription`）で公告する（main 側の既存方針
+            // `ColumnMeta::Scalar { .. } => WireType::Text` を踏襲）。`NUMERIC`
+            // は本 match の外側（`Id` 直後の専用分岐）で先に判定されるため、
+            // この `match ty` には到達しない。
             engine::catalog::ColumnType::Array(_)
             | engine::catalog::ColumnType::Bytea
             | engine::catalog::ColumnType::Json
@@ -474,6 +485,8 @@ pub(crate) fn column_wire_type(meta: &ColumnMeta) -> WireType {
             | engine::catalog::ColumnType::Date
             | engine::catalog::ColumnType::Timestamp
             | engine::catalog::ColumnType::Uuid
+            | engine::catalog::ColumnType::Real
+            | engine::catalog::ColumnType::Double
             | engine::catalog::ColumnType::Numeric { .. } => WireType::Text,
         },
         ColumnMeta::Computed { .. } => WireType::Text,

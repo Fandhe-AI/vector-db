@@ -215,10 +215,10 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             push_vector(b, vector)?;
         }
         // Issue #881 D7: 既存タグ（Null=0／Text=1／Vector=2）の意味・並びは
-        // 変更せず、`INTEGER`／`BIGINT` にタグ 3／4 を新設する。5〜6 は
-        // REAL/DOUBLE（別 Issue の作業）向けに予約し、BOOLEAN は TABLE-13 の
-        // 宣言順で 7 とする（Issue #883。他の型と衝突しない新規タグ）。8〜9 は
-        // DATE/TIMESTAMP（別 Issue の作業）向けに予約する。
+        // 変更せず、`INTEGER`／`BIGINT` にタグ 3／4 を新設する。TABLE-13・
+        // Issue #882 計画 F9: Real=5・Double=6（正規化後の LE ビット列）。
+        // BOOLEAN は TABLE-13 の宣言順で 7 とする（Issue #883。他の型と衝突しない
+        // 新規タグ）。8〜9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約する。
         Value::Integer(v) => {
             b.push_u8(3);
             b.push_raw(&v.to_le_bytes());
@@ -234,6 +234,20 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
         // 採番し直した（ENUM のタグ 13 の次点）。ハッシュ対象は束縛後の正規値
         // （`scale` + `unscaled`）のため、同一列へ再送された `1.10` と `1.1` は
         // 同一ハッシュ（`23505`）に収束する。
+        Value::Real(v) => {
+            b.push_u8(5);
+            // F4: エンコード時に `-0.0` を `+0.0` へ正規化する契約
+            // （row_codec.rs のエンコード経路と同じ理由）。ここでハッシュ入力を
+            // 正規化前の生ビット列のままにすると、論理的に同一な値の
+            // `operation_id` 再送が重複応答（23505）ではなく内容不一致
+            // （22023）として扱われてしまう。
+            b.push_raw(&crate::scalar_float::canonicalize_real(*v).to_le_bytes());
+        }
+        Value::Double(v) => {
+            b.push_u8(6);
+            // F4: canonicalize_real と同じ理由。
+            b.push_raw(&crate::scalar_float::canonicalize_double(*v).to_le_bytes());
+        }
         Value::Numeric(d) => {
             b.push_u8(14);
             b.push_u8(d.scale());
@@ -1346,6 +1360,68 @@ mod tests {
 
     // 一方、実際に異なる値が入れば当然ハッシュも変わる（区別できないほど鈍化
     // していないことの確認）。
+    // TABLE-13・Issue #882 計画 F9: Real=5／Double=6 のタグ割り当てを固定する
+    // golden テスト。既存タグ（Null=0／Text=1／Vector=2）と衝突せず、かつ
+    // 同じビットパターンを持つ異なる型（`Real(1.0)` と `Double(1.0)`）を
+    // 区別できることを固定する。
+    #[test]
+    fn for_typed_insert_real_and_double_tags_are_stable_and_distinct() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let real_col = Value::Real(1.0);
+        let double_col = Value::Double(1.0);
+        let text_col = Value::Text("1".to_string());
+        let cols_real: [(&str, &Value); 1] = [("v", &real_col)];
+        let cols_double: [(&str, &Value); 1] = [("v", &double_col)];
+        let cols_text: [(&str, &Value); 1] = [("v", &text_col)];
+
+        let h_real = for_typed_insert(7, Visibility::Public, &embedding, &cols_real).expect("hash");
+        let h_double =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_double).expect("hash");
+        let h_text = for_typed_insert(7, Visibility::Public, &embedding, &cols_text).expect("hash");
+
+        // 同じ論理値（1.0）でも型タグが異なれば別ハッシュになる（タグが
+        // ハッシュ入力に混ざっている証拠）。
+        assert_ne!(h_real, h_double);
+        assert_ne!(h_real, h_text);
+        assert_ne!(h_double, h_text);
+
+        // 再現性: 同一入力から同一ハッシュが得られる（タグ値が偶然の実行時
+        // 揺れでない）。
+        let h_real_again =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_real).expect("hash");
+        assert_eq!(h_real, h_real_again);
+    }
+
+    #[test]
+    fn for_typed_insert_real_and_double_signed_zero_normalizes_to_positive_zero() {
+        // F4: `-0.0` と `+0.0` は論理的に同一値であり、`operation_id` の
+        // 再送判定（同一内容なら 23505・不一致なら 22023）はハッシュ一致で
+        // 決まる。エンコード経路（row_codec.rs）だけでなくハッシュ入力の
+        // 生成でも正規化しないと、再送時に符号ビットの偶然の違いで
+        // 誤って内容不一致（22023）と判定されてしまう。
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let real_pos = Value::Real(0.0_f32);
+        let real_neg = Value::Real(-0.0_f32);
+        let double_pos = Value::Double(0.0_f64);
+        let double_neg = Value::Double(-0.0_f64);
+        let cols_real_pos: [(&str, &Value); 1] = [("v", &real_pos)];
+        let cols_real_neg: [(&str, &Value); 1] = [("v", &real_neg)];
+        let cols_double_pos: [(&str, &Value); 1] = [("v", &double_pos)];
+        let cols_double_neg: [(&str, &Value); 1] = [("v", &double_neg)];
+
+        let h_real_pos =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_real_pos).expect("hash");
+        let h_real_neg =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_real_neg).expect("hash");
+        let h_double_pos =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_double_pos).expect("hash");
+        let h_double_neg =
+            for_typed_insert(7, Visibility::Public, &embedding, &cols_double_neg).expect("hash");
+
+        assert_eq!(h_real_pos, h_real_neg);
+        assert_eq!(h_double_pos, h_double_neg);
+    }
+
     #[test]
     fn for_typed_insert_differs_by_column_value() {
         let embedding = [1.0_f32, 2.0, 3.0];

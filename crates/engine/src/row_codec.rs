@@ -110,6 +110,17 @@ pub(crate) const SCALAR_INT4_ENTRY_LEN: u32 = 5;
 /// `BIGINT` 列 1 個分のフレーム込みバイト数（presence(1) + 本体(8)。Issue #881 D2）。
 pub(crate) const SCALAR_INT8_ENTRY_LEN: u32 = 9;
 
+/// `REAL` 値 1 個をスカラーペイロードへ書き込む場合のフレーム込みバイト数
+/// （presence(1) + LE ビット列(4)）。長さプレフィクスは持たない（列の型が
+/// 固定長を決めるため、`TEXT` と異なり書き込む必要がない）。`tenant.rs` の
+/// `validate_set_assignments` が事前検証で同じ値を使う（[`SCALAR_TEXT_ENTRY_OVERHEAD`]
+/// と同じ理由。事前検証と実エンコードの乖離はテナント境界漏えいに直結する）。
+pub(crate) const SCALAR_REAL_ENTRY_LEN: u32 = 5;
+
+/// `DOUBLE PRECISION` 値 1 個をスカラーペイロードへ書き込む場合のフレーム込み
+/// バイト数（presence(1) + LE ビット列(8)）。
+pub(crate) const SCALAR_DOUBLE_ENTRY_LEN: u32 = 9;
+
 /// 列値の有無を示すタグバイト。未知の値は fail-closed に拒否する（presence の
 /// 黙殺フォールバックは NULL/値ありの取り違えに直結するため許容しない）。
 const PRESENCE_NULL: u8 = 0x00;
@@ -143,6 +154,9 @@ pub type Result<T> = std::result::Result<T, RowCodecError>;
 /// `Integer`／`BigInt`（Issue #881・TABLE-13・TASK-196）は幅ごとに variant を
 /// 分けることで、encode 時に `ColumnType` との型一致検査だけで値域の再検査なしに
 /// 取り違えを防げる設計にした（D1）。
+/// `Real`／`Double`（TABLE-13・TASK-196）は常に有限値かつ `-0.0` を保持しない
+/// 正規化済み値（`scalar_float::parse_real`／`parse_double`・`canonicalize_*`
+/// 参照）を前提とし、encode 側は非有限値を fail-closed に拒否する。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -152,6 +166,8 @@ pub enum Value {
     Integer(i32),
     /// 符号付き 64 ビット整数（`ColumnType::BigInt`）。
     BigInt(i64),
+    Real(f32),
+    Double(f64),
     /// 真偽値列の値（TABLE-13・TASK-196、Issue #883）。NULL とはバイト列上も
     /// 別物になる（[`PRESENCE_NULL`] とは別に 1 バイトの値本体を持つ）。
     Bool(bool),
@@ -220,10 +236,11 @@ impl ArrayValue {
     }
 }
 
-/// スカラー列走査（[`scan_scalar_columns`] 系）の借用結果。TEXT・BOOLEAN・ARRAY の
-/// いずれも返せるよう `Option<&str>` から型付き化した（Issue #883・D-b、Issue #888）。
-/// `INTEGER`／`BIGINT`（Issue #881 D3）は固定幅のため複製コストが無く値そのものを
-/// 返す。`VECTOR` 列・実際の NULL 列は走査結果として `None` になる。
+/// スカラー列走査（[`scan_scalar_columns`] 系）の借用結果。TEXT・REAL・
+/// DOUBLE PRECISION・BOOLEAN・ARRAY のいずれも返せるよう `Option<&str>` から
+/// 型付き化した（Issue #883・D-b、Issue #888。`INTEGER`／`BIGINT`（Issue #881
+/// D3）・`Real`／`Double` は固定長ペイロードなので値そのものを複製コストなしに
+/// 保持できる）。`VECTOR` 列・実際の NULL 列は走査結果として `None` になる。
 /// `#[non_exhaustive]` は付けない（Issue #880 D1 と同じ方針。型追加時に
 /// コンパイラが全呼び出し元を列挙する）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -231,6 +248,8 @@ pub enum ScalarRef<'a> {
     Text(&'a str),
     Integer(i32),
     BigInt(i64),
+    Real(f32),
+    Double(f64),
     Bool(bool),
     /// 日付列（TABLE-13・TASK-197、Issue #884）。1970-01-01 起点の日数。
     Date(i32),
@@ -267,15 +286,18 @@ pub enum ScalarRef<'a> {
 
 impl<'a> ScalarRef<'a> {
     /// TEXT 前提の既存消費側（等価/前方一致フィルタ・二次索引・hybrid 本文・
-    /// GROUP BY キー等）が `Integer`／`BigInt`／`Bool`／`Date`／`Timestamp`／
-    /// `Array`／`Bytes`／`Json`／`Enum` を取り違えて TEXT として扱わないよう、
-    /// `Text` 以外は `None` を返す（fail-closed。呼び出し元はスキーマ型で
-    /// 事前に対象外の列を除外するか、`None` を型不一致として拒否する）。
+    /// GROUP BY キー等）が `Integer`／`BigInt`／`Real`／`Double`／`Bool`／
+    /// `Date`／`Timestamp`／`Array`／`Bytes`／`Json`／`Enum` を取り違えて TEXT
+    /// として扱わないよう、`Text` 以外は `None` を返す（fail-closed。呼び出し
+    /// 元はスキーマ型で事前に対象外の列を除外するか、`None` を型不一致として
+    /// 拒否する）。
     pub fn as_text(&self) -> Option<&'a str> {
         match self {
             ScalarRef::Text(s) => Some(s),
             ScalarRef::Integer(_)
             | ScalarRef::BigInt(_)
+            | ScalarRef::Real(_)
+            | ScalarRef::Double(_)
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)
@@ -294,6 +316,8 @@ impl<'a> ScalarRef<'a> {
             ScalarRef::Text(_)
             | ScalarRef::Integer(_)
             | ScalarRef::BigInt(_)
+            | ScalarRef::Real(_)
+            | ScalarRef::Double(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)
             | ScalarRef::Array(_)
@@ -313,6 +337,8 @@ impl<'a> ScalarRef<'a> {
             ScalarRef::Text(_)
             | ScalarRef::Integer(_)
             | ScalarRef::BigInt(_)
+            | ScalarRef::Real(_)
+            | ScalarRef::Double(_)
             | ScalarRef::Bool(_)
             | ScalarRef::Timestamp(_)
             | ScalarRef::Array(_)
@@ -332,6 +358,8 @@ impl<'a> ScalarRef<'a> {
             ScalarRef::Text(_)
             | ScalarRef::Integer(_)
             | ScalarRef::BigInt(_)
+            | ScalarRef::Real(_)
+            | ScalarRef::Double(_)
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
             | ScalarRef::Array(_)
@@ -353,6 +381,8 @@ impl<'a> ScalarRef<'a> {
             ScalarRef::Text(_)
             | ScalarRef::Integer(_)
             | ScalarRef::BigInt(_)
+            | ScalarRef::Real(_)
+            | ScalarRef::Double(_)
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)
@@ -376,6 +406,8 @@ impl<'a> ScalarRef<'a> {
             ScalarRef::Text(_)
             | ScalarRef::Integer(_)
             | ScalarRef::BigInt(_)
+            | ScalarRef::Real(_)
+            | ScalarRef::Double(_)
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)
@@ -397,6 +429,8 @@ impl<'a> ScalarRef<'a> {
             ScalarRef::Text(s) | ScalarRef::Enum(s) => Some(s),
             ScalarRef::Integer(_)
             | ScalarRef::BigInt(_)
+            | ScalarRef::Real(_)
+            | ScalarRef::Double(_)
             | ScalarRef::Bool(_)
             | ScalarRef::Date(_)
             | ScalarRef::Timestamp(_)
@@ -877,6 +911,44 @@ pub fn encode_row(
                 buf.extend_from_slice(&text_len.to_le_bytes());
                 buf.extend_from_slice(text_bytes);
             }
+            Value::Real(v) => {
+                if !matches!(column.ty, ColumnType::Real) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Real value, got Real",
+                        column.name
+                    )));
+                }
+                if !v.is_finite() {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: REAL value must be finite",
+                        column.name
+                    )));
+                }
+                // F4: 公開 API（typed insert 等）経由で SQL リテラルの
+                // 解析（scalar_float::parse_real）を経ずに `-0.0` が渡り得るため、
+                // 永続化バイト列を確定させる直前に正規化する。
+                let v = crate::scalar_float::canonicalize_real(*v);
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::Double(v) => {
+                if !matches!(column.ty, ColumnType::Double) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Double value, got Double",
+                        column.name
+                    )));
+                }
+                if !v.is_finite() {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: DOUBLE PRECISION value must be finite",
+                        column.name
+                    )));
+                }
+                // F4: canonicalize_real と同じ理由（-0.0 正規化）。
+                let v = crate::scalar_float::canonicalize_double(*v);
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
             // ENUM 列の値（Issue #890 D3）。行バイト表現は TEXT と同一フレーム
             // （presence + `u32` LE 長 + UTF-8 本体）を共有するが、書き込み前に
             // 語彙を検査する多層防御を持つ（束縛層〔`sql::parser::bind_enum_literal`〕
@@ -888,6 +960,8 @@ pub fn encode_row(
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
+                    | ColumnType::Real
+                    | ColumnType::Double
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
@@ -927,6 +1001,8 @@ pub fn encode_row(
                     ColumnType::Text
                     | ColumnType::Integer
                     | ColumnType::BigInt
+                    | ColumnType::Real
+                    | ColumnType::Double
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
@@ -1032,6 +1108,8 @@ pub fn encode_row(
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
+                    | ColumnType::Real
+                    | ColumnType::Double
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
@@ -1087,6 +1165,8 @@ pub fn encode_row(
                     ColumnType::Text
                     | ColumnType::Integer
                     | ColumnType::BigInt
+                    | ColumnType::Real
+                    | ColumnType::Double
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
                     | ColumnType::Date
@@ -1298,6 +1378,62 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     } else {
                         values.push(Value::Text(text));
                     }
+                }
+                ColumnType::Real => {
+                    let bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before real field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid("row buffer truncated at real field".to_string())
+                        })?;
+                    let arr: [u8; 4] = bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("real field is not 4 bytes".to_string())
+                    })?;
+                    let v = f32::from_le_bytes(arr);
+                    if !v.is_finite() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: persisted REAL value is not finite",
+                            column.name
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after real field".to_string())
+                    })?;
+                    values.push(Value::Real(crate::scalar_float::canonicalize_real(v)));
+                }
+                ColumnType::Double => {
+                    let bytes = buf
+                        .get(
+                            offset..offset.checked_add(8).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before double field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "row buffer truncated at double field".to_string(),
+                            )
+                        })?;
+                    let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("double field is not 8 bytes".to_string())
+                    })?;
+                    let v = f64::from_le_bytes(arr);
+                    if !v.is_finite() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: persisted DOUBLE PRECISION value is not finite",
+                            column.name
+                        )));
+                    }
+                    offset = offset.checked_add(8).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after double field".to_string())
+                    })?;
+                    values.push(Value::Double(crate::scalar_float::canonicalize_double(v)));
                 }
                 ColumnType::Vector(expected_dim) => {
                     let expected_dim = *expected_dim;
@@ -1722,6 +1858,44 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                 buf.extend_from_slice(&text_len.to_le_bytes());
                 buf.extend_from_slice(text_bytes);
             }
+            Value::Real(v) => {
+                if !matches!(column.ty, ColumnType::Real) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Real value, got Real",
+                        column.name
+                    )));
+                }
+                if !v.is_finite() {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: REAL value must be finite",
+                        column.name
+                    )));
+                }
+                // F4: -0.0 正規化（他エンコード経路と同じ理由。row_codec.rs 冒頭参照）。
+                let v = crate::scalar_float::canonicalize_real(*v);
+                reserve(&mut buf, SCALAR_REAL_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::Double(v) => {
+                if !matches!(column.ty, ColumnType::Double) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} expects a non-Double value, got Double",
+                        column.name
+                    )));
+                }
+                if !v.is_finite() {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?}: DOUBLE PRECISION value must be finite",
+                        column.name
+                    )));
+                }
+                // F4: -0.0 正規化。
+                let v = crate::scalar_float::canonicalize_double(*v);
+                reserve(&mut buf, SCALAR_DOUBLE_ENTRY_LEN)?;
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
             Value::Enum(label) => {
                 let def = match &column.ty {
                     ColumnType::Enum(def) => def,
@@ -1729,6 +1903,8 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
+                    | ColumnType::Real
+                    | ColumnType::Double
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
@@ -1844,6 +2020,8 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     | ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Vector(_)
+                    | ColumnType::Real
+                    | ColumnType::Double
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
@@ -1916,6 +2094,8 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
                     ColumnType::Text
                     | ColumnType::Integer
                     | ColumnType::BigInt
+                    | ColumnType::Real
+                    | ColumnType::Double
                     | ColumnType::Vector(_)
                     | ColumnType::Boolean
                     | ColumnType::Date
@@ -1984,6 +2164,8 @@ fn validate_json_column_value(column: &crate::catalog::ColumnDef, text: &str) ->
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Vector(_)
+        | ColumnType::Real
+        | ColumnType::Double
         | ColumnType::Boolean
         | ColumnType::Date
         | ColumnType::Timestamp
@@ -2149,6 +2331,44 @@ pub(crate) fn merge_encode_scalar_columns(
                     }
                     write_text(&mut buf, &mut reserve, text.as_bytes())?;
                 }
+                Value::Real(v) => {
+                    if !matches!(column.ty, ColumnType::Real) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Real value, got Real",
+                            column.name
+                        )));
+                    }
+                    if !v.is_finite() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: REAL value must be finite",
+                            column.name
+                        )));
+                    }
+                    // F4: -0.0 正規化。
+                    let v = crate::scalar_float::canonicalize_real(*v);
+                    reserve(&mut buf, SCALAR_REAL_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                Value::Double(v) => {
+                    if !matches!(column.ty, ColumnType::Double) {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?} expects a non-Double value, got Double",
+                            column.name
+                        )));
+                    }
+                    if !v.is_finite() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: DOUBLE PRECISION value must be finite",
+                            column.name
+                        )));
+                    }
+                    // F4: -0.0 正規化。
+                    let v = crate::scalar_float::canonicalize_double(*v);
+                    reserve(&mut buf, SCALAR_DOUBLE_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
                 Value::Enum(label) => {
                     let def = match &column.ty {
                         ColumnType::Enum(def) => def,
@@ -2156,6 +2376,8 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Integer
                         | ColumnType::BigInt
                         | ColumnType::Vector(_)
+                        | ColumnType::Real
+                        | ColumnType::Double
                         | ColumnType::Boolean
                         | ColumnType::Date
                         | ColumnType::Timestamp
@@ -2260,6 +2482,8 @@ pub(crate) fn merge_encode_scalar_columns(
                         | ColumnType::Integer
                         | ColumnType::BigInt
                         | ColumnType::Vector(_)
+                        | ColumnType::Real
+                        | ColumnType::Double
                         | ColumnType::Boolean
                         | ColumnType::Date
                         | ColumnType::Timestamp
@@ -2295,6 +2519,8 @@ pub(crate) fn merge_encode_scalar_columns(
                         ColumnType::Text
                         | ColumnType::Integer
                         | ColumnType::BigInt
+                        | ColumnType::Real
+                        | ColumnType::Double
                         | ColumnType::Vector(_)
                         | ColumnType::Boolean
                         | ColumnType::Date
@@ -2379,6 +2605,31 @@ pub(crate) fn merge_encode_scalar_columns(
                         )));
                     }
                     reserve(&mut buf, SCALAR_INT8_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                Some(ScalarRef::Real(v)) => {
+                    // 既存の永続バイトから借用した値。decode 側で非有限値は
+                    // 既に拒否済みのため有限性は保証されるが、untrusted な
+                    // 格納済みデータに由来する不変条件のため念のため再検証する。
+                    if !v.is_finite() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: existing REAL value must be finite",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_REAL_ENTRY_LEN)?;
+                    buf.push(PRESENCE_VALUE);
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                Some(ScalarRef::Double(v)) => {
+                    if !v.is_finite() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: existing DOUBLE PRECISION value must be finite",
+                            column.name
+                        )));
+                    }
+                    reserve(&mut buf, SCALAR_DOUBLE_ENTRY_LEN)?;
                     buf.push(PRESENCE_VALUE);
                     buf.extend_from_slice(&v.to_le_bytes());
                 }
@@ -2572,6 +2823,74 @@ fn scan_scalar_columns_validated<'a>(
                 sink(col_index, None)?;
             }
             PRESENCE_VALUE => match &column.ty {
+                ColumnType::Real => {
+                    let bytes = buf
+                        .get(
+                            offset..offset.checked_add(4).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before real field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at real field".to_string(),
+                            )
+                        })?;
+                    let arr: [u8; 4] = bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("real field is not 4 bytes".to_string())
+                    })?;
+                    let v = f32::from_le_bytes(arr);
+                    if !v.is_finite() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: persisted REAL value is not finite",
+                            column.name
+                        )));
+                    }
+                    offset = offset.checked_add(4).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after real field".to_string())
+                    })?;
+                    let v = crate::scalar_float::canonicalize_real(v);
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Real(v)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
+                ColumnType::Double => {
+                    let bytes = buf
+                        .get(
+                            offset..offset.checked_add(8).ok_or_else(|| {
+                                RowCodecError::Invalid(
+                                    "offset overflow before double field".to_string(),
+                                )
+                            })?,
+                        )
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "scalar payload truncated at double field".to_string(),
+                            )
+                        })?;
+                    let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+                        RowCodecError::Invalid("double field is not 8 bytes".to_string())
+                    })?;
+                    let v = f64::from_le_bytes(arr);
+                    if !v.is_finite() {
+                        return Err(RowCodecError::Invalid(format!(
+                            "column {:?}: persisted DOUBLE PRECISION value is not finite",
+                            column.name
+                        )));
+                    }
+                    offset = offset.checked_add(8).ok_or_else(|| {
+                        RowCodecError::Invalid("offset overflow after double field".to_string())
+                    })?;
+                    let v = crate::scalar_float::canonicalize_double(v);
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Double(v)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                }
                 ColumnType::Boolean => {
                     let byte = *buf.get(offset).ok_or_else(|| {
                         RowCodecError::Invalid(
@@ -2985,6 +3304,8 @@ pub fn scalar_refs_as_text<'a>(scanned: &[Option<ScalarRef<'a>>]) -> Vec<Option<
             Some(ScalarRef::Text(t)) => Some(*t),
             Some(ScalarRef::Integer(_))
             | Some(ScalarRef::BigInt(_))
+            | Some(ScalarRef::Real(_))
+            | Some(ScalarRef::Double(_))
             | Some(ScalarRef::Bool(_))
             | Some(ScalarRef::Date(_))
             | Some(ScalarRef::Timestamp(_))
@@ -3029,6 +3350,8 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
             }
             Some(ScalarRef::Integer(v)) => values.push(Value::Integer(v)),
             Some(ScalarRef::BigInt(v)) => values.push(Value::BigInt(v)),
+            Some(ScalarRef::Real(v)) => values.push(Value::Real(v)),
+            Some(ScalarRef::Double(v)) => values.push(Value::Double(v)),
             Some(ScalarRef::Enum(label)) => {
                 let mut owned = String::new();
                 owned.try_reserve_exact(label.len()).map_err(|_| {
@@ -3082,6 +3405,17 @@ mod tests {
         )
     }
 
+    /// `REAL`／`DOUBLE PRECISION` 列（TABLE-13・TASK-196）の往復テスト用スキーマ。
+    fn float_schema() -> TableSchema {
+        TableSchema::new(
+            "metrics",
+            vec![
+                ColumnDef::new("score", ColumnType::Real, false),
+                ColumnDef::new("weight", ColumnType::Double, true),
+            ],
+        )
+    }
+
     #[test]
     fn encode_decode_roundtrip_preserves_row() {
         let schema = text_vector_schema();
@@ -3096,6 +3430,121 @@ mod tests {
         assert_eq!(decoded.tenant_id, "tenant-a");
         assert_eq!(decoded.visibility, Visibility::Private);
         assert_eq!(decoded.values, values);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_preserves_real_and_double_boundary_values() {
+        let schema = float_schema();
+        for (real, double) in [
+            (0.0f32, 0.0f64),
+            (-0.0f32, -0.0f64), // 正規化されて +0.0 になる（F4）
+            (f32::MAX, f64::MAX),
+            (f32::MIN, f64::MIN),
+            (f32::MIN_POSITIVE, f64::MIN_POSITIVE),
+            (0.1f32, 0.1f64),
+        ] {
+            let values = vec![Value::Real(real), Value::Double(double)];
+            let encoded =
+                encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+            let decoded = decode_row(&schema, &encoded).expect("decode");
+            match &decoded.values[0] {
+                Value::Real(v) => assert_eq!(
+                    v.to_bits(),
+                    crate::scalar_float::canonicalize_real(real).to_bits()
+                ),
+                other => panic!("expected Real, got {other:?}"),
+            }
+            match &decoded.values[1] {
+                Value::Double(v) => assert_eq!(
+                    v.to_bits(),
+                    crate::scalar_float::canonicalize_double(double).to_bits()
+                ),
+                other => panic!("expected Double, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn encode_row_normalizes_signed_zero_to_positive_zero_in_stored_bytes() {
+        // F4: `-0.0` はエンコード時点で `+0.0` へ正規化される契約。decode 側の
+        // 正規化（encode_decode_roundtrip_preserves_real_and_double_boundary_values）
+        // だけに頼ると、保存バイト列そのものは符号付きゼロのまま残り、
+        // `content_hash`（台帳の 23505／22023 判定）の入力が読み出し結果と
+        // 食い違う。ここでは encode_row が返す生バイト列を直接比較し、
+        // `-0.0`／`+0.0` が同一バイト列に写ることを固定する。
+        let schema = float_schema();
+        let values_pos = vec![Value::Real(0.0), Value::Double(0.0)];
+        let values_neg = vec![Value::Real(-0.0), Value::Double(-0.0)];
+        let encoded_pos =
+            encode_row(&schema, "tenant-a", Visibility::Public, &values_pos).expect("encode");
+        let encoded_neg =
+            encode_row(&schema, "tenant-a", Visibility::Public, &values_neg).expect("encode");
+        assert_eq!(encoded_pos, encoded_neg);
+    }
+
+    #[test]
+    fn encode_rejects_non_finite_real_and_double() {
+        let schema = float_schema();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let values = vec![Value::Real(bad), Value::Null];
+            assert!(matches!(
+                encode_row(&schema, "tenant-a", Visibility::Public, &values),
+                Err(RowCodecError::Invalid(_))
+            ));
+        }
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let values = vec![Value::Real(1.0), Value::Double(bad)];
+            assert!(matches!(
+                encode_row(&schema, "tenant-a", Visibility::Public, &values),
+                Err(RowCodecError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn encode_rejects_type_mismatch_for_real_and_double_columns() {
+        let schema = float_schema();
+        // score 列（Real）へ Double 値、weight 列（Double）へ Real 値を渡すのは
+        // 型不一致として拒否する。
+        let values = vec![Value::Double(1.0), Value::Real(1.0)];
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &values),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_non_finite_persisted_real_and_double_bytes() {
+        // 永続バイトも untrusted とみなし、NaN/Inf のビット列は decode 時点で
+        // 拒否する（TABLE-7 と同じ方針）。
+        let schema = float_schema();
+        let values = vec![Value::Real(1.0), Value::Double(1.0)];
+        let mut encoded =
+            encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        // ヘッダ（version(1)+visibility(1)+tenant_len(1)+"tenant-a"(8)）の直後、
+        // presence(1) を挟んだ位置から始まる 4 バイトが REAL の LE ビット列。
+        let real_bytes_offset = 1 + 1 + 1 + "tenant-a".len() + 1;
+        encoded[real_bytes_offset..real_bytes_offset + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(matches!(
+            decode_row(&schema, &encoded),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_real_and_double_fields() {
+        let schema = float_schema();
+        // 2 列目（weight, DOUBLE, nullable）も値ありにすることで、末尾切り詰めが
+        // 「nullable 列の欠落」（許容される）ではなく「DOUBLE 本体の途中で
+        // 打ち切られている」（拒否される）ことを保証する。
+        let values = vec![Value::Real(1.0), Value::Double(2.0)];
+        let encoded = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+        // DOUBLE は 8 バイト固定長のため、末尾を切り詰めると構造検証で拒否される。
+        let truncated = &encoded[..encoded.len() - 1];
+        assert!(matches!(
+            decode_row(&schema, truncated),
+            Err(RowCodecError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -3497,9 +3946,8 @@ mod tests {
         let buf_range = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
         for slot in scanned.iter().skip(1) {
             let s = slot
-                .expect("text column must be Some")
-                .as_text()
-                .expect("text column must be ScalarRef::Text");
+                .and_then(|v| v.as_text())
+                .expect("text column must be Some");
             let ptr = s.as_ptr() as usize;
             assert!(
                 buf_range.contains(&ptr),
@@ -3544,7 +3992,7 @@ mod tests {
         for (slot, value) in scanned.iter().zip(decoded.iter()) {
             match (slot, value) {
                 (None, Value::Null) => {}
-                (Some(s), Value::Text(t)) => assert_eq!(*s, ScalarRef::Text(t.as_str())),
+                (Some(ScalarRef::Text(s)), Value::Text(t)) => assert_eq!(*s, t.as_str()),
                 other => panic!("scan/decode mismatch: {other:?}"),
             }
         }

@@ -1938,6 +1938,10 @@ impl<'a> Parser<'a> {
     /// `+1` はいずれも従来どおり構造的に受理しない（`42601`）。実際の値域検証・
     /// パースは束縛段（`sql::parser::bind_integer_literal`）が行う。
     fn expect_literal(&mut self) -> Result<InsertLiteral, SqlSurfaceError> {
+        // F7（Issue #882 計画）: `REAL`/`DOUBLE PRECISION` の負リテラル
+        // （`-1.5` 等）も同じ規範で受理する（`HAVING` 述語〔約 L1359〕と同じ
+        // `['-'] <Number>` の文法を先読みで判定）。`Number` 以外（文字列・
+        // ベクトルリテラル）の直前の `-` は許可リスト外のまま拒否する。
         if matches!(self.peek(), Some(Token::Punct('-'))) {
             self.advance();
             return match self.advance() {
