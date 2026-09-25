@@ -83,8 +83,11 @@
 //!   親 Issue #941 の 2 時間単位 sub-issue 群の 1 つ）。X25519 鍵交換
 //!   （RFC 7748・定数時間。Issue #955）・`tls::record`（レコード層。
 //!   RFC 8446 §5.1。Issue #952）・`tls::record_protection`（レコード保護層。
-//!   RFC 8446 §5.2〜§5.5。Issue #959）まで実装済み。接続経路（`handshake.rs`・
-//!   `server.rs`）への結線は #966 以降
+//!   RFC 8446 §5.2〜§5.5。Issue #959）・`tls::ed25519`（Ed25519 署名生成・
+//!   検証。RFC 8032 §5.1。Issue #961）・`tls::certificate_verify`
+//!   （`CertificateVerify` の署名対象構成・生成・検証。RFC 8446 §4.4.3。
+//!   Issue #961）まで実装済み。接続経路（`handshake.rs`・`server.rs`）への
+//!   結線は #966 以降
 //! - `fault_injection`（feature `fault-injection` 限定・テスト専用。
 //!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
 //!   語彙パーサと、`simple_query::execute_and_respond` の登録ブロック内から

@@ -13,7 +13,7 @@
 //!   per-record nonce の導出・レコード保護本体は [`super::key_schedule`]・
 //!   #959 の担当
 //! - [`field25519`]（`pub(crate)`）: GF(2^255-19) 上の定数時間フィールド
-//!   算術。X25519 と後続の Ed25519（Issue #961）で共有する内部基盤
+//!   算術。X25519 と Ed25519（[`ed25519`]。Issue #961）で共有する内部基盤
 //! - [`x25519`]: X25519 鍵交換（RFC 7748・定数時間。Issue #955）。TLS 1.3
 //!   の鍵交換グループとして採用
 //! - [`record`]: レコード層（RFC 8446 §5.1。#952）。ヘッダ検証・
@@ -46,16 +46,24 @@
 //! - [`pkcs8`]: PKCS#8 v1・Ed25519（RFC 8410 §7）の最小 DER パース
 //!   （Issue #962）。[`pem`] が返す DER から 32 バイトの seed を取り出し、
 //!   RSA・ECDSA・v2（OneAsymmetricKey）等は起動時に明示的に拒否する。
-//!   鍵導出・署名は #961 の担当
+//!   鍵導出・署名は [`ed25519::SigningKey::from_seed`]（Issue #961）が担う
 //! - [`der`]（`pub(crate)`）: X.509 向けに一般化した任意深さの DER TLV
 //!   リーダー（Issue #963）。[`pkcs8::DerReader`] とは別に持つ
 //! - [`x509`]: X.509 証明書の最小パース・validity 検査・葉 SPKI
 //!   （Ed25519）と秘密鍵側の公開鍵の照合、`Certificate` メッセージの
 //!   組み立て（Issue #963）。証明書署名の検証・extensions の意味解釈は
 //!   対象外のまま（[`x509`] のドキュメンテーションコメントを参照）
-//! - [`sha512`]: SHA-512（FIPS 180-4）。Ed25519 署名生成・検証（Issue #961）の
-//!   秘密鍵展開・署名計算が使う（Issue #960）。トランスクリプトハッシュ・
-//!   HKDF は引き続き SHA-256（[`hkdf`]）のまま
+//! - [`sha512`]: SHA-512（FIPS 180-4）。[`ed25519`] の秘密鍵展開・署名計算が
+//!   使う（Issue #960）。トランスクリプトハッシュ・HKDF は引き続き
+//!   SHA-256（[`hkdf`]）のまま
+//! - [`ed25519`]: Ed25519 署名生成・検証（RFC 8032 §5.1。Issue #961）。
+//!   [`field25519`]・[`sha512`]・[`pkcs8::Ed25519Seed`] を組み合わせ、
+//!   [`x509::ServerCertificateChain::from_der_chain`] の
+//!   `expected_leaf_public_key` へ渡す公開鍵導出までを担う
+//! - [`certificate_verify`]: `CertificateVerify` の署名対象構成
+//!   （RFC 8446 §4.4.3。Issue #961）と、[`ed25519`] を使った生成・検証。
+//!   `transcript_hash` は [`transcript::Transcript::
+//!   hash_through_certificate`] の戻り値を呼び出し元（#965）が渡す契約
 //! - [`transcript`]: transcript hash（RFC 8446 §4.4.1。Issue #964）。
 //!   ハンドシェイクメッセージ列の累積 SHA-256 を、更新順序の単一情報源
 //!   （[`transcript::Transcript::expected_next`]）とともに提供し、
@@ -72,8 +80,10 @@
 
 pub mod aes;
 pub mod aes_gcm;
+pub mod certificate_verify;
 pub mod client_hello;
 pub(crate) mod der;
+pub mod ed25519;
 pub(crate) mod field25519;
 pub mod finished;
 pub mod handshake;
