@@ -73,7 +73,7 @@ macro_rules! define_error_classes {
 }
 
 define_error_classes! {
-    count = 21;
+    count = 22;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -89,7 +89,9 @@ define_error_classes! {
     /// `POST /v1/session/close` の再送）。
     AuthRequired => ("28000", "AUTH_REQUIRED"),
     /// テナント帰属不一致（`42501`）。[`crate::tenant::TenantWriteError::Forbidden`]
-    /// の写像。
+    /// の写像。SQL-23・TASK-202・TASK-203（Issue #899・#902）の DDL 実行権限
+    /// 不足（[`crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege`]）も
+    /// 同分類へ写像する（`UniqueViolation` が複数原因を束ねているのと同じ運用）。
     ForbiddenTenantMismatch => ("42501", "FORBIDDEN_TENANT_MISMATCH"),
     /// 参照したテーブルがカタログ未存在（`42P01`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::UndefinedTable`] の写像。
@@ -159,11 +161,17 @@ define_error_classes! {
     /// 対し、本分類は「値は文字列として妥当だが、宣言済み型が定める表現の集合に
     /// 属さない」ことを表す（PostgreSQL の `invalid_text_representation` と同じ区別）。
     InvalidTextRepresentation => ("22P02", "INVALID_TEXT_REPRESENTATION"),
-    /// `CREATE VIEW`／`CREATE TABLE` が既存のテーブル名・ビュー名と衝突した
-    /// （`42P07`。TABLE-18・SQL-23・TASK-205、Issue #909）。ビューはテーブルと
-    /// 名前空間を共有する（[`crate::catalog::CatalogError::TableAlreadyExists`]
-    /// の写像）。
+    /// `CREATE TABLE` が指定したテーブル名が既に存在する（`42P07`）。TABLE-4・
+    /// TASK-85（Issue #899）が追加。上書きしない設計（既存スキーマは変更されない）。
+    /// `CREATE VIEW`（TABLE-18・SQL-23・TASK-205、Issue #909）が既存のテーブル
+    /// 名・ビュー名と衝突した場合も同じ分類を共有する（ビューはテーブルと
+    /// 名前空間を共有する）。[`crate::sql::allowlist::SqlSurfaceError::
+    /// DuplicateTable`] の写像。
     DuplicateTable => ("42P07", "DUPLICATE_TABLE"),
+    /// `CREATE TABLE` の列リストに同名の列が複数回宣言された（`42701`）。
+    /// TABLE-6・TASK-85（Issue #899）が追加。
+    /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateColumn`] の写像。
+    DuplicateColumn => ("42701", "DUPLICATE_COLUMN"),
     /// `DROP TABLE`／`DROP VIEW` の対象に、それを参照するビューが 1 つ以上残って
     /// いるため削除を拒否した（`2BP01`。TABLE-18・SQL-23・TASK-205、Issue #909）。
     /// [`crate::catalog::CatalogError::DependentViewsExist`] の写像。依存する

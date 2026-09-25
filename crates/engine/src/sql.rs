@@ -259,6 +259,19 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     Update(exec::UpdateOutcome),
+    /// `CREATE TABLE <table> (<col> <type>[, ...]) [;]`（SQL-23・TASK-85・
+    /// TASK-202、Issue #899）がセッション経由の実行経路
+    /// （`crate::core::EngineCore::execute_parsed_in_session`）で成功したことを
+    /// 示す応答。DDL 実行権限ゲート（[`ddl::require_ddl_permission`]）を通過
+    /// したセッションに限り到達する。本 variant はその
+    /// [`ddl::CreateTableOutcome`] をそのまま運ぶ薄いラッパー（`Insert`・
+    /// `Truncate`・`Delete`・`Update` と同じ設計）。
+    ///
+    /// **BREAKING CHANGE**（Issue #899）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コード（`crate::core::EngineCore`・
+    /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
+    /// を網羅的にマッチするコードがあれば追随が必要。
+    CreateTable(ddl::CreateTableOutcome),
     /// `DROP TABLE <table>`（SQL-23・TASK-203、Issue #902）がセッション経由の
     /// 実行経路（`crate::core::EngineCore::execute_parsed_in_session`）で
     /// 成功したことを示す応答。DDL 実行権限ゲート（`ddl::require_ddl_permission`）を

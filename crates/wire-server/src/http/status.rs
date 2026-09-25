@@ -29,7 +29,10 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         ErrorClass::AuthRequired | ErrorClass::AuthInvalid => 401,
         ErrorClass::ForbiddenTenantMismatch => 403,
         ErrorClass::TableNotFound | ErrorClass::RowNotFound => 404,
-        ErrorClass::UniqueViolation => 409,
+        // `DuplicateTable`（`42P07`。SQL-23・TASK-85、Issue #899）は
+        // `CREATE TABLE` が指定したテーブル名の既存衝突であり、`UniqueViolation`
+        // と同じ「対象が既に存在する」意味論のため同じ 409 とする。
+        ErrorClass::UniqueViolation | ErrorClass::DuplicateTable => 409,
         ErrorClass::PayloadTooLarge => 413,
         ErrorClass::InternalError => 500,
         ErrorClass::FeatureNotSupported => 501,
@@ -42,10 +45,14 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::MissingOperationId
         | ErrorClass::DatetimeFieldOverflow
         | ErrorClass::InvalidTextRepresentation
+        // `DuplicateColumn`（`42701`。Issue #899）は `CREATE TABLE` の列リスト
+        // 自体が不正という構文的な分類のため、他の 42xxx 系と同じ 400 とする。
+        | ErrorClass::DuplicateColumn
         // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW`
-        // が新設する 3 分類。いずれもクライアント入力（対象名・依存関係）に
-        // 起因する拒否のため、既存の SQL 構文エラー系と同じ 400 とする。
-        | ErrorClass::DuplicateTable
+        // が新設する 2 分類（`DuplicateTable` は上で `UniqueViolation` と
+        // 同じ 409 に既に分類済みのためここには含めない）。いずれも
+        // クライアント入力（対象名・依存関係）に起因する拒否のため、既存の
+        // SQL 構文エラー系と同じ 400 とする。
         | ErrorClass::DependentObjectsStillExist
         | ErrorClass::WrongObjectType => 400,
     }
@@ -57,7 +64,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 21] = [
+    const EXPECTED: [(ErrorClass, u16); 22] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -76,7 +83,8 @@ mod tests {
         (ErrorClass::OperationIdContentMismatch, 400),
         (ErrorClass::DatetimeFieldOverflow, 400),
         (ErrorClass::InvalidTextRepresentation, 400),
-        (ErrorClass::DuplicateTable, 400),
+        (ErrorClass::DuplicateTable, 409),
+        (ErrorClass::DuplicateColumn, 400),
         (ErrorClass::DependentObjectsStillExist, 400),
         (ErrorClass::WrongObjectType, 400),
     ];

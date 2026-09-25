@@ -10,8 +10,15 @@
 //! 同一トランザクションで削除するが、これは DDL のライフサイクル管理としての
 //! 削除であり、行の中身（値）を読み書きするものではない。
 //! 行エンコーダーの列対応・NULL 解決（TASK-86）・
-//! アリーナデコード（TASK-87）・テナント境界統合（TASK-89）・SQL surface からの
-//! DDL 受理は本モジュールの責務外で、後続タスクが本モジュールの API に依存する。
+//! アリーナデコード（TASK-87）・テナント境界統合（TASK-89）は本モジュールの
+//! 責務外で、後続タスクが本モジュールの API に依存する。SQL 表層からの `CREATE
+//! TABLE` 受理は SQL-23・TASK-202（Issue #899）で `sql::ddl`（DDL 実行権限
+//! ゲート・`SqlOutcome` への写像）から配線済み（本モジュールは実行本体
+//! [`Storage::create_table`] を提供するのみで、権限判定・SQL 構文の許可リスト
+//! 判定は担わない）。`DROP TABLE`（[`Storage::drop_table`]）は Issue #902 で
+//! `EngineCore::parse_tokens` → `sql::ddl::execute_drop_table` →
+//! [`Storage::drop_table`] として配線済み（`docs/design/drop-table.md` 参照）。
+//! `ALTER TABLE` は引き続き未配線のまま。
 //!
 //! `storage.rs` との関係: `Storage::db()`（`pub(crate)`）を経由して同一
 //! `redb::Database` ハンドルを共有し、カタログ専用のテーブル（[`CATALOG_TABLE`]）に
@@ -2236,8 +2243,9 @@ impl Storage {
     /// [`crate::policy::PolicyContext`] を取らない生の DDL であり、全テナントの行を
     /// 不可逆に削除する。SQL 表層（`DROP TABLE <table>`。SQL-23・TASK-203、
     /// Issue #902）は `crate::sql::ddl::require_ddl_permission`（接続単位の
-    /// DDL 実行権限ゲート。既定拒否・`42501`）を通過したセッションに限り
-    /// `crate::sql::ddl::execute_drop_table` 経由で本メソッドへ到達する
+    /// DDL 実行権限ゲート。既定拒否・`42501`。`CREATE TABLE`〔SQL-23・
+    /// TASK-202、Issue #899〕と共有する単一の判定点）を通過したセッションに
+    /// 限り `crate::sql::ddl::execute_drop_table` 経由で本メソッドへ到達する
     /// （wire-server 側の付与経路は `crate::sql::mode::SessionState::allow_ddl`
     /// ドキュメント参照）。
     ///

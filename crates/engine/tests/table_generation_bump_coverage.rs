@@ -94,25 +94,26 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （旧: 1567／1591／1639／1653／1677）。Issue #901（`ALTER TABLE ... DROP
     // COLUMN`／`ALTER COLUMN ... TYPE` の追加。`DroppedSlot`／`PhysicalSlot`・
     // `Storage::alter_table_drop_column`／`alter_table_widen_numeric_precision`）
-    // で `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 1701）。Issue #902
-    // （`DROP TABLE` の DDL 実行権限ゲート）の base 取り込みマージで
-    // `Storage::drop_table` のドキュメンテーションコメントが増え、以下 2 件の
-    // 行番号がさらに移動したための追随（旧: 2173／2252）。PR #1045 レビュー
-    // 対応（`TableSchema` の公開 API 互換性ドキュメンテーションコメント追加、
-    // Issue #901）で `catalog.rs` 冒頭側にさらに 7 行追加され、再度追随
-    // （旧: 2177／2256）。Issue #995（`VECTOR` 列を持たないテーブルへの INSERT
-    // 系書き込み受理）の base 取り込みマージで `TableSchema::validate_embedding_dim`
-    // ／`validate_row_embedding_dim`・`Storage::insert_row_into_table`／
-    // `insert_typed_row` のドキュメンテーションコメントが計 33 行増え、以下 2 件の
-    // 行番号がさらに移動したための追随（旧: 2184／2263）。TABLE-18・SQL-23・
+    // で `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 1701）。Issue #899
+    // （CREATE TABLE 構文）・Issue #902（`DROP TABLE` の DDL 実行権限ゲート）の
+    // base 取り込みマージで `catalog.rs` 冒頭側・`Storage::drop_table` の
+    // ドキュメンテーションコメントが増え、以下 2 件の行番号がさらに移動した
+    // ための追随（旧: 2173／2252）。PR #1045 レビュー対応（`TableSchema` の
+    // 公開 API 互換性ドキュメンテーションコメント追加、Issue #901）で
+    // `catalog.rs` 冒頭側にさらに 7 行追加され、再度追随（旧: 2177／2256）。
+    // Issue #995（`VECTOR` 列を持たないテーブルへの INSERT 系書き込み受理）の
+    // base 取り込みマージで `TableSchema::validate_embedding_dim`／
+    // `validate_row_embedding_dim`・`Storage::insert_row_into_table`／
+    // `insert_typed_row` のドキュメンテーションコメントが計 33 行増え、以下
+    // 2 件の行番号がさらに移動したための追随（旧: 2184／2263）。PR #1044
+    // レビュー対応（`DROP TABLE` 配線済み記述への訂正コメント）で `catalog.rs`
+    // 冒頭側にさらに 2 行増え、再度追随（旧: 2217／2296）。TABLE-18・SQL-23・
     // TASK-205（Issue #909。`VIEWS_TABLE`・`Storage::create_view`／`drop_view`
-    // 追加）で `catalog.rs` に行が追加され、以下の行番号がさらに移動したための
-    // 追随（旧: 2217）。本 PR（#909）の base（main）取り込みマージ（Issue #901
-    // 系変更との統合）で再度追随（旧: 2487）。PR #1048 レビュー対応
+    // 追加）との base（main）取り込みマージ統合・PR #1048 レビュー対応
     // （`Storage::create_view` の `body_sql`／`base_relation` 自己検証追加、
     // codex-review 指摘）で `catalog.rs` 冒頭側にさらに行が追加され、
     // 再度追随。
-    ("catalog.rs", 2522),
+    ("catalog.rs", 2530),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -121,22 +122,23 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #901 の行追加で再度追随（旧: 1780）。Issue #902 の base 取り込み
     // マージでさらに追随（旧: 2252）。PR #1045 レビュー対応（同上）で再度
     // 追随（旧: 2256）。Issue #995 の base 取り込みマージでさらに追随
-    // （旧: 2263）。TABLE-18・SQL-23・TASK-205（Issue #909）の行追加で
-    // さらに追随（旧: 2296）。本 PR（#909）の base（main）取り込みマージ
-    // （Issue #901 系変更との統合）で再度追随（旧: 2566）。PR #1048 レビュー
+    // （旧: 2263）。PR #1044 レビュー対応（同上）でさらに追随（旧: 2296）。
+    // TABLE-18・SQL-23・TASK-205（Issue #909）の行追加で さらに追随
+    // （旧: 2304）。本 PR（#909）の base（main）取り込みマージ（Issue #901
+    // 系変更との統合）で再度追随（旧: 2566）。PR #1048 レビュー
     // 対応（同上）で再度追随。
-    ("catalog.rs", 2601),
+    ("catalog.rs", 2609),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
     // テーブルが存在せずバンプ対象がない）。PR #1048 レビュー対応（同上）で
     // 再度追随（旧: 2627）。
-    ("catalog.rs", 2678),
+    ("catalog.rs", 2686),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
     // 再度追随（旧: 2655）。
-    ("catalog.rs", 2706),
+    ("catalog.rs", 2714),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
