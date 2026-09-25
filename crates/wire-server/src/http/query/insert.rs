@@ -502,6 +502,49 @@ mod tests {
         assert_eq!(err.wire_code(), "22000");
     }
 
+    /// Issue #896 レビュー指摘（PR #1038）: `insert` op が `VECTOR` 列を
+    /// `InsertLiteral::String`（`[f1,f2,...]` 形のテキストリテラル）経由で
+    /// `engine::sql::parser::bind_insert` へ渡していたため、テキスト表現が
+    /// 64 KiB（`MAX_VECTOR_LITERAL_BYTES`）を超える宣言次元の妥当なベクトルが
+    /// `54000` で誤って拒否されていた。`InsertLiteral::Vector`（JSON 配列 →
+    /// `f32` の直接構築。テキスト長上限を経由しない）への変更後は、
+    /// スキーマ上合法な高次元ベクトルが JSON 配列の要素数上限の範囲内であれば
+    /// 受理されることを固定する。
+    #[test]
+    fn bind_rows_accepts_high_dimension_vector_exceeding_text_literal_length_limit() {
+        const DIM: usize = 20_000;
+        let high_dim_schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new(
+                "embedding",
+                ColumnType::Vector(DIM as u32),
+                false,
+            )],
+        );
+
+        let mut embedding_json = String::from("[");
+        for i in 0..DIM {
+            if i > 0 {
+                embedding_json.push(',');
+            }
+            embedding_json.push_str("0.1");
+        }
+        embedding_json.push(']');
+        // テキスト表現が旧経路の 64 KiB 上限（`MAX_VECTOR_LITERAL_BYTES`）を
+        // 超えることを確認する（超えなければ本テストは修正前の退行を検出できない）。
+        assert!(embedding_json.len() > 64 * 1024);
+
+        let body = format!(r#"[{{"id":1,"embedding":{embedding_json}}}]"#);
+        let items = rows_from(&body);
+        let bounds = bind_rows(&items, "docs", None, &high_dim_schema).expect("bind ok");
+        assert_eq!(bounds.len(), 1);
+        let Value::Vector(values) = &bounds[0].values[0] else {
+            panic!("expected Value::Vector");
+        };
+        assert_eq!(values.len(), DIM);
+        assert!(values.iter().all(|v| (*v - 0.1_f32).abs() < 1e-6));
+    }
+
     #[test]
     fn bind_rows_rejects_missing_non_nullable_column() {
         let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0]}]"#);

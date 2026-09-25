@@ -1003,6 +1003,19 @@ pub enum InsertLiteral {
     /// （INSERT・UPSERT。SQL テキストからもファイル形からも `Null` は
     /// 構築されない到達不能パス）は fail-closed に一律拒否する。
     Null,
+    /// `VECTOR` 列向けの、既に要素ごとに検証済みの `f32` 列（NoSQL 表層
+    /// `insert`／`update` op が JSON 配列から直接構築する。Issue #896
+    /// レビュー指摘〔PR #1038〕対応）。SQL テキスト・COPY・ファイル形
+    /// `INSERT` はいずれも `VECTOR` 列を `InsertLiteral::String`（`[f1,f2,...]`
+    /// 形のテキストリテラル）として構築するため到達しないが、`sql::parser`
+    /// の `(ColumnType::Vector(dim), ...)` 束縛は本 variant も明示的に
+    /// 受理し、`InsertLiteral::String` 経由の [`crate::sql::parser::
+    /// parse_vector_literal`]（64 KiB のテキスト長上限）を経由せずに次元・
+    /// 有限性のみを検証してから [`crate::row_codec::Value::Vector`] へ束縛
+    /// する（テキスト長上限は SQL リテラルの構文制約であり、JSON 配列から
+    /// 直接届く既に解析済みの数値列には適用対象が無い設計判断。
+    /// `docs/design/nosql-typed-json-binding.md` 参照）。
+    Vector(Vec<f32>),
 }
 
 /// `ON CONFLICT (id) DO UPDATE SET <col> = <value>` の SET 右辺（SQL-20・

@@ -108,3 +108,18 @@ Issue #896 導入前は `update` op の JSON/UUID 列 `null` 分岐を wire 層�
 - クロスサーフェス `23505`（再送同一性）テストは INTEGER/REAL/NUMERIC/ARRAY/DATE では未追加（TEXT/VECTOR のみ既存）。
 - HTTP 経由の往復テストは NUMERIC/BOOLEAN/DATE/TIMESTAMP/UUID/ARRAY では未追加（INTEGER/BIGINT/REAL のみ `wire_integer_bigint_column.rs`／`wire_float_columns.rs` で追加）。
 - `aggregate`（`SUM`/`AVG`/`MIN`/`MAX`）と新型の組み合わせの層 A パリティテストは未追加。
+
+## レビュー対応（PR #1038）
+
+`VECTOR` 列を `insert`／`update` op の JSON 配列から束縛する際、上記「テキストから
+直接解釈する」設計（`typed_json::vector_literal_text` → `InsertLiteral::String` →
+`engine::sql::parser::parse_vector_literal`）が SQL 表層のテキストリテラル長上限
+（64 KiB。`MAX_VECTOR_LITERAL_BYTES`）を経由してしまい、宣言次元が大きく JSON 配列
+としては妥当でもテキスト表現が 64 KiB を超えるベクトルを `54000` で誤って拒否する
+退行があった（cursor Bugbot 指摘）。`typed_json::vector_literal_values` が JSON 配列
+から `f32` 列を直接構築し、新設した `engine::sql::allowlist::InsertLiteral::Vector`
+（NoSQL 表層専用 variant。SQL テキスト・COPY・ファイル形 `INSERT` からは構築されない）
+としてテキストリテラルを経由せず束縛するよう変更した。次元一致・各要素の有限性は
+engine 側（`sql::parser::bind_vector_literal_values`）で再検証し、`content_hash` の
+`push_dml_assignments`（述語つき `UPDATE ... WHERE` 用。本 variant は現状 NoSQL
+表層からは到達しない）にも前方ガードのタグを追加した。

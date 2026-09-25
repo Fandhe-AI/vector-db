@@ -333,13 +333,17 @@ mod tests {
 
     #[test]
     fn map_set_assignments_maps_vector_array() {
+        // Issue #896 レビュー指摘（PR #1038）以降、`VECTOR` 列は
+        // `InsertLiteral::Vector`（テキストリテラルの 64 KiB 上限を経由しない
+        // 直接構築の `f32` 列）へ束縛される（`typed_json::vector_literal_values`
+        // 参照）。
         let set = set_map(r#"{"embedding":[1,2,3]}"#);
         let bound = map_set_assignments(&set, &schema()).expect("ok");
         assert_eq!(
             bound,
             vec![(
                 "embedding".to_string(),
-                InsertLiteral::String("[1,2,3]".to_string())
+                InsertLiteral::Vector(vec![1.0, 2.0, 3.0])
             )]
         );
     }
@@ -352,9 +356,16 @@ mod tests {
             bound,
             vec![(
                 "embedding".to_string(),
-                InsertLiteral::String("[-0,1,2]".to_string())
+                InsertLiteral::Vector(vec![-0.0, 1.0, 2.0])
             )]
         );
+        // `-0.0` はビットパターンまで一致することを確認する（符号ビットの
+        // 保持は `engine::json::JsonNumber::as_f32` の契約。テキスト直列化を
+        // 経由しなくなった後も同じ保証を維持する）。
+        let InsertLiteral::Vector(values) = &bound[0].1 else {
+            panic!("expected InsertLiteral::Vector");
+        };
+        assert_eq!(values[0].to_bits(), (-0.0f32).to_bits());
     }
 
     #[test]
@@ -365,7 +376,7 @@ mod tests {
             bound,
             vec![(
                 "embedding".to_string(),
-                InsertLiteral::String("[1.5,2.25,3.0]".to_string())
+                InsertLiteral::Vector(vec![1.5, 2.25, 3.0])
             )]
         );
     }
@@ -430,18 +441,16 @@ mod tests {
 
     #[test]
     fn map_set_assignments_rejects_vector_dimension_mismatch_via_bind_update() {
-        // 次元検証は `bind_update`（`parse_vector_literal`）側の責務であり、
-        // 本関数はリテラル文字列を組み立てるのみ（次元不一致はここでは
-        // 拒否しない）。
+        // Issue #896 レビュー指摘（PR #1038）以降、次元検証は
+        // `typed_json::vector_literal_values`（本関数が呼び出す JSON → `f32`
+        // 直接束縛）がアロケーション前に行うため、本関数自身が `22000` で
+        // 拒否する（`bind_update` 側での遅延検証ではなくなった）。
         let set = set_map(r#"{"embedding":[1,2]}"#);
-        let bound = map_set_assignments(&set, &schema()).expect("ok (dimension checked later)");
-        assert_eq!(
-            bound,
-            vec![(
-                "embedding".to_string(),
-                InsertLiteral::String("[1,2]".to_string())
-            )]
-        );
+        let err = map_set_assignments(&set, &schema()).expect_err("dimension mismatch rejected");
+        assert!(matches!(
+            err,
+            UpdateError::Set(TypedJsonError::LegacyMismatch(_))
+        ));
     }
 
     #[test]

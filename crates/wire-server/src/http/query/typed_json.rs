@@ -125,28 +125,44 @@ pub fn number_literal_text(n: &JsonNumber) -> String {
     }
 }
 
-/// `VECTOR` 列向け配列直列化（`update.rs::vector_literal_text` の移設）。
-/// 各要素は [`JsonNumber::as_f32`] が有限値として解釈できることを要求する。
-/// 生テキストをそのまま使うため、`engine::sql::parser::parse_vector_literal`
-/// （`str -> f32` 単一丸め）による再解釈と結果が一致する。`VECTOR` は旧来型
-/// のため要素の型不一致・非有限も `LegacyMismatch`（`22000`）で統一する
-/// （`insert.rs::bind_rows_rejects_non_finite_vector_element` の既存契約）。
-pub fn vector_literal_text(items: &[JsonValue]) -> Result<String, TypedJsonError> {
-    let mut parts: Vec<String> = Vec::with_capacity(items.len());
+/// `VECTOR` 列向け配列 → `f32` 要素列（`update.rs::vector_literal_text` の
+/// 移設・Issue #896 レビュー指摘〔PR #1038〕による再設計）。旧実装は
+/// `[f1,f2,...]` 形のテキストへ直列化し `InsertLiteral::String` として
+/// `engine::sql::parser::parse_vector_literal`（64 KiB のテキスト長上限）を
+/// 経由していたため、宣言次元が大きく JSON 配列自体は妥当でもテキスト表現が
+/// 64 KiB を超える正当なベクトルを誤って拒否していた（`54000`）。本関数は
+/// 旧経路（Issue #896 以前の `insert.rs::bind_row`）と同じ直接構築方式へ
+/// 戻し、次元一致を**アロケーション前**に検査してから（`security.md`
+/// 「不安全な設計」対応。`dim` は `catalog::validate_vector_dim` で
+/// `MAX_VECTOR_DIM` 以下と CREATE TABLE 時点で保証済みのため安全な上限として
+/// 使える）`Vec<f32>` を構築する。各要素は [`JsonNumber::as_f32`] が有限値と
+/// して解釈できることを要求する（SQL 表層 `parse_vector_literal` の
+/// `str -> f32` 単一丸めと同一実装を経由するため表層横断で `content_hash` が
+/// 一致する。Issue #771 レビュー指摘対応の設計を踏襲）。`VECTOR` は旧来型の
+/// ため要素の型不一致・非有限・次元不一致のいずれも `LegacyMismatch`
+/// （`22000`）で統一する（`insert.rs::bind_rows_rejects_non_finite_vector_element`
+/// の既存契約）。
+pub fn vector_literal_values(items: &[JsonValue], dim: u32) -> Result<Vec<f32>, TypedJsonError> {
+    if items.len() != dim as usize {
+        return Err(TypedJsonError::LegacyMismatch(
+            "VECTOR column length does not match the table dimension",
+        ));
+    }
+    let mut values: Vec<f32> = Vec::with_capacity(items.len());
     for item in items {
         let JsonValue::Number(n) = item else {
             return Err(TypedJsonError::LegacyMismatch(
                 "VECTOR column element must be a JSON number",
             ));
         };
-        if n.as_f32().is_none() {
+        let Some(f) = n.as_f32() else {
             return Err(TypedJsonError::LegacyMismatch(
                 "VECTOR column element must be finite",
             ));
-        }
-        parts.push(number_literal_text(n));
+        };
+        values.push(f);
     }
-    Ok(format!("[{}]", parts.join(",")))
+    Ok(values)
 }
 
 /// `{...}` 形の配列リテラル要素 1 個を組み立てる。`quote` が `true` のときは
@@ -364,11 +380,16 @@ pub fn map_json_to_literal(
             )),
         },
         // VECTOR も同じく旧来型のため `LegacyMismatch`（`22000`）を維持する。
-        // 配列要素自体の型不一致（数値でない要素）は
-        // [`vector_literal_text`] が `TypeMismatch`（`42601`）で返すため
-        // ここでは列トップレベルの型不一致（配列でない）のみを対象とする。
-        ColumnType::Vector(_) => match raw {
-            JsonValue::Array(items) => Ok(InsertLiteral::String(vector_literal_text(items)?)),
+        // 配列要素自体の型不一致・次元不一致は [`vector_literal_values`] が
+        // 同じ `LegacyMismatch` で返すため、ここでは列トップレベルの型不一致
+        // （配列でない）のみを対象とする。`InsertLiteral::Vector`（Issue #896
+        // レビュー指摘・PR #1038）として直接構築し、テキストリテラル経由の
+        // 64 KiB 上限を経由しない（`vector_literal_values` のドキュメント
+        // コメント参照）。
+        ColumnType::Vector(dim) => match raw {
+            JsonValue::Array(items) => {
+                Ok(InsertLiteral::Vector(vector_literal_values(items, *dim)?))
+            }
             _ => Err(TypedJsonError::LegacyMismatch(
                 "VECTOR column value must be a JSON array of numbers",
             )),
