@@ -103,6 +103,10 @@ NoSQL 表層の `op` 許可リストには索引 DDL が無く、両分類とも
   ただし UNIQUE 制約（TABLE-16、Issue #905）・`PRIMARY KEY` の構成列は `DROP COLUMN`
   自体が拒否されるため、その場合は索引宣言も含め何も変更しない。
 - UNIQUE 制約は名前を持たないため、relation 名前空間の衝突対象にはならない。
+- 列リストの重複は SQL 表層（構文検証段・`42601`）だけでなく公開 Rust API
+  `Storage::create_index` でも `CatalogError::Invalid`（SQL 表層では `42601`）として
+  拒否し、読み出し（カタログ値のデコード）時に重複を含む値は破損として fail-closed に
+  拒否する。
 
 ## 既存キャッシュ・RLS との関係
 

@@ -221,12 +221,30 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
         })?;
         columns.push(c.to_string());
     }
+    // [`Storage::create_index`] は列の重複を永続化しないため、重複を含む値は
+    // 破損として fail-closed に拒否する。
+    if first_duplicate_column(&columns).is_some() {
+        return Err(CatalogError::CorruptSchema(format!(
+            "duplicate column in index {name}"
+        )));
+    }
     Ok(IndexDef {
         name: name.to_string(),
         table,
         kind,
         columns,
     })
+}
+
+/// 列名リストの中で最初に重複した列名を返す（[`Storage::create_index`] の入力検証と
+/// [`decode_index_def`] の破損検出が共有する。要素数は呼び出し元が
+/// [`MAX_INDEX_DEF_COLUMNS`] 以下に制限済み）。
+fn first_duplicate_column(columns: &[String]) -> Option<&str> {
+    let mut seen = std::collections::HashSet::new();
+    columns
+        .iter()
+        .find(|c| !seen.insert(c.as_str()))
+        .map(|c| c.as_str())
 }
 
 /// [`IndexDef::kind`]・[`IndexDef::columns`] とテーブル定義（[`TableSchema`]）との
@@ -4065,6 +4083,16 @@ impl Storage {
         for c in &def.columns {
             validate_identifier(c)?;
         }
+        // 同一列の重複指定は SQL 表層の構文検証（`validate_create_index_tokens`）と
+        // 同じく `Invalid`（SQL 表層では `42601`）で拒否する。Rust API から直接
+        // 渡された `IndexDef` も同じ不変条件を満たさない限り永続化しない
+        // （[`decode_index_def`] は重複を破損として拒否するため、ここで通すと
+        // 以後そのカタログ値を読めなくなる）。
+        if let Some(dup) = first_duplicate_column(&def.columns) {
+            return Err(CatalogError::Invalid(format!(
+                "duplicate index column: {dup}"
+            )));
+        }
         let encoded = encode_index_def(def)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
@@ -5061,6 +5089,7 @@ mod tests {
             b"v1\ndocs\nscalar\nlang,,x",
             b"v1\n1docs\nscalar\nlang",
             b"v1\ndocs\nscalar\nlang\nextra",
+            b"v1\ndocs\nscalar\nlang,id,lang",
             b"v1\ndocs\nscalar",
             b"\xff\xfe",
         ] {
@@ -5120,6 +5149,21 @@ mod tests {
             .map(|d| d.name)
             .collect();
         assert_eq!(names, vec!["i4".to_string(), "i5".to_string()]);
+    }
+
+    /// 公開 Rust API（[`Storage::create_index`]）から同一列を重複指定した
+    /// `IndexDef` は SQL 表層と同じ `Invalid`（`42601`）で拒否し、何も永続化しない
+    /// （PR #1054 レビュー指摘の回帰防止）。
+    #[test]
+    fn create_index_rejects_duplicate_columns_from_rust_api() {
+        let (storage, _guard) = index_fixture_storage("index-ddl-dup-columns");
+        for cols in [&["lang", "lang"][..], &["id", "lang", "id"][..]] {
+            assert!(matches!(
+                storage.create_index(&scalar_def("dup", "docs", cols)),
+                Err(CatalogError::Invalid(_))
+            ));
+        }
+        assert!(storage.list_indexes().expect("list").is_empty());
     }
 
     /// UNIQUE 制約（TABLE-16、Issue #905）の構成列は `DROP COLUMN` 自体が拒否
