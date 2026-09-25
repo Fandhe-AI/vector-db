@@ -151,7 +151,10 @@ pub enum X509Error {
     /// 葉証明書の SPKI アルゴリズムが Ed25519 以外、または Ed25519 だが
     /// parameters を持つ等 RFC 8410 §3 の形状に反する。
     UnsupportedPublicKeyAlgorithm(KeyAlgorithm),
-    /// SPKI の BIT STRING がちょうど 32 バイトの鍵として取り出せない。
+    /// SPKI の `subjectPublicKey` BIT STRING が DER の形状として不正
+    /// （値が空・未使用ビット数 8 以上・非 0 パディング・内容 0 バイト。
+    /// 葉・中間を問わず全証明書に適用）、または葉証明書でちょうど
+    /// 32 バイトの Ed25519 鍵として取り出せない。
     InvalidPublicKey,
     /// 葉証明書の SPKI 公開鍵が期待公開鍵（秘密鍵から導出済み）と一致しない。
     PublicKeyMismatch,
@@ -416,12 +419,13 @@ fn set_of_elements_in_der_order(previous: &[u8], current: &[u8]) -> bool {
 }
 
 /// `BIT STRING` の値部分（先頭 1 バイトが未使用ビット数、残りが内容）が
-/// DER として整形式であることを検査する（未使用ビット数は 0〜7・非ゼロ
-/// なら最終オクテットの下位未使用ビットがすべて 0）。`signatureValue`・
-/// SPKI の公開鍵ビット列で既に使っているのと同じ形状検査を、
-/// `issuerUniqueID`／`subjectUniqueID`（`BIT STRING` の IMPLICIT タグ）
-/// にも適用するために切り出した。未使用ビット数が 0 の場合は内容が
-/// 空（0 ビットの BIT STRING）でも構文上は正当なため許容する。
+/// DER として整形式であることを検査する（値が空でない・未使用ビット数は
+/// 0〜7・非ゼロなら最終オクテットの下位未使用ビットがすべて 0）。
+/// 証明書内の全 `BIT STRING`（`issuerUniqueID`／`subjectUniqueID`・
+/// `signatureValue`・SPKI の `subjectPublicKey`）が共有する形状検査で、
+/// 内容の存在まで要求するフィールドは [`validate_non_empty_bit_string`]
+/// を経由する。未使用ビット数が 0 の場合は内容が空（0 ビットの
+/// BIT STRING）でも構文上は正当なため、本関数単体では許容する。
 fn validate_bit_string_shape(value: &[u8]) -> Result<(), X509Error> {
     let (&unused_bits, content) = value.split_first().ok_or(X509Error::Malformed)?;
     if unused_bits > 7 {
@@ -433,6 +437,21 @@ fn validate_bit_string_shape(value: &[u8]) -> Result<(), X509Error> {
         if last_byte & unused_mask != 0 {
             return Err(X509Error::Malformed);
         }
+    }
+    Ok(())
+}
+
+/// [`validate_bit_string_shape`] に加えて、未使用ビット数オクテットの後に
+/// 内容が 1 バイト以上あることを要求する。0 ビットの BIT STRING が構文上
+/// 正当でも意味を持たないフィールド（`signatureValue`・SPKI の
+/// `subjectPublicKey`）に使い、葉・中間を問わず全証明書へ同じ形状検査を
+/// 適用する単一の入口とする（PR #1036 codex-review P1 指摘: SPKI の
+/// BIT STRING は従来、葉だけが `check_leaf_public_key` で検査されていた）。
+fn validate_non_empty_bit_string(value: &[u8]) -> Result<(), X509Error> {
+    validate_bit_string_shape(value)?;
+    // 先頭 1 バイトは未使用ビット数。内容が 1 バイト以上あれば全体は 2 以上。
+    if value.len() < 2 {
+        return Err(X509Error::Malformed);
     }
     Ok(())
 }
@@ -623,6 +642,13 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
         .read_expected(TAG_BIT_STRING)
         .map_err(|_| X509Error::Malformed)?;
     spki_reader.expect_end().map_err(|_| X509Error::Malformed)?;
+    // subjectPublicKey BIT STRING の形状（値が空でない・未使用ビット数
+    // 0〜7・未使用ビットの 0 埋め・内容 1 バイト以上）を葉・中間を問わず
+    // 検査する。従来は葉だけが check_leaf_public_key で検査されており、
+    // 中間証明書では空・未使用ビット数 8 以上・非 0 パディングの BIT STRING
+    // が受理されていた（PR #1036 codex-review P1 指摘）。拒否理由は葉の
+    // 既存契約（鍵ビット列の不正は InvalidPublicKey）と揃える。
+    validate_non_empty_bit_string(spki_key_bits).map_err(|_| X509Error::InvalidPublicKey)?;
 
     // 任意の issuerUniqueID [1]／subjectUniqueID [2]／extensions [3]。
     // 意味は解釈しないが、存在すれば BIT STRING の形状（unique ID）・
@@ -655,19 +681,8 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     // 1 バイト以上存在すること（実体のない signatureValue を拒否）、
     // (b) unused-bits が非ゼロの場合、最終オクテットの下位 unused-bits
     // ビットがすべて 0 であること（DER の正規化要件。非正規表現を拒否）
-    // を検査する。
-    let (unused_bits, signature_bytes) =
-        signature_value.split_first().ok_or(X509Error::Malformed)?;
-    if *unused_bits > 7 {
-        return Err(X509Error::Malformed);
-    }
-    let last_byte = signature_bytes.last().ok_or(X509Error::Malformed)?;
-    if *unused_bits > 0 {
-        let unused_mask = (1u8 << *unused_bits) - 1;
-        if last_byte & unused_mask != 0 {
-            return Err(X509Error::Malformed);
-        }
-    }
+    // を、SPKI・unique ID と共有する形状検査で判定する。
+    validate_non_empty_bit_string(signature_value)?;
 
     Ok(ParsedCertificate {
         not_before,
@@ -1363,6 +1378,27 @@ mod tests {
             validate_bit_string_shape(&[]).unwrap_err(),
             X509Error::Malformed
         );
+    }
+
+    // 内容の存在まで要求する BIT STRING（signatureValue・SPKI）の共通検査
+    // （PR #1036 codex-review P1 指摘の回帰）。
+    #[test]
+    fn validate_non_empty_bit_string_requires_content_and_valid_shape() {
+        assert!(validate_non_empty_bit_string(&[0x00, 0x01]).is_ok());
+        assert!(validate_non_empty_bit_string(&[0x03, 0xf8]).is_ok());
+        for value in [
+            &[][..],
+            &[0x00][..],
+            &[0x08, 0x00][..],
+            &[0x03, 0xf9][..],
+            &[0x01][..],
+        ] {
+            assert_eq!(
+                validate_non_empty_bit_string(value),
+                Err(X509Error::Malformed),
+                "bit string {value:02x?} must be rejected"
+            );
+        }
     }
 
     fn sample_extension() -> Vec<u8> {

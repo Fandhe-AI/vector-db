@@ -1587,6 +1587,136 @@ fn multi_valued_rdn_in_descending_order_is_rejected() {
     ));
 }
 
+// X25519（1.3.101.110）。中間証明書の SPKI に置く（中間は SPKI アルゴリズムを
+// 制限しないため、葉限定の Ed25519 検査に依存せず BIT STRING 形状検査だけを
+// 観測できる）。
+const OID_X25519_BYTES: [u8; 3] = [0x2b, 0x65, 0x6e];
+
+/// テスト専用: SPKI の subjectPublicKey BIT STRING の値部分（未使用ビット数
+/// オクテット込み）を差し替えた X25519 中間証明書の DER を手組みする。
+fn build_x25519_intermediate_with_spki_bit_string(spki_bit_string_value: &[u8]) -> Vec<u8> {
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let spki = sequence(&[
+        &sequence(&[&tlv(0x06, &OID_X25519_BYTES)]),
+        &tlv(0x03, spki_bit_string_value),
+    ]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x02]),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ])
+}
+
+fn leaf_and_intermediate_result(
+    intermediate: Vec<u8>,
+) -> Result<ServerCertificateChain, CertificateChainError> {
+    let leaf = build_ed25519_leaf_certificate_der(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+    );
+    ServerCertificateChain::from_der_chain(
+        vec![leaf, intermediate],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+}
+
+#[test]
+fn intermediate_spki_bit_string_with_invalid_shape_is_rejected() {
+    // 中間証明書（index 1）の SPKI BIT STRING の形状違反（PR #1036
+    // codex-review P1 指摘: 従来は葉の check_leaf_public_key だけが検査して
+    // いたため、中間ではこれらが from_der_chain を通過していた）。
+    let cases: [(&str, Vec<u8>); 5] = [
+        ("empty value", Vec::new()),
+        ("unused bits octet only", vec![0x00]),
+        ("unused bits 8", [&[0x08u8][..], &[0u8; 32]].concat()),
+        ("unused bits 3 with nonzero padding", vec![0x03, 0xaa, 0xf9]),
+        ("unused bits without content", vec![0x05]),
+    ];
+    for (label, value) in cases {
+        let err =
+            leaf_and_intermediate_result(build_x25519_intermediate_with_spki_bit_string(&value))
+                .expect_err(label);
+        assert_eq!(
+            err,
+            CertificateChainError::Certificate {
+                index: 1,
+                error: X509Error::InvalidPublicKey
+            },
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn intermediate_spki_bit_string_with_valid_shape_is_accepted() {
+    // 形状が正しい BIT STRING は、未使用ビット数 0（32 バイト鍵）でも、
+    // 未使用ビット数が非 0 で 0 埋めされていても中間では受理される
+    // （中間の SPKI アルゴリズム・鍵長は制限しない）。
+    let mut unused_zero = vec![0x00u8];
+    unused_zero.extend_from_slice(&[0x5a; 32]);
+    let unused_three_zero_padded = vec![0x03, 0xaa, 0xf8];
+    for value in [unused_zero, unused_three_zero_padded] {
+        let chain =
+            leaf_and_intermediate_result(build_x25519_intermediate_with_spki_bit_string(&value))
+                .expect("intermediate with well-formed SPKI BIT STRING must be accepted");
+        assert_eq!(chain.leaf_public_key(), &RFC8410_10_1_ED25519_PUBLIC_KEY);
+    }
+}
+
+#[test]
+fn leaf_spki_bit_string_with_invalid_shape_is_rejected_as_invalid_public_key() {
+    // 葉でも同じ共通検査を通り、既存契約どおり InvalidPublicKey になる。
+    for value in [vec![0x08u8, 0x00], vec![0x00], Vec::new()] {
+        let signature_algorithm = ed25519_algorithm_identifier();
+        let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &value)]);
+        let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+        let tbs_certificate = sequence(&[
+            &version_v3(),
+            &tlv(0x02, &[0x01]),
+            &signature_algorithm,
+            &empty_name(),
+            &validity,
+            &empty_name(),
+            &spki,
+        ]);
+        let mut signature_bits = vec![0x00u8];
+        signature_bits.extend_from_slice(&[0u8; 64]);
+        let der = sequence(&[
+            &tbs_certificate,
+            &signature_algorithm,
+            &tlv(0x03, &signature_bits),
+        ]);
+        let err = ServerCertificateChain::from_der_chain(
+            vec![der],
+            &RFC8410_10_1_ED25519_PUBLIC_KEY,
+            NOW_WITHIN_RFC8410_10_2_VALIDITY,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CertificateChainError::Certificate {
+                index: 0,
+                error: X509Error::InvalidPublicKey
+            },
+            "{value:02x?}"
+        );
+    }
+}
+
 #[test]
 fn current_unix_secs_returns_a_plausible_recent_value() {
     // このリポジトリが書かれた時点（2020 年以降）より新しい値であることの
