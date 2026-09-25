@@ -451,9 +451,15 @@ SQL 表層とのパリティ・RLS-9 応答同一性・台帳のプロセス・�
   は述語を書けない）
 - `eq` は対象列の型に応じたレーンへ振り分ける（Issue #896・NOSQL-17。詳細は
   `docs/design/nosql-typed-json-binding.md`「filter（`eq` の型別レーン）」節
-  参照）: `TEXT`（旧来型。値・型不一致は `22000`）／`ENUM`（`42601`。語彙外は
+  参照）: `TEXT`（旧来型。値・型不一致は `42601`。insert/update の「TEXT は旧来型
+  = `22000`」非対称は filter には適用しない）／`ENUM`（`42601`。語彙外は
   `22P02`）／`BOOLEAN`（`42601`）／`DATE`・`TIMESTAMP`・`UUID`（`42601`。形式・
-  範囲は engine 側で検証）／`BYTEA`（base64 の JSON string。`42601`／`54000`）／
+  範囲は engine 側で検証）／`BYTEA`（base64 の JSON string。`42601`／`54000`。
+  復号後 約 2 MiB 超は hex 再エンコード後の長さ検査により `54000`——`insert`
+  の実効上限〔復号後 4 MiB〕とは非対称。SQL 表層 `WHERE bytea_col = '\x...'`
+  と同じ実効上限のパリティ。詳細は
+  `docs/design/nosql-typed-json-binding.md`「既知の制約（BYTEA の実効長）」節
+  参照）／
   `NUMERIC`（数値または数値文字列。`42601`）。`INTEGER`／`BIGINT`／`REAL`／
   `DOUBLE PRECISION` 列への `eq` は対象外（`0A000`。式レーンの入口が無いため。
   Issue #945）

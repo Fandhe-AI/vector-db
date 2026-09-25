@@ -165,7 +165,7 @@ impl FilterError {
                 SqlSurfaceError::InvalidTextRepresentation { detail }
             }
             ErrorClass::InvalidInput => SqlSurfaceError::InvalidInput { detail },
-            ErrorClass::FeatureNotSupported => SqlSurfaceError::UnsupportedSyntax { detail },
+            ErrorClass::FeatureNotSupported => SqlSurfaceError::FeatureNotSupported { detail },
             // `UnsupportedOperator`／`RlsPredicateNotAllowed`／
             // `TypeMismatch`／`InvalidBytea` はいずれもここに到達する。
             _ => SqlSurfaceError::UnsupportedSyntax { detail },
@@ -645,6 +645,18 @@ mod tests {
         let err = bind_filter(&items, &schema()).expect_err("must reject");
         assert!(matches!(err, FilterError::NumericFilterNotSupported));
         assert_eq!(err.wire_code(), "0A000");
+    }
+
+    /// `scan`／`search`／`aggregate` の束縛 closure（`Result<_, SqlSurfaceError>`）
+    /// が要求する形へ写像したあとも `0A000` が保たれることを固定する
+    /// （codex レビュー指摘。`SqlSurfaceError::FeatureNotSupported` variant
+    /// 追加前は closure 境界を通る際に `42601` へ縮退していた）。
+    #[test]
+    fn eq_on_integer_column_stays_feature_not_supported_after_sql_surface_conversion() {
+        let items = filter_items(r#"[{"column":"count","op":"eq","value":1}]"#);
+        let err = bind_filter(&items, &schema()).expect_err("must reject");
+        let sql_err = err.into_sql_surface_error();
+        assert_eq!(sql_err.wire_code(), "0A000");
     }
 
     #[test]

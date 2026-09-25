@@ -356,15 +356,21 @@ pub fn execute(
             |schema| {
                 bind_rows(rows, table, Some(&operation_id), schema).map_err(|e| match e {
                     InsertError::Bind(err) | InsertError::Exec(err) => err,
-                    // `bind_rows` は `InsertError::Shape`／`InsertError::InvalidIdentifier`
-                    // を構築しない（前者は `schema.rs` の意味的検証、後者は本関数冒頭の
-                    // `ident::check_identifier` がそれぞれ独立に検査する）。到達不能だが
-                    // `SqlSurfaceError` へ丸めて fail-closed のまま `match` を網羅する。
-                    InsertError::Shape(_) | InsertError::InvalidIdentifier => {
-                        SqlSurfaceError::Internal {
-                            detail: "unexpected shape error during INSERT row binding".to_string(),
-                        }
-                    }
+                    // `bind_rows`（`bind_row` を行ごとに呼ぶ）は列キーの識別子形状検査
+                    // （`ident::check_identifier`。NUL・制御文字・63 文字上限等）を
+                    // 行うため `InsertError::InvalidIdentifier` を実際に構築しうる
+                    // （Cursor Bugbot 指摘。かつては「本関数冒頭の `table` 検査でしか
+                    // 構築されない」という誤った前提で `Internal`〔`XX000`〕へ丸めて
+                    // いたため、不正な列キーを含む insert が `42601` ではなく内部
+                    // エラー相当のコードで返っていた）。`Shape` は `schema.rs` の
+                    // 意味的検証専用で `bind_rows` からは構築されないため、`Internal`
+                    // への丸め込みを維持する。
+                    InsertError::InvalidIdentifier => SqlSurfaceError::UnsupportedSyntax {
+                        detail: "invalid identifier".to_string(),
+                    },
+                    InsertError::Shape(_) => SqlSurfaceError::Internal {
+                        detail: "unexpected shape error during INSERT row binding".to_string(),
+                    },
                     // `TypedJsonError`（NOSQL-17。Issue #896）の分類は単一の
                     // `into_sql_surface_error` 変換点に集約する（`update.rs` と共有）。
                     InsertError::Set(err) => err.into_sql_surface_error(),
@@ -763,6 +769,27 @@ mod tests {
         let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"lang\u0000":"x"}]"#);
         let err = bind_rows(&items, "docs", None, &schema()).expect_err("must reject");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// `bind_rows_rejects_column_key_containing_nul_as_invalid_identifier` は
+    /// `bind_rows` を直接呼ぶ単体テストであり、`execute` の束縛 closure が
+    /// `InsertError::InvalidIdentifier` を `SqlSurfaceError::Internal`
+    /// （`XX000`）へ丸め込んでいたバグ（Cursor Bugbot 指摘）は検出できて
+    /// いなかった。本テストは本番経路（`execute`）を実際に通し、`42601` の
+    /// まま到達することを固定する。
+    #[test]
+    fn execute_rejects_column_key_containing_nul_as_invalid_identifier() {
+        let (core, path) = open_core();
+        let principal = principal("tenant-a");
+        let body = r#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[1,0,0,0],"lang\u0000":"x"}],"operation_id":"op-1"}"#;
+        let value = parse_json(body).expect("valid json");
+        let validated = super::super::schema::INSERT_SCHEMA
+            .validate(&value)
+            .expect("schema ok");
+
+        let err = execute(&core, &principal, &validated).expect_err("must reject");
+        assert_eq!(err.wire_code(), "42601");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

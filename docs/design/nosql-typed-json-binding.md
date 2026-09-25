@@ -75,19 +75,21 @@ Issue #896 導入前は `update` op の JSON/UUID 列 `null` 分岐を wire 層�
 
 | 列型 | `eq` の写像 | 値・型不一致 |
 | --- | --- | --- |
-| TEXT（旧来型） | `DeclarativeFilter::equals` | `22000`（`LegacyMismatch`） |
+| TEXT（旧来型） | `DeclarativeFilter::equals` | `42601`（`TypeMismatch`。本 Issue 導入前からの filter 既存契約をそのまま維持——insert/update の「TEXT は旧来型 = `22000`（`LegacyMismatch`）」非対称は filter には適用しない） |
 | ENUM | `DeclarativeFilter::equals`（語彙照合は engine 側 `bind` が `22P02` で行う） | `42601` |
 | BOOLEAN | `DeclarativeFilter::bool_equals` | `42601` |
 | DATE / TIMESTAMP / UUID | `DeclarativeFilter::compare`（`CompareOp::Eq`。形式・範囲検証は engine 側へ委譲） | `42601` |
-| BYTEA | base64 → hex（`typed_json::bytea_literal_text`）→ `compare` | `42601`／`54000` |
+| BYTEA | base64 → hex（`typed_json::bytea_literal_text`）→ `compare` | `42601`／`54000`（下記「既知の制約（BYTEA の実効長）」参照） |
 | NUMERIC | 数値または数値文字列 → `compare_numeric_literal`／`compare` | `42601` |
-| INTEGER / BIGINT / REAL / DOUBLE PRECISION | 対象外（`0A000`。下記「既知の制約」参照） | — |
+| INTEGER / BIGINT / REAL / DOUBLE PRECISION | 対象外（`0A000`） | — |
 | VECTOR / ARRAY / JSON / JSONB | 従来どおり engine 側「`TEXT` 列でない」判定へ委譲 | `22000` |
 | 未知列 | 列名だけで完結する判定のため値に関わらず engine 側「unknown column」へ委譲 | `22000` |
 
 `scan.rs` はこれまで `filter` を schema 到達前に未束縛の `DeclarativeFilter` として宣言し、schema 到達後に `declarative_filter::bind_all` で束縛する二段構成だったが、列型別レーンの振り分けに `schema` が必須なため、`search.rs`／`aggregate.rs` と同じ「schema 到達後に `bind_filter` を単一段で呼ぶ」構成へ揃えた。
 
-**既知の制約（`0A000` の縮退）**: `engine::sql::allowlist::SqlSurfaceError` には `FeatureNotSupported`（`0A000`）へ写像する variant が存在しない。`scan`／`search`／`aggregate` の束縛 closure は `Result<_, SqlSurfaceError>` を返す契約のため、`FilterError::NumericFilterNotSupported`（`INTEGER`/`BIGINT`/`REAL`/`DOUBLE PRECISION` 列への `eq`）はこの closure 境界を通る際に `42601`（`UnsupportedSyntax`）へ縮退する。`bind_filter` を直接呼ぶ層 A テスト（`filter.rs::tests::eq_on_integer_column_is_feature_not_supported`）では `0A000` を観測できるが、HTTP 経由の実応答は `42601` になる。数値列への `eq` を式レーン（`udf_call::bind_expr`）経由で扱う対応自体は、`BoundStatement`／`PlanSearchBinding` に `expr_filters` を渡す入口が無いため引き続き Issue #945 へ申し送る。
+`engine::sql::allowlist::SqlSurfaceError` へ `FeatureNotSupported { detail }`（`0A000`）variant を追加し（レビュー指摘対応。以前はこの variant が無く、`scan`／`search`／`aggregate` の束縛 closure〔`Result<_, SqlSurfaceError>` 契約〕を通る際に `FilterError::NumericFilterNotSupported` が `42601`〔`UnsupportedSyntax`〕へ縮退していた）、`bind_filter` を直接呼ぶ層 A テストと HTTP 経由の実応答のいずれも `0A000` を観測する。数値列への `eq` を式レーン（`udf_call::bind_expr`）経由で扱う対応自体は、`BoundStatement`／`PlanSearchBinding` に `expr_filters` を渡す入口が無いため引き続き Issue #945 へ申し送る。
+
+**既知の制約（BYTEA の実効長）**: `bytea_literal_text` 自身は復号後のバイト列を `insert`／`update` と同じ [`engine::bytea::MAX_BYTEA_FIELD_LEN`]（4 MiB）まで許容するが、その後 `DeclarativeFilter::compare` が共有する `declarative_filter::check_literal_len` は再エンコード後の hex テキスト（`\x` 接頭辞＋2 バイト/オクテット）の長さを同じ 4 MiB 上限（`MAX_TEXT_FIELD_LEN`）で検査するため、復号後 約 2 MiB を超える値は `54000` になる（Cursor Bugbot 指摘）。この `check_literal_len` は SQL 表層の `WHERE bytea_col = '\x...'`（`sql::parser::bind_where_predicates` が同じ `DeclarativeFilter::compare` 経路へ束縛する）にも同一に適用されるため、NoSQL `filter` の `eq` は SQL `WHERE` と同じ実効上限のパリティにある——insert（復号後 4 MiB まで）と filter（復号後 約 2 MiB まで）の非対称は本 Issue が新設したものではなく、`declarative_filter` 側の既存制約がそのまま可視化されたもの。是正（hex 長ではなく復号後バイト長で判定する等）は別 Issue へ申し送る。
 
 ## テスト
 
@@ -101,7 +103,7 @@ Issue #896 導入前は `update` op の JSON/UUID 列 `null` 分岐を wire 層�
 - `22P02` への統一（形式エラーの分類統一）→ Issue #897（TASK-227）。
 - TIMESTAMP 応答の区切り文字（空白／`T`）・REAL/DOUBLE/NUMERIC の指数表記が `22000` になる点は、SQL 表層と同じ既知の制約のまま。
 - `RowDescription` の OID 写像（`result_encoder.rs`）は Issue #895 の担当のまま変更していない。
-- 非 nullable な `TEXT`／`ENUM` 列への `update` op の JSON `null` が成功するようになった点（上記「null の扱い」節）はオーナー確認事項。
+- nullable な `TEXT`／`ENUM` 列への `update` op の JSON `null` が成功するようになった点（上記「null の扱い」節）はオーナー確認事項。
 - クロスサーフェス `23505`（再送同一性）テストは INTEGER/REAL/NUMERIC/ARRAY/DATE では未追加（TEXT/VECTOR のみ既存）。
 - HTTP 経由の往復テストは NUMERIC/BOOLEAN/DATE/TIMESTAMP/UUID/ARRAY では未追加（INTEGER/BIGINT/REAL のみ `wire_integer_bigint_column.rs`／`wire_float_columns.rs` で追加）。
 - `aggregate`（`SUM`/`AVG`/`MIN`/`MAX`）と新型の組み合わせの層 A パリティテストは未追加。

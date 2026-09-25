@@ -452,13 +452,11 @@ pub const EXPLAIN_NOT_YET_SUPPORTED_MESSAGE: &str = "search explain is not yet a
 /// SearchError` により最終的な `wire_code`／`client_message` はここでの分類
 /// のまま保たれる）。
 ///
-/// 既知の制約: `engine::sql::allowlist::SqlSurfaceError` に `0A000`
-/// （`FeatureNotSupported`）へ写像する variant が存在しないため、
 /// `FilterError::NumericFilterNotSupported`（`INTEGER`／`BIGINT`／`REAL`／
-/// `DOUBLE PRECISION` 列への `eq`）はこの closure 境界を通る際に `42601`
-/// （`UnsupportedSyntax`）へ縮退する（`bind_filter` を直接呼ぶ層 A テストでは
-/// 引き続き `0A000` を観測できる）。`docs/design/nosql-typed-json-binding.md`
-/// 参照。
+/// `DOUBLE PRECISION` 列への `eq`）は `SqlSurfaceError::FeatureNotSupported`
+/// （`0A000`）としてこの closure 境界をそのまま通過する（レビュー指摘対応。
+/// 以前は対応する variant が無く `42601` へ縮退していた。
+/// `docs/design/nosql-typed-json-binding.md` 参照）。
 fn to_sql_surface_error(err: SearchError) -> SqlSurfaceError {
     match err {
         SearchError::Bind(inner) => inner,
