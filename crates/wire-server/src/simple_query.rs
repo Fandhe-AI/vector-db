@@ -281,7 +281,7 @@ fn run_statement<'e>(
             OutcomeResponse::Rows { result, shape } => {
                 let sent = result.rows.len();
                 let tag = shape.render(sent);
-                respond_rows_with_tag(stream, &result, &tag, finish, txn.status())
+                respond_rows_with_tag(stream, &result, &tag, finish, txn)
             }
             OutcomeResponse::Command { tag } => {
                 respond_command_complete(stream, &tag, finish, txn.status())
@@ -635,13 +635,11 @@ fn respond_query_result(
     } else {
         format!("{command_tag} {}", result.rows.len())
     };
-    respond_rows_with_tag(
-        stream,
-        result,
-        &tag,
-        finish,
-        engine::sql::transaction::TransactionStatus::Idle,
-    )
+    // テスト専用ヘルパーのため明示トランザクションは持たない（`Idle` のまま）。
+    // `respond_rows_with_tag` は `Active` 以外では `fail()` が no-op になるため、
+    // 既存のバイト列契約（`ReadyForQuery` は常に `Idle`）は変わらない。
+    let mut txn = SessionTransaction::new(engine::sql::transaction::TransactionLimits::default());
+    respond_rows_with_tag(stream, result, &tag, finish, &mut txn)
 }
 
 /// `RowDescription`／`DataRow`* の組み立てとフレーム送出を担う共通本体
@@ -657,16 +655,23 @@ fn respond_rows_with_tag(
     result: &engine::sql::exec::QueryResult,
     tag: &str,
     finish: Finish,
-    txn_status: engine::sql::transaction::TransactionStatus,
+    txn: &mut SessionTransaction<'_>,
 ) -> io::Result<StatementStatus> {
     let row_desc = match result_encoder::encode_row_description(&result.columns) {
         Ok(msg) => msg,
         Err(_) => {
+            // エンコード失敗は engine 側の実行結果とは独立に発生しうる wire 層
+            // 固有の失敗だが、SQL-31 の契約（`Active` 中のエラーは種類を問わず
+            // `Failed` へ遷移させる）は応答生成の失敗にも及ぶ（PR #1041 レビュー
+            // 指摘 P1）。ここで `fail()` せずに `Active` のまま返すと、直前の
+            // `INSERT` 等の書き込みが未確定のまま残り、後続の `COMMIT` で
+            // 誤って永続化されてしまう。
+            txn.fail();
             respond_error_and_ready(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode row description",
-                txn_status,
+                txn.status(),
             )?;
             return Ok(StatementStatus::Failed);
         }
@@ -698,11 +703,14 @@ fn respond_rows_with_tag(
                 // ErrorResponse へ切り替える（部分フレームを絶対に残さない）。
                 buffer.truncate_to(start);
                 buffer.flush(stream)?;
+                // 行エンコード失敗も上記と同じ理由で `Active` を `Failed` へ
+                // 強制遷移させる（SQL-31・PR #1041 レビュー指摘 P1）。
+                txn.fail();
                 respond_error_and_ready(
                     stream,
                     ErrorClass::InternalError,
                     "failed to encode data row",
-                    txn_status,
+                    txn.status(),
                 )?;
                 return Ok(StatementStatus::Failed);
             }
@@ -716,23 +724,38 @@ fn respond_rows_with_tag(
         Ok(msg) => {
             buffer.push_frame(stream, &msg)?;
             if finish == Finish::ReadyForQuery {
-                buffer.push_frame(stream, &result_encoder::encode_ready_for_query(txn_status))?;
+                buffer.push_frame(
+                    stream,
+                    &result_encoder::encode_ready_for_query(txn.status()),
+                )?;
             }
             buffer.flush(stream)?;
             Ok(StatementStatus::Completed)
         }
         Err(_) => {
             buffer.flush(stream)?;
+            // `CommandComplete` エンコード失敗も同様に `Failed` へ遷移させる
+            // （SQL-31・PR #1041 レビュー指摘 P1）。
+            txn.fail();
             respond_error_and_ready(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode command complete response",
-                txn_status,
+                txn.status(),
             )?;
             Ok(StatementStatus::Failed)
         }
     }
 }
+
+// engine クレートの一時 DB ヘルパーをソース取り込みで共有する（wire-server の
+// 結合テスト `tests/*.rs` と同じ方式。`crates/engine/src/test_util/temp_db.rs`
+// モジュールドキュメント参照）。`#[path]` はこのファイル（`src/simple_query.rs`）
+// 自身の位置基準で解決されるため、ネストした `mod tests` の内側ではなく
+// トップレベルで宣言する（結合テストの `tests/*.rs` と同じ相対深さ）。
+#[cfg(test)]
+#[path = "../../engine/src/test_util/temp_db.rs"]
+mod temp_db;
 
 #[cfg(test)]
 mod tests {
@@ -866,6 +889,74 @@ mod tests {
             tail.last().copied(),
             Some(b'I'),
             "must still send ReadyForQuery after the error"
+        );
+    }
+
+    /// SQL-31（PR #1041 レビュー指摘 P1）: 明示 `BEGIN` で `Active` 中に
+    /// `respond_rows_with_tag` が応答エンコードへ失敗した場合、`ErrorResponse` を
+    /// 返すだけでなく `txn` 自身を `Failed` へ強制遷移させること。遷移させないと
+    /// クライアントにはエラーが返る一方で、先行する書き込みが後続の `COMMIT` で
+    /// 誤って確定してしまう（`respond_error_and_ready` の `ReadyForQuery` にも
+    /// 遷移後の `Failed`＝`'E'` が反映されることまで固定する）。
+    #[test]
+    fn respond_rows_with_tag_fails_active_transaction_on_encode_error() {
+        let path = temp_db::unique_db_path("respond-rows-with-tag-active-txn-fail");
+        let _guard = temp_db::CleanupGuard(path.clone());
+        let storage = engine::storage::Storage::open(&path).expect("open storage");
+
+        let mut txn =
+            SessionTransaction::new(engine::sql::transaction::TransactionLimits::default());
+        txn.begin(&storage, &SessionState::default())
+            .expect("begin explicit transaction");
+        assert_eq!(
+            txn.status(),
+            engine::sql::transaction::TransactionStatus::InTransaction,
+            "precondition: txn must be Active before the encode failure"
+        );
+
+        // `encode_data_row_into` を必ず失敗させる不正な行（`i16::MAX` を超える
+        // セル数）。
+        let columns = vec![ColumnMeta::Id];
+        let bad_row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Null; 32_768],
+        };
+        let result = QueryResult {
+            columns,
+            rows: vec![bad_row],
+        };
+
+        let (mut server, mut client) = loopback_pair();
+        let reader = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).expect("read_to_end");
+            buf
+        });
+        let status = respond_rows_with_tag(
+            &mut server,
+            &result,
+            "SELECT 1",
+            Finish::ReadyForQuery,
+            &mut txn,
+        )
+        .expect("respond");
+        drop(server);
+        let received = reader.join().expect("reader thread");
+
+        assert_eq!(status, StatementStatus::Failed);
+        assert_eq!(
+            txn.status(),
+            engine::sql::transaction::TransactionStatus::Failed,
+            "encode failure during Active must force-transition the transaction to Failed \
+             (SQL-31 abort-on-error contract)"
+        );
+        assert_eq!(
+            received.last().copied(),
+            Some(b'E'),
+            "ReadyForQuery must reflect the post-transition Failed status ('E'), not the \
+             pre-failure Active status"
         );
     }
 
