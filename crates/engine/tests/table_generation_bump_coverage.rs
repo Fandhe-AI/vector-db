@@ -94,15 +94,19 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （旧: 1567／1591／1639／1653／1677）。Issue #901（`ALTER TABLE ... DROP
     // COLUMN`／`ALTER COLUMN ... TYPE` の追加。`DroppedSlot`／`PhysicalSlot`・
     // `Storage::alter_table_drop_column`／`alter_table_widen_numeric_precision`）
-    // で `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 1701）。
-    ("catalog.rs", 2173),
+    // で `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 1701）。Issue #902
+    // （`DROP TABLE` の DDL 実行権限ゲート）の base 取り込みマージで
+    // `Storage::drop_table` のドキュメンテーションコメントが増え、以下 2 件の
+    // 行番号がさらに移動したための追随（旧: 2173／2252）。
+    ("catalog.rs", 2177),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（`alter_enum_type_add_value` の commit 呼び出しは
     // 依存テーブルの世代を明示的に進行させるため ALLOWLIST 対象外のまま）。
-    // Issue #901 の行追加で再度追随（旧: 1780）。
-    ("catalog.rs", 2252),
+    // Issue #901 の行追加で再度追随（旧: 1780）。Issue #902 の base 取り込み
+    // マージでさらに追随（旧: 2252）。
+    ("catalog.rs", 2256),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
