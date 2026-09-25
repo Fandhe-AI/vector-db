@@ -397,6 +397,70 @@ pub fn parse_literal_exact(text: &str) -> Result<Decimal, NumericError> {
     parse_for_column(text, MAX_PRECISION, scale)
 }
 
+/// `AVG(NUMERIC(p,s))`（TABLE-13・SQL-13、Issue #892・D6）向けの長除算。
+/// `sum`（`from_scale` 桁の unscaled 累積値）を `count`（非 NULL 行数、`> 0`）で
+/// 割り、結果を `to_scale`（`>= from_scale`）桁の unscaled 整数として返す。
+///
+/// `sum * 10^(to_scale - from_scale)` を素直に計算すると `to_scale` が大きい
+/// 場合に中間値が `i128` を超えて桁あふれし得るため、1 桁ずつ商を確定する
+/// 長除算方式を取る（各ステップの剰余は常に `count` 未満 = `u64::MAX` 以下の
+/// ため、`remainder * 10` は `i128`/`u128` の範囲内に収まり桁あふれしない）。
+/// 最後の剰余で丸め方向を判定する（half away from zero。
+/// [`parse_for_column`] の丸め規約と同じ）。
+///
+/// `count == 0` または `to_scale < from_scale` は呼び出し元
+/// （`sql::aggregate::Accumulator::finish`）の不変条件違反であり、
+/// [`NumericError::Malformed`] を返す（到達しない想定の防御）。
+pub(crate) fn avg_unscaled(
+    sum: i128,
+    count: u64,
+    from_scale: u8,
+    to_scale: u8,
+) -> Result<i128, NumericError> {
+    if count == 0 {
+        return Err(NumericError::Malformed(
+            "AVG divisor must not be zero".to_string(),
+        ));
+    }
+    if to_scale < from_scale {
+        return Err(NumericError::Malformed(
+            "AVG result scale must not be smaller than the input scale".to_string(),
+        ));
+    }
+
+    let negative = sum < 0;
+    let divisor: u128 = u128::from(count);
+    let mut remainder: u128 = sum.unsigned_abs();
+    let mut quotient: u128 = remainder / divisor;
+    remainder %= divisor;
+
+    let extra_scale = u32::from(to_scale - from_scale);
+    for _ in 0..extra_scale {
+        // `remainder < divisor <= u64::MAX` なので `remainder * 10` は
+        // `u128` に必ず収まる（桁あふれしない）。
+        remainder *= 10;
+        let digit = remainder / divisor;
+        remainder %= divisor;
+        quotient = quotient
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(digit))
+            .ok_or(NumericError::OutOfRange)?;
+    }
+
+    // 同じ理由（`remainder < divisor <= u64::MAX`）で `remainder * 2` も
+    // 桁あふれしない。half away from zero: 剰余が除数の半分以上なら切り上げる。
+    if remainder * 2 >= divisor {
+        quotient = quotient.checked_add(1).ok_or(NumericError::OutOfRange)?;
+    }
+
+    let unscaled = i128::try_from(quotient).map_err(|_| NumericError::OutOfRange)?;
+    Ok(if negative && unscaled != 0 {
+        -unscaled
+    } else {
+        unscaled
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,5 +652,71 @@ mod tests {
         // a は 0.999...9（38 桁）、b は 999...9（38 桁の整数）で a < b。
         assert_eq!(cmp_exact(&a, &b), Ordering::Less);
         assert_eq!(cmp_exact(&a, &a), Ordering::Equal);
+    }
+
+    // --- avg_unscaled（D6・Issue #892） -------------------------------------
+
+    #[test]
+    fn avg_unscaled_exact_division_needs_no_rounding() {
+        // 1.00 + 2.00 = 3.00（sum=300, scale=2）を 2 件で割ると 1.50。
+        assert_eq!(avg_unscaled(300, 2, 2, 4), Ok(15000));
+    }
+
+    #[test]
+    fn avg_unscaled_rounds_half_away_from_zero() {
+        // 0.01 / 3 = 0.003333... を scale 4 まで求めると 0.0033（切り捨て側）。
+        assert_eq!(avg_unscaled(1, 3, 2, 4), Ok(33));
+        // 0.05 / 2 = 0.025 を scale 2 で丸めると 0.03（4 捨 5 入ではなく
+        // 5 は必ず切り上げる half away from zero）。
+        assert_eq!(avg_unscaled(5, 2, 2, 2), Ok(3));
+    }
+
+    #[test]
+    fn avg_unscaled_rounds_negative_values_away_from_zero() {
+        // -0.05 / 2 = -0.025 → 絶対値が大きい方（-0.03）へ丸める。
+        assert_eq!(avg_unscaled(-5, 2, 2, 2), Ok(-3));
+    }
+
+    #[test]
+    fn avg_unscaled_same_scale_is_plain_division_with_rounding() {
+        assert_eq!(avg_unscaled(10, 4, 0, 0), Ok(3));
+        assert_eq!(avg_unscaled(10, 3, 0, 0), Ok(3));
+    }
+
+    #[test]
+    fn avg_unscaled_rejects_zero_count() {
+        assert!(matches!(
+            avg_unscaled(1, 0, 2, 4),
+            Err(NumericError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn avg_unscaled_rejects_shrinking_scale() {
+        assert!(matches!(
+            avg_unscaled(1, 1, 4, 2),
+            Err(NumericError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn avg_unscaled_large_sum_does_not_overflow_intermediate_math() {
+        // sum が大きく `sum * 10^(to_scale-from_scale)` を素直に計算すると
+        // i128 を超える組み合わせでも、1 桁ずつ商を確定する長除算（各ステップの
+        // 剰余は常に `count` 未満）のため、最終結果が 38 桁以内に収まる限り
+        // オーバーフローしない（D6 のコメント参照）。
+        let large_sum = 12_345_678_901_234_567_890i128; // 20 桁
+        assert!(avg_unscaled(large_sum, 7, 0, 16).is_ok());
+    }
+
+    #[test]
+    fn avg_unscaled_overflow_is_rejected() {
+        // 除算結果が 38 桁を超える場合、桁を積み上げる過程で `checked_mul`/
+        // `checked_add` が失敗し `OutOfRange` になる。
+        let near_max = 99_999_999_999_999_999_999_999_999_999_999_999_999i128;
+        assert_eq!(
+            avg_unscaled(near_max, 1, 0, 30),
+            Err(NumericError::OutOfRange)
+        );
     }
 }

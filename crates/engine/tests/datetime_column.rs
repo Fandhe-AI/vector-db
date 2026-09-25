@@ -340,6 +340,63 @@ fn count_counts_non_null_datetime_rows_and_sum_is_rejected() {
     assert_eq!(err.wire_code(), "22000");
 }
 
+/// `MIN`/`MAX(<DATE>/<TIMESTAMP>)` は Issue #892（D1・D7）で受理された
+/// （`SUM`/`AVG` は引き続き拒否。上のテスト参照）。
+#[test]
+fn min_max_on_date_and_timestamp_succeed_after_issue_892() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &insert_sql(1, "2024-01-01", "2024-01-01 00:00:00", "op-1"),
+    )
+    .expect("insert should succeed");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &insert_sql(2, "2023-06-15", "2025-06-15 12:30:00", "op-2"),
+    )
+    .expect("insert should succeed");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &insert_sql_without_day_at(3, "op-3"),
+    )
+    .expect("insert with NULL day/at should succeed");
+
+    let min_day = engine::datetime::parse_date("2023-06-15").expect("valid date");
+    let max_day = engine::datetime::parse_date("2024-01-01").expect("valid date");
+    let min_at = engine::datetime::parse_timestamp("2024-01-01 00:00:00").expect("valid ts");
+    let max_at = engine::datetime::parse_timestamp("2025-06-15 12:30:00").expect("valid ts");
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT MIN(day), MAX(day), MIN(at), MAX(at) FROM {TABLE}"),
+        )
+        .expect("MIN/MAX(DATE/TIMESTAMP) must succeed after Issue #892");
+    assert_eq!(
+        result.rows[0].cells,
+        vec![
+            Cell::Date(min_day),
+            Cell::Date(max_day),
+            Cell::Timestamp(min_at),
+            Cell::Timestamp(max_at),
+        ]
+    );
+
+    // NULL のみの空集合は NULL。
+    let empty = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT MIN(day) FROM {TABLE} WHERE id = 999"),
+        )
+        .expect("MIN over an empty result set must still succeed");
+    assert_eq!(empty.rows[0].cells, vec![Cell::Null]);
+}
+
 #[test]
 fn where_equality_and_range_on_datetime_column_is_accepted() {
     // DATE/TIMESTAMP 列は算術を持たない宣言的経路（レーン B。Issue #891）で
