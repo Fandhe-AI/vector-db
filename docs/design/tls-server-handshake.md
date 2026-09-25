@@ -239,6 +239,15 @@ Issue #965 の PR（#1046）に対する codex・Bugbot の指摘（いずれも
    `user_canceled_after_handshake_ignores_data_until_close_notify`・
    `dummy_ccs_after_user_canceled_is_still_validated`・
    `dummy_ccs_after_user_canceled_outside_window_is_rejected` を追加した。
+8. **タイムアウト復元失敗時の shutdown**（Bugbot Low）: client Finished
+   受理後の読み書きタイムアウトの通常値への復元（上記 5）に失敗した
+   場合、`?` で `Err` を返すだけで確立済みの `TlsSession` を drop し、
+   接続を shutdown していなかった。他の driver 失敗経路と同じく shutdown
+   してから `Record` エラーを返すよう揃えた（タイムアウトを保証できない
+   接続を呼び出し元へ渡さない fail-closed）。結合テスト
+   `driver_shuts_down_when_restoring_timeouts_fails_after_handshake`
+   （通常運用値への設定だけを失敗させるトランスポートで読み・書きの
+   各復元失敗を注入）を追加した。
 
 ## 対象外（後続 sub-issue の担当）
 

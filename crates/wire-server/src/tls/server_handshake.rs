@@ -1275,22 +1275,30 @@ pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeE
                     // （`limits::READ_TIMEOUT`）より大幅に早くタイムアウト
                     // する（#965 レビュー指摘）。ハンドシェイク成功時は
                     // 呼び出し元へ返す直前に通常運用値へ明示的に戻す。
-                    stream
-                        .set_read_timeout(Some(crate::limits::READ_TIMEOUT))
-                        .map_err(|e| {
-                            ServerHandshakeDriverError::Record(record::RecordError::Io(e))
-                        })?;
+                    //
                     // 送信側も同様: `DeadlineWriter` が残り時間で設定した
                     // 書き込みタイムアウトを、接続受理時に
                     // `limits::apply_read_timeout` が読み書き双方へ設定する
                     // 通常運用値（`limits::READ_TIMEOUT`）へ戻す。戻さないと
                     // 以降のアプリケーションデータ送出がハンドシェイクの
                     // 残り時間で早期にタイムアウトし得る。
-                    stream
-                        .set_write_timeout(Some(crate::limits::READ_TIMEOUT))
-                        .map_err(|e| {
-                            ServerHandshakeDriverError::Record(record::RecordError::Io(e))
-                        })?;
+                    //
+                    // いずれかの復元に失敗した場合は、他の driver 失敗経路と
+                    // 同じく接続を shutdown してから `Err` を返す（PR #1046
+                    // レビュー指摘: 従来は `?` で返し、確立済みの
+                    // `TlsSession` を drop するだけで接続を開いたまま残して
+                    // いた）。タイムアウトを保証できない接続を呼び出し元へ
+                    // 渡さない fail-closed。
+                    let restored = stream
+                        .set_read_timeout(Some(crate::limits::READ_TIMEOUT))
+                        .and_then(|()| stream.set_write_timeout(Some(crate::limits::READ_TIMEOUT)));
+                    if let Err(e) = restored {
+                        drop(session);
+                        let _ = stream.shutdown();
+                        return Err(ServerHandshakeDriverError::Record(record::RecordError::Io(
+                            e,
+                        )));
+                    }
                     return Ok(session);
                 }
                 Ok(Step::ClosedByPeer(output)) => {

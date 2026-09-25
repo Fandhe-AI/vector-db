@@ -1344,6 +1344,150 @@ fn open_record_decrypt_failure_poisons_the_session() {
     );
 }
 
+/// loopback `TcpStream` 越しに driver（`perform_server_handshake_with*`）と
+/// フルハンドシェイクを行うクライアント側の手順。ClientHello 送出から
+/// server flight の検証・client Finished 送出までを行い、application epoch
+/// の鍵へ切り替えた `TestClient` を返す（driver 経由の結合テストが共有）。
+fn drive_client_handshake_over_socket(client_socket: &mut std::net::TcpStream) -> TestClient {
+    let client_priv = [0x33u8; 32];
+    let client_ephemeral = EphemeralSecret::from_bytes(client_priv);
+    let client_pub = *client_ephemeral.public_key().as_bytes();
+
+    let mut client = TestClient::new();
+    let (ch_record, ch_raw) = build_client_hello(client_pub);
+    client
+        .transcript
+        .append_client_hello(&ch_raw)
+        .expect("valid ClientHello");
+
+    let mut ch_buf = Vec::new();
+    ch_record
+        .serialize_into(&mut ch_buf, RecordKind::Plaintext)
+        .expect("serialize ClientHello record");
+    client_socket
+        .write_all(&ch_buf)
+        .expect("write ClientHello to loopback stream");
+
+    let sh_record = record::read_record(client_socket, RecordKind::Ciphertext)
+        .expect("read ServerHello record")
+        .expect("ServerHello record present");
+    let sh = handshake::ServerHello::parse(&sh_record.fragment[4..]).expect("valid ServerHello");
+    let mut sh_body = Vec::new();
+    sh.serialize_body_into(&mut sh_body).expect("valid body");
+    let sh_raw = RawHandshake {
+        msg_type: HandshakeType::ServerHello,
+        body: sh_body,
+    };
+    client
+        .transcript
+        .append_server_hello(&sh_raw)
+        .expect("valid ServerHello");
+    let th_ch_sh = client
+        .transcript
+        .hash_through_server_hello()
+        .expect("checkpoint reached");
+
+    let server_pub = sh
+        .extensions
+        .iter()
+        .find(|e| e.extension_type == 0x0033)
+        .and_then(|e| e.extension_data.get(4..36))
+        .and_then(|s| <[u8; 32]>::try_from(s).ok())
+        .expect("server key_share public key present");
+
+    let shared = client_ephemeral
+        .diffie_hellman(&server_pub)
+        .expect("valid non-zero shared secret");
+    let early = EarlySecret::new_without_psk();
+    let handshake_secret = early
+        .into_handshake(&shared)
+        .expect("valid HKDF parameters");
+    let traffic = handshake_secret
+        .traffic_secrets(&th_ch_sh)
+        .expect("valid HKDF parameters");
+    let client_hs_keys = traffic
+        .client
+        .traffic_keys()
+        .expect("valid HKDF parameters");
+    let server_hs_keys = traffic
+        .server
+        .traffic_keys()
+        .expect("valid HKDF parameters");
+    client
+        .sealer
+        .install_handshake_keys(&client_hs_keys)
+        .expect("valid transition");
+    client
+        .opener
+        .install_handshake_keys(&server_hs_keys)
+        .expect("valid transition");
+
+    // server flight（EE・Certificate・CertificateVerify・server Finished）は
+    // 本テストの構成（最小の自己署名 ed25519 証明書 1 枚）では 1 ciphertext
+    // レコードに収まる（`full_handshake_round_trip_over_pure_api` と同じ
+    // 前提）。
+    let flight_record = record::read_record(client_socket, RecordKind::Ciphertext)
+        .expect("read server flight record")
+        .expect("server flight record present");
+    let th_ch_sf = client.process_server_flight(
+        std::slice::from_ref(&flight_record),
+        &RFC8032_TEST1_PUBLIC_KEY,
+        &traffic.server,
+    );
+
+    let master = handshake_secret
+        .into_master()
+        .expect("valid HKDF parameters");
+    let app = master
+        .application_traffic_secrets(&th_ch_sf)
+        .expect("valid HKDF parameters");
+    let client_ap_keys = app.client.traffic_keys().expect("valid HKDF parameters");
+    let server_ap_keys = app.server.traffic_keys().expect("valid HKDF parameters");
+
+    // client Finished を構成し、handshake epoch のまま送る。
+    let client_finished_key = traffic
+        .client
+        .finished_key()
+        .expect("valid HKDF parameters");
+    let verify_data = finished::compute_verify_data(&client_finished_key, &th_ch_sf);
+    let client_finished = handshake::Finished {
+        verify_data: verify_data.as_bytes().to_vec(),
+    };
+    let mut cf_body = Vec::new();
+    client_finished
+        .serialize_body_into(&mut cf_body)
+        .expect("valid body");
+    let cf_raw = RawHandshake {
+        msg_type: HandshakeType::Finished,
+        body: cf_body,
+    };
+    let cf_wire = cf_raw.to_bytes().expect("valid wire bytes");
+    let cf_records = client
+        .sealer
+        .seal_fragmented(ContentType::Handshake, &cf_wire)
+        .expect("valid seal");
+    let mut cf_buf = Vec::new();
+    for record in &cf_records {
+        record
+            .serialize_into(&mut cf_buf, RecordKind::Ciphertext)
+            .expect("serialize client Finished record");
+    }
+    client_socket
+        .write_all(&cf_buf)
+        .expect("write client Finished to loopback stream");
+
+    // application epoch へ切り替える（client 側）。
+    client
+        .sealer
+        .install_application_keys(&client_ap_keys)
+        .expect("valid transition");
+    client
+        .opener
+        .install_application_keys(&server_ap_keys)
+        .expect("valid transition");
+    client
+}
+
 /// 受け入れ条件全体（driver 経由）: `perform_server_handshake_with_timeout`
 /// （#966 が実接続へ結線する blocking driver 本体。乱数源は本番と同じ
 /// `OsEntropy`）を loopback `TcpStream` 越しに駆動し、フルハンドシェイクの
@@ -1425,143 +1569,7 @@ fn full_handshake_round_trip_over_driver_with_loopback_stream() {
     );
 
     let mut client_socket = TcpStream::connect(addr).expect("connect to loopback listener");
-
-    let client_priv = [0x33u8; 32];
-    let client_ephemeral = EphemeralSecret::from_bytes(client_priv);
-    let client_pub = *client_ephemeral.public_key().as_bytes();
-
-    let mut client = TestClient::new();
-    let (ch_record, ch_raw) = build_client_hello(client_pub);
-    client
-        .transcript
-        .append_client_hello(&ch_raw)
-        .expect("valid ClientHello");
-
-    let mut ch_buf = Vec::new();
-    ch_record
-        .serialize_into(&mut ch_buf, RecordKind::Plaintext)
-        .expect("serialize ClientHello record");
-    client_socket
-        .write_all(&ch_buf)
-        .expect("write ClientHello to loopback stream");
-
-    let sh_record = record::read_record(&mut client_socket, RecordKind::Ciphertext)
-        .expect("read ServerHello record")
-        .expect("ServerHello record present");
-    let sh = handshake::ServerHello::parse(&sh_record.fragment[4..]).expect("valid ServerHello");
-    let mut sh_body = Vec::new();
-    sh.serialize_body_into(&mut sh_body).expect("valid body");
-    let sh_raw = RawHandshake {
-        msg_type: HandshakeType::ServerHello,
-        body: sh_body,
-    };
-    client
-        .transcript
-        .append_server_hello(&sh_raw)
-        .expect("valid ServerHello");
-    let th_ch_sh = client
-        .transcript
-        .hash_through_server_hello()
-        .expect("checkpoint reached");
-
-    let server_pub = sh
-        .extensions
-        .iter()
-        .find(|e| e.extension_type == 0x0033)
-        .and_then(|e| e.extension_data.get(4..36))
-        .and_then(|s| <[u8; 32]>::try_from(s).ok())
-        .expect("server key_share public key present");
-
-    let shared = client_ephemeral
-        .diffie_hellman(&server_pub)
-        .expect("valid non-zero shared secret");
-    let early = EarlySecret::new_without_psk();
-    let handshake_secret = early
-        .into_handshake(&shared)
-        .expect("valid HKDF parameters");
-    let traffic = handshake_secret
-        .traffic_secrets(&th_ch_sh)
-        .expect("valid HKDF parameters");
-    let client_hs_keys = traffic
-        .client
-        .traffic_keys()
-        .expect("valid HKDF parameters");
-    let server_hs_keys = traffic
-        .server
-        .traffic_keys()
-        .expect("valid HKDF parameters");
-    client
-        .sealer
-        .install_handshake_keys(&client_hs_keys)
-        .expect("valid transition");
-    client
-        .opener
-        .install_handshake_keys(&server_hs_keys)
-        .expect("valid transition");
-
-    // server flight（EE・Certificate・CertificateVerify・server Finished）は
-    // 本テストの構成（最小の自己署名 ed25519 証明書 1 枚）では 1 ciphertext
-    // レコードに収まる（`full_handshake_round_trip_over_pure_api` と同じ
-    // 前提）。
-    let flight_record = record::read_record(&mut client_socket, RecordKind::Ciphertext)
-        .expect("read server flight record")
-        .expect("server flight record present");
-    let th_ch_sf = client.process_server_flight(
-        std::slice::from_ref(&flight_record),
-        &RFC8032_TEST1_PUBLIC_KEY,
-        &traffic.server,
-    );
-
-    let master = handshake_secret
-        .into_master()
-        .expect("valid HKDF parameters");
-    let app = master
-        .application_traffic_secrets(&th_ch_sf)
-        .expect("valid HKDF parameters");
-    let client_ap_keys = app.client.traffic_keys().expect("valid HKDF parameters");
-    let server_ap_keys = app.server.traffic_keys().expect("valid HKDF parameters");
-
-    // client Finished を構成し、handshake epoch のまま送る。
-    let client_finished_key = traffic
-        .client
-        .finished_key()
-        .expect("valid HKDF parameters");
-    let verify_data = finished::compute_verify_data(&client_finished_key, &th_ch_sf);
-    let client_finished = handshake::Finished {
-        verify_data: verify_data.as_bytes().to_vec(),
-    };
-    let mut cf_body = Vec::new();
-    client_finished
-        .serialize_body_into(&mut cf_body)
-        .expect("valid body");
-    let cf_raw = RawHandshake {
-        msg_type: HandshakeType::Finished,
-        body: cf_body,
-    };
-    let cf_wire = cf_raw.to_bytes().expect("valid wire bytes");
-    let cf_records = client
-        .sealer
-        .seal_fragmented(ContentType::Handshake, &cf_wire)
-        .expect("valid seal");
-    let mut cf_buf = Vec::new();
-    for record in &cf_records {
-        record
-            .serialize_into(&mut cf_buf, RecordKind::Ciphertext)
-            .expect("serialize client Finished record");
-    }
-    client_socket
-        .write_all(&cf_buf)
-        .expect("write client Finished to loopback stream");
-
-    // application epoch へ切り替える（client 側）。
-    client
-        .sealer
-        .install_application_keys(&client_ap_keys)
-        .expect("valid transition");
-    client
-        .opener
-        .install_application_keys(&server_ap_keys)
-        .expect("valid transition");
+    let mut client = drive_client_handshake_over_socket(&mut client_socket);
 
     // サーバー → クライアントのアプリケーションデータ。
     let server_payload_record = record::read_record(&mut client_socket, RecordKind::Ciphertext)
@@ -1611,6 +1619,126 @@ fn full_handshake_round_trip_over_driver_with_loopback_stream() {
          (limits::READ_TIMEOUT) immediately after a successful handshake, \
          not left at the short deadline-derived value from the handshake itself"
     );
+}
+
+/// PR #1046 レビュー指摘の回帰（driver 経由）: client Finished 受理後の
+/// 読み書きタイムアウトの通常値への復元に失敗した場合は、確立済みの
+/// `TlsSession` を返さず、他の driver 失敗経路と同じく接続を shutdown
+/// してから `Err` を返す。実ソケットでは `set_*_timeout(Some(非ゼロ))` を
+/// 失敗させられないため、loopback `TcpStream` を包み「通常運用値
+/// （`limits::READ_TIMEOUT`）への設定だけを失敗させる」トランスポートで
+/// 注入する（ハンドシェイク中の期限由来の値は 5 秒以下で、この値とは
+/// 一致しない）。
+#[test]
+fn driver_shuts_down_when_restoring_timeouts_fails_after_handshake() {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use wire_server::tls::server_handshake::{HandshakeTransport, ServerHandshakeDriverError};
+
+    #[derive(Clone, Copy, Debug)]
+    enum FailOn {
+        Read,
+        Write,
+    }
+
+    struct FailingRestore {
+        inner: TcpStream,
+        fail_on: FailOn,
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    fn injected(timeout: Option<Duration>) -> std::io::Result<()> {
+        if timeout == Some(wire_server::limits::READ_TIMEOUT) {
+            Err(std::io::Error::other("injected timeout restore failure"))
+        } else {
+            Ok(())
+        }
+    }
+
+    impl Read for FailingRestore {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for FailingRestore {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl HandshakeTransport for FailingRestore {
+        fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+            if matches!(self.fail_on, FailOn::Read) {
+                injected(timeout)?;
+            }
+            self.inner.set_read_timeout(timeout)
+        }
+
+        fn set_write_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+            if matches!(self.fail_on, FailOn::Write) {
+                injected(timeout)?;
+            }
+            self.inner.set_write_timeout(timeout)
+        }
+
+        fn shutdown(&mut self) -> std::io::Result<()> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            self.inner.shutdown(std::net::Shutdown::Both)
+        }
+    }
+
+    for fail_on in [FailOn::Read, FailOn::Write] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = Arc::clone(&shutdown_called);
+
+        let server_thread = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accept connection");
+            let mut transport = FailingRestore {
+                inner: socket,
+                fail_on,
+                shutdown_called: shutdown_flag,
+            };
+            wire_server::tls::server_handshake::perform_server_handshake_with_timeout(
+                &mut transport,
+                test_config(),
+                Duration::from_secs(5),
+            )
+        });
+
+        let mut client_socket = TcpStream::connect(addr).expect("connect to loopback listener");
+        let _client = drive_client_handshake_over_socket(&mut client_socket);
+
+        let result = server_thread.join().expect("server thread must not panic");
+        assert!(
+            matches!(result, Err(ServerHandshakeDriverError::Record(_))),
+            "a failed timeout restore ({fail_on:?}) must not hand out a session, got {result:?}"
+        );
+        assert!(
+            shutdown_called.load(Ordering::SeqCst),
+            "a failed timeout restore ({fail_on:?}) must shut the connection down"
+        );
+
+        // サーバーは shutdown 済みのため、クライアントからは EOF として
+        // 観測される（アプリケーションデータは届かない）。
+        client_socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set client read timeout");
+        let mut buf = [0u8; 1];
+        let n = client_socket
+            .read(&mut buf)
+            .expect("the shut-down connection must read as EOF");
+        assert_eq!(
+            n, 0,
+            "no bytes after a failed timeout restore ({fail_on:?})"
+        );
+    }
 }
 
 /// 改ざんした client Finished（verify_data を 1 bit 反転）は
