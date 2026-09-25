@@ -268,8 +268,10 @@ use crate::sql::mode::{self, SearchMode};
 /// `wire_code` へ写像する（`Malformed` → `22000`・`OutOfRange` →
 /// `22003`）。`InsertLiteral::Bool` は型不一致として `22000` で拒否する。
 /// INSERT（`bind_insert_row`）・UPDATE（`bind_set_assignments`）・UPSERT
-/// （`bind_upsert_assignments`）の 3 箇所が共有する（第 2 のパーサーを作らない）。
-fn bind_numeric_literal(
+/// （`bind_upsert_assignments`）・COPY（`sql::copy::bind_copy_record`。Issue
+/// #939 のマージで追加された `Numeric` 列への対応漏れの修正）の各箇所が
+/// 共有する（第 2 のパーサーを作らない）。
+pub(crate) fn bind_numeric_literal(
     literal: &InsertLiteral,
     name: &str,
     precision: u8,
@@ -376,7 +378,7 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
 /// （[`SqlSurfaceError::numeric_out_of_range`]）、小数点・16 進数等の非整数形式は
 /// `22000` で拒否する。エラーメッセージには列名のみを含め、リテラル本文は含めない
 /// （長大な数字列の反射防止）。
-fn bind_integer_literal(
+pub(crate) fn bind_integer_literal(
     name: &str,
     ty: ColumnType,
     literal: &InsertLiteral,
@@ -472,7 +474,7 @@ pub(crate) fn bind_double_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
 /// （[`crate::datetime::DateTimeLiteralError::Overflow`]）は
 /// [`SqlSurfaceError::DatetimeFieldOverflow`]（`22008`）へ写像する（D-1。
 /// `docs/design/datetime-column.md` 参照）。
-fn bind_datetime_literal(
+pub(crate) fn bind_datetime_literal(
     column_name: &str,
     ty: ColumnType,
     literal: &str,
@@ -1645,7 +1647,7 @@ fn bind_insert_row(
 ///
 /// - 形式不正（接頭辞なし・奇数桁・非 16 進）は `22000`（[`SqlSurfaceError::invalid_input`]）。
 /// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
-fn bind_bytea_literal(
+pub(crate) fn bind_bytea_literal(
     s: &str,
     column_name: &str,
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {
@@ -1670,7 +1672,7 @@ fn bind_bytea_literal(
 /// - 構文不正・深さ/要素数超過は `42601`（[`SqlSurfaceError::UnsupportedSyntax`]。
 ///   NOSQL-8 と同一分類）。
 /// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
-fn bind_json_literal(
+pub(crate) fn bind_json_literal(
     s: &str,
     column_ty: &ColumnType,
     column_name: &str,
@@ -1726,7 +1728,7 @@ fn json_column_error(e: crate::json::JsonColumnError, _s: &str) -> SqlSurfaceErr
 /// 開始前に `22P02`（[`SqlSurfaceError::invalid_text_representation`]）で拒否する。
 /// エラーメッセージには語彙の一覧を含めない（型名とクライアント自身の入力値のみ。
 /// security.md P0「情報漏えい」対応）。
-fn bind_enum_literal(
+pub(crate) fn bind_enum_literal(
     def: &crate::catalog::EnumTypeDef,
     s: &str,
     column_name: &str,
@@ -1747,8 +1749,10 @@ fn bind_enum_literal(
 /// 反する入力は書き込みトランザクション開始前に `22P02`
 /// （[`SqlSurfaceError::invalid_text_representation`]）で拒否する（U3・U7）。
 /// エラーメッセージには列名とクライアント自身の入力値のみを含める
-/// （security.md P0「情報漏えい」対応）。
-fn bind_uuid_literal(
+/// （security.md P0「情報漏えい」対応）。COPY（`sql::copy::bind_copy_record`。
+/// Issue #939 のマージで追加された `Uuid` 列への対応漏れの修正）も本関数を
+/// 共有する。
+pub(crate) fn bind_uuid_literal(
     s: &str,
     column_name: &str,
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {

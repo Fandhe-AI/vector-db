@@ -98,6 +98,7 @@
 pub mod auth;
 pub mod auth_method_opt;
 pub mod bind_guard;
+pub(crate) mod copy;
 pub mod durability_opt;
 pub mod error_response;
 pub mod extended_query;
