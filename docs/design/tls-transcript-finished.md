@@ -47,6 +47,10 @@ server Finished → client Finished
 （`ExpectedNext`。ClientHello 直後だけ HelloRetryRequest／ServerHello の
 2 択）を返し、状態機械（#965）はこれと各 `append_*` の `Result` のみを
 頼りに遷移を判断する契約とする。**#965 は独自の順序表を持たない。**
+`expected_next()` は `Result<ExpectedNext, TranscriptError>` を返し、
+poison 済み（append・チェックポイントのいずれかが一度でも `Err` を返した後）
+は `Err(OutOfOrder)` を返す。失敗済みの transcript に対して正常な次メッセージ
+を返し、状態機械に継続可能と誤認させないため（PR #1033 レビュー指摘）。
 
 各 `append_*`（`append_client_hello`／`append_hello_retry_request`／
 `append_server_hello`／`append_encrypted_extensions`／

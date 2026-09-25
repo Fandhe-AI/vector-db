@@ -14,7 +14,7 @@
 //! Certificate → CertificateVerify → server Finished → client Finished）を
 //! 唯一保持する。ハンドシェイク状態機械（#965）は独自の順序表を持たず、
 //! [`Transcript::expected_next`] と各 `append_*` の `Result` のみを頼りに
-//! 遷移を判断する契約とする。クライアント証明書・PSK／0-RTT・KeyUpdate は
+//! 遷移を判断する契約とする（poison 後は `expected_next` も `Err` を返す）。クライアント証明書・PSK／0-RTT・KeyUpdate は
 //! 親 Issue #941 の方針により対象外。
 //!
 //! **HelloRetryRequest 時の transcript 再構成**（RFC 8446 §4.4.1）:
@@ -153,8 +153,16 @@ impl Transcript {
     }
 
     /// 次に受理できるメッセージ種別（#965 の状態機械が参照する契約）。
-    pub fn expected_next(&self) -> ExpectedNext {
-        match self.step {
+    ///
+    /// poison 済み（append・チェックポイントのいずれかが一度でも `Err` を
+    /// 返した後）は `Err(TranscriptError::OutOfOrder)` を返す。状態機械は
+    /// この問い合わせだけで遷移を判断するため、失敗済みの transcript に対して
+    /// 正常な次メッセージを返すと継続可能と誤認させてしまう（fail-closed
+    /// 契約違反）。読み取り専用の問い合わせのため、ここでは poison 状態を
+    /// 変更しない。
+    pub fn expected_next(&self) -> Result<ExpectedNext, TranscriptError> {
+        self.check_not_poisoned()?;
+        Ok(match self.step {
             Step::Start => ExpectedNext::ClientHello,
             Step::ClientHello if !self.hrr_done => ExpectedNext::HelloRetryRequestOrServerHello,
             Step::ClientHello => ExpectedNext::ServerHello,
@@ -165,7 +173,7 @@ impl Transcript {
             Step::CertificateVerify => ExpectedNext::ServerFinished,
             Step::ServerFinished => ExpectedNext::ClientFinished,
             Step::ClientFinished => ExpectedNext::Complete,
-        }
+        })
     }
 
     fn fail(&mut self, err: TranscriptError) -> TranscriptError {
@@ -434,18 +442,18 @@ mod tests {
     #[test]
     fn simple_1rtt_transcript_matches_rfc8448_checkpoints() {
         let mut t = Transcript::new();
-        assert_eq!(t.expected_next(), ExpectedNext::ClientHello);
+        assert_eq!(t.expected_next(), Ok(ExpectedNext::ClientHello));
 
         t.append_client_hello(&raw(HandshakeType::ClientHello, CLIENT_HELLO_1RTT))
             .expect("valid ClientHello");
         assert_eq!(
             t.expected_next(),
-            ExpectedNext::HelloRetryRequestOrServerHello
+            Ok(ExpectedNext::HelloRetryRequestOrServerHello)
         );
 
         t.append_server_hello(&raw(HandshakeType::ServerHello, SERVER_HELLO_1RTT))
             .expect("valid ServerHello");
-        assert_eq!(t.expected_next(), ExpectedNext::EncryptedExtensions);
+        assert_eq!(t.expected_next(), Ok(ExpectedNext::EncryptedExtensions));
 
         let th_ch_sh = t.hash_through_server_hello().expect("checkpoint reached");
         assert_eq!(
@@ -467,11 +475,11 @@ mod tests {
             .expect("valid ClientHello1");
         t.append_hello_retry_request(&raw(HandshakeType::ServerHello, HELLO_RETRY_REQUEST_HRR))
             .expect("valid HelloRetryRequest");
-        assert_eq!(t.expected_next(), ExpectedNext::ClientHello);
+        assert_eq!(t.expected_next(), Ok(ExpectedNext::ClientHello));
 
         t.append_client_hello(&raw(HandshakeType::ClientHello, CLIENT_HELLO_2_HRR))
             .expect("valid ClientHello2");
-        assert_eq!(t.expected_next(), ExpectedNext::ServerHello);
+        assert_eq!(t.expected_next(), Ok(ExpectedNext::ServerHello));
 
         t.append_server_hello(&raw(HandshakeType::ServerHello, SERVER_HELLO_HRR))
             .expect("valid ServerHello");
@@ -498,6 +506,45 @@ mod tests {
             .append_client_hello(&raw(HandshakeType::ClientHello, CLIENT_HELLO_1RTT))
             .unwrap_err();
         assert_eq!(err2, TranscriptError::OutOfOrder);
+    }
+
+    // PR #1033 review（P1）: poison 後の `expected_next()` が正常な遷移先を
+    // 返し続けると、状態機械が失敗済みの transcript を継続可能と誤認する。
+    // append 失敗による poison 後は `Err(OutOfOrder)` を返すことを固定する。
+    #[test]
+    fn expected_next_is_rejected_after_append_failure_poisons() {
+        let mut t = Transcript::new();
+        t.append_client_hello(&raw(HandshakeType::ClientHello, CLIENT_HELLO_1RTT))
+            .expect("valid ClientHello");
+        assert_eq!(
+            t.expected_next(),
+            Ok(ExpectedNext::HelloRetryRequestOrServerHello)
+        );
+        // ServerHello 位置に Finished（msg_type 不一致）を投入して poison させる。
+        let bogus = RawHandshake {
+            msg_type: HandshakeType::Finished,
+            body: vec![0u8; 32],
+        };
+        assert_eq!(
+            t.append_server_hello(&bogus).unwrap_err(),
+            TranscriptError::UnexpectedMessage
+        );
+        assert_eq!(t.expected_next(), Err(TranscriptError::OutOfOrder));
+        // 読み取り専用の問い合わせを繰り返しても同じエラーを返し続ける。
+        assert_eq!(t.expected_next(), Err(TranscriptError::OutOfOrder));
+    }
+
+    // PR #1033 review（P1）: チェックポイントの時点違いによる poison 後も
+    // `expected_next()` が `Err(OutOfOrder)` を返すことを固定する。
+    #[test]
+    fn expected_next_is_rejected_after_checkpoint_failure_poisons() {
+        let mut t = Transcript::new();
+        assert_eq!(t.expected_next(), Ok(ExpectedNext::ClientHello));
+        assert_eq!(
+            t.hash_through_server_hello().unwrap_err(),
+            TranscriptError::OutOfOrder
+        );
+        assert_eq!(t.expected_next(), Err(TranscriptError::OutOfOrder));
     }
 
     #[test]
@@ -667,7 +714,7 @@ mod tests {
             body: vec![1u8; 32],
         };
         t.append_client_finished(&cf).unwrap();
-        assert_eq!(t.expected_next(), ExpectedNext::Complete);
+        assert_eq!(t.expected_next(), Ok(ExpectedNext::Complete));
 
         // 完了後の append はすべて拒否される。
         assert_eq!(
