@@ -49,6 +49,14 @@ pub trait WireStream: Read + Write {
     /// 接続終了時の best-effort な後始末（TLS では `close_notify` の送出）。
     /// 平文では no-op（既存挙動とビット同一）。
     fn graceful_close(&mut self);
+
+    /// SCRAM-SHA-256-PLUS（[`crate::auth::scram`]・WIRE-18）がチャネル
+    /// バインディングとして使う `tls-server-end-point`（RFC 5929 §4。
+    /// Issue #970）。平文接続では構造的に `None`（`TcpStream` 実装は常に
+    /// `None` を返す）。TLS 接続では [`crate::tls::server_handshake::
+    /// TlsSession::tls_server_end_point`] へ委譲し、非対応の署名
+    /// アルゴリズム・提示無効化設定の場合も `None` になる。
+    fn tls_server_end_point(&self) -> Option<&[u8]>;
 }
 
 impl WireStream for TcpStream {
@@ -79,5 +87,11 @@ impl WireStream for TcpStream {
     fn graceful_close(&mut self) {
         // 平文接続には送るべき終端メッセージが無い。既存挙動（drop のみ）と
         // ビット同一に保つため何もしない。
+    }
+
+    fn tls_server_end_point(&self) -> Option<&[u8]> {
+        // 平文接続は TLS を経由しないため、構造的にチャネルバインディング
+        // 値を持たない。
+        None
     }
 }

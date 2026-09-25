@@ -332,6 +332,10 @@ impl<S: WireStream> WireStream for TlsStream<S> {
             let _ = write_records(&mut self.inner, &records);
         }
     }
+
+    fn tls_server_end_point(&self) -> Option<&[u8]> {
+        self.session.tls_server_end_point()
+    }
 }
 
 #[cfg(test)]

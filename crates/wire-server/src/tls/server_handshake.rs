@@ -20,7 +20,7 @@
 //! # 対象外
 //!
 //! - CLI からの証明書・鍵読み込み（#967）・HTTPS 表層（#968）
-//! - 3 クライアント接続テスト（#969）・channel binding（#970）
+//! - 3 クライアント接続テスト（#969）
 //! - KeyUpdate・NewSessionTicket・0-RTT・クライアント証明書（親 #941 の方針）
 //!
 //! 受信データ経路のため `unwrap`／`expect`／添字アクセスを用いず `get()`・
@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use super::alert::{self, Alert, ReceivedAlert};
 use super::certificate_verify;
+use super::channel_binding::TlsServerEndPoint;
 use super::client_hello::{self, ClientHelloDecision, ClientHelloError, NegotiatedClientHello};
 use super::ed25519::SigningKey;
 use super::finished;
@@ -53,9 +54,22 @@ pub const HANDSHAKE_READ_TIMEOUT: Duration = crate::limits::READ_TIMEOUT;
 /// サーバー証明書チェーンと署名鍵の組。接続間で共有する（`Arc`）。
 /// CLI からの構築は #967 の担当で、本モジュールは
 /// [`TlsServerConfig::new`] による整合性検査までを提供する。
+///
+/// `channel_binding` は葉証明書から起動時に 1 回だけ算出する
+/// `tls-server-end-point`（RFC 5929 §4。[`super::channel_binding`]・
+/// Issue #970）。証明書は公開データのため接続ごとに再計算しない。算出に
+/// 失敗した場合（非対応の署名アルゴリズム・構造違反）は起動失敗にはせず
+/// `None`（チャネルバインディング非提供。TLS なしの接続と同じ SCRAM 挙動）
+/// へ縮退させる（`docs/design/tls-channel-binding.md` 参照）。
 pub struct TlsServerConfig {
     chain: ServerCertificateChain,
     key: SigningKey,
+    channel_binding: Option<TlsServerEndPoint>,
+    /// SCRAM-SHA-256-PLUS（`p=tls-server-end-point`）を機構リストへ
+    /// 提示するか（[`Self::with_scram_channel_binding`]。既定
+    /// `true`＝提示する。libpq 相互運用上の懸念により無効化する opt-in を
+    /// 用意する。詳細は `docs/design/tls-channel-binding.md` 参照）。
+    advertise_scram_channel_binding: bool,
 }
 
 /// [`TlsServerConfig::new`] の失敗理由。
@@ -82,16 +96,50 @@ impl std::error::Error for TlsServerConfigError {}
 
 impl TlsServerConfig {
     /// `key.public_key()` と `chain.leaf_public_key()` の一致を定数時間で
-    /// 検査してから構築する（起動時エラー。#967 が呼ぶ）。
+    /// 検査してから構築する（起動時エラー。#967 が呼ぶ）。あわせて葉証明書
+    /// から `tls-server-end-point`（Issue #970）を 1 回だけ算出する。算出に
+    /// 失敗しても起動失敗にはせず `channel_binding` を `None` にする
+    /// （[`Self::channel_binding`] のドキュメンテーションコメント参照）。
+    /// SCRAM-SHA-256-PLUS の提示は既定で有効（[`Self::
+    /// with_scram_channel_binding`] で opt-out できる）。
     pub fn new(
         chain: ServerCertificateChain,
         key: SigningKey,
     ) -> Result<Self, TlsServerConfigError> {
         if ct_eq(&key.public_key(), chain.leaf_public_key()) {
-            Ok(TlsServerConfig { chain, key })
+            let channel_binding =
+                super::channel_binding::tls_server_end_point(chain.leaf_der()).ok();
+            Ok(TlsServerConfig {
+                chain,
+                key,
+                channel_binding,
+                advertise_scram_channel_binding: true,
+            })
         } else {
             Err(TlsServerConfigError::PublicKeyMismatch)
         }
+    }
+
+    /// SCRAM-SHA-256-PLUS の機構リスト提示可否を明示的に設定する
+    /// （libpq 相互運用ゲートの結果に応じた opt-out。#967 が CLI から
+    /// 呼ぶ想定。詳細は `docs/design/tls-channel-binding.md` 参照）。
+    pub fn with_scram_channel_binding(mut self, enabled: bool) -> Self {
+        self.advertise_scram_channel_binding = enabled;
+        self
+    }
+
+    /// 算出済みの `tls-server-end-point`（[`super::channel_binding`]）。
+    /// 非対応の署名アルゴリズム・DER 構造違反の場合は `None`
+    /// （チャネルバインディング非提供）。#967 が起動時警告の判定に使う。
+    pub fn tls_server_end_point(&self) -> Option<&TlsServerEndPoint> {
+        self.channel_binding.as_ref()
+    }
+
+    /// SCRAM-SHA-256-PLUS を機構リストへ提示するか。`tls_server_end_point()`
+    /// が `None` の場合は提示可否の設定に関わらず実際には提示できない
+    /// （[`Self::tls_server_end_point`] と合わせて呼び出し元が判定する）。
+    pub fn scram_channel_binding_enabled(&self) -> bool {
+        self.advertise_scram_channel_binding
     }
 }
 
@@ -868,6 +916,17 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
         let opener = std::mem::take(&mut self.opener);
         self.state = HandshakeState::Complete;
 
+        // SCRAM-SHA-256-PLUS へ提示する値は「算出済みの tls-server-end-point」
+        // と「提示可否設定」の両方が揃った場合のみ `Some`（Issue #970）。
+        // 提示無効化設定（libpq 相互運用ゲート opt-out）はここで畳み込み、
+        // `TlsSession::tls_server_end_point` の呼び出し元（`handshake.rs`）が
+        // 別途設定を意識しなくてよい形にする。
+        let channel_binding = if self.config.scram_channel_binding_enabled() {
+            self.config.tls_server_end_point().cloned()
+        } else {
+            None
+        };
+
         Ok(Step::Complete(
             Vec::new(),
             Box::new(TlsSession {
@@ -878,6 +937,7 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
                 received_close_notify: false,
                 received_user_canceled: false,
                 fatal_alert_sent: false,
+                channel_binding,
             }),
         ))
     }
@@ -946,6 +1006,13 @@ pub struct TlsSession {
     /// 呼んでも、2 回目以降は `Err(Poisoned)` になり追加の暗号操作を
     /// 行わない）。
     fatal_alert_sent: bool,
+    /// この接続の `tls-server-end-point`（[`TlsServerConfig::
+    /// tls_server_end_point`] のスナップショット。Issue #970）。SCRAM-
+    /// SHA-256-PLUS がチャネルバインディングとして使う。`None` は
+    /// 非対応の署名アルゴリズム・提示無効化設定を含め「チャネルバインディング
+    /// 非提供」を表す（`crate::wire_stream::WireStream::
+    /// tls_server_end_point` の平文接続と同じ意味）。
+    channel_binding: Option<TlsServerEndPoint>,
 }
 
 /// [`TlsSession::open_record`] の戻り値。
@@ -1004,11 +1071,25 @@ impl TlsSession {
             received_close_notify: false,
             received_user_canceled: false,
             fatal_alert_sent: false,
+            channel_binding: None,
         }
     }
 }
 
 impl TlsSession {
+    /// この接続で SCRAM-SHA-256-PLUS へ提示すべき `tls-server-end-point`
+    /// （Issue #970）。`TlsServerConfig::scram_channel_binding_enabled`
+    /// が無効化されている場合は算出済みの値があっても `None`（提示無効化を
+    /// 契約として畳み込み済み。[`ServerHandshake::handle_client_finished`]
+    /// 参照）。[`super::stream::TlsStream::tls_server_end_point`]・
+    /// `crate::wire_stream::WireStream::tls_server_end_point` から
+    /// 委譲される。
+    pub fn tls_server_end_point(&self) -> Option<&[u8]> {
+        self.channel_binding
+            .as_ref()
+            .map(TlsServerEndPoint::as_bytes)
+    }
+
     /// アプリケーションデータを 1 個以上のレコードへ seal する。
     pub fn seal_application_data(
         &mut self,

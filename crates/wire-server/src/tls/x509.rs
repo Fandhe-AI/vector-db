@@ -891,6 +891,19 @@ impl ServerCertificateChain {
     pub fn leaf_public_key(&self) -> &[u8; 32] {
         &self.leaf_public_key
     }
+
+    /// 葉証明書（チェーン先頭）の DER 全体。`from_der_chain` が非空チェーンを
+    /// 要求する契約上、`certificate_list` は常に 1 件以上を持つ。
+    /// [`super::channel_binding::tls_server_end_point`]（Issue #970）が
+    /// `tls-server-end-point` チャネルバインディング値を算出する入力として
+    /// [`TlsServerConfig::new`]（#967）から呼ばれる。
+    pub fn leaf_der(&self) -> &[u8] {
+        self.message
+            .certificate_list
+            .first()
+            .map(|entry| entry.cert_data.as_slice())
+            .unwrap_or(&[])
+    }
 }
 
 /// 現在時刻をエポック秒（`i64`）で取得する。エポック以前・`i64` 範囲外は
