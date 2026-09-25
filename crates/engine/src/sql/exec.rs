@@ -1183,6 +1183,13 @@ pub(crate) fn execute_statement_with_cache(
                                         .iter()
                                         .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
                                         .collect();
+                                    // 数値・日時・`NUMERIC`・`UUID` 列の範囲
+                                    // 述語（`FilterOp::TypedCompare`。Issue
+                                    // #891・TASK-199 で production 結線済み）は
+                                    // `bound.metadata_filters` に混在したまま
+                                    // 渡り、`ScalarIndex::candidates_for` が
+                                    // 内部で振り分ける（Issue #893 production
+                                    // 接続）。
                                     match index.resolve_candidates(
                                         &bound.metadata_filters,
                                         &id_preds,
