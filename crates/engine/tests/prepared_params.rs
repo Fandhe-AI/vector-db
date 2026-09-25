@@ -822,3 +822,87 @@ fn parse_and_describe_prepared_insert_have_no_side_effects() {
     let _ = ctx; // ctx は本テストでは未使用（read_ctx のみ使う）だが、
                  // 意図を明示するために保持する。
 }
+
+// PR #1012 codex-review P1 指摘の回帰: 公開 API `sql::parser::bind_scan`／
+// `bind_aggregate` は従来どおりの 3 引数シグネチャを維持し、検証省略フラグを
+// 受け取らない（クレート外から ENUM ラベル検証を省略させる経路を作らない）。
+// `$n` に由来しない語彙外 ENUM ラベルは、公開束縛 API・通常 Describe・
+// Prepared Describe のいずれでも従来どおり `22P02` で拒否される。
+#[test]
+fn public_bind_and_describe_reject_invalid_enum_label_without_dollar_param() {
+    use engine::sql::allowlist::{validate_sql, Statement};
+    use engine::sql::parser::{bind_aggregate, bind_scan};
+    use engine::sql::udf_call::UdfRegistry;
+
+    let scan_invalid = "SELECT id FROM documents WHERE mood = 'not-a-real-mood' LIMIT 5";
+    let scan_valid = "SELECT id FROM documents WHERE mood = 'happy' LIMIT 5";
+    let agg_invalid = "SELECT COUNT(*) FROM documents WHERE mood = 'not-a-real-mood'";
+    let agg_valid = "SELECT COUNT(*) FROM documents WHERE mood = 'happy'";
+
+    // 公開束縛 API: `EngineCore` と同じ手順で作った ENUM 列付きテーブルの
+    // `Storage` を許可リスト照会・スキーマ取得に直接使う。
+    {
+        let path = unique_db_path("public-bind-rejects-invalid-enum-label");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let mood = storage
+            .create_enum_type("mood", vec!["happy".to_string(), "sad".to_string()])
+            .expect("create enum type");
+        storage
+            .create_table(&TableSchema::new(
+                "documents",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                    ColumnDef::new("mood", ColumnType::Enum(mood), true),
+                ],
+            ))
+            .expect("create table");
+        let schema = storage
+            .get_table_schema("documents")
+            .expect("get_table_schema");
+        let udfs = UdfRegistry::default();
+
+        let bind_scan_sql = |sql: &str| match validate_sql(sql, &storage).expect("validate_sql") {
+            Statement::Scan(v) => bind_scan(&v, &schema, &udfs).map(|_| ()),
+            other => panic!("expected Statement::Scan, got {other:?}"),
+        };
+        let bind_agg_sql = |sql: &str| match validate_sql(sql, &storage).expect("validate_sql") {
+            Statement::Aggregate(v) => bind_aggregate(&v, &schema, &udfs).map(|_| ()),
+            other => panic!("expected Statement::Aggregate, got {other:?}"),
+        };
+        assert_eq!(
+            bind_scan_sql(scan_invalid).unwrap_err().wire_code(),
+            "22P02"
+        );
+        assert_eq!(bind_agg_sql(agg_invalid).unwrap_err().wire_code(), "22P02");
+        bind_scan_sql(scan_valid).expect("valid label must bind (scan)");
+        bind_agg_sql(agg_valid).expect("valid label must bind (aggregate)");
+    }
+
+    // Describe（通常・Prepared）: `$n` を含まない文の実リテラルは必ず検証される。
+    let path = unique_db_path("public-describe-rejects-invalid-enum-label");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_enum_documents_table(&path);
+    let session = SessionState::default();
+
+    for sql in [scan_invalid, agg_invalid] {
+        let parsed = core.parse_sql(sql).expect("parse_sql should succeed");
+        let err = core
+            .describe_parsed_in_session(&session, &parsed)
+            .expect_err("describe must reject an invalid real enum label");
+        assert_eq!(err.wire_code(), "22P02", "sql = {sql}");
+
+        let prepared = core
+            .parse_sql_prepared(sql)
+            .expect("parse_sql_prepared should succeed");
+        let err = core
+            .describe_prepared_in_session(&session, &prepared)
+            .expect_err("prepared describe must reject an invalid real enum label");
+        assert_eq!(err.wire_code(), "22P02", "sql = {sql}");
+    }
+    for sql in [scan_valid, agg_valid] {
+        let parsed = core.parse_sql(sql).expect("parse_sql should succeed");
+        core.describe_parsed_in_session(&session, &parsed)
+            .expect("describe must accept a valid enum label");
+    }
+}

@@ -2402,7 +2402,8 @@ impl EngineCore {
         // 同じ理由で `WHERE` 等価述語（`prepared.where_equality_dummy_flags`）
         // も `$n` 由来の位置に限り ENUM 列の語彙照合を省略する（PR #1012
         // Cursor Bugbot 指摘対応: `describe_parsed_in_session_impl` 内で
-        // `bind_aggregate`／`bind_projection_for_describe`／`bind_scan` の
+        // `bind_aggregate_with_dummy_flags`／`bind_projection_for_describe`／
+        // `bind_scan_with_dummy_flags` の
         // いずれが呼ばれても同じ配列を共有する）。
         self.describe_parsed_in_session_impl(
             session,
@@ -2527,8 +2528,10 @@ impl EngineCore {
     /// 場合に限る（Issue #935・WIRE-12・TASK-217。PR #1012 レビュー指摘対応）。
     ///
     /// `dummy_equality_flags`（PR #1012 Cursor Bugbot 指摘対応）は
-    /// `sql::parser::bind_where_predicates`（`bind_aggregate`・
-    /// `bind_projection_for_describe`・`bind_scan` 経由）へそのまま渡し、`$n`
+    /// `sql::parser::bind_where_predicates`（crate 内限定の
+    /// `bind_aggregate_with_dummy_flags`・`bind_projection_for_describe`・
+    /// `bind_scan_with_dummy_flags` 経由。公開 API の `bind_aggregate`／
+    /// `bind_scan` はフラグを受け取らず常に全値検証する）へそのまま渡し、`$n`
     /// 由来のダミー値へ置換された `WHERE` 等価述語に限り ENUM 列の語彙照合
     /// （`declarative_filter`）を Describe 時点では省略する。`$n` を含まない
     /// 通常の Describe（`describe_parsed_in_session` 経由）では常に空スライスに
@@ -2588,7 +2591,7 @@ impl EngineCore {
             }
             ParsedSql::Statement(Statement::Aggregate(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-                let bound = crate::sql::parser::bind_aggregate(
+                let bound = crate::sql::parser::bind_aggregate_with_dummy_flags(
                     validated,
                     &schema,
                     session.udfs(),
@@ -2600,7 +2603,7 @@ impl EngineCore {
             }
             ParsedSql::Statement(Statement::Scan(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-                let bound = crate::sql::parser::bind_scan(
+                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
                     validated,
                     &schema,
                     session.udfs(),
@@ -2807,7 +2810,7 @@ impl EngineCore {
             crate::sql::allowlist::Statement::Aggregate(validated) => {
                 let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
                 let bound =
-                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs(), &[])?;
+                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
                 let result = self.run_aggregate_plan(&read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -2822,8 +2825,7 @@ impl EngineCore {
             // が同じ実行本体を束縛済み計画向けに再利用する）。
             crate::sql::allowlist::Statement::Scan(validated) => {
                 let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
-                let bound =
-                    crate::sql::parser::bind_scan(&validated, &schema, session.udfs(), &[])?;
+                let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
                 let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -3770,7 +3772,7 @@ impl EngineCore {
             }
             crate::sql::allowlist::CopyStatement::To(v) => {
                 let (read_txn, schema) = self.read_txn_with_schema(v.inner.table_name())?;
-                let bound = crate::sql::parser::bind_scan(&v.inner, &schema, session.udfs(), &[])?;
+                let bound = crate::sql::parser::bind_scan(&v.inner, &schema, session.udfs())?;
                 let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
                 Ok(CopyPlan::To(v.format, result))
             }

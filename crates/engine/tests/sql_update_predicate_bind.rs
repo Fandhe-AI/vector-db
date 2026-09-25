@@ -83,7 +83,7 @@ fn predicate_update_where_binds_to_the_same_representation_as_select_where() {
         other => panic!("expected Statement::Scan, got {other:?}"),
     };
     let bound_scan =
-        bind_scan(&scan, &schema(), &UdfRegistry::default(), &[]).expect("SELECT scan must bind");
+        bind_scan(&scan, &schema(), &UdfRegistry::default()).expect("SELECT scan must bind");
 
     let update_sql = format!(
         "UPDATE documents SET body = 'x' WHERE {where_clause} USING OPERATION_ID 'op-0001'"

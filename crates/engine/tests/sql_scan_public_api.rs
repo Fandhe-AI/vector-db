@@ -111,7 +111,7 @@ fn bind_scan_and_execute_scan_are_reachable_from_outside_the_crate() {
             panic!("expected Statement::Scan");
         };
         let schema = storage.get_table_schema(TABLE).expect("get_table_schema");
-        let bound = bind_scan(&validated_scan, &schema, &UdfRegistry::default(), &[])
+        let bound = bind_scan(&validated_scan, &schema, &UdfRegistry::default())
             .expect("bind_scan should succeed");
         assert_eq!(bound.table(), TABLE);
         assert_eq!(bound.limit(), 5);

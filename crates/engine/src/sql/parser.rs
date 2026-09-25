@@ -3432,13 +3432,27 @@ fn resolve_aggregate_input(
 /// constructor が無いため、クレート外からの到達は現状
 /// [`crate::sql::allowlist::validate_sql`]（SQL テキスト経由）のみ。
 ///
-/// `dummy_equality_flags`（PR #1012 Cursor Bugbot 指摘対応。Issue #935・
-/// WIRE-12・TASK-217）は [`bind_where_predicates`] へそのまま渡す（同関数の
-/// ドキュメント参照）。`core.rs::execute_validated_in_session`（Execute）は
-/// 常に空スライスを渡し、`core.rs::EngineCore::describe_prepared_in_session`
-/// 経由の Prepared Describe（Bind 前・ダミー値束縛済み）に限り
-/// `core.rs::PreparedSql` が保持する事前計算済みフラグを渡す。
+/// 公開 API は常に全値検証を行う（ENUM ラベルの語彙照合を含む。PR #1012
+/// codex-review P1 指摘対応: 検証省略フラグは公開シグネチャへ露出しない）。
+/// Prepared Describe 専用の縮退経路は crate 内限定の
+/// [`bind_aggregate_with_dummy_flags`] が担う。
 pub fn bind_aggregate(
+    stmt: &crate::sql::allowlist::ValidatedAggregate,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundAggregate, SqlSurfaceError> {
+    bind_aggregate_with_dummy_flags(stmt, schema, udfs, &[])
+}
+
+/// [`bind_aggregate`] の本体（crate 内限定。Issue #935・WIRE-12・TASK-217）。
+/// `dummy_equality_flags` は [`bind_where_predicates`] へそのまま渡す（同関数の
+/// ドキュメント参照）。空スライスは全値検証で [`bind_aggregate`] と同一。
+/// 非空のフラグを渡すのは `core.rs::EngineCore::describe_prepared_in_session`
+/// 経由の Prepared Describe（Bind 前・ダミー値束縛済み）だけであり、フラグは
+/// `core.rs::PreparedSql` が Parse 時点の元トークン列から計算した値に限る
+/// （クレート外から任意のフラグを渡して ENUM ラベル検証を省略させる経路を
+/// 作らないため `pub(crate)` に留める。PR #1012 codex-review P1 指摘対応）。
+pub(crate) fn bind_aggregate_with_dummy_flags(
     stmt: &crate::sql::allowlist::ValidatedAggregate,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
@@ -3635,10 +3649,20 @@ fn compile_expr_filter_programs(
 /// ランキング段（`ORDER BY`・`USING PLAN`）・取得モード（`USING MODE`）は関与しない
 /// （[`crate::sql::allowlist::ValidatedScan`] が構造上持たないため）。
 ///
-/// `dummy_equality_flags`（PR #1012 Cursor Bugbot 指摘対応）は
-/// [`bind_where_predicates`] へそのまま渡す（[`bind_aggregate`] と同じ契約。
-/// 同関数のドキュメント参照）。
+/// 公開 API は常に全値検証を行う（[`bind_aggregate`] と同じ方針。Prepared
+/// Describe 専用の縮退経路は crate 内限定の [`bind_scan_with_dummy_flags`]）。
 pub fn bind_scan(
+    stmt: &crate::sql::allowlist::ValidatedScan,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundScan, SqlSurfaceError> {
+    bind_scan_with_dummy_flags(stmt, schema, udfs, &[])
+}
+
+/// [`bind_scan`] の本体（crate 内限定。Issue #935・WIRE-12・TASK-217）。
+/// `dummy_equality_flags` の契約・可視性の理由は
+/// [`bind_aggregate_with_dummy_flags`] と同じ。
+pub(crate) fn bind_scan_with_dummy_flags(
     stmt: &crate::sql::allowlist::ValidatedScan,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
@@ -4683,7 +4707,6 @@ mod tests {
             &scan_stmt,
             &docs_schema(),
             &crate::sql::udf_call::UdfRegistry::default(),
-            &[],
         )
         .expect("bind_scan should succeed");
 
@@ -5330,7 +5353,6 @@ mod tests {
             &agg,
             &docs_schema(),
             &crate::sql::udf_call::UdfRegistry::default(),
-            &[],
         )
     }
 
@@ -5395,7 +5417,6 @@ mod tests {
             &agg,
             &docs_schema(),
             &crate::sql::udf_call::UdfRegistry::default(),
-            &[],
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "22000");
@@ -5463,13 +5484,8 @@ mod tests {
             crate::sql::allowlist::Statement::Aggregate(agg) => agg,
             other => panic!("expected Statement::Aggregate, got {other:?}"),
         };
-        let bound = bind_aggregate(
-            &agg,
-            &schema,
-            &crate::sql::udf_call::UdfRegistry::default(),
-            &[],
-        )
-        .expect("bind should succeed");
+        let bound = bind_aggregate(&agg, &schema, &crate::sql::udf_call::UdfRegistry::default())
+            .expect("bind should succeed");
         // スキーマが実カラム `id`（TEXT）を宣言しているため、疑似列ではなく実カラムへ
         // 束縛される（`resolve_aggregate_input` の優先順位。Issue #56 と同じ規約）。
         assert!(matches!(
