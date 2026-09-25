@@ -62,19 +62,26 @@ parse し、オーバーフロー・小数点混入は `UnsupportedSyntax`（`42
 DDL は全テナント共有のカタログを変更するため、既定拒否（fail-closed）の実行権限
 ゲートを導入した。
 
-- `engine::sql::mode::SessionState::ddl_allowed`（既定 `false`）・`grant_ddl()`
-  （wire-server の認証成功後にのみ呼ばれる想定）。
-- 判定点は `engine::sql::ddl::require_ddl_privilege` の 1 箇所のみ。
-- **判定順序（決定的。`core.rs::EngineCore::execute_sql_in_session`）**:
+- `engine::sql::mode::SessionState::ddl_allowed`（既定 `false`）・`allow_ddl()`
+  （wire-server の認証成功後にのみ呼ばれる想定。`DROP TABLE`〔Issue #902〕と
+  共有する単一のフィールド・セッタ）。
+- 判定点は `engine::sql::ddl::require_ddl_permission` の 1 箇所のみ
+  （`DROP TABLE` と共通）。
+- **判定順序（決定的。`core.rs::EngineCore::parse_tokens` →
+  `execute_parsed_in_session`）**:
   1. 字句解析
   2. 先頭 2 トークンが `CREATE`／`TABLE`（`sql::allowlist::
-     is_create_table_statement`）
-  3. **権限ゲート**（未許可なら即 `42501`）
-  4. 構造・上限の検証（`sql::allowlist::validate_create_table_tokens`）
-  5. 書き込みトランザクション内での存在判定（`sql::ddl::execute_create_table`）
-- 権限ゲートを構造検証・カタログ照会より**前**に置くことで、未許可の主体は
-  構文が正しいか・テーブルが存在するかに関わらず常に同じ `DdlNotPermitted`
-  （`42501`）のみを受け取り、それらの情報を一切観測できない
+     is_create_table_statement`）→ 構造・上限の検証
+     （`sql::allowlist::validate_create_table_tokens`。カタログ照会なし）を
+     経て `ParsedSql::CreateTable` へ束縛（`parse_tokens`）
+  3. **権限ゲート**（`ParsedSql::CreateTable` 分岐の先頭。未許可なら即 `42501`）
+  4. 書き込みトランザクション内での存在判定（`sql::ddl::execute_create_table`）
+- 構造検証（手順 2）はカタログを一切参照しないため、許可形状に一致しない構文は
+  権限の有無に関わらず `42601` になる（構文の正誤自体はテナント・カタログの
+  存在情報ではないためオラクルにならない）。権限ゲート（手順 3）をカタログ照会
+  （手順 4）より**前**に置くことで、許可形状に一致した以降は未許可の主体が
+  対象テーブルの有無に関わらず常に同じ `SqlSurfaceError::InsufficientPrivilege`
+  （`42501`）のみを受け取り、カタログの状態を一切観測できない
   （`crates/engine/tests/sql_create_table.rs::
   create_table_rejects_unauthorized_session_for_garbage_syntax`・
   `create_table_rejects_unauthorized_session_for_existing_table_name` で固定）。
@@ -83,22 +90,25 @@ DDL は全テナント共有のカタログを変更するため、既定拒否�
 `IdConflict`／`DuplicateOperationId` の複数原因を束ねているのと同じ運用。新規
 `ErrorClass` は追加しない）。
 
-### wire-server 側の付与経路: `--ddl-principals`
+### wire-server 側の付与経路: `--ddl-allowed-users`
 
-`--ddl-principals <user[,user...]>`（`wire_server::ddl_permission_opt`）で
-起動時 opt-in する。
+`--ddl-allowed-users <user[,user...]>`（`wire_server::ddl_permission_opt`。
+`DROP TABLE`〔Issue #902〕と共有する単一の CLI フラグ）で起動時 opt-in する。
 
-- 構文検証（カンマ区切り・空要素禁止・空白禁止・重複禁止）は
-  `ddl_permission_opt::parse` が担う。
-- ユーザーストアへの実在確認は `auth::UserStore::with_ddl_principals`
+- 構文検証（カンマ区切り・空要素禁止・重複禁止）は `ddl_permission_opt::parse`
+  が担う。
+- ユーザーストアへの実在確認は `auth::UserStore::with_ddl_allowed_users`
   （未知ユーザーを指す場合は起動失敗。fail-closed）。
 - `handshake.rs` は認証成功直後・`post_auth_loop` 呼び出しより前に
-  `store.is_ddl_principal(&username)` を判定し、真なら `session.grant_ddl()` を
+  `store.is_ddl_allowed(&username)` を判定し、真なら `session.allow_ddl()` を
   呼ぶ。
-- **未指定のサーバーは許可主体が存在せず、全ユーザーの全 `CREATE TABLE` が
-  `42501` になる**（既定 fail-closed）。
-- NoSQL 表層・拡張クエリプロトコルの Parse（`EngineCore::parse_sql`／
-  `ParsedSql`）は本 Issue の対象外のまま（下記「スコープ外」参照）。
+- **未指定のサーバーは許可主体が存在せず、全ユーザーの全 `CREATE TABLE`／
+  `DROP TABLE` が `42501` になる**（既定 fail-closed）。
+- NoSQL 表層は本 Issue の対象外のまま（下記「スコープ外」参照）。拡張クエリ
+  プロトコルの Parse（`EngineCore::parse_sql`／`ParsedSql`）は Issue #902 の
+  `DropTable` variant 追加を機に `CreateTable` variant としても対応済み
+  （`ParsedSql` はセッション非依存の構造検証のみを担い、DDL 実行権限ゲートは
+  `execute_parsed_in_session` が実行時にセッション状態を見て適用する）。
 
 ## 実行本体: 既存 `Storage::create_table` への委譲
 
@@ -151,14 +161,11 @@ PostgreSQL 互換の `CREATE TABLE`（件数なし）。
 
 ## スコープ外・後続 Issue
 
-- `ALTER TABLE ADD COLUMN`／DROP／MODIFY COLUMN・`DROP TABLE`・各種制約
+- `ALTER TABLE ADD COLUMN`／DROP／MODIFY COLUMN・各種制約
   （`NOT NULL`／`DEFAULT`／`PRIMARY KEY`／`UNIQUE`／`CHECK`／`REFERENCES`）・
   `CREATE INDEX`・`VIEW`・NoSQL 表層の DDL op はいずれも別 Issue の担当（本 Issue の
-  権限ゲート（`require_ddl_privilege`・`--ddl-principals`）・`DuplicateColumn`
-  分類の再利用を前提とする）。
-- 拡張クエリプロトコル（Parse/Describe/Execute。Issue #933〜#935）への
-  `CREATE TABLE` 対応は対象外。`EngineCore::parse_sql`／`ParsedSql` はセッション
-  非依存の構造検証のみを担う設計のため、セッション状態を要する DDL 権限ゲートを
-  混ぜず、`execute_sql_in_session`（簡易クエリプロトコル専用）でのみ受理する。
+  権限ゲート（`require_ddl_permission`・`--ddl-allowed-users`）・
+  `DuplicateColumn` 分類の再利用を前提とする）。`DROP TABLE` は Issue #902 で
+  同じ権限ゲートを共有する形で実装済み（`docs/design/drop-table.md` 参照）。
 - `EXPLAIN CREATE TABLE`・`CREATE TABLE` への `USING OPERATION_ID` 付与はいずれも
   許可形状に存在しないため構造的に `42601`。

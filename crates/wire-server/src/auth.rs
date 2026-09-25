@@ -103,12 +103,14 @@ pub struct UserStore {
     /// `None`（このフィールドを参照する `authenticate_scram` は
     /// `ScramSha256` のときにしか呼ばれない）。
     scram_mock_key: Option<[u8; scram::KEY_LEN]>,
-    /// DDL（`CREATE TABLE` 等）実行権限を持つユーザー名の集合（SQL-23・
-    /// TASK-202、Issue #899）。`--ddl-principals`（[`crate::ddl_permission_opt`]）
-    /// による opt-in のみで populate される。既定は空集合（fail-closed。
-    /// 未指定のサーバーでは全 DDL が `42501` になる。[`Self::
-    /// with_ddl_principals`] ドキュメント参照）。
-    ddl_principals: HashSet<String>,
+    /// DDL（`CREATE TABLE`・`DROP TABLE` 等）実行権限を持つ username 集合
+    /// （SQL-23・TASK-202・TASK-203、Issue #899・#902。`--ddl-allowed-users`
+    /// からのみ設定する）。`users` に実在しない username は
+    /// [`UserStore::with_ddl_allowed_users`] が起動時エラーとして拒否するため、
+    /// 本フィールドの要素は必ず `users` のキーの部分集合になる。既定は空集合
+    /// （全 DDL 文が `42501` で拒否される。`sql::ddl::require_ddl_permission`
+    /// ドキュメント参照）。
+    ddl_allowed: HashSet<String>,
 }
 
 /// [`UserStore::load_from_file`] のロード時検証エラー（fail-closed。起動を中断する）。
@@ -324,7 +326,7 @@ impl UserStore {
             users,
             auth_method: AuthMethod::default(),
             scram_mock_key: None,
-            ddl_principals: HashSet::new(),
+            ddl_allowed: HashSet::new(),
         })
     }
 
@@ -383,33 +385,6 @@ impl UserStore {
         Some((record.tenant_id.as_str(), verifier))
     }
 
-    /// DDL（`CREATE TABLE` 等）実行権限を持つユーザー名の集合を設定する
-    /// opt-in（SQL-23・TASK-202、Issue #899。`--ddl-principals`〔`main.rs`〕から
-    /// のみ呼ばれる）。`names` に含まれるユーザー名がロード済みユーザーストアに
-    /// 1 件でも存在しなければ起動失敗として拒否する（fail-closed。存在しない
-    /// ユーザーへ権限を「付与したつもり」の設定ミスを未然に防ぐ）。
-    /// `require_scram` と同じ「消費して返す」ビルダー形。
-    pub fn with_ddl_principals(mut self, names: &[String]) -> Result<Self, String> {
-        for name in names {
-            if !self.users.contains_key(name) {
-                return Err(format!(
-                    "{} references unknown user {name:?} (not present in --users store)",
-                    crate::ddl_permission_opt::FLAG
-                ));
-            }
-        }
-        self.ddl_principals = names.iter().cloned().collect();
-        Ok(self)
-    }
-
-    /// `username` が DDL 実行権限を付与された主体か（SQL-23・TASK-202、
-    /// Issue #899）。`handshake.rs` が認証成功後にのみ参照し、
-    /// `engine::sql::mode::SessionState::grant_ddl` を呼ぶかどうかの唯一の
-    /// 判定点とする（`--ddl-principals` 未指定なら常に `false`）。
-    pub fn is_ddl_principal(&self, username: &str) -> bool {
-        self.ddl_principals.contains(username)
-    }
-
     /// ロード済みレコード数。ユーザー名・テナント ID 等の存在情報は含まない
     /// （wire 経路からは呼ばない。テストのフィクスチャ診断専用。Issue #172）。
     pub fn len(&self) -> usize {
@@ -419,6 +394,35 @@ impl UserStore {
     /// レコードが 1 件も無いか（`len() == 0`）。`clippy::len_without_is_empty` 対応。
     pub fn is_empty(&self) -> bool {
         self.users.is_empty()
+    }
+
+    /// DDL 実行権限を持つ username 集合を設定する opt-in（`--ddl-allowed-users`
+    /// からのみ呼ばれる。Issue #902・SQL-23・TASK-203）。`--search-engine` 等の
+    /// 他の起動時 opt-in と同じく、起動後に変更できない構成値として一度だけ
+    /// 適用する想定（`main.rs` が重複指定自体は CLI 引数側で拒否する）。
+    ///
+    /// `usernames` に `self.users`（`--users` で読み込んだユーザーストア）へ
+    /// 実在しない username が含まれる場合は起動失敗として扱う（fail-closed。
+    /// typo で意図した username への権限付与が黙って無効になる事故を防ぐ。
+    /// `require_scram` の「欠落レコードは起動失敗」と同じ設計判断）。
+    pub fn with_ddl_allowed_users(mut self, usernames: &[String]) -> Result<Self, String> {
+        for username in usernames {
+            if !self.users.contains_key(username) {
+                return Err(format!(
+                    "{FLAG} lists unknown username {username:?} (not present in --users)",
+                    FLAG = crate::ddl_permission_opt::FLAG
+                ));
+            }
+        }
+        self.ddl_allowed = usernames.iter().cloned().collect();
+        Ok(self)
+    }
+
+    /// `username` が DDL 実行権限を持つか（Issue #902）。`handshake.rs` が
+    /// 認証成功直後に 1 回だけ参照し、真の場合に限り
+    /// `engine::sql::mode::SessionState::allow_ddl` を呼ぶ。
+    pub fn is_ddl_allowed(&self, username: &str) -> bool {
+        self.ddl_allowed.contains(username)
     }
 
     #[cfg(test)]
@@ -438,7 +442,7 @@ impl UserStore {
             users,
             auth_method: AuthMethod::default(),
             scram_mock_key: None,
-            ddl_principals: HashSet::new(),
+            ddl_allowed: HashSet::new(),
         }
     }
 }

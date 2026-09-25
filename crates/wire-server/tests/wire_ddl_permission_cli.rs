@@ -1,15 +1,15 @@
-//! `--ddl-principals` opt-in（SQL-23・TASK-202、Issue #899）をバイナリ子プロセス
+//! `--ddl-allowed-users` opt-in（SQL-23・TASK-203、Issue #902）をバイナリ子プロセス
 //! として起動し、CLI 引数の受理・拒否（fail-closed）を外形的に検証する結合
 //! テスト。`wire_durability_cli.rs`・`wire_search_engine_cli.rs` と同じ流儀
 //! （実バイナリを `Command::new(env!("CARGO_BIN_EXE_wire-server"))` で起動し、
 //! stderr の `listening on` 行または非 0 終了・エラーメッセージを外形的に
 //! 確認する）。
 //!
-//! - R1: 未知ユーザーを指す `--ddl-principals` は非 0 終了・stderr にフラグ名を
+//! - R1: 未知ユーザーを指す `--ddl-allowed-users` は非 0 終了・stderr にフラグ名を
 //!   含むこと（fail-closed。設定ミスを起動時に検出する）
 //! - R2: 値の欠落は非 0 終了・stderr にフラグ名を含むこと
 //! - R3: 重複指定は非 0 終了・stderr に "specified more than once" を含むこと
-//! - R4: ユーザーストアに実在するユーザーを指す `--ddl-principals` は
+//! - R4: ユーザーストアに実在するユーザーを指す `--ddl-allowed-users` は
 //!   `listening on` に到達すること（起動を妨げない）
 //!
 //! wire フレーミング越しの実際の権限ゲート挙動（`CommandComplete`／
@@ -159,30 +159,38 @@ fn assert_startup_rejected(extra_args: &[&str], expect_substr: &str) {
 }
 
 #[test]
-fn ddl_principals_rejects_unknown_user() {
-    assert_startup_rejected(&["--ddl-principals", "carol"], "--ddl-principals");
+fn ddl_allowed_users_rejects_unknown_user() {
+    assert_startup_rejected(&["--ddl-allowed-users", "carol"], "--ddl-allowed-users");
 }
 
 #[test]
-fn ddl_principals_rejects_missing_value() {
-    assert_startup_rejected(&["--ddl-principals"], "--ddl-principals");
+fn ddl_allowed_users_rejects_missing_value() {
+    assert_startup_rejected(&["--ddl-allowed-users"], "--ddl-allowed-users");
 }
 
 #[test]
-fn ddl_principals_rejects_duplicate_flag() {
+fn ddl_allowed_users_rejects_duplicate_flag() {
     assert_startup_rejected(
-        &["--ddl-principals", "alice", "--ddl-principals", "alice"],
+        &[
+            "--ddl-allowed-users",
+            "alice",
+            "--ddl-allowed-users",
+            "alice",
+        ],
         "specified more than once",
     );
 }
 
 #[test]
-fn ddl_principals_rejects_empty_element() {
-    assert_startup_rejected(&["--ddl-principals", "alice,,bob"], "--ddl-principals");
+fn ddl_allowed_users_rejects_empty_element() {
+    assert_startup_rejected(
+        &["--ddl-allowed-users", "alice,,bob"],
+        "--ddl-allowed-users",
+    );
 }
 
 #[test]
-fn ddl_principals_accepts_known_user_and_reaches_listening() {
+fn ddl_allowed_users_accepts_known_user_and_reaches_listening() {
     let fixture = TempFixtureDir::new("accept");
     let users_path = fixture.users_path_str();
     write_user_store_with_alice(&users_path);
@@ -196,7 +204,7 @@ fn ddl_principals_accepts_known_user_and_reaches_listening() {
             &db_path,
             "--bind",
             "127.0.0.1:0",
-            "--ddl-principals",
+            "--ddl-allowed-users",
             "alice",
         ])
         .stderr(Stdio::piped())
@@ -205,7 +213,7 @@ fn ddl_principals_accepts_known_user_and_reaches_listening() {
 
     assert!(
         wait_for_listening(&mut child),
-        "expected listening on with valid --ddl-principals"
+        "expected listening on with valid --ddl-allowed-users"
     );
     let _ = child.kill();
     let _ = child.wait();

@@ -3,12 +3,14 @@
 //! TASK-202・`docs/spec/04-behavior/sql-surface.md` SQL-23・
 //! `docs/spec/04-behavior/table-model.md` TABLE-1・TABLE-2・TABLE-4・TABLE-6。
 //!
-//! `EngineCore::execute_sql_in_session`（先頭 2 トークン `CREATE TABLE` の
-//! 覗き見判定 → `sql::ddl::require_ddl_privilege`〔DDL 実行権限ゲート〕 →
-//! `sql::allowlist::validate_create_table_tokens`〔構造検証〕 →
-//! `sql::ddl::execute_create_table`〔`catalog::Storage::create_table` への
-//! 委譲〕）を production 経路として検証する。`truncate_table.rs` と同じ流儀
-//! （実 `Storage` ＋ `CpuScalarProvider`、`unique_db_path`／`CleanupGuard`）。
+//! `EngineCore::execute_sql_in_session`（`parse_tokens` による `CREATE TABLE`
+//! の構造検証〔`sql::allowlist::validate_create_table_tokens`〕→
+//! `execute_parsed_in_session` の `ParsedSql::CreateTable` 分岐が
+//! `sql::ddl::require_ddl_permission`〔DDL 実行権限ゲート。`DROP TABLE` と共有
+//! する単一の判定点〕→ `sql::ddl::execute_create_table`〔`catalog::Storage::
+//! create_table` への委譲〕の順に適用する経路）を production 経路として検証
+//! する。`truncate_table.rs` と同じ流儀（実 `Storage` ＋ `CpuScalarProvider`、
+//! `unique_db_path`／`CleanupGuard`）。
 
 use engine::catalog::ColumnType;
 use engine::core::EngineCore;
@@ -47,7 +49,7 @@ fn ctx(tenant: &str) -> PolicyContext {
 
 fn granted_session() -> SessionState {
     let mut session = SessionState::default();
-    session.grant_ddl();
+    session.allow_ddl();
     session
 }
 
@@ -216,9 +218,15 @@ fn create_table_rejects_unauthorized_session_for_valid_syntax() {
     assert!(matches!(outcome, SqlOutcome::CreateTable(_)));
 }
 
-/// 未許可の主体は、構文が正しいかどうかに関わらず同じ `42501` のみを受け取り、
-/// カタログ状態・構文詳細を観測できない（fail-closed。`sql::ddl` モジュール
-/// ドキュメント参照）。
+/// 未許可の主体は、対象テーブルの有無に関わらず同じ `42501` のみを受け取り、
+/// カタログ状態を観測できない（fail-closed。`sql::ddl` モジュールドキュメント
+/// 参照）。一方、構造検証（カタログ照会なし）は `DROP TABLE`（Issue #902）と
+/// 同じく権限ゲートより**前**に通す設計判断のため、そもそも許可形状に一致しない
+/// 構文（`CREATE`／`TABLE` の 2 トークンにも満たない・カタログを一切参照しない
+/// 壊れ方）は権限の有無に関わらず `42601` になる（構文の正誤自体はカタログの
+/// 存在情報ではないためオラクルにならない。`parse_tokens`→
+/// `execute_parsed_in_session` の判定順序は `docs/design/sql-create-table.md`
+/// 参照）。
 #[test]
 fn create_table_rejects_unauthorized_session_for_garbage_syntax() {
     let (core, path) = new_core("create-unauthorized-garbage");
@@ -231,8 +239,9 @@ fn create_table_rejects_unauthorized_session_for_garbage_syntax() {
         .expect_err("unauthorized session must be denied even for malformed syntax");
     assert_eq!(
         err.wire_code(),
-        "42501",
-        "unauthorized session must see 42501, not a syntax error"
+        "42601",
+        "malformed syntax is rejected by structural validation before the DDL permission gate \
+         (no catalog access occurs at either stage, so this is not an existence oracle)"
     );
 }
 

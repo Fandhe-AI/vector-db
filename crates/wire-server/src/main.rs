@@ -13,6 +13,7 @@
 //! [--hnsw-acorn-max-visible-ratio <num>/<den>]
 //! [--hnsw-sparse-visited-max <N>]
 //! [--auth-method cleartext|scram-sha-256] [--scram-mock-key-file <path>]
+//! [--ddl-allowed-users <user1>[,<user2>...]]
 //! [--fault-inject post-commit-panic]`
 //! （既定 bind: `127.0.0.1:5432`）。`--db` は必須（省略時は fail-closed で
 //! 非 0 終了。匿名・揮発 DB の暗黙生成はしない。TASK-73・WIRE-1）。
@@ -93,6 +94,17 @@
 //! `search_engine_kind()` が構造的に `None` になり `EXPLAIN` の `engine:` 行が
 //! divergent するため使わない。`open_engine_core` のドキュメント参照）。
 //! `EXPLAIN` への durability 設定の露出は対象外。
+//!
+//! `--ddl-allowed-users`（Issue #902・SQL-23・TASK-203。`DROP TABLE` の DDL
+//! 実行権限ゲート `engine::sql::ddl::require_ddl_permission` へ untrusted な
+//! CLI 文字列から到達する唯一の入口）: カンマ区切りの username 列挙を
+//! `--users` で読み込んだユーザーストアへ照合し、認証成功後の handshake が
+//! それらの username に限り接続の `SessionState::allow_ddl` を呼ぶ（他の
+//! opt-in と同じく起動後に変更できない構成値。値欠落・空要素・重複要素・
+//! 未知 username・フラグの重複指定はいずれも fail-closed で起動エラー）。
+//! 未指定は DDL 実行権限を持つユーザーが 0 人のまま（全 DDL 文が `42501`
+//! で拒否される既定）。値の解決は `ddl_permission_opt::parse`・
+//! `UserStore::with_ddl_allowed_users` に一本化する。
 //!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
@@ -177,7 +189,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut acorn_max_visible_ratio_raw: Option<String> = None;
     let mut sparse_visited_max_raw: Option<String> = None;
     let mut durability_raw: Option<String> = None;
-    let mut ddl_principals_raw: Option<String> = None;
+    let mut ddl_allowed_users_raw: Option<String> = None;
     let mut auth_method_raw: Option<String> = None;
     let mut scram_mock_key_file_raw: Option<PathBuf> = None;
     // Issue #705（テスト専用・feature `fault-injection` 限定）。feature 無効
@@ -360,22 +372,22 @@ fn run_server(args: &[String]) -> ExitCode {
             wire_server::ddl_permission_opt::FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     eprintln!(
-                        "wire-server: {} requires a comma-separated username list",
+                        "wire-server: {} requires a comma-separated list of usernames",
                         wire_server::ddl_permission_opt::FLAG
                     );
                     return ExitCode::FAILURE;
                 };
-                // Issue #899: 起動後に変更できない構成値のため、
-                // `--search-engine`（D6）と同じ理由で 2 回目以降の指定を
-                // fail-closed に拒否する（last-wins にしない）。
-                if ddl_principals_raw.is_some() {
+                // Issue #902: 起動後に変更できない構成値のため、他の閉じた
+                // 語彙フラグ（`--search-engine` 等）と同じ理由で 2 回目以降の
+                // 指定を fail-closed に拒否する（last-wins にしない）。
+                if ddl_allowed_users_raw.is_some() {
                     eprintln!(
                         "wire-server: {} specified more than once",
                         wire_server::ddl_permission_opt::FLAG
                     );
                     return ExitCode::FAILURE;
                 }
-                ddl_principals_raw = Some(v.clone());
+                ddl_allowed_users_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::auth_method_opt::FLAG => {
@@ -518,22 +530,6 @@ fn run_server(args: &[String]) -> ExitCode {
             eprintln!(
                 "wire-server: invalid {}: {e}",
                 wire_server::durability_opt::FLAG
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Issue #899: `--search-engine`／`--durability` と同じく bind・ユーザー
-    // ストア読込より前に構文だけを決着させる（fail-closed）。個々のユーザー名が
-    // ユーザーストアに実在するかは、ストア読込後に `UserStore::
-    // with_ddl_principals` で検証する（このストアが読み込まれる前には判定
-    // できないため）。
-    let ddl_principals = match resolve_ddl_principals(ddl_principals_raw.as_deref()) {
-        Ok(names) => names,
-        Err(e) => {
-            eprintln!(
-                "wire-server: invalid {}: {e}",
-                wire_server::ddl_permission_opt::FLAG
             );
             return ExitCode::FAILURE;
         }
@@ -750,18 +746,32 @@ fn run_server(args: &[String]) -> ExitCode {
     } else {
         store
     };
-    // Issue #899: `--ddl-principals` に列挙されたユーザー名がロード済みユーザー
-    // ストアに実在することをここで確定させる（fail-closed。未知ユーザーへの
-    // 誤設定を起動時に検出する）。未指定（既定）なら許可主体なしのまま不変。
-    let store = match ddl_principals {
+    // Issue #902（SQL-23・TASK-203）: `--search-engine`／`--durability` と同じく
+    // 起動後に変更できない構成値のため、bind・listen より前に確定させる
+    // （fail-closed）。未指定は `ddl_allowed_users_raw == None` のままとなり、
+    // `UserStore::with_ddl_allowed_users` を呼ばない（既定＝DDL 実行権限を
+    // 持つユーザーが 0 人。`sql::ddl::require_ddl_permission` の既定拒否）。
+    let store = match ddl_allowed_users_raw.as_deref() {
         None => store,
-        Some(names) => match store.with_ddl_principals(&names) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("wire-server: {e}");
-                return ExitCode::FAILURE;
+        Some(raw) => {
+            let usernames = match wire_server::ddl_permission_opt::parse(raw) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!(
+                        "wire-server: invalid {}: {e}",
+                        wire_server::ddl_permission_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            match store.with_ddl_allowed_users(&usernames) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("wire-server: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
-        },
+        }
     };
     let store = Arc::new(store);
 
@@ -1037,17 +1047,6 @@ fn resolve_durability(raw: Option<&str>) -> Result<engine::storage::WriteDurabil
     match raw {
         None => Ok(engine::storage::WriteDurability::default()),
         Some(raw) => wire_server::durability_opt::parse(raw),
-    }
-}
-
-/// `--ddl-principals`（Issue #899）の値（未指定は `None`＝許可主体なし）から
-/// ユーザー名の一覧を解決する。構文検証のみ（`wire_server::ddl_permission_opt::
-/// parse`）で、ユーザーストアに対する実在確認は呼び出し元（`run_server`）が
-/// `UserStore::with_ddl_principals` で行う。
-fn resolve_ddl_principals(raw: Option<&str>) -> Result<Option<Vec<String>>, String> {
-    match raw {
-        None => Ok(None),
-        Some(raw) => wire_server::ddl_permission_opt::parse(raw).map(Some),
     }
 }
 

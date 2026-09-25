@@ -1598,11 +1598,13 @@ impl Storage {
     ///
     /// 安全性: `create_table`／`alter_table_add_column` と同じく
     /// [`crate::policy::PolicyContext`] を取らない生の DDL であり、全テナントの行を
-    /// 不可逆に削除する。`CREATE TABLE` は SQL-23・TASK-202（Issue #899）で DDL
-    /// 実行権限ゲート（`sql::ddl::require_ddl_privilege`・`--ddl-principals`）を
-    /// 経て untrusted 経路（SQL 表層・wire-server）へ配線済みだが、本メソッド
-    /// （`DROP TABLE` 相当）はそのゲートを再利用する形でもまだ配線していない
-    /// （`DROP TABLE` 文は引き続き許可リスト外で `42601`。配線は別 Issue の担当）。
+    /// 不可逆に削除する。SQL 表層（`DROP TABLE <table>`。SQL-23・TASK-203、
+    /// Issue #902）は `crate::sql::ddl::require_ddl_permission`（接続単位の
+    /// DDL 実行権限ゲート。既定拒否・`42501`。`CREATE TABLE`〔SQL-23・
+    /// TASK-202、Issue #899〕と共有する単一の判定点）を通過したセッションに
+    /// 限り `crate::sql::ddl::execute_drop_table` 経由で本メソッドへ到達する
+    /// （wire-server 側の付与経路は `crate::sql::mode::SessionState::allow_ddl`
+    /// ドキュメント参照）。
     ///
     /// 存在しないテーブル名は `Err(CatalogError::TableNotFound)`、識別子として不正な
     /// 名前は `Err(CatalogError::Invalid)`（fail-closed。冪等に `Ok` へ丸めない）。

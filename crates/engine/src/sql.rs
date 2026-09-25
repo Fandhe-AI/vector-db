@@ -37,6 +37,8 @@
 //! - [`mode`][]: 取得モード（`recall`／`precision`）の優先順位解決・セッション状態
 //!   （TASK-161・SQL-12）
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
+//! - [`ddl`][]: `DROP TABLE`（SQL-23・TASK-203、Issue #902）の DDL 実行権限ゲート
+//!   （`require_ddl_permission`。将来の DDL 全般が通る単一の判定点）と実行本体
 //! - [`using_plan`][]: `USING PLAN('<query>')` 文末句（`ORDER BY` の代替。SQL-5）の
 //!   LLM クエリ展開結果 → 既存 C4 ハイブリッド実行形への束縛（TASK-77）
 //! - [`aggregate`][]: 集計関数のみを結果列とする `GROUP BY` なし単一行 SELECT の
@@ -258,9 +260,9 @@ pub enum SqlOutcome {
     Update(exec::UpdateOutcome),
     /// `CREATE TABLE <table> (<col> <type>[, ...]) [;]`（SQL-23・TASK-85・
     /// TASK-202、Issue #899）がセッション経由の実行経路
-    /// （[`crate::core::EngineCore::execute_sql_in_session`]）で成功したことを
-    /// 示す応答。実行権限の判定・実行本体は [`ddl::require_ddl_privilege`]・
-    /// [`ddl::execute_create_table`] に委譲しており、本 variant はその
+    /// （`crate::core::EngineCore::execute_parsed_in_session`）で成功したことを
+    /// 示す応答。DDL 実行権限ゲート（[`ddl::require_ddl_permission`]）を通過
+    /// したセッションに限り到達する。本 variant はその
     /// [`ddl::CreateTableOutcome`] をそのまま運ぶ薄いラッパー（`Insert`・
     /// `Truncate`・`Delete`・`Update` と同じ設計）。
     ///
@@ -269,4 +271,16 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     CreateTable(ddl::CreateTableOutcome),
+    /// `DROP TABLE <table>`（SQL-23・TASK-203、Issue #902）がセッション経由の
+    /// 実行経路（`crate::core::EngineCore::execute_parsed_in_session`）で
+    /// 成功したことを示す応答。DDL 実行権限ゲート（`ddl::require_ddl_permission`）を
+    /// 通過したセッションに限り到達する。本 variant はその [`ddl::DropTableOutcome`]
+    /// をそのまま運ぶ薄いラッパー（`Insert`・`Truncate`・`Delete`・`Update` と
+    /// 同じ設計）。
+    ///
+    /// **BREAKING CHANGE**（Issue #902）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コード（`crate::core::EngineCore`・
+    /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
+    /// を網羅的にマッチするコードがあれば追随が必要。
+    DropTable(ddl::DropTableOutcome),
 }

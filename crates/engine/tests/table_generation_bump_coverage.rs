@@ -90,17 +90,18 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 再度追随（旧: 1540／1619）。PR #1007（Issue #882・REAL/DOUBLE 列型）・
     // Issue #885（NUMERIC / DECIMAL 列型）・Issue #887（UUID 列型）の base
     // 取り込みマージ・Issue #881（INTEGER／BIGINT 列型）マージ取り込みで
-    // `catalog.rs` に行が追加され、再度追随
-    // （旧: 1567／1591／1639／1653／1677）。Issue #899（CREATE TABLE 構文）で
-    // `catalog.rs` 冒頭側のドキュメンテーションコメントが増え、再度追随
-    // （旧: 1701／1780）。
-    ("catalog.rs", 1709),
+    // `catalog.rs` に行が追加され、再度追随（旧: 1567／1591／1639／1653／
+    // 1677）。Issue #899（CREATE TABLE 構文）・Issue #902（`DROP TABLE` の
+    // DDL 実行権限ゲート）の base 取り込みマージで `catalog.rs` 冒頭側・
+    // `Storage::drop_table` のドキュメンテーションコメントが増え、以下 2 件の
+    // 行番号がさらに移動したための追随（旧: 1701／1705／1780）。
+    ("catalog.rs", 1711),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（`alter_enum_type_add_value` の commit 呼び出しは
     // 依存テーブルの世代を明示的に進行させるため ALLOWLIST 対象外のまま）。
-    ("catalog.rs", 1788),
+    ("catalog.rs", 1790),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

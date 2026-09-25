@@ -89,8 +89,8 @@ define_error_classes! {
     /// `POST /v1/session/close` の再送）。
     AuthRequired => ("28000", "AUTH_REQUIRED"),
     /// テナント帰属不一致（`42501`）。[`crate::tenant::TenantWriteError::Forbidden`]
-    /// の写像。SQL-23・TASK-202（Issue #899）の DDL 実行権限不足
-    /// （[`crate::sql::allowlist::SqlSurfaceError::DdlNotPermitted`]）も
+    /// の写像。SQL-23・TASK-202・TASK-203（Issue #899・#902）の DDL 実行権限
+    /// 不足（[`crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege`]）も
     /// 同分類へ写像する（`UniqueViolation` が複数原因を束ねているのと同じ運用）。
     ForbiddenTenantMismatch => ("42501", "FORBIDDEN_TENANT_MISMATCH"),
     /// 参照したテーブルがカタログ未存在（`42P01`）。

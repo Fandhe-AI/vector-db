@@ -1229,6 +1229,30 @@ pub enum ParsedSql {
     Delete(crate::sql::allowlist::DeleteStatement),
     /// `UPDATE`（単一行・`id` 完全一致形／述語形。SQL-17・SQL-19）。
     Update(crate::sql::allowlist::ValidatedUpdateForm),
+    /// `DROP TABLE <table>`（SQL-23・TASK-203、Issue #902）。DDL 実行権限ゲート
+    /// （`sql::ddl::require_ddl_permission`）の判定は
+    /// `EngineCore::execute_parsed_in_session` が担い、`validate_drop_table_tokens`
+    /// 自体はカタログ照会を一切行わない（`ValidatedDropTable` ドキュメント参照）。
+    ///
+    /// **BREAKING CHANGE**（Issue #902）: 本 variant の追加により `ParsedSql` を
+    /// 網羅的にマッチする既存コード（`crate::core::EngineCore`）はすべて
+    /// 更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードがあれば
+    /// 追随が必要。
+    DropTable(crate::sql::allowlist::ValidatedDropTable),
+    /// `CREATE TABLE <table> (...)`（SQL-23・TASK-85・TASK-202、Issue #899）。
+    /// DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）の判定は
+    /// [`DropTable`](Self::DropTable) と同じく `EngineCore::
+    /// execute_parsed_in_session` が担い、`validate_create_table_tokens` 自体は
+    /// カタログ照会（テーブル名の重複判定）を一切行わない
+    /// （`ValidatedCreateTable` ドキュメント参照。既存名との衝突判定は
+    /// `sql::ddl::execute_create_table` が単一の書き込みトランザクション内で
+    /// TOCTOU なく行う）。
+    ///
+    /// **BREAKING CHANGE**（Issue #899）: 本 variant の追加により `ParsedSql` を
+    /// 網羅的にマッチする既存コード（`crate::core::EngineCore`）はすべて
+    /// 更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードがあれば
+    /// 追随が必要。
+    CreateTable(crate::sql::allowlist::ValidatedCreateTable),
 }
 
 /// [`EngineCore::parse_sql_prepared`] の結果（Issue #935・WIRE-12・TASK-217）。
@@ -2096,7 +2120,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
-                    | crate::sql::SqlOutcome::CreateTable(_) => {
+                    | crate::sql::SqlOutcome::CreateTable(_)
+                    | crate::sql::SqlOutcome::DropTable(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -2124,7 +2149,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
-                    | crate::sql::SqlOutcome::CreateTable(_) => {
+                    | crate::sql::SqlOutcome::CreateTable(_)
+                    | crate::sql::SqlOutcome::DropTable(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -2149,7 +2175,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
-                    | crate::sql::SqlOutcome::CreateTable(_) => {
+                    | crate::sql::SqlOutcome::CreateTable(_)
+                    | crate::sql::SqlOutcome::DropTable(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -2303,6 +2330,28 @@ impl EngineCore {
                 self.ledger_mode,
             )?;
             return Ok(ParsedSql::Update(stmt));
+        }
+
+        let is_drop_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DROP")
+        );
+        if is_drop_statement {
+            // `validate_drop_table_tokens` はカタログ照会を一切行わない
+            // （DDL 実行権限ゲートを存在確認より前に通す契約。`ValidatedDropTable`
+            // ドキュメント参照）。権限判定・実行本体は
+            // `execute_parsed_in_session` の `DropTable` 分岐が担う。
+            let stmt = crate::sql::allowlist::validate_drop_table_tokens(&tokens)?;
+            return Ok(ParsedSql::DropTable(stmt));
+        }
+
+        // `DropTable` と同じ設計（Issue #899・#902 で DDL 実行権限ゲートの判定
+        // 順序を統一）: `validate_create_table_tokens` はカタログ照会（テーブル名
+        // の重複判定）を一切行わない。権限判定・実行本体は
+        // `execute_parsed_in_session` の `CreateTable` 分岐が担う。
+        if crate::sql::allowlist::is_create_table_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_table_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateTable(stmt));
         }
 
         let stmt = crate::sql::allowlist::validate_sql_tokens(&tokens, &self.storage)?;
@@ -2477,6 +2526,27 @@ impl EngineCore {
                 let outcome = self.execute_predicate_update_form(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::Update(outcome))
             }
+            // SQL-23・TASK-203（Issue #902）: DDL 実行権限ゲート
+            // （`sql::ddl::require_ddl_permission`）を、カタログ照会（対象
+            // テーブルの存在確認）を含む `execute_drop_table` より必ず先に
+            // 通す（`SqlSurfaceError::InsufficientPrivilege` ドキュメント
+            // 参照）。`ctx`（テナント境界）は `Storage::drop_table` が取らない
+            // ため未使用のまま——`DROP TABLE` はテナントスコープの操作ではない。
+            ParsedSql::DropTable(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_drop_table(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::DropTable(outcome))
+            }
+            // SQL-23・TASK-202（Issue #899）: `DropTable` と同じ単一の DDL 実行
+            // 権限ゲート（`sql::ddl::require_ddl_permission`）を、カタログ照会
+            // （テーブル名の重複判定）を含む `execute_create_table` より必ず先に
+            // 通す。`ctx`（テナント境界）は `Storage::create_table` が取らない
+            // ため未使用のまま——`CREATE TABLE` はテナントスコープの操作ではない。
+            ParsedSql::CreateTable(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_create_table(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::CreateTable(outcome))
+            }
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
             }
@@ -2489,18 +2559,18 @@ impl EngineCore {
     /// による分割の前後でこの関数自体の判定順序・エラー契約・実行結果は不変
     /// （両メソッドの移設元コメント参照）。
     ///
-    /// **`CREATE TABLE`（SQL-23・TASK-85・TASK-202、Issue #899）は本メソッド
-    /// でのみ受理する**（拡張クエリプロトコルの Parse・[`Self::parse_sql`]・
-    /// [`ParsedSql`] は対象外のまま——DDL 実行権限ゲートはセッション状態を要する
-    /// のに対し、`parse_sql`／`ParsedSql` は接続横断で共有する構造検証のみを
-    /// 担う設計〔セッション非依存〕であり、両者を混ぜない）。先頭 2 トークンが
-    /// `CREATE`／`TABLE`（[`crate::sql::allowlist::is_create_table_statement`]）
-    /// と判定された場合に限り、字句解析の直後・**構造検証よりも前**に
-    /// [`crate::sql::ddl::require_ddl_privilege`] で権限ゲートを適用する
-    /// （fail-closed。未許可の主体は構文が正しいか・テーブルが存在するかに
-    /// 関わらず常に `DdlNotPermitted`〔`42501`〕のみを受け取り、それらの情報を
-    /// 一切観測できない。`sql::ddl` モジュールドキュメント参照）。それ以外の
-    /// 文（`CREATE FUNCTION` を含む）は従来どおり [`Self::parse_tokens`] へ渡す。
+    /// `CREATE TABLE`（SQL-23・TASK-85・TASK-202、Issue #899）・`DROP TABLE`
+    /// （SQL-23・TASK-203、Issue #902）は [`Self::parse_tokens`] が
+    /// [`ParsedSql::CreateTable`]／[`ParsedSql::DropTable`] へ構造検証のみ
+    /// （カタログ照会なし）で束縛し、DDL 実行権限ゲート
+    /// （[`crate::sql::ddl::require_ddl_permission`]）はカタログ照会を含む
+    /// 実行本体より必ず先に [`Self::execute_parsed_in_session`] が適用する
+    /// （fail-closed。構造検証はカタログを一切参照しないため許可形状に一致
+    /// しない構文は権限の有無に関わらず `42601` になるが〔構文の正誤自体は
+    /// テナント・カタログの存在情報ではないためオラクルにならない〕、許可
+    /// 形状に一致した以降は未許可の主体が対象テーブルの有無を問わず常に
+    /// `InsufficientPrivilege`〔`42501`〕のみを受け取り、カタログの状態を
+    /// 一切観測できない。`sql::ddl` モジュールドキュメント参照）。
     pub fn execute_sql_in_session(
         &self,
         ctx: &PolicyContext,
@@ -2508,12 +2578,6 @@ impl EngineCore {
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = crate::sql::lexer::tokenize(sql)?;
-        if crate::sql::allowlist::is_create_table_statement(&tokens) {
-            crate::sql::ddl::require_ddl_privilege(session)?;
-            let validated = crate::sql::allowlist::validate_create_table_tokens(&tokens)?;
-            let outcome = crate::sql::ddl::execute_create_table(&self.storage, &validated)?;
-            return Ok(crate::sql::SqlOutcome::CreateTable(outcome));
-        }
         let parsed = self.parse_tokens(tokens)?;
         self.execute_parsed_in_session(ctx, session, &parsed)
     }
@@ -2581,6 +2645,14 @@ impl EngineCore {
                 }
             }
             ParsedSql::Truncate(_) => Ok(None),
+            // `DROP TABLE`（Issue #902）は `CommandComplete` のみを返す DDL の
+            // ため、`Truncate` と同じく結果列を持たない。DDL 実行権限判定・
+            // 実際の削除は一切行わない（Describe は本体を実行しない契約）。
+            ParsedSql::DropTable(_) => Ok(None),
+            // `CREATE TABLE`（Issue #899）も同じく `CommandComplete` のみを返す
+            // DDL のため結果列を持たない。DDL 実行権限判定・カタログへの反映は
+            // 一切行わない（Describe は本体を実行しない契約）。
+            ParsedSql::CreateTable(_) => Ok(None),
             ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
                 match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {

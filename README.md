@@ -70,7 +70,7 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
   [--hnsw-acorn-max-visible-ratio <num>/<den>] \
   [--hnsw-sparse-visited-max <N>] \
   [--durability immediate|none] \
-  [--ddl-principals <user[,user...]>] \
+  [--ddl-allowed-users <user1>[,<user2>...]] \
   [--auth-method cleartext|scram-sha-256] \
   [--scram-mock-key-file <path>]
 ```
@@ -206,18 +206,6 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 `WARNING` 行を 1 行出します（`immediate`・未指定では出力されません）。
 `EXPLAIN` への durability 設定の露出は対象外です。
 
-`--ddl-principals`（SQL-23・TASK-202、Issue #899）は `CREATE TABLE` 等の DDL
-実行権限を持つユーザー名（`--users` ユーザーストアの username）をカンマ区切りで
-列挙する opt-in CLI 引数です。未指定（既定）では許可主体が存在せず、**全ユーザーの
-`CREATE TABLE` が `42501`（permission denied）で拒否されます**（fail-closed。
-DDL は全テナント共有のカタログを変更するため既定で無効化されています）。値の
-構文（空要素・空白・重複の禁止）はここで検証し、列挙したユーザー名が `--users`
-ユーザーストアに実在しない場合は起動時に拒否されます（設定ミスを起動時に検出する
-ため）。2 回目以降の重複指定も fail-closed で起動エラーになります（他の opt-in
-CLI 引数と同方針）。許可された主体は、認証済みの接続内で `CREATE TABLE
-<table> (<col> TEXT|VECTOR(<N>)[, ...])` を実行できます（詳細な構文・権限判定
-順序は `docs/design/sql-create-table.md` 参照）。
-
 `--auth-method`（Issue #940・WIRE-18・TASK-222）は SQL 表層の SASL 認証方式を
 選ぶ opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス
 起動時にのみ明示指定する注入点」で、未指定（または `cleartext`）は現行どおり
@@ -258,6 +246,20 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
   ユーザーストア更新をまたいで同じファイルを使い続けてください（毎回
   生成し直す・ユーザーストアと同じ内容から導出する、といった運用は
   未知ユーザーの存在を推測させる情報漏えいに繋がるため避けてください）。
+
+`--ddl-allowed-users`（SQL-23・TASK-202・TASK-203、Issue #899・#902）は
+`CREATE TABLE`・`DROP TABLE` の DDL 実行権限を持つ username をカンマ区切りで
+列挙する opt-in CLI 引数です。`--search-engine`／`--durability` と同型の
+「プロセス起動時にのみ明示指定する注入点」で、未指定は DDL 実行権限を持つ
+ユーザーが 0 人のまま（**全ユーザーの `CREATE TABLE`／`DROP TABLE` が
+`42501`（permission denied）で拒否されます**。fail-closed。DDL は全テナント
+共有のカタログを変更するため既定で無効化されています）。列挙した username は
+`--users` で読み込んだユーザーストアへ実在する必要があり、未知の
+username・空要素・重複要素・フラグの重複指定はいずれも fail-closed で
+起動エラーになります。認証成功後の接続に対してのみ、対応する username が
+一覧に含まれる場合に限り DDL 実行権限が付与されます（テナント境界とは別軸の
+権限で、`RLS` の判定は変更しません。詳細な構文・権限判定順序は
+`docs/design/sql-create-table.md`・`docs/design/drop-table.md` 参照）。
 
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 

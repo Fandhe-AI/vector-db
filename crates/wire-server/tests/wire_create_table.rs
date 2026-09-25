@@ -5,10 +5,10 @@
 //!
 //! 構文・実行本体そのものは `crates/engine/tests/sql_create_table.rs` が確定
 //! オラクルとして検証済みのため、本ファイルは (1) 同じ規則が wire フレーミング
-//! 越しに観測できること、(2) `--ddl-principals`（`auth::UserStore::
-//! with_ddl_principals`）による DDL 実行権限ゲートが wire 経由でも fail-closed
+//! 越しに観測できること、(2) `--ddl-allowed-users`（`auth::UserStore::
+//! with_ddl_allowed_users`）による DDL 実行権限ゲートが wire 経由でも fail-closed
 //! に働くこと、の確認に徹する（`wire_upsert.rs` と同じ流儀）。CLI 引数
-//! `--ddl-principals` 自体の受理・拒否は `wire_ddl_permission_cli.rs` の担当。
+//! `--ddl-allowed-users` 自体の受理・拒否は `wire_ddl_permission_cli.rs` の担当。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -38,22 +38,22 @@ fn new_core_without_tables() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
 }
 
 /// `spawn_server_with_engine`（`common/mod.rs`）と同型だが、`UserStore` を
-/// `--ddl-principals` 相当の許可主体付きで構築できるようにしたローカル版
-/// （Issue #899。CLI 経由ではなく `UserStore::with_ddl_principals` を直接呼ぶ
+/// `--ddl-allowed-users` 相当の許可主体付きで構築できるようにしたローカル版
+/// （Issue #899。CLI 経由ではなく `UserStore::with_ddl_allowed_users` を直接呼ぶ
 /// ため実バイナリを子プロセス起動しない。CLI の受理・拒否自体は
 /// `wire_ddl_permission_cli.rs` が別途検証する）。
-fn spawn_with_ddl_principals(
+fn spawn_with_ddl_allowed_users(
     users_path: &std::path::Path,
     engine: Arc<EngineCore>,
-    ddl_principals: &[&str],
+    ddl_allowed_users: &[&str],
 ) -> SocketAddr {
     let store = UserStore::load_from_file(users_path).expect("valid user store");
-    let store = if ddl_principals.is_empty() {
+    let store = if ddl_allowed_users.is_empty() {
         store
     } else {
-        let names: Vec<String> = ddl_principals.iter().map(|s| s.to_string()).collect();
+        let names: Vec<String> = ddl_allowed_users.iter().map(|s| s.to_string()).collect();
         store
-            .with_ddl_principals(&names)
+            .with_ddl_allowed_users(&names)
             .expect("ddl principals must reference known users")
     };
     let store = Arc::new(store);
@@ -84,7 +84,7 @@ fn connect_as(addr: SocketAddr, username: &str, password: &str) -> TcpStream {
 fn wire_create_table_succeeds_for_ddl_principal() {
     let (core, _guard) = new_core_without_tables();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let addr = spawn_with_ddl_principals(&users_path, core, &["alice"]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
     let mut stream = connect_as(addr, "alice", "pw-alice");
 
     send_simple_query(
@@ -101,7 +101,7 @@ fn wire_create_table_succeeds_for_ddl_principal() {
 fn wire_create_table_duplicate_name_is_rejected() {
     let (core, _guard) = new_core_without_tables();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let addr = spawn_with_ddl_principals(&users_path, core, &["alice"]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
     let mut stream = connect_as(addr, "alice", "pw-alice");
 
     send_simple_query(&mut stream, "CREATE TABLE docs (body TEXT)");
@@ -113,7 +113,7 @@ fn wire_create_table_duplicate_name_is_rejected() {
     read_ready_for_query(&mut stream);
 }
 
-/// `--ddl-principals` に含まれないユーザーは `42501`（未許可。カタログの状態を
+/// `--ddl-allowed-users` に含まれないユーザーは `42501`（未許可。カタログの状態を
 /// 一切観測できない。fail-closed）。
 #[test]
 fn wire_create_table_rejects_non_principal_user() {
@@ -122,7 +122,7 @@ fn wire_create_table_rejects_non_principal_user() {
         ("alice", "tenant-a", "pw-alice"),
         ("bob", "tenant-b", "pw-bob"),
     ]);
-    let addr = spawn_with_ddl_principals(&users_path, core, &["alice"]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
     let mut stream = connect_as(addr, "bob", "pw-bob");
 
     send_simple_query(&mut stream, "CREATE TABLE docs (body TEXT)");
@@ -130,13 +130,13 @@ fn wire_create_table_rejects_non_principal_user() {
     read_ready_for_query(&mut stream);
 }
 
-/// `--ddl-principals` 未指定のサーバーでは、ユーザーストアに存在する全ユーザーが
+/// `--ddl-allowed-users` 未指定のサーバーでは、ユーザーストアに存在する全ユーザーが
 /// `42501` になる（許可主体なし＝全 DDL 拒否の既定）。
 #[test]
-fn wire_create_table_rejects_everyone_when_ddl_principals_unset() {
+fn wire_create_table_rejects_everyone_when_ddl_allowed_users_unset() {
     let (core, _guard) = new_core_without_tables();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let addr = spawn_with_ddl_principals(&users_path, core, &[]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &[]);
     let mut stream = connect_as(addr, "alice", "pw-alice");
 
     send_simple_query(&mut stream, "CREATE TABLE docs (body TEXT)");
@@ -144,8 +144,13 @@ fn wire_create_table_rejects_everyone_when_ddl_principals_unset() {
     read_ready_for_query(&mut stream);
 }
 
-/// 未許可の主体は、構文が不正な `CREATE TABLE` でも同じ `42501` のみを受け取る
-/// （fail-closed。構文エラーの詳細やカタログ状態を漏らさない）。
+/// 未許可の主体は、対象テーブルの有無に関わらず同じ `42501` のみを受け取り、
+/// カタログ状態を観測できない（fail-closed）。一方、構造検証（カタログ照会
+/// なし）は `DROP TABLE`（Issue #902）と同じく権限ゲートより前に通す設計の
+/// ため、許可形状に一致しない構文は権限の有無に関わらず `42601` になる
+/// （構文の正誤自体はカタログの存在情報ではないためオラクルにならない。
+/// `crates/engine/tests/sql_create_table.rs::
+/// create_table_rejects_unauthorized_session_for_garbage_syntax` と同じ契約）。
 #[test]
 fn wire_create_table_rejects_non_principal_user_even_for_malformed_syntax() {
     let (core, _guard) = new_core_without_tables();
@@ -153,11 +158,11 @@ fn wire_create_table_rejects_non_principal_user_even_for_malformed_syntax() {
         ("alice", "tenant-a", "pw-alice"),
         ("bob", "tenant-b", "pw-bob"),
     ]);
-    let addr = spawn_with_ddl_principals(&users_path, core, &["alice"]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
     let mut stream = connect_as(addr, "bob", "pw-bob");
 
     send_simple_query(&mut stream, "CREATE TABLE docs ((()) not a schema");
-    expect_error_response_with_sqlstate(&mut stream, "42501");
+    expect_error_response_with_sqlstate(&mut stream, "42601");
     read_ready_for_query(&mut stream);
 }
 
@@ -168,7 +173,7 @@ fn wire_create_table_rejects_non_principal_user_even_for_malformed_syntax() {
 fn wire_create_table_then_insert_and_select_same_session() {
     let (core, _guard) = new_core_without_tables();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let addr = spawn_with_ddl_principals(&users_path, core, &["alice"]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
     let mut stream = connect_as(addr, "alice", "pw-alice");
 
     send_simple_query(

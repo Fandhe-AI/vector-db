@@ -412,6 +412,13 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::CreateTable(_) => OutcomeResponse::Command {
             tag: "CREATE TABLE".to_string(),
         },
+        // SQL-23・TASK-203（Issue #902）: `DROP TABLE`（`sql::ddl::
+        // DropTableOutcome` は削除件数を一切持たない）の応答を pg 互換の
+        // `CommandComplete` タグ `DROP TABLE`（件数を持たない固定タグ。
+        // `TRUNCATE TABLE` と同じ設計）へ整形する。
+        SqlOutcome::DropTable(_) => OutcomeResponse::Command {
+            tag: "DROP TABLE".to_string(),
+        },
     }
 }
 

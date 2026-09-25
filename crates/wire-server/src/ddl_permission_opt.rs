@@ -1,59 +1,55 @@
-//! `wire-server` バイナリ（`main.rs`）が起動時に受け取る `--ddl-principals`
-//! opt-in CLI 引数の閉じた形式パーサ（SQL-23・TASK-202、Issue #899）。
+//! `wire-server` バイナリ（`main.rs`）が起動時に受け取る `--ddl-allowed-users`
+//! opt-in CLI 引数の閉じた検証パーサ（Issue #902・SQL-23・TASK-203。`CREATE
+//! TABLE`（Issue #899・TASK-202）も同じ権限フラグを共有する単一の判定点とする）。
 //!
-//! `--search-engine`／`--durability`（同モジュール群参照）と同型の「プロセス
-//! 起動時にのみ明示指定する注入点」であり、`engine::sql::mode::SessionState::
-//! grant_ddl`（DDL 実行権限。`sql::ddl::require_ddl_privilege` が唯一の判定点）へ
-//! untrusted な CLI 文字列から到達する唯一の入口を本モジュールに置く。
+//! `--durability`／`--search-engine` と同型の「プロセス起動時にのみ明示指定する
+//! 注入点」であり、`engine::sql::mode::SessionState::allow_ddl`（DDL 実行権限。
+//! `EngineCore::execute_parsed_in_session` の `DROP TABLE`／`CREATE TABLE`
+//! 分岐が `sql::ddl::require_ddl_permission` で参照する）へ untrusted な CLI
+//! 文字列から到達する唯一の入口を本モジュールに置く。
 //!
-//! 本モジュールはカンマ区切りのユーザー名リストの**構文**のみを検証する
-//! （空文字列・空要素・重複・区切りの不正は fail-closed に拒否）。個々の
-//! ユーザー名が `auth::UserStore` に実在するかの検証は `main.rs` が
-//! `auth::UserStore::with_ddl_principals` へ委譲する（本モジュールは
-//! `UserStore` を知らない——untrusted 入力の構文検証と、ロード済みユーザー
-//! ストアに対する意味検証を分離する設計。`search_engine_opt`
-//! （構文検証）と `auth.rs::UserStore`（意味検証）の分離と同じ方針）。
+//! 本モジュールはカンマ区切りの username 列挙をパースし重複・空要素を
+//! fail-closed に拒否するところまでを担う。列挙した username が
+//! `--users` で読み込むユーザーストアに実在するかの検証は
+//! [`crate::auth::UserStore::with_ddl_allowed_users`] が担う（起動時に
+//! 1 回だけ確定させる。未知ユーザーの指定を黙って無視しない）。
 //!
-//! `--ddl-principals` 未指定のサーバーは許可主体が存在しないため、全 DDL が
-//! `42501` で拒否される（fail-closed 既定。`sql::ddl` モジュールドキュメント
+//! 未指定は DDL 実行権限を持つユーザーを 0 人のまま維持する（全 DDL 文が
+//! `42501` で拒否される既定。`sql::ddl::require_ddl_permission` ドキュメント
 //! 参照）。
 
-/// `--ddl-principals` の CLI フラグ名（Issue #899）。
-pub const FLAG: &str = "--ddl-principals";
+/// `--ddl-allowed-users` の CLI フラグ名（Issue #902）。
+pub const FLAG: &str = "--ddl-allowed-users";
 
-/// `raw`（`--ddl-principals` の値。カンマ区切りのユーザー名リスト）を構文検証し、
-/// 宣言順を保持したユーザー名の一覧へ変換する。
+/// `raw`（`--ddl-allowed-users` の値。カンマ区切りの username 列挙）を検証する。
 ///
-/// 拒否する形（いずれも fail-closed。`search_engine_opt::parse` と同じ
-/// 「厳密一致のみ受理・曖昧な入力を黙って読み替えない」方針）:
-/// - 空文字列（`""`）
-/// - 空要素（`"alice,,bob"`・先頭/末尾のカンマ `",alice"`／`"alice,"`）
-/// - 前後の空白を含む要素（trim しない。typo・コピペミスを黙って許容しない）
-/// - 重複したユーザー名（`"alice,alice"`）
+/// - 空文字列全体は拒否する（フラグを指定するなら少なくとも 1 人を挙げる
+///   契約。`--ddl-allowed-users ""` で「誰も許可しない」を暗黙表現させない）。
+/// - `,` で分割した各要素は前後の空白を trim しない（`durability_opt::parse` と
+///   同じ「厳密一致のみ受理」方針。空白入り username を許容すると
+///   `--users` ファイル側の username と黙って不一致になる事故を防げない）。
+/// - 空要素（`"alice,,bob"`・先頭または末尾のカンマ）は拒否する。
+/// - 重複要素は拒否する（typo によるスクリプトの二重指定で意図が読み取れない
+///   構成になるのを防ぐ。`--search-engine` の重複フラグ拒否と同じ理由）。
 pub fn parse(raw: &str) -> Result<Vec<String>, String> {
     if raw.is_empty() {
-        return Err(format!("{FLAG} must not be empty"));
+        return Err(format!(
+            "{FLAG} requires a non-empty comma-separated list of usernames"
+        ));
     }
-    let mut names: Vec<String> = Vec::new();
+    let mut usernames: Vec<String> = Vec::new();
     for part in raw.split(',') {
         if part.is_empty() {
             return Err(format!(
-                "{FLAG} must not contain empty elements (got {raw:?})"
+                "{FLAG} must not contain empty usernames (got {raw:?})"
             ));
         }
-        if part.chars().any(char::is_whitespace) {
-            return Err(format!(
-                "{FLAG} elements must not contain whitespace (got {part:?})"
-            ));
+        if usernames.iter().any(|u| u == part) {
+            return Err(format!("{FLAG} lists username {part:?} more than once"));
         }
-        if names.iter().any(|n| n == part) {
-            return Err(format!(
-                "{FLAG} must not contain duplicate usernames (got {part:?} twice)"
-            ));
-        }
-        names.push(part.to_string());
+        usernames.push(part.to_string());
     }
-    Ok(names)
+    Ok(usernames)
 }
 
 #[cfg(test)]
@@ -61,11 +57,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_accepts_single_and_multiple_names() {
-        assert_eq!(parse("alice").unwrap(), vec!["alice".to_string()]);
+    fn parse_accepts_single_username() {
+        assert_eq!(parse("alice"), Ok(vec!["alice".to_string()]));
+    }
+
+    #[test]
+    fn parse_accepts_multiple_usernames() {
         assert_eq!(
-            parse("alice,bob").unwrap(),
-            vec!["alice".to_string(), "bob".to_string()]
+            parse("alice,bob"),
+            Ok(vec!["alice".to_string(), "bob".to_string()])
         );
     }
 
@@ -87,17 +87,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_whitespace_padded_elements() {
-        for raw in [" alice", "alice ", "alice, bob"] {
-            assert!(parse(raw).is_err(), "expected {raw:?} to be rejected");
-        }
-    }
-
-    #[test]
-    fn parse_preserves_declaration_order() {
-        assert_eq!(
-            parse("carol,alice,bob").unwrap(),
-            vec!["carol".to_string(), "alice".to_string(), "bob".to_string()]
-        );
+    fn parse_does_not_trim_whitespace() {
+        // 空白入り要素は許容しない設計だが、本パーサーは trim を一切行わず、
+        // そのまま `Vec<String>` の一要素として通す（`--users` ファイル側との
+        // 突合せは呼び出し元 `UserStore::with_ddl_allowed_users` が担う）。
+        assert_eq!(parse(" alice"), Ok(vec![" alice".to_string()]));
     }
 }

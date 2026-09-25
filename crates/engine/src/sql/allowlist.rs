@@ -292,13 +292,20 @@ pub enum SqlSurfaceError {
     /// `CREATE TABLE` の列リストに同名の列が複数回宣言された（TABLE-6、
     /// Issue #899）。ERR-6: `42701`。
     DuplicateColumn { name: String },
-    /// DDL（`CREATE TABLE` 等）の実行権限をこのセッションが持たない
-    /// （SQL-23・TASK-202、Issue #899）。未許可の主体は既存名・新規名・構文不正の
-    /// いずれの `CREATE TABLE` でも本分類のみを受け取り、カタログの状態（テーブルの
-    /// 有無）を観測できない（fail-closed。security.md「アクセス制御の不備」対応）。
-    /// [`crate::error_format::ErrorClass::ForbiddenTenantMismatch`]（`42501`）へ
-    /// 写像する（同分類が複数原因を束ねる既存運用と同じ）。
-    DdlNotPermitted,
+    /// DDL 文（`CREATE TABLE`・`DROP TABLE` 等。SQL-23、TASK-202・TASK-203、
+    /// Issue #899・#902）を、DDL 実行権限（[`crate::sql::mode::SessionState::
+    /// ddl_allowed`]）を持たないセッションが実行しようとした（ERR-2 拡張:
+    /// `42501`。[`crate::error_format::ErrorClass::ForbiddenTenantMismatch`] を
+    /// 再利用する——テナント帰属不一致とは原因が異なるが `wire_code` は同じ
+    /// `42501` であり、`ErrorClass` は分類名ではなく `wire_code` の一意対応を
+    /// 保証する単位のため、新規分類は追加しない）。判定順序は構文検証の
+    /// 直後・カタログ照会（対象テーブルの存在確認）より前
+    /// （`sql::ddl::require_ddl_permission` 参照）: 権限を持たない主体には対象
+    /// テーブルの有無を問わず常にこの分類を返し、DDL 権限をテーブル存在の
+    /// オラクルにしない（security.md「エラー・ログ経由で他テナントのデータ・
+    /// 存在情報を漏らさない」対応）。固定文言のみを保持し、テーブル名・
+    /// ユーザー名を含めない。
+    InsufficientPrivilege,
 }
 
 impl SqlSurfaceError {
@@ -361,12 +368,6 @@ impl SqlSurfaceError {
         SqlSurfaceError::DuplicateColumn {
             name: truncate_for_error(&name.into()),
         }
-    }
-
-    /// `pub(crate)`: `sql::ddl::require_ddl_privilege`（SQL-23・TASK-202、
-    /// Issue #899）が DDL 実行権限の不足を報告するために使う。
-    pub(crate) fn ddl_not_permitted() -> Self {
-        SqlSurfaceError::DdlNotPermitted
     }
 
     /// `pub(crate)`: `sql::parser::bind`（TASK-75）が束縛時の値・引数不正を報告するために
@@ -436,7 +437,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::FeatureNotSupported { .. } => ErrorClass::FeatureNotSupported,
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
-            SqlSurfaceError::DdlNotPermitted => ErrorClass::ForbiddenTenantMismatch,
+            SqlSurfaceError::InsufficientPrivilege => ErrorClass::ForbiddenTenantMismatch,
         }
     }
 
@@ -497,11 +498,10 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::DuplicateColumn { name } => {
                 write!(f, "duplicate column name: {name}")
             }
-            // 主体名・テーブル名・カタログの状態を一切含めない固定文言
-            // （security.md P0。未許可の主体へ存在情報を渡さないための契約。
-            // `sql::ddl` モジュールドキュメント参照）。
-            SqlSurfaceError::DdlNotPermitted => {
-                write!(f, "permission denied for DDL")
+            // テーブル名・ユーザー名を含めない固定文言（security.md P0。
+            // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
+            SqlSurfaceError::InsufficientPrivilege => {
+                write!(f, "permission denied for DDL statement")
             }
         }
     }
@@ -1299,6 +1299,32 @@ pub struct ValidatedUpdate {
     /// 無視する fail-open を防ぐチョークポイント）。この型が構築される時点では
     /// 常に `None`。
     pub returning: Option<Projection>,
+}
+
+/// 許可形状の構造判定を通過した `DROP TABLE` 文（SQL-23、TASK-203、Issue #902）。
+/// カタログ定義（`CATALOG_TABLE` エントリ）と全テナントの行ストア・
+/// `operation_id` 台帳エントリを不可逆に削除する DDL であり、`TRUNCATE`
+/// （[`ValidatedTruncate`]。テナントスコープの書き込み系操作）とは異なり
+/// [`crate::policy::PolicyContext`] を取らない（`catalog::Storage::drop_table`
+/// ドキュメント参照）。
+///
+/// 受理する形は `DROP TABLE <table> [;]` のみ（`IF EXISTS`・`CASCADE`・
+/// `RESTRICT`・複数テーブル列挙・`USING OPERATION_ID` 句は許可リスト外として
+/// `42601`。`operation_id` を要求しない——`CREATE TABLE`・`ALTER TABLE` と
+/// 同じく DDL は台帳の対象外。詳細は `docs/design/drop-table.md` 参照）。
+///
+/// **本構造体はカタログ照会を一切行わない**（`validate_drop_table_tokens` の
+/// ドキュメント参照）: DDL 実行権限ゲート（[`crate::sql::ddl::
+/// require_ddl_permission`]）を対象テーブルの存在確認より先に通す契約
+/// （security.md「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」）
+/// を維持するため、将来ここへ `TableLookup` を追加して存在確認を前倒しし
+/// ないこと。存在確認は `sql::ddl::execute_drop_table` が書き込みトランザクション
+/// 内で行う（TOCTOU を避ける設計）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDropTable {
+    /// DROP TABLE に指定されたテーブル名（識別子構文の検証のみ済み。カタログ
+    /// 存在確認は未実施）。
+    pub table_name: String,
 }
 
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
@@ -2645,6 +2671,16 @@ impl<'a> Parser<'a> {
             "expected column type TEXT or VECTOR(<dim>)",
         ))
     }
+
+    /// `DROP TABLE <table> [;]` の単一テーブル形のみを受理する（SQL-23、
+    /// TASK-203、Issue #902）。`IF EXISTS`・`CASCADE`・`RESTRICT`・複数テーブル
+    /// 列挙・`USING OPERATION_ID` 句は構造的に受理しない（`expect_end_of_statement`
+    /// が余剰トークンとして `42601` で拒否する）。
+    fn parse_drop_table(&mut self) -> Result<String, SqlSurfaceError> {
+        self.expect_contextual_keyword("DROP")?;
+        self.expect_contextual_keyword("TABLE")?;
+        self.expect_ident()
+    }
 }
 
 /// 構文木（[`ValidatedTruncate`] の元）。カタログ存在確認前の中間結果
@@ -3420,11 +3456,14 @@ pub(crate) fn validate_insert_tokens(
 /// 先頭 2 トークンが文脈的キーワード `CREATE`／`TABLE`（大文字小文字を区別しない。
 /// `is_create_function_statement`〔`validate_sql_tokens`〕と同じ「statement 先頭
 /// という文脈でのみキーワードとして判定する」方針）に一致するかを判定する
-/// （SQL-23・TASK-202、Issue #899）。`core.rs::EngineCore::execute_sql_in_session`
-/// が DDL 実行権限ゲートを [`validate_create_table_tokens`] の完全な構文解析より
-/// 前に適用するために使う——未許可の主体は構文が正しいか・テーブルが存在するかに
-/// 関わらず同じ `DdlNotPermitted`（`42501`）のみを受け取り、それらの情報を一切
-/// 観測できない（fail-closed。`sql::ddl` モジュールドキュメント参照）。
+/// （SQL-23・TASK-202、Issue #899）。`core.rs::EngineCore::parse_tokens` が
+/// [`validate_create_table_tokens`]（構造検証のみ・カタログ照会なし）へ分岐
+/// するために使う。DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）は
+/// `DROP TABLE` と同じく `execute_parsed_in_session` の `ParsedSql::CreateTable`
+/// 分岐が、カタログ照会を含む実行本体より前に適用する——未許可の主体は構文が
+/// 正しいか・テーブルが存在するかに関わらず同じ `InsufficientPrivilege`
+/// （`42501`）のみを受け取り、それらの情報を一切観測できない（fail-closed。
+/// `sql::ddl` モジュールドキュメント参照）。
 pub(crate) fn is_create_table_statement(tokens: &[Token]) -> bool {
     matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"))
         && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("TABLE"))
@@ -3477,6 +3516,30 @@ pub(crate) fn validate_truncate_tokens(
         table_name: shape.table_name,
         operation_id: shape.operation_id,
     })
+}
+
+/// `DROP TABLE` 文をトークン化し、許可リスト形式で構造検証する（SQL-23、
+/// TASK-203、Issue #902 の公開 API）。`validate_truncate`・`validate_insert` と
+/// 異なり **`TableLookup` を取らない**——DDL 実行権限ゲート
+/// （[`crate::sql::ddl::require_ddl_permission`]）を対象テーブルの存在確認より
+/// 先に通す契約（`ValidatedDropTable` ドキュメント参照）のため、本関数は
+/// カタログへ一切問い合わせない。存在確認は `sql::ddl::execute_drop_table` が
+/// 書き込みトランザクション内で行う。
+pub fn validate_drop_table(sql: &str) -> Result<ValidatedDropTable, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_drop_table_tokens(&tokens)
+}
+
+/// [`validate_drop_table`] の本体。`core.rs::EngineCore::parse_tokens` が既に
+/// 字句解析済みの場合、同一 SQL 文字列の再トークナイズを避けるために使う
+/// （`validate_truncate_tokens` と同じ設計）。
+pub(crate) fn validate_drop_table_tokens(
+    tokens: &[lexer::Token],
+) -> Result<ValidatedDropTable, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let table_name = p.parse_drop_table()?;
+    p.expect_end_of_statement()?;
+    Ok(ValidatedDropTable { table_name })
 }
 
 /// `COPY ... FROM STDIN`／`COPY (...) TO STDOUT` の転送形式（Issue #939・

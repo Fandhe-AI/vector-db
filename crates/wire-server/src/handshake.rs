@@ -1064,13 +1064,14 @@ fn handle_connection_inner(
     // 接続単位のセッション状態（取得モード・宣言的 UDF レジストリ）。
     // `EngineCore` 自体は保持しない（`sql::mode` モジュールドキュメント参照）。
     let mut session = engine::sql::mode::SessionState::default();
-    // SQL-23・TASK-202（Issue #899）: DDL 実行権限は認証成功後・
-    // `--ddl-principals`（`store.is_ddl_principal`）による許可主体判定を経て
-    // のみ付与する（fail-closed 既定。`--ddl-principals` 未指定のサーバーでは
-    // 常に `false` のまま）。`session` 構築の直後・`post_auth_loop` 呼び出しより
-    // 前に確定させ、以後のこの接続内の全文が同じ権限を見る。
-    if store.is_ddl_principal(&username) {
-        session.grant_ddl();
+    // SQL-23・TASK-202・TASK-203（Issue #899・#902）: DDL 実行権限
+    // （`CREATE TABLE`・`DROP TABLE` 共通）は認証成功後（＝`username` が
+    // 確定した時点）に 1 回だけ付与する。`PolicyContext`（`ctx`）はテナント ID・
+    // 可視性のみを運び認証主体を持たないため、この判定は `ctx` ではなく
+    // `store`（`--ddl-allowed-users`）に基づく。SQL 文経由でセッションが自身の
+    // 権限を昇格させる経路は構造的に存在しない。
+    if store.is_ddl_allowed(&username) {
+        session.allow_ddl();
     }
     // 接続単位の Parse 済みステートメント・portal 保持（Issue #933・#934・
     // TASK-71・WIRE-11）。`session` と同じく接続終了で破棄し、接続間・
