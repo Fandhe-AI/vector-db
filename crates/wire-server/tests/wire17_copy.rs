@@ -278,6 +278,10 @@ fn wire17_copy_from_stdin_unknown_column_is_rejected_before_copy_in_response() {
 
 /// 非 nullable 列（`lang`）が列リストから欠落している場合も、
 /// `CopyInResponse` を送出する前に拒否されなければならない（同上）。
+/// エラー契約は `bind_copy_record`（`fill_omitted_columns` 経由）・INSERT・
+/// 行内 `\N` 処理と同じ NOT NULL 違反として `23502` に統一する
+/// （PR #1051 codex-review 指摘。列リストでの事前検出とデコード時検出とで
+/// エラー契約が経路依存で揺れないようにする）。
 #[test]
 fn wire17_copy_from_stdin_missing_non_nullable_column_is_rejected_before_copy_in_response() {
     let (core, _guard) = new_core_with_docs_table();
@@ -287,7 +291,7 @@ fn wire17_copy_from_stdin_missing_non_nullable_column_is_rejected_before_copy_in
         &mut stream,
         "COPY docs (id, embedding) FROM STDIN USING OPERATION_ID 'wire-copy-missing-col'",
     );
-    expect_error_response_with_sqlstate(&mut stream, "22000");
+    expect_error_response_with_sqlstate(&mut stream, "23502");
     read_ready_for_query(&mut stream);
 
     send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");

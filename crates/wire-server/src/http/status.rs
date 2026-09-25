@@ -65,7 +65,11 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::InvalidTransactionState
         | ErrorClass::ActiveSqlTransaction
         | ErrorClass::NoActiveSqlTransaction
-        | ErrorClass::InFailedSqlTransaction => 400,
+        | ErrorClass::InFailedSqlTransaction
+        // `NotNullViolation`（`23502`。TABLE-16・TASK-204、Issue #904）は
+        // `wire_code` を共有する `MissingOperationId` と同じくクライアント側の
+        // 入力不備であり 400 とする。
+        | ErrorClass::NotNullViolation => 400,
     }
 }
 
@@ -75,7 +79,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 27] = [
+    const EXPECTED: [(ErrorClass, u16); 28] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -103,6 +107,7 @@ mod tests {
         (ErrorClass::DuplicateColumn, 400),
         (ErrorClass::DependentObjectsStillExist, 400),
         (ErrorClass::WrongObjectType, 400),
+        (ErrorClass::NotNullViolation, 400),
     ];
 
     #[test]

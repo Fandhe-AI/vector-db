@@ -687,7 +687,9 @@ mod tests {
             .expect("schema ok");
 
         let err = execute(&core, &principal, &validated).expect_err("must reject");
-        assert_eq!(err.wire_code(), "22000");
+        // TABLE-16・TASK-204、Issue #904: NOT NULL 違反は `23502`
+        // （`NotNullViolation`）へ写像する（旧 `22000` から契約変更）。
+        assert_eq!(err.wire_code(), "23502");
         let _ = std::fs::remove_file(&path);
     }
 

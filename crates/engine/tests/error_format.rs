@@ -41,12 +41,25 @@ fn new_core_with_documents_table(path: &std::path::Path) -> EngineCore {
 // --- 一意性・決定性 -----------------------------------------------------------
 
 #[test]
-fn err2_all_classes_have_unique_wire_codes() {
+fn err2_all_classes_have_unique_wire_codes_except_shared() {
+    // ERR-6（TABLE-16・TASK-204、Issue #904）: `23502` は `MissingOperationId` と
+    // `NotNullViolation` が共有する。共有は許可された組のみで、それ以外の
+    // `wire_code` は従来どおり分類ごとに一意でなければならない。
     let codes: HashSet<&str> = ErrorClass::ALL.iter().map(|c| c.wire_code()).collect();
+    let expected_unique = ErrorClass::ALL.len() - 1; // 23502 の重複ぶんを 1 引く
     assert_eq!(
         codes.len(),
-        ErrorClass::ALL.len(),
-        "wire_code は分類ごとに一意でなければならない"
+        expected_unique,
+        "wire_code は SHARED_WIRE_CODES 外では一意でなければならない"
+    );
+    let sharing_23502: Vec<ErrorClass> = ErrorClass::ALL
+        .into_iter()
+        .filter(|c| c.wire_code() == "23502")
+        .collect();
+    assert_eq!(
+        sharing_23502,
+        vec![ErrorClass::MissingOperationId, ErrorClass::NotNullViolation],
+        "23502 を共有する分類は MissingOperationId・NotNullViolation の 2 つのみ"
     );
 }
 
@@ -74,8 +87,18 @@ fn err2_wire_code_is_deterministic() {
                 "同一 variant は常に同一 wire_code"
             );
         }
-        // 往復変換（wire_code → from_wire_code）が元の分類へ戻ることを確認する。
-        assert_eq!(ErrorClass::from_wire_code(first), Some(class));
+        // 往復変換（wire_code → from_wire_code）の確認。`SHARED_WIRE_CODES`
+        // （`23502`）は宣言順で最初の分類（`MissingOperationId`）へ戻る契約
+        // （ERR-6・Issue #904。`error_format::ErrorClass::from_wire_code` の doc
+        // 参照）のため、それ以外の分類のみ厳密往復を検証する。
+        if first == "23502" {
+            assert_eq!(
+                ErrorClass::from_wire_code(first),
+                Some(ErrorClass::MissingOperationId)
+            );
+        } else {
+            assert_eq!(ErrorClass::from_wire_code(first), Some(class));
+        }
     }
 
     // スレッドを跨いでも同一値であることを確認する（外部状態非依存の証跡）。

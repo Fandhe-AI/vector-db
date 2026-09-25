@@ -341,7 +341,9 @@ fn nosql_update_set_json_null_on_non_nullable_column_is_rejected() {
 
     let update_body = br#"{"op":"update","table":"docs","where":{"id":1},"set":{"doc":null},"operation_id":"op-nosql-update-reject-null"}"#;
     let resp = query(&both, update_body);
-    assert_eq!(http_common::wire_code_of(&resp), "22000", "resp: {resp:?}");
+    // TABLE-16・TASK-204、Issue #904: NOT NULL 違反は `23502`
+    // （`NotNullViolation`）へ写像する（旧 `22000` から契約変更）。
+    assert_eq!(http_common::wire_code_of(&resp), "23502", "resp: {resp:?}");
 }
 
 #[test]

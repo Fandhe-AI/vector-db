@@ -117,8 +117,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `drop_view` 追加）と Issue #942 系変更の base（main）取り込みマージ統合・
     // PR #1048 レビュー対応（`Storage::create_view` の `body_sql`／
     // `base_relation` 自己検証追加、codex-review 指摘）で `catalog.rs` 冒頭側に
+    // さらに行が追加され、再度追随（旧: 2543）。Issue #903（`PRIMARY KEY`
+    // 宣言構文）・Issue #904（NOT NULL／DEFAULT 宣言構文。カタログ v4・v5 形式）
+    // の base（main）取り込みマージ（PR #1048 手動統合）で `catalog.rs` 冒頭側に
     // さらに行が追加され、再度追随。
-    ("catalog.rs", 2543),
+    ("catalog.rs", 3147),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -132,21 +135,24 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （旧: 2304）。本 PR（#909）の base（main）取り込みマージ（Issue #901
     // 系変更との統合）で再度追随（旧: 2566）。PR #1048 レビュー
     // 対応（同上）で再度追随（旧: 2609）。Issue #942（SQL-31・TASK-221）系
-    // 変更との base（main）取り込みマージ統合で再度追随。
-    ("catalog.rs", 2622),
+    // 変更との base（main）取り込みマージ統合で再度追随（旧: 2622）。
+    // Issue #903・#904 の base（main）取り込みマージで再度追随。
+    ("catalog.rs", 3226),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
     // テーブルが存在せずバンプ対象がない）。PR #1048 レビュー対応（同上）で
     // 再度追随（旧: 2627）。Issue #942 系変更との base（main）取り込みマージ
-    // 統合で再度追随（旧: 2686）。
-    ("catalog.rs", 2699),
+    // 統合で再度追随（旧: 2686）。Issue #903・#904 の base（main）取り込み
+    // マージで再度追随（旧: 2699）。
+    ("catalog.rs", 3303),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
     // 再度追随（旧: 2655）。Issue #942 系変更との base（main）取り込みマージ
-    // 統合で再度追随（旧: 2714）。
-    ("catalog.rs", 2727),
+    // 統合で再度追随（旧: 2714）。Issue #903・#904 の base（main）取り込み
+    // マージで再度追随（旧: 2727）。
+    ("catalog.rs", 3331),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_
@@ -165,7 +171,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 4 呼び出し元はいずれも自分のクロージャの最後で
     // `bump_table_generation_in_txn` を呼んでから `Ok(())` を返すことを目視で
     // 確認済み（各関数のドキュメントコメント参照）。
-    ("tenant.rs", 397),
+    ("tenant.rs", 405),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
