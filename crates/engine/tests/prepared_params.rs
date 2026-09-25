@@ -412,6 +412,28 @@ fn bind_prepared_rejects_missing_operation_id_via_empty_string_value() {
     assert_eq!(err.wire_code(), "23502");
 }
 
+// PR #1012 codex 指摘の確認: `docs/design/wire-extended-query-param-binding.md`
+// 「NULL パラメータ値」節が案内する「`$n` を使わず SQL テキストへ
+// `USING OPERATION_ID NULL` を直接書く」形は、構文としては受理され（`42601`
+// にはならない）、句の省略と同じ扱い（台帳あり構成では必須化違反 `23502`）に
+// なることを固定する（RECOVER-1・TASK-92 の既存契約をそのまま継承する）。
+#[test]
+fn parse_sql_prepared_treats_literal_null_operation_id_as_omitted_clause() {
+    let path = unique_db_path("prepared-literal-null-operation-id");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+
+    for sql in [
+        "TRUNCATE TABLE documents USING OPERATION_ID NULL",
+        "TRUNCATE TABLE documents",
+    ] {
+        let err = core
+            .parse_sql_prepared(sql)
+            .expect_err("omitted operation_id must be rejected in ledgered mode");
+        assert_eq!(err.wire_code(), "23502", "sql = {sql}");
+    }
+}
+
 #[test]
 fn bind_prepared_rejects_value_count_mismatch() {
     let path = unique_db_path("prepared-rejects-value-count-mismatch");
