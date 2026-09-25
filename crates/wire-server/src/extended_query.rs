@@ -1653,105 +1653,135 @@ fn execute_portal<'e, S: WireStream>(
             }
         };
 
-        match crate::simple_query::map_outcome(outcome) {
-            crate::simple_query::OutcomeResponse::Command { tag } => {
-                let portal = state
-                    .portals
-                    .get_mut(portal_name)
-                    .ok_or(HandlerError::UnknownPortal)?;
-                portal.state = PortalState::Done { tag: tag.clone() };
-                portal.cursor_binding = cursor_binding;
-                return write_command_complete(stream, &tag).map_err(commit_wrap);
-            }
-            crate::simple_query::OutcomeResponse::Rows { result, shape } => {
-                if Some(&result.columns) != expected_columns.as_ref() {
-                    return Err(commit_wrap(HandlerError::ResultTypeChanged));
+        // PR #1049 レビュー指摘 codex P1 対応: カーソル `FETCH` はエンジン実行が
+        // 成功した時点（上の `execute_parsed_in_txn`）で取得位置を進める。以降の
+        // 応答生成（行エンコード・中断保持バイト上限・送出）が失敗した場合、
+        // 位置だけが進んで行がクライアントへ届かないまま次の `FETCH` が続きを
+        // 返すことがあってはならない。ここで明示トランザクションを直ちに
+        // `Failed` へ遷移させ（カーソルは `ActiveTxn` とともに破棄される）、
+        // 以降の `FETCH` は `25P02` になる——PostgreSQL の「エラーでトランザク
+        // ションを中断する」契約（SQL-31）と同じで、行を飛ばした状態から再開
+        // する経路を持たない。`handshake::post_auth_loop` もエラー応答後に同じ
+        // 遷移を行う（`respond_error_and_await_sync` 参照）が、その受け渡しに
+        // 依存せずこの失敗箇所で局所的に保証する。`fail` は `Active` 以外では
+        // 何もしない（冪等）。
+        let is_cursor_fetch = cursor_binding.is_some();
+        let response = (|| -> Result<(), HandlerError> {
+            match crate::simple_query::map_outcome(outcome) {
+                crate::simple_query::OutcomeResponse::Command { tag } => {
+                    let portal = state
+                        .portals
+                        .get_mut(portal_name)
+                        .ok_or(HandlerError::UnknownPortal)?;
+                    portal.state = PortalState::Done { tag: tag.clone() };
+                    portal.cursor_binding = cursor_binding;
+                    write_command_complete(stream, &tag).map_err(commit_wrap)
                 }
-                let total = result.rows.len();
-                let take = if max_rows <= 0 {
-                    total
-                } else {
-                    (max_rows as usize).min(total)
-                };
-
-                // まず中断保持へ回る行（`take` 以降）だけを対象に、1 行
-                // エンコードするたびに合計バイト数をセッション全体
-                // （他の全 portal の中断保持分を含む。PR #1013 レビュー
-                // 指摘・P0: portal 単体判定だと名前付き portal 最大 64 個で
-                // 接続全体では上限の約 64 倍相当を保持できてしまう）で
-                // 判定し、超過が判明した時点で残りの行を一切エンコードせず
-                // 即座に拒否する。この判定は `take` 分の送出を始める前に
-                // 完了させる ―― 1 回の Execute は「`take` 行の送出（＋
-                // 完了／中断マーカー）が丸ごと成功する」か「1 バイトも送らず
-                // 失敗する」かのいずれかである契約を保つ（中断バイト上限
-                // 超過を理由に、既に一部の行を送ってしまった後で
-                // ErrorResponse を返す事態を避ける）。
-                let other_suspended_bytes =
-                    state.portals.total_suspended_bytes_excluding(portal_name);
-                let mut remaining_bytes: usize = 0;
-                let mut frames = std::collections::VecDeque::new();
-                for row in result.rows.iter().skip(take) {
-                    // Bind 時点で確定した結果 format code（WIRE-14。
-                    // `Portal::result_formats`）を反映する。`validate_binary_
-                    // formats` が Bind で事前検査済みのため、ここでの
-                    // `EncodeError` は呼び出し元（本モジュール）内部の不整合
-                    // のみを意味する（`XX000` 相当。`result_encoder`
-                    // モジュールドキュメント参照）。
-                    let mut frame = Vec::new();
-                    result_encoder::encode_data_row_into_with_formats(
-                        row,
-                        &result_formats,
-                        &mut frame,
-                    )
-                    .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
-                    remaining_bytes = remaining_bytes.saturating_add(frame.len());
-                    let session_total = other_suspended_bytes.saturating_add(remaining_bytes);
-                    if session_total > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION {
-                        return Err(commit_wrap(HandlerError::SuspendedBytesExceeded));
+                crate::simple_query::OutcomeResponse::Rows { result, shape } => {
+                    if Some(&result.columns) != expected_columns.as_ref() {
+                        return Err(commit_wrap(HandlerError::ResultTypeChanged));
                     }
-                    frames.push_back(frame);
-                }
+                    let total = result.rows.len();
+                    let take = if max_rows <= 0 {
+                        total
+                    } else {
+                        (max_rows as usize).min(total)
+                    };
 
-                // 中断保持分の検査を通過した後で初めて `take` 分の送出へ移る。
-                // `take` 分は 1 行ずつエンコード→`ResponseBuffer` へ積んで
-                // その場で送出し、結果セット全体（`take` 分を含む）を先に
-                // メモリへ確保しない（PR #1013 レビュー指摘・P0: `max_rows`
-                // が非常に大きい／`max_rows<=0` の場合、`take` は `total` と
-                // 一致し得るため、`take` 分もここで先にすべてエンコードして
-                // 保持すると外部 wire 入力の結果セット規模で無制限にアロケー
-                // ションが発生してしまう）。
-                let mut buffer = crate::response_buffer::ResponseBuffer::with_capacity_hint(
-                    MAX_RESPONSE_BUFFER_BYTES,
-                    0,
-                );
-                for row in result.rows.iter().take(take) {
-                    let mut frame = Vec::new();
-                    result_encoder::encode_data_row_into_with_formats(
-                        row,
-                        &result_formats,
-                        &mut frame,
-                    )
-                    .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
-                    buffer
-                        .push_frame(stream, &frame)
-                        .map_err(|e| commit_wrap(io_to_handler(e)))?;
-                    if buffer.len() >= MAX_RESPONSE_BUFFER_BYTES {
+                    // まず中断保持へ回る行（`take` 以降）だけを対象に、1 行
+                    // エンコードするたびに合計バイト数をセッション全体
+                    // （他の全 portal の中断保持分を含む。PR #1013 レビュー
+                    // 指摘・P0: portal 単体判定だと名前付き portal 最大 64 個で
+                    // 接続全体では上限の約 64 倍相当を保持できてしまう）で
+                    // 判定し、超過が判明した時点で残りの行を一切エンコードせず
+                    // 即座に拒否する。この判定は `take` 分の送出を始める前に
+                    // 完了させる ―― 1 回の Execute は「`take` 行の送出（＋
+                    // 完了／中断マーカー）が丸ごと成功する」か「1 バイトも送らず
+                    // 失敗する」かのいずれかである契約を保つ（中断バイト上限
+                    // 超過を理由に、既に一部の行を送ってしまった後で
+                    // ErrorResponse を返す事態を避ける）。
+                    let other_suspended_bytes =
+                        state.portals.total_suspended_bytes_excluding(portal_name);
+                    let mut remaining_bytes: usize = 0;
+                    let mut frames = std::collections::VecDeque::new();
+                    for row in result.rows.iter().skip(take) {
+                        // Bind 時点で確定した結果 format code（WIRE-14。
+                        // `Portal::result_formats`）を反映する。`validate_binary_
+                        // formats` が Bind で事前検査済みのため、ここでの
+                        // `EncodeError` は呼び出し元（本モジュール）内部の不整合
+                        // のみを意味する（`XX000` 相当。`result_encoder`
+                        // モジュールドキュメント参照）。
+                        let mut frame = Vec::new();
+                        result_encoder::encode_data_row_into_with_formats(
+                            row,
+                            &result_formats,
+                            &mut frame,
+                        )
+                        .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
+                        remaining_bytes = remaining_bytes.saturating_add(frame.len());
+                        let session_total = other_suspended_bytes.saturating_add(remaining_bytes);
+                        if session_total > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION {
+                            return Err(commit_wrap(HandlerError::SuspendedBytesExceeded));
+                        }
+                        frames.push_back(frame);
+                    }
+
+                    // 中断保持分の検査を通過した後で初めて `take` 分の送出へ移る。
+                    // `take` 分は 1 行ずつエンコード→`ResponseBuffer` へ積んで
+                    // その場で送出し、結果セット全体（`take` 分を含む）を先に
+                    // メモリへ確保しない（PR #1013 レビュー指摘・P0: `max_rows`
+                    // が非常に大きい／`max_rows<=0` の場合、`take` は `total` と
+                    // 一致し得るため、`take` 分もここで先にすべてエンコードして
+                    // 保持すると外部 wire 入力の結果セット規模で無制限にアロケー
+                    // ションが発生してしまう）。
+                    let mut buffer = crate::response_buffer::ResponseBuffer::with_capacity_hint(
+                        MAX_RESPONSE_BUFFER_BYTES,
+                        0,
+                    );
+                    for row in result.rows.iter().take(take) {
+                        let mut frame = Vec::new();
+                        result_encoder::encode_data_row_into_with_formats(
+                            row,
+                            &result_formats,
+                            &mut frame,
+                        )
+                        .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
+                        buffer
+                            .push_frame(stream, &frame)
+                            .map_err(|e| commit_wrap(io_to_handler(e)))?;
+                        if buffer.len() >= MAX_RESPONSE_BUFFER_BYTES {
+                            buffer
+                                .flush(stream)
+                                .map_err(|e| commit_wrap(io_to_handler(e)))?;
+                        }
+                    }
+
+                    if frames.is_empty() {
+                        // 全行を今回の Execute で送出済み。`CommandComplete` の
+                        // タグは portal 全体の累計送出行数（この場合は `take`
+                        // そのもの）から組み立てる（PR #1013 レビュー指摘・P1）。
+                        let tag = shape.render(take);
+                        let msg = result_encoder::encode_command_complete(&tag).map_err(|_| {
+                            commit_wrap(internal_error("failed to encode command complete"))
+                        })?;
+                        buffer
+                            .push_frame(stream, &msg)
+                            .map_err(|e| commit_wrap(io_to_handler(e)))?;
                         buffer
                             .flush(stream)
                             .map_err(|e| commit_wrap(io_to_handler(e)))?;
-                    }
-                }
 
-                if frames.is_empty() {
-                    // 全行を今回の Execute で送出済み。`CommandComplete` の
-                    // タグは portal 全体の累計送出行数（この場合は `take`
-                    // そのもの）から組み立てる（PR #1013 レビュー指摘・P1）。
-                    let tag = shape.render(take);
-                    let msg = result_encoder::encode_command_complete(&tag).map_err(|_| {
-                        commit_wrap(internal_error("failed to encode command complete"))
-                    })?;
+                        let portal = state
+                            .portals
+                            .get_mut(portal_name)
+                            .ok_or(HandlerError::UnknownPortal)?;
+                        portal.state = PortalState::Done { tag };
+                        portal.cursor_binding = cursor_binding;
+                        return Ok(());
+                    }
+
                     buffer
-                        .push_frame(stream, &msg)
+                        .push_frame(stream, &result_encoder::encode_portal_suspended())
                         .map_err(|e| commit_wrap(io_to_handler(e)))?;
                     buffer
                         .flush(stream)
@@ -1761,32 +1791,21 @@ fn execute_portal<'e, S: WireStream>(
                         .portals
                         .get_mut(portal_name)
                         .ok_or(HandlerError::UnknownPortal)?;
-                    portal.state = PortalState::Done { tag };
+                    portal.state = PortalState::Suspended(PortalRows {
+                        frames,
+                        shape,
+                        sent_so_far: take,
+                        committed: is_write_statement,
+                    });
                     portal.cursor_binding = cursor_binding;
-                    return Ok(());
+                    Ok(())
                 }
-
-                buffer
-                    .push_frame(stream, &result_encoder::encode_portal_suspended())
-                    .map_err(|e| commit_wrap(io_to_handler(e)))?;
-                buffer
-                    .flush(stream)
-                    .map_err(|e| commit_wrap(io_to_handler(e)))?;
-
-                let portal = state
-                    .portals
-                    .get_mut(portal_name)
-                    .ok_or(HandlerError::UnknownPortal)?;
-                portal.state = PortalState::Suspended(PortalRows {
-                    frames,
-                    shape,
-                    sent_so_far: take,
-                    committed: is_write_statement,
-                });
-                portal.cursor_binding = cursor_binding;
-                return Ok(());
             }
+        })();
+        if response.is_err() && is_cursor_fetch {
+            txn.fail();
         }
+        return response;
     }
 
     let portal = state

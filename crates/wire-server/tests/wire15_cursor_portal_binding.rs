@@ -400,3 +400,118 @@ fn done_fetch_portal_replays_completion_after_rollback() {
 
     assert_done_replay_resends_tag_only(&mut stream, &tag);
 }
+
+// --- FETCH の応答生成失敗後に行を飛ばさない（PR #1049 レビュー指摘 codex P1） ---
+
+/// `ErrorResponse`（'E'）を読み、SQLSTATE（`C` フィールド）を返す。
+fn read_error_sqlstate(stream: &mut std::net::TcpStream) -> String {
+    let (kind, body) = read_message(stream);
+    assert_eq!(kind, b'E', "expected ErrorResponse, got {:?}", kind as char);
+    let mut fields = body.split(|b| *b == 0);
+    for field in fields.by_ref() {
+        if let Some((b'C', code)) = field.split_first() {
+            return String::from_utf8_lossy(code).into_owned();
+        }
+    }
+    panic!("ErrorResponse without SQLSTATE: {body:?}");
+}
+
+/// 拡張クエリの `FETCH`（`max_rows=1`）が中断保持バイト上限（セッション全体
+/// 16 MiB。別 portal の中断保持分と合算）を超えて `54000` で失敗した場合、
+/// エンジン側で取得位置が進んでいても、明示トランザクションは `Failed` へ遷移し
+/// カーソルごと破棄される。同じトランザクションの次の `FETCH` は行を返さず
+/// `25P02` になり（行を飛ばした位置から再開しない）、`ROLLBACK` 後に同じ
+/// カーソルを宣言し直せば先頭行から取得できる。
+#[test]
+fn fetch_response_overflow_fails_transaction_instead_of_skipping_rows() {
+    const ROW_BODY_LEN: usize = 1_000_000;
+    const ROW_COUNT: u64 = 11;
+
+    let (core, _guard) = new_core_with_documents_table();
+    let big_body = "x".repeat(ROW_BODY_LEN);
+    for id in 1..=ROW_COUNT {
+        let sql = format!(
+            "INSERT INTO documents (id, embedding, body) VALUES ({id}, '[0.1,0.2,0.3]', '{big_body}') USING OPERATION_ID 'seed-big-{id}'"
+        );
+        let mut session = engine::sql::mode::SessionState::default();
+        core.execute_sql_in_session(&owner_ctx(), &mut session, &sql)
+            .expect("seed big-body insert succeeds");
+    }
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "DECLARE c CURSOR FOR SELECT id, body FROM documents LIMIT 11",
+    );
+    assert_eq!(read_command_complete(&mut stream), "DECLARE CURSOR");
+    read_ready_for_query(&mut stream);
+
+    // 別 portal（通常の広域取得）で約 10 MiB を中断保持させる。
+    parse_and_bind(
+        &mut stream,
+        "sfill",
+        "pfill",
+        "SELECT id, body FROM documents LIMIT 11",
+    );
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pfill", 1));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'D', "expected DataRow for the filler portal");
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b's', "expected PortalSuspended for the filler portal");
+
+    // `FETCH` の残り 10 行（約 10 MiB）を中断保持しようとすると合計が上限を
+    // 超え、1 行も送らずに `54000` で失敗する。
+    parse_and_bind(&mut stream, "sf", "pf", "FETCH 11 FROM c");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pf", 1));
+    assert_eq!(read_error_sqlstate(&mut stream), "54000");
+    send_sync(&mut stream);
+    let (kind, status) = read_message(&mut stream);
+    assert_eq!(kind, b'Z', "expected ReadyForQuery after Sync");
+    assert_eq!(
+        status.first(),
+        Some(&b'E'),
+        "the explicit transaction must be failed after the FETCH response failure"
+    );
+
+    // 次の `FETCH` は（飛ばした位置からの）行を返さず 25P02。
+    send_simple_query(&mut stream, "FETCH 1 FROM c");
+    assert_eq!(read_error_sqlstate(&mut stream), "25P02");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+
+    // 宣言し直せば先頭行（id=1）から取得できる。
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "DECLARE c CURSOR FOR SELECT id FROM documents LIMIT 11",
+    );
+    assert_eq!(read_command_complete(&mut stream), "DECLARE CURSOR");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "FETCH 1 FROM c");
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'T', "expected RowDescription");
+    let (kind, row) = read_message(&mut stream);
+    assert_eq!(kind, b'D', "expected DataRow");
+    // DataRow: 列数 i16 → 1 列目の長さ i32 → 値（テキスト形式）。
+    let len = i32::from_be_bytes(row[2..6].try_into().expect("length")) as usize;
+    assert_eq!(
+        &row[6..6 + len],
+        b"1",
+        "the first FETCH must return the first row"
+    );
+    assert_eq!(read_command_complete(&mut stream), "FETCH 1");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+}

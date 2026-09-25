@@ -422,6 +422,13 @@ impl CursorRegistry {
     /// （検索本体は再実行しない）。`name` が存在しない場合は `34000`
     /// （他セッション所有・不在のいずれも区別しない固定文言。security.md
     /// 「存在情報を漏らさない」対応）。
+    ///
+    /// 取得位置はエンジン実行の成功時点で進む（応答の送出確定を待たない）。これが
+    /// 安全なのは、wire 側で応答生成・送出に失敗した場合は必ず明示トランザクションが
+    /// `Failed` へ遷移（または切断で破棄）し、本レジストリごとカーソルが消える
+    /// ためで、行を飛ばした位置から次の `FETCH` が再開する経路は存在しない
+    /// （`wire-server::extended_query::execute_portal`・`simple_query` の応答失敗
+    /// 経路・`handshake::post_auth_loop` 参照。PR #1049 レビュー指摘 codex P1）。
     pub(crate) fn fetch(
         &mut self,
         name: &str,
