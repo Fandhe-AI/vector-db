@@ -887,7 +887,23 @@ pub fn bind_body_text_column(schema: &TableSchema) -> Result<usize, SqlSurfaceEr
 }
 
 /// `ORDER BY` 式（[`OrderByForm`]）を [`Ranking`] へ束縛する。
-fn bind_ranking(order_by: &OrderByForm, schema: &TableSchema) -> Result<Ranking, SqlSurfaceError> {
+///
+/// `validate_literal` が `false` の場合、ベクトルリテラル文字列の実パース
+/// （[`parse_vector_literal`]）を省略し、対象列がテーブルの `VECTOR` 列で
+/// あることの構造検証のみ行う（返る `Ranking` の `query` は空——実行には
+/// 使わない呼び出し元専用）。Describe（Bind 前の結果列導出。
+/// [`bind_projection_for_describe`]）専用の縮退経路であり、通常の実行系
+/// （[`bind_in_session`]）は常に `true` を渡す（対象ビヘイビア: Issue #935・
+/// WIRE-12・TASK-217。PR #1012 Cursor Bugbot 指摘: `parse_sql_prepared` が
+/// `$n` を構造検証専用の固定ダミー値〔`substitute_dummy`〕へ置換するため、
+/// `ORDER BY <vec列> <=> $n` を含む文の Describe はダミー値がベクトルとして
+/// 不正でも結果列だけは導出できる必要がある——結果列は投影列にのみ依存し
+/// ランキングの実値には依存しないため、この省略は安全）。
+fn bind_ranking(
+    order_by: &OrderByForm,
+    schema: &TableSchema,
+    validate_literal: bool,
+) -> Result<Ranking, SqlSurfaceError> {
     let (vec_idx, vec_dim) = vector_column(schema)?;
     match order_by {
         OrderByForm::Distance { column, literal } => {
@@ -903,7 +919,11 @@ fn bind_ranking(order_by: &OrderByForm, schema: &TableSchema) -> Result<Ranking,
                     "column {column:?} is not the table's VECTOR column"
                 )));
             }
-            let query = parse_vector_literal(literal, vec_dim)?;
+            let query = if validate_literal {
+                parse_vector_literal(literal, vec_dim)?
+            } else {
+                Vec::new()
+            };
             Ok(Ranking::Distance { query })
         }
         OrderByForm::FunctionCall { args, .. } => {
@@ -939,7 +959,11 @@ fn bind_ranking(order_by: &OrderByForm, schema: &TableSchema) -> Result<Ranking,
                     "column {vec_col:?} is not the table's VECTOR column"
                 )));
             }
-            let query = parse_vector_literal(vec_literal, vec_dim)?;
+            let query = if validate_literal {
+                parse_vector_literal(vec_literal, vec_dim)?
+            } else {
+                Vec::new()
+            };
             let text_column_index = text_column_index(schema, text_col)?;
             Ok(Ranking::Hybrid {
                 query,
@@ -1066,11 +1090,26 @@ pub fn bind_projection(
 /// はフラグのみ、式述語は `Bool` 型を要求）で WHERE を解釈する必要があるため、
 /// 挙動を複製せずこの 1 箇所に集約する。戻り値は
 /// `(metadata_filters, expr_filters, rls_predicate_present)` の組。
+///
+/// `dummy_equality_flags`（PR #1012 Cursor Bugbot 指摘対応。Issue #935・
+/// WIRE-12・TASK-217）: `where_predicates` 中に現れる
+/// [`WherePredicate::Equality`] を出現順に数えた添字で、その値が
+/// `sql::params::substitute_dummy` による `$n` 由来の固定ダミー文字列かどうか
+/// を示す。`bind_in_session`（Bind／Execute）は常に `&[]`（すべて実値として
+/// 検証）を渡し、`bind_projection_for_describe`（Prepared Describe 専用）のみ
+/// `core.rs::PreparedSql` が保持する事前計算済みフラグを渡す（`$n` を含まない
+/// 通常の Describe では自然に空になる）。`true` の位置に限り ENUM 列の
+/// 語彙照合（`declarative_filter::bind_all_for_describe`）を Describe 時点では
+/// 省略する——実際に不正なラベルが束縛された場合は Bind／Execute で
+/// `22P02` として検出される（PR #1012 の vector literal 修正と同じ方針。
+/// `WherePredicate::Prefix`／`BoolEquality`／`BoolColumn` の右辺値は `$n` に
+/// 束縛できない〔`sql::params` モジュールドキュメント〕ため対象外）。
 pub(crate) fn bind_where_predicates(
     where_predicates: &[WherePredicate],
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
+    dummy_equality_flags: &[bool],
 ) -> Result<
     (
         Vec<MetadataFilter>,
@@ -1080,16 +1119,29 @@ pub(crate) fn bind_where_predicates(
     SqlSurfaceError,
 > {
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
+    let mut filter_skip_enum_validation = Vec::with_capacity(where_predicates.len());
+    let mut equality_ordinal: usize = 0;
     let mut expr_filters = Vec::new();
     let mut rls_predicate_present = false;
     for predicate in where_predicates {
         match predicate {
             WherePredicate::Equality { column, value } => {
                 declarative_filters.push(DeclarativeFilter::equals(column.clone(), value.clone()));
+                filter_skip_enum_validation.push(
+                    dummy_equality_flags
+                        .get(equality_ordinal)
+                        .copied()
+                        .unwrap_or(false),
+                );
+                equality_ordinal += 1;
             }
             WherePredicate::Prefix { column, pattern } => {
                 let prefix = declarative_filter::parse_prefix_pattern(pattern)?;
                 declarative_filters.push(DeclarativeFilter::starts_with(column.clone(), prefix));
+                // `LIKE` パターン右辺には `$n` を束縛できない（`sql::params`
+                // モジュールドキュメント。パターン 4 は `Ident '=' $n` のみ）ため
+                // 常に「実値」として扱う。
+                filter_skip_enum_validation.push(false);
             }
             WherePredicate::PredicateCall { .. } => {
                 // allowlist が許可する述語呼び出し形は `visible()` のみ
@@ -1099,9 +1151,14 @@ pub(crate) fn bind_where_predicates(
             }
             WherePredicate::BoolEquality { column, value } => {
                 declarative_filters.push(DeclarativeFilter::bool_equals(column.clone(), *value));
+                // `$n` は常に `Token::StringLiteral` へ置換されるため
+                // `Ident '=' Ident("true"/"false")` の形にはならず、この述語の
+                // 右辺も `$n` に由来し得ない。
+                filter_skip_enum_validation.push(false);
             }
             WherePredicate::BoolColumn { column } => {
                 declarative_filters.push(DeclarativeFilter::bool_equals(column.clone(), true));
+                filter_skip_enum_validation.push(false);
             }
             WherePredicate::Expression(expr) => {
                 let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
@@ -1114,7 +1171,11 @@ pub(crate) fn bind_where_predicates(
             }
         }
     }
-    let metadata_filters = declarative_filter::bind_all(&declarative_filters, schema)?;
+    let metadata_filters = declarative_filter::bind_all_for_describe(
+        &declarative_filters,
+        schema,
+        &filter_skip_enum_validation,
+    )?;
     Ok((metadata_filters, expr_filters, rls_predicate_present))
 }
 
@@ -1203,9 +1264,9 @@ pub fn bind_in_session(
     let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
 
     let (metadata_filters, expr_filters, rls_predicate_present) =
-        bind_where_predicates(&stmt.where_predicates, schema, udfs, &mut node_budget)?;
+        bind_where_predicates(&stmt.where_predicates, schema, udfs, &mut node_budget, &[])?;
 
-    let ranking = bind_ranking(&stmt.order_by, schema)?;
+    let ranking = bind_ranking(&stmt.order_by, schema, true)?;
 
     let limit = validate_search_limit(stmt.limit)?;
 
@@ -1229,6 +1290,59 @@ pub fn bind_in_session(
         mode: resolved_mode,
         evaluation_order: stmt.evaluation_order,
     })
+}
+
+/// Describe（拡張クエリプロトコルの 'D' 種別 S。値未確定でも呼べる契約。
+/// `core.rs::EngineCore::describe_parsed_in_session`）専用: [`bind_in_session`]
+/// と同じ検証（`USING MODE` リテラル・投影列・`WHERE` 式）を行いつつ、結果列
+/// （[`ProjectedColumn`]）だけを返す。結果列は投影列にのみ依存しランキング
+/// の実値には依存しないため、`ORDER BY` のベクトルリテラルの実パース有無は
+/// Describe が返す列を変えない。
+///
+/// `validate_vector_literal` が `true`（実リテラルを持つ通常の Describe
+/// 呼び出し）の場合は [`bind_in_session`] と同じくベクトルリテラル文字列の
+/// 実パース（[`parse_vector_literal`] による形式・次元・非有限値・64 KiB
+/// 上限検証）を行う。`false`（`EngineCore::describe_prepared_in_session` 専用。
+/// 対象ビヘイビア: Issue #935・WIRE-12・TASK-217）の場合に限り、対象列が
+/// テーブルの `VECTOR` 列であることの構造検証のみに留めこの実パースを省略
+/// する——`EngineCore::parse_sql_prepared` は Parse 時点（値未確定）の構造
+/// 検証のため全 `$n` を固定ダミー値（`sql::params::substitute_dummy`）へ
+/// 置換しており、`ORDER BY <vec列> <=> $n` を含む文はこのダミー値がベクトル
+/// として不正なため実パースを省略しなければ Describe（Bind 前）が常に
+/// `22000` で失敗する（PR #1012 レビュー指摘対応: 実リテラルを持つ通常の
+/// 呼び出しではこの省略を行わず常に実値を検証し、Execute まで検証が遅延して
+/// 既存のエラー契約が壊れるのを防ぐ）。
+///
+/// `dummy_equality_flags`（PR #1012 Cursor Bugbot 指摘対応）は
+/// [`bind_where_predicates`] へそのまま渡す（同関数のドキュメント参照。
+/// `validate_vector_literal == true`——実 SQL テキスト経由の通常 Describe
+/// ——の呼び出しでは常に空スライスになる）。
+pub(crate) fn bind_projection_for_describe(
+    stmt: &ValidatedStatement,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    validate_vector_literal: bool,
+    dummy_equality_flags: &[bool],
+) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
+    if let Some(literal) = &stmt.search_mode {
+        SearchMode::parse_literal(literal)?;
+    }
+
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
+
+    let (_metadata_filters, _expr_filters, _rls_predicate_present) = bind_where_predicates(
+        &stmt.where_predicates,
+        schema,
+        udfs,
+        &mut node_budget,
+        dummy_equality_flags,
+    )?;
+
+    let _ranking = bind_ranking(&stmt.order_by, schema, validate_vector_literal)?;
+    let _limit = validate_search_limit(stmt.limit)?;
+
+    Ok(projection)
 }
 
 /// [`ValidatedDelete`] を意味論的に束縛する（SQL-18・TASK-191 の公開 API）。
@@ -1363,7 +1477,7 @@ pub fn bind_predicate_delete(
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
     let (metadata_filters, expr_filters, _rls_predicate_present) =
-        bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+        bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget, &[])?;
 
     let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
 
@@ -2150,8 +2264,13 @@ pub fn bind_update_form(
             let assignments = bind_set_assignments(&predicate.assignments, schema)?;
 
             let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-            let (metadata_filters, expr_filters, _rls_predicate_present) =
-                bind_where_predicates(&predicate.where_predicates, schema, udfs, &mut node_budget)?;
+            let (metadata_filters, expr_filters, _rls_predicate_present) = bind_where_predicates(
+                &predicate.where_predicates,
+                schema,
+                udfs,
+                &mut node_budget,
+                &[],
+            )?;
 
             if metadata_filters.is_empty() && expr_filters.is_empty() {
                 return Err(SqlSurfaceError::unsupported(
@@ -3416,10 +3535,32 @@ fn resolve_aggregate_input(
 /// 歯止め）。`stmt`（[`crate::sql::allowlist::ValidatedAggregate`]）に `pub`
 /// constructor が無いため、クレート外からの到達は現状
 /// [`crate::sql::allowlist::validate_sql`]（SQL テキスト経由）のみ。
+///
+/// 公開 API は常に全値検証を行う（ENUM ラベルの語彙照合を含む。PR #1012
+/// codex-review P1 指摘対応: 検証省略フラグは公開シグネチャへ露出しない）。
+/// Prepared Describe 専用の縮退経路は crate 内限定の
+/// [`bind_aggregate_with_dummy_flags`] が担う。
 pub fn bind_aggregate(
     stmt: &crate::sql::allowlist::ValidatedAggregate,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundAggregate, SqlSurfaceError> {
+    bind_aggregate_with_dummy_flags(stmt, schema, udfs, &[])
+}
+
+/// [`bind_aggregate`] の本体（crate 内限定。Issue #935・WIRE-12・TASK-217）。
+/// `dummy_equality_flags` は [`bind_where_predicates`] へそのまま渡す（同関数の
+/// ドキュメント参照）。空スライスは全値検証で [`bind_aggregate`] と同一。
+/// 非空のフラグを渡すのは `core.rs::EngineCore::describe_prepared_in_session`
+/// 経由の Prepared Describe（Bind 前・ダミー値束縛済み）だけであり、フラグは
+/// `core.rs::PreparedSql` が Parse 時点の元トークン列から計算した値に限る
+/// （クレート外から任意のフラグを渡して ENUM ラベル検証を省略させる経路を
+/// 作らないため `pub(crate)` に留める。PR #1012 codex-review P1 指摘対応）。
+pub(crate) fn bind_aggregate_with_dummy_flags(
+    stmt: &crate::sql::allowlist::ValidatedAggregate,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    dummy_equality_flags: &[bool],
 ) -> Result<BoundAggregate, SqlSurfaceError> {
     use crate::sql::allowlist::AggregateSelectItem;
 
@@ -3472,8 +3613,13 @@ pub fn bind_aggregate(
         }
     }
 
-    let (metadata_filters, expr_filters, rls_predicate_present) =
-        bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+    let (metadata_filters, expr_filters, rls_predicate_present) = bind_where_predicates(
+        stmt.where_predicates(),
+        schema,
+        udfs,
+        &mut node_budget,
+        dummy_equality_flags,
+    )?;
 
     let group_by = match stmt.group_by() {
         None => None,
@@ -3606,17 +3752,37 @@ fn compile_expr_filter_programs(
 /// （[`bind_aggregate`]）と共有する（[`bind_projection`]・[`bind_where_predicates`]）。
 /// ランキング段（`ORDER BY`・`USING PLAN`）・取得モード（`USING MODE`）は関与しない
 /// （[`crate::sql::allowlist::ValidatedScan`] が構造上持たないため）。
+///
+/// 公開 API は常に全値検証を行う（[`bind_aggregate`] と同じ方針。Prepared
+/// Describe 専用の縮退経路は crate 内限定の [`bind_scan_with_dummy_flags`]）。
 pub fn bind_scan(
     stmt: &crate::sql::allowlist::ValidatedScan,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundScan, SqlSurfaceError> {
+    bind_scan_with_dummy_flags(stmt, schema, udfs, &[])
+}
+
+/// [`bind_scan`] の本体（crate 内限定。Issue #935・WIRE-12・TASK-217）。
+/// `dummy_equality_flags` の契約・可視性の理由は
+/// [`bind_aggregate_with_dummy_flags`] と同じ。
+pub(crate) fn bind_scan_with_dummy_flags(
+    stmt: &crate::sql::allowlist::ValidatedScan,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    dummy_equality_flags: &[bool],
+) -> Result<BoundScan, SqlSurfaceError> {
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
     let projection = bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
 
-    let (metadata_filters, expr_filters, _rls_predicate_present) =
-        bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+    let (metadata_filters, expr_filters, _rls_predicate_present) = bind_where_predicates(
+        stmt.where_predicates(),
+        schema,
+        udfs,
+        &mut node_budget,
+        dummy_equality_flags,
+    )?;
 
     let limit = validate_search_limit(stmt.limit())?;
 

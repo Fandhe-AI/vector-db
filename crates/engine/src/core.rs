@@ -1231,6 +1231,50 @@ pub enum ParsedSql {
     Update(crate::sql::allowlist::ValidatedUpdateForm),
 }
 
+/// [`EngineCore::parse_sql_prepared`] の結果（Issue #935・WIRE-12・TASK-217）。
+/// 拡張クエリプロトコルの Parse が `$n` を含む SQL テキストを値未確定のまま
+/// 構造検証した「束縛前テンプレート」を運ぶ。行・台帳・世代のいずれにも触れて
+/// いない。[`EngineCore::bind_prepared`]（Bind。実値を束縛して [`ParsedSql`] を
+/// 得る）・[`EngineCore::describe_prepared_in_session`]（Describe。値未確定の
+/// ままダミー値束縛済みの結果を再利用する）の入力になる。
+///
+/// フィールドは非公開（構築は [`EngineCore::parse_sql_prepared`] のみ）。値は
+/// 常に `tokens` 内の [`crate::sql::lexer::Token::StringLiteral`]（Bind 時に
+/// 置換されるまでは `Token::Param`）としてのみ保持され、SQL テキストへは
+/// 一度も戻らない（インジェクション経路を作らない設計。`sql::params`
+/// モジュールドキュメント参照）。
+#[derive(Debug, Clone)]
+pub struct PreparedSql {
+    tokens: Vec<crate::sql::lexer::Token>,
+    param_count: u16,
+    dummy_parsed: ParsedSql,
+    /// `dummy_parsed` の `ORDER BY` ベクトルリテラル（`Distance` 形。
+    /// [`crate::sql::allowlist::OrderByForm::Distance`]）が、元の SQL テキストの
+    /// `$n`（[`crate::sql::params::order_by_distance_literal_is_param`]）に由来する
+    /// ダミー値かどうか。`true` の場合に限り `describe_prepared_in_session` は
+    /// このリテラルの実パースを省略してよい（PR #1012 レビュー指摘対応:
+    /// `$n` を含まない文では `false` のままとなり、`dummy_parsed` に残る実
+    /// リテラルは通常の Describe と同じく必ず検証される）。
+    order_by_distance_literal_is_param: bool,
+    /// `dummy_parsed` の `WHERE` 等価述語（[`crate::sql::allowlist::
+    /// WherePredicate::Equality`]）を出現順に並べ、各々の値が元の SQL
+    /// テキストの `$n`（[`crate::sql::params::where_equality_literal_is_param`]）
+    /// に由来するダミー値かどうかを示す。`true` の位置に限り
+    /// `describe_prepared_in_session` は ENUM 列の語彙照合を省略してよい
+    /// （PR #1012 Cursor Bugbot 指摘対応: `$n` を含まない等価述語では `false`
+    /// のままとなり、実リテラルは通常の Describe と同じく必ず検証される）。
+    where_equality_dummy_flags: Vec<bool>,
+}
+
+impl PreparedSql {
+    /// 文が要求するパラメータ数（`$n` の最大番号。1 始まり。`$n` を含まない
+    /// 文は 0）。[`EngineCore::bind_prepared`] に渡す `values` の個数と一致する
+    /// 必要がある。
+    pub fn param_count(&self) -> u16 {
+        self.param_count
+    }
+}
+
 struct InsertSchemaLookup<'a> {
     storage: &'a Storage,
     cached: std::cell::RefCell<Option<(String, TableSchema)>>,
@@ -2192,63 +2236,181 @@ impl EngineCore {
         &self,
         sql: &str,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
-        if let Ok(tokens) = crate::sql::lexer::tokenize(sql) {
-            let is_insert_statement = matches!(
-                tokens.first(),
-                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("INSERT")
-            );
-            if is_insert_statement {
-                let lookup = InsertSchemaLookup::new(&self.storage);
-                let stmt = crate::sql::allowlist::validate_insert_tokens(
-                    &tokens,
-                    &lookup,
-                    self.ledger_mode,
-                )?;
-                return Ok(ParsedSql::Insert(stmt));
-            }
+        let tokens = crate::sql::lexer::tokenize(sql)?;
+        self.parse_tokens(tokens)
+    }
 
-            let is_truncate_statement = matches!(
-                tokens.first(),
-                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("TRUNCATE")
-            );
-            if is_truncate_statement {
-                let stmt = crate::sql::allowlist::validate_truncate_tokens(
-                    &tokens,
-                    &self.storage,
-                    self.ledger_mode,
-                )?;
-                return Ok(ParsedSql::Truncate(stmt));
-            }
-
-            let is_delete_statement = matches!(
-                tokens.first(),
-                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DELETE")
-            );
-            if is_delete_statement {
-                let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
-                    &tokens,
-                    &self.storage,
-                    self.ledger_mode,
-                )?;
-                return Ok(ParsedSql::Delete(stmt));
-            }
-
-            let is_update_statement = matches!(
-                tokens.first(),
-                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("UPDATE")
-            );
-            if is_update_statement {
-                let stmt = crate::sql::allowlist::validate_update_form_tokens(
-                    &tokens,
-                    &self.storage,
-                    self.ledger_mode,
-                )?;
-                return Ok(ParsedSql::Update(stmt));
-            }
+    /// [`Self::parse_sql`] の字句解析済みトークン列版（Issue #935・WIRE-12。
+    /// `sql::allowlist::validate_sql`/`validate_sql_tokens` の分割と同じ理由）。
+    /// [`Self::parse_sql_prepared`]・[`Self::bind_prepared`] が、拡張クエリ
+    /// プロトコルの `$n` を実値の `Token::StringLiteral` へ置換したトークン列を
+    /// SQL テキストへ戻さずここへ直接渡すための入口（第 2 の実行器を作らない
+    /// 設計）。判定順序・エラー分類は [`Self::parse_sql`] と完全に同一
+    /// （[`Self::parse_sql`] は字句解析した上でここへ委譲するだけの薄い
+    /// ラッパーになった）。
+    fn parse_tokens(
+        &self,
+        tokens: Vec<crate::sql::lexer::Token>,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let is_insert_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("INSERT")
+        );
+        if is_insert_statement {
+            let lookup = InsertSchemaLookup::new(&self.storage);
+            let stmt =
+                crate::sql::allowlist::validate_insert_tokens(&tokens, &lookup, self.ledger_mode)?;
+            return Ok(ParsedSql::Insert(stmt));
         }
 
-        let stmt = crate::sql::allowlist::validate_sql(sql, &self.storage)?;
+        let is_truncate_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("TRUNCATE")
+        );
+        if is_truncate_statement {
+            let stmt = crate::sql::allowlist::validate_truncate_tokens(
+                &tokens,
+                &self.storage,
+                self.ledger_mode,
+            )?;
+            return Ok(ParsedSql::Truncate(stmt));
+        }
+
+        let is_delete_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DELETE")
+        );
+        if is_delete_statement {
+            let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
+                &tokens,
+                &self.storage,
+                self.ledger_mode,
+            )?;
+            return Ok(ParsedSql::Delete(stmt));
+        }
+
+        let is_update_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("UPDATE")
+        );
+        if is_update_statement {
+            let stmt = crate::sql::allowlist::validate_update_form_tokens(
+                &tokens,
+                &self.storage,
+                self.ledger_mode,
+            )?;
+            return Ok(ParsedSql::Update(stmt));
+        }
+
+        let stmt = crate::sql::allowlist::validate_sql_tokens(&tokens, &self.storage)?;
         Ok(ParsedSql::Statement(stmt))
+    }
+
+    /// Parse（拡張クエリプロトコルの 'P' 種別。Issue #935・WIRE-12・TASK-217）:
+    /// `$n` を含みうる SQL テキストを構造検証だけ行い、実行（行・台帳・世代への
+    /// 到達）は一切行わない。値はまだ受け取っていないため、各 `$n` は位置に
+    /// 依存しない固定ダミー値へ一時的に置換したうえで構造検証を通す
+    /// （`sql::params` モジュールドキュメント参照。ダミー置換後の `Statement` は
+    /// 破棄せず [`PreparedSql::dummy_parsed`] として Describe 専用に保持する——
+    /// 実行には決して使わない）。
+    ///
+    /// `$n` が [`crate::sql::params`] の許可位置以外に現れる場合・パラメータ番号が
+    /// 上限を超える場合のエラーは通常の構造検証エラーと同じ分類
+    /// （`42601`／`54000`）で返る。`$n` を含まない SQL は
+    /// [`Self::parse_sql`] と完全に同一の結果を `param_count() == 0` として包む。
+    pub fn parse_sql_prepared(
+        &self,
+        sql: &str,
+    ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
+        let param_count = crate::sql::params::validate_param_positions(&tokens)?;
+        // ダミー置換前の元トークン列から判定する（置換後は `$n` 自体が
+        // 消えるため、置換後トークン列からは判定できない）。
+        let order_by_distance_literal_is_param =
+            crate::sql::params::order_by_distance_literal_is_param(&tokens);
+        let where_equality_dummy_flags =
+            crate::sql::params::where_equality_literal_is_param(&tokens);
+        let dummy_tokens = crate::sql::params::substitute_dummy(&tokens);
+        let dummy_parsed = self.parse_tokens(dummy_tokens)?;
+        Ok(PreparedSql {
+            tokens,
+            param_count,
+            dummy_parsed,
+            order_by_distance_literal_is_param,
+            where_equality_dummy_flags,
+        })
+    }
+
+    /// Bind（拡張クエリプロトコルの 'B' 種別。Issue #935・WIRE-12・TASK-217）:
+    /// [`Self::parse_sql_prepared`] が返したテンプレートへ、実値（テキスト形式。
+    /// バイナリ形式パラメータは wire 層が `0A000` で拒否済みの前提）を束縛し、
+    /// [`Self::parse_sql`] が SQL テキストから直接返すのと**完全に同一**の
+    /// [`ParsedSql`] を返す（第 2 の実行器を作らない設計。実行・Describe は
+    /// 以降すべて既存の [`Self::execute_parsed_in_session`]／
+    /// [`Self::describe_parsed_in_session`] を通る）。
+    ///
+    /// `values` は `$1` から順に対応する実値（NULL は `None`。本バージョンでは
+    /// スコープ外として `22000` で拒否する。詳細は `sql::params` モジュール
+    /// ドキュメント参照）。個数が [`PreparedSql::param_count`] と一致しない場合は
+    /// `22000`（wire 層は Bind メッセージ自体の値件数検証で `08P01` を先に返す
+    /// 契約のため、ここでの不一致検出は防御的な保険）。
+    pub fn bind_prepared(
+        &self,
+        prepared: &PreparedSql,
+        values: &[Option<Vec<u8>>],
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        if values.len() != prepared.param_count as usize {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                format!(
+                    "expected {} bind value(s), got {}",
+                    prepared.param_count,
+                    values.len()
+                ),
+            ));
+        }
+        let decoded = crate::sql::params::decode_bind_values(&prepared.tokens, values)?;
+        let substituted = crate::sql::params::substitute_values(&prepared.tokens, &decoded)?;
+        self.parse_tokens(substituted)
+    }
+
+    /// Describe(statement)（拡張クエリプロトコルの 'D' 種別 S。Issue #935・
+    /// WIRE-12・TASK-217）: [`Self::parse_sql_prepared`] が Parse 時点で構築した
+    /// ダミー値束縛済みの [`ParsedSql`] をそのまま
+    /// [`Self::describe_parsed_in_session`] へ渡す。値が未確定な段階（Bind 前）
+    /// でも呼べる契約を維持するため、実際のパラメータ値は一切参照しない
+    /// （投影列の形はどの `$n` 値を束縛しても変わらない——列名・型は列挙型
+    /// `Statement`/`ValidatedInsert` 等の構造にのみ依存し、リテラル値には
+    /// 依存しないため、ダミー値での導出結果は実値束縛後と常に一致する）。
+    pub fn describe_prepared_in_session(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        prepared: &PreparedSql,
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        // `prepared.dummy_parsed` は Parse 時点（値未確定）の構造検証のため
+        // 全 `$n` を固定ダミー値へ置換した `ParsedSql` である。`ORDER BY`
+        // ベクトルリテラルの実パースを省略してよいのは、そのリテラルが
+        // 実際に `$n` に由来するダミー値である場合（`prepared.
+        // order_by_distance_literal_is_param == true`）に限る。`$n` を含まない
+        // 文では `substitute_dummy` が当該位置を変更しないため `dummy_parsed`
+        // にも元の実リテラルがそのまま残っており、この場合は通常の
+        // `describe_parsed_in_session` と同じく必ず検証する（PR #1012
+        // レビュー指摘対応: 以前は文中の `$n` の位置に関係なく常に検証を
+        // 省略していたため、パラメータ化されていない実ベクトルリテラルの
+        // 不正値まで Describe をすり抜けて Execute まで遅延していた）。
+        //
+        // 同じ理由で `WHERE` 等価述語（`prepared.where_equality_dummy_flags`）
+        // も `$n` 由来の位置に限り ENUM 列の語彙照合を省略する（PR #1012
+        // Cursor Bugbot 指摘対応: `describe_parsed_in_session_impl` 内で
+        // `bind_aggregate_with_dummy_flags`／`bind_projection_for_describe`／
+        // `bind_scan_with_dummy_flags` の
+        // いずれが呼ばれても同じ配列を共有する）。
+        self.describe_parsed_in_session_impl(
+            session,
+            &prepared.dummy_parsed,
+            prepared.order_by_distance_literal_is_param,
+            &prepared.where_equality_dummy_flags,
+        )
     }
 
     /// [`Self::parse_sql`] が返した [`ParsedSql`] を実行する（Issue #933・
@@ -2350,6 +2512,38 @@ impl EngineCore {
         parsed: &ParsedSql,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
+        // 実リテラルを持つ通常の呼び出し（wire-server の Describe・単体テスト
+        // 等）は常に値検証を行う（`skip_vector_literal_validation = false`・
+        // `dummy_equality_flags = &[]`）。ダミー値専用の縮退は
+        // `describe_prepared_in_session` のみが使う（PR #1012 レビュー指摘
+        // 対応。詳細は同メソッドのコメント参照）。
+        self.describe_parsed_in_session_impl(session, parsed, false, &[])
+    }
+
+    /// [`Self::describe_parsed_in_session`]／[`Self::describe_prepared_in_session`]
+    /// が共有する実装本体。`skip_vector_literal_validation` が `true` のときのみ
+    /// `ORDER BY` のベクトルリテラルの実パース（`parse_vector_literal` による
+    /// 形式・次元・非有限値・64 KiB 上限検証）を省略する——`prepared.dummy_parsed`
+    /// のような実パラメータを持たない構造検証専用の `ParsedSql` を Describe する
+    /// 場合に限る（Issue #935・WIRE-12・TASK-217。PR #1012 レビュー指摘対応）。
+    ///
+    /// `dummy_equality_flags`（PR #1012 Cursor Bugbot 指摘対応）は
+    /// `sql::parser::bind_where_predicates`（crate 内限定の
+    /// `bind_aggregate_with_dummy_flags`・`bind_projection_for_describe`・
+    /// `bind_scan_with_dummy_flags` 経由。公開 API の `bind_aggregate`／
+    /// `bind_scan` はフラグを受け取らず常に全値検証する）へそのまま渡し、`$n`
+    /// 由来のダミー値へ置換された `WHERE` 等価述語に限り ENUM 列の語彙照合
+    /// （`declarative_filter`）を Describe 時点では省略する。`$n` を含まない
+    /// 通常の Describe（`describe_parsed_in_session` 経由）では常に空スライスに
+    /// なり、実リテラルは従来どおり必ず検証される。
+    fn describe_parsed_in_session_impl(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        parsed: &ParsedSql,
+        skip_vector_literal_validation: bool,
+        dummy_equality_flags: &[bool],
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
+    {
         use crate::sql::allowlist::{DeleteStatement, Statement, ValidatedUpdateForm};
 
         match parsed {
@@ -2397,14 +2591,24 @@ impl EngineCore {
             }
             ParsedSql::Statement(Statement::Aggregate(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-                let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
+                let bound = crate::sql::parser::bind_aggregate_with_dummy_flags(
+                    validated,
+                    &schema,
+                    session.udfs(),
+                    dummy_equality_flags,
+                )?;
                 Ok(Some(crate::sql::describe::aggregate_columns(
                     &bound.projection,
                 )))
             }
             ParsedSql::Statement(Statement::Scan(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-                let bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
+                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                    validated,
+                    &schema,
+                    session.udfs(),
+                    dummy_equality_flags,
+                )?;
                 Ok(Some(crate::sql::describe::projected_columns(
                     bound.projection(),
                     &schema,
@@ -2435,14 +2639,26 @@ impl EngineCore {
                         &schema,
                     )))
                 } else {
-                    let bound = crate::sql::parser::bind_in_session(
+                    // `USING MODE` の解決（クエリ句 > セッション変数）は結果列に
+                    // 影響しないため Describe では不要——ただし `bind_in_session`
+                    // が行うリテラル形式検証はここでは行わない代わりに
+                    // `bind_projection_for_describe` が同じ検証を担う。
+                    // `skip_vector_literal_validation` が `true`（ダミー値専用の
+                    // `describe_prepared_in_session` 経由）の場合に限り、`ORDER BY`
+                    // のベクトルリテラルは構造検証に留め実パースを省略する。
+                    // 実リテラルを持つ通常の Describe（`skip_vector_literal_validation
+                    // == false`）は従来どおり `parse_vector_literal` による形式・
+                    // 次元・非有限値・64 KiB 上限検証を行う（PR #1012 レビュー指摘
+                    // 対応。詳細は `sql::parser::bind_projection_for_describe` 参照）。
+                    let projection = crate::sql::parser::bind_projection_for_describe(
                         validated,
                         &schema,
-                        session.search_mode(),
                         session.udfs(),
+                        !skip_vector_literal_validation,
+                        dummy_equality_flags,
                     )?;
                     Ok(Some(crate::sql::describe::projected_columns(
-                        bound.projection(),
+                        &projection,
                         &schema,
                     )))
                 }

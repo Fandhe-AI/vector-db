@@ -132,6 +132,7 @@ pub(crate) mod hnsw_cache;
 pub(crate) mod hnsw_hybrid;
 pub mod lexer;
 pub mod mode;
+pub mod params;
 pub mod parser;
 pub mod plan;
 pub mod returning;

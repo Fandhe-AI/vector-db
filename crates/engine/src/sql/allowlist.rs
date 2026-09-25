@@ -2731,6 +2731,10 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
 /// （`validate_insert_tokens`・Issue #485 と同じ「トークン列を受け取る本体 /
 /// 文字列を受け取り委譲する公開 API」という分割方針）。`validate_sql` は本関数へ
 /// 委譲するだけで挙動・エラー契約は分割前と不変。
+///
+/// `sql::params`（Issue #935・WIRE-12。拡張クエリプロトコルの `$n` 束縛）も、Bind 時に
+/// `Token::Param` を実値のトークンへ置換したトークン列を SQL テキストを経由せず
+/// この関数へ渡し、[`validate_sql`] と同一の判定順序・エラー分類を再利用する。
 pub(crate) fn validate_sql_tokens(
     tokens: &[Token],
     lookup: &impl TableLookup,
