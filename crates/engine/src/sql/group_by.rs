@@ -78,9 +78,10 @@ const TEXT_BUDGET_EXCEEDED_DETAIL: &str =
 /// 明示的に扱うための防御）側の detail 文言。
 const TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL: &str =
     "GROUP BY TEXT aggregate size accounting overflowed";
-/// PR #1049 レビュー指摘 P0 対応: [`accumulate_row`] がグループキー累計バイト数
-/// （[`MAX_GROUP_KEY_TOTAL_BYTES`]）と TEXT 集計状態累計バイト数
-/// （[`MAX_TEXT_ACCUMULATOR_TOTAL_BYTES`]）の合算を、呼び出し元が指定する結果
+/// PR #1049 レビュー指摘 P0／codex P1 対応: [`ResultBudget`]（[`accumulate_row`]・
+/// [`check_new_group_budget`] から呼ばれる）が、グループ数に比例する固定分・
+/// グループキー累計バイト数（[`MAX_GROUP_KEY_TOTAL_BYTES`]）・TEXT 集計状態累計
+/// バイト数（[`MAX_TEXT_ACCUMULATOR_TOTAL_BYTES`]）の合算を、呼び出し元が指定する結果
 /// バイト予算（`execute_grouped_aggregate` の `max_result_bytes`。通常は大きな
 /// 既定値、`sql::cursor::CursorStatement::Declare` の内側実行だけが
 /// `sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`＝16 MiB）で頭打ちにする際の
@@ -90,6 +91,79 @@ const TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL: &str =
 /// `MIN`/`MAX(TEXT)` の縮小方向更新を含むため走査順に依存する一時的な超過が
 /// ありうる（[`is_text_accumulator_budget_error`] のドキュメント参照）。
 const RESULT_BUDGET_EXCEEDED_DETAIL: &str = "GROUP BY result exceeds capacity";
+
+/// 生成中の結果 1 行（1 グループ）あたりの固定オーバーヘッド見積り（`id`・`score`
+/// 相当）。`sql::cursor::estimate_row_bytes` と同じ見積り規約（DoS 対策の概算で
+/// あり厳密なメモリ使用量ではない）。
+const RESULT_ROW_FIXED_BYTES: usize = 16;
+/// 結果セル 1 個あたりの固定見積り（非 `TEXT` の集計値〔整数・浮動小数・日時等〕の
+/// 8 バイト、`TEXT` セルの長さ以外の固定分 8 バイト。`sql::cursor::
+/// estimate_cell_bytes` と同じ規約）。
+const RESULT_CELL_FIXED_BYTES: usize = 8;
+
+/// 生成中の `GROUP BY` 結果全体に対する結果バイト予算（`execute_grouped_aggregate`
+/// の `max_result_bytes`）の判定器。
+///
+/// PR #1049 レビュー指摘（codex P1）対応: 見積りは「グループ数 × 1 グループあたりの
+/// 固定分（行オーバーヘッド＋グループキーセル・全集計セルの固定分）」＋グループキー
+/// 累計バイト数＋`TEXT` 集計状態累計バイト数。非 `TEXT` の集計値（最大
+/// [`MAX_GROUPS`] グループ × 集計項目数）もグループ数に比例する固定分として含める。
+/// 判定は新規グループ追加時（[`check_new_group_budget`]）と `TEXT` 集計状態の増加時
+/// （[`accumulate_row`]）の双方で行い、どちらの順で増えても生成途中で打ち切る
+/// （既存グループへの非 `TEXT` 集計値の更新は固定サイズのため見積りを変えない）。
+/// 通常の（カーソル非経由の）呼び出しは十分大きい予算
+/// （`sql::aggregate::MAX_AGGREGATE_RESULT_BYTES`）を渡すため既存挙動は変わらない。
+#[derive(Debug, Clone, Copy)]
+struct ResultBudget {
+    max_result_bytes: usize,
+    per_group_bytes: usize,
+}
+
+impl ResultBudget {
+    /// `bound` の結果形状（投影列数・集計項目数）から 1 グループあたりの固定分を
+    /// 求める。メモリ上はグループキー 1 個＋集計項目ごとのアキュムレータを保持し、
+    /// 結果は投影列数ぶんのセルになるため、両者の大きい方で見積もる。
+    fn new(bound: &BoundAggregate, max_result_bytes: usize) -> Result<Self, SqlSurfaceError> {
+        let cells = bound
+            .projection
+            .len()
+            .max(bound.items.len().saturating_add(1));
+        let per_group_bytes = cells
+            .checked_mul(RESULT_CELL_FIXED_BYTES)
+            .and_then(|b| b.checked_add(RESULT_ROW_FIXED_BYTES))
+            .ok_or_else(|| {
+                SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
+            })?;
+        Ok(Self {
+            max_result_bytes,
+            per_group_bytes,
+        })
+    }
+
+    /// `group_count` グループ・キー累計 `total_key_bytes`・`TEXT` 集計状態累計
+    /// `total_text_bytes` の生成中結果が予算内かを判定する（超過は
+    /// [`RESULT_BUDGET_EXCEEDED_DETAIL`] の `54000`）。
+    fn check(
+        &self,
+        group_count: usize,
+        total_key_bytes: usize,
+        total_text_bytes: usize,
+    ) -> Result<(), SqlSurfaceError> {
+        let estimated = group_count
+            .checked_mul(self.per_group_bytes)
+            .and_then(|b| b.checked_add(total_key_bytes))
+            .and_then(|b| b.checked_add(total_text_bytes))
+            .ok_or_else(|| {
+                SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
+            })?;
+        if estimated > self.max_result_bytes {
+            return Err(SqlSurfaceError::payload_too_large(
+                RESULT_BUDGET_EXCEEDED_DETAIL,
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// PR #603 codex-review P1 指摘対応: `err` が [`accumulate_row`] の TEXT 集計
 /// 容量超過（[`TEXT_BUDGET_EXCEEDED_DETAIL`]／[`TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL`]）
@@ -176,7 +250,9 @@ impl Ord for GroupKey {
 /// グループ表への新規グループキー追加前に有界性を検査する（[`MAX_GROUPS`]・
 /// [`MAX_GROUP_KEY_TOTAL_BYTES`]）。呼び出し元が「このキーは表に存在しない」ことを
 /// 確認済みの場合にのみ呼ぶ（既存キーの更新では追加コストが発生しないため呼ばない）。
-/// 成功時は `total_key_bytes` へ今回のキー分のバイト数を加算する。
+/// 成功時は `total_key_bytes` へ今回のキー分のバイト数を加算する。加えて、追加後の
+/// グループ数・キー累計と現時点の `TEXT` 集計状態累計で生成中の結果全体を
+/// [`ResultBudget`] と照合する（PR #1049 レビュー指摘 codex P1 対応）。
 ///
 /// `key_len` はグループキーのバイト数（NULL グループは 0）。Issue #351 で行走査
 /// ループが借用キー（`&str`）主体に変わったため、所有 `String`/`Option<String>`
@@ -185,6 +261,8 @@ fn check_new_group_budget(
     current_group_count: usize,
     total_key_bytes: &mut usize,
     key_len: usize,
+    total_text_accumulator_bytes: usize,
+    budget: &ResultBudget,
 ) -> Result<(), SqlSurfaceError> {
     if current_group_count >= MAX_GROUPS {
         return Err(SqlSurfaceError::payload_too_large(
@@ -199,6 +277,10 @@ fn check_new_group_budget(
             "GROUP BY key values exceed the allowed total size",
         ));
     }
+    let next_group_count = current_group_count.checked_add(1).ok_or_else(|| {
+        SqlSurfaceError::payload_too_large("GROUP BY group count accounting overflowed")
+    })?;
+    budget.check(next_group_count, next, total_text_accumulator_bytes)?;
     *total_key_bytes = next;
     Ok(())
 }
@@ -239,14 +321,14 @@ fn accumulate_row(
     vector: &RowVector<'_>,
     scanned: &[Option<row_codec::ScalarRef<'_>>],
     total_text_accumulator_bytes: &mut usize,
-    // PR #1049 レビュー指摘 P0 対応: 呼び出し時点のグループキー累計バイト数
-    // （読み取り専用。本関数はキーを追加しないため `&mut` で渡す必要はない）。
-    // `total_text_accumulator_bytes` との合算を `max_result_bytes` で検査する
-    // ために使う。
+    // PR #1049 レビュー指摘 P0／codex P1 対応: 呼び出し時点のグループ数（この行が
+    // 属するグループを含む。新規グループはまだ表へ挿入していなくても数に含める）と
+    // グループキー累計バイト数（いずれも読み取り専用。本関数はグループ・キーを
+    // 追加しない）。`TEXT` 集計状態の増加時に生成中の結果全体を [`ResultBudget`]
+    // と照合するために使う。
+    group_count: usize,
     total_key_bytes: usize,
-    // PR #1049 レビュー指摘 P0 対応: 呼び出し元が指定する結果バイト予算
-    // （[`RESULT_BUDGET_EXCEEDED_DETAIL`] ドキュメント参照）。
-    max_result_bytes: usize,
+    budget: &ResultBudget,
     expr_scratch: &mut Vec<StackValue>,
 ) -> Result<(), SqlSurfaceError> {
     for (accumulator, item) in accs.iter_mut().zip(items) {
@@ -270,24 +352,16 @@ fn accumulate_row(
                     TEXT_BUDGET_EXCEEDED_DETAIL,
                 ));
             }
-            // PR #1049 レビュー指摘 P0 対応: グループキー累計・TEXT 集計状態
-            // 累計はそれぞれ独立に [`MAX_GROUP_KEY_TOTAL_BYTES`]・
+            // PR #1049 レビュー指摘 P0／codex P1 対応: グループキー累計・TEXT
+            // 集計状態累計はそれぞれ独立に [`MAX_GROUP_KEY_TOTAL_BYTES`]・
             // [`MAX_TEXT_ACCUMULATOR_TOTAL_BYTES`]（各 16 MiB）で頭打ちに
-            // なるのみで、合計は最大 32 MiB に達しうる。完成した
-            // [`crate::sql::exec::QueryResult`] 全体の容量を呼び出し元が指定
-            // する `max_result_bytes` で追加検査し、`sql::cursor::
-            // CursorStatement::Declare` の内側実行では `CursorRegistry::
-            // declare` の 16 MiB 判定へ到達する前に生成中の段階で打ち切る。
-            let combined = total_key_bytes
-                .checked_add(*total_text_accumulator_bytes)
-                .ok_or_else(|| {
-                    SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
-                })?;
-            if combined > max_result_bytes {
-                return Err(SqlSurfaceError::payload_too_large(
-                    RESULT_BUDGET_EXCEEDED_DETAIL,
-                ));
-            }
+            // なるのみで、合計（＋グループ数に比例する非 TEXT 集計値の固定分）は
+            // それを超えうる。生成中の結果全体を呼び出し元が指定する予算
+            // （[`ResultBudget`]）で追加検査し、`sql::cursor::CursorStatement::
+            // Declare` の内側実行では `CursorRegistry::declare` の 16 MiB 判定へ
+            // 到達する前に生成中の段階で打ち切る（新規グループ追加時の判定は
+            // [`check_new_group_budget`] が担う）。
+            budget.check(group_count, total_key_bytes, *total_text_accumulator_bytes)?;
         } else if after < before {
             // MIN/MAX(TEXT) の極値がより短い文字列へ更新された縮小方向。
             // 実際の保持量を正確に反映するため減算する（`checked_sub` の
@@ -332,7 +406,7 @@ fn observe_group_enumeration(
     null_group: &mut Option<Vec<Accumulator>>,
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
-    max_result_bytes: usize,
+    budget: &ResultBudget,
 ) -> Result<bool, SqlSurfaceError> {
     let Some(groups) = index.column_groups(group_by.column_index) else {
         return Ok(false);
@@ -361,7 +435,13 @@ fn observe_group_enumeration(
     // （`&[u32]`）は借用のまま [`observe_group_slots`] へ渡せるため複製不要。
     for (value, slots) in groups {
         let current_group_count = string_groups.len() + usize::from(null_group.is_some());
-        check_new_group_budget(current_group_count, total_key_bytes, value.len())?;
+        check_new_group_budget(
+            current_group_count,
+            total_key_bytes,
+            value.len(),
+            *total_text_accumulator_bytes,
+            budget,
+        )?;
         let mut accs = new_accumulators(&bound.items)?;
         if count_star_only {
             observe_group_count_only(slots, &mut accs)?;
@@ -376,8 +456,9 @@ fn observe_group_enumeration(
             referenced,
             &mut accs,
             total_text_accumulator_bytes,
+            current_group_count.saturating_add(1),
             *total_key_bytes,
-            max_result_bytes,
+            budget,
         ) {
             Ok(()) => {}
             Err(err) if is_text_accumulator_budget_error(&err) => {
@@ -397,7 +478,13 @@ fn observe_group_enumeration(
     }
     if !null_slots.is_empty() {
         let current_group_count = string_groups.len() + usize::from(null_group.is_some());
-        check_new_group_budget(current_group_count, total_key_bytes, 0)?;
+        check_new_group_budget(
+            current_group_count,
+            total_key_bytes,
+            0,
+            *total_text_accumulator_bytes,
+            budget,
+        )?;
         let mut accs = new_accumulators(&bound.items)?;
         if count_star_only {
             observe_group_count_only(&null_slots, &mut accs)?;
@@ -412,8 +499,9 @@ fn observe_group_enumeration(
             referenced,
             &mut accs,
             total_text_accumulator_bytes,
+            current_group_count.saturating_add(1),
             *total_key_bytes,
-            max_result_bytes,
+            budget,
         ) {
             Ok(()) => {}
             Err(err) if is_text_accumulator_budget_error(&err) => {
@@ -459,8 +547,10 @@ fn observe_group_slots(
     referenced: &ReferencedColumns,
     accs: &mut [Accumulator],
     total_text_accumulator_bytes: &mut usize,
+    // このグループを含むグループ数（[`accumulate_row`] の同名引数参照）。
+    group_count: usize,
     total_key_bytes: usize,
-    max_result_bytes: usize,
+    budget: &ResultBudget,
 ) -> Result<(), SqlSurfaceError> {
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
@@ -500,8 +590,9 @@ fn observe_group_slots(
             &vector,
             &scanned,
             total_text_accumulator_bytes,
+            group_count,
             total_key_bytes,
-            max_result_bytes,
+            budget,
             &mut expr_scratch,
         )?;
     }
@@ -536,7 +627,7 @@ fn observe_candidate_slots_grouped(
     null_group: &mut Option<Vec<Accumulator>>,
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
-    max_result_bytes: usize,
+    budget: &ResultBudget,
 ) -> Result<bool, SqlSurfaceError> {
     match observe_candidate_slots_grouped_inner(
         snapshot,
@@ -549,7 +640,7 @@ fn observe_candidate_slots_grouped(
         null_group,
         total_key_bytes,
         total_text_accumulator_bytes,
-        max_result_bytes,
+        budget,
     ) {
         Ok(()) => Ok(true),
         Err(GroupAccumulateError::TextBudgetExceeded) => {
@@ -577,7 +668,7 @@ fn observe_candidate_slots_grouped_inner(
     null_group: &mut Option<Vec<Accumulator>>,
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
-    max_result_bytes: usize,
+    budget: &ResultBudget,
 ) -> Result<(), GroupAccumulateError> {
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
@@ -650,12 +741,19 @@ fn observe_candidate_slots_grouped_inner(
                         &vector,
                         &scanned,
                         total_text_accumulator_bytes,
+                        total_group_count,
                         *total_key_bytes,
-                        max_result_bytes,
+                        budget,
                         &mut expr_scratch,
                     )?;
                 } else {
-                    check_new_group_budget(total_group_count, total_key_bytes, key_str.len())?;
+                    check_new_group_budget(
+                        total_group_count,
+                        total_key_bytes,
+                        key_str.len(),
+                        *total_text_accumulator_bytes,
+                        budget,
+                    )?;
                     let mut accs = new_accumulators(&bound.items)?;
                     accumulate_row(
                         &mut accs,
@@ -664,8 +762,9 @@ fn observe_candidate_slots_grouped_inner(
                         &vector,
                         &scanned,
                         total_text_accumulator_bytes,
+                        total_group_count.saturating_add(1),
                         *total_key_bytes,
-                        max_result_bytes,
+                        budget,
                         &mut expr_scratch,
                     )?;
                     string_groups.insert(try_clone_str(key_str)?, accs);
@@ -673,9 +772,18 @@ fn observe_candidate_slots_grouped_inner(
             }
             None => {
                 if null_group.is_none() {
-                    check_new_group_budget(total_group_count, total_key_bytes, 0)?;
+                    check_new_group_budget(
+                        total_group_count,
+                        total_key_bytes,
+                        0,
+                        *total_text_accumulator_bytes,
+                        budget,
+                    )?;
                     *null_group = Some(new_accumulators(&bound.items)?);
                 }
+                // NULL グループは直前で存在が確定しているため、グループ数は
+                // 非 NULL グループ数＋1。
+                let group_count = string_groups.len().saturating_add(1);
                 let accs = null_group.as_mut().ok_or_else(|| {
                     accumulator_bug("null group entry disappeared after insertion")
                 })?;
@@ -686,8 +794,9 @@ fn observe_candidate_slots_grouped_inner(
                     &vector,
                     &scanned,
                     total_text_accumulator_bytes,
+                    group_count,
                     *total_key_bytes,
-                    max_result_bytes,
+                    budget,
                     &mut expr_scratch,
                 )?;
             }
@@ -915,8 +1024,9 @@ pub(crate) fn execute_grouped_aggregate(
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundAggregate,
-    // PR #1049 レビュー指摘 P0 対応: グループキー累計・TEXT 集計状態累計の
-    // 合算に対する結果バイト予算（[`RESULT_BUDGET_EXCEEDED_DETAIL`]・
+    // PR #1049 レビュー指摘 P0／codex P1 対応: 生成中の結果全体（グループ数に
+    // 比例する固定分＋グループキー累計＋TEXT 集計状態累計。[`ResultBudget`]）に
+    // 対する結果バイト予算（[`RESULT_BUDGET_EXCEEDED_DETAIL`]・
     // `aggregate.rs::execute_aggregate_with_cache` ドキュメント参照）。通常の
     // （カーソル非経由の）呼び出し元は [`crate::sql::aggregate::
     // MAX_AGGREGATE_RESULT_BYTES`] を渡し、`sql::cursor::CursorStatement::
@@ -964,6 +1074,9 @@ pub(crate) fn execute_grouped_aggregate(
     let mut null_group: Option<Vec<Accumulator>> = None;
     let mut total_key_bytes: usize = 0;
     let mut total_text_accumulator_bytes: usize = 0;
+    // PR #1049 レビュー指摘 codex P1 対応: 生成中の結果全体に対する予算判定器
+    // （[`ResultBudget`]）。索引経路・全走査経路の双方が共有する。
+    let budget = ResultBudget::new(bound, max_result_bytes)?;
 
     // Issue #475: `WHERE` なしの `GROUP BY`（列挙形。`ScalarIndex::column_groups`/
     // `slots_without_value` で索引済みの値ごとにグループを直接構築する）、また
@@ -1041,7 +1154,7 @@ pub(crate) fn execute_grouped_aggregate(
                             &mut null_group,
                             &mut total_key_bytes,
                             &mut total_text_accumulator_bytes,
-                            max_result_bytes,
+                            &budget,
                         )?;
                     } else {
                         let id_preds: Vec<crate::sql::scalar_plan::IdPredicate> = bound
@@ -1068,7 +1181,7 @@ pub(crate) fn execute_grouped_aggregate(
                                 &mut null_group,
                                 &mut total_key_bytes,
                                 &mut total_text_accumulator_bytes,
-                                max_result_bytes,
+                                &budget,
                             )?;
                         }
                     }
@@ -1244,8 +1357,9 @@ pub(crate) fn execute_grouped_aggregate(
                                 &vector,
                                 &scanned,
                                 &mut total_text_accumulator_bytes,
+                                total_group_count,
                                 total_key_bytes,
-                                max_result_bytes,
+                                &budget,
                                 &mut expr_scratch,
                             )?;
                         } else {
@@ -1256,6 +1370,8 @@ pub(crate) fn execute_grouped_aggregate(
                                 total_group_count,
                                 &mut total_key_bytes,
                                 key_str.len(),
+                                total_text_accumulator_bytes,
+                                &budget,
                             )?;
                             let mut accs = new_accumulators(&bound.items)?;
                             accumulate_row(
@@ -1265,8 +1381,9 @@ pub(crate) fn execute_grouped_aggregate(
                                 &vector,
                                 &scanned,
                                 &mut total_text_accumulator_bytes,
+                                total_group_count.saturating_add(1),
                                 total_key_bytes,
-                                max_result_bytes,
+                                &budget,
                                 &mut expr_scratch,
                             )?;
                             string_groups.insert(try_clone_str(key_str)?, accs);
@@ -1274,9 +1391,18 @@ pub(crate) fn execute_grouped_aggregate(
                     }
                     None => {
                         if null_group.is_none() {
-                            check_new_group_budget(total_group_count, &mut total_key_bytes, 0)?;
+                            check_new_group_budget(
+                                total_group_count,
+                                &mut total_key_bytes,
+                                0,
+                                total_text_accumulator_bytes,
+                                &budget,
+                            )?;
                             null_group = Some(new_accumulators(&bound.items)?);
                         }
+                        // NULL グループは直前で存在が確定しているため、グループ数は
+                        // 非 NULL グループ数＋1。
+                        let group_count = string_groups.len().saturating_add(1);
                         let accs = null_group.as_mut().ok_or_else(|| {
                             accumulator_bug("null group entry disappeared after insertion")
                         })?;
@@ -1287,8 +1413,9 @@ pub(crate) fn execute_grouped_aggregate(
                             &vector,
                             &scanned,
                             &mut total_text_accumulator_bytes,
+                            group_count,
                             total_key_bytes,
-                            max_result_bytes,
+                            &budget,
                             &mut expr_scratch,
                         )?;
                     }
@@ -1647,6 +1774,89 @@ mod tests {
         let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, 1, None, None)
             .expect_err("tiny caller-supplied budget must reject before default cap");
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// `(id, lang)` の行を tenant-a・Public で raw redb 書き込みする
+    /// （[`schema_with_text_group_column`] 専用）。
+    fn write_lang_rows(storage: &Storage, schema: &TableSchema, rows: &[(u64, &str)]) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("docs"),
+                ))
+                .expect("open row table");
+            for (id, lang) in rows {
+                let metadata = crate::row_codec::encode_scalar_columns(
+                    schema,
+                    &[
+                        crate::row_codec::Value::Null,
+                        crate::row_codec::Value::Text((*lang).to_string()),
+                    ],
+                )
+                .expect("encode scalar columns");
+                let buf = crate::storage::encode_row(&RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 2.0, 3.0],
+                    metadata: &metadata,
+                })
+                .expect("encode row");
+                table
+                    .insert(("tenant-a", *id), buf.as_slice())
+                    .expect("insert row");
+            }
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    /// PR #1049 レビュー指摘（codex P1）の回帰テスト: `TEXT` 集計を含まない
+    /// `COUNT(*) ... GROUP BY lang` でも、グループ追加のたびに生成中の結果全体
+    /// （グループ数 × 1 グループあたりの固定分＋キー累計）を予算と照合する。
+    /// 修正前は `TEXT` 集計状態が増えたときしか判定しなかったため、非 `TEXT` 集計の
+    /// グループ数・キー追加だけで予算を超えても打ち切られなかった。
+    ///
+    /// 見積り: 投影 2 列・集計 1 項目 → 1 グループ 16＋2×8＝32 バイト。3 グループ
+    /// （`ja`・`en`・`fr`、キー計 6 バイト）で 3×32＋6＝102 バイト。
+    #[test]
+    fn grouped_non_text_aggregate_is_bounded_by_result_budget_on_group_addition() {
+        let path = unique_db_path("group-by-result-budget-non-text");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text_group_column();
+        storage.create_table(&schema).expect("create table");
+        write_lang_rows(&storage, &schema, &[(1, "ja"), (2, "en"), (3, "fr")]);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let bound = bound_count_star_grouped_by_lang();
+
+        let ok = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, 102, None, None)
+            .expect("estimate exactly at the budget must succeed");
+        assert_eq!(ok.rows.len(), 3);
+
+        let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, 101, None, None)
+            .expect_err("adding the third group must exceed the budget");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// [`ResultBudget::check`] はグループ数に比例する固定分・キー累計・`TEXT`
+    /// 集計状態累計の合計で判定し、どの成分の増加でも超過を検出する。
+    #[test]
+    fn result_budget_counts_groups_keys_and_text_state() {
+        let bound = bound_count_star_grouped_by_lang();
+        let budget = ResultBudget::new(&bound, 100).expect("budget");
+        assert_eq!(budget.per_group_bytes, 32);
+        budget.check(3, 4, 0).expect("3*32+4 = 100 fits");
+        assert_eq!(budget.check(3, 5, 0).unwrap_err().wire_code(), "54000");
+        assert_eq!(budget.check(3, 4, 1).unwrap_err().wire_code(), "54000");
+        assert_eq!(budget.check(4, 0, 0).unwrap_err().wire_code(), "54000");
+        assert_eq!(
+            budget.check(usize::MAX, 0, 0).unwrap_err().wire_code(),
+            "54000",
+            "overflow must fail closed"
+        );
     }
 
     // --- cmp_signed_to_literal（Issue #892・D8） --------------------------
