@@ -700,8 +700,17 @@ fn post_auth_loop<'e>(
             },
             b'E' => match engine {
                 Some(engine) => {
+                    // SQL-31・TASK-221（Issue #942 codex-review 指摘対応）:
+                    // `engine` が `Some` の間は `txn` も `Some`（`'Q'` 分岐と
+                    // 同じ不変条件。`post_auth_loop` 呼び出し元で対で構築する）。
+                    // 拡張クエリプロトコル経由の Execute も簡易クエリと同一の
+                    // `SessionTransaction` を共有し、`BEGIN`/`COMMIT`/
+                    // `ROLLBACK` を受理できるようにする。
+                    let txn = txn
+                        .as_mut()
+                        .expect("session transaction must exist whenever engine is attached");
                     match crate::extended_query::handle_execute(
-                        stream, engine, ctx, session, extended,
+                        stream, engine, ctx, session, txn, extended,
                     )? {
                         crate::extended_query::LoopSignal::Continue => {}
                         crate::extended_query::LoopSignal::Closed => return Ok(()),

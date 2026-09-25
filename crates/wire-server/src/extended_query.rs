@@ -22,11 +22,13 @@
 //! 読み捨てる（'X' は通常どおり終了、COPY・FunctionCall・未知の型バイトは
 //! 破棄対象にせず fail-closed に切断する。詳細は `post_auth_loop` 参照）。
 //! Sync 到達時にフラグを解除し、全 portal（名前付き・無名を問わない）を
-//! 破棄してから `ReadyForQuery` を返し、同期を回復する（本サーバーは明示
-//! トランザクション〔`BEGIN`/`COMMIT`〕を持たず各 Sync サイクルが暗黙
-//! トランザクションに相当するため、PostgreSQL がトランザクション終了時に
-//! portal を閉じる契約〔PostgreSQL 34.4「Bind」〕をそのまま Sync 境界へ
-//! 適用する。名前付き prepared statement は PostgreSQL と同様に保持する）。
+//! 破棄してから `ReadyForQuery` を返し、同期を回復する（portal の寿命は
+//! 明示トランザクション〔`BEGIN`/`COMMIT`/`ROLLBACK`。SQL-31・TASK-221〕の
+//! 有無とは独立な軸であり、`Active` な明示トランザクション中でも各 Sync
+//! サイクルで portal は破棄される——PostgreSQL がトランザクション終了時に
+//! portal を閉じる契約〔PostgreSQL 34.4「Bind」〕とは異なり、本サーバーは
+//! Sync 境界そのものを portal 破棄の契機とする。名前付き prepared statement
+//! は PostgreSQL と同様に保持する）。
 //!
 //! 一方、`read_length_prefixed_body` 自体が失敗した場合（メッセージの境界を
 //! 確定できない・宣言長が上限を超える等）は [`respond_error_and_close`] が
@@ -39,10 +41,11 @@
 //! ——後から statement が再 Parse されても portal の実行対象は変わらない）、
 //! Execute が実行・行送出（`max_rows` による分割送出。[`PortalState::
 //! Suspended`]）・完了（[`PortalState::Done`]。副作用は再実行しない）を管理
-//! する。名前付き・無名を問わず全 portal は Sync のたびに破棄される（本
-//! サーバーには明示トランザクションが無く各 Sync サイクルが暗黙
-//! トランザクションに相当するため。PostgreSQL のトランザクション終了時の
-//! portal 破棄契約に相当。名前付き prepared statement は Sync を越えて
+//! する。名前付き・無名を問わず全 portal は Sync のたびに破棄される
+//! （portal の寿命は明示トランザクション〔SQL-31・TASK-221〕の有無とは
+//! 独立に Sync 境界で決まる契約。PostgreSQL のトランザクション終了時の
+//! portal 破棄契約とは異なる点はモジュール冒頭「エラー後の同期回復」節
+//! 参照。名前付き prepared statement は Sync を越えて
 //! 残る）。Close(Statement) はその statement から作られた portal もまとめて
 //! 閉じる。
 //!
@@ -539,12 +542,12 @@ enum PortalState {
     /// （実装既定値として件数 0 のタグ）を返す契約）。
     Done { tag: String },
     /// この portal への Execute 実行を試みたが失敗した終端状態。
-    /// `engine::execute_parsed_in_session` を呼ぶ**前**に立て、成功した
+    /// `engine::execute_parsed_in_txn` を呼ぶ**前**に立て、成功した
     /// 場合のみ末尾で `Done`／`Suspended` へ上書きする（`execute_portal`
     /// 参照）。こうすることで、実行本体の呼び出し自体が失敗した場合・
     /// 呼び出し成功後の後処理（結果列整合検査・行エンコード・中断バイト
     /// 上限判定・応答フレーム送出）が失敗した場合のいずれも、以降の
-    /// 再 Execute で `engine::execute_parsed_in_session` を再実行して副作用を
+    /// 再 Execute で `engine::execute_parsed_in_txn` を再実行して副作用を
     /// 重複させることを防ぐ（PR #1013 レビュー指摘・P1・Cursor Bugbot
     /// Medium「Failed Execute leaves portal runnable」。再 Execute は
     /// `HandlerError::PortalFailed` で拒否し、実行し直すには新しい Bind で
@@ -630,10 +633,11 @@ impl PortalStore {
     }
 
     /// Sync（'S'）が名前付き・無名を問わず全 portal を破棄する（[`handle_sync`]
-    /// が呼ぶ）。本サーバーには明示トランザクション（`BEGIN`/`COMMIT`）が無く
-    /// 各 Sync サイクルが暗黙トランザクションに相当するため、PostgreSQL の
-    /// 「トランザクション終了時に portal を閉じる」契約〔PostgreSQL 34.4
-    /// 「Bind」〕を Sync 境界へ適用する（codex P1 指摘・PR #1013。従来は
+    /// が呼ぶ）。portal の寿命は明示トランザクション（`BEGIN`/`COMMIT`/
+    /// `ROLLBACK`。SQL-31・TASK-221）の有無とは独立に Sync 境界そのもので
+    /// 決まる契約とし、PostgreSQL の「トランザクション終了時に portal を
+    /// 閉じる」契約〔PostgreSQL 34.4「Bind」〕とは意図的に異なる（codex P1
+    /// 指摘・PR #1013。従来は
     /// 無名 portal のみ破棄しており、名前付き portal が Sync を越えて次回
     /// サイクルへ誤って持ち越されていた）。名前付き prepared statement
     /// （[`PreparedStatementStore`]）はこの対象外——PostgreSQL 同様、
@@ -1288,18 +1292,26 @@ fn handle_bind_body(
 
 /// Execute（'E'）を処理する（`engine` が接続済みの場合のみ呼ばれる）。portal
 /// の状態（[`PortalState`]）に応じて実行・分割送出・再利用を行う
-/// （モジュールドキュメント「portal のライフサイクル」節参照）。
-pub(crate) fn handle_execute(
+/// （モジュールドキュメント「portal のライフサイクル」節参照）。`txn` は
+/// 接続単位の [`engine::sql::transaction::SessionTransaction`]（`handshake::
+/// post_auth_loop` が簡易クエリと共有して保持する同一の値。SQL-31・
+/// TASK-221・Issue #942 codex-review 指摘対応: 以前は本関数が
+/// `execute_parsed_in_session`（autocommit 専用）を呼んでいたため、拡張
+/// クエリプロトコル経由の `BEGIN` は `Idle` から進めず常に `0A000`
+/// （`transaction_feature_not_supported`）で拒否されていた。`execute_parsed_
+/// in_txn` へ切り替え、簡易クエリと同じ状態機械を共有する）。
+pub(crate) fn handle_execute<'e>(
     stream: &mut TcpStream,
-    engine: &EngineCore,
+    engine: &'e EngineCore,
     ctx: &engine::policy::PolicyContext,
     session: &mut SessionState,
+    txn: &mut engine::sql::transaction::SessionTransaction<'e>,
     state: &mut ExtendedQueryState,
 ) -> io::Result<LoopSignal> {
     // commit 成功から本関数が応答を書き終えるまでの区間全体を覆う RAII ガード
     // （RECOVER-5 (3)・`simple_query::execute_and_respond` と同じ保護区間の
-    // 取り方）。Execute は `engine::execute_parsed_in_session` を通じて
-    // 書き込み系文（`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` 等）の commit も
+    // 取り方）。Execute は `engine::execute_parsed_in_txn` を通じて書き込み系
+    // 文（`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`/`COMMIT` 等）の commit も
     // 実行しうるため、簡易クエリと同様にこのガードが無いと commit 成功後
     // panic した際の緊急応答（`recovery::panic_hook`・TASK-97・RECOVER-6）が
     // 発火しない（PR #1013 レビュー指摘・cursor High: ResponseBoundaryGuard
@@ -1333,6 +1345,7 @@ pub(crate) fn handle_execute(
         engine,
         ctx,
         session,
+        txn,
         state,
         &msg.portal_name,
         msg.max_rows,
@@ -1355,12 +1368,19 @@ fn write_command_complete(stream: &mut TcpStream, tag: &str) -> Result<(), Handl
 /// Execute 本体（`crate::simple_query::execute_with_emergency_registration` と
 /// `map_outcome`/`TagShape` を再利用し、簡易クエリの `run_statement` と同じ
 /// 緊急応答登録位置・タグ組み立て規則を共有する。WIRE-11: 第 2 の実行器を
-/// 作らない）。
-fn execute_portal(
+/// 作らない）。`txn` は [`handle_execute`] が受け取った接続単位の
+/// `SessionTransaction` をそのまま引き継ぎ、`engine::execute_parsed_in_txn`
+/// （SQL-31・TASK-221）へ渡す。
+///
+/// `txn` 追加で `clippy::too_many_arguments`（閾値 7）を超える
+/// （`sql/exec.rs`・`tenant.rs` 等、既存の同種箇所と同じ対応）。
+#[allow(clippy::too_many_arguments)]
+fn execute_portal<'e>(
     stream: &mut TcpStream,
-    engine: &EngineCore,
+    engine: &'e EngineCore,
     ctx: &engine::policy::PolicyContext,
     session: &mut SessionState,
+    txn: &mut engine::sql::transaction::SessionTransaction<'e>,
     state: &mut ExtendedQueryState,
     portal_name: &str,
     max_rows: i32,
@@ -1422,18 +1442,37 @@ fn execute_portal(
         // `engine::sql::allowlist::Statement`（`ParsedSql::Statement`）は
         // `SELECT`／`SET search_mode`／`CREATE FUNCTION`／`EXPLAIN` のみで、
         // いずれも redb への書き込み commit を伴わない（`CREATE FUNCTION`・
-        // `SET` はセッションローカルな状態変更のみ）。それ以外の
-        // `ParsedSql`（`Insert`/`Truncate`/`Delete`/`Update`）は
-        // `execute_parsed_in_session` が `Ok` を返した時点で commit 成功が
-        // 確定している（`RECOVER-5`「commit 成功境界」契約——`Err` を返す
-        // 経路は commit 未到達のまま失敗する設計のため、`Ok` は必ず commit
-        // 成功を意味する）。この判定は Execute 呼び出しをまたいで使うため
-        // （`PortalRows::committed` 経由で中断保持継続時にも引き継ぐ）、
-        // ここで一度だけ確定する。
-        let is_write_statement = !matches!(parsed, ParsedSql::Statement(_));
+        // `SET` はセッションローカルな状態変更のみ）。`ParsedSql::Transaction`
+        // （SQL-31・TASK-221。`BEGIN`/`COMMIT`/`ROLLBACK`）は `COMMIT` のみが
+        // 実際に redb commit を伴い、`BEGIN`/`ROLLBACK` は伴わない。それ以外の
+        // `ParsedSql`（`Insert`/`Truncate`/`Delete`/`Update`）は、明示
+        // トランザクションが `Active`（`txn.is_active()`）でない限り
+        // `execute_parsed_in_txn` が `Ok` を返した時点で commit 成功が確定
+        // している（`RECOVER-5`「commit 成功境界」契約——`Err` を返す経路は
+        // commit 未到達のまま失敗する設計のため、`Ok` は必ず commit 成功を
+        // 意味する）。`Active` の間は書き込みが `write_txn` へ溜まるだけで
+        // `COMMIT` まで commit されない（`sql::transaction` モジュール
+        // ドキュメント参照）ため、この場合は false とする。判定は呼び出し前の
+        // `txn.is_active()`（`execute_parsed_in_txn` 自体が `Active`/`Idle`
+        // 間で状態遷移するため、呼び出し後の値を使うと `BEGIN`/`COMMIT`
+        // 自身の判定が壊れる）を使う。この判定は Execute 呼び出しをまたいで
+        // 使うため（`PortalRows::committed` 経由で中断保持継続時にも
+        // 引き継ぐ）、ここで一度だけ確定する（codex-review 指摘・Issue #942:
+        // 拡張クエリプロトコルを `execute_parsed_in_txn` へ接続した際に
+        // 追加した分岐。以前は `ParsedSql::Statement` 以外を一律 `true` と
+        // 判定していたが、当時は明示トランザクションが無かったため
+        // `Insert`/`Truncate`/`Delete`/`Update` は常に単独 commit で成立し
+        // 問題にならなかった）。
+        let was_active_before_execution = txn.is_active();
+        let is_write_statement = match &parsed {
+            ParsedSql::Statement(_) => false,
+            ParsedSql::Transaction(engine::sql::transaction::TxnControl::Commit) => true,
+            ParsedSql::Transaction(_) => false,
+            _ => !was_active_before_execution,
+        };
 
         // 実行を試みる時点で portal を `Failed`（終端状態）へ倒しておく
-        // （成功時のみ末尾で正しい状態へ上書きする）。`execute_parsed_in_session`
+        // （成功時のみ末尾で正しい状態へ上書きする）。`execute_parsed_in_txn`
         // 自体がエラーを返す経路も含め、実行を試みた portal は Sync を越えても
         // `Ready` に留まらず、再実行するには新しい Bind で portal を作り直す
         // 必要がある——PostgreSQL の「エラー後はトランザクションを中断する」
@@ -1450,7 +1489,7 @@ fn execute_portal(
         }
 
         let outcome = crate::simple_query::execute_with_emergency_registration(stream, || {
-            engine.execute_parsed_in_session(ctx, session, &parsed)
+            engine.execute_parsed_in_txn(ctx, session, txn, &parsed)
         })
         .map_err(HandlerError::Sql)?;
 
@@ -1717,11 +1756,14 @@ fn execute_portal(
 /// 拒否する（フレーム違反であり回復しない。`'X'` と同じ扱い）。
 /// [`ExtendedQueryState::ignore_till_sync`] を解除し、名前付き・無名を問わず
 /// 全 portal を破棄したうえで `ReadyForQuery` を返す（モジュールドキュメント
-/// 「エラー後の同期回復」節・「portal のライフサイクル」節参照。本サーバーに
-/// 明示トランザクションが無く各 Sync サイクルが暗黙トランザクションに
-/// 相当することの契約は [`PortalStore::clear_all`] 参照。codex P1 指摘・
+/// 「エラー後の同期回復」節・「portal のライフサイクル」節参照。portal の
+/// 寿命が明示トランザクション〔SQL-31・TASK-221〕の有無とは独立に Sync
+/// 境界だけで決まる契約は [`PortalStore::clear_all`] 参照。codex P1 指摘・
 /// PR #1013——名前付き prepared statement〔[`PreparedStatementStore`]〕は
-/// この対象外のまま Sync を越えて残る）。
+/// この対象外のまま Sync を越えて残る）。トランザクション状態機械
+/// （`SessionTransaction`）自体は本関数の対象外で、`handshake::
+/// post_auth_loop` が接続単位で保持したまま Sync を越えて生き続ける
+/// （SQL-31・TASK-221・Issue #942）。
 pub(crate) fn handle_sync(
     stream: &mut TcpStream,
     state: &mut ExtendedQueryState,
