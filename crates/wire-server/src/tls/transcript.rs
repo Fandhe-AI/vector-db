@@ -257,6 +257,20 @@ impl Transcript {
         if raw.msg_type != HandshakeType::ServerHello {
             return Err(self.fail(TranscriptError::UnexpectedMessage));
         }
+        // HelloRetryRequest は ServerHello と同じ `msg_type` を使う
+        // （RFC 8446 §4.1.4）ため、`random` が HRR の定数と一致する
+        // メッセージをここで通常の ServerHello として吸収してしまうと
+        // message_hash 置換（`append_hello_retry_request`）が漏れ、
+        // 誤った transcript hash から traffic secret が導出される。
+        // 呼び出し元は HRR を `append_hello_retry_request` へ回すべきで
+        // あり、ここでは random が HRR 定数と一致する場合のみ拒否する
+        // （本文が短く random を読み取れない場合は通常の ServerHello として
+        // 扱い、後続の処理・上位層の妥当性検証に委ねる）。
+        if let Some(random) = raw.body.get(2..34) {
+            if random == HELLO_RETRY_REQUEST_RANDOM {
+                return Err(self.fail(TranscriptError::UnexpectedMessage));
+            }
+        }
         self.absorb(raw)?;
         self.step = Step::ServerHello;
         Ok(())
@@ -265,7 +279,7 @@ impl Transcript {
     /// ClientHello..ServerHello の transcript hash（[`HandshakeSecret::
     /// traffic_secrets`](super::key_schedule::HandshakeSecret::traffic_secrets)
     /// の入力）。ServerHello を通過した直後にのみ取得できる。
-    pub fn hash_through_server_hello(&self) -> Result<[u8; 32], TranscriptError> {
+    pub fn hash_through_server_hello(&mut self) -> Result<[u8; 32], TranscriptError> {
         self.checkpoint(Step::ServerHello)
     }
 
@@ -300,7 +314,7 @@ impl Transcript {
 
     /// ClientHello..Certificate の transcript hash（CertificateVerify の
     /// 署名対象。#961 が利用）。Certificate を通過した直後にのみ取得できる。
-    pub fn hash_through_certificate(&self) -> Result<[u8; 32], TranscriptError> {
+    pub fn hash_through_certificate(&mut self) -> Result<[u8; 32], TranscriptError> {
         self.checkpoint(Step::Certificate)
     }
 
@@ -319,7 +333,7 @@ impl Transcript {
 
     /// ClientHello..CertificateVerify の transcript hash（server Finished の
     /// verify_data 算出対象。CertificateVerify を通過した直後にのみ取得できる）。
-    pub fn hash_through_certificate_verify(&self) -> Result<[u8; 32], TranscriptError> {
+    pub fn hash_through_certificate_verify(&mut self) -> Result<[u8; 32], TranscriptError> {
         self.checkpoint(Step::CertificateVerify)
     }
 
@@ -341,7 +355,7 @@ impl Transcript {
     /// (super::key_schedule::MasterSecret::application_traffic_secrets) と
     /// client Finished の verify_data 検証対象。server Finished を通過した
     /// 直後にのみ取得できる）。
-    pub fn hash_through_server_finished(&self) -> Result<[u8; 32], TranscriptError> {
+    pub fn hash_through_server_finished(&mut self) -> Result<[u8; 32], TranscriptError> {
         self.checkpoint(Step::ServerFinished)
     }
 
@@ -358,9 +372,16 @@ impl Transcript {
         Ok(())
     }
 
-    fn checkpoint(&self, want: Step) -> Result<[u8; 32], TranscriptError> {
-        if self.poisoned || self.step != want {
-            return Err(TranscriptError::OutOfOrder);
+    /// 名前付きチェックポイントの共通実装。時点違い（`self.step != want`）も
+    /// モジュール doc の poison 契約（一度でも `Err` を返したら以後すべて
+    /// `OutOfOrder`）の対象であるため `&mut self` を取り、失敗時は必ず
+    /// [`Transcript::fail`] を経由して poison する（`&self` のまま `Err` だけ
+    /// 返すと、以後も正しい append・チェックポイント取得が継続できてしまい
+    /// fail-closed 契約を満たさない）。
+    fn checkpoint(&mut self, want: Step) -> Result<[u8; 32], TranscriptError> {
+        self.check_not_poisoned()?;
+        if self.step != want {
+            return Err(self.fail(TranscriptError::OutOfOrder));
         }
         Ok(self.hasher.clone().finalize())
     }
@@ -492,19 +513,39 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_at_wrong_step_is_rejected() {
+    fn checkpoint_at_wrong_step_is_rejected_and_poisons() {
         let mut t = Transcript::new();
-        // まだ ServerHello に到達していない時点でのチェックポイント取得。
+        // まだ ServerHello に到達していない時点でのチェックポイント取得は
+        // 拒否され、モジュール doc の poison 契約（一度でも `Err` を返したら
+        // 以後すべて `OutOfOrder`）により以後の呼び出しもすべて拒否される
+        // （時点違いのチェックポイント取得を経ても正しい append を続行
+        // できてしまわないことを固定する）。
         assert_eq!(
             t.hash_through_server_hello().unwrap_err(),
             TranscriptError::OutOfOrder
         );
 
+        assert_eq!(
+            t.append_client_hello(&raw(HandshakeType::ClientHello, CLIENT_HELLO_1RTT))
+                .unwrap_err(),
+            TranscriptError::OutOfOrder
+        );
+    }
+
+    #[test]
+    fn checkpoint_at_wrong_step_after_valid_progress_is_rejected_and_poisons() {
+        let mut t = Transcript::new();
         t.append_client_hello(&raw(HandshakeType::ClientHello, CLIENT_HELLO_1RTT))
             .expect("valid ClientHello");
         // ServerHello 未投入のまま Certificate 側のチェックポイントを取得。
         assert_eq!(
             t.hash_through_certificate().unwrap_err(),
+            TranscriptError::OutOfOrder
+        );
+        // poison 後は正しい ServerHello の append も拒否される。
+        assert_eq!(
+            t.append_server_hello(&raw(HandshakeType::ServerHello, SERVER_HELLO_1RTT))
+                .unwrap_err(),
             TranscriptError::OutOfOrder
         );
     }
@@ -555,6 +596,37 @@ mod tests {
             .append_hello_retry_request(&raw(HandshakeType::ServerHello, SERVER_HELLO_1RTT))
             .unwrap_err();
         assert_eq!(err, TranscriptError::UnexpectedMessage);
+    }
+
+    #[test]
+    fn append_server_hello_rejects_hello_retry_request_shaped_message() {
+        // HRR は ServerHello と同じ `msg_type` を使うため（RFC 8446 §4.1.4）、
+        // `random` が HRR 定数と一致するメッセージを `append_server_hello` が
+        // msg_type だけで通常の ServerHello として受理してしまうと、
+        // message_hash 置換（`append_hello_retry_request`）が漏れ誤った
+        // transcript hash になる。呼び出し元の分類誤りをここで検出できる
+        // ことを固定する。
+        let mut t = Transcript::new();
+        t.append_client_hello(&raw(HandshakeType::ClientHello, CLIENT_HELLO_1RTT))
+            .expect("valid ClientHello");
+
+        let mut hrr_body = vec![0x03, 0x03];
+        hrr_body.extend_from_slice(&HELLO_RETRY_REQUEST_RANDOM);
+        hrr_body.extend_from_slice(&[0x00; 4]);
+        let hrr_shaped = RawHandshake {
+            msg_type: HandshakeType::ServerHello,
+            body: hrr_body,
+        };
+        assert_eq!(
+            t.append_server_hello(&hrr_shaped).unwrap_err(),
+            TranscriptError::UnexpectedMessage
+        );
+        // poison 済みのため、正しい呼び分け（append_hello_retry_request）を
+        // 後から試みても拒否される（OutOfOrder）。
+        assert_eq!(
+            t.append_hello_retry_request(&hrr_shaped).unwrap_err(),
+            TranscriptError::OutOfOrder
+        );
     }
 
     #[test]
