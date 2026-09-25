@@ -240,6 +240,27 @@ fn declare_outside_transaction_against_missing_table_is_25p01_not_undefined_tabl
     assert_eq!(err.wire_code(), "25P01");
 }
 
+/// (b'') PR #1049 レビュー指摘（P1）の回帰・拡張クエリプロトコル経路:
+/// [`EngineCore::parse_sql_prepared`]（Parse。`$n` を含まない SQL は
+/// [`EngineCore::parse_sql`] と完全に同一の構造検証結果を返す契約）は、
+/// `DECLARE` の内側 SELECT が存在しないテーブルを指していてもカタログへは
+/// 問い合わせず構造検証だけで成功する——`core.rs::parse_tokens` の `DECLARE`
+/// 分岐がカタログ照会（テーブル存在確認）を実行時（`Active` なトランザクション
+/// 内での内側 SELECT 実際の実行）まで遅延させているため。Parse 単体では
+/// テーブルの存在有無を一切観測できず、`UndefinedTable` を返してしまう
+/// （＝トランザクション状態が未確定な Parse の時点でカタログの状態を漏らす）
+/// 経路が無いことを固定する。
+#[test]
+fn parse_sql_prepared_declare_defers_catalog_lookup_past_parse() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+
+    let declare_sql = "DECLARE c CURSOR FOR SELECT id FROM missing_table LIMIT 10";
+    engine
+        .parse_sql_prepared(declare_sql)
+        .expect("Parse of DECLARE must not touch the catalog and must succeed structurally");
+}
+
 /// (c) `COMMIT`／`ROLLBACK` の後、開いていたカーソルは自動的に消える
 /// （新しいトランザクションからの `FETCH` は `34000`）。`Failed` 中の
 /// `FETCH`／`CLOSE`／`DECLARE` はいずれも `25P02`。

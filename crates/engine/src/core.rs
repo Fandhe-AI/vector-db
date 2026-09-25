@@ -2430,7 +2430,10 @@ impl EngineCore {
             Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DECLARE")
         );
         if is_declare_statement {
-            let stmt = crate::sql::cursor::validate_declare_tokens(&tokens, &self.storage)?;
+            // カタログ照会（テーブル存在確認）は意図的にここでは行わない
+            // （`sql::cursor::validate_declare_tokens_structure_only` 参照。
+            // PR #1049 レビュー指摘 P1 対応）。
+            let stmt = crate::sql::cursor::validate_declare_tokens_structure_only(&tokens)?;
             return Ok(ParsedSql::Cursor(stmt));
         }
 
@@ -2730,19 +2733,6 @@ impl EngineCore {
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = crate::sql::lexer::tokenize(sql)?;
-        // PR #1049 レビュー指摘（P1）: 本エントリポイントはトランザクション
-        // 文脈を持たないため `DECLARE` は常に `25P01`
-        // （`execute_parsed_in_session` の `Cursor` 分岐参照）だが、通常の
-        // `parse_tokens` 経路は内側 SELECT のカタログ照会（テーブル存在確認）を
-        // 伴うため、そのまま通すと存在しないテーブルを指す `DECLARE` が
-        // `UndefinedTable` を返してしまう。カタログ非依存の構造検証だけで
-        // 判定を確定させ、`parse_tokens`（カタログ照会を含む）を呼ぶ前に
-        // 返す（`sql::cursor::declare_outside_transaction_error` 参照）。
-        if crate::sql::cursor::is_declare_statement(&tokens) {
-            return Err(crate::sql::cursor::declare_outside_transaction_error(
-                &tokens,
-            ));
-        }
         let parsed = self.parse_tokens(tokens)?;
         self.execute_parsed_in_session(ctx, session, &parsed)
     }
@@ -2770,25 +2760,6 @@ impl EngineCore {
             && !crate::sql::transaction::is_rollback_statement(sql)
         {
             return Err(txn.take_failed_error());
-        }
-        // PR #1049 レビュー指摘（P1）: `Idle`（未 `BEGIN`）で `DECLARE` を送ると
-        // `25P01` を返す契約（`execute_parsed_in_session` の `Cursor` 分岐
-        // 参照）だが、`self.parse_sql(sql)` は内側 SELECT のカタログ照会
-        // （テーブル存在確認）まで一度に行うため、そのまま先に呼ぶと存在しない
-        // テーブルを指す `DECLARE` が `25P01` ではなく `UndefinedTable` を
-        // 返してしまう（テーブル存在確認がトランザクション状態判定より先に
-        // 走るため）。`Failed` は上で処理済みのため、ここでの `Idle` 判定は
-        // 「未 `BEGIN`」を意味する。字句解析自体に失敗した入力は `DECLARE`
-        // ではないものとして通常の parse エラー経路（下記）へ委ねる
-        // （`sql::cursor::declare_outside_transaction_error` 参照）。
-        if txn.status() == crate::sql::transaction::TransactionStatus::Idle {
-            if let Ok(tokens) = crate::sql::lexer::tokenize(sql) {
-                if crate::sql::cursor::is_declare_statement(&tokens) {
-                    return Err(crate::sql::cursor::declare_outside_transaction_error(
-                        &tokens,
-                    ));
-                }
-            }
         }
         // 構文・許可リスト検証のエラーも、明示トランザクション中なら種類を問わず
         // `Failed` へ遷移させる（PostgreSQL と同じ。`Active` のまま残すと後続の
