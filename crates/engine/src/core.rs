@@ -2546,11 +2546,20 @@ impl EngineCore {
             // トランザクション文脈を持たない本エントリポイントは `BEGIN`／
             // `COMMIT`／`ROLLBACK` を受理しない（SQL-31・TASK-221。
             // トランザクション対応の実行入口は [`Self::execute_sql_in_txn`]）。
-            ParsedSql::Transaction(_) => Err(
-                crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
-                    "transaction control statements require a transaction-aware entry point",
-                ),
-            ),
+            // PR #1041 レビュー指摘（P1）: `parse_tokens` が `BEGIN`／`COMMIT`／
+            // `ROLLBACK` を新たに `ParsedSql::Transaction` として受理するように
+            // なった結果、本メソッド（`execute_sql_in_session` の実行本体）が
+            // これらの文に対して以前（許可リスト外として `UnsupportedSyntax`
+            // ＝ `42601`）と異なる `TransactionFeatureNotSupported`（`0A000`）を
+            // 返すようになっていた。トランザクション文脈を持たない本 API の
+            // エラー契約を変えないため、ここでは意図的に `unsupported`
+            // （`42601`）へ写像し直す ―― `TransactionFeatureNotSupported`
+            // （`0A000`）は明示トランザクション対応の実行入口
+            // （[`Self::execute_parsed_in_txn`]・`Active` 中に未対応の文を
+            // 拒否する場合）専用のまま維持する。
+            ParsedSql::Transaction(_) => Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                "transaction control statements are not supported by this entry point",
+            )),
         }
     }
 

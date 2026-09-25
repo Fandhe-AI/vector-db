@@ -743,3 +743,31 @@ fn autocommit_insert_times_out_with_lock_not_available_while_explicit_transactio
     release_tx.send(()).expect("signal holder to rollback");
     holder.join().expect("holder thread must not panic");
 }
+
+/// PR #1041 レビュー指摘（P1）の回帰: `parse_sql`／`parse_tokens` が `BEGIN`／
+/// `COMMIT`／`ROLLBACK` を `ParsedSql::Transaction` として受理するようになった
+/// 結果、トランザクション文脈を持たない `execute_sql_in_session`（`EngineCore::
+/// execute_parsed_in_session` が実行本体）が、本 PR 以前の許可リスト外エラー
+/// （`UnsupportedSyntax` ＝ `42601`）ではなく `TransactionFeatureNotSupported`
+/// （`0A000`）を返すようになっていた。既存 API のエラー契約を変えないため、
+/// 本エントリポイントでは `42601` を維持する（`0A000` は明示トランザクション
+/// 対応の実行入口〔`execute_sql_in_txn`〕が `Active` 中に未対応の文を拒否する
+/// 場合専用のまま）。
+#[test]
+fn execute_sql_in_session_rejects_transaction_control_statements_with_unsupported_syntax() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+
+    for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
+        let err = engine
+            .execute_sql_in_session(&caller, &mut SessionState::default(), sql)
+            .expect_err("transaction control statements are unsupported by this entry point");
+        assert_eq!(
+            err.wire_code(),
+            "42601",
+            "{sql} 経由の execute_sql_in_session は従来どおり 42601（許可リスト外） \
+             を返すべき（0A000 への退行を検出する）"
+        );
+    }
+}
