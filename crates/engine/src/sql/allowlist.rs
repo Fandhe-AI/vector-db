@@ -325,6 +325,11 @@ pub enum SqlSurfaceError {
     /// 存在情報を漏らさない」対応）。固定文言のみを保持し、テーブル名・
     /// ユーザー名を含めない。
     InsufficientPrivilege,
+    /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
+    /// 存在しない（WIRE-15・TASK-218）。他セッション所有のカーソル名・単に
+    /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
+    /// 自体を含めない（security.md「存在情報を漏らさない」対応。ERR-6: `34000`）。
+    InvalidCursorName,
 }
 
 impl SqlSurfaceError {
@@ -414,6 +419,13 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `sql::cursor::CursorRegistry::fetch`／`close`（WIRE-15・
+    /// TASK-218）が、現在のトランザクション内に存在しないカーソル名を報告する
+    /// ために使う。固定 variant（データを持たない）のため引数はない。
+    pub(crate) fn invalid_cursor_name() -> Self {
+        SqlSurfaceError::InvalidCursorName
+    }
+
     /// `pub(crate)`: `sql::aggregate`（TASK-166・SQL-13）が集計の数値演算オーバー
     /// フロー（`u64` の `checked_add` 失敗・`f64` の非有限値化）を報告するために使う。
     pub(crate) fn numeric_out_of_range(detail: impl Into<String>) -> Self {
@@ -474,6 +486,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InsufficientPrivilege => ErrorClass::ForbiddenTenantMismatch,
+            SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
         }
     }
 
@@ -559,6 +572,12 @@ impl std::fmt::Display for SqlSurfaceError {
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
                 write!(f, "permission denied for DDL statement")
+            }
+            // カーソル名・他セッション所有かどうかを一切含めない固定文言
+            // （security.md P0。`SqlSurfaceError::InvalidCursorName` ドキュメント
+            // 参照）。
+            SqlSurfaceError::InvalidCursorName => {
+                write!(f, "cursor does not exist")
             }
         }
     }

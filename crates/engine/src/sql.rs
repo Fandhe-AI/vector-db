@@ -125,6 +125,7 @@ pub mod aggregate;
 pub mod allowlist;
 pub(crate) mod arena_cache;
 pub mod copy;
+pub mod cursor;
 pub mod ddl;
 pub(crate) mod describe;
 pub mod exec;
@@ -296,4 +297,25 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     DropTable(ddl::DropTableOutcome),
+    /// `DECLARE <name> CURSOR FOR <SELECT>`（WIRE-15・TASK-218）がセッション
+    /// 経由の実行経路（`crate::core::EngineCore::execute_sql_in_txn`。カーソルは
+    /// 明示トランザクション内でのみ有効）で成功したことを示す応答。
+    /// `wire-server::simple_query` は `CommandComplete` タグ `DECLARE CURSOR`
+    /// （件数を持たない固定タグ）を返す。
+    ///
+    /// **BREAKING CHANGE**（WIRE-15・TASK-218）: 本 variant の追加により
+    /// `SqlOutcome` を網羅的にマッチする既存コード（`crate::core::EngineCore`・
+    /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
+    /// を網羅的にマッチするコードがあれば追随が必要。
+    DeclareCursor,
+    /// `FETCH [FORWARD] <n> FROM <name>`（WIRE-15・TASK-218）が成功したことを
+    /// 示す応答。内側 `DECLARE` 時点で確定済みの行から未取得分を払い出すのみで
+    /// 検索本体は再実行しない。`wire-server::simple_query` は `RowDescription`／
+    /// `DataRow`* に続けて `CommandComplete` タグ `FETCH <実際に送出した行数>`
+    /// （`TagShape::Dynamic("FETCH")`）を送出する。
+    Fetch(exec::QueryResult),
+    /// `CLOSE <name>`（WIRE-15・TASK-218）が成功したことを示す応答。
+    /// `wire-server::simple_query` は `CommandComplete` タグ `CLOSE CURSOR`
+    /// （件数を持たない固定タグ）を返す。
+    CloseCursor,
 }

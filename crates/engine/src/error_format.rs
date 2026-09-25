@@ -73,7 +73,7 @@ macro_rules! define_error_classes {
 }
 
 define_error_classes! {
-    count = 25;
+    count = 26;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -189,6 +189,10 @@ define_error_classes! {
     /// TABLE-6・TASK-85（Issue #899）が追加。
     /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateColumn`] の写像。
     DuplicateColumn => ("42701", "DUPLICATE_COLUMN"),
+    /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
+    /// 存在しない（`34000`）。WIRE-15・TASK-218 が追加。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidCursorName`] の写像。
+    InvalidCursorName => ("34000", "INVALID_CURSOR_NAME"),
 }
 
 impl ErrorClass {

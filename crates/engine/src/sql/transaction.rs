@@ -114,6 +114,13 @@ struct ActiveTxn<'e> {
     written_tables: HashSet<String>,
     has_writes: bool,
     session_at_begin: SessionState,
+    /// `DECLARE`/`FETCH`/`CLOSE`（WIRE-15・TASK-218）が開いたカーソルの集合。
+    /// `ActiveTxn` に埋め込まれているため、トランザクションの終了（`commit`／
+    /// `rollback`／`fail`。いずれも `ActiveTxn` を `mem::replace` で取り出して
+    /// drop する）とともに保持していたカーソルもすべて自動的に消える
+    /// （カーソルの寿命がトランザクションの寿命に一致する設計。
+    /// `sql::cursor` モジュールドキュメント参照）。
+    cursors: crate::sql::cursor::CursorRegistry,
     _marker: std::marker::PhantomData<&'e ()>,
 }
 
@@ -198,6 +205,7 @@ impl<'e> SessionTransaction<'e> {
                     written_tables: HashSet::new(),
                     has_writes: false,
                     session_at_begin: session.clone(),
+                    cursors: crate::sql::cursor::CursorRegistry::new(),
                     _marker: std::marker::PhantomData,
                 }));
                 Ok(())
@@ -354,6 +362,27 @@ impl<'e> SessionTransaction<'e> {
     pub(crate) fn write_txn(&self) -> Option<&redb::WriteTransaction> {
         match &self.state {
             TxnState::Active(active) => Some(&*active.write_txn),
+            _ => None,
+        }
+    }
+
+    /// `Active` のときのみ、カーソル集合への可変参照を返す（`DECLARE`/
+    /// `FETCH`/`CLOSE` の実行本体〔`core.rs::EngineCore::
+    /// execute_cursor_in_active_txn`〕が使う）。
+    pub(crate) fn cursors_mut(&mut self) -> Option<&mut crate::sql::cursor::CursorRegistry> {
+        match &mut self.state {
+            TxnState::Active(active) => Some(&mut active.cursors),
+            _ => None,
+        }
+    }
+
+    /// `name` のカーソルが `Active` なトランザクション内に存在すれば、その
+    /// 結果列メタデータを返す（Describe 専用の読み取り専用アクセサ。
+    /// `core.rs::EngineCore::describe_parsed_in_txn` が使う。検索本体・
+    /// カーソルの取得位置には一切触れない）。
+    pub(crate) fn cursor_columns(&self, name: &str) -> Option<Vec<crate::sql::exec::ColumnMeta>> {
+        match &self.state {
+            TxnState::Active(active) => active.cursors.columns(name),
             _ => None,
         }
     }

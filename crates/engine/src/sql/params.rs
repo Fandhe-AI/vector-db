@@ -238,6 +238,25 @@ pub fn where_equality_literal_is_param(tokens: &[Token]) -> Vec<bool> {
 /// - `$n` の番号が [`MAX_PARAMS`] を超える場合は
 ///   [`SqlSurfaceError::payload_too_large`]（`54000`）。
 pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError> {
+    // WIRE-15・TASK-218: カーソル（`DECLARE`/`FETCH`/`CLOSE`）は `$n` 束縛を
+    // 本バージョンのスコープ外として一律拒否する（fail-closed。範囲を縮小）。
+    // 特に `DECLARE ... FOR SELECT ... WHERE col = $1` は、後段のパターン 4
+    // （`WHERE` 等価述語）判定が文の先頭語を見ずに `WHERE` キーワードの位置
+    // だけで判定するため、ここで先頭語を見て弾かないと DECLARE の内側 SELECT
+    // 経由で誤って受理されてしまう。
+    if matches!(
+        tokens.first(),
+        Some(Token::Ident(name))
+            if name.eq_ignore_ascii_case("DECLARE")
+                || name.eq_ignore_ascii_case("FETCH")
+                || name.eq_ignore_ascii_case("CLOSE")
+    ) && tokens.iter().any(|t| matches!(t, Token::Param(_)))
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "parameter placeholders are not supported in cursor statements",
+        ));
+    }
+
     let is_insert_statement = ident_eq_ignore_case(tokens.first(), "INSERT");
 
     // パターン 5（INSERT VALUES）の受理範囲: `VALUES` キーワード（文脈識別子。

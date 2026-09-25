@@ -1268,6 +1268,17 @@ pub enum ParsedSql {
     /// 更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードがあれば
     /// 追随が必要。
     CreateTable(crate::sql::allowlist::ValidatedCreateTable),
+    /// `DECLARE`/`FETCH`/`CLOSE`（カーソル。WIRE-15・TASK-218）。トランザクション
+    /// 文脈を持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
+    /// `DECLARE` なら `25P01`（`NoActiveSqlTransaction`）、`FETCH`／`CLOSE` なら
+    /// `34000`（`InvalidCursorName`）で拒否する（カーソルは明示トランザクション
+    /// 内でのみ有効。`sql::cursor` モジュールドキュメント参照）。
+    ///
+    /// **BREAKING CHANGE**（WIRE-15・TASK-218）: 本 variant の追加により
+    /// `ParsedSql` を網羅的にマッチする既存コード（`crate::core::EngineCore`）は
+    /// すべて更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードが
+    /// あれば追随が必要。
+    Cursor(crate::sql::cursor::CursorStatement),
 }
 
 /// `parsed` が保持する `operation_id`（`USING OPERATION_ID '<id>'`。書き込み系
@@ -2176,7 +2187,10 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
-                    | crate::sql::SqlOutcome::Rollback => {
+                    | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::DeclareCursor
+                    | crate::sql::SqlOutcome::Fetch(_)
+                    | crate::sql::SqlOutcome::CloseCursor => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -2208,7 +2222,10 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
-                    | crate::sql::SqlOutcome::Rollback => {
+                    | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::DeclareCursor
+                    | crate::sql::SqlOutcome::Fetch(_)
+                    | crate::sql::SqlOutcome::CloseCursor => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -2237,7 +2254,10 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
-                    | crate::sql::SqlOutcome::Rollback => {
+                    | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::DeclareCursor
+                    | crate::sql::SqlOutcome::Fetch(_)
+                    | crate::sql::SqlOutcome::CloseCursor => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -2403,6 +2423,33 @@ impl EngineCore {
                 self.ledger_mode,
             )?;
             return Ok(ParsedSql::Update(stmt));
+        }
+
+        let is_declare_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DECLARE")
+        );
+        if is_declare_statement {
+            let stmt = crate::sql::cursor::validate_declare_tokens(&tokens, &self.storage)?;
+            return Ok(ParsedSql::Cursor(stmt));
+        }
+
+        let is_fetch_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("FETCH")
+        );
+        if is_fetch_statement {
+            let stmt = crate::sql::cursor::validate_fetch_tokens(&tokens)?;
+            return Ok(ParsedSql::Cursor(stmt));
+        }
+
+        let is_close_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("CLOSE")
+        );
+        if is_close_statement {
+            let stmt = crate::sql::cursor::validate_close_tokens(&tokens)?;
+            return Ok(ParsedSql::Cursor(stmt));
         }
 
         let is_drop_statement = matches!(
@@ -2640,6 +2687,21 @@ impl EngineCore {
             ParsedSql::Transaction(_) => Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                 "transaction control statements are not supported by this entry point",
             )),
+            // WIRE-15・TASK-218: カーソルは明示トランザクション内でのみ有効
+            // （`sql::cursor` モジュールドキュメント参照）。トランザクション
+            // 文脈を持たない本エントリポイントでは、`DECLARE` は「トランザク
+            // ション外」（`25P01`。`COMMIT`/`ROLLBACK` を `Idle` で送った場合と
+            // 同じ分類）、`FETCH`／`CLOSE` は対象カーソルが存在し得ないため
+            // `34000` で拒否する。
+            ParsedSql::Cursor(stmt) => match stmt {
+                crate::sql::cursor::CursorStatement::Declare { .. } => {
+                    Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction)
+                }
+                crate::sql::cursor::CursorStatement::Fetch { .. }
+                | crate::sql::cursor::CursorStatement::Close { .. } => {
+                    Err(crate::sql::allowlist::SqlSurfaceError::invalid_cursor_name())
+                }
+            },
         }
     }
 
@@ -2848,12 +2910,89 @@ impl EngineCore {
             ParsedSql::Statement(stmt @ Statement::Explain(v)) => {
                 self.read_only_in_active_txn(ctx, session, txn, &v.table_name, stmt.clone())
             }
+            // WIRE-15・TASK-218: カーソルは `Active` なトランザクション内でのみ
+            // 意味を持つ（`sql::cursor` モジュールドキュメント参照）。
+            ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
             // 複数行 INSERT・ファイル形 INSERT・UPSERT・`UPDATE`・`DELETE`・
             // COPY 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
                 "this statement is not supported inside an explicit transaction",
             )),
+        }
+    }
+
+    /// [`Self::execute_in_active_txn`] の `ParsedSql::Cursor` 分岐本体
+    /// （WIRE-15・TASK-218）。
+    ///
+    /// - `DECLARE`: 同一トランザクション内で既に書き込み済みのテーブルへの
+    ///   読み取りは `0A000`（[`Self::read_only_in_active_txn`] と同じ既知の
+    ///   逸脱）。カーソル数上限・重複名は内側 SELECT を実行する**前**に判定し
+    ///   （[`crate::sql::cursor::CursorRegistry::ensure_capacity_for_declare`]）、
+    ///   実行後に確定した [`crate::sql::exec::QueryResult`] をバイト上限判定
+    ///   込みで登録する（[`crate::sql::cursor::CursorRegistry::declare`]）。
+    /// - `FETCH`／`CLOSE`: `CursorRegistry` への委譲のみ。検索本体は再実行
+    ///   しない。
+    fn execute_cursor_in_active_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        stmt: &crate::sql::cursor::CursorStatement,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
+        use crate::sql::cursor::CursorStatement;
+
+        match stmt {
+            CursorStatement::Declare { name, inner, table } => {
+                if txn.table_already_written(table) {
+                    return Err(SqlSurfaceError::transaction_feature_not_supported(
+                        "reading a table already written in the same transaction is not supported",
+                    ));
+                }
+                txn.cursors_mut()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?
+                    .ensure_capacity_for_declare(name)?;
+                let outcome = self.execute_validated_in_session(ctx, session, (**inner).clone())?;
+                let result = match outcome {
+                    crate::sql::SqlOutcome::Query(result) => result,
+                    // `inner` は構造検証段で `Statement::Aggregate`／
+                    // `Statement::Scan` のいずれかであることを保証済み
+                    // （`sql::cursor::validate_declare_tokens` 参照）。いずれも
+                    // `execute_validated_in_session` は必ず `SqlOutcome::Query`
+                    // を返すため、この分岐は公開 API の誤用時のみの防御的経路。
+                    _ => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "internal error".to_string(),
+                        })
+                    }
+                };
+                txn.cursors_mut()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?
+                    .declare(name.clone(), result)?;
+                Ok(crate::sql::SqlOutcome::DeclareCursor)
+            }
+            CursorStatement::Fetch { name, count } => {
+                let result = txn
+                    .cursors_mut()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?
+                    .fetch(name, *count)?;
+                Ok(crate::sql::SqlOutcome::Fetch(result))
+            }
+            CursorStatement::Close { name } => {
+                txn.cursors_mut()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?
+                    .close(name)?;
+                Ok(crate::sql::SqlOutcome::CloseCursor)
+            }
         }
     }
 
@@ -2904,6 +3043,38 @@ impl EngineCore {
         // `describe_prepared_in_session` のみが使う（PR #1012 レビュー指摘
         // 対応。詳細は同メソッドのコメント参照）。
         self.describe_parsed_in_session_impl(session, parsed, false, &[])
+    }
+
+    /// [`Self::describe_parsed_in_session`] のトランザクション対応版
+    /// （WIRE-15・TASK-218。`wire-server::extended_query::handle_describe`／
+    /// `handle_bind` が接続単位の `SessionTransaction` を渡して呼ぶ）。
+    /// `ParsedSql::Cursor(CursorStatement::Fetch { name, .. })` に限り、`txn` が
+    /// `Active` で `name` のカーソルが実在する場合はその結果列メタデータを
+    /// 返し、実在しない場合は `34000`（検索本体を実行せずに判定できる—— カーソル
+    /// 実行時に確定済みの `QueryResult::columns` を読むだけで済むため）。
+    /// `Declare`／`Close` は結果列を持たない（`CommandComplete` のみ）。
+    /// それ以外の `ParsedSql` は [`Self::describe_parsed_in_session`] と完全に
+    /// 同一の判定へ委譲する。
+    pub fn describe_parsed_in_txn(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        parsed: &ParsedSql,
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        if let ParsedSql::Cursor(stmt) = parsed {
+            return match stmt {
+                crate::sql::cursor::CursorStatement::Declare { .. }
+                | crate::sql::cursor::CursorStatement::Close { .. } => Ok(None),
+                crate::sql::cursor::CursorStatement::Fetch { name, .. } => {
+                    match txn.cursor_columns(name) {
+                        Some(columns) => Ok(Some(columns)),
+                        None => Err(crate::sql::allowlist::SqlSurfaceError::invalid_cursor_name()),
+                    }
+                }
+            };
+        }
+        self.describe_parsed_in_session(session, parsed)
     }
 
     /// [`Self::describe_parsed_in_session`]／[`Self::describe_prepared_in_session`]
@@ -3060,6 +3231,14 @@ impl EngineCore {
             // `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）は結果列を持たない
             // （`CommandComplete` のみ）。
             ParsedSql::Transaction(_) => Ok(None),
+            // WIRE-15・TASK-218: `DECLARE`／`CLOSE` は `CommandComplete` のみを
+            // 返すため結果列を持たない。`FETCH` は本来カーソルの列メタデータを
+            // 持つが、本メソッド（トランザクション文脈を持たない Describe。
+            // [`Self::describe_parsed_in_session`]・[`Self::
+            // describe_prepared_in_session`] が使う）はどのカーソルが開いて
+            // いるかを知り得ないため `None` を返す（fail-safe。実際のカーソル
+            // Describe は [`Self::describe_parsed_in_txn`] が担う）。
+            ParsedSql::Cursor(_) => Ok(None),
         }
     }
 
