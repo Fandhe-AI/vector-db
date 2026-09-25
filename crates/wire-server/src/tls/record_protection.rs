@@ -82,7 +82,8 @@ pub enum ProtectionError {
     /// 復号した `TLSInnerPlaintext` が全ゼロで、内容型が存在しない。
     NoContentType,
     /// 内側 content type が禁止された値（`ChangeCipherSpec`・未知値・
-    /// application epoch での `Handshake` を含む）。
+    /// application epoch での `Handshake`・handshake epoch での
+    /// `ApplicationData` を含む）。
     ForbiddenInnerType(u8),
     /// `Handshake`／`Alert` の内容が 0 長。
     EmptyContent,
@@ -460,6 +461,9 @@ impl Sealer {
     /// 許可する（`ApplicationData`・`ChangeCipherSpec` はこの epoch では
     /// 送信できない。CCS は鍵状態を持たない固定レコードのため、呼び出し
     /// 元がこの `Sealer` を経由せず直接組み立てる契約とする）。
+    /// `Handshake` epoch でも `ApplicationData` は送信できない
+    /// （[`ProtectionError::SendContractViolation`]。0-RTT 非対応の本実装
+    /// では Finished 完了前のアプリケーションデータ送信を認めないため）。
     pub fn seal(
         &mut self,
         content_type: ContentType,
@@ -489,7 +493,43 @@ impl Sealer {
                     fragment: content.to_vec(),
                 })
             }
-            Epoch::Handshake(cipher) | Epoch::Application(cipher) => {
+            Epoch::Handshake(cipher) => {
+                // 0-RTT 非対応の本実装では、Finished 完了前の Handshake
+                // epoch から ApplicationData を送信できてはならない
+                // （client 認証成立前のデータをアプリケーション入力として
+                // 扱う経路を作らないため）。この epoch では内側 content
+                // type を Handshake／Alert に限定する。
+                match content_type {
+                    ContentType::Handshake | ContentType::Alert => {}
+                    ContentType::ApplicationData => {
+                        return Err(ProtectionError::SendContractViolation);
+                    }
+                    ContentType::ChangeCipherSpec => {
+                        return Err(ProtectionError::ForbiddenInnerType(
+                            ContentType::ChangeCipherSpec.as_u8(),
+                        ));
+                    }
+                }
+                let mut inner = build_inner_plaintext(content_type, content, padding_len)?;
+                let ciphertext_and_tag_len = inner
+                    .len()
+                    .checked_add(TAG_LEN)
+                    .ok_or(ProtectionError::InnerOverflow)?;
+                let aad = seal_aad(ciphertext_and_tag_len)?;
+                let nonce = cipher.peek_nonce()?;
+                let sealed = cipher
+                    .cipher
+                    .seal(&nonce, &aad, &inner)
+                    .map_err(ProtectionError::from)?;
+                zeroize(&mut inner);
+                cipher.advance()?;
+                Ok(Record {
+                    content_type: ContentType::ApplicationData,
+                    legacy_version: record::LEGACY_RECORD_VERSION,
+                    fragment: sealed,
+                })
+            }
+            Epoch::Application(cipher) => {
                 match content_type {
                     ContentType::Handshake | ContentType::Alert | ContentType::ApplicationData => {}
                     ContentType::ChangeCipherSpec => {
@@ -615,7 +655,11 @@ impl Opener {
     ///
     /// `Plaintext` epoch では外側 content type が `Handshake`／`Alert` の
     /// 場合のみそのまま通す（`ApplicationData` は鍵導入前に届き得ないため
-    /// [`ProtectionError::UnexpectedOuterType`]）。
+    /// [`ProtectionError::UnexpectedOuterType`]）。`Handshake` epoch では
+    /// 復号後の内側 content type を `Handshake`／`Alert` に限定し、
+    /// `ApplicationData` は [`ProtectionError::ForbiddenInnerType`] として
+    /// 拒否する（0-RTT 非対応の本実装では Finished 完了前の
+    /// ApplicationData を受理してはならないため）。
     pub fn open(&mut self, record: &Record) -> Result<InnerPlaintext, ProtectionError> {
         match &mut self.epoch {
             Epoch::Plaintext => match record.content_type {
@@ -627,7 +671,20 @@ impl Opener {
                     Err(ProtectionError::UnexpectedOuterType)
                 }
             },
-            Epoch::Handshake(cipher) => open_protected(cipher, record),
+            Epoch::Handshake(cipher) => {
+                let mut inner = open_protected(cipher, record)?;
+                // 0-RTT 非対応の本実装では、Finished 完了前（client 認証
+                // 成立前）の Handshake epoch で ApplicationData を受理して
+                // はならない（送信側の契約〔`seal`〕と対称。復号済みの
+                // 平文は他の拒否経路と同様に zeroize してから破棄する）。
+                if inner.content_type == ContentType::ApplicationData {
+                    zeroize(&mut inner.content);
+                    return Err(ProtectionError::ForbiddenInnerType(
+                        ContentType::ApplicationData.as_u8(),
+                    ));
+                }
+                Ok(inner)
+            }
             Epoch::Application(cipher) => {
                 let mut inner = open_protected(cipher, record)?;
                 // KeyUpdate・post-handshake の Handshake メッセージは
@@ -843,7 +900,13 @@ mod tests {
             let mut sealer = Sealer::new();
             let mut opener = Opener::new();
             sealer.install_handshake_keys(&keys).expect("install");
+            sealer
+                .install_application_keys(&keys)
+                .expect("handshake -> application");
             opener.install_handshake_keys(&keys).expect("install");
+            opener
+                .install_application_keys(&keys)
+                .expect("handshake -> application");
 
             let record = sealer
                 .seal(ContentType::ApplicationData, b"abc", padding_len)
@@ -859,6 +922,9 @@ mod tests {
         let keys = dummy_keys(21, 22);
         let mut sealer = Sealer::new();
         sealer.install_handshake_keys(&keys).expect("install");
+        sealer
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
 
         let content = vec![7u8; MAX_INNER_PLAINTEXT_LEN - 1];
         assert!(sealer
@@ -998,10 +1064,51 @@ mod tests {
     }
 
     #[test]
+    fn handshake_epoch_seal_rejects_application_data() {
+        // 0-RTT 非対応の本実装では、Finished 完了前（client 認証成立前）の
+        // Handshake epoch から ApplicationData を送信できてはならない。
+        let keys = dummy_keys(43, 44);
+        let mut sealer = Sealer::new();
+        sealer.install_handshake_keys(&keys).expect("install");
+        assert_eq!(
+            sealer.seal(ContentType::ApplicationData, b"too early", 0),
+            Err(ProtectionError::SendContractViolation)
+        );
+    }
+
+    #[test]
+    fn handshake_epoch_open_rejects_inner_application_data_type() {
+        // 送信側の契約（`handshake_epoch_seal_rejects_application_data`）と
+        // 対称: 万一 Handshake epoch で ApplicationData 相当の内側 content
+        // type が復号できても、そのまま呼び出し元へは返さず拒否する。
+        let keys = dummy_keys(45, 46);
+        let mut sealer = Sealer::new();
+        sealer.install_handshake_keys(&keys).expect("install");
+        sealer
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
+        let record = sealer
+            .seal(ContentType::ApplicationData, b"too early", 0)
+            .expect("seal under application epoch for test setup");
+
+        let mut opener = Opener::new();
+        opener.install_handshake_keys(&keys).expect("install");
+        assert_eq!(
+            opener.open(&record),
+            Err(ProtectionError::ForbiddenInnerType(
+                ContentType::ApplicationData.as_u8()
+            ))
+        );
+    }
+
+    #[test]
     fn tampered_ciphertext_tag_and_wrong_seq_are_all_rejected_without_producing_plaintext() {
         let keys = dummy_keys(29, 30);
         let mut sealer = Sealer::new();
         sealer.install_handshake_keys(&keys).expect("install");
+        sealer
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
         let record = sealer
             .seal(ContentType::ApplicationData, b"secret payload", 0)
             .expect("seal");
@@ -1043,8 +1150,14 @@ mod tests {
         // 進めてから、seq=0 用にsealされた同じレコードを再度 open する）。
         let mut opener4 = Opener::new();
         opener4.install_handshake_keys(&keys).expect("install");
+        opener4
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
         let mut sealer4 = Sealer::new();
         sealer4.install_handshake_keys(&keys).expect("install");
+        sealer4
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
         let dummy = sealer4
             .seal(ContentType::ApplicationData, b"dummy", 0)
             .expect("seal seq=0");
@@ -1076,7 +1189,13 @@ mod tests {
         let mut sealer = Sealer::new();
         let mut opener = Opener::new();
         sealer.install_handshake_keys(&keys).expect("install");
+        sealer
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
         opener.install_handshake_keys(&keys).expect("install");
+        opener
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
 
         let payload = vec![9u8; (MAX_INNER_PLAINTEXT_LEN - 1) * 2 + 5];
         let records = sealer
@@ -1122,7 +1241,7 @@ mod tests {
         let keys = dummy_keys(39, 40);
         let cipher = RecordCipher::with_seq_for_test(&keys, MAX_RECORDS_PER_KEY - 1);
         let mut sealer = Sealer {
-            epoch: Epoch::Handshake(cipher),
+            epoch: Epoch::Application(cipher),
         };
         // MAX_RECORDS_PER_KEY - 1 の 1 回はまだ受理される。
         sealer
