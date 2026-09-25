@@ -2582,7 +2582,18 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let parsed = self.parse_sql(sql)?;
+        // 構文・許可リスト検証のエラーも、明示トランザクション中なら種類を問わず
+        // `Failed` へ遷移させる（PostgreSQL と同じ。`Active` のまま残すと後続の
+        // `COMMIT` が先行する書き込みを永続化してしまう。PR #1041 レビュー指摘）。
+        // `fail` は `Active` 以外では何もしないため、`Idle` の autocommit 経路・
+        // 既に `Failed` の経路の挙動は不変。
+        let parsed = match self.parse_sql(sql) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                txn.fail();
+                return Err(e);
+            }
+        };
         self.execute_parsed_in_txn(ctx, session, txn, &parsed)
     }
 

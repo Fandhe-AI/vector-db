@@ -314,7 +314,14 @@ impl<'e> SessionTransaction<'e> {
 
     /// 任意のエラーで `Active` → `Failed` へ強制遷移させる（文実行中に
     /// エラーが起きた場合、`core.rs` の実行ディスパッチが呼ぶ）。
+    ///
+    /// `Active` 以外（`Idle`・`Failed`）では状態を一切変えない（冪等）。wire 層は
+    /// エラー応答のたびに状態を問わず呼ぶため、`Failed` を `Idle` へ戻したり
+    /// `session_at_begin` を失ったりしてはならない。
     pub fn fail(&mut self) {
+        if !matches!(self.state, TxnState::Active(_)) {
+            return;
+        }
         if let TxnState::Active(active) = std::mem::replace(&mut self.state, TxnState::Idle) {
             // `write_txn` は drop（abort）され、`permit` はその後に解放される。
             self.state = TxnState::Failed {

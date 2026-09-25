@@ -191,6 +191,71 @@ fn rollback_discards_all_statements_in_the_transaction() {
     assert!(matches!(outcome, SqlOutcome::Insert(_)));
 }
 
+/// 構文・許可リスト検証で失敗した文も、明示トランザクション中なら `Failed` へ
+/// 遷移させる回帰テスト（PR #1041 レビュー指摘）。`Active` のまま残ると後続の
+/// `COMMIT` が先行する `INSERT` を永続化してしまう。
+#[test]
+fn parse_error_inside_transaction_fails_the_transaction_and_commit_is_rejected() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "SET search_mode = 'precision'",
+        )
+        .expect("set search_mode before begin");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(20, "op-20"))
+        .expect("insert");
+
+    // 2 つ目は `Failed` 中の拒否（`fail()` が `Failed` を `Idle` へ戻さないこと）。
+    for bad_sql in ["SELEC id FROM documents", "DROP TABLE documents"] {
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, bad_sql)
+            .expect_err("invalid statement is rejected");
+        assert_eq!(
+            txn.status(),
+            TransactionStatus::Failed,
+            "a rejected statement must fail the transaction: {bad_sql}"
+        );
+    }
+
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
+        .expect_err("commit is rejected while failed");
+    assert_eq!(err.wire_code(), "25P02");
+    assert_eq!(
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback recovers from failed"),
+        SqlOutcome::Rollback
+    );
+    // `Failed` 中のエラーで `fail()` が再度呼ばれても、BEGIN 時点のセッション
+    // 状態は失われない。
+    assert_eq!(session.search_mode(), Some(SearchMode::Precision));
+
+    let outcome = engine
+        .execute_sql_in_session(
+            &caller,
+            &mut SessionState::default(),
+            &format!("SELECT id FROM {TABLE} ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 10"),
+        )
+        .expect("select after rollback");
+    match outcome {
+        SqlOutcome::Query(result) => assert_eq!(result.rows.len(), 0),
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
 #[test]
 fn nested_begin_fails_the_transaction() {
     let (engine, path) = new_core();
