@@ -258,11 +258,38 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
 /// `core.rs::EngineCore::execute_sql_in_session` の `Statement::Scan` アームから
 /// 呼ばれるほか、[`BoundScan`] が公開型へ昇格したため engine クレート外から
 /// SQL テキストを経由せず直接呼び出すこともできる（TASK-186・NOSQL-3）。
+///
+/// 既定の結果バイト予算（[`MAX_SCAN_RESULT_BYTES`]）で
+/// [`execute_scan_with_budget`] へ委譲する薄いラッパー。
 pub fn execute_scan(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundScan,
+) -> Result<QueryResult, SqlSurfaceError> {
+    execute_scan_with_budget(read_txn, ctx, schema, bound, MAX_SCAN_RESULT_BYTES)
+}
+
+/// [`execute_scan`] の本体（PR #1049 レビュー指摘 P1 対応。`sql::cursor::
+/// CursorStatement::Declare` の内側 SELECT 実行専用の入口として
+/// `core.rs::EngineCore` から直接呼ばれる）。
+///
+/// `max_result_bytes` は行生成中の累積バイト予算の上限（[`try_accumulate_budget`]
+/// 等へそのまま渡す）。[`execute_scan`] は既定値（[`MAX_SCAN_RESULT_BYTES`]＝
+/// 1 GiB）を渡すだけの薄いラッパーだが、`DECLARE` の内側 SELECT は
+/// [`crate::sql::cursor::CursorRegistry`] の遥かに小さい byte 予算
+/// （[`crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`]＝16 MiB）でしか
+/// 保持できないにも関わらず、[`execute_scan`] の既定予算のまま実行すると
+/// カーソル登録時（`CursorRegistry::declare`）の判定より先に最大 1 GiB もの
+/// 結果を確定させてしまう（ネットワーク入力によるメモリ確保量の増幅。
+/// security.md「不安全な設計」対応）。`core.rs` の `DECLARE` 実行経路はこの
+/// 本体を `MAX_CURSOR_BYTES_PER_SESSION` で直接呼び、行生成中に打ち切る。
+pub(crate) fn execute_scan_with_budget(
+    read_txn: &redb::ReadTransaction,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundScan,
+    max_result_bytes: usize,
 ) -> Result<QueryResult, SqlSurfaceError> {
     let expected_dim = schema.vector_dim();
     let (tier, scalar_mask) = decode_tier_for(schema, bound);
@@ -445,7 +472,7 @@ pub fn execute_scan(
             // そのものを許可する前に拒否できるよう `Vec::try_reserve` 系より先に
             // 判定する）。
             byte_budget =
-                try_accumulate_budget(byte_budget, per_row_struct_bytes, MAX_SCAN_RESULT_BYTES)?;
+                try_accumulate_budget(byte_budget, per_row_struct_bytes, max_result_bytes)?;
 
             // 投影段。確保失敗時に abort せず `Err` を返せるよう `try_reserve_exact`
             // を使う（`try_alloc_text_for_budget`／`try_clone_embedding_for_budget`
@@ -484,7 +511,7 @@ pub fn execute_scan(
                                     cells.push(Cell::Vector(try_clone_embedding_for_budget(
                                         embedding,
                                         &mut byte_budget,
-                                        MAX_SCAN_RESULT_BYTES,
+                                        max_result_bytes,
                                     )?));
                                 }
                             }
@@ -493,7 +520,7 @@ pub fn execute_scan(
                                     cells.push(Cell::Text(try_alloc_text_for_budget(
                                         t,
                                         &mut byte_budget,
-                                        MAX_SCAN_RESULT_BYTES,
+                                        max_result_bytes,
                                     )?))
                                 }
                                 Some(None) | None => cells.push(Cell::Null),
@@ -589,7 +616,7 @@ pub fn execute_scan(
                                     let value = try_alloc_array_for_budget(
                                         *array_ref,
                                         &mut byte_budget,
-                                        MAX_SCAN_RESULT_BYTES,
+                                        max_result_bytes,
                                     )?;
                                     cells.push(Cell::Array(value));
                                 }
@@ -605,7 +632,7 @@ pub fn execute_scan(
                                     cells.push(Cell::Bytes(try_alloc_bytes_for_budget(
                                         b,
                                         &mut byte_budget,
-                                        MAX_SCAN_RESULT_BYTES,
+                                        max_result_bytes,
                                     )?));
                                 }
                                 Some(Some(_)) => {
@@ -620,7 +647,7 @@ pub fn execute_scan(
                                     cells.push(Cell::Json(try_alloc_text_for_budget(
                                         t,
                                         &mut byte_budget,
-                                        MAX_SCAN_RESULT_BYTES,
+                                        max_result_bytes,
                                     )?));
                                 }
                                 Some(Some(_)) => {
@@ -638,7 +665,7 @@ pub fn execute_scan(
                                         cells.push(Cell::Text(try_alloc_text_for_budget(
                                             t,
                                             &mut byte_budget,
-                                            MAX_SCAN_RESULT_BYTES,
+                                            max_result_bytes,
                                         )?));
                                     }
                                     None => {
@@ -702,7 +729,7 @@ pub fn execute_scan(
                                     cells.push(Cell::Vector(try_accumulate_vector_budget(
                                         owned,
                                         &mut byte_budget,
-                                        MAX_SCAN_RESULT_BYTES,
+                                        max_result_bytes,
                                     )?));
                                 }
                                 ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
@@ -817,6 +844,37 @@ mod tests {
         assert_eq!(row1.cells[1], Cell::Vector(vec![1.0, 2.0, 3.0]));
         let row2 = result.rows.iter().find(|r| r.id == 2).expect("row 2");
         assert_eq!(row2.cells[1], Cell::Null);
+    }
+
+    /// PR #1049 レビュー指摘（P1）の回帰: [`execute_scan_with_budget`] は
+    /// 呼び出し元が渡した `max_result_bytes` を実際に honor する——`DECLARE`
+    /// の内側 SELECT 実行専用の入口（`core.rs::EngineCore::
+    /// execute_cursor_inner_query`）が `sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`
+    /// （16 MiB）を渡すことで、`execute_scan` の既定予算（`MAX_SCAN_RESULT_BYTES`
+    /// ＝1 GiB）に到達するより遥かに手前で行生成中に打ち切れることを、
+    /// 既定予算では成功する結果が小さい `max_result_bytes` では `54000`
+    /// （`payload_too_large`）になることで確認する。
+    #[test]
+    fn execute_scan_with_budget_honors_caller_supplied_cap() {
+        let path = unique_db_path("scan-with-budget-cap");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+        write_row_direct(&storage, "docs", "tenant-a", 1, &[1.0, 2.0, 3.0]);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let bound = bound_star_scan(10);
+
+        // 既定予算（`execute_scan`）では成功する。
+        execute_scan(&read_txn, &ctx, &schema, &bound).expect("default budget should succeed");
+
+        // 同じデータ・同じクエリでも、呼び出し元が極端に小さい予算を渡せば
+        // 行生成中に打ち切られる（`execute_scan` の既定予算まで到達しない）。
+        let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 1)
+            .expect_err("tiny caller-supplied budget must reject before default cap");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]

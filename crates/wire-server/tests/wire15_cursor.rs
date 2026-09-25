@@ -179,6 +179,25 @@ fn wire15_cursor_statements_outside_transaction_are_rejected() {
     read_ready_for_query(&mut stream);
 }
 
+/// PR #1049 レビュー指摘（P1）の wire 経由回帰: トランザクション外の
+/// `DECLARE` は、内側 SELECT が存在しないテーブルを指していても `25P01` を
+/// 返す（テーブル存在確認〔`UndefinedTable`〕がトランザクション状態の判定
+/// より先に走ってはならない）。
+#[test]
+fn wire15_declare_outside_transaction_against_missing_table_is_25p01() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut stream,
+        "DECLARE c CURSOR FOR SELECT id FROM missing_table LIMIT 1",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "25P01");
+    read_ready_for_query(&mut stream);
+}
+
 /// ベクトル順位付けの検索 `SELECT`（`ORDER BY <=>`）を `DECLARE` の内側として
 /// 指定すると `42601`。`Active` なトランザクションは `Failed` へ遷移する。
 #[test]

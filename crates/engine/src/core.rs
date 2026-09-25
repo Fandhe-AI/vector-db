@@ -2730,6 +2730,19 @@ impl EngineCore {
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = crate::sql::lexer::tokenize(sql)?;
+        // PR #1049 レビュー指摘（P1）: 本エントリポイントはトランザクション
+        // 文脈を持たないため `DECLARE` は常に `25P01`
+        // （`execute_parsed_in_session` の `Cursor` 分岐参照）だが、通常の
+        // `parse_tokens` 経路は内側 SELECT のカタログ照会（テーブル存在確認）を
+        // 伴うため、そのまま通すと存在しないテーブルを指す `DECLARE` が
+        // `UndefinedTable` を返してしまう。カタログ非依存の構造検証だけで
+        // 判定を確定させ、`parse_tokens`（カタログ照会を含む）を呼ぶ前に
+        // 返す（`sql::cursor::declare_outside_transaction_error` 参照）。
+        if crate::sql::cursor::is_declare_statement(&tokens) {
+            return Err(crate::sql::cursor::declare_outside_transaction_error(
+                &tokens,
+            ));
+        }
         let parsed = self.parse_tokens(tokens)?;
         self.execute_parsed_in_session(ctx, session, &parsed)
     }
@@ -2757,6 +2770,25 @@ impl EngineCore {
             && !crate::sql::transaction::is_rollback_statement(sql)
         {
             return Err(txn.take_failed_error());
+        }
+        // PR #1049 レビュー指摘（P1）: `Idle`（未 `BEGIN`）で `DECLARE` を送ると
+        // `25P01` を返す契約（`execute_parsed_in_session` の `Cursor` 分岐
+        // 参照）だが、`self.parse_sql(sql)` は内側 SELECT のカタログ照会
+        // （テーブル存在確認）まで一度に行うため、そのまま先に呼ぶと存在しない
+        // テーブルを指す `DECLARE` が `25P01` ではなく `UndefinedTable` を
+        // 返してしまう（テーブル存在確認がトランザクション状態判定より先に
+        // 走るため）。`Failed` は上で処理済みのため、ここでの `Idle` 判定は
+        // 「未 `BEGIN`」を意味する。字句解析自体に失敗した入力は `DECLARE`
+        // ではないものとして通常の parse エラー経路（下記）へ委ねる
+        // （`sql::cursor::declare_outside_transaction_error` 参照）。
+        if txn.status() == crate::sql::transaction::TransactionStatus::Idle {
+            if let Ok(tokens) = crate::sql::lexer::tokenize(sql) {
+                if crate::sql::cursor::is_declare_statement(&tokens) {
+                    return Err(crate::sql::cursor::declare_outside_transaction_error(
+                        &tokens,
+                    ));
+                }
+            }
         }
         // 構文・許可リスト検証のエラーも、明示トランザクション中なら種類を問わず
         // `Failed` へ遷移させる（PostgreSQL と同じ。`Active` のまま残すと後続の
@@ -2922,6 +2954,45 @@ impl EngineCore {
         }
     }
 
+    /// `DECLARE` の内側 SELECT（`sql::cursor::validate_declare_tokens` により
+    /// `Statement::Aggregate`／`Statement::Scan` のいずれかであることが構造
+    /// 検証段で保証済み）専用の実行入口（PR #1049 レビュー指摘 P1 対応）。
+    ///
+    /// `Statement::Scan` のみ、[`crate::sql::scan::execute_scan_with_budget`] を
+    /// [`crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`]（16 MiB）で直接呼び、
+    /// 行生成中の累積判定を [`Self::execute_validated_in_session`] 経由の既定
+    /// 予算（`sql::scan::MAX_SCAN_RESULT_BYTES`＝1 GiB）より遥かに手前で打ち
+    /// 切る——`CursorRegistry::declare` のバイト上限判定（16 MiB）は本来
+    /// カーソルが保持できる上限を表すにも関わらず、既定予算のまま実行すると
+    /// その判定に到達する前に最大 1 GiB もの結果をメモリ上に確定させてしまう
+    /// （ネットワーク入力によるメモリ確保量の増幅。security.md「不安全な
+    /// 設計」対応）。`Statement::Aggregate` は `GROUP BY` のグループキー累計
+    /// バイト数上限（`sql::group_by::MAX_GROUP_KEY_TOTAL_BYTES`＝16 MiB）が
+    /// 既に同程度の予算で頭打ちになっているため、通常の
+    /// [`Self::execute_validated_in_session`] へそのまま委譲する（それ以外の
+    /// `Statement` 種別への到達は構造検証段の保証により起き得ないが、
+    /// 防御的に同じ経路へ委譲する）。
+    fn execute_cursor_inner_query(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        inner: &crate::sql::allowlist::Statement,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        if let crate::sql::allowlist::Statement::Scan(validated) = inner {
+            let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+            let bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
+            let result = crate::sql::scan::execute_scan_with_budget(
+                &read_txn,
+                ctx,
+                &schema,
+                &bound,
+                crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION,
+            )?;
+            return Ok(crate::sql::SqlOutcome::Query(result));
+        }
+        self.execute_validated_in_session(ctx, session, inner.clone())
+    }
+
     /// [`Self::execute_in_active_txn`] の `ParsedSql::Cursor` 分岐本体
     /// （WIRE-15・TASK-218）。
     ///
@@ -2929,8 +3000,9 @@ impl EngineCore {
     ///   読み取りは `0A000`（[`Self::read_only_in_active_txn`] と同じ既知の
     ///   逸脱）。カーソル数上限・重複名は内側 SELECT を実行する**前**に判定し
     ///   （[`crate::sql::cursor::CursorRegistry::ensure_capacity_for_declare`]）、
-    ///   実行後に確定した [`crate::sql::exec::QueryResult`] をバイト上限判定
-    ///   込みで登録する（[`crate::sql::cursor::CursorRegistry::declare`]）。
+    ///   内側 SELECT 自体の実行は [`Self::execute_cursor_inner_query`] へ
+    ///   委譲し、実行後に確定した [`crate::sql::exec::QueryResult`] をバイト
+    ///   上限判定込みで登録する（[`crate::sql::cursor::CursorRegistry::declare`]）。
     /// - `FETCH`／`CLOSE`: `CursorRegistry` への委譲のみ。検索本体は再実行
     ///   しない。
     fn execute_cursor_in_active_txn<'e>(
@@ -2955,7 +3027,7 @@ impl EngineCore {
                         detail: "internal error".to_string(),
                     })?
                     .ensure_capacity_for_declare(name)?;
-                let outcome = self.execute_validated_in_session(ctx, session, (**inner).clone())?;
+                let outcome = self.execute_cursor_inner_query(ctx, session, inner)?;
                 let result = match outcome {
                     crate::sql::SqlOutcome::Query(result) => result,
                     // `inner` は構造検証段で `Statement::Aggregate`／

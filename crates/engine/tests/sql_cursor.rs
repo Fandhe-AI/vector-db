@@ -213,6 +213,33 @@ fn cursor_statements_outside_transaction_are_rejected() {
     assert_eq!(err.wire_code(), "34000");
 }
 
+/// (b') PR #1049 レビュー指摘（P1）の回帰: トランザクション外の `DECLARE` は、
+/// 内側 SELECT が存在しないテーブルを指していても `25P01`
+/// （[`engine::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction`]）を
+/// 返す——`UndefinedTable`（テーブル存在確認）がトランザクション状態の判定
+/// より先に走ってはならない。`execute_sql_in_session`（トランザクション文脈を
+/// 持たない入口）・`execute_sql_in_txn`（`Idle`＝未 `BEGIN`）の双方で確認する。
+#[test]
+fn declare_outside_transaction_against_missing_table_is_25p01_not_undefined_table() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+
+    let declare_sql = "DECLARE c CURSOR FOR SELECT id FROM missing_table LIMIT 10";
+
+    let err = engine
+        .execute_sql_in_session(&caller, &mut session, declare_sql)
+        .expect_err("DECLARE outside transaction against a missing table must still be 25P01");
+    assert_eq!(err.wire_code(), "25P01");
+
+    let mut txn = engine.new_session_transaction();
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, declare_sql)
+        .expect_err("DECLARE before BEGIN against a missing table must still be 25P01");
+    assert_eq!(err.wire_code(), "25P01");
+}
+
 /// (c) `COMMIT`／`ROLLBACK` の後、開いていたカーソルは自動的に消える
 /// （新しいトランザクションからの `FETCH` は `34000`）。`Failed` 中の
 /// `FETCH`／`CLOSE`／`DECLARE` はいずれも `25P02`。

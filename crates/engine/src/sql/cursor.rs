@@ -141,6 +141,53 @@ pub(crate) fn validate_declare_tokens(
     })
 }
 
+/// トークン列の先頭が `DECLARE`（大小無視）かどうかだけを覗く（構造検証・
+/// カタログ照会を一切行わない軽量判定）。[`crate::sql::transaction::
+/// is_rollback_statement`] と同じ「先頭トークンだけを見て制御フローを
+/// 決める」設計で、`core.rs` の各実行入口がトランザクション状態を確認する
+/// より前に `DECLARE` かどうかだけを安全に判定するために使う。
+pub(crate) fn is_declare_statement(tokens: &[Token]) -> bool {
+    matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("DECLARE"))
+}
+
+/// 構造検証だけを行い、実カタログへは一切問い合わせない
+/// [`TableLookup`]（常にテーブルが存在するとみなす）。
+/// [`declare_outside_transaction_error`] 専用。
+struct AlwaysExistsLookup;
+
+impl TableLookup for AlwaysExistsLookup {
+    fn table_exists(&self, _name: &str) -> Result<bool, SqlSurfaceError> {
+        Ok(true)
+    }
+}
+
+/// 明示トランザクション外（`Idle`、またはトランザクション文脈を持たない
+/// 実行入口）での `DECLARE` を判定する（PR #1049 レビュー指摘 P1 対応）。
+///
+/// [`validate_declare_tokens`] は内側 SELECT の構造検証に続けてカタログ照会
+/// （対象テーブルの存在確認）まで一度に行う。そのため、トランザクション外
+/// では常に `25P01`（[`SqlSurfaceError::NoActiveSqlTransaction`]）を返す
+/// べき契約（`core.rs::execute_parsed_in_session` の `Cursor` 分岐参照）の下で
+/// そのまま呼ぶと、テーブル存在確認がトランザクション状態の判定より先に
+/// 走ってしまい、存在しないテーブルを指す `DECLARE` が `25P01` ではなく
+/// `UndefinedTable` を返してしまう（wire_code の互換性契約違反）。
+///
+/// 本関数は [`AlwaysExistsLookup`] を渡して構造検証だけを行う。
+///
+/// - 構造として妥当な `DECLARE`（テーブルの実在有無を問わず）なら `25P01` を返す。
+/// - 構造自体が不正な場合（`42601` 等。カタログの存在情報を含まないため
+///   トランザクション状態の判定より先に返しても情報漏えいにならない）は
+///   その構造エラーをそのまま返す。
+///
+/// 呼び出し元は「トランザクション状態が `Idle`（or 文脈なし）かつ
+/// `is_declare_statement` が真」の場合にのみこれを呼ぶこと。
+pub(crate) fn declare_outside_transaction_error(tokens: &[Token]) -> SqlSurfaceError {
+    match validate_declare_tokens(tokens, &AlwaysExistsLookup) {
+        Ok(_) => SqlSurfaceError::NoActiveSqlTransaction,
+        Err(e) => e,
+    }
+}
+
 /// `FETCH [FORWARD] <n> FROM <name>`（規範形のみ。`IN`／`ALL`／`NEXT`／
 /// `BACKWARD`／`ABSOLUTE` はいずれも `n` の位置に `Token::Number` を要求する
 /// 構造上、自然に `42601` へ落ちる）。`$n`（拡張クエリプロトコルのパラメータ
