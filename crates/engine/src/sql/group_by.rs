@@ -91,6 +91,19 @@ const TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL: &str =
 /// `MIN`/`MAX(TEXT)` の縮小方向更新を含むため走査順に依存する一時的な超過が
 /// ありうる（[`is_text_accumulator_budget_error`] のドキュメント参照）。
 const RESULT_BUDGET_EXCEEDED_DETAIL: &str = "GROUP BY result exceeds capacity";
+/// [`ResultBudget`] の超過を新規グループ追加時（[`check_new_group_budget`]）に
+/// 検出した場合の detail 文言。[`RESULT_BUDGET_EXCEEDED_DETAIL`] と異なり
+/// [`is_text_accumulator_budget_error`] の対象に**含めない**（索引経路から全走査への
+/// フォールバックを起こさず、どの経路でも同一の即時失敗 `54000` とする）。
+///
+/// 根拠（PR #1049 レビュー指摘 Cursor Bugbot Medium 対応）: グループ追加時の見積りの
+/// うちグループ数・キー累計は単調増加で処理順序に依存しない。`TEXT` 集計状態累計は
+/// 処理順序に依存しうるが、`TEXT` の `MIN`/`MAX` を含むクエリは列挙形を使わず
+/// （`execute_grouped_aggregate` の `text_min_max_blocks_enumeration`）、候補走査形は
+/// 全走査と同一の物理行順で処理するため、いずれの索引経路で超過しても全走査で同じ
+/// 時点に超過する——フォールバックしても結果は変わらず全表走査の無駄になるだけ。
+const RESULT_BUDGET_GROUPS_EXCEEDED_DETAIL: &str =
+    "GROUP BY groups exceed the allowed result capacity";
 
 /// 生成中の結果 1 行（1 グループ）あたりの固定オーバーヘッド見積り（`id`・`score`
 /// 相当）。`sql::cursor::estimate_row_bytes` と同じ見積り規約（DoS 対策の概算で
@@ -141,13 +154,15 @@ impl ResultBudget {
     }
 
     /// `group_count` グループ・キー累計 `total_key_bytes`・`TEXT` 集計状態累計
-    /// `total_text_bytes` の生成中結果が予算内かを判定する（超過は
-    /// [`RESULT_BUDGET_EXCEEDED_DETAIL`] の `54000`）。
+    /// `total_text_bytes` の生成中結果が予算内かを判定する（超過は `detail` を
+    /// 持つ `54000`。`TEXT` 増加時は [`RESULT_BUDGET_EXCEEDED_DETAIL`]、新規グループ
+    /// 追加時は [`RESULT_BUDGET_GROUPS_EXCEEDED_DETAIL`]）。
     fn check(
         &self,
         group_count: usize,
         total_key_bytes: usize,
         total_text_bytes: usize,
+        detail: &'static str,
     ) -> Result<(), SqlSurfaceError> {
         let estimated = group_count
             .checked_mul(self.per_group_bytes)
@@ -157,9 +172,7 @@ impl ResultBudget {
                 SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
             })?;
         if estimated > self.max_result_bytes {
-            return Err(SqlSurfaceError::payload_too_large(
-                RESULT_BUDGET_EXCEEDED_DETAIL,
-            ));
+            return Err(SqlSurfaceError::payload_too_large(detail));
         }
         Ok(())
     }
@@ -280,7 +293,12 @@ fn check_new_group_budget(
     let next_group_count = current_group_count.checked_add(1).ok_or_else(|| {
         SqlSurfaceError::payload_too_large("GROUP BY group count accounting overflowed")
     })?;
-    budget.check(next_group_count, next, total_text_accumulator_bytes)?;
+    budget.check(
+        next_group_count,
+        next,
+        total_text_accumulator_bytes,
+        RESULT_BUDGET_GROUPS_EXCEEDED_DETAIL,
+    )?;
     *total_key_bytes = next;
     Ok(())
 }
@@ -361,7 +379,12 @@ fn accumulate_row(
             // Declare` の内側実行では `CursorRegistry::declare` の 16 MiB 判定へ
             // 到達する前に生成中の段階で打ち切る（新規グループ追加時の判定は
             // [`check_new_group_budget`] が担う）。
-            budget.check(group_count, total_key_bytes, *total_text_accumulator_bytes)?;
+            budget.check(
+                group_count,
+                total_key_bytes,
+                *total_text_accumulator_bytes,
+                RESULT_BUDGET_EXCEEDED_DETAIL,
+            )?;
         } else if after < before {
             // MIN/MAX(TEXT) の極値がより短い文字列へ更新された縮小方向。
             // 実際の保持量を正確に反映するため減算する（`checked_sub` の
@@ -1839,6 +1862,18 @@ mod tests {
         let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, 101, None, None)
             .expect_err("adding the third group must exceed the budget");
         assert_eq!(err.wire_code(), "54000");
+        // グループ追加時の超過は索引経路から全走査へのフォールバック対象
+        // （走査順依存の TEXT 超過）として分類しない（Cursor Bugbot Medium 対応）。
+        assert!(
+            !is_text_accumulator_budget_error(&err),
+            "group-addition budget overflow must not trigger an index-path fallback"
+        );
+        assert!(
+            is_text_accumulator_budget_error(&SqlSurfaceError::payload_too_large(
+                RESULT_BUDGET_EXCEEDED_DETAIL
+            )),
+            "TEXT-growth budget overflow stays order-dependent (fallback)"
+        );
     }
 
     /// [`ResultBudget::check`] はグループ数に比例する固定分・キー累計・`TEXT`
@@ -1848,12 +1883,13 @@ mod tests {
         let bound = bound_count_star_grouped_by_lang();
         let budget = ResultBudget::new(&bound, 100).expect("budget");
         assert_eq!(budget.per_group_bytes, 32);
-        budget.check(3, 4, 0).expect("3*32+4 = 100 fits");
-        assert_eq!(budget.check(3, 5, 0).unwrap_err().wire_code(), "54000");
-        assert_eq!(budget.check(3, 4, 1).unwrap_err().wire_code(), "54000");
-        assert_eq!(budget.check(4, 0, 0).unwrap_err().wire_code(), "54000");
+        let d = RESULT_BUDGET_EXCEEDED_DETAIL;
+        budget.check(3, 4, 0, d).expect("3*32+4 = 100 fits");
+        assert_eq!(budget.check(3, 5, 0, d).unwrap_err().wire_code(), "54000");
+        assert_eq!(budget.check(3, 4, 1, d).unwrap_err().wire_code(), "54000");
+        assert_eq!(budget.check(4, 0, 0, d).unwrap_err().wire_code(), "54000");
         assert_eq!(
-            budget.check(usize::MAX, 0, 0).unwrap_err().wire_code(),
+            budget.check(usize::MAX, 0, 0, d).unwrap_err().wire_code(),
             "54000",
             "overflow must fail closed"
         );
