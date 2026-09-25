@@ -267,6 +267,13 @@ pub enum CatalogError {
     TypeAlreadyExists(String),
     DependentObjectsStillExist(String),
     WriteLockTimeout,
+    ColumnNotFound(String),
+    ProtectedColumn(String),
+    IncompatibleTypeChange {
+        column: String,
+        from: String,
+        to: String,
+    },
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError

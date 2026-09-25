@@ -1199,6 +1199,13 @@ fn dictionary_required_columns(
 /// `EngineCore::run_scan_plan` 参照）を保持する。
 #[derive(Debug)]
 pub enum CopyPlan {
+    // `CopyInSession` を直接（Box なしで）保持する。`TableSchema` へのフィールド
+    // 追加（TABLE-19・Issue #901）で `CopyInSession` 自体のサイズが増え、
+    // 一時的に `Box` でこの variant を包む対応を検討したが、公開 enum の
+    // variant 内包型を変える破壊的変更になるため、代わりに
+    // `CopyInSession` 内部の非公開フィールド `schema` を Box 化して
+    // `clippy::large_enum_variant` を解消した（`sql::copy::CopyInSession`
+    // 参照）。ここでの内包型・意味論はいずれも無変更。
     From(crate::sql::copy::CopyInSession),
     To(
         crate::sql::allowlist::CopyFormat,
