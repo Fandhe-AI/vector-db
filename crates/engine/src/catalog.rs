@@ -1080,9 +1080,19 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
     let mut i = 0;
+    // 上のコメントが述べる「添字直接アクセスを避け明示判定を使う」方針を、
+    // 実際に `[]` を書かない形で徹底する（Issue #904 レビュー指摘）。
+    // 直前の `is_multiple_of(2)` 検査により `i + 1 < bytes.len()` の間は
+    // `get(i)`／`get(i + 1)` が必ず `Some` になるが、`get` を使うことで
+    // この不変条件が崩れても panic ではなく `Err` へ倒れる（fail-closed）。
     while i + 1 < bytes.len() {
-        let hi = hex_nibble(bytes[i])?;
-        let lo = hex_nibble(bytes[i + 1])?;
+        let (Some(&hi_byte), Some(&lo_byte)) = (bytes.get(i), bytes.get(i + 1)) else {
+            return Err(CatalogError::Invalid(
+                "column default hex field has odd length".to_string(),
+            ));
+        };
+        let hi = hex_nibble(hi_byte)?;
+        let lo = hex_nibble(lo_byte)?;
         out.push((hi << 4) | lo);
         i += 2;
     }
