@@ -60,13 +60,35 @@ Issue #953 で不透明バイト列として実装済み）へ組み立てる必
     `OCTET STRING`・各種文字列型・時刻型等。予約済み・未定義のタグ番号も
     fail-closed にこちらへ含める）は primitive でなければならない
     （constructed は `ConstructedUniversalType`）
-  - `NULL` は値が空、`BOOLEAN` はちょうど 1 バイトで `0x00`／`0xFF` のいずれか、
-    `INTEGER`／`ENUMERATED` は空でなく最小符号化、`OBJECT IDENTIFIER`／
-    `RELATIVE-OID` は空でなくサブ識別子が最小符号化かつ切り詰められていない
-    こと（それ以外は `InvalidPrimitiveEncoding`）
-- 上記以外の primitive な値（`OCTET STRING`・`BIT STRING`・文字列型等）の
-  中身には潜らない（`BIT STRING` の形状はフィールドごとの拒否理由を保つため
-  `x509.rs` が検査する）
+  - universal の primitive な値は、`validate_universal_primitive` が型ごとの
+    DER 正規形・値の制約を一か所で検査する（違反は時刻型のみ `InvalidTime`、
+    それ以外は `InvalidPrimitiveEncoding`）
+    - `BOOLEAN`: 長さ 1 で `0x00`／`0xFF`
+    - `INTEGER`／`ENUMERATED`: 空でなく最小符号化
+    - `BIT STRING`: 長さ 1 以上・未使用ビット数 0〜7・内容が空なら未使用
+      ビット数 0・未使用ビットの 0 埋め（`validate_bit_string`。`x509.rs` も
+      IMPLICIT タグの unique ID や `signatureValue`・SPKI で同じ実装を使う）
+    - `NULL`: 長さ 0
+    - `OBJECT IDENTIFIER`／`RELATIVE-OID`: 空でなく、サブ識別子が最小符号化で
+      切り詰められていない
+    - `UTCTime`: `YYMMDDHHMMSSZ` の 13 バイト固定（X.690 §11.8。秒は省略
+      不可・`Z` 終端・オフセット不可）で暦として有効
+    - `GeneralizedTime`: `YYYYMMDDHHMMSS[.f+]Z`（X.690 §11.7。秒は省略不可・
+      小数秒は `.` の後に 1 桁以上で末尾 `0` なし・`Z` 終端・オフセット不可）で
+      暦として有効
+    - `UTF8String`: 正しい UTF-8。`NumericString`: 数字と空白。
+      `PrintableString`: 英大小文字・数字・空白・`' ( ) + , - . / : = ?`。
+      `IA5String`: 7 ビット。`VisibleString`: `0x20`〜`0x7E`。
+      `UniversalString`: 長さが 4 の倍数。`BMPString`: 長さが 2 の倍数
+    - `REAL`・`TIME`・予約済み（15）: 正規形検査を持たないため
+      `UnsupportedUniversalType` で拒否（X.509 では使われない）
+    - 意図的に制約を課さない型: `OCTET STRING`（任意のオクテット列）と、
+      ISO 2022 のエスケープシーケンスで文字集合を切り替えるため文字集合を
+      検証できない `ObjectDescriptor`・`TeletexString`・`VideotexString`・
+      `GraphicString`・`GeneralString`
+- context-specific 等 universal 以外のクラスの primitive 値は、IMPLICIT タグで
+  元の型が分からないため構造検証では検査せず、`x509.rs` のフィールド検査
+  （unique ID の BIT STRING 形状等）に委ねる
 - `Tlv` は `tag`・`value` に加えて `raw`（タグ+長さ+値の生バイト列）を持つ。
   `read_any` は消費前の残り入力（`start`）と消費後の残り入力（`remaining`）の
   長さの差分から `raw` を切り出す。`start`・`remaining` は常に同一バッファの
@@ -112,10 +134,10 @@ Issue #953 で不透明バイト列として実装済み）へ組み立てる必
    - `subjectPublicKeyInfo SEQUENCE { AlgorithmIdentifier, BIT STRING }`:
      AlgorithmIdentifier は葉・中間を問わず構造検査（先頭に整形式の OID が
      1 個・任意の `parameters` は高々 1 個の TLV・余剰要素なし）を通し、OID・
-     parameters 有無・鍵ビット列を保持する。`subjectPublicKey` BIT STRING も
-     葉・中間を問わず形状検査（値が空でない・未使用ビット数 0〜7・未使用
-     ビットの 0 埋め・内容 1 バイト以上）を通し、違反は `InvalidPublicKey`
-     とする（`signatureValue`・unique ID と共通の BIT STRING 形状検査）
+     parameters 有無・鍵ビット列を保持する。`subjectPublicKey` BIT STRING の
+     DER 形状（値が空でない・未使用ビット数 0〜7・未使用ビットの 0 埋め）は
+     手順 2 の構造検証が葉・中間を問わず検査し、違反は `Malformed`。DER と
+     しては正当だが内容が 0 バイトの鍵は葉・中間とも `InvalidPublicKey`
    - 任意の `issuerUniqueID [1] IMPLICIT`・`subjectUniqueID [2] IMPLICIT`:
      存在すれば `BIT STRING` の形状（未使用ビット数 0〜7・非 0 なら最終
      オクテットの未使用ビットが 0）を検査する
@@ -149,13 +171,18 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
 
 ## 時刻パース（RFC 5280 §4.1.2.5）
 
+- DER の正規形と暦の検査は `der.rs` の `parse_utc_time`／
+  `parse_generalized_time` に一本化し、構造検証（validity 以外の場所に現れる
+  時刻型を含む）と validity のパースが同じ実装を使う。形式・暦の違反は
+  `InvalidTime`
 - UTCTime（tag `0x17`）: `YYMMDDHHMMSSZ` の 13 バイト固定。`YY >= 50` は
   19YY、`YY < 50` は 20YY と解釈する
-- GeneralizedTime（tag `0x18`）: `YYYYMMDDHHMMSSZ` の 15 バイト固定。RFC 5280
-  は 2050 年以降にのみ GeneralizedTime を使うことを要求するため、2050 年
-  未満は fail-closed で拒否する
-- 共通: 数字以外・`Z` 以外の末尾（タイムゾーンオフセット・小数秒を含む）は
-  拒否。月 1〜12・日は月と閏年（グレゴリオ暦。400 年ルール込み）に応じた
+- GeneralizedTime（tag `0x18`）: DER としては小数秒（`.` の後に 1 桁以上・
+  末尾 `0` なし）を受理するが、validity では RFC 5280 §4.1.2.5.2 が小数秒を
+  禁じ、かつ 2050 年以降にのみ GeneralizedTime を使うことを要求するため、
+  小数秒付き・2050 年未満はいずれも `x509.rs` が fail-closed に拒否する
+- 共通: 数字以外・`Z` 以外の末尾（タイムゾーンオフセットを含む）は拒否。
+  月 1〜12・日は月と閏年（グレゴリオ暦。400 年ルール込み）に応じた
   上限・時 0〜23・分 0〜59・秒 0〜59（うるう秒 60 は非受理）を検査する
 - エポック秒（`i64`）への変換は Howard Hinnant の `days_from_civil`
   アルゴリズム（外部クレートなし・`div_euclid` で負の年にも対応）を自作し、
@@ -231,8 +258,8 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
   余剰要素付き・不正な OID の AlgorithmIdentifier／中間証明書 SPKI の
   AlgorithmIdentifier の余剰要素・切り詰め OID／中間証明書 SPKI の
   BIT STRING の形状違反（空・未使用ビット数オクテットのみ・未使用ビット数
-  8・非 0 パディング・内容なし。いずれも `index: 1` の `InvalidPublicKey`。
-  0 埋めの非 0 未使用ビット数は受理）／serialNumber の負数・ゼロ・
+  8・非 0 パディング・内容なし。DER 形状違反は `index: 1` の `Malformed`、
+  内容 0 バイトは `InvalidPublicKey`。0 埋めの非 0 未使用ビット数は受理）／serialNumber の負数・ゼロ・
   21 オクテット・非最小符号化（20 オクテット・符号ビット確保の先頭 `0x00` は
   受理）／`signatureValue` の署名データ欠落・非 0 パディング（0 パディングは
   受理）／SPKI parameters 付き／BIT STRING 未使用ビット非 0／鍵長 31・33／
@@ -245,7 +272,13 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
   同一 `extnID` の重複（異なる `extnID` の組は受理）／空の issuer（葉・中間
   とも。空の subject は受理）／Name の属性値に置いた `EXTERNAL` の primitive
   形・constructed 化した UTF8String（constructed の `EXTERNAL` は受理）／
-  AlgorithmIdentifier parameters 内の非最小符号化・空の INTEGER／
+  AlgorithmIdentifier parameters 内の非最小符号化・空の INTEGER／同
+  parameters 内の非正規 BIT STRING（未使用ビット数 8・非 0 パディング・
+  内容なしの未使用ビット数・空。正規形と OCTET STRING は受理）／Name の
+  属性値の不正 UTF-8・PrintableString 外の文字・8 ビットの IA5String・
+  奇数長の BMPString・REAL（正規形は受理）と、末尾 0 の小数秒を持つ
+  GeneralizedTime（`InvalidTime`）／validity の小数秒付き GeneralizedTime
+  （`InvalidTime`）／
   DER 長上限超過の拒否、エラー `Display` が証明書内容（CN 文字列・鍵の 16 進
   表現）を含まないこと、ファイル入口（一時ファイル経由の成功・存在しない
   ファイル）を固定した
@@ -254,7 +287,11 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
   universal 型（予約済みタグ番号を含む）・primitive の `SEQUENCE`／`SET`／
   `EXTERNAL`／`EMBEDDED PDV`／`CHARACTER STRING` の拒否（これらの constructed
   形は受理）・`NULL`／`BOOLEAN`／`INTEGER`／`ENUMERATED`／`OBJECT
-  IDENTIFIER`／`RELATIVE-OID` の非正規形の拒否
+  IDENTIFIER`／`RELATIVE-OID` の非正規形の拒否・`BIT STRING`／`UTCTime`／
+  `GeneralizedTime`／`UTF8String`／`NumericString`／`PrintableString`／
+  `IA5String`／`VisibleString`／`UniversalString`／`BMPString` の型ごとの
+  受理・拒否・制約を課さない型の任意オクテット受理・`REAL`／`TIME`／予約
+  タグの拒否・context-specific primitive 値を構造検証で検査しないこと
 
 手組み DER エンコーダ（`tlv`／`sequence` 等）はテスト専用であり、本番コード
 には存在しない（`pkcs8` の結合テストと同方針）。
