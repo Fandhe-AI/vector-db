@@ -720,3 +720,66 @@ fn unique_violation_response_does_not_depend_on_other_tenants_rows() {
     assert!(!message.contains("bob"), "{message}");
     assert!(!message.contains("alice"), "{message}");
 }
+
+// --- ALTER TABLE ADD COLUMN（Issue #900）との併用 --------------------------
+
+/// `ALTER TABLE ... ADD COLUMN` は既存の UNIQUE 制約を保持したまま列を追加し
+/// （カタログ v6 の往復）、追加後も既存制約の構成列は名前で解決されるため、
+/// 列の追加・削除（墓標）で物理位置がずれても検査対象の列を取り違えない。
+/// ADD COLUMN 自体は列制約を受理しないため、追加列に UNIQUE は付かない。
+#[test]
+fn add_column_preserves_existing_unique_constraint_and_column_resolution() {
+    let (core, path) = new_core("uniq-add-column");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a TEXT, b TEXT UNIQUE)",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a, b) VALUES (1, 'x', 'k') USING OPERATION_ID 'op-1'",
+    )
+    .expect("insert 1");
+    drop(core);
+
+    // 先頭列 `a` を削除して墓標を作り、`b` の論理位置をずらす。
+    let storage = Storage::open(&path).expect("reopen storage");
+    storage
+        .alter_table_drop_column("docs", "a")
+        .expect("drop a non-constrained column");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+
+    core.execute_sql_in_session(&alice, &mut session, "ALTER TABLE docs ADD COLUMN c TEXT")
+        .expect("add column");
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            "ALTER TABLE docs ADD COLUMN d TEXT UNIQUE",
+        )
+        .expect_err("ADD COLUMN must not accept a UNIQUE column constraint");
+    assert_eq!(err.wire_code(), "42601");
+
+    // 既存制約（`b`）は ADD COLUMN 後も有効で、追加列 `c` を取り違えない。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, b, c) VALUES (2, 'k', 'z') USING OPERATION_ID 'op-2'",
+        )
+        .expect_err("duplicate on the existing UNIQUE column must still be rejected");
+    assert_eq!(err.wire_code(), "23505");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, b, c) VALUES (3, 'm', 'k') USING OPERATION_ID 'op-3'",
+    )
+    .expect("a value equal to b's in the unconstrained added column must be accepted");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, b, c) VALUES (4, 'n', 'k') USING OPERATION_ID 'op-4'",
+    )
+    .expect("the added column carries no UNIQUE constraint");
+}
