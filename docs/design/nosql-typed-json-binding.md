@@ -28,7 +28,8 @@
 | JSON / JSONB（既存） | オブジェクト・配列 | `42601` | 長すぎは `54000`（既存契約） |
 | ENUM（既存） | 文字列 | `22P02`（語彙外） | 非文字列は `42601` |
 | TEXT / VECTOR（旧来型） | 文字列 / 数値配列 | **`22000`** | 既存コードを据え置く（`nosql-api.md` が `22000` と明記済みのため。新型との非対称はオーナー確認事項） |
-| 全型共通 | `null` | — | insert: 列を省略（nullable 列は `NULL`、非 nullable 列は「値が提供されていない」として `22000`）。update: `InsertLiteral::Null` をそのまま渡し `bind_update` の nullable 判定へ委譲 |
+| 全型共通（TEXT／ENUM を除く） | `null` | — | insert: 列を省略（nullable 列は `NULL`、非 nullable 列は「値が提供されていない」として `22000`）。update: `InsertLiteral::Null` をそのまま渡し `bind_update` の nullable 判定へ委譲 |
+| TEXT／ENUM（`update` op） | `null` | TEXT: `22000`／ENUM: `42601` | Issue #896 以前の契約を維持し `nullable` 属性に関わらず一律拒否する（下記「null の扱い」節参照） |
 
 数値は `f64` を経由しない（`JsonNumber::PosInt`/`NegInt` は `to_string()`、`Float` は保持済みの生テキストをそのまま使う）。SQL 表層のリテラルパーサーと同一の「テキストから直接解釈する」経路に載せることで、表層を跨いだ `content_hash`（TASK-101・RECOVER-10）の一致を保つ（`update.rs::vector_literal_text` が確立していた設計を `typed_json::number_literal_text`／`vector_literal_text` へ一般化した）。
 
@@ -38,7 +39,7 @@ Issue #896 導入前は `update` op の JSON/UUID 列 `null` 分岐を wire 層�
 
 その結果、**非 nullable 列への `null` の拒否コードが `42601` から `22000` へ変わった**（`wire_json_column.rs::nosql_update_set_json_null_on_non_nullable_column_is_rejected` で固定。旧テスト名 `..._is_rejected_with_42601` から改名）。拒否されること自体・fail-closed であることは不変。
 
-**未確定事項（オーナー確認）**: 一般化の副作用として、これまで `update` op が明示的に拒否していた **`nullable` な `TEXT`／`ENUM` 列への JSON `null` が成功するようになった**（`map_json_to_literal` が `null` を列型を問わず `InsertLiteral::Null` へ写像し、nullable 判定を `bind_update` へ委譲するため）。`{"set":{"lang":null}}`（`lang` が nullable な `TEXT`）は本 Issue 導入前は拒否対象だったが、導入後は `Value::Null` として成功する（`update.rs::tests::map_set_assignments_maps_null_to_insert_literal_null_for_nullable_column` で固定）。SQL 表層に `UPDATE ... SET col = NULL` の字句規則が無いため SQL とのパリティ問題は生じないが、意図した拡大かどうかはオーナー確認が必要。
+**解消済み（PR #1038 レビュー指摘）**: 一般化の副作用として、当初これまで `update` op が明示的に拒否していた `nullable` な `TEXT`／`ENUM` 列への JSON `null` が成功するように変わってしまっていた（`map_json_to_literal` が `null` を列型を問わず `InsertLiteral::Null` へ写像し、nullable 判定を `bind_update` へ委譲するため）。契約変更にはオーナー承認・spec 改訂・BREAKING CHANGE 告知が別途必要であり、本 PR の時点ではそれらが揃っていないため、安全側として `TEXT`／`ENUM` 列は `map_json_to_literal` の冒頭で `null` を列型固有のエラー（TEXT: `LegacyMismatch`＝`22000`、ENUM: `TypeMismatch`＝`42601`）として拒否する特例を追加し、`nullable` 属性に関わらず Issue #896 以前の拒否契約を維持するよう修正した。`{"set":{"lang":null}}`（`lang` が nullable な `TEXT`）は導入前・導入後を通じて一貫して拒否される（`typed_json.rs::tests::rejects_null_for_text_column_even_when_nullable`／`rejects_null_for_enum_column_even_when_nullable`・`update.rs::tests::map_set_assignments_rejects_null_for_nullable_text_column` で固定）。`TEXT`／`ENUM` 以外の型（`bind_update` へ nullable 判定を委譲する一般化そのもの）は変更していない。
 
 `insert` op は `bind_insert_row` が明示 `NULL` リテラルを列型を問わず一律拒否する契約（SQL テキストの `INSERT` 構文からは `NULL` リテラルが構築されない到達不能パスのため）を踏まえ、JSON `null` の列は **`ValidatedInsert.columns` から省略**する（値を丸ごと省略した場合と同じ扱いに統一。nullable 列は `Value::Null` で埋まり、非 nullable 列は「値が提供されていない」で `22000`）。`VECTOR` 列は `nullable` の値に関わらず常に必須という既存契約（PR #823）を維持する。
 
@@ -103,7 +104,7 @@ Issue #896 導入前は `update` op の JSON/UUID 列 `null` 分岐を wire 層�
 - `22P02` への統一（形式エラーの分類統一）→ Issue #897（TASK-227）。
 - TIMESTAMP 応答の区切り文字（空白／`T`）・REAL/DOUBLE/NUMERIC の指数表記が `22000` になる点は、SQL 表層と同じ既知の制約のまま。
 - `RowDescription` の OID 写像（`result_encoder.rs`）は Issue #895 の担当のまま変更していない。
-- nullable な `TEXT`／`ENUM` 列への `update` op の JSON `null` が成功するようになった点（上記「null の扱い」節）はオーナー確認事項。
+- nullable な `TEXT`／`ENUM` 列への `update` op の JSON `null` 受理拡大は PR #1038 レビュー指摘により見送り、Issue #896 以前の拒否契約を維持する形へ修正済み（上記「null の扱い」節）。
 - クロスサーフェス `23505`（再送同一性）テストは INTEGER/REAL/NUMERIC/ARRAY/DATE では未追加（TEXT/VECTOR のみ既存）。
 - HTTP 経由の往復テストは NUMERIC/BOOLEAN/DATE/TIMESTAMP/UUID/ARRAY では未追加（INTEGER/BIGINT/REAL のみ `wire_integer_bigint_column.rs`／`wire_float_columns.rs` で追加）。
 - `aggregate`（`SUM`/`AVG`/`MIN`/`MAX`）と新型の組み合わせの層 A パリティテストは未追加。

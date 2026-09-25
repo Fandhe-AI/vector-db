@@ -389,17 +389,23 @@ mod tests {
     }
 
     // Issue #896 で JSON `null` は列型を問わず `InsertLiteral::Null` へ写像
-    // する契約へ変更した（nullable 判定は `bind_update`〔engine 側の単一
-    // 情報源〕へ委譲する。`docs/design/nosql-typed-json-binding.md`「null の
-    // 扱い」節参照）。旧実装は本関数単体で `22000` を返していたが、現在は
-    // 本関数は成功し、非 nullable 列への `NULL` 拒否は `bind_update` の
-    // 責務になる（`execute_rejects_null_for_non_nullable_column_via_engine`
-    // で end-to-end に固定する）。
+    // する契約へ一般化しかけたが、`TEXT`／`ENUM` 列については Issue #896
+    // 以前の `update` op が `nullable` 属性に関わらず `null` を一律拒否して
+    // いた契約を維持する（PR #1038 レビュー指摘。`typed_json::
+    // map_json_to_literal` が `TEXT`／`ENUM` 列の `null` を列型固有の
+    // `TypedJsonError` で拒否する。`docs/design/nosql-typed-json-binding.md`
+    // 「null の扱い」節参照）。`TEXT`／`ENUM` 以外の列（`bind_update` の
+    // nullable 判定へ委譲する設計自体）は不変で、非 nullable 列への
+    // `NULL` 拒否は引き続き `bind_update` の責務
+    // （`execute_rejects_null_for_non_nullable_column_via_engine` で
+    // end-to-end に固定する）。
     #[test]
-    fn map_set_assignments_maps_null_to_insert_literal_null_for_nullable_column() {
+    fn map_set_assignments_rejects_null_for_nullable_text_column() {
         let set = set_map(r#"{"lang":null}"#);
-        let bound = map_set_assignments(&set, &schema()).expect("ok");
-        assert_eq!(bound, vec![("lang".to_string(), InsertLiteral::Null)]);
+        assert!(matches!(
+            map_set_assignments(&set, &schema()),
+            Err(UpdateError::Set(TypedJsonError::LegacyMismatch(_)))
+        ));
     }
 
     #[test]

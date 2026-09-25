@@ -241,8 +241,12 @@ pub fn json_literal_text(raw: &JsonValue) -> Result<String, TypedJsonError> {
 /// - `raw` が `JsonValue::Null` の場合の扱いは呼び出し元が決める（`insert` op
 ///   は列を省略する。`update` op はそのまま [`InsertLiteral::Null`] を engine
 ///   （`bind_set_assignments`）の nullable 判定へ委ねる）ため、本関数は
-///   `JsonValue::Null` もそのまま `InsertLiteral::Null` へ写像するのみで
-///   nullable 検査は行わない。
+///   `JsonValue::Null` を `InsertLiteral::Null` へ写像するのみで nullable
+///   検査は行わない——ただし `TEXT`／`ENUM` 列は例外で、Issue #896 以前の
+///   `update` op が列の `nullable` 属性に関わらず一律拒否していた契約を
+///   維持するため、`null` は列型を問わず（nullable 列でも）ここで拒否する
+///   （PR #1038 レビュー指摘。契約変更が必要ならオーナー承認・spec 改訂を
+///   別途経る）。
 /// - 列名の識別子形状検査（[`super::ident::check_identifier`]）は呼び出し元が
 ///   先に済ませておくこと（本関数はエラー文言に列名を含めないため直接には
 ///   影響しないが、多層防御の判定順序は呼び出し元の責務）。
@@ -250,6 +254,28 @@ pub fn map_json_to_literal(
     column: &ColumnDef,
     raw: &JsonValue,
 ) -> Result<InsertLiteral, TypedJsonError> {
+    // TEXT／ENUM 列は Issue #896 以前の `update` op が `null` を列の
+    // `nullable` 属性に関わらず一律拒否していた契約を維持する（PR #1038
+    // レビュー指摘。`map_json_to_literal` が `null` を列型を問わず一律
+    // `InsertLiteral::Null` へ写像し `bind_update` の nullable 判定へ
+    // 委譲する一般化〔`docs/design/nosql-typed-json-binding.md`「null の
+    // 扱い」節〕は、nullable な TEXT／ENUM 列への `null` 受理拡大という
+    // 契約変更を伴い、同 doc 自身も未確定事項〔オーナー確認要〕と記載して
+    // いた。契約確定までは安全側として従来の拒否を維持し、他の型
+    // （nullable 判定を `bind_update` へ委譲する設計自体）には影響しない。
+    match (&column.ty, raw) {
+        (ColumnType::Text, JsonValue::Null) => {
+            return Err(TypedJsonError::LegacyMismatch(
+                "TEXT column value must be a JSON string",
+            ))
+        }
+        (ColumnType::Enum(_), JsonValue::Null) => {
+            return Err(TypedJsonError::TypeMismatch(
+                "ENUM column value must be a JSON string",
+            ))
+        }
+        _ => {}
+    }
     if matches!(raw, JsonValue::Null) {
         return Ok(InsertLiteral::Null);
     }
@@ -438,6 +464,42 @@ mod tests {
     fn maps_null_to_insert_literal_null_regardless_of_column_type() {
         let lit = map_json_to_literal(&col(ColumnType::Integer), &JsonValue::Null).expect("ok");
         assert_eq!(lit, InsertLiteral::Null);
+    }
+
+    // PR #1038 レビュー指摘: `TEXT`／`ENUM` 列は Issue #896 以前の `update` op
+    // が `null` を `nullable` 属性に関わらず一律拒否していた契約を維持する
+    // （nullable 列でも拒否する。上記の「他の列型は列型を問わず
+    // `InsertLiteral::Null` へ写像する」一般化からの意図的な例外）。
+    #[test]
+    fn rejects_null_for_text_column_even_when_nullable() {
+        let err =
+            map_json_to_literal(&col(ColumnType::Text), &JsonValue::Null).expect_err("reject");
+        assert!(matches!(err, TypedJsonError::LegacyMismatch(_)));
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_null_for_enum_column_even_when_nullable() {
+        // `EnumTypeDef` はフィールドが private で `Storage::create_enum_type`
+        // 経由でのみ構築できる（`result_encoder.rs` の既存テストと同じ判断）。
+        let db_path = std::env::temp_dir().join(format!(
+            "typed-json-enum-null-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let storage = engine::storage::Storage::open(&db_path).expect("open throwaway storage");
+        let enum_def = storage
+            .create_enum_type("mood", vec!["happy".to_string(), "sad".to_string()])
+            .expect("create enum type");
+        let err = map_json_to_literal(&col(ColumnType::Enum(enum_def)), &JsonValue::Null)
+            .expect_err("reject");
+        drop(storage);
+        let _ = std::fs::remove_file(&db_path);
+        assert!(matches!(err, TypedJsonError::TypeMismatch(_)));
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
