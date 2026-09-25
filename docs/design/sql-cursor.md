@@ -88,6 +88,16 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   `WITHOUT HOLD` はいずれも `42601`（規範形のみ受理。`name` の直後が必ず
   `CURSOR` であることを要求する構造上、これらの修飾語が割り込むと自然に
   拒否される）。
+- **`DECLARE` のカタログ照合の遅延とビュー**: 構文解析段（`core.rs::parse_tokens`）
+  は内側 `SELECT` の構造検証のみを行い、カタログを参照しない（トランザクション
+  外の `DECLARE` を常に `25P01` にするため）。`Active` なトランザクション内の
+  実行時に、保持しておいた内側 `SELECT` のトークン列を実カタログに対して
+  `validate_sql_tokens` で再検証する（`sql::cursor::validate_declare_inner`）。
+  通常の広域取得 `SELECT` と同じ経路を通るため、FROM がビュー（TABLE-18・
+  SQL-23）を指す場合も同じビュー展開（基底テーブル＋ビュー由来述語・列スコープ
+  検査）が適用され、RLS は参照セッション自身の `PolicyContext` で暗黙適用される
+  （§3）。同一トランザクション内の書き込み済み判定もビュー展開後の基底テーブル
+  名で行う（PR #1049 レビュー指摘対応）。
 - **`FETCH`**: 受理するのは `FETCH [FORWARD] <n> FROM <name>` のみ。`n` は
   `sql::parser::validate_search_limit`（`1..=MAX_SEARCH_K`）を再利用する。
   `IN`／`ALL`／`NEXT`／`BACKWARD`／`ABSOLUTE` はいずれも `n` の位置に
@@ -185,6 +195,12 @@ execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き
 `Failed` へ倒し `34000`（invalid cursor name）を返す。`FETCH` 以外の文
 （通常の検索 `SELECT`・集計・広域取得等）から作った portal は束縛が常に
 `None` のためこの検証の対象外で、既存の挙動は変えない。
+
+検証対象は保持行を送出し得る `Suspended` のみとする。全行を送出済みの
+`Done` portal の再 Execute は、`FETCH` 以外の portal と同じく保持済みの
+完了タグ（`CommandComplete`）を再送するだけで行を一切送出しないため、
+`CLOSE`／`COMMIT`／`ROLLBACK` を挟んでいても `34000` にはしない
+（PR #1049 レビュー指摘対応）。
 
 ## 対象外・申し送り
 
