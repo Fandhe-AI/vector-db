@@ -33,6 +33,34 @@ fn new_core_with_documents_table(path: &std::path::Path) -> EngineCore {
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
 }
 
+/// ENUM 列（`mood`）を持つ `documents` テーブル（PR #1012 Cursor Bugbot 指摘の
+/// 回帰専用。`tests/enum_column.rs` と同じ流儀で名前付き型を先に登録する）。
+fn new_core_with_enum_documents_table(path: &std::path::Path) -> EngineCore {
+    let storage = Storage::open(path).expect("open storage");
+    let mood = storage
+        .create_enum_type(
+            "mood",
+            vec![
+                "happy".to_string(),
+                "sad".to_string(),
+                "neutral".to_string(),
+            ],
+        )
+        .expect("create enum type");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("mood", ColumnType::Enum(mood), true),
+            ],
+        ))
+        .expect("create table");
+    EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+}
+
 fn some(s: &str) -> Option<Vec<u8>> {
     Some(s.as_bytes().to_vec())
 }
@@ -576,6 +604,148 @@ fn describe_prepared_rejects_real_invalid_vector_literal_alongside_unrelated_dol
             "an unrelated $n in WHERE must not suppress ORDER BY vector literal validation",
         );
     assert_eq!(err.wire_code(), "22000");
+}
+
+// --- ENUM 列の WHERE 等価述語（Issue #935 PR #1012 Cursor Bugbot 指摘の回帰）---
+//
+// `describe_prepared_in_session` は `dummy_parsed` 上で `bind_where_predicates`
+// を走らせるため、ENUM 列の WHERE 等価 `$n` では固定ダミー文字列 "0" が
+// 語彙外ラベルとして扱われ、Bind 前の Describe が常に `22P02` で失敗して
+// いた。ダミー値へ置換された位置に限り語彙照合を省略し、実リテラル・Bind 後の
+// 不正値検出はいずれも従来どおり機能することを固定する。
+
+#[test]
+fn describe_prepared_enum_where_equality_with_dollar_param_succeeds_before_bind() {
+    let path = unique_db_path("prepared-describe-enum-dollar-param");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_enum_documents_table(&path);
+    let session = SessionState::default();
+
+    let prepared = core
+        .parse_sql_prepared("SELECT id, mood FROM documents WHERE mood = $1 LIMIT 5")
+        .expect("parse_sql_prepared should succeed (structural validation only)");
+
+    let described = core
+        .describe_prepared_in_session(&session, &prepared)
+        .expect(
+            "describe_prepared_in_session must not reject a dummy-substituted ENUM \
+             equality value before Bind (PR #1012 Cursor Bugbot regression)",
+        );
+
+    // 通常の Describe（実リテラル。語彙に含まれる値）と同一の結果列になることを
+    // 固定する（列の形はどの値を束縛しても変わらない契約）。
+    let literal = core
+        .parse_sql("SELECT id, mood FROM documents WHERE mood = 'happy' LIMIT 5")
+        .expect("parse_sql should succeed");
+    let literal_described = core
+        .describe_parsed_in_session(&session, &literal)
+        .expect("describe_parsed_in_session should succeed for a valid enum literal");
+    assert_eq!(described, literal_described);
+}
+
+#[test]
+fn bind_prepared_enum_where_equality_rejects_invalid_label_after_bind() {
+    let path = unique_db_path("prepared-bind-enum-invalid-label");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_enum_documents_table(&path);
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public]).expect("valid tenant");
+    let mut session = SessionState::default();
+
+    let prepared = core
+        .parse_sql_prepared("SELECT id, mood FROM documents WHERE mood = $1 LIMIT 5")
+        .expect("parse_sql_prepared should succeed");
+
+    // Describe（Bind 前）は語彙照合をダミー値に対して省略するため成功する。
+    core.describe_prepared_in_session(&session, &prepared)
+        .expect("describe before bind must succeed regardless of the eventual bound value");
+
+    // 語彙外ラベルを Bind すると Execute で `22P02` として検出される
+    // （Describe をすり抜けたまま黙って通ってはならない）。
+    let bound = core
+        .bind_prepared(&prepared, &[some("not-a-real-mood")])
+        .expect("bind_prepared should succeed (structural bind only)");
+    let err = core
+        .execute_parsed_in_session(&ctx, &mut session, &bound)
+        .expect_err("executing an invalid ENUM label must fail");
+    assert_eq!(err.wire_code(), "22P02");
+}
+
+// PR #1012 レビュー指摘の複合形: `$n` を含まない ENUM 等価述語（実リテラルが
+// 語彙外）は、通常の Describe と同じく Bind 前の Describe でも必ず `22P02` に
+// なる（ダミー値専用の縮退が実リテラルにまで及んではならない）。
+#[test]
+fn describe_prepared_rejects_real_invalid_enum_label_without_dollar_param() {
+    let path = unique_db_path("prepared-describe-real-invalid-enum-label");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_enum_documents_table(&path);
+    let session = SessionState::default();
+
+    let prepared = core
+        .parse_sql_prepared("SELECT id FROM documents WHERE mood = 'not-a-real-mood' LIMIT 5")
+        .expect("parse_sql_prepared should succeed (structural validation only)");
+
+    let err = core
+        .describe_prepared_in_session(&session, &prepared)
+        .expect_err(
+            "describe_prepared_in_session must reject an invalid real enum label, \
+             not defer detection to Execute",
+        );
+    assert_eq!(err.wire_code(), "22P02");
+
+    let literal = core
+        .parse_sql("SELECT id FROM documents WHERE mood = 'not-a-real-mood' LIMIT 5")
+        .expect("parse_sql should succeed");
+    let literal_err = core
+        .describe_parsed_in_session(&session, &literal)
+        .expect_err("describe_parsed_in_session should reject the same invalid label");
+    assert_eq!(err.wire_code(), literal_err.wire_code());
+}
+
+// 同上（複合形）: `$n` 由来のダミー等価述語と、実リテラルの語彙外 ENUM 等価
+// 述語が同一文に共存する場合でも、`$n` の存在自体が Describe 全体の検証を
+// 無効化してはならない。
+#[test]
+fn describe_prepared_rejects_real_invalid_enum_label_alongside_unrelated_dollar_param() {
+    let path = unique_db_path("prepared-describe-enum-mixed-param-and-invalid-label");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_enum_documents_table(&path);
+    let session = SessionState::default();
+
+    let prepared = core
+        .parse_sql_prepared(
+            "SELECT id FROM documents WHERE lang = $1 AND mood = 'not-a-real-mood' LIMIT 5",
+        )
+        .expect("parse_sql_prepared should succeed (structural validation only)");
+
+    let err = core
+        .describe_prepared_in_session(&session, &prepared)
+        .expect_err("an unrelated $n in WHERE must not suppress the real ENUM label validation");
+    assert_eq!(err.wire_code(), "22P02");
+}
+
+// PR #1012 レビュー指摘対応: 同じ根本原因（`bind_where_predicates` の値検証を
+// Prepared Describe が無条件にスキップし得る）は集計 SELECT・広域取得
+// （scan）経由の Describe でも同様に起こり得るため、`bind_aggregate`・
+// `bind_scan` へも同じ `dummy_equality_flags` を結線してある（`sql::parser`
+// のドキュメント参照）。ここでは集計経路（`COUNT(*) ... GROUP BY` なし）の
+// Describe が ENUM の `$n` 等価述語で同様に成功することを固定する。
+#[test]
+fn describe_prepared_enum_where_equality_succeeds_for_aggregate_before_bind() {
+    let path = unique_db_path("prepared-describe-enum-aggregate-dollar-param");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_enum_documents_table(&path);
+    let session = SessionState::default();
+
+    let prepared = core
+        .parse_sql_prepared("SELECT COUNT(*) AS n FROM documents WHERE mood = $1")
+        .expect("parse_sql_prepared should succeed (structural validation only)");
+
+    core.describe_prepared_in_session(&session, &prepared)
+        .expect(
+            "aggregate Describe must not reject a dummy-substituted ENUM equality \
+             value before Bind",
+        );
 }
 
 // --- 副作用ゼロ（Parse／Describe は行・台帳・世代に触れない） -----------------

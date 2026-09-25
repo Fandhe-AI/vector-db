@@ -166,7 +166,7 @@ fn run_bound_scan(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> QueryRes
         let Statement::Scan(validated_scan) = validated else {
             panic!("expected Statement::Scan for {sql:?}");
         };
-        bind_scan(&validated_scan, schema, udfs)
+        bind_scan(&validated_scan, schema, udfs, &[])
     })
     .unwrap_or_else(|err| panic!("execute_bound_scan_in_session({sql:?}) failed: {err:?}"))
 }
@@ -180,7 +180,7 @@ fn run_bound_aggregate(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Que
         let Statement::Aggregate(validated_aggregate) = validated else {
             panic!("expected Statement::Aggregate for {sql:?}");
         };
-        bind_aggregate(&validated_aggregate, schema, udfs)
+        bind_aggregate(&validated_aggregate, schema, udfs, &[])
     })
     .unwrap_or_else(|err| panic!("execute_bound_aggregate_in_session({sql:?}) failed: {err:?}"))
 }
@@ -773,7 +773,7 @@ fn bound_and_sql_paths_share_error_classification_for_same_invalid_input() {
             let Statement::Aggregate(validated_aggregate) = validated else {
                 panic!("expected Statement::Aggregate");
             };
-            bind_aggregate(&validated_aggregate, schema, udfs)
+            bind_aggregate(&validated_aggregate, schema, udfs, &[])
         })
         .expect_err("SUM(embedding) should be rejected on the bound path");
     // 両経路の `wire_code` が一致するだけでなく、その一致先が実際に契約どおりの
@@ -804,7 +804,7 @@ fn bound_and_sql_paths_share_error_classification_for_same_invalid_input() {
             let Statement::Aggregate(validated_aggregate) = validated else {
                 panic!("expected Statement::Aggregate");
             };
-            bind_aggregate(&validated_aggregate, schema, udfs)
+            bind_aggregate(&validated_aggregate, schema, udfs, &[])
         })
         .expect_err(
             "HAVING referencing the GROUP BY key column should be rejected on the bound path",

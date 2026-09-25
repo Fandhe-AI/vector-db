@@ -111,7 +111,7 @@ fn bind_aggregate_and_execute_aggregate_are_reachable_from_outside_the_crate() {
             panic!("expected Statement::Aggregate");
         };
         let schema = storage.get_table_schema(TABLE).expect("get_table_schema");
-        let bound = bind_aggregate(&validated_aggregate, &schema, &UdfRegistry::default())
+        let bound = bind_aggregate(&validated_aggregate, &schema, &UdfRegistry::default(), &[])
             .expect("bind_aggregate should succeed");
         assert_eq!(bound.table(), TABLE);
         assert_eq!(bound.items().len(), 3);
@@ -154,7 +154,7 @@ fn execute_aggregate_dispatches_group_by_without_caches() {
             panic!("expected Statement::Aggregate");
         };
         let schema = storage.get_table_schema(TABLE).expect("get_table_schema");
-        let bound = bind_aggregate(&validated_aggregate, &schema, &UdfRegistry::default())
+        let bound = bind_aggregate(&validated_aggregate, &schema, &UdfRegistry::default(), &[])
             .expect("bind_aggregate should succeed");
         assert!(bound.has_group_by());
         (schema, bound)
@@ -190,7 +190,7 @@ fn execute_aggregate_applies_index_eligible_where_without_caches() {
             panic!("expected Statement::Aggregate");
         };
         let schema = storage.get_table_schema(TABLE).expect("get_table_schema");
-        let bound = bind_aggregate(&validated_aggregate, &schema, &UdfRegistry::default())
+        let bound = bind_aggregate(&validated_aggregate, &schema, &UdfRegistry::default(), &[])
             .expect("bind_aggregate should succeed");
         assert_eq!(bound.metadata_filters().len(), 1);
         assert!(bound.expr_filters().is_empty());
@@ -225,7 +225,7 @@ fn execute_aggregate_returns_empty_set_contract_for_table_without_visible_rows()
             panic!("expected Statement::Aggregate");
         };
         let schema = storage.get_table_schema(TABLE).expect("get_table_schema");
-        let bound = bind_aggregate(&validated_aggregate, &schema, &UdfRegistry::default())
+        let bound = bind_aggregate(&validated_aggregate, &schema, &UdfRegistry::default(), &[])
             .expect("bind_aggregate should succeed");
         (schema, bound)
     };
@@ -262,8 +262,13 @@ fn bound_aggregate_new_matches_sql_text_bind_for_all_functions() {
     let Statement::Aggregate(validated_aggregate) = validated else {
         panic!("expected Statement::Aggregate");
     };
-    let via_sql = bind_aggregate(&validated_aggregate, &schema_val, &UdfRegistry::default())
-        .expect("bind_aggregate should succeed");
+    let via_sql = bind_aggregate(
+        &validated_aggregate,
+        &schema_val,
+        &UdfRegistry::default(),
+        &[],
+    )
+    .expect("bind_aggregate should succeed");
 
     let items = vec![
         BoundAggregateItem::bind(AggregateFunc::Count, AggregateTarget::Star, &schema_val)
@@ -459,8 +464,13 @@ fn bound_aggregate_new_grouped_matches_sql_text_bind() {
     let Statement::Aggregate(validated_aggregate) = validated else {
         panic!("expected Statement::Aggregate");
     };
-    let via_sql = bind_aggregate(&validated_aggregate, &schema_val, &UdfRegistry::default())
-        .expect("bind_aggregate should succeed");
+    let via_sql = bind_aggregate(
+        &validated_aggregate,
+        &schema_val,
+        &UdfRegistry::default(),
+        &[],
+    )
+    .expect("bind_aggregate should succeed");
 
     let items = vec![
         BoundAggregateItem::bind(AggregateFunc::Count, AggregateTarget::Star, &schema_val)

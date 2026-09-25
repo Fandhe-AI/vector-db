@@ -135,6 +135,95 @@ fn is_where_clause_boundary(tokens: &[Token], idx: usize) -> bool {
     }
 }
 
+/// `tokens` 中のトップレベル `WHERE`（パターン 4）の受理範囲 `(start, end)` を
+/// 判定する単一情報源。`start` は `WHERE` キーワード自身の添字、`end` は
+/// 後続句の境界（`ORDER`／`LIMIT`／[`is_where_clause_boundary`] が認める
+/// 実句境界）の添字（無ければ `tokens.len()`）。`WHERE` を含まない文は
+/// `None`。[`validate_param_positions`]・[`where_equality_literal_is_param`]
+/// の双方がこの 1 箇所を参照することで、境界判定がずれる余地をなくす
+/// （PR #1012 レビュー指摘の再発防止）。
+fn where_region(tokens: &[Token]) -> Option<(usize, usize)> {
+    let start = tokens
+        .iter()
+        .position(|t| matches!(t, Token::Keyword(crate::sql::lexer::Keyword::Where)))?;
+    let end = tokens
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(idx, t)| match t {
+            Token::Keyword(crate::sql::lexer::Keyword::Order)
+            | Token::Keyword(crate::sql::lexer::Keyword::Limit) => Some(idx),
+            Token::Ident(name)
+                if WHERE_CLAUSE_BOUNDARY_IDENTS
+                    .iter()
+                    .any(|b| name.eq_ignore_ascii_case(b))
+                    // 列名としての出現（例: `WHERE using = $1`）・UDF 呼び出しの
+                    // 関数名としての出現（例: `WHERE using(body) = 'x'`）はいずれも
+                    // 境界とみなさない。実際に対応する句を開始している場合
+                    // （`GROUP BY`・`HAVING <ident> <cmp>`・`RETURNING <col|*>`・
+                    // `USING OPERATION_ID|PLAN`・`ON CONFLICT`）に限り境界とする
+                    // （PR #1012 Bugbot・codex 指摘。詳細は
+                    // [`is_where_clause_boundary`] 参照）。
+                    && is_where_clause_boundary(tokens, idx) =>
+            {
+                Some(idx)
+            }
+            _ => None,
+        })
+        .unwrap_or(tokens.len());
+    Some((start, end))
+}
+
+/// `tokens`（`$n` 置換前の元トークン列）の `WHERE` 節内に現れる等価述語
+/// （[`validate_param_positions`] パターン 4。`Ident '=' (StringLiteral|Param)`
+/// の形。`sql::allowlist::Parser::parse_where` の legacy 分岐が受理する
+/// 唯一の形で、`WherePredicate::Equality` へ束縛される）を出現順に走査し、
+/// その右辺値が `$n`（`Token::Param`）由来かどうかを並べたベクタを返す。
+///
+/// [`crate::core::EngineCore::parse_sql_prepared`] が [`crate::core::
+/// PreparedSql`] へ結果を持たせ、`sql::parser::bind_where_predicates` の
+/// `dummy_equality_flags` 引数として「ダミー値へ置換された等価述語の値に
+/// 限り ENUM 列の語彙照合（`declarative_filter`）を Describe 時点では省略して
+/// よい」ことを機械的に判定するために使う（PR #1012 Cursor Bugbot 指摘対応:
+/// `$n` を含まない文——WHERE 等価条件の値が元の SQL テキストに書かれた実
+/// リテラルである文——では、`substitute_dummy` は当該位置を一切変更しない
+/// ため `dummy_parsed` にもその実リテラルがそのまま残る。この場合にまで
+/// 検証を省略すると、通常の Describe なら `22P02` で弾かれるはずの語彙外
+/// ENUM ラベルが Prepared Describe だけ素通りしてしまう——
+/// [`order_by_distance_literal_is_param`] と同じ設計）。
+///
+/// `WherePredicate::Prefix`（`LIKE`）・`BoolEquality`・`BoolColumn` の右辺値は
+/// `sql::params` が受理する `$n` 位置（パターン 4）の対象外（`Ident '=' $n`
+/// の形にしかならない）であり、本関数の走査対象にもならない。
+pub fn where_equality_literal_is_param(tokens: &[Token]) -> Vec<bool> {
+    let Some((start, end)) = where_region(tokens) else {
+        return Vec::new();
+    };
+    let mut flags = Vec::new();
+    let mut i = start + 1;
+    while i < end {
+        if matches!(tokens.get(i), Some(Token::Ident(_)))
+            && matches!(tokens.get(i + 1), Some(Token::Punct('=')))
+        {
+            match tokens.get(i + 2) {
+                Some(Token::Param(_)) => {
+                    flags.push(true);
+                    i += 3;
+                    continue;
+                }
+                Some(Token::StringLiteral(_)) => {
+                    flags.push(false);
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    flags
+}
+
 /// `tokens` 中の `Token::Param` がすべて許可位置に収まっていることを検証し、
 /// 文が要求するパラメータ数（最大の `$n` 番号。1 始まり。`$n` が 1 つも
 /// 無ければ 0）を返す。
@@ -176,40 +265,14 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
             .unwrap_or(tokens.len())
     });
 
-    // パターン 4（WHERE 等価）の受理範囲: トップレベル `WHERE`（最初の出現。本
-    // 許可形状は `WHERE` 節を 1 つしか持たない）の直後から、後続句の境界
-    // （`ORDER`／`LIMIT`／文脈識別子）の直前まで。`SET`（statement 全体）である
+    // パターン 4（WHERE 等価）の受理範囲は [`where_region`] が単一情報源として
+    // 判定する（[`where_equality_literal_is_param`] も同じ境界判定を再利用し、
+    // 両関数間で境界判定がずれる余地をなくす）。`SET`（statement 全体）である
     // 場合は `WHERE` を含まないため自然に対象外になる。
-    let where_idx = tokens
-        .iter()
-        .position(|t| matches!(t, Token::Keyword(crate::sql::lexer::Keyword::Where)));
-    let where_region_end = where_idx.map(|start| {
-        tokens
-            .iter()
-            .enumerate()
-            .skip(start + 1)
-            .find_map(|(idx, t)| match t {
-                Token::Keyword(crate::sql::lexer::Keyword::Order)
-                | Token::Keyword(crate::sql::lexer::Keyword::Limit) => Some(idx),
-                Token::Ident(name)
-                    if WHERE_CLAUSE_BOUNDARY_IDENTS
-                        .iter()
-                        .any(|b| name.eq_ignore_ascii_case(b))
-                        // 列名としての出現（例: `WHERE using = $1`）・UDF 呼び出しの
-                        // 関数名としての出現（例: `WHERE using(body) = 'x'`）はいずれも
-                        // 境界とみなさない。実際に対応する句を開始している場合
-                        // （`GROUP BY`・`HAVING <ident> <cmp>`・`RETURNING <col|*>`・
-                        // `USING OPERATION_ID|PLAN`・`ON CONFLICT`）に限り境界とする
-                        // （PR #1012 Bugbot・codex 指摘。詳細は
-                        // [`is_where_clause_boundary`] 参照）。
-                        && is_where_clause_boundary(tokens, idx) =>
-                {
-                    Some(idx)
-                }
-                _ => None,
-            })
-            .unwrap_or(tokens.len())
-    });
+    let (where_idx, where_region_end) = match where_region(tokens) {
+        Some((start, end)) => (Some(start), Some(end)),
+        None => (None, None),
+    };
 
     let mut max_index: u16 = 0;
     for (i, token) in tokens.iter().enumerate() {
@@ -507,6 +570,39 @@ mod tests {
         )
         .expect("tokenize_with_params should succeed");
         assert!(!order_by_distance_literal_is_param(&tokens));
+    }
+
+    // PR #1012 Cursor Bugbot 指摘の回帰: `where_equality_literal_is_param` は
+    // `WHERE` 等価述語（パターン 4）の値が `$n` 由来か実リテラルかを出現順で
+    // 正しく判定しなければならない。
+    #[test]
+    fn where_equality_literal_is_param_detects_dollar_param() {
+        let tokens = tokenize_with_params("SELECT * FROM documents WHERE mood = $1 LIMIT 5")
+            .expect("tokenize_with_params should succeed");
+        assert_eq!(where_equality_literal_is_param(&tokens), vec![true]);
+    }
+
+    #[test]
+    fn where_equality_literal_is_param_false_for_real_literal() {
+        let tokens = tokenize_with_params("SELECT * FROM documents WHERE mood = 'happy' LIMIT 5")
+            .expect("tokenize_with_params should succeed");
+        assert_eq!(where_equality_literal_is_param(&tokens), vec![false]);
+    }
+
+    #[test]
+    fn where_equality_literal_is_param_preserves_occurrence_order_for_multiple_predicates() {
+        let tokens = tokenize_with_params(
+            "SELECT * FROM documents WHERE lang = $1 AND mood = 'happy' LIMIT 5",
+        )
+        .expect("tokenize_with_params should succeed");
+        assert_eq!(where_equality_literal_is_param(&tokens), vec![true, false]);
+    }
+
+    #[test]
+    fn where_equality_literal_is_param_empty_when_no_where_clause() {
+        let tokens = tokenize_with_params("SELECT * FROM documents ORDER BY embedding <=> $1")
+            .expect("tokenize_with_params should succeed");
+        assert!(where_equality_literal_is_param(&tokens).is_empty());
     }
 
     #[test]

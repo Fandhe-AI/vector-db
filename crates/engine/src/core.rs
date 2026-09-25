@@ -1243,6 +1243,14 @@ pub struct PreparedSql {
     /// `$n` を含まない文では `false` のままとなり、`dummy_parsed` に残る実
     /// リテラルは通常の Describe と同じく必ず検証される）。
     order_by_distance_literal_is_param: bool,
+    /// `dummy_parsed` の `WHERE` 等価述語（[`crate::sql::allowlist::
+    /// WherePredicate::Equality`]）を出現順に並べ、各々の値が元の SQL
+    /// テキストの `$n`（[`crate::sql::params::where_equality_literal_is_param`]）
+    /// に由来するダミー値かどうかを示す。`true` の位置に限り
+    /// `describe_prepared_in_session` は ENUM 列の語彙照合を省略してよい
+    /// （PR #1012 Cursor Bugbot 指摘対応: `$n` を含まない等価述語では `false`
+    /// のままとなり、実リテラルは通常の Describe と同じく必ず検証される）。
+    where_equality_dummy_flags: Vec<bool>,
 }
 
 impl PreparedSql {
@@ -2307,6 +2315,8 @@ impl EngineCore {
         // 消えるため、置換後トークン列からは判定できない）。
         let order_by_distance_literal_is_param =
             crate::sql::params::order_by_distance_literal_is_param(&tokens);
+        let where_equality_dummy_flags =
+            crate::sql::params::where_equality_literal_is_param(&tokens);
         let dummy_tokens = crate::sql::params::substitute_dummy(&tokens);
         let dummy_parsed = self.parse_tokens(dummy_tokens)?;
         Ok(PreparedSql {
@@ -2314,6 +2324,7 @@ impl EngineCore {
             param_count,
             dummy_parsed,
             order_by_distance_literal_is_param,
+            where_equality_dummy_flags,
         })
     }
 
@@ -2374,10 +2385,17 @@ impl EngineCore {
         // レビュー指摘対応: 以前は文中の `$n` の位置に関係なく常に検証を
         // 省略していたため、パラメータ化されていない実ベクトルリテラルの
         // 不正値まで Describe をすり抜けて Execute まで遅延していた）。
+        //
+        // 同じ理由で `WHERE` 等価述語（`prepared.where_equality_dummy_flags`）
+        // も `$n` 由来の位置に限り ENUM 列の語彙照合を省略する（PR #1012
+        // Cursor Bugbot 指摘対応: `describe_parsed_in_session_impl` 内で
+        // `bind_aggregate`／`bind_projection_for_describe`／`bind_scan` の
+        // いずれが呼ばれても同じ配列を共有する）。
         self.describe_parsed_in_session_impl(
             session,
             &prepared.dummy_parsed,
             prepared.order_by_distance_literal_is_param,
+            &prepared.where_equality_dummy_flags,
         )
     }
 
@@ -2481,10 +2499,11 @@ impl EngineCore {
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
         // 実リテラルを持つ通常の呼び出し（wire-server の Describe・単体テスト
-        // 等）は常に値検証を行う（`skip_vector_literal_validation = false`）。
-        // ダミー値専用の縮退は `describe_prepared_in_session` のみが使う
-        // （PR #1012 レビュー指摘対応。詳細は同メソッドのコメント参照）。
-        self.describe_parsed_in_session_impl(session, parsed, false)
+        // 等）は常に値検証を行う（`skip_vector_literal_validation = false`・
+        // `dummy_equality_flags = &[]`）。ダミー値専用の縮退は
+        // `describe_prepared_in_session` のみが使う（PR #1012 レビュー指摘
+        // 対応。詳細は同メソッドのコメント参照）。
+        self.describe_parsed_in_session_impl(session, parsed, false, &[])
     }
 
     /// [`Self::describe_parsed_in_session`]／[`Self::describe_prepared_in_session`]
@@ -2493,11 +2512,20 @@ impl EngineCore {
     /// 形式・次元・非有限値・64 KiB 上限検証）を省略する——`prepared.dummy_parsed`
     /// のような実パラメータを持たない構造検証専用の `ParsedSql` を Describe する
     /// 場合に限る（Issue #935・WIRE-12・TASK-217。PR #1012 レビュー指摘対応）。
+    ///
+    /// `dummy_equality_flags`（PR #1012 Cursor Bugbot 指摘対応）は
+    /// `sql::parser::bind_where_predicates`（`bind_aggregate`・
+    /// `bind_projection_for_describe`・`bind_scan` 経由）へそのまま渡し、`$n`
+    /// 由来のダミー値へ置換された `WHERE` 等価述語に限り ENUM 列の語彙照合
+    /// （`declarative_filter`）を Describe 時点では省略する。`$n` を含まない
+    /// 通常の Describe（`describe_parsed_in_session` 経由）では常に空スライスに
+    /// なり、実リテラルは従来どおり必ず検証される。
     fn describe_parsed_in_session_impl(
         &self,
         session: &crate::sql::mode::SessionState,
         parsed: &ParsedSql,
         skip_vector_literal_validation: bool,
+        dummy_equality_flags: &[bool],
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
         use crate::sql::allowlist::{DeleteStatement, Statement, ValidatedUpdateForm};
@@ -2547,14 +2575,24 @@ impl EngineCore {
             }
             ParsedSql::Statement(Statement::Aggregate(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-                let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
+                let bound = crate::sql::parser::bind_aggregate(
+                    validated,
+                    &schema,
+                    session.udfs(),
+                    dummy_equality_flags,
+                )?;
                 Ok(Some(crate::sql::describe::aggregate_columns(
                     &bound.projection,
                 )))
             }
             ParsedSql::Statement(Statement::Scan(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
-                let bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
+                let bound = crate::sql::parser::bind_scan(
+                    validated,
+                    &schema,
+                    session.udfs(),
+                    dummy_equality_flags,
+                )?;
                 Ok(Some(crate::sql::describe::projected_columns(
                     bound.projection(),
                     &schema,
@@ -2601,6 +2639,7 @@ impl EngineCore {
                         &schema,
                         session.udfs(),
                         !skip_vector_literal_validation,
+                        dummy_equality_flags,
                     )?;
                     Ok(Some(crate::sql::describe::projected_columns(
                         &projection,
@@ -2755,7 +2794,7 @@ impl EngineCore {
             crate::sql::allowlist::Statement::Aggregate(validated) => {
                 let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
                 let bound =
-                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
+                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs(), &[])?;
                 let result = self.run_aggregate_plan(&read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -2770,7 +2809,8 @@ impl EngineCore {
             // が同じ実行本体を束縛済み計画向けに再利用する）。
             crate::sql::allowlist::Statement::Scan(validated) => {
                 let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
-                let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
+                let bound =
+                    crate::sql::parser::bind_scan(&validated, &schema, session.udfs(), &[])?;
                 let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }

@@ -134,7 +134,7 @@ fn scan_entry_applies_rls_implicitly_with_single_storage() {
             let Statement::Scan(validated_scan) = validated else {
                 panic!("expected Statement::Scan");
             };
-            bind_scan(&validated_scan, schema, udfs)
+            bind_scan(&validated_scan, schema, udfs, &[])
         })
         .expect("execute_bound_scan_in_session should succeed");
 
@@ -265,7 +265,7 @@ fn aggregate_entry_matches_sql_path_and_shares_visible_bitmap_cache() {
             let Statement::Aggregate(validated_aggregate) = validated else {
                 panic!("expected Statement::Aggregate");
             };
-            bind_aggregate(&validated_aggregate, schema, udfs)
+            bind_aggregate(&validated_aggregate, schema, udfs, &[])
         })
         .expect("execute_bound_aggregate_in_session should succeed")
     };
@@ -338,7 +338,7 @@ fn aggregate_entry_group_by_excludes_other_tenant_groups() {
             let Statement::Aggregate(validated_aggregate) = validated else {
                 panic!("expected Statement::Aggregate");
             };
-            let bound = bind_aggregate(&validated_aggregate, schema, udfs)?;
+            let bound = bind_aggregate(&validated_aggregate, schema, udfs, &[])?;
             assert!(bound.has_group_by());
             Ok(bound)
         })
@@ -382,7 +382,7 @@ fn binder_receives_session_udf_registry() {
         let Statement::Scan(validated_scan) = validated else {
             panic!("expected Statement::Scan");
         };
-        bind_scan(&validated_scan, schema, udfs)
+        bind_scan(&validated_scan, schema, udfs, &[])
     });
 
     assert!(result.is_ok());
