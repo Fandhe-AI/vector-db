@@ -15,18 +15,21 @@
 //! [`err4_projection_table_is_closed_over_all_error_classes`] で機械的に
 //! 固定する。production コードは変更しない（テスト専任）。
 //!
-//! 到達不能類型（`42501`・`P0002`）の扱い: NoSQL 表層はテナントをセッション
-//! （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己
-//! 申告の `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で
-//! 先に拒否する（`gate.rs`・`session/middleware.rs`・`router.rs`）ため、
-//! `ForbiddenTenantMismatch`（`42501`）を実要求から誘発する経路が構造的に
-//! 存在しない。`RowNotFound`（`P0002`）に対応する op（更新・削除系）も
-//! NoSQL 表層の許可リストに無い。これらはテナント境界の検査を緩める・
-//! バイパスする production 経路を新設せず（`.claude/rules/security.md`
-//! P0）、production の応答エンコーダ（`http::response::encode_error`。
-//! ルータ・各 op ハンドラが実際に使う関数）を通したバイト列を実応答と同じ
-//! パーサ（`http_common::parse_single_response`）で解析し、射影のみを検証
-//! する（[`err4_f_unreachable_classes_project_via_production_encoder`]）。
+//! 到達不能類型（`42501`・`P0002`・`42701`）の扱い: NoSQL 表層はテナントを
+//! セッション（`SessionPrincipal::policy_context()`）からのみ導出し、
+//! クライアント自己申告の `tenant_id` 相当値は JSON／ヘッダ／パスいずれの
+//! 位置でも `42601` で先に拒否する（`gate.rs`・`session/middleware.rs`・
+//! `router.rs`）ため、`ForbiddenTenantMismatch`（`42501`）を実要求から誘発
+//! する経路が構造的に存在しない。`RowNotFound`（`P0002`）に対応する op
+//! （更新・削除系）も NoSQL 表層の許可リストに無い。`DuplicateColumn`
+//! （`42701`。`ALTER TABLE ADD COLUMN` の列名重複。TASK-202・SQL-23・
+//! Issue #900）に対応する `op` も NoSQL 表層の許可リストに無い（DDL は
+//! NoSQL 表層の対象外）。これらはテナント境界の検査を緩める・バイパスする
+//! production 経路を新設せず（`.claude/rules/security.md` P0）、production
+//! の応答エンコーダ（`http::response::encode_error`。ルータ・各 op ハンドラ
+//! が実際に使う関数）を通したバイト列を実応答と同じパーサ
+//! （`http_common::parse_single_response`）で解析し、射影のみを検証する
+//! （[`err4_f_unreachable_classes_project_via_production_encoder`]）。
 //!
 //! `data` キー付き `XX000`（緊急応答。`RECOVER-5` (3)・ERR-5 ポインタ）も
 //! 同様に実要求からは到達不能: `http::response::encode_error_may_be_committed`
@@ -193,7 +196,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 25] = [
+const EXPECTED_STATUS: [(&str, u16); 27] = [
     ("22000", 400),
     ("28P01", 401),
     ("28000", 401),
@@ -217,8 +220,19 @@ const EXPECTED_STATUS: [(&str, u16); 25] = [
     ("25001", 400),
     ("25P01", 400),
     ("25P02", 400),
+    // `DuplicateTable`（`42P07`。SQL-23・TASK-85、Issue #899）は
+    // `UniqueViolation` と同じ「対象が既に存在する」意味論のため同じ 409。
+    // `CREATE VIEW`（TABLE-18・SQL-23・TASK-205、Issue #909）の名前衝突も
+    // 同じ分類・同じステータスを共有する。
     ("42P07", 409),
     ("42701", 400),
+    // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW` が
+    // 新設する残り 2 分類。SQL 表層専用の DDL であり NoSQL `op` 許可リストには
+    // 含めない（本ファイル冒頭 doc の「到達不能類型」と同じ扱い。
+    // production の応答エンコーダ経由で射影のみ検証する。下記
+    // `err4_f_unreachable_classes_project_via_production_encoder` 参照）。
+    ("2BP01", 400),
+    ("42809", 400),
 ];
 
 /// (a)〜(f) 全類型の共通アサーション: `wire_code` が逆引き可能・射影ステータス
@@ -277,11 +291,23 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 25);
+const _: () = assert!(ErrorClass::ALL.len() == 28);
+
+/// `23502` を共有する分類（ERR-6・TABLE-16・TASK-204、Issue #904）。
+/// [`err4_projection_table_is_closed_over_all_error_classes`] がこの組にだけ
+/// 「`wire_code` からの厳密往復」を免除する（`EXPECTED_STATUS` は wire_code
+/// 単位の一意テーブルのままで、共有側はどちらも同じステータス 400 のため
+/// テーブル自体は増やさない）。
+const SHARED_23502_CLASSES: [ErrorClass; 2] =
+    [ErrorClass::MissingOperationId, ErrorClass::NotNullViolation];
 
 #[test]
 fn err4_projection_table_is_closed_over_all_error_classes() {
-    assert_eq!(EXPECTED_STATUS.len(), ErrorClass::ALL.len());
+    // `EXPECTED_STATUS` は一意な `wire_code` 単位の期待表。`23502` は 2 分類が
+    // 共有するため、一意な `wire_code` の数は `ErrorClass::ALL` より 1 小さい。
+    let unique_wire_codes: std::collections::HashSet<&str> =
+        ErrorClass::ALL.iter().map(|c| c.wire_code()).collect();
+    assert_eq!(EXPECTED_STATUS.len(), unique_wire_codes.len());
     for class in ErrorClass::ALL {
         let wire_code = class.wire_code();
         let (_, expected_status) = EXPECTED_STATUS
@@ -295,7 +321,13 @@ fn err4_projection_table_is_closed_over_all_error_classes() {
         );
         let round_tripped = ErrorClass::from_wire_code(wire_code)
             .unwrap_or_else(|| panic!("{wire_code:?} must round-trip via from_wire_code"));
-        assert_eq!(round_tripped, class);
+        if SHARED_23502_CLASSES.contains(&class) {
+            // 共有 wire_code の逆引きは宣言順で最初の分類（MissingOperationId）
+            // へ固定的に戻る契約（`ErrorClass::from_wire_code` の doc 参照）。
+            assert_eq!(round_tripped, ErrorClass::MissingOperationId);
+        } else {
+            assert_eq!(round_tripped, class);
+        }
     }
 }
 
@@ -649,26 +681,35 @@ fn err4_f_internal_error_projects_xx000_to_500() {
     assert_projected(&resp, "XX000");
 }
 
-/// `42501`（テナント越境）・`P0002`（行不在）・明示トランザクション制御
-/// （SQL-31・TASK-221。`25000`/`25001`/`25P01`/`25P02`）は NoSQL 表層の
-/// 実要求からは構造的に到達不能（本ファイル冒頭 doc 参照。NoSQL 表層の `op`
-/// 許可リストにトランザクション制御が無い）。要求駆動ではなく、
+/// `42501`（テナント越境）・`P0002`（行不在）は NoSQL 表層の実要求からは
+/// 構造的に到達不能（本ファイル冒頭 doc 参照）。`42P07`（`DuplicateTable`）・
+/// `42701`（`DuplicateColumn`。SQL-23・TASK-85、Issue #899）は SQL 表層専用の
+/// `CREATE TABLE` 分類であり、`2BP01`／`42809`
+/// （TABLE-18・SQL-23・TASK-205、Issue #909）も同様——`CREATE VIEW`／
+/// `DROP VIEW` は SQL 表層専用の DDL で、いずれも NoSQL `op` 許可リストに
+/// 含まれない（`gate.rs`・`http/query/op.rs`）。明示トランザクション制御
+/// （SQL-31・TASK-221。`25000`/`25001`/`25P01`/`25P02`）も NoSQL 表層の `op`
+/// 許可リストにトランザクション制御が無いため同様に到達不能。要求駆動ではなく、
 /// production の応答エンコーダ（[`wire_server::http::response::encode_error`]。
-/// ルータ・各 op ハンドラが実際に使う関数）を通したバイト列を実応答と同じ
-/// パーサで解析し、射影のみを検証する。
+/// ルータ・各 op ハンドラが実際に使う関数）を通したバイト列を実応答と同じパーサで
+/// 解析し、射影のみを検証する。
 #[test]
 fn err4_f_unreachable_classes_project_via_production_encoder() {
     // `DuplicateTable`（`42P07`）・`DuplicateColumn`（`42701`。SQL-23・TASK-85、
     // Issue #899）は SQL 表層専用の `CREATE TABLE` 分類であり、NoSQL 表層の
     // `op` 許可リストに `create_table` 相当が存在しないため実要求からは
     // 構造的に到達不能（`ForbiddenTenantMismatch`・`RowNotFound` と同じ理由）。
-    // 明示トランザクション（SQL-31・TASK-221）の状態エラーも、NoSQL 表層の
-    // `op` 語彙にトランザクション制御が無いため同様に到達不能。
+    // `2BP01`／`42809`（TABLE-18・SQL-23・TASK-205、Issue #909）も
+    // `CREATE VIEW`／`DROP VIEW` が SQL 表層専用の DDL であるため同様に
+    // 到達不能。明示トランザクション（SQL-31・TASK-221）の状態エラーも、
+    // NoSQL 表層の `op` 語彙にトランザクション制御が無いため同様に到達不能。
     for class in [
         ErrorClass::ForbiddenTenantMismatch,
         ErrorClass::RowNotFound,
         ErrorClass::DuplicateTable,
         ErrorClass::DuplicateColumn,
+        ErrorClass::DependentObjectsStillExist,
+        ErrorClass::WrongObjectType,
         ErrorClass::InvalidTransactionState,
         ErrorClass::ActiveSqlTransaction,
         ErrorClass::NoActiveSqlTransaction,

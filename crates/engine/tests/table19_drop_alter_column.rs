@@ -86,10 +86,11 @@ fn column_count_limit_applies_to_physical_slots_including_tombstones() {
     let schema = storage.get_table_schema("docs").expect("get schema");
     assert_eq!(schema.columns.len(), 256);
 
-    // 上限ちょうどのため、これ以上の追加は拒否される。
+    // 上限ちょうどのため、これ以上の追加は拒否される（Issue #900 以降は `Invalid`
+    // と区別した `TooManyColumns`。SQL 表層は `54000` へ写像する）。
     assert!(matches!(
         storage.alter_table_add_column("docs", ColumnDef::new("overflow", ColumnType::Text, true)),
-        Err(CatalogError::Invalid(_))
+        Err(CatalogError::TooManyColumns { count: 257 })
     ));
 
     // 1 列削除しても、墓標が物理容量を消費し続けるため、追加は依然として
@@ -108,7 +109,7 @@ fn column_count_limit_applies_to_physical_slots_including_tombstones() {
                 "docs",
                 ColumnDef::new("still_over_limit", ColumnType::Text, true)
             ),
-            Err(CatalogError::Invalid(_))
+            Err(CatalogError::TooManyColumns { count: 257 })
         ),
         "a tombstoned physical slot must still count against MAX_COLUMN_COUNT"
     );

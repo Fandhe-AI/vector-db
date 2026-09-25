@@ -266,6 +266,10 @@ pub enum CatalogError {
     TypeNotFound(String),
     TypeAlreadyExists(String),
     DependentObjectsStillExist(String),
+    ViewNotFound(String),
+    WrongObjectKind(String),
+    DependentViewsExist(String),
+    ViewLimitExceeded(String),
     WriteLockTimeout,
     ColumnNotFound(String),
     ProtectedColumn(String),
@@ -274,6 +278,8 @@ pub enum CatalogError {
         from: String,
         to: String,
     },
+    TooManyColumns { count: usize },
+    UniqueConstraintViolation,
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError

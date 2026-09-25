@@ -368,14 +368,16 @@ fn sql_insert_dim_mismatch_and_missing_value_on_table_with_vector_column_are_unc
         .expect("scan docs table");
     assert!(result.rows.is_empty());
 
-    // 必須（非 nullable）の `VECTOR` 列の値が欠けた INSERT も 22000。
+    // 必須（非 nullable）の `VECTOR` 列の値が欠けた INSERT は `23502`
+    // （`NotNullViolation`。TABLE-16・TASK-204、Issue #904。旧 `22000` から
+    // 契約変更）。
     let err = core
         .execute_insert_sql(
             &policy,
             "INSERT INTO docs (id, lang) VALUES (1, 'ja') USING OPERATION_ID 'op-missing-vector'",
         )
         .expect_err("a missing NOT NULL VECTOR column value must still be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "23502");
     let result = core
         .execute_sql(&policy, "SELECT id FROM docs LIMIT 10")
         .expect("scan docs table");

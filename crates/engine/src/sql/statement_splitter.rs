@@ -481,6 +481,13 @@ mod tests {
             classify_statement("TRUNCATE TABLE t USING OPERATION_ID 'o1'"),
             StatementEffect::Write
         );
+        // TASK-202・SQL-23（Issue #900）: `ALTER` は `lexer::Keyword` へ含めない
+        // ため `Token::Ident(_) => StatementEffect::Write` の既存分岐がそのまま
+        // 適用される（`sql::allowlist::validate_alter_table` と同一情報源）。
+        assert_eq!(
+            classify_statement("ALTER TABLE t ADD COLUMN note TEXT"),
+            StatementEffect::Write
+        );
         // Issue #902（SQL-23・TASK-203）: `DROP TABLE` は書き込み系（DDL）の
         // ため、複文メッセージ中で最後以外に置かれた場合は他の書き込み文と
         // 同じく `0A000` で拒否されなければならない（`check_write_placement`
