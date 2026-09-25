@@ -1530,11 +1530,26 @@ fn run_sql_nosql_parity_scenario(client: HttpClient) {
                  NoSQL columns",
                 case.label
             );
-            let sql_types: Vec<&str> = sql_obs.types.iter().map(|(_, ty)| *ty).collect();
+            // Issue #896（NOSQL-17）以降、NoSQL `columns[].type` は SQL wire
+            // `RowDescription`（Issue #895）の OID 写像から意図的に独立した
+            // 対応表を返す。本テストの schema（`embedding: VECTOR`・
+            // `lang`/`body`: `TEXT`）では SQL wire 側が `VECTOR` 列を後方
+            // 互換のため `text`（OID 25）へ丸める一方、NoSQL 側は
+            // `"vector"` を返すため、列名から NoSQL 側の期待値を独立に
+            // 導出して比較する（`nosql_type_name`〔`response.rs`〕と同じ
+            // 対応。`docs/design/nosql-typed-json-binding.md` 参照）。
+            let expected_nosql_types: Vec<&str> = nosql_names
+                .iter()
+                .map(|name| match name.as_str() {
+                    "id" => "numeric",
+                    "embedding" => "vector",
+                    _ => "text",
+                })
+                .collect();
             assert_eq!(
-                nosql_types, sql_types,
-                "case={} user={user}: column type mismatch (SQL RowDescription vs NoSQL \
-                 columns[].type)",
+                nosql_types, expected_nosql_types,
+                "case={} user={user}: NoSQL columns[].type did not match the expected \
+                 per-column-type table (Issue #896)",
                 case.label
             );
 

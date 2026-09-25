@@ -6,8 +6,8 @@
 //! （境界値・範囲外 `22003`・型不一致 `22000`・RLS・台帳照合）を確定オラクルとして
 //! 検証済みのため、本ファイルは simple query プロトコル越しに観測できることの
 //! 確認に絞る: `DataRow` のテキスト表現・範囲外リテラルの `ErrorResponse`
-//! （`22003`）・NoSQL 表層 `insert` の JSON 数値束縛の暫定拒否（Issue #896 まで
-//! `22000`）。
+//! （`22003`）・NoSQL 表層 `insert` の JSON 数値束縛（Issue #896・NOSQL-17。
+//! `engine::sql::parser::bind_insert` へ写像し SQL 表層と同一の値を書き込む）。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -123,17 +123,19 @@ fn wire_insert_with_non_integer_literal_returns_22000() {
     read_ready_for_query(&mut stream);
 }
 
-/// NoSQL 表層 `POST /v1/query`（`op: insert`）で `INTEGER` 列へ JSON 数値を
-/// 渡した場合、Issue #896（NoSQL の JSON 束縛）までは型不一致として `22000`
-/// （HTTP 400）で拒否する（`sql::allowlist::ValidatedInsert` 経由の JSON→
-/// `InsertLiteral` 変換が数値を文字列として素通しし、`INTEGER` 列は
-/// `InsertLiteral::String` を受理しないため）。
+/// NoSQL 表層 `POST /v1/query`（`op: insert`）で `INTEGER`／`BIGINT` 列へ
+/// JSON 数値を渡すと成功し、SQL 表層から読み戻すと同じ値が観測できる
+/// （Issue #896・NOSQL-17。JSON 数値は `f64` を経由せず `InsertLiteral::Number`
+/// の生テキストとして `engine::sql::parser::bind_insert` へ渡る）。
 #[test]
-fn nosql_insert_with_json_number_for_integer_column_returns_22000() {
+fn nosql_insert_with_json_number_for_integer_column_succeeds_and_round_trips() {
     let (core, _guard) = new_core_with_integer_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let http_addr =
-        http_common::spawn_router_listener_with_engine(&users_path, SessionStore::new(), core);
+    let http_addr = http_common::spawn_router_listener_with_engine(
+        &users_path,
+        SessionStore::new(),
+        core.clone(),
+    );
 
     let login_body = br#"{"user":"alice","password":"pw-alice"}"#;
     let login_request = http_common::build_request(
@@ -176,10 +178,86 @@ fn nosql_insert_with_json_number_for_integer_column_returns_22000() {
         &request,
         AfterWrite::HalfClose,
     ));
-    assert_eq!(resp.status, 400, "unexpected response: {resp:?}");
+    assert_eq!(resp.status, 200, "unexpected response: {resp:?}");
     let text = String::from_utf8_lossy(&resp.body);
     assert!(
-        text.contains("22000"),
-        "expected 22000 in error body, got: {text}"
+        text.contains("\"inserted\":1"),
+        "expected inserted:1 in success body, got: {text}"
+    );
+
+    // SQL 表層から同一 core を読み戻し、NoSQL 表層の JSON 数値束縛
+    // （`InsertLiteral::Number` の生テキスト経由）が SQL 表層の `bind_insert`
+    // と同じ値を書き込んだことを固定する。
+    let mut stream = spawn_with_alice(core);
+    send_simple_query(&mut stream, "SELECT n, b FROM docs WHERE id = 1 LIMIT 10");
+    let _ = read_row_description_with_oids(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row, vec![Some("5".to_string()), Some("1".to_string())]);
+    let _ = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+}
+
+/// NoSQL 表層 `POST /v1/query`（`op: insert`）の `BIGINT` 列へ `u64`/`i64` の
+/// いずれにも収まらない整数リテラル（`18446744073709551616` = `u64::MAX + 1`）
+/// を渡すと `22003`（範囲外）として拒否される（Issue #896・NOSQL-17 codex
+/// レビュー指摘対応）。`engine::json::parse_number` はこの値を小数点・指数部
+/// を含まない `JsonNumber::Float` へフォールバックさせるが、
+/// `typed_json::map_json_to_literal` はこれを整数リテラルとして
+/// `engine::sql::parser::bind_insert` へ委譲し、範囲判定は SQL 表層と同じ
+/// `bind_integer_literal` に一本化する（型不一致 `42601` にはしない）。
+#[test]
+fn nosql_insert_with_integer_literal_overflowing_u64_returns_22003() {
+    let (core, _guard) = new_core_with_integer_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let http_addr = http_common::spawn_router_listener_with_engine(
+        &users_path,
+        SessionStore::new(),
+        core.clone(),
+    );
+
+    let login_body = br#"{"user":"alice","password":"pw-alice"}"#;
+    let login_request = http_common::build_request(
+        "/v1/session",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", &login_body.len().to_string()),
+        ],
+        login_body,
+    );
+    let login_resp: HttpResponse = http_common::parse_single_response(&http_common::send_raw(
+        http_addr,
+        &login_request,
+        AfterWrite::HalfClose,
+    ));
+    assert_eq!(login_resp.status, 200, "login must succeed: {login_resp:?}");
+    let login_text = String::from_utf8_lossy(&login_resp.body).into_owned();
+    let token = match engine::json::parse_json(&login_text).expect("login body must be valid json")
+    {
+        engine::json::JsonValue::Object(mut obj) => match obj.remove("token") {
+            Some(engine::json::JsonValue::String(s)) => s,
+            other => panic!("expected string token field, got {other:?}"),
+        },
+        other => panic!("expected json object body, got {other:?}"),
+    };
+
+    let insert_body = br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2],"n":5,"b":18446744073709551616}],"operation_id":"op-1"}"#;
+    let request = http_common::build_request(
+        "/v1/query",
+        &[
+            ("Authorization", &format!("Bearer {token}")),
+            ("Content-Type", "application/json"),
+            ("Content-Length", &insert_body.len().to_string()),
+        ],
+        insert_body,
+    );
+    let resp = http_common::parse_single_response(&http_common::send_raw(
+        http_addr,
+        &request,
+        AfterWrite::HalfClose,
+    ));
+    assert_eq!(
+        http_common::wire_code_of(&resp),
+        "22003",
+        "unexpected response: {resp:?}"
     );
 }

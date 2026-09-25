@@ -5,8 +5,13 @@
 //!
 //! 責務境界: [`super::schema::INSERT_SCHEMA`] が形（必須キー・型）を検証済みの
 //! JSON オブジェクトから `table`／`rows`／`operation_id` を取り出し、
-//! [`bind_rows`]（純関数・engine 非依存）で `engine::sql::parser::BoundInsert` の
-//! 列へ束縛したうえで、[`execute`] が
+//! [`bind_rows`] が行ごとに [`super::typed_json::map_json_to_literal`]
+//! （NOSQL-17。Issue #896。JSON 値 → `InsertLiteral` の型別写像）で列値を
+//! `engine::sql::allowlist::ValidatedInsert`（1 行分）へ組み立て、
+//! `engine::sql::parser::bind_insert`（SQL 表層 `INSERT` と共有する公開束縛
+//! 関数。整数のオーバーフロー・`NUMERIC` の桁あふれ・`DATE`／`TIMESTAMP` の
+//! 暦上妥当性・`UUID` の文法等はすべてここへ委譲する）で `BoundInsert` へ
+//! 束縛する。[`execute`] がその結果を
 //! `engine::core::EngineCore::execute_bound_insert_in_session`（Issue #728 と同型の
 //! セッション対応エントリ）へ委譲する。SQL テキストを一切生成せず、第 2 の実行器も
 //! 作らない（`filter.rs`・`docs/design/scalar-index-mask-search.md` と同じ設計方針）。
@@ -49,10 +54,9 @@ use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::recovery::required_op_id::OperationId;
-use engine::row_codec::Value;
-use engine::sql::allowlist::SqlSurfaceError;
+use engine::sql::allowlist::{SqlSurfaceError, ValidatedInsert};
 use engine::sql::exec::InsertOutcome;
-use engine::sql::parser::BoundInsert;
+use engine::sql::parser::{bind_insert, BoundInsert};
 
 use crate::http::error_body::escape_json_string_into;
 use crate::http::response as http_response;
@@ -60,6 +64,7 @@ use crate::http::session::middleware::SessionPrincipal;
 
 use super::ident::{self, InvalidIdentifier};
 use super::schema::{SchemaError, Validated};
+use super::typed_json::{self, TypedJsonError};
 
 /// [`bind_row`] が返す `InsertError::Bind` 用の `SqlSurfaceError::InvalidInput`
 /// 構築ヘルパー。`SqlSurfaceError::invalid_input`（切り詰め処理を持つコンストラクタ）
@@ -88,32 +93,18 @@ pub enum InsertError {
     /// 素通りし、兄弟 op と異なる `wire_code` として露出しうる（Cursor Bugbot 指摘・
     /// PR #823）。
     InvalidIdentifier,
-    /// `engine::sql::parser::BoundInsert` への束縛時のエラー（未知列・型不一致・
-    /// 次元不一致・非 nullable 列の欠落等。`22000`）。
+    /// `engine::sql::parser::bind_insert` への束縛時のエラー（未知列・型不一致・
+    /// 次元不一致・非 nullable 列の欠落・整数のオーバーフロー・`NUMERIC` の
+    /// 桁あふれ・`DATE`／`TIMESTAMP` の暦上妥当性・`UUID` の文法等。SQL 表層
+    /// `INSERT` と同一の分類）。
     Bind(SqlSurfaceError),
     /// `EngineCore::execute_bound_insert_in_session` 側のエラー（`operation_id`
     /// 必須化・台帳照合・INDEX-4 上限・テーブル不存在等）をそのまま透過する。
     Exec(SqlSurfaceError),
-    /// `BYTEA` 列の値が base64 の JSON string でない、または不正な base64
-    /// （`42601`。B10・Issue #886。SQL 表層の型不一致〔`22000`〕とは意図的に
-    /// 異なる分類——受け入れ基準 4・NOSQL-17 の「型不一致は `42601`」に従う）。
-    InvalidBytea(&'static str),
-    /// `BYTEA` 列の base64 値が復号後 [`engine::bytea::MAX_BYTEA_FIELD_LEN`] を
-    /// 超える（`54000`）。
-    ByteaTooLarge,
-    /// `JSON`／`JSONB` 列の値が JSON オブジェクト／配列の型として不整合、または
-    /// 構文不正（`42601`。Issue #889 D6。SQL 表層の型不一致〔`22000`〕とは
-    /// 意図的に異なる分類——BYTEA の `InvalidBytea` と同じ判断）。スカラー JSON
-    /// （文字列・数値・真偽値）は NOSQL-17 の束縛表に無いため曖昧さを避けて
-    /// 同じ分類で拒否する。
-    InvalidJson(&'static str),
-    /// `JSON`／`JSONB` 列の値が正規化後 [`engine::json::MAX_JSON_FIELD_LEN`] を
-    /// 超える（`54000`）。
-    JsonTooLarge,
-    /// `ENUM` 列の値が語彙外のラベル（`22P02`。TABLE-14・TASK-198、Issue #890。
-    /// SQL 表層の `sql::parser::bind_enum_literal` と同じ分類を NoSQL 表層でも
-    /// 共有する）。エラー文言には語彙の一覧を含めない（security.md P0）。
-    InvalidEnumLabel(String),
+    /// JSON 値 → `InsertLiteral` 写像時の型不一致・wire 固有の符号化エラー
+    /// （NOSQL-17。Issue #896。[`super::typed_json::TypedJsonError`] を
+    /// `update.rs::UpdateError::Set` と共有する単一情報源とする）。
+    Set(TypedJsonError),
 }
 
 impl From<SchemaError> for InsertError {
@@ -134,11 +125,7 @@ impl ClassifiedError for InsertError {
             InsertError::Shape(err) => err.error_class(),
             InsertError::InvalidIdentifier => ErrorClass::UnsupportedSqlSyntax,
             InsertError::Bind(err) | InsertError::Exec(err) => err.error_class(),
-            InsertError::InvalidBytea(_) => ErrorClass::UnsupportedSqlSyntax,
-            InsertError::ByteaTooLarge => ErrorClass::PayloadTooLarge,
-            InsertError::InvalidJson(_) => ErrorClass::UnsupportedSqlSyntax,
-            InsertError::JsonTooLarge => ErrorClass::PayloadTooLarge,
-            InsertError::InvalidEnumLabel(_) => ErrorClass::InvalidTextRepresentation,
+            InsertError::Set(err) => err.error_class(),
         }
     }
 
@@ -147,11 +134,7 @@ impl ClassifiedError for InsertError {
             InsertError::Shape(err) => err.client_message(),
             InsertError::InvalidIdentifier => "invalid identifier".to_string(),
             InsertError::Bind(err) | InsertError::Exec(err) => err.client_message(),
-            InsertError::InvalidBytea(detail) => detail.to_string(),
-            InsertError::ByteaTooLarge => "BYTEA value exceeds the length limit".to_string(),
-            InsertError::InvalidJson(detail) => detail.to_string(),
-            InsertError::JsonTooLarge => "JSON value exceeds the length limit".to_string(),
-            InsertError::InvalidEnumLabel(detail) => detail.clone(),
+            InsertError::Set(err) => err.client_message(),
         }
     }
 }
@@ -166,7 +149,12 @@ impl ClassifiedError for InsertError {
 /// `\u0000` エスケープ経由で NUL を含み得るため、`error_response::encode` の NUL
 /// 拒否で `XX000` へ縮退しうる。`schema.rs::SchemaError::UnknownKey`・
 /// `filter.rs::FilterError::UnsupportedOperator` と同じ判断）。
-fn bind_row(item: &JsonValue, schema: &TableSchema) -> Result<(u64, Vec<Value>), InsertError> {
+fn bind_row(
+    item: &JsonValue,
+    table: &str,
+    operation_id: Option<&OperationId>,
+    schema: &TableSchema,
+) -> Result<BoundInsert, InsertError> {
     let JsonValue::Object(map) = item else {
         return Err(InsertError::Bind(invalid_input_error(
             "INSERT row must be a JSON object",
@@ -207,148 +195,71 @@ fn bind_row(item: &JsonValue, schema: &TableSchema) -> Result<(u64, Vec<Value>),
         }
     };
 
-    let mut values: Vec<Value> = vec![Value::Null; schema.columns.len()];
-    let mut provided = vec![false; schema.columns.len()];
+    // `columns`／`literals` は宣言順に対応する 2 本の Vec として組み立て、
+    // `engine::sql::parser::bind_insert`（SQL 表層 `INSERT` と共有する公開
+    // 束縛関数）へそのまま渡す。値の解析・範囲検証（整数のオーバーフロー・
+    // `NUMERIC` の桁あふれ・暦上妥当性・`UUID` の文法等）は一切ここでは行わず、
+    // `bind_insert` 側の単一情報源に委譲する（NOSQL-17。Issue #896）。
+    let mut columns: Vec<String> = Vec::with_capacity(map.len());
+    let mut literals: Vec<engine::sql::allowlist::InsertLiteral> = Vec::with_capacity(map.len());
+    columns.push("id".to_string());
+    literals.push(engine::sql::allowlist::InsertLiteral::Number(
+        id.to_string(),
+    ));
 
     for (key, raw) in map.iter() {
         if key == "id" {
             continue;
         }
-        let Some(col_idx) = schema.columns.iter().position(|c| &c.name == key) else {
+        // untrusted な列名が engine 側のエラー文言へそのまま埋め込まれて
+        // `XX000` へ縮退する経路を塞ぐ（`table`・`update.rs` の `set` キーと
+        // 同じ判断・PR #823）。
+        ident::check_identifier(key)?;
+        let Some(column) = schema.columns.iter().find(|c| &c.name == key) else {
             return Err(InsertError::Bind(invalid_input_error(
                 "INSERT row references an unknown column",
             )));
         };
-        let column = &schema.columns[col_idx];
-        let value = match (&column.ty, raw) {
-            (ColumnType::Text, JsonValue::String(s)) => Value::Text(s.clone()),
-            (ColumnType::Text, JsonValue::Null) if column.nullable => Value::Null,
-            // ENUM 列は base64 ではなく生のラベル文字列を JSON string として
-            // 受け取る（Issue #890。BYTEA が base64 を採用しているのとは異なる
-            // 表現——ラベルは人間可読な識別子であり、SQL 表層の文字列リテラルと
-            // 同じ表示形にするため）。語彙外は `22P02`、非文字列は `42601`。
-            (ColumnType::Enum(def), JsonValue::String(s)) => {
-                if def.validate_label(s).is_err() {
-                    return Err(InsertError::InvalidEnumLabel(format!(
-                        "INSERT row enum column value {s:?} is not a member of enum type {:?}",
-                        def.name()
-                    )));
-                }
-                Value::Enum(s.clone())
-            }
-            (ColumnType::Enum(_), JsonValue::Null) if column.nullable => Value::Null,
-            (ColumnType::Enum(_), _) => {
-                return Err(InsertError::Bind(SqlSurfaceError::UnsupportedSyntax {
-                    detail: "INSERT row ENUM column value must be a JSON string".to_string(),
-                }))
-            }
-            (ColumnType::Vector(dim), JsonValue::Array(items)) => {
-                if items.len() != *dim as usize {
-                    return Err(InsertError::Bind(invalid_input_error(
-                        "INSERT row VECTOR column length does not match the table dimension",
-                    )));
-                }
-                let mut vec_values: Vec<f32> = Vec::with_capacity(items.len());
-                for item in items {
-                    let JsonValue::Number(n) = item else {
-                        return Err(InsertError::Bind(invalid_input_error(
-                            "INSERT row VECTOR column element must be a JSON number",
-                        )));
-                    };
-                    // `n.as_f64() as f32`（`str -> f64 -> f32` の 2 回丸め）ではなく
-                    // `as_f32()`（保持した生リテラル文字列を SQL 表層
-                    // `sql::parser::parse_vector_literal` と同一の `str -> f32`
-                    // 単一丸めで変換）を使う。同一リテラル・同一 `operation_id` を
-                    // NoSQL・SQL 表層を跨いで再送した際、ここで丸めが食い違うと
-                    // `content_hash` が一致せず「同一内容の再送」（`23505`）ではなく
-                    // 「内容不一致」（`22023`）に誤判定されるため（Issue #771 レビュー
-                    // 指摘対応）。
-                    let f = n.as_f32().ok_or_else(|| {
-                        InsertError::Bind(invalid_input_error(
-                            "INSERT row VECTOR column element must be finite",
-                        ))
-                    })?;
-                    vec_values.push(f);
-                }
-                Value::Vector(vec_values)
-            }
-            (ColumnType::Bytea, JsonValue::String(s)) => {
-                let decoded =
-                    super::base64_std::decode_base64_std(s, engine::bytea::MAX_BYTEA_FIELD_LEN)
-                        .map_err(|e| match e {
-                            super::base64_std::Base64StdError::TooLong => {
-                                InsertError::ByteaTooLarge
-                            }
-                            _ => InsertError::InvalidBytea(
-                                "INSERT row BYTEA column value must be valid base64",
-                            ),
-                        })?;
-                Value::Bytes(decoded)
-            }
-            (ColumnType::Bytea, JsonValue::Null) if column.nullable => Value::Null,
-            (ColumnType::Bytea, _) => {
-                return Err(InsertError::InvalidBytea(
-                    "INSERT row BYTEA column value must be a base64 JSON string",
-                ))
-            }
-            // `JSON`／`JSONB` 列はネストした JSON オブジェクト／配列を受理し、
-            // 正規化テキストへ写像する（Issue #889 D6。`JSON` 列も含め NoSQL
-            // 経由の値は常に正規化形で格納する設計判断——row_codec の encode
-            // チョークポイントは「有効な JSON か」のみを検証するため矛盾しない）。
-            // スカラー JSON（文字列・数値・真偽値）は NOSQL-17 の束縛表に無い
-            // ため曖昧さを避けて `42601` で拒否する。
-            (ColumnType::Json | ColumnType::Jsonb, JsonValue::Object(_) | JsonValue::Array(_)) => {
-                let mut canonical = String::new();
-                engine::json::write_canonical(raw, &mut canonical);
-                if canonical.len() > engine::json::MAX_JSON_FIELD_LEN {
-                    return Err(InsertError::JsonTooLarge);
-                }
-                Value::Json(canonical)
-            }
-            (ColumnType::Json | ColumnType::Jsonb, JsonValue::Null) if column.nullable => {
-                Value::Null
-            }
-            (ColumnType::Json | ColumnType::Jsonb, _) => {
-                return Err(InsertError::InvalidJson(
-                    "INSERT row JSON column value must be a JSON object or array",
-                ))
-            }
-            _ => {
-                return Err(InsertError::Bind(invalid_input_error(
-                    "INSERT row column value has an unexpected JSON type for its column",
-                )))
-            }
-        };
-        if let Some(slot) = values.get_mut(col_idx) {
-            *slot = value;
+        // JSON `null` は列を省略する契約（`insert` op。列を省略すれば
+        // nullable 列は `bind_insert` が `Value::Null` で埋め、非 nullable
+        // 列は「値が提供されていない」（`22000`）で拒否する。`update` op が
+        // `InsertLiteral::Null` をそのまま渡すのとは異なる——`bind_insert_row`
+        // は明示 `NULL` リテラルを列型を問わず一律拒否する契約のため、
+        // ここで `InsertLiteral::Null` を渡すと nullable 列でもエラーになる。
+        // NOSQL-17 束縛表「null の扱い」節参照）。
+        if matches!(raw, JsonValue::Null) {
+            continue;
         }
-        if let Some(flag) = provided.get_mut(col_idx) {
-            *flag = true;
-        }
+        let literal = typed_json::map_json_to_literal(column, raw).map_err(InsertError::Set)?;
+        columns.push(key.clone());
+        literals.push(literal);
     }
 
-    for (idx, column) in schema.columns.iter().enumerate() {
-        let is_provided = provided.get(idx).copied().unwrap_or(false);
-        // VECTOR 列は `nullable` の値に関わらず常に必須として扱う。
-        // `tenant::insert_typed_rows_unchecked`（実行層。`EngineCore::
-        // execute_bound_insert_in_session` から呼ばれる）が VECTOR 列の値を
-        // 無条件に `Value::Vector` として要求し、欠落・`Null` を
-        // `CatalogError::Invalid` で拒否する契約のため（`sql::parser::
-        // bind_insert` の SQL 表層束縛と同じ既存の制約で、schema 上
-        // `nullable: true` の VECTOR 列を宣言できても実行層では意味を持たない）。
-        // これを bind 層で先取りして検査しないと、明示 `null` は本関数の
-        // 直前の `match` で `22000`（`InsertError::Bind`）になる一方、値を
-        // 丸ごと省略した場合だけ実行層まで素通りし別の `wire_code` で
-        // 拒否される非対称が生じる（PR #823 レビュー指摘）。
-        let is_required = !column.nullable || matches!(column.ty, ColumnType::Vector(_));
-        if !is_provided && is_required {
+    // `VECTOR` 列は `nullable` の値に関わらず常に必須として扱う
+    // （`tenant::insert_typed_rows_unchecked` の既存契約。上の JSON `null` 省略
+    // 経路と合流させることで、明示 `null`・値の丸ごと省略のいずれも同じ
+    // 「値が提供されていない」拒否になる。PR #823 レビュー指摘の非対称解消を
+    // 引き続き維持する）。
+    for column in &schema.columns {
+        if matches!(column.ty, ColumnType::Vector(_)) && !columns.iter().any(|c| c == &column.name)
+        {
             return Err(InsertError::Bind(invalid_input_error(
                 "INSERT row is missing a value for a required column",
             )));
         }
     }
 
-    Ok((id, values))
+    let validated = ValidatedInsert {
+        table_name: table.to_string(),
+        columns,
+        rows: vec![literals],
+        operation_id: operation_id.cloned(),
+        // NoSQL 表層 `insert` op は `RETURNING`／`ON CONFLICT` を公開しない
+        // （Issue #896 のスコープ外）。
+        returning: None,
+        on_conflict: None,
+    };
+    bind_insert(&validated, schema).map_err(InsertError::Bind)
 }
 
 /// `rows`（[`Validated::required_array`]`("rows")` が返す形。要素の型は
@@ -370,13 +281,7 @@ pub fn bind_rows(
         })
     })?;
     for item in items {
-        let (id, values) = bind_row(item, schema)?;
-        bounds.push(BoundInsert {
-            table: table.to_string(),
-            id,
-            values,
-            operation_id: operation_id.cloned(),
-        });
+        bounds.push(bind_row(item, table, operation_id, schema)?);
     }
     Ok(bounds)
 }
@@ -451,38 +356,24 @@ pub fn execute(
             |schema| {
                 bind_rows(rows, table, Some(&operation_id), schema).map_err(|e| match e {
                     InsertError::Bind(err) | InsertError::Exec(err) => err,
-                    // `bind_rows` は `InsertError::Shape`／`InsertError::InvalidIdentifier`
-                    // を構築しない（前者は `schema.rs` の意味的検証、後者は本関数冒頭の
-                    // `ident::check_identifier` がそれぞれ独立に検査する）。到達不能だが
-                    // `SqlSurfaceError` へ丸めて fail-closed のまま `match` を網羅する。
-                    InsertError::Shape(_) | InsertError::InvalidIdentifier => {
-                        SqlSurfaceError::Internal {
-                            detail: "unexpected shape error during INSERT row binding".to_string(),
-                        }
-                    }
-                    // `InvalidBytea`（`42601`）／`ByteaTooLarge`（`54000`）の分類を
-                    // `SqlSurfaceError` へ写像しても維持する（B10・Issue #886）。
-                    InsertError::InvalidBytea(detail) => SqlSurfaceError::UnsupportedSyntax {
-                        detail: detail.to_string(),
+                    // `bind_rows`（`bind_row` を行ごとに呼ぶ）は列キーの識別子形状検査
+                    // （`ident::check_identifier`。NUL・制御文字・63 文字上限等）を
+                    // 行うため `InsertError::InvalidIdentifier` を実際に構築しうる
+                    // （Cursor Bugbot 指摘。かつては「本関数冒頭の `table` 検査でしか
+                    // 構築されない」という誤った前提で `Internal`〔`XX000`〕へ丸めて
+                    // いたため、不正な列キーを含む insert が `42601` ではなく内部
+                    // エラー相当のコードで返っていた）。`Shape` は `schema.rs` の
+                    // 意味的検証専用で `bind_rows` からは構築されないため、`Internal`
+                    // への丸め込みを維持する。
+                    InsertError::InvalidIdentifier => SqlSurfaceError::UnsupportedSyntax {
+                        detail: "invalid identifier".to_string(),
                     },
-                    InsertError::ByteaTooLarge => SqlSurfaceError::PayloadTooLarge {
-                        detail: "BYTEA value exceeds the length limit".to_string(),
+                    InsertError::Shape(_) => SqlSurfaceError::Internal {
+                        detail: "unexpected shape error during INSERT row binding".to_string(),
                     },
-                    // `InvalidJson`（`42601`）／`JsonTooLarge`（`54000`）の分類を
-                    // `SqlSurfaceError` へ写像しても維持する（Issue #889 D6）。
-                    InsertError::InvalidJson(detail) => SqlSurfaceError::UnsupportedSyntax {
-                        detail: detail.to_string(),
-                    },
-                    InsertError::JsonTooLarge => SqlSurfaceError::PayloadTooLarge {
-                        detail: "JSON value exceeds the length limit".to_string(),
-                    },
-                    // ENUM 語彙外ラベル（`22P02`）の分類を `SqlSurfaceError` へ
-                    // 写像しても維持する（Issue #890。`invalid_text_representation`
-                    // コンストラクタは engine クレート内 `pub(crate)` のため、
-                    // 他の variant と同じくフィールド直接構築で写像する）。
-                    InsertError::InvalidEnumLabel(detail) => {
-                        SqlSurfaceError::InvalidTextRepresentation { detail }
-                    }
+                    // `TypedJsonError`（NOSQL-17。Issue #896）の分類は単一の
+                    // `into_sql_surface_error` 変換点に集約する（`update.rs` と共有）。
+                    InsertError::Set(err) => err.into_sql_surface_error(),
                 })
             },
         )
@@ -529,6 +420,7 @@ mod tests {
     use engine::json::parse_json;
     use engine::kernel::CpuScalarProvider;
     use engine::policy::PolicyContext;
+    use engine::row_codec::Value;
     use engine::storage::Storage;
 
     fn schema() -> TableSchema {
@@ -608,6 +500,49 @@ mod tests {
         let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,"x"],"lang":"ja"}]"#);
         let err = bind_rows(&items, "docs", None, &schema()).expect_err("must reject");
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// Issue #896 レビュー指摘（PR #1038）: `insert` op が `VECTOR` 列を
+    /// `InsertLiteral::String`（`[f1,f2,...]` 形のテキストリテラル）経由で
+    /// `engine::sql::parser::bind_insert` へ渡していたため、テキスト表現が
+    /// 64 KiB（`MAX_VECTOR_LITERAL_BYTES`）を超える宣言次元の妥当なベクトルが
+    /// `54000` で誤って拒否されていた。`InsertLiteral::Vector`（JSON 配列 →
+    /// `f32` の直接構築。テキスト長上限を経由しない）への変更後は、
+    /// スキーマ上合法な高次元ベクトルが JSON 配列の要素数上限の範囲内であれば
+    /// 受理されることを固定する。
+    #[test]
+    fn bind_rows_accepts_high_dimension_vector_exceeding_text_literal_length_limit() {
+        const DIM: usize = 20_000;
+        let high_dim_schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new(
+                "embedding",
+                ColumnType::Vector(DIM as u32),
+                false,
+            )],
+        );
+
+        let mut embedding_json = String::from("[");
+        for i in 0..DIM {
+            if i > 0 {
+                embedding_json.push(',');
+            }
+            embedding_json.push_str("0.1");
+        }
+        embedding_json.push(']');
+        // テキスト表現が旧経路の 64 KiB 上限（`MAX_VECTOR_LITERAL_BYTES`）を
+        // 超えることを確認する（超えなければ本テストは修正前の退行を検出できない）。
+        assert!(embedding_json.len() > 64 * 1024);
+
+        let body = format!(r#"[{{"id":1,"embedding":{embedding_json}}}]"#);
+        let items = rows_from(&body);
+        let bounds = bind_rows(&items, "docs", None, &high_dim_schema).expect("bind ok");
+        assert_eq!(bounds.len(), 1);
+        let Value::Vector(values) = &bounds[0].values[0] else {
+            panic!("expected Value::Vector");
+        };
+        assert_eq!(values.len(), DIM);
+        assert!(values.iter().all(|v| (*v - 0.1_f32).abs() < 1e-6));
     }
 
     #[test]
@@ -866,6 +801,40 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // 列名（`id` 以外の JSON キー）に NUL を含む場合、`ident::check_identifier`
+    // が engine へ渡す前に `42601` で拒否する（`execute_rejects_table_name_
+    // containing_nul_as_invalid_identifier` と同じ判断を `rows[*]` のキーへも
+    // 適用する。Issue #896 で `bind_row` が列ごとに `ident::check_identifier`
+    // を呼ぶよう変更した結果——旧実装はこの検査を持たず、NUL を含む列名は
+    // engine 側の「未知列」判定〔`22000`〕まで素通りしていた）。
+    #[test]
+    fn bind_rows_rejects_column_key_containing_nul_as_invalid_identifier() {
+        let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"lang\u0000":"x"}]"#);
+        let err = bind_rows(&items, "docs", None, &schema()).expect_err("must reject");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// `bind_rows_rejects_column_key_containing_nul_as_invalid_identifier` は
+    /// `bind_rows` を直接呼ぶ単体テストであり、`execute` の束縛 closure が
+    /// `InsertError::InvalidIdentifier` を `SqlSurfaceError::Internal`
+    /// （`XX000`）へ丸め込んでいたバグ（Cursor Bugbot 指摘）は検出できて
+    /// いなかった。本テストは本番経路（`execute`）を実際に通し、`42601` の
+    /// まま到達することを固定する。
+    #[test]
+    fn execute_rejects_column_key_containing_nul_as_invalid_identifier() {
+        let (core, path) = open_core();
+        let principal = principal("tenant-a");
+        let body = r#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[1,0,0,0],"lang\u0000":"x"}],"operation_id":"op-1"}"#;
+        let value = parse_json(body).expect("valid json");
+        let validated = super::super::schema::INSERT_SCHEMA
+            .validate(&value)
+            .expect("schema ok");
+
+        let err = execute(&core, &principal, &validated).expect_err("must reject");
+        assert_eq!(err.wire_code(), "42601");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn execute_missing_operation_id_is_23502() {
         let (core, path) = open_core();
@@ -1076,7 +1045,10 @@ mod tests {
     fn bind_rows_rejects_non_string_bytea_column() {
         let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"blob":123}]"#);
         let err = bind_rows(&items, "docs", None, &bytea_schema()).expect_err("must reject");
-        assert!(matches!(err, InsertError::InvalidBytea(_)));
+        assert!(matches!(
+            err,
+            InsertError::Set(TypedJsonError::InvalidBytea(_))
+        ));
         assert_eq!(err.wire_code(), "42601");
     }
 
@@ -1087,7 +1059,10 @@ mod tests {
                 r#"[{{"id":1,"embedding":[1,0,0,0],"blob":"{bad}"}}]"#
             ));
             let err = bind_rows(&items, "docs", None, &bytea_schema()).expect_err("must reject");
-            assert!(matches!(err, InsertError::InvalidBytea(_)), "input: {bad}");
+            assert!(
+                matches!(err, InsertError::Set(TypedJsonError::InvalidBytea(_))),
+                "input: {bad}"
+            );
             assert_eq!(err.wire_code(), "42601", "input: {bad}");
         }
     }
@@ -1096,6 +1071,75 @@ mod tests {
     fn bind_rows_accepts_null_bytea_column() {
         let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"blob":null}]"#);
         let bounds = bind_rows(&items, "docs", None, &bytea_schema()).expect("bind ok");
+        assert_eq!(bounds[0].values[1], Value::Null);
+    }
+
+    // --- 新型（Issue #896）の INSERT 束縛 --------------------------------------
+
+    fn typed_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("count", ColumnType::Integer, true),
+                ColumnDef::new("score", ColumnType::Real, true),
+                ColumnDef::new("active", ColumnType::Boolean, true),
+                ColumnDef::new(
+                    "amount",
+                    ColumnType::Numeric {
+                        precision: 5,
+                        scale: 2,
+                    },
+                    true,
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn bind_rows_maps_integer_real_boolean_numeric_columns() {
+        let items = rows_from(
+            r#"[{"id":1,"embedding":[1,0,0,0],"count":42,"score":1.5,"active":true,"amount":12.34}]"#,
+        );
+        let bounds = bind_rows(&items, "docs", None, &typed_schema()).expect("bind ok");
+        assert_eq!(
+            bounds[0].values,
+            vec![
+                Value::Vector(vec![1.0, 0.0, 0.0, 0.0]),
+                Value::Integer(42),
+                Value::Real(1.5),
+                Value::Bool(true),
+                engine::numeric::parse_for_column("12.34", 5, 2)
+                    .map(Value::Numeric)
+                    .expect("valid numeric"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bind_rows_rejects_float_for_integer_column() {
+        let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"count":1.5}]"#);
+        let err = bind_rows(&items, "docs", None, &typed_schema()).expect_err("must reject");
+        assert!(matches!(
+            err,
+            InsertError::Set(TypedJsonError::TypeMismatch(_))
+        ));
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_rows_rejects_integer_overflow_via_bind_insert() {
+        // 範囲検証は `bind_insert`（engine 側の単一情報源）の責務。
+        let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"count":2147483648}]"#);
+        let err = bind_rows(&items, "docs", None, &typed_schema()).expect_err("must reject");
+        assert!(matches!(err, InsertError::Bind(_)));
+        assert_eq!(err.wire_code(), "22003");
+    }
+
+    #[test]
+    fn bind_rows_omits_null_integer_column() {
+        let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"count":null}]"#);
+        let bounds = bind_rows(&items, "docs", None, &typed_schema()).expect("bind ok");
         assert_eq!(bounds[0].values[1], Value::Null);
     }
 }

@@ -190,3 +190,7 @@ overflow_matches_visibility_parity`・
 （`row_codec::ScalarRef` 新設）。`Value`（`row_codec::Value`）へ `Real`／
 `Double` variant を追加した。いずれも公開 API の破壊的変更として
 `feat(engine)!:` コミットへ記録する。
+
+## Issue #896 追記
+
+NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応・`columns[].type` の型名整備は Issue #896（NOSQL-17）で実施済み。詳細は `docs/design/nosql-typed-json-binding.md` 参照。

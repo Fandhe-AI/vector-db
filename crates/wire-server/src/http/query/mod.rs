@@ -55,6 +55,12 @@
 //! `EngineCore::explain_bound_plan_in_session` へ写像し、SQL `EXPLAIN
 //! SELECT ... USING PLAN(...)` と同一内容の `{"explain":[...]}` 応答を返す
 //! （Issue #765・TASK-186・NOSQL-10。`vector` 指定・`plan` 未指定は `42601`）。
+//! [`typed_json`] は `insert`／`update`／`filter` が共有する
+//! 「JSON 値 → `engine::sql::allowlist::InsertLiteral`」写像を集約し、
+//! `INTEGER`／`BIGINT`／`REAL`／`DOUBLE`／`NUMERIC`／`BOOLEAN`／`DATE`／
+//! `TIMESTAMP`／`UUID`／`ARRAY` を含む全列型を SQL 表層と同一の束縛経路
+//! （`engine::sql::parser::bind_insert`／`bind_update`）へ到達させる
+//! （Issue #896・NOSQL-17）。
 
 pub mod aggregate;
 pub mod base64_std;
@@ -70,4 +76,5 @@ pub mod response;
 pub mod scan;
 pub mod schema;
 pub mod search;
+pub mod typed_json;
 pub mod update;

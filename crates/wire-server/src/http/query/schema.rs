@@ -112,6 +112,12 @@ pub enum FieldType {
     Bool,
     Number,
     String,
+    /// 文字列・数値・真偽値のいずれか（`null` は含まない。`nullable` で
+    /// 別途扱う）。`filter[].value`（Issue #896・NOSQL-17）のように列型に
+    /// 応じて種別を後段で判定するフィールド向け（`insert`／`update` の
+    /// 個々の列値のような、値の種類ごとに異なる意味を持つ場所とは異なり、
+    /// 単一フィールドが複数種別を許容する契約であることを型で表す）。
+    Scalar,
     Array(ElementType),
     /// 値が [`ObjectSchema`] に従うオブジェクトであることを再帰検証する。
     Object(&'static ObjectSchema),
@@ -157,6 +163,9 @@ fn check_field_type(
         (FieldType::Bool, JsonValue::Bool(_)) => Ok(()),
         (FieldType::Number, JsonValue::Number(_)) => Ok(()),
         (FieldType::String, JsonValue::String(_)) => Ok(()),
+        (FieldType::Scalar, JsonValue::String(_) | JsonValue::Number(_) | JsonValue::Bool(_)) => {
+            Ok(())
+        }
         (FieldType::Array(elem_ty), JsonValue::Array(items)) => {
             for item in items {
                 check_element_type(item, elem_ty, key)?;
@@ -344,6 +353,29 @@ impl<'a> Validated<'a> {
         }
     }
 
+    /// `FieldType::Scalar` フィールドの生 JSON 値（文字列・数値・真偽値の
+    /// いずれか）への参照を返す（Issue #896・NOSQL-17。`filter[].value`
+    /// 専用。他のアクセサと異なり単一の Rust 型へ変換しない——呼び出し元
+    /// が列型に応じて種別を判定する契約のため）。
+    pub fn required_scalar(&self, key: &'static str) -> Result<&'a JsonValue, SchemaError> {
+        let Some(spec) = self.field_spec(key) else {
+            return Err(SchemaError::UnknownKey);
+        };
+        if !matches!(spec.ty, FieldType::Scalar) {
+            return Err(SchemaError::TypeMismatch { key });
+        }
+        match self.map.get(key) {
+            Some(v @ (JsonValue::String(_) | JsonValue::Number(_) | JsonValue::Bool(_))) => Ok(v),
+            None => Err(SchemaError::MissingRequired { key }),
+            // 他のアクセサ（`optional_str`／`optional_number`／`optional_bool`
+            // 等）と同じく、キーは存在するが値の型が噛み合わない場合は
+            // `TypeMismatch` を返す（`Null`／`Array`／`Object` はここに落ちる。
+            // `ObjectSchema::validate` が既に拒否済みのため到達しないはずだが、
+            // 多層防御として他アクセサと分類を揃える）。
+            Some(_) => Err(SchemaError::TypeMismatch { key }),
+        }
+    }
+
     pub fn required_array(&self, key: &'static str) -> Result<&'a [JsonValue], SchemaError> {
         self.optional_array(key)?
             .ok_or(SchemaError::MissingRequired { key })
@@ -427,7 +459,10 @@ pub static FILTER_ITEM_SCHEMA: ObjectSchema = ObjectSchema {
         FieldSpec {
             key: "value",
             presence: Presence::Required,
-            ty: FieldType::String,
+            // Issue #896（NOSQL-17）: 列型ごとの `eq`／`prefix` レーンを
+            // `filter.rs::bind_filter` が判定するため、形の検証段階では
+            // 文字列・数値・真偽値のいずれも受理する（`null` は不可）。
+            ty: FieldType::Scalar,
             nullable: false,
         },
     ],

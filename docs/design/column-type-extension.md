@@ -737,10 +737,14 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
   （`declarative_filter::FilterOp::TypedCompare`。詳細は
   `docs/design/scalar-types-predicates.md` 参照）。式（算術・関数引数）中の
   UUID 列参照・`SUM`/`AVG`/`MIN`/`MAX`（#892）、`DecodeTier` の精査
-  （#894）、UUID 列のバイナリ形式・OID 2950 対応（#895）、NoSQL `insert`
-  op での JSON 束縛（#896）、SQL `CREATE TABLE` 構文での `UUID` 列宣言
-  （SQL-23 は未実装）は引き続き対象外。スカラー二次索引化（#893）は
+  （#894）、UUID 列のバイナリ形式・OID 2950 対応（#895）、SQL `CREATE TABLE`
+  構文での `UUID` 列宣言（SQL-23 は未実装）は引き続き対象外。スカラー二次索引化（#893）は
   `OrderedColumnIndex::U128` として構築し、`WHERE` の範囲比較述語から
   実際に候補削減へ消費される production 結線まで完了した
   （codex-review 指摘・PR #1032）。詳細は `docs/design/scalar-index-prune.md`
-  「Issue #893」節・「レビュー対応」節参照。
+  「Issue #893」節・「レビュー対応」節参照。NoSQL `insert` op での JSON 束縛
+  （#896）は Issue #896（NOSQL-17）で実施済み。
+
+## Issue #896 追記
+
+NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応・`columns[].type` の型名整備は Issue #896（NOSQL-17）で実施済み。詳細は `docs/design/nosql-typed-json-binding.md` 参照。

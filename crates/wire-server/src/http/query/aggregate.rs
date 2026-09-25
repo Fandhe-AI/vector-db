@@ -472,7 +472,11 @@ pub fn execute(
 /// ここでの分類のまま保たれる）。
 fn to_sql_surface_error(err: AggregateError) -> SqlSurfaceError {
     match err {
-        AggregateError::Engine(inner) | AggregateError::Filter(FilterError::Bind(inner)) => inner,
+        AggregateError::Engine(inner) => inner,
+        // `FilterError::into_sql_surface_error`（NOSQL-17。Issue #896）が
+        // `Bind` 以外の分類（`54000`／`42601`／`22P02`／`0A000` 等）も保つ
+        // 単一の変換点（`search.rs::to_sql_surface_error` のドキュメント参照）。
+        AggregateError::Filter(filter_err) => filter_err.into_sql_surface_error(),
         other => SqlSurfaceError::UnsupportedSyntax {
             detail: other.client_message(),
         },

@@ -60,11 +60,18 @@
 
 use std::fmt::Write as _;
 
+use engine::catalog::ColumnType;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::sql::exec::{Cell, ColumnMeta, QueryResult};
 
 use crate::http::error_body::escape_json_string_into;
-use crate::result_encoder::column_wire_type;
+
+/// `2^53 - 1`（IEEE 754 倍精度浮動小数点数が整数として無損失に表現できる
+/// 上限。JS 系 JSON クライアントの `Number.MAX_SAFE_INTEGER` と同じ値）。
+/// これを超える `Cell::SignedInteger`（`BIGINT` 列。Issue #896）は精度の
+/// 誤解を避けるため JSON 文字列で送出する（`Cell::Integer(u64)`〔`id`／
+/// `COUNT`〕は TASK-185 の担当のまま本 Issue では変更しない）。
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 /// [`encode`] の失敗を表す（`Cell::Float`／`Cell::Vector` の非有限要素が
 /// JSON で表現できない場合のみ発生する）。他テナント情報・内部詳細を運ばない
@@ -101,9 +108,19 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             Ok(())
         }
         // `INTEGER`／`BIGINT` 列の投影結果（Issue #881・TABLE-13・TASK-196）。
-        // JSON 数値としてそのまま出力する（`Cell::Integer` と同じ infallible 方針）。
+        // `INTEGER`（`i32` を無損失に格上げ）は常に安全範囲に収まるが、
+        // `BIGINT`（`i64` 全域）は超えうるため、`|v| > MAX_SAFE_INTEGER` は
+        // JSON 文字列で送出する（Issue #896。JS 系クライアントが
+        // `JSON.parse` した際の精度誤解を防ぐ。`Cell::Integer(u64)`〔`id`／
+        // `COUNT`〕は TASK-185 の担当のまま変更しない）。
         Cell::SignedInteger(v) => {
-            let _ = write!(out, "{v}");
+            if v.unsigned_abs() > MAX_SAFE_INTEGER.unsigned_abs() {
+                out.push('"');
+                let _ = write!(out, "{v}");
+                out.push('"');
+            } else {
+                let _ = write!(out, "{v}");
+            }
             Ok(())
         }
         Cell::Float(f) => write_finite_f64(out, *f),
@@ -224,6 +241,51 @@ fn write_finite_f32(out: &mut String, f: f32) -> Result<(), ResponseEncodeError>
     Ok(())
 }
 
+/// NoSQL 表層 `columns[].type` の型名（Issue #896・NOSQL-17。
+/// `crate::result_encoder::WireType`／`column_wire_type`（SQL wire
+/// `RowDescription` の OID 写像。Issue #895 の担当）とは**独立**の対応表——
+/// SQL wire 側は多くの新型を後方互換のため `text`（OID 25）へ丸めるが、
+/// NoSQL の JSON API は型情報をクライアントへそのまま伝える方が有用なため、
+/// 列型ごとに個別の名前を返す（BREAKING CHANGE。既存列の出力値が変わる）。
+/// 網羅 `match`（ワイルドカードなし）にすることで将来の列型追加を
+/// コンパイルエラーで検出する。
+fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
+    match meta {
+        // `id` 疑似列・式項目（`Computed`）は SQL wire 側（`column_wire_type`。
+        // Issue #895）と型名が一致する意図的な設計（`id` は他の集計等の
+        // `numeric` 系 API との一貫性、`Computed` は実行時の評価結果の型を
+        // 静的に持たないため）であり、ここでのみ SQL wire 側の対応表へ委譲
+        // することで二重管理を避ける（`Scalar` 腕は列型ごとに独立に決める。
+        // モジュール doc「独立の対応表」参照）。
+        ColumnMeta::Id | ColumnMeta::Computed { .. } => {
+            crate::result_encoder::column_wire_type(meta).pg_type_name()
+        }
+        ColumnMeta::Scalar { ty, .. } => match ty {
+            ColumnType::Text => "text",
+            ColumnType::Vector(_) => "vector",
+            ColumnType::Integer => "integer",
+            ColumnType::BigInt => "bigint",
+            ColumnType::Real => "real",
+            ColumnType::Double => "double precision",
+            ColumnType::Boolean => "boolean",
+            ColumnType::Date => "date",
+            ColumnType::Timestamp => "timestamp",
+            ColumnType::Numeric { .. } => "numeric",
+            ColumnType::Uuid => "uuid",
+            ColumnType::Bytea => "bytea",
+            ColumnType::Json => "json",
+            ColumnType::Jsonb => "jsonb",
+            // 固定語彙の ENUM 型は語彙一覧ではなく種別のみを返す（個々の
+            // ENUM 型名・語彙は型名の安定性のため含めない設計判断）。
+            ColumnType::Enum(_) => "enum",
+            ColumnType::Array(array_ty) => match array_ty.elem() {
+                engine::catalog::ArrayElemType::Text => "text[]",
+                engine::catalog::ArrayElemType::Bool => "boolean[]",
+            },
+        },
+    }
+}
+
 /// `columns[]` の 1 要素 `{"name":"...","type":"..."}` を `out` へ追記する。
 /// `name` はカタログ由来の untrusted 文字列（DDL でユーザーが指定した列名）
 /// のため [`Cell::Text`] と同じエスケーパを通す。
@@ -231,13 +293,13 @@ fn write_column(out: &mut String, meta: &ColumnMeta) {
     out.push_str("{\"name\":\"");
     escape_json_string_into(out, crate::result_encoder::column_name(meta));
     out.push_str("\",\"type\":\"");
-    // `pg_type_name()` はいずれの `WireType` variant でも固定 ASCII
-    // （`"numeric"`／`"text"`／`"bool"`／`"int4"` 等。WIRE-13・TASK-200・
-    // Issue #895 で追加した型も同様）のためエスケープ不要だが、型写像表が
-    // 将来拡張されても安全側に倒れるよう一律エスケーパを通す
+    // `nosql_type_name` はいずれの列型でも固定 ASCII
+    // （`"numeric"`／`"text"`／`"bool"`／`"jsonb"` 等。WIRE-13・TASK-200・
+    // Issue #895・本 Issue #896 で追加した新型も同様）のためエスケープ不要
+    // だが、型写像表が将来拡張されても安全側に倒れるよう一律エスケーパを通す
     // （`error_body.rs::wire_code_and_label_never_require_escaping` と
     // 同じ考え方）。
-    escape_json_string_into(out, column_wire_type(meta).pg_type_name());
+    escape_json_string_into(out, nosql_type_name(meta));
     out.push_str("\"}");
 }
 
@@ -430,13 +492,18 @@ mod tests {
         assert!(matches!(&top["row_count"], JsonValue::Number(n) if n.as_f64() == 1.0));
     }
 
-    /// 型名一致テーブルテスト: 各 `ColumnMeta` について `encode_row_description`
-    /// のバイト列から OID を読み取り、`WireType::from_oid` 相当の固定表
-    /// （テスト側で独立に持つ）と JSON `type` が一致することを固定する
-    /// （PR 計画 5.1「型名一致テーブルテスト」）。
+    /// `RowDescription`（SQL wire。Issue #895 の担当）が公告する OID とは
+    /// **独立**に、NoSQL `columns[].type`（Issue #896・NOSQL-17）が列名ごとに
+    /// 期待どおりの型名を返すことを固定する（両者は意図的に異なりうる。
+    /// `nosql_type_name` のモジュール doc 参照）。
     #[test]
-    fn column_type_matches_row_description_oid_for_every_column_kind() {
-        let expected: [(&str, i32); 4] = [("id", 1700), ("lang", 25), ("embedding", 25), ("n", 25)];
+    fn column_type_returns_expected_nosql_type_name_for_every_column_kind() {
+        let expected: [(&str, &str); 4] = [
+            ("id", "numeric"),
+            ("lang", "text"),
+            ("embedding", "vector"),
+            ("n", "text"),
+        ];
         let columns = all_column_kinds();
         assert_eq!(
             expected.len(),
@@ -444,8 +511,30 @@ mod tests {
             "期待表の長さが ColumnMeta 種別数と一致すること"
         );
 
+        // `RowDescription`（SQL wire。Issue #895 の担当）が独立に自己完結して
+        // OID → 型名を解決できること（本モジュールの `nosql_type_name` とは
+        // 非干渉であることの確認。`WireType::from_oid` を経由する唯一の
+        // 呼び出し元がここであるため到達性も兼ねて固定する）。
         let row_description =
             crate::result_encoder::encode_row_description(&columns).expect("encode");
+        let mut cursor = 1 + 4 + 2; // 'T' + length + field_count
+        for _ in 0..columns.len() {
+            let name_end = row_description[cursor..]
+                .iter()
+                .position(|&b| b == 0)
+                .expect("NUL terminator");
+            cursor += name_end + 1 + 4 + 2; // name + NUL + table_oid + attnum
+            let oid_bytes: [u8; 4] = row_description[cursor..cursor + 4]
+                .try_into()
+                .expect("4 bytes");
+            let oid = i32::from_be_bytes(oid_bytes);
+            assert!(
+                crate::result_encoder::WireType::from_oid(oid).is_some(),
+                "RowDescription must announce a known OID: {oid}"
+            );
+            cursor += 4 + 2 + 4 + 2; // type_oid + typlen + typmod + format
+        }
+
         let result = QueryResult {
             columns,
             rows: Vec::new(),
@@ -455,35 +544,14 @@ mod tests {
         let JsonValue::Array(json_columns) = &top["columns"] else {
             panic!("columns must be an array");
         };
-
-        // RowDescription body: 'T' + length(4) + field_count(2) から各フィールド
-        // が続く。各フィールドは name(NUL 終端) + table_oid(4) + attnum(2) +
-        // type_oid(4) + typlen(2) + typmod(4) + format(2)。
-        let mut cursor = 1 + 4 + 2; // 'T' + length + field_count
-        for (i, (name, expected_oid)) in expected.iter().enumerate() {
-            let name_end = row_description[cursor..]
-                .iter()
-                .position(|&b| b == 0)
-                .expect("NUL terminator");
-            let actual_name = std::str::from_utf8(&row_description[cursor..cursor + name_end])
-                .expect("utf8 name");
-            assert_eq!(&actual_name, name);
-            cursor += name_end + 1; // NUL を含めて読み飛ばす
-            cursor += 4 + 2; // table_oid + attnum
-            let oid_bytes: [u8; 4] = row_description[cursor..cursor + 4]
-                .try_into()
-                .expect("4 bytes");
-            let oid = i32::from_be_bytes(oid_bytes);
-            assert_eq!(oid, *expected_oid, "column={name}");
-            cursor += 4; // type_oid
-            cursor += 2 + 4 + 2; // typlen + typmod + format
-
-            let expected_type_name = crate::result_encoder::WireType::from_oid(oid)
-                .expect("known oid")
-                .pg_type_name();
+        for (i, (name, expected_type_name)) in expected.iter().enumerate() {
             let JsonValue::Object(col_obj) = &json_columns[i] else {
                 panic!("column must be an object");
             };
+            let JsonValue::String(actual_name) = &col_obj["name"] else {
+                panic!("name must be a string");
+            };
+            assert_eq!(actual_name, name);
             let JsonValue::String(actual_type) = &col_obj["type"] else {
                 panic!("type must be a string");
             };
@@ -497,7 +565,7 @@ mod tests {
     /// （OID 25）へ写像すると psql・ドライバ・ORM・JSON クライアントが整数列を
     /// 文字列として扱ってしまうため是正）。
     #[test]
-    fn integer_and_bigint_columns_announce_int4_int8_oid_and_json_type() {
+    fn integer_and_bigint_columns_announce_nosql_type_names() {
         let columns = vec![
             ColumnMeta::Scalar {
                 name: "n".to_string(),
@@ -508,10 +576,8 @@ mod tests {
                 ty: ColumnType::BigInt,
             },
         ];
-        let expected: [(&str, i32, &str); 2] = [("n", 23, "int4"), ("b", 20, "int8")];
+        let expected: [(&str, &str); 2] = [("n", "integer"), ("b", "bigint")];
 
-        let row_description =
-            crate::result_encoder::encode_row_description(&columns).expect("encode");
         let result = QueryResult {
             columns,
             rows: Vec::new(),
@@ -522,28 +588,14 @@ mod tests {
             panic!("columns must be an array");
         };
 
-        let mut cursor = 1 + 4 + 2; // 'T' + length + field_count
-        for (i, (name, expected_oid, expected_type_name)) in expected.iter().enumerate() {
-            let name_end = row_description[cursor..]
-                .iter()
-                .position(|&b| b == 0)
-                .expect("NUL terminator");
-            let actual_name = std::str::from_utf8(&row_description[cursor..cursor + name_end])
-                .expect("utf8 name");
-            assert_eq!(&actual_name, name);
-            cursor += name_end + 1;
-            cursor += 4 + 2; // table_oid + attnum
-            let oid_bytes: [u8; 4] = row_description[cursor..cursor + 4]
-                .try_into()
-                .expect("4 bytes");
-            let oid = i32::from_be_bytes(oid_bytes);
-            assert_eq!(oid, *expected_oid, "column={name}");
-            cursor += 4; // type_oid
-            cursor += 2 + 4 + 2; // typlen + typmod + format
-
+        for (i, (name, expected_type_name)) in expected.iter().enumerate() {
             let JsonValue::Object(col_obj) = &json_columns[i] else {
                 panic!("column must be an object");
             };
+            let JsonValue::String(actual_name) = &col_obj["name"] else {
+                panic!("name must be a string");
+            };
+            assert_eq!(actual_name, name);
             let JsonValue::String(actual_type) = &col_obj["type"] else {
                 panic!("type must be a string");
             };
@@ -596,10 +648,16 @@ mod tests {
                 ty: ColumnType::Jsonb,
             },
         ];
+        // OID（第 2 要素）は SQL wire `RowDescription` 側 `column_wire_type`
+        // （Issue #895）の値。NoSQL 応答 `columns[].type`（第 3 要素）は
+        // Issue #896 以降 `nosql_type_name` が独立の対応表として返す値で
+        // あり、両者は列型によって意図的に異なる（`flag`: OID は
+        // `bool`（16）のまま、NoSQL 型名は `boolean` 等。モジュール doc
+        // 「独立の対応表」参照）。
         let expected: [(&str, i32, &str); 9] = [
-            ("flag", 16, "bool"),
-            ("r", 700, "float4"),
-            ("d", 701, "float8"),
+            ("flag", 16, "boolean"),
+            ("r", 700, "real"),
+            ("d", 701, "double precision"),
             ("dt", 1082, "date"),
             ("ts", 1114, "timestamp"),
             ("blob", 17, "bytea"),
@@ -621,7 +679,7 @@ mod tests {
         };
 
         let mut cursor = 1 + 4 + 2; // 'T' + length + field_count
-        for (i, (name, expected_oid, expected_type_name)) in expected.iter().enumerate() {
+        for (i, (name, expected_oid, expected_nosql_type_name)) in expected.iter().enumerate() {
             let name_end = row_description[cursor..]
                 .iter()
                 .position(|&b| b == 0)
@@ -645,7 +703,7 @@ mod tests {
             let JsonValue::String(actual_type) = &col_obj["type"] else {
                 panic!("type must be a string");
             };
-            assert_eq!(actual_type, expected_type_name, "column={name}");
+            assert_eq!(actual_type, expected_nosql_type_name, "column={name}");
         }
     }
 
@@ -881,6 +939,49 @@ mod tests {
         let body = encode(&result).expect("encode");
         assert!(body.contains(",\"row_count\":1}"));
         assert!(body.contains(&u64::MAX.to_string()));
+    }
+
+    /// `BIGINT`（`Cell::SignedInteger`）が `2^53-1` を超える場合は JSON 文字列
+    /// で送出し、以下は bare な JSON number のまま送出することを固定する
+    /// （Issue #896。JS 系クライアントの `Number.MAX_SAFE_INTEGER` 越え精度
+    /// 誤解の防止）。
+    #[test]
+    fn signed_integer_cell_beyond_max_safe_integer_is_stringified() {
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "b".to_string(),
+                ty: ColumnType::BigInt,
+            }],
+            rows: vec![
+                row(vec![Cell::SignedInteger(MAX_SAFE_INTEGER)]),
+                row(vec![Cell::SignedInteger(MAX_SAFE_INTEGER + 1)]),
+                row(vec![Cell::SignedInteger(-(MAX_SAFE_INTEGER + 1))]),
+                row(vec![Cell::SignedInteger(i64::MIN)]),
+            ],
+        };
+        let body = encode(&result).expect("encode");
+        let top = parse_top(&body);
+        let JsonValue::Array(rows) = &top["rows"] else {
+            panic!("rows must be an array");
+        };
+        let cell_of = |i: usize| -> &JsonValue {
+            let JsonValue::Array(cells) = &rows[i] else {
+                panic!("row must be an array");
+            };
+            &cells[0]
+        };
+        assert!(
+            matches!(cell_of(0), JsonValue::Number(n) if n.as_f64() == MAX_SAFE_INTEGER as f64)
+        );
+        assert_eq!(
+            cell_of(1),
+            &JsonValue::String((MAX_SAFE_INTEGER + 1).to_string())
+        );
+        assert_eq!(
+            cell_of(2),
+            &JsonValue::String((-(MAX_SAFE_INTEGER + 1)).to_string())
+        );
+        assert_eq!(cell_of(3), &JsonValue::String(i64::MIN.to_string()));
     }
 
     #[test]

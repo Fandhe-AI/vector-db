@@ -320,8 +320,19 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 ```
 
 - `VECTOR` 列は数値配列。`nullable` の宣言値に関わらず常に必須で、省略・`null`
-  はいずれも `22000`（省略・`null` が可能なのは nullable な `TEXT` 列限定）
-- 未知キー・次元不一致・型不一致は `22000`
+  はいずれも `22000`
+- 列型ごとの JSON 表現（Issue #896・NOSQL-17。`docs/design/
+  nosql-typed-json-binding.md` 参照）: `INTEGER`／`BIGINT` は JSON 整数
+  （小数・非数値は `42601`。範囲外は `22003`）、`REAL`／`DOUBLE PRECISION`
+  は JSON 数値（範囲外は `22003`）、`NUMERIC` は JSON 数値または数値文字列
+  （桁あふれは `22003`）、`BOOLEAN` は JSON 真偽値、`DATE`／`TIMESTAMP`／
+  `UUID` は JSON 文字列（形式不正はそれぞれ `22000`／`22000`／`22P02`）、
+  `TEXT[]`／`BOOLEAN[]` は JSON 配列（要素種別不一致は `42601`、要素数
+  超過は `54000`）。`TEXT`／`VECTOR`（旧来型）の型不一致のみ引き続き
+  `22000` を維持する（新型は `42601`。表層内の非対称は既知の制約）
+- 全型共通: `null` は列を省略したものとして扱う（nullable 列は `NULL`、
+  非 nullable 列は「値が提供されていない」として `22000`）
+- 未知キー・次元不一致・型不一致は `22000`（新型の型不一致は `42601`。上記参照）
 - 同一 `operation_id` の再送: 内容が一致すれば `23505`、不一致なら `22023`
   （台帳照合。TASK-101・RECOVER-10 の再送判定を透過する）
 - 同一テナント内の `id` 重複は `23505`（他テナントの同 `id` とは衝突せず、
@@ -360,7 +371,7 @@ USING OPERATION_ID`（SQL-17）と同一の実行器
 | --- | --- | --- | --- |
 | `op` | ○ | string | `"update"` |
 | `table` | ○ | string | |
-| `set` | ○ | object（任意キー・非空） | 列名をキーに持つ部分更新。`id`／`tenant_id`／`visibility` は `42601`。`TEXT` 列は JSON 文字列、`VECTOR` 列は数値配列（**文字列形のベクトルリテラルは受理しない**）のみ受理。型不一致・未知列・次元不一致は `22000` |
+| `set` | ○ | object（任意キー・非空） | 列名をキーに持つ部分更新。`id`／`tenant_id`／`visibility` は `42601`。`TEXT` 列は JSON 文字列、`VECTOR` 列は数値配列（**文字列形のベクトルリテラルは受理しない**）のみ受理。他の列型は `insert` と同じ JSON 表現（Issue #896・NOSQL-17。上記参照）。`null` は列型を問わず nullable 判定込みで `bind_update` へ委譲する（非 nullable 列への `null` は `22000`）。型不一致・未知列・次元不一致は `22000`（新型の型不一致は `42601`） |
 | `where` | △ | `{"id": number}` | 単一行・`id` 完全一致形。小数は `22000`、負数は `42601`（SQL 表層の字句解析・束縛とのパリティ。詳細は design doc 参照）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。指定のみ（`where` 欠落）だと `0A000`（実行器未接続） |
 | `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により内容一致 `23505`・不一致 `22023`（SQL 表層と共有） |
@@ -430,15 +441,31 @@ SQL 表層とのパリティ・RLS-9 応答同一性・台帳のプロセス・�
 [{"column": "lang", "op": "eq", "value": "ja"}]
 ```
 
-- 各要素は `column`・`op`・`value` の 3 つの必須文字列フィールドのみ
+- 各要素は `column`（文字列）・`op`（文字列）・`value`（文字列・数値・真偽値の
+  いずれか。Issue #896・NOSQL-17）の 3 つの必須フィールドのみ
 - `op` は `eq`（一致）・`prefix`（前方一致）の 2 語彙のみ（`or`・否定・範囲比較の
   構文は存在しない）。複数要素は常に AND 結合
 - 要素数は 256 個まで（超過は `54000`）
 - `column` にサーバー側 RLS 述語名相当（`visible`／`visible()`。大文字小文字
   非区別）を指定する経路は `42601`（RLS はサーバー側暗黙適用のみで、クライアント
   は述語を書けない）
-- 列名解決・未知列／`VECTOR` 列拒否（`22000`）は `engine::declarative_filter`
-  の既存契約をそのまま透過する
+- `eq` は対象列の型に応じたレーンへ振り分ける（Issue #896・NOSQL-17。詳細は
+  `docs/design/nosql-typed-json-binding.md`「filter（`eq` の型別レーン）」節
+  参照）: `TEXT`（旧来型。値・型不一致は `42601`。insert/update の「TEXT は旧来型
+  = `22000`」非対称は filter には適用しない）／`ENUM`（`42601`。語彙外は
+  `22P02`）／`BOOLEAN`（`42601`）／`DATE`・`TIMESTAMP`・`UUID`（`42601`。形式・
+  範囲は engine 側で検証）／`BYTEA`（base64 の JSON string。`42601`／`54000`。
+  復号後 4 MiB 超で `54000`——`insert`／`update`・SQL 表層
+  `WHERE bytea_col = '\x...'` と同じ実効上限（PR #1038 で hex 再エンコード後
+  長を検査していた過小上限を是正済み。詳細は
+  `docs/design/nosql-typed-json-binding.md`「BYTEA の実効長（PR #1038 是正）」節
+  参照）／
+  `NUMERIC`（数値または数値文字列。`42601`）。`INTEGER`／`BIGINT`／`REAL`／
+  `DOUBLE PRECISION` 列への `eq` は対象外（`0A000`。式レーンの入口が無いため。
+  Issue #945）
+- `prefix` は従来どおり `TEXT` 列限定（他の列型は `22000`）
+- 未知列・`VECTOR`／`ARRAY`／`JSON`／`JSONB` 列拒否（`22000`）は
+  `engine::declarative_filter` の既存契約をそのまま透過する
 
 検証コード: `crates/wire-server/tests/nosql7_filter_mapping.rs`。
 
@@ -479,10 +506,19 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 
 - キー順固定（`columns` → `rows` → `row_count`）・空白なし
 - `row_count` は常に `rows` の長さ
-- `columns[].type` は SQL 表層 `RowDescription` と同じ型名写像: 疑似列 `id` は
-  `"numeric"`、それ以外（実列・`VECTOR` 列・式項目）はすべて `"text"`
-  （型名は wire 側との一致を優先する一方、値そのものは native JSON——配列・
-  数値・真偽値・文字列——で返す。値表現を型名に合わせて文字列化してはいない）
+- `columns[].type` は列型ごとの名前を返す（Issue #896・NOSQL-17。SQL 表層
+  `RowDescription`（Issue #895）の OID 写像とは**独立**の対応表——SQL wire
+  側は後方互換のため多くの新型を `text`（OID 25）へ丸めるが、NoSQL の JSON
+  API は型情報をそのまま伝える）: 疑似列 `id`／式項目は `"numeric"`／
+  `"text"`（wire 側と一致）、それ以外は `"text"`／`"vector"`／`"integer"`／
+  `"bigint"`／`"real"`／`"double precision"`／`"boolean"`／`"date"`／
+  `"timestamp"`／`"numeric"`／`"uuid"`／`"bytea"`／`"json"`／`"jsonb"`／
+  `"enum"`／`"text[]"`／`"boolean[]"`（列型に対応）。値そのものは常に
+  native JSON（配列・数値・真偽値・文字列）で返し、値表現を型名に合わせて
+  文字列化してはいない
+- `BIGINT` の値（`Cell::SignedInteger`）は `±(2^53-1)` を超える場合のみ
+  JSON 文字列で送出する（Issue #896。JS 系クライアントの `JSON.parse` に
+  よる精度誤解を防ぐ。`id`／`COUNT` の値表現は不変のまま TASK-185 の担当）
 - `Cell::Vector` は `[1,2.5]` のような JSON 数値配列として返る
 - 非有限（`NaN`／`±Infinity`）な浮動小数は `null` に丸めず内部エラーとして
   fail-closed に拒否する（通常は engine 側の評価時点で `22000` になり到達しない）

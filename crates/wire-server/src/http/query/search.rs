@@ -440,20 +440,27 @@ pub const EXPLAIN_NOT_YET_SUPPORTED_MESSAGE: &str = "search explain is not yet a
 
 /// binder closure（`Fn(...) -> Result<_, SqlSurfaceError>`）の戻り値型に
 /// [`SearchError`] をそのまま渡せないため、`Bind`（engine 側の分類をそのまま
-/// 持つ）・`Filter(FilterError::Bind(_))`（`declarative_filter::bind_all` 由来。
-/// `22000`／`54000` 等の分類を保つ）は中身の [`SqlSurfaceError`] をそのまま
-/// 使う。それ以外（形状・排他判定・識別子形状・`filter` の演算子語彙／RLS
-/// 述語名違反等）はいずれも `SqlSurfaceError::UnsupportedSyntax` 自身と同じ
-/// 分類（`42601`）のため、その variant として復元してよい（`aggregate.rs::
-/// to_sql_surface_error` と同じ判断。[`EngineCore::
-/// execute_bound_search_in_session`]／[`EngineCore::
+/// 持つ）は中身の [`SqlSurfaceError`] をそのまま使う。`Filter` は
+/// [`FilterError::into_sql_surface_error`]（NOSQL-17。Issue #896。`Bind` 以外の
+/// 分類〔`54000`／`42601`／`22P02` 等〕も保ったまま `SqlSurfaceError` へ写像
+/// する単一の変換点）へ委譲する。それ以外（形状・排他判定・識別子形状等）は
+/// いずれも `SqlSurfaceError::UnsupportedSyntax` 自身と同じ分類（`42601`）の
+/// ため、その variant として復元してよい（`aggregate.rs::to_sql_surface_error`
+/// と同じ判断。[`EngineCore::execute_bound_search_in_session`]／[`EngineCore::
 /// execute_bound_plan_search_in_session`] は binder のエラーをそのまま
 /// 呼び出し元へ返す契約のため、[`execute`] 側の `From<SqlSurfaceError> for
 /// SearchError` により最終的な `wire_code`／`client_message` はここでの分類
 /// のまま保たれる）。
+///
+/// `FilterError::NumericFilterNotSupported`（`INTEGER`／`BIGINT`／`REAL`／
+/// `DOUBLE PRECISION` 列への `eq`）は `SqlSurfaceError::FeatureNotSupported`
+/// （`0A000`）としてこの closure 境界をそのまま通過する（レビュー指摘対応。
+/// 以前は対応する variant が無く `42601` へ縮退していた。
+/// `docs/design/nosql-typed-json-binding.md` 参照）。
 fn to_sql_surface_error(err: SearchError) -> SqlSurfaceError {
     match err {
-        SearchError::Bind(inner) | SearchError::Filter(FilterError::Bind(inner)) => inner,
+        SearchError::Bind(inner) => inner,
+        SearchError::Filter(filter_err) => filter_err.into_sql_surface_error(),
         other => SqlSurfaceError::UnsupportedSyntax {
             detail: other.client_message(),
         },
