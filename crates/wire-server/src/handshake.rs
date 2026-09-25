@@ -15,9 +15,9 @@
 
 use std::io::{self, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use engine::error_format::ErrorClass;
+use engine::error_format::{ClassifiedError, ErrorClass};
 
 use crate::auth::{self, base64_std, scram, AuthMethod, UserStore};
 use crate::framing::{self, FrameError};
@@ -273,9 +273,18 @@ fn write_parameter_status(stream: &mut TcpStream, name: &str, value: &str) -> Re
 /// バッファ組み立てを経由しない経路向け）。バイトレイアウトの実体は
 /// `crate::result_encoder::encode_ready_for_query`（Issue #481）に一元化した
 /// ―― 以前は本関数がレイアウトを個別に持っており、`crate::response_buffer::
-/// ResponseBuffer` へ他フレームと同じ形で積める関数が無かった。
-fn write_ready_for_query(stream: &mut TcpStream) -> Result<()> {
-    write_all(stream, &crate::result_encoder::encode_ready_for_query())
+/// ResponseBuffer` へ他フレームと同じ形で積める関数が無かった。`status` は
+/// 明示トランザクション（SQL-31・TASK-221・WIRE-19）の状態バイトへそのまま
+/// 写像する。呼び出し元に `SessionTransaction` が無い箇所（ハンドシェイク
+/// 直後）は `TransactionStatus::Idle` を渡す。
+fn write_ready_for_query(
+    stream: &mut TcpStream,
+    status: engine::sql::transaction::TransactionStatus,
+) -> Result<()> {
+    write_all(
+        stream,
+        &crate::result_encoder::encode_ready_for_query(status),
+    )
 }
 
 /// ErrorResponse（'E'）。SQLSTATE と英語メッセージのみを含む最小フィールド構成
@@ -295,8 +304,11 @@ pub(crate) fn write_error_response_io(
 /// `write_ready_for_query` の `io::Result` 版ラッパー。[`crate::simple_query`] は
 /// 本モジュール限定の `handshake::Result` を扱えないため、`ReadyForQuery` を
 /// 送出する唯一の経路としてこの関数を `pub(crate)` にする。
-pub(crate) fn write_ready_for_query_io(stream: &mut TcpStream) -> io::Result<()> {
-    write_ready_for_query(stream).map_err(io::Error::from)
+pub(crate) fn write_ready_for_query_io(
+    stream: &mut TcpStream,
+    status: engine::sql::transaction::TransactionStatus,
+) -> io::Result<()> {
+    write_ready_for_query(stream, status).map_err(io::Error::from)
 }
 
 /// バイト列組み立ては [`crate::error_response::encode`] に委譲する（`ErrorClass`
@@ -456,17 +468,63 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
 /// `engine::sql::mode::SessionState`（取得モード・宣言的 UDF レジストリ）で、
 /// いずれも本ループの全クエリを通じて 1 個の値を使い回す（`EngineCore` 自体は
 /// セッション状態を保持しない設計。`sql::mode` モジュールドキュメント参照）。
-fn post_auth_loop(
+fn post_auth_loop<'e>(
     stream: &mut TcpStream,
     ctx: &engine::policy::PolicyContext,
-    engine: Option<&engine::core::EngineCore>,
+    engine: Option<&'e engine::core::EngineCore>,
     session: &mut engine::sql::mode::SessionState,
+    txn: &mut Option<engine::sql::transaction::SessionTransaction<'e>>,
     extended: &mut crate::extended_query::ExtendedQueryState,
 ) -> Result<()> {
+    // 接続全体に設定済みの読み取りタイムアウト（WIRE-5。`server::accept_loop_*`
+    // が受理直後に設定する）。明示トランザクション中に一時的に切り詰めた後は
+    // 必ずこの値へ戻す（[`read_next_frame_header`] 参照）。
+    let base_timeout = stream.read_timeout()?;
+    let mut applied_timeout = base_timeout;
     loop {
-        let type_byte = match framing::read_typed_frame_header(stream)? {
-            Some(b) => b,
-            None => return Ok(()),
+        let type_byte =
+            match read_next_frame_header(stream, txn, base_timeout, &mut applied_timeout)? {
+                Some(b) => b,
+                None => return Ok(()),
+            };
+
+        // SQL-31・TASK-221（PR #1041 レビュー指摘）: 明示トランザクションの持続時間
+        // 上限を、要求の種類（Sync・Flush 等 SQL を伴わない要求を含む）を問わず
+        // 受信のたびに検査する。期限を過ぎていれば共有書き込みトランザクションを
+        // abort してライタを解放し `Failed` へ遷移させる（最初の文／`COMMIT` には
+        // `54000` が返る）。無通信の間の期限到達は [`read_next_frame_header`] が
+        // 受信待ちを期限で打ち切って同じ遷移を行う。
+        if let Some(txn) = txn.as_mut() {
+            txn.release_if_expired();
+            // 拡張クエリプロトコルのエラー後（`ignore_till_sync`）は、ループ末尾の
+            // 同じ検査に加えてここでも `Failed` へ遷移させる（ループ末尾へ到達しない
+            // `continue` 経路が将来追加されても取りこぼさないための多層防御）。
+            if extended.ignore_till_sync {
+                txn.fail();
+            }
+        }
+
+        // SQL-31・TASK-221（PR #1041 レビュー指摘）: `Active` の間は、型バイトに
+        // 続く長さ・本文の受信全体にも持続時間上限（と接続の読み取りタイムアウト）
+        // までの期限を課す。本文を少しずつ送り続けて上限後もライタを保持させる
+        // 経路を塞ぐためで、期限を過ぎたら応答を送らずに接続を閉じ（I/O エラー）、
+        // `SessionTransaction` の drop でライタを解放する。読み取り 1 回あたりの
+        // 待機は短い読み取りタイムアウトで区切り、期限の確認を
+        // `framing::FrameDeadlineGuard` が行う。次の反復の
+        // [`read_next_frame_header`] が読み取りタイムアウトを戻す。
+        let _frame_deadline = match txn.as_ref().and_then(|t| t.remaining_duration()) {
+            Some(remaining) => {
+                let budget = base_timeout.map_or(remaining, |b| remaining.min(b));
+                let poll = budget.min(FRAME_DEADLINE_POLL).max(MIN_BOUNDED_READ_WAIT);
+                if applied_timeout != Some(poll) {
+                    stream.set_read_timeout(Some(poll))?;
+                    applied_timeout = Some(poll);
+                }
+                Instant::now()
+                    .checked_add(budget)
+                    .map(framing::FrameDeadlineGuard::set)
+            }
+            None => None,
         };
 
         // WIRE-11 確定化（Issue #934）: 拡張クエリプロトコルのエラー後は
@@ -553,8 +611,12 @@ fn post_auth_loop(
                 // statement／portal は維持する（PostgreSQL と同じ挙動）。
                 extended.discard_unnamed_for_simple_query();
 
-                match engine {
-                    Some(engine) => {
+                // SQL-31・TASK-221: `engine` が `Some` の間は `txn` も `Some`
+                // （`post_auth_loop` 呼び出し元で対で構築する）。受信経路で
+                // `expect` に頼らず、万一片方だけ `Some` の場合は engine 未接続と
+                // 同じ fail-closed 分岐（`0A000`）へ倒す。
+                match (engine, txn.as_mut()) {
+                    (Some(engine), Some(txn)) => {
                         // Issue #939（WIRE-17・TASK-220）: `COPY ... FROM STDIN`／
                         // `COPY (...) TO STDOUT` は簡易クエリの通常の 1 往復応答
                         // ではなく CopyIn／CopyOut サブプロトコルを要するため、
@@ -563,6 +625,38 @@ fn post_auth_loop(
                         // 形状には含めない。見逃した場合は通常経路が `42601` で
                         // 拒否する fail-closed。モジュールドキュメント参照）。
                         if engine::sql::copy::is_copy_statement(text) {
+                            // SQL-31・TASK-221: 明示トランザクション中の COPY は
+                            // 未対応（`0A000`）。`crate::copy::run` へは委譲せず
+                            // トランザクションを Failed へ遷移させる
+                            // （`sql::transaction` モジュールドキュメント参照）。
+                            // `Failed` 中の COPY も autocommit として実行させず、
+                            // 他の文と同じく `25P02` で拒否する（`Idle` 以外は
+                            // `crate::copy::run` へ到達させない。PR #1041 レビュー
+                            // 指摘: `is_active()` のみの判定では `Failed` 中の
+                            // COPY が autocommit で永続化されていた）。
+                            match txn.status() {
+                                engine::sql::transaction::TransactionStatus::Idle => {}
+                                engine::sql::transaction::TransactionStatus::InTransaction => {
+                                    txn.fail();
+                                    write_error_response_io(
+                                        stream,
+                                        ErrorClass::FeatureNotSupported,
+                                        "COPY is not supported inside an explicit transaction",
+                                    )?;
+                                    write_ready_for_query_io(stream, txn.status())?;
+                                    continue;
+                                }
+                                engine::sql::transaction::TransactionStatus::Failed => {
+                                    let err = txn.take_failed_error();
+                                    write_error_response_io(
+                                        stream,
+                                        err.error_class(),
+                                        &err.client_message(),
+                                    )?;
+                                    write_ready_for_query_io(stream, txn.status())?;
+                                    continue;
+                                }
+                            }
                             // Issue #939 レビュー指摘（discussion_r4096720859）:
                             // COPY サブプロトコル中に Terminate（'X'）を受信した
                             // 場合、`crate::copy::run` はそれを消費するだけで
@@ -577,17 +671,20 @@ fn post_auth_loop(
                             }
                         } else {
                             crate::simple_query::execute_and_respond(
-                                stream, engine, ctx, session, text,
+                                stream, engine, ctx, session, txn, text,
                             )?;
                         }
                     }
-                    None => {
+                    _ => {
                         write_error_response(
                             stream,
                             ErrorClass::FeatureNotSupported,
                             "simple query execution is not yet implemented",
                         )?;
-                        write_ready_for_query(stream)?;
+                        write_ready_for_query(
+                            stream,
+                            engine::sql::transaction::TransactionStatus::Idle,
+                        )?;
                     }
                 }
             }
@@ -603,14 +700,14 @@ fn post_auth_loop(
                 // 自体が存在しないため、従来どおり `protocol_dispatch::
                 // reject_and_close`（`0A000` + 切断）へ倒す（WIRE-8 が Parse に
                 // 適用していた契約をそのまま維持）。
-                match engine {
-                    Some(engine) => {
-                        match crate::extended_query::handle_parse(stream, engine, extended)? {
+                match (engine, txn.as_mut()) {
+                    (Some(engine), Some(txn)) => {
+                        match crate::extended_query::handle_parse(stream, engine, txn, extended)? {
                             crate::extended_query::LoopSignal::Continue => {}
                             crate::extended_query::LoopSignal::Closed => return Ok(()),
                         }
                     }
-                    None => {
+                    _ => {
                         // `other` 分岐（WIRE-8）と同じく、`0A000` を返す前に長さ
                         // フィールド自体を検証する（malformed frame を正規の
                         // 未対応機能扱いにしない。レビュー指摘の回帰防止）。
@@ -656,14 +753,16 @@ fn post_auth_loop(
                     }
                 }
             }
-            b'B' => match engine {
-                Some(engine) => {
-                    match crate::extended_query::handle_bind(stream, engine, session, extended)? {
+            b'B' => match (engine, txn.as_mut()) {
+                (Some(engine), Some(txn)) => {
+                    match crate::extended_query::handle_bind(
+                        stream, engine, session, txn, extended,
+                    )? {
                         crate::extended_query::LoopSignal::Continue => {}
                         crate::extended_query::LoopSignal::Closed => return Ok(()),
                     }
                 }
-                None => {
+                _ => {
                     framing::validate_typed_message_length_prefix(
                         stream,
                         framing::MIN_TYPED_MESSAGE_LEN,
@@ -678,16 +777,22 @@ fn post_auth_loop(
                     return Ok(());
                 }
             },
-            b'E' => match engine {
-                Some(engine) => {
+            // SQL-31・TASK-221（Issue #942 codex-review 指摘対応）: `engine` が
+            // `Some` の間は `txn` も `Some`（`'Q'` 分岐と同じ不変条件。
+            // `post_auth_loop` 呼び出し元で対で構築する）。拡張クエリプロトコル
+            // 経由の Execute も簡易クエリと同一の `SessionTransaction` を共有し、
+            // `BEGIN`/`COMMIT`/`ROLLBACK` を受理できるようにする。片方だけ
+            // `Some` の場合は engine 未接続と同じ fail-closed 分岐へ倒す。
+            b'E' => match (engine, txn.as_mut()) {
+                (Some(engine), Some(txn)) => {
                     match crate::extended_query::handle_execute(
-                        stream, engine, ctx, session, extended,
+                        stream, engine, ctx, session, txn, extended,
                     )? {
                         crate::extended_query::LoopSignal::Continue => {}
                         crate::extended_query::LoopSignal::Closed => return Ok(()),
                     }
                 }
-                None => {
+                _ => {
                     framing::validate_typed_message_length_prefix(
                         stream,
                         framing::MIN_TYPED_MESSAGE_LEN,
@@ -703,10 +808,20 @@ fn post_auth_loop(
                 }
             },
             b'S' => match engine {
-                Some(_engine) => match crate::extended_query::handle_sync(stream, extended)? {
-                    crate::extended_query::LoopSignal::Continue => {}
-                    crate::extended_query::LoopSignal::Closed => return Ok(()),
-                },
+                Some(_engine) => {
+                    // `engine` が `Some` の間は `txn` も `Some`（他の拡張クエリ
+                    // 分岐と同じ不変条件）。万一片方だけの場合は fail-closed に
+                    // `Idle` を送出する（`TransactionStatus::Idle` は既存の
+                    // 固定 `'I'` 送出と同じ安全側の既定値）。
+                    let txn_status = txn
+                        .as_ref()
+                        .map(|t| t.status())
+                        .unwrap_or(engine::sql::transaction::TransactionStatus::Idle);
+                    match crate::extended_query::handle_sync(stream, extended, txn_status)? {
+                        crate::extended_query::LoopSignal::Continue => {}
+                        crate::extended_query::LoopSignal::Closed => return Ok(()),
+                    }
+                }
                 None => {
                     framing::validate_typed_message_length_prefix(
                         stream,
@@ -783,6 +898,109 @@ fn post_auth_loop(
                 return Ok(());
             }
         }
+
+        // SQL-31・TASK-221（PR #1041 レビュー指摘）: 拡張クエリプロトコルの
+        // Parse／Bind／Describe／Execute 等でエラー応答を返した場合
+        // （`ignore_till_sync` が立つ）、明示トランザクション中なら種類を問わず
+        // `Failed` へ遷移させる（PostgreSQL と同じ）。`Active` のまま残すと後続の
+        // `COMMIT` が先行する書き込みを永続化してしまう。`fail` は `Active` 以外
+        // では何もしないため、トランザクション外・既に `Failed` の挙動は不変。
+        if extended.ignore_till_sync {
+            if let Some(txn) = txn.as_mut() {
+                txn.fail();
+            }
+        }
+    }
+}
+
+/// 読み取りタイムアウトの切り詰め後に設定する最小値（`set_read_timeout` は
+/// `Duration::ZERO` を受け付けないため、残り時間が 0 でもこの値で待つ）。
+const MIN_BOUNDED_READ_WAIT: Duration = Duration::from_millis(1);
+
+/// `Active` な明示トランザクション中にフレームの長さ・本文を受信する間の、
+/// 読み取り 1 回あたりの待機上限（この間隔で `framing::FrameDeadlineGuard` の
+/// 期限を確認する。期限超過の検出遅れの上限でもある）。
+const FRAME_DEADLINE_POLL: Duration = Duration::from_millis(100);
+
+/// [`post_auth_loop`] が次の要求の型バイトを待つ（SQL-31・TASK-221。PR #1041
+/// レビュー指摘）。
+///
+/// 明示トランザクションが `Active`（共有書き込みトランザクション＝単一ライタを
+/// 保持中）の間は、受信待ちの読み取りタイムアウトを「持続時間上限までの残り
+/// 時間」と接続の読み取りタイムアウト（`base_timeout`。WIRE-5）の小さい方へ
+/// 切り詰める。期限到達でタイムアウトした場合は
+/// `engine::sql::transaction::SessionTransaction::release_if_expired` で abort
+/// してライタを解放し（応答は送らない。受信のたびの検査と同じく、次の文／
+/// `COMMIT` に `54000` が返る）、接続は維持したまま受信待ちを続ける。これにより
+/// 無通信のクライアントが上限を超えてライタを占有し続けることはない。
+///
+/// - `Failed` は既にライタを解放済みのため切り詰めの対象外（`Idle` と同じく
+///   `base_timeout` のまま待つ。この経路はシステムコールを追加しない）。
+/// - WIRE-5 の無通信上限は不変: 期限到達後の再待機は、この関数へ入った時点から
+///   の経過時間を差し引いた `base_timeout` の残りで待ち、尽きたら通常の読み取り
+///   タイムアウトと同じ I/O エラー（応答なしで切断）を返す。
+/// - 型バイトを受信できたら `base_timeout` へ戻す（ここでの打ち切りはフレームの
+///   境界でだけ行う）。`Active` の間の長さ・本文の受信は、[`post_auth_loop`] が
+///   `framing::FrameDeadlineGuard` でフレーム全体の期限を課す（期限超過は接続を
+///   閉じてライタを解放する）。`applied` は現在ソケットに設定中の値で、変更が
+///   必要なときだけ `set_read_timeout` を呼ぶ。
+fn read_next_frame_header(
+    stream: &mut TcpStream,
+    txn: &mut Option<engine::sql::transaction::SessionTransaction<'_>>,
+    base_timeout: Option<Duration>,
+    applied: &mut Option<Duration>,
+) -> Result<Option<u8>> {
+    let waiting_since = Instant::now();
+    let mut deadline_reached = false;
+    loop {
+        if let Some(t) = txn.as_mut() {
+            t.release_if_expired();
+        }
+        let txn_remaining = txn.as_ref().and_then(|t| t.remaining_duration());
+        let base_part = if deadline_reached {
+            match base_timeout {
+                Some(t) => {
+                    let rest = t.saturating_sub(waiting_since.elapsed());
+                    if rest.is_zero() {
+                        return Err(HandshakeError::Io(io::Error::from(io::ErrorKind::TimedOut)));
+                    }
+                    Some(rest)
+                }
+                None => None,
+            }
+        } else {
+            base_timeout
+        };
+        let (desired, bounded_by_txn) = match (base_part, txn_remaining) {
+            (Some(b), Some(r)) if r < b => (Some(r.max(MIN_BOUNDED_READ_WAIT)), true),
+            (None, Some(r)) => (Some(r.max(MIN_BOUNDED_READ_WAIT)), true),
+            (b, _) => (b, false),
+        };
+        if *applied != desired {
+            stream.set_read_timeout(desired)?;
+            *applied = desired;
+        }
+        match framing::read_typed_frame_header(stream) {
+            Ok(header) => {
+                if *applied != base_timeout {
+                    stream.set_read_timeout(base_timeout)?;
+                    *applied = base_timeout;
+                }
+                return Ok(header);
+            }
+            Err(FrameError::Io(e))
+                if bounded_by_txn
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+            {
+                // 期限到達（またはタイマ粒度による直前の早期起床）。次の反復の
+                // 先頭で `release_if_expired` が abort・ライタ解放を行う。
+                deadline_reached = true;
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 
@@ -829,7 +1047,9 @@ fn respond_and_close(
 /// 読み取りタイムアウト（`limits::READ_TIMEOUT`）は呼び出し元の
 /// `server::accept_loop_with_limiter` が受理直後に一度だけソケットへ設定済み
 /// であり、本関数はそれを認証前後で変更しない（WIRE-5: 接続全体に同一の期限を
-/// 適用する）。タイムアウト由来の `io::Error`（`TimedOut` / `WouldBlock`）は
+/// 適用する）。例外は明示トランザクションが `Active` の間の要求待ちで、持続時間
+/// 上限の残り時間へ一時的に切り詰める（無通信の上限そのものは不変。
+/// [`read_next_frame_header`] 参照。SQL-31・TASK-221）。タイムアウト由来の `io::Error`（`TimedOut` / `WouldBlock`）は
 /// ここで捕捉して ErrorResponse を書くことはせず、そのまま `Err` として
 /// 呼び出し元へ返す（応答なしでクローズすることが WIRE-5 の契約）。
 ///
@@ -1059,11 +1279,19 @@ fn handle_connection_inner(
     write_backend_key_data(&mut stream, pid, secret)?;
     write_parameter_status(&mut stream, "server_version", "14.0")?;
     write_parameter_status(&mut stream, "client_encoding", "UTF8")?;
-    write_ready_for_query(&mut stream)?;
+    write_ready_for_query(
+        &mut stream,
+        engine::sql::transaction::TransactionStatus::Idle,
+    )?;
 
     // 接続単位のセッション状態（取得モード・宣言的 UDF レジストリ）。
     // `EngineCore` 自体は保持しない（`sql::mode` モジュールドキュメント参照）。
     let mut session = engine::sql::mode::SessionState::default();
+    // 接続単位の明示トランザクション状態（SQL-31・TASK-221）。`session` と同じく
+    // 接続終了（drop）で破棄する ―― 未 commit のまま接続が切れた場合、保持中の
+    // 共有 `redb::WriteTransaction` は commit されずに abort され、単一ライタの
+    // 占有（`writer_gate::WriterPermit`）も解放される。
+    let mut txn = engine.map(|e| e.new_session_transaction());
     // SQL-23・TASK-202・TASK-203（Issue #899・#902）: DDL 実行権限
     // （`CREATE TABLE`・`DROP TABLE` 共通）は認証成功後（＝`username` が
     // 確定した時点）に 1 回だけ付与する。`PolicyContext`（`ctx`）はテナント ID・
@@ -1078,7 +1306,14 @@ fn handle_connection_inner(
     // テナント間で共有しない（`extended_query` モジュールドキュメント参照）。
     let mut extended = crate::extended_query::ExtendedQueryState::new();
 
-    match post_auth_loop(&mut stream, &ctx, engine, &mut session, &mut extended) {
+    match post_auth_loop(
+        &mut stream,
+        &ctx,
+        engine,
+        &mut session,
+        &mut txn,
+        &mut extended,
+    ) {
         Ok(()) => Ok(()),
         Err(e) => respond_and_close(&mut stream, e, "invalid message frame"),
     }
@@ -1291,6 +1526,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(result.is_err(), "empty query body must be rejected");
@@ -1317,6 +1553,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(result.is_err(), "embedded NUL in query must be rejected");
@@ -1343,6 +1580,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(
@@ -1371,6 +1609,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(result.is_ok(), "well-formed Terminate must succeed");
@@ -1400,6 +1639,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             match result {
@@ -1437,6 +1677,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             match result {
@@ -1473,6 +1714,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(

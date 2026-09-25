@@ -193,7 +193,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 20] = [
+const EXPECTED_STATUS: [(&str, u16); 25] = [
     ("22000", 400),
     ("28P01", 401),
     ("28000", 401),
@@ -212,6 +212,11 @@ const EXPECTED_STATUS: [(&str, u16); 20] = [
     ("22023", 400),
     ("22008", 400),
     ("22P02", 400),
+    ("55P03", 503),
+    ("25000", 400),
+    ("25001", 400),
+    ("25P01", 400),
+    ("25P02", 400),
     ("42P07", 409),
     ("42701", 400),
 ];
@@ -272,7 +277,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 21);
+const _: () = assert!(ErrorClass::ALL.len() == 26);
 
 /// `23502` を共有する分類（ERR-6・TABLE-16・TASK-204、Issue #904）。
 /// [`err4_projection_table_is_closed_over_all_error_classes`] がこの組にだけ
@@ -662,8 +667,10 @@ fn err4_f_internal_error_projects_xx000_to_500() {
     assert_projected(&resp, "XX000");
 }
 
-/// `42501`（テナント越境）・`P0002`（行不在）は NoSQL 表層の実要求からは
-/// 構造的に到達不能（本ファイル冒頭 doc 参照）。要求駆動ではなく、
+/// `42501`（テナント越境）・`P0002`（行不在）・明示トランザクション制御
+/// （SQL-31・TASK-221。`25000`/`25001`/`25P01`/`25P02`）は NoSQL 表層の
+/// 実要求からは構造的に到達不能（本ファイル冒頭 doc 参照。NoSQL 表層の `op`
+/// 許可リストにトランザクション制御が無い）。要求駆動ではなく、
 /// production の応答エンコーダ（[`wire_server::http::response::encode_error`]。
 /// ルータ・各 op ハンドラが実際に使う関数）を通したバイト列を実応答と同じ
 /// パーサで解析し、射影のみを検証する。
@@ -673,15 +680,38 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
     // Issue #899）は SQL 表層専用の `CREATE TABLE` 分類であり、NoSQL 表層の
     // `op` 許可リストに `create_table` 相当が存在しないため実要求からは
     // 構造的に到達不能（`ForbiddenTenantMismatch`・`RowNotFound` と同じ理由）。
+    // 明示トランザクション（SQL-31・TASK-221）の状態エラーも、NoSQL 表層の
+    // `op` 語彙にトランザクション制御が無いため同様に到達不能。
     for class in [
         ErrorClass::ForbiddenTenantMismatch,
         ErrorClass::RowNotFound,
         ErrorClass::DuplicateTable,
         ErrorClass::DuplicateColumn,
+        ErrorClass::InvalidTransactionState,
+        ErrorClass::ActiveSqlTransaction,
+        ErrorClass::NoActiveSqlTransaction,
+        ErrorClass::InFailedSqlTransaction,
     ] {
         let raw =
             wire_server::http::response::encode_error(class, "test message", SystemTime::now());
         let resp = http_common::parse_single_response(&raw);
         assert_projected(&resp, class.wire_code());
     }
+}
+
+/// `55P03`（書き込みゲートの待機上限超過。SQL-31・TASK-221）は到達不能では
+/// ない: SQL 表層の明示トランザクションが単一ライタを保持している間に NoSQL
+/// 表層の書き込み op（`insert`／`update`／`delete`）が待機上限を超えると
+/// `TenantWriteError::WriteLockTimeout` → `LOCK_NOT_AVAILABLE` として返る。
+/// 再現には待機上限の経過を要するため、射影（503）は production の応答
+/// エンコーダ経由で固定する。
+#[test]
+fn err4_lock_not_available_projects_to_service_unavailable() {
+    let raw = wire_server::http::response::encode_error(
+        ErrorClass::LockNotAvailable,
+        "test message",
+        SystemTime::now(),
+    );
+    let resp = http_common::parse_single_response(&raw);
+    assert_projected(&resp, "55P03");
 }

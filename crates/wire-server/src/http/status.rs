@@ -37,6 +37,10 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         ErrorClass::InternalError => 500,
         ErrorClass::FeatureNotSupported => 501,
         ErrorClass::ConnectionLimitExceeded => 503,
+        // 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有によるロック
+        // 待ちタイムアウト。NoSQL 表層からは `insert`／`update`／`delete` op が
+        // 待たされて到達しうる（一時的なサーバー側の輻輳として 503 に射影する）。
+        ErrorClass::LockNotAvailable => 503,
         ErrorClass::ProtocolViolation
         | ErrorClass::UnsupportedSqlSyntax
         | ErrorClass::InvalidInput
@@ -48,6 +52,13 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // `DuplicateColumn`（`42701`。Issue #899）は `CREATE TABLE` の列リスト
         // 自体が不正という構文的な分類のため、他の 42xxx 系と同じ 400 とする。
         | ErrorClass::DuplicateColumn
+        // トランザクション状態エラー（SQL-31・TASK-221）は NoSQL 表層の `op` 語彙に
+        // トランザクション制御が無く構造的に到達しないが、`ErrorClass` の網羅性の
+        // ため他の `42601`／`22000` 系と同じ 400 へ寄せる。
+        | ErrorClass::InvalidTransactionState
+        | ErrorClass::ActiveSqlTransaction
+        | ErrorClass::NoActiveSqlTransaction
+        | ErrorClass::InFailedSqlTransaction
         // `NotNullViolation`（`23502`。TABLE-16・TASK-204、Issue #904）は
         // `wire_code` を共有する `MissingOperationId` と同じくクライアント側の
         // 入力不備であり 400 とする。
@@ -61,7 +72,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 21] = [
+    const EXPECTED: [(ErrorClass, u16); 26] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -80,6 +91,11 @@ mod tests {
         (ErrorClass::OperationIdContentMismatch, 400),
         (ErrorClass::DatetimeFieldOverflow, 400),
         (ErrorClass::InvalidTextRepresentation, 400),
+        (ErrorClass::LockNotAvailable, 503),
+        (ErrorClass::InvalidTransactionState, 400),
+        (ErrorClass::ActiveSqlTransaction, 400),
+        (ErrorClass::NoActiveSqlTransaction, 400),
+        (ErrorClass::InFailedSqlTransaction, 400),
         (ErrorClass::DuplicateTable, 409),
         (ErrorClass::DuplicateColumn, 400),
         (ErrorClass::NotNullViolation, 400),

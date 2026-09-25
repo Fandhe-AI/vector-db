@@ -71,8 +71,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #865（PR #989 マージ）で `MAX_METADATA_LEN` のドキュメンテーション
     // コメントが `pub(crate)` 化に伴い増量し、行番号がさらに移動したための追随
     // （旧: 648／679）。
-    ("storage.rs", 652),
-    ("storage.rs", 683),
+    // Issue #942（SQL-31・TASK-221。`writer_gate` choke point 追加）で
+    // `Storage::put`/`Storage::put_batch` の行番号がさらに移動したための追随
+    // （旧: 652／683）。
+    ("storage.rs", 804),
+    ("storage.rs", 835),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 191),
     ("txn.rs", 362),
@@ -112,14 +115,35 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // v4 カタログ形式）に行が追加され、再度追随（旧: 2225／2304）。同 Issue の
     // レビュー対応（`hex_decode` の添字直接アクセス撤去。fail-closed な
     // `get()` ベースへの書き換え）でさらに 10 行増え、再度追随
-    // （旧: 2541／2620）。
-    ("catalog.rs", 2551),
+    // （旧: 2541／2620）。Issue #942（SQL-31・TASK-221。`convert_storage_error`
+    // ドキュメント拡充）の base 取り込みマージで行番号がさらに移動したための
+    // 追随（旧: 2551）。
+    ("catalog.rs", 2565),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（`alter_enum_type_add_value` の commit 呼び出しは
     // 依存テーブルの世代を明示的に進行させるため ALLOWLIST 対象外のまま）。
-    ("catalog.rs", 2630),
+    ("catalog.rs", 2644),
+    // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
+    // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
+    // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_
+    // unchecked`／`truncate_table_unchecked` の `WriteTarget::InTxn` 経路）が
+    // 既に同一 `write_txn` 内で `bump_table_generation_in_txn` を呼び終えている
+    // （`sql/exec.rs::execute_insert_with_schema_in`／`execute_truncate_in` →
+    // `tenant.rs` 各関数のドキュメント参照）。本呼び出し箇所自体は複数文を
+    // まとめて確定させるだけで、新たな `user_rows/{table}` 書き込みを行わない。
+    ("sql/transaction.rs", 248),
+    // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
+    // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
+    // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を
+    // 共有するための choke point）: この汎用ヘルパー自身は `f`（呼び出し元が
+    // 渡すクロージャ）を実行してから commit するだけで、`user_rows/{table}` へ
+    // 直接触れない。近傍走査（テキスト上の近さ）では検出できないが、`f` を渡す
+    // 4 呼び出し元はいずれも自分のクロージャの最後で
+    // `bump_table_generation_in_txn` を呼んでから `Ok(())` を返すことを目視で
+    // 確認済み（各関数のドキュメントコメント参照）。
+    ("tenant.rs", 397),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

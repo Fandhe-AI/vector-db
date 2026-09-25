@@ -545,8 +545,15 @@ pub fn expect_empty_query_response(stream: &mut TcpStream) {
 }
 
 /// `ReadyForQuery`（'Z'）を読み切る（`status` バイトの中身は検証しない呼び出し側
-/// 向けの簡便ヘルパー）。
+/// 向けの簡便ヘルパー）。トランザクション状態バイトを検証したい呼び出し側は
+/// [`read_ready_for_query_status`] を使う。
 pub fn read_ready_for_query(stream: &mut TcpStream) {
+    let _status = read_ready_for_query_status(stream);
+}
+
+/// `ReadyForQuery`（'Z'）を読み切り、トランザクション状態バイト
+/// （`'I'`／`'T'`／`'E'`）を返す（WIRE-19・SQL-31・TASK-221）。
+pub fn read_ready_for_query_status(stream: &mut TcpStream) -> u8 {
     let mut header = [0u8; 1];
     stream.read_exact(&mut header).expect("read type");
     assert_eq!(header[0], b'Z', "expected ReadyForQuery");
@@ -555,6 +562,7 @@ pub fn read_ready_for_query(stream: &mut TcpStream) {
     let len = i32::from_be_bytes(len_buf) as usize;
     let mut body = vec![0u8; len - 4];
     stream.read_exact(&mut body).expect("read body");
+    *body.last().expect("ReadyForQuery body has a status byte")
 }
 
 // ---------------------------------------------------------------------------

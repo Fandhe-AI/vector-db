@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
 
 define_error_classes! {
-    count = 21;
+    count = 26;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -179,6 +179,26 @@ define_error_classes! {
     /// 対し、本分類は「値は文字列として妥当だが、宣言済み型が定める表現の集合に
     /// 属さない」ことを表す（PostgreSQL の `invalid_text_representation` と同じ区別）。
     InvalidTextRepresentation => ("22P02", "INVALID_TEXT_REPRESENTATION"),
+    /// 明示トランザクション（SQL-31・TASK-221）内で発生した一般的な状態不整合
+    /// （`25000`）。同一トランザクション内での `operation_id` 再利用など、他の
+    /// より具体的な分類に属さないトランザクション状態エラーに使う。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidTransactionState`] の写像。
+    InvalidTransactionState => ("25000", "INVALID_TRANSACTION_STATE"),
+    /// `Active` なトランザクション中に再度 `BEGIN` を送った（`25001`）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::ActiveSqlTransaction`] の写像。
+    ActiveSqlTransaction => ("25001", "ACTIVE_SQL_TRANSACTION"),
+    /// `Idle`（トランザクション外）で `COMMIT`／`ROLLBACK` を送った（`25P01`）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction`] の写像。
+    NoActiveSqlTransaction => ("25P01", "NO_ACTIVE_SQL_TRANSACTION"),
+    /// `Failed` なトランザクション中に `ROLLBACK` 以外の文を送った（`25P02`）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InFailedSqlTransaction`] の写像。
+    InFailedSqlTransaction => ("25P02", "IN_FAILED_SQL_TRANSACTION"),
+    /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
+    /// トランザクションの取得がロック待ちの上限を超過した（`55P03`）。
+    /// [`crate::storage::StorageError::WriteLockTimeout`]・
+    /// [`crate::catalog::CatalogError::WriteLockTimeout`]・
+    /// [`crate::sql::allowlist::SqlSurfaceError::LockNotAvailable`] の写像。
+    LockNotAvailable => ("55P03", "LOCK_NOT_AVAILABLE"),
     /// `CREATE TABLE` が指定したテーブル名が既に存在する（`42P07`）。TABLE-4・
     /// TASK-85（Issue #899）が追加。上書きしない設計（既存スキーマは変更されない）。
     /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateTable`] の写像。
