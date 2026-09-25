@@ -124,6 +124,12 @@ sql-create-table.md` 参照）のため、`DEFAULT` が実質的に使えるの�
   （`tenant::insert_typed_rows_unchecked` の既存契約により nullable の値に
   関わらず常に必須。`DEFAULT` は適用対象外のまま）を除き、
   `InsertLiteral::Null` として `bind_insert` へそのまま渡すよう変更した。
+  `VECTOR` 列専用の必須判定ループ自体は `fill_omitted_columns` を経由しない
+  ため、`wire_code` は列の `nullable` で分岐させている: 非 nullable な
+  `VECTOR` 列の省略は SQL 表層（`fill_omitted_columns`）と同じ `23502`
+  （`NotNullViolation`）、nullable な `VECTOR` 列の省略（PR #823 が導入した
+  NoSQL 表層固有の「VECTOR は nullable でも常に必須」という別ルール。NOT
+  NULL 違反ではない）は従来どおり `22000` のまま維持する。
 
 `operation_id` の内容照合ハッシュ（RECOVER-10。`content_hash::
 for_typed_insert`／`for_typed_insert_batch`）は束縛後（`DEFAULT` 適用後）の
