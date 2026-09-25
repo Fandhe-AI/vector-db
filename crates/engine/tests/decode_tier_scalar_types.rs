@@ -130,7 +130,7 @@ fn as_integer(cell: &Cell) -> u64 {
 // --- 受入条件 1・3: Fast/DimAndScalar/Embedding 3 段の正しさ -----------------
 
 #[test]
-fn count_star_min_date_sum_integer_avg_numeric_match_visible_only_oracle() {
+fn count_star_count_uuid_min_date_sum_integer_match_visible_only_oracle() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");

@@ -4979,6 +4979,24 @@ mod tests {
     }
 
     #[test]
+    fn masked_unwanted_date_out_of_range_is_rejected() {
+        // 日時の値域検証（`crate::datetime::validate_date_days`）も、非要求列
+        // （マスク false）で省略しない。`encode_scalar_columns` は範囲外の
+        // `Value::Date` を拒否するため、decode 側の検証を独立に固定するには
+        // バイト列を直接組み立てる必要がある。
+        let schema = TableSchema::new("docs", vec![ColumnDef::new("dt", ColumnType::Date, false)]);
+        let mut buf = Vec::new();
+        buf.push(PRESENCE_VALUE);
+        let out_of_range_days = crate::datetime::DATE_MAX_DAYS + 1;
+        buf.extend_from_slice(&out_of_range_days.to_le_bytes());
+        let mask = [false];
+        assert!(matches!(
+            scan_scalar_columns_masked(&schema, &buf, Some(&mask)),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn masked_unwanted_all_scalar_types_trailing_bytes_are_rejected() {
         let schema = all_scalar_types_schema();
         let values = all_scalar_types_values();

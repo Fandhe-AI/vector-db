@@ -224,7 +224,12 @@ production コードとして既に実装されていた（#892 で集計本体�
   （ENUM を除く。後述）での単一ビットマスク総当たり（対象列だけが値化され他は
   `None`・全 false／全 true マスクの境界）、非要求列でも構造・値域検証を省略しない
   こと（REAL の NaN・BOOLEAN の未知バイト・NUMERIC の precision 超過・INTEGER の
-  途中打ち切り・全新型スキーマでの末尾余剰バイト）
+  途中打ち切り・DATE の値域超過・全新型スキーマでの末尾余剰バイト。BYTEA/JSON/
+  ARRAY・ENUM の同種契約は個別のバイト単位テストとしては追加していないが、
+  上記の単一ビットマスク総当たり・末尾余剰バイトテストは全新型スキーマ〔ENUM を
+  除く〕に対して行毎に構造検証を通しており、`scan_scalar_columns_validated` の
+  各型別 `match` 分岐はいずれも `wanted` の分岐より前に検証を完了させる実装で
+  あることをコードリーディングで確認した）
 - `crates/engine/tests/decode_tier_scalar_types.rs`（新設）: `EngineCore::execute_sql`
   経由で `COUNT(*)`（Fast）・`COUNT(u)`/`MIN(dt)`/`SUM(i)`（DimAndScalar）・
   `GROUP BY lang` ＋新型集計・広域取得 `SELECT id, i, u, dt FROM ... LIMIT` が、
