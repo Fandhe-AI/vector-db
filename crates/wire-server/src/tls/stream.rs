@@ -209,8 +209,18 @@ impl<S: WireStream> Read for TlsStream<S> {
                     // レコードがそろっていない: 生バイト列を追加で読む。
                     let n = self.fill_from_inner()?;
                     if n == 0 {
-                        // 相手が close_notify なしで切断した。`finish` で
-                        // 未消費の部分レコードが残っていれば truncation。
+                        // 相手が close_notify なしで切断した。未消費の部分
+                        // レコードが残っていれば truncation（暗号文の途中
+                        // 切断）であり、正常な EOF（`Ok(0)`）として扱わず
+                        // 破損状態へ倒す（fail-closed）。相手は既に送信側を
+                        // 閉じているため alert は送り返さない。
+                        if self.rx.finish().is_err() {
+                            self.failed = true;
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "TLS record truncated by peer EOF",
+                            ));
+                        }
                         self.eof = true;
                         return Ok(0);
                     }
@@ -577,6 +587,64 @@ mod tests {
     /// 改ざんした暗号文を実際に読ませて固定する。読み手は `InvalidData` を
     /// 返し、送り手側の生ソケットには fatal alert（レコードヘッダの先頭
     /// バイトは `ContentType::Alert` = 0x15）が届く。
+    /// 部分レコードを送った直後に相手が close_notify なしで切断した場合、
+    /// 正常な EOF（`Ok(0)`）ではなくエラーとして扱い、以後の読み取りも
+    /// 失敗し続けること（truncation の fail-closed。PR #1056 レビュー指摘）。
+    #[test]
+    fn truncated_record_at_eof_fails_closed_instead_of_clean_eof() {
+        let (mut server_sock, client_sock) = loopback_pair();
+        let (mut server_session, client_session) = test_session_pair();
+        let mut client = TlsStream::new(client_sock, client_session);
+
+        let records = server_session
+            .seal_application_data(b"cut in the middle")
+            .expect("seal");
+        let mut wire = Vec::new();
+        for record in &records {
+            record
+                .serialize_into(&mut wire, RecordKind::Ciphertext)
+                .expect("serialize");
+        }
+        let cut = wire.len() / 2;
+        server_sock
+            .write_all(wire.get(..cut).expect("prefix"))
+            .expect("write partial record");
+        server_sock
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let mut buf = [0u8; 64];
+        let err = client
+            .read(&mut buf)
+            .expect_err("truncated record must not be a clean EOF");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let again = client
+            .read(&mut buf)
+            .expect_err("stream must stay failed after truncation");
+        assert_eq!(again.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// バッファが空のまま close_notify なしで切断された場合は従来どおり
+    /// `Ok(0)`（上位の pg wire 層が切断として扱う）を返すこと。
+    #[test]
+    fn eof_on_record_boundary_is_clean_eof() {
+        let (server_sock, client_sock) = loopback_pair();
+        let (_server_session, client_session) = test_session_pair();
+        let mut client = TlsStream::new(client_sock, client_session);
+        server_sock
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let mut buf = [0u8; 64];
+        assert_eq!(client.read(&mut buf).expect("clean eof"), 0);
+    }
+
     #[test]
     fn corrupted_ciphertext_sends_fatal_alert_and_fails_closed() {
         let (mut server_sock, client_sock) = loopback_pair();
