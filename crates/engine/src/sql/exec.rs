@@ -3367,6 +3367,12 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
         // 判別できなくなる。
         TenantWriteError::DuplicateOperationId => SqlSurfaceError::DuplicateOperationId,
         TenantWriteError::OperationIdContentMismatch => SqlSurfaceError::OperationIdContentMismatch,
+        // 明示トランザクション（SQL-31・TASK-221）が `writer_gate` を保持している間、
+        // 別セッションの自動コミット INSERT/UPDATE/DELETE/TRUNCATE が待機タイムアウト
+        // した（`55P03`）。`_` 節（`XX000`）へ丸めると、クライアントがリトライ可能な
+        // ロック競合とサーバー内部エラーを判別できなくなる。`catalog::table_lookup_error`・
+        // `tenant::ClassifiedError` と同じ写像先（codex-review 指摘）。
+        TenantWriteError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
         // `RETURNING` 句（Issue #873・SQL-21）の捕捉行投影が容量上限超過で失敗した
         // （[`execute_delete_returning`] の `project` コールバック。commit **前**に
         // 検出し `write_txn` を abort させる設計のため、この写像に到達する時点で

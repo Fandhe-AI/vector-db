@@ -393,3 +393,76 @@ fn dropping_an_active_transaction_without_commit_leaves_no_trace() {
         other => panic!("expected Query, got {other:?}"),
     }
 }
+
+/// [`new_core`] と同一だが、`Storage::with_write_lock_wait` で `writer_gate`
+/// 待機上限を短く設定する（codex-review 指摘・Issue #942。`map_write_error`
+/// 〔`sql/exec.rs`〕が `TenantWriteError::WriteLockTimeout` を `55P03` へ写像
+/// することを、実際に別セッションの自動コミット書き込みが待機タイムアウト
+/// する経路で固定するため）。
+fn new_core_with_short_write_lock_wait() -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path("sql31-transaction-lock-timeout");
+    let storage = Storage::open(&path)
+        .expect("open storage")
+        .with_write_lock_wait(std::time::Duration::from_millis(200));
+    storage.create_table(&schema(TABLE)).expect("create table");
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        path,
+    )
+}
+
+/// 明示トランザクション（`BEGIN`）が `writer_gate` を保持している間、別セッションの
+/// 自動コミット `INSERT` が待機タイムアウトすると `TenantWriteError::WriteLockTimeout`
+/// が SQL 表層で `55P03`（`SqlSurfaceError::LockNotAvailable`）へ写像されることを
+/// 固定する（codex-review 指摘・Issue #942）。`map_write_error`〔`sql/exec.rs`〕に
+/// 専用アームが無いと `_` 節へ落ちて `XX000`（内部エラー）になり、クライアントが
+/// リトライ可能なロック競合と内部エラーを判別できなくなる。
+#[test]
+fn autocommit_insert_times_out_with_lock_not_available_while_explicit_transaction_holds_writer_gate(
+) {
+    let (engine, path) = new_core_with_short_write_lock_wait();
+    let _cleanup = CleanupGuard(path);
+    let engine = std::sync::Arc::new(engine);
+    let caller_a = ctx("tenant-a");
+    let caller_b = ctx("tenant-b");
+
+    let (began_tx, began_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+    let holder_engine = std::sync::Arc::clone(&engine);
+    let holder = std::thread::spawn(move || {
+        let mut session = SessionState::default();
+        let mut txn = holder_engine.new_session_transaction();
+        holder_engine
+            .execute_sql_in_txn(&caller_a, &mut session, &mut txn, "BEGIN")
+            .expect("begin holds writer_gate");
+        began_tx.send(()).expect("notify begin done");
+        // 別セッションの自動コミット `INSERT` がタイムアウトするまで `writer_gate`
+        // を保持し続ける（解放シグナルを受けてから ROLLBACK する）。
+        release_rx.recv().expect("wait for release signal");
+        holder_engine
+            .execute_sql_in_txn(&caller_a, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback releases writer_gate");
+    });
+
+    began_rx
+        .recv()
+        .expect("wait for BEGIN to acquire writer_gate");
+
+    let err = engine
+        .execute_sql_in_session(
+            &caller_b,
+            &mut SessionState::default(),
+            &insert_sql(1, "op-1"),
+        )
+        .expect_err("autocommit INSERT must time out while writer_gate is held");
+    assert_eq!(
+        err.wire_code(),
+        "55P03",
+        "writer_gate 待機タイムアウトは 55P03（LOCK_NOT_AVAILABLE）へ写像されるべき \
+         （`_` 節へ落ちて XX000 になる退行を検出する）"
+    );
+
+    release_tx.send(()).expect("signal holder to rollback");
+    holder.join().expect("holder thread must not panic");
+}
