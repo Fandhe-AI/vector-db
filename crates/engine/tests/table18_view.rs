@@ -313,6 +313,119 @@ fn view_column_scope_rejects_unknown_column() {
     assert_eq!(err.wire_code(), "22000");
 }
 
+/// ネストしたビューの列スコープ検査（レビュー指摘対応）: 内側ビューが列を
+/// 絞り込んでいる場合、外側ビューが `SELECT *` で内側ビューを参照しても
+/// その制限を引き継ぐ。`resolve_from` が連鎖の最も外側の射影だけを記録して
+/// いると、`SELECT * FROM inner_view` を重ねるだけで内側ビューが隠していた
+/// 列（ここでは `body`）へ到達できてしまう。
+#[test]
+fn nested_view_star_inherits_inner_column_restriction() {
+    let path = unique_db_path("view-nested-star");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_base_fixture(&storage);
+    let core = new_core(storage);
+    let mut session = allowed_session();
+
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW id_only AS SELECT id FROM docs WHERE lang = 'ja'",
+    )
+    .expect("create inner view");
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW id_only_wrapped AS SELECT * FROM id_only",
+    )
+    .expect("create outer view wrapping inner via *");
+
+    // 外側ビューが `*` を使っていても、内側ビューが公開しない `body`・`lang`
+    // へは到達できない。
+    let err = scan(&core, "alice", "SELECT body FROM id_only_wrapped LIMIT 10")
+        .expect_err("body must stay hidden through the outer * wrapper");
+    assert_eq!(err.wire_code(), "22000");
+    let err = scan(&core, "alice", "SELECT lang FROM id_only_wrapped LIMIT 10")
+        .expect_err("lang must stay hidden through the outer * wrapper");
+    assert_eq!(err.wire_code(), "22000");
+
+    // 内側ビューが公開する `id` は引き続き参照でき、結果は内側ビューを直接
+    // 引いた場合と一致する。
+    let via_outer =
+        scan(&core, "alice", "SELECT id FROM id_only_wrapped LIMIT 100").expect("outer scan");
+    let via_inner = scan(&core, "alice", "SELECT id FROM id_only LIMIT 100").expect("inner scan");
+    assert_eq!(result_ids(&via_outer), result_ids(&via_inner));
+    assert!(!result_ids(&via_outer).is_empty());
+}
+
+/// ネストしたビューの列スコープ検査: 外側ビューが明示列指定で内側ビューの
+/// 非公開列を参照した場合も、積集合が空になり `22000` で拒否される
+/// （`CREATE VIEW` 自体はカタログ照会を行わないため作成時には検出されず、
+/// 参照時の `resolve_from` が唯一の検査点になる）。
+#[test]
+fn nested_view_explicit_column_not_exposed_by_inner_is_rejected() {
+    let path = unique_db_path("view-nested-explicit");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_base_fixture(&storage);
+    let core = new_core(storage);
+    let mut session = allowed_session();
+
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW id_only AS SELECT id FROM docs WHERE lang = 'ja'",
+    )
+    .expect("create inner view");
+    // 内側ビューは `id` しか公開しないが、外側ビューは作成時点でその制限を
+    // 検証されないため `body` を明示的に指定できてしまう。
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW leaky AS SELECT body FROM id_only",
+    )
+    .expect("create outer view referencing a column hidden by the inner view");
+
+    let err = scan(&core, "alice", "SELECT body FROM leaky LIMIT 10")
+        .expect_err("body is not exposed by the inner view id_only");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+/// ネストしたビューの列スコープ検査: 外側ビュー自身の `WHERE` 述語が内側
+/// ビューの非公開列を参照している場合も `22000` で拒否する（列漏えいは
+/// 投影〔`SELECT`〕経由だけでなく `WHERE` 経由でも起こりうる。内側ビュー
+/// `id_only` は `id` のみを公開するが、外側ビュー `probe` はカタログ照会を
+/// 経ない作成時には検出されない `body` 列を `WHERE` に埋め込める）。
+#[test]
+fn nested_view_where_predicate_not_exposed_by_inner_is_rejected() {
+    let path = unique_db_path("view-nested-where");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_base_fixture(&storage);
+    let core = new_core(storage);
+    let mut session = allowed_session();
+
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW id_only AS SELECT id FROM docs WHERE lang = 'ja'",
+    )
+    .expect("create inner view");
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW probe AS SELECT id FROM id_only WHERE body = 'alice private ja'",
+    )
+    .expect("create outer view whose own WHERE references a column hidden by the inner view");
+
+    let err = scan(&core, "alice", "SELECT id FROM probe LIMIT 10")
+        .expect_err("probe's own WHERE references body, which id_only does not expose");
+    assert_eq!(err.wire_code(), "22000");
+}
+
 // --- 受入基準 3: ネスト深さ上限 ----------------------------------------------
 
 #[test]

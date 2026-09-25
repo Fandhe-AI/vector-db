@@ -30,8 +30,9 @@ pub(crate) enum Resolved {
         /// ビュー定義由来の `WHERE` 述語（内側のビューが先頭。クエリ自身の
         /// 述語はこの後ろに追加する）。
         view_predicates: Vec<WherePredicate>,
-        /// クエリ直接の参照先（最も外側のビュー）が公開する列集合。
-        /// `None` は `SELECT *`（列を絞り込まない）を意味する。
+        /// クエリ直接の参照先（最も外側のビュー）が最終的に公開する列集合
+        /// （連鎖の各段の投影を内側から積み上げた結果。`None` は連鎖のどの
+        /// 段も列を絞り込んでいない——全段が `SELECT *`——ことを意味する）。
         view_columns: Option<Vec<String>>,
     },
 }
@@ -51,14 +52,19 @@ pub(crate) fn resolve_from(
     lookup: &impl TableLookup,
     name: &str,
 ) -> Result<Resolved, SqlSurfaceError> {
+    // 第 1 パス: 外側（クエリが直接参照した名前）から内側へ向けて連鎖を
+    // 辿り、各段の本文をそのまま集める（列スコープの検証・畳み込みはまだ
+    // 行わない——内側の露出列が確定するまでは外側の参照が妥当かどうか
+    // 判断できないため、確定は第 2 パスへ分離する）。
     let mut current = name.to_string();
-    let mut acc_predicates: Vec<WherePredicate> = Vec::new();
-    let mut acc_columns: Option<Vec<String>> = None;
-    let mut is_view = false;
+    let mut chain: Vec<super::allowlist::ParsedViewBody> = Vec::new();
     let mut depth: u32 = 0;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for _ in 0..MAX_VIEW_RESOLVE_STEPS {
+    let base_table = loop {
+        if chain.len() >= MAX_VIEW_RESOLVE_STEPS {
+            return Err(corrupt_view_error());
+        }
         if !visited.insert(current.clone()) {
             return Err(corrupt_view_error());
         }
@@ -74,39 +80,48 @@ pub(crate) fn resolve_from(
                         "view nesting depth exceeds limit",
                     ));
                 }
-                if !is_view {
-                    // 最も外側（クエリが直接参照した）のビューだけが、クエリへ
-                    // 公開する列集合を決める。
-                    acc_columns = match &parsed.projection {
-                        Projection::All => None,
-                        Projection::Columns(cols) => Some(cols.clone()),
-                        Projection::Items(_) => None,
-                    };
-                }
-                is_view = true;
-                // 内側（より深い）のビューの述語を先頭に置く（§設計「述語合成」）。
-                let mut merged = parsed.where_predicates;
-                merged.extend(acc_predicates);
-                acc_predicates = merged;
+                chain.push(parsed);
                 current = base_relation;
             }
             None => {
                 if !lookup.table_exists(&current)? {
                     return Err(SqlSurfaceError::undefined_table(name));
                 }
-                return if is_view {
-                    Ok(Resolved::View {
-                        base_table: current,
-                        view_predicates: acc_predicates,
-                        view_columns: acc_columns,
-                    })
-                } else {
-                    Ok(Resolved::Table)
-                };
+                break current;
             }
         }
+    };
+
+    if chain.is_empty() {
+        return Ok(Resolved::Table);
     }
-    Err(corrupt_view_error())
+
+    // 第 2 パス: 最も内側（base table に最も近い）のビューから外側へ向けて
+    // 走査し、各段の投影・`WHERE` が「その段の FROM が指す関係が公開する
+    // 列集合」に収まっていることを [`check_columns_within_view`]（クエリ
+    // 自身の列スコープ検査と同じ実装）で検証してから、その段自身の投影で
+    // 公開列集合を更新する。検証を先に行うことで、外側ビューが `SELECT *`
+    // で内側ビューを包んだ場合（内側の列制限をそのまま引き継ぐ）だけでなく、
+    // 外側ビューが明示列指定・`WHERE` で内側ビューが公開しない列を直接
+    // 参照した場合（`CREATE VIEW` 自体はカタログ照会を行わないため作成時
+    // には検出されない）も、連鎖のどの段であれ参照時に一様に拒否できる。
+    let mut exposed: Option<Vec<String>> = None;
+    let mut acc_predicates: Vec<WherePredicate> = Vec::new();
+    for view in chain.into_iter().rev() {
+        check_columns_within_view(exposed.as_deref(), &view.projection, &view.where_predicates)?;
+        if let Projection::Columns(cols) = view.projection {
+            exposed = Some(cols);
+        }
+        // 内側（より深い）のビューの述語を先頭に置く（§設計「述語合成」）。
+        // ここでは内側から外側へ順に処理しているため、単純な追記でよい。
+        acc_predicates.extend(view.where_predicates);
+    }
+
+    Ok(Resolved::View {
+        base_table,
+        view_predicates: acc_predicates,
+        view_columns: exposed,
+    })
 }
 
 /// 格納済み `body_sql`（`sql::allowlist::render_view_body` の出力）を再トークン化・
@@ -134,11 +149,16 @@ fn corrupt_view_error_fn() -> SqlSurfaceError {
     corrupt_view_error()
 }
 
-/// クエリ側の投影・`WHERE` が、ビューが公開する列集合（`view_columns`）に
-/// 収まっているかを検査する（`view_columns` が `None`〔ビュー自身が `*`〕の
-/// 場合は検査不要——基底テーブルの束縛段がそのまま列存在を検査する）。
-/// 範囲外の列参照は `SqlSurfaceError::InvalidInput`（`22000`。既存の
-/// 「未知の列」束縛エラーと同じ分類）。
+/// 投影・`WHERE` が、参照先が公開する列集合（`view_columns`）に収まって
+/// いるかを検査する。呼び出し元は 2 箇所: (1) クエリ自身の投影・`WHERE` を
+/// [`Resolved::View::view_columns`]（連鎖全体を畳み込んだ最終的な公開列
+/// 集合）に対して検査する箇所（`sql::allowlist::validate_sql_tokens`）、
+/// (2) [`resolve_from`] が連鎖の各段自身の投影・`WHERE` を「その段の FROM
+/// が指す関係の公開列集合」に対して検査する箇所。`view_columns` が `None`
+/// の場合は検査不要（対象の関係がどの段でも列を絞り込んでいない——基底
+/// テーブルの束縛段がそのまま列存在を検査する）。範囲外の列参照は
+/// `SqlSurfaceError::InvalidInput`（`22000`。既存の「未知の列」束縛エラーと
+/// 同じ分類）。
 pub(crate) fn check_columns_within_view(
     view_columns: Option<&[String]>,
     projection: &Projection,
