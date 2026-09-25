@@ -18,8 +18,8 @@
 //!   `ClientHello` が 1 回目と（許可された差分を除き）同一であることの
 //!   検証（RFC 8446 §4.1.2）はいずれも本モジュールが単一情報源として持ち、
 //!   #965 側で再実装しない
-//! - #964（transcript hash）: HRR 時の `message_hash` 置換を担う。本モジュール
-//!   は関与しない
+//! - [`super::transcript`]（Issue #964。transcript hash）: HRR 時の
+//!   `message_hash` 置換を担う。本モジュールは関与しない
 //! - #955（X25519）: 共有秘密の計算・全ゼロ検出を担う。本モジュールは
 //!   client 公開鍵 32 バイトを取り出して渡すだけ
 //! - #959／#965（0-RTT）: 0-RTT を受理した場合の早期 application_data
@@ -941,7 +941,9 @@ pub fn negotiate(
 }
 
 /// HelloRetryRequest（`ServerHello` 形。RFC 8446 §4.1.3・§4.1.4・§4.2.8）を
-/// 組み立てる。送出と transcript への反映は #965／#964 が担う。
+/// 組み立てる。送出は #965、transcript への反映は
+/// [`super::transcript::Transcript::append_hello_retry_request`]（Issue #964）
+/// が担う。
 pub fn build_hello_retry_request(legacy_session_id: &[u8]) -> handshake::ServerHello {
     let supported_versions_ext = handshake::Extension {
         extension_type: EXT_SUPPORTED_VERSIONS,
