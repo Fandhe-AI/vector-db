@@ -279,6 +279,7 @@ pub enum CatalogError {
         to: String,
     },
     TooManyColumns { count: usize },
+    UniqueConstraintViolation,
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError
