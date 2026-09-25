@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
 
 define_error_classes! {
-    count = 27;
+    count = 29;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -201,7 +201,10 @@ define_error_classes! {
     LockNotAvailable => ("55P03", "LOCK_NOT_AVAILABLE"),
     /// `CREATE TABLE` が指定したテーブル名が既に存在する（`42P07`）。TABLE-4・
     /// TASK-85（Issue #899）が追加。上書きしない設計（既存スキーマは変更されない）。
-    /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateTable`] の写像。
+    /// `CREATE VIEW`（TABLE-18・SQL-23・TASK-205、Issue #909）が既存のテーブル
+    /// 名・ビュー名と衝突した場合も同じ分類を共有する（ビューはテーブルと
+    /// 名前空間を共有する）。[`crate::sql::allowlist::SqlSurfaceError::
+    /// DuplicateTable`] の写像。
     DuplicateTable => ("42P07", "DUPLICATE_TABLE"),
     /// `CREATE TABLE` の列リストに同名の列が複数回宣言された（`42701`）。
     /// TABLE-6・TASK-85（Issue #899）が追加。
@@ -211,6 +214,17 @@ define_error_classes! {
     /// 存在しない（`34000`）。WIRE-15・TASK-218 が追加。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidCursorName`] の写像。
     InvalidCursorName => ("34000", "INVALID_CURSOR_NAME"),
+    /// `DROP TABLE`／`DROP VIEW` の対象に、それを参照するビューが 1 つ以上残って
+    /// いるため削除を拒否した（`2BP01`。TABLE-18・SQL-23・TASK-205、Issue #909）。
+    /// [`crate::catalog::CatalogError::DependentViewsExist`] の写像。依存する
+    /// オブジェクト名の一覧はエラー文言に含めない（security.md P0）。
+    DependentObjectsStillExist => ("2BP01", "DEPENDENT_OBJECTS_STILL_EXIST"),
+    /// 指定した名前は存在するが、要求された操作が期待する種別のオブジェクトでは
+    /// ない（`42809`。`DROP TABLE` にビュー名、`DROP VIEW` にテーブル名、または
+    /// ビューへの書き込み系文〔`INSERT`／UPSERT／`UPDATE`／`DELETE`／
+    /// `TRUNCATE`〕。TABLE-18・SQL-23・TASK-205、Issue #909）。
+    /// [`crate::catalog::CatalogError::WrongObjectKind`] の写像。
+    WrongObjectType => ("42809", "WRONG_OBJECT_TYPE"),
     /// 列に NOT NULL 制約が宣言されているにもかかわらず、値が省略またはNULL
     /// として書き込まれた（TABLE-16・TASK-204、Issue #904）。`wire_code`
     /// （`23502`）は [`ErrorClass::MissingOperationId`] と共有する

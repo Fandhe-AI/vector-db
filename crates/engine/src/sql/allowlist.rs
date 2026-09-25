@@ -312,7 +312,10 @@ pub enum SqlSurfaceError {
     /// （Issue #896 レビュー指摘）を避けるために独立させた。
     FeatureNotSupported { detail: String },
     /// `CREATE TABLE`（SQL-23・TASK-85、Issue #899）が指定したテーブル名が既に
-    /// カタログに存在する。既存スキーマは変更しない（TABLE-4）。ERR-6: `42P07`。
+    /// カタログに存在する。既存スキーマは変更しない（TABLE-4）。`CREATE VIEW`
+    /// （TABLE-18・SQL-23・TASK-205、Issue #909）が既存のテーブル名・ビュー名と
+    /// 衝突した場合も同じ分類を共有する（ビューはテーブルと名前空間を共有する）。
+    /// ERR-6: `42P07`。
     DuplicateTable { name: String },
     /// `CREATE TABLE` の列リストに同名の列が複数回宣言された（TABLE-6、
     /// Issue #899）。ERR-6: `42701`。
@@ -336,6 +339,15 @@ pub enum SqlSurfaceError {
     /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
     /// 自体を含めない（security.md「存在情報を漏らさない」対応。ERR-6: `34000`）。
     InvalidCursorName,
+    /// `DROP TABLE`／`DROP VIEW` の対象を、それを参照するビューが 1 つ以上
+    /// 残っているため削除できない（TABLE-18・SQL-23・TASK-205、Issue #909。
+    /// ERR-6: `2BP01`）。依存元の名前一覧はエラー文言に含めない
+    /// （security.md P0）。
+    DependentObjectsStillExist { name: String },
+    /// 名前は存在するが、要求された操作が期待するオブジェクト種別と一致
+    /// しない（`DROP TABLE` にビュー名、`DROP VIEW` にテーブル名、ビューへの
+    /// 書き込み系文。TABLE-18・SQL-23・TASK-205、Issue #909。ERR-6: `42809`）。
+    WrongObjectType { name: String },
     /// 列に `NOT NULL` 制約が宣言されているにもかかわらず、値が省略された、
     /// または明示的に `NULL` として書き込まれた（TABLE-16・TASK-204、
     /// Issue #904）。`DEFAULT` 句を持つ列は省略時に既定値が補われるため
@@ -399,8 +411,10 @@ impl SqlSurfaceError {
 
     /// FROM に指定されたテーブルがカタログ未存在（ERR-2: `42P01`）。テーブル名は
     /// untrusted な字句解析結果のため、`UnsupportedSyntax` と同様に長さを切り詰めて
-    /// エラーへ含める（security.md「情報漏えい」対応）。
-    fn undefined_table(name: impl Into<String>) -> Self {
+    /// エラーへ含める（security.md「情報漏えい」対応）。`pub(crate)`:
+    /// `sql::view::resolve_from`（TABLE-18・SQL-23・TASK-205、Issue #909）も
+    /// FROM 解決失敗を同じ形へ写像するために使う。
+    pub(crate) fn undefined_table(name: impl Into<String>) -> Self {
         SqlSurfaceError::UndefinedTable {
             name: truncate_for_error(&name.into()),
         }
@@ -529,6 +543,10 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InsufficientPrivilege => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
+            SqlSurfaceError::DependentObjectsStillExist { .. } => {
+                ErrorClass::DependentObjectsStillExist
+            }
+            SqlSurfaceError::WrongObjectType { .. } => ErrorClass::WrongObjectType,
             SqlSurfaceError::NotNullViolation { .. } => ErrorClass::NotNullViolation,
             SqlSurfaceError::UniqueViolation => ErrorClass::UniqueViolation,
         }
@@ -606,8 +624,12 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::FeatureNotSupported { detail } => {
                 write!(f, "feature not supported: {detail}")
             }
+            // 名前はクライアント自身が指定した識別子であり秘匿情報ではない
+            // （既存の `UndefinedTable`／`WrongObjectType` と同じ扱い）。
+            // `CREATE TABLE`（TASK-85）・`CREATE VIEW`（TASK-205、Issue #909）
+            // 双方の名前衝突を共有する分類のため "relation" と汎称する。
             SqlSurfaceError::DuplicateTable { name } => {
-                write!(f, "table already exists: {name}")
+                write!(f, "relation already exists: {name}")
             }
             SqlSurfaceError::DuplicateColumn { name } => {
                 write!(f, "duplicate column name: {name}")
@@ -622,6 +644,13 @@ impl std::fmt::Display for SqlSurfaceError {
             // 参照）。
             SqlSurfaceError::InvalidCursorName => {
                 write!(f, "cursor does not exist")
+            }
+            // 依存元の名前一覧は含めない固定文言（security.md P0）。
+            SqlSurfaceError::DependentObjectsStillExist { name } => {
+                write!(f, "cannot drop {name} because other objects depend on it")
+            }
+            SqlSurfaceError::WrongObjectType { name } => {
+                write!(f, "wrong object type: {name}")
             }
             // 値そのもの・他テナントの情報を含めない固定形式（security.md P0）。
             SqlSurfaceError::NotNullViolation { column } => {
@@ -654,6 +683,21 @@ pub trait TableLookup {
     /// カタログ照会自体が失敗した場合（redb I/O 等）は `Err` とし、
     /// 存在するとも存在しないとも判定しない（fail-closed）。
     fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError>;
+
+    /// `name` が定義済みビュー（`CREATE VIEW`。TABLE-18・SQL-23・TASK-205、
+    /// Issue #909）なら `Ok(Some(_))`、テーブル・ビューいずれでもなければ
+    /// `Ok(None)`。既定実装は常に `Ok(None)` を返すため、ビュー機能を持たない
+    /// 既存の `TableLookup` 実装（テスト用モック等）は無変更のままコンパイル
+    /// できる（`catalog.rs::impl TableLookup for Storage` のみが実データを
+    /// 返す）。カタログ照会自体が失敗した場合（redb I/O・カタログ破損等）は
+    /// `Err`（fail-closed。[`crate::sql::view::resolve_from`] 参照）。
+    fn view_definition(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::catalog::ViewDef>, SqlSurfaceError> {
+        let _ = name;
+        Ok(None)
+    }
 }
 
 /// ORDER BY 関数呼び出し形（`FunctionCall`, TASK-75）の 1 引数。本モジュールは
@@ -3067,6 +3111,234 @@ impl<'a> Parser<'a> {
         self.expect_contextual_keyword("TABLE")?;
         self.expect_ident()
     }
+
+    /// 現在位置から末尾までの未消費トークン列（TABLE-18・SQL-23・TASK-205、
+    /// Issue #909）。`CREATE VIEW <name> AS <body>` の `<body>` 部分を
+    /// [`parse_view_body`] へ独立した文として渡すために使う。
+    fn remaining(&self) -> &'a [Token] {
+        match self.tokens.get(self.pos..) {
+            Some(rest) => rest,
+            None => &[],
+        }
+    }
+
+    /// `CREATE VIEW <name> AS <body> [;]`（TABLE-18・SQL-23・TASK-205、
+    /// Issue #909）。`CREATE OR REPLACE`・`IF NOT EXISTS`・`TEMP`／
+    /// `MATERIALIZED`・列別名リスト `v (a, b)` はいずれも構造的に受理しない。
+    fn parse_create_view(&mut self) -> Result<(String, ParsedViewBody), SqlSurfaceError> {
+        self.expect_ident_matching("CREATE")?;
+        self.expect_ident_matching("VIEW")?;
+        let name = self.expect_ident()?;
+        self.expect_ident_matching("AS")?;
+        let body = parse_view_body(self.remaining())?;
+        // `parse_view_body` が本文トークン列（`self.remaining()`）の終端まで
+        // 消費し尽くしたことを既に検証済みのため（`expect_end_of_statement`
+        // 呼び出し）、この Parser 側で追加のトークンを消費する必要はない。
+        Ok((name, body))
+    }
+
+    /// `DROP VIEW <name> [;]`（TABLE-18・SQL-23・TASK-205、Issue #909）。
+    /// `IF EXISTS`・`CASCADE`／`RESTRICT`・複数ビュー列挙は構造的に受理しない。
+    fn parse_drop_view(&mut self) -> Result<String, SqlSurfaceError> {
+        self.expect_ident_matching("DROP")?;
+        self.expect_ident_matching("VIEW")?;
+        self.expect_ident()
+    }
+}
+
+/// `CREATE VIEW ... AS` 本文の許可形状（TABLE-18・SQL-23・TASK-205、
+/// Issue #909）。`SELECT <* | 列名リスト> FROM <table | view> [WHERE
+/// <単純述語> [AND ...]]` のみを受理する（`LIMIT`・`ORDER BY`・`USING PLAN`・
+/// 集計・式項目〔`Projection::Items`〕・UDF 呼び出し述語
+/// 〔`WherePredicate::PredicateCall`／`Expression`〕はいずれも許可リスト外。
+/// §2.1「本リポの実装既定値」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedViewBody {
+    pub(crate) table_name: String,
+    pub(crate) projection: Projection,
+    pub(crate) where_predicates: Vec<WherePredicate>,
+}
+
+/// [`ParsedViewBody`] の構造検証本体。`CREATE VIEW` の本文パース
+/// （[`Parser::parse_create_view`]）と、格納済みビュー定義の再検証
+/// （`sql::view::resolve_from` が [`crate::catalog::ViewDef::body_sql`] を
+/// 再トークン化して渡す。第 2 の SQL パーサーを作らない設計）の双方が共有する
+/// 唯一の実装。
+pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_keyword(Keyword::Select)?;
+    let projection = p.parse_select_list()?;
+    if let Projection::Items(_) = projection {
+        return Err(SqlSurfaceError::unsupported(
+            "view body does not support expression projection items",
+        ));
+    }
+    p.expect_keyword(Keyword::From)?;
+    let table_name = p.expect_ident()?;
+    let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
+        p.advance();
+        p.parse_where()?
+    } else {
+        Vec::new()
+    };
+    for pred in &where_predicates {
+        match pred {
+            WherePredicate::Equality { .. }
+            | WherePredicate::Prefix { .. }
+            | WherePredicate::BoolEquality { .. }
+            | WherePredicate::BoolColumn { .. }
+            | WherePredicate::Compare { .. } => {}
+            WherePredicate::PredicateCall { .. } | WherePredicate::Expression(_) => {
+                return Err(SqlSurfaceError::unsupported(
+                    "view body WHERE predicate form is not supported",
+                ));
+            }
+        }
+    }
+    p.expect_end_of_statement()?;
+    Ok(ParsedViewBody {
+        table_name,
+        projection,
+        where_predicates,
+    })
+}
+
+/// [`ParsedViewBody`] を再パース可能な正規化 SQL テキストへ描画する
+/// （TABLE-18・SQL-23・TASK-205、Issue #909）。「描画 → 再トークン化 →
+/// [`parse_view_body`]」が元と等価な AST を復元することを
+/// `sql::view` の round-trip テストで固定する（[`crate::catalog::Storage::
+/// create_view`] が保存する `body_sql` はこの関数の出力のみ）。文字列
+/// リテラルは `'` を `''` へ二重化してエスケープする（[`crate::sql::lexer`]
+/// の読み取り側〔`''` → `'`〕と対称）。
+pub(crate) fn render_view_body(body: &ParsedViewBody) -> String {
+    let mut out = String::from("SELECT ");
+    match &body.projection {
+        Projection::All => out.push('*'),
+        Projection::Columns(cols) => out.push_str(&cols.join(", ")),
+        // `parse_view_body` が構造的に拒否するため到達しない。
+        Projection::Items(_) => out.push('*'),
+    }
+    out.push_str(" FROM ");
+    out.push_str(&body.table_name);
+    if !body.where_predicates.is_empty() {
+        out.push_str(" WHERE ");
+        let rendered: Vec<String> = body
+            .where_predicates
+            .iter()
+            .map(render_where_predicate)
+            .collect();
+        out.push_str(&rendered.join(" AND "));
+    }
+    out
+}
+
+/// 文字列リテラルを `'` の二重化でエスケープする（[`render_view_body`] 参照）。
+fn escape_string_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// [`WherePredicate`] のうち [`parse_view_body`] が受理する形状のみを描画する
+/// （`PredicateCall`／`Expression` は到達しない）。
+fn render_where_predicate(pred: &WherePredicate) -> String {
+    match pred {
+        WherePredicate::Equality { column, value } => {
+            format!("{column} = '{}'", escape_string_literal(value))
+        }
+        // `pattern` は末尾の `%` を含む文字列リテラルの生値をそのまま保持する
+        // （`Parser::parse_where` の LIKE 分岐参照。呼び出し元が既に `%` 込みで
+        // 検証済みのため、ここで追加の `%` を付与しない）。
+        WherePredicate::Prefix { column, pattern } => {
+            format!("{column} LIKE '{}'", escape_string_literal(pattern))
+        }
+        WherePredicate::BoolEquality { column, value } => {
+            format!("{column} = {}", if *value { "true" } else { "false" })
+        }
+        WherePredicate::BoolColumn { column } => column.clone(),
+        WherePredicate::Compare { column, op, value } => {
+            let op_str = match op {
+                CompareOp::Lt => "<",
+                CompareOp::Le => "<=",
+                CompareOp::Gt => ">",
+                CompareOp::Ge => ">=",
+            };
+            format!("{column} {op_str} '{}'", escape_string_literal(value))
+        }
+        // `parse_view_body` が構造的に拒否するため到達しない
+        // （`render_view_body` は常に [`parse_view_body`] の出力のみを描画する）。
+        WherePredicate::PredicateCall { name } => format!("{name}()"),
+        WherePredicate::Expression(_) => String::new(),
+    }
+}
+
+/// `CREATE VIEW <name> AS <body>` の許可形状構造検証結果（TABLE-18・SQL-23・
+/// TASK-205、Issue #909）。カタログ照会は一切行わない（構文検証段はカタログを
+/// 照会しない契約。DDL 実行権限ゲート・参照先の存在確認・ネスト深さ判定は
+/// いずれも `crate::sql::ddl::execute_create_view` が担う）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCreateView {
+    pub(crate) name: String,
+    /// `body` の直接の参照先（テーブルまたは別のビュー。連鎖の畳み込みは
+    /// 参照時の [`crate::sql::view::resolve_from`] が担う）。
+    pub(crate) base_relation: String,
+    /// [`render_view_body`] で描画した正規化 SQL（永続化される値そのもの）。
+    pub(crate) body_sql: String,
+}
+
+impl ValidatedCreateView {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn base_relation(&self) -> &str {
+        &self.base_relation
+    }
+
+    pub fn body_sql(&self) -> &str {
+        &self.body_sql
+    }
+}
+
+/// `DROP VIEW <name>` の許可形状構造検証結果（TABLE-18・SQL-23・TASK-205、
+/// Issue #909）。[`ValidatedDropTable`] と同じくカタログ照会を一切行わない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDropView {
+    pub(crate) name: String,
+}
+
+impl ValidatedDropView {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// [`ValidatedCreateView`] の構造検証本体（[`sql::ddl::execute_create_view`]
+/// から呼ばれる。TABLE-18・SQL-23・TASK-205、Issue #909）。
+pub(crate) fn validate_create_view_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedCreateView, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let (name, body) = p.parse_create_view()?;
+    let body_sql = render_view_body(&body);
+    if body_sql.len() > crate::catalog::MAX_VIEW_BODY_BYTES {
+        return Err(SqlSurfaceError::payload_too_large(
+            "view body exceeds the allowed size",
+        ));
+    }
+    Ok(ValidatedCreateView {
+        name,
+        base_relation: body.table_name,
+        body_sql,
+    })
+}
+
+/// [`ValidatedDropView`] の構造検証本体。
+pub(crate) fn validate_drop_view_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedDropView, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let name = p.parse_drop_view()?;
+    p.expect_end_of_statement()?;
+    Ok(ValidatedDropView { name })
 }
 
 /// 構文木（[`ValidatedTruncate`] の元）。カタログ存在確認前の中間結果
@@ -3468,18 +3740,44 @@ pub(crate) fn validate_sql_tokens(
                 }))
             }
             // Issue #454: `ORDER BY`・`USING PLAN` のいずれも伴わない
-            // `SELECT ... [WHERE ...] LIMIT n`（広域取得）。
+            // `SELECT ... [WHERE ...] LIMIT n`（広域取得）。TABLE-18・SQL-23・
+            // TASK-205（Issue #909）: FROM がビュー（`CREATE VIEW`）を指す場合、
+            // `sql::view::resolve_from` が連鎖を畳み込んで基底テーブル名＋
+            // 合成済み `WHERE` 述語へ書き換える。書き換え後は通常のテーブル
+            // 参照と完全に同じ `ValidatedScan` になり、束縛・実行・RLS 適用は
+            // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
             ParsedSelect::Scan(shape) => {
-                let exists = lookup.table_exists(&shape.table_name)?;
-                if !exists {
-                    return Err(SqlSurfaceError::undefined_table(shape.table_name));
+                match super::view::resolve_from(lookup, &shape.table_name)? {
+                    super::view::Resolved::Table => Ok(Statement::Scan(ValidatedScan {
+                        table_name: shape.table_name,
+                        projection: shape.projection,
+                        where_predicates: shape.where_predicates,
+                        limit: shape.limit,
+                    })),
+                    super::view::Resolved::View {
+                        base_table,
+                        view_predicates,
+                        view_columns,
+                    } => {
+                        super::view::check_columns_within_view(
+                            view_columns.as_deref(),
+                            &shape.projection,
+                            &shape.where_predicates,
+                        )?;
+                        let projection = match (&shape.projection, &view_columns) {
+                            (Projection::All, Some(cols)) => Projection::Columns(cols.clone()),
+                            (other, _) => other.clone(),
+                        };
+                        let mut where_predicates = view_predicates;
+                        where_predicates.extend(shape.where_predicates);
+                        Ok(Statement::Scan(ValidatedScan {
+                            table_name: base_table,
+                            projection,
+                            where_predicates,
+                            limit: shape.limit,
+                        }))
+                    }
                 }
-                Ok(Statement::Scan(ValidatedScan {
-                    table_name: shape.table_name,
-                    projection: shape.projection,
-                    where_predicates: shape.where_predicates,
-                    limit: shape.limit,
-                }))
             }
         },
         _ if is_set_statement => {
