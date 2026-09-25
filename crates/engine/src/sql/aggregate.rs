@@ -74,6 +74,31 @@ pub(crate) fn accumulator_bug(detail: &str) -> SqlSurfaceError {
 /// （[`crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`]）を明示的に渡す。
 pub(crate) const MAX_AGGREGATE_RESULT_BYTES: usize = crate::arena::MAX_ARENA_TOTAL_BYTES;
 
+/// [`accumulate_text_budget`] の予算超過 detail 文言（[`is_aggregate_text_budget_error`]
+/// が照合する）。
+const AGGREGATE_TEXT_BUDGET_EXCEEDED_DETAIL: &str = "aggregate result exceeds capacity";
+/// 同上。`checked_add` のオーバーフロー側の detail 文言。
+const AGGREGATE_TEXT_BUDGET_OVERFLOW_DETAIL: &str = "aggregate text budget accounting overflowed";
+
+/// `err` が [`accumulate_text_budget`] の予算超過（処理順序に依存しうる一時的な
+/// 超過）かを判定する（PR #1049 レビュー指摘 codex P1 対応）。
+///
+/// `MIN`/`MAX(<TEXT 列>)` の保持文字列は後続行でより短い極値へ更新されると縮小する
+/// ため、途中の最大値は行の処理順序に依存する。索引経路の候補順と全走査の物理行順が
+/// 異なると、同じ最終結果でも索引経路だけが途中で予算を超えて失敗しうる——索引選択
+/// によってクエリの成否が変わってはならない（`sql::group_by::
+/// is_text_accumulator_budget_error` と同じ理由・同じ設計）ため、索引経路は
+/// この超過を検出したら結果を破棄して全走査（処理順序に依存しない基準実装）へ
+/// 退避する。
+fn is_aggregate_text_budget_error(err: &SqlSurfaceError) -> bool {
+    matches!(
+        err,
+        SqlSurfaceError::PayloadTooLarge { detail }
+            if detail == AGGREGATE_TEXT_BUDGET_EXCEEDED_DETAIL
+                || detail == AGGREGATE_TEXT_BUDGET_OVERFLOW_DETAIL
+    )
+}
+
 /// `MIN`/`MAX(<TEXT 列>)` 集計項目（[`Accumulator::TextMin`]/[`Accumulator::TextMax`]）
 /// がクエリ全体で保持する文字列の累計バイト数を、呼び出し元が指定する
 /// `max_result_bytes` 予算で頭打ちにする（PR #1049 レビュー指摘 P0 対応）。
@@ -87,6 +112,11 @@ pub(crate) const MAX_AGGREGATE_RESULT_BYTES: usize = crate::arena::MAX_ARENA_TOT
 /// `before`／`after` の比較により、より短い極値への更新（保持量の縮小）を正しく
 /// 減算し、正常なクエリを誤って予算超過にしない（`sql::group_by::accumulate_row`
 /// と同方針）。
+///
+/// 超過時の detail は [`AGGREGATE_TEXT_BUDGET_EXCEEDED_DETAIL`]／
+/// [`AGGREGATE_TEXT_BUDGET_OVERFLOW_DETAIL`]。より短い極値への更新で縮小しうる
+/// ため途中の最大値は処理順序に依存し、索引経路（[`try_scalar_index_aggregate`]）は
+/// この超過を検出したら全走査へ退避する（[`is_aggregate_text_budget_error`] 参照）。
 fn accumulate_text_budget(
     before: usize,
     after: usize,
@@ -98,11 +128,11 @@ fn accumulate_text_budget(
         *total_text_accumulator_bytes = total_text_accumulator_bytes
             .checked_add(delta)
             .ok_or_else(|| {
-                SqlSurfaceError::payload_too_large("aggregate text budget accounting overflowed")
+                SqlSurfaceError::payload_too_large(AGGREGATE_TEXT_BUDGET_OVERFLOW_DETAIL)
             })?;
         if *total_text_accumulator_bytes > max_result_bytes {
             return Err(SqlSurfaceError::payload_too_large(
-                "aggregate result exceeds capacity",
+                AGGREGATE_TEXT_BUDGET_EXCEEDED_DETAIL,
             ));
         }
     } else if after < before {
@@ -1852,7 +1882,7 @@ fn try_scalar_index_aggregate(
             acc.observe_present_n(hits)?;
         }
     } else {
-        observe_candidate_slots(
+        match observe_candidate_slots(
             &snapshot,
             &slots,
             schema,
@@ -1860,7 +1890,18 @@ fn try_scalar_index_aggregate(
             referenced,
             &mut accumulators,
             max_result_bytes,
-        )?;
+        ) {
+            Ok(()) => {}
+            // PR #1049 レビュー指摘 codex P1 対応: 候補順に依存しうる一時的な
+            // `TEXT` 予算超過は、索引経路の途中結果（`accumulators`）を破棄して
+            // 全走査へ退避する（[`is_aggregate_text_budget_error`] 参照）。全走査
+            // でも超過するなら、そこで同じ `54000` が返る。
+            Err(err) if is_aggregate_text_budget_error(&err) => {
+                scalar_access.cache.record_aggregate_plain_scan_fallback();
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        }
     }
     scalar_access.cache.record_aggregate_index_scan();
     Ok(Some(finish_aggregate_result(accumulators, bound)?))
@@ -2707,6 +2748,158 @@ mod tests {
         let err =
             execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound, 1, None, None, None)
                 .expect_err("tiny caller-supplied budget must reject before default cap");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// PR #1049 レビュー指摘 codex P1 の回帰テスト: 単一行集計の索引経路
+    /// （候補走査）で、候補順に依存する一時的な `MIN(<TEXT 列>)` 予算超過が
+    /// 起きても `54000` で失敗させず、全走査（物理行順）へ退避して全走査と同じ
+    /// 結果を返す。
+    ///
+    /// 構成: redb 上は `id` 昇順（1:`a`、2:`bbbbbbbbbb`）だが、温めた
+    /// `SqlArenaSnapshot` には `id` 降順で積むため、候補走査は 2 → 1 の順に処理する。
+    /// `MIN(v)` の保持量のピークは物理行順なら 1 バイト、候補順なら 10 バイトに
+    /// なるため、予算 5 バイトでは候補順だけが途中で超過する。
+    #[test]
+    fn index_path_text_budget_overflow_falls_back_to_full_scan() {
+        let path = unique_db_path("agg-index-text-budget-fallback");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("kind", ColumnType::Text, false),
+                ColumnDef::new("v", ColumnType::Text, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let rows: [(u64, &str, &str); 5] = [
+            (1, "x", "a"),
+            (2, "x", "bbbbbbbbbb"),
+            (3, "y", "z"),
+            (4, "y", "z"),
+            (5, "y", "z"),
+        ];
+        let metadata_of = |kind: &str, v: &str| {
+            row_codec::encode_scalar_columns(
+                &schema,
+                &[
+                    row_codec::Value::Null,
+                    row_codec::Value::Text(kind.to_string()),
+                    row_codec::Value::Text(v.to_string()),
+                ],
+            )
+            .expect("encode scalar columns")
+        };
+        for (id, kind, v) in rows {
+            let metadata = metadata_of(kind, v);
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 2.0, 3.0],
+                metadata: &metadata,
+            })
+            .expect("encode row");
+            write_row_raw(&storage, "docs", "tenant-a", id, &buf);
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let expected_dim = schema.vector_dim().expect("vector dim");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let generation = crate::catalog::table_generation_in_txn(&read_txn, "docs")
+            .expect("read table generation");
+
+        // 物理行順と逆（`id` 降順）のスナップショットを温める。
+        let mut capture = crate::arena::SqlArenaCaptureBuilder::new(
+            expected_dim,
+            crate::arena::MAX_ARENA_ROWS,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+        );
+        for (id, kind, v) in rows.iter().rev() {
+            capture.push(
+                *id,
+                "tenant-a",
+                Visibility::Public,
+                &[1.0, 2.0, 3.0],
+                &metadata_of(kind, v),
+                0,
+            );
+        }
+        let (arena, metadata) = capture.finish("docs").expect("capture");
+        let snapshot = crate::sql::arena_cache::SqlArenaSnapshot::new(
+            arena,
+            metadata,
+            ctx.clone(),
+            generation,
+        );
+        let arena_cache = crate::sql::arena_cache::SqlArenaCache::new();
+        let scalar_cache = crate::sql::scalar_index::ScalarIndexCache::new();
+        arena_cache.insert(&storage, "docs", &ctx, snapshot);
+
+        let crate::sql::allowlist::Statement::Aggregate(validated) =
+            crate::sql::allowlist::validate_sql(
+                "SELECT MIN(v) AS mn FROM docs WHERE kind = 'x'",
+                &storage,
+            )
+            .expect("validate")
+        else {
+            panic!("expected aggregate statement");
+        };
+        let bound = crate::sql::parser::bind_aggregate(
+            &validated,
+            &schema,
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+        .expect("bind");
+
+        let run = |budget: usize| {
+            execute_aggregate_with_cache(
+                &read_txn,
+                &ctx,
+                &schema,
+                &bound,
+                budget,
+                None,
+                Some(crate::sql::arena_cache::ArenaCacheAccess {
+                    storage: &storage,
+                    cache: &arena_cache,
+                }),
+                Some(crate::sql::scalar_index::ScalarCacheAccess {
+                    storage: &storage,
+                    cache: &scalar_cache,
+                }),
+            )
+        };
+
+        // 既定予算では索引経路をそのまま使う（非 vacuous 性の確認）。
+        let before = scalar_cache.stats();
+        let ok = run(MAX_AGGREGATE_RESULT_BYTES).expect("default budget succeeds");
+        assert_eq!(ok.rows[0].cells, vec![Cell::Text("a".to_string())]);
+        let after = scalar_cache.stats();
+        assert_eq!(
+            after.aggregate_index_scans,
+            before.aggregate_index_scans + 1,
+            "the candidate-walk index path must be taken"
+        );
+
+        // 予算 5 バイト: 候補順では途中で超過するが、全走査へ退避して成功する。
+        let before = scalar_cache.stats();
+        let result = run(5).expect("order-dependent overflow must fall back, not fail");
+        assert_eq!(result.rows[0].cells, vec![Cell::Text("a".to_string())]);
+        let after = scalar_cache.stats();
+        assert_eq!(
+            after.aggregate_plain_scan_fallbacks,
+            before.aggregate_plain_scan_fallbacks + 1,
+            "the index path must record a fallback to the full scan"
+        );
+        assert_eq!(after.aggregate_index_scans, before.aggregate_index_scans);
+
+        // 全走査でも超過する予算では、従来どおり `54000` で失敗する。
+        let err = run(0).expect_err("overflow on the full scan must still fail");
         assert_eq!(err.wire_code(), "54000");
     }
 
