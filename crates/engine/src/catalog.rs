@@ -1115,6 +1115,14 @@ impl TableSchema {
     /// 挿入経路（TASK-86 以降）が、宣言済み次元と一致しない埋め込みを拒否するための
     /// 検証ヘルパ（TABLE-1）。`VECTOR` 列を持たないテーブルへの呼び出しも
     /// fail-closed に拒否する。
+    ///
+    /// `VECTOR` 列の SET／値が実際にある場合の次元検証（単一行 UPDATE・述語つき
+    /// UPDATE・UPSERT の `DO UPDATE`）はこのメソッドを直接使う。これらの呼び出し元は
+    /// `VECTOR` 列への SET があった場合のみ本メソッドを呼ぶガード（`vector_assigned`
+    /// 等）で囲っているため、`VECTOR` 列を持たないテーブルでは通常到達しない。
+    /// 例外は `tenant::update_row_unchecked`（[`RowInput`] による行全体置換 UPDATE）で、
+    /// こちらは無条件に呼ぶため `VECTOR` 列なしテーブルでは常に拒否される
+    /// （Issue #995 のスコープは INSERT 系のみで、この経路の是正は対象外）。
     pub fn validate_embedding_dim(&self, dim: usize) -> Result<()> {
         let expected = self
             .vector_dim()
@@ -1125,6 +1133,31 @@ impl TableSchema {
             )));
         }
         Ok(())
+    }
+
+    /// 行全体を書き込む経路（INSERT 系。TABLE-1・Issue #995）向けの embedding
+    /// 次元検証。
+    ///
+    /// `VECTOR` 列を持つスキーマでは [`Self::validate_embedding_dim`] へそのまま
+    /// 委譲し、エラー分類・文言は完全に同一のまま変えない（Issue #995 受け入れ
+    /// 基準「`VECTOR` 列を持つスキーマの次元検証・エラー分類は変わらない」）。
+    ///
+    /// `VECTOR` 列を持たないスキーマでは、読み取り経路（`sql/scan.rs`・
+    /// `sql/aggregate.rs` の `expected_dim: Option<u32>`・`storage::decode_row*`）
+    /// が既に採用している「dim 0 の行として扱う」モデルに合わせ、`dim == 0` の
+    /// ときのみ受理する。非空 embedding（`dim > 0`）は
+    /// `validate_embedding_dim` と同じ文言・`CatalogError::Invalid` で
+    /// fail-closed に拒否する（`tests/extensions.rs` の既存拒否テストが固定）。
+    pub(crate) fn validate_row_embedding_dim(&self, dim: usize) -> Result<()> {
+        if self.vector_dim().is_none() {
+            if dim == 0 {
+                return Ok(());
+            }
+            return Err(CatalogError::Invalid(
+                "table has no VECTOR column".to_string(),
+            ));
+        }
+        self.validate_embedding_dim(dim)
     }
 }
 
@@ -2292,8 +2325,10 @@ impl Storage {
     ///
     /// カタログからのスキーマ取得・次元検証・行書き込みを単一の write トランザクション内で
     /// 行うことで、並行する DDL（`alter_table_add_column` 等）との整合を確保する。
-    /// テーブル不存在・`VECTOR` 列なし・次元不一致はすべて fail-closed に `Err` で拒否する
-    /// （security.md「不安全な設計」）。
+    /// テーブル不存在・次元不一致は fail-closed に `Err` で拒否する（security.md
+    /// 「不安全な設計」）。`VECTOR` 列を持たないテーブルは embedding が空（dim 0）の
+    /// ときのみ受理し、非空 embedding は同様に `Err`（Issue #995・
+    /// [`TableSchema::validate_row_embedding_dim`] 参照）。
     ///
     /// `pub(crate)`: 本メソッドはテナント境界チェック（`PolicyContext::is_owner`）を
     /// 一切行わない生の書き込み経路であり、クレート外（wire-server・結合テスト等）へ
@@ -2318,7 +2353,7 @@ impl Storage {
         let write_txn = self.begin_write_txn()?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
-            schema.validate_embedding_dim(row.embedding.len())?;
+            schema.validate_row_embedding_dim(row.embedding.len())?;
             let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
             let row_table_name = user_rows_table_name(table_name);
             let mut row_table = write_txn
@@ -2376,7 +2411,7 @@ impl Storage {
             // `storage.rs::Storage::put_batch` の同パターンと揃える）。
             let mut scratch: Vec<u8> = Vec::new();
             for (id, row) in rows {
-                schema.validate_embedding_dim(row.embedding.len())?;
+                schema.validate_row_embedding_dim(row.embedding.len())?;
                 scratch.clear();
                 crate::storage::encode_row_into(&mut scratch, row)
                     .map_err(convert_storage_error)?;
@@ -2396,8 +2431,9 @@ impl Storage {
     /// スキーマ取得・`VECTOR` 列の抽出・スカラーペイロード生成
     /// （[`row_codec::encode_scalar_columns`]）・行書き込みを単一の write トランザクション
     /// 内で行う（`insert_row_into_table` と同じ理由で並行 DDL との整合を確保する）。
-    /// `VECTOR` 列を持たない・`values` の対応する位置が `Value::Vector` でない場合は
-    /// fail-closed に `Err`。
+    /// `VECTOR` 列を持つスキーマで対応する位置が `Value::Vector` でない場合は
+    /// fail-closed に `Err`。`VECTOR` 列を持たないスキーマでは embedding を空
+    /// として扱う（Issue #995）。
     ///
     /// `pub(crate)`（codex-review P0 指摘・PR #194 対応）: [`Self::insert_rows_into_table`]
     /// と同じ理由でクレート外へは公開しない（`tenant_id` を引数で受け取る生の経路）。
@@ -2416,20 +2452,22 @@ impl Storage {
         let write_txn = self.begin_write_txn()?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
-            let vector_idx = schema
-                .columns
-                .iter()
-                .position(|c| c.ty.is_vector())
-                .ok_or_else(|| CatalogError::Invalid("table has no VECTOR column".to_string()))?;
-            let embedding = match values.get(vector_idx) {
-                Some(RowCodecValue::Vector(v)) => v.clone(),
-                _ => {
-                    return Err(CatalogError::Invalid(
-                        "VECTOR column value missing or not a Vector".to_string(),
-                    ))
-                }
+            let vector_idx = schema.columns.iter().position(|c| c.ty.is_vector());
+            // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま
+            // 扱う（読み取り側の dim==0 モデルと整合）。列がある場合の「値が
+            // 欠落・非 Vector なら拒否」という fail-closed 判定は変えない。
+            let embedding = match vector_idx {
+                Some(idx) => match values.get(idx) {
+                    Some(RowCodecValue::Vector(v)) => v.clone(),
+                    _ => {
+                        return Err(CatalogError::Invalid(
+                            "VECTOR column value missing or not a Vector".to_string(),
+                        ))
+                    }
+                },
+                None => Vec::new(),
             };
-            schema.validate_embedding_dim(embedding.len())?;
+            schema.validate_row_embedding_dim(embedding.len())?;
             let metadata = row_codec::encode_scalar_columns(&schema, values)
                 .map_err(|e| CatalogError::Invalid(e.to_string()))?;
             let row_input = RowInput {
@@ -3267,6 +3305,39 @@ mod tests {
             vec![ColumnDef::new("body", ColumnType::Text, false)],
         );
         assert!(no_vector.validate_embedding_dim(384).is_err());
+    }
+
+    // Issue #995: 行全体を書き込む経路（INSERT 系）向けの次元検証。`VECTOR` 列
+    // ありスキーマでは `validate_embedding_dim` と完全に同一の判定・文言になり
+    // （受け入れ基準「`VECTOR` 列を持つスキーマの次元検証・エラー分類は変わらない」）、
+    // `VECTOR` 列なしスキーマでは dim 0 のみ受理する。
+    #[test]
+    fn table_schema_validate_row_embedding_dim_with_vector_column_matches_validate_embedding_dim() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("embedding", ColumnType::Vector(384), false)],
+        );
+        assert!(schema.validate_row_embedding_dim(384).is_ok());
+        let err = schema.validate_row_embedding_dim(128).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            schema.validate_embedding_dim(128).unwrap_err().to_string()
+        );
+    }
+
+    #[test]
+    fn table_schema_validate_row_embedding_dim_without_vector_column_accepts_only_empty() {
+        let no_vector = TableSchema::new(
+            "docs2",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        );
+        assert!(no_vector.validate_row_embedding_dim(0).is_ok());
+        let err = no_vector.validate_row_embedding_dim(1).unwrap_err();
+        assert!(
+            matches!(&err, CatalogError::Invalid(msg) if msg == "table has no VECTOR column"),
+            "non-empty embedding on a table without a VECTOR column must be rejected \
+             fail-closed with the same message as validate_embedding_dim, got: {err:?}"
+        );
     }
 
     // --- Storage::drop_table -----------------------------------------------
