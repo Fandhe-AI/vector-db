@@ -61,6 +61,19 @@ Protection` の `alert_description()` が `Some` を返す場合は、
 bad_record_mac 終了に対応）で fatal alert を 1 回だけ best-effort 送出
 してから失敗を返す。
 
+### 入力終端（EOF）の契約
+
+`read` が正常終端の `Ok(0)` を返すのは、相手の `close_notify` を受信した
+後に限る（RFC 8446 §6.1。PR #1056 レビュー指摘対応）。`close_notify`
+なしで生ソケットが EOF になった場合は、受信バッファに部分レコードが
+残っていれば `InvalidData`（truncation。`RecordBuffer::finish`）、
+レコード境界なら `UnexpectedEof` を返し、いずれも `failed` へ固定する
+（切断と正常終了・応答末尾の欠落を取り違えない）。上位の pg wire 層は
+メッセージ境界での `UnexpectedEof` を平文 TCP の切断と同じく
+`framing::read_typed_frame_header` で接続終了（`Ok(None)`）として静かに
+扱い、メッセージ途中なら `FrameError::Truncated`（応答なし）となる。
+失敗状態のため、切断後に `close_notify` や ErrorResponse は送らない。
+
 ### 緊急応答（RECOVER-6）との関係・既知の制約
 
 `WireStream::emergency_channel` は `None` を返す。
@@ -125,7 +138,8 @@ pipelined_plaintext_after_ssl_request_is_not_processed_as_startup` で
 
 - `tls::stream::tests`（単体）: 平文往復・空バッファ書き込みの no-op・
   `WouldBlock` を挟んだレコード途中読み取りの復旧・書き込み失敗後の
-  fail-closed 固定。実ハンドシェイクを経由しない `TlsSession::
+  fail-closed 固定・部分レコードを残した EOF（truncation）と `close_notify`
+  なしの EOF のエラー化・`close_notify` 受信後の正常終端。実ハンドシェイクを経由しない `TlsSession::
   new_for_tests`（`#[cfg(test)]` 限定）で鍵スケジュールから直接組み立てた
   `Sealer`/`Opener` を使う。
 - `tests/common/tls_client.rs`（新設）: `wire_server::tls::*` の公開 API
@@ -137,7 +151,9 @@ pipelined_plaintext_after_ssl_request_is_not_processed_as_startup` で
 - `tests/wire_tls_connection.rs`（新設）: TLS 未設定時の `'N'` 回帰・
   TLS opt-in 時の `'S'` → ハンドシェイク → StartupMessage → cleartext
   認証 → 簡易クエリ往復 → Terminate の完走・TLS 確立後の
-  `SSLRequest`/`GSSENCRequest` 拒否・pipelining 耐性を固定。
+  `SSLRequest`/`GSSENCRequest` 拒否・pipelining 耐性・`close_notify` なしの
+  クライアント切断（Terminate の有無を問わず）が panic・エラー終了・応答送出
+  なしに静かに終わることを固定。
 
 `cargo fmt --all -- --check`・`cargo clippy -p fandhe-vector-db-wire-server
 --all-targets -- -D warnings`・`cargo test -p fandhe-vector-db-wire-server`
