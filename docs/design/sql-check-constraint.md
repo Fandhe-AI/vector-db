@@ -189,6 +189,13 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 - `alter_table_add_column`／`alter_table_widen_numeric_precision`：
   再エンコード時に `checks` を保持する（`decode_schema_with_resolver` →
   変更 → `encode_schema` の往復で自動的に保存される）。
+- 依存列（`CheckConstraint::columns`）は、宣言的フィルタの参照列に加え、式述語
+  （組み込み関数の引数・算術式の内側を含む）が参照する列も集める（`vec_norm(embedding)`
+  の `VECTOR` 列等。PR #1055 codex P1 の是正）。`ALTER TABLE` の依存検査は記録された
+  依存列と、述語テキストからの再計算結果（`recompute_referenced_columns`）の両方で
+  判定し、再計算に失敗した制約は依存ありとみなす（fail-closed）。書き込み時の
+  コンパイルも記録が再計算結果を覆っていることを検査し、欠けていれば `XX000` で
+  拒否する。
 - `alter_table_drop_column`：CHECK が参照する列の削除は
   `CatalogError::DependentObjectsStillExist` で拒否する（PostgreSQL は制約を
   自動削除するが、制約を黙って弱める経路を作らないよう安全側に倒す）。

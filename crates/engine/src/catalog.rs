@@ -2694,11 +2694,20 @@ fn encode_column_line_v5(
 
 /// `schema` のいずれかの `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が列
 /// `column_name` を参照しているか（`ALTER TABLE` の依存オブジェクト検査用）。
+///
+/// カタログに記録された依存列（`CheckConstraint::columns`）に加え、述語テキストから
+/// 依存列を再計算して照合する（`sql::check_constraint::recompute_referenced_columns`。
+/// 式述語内の `VECTOR` 列参照など、記録が欠けていた場合でも依存を取りこぼさない
+/// 多層防御）。再計算に失敗した制約は「依存あり」とみなす（fail-closed。制約を
+/// 黙って壊す `ALTER` を通さない）。
 fn schema_check_references_column(schema: &TableSchema, column_name: &str) -> bool {
-    schema
-        .checks
-        .iter()
-        .any(|c| c.columns.iter().any(|col| col == column_name))
+    schema.checks.iter().any(|c| {
+        c.columns.iter().any(|col| col == column_name)
+            || match crate::sql::check_constraint::recompute_referenced_columns(schema, c) {
+                Ok(columns) => columns.iter().any(|col| col == column_name),
+                Err(_) => true,
+            }
+    })
 }
 
 /// `CHECK` 制約セクション（`checks:<N>` 行 + N 行の
@@ -7996,7 +8005,7 @@ mod tests {
         )
         .with_checks(vec![
             check("kind_ck", &["kind"], "kind = 'a'"),
-            check("amount_ck", &["amount"], "amount = 'x'"),
+            check("amount_ck", &["amount"], "amount > '1.00'"),
         ]);
         storage.create_table(&schema).expect("create table");
         let err = storage
@@ -8012,5 +8021,49 @@ mod tests {
             .expect("dropping an unreferenced column must succeed");
         let reloaded = storage.get_table_schema("docs").expect("schema");
         assert_eq!(reloaded.checks().len(), 2);
+    }
+
+    /// 回帰（PR #1055 codex P1）: 依存列の記録が欠けた `CHECK` でも、述語テキスト
+    /// からの再計算で依存を検出し `DROP COLUMN` を拒否する（式述語内の `VECTOR`
+    /// 列参照も依存として扱う）。
+    #[test]
+    fn check_dependency_is_recomputed_from_predicate_text() {
+        let path = unique_db_path("check-recompute-dependency");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("kind", ColumnType::Text, true),
+                ColumnDef::new("body", ColumnType::Text, true),
+            ],
+        )
+        .with_checks(vec![
+            check("no_record", &[], "kind = 'a'"),
+            check("vec_expr", &[], "vec_norm(embedding) < 100"),
+        ]);
+        assert!(schema_check_references_column(&schema, "embedding"));
+        assert!(schema_check_references_column(&schema, "kind"));
+        assert!(!schema_check_references_column(&schema, "body"));
+        storage.create_table(&schema).expect("create table");
+        let err = storage
+            .alter_table_drop_column("docs", "kind")
+            .expect_err("recomputed dependency must block DROP COLUMN");
+        assert!(matches!(err, CatalogError::DependentObjectsStillExist(name) if name == "kind"));
+        storage
+            .alter_table_drop_column("docs", "body")
+            .expect("unreferenced column can still be dropped");
+
+        // 再計算できない（破損した）述語は「依存あり」とみなす（fail-closed）。
+        let broken = TableSchema::new(
+            "docs2",
+            vec![
+                ColumnDef::new("kind", ColumnType::Text, true),
+                ColumnDef::new("body", ColumnType::Text, true),
+            ],
+        )
+        .with_checks(vec![check("broken", &["kind"], "kind = = 'a'")]);
+        assert!(schema_check_references_column(&broken, "body"));
     }
 }

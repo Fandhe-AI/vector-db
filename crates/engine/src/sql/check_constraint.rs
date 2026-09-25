@@ -189,14 +189,99 @@ fn reject_forbidden_expr(expr: &Expr) -> Result<(), SqlSurfaceError> {
     }
 }
 
-/// `predicates` が参照するテーブル列名を、束縛済み [`MetadataFilter`] から
-/// 復元する（`WherePredicate::Expression` は現状 `id`／`VECTOR` 列のみ参照可能
-/// で、いずれもスカラー列ではないため寄与しない。「既知の制約」節参照）。
-fn referenced_column_names(schema: &TableSchema, filters: &[MetadataFilter]) -> Vec<String> {
-    filters
-        .iter()
-        .filter_map(|f| schema.columns.get(f.column_index()).map(|c| c.name.clone()))
-        .collect()
+/// `CHECK` 述語が依存するテーブル列名（`ALTER TABLE` の依存検査に使う。疑似列
+/// `id` は含めない）を宣言順・重複なしで返す。3 つの情報源の和集合を取る
+/// （漏れは制約を黙って壊す経路になるため、過剰側に倒す。fail-closed）:
+///
+/// 1. 束縛済み宣言的フィルタ（[`MetadataFilter`]）の参照列
+/// 2. 束縛済み式フィルタのうち `VECTOR` 列を参照するもの（`vec_norm(embedding)`
+///    等。組み込み関数の引数・算術式の内側を含む。[`udf_call::references_embedding`]
+///    が再帰的に判定する）→ スキーマの `VECTOR` 列
+/// 3. 未束縛の式述語（[`WherePredicate::Expression`]）に現れる識別子
+///    （関数引数・算術式を再帰的に走査）のうち、スキーマの生存列名と一致するもの
+///    （式内で参照できる列が将来拡張されても、束縛側の表現に依存せず依存列を
+///    取りこぼさないための保険。ASCII 大文字小文字を無視して照合する）
+fn referenced_column_names(
+    schema: &TableSchema,
+    predicates: &[WherePredicate],
+    filters: &[MetadataFilter],
+    expr_filters: &[udf_call::BoundExpr],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    };
+    for filter in filters {
+        if let Some(column) = schema.columns.get(filter.column_index()) {
+            push(&column.name);
+        }
+    }
+    if expr_filters.iter().any(udf_call::references_embedding) {
+        if let Some(column) = schema.columns.iter().find(|c| c.ty.is_vector()) {
+            push(&column.name);
+        }
+    }
+    fn collect_idents<'a>(expr: &'a Expr, acc: &mut Vec<&'a str>) {
+        match expr {
+            Expr::Number(_) => {}
+            Expr::Ident(name) => acc.push(name.as_str()),
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    collect_idents(arg, acc);
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                collect_idents(lhs, acc);
+                collect_idents(rhs, acc);
+            }
+        }
+    }
+    let mut idents: Vec<&str> = Vec::new();
+    for predicate in predicates {
+        if let WherePredicate::Expression(expr) = predicate {
+            collect_idents(expr, &mut idents);
+        }
+    }
+    for ident in idents {
+        if let Some(column) = schema
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(ident))
+        {
+            push(&column.name);
+        }
+    }
+    out
+}
+
+/// 永続化済み `CHECK` の述語テキストを再パース・再束縛し、依存列を再計算する
+/// （[`referenced_column_names`] と同じ規則）。`catalog::Storage` の
+/// `ALTER TABLE` 依存検査が、カタログに記録された `CheckConstraint::columns` と
+/// 併用する（記録が欠けていても依存列を取りこぼさないための多層防御）。
+/// 再計算自体の失敗は呼び出し元が「依存あり」として扱う（fail-closed）。
+pub(crate) fn recompute_referenced_columns(
+    schema: &TableSchema,
+    check: &CheckConstraint,
+) -> Result<Vec<String>, SqlSurfaceError> {
+    let predicates = crate::sql::allowlist::parse_check_predicate_text(&check.predicate_sql)?;
+    reject_forbidden_elements(&predicates)?;
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    let (metadata_filters, expr_filters, _rls_predicate_present) =
+        crate::sql::parser::bind_where_predicates(
+            &predicates,
+            schema,
+            &UdfRegistry::default(),
+            &mut node_budget,
+            &[],
+        )?;
+    Ok(referenced_column_names(
+        schema,
+        &predicates,
+        &metadata_filters,
+        &expr_filters,
+    ))
 }
 
 /// `table` と列 `column`（`Some` のとき列制約・`None` のとき表制約）から
@@ -287,7 +372,7 @@ pub(crate) fn validate_and_build(
         reject_forbidden_elements(&check.predicates)?;
 
         let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-        let (metadata_filters, _expr_filters, _rls_predicate_present) =
+        let (metadata_filters, expr_filters, _rls_predicate_present) =
             crate::sql::parser::bind_where_predicates(
                 &check.predicates,
                 schema,
@@ -296,7 +381,8 @@ pub(crate) fn validate_and_build(
                 &[],
             )?;
 
-        let columns = referenced_column_names(schema, &metadata_filters);
+        let columns =
+            referenced_column_names(schema, &check.predicates, &metadata_filters, &expr_filters);
         if columns.len() > crate::catalog::MAX_CHECK_REFERENCED_COLUMNS {
             return Err(SqlSurfaceError::payload_too_large(
                 "CHECK constraint references too many columns",
@@ -402,6 +488,18 @@ impl CompiledChecks {
                     &[],
                 )
                 .map_err(corrupt_check)?;
+
+            // 依存列の記録（`CheckConstraint::columns`）が再計算結果を覆っていること
+            // を検査する。欠けていれば `ALTER TABLE` の依存検査が素通りし得た
+            // 破損・漂流であり、書き込みを fail-closed に拒否する。
+            let recomputed =
+                referenced_column_names(schema, &predicates, &metadata_filters, &expr_filters);
+            if let Some(missing) = recomputed.iter().find(|c| !check.columns.contains(c)) {
+                return Err(corrupt_check(SqlSurfaceError::unsupported(format!(
+                    "CHECK constraint {:?} does not record dependent column {missing:?}",
+                    check.name
+                ))));
+            }
 
             let mut conjuncts = Vec::with_capacity(metadata_filters.len() + expr_filters.len());
             for filter in metadata_filters {
@@ -658,8 +756,67 @@ mod tests {
         );
         let schema = schema_of(&v);
         let checks = validate_and_build(&schema, &v.checks).expect("must validate");
-        assert_eq!(checks[0].columns, Vec::<String>::new());
+        // 回帰（PR #1055 codex P1）: 式述語が参照する `VECTOR` 列も依存列として
+        // 記録する（旧実装は宣言的フィルタの列しか集めず空だった）。
+        assert_eq!(checks[0].columns, vec!["embedding".to_string()]);
         assert_eq!(checks[0].predicate_sql, "vec_norm(embedding) < 100");
+    }
+
+    /// 式の内側（組み込み関数の引数・算術式）に現れる列参照も依存列として
+    /// 収集し、宣言的フィルタの列と重複なく併合する。`id` は疑似列のため含めない。
+    #[test]
+    fn validate_and_build_collects_columns_referenced_inside_expressions() {
+        let v = parse_create_table(
+            "CREATE TABLE docs (embedding VECTOR(3), kind TEXT, \
+             CHECK (kind = 'a' AND (vec_sum(embedding) + id) * 2 < 100 AND vec_norm(embedding) > 0))",
+        );
+        let schema = schema_of(&v);
+        let checks = validate_and_build(&schema, &v.checks).expect("must validate");
+        assert_eq!(
+            checks[0].columns,
+            vec!["kind".to_string(), "embedding".to_string()]
+        );
+        // 再計算（`ALTER TABLE` の依存検査が併用する）も同じ結果になる。
+        assert_eq!(
+            recompute_referenced_columns(&schema, &checks[0]).expect("recompute"),
+            checks[0].columns
+        );
+    }
+
+    /// 記録された依存列が再計算結果を覆っていない（破損・漂流した）`CHECK` は、
+    /// 書き込み時のコンパイルで fail-closed に拒否する。
+    #[test]
+    fn compiled_checks_reject_check_missing_recorded_dependency() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("kind", ColumnType::Text, true),
+            ],
+        );
+        for (columns, predicate) in [
+            (vec![], "vec_norm(embedding) < 100"),
+            (vec![], "kind = 'a'"),
+            (
+                vec!["kind".to_string()],
+                "kind = 'a' AND vec_norm(embedding) < 100",
+            ),
+        ] {
+            let schema = schema.clone().with_checks(vec![CheckConstraint {
+                name: "c".to_string(),
+                columns,
+                predicate_sql: predicate.to_string(),
+            }]);
+            assert!(
+                matches!(
+                    CompiledChecks::compile(&schema),
+                    Err(TenantWriteError::Catalog(
+                        crate::catalog::CatalogError::CorruptSchema(_)
+                    ))
+                ),
+                "{predicate}"
+            );
+        }
     }
 
     #[test]
