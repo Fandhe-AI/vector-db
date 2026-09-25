@@ -928,6 +928,15 @@ fn respond_error_and_close(stream: &mut TcpStream, err: &HandlerError) -> io::Re
 
 /// ErrorResponse を送出したうえで [`ExtendedQueryState::ignore_till_sync`] を
 /// 立てる（モジュールドキュメント「エラー後の同期回復」節）。接続は維持する。
+///
+/// 拡張クエリプロトコルのエラー応答（Parse・Bind・Describe・Execute・Close 等）は
+/// すべて本関数を通る。`handshake::post_auth_loop` は各メッセージの処理後（と次の
+/// メッセージの受信直後）に `ignore_till_sync` を見て、明示トランザクションが
+/// `Active` なら `Failed` へ遷移させる（SQL-31・TASK-221。PR #1041 レビュー指摘）。
+/// 各ハンドラは `SessionTransaction` を受け取らないため、この旗が唯一の受け渡し
+/// 経路になる。エラー応答を本関数以外の方法で返す経路を追加してはならない
+/// （切断する経路は `respond_error_and_close`。切断で `SessionTransaction` が
+/// drop され、書き込みトランザクションは abort される）。
 fn respond_error_and_await_sync(
     stream: &mut TcpStream,
     err: &HandlerError,
@@ -963,6 +972,7 @@ fn io_error_from_frame(e: FrameError) -> io::Error {
 pub(crate) fn handle_parse(
     stream: &mut TcpStream,
     engine: &EngineCore,
+    txn: &mut engine::sql::transaction::SessionTransaction<'_>,
     state: &mut ExtendedQueryState,
 ) -> io::Result<LoopSignal> {
     let body = match framing::read_length_prefixed_body(
@@ -979,7 +989,7 @@ pub(crate) fn handle_parse(
         }
     };
 
-    match handle_parse_body(engine, &mut state.statements, &body) {
+    match handle_parse_body(engine, txn, &mut state.statements, &body) {
         Ok(()) => {
             stream.write_all(&result_encoder::encode_parse_complete())?;
             stream.flush()?;
@@ -994,12 +1004,22 @@ pub(crate) fn handle_parse(
 
 fn handle_parse_body(
     engine: &EngineCore,
+    txn: &mut engine::sql::transaction::SessionTransaction<'_>,
     store: &mut PreparedStatementStore,
     body: &[u8],
 ) -> Result<(), HandlerError> {
     let msg = parse_parse_body(body)?;
     if msg.num_param_types > 0 {
         return Err(HandlerError::ParamTypesUnsupported);
+    }
+    // 明示トランザクションが `Failed` の間は、`ROLLBACK` と空文字列以外を parse
+    // より前に `25P02` で拒否する（SQL-31・TASK-221。簡易クエリの
+    // `EngineCore::execute_sql_in_txn` と同じ判定順序。PR #1041 レビュー指摘）。
+    if txn.status() == engine::sql::transaction::TransactionStatus::Failed
+        && !msg.query.trim().is_empty()
+        && !engine::sql::transaction::is_rollback_statement(&msg.query)
+    {
+        return Err(HandlerError::Sql(txn.take_failed_error()));
     }
 
     let statement = if msg.query.trim().is_empty() {
@@ -1193,6 +1213,7 @@ pub(crate) fn handle_bind(
     stream: &mut TcpStream,
     engine: &EngineCore,
     session: &SessionState,
+    txn: &mut engine::sql::transaction::SessionTransaction<'_>,
     state: &mut ExtendedQueryState,
 ) -> io::Result<LoopSignal> {
     let body = match framing::read_length_prefixed_body(
@@ -1209,7 +1230,7 @@ pub(crate) fn handle_bind(
         }
     };
 
-    match handle_bind_body(engine, session, state, &body) {
+    match handle_bind_body(engine, session, txn, state, &body) {
         Ok(()) => {
             stream.write_all(&result_encoder::encode_bind_complete())?;
             stream.flush()?;
@@ -1225,6 +1246,7 @@ pub(crate) fn handle_bind(
 fn handle_bind_body(
     engine: &EngineCore,
     session: &SessionState,
+    txn: &mut engine::sql::transaction::SessionTransaction<'_>,
     state: &mut ExtendedQueryState,
     body: &[u8],
 ) -> Result<(), HandlerError> {
@@ -1236,6 +1258,20 @@ fn handle_bind_body(
         .statements
         .get(&msg.statement_name)
         .ok_or(HandlerError::UnknownStatement)?;
+
+    // 明示トランザクションが `Failed` の間は、`ROLLBACK` と空文字列以外の
+    // ステートメントの Bind を `25P02` で拒否する（`Failed` になる前に Parse 済みの
+    // ステートメントを含む。SQL-31・TASK-221。PR #1041 レビュー指摘）。
+    let is_exit_or_empty = matches!(
+        statement,
+        PreparedStatement::Empty
+            | PreparedStatement::Parsed(ParsedSql::Transaction(
+                engine::sql::transaction::TxnControl::Rollback
+            ))
+    );
+    if txn.status() == engine::sql::transaction::TransactionStatus::Failed && !is_exit_or_empty {
+        return Err(HandlerError::Sql(txn.take_failed_error()));
+    }
 
     // `$n` 束縛は #935（WIRE-12）の担当。現状ステートメントが要求する
     // パラメータ数は常に 0（`parse_parse_body` が `num_param_types > 0` を

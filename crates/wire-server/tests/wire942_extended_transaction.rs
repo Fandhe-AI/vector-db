@@ -432,3 +432,169 @@ fn expired_transaction_releases_writer_on_next_protocol_message() {
     let _tag = read_command_complete(&mut other);
     read_ready_for_query(&mut other);
 }
+
+/// 拡張クエリの 1 メッセージを送り、ErrorResponse が返ったあと Sync で
+/// ReadyForQuery まで進める。
+fn send_expect_error_then_sync(stream: &mut std::net::TcpStream, type_byte: u8, body: &[u8]) {
+    send_length_prefixed_message(stream, type_byte, body);
+    let (kind, _) = read_message(stream);
+    assert_eq!(kind, b'E', "expected ErrorResponse");
+    send_sync(stream);
+    assert_ready_for_query(stream);
+}
+
+/// 拡張クエリプロトコルの Bind エラーでも明示トランザクションが `Failed` へ
+/// 遷移し、後続の `COMMIT` が先行する `INSERT` を永続化しないこと（PR #1041
+/// レビュー指摘）。
+#[test]
+fn extended_bind_error_inside_transaction_blocks_commit() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 36, "op-942-36");
+    // 存在しないステートメントへの Bind。
+    send_expect_error_then_sync(&mut stream, b'B', &bind_body("p1", "no-such-statement"));
+
+    expect_commit_rejected_then_rollback(&mut stream);
+    assert_eq!(visible_rows_with_id(&core, 36), 0);
+}
+
+/// 拡張クエリプロトコルの Describe エラーでも明示トランザクションが `Failed` へ
+/// 遷移し、後続の `COMMIT` が先行する `INSERT` を永続化しないこと（PR #1041
+/// レビュー指摘）。
+#[test]
+fn extended_describe_error_inside_transaction_blocks_commit() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 37, "op-942-37");
+    // 存在しないステートメントの Describe。
+    let mut body = vec![b'S'];
+    body.extend_from_slice(b"no-such-statement\0");
+    send_expect_error_then_sync(&mut stream, b'D', &body);
+
+    expect_commit_rejected_then_rollback(&mut stream);
+    assert_eq!(visible_rows_with_id(&core, 37), 0);
+}
+
+/// 対照: エラーなしで COMMIT すれば行が確定する（上の各テストの行数判定が
+/// 空振りしていないことの確認）。
+#[test]
+fn begin_insert_commit_over_simple_query_persists_the_row() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 38, "op-942-38");
+    send_simple_query(&mut stream, "COMMIT");
+    assert_eq!(read_command_complete(&mut stream), "COMMIT");
+    read_ready_for_query(&mut stream);
+    assert_eq!(visible_rows_with_id(&core, 38), 1);
+}
+
+/// `Failed` 中は構文エラーの文も parse より前に `25P02` で拒否され、`ROLLBACK`
+/// だけは受理されること（PR #1041 レビュー指摘）。
+#[test]
+fn syntax_error_while_failed_is_rejected_with_in_failed_sql_transaction() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 39, "op-942-39");
+    send_simple_query(&mut stream, "BEGIN");
+    expect_error_response_with_sqlstate(&mut stream, "25001");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELEC id FROM documents");
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+    assert_eq!(visible_rows_with_id(&core, 39), 0);
+}
+
+/// 拡張クエリプロトコルでも `Failed` 中は `ROLLBACK` 以外の Parse・Bind を
+/// `25P02` で拒否し、`ROLLBACK` の Parse/Bind/Execute は受理すること
+/// （`Failed` になる前に Parse 済みのステートメントの Bind も拒否する。PR #1041
+/// レビュー指摘）。
+#[test]
+fn extended_parse_and_bind_while_failed_are_rejected_except_rollback() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 43, "op-942-43");
+    // Failed になる前に INSERT を Parse しておく。
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("ins-before", &insert_sql(44, "op-942-44"), 0),
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'1', "expected ParseComplete");
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "BEGIN");
+    expect_error_response_with_sqlstate(&mut stream, "25001");
+    read_ready_for_query(&mut stream);
+
+    // 構文エラーの Parse も 25P02。
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("bad", "SELEC 1", 0));
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
+
+    // Failed 前に Parse 済みの INSERT の Bind も 25P02。
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("pi", "ins-before"));
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
+
+    // ROLLBACK は Parse/Bind/Execute とも受理される。
+    parse_and_bind(&mut stream, "rb", "prb", "ROLLBACK");
+    assert_eq!(
+        execute_and_read_command_complete(&mut stream, "prb"),
+        "ROLLBACK"
+    );
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
+
+    assert_eq!(visible_rows_with_id(&core, 43), 0);
+    assert_eq!(visible_rows_with_id(&core, 44), 0);
+}
+
+/// `Failed` 中は複数文メッセージの分割エラーも `25P02` で拒否すること
+/// （個々の文と同じ扱い。PR #1041 レビュー指摘）。
+#[test]
+fn split_error_while_failed_is_rejected_with_in_failed_sql_transaction() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 45, "op-942-45");
+    send_simple_query(&mut stream, "BEGIN");
+    expect_error_response_with_sqlstate(&mut stream, "25001");
+    read_ready_for_query(&mut stream);
+
+    let too_many = "SELECT id FROM documents LIMIT 1;"
+        .repeat(engine::sql::statement_splitter::MAX_STATEMENTS_PER_QUERY + 1);
+    send_simple_query(&mut stream, &too_many);
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+    assert_eq!(visible_rows_with_id(&core, 45), 0);
+}

@@ -478,6 +478,12 @@ fn post_auth_loop<'e>(
         // `SessionTransaction` が drop されライタが解放される。
         if let Some(txn) = txn.as_mut() {
             txn.release_if_expired();
+            // 拡張クエリプロトコルのエラー後（`ignore_till_sync`）は、ループ末尾の
+            // 同じ検査に加えてここでも `Failed` へ遷移させる（ループ末尾へ到達しない
+            // `continue` 経路が将来追加されても取りこぼさないための多層防御）。
+            if extended.ignore_till_sync {
+                txn.fail();
+            }
         }
 
         // WIRE-11 確定化（Issue #934）: 拡張クエリプロトコルのエラー後は
@@ -650,14 +656,14 @@ fn post_auth_loop<'e>(
                 // 自体が存在しないため、従来どおり `protocol_dispatch::
                 // reject_and_close`（`0A000` + 切断）へ倒す（WIRE-8 が Parse に
                 // 適用していた契約をそのまま維持）。
-                match engine {
-                    Some(engine) => {
-                        match crate::extended_query::handle_parse(stream, engine, extended)? {
+                match (engine, txn.as_mut()) {
+                    (Some(engine), Some(txn)) => {
+                        match crate::extended_query::handle_parse(stream, engine, txn, extended)? {
                             crate::extended_query::LoopSignal::Continue => {}
                             crate::extended_query::LoopSignal::Closed => return Ok(()),
                         }
                     }
-                    None => {
+                    _ => {
                         // `other` 分岐（WIRE-8）と同じく、`0A000` を返す前に長さ
                         // フィールド自体を検証する（malformed frame を正規の
                         // 未対応機能扱いにしない。レビュー指摘の回帰防止）。
@@ -703,14 +709,16 @@ fn post_auth_loop<'e>(
                     }
                 }
             }
-            b'B' => match engine {
-                Some(engine) => {
-                    match crate::extended_query::handle_bind(stream, engine, session, extended)? {
+            b'B' => match (engine, txn.as_mut()) {
+                (Some(engine), Some(txn)) => {
+                    match crate::extended_query::handle_bind(
+                        stream, engine, session, txn, extended,
+                    )? {
                         crate::extended_query::LoopSignal::Continue => {}
                         crate::extended_query::LoopSignal::Closed => return Ok(()),
                     }
                 }
-                None => {
+                _ => {
                     framing::validate_typed_message_length_prefix(
                         stream,
                         framing::MIN_TYPED_MESSAGE_LEN,

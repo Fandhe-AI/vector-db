@@ -151,8 +151,7 @@ pub(crate) fn execute_and_respond<'e>(
             // 分割・位置検証のエラーも、明示トランザクション中なら `Failed` へ
             // 遷移させる（SQL-31・TASK-221。PR #1041 レビュー指摘: `Active` の
             // まま残すと後続の `COMMIT` が先行する書き込みを永続化してしまう）。
-            txn.fail();
-            respond_error_and_ready(stream, e.error_class(), &e.client_message())
+            respond_splitter_error(stream, txn, &e)
         }
         Ok(engine::sql::statement_splitter::SplitOutcome::Single) => run_statement(
             stream,
@@ -177,8 +176,7 @@ pub(crate) fn execute_and_respond<'e>(
             if let Err(e) =
                 engine::sql::statement_splitter::check_write_placement(&stmts, txn.is_active())
             {
-                txn.fail();
-                return respond_error_and_ready(stream, e.error_class(), &e.client_message());
+                return respond_splitter_error(stream, txn, &e);
             }
             // 途中の文がエラーになった場合にメッセージ受信前の状態へ巻き戻す
             // ためのスナップショット（`SET`／`CREATE FUNCTION` の暗黙ロールバック）。
@@ -208,6 +206,24 @@ pub(crate) fn execute_and_respond<'e>(
             Ok(())
         }
     }
+}
+
+/// 複数文メッセージの分割・位置検証エラーの応答（SQL-31・TASK-221）。
+/// 明示トランザクションが `Failed` なら、個々の文と同じく `25P02`（期限切れの
+/// 未報告分があれば `54000`）を返す。`Active` なら `Failed` へ遷移させてから
+/// 元のエラーを返す（`Active` のまま残すと後続の `COMMIT` が先行する書き込みを
+/// 永続化してしまう。PR #1041 レビュー指摘）。
+fn respond_splitter_error(
+    stream: &mut TcpStream,
+    txn: &mut SessionTransaction<'_>,
+    e: &engine::sql::statement_splitter::MultiStatementError,
+) -> io::Result<()> {
+    if txn.status() == engine::sql::transaction::TransactionStatus::Failed {
+        let failed = txn.take_failed_error();
+        return respond_error_and_ready(stream, failed.error_class(), &failed.client_message());
+    }
+    txn.fail();
+    respond_error_and_ready(stream, e.error_class(), &e.client_message())
 }
 
 /// 複数文実行の 1 文を実行し、応答（`finish` に応じた `ReadyForQuery` の有無）を
