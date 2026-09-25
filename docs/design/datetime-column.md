@@ -118,14 +118,20 @@ PG のバイナリ表現を返す場合はオフセット変換が必要にな�
 
 ## Issue #893 追記: スカラー二次索引
 
-`ScalarIndex::build` は `DATE`／`TIMESTAMP` 列を `i64` へ昇格した順序索引
-（`sql::scalar_index::OrderedColumnIndex::I64`）で索引化するよう実装した
-（`DATE` は日数、`TIMESTAMP` はマイクロ秒。`TIMESTAMP` の絶対値が `2^53`
-を超える値を 1 件でも含む列は列単位で索引対象外へ縮退する。`DATE` は値域が
-`i32` のため構造的にこの上限に収まる）。ただし WHERE 句・式が `DATE`／
-`TIMESTAMP` 列をまだ参照できない（下記「WHERE の比較・等価述語と式評価
-（#891）」が未接続）ため、SQL 表層からは未到達のまま。詳細は
-`docs/design/scalar-index-prune.md`「Issue #893」節参照。
+`DATE`／`TIMESTAMP` 列を `i64` へ昇格した順序索引
+（`sql::scalar_index::OrderedColumnIndex::I64`。`DATE` は日数、`TIMESTAMP`
+はマイクロ秒。`TIMESTAMP` の絶対値が `2^53` を超える値を 1 件でも含む列は
+列単位で索引対象外へ縮退する。`DATE` は値域が `i32` のため構造的にこの上限
+に収まる）で索引化するロジック自体は実装したが、production 経路の既定入口
+`ScalarIndex::build` は `TypedRangePredicate` の本線配線（WHERE の比較・
+等価述語と式評価。下記「WHERE の比較・等価述語と式評価（#891）」が未接続）
+を待つ間、typed 列（`DATE`／`TIMESTAMP` を含む）の構築を `BOOLEAN` 等と
+同じ非索引化（`None`）へ遅延させている（codex-review P2 指摘・PR #1032）。
+索引化ロジックの単体テストはテスト専用入口
+`ScalarIndex::build_including_unwired_typed_range_columns` 経由でのみ検証
+され、SQL 表層からは引き続き未到達のまま。詳細は
+`docs/design/scalar-index-prune.md`「Issue #893」節・「レビュー対応」節
+参照。
 
 ## 対象外（申し送り）
 

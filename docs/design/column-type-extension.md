@@ -613,8 +613,13 @@ scale }` を追加した。`DECIMAL` は別名として扱うだけで、カタ�
   `sql::scan`（DecodeTier 分類）・`sql::using_plan`（本文列規約）は
   いずれも明示的な拒否・除外腕を追加した。`sql::scalar_index` は本 Issue
   時点では索引対象外だったが、#893 で `OrderedColumnIndex::I128` として
-  索引化した（`WHERE` 述語からの到達経路は #891 未接続のまま。詳細は
-  `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
+  索引化するロジック自体は実装した。ただし production 経路の既定入口
+  `ScalarIndex::build` は `WHERE` 述語からの到達経路（#891 未接続）が
+  無いまま構築コストだけを負う退行を避けるため、本列を含む typed 列の
+  構築を `BOOLEAN` 等と同じ非索引化（`None`）へ遅延させている
+  （codex-review P2 指摘・PR #1032）。詳細は
+  `docs/design/scalar-index-prune.md`「Issue #893」節・「レビュー対応」節
+  参照。
 - **wire-server**: `result_encoder.rs::cell_to_text`・`http/query/response.rs`
   の JSON 出力に `Cell::Numeric` を追加。NoSQL `update` op の JSON `SET`
   束縛（`http/query/update.rs`）は NUMERIC 列を対象外として明示的に拒否し
@@ -637,10 +642,13 @@ scale }` を追加した。`DECIMAL` は別名として扱うだけで、カタ�
   での `NUMERIC`/`DECIMAL` 列宣言（SQL-23 は未実装）、ファイル形 `INSERT`
   （`path`/`body` 列規約専用のため NUMERIC 列は明示的に拒否）。スカラー
   二次索引化（#893。`unscaled` の `i128` をキーとする順序索引
-  `sql::scalar_index::OrderedColumnIndex::I128` として実装済み。ただし
-  `WHERE` 述語がまだ NUMERIC 列を bind 時点で拒否している〔#891 未接続〕
-  ため SQL 表層からは未到達。詳細は `docs/design/scalar-index-prune.md`
-  「Issue #893」節参照）。
+  `sql::scalar_index::OrderedColumnIndex::I128` として構築ロジック自体は
+  実装済み。ただし `WHERE` 述語がまだ NUMERIC 列を bind 時点で拒否して
+  いる〔#891 未接続〕ため SQL 表層からは未到達で、production 経路の
+  既定入口 `ScalarIndex::build` も typed 列の構築自体を非索引化（`None`）
+  へ遅延させている〔codex-review P2 指摘・PR #1032〕。詳細は
+  `docs/design/scalar-index-prune.md`「Issue #893」節・「レビュー対応」節
+  参照）。
 
 ## #887 追記: UUID 列型
 
@@ -660,9 +668,12 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
   未結線（WHERE 比較・ORDER BY は #891 へ、二次索引は #893 で
   `sql::scalar_index::OrderedColumnIndex::U128`〔ネットワークバイトオーダーの
   バイト列を `u128` ビッグエンディアンとして扱う。この `Ord` 導出と同じ大小
-  関係になる〕として実装済み。ただし `WHERE` 述語がまだ UUID 列を bind
-  時点で拒否している〔#891 未接続〕ため SQL 表層からは未到達。詳細は
-  `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
+  関係になる〕として構築ロジック自体は実装済み。ただし `WHERE` 述語がまだ
+  UUID 列を bind 時点で拒否している〔#891 未接続〕ため SQL 表層からは
+  未到達で、production 経路の既定入口 `ScalarIndex::build` も typed 列の
+  構築自体を非索引化（`None`）へ遅延させている〔codex-review P2 指摘・
+  PR #1032〕。詳細は `docs/design/scalar-index-prune.md`「Issue #893」節・
+  「レビュー対応」節参照）。
 - **カタログ**: 型タグ `"uuid"`・`param` は常に `"-"`（他のパラメータなし
   スカラー型と同じ）。
 - **行バイト表現**: presence タグに続く 16 バイト生値固定
@@ -699,7 +710,10 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
   （本文列規約）はいずれも明示的な拒否腕を追加した（網羅性はコンパイラが
   強制。ワイルドカード腕は使わない）。`sql::scalar_index` は本 Issue
   時点では索引対象外だったが、#893 で `OrderedColumnIndex::U128` として
-  索引化した（`WHERE` 述語からの到達経路は #891 未接続のまま）。
+  索引化するロジック自体は実装した（`WHERE` 述語からの到達経路は #891
+  未接続のまま。production 経路の既定入口 `ScalarIndex::build` も typed
+  列の構築自体を非索引化〔`None`〕へ遅延させている〔codex-review P2
+  指摘・PR #1032〕）。
   `sql::scan`（DecodeTier 分類・投影）は UUID 列を他のスカラー型と同じ
   `DimAndScalar` tier で扱う。
 - **wire-server**: `result_encoder.rs::cell_to_text`・`http/query/response.rs`
@@ -717,5 +731,9 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
   `SUM`/`AVG`/`MIN`/`MAX`（#892）、`DecodeTier` の精査（#894）、UUID 列の
   バイナリ形式・OID 2950 対応（#895）、NoSQL `insert` op での JSON 束縛
   （#896）、SQL `CREATE TABLE` 構文での `UUID` 列宣言（SQL-23 は未実装）。
-  スカラー二次索引化（#893）は `OrderedColumnIndex::U128` として実装済み
-  （詳細は `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
+  スカラー二次索引化（#893）は `OrderedColumnIndex::U128` として構築
+  ロジック自体は実装済みだが、production 経路の既定入口
+  `ScalarIndex::build` は typed 列の構築を非索引化（`None`）へ遅延させて
+  おり未到達のまま（codex-review P2 指摘・PR #1032）。詳細は
+  `docs/design/scalar-index-prune.md`「Issue #893」節・「レビュー対応」節
+  参照。
