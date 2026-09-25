@@ -81,6 +81,23 @@ impl DeclarativeFilter {
     /// いずれも不一致は `22000`）・リテラル長上限（[`MAX_TEXT_FIELD_LEN`] 超は
     /// `54000`）・空 prefix 拒否（`22000`）を検証する。
     pub fn bind(&self, schema: &TableSchema) -> Result<MetadataFilter, SqlSurfaceError> {
+        self.bind_impl(schema, false)
+    }
+
+    /// [`Self::bind`] の内部実装。`skip_enum_label_validation` が `true` の
+    /// ときに限り、ENUM 列の等価フィルタで語彙照合（`EnumTypeDef::
+    /// validate_label`）を省略する。Prepared Describe（`$n` 由来のダミー値。
+    /// PR #1012・Cursor Bugbot 指摘対応）専用の縮退経路であり、公開 API
+    /// [`Self::bind`]／[`bind_all`] は常に `false`（従来どおり全値検証）を渡す
+    /// （`sql::parser::bind_where_predicates` の `dummy_equality_flags` 経由の
+    /// み `true` になりうる。詳細は同関数のドキュメント参照）。列型検査・
+    /// リテラル長上限・空 prefix 拒否など値に依存しない構造検証は
+    /// `skip_enum_label_validation` の値に関係なく常に行う。
+    fn bind_impl(
+        &self,
+        schema: &TableSchema,
+        skip_enum_label_validation: bool,
+    ) -> Result<MetadataFilter, SqlSurfaceError> {
         let column_index = schema
             .columns
             .iter()
@@ -101,7 +118,13 @@ impl DeclarativeFilter {
                 match &column.ty {
                     ColumnType::Text => {}
                     ColumnType::Enum(def) => {
-                        if def.validate_label(value).is_err() {
+                        // `skip_enum_label_validation` が `true` の場合、この値は
+                        // `sql::params::substitute_dummy` が生成した固定ダミー
+                        // 文字列であり、実際にどのラベルが束縛されるかは Bind
+                        // まで未確定（PR #1012 Cursor Bugbot 指摘: ここで通常どおり
+                        // 語彙照合すると、`WHERE enum_col = $n` を含む文の Describe
+                        // が実リテラルの有無に関わらず常に `22P02` になってしまう）。
+                        if !skip_enum_label_validation && def.validate_label(value).is_err() {
                             return Err(SqlSurfaceError::invalid_text_representation(format!(
                                 "column {:?} (enum {:?}) does not accept label {value:?}",
                                 self.column,
@@ -109,7 +132,13 @@ impl DeclarativeFilter {
                             )));
                         }
                     }
+                    // F10（Issue #882 計画）: REAL/DOUBLE 列は VECTOR 列と同じ
+                    // 「TEXT 列でない」拒否腕へ合流させる（対応は #891 へ申し送り）。
                     ColumnType::Vector(_)
+                    | ColumnType::Integer
+                    | ColumnType::BigInt
+                    | ColumnType::Real
+                    | ColumnType::Double
                     | ColumnType::Boolean
                     | ColumnType::Date
                     | ColumnType::Timestamp
@@ -270,6 +299,32 @@ pub fn bind_all(
     Ok(bound)
 }
 
+/// [`bind_all`] の Prepared Describe 専用版（PR #1012 Cursor Bugbot 指摘対応。
+/// Issue #935・WIRE-12・TASK-217）。`filters[i]` を束縛する際、
+/// `skip_enum_label_validation[i]`（範囲外は `false` 扱い）が `true` の場合に
+/// 限り ENUM 列の等価フィルタの語彙照合を省略する。呼び出し元
+/// （`sql::parser::bind_where_predicates`）は、`sql::params::
+/// order_by_distance_literal_is_param` と同じ設計で「そのフィルタの値が
+/// `$n` に由来する固定ダミーかどうか」を並べたスライスを渡す。`filters` と
+/// `skip_enum_label_validation` の対応は呼び出し元が構築順を揃えて保証する
+/// 契約（本関数自身は対応関係を検証しない）。
+pub(crate) fn bind_all_for_describe(
+    filters: &[DeclarativeFilter],
+    schema: &TableSchema,
+    skip_enum_label_validation: &[bool],
+) -> Result<Vec<MetadataFilter>, SqlSurfaceError> {
+    check_filter_count(filters.len())?;
+    let mut bound = Vec::with_capacity(filters.len());
+    for (index, filter) in filters.iter().enumerate() {
+        let skip = skip_enum_label_validation
+            .get(index)
+            .copied()
+            .unwrap_or(false);
+        bound.push(filter.bind_impl(schema, skip)?);
+    }
+    Ok(bound)
+}
+
 /// `scanned`（`row_codec::scan_scalar_columns` が返す列値。添字は列インデックス）に
 /// 対して `filters` を全件 AND 評価する。範囲外インデックスは不一致として扱う
 /// （fail-closed。`scanned` は投影・フィルタが必要とする列だけを保持する構造の
@@ -277,6 +332,11 @@ pub fn bind_all(
 /// 範囲外になり得る）。
 pub fn matches_all(filters: &[MetadataFilter], scanned: &[Option<ScalarRef<'_>>]) -> bool {
     filters.iter().all(|f| {
+        // 型不一致（`TEXT` フィルタに `Bool`／`Real`／`Double` 値、`BoolEquals` に
+        // `Text` 値等）は `bind` が列型で事前に排除している契約だが、
+        // `MetadataFilter::matches` 側で防御的に不一致（fail-closed）へ落とす
+        // （F10: TEXT 系フィルタに対する REAL/DOUBLE も同様に「値なし」と同じ
+        // 扱いになる）。
         let value = scanned.get(f.column_index).copied().flatten();
         f.matches(value)
     })
@@ -335,6 +395,48 @@ mod tests {
             .bind(&schema())
             .unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // PR #1012 Cursor Bugbot 指摘の回帰: `bind_all_for_describe` は
+    // `skip_enum_label_validation[i]` が `true` の位置に限り ENUM 列の等価
+    // フィルタの語彙照合を省略し、それ以外（範囲外含む）は従来どおり
+    // `bind`（`bind_impl(.., false)`）と同一の検証を行う。
+    #[test]
+    fn bind_all_for_describe_skips_enum_validation_only_at_flagged_positions() {
+        use crate::storage::Storage;
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+        let path = unique_db_path("declarative-filter-bind-all-for-describe");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let mood = storage
+            .create_enum_type("mood", vec!["happy".to_string(), "sad".to_string()])
+            .expect("create enum type");
+        let schema_with_enum = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("mood", ColumnType::Enum(mood), true)],
+        );
+
+        // flags[0] = true（ダミー値扱い）: 語彙外ラベルでも束縛が成功する。
+        let filters = [DeclarativeFilter::equals("mood", "not-a-real-mood")];
+        let bound = bind_all_for_describe(&filters, &schema_with_enum, &[true])
+            .expect("skip_enum_label_validation=true must accept an out-of-vocabulary label");
+        assert_eq!(bound.len(), 1);
+
+        // flags[0] = false（実値扱い）: 従来どおり `22P02` で拒否される。
+        let err = bind_all_for_describe(&filters, &schema_with_enum, &[false])
+            .expect_err("skip_enum_label_validation=false must reject the same invalid label");
+        assert_eq!(err.wire_code(), "22P02");
+
+        // flags が短い（対応する要素が無い）場合は `false` 扱い（安全側）。
+        let err_default = bind_all_for_describe(&filters, &schema_with_enum, &[])
+            .expect_err("missing flag entries must default to full validation");
+        assert_eq!(err_default.wire_code(), "22P02");
+
+        // 妥当なラベルは `skip_enum_label_validation` の値に関係なく常に成功する。
+        let valid_filters = [DeclarativeFilter::equals("mood", "happy")];
+        assert!(bind_all_for_describe(&valid_filters, &schema_with_enum, &[true]).is_ok());
+        assert!(bind_all_for_describe(&valid_filters, &schema_with_enum, &[false]).is_ok());
     }
 
     #[test]

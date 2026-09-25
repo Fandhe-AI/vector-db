@@ -1684,6 +1684,87 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (crate::catalog::ColumnType::Integer, crate::row_codec::Value::Integer(_)) => {
+                // 固定幅（presence(1) + 本体(4)）のため、事前検証は累計バイト
+                // 予算への計上だけでよい（値域は束縛段
+                // `sql::parser::bind_integer_literal` が既に検証済み）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_INT4_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::BigInt, crate::row_codec::Value::BigInt(_)) => {
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_INT8_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            // REAL/DOUBLE の SET 値は固定長ペイロード（`SCALAR_REAL_ENTRY_LEN`／
+            // `SCALAR_DOUBLE_ENTRY_LEN`）だが、BOOLEAN と同様に累計へ加算し
+            // 対象行の探索より前に上限判定を完了させる（codex-review P0 指摘・
+            // PR #1007。累計へ計上しないと、TEXT 列と REAL/DOUBLE 列を多数
+            // 同時に SET した場合に事前検証は通過するが対象行が実在するときのみ
+            // `merge_encode_scalar_columns` が `MAX_SCALAR_PAYLOAD_LEN` 超過で
+            // 失敗し、未存在／他テナント所有では `UPDATE 0` の成功へ分岐して
+            // 対象行の存在情報が漏れる）。
+            (crate::catalog::ColumnType::Real, crate::row_codec::Value::Real(v)) => {
+                if !v.is_finite() {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "REAL value must be finite".to_string(),
+                    )));
+                }
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_REAL_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::Double, crate::row_codec::Value::Double(v)) => {
+                if !v.is_finite() {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "DOUBLE PRECISION value must be finite".to_string(),
+                    )));
+                }
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_DOUBLE_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             (crate::catalog::ColumnType::Boolean, crate::row_codec::Value::Bool(_)) => {
                 // BOOLEAN 値は行コーデック上 1 バイト固定
                 // （`row_codec::SCALAR_BOOL_ENTRY_LEN`）のため、TEXT のような
@@ -1911,6 +1992,10 @@ fn validate_set_assignments(
             // ここでも再検査する（`schema.columns` の型検証と同じ設計）。
             (
                 crate::catalog::ColumnType::Text
+                | crate::catalog::ColumnType::Integer
+                | crate::catalog::ColumnType::BigInt
+                | crate::catalog::ColumnType::Real
+                | crate::catalog::ColumnType::Double
                 | crate::catalog::ColumnType::Boolean
                 | crate::catalog::ColumnType::Date
                 | crate::catalog::ColumnType::Timestamp
@@ -1943,6 +2028,10 @@ fn validate_set_assignments(
             }
             (crate::catalog::ColumnType::Vector(_), _)
             | (crate::catalog::ColumnType::Text, _)
+            | (crate::catalog::ColumnType::Integer, _)
+            | (crate::catalog::ColumnType::BigInt, _)
+            | (crate::catalog::ColumnType::Real, _)
+            | (crate::catalog::ColumnType::Double, _)
             | (crate::catalog::ColumnType::Boolean, _)
             | (crate::catalog::ColumnType::Date, _)
             | (crate::catalog::ColumnType::Timestamp, _)
@@ -4294,6 +4383,113 @@ mod tests {
         );
     }
 
+    // codex-review P0 指摘（PR #1007・Issue #882）: `validate_set_assignments` は
+    // `TEXT`／`BOOLEAN` の SET 値を累計スカラーペイロード上限
+    // （`MAX_SCALAR_PAYLOAD_LEN`）へ加算する一方、`REAL`／`DOUBLE PRECISION` の
+    // 固定長エントリ（`SCALAR_REAL_ENTRY_LEN`／`SCALAR_DOUBLE_ENTRY_LEN`）を
+    // 加算していなかった。TEXT 単体では上限を跨がないが REAL/DOUBLE を加えると
+    // 跨ぐ長さの SET を構成すると、対象行が実在する場合のみ
+    // `merge_encode_scalar_columns` が実データ構築時に上限超過で失敗し、
+    // 未存在／他テナント所有の場合は対象行の探索前チェックを素通りしたまま
+    // `UPDATE 0` の成功へ分岐してしまう（対象行の存在情報が漏れる）。本テストは
+    // REAL/DOUBLE の固定長エントリも累計へ加算し、対象行の有無に関わらず
+    // 対象行探索より前の同一チェックで同一の拒否になることを固定する
+    // （上記 `update_row_columns_set_text_at_max_field_len_rejects_identically_
+    // regardless_of_row_existence` と同じ流儀。SQL 経由の統合テストでは
+    // `sql::lexer::MAX_INPUT_LEN`（1 MiB）により 4 MiB 級の SET リテラルを
+    // 構成できないため、本テストのように `update_row_columns_unchecked` を
+    // 直接呼ぶ必要がある）。
+    #[test]
+    fn update_row_columns_set_real_and_double_are_counted_toward_the_scalar_payload_cap() {
+        let path = unique_db_path("update-columns-real-double-payload-cap");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("note", ColumnType::Text, false),
+                ColumnDef::new("score", ColumnType::Real, false),
+                ColumnDef::new("weight", ColumnType::Double, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        insert_typed_row(
+            &storage,
+            "docs",
+            &a,
+            1,
+            Visibility::Private,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text("v1".to_string()),
+                crate::row_codec::Value::Real(1.0),
+                crate::row_codec::Value::Double(1.0),
+            ],
+            &OperationId::parse("seed-real-double-payload-cap").expect("valid operation_id"),
+        )
+        .expect("seed row");
+
+        // `note` 単体では `MAX_SCALAR_PAYLOAD_LEN`（4 * 1024 * 1024 バイト）を
+        // 跨がないが、`score`（REAL）・`weight`（DOUBLE）の固定長エントリを
+        // 加算すると跨ぐ長さに調整する。
+        let big_text = "x".repeat(4 * 1024 * 1024 - 10);
+        let assignments = [
+            (1, crate::row_codec::Value::Text(big_text)),
+            (2, crate::row_codec::Value::Real(1.0)),
+            (3, crate::row_codec::Value::Double(1.0)),
+        ];
+
+        // ケース (a): 対象行が存在する（id=1）。
+        let op_existing =
+            OperationId::parse("op-real-double-cap-existing").expect("valid operation_id");
+        let err_existing = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &a,
+            1,
+            &assignments,
+            LedgerWrite::Record(&op_existing),
+            None,
+        )
+        .expect_err(
+            "SET value combining TEXT with REAL/DOUBLE must overflow the scalar payload cap",
+        );
+
+        // ケース (b): 対象行が存在しない（id=999）。REAL/DOUBLE を累計へ
+        // 加算していない場合、この呼び出しは対象行不在のまま `Ok(0)` を返して
+        // しまい、上のケース (a) とは異なる応答（存在情報の漏えい）になる。
+        let op_missing =
+            OperationId::parse("op-real-double-cap-missing").expect("valid operation_id");
+        let err_missing = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &a,
+            999,
+            &assignments,
+            LedgerWrite::Record(&op_missing),
+            None,
+        )
+        .expect_err(
+            "SET value combining TEXT with REAL/DOUBLE must overflow identically for a \
+             nonexistent row",
+        );
+
+        // 対象行の有無に関わらず同一のエラー文言（= 対象行探索より前の同一
+        // チェックで拒否されたこと）を固定する。
+        assert_eq!(format!("{err_existing:?}"), format!("{err_missing:?}"));
+        assert!(
+            matches!(
+                &err_existing,
+                TenantWriteError::Catalog(CatalogError::Invalid(msg))
+                    if msg.contains("scalar payload length")
+            ),
+            "unexpected error shape: {err_existing:?}"
+        );
+    }
+
     // codex-review P1 指摘（PR #993 系・Issue #871）: 述語つき `UPDATE ... WHERE`
     // （[`update_rows_where_unchecked`]）の SET 値検証（[`validate_set_assignments`]。
     // `update_row_columns_unchecked` と共有）が、一致行の適用ループ内にしか無いと、
@@ -4509,9 +4705,14 @@ mod tests {
         let match_lang_ja = |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> {
             let existing = crate::row_codec::scan_scalar_columns(&schema, c.metadata)
                 .expect("decode seeded metadata");
-            Ok(
-                matches!(existing.first(), Some(Some(s)) if *s == crate::row_codec::ScalarRef::Text("ja")),
-            )
+            Ok(matches!(
+                existing
+                    .first()
+                    .copied()
+                    .flatten()
+                    .and_then(|v| v.as_text()),
+                Some("ja")
+            ))
         };
         let op_id = OperationId::parse("op-pred-no-vector-column").expect("valid operation_id");
 
@@ -4989,6 +5190,230 @@ mod tests {
             values[1],
             crate::row_codec::Value::Text("orig".to_string()),
             "row must be unchanged by either call"
+        );
+    }
+
+    // codex-review P0 指摘（PR #1007・Issue #882・`crates/engine/src/tenant.rs:1695`
+    // 指摘）: nullable `REAL`／`DOUBLE PRECISION` 列の SET は、対象行が現在 `NULL`
+    // なら presence バイトのみ（1 byte）だが値ありへ更新すると固定長エントリ
+    // （REAL: 5 bytes・DOUBLE: 9 bytes）へ増える。`validate_set_assignments` は
+    // SET 句自身の値（更新後サイズ）は正しく累計するが、対象行に**既に格納
+    // されている未変更列**の payload までは考慮しない冒頭ループの範囲外であり、
+    // この増分は「未変更 TEXT 列と組み合わさって初めて上限を超える」ケース
+    // （`update_row_columns_overflow_from_unchanged_column_is_rejected_only_when_
+    // visible_and_invisible_matches_not_found`、判断 D 再改訂・
+    // `docs/design/update-single-row.md`）と同じ内容依存クラスに属する。本テストは
+    // その既存の受け入れ済み契約——`merge_encode_scalar_columns` を含む内容依存の
+    // 処理は `is_owner && is_visible` を満たす行にのみ実行し、それ以外
+    // （RLS 不可視・未存在・他テナント所有）は内容に一切触れず `UPDATE 0` と
+    // 区別できない——が REAL の NULL→値あり遷移でも成立することを固定する
+    // （単一行 UPDATE・述語 UPDATE の双方。述語 UPDATE の候補列挙スコープは
+    // テナント所有のみ〔RLS 可視性フィルタではない〕ため他テナント行はそもそも
+    // 候補にならず、可視性差の検証は単一行 UPDATE 側でのみ行う）。
+    #[test]
+    fn update_row_columns_nullable_real_null_to_value_transition_overflow_matches_visibility_parity(
+    ) {
+        let path = unique_db_path("update-columns-nullable-real-presence-parity");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("score", ColumnType::Real, true),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let ctx_owner = PolicyContext::new("tenant-a").expect("valid tenant");
+        // `body` を、`score`（REAL）が NULL（presence 1 byte）の間は上限内だが
+        // 値あり（5 bytes。+4 byte 増）へ遷移すると `MAX_SCALAR_PAYLOAD_LEN` を
+        // 超えるちょうどの大きさに調整する
+        // （text エントリ = presence(1)+len(4)+本文、`SCALAR_TEXT_ENTRY_OVERHEAD`)。
+        let text_len = crate::row_codec::MAX_SCALAR_PAYLOAD_LEN - 8;
+        let large_body = "b".repeat(text_len as usize);
+        insert_typed_row(
+            &storage,
+            "docs",
+            &ctx_owner,
+            1,
+            Visibility::Private,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text(large_body),
+                crate::row_codec::Value::Null,
+            ],
+            &OperationId::parse("seed-real-presence-parity").expect("valid operation_id"),
+        )
+        .expect("seed row");
+
+        let assignments = [(2, crate::row_codec::Value::Real(1.0))];
+
+        // ケース (a): 行が見える `ctx`（`Private` 許可）。NULL→値あり遷移の
+        // +4 byte 増分により上限を超え、merge 段でエラーになる。
+        let ctx_visible =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let op_visible =
+            OperationId::parse("op-real-presence-parity-visible").expect("valid operation_id");
+        let err_visible = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &ctx_visible,
+            1,
+            &assignments,
+            LedgerWrite::Record(&op_visible),
+            None,
+        )
+        .expect_err(
+            "REAL NULL-to-value transition combined with the existing large body must overflow \
+             the scalar payload cap",
+        );
+        assert!(
+            matches!(
+                &err_visible,
+                TenantWriteError::Catalog(CatalogError::Invalid(msg))
+                    if msg.contains("scalar payload length")
+            ),
+            "unexpected error shape: {err_visible:?}"
+        );
+
+        // ケース (b): 同じ行だが見えない `ctx`（`Public` のみ許可・行は
+        // `Private`）。内容依存の処理（decode・merge・超過判定）には一切
+        // 触れず、不存在の id と区別できない `UPDATE 0` 成功になる。
+        let ctx_invisible = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_invisible =
+            OperationId::parse("op-real-presence-parity-invisible").expect("valid operation_id");
+        let rows_affected_invisible = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &ctx_invisible,
+            1,
+            &assignments,
+            LedgerWrite::Record(&op_invisible),
+            None,
+        )
+        .expect(
+            "an RLS-invisible existing row must not surface the presence-byte overflow; it must \
+             behave exactly like a nonexistent row (UPDATE 0)",
+        );
+        assert_eq!(
+            rows_affected_invisible, 0,
+            "RLS-invisible existing row must report UPDATE 0, identical to a nonexistent id"
+        );
+
+        // ケース (c): 未存在の id（同じ可視 ctx）。存在する不可視行と同じ
+        // `UPDATE 0` になり、応答から存在有無を区別できない。
+        let op_missing =
+            OperationId::parse("op-real-presence-parity-missing").expect("valid operation_id");
+        let rows_affected_missing = update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &ctx_visible,
+            999,
+            &assignments,
+            LedgerWrite::Record(&op_missing),
+            None,
+        )
+        .expect("nonexistent id must report UPDATE 0");
+        assert_eq!(rows_affected_missing, 0);
+
+        // 対象行は無変更のまま（可視 ctx の呼び出しはマージ検証段で拒否され
+        // 書き込みが発生せず、不可視 ctx の呼び出しは内容に一切触れない）。
+        let row = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("row must still exist");
+        let values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+            .expect("decode scalar columns");
+        assert_eq!(
+            values[2],
+            crate::row_codec::Value::Null,
+            "row must be unchanged by either call (score remains NULL)"
+        );
+    }
+
+    // 述語 UPDATE（`update_rows_where_unchecked`）版: 候補列挙スコープが
+    // テナント所有のみ（RLS 可視性フィルタではない。上記単体テストのコメント
+    // 参照）であるため、他テナント所有行はそもそも候補にならず存在情報が
+    // 漏れる余地がない。本テストは、対象行が候補に含まれる場合の overflow
+    // エラーと、対象行が候補に含まれない場合（未存在 id）の `rows_affected: 0`
+    // が、それぞれの前提のもとで一貫することを固定する。
+    #[test]
+    fn update_rows_where_unchecked_nullable_real_null_to_value_transition_overflow() {
+        let path = unique_db_path("update-where-nullable-real-presence-parity");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("score", ColumnType::Real, true),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let text_len = crate::row_codec::MAX_SCALAR_PAYLOAD_LEN - 8;
+        let large_body = "b".repeat(text_len as usize);
+        insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            Visibility::Private,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text(large_body),
+                crate::row_codec::Value::Null,
+            ],
+            &OperationId::parse("seed-where-real-presence-parity").expect("valid operation_id"),
+        )
+        .expect("seed row");
+
+        let assignments = [(2, crate::row_codec::Value::Real(1.0))];
+        let op = OperationId::parse("op-where-real-presence-parity").expect("valid operation_id");
+        let content_hash_value =
+            content_hash::ContentHash::for_test(b"predicate-update-real-presence-parity");
+        let matches_seeded_id =
+            |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(c.id == 1) };
+        let err = update_rows_where_unchecked(
+            &storage,
+            "docs",
+            &ctx,
+            LedgerWrite::Record(&op),
+            &content_hash_value,
+            None,
+            &assignments,
+            false,
+            100,
+            matches_seeded_id,
+        )
+        .expect_err(
+            "REAL NULL-to-value transition combined with the existing large body must overflow \
+             the scalar payload cap for the matched candidate",
+        );
+        match err {
+            PredicateDmlError::Write(TenantWriteError::Catalog(CatalogError::Invalid(msg))) => {
+                assert!(
+                    msg.contains("scalar payload length"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("unexpected error shape: {other:?}"),
+        }
+
+        // 対象行は無変更のまま（write_txn が commit されず破棄される）。
+        let row = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("row must still exist");
+        let values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+            .expect("decode scalar columns");
+        assert_eq!(
+            values[2],
+            crate::row_codec::Value::Null,
+            "row must be unchanged after the aborted predicate UPDATE"
         );
     }
 

@@ -190,20 +190,25 @@ impl std::error::Error for HandshakeError {}
 /// バイト列を先頭から消費していく読み取りカーソル。すべてのメソッドは
 /// 未検証の残りバイト数を確認してから切り出すため、`unwrap`／`expect`／
 /// 添字アクセスなしに fail-closed へ倒れる。
-struct Reader<'a> {
+///
+/// `pub(super)` として `super::client_hello`（#954）からも共有する。
+/// ClientHello 本体の parse（本モジュール）と拡張の意味解析（#954）が
+/// 同じ fail-closed カーソル実装を再利用するための契約であり、
+/// parse／serialize の意味論・既存テストはこの可視性変更で変わらない。
+pub(super) struct Reader<'a> {
     rest: &'a [u8],
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(super) fn new(bytes: &'a [u8]) -> Self {
         Self { rest: bytes }
     }
 
-    fn remaining(&self) -> usize {
+    pub(super) fn remaining(&self) -> usize {
         self.rest.len()
     }
 
-    fn bytes(&mut self, n: usize) -> Result<&'a [u8], HandshakeError> {
+    pub(super) fn bytes(&mut self, n: usize) -> Result<&'a [u8], HandshakeError> {
         let (head, tail) = self.rest.split_at_checked(n).ok_or(HandshakeError::Decode(
             "unexpected end of handshake message",
         ))?;
@@ -214,18 +219,18 @@ impl<'a> Reader<'a> {
     /// 固定長 `N` バイトを読み、配列へ変換する。`bytes(N)` が返す
     /// スライスは常にちょうど `N` バイトのため `try_into` は必ず成功するが、
     /// 添字アクセスを避けるため `?` で明示的に処理する。
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], HandshakeError> {
+    pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N], HandshakeError> {
         self.bytes(N)?
             .try_into()
             .map_err(|_| HandshakeError::Decode("internal fixed-length read mismatch"))
     }
 
-    fn u8(&mut self) -> Result<u8, HandshakeError> {
+    pub(super) fn u8(&mut self) -> Result<u8, HandshakeError> {
         let [b] = self.array::<1>()?;
         Ok(b)
     }
 
-    fn u16(&mut self) -> Result<u16, HandshakeError> {
+    pub(super) fn u16(&mut self) -> Result<u16, HandshakeError> {
         Ok(u16::from_be_bytes(self.array::<2>()?))
     }
 
@@ -236,7 +241,11 @@ impl<'a> Reader<'a> {
 
     /// 8bit 長接頭辞のベクタを読み、`[min, max]`（バイト数）に収まって
     /// いることを確認してから本体を切り出す。
-    fn vec_u8_len(&mut self, min: usize, max: usize) -> Result<&'a [u8], HandshakeError> {
+    pub(super) fn vec_u8_len(
+        &mut self,
+        min: usize,
+        max: usize,
+    ) -> Result<&'a [u8], HandshakeError> {
         let len = usize::from(self.u8()?);
         if len < min || len > max {
             return Err(HandshakeError::Decode("8-bit vector length out of range"));
@@ -244,7 +253,11 @@ impl<'a> Reader<'a> {
         self.bytes(len)
     }
 
-    fn vec_u16_len(&mut self, min: usize, max: usize) -> Result<&'a [u8], HandshakeError> {
+    pub(super) fn vec_u16_len(
+        &mut self,
+        min: usize,
+        max: usize,
+    ) -> Result<&'a [u8], HandshakeError> {
         let len = usize::from(self.u16()?);
         if len < min || len > max {
             return Err(HandshakeError::Decode("16-bit vector length out of range"));
@@ -261,7 +274,7 @@ impl<'a> Reader<'a> {
     }
 
     /// 末尾まで読み切ったことを確認する（余りバイトを許さない）。
-    fn expect_end(&self) -> Result<(), HandshakeError> {
+    pub(super) fn expect_end(&self) -> Result<(), HandshakeError> {
         if self.rest.is_empty() {
             Ok(())
         } else {

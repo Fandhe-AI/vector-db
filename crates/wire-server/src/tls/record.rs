@@ -157,9 +157,10 @@ fn rejects_empty_fragment(kind: RecordKind, content_type: ContentType) -> bool {
     }
 }
 
-/// TLS alert の `AlertDescription`（RFC 8446 §6）のうち、本レコード層が
-/// 検出しうる違反に対応する値のみを最小限持つ。実際の alert 送出・
-/// 状態機械は #965 が担う（本モジュールは定型コードの対応表を提供するのみ）。
+/// TLS alert の `AlertDescription`（RFC 8446 §6）の定型コード対応表。
+/// レコード層に限らず TLS 層全体（`handshake.rs`・`client_hello.rs` を
+/// 含む）で共有し、各モジュールは自身が検出した違反をこの型へ写像する
+/// のみで、実際の alert 送出・状態機械は #965 が担う。
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertDescription {
@@ -170,6 +171,18 @@ pub enum AlertDescription {
     BadRecordMac,
     /// 呼び出し契約違反（レコード保護層の送信側長さ超過・不正な状態遷移。#959）。
     InternalError,
+    /// TLS 1.3 の必須暗号スイート（`TLS_AES_128_GCM_SHA256`）を含まない
+    /// （RFC 8446 §4.1.1。判定は `client_hello::negotiate` が担う）。
+    HandshakeFailure,
+    /// 拡張の重複・compression 値の不正など、値そのものの意味検査違反
+    /// （RFC 8446 §4.1.2・§4.2。判定は `client_hello::negotiate` が担う）。
+    IllegalParameter,
+    /// `supported_versions` に TLS 1.3（0x0304）が無い（RFC 8446 §4.2.1・
+    /// 付録 D。判定は `client_hello::negotiate` が担う）。
+    ProtocolVersion,
+    /// 必須拡張（`signature_algorithms` 等）が欠落している（RFC 8446
+    /// §9.2。判定は `client_hello::negotiate` が担う）。
+    MissingExtension,
 }
 
 impl AlertDescription {
@@ -180,6 +193,10 @@ impl AlertDescription {
             AlertDescription::DecodeError => 50,
             AlertDescription::BadRecordMac => 20,
             AlertDescription::InternalError => 80,
+            AlertDescription::HandshakeFailure => 40,
+            AlertDescription::IllegalParameter => 47,
+            AlertDescription::ProtocolVersion => 70,
+            AlertDescription::MissingExtension => 109,
         }
     }
 }

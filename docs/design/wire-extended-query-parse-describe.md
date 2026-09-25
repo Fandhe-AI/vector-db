@@ -2,8 +2,9 @@
 
 ## ステータス
 
-Implemented（#933 の範囲。Bind／Execute／Sync／Close／Flush と Sync による
-同期回復は #934、`$n` パラメータ束縛は #935 の担当のまま）。
+Implemented（#933 の範囲）。Bind／Execute／Sync／Close／Flush と Sync による
+同期回復は #934 で実装済み（`docs/design/wire-extended-query-bind-execute-sync.md`
+参照）。`$n` パラメータ束縛は #935 の担当のまま。
 
 ## 背景
 
@@ -19,12 +20,16 @@ vector-db-spec 側の改訂（2026-09-22）で WIRE-11（拡張クエリプロ�
 
 ## 受理範囲（本 Issue）
 
-| メッセージ | 挙動 |
+本 Issue（#934）以降は portal も構築されるようになり、Describe（'D' 種別
+P）・Bind／Execute／Sync／Close／Flush はすべて受理される。詳細は
+`docs/design/wire-extended-query-bind-execute-sync.md` 参照。
+
+| メッセージ | 挙動（#933 時点） |
 | --- | --- |
 | Parse（'P'） | SQL を簡易クエリと同一の許可リストで検証し、接続単位で保持する |
 | Describe（'D' 種別 S） | `ParameterDescription`（常に 0 件）＋ `RowDescription` または `NoData` |
-| Describe（'D' 種別 P） | portal は構築され得ないため `0A000` + 切断（WIRE-8 のまま） |
-| Bind／Execute／Sync／Close／Flush | WIRE-8 のまま `0A000` + 切断 |
+| Describe（'D' 種別 P） | portal は構築され得ないため `0A000` + 切断（WIRE-8 のまま。#934 で受理範囲に入った） |
+| Bind／Execute／Sync／Close／Flush | WIRE-8 のまま `0A000` + 切断（#934 で受理範囲に入った） |
 
 ## エンジン側の分割（`crates/engine/src/core.rs`）
 
@@ -112,16 +117,16 @@ statement）・`42P05`（duplicate prepared statement）相当の分類が
 ERR-2／ERR-6 に無いため、WIRE-11 確定時に分類を定めるかは spec リポ側の
 判断に委ねる。
 
-## 暫定契約（#934 で置換予定）
+## 暫定契約（#934 で置換済み）
 
-Sync による同期回復（Sync までの破棄→ReadyForQuery・接続維持）を持たない
-本 Issue の時点では、Parse／Describe の失敗は ErrorResponse 送出後に
+本節は #933 時点の暫定契約の記録として残す。Sync による同期回復を持たな
+かった #933 の時点では、Parse／Describe の失敗は ErrorResponse 送出後に
 `protocol_dispatch::drain_and_close` による有界 lingering close で接続を
-終了する（WIRE-8 が採用していた設計をそのまま踏襲）。#934 で Sync 対応と
-同時に、エラー後も接続を維持する契約へ置き換える。
-
-応答は Sync・Flush を持たない現状の設計上、都度即時に書き出す
-（PostgreSQL プロトコル上バックエンドは任意時点で応答してよい）。
+終了していた（WIRE-8 が採用していた設計をそのまま踏襲）。#934 で Sync 対応
+と同時に、body 復号後に判明するエラーは接続を維持したまま Sync まで同期
+回復する契約へ置き換え済み（フレーム自体が壊れている場合は引き続き切断。
+詳細は `docs/design/wire-extended-query-bind-execute-sync.md`
+「エラー後の同期回復」節参照）。
 
 ## 検証
 
@@ -141,10 +146,11 @@ Sync による同期回復（Sync までの破棄→ReadyForQuery・接続維持
 
 ## スコープ外・申し送り
 
-- #934: Sync での同期回復・接続維持への置換、Bind／Execute
+- #934（実装済み）: Sync での同期回復・接続維持への置換、Bind／Execute
   （`execute_parsed_in_session` の再利用）、portal の Describe、Close／
   Flush、応答のバッファリング方針。
 - #935: `$n` と `ParameterDescription` の型 OID 推論（WIRE-12）、Parse の
   パラメータ型宣言受理。
-- 実クライアント（psql／psycopg 3／node pg）での拡張プロトコル実行検証は
-  Sync 対応後（#934 以降）。
+- 実クライアント（psql／psycopg 3／node pg）でのパラメータ付き拡張プロト
+  コル実行検証は #935 以降（パラメータなしの層 B シナリオは #934 の任意
+  範囲として `docs/design/wire-extended-query-bind-execute-sync.md` 参照）。

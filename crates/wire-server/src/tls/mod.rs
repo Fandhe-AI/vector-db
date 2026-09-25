@@ -23,6 +23,11 @@
 //!   最小集合 6 種の parse/serialize と、レコード境界をまたぐ再組み立てを
 //!   担う。拡張の意味解釈・状態機械・暗号は持たない（`handshake` の
 //!   ドキュメンテーションコメントを参照）
+//! - [`client_hello`]: `ClientHello` 拡張の意味解釈・受理判定・
+//!   HelloRetryRequest 構築（RFC 8446 §4.1.2・§4.1.3・§4.2。#954）。
+//!   TLS 1.3・`TLS_AES_128_GCM_SHA256`・X25519・Ed25519 のみを受理する
+//!   fail-closed な純粋関数層で、状態は持たない（`client_hello` の
+//!   ドキュメンテーションコメントを参照）
 //! - [`hkdf`]: HMAC-SHA-256（RFC 2104）・HKDF-Extract/Expand（RFC 5869）・
 //!   `HKDF-Expand-Label`／`Derive-Secret`（RFC 8446 §7.1）の原始操作
 //!   （Issue #956）。ハッシュ本体は `engine::crypto::sha256`（SCRAM-SHA-256 認証・Issue #940 が切り出し済み）を再利用する
@@ -35,13 +40,14 @@
 //!   handshake 鍵 → application 鍵の方向別切替（[`record_protection::
 //!   Sealer`]／[`record_protection::Opener`]）を提供する
 //!
-//! key_share 拡張の解析（#954）・alert 型やハンドシェイク状態機械（#965）・
-//! 接続への結線（#966 以降）はいずれも後続 sub-issue の担当であり、本モジュール
-//! は対象外のまま。並列開発時のコンフリクトを避けるため、後続 sub-issue は
+//! alert の実送出やハンドシェイク状態機械（#965）・接続への結線
+//! （#966 以降）はいずれも後続 sub-issue の担当であり、本モジュールは
+//! 対象外のまま。並列開発時のコンフリクトを避けるため、後続 sub-issue は
 //! `pub mod` を 1 行ずつ追加していく想定。
 
 pub mod aes;
 pub mod aes_gcm;
+pub mod client_hello;
 pub(crate) mod field25519;
 pub mod handshake;
 pub mod hkdf;

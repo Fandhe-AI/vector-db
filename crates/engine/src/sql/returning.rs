@@ -222,6 +222,12 @@ pub(crate) fn project_row(
                     budget,
                     MAX_RETURNING_RESULT_BYTES,
                 )?),
+                Some(Value::Integer(v)) => Cell::SignedInteger(i64::from(*v)),
+                Some(Value::BigInt(v)) => Cell::SignedInteger(*v),
+                // F8（Issue #882 計画）: REAL は f64 への無損失拡大、DOUBLE は
+                // そのまま `Cell::Float` へ投影する。
+                Some(Value::Real(v)) => Cell::Float(f64::from(*v)),
+                Some(Value::Double(v)) => Cell::Float(*v),
                 Some(Value::Bool(b)) => Cell::Bool(*b),
                 Some(Value::Date(d)) => Cell::Date(*d),
                 Some(Value::Timestamp(t)) => Cell::Timestamp(*t),

@@ -73,8 +73,11 @@ match にもワイルドカード腕（`_ =>`）を入れない。variant を追
   型別セル encode／decode 集約自体は、#880 時点で既に
   `scalar_text_entry_len`／`SCALAR_TEXT_ENTRY_OVERHEAD` という形で
   `tenant::validate_set_assignments` と共有済みであり（先行 Issue で実装済み）、
-  本 Issue で新たに壊す理由が薄いと判断した。#881 で `INTEGER` を追加する時点で
-  実際に破壊が必要になった場合、その Issue で `!` を付けて対応する。
+  本 Issue で新たに壊す理由が薄いと判断した。#881（`INTEGER`／`BIGINT`）・
+  #882（`REAL`／`DOUBLE PRECISION`）がいずれも固定長の非 TEXT スカラー値を
+  導入する時点で実際に破壊が必要になったため、`ScalarRef<'a>` を新設し `!`
+  を付けて対応済み（`docs/design/column-type-integer.md` D3・
+  `docs/design/float-column-types.md` F2 参照）。
 - `sql/parser.rs` の `(ColumnType, InsertLiteral)` 束縛 3 重複の
   `bind_literal_for_column` への集約。挙動不変のリファクタリングだが、
   #880 のスコープ（カタログ v2・型タグ往復の集約）から独立して行える
@@ -106,6 +109,15 @@ match にもワイルドカード腕（`_ =>`）を入れない。variant を追
    網羅 match（コンパイラが列挙する）に新型の扱いを追加する。
 8. 3 段階デコード tier（`sql::aggregate`／`sql::group_by` の
    `DecodeTier`）が新型を正しく分類することを確認する。
+9. `recovery/content_hash.rs::push_value` のタグは、TABLE-13 の列挙順で
+   予約割り当て済み（Integer=3、BigInt=4、Real=5、Double=6、Boolean=7）。
+   実装するタグ番号を勝手に選ばず、この表に従う（着地後に番号を振り直せない
+   ため。Issue #882 で Real=5／Double=6 を実装済み）。
+10. `Value`（[`row_codec::Value`]）へ variant を追加する場合、`scan_scalar_columns`
+    系が返す `ScalarRef<'a>`（Issue #882 で新設。`Text(&'a str)` に加え
+    `Real(f32)`／`Double(f64)` を持つ）にも対応する variant を追加し、
+    `ScalarRef::as_text()` の `None` 腕（`TEXT` 専用の既存呼び出し元向け
+    後方互換ヘルパー）に含める。
 
 ## バイト表現の不変範囲（golden で固定）
 

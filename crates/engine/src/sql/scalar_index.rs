@@ -544,21 +544,26 @@ impl ScalarIndex {
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     per_column.push(Some(acc));
                 }
-                // `VECTOR` 列・`BOOLEAN` 列はいずれも索引対象外（BOOLEAN は
-                // Issue #883・D-e。値域が 2 値のため索引化コストに見合わず、
-                // 対応述語 `BoolEquals` は常に plain scan——`scalar_plan.rs`
-                // 参照——のまま据え置く）。`DATE`／`TIMESTAMP` 列も同じ理由で
-                // 索引対象外（TABLE-13・TASK-197、Issue #884。等価・範囲述語
-                // 自体が未実装〔Issue #891〕のため索引化する対応述語がまだ無い）。
-                // `NUMERIC` 列も同じく索引対象外（本索引が TEXT 列の等価・
+                // `INTEGER`／`BIGINT` 列の索引対応は Issue #893 の担当。本 Issue
+                // （#881）では `Vector` 列と同じく未索引のまま扱う。`BOOLEAN` 列も
+                // 索引対象外（Issue #883・D-e。値域が 2 値のため索引化コストに
+                // 見合わず、対応述語 `BoolEquals` は常に plain scan——
+                // `scalar_plan.rs` 参照——のまま据え置く）。`DATE`／`TIMESTAMP` 列も
+                // 同じ理由で索引対象外（TABLE-13・TASK-197、Issue #884。等価・範囲
+                // 述語自体が未実装〔Issue #891〕のため索引化する対応述語がまだ
+                // 無い）。`NUMERIC` 列も同じく索引対象外（本索引が TEXT 列の等価・
                 // 前方一致向け辞書索引のみを対象とする設計であり、WHERE 述語
                 // 自体が束縛時点で NUMERIC 列を拒否済み〔TABLE-13〔検討中〕・
-                // TASK-197、Issue #885〕のため到達しない）。`ARRAY` 列
-                // （TABLE-14・Issue #888）・`BYTEA` 列（Issue #886）・
-                // `JSON`／`JSONB` 列（TABLE-14・Issue #889。拡張は Issue #893 へ
-                // 申し送り）もいずれも等価・前方一致述語を持たないため同じく
-                // 非索引化。
+                // TASK-197、Issue #885〕のため到達しない）。`ARRAY` 列（TABLE-14・
+                // Issue #888）・`BYTEA` 列（Issue #886）・`JSON`／`JSONB` 列
+                // （TABLE-14・Issue #889。拡張は Issue #893 へ申し送り）もいずれも
+                // 等価・前方一致述語を持たないため同じく非索引化。REAL/DOUBLE
+                // 列の索引化も #893 の担当（F10・Issue #882 計画）。
                 ColumnType::Vector(_)
+                | ColumnType::Integer
+                | ColumnType::BigInt
+                | ColumnType::Real
+                | ColumnType::Double
                 | ColumnType::Boolean
                 | ColumnType::Date
                 | ColumnType::Timestamp
@@ -593,9 +598,10 @@ impl ScalarIndex {
                     continue;
                 }
                 // 索引対象列は常に `TEXT`／`ENUM`（上記の列単位除外により
-                // `BOOLEAN`／`VECTOR`／`BYTEA` は `per_column[col_index] == None`
-                // のまま到達しない）。`as_dictionary_text` で両者を同じ辞書
-                // 表現として扱う（Issue #890 D3）。
+                // `INTEGER`／`BIGINT`／`BOOLEAN`／`VECTOR`／`REAL`／`DOUBLE`／
+                // `BYTEA` は `per_column[col_index] == None` のまま到達しない）。
+                // `as_dictionary_text` で両者を同じ辞書表現として扱う
+                // （Issue #890 D3）。
                 let Some(v) = v.as_dictionary_text() else {
                     continue;
                 };
