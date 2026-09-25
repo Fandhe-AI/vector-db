@@ -264,6 +264,16 @@ pub enum BuiltinFn {
     VecDiv,
 }
 
+/// `name` が組み込み関数（[`BuiltinFn`]）の名前かどうかを判定する。`pub(crate)`:
+/// `sql::check_constraint`（TABLE-16・TASK-204、Issue #906）が `CHECK` 述語中の
+/// `Expr::Call` を束縛より**前**に検査し、組み込み関数以外（セッション UDF・
+/// WASM UDF・未知関数）の呼び出しを `42601` として拒否するために使う
+/// （空の [`UdfRegistry`] で束縛すると「未知の関数」として `22000` へ丸まって
+/// しまい、CHECK の禁止要素として区別できないため）。
+pub(crate) fn is_builtin_function_name(name: &str) -> bool {
+    builtin_from_name(name).is_some()
+}
+
 fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     match name.to_ascii_lowercase().as_str() {
         "vec_norm" => Some(BuiltinFn::VecNorm),

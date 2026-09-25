@@ -42,6 +42,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
         TenantWriteError::TooManyRowsScanned => ErrorClass::PayloadTooLarge,
         TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
+        TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
+        TenantWriteError::CheckEvaluationFailed => ErrorClass::InternalError,
         TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
     }
 }
@@ -65,6 +67,10 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
         TenantWriteError::CapturedRowDecodeFailed("test".to_string()),
         TenantWriteError::TooManyRowsScanned,
         TenantWriteError::UniqueViolation,
+        TenantWriteError::CheckViolation {
+            constraint: "test_check".to_string(),
+        },
+        TenantWriteError::CheckEvaluationFailed,
         TenantWriteError::WriteLockTimeout,
     ];
     for case in &cases {

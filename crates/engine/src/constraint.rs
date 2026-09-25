@@ -1,5 +1,12 @@
-//! テナント内一意性制約（`PRIMARY KEY` 宣言〔Issue #903〕・UNIQUE 制約
-//! 〔Issue #905〕。いずれも TABLE-16・TASK-204）を検査する単一の検査点。
+//! 行単位の宣言的制約——テナント内一意性制約（`PRIMARY KEY` 宣言〔Issue #903〕・
+//! UNIQUE 制約〔Issue #905〕）と `CHECK` 制約〔Issue #906〕。いずれも TABLE-16・
+//! TASK-204——を検査する単一の検査点（入口は [`enforce_row_constraints_in_txn`]）。
+//!
+//! `CHECK` 制約は書き込んだ各行を同一 write トランザクション内で読み戻し、
+//! `sql::check_constraint::CompiledChecks`（`WHERE` と同じ束縛・評価器を再利用）で
+//! 評価する。一意性制約より**先**に評価する（両方に違反する行は `23514`。
+//! PostgreSQL の評価順序に倣う）。`CHECK` を宣言しないテーブルはコンパイル自体を
+//! 行わない（コストゼロ）。
 //!
 //! 呼び出し元は `tenant.rs` の各書き込み関数（`insert_*_unchecked`・
 //! `upsert_typed_rows_unchecked`・`update_row_unchecked`・
@@ -120,8 +127,66 @@ fn key_specs(schema: &TableSchema) -> Result<(Vec<KeySpec>, Vec<bool>), CatalogE
     Ok((specs, mask))
 }
 
-/// 書き込み後・commit 前に呼ぶ唯一の検査点。主キーも UNIQUE 制約も宣言しない
-/// テーブルは即座に成功する。
+/// `tenant.rs` の各書き込み関数が書き込み後・commit 前に呼ぶ唯一の入口
+/// （TABLE-16・TASK-204）。`CHECK` 制約（Issue #906）→ 一意性制約（主キー・
+/// UNIQUE）の順に検査する。`written_ids` の契約は [`enforce_unique_keys_in_txn`]
+/// と同じ。いずれの制約も宣言しないテーブルは即座に成功する。
+pub(crate) fn enforce_row_constraints_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[u64],
+) -> Result<(), TenantWriteError> {
+    enforce_check_constraints_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
+    enforce_unique_keys_in_txn(write_txn, table_name, schema, tenant_id, written_ids)
+}
+
+/// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）の検査。`written_ids` の各行を
+/// 同一 write トランザクション内で読み戻し（物理キーはサーバー側導出テナント
+/// `tenant_id` で名前空間化済み。RLS-9・TABLE-12）、書き込まれた最終値
+/// （UPSERT の `DO UPDATE`・`UPDATE` の SET 適用後の値を含む）に対して全 `CHECK`
+/// を評価する。`CHECK` を宣言しないテーブルは即座に成功する。
+///
+/// 読み戻せない id（同一文内で後から削除された等）は検査対象外とする
+/// （存在しない行は制約に違反し得ない。[`enforce_unique_keys_in_txn`] と同じ扱い）。
+/// 違反時は [`TenantWriteError::CheckViolation`]（制約名のみ。行の値・id・
+/// テナントは含まない）を返し、呼び出し元は `write_txn` を commit しない。
+fn enforce_check_constraints_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[u64],
+) -> Result<(), TenantWriteError> {
+    if written_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(compiled) = crate::sql::check_constraint::CompiledChecks::compile(schema)? else {
+        return Ok(());
+    };
+    let row_table_name = crate::catalog::user_rows_table_name(table_name);
+    let row_table = write_txn
+        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .map_err(crate::catalog::map_row_table_error)?;
+    let mut embedding: Vec<f32> = Vec::new();
+    for &id in written_ids {
+        let Some(guard) = row_table
+            .get((tenant_id, id))
+            .map_err(crate::catalog::CatalogError::from)?
+        else {
+            continue;
+        };
+        let buf = guard.value();
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
+        compiled.enforce(schema, id, &embedding, metadata)?;
+    }
+    Ok(())
+}
+
+/// 一意性制約（主キー・UNIQUE）の検査点（[`enforce_row_constraints_in_txn`] から
+/// 呼ばれる）。主キーも UNIQUE 制約も宣言しないテーブルは即座に成功する。
 ///
 /// `written_ids` は今回の書き込みトランザクションで `user_rows/{table}` へ
 /// 書き込んだ（または上書きした）行の `id` 集合。呼び出し元がこの txn の中で

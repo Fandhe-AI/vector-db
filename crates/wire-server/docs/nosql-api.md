@@ -686,6 +686,7 @@ Date: <IMF-fixdate>
 | `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
 | `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
 | `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | `insert` の `operation_id` 重複（内容一致の再送）、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`update`） |
+| `23514` | `CHECK_VIOLATION` | 409 | Conflict | `insert`／`update` が書き込む行が `CHECK` 制約（TABLE-16・TASK-204）を満たさない |
 | `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`／`CREATE VIEW`／`CREATE INDEX` は op 許可リスト外。後述） |
 | `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過 |
 | `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
