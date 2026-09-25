@@ -145,6 +145,7 @@ pub mod scan;
 pub(crate) mod sparse_cache;
 pub mod statement_splitter;
 pub mod udf_call;
+pub(crate) mod view;
 pub(crate) mod visible_cache;
 
 /// `EngineCore::sparse_index_cache_stats`（`pub`）の戻り値型を外部から
@@ -270,4 +271,18 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     DropTable(ddl::DropTableOutcome),
+    /// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、Issue #909）
+    /// がセッション経由の実行経路で成功したことを示す応答。`DropTable` と
+    /// 同じ設計で、本 variant はその [`ddl::CreateViewOutcome`] をそのまま
+    /// 運ぶ薄いラッパー。
+    ///
+    /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コードはすべて更新済み。
+    CreateView(ddl::CreateViewOutcome),
+    /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）がセッション
+    /// 経由の実行経路で成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コードはすべて更新済み。
+    DropView(ddl::DropViewOutcome),
 }

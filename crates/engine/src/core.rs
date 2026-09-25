@@ -1239,6 +1239,20 @@ pub enum ParsedSql {
     /// 更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードがあれば
     /// 追随が必要。
     DropTable(crate::sql::allowlist::ValidatedDropTable),
+    /// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、
+    /// Issue #909）。DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）の
+    /// 判定は `EngineCore::execute_parsed_in_session` が担い、
+    /// `validate_create_view_tokens` 自体はカタログ照会を一切行わない
+    /// （`ValidatedDropTable` と同じ設計）。
+    ///
+    /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `ParsedSql` を
+    /// 網羅的にマッチする既存コードはすべて更新済み。
+    CreateView(crate::sql::allowlist::ValidatedCreateView),
+    /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）。
+    ///
+    /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `ParsedSql` を
+    /// 網羅的にマッチする既存コードはすべて更新済み。
+    DropView(crate::sql::allowlist::ValidatedDropView),
 }
 
 /// [`EngineCore::parse_sql_prepared`] の結果（Issue #935・WIRE-12・TASK-217）。
@@ -2106,7 +2120,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
-                    | crate::sql::SqlOutcome::DropTable(_) => {
+                    | crate::sql::SqlOutcome::DropTable(_)
+                    | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::DropView(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -2134,7 +2150,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
-                    | crate::sql::SqlOutcome::DropTable(_) => {
+                    | crate::sql::SqlOutcome::DropTable(_)
+                    | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::DropView(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -2159,7 +2177,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
-                    | crate::sql::SqlOutcome::DropTable(_) => {
+                    | crate::sql::SqlOutcome::DropTable(_)
+                    | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::DropView(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -2253,6 +2273,31 @@ impl EngineCore {
         self.parse_tokens(tokens)
     }
 
+    /// TABLE-18・SQL-23・TASK-205（Issue #909）: `INSERT`／`TRUNCATE`／
+    /// `DELETE`／`UPDATE` の構造検証（`validate_*_tokens`）はカタログを
+    /// 「テーブルとして」照会するため、対象名がビューであっても
+    /// `SqlSurfaceError::UndefinedTable`（`42P01`）を返す。書き込み系文が
+    /// ビューを対象にした場合は「ビューへの書き込みは非対応」（`42809`）と
+    /// 区別する必要があるため、`UndefinedTable` に限り対象名がビューとして
+    /// 存在するかを 1 回だけ読み直し、存在すれば `WrongObjectType` へ読み替える
+    /// （`sql::allowlist::validate_sql_tokens` の `Statement::Scan` 分岐が使う
+    /// `sql::view::resolve_from` とは別の入口だが、いずれも
+    /// `catalog::Storage::view_definition` を単一の情報源とする）。他の
+    /// エラー（構文エラー等）はそのまま透過する。
+    fn reclassify_write_to_view_error(
+        &self,
+        e: crate::sql::allowlist::SqlSurfaceError,
+    ) -> crate::sql::allowlist::SqlSurfaceError {
+        if let crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name } = &e {
+            if let Ok(Some(_)) = self.storage.view_definition(name) {
+                return crate::sql::allowlist::SqlSurfaceError::WrongObjectType {
+                    name: name.clone(),
+                };
+            }
+        }
+        e
+    }
+
     /// [`Self::parse_sql`] の字句解析済みトークン列版（Issue #935・WIRE-12。
     /// `sql::allowlist::validate_sql`/`validate_sql_tokens` の分割と同じ理由）。
     /// [`Self::parse_sql_prepared`]・[`Self::bind_prepared`] が、拡張クエリ
@@ -2272,7 +2317,8 @@ impl EngineCore {
         if is_insert_statement {
             let lookup = InsertSchemaLookup::new(&self.storage);
             let stmt =
-                crate::sql::allowlist::validate_insert_tokens(&tokens, &lookup, self.ledger_mode)?;
+                crate::sql::allowlist::validate_insert_tokens(&tokens, &lookup, self.ledger_mode)
+                    .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return Ok(ParsedSql::Insert(stmt));
         }
 
@@ -2285,7 +2331,8 @@ impl EngineCore {
                 &tokens,
                 &self.storage,
                 self.ledger_mode,
-            )?;
+            )
+            .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return Ok(ParsedSql::Truncate(stmt));
         }
 
@@ -2298,7 +2345,8 @@ impl EngineCore {
                 &tokens,
                 &self.storage,
                 self.ledger_mode,
-            )?;
+            )
+            .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return Ok(ParsedSql::Delete(stmt));
         }
 
@@ -2311,8 +2359,23 @@ impl EngineCore {
                 &tokens,
                 &self.storage,
                 self.ledger_mode,
-            )?;
+            )
+            .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return Ok(ParsedSql::Update(stmt));
+        }
+
+        let is_drop_view_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DROP")
+        ) && matches!(
+            tokens.get(1),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("VIEW")
+        );
+        if is_drop_view_statement {
+            // TABLE-18・SQL-23・TASK-205（Issue #909）: `validate_drop_view_tokens`
+            // もカタログ照会を一切行わない（`DropTable` と同じ設計）。
+            let stmt = crate::sql::allowlist::validate_drop_view_tokens(&tokens)?;
+            return Ok(ParsedSql::DropView(stmt));
         }
 
         let is_drop_statement = matches!(
@@ -2326,6 +2389,23 @@ impl EngineCore {
             // `execute_parsed_in_session` の `DropTable` 分岐が担う。
             let stmt = crate::sql::allowlist::validate_drop_table_tokens(&tokens)?;
             return Ok(ParsedSql::DropTable(stmt));
+        }
+
+        let is_create_view_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE")
+        ) && matches!(
+            tokens.get(1),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("VIEW")
+        );
+        if is_create_view_statement {
+            // TABLE-18・SQL-23・TASK-205（Issue #909）: `validate_create_view_tokens`
+            // もカタログ照会を一切行わない（`DropTable`・`DropView` と同じ設計。
+            // `is_create_function_statement`〔`sql::allowlist::validate_sql_tokens`
+            // 内〕より前にここで分岐するため、`CREATE VIEW` のトークン列が
+            // `parse_create_function` へ渡ることはない）。
+            let stmt = crate::sql::allowlist::validate_create_view_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateView(stmt));
         }
 
         let stmt = crate::sql::allowlist::validate_sql_tokens(&tokens, &self.storage)?;
@@ -2349,6 +2429,30 @@ impl EngineCore {
         sql: &str,
     ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = crate::sql::lexer::tokenize_with_params(sql)?;
+        // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW`
+        // は DDL であり、`sql::params` が受理する `$n` の許可位置一覧
+        // （WHERE 等号右辺・VALUES 節等）はいずれも DML 向けの規範形のため、
+        // これらの DDL トークン列に紛れ込んだ `$n` は位置に関わらず一律で
+        // 拒否する（PostgreSQL の DDL がバインドパラメータを受け付けない
+        // のと同じ方針。`sql::params::validate_param_positions` の汎用位置
+        // 判定へ DDL 分岐を混在させない設計）。
+        let is_create_or_drop_view = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name))
+                if name.eq_ignore_ascii_case("CREATE") || name.eq_ignore_ascii_case("DROP")
+        ) && matches!(
+            tokens.get(1),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("VIEW")
+        );
+        if is_create_or_drop_view
+            && tokens
+                .iter()
+                .any(|t| matches!(t, crate::sql::lexer::Token::Param(_)))
+        {
+            return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                "bind parameters are not supported in CREATE VIEW / DROP VIEW",
+            ));
+        }
         let param_count = crate::sql::params::validate_param_positions(&tokens)?;
         // ダミー置換前の元トークン列から判定する（置換後は `$n` 自体が
         // 消えるため、置換後トークン列からは判定できない）。
@@ -2511,6 +2615,18 @@ impl EngineCore {
                 let outcome = crate::sql::ddl::execute_drop_table(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropTable(outcome))
             }
+            // TABLE-18・SQL-23・TASK-205（Issue #909）: `DropTable` と同じ判定
+            // 順序（DDL 実行権限ゲート → カタログ照会を含む実行本体）。
+            ParsedSql::CreateView(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_create_view(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::CreateView(outcome))
+            }
+            ParsedSql::DropView(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_drop_view(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::DropView(outcome))
+            }
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
             }
@@ -2599,6 +2715,10 @@ impl EngineCore {
             // ため、`Truncate` と同じく結果列を持たない。DDL 実行権限判定・
             // 実際の削除は一切行わない（Describe は本体を実行しない契約）。
             ParsedSql::DropTable(_) => Ok(None),
+            // TABLE-18・SQL-23・TASK-205（Issue #909）: DDL につき結果列を持たない
+            // （`DropTable` と同じ扱い）。
+            ParsedSql::CreateView(_) => Ok(None),
+            ParsedSql::DropView(_) => Ok(None),
             ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
                 match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {

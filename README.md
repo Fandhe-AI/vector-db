@@ -247,16 +247,17 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
   生成し直す・ユーザーストアと同じ内容から導出する、といった運用は
   未知ユーザーの存在を推測させる情報漏えいに繋がるため避けてください）。
 
-`--ddl-allowed-users`（Issue #902・SQL-23・TASK-203）は `DROP TABLE` の DDL
+`--ddl-allowed-users`（Issue #902・SQL-23・TASK-203）は `DROP TABLE`・
+`CREATE VIEW`／`DROP VIEW`（TABLE-18・TASK-205、Issue #909）の DDL
 実行権限を持つ username をカンマ区切りで列挙する opt-in CLI 引数です。
 `--search-engine`／`--durability` と同型の「プロセス起動時にのみ明示指定する
-注入点」で、未指定は DDL 実行権限を持つユーザーが 0 人のまま（`DROP TABLE`
+注入点」で、未指定は DDL 実行権限を持つユーザーが 0 人のまま（これらの DDL
 は常に `42501` で拒否されます）。列挙した username は `--users` で読み込んだ
 ユーザーストアへ実在する必要があり、未知の username・空要素・重複要素・
 フラグの重複指定はいずれも fail-closed で起動エラーになります。認証成功後の
 接続に対してのみ、対応する username が一覧に含まれる場合に限り DDL 実行
 権限が付与されます（テナント境界とは別軸の権限で、`RLS` の判定は変更しません。
-詳細は `docs/design/drop-table.md` 参照）。
+詳細は `docs/design/drop-table.md`・`docs/design/create-view.md` 参照）。
 
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 

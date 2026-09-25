@@ -659,7 +659,10 @@ Date: <IMF-fixdate>
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | ENUM 列の語彙外ラベル（`insert`／`update`／`filter`） |
 | `23502` | `MISSING_OPERATION_ID` | 400 | Bad Request | `insert` の `operation_id` 欠落 |
+| `2BP01` | `DEPENDENT_OBJECTS_STILL_EXIST` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW` は SQL 表層専用の DDL。後述） |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
+| `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
+| `42P07` | `DUPLICATE_TABLE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE VIEW` は SQL 表層専用の DDL。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
@@ -671,15 +674,17 @@ Date: <IMF-fixdate>
 | `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 
-到達不能な 2 分類（`42501`・`P0002`）の理由: NoSQL 表層はテナントを
+到達不能な 5 分類（`42501`・`P0002`・`42P07`・`2BP01`・`42809`）の理由: NoSQL 表層はテナントを
 セッション（`SessionPrincipal::policy_context()`）からのみ導出し、
 クライアント自己申告の `tenant_id` 相当値は JSON／ヘッダ／パスいずれの
 位置でも `42601` で先に拒否するため、`ForbiddenTenantMismatch` を実要求から
 誘発する経路が構造的に存在しない。`RowNotFound` に対応する op（更新・削除系）
-も NoSQL 表層の許可リストに無い。テナント境界の検査を緩める・バイパスする
-production 経路をこの 2 分類のために新設することはせず（`.claude/rules/
-security.md` P0）、射影表としての一致のみを production の応答エンコーダ経由で
-固定する。
+も NoSQL 表層の許可リストに無い。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
+TASK-205）は SQL 表層専用の DDL で、NoSQL `op` 許可リストに `view` 相当の語彙が
+無いため `42P07`／`2BP01`／`42809` も同様に到達不能。テナント境界の検査を
+緩める・バイパスする production 経路をこれらの分類のために新設することは
+せず（`.claude/rules/security.md` P0）、射影表としての一致のみを production
+の応答エンコーダ経由で固定する。
 
 本節の各 op スキーマ節（[op 別スキーマ](#op-別スキーマ)・
 [`filter` 配列](#filter-配列)・[`explain`](#explain)）では引き続き

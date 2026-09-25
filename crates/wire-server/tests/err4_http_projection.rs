@@ -193,7 +193,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 18] = [
+const EXPECTED_STATUS: [(&str, u16); 21] = [
     ("22000", 400),
     ("28P01", 401),
     ("28000", 401),
@@ -212,6 +212,14 @@ const EXPECTED_STATUS: [(&str, u16); 18] = [
     ("22023", 400),
     ("22008", 400),
     ("22P02", 400),
+    // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW` が
+    // 新設する 3 分類。SQL 表層専用の DDL であり NoSQL `op` 許可リストには
+    // 含めない（本ファイル冒頭 doc の「到達不能類型」と同じ扱い。
+    // production の応答エンコーダ経由で射影のみ検証する。下記
+    // `err4_f_unreachable_classes_project_via_production_encoder` 参照）。
+    ("42P07", 400),
+    ("2BP01", 400),
+    ("42809", 400),
 ];
 
 /// (a)〜(f) 全類型の共通アサーション: `wire_code` が逆引き可能・射影ステータス
@@ -270,7 +278,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 18);
+const _: () = assert!(ErrorClass::ALL.len() == 21);
 
 #[test]
 fn err4_projection_table_is_closed_over_all_error_classes() {
@@ -643,13 +651,22 @@ fn err4_f_internal_error_projects_xx000_to_500() {
 }
 
 /// `42501`（テナント越境）・`P0002`（行不在）は NoSQL 表層の実要求からは
-/// 構造的に到達不能（本ファイル冒頭 doc 参照）。要求駆動ではなく、
-/// production の応答エンコーダ（[`wire_server::http::response::encode_error`]。
-/// ルータ・各 op ハンドラが実際に使う関数）を通したバイト列を実応答と同じ
-/// パーサで解析し、射影のみを検証する。
+/// 構造的に到達不能（本ファイル冒頭 doc 参照）。`42P07`／`2BP01`／`42809`
+/// （TABLE-18・SQL-23・TASK-205、Issue #909）も同様——`CREATE VIEW`／
+/// `DROP VIEW` は SQL 表層専用の DDL で NoSQL `op` 許可リストに含まれない
+/// （`gate.rs`・`http/query/op.rs`）。要求駆動ではなく、production の応答
+/// エンコーダ（[`wire_server::http::response::encode_error`]。ルータ・各 op
+/// ハンドラが実際に使う関数）を通したバイト列を実応答と同じパーサで解析し、
+/// 射影のみを検証する。
 #[test]
 fn err4_f_unreachable_classes_project_via_production_encoder() {
-    for class in [ErrorClass::ForbiddenTenantMismatch, ErrorClass::RowNotFound] {
+    for class in [
+        ErrorClass::ForbiddenTenantMismatch,
+        ErrorClass::RowNotFound,
+        ErrorClass::DuplicateTable,
+        ErrorClass::DependentObjectsStillExist,
+        ErrorClass::WrongObjectType,
+    ] {
         let raw =
             wire_server::http::response::encode_error(class, "test message", SystemTime::now());
         let resp = http_common::parse_single_response(&raw);

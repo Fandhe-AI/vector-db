@@ -48,6 +48,36 @@ const CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("catalo
 /// 持つ名前空間で、列は型名の参照（[`ColumnType::Enum`]）のみを保持する。
 const ENUM_TYPES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("enum_types");
 
+/// 非マテリアライズド `VIEW` 定義（TABLE-18・SQL-23・TASK-205、Issue #909）を
+/// 格納するテーブル。キーはビュー名（テーブルと名前空間を共有する。
+/// [`Storage::create_view`]／[`Storage::create_table`] のいずれも [`CATALOG_TABLE`]・
+/// 本テーブルの双方を同一 write txn で確認する）。値は [`encode_view_def`] で
+/// エンコードした「直接参照するリレーション名＋正規化 body SQL」の blob。
+/// 参照時の展開（`sql::view::resolve_from`）は本テーブルから取得した定義を
+/// 許可リストパーサー（`sql::allowlist::parse_view_body`）で再検証してから使う
+/// （第 2 の SQL パーサー・実行器を作らない設計。spec-confidentiality に配慮し
+/// 本コメントには TABLE-18・SQL-23 のポインタのみを記す）。
+const VIEWS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("views");
+
+/// 登録可能なビューの総数上限（[`MAX_LIST_TABLES`] と同じ既定値。本リポの
+/// 実装既定値であり DoS 対策）。
+const MAX_VIEWS: usize = MAX_LIST_TABLES;
+
+/// ビュー本文（正規化 SQL テキスト）1 件あたりのバイト数上限（本リポの実装
+/// 既定値）。untrusted 入力から無制限 `String`／redb 値を確保しないための
+/// アロケーション前の上限（security.md「無制限リソース確保（DoS）」対応）。
+pub(crate) const MAX_VIEW_BODY_BYTES: usize = 64 * 1024;
+
+/// ビューのネスト深さ上限（本リポの実装既定値。テーブル自身を深さ 0 とし、
+/// それを直接参照するビューを深さ 1、以降 1 段ごとに +1 する）。
+pub(crate) const MAX_VIEW_NESTING_DEPTH: u32 = 4;
+
+/// カタログ破損時の連鎖走査を打ち切る安全上限（[`MAX_VIEWS`] と同じ値。
+/// 正常経路では循環を構造的に構築できない（[`Storage::create_view`] が
+/// 参照先の存在を作成前に要求するため）が、破損したカタログ値に対しても
+/// 無限ループにならないことを保証する防御的上限）。
+const MAX_VIEW_CHAIN_WALK: usize = MAX_VIEWS;
+
 /// カタログのテキスト形式フォーマットバージョン識別子。値の追加・変更は
 /// 破壊的変更として扱い、この値を更新する。旧バージョンの読み出しは
 /// マイグレーションを提供せず fail-closed に拒否する
@@ -214,6 +244,25 @@ pub enum CatalogError {
     /// 想定だが、本 variant は Rust API 専用であり wire への送出経路を持たない
     /// ため `ErrorClass` には追加しない）。
     DependentObjectsStillExist(String),
+    /// `DROP VIEW` の対象名がカタログ・ビュー双方のいずれにも存在しない
+    /// （TABLE-18・SQL-23・TASK-205、Issue #909）。テーブルの `TableNotFound` とは
+    /// 別 variant とし、SQL 表層側で同じ `42P01` へ写像しつつ「ビュー専用の
+    /// 検索だった」ことを型で残す。
+    ViewNotFound(String),
+    /// 名前は存在するが、要求された操作が期待するオブジェクト種別
+    /// （テーブル／ビュー）と一致しない（`DROP TABLE` にビュー名、`DROP VIEW` に
+    /// テーブル名、ビューへの書き込み系文。TABLE-18・SQL-23・TASK-205、
+    /// Issue #909。ERR-6: `42809`）。
+    WrongObjectKind(String),
+    /// `DROP TABLE`／`DROP VIEW` の対象を参照するビューが 1 つ以上残っている
+    /// （TABLE-18・SQL-23・TASK-205、Issue #909。ERR-6: `2BP01`）。ENUM 型専用の
+    /// [`CatalogError::DependentObjectsStillExist`] とは独立させ、依存元・
+    /// 依存先の意味論が混ざらないようにする。
+    DependentViewsExist(String),
+    /// ビュー関連の DoS 対策上限超過（ビュー総数・本文バイト数・ネスト深さ。
+    /// TABLE-18・SQL-23・TASK-205、Issue #909。ERR-6: `54000`）。`detail` は
+    /// 固定文言のみ（テナント・行内容を含まない）。
+    ViewLimitExceeded(String),
 }
 
 impl fmt::Display for CatalogError {
@@ -239,6 +288,16 @@ impl fmt::Display for CatalogError {
             CatalogError::DependentObjectsStillExist(name) => {
                 write!(f, "dependent objects still exist for type: {name}")
             }
+            CatalogError::ViewNotFound(name) => write!(f, "view not found: {name}"),
+            CatalogError::WrongObjectKind(name) => {
+                write!(f, "wrong object kind for: {name}")
+            }
+            CatalogError::DependentViewsExist(name) => {
+                write!(f, "dependent views still exist for: {name}")
+            }
+            CatalogError::ViewLimitExceeded(detail) => {
+                write!(f, "view limit exceeded: {detail}")
+            }
         }
     }
 }
@@ -257,7 +316,11 @@ impl std::error::Error for CatalogError {
             | CatalogError::TableGenerationCounterOverflow
             | CatalogError::TypeNotFound(_)
             | CatalogError::TypeAlreadyExists(_)
-            | CatalogError::DependentObjectsStillExist(_) => None,
+            | CatalogError::DependentObjectsStillExist(_)
+            | CatalogError::ViewNotFound(_)
+            | CatalogError::WrongObjectKind(_)
+            | CatalogError::DependentViewsExist(_)
+            | CatalogError::ViewLimitExceeded(_) => None,
         }
     }
 }
@@ -813,6 +876,176 @@ fn decode_enum_type_def_body(name: &str, bytes: &[u8]) -> Result<EnumTypeDef> {
         name: name.to_string(),
         labels,
     })
+}
+
+/// 永続化済み `VIEW` 定義（TABLE-18・SQL-23・TASK-205、Issue #909）。`sql::view`
+/// モジュールが `body_sql` を許可リストパーサーで再検証・再展開する（本モジュールは
+/// 「直接参照するリレーション名」と「正規化 body SQL」を運ぶだけで、SQL の意味論
+/// には一切踏み込まない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewDef {
+    /// `CREATE VIEW ... AS SELECT ... FROM <base_relation> ...` の
+    /// `<base_relation>`（テーブルまたは別のビューの名前。存在確認・
+    /// ネスト深さの計算は本モジュールが担い、値そのものはカタログ照会前の
+    /// 識別子として保持する）。
+    pub base_relation: String,
+    /// [`crate::sql::allowlist::validate_create_view_tokens`] が構築した、
+    /// 再パース可能な正規化 SQL（`SELECT ... FROM ... [WHERE ...]`。`sql::view`
+    /// の round-trip テストが「描画 → 再トークン化 → 再パース」で元の AST と
+    /// 一致することを固定する）。
+    pub body_sql: String,
+}
+
+/// [`ViewDef`] のバイト表現（`u8` バージョン・`base_relation`／`body_sql` それぞれ
+/// `u32`（LE）長 + UTF-8 本体）。[`encode_enum_type_def`] と同じく untrusted
+/// クライアント入力の直接デコード対象ではなく、格納済みカタログ値のデコード
+/// （破損は `CorruptSchema`）。
+fn encode_view_def(def: &ViewDef) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.push(1u8); // バージョン
+    for part in [def.base_relation.as_str(), def.body_sql.as_str()] {
+        let len = u32::try_from(part.len()).map_err(|_| {
+            CatalogError::Invalid("view definition part too long to encode".to_string())
+        })?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(part.as_bytes());
+    }
+    if out.len() > MAX_VIEW_BODY_BYTES.saturating_add(64) {
+        return Err(CatalogError::ViewLimitExceeded(
+            "view body too large".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// [`encode_view_def`] の逆変換。バージョン不一致・長さ不整合・不正 UTF-8・
+/// 余剰バイトはすべて `CatalogError::CorruptSchema` として拒否する（格納済み
+/// データの破損。呼び出し元〔`sql::view::resolve_from`〕はこれを固定文言
+/// `XX000` へ丸め、body のリテラル値をエラーへ含めない。security.md P0）。
+fn decode_view_def(bytes: &[u8]) -> Result<ViewDef> {
+    decode_view_def_body(bytes).map_err(|e| match e {
+        CatalogError::Invalid(msg) => CatalogError::CorruptSchema(msg),
+        other => other,
+    })
+}
+
+fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
+    let version = *bytes
+        .first()
+        .ok_or_else(|| CatalogError::Invalid("view definition value is empty".to_string()))?;
+    if version != 1 {
+        return Err(CatalogError::Invalid(format!(
+            "unknown view definition format version: {version}"
+        )));
+    }
+    let mut offset = 1usize;
+    let mut parts: Vec<String> = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let len_bytes: [u8; 4] = bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| CatalogError::Invalid("view definition value truncated".to_string()))?
+            .try_into()
+            .map_err(|_| CatalogError::Invalid("view definition value truncated".to_string()))?;
+        offset = offset
+            .checked_add(4)
+            .ok_or_else(|| CatalogError::Invalid("view definition offset overflow".to_string()))?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        if len > MAX_VIEW_BODY_BYTES {
+            return Err(CatalogError::Invalid(
+                "view definition part too large".to_string(),
+            ));
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| CatalogError::Invalid("view definition offset overflow".to_string()))?;
+        let part_bytes = bytes.get(offset..end).ok_or_else(|| {
+            CatalogError::Invalid("view definition value truncated at part body".to_string())
+        })?;
+        let part = std::str::from_utf8(part_bytes)
+            .map_err(|_| {
+                CatalogError::Invalid("view definition part is not valid UTF-8".to_string())
+            })?
+            .to_string();
+        parts.push(part);
+        offset = end;
+    }
+    if offset != bytes.len() {
+        return Err(CatalogError::Invalid(
+            "view definition value has trailing bytes".to_string(),
+        ));
+    }
+    let body_sql = parts.pop().expect("2 parts were pushed above");
+    let base_relation = parts.pop().expect("2 parts were pushed above");
+    Ok(ViewDef {
+        base_relation,
+        body_sql,
+    })
+}
+
+/// `start` から始めてテーブルへ到達するまでの参照段数（テーブル自身が深さ 0、
+/// それを直接参照するビューが深さ 1）を計算する（[`Storage::create_view`] が
+/// 新規ビューのネスト深さ判定に使う。同一 write txn 内で完結させ TOCTOU を
+/// 避ける）。`start` がテーブル・ビューのいずれにも存在しない場合は
+/// `CatalogError::TableNotFound`。循環・異常に長い連鎖はカタログ破損として
+/// `CorruptSchema`（正常経路では発生しない。[`Storage::create_view`] が新規
+/// ビュー名の被参照を作成前に拒否するため自己参照は構造的に作れない）。
+fn resolve_reference_depth_in_txn(
+    catalog_table: &redb::Table<'_, &str, &[u8]>,
+    views_table: &redb::Table<'_, &str, &[u8]>,
+    start: &str,
+) -> Result<u32> {
+    let mut current = start.to_string();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut depth = 0u32;
+    loop {
+        if !visited.insert(current.clone()) {
+            return Err(CatalogError::CorruptSchema(
+                "view reference cycle detected".to_string(),
+            ));
+        }
+        if visited.len() > MAX_VIEW_CHAIN_WALK {
+            return Err(CatalogError::CorruptSchema(
+                "view reference chain too long".to_string(),
+            ));
+        }
+        if catalog_table.get(current.as_str())?.is_some() {
+            return Ok(depth);
+        }
+        match views_table.get(current.as_str())? {
+            Some(guard) => {
+                let def = decode_view_def(guard.value())?;
+                depth = depth.checked_add(1).ok_or_else(|| {
+                    CatalogError::CorruptSchema("view nesting depth overflow".to_string())
+                })?;
+                current = def.base_relation;
+            }
+            None => return Err(CatalogError::TableNotFound(start.to_string())),
+        }
+    }
+}
+
+/// `target`（テーブルまたはビュー名）を直接参照している既存ビュー名の一覧
+/// （[`Storage::drop_table`]／[`Storage::drop_view`] の依存検査が使う。
+/// [`dependent_tables_in_txn`] と同じ「上限超過は無制限 `Vec` 確保を避けて
+/// `Err`」方針）。
+fn views_depending_on_in_txn(
+    views_table: &redb::Table<'_, &str, &[u8]>,
+    target: &str,
+) -> Result<Vec<String>> {
+    let mut dependents = Vec::new();
+    for entry in views_table.iter()? {
+        let (key, value) = entry?;
+        if dependents.len() >= MAX_VIEWS {
+            return Err(CatalogError::ViewLimitExceeded(
+                "too many views".to_string(),
+            ));
+        }
+        let def = decode_view_def(value.value())?;
+        if def.base_relation == target {
+            dependents.push(key.value().to_string());
+        }
+    }
+    Ok(dependents)
 }
 
 /// 配列列（`ColumnType::Array`）の要素型（TABLE-14・Issue #888）。`VECTOR`・`ARRAY`
@@ -1575,6 +1808,18 @@ impl Storage {
             if table.get(schema.name.as_str())?.is_some() {
                 return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
             }
+            // ビューとテーブルは名前空間を共有する（TABLE-18・SQL-23・TASK-205、
+            // Issue #909）。`VIEWS_TABLE` 側の衝突も同じ `TableAlreadyExists` へ
+            // 写像する。
+            match write_txn.open_table(VIEWS_TABLE) {
+                Ok(views_table) => {
+                    if views_table.get(schema.name.as_str())?.is_some() {
+                        return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(CatalogError::from(e)),
+            }
             table.insert(schema.name.as_str(), encoded.as_slice())?;
         }
         bump_table_generation_in_txn(&write_txn, &schema.name)?;
@@ -1612,6 +1857,26 @@ impl Storage {
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
         validate_identifier(table_name)?;
         let write_txn = self.begin_write_txn()?;
+        {
+            // ビュー名前空間との判別・依存検査（TABLE-18・SQL-23・TASK-205、
+            // Issue #909）。テーブル削除より前の同一 write txn 内で判定する
+            // （TOCTOU 回避）。`name` がビューなら `WrongObjectKind`（`42809`）、
+            // このテーブルを参照するビューが 1 つでも残っていれば
+            // `DependentViewsExist`（`2BP01`）。
+            match write_txn.open_table(VIEWS_TABLE) {
+                Ok(views_table) => {
+                    if views_table.get(table_name)?.is_some() {
+                        return Err(CatalogError::WrongObjectKind(table_name.to_string()));
+                    }
+                    let dependents = views_depending_on_in_txn(&views_table, table_name)?;
+                    if !dependents.is_empty() {
+                        return Err(CatalogError::DependentViewsExist(table_name.to_string()));
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(CatalogError::from(e)),
+            }
+        }
         {
             let mut table = match write_txn.open_table(CATALOG_TABLE) {
                 Ok(table) => table,
@@ -1782,6 +2047,113 @@ impl Storage {
             }
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、Issue #909）の
+    /// 永続化。呼び出し元（`sql::ddl::execute_create_view`）は許可リスト検証
+    /// （`sql::allowlist::validate_create_view_tokens`）を通過した `name`・
+    /// `base_relation`・`body_sql` を渡す（カタログ照会自体はここで初めて行う。
+    /// 構文検証段はカタログを一切照会しない契約）。
+    ///
+    /// 判定順序（同一 write txn 内。TOCTOU 回避）: 名前空間の衝突
+    /// （[`CATALOG_TABLE`]／[`VIEWS_TABLE`] のいずれか。`Err(TableAlreadyExists)`）
+    /// → 参照先の存在・ネスト深さ（[`resolve_reference_depth_in_txn`]。参照先
+    /// 不存在は `Err(TableNotFound)`、深さ超過は `Err(ViewLimitExceeded)`）→
+    /// 登録件数上限（`Err(ViewLimitExceeded)`）→ 保存。
+    ///
+    /// 自己参照（`CREATE VIEW v AS ... FROM v`）は `base_relation == name` が
+    /// [`CATALOG_TABLE`]・[`VIEWS_TABLE`] のいずれにも存在しない（`name` は
+    /// この時点でまだ登録されていない）ことから構造的に `TableNotFound` へ
+    /// 落ち、何も永続化されない。行ストア・世代カウンタは持たないため
+    /// [`bump_table_generation_in_txn`] は呼ばない。
+    pub fn create_view(&self, name: &str, base_relation: &str, body_sql: &str) -> Result<()> {
+        validate_identifier(name)?;
+        if body_sql.len() > MAX_VIEW_BODY_BYTES {
+            return Err(CatalogError::ViewLimitExceeded(
+                "view body too large".to_string(),
+            ));
+        }
+        let encoded = encode_view_def(&ViewDef {
+            base_relation: base_relation.to_string(),
+            body_sql: body_sql.to_string(),
+        })?;
+        let write_txn = self.begin_write_txn()?;
+        {
+            let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            if catalog_table.get(name)?.is_some() {
+                return Err(CatalogError::TableAlreadyExists(name.to_string()));
+            }
+            let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+            if views_table.get(name)?.is_some() {
+                return Err(CatalogError::TableAlreadyExists(name.to_string()));
+            }
+            let depth =
+                resolve_reference_depth_in_txn(&catalog_table, &views_table, base_relation)?;
+            // テーブル自身が深さ 0 のため、それを直接参照する新規ビューの深さは
+            // `depth`（参照先の深さ）+ 1。
+            let new_depth = depth.checked_add(1).ok_or_else(|| {
+                CatalogError::ViewLimitExceeded("view nesting depth overflow".to_string())
+            })?;
+            if new_depth > MAX_VIEW_NESTING_DEPTH {
+                return Err(CatalogError::ViewLimitExceeded(
+                    "view nesting depth exceeds limit".to_string(),
+                ));
+            }
+            let count = views_table.len()?;
+            if count >= MAX_VIEWS as u64 {
+                return Err(CatalogError::ViewLimitExceeded(
+                    "too many views".to_string(),
+                ));
+            }
+            views_table.insert(name, encoded.as_slice())?;
+        }
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）。他のビューが
+    /// `name` を参照している場合は `Err(DependentViewsExist)`（作り直しによる
+    /// 循環構築を阻止する）。`name` がテーブルとして存在する場合は
+    /// `Err(WrongObjectKind)`。いずれの名前空間にも存在しない場合は
+    /// `Err(ViewNotFound)`。行ストア・世代カウンタは持たないため
+    /// テーブル単位の世代 bump は行わない。
+    pub fn drop_view(&self, name: &str) -> Result<()> {
+        validate_identifier(name)?;
+        let write_txn = self.begin_write_txn()?;
+        {
+            let catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            if catalog_table.get(name)?.is_some() {
+                return Err(CatalogError::WrongObjectKind(name.to_string()));
+            }
+        }
+        {
+            let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
+            let dependents = views_depending_on_in_txn(&views_table, name)?;
+            if !dependents.is_empty() {
+                return Err(CatalogError::DependentViewsExist(name.to_string()));
+            }
+            if views_table.remove(name)?.is_none() {
+                return Err(CatalogError::ViewNotFound(name.to_string()));
+            }
+        }
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// ビュー定義をスナップショット読み取りで取得する（[`TableLookup::
+    /// view_definition`] のバックエンド実装。存在しない場合は `Ok(None)`——
+    /// テーブル名かどうかを問わず「ビューとしては見つからない」ことだけを表す
+    /// fail-closed な戻り値で、呼び出し元〔`sql::view::resolve_from`〕が
+    /// テーブルとしての存在確認を別途行う）。
+    pub fn view_definition(&self, name: &str) -> Result<Option<ViewDef>> {
+        let read_txn = self.db().begin_read()?;
+        let table = match read_txn.open_table(VIEWS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        match table.get(name)? {
+            Some(guard) => Ok(Some(decode_view_def(guard.value())?)),
+            None => Ok(None),
+        }
     }
 
     /// テーブル定義を読み出す（スナップショット読み取り）。存在しない場合は
@@ -2097,6 +2469,13 @@ impl TableLookup for Storage {
             Err(other) => Err(table_lookup_error(other)),
         }
     }
+
+    /// [`Storage::view_definition`]（本ファイル上部の inherent メソッド）へ
+    /// 委譲し、`CatalogError` は [`table_lookup_error`] で SQL 表層の契約へ
+    /// 写像する（TABLE-18・SQL-23・TASK-205、Issue #909）。
+    fn view_definition(&self, name: &str) -> std::result::Result<Option<ViewDef>, SqlSurfaceError> {
+        Storage::view_definition(self, name).map_err(table_lookup_error)
+    }
 }
 
 /// [`TableLookup::table_exists`]（`impl TableLookup for Storage`）と
@@ -2123,7 +2502,15 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::TableGenerationCounterOverflow
         | CatalogError::TypeNotFound(_)
         | CatalogError::TypeAlreadyExists(_)
-        | CatalogError::DependentObjectsStillExist(_) => SqlSurfaceError::Internal {
+        | CatalogError::DependentObjectsStillExist(_)
+        // ビュー関連の variant は `table_exists`（テーブルカタログのみを引く）
+        // からは構造的に到達しない（`view_definition` 経由のみで発生する）が、
+        // `CatalogError` の網羅 `match` を保つため他の未接続 variant と同じ
+        // `Internal` へ丸める（security.md「不安全な設計」対応）。
+        | CatalogError::ViewNotFound(_)
+        | CatalogError::WrongObjectKind(_)
+        | CatalogError::DependentViewsExist(_)
+        | CatalogError::ViewLimitExceeded(_) => SqlSurfaceError::Internal {
             detail: "catalog lookup failed".to_string(),
         },
     }

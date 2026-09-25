@@ -41,7 +41,13 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::OperationIdContentMismatch
         | ErrorClass::MissingOperationId
         | ErrorClass::DatetimeFieldOverflow
-        | ErrorClass::InvalidTextRepresentation => 400,
+        | ErrorClass::InvalidTextRepresentation
+        // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW`
+        // が新設する 3 分類。いずれもクライアント入力（対象名・依存関係）に
+        // 起因する拒否のため、既存の SQL 構文エラー系と同じ 400 とする。
+        | ErrorClass::DuplicateTable
+        | ErrorClass::DependentObjectsStillExist
+        | ErrorClass::WrongObjectType => 400,
     }
 }
 
@@ -51,7 +57,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 18] = [
+    const EXPECTED: [(ErrorClass, u16); 21] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -70,6 +76,9 @@ mod tests {
         (ErrorClass::OperationIdContentMismatch, 400),
         (ErrorClass::DatetimeFieldOverflow, 400),
         (ErrorClass::InvalidTextRepresentation, 400),
+        (ErrorClass::DuplicateTable, 400),
+        (ErrorClass::DependentObjectsStillExist, 400),
+        (ErrorClass::WrongObjectType, 400),
     ];
 
     #[test]

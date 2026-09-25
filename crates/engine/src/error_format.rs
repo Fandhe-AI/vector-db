@@ -73,7 +73,7 @@ macro_rules! define_error_classes {
 }
 
 define_error_classes! {
-    count = 18;
+    count = 21;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -159,6 +159,22 @@ define_error_classes! {
     /// 対し、本分類は「値は文字列として妥当だが、宣言済み型が定める表現の集合に
     /// 属さない」ことを表す（PostgreSQL の `invalid_text_representation` と同じ区別）。
     InvalidTextRepresentation => ("22P02", "INVALID_TEXT_REPRESENTATION"),
+    /// `CREATE VIEW`／`CREATE TABLE` が既存のテーブル名・ビュー名と衝突した
+    /// （`42P07`。TABLE-18・SQL-23・TASK-205、Issue #909）。ビューはテーブルと
+    /// 名前空間を共有する（[`crate::catalog::CatalogError::TableAlreadyExists`]
+    /// の写像）。
+    DuplicateTable => ("42P07", "DUPLICATE_TABLE"),
+    /// `DROP TABLE`／`DROP VIEW` の対象に、それを参照するビューが 1 つ以上残って
+    /// いるため削除を拒否した（`2BP01`。TABLE-18・SQL-23・TASK-205、Issue #909）。
+    /// [`crate::catalog::CatalogError::DependentViewsExist`] の写像。依存する
+    /// オブジェクト名の一覧はエラー文言に含めない（security.md P0）。
+    DependentObjectsStillExist => ("2BP01", "DEPENDENT_OBJECTS_STILL_EXIST"),
+    /// 指定した名前は存在するが、要求された操作が期待する種別のオブジェクトでは
+    /// ない（`42809`。`DROP TABLE` にビュー名、`DROP VIEW` にテーブル名、または
+    /// ビューへの書き込み系文〔`INSERT`／UPSERT／`UPDATE`／`DELETE`／
+    /// `TRUNCATE`〕。TABLE-18・SQL-23・TASK-205、Issue #909）。
+    /// [`crate::catalog::CatalogError::WrongObjectKind`] の写像。
+    WrongObjectType => ("42809", "WRONG_OBJECT_TYPE"),
 }
 
 impl ErrorClass {
