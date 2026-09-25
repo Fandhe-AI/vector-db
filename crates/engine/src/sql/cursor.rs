@@ -258,16 +258,31 @@ struct OpenCursor {
     /// [`estimate_result_bytes`] によるこのカーソルの概算バイト数
     /// （`CursorRegistry::total_bytes` から差し引くために保持する）。
     bytes: usize,
+    /// この `DECLARE` インスタンス固有の識別子（[`CursorRegistry::next_id`]
+    /// から払い出す単調増加値）。`CLOSE` 後に同じ名前で再 `DECLARE` した
+    /// 別インスタンスと区別するために使う（PR #1049 レビュー指摘対応。
+    /// `docs/design/sql-cursor.md`「wire-server 拡張クエリの portal 束縛」節
+    /// 参照）。
+    id: u64,
 }
 
 /// 明示トランザクション（[`crate::sql::transaction::ActiveTxn`]）が保持する
 /// カーソルの集合。トランザクションの終了（`COMMIT`／`ROLLBACK`／`fail`／
 /// 期限切れ／接続断）とともに `Drop` され、開いていたカーソルはすべて自動的に
-/// 消える（漏れる経路を持たない設計）。
+/// 消える（`sql::exec::QueryResult` 自体の寿命はこれで尽きる設計。ただし
+/// wire-server 拡張クエリプロトコルの portal は既に送出済みフレームを別途
+/// バッファするため、この `Drop` だけでは portal 側の残存を防げない——
+/// portal 側は [`crate::sql::transaction::SessionTransaction::cursor_id`] で
+/// 個体識別子を突き合わせて無効化する。`docs/design/sql-cursor.md` 参照）。
 #[derive(Debug, Default)]
 pub(crate) struct CursorRegistry {
     cursors: std::collections::BTreeMap<String, OpenCursor>,
     total_bytes: usize,
+    /// 次に `declare` するカーソルへ払い出す識別子（単調増加。オーバーフロー
+    /// 目前で頭打ちにし `id` の再利用を避ける——`MAX_CURSORS_PER_SESSION` に
+    /// より現実的には到達し得ないが、`.claude/rules/coding-rust.md` の
+    /// checked 演算方針に従う）。
+    next_id: u64,
 }
 
 impl CursorRegistry {
@@ -314,6 +329,10 @@ impl CursorRegistry {
                 "cursor byte budget exceeds limit {MAX_CURSOR_BYTES_PER_SESSION}"
             )));
         }
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("cursor identifier space exhausted".to_string())
+        })?;
         self.total_bytes = total;
         self.cursors.insert(
             name,
@@ -321,6 +340,7 @@ impl CursorRegistry {
                 result,
                 next_row: 0,
                 bytes,
+                id,
             },
         );
         Ok(())
@@ -359,6 +379,16 @@ impl CursorRegistry {
     /// 専用の読み取り専用アクセサ。取得位置には一切触れない）。
     pub(crate) fn columns(&self, name: &str) -> Option<Vec<crate::sql::exec::ColumnMeta>> {
         self.cursors.get(name).map(|c| c.result.columns.clone())
+    }
+
+    /// `name` のカーソルが存在すれば、その `DECLARE` インスタンス固有の
+    /// 識別子を返す（読み取り専用アクセサ。取得位置には一切触れない）。
+    /// wire-server 拡張クエリの portal が、`FETCH` 実行時に束縛したカーソルが
+    /// その後 `CLOSE`／再 `DECLARE` されていないか突き合わせるために使う
+    /// （PR #1049 レビュー指摘対応。[`crate::sql::transaction::
+    /// SessionTransaction::cursor_id`] 参照）。
+    pub(crate) fn cursor_id(&self, name: &str) -> Option<u64> {
+        self.cursors.get(name).map(|c| c.id)
     }
 
     /// `name` のカーソルを閉じる。不在は `34000`（[`Self::fetch`] と同じ
@@ -516,6 +546,44 @@ mod tests {
             .declare("c".to_string(), empty)
             .expect_err("duplicate name rejected");
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// `CLOSE` 後に同名で再 `DECLARE` すると、`cursor_id` は必ず前のインスタンス
+    /// と異なる値になる（単調増加。PR #1049 レビュー指摘対応: wire-server
+    /// 拡張クエリの portal 束縛検証が名前だけでなくこの識別子で「別インスタンス」
+    /// を判別できることの前提）。
+    #[test]
+    fn cursor_id_is_monotonic_across_close_and_redeclare_with_same_name() {
+        let mut registry = CursorRegistry::new();
+        let empty = QueryResult {
+            columns: vec![],
+            rows: vec![],
+        };
+        registry
+            .declare("c".to_string(), empty.clone())
+            .expect("first declare");
+        let first_id = registry.cursor_id("c").expect("cursor exists");
+
+        registry.close("c").expect("close succeeds");
+        assert_eq!(
+            registry.cursor_id("c"),
+            None,
+            "closed cursor must not resolve an id"
+        );
+
+        registry
+            .declare("c".to_string(), empty)
+            .expect("redeclare succeeds after close");
+        let second_id = registry.cursor_id("c").expect("cursor exists again");
+
+        assert_ne!(
+            first_id, second_id,
+            "redeclare with the same name must yield a distinct instance id"
+        );
+        assert!(
+            second_id > first_id,
+            "cursor id must increase monotonically"
+        );
     }
 
     #[test]

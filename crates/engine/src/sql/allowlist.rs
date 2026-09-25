@@ -419,10 +419,15 @@ impl SqlSurfaceError {
         }
     }
 
-    /// `pub(crate)`: `sql::cursor::CursorRegistry::fetch`／`close`（WIRE-15・
-    /// TASK-218）が、現在のトランザクション内に存在しないカーソル名を報告する
-    /// ために使う。固定 variant（データを持たない）のため引数はない。
-    pub(crate) fn invalid_cursor_name() -> Self {
+    /// `sql::cursor::CursorRegistry::fetch`／`close`（WIRE-15・TASK-218）が、
+    /// 現在のトランザクション内に存在しないカーソル名を報告するために使う。
+    /// 固定 variant（データを持たない）のため引数はない。`pub`（`pub(crate)`
+    /// から昇格。PR #1049 レビュー指摘対応）——`wire-server::extended_query`
+    /// が、カーソル `FETCH` 由来 portal の中断保持分を再送出する前に
+    /// `CLOSE`／`COMMIT`／`ROLLBACK`／再 `DECLARE` を挟んでいないか検証する
+    /// 経路で、同じ `34000` を直接構築するために使う（第 2 の実行器・第 2 の
+    /// エラー分類を作らない設計）。
+    pub fn invalid_cursor_name() -> Self {
         SqlSurfaceError::InvalidCursorName
     }
 

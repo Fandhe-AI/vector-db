@@ -33,8 +33,12 @@
 追加コードなしで成り立つ:
 
 - `COMMIT`／`ROLLBACK`／`fail()`／`release_if_expired`／接続断（`SessionTransaction`
-  の drop）のいずれでも、全カーソルが自動的にクローズされる（漏れる経路を
-  持たない）。
+  の drop）のいずれでも、`sql::cursor::CursorRegistry`（engine 側の実体）が
+  自動的にクローズされる。ただし wire-server 拡張クエリプロトコルの portal
+  （`PortalState::Suspended`）は `FETCH` 実行時点で既に送出用フレームへ
+  エンコード済みの行を独立に保持するため、この `Drop` だけでは portal 側の
+  残存を防げない——`CLOSE`／`COMMIT`／`ROLLBACK`／再 `DECLARE` を挟んでからの
+  portal 再開を拒否する追加の検証が必要（§8 参照。PR #1049 レビュー指摘）。
 - `Failed` 中の `FETCH`／`CLOSE`／`DECLARE` は、既存の parse 前判定
   （`is_rollback_statement`）によって `25P02` になる。
 
@@ -153,6 +157,34 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
 
 `sql::statement_splitter::classify_statement` は `DECLARE`／`FETCH`／`CLOSE`
 を `StatementEffect::ReadOnly` に分類する（redb の commit を伴わないため）。
+
+### 8. wire-server 拡張クエリの portal 束縛（PR #1049 レビュー指摘対応）
+
+`FETCH` を拡張クエリプロトコル（Bind/Execute）で実行すると、`max_rows` に
+より結果が `PortalState::Suspended` として中断保持されうる（§6）。この
+中断保持分は wire-server 側が既にエンコード済みのフレームとして保持して
+おり、`CursorRegistry` の `Drop`（§1）とは寿命が独立している。名前付き
+portal は Sync（'S'）のたびにしか破棄されないため、同一 Sync サイクル
+（`BEGIN` → `DECLARE` → `FETCH`（一部だけ Execute で中断保持）→ `CLOSE`／
+`COMMIT`／`ROLLBACK` → 再 Execute）の中では、修正前は中断保持分がカーソル・
+トランザクションの終了を一切確認せずにそのまま送出できてしまっていた
+（codex-review P1「終了したカーソルの FETCH portal から行を送出できる」）。
+
+是正として、`FETCH` の実行が成功した時点（`wire-server::extended_query::
+execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き合わせる:
+
+- **トランザクション世代**（`engine::sql::transaction::SessionTransaction::
+  active_generation`）: `BEGIN` が成功するたびに 1 つ進む単調増加カウンタ。
+  `COMMIT`／`ROLLBACK` は `Idle` へ戻るため世代が失われ、次の `BEGIN` は
+  新しい世代になる——同一名で再 `BEGIN` しても不一致になる。
+- **カーソル個体識別子**（`engine::sql::cursor::CursorRegistry::cursor_id`／
+  `SessionTransaction::cursor_id`）: `DECLARE` のたびに払い出す単調増加値。
+  `CLOSE` 後に同じ名前で再 `DECLARE` した別インスタンスと区別する。
+
+再開時にどちらか一方でも不一致なら、蓄積済みフレームを送出せず portal を
+`Failed` へ倒し `34000`（invalid cursor name）を返す。`FETCH` 以外の文
+（通常の検索 `SELECT`・集計・広域取得等）から作った portal は束縛が常に
+`None` のためこの検証の対象外で、既存の挙動は変えない。
 
 ## 対象外・申し送り
 

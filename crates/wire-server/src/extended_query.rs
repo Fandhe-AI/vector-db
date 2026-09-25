@@ -49,6 +49,15 @@
 //! 残る）。Close(Statement) はその statement から作られた portal もまとめて
 //! 閉じる。
 //!
+//! カーソル `FETCH`（WIRE-15・TASK-218）から作った portal は、Sync 境界とは
+//! 別に、実行成功時点で束縛した [`CursorBinding`]（トランザクション世代・
+//! カーソル個体識別子）を中断保持分の再開前に突き合わせる——`CLOSE`／
+//! `COMMIT`／`ROLLBACK`（→ 世代不一致）・同名での再 `DECLARE`（→ 識別子
+//! 不一致）を、名前付き portal が Sync を跨がず生き残っている間に挟んでも
+//! 蓄積済みフレームを送出しない（PR #1049 レビュー指摘対応。詳細は
+//! `docs/design/sql-cursor.md`「wire-server 拡張クエリの portal 束縛」節
+//! 参照）。`Fetch` 以外の文から作った portal は対象外。
+//!
 //! 中断中の全 portal が保持するバイト数の合計（[`crate::limits::
 //! MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION`]）は接続（セッション）全体の
 //! 上限として運用する（[`PortalStore::total_suspended_bytes_excluding`]。
@@ -555,6 +564,26 @@ enum PortalState {
     Failed,
 }
 
+/// カーソル `FETCH`（[`engine::sql::cursor::CursorStatement::Fetch`]）を実行
+/// した portal が、その実行成功時点で束縛したトランザクション世代・カーソル
+/// 個体識別子（PR #1049 レビュー指摘対応: cursor Bugbot P1「終了した
+/// カーソルの FETCH portal から行を送出できる」）。この portal の中断保持分
+/// （[`PortalState::Suspended`]）を再送出する前に
+/// [`engine::sql::transaction::SessionTransaction::active_generation`]／
+/// `cursor_id` と突き合わせ、`CLOSE`／`COMMIT`／`ROLLBACK`（→ 世代不一致）や
+/// 同名での再 `DECLARE`（→ 識別子不一致）を挟んでいないかを検証する。`Fetch`
+/// 以外の文（通常の検索 `SELECT`・集計・広域取得等）から作られた portal は
+/// 常に `None`（この検証の対象外。既存の挙動を変えない）。
+#[derive(Debug, Clone)]
+struct CursorBinding {
+    /// 束縛先のカーソル名（`FETCH ... FROM <name>`）。再送出前の検証で
+    /// `SessionTransaction::cursor_id` を引くために使う（`portal.body` から
+    /// 都度再解体しない）。
+    cursor_name: String,
+    txn_generation: u64,
+    cursor_id: u64,
+}
+
 struct Portal {
     /// この portal を作った statement 名（Close(Statement) が派生 portal も
     /// 連動して閉じるために使う）。
@@ -572,6 +601,10 @@ struct Portal {
     /// （PostgreSQL の Bind 規則と同じ）。
     result_formats: Vec<result_encoder::FormatCode>,
     state: PortalState,
+    /// [`CursorBinding`] 参照。Bind 時点では常に `None`（内側 SELECT 未実行の
+    /// ため束縛先のカーソルが未確定）で、`FETCH` の初回実行が成功した直後
+    /// （`execute_portal`）に一度だけ設定する。
+    cursor_binding: Option<CursorBinding>,
 }
 
 /// 接続単位で portal を保持する（[`PreparedStatementStore`] と同型の設計）。
@@ -1333,6 +1366,7 @@ fn handle_bind_body(
         columns,
         result_formats,
         state: PortalState::Ready,
+        cursor_binding: None,
     };
 
     state
@@ -1582,6 +1616,27 @@ fn execute_portal<'e>(
         })
         .map_err(HandlerError::Sql)?;
 
+        // `parsed` がカーソル `FETCH` なら、実行が成功したこの時点（`txn` は
+        // 実行後の状態）のトランザクション世代・カーソル個体識別子を portal へ
+        // 束縛する（PR #1049 レビュー指摘対応。cursor Bugbot P1「終了した
+        // カーソルの FETCH portal から行を送出できる」の是正）。`FETCH` 以外は
+        // 常に `None`（この検証の対象外。既存の挙動を変えない）。中断保持
+        // （`PortalState::Suspended`）へ回った場合はこの束縛を再送出前の
+        // 検証に使い、`CLOSE`／`COMMIT`／`ROLLBACK`／再 `DECLARE` を挟んで
+        // いれば以降の再 Execute を拒否する（本関数冒頭の検証ブロック参照）。
+        let cursor_binding = match &parsed {
+            ParsedSql::Cursor(engine::sql::cursor::CursorStatement::Fetch { name, .. }) => {
+                txn.active_generation().and_then(|txn_generation| {
+                    txn.cursor_id(name).map(|cursor_id| CursorBinding {
+                        cursor_name: name.clone(),
+                        txn_generation,
+                        cursor_id,
+                    })
+                })
+            }
+            _ => None,
+        };
+
         // ここに到達した時点で `is_write_statement` なら commit は既に成功
         // している（上のコメント参照）。これ以降（結果列整合検査・行
         // エンコード・中断バイト上限判定・応答フレーム送出）で発生する失敗は
@@ -1605,6 +1660,7 @@ fn execute_portal<'e>(
                     .get_mut(portal_name)
                     .ok_or(HandlerError::UnknownPortal)?;
                 portal.state = PortalState::Done { tag: tag.clone() };
+                portal.cursor_binding = cursor_binding;
                 return write_command_complete(stream, &tag).map_err(commit_wrap);
             }
             crate::simple_query::OutcomeResponse::Rows { result, shape } => {
@@ -1706,6 +1762,7 @@ fn execute_portal<'e>(
                         .get_mut(portal_name)
                         .ok_or(HandlerError::UnknownPortal)?;
                     portal.state = PortalState::Done { tag };
+                    portal.cursor_binding = cursor_binding;
                     return Ok(());
                 }
 
@@ -1726,6 +1783,7 @@ fn execute_portal<'e>(
                     sent_so_far: take,
                     committed: is_write_statement,
                 });
+                portal.cursor_binding = cursor_binding;
                 return Ok(());
             }
         }
@@ -1735,6 +1793,27 @@ fn execute_portal<'e>(
         .portals
         .get_mut(portal_name)
         .ok_or(HandlerError::UnknownPortal)?;
+
+    // カーソル `FETCH` 由来 portal の中断保持分（`PortalState::Suspended`）を
+    // 再送出する前に、実行成功時点で束縛した世代・カーソル個体識別子が現在も
+    // 有効かを検証する（PR #1049 レビュー指摘対応。cursor Bugbot P1「終了した
+    // カーソルの FETCH portal から行を送出できる」の是正）。`CLOSE`（同名の
+    // 再 `DECLARE` を含む）・`COMMIT`／`ROLLBACK`（→ 新しい世代／`Idle`）の
+    // いずれを挟んでいても不一致となり fail-closed に拒否する。`Fetch` 以外
+    // から作った portal は `cursor_binding` が常に `None` のため対象外
+    // （既存の挙動を変えない）。`Ready`（初回実行）はこの分岐に到達しない
+    // （`needs_execution` 判定で上のブロックへ流れ、この時点では既に
+    // `return` 済みのため）。
+    if let Some(binding) = &portal.cursor_binding {
+        let still_valid = txn.active_generation() == Some(binding.txn_generation)
+            && txn.cursor_id(&binding.cursor_name) == Some(binding.cursor_id);
+        if !still_valid {
+            portal.state = PortalState::Failed;
+            return Err(HandlerError::Sql(
+                engine::sql::allowlist::SqlSurfaceError::invalid_cursor_name(),
+            ));
+        }
+    }
 
     if let PortalState::Done { tag } = &portal.state {
         let tag = tag.clone();
@@ -2353,6 +2432,7 @@ mod tests {
                         columns: None,
                         result_formats: Vec::new(),
                         state: PortalState::Ready,
+                        cursor_binding: None,
                     },
                 )
                 .expect("insert within limit succeeds");
@@ -2365,6 +2445,7 @@ mod tests {
                 columns: None,
                 result_formats: Vec::new(),
                 state: PortalState::Ready,
+                cursor_binding: None,
             },
         );
         assert!(matches!(result, Err(PortalStoreError::TooManyPortals)));
@@ -2382,6 +2463,7 @@ mod tests {
                     columns: None,
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
+                    cursor_binding: None,
                 },
             )
             .expect("insert succeeds");
@@ -2394,6 +2476,7 @@ mod tests {
                     columns: None,
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
+                    cursor_binding: None,
                 },
             )
             .expect("insert succeeds");
@@ -2415,6 +2498,7 @@ mod tests {
                     columns: None,
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
+                    cursor_binding: None,
                 },
             )
             .expect("insert succeeds");
@@ -2427,6 +2511,7 @@ mod tests {
                     columns: None,
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
+                    cursor_binding: None,
                 },
             )
             .expect("insert succeeds");
