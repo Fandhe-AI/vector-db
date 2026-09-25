@@ -219,10 +219,10 @@ encode_ready_for_query`／`simple_query.rs`／`extended_query::handle_sync`）�
 | 簡易クエリ: `COPY`（`handshake::post_auth_loop`） | `0A000` で `fail()` | `25P02`（`crate::copy::run` へ委譲しない） |
 | 簡易クエリ: 空文字列 | 対象外（エラーにならない） | EmptyQueryResponse（副作用なし） |
 | 簡易クエリ: 応答のエンコード失敗（`RowDescription`・`DataRow`・`CommandComplete`） | 文の実行後でも `txn.fail()` | — |
-| 拡張: Parse | エラー応答は `respond_error_and_await_sync` を通り、`post_auth_loop` が `ignore_till_sync` を見て `fail()` | `ROLLBACK`・空文字列以外は parse より前に `25P02` |
-| 拡張: Bind | 同上 | `ROLLBACK`・空文字列以外のステートメントは `25P02`（`Failed` 前に Parse 済みのものを含む） |
+| 拡張: Parse | エラー応答は `respond_error_and_await_sync` を通り、`post_auth_loop` が `ignore_till_sync` を見て `fail()` | `ROLLBACK`・空文字列以外は、本体の構造検証（`08P01`）の後、パラメータ型 OID 指定の検査（`0A000`）・parse より前に `25P02` |
+| 拡張: Bind | 同上 | `ROLLBACK`・空文字列以外のステートメントは、本体の構造検証の後、format code の検証・ステートメントの存在確認より前に `25P02`（未登録・`Failed` 前に Parse 済みのものを含む） |
 | 拡張: Describe | 同上 | 受理（副作用なし。実行は Execute で拒否される） |
-| 拡張: Execute | 実行エラーは `execute_parsed_in_txn` が `fail()`。後処理のエラー応答は `ignore_till_sync` 経由で `fail()` | `execute_parsed_in_txn` が `25P02`（`ROLLBACK` のみ受理）。実行を開始済みの portal（`Suspended`・`Done`）も残り行の送出・タグの再送をせず `25P02`（期限切れの未報告分は `54000`）で拒否し、portal を終端状態 `Failed` にする |
+| 拡張: Execute | 実行エラーは `execute_parsed_in_txn` が `fail()`。後処理のエラー応答は `ignore_till_sync` 経由で `fail()` | 未実行の `ROLLBACK`・空文字列以外の portal は、本体の構造検証の後、portal の存在確認・実行状態より前に `25P02`（期限切れの未報告分は `54000`）で拒否し、portal を終端状態 `Failed` にする（実行を開始済みの `Suspended`・`Done` も残り行の送出・タグの再送をしない） |
 | 拡張: Close・Sync・Flush | 対象外（エラー応答は `ignore_till_sync` 経由で `fail()`） | 受理（副作用なし） |
 | フレーミング・プロトコル違反 | 接続を切断し、`SessionTransaction` の drop で abort | 同左 |
 | 全メッセージ共通（受信直後） | 期限切れなら `release_if_expired` で `Failed` にしてライタを解放 | — |
