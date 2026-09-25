@@ -89,6 +89,13 @@ pub(crate) fn execute_create_table(
     if let Some(primary_key) = validated.primary_key.clone() {
         schema = schema.with_primary_key(primary_key);
     }
+    // UNIQUE 制約（TABLE-16・TASK-204、Issue #905）。参照列の実在・型適格性は
+    // `sql::allowlist` が構造検証段階で判定済みで、`catalog::validate_schema`
+    // （`create_table` 内）が同じ不変条件を再検証する（違反は `Invalid` として
+    // 下記の `42601` へ写像される）。
+    if !validated.unique_constraints.is_empty() {
+        schema = schema.with_unique_constraints(validated.unique_constraints.clone());
+    }
     storage.create_table(&schema).map_err(|e| match e {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
         CatalogError::Invalid(detail) => {
@@ -125,7 +132,11 @@ pub(crate) fn execute_create_table(
         // `Storage::alter_table_add_column`）専用の変種で、`Storage::create_table`
         // からは返らない（列数上限は `validate_create_table_tokens` が構造検証
         // 段階で `54000` として既に拒否する。到達不能）。
-        | CatalogError::TooManyColumns { .. } => SqlSurfaceError::Internal {
+        | CatalogError::TooManyColumns { .. }
+        // `UniqueConstraintViolation` は `Storage::alter_table_add_unique_constraint`
+        // 専用（既存行の走査結果）で、`create_table`（新規テーブル・既存行なし）
+        // からは返らない（到達不能）。
+        | CatalogError::UniqueConstraintViolation => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     })?;
@@ -357,7 +368,11 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IncompatibleTypeChange { .. }
         | CatalogError::ViewNotFound(_)
         | CatalogError::DependentViewsExist(_)
-        | CatalogError::ViewLimitExceeded(_) => SqlSurfaceError::Internal {
+        | CatalogError::ViewLimitExceeded(_)
+        // `UniqueConstraintViolation` は `Storage::alter_table_add_unique_constraint`
+        // 専用（TABLE-16・TASK-204、Issue #905）で、`alter_table_add_column` からは
+        // 返らない（到達不能）。
+        | CatalogError::UniqueConstraintViolation => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     }
@@ -476,6 +491,7 @@ mod tests {
                 true,
             )],
             primary_key: None,
+            unique_constraints: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("create table");
         storage
@@ -574,6 +590,7 @@ mod tests {
                 crate::catalog::ColumnDef::new("body", crate::catalog::ColumnType::Text, true),
             ],
             primary_key: None,
+            unique_constraints: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("create table must succeed");
         let schema = storage.get_table_schema("docs").expect("schema must exist");
@@ -591,6 +608,7 @@ mod tests {
                 true,
             )],
             primary_key: None,
+            unique_constraints: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("first create must succeed");
         let err = execute_create_table(&storage, &validated)
@@ -609,6 +627,7 @@ mod tests {
                 crate::catalog::ColumnDef::new("b", crate::catalog::ColumnType::Vector(4), false),
             ],
             primary_key: None,
+            unique_constraints: Vec::new(),
         };
         let err = execute_create_table(&storage, &validated)
             .expect_err("two VECTOR columns must be rejected");

@@ -47,8 +47,8 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 - 拒否（いずれも `42601`。決定的な構造検証段で判定し、権限ゲート・カタログ照会より
   前に確定する）:
   - 主キー宣言が 2 つ以上（列制約 × 2・列制約 + 表制約・表制約 × 2）
-  - `CONSTRAINT <name> PRIMARY KEY` 形・`UNIQUE`／`NOT NULL`／`DEFAULT`／`CHECK`／
-    `REFERENCES`
+  - `CONSTRAINT <name> PRIMARY KEY` 形・`CHECK`／`REFERENCES`（`NOT NULL`／
+    `DEFAULT` は Issue #904、`UNIQUE` は Issue #905 で受理済み）
   - 空リスト `PRIMARY KEY ()`
   - 列リストに存在しない列名（`42703` は `ErrorClass` 未実装のため既存の
     未知列扱いに揃える）
@@ -95,7 +95,7 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
 
 ## テナント内一意性制約の検査点（`constraint.rs`）
 
-単一の検査点 `constraint::enforce_primary_key_in_txn` を新設し、`tenant.rs` の
+単一の検査点 `constraint::enforce_unique_keys_in_txn` を新設し、`tenant.rs` の
 各書き込み関数（`insert_row_unchecked`・`insert_rows_unchecked`・
 `insert_typed_row_unchecked`・`insert_typed_rows_unchecked`・
 `upsert_typed_rows_unchecked`・`update_row_unchecked`・
@@ -106,7 +106,9 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
 〔`23505`／`22023`〕は主キー違反として誤検出されない）。
 
 - 主キー未宣言のテーブルは `schema.primary_key()` が `None` を返し、即座に成功
-  する（コストゼロ）。
+  する（コストゼロ）。UNIQUE 制約（Issue #905。`docs/design/unique-constraint.md`）
+  も同じ検査点で判定し、テナント範囲の走査は 1 文あたり 1 回に保つ（主キー・
+  UNIQUE 制約の両方を宣言したテーブルでも走査は 1 回）。
 - 判定は今回の書き込みで実際に値が変わった行の `id` 集合（`written_ids`。UPSERT
   の `DO NOTHING` は含めない）についてのみ行う。
 - 各行の主キー列値を `[type_tag][u32 BE len][payload]` の型タグ＋長さ前置バイト列
@@ -147,8 +149,8 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
 
 ## 既知のギャップ（スコープ外）
 
-- NOT NULL 違反の `23502` 統一・`DEFAULT`（別 Issue）、`UNIQUE`（別 Issue）、
-  `CHECK`（別 Issue）、`FOREIGN KEY`（別 Issue）。
+- NOT NULL 違反の `23502` 統一・`DEFAULT`（Issue #904 で実装済み）、`UNIQUE`
+  （Issue #905 で実装済み）、`CHECK`（別 Issue）、`FOREIGN KEY`（別 Issue）。
 - `ALTER TABLE ADD/DROP CONSTRAINT`・`ADD PRIMARY KEY`、`ON CONFLICT (<主キー列>)`、
   NoSQL 表層の DDL op。
 - 主キー用の永続一意索引（書き込み時のテナント全行走査の解消）。

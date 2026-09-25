@@ -7,7 +7,7 @@
 //! `sql_create_table.rs` と同じ流儀（`EngineCore::execute_sql_in_session`・
 //! 実 `Storage` ＋ `CpuScalarProvider`、`unique_db_path`／`CleanupGuard`）で、
 //! `CREATE TABLE` の列制約・表制約両形の `PRIMARY KEY` 構文、テナント内
-//! 一意性制約の検査点（`constraint::enforce_primary_key_in_txn`）を production
+//! 一意性制約の検査点（`constraint::enforce_unique_keys_in_txn`）を production
 //! 経路（SQL 表層）から検証する。
 
 use engine::core::EngineCore;
@@ -432,7 +432,7 @@ fn upsert_do_nothing_row_value_still_participates_in_primary_key_check_via_exist
 
     // id=1 は `DO NOTHING`（既存の code='dup' は変わらない）。id=2 は新規行で
     // `code='dup'` を書き込もうとする。id=1 が `written_ids` から除外されて
-    // いても、テナント全行走査（`enforce_primary_key_in_txn` の第 2 パス）が
+    // いても、テナント全行走査（`enforce_unique_keys_in_txn` の第 2 パス）が
     // 未変更の id=1 を拾い、id=2 との衝突を検出しなければならない。
     let err = core
         .execute_insert_sql(

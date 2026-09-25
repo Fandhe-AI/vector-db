@@ -3358,7 +3358,7 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
         // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
         TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
-        // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約
+        // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約
         // 違反。行キー衝突（`IdConflict`）と原因は異なるが `23505` は共有する。
         TenantWriteError::UniqueViolation => SqlSurfaceError::unique_violation(),
         // `tenant::insert_typed_row_unchecked`／`insert_typed_rows_unchecked`／
@@ -3962,7 +3962,7 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         IncrementalError::Write(TenantWriteError::OperationIdContentMismatch) => {
             SqlSurfaceError::OperationIdContentMismatch
         }
-        // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約違反
+        // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約違反
         // （`replace_typed_rows_by_text_key` の採番 id 範囲検査。`constraint.rs`
         // ドキュメント参照）。行形 INSERT（[`map_write_error`]）と同じ `23505` へ
         // 写像し、`_` 節（`XX000`）へ丸めない（クライアントが一意制約違反を内部
