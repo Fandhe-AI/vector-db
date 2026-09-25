@@ -544,10 +544,12 @@ fn bind_copy_record(
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
         let value = match field {
             None => {
+                // 明示的な `\N`（COPY テキスト形式の NULL マーカー）は
+                // `DEFAULT` を適用しない（TABLE-16・TASK-204、Issue #904。
+                // 列を丸ごと省略した場合〔下の省略列補完ループ〕とは異なる
+                // 経路として区別する）。
                 if !column.nullable {
-                    return Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} does not accept NULL"
-                    )));
+                    return Err(SqlSurfaceError::not_null_violation(name.clone()));
                 }
                 Value::Null
             }
@@ -603,15 +605,7 @@ fn bind_copy_record(
         }
     }
 
-    for (idx, column) in schema.columns.iter().enumerate() {
-        let is_provided = provided.get(idx).copied().unwrap_or(false);
-        if !is_provided && !column.nullable {
-            return Err(SqlSurfaceError::invalid_input(format!(
-                "missing value for non-nullable column: {}",
-                column.name
-            )));
-        }
-    }
+    crate::sql::parser::fill_omitted_columns(&schema.columns, &mut bound_values, &provided)?;
 
     Ok(BoundInsert {
         table: table_name.to_string(),
@@ -740,7 +734,13 @@ impl CopyInSession {
             }
         }
         for column in &schema.columns {
-            if !column.nullable && !columns.iter().any(|c| c == &column.name) {
+            // `DEFAULT`（TABLE-16・TASK-204、Issue #904）を持つ列は列リストに
+            // 無くても [`bind_copy_record`]（`fill_omitted_columns` 経由）が
+            // 補うため、事前検証の対象から外す。
+            if !column.nullable
+                && column.default.is_none()
+                && !columns.iter().any(|c| c == &column.name)
+            {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "missing value for non-nullable column: {}",
                     column.name
@@ -897,16 +897,8 @@ mod tests {
         TableSchema::new(
             "t",
             vec![
-                ColumnDef {
-                    name: "body".to_string(),
-                    ty: ColumnType::Text,
-                    nullable: false,
-                },
-                ColumnDef {
-                    name: "note".to_string(),
-                    ty: ColumnType::Text,
-                    nullable: true,
-                },
+                ColumnDef::new("body".to_string(), ColumnType::Text, false),
+                ColumnDef::new("note".to_string(), ColumnType::Text, true),
             ],
         )
     }
@@ -1164,7 +1156,9 @@ mod tests {
         let columns = vec!["id".to_string(), "body".to_string()];
         let fields = vec![Some("1".to_string()), None];
         let err = bind_copy_record("t", &columns, &fields, &None, &schema).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        // TABLE-16・TASK-204、Issue #904: NOT NULL 違反は `23502`
+        // （`NotNullViolation`）へ写像する（旧 `22000` から契約変更）。
+        assert_eq!(err.wire_code(), "23502");
     }
 
     #[test]

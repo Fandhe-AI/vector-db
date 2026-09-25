@@ -47,7 +47,11 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::InvalidTextRepresentation
         // `DuplicateColumn`（`42701`。Issue #899）は `CREATE TABLE` の列リスト
         // 自体が不正という構文的な分類のため、他の 42xxx 系と同じ 400 とする。
-        | ErrorClass::DuplicateColumn => 400,
+        | ErrorClass::DuplicateColumn
+        // `NotNullViolation`（`23502`。TABLE-16・TASK-204、Issue #904）は
+        // `wire_code` を共有する `MissingOperationId` と同じくクライアント側の
+        // 入力不備であり 400 とする。
+        | ErrorClass::NotNullViolation => 400,
     }
 }
 
@@ -57,7 +61,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 20] = [
+    const EXPECTED: [(ErrorClass, u16); 21] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -78,6 +82,7 @@ mod tests {
         (ErrorClass::InvalidTextRepresentation, 400),
         (ErrorClass::DuplicateTable, 409),
         (ErrorClass::DuplicateColumn, 400),
+        (ErrorClass::NotNullViolation, 400),
     ];
 
     #[test]

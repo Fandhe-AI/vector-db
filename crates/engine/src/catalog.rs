@@ -77,6 +77,16 @@ const CATALOG_FORMAT_VERSION_LINE: &str = "v2";
 /// 5 フィールドで、物理スロット順（[`TableSchema::physical_slots`]）に並ぶ。
 const CATALOG_FORMAT_VERSION_V3: &str = "v3";
 
+/// カタログ v4（TABLE-16・TASK-204、Issue #904）: `DEFAULT` 句を 1 つ以上持つ
+/// スキーマ専用のフォーマット。`DEFAULT` を持たないスキーマは引き続き
+/// v2／v3 のいずれか（墓標の有無で選択）で書き、バイト列を変えない
+/// （既存ゴールデンテストへ影響しない）。v4 は v3 の上位集合として、墓標の
+/// 有無にかかわらず 1 列 1 行を必ず `name:tag:param:nullable:state:default`
+/// の 6 フィールド（`state` は v3 と同じ `L`／`D`。墓標行の `default` は常に
+/// `-`）で書く。`default` フィールドの符号化は [`ColumnDefault::
+/// encode_catalog_field`] 参照。
+const CATALOG_FORMAT_VERSION_V4: &str = "v4";
+
 /// カタログ v2 の `param` フィールドに許容する文字集合（TABLE-6・Issue #880）。
 /// パラメータなし型を表す `-` は本集合の外だが、[`validate_catalog_param`] で
 /// 別途特別扱いする。`:`・改行を含まないため、encode 側の `:` 区切りと
@@ -922,6 +932,173 @@ impl ArrayType {
     }
 }
 
+/// `DEFAULT <literal>` 句（TABLE-16・TASK-204、Issue #904）が宣言する既定値。
+/// [`crate::sql::allowlist::InsertLiteral`] の対応する 3 variant
+/// （`String`／`Number`／`Bool`。`Vector`・`Null` は `DEFAULT` の文法上
+/// 構造的に構築されない）を写した軽量表現で、`row_codec::Value` を直接
+/// 持たない（`Value` は `Real`／`Double` に `f64`/`f32` を持ち `Eq` を
+/// 実装できないため、`ColumnDef` の `Eq` 導出を維持できなくなる）。
+///
+/// `sql::parser::bind_literal_for_column`（省略列への補完・`INSERT`／
+/// `UPDATE`／`UPSERT`・COPY が共有する単一の束縛点）がこの値を実際の列型へ
+/// 束縛する際の型不一致・数値範囲外は通常の `INSERT` リテラルと同じ
+/// エラー分類（`22000`/`22003` 等）で拒否する。カタログ層（本モジュール）は
+/// [`column_default_compatible`] で列型の大分類（テキスト系／数値系／真偽値）
+/// との整合のみを検証し、`sql` 層に依存しない自己完結の防御として持つ
+/// （decode 時・Rust API 直接構築時にも効く多層防御）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnDefault {
+    Text(String),
+    Number(String),
+    Bool(bool),
+}
+
+/// [`ColumnDefault`] 1 個ぶんのカタログテキスト表現（未加工の値本体）の
+/// バイト長上限。カタログ decode 時・CREATE TABLE 構文検証時の両方で、
+/// 16 進符号化・アロケーションの前に検証する
+/// （`.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。
+pub const MAX_COLUMN_DEFAULT_LEN: usize = 1024;
+
+// `MAX_COLUMN_DEFAULT_LEN` を 16 進符号化（最大 2 倍）したうえで
+// `MAX_COLUMN_COUNT` 列ぶん連結しても、カタログ値全体の上限
+// （`MAX_CATALOG_VALUE_LEN`）に十分収まることをコンパイル時に固定する
+// （プレフィックス 1 バイト・区切り文字・列名等の余地として 500,000 バイトの
+// 余裕を残す）。
+const _: () = assert!(
+    MAX_COLUMN_DEFAULT_LEN * 2 * MAX_COLUMN_COUNT + 500_000 <= MAX_CATALOG_VALUE_LEN,
+    "MAX_COLUMN_DEFAULT_LEN * 2 * MAX_COLUMN_COUNT must leave slack under MAX_CATALOG_VALUE_LEN"
+);
+
+impl ColumnDefault {
+    /// この既定値が列型の大分類と整合するか（TABLE-16 D2）。`VECTOR` は
+    /// 常に不可（DEFAULT 自体が禁止）。ここでは型の大分類のみを見る粗い
+    /// フィルタで、数値の桁数・範囲・ENUM 語彙といった細かな整合性は
+    /// `sql::parser::bind_literal_for_column` が実際の束縛時に検証する。
+    fn compatible_with(&self, ty: &ColumnType) -> bool {
+        matches!(
+            (self, ty),
+            (ColumnDefault::Text(_), ColumnType::Text)
+                | (
+                    ColumnDefault::Number(_),
+                    ColumnType::Integer
+                        | ColumnType::BigInt
+                        | ColumnType::Real
+                        | ColumnType::Double
+                        | ColumnType::Numeric { .. },
+                )
+                | (ColumnDefault::Bool(_), ColumnType::Boolean)
+        )
+    }
+
+    /// カタログテキスト形式（v4）の `default` フィールドへ符号化する。
+    /// `-`（なし）は [`encode_column_line_v4`] 側が扱うため本関数は
+    /// `Some` の場合のみ呼ばれる。値本体を 16 進化するのは、`TEXT` 既定値が
+    /// `:`・改行等のカタログの区切り文字を含み得るため（区切り文字注入の
+    /// 防止。TABLE-6 と同じ設計判断）。
+    fn encode_catalog_field(&self) -> Result<String> {
+        let (tag, raw): (char, String) = match self {
+            ColumnDefault::Text(s) => ('s', s.clone()),
+            ColumnDefault::Number(s) => ('n', s.clone()),
+            ColumnDefault::Bool(b) => {
+                return Ok(if *b { "t".to_string() } else { "f".to_string() })
+            }
+        };
+        if raw.len() > MAX_COLUMN_DEFAULT_LEN {
+            return Err(CatalogError::Invalid(format!(
+                "column default literal exceeds length limit: {} bytes",
+                raw.len()
+            )));
+        }
+        let mut out = String::with_capacity(1 + raw.len() * 2);
+        out.push(tag);
+        for byte in raw.as_bytes() {
+            out.push_str(&hex_encode_byte(*byte));
+        }
+        Ok(out)
+    }
+
+    /// [`ColumnDefault::encode_catalog_field`] の逆変換。未知タグ・不正 16 進・
+    /// 不正 UTF-8・長さ上限超過はいずれも `Err`（fail-closed。TABLE-6 と同じ
+    /// 「デコード不能なカタログ値を許さない」方針）。
+    fn decode_catalog_field(field: &str) -> Result<Option<ColumnDefault>> {
+        if field == "-" {
+            return Ok(None);
+        }
+        if field == "t" {
+            return Ok(Some(ColumnDefault::Bool(true)));
+        }
+        if field == "f" {
+            return Ok(Some(ColumnDefault::Bool(false)));
+        }
+        let mut chars = field.chars();
+        let tag = chars
+            .next()
+            .ok_or_else(|| CatalogError::Invalid("empty column default field".to_string()))?;
+        let hex_body = chars.as_str();
+        // 16 進復号前に長さ上限を検証する（1 バイトは 16 進 2 文字。奇数長は
+        // 復号側で拒否されるが、上限判定はアロケーション前に済ませる）。
+        if hex_body.len() > MAX_COLUMN_DEFAULT_LEN * 2 {
+            return Err(CatalogError::Invalid(
+                "column default field exceeds length limit".to_string(),
+            ));
+        }
+        let bytes = hex_decode(hex_body)?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            CatalogError::Invalid("column default field is not valid UTF-8".to_string())
+        })?;
+        match tag {
+            's' => Ok(Some(ColumnDefault::Text(text))),
+            'n' => Ok(Some(ColumnDefault::Number(text))),
+            other => Err(CatalogError::Invalid(format!(
+                "unknown column default tag: {other:?}"
+            ))),
+        }
+    }
+}
+
+/// 1 バイトを小文字 16 進 2 文字へ変換する（依存追加なしの自作。
+/// dependency-policy.md 準拠）。
+fn hex_encode_byte(b: u8) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hi = HEX[(b >> 4) as usize] as char;
+    let lo = HEX[(b & 0x0f) as usize] as char;
+    let mut s = String::with_capacity(2);
+    s.push(hi);
+    s.push(lo);
+    s
+}
+
+/// 小文字 16 進文字列をバイト列へ復号する。奇数長・非 16 進文字は `Err`
+/// （fail-closed。untrusted なカタログ値を復号する経路のため添字直接
+/// アクセスを避け `get`／`from_digit` 相当の明示判定を使う）。
+fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err(CatalogError::Invalid(
+            "column default hex field has odd length".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        _ => Err(CatalogError::Invalid(
+            "column default field contains invalid hex digit".to_string(),
+        )),
+    }
+}
+
 /// テーブル定義中の 1 列。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -931,6 +1108,11 @@ pub struct ColumnDef {
     /// 実際の行デコード時の NULL 解決は行エンコーダー（TASK-86）の責務であり、
     /// 本モジュールはこのフラグを保持・往復させるのみ。
     pub nullable: bool,
+    /// `DEFAULT <literal>` 句（TABLE-16・TASK-204、Issue #904）。`INSERT` で
+    /// この列が省略された場合に補われる値。明示的な `NULL` には適用しない
+    /// （TABLE-16。`sql::parser::bind_literal_for_column`／
+    /// `fill_omitted_columns` が唯一の適用点）。
+    pub default: Option<ColumnDefault>,
 }
 
 impl ColumnDef {
@@ -939,7 +1121,16 @@ impl ColumnDef {
             name: name.into(),
             ty,
             nullable,
+            default: None,
         }
+    }
+
+    /// [`ColumnDef::new`] に `DEFAULT` を追加した版（TABLE-16・TASK-204、
+    /// Issue #904）。`ColumnDef::new` の呼び出し元（約 1,200 箇所）を変えずに
+    /// 済むよう、既定値の付与だけを別メソッドへ切り出す。
+    pub fn with_default(mut self, default: ColumnDefault) -> Self {
+        self.default = Some(default);
+        self
     }
 }
 
@@ -1322,6 +1513,18 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
         if column.ty.is_vector() {
             vector_column_count += 1;
         }
+        // `DEFAULT`（TABLE-16・TASK-204、Issue #904）は列型の大分類と整合する
+        // ものだけを許可する（`VECTOR` は常に不可）。SQL 表層の構文検証
+        // （`sql::allowlist::parse_create_table_column`）をすり抜けた場合も、
+        // Rust API 直接構築の場合も、ここで fail-closed に拒否する。
+        if let Some(default) = &column.default {
+            if !default.compatible_with(&column.ty) {
+                return Err(CatalogError::Invalid(format!(
+                    "column {:?} has a DEFAULT that is not compatible with its type",
+                    column.name
+                )));
+            }
+        }
     }
     if vector_column_count > 1 {
         return Err(CatalogError::Invalid(format!(
@@ -1406,17 +1609,75 @@ fn encode_column_line_v3(
     ))
 }
 
+/// [`encode_column_line_v3`] の v4 版（6 フィールド。末尾に `default`。
+/// TABLE-16・TASK-204、Issue #904）。`default` は `None` を `-` として書く
+/// （墓標行・`DEFAULT` 未宣言の生存列の両方がこの経路を通る）。
+fn encode_column_line_v4(
+    name: &str,
+    type_name: &str,
+    param_field: &str,
+    nullable: bool,
+    state: char,
+    default: Option<&ColumnDefault>,
+) -> Result<String> {
+    validate_catalog_param(param_field)?;
+    let nullable_field = if nullable { "1" } else { "0" };
+    let default_field = match default {
+        None => "-".to_string(),
+        Some(d) => d.encode_catalog_field()?,
+    };
+    Ok(format!(
+        "{name}:{type_name}:{param_field}:{nullable_field}:{state}:{default_field}\n"
+    ))
+}
+
 /// [`TableSchema`] をカタログのテキスト形式へエンコードする。1 行目に
 /// フォーマットバージョン、2 行目に列数、以降 1 行 1 列（`name:type:dim:nullable`
 /// の 4 フィールドを `:` 区切り。識別子は `validate_identifier` により `:` を
 /// 含み得ないため、区切り文字との衝突は起きない）。エンコード時にも
 /// `validate_schema` を通し、不正なスキーマを永続化しない（fail-closed）。
+///
+/// バージョン選択（TABLE-16・TASK-204、Issue #904 で v4 を追加）: `DEFAULT` を
+/// 1 つでも持つスキーマは（墓標の有無を問わず）v4 で書く。`DEFAULT` を持たない
+/// スキーマは従来どおり v2／v3（墓標の有無で選択）のまま、バイト列を変えない
+/// （既存ゴールデンテストへ影響しない）。
 fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     validate_schema(schema)?;
+    let has_default = schema.columns.iter().any(|c| c.default.is_some());
     let mut out = String::new();
-    if schema.dropped_slots().is_empty() {
-        // 墓標を持たないスキーマは常に v2 で書く（バイト列不変。既存のゴールデン
-        // テストに影響しない。TABLE-19・Issue #901）。
+    if has_default {
+        out.push_str(CATALOG_FORMAT_VERSION_V4);
+        out.push('\n');
+        out.push_str(&format!("cols:{}\n", schema.physical_slot_count()));
+        for slot in schema.physical_slots() {
+            match slot {
+                PhysicalSlot::Live(_, column) => {
+                    let (type_name, param_field) = column.ty.catalog_fields();
+                    out.push_str(&encode_column_line_v4(
+                        &column.name,
+                        type_name,
+                        &param_field,
+                        column.nullable,
+                        'L',
+                        column.default.as_ref(),
+                    )?);
+                }
+                PhysicalSlot::Dropped(dropped) => {
+                    let (type_name, param_field) = dropped.ty().catalog_fields();
+                    out.push_str(&encode_column_line_v4(
+                        dropped.name(),
+                        type_name,
+                        &param_field,
+                        true,
+                        'D',
+                        None,
+                    )?);
+                }
+            }
+        }
+    } else if schema.dropped_slots().is_empty() {
+        // 墓標も DEFAULT も持たないスキーマは常に v2 で書く（バイト列不変。
+        // 既存のゴールデンテストに影響しない。TABLE-19・Issue #901）。
         out.push_str(CATALOG_FORMAT_VERSION_LINE);
         out.push('\n');
         out.push_str(&format!("cols:{}\n", schema.columns.len()));
@@ -1432,8 +1693,9 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
             )?);
         }
     } else {
-        // 墓標が 1 つでもあるスキーマは v3 で書く。物理位置の昇順
-        // （[`TableSchema::physical_slots`]）で生存列・墓標を交互に列挙する。
+        // 墓標が 1 つでもあるが DEFAULT を持たないスキーマは v3 で書く。
+        // 物理位置の昇順（[`TableSchema::physical_slots`]）で生存列・墓標を
+        // 交互に列挙する。
         out.push_str(CATALOG_FORMAT_VERSION_V3);
         out.push('\n');
         out.push_str(&format!("cols:{}\n", schema.physical_slot_count()));
@@ -1528,17 +1790,28 @@ fn decode_schema_body(
         .next()
         .ok_or_else(|| CatalogError::Invalid("catalog value is empty".to_string()))?;
     // v3（TABLE-19・Issue #901）は 1 行あたり 5 フィールド（末尾に `state`
-    // `L`／`D`）を持つ以外は v2 と同じ枠組みを共有する。`cols:` は物理スロット
-    // 総数（v2 では常に生存列数と一致）を表す。
-    let is_v3 = match version_line {
-        CATALOG_FORMAT_VERSION_LINE => false,
-        CATALOG_FORMAT_VERSION_V3 => true,
+    // `L`／`D`）、v4（TABLE-16・TASK-204、Issue #904）はさらに 6 番目の
+    // `default` フィールドを持つ以外は v2 と同じ枠組みを共有する。`cols:` は
+    // 物理スロット総数（v2 では常に生存列数と一致）を表す。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FormatVersion {
+        V2,
+        V3,
+        V4,
+    }
+    let format_version = match version_line {
+        CATALOG_FORMAT_VERSION_LINE => FormatVersion::V2,
+        CATALOG_FORMAT_VERSION_V3 => FormatVersion::V3,
+        CATALOG_FORMAT_VERSION_V4 => FormatVersion::V4,
         other => {
             return Err(CatalogError::Invalid(format!(
                 "unknown catalog format version: {other:?}"
             )))
         }
     };
+    let is_v3 = format_version == FormatVersion::V3;
+    let has_state_field = format_version != FormatVersion::V2;
+    let has_default_field = format_version == FormatVersion::V4;
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::Invalid("catalog value truncated: missing cols line".to_string())
@@ -1591,9 +1864,18 @@ fn decode_schema_body(
             .next()
             .ok_or_else(|| CatalogError::Invalid(format!("malformed column line: {line:?}")))?;
         // v2 は 4 フィールド固定（state 相当は常に「生存」）。v3 は 5 番目に
-        // `state` フィールドを必須で持つ。
+        // `state` フィールドを必須で持ち、v4 はさらに 6 番目に `default` を
+        // 必須で持つ。
         let state_field =
-            if is_v3 {
+            if has_state_field {
+                Some(fields.next().ok_or_else(|| {
+                    CatalogError::Invalid(format!("malformed column line: {line:?}"))
+                })?)
+            } else {
+                None
+            };
+        let default_field =
+            if has_default_field {
                 Some(fields.next().ok_or_else(|| {
                     CatalogError::Invalid(format!("malformed column line: {line:?}"))
                 })?)
@@ -1625,9 +1907,25 @@ fn decode_schema_body(
 
         match state_field {
             None | Some("L") => {
-                columns.push(ColumnDef::new(name, ty, nullable));
+                let mut column = ColumnDef::new(name, ty, nullable);
+                if let Some(field) = default_field {
+                    // decode 側は「fail-closed（不正な default はスキーマ自体を
+                    // 読み込み不能にする）」方針。`ColumnDefault::compatible_with`
+                    // による型整合は後続の `validate_schema` が担う。
+                    column.default = ColumnDefault::decode_catalog_field(field)?;
+                }
+                columns.push(column);
             }
             Some("D") => {
+                // 墓標は default を持たない（encode 側は常に `-` を書く。
+                // 手書きの不正データによる持ち込みも fail-closed に拒否する）。
+                if let Some(field) = default_field {
+                    if field != "-" {
+                        return Err(CatalogError::Invalid(format!(
+                            "dropped column {name:?} must not declare a DEFAULT"
+                        )));
+                    }
+                }
                 // 墓標の型は必ずフレーム等価型（TABLE-19 D1・D2）でなければ
                 // ならない。手書きの不正データが `VECTOR`／`ENUM`／`JSON`／
                 // `JSONB` を削除済み状態で持ち込むのを拒否する。
@@ -1669,6 +1967,14 @@ fn decode_schema_body(
     if is_v3 && dropped.is_empty() {
         return Err(CatalogError::Invalid(
             "v3 catalog format requires at least one dropped column".to_string(),
+        ));
+    }
+    // v4 なのに DEFAULT 0 件は形式の一意性に反する（同一スキーマが v2／v3 と
+    // v4 の 2 通りにエンコードされ得る状態を許さない。TABLE-16・TASK-204、
+    // Issue #904。TABLE-19 D2 と同じ設計判断）。
+    if format_version == FormatVersion::V4 && !columns.iter().any(|c| c.default.is_some()) {
+        return Err(CatalogError::Invalid(
+            "v4 catalog format requires at least one column with a DEFAULT".to_string(),
         ));
     }
 
@@ -2011,6 +2317,16 @@ impl Storage {
         if !column.nullable {
             return Err(CatalogError::Invalid(
                 "column added via ALTER TABLE ADD COLUMN must be nullable".to_string(),
+            ));
+        }
+        // `DEFAULT` を伴う ADD COLUMN は未対応（TABLE-16・TASK-204、Issue #904
+        // D7）。既存行に対する読み出し時の DEFAULT 補完（PostgreSQL の
+        // `ALTER TABLE ... ADD COLUMN ... DEFAULT ...` 相当）を実装していない
+        // ため、受理すると既存行が常に NULL で読める一方、新規行だけ既定値を
+        // 持つという意味論の食い違いが生じる。fail-closed に拒否する。
+        if column.default.is_some() {
+            return Err(CatalogError::Invalid(
+                "column added via ALTER TABLE ADD COLUMN must not declare a DEFAULT".to_string(),
             ));
         }
         let write_txn = self.begin_write_txn()?;

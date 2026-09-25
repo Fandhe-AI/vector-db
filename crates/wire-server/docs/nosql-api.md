@@ -648,7 +648,7 @@ Date: <IMF-fixdate>
 
 「1 つの `wire_code` → 常に 1 つの HTTP ステータス」の方向にのみ 1:1 の射影
 であり、逆方向（ステータス → `wire_code`）は 1:1 ではない（例えば `400` は
-7 分類が共有する）。
+10 分類が共有する）。
 
 | `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
 | --- | --- | --- | --- | --- |
@@ -659,6 +659,7 @@ Date: <IMF-fixdate>
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | ENUM 列の語彙外ラベル（`insert`／`update`／`filter`） |
 | `23502` | `MISSING_OPERATION_ID` | 400 | Bad Request | `insert` の `operation_id` 欠落 |
+| `23502` | `NOT_NULL_VIOLATION` | 400 | Bad Request | `NOT NULL` 列（TABLE-16・TASK-204）への `insert`／`update` での省略・明示 `null` |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
 | `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE` は op 許可リスト外。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |

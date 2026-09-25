@@ -160,13 +160,19 @@ PostgreSQL 互換の `CREATE TABLE`（件数なし）。
   信頼された運用者を想定するため優先度は低いが、起票候補として記録する
   （out-of-scope-tracking）。
 
+## 列制約（`NOT NULL`／`DEFAULT`。TABLE-16・TASK-204、Issue #904）
+
+`<type>` の直後に、順序自由・各々最大 1 回まで `NOT NULL`／`DEFAULT <literal>` を
+受理する。詳細な設計判断は `docs/design/not-null-default.md` 参照。
+
 ## スコープ外・後続 Issue
 
 - `ALTER TABLE ADD COLUMN`／DROP／MODIFY COLUMN・各種制約
-  （`NOT NULL`／`DEFAULT`／`PRIMARY KEY`／`UNIQUE`／`CHECK`／`REFERENCES`）・
+  （`PRIMARY KEY`／`UNIQUE`／`CHECK`／`REFERENCES`）・
   `CREATE INDEX`・`VIEW`・NoSQL 表層の DDL op はいずれも別 Issue の担当（本 Issue の
   権限ゲート（`require_ddl_permission`・`--ddl-allowed-users`）・
   `DuplicateColumn` 分類の再利用を前提とする）。`DROP TABLE` は Issue #902 で
   同じ権限ゲートを共有する形で実装済み（`docs/design/drop-table.md` 参照）。
+  `NOT NULL`／`DEFAULT` は Issue #904 で実装済み（上記節参照）。
 - `EXPLAIN CREATE TABLE`・`CREATE TABLE` への `USING OPERATION_ID` 付与はいずれも
   許可形状に存在しないため構造的に `42601`。

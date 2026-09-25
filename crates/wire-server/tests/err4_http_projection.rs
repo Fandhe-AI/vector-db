@@ -272,11 +272,23 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 20);
+const _: () = assert!(ErrorClass::ALL.len() == 21);
+
+/// `23502` を共有する分類（ERR-6・TABLE-16・TASK-204、Issue #904）。
+/// [`err4_projection_table_is_closed_over_all_error_classes`] がこの組にだけ
+/// 「`wire_code` からの厳密往復」を免除する（`EXPECTED_STATUS` は wire_code
+/// 単位の一意テーブルのままで、共有側はどちらも同じステータス 400 のため
+/// テーブル自体は増やさない）。
+const SHARED_23502_CLASSES: [ErrorClass; 2] =
+    [ErrorClass::MissingOperationId, ErrorClass::NotNullViolation];
 
 #[test]
 fn err4_projection_table_is_closed_over_all_error_classes() {
-    assert_eq!(EXPECTED_STATUS.len(), ErrorClass::ALL.len());
+    // `EXPECTED_STATUS` は一意な `wire_code` 単位の期待表。`23502` は 2 分類が
+    // 共有するため、一意な `wire_code` の数は `ErrorClass::ALL` より 1 小さい。
+    let unique_wire_codes: std::collections::HashSet<&str> =
+        ErrorClass::ALL.iter().map(|c| c.wire_code()).collect();
+    assert_eq!(EXPECTED_STATUS.len(), unique_wire_codes.len());
     for class in ErrorClass::ALL {
         let wire_code = class.wire_code();
         let (_, expected_status) = EXPECTED_STATUS
@@ -290,7 +302,13 @@ fn err4_projection_table_is_closed_over_all_error_classes() {
         );
         let round_tripped = ErrorClass::from_wire_code(wire_code)
             .unwrap_or_else(|| panic!("{wire_code:?} must round-trip via from_wire_code"));
-        assert_eq!(round_tripped, class);
+        if SHARED_23502_CLASSES.contains(&class) {
+            // 共有 wire_code の逆引きは宣言順で最初の分類（MissingOperationId）
+            // へ固定的に戻る契約（`ErrorClass::from_wire_code` の doc 参照）。
+            assert_eq!(round_tripped, ErrorClass::MissingOperationId);
+        } else {
+            assert_eq!(round_tripped, class);
+        }
     }
 }
 

@@ -220,14 +220,22 @@ fn bind_row(
                 "INSERT row references an unknown column",
             )));
         };
-        // JSON `null` は列を省略する契約（`insert` op。列を省略すれば
-        // nullable 列は `bind_insert` が `Value::Null` で埋め、非 nullable
-        // 列は「値が提供されていない」（`22000`）で拒否する。`update` op が
-        // `InsertLiteral::Null` をそのまま渡すのとは異なる——`bind_insert_row`
-        // は明示 `NULL` リテラルを列型を問わず一律拒否する契約のため、
-        // ここで `InsertLiteral::Null` を渡すと nullable 列でもエラーになる。
-        // NOSQL-17 束縛表「null の扱い」節参照）。
+        // JSON `null` の扱い（TABLE-16・TASK-204、Issue #904 D5）: `VECTOR` 列は
+        // 引き続き列を省略する契約のまま維持する（`VECTOR` は
+        // `tenant::insert_typed_rows_unchecked` の既存契約により `nullable` の
+        // 値に関わらず常に必須で、下の「VECTOR 列は常に必須」ループが
+        // `22000` で拒否する。TABLE-16 の `DEFAULT`／`NOT NULL` は `VECTOR` に
+        // 適用できないため対象外）。それ以外の列は `InsertLiteral::Null` を
+        // そのまま `bind_insert` へ渡し、「省略」（`DEFAULT` 適用対象）と
+        // 「明示 NULL」（`DEFAULT` を適用せず nullable なら NULL・非 nullable
+        // なら `23502`）を区別する（TABLE-16 の確定契約。NOSQL-17 束縛表
+        // 「null の扱い」節参照）。
         if matches!(raw, JsonValue::Null) {
+            if matches!(column.ty, ColumnType::Vector(_)) {
+                continue;
+            }
+            columns.push(key.clone());
+            literals.push(engine::sql::allowlist::InsertLiteral::Null);
             continue;
         }
         let literal = typed_json::map_json_to_literal(column, raw).map_err(InsertError::Set)?;
@@ -549,7 +557,9 @@ mod tests {
     fn bind_rows_rejects_missing_non_nullable_column() {
         let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0]}]"#);
         let err = bind_rows(&items, "docs", None, &schema()).expect_err("must reject");
-        assert_eq!(err.wire_code(), "22000");
+        // TABLE-16・TASK-204、Issue #904: NOT NULL 違反は `23502`
+        // （`NotNullViolation`）へ写像する（旧 `22000` から契約変更）。
+        assert_eq!(err.wire_code(), "23502");
     }
 
     // id 精度（PR #823 レビュー指摘対応）: `JsonNumber::PosInt` は `f64` へ丸める

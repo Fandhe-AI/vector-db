@@ -123,9 +123,11 @@ fn doc_has_error_section_with_projection_table() {
     assert!(!rows.is_empty(), "射影表の行が 1 件も抽出できなかった");
 }
 
-/// 表の行数が `ErrorClass::ALL` と一致し、各 class の `wire_code` がちょうど
-/// 1 回現れ、各行の `wire_code` が `from_wire_code` で解決できること
-/// （stale な余剰行・欠落行のいずれも検出する）。
+/// 表の行数が `ErrorClass::ALL` と一致し、各 class の `code`（ラベル）が
+/// ちょうど 1 回現れ、各行の `code` が既知の `ErrorClass` に解決できること
+/// （stale な余剰行・欠落行のいずれも検出する）。ERR-6（TABLE-16・TASK-204、
+/// Issue #904）が `wire_code`（`23502`）の分類間共有を認めたため、一意性の
+/// キーは `wire_code` ではなく `code`（ラベル。全分類で一意なまま）を使う。
 #[test]
 fn projection_table_covers_every_error_class_exactly_once() {
     let markdown = read_doc();
@@ -139,23 +141,20 @@ fn projection_table_covers_every_error_class_exactly_once() {
     );
 
     for class in ErrorClass::ALL {
-        let occurrences = rows
-            .iter()
-            .filter(|r| r.wire_code == class.wire_code())
-            .count();
+        let occurrences = rows.iter().filter(|r| r.code == class.label()).count();
         assert_eq!(
             occurrences,
             1,
-            "wire_code={} は表にちょうど 1 回現れるべき",
-            class.wire_code()
+            "code={} は表にちょうど 1 回現れるべき",
+            class.label()
         );
     }
 
     for row in &rows {
         assert!(
-            ErrorClass::from_wire_code(&row.wire_code).is_some(),
-            "表の wire_code={} が既知の ErrorClass に解決できない（stale な行の疑い）",
-            row.wire_code
+            ErrorClass::ALL.iter().any(|c| c.label() == row.code),
+            "表の code={} が既知の ErrorClass に解決できない（stale な行の疑い）",
+            row.code
         );
     }
 }
@@ -168,19 +167,23 @@ fn projection_table_matches_http_status_label_and_reason_phrase() {
     let rows = projection_rows(&section);
 
     for row in &rows {
-        let class = ErrorClass::from_wire_code(&row.wire_code)
-            .unwrap_or_else(|| panic!("wire_code={} が解決できない", row.wire_code));
+        // `code`（ラベル）で解決する: `wire_code`（`23502`）は ERR-6 で
+        // 複数分類が共有し得るため、行を一意に特定できるキーは `code` のみ。
+        let class = ErrorClass::ALL
+            .into_iter()
+            .find(|c| c.label() == row.code)
+            .unwrap_or_else(|| panic!("code={} が解決できない", row.code));
+        assert_eq!(
+            class.wire_code(),
+            row.wire_code,
+            "code={} の wire_code が不一致",
+            row.code
+        );
         assert_eq!(
             http_status(class),
             row.status,
-            "wire_code={} の HTTP ステータスが不一致",
-            row.wire_code
-        );
-        assert_eq!(
-            class.label(),
-            row.code,
-            "wire_code={} の code ラベルが不一致",
-            row.wire_code
+            "code={} の HTTP ステータスが不一致",
+            row.code
         );
         let expected_reason = reason_phrase(row.status)
             .unwrap_or_else(|| panic!("status={} の reason_phrase が表外", row.status));
