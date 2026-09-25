@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
 
 define_error_classes! {
-    count = 29;
+    count = 31;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -232,6 +232,14 @@ define_error_classes! {
     /// ラベルによる区別を認める）。
     /// [`crate::sql::allowlist::SqlSurfaceError::NotNullViolation`] の写像。
     NotNullViolation => ("23502", "NOT_NULL_VIOLATION"),
+    /// `DROP INDEX` で指定した索引が存在しない（`42704`。TASK-206・INDEX-7、
+    /// Issue #908）。[`crate::sql::allowlist::SqlSurfaceError::UndefinedObject`] の
+    /// 写像。
+    UndefinedObject => ("42704", "UNDEFINED_OBJECT"),
+    /// 索引 DDL が参照した列が対象テーブルに存在しない（`42703`。TASK-206・
+    /// INDEX-7、Issue #908）。[`crate::sql::allowlist::SqlSurfaceError::
+    /// UndefinedColumn`] の写像。
+    UndefinedColumn => ("42703", "UNDEFINED_COLUMN"),
 }
 
 impl ErrorClass {

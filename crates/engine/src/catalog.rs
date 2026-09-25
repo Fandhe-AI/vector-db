@@ -85,6 +85,311 @@ pub(crate) const MAX_VIEW_NESTING_DEPTH: u32 = 4;
 /// 無限ループにならないことを保証する防御的上限）。
 const MAX_VIEW_CHAIN_WALK: usize = MAX_VIEWS;
 
+/// 索引宣言（`CREATE INDEX`／`DROP INDEX`。TASK-206・INDEX-7、Issue #908）を格納する
+/// テーブル。キーは索引名（テーブル・ビューと同じ relation 名前空間を共有する。
+/// PostgreSQL と同じ設計。[`Storage::create_table`]／[`Storage::create_view`]／
+/// [`Storage::create_index`] はいずれも [`CATALOG_TABLE`]・[`VIEWS_TABLE`]・本テーブルの
+/// 3 者を同一 write txn で確認する）、値は [`encode_index_def`] でエンコードした
+/// バイト列。対象テーブルが [`Storage::drop_table`] で削除された場合は同一 write
+/// トランザクションで該当エントリも削除する（[`delete_indexes_for_table_in_txn`]）。
+///
+/// 責務境界: 本テーブルは宣言（索引の存在・種別・対象列）のみを保持し、索引の
+/// 物理表現（`sql::scalar_index::ScalarIndexCache`・`sql::hnsw_cache::HnswIndexCache`
+/// 等のテーブル世代整合キャッシュ。いずれも `(table, PolicyContext)` 可視
+/// スナップショットから構築する）は一切構築しない（宣言の書き込みは行数に依存
+/// しない）。宣言が既存キャッシュの構築対象へ与える効果は本 Issue の対象外
+/// （`docs/design/index-ddl-declaration.md`「対象外」節参照）。
+const INDEX_CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index_catalog");
+
+/// [`INDEX_CATALOG_TABLE`] に宣言できる索引の総数上限（[`MAX_LIST_TABLES`] と
+/// 同じ既定値。無制限 `Vec`／走査コストを避ける。本リポの実装既定値）。
+const MAX_INDEX_COUNT: usize = MAX_LIST_TABLES;
+
+/// 索引宣言 1 件が持てる列数の上限（[`MAX_COLUMN_COUNT`] と同値。本リポの実装
+/// 既定値）。
+const MAX_INDEX_DEF_COLUMNS: usize = MAX_COLUMN_COUNT;
+
+/// 索引種別（TASK-206・INDEX-7、Issue #908）。`Scalar` はスカラー列（1 列以上）への
+/// 宣言、`Hnsw` は単一の `VECTOR` 列に対する ANN 索引の宣言を表す。疎索引（BM25）は
+/// 宣言の対象外（hybrid 実行のたびに自動構築する既存契約のまま）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    Scalar,
+    Hnsw,
+}
+
+impl IndexKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            IndexKind::Scalar => "scalar",
+            IndexKind::Hnsw => "hnsw",
+        }
+    }
+}
+
+/// 索引宣言 1 件（TASK-206・INDEX-7、Issue #908）。[`Storage::create_index`] の入力・
+/// [`decode_index_def`] の出力。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDef {
+    pub name: String,
+    pub table: String,
+    pub kind: IndexKind,
+    pub columns: Vec<String>,
+}
+
+impl IndexDef {
+    pub fn new(name: String, table: String, kind: IndexKind, columns: Vec<String>) -> Self {
+        Self {
+            name,
+            table,
+            kind,
+            columns,
+        }
+    }
+}
+
+/// [`IndexDef`] のテキスト形式エンコード（`v1\n<table>\n<kind>\n<col1>,<col2>,...`）。
+/// 列名・テーブル名は [`validate_identifier`] を通過済みの前提（`,`・改行のいずれも
+/// 含み得ない）のため、区切り文字として安全に使える。
+fn encode_index_def(def: &IndexDef) -> Result<Vec<u8>> {
+    let columns_csv = def.columns.join(",");
+    let text = format!("v1\n{}\n{}\n{}", def.table, def.kind.as_str(), columns_csv);
+    if text.len() > MAX_CATALOG_VALUE_LEN {
+        return Err(CatalogError::Invalid(
+            "index definition exceeds catalog value size limit".to_string(),
+        ));
+    }
+    Ok(text.into_bytes())
+}
+
+/// [`encode_index_def`] の逆写像。永続化済みバイト列の破損は fail-closed に
+/// [`CatalogError::CorruptSchema`] として拒否する（`decode_schema` と同じ方針）。
+fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
+    if bytes.len() > MAX_CATALOG_VALUE_LEN {
+        return Err(CatalogError::CorruptSchema(format!(
+            "index catalog value too large for index {name}"
+        )));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        CatalogError::CorruptSchema(format!("index catalog value is not utf-8 for index {name}"))
+    })?;
+    let mut lines = text.split('\n');
+    let version = lines.next().ok_or_else(|| {
+        CatalogError::CorruptSchema(format!("missing format version for index {name}"))
+    })?;
+    if version != "v1" {
+        return Err(CatalogError::CorruptSchema(format!(
+            "unknown index catalog format version for index {name}"
+        )));
+    }
+    let table = lines
+        .next()
+        .ok_or_else(|| CatalogError::CorruptSchema(format!("missing table for index {name}")))?
+        .to_string();
+    validate_identifier(&table).map_err(|_| {
+        CatalogError::CorruptSchema(format!("invalid table identifier for index {name}"))
+    })?;
+    let kind_tag = lines
+        .next()
+        .ok_or_else(|| CatalogError::CorruptSchema(format!("missing kind for index {name}")))?;
+    let kind = match kind_tag {
+        "scalar" => IndexKind::Scalar,
+        "hnsw" => IndexKind::Hnsw,
+        _ => {
+            return Err(CatalogError::CorruptSchema(format!(
+                "unknown index kind for index {name}"
+            )))
+        }
+    };
+    let columns_csv = lines
+        .next()
+        .ok_or_else(|| CatalogError::CorruptSchema(format!("missing columns for index {name}")))?;
+    if lines.next().is_some() {
+        return Err(CatalogError::CorruptSchema(format!(
+            "unexpected trailing data for index {name}"
+        )));
+    }
+    let mut columns: Vec<String> = Vec::new();
+    for c in columns_csv.split(',') {
+        if columns.len() >= MAX_INDEX_DEF_COLUMNS {
+            return Err(CatalogError::CorruptSchema(format!(
+                "index column count exceeds limit for index {name}"
+            )));
+        }
+        validate_identifier(c).map_err(|_| {
+            CatalogError::CorruptSchema(format!("invalid column identifier for index {name}"))
+        })?;
+        columns.push(c.to_string());
+    }
+    // [`Storage::create_index`] は列の重複を永続化しないため、重複を含む値は
+    // 破損として fail-closed に拒否する。
+    if first_duplicate_column(&columns).is_some() {
+        return Err(CatalogError::CorruptSchema(format!(
+            "duplicate column in index {name}"
+        )));
+    }
+    Ok(IndexDef {
+        name: name.to_string(),
+        table,
+        kind,
+        columns,
+    })
+}
+
+/// 列名リストの中で最初に重複した列名を返す（[`Storage::create_index`] の入力検証と
+/// [`decode_index_def`] の破損検出が共有する。要素数は呼び出し元が
+/// [`MAX_INDEX_DEF_COLUMNS`] 以下に制限済み）。
+fn first_duplicate_column(columns: &[String]) -> Option<&str> {
+    let mut seen = std::collections::HashSet::new();
+    columns
+        .iter()
+        .find(|c| !seen.insert(c.as_str()))
+        .map(|c| c.as_str())
+}
+
+/// [`IndexDef::kind`]・[`IndexDef::columns`] とテーブル定義（[`TableSchema`]）との
+/// 整合を検証する（TASK-206・INDEX-7、Issue #908）。`id`（暗黙の行キー。
+/// `schema.columns` には現れない）はスカラー宣言の対象列として常に有効とする。
+///
+/// - `Hnsw`: ちょうど 1 列を対象とし、その列は `VECTOR` 型でなければならない。
+/// - `Scalar`: 各列は索引化対応済みの型（[`is_declarable_scalar_index_type`]）で
+///   なければならない。
+fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
+    match def.kind {
+        IndexKind::Hnsw => {
+            let col = match def.columns.as_slice() {
+                [only] => only,
+                _ => {
+                    return Err(CatalogError::IndexKindMismatch(
+                        "USING hnsw requires exactly one column".to_string(),
+                    ))
+                }
+            };
+            if col == "id" {
+                // `id` は暗黙の行キーで常に「存在する列」だが `VECTOR` 型ではないため、
+                // 列不在（`ColumnNotFound`）ではなく種別・列型の不整合へ倒す。
+                return Err(CatalogError::IndexKindMismatch(
+                    "USING hnsw requires a VECTOR column, column id is not VECTOR".to_string(),
+                ));
+            }
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| &c.name == col)
+                .ok_or_else(|| CatalogError::ColumnNotFound(col.clone()))?;
+            if !column.ty.is_vector() {
+                return Err(CatalogError::IndexKindMismatch(format!(
+                    "USING hnsw requires a VECTOR column, column {col} is not VECTOR"
+                )));
+            }
+        }
+        IndexKind::Scalar => {
+            for col in &def.columns {
+                if col == "id" {
+                    continue;
+                }
+                let column = schema
+                    .columns
+                    .iter()
+                    .find(|c| &c.name == col)
+                    .ok_or_else(|| CatalogError::ColumnNotFound(col.clone()))?;
+                if !is_declarable_scalar_index_type(&column.ty) {
+                    return Err(CatalogError::IndexKindMismatch(format!(
+                        "column {col} cannot be declared as a scalar index target"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// スカラー索引宣言が対象にできる列型（`sql::scalar_index::ScalarIndex` が現に扱う
+/// 型に限る。`VECTOR`・`BOOLEAN`／`BYTEA`／`JSON(B)`／`ARRAY`・未結線の数値型
+/// 〔`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`〕は、宣言しても索引化に一切効かない
+/// 状態を作らないため fail-closed に拒否する）。
+fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Text
+            | ColumnType::Enum(_)
+            | ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid
+    )
+}
+
+/// `name` が [`INDEX_CATALOG_TABLE`] に索引名として登録済みかを write txn 内で
+/// 判定する（relation 名前空間の衝突・種別判定用）。索引カタログ自体が未作成
+/// （宣言 0 件）の場合は `false`。
+fn index_name_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
+    match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => Ok(t.get(name)?.is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// [`INDEX_CATALOG_TABLE`] の全エントリのうち `keep` が `false` を返す宣言を同一
+/// write txn 内で削除する（[`delete_indexes_for_table_in_txn`]・
+/// [`delete_indexes_referencing_column_in_txn`] の共通本体）。索引カタログ未作成は
+/// 何もせず `Ok(())`。走査件数は [`MAX_INDEX_COUNT`] で打ち切る（fail-closed）。
+fn retain_index_defs_in_txn(
+    write_txn: &redb::WriteTransaction,
+    mut keep: impl FnMut(&IndexDef) -> bool,
+) -> Result<()> {
+    let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut to_remove = Vec::new();
+    for (scanned, entry) in index_table.iter()?.enumerate() {
+        if scanned >= MAX_INDEX_COUNT {
+            return Err(CatalogError::CorruptSchema(format!(
+                "index catalog exceeds {MAX_INDEX_COUNT} entries"
+            )));
+        }
+        let (key, value) = entry?;
+        let name = key.value().to_string();
+        let def = decode_index_def(&name, value.value())?;
+        if !keep(&def) {
+            to_remove.push(name);
+        }
+    }
+    for name in to_remove {
+        index_table.remove(name.as_str())?;
+    }
+    Ok(())
+}
+
+/// [`Storage::drop_table`] が同一 write txn から呼ぶ。対象テーブルの索引宣言を
+/// すべて削除する（残置した宣言名が drop 後の同名テーブル再作成に伴う
+/// `CREATE INDEX` を無関係に `42P07` で塞ぐ事故を防ぐ。
+/// `recovery::ledger::delete_table_in_txn` と同じ「テーブルのライフサイクルに
+/// 追随して掃除する」設計判断）。
+fn delete_indexes_for_table_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+) -> Result<()> {
+    retain_index_defs_in_txn(write_txn, |def| def.table != table_name)
+}
+
+/// [`Storage::alter_table_drop_column`] が同一 write txn から呼ぶ。削除する列を
+/// 対象に含む索引宣言を削除する（PostgreSQL の `DROP COLUMN` が当該列を含む索引を
+/// 削除するのと同じ扱い。宣言が消えた列名を指したまま残り、後の同名列の再追加で
+/// 意図せず復活する事故を防ぐ）。
+fn delete_indexes_referencing_column_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    column_name: &str,
+) -> Result<()> {
+    retain_index_defs_in_txn(write_txn, |def| {
+        def.table != table_name || !def.columns.iter().any(|c| c == column_name)
+    })
+}
+
 /// カタログのテキスト形式フォーマットバージョン識別子。値の追加・変更は
 /// 破壊的変更として扱い、この値を更新する。旧バージョンの読み出しは
 /// マイグレーションを提供せず fail-closed に拒否する
@@ -360,6 +665,21 @@ pub enum CatalogError {
     /// 含めない（security.md P0。`TenantWriteError::UniqueViolation` と同じ
     /// 秘匿方針）。
     UniqueConstraintViolation,
+    /// `CREATE INDEX` で指定した索引名が、既存の索引・テーブル・ビューの名前と
+    /// 衝突する（TASK-206・INDEX-7、Issue #908。索引名はテーブル・ビューと同じ
+    /// relation 名前空間を共有する。PostgreSQL と同じ設計。ERR-6: `42P07`）。
+    IndexAlreadyExists(String),
+    /// `DROP INDEX` で指定した名前が索引・テーブル・ビューのいずれとしても存在
+    /// しない（TASK-206・INDEX-7、Issue #908。ERR-6: `42704`）。名前がテーブル・
+    /// ビューとして存在する場合は [`CatalogError::WrongObjectKind`]（`42809`）。
+    IndexNotFound(String),
+    /// 索引種別と対象列の型が整合しない（`USING hnsw` に `VECTOR` 以外の列、
+    /// スカラー宣言に `VECTOR` 列または索引化非対応の型を指定した等。
+    /// TASK-206・INDEX-7、Issue #908。SQL 表層では `0A000`）。
+    IndexKindMismatch(String),
+    /// 索引宣言の登録件数上限超過（TASK-206・INDEX-7、Issue #908。本リポの実装
+    /// 既定値による DoS 対策。SQL 表層では `54000`）。`detail` は固定文言のみ。
+    IndexLimitExceeded(String),
 }
 
 impl fmt::Display for CatalogError {
@@ -415,6 +735,14 @@ impl fmt::Display for CatalogError {
             CatalogError::TooManyColumns { count } => {
                 write!(f, "too many columns: {count}")
             }
+            CatalogError::IndexAlreadyExists(name) => write!(f, "index already exists: {name}"),
+            CatalogError::IndexNotFound(name) => write!(f, "index not found: {name}"),
+            CatalogError::IndexKindMismatch(detail) => {
+                write!(f, "index kind mismatch: {detail}")
+            }
+            CatalogError::IndexLimitExceeded(detail) => {
+                write!(f, "index limit exceeded: {detail}")
+            }
         }
     }
 }
@@ -443,7 +771,11 @@ impl std::error::Error for CatalogError {
             | CatalogError::IncompatibleTypeChange { .. }
             | CatalogError::UniqueConstraintViolation
             | CatalogError::WriteLockTimeout
-            | CatalogError::TooManyColumns { .. } => None,
+            | CatalogError::TooManyColumns { .. }
+            | CatalogError::IndexAlreadyExists(_)
+            | CatalogError::IndexNotFound(_)
+            | CatalogError::IndexKindMismatch(_)
+            | CatalogError::IndexLimitExceeded(_) => None,
         }
     }
 }
@@ -3105,6 +3437,11 @@ impl Storage {
                 Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(e) => return Err(CatalogError::from(e)),
             }
+            // 索引名とも名前空間を共有する（TASK-206・INDEX-7、Issue #908）。
+            // 既存の索引宣言と同名のテーブルは同じ `TableAlreadyExists` で拒否する。
+            if index_name_exists_in_txn(&write_txn, schema.name.as_str())? {
+                return Err(CatalogError::TableAlreadyExists(schema.name.clone()));
+            }
             table.insert(schema.name.as_str(), encoded.as_slice())?;
         }
         bump_table_generation_in_txn(&write_txn, &schema.name)?;
@@ -3162,6 +3499,11 @@ impl Storage {
                 Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(e) => return Err(CatalogError::from(e)),
             }
+            // 索引名を指定された場合もビューと同じく種別不一致（`42809`）とする
+            // （TASK-206・INDEX-7、Issue #908）。
+            if index_name_exists_in_txn(&write_txn, table_name)? {
+                return Err(CatalogError::WrongObjectKind(table_name.to_string()));
+            }
         }
         {
             let mut table = match write_txn.open_table(CATALOG_TABLE) {
@@ -3184,6 +3526,9 @@ impl Storage {
         // エントリが同居するため）。
         crate::recovery::ledger::delete_table_in_txn(&write_txn, table_name)
             .map_err(convert_storage_error)?;
+        // 索引宣言（TASK-206・INDEX-7、Issue #908）も同一 txn・同一 commit で整合
+        // させる（[`delete_indexes_for_table_in_txn`] 参照）。
+        delete_indexes_for_table_in_txn(&write_txn, table_name)?;
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
@@ -3347,6 +3692,9 @@ impl Storage {
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
         }
+        // 削除した列を含む索引宣言（TASK-206・INDEX-7、Issue #908）も同一 txn で
+        // 削除する（[`delete_indexes_referencing_column_in_txn`] 参照）。
+        delete_indexes_referencing_column_in_txn(&write_txn, table_name, column_name)?;
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
@@ -3639,6 +3987,10 @@ impl Storage {
             if views_table.get(name)?.is_some() {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
+            // 索引名とも名前空間を共有する（TASK-206・INDEX-7、Issue #908）。
+            if index_name_exists_in_txn(&write_txn, name)? {
+                return Err(CatalogError::TableAlreadyExists(name.to_string()));
+            }
             let depth =
                 resolve_reference_depth_in_txn(&catalog_table, &views_table, base_relation)?;
             // テーブル自身が深さ 0 のため、それを直接参照する新規ビューの深さは
@@ -3676,6 +4028,11 @@ impl Storage {
             if catalog_table.get(name)?.is_some() {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
+            // 索引名を指定された場合も種別不一致（`42809`。TASK-206・INDEX-7、
+            // Issue #908）。
+            if index_name_exists_in_txn(&write_txn, name)? {
+                return Err(CatalogError::WrongObjectKind(name.to_string()));
+            }
         }
         {
             let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
@@ -3688,6 +4045,171 @@ impl Storage {
             }
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// 索引を宣言する（`CREATE INDEX`。TASK-206・INDEX-7、Issue #908）。カタログ
+    /// （[`INDEX_CATALOG_TABLE`]）のみを書き換え、行ストアには一切触れない（実行
+    /// 時間は行数に依存しない）。`PolicyContext` を取らない全テナント共有の DDL で、
+    /// SQL 表層からは `crate::sql::ddl::require_ddl_permission` を通過したセッション
+    /// に限り `crate::sql::ddl::execute_create_index` 経由で到達する。
+    ///
+    /// 判定順序（同一 write txn 内。TOCTOU 回避。[`Storage::create_view`] と同じ
+    /// 流儀）: 識別子・列数の形状検証（`Err(Invalid)`。txn 開始前）→ 索引名の
+    /// relation 名前空間衝突（テーブル・ビュー・既存索引のいずれか。
+    /// `Err(IndexAlreadyExists)`）→ 対象がビュー（`Err(WrongObjectKind)`）→ 対象
+    /// テーブルの存在（`Err(TableNotFound)`）→ 列の存在・種別整合
+    /// （[`validate_index_columns`]。`Err(ColumnNotFound)`／`Err(IndexKindMismatch)`）
+    /// → 登録件数上限（`Err(IndexLimitExceeded)`）→ 保存。
+    ///
+    /// 成功時は対象テーブルの世代（[`bump_table_generation_in_txn`]）を進める。
+    /// テーブル単位世代整合キャッシュ（`sql::scalar_index::ScalarIndexCache`・
+    /// `sql::hnsw_cache::HnswIndexCache` 等）は次のクエリで自然に失効・再構築され、
+    /// 宣言変更前のキャッシュが残り続ける経路を作らない（宣言列をキャッシュの
+    /// 構築対象へ反映する結線自体は本メソッドの管轄外）。
+    pub fn create_index(&self, def: &IndexDef) -> Result<()> {
+        validate_identifier(&def.name)?;
+        validate_identifier(&def.table)?;
+        if def.columns.is_empty() {
+            return Err(CatalogError::Invalid(
+                "index must reference at least one column".to_string(),
+            ));
+        }
+        if def.columns.len() > MAX_INDEX_DEF_COLUMNS {
+            return Err(CatalogError::Invalid(format!(
+                "index column count {} exceeds limit {MAX_INDEX_DEF_COLUMNS}",
+                def.columns.len()
+            )));
+        }
+        for c in &def.columns {
+            validate_identifier(c)?;
+        }
+        // 同一列の重複指定は SQL 表層の構文検証（`validate_create_index_tokens`）と
+        // 同じく `Invalid`（SQL 表層では `42601`）で拒否する。Rust API から直接
+        // 渡された `IndexDef` も同じ不変条件を満たさない限り永続化しない
+        // （[`decode_index_def`] は重複を破損として拒否するため、ここで通すと
+        // 以後そのカタログ値を読めなくなる）。
+        if let Some(dup) = first_duplicate_column(&def.columns) {
+            return Err(CatalogError::Invalid(format!(
+                "duplicate index column: {dup}"
+            )));
+        }
+        let encoded = encode_index_def(def)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        {
+            let views_contains = |name: &str| -> Result<bool> {
+                match write_txn.open_table(VIEWS_TABLE) {
+                    Ok(t) => Ok(t.get(name)?.is_some()),
+                    Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+                    Err(e) => Err(e.into()),
+                }
+            };
+            let table_contains = |name: &str| -> Result<bool> {
+                match write_txn.open_table(CATALOG_TABLE) {
+                    Ok(t) => Ok(t.get(name)?.is_some()),
+                    Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+                    Err(e) => Err(e.into()),
+                }
+            };
+            if table_contains(&def.name)?
+                || views_contains(&def.name)?
+                || index_name_exists_in_txn(&write_txn, &def.name)?
+            {
+                return Err(CatalogError::IndexAlreadyExists(def.name.clone()));
+            }
+            // 対象がビュー・既存の索引（relation 名前空間を共有するが行を持たない）
+            // なら種別不一致（`42809`）。テーブル不在（`42P01`）へ落とさない。
+            if views_contains(&def.table)? || index_name_exists_in_txn(&write_txn, &def.table)? {
+                return Err(CatalogError::WrongObjectKind(def.table.clone()));
+            }
+            let schema = require_table_schema_write(&write_txn, &def.table)?;
+            validate_index_columns(def, &schema)?;
+            let mut index_table = write_txn.open_table(INDEX_CATALOG_TABLE)?;
+            if index_table.len()? >= MAX_INDEX_COUNT as u64 {
+                return Err(CatalogError::IndexLimitExceeded(
+                    "too many indexes".to_string(),
+                ));
+            }
+            index_table.insert(def.name.as_str(), encoded.as_slice())?;
+        }
+        bump_table_generation_in_txn(&write_txn, &def.table)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// 索引宣言を削除する（`DROP INDEX`。TASK-206・INDEX-7、Issue #908）。名前が
+    /// テーブル・ビューとして存在する場合は `Err(WrongObjectKind)`（`drop_view` に
+    /// テーブル名を渡した場合と同じ扱い）、いずれとしても存在しない場合は
+    /// `Err(IndexNotFound)`（冪等に `Ok` へ丸めない。fail-closed）。成功時は
+    /// 対象テーブルの世代を進める（[`Storage::create_index`] と同じ理由）。
+    pub fn drop_index(&self, name: &str) -> Result<()> {
+        validate_identifier(name)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let removed = {
+            match write_txn.open_table(INDEX_CATALOG_TABLE) {
+                Ok(mut index_table) => {
+                    let bytes = index_table
+                        .remove(name)?
+                        .map(|guard| guard.value().to_vec());
+                    match bytes {
+                        Some(bytes) => Some(decode_index_def(name, &bytes)?),
+                        None => None,
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let Some(def) = removed else {
+            for relation_table in [CATALOG_TABLE, VIEWS_TABLE] {
+                match write_txn.open_table(relation_table) {
+                    Ok(t) => {
+                        if t.get(name)?.is_some() {
+                            return Err(CatalogError::WrongObjectKind(name.to_string()));
+                        }
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            return Err(CatalogError::IndexNotFound(name.to_string()));
+        };
+        bump_table_generation_in_txn(&write_txn, &def.table)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// `name` が索引宣言として存在するかをスナップショット読み取りで判定する
+    /// （TASK-206・INDEX-7、Issue #908）。テーブルとして存在しない名前について、
+    /// SQL 表層が `42P01` ではなく種別不一致（`42809`）を返すべきかを判定する
+    /// 呼び出し元（`sql::ddl` の `ALTER TABLE`・`core.rs` の書き込み系 DML）専用。
+    pub(crate) fn index_exists(&self, name: &str) -> Result<bool> {
+        let read_txn = self.db().begin_read()?;
+        match read_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => Ok(t.get(name)?.is_some()),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 索引宣言を名前順に列挙する（TASK-206・INDEX-7、Issue #908。宣言の確認・
+    /// テスト用の読み取り API。スナップショット読み取りで、件数は
+    /// [`MAX_INDEX_COUNT`] で打ち切る）。
+    pub fn list_indexes(&self) -> Result<Vec<IndexDef>> {
+        let read_txn = self.db().begin_read()?;
+        let table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            if out.len() >= MAX_INDEX_COUNT {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                )));
+            }
+            let (key, value) = entry?;
+            out.push(decode_index_def(key.value(), value.value())?);
+        }
+        Ok(out)
     }
 
     /// ビュー定義をスナップショット読み取りで取得する（[`TableLookup::
@@ -4072,7 +4594,14 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
         | CatalogError::UniqueConstraintViolation
-        | CatalogError::TooManyColumns { .. } => SqlSurfaceError::Internal {
+        | CatalogError::TooManyColumns { .. }
+        // 索引宣言（TASK-206・INDEX-7、Issue #908）の variant は
+        // `Storage::create_index`／`drop_index` 専用で、テーブル存在確認からは
+        // 到達しない（網羅性のため `Internal` へ丸める）。
+        | CatalogError::IndexAlreadyExists(_)
+        | CatalogError::IndexNotFound(_)
+        | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexLimitExceeded(_) => SqlSurfaceError::Internal {
             detail: "catalog lookup failed".to_string(),
         },
         // 読み取り専用の存在確認（`table_exists`）は書き込みトランザクションを
@@ -4485,6 +5014,253 @@ mod tests {
     // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
     // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    // --- 索引宣言（TASK-206・INDEX-7、Issue #908） --------------------------
+
+    fn index_fixture_storage(label: &str) -> (Storage, CleanupGuard) {
+        let path = unique_db_path(label);
+        let guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("lang", ColumnType::Text, false),
+                    ColumnDef::new("flag", ColumnType::Boolean, true),
+                ],
+            ))
+            .expect("create docs");
+        storage
+            .create_table(&TableSchema::new(
+                "sibling",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create sibling");
+        (storage, guard)
+    }
+
+    fn scalar_def(name: &str, table: &str, cols: &[&str]) -> IndexDef {
+        IndexDef::new(
+            name.to_string(),
+            table.to_string(),
+            IndexKind::Scalar,
+            cols.iter().map(|c| c.to_string()).collect(),
+        )
+    }
+
+    /// 索引宣言の作成・削除は対象テーブルの世代だけを進め（テーブル単位世代整合
+    /// キャッシュの失効源泉）、無関係なテーブルの世代は変えない。失敗した DDL は
+    /// commit しないため世代を進めない。
+    #[test]
+    fn create_and_drop_index_bump_only_target_table_generation() {
+        let (storage, _guard) = index_fixture_storage("index-ddl-generation");
+        let read_gen = |name: &str| -> u64 {
+            let read_txn = storage.db().begin_read().expect("begin read");
+            table_generation_in_txn(&read_txn, name).expect("read table generation")
+        };
+        let (docs0, sibling0) = (read_gen("docs"), read_gen("sibling"));
+
+        storage
+            .create_index(&scalar_def("idx_lang", "docs", &["lang"]))
+            .expect("create index");
+        let docs1 = read_gen("docs");
+        assert!(
+            docs1 > docs0,
+            "create_index must bump the target table generation"
+        );
+        assert_eq!(read_gen("sibling"), sibling0);
+
+        // 失敗（重複名）は commit せず世代を進めない。
+        assert!(matches!(
+            storage.create_index(&scalar_def("idx_lang", "docs", &["lang"])),
+            Err(CatalogError::IndexAlreadyExists(_))
+        ));
+        assert_eq!(read_gen("docs"), docs1);
+
+        storage.drop_index("idx_lang").expect("drop index");
+        assert!(
+            read_gen("docs") > docs1,
+            "drop_index must bump the target table generation"
+        );
+        assert_eq!(read_gen("sibling"), sibling0);
+    }
+
+    #[test]
+    fn index_def_round_trips_and_rejects_corruption() {
+        let def = IndexDef::new(
+            "idx".to_string(),
+            "docs".to_string(),
+            IndexKind::Hnsw,
+            vec!["embedding".to_string()],
+        );
+        let bytes = encode_index_def(&def).expect("encode");
+        assert_eq!(decode_index_def("idx", &bytes).expect("decode"), def);
+
+        for corrupt in [
+            &b"v2\ndocs\nscalar\nlang"[..],
+            b"v1\ndocs\nbtree\nlang",
+            b"v1\ndocs\nscalar\n",
+            b"v1\ndocs\nscalar\nlang,,x",
+            b"v1\n1docs\nscalar\nlang",
+            b"v1\ndocs\nscalar\nlang\nextra",
+            b"v1\ndocs\nscalar\nlang,id,lang",
+            b"v1\ndocs\nscalar",
+            b"\xff\xfe",
+        ] {
+            assert!(
+                matches!(
+                    decode_index_def("idx", corrupt),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "corrupt value must be rejected: {corrupt:?}"
+            );
+        }
+    }
+
+    /// 列の存在・種別整合の判定（`id` は暗黙列としてスカラー宣言に使えるが
+    /// `VECTOR` ではないため `USING hnsw` には使えない）。
+    #[test]
+    fn create_index_validates_columns_against_schema() {
+        let (storage, _guard) = index_fixture_storage("index-ddl-columns");
+        assert!(matches!(
+            storage.create_index(&scalar_def("i1", "docs", &["missing"])),
+            Err(CatalogError::ColumnNotFound(c)) if c == "missing"
+        ));
+        assert!(matches!(
+            storage.create_index(&scalar_def("i2", "docs", &["embedding"])),
+            Err(CatalogError::IndexKindMismatch(_))
+        ));
+        assert!(matches!(
+            storage.create_index(&scalar_def("i3", "docs", &["flag"])),
+            Err(CatalogError::IndexKindMismatch(_))
+        ));
+        let hnsw = |col: &str| {
+            IndexDef::new(
+                "i4".to_string(),
+                "docs".to_string(),
+                IndexKind::Hnsw,
+                vec![col.to_string()],
+            )
+        };
+        assert!(matches!(
+            storage.create_index(&hnsw("id")),
+            Err(CatalogError::IndexKindMismatch(_))
+        ));
+        assert!(matches!(
+            storage.create_index(&hnsw("lang")),
+            Err(CatalogError::IndexKindMismatch(_))
+        ));
+        storage
+            .create_index(&scalar_def("i5", "docs", &["id", "lang"]))
+            .expect("id and TEXT columns are declarable");
+        storage
+            .create_index(&hnsw("embedding"))
+            .expect("hnsw on VECTOR");
+        let names: Vec<String> = storage
+            .list_indexes()
+            .expect("list")
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names, vec!["i4".to_string(), "i5".to_string()]);
+    }
+
+    /// 公開 Rust API（[`Storage::create_index`]）から同一列を重複指定した
+    /// `IndexDef` は SQL 表層と同じ `Invalid`（`42601`）で拒否し、何も永続化しない
+    /// （PR #1054 レビュー指摘の回帰防止）。
+    #[test]
+    fn create_index_rejects_duplicate_columns_from_rust_api() {
+        let (storage, _guard) = index_fixture_storage("index-ddl-dup-columns");
+        for cols in [&["lang", "lang"][..], &["id", "lang", "id"][..]] {
+            assert!(matches!(
+                storage.create_index(&scalar_def("dup", "docs", cols)),
+                Err(CatalogError::Invalid(_))
+            ));
+        }
+        assert!(storage.list_indexes().expect("list").is_empty());
+    }
+
+    /// UNIQUE 制約（TABLE-16、Issue #905）の構成列は `DROP COLUMN` 自体が拒否
+    /// されるため、その列を含む索引宣言も削除されずに残る（拒否時は何も変更しない）。
+    #[test]
+    fn drop_column_rejected_by_unique_constraint_keeps_index_declarations() {
+        let (storage, _guard) = index_fixture_storage("index-ddl-unique-drop");
+        storage
+            .alter_table_add_unique_constraint("docs", &["lang"])
+            .expect("add unique constraint");
+        storage
+            .create_index(&scalar_def("docs_lang", "docs", &["lang"]))
+            .expect("create index");
+        assert!(matches!(
+            storage.alter_table_drop_column("docs", "lang"),
+            Err(CatalogError::DependentObjectsStillExist(_))
+        ));
+        let names: Vec<String> = storage
+            .list_indexes()
+            .expect("list")
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names, vec!["docs_lang".to_string()]);
+    }
+
+    /// `CREATE INDEX ... ON <既存索引名>` は索引もテーブル・ビューと同じ
+    /// relation 名前空間に属するため、テーブル不在ではなく種別不一致
+    /// （`WrongObjectKind`）で拒否する（PR #1054 レビュー指摘の回帰防止）。
+    #[test]
+    fn create_index_on_existing_index_name_is_wrong_object_kind() {
+        let (storage, _guard) = index_fixture_storage("index-ddl-on-index");
+        storage
+            .create_index(&scalar_def("docs_lang", "docs", &["lang"]))
+            .expect("create index");
+        assert!(matches!(
+            storage.create_index(&scalar_def("other", "docs_lang", &["lang"])),
+            Err(CatalogError::WrongObjectKind(name)) if name == "docs_lang"
+        ));
+        assert!(storage.index_exists("docs_lang").expect("lookup"));
+        assert!(!storage.index_exists("docs").expect("lookup"));
+        assert_eq!(storage.list_indexes().expect("list").len(), 1);
+    }
+
+    /// `DROP TABLE` は対象テーブルの索引宣言を同一 txn で一掃し、他テーブルの
+    /// 宣言は残す。`DROP COLUMN` は当該列を含む宣言のみを削除する。
+    #[test]
+    fn drop_table_and_drop_column_clean_up_index_declarations() {
+        let (storage, _guard) = index_fixture_storage("index-ddl-cleanup");
+        storage
+            .create_index(&scalar_def("docs_lang", "docs", &["lang"]))
+            .expect("create");
+        storage
+            .create_index(&scalar_def("docs_id", "docs", &["id"]))
+            .expect("create");
+        storage
+            .create_index(&IndexDef::new(
+                "sib_hnsw".to_string(),
+                "sibling".to_string(),
+                IndexKind::Hnsw,
+                vec!["embedding".to_string()],
+            ))
+            .expect("create");
+
+        storage
+            .alter_table_drop_column("docs", "lang")
+            .expect("drop column");
+        let names = |s: &Storage| -> Vec<String> {
+            s.list_indexes()
+                .expect("list")
+                .into_iter()
+                .map(|d| d.name)
+                .collect()
+        };
+        assert_eq!(
+            names(&storage),
+            vec!["docs_id".to_string(), "sib_hnsw".to_string()]
+        );
+
+        storage.drop_table("docs").expect("drop table");
+        assert_eq!(names(&storage), vec!["sib_hnsw".to_string()]);
+    }
 
     #[test]
     fn validate_schema_rejects_more_than_one_vector_column() {

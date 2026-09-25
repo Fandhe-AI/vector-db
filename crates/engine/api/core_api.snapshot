@@ -280,6 +280,10 @@ pub enum CatalogError {
     },
     TooManyColumns { count: usize },
     UniqueConstraintViolation,
+    IndexAlreadyExists(String),
+    IndexNotFound(String),
+    IndexKindMismatch(String),
+    IndexLimitExceeded(String),
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError
