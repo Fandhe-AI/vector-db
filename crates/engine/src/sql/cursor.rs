@@ -35,19 +35,21 @@ pub const MAX_CURSOR_BYTES_PER_SESSION: usize = 16 * 1024 * 1024;
 
 /// `DECLARE`/`FETCH`/`CLOSE`（許可リスト検証済み。TASK-218・WIRE-15）。
 ///
-/// `Declare` の `inner` は集計 `SELECT`（[`Statement::Aggregate`]）・広域取得
-/// `SELECT`（[`Statement::Scan`]）のいずれかに限る（構造検証段で保証済み）。
-/// `Statement` 自体のサイズが大きいため `Box` で包む
-/// （`clippy::large_enum_variant` 対応。`CopyPlan::From` と同じ設計）。
+/// `Declare` の `query` は集計 `SELECT`（[`Statement::Aggregate`]）・広域取得
+/// `SELECT`（[`Statement::Scan`]）のいずれかとして構造検証を通ったトークン列に
+/// 限る（構造検証段で保証済み。実行時の再検証でも同じ制約を再確認する）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum CursorStatement {
     Declare {
         name: String,
-        inner: Box<Statement>,
-        /// `inner` の `FROM` テーブル名。明示トランザクション内での
-        /// `written_tables` 判定（`sql::transaction` モジュールドキュメント
-        /// 「読み取りの既知の逸脱」参照）に使う。
-        table: String,
+        /// `FOR` より後ろの内側 SELECT のトークン列（構文解析段では
+        /// [`AlwaysExistsLookup`] による構造検証のみを通したもの）。実カタログ
+        /// との照合——テーブル存在確認・ビュー展開（TABLE-18・SQL-23）——は
+        /// `Active` なトランザクション内で [`validate_declare_inner`] を実
+        /// カタログに対して再実行する時点まで遅延する（PR #1049 レビュー指摘
+        /// codex P1 対応: 構造検証段の結果を保持すると、ビュー名がテーブル名と
+        /// して残り実行時に `UndefinedTable` になるため）。
+        query: Vec<Token>,
     },
     Fetch {
         name: String,
@@ -119,12 +121,41 @@ pub(crate) fn validate_declare_tokens(
     let name = validate_cursor_name(raw_name)?;
     let rest = expect_contextual_ident(rest, "CURSOR")?;
     let rest = expect_contextual_ident(rest, "FOR")?;
-    if rest.is_empty() {
+    // 構造検証のみ（結果の `Statement` は保持しない。実カタログでの再検証は
+    // `Active` 内の実行時に [`validate_declare_inner`] で行う）。
+    validate_declare_inner(rest, lookup)?;
+    Ok(CursorStatement::Declare {
+        name,
+        query: rest.to_vec(),
+    })
+}
+
+/// `DECLARE` の内側 SELECT（`FOR` より後ろのトークン列）を
+/// [`crate::sql::allowlist::validate_sql_tokens`] で検証し、検証済み
+/// [`Statement`] とその読み取り対象の基底テーブル名を返す。
+///
+/// 呼び出し元は 2 つ: (1) [`validate_declare_tokens`]（構文解析段。
+/// [`AlwaysExistsLookup`] による構造検証のみ）、(2) `core.rs::EngineCore::
+/// execute_cursor_in_active_txn`（`Active` なトランザクション内。実カタログ
+/// ＝`catalog::Storage` を `lookup` に渡す）。(2) は通常の広域取得 `SELECT` と
+/// 完全に同じ `validate_sql_tokens` の `Statement::Scan` 分岐を通るため、
+/// FROM がビューを指す場合は `sql::view::resolve_from` による連鎖の畳み込み
+/// （基底テーブル名＋ビュー由来 `WHERE` 述語・列スコープ検査）がそのまま
+/// 適用される（第 2 のビュー展開を作らない）。返すテーブル名はビュー展開後の
+/// 基底テーブル名であり、明示トランザクション内の `written_tables` 判定
+/// （`sql::transaction` モジュールドキュメント「読み取りの既知の逸脱」参照）
+/// にはこの名前を使う——ビュー名で判定すると、書き込み済みの基底テーブルを
+/// ビュー越しに読む経路が判定をすり抜けるため。
+pub(crate) fn validate_declare_inner(
+    query: &[Token],
+    lookup: &impl TableLookup,
+) -> Result<(Statement, String), SqlSurfaceError> {
+    if query.is_empty() {
         return Err(SqlSurfaceError::unsupported(
             "DECLARE requires a query after FOR",
         ));
     }
-    let inner = crate::sql::allowlist::validate_sql_tokens(rest, lookup)?;
+    let inner = crate::sql::allowlist::validate_sql_tokens(query, lookup)?;
     let table = match &inner {
         Statement::Aggregate(v) => v.table_name().to_string(),
         Statement::Scan(v) => v.table_name().to_string(),
@@ -134,11 +165,7 @@ pub(crate) fn validate_declare_tokens(
             ));
         }
     };
-    Ok(CursorStatement::Declare {
-        name,
-        inner: Box::new(inner),
-        table,
-    })
+    Ok((inner, table))
 }
 
 /// 構造検証だけを行い、実カタログへは一切問い合わせない
@@ -166,9 +193,11 @@ impl TableLookup for AlwaysExistsLookup {
 /// `validate_create_table_tokens`）と同じ「構造検証はカタログを一切参照
 /// しない・カタログ照会は実行本体が担う」設計を踏襲し、[`AlwaysExistsLookup`]
 /// で内側 SELECT の構造検証だけを行う。実カタログとの照合（テーブル存在
-/// 確認・列解決）は `Active` なトランザクション内で内側 SELECT を実際に
-/// 実行する時点（`core.rs::EngineCore::execute_cursor_inner_query` →
-/// `read_txn_with_schema`／`bind_scan`／`bind_aggregate`）まで遅延する。
+/// 確認・ビュー展開・列解決）は `Active` なトランザクション内で内側 SELECT を
+/// 実際に実行する時点まで遅延する（`core.rs::EngineCore::
+/// execute_cursor_in_active_txn` が [`validate_declare_inner`] を実カタログ
+/// に対して再実行し、続く `execute_cursor_inner_query` →
+/// `read_txn_with_schema`／`bind_scan`／`bind_aggregate` が列を解決する）。
 pub(crate) fn validate_declare_tokens_structure_only(
     tokens: &[Token],
 ) -> Result<CursorStatement, SqlSurfaceError> {
@@ -461,8 +490,11 @@ mod tests {
         )
         .expect("scan form accepted");
         match stmt {
-            CursorStatement::Declare { name, table, .. } => {
+            CursorStatement::Declare { name, query } => {
                 assert_eq!(name, "c");
+                let (inner, table) =
+                    validate_declare_inner(&query, &FakeCatalog).expect("inner revalidates");
+                assert!(matches!(inner, Statement::Scan(_)));
                 assert_eq!(table, "documents");
             }
             _ => panic!("expected Declare"),

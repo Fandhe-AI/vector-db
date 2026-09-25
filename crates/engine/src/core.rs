@@ -3176,8 +3176,18 @@ impl EngineCore {
         use crate::sql::cursor::CursorStatement;
 
         match stmt {
-            CursorStatement::Declare { name, inner, table } => {
-                if txn.table_already_written(table) {
+            CursorStatement::Declare { name, query } => {
+                // 構文解析段（`parse_tokens`）は構造検証のみでカタログを参照
+                // しないため、ここで内側 SELECT を実カタログに対して再検証する
+                // （PR #1049 レビュー指摘 codex P1 対応）。通常の広域取得
+                // `SELECT` と同じ `validate_sql_tokens` を通すことで、FROM が
+                // ビューを指す場合も同じ `sql::view::resolve_from` による展開
+                // （基底テーブル＋ビュー由来述語。RLS は後段の実行経路が参照
+                // セッション自身の `ctx` で暗黙適用する）が適用される。
+                // `table` はビュー展開後の基底テーブル名。
+                let (inner, table) =
+                    crate::sql::cursor::validate_declare_inner(query, &self.storage)?;
+                if txn.table_already_written(&table) {
                     return Err(SqlSurfaceError::transaction_feature_not_supported(
                         "reading a table already written in the same transaction is not supported",
                     ));
@@ -3187,7 +3197,7 @@ impl EngineCore {
                         detail: "internal error".to_string(),
                     })?
                     .ensure_capacity_for_declare(name)?;
-                let outcome = self.execute_cursor_inner_query(ctx, session, inner)?;
+                let outcome = self.execute_cursor_inner_query(ctx, session, &inner)?;
                 let result = match outcome {
                     crate::sql::SqlOutcome::Query(result) => result,
                     // `inner` は構造検証段で `Statement::Aggregate`／

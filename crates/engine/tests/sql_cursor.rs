@@ -532,3 +532,194 @@ fn cursor_becomes_unusable_after_transaction_duration_limit() {
     assert_eq!(err.wire_code(), "54000");
     assert_eq!(txn.status(), TransactionStatus::Failed);
 }
+
+// --- ビュー越しのカーソル（PR #1049 レビュー指摘 codex P1 の回帰防止） -------
+//
+// `DECLARE` の構文解析段はカタログを参照しない構造検証のみ（トランザクション外
+// `25P01` 契約のため）で、`Active` 内の実行時に内側 SELECT を実カタログで
+// 再検証する。この再検証が通常の広域取得 `SELECT` と同じ経路でビューを展開し、
+// 参照セッション自身の `PolicyContext` で RLS が暗黙適用されることを固定する
+// （TABLE-18・SQL-23・RLS-10 (b) のポインタ。`table18_view.rs` と同じ fixture
+// 構成）。
+
+/// `id` 1〜4 は tenant-a（4 のみ Private）、5・6 は tenant-b（6 のみ Private）、
+/// 7 は tenant-c（Public）。3 のみ `lang = 'en'`。
+fn seed_view_fixture(storage: &Storage) {
+    let rows: [(&str, u64, &str, Visibility); 7] = [
+        ("tenant-a", 1, "ja", Visibility::Public),
+        ("tenant-a", 2, "ja", Visibility::Public),
+        ("tenant-a", 3, "en", Visibility::Public),
+        ("tenant-a", 4, "ja", Visibility::Private),
+        ("tenant-b", 5, "ja", Visibility::Public),
+        ("tenant-b", 6, "ja", Visibility::Private),
+        ("tenant-c", 7, "ja", Visibility::Public),
+    ];
+    for (tenant, id, lang, visibility) in rows {
+        engine::tenant::insert_typed_row(
+            storage,
+            TABLE,
+            &ctx(tenant),
+            id,
+            visibility,
+            &[
+                engine::row_codec::Value::Vector(vec![id as f32, 0.0]),
+                engine::row_codec::Value::Text(lang.to_string()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("view-seed-{id}"))
+                .expect("valid operation id"),
+        )
+        .expect("seed typed row");
+    }
+}
+
+/// 基底テーブル作成・fixture 投入・ビュー作成まで済ませた `EngineCore`。
+fn new_view_core() -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path("sql-cursor-view");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create table");
+    seed_view_fixture(&storage);
+    let engine = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    create_ja_view(&engine);
+    (engine, path)
+}
+
+fn create_ja_view(engine: &EngineCore) {
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    engine
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            &format!("CREATE VIEW ja_docs AS SELECT id, lang FROM {TABLE} WHERE lang = 'ja'"),
+        )
+        .expect("create view");
+}
+
+/// `BEGIN` → `DECLARE ... FOR SELECT ... FROM <view>` → `FETCH` の全ページの
+/// 和集合が、同じセッション `ctx` で基底テーブルへ直接問い合わせた結果と一致し、
+/// 他テナントの Private 行（作成者 tenant-a の 4・tenant-b の 6）が混入しない。
+#[test]
+fn declare_over_view_resolves_view_and_applies_session_rls() {
+    let (engine, path) = new_view_core();
+    let _cleanup = CleanupGuard(path);
+
+    for tenant in ["tenant-a", "tenant-b", "tenant-c"] {
+        let caller = ctx(tenant);
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        assert_eq!(
+            engine
+                .execute_sql_in_txn(
+                    &caller,
+                    &mut session,
+                    &mut txn,
+                    "DECLARE v CURSOR FOR SELECT id, lang FROM ja_docs LIMIT 100",
+                )
+                .expect("DECLARE over a view must resolve the view"),
+            SqlOutcome::DeclareCursor
+        );
+        let mut fetched: Vec<u64> = Vec::new();
+        loop {
+            let SqlOutcome::Fetch(result) = engine
+                .execute_sql_in_txn(&caller, &mut session, &mut txn, "FETCH 2 FROM v")
+                .expect("fetch")
+            else {
+                panic!("expected Fetch outcome");
+            };
+            if result.rows.is_empty() {
+                break;
+            }
+            for row in &result.rows {
+                assert_eq!(
+                    row.cells.last(),
+                    Some(&Cell::Text("ja".to_string())),
+                    "tenant={tenant}: rows through the view must satisfy the view predicate"
+                );
+            }
+            fetched.extend(row_ids(&result));
+        }
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
+            .expect("commit");
+        fetched.sort_unstable();
+
+        let SqlOutcome::Query(direct) = engine
+            .execute_sql_in_session(
+                &caller,
+                &mut SessionState::default(),
+                &format!("SELECT id FROM {TABLE} WHERE lang = 'ja' LIMIT 100"),
+            )
+            .expect("direct scan")
+        else {
+            panic!("expected Query outcome");
+        };
+        let mut expected = row_ids(&direct);
+        expected.sort_unstable();
+        assert_eq!(
+            fetched, expected,
+            "tenant={tenant}: cursor over the view must match the direct query under the same ctx"
+        );
+
+        match tenant {
+            "tenant-a" => assert_eq!(fetched, vec![1, 2, 4, 5, 7]),
+            "tenant-b" => assert_eq!(fetched, vec![1, 2, 5, 6, 7]),
+            _ => assert_eq!(fetched, vec![1, 2, 5, 7]),
+        }
+    }
+}
+
+/// ビューを指す `DECLARE` もトランザクション外では実カタログを照会せず
+/// `25P01` のまま（構造検証段でビュー展開を行わない契約の維持）。
+#[test]
+fn declare_over_view_outside_transaction_is_still_25p01() {
+    let (engine, path) = new_view_core();
+    let _cleanup = CleanupGuard(path);
+
+    let err = engine
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut SessionState::default(),
+            "DECLARE v CURSOR FOR SELECT id FROM ja_docs LIMIT 10",
+        )
+        .expect_err("DECLARE outside a transaction must be rejected");
+    assert_eq!(err.wire_code(), "25P01");
+}
+
+/// 同一トランザクション内で基底テーブルへ書き込んだ後は、ビュー越しの
+/// `DECLARE` も `0A000`（`written_tables` 判定がビュー名ではなく展開後の
+/// 基底テーブル名で行われること）。
+#[test]
+fn declare_over_view_after_writing_its_base_table_is_rejected() {
+    let (engine, path) = new_view_core();
+    let _cleanup = CleanupGuard(path);
+
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            &insert_sql(100, "ja", "view-w1"),
+        )
+        .expect("insert into base table");
+    let err = engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "DECLARE v CURSOR FOR SELECT id FROM ja_docs LIMIT 10",
+        )
+        .expect_err("DECLARE over a view whose base table was written must be rejected");
+    assert_eq!(err.wire_code(), "0A000");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
