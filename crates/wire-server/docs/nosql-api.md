@@ -677,6 +677,8 @@ Date: <IMF-fixdate>
 | `2BP01` | `DEPENDENT_OBJECTS_STILL_EXIST` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW` は SQL 表層専用の DDL。後述） |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
 | `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`・`ALTER TABLE ADD COLUMN` は op 許可リスト外。後述） |
+| `42703` | `UNDEFINED_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE INDEX` は op 許可リスト外。後述） |
+| `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP INDEX` は op 許可リスト外。後述） |
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
@@ -684,15 +686,15 @@ Date: <IMF-fixdate>
 | `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
 | `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
 | `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | `insert` の `operation_id` 重複（内容一致の再送）、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`update`） |
-| `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`／`CREATE VIEW` は op 許可リスト外。後述） |
+| `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`／`CREATE VIEW`／`CREATE INDEX` は op 許可リスト外。後述） |
 | `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過 |
 | `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
 | `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 10 分類（`42501`・`P0002`・`42701`・`42P07`・`2BP01`・`42809`・
-`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 12 分類（`42501`・`P0002`・`42701`・`42P07`・`2BP01`・`42809`・
+`42703`・`42704`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -704,7 +706,9 @@ Issue #900）が誘発する分類だが、NoSQL 表層の `op` 許可リスト�
 `docs/design/sql-alter-table-add-column.md` 参照）。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
 TASK-205、Issue #909）は SQL 表層専用の DDL で、NoSQL `op` 許可リストに
 `view` 相当の語彙が無いため `42P07`（名前衝突を `CREATE TABLE` と共有）・
-`2BP01`・`42809` も同様に到達不能。明示トランザクション（SQL-31・TASK-221）の
+`2BP01`・`42809` も同様に到達不能。`CREATE INDEX`／`DROP INDEX`（INDEX-7・
+SQL-23・TASK-206、Issue #908）も SQL 表層専用の DDL で、`42P07`（名前衝突を
+共有）・`42703`・`42704` は同様に到達不能。明示トランザクション（SQL-31・TASK-221）の
 `BEGIN`／`COMMIT`／`ROLLBACK` は SQL 表層専用の機構で、NoSQL 表層の `op`
 許可リストにトランザクション制御に対応する語彙が無いため、その状態エラー
 （`25xxx`）は到達しない（一方、ロック待ちの `55P03` は SQL 表層のトランザク

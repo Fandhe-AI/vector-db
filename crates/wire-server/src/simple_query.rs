@@ -556,6 +556,14 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropView(_) => OutcomeResponse::Command {
             tag: "DROP VIEW".to_string(),
         },
+        // TASK-206・INDEX-7・SQL-23（Issue #908）: 索引宣言 DDL も件数を持たない
+        // pg 互換の固定タグへ整形する（`CREATE VIEW`／`DROP VIEW` と同じ設計）。
+        SqlOutcome::CreateIndex(_) => OutcomeResponse::Command {
+            tag: "CREATE INDEX".to_string(),
+        },
+        SqlOutcome::DropIndex(_) => OutcomeResponse::Command {
+            tag: "DROP INDEX".to_string(),
+        },
     }
 }
 

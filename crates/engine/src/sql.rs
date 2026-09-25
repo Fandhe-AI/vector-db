@@ -333,4 +333,17 @@ pub enum SqlOutcome {
     /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `SqlOutcome`
     /// を網羅的にマッチする既存コードはすべて更新済み。
     DropView(ddl::DropViewOutcome),
+    /// `CREATE INDEX <name> ON <table> [USING hnsw] (<col>[, ...])`（TASK-206・
+    /// INDEX-7・SQL-23、Issue #908）がセッション経由の実行経路で成功したことを
+    /// 示す応答（[`ddl::CreateIndexOutcome`] を運ぶ薄いラッパー）。
+    ///
+    /// **BREAKING CHANGE**（Issue #908）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コードはすべて更新済み。
+    CreateIndex(ddl::CreateIndexOutcome),
+    /// `DROP INDEX <name>`（TASK-206・INDEX-7・SQL-23、Issue #908）がセッション
+    /// 経由の実行経路で成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #908）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コードはすべて更新済み。
+    DropIndex(ddl::DropIndexOutcome),
 }
