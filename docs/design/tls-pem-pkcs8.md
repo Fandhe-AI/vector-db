@@ -141,8 +141,8 @@ X.509 DER のパース・公開鍵との整合チェック・validity 検査・C
 | `MAX_CERTIFICATE_CHAIN_LEN` | 8 | 証明書チェーンに含めてよい `CERTIFICATE` ブロック数の上限 |
 
 ファイル読み込みは `main.rs` の `--scram-mock-key-file` 読み込みパターン
-（`std::fs::metadata` で通常ファイルを確認 → `File::open` → `Read::take(max
-+ 1)` で上限+1 バイトまで読む二重防御）をそのまま踏襲した
+（`std::fs::metadata` で通常ファイルを確認 → `File::open` →
+`Read::take(max + 1)` で上限 + 1 バイトまで読む二重防御）をそのまま踏襲した
 （`pem::read_bounded_file`）。
 
 ## 公開 API
