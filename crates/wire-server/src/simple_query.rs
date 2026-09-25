@@ -283,9 +283,7 @@ fn run_statement<'e>(
                 let tag = shape.render(sent);
                 respond_rows_with_tag(stream, &result, &tag, finish, txn)
             }
-            OutcomeResponse::Command { tag } => {
-                respond_command_complete(stream, &tag, finish, txn.status())
-            }
+            OutcomeResponse::Command { tag } => respond_command_complete(stream, &tag, finish, txn),
         },
         Err(e) => {
             // `engine::core::EngineCore::execute_sql_in_txn`／
@@ -487,22 +485,48 @@ fn respond_command_complete(
     stream: &mut TcpStream,
     tag: &str,
     finish: Finish,
-    txn_status: engine::sql::transaction::TransactionStatus,
+    txn: &mut SessionTransaction<'_>,
 ) -> io::Result<StatementStatus> {
-    match result_encoder::encode_command_complete(tag) {
+    respond_command_complete_with(
+        stream,
+        tag,
+        finish,
+        txn,
+        result_encoder::encode_command_complete,
+    )
+}
+
+/// [`respond_command_complete`] の本体。`encode` はエンコード失敗経路を単体
+/// テストから注入するための差し替え点で、production は常に
+/// [`result_encoder::encode_command_complete`] を渡す。
+///
+/// エンコード失敗は、文自体は実行済み（`INSERT`／`TRUNCATE` 等の書き込みが共有
+/// 書き込みトランザクションに積まれている）のにクライアントへはエラーを返す
+/// 経路であるため、`respond_rows_with_tag` と同じく明示トランザクション中なら
+/// `Failed` へ遷移させる（SQL-31・TASK-221。PR #1041 レビュー指摘: `Active` の
+/// まま残すと後続の `COMMIT` が書き込みを永続化してしまう）。
+fn respond_command_complete_with(
+    stream: &mut TcpStream,
+    tag: &str,
+    finish: Finish,
+    txn: &mut SessionTransaction<'_>,
+    encode: impl FnOnce(&str) -> Result<Vec<u8>, result_encoder::EncodeError>,
+) -> io::Result<StatementStatus> {
+    match encode(tag) {
         Ok(msg) => {
             write_all(stream, &msg)?;
             if finish == Finish::ReadyForQuery {
-                crate::handshake::write_ready_for_query_io(stream, txn_status)?;
+                crate::handshake::write_ready_for_query_io(stream, txn.status())?;
             }
             Ok(StatementStatus::Completed)
         }
         Err(_) => {
+            txn.fail();
             respond_error_and_ready(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode command complete response",
-                txn_status,
+                txn.status(),
             )?;
             Ok(StatementStatus::Failed)
         }
@@ -965,6 +989,93 @@ mod tests {
             "ReadyForQuery must reflect the post-transition Failed status ('E'), not the \
              pre-failure Active status"
         );
+    }
+
+    /// SQL-31・TASK-221（PR #1041 レビュー指摘）: `CommandComplete` 単独応答の
+    /// エンコードが失敗した場合も、`Active` な明示トランザクションを `Failed` へ
+    /// 強制遷移させること（`Active` のまま残すと、クライアントにはエラーが返る
+    /// 一方で直前の `INSERT`／`TRUNCATE` が後続の `COMMIT` で確定してしまう）。
+    /// `ReadyForQuery` にも遷移後の `Failed`（`'E'`）が反映されることまで固定する。
+    #[test]
+    fn respond_command_complete_fails_active_transaction_on_encode_error() {
+        let path = temp_db::unique_db_path("respond-command-complete-active-txn-fail");
+        let _guard = temp_db::CleanupGuard(path.clone());
+        let storage = engine::storage::Storage::open(&path).expect("open storage");
+
+        let mut txn =
+            SessionTransaction::new(engine::sql::transaction::TransactionLimits::default());
+        txn.begin(&storage, &SessionState::default())
+            .expect("begin explicit transaction");
+        assert_eq!(
+            txn.status(),
+            engine::sql::transaction::TransactionStatus::InTransaction,
+            "precondition: txn must be Active before the encode failure"
+        );
+
+        let (mut server, mut client) = loopback_pair();
+        let reader = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).expect("read_to_end");
+            buf
+        });
+        let status = respond_command_complete_with(
+            &mut server,
+            "INSERT 0 1",
+            Finish::ReadyForQuery,
+            &mut txn,
+            |_| Err(result_encoder::EncodeError),
+        )
+        .expect("respond");
+        drop(server);
+        let received = reader.join().expect("reader thread");
+
+        assert_eq!(status, StatementStatus::Failed);
+        assert_eq!(
+            txn.status(),
+            engine::sql::transaction::TransactionStatus::Failed,
+            "encode failure during Active must force-transition the transaction to Failed"
+        );
+        assert_eq!(received.first().copied(), Some(b'E'), "ErrorResponse first");
+        assert_eq!(
+            received.last().copied(),
+            Some(b'E'),
+            "ReadyForQuery must reflect the post-transition Failed status ('E')"
+        );
+    }
+
+    /// 対照: エンコードが成功すれば `Active` のまま `CommandComplete` を返す
+    /// （上のテストの遷移判定が空振りしていないことの確認）。
+    #[test]
+    fn respond_command_complete_keeps_active_transaction_on_success() {
+        let path = temp_db::unique_db_path("respond-command-complete-active-txn-ok");
+        let _guard = temp_db::CleanupGuard(path.clone());
+        let storage = engine::storage::Storage::open(&path).expect("open storage");
+        let mut txn =
+            SessionTransaction::new(engine::sql::transaction::TransactionLimits::default());
+        txn.begin(&storage, &SessionState::default())
+            .expect("begin explicit transaction");
+
+        let (mut server, mut client) = loopback_pair();
+        let reader = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).expect("read_to_end");
+            buf
+        });
+        let status =
+            respond_command_complete(&mut server, "INSERT 0 1", Finish::ReadyForQuery, &mut txn)
+                .expect("respond");
+        drop(server);
+        let received = reader.join().expect("reader thread");
+
+        assert_eq!(status, StatementStatus::Completed);
+        assert_eq!(
+            txn.status(),
+            engine::sql::transaction::TransactionStatus::InTransaction
+        );
+        assert_eq!(received.first().copied(), Some(b'C'));
+        assert_eq!(received.last().copied(), Some(b'T'));
     }
 
     /// ERR-5: [`emergency_response_bytes`] が返すバイト列（`crates/wire-server/
