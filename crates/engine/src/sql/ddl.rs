@@ -64,6 +64,8 @@ pub struct CreateTableOutcome {}
 ///   大半は [`crate::sql::allowlist::validate_create_table_tokens`] が構造検証
 ///   段階で既に拒否済みのため、ここに到達するのは主に `VECTOR` の次元範囲・
 ///   複数 `VECTOR` 列宣言）→ [`SqlSurfaceError::unsupported`]（`42601`）
+/// - `WriteLockTimeout`（書き込みゲートの待機上限超過。SQL-31）→
+///   `SqlSurfaceError::LockNotAvailable`（`55P03`）
 /// - その他（`redb` I/O 等）→ `SqlSurfaceError::Internal`（`XX000`。詳細を
 ///   クライアントへ渡さない。security.md「情報漏えい」対応）
 pub(crate) fn execute_create_table(
@@ -82,6 +84,9 @@ pub(crate) fn execute_create_table(
         CatalogError::Invalid(detail) => {
             SqlSurfaceError::unsupported(format!("invalid table schema: {detail}"))
         }
+        // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
+        // ゲートの待機上限を超えた。他の書き込み入口と同じく `55P03` を返す。
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::TableNotFound(_)
@@ -150,6 +155,10 @@ fn map_drop_table_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::Invalid(_) => {
             SqlSurfaceError::unsupported("malformed table reference in DROP TABLE")
         }
+        // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で、書き込み
+        // ゲートの待機上限を超えた。他の書き込み入口と同じく `55P03` を返す
+        // （`catalog::table_lookup_error` 系の写像と同じ契約）。
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
         // それ以外（redb バックエンド障害・カタログ破損・世代カウンタ枯渇等）は
         // サーバー側の内部事象として `XX000` へ丸める（`Storage::drop_table` の
         // ドキュメントが一覧する他の `CatalogError` variant はいずれもこの
@@ -163,6 +172,14 @@ fn map_drop_table_error(e: CatalogError) -> SqlSurfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 書き込みゲートの待機上限超過は `XX000` ではなく `55P03` へ写像する
+    /// （SQL-31・TASK-221。DROP TABLE も他の書き込み入口と同じ契約）。
+    #[test]
+    fn drop_table_write_lock_timeout_maps_to_lock_not_available() {
+        let err = map_drop_table_error(CatalogError::WriteLockTimeout);
+        assert_eq!(err.wire_code(), "55P03");
+    }
 
     #[test]
     fn require_ddl_permission_rejects_default_session() {

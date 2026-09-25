@@ -30,6 +30,7 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 /// 同一ソースを取り込む。テストコードのみで使うため通常ビルドには含めない。
 #[cfg(test)]
 mod power_loss_model;
+pub(crate) mod writer_gate;
 
 /// 行ストアの物理キー型（対象ビヘイビア: TABLE-12。ポインタ:
 /// `docs/spec/04-behavior/data-model.md` TABLE-12）。キーはテナント ID・行 `id` の
@@ -184,6 +185,11 @@ pub(crate) const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
 /// [`Storage::batch_log_max_seq`] を使う。
 const MAX_BATCH_LOG_ROWS: usize = 1_000_000;
 
+/// [`Storage::writer_gate`] の待機上限の既定値（SQL-31・TASK-221。実装既定値で
+/// spec 由来の数値ではない。ロック待ちで [`StorageError::WriteLockTimeout`]
+/// （`55P03`）を返すまでの時間）。
+pub const DEFAULT_WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 永続化層の公開エラー型。`redb` の複数のエラー型（`DatabaseError` 等）はすべて
 /// `redb::Error` へ変換可能なため、それを内部に保持して一本化する。
 /// ライブラリコードとして panic せず、すべての失敗を `Result` で返す
@@ -254,6 +260,15 @@ pub enum StorageError {
     /// テナント ID・テーブル名を含めない（security.md「情報漏えい（エラー経由の
     /// 存在情報）」対応。`CatalogError::IncompatibleRowKeyFormat` と同一文言）。
     IncompatibleRowKeyFormat,
+    /// 明示トランザクション（SQL-31・TASK-221）が単一ライタ（`TABLE-3`）を
+    /// 保持している間に、別セッション（またはロック待ちの上限を超えた同一セッション）が
+    /// 書き込みトランザクションを取得しようとした（[`storage::writer_gate`] の
+    /// 待機上限超過）。fail-closed に拒否する（`55P03`。他テナントの情報は含まない）。
+    WriteLockTimeout,
+    /// 明示トランザクションを保持している当該スレッド自身が、再度書き込み
+    /// トランザクションを取得しようとした（配線漏れに対する多層防御。許可リスト側で
+    /// 本来は手前で拒否される想定）。到達した場合は内部矛盾として扱う。
+    WriteTxnHeldByCurrentSession,
 }
 
 impl fmt::Display for StorageError {
@@ -292,6 +307,12 @@ impl fmt::Display for StorageError {
             StorageError::IncompatibleRowKeyFormat => {
                 write!(f, "incompatible row store key format: rebuild required")
             }
+            StorageError::WriteLockTimeout => {
+                write!(f, "write lock not available: timed out waiting for writer")
+            }
+            StorageError::WriteTxnHeldByCurrentSession => {
+                write!(f, "write transaction already held by current session")
+            }
         }
     }
 }
@@ -308,7 +329,9 @@ impl std::error::Error for StorageError {
             | StorageError::UnloggedRows(_)
             | StorageError::EmptyBatch
             | StorageError::GenerationCounterOverflow
-            | StorageError::IncompatibleRowKeyFormat => None,
+            | StorageError::IncompatibleRowKeyFormat
+            | StorageError::WriteLockTimeout
+            | StorageError::WriteTxnHeldByCurrentSession => None,
         }
     }
 }
@@ -331,6 +354,78 @@ where
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+/// `redb` の書き込みトランザクションと [`writer_gate::WriterPermit`] を同じ寿命で
+/// 束ねたハンドル（SQL-31・TASK-221。PR #1041 レビュー指摘）。
+///
+/// [`Storage::begin_write_txn`]（autocommit）・[`Storage::begin_explicit_write_txn`]
+/// （明示トランザクション）の双方が返す。`redb` のライタが生きている間は必ず
+/// ゲートも占有しているため、後続の書き込み要求は `redb::Database::begin_write`
+/// の中で無期限に待つことはなく、ゲートの待機上限（`write_lock_wait`）で
+/// `55P03` へ倒れる。`Deref`/`DerefMut` で `redb::WriteTransaction` として扱える。
+///
+/// フィールドの宣言順が drop 順序を決める（`txn` を先に drop＝abort してから
+/// `_permit` を解放する）。並べ替えてはならない。
+pub(crate) struct GatedWriteTxn {
+    txn: redb::WriteTransaction,
+    _permit: writer_gate::WriterPermit,
+}
+
+impl std::ops::Deref for GatedWriteTxn {
+    type Target = redb::WriteTransaction;
+    fn deref(&self) -> &redb::WriteTransaction {
+        &self.txn
+    }
+}
+
+impl std::ops::DerefMut for GatedWriteTxn {
+    fn deref_mut(&mut self) -> &mut redb::WriteTransaction {
+        &mut self.txn
+    }
+}
+
+impl GatedWriteTxn {
+    /// 変更を破棄して閉じる。`txn` を abort した後にゲートを解放する。
+    pub(crate) fn abort(self) -> Result<()> {
+        let GatedWriteTxn { txn, _permit } = self;
+        txn.abort()?;
+        Ok(())
+    }
+
+    /// テスト fixture 用: 世代を進めずに `redb` の commit だけを行う（旧来の
+    /// `write_txn.commit()` 直呼び出しと同じ効果）。permit は commit 後に解放する。
+    #[cfg(test)]
+    pub(crate) fn commit_raw_for_test(self) -> Result<()> {
+        let GatedWriteTxn { txn, _permit } = self;
+        txn.commit()?;
+        Ok(())
+    }
+}
+
+/// commit 系の入口（[`commit_write_txn`]・[`bump_generation_and_commit`]・
+/// [`crate::recovery::commit_boundary::commit`] 等）が受け取る書き込み
+/// トランザクション。[`GatedWriteTxn`] はゲートの permit を commit 完了まで
+/// 保持し、その後で解放する。素の `redb::WriteTransaction`（テスト fixture が
+/// `db().begin_write()` で直接作るもの）は permit を持たない。
+pub(crate) trait CommitTxn {
+    /// commit 対象の `redb::WriteTransaction` と、commit 完了まで保持すべき
+    /// permit（あれば）に分ける。呼び出し元は permit を `_permit` のような名前付き
+    /// 束縛で commit 完了まで保持すること（`_` で受けると即座に解放される）。
+    fn split_for_commit(self) -> (redb::WriteTransaction, Option<writer_gate::WriterPermit>);
+}
+
+impl CommitTxn for redb::WriteTransaction {
+    fn split_for_commit(self) -> (redb::WriteTransaction, Option<writer_gate::WriterPermit>) {
+        (self, None)
+    }
+}
+
+impl CommitTxn for GatedWriteTxn {
+    fn split_for_commit(self) -> (redb::WriteTransaction, Option<writer_gate::WriterPermit>) {
+        let GatedWriteTxn { txn, _permit } = self;
+        (txn, Some(_permit))
+    }
+}
 
 /// [`GENERATION_TABLE`] を +1 する（TASK-133 P1 対応）。`write_txn.commit()` を
 /// 呼ぶ前の準備段階のみを担い、この関数自体は commit を行わない。
@@ -400,7 +495,9 @@ pub(crate) fn current_generation_in_txn(read_txn: &redb::ReadTransaction) -> Res
 /// （choke point の一本化。詳細は `commit_boundary` モジュールのドキュメントを参照）。
 /// 本関数自体は本クレート内のテスト fixture 等、commit 成功境界の保護区間を
 /// 必要としない直接呼び出し元向けに残している。
-pub(crate) fn bump_generation_and_commit(write_txn: redb::WriteTransaction) -> Result<()> {
+pub(crate) fn bump_generation_and_commit(write_txn: impl CommitTxn) -> Result<()> {
+    // permit は commit 完了まで保持する（`GatedWriteTxn` 参照）。
+    let (write_txn, _permit) = write_txn.split_for_commit();
     prepare_generation_bump(&write_txn)?;
     commit_prepared_write_txn(write_txn)
 }
@@ -429,10 +526,11 @@ pub(crate) fn bump_generation_and_commit(write_txn: redb::WriteTransaction) -> R
 /// 前提に「過剰失効はあっても見逃し（fail-open）はない」設計とする
 /// （見逃しは `crate::rls::PrefilterIndex` の RLS 相当の失効検出を素通りさせ、
 /// 他テナント行の混入・削除済み可視性の残存に直結するため P0）。
-pub(crate) fn commit_write_txn(write_txn: redb::WriteTransaction, has_writes: bool) -> Result<()> {
+pub(crate) fn commit_write_txn(write_txn: impl CommitTxn, has_writes: bool) -> Result<()> {
     if has_writes {
         bump_generation_and_commit(write_txn)
     } else {
+        let (write_txn, _permit) = write_txn.split_for_commit();
         write_txn.abort()?;
         Ok(())
     }
@@ -559,6 +657,13 @@ pub struct Storage {
     /// 生成箇所が choke point を通ることの検証）に使う。
     #[cfg(test)]
     write_txn_creations: std::sync::atomic::AtomicU64,
+    /// 明示トランザクション（SQL-31・TASK-221）と autocommit の間で単一ライタを
+    /// 安全に共有する choke point（[`writer_gate`] 参照）。
+    writer_gate: std::sync::Arc<writer_gate::WriterGate>,
+    /// 書き込みトランザクション取得（autocommit・明示トランザクション双方）が
+    /// [`Self::writer_gate`] を待つ上限（既定 30 秒）。超過時は
+    /// [`StorageError::WriteLockTimeout`]（`55P03`）を返す。
+    write_lock_wait: std::time::Duration,
 }
 
 impl Storage {
@@ -582,7 +687,17 @@ impl Storage {
             durability,
             #[cfg(test)]
             write_txn_creations: std::sync::atomic::AtomicU64::new(0),
+            writer_gate: writer_gate::WriterGate::new(),
+            write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
         })
+    }
+
+    /// 書き込みロック待ちの上限（[`Self::writer_gate`]）を明示指定する（トランザクション
+    /// 上限を短くしたテスト・opt-in CLI 用）。既定値（[`DEFAULT_WRITE_LOCK_WAIT`]）を
+    /// 使う場合は呼ぶ必要がない。
+    pub fn with_write_lock_wait(mut self, wait: std::time::Duration) -> Self {
+        self.write_lock_wait = wait;
+        self
     }
 
     /// 書き込みトランザクション生成の choke point（Issue #849）。
@@ -599,9 +714,39 @@ impl Storage {
     /// `set_durability` は「このトランザクションで persistent savepoint を
     /// 作成/削除していない限り成功する」契約（`redb` `=4.2.0`）であり、`begin_write`
     /// 直後に呼ぶ本実装は構造的に失敗しない。
-    pub(crate) fn begin_write_txn(
-        &self,
-    ) -> std::result::Result<redb::WriteTransaction, redb::Error> {
+    ///
+    /// autocommit 経路（本メソッド）も明示トランザクションと同じく
+    /// [`Self::writer_gate`] を待機上限つきで取得し、返す [`GatedWriteTxn`] が
+    /// commit/abort されるまで保持する（`redb` のライタが生きている間はゲートも
+    /// 占有する。[`writer_gate`] モジュールドキュメント参照）。
+    pub(crate) fn begin_write_txn(&self) -> Result<GatedWriteTxn> {
+        let permit = self.acquire_writer_permit()?;
+        let txn = self.begin_write_txn_raw()?;
+        Ok(GatedWriteTxn {
+            txn,
+            _permit: permit,
+        })
+    }
+
+    /// ゲートを待機上限（[`Self::write_lock_wait`]）つきで取得する。超過は
+    /// `WriteLockTimeout`、同一スレッドからの再入は `WriteTxnHeldByCurrentSession`
+    /// （いずれも `55P03`）。
+    fn acquire_writer_permit(&self) -> Result<writer_gate::WriterPermit> {
+        self.writer_gate
+            .acquire(self.write_lock_wait)
+            .map_err(|e| match e {
+                writer_gate::GateError::Timeout => StorageError::WriteLockTimeout,
+                writer_gate::GateError::HeldByCurrentThread => {
+                    StorageError::WriteTxnHeldByCurrentSession
+                }
+            })
+    }
+
+    /// ゲートを介さず `redb::Database::begin_write` を直接呼ぶ内部ヘルパー。
+    /// [`Self::begin_write_txn`]（autocommit）と
+    /// [`Self::begin_explicit_write_txn`]（明示トランザクション）の双方が、
+    /// それぞれ異なるゲート保持方針で本ヘルパーを共有する。
+    fn begin_write_txn_raw(&self) -> Result<redb::WriteTransaction> {
         let mut txn = self.db.begin_write()?;
         if !matches!(self.durability, WriteDurability::Immediate) {
             txn.set_durability(self.durability.into())?;
@@ -610,6 +755,13 @@ impl Storage {
         self.write_txn_creations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(txn)
+    }
+
+    /// 明示トランザクション（SQL-31・TASK-221）用の入口。ゲートの保持方針は
+    /// autocommit（[`Self::begin_write_txn`]）と同一で、返す [`GatedWriteTxn`] を
+    /// 呼び出し元が `COMMIT`/`ROLLBACK` まで保持する。
+    pub(crate) fn begin_explicit_write_txn(&self) -> Result<GatedWriteTxn> {
+        self.begin_write_txn()
     }
 
     /// [`Storage::begin_write_txn`] の呼び出し回数（テスト専用）。全書き込み経路が
@@ -2811,6 +2963,8 @@ mod tests {
                 db: raw_db,
                 durability: WriteDurability::default(),
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
+                writer_gate: writer_gate::WriterGate::new(),
+                write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             };
 
             // embedding/metadata は空スライスにしない。空だと encoder/decoder が
@@ -2871,6 +3025,8 @@ mod tests {
                 db: recovered_raw_db,
                 durability: WriteDurability::default(),
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
+                writer_gate: writer_gate::WriterGate::new(),
+                write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             };
 
             let row1_after = recovered_storage
@@ -2927,6 +3083,8 @@ mod tests {
                 db: raw_db,
                 durability: WriteDurability::None,
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
+                writer_gate: writer_gate::WriterGate::new(),
+                write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             };
 
             let embedding = [1.5_f32, -2.0, 0.25];
@@ -2963,6 +3121,8 @@ mod tests {
                 db: recovered_raw_db,
                 durability: WriteDurability::default(),
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
+                writer_gate: writer_gate::WriterGate::new(),
+                write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             };
 
             // commit 成功応答を受け取ったはずの行が、電源断後は失われている
@@ -3043,5 +3203,66 @@ mod tests {
                  追従しない退行の兆候）"
             );
         }
+    }
+
+    /// 別スレッドで `f` を実行し、`bound` 以内に結果が返らなければ `None` を返す
+    /// （書き込みゲートの回帰テスト用。無期限待ちの退行でテスト自体が止まらない
+    /// ように、呼び出し元は `None` を観測したら保持中のトランザクションを解放
+    /// してから失敗させる）。
+    fn run_with_bound<T: Send + 'static>(
+        storage: &std::sync::Arc<Storage>,
+        bound: std::time::Duration,
+        f: impl FnOnce(&Storage) -> T + Send + 'static,
+    ) -> (Option<T>, std::thread::JoinHandle<()>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let storage = std::sync::Arc::clone(storage);
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(f(&storage));
+        });
+        (rx.recv_timeout(bound).ok(), handle)
+    }
+
+    /// autocommit の書き込みトランザクションが `redb` のライタを保持している間、
+    /// 別セッションの明示トランザクション `BEGIN`・autocommit 書き込みはいずれも
+    /// `redb::Database::begin_write` の中で無期限に待たず、ゲートの待機上限で
+    /// `WriteLockTimeout`（`55P03`）になる（PR #1041 レビュー指摘の回帰テスト）。
+    #[test]
+    fn writer_gate_is_held_for_the_whole_autocommit_write_txn_lifetime() {
+        let path = unique_db_path("writer-gate-autocommit-lifetime");
+        let _cleanup = CleanupGuard(path.clone());
+        let wait = std::time::Duration::from_millis(100);
+        let storage = std::sync::Arc::new(
+            Storage::open(&path)
+                .expect("open storage")
+                .with_write_lock_wait(wait),
+        );
+        let bound = wait * 20;
+
+        let held = storage.begin_write_txn().expect("autocommit write txn");
+
+        let (explicit, explicit_handle) = run_with_bound(&storage, bound, |s| {
+            s.begin_explicit_write_txn().map(|_| ())
+        });
+        let (autocommit, autocommit_handle) =
+            run_with_bound(&storage, bound, |s| s.begin_write_txn().map(|_| ()));
+
+        // 退行時に別スレッドが `redb` の中で待ち続けていても join できるよう、
+        // 判定より先に保持中のトランザクションを解放する。
+        drop(held);
+        explicit_handle.join().expect("explicit thread");
+        autocommit_handle.join().expect("autocommit thread");
+
+        assert!(
+            matches!(explicit, Some(Err(StorageError::WriteLockTimeout))),
+            "explicit BEGIN must time out with WriteLockTimeout, got {explicit:?}"
+        );
+        assert!(
+            matches!(autocommit, Some(Err(StorageError::WriteLockTimeout))),
+            "autocommit write must time out with WriteLockTimeout, got {autocommit:?}"
+        );
+
+        // 解放後は取得できる。
+        let txn = storage.begin_write_txn().expect("write txn after release");
+        txn.abort().expect("abort");
     }
 }

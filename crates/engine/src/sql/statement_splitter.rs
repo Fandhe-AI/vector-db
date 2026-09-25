@@ -108,6 +108,9 @@ pub enum StatementEffect {
     /// 許可リスト外（`42601`）で拒否され副作用が起きないため、位置に関わらず
     /// 許可する（`check_write_placement` の対象外）。
     Rejected,
+    /// `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）。[`check_write_placement`]
+    /// がトランザクション状態を模擬する際の遷移点になる。
+    TransactionControl(crate::sql::transaction::TxnControl),
 }
 
 /// SQL テキストをセミコロン区切りの文へ分割する。文字列リテラルの中にある `;`
@@ -252,6 +255,15 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
         Token::Keyword(Keyword::Select) => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("EXPLAIN") => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("SET") => StatementEffect::SessionLocal,
+        Token::Ident(name) if name.eq_ignore_ascii_case("BEGIN") => {
+            StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Begin)
+        }
+        Token::Ident(name) if name.eq_ignore_ascii_case("COMMIT") => {
+            StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Commit)
+        }
+        Token::Ident(name) if name.eq_ignore_ascii_case("ROLLBACK") => {
+            StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Rollback)
+        }
         Token::Ident(name) if name.eq_ignore_ascii_case("CREATE") => match tokens.get(1) {
             Some(Token::Ident(next)) if next.eq_ignore_ascii_case("FUNCTION") => {
                 StatementEffect::SessionLocal
@@ -270,12 +282,37 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
 }
 
 /// 書き込み系文（[`StatementEffect::Write`]）が最後の文以外にある場合を拒否する
-/// （モジュールドキュメント「原子性」節参照）。
-pub fn check_write_placement(stmts: &[&str]) -> Result<(), MultiStatementError> {
+/// （モジュールドキュメント「原子性」節参照）。`initially_in_txn` は本メッセージの
+/// 先頭文実行前のセッションが既に明示トランザクション中（`Active`）かどうかを表す
+/// （SQL-31・TASK-221。`BEGIN` でトランザクション内、`COMMIT`／`ROLLBACK` で
+/// トランザクション外という遷移を先頭から模擬し、`BEGIN` を含むメッセージ内では
+/// 位置に関わらず書き込みを許可する。`COMMIT` は必ず最後の文でのみ許可し、
+/// 「1 メッセージにつき commit は高々 1 回」という既存の不変条件を維持する）。
+pub fn check_write_placement(
+    stmts: &[&str],
+    initially_in_txn: bool,
+) -> Result<(), MultiStatementError> {
+    use crate::sql::transaction::TxnControl;
     let last_index = stmts.len().saturating_sub(1);
+    let mut in_txn = initially_in_txn;
     for (i, stmt) in stmts.iter().enumerate() {
-        if i != last_index && classify_statement(stmt) == StatementEffect::Write {
-            return Err(MultiStatementError::WriteNotLast);
+        match classify_statement(stmt) {
+            StatementEffect::Write if !in_txn && i != last_index => {
+                return Err(MultiStatementError::WriteNotLast);
+            }
+            StatementEffect::TransactionControl(TxnControl::Begin) => {
+                in_txn = true;
+            }
+            StatementEffect::TransactionControl(TxnControl::Commit) => {
+                if i != last_index {
+                    return Err(MultiStatementError::WriteNotLast);
+                }
+                in_txn = false;
+            }
+            StatementEffect::TransactionControl(TxnControl::Rollback) => {
+                in_txn = false;
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -451,8 +488,15 @@ mod tests {
         assert_eq!(classify_statement("DROP TABLE t"), StatementEffect::Write);
         assert_eq!(
             classify_statement("BEGIN"),
-            StatementEffect::Write,
-            "未知の先頭語は fail-closed で Write 扱い"
+            StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Begin)
+        );
+        assert_eq!(
+            classify_statement("COMMIT"),
+            StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Commit)
+        );
+        assert_eq!(
+            classify_statement("ROLLBACK"),
+            StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Rollback)
         );
         assert_eq!(
             classify_statement("SELECT 'unterminated"),
@@ -465,17 +509,38 @@ mod tests {
 
     #[test]
     fn check_write_placement_allows_write_only_as_last_statement() {
-        assert!(check_write_placement(&["SELECT 1", "INSERT INTO t VALUES (1)"]).is_ok());
-        assert!(check_write_placement(&["INSERT INTO t VALUES (1)", "SELECT 1"]).is_err());
-        assert!(
-            check_write_placement(&["INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (2)"])
-                .is_err()
-        );
-        assert!(
-            check_write_placement(&["SELECT 'unterminated", "INSERT INTO t VALUES (1)"]).is_ok()
-        );
-        assert!(check_write_placement(&["INSERT INTO t VALUES (1)"]).is_ok());
-        assert!(check_write_placement(&[]).is_ok());
+        assert!(check_write_placement(&["SELECT 1", "INSERT INTO t VALUES (1)"], false).is_ok());
+        assert!(check_write_placement(&["INSERT INTO t VALUES (1)", "SELECT 1"], false).is_err());
+        assert!(check_write_placement(
+            &["INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (2)"],
+            false
+        )
+        .is_err());
+        assert!(check_write_placement(
+            &["SELECT 'unterminated", "INSERT INTO t VALUES (1)"],
+            false
+        )
+        .is_ok());
+        assert!(check_write_placement(&["INSERT INTO t VALUES (1)"], false).is_ok());
+        assert!(check_write_placement(&[], false).is_ok());
+    }
+
+    #[test]
+    fn check_write_placement_allows_writes_anywhere_inside_a_begin_block() {
+        assert!(check_write_placement(
+            &[
+                "BEGIN",
+                "INSERT INTO t VALUES (1)",
+                "INSERT INTO t VALUES (2)",
+                "COMMIT",
+            ],
+            false
+        )
+        .is_ok());
+        // `COMMIT` は必ず最後の文でのみ許可する。
+        assert!(check_write_placement(&["BEGIN", "COMMIT", "SELECT 1"], false).is_err());
+        // `initially_in_txn = true`（すでに `Active`）なら先頭の書き込みも許可する。
+        assert!(check_write_placement(&["INSERT INTO t VALUES (1)", "SELECT 1"], true).is_ok());
     }
 
     /// Issue #902（SQL-23・TASK-203）: `DROP TABLE x; SELECT ...` のような
@@ -484,7 +549,7 @@ mod tests {
     /// 参照）。
     #[test]
     fn check_write_placement_rejects_drop_table_not_last() {
-        assert!(check_write_placement(&["DROP TABLE docs", "SELECT 1"]).is_err());
-        assert!(check_write_placement(&["SELECT 1", "DROP TABLE docs"]).is_ok());
+        assert!(check_write_placement(&["DROP TABLE docs", "SELECT 1"], false).is_err());
+        assert!(check_write_placement(&["SELECT 1", "DROP TABLE docs"], false).is_ok());
     }
 }

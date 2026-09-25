@@ -187,21 +187,29 @@ pub enum AlertDescription {
     /// TLS 1.3 では bad_record_mac ではなく decrypt_error を用いる。
     /// 判定は `super::finished::verify_client_finished` が担う。Issue #964）。
     DecryptError,
+    /// 正常終了（RFC 8446 §6.1）。受信したら状態機械（#965）は
+    /// エラーではなく `ClosedByPeer` として扱う。
+    CloseNotify,
+    /// クライアントが自発的にハンドシェイクを中断した（RFC 8446 §6.1）。
+    /// `CloseNotify` と同じく正常終了として扱う。
+    UserCanceled,
 }
 
 impl AlertDescription {
     pub fn as_u8(self) -> u8 {
         match self {
+            AlertDescription::CloseNotify => 0,
             AlertDescription::UnexpectedMessage => 10,
+            AlertDescription::BadRecordMac => 20,
             AlertDescription::RecordOverflow => 22,
             AlertDescription::DecodeError => 50,
-            AlertDescription::BadRecordMac => 20,
-            AlertDescription::InternalError => 80,
+            AlertDescription::DecryptError => 51,
             AlertDescription::HandshakeFailure => 40,
             AlertDescription::IllegalParameter => 47,
+            AlertDescription::UserCanceled => 90,
             AlertDescription::ProtocolVersion => 70,
+            AlertDescription::InternalError => 80,
             AlertDescription::MissingExtension => 109,
-            AlertDescription::DecryptError => 51,
         }
     }
 }
