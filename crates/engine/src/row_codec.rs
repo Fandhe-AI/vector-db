@@ -4782,4 +4782,216 @@ mod tests {
             apply_overrides_via_decode_then_encode(&mid_vector, &buf_mid_vector, &overrides)
         );
     }
+
+    // --- Issue #894: 新スカラー型（TABLE-13・TASK-199）のマスク付き走査網羅 -----
+    //
+    // 集計・広域取得の必要列限定デコード（Issue #350・`sql::aggregate::
+    // ReferencedColumns`／`sql::scan::decode_tier_for`）は `scan_scalar_columns_
+    // masked` を単一情報源とする。ここでは可変長・固定長列が交互に並ぶスキーマで
+    // 単一ビットのマスクを総当たりし、`wanted` な列だけが値化されること、
+    // 非要求列でも構造検証（presence・宣言長・値域）が一切省略されないことを
+    // 固定する（受入条件 1）。`ENUM` は `Storage::create_enum_type` を要し本
+    // ユニットテストの構成では作れないため対象外とし、`tests/enum_column.rs`
+    // （既存）・`tests/decode_tier_scalar_types.rs`（Issue #894 新設）で検証する。
+
+    /// 新スカラー型を可変長・固定長が交互になるよう並べたスキーマ。
+    fn all_scalar_types_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true), // 0: VECTOR（常に None）
+                ColumnDef::new("t", ColumnType::Text, false),             // 1: 可変長
+                ColumnDef::new("i", ColumnType::Integer, false),          // 2: 固定長
+                ColumnDef::new("by", ColumnType::Bytea, true),            // 3: 可変長
+                ColumnDef::new("b", ColumnType::BigInt, false),           // 4: 固定長
+                ColumnDef::new("j", ColumnType::Json, true),              // 5: 可変長
+                ColumnDef::new("r", ColumnType::Real, false),             // 6: 固定長
+                ColumnDef::new("u", ColumnType::Uuid, true),              // 7: 固定長
+                ColumnDef::new("d", ColumnType::Double, false),           // 8: 固定長
+                ColumnDef::new(
+                    "a",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::Text, 8).expect("array ty")),
+                    true,
+                ), // 9: 可変長
+                ColumnDef::new("bo", ColumnType::Boolean, false),         // 10: 固定長
+                ColumnDef::new(
+                    "n",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ), // 11: 固定長
+                ColumnDef::new("dt", ColumnType::Date, true),             // 12: 固定長
+                ColumnDef::new("ts", ColumnType::Timestamp, true),        // 13: 固定長
+            ],
+        )
+    }
+
+    /// 全列に非 NULL の値を持つ行（マスク総当たりの基準値）。
+    fn all_scalar_types_values() -> Vec<Value> {
+        vec![
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::Text("hello".to_string()),
+            Value::Integer(42),
+            Value::Bytes(vec![1, 2, 3]),
+            Value::BigInt(123_456_789),
+            Value::Json(r#"{"a":1}"#.to_string()),
+            Value::Real(1.5),
+            Value::Uuid(Uuid::from_bytes([9u8; 16])),
+            Value::Double(2.5),
+            Value::Array(ArrayValue::Text(vec!["x".to_string(), "y".to_string()])),
+            Value::Bool(true),
+            Value::Numeric(Decimal::from_parts(1234, 2).expect("decimal")),
+            Value::Date(100),
+            Value::Timestamp(123_456_789),
+        ]
+    }
+
+    #[test]
+    fn scan_scalar_columns_masked_all_scalar_types_single_bit_mask_sweep() {
+        let schema = all_scalar_types_schema();
+        let values = all_scalar_types_values();
+        let buf = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        let full_scan = scan_scalar_columns(&schema, &buf).expect("scan scalar");
+        assert_eq!(full_scan.len(), schema.columns.len());
+        assert_eq!(full_scan[0], None, "VECTOR column is always None");
+
+        // 全 false マスク: すべて None。
+        let all_false = vec![false; schema.columns.len()];
+        let scanned_all_false =
+            scan_scalar_columns_masked(&schema, &buf, Some(&all_false)).expect("scan all-false");
+        assert!(scanned_all_false.iter().all(|slot| slot.is_none()));
+
+        // 全 true マスク: `scan_scalar_columns`（マスクなし）と一致。
+        let all_true = vec![true; schema.columns.len()];
+        let scanned_all_true =
+            scan_scalar_columns_masked(&schema, &buf, Some(&all_true)).expect("scan all-true");
+        assert_eq!(scanned_all_true, full_scan);
+
+        // 単一ビットマスク: 対象列だけが値化され、他はすべて None。
+        for wanted_index in 1..schema.columns.len() {
+            let mut mask = vec![false; schema.columns.len()];
+            mask[wanted_index] = true;
+            let scanned =
+                scan_scalar_columns_masked(&schema, &buf, Some(&mask)).expect("scan single-bit");
+            for (idx, slot) in scanned.iter().enumerate() {
+                if idx == wanted_index {
+                    assert_eq!(
+                        *slot, full_scan[idx],
+                        "column {idx} must decode its value when masked wanted"
+                    );
+                } else {
+                    assert_eq!(*slot, None, "column {idx} must be None when not wanted");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validate_scalar_columns_accepts_all_scalar_types_row() {
+        let schema = all_scalar_types_schema();
+        let values = all_scalar_types_values();
+        let buf = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        assert!(validate_scalar_columns(&schema, &buf).is_ok());
+    }
+
+    // --- 非要求列（マスク false）でも構造・値域検証を省略しない ------------------
+
+    #[test]
+    fn masked_unwanted_real_nan_is_rejected() {
+        // 有限値で符号化した後、REAL の値バイト列（presence 直後の 4 バイト）を
+        // NaN のビットパターンへ直接書き換える（`encode_scalar_columns` 自身は
+        // 非有限値を拒否するため経由できない。decode 側の検証を独立に固定する）。
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("score", ColumnType::Real, false)],
+        );
+        let mut buf = encode_scalar_columns(&schema, &[Value::Real(1.0)]).expect("encode");
+        let value_offset = buf.len() - 4;
+        buf[value_offset..].copy_from_slice(&f32::NAN.to_le_bytes());
+        let mask = [false];
+        assert!(matches!(
+            scan_scalar_columns_masked(&schema, &buf, Some(&mask)),
+            Err(RowCodecError::Invalid(_))
+        ));
+        assert!(matches!(
+            validate_scalar_columns(&schema, &buf),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn masked_unwanted_boolean_unknown_byte_is_rejected() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("flag", ColumnType::Boolean, false)],
+        );
+        // BOOL_FALSE_BYTE=0, BOOL_TRUE_BYTE=1 以外の未知バイト。
+        let buf = vec![PRESENCE_VALUE, 2];
+        let mask = [false];
+        assert!(matches!(
+            scan_scalar_columns_masked(&schema, &buf, Some(&mask)),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn masked_unwanted_numeric_precision_overflow_is_rejected() {
+        // `precision=3` のスキーマへ、桁数がそれを超える unscaled 値を直接書き込む
+        // （`encode_scalar_columns` は `fits_precision` を検証するため経由できない）。
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new(
+                "n",
+                ColumnType::Numeric {
+                    precision: 3,
+                    scale: 0,
+                },
+                false,
+            )],
+        );
+        let mut buf = Vec::new();
+        buf.push(PRESENCE_VALUE);
+        let unscaled: i128 = 12_345; // precision=3 (999 が上限) を超える。
+        buf.extend_from_slice(&unscaled.to_le_bytes());
+        let mask = [false];
+        assert!(matches!(
+            scan_scalar_columns_masked(&schema, &buf, Some(&mask)),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn masked_unwanted_integer_truncated_is_rejected() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("n", ColumnType::Integer, false)],
+        );
+        let mut buf = Vec::new();
+        buf.push(PRESENCE_VALUE);
+        buf.extend_from_slice(&[0u8, 1u8]); // 4 バイト必要だが 2 バイトで打ち切り。
+        let mask = [false];
+        assert!(matches!(
+            scan_scalar_columns_masked(&schema, &buf, Some(&mask)),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn masked_unwanted_all_scalar_types_trailing_bytes_are_rejected() {
+        let schema = all_scalar_types_schema();
+        let values = all_scalar_types_values();
+        let mut buf = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        buf.push(0xff);
+        let all_false = vec![false; schema.columns.len()];
+        assert!(matches!(
+            scan_scalar_columns_masked(&schema, &buf, Some(&all_false)),
+            Err(RowCodecError::Invalid(_))
+        ));
+        assert!(matches!(
+            validate_scalar_columns(&schema, &buf),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
 }

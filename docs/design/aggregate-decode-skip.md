@@ -161,3 +161,98 @@ tenant プレフィクスの range scan 化等の更なる最適化はスコー�
 `DecodeTier::Fast` が実際にデコードを行わないことを上記の破損注入テストで構造的に
 実証する方針とした。行数比例の実測（レイテンシ・スループット差）が必要な場合は、
 別途ベンチ整備をオーナー確認のうえ Issue 化する。
+
+## #894 追記: 新スカラー型（TABLE-13・TASK-199）の 3 段階デコード tier 対応
+
+- ステータス: Accepted（精査・回帰テストの固定）
+- 対応: Issue #894（`docs/spec/05-tasks.md` TASK-199）
+- 変更コード: `crates/engine/src/sql/aggregate.rs`（`select_decode_tier` 抽出のみ）・
+  `crates/engine/src/row_codec.rs`・`crates/engine/src/sql/group_by.rs`・
+  `crates/engine/src/sql/scan.rs`（いずれもテスト追加のみ）
+- 新規結合テスト: `crates/engine/tests/decode_tier_scalar_types.rs`
+
+### 監査結果
+
+INTEGER・BIGINT・REAL・DOUBLE PRECISION・BOOLEAN・DATE・TIMESTAMP・NUMERIC・BYTEA・
+UUID・ARRAY・JSON/JSONB・ENUM（Issue #881〜#890）の各追加時点で、本 ADR が定める
+3 段階デコード契約（`row_codec::scan_scalar_columns_validated` の全型網羅・`match` に
+ワイルドカードを置かない設計、`sql::aggregate::ReferencedColumns::derive`・
+`sql::scan::decode_tier_for` の型ごとの分岐を持たない `scalar_mask` 反映）は
+production コードとして既に実装されていた（#892 で集計本体が新型へ対応済み）。
+本 Issue の実体は次の 3 点である。
+
+1. 網羅性・fail-closed 性の確認（新型ごとに個別の「非要求列でも検証を続ける」実装が
+   `row_codec.rs` に揃っていることをコードリーディングで確認済み。ENUM の語彙照合・
+   NUMERIC の precision 検証・ARRAY のフレーム解析・非有限浮動小数の拒否・日時の値域・
+   UTF-8 検証はいずれもマスクの `wanted` に関わらず実行される）
+2. それを固定する回帰テストの追加（新型はほとんど個別追加時のテストが `TEXT` 型を
+   前提にした既存テストのコピーに留まり、tier 選択・全型を含むスキーマでのマスク走査・
+   TABLE-12 の新型版は未検証だった）
+3. `sql::aggregate` の tier 選択インライン `if` 連鎖を `select_decode_tier`
+   （`pub(crate) fn select_decode_tier(referenced: &ReferencedColumns, has_expr_filters:
+   bool) -> DecodeTier`）へ挙動不変で抽出し、単体テストで直接固定できるようにした
+   （production の判定式・分岐順序は抽出前と完全に同一）
+
+### 新型ごとの tier 対応表
+
+| 型 | `COUNT` | `SUM`/`AVG`/`MIN`/`MAX` | 選択される tier（`WHERE`／式なし） |
+| --- | --- | --- | --- |
+| INTEGER/BIGINT/REAL/DOUBLE | ○ | ○ | `DimAndScalar` |
+| BOOLEAN/DATE/TIMESTAMP/ARRAY/BYTEA/JSON/JSONB/ENUM/UUID | ○ | 型により不可（`resolve_aggregate_input` が拒否） | `DimAndScalar` |
+| NUMERIC | ○ | ○ | `DimAndScalar` |
+| （新型を一切参照しない `COUNT(*)`/`COUNT(id)`/`SUM(id)` 等） | - | - | `Fast`（不変） |
+| `VECTOR` 列を参照する式（`ScalarExpr`） | - | - | `Embedding`（不変） |
+
+新型はどれも `Embedding` を要求しない（embedding をデコードしない）契約を維持する。
+
+### 固定したテスト
+
+- `crates/engine/src/sql/aggregate.rs`: `select_decode_tier` の直接構成した
+  `ReferencedColumns` による分岐順序の単体テスト、および新型 `AggregateInput`
+  （`UuidColumn`/`BooleanColumn`/`NumericColumn`/`DateColumn`/`TimestampColumn`/
+  `IntegerColumn`/`BigIntColumn`/`RealColumn`/`DoubleColumn`）を `ReferencedColumns::
+  derive` へ通した経路での `DimAndScalar`・`needs_embedding() == false` の固定、
+  新型を多数持つスキーマでの `COUNT(*)`（`Fast`）・`COUNT(<VECTOR 列>)`
+  （`DimAndScalar`）、TABLE-12（キー/ヘッダ tenant 不一致）が `Fast`／新型列参照の
+  `DimAndScalar` いずれでも `XX000` になること、参照されない新型列（REAL）の
+  メタデータ破損が `COUNT(*)` でも fail-closed に拒否されること
+- `crates/engine/src/sql/group_by.rs`: `TEXT` キー `GROUP BY` ＋新型（UUID）集計での
+  TABLE-12 fail-closed・正しい結果（可視行だけのオラクルと一致）
+- `crates/engine/src/sql/scan.rs`: `decode_tier_for`（純関数）の新型列投影
+  （`DimAndScalar`）・`id` のみ投影（`Fast`）・`VECTOR` 列投影（`Embedding`）
+- `crates/engine/src/row_codec.rs`: 可変長・固定長が交互になる全新型スキーマ
+  （ENUM を除く。後述）での単一ビットマスク総当たり（対象列だけが値化され他は
+  `None`・全 false／全 true マスクの境界）、非要求列でも構造・値域検証を省略しない
+  こと（REAL の NaN・BOOLEAN の未知バイト・NUMERIC の precision 超過・INTEGER の
+  途中打ち切り・全新型スキーマでの末尾余剰バイト）
+- `crates/engine/tests/decode_tier_scalar_types.rs`（新設）: `EngineCore::execute_sql`
+  経由で `COUNT(*)`（Fast）・`COUNT(u)`/`MIN(dt)`/`SUM(i)`（DimAndScalar）・
+  `GROUP BY lang` ＋新型集計・広域取得 `SELECT id, i, u, dt FROM ... LIMIT` が、
+  tenant A/B・NULL 行を混ぜた可視行のみのオラクルと一致し他テナント行を混入させない
+  ことを固定
+
+ENUM は `Storage::create_enum_type`（redb ファイルを要する）を経由しないと
+`EnumTypeDef` を構築できないため、`row_codec.rs` の軽量なユニットテスト（DB ファイル
+不要）の対象からは意図的に外し、既存の `tests/enum_column.rs`（マスク付き走査の
+語彙照合 fail-closed テストを含む）と新設の `tests/decode_tier_scalar_types.rs`
+（`Storage` 経由）で検証する。
+
+### 性能
+
+`select_decode_tier` への抽出はクエリ 1 回あたり 1 回だけ呼ばれる分岐の関数化であり、
+可視行 1 件ごとの行走査ループ（`scan_scalar_columns_validated`・各実行経路の行ループ
+本体）には一切手を入れていないため、構造的に退行の余地がないと判断し本 Issue の
+スコープでは前後比較の実測を必須化しなかった。行ループ自体に変更が入る場合は
+`docs/design/benchmark-judgement-policy.md` の規約に従った実測を必須とする。
+
+### 申し送り
+
+- `row_codec::scalar_refs_as_text`（`pub`・呼び出し元ゼロ・fail-open の危険が doc に
+  明記済み）の削除または非推奨化は公開 API の破壊的変更になるため別 Issue の候補
+- Issue #891（`BoundExpr` への新型スカラー列参照追加）時、`ReferencedColumns::
+  derive`（`ScalarExpr` 項目・`expr_filters`）と `sql::scan::decode_tier_for`
+  （`Computed` 投影・`expr_filters`）は現状 embedding への到達しか見ておらず、式が
+  参照する新型スカラー列も `scalar_mask` へ反映する必要がある（反映しないと
+  値があるのに `None` として評価される fail-open になり得る）
+- `GROUP BY` キー列の新型拡張（現状 `TEXT` に限定）・二次索引経路の新型対応
+  （Issue #893）はいずれも別 Issue の担当
