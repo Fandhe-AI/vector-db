@@ -370,47 +370,8 @@ fn extended_execute_time_error_inside_transaction_fails_with_e_status_at_sync() 
     let (core, _guard) = new_core_with_documents_table();
     let mut stream = spawn_alice(core);
 
-    fn parse_body(name: &str, query: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(name.as_bytes());
-        body.push(0);
-        body.extend_from_slice(query.as_bytes());
-        body.push(0);
-        body.extend_from_slice(&0i16.to_be_bytes());
-        body
-    }
-    fn bind_body(portal: &str, statement: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(portal.as_bytes());
-        body.push(0);
-        body.extend_from_slice(statement.as_bytes());
-        body.push(0);
-        body.extend_from_slice(&0i16.to_be_bytes());
-        body.extend_from_slice(&0i16.to_be_bytes());
-        body.extend_from_slice(&0i16.to_be_bytes());
-        body
-    }
-    fn execute_body(portal: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(portal.as_bytes());
-        body.push(0);
-        body.extend_from_slice(&0i32.to_be_bytes());
-        body
-    }
-    fn read_message(stream: &mut std::net::TcpStream) -> (u8, Vec<u8>) {
-        use std::io::Read;
-        let mut type_byte = [0u8; 1];
-        stream.read_exact(&mut type_byte).expect("read type byte");
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).expect("read length");
-        let len = i32::from_be_bytes(len_buf) as usize;
-        let body_len = len.checked_sub(4).expect("length must be >= 4");
-        let mut body = vec![0u8; body_len];
-        stream.read_exact(&mut body).expect("read body");
-        (type_byte[0], body)
-    }
     fn parse_and_bind(stream: &mut std::net::TcpStream, statement: &str, portal: &str, sql: &str) {
-        send_length_prefixed_message(stream, b'P', &parse_body(statement, sql));
+        send_length_prefixed_message(stream, b'P', &parse_body(statement, sql, 0));
         let (kind, _) = read_message(stream);
         assert_eq!(kind, b'1', "expected ParseComplete");
         send_length_prefixed_message(stream, b'B', &bind_body(portal, statement));
@@ -423,7 +384,7 @@ fn extended_execute_time_error_inside_transaction_fails_with_e_status_at_sync() 
 
     // BEGIN。
     parse_and_bind(&mut stream, "begin1", "pb1", "BEGIN");
-    send_length_prefixed_message(&mut stream, b'E', &execute_body("pb1"));
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pb1", 0));
     let (kind, tag) = read_message(&mut stream);
     assert_eq!(kind, b'C', "expected CommandComplete");
     assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "BEGIN");
@@ -434,7 +395,7 @@ fn extended_execute_time_error_inside_transaction_fails_with_e_status_at_sync() 
     // 台帳照合による `23505` で Execute 段で失敗する。RECOVER-3/TASK-101）。
     let insert = insert_sql(21, "op-943-dup");
     parse_and_bind(&mut stream, "ins1", "pi1", &insert);
-    send_length_prefixed_message(&mut stream, b'E', &execute_body("pi1"));
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pi1", 0));
     let (kind, tag) = read_message(&mut stream);
     assert_eq!(kind, b'C', "expected CommandComplete for first insert");
     assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "INSERT 0 1");
@@ -442,7 +403,7 @@ fn extended_execute_time_error_inside_transaction_fails_with_e_status_at_sync() 
     assert_eq!(read_ready_for_query_status(&mut stream), b'T');
 
     parse_and_bind(&mut stream, "ins2", "pi2", &insert);
-    send_length_prefixed_message(&mut stream, b'E', &execute_body("pi2"));
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pi2", 0));
     let (kind, _) = read_message(&mut stream);
     assert_eq!(
         kind, b'E',
@@ -453,7 +414,7 @@ fn extended_execute_time_error_inside_transaction_fails_with_e_status_at_sync() 
 
     // ROLLBACK の Parse/Bind/Execute → Sync で `'I'` へ戻る。
     parse_and_bind(&mut stream, "rb1", "prb1", "ROLLBACK");
-    send_length_prefixed_message(&mut stream, b'E', &execute_body("prb1"));
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("prb1", 0));
     let (kind, tag) = read_message(&mut stream);
     assert_eq!(kind, b'C', "expected CommandComplete for ROLLBACK");
     assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "ROLLBACK");
@@ -469,59 +430,19 @@ fn extended_execute_time_error_outside_transaction_stays_idle_at_sync() {
     let (core, _guard) = new_core_with_documents_table();
     let mut stream = spawn_alice(core);
 
-    fn parse_body(name: &str, query: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(name.as_bytes());
-        body.push(0);
-        body.extend_from_slice(query.as_bytes());
-        body.push(0);
-        body.extend_from_slice(&0i16.to_be_bytes());
-        body
-    }
-    fn bind_body(portal: &str, statement: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(portal.as_bytes());
-        body.push(0);
-        body.extend_from_slice(statement.as_bytes());
-        body.push(0);
-        body.extend_from_slice(&0i16.to_be_bytes());
-        body.extend_from_slice(&0i16.to_be_bytes());
-        body.extend_from_slice(&0i16.to_be_bytes());
-        body
-    }
-    fn execute_body(portal: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(portal.as_bytes());
-        body.push(0);
-        body.extend_from_slice(&0i32.to_be_bytes());
-        body
-    }
-    fn read_message(stream: &mut std::net::TcpStream) -> (u8, Vec<u8>) {
-        use std::io::Read;
-        let mut type_byte = [0u8; 1];
-        stream.read_exact(&mut type_byte).expect("read type byte");
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).expect("read length");
-        let len = i32::from_be_bytes(len_buf) as usize;
-        let body_len = len.checked_sub(4).expect("length must be >= 4");
-        let mut body = vec![0u8; body_len];
-        stream.read_exact(&mut body).expect("read body");
-        (type_byte[0], body)
-    }
-
     let insert = insert_sql(22, "op-943-outside-dup");
     // 事前に一度 autocommit で投入し、台帳に operation_id を記録させる。
     send_simple_query(&mut stream, &insert);
     assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 
-    send_length_prefixed_message(&mut stream, b'P', &parse_body("dup1", &insert));
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("dup1", &insert, 0));
     let (kind, _) = read_message(&mut stream);
     assert_eq!(kind, b'1', "expected ParseComplete");
     send_length_prefixed_message(&mut stream, b'B', &bind_body("pdup1", "dup1"));
     let (kind, _) = read_message(&mut stream);
     assert_eq!(kind, b'2', "expected BindComplete");
-    send_length_prefixed_message(&mut stream, b'E', &execute_body("pdup1"));
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pdup1", 0));
     let (kind, _) = read_message(&mut stream);
     assert_eq!(
         kind, b'E',

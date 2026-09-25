@@ -325,16 +325,6 @@ fn seed_arbitrary_table_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
     (path, guard)
 }
 
-/// `seed_three_tenant_db` と同じ Public 3 行（`embedding`/`lang`/`body`）に加え、
-/// tenant-a の Private 行（id=11, lang="xx"）・tenant-b の Private 行
-/// （id=12, lang="ja"）を投入した一時 DB を用意する（TASK-168・SQL-13/14）。
-/// wire 認証経路の `PolicyContext` は `Public` ＋ 自テナントの `Private` を
-/// 許可可視性とする（RLS-11・TASK-195。read-your-writes）ため、tenant-a の
-/// 接続では id=11 が、tenant-b の接続では id=12 が集計・GROUP BY の対象に
-/// 含まれる。他テナントの `Private` 行は引き続きどの接続からも不可視
-/// （carol は Private 行を持たないため元の集計結果のまま不変）。既存
-/// C1〜C4 テストの seed（`seed_three_tenant_db`）はこの関数の追加では
-/// 変更しない。
 /// `documents`（`VECTOR` 列を持つ書き込み対象）と `notes`（未書き込みの別
 /// テーブル）の 2 テーブルを持つ一時 DB を用意する（Issue #943・WIRE-19。
 /// 明示トランザクション内で「直前に書き込んだテーブル自身は読めない」
@@ -583,6 +573,16 @@ fn three_clients_observe_transaction_status_transitions() {
     }
 }
 
+/// `seed_three_tenant_db` と同じ Public 3 行（`embedding`/`lang`/`body`）に加え、
+/// tenant-a の Private 行（id=11, lang="xx"）・tenant-b の Private 行
+/// （id=12, lang="ja"）を投入した一時 DB を用意する（TASK-168・SQL-13/14）。
+/// wire 認証経路の `PolicyContext` は `Public` ＋ 自テナントの `Private` を
+/// 許可可視性とする（RLS-11・TASK-195。read-your-writes）ため、tenant-a の
+/// 接続では id=11 が、tenant-b の接続では id=12 が集計・GROUP BY の対象に
+/// 含まれる。他テナントの `Private` 行は引き続きどの接続からも不可視
+/// （carol は Private 行を持たないため元の集計結果のまま不変）。既存
+/// C1〜C4 テストの seed（`seed_three_tenant_db`）はこの関数の追加では
+/// 変更しない。
 fn seed_aggregate_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("three-client-e2e-aggregate-docs");
     let guard = temp_db::CleanupGuard(path.clone());

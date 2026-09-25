@@ -50,48 +50,6 @@ fn new_core_with_documents_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (core, guard)
 }
 
-fn parse_body(name: &str, query: &str, num_param_types: i16) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(name.as_bytes());
-    body.push(0);
-    body.extend_from_slice(query.as_bytes());
-    body.push(0);
-    body.extend_from_slice(&num_param_types.to_be_bytes());
-    body
-}
-
-fn bind_body(portal: &str, statement: &str) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(portal.as_bytes());
-    body.push(0);
-    body.extend_from_slice(statement.as_bytes());
-    body.push(0);
-    body.extend_from_slice(&0i16.to_be_bytes()); // param format code count
-    body.extend_from_slice(&0i16.to_be_bytes()); // param count
-    body.extend_from_slice(&0i16.to_be_bytes()); // result format code count
-    body
-}
-
-fn execute_body(portal: &str, max_rows: i32) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(portal.as_bytes());
-    body.push(0);
-    body.extend_from_slice(&max_rows.to_be_bytes());
-    body
-}
-
-fn read_message(stream: &mut std::net::TcpStream) -> (u8, Vec<u8>) {
-    let mut type_byte = [0u8; 1];
-    stream.read_exact(&mut type_byte).expect("read type byte");
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).expect("read length");
-    let len = i32::from_be_bytes(len_buf) as usize;
-    let body_len = len.checked_sub(4).expect("length must be >= 4");
-    let mut body = vec![0u8; body_len];
-    stream.read_exact(&mut body).expect("read body");
-    (type_byte[0], body)
-}
-
 fn send_sync(stream: &mut std::net::TcpStream) {
     send_length_prefixed_message(stream, b'S', b"");
 }
