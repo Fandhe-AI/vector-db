@@ -3451,6 +3451,16 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     };
 
     let mut found = false;
+    // v5 の「DEFAULT 0 件のカタログを拒否する」不変条件（`decode_schema_body`
+    // 側。TABLE-16・TASK-204、Issue #904）をこの軽量パーサーでも敷く
+    // （codex-review P1 指摘・Issue #904・PR #1051: v5 分岐が `default`
+    // フィールドの存在確認のみで内容を検証しないと、DEFAULT を 1 件も
+    // 持たない・不正なタグ／16 進文字列／型不一致の default を持つ壊れた
+    // v5 カタログでも ENUM 参照だけを見て「依存なし」に丸められ、
+    // `decode_schema_body` が `CorruptSchema` で拒否するはずの値に対して
+    // `DROP TYPE`／`ALTER TYPE` の fail-closed 依存関係検査だけがすり抜けて
+    // しまう）。
+    let mut seen_default = false;
     let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for _ in 0..col_count {
         let line = lines.next().ok_or_else(|| {
@@ -3494,13 +3504,33 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
             true
         };
         // v5 の 6 番目フィールドは `default`。この軽量パーサーは依存判定に
-        // 値を使わないため存在確認のみ行い、内容の検証は `decode_schema_body`
-        // に委ねる（存在しなければ他のフィールド数不整合と同じく
-        // `CorruptSchema` で拒否する）。
-        if has_default_field && fields.next().is_none() {
-            return Err(CatalogError::CorruptSchema(format!(
-                "malformed column line: {line:?}"
-            )));
+        // 値を直接使わないが、`decode_schema_body` と同じ fail-closed 方針を
+        // 徹底するため内容も検証する（codex-review P1 指摘・Issue #904・
+        // PR #1051）: 墓標（`is_live == false`）は必ず `-`、生存列は
+        // `ColumnDefault::decode_catalog_field`（未知タグ・不正 16 進・不正
+        // UTF-8 を拒否する既存デコーダ）でデコードしたうえ、列の型タグと
+        // 大分類が整合すること（`ColumnDefault::compatible_with` の判定基準を
+        // タグ文字列ベースで再現）を確認する。
+        if has_default_field {
+            let default_field = fields.next().ok_or_else(|| {
+                CatalogError::CorruptSchema(format!("malformed column line: {line:?}"))
+            })?;
+            if is_live {
+                let decoded = ColumnDefault::decode_catalog_field(default_field)
+                    .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+                if let Some(default) = decoded {
+                    if !column_default_compatible_with_tag(&default, tag) {
+                        return Err(CatalogError::CorruptSchema(format!(
+                            "column {name:?} has a DEFAULT that is not compatible with its type"
+                        )));
+                    }
+                    seen_default = true;
+                }
+            } else if default_field != "-" {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "dropped column {name:?} must not declare a DEFAULT"
+                )));
+            }
         }
         if fields.next().is_some() {
             return Err(CatalogError::CorruptSchema(format!(
@@ -3557,7 +3587,34 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         }
     }
 
+    // v5 なのに DEFAULT 0 件は形式の一意性に反する（`decode_schema_body` と
+    // 同じ不変条件。TABLE-16・TASK-204、Issue #904）。ここで拒否しないと、
+    // この不変条件に違反する壊れた v5 カタログが本関数だけ「依存なし」を
+    // 返し続ける（codex-review P1 指摘・Issue #904・PR #1051）。
+    if has_default_field && !seen_default {
+        return Err(CatalogError::CorruptSchema(
+            "v5 catalog format requires at least one column with a DEFAULT".to_string(),
+        ));
+    }
+
     Ok(found)
+}
+
+/// [`catalog_value_references_enum_type`] が `default` フィールドの内容検証に
+/// 使う軽量な型整合判定。`ColumnDefault::compatible_with` と同じ大分類の
+/// 組み合わせを、完全な `ColumnType` を構築せず列タグ文字列（`catalog_fields`
+/// が生成する型タグ。TABLE-16 D2）だけで再現する（ENUM 解決・数値パラメータの
+/// パースを要しない軽量パーサーとしての設計を維持するため）。
+fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> bool {
+    matches!(
+        (default, tag),
+        (ColumnDefault::Text(_), "text")
+            | (
+                ColumnDefault::Number(_),
+                "integer" | "bigint" | "real" | "double" | "numeric"
+            )
+            | (ColumnDefault::Bool(_), "boolean")
+    )
 }
 
 /// ENUM 型 `type_name` を参照する列を持つテーブル名の一覧を列挙する
@@ -4344,6 +4401,133 @@ mod tests {
         assert!(
             matches!(err, CatalogError::CorruptSchema(_)),
             "drop_enum_type must fail-closed on a v4 pk line with a duplicate column, got: {err:?}"
+        );
+
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// `catalog_value_references_enum_type` は v5 カタログの `default`
+    /// フィールドが「フィールドの存在」だけでなく内容（未知タグ）も検証しな
+    /// ければならない（codex-review P1 指摘・Issue #904・PR #1051）。値検証を
+    /// 欠くと、`decode_schema_body`（`ColumnDefault::decode_catalog_field`）
+    /// なら拒否する未知タグの破損 default を「依存なし」に丸めてしまう
+    /// （このテーブルは対象 ENUM 型を参照しないため、値検証が無いと素通り
+    /// してしまう点が v3/v4 の既存回帰テストと同じ構図）。
+    #[test]
+    fn drop_enum_type_rejects_v5_catalog_value_with_unknown_default_tag() {
+        let path = unique_db_path("catalog-drop-enum-v5-bad-default-tag");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        // v5 形式。ENUM 参照列は持たず、`default` フィールドに
+        // `ColumnDefault::decode_catalog_field` が拒否する未知タグ `z` を置く。
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V5}\ncols:1\npk:\ncode:text:-:0:L:zff\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on an unknown v5 DEFAULT tag, got: {err:?}"
+        );
+
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// 上と対の検証: `default` フィールドのデコード自体は成功しても、列の型
+    /// タグと大分類が一致しない（`integer` 列に `TEXT` の DEFAULT）場合も
+    /// `validate_schema`（`ColumnDefault::compatible_with`）と同じく拒否する
+    /// （codex-review P1 指摘・Issue #904・PR #1051）。
+    #[test]
+    fn drop_enum_type_rejects_v5_catalog_value_with_type_incompatible_default() {
+        let path = unique_db_path("catalog-drop-enum-v5-bad-default-type");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        // `s6a61` は `ColumnDefault::Text("ja")` に正しくデコードできるが、
+        // 列の型タグは `integer`（数値のみ許容）のため型不一致となる。
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V5}\ncols:1\npk:\ncount:integer:-:0:L:s6a61\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on a type-incompatible v5 DEFAULT, got: {err:?}"
+        );
+
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// 上と対の検証: v5 カタログなのに `DEFAULT` を宣言する列が 1 つも無い
+    /// （全列 `default` が `-`）場合も、`decode_schema_body` の「v5 は
+    /// DEFAULT 0 件を許容しない」不変条件と同じく拒否する（codex-review P1
+    /// 指摘・Issue #904・PR #1051）。
+    #[test]
+    fn drop_enum_type_rejects_v5_catalog_value_with_zero_defaults() {
+        let path = unique_db_path("catalog-drop-enum-v5-zero-default");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V5}\ncols:1\npk:\ncode:text:-:0:L:-\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on a v5 catalog value with zero DEFAULTs, got: {err:?}"
         );
 
         storage
