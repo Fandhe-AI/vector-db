@@ -3463,12 +3463,15 @@ pub(crate) fn validate_insert_tokens(
 /// という文脈でのみキーワードとして判定する」方針）に一致するかを判定する
 /// （SQL-23・TASK-202、Issue #899）。`core.rs::EngineCore::parse_tokens` が
 /// [`validate_create_table_tokens`]（構造検証のみ・カタログ照会なし）へ分岐
-/// するために使う。DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）は
-/// `DROP TABLE` と同じく `execute_parsed_in_session` の `ParsedSql::CreateTable`
-/// 分岐が、カタログ照会を含む実行本体より前に適用する——未許可の主体は構文が
-/// 正しいか・テーブルが存在するかに関わらず同じ `InsufficientPrivilege`
-/// （`42501`）のみを受け取り、それらの情報を一切観測できない（fail-closed。
-/// `sql::ddl` モジュールドキュメント参照）。
+/// するために使う。`parse_tokens` は本関数（構造検証のみ・カタログ照会なし）を
+/// DDL 実行権限ゲートより先に実行するため、不正な構文は権限の有無に関わらず
+/// 常に構文エラー（`42601`）になる。DDL 実行権限ゲート
+/// （`sql::ddl::require_ddl_permission`）は `DROP TABLE` と同じく
+/// `execute_parsed_in_session` の `ParsedSql::CreateTable` 分岐が、カタログ照会を
+/// 含む実行本体より前に適用する——構文検証を通過した文に限り、未許可の主体は
+/// テーブルが存在するかに関わらず同じ `InsufficientPrivilege`（`42501`）のみを
+/// 受け取り、その情報を一切観測できない（fail-closed。`sql::ddl` モジュール
+/// ドキュメント参照）。
 pub(crate) fn is_create_table_statement(tokens: &[Token]) -> bool {
     matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"))
         && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("TABLE"))

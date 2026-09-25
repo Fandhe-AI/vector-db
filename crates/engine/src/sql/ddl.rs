@@ -85,7 +85,13 @@ pub(crate) fn execute_create_table(
         | CatalogError::TableGenerationCounterOverflow
         | CatalogError::TypeNotFound(_)
         | CatalogError::TypeAlreadyExists(_)
-        | CatalogError::DependentObjectsStillExist(_) => SqlSurfaceError::Internal {
+        | CatalogError::DependentObjectsStillExist(_)
+        // `ColumnNotFound`／`ProtectedColumn`／`IncompatibleTypeChange` は
+        // `ALTER TABLE`（Issue #901・`Storage::alter_table_drop_column` 等）
+        // 専用の変種で、`Storage::create_table` からは返らない（到達不能）。
+        | CatalogError::ColumnNotFound(_)
+        | CatalogError::ProtectedColumn(_)
+        | CatalogError::IncompatibleTypeChange { .. } => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     })?;
