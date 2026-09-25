@@ -16,8 +16,11 @@
 //! `PolicyContext` を使う既存の実行経路でしか評価されないため、作成者の
 //! 可視性が参照者へ引き継がれることは構造的に起こらない。
 
-use super::allowlist::{parse_view_body, Projection, SqlSurfaceError, TableLookup, WherePredicate};
+use super::allowlist::{
+    parse_view_body, Projection, SelectItem, SqlSurfaceError, TableLookup, WherePredicate,
+};
 use crate::catalog::{ViewDef, MAX_VIEW_NESTING_DEPTH};
+use crate::sql::udf_call::Expr;
 
 /// FROM に指定された名前の解決結果。
 pub(crate) enum Resolved {
@@ -159,6 +162,15 @@ fn corrupt_view_error_fn() -> SqlSurfaceError {
 /// テーブルの束縛段がそのまま列存在を検査する）。範囲外の列参照は
 /// `SqlSurfaceError::InvalidInput`（`22000`。既存の「未知の列」束縛エラーと
 /// 同じ分類）。
+///
+/// `Projection::Items`（TASK-79・SQL-9 の式項目）・`WherePredicate::Expression`
+/// （同）は列参照を式木の内側に持つため、[`expr_columns_within`] で式木を
+/// 再帰的に走査し、含まれるすべての列参照（`Expr::Ident`）を検査する
+/// （codex-review 指摘・PR #1048: 単純な `column` フィールドしか見ない旧実装は
+/// `SELECT body || '' FROM v` や式述語経由でビューの非公開列を素通しにしていた。
+/// RLS 境界そのものには影響しない――基底テーブルへ書き換え済みの式は RLS 判定を
+/// 経由する既存経路でそのまま評価される――が、ビューが宣言した列スコープ契約が
+/// 破れていたため、他の形と同じ扱いへ揃える）。
 pub(crate) fn check_columns_within_view(
     view_columns: Option<&[String]>,
     projection: &Projection,
@@ -168,7 +180,7 @@ pub(crate) fn check_columns_within_view(
         return Ok(());
     };
     match projection {
-        Projection::All | Projection::Items(_) => {}
+        Projection::All => {}
         Projection::Columns(cols) => {
             for c in cols {
                 if !columns.iter().any(|vc| vc == c) {
@@ -178,25 +190,72 @@ pub(crate) fn check_columns_within_view(
                 }
             }
         }
+        Projection::Items(items) => {
+            for item in items {
+                match item {
+                    SelectItem::Column(c) => {
+                        if !columns.iter().any(|vc| vc == c) {
+                            return Err(SqlSurfaceError::InvalidInput {
+                                detail: format!("unknown column: {c}"),
+                            });
+                        }
+                    }
+                    SelectItem::Expr { expr, .. } => expr_columns_within(columns, expr)?,
+                }
+            }
+        }
     }
     for pred in where_predicates {
-        if let Some(c) = predicate_column(pred) {
-            if !columns.iter().any(|vc| vc == c) {
-                return Err(SqlSurfaceError::InvalidInput {
-                    detail: format!("unknown column: {c}"),
-                });
+        match pred {
+            WherePredicate::Expression(expr) => expr_columns_within(columns, expr)?,
+            _ => {
+                if let Some(c) = predicate_column(pred) {
+                    if !columns.iter().any(|vc| vc == c) {
+                        return Err(SqlSurfaceError::InvalidInput {
+                            detail: format!("unknown column: {c}"),
+                        });
+                    }
+                }
             }
         }
     }
     Ok(())
 }
 
-/// 単純な `column` フィールドを持つ述語からその列名を取り出す。`PredicateCall`・
-/// `Expression`（UDF・式ベース）はビュー越しの列スコープ検査の対象外
-/// （§対象外「複雑な述語のビュー越しスコープ検査」。RLS 境界には影響しない——
-/// 基底テーブルへ書き換え済みの述語は RLS 判定を経由する既存経路でそのまま
-/// 評価されるため、ここでの検査は「ビューが宣言した列だけに絞る」という
-/// 利便性のためのものであり、安全性の境界ではない）。
+/// 式木（[`Expr`]）が参照する列（[`Expr::Ident`]）をすべて再帰的に検査し、
+/// `columns`（ビューが公開する列集合）に含まれない列参照があれば
+/// `SqlSurfaceError::InvalidInput` で拒否する（[`check_columns_within_view`] の
+/// 式項目・式述語向け実装）。`Expr::Number` は列参照を持たず、`Expr::Call`・
+/// `Expr::Binary` は子孫を再帰的に辿る。
+fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurfaceError> {
+    match expr {
+        Expr::Number(_) => Ok(()),
+        Expr::Ident(name) => {
+            if columns.iter().any(|vc| vc == name) {
+                Ok(())
+            } else {
+                Err(SqlSurfaceError::InvalidInput {
+                    detail: format!("unknown column: {name}"),
+                })
+            }
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                expr_columns_within(columns, arg)?;
+            }
+            Ok(())
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_columns_within(columns, lhs)?;
+            expr_columns_within(columns, rhs)
+        }
+    }
+}
+
+/// 単純な `column` フィールドを持つ述語からその列名を取り出す。`PredicateCall`は
+/// 名前だけの述語呼び出し形（列参照を持たない）のため対象外。`Expression`
+/// （式ベース）は呼び出し元（[`check_columns_within_view`]）が
+/// [`expr_columns_within`] で個別に検査するためここには渡らない。
 fn predicate_column(pred: &WherePredicate) -> Option<&str> {
     match pred {
         WherePredicate::Equality { column, .. } => Some(column),

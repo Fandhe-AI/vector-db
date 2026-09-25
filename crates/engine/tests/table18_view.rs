@@ -313,6 +313,66 @@ fn view_column_scope_rejects_unknown_column() {
     assert_eq!(err.wire_code(), "22000");
 }
 
+/// ビュー越しの列スコープ検査は式項目（TASK-79・SQL-9 の `SelectItem::Expr`）が
+/// 隠れた列を参照する場合も適用される（codex-review 指摘・PR #1048）。
+/// `id_only` は `id` のみを公開するが、`vec_norm(embedding)` は `embedding`
+/// （非公開の `VECTOR` 列）を式の内側で参照するため、単純な `column` フィールド
+/// だけを見る旧実装では素通りしていた。
+#[test]
+fn view_column_scope_rejects_expr_item_referencing_hidden_column() {
+    let path = unique_db_path("view-column-scope-expr-item");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_base_fixture(&storage);
+    let core = new_core(storage);
+    let mut session = allowed_session();
+
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW id_only AS SELECT id FROM docs WHERE lang = 'ja'",
+    )
+    .expect("create view");
+
+    let err = scan(
+        &core,
+        "alice",
+        "SELECT vec_norm(embedding) FROM id_only LIMIT 10",
+    )
+    .expect_err("embedding is not exposed by id_only, even inside an expression item");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+/// ビュー越しの列スコープ検査は式述語（`WherePredicate::Expression`）が隠れた
+/// 列を参照する場合も適用される（codex-review 指摘・PR #1048。上記テストの
+/// `WHERE` 版）。
+#[test]
+fn view_column_scope_rejects_expression_predicate_referencing_hidden_column() {
+    let path = unique_db_path("view-column-scope-expr-where");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_base_fixture(&storage);
+    let core = new_core(storage);
+    let mut session = allowed_session();
+
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW id_only AS SELECT id FROM docs WHERE lang = 'ja'",
+    )
+    .expect("create view");
+
+    let err = scan(
+        &core,
+        "alice",
+        "SELECT id FROM id_only WHERE vec_norm(embedding) > 0 LIMIT 10",
+    )
+    .expect_err("embedding is not exposed by id_only, even inside a WHERE expression predicate");
+    assert_eq!(err.wire_code(), "22000");
+}
+
 /// ネストしたビューの列スコープ検査（レビュー指摘対応）: 内側ビューが列を
 /// 絞り込んでいる場合、外側ビューが `SELECT *` で内側ビューを参照しても
 /// その制限を引き継ぐ。`resolve_from` が連鎖の最も外側の射影だけを記録して

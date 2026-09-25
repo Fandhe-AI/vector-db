@@ -108,8 +108,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // TASK-205（Issue #909。`VIEWS_TABLE`・`Storage::create_view`／`drop_view`
     // 追加）で `catalog.rs` に行が追加され、以下の行番号がさらに移動したための
     // 追随（旧: 2217）。本 PR（#909）の base（main）取り込みマージ（Issue #901
-    // 系変更との統合）で再度追随。
-    ("catalog.rs", 2487),
+    // 系変更との統合）で再度追随（旧: 2487）。PR #1048 レビュー対応
+    // （`Storage::create_view` の `body_sql`／`base_relation` 自己検証追加、
+    // codex-review 指摘）で `catalog.rs` 冒頭側にさらに行が追加され、
+    // 再度追随。
+    ("catalog.rs", 2522),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -120,17 +123,20 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 追随（旧: 2256）。Issue #995 の base 取り込みマージでさらに追随
     // （旧: 2263）。TABLE-18・SQL-23・TASK-205（Issue #909）の行追加で
     // さらに追随（旧: 2296）。本 PR（#909）の base（main）取り込みマージ
-    // （Issue #901 系変更との統合）で再度追随。
-    ("catalog.rs", 2566),
+    // （Issue #901 系変更との統合）で再度追随（旧: 2566）。PR #1048 レビュー
+    // 対応（同上）で再度追随。
+    ("catalog.rs", 2601),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
-    // テーブルが存在せずバンプ対象がない）。
-    ("catalog.rs", 2627),
+    // テーブルが存在せずバンプ対象がない）。PR #1048 レビュー対応（同上）で
+    // 再度追随（旧: 2627）。
+    ("catalog.rs", 2678),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
-    // 書く。同じ理由でバンプ対象がない。
-    ("catalog.rs", 2655),
+    // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
+    // 再度追随（旧: 2655）。
+    ("catalog.rs", 2706),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

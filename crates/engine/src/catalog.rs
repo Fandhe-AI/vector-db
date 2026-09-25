@@ -34,7 +34,7 @@ use std::sync::Arc;
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::row_codec::{self, Value as RowCodecValue};
-use crate::sql::allowlist::{SqlSurfaceError, TableLookup};
+use crate::sql::allowlist::{parse_view_body, SqlSurfaceError, TableLookup};
 use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError, Visibility};
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
@@ -1022,6 +1022,41 @@ fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
         base_relation,
         body_sql,
     })
+}
+
+/// [`Storage::create_view`] が保存前に行う `body_sql` の自己検証（codex-review
+/// 指摘・PR #1048）。`sql::allowlist::parse_view_body`（`CREATE VIEW` 構文検証・
+/// `sql::view::resolve_from` の格納値再検証と同一実装。第 2 のパーサーを
+/// 作らない）で `body_sql` を再トークン化・再パースし、(1) 許可リスト形状
+/// （`SELECT <* | 列名> FROM <relation> [WHERE <単純述語>]`。式項目・UDF 述語は
+/// `42601` 相当として拒否）を満たすこと、(2) パース結果が示す `FROM` の参照先が
+/// 呼び出し元の主張する `base_relation` と一致することを検証する。
+///
+/// `sql::allowlist::validate_create_view_tokens` を経由する正規の SQL 表層経路
+/// では `body_sql` は常に `render_view_body(parsed)`（`parsed.table_name ==
+/// base_relation`）として構築されるためこの検証は常に通るが、それ以外の
+/// `pub fn create_view` 呼び出し元（本メソッドは engine の公開 Rust API）が
+/// 独自に組み立てた `body_sql`／`base_relation` の組を渡した場合、両者が
+/// 食い違う定義や許可リスト外の形状が永続化されてしまうと、参照時
+/// （`sql::view::resolve_from`）の列スコープ検査
+/// （`sql::view::check_columns_within_view`）が「`body_sql` の投影は
+/// `base_relation` に対して検証済み」という前提の上に成り立たなくなる
+/// （テナント境界そのものは崩さないが、ビューが宣言する列公開契約が破れる）。
+fn validate_view_body_matches_base_relation(body_sql: &str, base_relation: &str) -> Result<()> {
+    let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| {
+        CatalogError::Invalid("view body is not valid SQL for a view definition".to_string())
+    })?;
+    let parsed = parse_view_body(&tokens).map_err(|_| {
+        CatalogError::Invalid(
+            "view body does not match the allowed view definition shape".to_string(),
+        )
+    })?;
+    if parsed.table_name != base_relation {
+        return Err(CatalogError::Invalid(
+            "view body FROM target does not match base_relation".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// `start` から始めてテーブルへ到達するまでの参照段数（テーブル自身が深さ 0、
@@ -2572,7 +2607,22 @@ impl Storage {
     /// `base_relation`・`body_sql` を渡す（カタログ照会自体はここで初めて行う。
     /// 構文検証段はカタログを一切照会しない契約）。
     ///
-    /// 判定順序（同一 write txn 内。TOCTOU 回避）: 名前空間の衝突
+    /// `body_sql` はこのメソッド自身も [`parse_view_body`]（`CREATE VIEW` 構文
+    /// 検証・`sql::view::resolve_from` の再検証と同一実装）で再検証し、`FROM`
+    /// が指す名前が `base_relation` と一致することを保存前に確認する
+    /// （codex-review 指摘・PR #1048: 本メソッドは `pub fn` の Rust API であり、
+    /// SQL 表層の `validate_create_view_tokens`〔`body_sql` を必ず
+    /// `render_view_body(parsed)` として `base_relation` と対応づけて生成する〕
+    /// を経由しない呼び出し元が、`body_sql` の実際の `FROM` と食い違う
+    /// `base_relation`・許可リスト外の形状〔式項目・UDF 述語〕を持つ定義を
+    /// そのまま永続化できてしまっていた。`sql::view::resolve_from` は列公開
+    /// 判定を `body_sql` の投影から、連鎖の探索先を `base_relation` から
+    /// それぞれ独立に読むため、この食い違いは「`body_sql` が宣言する列は
+    /// 実際には別の関係に対して検証されたものではない」という列スコープ契約
+    /// 〔`sql::view::check_columns_within_view`〕の前提を静かに破る）。
+    ///
+    /// 判定順序（同一 write txn 内。TOCTOU 回避）: `body_sql` の構文・
+    /// 参照先一致検証（`Err(Invalid)`）→ 名前空間の衝突
     /// （[`CATALOG_TABLE`]／[`VIEWS_TABLE`] のいずれか。`Err(TableAlreadyExists)`）
     /// → 参照先の存在・ネスト深さ（[`resolve_reference_depth_in_txn`]。参照先
     /// 不存在は `Err(TableNotFound)`、深さ超過は `Err(ViewLimitExceeded)`）→
@@ -2590,6 +2640,7 @@ impl Storage {
                 "view body too large".to_string(),
             ));
         }
+        validate_view_body_matches_base_relation(body_sql, base_relation)?;
         let encoded = encode_view_def(&ViewDef {
             base_relation: base_relation.to_string(),
             body_sql: body_sql.to_string(),
@@ -4871,6 +4922,68 @@ mod tests {
                 scale: 2
             },
             "rejected ALTER COLUMN TYPE must not mutate the catalog"
+        );
+    }
+
+    /// [`Storage::create_view`] は `pub fn` の Rust API であり、SQL 表層の
+    /// `validate_create_view_tokens`（`body_sql` を必ず `base_relation` と
+    /// 対応づけて生成する）を経由しない呼び出し元も存在しうる（codex-review
+    /// 指摘・PR #1048）。`body_sql` の `FROM` が主張する参照先と `base_relation`
+    /// 引数が食い違う場合は `CatalogError::Invalid` で拒否し、何も永続化しない。
+    #[test]
+    fn create_view_rejects_body_sql_from_target_mismatching_base_relation() {
+        let path = unique_db_path("create-view-mismatched-base-relation");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table docs");
+        storage
+            .create_table(&TableSchema::new(
+                "other",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table other");
+
+        // `base_relation` は "docs" だが、`body_sql` 自身の FROM は "other" を
+        // 指す。SQL 表層経由（`render_view_body`）では構造的に発生しない食い違い。
+        let err = storage
+            .create_view("v", "docs", "SELECT id FROM other")
+            .expect_err("body_sql FROM target must match base_relation");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert!(
+            storage.view_definition("v").expect("view lookup").is_none(),
+            "mismatched view definition must not be persisted"
+        );
+    }
+
+    /// [`Storage::create_view`] は `body_sql` が許可リスト形状（式項目・UDF
+    /// 述語を含まない `SELECT <* | 列名> FROM <relation> [WHERE <単純述語>]`）
+    /// を満たさない場合も `CatalogError::Invalid` で拒否する（同上。`sql::view::
+    /// resolve_from` が再パースする際に想定していない構文が紛れ込むのを
+    /// 保存前に防ぐ）。
+    #[test]
+    fn create_view_rejects_body_sql_outside_allowed_shape() {
+        let path = unique_db_path("create-view-disallowed-shape");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table docs");
+
+        let err = storage
+            .create_view("v", "docs", "SELECT vec_norm(embedding) FROM docs")
+            .expect_err("expression projection items are outside the allowed view body shape");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert!(
+            storage.view_definition("v").expect("view lookup").is_none(),
+            "invalid view definition must not be persisted"
         );
     }
 }
