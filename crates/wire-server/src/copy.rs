@@ -121,13 +121,20 @@ fn enforce_discard_budget(
 /// ErrorResponse を書いてから ReadyForQuery を書く
 /// （`simple_query::respond_error_and_ready` と同じ契約。COPY サブプロトコル
 /// のエラーも接続を維持する簡易クエリの一部であり、切断はしない）。
+/// `ReadyForQuery` の状態バイトは常に `Idle` を渡す ―― `handshake::
+/// post_auth_loop` は明示トランザクションが `Idle` の場合に限り本モジュール
+/// （`crate::copy::run`）へ委譲するため（SQL-31・TASK-221。`Active`／`Failed`
+/// 中の COPY は本モジュールへ到達する前に `0A000`／`25P02` で拒否される）。
 fn respond_error_and_ready(
     stream: &mut TcpStream,
     class: ErrorClass,
     message: &str,
 ) -> io::Result<()> {
     crate::handshake::write_error_response_io(stream, class, message)?;
-    crate::handshake::write_ready_for_query_io(stream)
+    crate::handshake::write_ready_for_query_io(
+        stream,
+        engine::sql::transaction::TransactionStatus::Idle,
+    )
 }
 
 fn respond_sql_error(stream: &mut TcpStream, e: &SqlSurfaceError) -> io::Result<()> {
@@ -322,7 +329,12 @@ fn run_copy_to(stream: &mut TcpStream, format: CopyFormat, result: &QueryResult)
     match result_encoder::encode_command_complete(&tag) {
         Ok(msg) => {
             buffer.push_frame(stream, &msg)?;
-            buffer.push_frame(stream, &result_encoder::encode_ready_for_query())?;
+            buffer.push_frame(
+                stream,
+                &result_encoder::encode_ready_for_query(
+                    engine::sql::transaction::TransactionStatus::Idle,
+                ),
+            )?;
             buffer.flush(stream)
         }
         Err(_) => {
@@ -571,7 +583,10 @@ fn finish_copy_from(
             )) {
                 Ok(msg) => {
                     stream.write_all(&msg)?;
-                    crate::handshake::write_ready_for_query_io(stream)
+                    crate::handshake::write_ready_for_query_io(
+                        stream,
+                        engine::sql::transaction::TransactionStatus::Idle,
+                    )
                 }
                 Err(_) => respond_error_and_ready(
                     stream,

@@ -68,7 +68,10 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::Delete(_)
         | SqlOutcome::Update(_)
         | SqlOutcome::CreateTable(_)
-        | SqlOutcome::DropTable(_) => None,
+        | SqlOutcome::DropTable(_)
+        | SqlOutcome::Begin
+        | SqlOutcome::Commit
+        | SqlOutcome::Rollback => None,
     };
 
     assert_eq!(

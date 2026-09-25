@@ -3,8 +3,9 @@
 ## ステータス
 
 Implemented（本 Issue の範囲。`$n` パラメータ束縛・型 OID 推論は
-WIRE-12・#935、暗黙トランザクションブロックは #942・RECOVER-12・SQL-31、
-ReadyForQuery の状態バイトは #943・WIRE-19 の担当のまま）。結果 format
+WIRE-12・#935、暗黙トランザクションブロックは #942・RECOVER-12・SQL-31。
+ReadyForQuery の状態バイト（#943・WIRE-19）は PR #1041 レビュー指摘対応で
+Sync（`extended_query::handle_sync`）へ結線済み）。結果 format
 code のバイナリエンコード（WIRE-14・#936・PR #998）は本 Issue でマージ後に
 結線済み——「対象ファイル」「スコープ外・申し送り」節参照。
 
@@ -55,8 +56,9 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
   Terminate が「エラー後」という条件だけで正規の Terminate として受理されて
   しまう）。
 - Sync 到達で `ignore_till_sync` を解除し、名前付き・無名を問わず全 portal
-  を破棄してから `ReadyForQuery`（状態バイトは当面 `'I'` 固定。#943 で
-  置換）を返す。
+  を破棄してから `ReadyForQuery`（状態バイトは `SessionTransaction::status()`
+  から `'I'`／`'T'`／`'E'` へ写像。WIRE-19・#943・PR #1041 レビュー指摘対応で
+  結線済み）を返す。
 
 ## portal のライフサイクル
 
@@ -263,7 +265,6 @@ panic すると緊急応答〔TASK-97・RECOVER-6〕が発火しない fail-open
   （パラメータ format code は 0 以外を一律 `0A000` で拒否し続ける）。
 - 暗黙トランザクションブロック（Sync までの複数 Execute を 1 トランザクショ
   ンにまとめる挙動。#942・RECOVER-12・SQL-31）。
-- ReadyForQuery の状態バイト（#943・WIRE-19）。
 - CancelRequest。
 - パラメータ付きクエリを含む実クライアント（psycopg 3／node pg／psql）での
   拡張プロトコル層 B 検証は #935 以降。パラメータなしのシナリオは本 Issue
