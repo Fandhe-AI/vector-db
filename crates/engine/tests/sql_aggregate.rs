@@ -656,15 +656,10 @@ fn sql13_aggregate_over_declared_udf_call() {
 
 // --- VECTOR 列を持たないテーブルでも集計できる ------------------------------------
 //
-// 既存の行挿入経路（SQL `INSERT`・`EngineCore::insert_row`・`tenant::insert_typed_row`
-// はいずれも `TableSchema::validate_embedding_dim` を介して `VECTOR` 列の存在を必須と
-// する（対象ビヘイビア外の既存制約。TASK-166 のスコープ外）ため、`VECTOR` 列を
-// 持たないテーブルへ行を書き込む公開経路は本リポジトリに現状存在しない。
 // `sql::aggregate::execute_aggregate` 自体は `VECTOR` 列の有無を前提にしない設計
-// （モジュールドキュメント参照）だが、非空コーパスでの実地検証は行挿入経路が
-// 追加されるまで不可能なため、ここでは「行が 1 件もない `VECTOR` 列なしテーブル」
-// でも空集合契約どおり応答することのみ検証する（`open_table` の
-// `TableDoesNotExist` 分岐と `schema.vector_dim() == None` 分岐の両方を通す）。
+// （モジュールドキュメント参照）。Issue #995 で INSERT 系の全入口が `VECTOR` 列
+// なしテーブルへの書き込みを受理するようになったため、空集合だけでなく非空
+// コーパスでの実地検証も行う。
 #[test]
 fn sql13_works_on_empty_table_without_vector_column() {
     let path = unique_db_path("sql13-no-vector");
@@ -685,6 +680,49 @@ fn sql13_works_on_empty_table_without_vector_column() {
     let cells = single_row(&result);
     assert_eq!(as_integer(&cells[0]), 0);
     assert_eq!(as_text_or_null(&cells[1]), None);
+}
+
+// Issue #995: 行を持つ `VECTOR` 列なしテーブルでの集計（`COUNT`／`MIN`）が
+// 正しい値を返すことを確認する（上記テストの空集合契約に対する非空版）。
+#[test]
+fn sql13_works_on_non_empty_table_without_vector_column() {
+    let path = unique_db_path("sql13-no-vector-nonempty");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let text_only_schema = TableSchema::new(
+        "notes",
+        vec![ColumnDef::new("lang", ColumnType::Text, false)],
+    );
+    storage
+        .create_table(&text_only_schema)
+        .expect("create table");
+    // SQL `INSERT` は常に `Visibility::Private` で書き込む
+    // （`sql::exec::execute_insert_with_schema` の固定挙動）ため、読み戻しには
+    // `Private` を許可する ctx を使う（`Public` のみの `PolicyContext::new` では
+    // 見えない）。
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let core = new_core(storage);
+    for (id, lang, op_id) in [
+        (1u64, "en", "op-1"),
+        (2u64, "ja", "op-2"),
+        (3u64, "ja", "op-3"),
+    ] {
+        core.execute_insert_sql(
+            &ctx,
+            &format!(
+                "INSERT INTO notes (id, lang) VALUES ({id}, '{lang}') USING OPERATION_ID '{op_id}'"
+            ),
+        )
+        .expect("insert into a table without a VECTOR column should succeed");
+    }
+    let result = core
+        .execute_sql(&ctx, "SELECT COUNT(*), MIN(lang) FROM notes")
+        .expect("aggregate on a non-empty table without a VECTOR column should succeed");
+    let cells = single_row(&result);
+    assert_eq!(as_integer(&cells[0]), 3);
+    assert_eq!(as_text_or_null(&cells[1]), Some("en".to_string()));
 }
 
 // --- 拒否経路の決定性: 同一入力を 2 回実行して同じ wire_code -----------------------
