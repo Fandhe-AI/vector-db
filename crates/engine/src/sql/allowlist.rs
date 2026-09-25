@@ -2587,10 +2587,15 @@ impl<'a> Parser<'a> {
 
     /// `CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]`（SQL-23・
     /// TASK-85、Issue #899）の許可形状。カタログ照会は行わない（`sql::ddl`
-    /// モジュールドキュメント・[`ValidatedCreateTable`] 参照）。列数は `Vec` へ
-    /// push する**前**に `MAX_CREATE_TABLE_COLUMNS` 判定し、アロケーション前に
-    /// 上限超過を拒否する（`.claude/rules/security.md`「不安全な設計｜無制限
-    /// リソース確保（DoS）」対応）。
+    /// モジュールドキュメント・[`ValidatedCreateTable`] 参照）。列数の上限判定
+    /// （`MAX_CREATE_TABLE_COLUMNS`）は、次の列を実際にパースする直前
+    /// （カンマを消費した直後）にのみ行う。ちょうど上限数の列で閉じ括弧
+    /// `)` に到達する場合はこの判定を経由せず正しく受理される（次の列を
+    /// 一切パースしない＝アロケーションもしない前に上限超過を拒否する
+    /// 設計は維持。`.claude/rules/security.md`「不安全な設計｜無制限
+    /// リソース確保（DoS）」対応。PR #1044 レビュー時の境界値誤検知
+    /// （ちょうど上限数の列を誤って拒否する off-by-one 懸念）の指摘を受け、
+    /// 誤検知の再発を防ぐためにこの位置へ判定を固定した）。
     fn parse_create_table(&mut self) -> Result<ValidatedCreateTable, SqlSurfaceError> {
         self.expect_contextual_keyword("CREATE")?;
         self.expect_contextual_keyword("TABLE")?;
@@ -2601,15 +2606,15 @@ impl<'a> Parser<'a> {
         self.expect_punct('(')?;
         let mut columns: Vec<ColumnDef> = Vec::new();
         loop {
-            if columns.len() >= MAX_CREATE_TABLE_COLUMNS {
-                return Err(SqlSurfaceError::payload_too_large(
-                    "too many columns in CREATE TABLE",
-                ));
-            }
             let column = self.parse_create_table_column(&columns)?;
             columns.push(column);
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
+                if columns.len() >= MAX_CREATE_TABLE_COLUMNS {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many columns in CREATE TABLE",
+                    ));
+                }
                 continue;
             }
             break;
@@ -7564,5 +7569,40 @@ mod tests {
         )
         .expect("compare-only mode must not require operation_id");
         assert_eq!(stmt.operation_id, None);
+    }
+
+    /// PR #1044 レビュー時の境界値誤検知（ちょうど `MAX_CREATE_TABLE_COLUMNS`
+    /// 列の `CREATE TABLE` が off-by-one で誤って `54000` 拒否されるという
+    /// 懸念）に対する回帰テスト。ちょうど上限数の列は受理される。
+    #[test]
+    fn create_table_accepts_exactly_max_columns() {
+        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS)
+            .map(|i| format!("c{i} TEXT"))
+            .collect();
+        let sql = format!("CREATE TABLE t ({})", cols.join(", "));
+        let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+        let result = validate_create_table_tokens(&tokens);
+        match &result {
+            Ok(v) => assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS),
+            Err(e) => {
+                panic!("expected ok for exactly {MAX_CREATE_TABLE_COLUMNS} columns, got err: {e:?}")
+            }
+        }
+    }
+
+    /// 上限を 1 つ超える列数は `payload_too_large`（`54000`）で拒否される
+    /// （上記回帰テストと対の境界値検証）。
+    #[test]
+    fn create_table_rejects_max_columns_plus_one() {
+        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS + 1)
+            .map(|i| format!("c{i} TEXT"))
+            .collect();
+        let sql = format!("CREATE TABLE t ({})", cols.join(", "));
+        let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+        let result = validate_create_table_tokens(&tokens);
+        match result {
+            Err(SqlSurfaceError::PayloadTooLarge { .. }) => {}
+            other => panic!("expected PayloadTooLarge, got: {other:?}"),
+        }
     }
 }
