@@ -85,7 +85,11 @@
 - `WHERE`・宣言的フィルタ・スコアブースト・本文列（`text_column_index`・
   `declarative_filter.rs`・`scoring_boost.rs`・`using_plan.rs`）: 「TEXT 列で
   はない」として拒否
-- 式（`udf_call.rs`）: 「式で使えない列」として拒否（#891 まで）
+- 式（`udf_call.rs`）: 「式で使えない列」として拒否。#891・TASK-199 は
+  算術を持たない非数値型（DATE/TIMESTAMP/NUMERIC/UUID/BYTEA）の WHERE 等価・
+  範囲比較のみを対象としたため、INTEGER/BIGINT を算術・WHERE 範囲比較で
+  使う経路（レーン A）は引き続き別 Issue へ申し送り（詳細は
+  `docs/design/scalar-types-predicates.md` 参照）
 - 集計・`GROUP BY`（`sql/parser.rs::resolve_aggregate_input`・
   `resolve_group_by_column`）: 「TEXT 列でも VECTOR 列でもない」として拒否
   （#892 まで）
@@ -114,7 +118,9 @@
 
 ## スコープ外（後続 Issue の担当）
 
-- `WHERE` 述語・式評価での整数列参照 → #891
+- `WHERE` 述語・式評価での整数列参照（レーン A。算術との組み合わせ）→
+  #891 では対象外のまま別 Issue へ申し送り（`docs/design/
+  scalar-types-predicates.md` 参照）
 - 集計（`SUM`/`AVG`/`MIN`/`MAX`/`GROUP BY`）の整数列対応 → #892
 - スカラー列二次索引の整数列対応 → #893。3 段階デコード tier の最適化 → #894
 - `RowDescription` の型 OID 写像は `INTEGER`/`BIGINT` 分を実装済み（本節
