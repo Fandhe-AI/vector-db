@@ -417,7 +417,16 @@ fn bind_typed_compare_literal(
             }
         }
         (ColumnType::Bytea, CompareLiteral::Text(s)) => {
-            check_literal_len(s)?;
+            // `check_literal_len` は使わない: `BYTEA` の `s` は復号後バイト列を
+            // hex テキスト化した表現（`typed_json::bytea_literal_text`）で
+            // 長さが約 2 倍に膨らむため、`MAX_TEXT_FIELD_LEN`（復号後基準の
+            // `MAX_BYTEA_FIELD_LEN` と同値）をテキスト長へそのまま適用すると
+            // insert/update で受理できる復号後約 2〜4 MiB の値が eq/範囲比較
+            // フィルタでは `54000` になり書き込みと検索の許容範囲が食い違う
+            // （Issue #896・PR #1038 レビュー指摘）。`bind_bytea_literal`
+            // （`bytea::parse_hex_text`）自身が確保前に復号後長で
+            // `MAX_BYTEA_FIELD_LEN` 超過を判定し `TooLong` を返すため、ここでの
+            // 事前検査は不要かつ有害。
             match crate::sql::parser::bind_bytea_literal(s, column)? {
                 crate::row_codec::Value::Bytes(b) => Ok(TypedLiteral::Bytes(b)),
                 _ => Err(SqlSurfaceError::Internal {
@@ -964,6 +973,36 @@ mod tests {
             .expect("bind BYTEA range");
         assert!(lt.matches(Some(ScalarRef::Bytes(&[0xde, 0xad]))));
         assert!(!lt.matches(Some(ScalarRef::Bytes(&[0xff]))));
+    }
+
+    #[test]
+    fn typed_compare_bytea_eq_accepts_decoded_length_up_to_insert_limit() {
+        // 復号後 `MAX_BYTEA_FIELD_LEN`（4 MiB）ちょうどの値は insert/update と
+        // 同じ実効上限で `eq` フィルタも受理できることを固定する（PR #1038
+        // レビュー指摘の回帰防止。是正前は hex テキスト長〔約 8 MiB〕を
+        // `MAX_TEXT_FIELD_LEN`〔4 MiB〕で検査していたため、復号後 約 2 MiB
+        // 超で誤って `54000` になっていた）。
+        let schema = typed_compare_schema();
+        let hex_body = "ab".repeat(crate::bytea::MAX_BYTEA_FIELD_LEN as usize);
+        let literal = format!("\\x{hex_body}");
+        let eq = DeclarativeFilter::compare("blob", CompareOp::Eq, literal)
+            .bind(&schema)
+            .expect("decoded length at MAX_BYTEA_FIELD_LEN must bind for eq filter");
+        let decoded = vec![0xab_u8; crate::bytea::MAX_BYTEA_FIELD_LEN as usize];
+        assert!(eq.matches(Some(ScalarRef::Bytes(&decoded))));
+    }
+
+    #[test]
+    fn typed_compare_bytea_eq_rejects_decoded_length_over_insert_limit() {
+        // 復号後 `MAX_BYTEA_FIELD_LEN` を 1 バイト超える値は従来どおり `54000`
+        // で拒否する（`bind_bytea_literal`／`parse_hex_text` 自身の上限判定）。
+        let schema = typed_compare_schema();
+        let hex_body = "ab".repeat(crate::bytea::MAX_BYTEA_FIELD_LEN as usize + 1);
+        let literal = format!("\\x{hex_body}");
+        let err = DeclarativeFilter::compare("blob", CompareOp::Eq, literal)
+            .bind(&schema)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]

@@ -137,13 +137,12 @@ fn wire_insert_rejects_out_of_range_real_literal_with_22003() {
     read_ready_for_query(&mut stream);
 }
 
-/// NoSQL `insert` op へ float 列の値を渡すと、`insert.rs::bind_row` の既存の
-/// 型不一致腕（`_ =>`）へ合流し `22000`（InvalidInput）で拒否される（F10:
-/// REAL/DOUBLE の JSON 束縛対応は #896 の担当。`nosql6_insert.rs` の
+/// NoSQL `insert` op へ float 列の JSON 数値を渡すと成功し、SQL 表層から
+/// 読み戻すと同じ値が観測できる（Issue #896・NOSQL-17。`nosql6_insert.rs` の
 /// `spawn_both`／`query` と同じ流儀（`http_common::spawn_router_listener_with_engine`
 /// 経由）で production ルータを検証する）。
 #[test]
-fn nosql_insert_rejects_real_column_value_with_22000() {
+fn nosql_insert_accepts_real_column_value_and_round_trips() {
     use engine::json::{parse_json, JsonValue};
     use http_common::AfterWrite;
     use wire_server::http::session::store::SessionStore;
@@ -166,8 +165,11 @@ fn nosql_insert_rejects_real_column_value_with_22000() {
     ));
 
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let http_addr =
-        http_common::spawn_router_listener_with_engine(&users_path, SessionStore::new(), core);
+    let http_addr = http_common::spawn_router_listener_with_engine(
+        &users_path,
+        SessionStore::new(),
+        core.clone(),
+    );
 
     let login_body = br#"{"user":"alice","password":"pw-alice"}"#;
     let login_request = http_common::build_request(
@@ -208,5 +210,21 @@ fn nosql_insert_rejects_real_column_value_with_22000() {
         &insert_request,
         AfterWrite::HalfClose,
     ));
-    http_common::assert_rejected(&resp, 400, "22000");
+    assert_eq!(resp.status, 200, "unexpected response: {resp:?}");
+    let text = String::from_utf8_lossy(&resp.body);
+    assert!(
+        text.contains("\"inserted\":1"),
+        "expected inserted:1 in success body, got: {text}"
+    );
+
+    let mut stream = spawn_with_alice(core);
+    send_simple_query(
+        &mut stream,
+        "SELECT score FROM metrics WHERE id = 1 LIMIT 1",
+    );
+    let _ = read_row_description(&mut stream);
+    let cells = read_data_row(&mut stream);
+    assert_eq!(cells, vec![Some("1.5".to_string())]);
+    let _ = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
 }

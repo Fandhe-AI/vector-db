@@ -890,6 +890,20 @@ fn push_dml_assignments(
             InsertLiteral::Null => {
                 b.push_u8(4);
             }
+            // `InsertLiteral::Vector`（Issue #896 レビュー指摘・PR #1038。
+            // NoSQL 表層 `insert`／`update` op の `insert.rs`／`update.rs::
+            // map_set_assignments` が JSON 配列から直接構築する variant）。
+            // 述語つき `UPDATE ... WHERE`（本関数の呼び出し元）の `SET` は
+            // NoSQL 表層の `filter` 形からは到達しない（`update.rs` の
+            // `map_set_assignments` は `where`〔単一行 `id` 完全一致形〕
+            // 専用であり `bind_set_assignments` の Value ベースハッシュ
+            // （`for_update_columns`）を経由する。本関数へは SQL 表層の
+            // 字句規則からも `InsertLiteral::Vector` が構築されないため
+            // 実質未到達だが、`Null` と同じ前方ガードとしてタグ 5 を割り当てる。
+            InsertLiteral::Vector(values) => {
+                b.push_u8(5);
+                push_vector(b, values).map_err(|_| dml_hash_field_too_large())?;
+            }
         }
     }
     Ok(())

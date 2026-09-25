@@ -271,6 +271,14 @@ pub enum SqlSurfaceError {
     /// （`sql::parser::bind_uuid_literal`）も同じ発生経路を共有する。ERR-2 拡張:
     /// `22P02`（[`crate::error_format::ErrorClass::InvalidTextRepresentation`]）。
     InvalidTextRepresentation { detail: String },
+    /// 構文・入力としては正しいが、この表層ではまだ実装されていない機能
+    /// （NoSQL `filter` の `eq` を `INTEGER`／`BIGINT`／`REAL`／
+    /// `DOUBLE PRECISION` 列へ適用する等。式レーンの入口が無いための対象外。
+    /// Issue #945）。ERR-2: `0A000`（[`crate::error_format::ErrorClass::
+    /// FeatureNotSupported`]）。`UnsupportedSyntax`（`42601`。構文そのものが
+    /// 許可リスト外）とは意味論的に異なるため、`wire-server` 側の分類縮退
+    /// （Issue #896 レビュー指摘）を避けるために独立させた。
+    FeatureNotSupported { detail: String },
 }
 
 impl SqlSurfaceError {
@@ -382,6 +390,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
                 ErrorClass::InvalidTextRepresentation
             }
+            SqlSurfaceError::FeatureNotSupported { .. } => ErrorClass::FeatureNotSupported,
         }
     }
 
@@ -432,6 +441,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::InvalidTextRepresentation { detail } => {
                 write!(f, "invalid text representation: {detail}")
+            }
+            SqlSurfaceError::FeatureNotSupported { detail } => {
+                write!(f, "feature not supported: {detail}")
             }
         }
     }
@@ -991,6 +1003,19 @@ pub enum InsertLiteral {
     /// （INSERT・UPSERT。SQL テキストからもファイル形からも `Null` は
     /// 構築されない到達不能パス）は fail-closed に一律拒否する。
     Null,
+    /// `VECTOR` 列向けの、既に要素ごとに検証済みの `f32` 列（NoSQL 表層
+    /// `insert`／`update` op が JSON 配列から直接構築する。Issue #896
+    /// レビュー指摘〔PR #1038〕対応）。SQL テキスト・COPY・ファイル形
+    /// `INSERT` はいずれも `VECTOR` 列を `InsertLiteral::String`（`[f1,f2,...]`
+    /// 形のテキストリテラル）として構築するため到達しないが、`sql::parser`
+    /// の `(ColumnType::Vector(dim), ...)` 束縛は本 variant も明示的に
+    /// 受理し、`InsertLiteral::String` 経由の [`crate::sql::parser::
+    /// parse_vector_literal`]（64 KiB のテキスト長上限）を経由せずに次元・
+    /// 有限性のみを検証してから [`crate::row_codec::Value::Vector`] へ束縛
+    /// する（テキスト長上限は SQL リテラルの構文制約であり、JSON 配列から
+    /// 直接届く既に解析済みの数値列には適用対象が無い設計判断。
+    /// `docs/design/nosql-typed-json-binding.md` 参照）。
+    Vector(Vec<f32>),
 }
 
 /// `ON CONFLICT (id) DO UPDATE SET <col> = <value>` の SET 右辺（SQL-20・

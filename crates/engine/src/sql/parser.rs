@@ -284,10 +284,19 @@ pub(crate) fn bind_numeric_literal(
                 "column {name:?} expects a NUMERIC literal, got a boolean literal"
             )))
         }
+        // `InsertLiteral::Vector`（Issue #896 レビュー指摘・PR #1038）は
+        // `ColumnType::Numeric` 列へは呼び出し元の `match (&column.ty, lit)`
+        // 側で構造的に到達しない（`(ColumnType::Numeric{..}, lit)` の catch-all
+        // が全 `InsertLiteral` variant を本関数へ委譲するため、ここで拒否する）。
+        InsertLiteral::Vector(_) => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {name:?} expects a NUMERIC literal, got a vector literal"
+            )))
+        }
         // 呼び出し元（`bind_insert`／`bind_set_assignments`／
         // `bind_upsert_assignments`）はいずれも `InsertLiteral::Null` を
         // 本関数へ渡すより前に nullable 判定込みで独自に処理するため実際には
-        // 到達しないが、`InsertLiteral` は 4 variant の列挙であり本 match の
+        // 到達しないが、`InsertLiteral` は 5 variant の列挙であり本 match の
         // 網羅性のためだけに存在する（Issue #889 レビュー指摘・PR #1014 で
         // `Null` variant が追加された後の到達性を fail-closed に保つ）。
         InsertLiteral::Null => {
@@ -370,6 +379,41 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
     Ok(values)
 }
 
+/// [`InsertLiteral::Vector`]（NoSQL 表層が JSON 配列から直接構築する、要素
+/// ごとに [`engine::json::JsonNumber::as_f32`] で有限値と確認済みの `f32` 列。
+/// Issue #896 レビュー指摘・PR #1038）を [`crate::row_codec::Value::Vector`]
+/// へ束縛する。[`parse_vector_literal`] のテキスト長上限（64 KiB。SQL
+/// リテラルの構文上の制約であり、JSON 配列から届く既に解析済みの数値列には
+/// 適用対象が無い）を経由せずに構築するが、次元一致・各要素の有限性は
+/// engine 側で改めて検証する（wire-server の検証結果を無条件に信頼せず、
+/// engine を唯一の検証点に保つための多層防御。`security.md`「アクセス制御の
+/// 不備」観点）。
+fn bind_vector_literal_values(
+    values: &[f32],
+    expected_dim: u32,
+    name: &str,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    let dim = u32::try_from(values.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large(format!(
+            "column {name:?}: vector element count {} exceeds representable range",
+            values.len()
+        ))
+    })?;
+    if dim != expected_dim {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "column {name:?}: vector dimension mismatch: expected {expected_dim}, got {dim}"
+        )));
+    }
+    for v in values {
+        if !v.is_finite() {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {name:?}: vector element must be finite (NaN/Inf are not allowed)"
+            )));
+        }
+    }
+    Ok(crate::row_codec::Value::Vector(values.to_vec()))
+}
+
 /// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）向けの数値リテラル
 /// 束縛。`literal` は `InsertLiteral::Number`（`allowlist::expect_literal` が
 /// 単項マイナスを正規化済み）のみを受理し、`InsertLiteral::String` は
@@ -385,7 +429,10 @@ pub(crate) fn bind_integer_literal(
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {
     let raw = match literal {
         InsertLiteral::Number(s) => s,
-        InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Null => {
+        InsertLiteral::String(_)
+        | InsertLiteral::Bool(_)
+        | InsertLiteral::Null
+        | InsertLiteral::Vector(_) => {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "column {name:?} expects an integer literal, got a non-integer literal"
             )))
@@ -1635,7 +1682,10 @@ fn bind_insert_row(
         InsertLiteral::Number(n) => n
             .parse()
             .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed id value: {n}")))?,
-        InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Null => {
+        InsertLiteral::String(_)
+        | InsertLiteral::Bool(_)
+        | InsertLiteral::Null
+        | InsertLiteral::Vector(_) => {
             return Err(SqlSurfaceError::invalid_input(
                 "id pseudo-column value must be a number",
             ))
@@ -1667,6 +1717,9 @@ fn bind_insert_row(
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
             }
+            (ColumnType::Vector(dim), InsertLiteral::Vector(values)) => {
+                bind_vector_literal_values(values, *dim, name)?
+            }
             (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a vector literal, got a non-vector literal"
@@ -1675,27 +1728,39 @@ fn bind_insert_row(
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
-            (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Text,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a non-text literal"
                 )))
             }
             (ColumnType::Boolean, InsertLiteral::Bool(b)) => crate::row_codec::Value::Bool(*b),
-            (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
+            (
+                ColumnType::Boolean,
+                InsertLiteral::String(_) | InsertLiteral::Number(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a boolean literal (true/false)"
                 )))
             }
             (
                 ColumnType::Integer | ColumnType::BigInt,
-                InsertLiteral::Number(_) | InsertLiteral::String(_) | InsertLiteral::Bool(_),
+                InsertLiteral::Number(_)
+                | InsertLiteral::String(_)
+                | InsertLiteral::Bool(_)
+                | InsertLiteral::Vector(_),
             ) => bind_integer_literal(name, column.ty.clone(), literal)?,
             // F7（Issue #882 計画）: REAL/DOUBLE は数値リテラルのみ受理する
             // （文字列からの暗黙変換は行わない。#896 へ申し送り）。
             (ColumnType::Real, InsertLiteral::Number(n)) => {
                 crate::row_codec::Value::Real(bind_real_literal(n)?)
             }
-            (ColumnType::Real, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Real,
+                InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a REAL literal, got a non-numeric literal"
                 )))
@@ -1703,7 +1768,10 @@ fn bind_insert_row(
             (ColumnType::Double, InsertLiteral::Number(n)) => {
                 crate::row_codec::Value::Double(bind_double_literal(n)?)
             }
-            (ColumnType::Double, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Double,
+                InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a DOUBLE PRECISION literal, got a non-numeric literal"
                 )))
@@ -1711,7 +1779,10 @@ fn bind_insert_row(
             (ColumnType::Date, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Date, s)?
             }
-            (ColumnType::Date, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Date,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a DATE literal (YYYY-MM-DD)"
                 )))
@@ -1719,7 +1790,10 @@ fn bind_insert_row(
             (ColumnType::Timestamp, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Timestamp, s)?
             }
-            (ColumnType::Timestamp, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Timestamp,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
                 )))
@@ -1727,13 +1801,19 @@ fn bind_insert_row(
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
             }
-            (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Array(_),
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects an array literal, got a non-array literal"
                 )))
             }
             (ColumnType::Bytea, InsertLiteral::String(s)) => bind_bytea_literal(s, name)?,
-            (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Bytea,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a bytea hex literal"
                 )))
@@ -1743,14 +1823,17 @@ fn bind_insert_row(
             }
             (
                 ColumnType::Json | ColumnType::Jsonb,
-                InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a JSON text literal"
                 )))
             }
             (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
-            (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Enum(_),
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal for its enum type"
                 )))
@@ -1768,7 +1851,10 @@ fn bind_insert_row(
                 )))
             }
             (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
-            (ColumnType::Uuid, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Uuid,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a UUID text literal"
                 )))
@@ -2034,6 +2120,9 @@ fn bind_set_assignments(
             (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
             }
+            (ColumnType::Vector(dim), InsertLiteral::Vector(values)) => {
+                bind_vector_literal_values(values, *dim, name)?
+            }
             (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a vector literal, got a non-vector literal"
@@ -2050,25 +2139,37 @@ fn bind_set_assignments(
             (ColumnType::Text, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
-            (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Text,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a non-text literal"
                 )))
             }
             (ColumnType::Boolean, InsertLiteral::Bool(b)) => crate::row_codec::Value::Bool(*b),
-            (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
+            (
+                ColumnType::Boolean,
+                InsertLiteral::String(_) | InsertLiteral::Number(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a boolean literal (true/false)"
                 )))
             }
             (
                 ColumnType::Integer | ColumnType::BigInt,
-                InsertLiteral::Number(_) | InsertLiteral::String(_) | InsertLiteral::Bool(_),
+                InsertLiteral::Number(_)
+                | InsertLiteral::String(_)
+                | InsertLiteral::Bool(_)
+                | InsertLiteral::Vector(_),
             ) => bind_integer_literal(name, column.ty.clone(), literal)?,
             (ColumnType::Real, InsertLiteral::Number(n)) => {
                 crate::row_codec::Value::Real(bind_real_literal(n)?)
             }
-            (ColumnType::Real, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Real,
+                InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a REAL literal, got a non-numeric literal"
                 )))
@@ -2076,7 +2177,10 @@ fn bind_set_assignments(
             (ColumnType::Double, InsertLiteral::Number(n)) => {
                 crate::row_codec::Value::Double(bind_double_literal(n)?)
             }
-            (ColumnType::Double, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Double,
+                InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a DOUBLE PRECISION literal, got a non-numeric literal"
                 )))
@@ -2084,7 +2188,10 @@ fn bind_set_assignments(
             (ColumnType::Date, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Date, s)?
             }
-            (ColumnType::Date, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Date,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a DATE literal (YYYY-MM-DD)"
                 )))
@@ -2092,7 +2199,10 @@ fn bind_set_assignments(
             (ColumnType::Timestamp, InsertLiteral::String(s)) => {
                 bind_datetime_literal(name, ColumnType::Timestamp, s)?
             }
-            (ColumnType::Timestamp, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Timestamp,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
                 )))
@@ -2100,13 +2210,19 @@ fn bind_set_assignments(
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
             }
-            (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Array(_),
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects an array literal, got a non-array literal"
                 )))
             }
             (ColumnType::Bytea, InsertLiteral::String(s)) => bind_bytea_literal(s, name)?,
-            (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Bytea,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a bytea hex literal"
                 )))
@@ -2116,14 +2232,17 @@ fn bind_set_assignments(
             }
             (
                 ColumnType::Json | ColumnType::Jsonb,
-                InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a JSON text literal"
                 )))
             }
             (ColumnType::Enum(def), InsertLiteral::String(s)) => bind_enum_literal(def, s, name)?,
-            (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Enum(_),
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal for its enum type"
                 )))
@@ -2142,7 +2261,10 @@ fn bind_set_assignments(
                 )))
             }
             (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
-            (ColumnType::Uuid, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (
+                ColumnType::Uuid,
+                InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
+            ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a UUID text literal"
                 )))
@@ -2660,6 +2782,9 @@ fn bind_upsert_assignments(
                     (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Vector(parse_vector_literal(s, *dim)?)
                     }
+                    (ColumnType::Vector(dim), InsertLiteral::Vector(values)) => {
+                        bind_vector_literal_values(values, *dim, name)?
+                    }
                     (ColumnType::Vector(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a vector literal, got a non-vector literal"
@@ -2668,7 +2793,7 @@ fn bind_upsert_assignments(
                     (ColumnType::Text, InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Text(s.clone())
                     }
-                    (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                    (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a text literal, got a non-text literal"
                         )))
@@ -2676,18 +2801,18 @@ fn bind_upsert_assignments(
                     (ColumnType::Boolean, InsertLiteral::Bool(b)) => {
                         crate::row_codec::Value::Bool(*b)
                     }
-                    (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_)) => {
+                    (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a boolean literal (true/false)"
                         )))
                     }
-                    (ColumnType::Integer | ColumnType::BigInt, InsertLiteral::Number(_) | InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+                    (ColumnType::Integer | ColumnType::BigInt, InsertLiteral::Number(_) | InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         bind_integer_literal(name, column.ty.clone(), literal)?
                     }
                     (ColumnType::Real, InsertLiteral::Number(n)) => {
                         crate::row_codec::Value::Real(bind_real_literal(n)?)
                     }
-                    (ColumnType::Real, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+                    (ColumnType::Real, InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a REAL literal, got a non-numeric literal"
                         )))
@@ -2695,7 +2820,7 @@ fn bind_upsert_assignments(
                     (ColumnType::Double, InsertLiteral::Number(n)) => {
                         crate::row_codec::Value::Double(bind_double_literal(n)?)
                     }
-                    (ColumnType::Double, InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+                    (ColumnType::Double, InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a DOUBLE PRECISION literal, got a non-numeric literal"
                         )))
@@ -2703,7 +2828,7 @@ fn bind_upsert_assignments(
                     (ColumnType::Date, InsertLiteral::String(s)) => {
                         bind_datetime_literal(name, ColumnType::Date, s)?
                     }
-                    (ColumnType::Date, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                    (ColumnType::Date, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a DATE literal (YYYY-MM-DD)"
                         )))
@@ -2711,7 +2836,7 @@ fn bind_upsert_assignments(
                     (ColumnType::Timestamp, InsertLiteral::String(s)) => {
                         bind_datetime_literal(name, ColumnType::Timestamp, s)?
                     }
-                    (ColumnType::Timestamp, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                    (ColumnType::Timestamp, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a TIMESTAMP literal (YYYY-MM-DD HH:MM:SS)"
                         )))
@@ -2719,13 +2844,13 @@ fn bind_upsert_assignments(
                     (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
                     }
-                    (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                    (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects an array literal, got a non-array literal"
                         )))
                     }
                     (ColumnType::Bytea, InsertLiteral::String(s)) => bind_bytea_literal(s, name)?,
-                    (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                    (ColumnType::Bytea, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a bytea hex literal"
                         )))
@@ -2735,7 +2860,7 @@ fn bind_upsert_assignments(
                     }
                     (
                         ColumnType::Json | ColumnType::Jsonb,
-                        InsertLiteral::Number(_) | InsertLiteral::Bool(_),
+                        InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
                     ) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a JSON text literal"
@@ -2744,7 +2869,7 @@ fn bind_upsert_assignments(
                     (ColumnType::Enum(def), InsertLiteral::String(s)) => {
                         bind_enum_literal(def, s, name)?
                     }
-                    (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                    (ColumnType::Enum(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a text literal for its enum type"
                         )))
@@ -2759,7 +2884,7 @@ fn bind_upsert_assignments(
                         )))
                     }
                     (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
-                    (ColumnType::Uuid, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+                    (ColumnType::Uuid, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a UUID text literal"
                         )))
@@ -2850,6 +2975,14 @@ fn bind_file_insert(
             (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a non-text literal"
+                )))
+            }
+            // `InsertLiteral::Vector`（Issue #896 レビュー指摘・PR #1038）は
+            // NoSQL 表層専用であり、ファイル形 `INSERT` の VALUES 構文からは
+            // 構築されない到達不能パス（match の網羅性のためだけの分岐）。
+            (ColumnType::Text, InsertLiteral::Vector(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a text literal, got a vector literal"
                 )))
             }
             // `InsertLiteral::Null`（Issue #889 レビュー指摘）はファイル形

@@ -144,7 +144,7 @@ fn expected_json_type_for_oid(oid: i32) -> &'static str {
 }
 
 #[test]
-fn row_description_oid_and_json_type_agree_for_star_projection() {
+fn row_description_oid_and_nosql_json_type_for_star_projection() {
     let path = unique_db_path("nosql11-response-schema-star");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -171,6 +171,12 @@ fn row_description_oid_and_json_type_agree_for_star_projection() {
     };
     assert_eq!(json_columns.len(), fields.len());
 
+    // NoSQL 表層の `columns[].type`（Issue #896・NOSQL-17）は SQL wire
+    // `RowDescription` の OID 写像（Issue #895）から意図的に独立しており、
+    // `VECTOR` 列は SQL wire 側が `text`（OID 25、後方互換のため）で公告する
+    // 一方 NoSQL 側は型情報をそのまま伝えるため `"vector"` を返す（両者は
+    // ここでのみ乖離し、`id`／`TEXT` 列は引き続き一致する）。
+    let expected_json_type: [&str; 3] = ["numeric", "vector", "text"];
     for (i, (name, oid)) in fields.iter().enumerate() {
         let engine::json::JsonValue::Object(col_obj) = &json_columns[i] else {
             panic!("column must be an object");
@@ -183,10 +189,12 @@ fn row_description_oid_and_json_type_agree_for_star_projection() {
             panic!("type must be a string");
         };
         assert_eq!(
-            json_type,
-            expected_json_type_for_oid(*oid),
+            json_type, expected_json_type[i],
             "column index={i} name={name}"
         );
+        // OID 自体は Issue #895 の既存契約のまま非 vacuous であることを確認する
+        // （どのケースでも既知の OID を公告する）。
+        assert!(matches!(oid, 1700 | 25), "unexpected oid: {oid}");
     }
 }
 
