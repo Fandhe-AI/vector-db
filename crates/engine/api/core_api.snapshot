@@ -284,6 +284,7 @@ pub enum CatalogError {
     IndexNotFound(String),
     IndexKindMismatch(String),
     IndexLimitExceeded(String),
+    InvalidForeignKey(String),
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError

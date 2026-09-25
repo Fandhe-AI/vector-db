@@ -1,6 +1,9 @@
 //! 行単位の宣言的制約——テナント内一意性制約（`PRIMARY KEY` 宣言〔Issue #903〕・
 //! UNIQUE 制約〔Issue #905〕）と `CHECK` 制約〔Issue #906〕。いずれも TABLE-16・
-//! TASK-204——を検査する単一の検査点（入口は [`enforce_row_constraints_in_txn`]）。
+//! TASK-204——と `FOREIGN KEY` 制約（TABLE-17・TASK-205、Issue #907）を検査する
+//! 単一の検査点（書き込んだ行の検査の入口は [`enforce_row_constraints_in_txn`]、
+//! 参照先側〔削除・更新された行を参照する行が残っていないか〕の入口は
+//! [`enforce_referencing_rows_in_txn`]）。
 //!
 //! `CHECK` 制約は書き込んだ各行を同一 write トランザクション内で読み戻し、
 //! `sql::check_constraint::CompiledChecks`（`WHERE` と同じ束縛・評価器を再利用）で
@@ -61,11 +64,11 @@
 //! （TABLE-16・RLS-10 (c)）。違反時のエラー（`TenantWriteError::UniqueViolation`）
 //! はキー値・列名・行 id・テナント名を含まない固定文言。
 
-use crate::catalog::{CatalogError, ColumnType, TableSchema};
+use crate::catalog::{CatalogError, ColumnType, ForeignKeyDef, TableSchema};
 use crate::row_codec::ScalarRef;
 use crate::tenant::TenantWriteError;
 use redb::ReadableTable;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// 一意キー 1 個分の NULL の扱い。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,7 +132,8 @@ fn key_specs(schema: &TableSchema) -> Result<(Vec<KeySpec>, Vec<bool>), CatalogE
 
 /// `tenant.rs` の各書き込み関数が書き込み後・commit 前に呼ぶ唯一の入口
 /// （TABLE-16・TASK-204）。`CHECK` 制約（Issue #906）→ 一意性制約（主キー・
-/// UNIQUE）の順に検査する。`written_ids` の契約は [`enforce_unique_keys_in_txn`]
+/// UNIQUE）→ `FOREIGN KEY` の参照元側（TABLE-17・TASK-205、Issue #907。書いた行が
+/// 参照する値の組が参照先に存在するか）の順に検査する。`written_ids` の契約は [`enforce_unique_keys_in_txn`]
 /// と同じ。いずれの制約も宣言しないテーブルは即座に成功する。
 pub(crate) fn enforce_row_constraints_in_txn(
     write_txn: &redb::WriteTransaction,
@@ -139,7 +143,8 @@ pub(crate) fn enforce_row_constraints_in_txn(
     written_ids: &[u64],
 ) -> Result<(), TenantWriteError> {
     enforce_check_constraints_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
-    enforce_unique_keys_in_txn(write_txn, table_name, schema, tenant_id, written_ids)
+    enforce_unique_keys_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
+    enforce_foreign_keys_in_txn(write_txn, table_name, schema, tenant_id, written_ids)
 }
 
 /// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）の検査。`written_ids` の各行を
@@ -472,6 +477,404 @@ fn push_canonical_component(out: &mut Vec<u8>, value: ScalarRef<'_>) -> Result<(
             // 矛盾。値を黙って無視せず fail-closed に拒否する。
             return Err("unique key column has a type that is not allowed as a unique key");
         }
+    }
+    Ok(())
+}
+
+/// `FOREIGN KEY` 1 件分の参照元側の検査仕様（TABLE-17・TASK-205、Issue #907）。
+struct ForeignKeySpec<'a> {
+    fk: &'a ForeignKeyDef,
+    /// 参照元スキーマにおける参照元列の論理インデックス（`fk.columns()` の順）。
+    indices: Vec<usize>,
+}
+
+/// 参照元の行から集めた、参照先に存在しなければならない値の組の集合
+/// （重複排除済み）。`id` 参照は物理キーの `id` 値、それ以外は一意性検査と同じ
+/// 正準キーバイト列（[`key_bytes`]）で持つ。
+enum RequiredParentKeys {
+    Ids(BTreeSet<u64>),
+    Keys(HashSet<Vec<u8>>),
+}
+
+impl RequiredParentKeys {
+    fn new(fk: &ForeignKeyDef) -> Self {
+        if fk.references_parent_id() {
+            RequiredParentKeys::Ids(BTreeSet::new())
+        } else {
+            RequiredParentKeys::Keys(HashSet::new())
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            RequiredParentKeys::Ids(ids) => ids.is_empty(),
+            RequiredParentKeys::Keys(keys) => keys.is_empty(),
+        }
+    }
+}
+
+/// `schema` の各 `FOREIGN KEY` 宣言について参照元列のインデックスを解決し、
+/// それらの和集合マスク（[`crate::row_codec::scan_scalar_columns_masked`] へ渡す）を
+/// 組み立てる。列名解決の失敗は `validate_schema` が起こり得ないことを保証する
+/// 不変条件だが、panic せず fail-closed に拒否する。
+fn foreign_key_specs(
+    schema: &TableSchema,
+) -> Result<(Vec<ForeignKeySpec<'_>>, Vec<bool>), CatalogError> {
+    let mut specs = Vec::with_capacity(schema.foreign_keys().len());
+    let mut mask = vec![false; schema.columns.len()];
+    for fk in schema.foreign_keys() {
+        let mut indices = Vec::with_capacity(fk.columns().len());
+        for name in fk.columns() {
+            let idx = schema
+                .columns
+                .iter()
+                .position(|c| &c.name == name)
+                .ok_or_else(|| {
+                    CatalogError::Invalid(
+                        "foreign key column not found in live schema columns".to_string(),
+                    )
+                })?;
+            if let Some(slot) = mask.get_mut(idx) {
+                *slot = true;
+            }
+            indices.push(idx);
+        }
+        specs.push(ForeignKeySpec { fk, indices });
+    }
+    Ok((specs, mask))
+}
+
+/// 復元済みの参照元列の値から、参照先に存在しなければならない値の組を
+/// `required` へ積む。いずれかの構成列が NULL の組は検査対象外（MATCH SIMPLE。
+/// PostgreSQL の既定）。`id` 参照で負値（物理キー `id` は `u64`）は参照先が
+/// 存在し得ないため即座に違反とする。
+fn push_required_key(
+    spec: &ForeignKeySpec<'_>,
+    values: &[Option<ScalarRef<'_>>],
+    required: &mut RequiredParentKeys,
+) -> Result<(), TenantWriteError> {
+    match required {
+        RequiredParentKeys::Ids(ids) => {
+            let [idx] = spec.indices.as_slice() else {
+                return Err(internal("id-referencing foreign key must have one column"));
+            };
+            let id = match values.get(*idx).and_then(|v| v.as_ref()) {
+                None => return Ok(()),
+                Some(ScalarRef::Integer(v)) => u64::try_from(*v),
+                Some(ScalarRef::BigInt(v)) => u64::try_from(*v),
+                // `validate_foreign_keys` が `INTEGER`／`BIGINT` 以外を拒否するため
+                // 到達しない内部矛盾。黙って通さず fail-closed に拒否する。
+                Some(_) => {
+                    return Err(internal(
+                        "id-referencing foreign key column has a non-integer value",
+                    ))
+                }
+            }
+            .map_err(|_| TenantWriteError::ForeignKeyViolation)?;
+            ids.insert(id);
+        }
+        RequiredParentKeys::Keys(keys) => {
+            let key_spec = KeySpec {
+                indices: spec.indices.clone(),
+                null_policy: NullPolicy::Skip,
+            };
+            if let Some(key) = key_bytes(&key_spec, values).map_err(internal)? {
+                keys.insert(key);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 参照先テーブル `parent_table`（スキーマ `parent_schema`）の**同一テナントの
+/// 全行**（可視性を問わない。RLS-10 (c)）に、`required` の値の組がすべて存在する
+/// ことを確かめる（TABLE-17・TASK-205、Issue #907）。1 つでも欠ければ
+/// [`TenantWriteError::ForeignKeyViolation`]。
+///
+/// 走査・照会のキーはサーバー側導出テナント `tenant_id` の物理キー空間
+/// （`(tenant_id, 0)..=(tenant_id, u64::MAX)`。TABLE-12）に閉じ、他テナントの
+/// 行には一切触れない——他テナントだけが持つ値は「不在」と同じ結果になり、
+/// 応答・処理経路のいずれにも他テナントの行の有無が現れない（RLS-9）。
+/// 呼び出し元は `parent_table` の行ストアのハンドルを保持していない状態で呼ぶこと
+/// （自己参照では参照元と同じ行ストアを開き直すため。redb の `TableAlreadyOpen`）。
+fn verify_required_parent_keys(
+    write_txn: &redb::WriteTransaction,
+    parent_table: &str,
+    parent_schema: &TableSchema,
+    fk: &ForeignKeyDef,
+    tenant_id: &str,
+    required: RequiredParentKeys,
+) -> Result<(), TenantWriteError> {
+    if required.is_empty() {
+        return Ok(());
+    }
+    let row_table_name = crate::catalog::user_rows_table_name(parent_table);
+    let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
+    {
+        Ok(t) => t,
+        // 参照先へまだ 1 行も挿入されていない（行ストア未作成）。必要な値の組が
+        // 1 つ以上あるため違反。
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(TenantWriteError::ForeignKeyViolation)
+        }
+        Err(e) => {
+            return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                e,
+            )))
+        }
+    };
+    match required {
+        RequiredParentKeys::Ids(ids) => {
+            for id in ids {
+                if row_table
+                    .get((tenant_id, id))
+                    .map_err(CatalogError::from)?
+                    .is_none()
+                {
+                    return Err(TenantWriteError::ForeignKeyViolation);
+                }
+            }
+            Ok(())
+        }
+        RequiredParentKeys::Keys(mut pending) => {
+            let mut indices = Vec::with_capacity(fk.parent_columns().len());
+            let mut mask = vec![false; parent_schema.columns.len()];
+            for name in fk.parent_columns() {
+                let idx = parent_schema
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == name)
+                    .ok_or_else(|| internal("referenced column not found in parent schema"))?;
+                if let Some(slot) = mask.get_mut(idx) {
+                    *slot = true;
+                }
+                indices.push(idx);
+            }
+            let key_spec = KeySpec {
+                indices,
+                null_policy: NullPolicy::Skip,
+            };
+            let range_start = std::ops::Bound::Included((tenant_id, 0u64));
+            let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
+            for entry in row_table
+                .range::<(&str, u64)>((range_start, range_end))
+                .map_err(CatalogError::from)?
+            {
+                let (k, v) = entry.map_err(CatalogError::from)?;
+                let (key_tenant, _id) = k.value();
+                if key_tenant != tenant_id {
+                    // 閉区間により理論上到達しない（`enforce_unique_keys_in_txn` と
+                    // 同じ defense-in-depth）。
+                    break;
+                }
+                let values = decode_key_columns(parent_schema, &mask, v.value())?;
+                if let Some(key) = key_bytes(&key_spec, &values).map_err(internal)? {
+                    pending.remove(&key);
+                    if pending.is_empty() {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(TenantWriteError::ForeignKeyViolation)
+        }
+    }
+}
+
+/// 参照先スキーマを取得する（自己参照は `None` を返し、呼び出し元が参照元
+/// スキーマをそのまま使う）。参照先が存在しないのは `DROP TABLE` の依存検査
+/// （`2BP01`）が防ぐ内部矛盾のため、`TableNotFound` を含めて内部エラーとして
+/// fail-closed に拒否する。
+fn parent_schema_for(
+    write_txn: &redb::WriteTransaction,
+    child_table: &str,
+    fk: &ForeignKeyDef,
+) -> Result<Option<TableSchema>, TenantWriteError> {
+    if fk.parent_table() == child_table {
+        return Ok(None);
+    }
+    crate::catalog::require_table_schema_write(write_txn, fk.parent_table())
+        .map(Some)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => {
+                internal("referenced table of a foreign key is missing")
+            }
+            other => TenantWriteError::from(other),
+        })
+}
+
+/// `FOREIGN KEY` の参照元側の検査（[`enforce_row_constraints_in_txn`] から呼ばれる。
+/// TABLE-17・TASK-205、Issue #907）。`written_ids` の各行を同一 write トランザクション
+/// 内で読み戻し（書き込み後の最終値。UPSERT の `DO UPDATE`・`UPDATE` の SET 適用後・
+/// SET で触れない既存値を含む）、各 `FOREIGN KEY` の値の組が参照先の同一テナント
+/// 全行に存在することを確かめる。同一文・同一明示トランザクション内で先に書いた
+/// 参照先の行（自己参照で同じ文が書いた行を含む）も redb の write トランザクションが
+/// 自身の未 commit の書き込みを読めるため母集合に含まれる。`FOREIGN KEY` を宣言
+/// しないテーブルは即座に成功する。
+fn enforce_foreign_keys_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[u64],
+) -> Result<(), TenantWriteError> {
+    if schema.foreign_keys().is_empty() || written_ids.is_empty() {
+        return Ok(());
+    }
+    let (specs, mask) = foreign_key_specs(schema)?;
+    let mut required: Vec<RequiredParentKeys> = specs
+        .iter()
+        .map(|spec| RequiredParentKeys::new(spec.fk))
+        .collect();
+    {
+        let row_table_name = crate::catalog::user_rows_table_name(table_name);
+        let row_table = write_txn
+            .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+            .map_err(crate::catalog::map_row_table_error)?;
+        let written: BTreeSet<u64> = written_ids.iter().copied().collect();
+        for id in written {
+            let Some(guard) = row_table.get((tenant_id, id)).map_err(CatalogError::from)? else {
+                // 同一文内で後から削除された等、存在しない行は制約に違反し得ない
+                // （`enforce_unique_keys_in_txn` と同じ扱い）。
+                continue;
+            };
+            let values = decode_key_columns(schema, &mask, guard.value())?;
+            for (spec, req) in specs.iter().zip(required.iter_mut()) {
+                push_required_key(spec, &values, req)?;
+            }
+        }
+    }
+    for (spec, req) in specs.iter().zip(required) {
+        let parent = parent_schema_for(write_txn, table_name, spec.fk)?;
+        verify_required_parent_keys(
+            write_txn,
+            spec.fk.parent_table(),
+            parent.as_ref().unwrap_or(schema),
+            spec.fk,
+            tenant_id,
+            req,
+        )?;
+    }
+    Ok(())
+}
+
+/// 参照先テーブルの行に加えた変更の種類（[`enforce_referencing_rows_in_txn`] の
+/// 引数。TABLE-17・TASK-205、Issue #907）。変更が参照先キーに触れ得ない場合に
+/// 検査（参照元のテナント内全行走査）を省くための情報。
+#[derive(Clone, Copy)]
+pub(crate) enum ReferencedRowsChange<'a> {
+    /// 行の削除（単一行・述語つき `DELETE`・`TRUNCATE`・ファイル形 `INSERT` の
+    /// 旧行置換）。`id` を含むすべての参照先キーが失われ得る。
+    Removed,
+    /// 既存行の指定列（論理インデックス）のみの更新（`UPDATE ... SET`・UPSERT の
+    /// `DO UPDATE SET`）。`id` は予約列で `SET` できないため失われない。
+    ColumnsUpdated(&'a [usize]),
+    /// 既存行の全列置換（Rust API の `update_row`）。`id` は不変。
+    AllColumnsReplaced,
+}
+
+/// `FOREIGN KEY` の参照先側の検査（TABLE-17・TASK-205、Issue #907）。テーブル
+/// `table_name`（スキーマ `schema`）の行を削除・更新した write トランザクション内で、
+/// 行の変更・台帳記録の**後**・commit の**前**に呼ぶ（参照元側と同じ検査点・同じ
+/// 順序。`operation_id` の再送判定〔`23505`／`22023`〕が本検査より優先される）。
+///
+/// このテーブルを参照先とする各 `FOREIGN KEY`（他テーブル・自己参照のいずれも）に
+/// ついて、参照元の**同一テナントの全行**（可視性を問わない。RLS-10 (c)）の値の組が
+/// 変更後の参照先にすべて存在することを確かめる（事後状態の検証。削除・更新前の
+/// 値を保持する必要がなく、自己参照・複数行の同時削除・置換のいずれにも同一の
+/// 実装で効く）。`ALTER TABLE ... ADD FOREIGN KEY` を持たないため、各文の開始時点で
+/// 参照整合性は常に成立しており、この検証は既定の `NO ACTION`（非遅延のため
+/// `RESTRICT` と同値）と等価になる。違反は [`TenantWriteError::ForeignKeyViolation`]
+/// （呼び出し元は `write_txn` を commit しない）。
+///
+/// 更新（[`ReferencedRowsChange::ColumnsUpdated`]／`AllColumnsReplaced`）で主キー・
+/// UNIQUE 制約の構成列に触れない場合は、参照先キーが変わり得ないためカタログの
+/// 逆引きすら行わない（主キー・UNIQUE を宣言しないテーブルの `UPDATE` はコスト
+/// ゼロ）。計算量は参照元のテナント保有行数に比例する（一意性検査と同じく永続
+/// 索引は持たない。`docs/design/foreign-key.md` 参照）。
+pub(crate) fn enforce_referencing_rows_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    change: ReferencedRowsChange<'_>,
+) -> Result<(), TenantWriteError> {
+    let is_key_column = |name: &str| -> bool {
+        schema
+            .primary_key()
+            .is_some_and(|pk| pk.iter().any(|c| c == name))
+            || schema
+                .unique_constraints()
+                .iter()
+                .any(|u| u.columns().iter().any(|c| c == name))
+    };
+    let updated_names: Option<Vec<&str>> = match change {
+        ReferencedRowsChange::Removed => None,
+        ReferencedRowsChange::ColumnsUpdated(indices) => Some(
+            indices
+                .iter()
+                .filter_map(|&i| schema.columns.get(i).map(|c| c.name.as_str()))
+                .collect(),
+        ),
+        ReferencedRowsChange::AllColumnsReplaced => {
+            Some(schema.columns.iter().map(|c| c.name.as_str()).collect())
+        }
+    };
+    if let Some(names) = &updated_names {
+        if !names.iter().any(|n| is_key_column(n)) {
+            return Ok(());
+        }
+    }
+    let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table_name)?;
+    for (child_schema, fk) in &referencing {
+        if let Some(names) = &updated_names {
+            // `id` 参照は更新で失われない。列参照は、参照先列のいずれかが今回
+            // 更新された列に含まれる場合のみ検査する。
+            if fk.references_parent_id()
+                || !fk
+                    .parent_columns()
+                    .iter()
+                    .any(|c| names.contains(&c.as_str()))
+            {
+                continue;
+            }
+        }
+        // 参照元の同一テナント全行から、参照先に存在すべき値の組を集める。
+        let (specs, mask) = foreign_key_specs(child_schema)?;
+        let Some(spec) = specs.iter().find(|s| s.fk == fk) else {
+            return Err(internal(
+                "referencing foreign key not found in child schema",
+            ));
+        };
+        let mut required = RequiredParentKeys::new(fk);
+        {
+            let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
+            let row_table =
+                match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
+                    Ok(t) => t,
+                    // 参照元へまだ 1 行も挿入されていない（行ストア未作成）。
+                    Err(redb::TableError::TableDoesNotExist(_)) => continue,
+                    Err(e) => {
+                        return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                            e,
+                        )))
+                    }
+                };
+            let range_start = std::ops::Bound::Included((tenant_id, 0u64));
+            let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
+            for entry in row_table
+                .range::<(&str, u64)>((range_start, range_end))
+                .map_err(CatalogError::from)?
+            {
+                let (k, v) = entry.map_err(CatalogError::from)?;
+                let (key_tenant, _id) = k.value();
+                if key_tenant != tenant_id {
+                    break;
+                }
+                let values = decode_key_columns(child_schema, &mask, v.value())?;
+                push_required_key(spec, &values, &mut required)?;
+            }
+        }
+        verify_required_parent_keys(write_txn, table_name, schema, fk, tenant_id, required)?;
     }
     Ok(())
 }

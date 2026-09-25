@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
 
 define_error_classes! {
-    count = 32;
+    count = 34;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -245,6 +245,17 @@ define_error_classes! {
     /// [`crate::tenant::TenantWriteError::CheckViolation`]・
     /// [`crate::sql::allowlist::SqlSurfaceError::CheckViolation`] の写像。
     CheckViolation => ("23514", "CHECK_VIOLATION"),
+    /// `FOREIGN KEY` 制約（TABLE-17・TASK-205、Issue #907）の参照整合性違反
+    /// （`23503`）: 参照元の書き込みで参照先の値の組が同一テナント内に存在しない、
+    /// または参照先の削除・更新で参照元の行が残る。
+    /// [`crate::tenant::TenantWriteError::ForeignKeyViolation`]・
+    /// [`crate::sql::allowlist::SqlSurfaceError::ForeignKeyViolation`] の写像。
+    ForeignKeyViolation => ("23503", "FOREIGN_KEY_VIOLATION"),
+    /// `FOREIGN KEY` 宣言（TABLE-17・TASK-205、Issue #907）の参照先列が主キー・
+    /// UNIQUE 制約（または `id` 疑似列）と一致しない、あるいは参照元列と型が
+    /// 一致しない（`42830`）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidForeignKey`] の写像。
+    InvalidForeignKey => ("42830", "INVALID_FOREIGN_KEY"),
 }
 
 impl ErrorClass {
