@@ -52,14 +52,21 @@ Issue #953 で不透明バイト列として実装済み）へ組み立てる必
   既定値。X.509 の `Name` が `SEQUENCE → SET → SEQUENCE` で 5 階層程度に
   なるため十分な余裕を見込む）付きで検証する。あわせて、フィールドの意味を
   問わず入れ子の全階層で次の DER 制約を検査する
-  - universal クラスのタグは `SEQUENCE`／`SET` を除き primitive でなければ
-    ならない（constructed 化した文字列型等は `ConstructedUniversalType`）
-  - `SEQUENCE`／`SET` は常に constructed でなければならない（primitive の
-    `0x10`／`0x11` は `PrimitiveSequenceOrSet`）
-  - `NULL` は値が空、`BOOLEAN` はちょうど 1 バイトで `0x00`／`0xFF` のいずれか
-    （それ以外は `InvalidPrimitiveEncoding`）
-- 上記以外の primitive な値（`OCTET STRING`・`BIT STRING`・`INTEGER` 等）の
-  中身には潜らない（フィールドとしての検査は `x509.rs` が担う）
+  - X.690 が constructed を必須とする universal 型（`EXTERNAL`（8）・
+    `EMBEDDED PDV`（11）・`SEQUENCE`（16）・`SET`（17）・`CHARACTER STRING`
+    （29））は constructed でなければならない（primitive は
+    `PrimitiveConstructedOnlyType`）
+  - それ以外の universal 型（`BOOLEAN`・`INTEGER`・`BIT STRING`・
+    `OCTET STRING`・各種文字列型・時刻型等。予約済み・未定義のタグ番号も
+    fail-closed にこちらへ含める）は primitive でなければならない
+    （constructed は `ConstructedUniversalType`）
+  - `NULL` は値が空、`BOOLEAN` はちょうど 1 バイトで `0x00`／`0xFF` のいずれか、
+    `INTEGER`／`ENUMERATED` は空でなく最小符号化、`OBJECT IDENTIFIER`／
+    `RELATIVE-OID` は空でなくサブ識別子が最小符号化かつ切り詰められていない
+    こと（それ以外は `InvalidPrimitiveEncoding`）
+- 上記以外の primitive な値（`OCTET STRING`・`BIT STRING`・文字列型等）の
+  中身には潜らない（`BIT STRING` の形状はフィールドごとの拒否理由を保つため
+  `x509.rs` が検査する）
 - `Tlv` は `tag`・`value` に加えて `raw`（タグ+長さ+値の生バイト列）を持つ。
   `read_any` は消費前の残り入力（`start`）と消費後の残り入力（`remaining`）の
   長さの差分から `raw` を切り出す。`start`・`remaining` は常に同一バッファの
@@ -92,13 +99,16 @@ Issue #953 で不透明バイト列として実装済み）へ組み立てる必
      { type OBJECT IDENTIFIER, value ANY }` の構文（RFC 5280 §4.1.2.4）を
      検査する。RDN が `SET` でない・空の `SET`・`type` の OID 欠落／不正・
      `value` 欠落・余剰要素はいずれも `Malformed`。0 個の RDN から成る空の
-     `Name` は受理する。さらに `SET OF` の DER 正規順序（X.690 §11.6。各
+     issuer は RFC 5280 §4.1.2.4 に従い `Malformed` として拒否する。さらに `SET OF` の DER 正規順序（X.690 §11.6。各
      `AttributeTypeAndValue` の符号化バイト列が非減少の昇順）を検査し、
      隣接要素が降順の非正規 BER は `Malformed` とする（同一符号化の重複は
      昇順の定義上許容する）
    - `validity SEQUENCE { notBefore Time, notAfter Time }`（後続バイト拒否・
      `notBefore > notAfter` は `InvalidValidityRange`）
-   - `subject Name`（`issuer` と同じ構文・順序検査）
+   - `subject Name`（`issuer` と同じ構文・順序検査。ただし RFC 5280
+     §4.1.2.6 が subjectAltName で主体を表す場合に空の subject を認めるため、
+     0 個の RDN から成る空の subject は受理する。SAN の有無・critical との
+     整合は extensions の意味解釈に当たるため検査しない）
    - `subjectPublicKeyInfo SEQUENCE { AlgorithmIdentifier, BIT STRING }`:
      AlgorithmIdentifier は葉・中間を問わず構造検査（先頭に整形式の OID が
      1 個・任意の `parameters` は高々 1 個の TLV・余剰要素なし）を通し、OID・
@@ -118,7 +128,8 @@ Issue #953 で不透明バイト列として実装済み）へ組み立てる必
      `extnValue` 欠落／型違い・余剰要素はいずれも `Malformed`。`critical` の
      明示的な `FALSE`（`01 01 00`）は、DER（X.690 §11.5）が DEFAULT 値の省略を
      要求するものの、公開テストベクタである RFC 8410 §10.2 の証明書自身が
-     この形を使うため受理する。`extnValue` の中身は解釈しない
+     この形を使うため受理する。同一 `extnID` の Extension が 2 個以上ある場合も
+     RFC 5280 §4.2 に従い `Malformed` とする。`extnValue` の中身は解釈しない
    - `tbsCertificate` の後続バイトは拒否
 5. `tbsCertificate.signature` の AlgorithmIdentifier 構造検査（SPKI と同じ
    基準）の後、外側 `signatureAlgorithm` との DER バイト列一致（RFC 5280
@@ -180,8 +191,9 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
   側が検証する鍵一致は `CertificateVerify` 用の Ed25519 鍵一致のみで
   #961 の担当）
 - SAN・ホスト名・keyUsage・basicConstraints 等 extensions の意味解釈
-  （各 `Extension` の `extnID`／`critical`／`extnValue` の構文までは検査するが、
-  `extnValue` の中身は解釈しない。同一 `extnID` の重複検出も行わない）
+  （各 `Extension` の `extnID`／`critical`／`extnValue` の構文と `extnID` の
+  重複までは検査するが、`extnValue` の中身は解釈しない。空の subject と
+  subjectAltName の整合も検査しない）
 - issuer/subject `Name` の属性値の意味解釈（文字列型の妥当性・属性種別の
   制約）
 - 中間証明書どうしの issuer/subject 連結検査・パス構築（RFC 8446 §4.4.2 は
@@ -230,12 +242,19 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
   欠落・`extnValue` 欠落・`critical` の後置・`extnValue` が BIT STRING・
   余剰要素・`critical` が INTEGER・切り詰め `extnID`。単独でも正当な
   Extension の後続でも拒否。`critical` 省略・TRUE・明示 FALSE は受理）／
+  同一 `extnID` の重複（異なる `extnID` の組は受理）／空の issuer（葉・中間
+  とも。空の subject は受理）／Name の属性値に置いた `EXTERNAL` の primitive
+  形・constructed 化した UTF8String（constructed の `EXTERNAL` は受理）／
+  AlgorithmIdentifier parameters 内の非最小符号化・空の INTEGER／
   DER 長上限超過の拒否、エラー `Display` が証明書内容（CN 文字列・鍵の 16 進
   表現）を含まないこと、ファイル入口（一時ファイル経由の成功・存在しない
   ファイル）を固定した
 - 単体テスト（`tls/der.rs`）: long form 長さの境界・非最小符号化・indefinite・
-  high-tag-number／EOC・入れ子深さ上限・constructed 化した universal 型・
-  primitive の `SEQUENCE`／`SET`・`NULL`／`BOOLEAN` の非正規形の拒否
+  high-tag-number／EOC・入れ子深さ上限・constructed 化した primitive 専用
+  universal 型（予約済みタグ番号を含む）・primitive の `SEQUENCE`／`SET`／
+  `EXTERNAL`／`EMBEDDED PDV`／`CHARACTER STRING` の拒否（これらの constructed
+  形は受理）・`NULL`／`BOOLEAN`／`INTEGER`／`ENUMERATED`／`OBJECT
+  IDENTIFIER`／`RELATIVE-OID` の非正規形の拒否
 
 手組み DER エンコーダ（`tlv`／`sequence` 等）はテスト専用であり、本番コード
 には存在しない（`pkcs8` の結合テストと同方針）。
