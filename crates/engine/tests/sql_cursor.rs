@@ -723,3 +723,84 @@ fn declare_over_view_after_writing_its_base_table_is_rejected() {
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");
 }
+
+// --- 既存カーソル保持量を差し引いた生成予算（PR #1049 レビュー指摘 codex P1） ----
+
+/// 1 行あたり約 3 MiB の `TEXT` を持つ 3 行（計約 9 MiB）を投入した `EngineCore`。
+fn new_large_text_core() -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path("sql-cursor-remaining-budget");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create table");
+    let big = "x".repeat(3 * 1024 * 1024);
+    for id in 1..=3u64 {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx("tenant-a"),
+            id,
+            Visibility::Public,
+            &[
+                engine::row_codec::Value::Vector(vec![1.0, 0.0]),
+                engine::row_codec::Value::Text(big.clone()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("big-{id}"))
+                .expect("valid operation id"),
+        )
+        .expect("seed large row");
+    }
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        path,
+    )
+}
+
+/// 2 本目の `DECLARE` は、既存カーソルの保持量（約 9 MiB）を差し引いた残容量を
+/// 内側 SELECT の生成予算として受け取り、生成途中で打ち切られる（`declare` の
+/// 合計上限判定まで約 18 MiB を確保しない）。1 本目を `CLOSE` すると残容量が戻り
+/// 同じ `DECLARE` が成功する。
+#[test]
+fn second_declare_uses_remaining_session_budget_during_generation() {
+    let (engine, path) = new_large_text_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+
+    let declare =
+        |name: &str| format!("DECLARE {name} CURSOR FOR SELECT id, lang FROM {TABLE} LIMIT 10");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &declare("c1"))
+        .expect("first ~9 MiB cursor fits in the 16 MiB session budget");
+
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &declare("c2"))
+        .expect_err("second ~9 MiB cursor must exceed the remaining budget");
+    assert_eq!(err.wire_code(), "54000");
+    assert!(
+        err.to_string().contains("scan result exceeds capacity"),
+        "must be cut during generation by the remaining budget, not after it: {err}"
+    );
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+
+    // `CLOSE` で保持量が解放されれば、同じ内容の 2 本目は成功する。
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin 2");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &declare("c1"))
+        .expect("declare c1");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "CLOSE c1")
+        .expect("close c1");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &declare("c2"))
+        .expect("remaining budget is restored after CLOSE");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback 2");
+}

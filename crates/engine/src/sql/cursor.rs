@@ -376,6 +376,14 @@ impl CursorRegistry {
         self.check_can_declare(name)
     }
 
+    /// セッションのカーソル合計バイト上限（[`MAX_CURSOR_BYTES_PER_SESSION`]）から
+    /// 既存カーソルの保持量を差し引いた残容量（`DECLARE` の内側 SELECT の生成
+    /// 予算。`core.rs::EngineCore::execute_cursor_in_active_txn` が実行前に呼ぶ。
+    /// PR #1049 レビュー指摘 codex P1 対応）。
+    pub(crate) fn remaining_bytes(&self) -> usize {
+        MAX_CURSOR_BYTES_PER_SESSION.saturating_sub(self.total_bytes)
+    }
+
     /// 内側 SELECT の実行結果を確定済みカーソルとして登録する。呼び出し元は
     /// 直前に [`Self::ensure_capacity_for_declare`] を呼び出し済みであること
     /// （同期実行のため、両者の間に他の変更が割り込む余地はない）。

@@ -3177,11 +3177,20 @@ impl EngineCore {
     /// の行生成ループが 16 MiB 予算を生成中に検査するようにする）。それ以外の
     /// `Statement` 種別への到達は構造検証段の保証により起き得ないが、防御的に
     /// 通常の [`Self::execute_validated_in_session`] へ委譲する。
+    ///
+    /// `max_result_bytes` は呼び出し元（[`Self::execute_cursor_in_active_txn`]）が
+    /// 実行前に求めたセッションのカーソル残容量（[`crate::sql::cursor::
+    /// CursorRegistry::remaining_bytes`]＝16 MiB − 既存カーソルの保持量）。
+    /// 上記の 16 MiB は既存カーソルが無い場合の上限であり、既存カーソルが
+    /// 保持している分を差し引いた残容量を生成予算にすることで、`declare` の
+    /// 合計上限判定より前に「既存保持量＋新規結果」が上限を超えて確保される
+    /// ことを防ぐ（PR #1049 レビュー指摘 codex P1 対応）。
     fn execute_cursor_inner_query(
         &self,
         ctx: &PolicyContext,
         session: &mut crate::sql::mode::SessionState,
         inner: &crate::sql::allowlist::Statement,
+        max_result_bytes: usize,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         if let crate::sql::allowlist::Statement::Scan(validated) = inner {
             let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
@@ -3191,20 +3200,15 @@ impl EngineCore {
                 ctx,
                 &schema,
                 &bound,
-                crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION,
+                max_result_bytes,
             )?;
             return Ok(crate::sql::SqlOutcome::Query(result));
         }
         if let crate::sql::allowlist::Statement::Aggregate(validated) = inner {
             let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
             let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
-            let result = self.run_aggregate_plan(
-                &read_txn,
-                ctx,
-                &schema,
-                &bound,
-                crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION,
-            )?;
+            let result =
+                self.run_aggregate_plan(&read_txn, ctx, &schema, &bound, max_result_bytes)?;
             return Ok(crate::sql::SqlOutcome::Query(result));
         }
         self.execute_validated_in_session(ctx, session, inner.clone())
@@ -3249,12 +3253,16 @@ impl EngineCore {
                         "reading a table already written in the same transaction is not supported",
                     ));
                 }
-                txn.cursors_mut()
-                    .ok_or_else(|| SqlSurfaceError::Internal {
-                        detail: "internal error".to_string(),
-                    })?
-                    .ensure_capacity_for_declare(name)?;
-                let outcome = self.execute_cursor_inner_query(ctx, session, &inner)?;
+                let registry = txn.cursors_mut().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                registry.ensure_capacity_for_declare(name)?;
+                // 既存カーソルの保持量を差し引いた残容量を内側 SELECT の生成予算に
+                // する（PR #1049 レビュー指摘 codex P1 対応。
+                // `execute_cursor_inner_query` のドキュメント参照）。
+                let remaining_bytes = registry.remaining_bytes();
+                let outcome =
+                    self.execute_cursor_inner_query(ctx, session, &inner, remaining_bytes)?;
                 let result = match outcome {
                     crate::sql::SqlOutcome::Query(result) => result,
                     // `inner` は構造検証段で `Statement::Aggregate`／
