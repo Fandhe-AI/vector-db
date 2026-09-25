@@ -39,6 +39,14 @@
 //!   シーケンス番号・`TLSInnerPlaintext`（内容型・パディング）・AAD の構成・
 //!   handshake 鍵 → application 鍵の方向別切替（[`record_protection::
 //!   Sealer`]／[`record_protection::Opener`]）を提供する
+//! - [`pem`]: PEM（RFC 7468）ブロックのデコードと、鍵・証明書ファイルの
+//!   上限付き読み込み（Issue #962）。定数時間 base64 デコーダを持ち、
+//!   秘密鍵ブロックはちょうど 1 個・証明書チェーンは複数ブロックを順序
+//!   どおりに受け付ける
+//! - [`pkcs8`]: PKCS#8 v1・Ed25519（RFC 8410 §7）の最小 DER パース
+//!   （Issue #962）。[`pem`] が返す DER から 32 バイトの seed を取り出し、
+//!   RSA・ECDSA・v2（OneAsymmetricKey）等は起動時に明示的に拒否する。
+//!   鍵導出・署名は #961 の担当
 //! - [`transcript`]: transcript hash（RFC 8446 §4.4.1。Issue #964）。
 //!   ハンドシェイクメッセージ列の累積 SHA-256 を、更新順序の単一情報源
 //!   （[`transcript::Transcript::expected_next`]）とともに提供し、
@@ -61,6 +69,8 @@ pub mod finished;
 pub mod handshake;
 pub mod hkdf;
 pub mod key_schedule;
+pub mod pem;
+pub mod pkcs8;
 pub mod record;
 pub mod record_protection;
 pub mod transcript;

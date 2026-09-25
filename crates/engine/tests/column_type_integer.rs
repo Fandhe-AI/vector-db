@@ -381,11 +381,13 @@ fn non_integer_literal_forms_are_rejected_with_22000() {
     assert_eq!(count_rows(&core, &ctx), 0);
 }
 
-/// 整数列を `WHERE`・`GROUP BY`・式で参照した場合は後続 Issue（#891・#893）
-/// までの fail-closed 拒否として `22000` になる（本 Issue のスコープ外機能の
-/// 挙動を固定する）。集計（`SUM` 等）の直接参照は Issue #892 で受理された
-/// ため、この契約からは除外する
-/// （[`sum_of_integer_column_succeeds_after_issue_892`] 参照）。
+/// 整数列を `WHERE`（裸の数値リテラル形。式評価経路）・`GROUP BY`・式で
+/// 参照した場合は fail-closed 拒否として `22000` になる。#891・TASK-199 は
+/// 算術を持たない非数値型（DATE/TIMESTAMP/NUMERIC/UUID/BYTEA）の WHERE 等価・
+/// 範囲比較のみを対象としたため、INTEGER 列を算術・WHERE 範囲比較で使う経路
+/// （レーン A）は引き続き別 Issue（#893 と合わせて）へ申し送り。集計
+/// （`SUM` 等）の直接参照は Issue #892 で受理されたため、この契約からは
+/// 除外する（[`sum_of_integer_column_succeeds_after_issue_892`] 参照）。
 #[test]
 fn integer_column_reference_in_where_group_by_and_expr_is_rejected_with_22000() {
     let path = unique_db_path("column-type-integer-unsupported-refs");
