@@ -72,7 +72,8 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
   [--durability immediate|none] \
   [--ddl-allowed-users <user1>[,<user2>...]] \
   [--auth-method cleartext|scram-sha-256] \
-  [--scram-mock-key-file <path>]
+  [--scram-mock-key-file <path>] \
+  [--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow]]
 ```
 
 `--users`・`--db` はいずれも必須です（省略時は匿名ログイン・匿名 DB を暗黙生成せず
@@ -234,9 +235,10 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
 - **NoSQL 表層（`--surface nosql`）とは併用できません**（起動時 fail-closed で
   拒否）。`POST /v1/session` は Argon2id 照合を直接呼ぶ別経路であり SASL の
   ような往復を持たないためです（HTTP-10）。
-- TLS（TASK-72・WIRE-9）は未実装のため、channel binding
-  （`SCRAM-SHA-256-PLUS`・`p=` フラグ）は提示・受理せず `08P01` で拒否します
-  （詳細は Issue #941 参照）。
+- TLS 自体は `--tls-cert`／`--tls-key`（下記参照）で opt-in できますが、
+  SCRAM channel binding（`SCRAM-SHA-256-PLUS`・`p=` フラグ）は現時点では
+  結線されておらず提示・受理せず `08P01` で拒否します（詳細は Issue #941・
+  #970 参照）。
 - **`--scram-mock-key-file <path>` が必須です**（`scram-sha-256` 選択時のみ。
   未指定・`cleartext` との組合せ・32 バイト未満のファイルはいずれも
   fail-closed で起動拒否）。未知ユーザー向けモック検証子（列挙攻撃対策）の
@@ -263,6 +265,35 @@ username・空要素・重複要素・フラグの重複指定はいずれも fa
 権限で、`RLS` の判定は変更しません。詳細な構文・権限判定順序は
 `docs/design/sql-create-table.md`・`docs/design/drop-table.md`・
 `docs/design/create-view.md`・`docs/design/index-ddl-declaration.md` 参照）。
+
+`--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
+WIRE-7, WIRE-9 ポインタ）は SQL 表層（pg wire）の TLS を有効化する opt-in
+CLI 引数です。`--tls-cert`（サーバー証明書チェーン PEM）・`--tls-key`
+（Ed25519 PKCS#8 秘密鍵 PEM）は両方揃って初めて意味を持ち、片方のみの
+指定は fail-closed で起動エラーになります（`--search-engine`／
+`--durability` と同型の「プロセス起動時にのみ明示指定する注入点」）。
+証明書・鍵の読み込み・検証（鍵と証明書の公開鍵一致・有効期限）に失敗した
+場合も起動を拒否し、鍵・証明書の内容はエラーメッセージへ一切出力されません。
+
+`--tls-mode`（`require`／`allow`。`--tls-cert`／`--tls-key` を指定した
+ときのみ意味を持ち、単独指定は fail-closed。未指定時の既定は安全側の
+`require`）は `SSLRequest` を経ない平文 StartupMessage の受理ポリシーです。
+
+- `require`（既定）: 平文 StartupMessage を startup パラメータを解釈する
+  前に `08P01` で拒否します。TLS を構成済みであれば非ループバックアドレス
+  への bind も許可されます（WIRE-9 を満たすため）。
+- `allow`: 平文接続も受理します。平文パスワードが漏えいしうるため、
+  TLS 未構成時（`Cleartext`）と同じくループバック限定のままです
+  （非ループバック bind は起動時に fail-closed で拒否され、`require` へ
+  切り替えるよう案内するヒントを表示します）。
+
+TLS 有効時は起動ログへ `TLS enabled (mode=require|allow)` の 1 行のみを
+出します（未指定時はこの行を一切出さず、既存の起動ログはビット同一の
+まま不変です）。`--surface nosql`（HTTP リスナー）との併用は現時点では
+拒否されます（NoSQL 表層はまだ TLS を終端しないため。Issue #968 で対応
+予定）。実クライアント（psql・openssl s_client 等）での接続試験は
+Issue #969、SCRAM channel binding（`tls-server-end-point`）は Issue #970 の
+担当です。詳細は `docs/design/tls-wire-connection.md` を参照してください。
 
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 

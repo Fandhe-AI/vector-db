@@ -14,6 +14,7 @@
 //! [--hnsw-sparse-visited-max <N>]
 //! [--auth-method cleartext|scram-sha-256] [--scram-mock-key-file <path>]
 //! [--ddl-allowed-users <user1>[,<user2>...]]
+//! [--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow]]
 //! [--fault-inject post-commit-panic]`
 //! （既定 bind: `127.0.0.1:5432`）。`--db` は必須（省略時は fail-closed で
 //! 非 0 終了。匿名・揮発 DB の暗黙生成はしない。TASK-73・WIRE-1）。
@@ -106,6 +107,30 @@
 //! で拒否される既定）。値の解決は `ddl_permission_opt::parse`・
 //! `UserStore::with_ddl_allowed_users` に一本化する。
 //!
+//! `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
+//! WIRE-7, WIRE-9 ポインタ）: TLS opt-in の唯一の入口。`--tls-cert`（証明書
+//! チェーン PEM）・`--tls-key`（Ed25519 PKCS#8 秘密鍵 PEM）は両方揃って
+//! 初めて意味を持つ（`--planner-endpoint`／`--planner-model` と同じ設計。
+//! 片方のみの指定は fail-closed で起動エラー）。読み込み・検証は
+//! `wire_server::tls_opt::load_server_config`（`crate::tls::server_handshake::
+//! TlsServerConfig`）に一本化し、鍵・証明書の内容・長さはエラーメッセージへ
+//! 出さない。`--tls-mode`（`require`／`allow`。未指定時の既定は `require`。
+//! 安全側）は `--tls-cert`／`--tls-key` を指定したときのみ意味を持ち、単独
+//! 指定は組合せ不正として fail-closed 拒否する（`--hnsw-*` が
+//! `--search-engine` を要求するのと同じ設計）。`--surface nosql` との併用も
+//! 拒否する（HTTP リスナーは #968 まで平文のまま。TLS フラグと組み合わせると
+//! bind ガードだけが `TlsRequired`／`TlsOptional` へ緩み、HTTP-10 が意図しない
+//! 経路で平文 HTTP が非ループバックへ露出しうるため）。`bind_guard::
+//! TransportSecurity` は TLS 未指定時 `Cleartext`、`require` 選択時
+//! `TlsRequired`（非ループバック bind を許可。WIRE-9 を満たす）、`allow` 選択時
+//! `TlsOptional`（`Cleartext` と同じくループバック限定。D1: `allow` は平文
+//! 接続を受理する以上、非ループバックでは WIRE-9 を満たせないため警告のみで
+//! 済ませず起動を拒否する。`docs/design/tls-wire-connection.md` 参照）。
+//! TLS 有効時は起動ログへ `TLS enabled (mode=...)` の 1 行のみを出す
+//! （鍵・証明書の内容は出さない）。`SSLRequest` への `'S'` 応答・TLS
+//! ハンドシェイク本体（Issue #965・#966）・実クライアント接続試験（#969）・
+//! SCRAM channel binding（#970）は本 Issue の対象外のまま。
+//!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
 //! ログ・引数に残さない）。
@@ -124,15 +149,15 @@
 //! TASK-69（対象ビヘイビア WIRE-5, WIRE-6）・TASK-70（対象ビヘイビア WIRE-7）・
 //! TASK-99（対象ビヘイビア RECOVER-8。`engine::recovery::fail_fast::install` を
 //! 起動時に結線し、panic を経路・スレッド問わずプロセス終了へ統一する）。
-//! `--bind` は [`wire_server::bind_guard::GuardedBindAddrs::resolve`] により、TLS 未構成
-//! （[`wire_server::bind_guard::TransportSecurity::Cleartext`]）の間は非ループバック
-//! アドレスを起動時に fail-closed で拒否したうえで、検証済みの数値アドレスへ直接 bind
-//! する（TLS 未実装のうちは平文パスワードを非ループバックへ公開しない。ホスト名の
-//! 再解決による TOCTOU も作らない。TASK-67 review 是正・TASK-70 で移設）。同時接続数
-//! 上限・認証前後の読み取りタイムアウトは [`wire_server::limits`] の契約値を
-//! [`wire_server::server::accept_loop_with_limiter`] が適用する（TASK-69）。
-//! TLS 導入（TASK-72・WIRE-9）時は [`wire_server::bind_guard::TransportSecurity`]
-//! に variant を追加し、ここで渡す値を実行時の TLS 設定有無に応じて切り替える。
+//! `--bind` は [`wire_server::bind_guard::GuardedBindAddrs::resolve`] により、通信路の
+//! 保護状態（[`wire_server::bind_guard::TransportSecurity`]。TLS 未構成なら
+//! `Cleartext`、`--tls-mode require` なら `TlsRequired`、`allow` なら `TlsOptional`。
+//! Issue #967）に応じて非ループバックアドレスを起動時に fail-closed で拒否したうえで、
+//! 検証済みの数値アドレスへ直接 bind する（TLS 未構成・`allow` 選択時は平文パスワードを
+//! 非ループバックへ公開しない。ホスト名の再解決による TOCTOU も作らない。TASK-67
+//! review 是正・TASK-70 で移設）。同時接続数上限・認証前後の読み取りタイムアウトは
+//! [`wire_server::limits`] の契約値を [`wire_server::server::accept_loop_with_limiter`]／
+//! [`wire_server::server::accept_loop_with_tls_mode`] が適用する（TASK-69）。
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -192,6 +217,9 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut ddl_allowed_users_raw: Option<String> = None;
     let mut auth_method_raw: Option<String> = None;
     let mut scram_mock_key_file_raw: Option<PathBuf> = None;
+    let mut tls_cert_raw: Option<PathBuf> = None;
+    let mut tls_key_raw: Option<PathBuf> = None;
+    let mut tls_mode_raw: Option<String> = None;
     // Issue #705（テスト専用・feature `fault-injection` 限定）。feature 無効
     // ビルドではこの変数自体が存在せず、`--fault-inject` は下記 `other =>`
     // 分岐で未知引数として拒否される。
@@ -433,6 +461,65 @@ fn run_server(args: &[String]) -> ExitCode {
                 scram_mock_key_file_raw = Some(PathBuf::from(v));
                 i += 2;
             }
+            wire_server::tls_opt::CERT_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires a path argument",
+                        wire_server::tls_opt::CERT_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #967: 起動後に変更できない構成値のため、他の閉じた
+                // 語彙フラグ・パス引数フラグ（`--scram-mock-key-file` 等）と
+                // 同じ理由で 2 回目以降の指定を fail-closed に拒否する
+                // （last-wins にしない）。
+                if tls_cert_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::tls_opt::CERT_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                tls_cert_raw = Some(PathBuf::from(v));
+                i += 2;
+            }
+            wire_server::tls_opt::KEY_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires a path argument",
+                        wire_server::tls_opt::KEY_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if tls_key_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::tls_opt::KEY_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                tls_key_raw = Some(PathBuf::from(v));
+                i += 2;
+            }
+            wire_server::tls_opt::MODE_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires one of {:?}",
+                        wire_server::tls_opt::MODE_FLAG,
+                        wire_server::tls_opt::MODE_TOKENS
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if tls_mode_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::tls_opt::MODE_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                tls_mode_raw = Some(v.clone());
+                i += 2;
+            }
             // Issue #705（テスト専用・feature `fault-injection` 限定）。feature
             // 無効ビルドではこのアームごとコンパイルされず、`--fault-inject`
             // は下の `other =>` で未知引数として拒否される（fail-closed）。
@@ -624,6 +711,38 @@ fn run_server(args: &[String]) -> ExitCode {
         _ => {}
     }
 
+    // Issue #967: `--tls-cert`／`--tls-key`／`--tls-mode` の組合せ検証は
+    // `resolve_tls_options` に一本化する（`resolve_search_engine` と同じ
+    // 「純関数へ切り出して単体テストできるようにする」流儀）。片方のみの
+    // 指定・`--tls-mode` 単独指定・不正な語彙値はいずれも fail-closed で
+    // 起動エラー（D3・D4）。
+    let tls_options = match resolve_tls_options(
+        tls_cert_raw.as_deref(),
+        tls_key_raw.as_deref(),
+        tls_mode_raw.as_deref(),
+    ) {
+        Ok(opt) => opt,
+        Err(e) => {
+            eprintln!("wire-server: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // D5: NoSQL 表層（HTTP リスナー）は #968 まで平文のまま TLS を結線して
+    // いない。TLS フラグと `--surface nosql` を組み合わせると bind ガード
+    // だけが `TlsRequired`／`TlsOptional` へ緩み、実際には平文の HTTP が
+    // 非ループバックへ露出しうる（HTTP-10 違反）ため、`--auth-method
+    // scram-sha-256 × nosql` と同じ場所・同じ流儀で起動時に拒否する。
+    if tls_options.is_some() && surface == wire_server::surface::Surface::Nosql {
+        eprintln!(
+            "wire-server: {}/{} cannot be combined with {} nosql (NoSQL surface does not yet \
+             terminate TLS; see HTTP-9/HTTP-10)",
+            wire_server::tls_opt::CERT_FLAG,
+            wire_server::tls_opt::KEY_FLAG,
+            wire_server::surface::FLAG
+        );
+        return ExitCode::FAILURE;
+    }
+
     let Some(users_path) = users_path else {
         eprintln!("wire-server: --users <path> is required (fail-closed: no anonymous login)");
         return ExitCode::FAILURE;
@@ -635,14 +754,56 @@ fn run_server(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    // TLS（TASK-72・WIRE-9）は未実装のため常に `Cleartext` を渡す。bind の
-    // loopback 検証をユーザーストア読込より前に行うことで、ユーザーストアの
-    // 内容に関わらず bind 先が拒否対象であれば即座に終了できる（fail-closed を
-    // 早期に確定させる）。
-    let guarded = match GuardedBindAddrs::resolve(&bind_addr, TransportSecurity::Cleartext) {
+    // Issue #967: 証明書・鍵の読み込みは `--users`／`--db` 必須チェックの後・
+    // `GuardedBindAddrs::resolve` の前に行う（受理不能な TLS 構成のまま
+    // bind 検証・listen へ進む経路を作らない。fail-closed）。読み込み・検証
+    // 失敗時のエラーメッセージは `TlsConfigLoadError` の内容非依存な
+    // `Display` に委譲するため、鍵・証明書のバイト列・長さは出力されない。
+    let tls_config = match &tls_options {
+        None => None,
+        Some((cert, key, _mode)) => match wire_server::tls_opt::load_server_config_arc(cert, key) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                eprintln!("wire-server: failed to load TLS configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    // 通信路の保護状態は TLS opt-in の有無・`--tls-mode` によって決まる
+    // （Issue #967。TLS 未指定は従来どおり `Cleartext`）。bind の検証を
+    // ユーザーストア読込より前に行うことで、ユーザーストアの内容に関わらず
+    // bind 先が拒否対象であれば即座に終了できる（fail-closed を早期に
+    // 確定させる）。
+    let transport_security = match tls_options.as_ref().map(|(_, _, mode)| *mode) {
+        None => TransportSecurity::Cleartext,
+        Some(wire_server::tls_opt::TlsMode::Require) => TransportSecurity::TlsRequired,
+        Some(wire_server::tls_opt::TlsMode::Allow) => TransportSecurity::TlsOptional,
+        // `TlsMode` は `#[non_exhaustive]`（将来 variant 追加時に下流の
+        // exhaustive match を破壊しないため）。現時点で他 variant は存在
+        // せず構造的に到達しないが、fail-closed に起動拒否へ倒す
+        // （黙って `Cleartext` 等へ読み替えない）。
+        Some(_) => {
+            eprintln!("wire-server: unsupported TLS mode");
+            return ExitCode::FAILURE;
+        }
+    };
+    let guarded = match GuardedBindAddrs::resolve(&bind_addr, transport_security) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("wire-server: {e}");
+            // D1: `--tls-mode allow` を選んだ場合のみ、`require` へ切り替える
+            // ことで非ループバック bind が受理されうる旨を補足する（`allow`
+            // は平文接続を受理する以上、通信路保護の観点で `require` へ
+            // 切り替えない限り非ループバックへは出せないため）。
+            if transport_security == TransportSecurity::TlsOptional {
+                eprintln!(
+                    "wire-server: hint: {} allow accepts plaintext connections; use {} require \
+                     for non-loopback binds (WIRE-9)",
+                    wire_server::tls_opt::MODE_FLAG,
+                    wire_server::tls_opt::MODE_FLAG
+                );
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -852,6 +1013,14 @@ fn run_server(args: &[String]) -> ExitCode {
         );
     }
 
+    // Issue #967: TLS 有効時に限り、有効であることと `--tls-mode` を起動ログへ
+    // 1 行だけ出す（鍵・証明書の内容は出さない）。未指定時はこの行を一切出さず
+    // 既存 stderr をビット同一のまま保つ（`durability`／`surface nosql` の行と
+    // 同じ方針。`listening on` より前・bind 成功後に置く）。
+    if let Some((_, _, mode)) = &tls_options {
+        eprintln!("wire-server: TLS enabled (mode={})", mode.token());
+    }
+
     // 実際に bind されたアドレスを出す（`--bind 127.0.0.1:0` の ephemeral port
     // 割り当て結果を E2E テストハーネスがこの行から取得する前提。TASK-73）。
     match listener.local_addr() {
@@ -869,7 +1038,32 @@ fn run_server(args: &[String]) -> ExitCode {
     let limiter = limits::ConnectionLimiter::new(limits::MAX_CONNECTIONS);
     match surface {
         wire_server::surface::Surface::Sql => {
-            server::accept_loop_with_engine(listener, store, core, limiter, limits::READ_TIMEOUT);
+            // Issue #967: TLS 有効時は `accept_loop_with_tls_mode` へ切り替える
+            // （`tls_options` は D5 により `Surface::Nosql` と同時に `Some` へは
+            // ならない）。無効時は従来どおり `accept_loop_with_engine` を呼び、
+            // 既存経路とビット同一のまま維持する。
+            match (&tls_config, &tls_options) {
+                (Some(cfg), Some((_, _, mode))) => {
+                    server::accept_loop_with_tls_mode(
+                        listener,
+                        store,
+                        Some(core),
+                        Some(Arc::clone(cfg)),
+                        *mode,
+                        limiter,
+                        limits::READ_TIMEOUT,
+                    );
+                }
+                _ => {
+                    server::accept_loop_with_engine(
+                        listener,
+                        store,
+                        core,
+                        limiter,
+                        limits::READ_TIMEOUT,
+                    );
+                }
+            }
         }
         wire_server::surface::Surface::Nosql => {
             // Issue #752: `store` はセッション認証（`POST /v1/session`）の
@@ -1061,6 +1255,57 @@ fn resolve_auth_method(raw: Option<&str>) -> Result<wire_server::auth::AuthMetho
     match raw {
         None => Ok(wire_server::auth::AuthMethod::default()),
         Some(raw) => wire_server::auth_method_opt::parse(raw),
+    }
+}
+
+/// `--tls-cert`／`--tls-key`／`--tls-mode` の未パース値（Issue #967）から
+/// `(cert_path, key_path, TlsMode)` を解決する。純関数として切り出し、
+/// `std::env::args()` を直接読まずに単体テストできるようにする
+/// （`resolve_search_engine`・`resolve_durability` と同じ流儀。
+/// `--scram-mock-key-file` の組合せ検証を参考にした設計）。
+///
+/// - `cert`・`key` がいずれも `None`: TLS 未指定。`mode_raw` が `Some` でも
+///   単独指定として `Err`（D4。`--hnsw-*` が `--search-engine` を要求するのと
+///   同じ設計）。それ以外は `Ok(None)`（TLS 無効のまま既存経路を通す）。
+/// - `cert`・`key` の片方のみ `Some`: 組合せ不正として `Err`。
+/// - `cert`・`key` がいずれも `Some`: `mode_raw` を [`wire_server::tls_opt::
+///   parse`] で解決する（`None`＝未指定は既定 `TlsMode::Require`。D3:
+///   安全側の既定値）。不正な語彙値は `Err`（fail-closed。既定へ黙って
+///   読み替えない）。
+fn resolve_tls_options(
+    cert: Option<&std::path::Path>,
+    key: Option<&std::path::Path>,
+    mode_raw: Option<&str>,
+) -> Result<Option<(PathBuf, PathBuf, wire_server::tls_opt::TlsMode)>, String> {
+    match (cert, key) {
+        (None, None) => {
+            if mode_raw.is_some() {
+                return Err(format!(
+                    "{} requires {} and {} to also be set",
+                    wire_server::tls_opt::MODE_FLAG,
+                    wire_server::tls_opt::CERT_FLAG,
+                    wire_server::tls_opt::KEY_FLAG
+                ));
+            }
+            Ok(None)
+        }
+        (Some(_), None) => Err(format!(
+            "{} requires {} to also be set",
+            wire_server::tls_opt::CERT_FLAG,
+            wire_server::tls_opt::KEY_FLAG
+        )),
+        (None, Some(_)) => Err(format!(
+            "{} requires {} to also be set",
+            wire_server::tls_opt::KEY_FLAG,
+            wire_server::tls_opt::CERT_FLAG
+        )),
+        (Some(cert), Some(key)) => {
+            let mode = match mode_raw {
+                None => wire_server::tls_opt::TlsMode::Require,
+                Some(raw) => wire_server::tls_opt::parse(raw)?,
+            };
+            Ok(Some((cert.to_path_buf(), key.to_path_buf(), mode)))
+        }
     }
 }
 
@@ -1545,6 +1790,92 @@ mod tests {
     fn resolve_durability_rejects_case_variant() {
         // 厳密一致のみ受理（`durability_opt::parse` の契約）。
         expect_err(resolve_durability(Some("Immediate")));
+    }
+
+    // Issue #967: `--tls-cert`／`--tls-key`／`--tls-mode` の組合せ解決の
+    // 単体テスト。子プロセス経由の外形的検証（起動受理・拒否・TLS
+    // ハンドシェイク完走・`08P01` 平文拒否）は `tests/wire_tls_cli.rs` が担う。
+
+    #[test]
+    fn resolve_tls_options_none_when_all_unset() {
+        assert_eq!(resolve_tls_options(None, None, None), Ok(None));
+    }
+
+    #[test]
+    fn resolve_tls_options_mode_alone_is_rejected() {
+        // D4: `--tls-mode` 単独指定は組合せ不正（`--hnsw-*` が
+        // `--search-engine` を要求するのと同じ設計）。
+        let err = expect_err(resolve_tls_options(None, None, Some("require")));
+        assert!(
+            err.contains(wire_server::tls_opt::MODE_FLAG),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_tls_options_cert_alone_is_rejected() {
+        let err = expect_err(resolve_tls_options(
+            Some(std::path::Path::new("cert.pem")),
+            None,
+            None,
+        ));
+        assert!(
+            err.contains(wire_server::tls_opt::KEY_FLAG),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_tls_options_key_alone_is_rejected() {
+        let err = expect_err(resolve_tls_options(
+            None,
+            Some(std::path::Path::new("key.pem")),
+            None,
+        ));
+        assert!(
+            err.contains(wire_server::tls_opt::CERT_FLAG),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_tls_options_mode_unset_defaults_to_require() {
+        // D3: モード省略時の既定は安全側の `require`。
+        let (cert, key, mode) = resolve_tls_options(
+            Some(std::path::Path::new("cert.pem")),
+            Some(std::path::Path::new("key.pem")),
+            None,
+        )
+        .expect("cert+key must be accepted")
+        .expect("cert+key must yield Some");
+        assert_eq!(cert, std::path::PathBuf::from("cert.pem"));
+        assert_eq!(key, std::path::PathBuf::from("key.pem"));
+        assert_eq!(mode, wire_server::tls_opt::TlsMode::Require);
+    }
+
+    #[test]
+    fn resolve_tls_options_accepts_explicit_allow() {
+        let (_, _, mode) = resolve_tls_options(
+            Some(std::path::Path::new("cert.pem")),
+            Some(std::path::Path::new("key.pem")),
+            Some("allow"),
+        )
+        .expect("cert+key+allow must be accepted")
+        .expect("cert+key+allow must yield Some");
+        assert_eq!(mode, wire_server::tls_opt::TlsMode::Allow);
+    }
+
+    #[test]
+    fn resolve_tls_options_rejects_unknown_mode_value() {
+        let err = expect_err(resolve_tls_options(
+            Some(std::path::Path::new("cert.pem")),
+            Some(std::path::Path::new("key.pem")),
+            Some("prefer"),
+        ));
+        assert!(
+            err.contains(wire_server::tls_opt::MODE_FLAG),
+            "unexpected error: {err}"
+        );
     }
 
     /// テストごとに衝突しない一時ディレクトリ（DB ファイルの置き場）を確保し、

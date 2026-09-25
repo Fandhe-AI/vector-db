@@ -1,11 +1,12 @@
 //! TASK-70（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-7）。
 //!
-//! wire-server は cleartext password 認証（WIRE-2）を前提とし、TLS は未実装
-//! （TASK-72・WIRE-9 は設計 ADR `docs/design/tls-scram-design.md` のみ・Proposed）。
-//! この状態で非ループバックアドレスへ bind すると、平文パスワード・クエリ・結果が
-//! loopback 外へ晒される。本モジュールは `main.rs::run_server` の唯一の bind 経路
-//! （[`GuardedBindAddrs`]）として、通信路の保護状態（[`TransportSecurity`]）に応じた
-//! 要件を起動時に検証し、満たさなければ fail-closed で拒否する。
+//! wire-server は cleartext password 認証（WIRE-2）を前提とし、非ループバック
+//! アドレスへ bind するには TLS が必須（TASK-72・WIRE-9。CLI opt-in は
+//! `crate::tls_opt`・Issue #967）。TLS 未構成のまま非ループバックへ bind すると、
+//! 平文パスワード・クエリ・結果が loopback 外へ晒される。本モジュールは
+//! `main.rs::run_server` の唯一の bind 経路（[`GuardedBindAddrs`]）として、通信路の
+//! 保護状態（[`TransportSecurity`]）に応じた要件を起動時に検証し、満たさなければ
+//! fail-closed で拒否する。
 //!
 //! `server.rs`（accept ループ・同時接続数の有界化・I/O タイムアウト）とは責務を分離し、
 //! bind 前の検証のみをここに集約する（TASK-67 review 是正の `validate_loopback_bind` /
@@ -14,9 +15,9 @@
 use std::fmt;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 
-/// 通信路の保護状態。TLS 実装（TASK-72・WIRE-9）導入時にこの enum へ variant を
-/// 追加し、[`GuardedBindAddrs::resolve`] 内の match を exhaustiveness で更新させる
-/// ことで、「TLS を足したらガードの分岐も必ず書く」ことを型で強制する。
+/// 通信路の保護状態。将来 variant を追加する際もこの enum の
+/// [`GuardedBindAddrs::resolve`] 内の match を exhaustiveness で更新させる
+/// ことで、「保護状態を足したらガードの分岐も必ず書く」ことを型で強制する。
 ///
 /// `#[non_exhaustive]` は crate 内（本 crate 内）の match には影響しない
 /// （`non_exhaustive` が抑制するのは他 crate からの exhaustive match のみ）ため、
@@ -28,6 +29,17 @@ use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 pub enum TransportSecurity {
     /// TLS 未構成（cleartext password 認証を平文 TCP で行う）。loopback 限定。
     Cleartext,
+    /// TLS 構成済み・`--tls-mode require`（Issue #967）。`SSLRequest` を経ない
+    /// 平文 StartupMessage を `08P01` で拒否するため、非ループバックでも
+    /// 平文パスワードが外部へ晒されない（WIRE-9 を満たす）。
+    TlsRequired,
+    /// TLS 構成済み・`--tls-mode allow`（Issue #967）。TLS 済みクライアントに
+    /// 加え平文クライアントも受理するため、[`TransportSecurity::Cleartext`]
+    /// と同じくループバック限定とする（意図的な設計判断: Issue の記述は
+    /// 「非ループバック × allow は警告のみ」だが、`allow` は平文接続を
+    /// 受理する以上 WIRE-9（非ループバックでは TLS 必須）を満たさないため、
+    /// 起動拒否側へ倒す。`docs/design/tls-wire-connection.md` 参照）。
+    TlsOptional,
 }
 
 /// [`GuardedBindAddrs::resolve`] の拒否理由。`Display` はプログラム出力規約に
@@ -42,6 +54,13 @@ pub enum BindGuardError {
     /// 名前解決は成功したが、解決結果が空だった。
     NoAddress { bind_addr: String },
     /// 解決結果に、`security` の要件を満たさないアドレスが 1 件以上含まれていた。
+    ///
+    /// D7（Issue #967）: `security` 別のメッセージ分岐は持たせない
+    /// （フィールド追加は下流の構造分解パターン `NonLoopback { bind_addr, addr }`
+    /// を壊す破壊的変更になる。AGENTS.md P1 公開 API 互換方針）。`allow`
+    /// 選択時の具体的な案内（`--tls-mode require` への切り替え）は
+    /// `main.rs` が `TransportSecurity::TlsOptional` 拒否時にのみ追加で
+    /// 出す hint 行が担う。
     NonLoopback { bind_addr: String, addr: SocketAddr },
 }
 
@@ -57,15 +76,14 @@ impl fmt::Display for BindGuardError {
                     "bind address {bind_addr} did not resolve to any socket address"
                 )
             }
-            BindGuardError::NonLoopback { bind_addr, addr } => {
-                write!(
-                    f,
-                    "refusing to bind non-loopback address {addr} (from {bind_addr}): \
-                     cleartext password authentication is not yet protected by TLS \
-                     (TASK-72/WIRE-9); bind to a loopback address (e.g. 127.0.0.1) or \
-                     place a trusted TLS terminator in front of this listener"
-                )
-            }
+            BindGuardError::NonLoopback { bind_addr, addr } => write!(
+                f,
+                "refusing to bind non-loopback address {addr} (from {bind_addr}): \
+                 cleartext password authentication is not protected by TLS \
+                 (WIRE-9); bind to a loopback address (e.g. 127.0.0.1), enable TLS \
+                 with --tls-cert/--tls-key --tls-mode require, or place a trusted \
+                 TLS terminator in front of this listener"
+            ),
         }
     }
 }
@@ -120,7 +138,10 @@ impl GuardedBindAddrs {
 
         for addr in &addrs {
             match security {
-                TransportSecurity::Cleartext => {
+                // `TlsOptional`（`--tls-mode allow`）は平文接続も受理するため、
+                // 通信路保護の観点では `Cleartext` と同じ制約（ループバック限定）を
+                // 課す（D1。`docs/design/tls-wire-connection.md` 参照）。
+                TransportSecurity::Cleartext | TransportSecurity::TlsOptional => {
                     if !addr.ip().is_loopback() {
                         return Err(BindGuardError::NonLoopback {
                             bind_addr: bind_addr.to_string(),
@@ -128,6 +149,10 @@ impl GuardedBindAddrs {
                         });
                     }
                 }
+                // `TlsRequired`（`--tls-mode require`）は平文 StartupMessage を
+                // handshake 層（`negotiate_startup_or_upgrade`）が構造的に拒否する
+                // ため、非ループバックへの bind を許可してよい（WIRE-9 を満たす）。
+                TransportSecurity::TlsRequired => {}
             }
         }
 
@@ -247,5 +272,41 @@ mod tests {
         let non_loopback_err = GuardedBindAddrs::resolve("0.0.0.0:0", TransportSecurity::Cleartext)
             .expect_err("must be rejected as non-loopback");
         assert!(non_loopback_err.source().is_none());
+    }
+
+    /// D2: `TlsRequired`（`--tls-mode require`）は非ループバック（ワイルドカード・
+    /// LAN アドレス）を受理する（Issue #967。WIRE-9 を満たすため）。
+    #[test]
+    fn tls_required_accepts_non_loopback_wildcard_and_lan() {
+        assert!(GuardedBindAddrs::resolve("0.0.0.0:0", TransportSecurity::TlsRequired).is_ok());
+        assert!(GuardedBindAddrs::resolve("[::]:0", TransportSecurity::TlsRequired).is_ok());
+        assert!(
+            GuardedBindAddrs::resolve("192.168.1.10:5432", TransportSecurity::TlsRequired).is_ok()
+        );
+    }
+
+    #[test]
+    fn tls_required_still_accepts_loopback() {
+        assert!(GuardedBindAddrs::resolve("127.0.0.1:0", TransportSecurity::TlsRequired).is_ok());
+    }
+
+    /// D1: `TlsOptional`（`--tls-mode allow`）は平文接続も受理するため、
+    /// `Cleartext` と同じくループバック限定で拒否する（Issue #967）。
+    #[test]
+    fn tls_optional_rejects_non_loopback_like_cleartext() {
+        // D7: `NonLoopback` は `security` 別のメッセージを持たない共通の
+        // `BindGuardError` を返す（`allow` 選択時の具体的な案内は
+        // `main.rs` の hint 行が別途担う）。
+        let result = GuardedBindAddrs::resolve("0.0.0.0:5432", TransportSecurity::TlsOptional);
+        let err = result.expect_err("wildcard address must be rejected under allow mode");
+        assert!(
+            err.to_string().contains("TLS"),
+            "message should explain why: {err}"
+        );
+    }
+
+    #[test]
+    fn tls_optional_accepts_loopback() {
+        assert!(GuardedBindAddrs::resolve("127.0.0.1:0", TransportSecurity::TlsOptional).is_ok());
     }
 }
