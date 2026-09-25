@@ -50,8 +50,16 @@ Issue #953 で不透明バイト列として実装済み）へ組み立てる必
   1 個の TLV であること・constructed な TLV の値部分が入れ子の TLV 列として
   整形式であること）を深さ上限 `MAX_DER_NESTING_DEPTH`（16。本リポの実装
   既定値。X.509 の `Name` が `SEQUENCE → SET → SEQUENCE` で 5 階層程度に
-  なるため十分な余裕を見込む）付きで検証する。primitive な値
-  （`OCTET STRING`・`BIT STRING`・`INTEGER` 等）の中身には潜らない
+  なるため十分な余裕を見込む）付きで検証する。あわせて、フィールドの意味を
+  問わず入れ子の全階層で次の DER 制約を検査する
+  - universal クラスのタグは `SEQUENCE`／`SET` を除き primitive でなければ
+    ならない（constructed 化した文字列型等は `ConstructedUniversalType`）
+  - `SEQUENCE`／`SET` は常に constructed でなければならない（primitive の
+    `0x10`／`0x11` は `PrimitiveSequenceOrSet`）
+  - `NULL` は値が空、`BOOLEAN` はちょうど 1 バイトで `0x00`／`0xFF` のいずれか
+    （それ以外は `InvalidPrimitiveEncoding`）
+- 上記以外の primitive な値（`OCTET STRING`・`BIT STRING`・`INTEGER` 等）の
+  中身には潜らない（フィールドとしての検査は `x509.rs` が担う）
 - `Tlv` は `tag`・`value` に加えて `raw`（タグ+長さ+値の生バイト列）を持つ。
   `read_any` は消費前の残り入力（`start`）と消費後の残り入力（`remaining`）の
   長さの差分から `raw` を切り出す。`start`・`remaining` は常に同一バッファの
@@ -73,22 +81,53 @@ Issue #953 で不透明バイト列として実装済み）へ組み立てる必
 4. `tbsCertificate` の各フィールドを順に読む:
    - `version [0] EXPLICIT INTEGER 2`（v3）のみ受理。タグ不一致（欠落＝v1
      を含む）・値不一致（v2 の `1` 等）はいずれも `UnsupportedVersion`
-   - `serialNumber INTEGER`（空でないこと）
-   - `signature AlgorithmIdentifier`（生バイト列 `raw` を保持し、後で外側
-     `signatureAlgorithm` と比較する）
-   - `issuer Name`（中身は解釈しない）
+   - `serialNumber INTEGER`: 正の整数（最上位ビットが立つ負数・全オクテット
+     0 のゼロは拒否）・20 オクテット以下・最小符号化（符号ビット確保以外の
+     不要な先頭 `0x00` を拒否）であること（RFC 5280 §4.1.2.2）
+   - `signature AlgorithmIdentifier`（生バイト列 `raw` を保持し、手順 5 で
+     構造検査と外側 `signatureAlgorithm` との比較を行う）
+   - `issuer Name`: 属性値の意味は解釈しないが、`RDNSequence ::= SEQUENCE OF
+     RelativeDistinguishedName`・`RelativeDistinguishedName ::= SET SIZE
+     (1..MAX) OF AttributeTypeAndValue`・`AttributeTypeAndValue ::= SEQUENCE
+     { type OBJECT IDENTIFIER, value ANY }` の構文（RFC 5280 §4.1.2.4）を
+     検査する。RDN が `SET` でない・空の `SET`・`type` の OID 欠落／不正・
+     `value` 欠落・余剰要素はいずれも `Malformed`。0 個の RDN から成る空の
+     `Name` は受理する。さらに `SET OF` の DER 正規順序（X.690 §11.6。各
+     `AttributeTypeAndValue` の符号化バイト列が非減少の昇順）を検査し、
+     隣接要素が降順の非正規 BER は `Malformed` とする（同一符号化の重複は
+     昇順の定義上許容する）
    - `validity SEQUENCE { notBefore Time, notAfter Time }`（後続バイト拒否・
      `notBefore > notAfter` は `InvalidValidityRange`）
-   - `subject Name`（中身は解釈しない）
-   - `subjectPublicKeyInfo SEQUENCE { AlgorithmIdentifier, BIT STRING }`
-     （OID・parameters 有無・鍵ビット列を保持）
-   - 任意の `issuerUniqueID [1] IMPLICIT`・`subjectUniqueID [2] IMPLICIT`・
-     `extensions [3] EXPLICIT`（存在すれば読み飛ばすのみで意味は解釈しない。
-     `tbsCertificate` の後続バイトは拒否）
-5. `tbsCertificate.signature` と外側 `signatureAlgorithm` の DER バイト列
-   一致（RFC 5280 §4.1.1.2。不一致は `SignatureAlgorithmMismatch`）
-6. `signatureValue BIT STRING` は空でなく、先頭の未使用ビット数オクテットが
-   0〜7（中身は検証しない。署名検証はスコープ外）
+   - `subject Name`（`issuer` と同じ構文・順序検査）
+   - `subjectPublicKeyInfo SEQUENCE { AlgorithmIdentifier, BIT STRING }`:
+     AlgorithmIdentifier は葉・中間を問わず構造検査（先頭に整形式の OID が
+     1 個・任意の `parameters` は高々 1 個の TLV・余剰要素なし）を通し、OID・
+     parameters 有無・鍵ビット列を保持する
+   - 任意の `issuerUniqueID [1] IMPLICIT`・`subjectUniqueID [2] IMPLICIT`:
+     存在すれば `BIT STRING` の形状（未使用ビット数 0〜7・非 0 なら最終
+     オクテットの未使用ビットが 0）を検査する
+   - 任意の `extensions [3] EXPLICIT`: wrapper の値部分がちょうど 1 個の
+     `Extensions`（`SEQUENCE`）で後続データが無く、`Extensions` が 1 個以上の
+     `Extension` から成ることを検査する。各 `Extension` は `SEQUENCE {
+     extnID OBJECT IDENTIFIER, critical BOOLEAN DEFAULT FALSE, extnValue
+     OCTET STRING }`（RFC 5280 §4.1）の順序どおりに読み、空の Extension・
+     `extnID` 欠落／不正な OID・`critical` の型違いや `extnValue` 後への配置・
+     `extnValue` 欠落／型違い・余剰要素はいずれも `Malformed`。`critical` の
+     明示的な `FALSE`（`01 01 00`）は、DER（X.690 §11.5）が DEFAULT 値の省略を
+     要求するものの、公開テストベクタである RFC 8410 §10.2 の証明書自身が
+     この形を使うため受理する。`extnValue` の中身は解釈しない
+   - `tbsCertificate` の後続バイトは拒否
+5. `tbsCertificate.signature` の AlgorithmIdentifier 構造検査（SPKI と同じ
+   基準）の後、外側 `signatureAlgorithm` との DER バイト列一致（RFC 5280
+   §4.1.1.2。不一致は `SignatureAlgorithmMismatch`）
+6. `signatureValue BIT STRING`: 先頭の未使用ビット数オクテットが 0〜7・その
+   後に署名データが 1 バイト以上存在すること・未使用ビット数が非 0 なら最終
+   オクテットの下位未使用ビットがすべて 0 であること（中身は検証しない。
+   署名検証はスコープ外）
+
+OID の値部分は、空・サブ識別子先頭の `0x80`（非最小符号化）・継続ビット付きの
+まま終端（切り詰め）をいずれも `Malformed` として拒否する（AlgorithmIdentifier・
+`AttributeTypeAndValue.type`・`extnID` に共通）。
 
 validity はチェーン内の**全証明書**に対して現在時刻（呼び出し元が注入する
 `now_unix_secs`）で検査する。葉の SPKI 公開鍵照合は**チェーンの先頭のみ**に
@@ -120,7 +159,8 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
 - 期待公開鍵との照合は `super::hkdf::ct_eq`（定数時間比較）で行う。公開鍵は
   公開データそのものだが、導出元が秘密鍵であるため保守的に定数時間で
   比較する
-- 中間証明書の SPKI アルゴリズムは制限しない（構造だけ検査する）
+- 中間証明書の SPKI アルゴリズムは制限しない（AlgorithmIdentifier の構造
+  だけ検査する）
 
 ## `Certificate` メッセージの組み立て
 
@@ -137,7 +177,10 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
   側が検証する鍵一致は `CertificateVerify` 用の Ed25519 鍵一致のみで
   #961 の担当）
 - SAN・ホスト名・keyUsage・basicConstraints 等 extensions の意味解釈
-  （`der::validate_structure` による構造検証のみ行い、中身はスキップする）
+  （各 `Extension` の `extnID`／`critical`／`extnValue` の構文までは検査するが、
+  `extnValue` の中身は解釈しない。同一 `extnID` の重複検出も行わない）
+- issuer/subject `Name` の属性値の意味解釈（文字列型の妥当性・属性種別の
+  制約）
 - 中間証明書どうしの issuer/subject 連結検査・パス構築（RFC 8446 §4.4.2 は
   後続証明書の順序を SHOULD とするに留まるため、チェーン先頭が葉であることの
   みを前提にする）
@@ -157,7 +200,10 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
   日 32・時 24・分/秒 60）・`Z` 欠落／オフセット付き／小数秒／長さ違いの
   拒否・validity 境界（`now == notBefore`／`notAfter` は受理）・SPKI 照合
   （一致・不一致・非 Ed25519・parameters 付き・鍵長 31/33・未使用ビット
-  非 0）・空チェーン／上限超過チェーンの拒否
+  非 0）・空チェーン／上限超過チェーンの拒否・RDN の `SET OF` 順序判定
+  （昇順・等値は受理、降順は拒否）・`Extension` 構文検査（`critical` 省略／
+  TRUE／明示 FALSE は受理、空・`extnID` 欠落・`extnValue` 欠落・`critical`
+  後置・`extnValue` 型違い・余剰要素・不正 OID は拒否）
 - 結合テスト（`tests/tls_x509.rs`。公開 API のみ）: RFC 8410 §10.2 証明書を
   葉に置くと X25519 として拒否されること、手組みした Ed25519 葉（RFC 8410
   §10.1 の SPKI を埋め込み）が期待公開鍵で受理されること、葉＋中間
@@ -166,10 +212,24 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
   （全く別の鍵・1 ビット反転）・中間証明書の `NotYetValid`／`Expired`
   （`index: 1`）・空チェーン／上限超過チェーン・切り詰め／末尾 1 バイト
   追加／PKCS#8 DER を証明書として渡す／version 欠落（v1）・v2（`1`）／
-  `tbsCertificate.signature` と外側の不一致／SPKI parameters 付き／
-  BIT STRING 未使用ビット非 0／鍵長 31・33／DER 長上限超過の拒否、エラー
-  `Display` が証明書内容（CN 文字列・鍵の 16 進表現）を含まないこと、ファイル
-  入口（一時ファイル経由の成功・存在しないファイル）を固定した
+  `tbsCertificate.signature` と外側の不一致／両側とも空の AlgorithmIdentifier・
+  余剰要素付き・不正な OID の AlgorithmIdentifier／中間証明書 SPKI の
+  AlgorithmIdentifier の余剰要素・切り詰め OID／serialNumber の負数・ゼロ・
+  21 オクテット・非最小符号化（20 オクテット・符号ビット確保の先頭 `0x00` は
+  受理）／`signatureValue` の署名データ欠落・非 0 パディング（0 パディングは
+  受理）／SPKI parameters 付き／BIT STRING 未使用ビット非 0／鍵長 31・33／
+  issuer の primitive `SET`・subject の RDN が `SEQUENCE`／複数属性 RDN の
+  降順（issuer・subject・長さ違いの要素を含む。昇順・同一要素の重複は受理）／
+  extensions wrapper の余剰データ／Extension の内部構文違反（空・`extnID`
+  欠落・`extnValue` 欠落・`critical` の後置・`extnValue` が BIT STRING・
+  余剰要素・`critical` が INTEGER・切り詰め `extnID`。単独でも正当な
+  Extension の後続でも拒否。`critical` 省略・TRUE・明示 FALSE は受理）／
+  DER 長上限超過の拒否、エラー `Display` が証明書内容（CN 文字列・鍵の 16 進
+  表現）を含まないこと、ファイル入口（一時ファイル経由の成功・存在しない
+  ファイル）を固定した
+- 単体テスト（`tls/der.rs`）: long form 長さの境界・非最小符号化・indefinite・
+  high-tag-number／EOC・入れ子深さ上限・constructed 化した universal 型・
+  primitive の `SEQUENCE`／`SET`・`NULL`／`BOOLEAN` の非正規形の拒否
 
 手組み DER エンコーダ（`tlv`／`sequence` 等）はテスト専用であり、本番コード
 には存在しない（`pkcs8` の結合テストと同方針）。
