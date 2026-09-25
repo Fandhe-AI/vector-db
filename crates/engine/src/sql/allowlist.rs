@@ -3153,6 +3153,16 @@ impl<'a> Parser<'a> {
             break;
         }
         self.expect_punct(')')?;
+        // 列定義は 1 件以上必須（表制約 `PRIMARY KEY`／`UNIQUE`／`CHECK` だけの
+        // 列リストは列を持たないテーブルになる）。カタログの `validate_schema` も
+        // 拒否するが、構文段の不変条件としてここで `42601` にする（fail-closed。
+        // PR #1055 Bugbot 指摘: 表制約 `CHECK` の追加で列なしの列リストが構文段を
+        // 通過し得た）。
+        if columns.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "CREATE TABLE requires at least one column definition",
+            ));
+        }
 
         let primary_key = finalize_primary_key(primary_key, &mut columns)?;
         let unique_constraints = finalize_unique_constraints(unique_constraints, &columns)?;
@@ -9147,6 +9157,21 @@ mod tests {
             "CREATE TABLE t (body TEXT, constraint TEXT CHECK (body = 'a'))",
             "CREATE TABLE t (body TEXT, CONSTRAINT vector CHECK (body = 'a'))",
             "CREATE TABLE t (body TEXT CONSTRAINT Text CHECK (body = 'a'))",
+        ] {
+            assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
+        }
+    }
+
+    /// 回帰（PR #1055 Bugbot 指摘）: 表制約だけで列定義を持たない列リストは
+    /// 構文段で `42601` として拒否する。
+    #[test]
+    fn create_table_rejects_column_less_list_with_only_table_constraints() {
+        for sql in [
+            "CREATE TABLE t (CHECK (id > 0))",
+            "CREATE TABLE t (CONSTRAINT c1 CHECK (body = 'a'))",
+            "CREATE TABLE t (CHECK (a = 'x'), CHECK (b = 'y'))",
+            "CREATE TABLE t (UNIQUE (a))",
+            "CREATE TABLE t (PRIMARY KEY (a))",
         ] {
             assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
         }
