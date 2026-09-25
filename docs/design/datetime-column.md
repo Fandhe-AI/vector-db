@@ -122,10 +122,12 @@ PG のバイナリ表現を返す場合はオフセット変換が必要にな�
 （`sql::scalar_index::OrderedColumnIndex::I64`。`DATE` は日数、`TIMESTAMP`
 はマイクロ秒。`TIMESTAMP` の絶対値が `2^53` を超える値を 1 件でも含む列は
 列単位で索引対象外へ縮退する。`DATE` は値域が `i32` のため構造的にこの上限
-に収まる）で索引化するロジック自体は実装したが、production 経路の既定入口
-`ScalarIndex::build` は `TypedRangePredicate` の本線配線（WHERE の比較・
-等価述語と式評価。下記「WHERE の比較・等価述語と式評価（#891）」が未接続）
-を待つ間、typed 列（`DATE`／`TIMESTAMP` を含む）の構築を `BOOLEAN` 等と
+に収まる）で索引化するロジック自体は実装した。WHERE の比較・等価述語
+自体は #891・TASK-199 で結線済み（下記「対象外（申し送り）」参照）だが、
+新しい範囲比較述語は二次索引が未対応のため常に `PlainScan` へ縮退する
+（`BoolEquals` と同じ fail-closed 方針）。production 経路の既定入口
+`ScalarIndex::build` はこの縮退により構築コストだけを負う退行を避ける
+ため、typed 列（`DATE`／`TIMESTAMP` を含む）の構築を `BOOLEAN` 等と
 同じ非索引化（`None`）へ遅延させている（codex-review P2 指摘・PR #1032）。
 索引化ロジックの単体テストはテスト専用入口
 `ScalarIndex::build_including_unwired_typed_range_columns` 経由でのみ検証
@@ -135,10 +137,11 @@ PG のバイナリ表現を返す場合はオフセット変換が必要にな�
 
 ## 対象外（申し送り）
 
-- WHERE の比較・等価述語と式評価（#891・TASK-199）。本 Issue の時点では
-  `DATE`／`TIMESTAMP` 列は WHERE 句・式（`sql::udf_call::bind_expr`）から
-  参照できず、既存の TEXT 限定チェック（`declarative_filter::bind`）へ
-  自然に `22000` で落ちる。
+- WHERE の比較・等価述語（#891・TASK-199 で対応済み。範囲・設計は
+  `docs/design/scalar-types-predicates.md` 参照。`DATE`／`TIMESTAMP` 列は
+  `declarative_filter::FilterOp::TypedCompare` へ束縛される）。式（算術・
+  関数引数。`sql::udf_call::bind_expr`）中の参照は引き続き対象外のまま
+  （`22000`）。
 - `MIN`／`MAX` などの集計拡張（#892）。`COUNT` のみ受理。
 - 3 段階デコード tier の最適化（#894）。
 - RowDescription の OID `1082`（date）／`1114`（timestamp）の公告（#895・

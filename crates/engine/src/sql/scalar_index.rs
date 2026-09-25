@@ -1217,6 +1217,14 @@ impl ScalarIndex {
             // `?` で既にここへ到達しない）ため構造的に到達しないが、
             // 網羅性のため fail-closed に `None` を返す。
             FilterOp::BoolEquals(_) => return None,
+            // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の範囲比較
+            // （TABLE-13・TASK-199、Issue #891）は二次索引の対象外
+            // （新型への索引対応は別 Issue の担当）。`Compare`（未束縛）は
+            // `bind` を経た `MetadataFilter` には現れない契約だが網羅性のため
+            // 同じ腕で扱う。索引で解決しないことで `sql::exec` は候補削減を
+            // 信頼せず既存の全行走査（フィルタ事前/事後適用）へフォールバック
+            // する（fail-closed。索引未対応が誤って「一致 0 件」に化けない）。
+            FilterOp::TypedCompare { .. } | FilterOp::Compare { .. } => return None,
         };
         result.sort_unstable();
         Some(result)

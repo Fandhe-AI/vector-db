@@ -140,6 +140,19 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
     {
         return ScalarPlan::PlainScan;
     }
+    // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の範囲比較
+    // （TABLE-13・TASK-199、Issue #891）は二次索引が対応しない
+    // （`sql::scalar_index::ScalarIndex::candidates_for` が `None` を返す）
+    // ため、`BoolEquals` と同じ理由で先頭から plain scan へ倒す。複合述語に
+    // 紛れて誤って索引被覆済みと判定されるのを防ぐ単一情報源。
+    if input.metadata_filters.iter().any(|f| {
+        matches!(
+            f.op(),
+            crate::declarative_filter::FilterOp::TypedCompare { .. }
+        )
+    }) {
+        return ScalarPlan::PlainScan;
+    }
     let mut id_predicate_count = 0usize;
     for expr in input.expr_filters {
         if id_predicate_from_expr(expr).is_none() {
@@ -167,6 +180,12 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
             // `observe_group_count_only` が BOOLEAN 述語を「索引で完全被覆
             // 済み」と誤って信頼しないための単一情報源での保証。
             crate::declarative_filter::FilterOp::BoolEquals(_) => ScalarPlan::PlainScan,
+            // 上の事前判定で `TypedCompare` を含む場合は既に `PlainScan` で
+            // 早期リターン済みのため構造的に到達しないが、網羅性のため
+            // 同じ結果を返す（fail-closed の保険腕）。`Compare`（未束縛）は
+            // `bind` 済み `MetadataFilter` には現れない契約だが同じ腕で扱う。
+            crate::declarative_filter::FilterOp::TypedCompare { .. }
+            | crate::declarative_filter::FilterOp::Compare { .. } => ScalarPlan::PlainScan,
         }
     }
 }
@@ -309,6 +328,7 @@ mod tests {
                 ColumnDef::new("c0", ColumnType::Text, true),
                 ColumnDef::new("c1", ColumnType::Text, true),
                 ColumnDef::new("flag", ColumnType::Boolean, true),
+                ColumnDef::new("day", ColumnType::Date, true),
             ],
         )
     }
@@ -337,6 +357,47 @@ mod tests {
         )
         .expect("bind bool_equals filter");
         bound.into_iter().next().expect("one filter")
+    }
+
+    fn typed_compare_filter(column_index: usize) -> MetadataFilter {
+        let schema = test_schema();
+        let bound = crate::declarative_filter::bind_all(
+            &[DeclarativeFilter::compare(
+                schema.columns[column_index].name.clone(),
+                crate::declarative_filter::CompareOp::Gt,
+                "2024-01-01".to_string(),
+            )],
+            &schema,
+        )
+        .expect("bind compare filter");
+        bound.into_iter().next().expect("one filter")
+    }
+
+    /// TABLE-13・TASK-199、Issue #891: `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／
+    /// `BYTEA` 列の範囲比較（`TypedCompare`）は二次索引が対応しない
+    /// （`sql::scalar_index::ScalarIndex::candidates_for` が `None` を返す）
+    /// ため、単独でも複合述語の一部でも常に `PlainScan` に分類される
+    /// （`BoolEquals` と同じ単一情報源での保証）。
+    #[test]
+    fn plain_scan_for_single_typed_compare_predicate() {
+        let filters = vec![typed_compare_filter(4)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+    }
+
+    #[test]
+    fn plain_scan_when_typed_compare_predicate_mixed_with_text_equality() {
+        let filters = vec![eq_filter(1), typed_compare_filter(4)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
 
     /// Issue #883・D-e: BOOLEAN 述語は単独でも複合述語の一部でも常に

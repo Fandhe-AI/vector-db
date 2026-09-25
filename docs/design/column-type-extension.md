@@ -288,11 +288,16 @@ TABLE-13・TASK-197（Issue #886。関連: WIRE-13・NOSQL-17）で `ColumnType:
     `22P02` 導入時に再分類する）。長さ超過は表層を問わず `54000`。
 - 対象外（申し送り）: RowDescription の OID 拡張（既存の `WireType::Text`
   〔OID 25〕のまま。#895）、NoSQL の既存型統一・`columns[].type`（#896）、
-  `22P02` の新設（#897・TASK-227）、`WHERE` 述語対応（#891）、SQL
+- 対象外（申し送り）: RowDescription の OID 拡張（既存の `WireType::Text`
+  〔OID 25〕のまま。#895）、NoSQL の既存型統一・`columns[].type`（#896）、
+  `22P02` の新設（#897・TASK-227）、SQL
   `CREATE TABLE` 構文での `BYTEA` 宣言（SQL-23 は未実装。宣言は Rust API の
-  `TableSchema` 経由）。二次索引（#893）は等価・前方一致・範囲いずれの
-  述語も持たない型として索引対象外のまま据え置く判断を確定した
-  （`docs/design/scalar-index-prune.md`「Issue #893」節参照）。
+  `TableSchema` 経由）。`WHERE` 等価・範囲比較述語は #891・TASK-199 で
+  対応済み（`declarative_filter::FilterOp::TypedCompare`。詳細は
+  `docs/design/scalar-types-predicates.md` 参照）。二次索引（#893）は
+  等価・前方一致・範囲いずれの述語も持たない型として索引対象外のまま
+  据え置く判断を確定した（`docs/design/scalar-index-prune.md`
+  「Issue #893」節参照）。
 
 ## #889 追記: JSON / JSONB 列型
 
@@ -613,10 +618,12 @@ scale }` を追加した。`DECIMAL` は別名として扱うだけで、カタ�
   `sql::scan`（DecodeTier 分類）・`sql::using_plan`（本文列規約）は
   いずれも明示的な拒否・除外腕を追加した。`sql::scalar_index` は本 Issue
   時点では索引対象外だったが、#893 で `OrderedColumnIndex::I128` として
-  索引化するロジック自体は実装した。ただし production 経路の既定入口
-  `ScalarIndex::build` は `WHERE` 述語からの到達経路（#891 未接続）が
-  無いまま構築コストだけを負う退行を避けるため、本列を含む typed 列の
-  構築を `BOOLEAN` 等と同じ非索引化（`None`）へ遅延させている
+  索引化するロジック自体は実装した。`WHERE` 述語自体は #891・TASK-199 で
+  結線済みだが、新しい範囲比較述語は二次索引が未対応のため常に
+  `PlainScan` へ縮退する（`BoolEquals` と同じ fail-closed 方針）。
+  production 経路の既定入口 `ScalarIndex::build` はこの縮退により
+  構築コストだけを負う退行を避けるため、本列を含む typed 列の構築を
+  `BOOLEAN` 等と同じ非索引化（`None`）へ遅延させている
   （codex-review P2 指摘・PR #1032）。詳細は
   `docs/design/scalar-index-prune.md`「Issue #893」節・「レビュー対応」節
   参照。
@@ -634,18 +641,20 @@ scale }` を追加した。`DECIMAL` は別名として扱うだけで、カタ�
   この時点で一致する。バイナリ形式（format code 1）は引き続き
   `column_binary_support` が fail-closed に非対応とし、対応拡大は #895 の
   担当のまま。
-- 対象外（申し送り）: `22P02` の新設、WHERE 述語・式評価での NUMERIC 列
-  参照の受理（#891）、`SUM`/`AVG`/`MIN`/`MAX`（#892）、`DecodeTier` の精査
-  （#894）、NUMERIC 列のバイナリ形式対応（#895）、NoSQL `insert`/`update`
-  op での JSON 数値の完全な束縛対応（#896）、回帰テストの集約（#897）、
-  `ALTER COLUMN TYPE` による `p` の拡大（#901）、SQL `CREATE TABLE` 構文
-  での `NUMERIC`/`DECIMAL` 列宣言（SQL-23 は未実装）、ファイル形 `INSERT`
-  （`path`/`body` 列規約専用のため NUMERIC 列は明示的に拒否）。スカラー
-  二次索引化（#893。`unscaled` の `i128` をキーとする順序索引
-  `sql::scalar_index::OrderedColumnIndex::I128` として構築ロジック自体は
-  実装済み。ただし `WHERE` 述語がまだ NUMERIC 列を bind 時点で拒否して
-  いる〔#891 未接続〕ため SQL 表層からは未到達で、production 経路の
-  既定入口 `ScalarIndex::build` も typed 列の構築自体を非索引化（`None`）
+- 対象外（申し送り）: `22P02` の新設、`SUM`/`AVG`/`MIN`/`MAX`（#892）、
+  `DecodeTier` の精査（#894）、NUMERIC 列のバイナリ形式対応（#895）、
+  NoSQL `insert`/`update` op での JSON 数値の完全な束縛対応（#896）、
+  回帰テストの集約（#897）、`ALTER COLUMN TYPE` による `p` の拡大
+  （#901）、SQL `CREATE TABLE` 構文での `NUMERIC`/`DECIMAL` 列宣言
+  （SQL-23 は未実装）、ファイル形 `INSERT`（`path`/`body` 列規約専用の
+  ため NUMERIC 列は明示的に拒否）。`WHERE` 等価・範囲比較述語は
+  #891・TASK-199 で対応済み（`declarative_filter::FilterOp::
+  TypedCompare`。詳細は `docs/design/scalar-types-predicates.md`
+  参照）。スカラー二次索引化（#893。`unscaled` の `i128` をキーとする
+  順序索引 `sql::scalar_index::OrderedColumnIndex::I128` として構築
+  ロジック自体は実装済み。ただし新しい範囲比較述語は二次索引が未対応
+  のため常に `PlainScan` へ縮退し、production 経路の既定入口
+  `ScalarIndex::build` も typed 列の構築自体を非索引化（`None`）
   へ遅延させている〔codex-review P2 指摘・PR #1032〕。詳細は
   `docs/design/scalar-index-prune.md`「Issue #893」節・「レビュー対応」節
   参照）。
@@ -663,17 +672,17 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
 - **順序規約**: derive した `Ord` はバイト列の辞書順（`memcmp` 相当）になり、
   これは符号なし 128bit big-endian の大小・正規テキストの辞書順のどちらとも
   一致することを単体テストで機械的に固定した（`uuid.rs::tests::
-  byte_order_matches_canonical_text_order`）。WHERE 比較・二次索引・
-  ORDER BY がこの順序を共有する唯一の定義とするが、本 Issue ではいずれへも
-  未結線（WHERE 比較・ORDER BY は #891 へ、二次索引は #893 で
-  `sql::scalar_index::OrderedColumnIndex::U128`〔ネットワークバイトオーダーの
-  バイト列を `u128` ビッグエンディアンとして扱う。この `Ord` 導出と同じ大小
-  関係になる〕として構築ロジック自体は実装済み。ただし `WHERE` 述語がまだ
-  UUID 列を bind 時点で拒否している〔#891 未接続〕ため SQL 表層からは
-  未到達で、production 経路の既定入口 `ScalarIndex::build` も typed 列の
-  構築自体を非索引化（`None`）へ遅延させている〔codex-review P2 指摘・
-  PR #1032〕。詳細は `docs/design/scalar-index-prune.md`「Issue #893」節・
-  「レビュー対応」節参照）。
+  byte_order_matches_canonical_text_order`）。WHERE 比較（#891・TASK-199 で
+  結線済み。`declarative_filter::MetadataFilter::matches` の `TypedCompare`
+  腕がこの `Ord` をそのまま使う）・ORDER BY がこの順序を共有する唯一の
+  定義とする。二次索引は #893 で `sql::scalar_index::OrderedColumnIndex::
+  U128`〔ネットワークバイトオーダーのバイト列を `u128` ビッグエンディアン
+  として扱う。この `Ord` 導出と同じ大小関係になる〕として構築ロジック自体
+  は実装済みだが、production 経路の既定入口 `ScalarIndex::build` は typed
+  列の構築自体を非索引化（`None`）へ遅延させており未到達のまま
+  （codex-review P2 指摘・PR #1032）。詳細は
+  `docs/design/scalar-index-prune.md`「Issue #893」節・「レビュー対応」節
+  参照）。
 - **カタログ**: 型タグ `"uuid"`・`param` は常に `"-"`（他のパラメータなし
   スカラー型と同じ）。
 - **行バイト表現**: presence タグに続く 16 バイト生値固定
@@ -710,10 +719,11 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
   （本文列規約）はいずれも明示的な拒否腕を追加した（網羅性はコンパイラが
   強制。ワイルドカード腕は使わない）。`sql::scalar_index` は本 Issue
   時点では索引対象外だったが、#893 で `OrderedColumnIndex::U128` として
-  索引化するロジック自体は実装した（`WHERE` 述語からの到達経路は #891
-  未接続のまま。production 経路の既定入口 `ScalarIndex::build` も typed
-  列の構築自体を非索引化〔`None`〕へ遅延させている〔codex-review P2
-  指摘・PR #1032〕）。
+  索引化するロジック自体は実装した。`WHERE` 述語自体は #891・TASK-199 で
+  結線済みだが、新しい範囲比較述語は二次索引が未対応のため常に
+  `PlainScan` へ縮退する。production 経路の既定入口 `ScalarIndex::build`
+  も typed 列の構築自体を非索引化〔`None`〕へ遅延させている
+  〔codex-review P2 指摘・PR #1032〕。
   `sql::scan`（DecodeTier 分類・投影）は UUID 列を他のスカラー型と同じ
   `DimAndScalar` tier で扱う。
 - **wire-server**: `result_encoder.rs::cell_to_text`・`http/query/response.rs`
@@ -727,13 +737,15 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
   `InsertLiteral::Null`）。`insert` op は既存のワイルドカードによる拒否の
   まま（#896 へ申し送り。insert/update の非対称は BOOLEAN／DATE と同じ
   既知の制約）。
-- 対象外（申し送り）: WHERE 述語・式評価での UUID 列参照の受理（#891）、
-  `SUM`/`AVG`/`MIN`/`MAX`（#892）、`DecodeTier` の精査（#894）、UUID 列の
-  バイナリ形式・OID 2950 対応（#895）、NoSQL `insert` op での JSON 束縛
-  （#896）、SQL `CREATE TABLE` 構文での `UUID` 列宣言（SQL-23 は未実装）。
-  スカラー二次索引化（#893）は `OrderedColumnIndex::U128` として構築
-  ロジック自体は実装済みだが、production 経路の既定入口
-  `ScalarIndex::build` は typed 列の構築を非索引化（`None`）へ遅延させて
-  おり未到達のまま（codex-review P2 指摘・PR #1032）。詳細は
-  `docs/design/scalar-index-prune.md`「Issue #893」節・「レビュー対応」節
-  参照。
+- 対象外（申し送り）: WHERE 等価・範囲比較述語は #891・TASK-199 で対応済み
+  （`declarative_filter::FilterOp::TypedCompare`。詳細は
+  `docs/design/scalar-types-predicates.md` 参照）。式（算術・関数引数）中の
+  UUID 列参照・`SUM`/`AVG`/`MIN`/`MAX`（#892）、`DecodeTier` の精査
+  （#894）、UUID 列のバイナリ形式・OID 2950 対応（#895）、NoSQL `insert`
+  op での JSON 束縛（#896）、SQL `CREATE TABLE` 構文での `UUID` 列宣言
+  （SQL-23 は未実装）は引き続き対象外。スカラー二次索引化（#893）は
+  `OrderedColumnIndex::U128` として構築ロジック自体は実装済みだが、
+  production 経路の既定入口 `ScalarIndex::build` は typed 列の構築を
+  非索引化（`None`）へ遅延させており未到達のまま（codex-review P2 指摘・
+  PR #1032）。詳細は `docs/design/scalar-index-prune.md`「Issue #893」節・
+  「レビュー対応」節参照。
