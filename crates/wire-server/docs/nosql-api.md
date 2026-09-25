@@ -676,7 +676,7 @@ Date: <IMF-fixdate>
 | `25P02` | `IN_FAILED_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
 | `2BP01` | `DEPENDENT_OBJECTS_STILL_EXIST` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW` は SQL 表層専用の DDL。後述） |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
-| `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE` は op 許可リスト外。後述） |
+| `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`・`ALTER TABLE ADD COLUMN` は op 許可リスト外。後述） |
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
@@ -702,9 +702,10 @@ Date: <IMF-fixdate>
 `FETCH`／`CLOSE`）専用の分類だが、NoSQL 表層の `op` 許可リストにカーソル
 操作は無いため実要求からは到達しない。
 `DuplicateColumn`（`42701`）・`DuplicateTable`（`42P07`）は `CREATE TABLE`
-（SQL-23・TASK-202・Issue #899）が誘発する分類だが、NoSQL 表層の `op` 許可
-リストに `create_table` 相当が無いため実要求からは到達しない（`docs/design/
-sql-create-table.md` 参照）。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
+（SQL-23・TASK-202・Issue #899）・`ALTER TABLE ADD COLUMN`（`42701` のみ。
+Issue #900）が誘発する分類だが、NoSQL 表層の `op` 許可リストに DDL 相当が
+無いため実要求からは到達しない（`docs/design/sql-create-table.md`・
+`docs/design/sql-alter-table-add-column.md` 参照）。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
 TASK-205、Issue #909）は SQL 表層専用の DDL で、NoSQL `op` 許可リストに
 `view` 相当の語彙が無いため `42P07`（名前衝突を `CREATE TABLE` と共有）・
 `2BP01`・`42809` も同様に到達不能。明示トランザクション（SQL-31・TASK-221）の

@@ -1279,6 +1279,18 @@ pub enum ParsedSql {
     /// すべて更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードが
     /// あれば追随が必要。
     Cursor(crate::sql::cursor::CursorStatement),
+    /// `ALTER TABLE <table> ADD COLUMN <column> <type>`（SQL-23・TASK-202、
+    /// Issue #900）。DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）の
+    /// 判定は [`DropTable`](Self::DropTable)／[`CreateTable`](Self::CreateTable)
+    /// と同じく `EngineCore::execute_parsed_in_session` が担い、
+    /// `validate_alter_table_tokens` 自体はカタログ照会（テーブル・列・ENUM 型の
+    /// 存在確認）を一切行わない（`ValidatedAlterTableAddColumn` ドキュメント参照）。
+    ///
+    /// **BREAKING CHANGE**（Issue #900）: 本 variant の追加により `ParsedSql` を
+    /// 網羅的にマッチする既存コード（`crate::core::EngineCore`）はすべて
+    /// 更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードがあれば
+    /// 追随が必要。
+    AlterTable(crate::sql::allowlist::ValidatedAlterTableAddColumn),
     /// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、
     /// Issue #909）。DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）の
     /// 判定は `EngineCore::execute_parsed_in_session` が担い、
@@ -2199,6 +2211,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Update(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
                     | crate::sql::SqlOutcome::DropTable(_)
+                    | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::Begin
@@ -2236,6 +2249,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Update(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
                     | crate::sql::SqlOutcome::DropTable(_)
+                    | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::Begin
@@ -2270,6 +2284,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Update(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
                     | crate::sql::SqlOutcome::DropTable(_)
+                    | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::Begin
@@ -2568,6 +2583,19 @@ impl EngineCore {
             return Ok(ParsedSql::CreateTable(stmt));
         }
 
+        // TASK-202（SQL-23。Issue #900）: `ALTER TABLE ... ADD COLUMN ...` は
+        // DDL であり `USING OPERATION_ID` を取らないため `LedgerMode`・
+        // `TableLookup` のいずれも渡さない（`ValidatedAlterTableAddColumn` の
+        // ドキュメント参照。カタログ照会は権限ゲート通過後の実行段が担う）。
+        let is_alter_table_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("ALTER")
+        );
+        if is_alter_table_statement {
+            let stmt = crate::sql::allowlist::validate_alter_table_tokens(&tokens)?;
+            return Ok(ParsedSql::AlterTable(stmt));
+        }
+
         let stmt = crate::sql::allowlist::validate_sql_tokens(&tokens, &self.storage)?;
         Ok(ParsedSql::Statement(stmt))
     }
@@ -2784,6 +2812,17 @@ impl EngineCore {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 let outcome = crate::sql::ddl::execute_create_table(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateTable(outcome))
+            }
+            // SQL-23・TASK-202（Issue #900）: `DropTable`／`CreateTable` と同じ
+            // 単一の DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）を、
+            // カタログ照会（ENUM 型名・テーブル・列の存在確認）を含む
+            // `execute_alter_table_add_column` より必ず先に通す（権限の無い
+            // セッションへテーブル・列の存在有無を返さない）。`ctx`（テナント
+            // 境界）は `Storage::alter_table_add_column` が取らないため未使用。
+            ParsedSql::AlterTable(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_alter_table_add_column(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::AlterTable(outcome))
             }
             // TABLE-18・SQL-23・TASK-205（Issue #909）: `DropTable` と同じ判定
             // 順序（DDL 実行権限ゲート → カタログ照会を含む実行本体）。
@@ -3316,6 +3355,11 @@ impl EngineCore {
             // DDL のため結果列を持たない。DDL 実行権限判定・カタログへの反映は
             // 一切行わない（Describe は本体を実行しない契約）。
             ParsedSql::CreateTable(_) => Ok(None),
+            // `ALTER TABLE ADD COLUMN`（TASK-202・SQL-23。Issue #900）も
+            // `CommandComplete` のみを返す DDL のため結果列を持たない。DDL 実行
+            // 権限判定・カタログへの反映は一切行わない（Describe は本体を実行
+            // しない契約。テーブル・列の存在有無も確認しない）。
+            ParsedSql::AlterTable(_) => Ok(None),
             // TABLE-18・SQL-23・TASK-205（Issue #909）: DDL につき結果列を持たない
             // （`DropTable` と同じ扱い）。
             ParsedSql::CreateView(_) => Ok(None),

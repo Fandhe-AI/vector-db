@@ -324,6 +324,13 @@ pub enum CatalogError {
         from: String,
         to: String,
     },
+    /// `ALTER TABLE ADD COLUMN`（TABLE-5）で列を追加すると `MAX_COLUMN_COUNT`
+    /// を超える（Issue #900・SQL-23）。`count` は追加後の物理スロット数（生存列＋
+    /// 削除済み列の墓標。TABLE-19 D1。上限超過後の値）。
+    /// `sql::ddl::execute_alter_table_add_column` はこの分類のみ `54000`
+    /// （`SqlSurfaceError::PayloadTooLarge`）へ写像し、他の `Invalid` 系
+    /// （識別子・型不正）とは区別する。
+    TooManyColumns { count: usize },
 }
 
 impl fmt::Display for CatalogError {
@@ -373,6 +380,9 @@ impl fmt::Display for CatalogError {
                 f,
                 "incompatible type change for column {column:?}: {from} -> {to}"
             ),
+            CatalogError::TooManyColumns { count } => {
+                write!(f, "too many columns: {count}")
+            }
         }
     }
 }
@@ -399,7 +409,8 @@ impl std::error::Error for CatalogError {
             | CatalogError::ColumnNotFound(_)
             | CatalogError::ProtectedColumn(_)
             | CatalogError::IncompatibleTypeChange { .. }
-            | CatalogError::WriteLockTimeout => None,
+            | CatalogError::WriteLockTimeout
+            | CatalogError::TooManyColumns { .. } => None,
         }
     }
 }
@@ -2940,11 +2951,12 @@ impl Storage {
             // 列数上限は物理スロット総数（生存列 + 墓標）に適用する（TABLE-19 D1・
             // Issue #901。墓標も物理容量を消費するため、ADD 前に既存の墓標数も
             // 合算して判定する）。
+            // 上限超過は `Invalid` と区別した `TooManyColumns` で返す（Issue #900。
+            // SQL 表層 `ALTER TABLE ADD COLUMN` が `54000` へ写像するため）。
             if schema.physical_slot_count() >= MAX_COLUMN_COUNT {
-                return Err(CatalogError::Invalid(format!(
-                    "too many columns: {}",
-                    schema.physical_slot_count() + 1
-                )));
+                return Err(CatalogError::TooManyColumns {
+                    count: schema.physical_slot_count().saturating_add(1),
+                });
             }
             schema.columns.push(column);
             let encoded = encode_schema(&schema)?;
@@ -3711,7 +3723,8 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ViewLimitExceeded(_)
         | CatalogError::ColumnNotFound(_)
         | CatalogError::ProtectedColumn(_)
-        | CatalogError::IncompatibleTypeChange { .. } => SqlSurfaceError::Internal {
+        | CatalogError::IncompatibleTypeChange { .. }
+        | CatalogError::TooManyColumns { .. } => SqlSurfaceError::Internal {
             detail: "catalog lookup failed".to_string(),
         },
         // 読み取り専用の存在確認（`table_exists`）は書き込みトランザクションを
