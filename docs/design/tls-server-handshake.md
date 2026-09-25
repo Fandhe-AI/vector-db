@@ -186,6 +186,18 @@ Issue #965 の PR（#1046）に対する codex・Bugbot の指摘（いずれも
    期限内に失敗し shutdown されることを固定）を追加し、
    `full_handshake_round_trip_over_driver_with_loopback_stream` に成功後の
    書き込みタイムアウト復元の検証を加えた。
+6. **`close_notify` の方向別終了管理**（codex P1。上記 2 の見直し）:
+   上記 2 は `close_notify` の送出も単一の `poisoned` で表していたため、
+   送出後は `open_record` まで拒否し、相手のデータ・`close_notify` を
+   受け取れなかった。RFC 8446 §6.1 の `close_notify` は送信方向の終了に
+   すぎないため、`TlsSession` の状態を「致命的失敗（`poisoned`。fatal
+   alert の送受信・復号/alert 解析の失敗。送受信の両方向を拒否）」
+   「`close_notify` 送出済み（送信操作のみ拒否）」「相手の
+   `close_notify` 受信済み（`open_record` とアプリケーションデータ送信を
+   拒否。応答の `close_notify` 送出は許可）」の 3 つへ分けた。致命的
+   失敗時の両方向拒否（fail-closed）は変更していない。結合テスト
+   `sent_close_notify_still_allows_receiving_peer_data_and_close_notify`・
+   `received_close_notify_still_allows_sending_our_close_notify` を追加した。
 
 ## 対象外（後続 sub-issue の担当）
 
@@ -221,8 +233,8 @@ KeyUpdate・NewSessionTicket・0-RTT・クライアント証明書は親 Issue �
     PR #1046 で追加。読み取り側に加え、相手が受信を止めた場合の
     送信側（server flight 送出）の束縛も単体・driver 経由の結合テストで
     固定。成功後の読み書きタイムアウトの通常値への復元も検証）
-  - `TlsSession` の終端状態（`close_notify` 送信/受信後・復号失敗後の
-    poison。PR #1046 で追加）
+  - `TlsSession` の終端状態（`close_notify` 送信/受信後の方向別終了・
+    復号失敗後の両方向 poison。PR #1046 で追加）
   - 状態外メッセージ（`ApplicationData` 早期受信）・解析失敗
     （壊れた `ClientHello`）の fail-closed 拒否
   - fatal alert の 1 回限り送出・以後の poison

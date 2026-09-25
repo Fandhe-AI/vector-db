@@ -799,6 +799,8 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
                 sealer,
                 opener,
                 poisoned: false,
+                sent_close_notify: false,
+                received_close_notify: false,
             }),
         ))
     }
@@ -837,18 +839,25 @@ fn build_server_hello(
 pub struct TlsSession {
     sealer: Sealer,
     opener: Opener,
-    /// 接続が「以後アプリケーションデータの送受信を続けてはならない」
-    /// 終端状態に入ったら `true` にする（fail-closed）。以後の
-    /// `seal_application_data`／`open_record`／`close_notify` をすべて
-    /// 拒否する。true にする経路: (1) 送信側で fatal alert を送出した後
-    /// （[`Self::mark_poisoned`]）、(2) [`Self::close_notify`] で自ら
-    /// `close_notify` を送出した後（RFC 8446 §6.1: 送信後はそれ以上
-    /// データを送ってはならない）、(3) [`Self::open_record`] が
-    /// `close_notify`／fatal alert を受信した後、または復号・alert
-    /// 解析に失敗した後（#965 レビュー指摘: これらを poison にしないと
-    /// 終了済み・破損した接続でアプリケーションデータの送受信を続け
-    /// られてしまう）。
+    /// 接続が致命的な失敗状態に入ったら `true` にする（fail-closed）。
+    /// 以後の `seal_application_data`／`open_record`／`close_notify` を
+    /// **送受信の両方向とも**拒否する。true にする経路: (1) 送信側で fatal
+    /// alert を送出した後（[`Self::mark_poisoned`]）、(2) [`Self::open_record`]
+    /// が fatal alert を受信した後、または復号・alert 解析に失敗した後
+    /// （#965 レビュー指摘: これらを poison にしないと破損した接続で
+    /// アプリケーションデータの送受信を続けられてしまう）。
     poisoned: bool,
+    /// 自ら `close_notify` を送出した（送信方向の終了。RFC 8446 §6.1）。
+    /// 以後の送信操作（`seal_application_data`・`close_notify`）だけを
+    /// 拒否し、受信側（相手のデータ・`close_notify`）は引き続き受け取れる
+    /// （PR #1046 レビュー指摘: 単一の `poisoned` で表していたため
+    /// 送信後に受信まで拒否していた）。
+    sent_close_notify: bool,
+    /// 相手の `close_notify` を受信した（受信方向の終了）。以後の
+    /// `open_record` を拒否する。応答の `close_notify` 送出は許可し
+    /// （RFC 8446 §6.1: 書き込み側を閉じる前に `close_notify` を送る）、
+    /// アプリケーションデータの送信は fail-closed 側に倒して拒否する。
+    received_close_notify: bool,
 }
 
 /// [`TlsSession::open_record`] の戻り値。
@@ -864,7 +873,9 @@ pub enum TlsSessionError {
     Protection(ProtectionError),
     AlertDecode(AlertDescription),
     ReceivedFatalAlert(u8),
-    /// 送信側が既に fatal alert を送出済み（poison）。
+    /// 致命的な失敗（poison）・方向別の終了（`close_notify` 送出後の
+    /// 送信操作、`close_notify` 受信後の受信操作等）により、要求された
+    /// 操作がこの接続ではもう許されない。
     Poisoned,
 }
 
@@ -876,7 +887,9 @@ impl std::fmt::Display for TlsSessionError {
             TlsSessionError::ReceivedFatalAlert(d) => {
                 write!(f, "peer sent a fatal TLS alert (description {d})")
             }
-            TlsSessionError::Poisoned => write!(f, "TLS session already failed"),
+            TlsSessionError::Poisoned => {
+                write!(f, "TLS session already failed or closed in this direction")
+            }
         }
     }
 }
@@ -889,7 +902,7 @@ impl TlsSession {
         &mut self,
         payload: &[u8],
     ) -> Result<Vec<Record>, TlsSessionError> {
-        if self.poisoned {
+        if self.poisoned || self.sent_close_notify || self.received_close_notify {
             return Err(TlsSessionError::Poisoned);
         }
         self.sealer
@@ -901,12 +914,15 @@ impl TlsSession {
     /// `user_canceled`）は [`AppEvent::CloseNotify`] へ写像し、それ以外の
     /// alert は `Err(ReceivedFatalAlert)`。
     ///
-    /// 復号失敗・alert 解析失敗・`close_notify`／fatal alert の受信は
-    /// いずれもこの接続を終端させ、以後の呼び出しはすべて
-    /// `Err(Poisoned)` になる（#965 レビュー指摘: 終了済み・破損した
-    /// 接続でアプリケーションデータの送受信を続けさせない）。
+    /// 復号失敗・alert 解析失敗・fatal alert の受信はこの接続を両方向とも
+    /// 終端させ、以後の呼び出しはすべて `Err(Poisoned)` になる（#965
+    /// レビュー指摘: 破損した接続でアプリケーションデータの送受信を
+    /// 続けさせない）。`close_notify` の受信は受信方向だけを終端させる
+    /// （以後の `open_record` は `Err(Poisoned)`）。自ら `close_notify` を
+    /// 送出済みでも受信は続けられる（送信方向の終了は受信に影響しない。
+    /// PR #1046 レビュー指摘）。
     pub fn open_record(&mut self, record: &Record) -> Result<AppEvent, TlsSessionError> {
-        if self.poisoned {
+        if self.poisoned || self.received_close_notify {
             return Err(TlsSessionError::Poisoned);
         }
         let inner = match self.opener.open(record) {
@@ -928,7 +944,7 @@ impl TlsSession {
                 };
                 match alert::classify_received(alert) {
                     ReceivedAlert::Closed => {
-                        self.poisoned = true;
+                        self.received_close_notify = true;
                         Ok(AppEvent::CloseNotify)
                     }
                     ReceivedAlert::Fatal(code) => {
@@ -948,21 +964,25 @@ impl TlsSession {
 
     /// `close_notify` レコードを組み立てる。RFC 8446 §6.1 により、
     /// 送信後はこの接続でこれ以上データを送ってはならないため、組み立てに
-    /// 成功したら以後の `seal_application_data`／`open_record`／
-    /// `close_notify` をすべて拒否する（#965 レビュー指摘）。
+    /// 成功したら以後の送信操作（`seal_application_data`／`close_notify`）
+    /// を拒否する（#965 レビュー指摘）。`close_notify` は送信方向の終了に
+    /// すぎないため、`open_record` による相手のデータ・`close_notify` の
+    /// 受信は引き続き許可する（PR #1046 レビュー指摘）。相手の
+    /// `close_notify` 受信後の応答としての送出も許可する。
     pub fn close_notify(&mut self) -> Result<Vec<Record>, TlsSessionError> {
-        if self.poisoned {
+        if self.poisoned || self.sent_close_notify {
             return Err(TlsSessionError::Poisoned);
         }
         let records = self
             .sealer
             .seal_fragmented(ContentType::Alert, &Alert::close_notify())
             .map_err(TlsSessionError::Protection)?;
-        self.poisoned = true;
+        self.sent_close_notify = true;
         Ok(records)
     }
 
-    /// 送信側で fatal alert を送出した後に呼ぶ（以後 poison）。
+    /// 送信側で fatal alert を送出した後に呼ぶ（以後は送受信の両方向とも
+    /// poison）。
     pub fn mark_poisoned(&mut self) {
         self.poisoned = true;
     }

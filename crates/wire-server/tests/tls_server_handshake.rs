@@ -923,8 +923,9 @@ fn full_handshake_round_trip_over_pure_api() {
 
 /// #965 レビュー指摘の回帰: 自ら `close_notify` を送出した後は、RFC 8446
 /// §6.1 によりこの接続でこれ以上データを送ってはならないため、以後の
-/// `seal_application_data`／`open_record`／`close_notify` はすべて
-/// `Poisoned` で拒否される。
+/// 送信操作（`seal_application_data`／`close_notify`）は `Poisoned` で
+/// 拒否される（受信側の扱いは
+/// `sent_close_notify_still_allows_receiving_peer_data_and_close_notify`）。
 #[test]
 fn close_notify_poisons_the_session_against_further_data() {
     use wire_server::tls::server_handshake::TlsSessionError;
@@ -972,6 +973,103 @@ fn receiving_close_notify_poisons_the_session_against_further_data() {
         session.open_record(&close_records[0]),
         Err(TlsSessionError::Poisoned)
     );
+}
+
+/// PR #1046 レビュー指摘の回帰: `close_notify` は送信方向の終了にすぎない
+/// （RFC 8446 §6.1）。自ら送出した後も、相手のアプリケーションデータと
+/// `close_notify` は受信でき、相手の `close_notify` 受信後に初めて受信側も
+/// 拒否される。
+#[test]
+fn sent_close_notify_still_allows_receiving_peer_data_and_close_notify() {
+    use wire_server::tls::server_handshake::{AppEvent, TlsSessionError};
+
+    let (mut client, mut session) = establish_session_for_tests();
+
+    session
+        .close_notify()
+        .expect("server close_notify succeeds");
+
+    let payload = b"late data from client";
+    let data_records = client
+        .sealer
+        .seal_fragmented(ContentType::ApplicationData, payload)
+        .expect("valid seal");
+    let mut received = Vec::new();
+    for record in &data_records {
+        match session
+            .open_record(record)
+            .expect("peer data must still be readable after our close_notify")
+        {
+            AppEvent::ApplicationData(data) => received.extend_from_slice(&data),
+            other => panic!("expected application data, got {other:?}"),
+        }
+    }
+    assert_eq!(received, payload);
+
+    let close_records = client
+        .sealer
+        .seal_fragmented(ContentType::Alert, &Alert::close_notify())
+        .expect("valid seal");
+    let mut saw_close_notify = false;
+    for record in &close_records {
+        match session
+            .open_record(record)
+            .expect("peer close_notify must still be readable after our close_notify")
+        {
+            AppEvent::CloseNotify => saw_close_notify = true,
+            other => panic!("expected close_notify, got {other:?}"),
+        }
+    }
+    assert!(saw_close_notify, "peer close_notify must be observed");
+
+    // 両方向とも終了した後は、受信も送信も拒否される。
+    assert_eq!(
+        session.open_record(&close_records[0]),
+        Err(TlsSessionError::Poisoned)
+    );
+    assert_eq!(
+        session.seal_application_data(b"must not be sent"),
+        Err(TlsSessionError::Poisoned)
+    );
+}
+
+/// PR #1046 レビュー指摘の回帰: 相手の `close_notify` 受信は受信方向だけを
+/// 終了させるため、応答としての自らの `close_notify` 送出は成功し、相手が
+/// それを `close_notify` として開けること。
+#[test]
+fn received_close_notify_still_allows_sending_our_close_notify() {
+    use wire_server::tls::server_handshake::{AppEvent, TlsSessionError};
+
+    let (mut client, mut session) = establish_session_for_tests();
+
+    let close_records = client
+        .sealer
+        .seal_fragmented(ContentType::Alert, &Alert::close_notify())
+        .expect("valid seal");
+    for record in &close_records {
+        assert_eq!(
+            session.open_record(record),
+            Ok(AppEvent::CloseNotify),
+            "peer close_notify must be observed"
+        );
+    }
+
+    let reply = session
+        .close_notify()
+        .expect("replying close_notify after the peer's must succeed");
+    for record in &reply {
+        let inner = client
+            .opener
+            .open(record)
+            .expect("valid close_notify record");
+        assert_eq!(inner.content_type, ContentType::Alert);
+        let alert = Alert::parse(&inner.content).expect("valid alert bytes");
+        assert_eq!(
+            wire_server::tls::alert::classify_received(alert),
+            ReceivedAlert::Closed
+        );
+    }
+    assert_eq!(session.close_notify(), Err(TlsSessionError::Poisoned));
 }
 
 /// #965 レビュー指摘の回帰: 復号（`bad_record_mac`）・alert 解析の失敗は
