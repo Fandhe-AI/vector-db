@@ -2969,16 +2969,39 @@ pub(crate) enum AggregateInput {
     /// `MIN`/`MAX`（バイト順・NULL 無視）でのみ使う（`SUM`/`AVG` は
     /// [`resolve_aggregate_input`] が型不整合として拒否済み）。
     TextColumn(usize),
+    /// `INTEGER` 列の裸の列参照（`schema.columns` の添字）。`COUNT`/`SUM`/
+    /// `AVG`/`MIN`/`MAX` のすべてで使う（TABLE-13・TASK-196、Issue #881・
+    /// #892）。`SUM` の結果は `i128` 累積・確定時に `i64` へ収まるか検査する
+    /// （D2。`Accumulator::IntSum`）。
+    IntegerColumn(usize),
+    /// `BIGINT` 列の裸の列参照。`IntegerColumn` と同じ受理範囲・累積方式を
+    /// 共有する（`ScalarRef::BigInt` からそのまま `i64` を取り出す点のみが
+    /// 異なる）。
+    BigIntColumn(usize),
+    /// `REAL` 列の裸の列参照。`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のすべてで使う
+    /// （Issue #892）。`f32` は `f64::from` で無損失に拡張し、既存の
+    /// `Accumulator::FloatSum`/`FloatAvg`/`FloatMin`/`FloatMax`（`ScalarExpr`
+    /// と共有）へ観測する。結果はいずれも `Cell::Float`（DOUBLE PRECISION
+    /// 相当。本リポの実装既定値）。
+    RealColumn(usize),
+    /// `DOUBLE PRECISION` 列の裸の列参照。`RealColumn` と同じ受理範囲・
+    /// 累積方式を共有する（`f64` をそのまま使う点のみが異なる）。
+    DoubleColumn(usize),
     /// `BOOLEAN` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
     /// 行数）でのみ使う（TABLE-13・TASK-196、Issue #883）。`SUM`/`AVG`/`MIN`/
     /// `MAX` は `TextColumn` と同じパターンで [`resolve_aggregate_input`] が
     /// 型不整合として拒否する。
     BooleanColumn(usize),
-    /// `DATE`／`TIMESTAMP` 列の裸の列参照（`schema.columns` の添字）。`COUNT`
-    /// （非 NULL 行数）でのみ使う（TABLE-13・TASK-197、Issue #884）。`SUM`/`AVG`/
-    /// `MIN`/`MAX` は `BooleanColumn` と同じパターンで [`resolve_aggregate_input`]
-    /// が型不整合として拒否する（`MIN`/`MAX` 対応は Issue #892 へ申し送り）。
-    DatetimeColumn(usize),
+    /// `DATE` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
+    /// 行数）・`MIN`/`MAX`（1970-01-01 起点の日数の全順序比較・NULL 無視）
+    /// で使う（TABLE-13・TASK-197、Issue #884・#892）。`SUM`/`AVG` は
+    /// [`resolve_aggregate_input`] が型不整合として拒否する（暦日の合計・平均に
+    /// 意味論がないため）。
+    DateColumn(usize),
+    /// `TIMESTAMP` 列の裸の列参照（`schema.columns` の添字）。`DateColumn` と
+    /// 同じ受理範囲（`COUNT`・`MIN`/`MAX`）を持つ（TABLE-13・TASK-197、
+    /// Issue #884・#892）。
+    TimestampColumn(usize),
     /// `ARRAY` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL 行数）
     /// でのみ使う（TABLE-14・TASK-198、Issue #888・D-A8）。`SUM`/`AVG`/`MIN`/
     /// `MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
@@ -3000,12 +3023,17 @@ pub(crate) enum AggregateInput {
     /// 宣言順で `MIN`/`MAX` 比較できるが、辞書順で代用すると意味論が食い違うため
     /// 意図的に受理しない。Issue #890 D7）。
     EnumColumn(usize),
-    /// `NUMERIC` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
-    /// 行数）でのみ使う（TABLE-13〔検討中〕・TASK-197、Issue #885）。`SUM`/
-    /// `AVG`/`MIN`/`MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
-    /// [`resolve_aggregate_input`] が型不整合として拒否する（別 Issue #892 の
-    /// 担当）。
-    NumericColumn(usize),
+    /// `NUMERIC(p, s)` 列の裸の列参照（TABLE-13〔検討中〕・TASK-197、
+    /// Issue #885・#892）。`COUNT`（非 NULL 行数）・`SUM`/`AVG`/`MIN`/`MAX`
+    /// （unscaled i128 累積・列の `precision`/`scale` を保持）のすべてで使う。
+    /// `precision`/`scale` は `Accumulator::new`（`SUM`/`AVG` の桁あふれ判定・
+    /// `AVG` の結果 scale 決定）が必要とするため、列参照の時点で複製して
+    /// 保持する（行走査のたびにスキーマを引き直さない設計）。
+    NumericColumn {
+        index: usize,
+        precision: u8,
+        scale: u8,
+    },
     /// `UUID` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL
     /// 行数）でのみ使う（TABLE-13〔検討中〕・TASK-197、Issue #887）。`SUM`/
     /// `AVG`/`MIN`/`MAX` は `TextColumn`/`BooleanColumn` と同じパターンで
@@ -3381,12 +3409,18 @@ impl BoundAggregate {
 /// `sql::udf_call::bind_expr_in` と揃える（Issue #56 レビュー指摘で確立した既存
 /// 規約）。
 ///
-/// 型ごとの受理・拒否は以下（対象ビヘイビア: SQL-13）:
+/// 型ごとの受理・拒否は以下（対象ビヘイビア: SQL-13。Issue #892 で
+/// `INTEGER`/`BIGINT`/`REAL`/`DOUBLE PRECISION`/`NUMERIC` の `SUM`/`AVG`/
+/// `MIN`/`MAX`・`DATE`/`TIMESTAMP` の `MIN`/`MAX` を追加受理した）:
 /// - `*`（`COUNT` 限定。構文層が既に強制済み）→ [`AggregateInput::AllVisible`]
 /// - `id` → `COUNT` は [`AggregateInput::AllVisible`]、それ以外は
 ///   [`AggregateInput::IdU64`]
 /// - `TEXT` 列 → `SUM`/`AVG` は型不整合（`22000`）、それ以外は
 ///   [`AggregateInput::TextColumn`]
+/// - `INTEGER`/`BIGINT`/`REAL`/`DOUBLE PRECISION`/`NUMERIC` 列 → すべての
+///   集計関数を受理（[`AggregateInput::IntegerColumn`] 等）
+/// - `DATE`/`TIMESTAMP` 列 → `COUNT`・`MIN`/`MAX` を受理、`SUM`/`AVG` は
+///   型不整合（`22000`）
 /// - `VECTOR` 列（裸の列参照）→ `COUNT` は [`AggregateInput::VectorColumnPresence`]
 ///   （非 NULL 行のみ数える）、それ以外は型不整合（`22000`）
 /// - 上記以外の識別子 → 未知の列（`22000`）
@@ -3426,35 +3460,38 @@ fn resolve_aggregate_input(
                     (ColumnType::Vector(_), _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
-                    // `INTEGER`／`BIGINT` 列の集計対応は Issue #892 の担当。
-                    // 本 Issue（#881）では既存の TEXT/VECTOR 以外の列参照と同じ
-                    // fail-closed 拒否に倒す。
-                    (ColumnType::Integer | ColumnType::BigInt, _) => {
-                        Err(SqlSurfaceError::invalid_input(format!(
-                            "column {name:?} cannot be used in aggregate functions yet"
-                        )))
-                    }
-                    // F10（Issue #882 計画）: REAL/DOUBLE の集計対応は #892 の
-                    // 担当。現時点ではすべての集計関数（COUNT を含む）で拒否する。
-                    (ColumnType::Real | ColumnType::Double, _) => {
-                        Err(SqlSurfaceError::invalid_input(format!(
-                            "column {name:?} is REAL/DOUBLE and cannot be used in an aggregate"
-                        )))
-                    }
+                    // `INTEGER`／`BIGINT` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
+                    // のすべてで受理する（TABLE-13・TASK-196、Issue #881・
+                    // #892）。
+                    (ColumnType::Integer, _) => Ok(AggregateInput::IntegerColumn(index)),
+                    (ColumnType::BigInt, _) => Ok(AggregateInput::BigIntColumn(index)),
+                    // `REAL`／`DOUBLE PRECISION` 列も同様にすべての集計関数を
+                    // 受理する（Issue #892）。
+                    (ColumnType::Real, _) => Ok(AggregateInput::RealColumn(index)),
+                    (ColumnType::Double, _) => Ok(AggregateInput::DoubleColumn(index)),
                     (ColumnType::Boolean, AggregateFunc::Count) => {
                         Ok(AggregateInput::BooleanColumn(index))
                     }
                     (ColumnType::Boolean, _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is BOOLEAN and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
-                    (ColumnType::Date | ColumnType::Timestamp, AggregateFunc::Count) => {
-                        Ok(AggregateInput::DatetimeColumn(index))
-                    }
-                    (ColumnType::Date | ColumnType::Timestamp, _) => {
-                        Err(SqlSurfaceError::invalid_input(format!(
-                            "column {name:?} is DATE/TIMESTAMP and cannot be used with SUM/AVG/MIN/MAX"
-                        )))
-                    }
+                    // `DATE`／`TIMESTAMP` 列は `COUNT`・`MIN`/`MAX` を受理する
+                    // （暦日・時刻の全順序比較。Issue #892）。`SUM`/`AVG` は
+                    // 合計・平均に意味論がないため引き続き拒否する。
+                    (
+                        ColumnType::Date,
+                        AggregateFunc::Count | AggregateFunc::Min | AggregateFunc::Max,
+                    ) => Ok(AggregateInput::DateColumn(index)),
+                    (ColumnType::Date, _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is DATE and cannot be used with SUM/AVG"
+                    ))),
+                    (
+                        ColumnType::Timestamp,
+                        AggregateFunc::Count | AggregateFunc::Min | AggregateFunc::Max,
+                    ) => Ok(AggregateInput::TimestampColumn(index)),
+                    (ColumnType::Timestamp, _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is TIMESTAMP and cannot be used with SUM/AVG"
+                    ))),
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
                     }
@@ -3481,13 +3518,16 @@ fn resolve_aggregate_input(
                     (ColumnType::Enum(_), _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is ENUM and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
-                    (ColumnType::Numeric { .. }, AggregateFunc::Count) => {
-                        Ok(AggregateInput::NumericColumn(index))
-                    }
-                    (ColumnType::Numeric { .. }, _) => {
-                        Err(SqlSurfaceError::invalid_input(format!(
-                            "column {name:?} is NUMERIC and cannot be used with SUM/AVG/MIN/MAX"
-                        )))
+                    // `NUMERIC(p, s)` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` の
+                    // すべてで受理する（Issue #892）。列の `precision`/`scale`
+                    // をここで複製し保持する（`Accumulator::new` が桁あふれ
+                    // 判定・`AVG` の結果 scale 決定に使う）。
+                    (ColumnType::Numeric { precision, scale }, _) => {
+                        Ok(AggregateInput::NumericColumn {
+                            index,
+                            precision: *precision,
+                            scale: *scale,
+                        })
                     }
                     (ColumnType::Uuid, AggregateFunc::Count) => {
                         Ok(AggregateInput::UuidColumn(index))
@@ -3831,16 +3871,31 @@ fn resolve_group_by_column(schema: &TableSchema, column: &str) -> Result<usize, 
 /// [`BoundAggregate::new_grouped`]（TASK-186・NOSQL-5）が共有する単一実装。
 /// `target_name` はエラー文言用（SQL 経由は `HAVING` 述語の識別子、直接構築
 /// 経由は集計項目の実効名）。
+///
+/// Issue #892（D8）: `HAVING` は `f64` リテラルとの厳密な数値比較
+/// （[`crate::sql::group_by::having_matches`]）しか行わないため、`NUMERIC`
+/// 型の集計結果（`SUM`/`AVG`/`MIN`/`MAX(<NUMERIC 列>)`。`Cell::Numeric`）と
+/// `DATE`/`TIMESTAMP` の `MIN`/`MAX`（`Cell::Date`/`Cell::Timestamp`）は
+/// 黙って `false` へ縮退させず、`TEXT` と同じく型不整合 `22000` で拒否する
+/// （`COUNT` はいずれの列型でも結果が `Cell::Integer` になるため対象外）。
 fn check_having_target_is_numeric(
     item: &BoundAggregateItem,
     target_name: &str,
 ) -> Result<(), SqlSurfaceError> {
-    let is_text_valued = matches!(item.input, AggregateInput::TextColumn(_))
-        && !matches!(item.func, crate::sql::allowlist::AggregateFunc::Count);
-    if is_text_valued {
+    use crate::sql::allowlist::AggregateFunc;
+
+    let is_non_count = !matches!(item.func, AggregateFunc::Count);
+    let is_unsupported = is_non_count
+        && matches!(
+            item.input,
+            AggregateInput::TextColumn(_)
+                | AggregateInput::NumericColumn { .. }
+                | AggregateInput::DateColumn(_)
+                | AggregateInput::TimestampColumn(_)
+        );
+    if is_unsupported {
         return Err(SqlSurfaceError::invalid_input(format!(
-            "HAVING target {target_name:?} is a TEXT-typed aggregate and cannot be compared \
-             numerically"
+            "HAVING target {target_name:?} is not a numerically comparable aggregate result"
         )));
     }
     Ok(())

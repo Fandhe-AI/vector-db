@@ -656,8 +656,10 @@ fn rls_isolates_numeric_rows_across_tenants() {
     }
 }
 
-// --- 受け入れ条件 10: COUNT(numeric) と SUM/AVG/MIN/MAX・WHERE・式・GROUP BY の
-// 拒否（別 Issue #891・#892 の担当であることを固定するテスト） ------------------
+// --- 受け入れ条件 10: COUNT(numeric) と WHERE・式・GROUP BY の拒否
+// （別 Issue #891 の担当であることを固定するテスト。SUM/AVG/MIN/MAX の直接
+// 参照は Issue #892 で受理されたため
+// `sum_avg_min_max_on_numeric_column_succeed_after_issue_892` 参照）------------
 
 #[test]
 fn count_numeric_counts_non_null_rows_only() {
@@ -696,13 +698,6 @@ fn sum_avg_min_max_where_expr_and_group_by_reject_numeric_column() {
     )
     .expect("insert should succeed");
 
-    for func in ["SUM", "AVG", "MIN", "MAX"] {
-        let err = core
-            .execute_sql(&alice, &format!("SELECT {func}(price) FROM {TABLE}"))
-            .unwrap_err();
-        assert_eq!(err.wire_code(), "22000", "{func}(price) should be 22000");
-    }
-
     // WHERE 述語（等価）での NUMERIC 列参照は対象外（Issue #891）。
     let err = core
         .execute_sql(
@@ -729,6 +724,72 @@ fn sum_avg_min_max_where_expr_and_group_by_reject_numeric_column() {
         )
         .unwrap_err();
     assert_eq!(err.wire_code(), "22000");
+}
+
+/// `SUM`/`AVG`/`MIN`/`MAX(price)` は Issue #892（D5・D6）で受理された。
+/// `SUM`/`MIN`/`MAX` は列の scale（`NUMERIC(5,2)` なら scale=2）のまま、
+/// `AVG` は `max(s, min(16, 38-(p-s)))`（本ケースでは 16）まで拡張した scale
+/// で返る。
+#[test]
+fn sum_avg_min_max_on_numeric_column_succeed_after_issue_892() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &insert_sql(1, "ja", "1.00", 1),
+    )
+    .expect("insert row 1 should succeed");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &insert_sql(2, "ja", "2.50", 2),
+    )
+    .expect("insert row 2 should succeed");
+
+    let sum = core
+        .execute_sql(&alice, &format!("SELECT SUM(price) FROM {TABLE}"))
+        .expect("SUM(NUMERIC) must succeed after Issue #892");
+    assert_eq!(
+        sum.rows[0].cells,
+        vec![Cell::Numeric(
+            Decimal::from_parts(350, 2).expect("valid decimal")
+        )]
+    );
+
+    let avg = core
+        .execute_sql(&alice, &format!("SELECT AVG(price) FROM {TABLE}"))
+        .expect("AVG(NUMERIC) must succeed after Issue #892");
+    assert_eq!(
+        avg.rows[0].cells,
+        vec![Cell::Numeric(
+            Decimal::from_parts(17_500_000_000_000_000, 16).expect("valid decimal")
+        )]
+    );
+
+    let min_max = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT MIN(price), MAX(price) FROM {TABLE}"),
+        )
+        .expect("MIN/MAX(NUMERIC) must succeed after Issue #892");
+    assert_eq!(
+        min_max.rows[0].cells,
+        vec![
+            Cell::Numeric(Decimal::from_parts(100, 2).expect("valid decimal")),
+            Cell::Numeric(Decimal::from_parts(250, 2).expect("valid decimal")),
+        ]
+    );
+
+    // 空集合は NULL。
+    let empty = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT SUM(price) FROM {TABLE} WHERE id = 999"),
+        )
+        .expect("SUM over an empty result set must still succeed");
+    assert_eq!(empty.rows[0].cells, vec![Cell::Null]);
 }
 
 // --- 受け入れ条件 11: 負数リテラル（数値・文字列）が同じ値に束縛される --------

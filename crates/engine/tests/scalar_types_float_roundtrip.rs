@@ -274,9 +274,10 @@ fn select_where_on_real_column_is_rejected() {
     assert_eq!(err.wire_code(), "22000");
 }
 
-/// `SUM(score)` は fail-closed に拒否される（F10: 集計対応は #892）。
+/// `SUM(score)` は Issue #892 で受理された（TABLE-13・SQL-13）。結果は
+/// `Cell::Float`（DOUBLE PRECISION 相当。本リポの実装既定値）。
 #[test]
-fn sum_aggregate_on_real_column_is_rejected() {
+fn sum_aggregate_on_real_column_succeeds_after_issue_892() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -291,11 +292,20 @@ fn sum_aggregate_on_real_column_is_rejected() {
         ),
     )
     .expect("INSERT should succeed");
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, score) VALUES (2, '[0.1,0.2]', 2.5) \
+             USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("INSERT should succeed");
 
-    let err = core
+    let result = core
         .execute_sql(&alice, &format!("SELECT SUM(score) FROM {TABLE}"))
-        .expect_err("SUM on REAL column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+        .expect("SUM on REAL column must succeed after Issue #892");
+    assert_eq!(result.rows[0].cells, vec![Cell::Float(3.5)]);
 }
 
 /// `id = -1` の応答コードは REAL/DOUBLE 追加の前後で変わらない（既存契約の

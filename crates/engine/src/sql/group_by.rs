@@ -702,11 +702,27 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
             // 比較演算子として構造上生成しないため到達しない。
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
         },
-        // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT/ARRAY/BYTEA/JSON/
-        // NUMERIC 型の集計結果を HAVING の対象として拒否済みのため到達しない
-        // （NUMERIC 列の集計自体が TASK-197・Issue #885 の対象外。`SUM`/`AVG`/
-        // `MIN`/`MAX` は別 Issue #892 の担当）。`SignedInteger`（Issue #881・#892
-        // まで集計対象外）も同様。fail-closed に「不一致」として扱う。
+        // Issue #892（D8）: `SUM`/`AVG`/`MIN`/`MAX(<INTEGER>/<BIGINT>)` の結果
+        // （`Cell::SignedInteger`）。`Cell::Integer`（`u64`。疑似列 `id`・
+        // `COUNT`）とは符号付き/符号なしの境界が異なるため、専用の比較関数
+        // （[`cmp_signed_to_literal`]）で `f64` リテラルと厳密に比較する。
+        Cell::SignedInteger(n) => {
+            use std::cmp::Ordering;
+            let ord = cmp_signed_to_literal(*n, literal);
+            match op {
+                BinOp::Gt => ord == Ordering::Greater,
+                BinOp::Lt => ord == Ordering::Less,
+                BinOp::Ge => ord != Ordering::Less,
+                BinOp::Le => ord != Ordering::Greater,
+                BinOp::Eq => ord == Ordering::Equal,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
+            }
+        }
+        // 束縛段（`sql::parser::check_having_target_is_numeric`。Issue #892・
+        // D8）が TEXT・NUMERIC 型の集計結果・`DATE`/`TIMESTAMP` の `MIN`/`MAX`
+        // を HAVING の対象として拒否済みのため到達しない（`f64` リテラルとの
+        // 厳密な数値比較に意味論が無いため）。ARRAY/BYTEA/JSON/UUID も同様に
+        // 集計対象外。fail-closed に「不一致」として扱う。
         Cell::Null
         | Cell::Text(_)
         | Cell::Vector(_)
@@ -716,9 +732,36 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         | Cell::Array(_)
         | Cell::Bytes(_)
         | Cell::Json(_)
-        | Cell::SignedInteger(_)
         | Cell::Numeric(_)
         | Cell::Uuid(_) => false,
+    }
+}
+
+/// `Cell::SignedInteger`（`i64`）と `HAVING` の `f64` リテラルを厳密に比較する
+/// （Issue #892・D8）。[`cmp_integer_to_literal`]（`u64` 版）と同じ規約
+/// （`literal` が非有限・範囲外・非整数の場合の扱い）を符号付きへ拡張したもの。
+fn cmp_signed_to_literal(n: i64, literal: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if literal.is_nan() {
+        // `cmp_integer_to_literal` と同じ fail-closed 方針: `Eq` が false に
+        // なれば十分なため、`Equal` 以外であれば方向は問わない。
+        return Ordering::Greater;
+    }
+    // `i64` の表現域は `[-2^63, 2^63 - 1]`。範囲外のリテラルは符号だけで確定する。
+    if literal < -9_223_372_036_854_775_808.0 {
+        return Ordering::Greater;
+    }
+    if literal >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less;
+    }
+    // 上の範囲チェックにより `literal.floor()` は `i64` の表現域に収まる。
+    let floor_i64 = literal.floor() as i64;
+    match n.cmp(&floor_i64) {
+        Ordering::Equal if literal.fract() != 0.0 => {
+            // n == floor(literal) だが literal 自体は非整数 → 実際には n < literal。
+            Ordering::Less
+        }
+        other => other,
     }
 }
 
@@ -737,6 +780,20 @@ fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         (Cell::Float(x), Cell::Integer(y)) => x.total_cmp(&(*y as f64)),
         (Cell::Float(x), Cell::Float(y)) => x.total_cmp(y),
         (Cell::Text(x), Cell::Text(y)) => x.cmp(y),
+        // Issue #892（D9）: `ORDER BY` が新スカラー型の集計結果を並べ替える際に
+        // 使う。`ORDER BY` 対象は同一集計項目（`OrderTarget::Aggregate`）の
+        // 複数グループ分の結果であり、`Cell` の variant は常に揃っている
+        // （束縛段が集計関数・入力列型から一意に決まる結果型を割り当てるため）。
+        (Cell::SignedInteger(x), Cell::SignedInteger(y)) => x.cmp(y),
+        (Cell::Date(x), Cell::Date(y)) => x.cmp(y),
+        (Cell::Timestamp(x), Cell::Timestamp(y)) => x.cmp(y),
+        // `NUMERIC` は同一列由来なら常に同じ scale を持つ（`Accumulator`
+        // 各 variant が列の scale をそのまま保持する契約）。scale が一致しない
+        // 組み合わせは到達しない想定の防御的フォールバックとして Equal を返す
+        // （並び替え全体を破綻させない）。
+        (Cell::Numeric(x), Cell::Numeric(y)) if x.scale() == y.scale() => {
+            x.unscaled().cmp(&y.unscaled())
+        }
         // `Cell::Null` は呼び出し元が別途処理するため、ここへ渡ってきても
         // （防御的フォールバックとして）到達しない想定。型不一致も同様に
         // Equal を返す（並び替え全体が破綻しないようにする防御的フォールバック）。
@@ -1181,7 +1238,10 @@ pub(crate) fn execute_grouped_aggregate(
 
     let mut finished: Vec<(GroupKey, Vec<Cell>)> = Vec::with_capacity(total_group_count);
     for (key, accs) in group_entries {
-        let cells: Vec<Cell> = accs.into_iter().map(Accumulator::finish).collect();
+        let cells: Vec<Cell> = accs
+            .into_iter()
+            .map(Accumulator::finish)
+            .collect::<Result<Vec<_>, _>>()?;
         let mut keep = true;
         for h in &group_by.having {
             let cell = cells
@@ -1388,5 +1448,70 @@ mod tests {
         let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, None, None)
             .expect_err("key/header tenant mismatch must be rejected fail-closed");
         assert_eq!(err.wire_code(), "XX000");
+    }
+
+    // --- cmp_signed_to_literal（Issue #892・D8） --------------------------
+
+    #[test]
+    fn cmp_signed_to_literal_handles_exact_boundaries() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_signed_to_literal(0, 0.0), Ordering::Equal);
+        assert_eq!(cmp_signed_to_literal(-5, -5.0), Ordering::Equal);
+        // `i64::MAX` 自体は `f64` で厳密に表現できない（2^63 に丸まる）ため、
+        // `f64` で厳密表現できる大きな値で境界を確認する。
+        assert_eq!(
+            cmp_signed_to_literal(1_000_000_000_000_000, 1_000_000_000_000_000.0),
+            Ordering::Equal
+        );
+        // `i64::MIN`（`-2^63`）は `f64` で厳密に表現できる。
+        assert_eq!(
+            cmp_signed_to_literal(i64::MIN, i64::MIN as f64),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn cmp_signed_to_literal_handles_fractional_literals() {
+        use std::cmp::Ordering;
+        // n == floor(literal) だが literal 自体は非整数 → n < literal。
+        assert_eq!(cmp_signed_to_literal(-4, -3.5), Ordering::Less);
+        assert_eq!(cmp_signed_to_literal(3, 3.5), Ordering::Less);
+        assert_eq!(cmp_signed_to_literal(4, 3.5), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_signed_to_literal_handles_out_of_range_literals() {
+        use std::cmp::Ordering;
+        // `i64` の表現域を超えるリテラルは符号だけで確定する。
+        assert_eq!(cmp_signed_to_literal(i64::MAX, 1e30), Ordering::Less);
+        assert_eq!(cmp_signed_to_literal(i64::MIN, -1e30), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_signed_to_literal_rejects_nan_as_not_equal() {
+        use std::cmp::Ordering;
+        assert_ne!(cmp_signed_to_literal(0, f64::NAN), Ordering::Equal);
+    }
+
+    // --- cmp_cell_values（Issue #892・D9） ---------------------------------
+
+    #[test]
+    fn cmp_cell_values_orders_signed_integer_date_timestamp_and_numeric() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            cmp_cell_values(&Cell::SignedInteger(-5), &Cell::SignedInteger(3)),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_cell_values(&Cell::Date(100), &Cell::Date(50)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_cell_values(&Cell::Timestamp(1_000), &Cell::Timestamp(1_000)),
+            Ordering::Equal
+        );
+        let a = Cell::Numeric(crate::numeric::Decimal::from_parts(150, 2).unwrap());
+        let b = Cell::Numeric(crate::numeric::Decimal::from_parts(200, 2).unwrap());
+        assert_eq!(cmp_cell_values(&a, &b), Ordering::Less);
     }
 }
