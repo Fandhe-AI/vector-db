@@ -173,9 +173,10 @@ impl fmt::Display for PemError {
 
 impl std::error::Error for PemError {}
 
-/// 上限付きファイル読み込み・鍵ファイル固有のエラー。`main.rs` の
-/// `--scram-mock-key-file` 読み込みパターン（メタデータで通常ファイルを
-/// 確認 → `Read::take` で上限+1 バイトまで読む）を踏襲する。
+/// 上限付きファイル読み込み・鍵ファイル固有のエラー。[`read_bounded_file`]
+/// が `open` した記述子から `fstat` で通常ファイルを確認し、`Read::take`
+/// で上限+1 バイトまで読む（TOCTOU 回避のため `open` 前のパス単体への
+/// `stat` は行わない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TlsFileError {
     NotFound,
@@ -236,12 +237,23 @@ impl fmt::Display for CertificateLoadError {
 
 impl std::error::Error for CertificateLoadError {}
 
-/// メタデータ確認 → `Read::take(max + 1)` の二重防御で読み込む上限付き
-/// ファイル読み込み（`main.rs` の `--scram-mock-key-file` 読み込みと同じ
-/// パターン）。`std::fs::metadata` の `len()` は特殊ファイルでは信用でき
-/// ないため、実際の読み込みも固定上限で打ち切る。
+/// `open` → 同一ハンドルの `fstat`（`File::metadata`）→ `Read::take(max + 1)`
+/// の順で読み込む上限付きファイル読み込み。パスに対する `stat` と `open` を
+/// 分けると、その間にパスを差し替えられ（TOCTOU）通常ファイル検査
+/// （`NotRegularFile` の fail-closed 契約）を迂回されうるため、`open` した
+/// ファイル記述子そのものから `is_file()` を判定し、以降ファイルシステムへ
+/// パス経由でアクセスしない（`std::fs::metadata(path)` は使わない。エラー
+/// 表示用の `path.to_path_buf()` はパスの文字列コピーのみで I/O を伴わない）。
+/// なお `open` 自体が FIFO に対してブロックしうる余地は本修正の範囲外
+/// （`O_NONBLOCK` 指定には `libc` 定数の追加依存が要るため見送り。パスは
+/// 運用者が起動時に CLI で渡す設定値であり、wire プロトコル越しの
+/// untrusted な実行時入力ではない）。
 pub(crate) fn read_bounded_file(path: &Path, max: u64) -> Result<SecretBuf, FileLoadError> {
-    let metadata = std::fs::metadata(path).map_err(|e| FileLoadError {
+    let file = File::open(path).map_err(|e| FileLoadError {
+        path: path.to_path_buf(),
+        error: map_io_error(&e),
+    })?;
+    let metadata = file.metadata().map_err(|e| FileLoadError {
         path: path.to_path_buf(),
         error: map_io_error(&e),
     })?;
@@ -251,10 +263,6 @@ pub(crate) fn read_bounded_file(path: &Path, max: u64) -> Result<SecretBuf, File
             error: TlsFileError::NotRegularFile,
         });
     }
-    let file = File::open(path).map_err(|e| FileLoadError {
-        path: path.to_path_buf(),
-        error: map_io_error(&e),
-    })?;
     // 確保量を上限 + 1 で頭打ちにしてから読む（untrusted なファイル長を
     // 無制限確保に使わない。`.claude/rules/coding-rust.md`）。
     let cap = (max.saturating_add(1)) as usize;
@@ -483,11 +491,48 @@ fn classify_label(label: &str) -> BlockLabel {
     }
 }
 
+/// `Vec<u8>` を Drop 時に [`super::hkdf::zeroize`] で best-effort ゼロ化する
+/// ラッパー。秘密鍵ブロックの base64 本体（[`RawBlock::body`]・
+/// [`scan_blocks`] の走査中バッファ・デコード後の中間 DER）は、通常の
+/// `Vec<u8>` のまま確保すると `SecretBuf` のゼロ化を経由しないコピーが
+/// ヒープに残りうるため、証明書（公開データ）分も含めて実装を 1 つに
+/// 保ったままこの型で統一する。
+#[derive(Default)]
+struct ZeroizingBytes(Vec<u8>);
+
+impl ZeroizingBytes {
+    /// 内部の `Vec<u8>` を取り出す（`self` は空のまま Drop されるため
+    /// 二重ゼロ化にはならない）。デコード済みの秘密鍵 DER を
+    /// [`SecretBuf`] へ引き継ぐ経路でのみ使う。
+    fn into_inner(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl std::ops::Deref for ZeroizingBytes {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ZeroizingBytes {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.0
+    }
+}
+
+impl Drop for ZeroizingBytes {
+    fn drop(&mut self) {
+        super::hkdf::zeroize(&mut self.0);
+    }
+}
+
 /// 1 つの PEM ブロック（BEGIN〜END）から抽出した情報。
 struct RawBlock {
     label: BlockLabel,
     /// base64 本体（改行・空白を除去済み。まだデコードしていない）。
-    body: Vec<u8>,
+    body: ZeroizingBytes,
 }
 
 /// PEM テキスト全体を構文レベルで走査し、ブロック列を返す
@@ -507,7 +552,7 @@ fn scan_blocks(text: &[u8]) -> Result<Vec<RawBlock>, PemError> {
 
     let mut blocks = Vec::new();
     let mut current_label: Option<String> = None;
-    let mut current_body: Vec<u8> = Vec::new();
+    let mut current_body = ZeroizingBytes::default();
 
     for raw_line in text.split('\n') {
         // CRLF の CR を取り除く（行末以外に CR が来る形は下の判定で
@@ -524,6 +569,13 @@ fn scan_blocks(text: &[u8]) -> Result<Vec<RawBlock>, PemError> {
             }
             current_label = Some(label.to_string());
             current_body.clear();
+            // ブロック本体は必ず `text` の部分集合であるため、その長さを
+            // 上限に一度だけ確保しておく（`text` 自体は呼び出し元
+            // ［`read_bounded_file`］で上限済み。`extend_from_slice` の
+            // 段階的な再確保を避け、秘密鍵 base64 のゼロ化されない
+            // 旧確保領域が複数世代ヒープに残ることを防ぐ。失敗時は
+            // best-effort のため無視し、通常の再確保に委ねる）。
+            let _ = current_body.try_reserve_exact(text.len());
             continue;
         }
         if let Some(label) = trimmed
@@ -605,14 +657,20 @@ pub fn load_certificate_chain_file(path: &Path) -> Result<Vec<Vec<u8>>, Certific
 /// さらに PKCS#8 として構文解析する。
 pub(crate) fn decode_private_key_pem(text: &[u8]) -> Result<SecretBuf, PemError> {
     let blocks = scan_blocks(text)?;
-    let mut private_key_der: Option<Vec<u8>> = None;
+    let mut private_key_der: Option<ZeroizingBytes> = None;
     let mut private_key_count = 0usize;
     for block in blocks {
         match block.label {
             BlockLabel::PrivateKey => {
                 private_key_count += 1;
-                let der = decode_base64_const_time(&block.body, MAX_PRIVATE_KEY_FILE_LEN)
-                    .map_err(PemError::Base64)?;
+                // 複数 `PRIVATE KEY` ブロックが見つかった場合（後段で
+                // `ExpectedSingleBlock` として拒否する）でも、2 個目以降の
+                // デコード結果を破棄する前に `ZeroizingBytes` でラップし、
+                // 破棄時（スコープ末尾の Drop）にゼロ化する。
+                let der = ZeroizingBytes(
+                    decode_base64_const_time(&block.body, MAX_PRIVATE_KEY_FILE_LEN)
+                        .map_err(PemError::Base64)?,
+                );
                 if private_key_der.is_none() {
                     private_key_der = Some(der);
                 }
@@ -631,7 +689,7 @@ pub(crate) fn decode_private_key_pem(text: &[u8]) -> Result<SecretBuf, PemError>
     }
     // `private_key_count == 1` を確認済みのため必ず `Some`。
     let der = private_key_der.ok_or(PemError::ExpectedSingleBlock { found: 0 })?;
-    Ok(SecretBuf::from_vec(der))
+    Ok(SecretBuf::from_vec(der.into_inner()))
 }
 
 #[cfg(test)]
@@ -885,6 +943,18 @@ mod tests {
     fn read_bounded_file_rejects_directory() {
         let dir = std::env::temp_dir();
         let err = read_bounded_file(&dir, MAX_PRIVATE_KEY_FILE_LEN).unwrap_err();
+        assert_eq!(err.error, TlsFileError::NotRegularFile);
+    }
+
+    // TOCTOU 是正（open → 同一ハンドルの fstat）の回帰テスト。
+    // `/dev/null` は「open は成功するが通常ファイルではない」対象の代表例
+    // （FIFO はテストプロセスが `File::open` した時点でブロックしうるため
+    // 使わない）で、`is_file()` 判定が確かに `open` 後のファイル記述子
+    // 経由（`file.metadata()`）で行われていることを固定する。
+    #[test]
+    #[cfg(unix)]
+    fn read_bounded_file_rejects_non_regular_openable_file() {
+        let err = read_bounded_file(Path::new("/dev/null"), MAX_PRIVATE_KEY_FILE_LEN).unwrap_err();
         assert_eq!(err.error, TlsFileError::NotRegularFile);
     }
 

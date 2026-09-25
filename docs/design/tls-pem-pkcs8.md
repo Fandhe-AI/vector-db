@@ -140,10 +140,14 @@ X.509 DER のパース・公開鍵との整合チェック・validity 検査・C
 | `MAX_CERTIFICATE_FILE_LEN` | 1 MiB | 証明書チェーン PEM ファイルの読み込み上限 |
 | `MAX_CERTIFICATE_CHAIN_LEN` | 8 | 証明書チェーンに含めてよい `CERTIFICATE` ブロック数の上限 |
 
-ファイル読み込みは `main.rs` の `--scram-mock-key-file` 読み込みパターン
-（`std::fs::metadata` で通常ファイルを確認 → `File::open` →
-`Read::take(max + 1)` で上限 + 1 バイトまで読む二重防御）をそのまま踏襲した
-（`pem::read_bounded_file`）。
+ファイル読み込みは `pem::read_bounded_file` が担う。`File::open` →
+同一ファイル記述子の `fstat`（`File::metadata`）で通常ファイルを確認 →
+`Read::take(max + 1)` で上限 + 1 バイトまで読む、の順に固定している
+（パスに対する `stat` を `open` の前に別途行うと、その間にパスを
+差し替えられる TOCTOU で通常ファイル検査を迂回されうるため、`open`
+後の記述子から判定する。秘密鍵の base64 中間バッファ（`RawBlock::body`
+等）は `SecretBuf` と同じ best-effort ゼロ化を行う `ZeroizingBytes` で
+確保する）。
 
 ## 公開 API
 
