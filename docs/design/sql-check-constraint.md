@@ -194,6 +194,15 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   自動削除するが、制約を黙って弱める経路を作らないよう安全側に倒す）。
 - `alter_table_widen_numeric_precision`：CHECK が参照する列の型変更も同様に
   拒否する。
+- 索引宣言（TASK-206・INDEX-7、Issue #908）との関係: `alter_table_drop_column` は
+  削除列を含む索引宣言を同一 write トランザクションで掃除するが、CHECK 参照列の
+  拒否はその掃除より前に判定し commit しないため、拒否時は索引宣言も一切変わら
+  ない（CHECK 参照列を含む索引宣言は残る）。参照しない列の削除では従来どおり
+  その列を含む宣言だけが掃除される。
+- 列名 `check`／`constraint` の予約は `CREATE TABLE`／`ADD COLUMN` の列宣言の
+  曖昧さを排除するためのもので、`CREATE INDEX ... (<col>, ...)` の列指定には
+  適用しない（列指定は既存列名の参照のみで曖昧さが無く、SQL 表層からはこれらの
+  名前の列を作れない）。
 - `DROP TABLE` → 同じ名前で CHECK なしのテーブルを再作成した場合、旧制約は
   残らない（同一のカタログ値のため自動的に消える）。
 

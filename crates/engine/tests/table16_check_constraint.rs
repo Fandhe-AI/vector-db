@@ -786,3 +786,62 @@ fn create_table_rejects_ambiguous_constraint_column_without_creating_table() {
         .expect_err("table must not exist");
     assert_eq!(err.wire_code(), "42P01");
 }
+
+/// `CHECK` 参照列の `DROP COLUMN` 拒否と、索引宣言の掃除（TASK-206・INDEX-7、
+/// Issue #908。`alter_table_drop_column` が削除列を含む宣言を同一 txn で消す）の
+/// 関係: 拒否は索引掃除より前に判定され write トランザクションを commit しない
+/// ため、`CHECK` 参照列を含む索引宣言は残る。参照しない列の削除では、その列を
+/// 含む宣言だけが従来どおり掃除される。
+#[test]
+fn drop_column_rejected_by_check_keeps_index_declarations() {
+    let (core, path) = new_core("check-drop-column-index");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    for sql in [
+        "CREATE TABLE docs (kind TEXT CHECK (kind = 'a'), body TEXT)",
+        "CREATE INDEX docs_kind_idx ON docs (kind)",
+        "CREATE INDEX docs_body_idx ON docs (body)",
+    ] {
+        core.execute_sql_in_session(&alice, &mut session, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    drop(core);
+    let storage = Storage::open(&path).expect("reopen storage");
+    let index_names = |storage: &Storage| {
+        let mut names: Vec<String> = storage
+            .list_indexes()
+            .expect("list indexes")
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        names.sort();
+        names
+    };
+
+    let err = storage
+        .alter_table_drop_column("docs", "kind")
+        .expect_err("dropping a CHECK-referenced column must be rejected");
+    assert!(matches!(
+        err,
+        engine::catalog::CatalogError::DependentObjectsStillExist(_)
+    ));
+    assert_eq!(
+        index_names(&storage),
+        vec!["docs_body_idx".to_string(), "docs_kind_idx".to_string()],
+        "a rejected DROP COLUMN must not remove any index declaration"
+    );
+
+    storage
+        .alter_table_drop_column("docs", "body")
+        .expect("dropping an unreferenced column must succeed");
+    assert_eq!(index_names(&storage), vec!["docs_kind_idx".to_string()]);
+    assert_eq!(
+        storage
+            .get_table_schema("docs")
+            .expect("schema")
+            .columns
+            .len(),
+        1
+    );
+}
