@@ -711,6 +711,28 @@ WIRE-19。production の中核は Issue #942（PR #1041）で実装済み——
 15 件中 8 件・層 B（3 クライアントいずれも）が失敗することを確認した
 うえで元に戻した（コミットには含めない）。
 
+**子プロセス stderr の読み続け契約（ハーネス不具合の是正）**: 本テストの
+追加で `make e2e-three-client` の並列度が上がった結果、高負荷下（load
+average 約 20）で既存テスト（集計・取得モード切替）が 1〜2 件ずつ psql の
+"server closed the connection unexpectedly" で失敗する事象が出た。各テスト
+は独立したサーバープロセス・一時 DB を使っており、新テストからの状態漏れ
+ではない。原因は既存ハーネスの `spawn_wire_server`（`three_client_e2e.rs`・
+`extended_syntax_e2e.rs`）で、listen 行の取得後に受信側チャネルが破棄される
+と stderr 読み取りスレッドが終了してパイプの読み口を閉じていた点にある。
+以後サーバーが `wire-server: connection error: Connection reset by peer`
+等をログすると `EPIPE` で `eprintln!` が panic し、panic フック
+（TASK-97・RECOVER-6／TASK-99・RECOVER-8）経由で SIGABRT 終了していた
+（失敗時のサーバー終了状態 134 で確認。未読データを残した接続 close による
+RST で決定的に再現する）。是正として読み取りスレッドは子プロセスの終了
+（EOF）まで読み続け、`three_client_e2e.rs` は listen 後の行を直近 256 行まで
+保持してテストが panic した場合に限り `[e2e-diag]` 行（サーバーの終了状態・
+listen 後の stderr）を出力する。回帰テスト
+`server_guard_keeps_draining_stderr_so_logged_connection_errors_do_not_abort_server`
+（外部クライアント不要のため `#[ignore]` なし・`make ci` で常時実行）が、
+接続エラーのログ後もサーバーが生存し新規接続へ認証要求を返すことを固定する。
+production コードは変更していない（stderr の消費側が閉じた場合に
+サーバーが abort する挙動の扱いは、本 Issue のスコープ外として別途判断する）。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・
