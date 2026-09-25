@@ -57,6 +57,7 @@ use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::policy::PolicyContext;
 use engine::sql::mode::SessionState;
+use engine::sql::transaction::SessionTransaction;
 use engine::sql::SqlOutcome;
 
 use crate::result_encoder;
@@ -115,11 +116,12 @@ enum StatementStatus {
 /// 既存挙動（応答バイト列・エラーコード・メッセージ）は構造的に不変のまま保たれる。
 ///
 /// SQL 本文・テナント ID はログへ出さない（security.md P0）。
-pub(crate) fn execute_and_respond(
+pub(crate) fn execute_and_respond<'e>(
     stream: &mut TcpStream,
-    engine: &EngineCore,
+    engine: &'e EngineCore,
     ctx: &PolicyContext,
     session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
     sql: &str,
 ) -> io::Result<()> {
     // commit 成功から本関数が応答を書き終える（`ReadyForQuery` 送出含む）までの
@@ -146,24 +148,38 @@ pub(crate) fn execute_and_respond(
 
     match engine::sql::statement_splitter::split_statements(sql) {
         Err(e) => respond_error_and_ready(stream, e.error_class(), &e.client_message()),
-        Ok(engine::sql::statement_splitter::SplitOutcome::Single) => {
-            run_statement(stream, engine, ctx, session, sql, Finish::ReadyForQuery).map(|_| ())
-        }
+        Ok(engine::sql::statement_splitter::SplitOutcome::Single) => run_statement(
+            stream,
+            engine,
+            ctx,
+            session,
+            txn,
+            sql,
+            Finish::ReadyForQuery,
+        )
+        .map(|_| ()),
         Ok(engine::sql::statement_splitter::SplitOutcome::Empty) => {
             write_all(stream, &result_encoder::encode_empty_query_response())?;
             crate::handshake::write_ready_for_query_io(stream)
         }
         Ok(engine::sql::statement_splitter::SplitOutcome::Statements(stmts)) => {
-            // 書き込み系文（`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`）は最後の 1 文に
-            // 限る（モジュールドキュメント「原子性」節）。違反時は 1 文も実行せず
-            // `0A000` で拒否する。
-            if let Err(e) = engine::sql::statement_splitter::check_write_placement(&stmts) {
+            // 書き込み系文（`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`）は、本メッセージ
+            // 受信前から明示トランザクション中（`txn.is_active()`）でない限り
+            // 最後の 1 文に限る（モジュールドキュメント「原子性」節。SQL-31・
+            // TASK-221 で `BEGIN` を含むメッセージのルールへ拡張済み）。違反時は
+            // 1 文も実行せず `0A000` で拒否する。
+            if let Err(e) =
+                engine::sql::statement_splitter::check_write_placement(&stmts, txn.is_active())
+            {
                 return respond_error_and_ready(stream, e.error_class(), &e.client_message());
             }
             // 途中の文がエラーになった場合にメッセージ受信前の状態へ巻き戻す
             // ためのスナップショット（`SET`／`CREATE FUNCTION` の暗黙ロールバック）。
             // 単一文経路（`Single`）はこの clone を行わないため、既存の単一文
-            // レイテンシ・コストは不変。
+            // レイテンシ・コストは不変。トランザクション状態自体（`txn`）は
+            // 巻き戻さない ―― `BEGIN` 済みのトランザクションは、途中の文が
+            // エラーになれば `Failed` へ遷移したまま残り、次の `ROLLBACK` で
+            // 閉じる契約（`sql::transaction` モジュールドキュメント参照）。
             let snapshot = session.clone();
             let last_index = stmts.len().saturating_sub(1);
             for (i, stmt) in stmts.iter().enumerate() {
@@ -172,7 +188,7 @@ pub(crate) fn execute_and_respond(
                 } else {
                     Finish::Continue
                 };
-                match run_statement(stream, engine, ctx, session, stmt, finish)? {
+                match run_statement(stream, engine, ctx, session, txn, stmt, finish)? {
                     StatementStatus::Completed => {}
                     StatementStatus::Failed => {
                         // ErrorResponse＋ReadyForQuery は run_statement 内で
@@ -218,16 +234,17 @@ pub(crate) fn execute_and_respond(
 /// `INSERT` 等の分岐先決定は engine 側（`EngineCore::execute_sql_in_session`。
 /// TASK-82・SQL-10）に一元化する。wire 層はここで構文種別ごとに分岐しない
 /// （モジュール冒頭コメント参照）。
-fn run_statement(
+fn run_statement<'e>(
     stream: &mut TcpStream,
-    engine: &EngineCore,
+    engine: &'e EngineCore,
     ctx: &PolicyContext,
     session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
     stmt_sql: &str,
     finish: Finish,
 ) -> io::Result<StatementStatus> {
     let outcome = execute_with_emergency_registration(stream, || {
-        engine.execute_sql_in_session(ctx, session, stmt_sql)
+        engine.execute_sql_in_txn(ctx, session, txn, stmt_sql)
     });
 
     match outcome {
@@ -404,6 +421,17 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         // タグ `UPDATE <rows>` へ整形する。
         SqlOutcome::Update(outcome) => OutcomeResponse::Command {
             tag: format!("UPDATE {}", outcome.rows_affected),
+        },
+        // SQL-31（TASK-221）: 明示トランザクション制御文の応答を pg 互換の
+        // `CommandComplete` タグへ整形する（いずれも件数を持たない固定タグ）。
+        SqlOutcome::Begin => OutcomeResponse::Command {
+            tag: "BEGIN".to_string(),
+        },
+        SqlOutcome::Commit => OutcomeResponse::Command {
+            tag: "COMMIT".to_string(),
+        },
+        SqlOutcome::Rollback => OutcomeResponse::Command {
+            tag: "ROLLBACK".to_string(),
         },
     }
 }

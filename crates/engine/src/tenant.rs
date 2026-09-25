@@ -334,6 +334,65 @@ pub enum TenantWriteError {
     /// commit せず破棄する（行・台帳とも痕跡ゼロ）ため `54000`
     /// （`PayloadTooLarge`）へ写像する。
     TooManyRowsScanned,
+    /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
+    /// トランザクションの取得（[`Storage::begin_write_txn`]）がロック待ちの上限を
+    /// 超過した（`55P03`）。`Storage(StorageError::WriteLockTimeout)` へ一般化せず
+    /// 専用 variant にすることで、他の内部ストレージエラー（`XX000`）と
+    /// 取り違えないようにする。
+    WriteLockTimeout,
+}
+
+/// [`Storage::begin_write_txn`]（choke point。SQL-31・TASK-221 の単一ライタ占有に
+/// より `55P03` を返しうる）が返す `StorageError` を `TenantWriteError` へ写像する。
+/// `TenantWriteError::from(StorageError)` は汎用の `Storage(e)` へ包むだけで
+/// ロック待ちタイムアウトの意味を保てないため、`*_unchecked` 各関数はこの専用関数を
+/// 経由する。
+fn convert_write_txn_err(e: StorageError) -> TenantWriteError {
+    match e {
+        StorageError::WriteLockTimeout | StorageError::WriteTxnHeldByCurrentSession => {
+            TenantWriteError::WriteLockTimeout
+        }
+        other => TenantWriteError::Storage(other),
+    }
+}
+
+/// 明示トランザクション（SQL-31・TASK-221）と autocommit の間で書き込み本体を
+/// 共有するための入口。`sql::transaction::SessionTransaction` が `Active` の間は
+/// `InTxn` で共有 `redb::WriteTransaction` を渡し、通常時（autocommit）は
+/// `Autocommit` として [`Storage::begin_write_txn`] 経由で新規トランザクションを
+/// 開いて 1 文ごとに commit する。
+///
+/// 現時点で `InTxn` を受理するのは [`insert_row_unchecked`]・
+/// [`insert_rows_unchecked`]・[`truncate_table_unchecked`] の 3 経路のみ
+/// （`docs/design/explicit-transaction.md` 参照。他の書き込み系 API は
+/// 明示トランザクション内では `0A000` で拒否され、本 enum に到達しない）。
+pub(crate) enum WriteTarget<'a> {
+    Autocommit(&'a Storage),
+    InTxn(&'a redb::WriteTransaction),
+}
+
+impl<'a> WriteTarget<'a> {
+    /// `f` を書き込みトランザクションのスコープで実行する。`Autocommit` は
+    /// [`Storage::begin_write_txn`] choke point で新規トランザクションを開き、
+    /// `f` が `Ok` を返した場合のみ [`crate::recovery::commit_boundary::commit`]
+    /// で commit する（`f` が `Err` を返せば `write_txn` は drop され abort する。
+    /// 既存 `*_unchecked` 関数群と同じ「TOCTOU なし・部分書き込みを残さない」
+    /// 契約を保つ）。`InTxn` は commit を一切呼ばず、`f` の結果をそのまま返す
+    /// （commit／abort は `COMMIT`／`ROLLBACK` 文が一括で行う。SQL-31・RECOVER-12）。
+    fn with_txn<T>(
+        &self,
+        f: impl FnOnce(&redb::WriteTransaction) -> Result<T, TenantWriteError>,
+    ) -> Result<T, TenantWriteError> {
+        match self {
+            WriteTarget::Autocommit(storage) => {
+                let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
+                let value = f(&write_txn)?;
+                crate::recovery::commit_boundary::commit(write_txn)?;
+                Ok(value)
+            }
+            WriteTarget::InTxn(write_txn) => f(write_txn),
+        }
+    }
 }
 
 impl TenantWriteError {
@@ -367,6 +426,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,
             TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
             TenantWriteError::TooManyRowsScanned => ErrorClass::PayloadTooLarge,
+            TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
         }
     }
 
@@ -413,6 +473,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::TooManyRowsScanned => {
                 write!(f, "too many rows scanned: limit={MAX_SCANNED_ROWS}")
             }
+            TenantWriteError::WriteLockTimeout => {
+                write!(f, "write lock not available: timed out waiting for writer")
+            }
         }
     }
 }
@@ -444,6 +507,7 @@ impl std::fmt::Debug for TenantWriteError {
                 f.write_str("CapturedRowDecodeFailed(<redacted>)")
             }
             TenantWriteError::TooManyRowsScanned => f.write_str("TooManyRowsScanned"),
+            TenantWriteError::WriteLockTimeout => f.write_str("WriteLockTimeout"),
         }
     }
 }
@@ -553,7 +617,14 @@ pub fn insert_row(
     operation_id: &OperationId,
 ) -> Result<(), TenantWriteError> {
     let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
-    insert_row_unchecked(storage, table, ctx, id, row, ledger_write)
+    insert_row_unchecked(
+        WriteTarget::Autocommit(storage),
+        table,
+        ctx,
+        id,
+        row,
+        ledger_write,
+    )
 }
 
 /// [`insert_row`] のガードなし実体（`pub(crate)`。TASK-92・RECOVER-1）。
@@ -568,7 +639,7 @@ pub fn insert_row(
 /// drop された場合に台帳も一緒に破棄される（原子性）ことを結合テストで直接検証できる
 /// （`recovery::ledger` モジュールドキュメント参照）。
 pub(crate) fn insert_row_unchecked(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
@@ -581,9 +652,11 @@ pub(crate) fn insert_row_unchecked(
     if !ctx.is_owner(row.tenant_id) {
         return Err(TenantWriteError::Forbidden);
     }
-    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
-    {
-        let schema = require_table_schema_write(&write_txn, table)?;
+    // 本体は [`WriteTarget::with_txn`] が choke point の
+    // autocommit（1 文ごとに commit）／明示トランザクション（呼び出し元の
+    // `COMMIT`/`ROLLBACK` まで持ち越し）のいずれとも共有する（SQL-31・TASK-221）。
+    target.with_txn(|write_txn| {
+        let schema = require_table_schema_write(write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
         // エンコードは 1 回のみ（Issue #397）: 以前は台帳ハッシュ計算用と redb 書き込み用で
         // それぞれ `encode_row` していた二重実行を排除し、ここで計算した結果を
@@ -594,12 +667,15 @@ pub(crate) fn insert_row_unchecked(
         // `content_hash` モジュールドキュメント参照）。同一 write トランザクション内で
         // 即座に判定する（TOCTOU なし。redb 単一ライタ直列化により、この
         // get→insert→判定がそのまま「トランザクション内再確認」になる）。`Err` の場合は
-        // 行の書き込みへ進まず、この後 `write_txn` が commit されない（呼び出し元の `?`
-        // で早期 return → drop）ため台帳追記も破棄され、部分書き込みが残らない
-        // （fail-closed。TASK-94・RECOVER-3 の原子性契約を包含する）。
+        // 行の書き込みへ進まず、autocommit なら `write_txn` が commit されない
+        // （[`WriteTarget::with_txn`] が drop → abort）ため台帳追記も破棄され、
+        // 部分書き込みが残らない（fail-closed。TASK-94・RECOVER-3 の原子性契約を
+        // 包含する。明示トランザクション中は呼び出し元の文実行が失敗した時点で
+        // トランザクション全体を abort し `Failed` へ遷移させる契約
+        // （`sql::transaction` 参照）のため、ここでも部分書き込みは残らない）。
         let content_hash = content_hash::for_insert_encoded(id, &encoded)?;
         ledger::record_in_txn(
-            &write_txn,
+            write_txn,
             ctx.tenant_id(),
             table,
             ledger_write,
@@ -612,10 +688,10 @@ pub(crate) fn insert_row_unchecked(
         // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
         let key = (ctx.tenant_id(), id);
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
-    }
-    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
-    crate::recovery::commit_boundary::commit(write_txn)?;
-    Ok(())
+        drop(row_table);
+        crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        Ok(())
+    })
 }
 
 /// `table` へ複数行をまとめて挿入する（[`insert_row`] のバッチ版。TASK-95・
@@ -653,7 +729,13 @@ pub fn insert_rows(
     operation_id: &OperationId,
 ) -> Result<(), TenantWriteError> {
     let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
-    insert_rows_unchecked(storage, table, ctx, rows, ledger_write)
+    insert_rows_unchecked(
+        WriteTarget::Autocommit(storage),
+        table,
+        ctx,
+        rows,
+        ledger_write,
+    )
 }
 
 /// [`insert_rows`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と同じ
@@ -663,7 +745,7 @@ pub fn insert_rows(
 /// 維持する（[`insert_row_unchecked`] のドキュメント参照。順序はスキーマ取得 →
 /// 空バッチ早期 return → 台帳追記 → 行書き込み → commit）。
 pub(crate) fn insert_rows_unchecked(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     rows: &[(u64, RowInput<'_>)],
@@ -690,11 +772,14 @@ pub(crate) fn insert_rows_unchecked(
         }
     }
 
-    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
-    {
-        let schema = require_table_schema_write(&write_txn, table)?;
+    target.with_txn(|write_txn| {
+        let schema = require_table_schema_write(write_txn, table)?;
         if rows.is_empty() {
-            drop(write_txn);
+            // 空バッチは書き込みを一切行わない（[`WriteTarget::with_txn`] の
+            // autocommit 経路では、この後の `Ok(())` を受けて空の write_txn を
+            // そのまま commit する。行を 1 件も書かないため commit しても
+            // 世代・データいずれも変化せず、以前の「drop で abort する」実装と
+            // 観測可能な挙動は変わらない）。
             return Ok(());
         }
         // エンコードは行ごとに 1 回のみ（Issue #397）: 台帳ハッシュ計算用
@@ -762,7 +847,7 @@ pub(crate) fn insert_rows_unchecked(
         }
         let content_hash = content_hash::for_insert_batch_encoded(&hash_input)?;
         ledger::record_in_txn(
-            &write_txn,
+            write_txn,
             ctx.tenant_id(),
             table,
             ledger_write,
@@ -782,10 +867,10 @@ pub(crate) fn insert_rows_unchecked(
             })?;
             insert_unique_row(&mut row_table, key, encoded)?;
         }
-    }
-    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
-    crate::recovery::commit_boundary::commit(write_txn)?;
-    Ok(())
+        drop(row_table);
+        crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        Ok(())
+    })
 }
 
 /// スキーマ列順の型付き値列から 1 行挿入する（`catalog.rs::Storage::insert_typed_row` の
@@ -812,7 +897,7 @@ pub fn insert_typed_row(
 ) -> Result<(), TenantWriteError> {
     let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
     insert_typed_row_unchecked(
-        storage,
+        WriteTarget::Autocommit(storage),
         table,
         ctx,
         id,
@@ -850,7 +935,7 @@ pub fn insert_typed_row(
 // `arena.rs`・`hnsw.rs` と同じ方針で許容する。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_typed_row_unchecked(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
@@ -860,9 +945,8 @@ pub(crate) fn insert_typed_row_unchecked(
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
-    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
-    {
-        let schema = require_table_schema_write(&write_txn, table)?;
+    target.with_txn(|write_txn| {
+        let schema = require_table_schema_write(write_txn, table)?;
         if let Some(expected) = expected_schema {
             if expected != &schema {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
@@ -924,7 +1008,7 @@ pub(crate) fn insert_typed_row_unchecked(
         let content_hash =
             content_hash::for_typed_insert(id, visibility, embedding, &named_columns)?;
         ledger::record_in_txn(
-            &write_txn,
+            write_txn,
             ctx.tenant_id(),
             table,
             ledger_write,
@@ -937,10 +1021,10 @@ pub(crate) fn insert_typed_row_unchecked(
         let key = (ctx.tenant_id(), id);
         let encoded = encode_row(&row)?;
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
-    }
-    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
-    crate::recovery::commit_boundary::commit(write_txn)?;
-    Ok(())
+        drop(row_table);
+        crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        Ok(())
+    })
 }
 
 /// [`insert_typed_row_unchecked`] の複数行版（Issue #771・TASK-178・NOSQL-6）。
@@ -995,7 +1079,7 @@ pub(crate) fn insert_typed_rows_unchecked(
         }
     }
 
-    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         if let Some(expected) = expected_schema {
@@ -1197,7 +1281,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
         }
     }
 
-    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
     let mut inserted: u64 = 0;
     let mut updated: u64 = 0;
     {
@@ -1532,7 +1616,7 @@ pub(crate) fn update_row_unchecked(
     if !ctx.is_owner(row.tenant_id) {
         return Err(TenantWriteError::Forbidden);
     }
-    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
@@ -2130,7 +2214,7 @@ pub(crate) fn update_row_columns_unchecked(
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<usize, TenantWriteError> {
     validate_identifier(table)?;
-    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
     let rows_affected: usize;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
@@ -2512,7 +2596,7 @@ fn delete_row_impl(
     mut capture: Option<DeleteCapture<'_>>,
 ) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     validate_identifier(table)?;
-    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
     let mut captured_row: Option<CapturedRow> = None;
     let owns_existing = {
         // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
@@ -2936,7 +3020,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
     validate_identifier(table).map_err(dml_write_err)?;
     let write_txn = storage
         .begin_write_txn()
-        .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+        .map_err(|e| dml_write_err(convert_write_txn_err(e)))?;
 
     let candidate_ids = {
         let schema = require_table_schema_write(&write_txn, table).map_err(dml_write_err)?;
@@ -3021,7 +3105,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
     validate_identifier(table).map_err(dml_write_err)?;
     let write_txn = storage
         .begin_write_txn()
-        .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+        .map_err(|e| dml_write_err(convert_write_txn_err(e)))?;
 
     let (candidate_ids, schema) = {
         let schema = require_table_schema_write(&write_txn, table).map_err(dml_write_err)?;
@@ -3124,23 +3208,22 @@ pub(crate) fn update_rows_where_unchecked<E>(
 }
 
 pub(crate) fn truncate_table_unchecked(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
-    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
-    {
+    target.with_txn(|write_txn| {
         // テーブル不存在の判定・並行 DDL との整合のため他の書き込み系操作と
         // 同じ前段を通す。
-        require_table_schema_write(&write_txn, table)?;
+        require_table_schema_write(write_txn, table)?;
         // TRUNCATE 要求のクライアント由来の内容はテーブル名（台帳キー
         // `(tenant, table, operation_id)` に既に含まれる）以外に存在しない
         // （`content_hash::for_truncate` ドキュメント参照）。
         let content_hash = content_hash::for_truncate();
         ledger::record_in_txn(
-            &write_txn,
+            write_txn,
             ctx.tenant_id(),
             table,
             ledger_write,
@@ -3157,10 +3240,10 @@ pub(crate) fn truncate_table_unchecked(
         row_table
             .retain_in((start, end), |_, _| false)
             .map_err(CatalogError::from)?;
-    }
-    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
-    crate::recovery::commit_boundary::commit(write_txn)?;
-    Ok(())
+        drop(row_table);
+        crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        Ok(())
+    })
 }
 
 /// [`replace_typed_rows_by_text_key`] の成功応答。
@@ -3246,7 +3329,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
         ledger_write,
     } = req;
     validate_identifier(table)?;
-    let write_txn = storage.begin_write_txn().map_err(CatalogError::from)?;
+    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
     // `row_table` の借用（`write_txn.open_table(..)`）をこのブロック内に閉じ込め、
     // ブロックを抜けた後に `write_txn` を（成功なら commit、無変更なら drop で
     // abort）自由に扱えるようにする（`insert_rows` の空バッチ早期 return と異なり、
@@ -3649,7 +3732,7 @@ mod tests {
         // 直接使う）で tenant-b 名義の行を正規に投入する。
         let owner = PolicyContext::new("tenant-b").expect("valid tenant");
         insert_row_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &owner,
             1,

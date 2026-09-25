@@ -41,6 +41,7 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,
         TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
         TenantWriteError::TooManyRowsScanned => ErrorClass::PayloadTooLarge,
+        TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
     }
 }
 

@@ -3024,6 +3024,27 @@ pub(crate) fn execute_insert_with_schema(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
+    execute_insert_with_schema_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bound,
+        ledger_mode,
+        expected_schema,
+    )
+}
+
+/// [`execute_insert_with_schema`] の本体（明示トランザクション対応版。SQL-31・
+/// TASK-221）。`target` が `InTxn` の場合は呼び出し元（`sql::transaction`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`/`ROLLBACK` 文が一括で行う）。`Autocommit` 経路は
+/// [`execute_insert_with_schema`] とビット同一の挙動を保つ。
+pub(crate) fn execute_insert_with_schema_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundInsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<InsertOutcome, SqlSurfaceError> {
     use crate::storage::Visibility;
 
     let ledger_write = ledger_mode
@@ -3031,7 +3052,7 @@ pub(crate) fn execute_insert_with_schema(
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
     crate::tenant::insert_typed_row_unchecked(
-        storage,
+        target,
         &bound.table,
         ctx,
         bound.id,
@@ -3065,11 +3086,27 @@ pub fn execute_truncate(
     validated: &crate::sql::allowlist::ValidatedTruncate,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
 ) -> Result<TruncateOutcome, SqlSurfaceError> {
+    execute_truncate_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        validated,
+        ledger_mode,
+    )
+}
+
+/// [`execute_truncate`] の本体（明示トランザクション対応版。SQL-31・TASK-221。
+/// [`execute_insert_with_schema_in`] と同じ設計）。
+pub(crate) fn execute_truncate_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    validated: &crate::sql::allowlist::ValidatedTruncate,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+) -> Result<TruncateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(validated.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
-    crate::tenant::truncate_table_unchecked(storage, &validated.table_name, ctx, ledger_write)
+    crate::tenant::truncate_table_unchecked(target, &validated.table_name, ctx, ledger_write)
         .map_err(map_insert_write_error)?;
 
     Ok(TruncateOutcome {})
@@ -3283,7 +3320,7 @@ pub(crate) fn execute_update_with_schema(
 /// [`map_write_error`] の `"insert"` 版ラッパー（既存呼び出し元との後方互換用。
 /// Issue #865 で `op` パラメータ化した本体へ切り出した。挙動は切り出し前と
 /// 完全に同一）。
-fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError {
+pub(crate) fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlSurfaceError {
     map_write_error(e, "insert")
 }
 

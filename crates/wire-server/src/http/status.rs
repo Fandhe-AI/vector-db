@@ -34,6 +34,10 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         ErrorClass::InternalError => 500,
         ErrorClass::FeatureNotSupported => 501,
         ErrorClass::ConnectionLimitExceeded => 503,
+        // 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有によるロック
+        // 待ちタイムアウト。NoSQL 表層からは `insert`／`update`／`delete` op が
+        // 待たされて到達しうる（一時的なサーバー側の輻輳として 503 に射影する）。
+        ErrorClass::LockNotAvailable => 503,
         ErrorClass::ProtocolViolation
         | ErrorClass::UnsupportedSqlSyntax
         | ErrorClass::InvalidInput
@@ -41,7 +45,14 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::OperationIdContentMismatch
         | ErrorClass::MissingOperationId
         | ErrorClass::DatetimeFieldOverflow
-        | ErrorClass::InvalidTextRepresentation => 400,
+        | ErrorClass::InvalidTextRepresentation
+        // トランザクション状態エラー（SQL-31・TASK-221）は NoSQL 表層の `op` 語彙に
+        // トランザクション制御が無く構造的に到達しないが、`ErrorClass` の網羅性の
+        // ため他の `42601`／`22000` 系と同じ 400 へ寄せる。
+        | ErrorClass::InvalidTransactionState
+        | ErrorClass::ActiveSqlTransaction
+        | ErrorClass::NoActiveSqlTransaction
+        | ErrorClass::InFailedSqlTransaction => 400,
     }
 }
 
@@ -51,7 +62,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 18] = [
+    const EXPECTED: [(ErrorClass, u16); 23] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -70,6 +81,11 @@ mod tests {
         (ErrorClass::OperationIdContentMismatch, 400),
         (ErrorClass::DatetimeFieldOverflow, 400),
         (ErrorClass::InvalidTextRepresentation, 400),
+        (ErrorClass::LockNotAvailable, 503),
+        (ErrorClass::InvalidTransactionState, 400),
+        (ErrorClass::ActiveSqlTransaction, 400),
+        (ErrorClass::NoActiveSqlTransaction, 400),
+        (ErrorClass::InFailedSqlTransaction, 400),
     ];
 
     #[test]

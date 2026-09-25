@@ -1072,6 +1072,9 @@ pub struct EngineCore {
     /// 対象ビヘイビア: INDEX-4）。差し替えは [`Self::with_batch_limits`] のみ。
     /// `crate::batch_limits` モジュールドキュメント参照。
     batch_limits: crate::batch_limits::BatchLimits,
+    /// 明示トランザクション（SQL-31・TASK-221）の持続時間・文数の上限。差し替えは
+    /// [`Self::with_transaction_limits`] のみ。
+    transaction_limits: crate::sql::transaction::TransactionLimits,
     /// `dictionary.rs` の辞書的情報源（TASK-109・PLAN-5）の世代整合キャッシュ。
     /// [`Self::dictionary_snapshot`] がこれを経由して再構築を再利用する（詳細は
     /// [`DictionaryCache`] のドキュメント参照）。
@@ -1229,6 +1232,25 @@ pub enum ParsedSql {
     Delete(crate::sql::allowlist::DeleteStatement),
     /// `UPDATE`（単一行・`id` 完全一致形／述語形。SQL-17・SQL-19）。
     Update(crate::sql::allowlist::ValidatedUpdateForm),
+    /// `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）。トランザクション文脈を
+    /// 持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
+    /// `0A000` で拒否する（トランザクション対応の実行入口は
+    /// [`EngineCore::execute_sql_in_txn`]／[`EngineCore::execute_parsed_in_txn`]）。
+    Transaction(crate::sql::transaction::TxnControl),
+}
+
+/// `parsed` が保持する `operation_id`（`USING OPERATION_ID '<id>'`。書き込み系
+/// 文のみ保持しうる）。[`EngineCore::execute_parsed_in_txn`] が同一トランザクション
+/// 内での再利用検査（[`crate::sql::transaction::SessionTransaction::
+/// check_and_register_statement`]）に使う。明示トランザクション内で対応外の
+/// 文種別（[`EngineCore::execute_in_active_txn`] が `0A000` で拒否する）は
+/// `None` を返す（どのみち実行されないため再利用検査は不要）。
+fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
+    match parsed {
+        ParsedSql::Insert(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
+        ParsedSql::Truncate(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
+        _ => None,
+    }
 }
 
 /// [`EngineCore::parse_sql_prepared`] の結果（Issue #935・WIRE-12・TASK-217）。
@@ -1466,6 +1488,7 @@ impl EngineCore {
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
             batch_limits: crate::batch_limits::BatchLimits::default(),
+            transaction_limits: crate::sql::transaction::TransactionLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
@@ -1616,6 +1639,28 @@ impl EngineCore {
     pub fn with_batch_limits(mut self, limits: crate::batch_limits::BatchLimits) -> Self {
         self.batch_limits = limits;
         self
+    }
+
+    /// 明示トランザクション（SQL-31・TASK-221）の持続時間・文数の上限
+    /// （[`crate::sql::transaction::TransactionLimits`]）を差し替えたビルダーを
+    /// 返す（[`Self::with_batch_limits`] と同じ流儀。未呼び出しなら
+    /// `TransactionLimits::default()`）。書き込みロック待ちの上限
+    /// （`55P03` を返すまでの時間）は独立に `Storage::with_write_lock_wait` で
+    /// 設定する（`Storage` を構築する側の責務）。
+    pub fn with_transaction_limits(
+        mut self,
+        limits: crate::sql::transaction::TransactionLimits,
+    ) -> Self {
+        self.transaction_limits = limits;
+        self
+    }
+
+    /// 新規の [`crate::sql::transaction::SessionTransaction`]（`Idle`）を作る。
+    /// `wire-server` が接続（セッション）ごとに 1 つ保持し、
+    /// [`Self::execute_sql_in_txn`]／[`Self::execute_parsed_in_txn`] へ `&mut` で
+    /// 渡す想定（SQL-31・TASK-221）。
+    pub fn new_session_transaction(&self) -> crate::sql::transaction::SessionTransaction<'_> {
+        crate::sql::transaction::SessionTransaction::new(self.transaction_limits)
     }
 
     /// 辞書的情報源抽出（TASK-109・PLAN-5）の設定
@@ -2095,7 +2140,10 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Truncate(_)
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
-                    | crate::sql::SqlOutcome::Update(_) => {
+                    | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::Begin
+                    | crate::sql::SqlOutcome::Commit
+                    | crate::sql::SqlOutcome::Rollback => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -2122,7 +2170,10 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Truncate(_)
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
-                    | crate::sql::SqlOutcome::Update(_) => {
+                    | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::Begin
+                    | crate::sql::SqlOutcome::Commit
+                    | crate::sql::SqlOutcome::Rollback => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -2146,7 +2197,10 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Truncate(_)
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
-                    | crate::sql::SqlOutcome::Update(_) => {
+                    | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::Begin
+                    | crate::sql::SqlOutcome::Commit
+                    | crate::sql::SqlOutcome::Rollback => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -2252,6 +2306,18 @@ impl EngineCore {
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let txn_control_head = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name))
+                if name.eq_ignore_ascii_case("BEGIN")
+                    || name.eq_ignore_ascii_case("COMMIT")
+                    || name.eq_ignore_ascii_case("ROLLBACK")
+        );
+        if txn_control_head {
+            let ctrl = crate::sql::transaction::validate_transaction_control_tokens(&tokens)?;
+            return Ok(ParsedSql::Transaction(ctrl));
+        }
+
         let is_insert_statement = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("INSERT")
@@ -2477,6 +2543,14 @@ impl EngineCore {
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
             }
+            // トランザクション文脈を持たない本エントリポイントは `BEGIN`／
+            // `COMMIT`／`ROLLBACK` を受理しない（SQL-31・TASK-221。
+            // トランザクション対応の実行入口は [`Self::execute_sql_in_txn`]）。
+            ParsedSql::Transaction(_) => Err(
+                crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                    "transaction control statements require a transaction-aware entry point",
+                ),
+            ),
         }
     }
 
@@ -2493,6 +2567,201 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let parsed = self.parse_sql(sql)?;
         self.execute_parsed_in_session(ctx, session, &parsed)
+    }
+
+    /// [`Self::execute_sql_in_session`] のトランザクション対応版（SQL-31・
+    /// TASK-221）。`txn` が `Idle` の間は [`Self::execute_parsed_in_session`]
+    /// （既存 autocommit 経路）とビット同一に振る舞う。`wire-server` の簡易・
+    /// 拡張クエリ両経路が、接続（セッション）ごとに 1 つ保持する
+    /// `SessionTransaction` を渡してここへ委譲する唯一の入口（第 2 の実行器を
+    /// 作らない設計。`Self::execute_sql_in_session` と同じ判定順序を踏襲する）。
+    pub fn execute_sql_in_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        sql: &str,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let parsed = self.parse_sql(sql)?;
+        self.execute_parsed_in_txn(ctx, session, txn, &parsed)
+    }
+
+    /// [`Self::execute_parsed_in_session`] のトランザクション対応版（SQL-31・
+    /// TASK-221）。`parsed` が `ParsedSql::Transaction` なら `txn` の状態機械を
+    /// 直接遷移させる。それ以外は `txn.status()` に応じて分岐する:
+    /// - `Idle`: 既存の [`Self::execute_parsed_in_session`]（autocommit）へ
+    ///   そのまま委譲（挙動は不変）。
+    /// - `Failed`: `ROLLBACK` 以外は一切実行せず `25P02` を返す
+    ///   （`ParsedSql::Transaction(Rollback)` は上の分岐で既に処理済み）。
+    /// - `Active`: 上限検査・`operation_id` 再利用検査（[`crate::sql::
+    ///   transaction::SessionTransaction::check_and_register_statement`]）を
+    ///   経てから、明示トランザクション内で対応する書き込み系（`INSERT` 単一行
+    ///   形・`TRUNCATE`）・読み取り系（未書き込みテーブルの `SELECT`／
+    ///   `Aggregate`／`Scan`）文のみを実行する。対応外の文
+    ///   （複数行/ファイル形/`UPSERT` の `INSERT`・`UPDATE`・`DELETE`・
+    ///   `UPSERT`・COPY・書き込み済みテーブルへの読み取り等）は `0A000` で
+    ///   拒否する。文の実行中にエラーが起きた場合は必ずトランザクションを
+    ///   `Failed` へ遷移させ（[`crate::sql::transaction::SessionTransaction::
+    ///   fail`]）、元のエラーをそのまま返す（部分書き込みを残さない
+    ///   fail-closed 契約。`docs/design/explicit-transaction.md` 参照）。
+    pub fn execute_parsed_in_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        parsed: &ParsedSql,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
+        use crate::sql::transaction::{TransactionStatus, TxnControl};
+
+        if let ParsedSql::Transaction(ctrl) = parsed {
+            return match ctrl {
+                TxnControl::Begin => {
+                    txn.begin(&self.storage, session)?;
+                    Ok(crate::sql::SqlOutcome::Begin)
+                }
+                TxnControl::Commit => {
+                    txn.commit()?;
+                    Ok(crate::sql::SqlOutcome::Commit)
+                }
+                TxnControl::Rollback => {
+                    txn.rollback(session)?;
+                    Ok(crate::sql::SqlOutcome::Rollback)
+                }
+            };
+        }
+
+        match txn.status() {
+            TransactionStatus::Idle => self.execute_parsed_in_session(ctx, session, parsed),
+            TransactionStatus::Failed => Err(SqlSurfaceError::InFailedSqlTransaction),
+            TransactionStatus::InTransaction => {
+                txn.check_and_register_statement(parsed_operation_id(parsed))?;
+                let result = self.execute_in_active_txn(ctx, session, txn, parsed);
+                if result.is_err() {
+                    txn.fail();
+                }
+                result
+            }
+        }
+    }
+
+    /// [`Self::execute_parsed_in_txn`] の `Active` 分岐本体（SQL-31・TASK-221。
+    /// エラー時のトランザクション遷移は呼び出し元が一括して行う）。
+    fn execute_in_active_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        parsed: &ParsedSql,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::{SqlSurfaceError, Statement};
+
+        match parsed {
+            ParsedSql::Insert(stmt) if stmt.returning.is_none() => {
+                let schema =
+                    self.storage
+                        .get_table_schema(&stmt.table_name)
+                        .map_err(|e| match e {
+                            CatalogError::TableNotFound(name) => {
+                                SqlSurfaceError::UndefinedTable { name }
+                            }
+                            _ => SqlSurfaceError::Internal {
+                                detail: "failed to load table schema".to_string(),
+                            },
+                        })?;
+                let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
+                match bound {
+                    crate::sql::parser::BoundInsertForm::Row(bound) => {
+                        let write_txn =
+                            txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                                detail: "internal error".to_string(),
+                            })?;
+                        let outcome = crate::sql::exec::execute_insert_with_schema_in(
+                            crate::tenant::WriteTarget::InTxn(write_txn),
+                            ctx,
+                            &bound,
+                            self.ledger_mode,
+                            Some(&schema),
+                        )?;
+                        txn.mark_written(&stmt.table_name);
+                        Ok(crate::sql::SqlOutcome::Insert(outcome))
+                    }
+                    // 複数行 `VALUES`・ファイル形・`ON CONFLICT`（UPSERT）は
+                    // 明示トランザクション内では未対応（対象外。
+                    // `docs/design/explicit-transaction.md` 参照）。
+                    _ => Err(SqlSurfaceError::transaction_feature_not_supported(
+                        "this INSERT form is not supported inside an explicit transaction",
+                    )),
+                }
+            }
+            ParsedSql::Truncate(stmt) => {
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let outcome = crate::sql::exec::execute_truncate_in(
+                    crate::tenant::WriteTarget::InTxn(write_txn),
+                    ctx,
+                    stmt,
+                    self.ledger_mode,
+                )?;
+                txn.mark_written(&stmt.table_name);
+                Ok(crate::sql::SqlOutcome::Truncate(outcome))
+            }
+            ParsedSql::Statement(Statement::SetSearchMode { .. })
+            | ParsedSql::Statement(Statement::CreateFunction { .. }) => self
+                .execute_validated_in_session(
+                    ctx,
+                    session,
+                    match parsed {
+                        ParsedSql::Statement(stmt) => stmt.clone(),
+                        _ => unreachable!(),
+                    },
+                ),
+            ParsedSql::Statement(stmt @ Statement::Select(v)) => {
+                self.read_only_in_active_txn(ctx, session, txn, &v.table_name, stmt.clone())
+            }
+            ParsedSql::Statement(stmt @ Statement::Aggregate(v)) => {
+                let table = v.table_name().to_string();
+                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
+            }
+            ParsedSql::Statement(stmt @ Statement::Scan(v)) => {
+                let table = v.table_name().to_string();
+                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
+            }
+            ParsedSql::Statement(stmt @ Statement::Explain(v)) => {
+                self.read_only_in_active_txn(ctx, session, txn, &v.table_name, stmt.clone())
+            }
+            // 複数行 INSERT・ファイル形 INSERT・UPSERT・`UPDATE`・`DELETE`・
+            // COPY 等、明示トランザクション内での対応外の文（対象外。
+            // `docs/design/explicit-transaction.md` 参照）。
+            _ => Err(SqlSurfaceError::transaction_feature_not_supported(
+                "this statement is not supported inside an explicit transaction",
+            )),
+        }
+    }
+
+    /// 明示トランザクション内の読み取り系文（`Active` のときのみ呼ばれる）。
+    /// 同一トランザクション内で既に書き込み済みのテーブルへの読み取りは
+    /// `0A000` で拒否する（自トランザクションの未 commit 変更の可視化は対象外。
+    /// `sql::transaction` モジュールドキュメント「読み取りの既知の逸脱」参照）。
+    /// それ以外は BEGIN 時点のスナップショットに対する通常の読み取り経路
+    /// （[`Self::execute_validated_in_session`]）へそのまま委譲する。
+    fn read_only_in_active_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'e>,
+        table: &str,
+        stmt: crate::sql::allowlist::Statement,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        if txn.table_already_written(table) {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                    "reading a table already written in the same transaction is not supported",
+                ),
+            );
+        }
+        self.execute_validated_in_session(ctx, session, stmt)
     }
 
     /// Describe（拡張クエリプロトコルの 'D' 種別 S。Issue #933・TASK-71・
@@ -2663,6 +2932,9 @@ impl EngineCore {
                     )))
                 }
             }
+            // `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）は結果列を持たない
+            // （`CommandComplete` のみ）。
+            ParsedSql::Transaction(_) => Ok(None),
         }
     }
 
@@ -4211,7 +4483,14 @@ impl EngineCore {
         operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
         let ledger_write = self.ledger_mode.resolve(operation_id)?;
-        crate::tenant::insert_row_unchecked(&self.storage, table, ctx, id, row, ledger_write)
+        crate::tenant::insert_row_unchecked(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            table,
+            ctx,
+            id,
+            row,
+            ledger_write,
+        )
     }
 
     /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。

@@ -141,6 +141,7 @@ pub(crate) mod scalar_plan;
 pub mod scan;
 pub(crate) mod sparse_cache;
 pub mod statement_splitter;
+pub mod transaction;
 pub mod udf_call;
 pub(crate) mod visible_cache;
 
@@ -255,4 +256,16 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     Update(exec::UpdateOutcome),
+    /// `BEGIN [WORK|TRANSACTION]`（SQL-31・TASK-221）が成功したことを示す応答。
+    /// `wire-server::simple_query` は `CommandComplete` タグ `BEGIN` を返す。
+    ///
+    /// **BREAKING CHANGE**（Issue #942）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コードは更新が必要。
+    Begin,
+    /// `COMMIT [WORK|TRANSACTION]`（SQL-31・TASK-221）が成功したことを示す応答。
+    /// `wire-server::simple_query` は `CommandComplete` タグ `COMMIT` を返す。
+    Commit,
+    /// `ROLLBACK [WORK|TRANSACTION]`（SQL-31・TASK-221）が成功したことを示す応答。
+    /// `wire-server::simple_query` は `CommandComplete` タグ `ROLLBACK` を返す。
+    Rollback,
 }

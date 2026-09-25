@@ -48,16 +48,22 @@ wire 層（`crates/wire-server/src/simple_query.rs`）は SQL の字句知識を
 
 ### 文種別分類と「書き込みは最後の 1 文のみ」の制約
 
-明示 `BEGIN`（SQL-31）と複数文単位のトランザクション機構（RECOVER-12）は
-未実装のため、書き込み系文が含まれる複数文メッセージでは「書き込みが最後の
-1 文に限られる」形のみを受理する（fail-closed）。
+明示トランザクション（`BEGIN`/`COMMIT`/`ROLLBACK`。SQL-31・TASK-221。Issue #942）
+実装後は、複数文メッセージ内で `BEGIN` から `COMMIT`/`ROLLBACK` までの区間
+（`Active` 相当）にある書き込み系文は位置に関わらず許可する。`BEGIN` を含まない
+複数文メッセージでは、従来どおり「書き込みが最後の 1 文に限られる」形のみを
+受理する（fail-closed のまま）。詳細な状態機械は
+[`explicit-transaction.md`](./explicit-transaction.md) 参照。
 
 - `StatementEffect::ReadOnly`: `SELECT`（検索・集計・広域取得）・`EXPLAIN`。
 - `StatementEffect::SessionLocal`: `SET ...`・`CREATE FUNCTION ...`。
+- `StatementEffect::TransactionControl(TxnControl)`: `BEGIN`／`COMMIT`／
+  `ROLLBACK`（SQL-31・TASK-221）。`check_write_placement` がトランザクション
+  状態を模擬する際の遷移点になる。
 - `StatementEffect::Write`: `INSERT`（UPSERT 含む）・`UPDATE`・`DELETE`・
-  `TRUNCATE`、および読み取り専用・セッション局所のいずれとも判定できない
-  未知の先頭語（fail-closed の既定。将来 engine に書き込み系構文が追加された
-  場合に誤って許可しないための安全側の既定）。
+  `TRUNCATE`、および読み取り専用・セッション局所・トランザクション制御の
+  いずれとも判定できない未知の先頭語（fail-closed の既定。将来 engine に
+  書き込み系構文が追加された場合に誤って許可しないための安全側の既定）。
 - `StatementEffect::Rejected`: 字句解析に失敗する文、および字句解析には
   成功しても構造上どの `core.rs::execute_sql_in_session` の分岐にも到達し
   得ない先頭トークン形（`Token::Number`・`Token::Punct`・`Token::StringLiteral`・
@@ -65,9 +71,14 @@ wire 層（`crates/wire-server/src/simple_query.rs`）は SQL の字句知識を
   `validate_sql` の許可リスト外（`42601`）で拒否され副作用が起きないため、
   位置に関わらず許可する（`check_write_placement` の対象外）。
 
-`check_write_placement` は `Write` が最後の文以外の位置にある場合、または
-`Write` が 2 個以上ある場合（後者は必ず一方が最後以外に来るため同じ規則で
-拒否される）に `0A000`（`FeatureNotSupported`）で 1 文も実行せずに拒否する。
+`check_write_placement(stmts, initially_in_txn)` は、本メッセージの先頭文
+実行前に接続が既に明示トランザクション中（`Active`）かどうかを
+`initially_in_txn` で受け取り、`BEGIN` で「トランザクション内」、`COMMIT`／
+`ROLLBACK` で「トランザクション外」という遷移をメッセージ内で先頭から模擬
+する。トランザクション外で `Write` が最後の文以外の位置にある場合は
+`0A000`（`FeatureNotSupported`）で 1 文も実行せずに拒否する。`COMMIT` は
+トランザクション状態によらず必ず最後の文でのみ許可する（1 メッセージにつき
+commit は高々 1 回という既存の不変条件を維持するため）。
 
 ## 原子性（暗黙トランザクション）の扱い
 
@@ -96,12 +107,14 @@ wire 層（`crates/wire-server/src/simple_query.rs`）は SQL の字句知識を
 復元する。単一文経路（`SplitOutcome::Single`）はこの clone を行わないため、
 既存の単一文レイテンシ・アロケーションコストは不変。
 
-### 制約を緩める条件
+### 制約を緩める条件（Issue #942 で緩和済み）
 
 SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
-トランザクション機構）が実装された時点で、「書き込みは最後の 1 文のみ」の
-制約を外す判断を再度行う。それまでは、書き込みを含む複数文の原子性を
-安全側（受理範囲を狭める）に倒して保証する。
+トランザクション機構の一部）は Issue #942 で実装済みとなり、`BEGIN` を含む
+メッセージ内では「書き込みは最後の 1 文のみ」の制約を外した（上記
+「文種別分類」節参照）。`BEGIN` を含まないメッセージでは引き続き従来の制約
+（書き込みを含む複数文の原子性を安全側〔受理範囲を狭める〕に倒して保証する）
+を維持する。
 
 ## 応答順序
 
@@ -135,9 +148,7 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
 
 ## スコープ外
 
-- `BEGIN`/`COMMIT`/`ROLLBACK`（SQL-31）・複数文単位のトランザクション機構
-  （RECOVER-12）。
-- `ReadyForQuery` の状態バイト（WIRE-19。`I` 固定のまま）。
+- `ReadyForQuery` の状態バイト（WIRE-19。`I` 固定のまま。#943 が担当）。
 - 拡張クエリプロトコル（WIRE-11）。
 - `EngineCore::execute_sql`（非セッション API）・`execute_sql_in_session` の
   engine 側単一文契約。複数文対応は wire の `'Q'` 経路のみに実装し、

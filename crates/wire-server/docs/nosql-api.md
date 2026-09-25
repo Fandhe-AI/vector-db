@@ -612,7 +612,7 @@ Date: <IMF-fixdate>
 
 「1 つの `wire_code` → 常に 1 つの HTTP ステータス」の方向にのみ 1:1 の射影
 であり、逆方向（ステータス → `wire_code`）は 1:1 ではない（例えば `400` は
-7 分類が共有する）。
+11 分類が共有する）。
 
 | `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
 | --- | --- | --- | --- | --- |
@@ -623,6 +623,10 @@ Date: <IMF-fixdate>
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | ENUM 列の語彙外ラベル（`insert`／`update`／`filter`） |
 | `23502` | `MISSING_OPERATION_ID` | 400 | Bad Request | `insert` の `operation_id` 欠落 |
+| `25000` | `INVALID_TRANSACTION_STATE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（明示トランザクション制御が op 語彙に無い。後述） |
+| `25001` | `ACTIVE_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
+| `25P01` | `NO_ACTIVE_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
+| `25P02` | `IN_FAILED_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
@@ -634,16 +638,20 @@ Date: <IMF-fixdate>
 | `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
 | `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
+| `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | NoSQL 表層の実要求からは到達不能（明示トランザクション制御が op 語彙に無い。後述） |
 
-到達不能な 2 分類（`42501`・`P0002`）の理由: NoSQL 表層はテナントを
-セッション（`SessionPrincipal::policy_context()`）からのみ導出し、
+到達不能な 7 分類（`42501`・`P0002`・`55P03`・`25000`・`25001`・`25P01`・
+`25P02`）の理由: NoSQL 表層はテナントをセッション
+（`SessionPrincipal::policy_context()`）からのみ導出し、
 クライアント自己申告の `tenant_id` 相当値は JSON／ヘッダ／パスいずれの
 位置でも `42601` で先に拒否するため、`ForbiddenTenantMismatch` を実要求から
 誘発する経路が構造的に存在しない。`RowNotFound` に対応する op（更新・削除系）
-も NoSQL 表層の許可リストに無い。テナント境界の検査を緩める・バイパスする
-production 経路をこの 2 分類のために新設することはせず（`.claude/rules/
-security.md` P0）、射影表としての一致のみを production の応答エンコーダ経由で
-固定する。
+も NoSQL 表層の許可リストに無い。明示トランザクション（SQL-31・TASK-221）の
+`BEGIN`／`COMMIT`／`ROLLBACK`・ロック待ち（`55P03`）は SQL 表層専用の機構で、
+NoSQL 表層の `op` 許可リストにトランザクション制御に対応する語彙が無いため
+到達しない。テナント境界の検査を緩める・バイパスする production 経路をこれら
+の分類のために新設することはせず（`.claude/rules/security.md` P0）、
+射影表としての一致のみを production の応答エンコーダ経由で固定する。
 
 本節の各 op スキーマ節（[op 別スキーマ](#op-別スキーマ)・
 [`filter` 配列](#filter-配列)・[`explain`](#explain)）では引き続き

@@ -456,11 +456,12 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
 /// `engine::sql::mode::SessionState`（取得モード・宣言的 UDF レジストリ）で、
 /// いずれも本ループの全クエリを通じて 1 個の値を使い回す（`EngineCore` 自体は
 /// セッション状態を保持しない設計。`sql::mode` モジュールドキュメント参照）。
-fn post_auth_loop(
+fn post_auth_loop<'e>(
     stream: &mut TcpStream,
     ctx: &engine::policy::PolicyContext,
-    engine: Option<&engine::core::EngineCore>,
+    engine: Option<&'e engine::core::EngineCore>,
     session: &mut engine::sql::mode::SessionState,
+    txn: &mut Option<engine::sql::transaction::SessionTransaction<'e>>,
     extended: &mut crate::extended_query::ExtendedQueryState,
 ) -> Result<()> {
     loop {
@@ -555,6 +556,11 @@ fn post_auth_loop(
 
                 match engine {
                     Some(engine) => {
+                        // SQL-31・TASK-221: `engine` が `Some` の間は `txn` も
+                        // `Some`（`post_auth_loop` 呼び出し元で対で構築する）。
+                        let txn = txn
+                            .as_mut()
+                            .expect("session transaction must exist whenever engine is attached");
                         // Issue #939（WIRE-17・TASK-220）: `COPY ... FROM STDIN`／
                         // `COPY (...) TO STDOUT` は簡易クエリの通常の 1 往復応答
                         // ではなく CopyIn／CopyOut サブプロトコルを要するため、
@@ -563,6 +569,20 @@ fn post_auth_loop(
                         // 形状には含めない。見逃した場合は通常経路が `42601` で
                         // 拒否する fail-closed。モジュールドキュメント参照）。
                         if engine::sql::copy::is_copy_statement(text) {
+                            // SQL-31・TASK-221: 明示トランザクション中の COPY は
+                            // 未対応（`0A000`）。`crate::copy::run` へは委譲せず
+                            // トランザクションを Failed へ遷移させる
+                            // （`sql::transaction` モジュールドキュメント参照）。
+                            if txn.is_active() {
+                                txn.fail();
+                                write_error_response_io(
+                                    stream,
+                                    ErrorClass::FeatureNotSupported,
+                                    "COPY is not supported inside an explicit transaction",
+                                )?;
+                                write_ready_for_query_io(stream)?;
+                                continue;
+                            }
                             // Issue #939 レビュー指摘（discussion_r4096720859）:
                             // COPY サブプロトコル中に Terminate（'X'）を受信した
                             // 場合、`crate::copy::run` はそれを消費するだけで
@@ -577,7 +597,7 @@ fn post_auth_loop(
                             }
                         } else {
                             crate::simple_query::execute_and_respond(
-                                stream, engine, ctx, session, text,
+                                stream, engine, ctx, session, txn, text,
                             )?;
                         }
                     }
@@ -1064,12 +1084,24 @@ fn handle_connection_inner(
     // 接続単位のセッション状態（取得モード・宣言的 UDF レジストリ）。
     // `EngineCore` 自体は保持しない（`sql::mode` モジュールドキュメント参照）。
     let mut session = engine::sql::mode::SessionState::default();
+    // 接続単位の明示トランザクション状態（SQL-31・TASK-221）。`session` と同じく
+    // 接続終了（drop）で破棄する ―― 未 commit のまま接続が切れた場合、保持中の
+    // 共有 `redb::WriteTransaction` は commit されずに abort され、単一ライタの
+    // 占有（`writer_gate::WriterPermit`）も解放される。
+    let mut txn = engine.map(|e| e.new_session_transaction());
     // 接続単位の Parse 済みステートメント・portal 保持（Issue #933・#934・
     // TASK-71・WIRE-11）。`session` と同じく接続終了で破棄し、接続間・
     // テナント間で共有しない（`extended_query` モジュールドキュメント参照）。
     let mut extended = crate::extended_query::ExtendedQueryState::new();
 
-    match post_auth_loop(&mut stream, &ctx, engine, &mut session, &mut extended) {
+    match post_auth_loop(
+        &mut stream,
+        &ctx,
+        engine,
+        &mut session,
+        &mut txn,
+        &mut extended,
+    ) {
         Ok(()) => Ok(()),
         Err(e) => respond_and_close(&mut stream, e, "invalid message frame"),
     }
@@ -1282,6 +1314,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(result.is_err(), "empty query body must be rejected");
@@ -1308,6 +1341,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(result.is_err(), "embedded NUL in query must be rejected");
@@ -1334,6 +1368,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(
@@ -1362,6 +1397,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(result.is_ok(), "well-formed Terminate must succeed");
@@ -1391,6 +1427,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             match result {
@@ -1428,6 +1465,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             match result {
@@ -1464,6 +1502,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
+                &mut None,
                 &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(
