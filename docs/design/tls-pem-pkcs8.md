@@ -132,6 +132,32 @@ X.509 DER のパース・公開鍵との整合チェック・validity 検査・C
 ない。これは既存の `hkdf::Secret32`・`x25519::SharedSecret` と同じ限界
 であり、本 Issue で新たに緩和も強化もしていない。
 
+## 走査時のメモリ確保上限（PR #1030 codex-review P1 是正）
+
+`pem::scan_blocks` は BEGIN ブロックを見つけるたびにその本体（base64）用の
+バッファを事前確保するが、この確保量の上限とブロック数の打ち切りを
+走査完了より前に課さないと、短い（本文なしの）BEGIN/END ブロックを
+多数並べるだけで「入力サイズ × ブロック数」規模のメモリ確保を誘発でき、
+証明書チェーンのブロック数上限（`MAX_CERTIFICATE_CHAIN_LEN`）判定が
+走査完了後にしか行われない構造と相まって起動時 OOM/abort を招きうる
+（PEM を直接パースする `pub` API・`decode_certificate_chain_pem`／
+`decode_private_key_pem` は `read_bounded_file` を経由しない呼び出しにも
+開かれているため、この入力自体にもサイズ上限が無かった）。是正として
+`scan_blocks` の入口に限り以下を追加する:
+
+- 入力テキスト全体を `MAX_PEM_SCAN_INPUT_LEN`（`MAX_CERTIFICATE_FILE_LEN`
+  と同値）で上限し、超過は `PemError::InputTooLarge` で拒否する
+- BEGIN ブロックの数を走査中に `MAX_PEM_BLOCKS_PER_SCAN` で打ち切り、
+  超過は `PemError::TooManyBlocksInScan` で拒否する（証明書チェーンの
+  意味的な上限 `MAX_CERTIFICATE_CHAIN_LEN` の挙動・エラーは無変更のまま
+  維持し、これより十分大きい値を汎用の走査時上限として設定する）
+- 各ブロック本体の事前確保量を、入力全体の長さではなく走査中の現在位置
+  からの残り入力長に変更する（後段のブロックほど確保量が小さくなる）
+
+これらは走査時の一時的な確保量を上限化する目的の実装既定値であり、
+証明書チェーン・秘密鍵の意味的な受理条件（`MAX_CERTIFICATE_CHAIN_LEN`・
+「`PRIVATE KEY` ブロックはちょうど 1 個」）はいずれも変更しない。
+
 ## 上限値（本リポ独自の実装既定値。spec 由来の数値ではない）
 
 | 定数 | 値 | 用途 |
@@ -139,6 +165,8 @@ X.509 DER のパース・公開鍵との整合チェック・validity 検査・C
 | `MAX_PRIVATE_KEY_FILE_LEN` | 16 KiB | 秘密鍵 PEM ファイルの読み込み上限（Ed25519 PKCS#8 は 48 バイトの DER に収まるため十分な余裕） |
 | `MAX_CERTIFICATE_FILE_LEN` | 1 MiB | 証明書チェーン PEM ファイルの読み込み上限 |
 | `MAX_CERTIFICATE_CHAIN_LEN` | 8 | 証明書チェーンに含めてよい `CERTIFICATE` ブロック数の上限 |
+| `MAX_PEM_SCAN_INPUT_LEN` | 1 MiB（`MAX_CERTIFICATE_FILE_LEN` と同値） | `pem::scan_blocks` が受理する PEM テキストの最大バイト数（`pub` API が `read_bounded_file` を経由しない直接呼び出しでも上限を課すための入口ガード） |
+| `MAX_PEM_BLOCKS_PER_SCAN`（モジュール内部定数） | 64 | `pem::scan_blocks` が走査中に打ち切る BEGIN/END ブロック数の汎用上限 |
 
 ファイル読み込みは `pem::read_bounded_file` が担う。`File::open` →
 同一ファイル記述子の `fstat`（`File::metadata`）で通常ファイルを確認 →

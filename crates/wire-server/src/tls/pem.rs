@@ -46,6 +46,30 @@ pub const MAX_CERTIFICATE_FILE_LEN: u64 = 1024 * 1024;
 /// 本リポ独自の実装既定値。
 pub const MAX_CERTIFICATE_CHAIN_LEN: usize = 8;
 
+/// [`scan_blocks`] が受理する PEM テキストの最大バイト数。
+///
+/// `decode_certificate_chain_pem`／`decode_private_key_pem`（延いては
+/// `decode_ed25519_private_key_pem`）は `pub` API であり、
+/// `load_certificate_chain_file`／`load_private_key_file` が課す
+/// [`read_bounded_file`] 由来の上限（呼び出し元側の防御）を経由しない
+/// 直接呼び出しに対しては、これまでファイルサイズ上限が一切存在しなかった
+/// （PR #1030 codex-review P1 指摘）。本モジュールが正当に扱う最大の入力は
+/// 証明書チェーン PEM（[`MAX_CERTIFICATE_FILE_LEN`]）であるため、
+/// `scan_blocks` 自体の入口でこの値を上限として fail-closed に拒否する。
+pub const MAX_PEM_SCAN_INPUT_LEN: usize = MAX_CERTIFICATE_FILE_LEN as usize;
+
+/// [`scan_blocks`] が 1 回の走査で受理する BEGIN/END ブロック数の上限。
+///
+/// 証明書チェーンの意味的な上限（[`MAX_CERTIFICATE_CHAIN_LEN`]）は
+/// 走査完了後に `decode_certificate_chain_pem` が判定するため、走査自体は
+/// ここでブロック数を独立に打ち切らないと、短い空ブロックを大量に並べる
+/// ことで「入力サイズ × ブロック数」規模のメモリ確保を誘発できてしまう
+/// （PR #1030 codex-review P1 指摘）。秘密鍵は 1 ブロックしか許さないため、
+/// 証明書チェーンの上限より十分大きい値を汎用の走査時上限として設定し、
+/// 既存の意味的上限（証明書チェーン 8 本・秘密鍵 1 本）の挙動・エラー
+/// メッセージは変えない。
+const MAX_PEM_BLOCKS_PER_SCAN: usize = 64;
+
 /// 秘密値（ファイルバッファ・base64 除去後テキスト・デコード後の DER）を
 /// 保持するバッファ。Drop 時に [`super::hkdf::zeroize`] で best-effort に
 /// ゼロ化する（`unsafe` を使わないため最適化による消去省略は排除できない。
@@ -131,6 +155,11 @@ pub enum PemError {
     ExpectedSingleBlock { found: usize },
     /// 証明書チェーンのブロック数が [`MAX_CERTIFICATE_CHAIN_LEN`] を超える。
     TooManyBlocks { max: usize },
+    /// 走査中のブロック数が [`MAX_PEM_BLOCKS_PER_SCAN`]（用途を問わない
+    /// 走査時の汎用上限）を超える。
+    TooManyBlocksInScan { max: usize },
+    /// 入力テキストが [`MAX_PEM_SCAN_INPUT_LEN`] を超える。
+    InputTooLarge { max: usize },
     /// base64 本体のデコードに失敗した。
     Base64(Base64DecodeError),
 }
@@ -165,6 +194,12 @@ impl fmt::Display for PemError {
             }
             PemError::TooManyBlocks { max } => {
                 write!(f, "PEM input has more than {max} CERTIFICATE blocks")
+            }
+            PemError::TooManyBlocksInScan { max } => {
+                write!(f, "PEM input has more than {max} blocks")
+            }
+            PemError::InputTooLarge { max } => {
+                write!(f, "PEM input exceeds the maximum size of {max} bytes")
             }
             PemError::Base64(e) => write!(f, "PEM body is not valid base64: {e}"),
         }
@@ -544,6 +579,15 @@ struct RawBlock {
 /// - 本文中に `:` を含む行（RFC 1421 暗号化ヘッダ）があれば拒否する
 /// - BEGIN の入れ子・END 単独の出現は拒否する
 fn scan_blocks(text: &[u8]) -> Result<Vec<RawBlock>, PemError> {
+    // `text` は `pub` API（`decode_certificate_chain_pem`・
+    // `decode_private_key_pem`）へ直接渡されうるため、呼び出し元
+    // （`read_bounded_file` 経由の `load_*_file`）を経由しない大入力にも
+    // ここで fail-closed に上限を課す（PR #1030 codex-review P1 指摘）。
+    if text.len() > MAX_PEM_SCAN_INPUT_LEN {
+        return Err(PemError::InputTooLarge {
+            max: MAX_PEM_SCAN_INPUT_LEN,
+        });
+    }
     if !text.is_ascii() {
         return Err(PemError::NonAscii);
     }
@@ -553,8 +597,18 @@ fn scan_blocks(text: &[u8]) -> Result<Vec<RawBlock>, PemError> {
     let mut blocks = Vec::new();
     let mut current_label: Option<String> = None;
     let mut current_body = ZeroizingBytes::default();
+    // 走査済みブロック数（用途を問わない汎用上限。下記 try_reserve_exact
+    // の合計確保量を打ち切るための独立した歯止め）。
+    let mut block_count: usize = 0;
+    // `text` 中で走査済みの先頭からのバイト数（`split('\n')` は末尾の
+    // 改行を含まないため、行ごとに `+1` して近似する。ブロック本体の
+    // 確保量を「残り入力長」に抑えるための目安であり、多少の過大評価
+    // （最終行の `+1` 分）があっても安全側にしか振れない）。
+    let mut consumed: usize = 0;
+    let total_len = text.len();
 
     for raw_line in text.split('\n') {
+        let advance = raw_line.len() + 1;
         // CRLF の CR を取り除く（行末以外に CR が来る形は下の判定で
         // 空白以外の文字として自然に拒否される）。
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
@@ -567,15 +621,27 @@ fn scan_blocks(text: &[u8]) -> Result<Vec<RawBlock>, PemError> {
             if current_label.is_some() {
                 return Err(PemError::UnexpectedBoundary);
             }
+            // ブロック本体の確保（下記）を行う前に上限を検査する
+            // （検査を走査完了後まで遅延させると、短い空ブロックを大量に
+            // 並べるだけで「入力サイズ × ブロック数」規模のメモリ確保を
+            // 誘発できてしまう。PR #1030 codex-review P1 指摘）。
+            block_count += 1;
+            if block_count > MAX_PEM_BLOCKS_PER_SCAN {
+                return Err(PemError::TooManyBlocksInScan {
+                    max: MAX_PEM_BLOCKS_PER_SCAN,
+                });
+            }
             current_label = Some(label.to_string());
             current_body.clear();
-            // ブロック本体は必ず `text` の部分集合であるため、その長さを
-            // 上限に一度だけ確保しておく（`text` 自体は呼び出し元
-            // ［`read_bounded_file`］で上限済み。`extend_from_slice` の
-            // 段階的な再確保を避け、秘密鍵 base64 のゼロ化されない
-            // 旧確保領域が複数世代ヒープに残ることを防ぐ。失敗時は
-            // best-effort のため無視し、通常の再確保に委ねる）。
-            let _ = current_body.try_reserve_exact(text.len());
+            // ブロック本体は必ず「残りの入力」の部分集合であるため、
+            // その長さ（`text.len()` 全体ではなく現在位置からの残り）を
+            // 上限に一度だけ確保しておく（`extend_from_slice` の段階的な
+            // 再確保を避け、秘密鍵 base64 のゼロ化されない旧確保領域が
+            // 複数世代ヒープに残ることを防ぐ。失敗時は best-effort のため
+            // 無視し、通常の再確保に委ねる）。
+            let remaining = total_len.saturating_sub(consumed);
+            let _ = current_body.try_reserve_exact(remaining);
+            consumed += advance;
             continue;
         }
         if let Some(label) = trimmed
@@ -592,6 +658,7 @@ fn scan_blocks(text: &[u8]) -> Result<Vec<RawBlock>, PemError> {
                 label: classify_label(&begin_label),
                 body: std::mem::take(&mut current_body),
             });
+            consumed += advance;
             continue;
         }
 
@@ -606,6 +673,7 @@ fn scan_blocks(text: &[u8]) -> Result<Vec<RawBlock>, PemError> {
             // ブロックの外側は空白・改行のみ許容する。
             return Err(PemError::UnexpectedContent);
         }
+        consumed += advance;
     }
 
     if current_label.is_some() {
@@ -726,6 +794,42 @@ mod tests {
         let chain = decode_certificate_chain_pem(doubled.as_bytes()).expect("valid chain");
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0], chain[1]);
+    }
+
+    #[test]
+    fn scan_blocks_rejects_input_over_max_scan_len() {
+        // `text` は `pub` API へ直接渡されうるため、`read_bounded_file` を
+        // 経由しない呼び出しでも `MAX_PEM_SCAN_INPUT_LEN` で拒否される
+        // ことを固定する（PR #1030 codex-review P1 指摘）。
+        let oversized = vec![b'a'; MAX_PEM_SCAN_INPUT_LEN + 1];
+        assert_eq!(
+            decode_certificate_chain_pem(&oversized),
+            Err(PemError::InputTooLarge {
+                max: MAX_PEM_SCAN_INPUT_LEN
+            })
+        );
+    }
+
+    #[test]
+    fn scan_blocks_rejects_many_short_blocks_before_reserving_per_block_memory() {
+        // 短い（本文なしの）BEGIN/END ブロックを大量に並べても、
+        // ブロック数上限が走査完了を待たずに発火することを固定する。
+        // 修正前は `decode_certificate_chain_pem` の
+        // `chain.len() > MAX_CERTIFICATE_CHAIN_LEN` 判定が走査完了後にしか
+        // 行われず、各ブロックが `text.len()` バイトを確保していたため、
+        // 1 MiB 以下の入力でも「入力サイズ × ブロック数」規模のメモリ
+        // 確保を誘発できた（PR #1030 codex-review P1 指摘）。
+        let mut text = String::new();
+        for _ in 0..(MAX_PEM_BLOCKS_PER_SCAN + 1) {
+            text.push_str("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n");
+        }
+        assert!(text.len() < MAX_PEM_SCAN_INPUT_LEN);
+        assert_eq!(
+            decode_certificate_chain_pem(text.as_bytes()),
+            Err(PemError::TooManyBlocksInScan {
+                max: MAX_PEM_BLOCKS_PER_SCAN
+            })
+        );
     }
 
     #[test]
