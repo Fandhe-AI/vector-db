@@ -252,10 +252,13 @@ enum HandshakeState {
         after_hrr: bool,
     },
     ExpectClientFinished,
-    /// client Finished 検証まで完了（[`ServerHandshake::handle_record`]
-    /// はこの状態には遷移しない。[`Step::Complete`] を返した時点で
-    /// 呼び出し元が [`TlsSession`] を受け取り、以後このインスタンスへは
-    /// 触れない契約とする）。
+    /// client Finished 検証まで完了した状態（`handle_client_finished` が
+    /// この状態へ遷移させる）。[`Step::Complete`] を返した時点で呼び出し元が
+    /// [`TlsSession`] を受け取り、以後このインスタンスへは触れない契約と
+    /// する。この契約に反してこの状態のまま再度 [`ServerHandshake::
+    /// handle_record`] を呼んだ場合は [`ServerHandshakeError::
+    /// AlreadyFailed`]（他の poison 系 variant と名称を共有するが、実際には
+    /// 「完了後の契約違反な再呼び出し」であり失敗ではない）を返す。
     Complete,
     /// fatal alert を送出済み（またはこれから送出を試みる）。以後の
     /// `handle_record` は同じ理由の `Err` を返し続ける。
@@ -349,6 +352,19 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
     /// 呼び出し元（driver）が次のレコードを読む際に使うべき [`RecordKind`]。
     pub fn record_kind(&self) -> RecordKind {
         self.opener.record_kind()
+    }
+
+    /// 呼び出し元（driver）が、この状態機械が送出したレコード列
+    /// （[`Step::Continue`]／[`Step::Complete`] の出力・[`Self::
+    /// take_pending_alert_output`]・[`Self::fail_on_record_error`] の
+    /// 戻り値）を書き込む際に使うべき [`RecordKind`]。[`Self::record_kind`]
+    /// （受信 [`Opener`] 側の epoch）とは独立した送信 [`Sealer`] 側の値で
+    /// あり、書き込み検証に受信側の値を流用しない（#965 レビュー指摘。
+    /// 本実装は `Sealer`／`Opener` が常に同時に鍵切替する構成のため現状は
+    /// 両者が同値になるが、将来非対称な鍵切替が入っても壊れないよう
+    /// 区別しておく）。
+    fn write_record_kind(&self) -> RecordKind {
+        self.sealer.record_kind()
     }
 
     /// レコード層で検出された違反（[`record::RecordError`]）を、この
@@ -994,22 +1010,22 @@ pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeE
         match record::read_record(stream, core.record_kind()) {
             Ok(Some(record)) => match core.handle_record(&record) {
                 Ok(Step::Continue(output)) => {
-                    write_all_records(stream, &output, core.record_kind())
+                    write_all_records(stream, &output, core.write_record_kind())
                         .map_err(ServerHandshakeDriverError::Record)?;
                 }
                 Ok(Step::Complete(output, session)) => {
-                    write_all_records(stream, &output, core.record_kind())
+                    write_all_records(stream, &output, core.write_record_kind())
                         .map_err(ServerHandshakeDriverError::Record)?;
                     return Ok(session);
                 }
                 Ok(Step::ClosedByPeer(output)) => {
-                    let _ = write_all_records(stream, &output, core.record_kind());
+                    let _ = write_all_records(stream, &output, core.write_record_kind());
                     let _ = stream.shutdown();
                     return Err(ServerHandshakeDriverError::ClosedByPeer);
                 }
                 Err(err) => {
                     let alert_output = core.take_pending_alert_output();
-                    let _ = write_all_records(stream, &alert_output, core.record_kind());
+                    let _ = write_all_records(stream, &alert_output, core.write_record_kind());
                     let _ = stream.shutdown();
                     return Err(ServerHandshakeDriverError::Handshake(err));
                 }
@@ -1022,7 +1038,7 @@ pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeE
             }
             Err(e) => {
                 let alert_output = core.fail_on_record_error(e.alert_description());
-                let _ = write_all_records(stream, &alert_output, core.record_kind());
+                let _ = write_all_records(stream, &alert_output, core.write_record_kind());
                 let _ = stream.shutdown();
                 return Err(ServerHandshakeDriverError::Record(e));
             }
