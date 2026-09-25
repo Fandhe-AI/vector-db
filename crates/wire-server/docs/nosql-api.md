@@ -676,10 +676,10 @@ Date: <IMF-fixdate>
 | `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
 | `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
-| `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | NoSQL 表層の実要求からは到達不能（明示トランザクション制御が op 語彙に無い。後述） |
+| `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 9 分類（`42501`・`P0002`・`42701`・`42P07`・`55P03`・`25000`・
-`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 8 分類（`42501`・`P0002`・`42701`・`42P07`・`25000`・`25001`・
+`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -688,9 +688,10 @@ Date: <IMF-fixdate>
 （SQL-23・TASK-202・Issue #899）が誘発する分類だが、NoSQL 表層の `op` 許可
 リストに `create_table` 相当が無いため実要求からは到達しない（`docs/design/
 sql-create-table.md` 参照）。明示トランザクション（SQL-31・TASK-221）の
-`BEGIN`／`COMMIT`／`ROLLBACK`・ロック待ち（`55P03`）は SQL 表層専用の機構で、
-NoSQL 表層の `op` 許可リストにトランザクション制御に対応する語彙が無いため
-到達しない。テナント境界の検査を緩める・バイパスする production 経路をこれら
+`BEGIN`／`COMMIT`／`ROLLBACK` は SQL 表層専用の機構で、NoSQL 表層の `op`
+許可リストにトランザクション制御に対応する語彙が無いため、その状態エラー
+（`25xxx`）は到達しない（一方、ロック待ちの `55P03` は SQL 表層のトランザク
+ションがライタを保持している間の NoSQL 書き込みで発生しうる。上表参照）。テナント境界の検査を緩める・バイパスする production 経路をこれら
 の分類のために新設することはせず（`.claude/rules/security.md` P0）、射影表と
 しての一致のみを production の応答エンコーダ経由で固定する。
 
