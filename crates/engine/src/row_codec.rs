@@ -871,6 +871,16 @@ pub fn encode_row(
     visibility: Visibility,
     values: &[Value],
 ) -> Result<Vec<u8>> {
+    // この「フル行」v1 物理フォーマットは production 経路では使われない
+    // （production は `storage.rs` のヘッダ + `encode_scalar_columns` のスカラー
+    // ペイロード形式のみを書く）。削除済み列（墓標）を持つスキーマの物理配置は
+    // この形式に反映していないため、混同を避け fail-closed に拒否する
+    // （TABLE-19・Issue #901）。
+    if !schema.dropped_slots().is_empty() {
+        return Err(RowCodecError::Invalid(
+            "encode_row does not support schemas with dropped columns".to_string(),
+        ));
+    }
     if values.len() > schema.columns.len() {
         return Err(RowCodecError::Invalid(format!(
             "too many values: schema has {} columns, got {}",
@@ -1274,6 +1284,13 @@ fn encode_json_value(
 /// non-nullable なら `Err`」として扱う（TABLE-5: `ALTER TABLE ADD COLUMN` 後の
 /// 既存行デコード前提）。
 pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
+    // `encode_row` と同じ理由で、削除済み列（墓標）を持つスキーマは fail-closed
+    // に拒否する（TABLE-19・Issue #901）。
+    if !schema.dropped_slots().is_empty() {
+        return Err(RowCodecError::Invalid(
+            "decode_row does not support schemas with dropped columns".to_string(),
+        ));
+    }
     let version = *buf
         .first()
         .ok_or_else(|| RowCodecError::Invalid("row buffer is empty".to_string()))?;
@@ -1841,7 +1858,18 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
         }
         Ok(())
     };
-    for (idx, column) in schema.columns.iter().enumerate() {
+    for slot in schema.physical_slots() {
+        let (idx, column) = match slot {
+            crate::catalog::PhysicalSlot::Live(idx, column) => (idx, column),
+            crate::catalog::PhysicalSlot::Dropped(_) => {
+                // 削除済み列（墓標）の物理位置には、新規に書き込む行では常に
+                // NULL を書く（削除前の値を引き継がない。TABLE-19 D1・
+                // Issue #901）。
+                reserve(&mut buf, 1)?;
+                buf.push(PRESENCE_NULL);
+                continue;
+            }
+        };
         if matches!(column.ty, ColumnType::Vector(_)) {
             // VECTOR 列は storage.rs 側の embedding スロットが担当するため、
             // スカラーペイロードには一切含めない（値の有無・内容を問わずスキップ）。
@@ -2329,7 +2357,19 @@ pub(crate) fn merge_encode_scalar_columns(
         write_text(buf, reserve, text.as_bytes())
     };
 
-    for (idx, column) in schema.columns.iter().enumerate() {
+    for slot in schema.physical_slots() {
+        let (idx, column) = match slot {
+            crate::catalog::PhysicalSlot::Live(idx, column) => (idx, column),
+            crate::catalog::PhysicalSlot::Dropped(_) => {
+                // 削除済み列（墓標）は UPDATE でも常に NULL を書く。`existing`
+                // （削除前の値。構造検証のみ経由し出力へは積まれていない）・
+                // `overrides` のいずれも参照しない（削除済みの値を引き継がない。
+                // TABLE-19 D1・Issue #901）。
+                reserve(&mut buf, 1)?;
+                buf.push(PRESENCE_NULL);
+                continue;
+            }
+        };
         if matches!(column.ty, ColumnType::Vector(_)) {
             // VECTOR 列は encode_scalar_columns と同じくスキップ（embedding は
             // storage.rs 側のスロットが担当。`overrides` に含まれていても無視）。
@@ -2773,8 +2813,13 @@ pub fn scan_scalar_columns_masked<'a>(
     values
         .try_reserve_exact(schema.columns.len())
         .map_err(|_| RowCodecError::Invalid("failed to reserve scalar scan output".to_string()))?;
-    scan_scalar_columns_validated(schema, buf, mask, |_, value| {
-        values.push(value);
+    scan_scalar_columns_validated(schema, buf, mask, |col_index, value| {
+        // 削除済み列（墓標。`col_index == None`）は物理走査上の構造検証のみを
+        // 行い、出力へは一切積まない（`values` は常に論理列数と同じ長さを保つ。
+        // TABLE-19・Issue #901）。
+        if col_index.is_some() {
+            values.push(value);
+        }
         Ok(())
     })?;
     Ok(values)
@@ -2795,17 +2840,59 @@ pub fn validate_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<()> {
     scan_scalar_columns_validated(schema, buf, None, |_, _| Ok(()))
 }
 
+/// [`scan_scalar_columns_validated`] が生存列・削除済み列（墓標）のいずれについても
+/// 同じ型別ディスパッチ本体を共有するための薄い借用ビュー（TABLE-19・Issue #901）。
+/// 生存列は `&ColumnDef` からそのまま、墓標は `&DroppedSlot`（常に nullable 扱い。
+/// TABLE-19 D1）から構築する。フィールド名を `ColumnDef` と揃えているため、
+/// 本体側のコードは `column.name`／`column.ty`／`column.nullable` を無変更で
+/// 参照できる。
+struct ScalarSlotView<'a> {
+    name: &'a str,
+    ty: &'a ColumnType,
+    nullable: bool,
+}
+
+impl<'a> From<&'a crate::catalog::ColumnDef> for ScalarSlotView<'a> {
+    fn from(c: &'a crate::catalog::ColumnDef) -> Self {
+        Self {
+            name: c.name.as_str(),
+            ty: &c.ty,
+            nullable: c.nullable,
+        }
+    }
+}
+
+impl<'a> From<&'a crate::catalog::DroppedSlot> for ScalarSlotView<'a> {
+    fn from(d: &'a crate::catalog::DroppedSlot) -> Self {
+        Self {
+            name: d.name(),
+            ty: d.ty(),
+            // 削除済み列は元の nullable 宣言に関わらず常に nullable 扱いとする
+            // （削除前は non-nullable でも、削除後の新規行は当該位置を常に
+            // NULL として書くため。TABLE-19 D1）。
+            nullable: true,
+        }
+    }
+}
+
 /// [`scan_scalar_columns_masked`]・[`validate_scalar_columns`] が共有する走査本体。
 /// 列ごとの構造検証（presence タグ・宣言長上限・バッファ境界・UTF-8 妥当性）を
 /// 一箇所に集約し、検証済みの値（`col_index`・`Option<&'a str>`）を `sink` へ渡す
 /// だけで、値の保持要否（`Vec` へ積むか捨てるか）は呼び出し元が選ぶ。`mask` の意味
 /// は [`scan_scalar_columns_masked`] のドキュメントコメントを参照
 /// （`m[i] == false` の列も検証は行い、`sink` へは `None` を渡す）。
+///
+/// 走査は論理列（`schema.columns`）ではなく物理配置
+/// （[`TableSchema::physical_slots`]）に沿って行う（TABLE-19・Issue #901）。
+/// 削除済み列（墓標）は行バイト列上の位置を占有し続けるため、後続の生存列を
+/// 正しくデコードするには墓標の型に応じたバイト数を読み飛ばす必要がある一方、
+/// 墓標自体は論理列を持たないため `sink` には `col_index = None` で渡され、
+/// 呼び出し元は出力へ積まない（構造検証のみ行い読み捨てる）。
 fn scan_scalar_columns_validated<'a>(
     schema: &TableSchema,
     buf: &'a [u8],
     mask: Option<&[bool]>,
-    mut sink: impl FnMut(usize, Option<ScalarRef<'a>>) -> Result<()>,
+    mut sink: impl FnMut(Option<usize>, Option<ScalarRef<'a>>) -> Result<()>,
 ) -> Result<()> {
     if let Some(m) = mask {
         if m.len() != schema.columns.len() {
@@ -2815,12 +2902,20 @@ fn scan_scalar_columns_validated<'a>(
         }
     }
     let mut offset = 0usize;
-    for (col_index, column) in schema.columns.iter().enumerate() {
+    for slot in schema.physical_slots() {
+        let (col_index, column): (Option<usize>, ScalarSlotView<'_>) = match slot {
+            crate::catalog::PhysicalSlot::Live(logical_index, c) => {
+                (Some(logical_index), ScalarSlotView::from(c))
+            }
+            crate::catalog::PhysicalSlot::Dropped(d) => (None, ScalarSlotView::from(d)),
+        };
         if matches!(column.ty, ColumnType::Vector(_)) {
             sink(col_index, None)?;
             continue;
         }
-        let wanted = mask.map(|m| m[col_index]).unwrap_or(true);
+        let wanted = col_index
+            .map(|i| mask.map(|m| m[i]).unwrap_or(true))
+            .unwrap_or(false);
         let presence = match buf.get(offset) {
             Some(&b) => b,
             None => {
@@ -2849,7 +2944,7 @@ fn scan_scalar_columns_validated<'a>(
                 }
                 sink(col_index, None)?;
             }
-            PRESENCE_VALUE => match &column.ty {
+            PRESENCE_VALUE => match column.ty {
                 ColumnType::Real => {
                     let bytes = buf
                         .get(
@@ -3063,7 +3158,7 @@ fn scan_scalar_columns_validated<'a>(
                     let text = std::str::from_utf8(text_bytes).map_err(|_| {
                         RowCodecError::Invalid("text field is not valid UTF-8".to_string())
                     })?;
-                    if let ColumnType::Enum(def) = &column.ty {
+                    if let ColumnType::Enum(def) = column.ty {
                         if !def.contains(text) {
                             return Err(RowCodecError::Invalid(format!(
                                 "enum value {text:?} is not a valid label of type {:?}",
