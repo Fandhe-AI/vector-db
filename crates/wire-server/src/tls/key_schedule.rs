@@ -14,7 +14,8 @@
 //! 担当）:
 //! - PSK・0-RTT（`early_secret` は `new_without_psk` のみを提供する）
 //! - セッション再開（`exp master`／`res master` は導出しない）
-//! - transcript hash の蓄積・Finished の verify_data 計算/検証（#964）
+//! - transcript hash の蓄積・Finished の verify_data 計算/検証
+//!   （[`super::transcript`]・[`super::finished`]。Issue #964）
 //! - レコード保護（nonce・シーケンス番号。#959）
 //! - alert の実送出・ハンドシェイク状態機械への結線（#965・#966 以降）
 
@@ -161,7 +162,8 @@ impl TrafficSecret {
     }
 
     /// `finished_key = Expand-Label(secret, "finished", "", Hash.length)`
-    /// （RFC 8446 §4.4.4）。verify_data の計算・検証自体は #964 の担当。
+    /// （RFC 8446 §4.4.4）。verify_data の計算・検証自体は
+    /// [`super::finished`]（Issue #964）の担当。
     pub fn finished_key(&self) -> Result<Secret32, HkdfError> {
         let mut out = [0u8; HASH_LEN];
         hkdf_expand_label(self.0.as_bytes(), b"finished", b"", &mut out)?;

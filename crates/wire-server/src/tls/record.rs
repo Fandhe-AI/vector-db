@@ -183,6 +183,10 @@ pub enum AlertDescription {
     /// 必須拡張（`signature_algorithms` 等）が欠落している（RFC 8446
     /// §9.2。判定は `client_hello::negotiate` が担う）。
     MissingExtension,
+    /// Finished.verify_data の不一致（RFC 8446 §4.4.4 の実装注記どおり、
+    /// TLS 1.3 では bad_record_mac ではなく decrypt_error を用いる。
+    /// 判定は `super::finished::verify_client_finished` が担う。Issue #964）。
+    DecryptError,
 }
 
 impl AlertDescription {
@@ -197,6 +201,7 @@ impl AlertDescription {
             AlertDescription::IllegalParameter => 47,
             AlertDescription::ProtocolVersion => 70,
             AlertDescription::MissingExtension => 109,
+            AlertDescription::DecryptError => 51,
         }
     }
 }
