@@ -974,8 +974,13 @@ fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
             "view definition value has trailing bytes".to_string(),
         ));
     }
-    let body_sql = parts.pop().expect("2 parts were pushed above");
-    let base_relation = parts.pop().expect("2 parts were pushed above");
+    // `parts` はループで必ず 2 要素を push 済みだが、`expect` による panic 経路を
+    // 作らず（coding-rust.md: engine ライブラリコードで panic させない）
+    // スライスパターンで直接分解する。要素数不一致は構造的に到達不能なため
+    // `CorruptSchema` 経由の防御的フォールバックとして扱う。
+    let [base_relation, body_sql] = <[String; 2]>::try_from(parts).map_err(|_| {
+        CatalogError::Invalid("view definition value has unexpected part count".to_string())
+    })?;
     Ok(ViewDef {
         base_relation,
         body_sql,
