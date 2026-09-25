@@ -3873,6 +3873,10 @@ impl EngineCore {
                     crate::row_codec::Value::Vector(v) => {
                         v.len().saturating_mul(std::mem::size_of::<f32>())
                     }
+                    // REAL/DOUBLE は固定長ペイロード（row_codec の
+                    // SCALAR_REAL_ENTRY_LEN/SCALAR_DOUBLE_ENTRY_LEN と同じ本体幅）。
+                    crate::row_codec::Value::Real(_) => std::mem::size_of::<f32>(),
+                    crate::row_codec::Value::Double(_) => std::mem::size_of::<f64>(),
                     // BOOLEAN 値は行コーデック上 1 バイト固定（Issue #883・D-a）。
                     crate::row_codec::Value::Bool(_) => 1,
                     // DATE／TIMESTAMP 値は行コーデック上それぞれ 4／8 バイト固定

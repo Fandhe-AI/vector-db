@@ -822,9 +822,11 @@ pub(crate) fn execute_statement_with_cache(
         // メント参照）。
         if is_hybrid && !skip_sparse_accumulation {
             if let Some(idx) = text_column_index {
-                if let Some(Some(t)) = scanned
+                if let Some(t) = scanned
                     .get(idx)
-                    .map(|v| v.as_ref().and_then(|v| v.as_text()))
+                    .copied()
+                    .flatten()
+                    .and_then(|v| v.as_text())
                 {
                     if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
                         return Err(ArenaError::CapacityExceeded);
@@ -892,6 +894,10 @@ pub(crate) fn execute_statement_with_cache(
                         )?;
                         kept.push(Value::Text(owned));
                     }
+                    // REAL/DOUBLE は固定長のためヒープ確保・バイト予算計上を
+                    // 要しない（`Value::Real`/`Value::Double` はスタック上の値）。
+                    Some(row_codec::ScalarRef::Real(v)) => kept.push(Value::Real(v)),
+                    Some(row_codec::ScalarRef::Double(v)) => kept.push(Value::Double(v)),
                     Some(row_codec::ScalarRef::Enum(label)) => {
                         let owned = try_alloc_text_for_budget(
                             label,
@@ -1915,6 +1921,8 @@ pub(crate) fn execute_statement_with_cache(
                 .iter()
                 .map(|v| match v {
                     Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
+                    Value::Real(r) => Some(row_codec::ScalarRef::Real(*r)),
+                    Value::Double(d) => Some(row_codec::ScalarRef::Double(*d)),
                     Value::Enum(label) => Some(row_codec::ScalarRef::Enum(label.as_str())),
                     Value::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
                     Value::Bytes(b) => Some(row_codec::ScalarRef::Bytes(b.as_slice())),
@@ -2256,6 +2264,8 @@ fn decode_deferred_scalars(
                     })?;
                 out.push(Value::Text(owned));
             }
+            Some(row_codec::ScalarRef::Real(v)) => out.push(Value::Real(v)),
+            Some(row_codec::ScalarRef::Double(v)) => out.push(Value::Double(v)),
             Some(row_codec::ScalarRef::Enum(label)) => {
                 let owned = try_alloc_text_for_budget(label, budget, MAX_CANDIDATE_SCALAR_BYTES)
                     .map_err(|_| {
@@ -2523,6 +2533,8 @@ fn project_rows(
                             Some(Value::Text(t)) => cells.push(Cell::Text(try_clone_text(t)?)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
                             | Some(Value::Timestamp(_))
@@ -2537,6 +2549,28 @@ fn project_rows(
                                 })
                             }
                         },
+                        // F8（Issue #882 計画）: REAL は f64 への無損失拡大、DOUBLE
+                        // はそのまま `Cell::Float` へ投影する（`Cell` enum への
+                        // variant 追加は #882 計画で見送り、既存の Float 経路を
+                        // 共有する設計判断）。
+                        ColumnType::Real => match decoded.get(*index) {
+                            Some(Value::Real(v)) => cells.push(Cell::Float(f64::from(*v))),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            _ => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Double => match decoded.get(*index) {
+                            Some(Value::Double(v)) => cells.push(Cell::Float(*v)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            _ => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
                         // ENUM 列の投影は既存の `Cell::Text` に写像する（Issue #890
                         // D7。表示形式が TEXT と同一のため wire 側の追加変更を
                         // 抑えられる。`RETURNING`／NoSQL 応答も同じ写像を共有する）。
@@ -2546,6 +2580,8 @@ fn project_rows(
                             }
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
                             | Some(Value::Timestamp(_))
@@ -2564,6 +2600,8 @@ fn project_rows(
                             Some(Value::Bool(b)) => cells.push(Cell::Bool(*b)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Date(_))
                             | Some(Value::Timestamp(_))
@@ -2582,6 +2620,8 @@ fn project_rows(
                             Some(Value::Date(d)) => cells.push(Cell::Date(*d)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Timestamp(_))
@@ -2600,6 +2640,8 @@ fn project_rows(
                             Some(Value::Timestamp(t)) => cells.push(Cell::Timestamp(*t)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2620,6 +2662,8 @@ fn project_rows(
                             }
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2648,6 +2692,8 @@ fn project_rows(
                             }
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2666,6 +2712,8 @@ fn project_rows(
                             Some(Value::Json(t)) => cells.push(Cell::Json(try_clone_text(t)?)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2684,6 +2732,8 @@ fn project_rows(
                             Some(Value::Numeric(d)) => cells.push(Cell::Numeric(*d)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))
@@ -2702,6 +2752,8 @@ fn project_rows(
                             Some(Value::Uuid(u)) => cells.push(Cell::Uuid(*u)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
                             | Some(Value::Text(_))
                             | Some(Value::Bool(_))
                             | Some(Value::Date(_))

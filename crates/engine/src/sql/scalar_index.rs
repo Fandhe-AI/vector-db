@@ -557,8 +557,11 @@ impl ScalarIndex {
                 // （TABLE-14・Issue #888）・`BYTEA` 列（Issue #886）・
                 // `JSON`／`JSONB` 列（TABLE-14・Issue #889。拡張は Issue #893 へ
                 // 申し送り）もいずれも等価・前方一致述語を持たないため同じく
-                // 非索引化。
+                // 非索引化。REAL/DOUBLE 列の索引化は #893 の担当
+                // （F10・Issue #882 計画）。
                 ColumnType::Vector(_)
+                | ColumnType::Real
+                | ColumnType::Double
                 | ColumnType::Boolean
                 | ColumnType::Date
                 | ColumnType::Timestamp
@@ -593,9 +596,10 @@ impl ScalarIndex {
                     continue;
                 }
                 // 索引対象列は常に `TEXT`／`ENUM`（上記の列単位除外により
-                // `BOOLEAN`／`VECTOR`／`BYTEA` は `per_column[col_index] == None`
-                // のまま到達しない）。`as_dictionary_text` で両者を同じ辞書
-                // 表現として扱う（Issue #890 D3）。
+                // `BOOLEAN`／`VECTOR`／`REAL`／`DOUBLE`／`BYTEA` は
+                // `per_column[col_index] == None` のまま到達しない）。
+                // `as_dictionary_text` で両者を同じ辞書表現として扱う
+                // （Issue #890 D3）。
                 let Some(v) = v.as_dictionary_text() else {
                     continue;
                 };
