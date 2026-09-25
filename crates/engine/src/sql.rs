@@ -125,6 +125,7 @@
 pub mod aggregate;
 pub mod allowlist;
 pub(crate) mod arena_cache;
+pub(crate) mod check_constraint;
 pub mod copy;
 pub mod ddl;
 pub(crate) mod ddl_column_type;

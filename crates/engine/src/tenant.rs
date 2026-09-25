@@ -343,6 +343,17 @@ pub enum TenantWriteError {
     /// テナント名・テーブル名を含まない固定文言（security.md P0「エラー・ログ
     /// 経由で他テナントのデータ・存在情報を漏らさない」）。
     UniqueViolation,
+    /// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が宣言する述語を、書き込もうと
+    /// した行の値が満たさない。`constraint` は制約名のみ（行の値・id・テナントは
+    /// 含めない。security.md P0）。一意性制約と同じ単一の検査点
+    /// （`constraint::enforce_row_constraints_in_txn`）が、台帳照合・行の書き込みの
+    /// **後**・テーブル世代 bump／commit の**前**に返す（`write_txn` は commit
+    /// されないため、行・台帳とも痕跡が残らない）。
+    CheckViolation { constraint: String },
+    /// `CHECK` 制約の述語評価自体が失敗した（`vec_div` の 0 除算等、値依存で
+    /// 発生しうる）。違反（`CheckViolation`）に丸めず `XX000`（内部事象）として
+    /// 書き込みを拒否する（fail-closed。値・詳細はクライアントへ渡さない）。
+    CheckEvaluationFailed,
     /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
     /// トランザクションの取得（[`Storage::begin_write_txn`]）がロック待ちの上限を
     /// 超過した（`55P03`）。`Storage(StorageError::WriteLockTimeout)` へ一般化せず
@@ -454,6 +465,8 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
             TenantWriteError::TooManyRowsScanned => ErrorClass::PayloadTooLarge,
             TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
+            TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
+            TenantWriteError::CheckEvaluationFailed => ErrorClass::InternalError,
             TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
         }
     }
@@ -502,6 +515,14 @@ impl std::fmt::Display for TenantWriteError {
                 write!(f, "too many rows scanned: limit={MAX_SCANNED_ROWS}")
             }
             TenantWriteError::UniqueViolation => write!(f, "unique constraint violation"),
+            // 制約名のみを含む固定文言（行の値・id・テナントは含めない。
+            // security.md P0）。
+            TenantWriteError::CheckViolation { constraint } => {
+                write!(f, "new row violates check constraint {constraint:?}")
+            }
+            TenantWriteError::CheckEvaluationFailed => {
+                write!(f, "check constraint evaluation failed")
+            }
             TenantWriteError::WriteLockTimeout => {
                 write!(f, "write lock not available: timed out waiting for writer")
             }
@@ -537,6 +558,8 @@ impl std::fmt::Debug for TenantWriteError {
             }
             TenantWriteError::TooManyRowsScanned => f.write_str("TooManyRowsScanned"),
             TenantWriteError::UniqueViolation => f.write_str("UniqueViolation"),
+            TenantWriteError::CheckViolation { .. } => f.write_str("CheckViolation(<redacted>)"),
+            TenantWriteError::CheckEvaluationFailed => f.write_str("CheckEvaluationFailed"),
             TenantWriteError::WriteLockTimeout => f.write_str("WriteLockTimeout"),
         }
     }
@@ -730,13 +753,14 @@ pub(crate) fn insert_row_unchecked(
         // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
         let key = (ctx.tenant_id(), id);
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
-        // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約は、
+        // `CHECK` 制約（Issue #906）と `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905）の
+        // テナント内一意性制約（いずれも TABLE-16・TASK-204）は、
         // 台帳照合（上記 `ledger::record_in_txn`）と行の書き込み（`insert_unique_row`）が
         // 済んだ後・テーブル世代 bump／commit の前に検査する（RECOVER-12。判定順序の
         // 詳細は `constraint.rs` モジュールドキュメント参照）。検査前に `row_table`
         // ハンドルを drop し、同一 `write_txn` 内で読み取り専用の検査を行う。
         drop(row_table);
-        crate::constraint::enforce_unique_keys_in_txn(
+        crate::constraint::enforce_row_constraints_in_txn(
             write_txn,
             table,
             &schema,
@@ -923,7 +947,7 @@ pub(crate) fn insert_rows_unchecked(
         // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
         // ドキュメント参照）。
         let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
-        crate::constraint::enforce_unique_keys_in_txn(
+        crate::constraint::enforce_row_constraints_in_txn(
             write_txn,
             table,
             &schema,
@@ -1091,7 +1115,7 @@ pub(crate) fn insert_typed_row_unchecked(
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
         // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
         // ドキュメント参照）。
-        crate::constraint::enforce_unique_keys_in_txn(
+        crate::constraint::enforce_row_constraints_in_txn(
             write_txn,
             table,
             &schema,
@@ -1264,7 +1288,7 @@ pub(crate) fn insert_typed_rows_unchecked(
     {
         let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
         let schema_for_pk = require_table_schema_write(&write_txn, table)?;
-        crate::constraint::enforce_unique_keys_in_txn(
+        crate::constraint::enforce_row_constraints_in_txn(
             &write_txn,
             table,
             &schema_for_pk,
@@ -1667,7 +1691,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
         // 切って再オープンする）。
         if !written_ids.is_empty() {
             drop(row_table);
-            crate::constraint::enforce_unique_keys_in_txn(
+            crate::constraint::enforce_row_constraints_in_txn(
                 &write_txn,
                 table,
                 &schema,
@@ -1784,7 +1808,7 @@ pub(crate) fn update_row_unchecked(
     // ドキュメント参照）。
     {
         let schema_for_pk = require_table_schema_write(&write_txn, table)?;
-        crate::constraint::enforce_unique_keys_in_txn(
+        crate::constraint::enforce_row_constraints_in_txn(
             &write_txn,
             table,
             &schema_for_pk,
@@ -2555,7 +2579,7 @@ pub(crate) fn update_row_columns_unchecked(
         // 明示的に drop してから読み取りハンドルとして再度開く）。
         if rows_affected > 0 {
             drop(row_table);
-            crate::constraint::enforce_unique_keys_in_txn(
+            crate::constraint::enforce_row_constraints_in_txn(
                 &write_txn,
                 table,
                 &schema,
@@ -3349,7 +3373,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
     // 一致行が 0 件（何も書き込んでいない）場合は呼ばない（`constraint.rs`
     // モジュールドキュメント参照）。
     if !candidate_ids.is_empty() {
-        crate::constraint::enforce_unique_keys_in_txn(
+        crate::constraint::enforce_row_constraints_in_txn(
             &write_txn,
             table,
             &schema,
@@ -3727,7 +3751,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 .filter_map(|offset| first_id.checked_add(offset))
                 .collect();
             let schema_for_pk = require_table_schema_write(&write_txn, table)?;
-            crate::constraint::enforce_unique_keys_in_txn(
+            crate::constraint::enforce_row_constraints_in_txn(
                 &write_txn,
                 table,
                 &schema_for_pk,

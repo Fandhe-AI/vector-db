@@ -141,6 +141,31 @@ const CATALOG_FORMAT_VERSION_V5: &str = "v5";
 /// 排他な正規形）。
 const CATALOG_FORMAT_VERSION_V6: &str = "v6";
 
+/// カタログ v7（TABLE-16・TASK-204、Issue #906）: `CHECK` 制約
+/// （[`CheckConstraint`]）を 1 つ以上持つスキーマ専用のフォーマット。v6 の
+/// 上位集合で、`cols:` 行の直後に `pk:` 行（主キー宣言が無ければ空）を必ず
+/// 1 行持ち、列行は 6 フィールド（`name:tag:param:nullable:state:default`）で
+/// 書く。列行の直後に `uniq:<n>` 行（v7 に限り `n == 0` を許容する）と `n` 個の
+/// `U:` 行、続けて `checks:<m>` 行（`m >= 1`）と `m` 個の
+/// `check:<name>:<col1,col2,...>:<hex(predicate_sql)>` 行を追記する。`CHECK` 制約を
+/// 1 つでも持つスキーマは（主キー・`DEFAULT`・UNIQUE・墓標の有無に関わらず）
+/// 必ず v7 で書き、持たないスキーマは従来どおり v2〜v6 のままバイト列を変えない
+/// （v2〜v7 は互いに排他な正規形）。
+const CATALOG_FORMAT_VERSION_V7: &str = "v7";
+
+/// 1 テーブルが持てる `CHECK` 制約数の上限（TABLE-16・TASK-204、Issue #906。
+/// 実装既定値）。デコード時、この値を超える宣言件数はアロケーション前に拒否する
+/// （.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
+pub(crate) const MAX_CHECK_CONSTRAINTS_PER_TABLE: usize = 32;
+
+/// `CHECK` 制約 1 件あたりの正規化済み述語テキストのバイト長上限（実装既定値）。
+/// 個々の制約の評価コストを書き込み経路で有界にするための上限（式ノード数・
+/// 深さは `sql::udf_call::MAX_EXPR_NODES`／`MAX_EXPR_DEPTH` を別途適用する）。
+pub(crate) const MAX_CHECK_PREDICATE_SQL_LEN: usize = 4096;
+
+/// `CHECK` 制約 1 件が参照する列名の件数上限（実装既定値）。
+pub(crate) const MAX_CHECK_REFERENCED_COLUMNS: usize = 32;
+
 /// 1 テーブルが宣言できる UNIQUE 制約数の上限（TABLE-16・TASK-204、
 /// Issue #905）。本リポの実装既定値。デコード時、この値を超える宣言数は
 /// アロケーション前に拒否する（.claude/rules/coding-rust.md「untrusted 入力の
@@ -1659,6 +1684,22 @@ impl UniqueConstraint {
     }
 }
 
+/// `CHECK` 制約 1 件分（TABLE-16・TASK-204、Issue #906）。catalog 層は SQL を
+/// 解釈しない（`predicate_sql` は `sql::check_constraint` が正規化レンダリングした
+/// テキストであり、本モジュールは中身を解釈せず不透明な文字列として持ち回す）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckConstraint {
+    /// 制約名（識別子として妥当。同一テーブル内で一意）。
+    pub(crate) name: String,
+    /// 述語が参照するテーブル列名（疑似列 `id` は含めない）。
+    /// [`Storage::alter_table_drop_column`]／`alter_table_widen_numeric_precision`
+    /// の依存検査が使う（参照列は変更・削除しない。fail-closed）。
+    pub(crate) columns: Vec<String>,
+    /// `sql::check_constraint::render_predicates` が正規化レンダリングした
+    /// SQL 述語テキスト（AND 連結の `WHERE` 述語文法）。
+    pub(crate) predicate_sql: String,
+}
+
 /// テーブル定義。列の宣言順を保持する（`ALTER TABLE ADD COLUMN` は末尾追記のみを
 /// 許可する。TABLE-5）。`columns` は常に**論理列（生存列のみ）**を宣言順で持つ。
 /// `SELECT *`・投影・`WHERE` 解決・`RowDescription` など、行の物理配置を
@@ -1691,6 +1732,11 @@ pub struct TableSchema {
     /// UNIQUE 制約（TABLE-16・TASK-204、Issue #905）。空が既定（カタログ
     /// v2〜v5 のバイト列不変）。1 件以上持つスキーマは v6 で永続化される。
     unique_constraints: Vec<UniqueConstraint>,
+    /// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）。空が既定（カタログ
+    /// v2〜v6 のバイト列不変）。1 件以上持つスキーマは v7 で永続化される。
+    /// SQL DDL（`sql::ddl::execute_create_table`）以外から任意の述語テキストを
+    /// 差し込めないよう [`TableSchema::with_checks`] は `pub(crate)` に留める。
+    checks: Vec<CheckConstraint>,
 }
 
 impl TableSchema {
@@ -1701,6 +1747,7 @@ impl TableSchema {
             dropped: Vec::new(),
             primary_key: None,
             unique_constraints: Vec::new(),
+            checks: Vec::new(),
         }
     }
 
@@ -1721,7 +1768,22 @@ impl TableSchema {
             dropped,
             primary_key,
             unique_constraints,
+            checks: Vec::new(),
         }
+    }
+
+    /// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）を設定したコピーを返す
+    /// ビルダー。`sql::ddl::execute_create_table`（`CREATE TABLE` の検証結果）・
+    /// [`decode_schema_body`]（v7 カタログ値の復元）が使う。バリデーションは
+    /// 行わない（[`encode_schema`] 内の [`validate_schema`] が別途通す）。
+    pub(crate) fn with_checks(mut self, checks: Vec<CheckConstraint>) -> Self {
+        self.checks = checks;
+        self
+    }
+
+    /// 宣言済みの `CHECK` 制約一覧（宣言順。TABLE-16・TASK-204、Issue #906）。
+    pub(crate) fn checks(&self) -> &[CheckConstraint] {
+        &self.checks
     }
 
     /// `PRIMARY KEY` 宣言列名（宣言順）。未宣言（`id` 暗黙主キー）は `None`
@@ -2062,6 +2124,55 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
         validate_primary_key(schema, pk_cols)?;
     }
     validate_unique_constraints(schema)?;
+    validate_check_constraints(schema)?;
+    Ok(())
+}
+
+/// `CHECK` 制約（[`CheckConstraint`]。TABLE-16・TASK-204、Issue #906）の不変条件
+/// 検査: 件数上限・制約名の識別子妥当性・一意性、参照列名の識別子妥当性・
+/// 生存列内での存在、述語テキストの長さ上限。述語の構文的妥当性
+/// （`WherePredicate` としてのパース可能性・型検査）は catalog 層の管轄外
+/// （`sql::check_constraint` が DDL 時・書き込み時の双方で担う）。
+fn validate_check_constraints(schema: &TableSchema) -> Result<()> {
+    if schema.checks.len() > MAX_CHECK_CONSTRAINTS_PER_TABLE {
+        return Err(CatalogError::Invalid(format!(
+            "too many CHECK constraints: {}",
+            schema.checks.len()
+        )));
+    }
+    let mut seen_names: Vec<&str> = Vec::with_capacity(schema.checks.len());
+    for check in &schema.checks {
+        validate_identifier(&check.name)?;
+        if seen_names.contains(&check.name.as_str()) {
+            return Err(CatalogError::Invalid(format!(
+                "duplicate CHECK constraint name: {}",
+                check.name
+            )));
+        }
+        seen_names.push(check.name.as_str());
+        if check.predicate_sql.is_empty() || check.predicate_sql.len() > MAX_CHECK_PREDICATE_SQL_LEN
+        {
+            return Err(CatalogError::Invalid(format!(
+                "CHECK constraint {:?} predicate is empty or exceeds {} bytes",
+                check.name, MAX_CHECK_PREDICATE_SQL_LEN
+            )));
+        }
+        if check.columns.len() > MAX_CHECK_REFERENCED_COLUMNS {
+            return Err(CatalogError::Invalid(format!(
+                "CHECK constraint {:?} references too many columns",
+                check.name
+            )));
+        }
+        for column_name in &check.columns {
+            validate_identifier(column_name)?;
+            if !schema.columns.iter().any(|c| &c.name == column_name) {
+                return Err(CatalogError::Invalid(format!(
+                    "CHECK constraint {:?} references unknown column {:?}",
+                    check.name, column_name
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2249,13 +2360,132 @@ fn encode_column_line_v5(
     ))
 }
 
+/// `schema` のいずれかの `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が列
+/// `column_name` を参照しているか（`ALTER TABLE` の依存オブジェクト検査用）。
+fn schema_check_references_column(schema: &TableSchema, column_name: &str) -> bool {
+    schema
+        .checks
+        .iter()
+        .any(|c| c.columns.iter().any(|col| col == column_name))
+}
+
+/// `CHECK` 制約セクション（`checks:<N>` 行 + N 行の
+/// `check:<name>:<col1,col2,...>:<hex(predicate_sql)>`）を `out` へ追記する
+/// （[`encode_schema`] の v7 分岐が呼ぶ。TABLE-16・TASK-204、Issue #906）。
+/// 述語テキストはカタログの `:`／改行区切りと衝突しないよう小文字 16 進で
+/// 符号化する（`DEFAULT` の `x` 形式と同じ [`hex_encode_byte`] を共有）。
+/// 名前・列名は `validate_identifier`（[`validate_schema`] 経由で検証済み）に
+/// より `:`／`,`／改行を含み得ない。
+fn encode_check_section(out: &mut String, checks: &[CheckConstraint]) -> Result<()> {
+    out.push_str(&format!("checks:{}\n", checks.len()));
+    for check in checks {
+        validate_identifier(&check.name)?;
+        for column_name in &check.columns {
+            validate_identifier(column_name)?;
+        }
+        out.push_str("check:");
+        out.push_str(&check.name);
+        out.push(':');
+        out.push_str(&check.columns.join(","));
+        out.push(':');
+        for byte in check.predicate_sql.as_bytes() {
+            out.push_str(&hex_encode_byte(*byte));
+        }
+        out.push('\n');
+    }
+    Ok(())
+}
+
+/// カタログ v7 の `CHECK` 制約セクション（[`encode_check_section`] の逆変換）を
+/// 構造検証しつつ読み取る共有パーサー。[`decode_schema_body`] と軽量パーサー
+/// [`catalog_value_references_enum_type`] の両方が使う（[`parse_unique_section`]
+/// と同じく、両者の fail-closed 判定を 1 か所に揃える）。
+///
+/// 検証順序: `checks:` 行の存在・件数の数値形式・`1..=MAX_CHECK_CONSTRAINTS_PER_TABLE`
+/// （0 件は「`CHECK` を持たないスキーマは v2〜v6 で書く」形式の一意性契約に
+/// 反する）→ 各行の `check:` 接頭辞・フィールド数 → 識別子形状 → 参照列数上限
+/// （`Vec` へ積む前）→ hex → 長さ上限 → UTF-8。参照列の実在・制約名の一意性は
+/// 呼び出し元の [`validate_schema`] が判定する。確保は宣言件数（上限検査済み）の
+/// 範囲に限る。エラーは呼び出し元が自身の分類へ包む文言のみを返す。
+fn parse_check_section<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+) -> std::result::Result<Vec<CheckConstraint>, String> {
+    let checks_line = lines
+        .next()
+        .ok_or_else(|| "catalog value truncated: missing checks line".to_string())?;
+    let count_str = checks_line
+        .strip_prefix("checks:")
+        .ok_or_else(|| format!("malformed checks line: {checks_line:?}"))?;
+    let count: usize = count_str
+        .parse()
+        .map_err(|_| format!("malformed check constraint count: {count_str:?}"))?;
+    if count == 0 {
+        return Err("v7 catalog format requires at least one CHECK constraint".to_string());
+    }
+    if count > MAX_CHECK_CONSTRAINTS_PER_TABLE {
+        return Err(format!("too many CHECK constraints: {count}"));
+    }
+    let mut checks = Vec::with_capacity(count);
+    for _ in 0..count {
+        let line = lines
+            .next()
+            .ok_or_else(|| "catalog value truncated: missing check line".to_string())?;
+        let body = line
+            .strip_prefix("check:")
+            .ok_or_else(|| format!("malformed check line: {line:?}"))?;
+        let mut fields = body.split(':');
+        let (Some(name), Some(columns_field), Some(hex_predicate), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(format!("malformed check line: {line:?}"));
+        };
+        validate_identifier(name).map_err(|_| format!("malformed check line: {line:?}"))?;
+        let mut columns: Vec<String> = Vec::new();
+        if !columns_field.is_empty() {
+            for (i, column_name) in columns_field.split(',').enumerate() {
+                if i >= MAX_CHECK_REFERENCED_COLUMNS {
+                    return Err(format!(
+                        "CHECK constraint {name:?} references too many columns"
+                    ));
+                }
+                validate_identifier(column_name)
+                    .map_err(|_| format!("malformed check line: {line:?}"))?;
+                columns.push(column_name.to_string());
+            }
+        }
+        if hex_predicate.len() > MAX_CHECK_PREDICATE_SQL_LEN.saturating_mul(2) {
+            return Err(format!(
+                "CHECK constraint {name:?} predicate exceeds {MAX_CHECK_PREDICATE_SQL_LEN} bytes"
+            ));
+        }
+        let predicate_bytes = hex_decode(hex_predicate)
+            .map_err(|_| format!("CHECK constraint {name:?} predicate is not valid hex"))?;
+        let predicate_sql = String::from_utf8(predicate_bytes)
+            .map_err(|_| format!("CHECK constraint {name:?} predicate is not valid UTF-8"))?;
+        // 空述語は encode 側が生成しない（`validate_check_constraints` と同じ
+        // 不変条件）。`DROP TYPE` の依存判定が decode より緩くならないよう、
+        // 共有パーサーで先に拒否する。
+        if predicate_sql.is_empty() {
+            return Err(format!("CHECK constraint {name:?} predicate is empty"));
+        }
+        checks.push(CheckConstraint {
+            name: name.to_string(),
+            columns,
+            predicate_sql,
+        });
+    }
+    Ok(checks)
+}
+
 /// [`TableSchema`] をカタログのテキスト形式へエンコードする。1 行目に
 /// フォーマットバージョン、2 行目に列数、以降 1 行 1 列（`name:type:dim:nullable`
 /// の 4 フィールドを `:` 区切り。識別子は `validate_identifier` により `:` を
 /// 含み得ないため、区切り文字との衝突は起きない）。エンコード時にも
 /// `validate_schema` を通し、不正なスキーマを永続化しない（fail-closed）。
 ///
-/// バージョン選択: UNIQUE 制約を 1 つでも持つスキーマは（`PRIMARY KEY`・
+/// バージョン選択: `CHECK` 制約を 1 つでも持つスキーマは（他の宣言の有無を
+/// 問わず）v7 で書く（TABLE-16・TASK-204、Issue #906）。それ以外で
+/// UNIQUE 制約を 1 つでも持つスキーマは（`PRIMARY KEY`・
 /// `DEFAULT`・墓標の有無を問わず）v6 で書く（TABLE-16・TASK-204、Issue #905）。
 /// それ以外で `DEFAULT` を 1 つでも持つスキーマは（`PRIMARY KEY`・墓標の
 /// 有無を問わず）v5 で書く（TABLE-16・TASK-204、Issue #904）。`DEFAULT` を
@@ -2267,8 +2497,9 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     validate_schema(schema)?;
     let has_default = schema.columns.iter().any(|c| c.default.is_some());
     let has_unique = !schema.unique_constraints.is_empty();
+    let has_check = !schema.checks.is_empty();
     let mut out = String::new();
-    if has_default || has_unique {
+    if has_default || has_unique || has_check {
         // UNIQUE 制約を持つスキーマは v6、それ以外で `DEFAULT` を持つスキーマは
         // v5 で書く（`PRIMARY KEY` の有無に関わらず）。v6 は v5 と同じ本体
         // （`pk:` 行・6 フィールドの列行）の後ろに `uniq:` セクションを追記
@@ -2277,7 +2508,12 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         // なし」と解釈する。v4 の `pk:` 行は非空必須のまま変えない）。
         // 識別子は `validate_identifier`（`validate_schema` が経由済み）により
         // `,` を含み得ないため、`,` 区切りとの衝突は起きない。
-        out.push_str(if has_unique {
+        // `CHECK` 制約を持つスキーマは v7（TABLE-16・TASK-204、Issue #906）。
+        // v7 は v6 と同じ本体・`uniq:` セクション（0 件可）の後ろに `checks:`
+        // セクションを追記するだけの上位集合。
+        out.push_str(if has_check {
+            CATALOG_FORMAT_VERSION_V7
+        } else if has_unique {
             CATALOG_FORMAT_VERSION_V6
         } else {
             CATALOG_FORMAT_VERSION_V5
@@ -2316,7 +2552,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
                 }
             }
         }
-        if has_unique {
+        if has_unique || has_check {
             // 識別子は `validate_identifier`（列名は `validate_schema` 経由で
             // 生存列名と一致することを検証済み）により `,`／`:`／改行を含み
             // 得ないため、カンマ区切りで連結しても区切り文字と衝突しない。
@@ -2326,6 +2562,9 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
                 out.push_str(&constraint.columns().join(","));
                 out.push('\n');
             }
+        }
+        if has_check {
+            encode_check_section(&mut out, &schema.checks)?;
         }
     } else if let Some(pk_cols) = &schema.primary_key {
         // 主キーを宣言したが DEFAULT は持たないスキーマは（墓標の有無に
@@ -2490,6 +2729,7 @@ fn decode_schema_body(
         V4,
         V5,
         V6,
+        V7,
     }
     let format_version = match version_line {
         CATALOG_FORMAT_VERSION_LINE => FormatVersion::V2,
@@ -2497,6 +2737,7 @@ fn decode_schema_body(
         CATALOG_FORMAT_VERSION_V4 => FormatVersion::V4,
         CATALOG_FORMAT_VERSION_V5 => FormatVersion::V5,
         CATALOG_FORMAT_VERSION_V6 => FormatVersion::V6,
+        CATALOG_FORMAT_VERSION_V7 => FormatVersion::V7,
         other => {
             return Err(CatalogError::Invalid(format!(
                 "unknown catalog format version: {other:?}"
@@ -2504,13 +2745,18 @@ fn decode_schema_body(
         }
     };
     let has_state_field = format_version != FormatVersion::V2;
-    let has_default_field =
-        format_version == FormatVersion::V5 || format_version == FormatVersion::V6;
+    // v7（TABLE-16・TASK-204、Issue #906）は v6 の上位集合（`pk:` 行・6 フィールド
+    // 列行・`uniq:` セクション〔0 件可〕の後ろに `checks:` セクション）。
+    let has_default_field = matches!(
+        format_version,
+        FormatVersion::V5 | FormatVersion::V6 | FormatVersion::V7
+    );
     // `pk:` 行を持つのは v4／v5／v6（v4 は非空必須、v5／v6 は空を「主キー
     // なし」として許容する）。
-    let has_pk_line = format_version == FormatVersion::V4
-        || format_version == FormatVersion::V5
-        || format_version == FormatVersion::V6;
+    let has_pk_line = matches!(
+        format_version,
+        FormatVersion::V4 | FormatVersion::V5 | FormatVersion::V6 | FormatVersion::V7
+    );
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::Invalid("catalog value truncated: missing cols line".to_string())
@@ -2726,12 +2972,24 @@ fn decode_schema_body(
     // （件数・`U:` 行・識別子形状・制約内重複・同一列リスト重複）は共有
     // パーサー [`parse_unique_section`] が検証し、参照列の実在・型適格性は
     // 後続の `validate_schema`（[`validate_unique_constraints`]）が担う。
-    let unique_constraints: Vec<UniqueConstraint> = if format_version == FormatVersion::V6 {
-        parse_unique_section(&mut lines)
-            .map_err(CatalogError::Invalid)?
-            .into_iter()
-            .map(UniqueConstraint::new)
-            .collect()
+    // v7 も同じ `uniq:` セクションを持つが、UNIQUE 制約 0 件を許容する（v7 の
+    // 選択材料は `CHECK` の有無であり UNIQUE の有無とは独立なため。TABLE-16・
+    // TASK-204、Issue #906）。
+    let unique_constraints: Vec<UniqueConstraint> = match format_version {
+        FormatVersion::V6 | FormatVersion::V7 => {
+            parse_unique_section(&mut lines, format_version == FormatVersion::V7)
+                .map_err(CatalogError::Invalid)?
+                .into_iter()
+                .map(UniqueConstraint::new)
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    // v7 専用の `checks:` セクション（TABLE-16・TASK-204、Issue #906）。構造は
+    // 共有パーサー [`parse_check_section`] が検証し、参照列の実在・制約名の
+    // 一意性は後続の `validate_schema` が担う。
+    let checks: Vec<CheckConstraint> = if format_version == FormatVersion::V7 {
+        parse_check_section(&mut lines).map_err(CatalogError::Invalid)?
     } else {
         Vec::new()
     };
@@ -2755,7 +3013,8 @@ fn decode_schema_body(
         dropped,
         primary_key,
         unique_constraints,
-    );
+    )
+    .with_checks(checks);
     // デコード結果を再度検証する（列数上限・列名重複・識別子・墓標の不変条件）。
     // 手書きの不正データがフィールドごとの検証をすり抜けても、スキーマ全体の
     // 不変条件はここで担保する。
@@ -2772,13 +3031,16 @@ fn decode_schema_body(
 ///
 /// 検証項目: `uniq:` 行の存在・件数の数値形式・`1..=MAX_UNIQUE_CONSTRAINTS`
 /// （0 件は「UNIQUE 制約を持たないスキーマは v2〜v5 で書く」形式の一意性
-/// 契約に反する）・各 `U:` 行の接頭辞・空要素なし・要素数
+/// 契約に反する。ただし v7〔`CHECK` を持つスキーマ。Issue #906〕は UNIQUE の
+/// 有無と独立に選ばれるため、呼び出し元が `allow_empty = true` を渡して
+/// `0..=MAX_UNIQUE_CONSTRAINTS` を許容する）・各 `U:` 行の接頭辞・空要素なし・要素数
 /// `MAX_UNIQUE_CONSTRAINT_COLUMNS` 以下（`Vec` へ積む前に判定）・識別子形状・
 /// 制約内の列名重複なし・同一列リストの制約重複なし。参照列の実在・型適格性は
 /// 呼び出し元が判定する（列行の集合が必要なため）。エラーは呼び出し元が自身の
 /// 分類（`Invalid`／`CorruptSchema`）へ包む文言のみを返す。
 fn parse_unique_section<'a>(
     lines: &mut impl Iterator<Item = &'a str>,
+    allow_empty: bool,
 ) -> std::result::Result<Vec<Vec<String>>, String> {
     let uniq_line = lines
         .next()
@@ -2789,7 +3051,9 @@ fn parse_unique_section<'a>(
     let count: usize = count_str
         .parse()
         .map_err(|_| format!("malformed unique constraint count: {count_str:?}"))?;
-    if count == 0 {
+    // `allow_empty` は v7（`CHECK` を持つスキーマ。UNIQUE の有無とは独立）のみ
+    // `true`。v6 の 0 件は形式の一意性契約違反として拒否する。
+    if count == 0 && !allow_empty {
         return Err("v6 catalog format requires at least one unique constraint".to_string());
     }
     if count > MAX_UNIQUE_CONSTRAINTS {
@@ -3314,7 +3578,9 @@ impl Storage {
             // 同じ分類へ揃える）。
             //
             // UNIQUE 制約（TABLE-16・TASK-204、Issue #905）が参照する列も同様に
-            // 暗黙 cascade で制約ごと消さず、明示的に拒否する。
+            // 暗黙 cascade で制約ごと消さず、明示的に拒否する。`CHECK` 制約
+            // （TABLE-16・TASK-204、Issue #906）が参照する列も同じく拒否する
+            // （制約を黙って弱める・無効化する経路を作らない。fail-closed）。
             if schema
                 .primary_key
                 .as_ref()
@@ -3323,6 +3589,7 @@ impl Storage {
                     .unique_constraints
                     .iter()
                     .any(|u| u.columns().iter().any(|c| c == column_name))
+                || schema_check_references_column(&schema, column_name)
             {
                 return Err(CatalogError::DependentObjectsStillExist(
                     column_name.to_string(),
@@ -3448,6 +3715,14 @@ impl Storage {
             };
             let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
             let mut schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
+            // `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が参照する列の型変更は
+            // 安全側で拒否する（`alter_table_drop_column` と同じ判断。述語の
+            // 意味を黙って変えない）。
+            if schema_check_references_column(&schema, column_name) {
+                return Err(CatalogError::DependentObjectsStillExist(
+                    column_name.to_string(),
+                ));
+            }
             let column = schema
                 .columns
                 .iter_mut()
@@ -4184,6 +4459,9 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         // v6（TABLE-16・TASK-204、Issue #905）は v5 と同じ列行の後ろに
         // `uniq:` セクションを持つ（下記で検証する）。
         CATALOG_FORMAT_VERSION_V6 => (true, true),
+        // v7（TABLE-16・TASK-204、Issue #906）は v6 の上位集合で、`uniq:`
+        // セクション（0 件可）の後ろに `checks:` セクションを持つ。
+        CATALOG_FORMAT_VERSION_V7 => (true, true),
         other => {
             return Err(CatalogError::CorruptSchema(format!(
                 "unknown catalog format version: {other:?}"
@@ -4193,7 +4471,8 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     let is_v4 = version_line == CATALOG_FORMAT_VERSION_V4;
     let is_v5 = version_line == CATALOG_FORMAT_VERSION_V5;
     let is_v6 = version_line == CATALOG_FORMAT_VERSION_V6;
-    let has_pk_line = is_v4 || is_v5 || is_v6;
+    let is_v7 = version_line == CATALOG_FORMAT_VERSION_V7;
+    let has_pk_line = is_v4 || is_v5 || is_v6 || is_v7;
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
@@ -4364,8 +4643,18 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     // 構造を検証し（行数だけを読み飛ばすと、壊れた `uniq:` セクションを持つ
     // カタログが本関数だけ「依存なし」に丸められる）、参照列の実在は列行を
     // 読み終えた後に `pk:` 行と同じ手順で検証する。
-    let unique_constraints: Vec<Vec<String>> = if is_v6 {
-        parse_unique_section(&mut lines).map_err(CatalogError::CorruptSchema)?
+    let unique_constraints: Vec<Vec<String>> = if is_v6 || is_v7 {
+        parse_unique_section(&mut lines, is_v7).map_err(CatalogError::CorruptSchema)?
+    } else {
+        Vec::new()
+    };
+    // v7 の `checks:` セクション（TABLE-16・TASK-204、Issue #906）。`CHECK` 述語は
+    // 既存列の参照のみで ENUM 型への新たな依存を作らないが、行数だけを読み
+    // 飛ばすと壊れたセクションを持つカタログが本関数だけ「依存なし」に丸め
+    // られるため、`decode_schema_body` と同じ共有パーサーで構造を検証し、
+    // 参照列の実在・制約名の一意性も下で検証する。
+    let checks: Vec<CheckConstraint> = if is_v7 {
+        parse_check_section(&mut lines).map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
     };
@@ -4426,6 +4715,25 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
             if !seen_names.contains(name.as_str()) {
                 return Err(CatalogError::CorruptSchema(format!(
                     "unique constraint references unknown column: {name:?}"
+                )));
+            }
+        }
+    }
+
+    // `CHECK` 制約の参照整合性・制約名の一意性（`validate_check_constraints` と
+    // 同じ契約。TABLE-16・TASK-204、Issue #906）。
+    let mut check_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for check in &checks {
+        if !check_names.insert(check.name.as_str()) {
+            return Err(CatalogError::CorruptSchema(format!(
+                "duplicate CHECK constraint name: {:?}",
+                check.name
+            )));
+        }
+        for name in &check.columns {
+            if !seen_names.contains(name.as_str()) {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "CHECK constraint references unknown column: {name:?}"
                 )));
             }
         }
@@ -6742,5 +7050,191 @@ mod tests {
             storage.view_definition("v").expect("view lookup").is_none(),
             "invalid view definition must not be persisted"
         );
+    }
+
+    // --- CHECK 制約・カタログ v7（TABLE-16・TASK-204、Issue #906） ---------
+
+    fn check(name: &str, columns: &[&str], predicate_sql: &str) -> CheckConstraint {
+        CheckConstraint {
+            name: name.to_string(),
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            predicate_sql: predicate_sql.to_string(),
+        }
+    }
+
+    /// `CHECK` 制約を持たないスキーマは v2〜v6 のバイト列を変えない（`checks`
+    /// フィールド追加による既存形式の変化が無いことの固定）。
+    #[test]
+    fn encode_schema_without_checks_keeps_existing_formats() {
+        let plain = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Text, true),
+            ],
+        );
+        assert_eq!(
+            encode_schema(&plain).expect("encode"),
+            b"v2\ncols:2\nembedding:vector:3:0\nbody:text:-:1\n".to_vec()
+        );
+        let unique = plain
+            .clone()
+            .with_unique_constraints(vec![UniqueConstraint::new(vec!["body".to_string()])]);
+        assert!(encode_schema(&unique).expect("encode").starts_with(b"v6\n"));
+    }
+
+    /// `CHECK` を 1 つ以上持つスキーマは v7 で書かれ、往復でビット同一のスキーマへ
+    /// 戻る（UNIQUE 0 件・主キーあり・`DEFAULT`・墓標の各組み合わせ）。
+    #[test]
+    fn encode_decode_roundtrips_v7_with_check_constraints() {
+        let base = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("kind", ColumnType::Text, true),
+                ColumnDef::new("status", ColumnType::Text, false),
+            ],
+        )
+        .with_checks(vec![
+            check("docs_kind_check", &["kind"], "kind = 'a'"),
+            check(
+                "multi",
+                &["kind", "status"],
+                "kind = 'a:b' AND status LIKE 'x%'",
+            ),
+            check("docs_check", &[], "vec_norm(embedding) < 100"),
+        ]);
+        let encoded = encode_schema(&base).expect("encode");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        assert!(text.starts_with("v7\ncols:3\npk:\n"), "{text}");
+        assert!(
+            text.contains("\nuniq:0\nchecks:3\ncheck:docs_kind_check:kind:"),
+            "{text}"
+        );
+        assert_eq!(decode_schema("docs", &encoded).expect("decode"), base);
+
+        let with_pk_unique = base
+            .clone()
+            .with_primary_key(vec!["status".to_string()])
+            .with_unique_constraints(vec![UniqueConstraint::new(vec!["kind".to_string()])]);
+        let encoded = encode_schema(&with_pk_unique).expect("encode");
+        assert!(encoded.starts_with(b"v7\ncols:3\npk:status\n"));
+        assert_eq!(
+            decode_schema("docs", &encoded).expect("decode"),
+            with_pk_unique
+        );
+
+        let with_dropped = TableSchema::from_parts(
+            "docs",
+            vec![ColumnDef::new("kind", ColumnType::Text, true)
+                .with_default(ColumnDefault::Text("a".to_string()))],
+            vec![DroppedSlot {
+                physical_index: 0,
+                name: "old".to_string(),
+                ty: ColumnType::Text,
+            }],
+            None,
+            Vec::new(),
+        )
+        .with_checks(vec![check("k", &["kind"], "kind = 'a'")]);
+        let encoded = encode_schema(&with_dropped).expect("encode");
+        assert_eq!(
+            decode_schema("docs", &encoded).expect("decode"),
+            with_dropped
+        );
+    }
+
+    /// v7 の破損入力（`checks:0`・件数不足・不正 hex・未知参照列・制約名重複・
+    /// 余剰行・`checks:` 行欠落）を fail-closed に拒否する。`DROP TYPE` の依存判定
+    /// （`catalog_value_references_enum_type`）も同じ値を「依存なし」に丸めない。
+    #[test]
+    fn decode_v7_rejects_corrupt_check_section() {
+        let head = "v7\ncols:2\npk:\nmood_col:enum:mood:1:L:-\nkind:text:-:1:L:-\nuniq:0\n";
+        let hex = |s: &str| -> String { s.bytes().map(hex_encode_byte).collect() };
+        let pred = hex("kind = 'a'");
+        let valid = format!("{head}checks:1\ncheck:c1:kind:{pred}\n");
+        assert!(catalog_value_references_enum_type(valid.as_bytes(), "mood").expect("valid v7"));
+        let corrupt_values = [
+            format!("{head}checks:0\n"),
+            format!("{head}checks:1\n"),
+            head.to_string(),
+            format!("{head}checks:1\ncheck:c1:kind:abc\n"),
+            format!("{head}checks:1\ncheck:c1:kind:zz\n"),
+            format!("{head}checks:1\ncheck:c1:missing:{pred}\n"),
+            format!("{head}checks:2\ncheck:c1:kind:{pred}\ncheck:c1:kind:{pred}\n"),
+            format!("{head}checks:1\ncheck:c1:kind:{pred}\nsurplus\n"),
+            format!("{head}checks:1\ncheck:c1:kind:{pred}:extra\n"),
+            format!("{head}checks:1\nchk:c1:kind:{pred}\n"),
+            format!("{head}checks:1\ncheck:c1:kind:\n"),
+            format!("{head}checks:33\n"),
+        ];
+        for corrupt in &corrupt_values {
+            let resolve = &mut |name: &str| -> Result<Arc<EnumTypeDef>> {
+                Ok(Arc::new(EnumTypeDef {
+                    name: name.to_string(),
+                    labels: vec!["x".to_string()],
+                }))
+            };
+            assert!(
+                matches!(
+                    decode_schema_with_resolver("docs", corrupt.as_bytes(), resolve),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "decode must reject {corrupt:?}"
+            );
+        }
+        // `DROP TYPE` 側の軽量パーサーも同じ破損値をすべて拒否する（decode より
+        // 緩くならない）。
+        for corrupt in &corrupt_values {
+            assert!(
+                matches!(
+                    catalog_value_references_enum_type(corrupt.as_bytes(), "mood"),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "enum dependency parser must reject {corrupt:?}"
+            );
+        }
+    }
+
+    /// `CHECK` が参照する列の `DROP COLUMN`・型変更は `DependentObjectsStillExist`
+    /// で拒否し、参照しない列の削除は従来どおり成功する（制約を黙って弱めない）。
+    #[test]
+    fn alter_table_rejects_changes_to_check_referenced_columns() {
+        let path = unique_db_path("check-dependent-column");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("kind", ColumnType::Text, true),
+                ColumnDef::new("body", ColumnType::Text, true),
+                ColumnDef::new(
+                    "amount",
+                    ColumnType::Numeric {
+                        precision: 5,
+                        scale: 2,
+                    },
+                    true,
+                ),
+            ],
+        )
+        .with_checks(vec![
+            check("kind_ck", &["kind"], "kind = 'a'"),
+            check("amount_ck", &["amount"], "amount = 'x'"),
+        ]);
+        storage.create_table(&schema).expect("create table");
+        let err = storage
+            .alter_table_drop_column("docs", "kind")
+            .expect_err("dropping a CHECK-referenced column must be rejected");
+        assert!(matches!(err, CatalogError::DependentObjectsStillExist(name) if name == "kind"));
+        let err = storage
+            .alter_table_widen_numeric_precision("docs", "amount", 9)
+            .expect_err("changing a CHECK-referenced column type must be rejected");
+        assert!(matches!(err, CatalogError::DependentObjectsStillExist(name) if name == "amount"));
+        storage
+            .alter_table_drop_column("docs", "body")
+            .expect("dropping an unreferenced column must succeed");
+        let reloaded = storage.get_table_schema("docs").expect("schema");
+        assert_eq!(reloaded.checks().len(), 2);
     }
 }

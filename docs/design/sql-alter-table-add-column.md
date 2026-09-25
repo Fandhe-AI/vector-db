@@ -23,6 +23,8 @@ ALTER TABLE <table> ADD COLUMN <column> <type>
   `CREATE TABLE`（Issue #899）の列定義と同じく構造検証段階で `42601` 拒否する
   （`sql::parser` が疑似列・RLS 内部列として扱う名前を DDL で隠蔽させない）。
   カタログを参照しない判定のため、権限ゲートより前に置いても存在オラクルにならない。
+  `check`／`constraint` も `CREATE TABLE`（Issue #906。`CHECK` 制約構文との曖昧さ
+  排除）と揃えて予約列名として拒否する。
 - `IF NOT EXISTS`・複数 `ADD`・`DROP COLUMN`・`ALTER COLUMN TYPE`・`RETURNING`・
   `USING OPERATION_ID` の併用はいずれも許可リスト外（`42601`）。DDL（テーブル定義の
   変更）であり `operation_id` 台帳（TASK-93）の対象外のため、`TRUNCATE`・`INSERT` と

@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
 
 define_error_classes! {
-    count = 28;
+    count = 29;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -228,6 +228,11 @@ define_error_classes! {
     /// ラベルによる区別を認める）。
     /// [`crate::sql::allowlist::SqlSurfaceError::NotNullViolation`] の写像。
     NotNullViolation => ("23502", "NOT_NULL_VIOLATION"),
+    /// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が宣言する述語を、書き込み
+    /// しようとした行の値が満たさない（`23514`）。
+    /// [`crate::tenant::TenantWriteError::CheckViolation`]・
+    /// [`crate::sql::allowlist::SqlSurfaceError::CheckViolation`] の写像。
+    CheckViolation => ("23514", "CHECK_VIOLATION"),
 }
 
 impl ErrorClass {

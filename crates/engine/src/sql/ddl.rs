@@ -96,6 +96,14 @@ pub(crate) fn execute_create_table(
     if !validated.unique_constraints.is_empty() {
         schema = schema.with_unique_constraints(validated.unique_constraints.clone());
     }
+    // `CHECK` 制約（TABLE-16・TASK-204、Issue #906）。意味論検証（列の存在・型・
+    // 禁止要素・正規化の往復一致）は列定義だけを持つスキーマに対して行う（他の
+    // `CHECK` を参照する `CHECK` は許可しない）。カタログを参照しないため、
+    // テーブル名の既存衝突（`42P07`）より先に判定しても存在オラクルにならない。
+    if !validated.checks.is_empty() {
+        let checks = crate::sql::check_constraint::validate_and_build(&schema, &validated.checks)?;
+        schema = schema.with_checks(checks);
+    }
     storage.create_table(&schema).map_err(|e| match e {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
         CatalogError::Invalid(detail) => {
@@ -492,6 +500,7 @@ mod tests {
             )],
             primary_key: None,
             unique_constraints: Vec::new(),
+            checks: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("create table");
         storage
@@ -591,6 +600,7 @@ mod tests {
             ],
             primary_key: None,
             unique_constraints: Vec::new(),
+            checks: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("create table must succeed");
         let schema = storage.get_table_schema("docs").expect("schema must exist");
@@ -609,6 +619,7 @@ mod tests {
             )],
             primary_key: None,
             unique_constraints: Vec::new(),
+            checks: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("first create must succeed");
         let err = execute_create_table(&storage, &validated)
@@ -628,6 +639,7 @@ mod tests {
             ],
             primary_key: None,
             unique_constraints: Vec::new(),
+            checks: Vec::new(),
         };
         let err = execute_create_table(&storage, &validated)
             .expect_err("two VECTOR columns must be rejected");
