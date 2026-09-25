@@ -230,7 +230,17 @@ fn begin_insert_rollback_over_extended_protocol_discards_the_row() {
 /// では「書き込みが起きなかった」のか「破棄された」のかを区別できないため）。
 fn visible_rows_with_id(core: &EngineCore, id: u64) -> usize {
     let mut session = engine::sql::mode::SessionState::default();
-    let ctx = engine::policy::PolicyContext::new("tenant-a").expect("valid tenant id");
+    // wire 経由の INSERT は `Private` 行になりうるため、`Public` のみの
+    // `PolicyContext::new` では常に 0 件になり判定が空振りする。認証済み
+    // セッションと同じく両方の可視性を持つ文脈で数える。
+    let ctx = engine::policy::PolicyContext::with_visibilities(
+        "tenant-a",
+        [
+            engine::storage::Visibility::Public,
+            engine::storage::Visibility::Private,
+        ],
+    )
+    .expect("valid tenant id");
     let outcome = core
         .execute_sql_in_session(
             &ctx,
@@ -358,4 +368,67 @@ fn copy_while_transaction_failed_is_rejected_with_in_failed_sql_transaction() {
     assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
     read_ready_for_query(&mut stream);
     assert_eq!(visible_rows_with_id(&core, 33), 0);
+}
+
+/// 期限切れ後は SQL を伴わない要求（Sync）でも書き込みトランザクションが
+/// abort されライタが解放されること。解放されていなければ別接続の autocommit
+/// `INSERT` は書き込みゲートの待機上限で `55P03` になる。元の接続の `COMMIT` には
+/// 上限超過の `54000` が返る（PR #1041 レビュー指摘）。
+#[test]
+fn expired_transaction_releases_writer_on_next_protocol_message() {
+    let path = temp_db::unique_db_path("wire942-expired-transaction");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path)
+        .expect("open storage")
+        .with_write_lock_wait(std::time::Duration::from_millis(300));
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let max_duration = std::time::Duration::from_millis(200);
+    let core = Arc::new(
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_transaction_limits(
+            engine::sql::transaction::TransactionLimits {
+                max_duration,
+                max_statements: 1_000,
+            },
+        ),
+    );
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 34, "op-942-34");
+    std::thread::sleep(max_duration * 2);
+
+    // SQL を伴わない要求（Sync）だけを送る。
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
+
+    // 別接続の autocommit INSERT がライタを取得できる。
+    let mut other = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    send_simple_query(&mut other, &insert_sql(35, "op-942-35"));
+    assert_eq!(read_command_complete(&mut other), "INSERT 0 1");
+    read_ready_for_query(&mut other);
+
+    send_simple_query(&mut stream, "COMMIT");
+    expect_error_response_with_sqlstate(&mut stream, "54000");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+
+    assert_eq!(visible_rows_with_id(&core, 34), 0);
+    assert_eq!(visible_rows_with_id(&core, 35), 1);
+    // 別接続で書いた id=35 は同じ接続から読み戻せる（read-your-writes）。
+    send_simple_query(&mut other, "SELECT id FROM documents WHERE id = 35 LIMIT 1");
+    let _columns = read_row_description(&mut other);
+    assert_eq!(read_data_row(&mut other), vec![Some("35".to_string())]);
+    let _tag = read_command_complete(&mut other);
+    read_ready_for_query(&mut other);
 }

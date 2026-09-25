@@ -470,6 +470,16 @@ fn post_auth_loop<'e>(
             None => return Ok(()),
         };
 
+        // SQL-31・TASK-221（PR #1041 レビュー指摘）: 明示トランザクションの持続時間
+        // 上限を、要求の種類（Sync・Flush 等 SQL を伴わない要求を含む）を問わず
+        // 受信のたびに検査する。期限を過ぎていれば共有書き込みトランザクションを
+        // abort してライタを解放し `Failed` へ遷移させる（最初の文／`COMMIT` には
+        // `54000` が返る）。無通信の間は `limits::READ_TIMEOUT` による切断で
+        // `SessionTransaction` が drop されライタが解放される。
+        if let Some(txn) = txn.as_mut() {
+            txn.release_if_expired();
+        }
+
         // WIRE-11 確定化（Issue #934）: 拡張クエリプロトコルのエラー後は
         // Sync（'S'）まで後続メッセージを破棄する「同期回復」モードに入る
         // （`extended_query` モジュールドキュメント「エラー後の同期回復」節）。
@@ -590,7 +600,7 @@ fn post_auth_loop<'e>(
                                     continue;
                                 }
                                 engine::sql::transaction::TransactionStatus::Failed => {
-                                    let err = engine::sql::allowlist::SqlSurfaceError::InFailedSqlTransaction;
+                                    let err = txn.take_failed_error();
                                     write_error_response_io(
                                         stream,
                                         err.error_class(),
