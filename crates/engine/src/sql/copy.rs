@@ -741,10 +741,11 @@ impl CopyInSession {
                 && column.default.is_none()
                 && !columns.iter().any(|c| c == &column.name)
             {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "missing value for non-nullable column: {}",
-                    column.name
-                )));
+                // `bind_copy_record`（`fill_omitted_columns` 経由）・INSERT・行内
+                // `\N` 処理と同じ NOT NULL 違反として `23502` へ統一する
+                // （PR #1051 codex-review 指摘。列リストでの事前検出とデコード時
+                // 検出とでエラー契約が経路依存で揺れないようにする）。
+                return Err(SqlSurfaceError::not_null_violation(column.name.clone()));
             }
         }
         Ok(())
