@@ -1,0 +1,741 @@
+//! X.509 最小パース・`Certificate` メッセージ組み立て（`tls::x509`。
+//! TASK-228・WIRE-9・HTTP-10 ポインタ。Issue #963・親 #941）の公開 API
+//! だけを使う結合テスト。単体テスト（`tls::x509::tests`）の内部関数照合
+//! （時刻パース・SPKI 照合の個別関数）とは別に、外部から見える契約
+//! （DER 列 → 検査済みチェーン → `Certificate` メッセージ）が RFC 8410 の
+//! 公開ベクタと一致すること、および fail-closed な拒否・ファイル入出力
+//! エラーの分類を固定する。
+
+use std::io::Write;
+use std::path::PathBuf;
+
+use wire_server::tls::handshake::Certificate as HandshakeCertificate;
+use wire_server::tls::pem;
+use wire_server::tls::x509::{
+    self, CertificateChainError, ServerCertificateChain, ServerCertificateLoadError, X509Error,
+};
+
+fn unique_temp_path(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "tls-x509-e2e-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ))
+}
+
+struct TempFile {
+    path: PathBuf,
+}
+
+impl TempFile {
+    fn write(label: &str, contents: &[u8]) -> Self {
+        let path = unique_temp_path(label);
+        let mut file = std::fs::File::create(&path).expect("create temp file");
+        file.write_all(contents).expect("write temp file");
+        TempFile { path }
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+// RFC 8410 §10.2 の X25519 自己発行証明書（PEM。66 文字幅の改行はそのまま
+// RFC 原文どおり）。notBefore=2016-08-01T12:19:24Z(1470053964)・
+// notAfter=2040-12-31T23:59:59Z(2240611199)。SPKI アルゴリズムは X25519
+// であり Ed25519 ではないため、葉に置くと拒否される想定のフィクスチャ。
+const RFC8410_10_2_X25519_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBLDCB36ADAgECAghWAUdKKo3DMDAFBgMrZXAwGTEXMBUGA1UEAwwOSUVURiBUZX\nN0IERlbW8wHhcNMTYwODAxMTIxOTI0WhcNNDAxMjMxMjM1OTU5WjAZMRcwFQYDVQQD\nDA5JRVRGIFRlc3QgRGVtbzAqMAUGAytlbgMhAIUg8AmJMKdUdIt93LQ+91oNvzoNJj\nga9OukqY6qm05qo0UwQzAPBgNVHRMBAf8EBTADAQEAMA4GA1UdDwEBAAQEAwIDCDAg\nBgNVHQ4BAQAEFgQUmx9e7e0EM4Xk97xiPFl1uQvIuzswBQYDK2VwA0EAryMB/t3J5v\n/BzKc9dNZIpDmAgs3babFOTQbs+BolzlDUwsPrdGxO3YNGhW7Ibz3OGhhlxXrCe1Cg\nw1AH9efZBw==\n-----END CERTIFICATE-----\n";
+
+// RFC 8410 §10.1 の Ed25519 公開鍵（SPKI の BIT STRING 部・32 バイト）。
+// `19bf4409...` は同 RFC §10.3 の秘密鍵 seed に対応する公開鍵でもある
+// （#961 着地後の end-to-end 検証にも使える定数）。
+const RFC8410_10_1_ED25519_PUBLIC_KEY: [u8; 32] = [
+    0x19, 0xbf, 0x44, 0x09, 0x69, 0x84, 0xcd, 0xfe, 0x85, 0x41, 0xba, 0xc1, 0x67, 0xdc, 0x3b, 0x96,
+    0xc8, 0x50, 0x86, 0xaa, 0x30, 0xb6, 0xb6, 0xcb, 0x0c, 0x5c, 0x38, 0xad, 0x70, 0x31, 0x66, 0xe1,
+];
+
+// RFC 8032 §7.1 TEST 1 の Ed25519 公開鍵（不一致の対照値としてのみ使う）。
+const RFC8032_TEST1_ED25519_PUBLIC_KEY: [u8; 32] = [
+    0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+    0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+];
+
+/// テスト専用の最小 DER エンコーダ（本番コードには持たない。
+/// `tls::pkcs8` の結合テストと同方針）。definite・long-form（2 バイトまで
+/// 十分な範囲で）のみ生成する。
+fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let len = body.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else if len < 0x100 {
+        out.push(0x81);
+        out.push(len as u8);
+    } else {
+        out.push(0x82);
+        out.push((len >> 8) as u8);
+        out.push((len & 0xff) as u8);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+fn sequence(parts: &[&[u8]]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for part in parts {
+        body.extend_from_slice(part);
+    }
+    tlv(0x30, &body)
+}
+
+const OID_ED25519_BYTES: [u8; 3] = [0x2b, 0x65, 0x70];
+
+fn ed25519_algorithm_identifier() -> Vec<u8> {
+    sequence(&[&tlv(0x06, &OID_ED25519_BYTES)])
+}
+
+fn utc_time(text: &str) -> Vec<u8> {
+    tlv(0x17, text.as_bytes())
+}
+
+fn empty_name() -> Vec<u8> {
+    // RDNSequence ::= SEQUENCE OF RelativeDistinguishedName（0 個も許容）。
+    sequence(&[])
+}
+
+/// テスト専用: `version [0] EXPLICIT INTEGER 2` を組み立てる。
+fn version_v3() -> Vec<u8> {
+    tlv(0xa0, &tlv(0x02, &[0x02]))
+}
+
+/// テスト専用: Ed25519 葉証明書の DER を手組みする。`not_before`／
+/// `not_after` は UTCTime 文字列（`YYMMDDHHMMSSZ`）で指定する。署名は
+/// 検証対象外（受入基準・スコープ外）のため全 0 の 64 バイトで埋める。
+fn build_ed25519_leaf_certificate_der(
+    public_key: &[u8; 32],
+    not_before: &str,
+    not_after: &str,
+) -> Vec<u8> {
+    let signature_algorithm = ed25519_algorithm_identifier();
+
+    let mut spki_bits = vec![0x00u8]; // unused bits = 0
+    spki_bits.extend_from_slice(public_key);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+
+    let validity = sequence(&[&utc_time(not_before), &utc_time(not_after)]);
+
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]), // serialNumber = 1
+        &signature_algorithm,
+        &empty_name(), // issuer
+        &validity,
+        &empty_name(), // subject
+        &spki,
+    ]);
+
+    let mut signature_bits = vec![0x00u8]; // unused bits = 0
+    signature_bits.extend_from_slice(&[0u8; 64]);
+
+    sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ])
+}
+
+fn pem_wrap_certificate(der: &[u8]) -> String {
+    // RFC 8410 §10.2 と同じ 66 文字幅で改行する（PEM lax デコーダの
+    // 「行長は強制しない」契約自体は既に固定済みのため、ここでは
+    // 単に「デコード可能な PEM」を作れれば十分）。
+    let encoded = pem_base64(der);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in encoded.as_bytes().chunks(66) {
+        out.push_str(std::str::from_utf8(chunk).expect("ascii base64"));
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
+}
+
+/// テスト専用の標準 base64 エンコーダ（本番の定数時間デコーダとは独立に、
+/// フィクスチャ組み立てのためだけに使う）。
+fn pem_base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
+        out.push(ALPHABET[(n >> 18 & 0x3f) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn decode_rfc8410_10_2_der() -> Vec<u8> {
+    pem::decode_certificate_chain_pem(RFC8410_10_2_X25519_CERT_PEM.as_bytes())
+        .expect("valid PEM certificate chain")
+        .into_iter()
+        .next()
+        .expect("exactly one certificate block")
+}
+
+// notBefore/notAfter の範囲内（RFC 8410 §10.2 の証明書自身の validity と
+// 重なる時刻）。
+const NOW_WITHIN_RFC8410_10_2_VALIDITY: i64 = 1_600_000_000; // 2020-09-13 頃
+
+#[test]
+fn leaf_with_x25519_spki_is_rejected_as_unsupported_algorithm() {
+    let der = decode_rfc8410_10_2_der();
+    let expected = [0u8; 32];
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &expected,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert!(matches!(error, X509Error::UnsupportedPublicKeyAlgorithm(_)));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn handmade_ed25519_leaf_is_accepted_with_matching_public_key() {
+    let der = build_ed25519_leaf_certificate_der(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+    );
+    let chain = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .expect("Ed25519 leaf with matching public key must be accepted");
+    assert_eq!(chain.leaf_public_key(), &RFC8410_10_1_ED25519_PUBLIC_KEY);
+}
+
+#[test]
+fn chain_of_ed25519_leaf_and_x25519_intermediate_preserves_order_in_certificate_message() {
+    let leaf_der = build_ed25519_leaf_certificate_der(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+    );
+    let intermediate_der = decode_rfc8410_10_2_der();
+
+    let chain = ServerCertificateChain::from_der_chain(
+        vec![leaf_der.clone(), intermediate_der.clone()],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .expect("leaf Ed25519 + intermediate X25519-signed-by-Ed25519 chain must be accepted");
+
+    let message = chain.certificate_message();
+    assert_eq!(message.certificate_request_context, Vec::<u8>::new());
+    assert_eq!(message.certificate_list.len(), 2);
+    assert_eq!(message.certificate_list[0].cert_data, leaf_der);
+    assert_eq!(message.certificate_list[1].cert_data, intermediate_der);
+    assert!(message.certificate_list[0].extensions.is_empty());
+    assert!(message.certificate_list[1].extensions.is_empty());
+
+    // Certificate::encode_into → Certificate::parse の往復がビット一致
+    // すること（RFC 8446 §4.4.2 のコーデック契約。Issue #953）。
+    let mut encoded = Vec::new();
+    message.encode_into(&mut encoded).expect("encode succeeds");
+    // encode_into はハンドシェイクヘッダ（type + u24 長さ）を含むため、
+    // 本体一致の確認は serialize_body_into 側で行う。
+    let mut body = Vec::new();
+    message
+        .serialize_body_into(&mut body)
+        .expect("serialize_body_into succeeds");
+    let round_tripped = HandshakeCertificate::parse(&body).expect("parse succeeds");
+    assert_eq!(round_tripped, message);
+}
+
+#[test]
+fn public_key_mismatch_is_rejected() {
+    let der = build_ed25519_leaf_certificate_der(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+    );
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8032_TEST1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::PublicKeyMismatch);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn public_key_mismatch_with_single_bit_flip_is_rejected() {
+    let mut flipped = RFC8410_10_1_ED25519_PUBLIC_KEY;
+    flipped[0] ^= 0x01;
+    let der = build_ed25519_leaf_certificate_der(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+    );
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &flipped,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::PublicKeyMismatch);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn intermediate_not_yet_valid_and_expired_are_rejected_at_index_1() {
+    // 葉証明書の validity は 1950〜2049 年（UTCTime の範囲）をカバーし、
+    // 注入した now がどちらの境界でも葉自身は常に有効になるようにする
+    // （葉の判定が先に発生して中間証明書の判定を隠さないようにするため）。
+    let leaf_der = build_ed25519_leaf_certificate_der(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "500101000000Z",
+        "491231235959Z",
+    );
+    let intermediate_der = decode_rfc8410_10_2_der();
+
+    // 中間証明書の notBefore（2016-08-01T12:19:24Z）より前。
+    let before_not_before = 1_000_000_000i64; // 2001-09-09 頃
+    let err = ServerCertificateChain::from_der_chain(
+        vec![leaf_der.clone(), intermediate_der.clone()],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        before_not_before,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 1, error } => {
+            assert_eq!(error, X509Error::NotYetValid);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    // 中間証明書の notAfter（2040-12-31T23:59:59Z）より後。
+    let after_not_after = 2_300_000_000i64; // 2042-11-22 頃
+    let err = ServerCertificateChain::from_der_chain(
+        vec![leaf_der, intermediate_der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        after_not_after,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 1, error } => {
+            assert_eq!(error, X509Error::Expired);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn empty_chain_is_rejected() {
+    let err = ServerCertificateChain::from_der_chain(vec![], &[0u8; 32], 0).unwrap_err();
+    assert_eq!(err, CertificateChainError::EmptyChain);
+}
+
+#[test]
+fn chain_longer_than_limit_is_rejected() {
+    let leaf_der = build_ed25519_leaf_certificate_der(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+    );
+    let intermediate_der = decode_rfc8410_10_2_der();
+    let mut chain = vec![leaf_der];
+    for _ in 0..pem::MAX_CERTIFICATE_CHAIN_LEN {
+        chain.push(intermediate_der.clone());
+    }
+    assert_eq!(chain.len(), pem::MAX_CERTIFICATE_CHAIN_LEN + 1);
+    let err = ServerCertificateChain::from_der_chain(
+        chain,
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CertificateChainError::ChainTooLong {
+            max: pem::MAX_CERTIFICATE_CHAIN_LEN
+        }
+    );
+}
+
+#[test]
+fn truncated_certificate_is_rejected_without_panicking() {
+    let der = decode_rfc8410_10_2_der();
+    let truncated = &der[..der.len() - 10];
+    let err = ServerCertificateChain::from_der_chain(vec![truncated.to_vec()], &[0u8; 32], 0)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        CertificateChainError::Certificate { index: 0, .. }
+    ));
+}
+
+#[test]
+fn certificate_with_trailing_byte_is_rejected() {
+    let mut der = decode_rfc8410_10_2_der();
+    der.push(0x00);
+    let err = ServerCertificateChain::from_der_chain(vec![der], &[0u8; 32], 0).unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::Malformed);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn pkcs8_der_passed_as_certificate_is_rejected_without_panicking() {
+    // RFC 8410 §10.3 の PKCS#8 DER（証明書としては構造がまったく異なる）。
+    let pkcs8_der: Vec<u8> = vec![
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20, 0xd4, 0xee, 0x72, 0xdb, 0xf9, 0x13, 0x58, 0x4a, 0xd5, 0xb6, 0xd8, 0xf1, 0xf7, 0x69,
+        0xf8, 0xad, 0x3a, 0xfe, 0x7c, 0x28, 0xcb, 0xf1, 0xd4, 0xfb, 0xe0, 0x97, 0xa8, 0x8f, 0x44,
+        0x75, 0x58, 0x42,
+    ];
+    let err = ServerCertificateChain::from_der_chain(vec![pkcs8_der], &[0u8; 32], 0).unwrap_err();
+    assert!(matches!(
+        err,
+        CertificateChainError::Certificate { index: 0, .. }
+    ));
+}
+
+#[test]
+fn version_v1_without_explicit_tag_is_rejected() {
+    // version フィールドを省略した v1 相当（tbsCertificate の残りは
+    // 有効な Ed25519 葉と同じ構成）。
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        // version を省略（v1）。
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::UnsupportedVersion);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn version_v2_integer_1_is_rejected() {
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let version_v2 = tlv(0xa0, &tlv(0x02, &[0x01]));
+    let tbs_certificate = sequence(&[
+        &version_v2,
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::UnsupportedVersion);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn tbs_signature_mismatch_with_outer_signature_algorithm_is_rejected() {
+    let tbs_signature_algorithm = ed25519_algorithm_identifier();
+    // 外側の signatureAlgorithm だけを X25519 に差し替える
+    // （RFC 5280 §4.1.1.2 の一致要求への違反）。
+    let outer_signature_algorithm = sequence(&[&tlv(0x06, &[0x2b, 0x65, 0x6e])]);
+
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &tbs_signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let der = sequence(&[
+        &tbs_certificate,
+        &outer_signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::SignatureAlgorithmMismatch);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn spki_with_parameters_is_rejected() {
+    let signature_algorithm = ed25519_algorithm_identifier();
+    // Ed25519 の OID の後ろに NULL parameters を付けた不正な SPKI。
+    let spki_algorithm_with_params = sequence(&[&tlv(0x06, &OID_ED25519_BYTES), &tlv(0x05, &[])]);
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&spki_algorithm_with_params, &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::InvalidPublicKey);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn spki_bit_string_unused_bits_nonzero_is_rejected() {
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let mut spki_bits = vec![0x01u8]; // unused bits != 0
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::InvalidPublicKey);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn spki_key_length_31_and_33_are_rejected() {
+    for bad_len in [31usize, 33usize] {
+        let signature_algorithm = ed25519_algorithm_identifier();
+        let mut spki_bits = vec![0x00u8];
+        spki_bits.extend_from_slice(&vec![0u8; bad_len]);
+        let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+        let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+        let tbs_certificate = sequence(&[
+            &version_v3(),
+            &tlv(0x02, &[0x01]),
+            &signature_algorithm,
+            &empty_name(),
+            &validity,
+            &empty_name(),
+            &spki,
+        ]);
+        let mut signature_bits = vec![0x00u8];
+        signature_bits.extend_from_slice(&[0u8; 64]);
+        let der = sequence(&[
+            &tbs_certificate,
+            &signature_algorithm,
+            &tlv(0x03, &signature_bits),
+        ]);
+
+        let err = ServerCertificateChain::from_der_chain(
+            vec![der],
+            &RFC8410_10_1_ED25519_PUBLIC_KEY,
+            NOW_WITHIN_RFC8410_10_2_VALIDITY,
+        )
+        .unwrap_err();
+        match err {
+            CertificateChainError::Certificate { index: 0, error } => {
+                assert_eq!(error, X509Error::InvalidPublicKey);
+            }
+            other => panic!("unexpected error ({bad_len} bytes): {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn certificate_der_exceeding_max_len_is_rejected() {
+    let oversized = vec![0u8; x509::MAX_CERTIFICATE_DER_LEN + 1];
+    let err = ServerCertificateChain::from_der_chain(vec![oversized], &[0u8; 32], 0).unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::CertificateTooLarge);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn error_display_does_not_leak_certificate_content() {
+    let der = decode_rfc8410_10_2_der();
+    let err = ServerCertificateChain::from_der_chain(vec![der], &[0u8; 32], 0).unwrap_err();
+    let text = format!("{err}");
+    assert!(!text.contains("IETF Test Demo"));
+    assert!(!text.contains("85520f0"));
+}
+
+#[test]
+fn load_server_certificate_chain_file_reaches_chain_check_via_file_path() {
+    let file = TempFile::write("chain-ok", RFC8410_10_2_X25519_CERT_PEM.as_bytes());
+    // X25519 の葉は Ed25519 以外として拒否されるが、ファイル読み込み経路
+    // （PEM → DER 列 → チェーン検査）が正しく合成されていることは
+    // 「チェーン検査まで到達して index 0 の理由で拒否される」ことで確認できる。
+    let err = x509::load_server_certificate_chain_file(&file.path, &[0u8; 32], 0).unwrap_err();
+    assert!(matches!(
+        err,
+        ServerCertificateLoadError::Chain(CertificateChainError::Certificate { index: 0, .. })
+    ));
+}
+
+#[test]
+fn load_server_certificate_chain_file_reports_missing_file() {
+    let path = unique_temp_path("missing");
+    let err = x509::load_server_certificate_chain_file(&path, &[0u8; 32], 0).unwrap_err();
+    assert!(matches!(err, ServerCertificateLoadError::Load(_)));
+}
+
+#[test]
+fn load_server_certificate_chain_file_accepts_handmade_ed25519_leaf() {
+    let der = build_ed25519_leaf_certificate_der(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+    );
+    let file = TempFile::write("leaf-ok", pem_wrap_certificate(&der).as_bytes());
+    let chain = x509::load_server_certificate_chain_file(
+        &file.path,
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .expect("valid Ed25519 leaf file must be accepted");
+    assert_eq!(chain.leaf_public_key(), &RFC8410_10_1_ED25519_PUBLIC_KEY);
+}
+
+#[test]
+fn current_unix_secs_returns_a_plausible_recent_value() {
+    // このリポジトリが書かれた時点（2020 年以降）より新しい値であることの
+    // ゆるい健全性チェック。厳密な現在時刻検証はできないため、明らかに
+    // 過去・エラーでないことのみ確認する。
+    let now = x509::current_unix_secs().expect("clock must be readable");
+    assert!(now > 1_600_000_000);
+}

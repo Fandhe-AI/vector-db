@@ -47,6 +47,12 @@
 //!   （Issue #962）。[`pem`] が返す DER から 32 バイトの seed を取り出し、
 //!   RSA・ECDSA・v2（OneAsymmetricKey）等は起動時に明示的に拒否する。
 //!   鍵導出・署名は #961 の担当
+//! - [`der`]（`pub(crate)`）: X.509 向けに一般化した任意深さの DER TLV
+//!   リーダー（Issue #963）。[`pkcs8::DerReader`] とは別に持つ
+//! - [`x509`]: X.509 証明書の最小パース・validity 検査・葉 SPKI
+//!   （Ed25519）と秘密鍵側の公開鍵の照合、`Certificate` メッセージの
+//!   組み立て（Issue #963）。証明書署名の検証・extensions の意味解釈は
+//!   対象外のまま（[`x509`] のドキュメンテーションコメントを参照）
 //!
 //! alert の実送出やハンドシェイク状態機械（#965）・接続への結線
 //! （#966 以降）はいずれも後続 sub-issue の担当であり、本モジュールは
@@ -56,6 +62,7 @@
 pub mod aes;
 pub mod aes_gcm;
 pub mod client_hello;
+pub(crate) mod der;
 pub(crate) mod field25519;
 pub mod handshake;
 pub mod hkdf;
@@ -65,3 +72,4 @@ pub mod pkcs8;
 pub mod record;
 pub mod record_protection;
 pub mod x25519;
+pub mod x509;

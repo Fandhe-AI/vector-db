@@ -18,8 +18,10 @@
 //!   `legacy_version`／compression 値の検査・HelloRetryRequest の意味論は
 //!   #954 が担う。本モジュールは [`Extension`] を不透明な
 //!   `(extension_type, extension_data)` の列としてのみ扱う
-//! - `Certificate::certificate_list` の `cert_data`（X.509 DER）の解釈・
-//!   組み立て元は #963 が担う
+//! - `Certificate::certificate_list` の `cert_data`（X.509 DER）の解釈は
+//!   `super::x509` が担い、`Certificate` メッセージそのものの組み立ても
+//!   同モジュールの `ServerCertificateChain::certificate_message` が担う
+//!   （Issue #963）
 //! - `CertificateVerify` の署名生成・署名対象の構成は #961 が担う
 //! - transcript hash・`Finished::verify_data` の生成と検証は #964 が担う。
 //!   本モジュールは `Finished` の長さ（32 バイト固定。暗号スイートが
@@ -539,7 +541,8 @@ impl EncryptedExtensions {
 }
 
 /// `Certificate` の 1 エントリ（RFC 8446 §4.4.2）。`cert_data`（X.509 DER）は
-/// 不透明なバイト列のまま保持する（解釈は #963 が担う）。
+/// 不透明なバイト列のまま保持する（解釈・組み立ては `super::x509` が
+/// 担う。Issue #963）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertificateEntry {
     pub cert_data: Vec<u8>,
