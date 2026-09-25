@@ -41,17 +41,21 @@
 `crates/engine/src/storage/writer_gate.rs`。`Mutex<GateState>` と `Condvar` で
 構成し、`GateState` は `{ held_by: Option<ThreadId> }`。
 
-- **autocommit 経路**（`Storage::begin_write_txn`）: ゲートを待機上限つきで
-  取得し、`redb` のライタを得た直後にゲートを手放す（占有時間は redb 呼び出し
-  1 回分のみ）。超過時は `StorageError::WriteLockTimeout`（`55P03`）。
-- **明示トランザクション経路**（`Storage::begin_explicit_write_txn`）:
-  ゲートを取得したまま `WriterPermit`（RAII）としてトランザクションと同じ
-  寿命で保持する。
-- **デッドロックが起きない理由**: ゲートは 1 段しかなく、redb 自身のロックへ
-  待機付きで到達できるのはゲートを取得できたスレッドだけ。明示トランザクション
-  保持中の autocommit はゲートの段で待たされる（上限で打ち切り）ため redb の
-  `begin_write` に届かない。
-- **自己デッドロックの防御**: 明示トランザクションを保持しているスレッド自身が
+- **autocommit 経路**（`Storage::begin_write_txn`）と**明示トランザクション
+  経路**（`Storage::begin_explicit_write_txn`）は同じ保持方針をとる。どちらも
+  ゲートを待機上限つきで取得し、`redb` の書き込みトランザクションが commit／abort
+  されるまで `WriterPermit`（RAII）を保持する。`storage::GatedWriteTxn` が
+  `redb::WriteTransaction` と permit を同じ寿命で束ねる。超過時は
+  `StorageError::WriteLockTimeout`（`55P03`）。
+- 当初の実装では、autocommit が `redb` のライタを得た直後にゲートを手放して
+  いた。このため autocommit の書き込みがライタを持っている間に別セッションが
+  ゲートを取得すると、`redb::Database::begin_write` の中で待機上限なしに
+  止まっていた（PR #1041 レビュー指摘）。現在は「ゲートを保持していること」と
+  「`redb` のライタを保持していること」が常に一致するため、ライタ待ちはすべて
+  ゲートの待機上限で打ち切られる。
+- **デッドロックが起きない理由**: ゲートは 1 段しかなく、`redb` のライタへの
+  経路はゲート経由だけ。待機はすべてゲートの待機上限で打ち切られる。
+- **自己デッドロックの防御**: 書き込みトランザクションを保持しているスレッド自身が
   再度ゲートへ到達した場合は待たずに即座に `WriteTxnHeldByCurrentSession`
   エラーを返す（`55P03` へ写像。書き込み経路の配線漏れに対する多層防御）。
 
@@ -87,8 +91,8 @@ redb commit 呼び出しが 1 回増える（cosmetic な差異として記録�
 ### 4. 状態機械（`crates/engine/src/sql/transaction.rs`）
 
 `SessionTransaction<'e>`（`enum TxnState<'e> { Idle, Active(Box<ActiveTxn<'e>>),
-Failed { session_at_begin: SessionState } }`）。`ActiveTxn` は
-`write_txn: redb::WriteTransaction`・`permit: WriterPermit`・`started_at`・
+Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
+`write_txn: GatedWriteTxn`（permit を内包）・`started_at`・
 `statements`・`seen_operation_ids`・`written_tables`・`has_writes`・
 `session_at_begin` を保持する。
 
@@ -98,6 +102,10 @@ Failed { session_at_begin: SessionState } }`）。`ActiveTxn` は
 - **`COMMIT`**: `Idle` は `25P01`（`NoActiveSqlTransaction`）。`Active` は
   `has_writes` なら `commit_boundary::commit`、無ければ `drop`（abort）して
   `Idle` へ。`Failed` は `25P02` のまま（`ROLLBACK` のみ受理し続ける）。
+  持続時間の上限を過ぎた `Active` の `COMMIT` は確定させず、abort して
+  `Failed` へ遷移し `54000` を返す（文実行時の上限超過と同じ契約）。commit
+  自体が失敗した場合は、PostgreSQL と同じくロールバック扱いとし、`BEGIN`
+  時点の `SessionState` を復元してから `Idle` へ戻る（PR #1041 レビュー指摘）。
 - **`ROLLBACK`**: `Active`／`Failed` いずれからも `Idle` へ戻り、`BEGIN` 時点の
   `SessionState`（`SET search_mode`・`CREATE FUNCTION` 等）を復元する
   （PostgreSQL の挙動に準拠する実装判断。spec は沈黙）。`Idle` からの
@@ -126,6 +134,18 @@ Failed { session_at_begin: SessionState } }`）。`ActiveTxn` は
 - `max_duration`（`BEGIN` からの経過時間の上限）: **20 秒**
 - `max_statements`（トランザクション内の文数の上限）: **1,000**
 - 超過時は `54000`（`PayloadTooLarge`）で `Failed` へ遷移する。
+- `max_duration` は文の実行時・`COMMIT` 時に検査するほか、wire 層
+  （`handshake::post_auth_loop`）が要求を受け取るたびに
+  `SessionTransaction::release_if_expired` で検査する。期限を過ぎていれば、
+  要求の種類（Sync・Flush 等の SQL を伴わない要求を含む）を問わず
+  共有書き込みトランザクションを abort してライタを解放し、`Failed` へ遷移する。
+  その後の最初の文／`COMMIT` には `54000` を 1 回だけ返し、以降は `25P02`。
+- 要求が 1 件も届かない無通信の間は、接続全体の読み取りタイムアウト
+  （`limits::READ_TIMEOUT`＝30 秒。WIRE-5）で接続が閉じられ、
+  `SessionTransaction` の drop によってライタが解放される。したがって、
+  無通信時にライタを保持し続ける時間の上限は `max_duration` ではなく
+  `READ_TIMEOUT` になる。`max_duration` ちょうどで解放するには WIRE-5 の
+  「接続全体に同一の期限を適用する」契約の変更が必要なため、本 PR の対象外とする。
 - `lock_wait`（他セッションが writer gate を待つ上限）: **30 秒**
   （`Storage::DEFAULT_WRITE_LOCK_WAIT`。既存 `READ_TIMEOUT` と同じ値）。
   超過時は `55P03`。
