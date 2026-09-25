@@ -55,7 +55,7 @@ DROP INDEX <name>
    判定する（TOCTOU なし）
 
 `CREATE INDEX` の txn 内判定順序: 索引名の衝突（テーブル・ビュー・既存索引のいずれか。
-`42P07`）→ 対象がビュー（`42809`）→ 対象テーブルの不在（`42P01`）→ 列の不在
+`42P07`）→ 対象がビュー・既存索引（`42809`）→ 対象テーブルの不在（`42P01`）→ 列の不在
 （`42703`）→ 種別と列型の不整合（`0A000`）→ 登録件数上限（`54000`）→ 保存・世代 bump。
 
 `DROP INDEX` の txn 内判定: 索引として存在すれば削除・世代 bump。存在しなければ
@@ -73,7 +73,7 @@ DROP INDEX <name>
 | `CREATE TABLE`／`CREATE VIEW` の名前が既存索引と衝突 | `42P07` | 409 |
 | `DROP INDEX` で索引が存在しない | `42704`（`UNDEFINED_OBJECT`。新設） | 400 |
 | 参照列が存在しない（`id` は暗黙列として常に有効） | `42703`（`UNDEFINED_COLUMN`。新設） | 400 |
-| `CREATE INDEX` の対象がビュー、`DROP INDEX` にテーブル・ビュー名、`DROP TABLE`／`DROP VIEW` に索引名 | `42809` | 400 |
+| `CREATE INDEX` の対象がビュー・既存索引、`DROP INDEX` にテーブル・ビュー名、`DROP TABLE`／`DROP VIEW`／`ALTER TABLE ADD COLUMN`／書き込み系 DML（`INSERT`・UPSERT・`UPDATE`・`DELETE`・`TRUNCATE`）に索引名 | `42809` | 400 |
 | 対象テーブルが存在しない | `42P01` | 404 |
 | `USING` が `hnsw` 以外（`btree`・`bm25` 等）／`USING hnsw` の複数列・非 `VECTOR` 列（`id` を含む）／スカラー宣言が `VECTOR` 列・索引化非対応の型／部分索引の `WHERE`／式・関数呼び出し・リテラルの列指定 | `0A000` | 501 |
 | `UNIQUE`／`IF [NOT] EXISTS`／`ASC`・`DESC`／列の重複指定／`DROP` の複数名・`CASCADE`／`(col + 1)` 等の余分なトークン | `42601` | 400 |
@@ -136,6 +136,10 @@ NoSQL 表層の `op` 許可リストには索引 DDL が無く、両分類とも
 4. **NoSQL 表層**: `op` 許可リストに索引 DDL を含めない（NOSQL-13 の担当）。
 
 ## 既知の制約
+
+- 読み取り系（`SELECT`・集計・`EXPLAIN`・`CREATE VIEW` の参照先）で索引名を
+  `FROM` に指定した場合は、テーブルとして存在しない名前と同じく `42P01` のまま
+  （書き込み系 DDL/DML のみ `42809` へ揃えた）。
 
 - 列の直後に二項演算子が続く形（`(col + 1)`）は、列リストの閉じ括弧を期待する検査の
   不一致により `42601` になる（`0A000` ではない）。空の列リスト `()` は列要素の

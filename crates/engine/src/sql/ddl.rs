@@ -271,22 +271,30 @@ pub(crate) fn execute_alter_table_add_column(
     })
 }
 
-/// テーブルとして存在しない `name` について、ビューとして存在すれば
-/// `WrongObjectType`（`42809`）、しなければ `UndefinedTable`（`42P01`）を返す
-/// （`core.rs::EngineCore::reclassify_write_to_view_error` と同じ判定。
-/// `catalog::Storage::view_definition` を単一の情報源とする）。ビュー定義の
-/// 読み直し自体が失敗した場合は「ビューではない」と同一視せず
-/// `catalog::table_lookup_error` で写像する（fail-closed。破損したビューを
-/// 「存在しない」と誤報告しない）。
+/// テーブルとして存在しない `name` について、ビューまたは索引（TASK-206・
+/// INDEX-7、Issue #908。いずれもテーブルと relation 名前空間を共有する）として
+/// 存在すれば `WrongObjectType`（`42809`）、しなければ `UndefinedTable`（`42P01`）を
+/// 返す（`core.rs::EngineCore::reclassify_write_to_view_error` と同じ判定。
+/// `catalog::Storage::view_definition`／`index_exists` を情報源とする）。読み直し
+/// 自体が失敗した場合は「存在しない」と同一視せず `catalog::table_lookup_error` で
+/// 写像する（fail-closed。破損したカタログを「存在しない」と誤報告しない）。
 fn undefined_table_or_view(storage: &Storage, name: &str) -> SqlSurfaceError {
-    match storage.view_definition(name) {
-        Ok(Some(_)) => SqlSurfaceError::WrongObjectType {
-            name: name.to_string(),
+    let wrong_kind = match storage.view_definition(name) {
+        Ok(Some(_)) => true,
+        Ok(None) => match storage.index_exists(name) {
+            Ok(found) => found,
+            Err(e) => return crate::catalog::table_lookup_error(e),
         },
-        Ok(None) => SqlSurfaceError::UndefinedTable {
+        Err(e) => return crate::catalog::table_lookup_error(e),
+    };
+    if wrong_kind {
+        SqlSurfaceError::WrongObjectType {
             name: name.to_string(),
-        },
-        Err(e) => crate::catalog::table_lookup_error(e),
+        }
+    } else {
+        SqlSurfaceError::UndefinedTable {
+            name: name.to_string(),
+        }
     }
 }
 

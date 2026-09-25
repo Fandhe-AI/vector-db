@@ -309,6 +309,12 @@ fn catalog_level_classification_matches_err6() {
         ("DROP INDEX ja_docs", "42809"),
         ("DROP TABLE idx_lang", "42809"),
         ("DROP VIEW idx_lang", "42809"),
+        // 索引名を TABLE 系 DDL の対象にした場合も種別不一致（PR #1054 レビュー
+        // 指摘の回帰防止。テーブル不在の `42P01` へ落とさない）。
+        ("CREATE INDEX idx_x ON idx_lang (lang)", "42809"),
+        ("ALTER TABLE idx_lang ADD COLUMN extra TEXT", "42809"),
+        // 対照: 実在しない名前は従来どおり `42P01`。
+        ("ALTER TABLE ghost ADD COLUMN extra TEXT", "42P01"),
     ];
     for (sql, code) in cases {
         let err = run_err(&core, &mut s, sql);
@@ -317,6 +323,56 @@ fn catalog_level_classification_matches_err6() {
     // 失敗した DDL はいずれも何も書かない（索引・ビュー・テーブルとも残存）。
     run(&core, &mut s, "DROP INDEX idx_lang").expect("index still exists");
     run(&core, &mut s, "DROP VIEW ja_docs").expect("view still exists");
+}
+
+fn visible_count(core: &EngineCore) -> String {
+    match run(
+        core,
+        &mut SessionState::default(),
+        "SELECT COUNT(*) FROM docs",
+    ) {
+        Ok(SqlOutcome::Query(result)) => format!("{:?}", result.rows),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// 書き込み系 DML（`INSERT`／UPSERT／`UPDATE`／`DELETE`／`TRUNCATE`）の対象に索引名を
+/// 指定した場合は、ビューと同じく種別不一致（`42809`）で拒否し、何も書かない
+/// （DML は DDL 権限を要しない）。実在しない名前は従来どおり `42P01`。
+#[test]
+fn write_dml_targeting_an_index_name_is_wrong_object_type() {
+    let (path, _guard) = open_fixture("index-ddl-dml-target");
+    let core = core_at(&path);
+    run(
+        &core,
+        &mut allowed_session(),
+        "CREATE INDEX idx_lang ON docs (lang)",
+    )
+    .expect("create index");
+    let before = visible_count(&core);
+    for target in ["idx_lang", "ghost"] {
+        let expected = if target == "idx_lang" {
+            "42809"
+        } else {
+            "42P01"
+        };
+        for sql in [
+            format!(
+                "INSERT INTO {target} (id, embedding, lang, body) VALUES (100, '[1.0, 0.0]', 'ja', 'b') USING OPERATION_ID 'op-ins-{target}'"
+            ),
+            format!(
+                "INSERT INTO {target} (id, embedding, lang, body) VALUES (100, '[1.0, 0.0]', 'ja', 'b') ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-ups-{target}'"
+            ),
+            format!("UPDATE {target} SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-upd-{target}'"),
+            format!("DELETE FROM {target} WHERE id = 1 USING OPERATION_ID 'op-del-{target}'"),
+            format!("TRUNCATE TABLE {target} USING OPERATION_ID 'op-trn-{target}'"),
+        ] {
+            let err = run_err(&core, &mut SessionState::default(), &sql);
+            assert_eq!(err.wire_code(), expected, "{sql}");
+        }
+    }
+    // 対象テーブルの行（alice から見える件数）は変化していない。
+    assert_eq!(visible_count(&core), before);
 }
 
 // --- 明示トランザクション ---------------------------------------------------

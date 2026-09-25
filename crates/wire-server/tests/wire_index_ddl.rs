@@ -169,6 +169,16 @@ fn wire_index_ddl_error_classification() {
     expect_error(&mut stream, "CREATE INDEX docs ON docs (body)", "42P07");
     expect_error(&mut stream, "DROP INDEX ghost_idx", "42704");
     expect_error(&mut stream, "DROP INDEX docs", "42809");
+    expect_error(
+        &mut stream,
+        "CREATE INDEX idx_x ON idx_body (body)",
+        "42809",
+    );
+    expect_error(
+        &mut stream,
+        "ALTER TABLE idx_body ADD COLUMN extra TEXT",
+        "42809",
+    );
     expect_error(&mut stream, "CREATE INDEX idx_m ON docs (missing)", "42703");
     expect_error(&mut stream, "CREATE INDEX idx_t ON ghost (body)", "42P01");
     expect_error(

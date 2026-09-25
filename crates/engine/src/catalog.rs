@@ -4116,7 +4116,9 @@ impl Storage {
             {
                 return Err(CatalogError::IndexAlreadyExists(def.name.clone()));
             }
-            if views_contains(&def.table)? {
+            // 対象がビュー・既存の索引（relation 名前空間を共有するが行を持たない）
+            // なら種別不一致（`42809`）。テーブル不在（`42P01`）へ落とさない。
+            if views_contains(&def.table)? || index_name_exists_in_txn(&write_txn, &def.table)? {
                 return Err(CatalogError::WrongObjectKind(def.table.clone()));
             }
             let schema = require_table_schema_write(&write_txn, &def.table)?;
@@ -4172,6 +4174,19 @@ impl Storage {
         };
         bump_table_generation_in_txn(&write_txn, &def.table)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// `name` が索引宣言として存在するかをスナップショット読み取りで判定する
+    /// （TASK-206・INDEX-7、Issue #908）。テーブルとして存在しない名前について、
+    /// SQL 表層が `42P01` ではなく種別不一致（`42809`）を返すべきかを判定する
+    /// 呼び出し元（`sql::ddl` の `ALTER TABLE`・`core.rs` の書き込み系 DML）専用。
+    pub(crate) fn index_exists(&self, name: &str) -> Result<bool> {
+        let read_txn = self.db().begin_read()?;
+        match read_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => Ok(t.get(name)?.is_some()),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// 索引宣言を名前順に列挙する（TASK-206・INDEX-7、Issue #908。宣言の確認・
@@ -5188,6 +5203,24 @@ mod tests {
             .map(|d| d.name)
             .collect();
         assert_eq!(names, vec!["docs_lang".to_string()]);
+    }
+
+    /// `CREATE INDEX ... ON <既存索引名>` は索引もテーブル・ビューと同じ
+    /// relation 名前空間に属するため、テーブル不在ではなく種別不一致
+    /// （`WrongObjectKind`）で拒否する（PR #1054 レビュー指摘の回帰防止）。
+    #[test]
+    fn create_index_on_existing_index_name_is_wrong_object_kind() {
+        let (storage, _guard) = index_fixture_storage("index-ddl-on-index");
+        storage
+            .create_index(&scalar_def("docs_lang", "docs", &["lang"]))
+            .expect("create index");
+        assert!(matches!(
+            storage.create_index(&scalar_def("other", "docs_lang", &["lang"])),
+            Err(CatalogError::WrongObjectKind(name)) if name == "docs_lang"
+        ));
+        assert!(storage.index_exists("docs_lang").expect("lookup"));
+        assert!(!storage.index_exists("docs").expect("lookup"));
+        assert_eq!(storage.list_indexes().expect("list").len(), 1);
     }
 
     /// `DROP TABLE` は対象テーブルの索引宣言を同一 txn で一掃し、他テーブルの

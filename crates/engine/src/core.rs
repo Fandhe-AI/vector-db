@@ -2405,13 +2405,22 @@ impl EngineCore {
         e: crate::sql::allowlist::SqlSurfaceError,
     ) -> crate::sql::allowlist::SqlSurfaceError {
         if let crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name } = &e {
-            return match self.storage.view_definition(name) {
-                Ok(Some(_)) => {
-                    crate::sql::allowlist::SqlSurfaceError::WrongObjectType { name: name.clone() }
-                }
-                Ok(None) => e,
-                Err(lookup_err) => crate::catalog::table_lookup_error(lookup_err),
+            // 索引名（TASK-206・INDEX-7、Issue #908）もビューと同じくテーブルと
+            // relation 名前空間を共有する行を持たないオブジェクトのため、書き込み
+            // 系 DML の対象にされた場合は `42809` へ揃える。
+            let wrong_kind = match self.storage.view_definition(name) {
+                Ok(Some(_)) => true,
+                Ok(None) => match self.storage.index_exists(name) {
+                    Ok(found) => found,
+                    Err(lookup_err) => return crate::catalog::table_lookup_error(lookup_err),
+                },
+                Err(lookup_err) => return crate::catalog::table_lookup_error(lookup_err),
             };
+            if wrong_kind {
+                return crate::sql::allowlist::SqlSurfaceError::WrongObjectType {
+                    name: name.clone(),
+                };
+            }
         }
         e
     }
