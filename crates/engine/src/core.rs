@@ -3374,6 +3374,15 @@ impl EngineCore {
                 crate::sql::cursor::CursorStatement::Declare { .. }
                 | crate::sql::cursor::CursorStatement::Close { .. } => Ok(None),
                 crate::sql::cursor::CursorStatement::Fetch { name, .. } => {
+                    // `Failed` 中はカーソルが既に破棄されているが、Execute と同じく
+                    // `25P02` を返す（`34000` にしない。PR #1049 レビュー指摘
+                    // Cursor Bugbot Low 対応）。`txn` は読み取り専用のため、期限切れ
+                    // 由来の `54000` の 1 回限り報告（`SessionTransaction::
+                    // take_failed_error`）は後続の Execute に委ね、ここでは状態を
+                    // 変えない。
+                    if txn.status() == crate::sql::transaction::TransactionStatus::Failed {
+                        return Err(crate::sql::allowlist::SqlSurfaceError::InFailedSqlTransaction);
+                    }
                     match txn.cursor_columns(name) {
                         Some(columns) => Ok(Some(columns)),
                         None => Err(crate::sql::allowlist::SqlSurfaceError::invalid_cursor_name()),

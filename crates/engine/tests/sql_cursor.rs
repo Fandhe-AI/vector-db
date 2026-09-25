@@ -804,3 +804,52 @@ fn second_declare_uses_remaining_session_budget_during_generation() {
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
         .expect("rollback 2");
 }
+
+// --- Failed 中の FETCH の Describe（PR #1049 レビュー指摘 Cursor Bugbot Low） -----
+
+/// `Failed` なトランザクションでの `FETCH` の Describe（拡張クエリの Bind／
+/// Describe が使う `describe_parsed_in_txn`）は、Execute と同じく `25P02` を返す
+/// （カーソル破棄済みでも `34000` にしない）。
+#[test]
+fn describe_fetch_in_failed_transaction_is_25p02() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    seed_rows(&engine, &caller, 2);
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            &format!("DECLARE c CURSOR FOR SELECT id FROM {TABLE} LIMIT 10"),
+        )
+        .expect("declare");
+
+    let parsed = engine.parse_sql("FETCH 1 FROM c").expect("parse FETCH");
+    assert!(
+        engine
+            .describe_parsed_in_txn(&session, &txn, &parsed)
+            .expect("describe in Active")
+            .is_some(),
+        "open cursor must describe its columns while Active"
+    );
+
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "FETCH 1 FROM missing")
+        .expect_err("unknown cursor fails the transaction");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+
+    let err = engine
+        .describe_parsed_in_txn(&session, &txn, &parsed)
+        .expect_err("describe in Failed must be rejected");
+    assert_eq!(err.wire_code(), "25P02");
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "FETCH 1 FROM c")
+        .expect_err("execute in Failed must be rejected");
+    assert_eq!(err.wire_code(), "25P02", "describe and execute must agree");
+}
