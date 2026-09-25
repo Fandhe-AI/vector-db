@@ -37,9 +37,11 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
 
 ### 許可リスト検証の分割（`sql::allowlist`）
 
-- `pub fn validate_sql(sql, lookup)` は字句解析後 `validate_sql_tokens(tokens,
-  lookup)` へ委譲するだけの薄いラッパーへ分割した（挙動不変。既存 269 件の
-  `allowlist` テストが green のまま）。
+- `pub fn validate_sql(sql, lookup)` は字句解析後 `validate_sql_tokens(&tokens,
+  lookup)` へ委譲するだけの薄いラッパーである（挙動不変）。トークン列版
+  `validate_sql_tokens(tokens: &[Token], lookup)` は COPY プロトコル（#939・
+  WIRE-17）の内側 SELECT 検証と共有しており、`$n` 束縛経路（`core.rs` の
+  `parse_tokens`）もこの入口を使う。
 
 ### `sql::params`（新設）
 
@@ -71,7 +73,31 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
   `execute_parsed_in_session`／`describe_parsed_in_session` へそのまま渡せる。
 - `pub fn describe_prepared_in_session(&self, session, prepared) ->
   Result<Option<Vec<ColumnMeta>>, _>`（Describe(statement)）:
-  `describe_parsed_in_session(session, &prepared.dummy_parsed)` を呼ぶだけ。
+  通常の `describe_parsed_in_session` ではなく、その本体
+  `describe_parsed_in_session_impl` へ `prepared.dummy_parsed` と、どの
+  リテラル位置が `$n` 由来のダミー値かを示す 2 種のフラグを渡す。
+  - `order_by_distance_literal_is_param`（`sql::params::
+    order_by_distance_literal_is_param` が Parse 時点の元トークン列から判定）:
+    `ORDER BY <vec列> <=> $n` のベクトル位置が `$n` 由来の場合に限り、
+    ダミー値 `"0"` のベクトルリテラルとしての実パースを省略する。
+  - `where_equality_dummy_flags`（`sql::params::
+    where_equality_literal_is_param` が `WHERE` 等価述語ごとに判定）:
+    `$n` 由来の等価述語に限り、ENUM 列ラベルの語彙照合（`22P02`）を省略する
+    （`bind_aggregate`／`bind_projection_for_describe`／`bind_scan` の
+    いずれの経路でも同じ配列を共有する）。
+
+  省略するのは「ダミー値 `"0"` そのものの値に依存する検証」だけである。
+  固定ダミーを通常どおり検証すると、正当なベクトル／ENUM 位置を持つ
+  prepared statement まで Describe できなくなるためである。`$n` を含まない
+  文や、`$n` と無関係な位置に書かれた実リテラルはフラグが `false` のまま
+  となり、通常の Describe と同じく Describe 時点で検証される。省略された
+  位置の値の妥当性（ベクトルリテラル形式・次元、ENUM ラベルの語彙）は、
+  Bind まで遅延される。すなわち `bind_prepared` が実値で置換した
+  `ParsedSql` を `describe_parsed_in_session`（フラグなしの通常 Describe）
+  または `execute_parsed_in_session` へ渡した時点で、同じ値をリテラルで
+  書いた SQL と同一のエラー契約（例: 語彙外 ENUM ラベルは `22P02`）で
+  判定される（`crates/engine/tests/prepared_params.rs` の
+  `bind_prepared_enum_where_equality_rejects_invalid_label_after_bind` で固定）。
   投影列の形はどの `$n` 値を束縛しても変わらない（列名・型は文の構造にのみ
   依存し、リテラル値の中身には依存しない）ため、ダミー値での導出結果は
   実値束縛後と常に一致する。LLM・埋め込み I/O は呼ばない（`USING PLAN` の
@@ -117,10 +143,24 @@ WHERE b = $n` の `WHERE` 節内の等価条件は受理——後者は述語形
 ## NULL パラメータ値
 
 `decode_bind_values` は `None`（SQL NULL）を一律 `22000` で拒否する（本
-バージョンのスコープ外）。`USING OPERATION_ID $n` を省略と同義にしたい
-クライアントは、空文字列を束縛する（`OperationId::parse("")` が既存の
-`23502` へ写像する）か、SQL テキスト側で `USING OPERATION_ID NULL` を直接
-書く（パラメータ化しない）。
+バージョンのスコープ外）。したがって `USING OPERATION_ID $n` の `$n` に
+「句の省略」に相当する値を束縛する手段は現状ない。
+
+- 空文字列の束縛は省略と同義ではない。`OperationId::parse("")` は台帳の
+  構成（`LedgerMode`）に関係なく常に `23502` を返す。一方、句の省略が
+  `23502` になるのは台帳あり構成（`LedgerMode::Ledgered`）の場合だけで、
+  台帳なし構成（`CompareOnlyWithoutLedger`）では省略が受理される。
+- 省略相当を指定したい場合は、`$n` を使わない別の文として Parse する。
+  具体的には `USING OPERATION_ID` 句そのものを書かないか、SQL テキストへ
+  `USING OPERATION_ID NULL` を直接書く。後者は既存の許可リスト
+  （`sql::allowlist::Parser::parse_operation_id_clause`。大小無視の `NULL`
+  を句の省略と同じ `None` として扱う）が構文として受理するため `42601` には
+  ならず、どちらの書き方も構成ごとに省略と同じ結果になる（台帳あり構成は
+  `23502`、台帳なし構成は受理。RECOVER-1・TASK-92 の既存契約。
+  `crates/engine/tests/prepared_params.rs` の
+  `parse_sql_prepared_treats_literal_null_operation_id_as_omitted_clause`
+  で固定）。`USING OPERATION_ID` の値そのものは、NULL 以外は文字列リテラル
+  のみを受理する（数値・他の識別子は `42601`）。
 
 ## 検証
 
