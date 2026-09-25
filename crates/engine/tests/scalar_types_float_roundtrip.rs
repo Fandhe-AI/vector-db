@@ -3,8 +3,10 @@
 //! `docs/spec/04-behavior/data-model.md`。
 //!
 //! ファイル名は `scalar_types_roundtrip.rs`（並行 Issue #881／#883 が使う可能性
-//! がある名前）と意図的に衝突を避けている。後続 Issue #897（回帰の統合）で
-//! 3 型分のテストを 1 ファイルへ集約する際、本ファイルは削除・統合される想定。
+//! がある名前）と意図的に衝突を避けている。Issue #897（型横断回帰）では本
+//! ファイルを削除・統合せず、`column_type_codec_roundtrip.rs`・
+//! `column_type_catalog_regression.rs`・`column_type_sql_rejection_matrix.rs`
+//! を型横断の別ファイルとして追加する方針を採った（既存の網羅性を保つため）。
 //!
 //! `EngineCore::execute_sql_in_session`（production の SQL 実行経路）を直接
 //! 検証する（`sql_update_single_row.rs` と同じ流儀。実 `Storage`＋
