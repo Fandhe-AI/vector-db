@@ -100,6 +100,12 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             let _ = write!(out, "{v}");
             Ok(())
         }
+        // `INTEGER`／`BIGINT` 列の投影結果（Issue #881・TABLE-13・TASK-196）。
+        // JSON 数値としてそのまま出力する（`Cell::Integer` と同じ infallible 方針）。
+        Cell::SignedInteger(v) => {
+            let _ = write!(out, "{v}");
+            Ok(())
+        }
         Cell::Float(f) => write_finite_f64(out, *f),
         Cell::Bool(b) => {
             out.push_str(if *b { "true" } else { "false" });
@@ -473,6 +479,66 @@ mod tests {
             let expected_type_name = crate::result_encoder::WireType::from_oid(oid)
                 .expect("known oid")
                 .pg_type_name();
+            let JsonValue::Object(col_obj) = &json_columns[i] else {
+                panic!("column must be an object");
+            };
+            let JsonValue::String(actual_type) = &col_obj["type"] else {
+                panic!("type must be a string");
+            };
+            assert_eq!(actual_type, expected_type_name, "column={name}");
+        }
+    }
+
+    /// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）が `RowDescription`
+    /// の OID と JSON `columns[].type` の双方で `int4`（OID 23）／`int8`（OID 20）
+    /// として一致公告されることを固定する（Issue #903 レビュー指摘: 一律 `text`
+    /// （OID 25）へ写像すると psql・ドライバ・ORM・JSON クライアントが整数列を
+    /// 文字列として扱ってしまうため是正）。
+    #[test]
+    fn integer_and_bigint_columns_announce_int4_int8_oid_and_json_type() {
+        let columns = vec![
+            ColumnMeta::Scalar {
+                name: "n".to_string(),
+                ty: ColumnType::Integer,
+            },
+            ColumnMeta::Scalar {
+                name: "b".to_string(),
+                ty: ColumnType::BigInt,
+            },
+        ];
+        let expected: [(&str, i32, &str); 2] = [("n", 23, "int4"), ("b", 20, "int8")];
+
+        let row_description =
+            crate::result_encoder::encode_row_description(&columns).expect("encode");
+        let result = QueryResult {
+            columns,
+            rows: Vec::new(),
+        };
+        let body = encode(&result).expect("encode");
+        let top = parse_top(&body);
+        let JsonValue::Array(json_columns) = &top["columns"] else {
+            panic!("columns must be an array");
+        };
+
+        let mut cursor = 1 + 4 + 2; // 'T' + length + field_count
+        for (i, (name, expected_oid, expected_type_name)) in expected.iter().enumerate() {
+            let name_end = row_description[cursor..]
+                .iter()
+                .position(|&b| b == 0)
+                .expect("NUL terminator");
+            let actual_name = std::str::from_utf8(&row_description[cursor..cursor + name_end])
+                .expect("utf8 name");
+            assert_eq!(&actual_name, name);
+            cursor += name_end + 1;
+            cursor += 4 + 2; // table_oid + attnum
+            let oid_bytes: [u8; 4] = row_description[cursor..cursor + 4]
+                .try_into()
+                .expect("4 bytes");
+            let oid = i32::from_be_bytes(oid_bytes);
+            assert_eq!(oid, *expected_oid, "column={name}");
+            cursor += 4; // type_oid
+            cursor += 2 + 4 + 2; // typlen + typmod + format
+
             let JsonValue::Object(col_obj) = &json_columns[i] else {
                 panic!("column must be an object");
             };

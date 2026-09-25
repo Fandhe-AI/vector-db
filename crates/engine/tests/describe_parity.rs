@@ -319,3 +319,37 @@ fn describe_has_no_side_effects_on_rows_or_table_generation() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].id, 1);
 }
+
+/// PR #1012 レビュー指摘の回帰固定: 実リテラルを持つ通常の SQL テキスト
+/// （`$n` を含まない・`parse_sql` 経由の `ParsedSql`）の Describe は、
+/// `ORDER BY <vec列> <=> '<不正なベクトルリテラル>'` の形式・次元・非有限値
+/// 検証を Bind 前から必ず行う（Execute まで失敗が遅延してはならない）。
+/// `describe_prepared_in_session`（ダミー値専用の縮退経路）専用の省略が
+/// この通常経路へ誤って一律適用されていないことを固定する。
+#[test]
+fn describe_select_rejects_invalid_vector_literal_before_execute() {
+    let path = unique_db_path("describe-invalid-vector-literal");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let session = SessionState::default();
+
+    // 次元不一致（テーブルの VECTOR 列は 3 次元）。
+    let parsed = core
+        .parse_sql("SELECT id FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 5")
+        .expect("parse should succeed (literal shape is structurally valid)");
+    let err = core
+        .describe_parsed_in_session(&session, &parsed)
+        .expect_err(
+            "describe must reject a dimension-mismatched vector literal, not defer to execute",
+        );
+    assert_eq!(err.wire_code(), "22000");
+
+    // 形式不正（数値として解釈できない）。
+    let parsed = core
+        .parse_sql("SELECT id FROM documents ORDER BY embedding <=> 'invalid' LIMIT 5")
+        .expect("parse should succeed (literal shape is structurally valid)");
+    let err = core
+        .describe_parsed_in_session(&session, &parsed)
+        .expect_err("describe must reject a malformed vector literal, not defer to execute");
+    assert_eq!(err.wire_code(), "22000");
+}

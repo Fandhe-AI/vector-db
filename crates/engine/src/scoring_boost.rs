@@ -100,6 +100,8 @@ impl ScoringBoost {
         match &column.ty {
             ColumnType::Text => {}
             ColumnType::Vector(_)
+            | ColumnType::Integer
+            | ColumnType::BigInt
             | ColumnType::Real
             | ColumnType::Double
             | ColumnType::Boolean

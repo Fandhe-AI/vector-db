@@ -1684,6 +1684,39 @@ fn validate_set_assignments(
                     ))));
                 }
             }
+            (crate::catalog::ColumnType::Integer, crate::row_codec::Value::Integer(_)) => {
+                // 固定幅（presence(1) + 本体(4)）のため、事前検証は累計バイト
+                // 予算への計上だけでよい（値域は束縛段
+                // `sql::parser::bind_integer_literal` が既に検証済み）。
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_INT4_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
+            (crate::catalog::ColumnType::BigInt, crate::row_codec::Value::BigInt(_)) => {
+                set_text_payload_total = set_text_payload_total
+                    .checked_add(crate::row_codec::SCALAR_INT8_ENTRY_LEN)
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "scalar payload length overflow".to_string(),
+                        ))
+                    })?;
+                if set_text_payload_total > crate::row_codec::MAX_SCALAR_PAYLOAD_LEN {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "scalar payload length {set_text_payload_total} exceeds limit {}",
+                        crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
+                    ))));
+                }
+            }
             // REAL/DOUBLE の SET 値は固定長ペイロード（`SCALAR_REAL_ENTRY_LEN`／
             // `SCALAR_DOUBLE_ENTRY_LEN`）だが、BOOLEAN と同様に累計へ加算し
             // 対象行の探索より前に上限判定を完了させる（codex-review P0 指摘・
@@ -1959,6 +1992,8 @@ fn validate_set_assignments(
             // ここでも再検査する（`schema.columns` の型検証と同じ設計）。
             (
                 crate::catalog::ColumnType::Text
+                | crate::catalog::ColumnType::Integer
+                | crate::catalog::ColumnType::BigInt
                 | crate::catalog::ColumnType::Real
                 | crate::catalog::ColumnType::Double
                 | crate::catalog::ColumnType::Boolean
@@ -1993,6 +2028,8 @@ fn validate_set_assignments(
             }
             (crate::catalog::ColumnType::Vector(_), _)
             | (crate::catalog::ColumnType::Text, _)
+            | (crate::catalog::ColumnType::Integer, _)
+            | (crate::catalog::ColumnType::BigInt, _)
             | (crate::catalog::ColumnType::Real, _)
             | (crate::catalog::ColumnType::Double, _)
             | (crate::catalog::ColumnType::Boolean, _)

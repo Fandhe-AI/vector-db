@@ -226,80 +226,163 @@ fn run_statement(
     stmt_sql: &str,
     finish: Finish,
 ) -> io::Result<StatementStatus> {
-    let outcome = {
-        let _emergency_registration =
-            cached_emergency_response_bytes().and_then(|response_bytes| {
-                let clone = stream.try_clone().ok()?;
-                Some(
-                    engine::recovery::panic_hook::EmergencyResponseRegistration::register(
-                        response_bytes.clone(),
-                        clone,
-                        crate::limits::EMERGENCY_RESPONSE_WRITE_TIMEOUT,
-                    ),
-                )
-            });
-        let outcome = engine.execute_sql_in_session(ctx, session, stmt_sql);
-        // Issue #705（テスト専用・feature `fault-injection` 限定）: 直前行の
-        // `outcome` を「登録ブロック」の終端（`_emergency_registration` が
-        // drop される直前）でだけ検査し、commit 後 panic を注入できる唯一の
-        // 位置に置く。このブロックを抜けて `match outcome { .. }` 側へ進むと
-        // `_emergency_registration` は既に drop 済みで緊急応答は送られなく
-        // なる（上記コメント「outcome を決定する区間」参照）ため、注入点を
-        // ここより後ろへ移動してはならない。feature 無効時はこの呼び出し
-        // ごとコンパイルされず、既定ビルドの挙動・コード生成は完全に不変。
-        #[cfg(feature = "fault-injection")]
-        crate::fault_injection::maybe_panic_after_commit(&outcome);
-        outcome
-    };
+    let outcome = execute_with_emergency_registration(stream, || {
+        engine.execute_sql_in_session(ctx, session, stmt_sql)
+    });
 
     match outcome {
-        Ok(SqlOutcome::Query(result)) => respond_query_result(stream, &result, "SELECT", finish),
+        Ok(outcome) => match map_outcome(outcome) {
+            OutcomeResponse::Rows { result, shape } => {
+                let sent = result.rows.len();
+                let tag = shape.render(sent);
+                respond_rows_with_tag(stream, &result, &tag, finish)
+            }
+            OutcomeResponse::Command { tag } => respond_command_complete(stream, &tag, finish),
+        },
+        Err(e) => {
+            respond_error_and_ready(stream, e.error_class(), &e.client_message())?;
+            Ok(StatementStatus::Failed)
+        }
+    }
+}
+
+/// TASK-97（対象ビヘイビア: RECOVER-6・ERR-1、codex-review Medium 指摘対応・
+/// PR #90）の「登録ブロック」を関数として切り出したもの（Issue #934・#933 の
+/// Execute（拡張クエリプロトコル）が [`engine::core::EngineCore::
+/// execute_parsed_in_session`] 呼び出しでも同じ緊急応答登録・panic 注入点の
+/// 位置関係を再利用するための共有本体。簡易クエリ（[`run_statement`]）・
+/// 拡張クエリの Execute（`crate::extended_query::handle_execute`）はいずれも
+/// 「outcome を決定する区間」をこの関数の `f` 引数へ委譲することで、登録
+/// （eager）と panic 注入位置の契約を 1 箇所に保つ——`f` の呼び出し完了直後
+/// （ブロック終端）で `_emergency_registration` がレキシカルに drop されるため、
+/// 呼び出し元がこの関数から返った outcome を使って応答を組み立てている間は
+/// 緊急応答チャネルへの登録が既に外れている（[`run_statement`] 旧実装の
+/// コメントが警告していた「書きかけの通常応答フレームへの緊急応答混入」を
+/// 防ぐ構造は不変のまま）。
+pub(crate) fn execute_with_emergency_registration(
+    stream: &mut TcpStream,
+    f: impl FnOnce() -> Result<SqlOutcome, engine::sql::allowlist::SqlSurfaceError>,
+) -> Result<SqlOutcome, engine::sql::allowlist::SqlSurfaceError> {
+    let _emergency_registration = cached_emergency_response_bytes().and_then(|response_bytes| {
+        let clone = stream.try_clone().ok()?;
+        Some(
+            engine::recovery::panic_hook::EmergencyResponseRegistration::register(
+                response_bytes.clone(),
+                clone,
+                crate::limits::EMERGENCY_RESPONSE_WRITE_TIMEOUT,
+            ),
+        )
+    });
+    let outcome = f();
+    // Issue #705（テスト専用・feature `fault-injection` 限定）: 直前行の
+    // `outcome` を「登録ブロック」の終端（`_emergency_registration` が
+    // drop される直前）でだけ検査し、commit 後 panic を注入できる唯一の
+    // 位置に置く。この関数を抜けて呼び出し元が outcome を使い始めると
+    // `_emergency_registration` は既に drop 済みで緊急応答は送られなく
+    // なる（上記ドキュメント「outcome を決定する区間」参照）ため、注入点を
+    // ここより後ろへ移動してはならない。feature 無効時はこの呼び出し
+    // ごとコンパイルされず、既定ビルドの挙動・コード生成は完全に不変。
+    #[cfg(feature = "fault-injection")]
+    crate::fault_injection::maybe_panic_after_commit(&outcome);
+    outcome
+}
+
+/// [`SqlOutcome`] の行を返す応答が確定する際、`CommandComplete` タグの数値部分を
+/// どう決めるかの区別（Issue #934。拡張クエリプロトコルの Execute が `max_rows`
+/// で行を分割送出できるようになったことで、簡易クエリ〔常に全行を 1 回で送る〕
+/// とは「タグの count をどの時点の行数から取るか」が食い違いうるため、`map_outcome`
+/// の戻り値へ埋め込んで両呼び出し元（[`run_statement`]・`crate::extended_query::
+/// handle_execute`）が共有する）。
+pub(crate) enum TagShape {
+    /// `prefix` と実際に送出した行数（`render` の `sent` 引数）からタグを組み立てる
+    /// （`SELECT`。拡張クエリの分割送出では PostgreSQL の `PortalRun` と同じく
+    /// 「その回の Execute で実際に送った行数」を使う）。
+    Dynamic(&'static str),
+    /// 常に固定文字列（`EXPLAIN`。行を返すが件数を持たないタグ）。
+    Fixed(String),
+    /// タグの数値部分も固定（`INSERT 0 <n>`・`RETURNING` の `rows_affected`）。
+    /// `result.rows.len()` とは独立の値であり、分割送出の影響を受けない
+    /// （`ReturningOutcome` のドキュメント参照）。
+    FixedTag(String),
+}
+
+impl TagShape {
+    /// この応答が確定する（`CommandComplete` を送る）時点でタグ文字列を組み立てる。
+    /// `sent` は [`TagShape::Dynamic`] にのみ効き、それ以外は無視される。
+    pub(crate) fn render(&self, sent: usize) -> String {
+        match self {
+            TagShape::Dynamic(prefix) => format!("{prefix} {sent}"),
+            TagShape::Fixed(s) | TagShape::FixedTag(s) => s.clone(),
+        }
+    }
+}
+
+/// [`SqlOutcome`] を「行を返す応答」か「`CommandComplete` 単独応答」かへ写像する
+/// （Issue #934。旧 [`run_statement`] の `match outcome { .. }` 本体をここへ抽出し、
+/// 拡張クエリプロトコルの Execute（`crate::extended_query::handle_execute`）とも
+/// 共有する。SQL 種別ごとの `CommandComplete` タグ文言・分岐は本関数が唯一の
+/// 情報源であり、`run_statement`・`handle_execute` の双方がこれ以外の場所で
+/// タグを組み立てない）。
+pub(crate) enum OutcomeResponse {
+    Rows {
+        result: engine::sql::exec::QueryResult,
+        shape: TagShape,
+    },
+    Command {
+        tag: String,
+    },
+}
+
+pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
+    match outcome {
+        SqlOutcome::Query(result) => OutcomeResponse::Rows {
+            result,
+            shape: TagShape::Dynamic("SELECT"),
+        },
         // TASK-78（SQL-6）: `EXPLAIN` は検索本体を実行しない別応答だが、行の
         // 形（`QUERY PLAN` 単一列・複数 `Cell::Text` 行）は通常の検索 SELECT と
         // 同じ `RowDescription`/`DataRow` エンコードを再利用できる（`ColumnMeta`/
         // `ResultRow` の汎用性による）。CommandComplete タグのみ pg 互換の
-        // `EXPLAIN` に差し替える（`respond_query_result` のタグ引数化。SELECT
-        // との違いはこのタグと呼び出し元の分岐のみ）。
-        Ok(SqlOutcome::Explain(result)) => respond_query_result(stream, &result, "EXPLAIN", finish),
-        Ok(SqlOutcome::SetSearchMode(_)) => respond_command_complete(stream, "SET", finish),
-        Ok(SqlOutcome::CreateFunction { .. }) => {
-            respond_command_complete(stream, "CREATE FUNCTION", finish)
-        }
+        // `EXPLAIN` に差し替える（件数を持たない固定タグ）。
+        SqlOutcome::Explain(result) => OutcomeResponse::Rows {
+            result,
+            shape: TagShape::Fixed("EXPLAIN".to_string()),
+        },
+        SqlOutcome::SetSearchMode(_) => OutcomeResponse::Command {
+            tag: "SET".to_string(),
+        },
+        SqlOutcome::CreateFunction { .. } => OutcomeResponse::Command {
+            tag: "CREATE FUNCTION".to_string(),
+        },
         // TASK-82（SQL-10）: `INSERT`（行形・ファイル形いずれも
         // `exec::InsertOutcome::rows_affected` に書き込み件数を保持する。
         // `sql/exec.rs` ドキュメント参照）の応答を pg 互換の `CommandComplete`
         // タグ `INSERT <oid> <rows>` へ整形する。OID 機構は本実装に無いため
-        // 固定で `0` を使う（pg プロトコルの規範。他の書き込み系 wire 応答も
-        // 同様の固定値を使う契約はまだ無いためここでのみ導入する）。
-        Ok(SqlOutcome::Insert(outcome)) => respond_command_complete(
-            stream,
-            &format!("INSERT 0 {}", outcome.rows_affected),
-            finish,
-        ),
+        // 固定で `0` を使う（pg プロトコルの規範）。
+        SqlOutcome::Insert(outcome) => OutcomeResponse::Command {
+            tag: format!("INSERT 0 {}", outcome.rows_affected),
+        },
         // TASK-195（SQL-22）: `TRUNCATE TABLE`（`exec::TruncateOutcome`。削除件数を
-        // 一切返さない契約。`sql/exec.rs` ドキュメント参照）の応答を pg 互換の
-        // `CommandComplete` タグ `TRUNCATE TABLE`（PostgreSQL の `TRUNCATE` タグに
-        // 準拠。件数を持たない固定タグ）へ整形する。`SetSearchMode`（`SET`）と
-        // 同型で、行データを返さない書き込み系操作の応答形。
-        Ok(SqlOutcome::Truncate(_)) => respond_command_complete(stream, "TRUNCATE TABLE", finish),
+        // 一切返さない契約）の応答を pg 互換の `CommandComplete` タグ
+        // `TRUNCATE TABLE`（件数を持たない固定タグ）へ整形する。
+        SqlOutcome::Truncate(_) => OutcomeResponse::Command {
+            tag: "TRUNCATE TABLE".to_string(),
+        },
         // SQL-18（TASK-191・#867）: `DELETE`（単一行・`id` 等価指定形。
         // `exec::DeleteOutcome::rows_affected` は自テナント削除件数
-        // `0`／`1` のみを保持する。`sql/exec.rs` ドキュメント参照）の応答を
-        // pg 互換の `CommandComplete` タグ `DELETE <rows>`（PostgreSQL の
-        // `DELETE` タグに準拠）へ整形する。`INSERT 0 <rows>` と同じ設計。
-        Ok(SqlOutcome::Delete(outcome)) => {
-            respond_command_complete(stream, &format!("DELETE {}", outcome.rows_affected), finish)
-        }
+        // `0`／`1` のみを保持する）の応答を pg 互換の `CommandComplete` タグ
+        // `DELETE <rows>` へ整形する。
+        SqlOutcome::Delete(outcome) => OutcomeResponse::Command {
+            tag: format!("DELETE {}", outcome.rows_affected),
+        },
         // Issue #873（SQL-21）: `RETURNING` 句付き `INSERT`／`DELETE` の応答。
         // `RowDescription`／`DataRow`* は通常の検索 SELECT・`EXPLAIN` と同じ
-        // `respond_rows_with_tag`（`respond_query_result` から切り出した共通
-        // 本体）で組み立てるが、`CommandComplete` タグの件数は
+        // 経路で組み立てるが、`CommandComplete` タグの件数は
         // `result.rows.len()`（RLS 再判定後に絞られた投影行数）ではなく
-        // `outcome.rows_affected`（実際に変更した行数。`ReturningOutcome` の
-        // ドキュメント参照）を使う——両者は書き込み本人にも不可視な行がある
-        // 場合に一致しないことが契約上ありうるため、`SELECT`/`EXPLAIN` と同じ
-        // `format!("{tag} {}", result.rows.len())` を再利用できない。
-        Ok(SqlOutcome::Returning(outcome)) => {
+        // `outcome.rows_affected`（実際に変更した行数）を使う——両者は書き込み
+        // 本人にも不可視な行がある場合に一致しないことが契約上ありうるため
+        // `TagShape::FixedTag` で固定する（分割送出の影響を受けない）。
+        SqlOutcome::Returning(outcome) => {
             let tag = match outcome.command {
                 engine::sql::returning::DmlCommand::Insert => {
                     format!("INSERT 0 {}", outcome.rows_affected)
@@ -311,22 +394,17 @@ fn run_statement(
                     format!("DELETE {}", outcome.rows_affected)
                 }
             };
-            respond_rows_with_tag(stream, &outcome.result, &tag, finish)
+            OutcomeResponse::Rows {
+                result: outcome.result,
+                shape: TagShape::FixedTag(tag),
+            }
         }
         // `UPDATE`（単一行・id 指定形。SQL-17・TASK-191、Issue #865。述語形。
-        // SQL-19・TASK-192、Issue #871。`exec::UpdateOutcome::rows_affected` は
-        // いずれの形式でも自テナント所有・一致行の更新件数を保持する。
-        // `sql/exec.rs` ドキュメント参照）の応答を pg 互換の `CommandComplete`
-        // タグ `UPDATE <rows>`（PostgreSQL の `UPDATE` タグに準拠。`INSERT` の
-        // `<oid> <rows>` と異なり OID フィールドを持たない）へ整形する。
-        // `DELETE <rows>` と同じ設計。
-        Ok(SqlOutcome::Update(outcome)) => {
-            respond_command_complete(stream, &format!("UPDATE {}", outcome.rows_affected), finish)
-        }
-        Err(e) => {
-            respond_error_and_ready(stream, e.error_class(), &e.client_message())?;
-            Ok(StatementStatus::Failed)
-        }
+        // SQL-19・TASK-192、Issue #871）の応答を pg 互換の `CommandComplete`
+        // タグ `UPDATE <rows>` へ整形する。
+        SqlOutcome::Update(outcome) => OutcomeResponse::Command {
+            tag: format!("UPDATE {}", outcome.rows_affected),
+        },
     }
 }
 
@@ -473,6 +551,13 @@ pub fn emergency_response_bytes() -> Option<&'static [u8]> {
 /// 経路は `finish` に関係なく常に ErrorResponse＋`ReadyForQuery` を送り
 /// [`StatementStatus::Failed`] を返す（途中エラーで打ち切るため、その時点で
 /// 応答を確定する）。
+///
+/// Issue #934: `run_statement` は `map_outcome`／`TagShape` 経由で直接
+/// `respond_rows_with_tag` を呼ぶようになったため、本関数は production 経路では
+/// 使われなくなった（`TagShape` が `SELECT`/`EXPLAIN` のタグ組み立てを一元化した
+/// ため）。バイト列契約の回帰テスト（`respond_query_result_matches_*`）専用の
+/// ヘルパーとして残す。
+#[cfg(test)]
 fn respond_query_result(
     stream: &mut TcpStream,
     result: &engine::sql::exec::QueryResult,

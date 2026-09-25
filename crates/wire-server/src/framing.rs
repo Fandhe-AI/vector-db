@@ -210,6 +210,30 @@ pub fn validate_typed_message_length_prefix<R: Read>(
     Ok(total_len)
 }
 
+/// 指定バイト数だけ読み捨てる（アロケーションせず `io::copy` で `io::sink()` へ
+/// 流す）。拡張クエリプロトコルのエラー後の同期回復（Issue #934・WIRE-11。
+/// `handshake::post_auth_loop` の `ignore_till_sync` モード）が、後続メッセージの
+/// 本文を解釈せず読み飛ばすために使う。`len` は呼び出し元が
+/// [`validate_typed_message_length_prefix`] 等で `MAX_MESSAGE_LEN` 以内と
+/// 確認済みの値であること（本関数自身は上限を検証しない）。
+///
+/// `Read::take(len)` に対する `io::copy` は、基底 reader が `len` バイト未満で
+/// EOF に達しても `Err` にならず、実際にコピーできたバイト数を返して正常
+/// 完了する（`std::io::Take` の仕様）。この戻り値を確認せず捨てると、
+/// 宣言された `len` より短い本文で接続が切断された場合に、フレームが
+/// 途中で切り詰められた事実を見逃し正規の読み捨てとして受理してしまう
+/// （AGENTS.md P0「wire プロトコル入力の未検証処理」・codex P0 指摘・
+/// PR #1013）。ここでは実コピー長を `len` と照合し、一致しなければ
+/// [`FrameError::Truncated`] へ fail-closed に写像する。
+pub fn discard_body<R: Read>(reader: &mut R, len: usize) -> Result<(), FrameError> {
+    let mut limited = reader.take(len as u64);
+    let copied = io::copy(&mut limited, &mut io::sink())?;
+    if copied != len as u64 {
+        return Err(FrameError::Truncated);
+    }
+    Ok(())
+}
+
 /// StartupMessage（SSLRequest/GSSENCRequest/CancelRequest を含む、認証前の最初の
 /// パケット）を読み取る。`MIN_STARTUP_LEN..=MAX_STARTUP_LEN` の範囲外は
 /// `Malformed`（`08P01`）に写像する（WIRE-10。`MAX_MESSAGE_LEN` 超過であっても
@@ -330,6 +354,36 @@ mod tests {
             .expect_err("truncated body must be rejected");
         assert!(matches!(err, FrameError::Truncated));
         assert_eq!(err.sqlstate(), None);
+    }
+
+    /// codex P0 指摘（PR #1013）の回帰防止: `discard_body` は宣言長どおりの
+    /// バイト数を読み捨てた場合のみ成功し、`Read::take` が基底 reader の
+    /// EOF で切り詰められた場合（宣言長より短い本文で接続が切断された場合）
+    /// は `FrameError::Truncated` へ fail-closed に写像する。`io::copy` の
+    /// 戻り値（実コピー長）を確認しないと、この切り詰めが正常な読み捨てと
+    /// して受理されてしまう。
+    #[test]
+    fn discard_body_accepts_exact_length() {
+        let mut cursor = Cursor::new(vec![0u8; 10]);
+        discard_body(&mut cursor, 10).expect("exact length must be accepted");
+        assert_eq!(cursor.position(), 10);
+    }
+
+    #[test]
+    fn discard_body_rejects_short_read_as_truncated() {
+        // 宣言長 10 に対し実際に読める本文は 3 バイトしかない
+        // （`ignore_till_sync` 中に接続が切断されたケースの再現）。
+        let mut cursor = Cursor::new(vec![0u8; 3]);
+        let err = discard_body(&mut cursor, 10).expect_err("short read must be rejected");
+        assert!(matches!(err, FrameError::Truncated));
+        assert_eq!(err.sqlstate(), None);
+    }
+
+    #[test]
+    fn discard_body_accepts_zero_length() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        discard_body(&mut cursor, 0).expect("zero length must be accepted");
+        assert_eq!(cursor.position(), 0);
     }
 
     #[test]

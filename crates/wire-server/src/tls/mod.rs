@@ -23,12 +23,22 @@
 //!   最小集合 6 種の parse/serialize と、レコード境界をまたぐ再組み立てを
 //!   担う。拡張の意味解釈・状態機械・暗号は持たない（`handshake` の
 //!   ドキュメンテーションコメントを参照）
+//! - [`client_hello`]: `ClientHello` 拡張の意味解釈・受理判定・
+//!   HelloRetryRequest 構築（RFC 8446 §4.1.2・§4.1.3・§4.2。#954）。
+//!   TLS 1.3・`TLS_AES_128_GCM_SHA256`・X25519・Ed25519 のみを受理する
+//!   fail-closed な純粋関数層で、状態は持たない（`client_hello` の
+//!   ドキュメンテーションコメントを参照）
 //! - [`hkdf`]: HMAC-SHA-256（RFC 2104）・HKDF-Extract/Expand（RFC 5869）・
 //!   `HKDF-Expand-Label`／`Derive-Secret`（RFC 8446 §7.1）の原始操作
 //!   （Issue #956）。ハッシュ本体は `engine::crypto::sha256`（SCRAM-SHA-256 認証・Issue #940 が切り出し済み）を再利用する
 //! - [`key_schedule`]: TLS 1.3 鍵スケジュール本体（RFC 8446 §7.1。Issue #956）。
 //!   Early → Handshake → Master の secret 遷移と各段の traffic secret／
 //!   key／iv 導出を型状態で提供する
+//! - [`record_protection`]: レコード保護層（RFC 8446 §5.2〜§5.5。Issue #959）。
+//!   [`record`]・[`key_schedule`]・[`aes_gcm`] をつなぎ、per-record nonce・
+//!   シーケンス番号・`TLSInnerPlaintext`（内容型・パディング）・AAD の構成・
+//!   handshake 鍵 → application 鍵の方向別切替（[`record_protection::
+//!   Sealer`]／[`record_protection::Opener`]）を提供する
 //! - [`pem`]: PEM（RFC 7468）ブロックのデコードと、鍵・証明書ファイルの
 //!   上限付き読み込み（Issue #962）。定数時間 base64 デコーダを持ち、
 //!   秘密鍵ブロックはちょうど 1 個・証明書チェーンは複数ブロックを順序
@@ -38,14 +48,14 @@
 //!   RSA・ECDSA・v2（OneAsymmetricKey）等は起動時に明示的に拒否する。
 //!   鍵導出・署名は #961 の担当
 //!
-//! key_share 拡張の解析（#954）・alert 型やハンドシェイク状態機械（#965）・
-//! レコード保護／暗号化（#959）・接続への結線（#966 以降）はいずれも
-//! 後続 sub-issue の担当であり、本モジュールは対象外のまま。並列開発時の
-//! コンフリクトを避けるため、後続 sub-issue は `pub mod` を 1 行ずつ
-//! 追加していく想定。
+//! alert の実送出やハンドシェイク状態機械（#965）・接続への結線
+//! （#966 以降）はいずれも後続 sub-issue の担当であり、本モジュールは
+//! 対象外のまま。並列開発時のコンフリクトを避けるため、後続 sub-issue は
+//! `pub mod` を 1 行ずつ追加していく想定。
 
 pub mod aes;
 pub mod aes_gcm;
+pub mod client_hello;
 pub(crate) mod field25519;
 pub mod handshake;
 pub mod hkdf;
@@ -53,4 +63,5 @@ pub mod key_schedule;
 pub mod pem;
 pub mod pkcs8;
 pub mod record;
+pub mod record_protection;
 pub mod x25519;

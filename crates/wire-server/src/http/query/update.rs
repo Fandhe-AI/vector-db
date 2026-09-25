@@ -279,6 +279,13 @@ fn map_set_assignments(
                     "SET VECTOR column value must be a JSON array of numbers",
                 ))
             }
+            // `INTEGER`／`BIGINT` 列の NoSQL SET 対応は Issue #896 の担当。
+            // 本 Issue（#881）では未対応として明示的に拒否する。
+            (ColumnType::Integer | ColumnType::BigInt, _) => {
+                return Err(UpdateError::Set(
+                    "SET integer column is not supported on the NoSQL surface yet",
+                ))
+            }
             // F10（Issue #882 計画）: REAL/DOUBLE 列の JSON 束縛は #896 の担当。
             // 現時点では非対応列として一律拒否する（`22000`。既存の型不一致と
             // 同じ応答形へ合流させる）。
