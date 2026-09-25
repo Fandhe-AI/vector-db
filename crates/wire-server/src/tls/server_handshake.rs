@@ -973,12 +973,19 @@ impl TlsSession {
 /// 実装する（#966 の実接続結線がこの trait を経由する）。
 pub trait HandshakeTransport: Read + Write {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+    /// 送信側の絶対期限強制（[`DeadlineWriter`]）が使う書き込みタイムアウト
+    /// 設定。読み取り側の [`set_read_timeout`](Self::set_read_timeout) と対。
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
     fn shutdown(&mut self) -> io::Result<()>;
 }
 
 impl HandshakeTransport for std::net::TcpStream {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         std::net::TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        std::net::TcpStream::set_write_timeout(self, timeout)
     }
 
     fn shutdown(&mut self) -> io::Result<()> {
@@ -1015,6 +1022,42 @@ impl<S: HandshakeTransport> Read for DeadlineReader<'_, S> {
         }
         self.stream.set_read_timeout(Some(remaining))?;
         self.stream.read(buf)
+    }
+}
+
+/// [`perform_server_handshake_with`] がハンドシェイク全体の**絶対期限**を
+/// 送信側にも強制する `Write` ラッパー（PR #1046 レビュー指摘）。
+///
+/// [`DeadlineReader`] は受信側の各 `read` 呼び出しで残り時間を都度
+/// ソケットへ反映するが、送信側（`write_all_records` が `Step::Continue`
+/// で ServerHello・証明書等を含む server flight を書き出す経路）には
+/// 対応する期限強制がなく、相手が受信を止めれば `write_all` が無期限に
+/// ブロックしハンドシェイク全体の絶対期限を超えて接続処理を占有し得た。
+/// 本ラッパーは `write` を呼ぶたびに `deadline` までの残り時間を
+/// 再計算して都度ソケットへ反映することで、`DeadlineReader` と対称な
+/// 絶対期限強制を送信側にも与える。期限切れ後は OS を呼ばず即座に
+/// `TimedOut` を返す（`DeadlineReader` と同じ理由でゼロ Duration は
+/// 渡さない）。
+struct DeadlineWriter<'a, S: HandshakeTransport> {
+    stream: &'a mut S,
+    deadline: Instant,
+}
+
+impl<S: HandshakeTransport> Write for DeadlineWriter<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TLS handshake exceeded overall time budget",
+            ));
+        }
+        self.stream.set_write_timeout(Some(remaining))?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }
 
@@ -1087,11 +1130,11 @@ pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeE
         match record_result {
             Ok(Some(record)) => match core.handle_record(&record) {
                 Ok(Step::Continue(output)) => {
-                    write_all_records(stream, &output, core.write_record_kind())
+                    write_all_records(stream, &output, core.write_record_kind(), deadline)
                         .map_err(ServerHandshakeDriverError::Record)?;
                 }
                 Ok(Step::Complete(output, session)) => {
-                    write_all_records(stream, &output, core.write_record_kind())
+                    write_all_records(stream, &output, core.write_record_kind(), deadline)
                         .map_err(ServerHandshakeDriverError::Record)?;
                     // DeadlineReader はハンドシェイク中の各読み取りで
                     // 「絶対期限までの残り時間」を set_read_timeout へ設定する
@@ -1110,13 +1153,18 @@ pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeE
                     return Ok(session);
                 }
                 Ok(Step::ClosedByPeer(output)) => {
-                    let _ = write_all_records(stream, &output, core.write_record_kind());
+                    let _ = write_all_records(stream, &output, core.write_record_kind(), deadline);
                     let _ = stream.shutdown();
                     return Err(ServerHandshakeDriverError::ClosedByPeer);
                 }
                 Err(err) => {
                     let alert_output = core.take_pending_alert_output();
-                    let _ = write_all_records(stream, &alert_output, core.write_record_kind());
+                    let _ = write_all_records(
+                        stream,
+                        &alert_output,
+                        core.write_record_kind(),
+                        deadline,
+                    );
                     let _ = stream.shutdown();
                     return Err(ServerHandshakeDriverError::Handshake(err));
                 }
@@ -1129,7 +1177,8 @@ pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeE
             }
             Err(e) => {
                 let alert_output = core.fail_on_record_error(e.alert_description());
-                let _ = write_all_records(stream, &alert_output, core.write_record_kind());
+                let _ =
+                    write_all_records(stream, &alert_output, core.write_record_kind(), deadline);
                 let _ = stream.shutdown();
                 return Err(ServerHandshakeDriverError::Record(e));
             }
@@ -1137,17 +1186,25 @@ pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeE
     }
 }
 
-fn write_all_records<S: Write>(
+/// server flight（ServerHello・証明書・Finished 等）を `deadline`（ハンド
+/// シェイク全体の絶対期限。[`perform_server_handshake_with`] 参照）の
+/// 制約下で送出する。[`DeadlineWriter`] 経由で書き込むため、相手が受信を
+/// 止めても `deadline` を超えて `write_all` がブロックし続けることはない。
+fn write_all_records<S: HandshakeTransport>(
     stream: &mut S,
     records: &[Record],
     kind: RecordKind,
+    deadline: Instant,
 ) -> Result<(), record::RecordError> {
     let mut buf = Vec::new();
     for record in records {
         record.serialize_into(&mut buf, kind)?;
     }
     if !buf.is_empty() {
-        stream.write_all(&buf).map_err(record::RecordError::Io)?;
+        let mut deadline_writer = DeadlineWriter { stream, deadline };
+        deadline_writer
+            .write_all(&buf)
+            .map_err(record::RecordError::Io)?;
     }
     Ok(())
 }
@@ -1230,6 +1287,77 @@ mod tests {
                 AlertDescription::RecordOverflow
             )),
             Some(AlertDescription::RecordOverflow)
+        );
+    }
+
+    /// PR #1046 レビュー指摘の回帰: 相手が受信を止めた場合でも
+    /// `write_all_records`（server flight の送出）はハンドシェイク全体の
+    /// 絶対期限に束縛される。修正前は送信側に一切タイムアウトを設定
+    /// しておらず、相手が受信を止めると `write_all` が無期限にブロックし
+    /// 得た。このモックは「OS が `set_write_timeout` を尊重し、相手が
+    /// 読まないまま指定時間だけブロックしたのちタイムアウトを返す」という
+    /// 実ソケットの典型的挙動を再現する。
+    #[test]
+    fn write_all_records_is_bounded_by_absolute_deadline_when_peer_stops_reading() {
+        struct StalledPeer {
+            write_timeout: Option<Duration>,
+        }
+
+        impl Read for StalledPeer {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl Write for StalledPeer {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                // 相手が受信を止めた状況では、OS は `set_write_timeout` で
+                // 指定された時間だけブロックしたのちタイムアウトを返す。
+                std::thread::sleep(self.write_timeout.unwrap_or(Duration::from_secs(5)));
+                Err(io::Error::new(io::ErrorKind::TimedOut, "peer never reads"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl HandshakeTransport for StalledPeer {
+            fn set_read_timeout(&mut self, _timeout: Option<Duration>) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+                self.write_timeout = timeout;
+                Ok(())
+            }
+
+            fn shutdown(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut peer = StalledPeer {
+            write_timeout: None,
+        };
+        let record = Record {
+            content_type: ContentType::Handshake,
+            legacy_version: 0x0303,
+            fragment: vec![0u8; 16],
+        };
+        let deadline = Instant::now() + Duration::from_millis(50);
+
+        let started = Instant::now();
+        let result = write_all_records(&mut peer, &[record], RecordKind::Plaintext, deadline);
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a peer that never reads must not appear to succeed"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "write must be bounded by the absolute deadline, got {elapsed:?}"
         );
     }
 }

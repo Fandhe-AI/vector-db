@@ -158,6 +158,19 @@ Issue #965 の PR（#1046）に対する codex・Bugbot の指摘（いずれも
    `dummy_ccs_after_server_hello_is_discarded_without_limit`（3 個連続の
    読み捨てを固定）へ改め、値違反の拒否を独立に固定する
    `dummy_ccs_with_wrong_fragment_value_is_rejected` を追加した。
+4. **server flight 送信側の絶対期限化**（codex P1）: 上記 1 の
+   `DeadlineReader` は読み取り側のみ絶対期限を強制しており、
+   `Step::Continue`／`Step::Complete` で ServerHello・証明書等を含む
+   server flight を送出する `write_all_records` には一切タイムアウトが
+   設定されていなかった。相手が受信を止めると `write_all` が無期限に
+   ブロックし、ハンドシェイク全体の絶対期限を超えて接続処理を占有し
+   得た。`DeadlineReader` と対称な `Write` ラッパー `DeadlineWriter` を
+   新設し、`write_all_records` の書き込みごとに `deadline` までの残り
+   時間を再計算して都度ソケットの書き込みタイムアウトへ反映するよう
+   変更した（`HandshakeTransport` へ `set_write_timeout` を追加）。
+   単体テスト `write_all_records_is_bounded_by_absolute_deadline_when_
+   peer_stops_reading`（相手が受信を止めた状況を模したモックで、
+   書き込みが絶対期限に束縛されることを固定）を追加した。
 
 ## 対象外（後続 sub-issue の担当）
 
@@ -190,7 +203,8 @@ KeyUpdate・NewSessionTicket・0-RTT・クライアント証明書は親 Issue �
   - ダミー CCS の無制限読み捨て・値違反拒否・時期外拒否（PR #1046 で
     上限撤廃に合わせ更新）
   - ハンドシェイク全体の絶対期限（低速送信クライアントに対する強制。
-    PR #1046 で追加）
+    PR #1046 で追加。読み取り側に加え、相手が受信を止めた場合の
+    送信側（server flight 送出）の束縛も単体テストで固定）
   - `TlsSession` の終端状態（`close_notify` 送信/受信後・復号失敗後の
     poison。PR #1046 で追加）
   - 状態外メッセージ（`ApplicationData` 早期受信）・解析失敗
