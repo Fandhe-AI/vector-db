@@ -1263,7 +1263,8 @@ fn handle_connection_inner(
     // 共有 `redb::WriteTransaction` は commit されずに abort され、単一ライタの
     // 占有（`writer_gate::WriterPermit`）も解放される。
     let mut txn = engine.map(|e| e.new_session_transaction());
-    // Issue #902（SQL-23・TASK-203）: DDL 実行権限は認証成功後（＝`username` が
+    // SQL-23・TASK-202・TASK-203（Issue #899・#902）: DDL 実行権限
+    // （`CREATE TABLE`・`DROP TABLE` 共通）は認証成功後（＝`username` が
     // 確定した時点）に 1 回だけ付与する。`PolicyContext`（`ctx`）はテナント ID・
     // 可視性のみを運び認証主体を持たないため、この判定は `ctx` ではなく
     // `store`（`--ddl-allowed-users`）に基づく。SQL 文経由でセッションが自身の

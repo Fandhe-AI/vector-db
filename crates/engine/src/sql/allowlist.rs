@@ -10,6 +10,7 @@
 //! 後続タスクが [`ValidatedStatement`] を土台に実装する。本モジュールは
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
+use crate::catalog::{ColumnDef, ColumnType};
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
@@ -30,6 +31,12 @@ const MAX_ERROR_DETAIL_LEN: usize = crate::error_format::MAX_MESSAGE_LEN;
 /// 無制限 `Vec` 確保を避ける（`.claude/rules/security.md`「不安全な設計｜無制限
 /// リソース確保（DoS）」対応）。`catalog::MAX_COLUMN_COUNT` と同値を採用する。
 const MAX_INSERT_COLUMNS: usize = 256;
+
+/// `CREATE TABLE`（SQL-23・TASK-85、Issue #899）の列リストが持てる列数の上限。
+/// `catalog::MAX_COLUMN_COUNT` と同値を採用する（`MAX_INSERT_COLUMNS` と同じ
+/// 「無制限 `Vec` 確保を避ける」設計方針。列を `Vec` へ push する**前**に判定し、
+/// アロケーション前の上限検証（`.claude/rules/security.md`）を満たす）。
+const MAX_CREATE_TABLE_COLUMNS: usize = 256;
 
 /// 複数行 `VALUES (...), (...), ...`（SQL-16、TASK-190）が 1 文に持てる行数の上限。
 /// `sql/group_by.rs::MAX_GROUPS` と同じ「本リポ独自の実装既定値・無制限 `Vec`
@@ -298,13 +305,20 @@ pub enum SqlSurfaceError {
     /// 許可リスト外）とは意味論的に異なるため、`wire-server` 側の分類縮退
     /// （Issue #896 レビュー指摘）を避けるために独立させた。
     FeatureNotSupported { detail: String },
-    /// DDL 文（`DROP TABLE` 等。SQL-23、TASK-203、Issue #902）を、DDL 実行権限
-    /// （[`crate::sql::mode::SessionState::ddl_allowed`]）を持たないセッションが
-    /// 実行しようとした（ERR-2 拡張: `42501`。[`crate::error_format::ErrorClass::
-    /// ForbiddenTenantMismatch`] を再利用する——テナント帰属不一致とは原因が
-    /// 異なるが `wire_code` は同じ `42501` であり、`ErrorClass` は分類名ではなく
-    /// `wire_code` の一意対応を保証する単位のため、新規分類は追加しない）。
-    /// 判定順序は構文検証の直後・カタログ照会（対象テーブルの存在確認）より前
+    /// `CREATE TABLE`（SQL-23・TASK-85、Issue #899）が指定したテーブル名が既に
+    /// カタログに存在する。既存スキーマは変更しない（TABLE-4）。ERR-6: `42P07`。
+    DuplicateTable { name: String },
+    /// `CREATE TABLE` の列リストに同名の列が複数回宣言された（TABLE-6、
+    /// Issue #899）。ERR-6: `42701`。
+    DuplicateColumn { name: String },
+    /// DDL 文（`CREATE TABLE`・`DROP TABLE` 等。SQL-23、TASK-202・TASK-203、
+    /// Issue #899・#902）を、DDL 実行権限（[`crate::sql::mode::SessionState::
+    /// ddl_allowed`]）を持たないセッションが実行しようとした（ERR-2 拡張:
+    /// `42501`。[`crate::error_format::ErrorClass::ForbiddenTenantMismatch`] を
+    /// 再利用する——テナント帰属不一致とは原因が異なるが `wire_code` は同じ
+    /// `42501` であり、`ErrorClass` は分類名ではなく `wire_code` の一意対応を
+    /// 保証する単位のため、新規分類は追加しない）。判定順序は構文検証の
+    /// 直後・カタログ照会（対象テーブルの存在確認）より前
     /// （`sql::ddl::require_ddl_permission` 参照）: 権限を持たない主体には対象
     /// テーブルの有無を問わず常にこの分類を返し、DDL 権限をテーブル存在の
     /// オラクルにしない（security.md「エラー・ログ経由で他テナントのデータ・
@@ -363,6 +377,23 @@ impl SqlSurfaceError {
     /// エラーへ含める（security.md「情報漏えい」対応）。
     fn undefined_table(name: impl Into<String>) -> Self {
         SqlSurfaceError::UndefinedTable {
+            name: truncate_for_error(&name.into()),
+        }
+    }
+
+    /// `pub(crate)`: `sql::ddl::execute_create_table`（Issue #899）が
+    /// `catalog::CatalogError::TableAlreadyExists` を写像するために使う。
+    /// テーブル名は untrusted な字句解析結果のため長さを切り詰める。
+    pub(crate) fn duplicate_table(name: impl Into<String>) -> Self {
+        SqlSurfaceError::DuplicateTable {
+            name: truncate_for_error(&name.into()),
+        }
+    }
+
+    /// `pub(crate)`: `CREATE TABLE`（Issue #899）の列リスト構造検証が同一文内の
+    /// 列名重複を報告するために使う。
+    pub(crate) fn duplicate_column(name: impl Into<String>) -> Self {
+        SqlSurfaceError::DuplicateColumn {
             name: truncate_for_error(&name.into()),
         }
     }
@@ -440,6 +471,8 @@ impl ClassifiedError for SqlSurfaceError {
                 ErrorClass::FeatureNotSupported
             }
             SqlSurfaceError::FeatureNotSupported { .. } => ErrorClass::FeatureNotSupported,
+            SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
+            SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InsufficientPrivilege => ErrorClass::ForbiddenTenantMismatch,
         }
     }
@@ -515,6 +548,12 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::FeatureNotSupported { detail } => {
                 write!(f, "feature not supported: {detail}")
+            }
+            SqlSurfaceError::DuplicateTable { name } => {
+                write!(f, "table already exists: {name}")
+            }
+            SqlSurfaceError::DuplicateColumn { name } => {
+                write!(f, "duplicate column name: {name}")
             }
             // テーブル名・ユーザー名を含めない固定文言（security.md P0。
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
@@ -1247,6 +1286,25 @@ impl ValidatedPredicateDelete {
 pub enum DeleteStatement {
     SingleRow(ValidatedDelete),
     Predicate(ValidatedPredicateDelete),
+}
+
+/// 許可形状の構造判定を通過した `CREATE TABLE` 文（SQL-23・TASK-85、Issue #899）。
+/// カタログ照会（既存テーブル名との衝突判定）は本モジュールの管轄外——
+/// `sql::ddl::execute_create_table` が `catalog::Storage::create_table` の
+/// 単一 write トランザクション内で行う（事前の `table_exists` 照会は TOCTOU を
+/// 避けるため行わない。`sql::ddl` モジュールドキュメント参照）。
+///
+/// 受理する形は `CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]` の
+/// みで、`<type>` は `TEXT`／`VECTOR ( <N> )` のみ（`IF NOT EXISTS`・列制約・
+/// 表制約・`USING OPERATION_ID` の付与はいずれも許可リスト外。TABLE-13/14 の
+/// 追加型は別 Issue の管轄）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedCreateTable {
+    /// カタログ存在確認前のテーブル名（識別子形式のみ検証済み）。
+    pub table_name: String,
+    /// 宣言順を保持した列定義（1 件以上）。`VECTOR` 列は `nullable = false`・
+    /// `TEXT` 列は `nullable = true`（PostgreSQL の既定に倣う。TABLE-1）。
+    pub columns: Vec<ColumnDef>,
 }
 
 /// 許可形状の構造判定を通過した TRUNCATE 文（SQL-22、TASK-195）。テーブル定義
@@ -2584,6 +2642,98 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]`（SQL-23・
+    /// TASK-85、Issue #899）の許可形状。カタログ照会は行わない（`sql::ddl`
+    /// モジュールドキュメント・[`ValidatedCreateTable`] 参照）。列数の上限判定
+    /// （`MAX_CREATE_TABLE_COLUMNS`）は、次の列を実際にパースする直前
+    /// （カンマを消費した直後）にのみ行う。ちょうど上限数の列で閉じ括弧
+    /// `)` に到達する場合はこの判定を経由せず正しく受理される（次の列を
+    /// 一切パースしない＝アロケーションもしない前に上限超過を拒否する
+    /// 設計は維持。`.claude/rules/security.md`「不安全な設計｜無制限
+    /// リソース確保（DoS）」対応。PR #1044 レビュー時の境界値誤検知
+    /// （ちょうど上限数の列を誤って拒否する off-by-one 懸念）の指摘を受け、
+    /// 誤検知の再発を防ぐためにこの位置へ判定を固定した）。
+    fn parse_create_table(&mut self) -> Result<ValidatedCreateTable, SqlSurfaceError> {
+        self.expect_contextual_keyword("CREATE")?;
+        self.expect_contextual_keyword("TABLE")?;
+        let table_name = self.expect_ident()?;
+        crate::catalog::validate_identifier(&table_name)
+            .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+
+        self.expect_punct('(')?;
+        let mut columns: Vec<ColumnDef> = Vec::new();
+        loop {
+            let column = self.parse_create_table_column(&columns)?;
+            columns.push(column);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                if columns.len() >= MAX_CREATE_TABLE_COLUMNS {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many columns in CREATE TABLE",
+                    ));
+                }
+                continue;
+            }
+            break;
+        }
+        self.expect_punct(')')?;
+
+        Ok(ValidatedCreateTable {
+            table_name,
+            columns,
+        })
+    }
+
+    /// `CREATE TABLE` の列 1 個ぶんの許可形状: `<col> (TEXT | VECTOR '(' <N> ')')`
+    /// （Issue #899）。`TEXT`／`VECTOR` は `lexer::Keyword` へ含めない（`SET`・
+    /// `CREATE` と同方針。statement 中のこの位置でのみ文脈的キーワードとして
+    /// 照合する）。予約列名（`id`／`tenant_id`／`visibility`。ASCII の大文字小文字を
+    /// 無視して照合）・同一文内の列名重複はここで拒否する（`sql::parser` が
+    /// これら 3 語を疑似列・RLS 内部列として扱う契約と整合させ、SQL 表層の DDL で
+    /// これらを隠蔽する列を作らせない。fail-closed。`.claude/rules/security.md`
+    /// 「アクセス制御の不備」対応）。`VECTOR` の次元は `Token::Number` を `u32` へ
+    /// checked に parse する（先頭 `-`・小数点・オーバーフローはいずれも
+    /// `UnsupportedSyntax` へ落ちる。範囲（`1..=MAX_VECTOR_DIM`）検証自体は
+    /// `catalog::validate_schema`（`sql::ddl::execute_create_table` が書き込み
+    /// トランザクション内で通す）に委ねる——同じ `42601` 分類のため二重実装しない）。
+    fn parse_create_table_column(
+        &mut self,
+        existing: &[ColumnDef],
+    ) -> Result<ColumnDef, SqlSurfaceError> {
+        let name = self.expect_ident()?;
+        crate::catalog::validate_identifier(&name)
+            .map_err(|e| SqlSurfaceError::unsupported(format!("invalid column name: {e}")))?;
+        if name.eq_ignore_ascii_case("id")
+            || name.eq_ignore_ascii_case("tenant_id")
+            || name.eq_ignore_ascii_case("visibility")
+        {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "column name {name:?} is reserved"
+            )));
+        }
+        if existing.iter().any(|c| c.name == name) {
+            return Err(SqlSurfaceError::duplicate_column(name));
+        }
+
+        if self.peek_ident_matches("TEXT") {
+            self.advance();
+            return Ok(ColumnDef::new(name, ColumnType::Text, true));
+        }
+        if self.peek_ident_matches("VECTOR") {
+            self.advance();
+            self.expect_punct('(')?;
+            let raw_dim = self.expect_number()?;
+            let dim: u32 = raw_dim.parse().map_err(|_| {
+                SqlSurfaceError::unsupported(format!("invalid VECTOR dimension: {raw_dim:?}"))
+            })?;
+            self.expect_punct(')')?;
+            return Ok(ColumnDef::new(name, ColumnType::Vector(dim), false));
+        }
+        Err(SqlSurfaceError::unsupported(
+            "expected column type TEXT or VECTOR(<dim>)",
+        ))
+    }
+
     /// `DROP TABLE <table> [;]` の単一テーブル形のみを受理する（SQL-23、
     /// TASK-203、Issue #902）。`IF EXISTS`・`CASCADE`・`RESTRICT`・複数テーブル
     /// 列挙・`USING OPERATION_ID` 句は構造的に受理しない（`expect_end_of_statement`
@@ -3365,6 +3515,39 @@ pub(crate) fn validate_insert_tokens(
 /// 検証順序は決定的（同一入力には常に同一の [`SqlSurfaceError`] を返す）。
 /// `operation_id` 必須化ガード（`mode.require`。TASK-92・RECOVER-1）を含む段階構成の
 /// 詳細は `recovery::required_op_id` モジュールドキュメント参照。
+/// 先頭 2 トークンが文脈的キーワード `CREATE`／`TABLE`（大文字小文字を区別しない。
+/// `is_create_function_statement`〔`validate_sql_tokens`〕と同じ「statement 先頭
+/// という文脈でのみキーワードとして判定する」方針）に一致するかを判定する
+/// （SQL-23・TASK-202、Issue #899）。`core.rs::EngineCore::parse_tokens` が
+/// [`validate_create_table_tokens`]（構造検証のみ・カタログ照会なし）へ分岐
+/// するために使う。`parse_tokens` は本関数（構造検証のみ・カタログ照会なし）を
+/// DDL 実行権限ゲートより先に実行するため、不正な構文は権限の有無に関わらず
+/// 常に構文エラー（`42601`）になる。DDL 実行権限ゲート
+/// （`sql::ddl::require_ddl_permission`）は `DROP TABLE` と同じく
+/// `execute_parsed_in_session` の `ParsedSql::CreateTable` 分岐が、カタログ照会を
+/// 含む実行本体より前に適用する——構文検証を通過した文に限り、未許可の主体は
+/// テーブルが存在するかに関わらず同じ `InsufficientPrivilege`（`42501`）のみを
+/// 受け取り、その情報を一切観測できない（fail-closed。`sql::ddl` モジュール
+/// ドキュメント参照）。
+pub(crate) fn is_create_table_statement(tokens: &[Token]) -> bool {
+    matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"))
+        && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("TABLE"))
+}
+
+/// [`is_create_table_statement`] が真を返したトークン列から `CREATE TABLE`
+/// の許可形状を構造検証する（SQL-23・TASK-85、Issue #899）。カタログ照会
+/// （既存テーブル名との衝突判定）は行わない——[`ValidatedCreateTable`] の
+/// ドキュメント参照のとおり、`sql::ddl::execute_create_table` が単一の
+/// 書き込みトランザクション内で TOCTOU なく判定する。
+pub(crate) fn validate_create_table_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedCreateTable, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let validated = p.parse_create_table()?;
+    p.expect_end_of_statement()?;
+    Ok(validated)
+}
+
 pub fn validate_truncate(
     sql: &str,
     lookup: &impl TableLookup,
@@ -7446,5 +7629,40 @@ mod tests {
         )
         .expect("compare-only mode must not require operation_id");
         assert_eq!(stmt.operation_id, None);
+    }
+
+    /// PR #1044 レビュー時の境界値誤検知（ちょうど `MAX_CREATE_TABLE_COLUMNS`
+    /// 列の `CREATE TABLE` が off-by-one で誤って `54000` 拒否されるという
+    /// 懸念）に対する回帰テスト。ちょうど上限数の列は受理される。
+    #[test]
+    fn create_table_accepts_exactly_max_columns() {
+        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS)
+            .map(|i| format!("c{i} TEXT"))
+            .collect();
+        let sql = format!("CREATE TABLE t ({})", cols.join(", "));
+        let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+        let result = validate_create_table_tokens(&tokens);
+        match &result {
+            Ok(v) => assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS),
+            Err(e) => {
+                panic!("expected ok for exactly {MAX_CREATE_TABLE_COLUMNS} columns, got err: {e:?}")
+            }
+        }
+    }
+
+    /// 上限を 1 つ超える列数は `payload_too_large`（`54000`）で拒否される
+    /// （上記回帰テストと対の境界値検証）。
+    #[test]
+    fn create_table_rejects_max_columns_plus_one() {
+        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS + 1)
+            .map(|i| format!("c{i} TEXT"))
+            .collect();
+        let sql = format!("CREATE TABLE t ({})", cols.join(", "));
+        let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+        let result = validate_create_table_tokens(&tokens);
+        match result {
+            Err(SqlSurfaceError::PayloadTooLarge { .. }) => {}
+            other => panic!("expected PayloadTooLarge, got: {other:?}"),
+        }
     }
 }

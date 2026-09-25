@@ -664,30 +664,35 @@ Date: <IMF-fixdate>
 | `25P01` | `NO_ACTIVE_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
 | `25P02` | `IN_FAILED_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
+| `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE` は op 許可リスト外。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
 | `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
 | `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
 | `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | `insert` の `operation_id` 重複（内容一致の再送） |
+| `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE` は op 許可リスト外。後述） |
 | `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過 |
 | `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
 | `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | NoSQL 表層の実要求からは到達不能（明示トランザクション制御が op 語彙に無い。後述） |
 
-到達不能な 7 分類（`42501`・`P0002`・`55P03`・`25000`・`25001`・`25P01`・
-`25P02`）の理由: NoSQL 表層はテナントをセッション
-（`SessionPrincipal::policy_context()`）からのみ導出し、
-クライアント自己申告の `tenant_id` 相当値は JSON／ヘッダ／パスいずれの
-位置でも `42601` で先に拒否するため、`ForbiddenTenantMismatch` を実要求から
-誘発する経路が構造的に存在しない。`RowNotFound` に対応する op（更新・削除系）
-も NoSQL 表層の許可リストに無い。明示トランザクション（SQL-31・TASK-221）の
+到達不能な 9 分類（`42501`・`P0002`・`42701`・`42P07`・`55P03`・`25000`・
+`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
+（`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
+`tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
+ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
+`RowNotFound` に対応する op（更新・削除系）も NoSQL 表層の許可リストに無い。
+`DuplicateColumn`（`42701`）・`DuplicateTable`（`42P07`）は `CREATE TABLE`
+（SQL-23・TASK-202・Issue #899）が誘発する分類だが、NoSQL 表層の `op` 許可
+リストに `create_table` 相当が無いため実要求からは到達しない（`docs/design/
+sql-create-table.md` 参照）。明示トランザクション（SQL-31・TASK-221）の
 `BEGIN`／`COMMIT`／`ROLLBACK`・ロック待ち（`55P03`）は SQL 表層専用の機構で、
 NoSQL 表層の `op` 許可リストにトランザクション制御に対応する語彙が無いため
 到達しない。テナント境界の検査を緩める・バイパスする production 経路をこれら
-の分類のために新設することはせず（`.claude/rules/security.md` P0）、
-射影表としての一致のみを production の応答エンコーダ経由で固定する。
+の分類のために新設することはせず（`.claude/rules/security.md` P0）、射影表と
+しての一致のみを production の応答エンコーダ経由で固定する。
 
 本節の各 op スキーマ節（[op 別スキーマ](#op-別スキーマ)・
 [`filter` 配列](#filter-配列)・[`explain`](#explain)）では引き続き

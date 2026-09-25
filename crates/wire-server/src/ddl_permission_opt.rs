@@ -1,11 +1,12 @@
 //! `wire-server` バイナリ（`main.rs`）が起動時に受け取る `--ddl-allowed-users`
-//! opt-in CLI 引数の閉じた検証パーサ（Issue #902・SQL-23・TASK-203）。
+//! opt-in CLI 引数の閉じた検証パーサ（Issue #902・SQL-23・TASK-203。`CREATE
+//! TABLE`（Issue #899・TASK-202）も同じ権限フラグを共有する単一の判定点とする）。
 //!
 //! `--durability`／`--search-engine` と同型の「プロセス起動時にのみ明示指定する
 //! 注入点」であり、`engine::sql::mode::SessionState::allow_ddl`（DDL 実行権限。
-//! `EngineCore::execute_parsed_in_session` の `DROP TABLE` 分岐が
-//! `sql::ddl::require_ddl_permission` で参照する）へ untrusted な CLI 文字列から
-//! 到達する唯一の入口を本モジュールに置く。
+//! `EngineCore::execute_parsed_in_session` の `DROP TABLE`／`CREATE TABLE`
+//! 分岐が `sql::ddl::require_ddl_permission` で参照する）へ untrusted な CLI
+//! 文字列から到達する唯一の入口を本モジュールに置く。
 //!
 //! 本モジュールはカンマ区切りの username 列挙をパースし重複・空要素を
 //! fail-closed に拒否するところまでを担う。列挙した username が

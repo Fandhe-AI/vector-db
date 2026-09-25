@@ -73,7 +73,7 @@ macro_rules! define_error_classes {
 }
 
 define_error_classes! {
-    count = 23;
+    count = 25;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -89,7 +89,9 @@ define_error_classes! {
     /// `POST /v1/session/close` の再送）。
     AuthRequired => ("28000", "AUTH_REQUIRED"),
     /// テナント帰属不一致（`42501`）。[`crate::tenant::TenantWriteError::Forbidden`]
-    /// の写像。
+    /// の写像。SQL-23・TASK-202・TASK-203（Issue #899・#902）の DDL 実行権限
+    /// 不足（[`crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege`]）も
+    /// 同分類へ写像する（`UniqueViolation` が複数原因を束ねているのと同じ運用）。
     ForbiddenTenantMismatch => ("42501", "FORBIDDEN_TENANT_MISMATCH"),
     /// 参照したテーブルがカタログ未存在（`42P01`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::UndefinedTable`] の写像。
@@ -179,6 +181,14 @@ define_error_classes! {
     /// [`crate::catalog::CatalogError::WriteLockTimeout`]・
     /// [`crate::sql::allowlist::SqlSurfaceError::LockNotAvailable`] の写像。
     LockNotAvailable => ("55P03", "LOCK_NOT_AVAILABLE"),
+    /// `CREATE TABLE` が指定したテーブル名が既に存在する（`42P07`）。TABLE-4・
+    /// TASK-85（Issue #899）が追加。上書きしない設計（既存スキーマは変更されない）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateTable`] の写像。
+    DuplicateTable => ("42P07", "DUPLICATE_TABLE"),
+    /// `CREATE TABLE` の列リストに同名の列が複数回宣言された（`42701`）。
+    /// TABLE-6・TASK-85（Issue #899）が追加。
+    /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateColumn`] の写像。
+    DuplicateColumn => ("42701", "DUPLICATE_COLUMN"),
 }
 
 impl ErrorClass {
