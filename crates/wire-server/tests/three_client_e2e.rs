@@ -53,6 +53,14 @@
 //! （`three_clients_receive_emergency_response_detail_after_post_commit_panic`）。
 //! `--fault-inject` は 1 プロセスにつき 1 回しか発火しない take-once 契約
 //! （Issue #705）のため、クライアントごとに独立したサーバー・DB を起動する。
+//!
+//! WIRE-19（Issue #943）: 明示トランザクションの `ReadyForQuery` 状態バイト
+//! （`'I'`/`'T'`/`'E'`。production の中核は Issue #942・PR #1041 で実装済み）
+//! が無改造クライアント自身の API から観測できることを
+//! `three_clients_observe_transaction_status_transitions` で確認する。
+//! 各ドライバの観測経路の選定理由・非 vacuous 性の検証は
+//! `docs/design/three-client-e2e-harness.md`「トランザクション状態遷移
+//! （Issue #943・WIRE-19）」節参照。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -60,10 +68,11 @@ mod common;
 #[path = "../../engine/src/test_util/temp_db.rs"]
 mod temp_db;
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -91,16 +100,49 @@ fn resolve_tool(env_var: &str, default_name: &str) -> String {
 /// 子プロセスが自発的に終了することがある（Issue #706 の commit 後 panic
 /// 注入。`Drop` の `kill`／`wait` は既終了プロセスに対しても安全に no-op と
 /// なる）ため、`wait_for_exit` で明示的に終了を待ち受けられるようにする。
+///
+/// stderr は listen 行の取得後も子プロセスの終了まで読み続ける（Issue #943）。
+/// 以前は listen 行の取得後に受信側チャネルが破棄されると読み取りスレッドが
+/// 終了してパイプの読み口を閉じていたため、サーバーが接続エラー等を 2 行以上
+/// stderr へ書くと `EPIPE` で `eprintln!` が panic し、panic フック
+/// （TASK-97・RECOVER-6／TASK-99・RECOVER-8）経由で SIGABRT 終了していた
+/// （高負荷下で後続クライアントが "server closed the connection unexpectedly"
+/// となる偽陽性の原因）。listen 後の行は `stderr_tail` に直近
+/// [`STDERR_TAIL_MAX_LINES`] 行まで保持し、テストが panic した場合に限り
+/// `Drop` で終了状態とあわせて出力する（失敗時の診断用）。
 struct ServerGuard {
     child: Child,
     port: u16,
     startup_lines: Vec<String>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
 }
+
+/// 失敗時診断用に保持する listen 後の stderr 行数の上限（無制限に溜めない）。
+const STDERR_TAIL_MAX_LINES: usize = 256;
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
+        // kill 前に終了状態を採取する（テスト中にサーバーが自発終了していたか
+        // を失敗時診断で区別するため）。
+        let exited_before_drop = self.child.try_wait().ok().flatten();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // 子プロセス終了でパイプの書き口が閉じ、読み取りスレッドは EOF で終わる。
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+        if std::thread::panicking() {
+            let tail: Vec<String> = match self.stderr_tail.lock() {
+                Ok(guard) => guard.iter().cloned().collect(),
+                Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
+            };
+            eprintln!(
+                "[e2e-diag] wire-server port={} exited_before_drop={exited_before_drop:?} \
+                 stderr_after_listen={tail:#?}",
+                self.port
+            );
+        }
     }
 }
 
@@ -148,14 +190,29 @@ fn spawn_wire_server(users_path: &Path, db_path: &Path, extra_args: &[String]) -
 
     let stderr = child.stderr.take().expect("piped stderr");
     let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
+    let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let tail_for_reader = Arc::clone(&stderr_tail);
+    // EOF（子プロセス終了）まで読み続ける。受信側（listen 行待ち）が破棄された
+    // 後も読み取りを止めない（止めるとパイプが閉じサーバーが EPIPE で abort
+    // する。[`ServerGuard`] 参照）。
+    let stderr_reader = std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
+        let mut listening = true;
         loop {
             line.clear();
             let n = reader.read_line(&mut line).unwrap_or(0);
-            if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
+            if n == 0 {
                 break;
+            }
+            let taken = std::mem::take(&mut line);
+            if listening {
+                if let Err(mpsc::SendError(unsent)) = tx.send(taken) {
+                    listening = false;
+                    push_tail(&tail_for_reader, unsent);
+                }
+            } else {
+                push_tail(&tail_for_reader, taken);
             }
         }
     });
@@ -184,9 +241,14 @@ fn spawn_wire_server(users_path: &Path, db_path: &Path, extra_args: &[String]) -
         }
     }
 
+    // listen 行の待ち受けを終えたら受信側を破棄し、以降の行は `stderr_tail`
+    // へ回す（読み取りスレッド側で送信失敗を検知して切り替える）。
+    drop(rx);
+
     let Some(port) = port else {
         let _ = child.kill();
         let _ = child.wait();
+        let _ = stderr_reader.join();
         panic!(
             "wire-server did not report a listening port within the deadline \
              (run via `make e2e-three-client` which builds with `--features \
@@ -199,7 +261,93 @@ fn spawn_wire_server(users_path: &Path, db_path: &Path, extra_args: &[String]) -
         child,
         port,
         startup_lines,
+        stderr_tail,
+        stderr_reader: Some(stderr_reader),
     }
+}
+
+/// listen 後の stderr 行を上限付きで `tail` へ追加する（古い行から捨てる）。
+fn push_tail(tail: &Mutex<VecDeque<String>>, line: String) {
+    let mut guard = match tail.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.len() >= STDERR_TAIL_MAX_LINES {
+        guard.pop_front();
+    }
+    guard.push_back(line.trim_end().to_string());
+}
+
+/// 回帰テスト（Issue #943）: [`spawn_wire_server`] が listen 行の取得後も
+/// 子プロセスの stderr を読み続けるため、サーバーが接続エラーを複数行ログへ
+/// 書いても `EPIPE` 起因の panic → fail-fast abort（TASK-99・RECOVER-8）で
+/// 落ちないことを固定する。未読データを残したまま接続を閉じて RST を送り、
+/// サーバー側に `connection error: Connection reset by peer` を複数回ログ
+/// させたうえで（`stderr_tail` に行が届いたことを確認し非 vacuous 化する）、
+/// サーバーが生存し新規接続へ認証要求を返すことを確認する。外部クライアントを
+/// 必要としないため `#[ignore]` を付けず常時実行する。
+#[test]
+fn server_guard_keeps_draining_stderr_so_logged_connection_errors_do_not_abort_server() {
+    const RESET_CONNECTIONS: usize = 3;
+
+    let (db_path, _db_guard) = seed_three_tenant_db();
+    let users_dir = temp_db::TempDir::new("three-client-e2e-stderr-drain-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+    let mut server = spawn_wire_server(&users_path, &db_path, &[]);
+
+    for _ in 0..RESET_CONNECTIONS {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+        common::send_startup_message(&mut stream, "alice", "docs");
+        // サーバーの認証要求が受信バッファに届いたことを `peek`（消費しない）で
+        // 確かめてから読まずに閉じる（未読データを残した close は RST になり、
+        // サーバー側の読み取りが ECONNRESET となって stderr へ 1 行ログされる。
+        // 固定 sleep だと高負荷下で到着前に閉じ FIN になりうるため待ち合わせる）。
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set_read_timeout");
+        let mut probe = [0u8; 1];
+        let peeked = stream
+            .peek(&mut probe)
+            .expect("peek authentication request");
+        assert!(peeked >= 1, "expected pending authentication request bytes");
+        drop(stream);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let logged = server
+            .stderr_tail
+            .lock()
+            .map(|t| t.iter().filter(|l| l.contains("connection error")).count())
+            .unwrap_or(0);
+        if logged >= 2 {
+            break;
+        }
+        // 旧ハーネス（listen 後にパイプを閉じる）では、ここでサーバーが SIGABRT
+        // 終了している。行数待ちのタイムアウトより先に終了を検出して報告する。
+        if let Some(status) = server.child.try_wait().expect("try_wait") {
+            panic!("wire-server exited while logging connection errors: {status:?}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected at least 2 'connection error' lines after listen; got {logged}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        server.child.try_wait().expect("try_wait").is_none(),
+        "wire-server must stay alive after logging connection errors to stderr"
+    );
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set_read_timeout");
+    common::send_startup_message(&mut stream, "alice", "docs");
+    let mut message_type = [0u8; 1];
+    std::io::Read::read_exact(&mut stream, &mut message_type).expect("read message type");
+    assert_eq!(message_type[0], b'R', "expected an Authentication* request");
 }
 
 /// 3 テナント（alice/bob/carol）に Public 行 1 件ずつを投入した `docs`
@@ -315,6 +463,254 @@ fn seed_arbitrary_table_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
     )
     .expect("insert private row");
     (path, guard)
+}
+
+/// `documents`（`VECTOR` 列を持つ書き込み対象）と `notes`（未書き込みの別
+/// テーブル）の 2 テーブルを持つ一時 DB を用意する（Issue #943・WIRE-19。
+/// 明示トランザクション内で「直前に書き込んだテーブル自身は読めない」
+/// 制約（`docs/design/explicit-transaction.md` 参照）を避けつつ、同一
+/// トランザクション内の `SELECT` を検証するために `notes` を用意する）。
+/// `write_users_file` と異なり alice 1 テナントのみで十分（状態遷移の
+/// 検証にテナント分離は関与しない）。
+fn seed_txn_status_db() -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("three-client-e2e-txn-status");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    storage
+        .create_table(&TableSchema::new(
+            "notes",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        ))
+        .expect("create table");
+    (path, guard)
+}
+
+/// `seed_txn_status_db` 用の単一ユーザー（alice）だけの認証ファイル。
+fn write_alice_only_users_file(path: &Path) {
+    use wire_server::auth::argon2id;
+    let salt = b"0123456789abcdef";
+    let phc = argon2id::encode_phc(b"correct-horse", salt, &argon2id::RECOMMENDED_PARAMS)
+        .expect("valid phc encoding");
+    std::fs::write(path, format!("alice:tenant-a:{phc}\n")).expect("write users file");
+}
+
+/// `psycopg_txn_status.py` を子プロセスとして起動し、stdout の状態名の列
+/// （`IDLE`/`INTRANS`/`INERROR`）を返す。非 0 終了は `panic!`（silent skip
+/// しない）。
+fn run_psycopg_txn_status(port: u16, insert_id: u64, op: &str) -> Vec<String> {
+    let python = resolve_tool("PYTHON_BIN", "python3");
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/psycopg_txn_status.py");
+    let output = Command::new(&python)
+        .arg(&script)
+        .env("WIRE_HOST", "127.0.0.1")
+        .env("WIRE_PORT", port.to_string())
+        .env("WIRE_USER", "alice")
+        .env("WIRE_PASSWORD", "correct-horse")
+        .env("WIRE_TXN_INSERT_SQL", insert_sql(insert_id, op))
+        .env("WIRE_TXN_SELECT_SQL", "SELECT id FROM notes LIMIT 1")
+        .env(
+            "WIRE_TXN_VERIFY_SQL",
+            format!("SELECT id FROM documents WHERE id = {insert_id} LIMIT 1"),
+        )
+        .env("WIRE_TXN_BAD_SQL", "SELEC id FROM notes")
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("failed to spawn {python} (install psycopg via `pip install psycopg` or set PYTHON_BIN): {e}")
+        });
+    assert!(
+        output.status.success(),
+        "psycopg_txn_status.py failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// `pg_txn_status.js` を子プロセスとして起動し、stdout の `ReadyForQuery`
+/// 状態バイトの列（`'I'`/`'T'`/`'E'`）を返す。非 0 終了は `panic!`。
+fn run_pg_txn_status(port: u16, insert_id: u64, op: &str) -> Vec<String> {
+    let node = resolve_tool("NODE_BIN", "node");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/pg_txn_status.js");
+    let output = Command::new(&node)
+        .arg(&script)
+        .env("WIRE_HOST", "127.0.0.1")
+        .env("WIRE_PORT", port.to_string())
+        .env("WIRE_USER", "alice")
+        .env("WIRE_PASSWORD", "correct-horse")
+        .env("WIRE_TXN_INSERT_SQL", insert_sql(insert_id, op))
+        .env("WIRE_TXN_SELECT_SQL", "SELECT id FROM notes LIMIT 1")
+        .env(
+            "WIRE_TXN_VERIFY_SQL",
+            format!("SELECT id FROM documents WHERE id = {insert_id} LIMIT 1"),
+        )
+        .env("WIRE_TXN_BAD_SQL", "SELEC id FROM notes")
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("failed to spawn {node} (install pg via `npm install pg` or set NODE_BIN): {e}")
+        });
+    assert!(
+        output.status.success(),
+        "pg_txn_status.js failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn insert_sql(id: u64, op: &str) -> String {
+    format!(
+        "INSERT INTO documents (id, embedding, body) VALUES ({id}, '[0.1,0.2,0.3]', 'row') USING OPERATION_ID '{op}'"
+    )
+}
+
+/// psql（無改造）でトランザクション状態の反映を**間接的に**確認する。psql
+/// は `\set AUTOCOMMIT off` の下では、libpq が `ReadyForQuery` の状態バイト
+/// から導出する `PQtransactionStatus()` を見て、`IDLE` のときに限り
+/// 次の文の前に暗黙の `BEGIN` を送る
+/// （`docs/design/three-client-e2e-harness.md`「トランザクション状態遷移
+/// （Issue #943・WIRE-19）」節参照。プロンプト文字列 `%x` は対話端末専用の
+/// ため非対話実行では観測できず採らない判断の記録も同節にある）。
+/// もし `wire-server` が `ReadyForQuery` の状態バイトを常に `'I'` のまま
+/// 返す不具合があれば、`INSERT` の後の 2 文目の前にも `BEGIN` が再送され
+/// 「入れ子の BEGIN」（`25001`）で失敗し、続く `COMMIT` も `25P02` で
+/// 拒否されて非 0 終了する。正しく `'T'` を反映していれば `BEGIN` は
+/// 1 回しか送られず、全体が正常終了して `COMMIT` タグが確認できる。
+fn assert_psql_autocommit_off_reflects_transaction_status(
+    port: u16,
+    user: &str,
+    password: &str,
+    insert_id: u64,
+    op: &str,
+) {
+    let psql = resolve_tool("PSQL_BIN", "psql");
+    let insert = insert_sql(insert_id, op);
+    let output = Command::new(&psql)
+        .env("PGPASSWORD", password)
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-U",
+            user,
+            "-d",
+            "irrelevant-db-name",
+            "-X",
+            "-w",
+            "-q",
+            "-At",
+            "-c",
+            "\\set AUTOCOMMIT off",
+            "-c",
+            &insert,
+            "-c",
+            "SELECT id FROM notes LIMIT 1",
+            "-c",
+            "COMMIT",
+        ])
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("failed to spawn {psql} (install libpq-client tools or set PSQL_BIN): {e}")
+        });
+    assert!(
+        output.status.success(),
+        "psql -c sequence under AUTOCOMMIT off must succeed exactly once per BEGIN \
+         (a bug that always reports 'I' would cause a spurious nested BEGIN → 25001 → \
+         25P02 on COMMIT): stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // commit 済みの行が読み戻せる（read-your-writes）ことも独立に確認する。
+    let rows = run_psql(
+        port,
+        user,
+        password,
+        &format!("SELECT id FROM documents WHERE id = {insert_id} LIMIT 1"),
+    );
+    assert_eq!(
+        rows,
+        vec![insert_id.to_string()],
+        "committed row must be visible after AUTOCOMMIT off session"
+    );
+}
+
+/// WIRE-19（Issue #943）: `ReadyForQuery` の状態バイトが明示トランザクション
+/// 状態（`Idle`/`InTransaction`/`Failed`）を反映することを、無改造の実
+/// クライアント 3 種（psql／psycopg／pg）から検証する。層 A
+/// （`wire942_extended_transaction.rs`・`wire19_ready_for_query_status.rs`）が
+/// 生バイトの wire クライアントで固定する契約と同じものを、各ドライバ自身の
+/// トランザクション状態 API・暗黙 `BEGIN` 挙動を通じて追加確認する
+/// （responsibility boundary は本ファイル冒頭のドキュメンテーションコメント
+/// と同じ方針）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_observe_transaction_status_transitions() {
+    // psql・psycopg・pg で 1 つずつ独立したサーバー・DB を使う（各クライアント
+    // が別々の `operation_id`／`id` で書き込むため、テナント境界の検証は
+    // 不要。同一 DB を使い回しても害はないが、状態遷移の検証観点を独立に
+    // 保つため分ける）。
+    for (label, run) in [
+        (
+            "psql",
+            (|port: u16| {
+                assert_psql_autocommit_off_reflects_transaction_status(
+                    port,
+                    "alice",
+                    "correct-horse",
+                    50,
+                    "op-943-psql",
+                );
+            }) as fn(u16),
+        ),
+        (
+            "psycopg",
+            (|port: u16| {
+                let statuses = run_psycopg_txn_status(port, 51, "op-943-psycopg");
+                assert_eq!(
+                    statuses,
+                    vec!["IDLE", "INTRANS", "INTRANS", "IDLE", "INERROR", "IDLE"],
+                    "psycopg: unexpected transaction_status sequence"
+                );
+            }) as fn(u16),
+        ),
+        (
+            "pg",
+            (|port: u16| {
+                let statuses = run_pg_txn_status(port, 52, "op-943-pg");
+                assert_eq!(
+                    statuses,
+                    vec!["I", "T", "T", "T", "I", "I", "T", "E", "I"],
+                    "pg: unexpected ReadyForQuery status sequence"
+                );
+            }) as fn(u16),
+        ),
+    ] {
+        let (db_path, _db_guard) = seed_txn_status_db();
+        let users_dir = temp_db::TempDir::new("three-client-e2e-txn-status-users");
+        let users_path = users_dir.path().join("users.txt");
+        write_alice_only_users_file(&users_path);
+        let server = spawn_wire_server(&users_path, &db_path, &[]);
+        run(server.port);
+        drop(server);
+        let _ = std::io::stdout().flush();
+        eprintln!("[e2e-record] three_clients_observe_transaction_status_transitions: {label} ok");
+    }
 }
 
 /// `seed_three_tenant_db` と同じ Public 3 行（`embedding`/`lang`/`body`）に加え、

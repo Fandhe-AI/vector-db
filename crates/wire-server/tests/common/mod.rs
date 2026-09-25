@@ -746,3 +746,54 @@ pub fn run_wire_server_to_exit(extra_args: &[&str]) -> std::process::Output {
         .output()
         .expect("spawn wire-server")
 }
+
+/// 拡張クエリプロトコルの `Parse`（'P'）メッセージ本体を組み立てる
+/// （`wire942_extended_transaction.rs`・`wire19_ready_for_query_status.rs`
+/// で共有。`num_param_types` は事前指定するパラメータ型数）。
+pub fn parse_body(name: &str, query: &str, num_param_types: i16) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    body.extend_from_slice(query.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&num_param_types.to_be_bytes());
+    body
+}
+
+/// 拡張クエリプロトコルの `Bind`（'B'）メッセージ本体を組み立てる
+/// （パラメータなしの固定形。上記 `parse_body` と同様に共有）。
+pub fn bind_body(portal: &str, statement: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    body.extend_from_slice(statement.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&0i16.to_be_bytes()); // param format code count
+    body.extend_from_slice(&0i16.to_be_bytes()); // param count
+    body.extend_from_slice(&0i16.to_be_bytes()); // result format code count
+    body
+}
+
+/// 拡張クエリプロトコルの `Execute`（'E'）メッセージ本体を組み立てる
+/// （上記 `parse_body`／`bind_body` と同様に共有）。
+pub fn execute_body(portal: &str, max_rows: i32) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&max_rows.to_be_bytes());
+    body
+}
+
+/// 型バイト＋長さプレフィックス付きの 1 メッセージを読み取り
+/// `(型バイト, 本体)` を返す（拡張クエリプロトコルの応答読み取りに共有）。
+pub fn read_message(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+    let mut type_byte = [0u8; 1];
+    stream.read_exact(&mut type_byte).expect("read type byte");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read length");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let body_len = len.checked_sub(4).expect("length must be >= 4");
+    let mut body = vec![0u8; body_len];
+    stream.read_exact(&mut body).expect("read body");
+    (type_byte[0], body)
+}
