@@ -231,6 +231,32 @@ pub(crate) enum DecodeTier {
     Embedding,
 }
 
+/// 単一行集計（`GROUP BY` なし）の [`DecodeTier`] 選択本体（Issue #894 で
+/// `execute_aggregate_with_cache` のインライン if 連鎖から抽出。判定式・分岐順序は
+/// 抽出前と完全に同一で挙動はビット同一のまま変わらない）。`ReferencedColumns` が
+/// 新スカラー型（INTEGER〜ENUM。TABLE-13・TASK-199）の列参照も `scalar_mask`／
+/// `has_scalar_reference` へ一律に反映するため、本関数は型ごとの分岐を持たず
+/// `DimAndScalar` に収まる（embedding をデコードしない）。
+pub(crate) fn select_decode_tier(
+    referenced: &ReferencedColumns,
+    has_expr_filters: bool,
+) -> DecodeTier {
+    if referenced.needs_embedding {
+        DecodeTier::Embedding
+    } else if referenced.needs_vector_presence
+        || referenced.any_scalar_column_referenced()
+        || has_expr_filters
+    {
+        DecodeTier::DimAndScalar
+    } else {
+        // `WHERE`（`metadata_filters`・`expr_filters` いずれも空）・`VECTOR` 列
+        // 参照・スカラー列参照のいずれも無い場合のみ（`COUNT(*)`・`COUNT(id)`・
+        // `SUM`/`AVG`/`MIN`/`MAX(id)` の組み合わせ）。RLS 可視判定＋TABLE-12 の
+        // キー/ヘッダ tenant 整合検査だけで完結する（受入条件 3）。
+        DecodeTier::Fast
+    }
+}
+
 /// 集計項目 1 つの実行時アキュムレータ（TASK-166・SQL-13）。すべて O(1) 状態
 /// （`TextMin`/`TextMax` のみ、新しい極値を更新するたびに高々 1 本の `String` を
 /// 保持し直す。`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
@@ -1282,7 +1308,10 @@ pub(crate) fn execute_aggregate_with_cache(
 
     // Issue #350: クエリが実際に参照する列集合から、可視行 1 件あたりの最小限の
     // デコード段階（[`DecodeTier`]）を一度だけ決める（`GROUP BY` なしなので
-    // `extra_scalar_index` は無し）。
+    // `extra_scalar_index` は無し）。新スカラー型（INTEGER〜ENUM。TABLE-13・
+    // TASK-199）の列参照も `ReferencedColumns::derive` が `scalar_mask` へ
+    // 反映済みのため、以下の判定式は型を問わず「スカラー列参照の有無」だけを見る
+    // （新型ごとの分岐は増えない。#894 で判定式自体の網羅性を確認済み）。
     let referenced = ReferencedColumns::derive(
         schema,
         &bound.items,
@@ -1290,20 +1319,7 @@ pub(crate) fn execute_aggregate_with_cache(
         &bound.expr_filters,
         None,
     );
-    let tier = if referenced.needs_embedding {
-        DecodeTier::Embedding
-    } else if referenced.needs_vector_presence
-        || referenced.any_scalar_column_referenced()
-        || !bound.expr_filters.is_empty()
-    {
-        DecodeTier::DimAndScalar
-    } else {
-        // `WHERE`（`metadata_filters`・`expr_filters` いずれも空）・`VECTOR` 列
-        // 参照・スカラー列参照のいずれも無い場合のみ（`COUNT(*)`・`COUNT(id)`・
-        // `SUM`/`AVG`/`MIN`/`MAX(id)` の組み合わせ）。RLS 可視判定＋TABLE-12 の
-        // キー/ヘッダ tenant 整合検査だけで完結する（受入条件 3）。
-        DecodeTier::Fast
-    };
+    let tier = select_decode_tier(&referenced, !bound.expr_filters.is_empty());
 
     // Issue #475: `WHERE` が索引対応述語のみ（`classify_scalar_plan` が
     // `PlainScan` 以外）で構成される場合、`user_rows/{table}` の全行走査
@@ -2824,5 +2840,289 @@ mod tests {
             failures_after_second, failures_after_first,
             "a generation already known to be unbuildable must not retry the build"
         );
+    }
+
+    // --- Issue #894: 新スカラー型（TABLE-13・TASK-199）の DecodeTier 選択 ------
+    //
+    // `select_decode_tier` は Issue #350 の判定式をインライン if 連鎖から抽出した
+    // ものであり、`ReferencedColumns` が新型の列参照をどう反映するかにさえ依存
+    // しない（`scalar_mask`／`has_scalar_reference` を見るだけで型を区別しない）。
+    // ここでは (a) 関数単体を直接構成した `ReferencedColumns` で固定し、
+    // (b) 新型 `AggregateInput` を実際に `ReferencedColumns::derive` へ通した
+    // 経路でも `DimAndScalar` に収まり `needs_embedding() == false` になることを
+    // 固定する（受入条件 3）。
+
+    fn referenced_columns_for_test(
+        scalar_mask: Vec<bool>,
+        needs_embedding: bool,
+        needs_vector_presence: bool,
+        has_scalar_reference: bool,
+    ) -> ReferencedColumns {
+        ReferencedColumns {
+            scalar_mask,
+            needs_embedding,
+            needs_vector_presence,
+            has_scalar_reference,
+        }
+    }
+
+    #[test]
+    fn select_decode_tier_no_reference_is_fast() {
+        let referenced =
+            referenced_columns_for_test(vec![false, false, false], false, false, false);
+        assert_eq!(select_decode_tier(&referenced, false), DecodeTier::Fast);
+    }
+
+    #[test]
+    fn select_decode_tier_scalar_reference_is_dim_and_scalar() {
+        let referenced = referenced_columns_for_test(vec![false, true, false], false, false, true);
+        assert_eq!(
+            select_decode_tier(&referenced, false),
+            DecodeTier::DimAndScalar
+        );
+    }
+
+    #[test]
+    fn select_decode_tier_vector_presence_is_dim_and_scalar() {
+        let referenced = referenced_columns_for_test(vec![false, false, false], false, true, false);
+        assert_eq!(
+            select_decode_tier(&referenced, false),
+            DecodeTier::DimAndScalar
+        );
+    }
+
+    #[test]
+    fn select_decode_tier_expr_filter_is_dim_and_scalar() {
+        let referenced =
+            referenced_columns_for_test(vec![false, false, false], false, false, false);
+        assert_eq!(
+            select_decode_tier(&referenced, true),
+            DecodeTier::DimAndScalar
+        );
+    }
+
+    #[test]
+    fn select_decode_tier_needs_embedding_wins_over_scalar_reference() {
+        // `needs_embedding` は `scalar_mask`／`has_scalar_reference` の状態を問わず
+        // 最優先で `Embedding` を選ぶ（判定式の分岐順序を固定する）。
+        let referenced = referenced_columns_for_test(vec![true, true], true, true, true);
+        assert_eq!(select_decode_tier(&referenced, true), DecodeTier::Embedding);
+    }
+
+    /// 新スカラー型（TABLE-13・TASK-199）を多数含むスキーマ。`ReferencedColumns::
+    /// derive` が型ごとに分岐せず一律に `scalar_mask` を立てることを確認する
+    /// ための固定 fixture（列順は本 Issue のスコープと無関係で任意）。
+    fn many_new_scalar_types_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true), // 0
+                ColumnDef::new("u", ColumnType::Uuid, true),              // 1
+                ColumnDef::new("bo", ColumnType::Boolean, true),          // 2
+                ColumnDef::new(
+                    "n",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ), // 3
+                ColumnDef::new("dt", ColumnType::Date, true),             // 4
+                ColumnDef::new("ts", ColumnType::Timestamp, true),        // 5
+                ColumnDef::new("i", ColumnType::Integer, true),           // 6
+                ColumnDef::new("bi", ColumnType::BigInt, true),           // 7
+                ColumnDef::new("r", ColumnType::Real, true),              // 8
+                ColumnDef::new("d", ColumnType::Double, true),            // 9
+            ],
+        )
+    }
+
+    #[test]
+    fn derive_and_select_decode_tier_new_type_count_is_dim_and_scalar_without_embedding() {
+        let schema = many_new_scalar_types_schema();
+        for (input, label) in [
+            (AggregateInput::UuidColumn(1), "uuid"),
+            (AggregateInput::BooleanColumn(2), "boolean"),
+            (
+                AggregateInput::NumericColumn {
+                    index: 3,
+                    precision: 10,
+                    scale: 2,
+                },
+                "numeric",
+            ),
+            (AggregateInput::DateColumn(4), "date"),
+            (AggregateInput::TimestampColumn(5), "timestamp"),
+            (AggregateInput::IntegerColumn(6), "integer"),
+            (AggregateInput::BigIntColumn(7), "bigint"),
+            (AggregateInput::RealColumn(8), "real"),
+            (AggregateInput::DoubleColumn(9), "double"),
+        ] {
+            let items = vec![BoundAggregateItem {
+                func: AggregateFunc::Count,
+                input: input.clone(),
+                name: "result".to_string(),
+            }];
+            let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], None);
+            assert!(
+                !referenced.needs_embedding(),
+                "COUNT({label}) must not require embedding decode"
+            );
+            let tier = select_decode_tier(&referenced, false);
+            assert_eq!(
+                tier,
+                DecodeTier::DimAndScalar,
+                "COUNT({label}) must select DimAndScalar (TABLE-13・TASK-199)"
+            );
+            let col_index = match &input {
+                AggregateInput::UuidColumn(i)
+                | AggregateInput::BooleanColumn(i)
+                | AggregateInput::DateColumn(i)
+                | AggregateInput::TimestampColumn(i)
+                | AggregateInput::IntegerColumn(i)
+                | AggregateInput::BigIntColumn(i)
+                | AggregateInput::RealColumn(i)
+                | AggregateInput::DoubleColumn(i) => *i,
+                AggregateInput::NumericColumn { index, .. } => *index,
+                _ => unreachable!(),
+            };
+            assert!(
+                referenced.scalar_mask()[col_index],
+                "COUNT({label}) must mark its own column in scalar_mask"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_and_select_decode_tier_count_star_on_new_type_schema_is_fast() {
+        // `WHERE`・スカラー列参照・`VECTOR` 列参照のいずれも無い `COUNT(*)` は、
+        // 新型列を多数持つスキーマでも `Fast` のまま（受入条件 3）。
+        let schema = many_new_scalar_types_schema();
+        let items = vec![BoundAggregateItem {
+            func: AggregateFunc::Count,
+            input: AggregateInput::AllVisible,
+            name: "result".to_string(),
+        }];
+        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], None);
+        assert_eq!(select_decode_tier(&referenced, false), DecodeTier::Fast);
+    }
+
+    #[test]
+    fn derive_and_select_decode_tier_count_embedding_on_new_type_schema_is_dim_and_scalar() {
+        // `COUNT(<VECTOR 列>)`（次元のみ必要・embedding 本体は不要）は、新型列を
+        // 多数持つスキーマでも従来どおり `DimAndScalar`。
+        let schema = many_new_scalar_types_schema();
+        let items = vec![BoundAggregateItem {
+            func: AggregateFunc::Count,
+            input: AggregateInput::VectorColumnPresence,
+            name: "result".to_string(),
+        }];
+        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], None);
+        assert!(!referenced.needs_embedding());
+        assert_eq!(
+            select_decode_tier(&referenced, false),
+            DecodeTier::DimAndScalar
+        );
+    }
+
+    /// 新型列を持つスキーマでの TABLE-12（キー側／ヘッダ側 tenant 不一致）が、
+    /// `Fast`／`DimAndScalar` いずれの tier でも fail-closed（`XX000`）で
+    /// 拒否されることを固定する（受入条件 2。`key_tenant_header_tenant_mismatch_
+    /// is_rejected_fail_closed` の新型版）。
+    #[test]
+    fn key_tenant_header_tenant_mismatch_is_rejected_fail_closed_on_new_type_schema_fast_and_dim_and_scalar(
+    ) {
+        let path = unique_db_path("agg-table12-mismatch-new-types");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = many_new_scalar_types_schema();
+        storage.create_table(&schema).expect("create table");
+
+        write_row_with_mismatched_key_tenant(
+            &storage,
+            "docs",
+            "tenant-a",
+            "tenant-b",
+            1,
+            &[1.0, 2.0, 3.0],
+        );
+
+        let ctx = PolicyContext::new("tenant-b").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        // Fast tier: COUNT(*)
+        let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
+        let err =
+            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None, None, None)
+                .expect_err("Fast tier must reject key/header tenant mismatch");
+        assert_eq!(err.wire_code(), "XX000");
+
+        // DimAndScalar tier: COUNT(<UUID 列>)（新型列参照）
+        let bound_uuid = bound_single(AggregateFunc::Count, AggregateInput::UuidColumn(1));
+        let err =
+            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_uuid, None, None, None)
+                .expect_err(
+                    "DimAndScalar tier (new-type column) must reject key/header tenant mismatch",
+                );
+        assert_eq!(err.wire_code(), "XX000");
+    }
+
+    /// `Fast` tier（`COUNT(*)`・新型列は非参照）でも、可視行の新型スカラー列
+    /// メタデータが破損していれば fail-closed に拒否する（受入条件 2。
+    /// `count_star_still_fails_closed_on_corrupted_metadata_with_no_scalar_
+    /// reference` の新型版。REAL 列に NaN のビットパターンを直接書き込む）。
+    #[test]
+    fn count_star_still_fails_closed_on_corrupted_new_type_metadata_with_no_scalar_reference() {
+        let path = unique_db_path("agg-metadata-corrupt-new-type-no-scalar-ref");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true),
+                ColumnDef::new("score", ColumnType::Real, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let mut metadata = row_codec::encode_scalar_columns(
+            &schema,
+            &[row_codec::Value::Null, row_codec::Value::Real(1.0)],
+        )
+        .expect("encode scalar columns");
+        // presence タグはそのまま、REAL 値のバイト列だけを NaN へ書き換える
+        // （末尾 4 バイトが REAL の値フィールド。`SCALAR_REAL_ENTRY_LEN` = 5 =
+        // presence(1) + f32(4)）。
+        let value_offset = metadata.len() - 4;
+        metadata[value_offset..].copy_from_slice(&f32::NAN.to_le_bytes());
+
+        let buf = crate::storage::encode_row(&RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0, 3.0],
+            metadata: &metadata,
+        })
+        .expect("encode row");
+        write_row_raw(&storage, "docs", "tenant-a", 1, &buf);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
+        let err = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound_star,
+            None,
+            None,
+            None,
+        )
+        .expect_err(
+            "COUNT(*) must fail closed on corrupted REAL metadata even with no scalar column referenced",
+        );
+        assert_eq!(err.wire_code(), "XX000");
     }
 }
