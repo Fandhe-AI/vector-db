@@ -12,7 +12,7 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wire_server::tls::alert::{Alert, ReceivedAlert};
 use wire_server::tls::certificate_verify;
@@ -389,6 +389,55 @@ fn handshake_times_out_without_sending_any_alert() {
     }
 }
 
+/// #965 レビュー指摘の回帰: ハンドシェイク全体のタイムアウトは個々の
+/// 読み取り呼び出し単位ではなく絶対期限として働かなければならない。
+/// クライアントが個々の読み取りタイムアウトを常に下回る間隔で 1 バイト
+/// ずつ送り続けても、ハンドシェイク全体は `overall_timeout` の数倍以内で
+/// 打ち切られることを固定する（ループの外側で `set_read_timeout` を
+/// 1 回だけ呼ぶ実装だと、この打ち切りが働かず低速送信で長時間占有され
+/// 得た）。
+#[test]
+fn handshake_absolute_deadline_bounds_slow_drip_client() {
+    use std::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().expect("local addr");
+    let overall_timeout = Duration::from_millis(200);
+
+    let server_thread = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept connection");
+        let started = Instant::now();
+        let result = wire_server::tls::server_handshake::perform_server_handshake_with_timeout(
+            &mut socket,
+            test_config(),
+            overall_timeout,
+        );
+        (started.elapsed(), result)
+    });
+
+    let mut client = TcpStream::connect(addr).expect("connect to loopback listener");
+    // 1 バイトずつ、`overall_timeout` を常に下回る間隔で送り続ける。
+    // 打ち切られなければ 12 回 * 80ms = 960ms 分、個々の読み取りタイム
+    // アウトには一度もかからないまま送り続けられる。
+    for _ in 0..12 {
+        if client.write_all(&[0x16]).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    drop(client);
+
+    let (elapsed, result) = server_thread.join().expect("server thread must not panic");
+    assert!(
+        result.is_err(),
+        "slow-drip client must not complete the handshake"
+    );
+    assert!(
+        elapsed < overall_timeout * 4,
+        "handshake must be bounded by the absolute deadline, got {elapsed:?} for timeout {overall_timeout:?}"
+    );
+}
+
 // ---- 独立クライアントによる完全な往復（受け入れ条件 3 以外の全体結合）。
 // ----
 
@@ -565,10 +614,15 @@ impl TestClient {
     }
 }
 
-/// 受け入れ条件全体: 純粋 API（`handle_record` の直結）による完全な
-/// ハンドシェイクの往復と、application data・`close_notify` の往復まで。
-#[test]
-fn full_handshake_round_trip_over_pure_api() {
+/// フルハンドシェイクを純粋 API（`handle_record` 直結）で完了させ、
+/// application epoch まで切り替えた `TestClient` と、サーバー側の
+/// `TlsSession` を返す。application data・`close_notify`・poison 状態を
+/// 検証する各テストが共有するセットアップ（#965 レビュー指摘対応で
+/// `full_handshake_round_trip_over_pure_api` から切り出した）。
+fn establish_session_for_tests() -> (
+    TestClient,
+    Box<wire_server::tls::server_handshake::TlsSession>,
+) {
     let config = test_config();
     let leaf_public_key = RFC8032_TEST1_PUBLIC_KEY;
 
@@ -696,7 +750,7 @@ fn full_handshake_round_trip_over_pure_api() {
             Step::ClosedByPeer(_) => panic!("must not close during client Finished"),
         }
     }
-    let mut session = session.expect("handshake must complete");
+    let session = session.expect("handshake must complete");
 
     // application epoch へ切り替える（client 側）。
     client
@@ -707,6 +761,15 @@ fn full_handshake_round_trip_over_pure_api() {
         .opener
         .install_application_keys(&server_ap_keys)
         .expect("valid transition");
+
+    (client, session)
+}
+
+/// 受け入れ条件全体: 純粋 API（`handle_record` の直結）による完全な
+/// ハンドシェイクの往復と、application data・`close_notify` の往復まで。
+#[test]
+fn full_handshake_round_trip_over_pure_api() {
+    let (mut client, mut session) = establish_session_for_tests();
 
     // サーバー → クライアント。
     let payload = b"hello from server";
@@ -756,6 +819,94 @@ fn full_handshake_round_trip_over_pure_api() {
             ReceivedAlert::Closed
         );
     }
+}
+
+/// #965 レビュー指摘の回帰: 自ら `close_notify` を送出した後は、RFC 8446
+/// §6.1 によりこの接続でこれ以上データを送ってはならないため、以後の
+/// `seal_application_data`／`open_record`／`close_notify` はすべて
+/// `Poisoned` で拒否される。
+#[test]
+fn close_notify_poisons_the_session_against_further_data() {
+    use wire_server::tls::server_handshake::TlsSessionError;
+
+    let (_client, mut session) = establish_session_for_tests();
+
+    session.close_notify().expect("first close_notify succeeds");
+
+    assert_eq!(
+        session.seal_application_data(b"must not be sent"),
+        Err(TlsSessionError::Poisoned)
+    );
+    assert_eq!(session.close_notify(), Err(TlsSessionError::Poisoned));
+}
+
+/// #965 レビュー指摘の回帰: `close_notify` を受信した後も、この接続で
+/// アプリケーションデータの送受信を続けられてはならない。
+#[test]
+fn receiving_close_notify_poisons_the_session_against_further_data() {
+    use wire_server::tls::server_handshake::{AppEvent, TlsSessionError};
+
+    let (mut client, mut session) = establish_session_for_tests();
+
+    let close_records = client
+        .sealer
+        .seal_fragmented(ContentType::Alert, &Alert::close_notify())
+        .expect("valid seal");
+    let mut saw_close_notify = false;
+    for record in &close_records {
+        match session
+            .open_record(record)
+            .expect("valid close_notify record")
+        {
+            AppEvent::CloseNotify => saw_close_notify = true,
+            AppEvent::ApplicationData(_) => panic!("expected close_notify"),
+        }
+    }
+    assert!(saw_close_notify, "close_notify must be observed");
+
+    assert_eq!(
+        session.seal_application_data(b"must not be sent"),
+        Err(TlsSessionError::Poisoned)
+    );
+    assert_eq!(
+        session.open_record(&close_records[0]),
+        Err(TlsSessionError::Poisoned)
+    );
+}
+
+/// #965 レビュー指摘の回帰: 復号（`bad_record_mac`）・alert 解析の失敗は
+/// いずれもこの接続を終端させ、以後の `seal_application_data` を含む
+/// すべての操作を拒否する（破損した TLS 接続での送受信継続を防ぐ）。
+#[test]
+fn open_record_decrypt_failure_poisons_the_session() {
+    use wire_server::tls::server_handshake::TlsSessionError;
+
+    let (_client, mut session) = establish_session_for_tests();
+
+    let mut tampered = Record {
+        content_type: ContentType::ApplicationData,
+        legacy_version: record::LEGACY_RECORD_VERSION,
+        fragment: vec![0u8; 32],
+    };
+    // 復号できない乱雑なバイト列（鍵・nonce に無関係）は
+    // `ProtectionError`（`bad_record_mac` 相当）で拒否されるはず。
+    for (i, b) in tampered.fragment.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+
+    let err = session
+        .open_record(&tampered)
+        .expect_err("garbage ciphertext must fail to decrypt");
+    assert!(matches!(err, TlsSessionError::Protection(_)));
+
+    assert_eq!(
+        session.seal_application_data(b"must not be sent"),
+        Err(TlsSessionError::Poisoned)
+    );
+    assert_eq!(
+        session.open_record(&tampered),
+        Err(TlsSessionError::Poisoned)
+    );
 }
 
 /// 受け入れ条件全体（driver 経由）: `perform_server_handshake_with_timeout`
@@ -1123,10 +1274,12 @@ fn dummy_ccs_before_client_hello_is_rejected() {
 }
 
 /// ClientHello 受信後（`ExpectClientFinished`）に届くダミー CCS は
-/// 読み捨てられ、出力・状態遷移は起きない。上限（[`MAX_DUMMY_CCS_RECORDS`]）
-/// を超える 2 個目は拒否される。
+/// 読み捨てられ、出力・状態遷移は起きない。RFC 8446 §5 は件数の上限を
+/// 設けず単純に読み捨てることを要求するため（#965 レビュー指摘。付録
+/// D.4 の HelloRetryRequest 経由 middlebox 互換フローでは 2 回届き
+/// 得る）、複数個連続で届いても読み捨て続けることを固定する。
 #[test]
-fn dummy_ccs_after_server_hello_is_discarded_up_to_limit() {
+fn dummy_ccs_after_server_hello_is_discarded_without_limit() {
     let (ch_record, _ch) = client_hello_from_rfc8448_with_ed25519();
     let entropy = FixedEntropy {
         random: hex_decode32(SERVER_RANDOM),
@@ -1138,19 +1291,39 @@ fn dummy_ccs_after_server_hello_is_discarded_up_to_limit() {
         .handle_record(&ch_record)
         .expect("valid ClientHello accepted");
 
-    let Step::Continue(output) = server
-        .handle_record(&dummy_ccs_record())
-        .expect("first dummy CCS must be discarded")
-    else {
-        panic!("expected Continue");
-    };
-    assert!(
-        output.is_empty(),
-        "discarding a dummy CCS produces no output"
-    );
+    for i in 0..3 {
+        let Step::Continue(output) = server
+            .handle_record(&dummy_ccs_record())
+            .unwrap_or_else(|_| panic!("dummy CCS #{i} must be discarded without limit"))
+        else {
+            panic!("expected Continue");
+        };
+        assert!(
+            output.is_empty(),
+            "discarding a dummy CCS produces no output"
+        );
+    }
+}
 
+/// 時期・状態に関わらず、値が `0x01` 以外のダミー CCS は引き続き
+/// `unexpected_message` で拒否される（上限撤廃は値検査を緩めない）。
+#[test]
+fn dummy_ccs_with_wrong_fragment_value_is_rejected() {
+    let (ch_record, _ch) = client_hello_from_rfc8448_with_ed25519();
+    let entropy = FixedEntropy {
+        random: hex_decode32(SERVER_RANDOM),
+        ephemeral_seed: hex_decode32(SERVER_X25519_PRIV),
+        used: false,
+    };
+    let mut server = ServerHandshake::with_entropy(test_config(), entropy);
+    let _ = server
+        .handle_record(&ch_record)
+        .expect("valid ClientHello accepted");
+
+    let mut bad_ccs = dummy_ccs_record();
+    bad_ccs.fragment = vec![0x02];
     let err = server
-        .handle_record(&dummy_ccs_record())
-        .expect_err("second dummy CCS must exceed the accepted limit");
+        .handle_record(&bad_ccs)
+        .expect_err("non-0x01 CCS fragment must be rejected");
     assert_eq!(err, ServerHandshakeError::UnexpectedMessage);
 }

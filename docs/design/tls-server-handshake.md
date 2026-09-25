@@ -88,10 +88,9 @@ fail-closed な poison 契約（一度 `Err` を返したら以後同じ理由�
 
 `ClientHello` 受信後（`after_hrr:true` または `ExpectClientFinished`）に
 限り、外側 type が `ChangeCipherSpec` かつ fragment がちょうど `[0x01]`
-のレコードを `Opener::open` の**前**に読み捨てる。受理数の上限
-`MAX_DUMMY_CCS_RECORDS`（既定 1。RFC 8446 付録 D.4 に従うクライアントは
-1 回しか送らない）を超えた分・時期外・値違反はいずれも
-`unexpected_message`。
+のレコードを `Opener::open` の**前**に読み捨てる。時期外・値違反は
+`unexpected_message`。受理数に上限は設けない（PR #1046 で変更。後述
+「PR #1046 レビュー指摘の是正」節参照）。
 
 ## client Finished の検証順序
 
@@ -104,7 +103,61 @@ fail-closed な poison 契約（一度 `Err` を返したら以後同じ理由�
 
 `HANDSHAKE_READ_TIMEOUT = crate::limits::READ_TIMEOUT`（WIRE-5 の簡易
 クエリ応答と同値）を単一情報源とし、`tests/tls_server_handshake.rs::
-handshake_read_timeout_matches_wire_read_timeout` で固定した。
+handshake_read_timeout_matches_wire_read_timeout` で固定した。このタイムアウトを
+ハンドシェイク開始からの絶対期限として強制する経路は後述「PR #1046
+レビュー指摘の是正」節参照。
+
+## PR #1046 レビュー指摘の是正
+
+Issue #965 の PR（#1046）に対する codex・Bugbot の指摘（いずれも
+`crates/wire-server/src/tls/server_handshake.rs`）を是正した。
+
+1. **読み取りタイムアウトの絶対期限化**（codex P1）: `perform_server_
+   handshake_with` は従来、ループの外側で `stream.set_read_timeout
+   (Some(timeout))` を 1 回だけ呼んでいた。これは個々の `read`
+   システムコール単位の上限にしかならず、[`record::read_record`] が
+   1 レコードを読むだけでも `read`／`read_exact` を複数回呼ぶ（可変長
+   フィールドのため）ことと組み合わさると、相手が個々の読み取り
+   タイムアウトを常に下回る間隔で少量ずつ送り続けた場合にハンド
+   シェイク全体が `timeout` を大幅に超えて占有され得た。新設した
+   `Read` ラッパー `DeadlineReader` が `read` を呼ぶたびに絶対期限
+   `deadline = Instant::now() + timeout` までの残り時間を再計算して
+   都度ソケットの読み取りタイムアウトへ反映することで、個々の低レベル
+   `read` 呼び出しの粒度で絶対期限を強制する（期限切れ後は OS を呼ばず
+   即座に `TimedOut` を返す。ゼロ Duration を `set_read_timeout` へ渡す
+   とプラットフォームによってはエラーになるため）。回帰テスト
+   `tests/tls_server_handshake.rs::
+   handshake_absolute_deadline_bounds_slow_drip_client`（1 バイトずつ
+   個々の読み取りタイムアウトを下回る間隔で送り続けるクライアントに
+   対し、ハンドシェイク全体が絶対期限の数倍以内で打ち切られることを
+   固定）を追加した。
+2. **`TlsSession` の終端状態管理**（codex P1）: `open_record` は復号
+   失敗・alert 解析失敗・`close_notify`／fatal alert の受信のいずれでも
+   `poisoned` を立てず、`close_notify()` も送出後に `poisoned` を立てて
+   いなかったため、終了済み・破損した TLS 接続で `seal_application_data`
+   が成功し続け得た。`poisoned` フィールドの意味を「送信側で fatal
+   alert を送出した後」から「以後アプリケーションデータの送受信を
+   続けてはならない終端状態全般」へ広げ、上記いずれの経路でも
+   `poisoned = true` にしてから返すよう変更した（RFC 8446 §6.1:
+   `close_notify` を送信・受信したら以後データを送ってはならない）。
+   回帰テストを 3 本追加: `close_notify_poisons_the_session_against_
+   further_data`・`receiving_close_notify_poisons_the_session_against_
+   further_data`・`open_record_decrypt_failure_poisons_the_session`。
+3. **middlebox 互換ダミー CCS の受理上限撤廃**（Bugbot High）:
+   `MAX_DUMMY_CCS_RECORDS`（既定 1）は RFC 8446 §5 の「最初の
+   ClientHello を送信／受信した後から相手の Finished を受信するまでの
+   間に届いた値 `0x01` の平文 CCS は、件数の上限を設けず単純に読み
+   捨てる」契約に反していた。HelloRetryRequest を伴う middlebox 互換
+   モードのクライアントは 1 回目の ClientHello 前後と 2 回目の
+   ClientHello 後の計 2 回 CCS を送り得るため、上限があると 2 回目が
+   `unexpected_message` になり正当なハンドシェイクを中断させて
+   いた。定数・カウンタ（`dummy_ccs_received`）を撤去し、時期内・値
+   `0x01` であれば件数の上限なく読み捨てるよう変更した（時期外・値
+   違反の拒否は不変）。既存テスト
+   `dummy_ccs_after_server_hello_is_discarded_up_to_limit` を
+   `dummy_ccs_after_server_hello_is_discarded_without_limit`（3 個連続の
+   読み捨てを固定）へ改め、値違反の拒否を独立に固定する
+   `dummy_ccs_with_wrong_fragment_value_is_rejected` を追加した。
 
 ## 対象外（後続 sub-issue の担当）
 
@@ -134,7 +187,12 @@ KeyUpdate・NewSessionTicket・0-RTT・クライアント証明書は親 Issue �
     application data・`close_notify` の往復
   - HelloRetryRequest の 1 回限りの往復（`key_share` 無し CH1 → HRR →
     `key_share` 有り CH2 → Accept）
-  - ダミー CCS の受理・上限超過拒否・時期外拒否
+  - ダミー CCS の無制限読み捨て・値違反拒否・時期外拒否（PR #1046 で
+    上限撤廃に合わせ更新）
+  - ハンドシェイク全体の絶対期限（低速送信クライアントに対する強制。
+    PR #1046 で追加）
+  - `TlsSession` の終端状態（`close_notify` 送信/受信後・復号失敗後の
+    poison。PR #1046 で追加）
   - 状態外メッセージ（`ApplicationData` 早期受信）・解析失敗
     （壊れた `ClientHello`）の fail-closed 拒否
   - fatal alert の 1 回限り送出・以後の poison

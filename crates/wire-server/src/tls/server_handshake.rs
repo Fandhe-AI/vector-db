@@ -32,7 +32,7 @@
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::alert::{self, Alert, ReceivedAlert};
 use super::certificate_verify;
@@ -51,11 +51,6 @@ use super::x509::ServerCertificateChain;
 /// ハンドシェイク中の読み取りタイムアウト（WIRE-5 の簡易クエリ応答と同値。
 /// `crate::limits::READ_TIMEOUT` を単一情報源とする）。
 pub const HANDSHAKE_READ_TIMEOUT: Duration = crate::limits::READ_TIMEOUT;
-
-/// middlebox 互換のダミー `ChangeCipherSpec`（RFC 8446 付録 D.4）を受理する
-/// 上限件数。付録 D.4 に従うクライアントは 1 回しか送らないため、この
-/// 上限は空レコードを送り続ける DoS の抑止が目的の本リポの実装既定値。
-pub const MAX_DUMMY_CCS_RECORDS: u32 = 1;
 
 /// サーバー証明書チェーンと署名鍵の組。接続間で共有する（`Arc`）。
 /// CLI からの構築は #967 の担当で、本モジュールは
@@ -302,7 +297,6 @@ pub struct ServerHandshake<E: HandshakeEntropy = OsEntropy> {
     /// `Some`）。
     client_ap_secret: Option<TrafficSecret>,
     dummy_ccs_sent: bool,
-    dummy_ccs_received: u32,
     /// [`ServerHandshake::handle_record`] が `Err` を返した際に、直前に
     /// 送出（を試行）した fatal alert のレコード列を一時的に保持する。
     /// `Result` の `Err` 側へ出力バイト列を同時に載せる型を作らず、
@@ -336,7 +330,6 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
             th_ch_sf: None,
             client_ap_secret: None,
             dummy_ccs_sent: false,
-            dummy_ccs_received: 0,
             pending_alert_output: Vec::new(),
         }
     }
@@ -418,22 +411,26 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
     }
 
     fn step_inner(&mut self, record: &Record) -> Result<Step, ServerHandshakeError> {
-        // ダミー CCS（middlebox 互換。RFC 8446 付録 D.4）は Opener を経由
-        // せず、ClientHello 受信後から client Finished 受信前までに限り
-        // 読み捨てる。
+        // ダミー CCS（middlebox 互換。RFC 8446 §5・付録 D.4）は Opener を
+        // 経由せず、ClientHello 受信後から client Finished 受信前までに
+        // 限り読み捨てる。RFC 8446 §5 は「最初の ClientHello を送信／受信
+        // した後から相手の Finished を受信するまでの間に届いた値
+        // `0x01` の平文 CCS は、件数の上限を設けず単純に読み捨てる」
+        // ことを要求する（#965 レビュー指摘。HelloRetryRequest を伴う
+        // middlebox 互換モードのクライアントは、1 回目の ClientHello 前後
+        // と 2 回目の ClientHello 後の計 2 回 CCS を送り得るため、受理数を
+        // 1 回に制限すると 2 回目が `unexpected_message` になり正当な
+        // ハンドシェイクを中断させてしまう）。時期外・値違反（0x01 以外の
+        // fragment）は引き続き `unexpected_message` として拒否する。
         if record.content_type == ContentType::ChangeCipherSpec {
             let in_ccs_window = matches!(
                 self.state,
                 HandshakeState::ExpectClientHello { after_hrr: true }
                     | HandshakeState::ExpectClientFinished
             );
-            if !in_ccs_window
-                || record.fragment != [0x01]
-                || self.dummy_ccs_received >= MAX_DUMMY_CCS_RECORDS
-            {
+            if !in_ccs_window || record.fragment != [0x01] {
                 return Err(ServerHandshakeError::UnexpectedMessage);
             }
-            self.dummy_ccs_received += 1;
             return Ok(Step::Continue(Vec::new()));
         }
 
@@ -840,8 +837,17 @@ fn build_server_hello(
 pub struct TlsSession {
     sealer: Sealer,
     opener: Opener,
-    /// 送信側で fatal alert を送出した後は `true` にし、以後の
-    /// `seal_application_data` を拒否する（fail-closed）。
+    /// 接続が「以後アプリケーションデータの送受信を続けてはならない」
+    /// 終端状態に入ったら `true` にする（fail-closed）。以後の
+    /// `seal_application_data`／`open_record`／`close_notify` をすべて
+    /// 拒否する。true にする経路: (1) 送信側で fatal alert を送出した後
+    /// （[`Self::mark_poisoned`]）、(2) [`Self::close_notify`] で自ら
+    /// `close_notify` を送出した後（RFC 8446 §6.1: 送信後はそれ以上
+    /// データを送ってはならない）、(3) [`Self::open_record`] が
+    /// `close_notify`／fatal alert を受信した後、または復号・alert
+    /// 解析に失敗した後（#965 レビュー指摘: これらを poison にしないと
+    /// 終了済み・破損した接続でアプリケーションデータの送受信を続け
+    /// られてしまう）。
     poisoned: bool,
 }
 
@@ -894,38 +900,66 @@ impl TlsSession {
     /// 受信した 1 レコードを open する。alert（`close_notify`／
     /// `user_canceled`）は [`AppEvent::CloseNotify`] へ写像し、それ以外の
     /// alert は `Err(ReceivedFatalAlert)`。
+    ///
+    /// 復号失敗・alert 解析失敗・`close_notify`／fatal alert の受信は
+    /// いずれもこの接続を終端させ、以後の呼び出しはすべて
+    /// `Err(Poisoned)` になる（#965 レビュー指摘: 終了済み・破損した
+    /// 接続でアプリケーションデータの送受信を続けさせない）。
     pub fn open_record(&mut self, record: &Record) -> Result<AppEvent, TlsSessionError> {
         if self.poisoned {
             return Err(TlsSessionError::Poisoned);
         }
-        let inner = self
-            .opener
-            .open(record)
-            .map_err(TlsSessionError::Protection)?;
+        let inner = match self.opener.open(record) {
+            Ok(inner) => inner,
+            Err(e) => {
+                self.poisoned = true;
+                return Err(TlsSessionError::Protection(e));
+            }
+        };
         match inner.content_type {
             ContentType::ApplicationData => Ok(AppEvent::ApplicationData(inner.content)),
             ContentType::Alert => {
-                let alert = Alert::parse(&inner.content).map_err(TlsSessionError::AlertDecode)?;
+                let alert = match Alert::parse(&inner.content) {
+                    Ok(alert) => alert,
+                    Err(e) => {
+                        self.poisoned = true;
+                        return Err(TlsSessionError::AlertDecode(e));
+                    }
+                };
                 match alert::classify_received(alert) {
-                    ReceivedAlert::Closed => Ok(AppEvent::CloseNotify),
-                    ReceivedAlert::Fatal(code) => Err(TlsSessionError::ReceivedFatalAlert(code)),
+                    ReceivedAlert::Closed => {
+                        self.poisoned = true;
+                        Ok(AppEvent::CloseNotify)
+                    }
+                    ReceivedAlert::Fatal(code) => {
+                        self.poisoned = true;
+                        Err(TlsSessionError::ReceivedFatalAlert(code))
+                    }
                 }
             }
-            ContentType::Handshake | ContentType::ChangeCipherSpec => Err(
-                TlsSessionError::Protection(ProtectionError::UnexpectedOuterType),
-            ),
+            ContentType::Handshake | ContentType::ChangeCipherSpec => {
+                self.poisoned = true;
+                Err(TlsSessionError::Protection(
+                    ProtectionError::UnexpectedOuterType,
+                ))
+            }
         }
     }
 
-    /// `close_notify` レコードを組み立てる。以後 `seal_application_data`
-    /// は拒否しない（呼び出し元が接続を閉じる判断を担う）。
+    /// `close_notify` レコードを組み立てる。RFC 8446 §6.1 により、
+    /// 送信後はこの接続でこれ以上データを送ってはならないため、組み立てに
+    /// 成功したら以後の `seal_application_data`／`open_record`／
+    /// `close_notify` をすべて拒否する（#965 レビュー指摘）。
     pub fn close_notify(&mut self) -> Result<Vec<Record>, TlsSessionError> {
         if self.poisoned {
             return Err(TlsSessionError::Poisoned);
         }
-        self.sealer
+        let records = self
+            .sealer
             .seal_fragmented(ContentType::Alert, &Alert::close_notify())
-            .map_err(TlsSessionError::Protection)
+            .map_err(TlsSessionError::Protection)?;
+        self.poisoned = true;
+        Ok(records)
     }
 
     /// 送信側で fatal alert を送出した後に呼ぶ（以後 poison）。
@@ -949,6 +983,38 @@ impl HandshakeTransport for std::net::TcpStream {
 
     fn shutdown(&mut self) -> io::Result<()> {
         std::net::TcpStream::shutdown(self, std::net::Shutdown::Both)
+    }
+}
+
+/// [`perform_server_handshake_with`] がハンドシェイク全体の**絶対期限**を
+/// 強制するための `Read` ラッパー（#965 レビュー指摘）。
+///
+/// [`record::read_record`] は 1 レコードを読むだけでも `Read::read`／
+/// `read_exact` を複数回（可変長フィールドを含むため）呼び出す。ループの
+/// 外側で `set_read_timeout` を 1 回だけ設定する実装だと、この個々の
+/// `read` 呼び出し単位のタイムアウトしか働かず、相手が期限の直前まで
+/// 待ってから 1 バイトずつ送り続ければ、1 回の `read_record` 呼び出しが
+/// 何倍にも間延びし得る。本ラッパーは `read` を呼ぶたびに `deadline`
+/// までの残り時間を再計算して都度ソケットへ反映することで、
+/// 個々の低レベル `read` 呼び出しの粒度で絶対期限を強制する。期限切れ
+/// 後は OS を呼ばず即座に `TimedOut` を返す（`set_read_timeout` へ
+/// ゼロ Duration を渡すとプラットフォームによってはエラーになるため）。
+struct DeadlineReader<'a, S: HandshakeTransport> {
+    stream: &'a mut S,
+    deadline: Instant,
+}
+
+impl<S: HandshakeTransport> Read for DeadlineReader<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TLS handshake exceeded overall time budget",
+            ));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buf)
     }
 }
 
@@ -996,18 +1062,29 @@ pub fn perform_server_handshake_with_timeout<S: HandshakeTransport>(
 }
 
 /// テスト用: 乱数源・タイムアウトを両方注入する完全形。
+///
+/// `timeout` は個々の読み取り呼び出しの上限ではなく、ハンドシェイク
+/// 開始からの**絶対期限**として扱う（[`DeadlineReader`] 参照。#965
+/// レビュー指摘: `set_read_timeout` をループの外側で 1 回だけ呼ぶ実装だと、
+/// 相手が期限ぎりぎりの間隔で少量ずつバイトを送り続けた場合に
+/// ハンドシェイク全体が `timeout` を大幅に超えて占有され得る）。
 pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeEntropy>(
     stream: &mut S,
     config: Arc<TlsServerConfig>,
     entropy: E,
     timeout: Duration,
 ) -> Result<Box<TlsSession>, ServerHandshakeDriverError> {
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|e| ServerHandshakeDriverError::Record(record::RecordError::Io(e)))?;
+    let deadline = Instant::now() + timeout;
     let mut core = ServerHandshake::with_entropy(config, entropy);
     loop {
-        match record::read_record(stream, core.record_kind()) {
+        let record_result = {
+            let mut deadline_reader = DeadlineReader {
+                stream: &mut *stream,
+                deadline,
+            };
+            record::read_record(&mut deadline_reader, core.record_kind())
+        };
+        match record_result {
             Ok(Some(record)) => match core.handle_record(&record) {
                 Ok(Step::Continue(output)) => {
                     write_all_records(stream, &output, core.write_record_kind())
