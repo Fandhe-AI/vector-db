@@ -453,6 +453,21 @@ impl Sealer {
         install_application(&mut self.epoch, keys)
     }
 
+    /// 現在の epoch に応じて、呼び出し元が [`super::record::Record::
+    /// serialize_into`] へ渡すべき [`RecordKind`] を返す（`Plaintext` epoch
+    /// は [`RecordKind::Plaintext`]、それ以外は [`RecordKind::Ciphertext`]）。
+    /// [`Opener::record_kind`] とは独立した送信側（seal 済みデータ）の値
+    /// であり、両者を混同しない（#965 レビュー指摘。本実装は
+    /// [`Sealer`]／[`Opener`] が常に同時に鍵切替する構成のため現状は
+    /// 両者が同値になるが、将来非対称な鍵切替が入っても書き込み側の検証が
+    /// 誤った epoch を参照しないよう区別する）。
+    pub fn record_kind(&self) -> RecordKind {
+        match self.epoch {
+            Epoch::Plaintext => RecordKind::Plaintext,
+            Epoch::Handshake(_) | Epoch::Application(_) => RecordKind::Ciphertext,
+        }
+    }
+
     /// `content` を 1 レコード分 seal する。`padding_len` は呼び出し側が
     /// 明示的に指定するパディング長（通常呼び出しは 0 を渡す。パディング
     /// 方針を決める仕組みはこのモジュールでは提供しない）。
