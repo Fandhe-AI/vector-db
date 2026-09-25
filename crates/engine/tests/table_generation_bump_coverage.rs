@@ -95,15 +95,23 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 取り込みマージ・Issue #881（INTEGER／BIGINT 列型）マージ取り込みで
     // `catalog.rs` に行が追加され、再度追随
     // （旧: 1567／1591／1639／1653／1677）。
+    // Issue #902（`DROP TABLE` の DDL 実行権限ゲート）で `Storage::drop_table` の
+    // ドキュメンテーションコメントが 4 行増え、以下 2 件の行番号がさらに移動
+    // したための追随（旧: 1701／1780）。
+    // Issue #995（`VECTOR` 列を持たないテーブルへの INSERT 系書き込み受理）で
+    // `TableSchema::validate_embedding_dim`／`validate_row_embedding_dim`・
+    // `Storage::insert_row_into_table`／`insert_typed_row` のドキュメンテーション
+    // コメントが計 33 行増え、以下 2 件の行番号がさらに移動したための追随
+    // （旧: 1705／1784）。
     // Issue #942（SQL-31・TASK-221。`convert_storage_error` ドキュメント拡充）で
-    // 行番号がさらに移動したための追随（旧: 1701）。
-    ("catalog.rs", 1714),
+    // 行番号がさらに移動したための追随（旧: 1738）。
+    ("catalog.rs", 1751),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（`alter_enum_type_add_value` の commit 呼び出しは
     // 依存テーブルの世代を明示的に進行させるため ALLOWLIST 対象外のまま）。
-    ("catalog.rs", 1793),
+    ("catalog.rs", 1830),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_

@@ -235,8 +235,13 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
 
 /// 1 文の先頭トークンから [`StatementEffect`] を判定する。判定語彙は
 /// `core.rs::execute_sql_in_session` の先頭トークン覗き見分岐（`INSERT`／
-/// `TRUNCATE`／`DELETE`／`UPDATE`）と `sql::allowlist::validate_sql` が受理する
-/// `SET`／`CREATE FUNCTION`／`SELECT`／`EXPLAIN` に対応づける。
+/// `TRUNCATE`／`DELETE`／`UPDATE`／`DROP`）と `sql::allowlist::validate_sql` が
+/// 受理する `SET`／`CREATE FUNCTION`／`SELECT`／`EXPLAIN` に対応づける。
+/// `DROP`（`DROP TABLE`。SQL-23・TASK-203、Issue #902）は個別の判定分岐を
+/// 持たず、`Token::Ident(_) => StatementEffect::Write` の fail-closed 既定
+/// （未知の先頭語は書き込み扱い）へ自然に落ちる——`DROP` は [`Keyword`] へ
+/// 含まれないため常に `Token::Ident` として字句解析される
+/// （`lexer::keyword_from_str` 参照）。
 pub fn classify_statement(stmt: &str) -> StatementEffect {
     let tokens = match tokenize(stmt) {
         Ok(t) => t,
@@ -476,6 +481,11 @@ mod tests {
             classify_statement("TRUNCATE TABLE t USING OPERATION_ID 'o1'"),
             StatementEffect::Write
         );
+        // Issue #902（SQL-23・TASK-203）: `DROP TABLE` は書き込み系（DDL）の
+        // ため、複文メッセージ中で最後以外に置かれた場合は他の書き込み文と
+        // 同じく `0A000` で拒否されなければならない（`check_write_placement`
+        // ドキュメント参照）。
+        assert_eq!(classify_statement("DROP TABLE t"), StatementEffect::Write);
         assert_eq!(
             classify_statement("BEGIN"),
             StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Begin)
@@ -531,5 +541,15 @@ mod tests {
         assert!(check_write_placement(&["BEGIN", "COMMIT", "SELECT 1"], false).is_err());
         // `initially_in_txn = true`（すでに `Active`）なら先頭の書き込みも許可する。
         assert!(check_write_placement(&["INSERT INTO t VALUES (1)", "SELECT 1"], true).is_ok());
+    }
+
+    /// Issue #902（SQL-23・TASK-203）: `DROP TABLE x; SELECT ...` のような
+    /// メッセージが、`DROP` を書き込み分類の対象外として扱う抜け穴により
+    /// fail-open で通過しないことを固定する（`classify_statement` ドキュメント
+    /// 参照）。
+    #[test]
+    fn check_write_placement_rejects_drop_table_not_last() {
+        assert!(check_write_placement(&["DROP TABLE docs", "SELECT 1"], false).is_err());
+        assert!(check_write_placement(&["SELECT 1", "DROP TABLE docs"], false).is_ok());
     }
 }

@@ -1237,6 +1237,16 @@ pub enum ParsedSql {
     /// `0A000` で拒否する（トランザクション対応の実行入口は
     /// [`EngineCore::execute_sql_in_txn`]／[`EngineCore::execute_parsed_in_txn`]）。
     Transaction(crate::sql::transaction::TxnControl),
+    /// `DROP TABLE <table>`（SQL-23・TASK-203、Issue #902）。DDL 実行権限ゲート
+    /// （`sql::ddl::require_ddl_permission`）の判定は
+    /// `EngineCore::execute_parsed_in_session` が担い、`validate_drop_table_tokens`
+    /// 自体はカタログ照会を一切行わない（`ValidatedDropTable` ドキュメント参照）。
+    ///
+    /// **BREAKING CHANGE**（Issue #902）: 本 variant の追加により `ParsedSql` を
+    /// 網羅的にマッチする既存コード（`crate::core::EngineCore`）はすべて
+    /// 更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードがあれば
+    /// 追随が必要。
+    DropTable(crate::sql::allowlist::ValidatedDropTable),
 }
 
 /// `parsed` が保持する `operation_id`（`USING OPERATION_ID '<id>'`。書き込み系
@@ -2141,6 +2151,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback => {
@@ -2171,6 +2182,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback => {
@@ -2198,6 +2210,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback => {
@@ -2366,6 +2379,19 @@ impl EngineCore {
                 self.ledger_mode,
             )?;
             return Ok(ParsedSql::Update(stmt));
+        }
+
+        let is_drop_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DROP")
+        );
+        if is_drop_statement {
+            // `validate_drop_table_tokens` はカタログ照会を一切行わない
+            // （DDL 実行権限ゲートを存在確認より前に通す契約。`ValidatedDropTable`
+            // ドキュメント参照）。権限判定・実行本体は
+            // `execute_parsed_in_session` の `DropTable` 分岐が担う。
+            let stmt = crate::sql::allowlist::validate_drop_table_tokens(&tokens)?;
+            return Ok(ParsedSql::DropTable(stmt));
         }
 
         let stmt = crate::sql::allowlist::validate_sql_tokens(&tokens, &self.storage)?;
@@ -2539,6 +2565,17 @@ impl EngineCore {
             ParsedSql::Update(stmt) => {
                 let outcome = self.execute_predicate_update_form(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::Update(outcome))
+            }
+            // SQL-23・TASK-203（Issue #902）: DDL 実行権限ゲート
+            // （`sql::ddl::require_ddl_permission`）を、カタログ照会（対象
+            // テーブルの存在確認）を含む `execute_drop_table` より必ず先に
+            // 通す（`SqlSurfaceError::InsufficientPrivilege` ドキュメント
+            // 参照）。`ctx`（テナント境界）は `Storage::drop_table` が取らない
+            // ため未使用のまま——`DROP TABLE` はテナントスコープの操作ではない。
+            ParsedSql::DropTable(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_drop_table(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::DropTable(outcome))
             }
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
@@ -2850,6 +2887,10 @@ impl EngineCore {
                 }
             }
             ParsedSql::Truncate(_) => Ok(None),
+            // `DROP TABLE`（Issue #902）は `CommandComplete` のみを返す DDL の
+            // ため、`Truncate` と同じく結果列を持たない。DDL 実行権限判定・
+            // 実際の削除は一切行わない（Describe は本体を実行しない契約）。
+            ParsedSql::DropTable(_) => Ok(None),
             ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
                 match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {

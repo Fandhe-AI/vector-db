@@ -675,7 +675,7 @@ pub(crate) fn insert_row_unchecked(
     // `COMMIT`/`ROLLBACK` まで持ち越し）のいずれとも共有する（SQL-31・TASK-221）。
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write(write_txn, table)?;
-        schema.validate_embedding_dim(row.embedding.len())?;
+        schema.validate_row_embedding_dim(row.embedding.len())?;
         // エンコードは 1 回のみ（Issue #397）: 以前は台帳ハッシュ計算用と redb 書き込み用で
         // それぞれ `encode_row` していた二重実行を排除し、ここで計算した結果を
         // `content_hash::for_insert_encoded` と `insert_unique_row` の双方で共有する。
@@ -873,7 +873,7 @@ pub(crate) fn insert_rows_unchecked(
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
         for ((id, row), range) in rows.iter().zip(ranges.iter()) {
-            schema.validate_embedding_dim(row.embedding.len())?;
+            schema.validate_row_embedding_dim(row.embedding.len())?;
             let key = (ctx.tenant_id(), *id);
             let encoded = arena.get(range.clone()).ok_or_else(|| {
                 TenantWriteError::Storage(StorageError::Codec(
@@ -941,7 +941,7 @@ pub fn insert_typed_row(
 /// 実際に書き込み時点で参照するスキーマとの間に競合（束縛後・書き込み前に
 /// 同名テーブルが `DROP`・再作成され `TEXT` 列の宣言順が入れ替わった等）が
 /// 生じても検出できず、`VECTOR` 列の位置・次元さえ一致していれば
-/// `validate_embedding_dim` を素通りしたうえで値が意図しない列へ保存され得る
+/// `validate_row_embedding_dim` を素通りしたうえで値が意図しない列へ保存され得る
 /// （`core::EngineCore::execute_bound_insert_in_session` が read トランザクション
 /// で束縛した後にトランザクションを閉じ、実書き込みは別の write トランザクション
 /// で行う構造のため発生しうる TOCTOU）。`values` 自体を使い回さない他の呼び出し元
@@ -972,25 +972,28 @@ pub(crate) fn insert_typed_row_unchecked(
         let vector_idx = schema
             .columns
             .iter()
-            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
-            .ok_or_else(|| {
-                TenantWriteError::Catalog(CatalogError::Invalid(
-                    "table has no VECTOR column".to_string(),
-                ))
-            })?;
+            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)));
+        // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま扱う
+        // （読み取り側の dim==0 モデル・`sql/scan.rs`・`sql/aggregate.rs` の
+        // `expected_dim: Option<u32>` と整合。列がある場合の「値が欠落・非
+        // Vector なら拒否」という fail-closed 判定は変えない）。
+        //
         // Issue #485: `Vec<f32>` の複製（dim 128 で 512 B）を避けるため
         // `values` を所有する呼び出し元のバッファから借用する（`RowInput`・
         // `content_hash::for_typed_insert` はいずれも `&[f32]` で受けられる
         // ため、この関数の生存期間内で借用を保持するだけで足りる）。
-        let embedding: &[f32] = match values.get(vector_idx) {
-            Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-            _ => {
-                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                    "VECTOR column value missing or not a Vector".to_string(),
-                )))
-            }
+        let embedding: &[f32] = match vector_idx {
+            Some(idx) => match values.get(idx) {
+                Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                _ => {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "VECTOR column value missing or not a Vector".to_string(),
+                    )))
+                }
+            },
+            None => &[],
         };
-        schema.validate_embedding_dim(embedding.len())?;
+        schema.validate_row_embedding_dim(embedding.len())?;
         let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
             .map_err(|e| CatalogError::Invalid(e.to_string()))?;
         let row = RowInput {
@@ -1016,7 +1019,8 @@ pub(crate) fn insert_typed_row_unchecked(
             .iter()
             .enumerate()
             .filter(|(idx, column)| {
-                *idx != vector_idx && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
+                Some(*idx) != vector_idx
+                    && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
             })
             .filter_map(|(idx, column)| values.get(idx).map(|value| (column.name.as_str(), value)))
             .collect();
@@ -1104,15 +1108,12 @@ pub(crate) fn insert_typed_rows_unchecked(
                 )));
             }
         }
+        // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま扱う
+        // （`insert_typed_row_unchecked` と同じ設計。読み取り側の dim==0 モデルと整合）。
         let vector_idx = schema
             .columns
             .iter()
-            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
-            .ok_or_else(|| {
-                TenantWriteError::Catalog(CatalogError::Invalid(
-                    "table has no VECTOR column".to_string(),
-                ))
-            })?;
+            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)));
 
         // ハッシュ材料（`(id, visibility, embedding, 列名付きペア列)`）を要求記載順で
         // 事前に組み立てる（`for_typed_insert_batch` ドキュメント参照）。列名付き
@@ -1132,21 +1133,24 @@ pub(crate) fn insert_typed_rows_unchecked(
             ))
         })?;
         for (id, values) in rows {
-            let embedding: &[f32] = match values.get(vector_idx) {
-                Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                _ => {
-                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                        "VECTOR column value missing or not a Vector".to_string(),
-                    )))
-                }
+            let embedding: &[f32] = match vector_idx {
+                Some(idx) => match values.get(idx) {
+                    Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                    _ => {
+                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                            "VECTOR column value missing or not a Vector".to_string(),
+                        )))
+                    }
+                },
+                None => &[],
             };
-            schema.validate_embedding_dim(embedding.len())?;
+            schema.validate_row_embedding_dim(embedding.len())?;
             let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
                 .columns
                 .iter()
                 .enumerate()
                 .filter(|(idx, column)| {
-                    *idx != vector_idx
+                    Some(*idx) != vector_idx
                         && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
                 })
                 .filter_map(|(idx, column)| {
@@ -1173,13 +1177,16 @@ pub(crate) fn insert_typed_rows_unchecked(
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
         for (id, values) in rows {
-            let embedding: &[f32] = match values.get(vector_idx) {
-                Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                _ => {
-                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                        "VECTOR column value missing or not a Vector".to_string(),
-                    )))
-                }
+            let embedding: &[f32] = match vector_idx {
+                Some(idx) => match values.get(idx) {
+                    Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                    _ => {
+                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                            "VECTOR column value missing or not a Vector".to_string(),
+                        )))
+                    }
+                },
+                None => &[],
             };
             let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
                 .map_err(|e| CatalogError::Invalid(e.to_string()))?;
@@ -1308,15 +1315,12 @@ pub(crate) fn upsert_typed_rows_unchecked(
                 )));
             }
         }
+        // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま扱う
+        // （`insert_typed_rows_unchecked` と同じ設計。読み取り側の dim==0 モデルと整合）。
         let vector_idx = schema
             .columns
             .iter()
-            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
-            .ok_or_else(|| {
-                TenantWriteError::Catalog(CatalogError::Invalid(
-                    "table has no VECTOR column".to_string(),
-                ))
-            })?;
+            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)));
 
         // ハッシュ材料（`(id, visibility, embedding, 列名付きペア列)`）を要求記載順で
         // 事前に組み立てる（`insert_typed_rows_unchecked` と同じ構造。`content_hash::
@@ -1334,21 +1338,24 @@ pub(crate) fn upsert_typed_rows_unchecked(
             ))
         })?;
         for (id, values) in rows {
-            let embedding: &[f32] = match values.get(vector_idx) {
-                Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                _ => {
-                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                        "VECTOR column value missing or not a Vector".to_string(),
-                    )))
-                }
+            let embedding: &[f32] = match vector_idx {
+                Some(idx) => match values.get(idx) {
+                    Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                    _ => {
+                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                            "VECTOR column value missing or not a Vector".to_string(),
+                        )))
+                    }
+                },
+                None => &[],
             };
-            schema.validate_embedding_dim(embedding.len())?;
+            schema.validate_row_embedding_dim(embedding.len())?;
             let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
                 .columns
                 .iter()
                 .enumerate()
                 .filter(|(idx, column)| {
-                    *idx != vector_idx
+                    Some(*idx) != vector_idx
                         && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
                 })
                 .filter_map(|(idx, column)| {
@@ -1499,7 +1506,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
                                 }
                                 UpsertSetValue::Literal(v) => (*v).clone(),
                             };
-                            if *col_idx == vector_idx {
+                            if Some(*col_idx) == vector_idx {
                                 match new_value {
                                     crate::row_codec::Value::Vector(v) => embedding_value = v,
                                     _ => {
@@ -1521,7 +1528,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
                                 *slot = new_value;
                             }
                         }
-                        schema.validate_embedding_dim(embedding_value.len())?;
+                        schema.validate_row_embedding_dim(embedding_value.len())?;
                         let metadata =
                             crate::row_codec::encode_scalar_columns(&schema, &merged_values)
                                 .map_err(|e| CatalogError::Invalid(e.to_string()))?;
@@ -1546,14 +1553,17 @@ pub(crate) fn upsert_typed_rows_unchecked(
                 }
             } else {
                 // 非衝突（新規挿入）。既存 `insert_typed_rows_unchecked` と同じ
-                // 組み立て。
-                let embedding: &[f32] = match values.get(vector_idx) {
-                    Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                    _ => {
-                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                            "VECTOR column value missing or not a Vector".to_string(),
-                        )))
-                    }
+                // 組み立て（Issue #995: `VECTOR` 列なしスキーマは embedding 空）。
+                let embedding: &[f32] = match vector_idx {
+                    Some(idx) => match values.get(idx) {
+                        Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                        _ => {
+                            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                                "VECTOR column value missing or not a Vector".to_string(),
+                            )))
+                        }
+                    },
+                    None => &[],
                 };
                 let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
                     .map_err(|e| CatalogError::Invalid(e.to_string()))?;
@@ -4749,12 +4759,12 @@ mod tests {
     // `VECTOR` 列への SET があった場合のみ次元検証しており、本テストは述語形を
     // 同じ契約に揃えたことを固定する。
     //
-    // 現行の全 INSERT 系公開・準公開 API（`insert_row`/`insert_typed_row`/
-    // `insert_typed_row_unchecked`/`Storage::insert_row_into_table` 等）は
-    // いずれも `schema.validate_embedding_dim` を無条件で呼ぶため、`VECTOR`
-    // 列を持たないテーブルへは現状経由できない（本 Issue のスコープ外）。
-    // そのため本テストは `redb` への直接書き込みでスキーマ検証を迂回し、
-    // `update_rows_where_unchecked`（適用対象の関数そのもの）だけを検証する。
+    // Issue #995 で全 INSERT 系入口（`insert_row`/`insert_typed_row`/
+    // `insert_typed_row_unchecked`/`Storage::insert_row_into_table` 等）が
+    // `VECTOR` 列なしテーブルへの書き込みを受理するようになったため、現在は
+    // それらを経由してもよいが、本テストは `update_rows_where_unchecked`
+    // （適用対象の関数そのもの）の検証に的を絞るため、引き続き `redb` への
+    // 直接書き込みで種行を用意する。
     #[test]
     fn update_rows_where_unchecked_applies_text_assignments_on_table_without_vector_column() {
         let path = unique_db_path("predicate-update-no-vector-column");
