@@ -149,13 +149,13 @@ fn full_row_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> Ta
 /// スカラーペイロード）向けのスキーマ。`VECTOR` 列は当該 API から常にスキップ
 /// されるため（production 契約）、意図的に含めない。
 fn scalar_schema(enum_def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> TableSchema {
-    let mut cols: Vec<ColumnDef> = full_row_schema(enum_def)
+    let cols: Vec<ColumnDef> = full_row_schema(enum_def)
         .columns
         .into_iter()
         .filter(|c| !matches!(c.ty, ColumnType::Vector(_)))
         .collect();
-    // テーブル名をフルスキーマと区別する必要はない（`TableSchema` は独立して使う）。
-    cols.shrink_to_fit();
+    // テーブル名は full_row_schema と別の値（"docs_scalar"）を使う。`TableSchema`
+    // は名前を保持するだけで比較や検証に使わないため、独立した名前で構わない。
     TableSchema::new("docs_scalar", cols)
 }
 
@@ -586,8 +586,13 @@ fn scalar_columns_roundtrip_is_bit_exact_for_representative_values() {
     let re_encoded = encode_scalar_columns(&schema, &decoded).expect("re-encode");
     assert_eq!(re_encoded, encoded);
 
-    // scan_scalar_columns の ScalarRef も期待値と一致する（テキスト系のみ抜粋
-    // 確認。他は decode_scalar_columns 経由で既に固定済み）。
+    // decode_scalar_columns は内部で scan_scalar_columns を呼び出し ScalarRef を
+    // Value へ変換するため、直前の assert_eq!(decoded, values) の時点で
+    // ScalarRef の値そのものは全列型について既にビット単位で固定済みである
+    // （row_codec.rs::decode_scalar_columns 参照）。ここでの直接呼び出しは、
+    // decode_scalar_columns を経由しない独立した scan_scalar_columns 単体の
+    // 呼び出しがエラーにならず、列数（None を含む）が期待どおりであることを
+    // 追加で固定する非自明な検査であり、値の再比較ではない。
     let scanned = scan_scalar_columns(&schema, &encoded).expect("scan scalar columns");
     assert_eq!(scanned.len(), values.len());
 
