@@ -532,6 +532,13 @@ impl TlsTestChannel {
     pub fn into_parts(self) -> (TestClient, std::net::TcpStream) {
         (self.client, self.socket)
     }
+
+    /// 受信した葉証明書 DER（[`TestClient::server_leaf_der`]）。
+    /// `wire_scram_plus_tls.rs` がクライアント側で独立に
+    /// `tls-server-end-point` を算出するために使う（Issue #970）。
+    pub fn client_leaf_der(&self) -> &[u8] {
+        &self.client.server_leaf_der
+    }
 }
 
 impl Read for TlsTestChannel {

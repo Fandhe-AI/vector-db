@@ -1,13 +1,15 @@
 //! SCRAM-SHA-256（RFC 5802／RFC 7677）の検証子・メッセージ解析・組み立て・
-//! 照合ロジック。TLS が無い間はチャネルバインディング（`-PLUS`）を提示・受理
-//! しない（[`ChannelBinding`] は将来の TLS 実装〔Issue #941・TASK-228〕向けの
-//! 拡張点として `None` の 1 variant のみを持つ）。
+//! 照合ロジック。TLS 接続では SCRAM-SHA-256-PLUS（チャネルバインディング
+//! `tls-server-end-point`。RFC 5929 §4。Issue #970）も提示・受理する
+//! （[`ChannelBinding`]。TLS が無い接続では引き続き `None` のみを提示・
+//! 受理する）。
 //!
 //! `handshake.rs` の SASL フローから呼ばれる（ポインタ: Issue #940・WIRE-18・
-//! TASK-222）。本モジュールはメッセージのバイト列表現・パース・
-//! `AuthMessage` の構成・proof の照合のみを担い、wire フレーミング
-//! （`AuthenticationSASL`/`Continue`/`Final` の型バイト・長さプレフィクス）は
-//! `handshake.rs` 側が組み立てる。
+//! TASK-222・Issue #970）。本モジュールはメッセージのバイト列表現・パース・
+//! `AuthMessage` の構成・proof の照合・チャネルバインディングの交渉判定の
+//! みを担い、wire フレーミング（`AuthenticationSASL`/`Continue`/`Final` の
+//! 型バイト・長さプレフィクス）・`tls-server-end-point` の値そのものの算出
+//! （[`super::super::tls::channel_binding`]）は `handshake.rs` 側が担う。
 //!
 //! untrusted 入力（client-first/client-final）の解析は `unwrap`/`expect`/
 //! 添字アクセスを使わず fail-closed に拒否する（`.claude/rules/coding-rust.md`）。
@@ -16,8 +18,18 @@ use super::base64_std;
 use super::hmac_sha256::{hmac_sha256, pbkdf2_hmac_sha256_one_block};
 use engine::crypto::sha256::digest;
 
-/// PostgreSQL wire プロトコルへ提示する唯一の SASL 機構名。
+/// PostgreSQL wire プロトコルへ提示する SASL 機構名（TLS 未接続、または
+/// TLS 接続でもチャネルバインディング提示を無効化した設定の場合）。
 pub const MECHANISM_NAME: &str = "SCRAM-SHA-256";
+
+/// チャネルバインディング付きの SASL 機構名（TLS 接続かつ
+/// `tls-server-end-point` を算出できた場合にのみ、`MECHANISM_NAME` と
+/// あわせて機構リストへ提示する。Issue #970・RFC 5802 §6）。
+pub const MECHANISM_NAME_PLUS: &str = "SCRAM-SHA-256-PLUS";
+
+/// RFC 5929 §4 のチャネルバインディング種別名（gs2 `p=<cb-name>` の
+/// `<cb-name>`）。本サーバーが対応する唯一の種別。
+pub const CB_NAME_TLS_SERVER_END_POINT: &str = "tls-server-end-point";
 
 /// `UserStore::load_from_file` が検証子を起動時検証する際に要求する反復回数
 /// （完全一致のみ受理。反復回数がレコードごとに異なると server-first の
@@ -33,12 +45,14 @@ pub const KEY_LEN: usize = 32;
 
 const VERIFIER_PREFIX: &str = "SCRAM-SHA-256$";
 
-/// クライアントが `channel_binding=require`（`p=<cb-name>`）を指定した場合の
-/// 拒否理由として使う。TLS 導入後は `TlsServerEndPoint` variant を追加する
-/// 拡張点（Issue #941・TASK-228 へ引き継ぐ）。
+/// この接続で交渉されたチャネルバインディング（[`negotiate_channel_binding`]
+/// の戻り値）。`None` は TLS 未接続、または TLS 接続でも `n`／`y` を選んだ
+/// 場合。`TlsServerEndPoint` は SCRAM-SHA-256-PLUS で
+/// `p=tls-server-end-point` を選んだ場合（Issue #970）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelBinding {
     None,
+    TlsServerEndPoint,
 }
 
 /// 検証子（RFC 5802 の StoredKey／ServerKey）。PostgreSQL 互換形式
@@ -165,9 +179,15 @@ pub fn generate_verifier(
 pub enum ScramError {
     /// 構文違反（`08P01`。ProtocolViolation）。
     Malformed,
-    /// `p=<cb-name>`（channel binding 要求）。TLS 未実装のため拒否する
-    /// （`08P01`）。
+    /// `p=<cb-name>`（channel binding 要求）だが、この接続ではチャネル
+    /// バインディングを提供できない（TLS 未接続、または TLS 接続でも
+    /// `tls-server-end-point` を算出できなかった／提示無効化設定。`08P01`）。
     ChannelBindingRequested,
+    /// サーバーが PLUS を提示したにもかかわらず、非 PLUS 機構を選びつつ
+    /// gs2 cbind-flag `y`（クライアントは PLUS に対応するがサーバーは
+    /// 対応しないと誤認）を送った（ダウングレード攻撃の検出。RFC 5802 §6。
+    /// `08P01`）。
+    ChannelBindingDowngrade,
     /// メッセージ長が上限を超過（`54000`。呼び出し元が別途フレーミング層で
     /// 検証する契約だが、本モジュール内の防御としても検証する）。
     TooLarge,
@@ -191,6 +211,19 @@ fn validate_nonce(nonce: &str) -> Result<(), ScramError> {
     Ok(())
 }
 
+/// gs2 cbind-flag（client-first-message の先頭要素）の解析結果。
+/// [`negotiate_channel_binding`] の判定入力。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gs2CbindFlag {
+    /// `n`: クライアントはチャネルバインディングに対応しない。
+    NotSupported,
+    /// `y`: クライアントは対応するが、サーバーが対応しないと判断した
+    /// （ダウングレード検出の対象）。
+    ClientSupportsServerNot,
+    /// `p=<cb-name>`: 指定した種別のチャネルバインディングを要求する。
+    Requested(String),
+}
+
 /// client-first-message（gs2-header 部分を含む）を解析する。
 #[derive(Debug)]
 pub struct ClientFirstMessage {
@@ -199,33 +232,63 @@ pub struct ClientFirstMessage {
     /// client-first-message-bare（`AuthMessage` の先頭要素）。
     pub client_first_bare: Vec<u8>,
     pub client_nonce: String,
+    /// gs2 cbind-flag の解析結果（[`negotiate_channel_binding`] の入力）。
+    pub cbind_flag: Gs2CbindFlag,
 }
 
-pub fn parse_client_first(body: &[u8]) -> Result<ClientFirstMessage, ScramError> {
+/// RFC 5802 の gs2-cb-name 文字集合（`1*(ALPHA / DIGIT / "." / "-")`）を
+/// 検証する。
+fn validate_cbind_name(name: &str) -> Result<(), ScramError> {
+    if name.is_empty() || name.len() > MAX_SCRAM_FIELD_LEN {
+        return Err(ScramError::Malformed);
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return Err(ScramError::Malformed);
+    }
+    Ok(())
+}
+
+/// [`parse_client_first`]／[`parse_client_first_with_cbind`] が共有する本体。
+/// `allow_cbind_request` が `false` の場合、`p=<cb-name>` は（cb-name の
+/// 形状を検査せず）直ちに [`ScramError::ChannelBindingRequested`] にする
+/// （既存 `parse_client_first` の挙動をビット単位で保つため）。
+fn parse_client_first_inner(
+    body: &[u8],
+    allow_cbind_request: bool,
+) -> Result<ClientFirstMessage, ScramError> {
     if body.len() > MAX_SCRAM_FIELD_LEN {
         return Err(ScramError::TooLarge);
     }
     let s = std::str::from_utf8(body).map_err(|_| ScramError::Malformed)?;
 
     let mut parts = s.splitn(3, ',');
-    let cbind_flag = parts.next().ok_or(ScramError::Malformed)?;
+    let cbind_flag_str = parts.next().ok_or(ScramError::Malformed)?;
     let authzid = parts.next().ok_or(ScramError::Malformed)?;
     let bare = parts.next().ok_or(ScramError::Malformed)?;
 
-    if let Some(stripped) = cbind_flag.strip_prefix("p=") {
-        let _ = stripped;
-        return Err(ScramError::ChannelBindingRequested);
-    }
-    if cbind_flag != "n" && cbind_flag != "y" {
+    let cbind_flag = if let Some(cb_name) = cbind_flag_str.strip_prefix("p=") {
+        if !allow_cbind_request {
+            return Err(ScramError::ChannelBindingRequested);
+        }
+        validate_cbind_name(cb_name)?;
+        Gs2CbindFlag::Requested(cb_name.to_string())
+    } else if cbind_flag_str == "n" {
+        Gs2CbindFlag::NotSupported
+    } else if cbind_flag_str == "y" {
+        Gs2CbindFlag::ClientSupportsServerNot
+    } else {
         return Err(ScramError::Malformed);
-    }
+    };
     // authzid（`a=<authzid>`）は空でなければ拒否する（テナントは StartupMessage
     // の `user` からのみ導出し、SASL 側の authzid は一切使わない設計判断）。
     if !authzid.is_empty() {
         return Err(ScramError::Malformed);
     }
 
-    let gs2_header_len = cbind_flag.len() + 1 + authzid.len() + 1;
+    let gs2_header_len = cbind_flag_str.len() + 1 + authzid.len() + 1;
     let gs2_header = body
         .get(..gs2_header_len)
         .ok_or(ScramError::Malformed)?
@@ -258,7 +321,68 @@ pub fn parse_client_first(body: &[u8]) -> Result<ClientFirstMessage, ScramError>
         gs2_header,
         client_first_bare,
         client_nonce: nonce.to_string(),
+        cbind_flag,
     })
+}
+
+/// TLS 未接続、またはチャネルバインディング非提供の接続向け（既存の
+/// `p=<cb-name>` 拒否をビット単位で保つ）。
+pub fn parse_client_first(body: &[u8]) -> Result<ClientFirstMessage, ScramError> {
+    parse_client_first_inner(body, false)
+}
+
+/// TLS 接続かつチャネルバインディングを提供できる接続向け（Issue #970）。
+/// `p=<cb-name>` を [`Gs2CbindFlag::Requested`] として受理し、交渉判定は
+/// [`negotiate_channel_binding`] が別途行う。
+pub fn parse_client_first_with_cbind(body: &[u8]) -> Result<ClientFirstMessage, ScramError> {
+    parse_client_first_inner(body, true)
+}
+
+/// gs2 cbind-flag・選択した機構・サーバーが PLUS を提示したかから
+/// チャネルバインディングの交渉結果を決める純粋関数（RFC 5802 §6・§7。
+/// Issue #970）。ユーザーの存在に依存せず client-first 受信後・server-first
+/// 送出前に呼べる（列挙攻撃対策として重要）。
+///
+/// | サーバーが PLUS を提示 | 選択機構 | cbind-flag | 結果 |
+/// |---|---|---|---|
+/// | no | 非PLUS | `n`／`y` | `None` |
+/// | no | 非PLUS | `p=…` | `ChannelBindingRequested` |
+/// | yes | PLUS | `p=tls-server-end-point` | `TlsServerEndPoint` |
+/// | yes | PLUS | それ以外 | `Malformed`（構造上到達しない想定の防御） |
+/// | yes | 非PLUS | `n` | `None` |
+/// | yes | 非PLUS | `y` | `ChannelBindingDowngrade` |
+/// | yes | 非PLUS | `p=…` | `Malformed`（構造上到達しない想定の防御） |
+pub fn negotiate_channel_binding(
+    selected_plus: bool,
+    flag: &Gs2CbindFlag,
+    server_offers_plus: bool,
+) -> Result<ChannelBinding, ScramError> {
+    match (server_offers_plus, selected_plus, flag) {
+        (false, false, Gs2CbindFlag::NotSupported | Gs2CbindFlag::ClientSupportsServerNot) => {
+            Ok(ChannelBinding::None)
+        }
+        (false, false, Gs2CbindFlag::Requested(_)) => Err(ScramError::ChannelBindingRequested),
+        (true, true, Gs2CbindFlag::Requested(name)) if name == CB_NAME_TLS_SERVER_END_POINT => {
+            Ok(ChannelBinding::TlsServerEndPoint)
+        }
+        (true, false, Gs2CbindFlag::NotSupported) => Ok(ChannelBinding::None),
+        (true, false, Gs2CbindFlag::ClientSupportsServerNot) => {
+            Err(ScramError::ChannelBindingDowngrade)
+        }
+        // 呼び出し元（`handshake.rs`）の判定順序・機構選択のバリデーション上、
+        // 到達しないはずの組み合わせ（PLUS 未提示なのに PLUS を選んだ、
+        // PLUS 選択時に未知の cb-name、非PLUS 選択時に `p=` 等）を
+        // fail-closed に拒否する多層防御。
+        (false, true, _)
+        | (
+            true,
+            true,
+            Gs2CbindFlag::NotSupported
+            | Gs2CbindFlag::ClientSupportsServerNot
+            | Gs2CbindFlag::Requested(_),
+        )
+        | (true, false, Gs2CbindFlag::Requested(_)) => Err(ScramError::Malformed),
+    }
 }
 
 /// client-final-message（`c=<gs2-header-b64>,r=<nonce>,p=<proof-b64>`）。
@@ -328,8 +452,24 @@ pub fn compute_auth_message(
 /// `c=<base64(gs2_header)>,r=<nonce>` を組み立てる（client-final-without-proof。
 /// クライアントが送った client-final のうち `p=` を除いた部分と一致するべき値を
 /// サーバー側でも独立に再構成し、`AuthMessage` の構成に使う）。
+/// [`client_final_without_proof_with_cbind`] の `cbind_data` 空版に等しい。
 pub fn client_final_without_proof(gs2_header: &[u8], nonce: &str) -> Vec<u8> {
-    format!("c={},r={nonce}", base64_std::encode(gs2_header)).into_bytes()
+    client_final_without_proof_with_cbind(gs2_header, &[], nonce)
+}
+
+/// `c=<base64(gs2_header ++ cbind_data)>,r=<nonce>` を組み立てる
+/// （cbind-input = gs2-header ‖ cbind-data。RFC 5802 §5・RFC 5929 §4。
+/// Issue #970）。`cbind_data` が空なら [`client_final_without_proof`] と
+/// バイト同一。
+pub fn client_final_without_proof_with_cbind(
+    gs2_header: &[u8],
+    cbind_data: &[u8],
+    nonce: &str,
+) -> Vec<u8> {
+    let mut cbind_input = Vec::with_capacity(gs2_header.len() + cbind_data.len());
+    cbind_input.extend_from_slice(gs2_header);
+    cbind_input.extend_from_slice(cbind_data);
+    format!("c={},r={nonce}", base64_std::encode(&cbind_input)).into_bytes()
 }
 
 /// server-first-message（`r=<nonce>,s=<salt_b64>,i=<iterations>`）。
@@ -578,5 +718,146 @@ mod tests {
         let wrong_proof = [0u8; KEY_LEN];
         let result = verify_client_final(&verifier, auth_message, &wrong_proof);
         assert!(!result.ok);
+    }
+
+    // ---- Issue #970: SCRAM-SHA-256-PLUS チャネルバインディング ----
+
+    #[test]
+    fn parse_client_first_with_cbind_accepts_p_and_returns_requested_flag() {
+        let body = b"p=tls-server-end-point,,n=user,r=abc";
+        let parsed = parse_client_first_with_cbind(body).expect("parse");
+        assert_eq!(
+            parsed.cbind_flag,
+            Gs2CbindFlag::Requested("tls-server-end-point".to_string())
+        );
+        assert_eq!(parsed.gs2_header, b"p=tls-server-end-point,,");
+        assert_eq!(parsed.client_nonce, "abc");
+    }
+
+    #[test]
+    fn parse_client_first_with_cbind_rejects_invalid_cbind_name_charset() {
+        // gs2-cb-name は ALPHA/DIGIT/"."/"-" のみ（`,` はフィールド区切りに
+        // 使われるため元々別フィールドとして切り出されるが、`_` 等の非対応
+        // 文字は cb-name 自体として拒否する）。
+        assert_eq!(
+            parse_client_first_with_cbind(b"p=tls_server,,n=user,r=abc").unwrap_err(),
+            ScramError::Malformed
+        );
+    }
+
+    #[test]
+    fn parse_client_first_with_cbind_still_accepts_n_and_y() {
+        let n = parse_client_first_with_cbind(b"n,,n=user,r=abc").expect("parse n");
+        assert_eq!(n.cbind_flag, Gs2CbindFlag::NotSupported);
+        let y = parse_client_first_with_cbind(b"y,,n=user,r=abc").expect("parse y");
+        assert_eq!(y.cbind_flag, Gs2CbindFlag::ClientSupportsServerNot);
+    }
+
+    #[test]
+    fn parse_client_first_unchanged_still_rejects_p_immediately() {
+        // 既存 `parse_client_first`（非 PLUS 対応接続向け）はビット単位で
+        // 不変（`p=` は cb-name の形状を検査せず即座に拒否）。
+        assert_eq!(
+            parse_client_first(b"p=tls-server-end-point,,n=user,r=abc").unwrap_err(),
+            ScramError::ChannelBindingRequested
+        );
+    }
+
+    #[test]
+    fn negotiate_channel_binding_no_plus_offered_accepts_n_and_y() {
+        assert_eq!(
+            negotiate_channel_binding(false, &Gs2CbindFlag::NotSupported, false),
+            Ok(ChannelBinding::None)
+        );
+        assert_eq!(
+            negotiate_channel_binding(false, &Gs2CbindFlag::ClientSupportsServerNot, false),
+            Ok(ChannelBinding::None)
+        );
+    }
+
+    #[test]
+    fn negotiate_channel_binding_no_plus_offered_rejects_p() {
+        assert_eq!(
+            negotiate_channel_binding(
+                false,
+                &Gs2CbindFlag::Requested("tls-server-end-point".to_string()),
+                false
+            ),
+            Err(ScramError::ChannelBindingRequested)
+        );
+    }
+
+    #[test]
+    fn negotiate_channel_binding_plus_offered_and_selected_with_known_cb_name_succeeds() {
+        assert_eq!(
+            negotiate_channel_binding(
+                true,
+                &Gs2CbindFlag::Requested(CB_NAME_TLS_SERVER_END_POINT.to_string()),
+                true
+            ),
+            Ok(ChannelBinding::TlsServerEndPoint)
+        );
+    }
+
+    #[test]
+    fn negotiate_channel_binding_plus_offered_and_selected_with_unknown_cb_name_is_rejected() {
+        assert_eq!(
+            negotiate_channel_binding(
+                true,
+                &Gs2CbindFlag::Requested("tls-unique".to_string()),
+                true
+            ),
+            Err(ScramError::Malformed)
+        );
+    }
+
+    #[test]
+    fn negotiate_channel_binding_plus_offered_non_plus_selected_with_n_succeeds() {
+        assert_eq!(
+            negotiate_channel_binding(false, &Gs2CbindFlag::NotSupported, true),
+            Ok(ChannelBinding::None)
+        );
+    }
+
+    #[test]
+    fn negotiate_channel_binding_plus_offered_non_plus_selected_with_y_is_downgrade() {
+        assert_eq!(
+            negotiate_channel_binding(false, &Gs2CbindFlag::ClientSupportsServerNot, true),
+            Err(ScramError::ChannelBindingDowngrade)
+        );
+    }
+
+    #[test]
+    fn negotiate_channel_binding_plus_offered_non_plus_selected_with_p_is_rejected() {
+        assert_eq!(
+            negotiate_channel_binding(
+                false,
+                &Gs2CbindFlag::Requested(CB_NAME_TLS_SERVER_END_POINT.to_string()),
+                true
+            ),
+            Err(ScramError::Malformed)
+        );
+    }
+
+    #[test]
+    fn client_final_without_proof_with_cbind_matches_empty_data_form() {
+        let gs2_header = b"n,,";
+        let nonce = "abc123";
+        assert_eq!(
+            client_final_without_proof(gs2_header, nonce),
+            client_final_without_proof_with_cbind(gs2_header, &[], nonce)
+        );
+    }
+
+    #[test]
+    fn client_final_without_proof_with_cbind_concatenates_gs2_header_and_cbind_data() {
+        let gs2_header = b"p=tls-server-end-point,,";
+        let cbind_data = [0xaa, 0xbb, 0xcc];
+        let nonce = "abc123";
+        let result = client_final_without_proof_with_cbind(gs2_header, &cbind_data, nonce);
+        let mut expected_input = gs2_header.to_vec();
+        expected_input.extend_from_slice(&cbind_data);
+        let expected = format!("c={},r={nonce}", base64_std::encode(&expected_input));
+        assert_eq!(std::str::from_utf8(&result).expect("utf8"), expected);
     }
 }
