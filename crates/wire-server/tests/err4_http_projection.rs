@@ -199,7 +199,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 30] = [
+const EXPECTED_STATUS: [(&str, u16); 31] = [
     ("22000", 400),
     ("28P01", 401),
     ("28000", 401),
@@ -243,6 +243,9 @@ const EXPECTED_STATUS: [(&str, u16); 30] = [
     // production の応答エンコーダ経由で射影のみ検証する。
     ("42704", 400),
     ("42703", 400),
+    // `CheckViolation`（`23514`。TABLE-16・TASK-204、Issue #906）は
+    // `UniqueViolation` と同じ「対象の状態と矛盾する」意味論のため同じ 409。
+    ("23514", 409),
 ];
 
 /// (a)〜(f) 全類型の共通アサーション: `wire_code` が逆引き可能・射影ステータス
@@ -301,7 +304,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 31);
+const _: () = assert!(ErrorClass::ALL.len() == 32);
 
 /// `23502` を共有する分類（ERR-6・TABLE-16・TASK-204、Issue #904）。
 /// [`err4_projection_table_is_closed_over_all_error_classes`] がこの組にだけ

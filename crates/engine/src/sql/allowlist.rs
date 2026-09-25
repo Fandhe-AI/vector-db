@@ -43,6 +43,12 @@ pub(crate) const MAX_INDEX_DDL_COLUMNS: usize = 256;
 /// アロケーション前の上限検証（`.claude/rules/security.md`）を満たす）。
 const MAX_CREATE_TABLE_COLUMNS: usize = 256;
 
+/// `CREATE TABLE` の列定義が受理する列型キーワード（[`Parser::parse_create_table_column`]
+/// が照合する語と一致させる契約。型を追加する際はここも同時に拡張する）。
+/// `CHECK` 制約名がこれらと一致する場合は拒否する（TABLE-16・TASK-204、
+/// Issue #906。[`Parser::peek_check_clause_start`] の「曖昧さの排除」参照）。
+const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &["TEXT", "VECTOR"];
+
 /// `PRIMARY KEY (<col>[, <col>]*)` に宣言できる列数の上限（TABLE-16・
 /// TASK-204、Issue #903）。`catalog::validate_schema` が同じ上限
 /// （[`crate::catalog::MAX_PRIMARY_KEY_COLUMNS`]）で再検証するため、単一の
@@ -90,10 +96,15 @@ pub fn is_allowed_where_predicate_name(name: &str) -> bool {
 /// `HAVING` の各文脈キーワード）の開始位置に限って裸識別子を BOOLEAN 述語と
 /// みなす。受理範囲をこの集合に限定することで、`flag + 1` のような式の一部を
 /// 誤って BOOLEAN 述語と解釈しない（既存の式フォールバックへそのまま委譲する）。
-fn is_where_predicate_boundary_token(token: Option<&Token>) -> bool {
+/// `extra_close_paren` が `true` の場合に限り `)` も境界として扱う（`CHECK (...)`
+/// の本体を [`Parser::parse_check_body`] が解析する場合のみ。通常の `WHERE` 句
+/// 解析は `false` を渡し、既存の受理範囲を一切変えない。TABLE-16・TASK-204、
+/// Issue #906）。
+fn is_where_predicate_boundary_token(token: Option<&Token>, extra_close_paren: bool) -> bool {
     match token {
         None => true,
         Some(Token::Punct(';')) => true,
+        Some(Token::Punct(')')) if extra_close_paren => true,
         Some(Token::Keyword(Keyword::And)) => true,
         Some(Token::Keyword(Keyword::Order)) => true,
         Some(Token::Keyword(Keyword::Limit)) => true,
@@ -375,6 +386,11 @@ pub enum SqlSurfaceError {
     /// Issue #908。[`crate::catalog::CatalogError::ColumnNotFound`] の写像。
     /// ERR-6: `42703`）。
     UndefinedColumn { name: String },
+    /// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が宣言する述語を、書き込もう
+    /// とした行の値が満たさない。ERR-6: `23514`。
+    /// [`crate::tenant::TenantWriteError::CheckViolation`] の写像。制約名のみを
+    /// 保持する（行の値・id・テナントは含めない。security.md P0）。
+    CheckViolation { constraint: String },
 }
 
 impl SqlSurfaceError {
@@ -520,6 +536,16 @@ impl SqlSurfaceError {
     pub(crate) fn unique_violation() -> Self {
         SqlSurfaceError::UniqueViolation
     }
+
+    /// `pub(crate)`: `sql::exec::map_write_error`・`map_incremental_error`
+    /// （Issue #906）が [`crate::tenant::TenantWriteError::CheckViolation`] を
+    /// 写像するために使う。制約名は catalog 由来（識別子として検証済み）だが、
+    /// 他 variant と同じ切り詰め規約を適用する。
+    pub(crate) fn check_violation(constraint: impl Into<String>) -> Self {
+        SqlSurfaceError::CheckViolation {
+            constraint: truncate_for_error(&constraint.into()),
+        }
+    }
 }
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
@@ -564,6 +590,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::UniqueViolation => ErrorClass::UniqueViolation,
             SqlSurfaceError::UndefinedObject { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::UndefinedColumn { .. } => ErrorClass::UndefinedColumn,
+            SqlSurfaceError::CheckViolation { .. } => ErrorClass::CheckViolation,
         }
     }
 
@@ -684,6 +711,11 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::UndefinedColumn { name } => {
                 write!(f, "column does not exist: {name}")
+            }
+            // 制約名のみを含む固定文言（行の値・id・テナントは含めない。
+            // security.md P0。`TenantWriteError::CheckViolation` と同じ文言）。
+            SqlSurfaceError::CheckViolation { constraint } => {
+                write!(f, "new row violates check constraint {constraint:?}")
             }
         }
     }
@@ -1253,6 +1285,9 @@ struct ParsedCreateTableColumn {
     column: ColumnDef,
     primary_key: bool,
     unique: bool,
+    /// 列定義の後ろに続く列制約 `[CONSTRAINT <name>] CHECK (...)`（0 個以上。
+    /// TABLE-16・TASK-204、Issue #906）。
+    checks: Vec<ParsedCheck>,
 }
 
 /// INSERT の VALUES リストの 1 リテラル（SQL-10、TASK-80）。トークン種別
@@ -1460,8 +1495,10 @@ pub enum DeleteStatement {
 ///
 /// 受理する形は `CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]` の
 /// みで、`<type>` は `TEXT`／`VECTOR ( <N> )` のみ（`IF NOT EXISTS`・
-/// `CONSTRAINT <name>`・`CHECK`／`REFERENCES`・`USING OPERATION_ID` の付与は
-/// いずれも許可リスト外）。列制約 `NOT NULL`／`DEFAULT <literal>`（Issue #904）・
+/// `REFERENCES`・`USING OPERATION_ID` の付与はいずれも許可リスト外。
+/// `CONSTRAINT <name>` は `CHECK` の前置にのみ受理する）。列制約・表制約
+/// `[CONSTRAINT <name>] CHECK ( <述語> )`（TABLE-16・TASK-204、Issue #906。
+/// `docs/design/sql-check-constraint.md` 参照）も受理する。列制約 `NOT NULL`／`DEFAULT <literal>`（Issue #904）・
 /// `UNIQUE`（Issue #905）・`PRIMARY KEY`（Issue #903）と、表制約
 /// `PRIMARY KEY (<col>[, <col>]*)`・`UNIQUE (<col>[, <col>]*)`（複合キーを含む）
 /// を許可形状として追加受理する（TABLE-16・TASK-204。詳細は
@@ -1486,6 +1523,25 @@ pub struct ValidatedCreateTable {
     /// Issue #905）。参照列の実在・型適格性は構造検証段階
     /// （[`finalize_unique_constraints`]）で判定済み。
     pub unique_constraints: Vec<crate::catalog::UniqueConstraint>,
+    /// 宣言順の `CHECK` 制約（列制約・表制約のいずれも本フィールドへ集約する。
+    /// TABLE-16・TASK-204、Issue #906）。構文段では述語の意味論的妥当性
+    /// （列の存在・型・許可関数）を検証しない——`sql::ddl::execute_create_table`
+    /// が `sql::check_constraint::validate_and_build` で検証する。
+    pub checks: Vec<ParsedCheck>,
+}
+
+/// `CREATE TABLE` の `CHECK` 制約 1 件分の構文段中間表現（TABLE-16・TASK-204、
+/// Issue #906）。`sql::check_constraint::validate_and_build` が意味論検証・
+/// 制約名の確定（省略時の自動生成）・カタログ表現への変換を行う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedCheck {
+    /// `CONSTRAINT <name>` で明示された制約名（省略時は `None`）。
+    pub name: Option<String>,
+    /// 列制約として宣言された場合のみ `Some(<列名>)`（表制約は `None`）。
+    /// 制約名の自動生成（`<table>_<col>_check`）に使う。
+    pub column: Option<String>,
+    /// 括弧内の述語列（`AND` 連結。`WHERE` と同一文法）。
+    pub predicates: Vec<WherePredicate>,
 }
 
 /// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
@@ -2026,6 +2082,24 @@ impl<'a> Parser<'a> {
     /// `ILIKE`・`LIKE` の右辺が非リテラルの各形は、この確定判定に一致しないため
     /// 式述語フォールバックへ流れ、通常は `42601` で拒否される。
     fn parse_where(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        self.parse_where_predicates(false)
+    }
+
+    /// `CHECK (<body>)` の本体（TABLE-16・TASK-204、Issue #906）を [`Self::parse_where`]
+    /// と同じ文法で解析する。`WHERE` との唯一の違いは、末尾の `)` を境界トークン
+    /// として扱う点（`is_where_predicate_boundary_token` の `extra_close_paren`）で、
+    /// これにより裸の BOOLEAN 列参照（`CHECK (flag)`）が式フォールバックへ誤って
+    /// 落ちずに受理される。呼び出し元（[`Self::parse_check_clause`]）が `(` を消費
+    /// した直後に呼び、本体解析の完了後に `expect_punct(')')` で閉じ括弧を消費する。
+    fn parse_check_body(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        self.parse_where_predicates(true)
+    }
+
+    /// [`Self::parse_where`]・[`Self::parse_check_body`] が共有する述語列の解析本体。
+    fn parse_where_predicates(
+        &mut self,
+        extra_close_paren: bool,
+    ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         let mut predicates = Vec::new();
         loop {
             let start = self.pos;
@@ -2106,7 +2180,10 @@ impl<'a> Parser<'a> {
                     }
                 }
                 if !matched_legacy
-                    && is_where_predicate_boundary_token(self.tokens.get(self.pos + 1))
+                    && is_where_predicate_boundary_token(
+                        self.tokens.get(self.pos + 1),
+                        extra_close_paren,
+                    )
                 {
                     // BOOLEAN 列の裸参照（`WHERE flag`）。直後のトークンが
                     // WHERE 句の終端（`AND`・`ORDER`・`LIMIT`・`;`・EOF・後続構文
@@ -2962,10 +3039,14 @@ impl<'a> Parser<'a> {
         // がこれら 3 語を疑似列・RLS 内部列として扱う契約と整合させ、DDL で
         // これらを隠蔽する列を作らせない。fail-closed。security.md「アクセス
         // 制御の不備」対応）。カタログを参照しない判定のため権限ゲートより
-        // 前に置いても存在オラクルにならない。
+        // 前に置いても存在オラクルにならない。`check`／`constraint`（Issue #906）も
+        // `CREATE TABLE` と同じ予約列名として揃える（同じ列定義を `CREATE TABLE` で
+        // 再現できない列を ALTER 経由で作らせない）。
         if column_name.eq_ignore_ascii_case("id")
             || column_name.eq_ignore_ascii_case("tenant_id")
             || column_name.eq_ignore_ascii_case("visibility")
+            || column_name.eq_ignore_ascii_case("check")
+            || column_name.eq_ignore_ascii_case("constraint")
         {
             return Err(SqlSurfaceError::unsupported(format!(
                 "column name {column_name:?} is reserved"
@@ -3014,6 +3095,9 @@ impl<'a> Parser<'a> {
         // UNIQUE 制約（列制約・表制約。TABLE-16・TASK-204、Issue #905）。参照列の
         // 解決は `finalize_unique_constraints` が列リスト全体の構文判定後に行う。
         let mut unique_constraints: Vec<Vec<String>> = Vec::new();
+        // `CHECK` 制約（列制約・表制約。TABLE-16・TASK-204、Issue #906）。意味論
+        // 検証は `sql::check_constraint::validate_and_build`（`sql::ddl` から）が行う。
+        let mut checks: Vec<ParsedCheck> = Vec::new();
         loop {
             // 表制約 `PRIMARY KEY (<col>[, <col>]*)` は要素先頭が文脈的識別子
             // `PRIMARY` かつ次のトークンが `KEY` の場合にのみ判定する
@@ -3041,6 +3125,21 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 unique_constraints.push(self.parse_unique_table_constraint()?);
+            } else if self.peek_check_clause_start() {
+                // 表制約 `[CONSTRAINT <name>] CHECK (...)`（TABLE-16・TASK-204、
+                // Issue #906）。列を追加しないため列数上限の判定対象外（位置
+                // 非依存）。件数上限はパース前に判定する（UNIQUE と同じ）。
+                if checks.len() >= crate::catalog::MAX_CHECK_CONSTRAINTS_PER_TABLE {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many CHECK constraints in CREATE TABLE",
+                    ));
+                }
+                let (name, predicates) = self.parse_check_clause()?;
+                checks.push(ParsedCheck {
+                    name,
+                    column: None,
+                    predicates,
+                });
             } else {
                 // 列定義を 1 つ確定させる前に、確定済みの列数だけで上限を判定する
                 // （位置非依存。`parse_create_table` のドキュメント参照）。
@@ -3049,7 +3148,10 @@ impl<'a> Parser<'a> {
                         "too many columns in CREATE TABLE",
                     ));
                 }
-                let parsed = self.parse_create_table_column(&columns)?;
+                let remaining_checks =
+                    crate::catalog::MAX_CHECK_CONSTRAINTS_PER_TABLE.saturating_sub(checks.len());
+                let parsed = self.parse_create_table_column(&columns, remaining_checks)?;
+                checks.extend(parsed.checks);
                 if parsed.primary_key {
                     if primary_key.is_some() {
                         return Err(SqlSurfaceError::unsupported(
@@ -3075,6 +3177,16 @@ impl<'a> Parser<'a> {
             break;
         }
         self.expect_punct(')')?;
+        // 列定義は 1 件以上必須（表制約 `PRIMARY KEY`／`UNIQUE`／`CHECK` だけの
+        // 列リストは列を持たないテーブルになる）。カタログの `validate_schema` も
+        // 拒否するが、構文段の不変条件としてここで `42601` にする（fail-closed。
+        // PR #1055 Bugbot 指摘: 表制約 `CHECK` の追加で列なしの列リストが構文段を
+        // 通過し得た）。
+        if columns.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "CREATE TABLE requires at least one column definition",
+            ));
+        }
 
         let primary_key = finalize_primary_key(primary_key, &mut columns)?;
         let unique_constraints = finalize_unique_constraints(unique_constraints, &columns)?;
@@ -3084,7 +3196,65 @@ impl<'a> Parser<'a> {
             columns,
             primary_key,
             unique_constraints,
+            checks,
         })
+    }
+
+    /// 現在位置が `CREATE TABLE` の列リスト要素としての `CHECK` 句の開始位置
+    /// （`CHECK (`、または `CONSTRAINT`）であるかを消費せずに判定する（TABLE-16・
+    /// TASK-204、Issue #906）。`CHECK`／`CONSTRAINT` はキーワード化しない
+    /// （`sql::lexer` のモジュール方針。この位置でのみ文脈的に照合する）。
+    ///
+    /// 曖昧さの排除: 列名 `check`／`constraint` は [`Self::parse_create_table_column`]
+    /// が予約語として `42601` で拒否するため、要素先頭の `CONSTRAINT` は常に制約
+    /// 宣言の開始として扱ってよい（`CONSTRAINT` の後ろが `<name> CHECK (` の形で
+    /// なければ [`Self::parse_check_clause`] が `42601` で拒否する）。さらに制約名が
+    /// 列型キーワード（[`CREATE_TABLE_COLUMN_TYPE_KEYWORDS`]）と一致する場合も
+    /// 拒否するため、`constraint TEXT CHECK (...)` のように「列 `constraint`
+    /// の定義」とも「制約名 `TEXT` の表制約」とも読める入力は、どちらの解釈でも
+    /// 黙って受理されず必ず `42601` になる（サイレントなスキーマ改変を防ぐ
+    /// fail-closed。PR レビュー指摘）。
+    fn peek_check_clause_start(&self) -> bool {
+        (self.peek_ident_matches("CHECK")
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::Punct('('))
+            ))
+            || self.peek_ident_matches("CONSTRAINT")
+    }
+
+    /// [`Self::peek_check_clause_start`] が `true` を返した位置から
+    /// `[CONSTRAINT <name>] CHECK ( <述語> )` を消費する（TABLE-16・TASK-204、
+    /// Issue #906）。括弧内の述語文法は `WHERE` と同一（[`Self::parse_check_body`]）。
+    /// 制約名は `catalog::validate_identifier` で検証し、列型キーワードとの一致は
+    /// 拒否する（`peek_check_clause_start` の「曖昧さの排除」参照）。同一テーブル内の
+    /// 制約名の重複は `sql::check_constraint::validate_and_build` が検査する。
+    fn parse_check_clause(
+        &mut self,
+    ) -> Result<(Option<String>, Vec<WherePredicate>), SqlSurfaceError> {
+        let name = if self.peek_ident_matches("CONSTRAINT") {
+            self.advance();
+            let n = self.expect_ident()?;
+            crate::catalog::validate_identifier(&n).map_err(|e| {
+                SqlSurfaceError::unsupported(format!("invalid constraint name: {e}"))
+            })?;
+            if CREATE_TABLE_COLUMN_TYPE_KEYWORDS
+                .iter()
+                .any(|kw| n.eq_ignore_ascii_case(kw))
+            {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "constraint name {n:?} collides with a column type keyword"
+                )));
+            }
+            Some(n)
+        } else {
+            None
+        };
+        self.expect_ident_matching("CHECK")?;
+        self.expect_punct('(')?;
+        let predicates = self.parse_check_body()?;
+        self.expect_punct(')')?;
+        Ok((name, predicates))
     }
 
     /// `CREATE TABLE` の列 1 個ぶんの許可形状: `<col> (TEXT | VECTOR '(' <N> ')')
@@ -3107,13 +3277,20 @@ impl<'a> Parser<'a> {
     fn parse_create_table_column(
         &mut self,
         existing: &[ColumnDef],
+        max_checks: usize,
     ) -> Result<ParsedCreateTableColumn, SqlSurfaceError> {
         let name = self.expect_ident()?;
         crate::catalog::validate_identifier(&name)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid column name: {e}")))?;
+        // `check`／`constraint`（TABLE-16・TASK-204、Issue #906）も予約列名として
+        // 拒否する。列リスト要素の先頭に現れる `CHECK (`／`CONSTRAINT` を常に
+        // 制約宣言として解釈できるようにし、列定義との曖昧さを構造的に排除する
+        // （[`Self::peek_check_clause_start`] 参照。PostgreSQL でも両語は予約語）。
         if name.eq_ignore_ascii_case("id")
             || name.eq_ignore_ascii_case("tenant_id")
             || name.eq_ignore_ascii_case("visibility")
+            || name.eq_ignore_ascii_case("check")
+            || name.eq_ignore_ascii_case("constraint")
         {
             return Err(SqlSurfaceError::unsupported(format!(
                 "column name {name:?} is reserved"
@@ -3178,8 +3355,8 @@ impl<'a> Parser<'a> {
         };
 
         // 列制約 `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`CONSTRAINT
-        // <name> PRIMARY KEY` 形・`REFERENCES`／`CHECK` はいずれも許可リスト外の
-        // まま（受理しない）。`NOT NULL`／`DEFAULT`（Issue #904）・`UNIQUE`
+        // <name> PRIMARY KEY` 形・`REFERENCES` はいずれも許可リスト外のまま
+        // （受理しない。`CONSTRAINT <name>` は後段の `CHECK` にのみ前置できる）。`NOT NULL`／`DEFAULT`（Issue #904）・`UNIQUE`
         // （Issue #905）は列型キーワードの直後（`parse_column_constraints` 内）で
         // 先に受理済みで、`PRIMARY KEY` は
         // その後段の独立した列制約として構文上共存できる（`finalize_primary_key`
@@ -3192,10 +3369,30 @@ impl<'a> Parser<'a> {
             false
         };
 
+        // 列制約 `[CONSTRAINT <name>] CHECK (...)`（TABLE-16・TASK-204、Issue #906）。
+        // 他の列制約（`NOT NULL`／`DEFAULT`／`UNIQUE`／`PRIMARY KEY`）の後ろに
+        // 0 個以上置ける。列名を自動生成名の材料として保持する。件数は呼び出し元
+        // から渡された残り枠（`max_checks`）で打ち切り、`Vec` へ積む前に `54000`。
+        let mut checks: Vec<ParsedCheck> = Vec::new();
+        while self.peek_check_clause_start() {
+            if checks.len() >= max_checks {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many CHECK constraints in CREATE TABLE",
+                ));
+            }
+            let (check_name, predicates) = self.parse_check_clause()?;
+            checks.push(ParsedCheck {
+                name: check_name,
+                column: Some(column.name.clone()),
+                predicates,
+            });
+        }
+
         Ok(ParsedCreateTableColumn {
             column,
             primary_key: is_pk,
             unique,
+            checks,
         })
     }
 
@@ -4558,6 +4755,22 @@ pub(crate) fn validate_create_table_tokens(
     let validated = p.parse_create_table()?;
     p.expect_end_of_statement()?;
     Ok(validated)
+}
+
+/// カタログに永続化された `CHECK` 制約の正規化述語テキスト（`sql::check_constraint::
+/// render_predicates` が生成する）を、`WHERE` 句と同じ文法で再パースする
+/// （TABLE-16・TASK-204、Issue #906）。`CREATE TABLE` 実行時（往復一致検証）と
+/// 書き込み時（`sql::check_constraint::CompiledChecks::compile`）の双方が呼ぶ
+/// 唯一の再パース経路（第 2 のパーサーを作らない）。末尾に余剰トークンが残る
+/// 場合は `42601`（往復不能な入力・手書きの破損データのいずれもここで検知する）。
+pub(crate) fn parse_check_predicate_text(
+    sql: &str,
+) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    let mut p = Parser::new(&tokens);
+    let predicates = p.parse_where()?;
+    p.expect_end_of_statement()?;
+    Ok(predicates)
 }
 
 pub fn validate_truncate(
@@ -8863,5 +9076,185 @@ mod tests {
                 other => panic!("expected PayloadTooLarge, got: {other:?}"),
             }
         }
+    }
+
+    // --- CHECK 制約構文（TABLE-16・TASK-204、Issue #906） -----------------
+
+    fn parse_create_table_ok(sql: &str) -> ValidatedCreateTable {
+        let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        validate_create_table_tokens(&tokens).unwrap_or_else(|e| panic!("expected ok, got {e:?}"))
+    }
+
+    fn parse_create_table_err(sql: &str) -> SqlSurfaceError {
+        let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        match validate_create_table_tokens(&tokens) {
+            Ok(v) => panic!("expected error, got ok: {v:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn create_table_accepts_column_level_check_without_name() {
+        let v = parse_create_table_ok("CREATE TABLE t (kind TEXT CHECK (kind = 'a'), body TEXT)");
+        assert_eq!(v.columns.len(), 2);
+        assert_eq!(v.checks.len(), 1);
+        assert_eq!(v.checks[0].name, None);
+        assert_eq!(v.checks[0].column.as_deref(), Some("kind"));
+    }
+
+    #[test]
+    fn create_table_accepts_column_level_check_with_named_constraint() {
+        let v = parse_create_table_ok(
+            "CREATE TABLE t (kind TEXT CONSTRAINT kind_ck CHECK (kind = 'a'))",
+        );
+        assert_eq!(v.checks.len(), 1);
+        assert_eq!(v.checks[0].name.as_deref(), Some("kind_ck"));
+        assert_eq!(v.checks[0].column.as_deref(), Some("kind"));
+    }
+
+    #[test]
+    fn create_table_accepts_check_after_other_column_constraints() {
+        // `NOT NULL`／`UNIQUE` 等の列制約の後ろに複数の `CHECK` を置ける。
+        let v = parse_create_table_ok(
+            "CREATE TABLE t (kind TEXT NOT NULL UNIQUE CHECK (kind = 'a') CHECK (kind LIKE 'a%'))",
+        );
+        assert_eq!(v.checks.len(), 2);
+        assert!(!v.columns[0].nullable);
+        assert_eq!(v.unique_constraints.len(), 1);
+    }
+
+    #[test]
+    fn create_table_accepts_table_level_check() {
+        let v = parse_create_table_ok(
+            "CREATE TABLE t (kind TEXT, status TEXT, CHECK (kind = 'a' AND status = 'b'))",
+        );
+        assert_eq!(v.columns.len(), 2);
+        assert_eq!(v.checks.len(), 1);
+        assert_eq!(v.checks[0].column, None);
+        assert_eq!(v.checks[0].predicates.len(), 2);
+    }
+
+    #[test]
+    fn create_table_accepts_table_level_check_with_named_constraint_anywhere() {
+        let v = parse_create_table_ok(
+            "CREATE TABLE t (CONSTRAINT t_check CHECK (kind = 'a'), kind TEXT, PRIMARY KEY (kind))",
+        );
+        assert_eq!(v.checks[0].name.as_deref(), Some("t_check"));
+        assert_eq!(v.columns.len(), 1);
+        assert_eq!(v.primary_key.as_deref(), Some(&["kind".to_string()][..]));
+    }
+
+    #[test]
+    fn create_table_accepts_boolean_bare_column_check_body() {
+        // `)` を境界トークンとして扱う `parse_check_body`（`parse_where` との
+        // 唯一の違い）が、裸の BOOLEAN 列参照を式フォールバックへ誤って
+        // 落とさないことを固定する。
+        let v = parse_create_table_ok("CREATE TABLE t (flag TEXT, CHECK (flag))");
+        assert!(matches!(
+            v.checks[0].predicates.as_slice(),
+            [WherePredicate::BoolColumn { column }] if column == "flag"
+        ));
+    }
+
+    /// 列名 `check`／`constraint` は予約語として `42601` で拒否する（PR
+    /// レビュー指摘: 列リスト要素先頭の `CONSTRAINT`／`CHECK (` を制約宣言と
+    /// 曖昧さなく解釈するため）。
+    #[test]
+    fn create_table_rejects_check_and_constraint_as_column_names() {
+        for sql in [
+            "CREATE TABLE t (check TEXT)",
+            "CREATE TABLE t (constraint TEXT)",
+            "CREATE TABLE t (body TEXT, Constraint TEXT)",
+            "CREATE TABLE t (CHECK VECTOR(3))",
+        ] {
+            assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
+        }
+    }
+
+    /// 回帰: 列 `constraint`（型 `TEXT`・列制約 `CHECK`）とも、制約名 `TEXT` の
+    /// 表制約とも読める入力を、黙って「制約名 TEXT の表制約」として受理し列
+    /// `constraint` を消す誤パースをしない（どちらの解釈でも `42601`）。
+    #[test]
+    fn create_table_rejects_ambiguous_constraint_column_with_check() {
+        for sql in [
+            "CREATE TABLE t (constraint TEXT CHECK (body = 'a'), body TEXT)",
+            "CREATE TABLE t (body TEXT, constraint TEXT CHECK (body = 'a'))",
+            "CREATE TABLE t (body TEXT, CONSTRAINT vector CHECK (body = 'a'))",
+            "CREATE TABLE t (body TEXT CONSTRAINT Text CHECK (body = 'a'))",
+        ] {
+            assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
+        }
+    }
+
+    /// 回帰（PR #1055 Bugbot 指摘）: 表制約だけで列定義を持たない列リストは
+    /// 構文段で `42601` として拒否する。
+    #[test]
+    fn create_table_rejects_column_less_list_with_only_table_constraints() {
+        for sql in [
+            "CREATE TABLE t (CHECK (id > 0))",
+            "CREATE TABLE t (CONSTRAINT c1 CHECK (body = 'a'))",
+            "CREATE TABLE t (CHECK (a = 'x'), CHECK (b = 'y'))",
+            "CREATE TABLE t (UNIQUE (a))",
+            "CREATE TABLE t (PRIMARY KEY (a))",
+        ] {
+            assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn create_table_rejects_constraint_without_check() {
+        for sql in [
+            "CREATE TABLE t (body TEXT, CONSTRAINT c1 UNIQUE (body))",
+            "CREATE TABLE t (body TEXT CONSTRAINT c1 NOT NULL)",
+            "CREATE TABLE t (body TEXT, CONSTRAINT)",
+            "CREATE TABLE t (body TEXT, CHECK body = 'a')",
+        ] {
+            assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn create_table_rejects_too_many_check_constraints() {
+        let limit = crate::catalog::MAX_CHECK_CONSTRAINTS_PER_TABLE;
+        let table_level: Vec<String> = (0..=limit)
+            .map(|i| format!("CONSTRAINT c{i} CHECK (kind = 'a')"))
+            .collect();
+        let column_level: Vec<String> = (0..=limit)
+            .map(|i| format!("CONSTRAINT c{i} CHECK (kind = 'a')"))
+            .collect();
+        for sql in [
+            format!("CREATE TABLE t (kind TEXT, {})", table_level.join(", ")),
+            format!("CREATE TABLE t (kind TEXT {})", column_level.join(" ")),
+        ] {
+            assert!(
+                matches!(
+                    parse_create_table_err(&sql),
+                    SqlSurfaceError::PayloadTooLarge { .. }
+                ),
+                "{sql}"
+            );
+        }
+        // ちょうど上限数は受理する。
+        let exact: Vec<String> = (0..limit)
+            .map(|i| format!("CONSTRAINT c{i} CHECK (kind = 'a')"))
+            .collect();
+        let v = parse_create_table_ok(&format!("CREATE TABLE t (kind TEXT, {})", exact.join(", ")));
+        assert_eq!(v.checks.len(), limit);
+    }
+
+    /// 表制約 `CHECK` は列を追加しないため、列数上限の判定（位置非依存）に
+    /// 影響しない（ちょうど上限数の列の前後に CHECK があっても受理する）。
+    #[test]
+    fn create_table_check_does_not_affect_column_limit() {
+        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS)
+            .map(|i| format!("c{i} TEXT"))
+            .collect();
+        let sql = format!(
+            "CREATE TABLE t (CHECK (c0 = 'a'), {}, CHECK (c1 = 'b'))",
+            cols.join(", ")
+        );
+        let v = parse_create_table_ok(&sql);
+        assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
+        assert_eq!(v.checks.len(), 2);
     }
 }

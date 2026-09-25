@@ -15,12 +15,14 @@ CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
 ```
 
 - `<type>` は `TEXT` または `VECTOR ( <N> )` のみ（TABLE-13／14 の追加型は別 Issue の
-  管轄。`IF NOT EXISTS`・`CONSTRAINT <name>`・`CHECK`／`REFERENCES`・
-  `USING OPERATION_ID` の付与はいずれも許可リスト外（構造的に受理しない・
-  `42601`）。列制約 `PRIMARY KEY`・表制約 `PRIMARY KEY (<col>[, ...])`（複合キーを
+  管轄。`IF NOT EXISTS`・`REFERENCES`・`USING OPERATION_ID` の付与は
+  いずれも許可リスト外（構造的に受理しない・`42601`）。`CONSTRAINT <name>` は
+  `CHECK` の前置にのみ受理する。列制約 `PRIMARY KEY`・表制約 `PRIMARY KEY (<col>[, ...])`（複合キーを
   含む。TABLE-16・TASK-204、Issue #903。`docs/design/sql-primary-key.md`）と、
   列制約 `UNIQUE`・表制約 `UNIQUE (<col>[, ...])`（Issue #905。
-  `docs/design/unique-constraint.md`）を制約構文として追加受理する。
+  `docs/design/unique-constraint.md`）、列制約・表制約
+  `[CONSTRAINT <name>] CHECK (<述語>)`（Issue #906。
+  `docs/design/sql-check-constraint.md`）を制約構文として追加受理する。
   列数の上限（256）は列定義 1 個をパースする直前に確定済みの列数だけで判定し、
   表制約の位置（先頭・中間・末尾）に依存しない。
 - `TEXT`／`VECTOR` は `lexer::Keyword` へ追加しない（`SET`・`CREATE`・`TRUNCATE`・
@@ -40,6 +42,9 @@ CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
   列宣言として拒否する（`42601`）。`sql::parser` がこれら 3 語を疑似列・RLS 内部列
   として扱う契約と整合させ、SQL 表層の DDL でこれらを隠蔽する列を作らせないため
   （fail-closed）。Rust API（`Storage::create_table`）の挙動は変更しない。
+- `check`／`constraint` も予約列名として拒否する（`42601`。Issue #906）。列リスト
+  要素先頭の `CHECK (`／`CONSTRAINT` を列定義と曖昧さなく制約宣言として解釈する
+  ため（`docs/design/sql-check-constraint.md`「曖昧さの排除」参照）。
 
 ## 上限検証（確保より前に拒否）
 
@@ -174,7 +179,8 @@ PostgreSQL 互換の `CREATE TABLE`（件数なし）。
 ## スコープ外・後続 Issue
 
 - `ALTER TABLE ADD COLUMN`／DROP／MODIFY COLUMN・各種制約
-  （`CHECK`／`REFERENCES`。`PRIMARY KEY`・`UNIQUE` は Issue #903・#905 で実装済み）・
+  （`REFERENCES`。`PRIMARY KEY`・`UNIQUE`・`CHECK` は Issue #903・#905・#906 で
+  実装済み）・
   `CREATE INDEX`・`VIEW`・NoSQL 表層の DDL op はいずれも別 Issue の担当（本 Issue の
   権限ゲート（`require_ddl_permission`・`--ddl-allowed-users`）・
   `DuplicateColumn` 分類の再利用を前提とする）。`DROP TABLE` は Issue #902 で

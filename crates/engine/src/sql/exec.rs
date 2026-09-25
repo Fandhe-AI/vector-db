@@ -3361,6 +3361,15 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約
         // 違反。行キー衝突（`IdConflict`）と原因は異なるが `23505` は共有する。
         TenantWriteError::UniqueViolation => SqlSurfaceError::unique_violation(),
+        // `CHECK` 制約違反（TABLE-16・TASK-204、Issue #906）を `_` 節（`XX000`）へ
+        // 丸めると、クライアントが「内部事象」と「宣言済み制約への違反」を
+        // 判別できなくなる。制約名のみを含む固定文言（行の値・テナントは含まない）。
+        TenantWriteError::CheckViolation { constraint } => {
+            SqlSurfaceError::check_violation(constraint)
+        }
+        TenantWriteError::CheckEvaluationFailed => SqlSurfaceError::Internal {
+            detail: "check constraint evaluation failed".to_string(),
+        },
         // `tenant::insert_typed_row_unchecked`／`insert_typed_rows_unchecked`／
         // `update_row_columns_unchecked` 自体は `operation_id` 必須化ガード
         // （`recovery::required_op_id::LedgerMode`）を持たない（`tenant.rs`
@@ -3969,6 +3978,17 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         // エラーと取り違えないようにする）。
         IncrementalError::Write(TenantWriteError::UniqueViolation) => {
             SqlSurfaceError::unique_violation()
+        }
+        // `CHECK` 制約違反（TABLE-16・TASK-204、Issue #906）もファイル形 INSERT で
+        // 行形 INSERT（[`map_write_error`]）と同じ `23514` へ写像する（`_` 節へ
+        // 丸めない）。制約名のみを含む固定文言。
+        IncrementalError::Write(TenantWriteError::CheckViolation { constraint }) => {
+            SqlSurfaceError::check_violation(constraint)
+        }
+        IncrementalError::Write(TenantWriteError::CheckEvaluationFailed) => {
+            SqlSurfaceError::Internal {
+                detail: "check constraint evaluation failed".to_string(),
+            }
         }
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),

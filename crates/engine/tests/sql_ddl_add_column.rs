@@ -498,6 +498,10 @@ fn reserved_column_names_are_rejected_with_42601() {
         "ID",
         "Tenant_Id",
         "VISIBILITY",
+        // `CREATE TABLE` と揃えた予約列名（Issue #906。`CHECK` 制約構文との
+        // 曖昧さ排除のため）。
+        "check",
+        "Constraint",
     ] {
         let sql = format!("ALTER TABLE {TABLE} ADD COLUMN {name} TEXT");
         let err = alter_table(&core, &mut session, &sql)
