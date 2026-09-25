@@ -1104,6 +1104,22 @@ pub fn bind_projection(
 /// `22P02` として検出される（PR #1012 の vector literal 修正と同じ方針。
 /// `WherePredicate::Prefix`／`BoolEquality`／`BoolColumn` の右辺値は `$n` に
 /// 束縛できない〔`sql::params` モジュールドキュメント〕ため対象外）。
+/// `ty` が範囲比較（[`declarative_filter::FilterOp::TypedCompare`]。TABLE-13・
+/// TASK-199、Issue #891・レーン B）の対象列型かどうかを判定する。`=` の
+/// [`WherePredicate::Equality`] をどちらの経路（TEXT/ENUM 向け `equals`・
+/// 非数値型向け `compare`）へ振り分けるかの単一情報源。算術を持つ
+/// INTEGER/BIGINT/REAL/DOUBLE（レーン A。式評価系が担当）はここに含めない。
+fn is_typed_compare_column_type(ty: &ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid
+            | ColumnType::Bytea
+    )
+}
+
 pub(crate) fn bind_where_predicates(
     where_predicates: &[WherePredicate],
     schema: &TableSchema,
@@ -1126,7 +1142,27 @@ pub(crate) fn bind_where_predicates(
     for predicate in where_predicates {
         match predicate {
             WherePredicate::Equality { column, value } => {
-                declarative_filters.push(DeclarativeFilter::equals(column.clone(), value.clone()));
+                // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の `=` は
+                // 算術を持たない宣言的経路（レーン B。TABLE-13・TASK-199、
+                // Issue #891）へ振り分ける。列が未知の場合（後続の `bind_all`
+                // が「unknown column」で拒否する既存契約）はそのまま
+                // `DeclarativeFilter::equals` へ流し、挙動を変えない。
+                let is_typed_compare_column = schema
+                    .columns
+                    .iter()
+                    .find(|c| &c.name == column)
+                    .map(|c| is_typed_compare_column_type(&c.ty))
+                    .unwrap_or(false);
+                if is_typed_compare_column {
+                    declarative_filters.push(DeclarativeFilter::compare(
+                        column.clone(),
+                        declarative_filter::CompareOp::Eq,
+                        value.clone(),
+                    ));
+                } else {
+                    declarative_filters
+                        .push(DeclarativeFilter::equals(column.clone(), value.clone()));
+                }
                 filter_skip_enum_validation.push(
                     dummy_equality_flags
                         .get(equality_ordinal)
@@ -1134,6 +1170,18 @@ pub(crate) fn bind_where_predicates(
                         .unwrap_or(false),
                 );
                 equality_ordinal += 1;
+            }
+            WherePredicate::Compare { column, op, value } => {
+                // `< > <= >=`（TABLE-13・TASK-199、Issue #891・レーン B）。
+                // `$n` はこの述語形の右辺に束縛できない（`sql::params` の
+                // パターン 4 は `Ident '=' $n` のみ）ため、常に「実値」として
+                // 扱う（Describe 専用のダミー値スキップは対象外）。
+                declarative_filters.push(DeclarativeFilter::compare(
+                    column.clone(),
+                    (*op).into(),
+                    value.clone(),
+                ));
+                filter_skip_enum_validation.push(false);
             }
             WherePredicate::Prefix { column, pattern } => {
                 let prefix = declarative_filter::parse_prefix_pattern(pattern)?;

@@ -150,6 +150,40 @@ impl Decimal {
     }
 }
 
+/// `scale` が異なりうる 2 つの `Decimal` を、丸めずに正確な数値として比較する
+/// （TABLE-13・TASK-199、Issue #891。`declarative_filter::MetadataFilter::matches`
+/// の `NUMERIC` 列比較述語から呼ばれる）。
+///
+/// 手順: まず整数部（`div_euclid`。負数でも余りが非負になる床除算）を比較し、
+/// 異なればその大小関係を返す。整数部が一致する場合のみ小数部（`rem_euclid`。
+/// 常に `[0, 10^scale)` の範囲）を大きい方の `scale` へ揃えて比較する。揃えた後の
+/// 小数部は `10^MAX_PRECISION` 未満（`Decimal` の `scale` は構築時点で
+/// `0..=MAX_PRECISION` に検証済み）に収まるため `i128` の乗算がオーバーフローしない。
+/// クロス乗算（`a_frac * 10^b_scale` のように両者の全桁を掛け合わせる）ではなく
+/// 差分桁数だけ底上げする方式のため、桁数の上限に対して安全である。
+pub fn cmp_exact(a: &Decimal, b: &Decimal) -> std::cmp::Ordering {
+    let a_div = pow10(a.scale).unwrap_or(1);
+    let b_div = pow10(b.scale).unwrap_or(1);
+    let a_int = a.unscaled.div_euclid(a_div);
+    let b_int = b.unscaled.div_euclid(b_div);
+    match a_int.cmp(&b_int) {
+        std::cmp::Ordering::Equal => {}
+        other => return other,
+    }
+    let a_frac = a.unscaled.rem_euclid(a_div);
+    let b_frac = b.unscaled.rem_euclid(b_div);
+    let max_scale = a.scale.max(b.scale);
+    // `checked_pow`/`checked_mul` が使えない場面ではないが、`scale` は事前に
+    // `MAX_PRECISION` 以下と検証済みのため差分桁の底上げは常に成功する契約。
+    // それでも untrusted 経由の不変条件破れに備えて `unwrap_or` で fail-closed
+    // （桁上げが失敗した側は 0 とみなし、少なくとも整数部一致の判定は保つ）。
+    let a_scale_up = pow10(max_scale - a.scale).unwrap_or(1);
+    let b_scale_up = pow10(max_scale - b.scale).unwrap_or(1);
+    let a_frac_scaled = a_frac.saturating_mul(a_scale_up);
+    let b_frac_scaled = b_frac.saturating_mul(b_scale_up);
+    a_frac_scaled.cmp(&b_frac_scaled)
+}
+
 impl fmt::Display for Decimal {
     /// 正規テキスト表現（D8）。符号・整数部・（`scale > 0` のときのみ）`.` と
     /// ちょうど `scale` 桁にゼロ埋めした小数部。先頭ゼロ・指数表記・trailing
@@ -341,6 +375,28 @@ pub fn parse_for_column(text: &str, precision: u8, scale: u8) -> Result<Decimal,
     Ok(value)
 }
 
+/// `NUMERIC` 列の範囲比較リテラル（TABLE-13・TASK-199、Issue #891・
+/// `declarative_filter::DeclarativeFilter::compare`/`compare_numeric_literal`）
+/// を、**列の `scale` に丸めず**リテラル自身の小数桁数をそのまま `scale` として
+/// [`parse_for_column`] へ委譲する。範囲比較の意味論（`x > 1.005` が列の
+/// scale で丸めた `1.01` 比較に化けない）を保つための第 2 の入口だが、
+/// 実際のトークン走査・文法検証は [`parse_for_column`] 1 箇所を共有するため
+/// 「第 2 のパーサー」にはならない。
+///
+/// `.` 以降の桁数が `u8`（255）を超える、または [`MAX_PRECISION`] を超える
+/// 場合は `NumericError::OutOfRange`（範囲比較に使う `NUMERIC` 値としては
+/// 桁数過多で不成立）。
+pub fn parse_literal_exact(text: &str) -> Result<Decimal, NumericError> {
+    let scale = match text.split_once('.') {
+        Some((_, frac)) => u8::try_from(frac.len()).map_err(|_| NumericError::OutOfRange)?,
+        None => 0,
+    };
+    if scale > MAX_PRECISION {
+        return Err(NumericError::OutOfRange);
+    }
+    parse_for_column(text, MAX_PRECISION, scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +544,49 @@ mod tests {
         );
         // 境界値（`MAX_PRECISION` ちょうど）は受理される。
         assert!(Decimal::from_parts(1, MAX_PRECISION).is_ok());
+    }
+
+    #[test]
+    fn cmp_exact_same_scale() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_exact(&d(100, 2), &d(100, 2)), Ordering::Equal);
+        assert_eq!(cmp_exact(&d(100, 2), &d(101, 2)), Ordering::Less);
+        assert_eq!(cmp_exact(&d(101, 2), &d(100, 2)), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_exact_different_scale_does_not_round() {
+        use std::cmp::Ordering;
+        // 1.005 (scale 3) と 1.01 (scale 2) は丸めれば等しく見えうるが、
+        // 正確な数値としては 1.005 < 1.01 でなければならない（設計上の要件。
+        // 列の scale で丸めて解析すると `x > 1.005` の意味が変わってしまう）。
+        assert_eq!(cmp_exact(&d(1005, 3), &d(101, 2)), Ordering::Less);
+        assert_eq!(cmp_exact(&d(101, 2), &d(1005, 3)), Ordering::Greater);
+        // 1.10 (scale 2) と 1.100 (scale 3) は数値として等しい。
+        assert_eq!(cmp_exact(&d(110, 2), &d(1100, 3)), Ordering::Equal);
+    }
+
+    #[test]
+    fn cmp_exact_handles_sign_and_zero_boundary() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_exact(&d(-150, 2), &d(150, 2)), Ordering::Less);
+        assert_eq!(cmp_exact(&d(-150, 2), &d(-100, 2)), Ordering::Less);
+        assert_eq!(cmp_exact(&d(0, 2), &d(0, 5)), Ordering::Equal);
+        // -0.5 (scale 1) と -0.50 (scale 2) はいずれも同じ値。
+        assert_eq!(cmp_exact(&d(-5, 1), &d(-50, 2)), Ordering::Equal);
+        // -0.01 と 0 の境界（負の小数部の床除算が正しく処理されること）。
+        assert_eq!(cmp_exact(&d(-1, 2), &d(0, 2)), Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_exact_max_precision_does_not_overflow() {
+        use std::cmp::Ordering;
+        // 38 桁の最大値付近同士の比較で `i128` オーバーフローが起きないこと。
+        let max_unscaled: i128 = POW10[MAX_PRECISION as usize] - 1;
+        let a = d(max_unscaled, MAX_PRECISION);
+        let b = d(max_unscaled, 0);
+        // a は 0.999...9（38 桁）、b は 999...9（38 桁の整数）で a < b。
+        assert_eq!(cmp_exact(&a, &b), Ordering::Less);
+        assert_eq!(cmp_exact(&a, &a), Ordering::Equal);
     }
 }

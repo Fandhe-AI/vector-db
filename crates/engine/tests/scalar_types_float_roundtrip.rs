@@ -247,7 +247,10 @@ fn insert_rejects_string_literal_for_real_column_with_22000() {
     assert_eq!(err.wire_code(), "22000");
 }
 
-/// `WHERE score = 1` は fail-closed に拒否される（F10: WHERE 述語対応は #891）。
+/// `WHERE score = 1` は fail-closed に拒否される（F10: REAL/DOUBLE は算術と
+/// 組み合わせる式評価経路〔レーン A〕の対象で、#891・TASK-199 が対応した
+/// 非数値型〔DATE/TIMESTAMP/NUMERIC/UUID/BYTEA〕の範囲外のまま。詳細は
+/// `docs/design/scalar-types-predicates.md` 参照）。
 #[test]
 fn select_where_on_real_column_is_rejected() {
     let (core, path) = new_core();

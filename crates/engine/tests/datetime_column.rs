@@ -7,9 +7,11 @@
 //! `execute_sql_in_session` を production 経路として検証）。往復（宣言→書き込み→
 //! 再オープン→読み出し）・リテラル受理範囲（`22000` 文法違反／`22008` 範囲外・
 //! 暦上不正）・COUNT／SUM 拒否・RLS 境界・UPDATE・content_hash 再送判定
-//! （`23505`／`22023`）・スカラー二次索引の非索引化（WHERE 自体が式経路の
-//! `22000` へ倒れることも含む。Issue #891 まで）・Rust API 直接投入の往復を
-//! 固定する。`DATE`／`TIMESTAMP` の等価・範囲 WHERE 述語自体は対象外（#891）。
+//! （`23505`／`22023`）・Rust API 直接投入の往復を固定する。`DATE`／`TIMESTAMP`
+//! の等価・範囲 WHERE 述語（TABLE-13・TASK-199、Issue #891・レーン B）は
+//! 受理する。より広い網羅テストは `tests/scalar_types_predicates.rs` を参照。
+//! 式（算術・関数引数）中の参照・二次索引での候補削減は引き続き対象外
+//! （Issue #891・#893）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -339,10 +341,10 @@ fn count_counts_non_null_datetime_rows_and_sum_is_rejected() {
 }
 
 #[test]
-fn where_on_datetime_column_is_rejected_as_22000() {
-    // TABLE-13・TASK-197 は WHERE の等価・範囲述語を対象外とする（#891）。
-    // 束縛は式評価経路（`sql::udf_call::bind_expr`）へフォールバックし、
-    // DATE/TIMESTAMP 列は式内で参照不能として `22000` になる。
+fn where_equality_and_range_on_datetime_column_is_accepted() {
+    // DATE/TIMESTAMP 列は算術を持たない宣言的経路（レーン B。Issue #891）で
+    // `=` と範囲比較（`< > <= >=`）を受理する。式（算術・関数引数）中の
+    // 参照は引き続き対象外のまま（下の `sum_avg_min_max...` と同じ経路）。
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -352,11 +354,54 @@ fn where_on_datetime_column_is_rejected_as_22000() {
         &insert_sql(1, "2024-01-01", "2024-01-01 00:00:00", "op-1"),
     )
     .expect("insert should succeed");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &insert_sql(2, "2024-06-01", "2024-06-01 12:00:00", "op-2"),
+    )
+    .expect("insert should succeed");
 
-    let err = core
+    let result = core
         .execute_sql(
             &alice,
             &format!("SELECT id FROM {TABLE} WHERE day = '2024-01-01' LIMIT 10"),
+        )
+        .expect("DATE equality predicate should be accepted");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE day > '2024-01-01' LIMIT 10"),
+        )
+        .expect("DATE range predicate should be accepted");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE at <= '2024-01-01 00:00:00' LIMIT 10"),
+        )
+        .expect("TIMESTAMP range predicate should be accepted");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
+
+    // 文法違反のリテラルは `22000`。
+    let err = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE day = 'not-a-date' LIMIT 10"),
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22000");
+
+    // TEXT 列との比較（型不一致）は `22000`。
+    let err = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE lang > '2024-01-01' LIMIT 10"),
         )
         .unwrap_err();
     assert_eq!(err.wire_code(), "22000");

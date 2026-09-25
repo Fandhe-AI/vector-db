@@ -118,10 +118,11 @@ PG のバイナリ表現を返す場合はオフセット変換が必要にな�
 
 ## 対象外（申し送り）
 
-- WHERE の比較・等価述語と式評価（#891・TASK-199）。本 Issue の時点では
-  `DATE`／`TIMESTAMP` 列は WHERE 句・式（`sql::udf_call::bind_expr`）から
-  参照できず、既存の TEXT 限定チェック（`declarative_filter::bind`）へ
-  自然に `22000` で落ちる。
+- WHERE の比較・等価述語（#891・TASK-199 で対応済み。範囲・設計は
+  `docs/design/scalar-types-predicates.md` 参照。`DATE`／`TIMESTAMP` 列は
+  `declarative_filter::FilterOp::TypedCompare` へ束縛される）。式（算術・
+  関数引数。`sql::udf_call::bind_expr`）中の参照は引き続き対象外のまま
+  （`22000`）。
 - `MIN`／`MAX` などの集計拡張（#892）。`COUNT` のみ受理。
 - スカラー二次索引（#893）。`ScalarIndex::build` は DATE／TIMESTAMP 列を
   索引化しない（`per_column.push(None)`）。

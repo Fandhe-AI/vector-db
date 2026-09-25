@@ -7,8 +7,10 @@
 //! `EngineCore::execute_sql`／`execute_sql_in_session` を production 経路として
 //! 検証）。NUMERIC 列の往復・境界値・丸め規則・桁あふれ拒否・NULL 区別・
 //! UPDATE/UPSERT/RETURNING・content_hash 再送判定・RLS 境界・COUNT 集計・
-//! WHERE/式/GROUP BY の拒否（別 Issue #891・#892 への申し送り）・負数リテラルを
-//! 固定する。
+//! SUM/AVG/MIN/MAX・式・GROUP BY の拒否・負数リテラルを固定する。WHERE の
+//! 文字列リテラル形等価・範囲比較（TABLE-13・TASK-199、Issue #891・レーン B）
+//! は受理する（裸の数値リテラル形は対象外のまま。詳細は
+//! `tests/scalar_types_predicates.rs` 参照）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -703,7 +705,11 @@ fn sum_avg_min_max_where_expr_and_group_by_reject_numeric_column() {
         assert_eq!(err.wire_code(), "22000", "{func}(price) should be 22000");
     }
 
-    // WHERE 述語（等価）での NUMERIC 列参照は対象外（Issue #891）。
+    // WHERE 述語の裸の数値リテラル形（引用符なし `price = 1.00`）は対象外の
+    // まま（Issue #891・レーン B は文字列リテラル形 `price = '1.00'` のみを
+    // 受理する。裸の数値リテラル形は式評価経路〔`Expr::Binary`〕へ
+    // フォールバックし、NUMERIC 列は式内で参照不能として `22000` になる）。
+    // 文字列リテラル形の受理は `tests/scalar_types_predicates.rs` を参照。
     let err = core
         .execute_sql(
             &alice,

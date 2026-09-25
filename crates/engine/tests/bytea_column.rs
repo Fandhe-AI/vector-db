@@ -177,10 +177,13 @@ fn insert_rejects_number_or_boolean_literal_for_bytea_column() {
     assert_eq!(err.wire_code(), "22000");
 }
 
-// --- 受け入れ条件 5: WHERE 述語・集計・式評価への露出は拒否 --------------------
+// --- 受け入れ条件 5: WHERE 等価・範囲比較述語（TABLE-13・TASK-199、Issue #891）は
+// 受理・集計・式評価への露出は拒否 --------------------------------------------
 
 #[test]
-fn where_predicate_on_bytea_column_is_rejected() {
+fn where_equality_predicate_on_bytea_column_is_accepted() {
+    // BYTEA 列は算術を持たない宣言的経路（レーン B。Issue #891）で `=` と
+    // 範囲比較（辞書順）を受理する。
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -190,11 +193,36 @@ fn where_predicate_on_bytea_column_is_rejected() {
         &insert_sql(1, "ja", "'\\xdead'", 1),
     )
     .expect("insert should succeed");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &insert_sql(2, "ja", "'\\xff'", 2),
+    )
+    .expect("insert should succeed");
 
-    let err = core
+    let result = core
         .execute_sql(
             &alice,
             &format!("SELECT id FROM {TABLE} WHERE blob = '\\xdead' LIMIT 10"),
+        )
+        .expect("BYTEA equality predicate should be accepted");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE blob > '\\xdead' LIMIT 10"),
+        )
+        .expect("BYTEA range predicate should be accepted");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
+
+    // 形式不正のリテラル（接頭辞なし）は `22000`。
+    let err = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE blob = 'deadbeef' LIMIT 10"),
         )
         .unwrap_err();
     assert_eq!(err.wire_code(), "22000");
