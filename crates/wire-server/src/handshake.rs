@@ -554,13 +554,12 @@ fn post_auth_loop<'e>(
                 // statement／portal は維持する（PostgreSQL と同じ挙動）。
                 extended.discard_unnamed_for_simple_query();
 
-                match engine {
-                    Some(engine) => {
-                        // SQL-31・TASK-221: `engine` が `Some` の間は `txn` も
-                        // `Some`（`post_auth_loop` 呼び出し元で対で構築する）。
-                        let txn = txn
-                            .as_mut()
-                            .expect("session transaction must exist whenever engine is attached");
+                // SQL-31・TASK-221: `engine` が `Some` の間は `txn` も `Some`
+                // （`post_auth_loop` 呼び出し元で対で構築する）。受信経路で
+                // `expect` に頼らず、万一片方だけ `Some` の場合は engine 未接続と
+                // 同じ fail-closed 分岐（`0A000`）へ倒す。
+                match (engine, txn.as_mut()) {
+                    (Some(engine), Some(txn)) => {
                         // Issue #939（WIRE-17・TASK-220）: `COPY ... FROM STDIN`／
                         // `COPY (...) TO STDOUT` は簡易クエリの通常の 1 往復応答
                         // ではなく CopyIn／CopyOut サブプロトコルを要するため、
@@ -601,7 +600,7 @@ fn post_auth_loop<'e>(
                             )?;
                         }
                     }
-                    None => {
+                    _ => {
                         write_error_response(
                             stream,
                             ErrorClass::FeatureNotSupported,
@@ -698,17 +697,14 @@ fn post_auth_loop<'e>(
                     return Ok(());
                 }
             },
-            b'E' => match engine {
-                Some(engine) => {
-                    // SQL-31・TASK-221（Issue #942 codex-review 指摘対応）:
-                    // `engine` が `Some` の間は `txn` も `Some`（`'Q'` 分岐と
-                    // 同じ不変条件。`post_auth_loop` 呼び出し元で対で構築する）。
-                    // 拡張クエリプロトコル経由の Execute も簡易クエリと同一の
-                    // `SessionTransaction` を共有し、`BEGIN`/`COMMIT`/
-                    // `ROLLBACK` を受理できるようにする。
-                    let txn = txn
-                        .as_mut()
-                        .expect("session transaction must exist whenever engine is attached");
+            // SQL-31・TASK-221（Issue #942 codex-review 指摘対応）: `engine` が
+            // `Some` の間は `txn` も `Some`（`'Q'` 分岐と同じ不変条件。
+            // `post_auth_loop` 呼び出し元で対で構築する）。拡張クエリプロトコル
+            // 経由の Execute も簡易クエリと同一の `SessionTransaction` を共有し、
+            // `BEGIN`/`COMMIT`/`ROLLBACK` を受理できるようにする。片方だけ
+            // `Some` の場合は engine 未接続と同じ fail-closed 分岐へ倒す。
+            b'E' => match (engine, txn.as_mut()) {
+                (Some(engine), Some(txn)) => {
                     match crate::extended_query::handle_execute(
                         stream, engine, ctx, session, txn, extended,
                     )? {
@@ -716,7 +712,7 @@ fn post_auth_loop<'e>(
                         crate::extended_query::LoopSignal::Closed => return Ok(()),
                     }
                 }
-                None => {
+                _ => {
                     framing::validate_typed_message_length_prefix(
                         stream,
                         framing::MIN_TYPED_MESSAGE_LEN,
