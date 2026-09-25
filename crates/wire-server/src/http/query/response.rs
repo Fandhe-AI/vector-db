@@ -648,10 +648,16 @@ mod tests {
                 ty: ColumnType::Jsonb,
             },
         ];
+        // OID（第 2 要素）は SQL wire `RowDescription` 側 `column_wire_type`
+        // （Issue #895）の値。NoSQL 応答 `columns[].type`（第 3 要素）は
+        // Issue #896 以降 `nosql_type_name` が独立の対応表として返す値で
+        // あり、両者は列型によって意図的に異なる（`flag`: OID は
+        // `bool`（16）のまま、NoSQL 型名は `boolean` 等。モジュール doc
+        // 「独立の対応表」参照）。
         let expected: [(&str, i32, &str); 9] = [
-            ("flag", 16, "bool"),
-            ("r", 700, "float4"),
-            ("d", 701, "float8"),
+            ("flag", 16, "boolean"),
+            ("r", 700, "real"),
+            ("d", 701, "double precision"),
             ("dt", 1082, "date"),
             ("ts", 1114, "timestamp"),
             ("blob", 17, "bytea"),
@@ -673,7 +679,7 @@ mod tests {
         };
 
         let mut cursor = 1 + 4 + 2; // 'T' + length + field_count
-        for (i, (name, expected_oid, expected_type_name)) in expected.iter().enumerate() {
+        for (i, (name, expected_oid, expected_nosql_type_name)) in expected.iter().enumerate() {
             let name_end = row_description[cursor..]
                 .iter()
                 .position(|&b| b == 0)
@@ -697,7 +703,7 @@ mod tests {
             let JsonValue::String(actual_type) = &col_obj["type"] else {
                 panic!("type must be a string");
             };
-            assert_eq!(actual_type, expected_type_name, "column={name}");
+            assert_eq!(actual_type, expected_nosql_type_name, "column={name}");
         }
     }
 
